@@ -34,6 +34,11 @@ CONFIG_VIRTIO_NET=y
 CONFIG_VIRTIO_BLK=y
 CONFIG_VIRTIO_CONSOLE=y
 CONFIG_VIRTIO_INPUT=y
+CONFIG_MEMORY_HOTPLUG=y
+CONFIG_MEMORY_HOTREMOVE=y
+CONFIG_ZONE_DEVICE=y
+CONFIG_DMA_SHARED_BUFFER=y
+CONFIG_SYNC_FILE=y
 CONFIG_INPUT_UINPUT=y
 CONFIG_DRM=y
 CONFIG_DRM_VIRTIO_GPU=y
@@ -42,7 +47,24 @@ CONFIG_DRM_VIRTIO_GPU=y
 CONFIG_DRM_I915=m
 CONFIG_DRM_XE=m
 CONFIG_DRM_AMDGPU=m
+CONFIG_DRM_AMD_DC=y
 CONFIG_DRM_FBDEV_EMULATION=y
+# The display DVM consumes a fixed, kernel-owned DMA-BUF capability. Do not
+# expose general guest allocation/import or nested device-assignment surfaces.
+# CONFIG_UDMABUF is not set
+# CONFIG_DMABUF_MOVE_NOTIFY is not set
+# CONFIG_DMABUF_HEAPS is not set
+# CONFIG_DRM_AMDGPU_USERPTR is not set
+# CONFIG_VFIO is not set
+# CONFIG_IOMMUFD is not set
+# CONFIG_VIRTIO_IOMMU is not set
+# Diagnostic/fallback DRM providers cannot become production display owners.
+# CONFIG_DRM_RADEON is not set
+# CONFIG_DRM_VGEM is not set
+# CONFIG_DRM_VKMS is not set
+# CONFIG_DRM_SIMPLEDRM is not set
+# Firmware supply is sealed into the image; runtime userspace fallback is not.
+# CONFIG_FW_LOADER_USER_HELPER is not set
 CONFIG_HW_RANDOM_VIRTIO=y
 CONFIG_VSOCKETS=y
 CONFIG_VIRTIO_VSOCKETS=y

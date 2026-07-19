@@ -2,277 +2,522 @@
 EXTENDS Naturals, FiniteSets
 
 (*******************************************************************************
-Direct DMA-BUF GUI-DVM scanout ownership contract.
+Physical AMD zero-copy composition and atomic KMS ownership contract.
 
 Concrete owners:
   driver-domains/linux/package/rustos-dvm-display/src/rustos-dvm-display.c
+  driver-domains/linux/package/rustos-dvm-display/src/rustos-dvm-gpu-runtime.c
   driver-domains/linux/package/rustos-dvm-display/src/rustos_dvm_ivshmem_uio.c
 
-The root-only exporter opens and grants device-read mappings before any host
-invitation. This breaks the otherwise impossible cycle in which KMS readiness
-would require a relay acknowledgement that itself required completed imports.
-Relay readiness still requires all three read-only imports, KMS setup, and an
-actual published host slot. Device-write authority is never granted.
+RustOS owns three immutable source slots.  Their complete backing must be
+DMA-pinnable and mapped into the VFIO IOAS before the DVM exporter can grant
+the AMD GPU read-only DMA-BUF mappings.  The DVM adapter first owns a fixed
+ZONE_DEVICE page-map for the complete pixel aperture; raw physical addresses
+without live page metadata cannot become DMA-BUF authority.  GLES imports each source as an
+EGLImage.  Before GLES samples a source, the kernel validates the exact live
+slot/generation invitation and materializes the completed CPU producer release
+as a sync_file; EGL imports and server-waits on that exact fence.  GLES then
+executes the bounded compositor vocabulary into one of three separate GBM
+output buffers and produces a GPU completion fence.  Atomic KMS accepts that
+possibly-unsignalled fence as IN_FENCE_FD instead of forcing a CPU pre-wait;
+the page flip cannot complete before the fence.  The source is released and
+the old output becomes reusable only after the new page-flip fence.  Offline
+revokes the whole source pool and publishes no success evidence.
 
-A page-flip event fences the new front slot. The previous front is released
-only after that fence, while the new front remains pinned until a later flip.
-An offline transition revokes the entire pool instead of fabricating releases.
+This is deliberately not the old model in which a RustOS source slot itself
+became the KMS front buffer.  That would omit the GPU composition ownership
+and could falsely call a staged upload zero-copy.
 *******************************************************************************)
 
 CONSTANTS Slots, MaxGeneration
 
-Free == "free"
-Ready == "ready"
-Front == "front"
+SourceFree == "source-free"
+SourceReady == "source-ready"
+SourceInFlight == "source-in-flight"
 NoSlot == 99
 
 Bound == "bound"
+PageMapOwned == "page-map-owned"
 ExporterOpen == "exporter-open"
-SlotsImported == "slots-imported"
+SourcesImported == "sources-imported"
 KmsReady == "kms-ready"
+PeerConfirmed == "peer-confirmed"
 RelayReady == "relay-ready"
 Offline == "offline"
 
-VARIABLES slotState,
-          slotGeneration,
+VARIABLES sourceState,
+          sourceGeneration,
           publishedGeneration,
-          displayedGeneration,
-          fencedGeneration,
+          presentedGeneration,
           releasedGeneration,
           revokedGeneration,
-          frontSlot,
-          pendingSlot,
+          pendingSource,
+          pendingOutput,
           pendingGeneration,
+          acquireSyncSlot,
+          acquireSyncGeneration,
+          acquireSyncIssued,
+          acquireSyncConsumed,
+          frontOutput,
+          gpuFenceComplete,
           pageFlipPending,
           pageFlipComplete,
           dmaReadSlots,
           dmaWriteSlots,
+          dmaCoherent,
+          vfioBackingPinnable,
+          vfioDmaMapped,
           setupPhase,
+          evidencePublished,
           online
 
-vars == <<slotState, slotGeneration, publishedGeneration, displayedGeneration,
-          fencedGeneration, releasedGeneration, revokedGeneration, frontSlot,
-          pendingSlot, pendingGeneration, pageFlipPending, pageFlipComplete,
-          dmaReadSlots, dmaWriteSlots, setupPhase, online>>
+vars == <<sourceState, sourceGeneration, publishedGeneration,
+          presentedGeneration, releasedGeneration, revokedGeneration,
+          pendingSource, pendingOutput, pendingGeneration, frontOutput,
+          acquireSyncSlot, acquireSyncGeneration, acquireSyncIssued,
+          acquireSyncConsumed,
+          gpuFenceComplete, pageFlipPending, pageFlipComplete,
+          dmaReadSlots, dmaWriteSlots, dmaCoherent, vfioBackingPinnable,
+          vfioDmaMapped, setupPhase,
+          evidencePublished, online>>
 
-FreeSlots == {s \in Slots : slotState[s] = Free}
-ReadySlots == {s \in Slots : slotState[s] = Ready}
-FrontSlots == {s \in Slots : slotState[s] = Front}
+FreeSources == {s \in Slots : sourceState[s] = SourceFree}
+ReadySources == {s \in Slots : sourceState[s] = SourceReady}
+InFlightSources == {s \in Slots : sourceState[s] = SourceInFlight}
 
 Init ==
-    /\ slotState = [s \in Slots |-> Free]
-    /\ slotGeneration = [s \in Slots |-> 0]
+    /\ sourceState = [s \in Slots |-> SourceFree]
+    /\ sourceGeneration = [s \in Slots |-> 0]
     /\ publishedGeneration = 0
-    /\ displayedGeneration = 0
-    /\ fencedGeneration = 0
+    /\ presentedGeneration = 0
     /\ releasedGeneration = [s \in Slots |-> 0]
     /\ revokedGeneration = [s \in Slots |-> 0]
-    /\ frontSlot = NoSlot
-    /\ pendingSlot = NoSlot
+    /\ pendingSource = NoSlot
+    /\ pendingOutput = NoSlot
     /\ pendingGeneration = 0
+    /\ acquireSyncSlot = NoSlot
+    /\ acquireSyncGeneration = 0
+    /\ acquireSyncIssued = FALSE
+    /\ acquireSyncConsumed = FALSE
+    /\ frontOutput = NoSlot
+    /\ gpuFenceComplete = FALSE
     /\ pageFlipPending = FALSE
     /\ pageFlipComplete = FALSE
     /\ dmaReadSlots = {}
     /\ dmaWriteSlots = {}
+    /\ dmaCoherent \in BOOLEAN
+    /\ vfioBackingPinnable \in BOOLEAN
+    /\ vfioDmaMapped = FALSE
     /\ setupPhase = Bound
+    /\ evidencePublished = FALSE
     /\ online = TRUE
+
+MapVfioPixelBacking ==
+    /\ online
+    /\ setupPhase = Bound
+    /\ vfioBackingPinnable
+    /\ ~vfioDmaMapped
+    /\ vfioDmaMapped' = TRUE
+    /\ UNCHANGED <<sourceState, sourceGeneration, publishedGeneration,
+                  presentedGeneration, releasedGeneration, revokedGeneration,
+                  pendingSource, pendingOutput, pendingGeneration, frontOutput,
+                  acquireSyncSlot, acquireSyncGeneration, acquireSyncIssued,
+                  acquireSyncConsumed,
+                  gpuFenceComplete, pageFlipPending, pageFlipComplete,
+                  dmaReadSlots, dmaWriteSlots, dmaCoherent,
+                  vfioBackingPinnable, setupPhase, evidencePublished, online>>
+
+OwnSourcePageMap ==
+    /\ online
+    /\ setupPhase = Bound
+    /\ vfioDmaMapped
+    /\ setupPhase' = PageMapOwned
+    /\ UNCHANGED <<sourceState, sourceGeneration, publishedGeneration,
+                  presentedGeneration, releasedGeneration, revokedGeneration,
+                  pendingSource, pendingOutput, pendingGeneration, frontOutput,
+                  acquireSyncSlot, acquireSyncGeneration, acquireSyncIssued,
+                  acquireSyncConsumed,
+                  gpuFenceComplete, pageFlipPending, pageFlipComplete,
+                  dmaReadSlots, dmaWriteSlots, dmaCoherent,
+                  vfioBackingPinnable, vfioDmaMapped, evidencePublished,
+                  online>>
 
 OpenExporter ==
     /\ online
-    /\ setupPhase = Bound
+    /\ setupPhase = PageMapOwned
+    /\ vfioDmaMapped
     /\ setupPhase' = ExporterOpen
-    /\ UNCHANGED <<slotState, slotGeneration, publishedGeneration,
-                  displayedGeneration, fencedGeneration, releasedGeneration,
-                  revokedGeneration, frontSlot, pendingSlot, pendingGeneration,
-                  pageFlipPending, pageFlipComplete, dmaReadSlots,
-                  dmaWriteSlots, online>>
+    /\ UNCHANGED <<sourceState, sourceGeneration, publishedGeneration,
+                  presentedGeneration, releasedGeneration, revokedGeneration,
+                  pendingSource, pendingOutput, pendingGeneration, frontOutput,
+                  acquireSyncSlot, acquireSyncGeneration, acquireSyncIssued,
+                  acquireSyncConsumed,
+                  gpuFenceComplete, pageFlipPending, pageFlipComplete,
+                  dmaReadSlots, dmaWriteSlots, dmaCoherent,
+                  vfioBackingPinnable, vfioDmaMapped, evidencePublished,
+                  online>>
 
-ImportReadOnlySlots ==
+ImportReadOnlySources ==
     /\ online
     /\ setupPhase = ExporterOpen
-    /\ setupPhase' = SlotsImported
+    /\ dmaCoherent
+    /\ setupPhase' = SourcesImported
     /\ dmaReadSlots' = Slots
-    /\ UNCHANGED <<slotState, slotGeneration, publishedGeneration,
-                  displayedGeneration, fencedGeneration, releasedGeneration,
-                  revokedGeneration, frontSlot, pendingSlot, pendingGeneration,
-                  pageFlipPending, pageFlipComplete, dmaWriteSlots, online>>
+    /\ UNCHANGED <<sourceState, sourceGeneration, publishedGeneration,
+                  presentedGeneration, releasedGeneration, revokedGeneration,
+                  pendingSource, pendingOutput, pendingGeneration, frontOutput,
+                  acquireSyncSlot, acquireSyncGeneration, acquireSyncIssued,
+                  acquireSyncConsumed,
+                  gpuFenceComplete, pageFlipPending, pageFlipComplete,
+                  dmaWriteSlots, dmaCoherent, vfioBackingPinnable,
+                  vfioDmaMapped, evidencePublished, online>>
 
 CompleteKmsSetup ==
     /\ online
-    /\ setupPhase = SlotsImported
+    /\ setupPhase = SourcesImported
     /\ setupPhase' = KmsReady
-    /\ UNCHANGED <<slotState, slotGeneration, publishedGeneration,
-                  displayedGeneration, fencedGeneration, releasedGeneration,
-                  revokedGeneration, frontSlot, pendingSlot, pendingGeneration,
-                  pageFlipPending, pageFlipComplete, dmaReadSlots,
-                  dmaWriteSlots, online>>
+    /\ UNCHANGED <<sourceState, sourceGeneration, publishedGeneration,
+                  presentedGeneration, releasedGeneration, revokedGeneration,
+                  pendingSource, pendingOutput, pendingGeneration, frontOutput,
+                  acquireSyncSlot, acquireSyncGeneration, acquireSyncIssued,
+                  acquireSyncConsumed,
+                  gpuFenceComplete, pageFlipPending, pageFlipComplete,
+                  dmaReadSlots, dmaWriteSlots, dmaCoherent,
+                  vfioBackingPinnable, vfioDmaMapped, evidencePublished,
+                  online>>
 
-AcknowledgeRelay ==
+PublishSource(s) ==
+    /\ online
+    /\ s \in FreeSources
+    /\ publishedGeneration <= MaxGeneration - 2
+    /\ sourceState' = [sourceState EXCEPT ![s] = SourceReady]
+    /\ sourceGeneration' =
+         [sourceGeneration EXCEPT ![s] = publishedGeneration + 2]
+    /\ publishedGeneration' = publishedGeneration + 2
+    /\ UNCHANGED <<presentedGeneration, releasedGeneration, revokedGeneration,
+                  pendingSource, pendingOutput, pendingGeneration, frontOutput,
+                  acquireSyncSlot, acquireSyncGeneration, acquireSyncIssued,
+                  acquireSyncConsumed,
+                  gpuFenceComplete, pageFlipPending, pageFlipComplete,
+                  dmaReadSlots, dmaWriteSlots, dmaCoherent,
+                  vfioBackingPinnable, vfioDmaMapped, setupPhase,
+                  evidencePublished, online>>
+
+ConfirmPeer ==
     /\ online
     /\ setupPhase = KmsReady
-    /\ ReadySlots # {}
-    /\ setupPhase' = RelayReady
-    /\ UNCHANGED <<slotState, slotGeneration, publishedGeneration,
-                  displayedGeneration, fencedGeneration, releasedGeneration,
-                  revokedGeneration, frontSlot, pendingSlot, pendingGeneration,
-                  pageFlipPending, pageFlipComplete, dmaReadSlots,
-                  dmaWriteSlots, online>>
+    /\ ReadySources # {}
+    /\ setupPhase' = PeerConfirmed
+    /\ UNCHANGED <<sourceState, sourceGeneration, publishedGeneration,
+                  presentedGeneration, releasedGeneration, revokedGeneration,
+                  pendingSource, pendingOutput, pendingGeneration, frontOutput,
+                  acquireSyncSlot, acquireSyncGeneration, acquireSyncIssued,
+                  acquireSyncConsumed,
+                  gpuFenceComplete, pageFlipPending, pageFlipComplete,
+                  dmaReadSlots, dmaWriteSlots, dmaCoherent,
+                  vfioBackingPinnable, vfioDmaMapped, evidencePublished,
+                  online>>
 
-Publish(s) ==
+IssueAcquireSyncFile(s) ==
     /\ online
-    /\ s \in FreeSlots
-    /\ publishedGeneration <= MaxGeneration - 2
-    /\ slotState' = [slotState EXCEPT ![s] = Ready]
-    /\ slotGeneration' = [slotGeneration EXCEPT ![s] = publishedGeneration + 2]
-    /\ publishedGeneration' = publishedGeneration + 2
-    /\ UNCHANGED <<displayedGeneration, fencedGeneration, releasedGeneration,
-                  revokedGeneration, frontSlot, pendingSlot, pendingGeneration,
-                  pageFlipPending, pageFlipComplete, dmaReadSlots,
-                  dmaWriteSlots, setupPhase, online>>
-
-BeginDirectFlip(s) ==
-    /\ online
-    /\ setupPhase = RelayReady
-    /\ s \in ReadySlots
-    /\ slotGeneration[s] > displayedGeneration
+    /\ setupPhase \in {PeerConfirmed, RelayReady}
+    /\ s \in ReadySources
+    /\ sourceGeneration[s] > presentedGeneration
+    /\ \A ready \in ReadySources :
+           sourceGeneration[s] <= sourceGeneration[ready]
+    /\ pendingSource = NoSlot
     /\ ~pageFlipPending
-    /\ pendingSlot' = s
-    /\ pendingGeneration' = slotGeneration[s]
+    /\ ~acquireSyncIssued
+    /\ acquireSyncSlot' = s
+    /\ acquireSyncGeneration' = sourceGeneration[s]
+    /\ acquireSyncIssued' = TRUE
+    /\ acquireSyncConsumed' = FALSE
+    /\ UNCHANGED <<sourceState, sourceGeneration, publishedGeneration,
+                  presentedGeneration, releasedGeneration, revokedGeneration,
+                  pendingSource, pendingOutput, pendingGeneration, frontOutput,
+                  gpuFenceComplete, pageFlipPending, pageFlipComplete,
+                  dmaReadSlots, dmaWriteSlots, dmaCoherent,
+                  vfioBackingPinnable, vfioDmaMapped, setupPhase,
+                  evidencePublished, online>>
+
+BeginGpuComposition(s, output) ==
+    /\ online
+    /\ setupPhase \in {PeerConfirmed, RelayReady}
+    /\ s \in ReadySources
+    /\ sourceGeneration[s] > presentedGeneration
+    /\ \A ready \in ReadySources :
+           sourceGeneration[s] <= sourceGeneration[ready]
+    /\ output \in Slots
+    /\ output # frontOutput
+    /\ pendingSource = NoSlot
+    /\ ~pageFlipPending
+    /\ acquireSyncIssued
+    /\ ~acquireSyncConsumed
+    /\ acquireSyncSlot = s
+    /\ acquireSyncGeneration = sourceGeneration[s]
+    /\ sourceState' = [sourceState EXCEPT ![s] = SourceInFlight]
+    /\ pendingSource' = s
+    /\ pendingOutput' = output
+    /\ pendingGeneration' = sourceGeneration[s]
+    /\ gpuFenceComplete' = FALSE
+    /\ pageFlipComplete' = FALSE
+    /\ acquireSyncConsumed' = TRUE
+    /\ UNCHANGED <<sourceGeneration, publishedGeneration, presentedGeneration,
+                  releasedGeneration, revokedGeneration, frontOutput,
+                  acquireSyncSlot, acquireSyncGeneration, acquireSyncIssued,
+                  pageFlipPending, dmaReadSlots, dmaWriteSlots, dmaCoherent,
+                  vfioBackingPinnable, vfioDmaMapped, setupPhase,
+                  evidencePublished, online>>
+
+CompleteGpuFence ==
+    /\ online
+    /\ pendingSource \in Slots
+    /\ ~gpuFenceComplete
+    /\ gpuFenceComplete' = TRUE
+    /\ UNCHANGED <<sourceState, sourceGeneration, publishedGeneration,
+                  presentedGeneration, releasedGeneration, revokedGeneration,
+                  pendingSource, pendingOutput, pendingGeneration, frontOutput,
+                  acquireSyncSlot, acquireSyncGeneration, acquireSyncIssued,
+                  acquireSyncConsumed,
+                  pageFlipPending, pageFlipComplete, dmaReadSlots,
+                  dmaWriteSlots, dmaCoherent, vfioBackingPinnable,
+                  vfioDmaMapped, setupPhase, evidencePublished, online>>
+
+BeginAtomicPageFlip ==
+    /\ online
+    /\ pendingSource \in Slots
+    /\ pendingOutput \in Slots
+    /\ ~pageFlipPending
     /\ pageFlipPending' = TRUE
     /\ pageFlipComplete' = FALSE
-    /\ UNCHANGED <<slotState, slotGeneration, publishedGeneration,
-                  displayedGeneration, fencedGeneration, releasedGeneration,
-                  revokedGeneration, frontSlot, dmaReadSlots, dmaWriteSlots,
-                  setupPhase, online>>
+    /\ UNCHANGED <<sourceState, sourceGeneration, publishedGeneration,
+                  presentedGeneration, releasedGeneration, revokedGeneration,
+                  pendingSource, pendingOutput, pendingGeneration, frontOutput,
+                  acquireSyncSlot, acquireSyncGeneration, acquireSyncIssued,
+                  acquireSyncConsumed,
+                  gpuFenceComplete, dmaReadSlots, dmaWriteSlots, dmaCoherent,
+                  vfioBackingPinnable, vfioDmaMapped, setupPhase,
+                  evidencePublished, online>>
 
 CompletePageFlip ==
     /\ online
     /\ pageFlipPending
+    /\ gpuFenceComplete
     /\ ~pageFlipComplete
     /\ pageFlipComplete' = TRUE
-    /\ fencedGeneration' = pendingGeneration
-    /\ UNCHANGED <<slotState, slotGeneration, publishedGeneration,
-                  displayedGeneration, releasedGeneration, revokedGeneration,
-                  frontSlot, pendingSlot, pendingGeneration, pageFlipPending,
-                  dmaReadSlots, dmaWriteSlots, setupPhase, online>>
+    /\ UNCHANGED <<sourceState, sourceGeneration, publishedGeneration,
+                  presentedGeneration, releasedGeneration, revokedGeneration,
+                  pendingSource, pendingOutput, pendingGeneration, frontOutput,
+                  acquireSyncSlot, acquireSyncGeneration, acquireSyncIssued,
+                  acquireSyncConsumed,
+                  gpuFenceComplete, pageFlipPending, dmaReadSlots,
+                  dmaWriteSlots, dmaCoherent, vfioBackingPinnable,
+                  vfioDmaMapped, setupPhase, evidencePublished, online>>
 
-CommitPageFlip ==
+CommitPresentedOutput ==
     /\ online
     /\ pageFlipPending
     /\ pageFlipComplete
-    /\ pendingSlot \in Slots
-    /\ slotState[pendingSlot] = Ready
-    /\ slotGeneration[pendingSlot] = pendingGeneration
-    /\ slotState' = [s \in Slots |->
-         IF s = pendingSlot THEN Front
-         ELSE IF s = frontSlot THEN Free
-         ELSE slotState[s]]
+    /\ pendingSource \in Slots
+    /\ sourceState[pendingSource] = SourceInFlight
+    /\ sourceGeneration[pendingSource] = pendingGeneration
+    /\ sourceState' =
+         [sourceState EXCEPT ![pendingSource] = SourceFree]
     /\ releasedGeneration' =
-         IF frontSlot \in Slots
-         THEN [releasedGeneration EXCEPT ![frontSlot] = slotGeneration[frontSlot]]
-         ELSE releasedGeneration
-    /\ displayedGeneration' = pendingGeneration
-    /\ frontSlot' = pendingSlot
-    /\ pendingSlot' = NoSlot
+         [releasedGeneration EXCEPT ![pendingSource] = pendingGeneration]
+    /\ presentedGeneration' = pendingGeneration
+    /\ frontOutput' = pendingOutput
+    /\ pendingSource' = NoSlot
+    /\ pendingOutput' = NoSlot
     /\ pendingGeneration' = 0
+    /\ acquireSyncSlot' = NoSlot
+    /\ acquireSyncGeneration' = 0
+    /\ acquireSyncIssued' = FALSE
+    /\ acquireSyncConsumed' = FALSE
+    /\ gpuFenceComplete' = FALSE
     /\ pageFlipPending' = FALSE
     /\ pageFlipComplete' = FALSE
-    /\ UNCHANGED <<slotGeneration, publishedGeneration, fencedGeneration,
-                  revokedGeneration, dmaReadSlots, dmaWriteSlots, setupPhase,
+    /\ setupPhase' = RelayReady
+    /\ UNCHANGED <<sourceGeneration, publishedGeneration, revokedGeneration,
+                  dmaReadSlots, dmaWriteSlots, dmaCoherent,
+                  vfioBackingPinnable, vfioDmaMapped, evidencePublished,
                   online>>
+
+PublishPhysicalEvidence ==
+    /\ online
+    /\ setupPhase = RelayReady
+    /\ presentedGeneration > 0
+    /\ dmaReadSlots = Slots
+    /\ dmaWriteSlots = {}
+    /\ evidencePublished' = TRUE
+    /\ UNCHANGED <<sourceState, sourceGeneration, publishedGeneration,
+                  presentedGeneration, releasedGeneration, revokedGeneration,
+                  pendingSource, pendingOutput, pendingGeneration, frontOutput,
+                  acquireSyncSlot, acquireSyncGeneration, acquireSyncIssued,
+                  acquireSyncConsumed,
+                  gpuFenceComplete, pageFlipPending, pageFlipComplete,
+                  dmaReadSlots, dmaWriteSlots, dmaCoherent,
+                  vfioBackingPinnable, vfioDmaMapped, setupPhase, online>>
 
 GoOffline ==
     /\ online
     /\ online' = FALSE
-    /\ slotState' = [s \in Slots |-> Free]
-    /\ revokedGeneration' = [s \in Slots |-> slotGeneration[s]]
-    /\ frontSlot' = NoSlot
-    /\ pendingSlot' = NoSlot
+    /\ sourceState' = [s \in Slots |-> SourceFree]
+    /\ revokedGeneration' = [s \in Slots |-> sourceGeneration[s]]
+    /\ pendingSource' = NoSlot
+    /\ pendingOutput' = NoSlot
     /\ pendingGeneration' = 0
+    /\ acquireSyncSlot' = NoSlot
+    /\ acquireSyncGeneration' = 0
+    /\ acquireSyncIssued' = FALSE
+    /\ acquireSyncConsumed' = FALSE
+    /\ frontOutput' = NoSlot
+    /\ gpuFenceComplete' = FALSE
     /\ pageFlipPending' = FALSE
     /\ pageFlipComplete' = FALSE
     /\ dmaReadSlots' = {}
     /\ dmaWriteSlots' = {}
+    /\ vfioDmaMapped' = FALSE
     /\ setupPhase' = Offline
-    /\ UNCHANGED <<slotGeneration, publishedGeneration, displayedGeneration,
-                  fencedGeneration, releasedGeneration>>
+    /\ evidencePublished' = FALSE
+    /\ UNCHANGED <<sourceGeneration, publishedGeneration,
+                  presentedGeneration, releasedGeneration, dmaCoherent,
+                  vfioBackingPinnable>>
 
 Idle == UNCHANGED vars
 
 Next ==
+    \/ MapVfioPixelBacking
+    \/ OwnSourcePageMap
     \/ OpenExporter
-    \/ ImportReadOnlySlots
+    \/ ImportReadOnlySources
     \/ CompleteKmsSetup
-    \/ AcknowledgeRelay
-    \/ \E s \in Slots : Publish(s)
-    \/ \E s \in Slots : BeginDirectFlip(s)
+    \/ \E s \in Slots : PublishSource(s)
+    \/ ConfirmPeer
+    \/ \E s \in Slots : IssueAcquireSyncFile(s)
+    \/ \E s \in Slots, output \in Slots : BeginGpuComposition(s, output)
+    \/ CompleteGpuFence
+    \/ BeginAtomicPageFlip
     \/ CompletePageFlip
-    \/ CommitPageFlip
+    \/ CommitPresentedOutput
+    \/ PublishPhysicalEvidence
     \/ GoOffline
     \/ Idle
 
 TypeOK ==
-    /\ slotState \in [Slots -> {Free, Ready, Front}]
-    /\ slotGeneration \in [Slots -> 0..MaxGeneration]
+    /\ sourceState \in [Slots -> {SourceFree, SourceReady, SourceInFlight}]
+    /\ sourceGeneration \in [Slots -> 0..MaxGeneration]
     /\ publishedGeneration \in 0..MaxGeneration
-    /\ displayedGeneration \in 0..MaxGeneration
-    /\ fencedGeneration \in 0..MaxGeneration
+    /\ presentedGeneration \in 0..MaxGeneration
     /\ releasedGeneration \in [Slots -> 0..MaxGeneration]
     /\ revokedGeneration \in [Slots -> 0..MaxGeneration]
-    /\ frontSlot \in Slots \cup {NoSlot}
-    /\ pendingSlot \in Slots \cup {NoSlot}
+    /\ pendingSource \in Slots \cup {NoSlot}
+    /\ pendingOutput \in Slots \cup {NoSlot}
     /\ pendingGeneration \in 0..MaxGeneration
+    /\ acquireSyncSlot \in Slots \cup {NoSlot}
+    /\ acquireSyncGeneration \in 0..MaxGeneration
+    /\ acquireSyncIssued \in BOOLEAN
+    /\ acquireSyncConsumed \in BOOLEAN
+    /\ frontOutput \in Slots \cup {NoSlot}
+    /\ gpuFenceComplete \in BOOLEAN
     /\ pageFlipPending \in BOOLEAN
     /\ pageFlipComplete \in BOOLEAN
     /\ dmaReadSlots \subseteq Slots
     /\ dmaWriteSlots \subseteq Slots
-    /\ setupPhase \in {Bound, ExporterOpen, SlotsImported, KmsReady,
-                         RelayReady, Offline}
+    /\ dmaCoherent \in BOOLEAN
+    /\ vfioBackingPinnable \in BOOLEAN
+    /\ vfioDmaMapped \in BOOLEAN
+    /\ setupPhase \in {Bound, PageMapOwned, ExporterOpen, SourcesImported, KmsReady,
+                         PeerConfirmed, RelayReady, Offline}
+    /\ evidencePublished \in BOOLEAN
     /\ online \in BOOLEAN
 
 FixedTripleSlots == Cardinality(Slots) = 3
 
-AtMostOnePinnedFront == Cardinality(FrontSlots) <= 1
+AtMostOneInFlightSource == Cardinality(InFlightSources) <= 1
 
-DisplayedSlotRemainsPinned ==
-    frontSlot \in Slots =>
-        /\ slotState[frontSlot] = Front
-        /\ slotGeneration[frontSlot] = displayedGeneration
+PendingNamesPinnedSourceAndSeparateOutput ==
+    pendingSource \in Slots =>
+        /\ sourceState[pendingSource] = SourceInFlight
+        /\ sourceGeneration[pendingSource] = pendingGeneration
+        /\ pendingOutput \in Slots
+        /\ pendingOutput # frontOutput
 
-PendingNamesImmutableReadySlot ==
-    pageFlipPending =>
-        /\ pendingSlot \in Slots
-        /\ slotState[pendingSlot] = Ready
-        /\ slotGeneration[pendingSlot] = pendingGeneration
-        /\ pendingSlot # frontSlot
+NoOrphanInFlightSource ==
+    /\ (pendingSource = NoSlot => InFlightSources = {})
+    /\ (pendingSource \in Slots => InFlightSources = {pendingSource})
 
-FencePrecedesRelease ==
-    \A s \in Slots : releasedGeneration[s] <= fencedGeneration
+AcquireSyncStateIsCanonical ==
+    /\ (~acquireSyncIssued =>
+            /\ acquireSyncSlot = NoSlot
+            /\ acquireSyncGeneration = 0
+            /\ ~acquireSyncConsumed)
+    /\ (acquireSyncConsumed => acquireSyncIssued)
 
-NoReleaseOfCurrentFront ==
-    frontSlot \in Slots => releasedGeneration[frontSlot] < slotGeneration[frontSlot]
+UnconsumedAcquireNamesExactReadySource ==
+    acquireSyncIssued /\ ~acquireSyncConsumed =>
+        /\ pendingSource = NoSlot
+        /\ acquireSyncSlot \in ReadySources
+        /\ sourceGeneration[acquireSyncSlot] = acquireSyncGeneration
+
+GpuCompositionRequiresExternalAcquireSync ==
+    pendingSource \in Slots =>
+        /\ acquireSyncIssued
+        /\ acquireSyncConsumed
+        /\ acquireSyncSlot = pendingSource
+        /\ acquireSyncGeneration = pendingGeneration
+
+GpuFencePrecedesPageFlipCompletion == pageFlipComplete => gpuFenceComplete
+
+PageFlipCompletionRequiresPendingOutput ==
+    pageFlipComplete => pageFlipPending /\ pendingOutput \in Slots
+
+SourceReleaseRequiresPresentedOutput ==
+    \A s \in Slots : releasedGeneration[s] <= presentedGeneration
+
+NoReleaseOfCurrentSource ==
+    pendingSource \in Slots =>
+        releasedGeneration[pendingSource] < sourceGeneration[pendingSource]
 
 NoDeviceWriteAuthority == dmaWriteSlots = {}
 
+ReadAuthorityRequiresCoherentDma == dmaReadSlots # {} => dmaCoherent
+
+DmaAuthorityRequiresPinnableVfioBacking ==
+    dmaReadSlots # {} => vfioBackingPinnable /\ vfioDmaMapped
+
 SetupOrderPreservesReadOnlyAuthority ==
-    /\ (setupPhase \in {Bound, ExporterOpen} => dmaReadSlots = {})
-    /\ (setupPhase \in {SlotsImported, KmsReady, RelayReady} => dmaReadSlots = Slots)
+    /\ (setupPhase \in {Bound, PageMapOwned, ExporterOpen} => dmaReadSlots = {})
+    /\ (setupPhase \in {SourcesImported, KmsReady, PeerConfirmed, RelayReady} =>
+            dmaReadSlots = Slots)
 
-RelayReadinessRequiresCompleteSetup ==
+RelayReadinessRequiresCompletedGpuAndKms ==
     setupPhase = RelayReady =>
+        /\ presentedGeneration > 0
+        /\ frontOutput \in Slots
         /\ dmaReadSlots = Slots
-        /\ publishedGeneration > 0
 
-PageFlipRequiresRelayReadiness ==
-    pageFlipPending => setupPhase = RelayReady
+PhysicalEvidenceRequiresVfioBacking ==
+    evidencePublished => vfioBackingPinnable /\ vfioDmaMapped
 
-OfflineRevokesEverySlot ==
+PhysicalEvidenceRequiresZeroCopyComposition ==
+    evidencePublished =>
+        /\ online
+        /\ setupPhase = RelayReady
+        /\ presentedGeneration > 0
+        /\ dmaReadSlots = Slots
+        /\ dmaWriteSlots = {}
+        /\ frontOutput \in Slots
+
+OfflineRevokesEverySource ==
     ~online =>
-        /\ frontSlot = NoSlot
-        /\ pendingSlot = NoSlot
+        /\ pendingSource = NoSlot
+        /\ pendingOutput = NoSlot
+        /\ frontOutput = NoSlot
         /\ dmaReadSlots = {}
         /\ setupPhase = Offline
-        /\ \A s \in Slots : revokedGeneration[s] = slotGeneration[s]
+        /\ ~evidencePublished
+        /\ \A s \in Slots : revokedGeneration[s] = sourceGeneration[s]
 
 Spec == Init /\ [][Next]_vars
 =============================================================================

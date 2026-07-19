@@ -34,6 +34,9 @@ int rustos_gpu_runtime_open(int drm_fd, uint32_t output_width, uint32_t output_h
                             uint32_t atlas_width, uint32_t atlas_height,
                             uint32_t atlas_stride_bytes,
                             struct rustos_gpu_runtime **runtime_out);
+int rustos_gpu_runtime_import_dmabuf_sources(struct rustos_gpu_runtime *runtime,
+                                             const int *source_fds,
+                                             size_t source_count);
 int rustos_gpu_runtime_render_prime(struct rustos_gpu_runtime *runtime,
                                     struct rustos_gpu_frame *frame);
 int rustos_gpu_runtime_render_batch(struct rustos_gpu_runtime *runtime,
@@ -42,7 +45,7 @@ int rustos_gpu_runtime_render_batch(struct rustos_gpu_runtime *runtime,
                                     uint32_t damage_count,
                                     const uint8_t *batch, size_t batch_bytes,
                                     uint32_t binding_slot, uint64_t generation,
-                                    uint64_t sequence,
+                                    uint64_t sequence, int source_acquire_fence_fd,
                                     struct rustos_gpu_frame *frame);
 void rustos_gpu_runtime_presented(struct rustos_gpu_runtime *runtime,
                                   uint32_t output_index);
@@ -50,5 +53,6 @@ void rustos_gpu_runtime_close(struct rustos_gpu_runtime *runtime);
 const char *rustos_gpu_runtime_driver(const struct rustos_gpu_runtime *runtime);
 const char *rustos_gpu_runtime_renderer(const struct rustos_gpu_runtime *runtime);
 const char *rustos_gpu_runtime_stage(const struct rustos_gpu_runtime *runtime);
+int rustos_gpu_runtime_uses_dmabuf_sources(const struct rustos_gpu_runtime *runtime);
 
 #endif

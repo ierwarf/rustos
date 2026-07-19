@@ -14,8 +14,12 @@
 
 #include <linux/io.h>
 #include <linux/dma-buf.h>
+#include <linux/dma-fence.h>
+#include <linux/dma-map-ops.h>
 #include <linux/dma-mapping.h>
+#include <linux/file.h>
 #include <linux/fs.h>
+#include <linux/memremap.h>
 #include <linux/mm.h>
 #include <linux/miscdevice.h>
 #include <linux/module.h>
@@ -24,6 +28,7 @@
 #include <linux/overflow.h>
 #include <linux/scatterlist.h>
 #include <linux/string.h>
+#include <linux/sync_file.h>
 #include <linux/uaccess.h>
 #include <linux/uio_driver.h>
 #include <asm/pgtable.h>
@@ -69,10 +74,16 @@
 #define RUSTOS_GPU_ATLAS_PRIME_FENCE_OFFSET 2152
 #define RUSTOS_GPU_PRIME_COMPLETION_BYTES 64
 #define RUSTOS_GPU_RENDER_VERSION 1
+#define RUSTOS_GPU_RENDER_HEADER_BYTES 64
+#define RUSTOS_GPU_RENDER_SOURCE_BYTES 64
+#define RUSTOS_GPU_RENDER_COMMAND_BYTES 64
+#define RUSTOS_GPU_RENDER_MAX_COMMANDS 512
+#define RUSTOS_GPU_RENDER_MAX_BUDGET_US 50000
 #define RUSTOS_GPU_PRIME_READY 1
 #define RUSTOS_GPU_PIPELINE_PRIME_MAX_NS (500ULL * 1000ULL * 1000ULL)
 #define RUSTOS_GPU_ATLAS_FLAG_DVM_READ_ONLY 1
 #define RUSTOS_GPU_ATLAS_EXPORT_FLAG 1
+#define RUSTOS_GPU_ATLAS_SUBMIT_FLAG_DIRECT_DMABUF 2
 
 #define RUSTOS_GUI_MESSAGE_VERSION 1
 #define RUSTOS_GUI_MESSAGE_KIND_PRESENT 1
@@ -81,15 +92,25 @@
 #define RUSTOS_DVM_UIO_NAME "rustos-dvm-ivshmem-uio"
 #define RUSTOS_DVM_DMABUF_NAME "rustos-dvm-display-dmabuf"
 #define RUSTOS_DVM_DMABUF_IOCTL_EXPORT _IOW('R', 0x41, struct rustos_dvm_dmabuf_request)
+#define RUSTOS_DVM_DMABUF_IOCTL_ACQUIRE _IOW('R', 0x42, struct rustos_dvm_acquire_request)
 
 struct rustos_dvm_dmabuf_request {
 	__u32 slot;
 	__u32 flags;
 };
 
+struct rustos_dvm_acquire_request {
+	__u32 slot;
+	__u32 reserved;
+	__u64 generation;
+	__u64 sequence;
+	__u64 acquire_value;
+};
+
 struct rustos_dvm_dmabuf_export {
 	phys_addr_t phys;
 	size_t bytes;
+	struct dev_pagemap *pgmap;
 };
 
 struct rustos_dvm_ivshmem {
@@ -97,6 +118,8 @@ struct rustos_dvm_ivshmem {
 	struct miscdevice dmabuf_misc;
 	void __iomem *doorbell;
 	void __iomem *shared;
+	struct dev_pagemap pixel_pgmap;
+	void *pixels;
 	u64 slot_bytes;
 	u64 gpu_command_offset;
 	u64 gpu_atlas_offset;
@@ -109,6 +132,7 @@ struct rustos_dvm_ivshmem {
 	atomic_t gpu_prime_ready;
 	atomic64_t invitation_generation;
 	atomic64_t control_sequence;
+	u64 acquired_values[RUSTOS_GPU_ATLAS_SLOT_COUNT];
 	struct mutex control_lock;
 };
 
@@ -120,6 +144,9 @@ static const u8 rustos_gpu_completion_magic[] = "RSGPUC01";
 static const u8 rustos_gpu_render_completion_magic[] = "RSGPUD01";
 static const u8 rustos_gpu_present_completion_magic[] = "RSGPUF01";
 static const u8 rustos_gpu_prime_completion_magic[] = "RSGPUP01";
+
+static int rustos_dvm_gpu_acquire_sync_fd(struct rustos_dvm_ivshmem *state,
+					   unsigned long argument);
 
 static struct sg_table *rustos_dvm_dmabuf_map(struct dma_buf_attachment *attachment,
 					      enum dma_data_direction direction)
@@ -136,7 +163,14 @@ static struct sg_table *rustos_dvm_dmabuf_map(struct dma_buf_attachment *attachm
 	 * RustOS-owned pixels. Explicit device-to-memory imports stay forbidden. */
 	if (direction != DMA_TO_DEVICE && direction != DMA_BIDIRECTIONAL)
 		return ERR_PTR(-EPERM);
-	if (!export || !export->bytes || export->phys & ~PAGE_MASK || export->bytes & ~PAGE_MASK)
+	/* The producer lives in a different VM, so this exporter cannot perform a
+	 * meaningful guest-side cache clean on its behalf. The enabled x86 AMD
+	 * topology is coherent; reject any future non-coherent attachment instead
+	 * of silently relying on DMA_ATTR_SKIP_CPU_SYNC there. */
+	if (!dev_is_dma_coherent(attachment->dev))
+		return ERR_PTR(-EOPNOTSUPP);
+	if (!export || !export->pgmap || !export->bytes ||
+	    export->phys & ~PAGE_MASK || export->bytes & ~PAGE_MASK)
 		return ERR_PTR(-EINVAL);
 	pages = export->bytes >> PAGE_SHIFT;
 	table = kzalloc(sizeof(*table), GFP_KERNEL);
@@ -149,7 +183,10 @@ static struct sg_table *rustos_dvm_dmabuf_map(struct dma_buf_attachment *attachm
 	for_each_sg(table->sgl, entry, pages, index) {
 		unsigned long pfn = PHYS_PFN(export->phys) + index;
 
-		if (!pfn_valid(pfn)) {
+		if (!pfn_valid(pfn) || !pgmap_pfn_valid(export->pgmap, pfn) ||
+		    pfn_to_page(pfn)->pgmap != export->pgmap) {
+			pr_err_ratelimited("rustos-dvm-display: DMA-BUF page-map ownership lost pfn=%#lx\n",
+					   pfn);
 			sg_free_table(table);
 			kfree(table);
 			return ERR_PTR(-ENXIO);
@@ -158,6 +195,9 @@ static struct sg_table *rustos_dvm_dmabuf_map(struct dma_buf_attachment *attachm
 	}
 	if (dma_map_sgtable(attachment->dev, table, DMA_TO_DEVICE,
 			    DMA_ATTR_SKIP_CPU_SYNC)) {
+		dev_err_ratelimited(attachment->dev,
+				    "rustos-dvm-display: GPU DMA-BUF map failed phys=%pa bytes=%zu\n",
+				    &export->phys, export->bytes);
 		sg_free_table(table);
 		kfree(table);
 		return ERR_PTR(-EIO);
@@ -188,6 +228,7 @@ static void rustos_dvm_dmabuf_release(struct dma_buf *dmabuf)
 	struct rustos_dvm_dmabuf_export *export = dmabuf->priv;
 
 	if (export) {
+		put_dev_pagemap(export->pgmap);
 		memzero_explicit(export, sizeof(*export));
 		kfree(export);
 	}
@@ -227,8 +268,11 @@ static long rustos_dvm_dmabuf_ioctl(struct file *file, unsigned int command,
 	struct rustos_dvm_dmabuf_export *export;
 	DEFINE_DMA_BUF_EXPORT_INFO(info);
 	struct dma_buf *dmabuf;
+	phys_addr_t end_phys;
 	int fd;
 
+	if (command == RUSTOS_DVM_DMABUF_IOCTL_ACQUIRE)
+		return rustos_dvm_gpu_acquire_sync_fd(state, argument);
 	if (command != RUSTOS_DVM_DMABUF_IOCTL_EXPORT ||
 	    copy_from_user(&request, (void __user *)argument, sizeof(request)))
 		return -EINVAL;
@@ -239,8 +283,10 @@ static long rustos_dvm_dmabuf_ioctl(struct file *file, unsigned int command,
 	if (!export)
 		return -ENOMEM;
 	if (request.flags == RUSTOS_GPU_ATLAS_EXPORT_FLAG) {
-		if (!state->gpu_atlas_offset || !state->gpu_atlas_slot_bytes)
+		if (!state->gpu_atlas_offset || !state->gpu_atlas_slot_bytes) {
+			kfree(export);
 			return -ENODEV;
+		}
 		export->phys = RUSTOS_GUI_PIXEL_REGION_PHYS + state->gpu_atlas_offset +
 			       request.slot * state->gpu_atlas_slot_bytes;
 		export->bytes = state->gpu_atlas_slot_bytes;
@@ -249,6 +295,17 @@ static long rustos_dvm_dmabuf_ioctl(struct file *file, unsigned int command,
 			       request.slot * state->slot_bytes;
 		export->bytes = state->slot_bytes;
 	}
+	if (check_add_overflow(export->phys, export->bytes - 1U, &end_phys)) {
+		kfree(export);
+		return -EOVERFLOW;
+	}
+	export->pgmap = get_dev_pagemap(PHYS_PFN(export->phys), NULL);
+	if (!export->pgmap ||
+	    !pgmap_pfn_valid(export->pgmap, PHYS_PFN(end_phys))) {
+		put_dev_pagemap(export->pgmap);
+		kfree(export);
+		return -ENXIO;
+	}
 	info.ops = &rustos_dvm_dmabuf_ops;
 	info.size = export->bytes;
 	info.flags = O_RDONLY;
@@ -256,6 +313,7 @@ static long rustos_dvm_dmabuf_ioctl(struct file *file, unsigned int command,
 	dmabuf = dma_buf_export(&info);
 	if (IS_ERR(dmabuf)) {
 		fd = PTR_ERR(dmabuf);
+		put_dev_pagemap(export->pgmap);
 		kfree(export);
 		return fd;
 	}
@@ -288,6 +346,182 @@ static u64 rustos_dvm_read_le64(const u8 *bytes)
 	for (index = 0; index < sizeof(value); index++)
 		value |= (u64)bytes[index] << (index * 8);
 	return value;
+}
+
+static bool rustos_dvm_copy_pixels(struct rustos_dvm_ivshmem *state,
+				   u64 physical, void *destination,
+				   size_t bytes)
+{
+	u64 offset;
+	u64 end;
+
+	if (!state || !state->pixels || !destination || !bytes ||
+	    physical < RUSTOS_GUI_PIXEL_REGION_PHYS)
+		return false;
+	offset = physical - RUSTOS_GUI_PIXEL_REGION_PHYS;
+	if (check_add_overflow(offset, (u64)bytes, &end) ||
+	    end > RUSTOS_GUI_PIXEL_REGION_BYTES)
+		return false;
+	memcpy(destination, (u8 *)state->pixels + offset, bytes);
+	return true;
+}
+
+static bool rustos_dvm_valid_gpu_acquire(
+	struct rustos_dvm_ivshmem *state,
+	const struct rustos_dvm_acquire_request *request)
+{
+	u8 command[64];
+	u8 batch[128];
+	u32 batch_bytes;
+	u32 command_count;
+	u32 damage_count;
+	u64 command_phys;
+	u64 damage_bytes;
+	u64 batch_phys;
+	u64 batch_end;
+	u64 expected_batch_bytes;
+	u64 slot_end;
+
+	if (!state || !request || request->reserved ||
+	    !atomic_read(&state->relay_ready) ||
+	    request->slot >= RUSTOS_GPU_ATLAS_SLOT_COUNT ||
+	    !request->generation || !request->sequence || !request->acquire_value)
+		return false;
+
+	/* The host publishes pixels and the exact command record before ringing
+	 * MSI-X. The UIO read precedes this ioctl; complete the device-to-CPU
+	 * acquire ordering before validating the shared generation and issuing a
+	 * sync_file that the GPU command stream will wait on. */
+	dma_rmb();
+	if (readq(state->shared + RUSTOS_GPU_ATLAS_INVITATION_OFFSET +
+		  request->slot * sizeof(u64)) != request->sequence ||
+	    readq(state->shared + RUSTOS_GPU_ATLAS_COMPLETION_ACK_OFFSET +
+		  request->slot * sizeof(u64)) == request->sequence)
+		return false;
+
+	if (check_mul_overflow((u64)request->slot,
+			       (u64)RUSTOS_GPU_ATLAS_COMMAND_SLOT_BYTES,
+			       &command_phys) ||
+	    check_add_overflow(command_phys, state->gpu_command_offset,
+			       &command_phys) ||
+	    check_add_overflow(command_phys, RUSTOS_GUI_PIXEL_REGION_PHYS,
+			       &command_phys))
+		return false;
+	if (!rustos_dvm_copy_pixels(state, command_phys, command,
+				    sizeof(command)))
+		return false;
+
+	batch_bytes = rustos_dvm_read_le32(command + 20);
+	damage_count = rustos_dvm_read_le32(command + 56);
+	if (memcmp(command, rustos_gpu_submit_magic, 8) ||
+	    rustos_dvm_read_le32(command + 8) != RUSTOS_GPU_ATLAS_VERSION ||
+	    rustos_dvm_read_le32(command + 12) != sizeof(command) ||
+	    rustos_dvm_read_le32(command + 16) != request->slot ||
+	    rustos_dvm_read_le64(command + 24) != request->generation ||
+	    rustos_dvm_read_le64(command + 32) != request->sequence ||
+	    !rustos_dvm_read_le32(command + 40) ||
+	    rustos_dvm_read_le32(command + 44) !=
+		    RUSTOS_GPU_ATLAS_SUBMIT_FLAG_DIRECT_DMABUF ||
+	    !rustos_dvm_read_le64(command + 48) ||
+	    damage_count > RUSTOS_GPU_ATLAS_MAX_DAMAGE_RECTS ||
+	    memchr_inv(command + 60, 0, 4) || batch_bytes < sizeof(batch) ||
+	    check_mul_overflow((u64)damage_count,
+			       (u64)RUSTOS_GPU_ATLAS_DAMAGE_BYTES,
+			       &damage_bytes) ||
+	    check_add_overflow(command_phys, (u64)sizeof(command), &batch_phys) ||
+	    check_add_overflow(batch_phys, damage_bytes, &batch_phys) ||
+	    check_add_overflow(batch_phys, (u64)batch_bytes, &batch_end) ||
+	    check_add_overflow(command_phys,
+			       (u64)RUSTOS_GPU_ATLAS_COMMAND_SLOT_BYTES,
+			       &slot_end) || batch_end > slot_end)
+		return false;
+
+	if (!rustos_dvm_copy_pixels(state, batch_phys, batch, sizeof(batch)))
+		return false;
+	command_count = rustos_dvm_read_le32(batch + 20);
+	if (!command_count || command_count > RUSTOS_GPU_RENDER_MAX_COMMANDS ||
+	    check_mul_overflow((u64)command_count,
+			       (u64)RUSTOS_GPU_RENDER_COMMAND_BYTES,
+			       &expected_batch_bytes) ||
+	    check_add_overflow(expected_batch_bytes,
+			       (u64)RUSTOS_GPU_RENDER_HEADER_BYTES +
+			       RUSTOS_GPU_RENDER_SOURCE_BYTES,
+			       &expected_batch_bytes) ||
+	    expected_batch_bytes != batch_bytes)
+		return false;
+	return !memcmp(batch, "RSGPU001", 8) &&
+	       rustos_dvm_read_le32(batch + 8) == 1 &&
+	       rustos_dvm_read_le32(batch + 12) == RUSTOS_GPU_RENDER_HEADER_BYTES &&
+	       rustos_dvm_read_le32(batch + 16) == RUSTOS_GPU_RENDER_COMMAND_BYTES &&
+	       rustos_dvm_read_le32(batch + 24) != 0 &&
+	       rustos_dvm_read_le32(batch + 28) ==
+		       rustos_dvm_read_le32(command + 40) &&
+	       rustos_dvm_read_le64(batch + 32) != 0 &&
+	       rustos_dvm_read_le64(batch + 40) == request->acquire_value &&
+	       request->acquire_value <= rustos_dvm_read_le64(batch + 32) &&
+	       rustos_dvm_read_le32(batch + 48) != 0 &&
+	       rustos_dvm_read_le32(batch + 48) <= RUSTOS_GPU_RENDER_MAX_BUDGET_US &&
+	       rustos_dvm_read_le32(batch + 52) == 1 &&
+	       rustos_dvm_read_le32(batch + 56) == 1 &&
+	       !memchr_inv(batch + 60, 0, 4) &&
+	       rustos_dvm_read_le64(batch + 64) != 0 &&
+	       rustos_dvm_read_le64(batch + 72) == request->generation &&
+	       rustos_dvm_read_le64(batch + 80) == request->acquire_value &&
+	       rustos_dvm_read_le32(batch + 88) == state->gpu_atlas_width &&
+	       rustos_dvm_read_le32(batch + 92) == state->gpu_atlas_height &&
+	       rustos_dvm_read_le32(batch + 96) == state->gpu_atlas_stride &&
+	       rustos_dvm_read_le32(batch + 100) == 1 &&
+	       rustos_dvm_read_le32(batch + 104) == 3 &&
+	       rustos_dvm_read_le32(batch + 108) == request->slot &&
+	       rustos_dvm_read_le64(batch + 112) ==
+		       rustos_dvm_read_le64(command + 48) &&
+	       !memchr_inv(batch + 120, 0, 8);
+}
+
+static int rustos_dvm_gpu_acquire_sync_fd(struct rustos_dvm_ivshmem *state,
+					   unsigned long argument)
+{
+	struct rustos_dvm_acquire_request request;
+	struct dma_fence *fence;
+	struct sync_file *sync_file;
+	int fd;
+	int result;
+
+	if (copy_from_user(&request, (void __user *)argument, sizeof(request)))
+		return -EFAULT;
+	if (!state)
+		return -ENODEV;
+	fd = get_unused_fd_flags(O_CLOEXEC);
+	if (fd < 0)
+		return fd;
+	result = 0;
+	mutex_lock(&state->control_lock);
+	if (request.slot >= RUSTOS_GPU_ATLAS_SLOT_COUNT ||
+	    request.acquire_value <= state->acquired_values[request.slot] ||
+	    !rustos_dvm_valid_gpu_acquire(state, &request)) {
+		result = -EPERM;
+		goto out_unlock;
+	}
+	fence = dma_fence_get_stub();
+	if (!fence) {
+		result = -ENOMEM;
+		goto out_unlock;
+	}
+	sync_file = sync_file_create(fence);
+	dma_fence_put(fence);
+	if (!sync_file) {
+		result = -ENOMEM;
+		goto out_unlock;
+	}
+	state->acquired_values[request.slot] = request.acquire_value;
+	mutex_unlock(&state->control_lock);
+	fd_install(fd, sync_file->file);
+	return fd;
+
+out_unlock:
+	mutex_unlock(&state->control_lock);
+	put_unused_fd(fd);
+	return result;
 }
 
 static bool rustos_dvm_valid_gpu_atlas_header(const u8 *bytes)
@@ -568,7 +802,6 @@ static bool rustos_dvm_valid_gpu_completion(struct rustos_dvm_ivshmem *state,
 {
 	u8 command[64];
 	u8 batch_header[64];
-	void *mapped;
 	u32 slot;
 	u32 batch_bytes;
 	u32 damage_count;
@@ -615,11 +848,9 @@ static bool rustos_dvm_valid_gpu_completion(struct rustos_dvm_ivshmem *state,
 	    check_add_overflow(command_phys, RUSTOS_GUI_PIXEL_REGION_PHYS,
 			       &command_phys))
 		return false;
-	mapped = memremap(command_phys, sizeof(command), MEMREMAP_WB);
-	if (!mapped)
+	if (!rustos_dvm_copy_pixels(state, command_phys, command,
+				    sizeof(command)))
 		return false;
-	memcpy(command, mapped, sizeof(command));
-	memunmap(mapped);
 	batch_bytes = rustos_dvm_read_le32(command + 20);
 	damage_count = rustos_dvm_read_le32(command + 56);
 	if (memcmp(command, rustos_gpu_submit_magic, 8) ||
@@ -644,11 +875,9 @@ static bool rustos_dvm_valid_gpu_completion(struct rustos_dvm_ivshmem *state,
 			       (u64)RUSTOS_GPU_ATLAS_COMMAND_SLOT_BYTES,
 			       &slot_end) || batch_end > slot_end)
 		return false;
-	mapped = memremap(batch_phys, sizeof(batch_header), MEMREMAP_WB);
-	if (!mapped)
+	if (!rustos_dvm_copy_pixels(state, batch_phys, batch_header,
+				    sizeof(batch_header)))
 		return false;
-	memcpy(batch_header, mapped, sizeof(batch_header));
-	memunmap(mapped);
 	if (memcmp(batch_header, "RSGPU001", 8))
 		return false;
 	context_id = rustos_dvm_read_le32(batch_header + 24);
@@ -723,16 +952,19 @@ static ssize_t rustos_dvm_display_offline_store(struct device *dev,
 
 	if (!state || count != 8 || memcmp(buf, "offline\n", 8))
 		return -EINVAL;
+	mutex_lock(&state->control_lock);
 	atomic_set(&state->host_invited, 0);
 	atomic_set(&state->relay_ready, 0);
 	atomic_set(&state->gpu_prime_ready, 0);
 	atomic64_set(&state->invitation_generation, 0);
+	memset(state->acquired_values, 0, sizeof(state->acquired_values));
 	writeq(0, state->shared + RUSTOS_GUI_POOL_READY_ACK_OFFSET);
 	memset_io(state->shared + RUSTOS_GPU_ATLAS_PRIME_COMPLETION_OFFSET, 0,
 		  RUSTOS_GPU_PRIME_COMPLETION_BYTES);
 	wmb();
 	iowrite32(RUSTOS_DVM_HOST_OFFLINE_VECTOR,
 		  state->doorbell + RUSTOS_IVSHMEM_DOORBELL_OFFSET);
+	mutex_unlock(&state->control_lock);
 	return count;
 }
 static DEVICE_ATTR_WO(rustos_dvm_display_offline);
@@ -825,6 +1057,19 @@ static int rustos_dvm_ivshmem_probe(struct pci_dev *pdev,
 	state = devm_kzalloc(&pdev->dev, sizeof(*state), GFP_KERNEL);
 	if (!state)
 		return -ENOMEM;
+	if (!devm_request_mem_region(&pdev->dev, RUSTOS_GUI_PIXEL_REGION_PHYS,
+				     RUSTOS_GUI_PIXEL_REGION_BYTES,
+				     "rustos-dvm-display-pixels"))
+		return -EBUSY;
+	state->pixel_pgmap.type = MEMORY_DEVICE_GENERIC;
+	state->pixel_pgmap.range.start = RUSTOS_GUI_PIXEL_REGION_PHYS;
+	state->pixel_pgmap.range.end = RUSTOS_GUI_PIXEL_REGION_PHYS +
+		RUSTOS_GUI_PIXEL_REGION_BYTES - 1U;
+	state->pixel_pgmap.nr_range = 1;
+	state->pixel_pgmap.owner = state;
+	state->pixels = devm_memremap_pages(&pdev->dev, &state->pixel_pgmap);
+	if (IS_ERR(state->pixels))
+		return PTR_ERR(state->pixels);
 	state->doorbell = pcim_iomap(pdev, RUSTOS_IVSHMEM_REGISTERS_BAR,
 				    RUSTOS_IVSHMEM_DOORBELL_OFFSET + sizeof(u32));
 	if (!state->doorbell)
@@ -856,6 +1101,7 @@ static int rustos_dvm_ivshmem_probe(struct pci_dev *pdev,
 	atomic_set(&state->gpu_prime_ready, 0);
 	atomic64_set(&state->invitation_generation, 0);
 	atomic64_set(&state->control_sequence, 0);
+	memset(state->acquired_values, 0, sizeof(state->acquired_values));
 	mutex_init(&state->control_lock);
 	/*
 	 * A RustOS present can precede Linux-DVM boot. ivshmem has no retained

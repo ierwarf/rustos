@@ -146,18 +146,26 @@ generation and whose source mapping is unchanged; retained content generation
 is not release authority. An uninitialized/stale slot, a source replacement,
 or full damage forces a complete copy. The DVM module requires matching
 control/pixel headers, exposes only WB read-only pixel pages to its relay, and
-rejects writable VMAs. Each immutable slot is also exported as a read-only
-DMA-BUF. Standard DRM PRIME may request a bidirectional import, but the exporter
+rejects writable VMAs. Before export, the module owns the complete fixed pixel
+aperture through one `MEMORY_DEVICE_GENERIC` `dev_pagemap`; every exported PFN
+must remain inside that live page-map. A raw guest-physical range that is merely
+CPU-readable through `memremap()` is not sufficient DMA backing. Each immutable
+slot is then exported as a read-only DMA-BUF. Standard DRM PRIME may request a bidirectional import, but the exporter
 maps its scatterlist as `DMA_TO_DEVICE`; device-to-memory mapping is rejected.
-The specification-only physical AMD mode requires the relay to import those
-three slots directly as KMS framebuffers, avoid a guest-owned scanout copy, and
-keep the current front slot pinned. The present runnable relay does not contain
-that DMA-BUF consumer; these are failed implementation and hardware gates, not
-claims about the staged-copy GPU-command path. A future consumer must validate
-each release against the matching host record before it writes the one
-outstanding control sequence. Its MSI-X leaf may only mark pending state in IRQ
-context; normal context must check the exact readiness invitation, confirmation,
-release generation, and ACK.
+Because the producer is in another VM and cannot participate in guest-side
+cache maintenance, the exporter also rejects a non-coherent DMA attachment;
+the enabled x86 AMD topology must report coherent DMA before
+`DMA_ATTR_SKIP_CPU_SYNC` is permitted.
+The physical AMD mode imports those three slots as read-only EGL DMA-BUF source
+images, composes with GLES into a separate three-buffer GBM scanout pool, waits
+an explicit native fence, and submits an atomic KMS page flip. It never uploads
+the source with `glTexSubImage2D` and cannot report physical readiness through
+the virtio staged-copy fallback. This source implementation and the model do
+not substitute for the still-required physical import, page-flip, and sustained
+performance capture. The consumer validates each release against the matching
+host record before it writes the one outstanding control sequence. Its MSI-X
+leaf may only mark pending state in IRQ context; normal context checks the exact
+readiness invitation, confirmation, release generation, and ACK.
 Only a completed page-flip fences the replacement front and releases the old
 front; the new front is not reusable until a later fenced flip. An offline
 notification clears readiness confirmation and revokes all slot authority. If a restart finds all
@@ -191,8 +199,15 @@ geometry, stride, and content epoch. A batch that binds a second source, uses a
 slot outside `0..2`, names an empty/out-of-atlas subrectangle, or rebinds a token
 is a protocol error. RustOS owns the context id, epoch, monotonic
 acquire/submit/completion/release values, queue admission, and reset.
-The acquire value names an independently signalled RustOS source fence, never a
-numerically plausible submit value. Timeout, context loss, or revoke invalidates
+The acquire value names an exact RustOS CPU-producer release, never a
+numerically plausible submit value. In physical AMD mode the root-only DVM
+exporter accepts it only after the live invitation, slot, generation, sequence,
+bounded batch, geometry, stride, and content epoch all match shared state. A
+device-to-CPU acquire barrier then precedes creation of an already-signalled,
+one-use `sync_file`; EGL imports that fd and inserts `eglWaitSyncKHR` into the
+GPU command stream before the source texture can be sampled. The fd cannot be
+replayed and is distinct from the later GPU render and KMS present fences.
+Timeout, context loss, or revoke invalidates
 every unfinished command and all source/output authority in the epoch; an old
 completion cannot revive the reset context. The DVM may write only DVM-private
 render targets and receives only device-read authority to RustOS sources. A
@@ -211,22 +226,29 @@ implements `source-path=staged-copy zero-copy=0`: only damaged atlas rectangles
 are copied once into a virtio-GPU texture, after which the fixed GLES commands
 perform the actual composition into a DVM-private output. This is a valid
 GPU-composition test but can never satisfy the physical zero-copy gate. The
-physical AMD `source-path=dmabuf zero-copy=1` mode remains a specification and
-failed implementation gate: the module retains the read-only DMA-BUF exporter,
-but the old relay consumer was unreachable because the mandatory V3 atlas
-parser always selected the GPU-command branch. That dead branch and its
-CPU-composed-frame renderer were removed rather than claimed as hardware
-support. A future physical implementation must select an explicit authenticated
-mode and import the same atlas slot read-only; it must not infer a mode from an
-impossible zero-sized atlas or revive the retired renderer. Direct scanout is a
-separate future optimization admitted only for one opaque, untransformed,
-full-screen source; ordinary multi-layer frames still require GPU composition.
-The DVM relay-to-agent readiness lock is schema 2 and names the runnable mode
-exactly as `MODE=gpu-compositor-staged-copy`, `ZERO_COPY=0`,
-`GPU_COMPOSITION=1`, and `EXPLICIT_FENCE=1`. The agent accepts that complete
-payload while the relay holds its lock; the old direct-scanout label is
-rejected. `xtask check` cross-checks both C sources so readiness evidence cannot
-claim a transport that did not run. The display process first owns a singleton
+physical AMD `source-path=dmabuf zero-copy=1` implementation opens the root-only
+exporter, imports all three immutable atlas slots as EGLImages, samples them
+read-only in the same fixed GLES vocabulary only after the exact kernel-issued
+acquire `sync_file` has been server-waited, emits a native GPU completion fence,
+and immediately supplies that possibly-unsignalled fd to KMS `IN_FENCE_FD`.
+The relay does not serialize the GPU and vblank with a CPU pre-wait; one bounded
+poll collects render completion, the DRM page-flip event, and the CRTC
+out-fence before publishing completion. Generation,
+content epoch, submit value, and transport sequence must all advance before a
+source is accepted. The old unreachable zero-atlas branch and its
+CPU-composed-frame renderer remain retired. Direct scanout without composition
+is only a possible later optimization for one opaque, untransformed full-screen
+source; it is not claimed by evidence-v2 or required for ordinary multi-layer
+frames.
+The DVM relay-to-agent readiness lock is mode-exact. Virtio fallback retains
+schema 2 with `MODE=gpu-compositor-staged-copy`, `ZERO_COPY=0`,
+`GPU_COMPOSITION=1`, and `EXPLICIT_FENCE=1`. An amdgpu-bound agent instead
+requires schema 3 with `MODE=gpu-compositor-dmabuf-source`, `SOURCE_PATH=dmabuf`,
+zero copy, GPU composition, explicit fence, atomic KMS, exactly three scanout
+buffers, no staged damage copy, and no CPU final composition. Cross-mode
+payloads fail closed while the relay holds its lock; the old direct-scanout
+label remains rejected. `xtask check` cross-checks both C sources so readiness
+cannot claim a transport that did not run. The display process first owns a singleton
 lock, writes and fsyncs the exact payload on one locked fixed-name candidate,
 and atomically renames that inode to the ready path. Ordinary failure closes
 the ready lock before scheduler restoration; process exit and the RT hard limit
@@ -281,15 +303,18 @@ and GPU-output-to-KMS handoff together. The relay publishes readiness only
 after a validated command batch completes GPU and present fences; a
 CPU-composed snapshot can no longer activate it. The app-visible 2D/3D ABI is
 deliberately the next boundary, not part of this private compositor slice.
-Physical AMD read-only atlas import, direct scanout, and zero-copy capture remain
-failed gates rather than CPU fallbacks.
+Physical AMD read-only atlas import, zero-copy source consumption, and atomic
+scanout capture remain failed hardware gates rather than CPU fallbacks.
 
 The enabled physical release profile is AMDGPU-only. Its signed schema-3 device
 policy binds `amdgpu` plus PCI `1002:1900` and nominal-60-Hz throughput,
 page-flip completion latency, atomic-commit latency, freshness, and consecutive
 sample bounds. The relay atomically publishes one sequence-numbered sample per
 second from completed DRM page-flip events; the authenticated DVM agent exposes
-it through `display-evidence-v1`. Hostd admits readiness only after five fresh
+it through `display-evidence-v2`. That ABI additionally requires
+`SOURCE_PATH=dmabuf`, GPU composition, an explicit fence, atomic KMS, exactly
+three scanout buffers, and no staged damage copy. Hostd admits readiness only
+after five fresh
 consecutive samples and requires the sequence to keep advancing during health
 checks. A wrong host/DVM identity, CPU-copy path, stale or restarted sequence,
 low page-flip rate, or excessive latency revokes readiness and enters bounded

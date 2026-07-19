@@ -60,7 +60,7 @@ for assignment in \
     'control-state=control' \
     'control-transport=kvm-vsock' \
     'control-authentication=dvm-agent-hmac-sha256-v1' \
-    'control-capabilities=health,device-inventory,driver-inventory,display-evidence-v1,input-stream' \
+    'control-capabilities=health,device-inventory,driver-inventory,display-evidence-v2,input-stream' \
     'buildroot_version=2026.05' \
     'linux_version=6.12.94' \
     'nvidia-open-version=580.173.02' \
@@ -102,6 +102,12 @@ sources_lock_sha256:rustos-linux-dvm-x86_64.sources.lock
 control-contract-sha256:rustos-linux-dvm-x86_64.control.env
 EOF
 
+grep -qx 'BR2_PACKAGE_ACPID=y' \
+    "$artifact_dir/rustos-linux-dvm-x86_64.config" || {
+    echo "rustos-linux-dvm: release configuration lacks bounded ACPI shutdown" >&2
+    exit 1
+}
+
 "$(dirname -- "$0")/verify-kernel-config.sh" \
     "$artifact_dir/rustos-linux-dvm-x86_64.kernel.config"
 openssl x509 -inform DER \
@@ -128,7 +134,7 @@ for required in \
     'CONTROL_STATE=control' \
     'CONTROL_TRANSPORT=kvm-vsock' \
     'CONTROL_AUTHENTICATION=dvm-agent-hmac-sha256-v1' \
-    'CONTROL_CAPABILITIES=health,device-inventory,driver-inventory,display-evidence-v1,input-stream'; do
+    'CONTROL_CAPABILITIES=health,device-inventory,driver-inventory,display-evidence-v2,input-stream'; do
     grep -qx "$required" "$artifact_dir/rustos-linux-dvm-x86_64.control.env" || {
         echo "rustos-linux-dvm: packaged control contract lacks $required" >&2
         exit 1

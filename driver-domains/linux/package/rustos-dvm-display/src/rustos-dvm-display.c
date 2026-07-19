@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
@@ -46,8 +47,8 @@
 #define RUSTOS_DVM_DISPLAY_READY_NAME "display-ready.lock"
 #define RUSTOS_DVM_DISPLAY_OWNER_NAME "display-owner.lock"
 #define RUSTOS_DVM_DISPLAY_READY_CANDIDATE ".display-ready.next"
-#define RUSTOS_DVM_DISPLAY_EVIDENCE "/run/rustos-dvm/display-evidence-v1.env"
-#define RUSTOS_DVM_DISPLAY_EVIDENCE_TEMP "/run/rustos-dvm/display-evidence-v1.env.tmp"
+#define RUSTOS_DVM_DISPLAY_EVIDENCE "/run/rustos-dvm/display-evidence-v2.env"
+#define RUSTOS_DVM_DISPLAY_EVIDENCE_TEMP "/run/rustos-dvm/display-evidence-v2.env.tmp"
 #define GUI_POOL_MAGIC "RSGUI002"
 #define GUI_POOL_VERSION 2U
 #define GUI_POOL_HEADER_BYTES 4096U
@@ -82,6 +83,26 @@
 #define GPU_RENDER_VERSION 1U
 #define SCANOUT_BUFFER_COUNT 3U
 #define NO_SCANOUT_BUFFER UINT32_MAX
+#define RUSTOS_DVM_DMABUF_DEVICE "/dev/rustos-dvm-display-dmabuf"
+#define RUSTOS_DVM_DMABUF_EXPORT_ATLAS 1U
+
+struct rustos_dvm_dmabuf_request {
+    uint32_t slot;
+    uint32_t flags;
+};
+
+struct rustos_dvm_acquire_request {
+    uint32_t slot;
+    uint32_t reserved;
+    uint64_t generation;
+    uint64_t sequence;
+    uint64_t acquire_value;
+};
+
+#define RUSTOS_DVM_DMABUF_IOCTL_EXPORT \
+    _IOW('R', 0x41, struct rustos_dvm_dmabuf_request)
+#define RUSTOS_DVM_DMABUF_IOCTL_ACQUIRE \
+    _IOW('R', 0x42, struct rustos_dvm_acquire_request)
 
 /*
  * Multiple DVM services share the serial tty. stdio may split one formatted
@@ -283,6 +304,7 @@ struct atomic_property_ids {
 
 struct kms_display {
     int fd;
+    int source_exporter_fd;
     const char *setup_stage;
     uint32_t connector_id;
     uint32_t crtc_id;
@@ -761,6 +783,40 @@ static uint32_t select_crtc(const drmModeRes *resources, const drmModeEncoder *e
     return 0U;
 }
 
+static uint32_t select_connector_crtc(int fd, const drmModeRes *resources,
+                                      const drmModeConnector *connector) {
+    uint32_t index;
+    if (connector->encoder_id != 0U) {
+        drmModeEncoder *encoder = drmModeGetEncoder(fd, connector->encoder_id);
+        if (encoder != NULL) {
+            uint32_t crtc = select_crtc(resources, encoder);
+            drmModeFreeEncoder(encoder);
+            if (crtc != 0U)
+                return crtc;
+        }
+    }
+    /* A freshly initialized passthrough GPU can report a connected eDP panel
+     * without a currently bound encoder. Atomic modesetting is allowed to pick
+     * one of the connector's possible encoders; requiring encoder_id would
+     * make first boot depend on stale firmware display state. */
+    if (connector->count_encoders <= 0 || connector->encoders == NULL)
+        return 0U;
+    for (index = 0U; index < (uint32_t)connector->count_encoders; index++) {
+        drmModeEncoder *encoder;
+        uint32_t crtc;
+        if (connector->encoders[index] == connector->encoder_id)
+            continue;
+        encoder = drmModeGetEncoder(fd, connector->encoders[index]);
+        if (encoder == NULL)
+            continue;
+        crtc = select_crtc(resources, encoder);
+        drmModeFreeEncoder(encoder);
+        if (crtc != 0U)
+            return crtc;
+    }
+    return 0U;
+}
+
 static int select_kms_target(int fd, const struct gui_pool_header *header, uint32_t *connector_id,
                              uint32_t *crtc_id, drmModeModeInfo *mode) {
     drmModeRes *resources = drmModeGetResources(fd);
@@ -774,23 +830,21 @@ static int select_kms_target(int fd, const struct gui_pool_header *header, uint3
     }
     for (connector_index = 0; connector_index < resources->count_connectors; connector_index++) {
         drmModeConnector *connector = drmModeGetConnector(fd, resources->connectors[connector_index]);
-        drmModeEncoder *encoder;
+        uint32_t candidate_crtc;
         int mode_index;
         if (connector == NULL) {
             continue;
         }
-        if (connector->connection != DRM_MODE_CONNECTED || connector->count_modes == 0 ||
-            connector->encoder_id == 0U) {
+        if (connector->connection != DRM_MODE_CONNECTED || connector->count_modes == 0) {
             drmModeFreeConnector(connector);
             continue;
         }
-        encoder = drmModeGetEncoder(fd, connector->encoder_id);
-        if (encoder == NULL) {
+        candidate_crtc = select_connector_crtc(fd, resources, connector);
+        if (candidate_crtc == 0U) {
             drmModeFreeConnector(connector);
             continue;
         }
-        uint32_t candidate_crtc = select_crtc(resources, encoder);
-        if (candidate_crtc != 0U && fallback_connector == 0U) {
+        if (fallback_connector == 0U) {
             fallback_connector = connector->connector_id;
             fallback_crtc = candidate_crtc;
             fallback_mode = connector->modes[0];
@@ -805,7 +859,6 @@ static int select_kms_target(int fd, const struct gui_pool_header *header, uint3
                 break;
             }
         }
-        drmModeFreeEncoder(encoder);
         drmModeFreeConnector(connector);
         if (result == 0) {
             break;
@@ -1041,14 +1094,29 @@ static int claim_display_process_owner(void) {
     return owner_fd;
 }
 
-static int publish_display_ready_lock(void) {
-    static const char state[] =
+static int publish_display_ready_lock(int dmabuf_sources) {
+    static const char staged_state[] =
         "DISPLAY_RELAY_SCHEMA=2\n"
         "STATE=ready\n"
         "MODE=gpu-compositor-staged-copy\n"
         "ZERO_COPY=0\n"
         "GPU_COMPOSITION=1\n"
         "EXPLICIT_FENCE=1\n";
+    static const char dmabuf_state[] =
+        "DISPLAY_RELAY_SCHEMA=3\n"
+        "STATE=ready\n"
+        "MODE=gpu-compositor-dmabuf-source\n"
+        "SOURCE_PATH=dmabuf\n"
+        "ZERO_COPY=1\n"
+        "GPU_COMPOSITION=1\n"
+        "EXPLICIT_FENCE=1\n"
+        "ATOMIC_KMS_SCANOUT=1\n"
+        "SCANOUT_BUFFERS=3\n"
+        "STAGED_DAMAGE_COPY=0\n"
+        "CPU_FINAL_COMPOSE=0\n";
+    const char *state = dmabuf_sources ? dmabuf_state : staged_state;
+    size_t state_length = dmabuf_sources ? sizeof(dmabuf_state) - 1U
+                                         : sizeof(staged_state) - 1U;
     struct stat file_state;
     int directory_fd = open_display_state_directory();
     int ready_fd = -1;
@@ -1067,7 +1135,7 @@ static int publish_display_ready_lock(void) {
     if (fstat(ready_fd, &file_state) != 0 || !S_ISREG(file_state.st_mode) ||
         file_state.st_uid != geteuid() || (file_state.st_mode & 0777U) != 0600U ||
         file_state.st_nlink != 1 || flock(ready_fd, LOCK_EX | LOCK_NB) != 0 ||
-        write_complete(ready_fd, state, sizeof(state) - 1U) != 0 || fsync(ready_fd) != 0 ||
+        write_complete(ready_fd, state, state_length) != 0 || fsync(ready_fd) != 0 ||
         renameat(directory_fd, RUSTOS_DVM_DISPLAY_READY_CANDIDATE, directory_fd,
                  RUSTOS_DVM_DISPLAY_READY_NAME) != 0)
         goto fail;
@@ -1108,7 +1176,8 @@ static int write_complete(int fd, const void *buffer, size_t length) {
     return 0;
 }
 
-static int publish_display_evidence(const struct kms_display *display, uint64_t sample_sequence,
+static int publish_display_evidence(const struct kms_display *display, int dmabuf_sources,
+                                    uint64_t sample_sequence,
                                     uint64_t sample_monotonic_ns, uint64_t window_ns,
                                     uint64_t pageflip_completions, uint64_t frame_hz_milli,
                                     uint64_t pageflip_latency_us_avg,
@@ -1120,17 +1189,21 @@ static int publish_display_evidence(const struct kms_display *display, uint64_t 
     int saved;
     length = snprintf(
         state, sizeof(state),
-        "DISPLAY_EVIDENCE_SCHEMA=1\nSAMPLE_SEQUENCE=%llu\nSAMPLE_MONOTONIC_NS=%llu\n"
+        "DISPLAY_EVIDENCE_SCHEMA=2\nSAMPLE_SEQUENCE=%llu\nSAMPLE_MONOTONIC_NS=%llu\n"
         "WINDOW_NS=%llu\nPAGEFLIP_COMPLETIONS=%llu\nFRAME_HZ_MILLI=%llu\n"
         "CPU_COPY_US_AVG=0\nPAGEFLIP_LATENCY_US_AVG=%llu\n"
         "PAGEFLIP_LATENCY_US_MAX=%llu\nATOMIC_COMMIT_US_AVG=%llu\n"
-        "CONNECTOR_ID=%u\nMODE_WIDTH=%u\nMODE_HEIGHT=%u\nDIRECT_SCANOUT=yes\n",
+        "CONNECTOR_ID=%u\nMODE_WIDTH=%u\nMODE_HEIGHT=%u\n"
+        "SOURCE_PATH=%s\nZERO_COPY=%s\nGPU_COMPOSITION=yes\nEXPLICIT_FENCE=yes\n"
+        "ATOMIC_KMS_SCANOUT=yes\nSCANOUT_BUFFERS=3\nSTAGED_DAMAGE_COPY=%s\n",
         (unsigned long long)sample_sequence, (unsigned long long)sample_monotonic_ns,
         (unsigned long long)window_ns, (unsigned long long)pageflip_completions,
         (unsigned long long)frame_hz_milli, (unsigned long long)pageflip_latency_us_avg,
         (unsigned long long)pageflip_latency_us_max,
         (unsigned long long)atomic_commit_us_avg, display->connector_id,
-        display->mode.hdisplay, display->mode.vdisplay);
+        display->mode.hdisplay, display->mode.vdisplay,
+        dmabuf_sources ? "dmabuf" : "staged-copy",
+        dmabuf_sources ? "yes" : "no", dmabuf_sources ? "no" : "yes");
     if (length <= 0 || (size_t)length >= sizeof(state)) {
         errno = EOVERFLOW;
         return -1;
@@ -1161,7 +1234,8 @@ static int publish_display_evidence(const struct kms_display *display, uint64_t 
     return 0;
 }
 
-static int report_relay_stats(struct kms_display *display, uint64_t pageflip_completions,
+static int report_relay_stats(struct kms_display *display, int dmabuf_sources,
+                              uint64_t pageflip_completions,
                               uint64_t atomic_commit_time_ns,
                               uint64_t atomic_commit_measurements, uint64_t *last_reported_ns,
                               uint64_t *last_pageflip_completions,
@@ -1244,7 +1318,7 @@ static int report_relay_stats(struct kms_display *display, uint64_t pageflip_com
         errno = EOVERFLOW;
         return -1;
     }
-    if (publish_display_evidence(display, *sample_sequence + 1U, now, elapsed_ns,
+    if (publish_display_evidence(display, dmabuf_sources, *sample_sequence + 1U, now, elapsed_ns,
                                  submitted_frames, frame_hz_milli,
                                  average_pageflip_latency_us, maximum_pageflip_latency_us,
                                  average_atomic_commit_us) != 0)
@@ -1404,38 +1478,29 @@ static int atomic_gpu_page_flip(struct kms_display *display,
         .version = DRM_EVENT_CONTEXT_VERSION,
         .page_flip_handler = gpu_page_flip_completed,
     };
-    struct pollfd pollfds[2];
-    uint64_t completed_ns;
+    struct pollfd pollfds[3];
+    uint64_t render_completed_ns = 0U;
     uint64_t commit_started_ns = 0U;
     uint64_t commit_completed_ns = 0U;
+    uint64_t deadline_ns = 0U;
     int out_fence_fd = -1;
     int result;
     int out_complete = 0;
+    int render_complete = 0;
     if (display == NULL || runtime == NULL || frame == NULL || presented_ns == NULL ||
         render_time_ns == NULL || atomic_commit_time_ns == NULL ||
-        atomic_commit_measurements == NULL || frame->output_index == display->front_buffer) {
+        atomic_commit_measurements == NULL || frame->output_index == display->front_buffer ||
+        frame->in_fence_fd < 0) {
         errno = EINVAL;
         return -1;
     }
-    display->setup_stage = "gpu-frame-render-fence";
-    if (wait_sync_file(frame->in_fence_fd, frame->budget_us) != 0) {
-        close(frame->in_fence_fd);
-        frame->in_fence_fd = -1;
-        return -1;
-    }
-    display->setup_stage = "gpu-frame-render-budget";
-    if (monotonic_time_ns(&completed_ns) != 0 || completed_ns <= frame->render_started_ns ||
-        completed_ns - frame->render_started_ns > (uint64_t)frame->budget_us * 1000ULL) {
-        close(frame->in_fence_fd);
-        frame->in_fence_fd = -1;
-        errno = ETIMEDOUT;
-        return -1;
-    }
-    *render_time_ns = completed_ns - frame->render_started_ns;
     display->setup_stage = "gpu-frame-atomic-request";
     request = drmModeAtomicAlloc();
-    if (request == NULL)
+    if (request == NULL) {
+        close(frame->in_fence_fd);
+        frame->in_fence_fd = -1;
         return -1;
+    }
     result = add_gpu_plane_properties(display, request, frame->framebuffer_id,
                                       frame->in_fence_fd);
     if (result == 0 &&
@@ -1453,39 +1518,85 @@ static int atomic_gpu_page_flip(struct kms_display *display,
     if (result == 0 && monotonic_time_ns(&commit_completed_ns) != 0)
         result = -1;
     drmModeAtomicFree(request);
-    close(frame->in_fence_fd);
-    frame->in_fence_fd = -1;
     if (result != 0 || out_fence_fd < 0) {
         if (out_fence_fd >= 0)
             close(out_fence_fd);
+        close(frame->in_fence_fd);
+        frame->in_fence_fd = -1;
         return -1;
     }
+    if (UINT64_MAX - commit_started_ns <
+        (uint64_t)DISPLAY_PAGEFLIP_TIMEOUT_MS * 1000000ULL) {
+        close(out_fence_fd);
+        close(frame->in_fence_fd);
+        frame->in_fence_fd = -1;
+        errno = EOVERFLOW;
+        return -1;
+    }
+    deadline_ns = commit_started_ns +
+                  (uint64_t)DISPLAY_PAGEFLIP_TIMEOUT_MS * 1000000ULL;
     display->setup_stage = "gpu-frame-present-fences";
-    while (!wait.page_flip_complete || !out_complete) {
+    while (!wait.page_flip_complete || !out_complete || !render_complete) {
+        uint64_t now_ns;
+        uint64_t remaining_ns;
+        int timeout_ms;
+        if (monotonic_time_ns(&now_ns) != 0) {
+            result = -1;
+            goto fail_fences;
+        }
+        if (now_ns >= deadline_ns) {
+            result = 0;
+            goto fail_fences;
+        }
+        remaining_ns = deadline_ns - now_ns;
+        timeout_ms = (int)((remaining_ns + 999999ULL) / 1000000ULL);
+        if (timeout_ms <= 0)
+            timeout_ms = 1;
         pollfds[0].fd = display->fd;
         pollfds[0].events = wait.page_flip_complete ? 0 : POLLIN;
         pollfds[0].revents = 0;
         pollfds[1].fd = out_fence_fd;
         pollfds[1].events = out_complete ? 0 : POLLIN;
         pollfds[1].revents = 0;
-        do {
-            result = poll(pollfds, 2U, DISPLAY_PAGEFLIP_TIMEOUT_MS);
-        } while (result < 0 && errno == EINTR);
+        pollfds[2].fd = frame->in_fence_fd;
+        pollfds[2].events = render_complete ? 0 : POLLIN;
+        pollfds[2].revents = 0;
+        result = poll(pollfds, 3U, timeout_ms);
+        if (result < 0 && errno == EINTR)
+            continue;
         if (result <= 0 ||
             (pollfds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0 ||
-            (pollfds[1].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
-            close(out_fence_fd);
-            errno = result == 0 ? ETIMEDOUT : EIO;
-            return -1;
+            (pollfds[1].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0 ||
+            (pollfds[2].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+            if (result > 0)
+                errno = EIO;
+            goto fail_fences;
         }
         if ((pollfds[0].revents & POLLIN) != 0 && drmHandleEvent(display->fd, &event) != 0) {
-            close(out_fence_fd);
-            return -1;
+            result = -1;
+            goto fail_fences;
         }
         if ((pollfds[1].revents & POLLIN) != 0)
             out_complete = 1;
+        if ((pollfds[2].revents & POLLIN) != 0) {
+            if (monotonic_time_ns(&render_completed_ns) != 0) {
+                result = -1;
+                goto fail_fences;
+            }
+            render_complete = 1;
+        }
     }
     close(out_fence_fd);
+    close(frame->in_fence_fd);
+    frame->in_fence_fd = -1;
+    display->setup_stage = "gpu-frame-render-budget";
+    if (render_completed_ns <= frame->render_started_ns ||
+        render_completed_ns - frame->render_started_ns >
+            (uint64_t)frame->budget_us * 1000ULL) {
+        errno = ETIMEDOUT;
+        return -1;
+    }
+    *render_time_ns = render_completed_ns - frame->render_started_ns;
     if (monotonic_time_ns(presented_ns) != 0)
         return -1;
     if (commit_completed_ns <= commit_started_ns || *presented_ns <= commit_started_ns) {
@@ -1511,6 +1622,16 @@ static int atomic_gpu_page_flip(struct kms_display *display,
     display->front_buffer = frame->output_index;
     display->setup_stage = "gpu-ready";
     return 0;
+
+fail_fences:
+    close(out_fence_fd);
+    close(frame->in_fence_fd);
+    frame->in_fence_fd = -1;
+    if (result == 0)
+        errno = ETIMEDOUT;
+    else if (errno == 0)
+        errno = EIO;
+    return -1;
 }
 
 static int open_gpu_kms_display(const struct shared_display *shared,
@@ -1519,6 +1640,7 @@ static int open_gpu_kms_display(const struct shared_display *shared,
                                 uint64_t *prime_duration_ns,
                                 int *prime_present_fence) {
     struct rustos_gpu_frame black;
+    int source_fds[GPU_ATLAS_SLOT_COUNT] = {-1, -1, -1};
     uint64_t prime_started_ns;
     uint64_t prime_completed_ns;
     int saved;
@@ -1528,6 +1650,7 @@ static int open_gpu_kms_display(const struct shared_display *shared,
     }
     memset(display, 0, sizeof(*display));
     display->fd = -1;
+    display->source_exporter_fd = -1;
     display->front_buffer = NO_SCANOUT_BUFFER;
     display->source_width = shared->header.width;
     display->source_height = shared->header.height;
@@ -1555,6 +1678,51 @@ static int open_gpu_kms_display(const struct shared_display *shared,
                                 shared->atlas.atlas_height,
                                 shared->atlas.atlas_stride_bytes, runtime_out) != 0)
         goto fail;
+    if (strcmp(rustos_gpu_runtime_driver(*runtime_out), "amdgpu") == 0) {
+        struct stat state;
+        size_t slot;
+        int exporter;
+        display->setup_stage = "gpu-dmabuf-exporter";
+        exporter = open(RUSTOS_DVM_DMABUF_DEVICE,
+                        O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+        if (exporter < 0 || fstat(exporter, &state) != 0 || !S_ISCHR(state.st_mode) ||
+            state.st_uid != 0 || (state.st_mode & 077U) != 0) {
+            saved = errno == 0 ? EPERM : errno;
+            if (exporter >= 0)
+                close(exporter);
+            errno = saved;
+            goto fail_runtime;
+        }
+        for (slot = 0U; slot < GPU_ATLAS_SLOT_COUNT; slot++) {
+            struct rustos_dvm_dmabuf_request request = {
+                .slot = (uint32_t)slot,
+                .flags = RUSTOS_DVM_DMABUF_EXPORT_ATLAS,
+            };
+            source_fds[slot] = ioctl(exporter, RUSTOS_DVM_DMABUF_IOCTL_EXPORT,
+                                     &request);
+            if (source_fds[slot] < 0 ||
+                (fcntl(source_fds[slot], F_GETFD) & FD_CLOEXEC) == 0) {
+                saved = errno == 0 ? EPROTO : errno;
+                close(exporter);
+                errno = saved;
+                goto fail_runtime;
+            }
+        }
+        display->setup_stage = "gpu-dmabuf-import";
+        if (rustos_gpu_runtime_import_dmabuf_sources(
+                *runtime_out, source_fds, GPU_ATLAS_SLOT_COUNT) != 0) {
+            saved = errno == 0 ? EIO : errno;
+		    display->setup_stage = rustos_gpu_runtime_stage(*runtime_out);
+            close(exporter);
+            errno = saved;
+            goto fail_runtime;
+        }
+        for (slot = 0U; slot < GPU_ATLAS_SLOT_COUNT; slot++) {
+            close(source_fds[slot]);
+            source_fds[slot] = -1;
+        }
+        display->source_exporter_fd = exporter;
+    }
     display->setup_stage = "gpu-initial-black";
     if (rustos_gpu_runtime_render_prime(*runtime_out, &black) != 0) {
         saved = errno == 0 ? EIO : errno;
@@ -1587,8 +1755,25 @@ static int open_gpu_kms_display(const struct shared_display *shared,
     *prime_duration_ns = prime_completed_ns - prime_started_ns;
     display->setup_stage = "gpu-ready";
     return 0;
+fail_runtime:
+    saved = errno == 0 ? EIO : errno;
+    {
+        size_t slot;
+        for (slot = 0U; slot < GPU_ATLAS_SLOT_COUNT; slot++) {
+            if (source_fds[slot] >= 0)
+                close(source_fds[slot]);
+        }
+    }
+    rustos_gpu_runtime_close(*runtime_out);
+    *runtime_out = NULL;
+    errno = saved;
+    goto fail;
 fail:
     saved = errno == 0 ? EIO : errno;
+    if (display->source_exporter_fd >= 0) {
+        close(display->source_exporter_fd);
+        display->source_exporter_fd = -1;
+    }
     if (display->mode_blob_id != 0U)
         (void)drmModeDestroyPropertyBlob(display->fd, display->mode_blob_id);
     (void)drmDropMaster(display->fd);
@@ -1601,6 +1786,8 @@ fail:
 static void close_gpu_kms_display(struct kms_display *display,
                                   struct rustos_gpu_runtime *runtime) {
     rustos_gpu_runtime_close(runtime);
+    if (display->source_exporter_fd >= 0)
+        close(display->source_exporter_fd);
     if (display->fd >= 0) {
         if (display->mode_blob_id != 0U)
             (void)drmModeDestroyPropertyBlob(display->fd, display->mode_blob_id);
@@ -1609,6 +1796,7 @@ static void close_gpu_kms_display(struct kms_display *display,
     }
     memset(display, 0, sizeof(*display));
     display->fd = -1;
+    display->source_exporter_fd = -1;
 }
 
 struct gpu_submission {
@@ -1621,6 +1809,38 @@ struct gpu_submission {
     const uint8_t *atlas_pixels;
     const uint8_t *batch;
 };
+
+static int acquire_gpu_source_fence(const struct kms_display *display,
+                                    const struct gpu_submission *submission) {
+    struct rustos_dvm_acquire_request request;
+    int fd;
+    if (display == NULL || submission == NULL || display->source_exporter_fd < 0 ||
+        submission->slot >= GPU_ATLAS_SLOT_COUNT || submission->batch == NULL ||
+        submission->batch_bytes < 48U) {
+        errno = EINVAL;
+        return -1;
+    }
+    memset(&request, 0, sizeof(request));
+    request.slot = submission->slot;
+    request.generation = submission->generation;
+    request.sequence = submission->sequence;
+    request.acquire_value = read_le64(submission->batch + 40U);
+    if (request.acquire_value == 0U) {
+        errno = EPROTO;
+        return -1;
+    }
+    fd = ioctl(display->source_exporter_fd, RUSTOS_DVM_DMABUF_IOCTL_ACQUIRE,
+               &request);
+    if (fd < 0)
+        return -1;
+    if ((fcntl(fd, F_GETFD) & FD_CLOEXEC) == 0) {
+        int saved = errno == 0 ? EPROTO : errno;
+        close(fd);
+        errno = saved;
+        return -1;
+    }
+    return fd;
+}
 
 static const uint8_t *gpu_pixel_pointer(const struct shared_display *shared,
                                         uint64_t absolute_offset, uint64_t bytes) {
@@ -1887,6 +2107,7 @@ static int serve_gpu_display(struct shared_display *shared) {
                   display.setup_stage == NULL ? "unknown" : display.setup_stage, errno);
         return -1;
     }
+    const int dmabuf_sources = rustos_gpu_runtime_uses_dmabuf_sources(runtime);
     shared->uio_fd = open_uio_interrupt(shared);
     if (shared->uio_fd < 0 || map_gpu_pixel_pool(shared) != 0) {
         relay_log("rustos-dvm-display: GPU read-only pixel mapping unavailable errno=%d\n",
@@ -1895,8 +2116,9 @@ static int serve_gpu_display(struct shared_display *shared) {
         return -1;
     }
     relay_log("rustos-dvm-display: gpu-compositor primed contract=3 driver=%s renderer=%s "
-              "source-path=staged-copy zero-copy=0 explicit-fence=1 public-abi=0 prime_us=%llu prime-present=%s\n",
+              "source-path=%s zero-copy=%u explicit-fence=1 public-abi=0 prime_us=%llu prime-present=%s\n",
               rustos_gpu_runtime_driver(runtime), rustos_gpu_runtime_renderer(runtime),
+              dmabuf_sources ? "dmabuf" : "staged-copy", dmabuf_sources ? 1U : 0U,
               (unsigned long long)((prime_duration_ns + 999U) / 1000U),
               prime_present_fence ? "out-fence" : "blocking-atomic");
     if (monotonic_time_ns(&last_reported_ns) != 0)
@@ -1944,16 +2166,22 @@ static int serve_gpu_display(struct shared_display *shared) {
             struct rustos_gpu_frame frame;
             uint64_t presented_ns;
             uint64_t render_time_ns;
+            int acquire_fence_fd = -1;
             int selected = select_gpu_submission(shared, &submission);
             if (selected < 0)
                 goto fail;
             if (selected == 0)
                 break;
+            if (dmabuf_sources) {
+                acquire_fence_fd = acquire_gpu_source_fence(&display, &submission);
+                if (acquire_fence_fd < 0)
+                    goto fail;
+            }
             if (rustos_gpu_runtime_render_batch(runtime, submission.atlas_pixels,
                     (size_t)shared->atlas.atlas_slot_bytes, submission.damage,
                     submission.damage_count, submission.batch,
                     submission.batch_bytes, submission.slot, submission.generation,
-                    submission.sequence, &frame) != 0 ||
+                    submission.sequence, acquire_fence_fd, &frame) != 0 ||
                 atomic_gpu_page_flip(&display, runtime, &frame, &presented_ns,
                                      &render_time_ns, &atomic_commit_time_ns,
                                      &atomic_commit_measurements) != 0 ||
@@ -1972,26 +2200,32 @@ static int serve_gpu_display(struct shared_display *shared) {
             if (render_time_ns > gpu_metrics.render_max_ns)
                 gpu_metrics.render_max_ns = render_time_ns;
             if (ready_lock < 0 && peer_ready_confirmed) {
-                ready_lock = publish_display_ready_lock();
+                ready_lock = publish_display_ready_lock(dmabuf_sources);
                 if (ready_lock < 0)
                     goto fail;
             }
             if (!active_logged && ready_lock >= 0) {
                 relay_log(
-                    "rustos-dvm-display: active width=%u height=%u stride=%u format=BGRA8888 event=ivshmem-msix-uio irq_count=%u source-path=staged-copy zero-copy=0 gpu-composition=1 explicit-fence=1 scanout_buffers=%u cpu-final-compose=0 staged-damage-copy=1\n",
+                    "rustos-dvm-display: active width=%u height=%u stride=%u format=BGRA8888 event=ivshmem-msix-uio irq_count=%u source-path=%s zero-copy=%u gpu-composition=1 explicit-fence=1 scanout_buffers=%u cpu-final-compose=0 staged-damage-copy=%u\n",
                     shared->header.width, shared->header.height,
-                    shared->header.stride_bytes, event_count, SCANOUT_BUFFER_COUNT);
+                    shared->header.stride_bytes, event_count,
+                    dmabuf_sources ? "dmabuf" : "staged-copy",
+                    dmabuf_sources ? 1U : 0U, SCANOUT_BUFFER_COUNT,
+                    dmabuf_sources ? 0U : 1U);
                 active_logged = 1;
             }
             if (presented_frames == 1U || presented_frames % GPU_FRAME_LOG_INTERVAL == 0U) {
                 relay_log("rustos-dvm-display: gpu-frame sequence=%llu submit=%llu "
-                          "output=%u render_us=%llu source-path=staged-copy zero-copy=0 "
+                          "output=%u render_us=%llu source-path=%s zero-copy=%u "
                           "gpu-fence=1 present-fence=1\n",
                           (unsigned long long)frame.sequence,
                           (unsigned long long)frame.submit_value, frame.output_index,
-                          (unsigned long long)((render_time_ns + 999U) / 1000U));
+                          (unsigned long long)((render_time_ns + 999U) / 1000U),
+                          dmabuf_sources ? "dmabuf" : "staged-copy",
+                          dmabuf_sources ? 1U : 0U);
             }
-            if (report_relay_stats(&display, presented_frames, atomic_commit_time_ns,
+            if (report_relay_stats(&display, dmabuf_sources, presented_frames,
+                                   atomic_commit_time_ns,
                                    atomic_commit_measurements, &last_reported_ns,
                                    &last_pageflip_completions,
                                    &last_atomic_commit_time_ns,
@@ -2000,7 +2234,8 @@ static int serve_gpu_display(struct shared_display *shared) {
                                    &gpu_metrics) != 0)
                 goto fail;
         }
-        if (report_relay_stats(&display, presented_frames, atomic_commit_time_ns,
+        if (report_relay_stats(&display, dmabuf_sources, presented_frames,
+                               atomic_commit_time_ns,
                                atomic_commit_measurements, &last_reported_ns,
                                &last_pageflip_completions, &last_atomic_commit_time_ns,
                                &last_atomic_commit_measurements,

@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
@@ -16,6 +17,7 @@ use rustos_driver_domain_host::{
     HostControlListener, PhysicalDisplayPolicy, SysfsVfioOps, ValidatedLease, VfioLeaseRecord,
     VfioLeaseState, reset_vfio_group, restore_vfio_lease, validate_host_display_assignment,
     validate_physical_display_assignment, validate_physical_display_identity,
+    validate_reset_scope_assignment, validate_vfio_bind_dma_quiescence,
 };
 use sha2::{Digest, Sha256};
 
@@ -27,9 +29,39 @@ const DVM_KERNEL_CONFIG: &str = "rustos-linux-dvm-x86_64.kernel.config";
 const DVM_MODULE_SIGNING_CERT: &str = "rustos-linux-dvm-x86_64.module-signing.x509";
 const DVM_SOURCES_LOCK: &str = "rustos-linux-dvm-x86_64.sources.lock";
 const DVM_CONTROL_CONTRACT: &str = "rustos-linux-dvm-x86_64.control.env";
-const DVM_PIXEL_BYTES: u64 = 32 * 1024 * 1024;
+const ACPI_VFCT_HEADER_BYTES: usize = 0x4c;
+const ACPI_VFCT_VBIOS_OFFSET: usize = 0x34;
+const ACPI_VFCT_LIB1_OFFSET: usize = 0x38;
+// AMD's VFCT_IMAGE_HEADER ends with two ULONG fields: Revision and
+// ImageLength.  Keep the offsets explicit because treating Revision as the
+// length can turn a valid firmware table into a one-byte image.
+const ACPI_VFCT_IMAGE_HEADER_BYTES: usize = 28;
+const ACPI_VFCT_IMAGE_REVISION_OFFSET: usize = 20;
+const ACPI_VFCT_IMAGE_LENGTH_OFFSET: usize = 24;
+const ACPI_VFCT_MAX_BYTES: u64 = 4 * 1024 * 1024;
+const AMDGPU_GUEST_PCI_BUS: u32 = 0;
+const AMDGPU_GUEST_PCI_DEVICE: u32 = 8;
+const AMDGPU_GUEST_PCI_FUNCTION: u32 = 0;
+const AMDGPU_QEMU_PCI_ADDRESS: &str = "08.0";
+// The release initramfs expands to about 453 MiB. A 1 GiB guest leaves only a
+// marginal half-RAM root tmpfs after kernel and device reservations and was
+// observed to fail part-way through unpacking. Keep the physical supervisor
+// aligned with the independently exercised xtask DVM profile.
+const DVM_GUEST_MEMORY: &str = "2048M";
+const DVM_REQUIRED_MEMLOCK_BYTES: libc::rlim_t = 4 * 1024 * 1024 * 1024;
+// Must match RUSTOS_GUI_PIXEL_REGION_BYTES in the signed DVM exporter and the
+// V3 three-slot atlas ABI. The former 32 MiB supervisor value could not hold
+// the admitted 128 MiB source pool.
+const DVM_PIXEL_BYTES: u64 = 128 * 1024 * 1024;
 const DVM_PIXEL_PHYS: u64 = 0x1_0000_0000;
+const GUEST_SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 const TERMINATE_GRACE: Duration = Duration::from_secs(5);
+const QMP_IO_TIMEOUT: Duration = Duration::from_secs(3);
+const QMP_CONNECT_RETRY: Duration = Duration::from_millis(50);
+const QMP_MAX_MESSAGE_BYTES: u64 = 64 * 1024;
+const QMP_MAX_MESSAGES: usize = 32;
+const QMP_CAPABILITIES_ID: &str = "rustos-capabilities";
+const QMP_POWERDOWN_ID: &str = "rustos-powerdown";
 const SUPERVISOR_TICK: Duration = Duration::from_millis(100);
 const HEALTH_INTERVAL: Duration = Duration::from_secs(5);
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(3);
@@ -55,6 +87,55 @@ struct IommuDestroy {
 
 static TERMINATE_REQUESTED: AtomicBool = AtomicBool::new(false);
 static PRIVATE_REPLACE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StopKind {
+    CleanExit,
+    Forced,
+}
+
+#[derive(Debug)]
+struct StopResult {
+    status: ExitStatus,
+    kind: StopKind,
+    qmp_failure: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AmdVbiosArtifact {
+    pub path: PathBuf,
+    pub sha256: String,
+    pub size: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AmdVfctArtifact {
+    pub path: PathBuf,
+    pub sha256: String,
+    pub size: usize,
+}
+
+struct ValidatedAmdVfct {
+    table: Vec<u8>,
+    image: Vec<u8>,
+    image_header_offset: usize,
+}
+
+struct LocatedAmdVbios {
+    image: Vec<u8>,
+    header_offset: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AmdPciIdentity {
+    bus: u32,
+    device: u32,
+    function: u32,
+    vendor: u16,
+    device_id: u16,
+    subsystem_vendor: u16,
+    subsystem_device: u16,
+}
 
 extern "C" fn request_termination(_signal: libc::c_int) {
     TERMINATE_REQUESTED.store(true, Ordering::Release);
@@ -348,7 +429,7 @@ pub fn verify_artifacts(manifest: &Path) -> Result<VerifiedArtifacts> {
         || manifest_value(&values, "control-transport")? != "kvm-vsock"
         || manifest_value(&values, "control-authentication")? != "dvm-agent-hmac-sha256-v1"
         || manifest_value(&values, "control-capabilities")?
-            != "health,device-inventory,driver-inventory,display-evidence-v1,input-stream"
+            != "health,device-inventory,driver-inventory,display-evidence-v2,input-stream"
         || manifest_value(&values, "buildroot_version")? != "2026.05"
         || manifest_value(&values, "linux_version")? != "6.12.94"
         || manifest_value(&values, "nvidia-open-version")? != "580.173.02"
@@ -426,6 +507,341 @@ pub fn verify_artifacts(manifest: &Path) -> Result<VerifiedArtifacts> {
     })
 }
 
+fn read_le_u16(bytes: &[u8], offset: usize, label: &str) -> Result<u16> {
+    let value = bytes
+        .get(offset..offset + 2)
+        .ok_or_else(|| anyhow!("truncated {label}"))?;
+    Ok(u16::from_le_bytes([value[0], value[1]]))
+}
+
+fn read_le_u32(bytes: &[u8], offset: usize, label: &str) -> Result<u32> {
+    let value = bytes
+        .get(offset..offset + 4)
+        .ok_or_else(|| anyhow!("truncated {label}"))?;
+    Ok(u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
+}
+
+fn read_pci_hex_u16(path: &Path, field: &str, bdf: &str) -> Result<u16> {
+    let source = fs::read_to_string(path)
+        .with_context(|| format!("read PCI {field} for AMD VBIOS target {bdf}"))?;
+    let value = source
+        .trim()
+        .strip_prefix("0x")
+        .ok_or_else(|| anyhow!("PCI {field} for {bdf} lacks 0x prefix"))?;
+    u16::from_str_radix(value, 16).with_context(|| format!("parse PCI {field} for {bdf}"))
+}
+
+fn amd_pci_identity(sysfs_root: &Path, bdf: &str) -> Result<AmdPciIdentity> {
+    let bytes = bdf.as_bytes();
+    if bytes.len() != 12 || bytes[4] != b':' || bytes[7] != b':' || bytes[10] != b'.' {
+        bail!("invalid AMD display PCI BDF {bdf:?}");
+    }
+    let bus = u32::from_str_radix(&bdf[5..7], 16)
+        .with_context(|| format!("parse AMD display PCI bus in {bdf}"))?;
+    let device = u32::from_str_radix(&bdf[8..10], 16)
+        .with_context(|| format!("parse AMD display PCI device in {bdf}"))?;
+    let function = u32::from_str_radix(&bdf[11..12], 16)
+        .with_context(|| format!("parse AMD display PCI function in {bdf}"))?;
+    let device_path = sysfs_root.join("bus/pci/devices").join(bdf);
+    Ok(AmdPciIdentity {
+        bus,
+        device,
+        function,
+        vendor: read_pci_hex_u16(&device_path.join("vendor"), "vendor", bdf)?,
+        device_id: read_pci_hex_u16(&device_path.join("device"), "device", bdf)?,
+        subsystem_vendor: read_pci_hex_u16(
+            &device_path.join("subsystem_vendor"),
+            "subsystem vendor",
+            bdf,
+        )?,
+        subsystem_device: read_pci_hex_u16(
+            &device_path.join("subsystem_device"),
+            "subsystem device",
+            bdf,
+        )?,
+    })
+}
+
+fn validate_atom_vbios(image: &[u8]) -> Result<()> {
+    if image.len() < 0x4a || image[0..2] != [0x55, 0xaa] {
+        bail!("VFCT AMD VBIOS lacks the 0x55aa signature");
+    }
+    let header = usize::from(read_le_u16(image, 0x48, "AMD VBIOS header pointer")?);
+    let signature_offset = header
+        .checked_add(4)
+        .ok_or_else(|| anyhow!("AMD VBIOS header pointer overflow"))?;
+    let signature = image
+        .get(signature_offset..signature_offset + 4)
+        .ok_or_else(|| anyhow!("AMD VBIOS ATOM header is truncated"))?;
+    if signature != b"ATOM" && signature != b"MOTA" {
+        bail!("VFCT AMD VBIOS lacks an ATOM firmware header");
+    }
+    Ok(())
+}
+
+fn locate_amdgpu_vfct_image(table: &[u8], target: AmdPciIdentity) -> Result<LocatedAmdVbios> {
+    if table.len() < ACPI_VFCT_HEADER_BYTES || table.get(0..4) != Some(b"VFCT") {
+        bail!("ACPI VFCT table header is missing or truncated");
+    }
+    let table_length = usize::try_from(read_le_u32(table, 4, "ACPI VFCT length")?)
+        .context("ACPI VFCT length does not fit usize")?;
+    if table_length != table.len() {
+        bail!(
+            "ACPI VFCT length mismatch: header={table_length} actual={}",
+            table.len()
+        );
+    }
+    if table.iter().fold(0_u8, |sum, byte| sum.wrapping_add(*byte)) != 0 {
+        bail!("ACPI VFCT checksum is invalid");
+    }
+    let mut offset = usize::try_from(read_le_u32(
+        table,
+        ACPI_VFCT_VBIOS_OFFSET,
+        "ACPI VFCT VBIOS offset",
+    )?)
+    .context("ACPI VFCT VBIOS offset does not fit usize")?;
+    let lib1_offset = usize::try_from(read_le_u32(
+        table,
+        ACPI_VFCT_LIB1_OFFSET,
+        "ACPI VFCT library offset",
+    )?)
+    .context("ACPI VFCT library offset does not fit usize")?;
+    let image_end = if lib1_offset == 0 {
+        table.len()
+    } else {
+        lib1_offset
+    };
+    if offset < ACPI_VFCT_HEADER_BYTES || offset >= image_end || image_end > table.len() {
+        bail!("ACPI VFCT VBIOS image range is invalid");
+    }
+
+    let mut matched = None;
+    while offset < image_end {
+        // Firmware may pad the final image to the ACPI table length.  Admit
+        // only an entirely zero tail; nonzero trailing bytes must still parse
+        // as a complete VFCT_IMAGE_HEADER plus image or fail closed.
+        if table[offset..image_end].iter().all(|byte| *byte == 0) {
+            offset = image_end;
+            break;
+        }
+        let header_end = offset
+            .checked_add(ACPI_VFCT_IMAGE_HEADER_BYTES)
+            .ok_or_else(|| anyhow!("ACPI VFCT image header overflow"))?;
+        if header_end > image_end {
+            bail!("ACPI VFCT image header is truncated");
+        }
+        let bus = read_le_u32(table, offset, "VFCT image PCI bus")?;
+        let device = read_le_u32(table, offset + 4, "VFCT image PCI device")?;
+        let function = read_le_u32(table, offset + 8, "VFCT image PCI function")?;
+        let vendor = read_le_u16(table, offset + 12, "VFCT image PCI vendor")?;
+        let device_id = read_le_u16(table, offset + 14, "VFCT image PCI device ID")?;
+        let subsystem_vendor = read_le_u16(table, offset + 16, "VFCT image subsystem vendor")?;
+        let subsystem_device = read_le_u16(table, offset + 18, "VFCT image subsystem device")?;
+        let _revision = read_le_u32(
+            table,
+            offset + ACPI_VFCT_IMAGE_REVISION_OFFSET,
+            "VFCT image revision",
+        )?;
+        let image_length = usize::try_from(read_le_u32(
+            table,
+            offset + ACPI_VFCT_IMAGE_LENGTH_OFFSET,
+            "VFCT image length",
+        )?)
+        .context("VFCT image length does not fit usize")?;
+        let next = header_end
+            .checked_add(image_length)
+            .ok_or_else(|| anyhow!("ACPI VFCT image length overflow"))?;
+        if image_length == 0 || next > image_end {
+            bail!("ACPI VFCT image is empty or truncated");
+        }
+        // Some firmware, including the GA403UM VFCT, leaves both subsystem
+        // fields zero.  That is an absent identity, not a wildcard per field:
+        // accept only the all-zero pair, retain exact BDF/vendor/device
+        // matching, and still reject more than one matching image.  A partial
+        // zero or a populated mismatch remains fail-closed.
+        let subsystem_matches = (subsystem_vendor == 0 && subsystem_device == 0)
+            || (subsystem_vendor == target.subsystem_vendor
+                && subsystem_device == target.subsystem_device);
+        if bus == target.bus
+            && device == target.device
+            && function == target.function
+            && vendor == target.vendor
+            && device_id == target.device_id
+            && subsystem_matches
+        {
+            if matched.is_some() {
+                bail!("ACPI VFCT contains duplicate images for the AMD display target");
+            }
+            let image = table[header_end..next].to_vec();
+            validate_atom_vbios(&image)?;
+            matched = Some(LocatedAmdVbios {
+                image,
+                header_offset: offset,
+            });
+        }
+        offset = next;
+    }
+    if offset != image_end {
+        bail!("ACPI VFCT VBIOS image range has trailing partial data");
+    }
+    matched.ok_or_else(|| anyhow!("ACPI VFCT contains no exact image for the AMD display target"))
+}
+
+#[cfg(test)]
+fn extract_amdgpu_vfct_image(table: &[u8], target: AmdPciIdentity) -> Result<Vec<u8>> {
+    Ok(locate_amdgpu_vfct_image(table, target)?.image)
+}
+
+fn read_validated_amdgpu_vfct(
+    vfct_path: &Path,
+    sysfs_root: &Path,
+    display_bdf: &str,
+) -> Result<ValidatedAmdVfct> {
+    let metadata = fs::symlink_metadata(vfct_path)
+        .with_context(|| format!("inspect ACPI VFCT source {}", vfct_path.display()))?;
+    if !metadata.file_type().is_file() || metadata.mode() & 0o022 != 0 {
+        bail!("ACPI VFCT source must be a non-symlink file that is not group/world writable");
+    }
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(vfct_path)
+        .with_context(|| format!("open ACPI VFCT source {}", vfct_path.display()))?;
+    let mut table = Vec::new();
+    Read::by_ref(&mut file)
+        .take(ACPI_VFCT_MAX_BYTES + 1)
+        .read_to_end(&mut table)
+        .with_context(|| format!("read ACPI VFCT source {}", vfct_path.display()))?;
+    if u64::try_from(table.len()).unwrap_or(u64::MAX) > ACPI_VFCT_MAX_BYTES {
+        bail!("ACPI VFCT source exceeds the bounded 4 MiB limit");
+    }
+    let located = locate_amdgpu_vfct_image(&table, amd_pci_identity(sysfs_root, display_bdf)?)?;
+    Ok(ValidatedAmdVfct {
+        table,
+        image: located.image,
+        image_header_offset: located.header_offset,
+    })
+}
+
+pub fn export_amdgpu_vbios(
+    vfct_path: &Path,
+    sysfs_root: &Path,
+    display_bdf: &str,
+    output: &Path,
+) -> Result<AmdVbiosArtifact> {
+    let image = read_validated_amdgpu_vfct(vfct_path, sysfs_root, display_bdf)?.image;
+    let sha256 = format!("{:x}", Sha256::digest(&image));
+    let parent = output
+        .parent()
+        .ok_or_else(|| anyhow!("AMD VBIOS output {} has no parent", output.display()))?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(output)
+        .with_context(|| format!("create private AMD VBIOS output {}", output.display()))?;
+    if let Err(error) = (|| -> Result<()> {
+        file.write_all(&image)?;
+        file.sync_all()?;
+        sync_directory(parent)?;
+        Ok(())
+    })() {
+        drop(file);
+        let _ = fs::remove_file(output);
+        return Err(error).context("persist private AMD VBIOS snapshot");
+    }
+    let path = fs::canonicalize(output)
+        .with_context(|| format!("canonicalize AMD VBIOS output {}", output.display()))?;
+    Ok(AmdVbiosArtifact {
+        path,
+        sha256,
+        size: image.len(),
+    })
+}
+
+fn validate_amdgpu_vfct_source(sysfs_root: &Path, display_bdf: &str) -> Result<()> {
+    read_validated_amdgpu_vfct(
+        &sysfs_root.join("firmware/acpi/tables/VFCT"),
+        sysfs_root,
+        display_bdf,
+    )?;
+    Ok(())
+}
+
+pub fn export_amdgpu_guest_vfct(
+    vfct_path: &Path,
+    sysfs_root: &Path,
+    display_bdf: &str,
+    output: &Path,
+) -> Result<AmdVfctArtifact> {
+    let mut validated = read_validated_amdgpu_vfct(vfct_path, sysfs_root, display_bdf)?;
+    let header = validated.image_header_offset;
+    validated.table[header..header + 4].copy_from_slice(&AMDGPU_GUEST_PCI_BUS.to_le_bytes());
+    validated.table[header + 4..header + 8].copy_from_slice(&AMDGPU_GUEST_PCI_DEVICE.to_le_bytes());
+    validated.table[header + 8..header + 12]
+        .copy_from_slice(&AMDGPU_GUEST_PCI_FUNCTION.to_le_bytes());
+    // The host identity is validated before relocation.  QEMU then pins the
+    // device at this one guest BDF, so only those three routing fields may
+    // change; the VBIOS payload and PCI identity must remain byte-for-byte.
+    validated.table[9] = 0;
+    let checksum = validated
+        .table
+        .iter()
+        .fold(0_u8, |sum, byte| sum.wrapping_add(*byte));
+    validated.table[9] = 0_u8.wrapping_sub(checksum);
+    let guest_target = AmdPciIdentity {
+        bus: AMDGPU_GUEST_PCI_BUS,
+        device: AMDGPU_GUEST_PCI_DEVICE,
+        function: AMDGPU_GUEST_PCI_FUNCTION,
+        ..amd_pci_identity(sysfs_root, display_bdf)?
+    };
+    let relocated = locate_amdgpu_vfct_image(&validated.table, guest_target)?;
+    if relocated.header_offset != header || relocated.image != validated.image {
+        bail!("relocated AMD VFCT changed the validated VBIOS payload");
+    }
+    let parent = output
+        .parent()
+        .ok_or_else(|| anyhow!("AMD VFCT output {} has no parent", output.display()))?;
+    let sha256 = format!("{:x}", Sha256::digest(&validated.table));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(output)
+        .with_context(|| format!("create private AMD VFCT snapshot {}", output.display()))?;
+    if let Err(error) = (|| -> Result<()> {
+        file.write_all(&validated.table)?;
+        file.sync_all()?;
+        sync_directory(parent)?;
+        Ok(())
+    })() {
+        drop(file);
+        let _ = fs::remove_file(output);
+        return Err(error).context("persist private AMD VFCT snapshot");
+    }
+    Ok(AmdVfctArtifact {
+        path: fs::canonicalize(output)
+            .with_context(|| format!("canonicalize AMD VFCT snapshot {}", output.display()))?,
+        sha256,
+        size: validated.table.len(),
+    })
+}
+
+fn prepare_amdgpu_vfct(
+    sysfs_root: &Path,
+    display_bdf: &str,
+    runtime_dir: &Path,
+) -> Result<AmdVfctArtifact> {
+    export_amdgpu_guest_vfct(
+        &sysfs_root.join("firmware/acpi/tables/VFCT"),
+        sysfs_root,
+        display_bdf,
+        &runtime_dir.join("amdgpu-vfct.bin"),
+    )
+}
+
 /// Complete every reversible physical-runtime admission check before an
 /// authorized IOMMU group is detached from its host drivers.
 pub fn preflight_physical_runtime_inputs(
@@ -450,12 +866,19 @@ pub fn preflight_physical_runtime_inputs(
         .ok_or_else(|| anyhow!("physical runtime preflight requires device policy schema 3"))?;
     validate_host_display_assignment(lease, sysfs_root)?;
     validate_physical_display_assignment(lease, sysfs_root, physical_display)?;
+    let display_bdf = validate_physical_display_identity(lease, sysfs_root, physical_display)?;
+    if physical_display.driver() == "amdgpu" {
+        validate_amdgpu_vfct_source(sysfs_root, &display_bdf)?;
+    }
+    validate_reset_scope_assignment(lease, sysfs_root)?;
+    validate_vfio_bind_dma_quiescence(sysfs_root)?;
     let (_, qemu_sha256) = verify_qemu(qemu)?;
     if qemu_sha256 != policy.qemu_sha256() {
         bail!("physical runtime QEMU digest does not match the signed device policy");
     }
     verify_artifacts(artifact_manifest)?;
-    verify_iommufd()?;
+    verify_qemu_memlock_budget()?;
+    probe_iommufd()?;
     Ok(())
 }
 
@@ -533,32 +956,54 @@ pub fn supervise_domain(
     {
         bail!("durable VFIO lease does not retain the signed physical display driver");
     }
-    ensure_private_regular_file(config.display_pixels)?;
     ensure_private_socket(config.display_doorbell)?;
     let (qemu, qemu_sha256) = verify_qemu(config.qemu)?;
     if qemu_sha256 != policy.qemu_sha256() {
         bail!("production QEMU digest does not match the signed device policy");
     }
-    verify_iommufd()?;
+    verify_qemu_memlock_budget()?;
+    probe_iommufd()?;
     let artifacts = verify_artifacts(&artifact_manifest)?;
+    prepare_dma_pinnable_pixel_file(config.display_pixels)?;
     let contract = artifacts.control.clone();
     let secret = ControlSecret::random()?;
     let secret_path = store.write_secret(&lease.domain_id, &secret)?;
     let listener = HostControlListener::bind(lease.dvm_guest_cid, contract, secret)?;
+    let runtime_dir = store.prepare_domain_dir(&lease.domain_id)?;
+    let amd_vfct = if physical_display.driver() == "amdgpu" {
+        match prepare_amdgpu_vfct(sysfs_root, &display_bdf, &runtime_dir) {
+            Ok(artifact) => Some(artifact),
+            Err(error) => {
+                let _ = store.remove(&lease.domain_id);
+                return Err(error).context("prepare exact host AMD VFCT before device reset");
+            }
+        }
+    } else {
+        None
+    };
+    let qmp_path = match prepare_qmp_socket(&runtime_dir) {
+        Ok(path) => path,
+        Err(error) => {
+            let _ = store.remove(&lease.domain_id);
+            return Err(error).context("prepare private QMP shutdown endpoint");
+        }
+    };
 
     let mut ops = SysfsVfioOps::new(sysfs_root);
     reset_vfio_group(lease, &mut ops)?;
     install_signal_handlers()?;
     TERMINATE_REQUESTED.store(false, Ordering::Release);
-    let runtime_dir = store.prepare_domain_dir(&lease.domain_id)?;
     let (mut child, mut launch_gate) = match spawn_qemu_gated(
         &qemu,
         lease,
         &artifacts,
+        &display_bdf,
+        amd_vfct.as_ref(),
         &secret_path,
         config.display_doorbell,
         config.display_pixels,
         &runtime_dir,
+        &qmp_path,
     ) {
         Ok(child) => child,
         Err(start_error) => {
@@ -603,11 +1048,12 @@ pub fn supervise_domain(
             &listener,
             &physical_display,
             display_sample_sequence,
+            &qmp_path,
         )?;
         require_successful_child_exit(status)
     })();
     let stop_error = if run_result.is_err() {
-        stop_child(&mut child).err()
+        stop_child(&mut child, &qmp_path).err()
     } else {
         None
     };
@@ -654,7 +1100,8 @@ pub fn recover_domain(
             if !record.matches(lease) {
                 bail!("DVM runtime record does not match durable VFIO lease");
             }
-            terminate_recovered_process(record.pid, record.process_start_ticks)?;
+            let qmp_path = store.domain_dir(&lease.domain_id)?.join("qmp.sock");
+            terminate_recovered_process(record.pid, record.process_start_ticks, &qmp_path)?;
         }
         Err(error) if is_missing_runtime(&error) => {}
         Err(error) => return Err(error),
@@ -668,10 +1115,13 @@ fn spawn_qemu_gated(
     qemu: &Path,
     lease: &VfioLeaseRecord,
     artifacts: &VerifiedArtifacts,
+    display_bdf: &str,
+    amd_vfct: Option<&AmdVfctArtifact>,
     secret: &Path,
     display_doorbell: &Path,
     display_pixels: &Path,
     runtime_dir: &Path,
+    qmp_path: &Path,
 ) -> Result<(Child, UnixStream)> {
     let serial = fs::OpenOptions::new()
         .write(true)
@@ -684,13 +1134,23 @@ fn spawn_qemu_gated(
         .mode(0o600)
         .open(runtime_dir.join("qemu.stderr.log"))?;
     let mut command = Command::new(qemu);
+    let qmp_argument = qmp_server_argument(qmp_path)?;
     let (parent_gate, child_gate) = UnixStream::pair().context("create DVM launch gate")?;
     let parent_gate_fd = parent_gate.as_raw_fd();
     let child_gate_fd = child_gate.as_raw_fd();
     command
         .arg("-name")
         .arg(format!("rustos-dvm-{}", lease.domain_id))
-        .args(["-machine", "q35,accel=kvm", "-cpu", "host", "-m", "1024M", "-smp", "2"])
+        .args([
+            "-machine",
+            "q35,accel=kvm",
+            "-cpu",
+            "host",
+            "-m",
+            DVM_GUEST_MEMORY,
+            "-smp",
+            "2",
+        ])
         .args(["-object", "iommufd,id=iommufd0"])
         .arg("-kernel")
         .arg(&artifacts.kernel)
@@ -706,6 +1166,8 @@ fn spawn_qemu_gated(
             "-no-reboot",
             "-nodefaults",
         ])
+        .arg("-qmp")
+        .arg(qmp_argument)
         .arg("-serial")
         .arg("stdio")
         .arg("-device")
@@ -736,10 +1198,26 @@ fn spawn_qemu_gated(
         .stdin(Stdio::null())
         .stdout(Stdio::from(serial))
         .stderr(Stdio::from(stderr));
+    if let Some(vfct) = amd_vfct {
+        let path = vfct
+            .path
+            .to_str()
+            .ok_or_else(|| anyhow!("AMD VFCT path is not UTF-8"))?;
+        if path.contains([',', '\n', '\r']) {
+            bail!("AMD VFCT path cannot be represented as a QEMU ACPI table property");
+        }
+        if vfct.size < ACPI_VFCT_HEADER_BYTES || vfct.sha256.len() != 64 {
+            bail!("private AMD VFCT snapshot metadata is invalid");
+        }
+        command.arg("-acpitable").arg(format!("file={path}"));
+    }
     for bdf in lease.original_drivers.keys() {
-        command
-            .arg("-device")
-            .arg(format!("vfio-pci,host={bdf},iommufd=iommufd0"));
+        let mut device = format!("vfio-pci,host={bdf},iommufd=iommufd0");
+        if bdf == display_bdf && amd_vfct.is_some() {
+            device.push_str(",addr=");
+            device.push_str(AMDGPU_QEMU_PCI_ADDRESS);
+        }
+        command.arg("-device").arg(device);
     }
     // The child cannot exec QEMU (and therefore cannot open VFIO) until the
     // parent has fsync'd the exact PID/start-time runtime record. If hostd
@@ -749,6 +1227,7 @@ fn spawn_qemu_gated(
             for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
                 libc::signal(signal, libc::SIG_DFL);
             }
+            libc::umask(0o077);
             libc::close(parent_gate_fd);
             let mut byte = 0_u8;
             loop {
@@ -781,6 +1260,7 @@ fn monitor_child(
     listener: &HostControlListener,
     display_policy: &PhysicalDisplayPolicy,
     mut display_sample_sequence: u64,
+    qmp_path: &Path,
 ) -> Result<ExitStatus> {
     let mut next_health = Instant::now() + HEALTH_INTERVAL;
     loop {
@@ -790,8 +1270,17 @@ fn monitor_child(
         if TERMINATE_REQUESTED.load(Ordering::Acquire) {
             record.state = RuntimeState::Stopping;
             store.write_record(record)?;
-            stop_child(child)?;
-            return child.wait().context("wait for stopped DVM");
+            let stopped = stop_child(child, qmp_path)?;
+            if stopped.kind != StopKind::CleanExit {
+                bail!(
+                    "DVM required forced termination after bounded ACPI shutdown: {}",
+                    stopped
+                        .qmp_failure
+                        .as_deref()
+                        .unwrap_or("unknown QMP failure")
+                );
+            }
+            return Ok(stopped.status);
         }
         if Instant::now() >= next_health {
             let probe = listener
@@ -882,21 +1371,212 @@ fn wait_for_display_readiness(
     )
 }
 
-fn stop_child(child: &mut Child) -> Result<()> {
-    if child.try_wait()?.is_some() {
+fn prepare_qmp_socket(runtime_dir: &Path) -> Result<PathBuf> {
+    let owner = unsafe { libc::geteuid() };
+    ensure_trusted_directory(runtime_dir, owner, true)?;
+    let path = runtime_dir.join("qmp.sock");
+    qmp_server_argument(&path)?;
+    match fs::symlink_metadata(&path) {
+        Ok(metadata)
+            if metadata.file_type().is_socket()
+                && metadata.uid() == owner
+                && metadata.mode() & 0o077 == 0 =>
+        {
+            fs::remove_file(&path)
+                .with_context(|| format!("remove stale private QMP socket {}", path.display()))?;
+            sync_directory(runtime_dir)?;
+        }
+        Ok(_) => bail!(
+            "refusing non-private or non-socket QMP endpoint {}",
+            path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspect QMP socket {}", path.display()));
+        }
+    }
+    Ok(path)
+}
+
+fn qmp_server_argument(path: &Path) -> Result<String> {
+    let bytes = path.as_os_str().as_bytes();
+    if bytes.is_empty() || bytes.len() > 107 {
+        bail!("QMP Unix socket path must fit Linux sockaddr_un");
+    }
+    if bytes
+        .iter()
+        .any(|byte| matches!(*byte, b',' | b'\n' | b'\r' | 0))
+    {
+        bail!("QMP Unix socket path cannot be represented as a QEMU property");
+    }
+    let path = path
+        .to_str()
+        .ok_or_else(|| anyhow!("QMP Unix socket path is not UTF-8"))?;
+    Ok(format!("unix:{path},server=on,wait=off"))
+}
+
+fn connect_private_qmp(path: &Path, deadline: Instant) -> Result<UnixStream> {
+    let owner = unsafe { libc::geteuid() };
+    ensure_trusted_parent(path, owner)?;
+    loop {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                if !metadata.file_type().is_socket()
+                    || metadata.uid() != owner
+                    || metadata.mode() & 0o077 != 0
+                {
+                    bail!(
+                        "QMP endpoint {} must be an owner-private Unix socket",
+                        path.display()
+                    );
+                }
+                match UnixStream::connect(path) {
+                    Ok(stream) => return Ok(stream),
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                        ) => {}
+                    Err(error) => {
+                        return Err(error)
+                            .with_context(|| format!("connect QMP socket {}", path.display()));
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("inspect QMP socket {}", path.display()));
+            }
+        }
+        if Instant::now() >= deadline {
+            bail!("private QMP socket {} did not become ready", path.display());
+        }
+        std::thread::sleep(QMP_CONNECT_RETRY);
+    }
+}
+
+fn read_qmp_message(reader: &mut impl BufRead) -> Result<serde_json::Value> {
+    let mut message = Vec::new();
+    let count = (&mut *reader)
+        .take(QMP_MAX_MESSAGE_BYTES + 1)
+        .read_until(b'\n', &mut message)
+        .context("read bounded QMP message")?;
+    if count == 0 {
+        bail!("QMP endpoint closed before a complete response");
+    }
+    if u64::try_from(count).unwrap_or(u64::MAX) > QMP_MAX_MESSAGE_BYTES {
+        bail!("QMP message exceeds 64 KiB bound");
+    }
+    if !message.ends_with(b"\r\n") {
+        bail!("QMP message is not CRLF terminated");
+    }
+    message.truncate(message.len() - 2);
+    let value: serde_json::Value =
+        serde_json::from_slice(&message).context("parse QMP JSON object")?;
+    if !value.is_object() {
+        bail!("QMP message must be a JSON object");
+    }
+    Ok(value)
+}
+
+fn write_qmp_command(stream: &mut UnixStream, execute: &str, id: &str) -> Result<()> {
+    let command = serde_json::json!({"execute": execute, "id": id});
+    serde_json::to_writer(&mut *stream, &command).context("encode QMP command")?;
+    stream.write_all(b"\r\n")?;
+    stream.flush().context("flush QMP command")
+}
+
+fn require_qmp_response(reader: &mut impl BufRead, expected_id: &str) -> Result<()> {
+    for _ in 0..QMP_MAX_MESSAGES {
+        let response = read_qmp_message(reader)?;
+        if response.get("event").is_some() {
+            continue;
+        }
+        if response.get("id").and_then(serde_json::Value::as_str) != Some(expected_id) {
+            bail!("QMP returned an unexpected response id");
+        }
+        if let Some(error) = response.get("error") {
+            bail!("QMP command {expected_id} failed: {error}");
+        }
+        if response.get("return").is_none() {
+            bail!("QMP command {expected_id} response has no return member");
+        }
         return Ok(());
     }
-    terminate_process(child.id())?;
-    let deadline = Instant::now() + TERMINATE_GRACE;
-    while Instant::now() < deadline {
-        if child.try_wait()?.is_some() {
-            return Ok(());
+    bail!("QMP command {expected_id} exceeded the event/response bound")
+}
+
+fn request_guest_powerdown(qmp_path: &Path) -> Result<()> {
+    let deadline = Instant::now() + QMP_IO_TIMEOUT;
+    let mut stream = connect_private_qmp(qmp_path, deadline)?;
+    stream.set_read_timeout(Some(QMP_IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(QMP_IO_TIMEOUT))?;
+    let reader_stream = stream.try_clone().context("clone QMP stream reader")?;
+    let mut reader = BufReader::new(reader_stream);
+    let greeting = read_qmp_message(&mut reader).context("read QMP server greeting")?;
+    if !greeting
+        .get("QMP")
+        .is_some_and(serde_json::Value::is_object)
+    {
+        bail!("QMP server greeting lacks the QMP object");
+    }
+    write_qmp_command(&mut stream, "qmp_capabilities", QMP_CAPABILITIES_ID)?;
+    require_qmp_response(&mut reader, QMP_CAPABILITIES_ID)?;
+    write_qmp_command(&mut stream, "system_powerdown", QMP_POWERDOWN_ID)?;
+    require_qmp_response(&mut reader, QMP_POWERDOWN_ID)?;
+    Ok(())
+}
+
+fn wait_child_exit(child: &mut Child, timeout: Duration) -> Result<Option<ExitStatus>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
         }
         std::thread::sleep(SUPERVISOR_TICK);
     }
+}
+
+fn stop_child(child: &mut Child, qmp_path: &Path) -> Result<StopResult> {
+    if let Some(status) = child.try_wait()? {
+        return Ok(StopResult {
+            status,
+            kind: StopKind::CleanExit,
+            qmp_failure: None,
+        });
+    }
+    let qmp_failure = match request_guest_powerdown(qmp_path) {
+        Ok(()) => {
+            if let Some(status) = wait_child_exit(child, GUEST_SHUTDOWN_GRACE)? {
+                return Ok(StopResult {
+                    status,
+                    kind: StopKind::CleanExit,
+                    qmp_failure: None,
+                });
+            }
+            Some("QMP system_powerdown was accepted but QEMU did not exit in 10 seconds".to_owned())
+        }
+        Err(error) => Some(format!("{error:#}")),
+    };
+    terminate_process(child.id())?;
+    if let Some(status) = wait_child_exit(child, TERMINATE_GRACE)? {
+        return Ok(StopResult {
+            status,
+            kind: StopKind::Forced,
+            qmp_failure,
+        });
+    }
     child.kill().context("SIGKILL supervised DVM")?;
-    child.wait().context("reap supervised DVM")?;
-    Ok(())
+    let status = child.wait().context("reap supervised DVM")?;
+    Ok(StopResult {
+        status,
+        kind: StopKind::Forced,
+        qmp_failure,
+    })
 }
 
 fn install_signal_handlers() -> Result<()> {
@@ -919,7 +1599,7 @@ fn terminate_process(pid: u32) -> Result<()> {
     Ok(())
 }
 
-fn terminate_recovered_process(pid: u32, expected_start_ticks: u64) -> Result<()> {
+fn terminate_recovered_process(pid: u32, expected_start_ticks: u64, qmp_path: &Path) -> Result<()> {
     match process_start_ticks(pid) {
         Ok(actual) if actual != expected_start_ticks => return Ok(()),
         Ok(_) => {}
@@ -937,6 +1617,9 @@ fn terminate_recovered_process(pid: u32, expected_start_ticks: u64) -> Result<()
         Ok(_) => {}
         Err(error) if is_not_found(&error) => return Ok(()),
         Err(error) => return Err(error).context("revalidate recorded DVM process identity"),
+    }
+    if request_guest_powerdown(qmp_path).is_ok() && pidfd.wait_exited(GUEST_SHUTDOWN_GRACE)? {
+        return Ok(());
     }
     pidfd.send_signal(libc::SIGTERM)?;
     if pidfd.wait_exited(TERMINATE_GRACE)? {
@@ -1044,7 +1727,31 @@ fn verify_qemu(path: &Path) -> Result<(PathBuf, String)> {
     Ok((canonical, digest))
 }
 
-fn verify_iommufd() -> Result<()> {
+fn memlock_budget_is_adequate(limit: libc::rlim_t) -> bool {
+    limit == libc::RLIM_INFINITY || limit >= DVM_REQUIRED_MEMLOCK_BYTES
+}
+
+fn verify_qemu_memlock_budget() -> Result<()> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut limit) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("read QEMU memlock resource limit");
+    }
+    if !memlock_budget_is_adequate(limit.rlim_cur) {
+        bail!(
+            "physical DVM requires RLIMIT_MEMLOCK soft limit >= {} bytes (observed {}) before VFIO mutation",
+            DVM_REQUIRED_MEMLOCK_BYTES,
+            limit.rlim_cur
+        );
+    }
+    Ok(())
+}
+
+/// Exercise only the userspace IOMMUFD ABI. This does not bind, open, enable,
+/// or reset a VFIO device.
+pub fn probe_iommufd() -> Result<()> {
     let path = Path::new("/dev/iommu");
     let metadata = fs::symlink_metadata(path).context("inspect /dev/iommu")?;
     if !metadata.file_type().is_char_device() {
@@ -1094,20 +1801,54 @@ fn verify_iommufd() -> Result<()> {
     Ok(())
 }
 
-fn ensure_private_regular_file(path: &Path) -> Result<()> {
+fn prepare_dma_pinnable_pixel_file(path: &Path) -> Result<()> {
     ensure_trusted_parent(path, unsafe { libc::geteuid() })?;
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("inspect private DVM file {}", path.display()))?;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("open private DVM pixel file {}", path.display()))?;
+    let metadata = file.metadata()?;
     if !metadata.file_type().is_file()
         || metadata.uid() != unsafe { libc::geteuid() }
         || metadata.mode() & 0o077 != 0
+        || metadata.len() != DVM_PIXEL_BYTES
     {
         bail!(
-            "DVM file {} must be owner-private and non-symlink",
+            "DVM pixel file {} must be owner-private, non-symlink, and exactly {} bytes",
+            path.display(),
+            DVM_PIXEL_BYTES,
+        );
+    }
+    let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+    if unsafe { libc::fstatfs(file.as_raw_fd(), filesystem.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("inspect DVM pixel filesystem {}", path.display()));
+    }
+    let filesystem = unsafe { filesystem.assume_init() };
+    let filesystem_type = filesystem.f_type as u64;
+    if !dma_pinnable_filesystem_type(filesystem_type) {
+        bail!(
+            "DVM pixel file {} must use DMA-pinnable tmpfs or hugetlbfs, got filesystem type {filesystem_type:#x}",
             path.display()
         );
     }
+    let length =
+        libc::off_t::try_from(DVM_PIXEL_BYTES).expect("bounded DVM pixel aperture fits off_t");
+    if unsafe { libc::fallocate(file.as_raw_fd(), 0, 0, length) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("preallocate DVM pixel backing {}", path.display()));
+    }
+    file.sync_data()
+        .with_context(|| format!("sync DVM pixel backing {}", path.display()))?;
     Ok(())
+}
+
+fn dma_pinnable_filesystem_type(filesystem_type: u64) -> bool {
+    const TMPFS_MAGIC: u64 = 0x0102_1994;
+    const HUGETLBFS_MAGIC: u64 = 0x9584_58f6;
+    matches!(filesystem_type, TMPFS_MAGIC | HUGETLBFS_MAGIC)
 }
 
 fn ensure_private_socket(path: &Path) -> Result<()> {
@@ -1320,14 +2061,173 @@ fn is_not_found(error: &anyhow::Error) -> bool {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
     use std::os::unix::process::ExitStatusExt;
+    use std::sync::mpsc;
+
+    fn vfct_fixture(target: AmdPciIdentity) -> Vec<u8> {
+        let image_len = 0x80_usize;
+        let image_offset = ACPI_VFCT_HEADER_BYTES;
+        let image_start = image_offset + ACPI_VFCT_IMAGE_HEADER_BYTES;
+        let mut table = vec![0_u8; image_start + image_len];
+        let table_len = table.len() as u32;
+        table[0..4].copy_from_slice(b"VFCT");
+        table[4..8].copy_from_slice(&table_len.to_le_bytes());
+        table[ACPI_VFCT_VBIOS_OFFSET..ACPI_VFCT_VBIOS_OFFSET + 4]
+            .copy_from_slice(&(image_offset as u32).to_le_bytes());
+        table[image_offset..image_offset + 4].copy_from_slice(&target.bus.to_le_bytes());
+        table[image_offset + 4..image_offset + 8].copy_from_slice(&target.device.to_le_bytes());
+        table[image_offset + 8..image_offset + 12].copy_from_slice(&target.function.to_le_bytes());
+        table[image_offset + 12..image_offset + 14].copy_from_slice(&target.vendor.to_le_bytes());
+        table[image_offset + 14..image_offset + 16]
+            .copy_from_slice(&target.device_id.to_le_bytes());
+        table[image_offset + 16..image_offset + 18]
+            .copy_from_slice(&target.subsystem_vendor.to_le_bytes());
+        table[image_offset + 18..image_offset + 20]
+            .copy_from_slice(&target.subsystem_device.to_le_bytes());
+        table[image_offset + ACPI_VFCT_IMAGE_REVISION_OFFSET
+            ..image_offset + ACPI_VFCT_IMAGE_REVISION_OFFSET + 4]
+            .copy_from_slice(&1_u32.to_le_bytes());
+        table[image_offset + ACPI_VFCT_IMAGE_LENGTH_OFFSET
+            ..image_offset + ACPI_VFCT_IMAGE_LENGTH_OFFSET + 4]
+            .copy_from_slice(&(image_len as u32).to_le_bytes());
+        table[image_start] = 0x55;
+        table[image_start + 1] = 0xaa;
+        table[image_start + 0x48..image_start + 0x4a].copy_from_slice(&0x60_u16.to_le_bytes());
+        table[image_start + 0x64..image_start + 0x68].copy_from_slice(b"ATOM");
+        let checksum = table.iter().fold(0_u8, |sum, byte| sum.wrapping_add(*byte));
+        table[9] = table[9].wrapping_sub(checksum);
+        table
+    }
+
+    fn amd_target() -> AmdPciIdentity {
+        AmdPciIdentity {
+            bus: 0x65,
+            device: 0,
+            function: 0,
+            vendor: 0x1002,
+            device_id: 0x1900,
+            subsystem_vendor: 0x1043,
+            subsystem_device: 0x3a48,
+        }
+    }
 
     #[test]
     fn iommufd_probe_matches_linux_uapi_layout() {
+        assert_eq!(DVM_GUEST_MEMORY, "2048M");
+        assert_eq!(DVM_REQUIRED_MEMLOCK_BYTES, 4_294_967_296);
+        assert!(!memlock_budget_is_adequate(8 * 1024 * 1024));
+        assert!(memlock_budget_is_adequate(DVM_REQUIRED_MEMLOCK_BYTES));
+        assert!(memlock_budget_is_adequate(libc::RLIM_INFINITY));
         assert_eq!(std::mem::size_of::<IommuIoasAlloc>(), 12);
         assert_eq!(std::mem::size_of::<IommuDestroy>(), 8);
         assert_eq!(IOMMU_IOAS_ALLOC, 0x3b81);
         assert_eq!(IOMMU_DESTROY, 0x3b80);
+    }
+
+    #[test]
+    fn vfct_extraction_binds_exact_amd_identity_and_atom_image() {
+        let target = amd_target();
+        let table = vfct_fixture(target);
+        let image = extract_amdgpu_vfct_image(&table, target).unwrap();
+        assert_eq!(image.len(), 0x80);
+        assert_eq!(&image[0..2], &[0x55, 0xaa]);
+        assert_eq!(&image[0x64..0x68], b"ATOM");
+
+        let located = locate_amdgpu_vfct_image(&table, target).unwrap();
+        let mut relocated = table.clone();
+        let header = located.header_offset;
+        relocated[header..header + 4].copy_from_slice(&AMDGPU_GUEST_PCI_BUS.to_le_bytes());
+        relocated[header + 4..header + 8].copy_from_slice(&AMDGPU_GUEST_PCI_DEVICE.to_le_bytes());
+        relocated[header + 8..header + 12]
+            .copy_from_slice(&AMDGPU_GUEST_PCI_FUNCTION.to_le_bytes());
+        relocated[9] = 0;
+        let checksum = relocated
+            .iter()
+            .fold(0_u8, |sum, byte| sum.wrapping_add(*byte));
+        relocated[9] = 0_u8.wrapping_sub(checksum);
+        let guest = AmdPciIdentity {
+            bus: AMDGPU_GUEST_PCI_BUS,
+            device: AMDGPU_GUEST_PCI_DEVICE,
+            function: AMDGPU_GUEST_PCI_FUNCTION,
+            ..target
+        };
+        assert_eq!(
+            locate_amdgpu_vfct_image(&relocated, guest).unwrap().image,
+            located.image
+        );
+        assert!(locate_amdgpu_vfct_image(&relocated, target).is_err());
+
+        let mut wrong = target;
+        wrong.subsystem_device ^= 1;
+        assert!(extract_amdgpu_vfct_image(&table, wrong).is_err());
+
+        let mut subsystem_unspecified = vfct_fixture(target);
+        subsystem_unspecified[ACPI_VFCT_HEADER_BYTES + 16..ACPI_VFCT_HEADER_BYTES + 20].fill(0);
+        let checksum = subsystem_unspecified
+            .iter()
+            .fold(0_u8, |sum, byte| sum.wrapping_add(*byte));
+        subsystem_unspecified[9] = subsystem_unspecified[9].wrapping_sub(checksum);
+        assert_eq!(
+            extract_amdgpu_vfct_image(&subsystem_unspecified, wrong)
+                .unwrap()
+                .len(),
+            0x80
+        );
+
+        let mut partial_subsystem = vfct_fixture(target);
+        partial_subsystem[ACPI_VFCT_HEADER_BYTES + 18..ACPI_VFCT_HEADER_BYTES + 20].fill(0);
+        let checksum = partial_subsystem
+            .iter()
+            .fold(0_u8, |sum, byte| sum.wrapping_add(*byte));
+        partial_subsystem[9] = partial_subsystem[9].wrapping_sub(checksum);
+        assert!(extract_amdgpu_vfct_image(&partial_subsystem, target).is_err());
+    }
+
+    #[test]
+    fn vfct_extraction_rejects_checksum_bounds_and_invalid_atom() {
+        let target = amd_target();
+        let mut bad_checksum = vfct_fixture(target);
+        bad_checksum[20] ^= 1;
+        assert!(extract_amdgpu_vfct_image(&bad_checksum, target).is_err());
+
+        let mut bad_length = vfct_fixture(target);
+        let image_header = ACPI_VFCT_HEADER_BYTES;
+        bad_length[image_header + ACPI_VFCT_IMAGE_LENGTH_OFFSET
+            ..image_header + ACPI_VFCT_IMAGE_LENGTH_OFFSET + 4]
+            .copy_from_slice(&u32::MAX.to_le_bytes());
+        let checksum = bad_length
+            .iter()
+            .fold(0_u8, |sum, byte| sum.wrapping_add(*byte));
+        bad_length[9] = bad_length[9].wrapping_sub(checksum);
+        assert!(extract_amdgpu_vfct_image(&bad_length, target).is_err());
+
+        let mut bad_atom = vfct_fixture(target);
+        let image_start = ACPI_VFCT_HEADER_BYTES + ACPI_VFCT_IMAGE_HEADER_BYTES;
+        bad_atom[image_start] = 0;
+        let checksum = bad_atom
+            .iter()
+            .fold(0_u8, |sum, byte| sum.wrapping_add(*byte));
+        bad_atom[9] = bad_atom[9].wrapping_sub(checksum);
+        assert!(extract_amdgpu_vfct_image(&bad_atom, target).is_err());
+
+        let mut padded = vfct_fixture(target);
+        padded.extend_from_slice(&[0_u8; ACPI_VFCT_IMAGE_HEADER_BYTES]);
+        let padded_len = padded.len() as u32;
+        padded[4..8].copy_from_slice(&padded_len.to_le_bytes());
+        let checksum = padded
+            .iter()
+            .fold(0_u8, |sum, byte| sum.wrapping_add(*byte));
+        padded[9] = padded[9].wrapping_sub(checksum);
+        assert!(extract_amdgpu_vfct_image(&padded, target).is_ok());
+
+        let tail = padded.len() - 1;
+        padded[tail] = 1;
+        let checksum = padded
+            .iter()
+            .fold(0_u8, |sum, byte| sum.wrapping_add(*byte));
+        padded[9] = padded[9].wrapping_sub(checksum);
+        assert!(extract_amdgpu_vfct_image(&padded, target).is_err());
     }
 
     #[test]
@@ -1388,5 +2288,84 @@ mod tests {
         assert!(require_successful_child_exit(ExitStatus::from_raw(0)).is_ok());
         assert!(require_successful_child_exit(ExitStatus::from_raw(7 << 8)).is_err());
         assert!(require_successful_child_exit(ExitStatus::from_raw(libc::SIGKILL)).is_err());
+    }
+
+    #[test]
+    fn physical_pixel_backing_contract_is_exact_and_dma_pinnable() {
+        assert_eq!(DVM_PIXEL_BYTES, 128 * 1024 * 1024);
+        assert!(dma_pinnable_filesystem_type(0x0102_1994));
+        assert!(dma_pinnable_filesystem_type(0x9584_58f6));
+        assert!(!dma_pinnable_filesystem_type(0xef53));
+    }
+
+    #[test]
+    fn qmp_powerdown_negotiates_capabilities_before_shutdown() {
+        let owner = unsafe { libc::geteuid() };
+        let current = std::env::current_dir().unwrap();
+        let trusted_parent = current
+            .ancestors()
+            .find(|candidate| {
+                ensure_trusted_directory(candidate, owner, false).is_ok()
+                    && fs::metadata(candidate).is_ok_and(|metadata| metadata.mode() & 0o200 != 0)
+            })
+            .unwrap();
+        let root = trusted_parent.join(format!(
+            ".hostd-qmp-test-{}-{}",
+            std::process::id(),
+            PRIVATE_REPLACE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = root.join("qmp.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .write_all(b"{\"capabilities\":[],\"QMP\":{\"version\":{}}}\r\n")
+                .unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut commands = Vec::new();
+            for (expected_execute, expected_id) in [
+                ("qmp_capabilities", QMP_CAPABILITIES_ID),
+                ("system_powerdown", QMP_POWERDOWN_ID),
+            ] {
+                let request = read_qmp_message(&mut reader).unwrap();
+                assert_eq!(
+                    request.get("execute").and_then(serde_json::Value::as_str),
+                    Some(expected_execute)
+                );
+                assert_eq!(
+                    request.get("id").and_then(serde_json::Value::as_str),
+                    Some(expected_id)
+                );
+                commands.push(expected_execute.to_owned());
+                let response = serde_json::json!({"return": {}, "id": expected_id});
+                serde_json::to_writer(&mut stream, &response).unwrap();
+                stream.write_all(b"\r\n").unwrap();
+                stream.flush().unwrap();
+            }
+            sender.send(commands).unwrap();
+        });
+
+        request_guest_powerdown(&socket).unwrap();
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            ["qmp_capabilities", "system_powerdown"]
+        );
+        server.join().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn qmp_path_rejects_property_injection_and_oversize() {
+        assert!(qmp_server_argument(Path::new("/tmp/qmp,bad.sock")).is_err());
+        let oversized = format!("/{}", "q".repeat(108));
+        assert!(qmp_server_argument(Path::new(&oversized)).is_err());
+        assert_eq!(
+            qmp_server_argument(Path::new("/run/rustos/qmp.sock")).unwrap(),
+            "unix:/run/rustos/qmp.sock,server=on,wait=off"
+        );
     }
 }

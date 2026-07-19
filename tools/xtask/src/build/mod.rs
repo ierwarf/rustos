@@ -182,10 +182,60 @@ fn validate_dvm_gpu_contract(config: &Config) -> Result<()> {
     for token in [
         "#define RUSTOS_DVM_DISPLAY_OWNER_NAME \"display-owner.lock\"",
         "#define RUSTOS_DVM_DISPLAY_READY_CANDIDATE \".display-ready.next\"",
+        "#define RUSTOS_DVM_DMABUF_DEVICE \"/dev/rustos-dvm-display-dmabuf\"",
         "owner_fd = claim_display_process_owner();",
+        "candidate_crtc = select_connector_crtc(fd, resources, connector);",
+        "exporter = open(RUSTOS_DVM_DMABUF_DEVICE,",
+        "if (rustos_gpu_runtime_import_dmabuf_sources(",
+        "acquire_fence_fd = acquire_gpu_source_fence(&display, &submission);",
+        "const int dmabuf_sources = rustos_gpu_runtime_uses_dmabuf_sources(runtime);",
+        "pollfds[2].fd = frame->in_fence_fd;",
+        "\"MODE=gpu-compositor-dmabuf-source\\n\"",
+        "\"ATOMIC_KMS_SCANOUT=1\\n\"",
+        "\"STAGED_DAMAGE_COPY=0\\n\"",
         "renameat(directory_fd, RUSTOS_DVM_DISPLAY_READY_CANDIDATE, directory_fd,",
     ] {
         require_contract_token(&relay, &relay_path, token)?;
+    }
+    require_contract_token(
+        &runtime,
+        &runtime_path,
+        "runtime->egl_display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL,",
+    )?;
+    for token in [
+        "!extension_present(egl_extensions, \"EGL_KHR_wait_sync\") ||",
+        "result = runtime->wait_sync(runtime->egl_display, sync, 0);",
+        "runtime->stage = \"gpu-prime-internal-source\";",
+    ] {
+        require_contract_token(&runtime, &runtime_path, token)?;
+    }
+    require_contract_token(
+        &runtime,
+        &runtime_path,
+        "generation <= runtime->last_generation ||",
+    )?;
+    require_contract_token(
+        &runtime,
+        &runtime_path,
+        "sequence <= runtime->last_sequence ||",
+    )?;
+    require_contract_token(
+        &module,
+        &module_path,
+        "if (direction != DMA_TO_DEVICE && direction != DMA_BIDIRECTIONAL)",
+    )?;
+    require_contract_token(
+        &module,
+        &module_path,
+        "if (!dev_is_dma_coherent(attachment->dev))",
+    )?;
+    for token in [
+        "#define RUSTOS_DVM_DMABUF_IOCTL_ACQUIRE _IOW('R', 0x42, struct rustos_dvm_acquire_request)",
+        "!atomic_read(&state->relay_ready) ||",
+        "dma_rmb();",
+        "sync_file = sync_file_create(fence);",
+    ] {
+        require_contract_token(&module, &module_path, token)?;
     }
     require_contract_token(
         &agent,
@@ -195,6 +245,9 @@ fn validate_dvm_gpu_contract(config: &Config) -> Result<()> {
     for token in [
         "#define READY_OWNER_NAME \"agent-owner.lock\"",
         "#define READY_CANDIDATE_NAME \".ready.next\"",
+        "\"MODE=gpu-compositor-dmabuf-source\\n\"",
+        "\"ATOMIC_KMS_SCANOUT=1\\n\"",
+        "\"STAGED_DAMAGE_COPY=0\\n\"",
         "flock(guard->singleton_fd, LOCK_EX | LOCK_NB) != 0) {",
         "renameat(directory_fd, READY_CANDIDATE_NAME, directory_fd, \"ready\") != 0) {",
         "return local_health(&contract) ? EXIT_SUCCESS : EXIT_FAILURE;",
@@ -204,7 +257,6 @@ fn validate_dvm_gpu_contract(config: &Config) -> Result<()> {
     for (contents, path, token) in [
         (&relay, &relay_path, "rustos_gpu_runtime_render_legacy"),
         (&relay, &relay_path, "open_kms_display"),
-        (&relay, &relay_path, "RUSTOS_DVM_DMABUF_DEVICE"),
         (&runtime, &runtime_path, "rustos_gpu_runtime_render_legacy"),
         (
             &runtime_header,

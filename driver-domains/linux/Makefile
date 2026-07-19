@@ -4,11 +4,11 @@ ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 OUT ?= $(ROOT)/out
 JOBS ?= $(shell getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
 
-.PHONY: all fetch configure build verify stage-release clean distclean print-artifacts rebuild-agent rebuild-display rebuild-net dev-agent dev-display dev-net
+.PHONY: all fetch configure build verify stage-release clean distclean print-artifacts rebuild-agent rebuild-display rebuild-net dev-agent dev-display dev-net selftest-config-cache build-plan ccache-stats profile-build
 
 all: build
 
-fetch configure build verify print-artifacts:
+fetch configure build verify print-artifacts selftest-config-cache build-plan ccache-stats profile-build:
 	@OUT="$(OUT)" JOBS="$(JOBS)" "$(ROOT)/scripts/build.sh" $@
 
 # Rebuild exactly one local DVM relay without discarding the Buildroot host

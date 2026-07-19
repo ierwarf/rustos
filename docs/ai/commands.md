@@ -21,6 +21,10 @@ failure output as the primary debugging context.
 | Command | Use | Writes | Common failure meaning |
 | --- | --- | --- | --- |
 | `cargo xtask build-dvm` | build the pinned Linux DVM, cryptographically verify every installed module against its generated X.509 certificate, and emit a self-contained schema-8 bundle | `driver-domains/linux/out/` | missing Buildroot prerequisite, unsigned/foreign module, or source/artifact mismatch |
+| `make -C driver-domains/linux build-plan` | read-only classification of the next DVM build as cold/full or explicit incremental lanes | temporary config probe only | stale Buildroot/toolchain identity, unsafe config transition, or the listed kernel/package/rootfs lanes |
+| `make -C driver-domains/linux selftest-config-cache` | prove the config admission policy and that a kernel-fragment mutation changes the kernel lane without changing the host-toolchain lane | temporary files only | cache boundary regression |
+| `make -C driver-domains/linux ccache-stats` | report Buildroot's persistent compiler-cache hits and misses | none after the cached ccache tool exists | missing/incomplete Buildroot host tools |
+| `make -C driver-domains/linux profile-build` | generate Buildroot's package/step duration graphs after a completed build | `out/buildroot-output/graphs/` | incomplete timing data or missing matplotlib/numpy |
 | `cargo xtask verify-dvm` | verify every co-located DVM artifact, kernel signature-enforcement configuration, certificate, source lock, and control contract | none | altered/missing DVM artifact, signing policy, source input, or contract |
 | `make -C driver-domains/linux verify` | recheck Buildroot/kernel configuration and every installed module's detached PKCS#7 signature without rebuilding the DVM | temporary files under `/tmp` only | unsigned, malformed, or foreign-signed module; stale build tree |
 | `make -C driver-domains/linux stage-release DEST=/trusted/new/path` | verify, copy, reverify, and atomically publish the eight-file DVM bundle to a fresh owner-controlled path | the new destination only | existing destination, symlink/mutable ancestor, or artifact mutation |
@@ -31,11 +35,15 @@ failure output as the primary debugging context.
 | `make -C driver-domains/linux dev-display` | compile only the cached DVM display package; no rootfs or artifact is created | `out/buildroot-output/target/` only | cold/stale configuration; run `build` first |
 | `make -C driver-domains/linux dev-net` | compile only the cached DVM network package; no rootfs or artifact is created | `out/buildroot-output/target/` only | cold/stale configuration; run `build` first |
 | `cargo xtask kvm-smoke` | concurrently boot Linux DVM and RustOS with QEMU/KVM | `build/kvm/` | unavailable `/dev/kvm`, guest exit, missing readiness marker |
+| `cargo xtask kvm-smoke --timeout 30 --gui-dvm-surfaces --physical-amdgpu <BDF> --amd-vfct <TABLE>` | explicitly non-commercial dirty-device lab run: boot RustOS and a display-only DVM with QEMU 11.0 or newer VFIO PCI-BAR DMA-BUF mapping, execute the real `uiserver` GPU scene through the already-bound AMD VFIO function, and scan it out on the physical connector; the runner never binds, unbinds, or resets the device and attaches no network device | `build/kvm/` plus the physical display | unsafe AMD/VFIO/IOMMUFD/VFCT state, inaccessible per-device `/dev/vfio/devices/vfioN` cdev, unavailable VFIO BAR DMA-BUF support, inherited memlock below 4 GiB, missing end-to-end GPU completion, or guest exit; never counts as supervised reset/revoke evidence |
 | `cargo xtask kvm-run` | start the interactive Linux-DVM display session; it waits for an atomic three-buffer/page-flip-ready scanout before exposing the window, then records real pointer ingress and healthy idle UI ticks when QEMU closes | `build/kvm/` | unavailable GUI backend, `/dev/kvm`, display readiness failure, missing real pointer evidence, or a guest exit |
 | `cargo run -p rustos-hostd -- discover` | read host IOMMU groups | none | IOMMU unavailable or unreadable sysfs |
 | `cargo run -p rustos-hostd -- preflight --plan <file>` | require complete, non-protected IOMMU-group ownership and reject live `boot_vga`/connected DRM displays | none | incomplete group, declared host-critical BDF, or active L0 display |
-| `cargo run -p rustos-hostd -- preflight-physical --plan <file> --dvm-artifact-manifest <file> --device-policy <file> --qemu <file>` | before any VFIO bind, validate topology, live display safety, exact policy/QEMU/bundle, and an empty IOMMUFD IOAS allocate/destroy probe | none | unsafe/mismatched runtime input or unusable IOMMUFD ABI |
-| `cargo run -p rustos-hostd -- supervise ...` | launch one signed display-only physical-device DVM with IOMMUFD, authenticated readiness, bounded stop, reset, and restore | private runtime record and supervised QEMU | stale authorization, artifact/policy/QEMU mismatch, absent IOMMUFD/reset, failed authentication, signaled/nonzero QEMU exit, or quarantine |
+| `cargo run -p rustos-hostd -- preflight-physical --plan <file> --dvm-artifact-manifest <file> --device-policy <file> --qemu <file>` | before any VFIO bind, validate topology, live display, lease-contained reset scope, DMA-safe VFIO bind configuration, at least 4 GiB soft memlock, exact policy/QEMU/bundle, exact checksummed AMD VFCT/ATOM VBIOS, and an empty IOMMUFD IOAS allocate/destroy probe | none | unsafe/mismatched runtime input, reset scope escaping the lease, insufficient pinning budget, idle-D3 DMA window, missing/mismatched VBIOS, or unusable IOMMUFD ABI |
+| `cargo run -p rustos-hostd -- extract-amd-vbios --vfct <VFCT> --bdf <BDF> --output <ROM>` | extract one exact AMD APU VBIOS from a read-only VFCT snapshot into a new owner-private file for focused diagnosis; the subsystem pair must be exact or both VFCT fields must be zero | new 0600 ROM snapshot | bad ACPI checksum/bounds, wrong identity, partial/mismatched subsystem, duplicate image, invalid 0x55aa/ATOM header, symlink/mutable source, or existing output |
+| `cargo run -p rustos-hostd -- prepare-amd-vfct --vfct <VFCT> --bdf <HOST-BDF> --output <TABLE>` | validate the host identity, relocate only its VFCT image BDF to fixed guest slot `0000:00:08.0`, recompute the ACPI checksum, and preserve the VBIOS bytes | new 0600 relocated VFCT table | any source validation failure, changed payload, invalid relocated checksum/identity, unsafe path, or existing output |
+| `sudo target/debug/rustos-hostd probe-iommufd` | exercise one empty IOMMUFD IOAS allocate/destroy round trip without binding or opening a VFIO device | none | missing administrator access or incompatible IOMMUFD userspace ABI |
+| `cargo run -p rustos-hostd -- supervise ...` | launch one signed display-only physical-device DVM with IOMMUFD, an exact private relocated AMD VFCT table supplied through ACPI at fixed guest BDF, authenticated readiness, private QMP/ACPI shutdown with actual-exit proof, bounded forced fallback, reset, and restore | private runtime record/VFCT/QMP endpoint and supervised QEMU | stale authorization, artifact/policy/QEMU/VFCT mismatch, absent IOMMUFD/reset, failed authentication, rejected/timed-out ACPI shutdown, signaled/nonzero QEMU exit, or quarantine |
 | `cargo run -p rustos-hostd -- verify-artifacts --dvm-artifact-manifest <release/rustos-linux-dvm-x86_64.manifest>` | independently admit one staged self-contained schema-8 DVM bundle | none | mutable path, missing/extra metadata, or companion-file hash mismatch |
 | `cargo run -p rustos-hostd -- recover --plan <file>` | recover an active lease by canonical runtime record plus exact post-open PID/start-time identity, signal only through pidfd, then reset and restore the whole group | removes runtime/lease state only after success | unsafe/stale runtime identity, unavailable pidfd, or reset/restore failure |
 | `cargo run -p rustos-hostd -- relay-input ...` | relay validated DVM Linux input into RustOS's fixed input ring | launch-owned ivshmem backing and doorbell | policy mismatch, malformed DVM event, or peer lifecycle failure |
@@ -58,6 +66,18 @@ for a local DVM relay source change, use the matching `rebuild-*` target above
 and then `cargo xtask verify-dvm`.
 
 ## DVM build-speed contract
+
+Run `make -C driver-domains/linux build-plan` before any DVM integration build.
+Its output is routing, not artifact evidence. `mode=full-output` is reserved for
+a changed Buildroot/toolchain identity or a configuration transition whose
+complete `BR2_*` diff cannot be admitted safely. Kernel source/config changes
+select `linux+signed-kernel-modules+rootfs`; local relay changes select only
+their package plus rootfs; overlay, post-build, and AMD firmware-policy changes
+select rootfs only. The wrapper removes stale installed modules before the
+kernel lane completes and writes cache stamps only after all release checks
+succeed. Configuration-identity stamps are the exception: they are recorded
+after successful Kconfig reconciliation so an interrupted build can resume;
+they are routing state, not release evidence.
 
 For a source-only edit under one local DVM relay package, `cargo xtask dev-plan`
 puts `make -C driver-domains/linux dev-*` in `now` and the matching
@@ -82,6 +102,68 @@ the repository wrapper overrides Buildroot's reproducible single-threaded
 Do not call Buildroot directly: doing so bypasses this speed and reproducibility
 contract. XZ worker count may vary, but the fixed block partition and locked
 tool version keep the compressed stream independent of scheduling.
+
+An additive defconfig change preserves the cached Buildroot host toolchain only
+when every changed symbol is a disabled-to-`y` transition named in
+`scripts/additive-package-cache-v1.txt`. That file contains only audited
+target-only leaf packages that cannot alter feature detection or linkage of an
+already-built package. The wrapper renders a separate desired configuration
+and compares the complete `BR2_*` maps before building the new package and
+rootfs. Value changes, missing keys, an unlisted package, architecture/toolchain
+changes, package removal, or conservative driver source
+identity changes force Buildroot's clean-output rebuild. Linux Kconfig/source
+and host kernel-build header changes are isolated to the kernel and signed
+module lane; AMD firmware lock and post-build changes are rootfs-only. This
+matches the
+[Buildroot incremental-build warning](https://buildroot.org/downloads/manual/manual.html):
+package additions may be incremental only when existing optional consumers do
+not need rebuilding; removals require a clean rebuild.
+
+`BR2_CCACHE=y` and `BR2_CCACHE_USE_BASEDIR=y` keep object cache entries in
+`~/.buildroot-ccache`, outside the disposable output tree. Use `ccache-stats`
+to measure whether a repeated cold build is receiving real hits. After a
+completed build, Buildroot's official `graph-build` facility may be run through
+the wrapper during performance work to attribute duration by package; do not
+infer build cost from artifact size.
+
+The stronger cold-build optimization is a separately produced, checksummed
+Buildroot SDK consumed as a custom external toolchain. Buildroot explicitly
+recommends that backend when internal-toolchain rebuild time is excessive.
+RustOS does not switch to it opportunistically: the SDK needs a pinned source
+identity, relocation test, ABI/config equivalence check, and release provenance
+before it can replace the current internal toolchain.
+
+### Cold DVM integration runbook
+
+Use this only when `build-plan` requires a cold/full integration build or when
+producing the final appliance. Do not insert `clean` between these steps.
+
+1. Confirm no DVM build process is live, then run `selftest-config-cache` and
+   `build-plan`. Record the complete plan output.
+2. Capture cumulative `ccache-stats` if the cached host tool exists. Do not
+   reset a shared cache merely to obtain cleaner numbers.
+3. Run exactly one `cargo xtask build-dvm`. If it is interrupted or a
+   compile error is corrected, rerun that same command against the partial
+   output; do not restart from an empty tree.
+4. Only after success, run `ccache-stats`, `profile-build`, and
+   `cargo xtask verify-dvm`. The timing graphs explain build cost; they do not
+   prove runtime correctness.
+5. Keep KVM and physical-device tests as separate gates. A successful image
+   build never authorizes or proves VFIO binding, DMA-BUF scanout, FPS, reset,
+   revoke, or recovery.
+
+The signed DVM is verification-reproducible, not necessarily byte-identical
+between independent builds: Linux may generate a new per-build module-signing
+key. The release contract is the exact certificate-bound module verification,
+locked inputs, normalized packaging, and artifact manifest. Never strip or
+otherwise mutate a `.ko` after its signature is attached.
+
+Settle a physical-DVM kernel envelope before its first integration build. The
+AMD display envelope explicitly pins ZONE_DEVICE page ownership, DMA-BUF/sync,
+AMD DC/KMS, and the absence of nested VFIO/IOMMUFD, generic DMA heaps, userptr,
+and diagnostic DRM providers. The post-build step seals AMDGPU firmware to
+`board/amdgpu-firmware-1002-1900.txt`; changes to that rootfs-only profile
+regenerate the image while preserving the host toolchain.
 
 `cargo xtask dev-plan` never executes the printed commands. `now` is the
 edit-loop set. `stable-batch` is ordered and should run once after the related
@@ -109,7 +191,9 @@ fallback.
   needs a real input source assigned to the DVM. It is not storage or
   PCI-passthrough validation.
 - `--gui-dvm-surfaces` adds the private launch-owned production
-  `ivshmem-doorbell` topology to both KVM guests. Its broker accepts exactly
+  `ivshmem-doorbell` topology to both KVM guests. Both its writable control BAR
+  and separate pixel backing live in the same owner-only tmpfs directory so a
+  physical VFIO device can pin every guest RAM section through IOMMUFD. Its broker accepts exactly
   two same-UID QEMU peers and two fixed reverse-vector meanings, then passes
   only the host-created control records and eventfds. A separate 32 MiB
   cacheable pixel pool is writable in RustOS QEMU and read-only/ROM in the DVM.
@@ -125,9 +209,10 @@ fallback.
   was unreachable under the mandatory nonzero V3 atlas header and has been
   retired. QEMU validates staged atlas upload plus fixed GLES composition and
   must report `source-path=staged-copy zero-copy=0`. Physical AMD read-only
-  atlas import and direct scanout require a new explicit authenticated relay
-  mode and are failed gates; this KVM command must not bind a physical GPU or
-  claim their evidence. V2, polling, synchronous `DirtyFB`, a CPU-frame
+  atlas import, GPU composition, and atomic scanout now have an explicit
+  authenticated physical-AMD relay mode, but remain failed hardware gates
+  until captured on the assigned GPU; this KVM command must not bind a physical
+  GPU or claim their evidence. V2, polling, synchronous `DirtyFB`, a CPU-frame
   renderer, and a native-GPU fallback are rejected. The NVIDIA
   package admits only the exact 580.173.02 open-module/GSP pair and excludes
   UVM/CUDA; redistribution authorization remains a separate release gate.

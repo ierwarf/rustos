@@ -6,8 +6,10 @@ Authenticated physical AMD display evidence admitted by tools/hostd and the
 Linux DVM relay.  The finite two-sample abstraction represents the signed
 production policy's five consecutive one-second samples.  A sample is usable
 only when it advances the relay-owned sequence and proves the exact AMDGPU
-identity, direct DMA-BUF scanout with no CPU copy, minimum page-flip rate, and
-bounded page-flip/atomic-commit latency.  A stale or failing monitored sample
+identity, a read-only DMA-BUF source, GPU composition into a separate
+three-buffer output pool, explicit fence completion, atomic KMS, no staged or
+CPU copy, minimum page-flip rate, and bounded page-flip/atomic-commit latency.
+A stale or failing monitored sample
 revokes readiness rather than retaining the last successful measurement.
 ***************************************************************************)
 
@@ -22,7 +24,12 @@ VARIABLES policySigned,
           sampleSequence,
           lastAcceptedSequence,
           sampleFresh,
-          directScanout,
+          sourceDmabuf,
+          gpuComposition,
+          explicitFence,
+          atomicKmsScanout,
+          scanoutBuffersThree,
+          stagedDamageCopyAbsent,
           cpuCopyZero,
           frameRatePassed,
           pageflipLatencyPassed,
@@ -32,8 +39,10 @@ VARIABLES policySigned,
           revoked
 
 vars == <<policySigned, hostIdentity, dvmIdentity, relayReady,
-          sampleSequence, lastAcceptedSequence, sampleFresh, directScanout,
-          cpuCopyZero, frameRatePassed, pageflipLatencyPassed,
+          sampleSequence, lastAcceptedSequence, sampleFresh, sourceDmabuf,
+          gpuComposition, explicitFence, atomicKmsScanout,
+          scanoutBuffersThree, stagedDamageCopyAbsent, cpuCopyZero,
+          frameRatePassed, pageflipLatencyPassed,
           atomicCommitPassed, consecutiveSamples, admitted, revoked>>
 
 Init ==
@@ -44,7 +53,12 @@ Init ==
     /\ sampleSequence = 0
     /\ lastAcceptedSequence = 0
     /\ sampleFresh = FALSE
-    /\ directScanout = FALSE
+    /\ sourceDmabuf = FALSE
+    /\ gpuComposition = FALSE
+    /\ explicitFence = FALSE
+    /\ atomicKmsScanout = FALSE
+    /\ scanoutBuffersThree = FALSE
+    /\ stagedDamageCopyAbsent = FALSE
     /\ cpuCopyZero = FALSE
     /\ frameRatePassed = FALSE
     /\ pageflipLatencyPassed = FALSE
@@ -57,8 +71,10 @@ SignPolicy ==
     /\ ~policySigned
     /\ policySigned' = TRUE
     /\ UNCHANGED <<hostIdentity, dvmIdentity, relayReady, sampleSequence,
-                  lastAcceptedSequence, sampleFresh, directScanout,
-                  cpuCopyZero, frameRatePassed, pageflipLatencyPassed,
+                  lastAcceptedSequence, sampleFresh, sourceDmabuf,
+                  gpuComposition, explicitFence, atomicKmsScanout,
+                  scanoutBuffersThree, stagedDamageCopyAbsent, cpuCopyZero,
+                  frameRatePassed, pageflipLatencyPassed,
                   atomicCommitPassed, consecutiveSamples, admitted, revoked>>
 
 ObserveHost(identity) ==
@@ -66,8 +82,10 @@ ObserveHost(identity) ==
     /\ identity \in {ExactAmd, "other"}
     /\ hostIdentity' = identity
     /\ UNCHANGED <<policySigned, dvmIdentity, relayReady, sampleSequence,
-                  lastAcceptedSequence, sampleFresh, directScanout,
-                  cpuCopyZero, frameRatePassed, pageflipLatencyPassed,
+                  lastAcceptedSequence, sampleFresh, sourceDmabuf,
+                  gpuComposition, explicitFence, atomicKmsScanout,
+                  scanoutBuffersThree, stagedDamageCopyAbsent, cpuCopyZero,
+                  frameRatePassed, pageflipLatencyPassed,
                   atomicCommitPassed, consecutiveSamples, admitted, revoked>>
 
 StartRelay(identity) ==
@@ -79,8 +97,10 @@ StartRelay(identity) ==
     /\ dvmIdentity' = identity
     /\ relayReady' = TRUE
     /\ UNCHANGED <<policySigned, hostIdentity, sampleSequence,
-                  lastAcceptedSequence, sampleFresh, directScanout,
-                  cpuCopyZero, frameRatePassed, pageflipLatencyPassed,
+                  lastAcceptedSequence, sampleFresh, sourceDmabuf,
+                  gpuComposition, explicitFence, atomicKmsScanout,
+                  scanoutBuffersThree, stagedDamageCopyAbsent, cpuCopyZero,
+                  frameRatePassed, pageflipLatencyPassed,
                   atomicCommitPassed, consecutiveSamples, admitted, revoked>>
 
 PublishPassingSample ==
@@ -88,7 +108,12 @@ PublishPassingSample ==
     /\ sampleSequence < MaxSequence
     /\ sampleSequence' = sampleSequence + 1
     /\ sampleFresh' = TRUE
-    /\ directScanout' = TRUE
+    /\ sourceDmabuf' = TRUE
+    /\ gpuComposition' = TRUE
+    /\ explicitFence' = TRUE
+    /\ atomicKmsScanout' = TRUE
+    /\ scanoutBuffersThree' = TRUE
+    /\ stagedDamageCopyAbsent' = TRUE
     /\ cpuCopyZero' = TRUE
     /\ frameRatePassed' = TRUE
     /\ pageflipLatencyPassed' = TRUE
@@ -101,7 +126,12 @@ PublishFailingSample ==
     /\ sampleSequence < MaxSequence
     /\ sampleSequence' = sampleSequence + 1
     /\ sampleFresh' = FALSE
-    /\ directScanout' = FALSE
+    /\ sourceDmabuf' = FALSE
+    /\ gpuComposition' = FALSE
+    /\ explicitFence' = FALSE
+    /\ atomicKmsScanout' = FALSE
+    /\ scanoutBuffersThree' = FALSE
+    /\ stagedDamageCopyAbsent' = FALSE
     /\ cpuCopyZero' = FALSE
     /\ frameRatePassed' = FALSE
     /\ pageflipLatencyPassed' = FALSE
@@ -117,7 +147,9 @@ AcceptPassingSample ==
     /\ relayReady
     /\ dvmIdentity = ExactAmd
     /\ sampleSequence > lastAcceptedSequence
-    /\ sampleFresh /\ directScanout /\ cpuCopyZero
+    /\ sampleFresh /\ sourceDmabuf /\ gpuComposition /\ explicitFence
+    /\ atomicKmsScanout /\ scanoutBuffersThree /\ stagedDamageCopyAbsent
+    /\ cpuCopyZero
     /\ frameRatePassed /\ pageflipLatencyPassed /\ atomicCommitPassed
     /\ lastAcceptedSequence' = sampleSequence
     /\ consecutiveSamples' =
@@ -126,7 +158,9 @@ AcceptPassingSample ==
         ELSE consecutiveSamples + 1
     /\ admitted' = (consecutiveSamples + 1 >= RequiredSamples)
     /\ UNCHANGED <<policySigned, hostIdentity, dvmIdentity, relayReady,
-                  sampleSequence, sampleFresh, directScanout, cpuCopyZero,
+                  sampleSequence, sampleFresh, sourceDmabuf, gpuComposition,
+                  explicitFence, atomicKmsScanout, scanoutBuffersThree,
+                  stagedDamageCopyAbsent, cpuCopyZero,
                   frameRatePassed, pageflipLatencyPassed, atomicCommitPassed,
                   revoked>>
 
@@ -138,8 +172,10 @@ RejectWrongIdentity ==
     /\ admitted' = FALSE
     /\ revoked' = TRUE
     /\ UNCHANGED <<policySigned, hostIdentity, dvmIdentity, sampleSequence,
-                  lastAcceptedSequence, sampleFresh, directScanout,
-                  cpuCopyZero, frameRatePassed, pageflipLatencyPassed,
+                  lastAcceptedSequence, sampleFresh, sourceDmabuf,
+                  gpuComposition, explicitFence, atomicKmsScanout,
+                  scanoutBuffersThree, stagedDamageCopyAbsent, cpuCopyZero,
+                  frameRatePassed, pageflipLatencyPassed,
                   atomicCommitPassed>>
 
 RevokeStaleEvidence ==
@@ -151,8 +187,10 @@ RevokeStaleEvidence ==
     /\ admitted' = FALSE
     /\ revoked' = TRUE
     /\ UNCHANGED <<policySigned, hostIdentity, dvmIdentity, sampleSequence,
-                  lastAcceptedSequence, sampleFresh, directScanout,
-                  cpuCopyZero, frameRatePassed, pageflipLatencyPassed,
+                  lastAcceptedSequence, sampleFresh, sourceDmabuf,
+                  gpuComposition, explicitFence, atomicKmsScanout,
+                  scanoutBuffersThree, stagedDamageCopyAbsent, cpuCopyZero,
+                  frameRatePassed, pageflipLatencyPassed,
                   atomicCommitPassed>>
 
 Next ==
@@ -173,7 +211,12 @@ TypeOK ==
     /\ sampleSequence \in 0..MaxSequence
     /\ lastAcceptedSequence \in 0..MaxSequence
     /\ sampleFresh \in BOOLEAN
-    /\ directScanout \in BOOLEAN
+    /\ sourceDmabuf \in BOOLEAN
+    /\ gpuComposition \in BOOLEAN
+    /\ explicitFence \in BOOLEAN
+    /\ atomicKmsScanout \in BOOLEAN
+    /\ scanoutBuffersThree \in BOOLEAN
+    /\ stagedDamageCopyAbsent \in BOOLEAN
     /\ cpuCopyZero \in BOOLEAN
     /\ frameRatePassed \in BOOLEAN
     /\ pageflipLatencyPassed \in BOOLEAN
@@ -186,8 +229,10 @@ AdmittedRequiresExactAmd ==
     admitted => policySigned /\ hostIdentity = ExactAmd /\ dvmIdentity = ExactAmd
 
 AdmittedRequiresPassingEvidence ==
-    admitted => sampleFresh /\ directScanout /\ cpuCopyZero /\
-                frameRatePassed /\ pageflipLatencyPassed /\ atomicCommitPassed
+    admitted => sampleFresh /\ sourceDmabuf /\ gpuComposition /\
+                explicitFence /\ atomicKmsScanout /\ scanoutBuffersThree /\
+                stagedDamageCopyAbsent /\ cpuCopyZero /\ frameRatePassed /\
+                pageflipLatencyPassed /\ atomicCommitPassed
 
 AdmittedRequiresConsecutiveFreshSamples ==
     admitted => consecutiveSamples = RequiredSamples /\

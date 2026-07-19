@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,6 +27,7 @@ use rustos_driver_domain_host::{
     ControlContract as HostControlContract, ControlSecret, HostControlListener, InputRingSink,
     IvshmemDoorbellServer, ProbeResult,
 };
+use tempfile::TempDir;
 
 use crate::Result;
 use crate::config::Config;
@@ -47,7 +49,7 @@ const DVM_CONTROL_STATE: &str = "control";
 const DVM_CONTROL_TRANSPORT: &str = "kvm-vsock";
 const DVM_CONTROL_AUTHENTICATION: &str = "dvm-agent-hmac-sha256-v1";
 const DVM_CONTROL_CAPABILITIES: &str =
-    "health,device-inventory,driver-inventory,display-evidence-v1,input-stream";
+    "health,device-inventory,driver-inventory,display-evidence-v2,input-stream";
 const RUSTOS_BOOT_MARKER: &str = "rootd: core services ready, spawning initd via loaderd";
 const RUSTOS_GPU_SCENE_COMPILER_MARKER: &str =
     "uiserver: gpu-scene compiler ready contract=3 public-abi=0 dvm-submit=1";
@@ -133,6 +135,14 @@ const DVM_GUEST_CID: u32 = 4;
 const VHOST_VSOCK_DEVICE: &str = "/dev/vhost-vsock";
 const HOST_GPU_RENDER_NODE: &str = "/dev/dri/renderD128";
 const MAX_SMOKE_TIMEOUT: u64 = 30;
+const PHYSICAL_AMDGPU_VENDOR: &str = "0x1002";
+const PHYSICAL_AMDGPU_DEVICE: &str = "0x1900";
+const PHYSICAL_AMDGPU_REQUIRED_MEMLOCK: u64 = 4 * 1024 * 1024 * 1024;
+const ACPI_VFCT_HEADER_BYTES: usize = 0x4c;
+const ACPI_VFCT_VBIOS_OFFSET: usize = 0x34;
+const ACPI_VFCT_IMAGE_HEADER_BYTES: usize = 28;
+const ACPI_VFCT_IMAGE_LENGTH_OFFSET: usize = 24;
+const ACPI_VFCT_MAX_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug)]
 struct DvmArtifacts {
@@ -168,6 +178,9 @@ struct KvmLayout {
     dvm_input_ring: PathBuf,
     dvm_input_doorbell: PathBuf,
     dvm_control_secret: PathBuf,
+    // Keep the private tmpfs directory alive until both QEMU children have
+    // exited. Dropping it then removes both DMA-pinnable display backings.
+    _display_backing_dir: Option<TempDir>,
     gui_dvm_surfaces: Option<PathBuf>,
     gui_dvm_pixels: Option<PathBuf>,
     dvm_display_doorbell: Option<PathBuf>,
@@ -181,6 +194,8 @@ struct SmokeOptions {
     exercise_network: bool,
     gui_dvm_surfaces: bool,
     dvm_network_shmem: bool,
+    physical_amdgpu_bdf: Option<String>,
+    amd_vfct: Option<PathBuf>,
     min_ui_fps: Option<u32>,
     ui_proof_windows: usize,
     timeout: Duration,
@@ -230,6 +245,10 @@ where
     let qemu = require_qemu(config)?;
     let layout = prepare_layout(config, &options)?;
 
+    if options.physical_amdgpu_bdf.is_some() {
+        validate_physical_amdgpu_inputs(&options)?;
+    }
+
     if options.dry_run {
         println!(
             "xtask: KVM smoke inputs prepared in {}",
@@ -252,7 +271,9 @@ where
     )?;
     let display_doorbell = start_dvm_display_doorbell(&layout)?;
     let guest_display = smoke_guest_display(&options)?;
-    require_amd_host_render_node()?;
+    if guest_display != GuestDisplay::PhysicalAmd {
+        require_amd_host_render_node()?;
+    }
     if guest_display == GuestDisplay::DvmGtk {
         require_sole_host_render_node()?;
     }
@@ -327,6 +348,9 @@ fn smoke_guest_display(options: &SmokeOptions) -> Result<GuestDisplay> {
 }
 
 fn select_smoke_guest_display(options: &SmokeOptions, host_has_gui: bool) -> Result<GuestDisplay> {
+    if options.physical_amdgpu_bdf.is_some() {
+        return Ok(GuestDisplay::PhysicalAmd);
+    }
     if options.min_ui_fps.is_none() {
         return Ok(GuestDisplay::Headless);
     }
@@ -353,6 +377,8 @@ pub(crate) fn kvm_run_command(config: &Config) -> Result<()> {
         exercise_network: false,
         gui_dvm_surfaces: true,
         dvm_network_shmem: true,
+        physical_amdgpu_bdf: None,
+        amd_vfct: None,
         min_ui_fps: None,
         ui_proof_windows: DEFAULT_UI_FPS_ACTIVE_WINDOWS,
         timeout: Duration::ZERO,
@@ -465,8 +491,8 @@ options:
                        uinput/evdev load, then require three high-volume input
                        windows, WayClick commit/frame-callback windows, and three
                        accepted DVM atomic-page-flip relay samples at or above
-                       this integer FPS; this uses QEMU GTK and therefore
-                       requires a host GUI session
+                       this integer FPS; virtual display proof uses QEMU GTK,
+                       while --physical-amdgpu observes the physical KMS path
   --ui-proof-windows <count>
                        require 3..={MAX_UI_FPS_ACTIVE_WINDOWS} consecutive one-second UI/input
                        and DVM relay samples (default {DEFAULT_UI_FPS_ACTIVE_WINDOWS}); requires
@@ -476,6 +502,13 @@ options:
                        surface renderer or native-GPU path is accepted
   --dvm-network-shmem  attach the bounded RustOS↔DVM Ethernet ring; RustOS keeps
                        no native virtio-net device in this topology
+  --physical-amdgpu <BDF>
+                       non-commercial lab mode: attach one already-bound AMD
+                       vfio-pci function through IOMMUFD instead of virtio-GPU;
+                       never binds, unbinds, or resets the device
+  --amd-vfct <path>    owner-private guest-BDF-relocated VFCT produced by
+                       rustos-hostd prepare-amd-vfct; required with
+                       --physical-amdgpu
   --dry-run            validate inputs and prepare KVM log paths without launching QEMU
   -h, --help           show this help
 
@@ -494,6 +527,7 @@ host-to-DVM input injection endpoint.
 enum GuestDisplay {
     Headless,
     DvmGtk,
+    PhysicalAmd,
 }
 
 fn qemu_display_backend(display: GuestDisplay) -> &'static str {
@@ -511,18 +545,21 @@ fn qemu_display_backend(display: GuestDisplay) -> &'static str {
         GuestDisplay::DvmGtk => {
             "gtk,gl=on,show-tabs=off,zoom-to-fit=off,grab-on-hover=on,show-cursor=off"
         }
+        GuestDisplay::PhysicalAmd => "none",
     }
 }
 
-fn dvm_gpu_device(_display: GuestDisplay) -> String {
-    format!(
-        // Virgl executes the same fixed GLES vocabulary intended for the AMD
-        // DVM. Physical read-only DMA-BUF sampling and direct scanout remain
-        // separately failed implementation gates; this enables no CPU
-        // composition fallback.
-        "virtio-gpu-gl-pci,id=dvm-virtio-gpu,xres={},yres={},edid=off,blob=on,hostmem=256M",
-        DVM_DISPLAY_WIDTH, DVM_DISPLAY_HEIGHT
-    )
+fn dvm_gpu_device(display: GuestDisplay) -> Option<String> {
+    (display != GuestDisplay::PhysicalAmd).then(|| {
+        format!(
+            // Virgl executes the same fixed GLES vocabulary intended for the AMD
+            // DVM. The physical AMD relay has a separate read-only DMA-BUF source
+            // import and atomic-KMS path; this virtual device remains the explicit
+            // staged-copy fallback and enables no CPU-composition success path.
+            "virtio-gpu-gl-pci,id=dvm-virtio-gpu,xres={},yres={},edid=off,blob=on,hostmem=256M",
+            DVM_DISPLAY_WIDTH, DVM_DISPLAY_HEIGHT
+        )
+    })
 }
 
 fn dvm_pointer_device() -> &'static str {
@@ -530,6 +567,21 @@ fn dvm_pointer_device() -> &'static str {
     // window is merely hovered. The DVM agent normalizes the tablet range to
     // the fixed 1600x900 scanout before it emits the authenticated RDI3 frame.
     "virtio-tablet-pci,id=dvm-pointer"
+}
+
+fn append_dvm_network_device(command: &mut Command, display: GuestDisplay) {
+    if display == GuestDisplay::PhysicalAmd {
+        // The physical-display laboratory topology intentionally contains no
+        // network device. `-net none` is required because omitting all net
+        // arguments lets QEMU synthesize a default virtual NIC.
+        command.args(["-net", "none"]);
+    } else {
+        command
+            .arg("-netdev")
+            .arg("user,id=dvm-net")
+            .arg("-device")
+            .arg("virtio-net-pci,netdev=dvm-net,id=dvm-virtio-net,mac=52:54:00:12:34:56");
+    }
 }
 
 fn parse_smoke_options<I>(mut args: I) -> Result<SmokeOptions>
@@ -542,6 +594,8 @@ where
         exercise_network: false,
         gui_dvm_surfaces: false,
         dvm_network_shmem: false,
+        physical_amdgpu_bdf: None,
+        amd_vfct: None,
         min_ui_fps: None,
         ui_proof_windows: DEFAULT_UI_FPS_ACTIVE_WINDOWS,
         timeout: Duration::from_secs(MAX_SMOKE_TIMEOUT),
@@ -559,6 +613,12 @@ where
             "--exercise-network" => options.exercise_network = true,
             "--gui-dvm-surfaces" => options.gui_dvm_surfaces = true,
             "--dvm-network-shmem" => options.dvm_network_shmem = true,
+            "--physical-amdgpu" => {
+                options.physical_amdgpu_bdf = Some(next_value(&mut args, "--physical-amdgpu")?);
+            }
+            "--amd-vfct" => {
+                options.amd_vfct = Some(PathBuf::from(next_value(&mut args, "--amd-vfct")?));
+            }
             "--min-ui-fps" => {
                 let value = next_value(&mut args, "--min-ui-fps")?;
                 let fps = value
@@ -643,6 +703,14 @@ where
     }
     if options.ui_proof_windows != DEFAULT_UI_FPS_ACTIVE_WINDOWS && options.min_ui_fps.is_none() {
         bail!("--ui-proof-windows requires --min-ui-fps");
+    }
+    match (&options.physical_amdgpu_bdf, &options.amd_vfct) {
+        (Some(_), Some(_)) if !options.gui_dvm_surfaces => {
+            bail!("--physical-amdgpu requires --gui-dvm-surfaces")
+        }
+        (Some(_), Some(_)) => {}
+        (None, None) => {}
+        _ => bail!("--physical-amdgpu and --amd-vfct must be supplied together"),
     }
     Ok(options)
 }
@@ -1059,15 +1127,23 @@ fn prepare_layout(config: &Config, options: &SmokeOptions) -> Result<KvmLayout> 
     if options.exercise_network {
         enable_private_network_exercise(&runtime_disk)?;
     }
-    let gui_dvm_surfaces = if options.gui_dvm_surfaces {
-        let path = run_dir.join("dvm-display.ivshmem");
+    let display_backing_dir = if options.gui_dvm_surfaces {
+        Some(create_dma_pinnable_display_directory()?)
+    } else {
+        None
+    };
+    let gui_dvm_surfaces = if let Some(directory) = display_backing_dir.as_ref() {
+        // A physical VFIO device causes QEMU to map every guest RAM section
+        // into its IOMMUFD IOAS. Keep the writable ivshmem BAR on tmpfs: a
+        // regular build-directory file cannot be write-pinned by MAP_FILE.
+        let path = directory.path().join("dvm-display.ivshmem");
         create_gui_dvm_surfaces(&path)?;
         Some(path)
     } else {
         None
     };
-    let gui_dvm_pixels = if options.gui_dvm_surfaces {
-        let path = run_dir.join("dvm-display.pmem");
+    let gui_dvm_pixels = if let Some(directory) = display_backing_dir.as_ref() {
+        let path = directory.path().join("dvm-display.pmem");
         create_gui_dvm_surfaces(&path)?;
         Some(path)
     } else {
@@ -1113,11 +1189,31 @@ fn prepare_layout(config: &Config, options: &SmokeOptions) -> Result<KvmLayout> 
         dvm_input_ring,
         dvm_input_doorbell,
         dvm_control_secret,
+        _display_backing_dir: display_backing_dir,
         gui_dvm_surfaces,
         gui_dvm_pixels,
         dvm_display_doorbell,
         dvm_network_shmem,
     })
+}
+
+fn create_dma_pinnable_display_directory() -> Result<TempDir> {
+    let directory = tempfile::Builder::new()
+        .prefix("rustos-kvm-display-")
+        .tempdir_in("/dev/shm")
+        .context("create private tmpfs DVM display-backing directory")?;
+    fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+    let directory_fd = std::fs::File::open(directory.path())?;
+    let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+    if unsafe { libc::fstatfs(directory_fd.as_raw_fd(), filesystem.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("inspect KVM DVM display-backing filesystem");
+    }
+    const TMPFS_MAGIC: u64 = 0x0102_1994;
+    if unsafe { filesystem.assume_init() }.f_type as u64 != TMPFS_MAGIC {
+        bail!("/dev/shm is not tmpfs; refusing unproven VFIO display backings");
+    }
+    Ok(directory)
 }
 
 fn create_dvm_input_ring(path: &Path) -> Result<()> {
@@ -1464,6 +1560,281 @@ fn require_qemu(config: &Config) -> Result<PathBuf> {
     })
 }
 
+fn canonical_pci_bdf(value: &str) -> Result<String> {
+    let (domain, rest) = value
+        .split_once(':')
+        .with_context(|| format!("invalid PCI BDF {value:?}"))?;
+    let (bus, device_function) = rest
+        .split_once(':')
+        .with_context(|| format!("invalid PCI BDF {value:?}"))?;
+    let (device, function) = device_function
+        .split_once('.')
+        .with_context(|| format!("invalid PCI BDF {value:?}"))?;
+    let domain = u16::from_str_radix(domain, 16)
+        .with_context(|| format!("invalid PCI domain in {value:?}"))?;
+    let bus =
+        u8::from_str_radix(bus, 16).with_context(|| format!("invalid PCI bus in {value:?}"))?;
+    let device = u8::from_str_radix(device, 16)
+        .with_context(|| format!("invalid PCI device in {value:?}"))?;
+    let function = u8::from_str_radix(function, 16)
+        .with_context(|| format!("invalid PCI function in {value:?}"))?;
+    if device > 0x1f || function > 7 {
+        bail!("PCI BDF is outside device/function bounds: {value}");
+    }
+    let canonical = format!("{domain:04x}:{bus:02x}:{device:02x}.{function:x}");
+    if canonical != value {
+        bail!("PCI BDF must be canonical lowercase {canonical}, got {value:?}");
+    }
+    Ok(canonical)
+}
+
+fn require_direct_rw_character_device(path: &Path, label: &str) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("inspect {label} {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_char_device() {
+        bail!(
+            "{label} must be a direct character device: {}",
+            path.display()
+        );
+    }
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("open {label} {} read/write", path.display()))?;
+    Ok(())
+}
+
+fn vfio_device_cdev_path(device: &Path) -> Result<PathBuf> {
+    let mut names = std::fs::read_dir(device.join("vfio-dev"))?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    names.sort();
+    if names.len() != 1 {
+        bail!(
+            "physical AMD VFIO device must expose exactly one vfio-dev cdev, found {}",
+            names.len()
+        );
+    }
+    let name = names
+        .pop()
+        .and_then(|name| name.into_string().ok())
+        .context("physical AMD vfio-dev name is not UTF-8")?;
+    let id = name
+        .strip_prefix("vfio")
+        .context("physical AMD vfio-dev name lacks vfio prefix")?
+        .parse::<u32>()
+        .context("physical AMD vfio-dev name has a non-numeric ID")?;
+    if name != format!("vfio{id}") {
+        bail!("physical AMD vfio-dev name is not canonical: {name}");
+    }
+    Ok(Path::new("/dev/vfio/devices").join(name))
+}
+
+fn physical_memlock_soft_limit() -> Result<Option<u64>> {
+    let limits = fs::read_to_string("/proc/self/limits")?;
+    let line = limits
+        .lines()
+        .find(|line| line.starts_with("Max locked memory"))
+        .context("/proc/self/limits has no Max locked memory row")?;
+    let value = line
+        .split_whitespace()
+        .nth(3)
+        .context("Max locked memory row has no soft limit")?;
+    if value == "unlimited" {
+        return Ok(None);
+    }
+    Ok(Some(
+        value
+            .parse()
+            .context("parse Max locked memory soft limit")?,
+    ))
+}
+
+fn validate_lab_amd_vfct(path: &Path, owner: u32) -> Result<PathBuf> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("inspect lab AMD VFCT {}", path.display()))?;
+    if metadata.file_type().is_symlink()
+        || !metadata.file_type().is_file()
+        || metadata.uid() != owner
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        bail!(
+            "lab AMD VFCT must be an owner-private non-symlink file: {}",
+            path.display()
+        );
+    }
+    let canonical = std::fs::canonicalize(path)
+        .with_context(|| format!("canonicalize lab AMD VFCT {}", path.display()))?;
+    let label = canonical.to_string_lossy();
+    if label.contains([',', '\n', '\r']) {
+        bail!("lab AMD VFCT path is not representable as a QEMU property");
+    }
+    let table = fs::read(&canonical)?;
+    if table.len() < ACPI_VFCT_HEADER_BYTES
+        || table.len() > ACPI_VFCT_MAX_BYTES
+        || table.get(0..4) != Some(b"VFCT")
+    {
+        bail!("lab AMD VFCT header or bounded size is invalid");
+    }
+    let table_length =
+        u32::from_le_bytes(table[4..8].try_into().expect("validated VFCT length field")) as usize;
+    if table_length != table.len()
+        || table.iter().fold(0_u8, |sum, byte| sum.wrapping_add(*byte)) != 0
+    {
+        bail!("lab AMD VFCT length or ACPI checksum is invalid");
+    }
+    let image_header = u32::from_le_bytes(
+        table[ACPI_VFCT_VBIOS_OFFSET..ACPI_VFCT_VBIOS_OFFSET + 4]
+            .try_into()
+            .expect("validated VFCT image offset"),
+    ) as usize;
+    let image_start = image_header
+        .checked_add(ACPI_VFCT_IMAGE_HEADER_BYTES)
+        .context("lab AMD VFCT image offset overflow")?;
+    if image_header < ACPI_VFCT_HEADER_BYTES || image_start > table.len() {
+        bail!("lab AMD VFCT image header is out of bounds");
+    }
+    let field_u32 = |offset: usize| -> Result<u32> {
+        let bytes = table
+            .get(offset..offset + 4)
+            .context("truncated lab AMD VFCT field")?;
+        Ok(u32::from_le_bytes(
+            bytes.try_into().expect("four-byte VFCT field"),
+        ))
+    };
+    let field_u16 = |offset: usize| -> Result<u16> {
+        let bytes = table
+            .get(offset..offset + 2)
+            .context("truncated lab AMD VFCT identity")?;
+        Ok(u16::from_le_bytes(
+            bytes.try_into().expect("two-byte VFCT field"),
+        ))
+    };
+    let image_length = field_u32(image_header + ACPI_VFCT_IMAGE_LENGTH_OFFSET)? as usize;
+    let image_end = image_start
+        .checked_add(image_length)
+        .context("lab AMD VFCT image length overflow")?;
+    if field_u32(image_header)? != 0
+        || field_u32(image_header + 4)? != 8
+        || field_u32(image_header + 8)? != 0
+        || field_u16(image_header + 12)? != 0x1002
+        || field_u16(image_header + 14)? != 0x1900
+        || image_length < 0x4a
+        || image_end > table.len()
+        || table.get(image_start..image_start + 2) != Some(&[0x55, 0xaa])
+    {
+        bail!("lab AMD VFCT is not the exact relocated 1002:1900 guest 00:08.0 image");
+    }
+    let atom_header = usize::from(field_u16(image_start + 0x48)?);
+    let atom = image_start
+        .checked_add(atom_header)
+        .and_then(|offset| offset.checked_add(4))
+        .context("lab AMD VBIOS ATOM pointer overflow")?;
+    if table
+        .get(atom..atom + 4)
+        .is_none_or(|magic| magic != b"ATOM" && magic != b"MOTA")
+    {
+        bail!("lab AMD VFCT VBIOS lacks an ATOM header");
+    }
+    Ok(canonical)
+}
+
+fn validate_physical_amdgpu_inputs(options: &SmokeOptions) -> Result<()> {
+    let bdf = canonical_pci_bdf(
+        options
+            .physical_amdgpu_bdf
+            .as_deref()
+            .context("physical AMD BDF is missing")?,
+    )?;
+    let device = Path::new("/sys/bus/pci/devices").join(&bdf);
+    let vendor = fs::read_to_string(device.join("vendor"))?;
+    let device_id = fs::read_to_string(device.join("device"))?;
+    let driver = std::fs::canonicalize(device.join("driver"))?;
+    if vendor.trim() != PHYSICAL_AMDGPU_VENDOR
+        || device_id.trim() != PHYSICAL_AMDGPU_DEVICE
+        || driver.file_name() != Some(OsStr::new("vfio-pci"))
+    {
+        bail!(
+            "physical lab target must be pre-bound AMD 1002:1900 vfio-pci: vendor={} device={} driver={}",
+            vendor.trim(),
+            device_id.trim(),
+            driver.display()
+        );
+    }
+    let group = std::fs::canonicalize(device.join("iommu_group"))?;
+    let group_id = group
+        .file_name()
+        .and_then(OsStr::to_str)
+        .context("physical AMD IOMMU group has no numeric name")?;
+    group_id
+        .parse::<u32>()
+        .context("physical AMD IOMMU group name is not numeric")?;
+    let mut members = std::fs::read_dir(group.join("devices"))?
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .collect::<Vec<_>>();
+    members.sort();
+    if members != [bdf.clone()] {
+        bail!(
+            "physical AMD lab target must be the sole IOMMU-group member: {}",
+            members.join(",")
+        );
+    }
+    let reset_methods = fs::read_to_string(device.join("reset_method"))?;
+    if !reset_methods.trim().is_empty() {
+        bail!(
+            "physical AMD lab mode requires reset_method disabled so QEMU cannot bus-reset outside group: {}",
+            reset_methods.trim()
+        );
+    }
+    if fs::read_to_string("/sys/module/vfio_pci/parameters/disable_idle_d3")?.trim() != "Y" {
+        bail!("physical AMD lab mode requires vfio-pci disable_idle_d3=Y");
+    }
+    let mut config = std::fs::OpenOptions::new()
+        .read(true)
+        .open(device.join("config"))?;
+    config.seek(SeekFrom::Start(4))?;
+    let mut command = [0_u8; 2];
+    config.read_exact(&mut command)?;
+    if u16::from_le_bytes(command) & 0x4 != 0 {
+        bail!("physical AMD lab target still has PCI bus mastering enabled");
+    }
+    require_direct_rw_character_device(Path::new("/dev/iommu"), "IOMMUFD")?;
+    let vfio_cdev = vfio_device_cdev_path(&device)?;
+    require_direct_rw_character_device(&vfio_cdev, "VFIO device cdev")?;
+    let soft_memlock = physical_memlock_soft_limit()?;
+    if soft_memlock.is_some_and(|bytes| bytes < PHYSICAL_AMDGPU_REQUIRED_MEMLOCK) {
+        if options.dry_run {
+            eprintln!(
+                "xtask: physical AMD dry-run warning: inherited memlock is below 4 GiB; the real command will fail before QEMU"
+            );
+        } else {
+            bail!(
+                "physical AMD QEMU requires inherited memlock >= 4 GiB (observed {} bytes)",
+                soft_memlock.unwrap_or(0)
+            );
+        }
+    }
+    let owner = std::fs::metadata("/proc/self")?.uid();
+    validate_lab_amd_vfct(
+        options
+            .amd_vfct
+            .as_deref()
+            .context("physical AMD VFCT is missing")?,
+        owner,
+    )?;
+    let boot_vga = fs::read_to_string(device.join("boot_vga"))?;
+    if !matches!(boot_vga.trim(), "0" | "1") {
+        bail!("physical AMD boot_vga state is malformed");
+    }
+    eprintln!(
+        "xtask: NON-COMMERCIAL physical AMD lab mode target={bdf} group={group_id} boot_vga={} binding/reset are operator-owned",
+        boot_vga.trim()
+    );
+    Ok(())
+}
+
 fn require_amd_host_render_node() -> Result<()> {
     let metadata = std::fs::symlink_metadata(HOST_GPU_RENDER_NODE)
         .with_context(|| format!("missing AMD render node {HOST_GPU_RENDER_NODE}"))?;
@@ -1776,7 +2147,6 @@ fn spawn_guests(
             "-vga",
             "none",
             "-no-reboot",
-            "-no-shutdown",
         ])
         .arg("-chardev")
         .arg(format!(
@@ -1794,13 +2164,24 @@ fn spawn_guests(
         .arg("-device")
         .arg("virtio-keyboard-pci,id=dvm-keyboard")
         .arg("-device")
-        .arg(dvm_pointer_device())
-        .arg("-netdev")
-        .arg("user,id=dvm-net")
-        .arg("-device")
-        .arg("virtio-net-pci,netdev=dvm-net,id=dvm-virtio-net,mac=52:54:00:12:34:56")
-        .arg("-device")
-        .arg(dvm_gpu_device(guest_display))
+        .arg(dvm_pointer_device());
+    append_dvm_network_device(&mut dvm_command, guest_display);
+    if let Some(gpu) = dvm_gpu_device(guest_display) {
+        dvm_command.arg("-no-shutdown").arg("-device").arg(gpu);
+    } else {
+        let bdf = options
+            .physical_amdgpu_bdf
+            .as_deref()
+            .context("physical AMD display selected without a BDF")?;
+        let vfct = std::fs::canonicalize(
+            options
+                .amd_vfct
+                .as_deref()
+                .context("physical AMD display selected without a VFCT")?,
+        )?;
+        append_physical_amdgpu(&mut dvm_command, bdf, &vfct);
+    }
+    dvm_command
         .stdout(Stdio::null())
         .stderr(Stdio::from(std::fs::File::create(&layout.dvm_stderr_log)?));
     if let Some(doorbell) = layout.dvm_display_doorbell.as_deref() {
@@ -1858,6 +2239,11 @@ fn append_dvm_display_pixels(command: &mut Command, path: &Path, read_only: bool
     );
     if read_only {
         backend.push_str(",readonly=on,rom=on");
+    } else {
+        // Fault every tmpfs page before the VFIO device is attached in the
+        // second QEMU process. IOMMUFD must never discover an unpinnable or
+        // unpopulated source aperture only after device activation.
+        backend.push_str(",prealloc=on");
     }
     command
         .arg("-object")
@@ -1865,6 +2251,27 @@ fn append_dvm_display_pixels(command: &mut Command, path: &Path, read_only: bool
         .arg("-device")
         .arg(format!(
             "virtio-pmem-pci,id=dvm-display-pmem,memdev=dvm-display-pixels,memaddr={DVM_DISPLAY_PIXEL_PHYS_ADDR}"
+        ));
+}
+
+/// Add the already-bound AMD device for the explicitly non-commercial lab run.
+///
+/// QEMU 11.0 exposes each mmap-able VFIO PCI BAR through the kernel's
+/// VFIO_DEVICE_FEATURE_DMA_BUF API before IOMMUFD maps it. Keep BAR mmap enabled:
+/// `x-no-mmap=on` bypasses that API, falls back to slow MMIO, and recreates the
+/// unsupported PCI-BAR mapping that caused QEMU 10.2.1 to abort before DVM boot.
+fn append_physical_amdgpu(command: &mut Command, bdf: &str, vfct: &Path) {
+    command
+        .args(["-object", "iommufd,id=iommufd0"])
+        .arg("-acpitable")
+        .arg(format!("file={}", vfct.display()))
+        .args(["-trace", "enable=vfio_listener_region_add_ram"])
+        .args(["-trace", "enable=iommufd_backend_map_dma"])
+        .args(["-trace", "enable=iommufd_backend_map_file_dma"])
+        .args(["-trace", "enable=vfio_region_dmabuf"])
+        .arg("-device")
+        .arg(format!(
+            "vfio-pci,host={bdf},iommufd=iommufd0,addr=08.0,rombar=0"
         ));
 }
 
@@ -1964,7 +2371,8 @@ fn wait_for_parallel_boot(
             && dvm_relay_fps_ready
             && dvm_runtime_ready;
         let dvm_display_ready = !options.gui_dvm_surfaces
-            || (dvm_display_provider_ready(&rustos_log) && dvm_display_relay_ready(&dvm_log));
+            || (dvm_display_provider_ready(&rustos_log)
+                && dvm_display_relay_ready(&dvm_log, options.physical_amdgpu_bdf.is_some()));
         let dvm_network = if options.dvm_network_shmem {
             let shared_network = layout
                 .dvm_network_shmem
@@ -2191,7 +2599,7 @@ fn dvm_display_provider_ready(log: &str) -> bool {
     })
 }
 
-fn dvm_display_relay_ready(log: &str) -> bool {
+fn dvm_display_relay_ready(log: &str, physical_amdgpu: bool) -> bool {
     let expected_stride = DvmGuiSurfacePoolHeader::new(
         DVM_DISPLAY_REGION_BYTES,
         DVM_DISPLAY_WIDTH,
@@ -2204,6 +2612,15 @@ fn dvm_display_relay_ready(log: &str) -> bool {
             .find_map(|field| field.strip_prefix("irq_count="))
             .and_then(|value| value.parse::<u64>().ok())
             .is_some_and(|count| count > 0);
+        let transport = if physical_amdgpu {
+            line.contains("source-path=dmabuf")
+                && line.contains("zero-copy=1")
+                && line.contains("staged-damage-copy=0")
+        } else {
+            line.contains("source-path=staged-copy")
+                && line.contains("zero-copy=0")
+                && line.contains("staged-damage-copy=1")
+        };
         line.contains("rustos-dvm-display: active")
             && line.contains(&format!("width={DVM_DISPLAY_WIDTH}"))
             && line.contains(&format!("height={DVM_DISPLAY_HEIGHT}"))
@@ -2211,13 +2628,11 @@ fn dvm_display_relay_ready(log: &str) -> bool {
             && line.contains("event=ivshmem-msix-uio")
             && has_interrupt
             && line.contains("format=BGRA8888")
-            && line.contains("source-path=staged-copy")
-            && line.contains("zero-copy=0")
+            && transport
             && line.contains("gpu-composition=1")
             && line.contains("explicit-fence=1")
             && line.contains("scanout_buffers=3")
             && line.contains("cpu-final-compose=0")
-            && line.contains("staged-damage-copy=1")
     });
     active
         && log.lines().any(|line| {
@@ -2310,7 +2725,7 @@ fn wait_for_interactive_display(
             _ => false,
         };
         if dvm_display_provider_ready(&rustos_log)
-            && dvm_display_relay_ready(&dvm_log)
+            && dvm_display_relay_ready(&dvm_log, false)
             && surface_ready
         {
             return Ok(());
@@ -2338,7 +2753,7 @@ fn validate_interactive_session(layout: &KvmLayout, pointer_observed: bool) -> R
             layout.dvm_serial_log.display(),
         );
     }
-    if !dvm_display_provider_ready(&rustos_log) || !dvm_display_relay_ready(&dvm_log) {
+    if !dvm_display_provider_ready(&rustos_log) || !dvm_display_relay_ready(&dvm_log, false) {
         bail!(
             "interactive KVM DVM acceptance lacks the active atomic GUI-DVM display contract; inspect {} and {}",
             layout.debugcon_log.display(),
@@ -2832,17 +3247,36 @@ fn stop_guest(guest: &mut Child) {
 mod tests {
     use super::{
         DEFAULT_UI_FPS_ACTIVE_WINDOWS, DVM_CONTROL_AUTHENTICATION, DVM_CONTROL_CAPABILITIES,
-        DVM_CONTROL_PROTOCOL, DVM_CONTROL_STATE, DVM_CONTROL_TRANSPORT, DVM_GPU_COMPOSITOR_MARKER,
-        DVM_KEYBOARD_INGRESS_MARKER, DVM_POINTER_INGRESS_MARKER, DvmNetworkCounters, GuestDisplay,
-        RUSTOS_BOOT_MARKER, RUSTOS_GPU_SCENE_COMPILER_MARKER, WayclickProfileObservation,
-        dvm_display_failure, dvm_display_provider_ready, dvm_display_relay_meets_fps,
-        dvm_display_relay_ready, dvm_gpu_compositor_ready, dvm_gpu_device, dvm_pointer_device,
-        is_sha256, parse_dvm_control_contract_text, parse_manifest_text, parse_smoke_options,
-        qemu_display_backend, runtime_stall_or_crash_observed, select_smoke_guest_display,
+        DVM_CONTROL_PROTOCOL, DVM_CONTROL_STATE, DVM_CONTROL_TRANSPORT, DVM_DISPLAY_REGION_BYTES,
+        DVM_GPU_COMPOSITOR_MARKER, DVM_KEYBOARD_INGRESS_MARKER, DVM_POINTER_INGRESS_MARKER,
+        DvmNetworkCounters, GuestDisplay, RUSTOS_BOOT_MARKER, RUSTOS_GPU_SCENE_COMPILER_MARKER,
+        WayclickProfileObservation, append_dvm_display_pixels, append_dvm_network_device,
+        append_physical_amdgpu, dvm_display_failure, dvm_display_provider_ready,
+        dvm_display_relay_meets_fps, dvm_display_relay_ready, dvm_gpu_compositor_ready,
+        dvm_gpu_device, dvm_pointer_device, is_sha256, parse_dvm_control_contract_text,
+        parse_manifest_text, parse_smoke_options, qemu_display_backend,
+        runtime_stall_or_crash_observed, select_smoke_guest_display,
         uiserver_has_interactive_slow_loop, uiserver_idle_ticks_healthy,
         uiserver_profile_input_pipeline_healthy, uiserver_profile_meets_fps,
-        validate_manifest_values, wayclick_profile_meets_fps, wayclick_profile_observation,
+        validate_manifest_values, vfio_device_cdev_path, wayclick_profile_meets_fps,
+        wayclick_profile_observation,
     };
+    use std::{fs, path::Path, process::Command};
+
+    #[test]
+    fn physical_vfio_cdev_path_is_unique_and_canonical() {
+        let root = tempfile::tempdir().unwrap();
+        let vfio_dev = root.path().join("vfio-dev");
+        fs::create_dir(&vfio_dev).unwrap();
+        fs::create_dir(vfio_dev.join("vfio7")).unwrap();
+        assert_eq!(
+            vfio_device_cdev_path(root.path()).unwrap(),
+            Path::new("/dev/vfio/devices/vfio7")
+        );
+
+        fs::create_dir(vfio_dev.join("vfio8")).unwrap();
+        assert!(vfio_device_cdev_path(root.path()).is_err());
+    }
 
     #[test]
     fn smoke_timeout_is_bounded() {
@@ -2897,15 +3331,24 @@ mod tests {
             "rustos-dvm-display: peer readiness sent event=ivshmem-msix-uio\n\
              rustos-dvm-display: host confirmed peer readiness event=ivshmem-msix-uio\n\
              rustos-dvm-display: scheduler admitted policy=rr priority=9 rttime_soft_us=50000 rttime_hard_us=100000 rttime_hard_action=terminate\n\
-             rustos-dvm-display: active width=1600 height=900 stride=7168 format=BGRA8888 event=ivshmem-msix-uio irq_count=1 source-path=staged-copy zero-copy=0 gpu-composition=1 explicit-fence=1 scanout_buffers=3 cpu-final-compose=0 staged-damage-copy=1"
+             rustos-dvm-display: active width=1600 height=900 stride=7168 format=BGRA8888 event=ivshmem-msix-uio irq_count=1 source-path=staged-copy zero-copy=0 gpu-composition=1 explicit-fence=1 scanout_buffers=3 cpu-final-compose=0 staged-damage-copy=1",
+            false,
         ));
         assert!(!dvm_display_relay_ready(
-            "rustos-dvm-display: active width=1600 height=900 stride=7168 format=BGRA8888 dmabuf-direct-scanout"
+            "rustos-dvm-display: active width=1600 height=900 stride=7168 format=BGRA8888 dmabuf-direct-scanout",
+            false,
         ));
         assert!(!dvm_display_relay_ready(
             "rustos-dvm-display: peer readiness sent event=ivshmem-msix-uio\n\
              rustos-dvm-display: host confirmed peer readiness event=ivshmem-msix-uio\n\
-             rustos-dvm-display: active width=1600 height=900 stride=7168 format=BGRA8888 event=ivshmem-msix-uio irq_count=0 source-path=staged-copy zero-copy=0 gpu-composition=1 explicit-fence=1 scanout_buffers=3 cpu-final-compose=0 staged-damage-copy=1"
+             rustos-dvm-display: active width=1600 height=900 stride=7168 format=BGRA8888 event=ivshmem-msix-uio irq_count=0 source-path=staged-copy zero-copy=0 gpu-composition=1 explicit-fence=1 scanout_buffers=3 cpu-final-compose=0 staged-damage-copy=1",
+            false,
+        ));
+        assert!(dvm_display_relay_ready(
+            "rustos-dvm-display: host confirmed peer readiness event=ivshmem-msix-uio\n\
+             rustos-dvm-display: scheduler admitted policy=rr priority=9 rttime_soft_us=50000 rttime_hard_us=100000 rttime_hard_action=terminate\n\
+             rustos-dvm-display: active width=1600 height=900 stride=7168 format=BGRA8888 event=ivshmem-msix-uio irq_count=1 source-path=dmabuf zero-copy=1 gpu-composition=1 explicit-fence=1 scanout_buffers=3 cpu-final-compose=0 staged-damage-copy=0",
+            true,
         ));
         assert_eq!(
             dvm_display_failure(
@@ -3161,9 +3604,101 @@ uiserver: update tick backlog=false input_drops=0 input_slow=0 input_errors=0";
             qemu_display_backend(GuestDisplay::DvmGtk),
             "gtk,gl=on,show-tabs=off,zoom-to-fit=off,grab-on-hover=on,show-cursor=off"
         );
-        assert!(dvm_gpu_device(GuestDisplay::DvmGtk).starts_with("virtio-gpu-gl-pci,id="));
-        assert!(dvm_gpu_device(GuestDisplay::Headless).contains("hostmem=256M"));
+        assert_eq!(qemu_display_backend(GuestDisplay::PhysicalAmd), "none");
+        assert!(
+            dvm_gpu_device(GuestDisplay::DvmGtk)
+                .unwrap()
+                .starts_with("virtio-gpu-gl-pci,id=")
+        );
+        assert!(
+            dvm_gpu_device(GuestDisplay::Headless)
+                .unwrap()
+                .contains("hostmem=256M")
+        );
+        assert!(dvm_gpu_device(GuestDisplay::PhysicalAmd).is_none());
         assert_eq!(dvm_pointer_device(), "virtio-tablet-pci,id=dvm-pointer");
+
+        let mut physical = Command::new("qemu-system-x86_64");
+        append_dvm_network_device(&mut physical, GuestDisplay::PhysicalAmd);
+        let physical_args = physical
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(physical_args, ["-net", "none"]);
+
+        let mut virtual_display = Command::new("qemu-system-x86_64");
+        append_dvm_network_device(&mut virtual_display, GuestDisplay::Headless);
+        let virtual_args = virtual_display
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(virtual_args.iter().any(|arg| arg == "user,id=dvm-net"));
+        assert!(
+            virtual_args
+                .iter()
+                .any(|arg| arg.starts_with("virtio-net-pci,netdev=dvm-net"))
+        );
+    }
+
+    #[test]
+    fn physical_pixel_backing_is_preallocated_and_dvm_read_only() {
+        assert_eq!(DVM_DISPLAY_REGION_BYTES, 128 * 1024 * 1024);
+        let path = std::path::Path::new("/dev/shm/rustos-kvm-test-pixels");
+
+        let mut producer = Command::new("qemu-system-x86_64");
+        append_dvm_display_pixels(&mut producer, path, false);
+        let producer_args = producer
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(producer_args.iter().any(|arg| {
+            arg.contains("memory-backend-file,id=dvm-display-pixels")
+                && arg.contains("size=134217728")
+                && arg.contains("share=on")
+                && arg.contains("prealloc=on")
+                && !arg.contains("readonly=on")
+        }));
+
+        let mut consumer = Command::new("qemu-system-x86_64");
+        append_dvm_display_pixels(&mut consumer, path, true);
+        let consumer_args = consumer
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(consumer_args.iter().any(|arg| {
+            arg.contains("memory-backend-file,id=dvm-display-pixels")
+                && arg.contains("readonly=on,rom=on")
+                && !arg.contains("prealloc=on")
+        }));
+    }
+
+    #[test]
+    fn physical_amdgpu_lab_uses_vfio_bar_dmabuf_mapping() {
+        let mut command = Command::new("qemu-system-x86_64");
+        append_physical_amdgpu(
+            &mut command,
+            "0000:65:00.0",
+            Path::new("/tmp/rustos-amdgpu-vfct.bin"),
+        );
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert!(args.iter().any(|arg| arg == "iommufd,id=iommufd0"));
+        assert!(
+            args.iter()
+                .any(|arg| arg == "file=/tmp/rustos-amdgpu-vfct.bin")
+        );
+        assert!(args.iter().any(|arg| {
+            arg == "vfio-pci,host=0000:65:00.0,iommufd=iommufd0,addr=08.0,rombar=0"
+        }));
+        assert!(!args.iter().any(|arg| arg.contains("x-no-mmap")));
+        assert!(
+            args.iter()
+                .any(|arg| arg == "enable=iommufd_backend_map_file_dma")
+        );
+        assert!(args.iter().any(|arg| arg == "enable=vfio_region_dmabuf"));
     }
 
     #[test]
@@ -3180,6 +3715,35 @@ uiserver: update tick backlog=false input_drops=0 input_slow=0 input_errors=0";
         assert_eq!(
             select_smoke_guest_display(&fps, true).unwrap(),
             GuestDisplay::DvmGtk
+        );
+        let physical = parse_smoke_options(
+            vec![
+                "--gui-dvm-surfaces".into(),
+                "--physical-amdgpu".into(),
+                "0000:65:00.0".into(),
+                "--amd-vfct".into(),
+                "/tmp/amd-vfct.bin".into(),
+                "--min-ui-fps".into(),
+                "60".into(),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        assert_eq!(
+            select_smoke_guest_display(&physical, false).unwrap(),
+            GuestDisplay::PhysicalAmd
+        );
+        assert!(
+            parse_smoke_options(
+                vec![
+                    "--physical-amdgpu".into(),
+                    "0000:65:00.0".into(),
+                    "--amd-vfct".into(),
+                    "/tmp/amd-vfct.bin".into(),
+                ]
+                .into_iter(),
+            )
+            .is_err()
         );
     }
 
@@ -3319,7 +3883,7 @@ uiserver: update tick backlog=false input_drops=0 input_slow=0 input_errors=0";
 
         let hash = "0".repeat(64);
         let manifest = format!(
-            "schema=8\nid=rustos-linux-dvm-x86_64\narchitecture=x86_64\nboot=linux-bzimage+cpio-xz\ndata-plane=hostd-input-ring-msix\ncontrol-plane=agent-v1-control\ncontrol-protocol=agent-v1\ncontrol-state=control\ncontrol-transport=kvm-vsock\ncontrol-authentication=dvm-agent-hmac-sha256-v1\ncontrol-capabilities=health,device-inventory,driver-inventory,display-evidence-v1,input-stream\ncontrol-contract-sha256={hash}\nbuildroot_version=2026.05\nlinux_version=6.12.94\nnvidia-open-version=580.173.02\nnvidia-open-sha256=8d8eb9001e05a9a8a663d3d5d304feb64ef2844ee185ccdfd952786820f46e1b\nnvidia-open-redistribute=no\ndisplay-kernel-modules=i915,xe,amdgpu,nvidia-drm\nmodule-signing-enforced=yes\nmodule-signing-cert-sha256={hash}\nkernel_sha256={hash}\nrootfs_sha256={hash}\nconfig_sha256={hash}\nkernel-config-sha256={hash}\nsources_lock_sha256={hash}\n"
+            "schema=8\nid=rustos-linux-dvm-x86_64\narchitecture=x86_64\nboot=linux-bzimage+cpio-xz\ndata-plane=hostd-input-ring-msix\ncontrol-plane=agent-v1-control\ncontrol-protocol=agent-v1\ncontrol-state=control\ncontrol-transport=kvm-vsock\ncontrol-authentication=dvm-agent-hmac-sha256-v1\ncontrol-capabilities=health,device-inventory,driver-inventory,display-evidence-v2,input-stream\ncontrol-contract-sha256={hash}\nbuildroot_version=2026.05\nlinux_version=6.12.94\nnvidia-open-version=580.173.02\nnvidia-open-sha256=8d8eb9001e05a9a8a663d3d5d304feb64ef2844ee185ccdfd952786820f46e1b\nnvidia-open-redistribute=no\ndisplay-kernel-modules=i915,xe,amdgpu,nvidia-drm\nmodule-signing-enforced=yes\nmodule-signing-cert-sha256={hash}\nkernel_sha256={hash}\nrootfs_sha256={hash}\nconfig_sha256={hash}\nkernel-config-sha256={hash}\nsources_lock_sha256={hash}\n"
         );
         let values = parse_manifest_text(&manifest, "manifest").unwrap();
         assert_eq!(validate_manifest_values(&values).unwrap(), contract);
@@ -3335,7 +3899,7 @@ uiserver: update tick backlog=false input_drops=0 input_slow=0 input_errors=0";
             "../../../driver-domains/linux/board/overlay/usr/share/rustos-dvm/control-plane-v1.env"
         );
         let invalid = contract_source.replace(
-            "CONTROL_CAPABILITIES=health,device-inventory,driver-inventory,display-evidence-v1,input-stream",
+            "CONTROL_CAPABILITIES=health,device-inventory,driver-inventory,display-evidence-v2,input-stream",
             "CONTROL_CAPABILITIES=health,network-rx",
         );
         assert!(parse_dvm_control_contract_text(&invalid, "invalid contract").is_err());

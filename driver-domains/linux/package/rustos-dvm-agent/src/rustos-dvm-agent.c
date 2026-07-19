@@ -35,7 +35,7 @@
 #define READY_OWNER_NAME "agent-owner.lock"
 #define READY_CANDIDATE_NAME ".ready.next"
 #define DISPLAY_READY_LOCK READY_DIR "/display-ready.lock"
-#define DISPLAY_EVIDENCE_FILE READY_DIR "/display-evidence-v1.env"
+#define DISPLAY_EVIDENCE_FILE READY_DIR "/display-evidence-v2.env"
 #define CONTROL_PORT_FLOOR 49152U
 #define CONTROL_PORT_SPAN (UINT32_MAX - CONTROL_PORT_FLOOR + 1U)
 #define MAX_FRAME 4096U
@@ -551,7 +551,7 @@ static void parse_contract(struct control_contract *contract) {
         strcmp(contract->state, "control") != 0 || strcmp(contract->transport, "kvm-vsock") != 0 ||
         strcmp(contract->authentication, "dvm-agent-hmac-sha256-v1") != 0 ||
         strcmp(contract->capabilities,
-               "health,device-inventory,driver-inventory,display-evidence-v1,input-stream") != 0) {
+               "health,device-inventory,driver-inventory,display-evidence-v2,input-stream") != 0) {
         die("unsupported control contract");
     }
 }
@@ -1020,23 +1020,48 @@ static int supported_display_driver_is_bound(void) {
 }
 
 static int display_relay_is_ready(void) {
-    static const char expected[] =
+    static const char staged_expected[] =
         "DISPLAY_RELAY_SCHEMA=2\n"
         "STATE=ready\n"
         "MODE=gpu-compositor-staged-copy\n"
         "ZERO_COPY=0\n"
         "GPU_COMPOSITION=1\n"
         "EXPLICIT_FENCE=1\n";
-    char state[sizeof(expected)];
+    static const char amdgpu_expected[] =
+        "DISPLAY_RELAY_SCHEMA=3\n"
+        "STATE=ready\n"
+        "MODE=gpu-compositor-dmabuf-source\n"
+        "SOURCE_PATH=dmabuf\n"
+        "ZERO_COPY=1\n"
+        "GPU_COMPOSITION=1\n"
+        "EXPLICIT_FENCE=1\n"
+        "ATOMIC_KMS_SCANOUT=1\n"
+        "SCANOUT_BUFFERS=3\n"
+        "STAGED_DAMAGE_COPY=0\n"
+        "CPU_FINAL_COMPOSE=0\n";
+    char driver[64];
+    char state[512];
+    const char *expected;
+    size_t expected_length;
     int fd = open(DISPLAY_READY_LOCK, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     ssize_t length;
     int locked;
     int saved;
     if (fd < 0)
         return 0;
+    if (!display_driver_name(driver)) {
+        close(fd);
+        return 0;
+    }
+    if (strcmp(driver, "amdgpu") == 0) {
+        expected = amdgpu_expected;
+        expected_length = sizeof(amdgpu_expected) - 1U;
+    } else {
+        expected = staged_expected;
+        expected_length = sizeof(staged_expected) - 1U;
+    }
     length = read(fd, state, sizeof(state));
-    if (length != (ssize_t)(sizeof(expected) - 1U) ||
-        memcmp(state, expected, sizeof(expected) - 1U) != 0) {
+    if (length != (ssize_t)expected_length || memcmp(state, expected, expected_length) != 0) {
         close(fd);
         return 0;
     }
@@ -1313,7 +1338,13 @@ static int display_guest_pci_bdf(char bdf[16]) {
 static int read_display_evidence(struct display_evidence_sample *sample, uint64_t *age_ms,
                                  char driver[64], char vendor[5], char device[5], char bdf[16]) {
     char state[1024];
-    char direct_scanout[4];
+    char source_path[12];
+    char zero_copy[4];
+    char gpu_composition[4];
+    char explicit_fence[4];
+    char atomic_kms_scanout[4];
+    char staged_damage_copy[4];
+    uint32_t scanout_buffers;
     uint64_t now;
     int length;
     int consumed = 0;
@@ -1328,20 +1359,27 @@ static int read_display_evidence(struct display_evidence_sample *sample, uint64_
     memset(sample, 0, sizeof(*sample));
     if (sscanf(
             state,
-            "DISPLAY_EVIDENCE_SCHEMA=1\nSAMPLE_SEQUENCE=%" SCNu64
+            "DISPLAY_EVIDENCE_SCHEMA=2\nSAMPLE_SEQUENCE=%" SCNu64
             "\nSAMPLE_MONOTONIC_NS=%" SCNu64 "\nWINDOW_NS=%" SCNu64
             "\nPAGEFLIP_COMPLETIONS=%" SCNu64 "\nFRAME_HZ_MILLI=%" SCNu64
             "\nCPU_COPY_US_AVG=%" SCNu64 "\nPAGEFLIP_LATENCY_US_AVG=%" SCNu64
             "\nPAGEFLIP_LATENCY_US_MAX=%" SCNu64 "\nATOMIC_COMMIT_US_AVG=%" SCNu64
             "\nCONNECTOR_ID=%" SCNu32 "\nMODE_WIDTH=%" SCNu32 "\nMODE_HEIGHT=%" SCNu32
-            "\nDIRECT_SCANOUT=%3s\n%n",
+            "\nSOURCE_PATH=%11s\nZERO_COPY=%3s\nGPU_COMPOSITION=%3s"
+            "\nEXPLICIT_FENCE=%3s\nATOMIC_KMS_SCANOUT=%3s\nSCANOUT_BUFFERS=%" SCNu32
+            "\nSTAGED_DAMAGE_COPY=%3s\n%n",
             &sample->sequence, &sample->monotonic_ns, &sample->window_ns,
             &sample->pageflip_completions, &sample->frame_hz_milli,
             &sample->cpu_copy_us_avg, &sample->pageflip_latency_us_avg,
             &sample->pageflip_latency_us_max, &sample->atomic_commit_us_avg,
-            &sample->connector_id, &sample->mode_width, &sample->mode_height, direct_scanout,
-            &consumed) != 13 ||
-        consumed != length || strcmp(direct_scanout, "yes") != 0 || sample->sequence == 0U ||
+            &sample->connector_id, &sample->mode_width, &sample->mode_height,
+            source_path, zero_copy, gpu_composition, explicit_fence,
+            atomic_kms_scanout, &scanout_buffers, staged_damage_copy, &consumed) != 19 ||
+        consumed != length || strcmp(source_path, "dmabuf") != 0 ||
+        strcmp(zero_copy, "yes") != 0 || strcmp(gpu_composition, "yes") != 0 ||
+        strcmp(explicit_fence, "yes") != 0 || strcmp(atomic_kms_scanout, "yes") != 0 ||
+        scanout_buffers != 3U || strcmp(staged_damage_copy, "no") != 0 ||
+        sample->sequence == 0U ||
         sample->monotonic_ns == 0U || monotonic_time_ns(&now) != 0 ||
         now < sample->monotonic_ns) {
         errno = EPROTO;
@@ -1682,7 +1720,7 @@ static int serve_connection(int fd, const struct control_contract *contract,
                      "RESPONSE\nid=%u\nop=driver-inventory\nstatus=ok\nvirtio-net=%s\n"
                      "virtio-gpu=%s\ndisplay-driver=%s\ndisplay-relay=%s",
                      id, virtio_net, virtio_gpu, display_driver, display_relay);
-        } else if (request_id(payload, "display-evidence-v1", &id) == 0) {
+        } else if (request_id(payload, "display-evidence-v2", &id) == 0) {
             struct display_evidence_sample evidence;
             uint64_t age_ms;
             char driver[64];
@@ -1692,11 +1730,14 @@ static int serve_connection(int fd, const struct control_contract *contract,
             if (read_display_evidence(&evidence, &age_ms, driver, vendor, device, bdf) == 0) {
                 snprintf(
                     payload, sizeof(payload),
-                    "RESPONSE\nid=%u\nop=display-evidence-v1\nstatus=ok\n"
+                    "RESPONSE\nid=%u\nop=display-evidence-v2\nstatus=ok\n"
                     "sample-sequence=%" PRIu64 "\nsample-age-ms=%" PRIu64
                     "\ndriver=%s\npci-vendor=%s\npci-device=%s\nguest-pci-bdf=%s\n"
                     "connector-id=%" PRIu32 "\nmode-width=%" PRIu32
-                    "\nmode-height=%" PRIu32 "\ndirect-scanout=yes\nwindow-ns=%" PRIu64
+                    "\nmode-height=%" PRIu32
+                    "\nsource-path=dmabuf\nzero-copy=yes\ngpu-composition=yes"
+                    "\nexplicit-fence=yes\natomic-kms-scanout=yes\nscanout-buffers=3"
+                    "\nstaged-damage-copy=no\nwindow-ns=%" PRIu64
                     "\nframe-hz-milli=%" PRIu64 "\npageflip-completions=%" PRIu64
                     "\ncpu-copy-us-avg=%" PRIu64 "\npageflip-latency-us-avg=%" PRIu64
                     "\npageflip-latency-us-max=%" PRIu64 "\natomic-commit-us-avg=%" PRIu64,
@@ -1709,10 +1750,12 @@ static int serve_connection(int fd, const struct control_contract *contract,
             } else {
                 snprintf(
                     payload, sizeof(payload),
-                    "RESPONSE\nid=%u\nop=display-evidence-v1\nstatus=unavailable\n"
+                    "RESPONSE\nid=%u\nop=display-evidence-v2\nstatus=unavailable\n"
                     "sample-sequence=0\nsample-age-ms=0\ndriver=missing\npci-vendor=0000\n"
                     "pci-device=0000\nguest-pci-bdf=none\nconnector-id=0\nmode-width=0\n"
-                    "mode-height=0\ndirect-scanout=no\nwindow-ns=0\nframe-hz-milli=0\n"
+                    "mode-height=0\nsource-path=none\nzero-copy=no\ngpu-composition=no\n"
+                    "explicit-fence=no\natomic-kms-scanout=no\nscanout-buffers=0\n"
+                    "staged-damage-copy=no\nwindow-ns=0\nframe-hz-milli=0\n"
                     "pageflip-completions=0\ncpu-copy-us-avg=0\npageflip-latency-us-avg=0\n"
                     "pageflip-latency-us-max=0\natomic-commit-us-avg=0",
                     id);

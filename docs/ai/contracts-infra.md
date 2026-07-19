@@ -162,13 +162,23 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
   probe` and `relay-input` therefore require `--control-secret` from the same
   owner-private launch material. Do not put the secret on a kernel command
   line, image filesystem, manifest, log, or service environment.
-- The DVM wrapper fingerprints Buildroot configuration, each local relay
-  (`rustos-dvm-agent`, `rustos-dvm-display`, `rustos-dvm-net`), and the rootfs
-  overlay separately. Configuration or toolchain changes use `distclean`; a
-  relay edit removes only that relay's Buildroot directory, while overlay-only
-  changes prune retired overlay-owned files, synchronize current overlay files,
-  and regenerate only the CPIO image. `make -C driver-domains/linux
-  rebuild-{agent,display,net}` are explicit package-only rebuild entrypoints.
+- The DVM wrapper exposes its next mutation through read-only `build-plan`.
+  Buildroot/toolchain identity or an unsafe complete `BR2_*` transition is the
+  full-output lane. Linux source/config and host kernel-build headers select
+  Linux plus every enabled out-of-tree signed module and the rootfs. A local
+  relay edit removes only that relay's Buildroot directory. Overlay, post-build,
+  and AMD firmware-policy changes prune retired owned files and regenerate the
+  CPIO image. This matches Buildroot's explicit warning that it does not infer
+  all configuration dependencies and Linux kbuild's requirement that external
+  modules use the exact prepared/built kernel configuration and symbol data.
+  `rebuild-{agent,display,net}` remain explicit package-only integration
+  entrypoints.
+- Configuration identity stamps are written after successful Kconfig
+  reconciliation so an interrupted build can resume. Kernel, relay, overlay,
+  and release-input stamps are committed only after configuration, module
+  signature, manifest, and artifact verification succeeds. After an
+  interruption or ordinary compile failure, rerun the same wrapper target;
+  never erase the partial output as a first response.
 - The DVM wrapper requires host `libelf` headers and an unversioned linker
   library. `RUSTOS_DVM_LIBELF_SYSROOT` may name an immutable extracted
   `libelf-dev` package for non-root CI; the wrapper validates and hashes those
@@ -180,7 +190,7 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
   logs under `build/kvm/`.
 - A successful smoke requires RustOS's default `rootd` readiness marker and
   the L0 host broker to complete the DVM
-  `health,device-inventory,driver-inventory,display-evidence-v1,input-stream` handshake using launch-assigned KVM
+  `health,device-inventory,driver-inventory,display-evidence-v2,input-stream` handshake using launch-assigned KVM
   vsock CID `4`. L0 then attaches as the fixed ivshmem peer 1 only after
   RustOS has claimed peer 0, writes only fixed RDI3 session/key/pointer frames
   into the host-owned 128 KiB input ring, and signals the one RustOS MSI-X
@@ -262,8 +272,21 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
   `ivshmem-doorbell` broker gives exactly the RustOS compositor and GUI DVM one
   host-to-DVM wake vector and exactly two host receive vector meanings
   (`control`, `offline`) plus the fixed validated UC control plane; it rejects
-  other UIDs and peers. A separate 32 MiB `virtio-pmem` pixel device is writable
-  in RustOS QEMU and read-only/ROM in the DVM. RustOS publishes a complete
+  other UIDs and peers. A separate 128 MiB `virtio-pmem` pixel device is writable
+  in RustOS QEMU and read-only/ROM in the DVM. The KVM runner creates its pixel
+  backing in a private tmpfs directory and preallocates it from the RustOS QEMU
+  before attaching VFIO in the DVM. Commercial hostd likewise requires an exact
+  128 MiB owner-private tmpfs/hugetlbfs file and preallocates every page before
+  reset or launch. This is a real IOMMUFD prerequisite: QEMU 10.2.1 on the
+  measured host rejected the former repository-local ext4 device-memory mapping
+  at IOVA `0x100000000` with `EINVAL`. After moving that backing to tmpfs, the
+  next physical run advanced to a distinct `0xf0000000`/128 MiB failure: QEMU
+  tried to admit an mmap-able AMD PCI BAR as an IOMMUFD peer-to-peer DMA region,
+  which that interface does not support. The explicitly non-commercial runner
+  disables VFIO BAR mmap and the ROM BAR to get past this diagnostic boot
+  blocker, but that slower-MMIO configuration cannot prove the commercial
+  performance property. A source import cannot exist unless the whole backing
+  is DMA-pinnable and mapped into the VFIO IOAS. RustOS publishes a complete
   immutable frame in each slot. It may patch only the declared damage when a
   released slot retains the exact immediately preceding content generation and
   the compositor source mapping is unchanged; otherwise it copies the complete
@@ -278,21 +301,42 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
   attributes. It rejects writable VMAs. It permits one outstanding release
   until host ACK; a later host event retries bounded flow control rather than
   terminating the relay.
+  The adapter also reserves and owns the complete 128 MiB pixel aperture as a
+  `ZONE_DEVICE` page-map. DMA-BUF export pins that owner and rejects any PFN
+  outside it; a CPU-only `memremap()` alias cannot be mistaken for GPU-DMA
+  backing. Kernel configuration verification therefore requires memory
+  hotplug, hot-remove, and `CONFIG_ZONE_DEVICE`.
   Offline clears the confirmation, while a full pool re-invites its newest
   READY slot after restart. The relay rejects generic-UIO/INTx binding, releases
   superseded READY slots through the same validated path, and requires atomic
   KMS with one primary plane plus DMA-BUF import support. Each page-aligned
-  immutable slot is exported directly as one scanout framebuffer; there is no
-  relay CPU copy or guest-writable pixel mapping. DRM PRIME's generic
-  bidirectional import request is backed by a deliberately `DMA_TO_DEVICE`
-  mapping, so the display device receives read-only DMA authority. The relay
-  submits a nonblocking atomic page flip, keeps the new front slot pinned, and
-  returns the previous front slot only after the new page-flip event. Offline
-  revokes the entire pool. An accepted import or atomic ioctl alone is not
-  scanout completion.
+  immutable slot is exported as an EGL source image; it is never made the KMS
+  front buffer. DRM PRIME's generic bidirectional import request is backed by a
+  deliberately `DMA_TO_DEVICE` mapping, so the display device receives
+  read-only DMA authority and there is no relay CPU copy or guest-writable
+  source mapping. Since the producer is in another VM, import is additionally
+  rejected unless the AMD attachment reports coherent DMA; guest-side cache
+  maintenance is not misrepresented as cross-VM producer synchronization.
+  After an MSI-X publication, the root-only exporter validates
+  the exact live slot, generation, sequence, acquire value, and bounded batch,
+  performs the device-to-CPU acquire barrier, and materializes that completed
+  CPU-producer release as a one-use `sync_file`. EGL imports it and inserts a
+  server-side wait before GLES samples the source. GLES composes into a separate
+  three-buffer GBM pool; its possibly-unsignalled native completion fence feeds
+  KMS `IN_FENCE_FD` immediately, without a relay CPU pre-wait. One bounded poll
+  observes render completion, the page-flip event, and the CRTC out-fence; only
+  the latter completed chain retires the prior output. Offline
+  revokes the entire pool. An accepted import, acquire ioctl, or atomic ioctl
+  alone is not scanout completion.
+  A freshly initialized passthrough GPU may expose a connected eDP connector
+  with no current `encoder_id`. The relay therefore chooses only from that
+  connector's kernel-advertised encoder/CRTC compatibility set; it does not
+  require or trust stale firmware modeset state.
   The exporter device is explicitly root-only and may open before a host
-  invitation so the relay can import all three read-only slots and complete
-  its initial black modeset. Host control/readiness authority is still granted
+  invitation so the relay can import all three read-only slots and complete an
+  initial modeset using only its private zero-filled texture. It never samples
+  a RustOS source before the first exact acquire `sync_file`. Host
+  control/readiness authority is still granted
   only after those steps and an exact published invitation; requiring
   readiness at exporter open would create an impossible lifecycle cycle.
   V2, polling, and native-GPU fallback are not accepted as test or release
@@ -313,9 +357,10 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
   relay
   nevertheless preserves the fixed shared ABI and can scale only when a
   display backend genuinely requires a different mode. KVM still proves the
-  bounded control apertures, but direct scanout remains failed until a physical
-  i915/xe/amdgpu or pinned NVIDIA-open `nvidia-drm` assignment supplies the
-  import and page-flip evidence. The Linux appliance selects a display-class
+  bounded control apertures. The enabled AMD path has a source-level DMA-BUF
+  import, GPU-composition, explicit-fence, and atomic-page-flip consumer, but
+  its hardware gate remains failed until the assigned device supplies that
+  evidence. The Linux appliance selects a display-class
   device only through its kernel-generated PCI modalias. NVIDIA initialization
   then requires `nvidia`, `nvidia_modeset`, and `nvidia_drm modeset=1 fbdev=0`
   from one pinned 580.173.02 release plus the matching GSP images; a partial or
@@ -375,8 +420,28 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
 - `rustos-hostd preflight-physical` adds the complete reversible runtime gate:
   exact display-only policy and QEMU digest, the self-contained schema-8 DVM
   bundle, a writable `/dev/iommu`, successful empty-IOAS allocate/destroy
-  ioctls, the same live host-display safety check, and schema-3 proof that the
-  sole display-class function is the signed `amdgpu` `1002:1900` target. `acquire --activate`
+  ioctls, a soft `RLIMIT_MEMLOCK` of at least 4 GiB, the same live host-display
+  safety check, and schema-3 proof that the
+  sole display-class function is the signed `amdgpu` `1002:1900` target. Every
+  AMD admission additionally reads the kernel-owned ACPI VFCT source with a
+  4 MiB bound and no symlink following, verifies the ACPI checksum, selects one
+  exact bus/device/function/vendor/device image, permits the subsystem pair
+  only when exact or both firmware fields are zero, and requires its 0x55aa and
+  ATOM headers. Supervision repeats that check before reset, rewrites only the
+  validated image BDF to fixed guest slot `0000:00:08.0`, recomputes and
+  revalidates the ACPI checksum, proves the VBIOS payload unchanged, and fsyncs
+  the complete 0600 VFCT table in the owner-private runtime directory. QEMU
+  receives only that table through `-acpitable` and pins the VFIO function to
+  the same slot. Missing, duplicate, truncated, mutable, mismatched, or
+  incorrectly relocated VBIOS state fails before launch.
+  Every
+  enabled reset method must have an impact scope contained by the complete
+  lease. `bus`/`cxl_bus` is admitted only when every function on the affected
+  bus belongs to that lease; missing, empty, unknown, or escaping reset scope
+  fails closed. Physical binding also requires `vfio-pci.disable_idle_d3=Y`
+  before probe, then clears and rereads PCI bus-master after bind and before
+  and after every reset. This prevents an idle-D3 state restore from enabling
+  DMA while the group still has an identity host mapping. `acquire --activate`
   repeats this gate
   after signed-release verification and before it creates durable prepared
   state or changes any driver binding. A host lacking IOMMUFD therefore fails
@@ -390,12 +455,20 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
   virtual KVM test transports do not authorize physical assignment. The normal
   input command is a reconnecting L0 service; `--once` is diagnostics-only.
 - `rustos-hostd supervise` accepts physical readiness only after five distinct
-  authenticated `display-evidence-v1` samples meet the signed nominal-60-Hz
+  authenticated `display-evidence-v2` samples meet the signed nominal-60-Hz
   floor and page-flip/atomic-commit latency bounds. The relay sample is derived
-  from completed DRM page-flip events, declares direct DMA-BUF scanout and zero
-  relay CPU copy, and carries an advancing sequence plus DVM-monotonic age.
+  from completed DRM page-flip events and requires a read-only DMA-BUF source,
+  GPU composition, explicit fence, atomic KMS, a three-buffer scanout pool,
+  zero relay CPU copy, and no staged damage copy. It carries an advancing
+  sequence plus DVM-monotonic age.
   Wrong AMD identity, stale/restarted evidence, a CPU-copy path, low throughput,
   or excessive latency fails setup or ongoing health and triggers bounded recovery.
+  The physical supervisor uses a fixed 2 GiB guest-memory profile. This leaves
+  headroom for the approximately 453 MiB uncompressed release initramfs; the
+  former 1 GiB profile was physically observed to fail during unpacking before
+  the control and display services were available. Preflight and supervision
+  require a 4 GiB soft memlock limit before device mutation/reset so IOMMUFD
+  page pinning cannot fail for the first time after the GPU is detached.
 - `rustos-hostd acquire` remains read-only unless `--activate` is supplied
   together with a detached OpenPGP signature, an explicit pinned release
   keyring, a strict `release-authorization-v1` payload, the bound DVM artifact
@@ -425,12 +498,17 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
   the agent to observe a supported DRM driver plus the direct relay's kernel-
   released lifetime lock after a real page flip. A fresh authenticated health
   exchange rechecks both every five seconds with a three-second response bound.
-  Guest shutdown exits QEMU; a lost health/display exchange enters the same
-  teardown path. All release inputs, the signature verifier, QEMU, artifacts,
+  Host-requested shutdown uses an owner-private QMP Unix socket: hostd validates
+  the server greeting, negotiates `qmp_capabilities`, sends
+  `system_powerdown`, and then waits at most ten seconds for the exact QEMU
+  child to exit. The DVM runs Buildroot `acpid` with the fixed power-button to
+  `/sbin/poweroff` action. QMP command acceptance is not shutdown evidence. A
+  lost health/display exchange enters the same path. All release inputs, the signature verifier, QEMU, artifacts,
   and policy files are canonical regular files beneath root/service-owned,
   non-group/world-writable directory chains; hashing is in-process, so neither
   `PATH` substitution nor an untrusted symlink/parent can change the checked
-  object. TERM has a five-second bound before KILL and reap; original drivers are restored only after child
+  object. Only if QMP/ACPI fails does TERM get a five-second bound before KILL
+  and reap; a forced stop cannot be accepted as a successful run. Original drivers are restored only after child
   exit and a second complete-group reset. A signaled or nonzero QEMU exit is a
   failed supervision result even when reset and restoration succeed; the CLI
   cannot report a crashed DVM as a completed run. A reset failure keeps the active
@@ -438,8 +516,8 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
   device.
 - `rustos-hostd recover` signals a process only when the runtime record matches
   the lease and the live PID has the exact recorded start time. Recovery opens
-  a pidfd, rechecks the start token after the open, and sends TERM/KILL only via
-  that descriptor. A missing kernel pidfd facility fails the commercial gate;
+  a pidfd, rechecks the start token after the open, attempts the private
+  QMP/ACPI shutdown, and sends fallback TERM/KILL only via that descriptor. A missing kernel pidfd facility fails the commercial gate;
   there is no numeric-PID fallback. A reused numeric PID is never signaled. It then applies
   the same bounded stop, post-stop reset, restore, and durable-record deletion
   order. Missing, unsafe, stale, or foreign runtime state fails closed.

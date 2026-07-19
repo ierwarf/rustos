@@ -54,6 +54,8 @@
 #define GPU_TRANSFORM_LIMIT (4 * 65536)
 #define GPU_OUTPUT_COUNT 3U
 
+typedef void (*rustos_gl_egl_image_target_texture_fn)(GLenum target, void *image);
+
 struct gpu_batch_header {
     uint32_t command_count;
     uint32_t context_id;
@@ -110,9 +112,16 @@ struct rustos_gpu_runtime {
     EGLSurface egl_surface;
     PFNEGLCREATESYNCKHRPROC create_sync;
     PFNEGLDESTROYSYNCKHRPROC destroy_sync;
+    PFNEGLWAITSYNCKHRPROC wait_sync;
     PFNEGLDUPNATIVEFENCEFDANDROIDPROC dup_native_fence;
+    PFNEGLCREATEIMAGEKHRPROC create_image;
+    PFNEGLDESTROYIMAGEKHRPROC destroy_image;
+    rustos_gl_egl_image_target_texture_fn image_target_texture;
     GLuint program;
     GLuint source_texture;
+    GLuint dmabuf_source_textures[GPU_OUTPUT_COUNT];
+    EGLImageKHR dmabuf_source_images[GPU_OUTPUT_COUNT];
+    int dmabuf_sources_ready;
     GLuint vertex_buffer;
     GLuint vertex_array;
     GLint rect_uniform;
@@ -131,6 +140,8 @@ struct rustos_gpu_runtime {
     uint64_t completed_acquire;
     const char *stage;
     uint64_t last_content_epoch;
+    uint64_t last_generation;
+    uint64_t last_sequence;
     uint32_t context_id;
     uint32_t context_epoch;
     struct gpu_output outputs[GPU_OUTPUT_COUNT];
@@ -577,6 +588,48 @@ static int finish_frame(struct rustos_gpu_runtime *runtime, struct rustos_gpu_fr
     return 0;
 }
 
+static int reject_source_acquire_fence(int source_acquire_fence_fd, int error) {
+    if (source_acquire_fence_fd >= 0)
+        close(source_acquire_fence_fd);
+    if (error != 0)
+        errno = error;
+    else if (errno == 0)
+        errno = EPROTO;
+    return -1;
+}
+
+static int wait_external_source_acquire(struct rustos_gpu_runtime *runtime,
+                                        int source_acquire_fence_fd) {
+    const EGLint attributes[] = {
+        EGL_SYNC_NATIVE_FENCE_FD_ANDROID, source_acquire_fence_fd,
+        EGL_NONE,
+    };
+    EGLSyncKHR sync;
+    EGLint result;
+    if (runtime == NULL || runtime->wait_sync == NULL ||
+        source_acquire_fence_fd < 0) {
+        return reject_source_acquire_fence(source_acquire_fence_fd, EINVAL);
+    }
+    runtime->stage = "gpu-batch-external-acquire-import";
+    sync = runtime->create_sync(runtime->egl_display,
+                                EGL_SYNC_NATIVE_FENCE_ANDROID, attributes);
+    if (sync == EGL_NO_SYNC_KHR) {
+        close(source_acquire_fence_fd);
+        errno = EIO;
+        return -1;
+    }
+    /* A successful native-fence import transfers ownership of the fd to EGL.
+     * eglWaitSyncKHR inserts the producer dependency into the current GPU
+     * command stream without turning the relay into a CPU-side busy waiter. */
+    runtime->stage = "gpu-batch-external-acquire-wait";
+    result = runtime->wait_sync(runtime->egl_display, sync, 0);
+    if (!runtime->destroy_sync(runtime->egl_display, sync) || result != EGL_TRUE) {
+        errno = EIO;
+        return -1;
+    }
+    return 0;
+}
+
 int rustos_gpu_runtime_open(int drm_fd, uint32_t output_width, uint32_t output_height,
                             uint32_t atlas_width, uint32_t atlas_height,
                             uint32_t atlas_stride_bytes,
@@ -742,6 +795,99 @@ fail:
     return -1;
 }
 
+int rustos_gpu_runtime_import_dmabuf_sources(struct rustos_gpu_runtime *runtime,
+                                             const int *source_fds,
+                                             size_t source_count) {
+    const char *egl_extensions;
+    const char *gl_extensions;
+    size_t index;
+    if (runtime == NULL || source_fds == NULL || source_count != GPU_OUTPUT_COUNT ||
+        runtime->dmabuf_sources_ready || strcmp(runtime->driver, "amdgpu") != 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    runtime->stage = "gpu-dmabuf-extension-contract";
+    egl_extensions = eglQueryString(runtime->egl_display, EGL_EXTENSIONS);
+    gl_extensions = (const char *)glGetString(GL_EXTENSIONS);
+    if (!extension_present(egl_extensions, "EGL_KHR_image_base") ||
+        !extension_present(egl_extensions, "EGL_EXT_image_dma_buf_import") ||
+        !extension_present(egl_extensions, "EGL_KHR_wait_sync") ||
+        !extension_present(gl_extensions, "GL_OES_EGL_image")) {
+        errno = EOPNOTSUPP;
+        return -1;
+    }
+    runtime->create_image =
+        (PFNEGLCREATEIMAGEKHRPROC)eglGetProcAddress("eglCreateImageKHR");
+    runtime->destroy_image =
+        (PFNEGLDESTROYIMAGEKHRPROC)eglGetProcAddress("eglDestroyImageKHR");
+    runtime->wait_sync =
+        (PFNEGLWAITSYNCKHRPROC)eglGetProcAddress("eglWaitSyncKHR");
+    runtime->image_target_texture = (rustos_gl_egl_image_target_texture_fn)
+        eglGetProcAddress("glEGLImageTargetTexture2DOES");
+    if (runtime->create_image == NULL || runtime->destroy_image == NULL ||
+        runtime->wait_sync == NULL ||
+        runtime->image_target_texture == NULL) {
+        errno = ENOSYS;
+        return -1;
+    }
+    for (index = 0U; index < GPU_OUTPUT_COUNT; index++) {
+        const EGLint attributes[] = {
+            EGL_WIDTH, (EGLint)runtime->atlas_width,
+            EGL_HEIGHT, (EGLint)runtime->atlas_height,
+            EGL_LINUX_DRM_FOURCC_EXT, (EGLint)DRM_FORMAT_ARGB8888,
+            EGL_DMA_BUF_PLANE0_FD_EXT, source_fds[index],
+            EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
+            EGL_DMA_BUF_PLANE0_PITCH_EXT, (EGLint)runtime->atlas_stride_bytes,
+            EGL_NONE,
+        };
+        if (source_fds[index] < 0) {
+            errno = EBADF;
+            goto fail;
+        }
+        runtime->stage = "gpu-dmabuf-egl-image";
+        runtime->dmabuf_source_images[index] = runtime->create_image(
+            runtime->egl_display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL,
+            attributes);
+        if (runtime->dmabuf_source_images[index] == EGL_NO_IMAGE_KHR) {
+		EGLint egl_error = eglGetError();
+		fprintf(stderr,
+		        "rustos-dvm-display: DMA-BUF EGL import failed slot=%zu egl_error=0x%x\n",
+		        index, egl_error);
+            errno = EIO;
+            goto fail;
+        }
+        glGenTextures(1, &runtime->dmabuf_source_textures[index]);
+        glBindTexture(GL_TEXTURE_2D, runtime->dmabuf_source_textures[index]);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        runtime->image_target_texture(
+            GL_TEXTURE_2D, (void *)runtime->dmabuf_source_images[index]);
+        if (runtime->dmabuf_source_textures[index] == 0U ||
+            glGetError() != GL_NO_ERROR) {
+            errno = EIO;
+            goto fail;
+        }
+    }
+    runtime->dmabuf_sources_ready = 1;
+    runtime->stage = "gpu-dmabuf-ready";
+    return 0;
+fail:
+    for (index = 0U; index < GPU_OUTPUT_COUNT; index++) {
+        if (runtime->dmabuf_source_textures[index] != 0U) {
+            glDeleteTextures(1, &runtime->dmabuf_source_textures[index]);
+            runtime->dmabuf_source_textures[index] = 0U;
+        }
+        if (runtime->dmabuf_source_images[index] != EGL_NO_IMAGE_KHR) {
+            (void)runtime->destroy_image(runtime->egl_display,
+                                         runtime->dmabuf_source_images[index]);
+            runtime->dmabuf_source_images[index] = EGL_NO_IMAGE_KHR;
+        }
+    }
+    return -1;
+}
+
 int rustos_gpu_runtime_render_prime(struct rustos_gpu_runtime *runtime,
                                     struct rustos_gpu_frame *frame) {
     uint8_t *pixels;
@@ -765,11 +911,15 @@ int rustos_gpu_runtime_render_prime(struct rustos_gpu_runtime *runtime,
     runtime->stage = "gpu-prime-workload-clock";
     if (monotonic_ns(&frame->render_started_ns) != 0)
         goto fail;
-    runtime->stage = "gpu-prime-atlas-upload";
+    /* Prime must not sample RustOS-owned DMA-BUF pixels before the first
+     * validated producer release. Exercise the GPU/KMS pipeline with the
+     * private zero-filled texture; the first real frame proves DMA-BUF use. */
+    runtime->stage = "gpu-prime-internal-source";
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, runtime->source_texture);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-    glPixelStorei(GL_UNPACK_ROW_LENGTH, (GLint)(runtime->atlas_stride_bytes / 4U));
+    glPixelStorei(GL_UNPACK_ROW_LENGTH,
+                  (GLint)(runtime->atlas_stride_bytes / 4U));
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)runtime->atlas_width,
                     (GLsizei)runtime->atlas_height, GL_BGRA_EXT,
                     GL_UNSIGNED_BYTE, pixels);
@@ -810,7 +960,7 @@ int rustos_gpu_runtime_render_batch(struct rustos_gpu_runtime *runtime,
                                     uint32_t damage_count,
                                     const uint8_t *batch, size_t batch_bytes,
                                     uint32_t binding_slot, uint64_t generation,
-                                    uint64_t sequence,
+                                    uint64_t sequence, int source_acquire_fence_fd,
                                     struct rustos_gpu_frame *frame) {
     struct gpu_batch_header header;
     struct gpu_source source;
@@ -820,22 +970,27 @@ int rustos_gpu_runtime_render_batch(struct rustos_gpu_runtime *runtime,
     GLenum wait_result;
     if (runtime != NULL)
         runtime->stage = "gpu-batch-validate";
-    if (runtime == NULL || atlas_pixels == NULL ||
+    if (runtime == NULL)
+        return reject_source_acquire_fence(source_acquire_fence_fd, EINVAL);
+    if ((runtime->dmabuf_sources_ready && source_acquire_fence_fd < 0) ||
+        (!runtime->dmabuf_sources_ready && source_acquire_fence_fd >= 0) ||
+        atlas_pixels == NULL ||
         (damage_count != 0U && damage == NULL) || damage_count > 64U ||
         batch == NULL || frame == NULL ||
         generation == 0U || sequence == 0U ||
         atlas_bytes != (size_t)runtime->atlas_stride_bytes * runtime->atlas_height ||
         parse_batch(runtime, batch, batch_bytes, &header, &source) != 0 ||
         source.binding_slot != binding_slot || source.generation != generation ||
+        generation <= runtime->last_generation ||
+        sequence <= runtime->last_sequence ||
         header.submit_value != runtime->expected_submit + 1U ||
         header.acquire_value <= runtime->completed_acquire ||
         source.content_epoch <= runtime->last_content_epoch ||
         (runtime->expected_submit != 0U &&
          (header.context_id != runtime->context_id ||
           header.context_epoch != runtime->context_epoch))) {
-        if (errno == 0)
-            errno = EPROTO;
-        return -1;
+        return reject_source_acquire_fence(source_acquire_fence_fd,
+                                           errno == 0 ? EPROTO : 0);
     }
     for (index = 0U; index < damage_count; index++) {
         uint64_t x_end = (uint64_t)damage[index].x + damage[index].width;
@@ -843,16 +998,14 @@ int rustos_gpu_runtime_render_batch(struct rustos_gpu_runtime *runtime,
         uint32_t prior;
         if (damage[index].width == 0U || damage[index].height == 0U ||
             x_end > runtime->atlas_width || y_end > runtime->atlas_height) {
-            errno = EPROTO;
-            return -1;
+            return reject_source_acquire_fence(source_acquire_fence_fd, EPROTO);
         }
         for (prior = 0U; prior < index; prior++) {
             if ((uint64_t)damage[prior].x < (uint64_t)damage[index].x + damage[index].width &&
                 (uint64_t)damage[index].x < (uint64_t)damage[prior].x + damage[prior].width &&
                 (uint64_t)damage[prior].y < (uint64_t)damage[index].y + damage[index].height &&
                 (uint64_t)damage[index].y < (uint64_t)damage[prior].y + damage[prior].height) {
-                errno = EPROTO;
-                return -1;
+                return reject_source_acquire_fence(source_acquire_fence_fd, EPROTO);
             }
         }
     }
@@ -860,8 +1013,7 @@ int rustos_gpu_runtime_render_batch(struct rustos_gpu_runtime *runtime,
         (damage_count != 1U || damage[0].x != 0U || damage[0].y != 0U ||
          damage[0].width != runtime->atlas_width ||
          damage[0].height != runtime->atlas_height)) {
-        errno = EPROTO;
-        return -1;
+        return reject_source_acquire_fence(source_acquire_fence_fd, EPROTO);
     }
     memset(frame, 0, sizeof(*frame));
     if (runtime->expected_submit == 0U) {
@@ -876,34 +1028,48 @@ int rustos_gpu_runtime_render_batch(struct rustos_gpu_runtime *runtime,
     frame->sequence = sequence;
     frame->source_slot = binding_slot;
     frame->budget_us = header.budget_us;
-    runtime->stage = "gpu-batch-atlas-upload";
+    runtime->stage = runtime->dmabuf_sources_ready
+        ? "gpu-batch-dmabuf-acquire"
+        : "gpu-batch-atlas-upload";
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, runtime->source_texture);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-    glPixelStorei(GL_UNPACK_ROW_LENGTH, (GLint)(runtime->atlas_stride_bytes / 4U));
-    for (index = 0U; index < damage_count; index++) {
-        const uint8_t *pixels = atlas_pixels +
-            (size_t)damage[index].y * runtime->atlas_stride_bytes +
-            (size_t)damage[index].x * 4U;
-        glTexSubImage2D(GL_TEXTURE_2D, 0, (GLint)damage[index].x,
-                        (GLint)damage[index].y, (GLsizei)damage[index].width,
-                        (GLsizei)damage[index].height, GL_BGRA_EXT,
-                        GL_UNSIGNED_BYTE, pixels);
+    glBindTexture(GL_TEXTURE_2D, runtime->dmabuf_sources_ready
+        ? runtime->dmabuf_source_textures[binding_slot]
+        : runtime->source_texture);
+    if (runtime->dmabuf_sources_ready) {
+        if (wait_external_source_acquire(runtime, source_acquire_fence_fd) != 0)
+            return -1;
+        source_acquire_fence_fd = -1;
+    } else {
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+        glPixelStorei(GL_UNPACK_ROW_LENGTH,
+                      (GLint)(runtime->atlas_stride_bytes / 4U));
+        for (index = 0U; index < damage_count; index++) {
+            const uint8_t *pixels = atlas_pixels +
+                (size_t)damage[index].y * runtime->atlas_stride_bytes +
+                (size_t)damage[index].x * 4U;
+            glTexSubImage2D(GL_TEXTURE_2D, 0, (GLint)damage[index].x,
+                            (GLint)damage[index].y, (GLsizei)damage[index].width,
+                            (GLsizei)damage[index].height, GL_BGRA_EXT,
+                            GL_UNSIGNED_BYTE, pixels);
+        }
+        glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
     }
-    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
-    runtime->stage = "gpu-batch-upload-fence";
-    acquire_fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0U);
-    if (acquire_fence == NULL) {
-        errno = EIO;
-        return -1;
-    }
-    glFlush();
-    wait_result = glClientWaitSync(acquire_fence, GL_SYNC_FLUSH_COMMANDS_BIT,
-                                   (GLuint64)header.budget_us * 1000ULL);
-    glDeleteSync(acquire_fence);
-    if (wait_result != GL_ALREADY_SIGNALED && wait_result != GL_CONDITION_SATISFIED) {
-        errno = wait_result == GL_TIMEOUT_EXPIRED ? ETIMEDOUT : EIO;
-        return -1;
+    if (!runtime->dmabuf_sources_ready) {
+        runtime->stage = "gpu-batch-upload-fence";
+        acquire_fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0U);
+        if (acquire_fence == NULL) {
+            errno = EIO;
+            return -1;
+        }
+        glFlush();
+        wait_result = glClientWaitSync(acquire_fence, GL_SYNC_FLUSH_COMMANDS_BIT,
+                                       (GLuint64)header.budget_us * 1000ULL);
+        glDeleteSync(acquire_fence);
+        if (wait_result != GL_ALREADY_SIGNALED &&
+            wait_result != GL_CONDITION_SATISFIED) {
+            errno = wait_result == GL_TIMEOUT_EXPIRED ? ETIMEDOUT : EIO;
+            return -1;
+        }
     }
     runtime->completed_acquire = header.acquire_value;
     runtime->last_content_epoch = source.content_epoch;
@@ -966,6 +1132,8 @@ int rustos_gpu_runtime_render_batch(struct rustos_gpu_runtime *runtime,
     if (finish_frame(runtime, frame) != 0)
         return -1;
     runtime->expected_submit = header.submit_value;
+    runtime->last_generation = generation;
+    runtime->last_sequence = sequence;
     return 0;
 }
 
@@ -1002,6 +1170,14 @@ void rustos_gpu_runtime_close(struct rustos_gpu_runtime *runtime) {
         glDeleteVertexArrays(1, &runtime->vertex_array);
     if (runtime->source_texture != 0U)
         glDeleteTextures(1, &runtime->source_texture);
+    for (index = 0U; index < GPU_OUTPUT_COUNT; index++) {
+        if (runtime->dmabuf_source_textures[index] != 0U)
+            glDeleteTextures(1, &runtime->dmabuf_source_textures[index]);
+        if (runtime->dmabuf_source_images[index] != EGL_NO_IMAGE_KHR &&
+            runtime->destroy_image != NULL)
+            (void)runtime->destroy_image(runtime->egl_display,
+                                         runtime->dmabuf_source_images[index]);
+    }
     if (runtime->program != 0U)
         glDeleteProgram(runtime->program);
     for (index = 0U; index < GPU_OUTPUT_COUNT; index++) {
@@ -1036,4 +1212,8 @@ const char *rustos_gpu_runtime_renderer(const struct rustos_gpu_runtime *runtime
 
 const char *rustos_gpu_runtime_stage(const struct rustos_gpu_runtime *runtime) {
     return runtime == NULL || runtime->stage == NULL ? "gpu-runtime-unknown" : runtime->stage;
+}
+
+int rustos_gpu_runtime_uses_dmabuf_sources(const struct rustos_gpu_runtime *runtime) {
+    return runtime != NULL && runtime->dmabuf_sources_ready;
 }

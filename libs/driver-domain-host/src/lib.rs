@@ -17,7 +17,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::mem::size_of;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
@@ -275,7 +275,7 @@ impl ControlContract {
                 "health",
                 "device-inventory",
                 "driver-inventory",
-                "display-evidence-v1",
+                "display-evidence-v2",
                 "input-stream",
             ]
         {
@@ -414,7 +414,8 @@ pub enum DeviceTransport {
     /// Fixed RDI3 records in the host-owned input ring plus one MSI-X wake.
     InputRingMsix,
     /// Read-only RustOS snapshot slots exported by the GUI DVM as DMA-BUFs
-    /// and imported by the DVM-owned DRM/KMS device for direct scanout.
+    /// and imported as GPU composition sources; explicit fences then hand a
+    /// separate three-buffer output pool to DVM-owned atomic DRM/KMS.
     DisplayDmaBufKms,
 }
 
@@ -490,8 +491,18 @@ impl PhysicalDisplayPolicy {
                 self.pci_device
             );
         }
-        if !evidence.direct_scanout || evidence.cpu_copy_us_avg != 0 {
-            bail!("DVM display evidence does not prove zero-copy direct scanout");
+        if evidence.source_path != "dmabuf"
+            || !evidence.zero_copy
+            || !evidence.gpu_composition
+            || !evidence.explicit_fence
+            || !evidence.atomic_kms_scanout
+            || evidence.scanout_buffers != 3
+            || evidence.staged_damage_copy
+            || evidence.cpu_copy_us_avg != 0
+        {
+            bail!(
+                "DVM display evidence does not prove DMA-BUF GPU composition and atomic KMS scanout"
+            );
         }
         if evidence.connector_id == 0 || evidence.mode_width == 0 || evidence.mode_height == 0 {
             bail!("DVM display evidence omitted the active physical mode");
@@ -1176,6 +1187,103 @@ pub fn validate_host_display_assignment(lease: &ValidatedLease, sysfs_root: &Pat
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResetScope {
+    Function,
+    ParentBus,
+}
+
+/// Require every enabled reset method to have an impact scope fully contained
+/// by the admitted lease. Function-local methods affect only their BDF. A
+/// `bus`/`cxl_bus` fallback is accepted only when every function on that PCI
+/// bus belongs to the same complete lease.
+pub fn validate_reset_scope_assignment(lease: &ValidatedLease, sysfs_root: &Path) -> Result<()> {
+    let assigned = lease.pci_bdfs.iter().cloned().collect::<BTreeSet<_>>();
+    for bdf in &lease.pci_bdfs {
+        let reset_method = sysfs_root
+            .join("bus/pci/devices")
+            .join(bdf)
+            .join("reset_method");
+        let methods = fs::read_to_string(&reset_method)
+            .with_context(|| format!("read PCI reset methods for {bdf}"))?;
+        let scope = match parse_reset_scope(bdf, &methods)? {
+            ResetScope::Function => BTreeSet::from([bdf.clone()]),
+            ResetScope::ParentBus => discover_parent_bus_reset_scope(sysfs_root, bdf)?,
+        };
+        validate_reset_scope_members(bdf, &scope, &assigned)?;
+    }
+    Ok(())
+}
+
+/// VFIO PCI latches `disable_idle_d3` when a device binds. Requiring it before
+/// binding prevents the idle D3 transition from restoring a stale PCI command
+/// register (including bus mastering) while the device is still in its host
+/// identity domain. `acquire_vfio_lease` still clears and verifies the bit as
+/// defense in depth.
+pub fn validate_vfio_bind_dma_quiescence(sysfs_root: &Path) -> Result<()> {
+    let path = sysfs_root.join("module/vfio_pci/parameters/disable_idle_d3");
+    let value = fs::read_to_string(&path).context("read vfio-pci disable_idle_d3 parameter")?;
+    if value.trim() != "Y" {
+        bail!("vfio-pci disable_idle_d3 must be Y before physical VFIO binding");
+    }
+    Ok(())
+}
+
+fn parse_reset_scope(bdf: &str, methods: &str) -> Result<ResetScope> {
+    let methods = methods.split_ascii_whitespace().collect::<Vec<_>>();
+    if methods.is_empty() {
+        bail!("PCI function {bdf} has no enabled reset method");
+    }
+    let mut scope = ResetScope::Function;
+    for method in methods {
+        match method {
+            "device_specific" | "acpi" | "flr" | "af_flr" | "pm" => {}
+            "bus" | "cxl_bus" => scope = ResetScope::ParentBus,
+            _ => bail!("PCI function {bdf} exposes unknown reset method {method:?}"),
+        }
+    }
+    Ok(scope)
+}
+
+fn discover_parent_bus_reset_scope(sysfs_root: &Path, bdf: &str) -> Result<BTreeSet<String>> {
+    validate_pci_bdf(bdf, "PCI reset-scope query")?;
+    let bus_prefix = &bdf[..8];
+    let devices = sysfs_root.join("bus/pci/devices");
+    let mut scope = BTreeSet::new();
+    for entry in fs::read_dir(&devices)
+        .with_context(|| format!("read PCI devices for reset scope of {bdf}"))?
+    {
+        let entry = entry?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow!("non-UTF-8 PCI device name in reset scope of {bdf}"))?;
+        if name.starts_with(bus_prefix) {
+            validate_pci_bdf(&name, "PCI reset-scope member")?;
+            scope.insert(name);
+        }
+    }
+    if !scope.contains(bdf) {
+        bail!("PCI reset scope for {bdf} does not contain the function itself");
+    }
+    Ok(scope)
+}
+
+fn validate_reset_scope_members(
+    bdf: &str,
+    scope: &BTreeSet<String>,
+    assigned: &BTreeSet<String>,
+) -> Result<()> {
+    let outside = scope.difference(assigned).cloned().collect::<Vec<_>>();
+    if !outside.is_empty() {
+        bail!(
+            "PCI reset scope for {bdf} escapes the admitted lease through {}",
+            outside.join(",")
+        );
+    }
+    Ok(())
+}
+
 /// Bind the physical display release to one exact AMDGPU identity before any
 /// VFIO mutation.  The complete group may contain an AMD audio function, but
 /// a second display function or a network/storage function is out of scope and
@@ -1604,6 +1712,7 @@ impl FileLeaseStore {
 
 pub trait VfioOps {
     fn vfio_driver_present(&self) -> Result<bool>;
+    fn vfio_idle_d3_disabled(&self) -> Result<bool>;
     fn current_driver(&self, bdf: &str) -> Result<Option<String>>;
     /// Returns an empty string when sysfs reports no driver override.
     fn current_driver_override(&self, bdf: &str) -> Result<String>;
@@ -1611,6 +1720,10 @@ pub trait VfioOps {
     fn clear_driver_override(&mut self, bdf: &str) -> Result<()>;
     fn unbind_driver(&mut self, bdf: &str, driver: &str) -> Result<()>;
     fn bind_driver(&mut self, bdf: &str, driver: &str) -> Result<()>;
+    fn reset_methods(&self, bdf: &str) -> Result<String>;
+    fn reset_scope_bdfs(&self, bdf: &str) -> Result<BTreeSet<String>>;
+    fn bus_master_enabled(&self, bdf: &str) -> Result<bool>;
+    fn disable_bus_master(&mut self, bdf: &str) -> Result<()>;
     /// Reset one function after it is VFIO-bound and before assignment, and
     /// again after the guest has stopped but before the original driver is
     /// restored. Absence of the reset attribute is a failed commercial gate.
@@ -1649,11 +1762,39 @@ impl SysfsVfioOps {
         fs::write(self.driver_path(driver).join(attribute), format!("{bdf}\n"))
             .with_context(|| format!("write PCI driver {driver} {attribute} for {bdf}"))
     }
+
+    fn open_pci_config(&self, bdf: &str, write: bool) -> Result<fs::File> {
+        validate_pci_bdf(bdf, "PCI config access")?;
+        fs::OpenOptions::new()
+            .read(true)
+            .write(write)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(self.device_path(bdf).join("config"))
+            .with_context(|| format!("open PCI config for {bdf}"))
+    }
+
+    fn read_pci_command(&self, bdf: &str) -> Result<u16> {
+        let config = self.open_pci_config(bdf, false)?;
+        let mut bytes = [0_u8; 2];
+        config
+            .read_exact_at(&mut bytes, 4)
+            .with_context(|| format!("read PCI command register for {bdf}"))?;
+        Ok(u16::from_le_bytes(bytes))
+    }
 }
 
 impl VfioOps for SysfsVfioOps {
     fn vfio_driver_present(&self) -> Result<bool> {
         Ok(self.driver_path("vfio-pci").is_dir())
+    }
+
+    fn vfio_idle_d3_disabled(&self) -> Result<bool> {
+        let value = fs::read_to_string(
+            self.sysfs_root
+                .join("module/vfio_pci/parameters/disable_idle_d3"),
+        )
+        .context("read vfio-pci disable_idle_d3 parameter")?;
+        Ok(value.trim() == "Y")
     }
 
     fn current_driver(&self, bdf: &str) -> Result<Option<String>> {
@@ -1701,8 +1842,42 @@ impl VfioOps for SysfsVfioOps {
         self.write_driver_attr(driver, "bind", bdf)
     }
 
+    fn reset_methods(&self, bdf: &str) -> Result<String> {
+        validate_pci_bdf(bdf, "VFIO reset-method query")?;
+        fs::read_to_string(self.device_path(bdf).join("reset_method"))
+            .with_context(|| format!("read PCI reset methods for {bdf}"))
+    }
+
+    fn reset_scope_bdfs(&self, bdf: &str) -> Result<BTreeSet<String>> {
+        match parse_reset_scope(bdf, &self.reset_methods(bdf)?)? {
+            ResetScope::Function => Ok(BTreeSet::from([bdf.to_owned()])),
+            ResetScope::ParentBus => discover_parent_bus_reset_scope(&self.sysfs_root, bdf),
+        }
+    }
+
+    fn bus_master_enabled(&self, bdf: &str) -> Result<bool> {
+        Ok(self.read_pci_command(bdf)? & 0x0004 != 0)
+    }
+
+    fn disable_bus_master(&mut self, bdf: &str) -> Result<()> {
+        let config = self.open_pci_config(bdf, true)?;
+        let mut bytes = [0_u8; 2];
+        config
+            .read_exact_at(&mut bytes, 4)
+            .with_context(|| format!("read PCI command register for {bdf}"))?;
+        let command = u16::from_le_bytes(bytes) & !0x0004;
+        config
+            .write_all_at(&command.to_le_bytes(), 4)
+            .with_context(|| format!("clear PCI bus mastering for {bdf}"))?;
+        if self.bus_master_enabled(bdf)? {
+            bail!("PCI bus mastering remained enabled for {bdf}");
+        }
+        Ok(())
+    }
+
     fn reset_device(&mut self, bdf: &str) -> Result<()> {
         validate_pci_bdf(bdf, "VFIO reset")?;
+        parse_reset_scope(bdf, &self.reset_methods(bdf)?)?;
         let reset = self.device_path(bdf).join("reset");
         let metadata = fs::symlink_metadata(&reset)
             .with_context(|| format!("inspect PCI reset attribute for {bdf}"))?;
@@ -1713,19 +1888,50 @@ impl VfioOps for SysfsVfioOps {
     }
 }
 
+fn validate_vfio_reset_scope(
+    bdf: &str,
+    assigned: &BTreeSet<String>,
+    ops: &impl VfioOps,
+) -> Result<()> {
+    let expected = parse_reset_scope(bdf, &ops.reset_methods(bdf)?)?;
+    let scope = ops.reset_scope_bdfs(bdf)?;
+    if !scope.contains(bdf) {
+        bail!("PCI reset scope for {bdf} does not contain the function itself");
+    }
+    if expected == ResetScope::Function && scope != BTreeSet::from([bdf.to_owned()]) {
+        bail!("function-local PCI reset scope for {bdf} contains another function");
+    }
+    validate_reset_scope_members(bdf, &scope, assigned)
+}
+
 /// Reset every function in deterministic order. A partial reset never grants
 /// launch authority: callers must restore the complete durable lease instead.
 pub fn reset_vfio_group(record: &VfioLeaseRecord, ops: &mut impl VfioOps) -> Result<()> {
     if record.state != VfioLeaseState::Active {
         bail!("VFIO group reset requires an active durable lease");
     }
+    let assigned = record
+        .original_drivers
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
     let mut failures = Vec::new();
     for bdf in record.original_drivers.keys() {
         let result = (|| {
             if ops.current_driver(bdf)?.as_deref() != Some("vfio-pci") {
                 bail!("PCI device {bdf} is not VFIO-bound at reset");
             }
-            ops.reset_device(bdf)
+            validate_vfio_reset_scope(bdf, &assigned, ops)?;
+            ops.disable_bus_master(bdf)?;
+            if ops.bus_master_enabled(bdf)? {
+                bail!("PCI bus mastering remained enabled before reset for {bdf}");
+            }
+            ops.reset_device(bdf)?;
+            ops.disable_bus_master(bdf)?;
+            if ops.bus_master_enabled(bdf)? {
+                bail!("PCI bus mastering resumed after reset for {bdf}");
+            }
+            Ok(())
         })();
         if let Err(error) = result {
             failures.push(format!("{bdf}: {error:#}"));
@@ -1760,9 +1966,14 @@ fn inspect_vfio_lease_inner(
     ops: &impl VfioOps,
     release_binding: Option<VfioReleaseBinding>,
 ) -> Result<VfioLeaseRecord> {
+    if !ops.vfio_idle_d3_disabled()? {
+        bail!("vfio-pci disable_idle_d3 must be Y before VFIO lease inspection");
+    }
+    let assigned = lease.pci_bdfs.iter().cloned().collect::<BTreeSet<_>>();
     let mut original_drivers = BTreeMap::new();
     let mut original_driver_overrides = BTreeMap::new();
     for bdf in &lease.pci_bdfs {
+        validate_vfio_reset_scope(bdf, &assigned, ops)?;
         let driver = ops.current_driver(bdf)?;
         if driver.as_deref() == Some("vfio-pci") {
             bail!("refusing to adopt already-VFIO-bound PCI device {bdf} without a durable lease");
@@ -1796,8 +2007,17 @@ pub fn acquire_vfio_lease(
     if !ops.vfio_driver_present()? {
         bail!("vfio-pci is not loaded on L0");
     }
+    if !ops.vfio_idle_d3_disabled()? {
+        bail!("vfio-pci disable_idle_d3 changed before VFIO acquire");
+    }
+    let assigned = record
+        .original_drivers
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
     let mut touched = Vec::new();
     for (bdf, original_driver) in &record.original_drivers {
+        validate_vfio_reset_scope(bdf, &assigned, ops)?;
         let current = ops.current_driver(bdf)?;
         if current.as_deref() != original_driver.as_deref() {
             let rollback = rollback_vfio_lease(record, ops, &touched);
@@ -1817,6 +2037,10 @@ pub fn acquire_vfio_lease(
             ops.bind_driver(bdf, "vfio-pci")?;
             if ops.current_driver(bdf)?.as_deref() != Some("vfio-pci") {
                 bail!("vfio-pci did not bind {bdf}");
+            }
+            ops.disable_bus_master(bdf)?;
+            if ops.bus_master_enabled(bdf)? {
+                bail!("PCI bus mastering remained enabled after VFIO bind for {bdf}");
             }
             Ok(())
         })();
@@ -2072,7 +2296,13 @@ pub struct DvmDisplayEvidence {
     pub connector_id: u32,
     pub mode_width: u32,
     pub mode_height: u32,
-    pub direct_scanout: bool,
+    pub source_path: String,
+    pub zero_copy: bool,
+    pub gpu_composition: bool,
+    pub explicit_fence: bool,
+    pub atomic_kms_scanout: bool,
+    pub scanout_buffers: u32,
+    pub staged_damage_copy: bool,
     pub window_ns: u64,
     pub frame_hz_milli: u64,
     pub pageflip_completions: u64,
@@ -2670,7 +2900,7 @@ impl HostControlListener {
             display_driver_bound: parse_driver_inventory_state(&drivers, "display-driver")?,
             display_relay_ready: parse_ready_inventory_state(&drivers, "display-relay")?,
         };
-        let display = request(connection, 4, "display-evidence-v1")?;
+        let display = request(connection, 4, "display-evidence-v2")?;
         let display_evidence = parse_display_evidence(&display)?;
         Ok(ProbeResult {
             peer_cid: self.expected_dvm_cid,
@@ -2682,7 +2912,7 @@ impl HostControlListener {
 }
 
 fn parse_display_evidence(fields: &BTreeMap<String, String>) -> Result<Option<DvmDisplayEvidence>> {
-    const REQUIRED: [&str; 20] = [
+    const REQUIRED: [&str; 26] = [
         "id",
         "op",
         "status",
@@ -2695,7 +2925,13 @@ fn parse_display_evidence(fields: &BTreeMap<String, String>) -> Result<Option<Dv
         "connector-id",
         "mode-width",
         "mode-height",
-        "direct-scanout",
+        "source-path",
+        "zero-copy",
+        "gpu-composition",
+        "explicit-fence",
+        "atomic-kms-scanout",
+        "scanout-buffers",
+        "staged-damage-copy",
         "window-ns",
         "frame-hz-milli",
         "pageflip-completions",
@@ -2705,7 +2941,7 @@ fn parse_display_evidence(fields: &BTreeMap<String, String>) -> Result<Option<Dv
         "atomic-commit-us-avg",
     ];
     if !has_exact_fields(fields, &REQUIRED)
-        || fields.get("op") != Some(&"display-evidence-v1".to_owned())
+        || fields.get("op") != Some(&"display-evidence-v2".to_owned())
     {
         bail!("invalid Linux DVM display evidence response");
     }
@@ -2717,6 +2953,7 @@ fn parse_display_evidence(fields: &BTreeMap<String, String>) -> Result<Option<Dv
                 "connector-id",
                 "mode-width",
                 "mode-height",
+                "scanout-buffers",
                 "window-ns",
                 "frame-hz-milli",
                 "pageflip-completions",
@@ -2733,7 +2970,12 @@ fn parse_display_evidence(fields: &BTreeMap<String, String>) -> Result<Option<Dv
                 || fields.get("pci-vendor").map(String::as_str) != Some("0000")
                 || fields.get("pci-device").map(String::as_str) != Some("0000")
                 || fields.get("guest-pci-bdf").map(String::as_str) != Some("none")
-                || fields.get("direct-scanout").map(String::as_str) != Some("no")
+                || fields.get("source-path").map(String::as_str) != Some("none")
+                || fields.get("zero-copy").map(String::as_str) != Some("no")
+                || fields.get("gpu-composition").map(String::as_str) != Some("no")
+                || fields.get("explicit-fence").map(String::as_str) != Some("no")
+                || fields.get("atomic-kms-scanout").map(String::as_str) != Some("no")
+                || fields.get("staged-damage-copy").map(String::as_str) != Some("no")
             {
                 bail!("invalid unavailable Linux DVM display evidence sentinel");
             }
@@ -2765,11 +3007,18 @@ fn parse_display_evidence(fields: &BTreeMap<String, String>) -> Result<Option<Dv
                     .context("Linux DVM display width overflow")?,
                 mode_height: u32::try_from(parse_display_u64(fields, "mode-height")?)
                     .context("Linux DVM display height overflow")?,
-                direct_scanout: match fields.get("direct-scanout").map(String::as_str) {
-                    Some("yes") => true,
-                    Some("no") => false,
-                    _ => bail!("invalid Linux DVM direct-scanout evidence"),
-                },
+                source_path: fields
+                    .get("source-path")
+                    .filter(|value| value.as_str() == "dmabuf")
+                    .ok_or_else(|| anyhow!("invalid Linux DVM display source path"))?
+                    .to_owned(),
+                zero_copy: parse_display_bool(fields, "zero-copy")?,
+                gpu_composition: parse_display_bool(fields, "gpu-composition")?,
+                explicit_fence: parse_display_bool(fields, "explicit-fence")?,
+                atomic_kms_scanout: parse_display_bool(fields, "atomic-kms-scanout")?,
+                scanout_buffers: u32::try_from(parse_display_u64(fields, "scanout-buffers")?)
+                    .context("Linux DVM display scanout buffer count overflow")?,
+                staged_damage_copy: parse_display_bool(fields, "staged-damage-copy")?,
                 window_ns: parse_display_u64(fields, "window-ns")?,
                 frame_hz_milli: parse_display_u64(fields, "frame-hz-milli")?,
                 pageflip_completions: parse_display_u64(fields, "pageflip-completions")?,
@@ -2799,6 +3048,14 @@ fn parse_pci_id_field(fields: &BTreeMap<String, String>, key: &str) -> Result<u1
         bail!("invalid Linux DVM display evidence {key}");
     }
     u16::from_str_radix(value, 16).with_context(|| format!("invalid display evidence {key}"))
+}
+
+fn parse_display_bool(fields: &BTreeMap<String, String>, key: &str) -> Result<bool> {
+    match fields.get(key).map(String::as_str) {
+        Some("yes") => Ok(true),
+        Some("no") => Ok(false),
+        _ => bail!("invalid Linux DVM display evidence {key}"),
+    }
 }
 
 fn parse_display_u64(fields: &BTreeMap<String, String>, key: &str) -> Result<u64> {
@@ -3367,7 +3624,7 @@ fn write_message(connection: &mut std::fs::File, message: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::path::{Path, PathBuf};
@@ -3378,16 +3635,17 @@ mod tests {
         CONTROL_PORT_FLOOR, CONTROL_SECRET_BYTES, ControlContract, ControlSecret, DeviceClass,
         DeviceTransport, DriverDomainFleetPolicy, DriverDomainPolicy, FileLeaseStore,
         INPUT_STREAM_REQUEST_ID, InputRelayRate, IommuTopology, LaunchPlan, LinuxEvdevInputEvent,
-        LinuxEvdevKeyEvent, ReleaseAuthorization, RustosInputFrame, ValidatedLease,
+        LinuxEvdevKeyEvent, ReleaseAuthorization, RustosInputFrame, SysfsVfioOps, ValidatedLease,
         VfioLeaseRecord, VfioLeaseState, VfioOps, VfioReleaseBinding, acquire_vfio_lease,
         allocate_input_epoch, control_proof, inspect_vfio_lease, inspect_vfio_lease_preflight,
         parse_display_evidence, parse_linux_evdev_input_event, parse_message, reset_vfio_group,
         restore_vfio_lease, validate_hello, validate_host_display_assignment,
-        validate_physical_display_assignment,
+        validate_physical_display_assignment, validate_reset_scope_assignment,
+        validate_vfio_bind_dma_quiescence,
     };
     use anyhow::Result;
 
-    const VALID: &str = "CONTROL_SCHEMA=1\nCONTROL_PROTOCOL=agent-v1\nCONTROL_STATE=control\nCONTROL_TRANSPORT=kvm-vsock\nCONTROL_AUTHENTICATION=dvm-agent-hmac-sha256-v1\nCONTROL_CAPABILITIES=health,device-inventory,driver-inventory,display-evidence-v1,input-stream\n";
+    const VALID: &str = "CONTROL_SCHEMA=1\nCONTROL_PROTOCOL=agent-v1\nCONTROL_STATE=control\nCONTROL_TRANSPORT=kvm-vsock\nCONTROL_AUTHENTICATION=dvm-agent-hmac-sha256-v1\nCONTROL_CAPABILITIES=health,device-inventory,driver-inventory,display-evidence-v2,input-stream\n";
 
     #[test]
     fn relay_epochs_are_monotonic_and_fail_closed_before_reuse() {
@@ -3408,7 +3666,7 @@ mod tests {
                 "health",
                 "device-inventory",
                 "driver-inventory",
-                "display-evidence-v1",
+                "display-evidence-v2",
                 "input-stream"
             ]
         );
@@ -3427,12 +3685,12 @@ mod tests {
     #[test]
     fn hello_is_bound_to_the_exact_control_contract() {
         let contract = ControlContract::parse(VALID, "test").unwrap();
-        let hello = "HELLO\nrole=linux-driver-domain\nprotocol=agent-v1\nstate=control\ntransport=kvm-vsock\nauthentication=dvm-agent-hmac-sha256-v1\ncapabilities=health,device-inventory,driver-inventory,display-evidence-v1,input-stream";
+        let hello = "HELLO\nrole=linux-driver-domain\nprotocol=agent-v1\nstate=control\ntransport=kvm-vsock\nauthentication=dvm-agent-hmac-sha256-v1\ncapabilities=health,device-inventory,driver-inventory,display-evidence-v2,input-stream";
         assert!(validate_hello(hello, &contract).is_ok());
         assert!(
             validate_hello(
                 &hello.replace(
-                    "health,device-inventory,driver-inventory,display-evidence-v1,input-stream",
+                    "health,device-inventory,driver-inventory,display-evidence-v2,input-stream",
                     "health"
                 ),
                 &contract
@@ -3446,7 +3704,7 @@ mod tests {
     fn control_secret_and_proof_bind_each_session() {
         assert!(ControlSecret::from_bytes([0; CONTROL_SECRET_BYTES]).is_err());
         let secret = ControlSecret::from_bytes([0x5a; CONTROL_SECRET_BYTES]).unwrap();
-        let hello = "HELLO\nrole=linux-driver-domain\nprotocol=agent-v1\nstate=control\ntransport=kvm-vsock\nauthentication=dvm-agent-hmac-sha256-v1\ncapabilities=health,device-inventory,driver-inventory,display-evidence-v1,input-stream";
+        let hello = "HELLO\nrole=linux-driver-domain\nprotocol=agent-v1\nstate=control\ntransport=kvm-vsock\nauthentication=dvm-agent-hmac-sha256-v1\ncapabilities=health,device-inventory,driver-inventory,display-evidence-v2,input-stream";
         let first = control_proof(&secret, &[1; CONTROL_SECRET_BYTES], hello).unwrap();
         assert_eq!(
             first,
@@ -3516,13 +3774,15 @@ mod tests {
         )
         .unwrap();
         let message = parse_message(
-            "RESPONSE\nid=4\nop=display-evidence-v1\nstatus=ok\nsample-sequence=7\nsample-age-ms=20\ndriver=amdgpu\npci-vendor=1002\npci-device=1900\nguest-pci-bdf=0000:01:00.0\nconnector-id=78\nmode-width=1920\nmode-height=1080\ndirect-scanout=yes\nwindow-ns=1000000000\nframe-hz-milli=60000\npageflip-completions=60\ncpu-copy-us-avg=0\npageflip-latency-us-avg=16500\npageflip-latency-us-max=17100\natomic-commit-us-avg=40",
+            "RESPONSE\nid=4\nop=display-evidence-v2\nstatus=ok\nsample-sequence=7\nsample-age-ms=20\ndriver=amdgpu\npci-vendor=1002\npci-device=1900\nguest-pci-bdf=0000:00:08.0\nconnector-id=78\nmode-width=1920\nmode-height=1080\nsource-path=dmabuf\nzero-copy=yes\ngpu-composition=yes\nexplicit-fence=yes\natomic-kms-scanout=yes\nscanout-buffers=3\nstaged-damage-copy=no\nwindow-ns=1000000000\nframe-hz-milli=60000\npageflip-completions=60\ncpu-copy-us-avg=0\npageflip-latency-us-avg=16500\npageflip-latency-us-max=17100\natomic-commit-us-avg=40",
         )
         .unwrap();
         let evidence = parse_display_evidence(&message.fields).unwrap().unwrap();
         assert_eq!(evidence.driver, "amdgpu");
         assert_eq!(evidence.pci_vendor, 0x1002);
-        assert!(evidence.direct_scanout);
+        assert_eq!(evidence.source_path, "dmabuf");
+        assert!(evidence.zero_copy);
+        assert!(evidence.gpu_composition);
         policy
             .physical_display()
             .unwrap()
@@ -3530,7 +3790,7 @@ mod tests {
             .unwrap();
 
         let copied = parse_message(
-            "RESPONSE\nid=4\nop=display-evidence-v1\nstatus=ok\nsample-sequence=7\nsample-age-ms=20\ndriver=amdgpu\npci-vendor=1002\npci-device=1900\nguest-pci-bdf=0000:01:00.0\nconnector-id=78\nmode-width=1920\nmode-height=1080\ndirect-scanout=yes\nwindow-ns=1000000000\nframe-hz-milli=60000\npageflip-completions=60\ncpu-copy-us-avg=1\npageflip-latency-us-avg=16500\npageflip-latency-us-max=17100\natomic-commit-us-avg=40",
+            "RESPONSE\nid=4\nop=display-evidence-v2\nstatus=ok\nsample-sequence=7\nsample-age-ms=20\ndriver=amdgpu\npci-vendor=1002\npci-device=1900\nguest-pci-bdf=0000:00:08.0\nconnector-id=78\nmode-width=1920\nmode-height=1080\nsource-path=dmabuf\nzero-copy=yes\ngpu-composition=yes\nexplicit-fence=yes\natomic-kms-scanout=yes\nscanout-buffers=3\nstaged-damage-copy=no\nwindow-ns=1000000000\nframe-hz-milli=60000\npageflip-completions=60\ncpu-copy-us-avg=1\npageflip-latency-us-avg=16500\npageflip-latency-us-max=17100\natomic-commit-us-avg=40",
         )
         .unwrap();
         let evidence = parse_display_evidence(&copied.fields).unwrap().unwrap();
@@ -3543,7 +3803,7 @@ mod tests {
         );
 
         let inconsistent = parse_message(
-            "RESPONSE\nid=4\nop=display-evidence-v1\nstatus=ok\nsample-sequence=8\nsample-age-ms=20\ndriver=amdgpu\npci-vendor=1002\npci-device=1900\nguest-pci-bdf=0000:01:00.0\nconnector-id=78\nmode-width=1920\nmode-height=1080\ndirect-scanout=yes\nwindow-ns=1000000000\nframe-hz-milli=60000\npageflip-completions=59\ncpu-copy-us-avg=0\npageflip-latency-us-avg=16500\npageflip-latency-us-max=17100\natomic-commit-us-avg=40",
+            "RESPONSE\nid=4\nop=display-evidence-v2\nstatus=ok\nsample-sequence=8\nsample-age-ms=20\ndriver=amdgpu\npci-vendor=1002\npci-device=1900\nguest-pci-bdf=0000:00:08.0\nconnector-id=78\nmode-width=1920\nmode-height=1080\nsource-path=dmabuf\nzero-copy=yes\ngpu-composition=yes\nexplicit-fence=yes\natomic-kms-scanout=yes\nscanout-buffers=3\nstaged-damage-copy=no\nwindow-ns=1000000000\nframe-hz-milli=60000\npageflip-completions=59\ncpu-copy-us-avg=0\npageflip-latency-us-avg=16500\npageflip-latency-us-max=17100\natomic-commit-us-avg=40",
         )
         .unwrap();
         let evidence = parse_display_evidence(&inconsistent.fields)
@@ -3558,7 +3818,7 @@ mod tests {
         );
 
         let unavailable = parse_message(
-            "RESPONSE\nid=4\nop=display-evidence-v1\nstatus=unavailable\nsample-sequence=0\nsample-age-ms=0\ndriver=missing\npci-vendor=0000\npci-device=0000\nguest-pci-bdf=none\nconnector-id=0\nmode-width=0\nmode-height=0\ndirect-scanout=no\nwindow-ns=0\nframe-hz-milli=0\npageflip-completions=0\ncpu-copy-us-avg=0\npageflip-latency-us-avg=0\npageflip-latency-us-max=0\natomic-commit-us-avg=0",
+            "RESPONSE\nid=4\nop=display-evidence-v2\nstatus=unavailable\nsample-sequence=0\nsample-age-ms=0\ndriver=missing\npci-vendor=0000\npci-device=0000\nguest-pci-bdf=none\nconnector-id=0\nmode-width=0\nmode-height=0\nsource-path=none\nzero-copy=no\ngpu-composition=no\nexplicit-fence=no\natomic-kms-scanout=no\nscanout-buffers=0\nstaged-damage-copy=no\nwindow-ns=0\nframe-hz-milli=0\npageflip-completions=0\ncpu-copy-us-avg=0\npageflip-latency-us-avg=0\npageflip-latency-us-max=0\natomic-commit-us-avg=0",
         )
         .unwrap();
         assert!(
@@ -3821,6 +4081,65 @@ mod tests {
     }
 
     #[test]
+    fn vfio_assignment_rejects_reset_scope_outside_the_lease() {
+        let sysfs = TestSysfs::new(&[(18, &["0000:65:00.0"]), (19, &["0000:65:00.1"])]);
+        let lease = ValidatedLease {
+            domain_id: "linux-dvm-gpu0".to_owned(),
+            dvm_guest_cid: 4,
+            iommu_group: 18,
+            pci_bdfs: vec!["0000:65:00.0".to_owned()],
+        };
+
+        sysfs.write_pci_attr("0000:65:00.0", "reset_method", "flr pm\n");
+        validate_reset_scope_assignment(&lease, sysfs.path()).unwrap();
+
+        sysfs.write_pci_attr("0000:65:00.0", "reset_method", "flr bus\n");
+        assert!(validate_reset_scope_assignment(&lease, sysfs.path()).is_err());
+
+        let complete_bus_lease = ValidatedLease {
+            pci_bdfs: vec!["0000:65:00.0".to_owned(), "0000:65:00.1".to_owned()],
+            ..lease.clone()
+        };
+        sysfs.write_pci_attr("0000:65:00.1", "reset_method", "pm\n");
+        validate_reset_scope_assignment(&complete_bus_lease, sysfs.path()).unwrap();
+
+        sysfs.write_pci_attr("0000:65:00.0", "reset_method", "\n");
+        assert!(validate_reset_scope_assignment(&lease, sysfs.path()).is_err());
+    }
+
+    #[test]
+    fn vfio_binding_requires_idle_d3_disabled_before_probe() {
+        let sysfs = TestSysfs::new(&[]);
+        let parameter = sysfs
+            .path()
+            .join("module/vfio_pci/parameters/disable_idle_d3");
+        fs::create_dir_all(parameter.parent().unwrap()).unwrap();
+        fs::write(&parameter, "N\n").unwrap();
+        assert!(validate_vfio_bind_dma_quiescence(sysfs.path()).is_err());
+        fs::write(&parameter, "Y\n").unwrap();
+        validate_vfio_bind_dma_quiescence(sysfs.path()).unwrap();
+    }
+
+    #[test]
+    fn sysfs_vfio_bus_master_clear_preserves_other_command_bits() {
+        let sysfs = TestSysfs::new(&[(18, &["0000:65:00.0"])]);
+        let config = sysfs.path().join("bus/pci/devices/0000:65:00.0/config");
+        let mut bytes = vec![0_u8; 256];
+        bytes[4..6].copy_from_slice(&0x0407_u16.to_le_bytes());
+        bytes[32] = 0xa5;
+        fs::write(&config, &bytes).unwrap();
+
+        let mut ops = SysfsVfioOps::new(sysfs.path());
+        assert!(ops.bus_master_enabled("0000:65:00.0").unwrap());
+        ops.disable_bus_master("0000:65:00.0").unwrap();
+        assert!(!ops.bus_master_enabled("0000:65:00.0").unwrap());
+
+        let updated = fs::read(&config).unwrap();
+        assert_eq!(u16::from_le_bytes([updated[4], updated[5]]), 0x0403);
+        assert_eq!(updated[32], 0xa5);
+    }
+
+    #[test]
     fn physical_display_assignment_is_bound_to_exact_amdgpu_identity() {
         let sysfs = TestSysfs::new(&[(18, &["0000:65:00.0", "0000:65:00.1"])]);
         let lease = ValidatedLease {
@@ -3865,9 +4184,13 @@ mod tests {
             .insert("0000:02:00.0".to_owned(), "other-driver".to_owned());
         let mut record = inspect_vfio_lease(&lease, &ops, release_binding()).unwrap();
         acquire_vfio_lease(&record, &mut ops, 150).unwrap();
+        assert!(!ops.bus_master_enabled("0000:02:00.0").unwrap());
+        assert!(!ops.bus_master_enabled("0000:02:00.1").unwrap());
         reset_vfio_group(&record, &mut ops).unwrap_err();
         record.state = VfioLeaseState::Active;
         reset_vfio_group(&record, &mut ops).unwrap();
+        assert!(!ops.bus_master_enabled("0000:02:00.0").unwrap());
+        assert!(!ops.bus_master_enabled("0000:02:00.1").unwrap());
         assert_eq!(ops.reset_bdfs, ["0000:02:00.0", "0000:02:00.1"]);
         assert_eq!(
             ops.current_driver("0000:02:00.0").unwrap().as_deref(),
@@ -3891,6 +4214,59 @@ mod tests {
             "other-driver"
         );
         assert_eq!(ops.current_driver_override("0000:02:00.1").unwrap(), "");
+    }
+
+    #[test]
+    fn vfio_reset_method_changes_fail_closed_before_bind_and_reset() {
+        let lease = validated_lease(&["0000:02:00.0"]);
+        let mut unsafe_before_bind =
+            FakeVfioOps::with_drivers(&[("0000:02:00.0", Some("first-driver"))]);
+        let record = inspect_vfio_lease(&lease, &unsafe_before_bind, release_binding()).unwrap();
+        unsafe_before_bind
+            .reset_methods
+            .insert("0000:02:00.0".to_owned(), "bus\n".to_owned());
+        unsafe_before_bind.reset_scopes.insert(
+            "0000:02:00.0".to_owned(),
+            BTreeSet::from(["0000:02:00.0".to_owned(), "0000:02:00.1".to_owned()]),
+        );
+        assert!(acquire_vfio_lease(&record, &mut unsafe_before_bind, 150).is_err());
+        assert_eq!(
+            unsafe_before_bind
+                .current_driver("0000:02:00.0")
+                .unwrap()
+                .as_deref(),
+            Some("first-driver")
+        );
+
+        let mut unsafe_before_reset =
+            FakeVfioOps::with_drivers(&[("0000:02:00.0", Some("first-driver"))]);
+        let mut record =
+            inspect_vfio_lease(&lease, &unsafe_before_reset, release_binding()).unwrap();
+        acquire_vfio_lease(&record, &mut unsafe_before_reset, 150).unwrap();
+        record.state = VfioLeaseState::Active;
+        unsafe_before_reset
+            .reset_methods
+            .insert("0000:02:00.0".to_owned(), "bus\n".to_owned());
+        unsafe_before_reset.reset_scopes.insert(
+            "0000:02:00.0".to_owned(),
+            BTreeSet::from(["0000:02:00.0".to_owned(), "0000:02:00.1".to_owned()]),
+        );
+        assert!(reset_vfio_group(&record, &mut unsafe_before_reset).is_err());
+        assert!(unsafe_before_reset.reset_bdfs.is_empty());
+    }
+
+    #[test]
+    fn vfio_idle_d3_change_fails_closed_before_bind() {
+        let lease = validated_lease(&["0000:02:00.0"]);
+        let mut ops = FakeVfioOps::with_drivers(&[("0000:02:00.0", Some("first-driver"))]);
+        let record = inspect_vfio_lease(&lease, &ops, release_binding()).unwrap();
+        ops.idle_d3_disabled = false;
+        assert!(acquire_vfio_lease(&record, &mut ops, 150).is_err());
+        assert_eq!(
+            ops.current_driver("0000:02:00.0").unwrap().as_deref(),
+            Some("first-driver")
+        );
+        assert!(ops.bus_master_enabled("0000:02:00.0").unwrap());
     }
 
     #[test]
@@ -4008,17 +4384,22 @@ mod tests {
 
     struct FakeVfioOps {
         vfio_present: bool,
+        idle_d3_disabled: bool,
         drivers: BTreeMap<String, Option<String>>,
         overrides: BTreeMap<String, String>,
         fail_bind: Option<(String, String)>,
         fail_reset: Option<String>,
         reset_bdfs: Vec<String>,
+        reset_methods: BTreeMap<String, String>,
+        reset_scopes: BTreeMap<String, BTreeSet<String>>,
+        bus_master: BTreeMap<String, bool>,
     }
 
     impl FakeVfioOps {
         fn with_drivers(drivers: &[(&str, Option<&str>)]) -> Self {
             Self {
                 vfio_present: true,
+                idle_d3_disabled: true,
                 drivers: drivers
                     .iter()
                     .map(|(bdf, driver)| ((*bdf).to_owned(), driver.map(str::to_owned)))
@@ -4027,6 +4408,18 @@ mod tests {
                 fail_bind: None,
                 fail_reset: None,
                 reset_bdfs: Vec::new(),
+                reset_methods: drivers
+                    .iter()
+                    .map(|(bdf, _)| ((*bdf).to_owned(), "flr\n".to_owned()))
+                    .collect(),
+                reset_scopes: drivers
+                    .iter()
+                    .map(|(bdf, _)| ((*bdf).to_owned(), BTreeSet::from([(*bdf).to_owned()])))
+                    .collect(),
+                bus_master: drivers
+                    .iter()
+                    .map(|(bdf, _)| ((*bdf).to_owned(), true))
+                    .collect(),
             }
         }
     }
@@ -4034,6 +4427,10 @@ mod tests {
     impl VfioOps for FakeVfioOps {
         fn vfio_driver_present(&self) -> Result<bool, anyhow::Error> {
             Ok(self.vfio_present)
+        }
+
+        fn vfio_idle_d3_disabled(&self) -> Result<bool, anyhow::Error> {
+            Ok(self.idle_d3_disabled)
         }
 
         fn current_driver(&self, bdf: &str) -> Result<Option<String>, anyhow::Error> {
@@ -4080,6 +4477,36 @@ mod tests {
                 anyhow::bail!("fake PCI device {bdf} is already bound");
             }
             self.drivers.insert(bdf.to_owned(), Some(driver.to_owned()));
+            Ok(())
+        }
+
+        fn reset_methods(&self, bdf: &str) -> Result<String, anyhow::Error> {
+            self.reset_methods
+                .get(bdf)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("unknown fake PCI device {bdf}"))
+        }
+
+        fn reset_scope_bdfs(&self, bdf: &str) -> Result<BTreeSet<String>, anyhow::Error> {
+            self.reset_scopes
+                .get(bdf)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("unknown fake PCI device {bdf}"))
+        }
+
+        fn bus_master_enabled(&self, bdf: &str) -> Result<bool, anyhow::Error> {
+            self.bus_master
+                .get(bdf)
+                .copied()
+                .ok_or_else(|| anyhow::anyhow!("unknown fake PCI device {bdf}"))
+        }
+
+        fn disable_bus_master(&mut self, bdf: &str) -> Result<(), anyhow::Error> {
+            let enabled = self
+                .bus_master
+                .get_mut(bdf)
+                .ok_or_else(|| anyhow::anyhow!("unknown fake PCI device {bdf}"))?;
+            *enabled = false;
             Ok(())
         }
 

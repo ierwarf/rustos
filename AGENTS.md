@@ -9,6 +9,9 @@ prefix every agent should load. Everything else is opened on demand.
 1. Route the task through `docs/ai/task-router.md` before reading source.
 2. After edits, run `cargo xtask dev-plan` to separate fast checks from the
    one-time stable change-set gates; the plan is routing, not evidence.
+   Before any Linux DVM integration build, also run
+   `make -C driver-domains/linux build-plan`; if a build is interrupted, resume
+   the same target without `clean` or `distclean`.
    For one cached DVM relay source package, its `dev-*` command is only the
    fast compile loop; batch the matching `rebuild-*` image/artifact refresh
    once after the change set is stable. Never clean or rebuild a toolchain for

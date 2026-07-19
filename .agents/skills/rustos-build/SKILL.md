@@ -50,6 +50,27 @@ KVM run. Never run `clean`, `distclean`, or a toolchain rebuild for an ordinary
 relay source edit. This is aligned with Buildroot's package-rebuild and
 development guidance: <https://buildroot.org/downloads/manual/manual.html>.
 
+Before the first integration build of a commercial DVM hardware profile,
+settle its kernel feature envelope in `board/linux.fragment` and its fail-closed
+checks in `scripts/verify-kernel-config.sh`. Batch page-map, DMA-BUF/sync, KMS,
+recovery, and observability requirements into that one structural change. Do
+not pre-enable speculative guest VFIO/IOMMUFD, generic DMA heaps, or debug
+providers merely to avoid a future rebuild. A kernel-envelope change rebuilds
+Linux, both kernel-signed module packages, and the rootfs once; it must not
+discard GCC, binutils, musl, Mesa, or LLVM.
+
+Before invoking an integration build, run
+`make -C driver-domains/linux build-plan`. Treat its output as routing only.
+`mode=full-output` is valid for a changed Buildroot/toolchain identity or an
+unsafe complete `BR2_*` transition. Kernel inputs, local relay inputs, and
+rootfs/post-build inputs must appear as their narrower named lanes. Run
+`make -C driver-domains/linux selftest-config-cache` after changing this policy.
+
+The AMD `1002:1900` profile post-build seals the rootfs to the 12 names in
+`board/amdgpu-firmware-1002-1900.txt`. Changing only that list or post-build
+policy invalidates the rootfs image, not the host toolchain. Verification must
+reject both missing and extra AMD firmware.
+
 Release rootfs generation keeps the `.cpio.xz` ABI but uses the wrapper's
 fixed-block parallel XZ contract. Do not invoke Buildroot directly or replace
 it with the upstream reproducible-build default: that silently restores the
@@ -58,6 +79,74 @@ measured compression step is about 14 seconds and 182 MiB, versus about
 79 seconds and 144 MiB for the old default. The fixed block size, pinned host
 XZ, normalized input timestamps, and manifest hash retain deterministic
 release evidence; `verify-dvm` remains mandatory after integration.
+
+The wrapper also preserves the host toolchain for a semantically verified
+additive defconfig change only when every changed `BR2_*` value transitions
+from disabled to `y` and appears in
+`scripts/additive-package-cache-v1.txt`. That policy contains audited
+target-only leaf packages that cannot alter already-built package features or
+linkage. It then builds only the selected target package and rootfs. Any
+unlisted addition, removal, or value change stays on the conservative
+clean-output path. Linux source/Kconfig and host kernel-build headers have a
+kernel-plus-signed-modules lane; AMD firmware and post-build policy have a
+rootfs-only lane. Never widen these exceptions by path name alone.
+
+The profile enables Buildroot ccache with relative output paths. Use the
+wrapper's `ccache-stats` target to measure hits. A reusable external Buildroot
+SDK is the next cold-build optimization, but adopting one requires a pinned
+SDK hash, relocation check, toolchain ABI/config equivalence, and provenance;
+do not switch the defconfig to an unverified host or distribution toolchain.
+
+## DVM Integration Decision
+
+Before a DVM integration build:
+
+1. Run `make -C driver-domains/linux selftest-config-cache` after any cache
+   policy edit.
+2. Run `make -C driver-domains/linux build-plan` and report its exact mode and
+   lanes. A plan is not build or release evidence.
+3. Reject an unexplained `full-output` result. Full output is justified only by
+   the Buildroot/toolchain identity or an unsafe complete `BR2_*` transition.
+4. For an interrupted or failed build, rerun the same target. Never use
+   `clean`/`distclean` as recovery unless the classified inputs truly require a
+   fresh tree or the cached tree is proven corrupt.
+
+Linux source/config, the prepared kernel tree, and every enabled out-of-tree
+module form one compatibility unit. Linux kbuild requires external modules to
+use the matching kernel configuration and symbol data; module signatures cover
+the final module bytes and must not be stripped afterward. Therefore a kernel
+lane rebuilds and re-verifies all enabled signed modules even when their source
+did not change.
+
+Configuration stamps may be written after Kconfig reconciliation to support
+resume. Mutable kernel/package/rootfs stamps are release-current only after the
+wrapper completes config checks, module-signature verification, manifest
+generation, and artifact verification.
+
+## Cold Build Handoff
+
+When the user schedules a cold build for a later session, stop before invoking
+it and leave this exact handoff sequence:
+
+```text
+make -C driver-domains/linux selftest-config-cache
+make -C driver-domains/linux build-plan
+cargo xtask build-dvm
+make -C driver-domains/linux ccache-stats
+make -C driver-domains/linux profile-build
+cargo xtask verify-dvm
+```
+
+Run `build-dvm` only once; rerunning after interruption resumes the same output.
+`profile-build` is post-build attribution and may require matplotlib/numpy.
+Do not install optional host packages without user authority. Keep KVM and
+physical VFIO tests out of this handoff until the artifact gate succeeds.
+
+Primary references: the
+[Buildroot rebuild rules](https://buildroot.org/downloads/manual/manual.html#_understanding_when_a_full_rebuild_is_necessary),
+[Buildroot ccache contract](https://buildroot.org/downloads/manual/manual.html#ccache),
+[Linux external-module contract](https://docs.kernel.org/kbuild/modules.html),
+and [Linux module-signing contract](https://docs.kernel.org/admin-guide/module-signing.html).
 
 All commands are expected to be quiet on success. On failure, use the
 command output as primary context — do **not** scan `logs/` for build

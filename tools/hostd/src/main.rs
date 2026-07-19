@@ -11,13 +11,15 @@ use rustos_driver_domain_host::{
     LaunchPlan, ReleaseAuthorization, SysfsVfioOps, ValidatedLease, VfioOps, VfioReleaseBinding,
     acquire_vfio_lease, inspect_vfio_lease, inspect_vfio_lease_preflight, restore_vfio_lease,
     validate_host_display_assignment, validate_physical_display_assignment,
+    validate_reset_scope_assignment, validate_vfio_bind_dma_quiescence,
 };
 
 mod runtime;
 
 use runtime::{
-    RuntimeStore, SuperviseConfig, preflight_physical_runtime_inputs, recover_domain,
-    supervise_domain, verify_artifacts,
+    RuntimeStore, SuperviseConfig, export_amdgpu_guest_vfct, export_amdgpu_vbios,
+    preflight_physical_runtime_inputs, probe_iommufd, recover_domain, supervise_domain,
+    verify_artifacts,
 };
 use runtime::{sha256_file, trusted_canonical_regular_file};
 
@@ -58,6 +60,30 @@ enum Command {
         #[arg(long)]
         device_policy: PathBuf,
     },
+    /// Extract one exact AMD APU VBIOS from a read-only ACPI VFCT snapshot.
+    ExtractAmdVbios {
+        #[arg(long)]
+        vfct: PathBuf,
+        #[arg(long, default_value = "/sys")]
+        sysfs_root: PathBuf,
+        #[arg(long)]
+        bdf: String,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Validate host VFCT identity, relocate it to the fixed AMD guest BDF, and snapshot it.
+    PrepareAmdVfct {
+        #[arg(long)]
+        vfct: PathBuf,
+        #[arg(long, default_value = "/sys")]
+        sysfs_root: PathBuf,
+        #[arg(long)]
+        bdf: String,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Allocate and destroy one empty IOMMUFD IO address space without opening a VFIO device.
+    ProbeIommufd,
     /// Preflight the lease, then accept one bounded host-to-DVM control probe.
     Probe {
         #[arg(long)]
@@ -228,12 +254,46 @@ fn main() -> Result<()> {
                 &device_policy,
             )?;
             println!(
-                "rustos-hostd: physical runtime preflight passed domain={} cid={} iommu_group={} pci_bdfs={} iommufd=ready",
+                "rustos-hostd: physical runtime preflight passed domain={} cid={} iommu_group={} pci_bdfs={} iommufd=ready memlock=ready",
                 lease.domain_id,
                 lease.dvm_guest_cid,
                 lease.iommu_group,
                 lease.pci_bdfs.join(","),
             );
+        }
+        Command::ExtractAmdVbios {
+            vfct,
+            sysfs_root,
+            bdf,
+            output,
+        } => {
+            let artifact = export_amdgpu_vbios(&vfct, &sysfs_root, &bdf, &output)?;
+            println!(
+                "rustos-hostd: AMD VBIOS extracted bdf={} size={} sha256={} output={}",
+                bdf,
+                artifact.size,
+                artifact.sha256,
+                artifact.path.display(),
+            );
+        }
+        Command::PrepareAmdVfct {
+            vfct,
+            sysfs_root,
+            bdf,
+            output,
+        } => {
+            let artifact = export_amdgpu_guest_vfct(&vfct, &sysfs_root, &bdf, &output)?;
+            println!(
+                "rustos-hostd: AMD VFCT prepared host_bdf={} guest_bdf=0000:00:08.0 size={} sha256={} output={}",
+                bdf,
+                artifact.size,
+                artifact.sha256,
+                artifact.path.display(),
+            );
+        }
+        Command::ProbeIommufd => {
+            probe_iommufd()?;
+            println!("rustos-hostd: empty IOMMUFD IOAS allocate/destroy probe passed");
         }
         Command::Probe {
             plan,
@@ -261,7 +321,7 @@ fn main() -> Result<()> {
             );
             match result.display_evidence.as_ref() {
                 Some(evidence) => println!(
-                    "rustos-hostd: physical display evidence sequence={} age_ms={} identity={}:{:04x}:{:04x} guest_bdf={} mode={}x{} connector={} direct_scanout={} frame_hz_milli={} pageflips={} pageflip_latency_us_avg={} pageflip_latency_us_max={} atomic_commit_us_avg={} cpu_copy_us_avg={}",
+                    "rustos-hostd: physical display evidence sequence={} age_ms={} identity={}:{:04x}:{:04x} guest_bdf={} mode={}x{} connector={} source_path={} zero_copy={} gpu_composition={} explicit_fence={} atomic_kms_scanout={} scanout_buffers={} staged_damage_copy={} frame_hz_milli={} pageflips={} pageflip_latency_us_avg={} pageflip_latency_us_max={} atomic_commit_us_avg={} cpu_copy_us_avg={}",
                     evidence.sample_sequence,
                     evidence.sample_age_ms,
                     evidence.driver,
@@ -271,7 +331,13 @@ fn main() -> Result<()> {
                     evidence.mode_width,
                     evidence.mode_height,
                     evidence.connector_id,
-                    evidence.direct_scanout,
+                    evidence.source_path,
+                    evidence.zero_copy,
+                    evidence.gpu_composition,
+                    evidence.explicit_fence,
+                    evidence.atomic_kms_scanout,
+                    evidence.scanout_buffers,
+                    evidence.staged_damage_copy,
                     evidence.frame_hz_milli,
                     evidence.pageflip_completions,
                     evidence.pageflip_latency_us_avg,
@@ -407,6 +473,8 @@ fn main() -> Result<()> {
             store.create_prepared(&record, current_unix_time()?)?;
             let final_assignment_check = (|| {
                 validate_host_display_assignment(&lease, &sysfs_root)?;
+                validate_reset_scope_assignment(&lease, &sysfs_root)?;
+                validate_vfio_bind_dma_quiescence(&sysfs_root)?;
                 let policy = activation_policy
                     .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("missing activation device policy"))?;

@@ -7,6 +7,8 @@ target_dir=${1:?usage: verify-module-signatures.sh TARGET_DIR KERNEL_BUILD_DIR C
 kernel_build_dir=${2:?usage: verify-module-signatures.sh TARGET_DIR KERNEL_BUILD_DIR CERT SOURCES_LOCK}
 certificate=${3:?usage: verify-module-signatures.sh TARGET_DIR KERNEL_BUILD_DIR CERT SOURCES_LOCK}
 sources_lock=${4:?usage: verify-module-signatures.sh TARGET_DIR KERNEL_BUILD_DIR CERT SOURCES_LOCK}
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+amdgpu_profile="$script_dir/../board/amdgpu-firmware-1002-1900.txt"
 extract="$kernel_build_dir/scripts/extract-module-sig.pl"
 modules="$target_dir/lib/modules"
 private_key="$kernel_build_dir/certs/signing_key.pem"
@@ -17,7 +19,7 @@ for tool in openssl perl; do
         exit 1
     }
 done
-for path in "$extract" "$certificate" "$private_key" "$modules" "$sources_lock"; do
+for path in "$extract" "$certificate" "$private_key" "$modules" "$sources_lock" "$amdgpu_profile"; do
     test -e "$path" || {
         echo "rustos-linux-dvm: module-signature input missing: $path" >&2
         exit 1
@@ -72,6 +74,28 @@ for required in nvidia nvidia-modeset nvidia-drm rustos_dvm_ivshmem_uio i915 xe 
         exit 1
     }
 done
+
+# A supervised physical DVM must consume QEMU's ACPI power-button request and
+# reach an ordinary guest poweroff before hostd falls back to TERM/KILL. Check
+# the installed target, not only the Buildroot package selection.
+for required in \
+    usr/sbin/acpid \
+    etc/init.d/S02acpid \
+    etc/acpi/events/powerbtn; do
+    path="$target_dir/$required"
+    if test -L "$path" || ! test -f "$path"; then
+        echo "rustos-linux-dvm: required ACPI shutdown component missing: $required" >&2
+        exit 1
+    fi
+done
+grep -Fqx 'event=button[ /]power' "$target_dir/etc/acpi/events/powerbtn" || {
+    echo "rustos-linux-dvm: ACPI power-button event contract is missing" >&2
+    exit 1
+}
+grep -Fqx 'action=/sbin/poweroff' "$target_dir/etc/acpi/events/powerbtn" || {
+    echo "rustos-linux-dvm: ACPI power-button action must be /sbin/poweroff" >&2
+    exit 1
+}
 if find "$modules" -type f -name 'nvidia-uvm.ko*' -print -quit | grep -q .; then
     echo "rustos-linux-dvm: forbidden NVIDIA UVM/compute module installed" >&2
     exit 1
@@ -82,6 +106,15 @@ fi
 # selection is not supply evidence: fail the image build if any exact firmware
 # consumed by this target is absent from the sealed rootfs.
 amdgpu_firmware="$target_dir/lib/firmware/amdgpu"
+expected_firmware="$tmp/amdgpu-firmware.expected"
+actual_firmware="$tmp/amdgpu-firmware.actual"
+LC_ALL=C sort -u "$amdgpu_profile" >"$expected_firmware"
+find "$amdgpu_firmware" -mindepth 1 -maxdepth 1 -printf '%f\n' |
+    LC_ALL=C sort >"$actual_firmware"
+if ! cmp -s "$expected_firmware" "$actual_firmware"; then
+    echo "rustos-linux-dvm: AMDGPU firmware set differs from sealed 1002:1900 profile" >&2
+    exit 1
+fi
 amdgpu_required=(
     "gc_11_0_1_imu.bin:$AMDGPU_GC_11_0_1_IMU_SHA256"
     "gc_11_0_1_me.bin:$AMDGPU_GC_11_0_1_ME_SHA256"

@@ -9,6 +9,7 @@ anyhow = "1"
 clap = { version = "4.6", features = ["derive"] }
 fatfs = { git = "https://github.com/rafalh/rust-fatfs", default-features = false, features = ["std", "lfn"] }
 fs-err = "3"
+libc = "0.2"
 rustos-fault-injection = { path = "../../libs/rustos-fault-injection" }
 rustos-driver-domain-host = { path = "../../libs/driver-domain-host" }
 rustos-image-admission = { path = "../../libs/rustos-image-admission" }

@@ -9,6 +9,7 @@ export TZ=UTC
 
 readonly ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 readonly LOCK_FILE="$ROOT/sources.lock"
+readonly ADDITIVE_PACKAGE_CACHE_POLICY="$ROOT/scripts/additive-package-cache-v1.txt"
 readonly COMMAND="${1:-build}"
 readonly OUT_DIR="${OUT:-$ROOT/out}"
 readonly JOBS="${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)}"
@@ -146,20 +147,181 @@ prepare_sources() {
 config_input_hash() {
     (
         cd "$ROOT"
-        # These inputs can change the generated Buildroot configuration or
-        # target-toolchain ABI. A change here deliberately starts from a clean
-        # output tree because Buildroot cannot, in general, reconcile it with
-        # already-built packages.
+        # These inputs only describe the generated Buildroot configuration.
+        # The complete BR2_* map is compared below before cache admission.
         find configs -type f -print0 | sort -z | xargs -0 sha256sum
         find package -name Config.in -type f -print0 | sort -z | xargs -0 sha256sum
+        sha256sum external.desc external.mk Config.in
+    ) | sha256sum | awk '{print $1}'
+}
+
+structural_config_input_hash() {
+    (
+        cd "$ROOT"
+        # Only source/toolchain identities that cannot be reconciled from the
+        # generated BR2_* map belong here.  Linux and AMD firmware are handled
+        # by narrower lanes; the unchanged NVIDIA policy remains conservative.
         find package/rustos-dvm-nvidia-open -type f -print0 | sort -z | xargs -0 sha256sum
-        sha256sum board/linux.fragment
-        sha256sum sources.lock external.desc external.mk Config.in
+        printf '%s\n' \
+            "$BUILDROOT_VERSION" "$BUILDROOT_SHA256" \
+            "$NVIDIA_OPEN_VERSION" "$NVIDIA_OPEN_SHA256"
+    ) | sha256sum | awk '{print $1}'
+}
+
+kernel_config_input_hash() {
+    local fragment=${1:-$ROOT/board/linux.fragment}
+
+    (
+        cd "$ROOT"
+        # Keep the kernel configuration and the host headers used by the
+        # kernel build together.  This identity deliberately excludes the
+        # target toolchain and userspace packages.
+        sha256sum "$fragment" | awk '{print $1}'
+        printf '%s\n' "$LINUX_VERSION" "$LINUX_SHA256"
         sha256sum "$LIBELF_INCLUDE_DIR/libelf.h" "$LIBELF_INCLUDE_DIR/gelf.h"
         if test -n "$LIBELF_LIBRARY_DIR"; then
             sha256sum "$LIBELF_LIBRARY_DIR/libelf.so"
         fi
     ) | sha256sum | awk '{print $1}'
+}
+
+render_desired_config() {
+    local output=$1
+    local probe
+    local result
+
+    probe="$(mktemp -d "$OUT_DIR/config-probe.XXXXXX")"
+    result=0
+    make -C "$BUILDROOT_DIR" O="$probe" \
+        BR2_EXTERNAL="$ROOT" BR2_DL_DIR="$DL_DIR" \
+        rustos_linux_dvm_x86_64_defconfig >/dev/null || result=$?
+    if test "$result" -eq 0; then
+        make -C "$BUILDROOT_DIR" O="$probe" \
+            BR2_EXTERNAL="$ROOT" BR2_DL_DIR="$DL_DIR" \
+            olddefconfig >/dev/null || result=$?
+    fi
+    if test "$result" -eq 0; then
+        cp -- "$probe/.config" "$output" || result=$?
+    fi
+    rm -rf -- "$probe"
+    return "$result"
+}
+
+config_change_preserves_host_toolchain() {
+    local previous=$1
+    local desired=$2
+
+    awk '
+        function record(line, side, key, value) {
+            if (line ~ /^# BR2_[A-Z0-9_]+ is not set$/) {
+                key = line
+                sub(/^# /, "", key)
+                sub(/ is not set$/, "", key)
+                value = "n"
+            } else if (line ~ /^BR2_[A-Z0-9_]+=/) {
+                key = line
+                sub(/=.*/, "", key)
+                value = substr(line, length(key) + 2)
+            } else {
+                return
+            }
+            if (side == 0) {
+                before[key] = value
+            } else {
+                after[key] = value
+            }
+        }
+        FILENAME == ARGV[1] {
+            if ($0 == "" || $0 ~ /^#/) next
+            if ($0 !~ /^BR2_PACKAGE_[A-Z0-9_]+$/ || admitted[$0]) exit 2
+            admitted[$0] = 1
+            next
+        }
+        FILENAME == ARGV[2] { record($0, 0); next }
+        FILENAME == ARGV[3] { record($0, 1); next }
+        END {
+            changes = 0
+            for (key in before) {
+                if (!(key in after)) exit 1
+                if (before[key] != after[key]) {
+                    changes++
+                    if (key == "BR2_ROOTFS_POST_BUILD_SCRIPT") {
+                        continue
+                    }
+                    if (!(key in admitted) || before[key] != "n" || after[key] != "y") {
+                        exit 1
+                    }
+                }
+            }
+            for (key in after) {
+                if (!(key in before)) {
+                    changes++
+                    if (key == "BR2_ROOTFS_POST_BUILD_SCRIPT") continue
+                    if (!(key in admitted) || after[key] != "y") exit 1
+                }
+            }
+            exit(changes > 0 ? 0 : 1)
+        }
+    ' "$ADDITIVE_PACKAGE_CACHE_POLICY" "$previous" "$desired"
+}
+
+selftest_config_cache_policy() {
+    local tmp
+    local previous
+    local desired
+    local kernel_before
+    local kernel_after
+    local structural_before
+    local structural_after
+
+    tmp="$(mktemp -d /tmp/rustos-dvm-config-policy.XXXXXX)"
+    previous="$tmp/previous"
+    desired="$tmp/desired"
+    printf '%s\n' \
+        '# BR2_PACKAGE_ACPID is not set' \
+        'BR2_TOOLCHAIN_BUILDROOT_MUSL=y' >"$previous"
+    printf '%s\n' \
+        'BR2_PACKAGE_ACPID=y' \
+        'BR2_TOOLCHAIN_BUILDROOT_MUSL=y' >"$desired"
+    config_change_preserves_host_toolchain "$previous" "$desired" \
+        || die "additive package selection did not preserve the cache"
+    if config_change_preserves_host_toolchain "$desired" "$previous"; then
+        die "package removal incorrectly preserved the cache"
+    fi
+    printf '%s\n' \
+        '# BR2_PACKAGE_ACPID is not set' \
+        'BR2_TOOLCHAIN_BUILDROOT_MUSL=n' >"$desired"
+    if config_change_preserves_host_toolchain "$previous" "$desired"; then
+        die "toolchain change incorrectly preserved the cache"
+    fi
+    printf '%s\n' \
+        '# BR2_PACKAGE_ACPID is not set' \
+        'BR2_PACKAGE_MESA3D_GALLIUM_DRIVERS="virgl radeonsi"' \
+        'BR2_TOOLCHAIN_BUILDROOT_MUSL=y' >"$desired"
+    if config_change_preserves_host_toolchain "$previous" "$desired"; then
+        die "package value change incorrectly preserved the cache"
+    fi
+    printf '%s\n' \
+        'BR2_ROOTFS_POST_BUILD_SCRIPT=""' \
+        'BR2_TOOLCHAIN_BUILDROOT_MUSL=y' >"$previous"
+    printf '%s\n' \
+        'BR2_ROOTFS_POST_BUILD_SCRIPT="/sealed/post-build.sh"' \
+        'BR2_TOOLCHAIN_BUILDROOT_MUSL=y' >"$desired"
+    config_change_preserves_host_toolchain "$previous" "$desired" \
+        || die "rootfs-only policy change did not preserve the cache"
+
+    cp -- "$ROOT/board/linux.fragment" "$tmp/linux.fragment"
+    kernel_before="$(kernel_config_input_hash "$tmp/linux.fragment")"
+    structural_before="$(structural_config_input_hash)"
+    printf '%s\n' '# cache-routing-selftest' >>"$tmp/linux.fragment"
+    kernel_after="$(kernel_config_input_hash "$tmp/linux.fragment")"
+    structural_after="$(structural_config_input_hash)"
+    test "$kernel_before" != "$kernel_after" \
+        || die "kernel fragment change did not invalidate the kernel lane"
+    test "$structural_before" = "$structural_after" \
+        || die "kernel fragment change invalidated the host toolchain lane"
+    rm -rf -- "$tmp"
+    printf 'rustos-linux-dvm: config cache policy selftest passed\n'
 }
 
 local_service_input_hash() {
@@ -181,6 +343,9 @@ local_service_input_hash() {
 overlay_input_hash() {
     (
         cd "$ROOT"
+        # Post-build policy changes only the finalized rootfs. Keep it on the
+        # image-regeneration lane rather than invalidating the host toolchain.
+        sha256sum board/post-build.sh board/amdgpu-firmware-1002-1900.txt sources.lock
         find board/overlay -type f -print0 | sort -z | xargs -0 sha256sum
     ) | sha256sum | awk '{print $1}'
 }
@@ -277,7 +442,7 @@ make_release_rootfs() {
 }
 
 require_warm_dvm_configuration() {
-    local config_stamp="$BUILD_DIR/.rustos-config-input-v2.sha256"
+    local config_stamp="$BUILD_DIR/.rustos-config-input-v3.sha256"
     local buildroot_marker="$BUILDROOT_DIR/.rustos-buildroot-sha256"
     local current_config
 
@@ -320,21 +485,131 @@ assert_release_output_is_current() {
     fi
 }
 
+print_build_plan() {
+    local config_stamp="$BUILD_DIR/.rustos-config-input-v3.sha256"
+    local structural_stamp="$BUILD_DIR/.rustos-structural-config-input-v2.sha256"
+    local kernel_stamp="$BUILD_DIR/.rustos-kernel-config-input-v1.sha256"
+    local desired
+    local service
+    local service_stamp
+    local config_lane=0
+    local lane_count=0
+
+    require_kernel_build_headers
+    if ! test -d "$BUILDROOT_DIR" \
+        || ! test -f "$BUILDROOT_DIR/.rustos-buildroot-sha256" \
+        || test "$(cat "$BUILDROOT_DIR/.rustos-buildroot-sha256")" != "$BUILDROOT_SHA256" \
+        || ! test -f "$BUILD_DIR/.config"; then
+        printf 'mode=cold-full reason=missing-or-stale-buildroot-configuration\n'
+        return
+    fi
+    if ! test -f "$structural_stamp" \
+        || test "$(cat "$structural_stamp")" != "$(structural_config_input_hash)"; then
+        printf 'mode=full-output reason=buildroot-or-conservative-driver-source-identity\n'
+        return
+    fi
+    if ! test -f "$config_stamp" \
+        || test "$(cat "$config_stamp")" != "$(config_input_hash)"; then
+        desired="$(mktemp "$OUT_DIR/desired-config-plan.XXXXXX")"
+        if ! render_desired_config "$desired"; then
+            rm -f -- "$desired"
+            printf 'mode=full-output reason=unable-to-render-desired-config\n'
+            return
+        fi
+        if cmp -s "$BUILD_DIR/.config" "$desired"; then
+            config_lane=1
+        elif config_change_preserves_host_toolchain "$BUILD_DIR/.config" "$desired"; then
+            config_lane=2
+        else
+            rm -f -- "$desired"
+            printf 'mode=full-output reason=unsafe-buildroot-config-transition\n'
+            return
+        fi
+        rm -f -- "$desired"
+    fi
+
+    printf 'mode=incremental\n'
+    if test "$config_lane" -eq 1; then
+        printf 'lane=config-metadata\n'
+        lane_count=$((lane_count + 1))
+    elif test "$config_lane" -eq 2; then
+        printf 'lane=target-package-or-rootfs-config\n'
+        lane_count=$((lane_count + 1))
+    fi
+    if ! test -f "$kernel_stamp" \
+        || test "$(cat "$kernel_stamp")" != "$(kernel_config_input_hash)"; then
+        printf 'lane=linux+signed-kernel-modules+rootfs\n'
+        lane_count=$((lane_count + 1))
+    fi
+    for service in rustos-dvm-agent rustos-dvm-display rustos-dvm-net; do
+        service_stamp="$BUILD_DIR/.${service}-input-v1.sha256"
+        if ! test -f "$service_stamp" \
+            || test "$(cat "$service_stamp")" != "$(local_service_input_hash "$service")"; then
+            printf 'lane=%s+rootfs\n' "$service"
+            lane_count=$((lane_count + 1))
+        fi
+    done
+    if ! test -f "$BUILD_DIR/.rustos-overlay-input.sha256" \
+        || test "$(cat "$BUILD_DIR/.rustos-overlay-input.sha256")" != "$(overlay_input_hash)"; then
+        printf 'lane=rootfs-overlay-or-policy\n'
+        lane_count=$((lane_count + 1))
+    fi
+    if test "$lane_count" -eq 0; then
+        printf 'lane=none\n'
+    fi
+}
+
 configure() {
-    local stamp="$BUILD_DIR/.rustos-config-input-v2.sha256"
+    local stamp="$BUILD_DIR/.rustos-config-input-v3.sha256"
+    local structural_stamp="$BUILD_DIR/.rustos-structural-config-input-v2.sha256"
     local current
+    local current_structural
+    local desired
 
     require_kernel_build_headers
     current="$(config_input_hash)"
+    current_structural="$(structural_config_input_hash)"
 
     if test -f "$BUILD_DIR/.config" && test -f "$stamp" \
         && test "$(cat "$stamp")" = "$current"; then
+        # One-time migration for output created before structural/package-only
+        # hashes were separated. The combined hash proves this exact config.
+        if ! test -f "$structural_stamp"; then
+            write_stamp "$structural_stamp" "$current_structural"
+        fi
         return
     fi
-    # Buildroot cannot safely reconcile an external configuration or toolchain
-    # input change with already-built packages. Local package sources and the
-    # rootfs overlay are handled below with targeted invalidation; they must
-    # never force a host-toolchain rebuild.
+    if test -f "$BUILD_DIR/.config" \
+        && test -f "$structural_stamp" \
+        && test "$(cat "$structural_stamp")" = "$current_structural"; then
+        desired="$(mktemp "$OUT_DIR/desired-config.XXXXXX")"
+        if render_desired_config "$desired"; then
+            # Cache admission policy controls how configuration transitions are
+            # classified; it is not an artifact or toolchain input.  A policy
+            # update must therefore be able to reconcile an otherwise identical
+            # generated configuration without deleting the output tree.
+            if cmp -s "$BUILD_DIR/.config" "$desired"; then
+                rm -f -- "$desired"
+                write_stamp "$stamp" "$current"
+                write_stamp "$structural_stamp" "$current_structural"
+                printf 'rustos-linux-dvm: reconciled unchanged configuration without cleaning\n'
+                return
+            fi
+            if config_change_preserves_host_toolchain "$BUILD_DIR/.config" "$desired"; then
+                cp -- "$desired" "$BUILD_DIR/.config"
+                rm -f -- "$desired" "$BUILD_DIR/images/rootfs.cpio.xz"
+                make_buildroot olddefconfig >/dev/null
+                write_stamp "$stamp" "$current"
+                write_stamp "$structural_stamp" "$current_structural"
+                printf 'rustos-linux-dvm: preserved host toolchain for target/rootfs-only config\n'
+                return
+            fi
+        fi
+        rm -f -- "$desired"
+    fi
+    # Package removal, changed option values, or any structural/toolchain input
+    # can leave stale target files or an incompatible sysroot. Keep those
+    # changes on Buildroot's conservative clean-output path.
     if test -f "$BUILD_DIR/.config"; then
         make_buildroot distclean
     fi
@@ -342,9 +617,14 @@ configure() {
     make_buildroot rustos_linux_dvm_x86_64_defconfig
     make_buildroot olddefconfig
     write_stamp "$stamp" "$current"
+    write_stamp "$structural_stamp" "$current_structural"
 }
 
 prepare_mutable_inputs() {
+    local kernel_stamp="$BUILD_DIR/.rustos-kernel-config-input-v1.sha256"
+    local kernel_current
+    local kernel_build="$BUILD_DIR/build/linux-${LINUX_VERSION}"
+    local target_modules="$BUILD_DIR/target/lib/modules/${LINUX_VERSION}"
     local overlay_stamp="$BUILD_DIR/.rustos-overlay-input.sha256"
     local overlay_files_stamp="$BUILD_DIR/.rustos-overlay-files-v1"
     local overlay_current
@@ -352,7 +632,24 @@ prepare_mutable_inputs() {
     local service_stamp
     local service_current
 
+    kernel_current="$(kernel_config_input_hash)"
     overlay_current="$(overlay_input_hash)"
+
+    # Linux Kconfig changes invalidate only Linux and the two packages that
+    # produce modules signed by that kernel build.  Removing the old module
+    # directory prevents a stale signed object from surviving target-finalize.
+    # The NVIDIA package is rebuilt unchanged solely because its module must be
+    # signed against the new kernel; no NVIDIA source or device state is edited.
+    if ! test -f "$kernel_stamp" \
+        || test "$(cat "$kernel_stamp")" != "$kernel_current"; then
+        if test -d "$kernel_build" || test -d "$target_modules"; then
+            make_buildroot linux-dirclean
+            make_buildroot rustos-dvm-display-dirclean
+            make_buildroot rustos-dvm-nvidia-open-dirclean
+            rm -rf -- "$target_modules"
+        fi
+        rm -f -- "$BUILD_DIR/images/rootfs.cpio.xz"
+    fi
 
     # SITE_METHOD=local is intentionally explicit: Buildroot does not watch
     # the external source tree after its first rsync. Remove only the local
@@ -384,6 +681,7 @@ commit_mutable_input_stamps() {
         write_stamp "$BUILD_DIR/.${service}-input-v1.sha256" "$(local_service_input_hash "$service")"
     done
     write_stamp "$BUILD_DIR/.rustos-overlay-input.sha256" "$(overlay_input_hash)"
+    write_stamp "$BUILD_DIR/.rustos-kernel-config-input-v1.sha256" "$(kernel_config_input_hash)"
     write_overlay_file_manifest "$BUILD_DIR/.rustos-overlay-files-v1"
 }
 
@@ -558,6 +856,21 @@ main() {
             ;;
         print-artifacts)
             print_artifacts
+            ;;
+        selftest-config-cache)
+            require_kernel_build_headers
+            selftest_config_cache_policy
+            ;;
+        build-plan)
+            print_build_plan
+            ;;
+        ccache-stats)
+            require_tool make
+            make_buildroot ccache-stats
+            ;;
+        profile-build)
+            require_tool make
+            make_buildroot graph-build
             ;;
         clean)
             require_tool make

@@ -39,9 +39,32 @@ repeats the live check after durable prepare and immediately before unbind.
 `rustos-hostd preflight-physical` additionally verifies the exact production
 QEMU, display-only policy, schema-8 bundle, writable `/dev/iommu`, and a
 successful empty-IOAS allocate/destroy ioctl probe without changing a binding.
+It also requires a 4 GiB soft `RLIMIT_MEMLOCK` budget before any VFIO mutation,
+covering the fixed 2 GiB guest RAM, display backing, and bounded pinning
+headroom. Supervision repeats the limit check before reset and launch.
+For an `amdgpu` display it also parses the bounded host ACPI VFCT table before
+binding, requires its ACPI checksum and one exact bus/device/function/vendor/
+device image, accepts only either an exact populated subsystem pair or the
+firmware-defined all-zero absent pair, and validates the image's 0x55aa and
+ATOM headers.
+It also derives the maximum impact scope of the enabled reset ordering.
+`bus`/`cxl_bus` is accepted only when every function on the affected bus is in
+the same admitted lease; missing, unknown, or escaping reset scope fails closed
+because IOMMU-group isolation alone does not prove reset-domain isolation.
+Before binding, hostd also requires the vfio-pci `disable_idle_d3` parameter to
+be latched on new devices. It clears and verifies PCI bus-master immediately
+after bind and around each reset, so an idle power-state restore cannot leave
+DMA enabled before the non-identity IOMMUFD mapping exists.
 `acquire --activate` repeats that complete reversible gate
 after signed-release admission and before it writes prepared state or detaches
 the group from its host drivers.
+Supervision repeats the VFCT parse before reset, rewrites only the validated
+image's BDF to the fixed guest slot `0000:00:08.0`, recomputes the ACPI
+checksum, verifies that the VBIOS payload is byte-identical, and fsyncs the
+complete relocated table into the owner-private per-launch directory. QEMU
+receives only that immutable table through `-acpitable`; the VFIO function is
+pinned at the same guest slot. This is required for APUs whose VBIOS is part
+of system firmware rather than a readable PCI ROM BAR.
 
 `rustos-hostd relay-input` accepts the strict schema-2 input-only policy. The
 physical-device supervisor requires `driver-domain-policy-v3`: its domain ID
@@ -57,16 +80,25 @@ lease, snapshots every original driver/override, binds the complete group to
 `vfio-pci`, and atomically marks it active. Unsigned binding is unavailable.
 
 `rustos-hostd supervise` then resets the complete group, requires `/dev/iommu`,
-launches the signed QEMU with one IOMMUFD and every group function attached to
-it, and authenticates the DVM control channel within 30 seconds. Readiness then
-requires five fresh relay-owned `display-evidence-v1` samples proving direct
-DMA-BUF scanout, zero CPU copy, the exact AMD identity, and the signed
-throughput/page-flip/commit latency bounds. A pre-exec
+launches the signed QEMU with 2 GiB guest RAM, one IOMMUFD, and every group
+function attached to it, and authenticates the DVM control channel within 30
+seconds. The 2 GiB fixed profile leaves bounded unpacking headroom for the
+approximately 453 MiB release initramfs; the retired 1 GiB profile failed
+part-way through unpacking on the physical GPU run. Readiness then
+requires five fresh relay-owned `display-evidence-v2` samples proving a
+read-only DMA-BUF source import, GPU composition into a separate three-buffer
+GBM scanout pool, explicit fence completion, atomic KMS page flips, zero relay
+CPU copy, the exact AMD identity, and the signed throughput/page-flip/commit
+latency bounds. A pre-exec
 gate keeps QEMU from opening VFIO until the exact PID/start-time and all bound
 digests are fsync'd in the private runtime record. The launcher accepts only
 canonical trusted-owner launch files under non-mutable directory chains and
-computes their SHA-256 internally. Stop is bounded TERM/KILL; crash recovery
-rechecks the start token after `pidfd_open` and signals only through that pidfd;
+    computes their SHA-256 internally. The release image includes `acpid` with
+    an exact power-button to `/sbin/poweroff` action. Hostd uses a private QMP
+    socket to negotiate capabilities, request `system_powerdown`, and wait ten
+    seconds for actual QEMU exit; command acceptance alone is not evidence.
+    TERM/KILL are bounded fallback only. Crash recovery rechecks the start token
+    after `pidfd_open`, tries the same QMP/ACPI path, and signals only through that pidfd;
 original drivers return only after child reap and a second group reset. Reset
 failure retains `vfio-pci` plus the durable quarantine evidence. `recover`
 signals only an exact PID/start-time match and follows the same order.
@@ -164,9 +196,11 @@ than an implied `width * bpp` value. Atlas allocation/mapping runs in a bounded
 worker; the existing CPU-presented surface remains live until the current-epoch
 prime, retained scene, and first GPU+KMS completion atomically promote the path.
 The prime is workload-representative rather than a clear-only readiness token:
-before advertising the epoch, the DVM performs one full provider-stride atlas
-upload, the fixed textured-quad GLES path, an EGL native completion fence, and
-the initial atomic KMS present under one 500 ms setup deadline. Steady frames
+before advertising the epoch, the DVM performs one full provider-stride upload
+from a private zero-filled texture, the fixed textured-quad GLES path, an EGL
+native completion fence, and the initial atomic KMS present under one 500 ms
+setup deadline. The physical prime deliberately does not sample a RustOS
+DMA-BUF before the first validated producer release. Steady frames
 remain independently limited to 16.667 ms. Thus shader or full-upload first-use
 cost cannot destroy an epoch after it was reported ready.
 Initialization or first-frame timeout is terminal, and malformed layers never
@@ -174,11 +208,21 @@ hide behind the transient retained-scene wait.
 In QEMU, changed atlas rectangles take one explicit staged upload into the
 virtio-GPU texture and evidence is labelled `source-path=staged-copy
 zero-copy=0`. On physical AMD, the same logical source is a read-only DMA-BUF
-import labelled `source-path=dmabuf zero-copy=1` only after the currently
-failed physical implementation and hardware-evidence gates are closed; the
-present source does not claim that path. The first path can prove real GPU
-composition but never physical zero copy. Atlas reuse follows the GPU
-completion fence; old output reuse follows the later KMS page-flip fence.
+import. The kernel validates the exact live source generation and acquire value,
+materializes the completed CPU release as a non-replayable `sync_file`, and EGL
+server-waits it before GLES sampling. The display adapter owns the complete
+fixed pixel aperture as one `MEMORY_DEVICE_GENERIC` `dev_pagemap`; every export
+holds that owner live and rejects an out-of-range PFN. Plain guest-physical
+`memremap()` visibility is never treated as DMA-BUF backing. Because the producer is outside the DVM,
+the exporter admits only a DMA-coherent attachment before using its persistent
+read-only mapping; a non-coherent future topology fails closed. Source and model checks can establish this
+implementation, but `source-path=dmabuf zero-copy=1` is commercial evidence only
+after physical import, page-flip, and sustained-rate capture pass. The QEMU path
+can prove real GPU composition but never physical zero copy. Atlas reuse follows
+the GPU completion fence; old output reuse follows the later KMS page-flip fence.
+The relay sends the possibly-unsignalled render fence directly as KMS
+`IN_FENCE_FD` and observes render, page-flip, and out-fence completion together;
+it does not CPU-wait before commit and thereby miss the next vblank.
 Ring0 validates fixed records and slot epochs only; scene policy, packing, and
 fallback rejection remain in `uiserver`, while GLES/KMS execution remains in
 the DVM.
@@ -213,11 +257,11 @@ References: [Linux DMA-BUF buffer exchange](https://docs.kernel.org/userspace-ap
 [Khronos EGL native-fence contract](https://registry.khronos.org/EGL/extensions/ANDROID/EGL_ANDROID_native_fence_sync.txt),
 and [Android SurfaceFlinger/HWC ownership](https://source.android.com/docs/core/graphics/surfaceflinger-windowmanager).
 
-Linux 6.12 virtio-gpu rejects the foreign SG-table DMA-BUF needed by direct
-scanout, and current QEMU vmware-svga cannot bind vmwgfx because pitchlock is
-absent. Therefore virtual KVM cannot close the direct-scanout gate; the required
-runtime capture uses a physically assigned i915, xe, amdgpu, or pinned
-NVIDIA-open `nvidia-drm` device and no CPU-copy fallback. The current Blackwell
+Linux 6.12 virtio-gpu rejects the foreign SG-table DMA-BUF needed by the
+zero-copy source path, and current QEMU vmware-svga cannot bind vmwgfx because
+pitchlock is absent. Therefore virtual KVM cannot close the physical source
+import/atomic-scanout gate; the enabled AMD profile requires the physically
+assigned amdgpu device and permits no CPU-copy fallback. The current Blackwell
 target is packaged from the SHA-256-pinned 580.173.02 official release: only
 the open `nvidia`, `nvidia-modeset`, and `nvidia-drm` modules plus matching
 `gsp_ga10x.bin`/`gsp_tu10x.bin` are installed. UVM, CUDA, the proprietary
@@ -242,6 +286,13 @@ The build and `make verify` run Linux's signature extractor over every
 installed `.ko`, then ask OpenSSL CMS to verify the detached module payload
 against the bound X.509 certificate. A trailer-shaped but invalid or
 foreign-signed module therefore cannot pass the artifact gate.
+The AMD `1002:1900` image additionally prunes the broad upstream AMDGPU firmware
+package to the 12 regular files named by the sealed board profile. Verification
+requires that exact filename set and the per-file SHA-256 values in
+`sources.lock`; an extra firmware blob is a supply-contract failure, not benign
+payload. The kernel feature envelope requires ZONE_DEVICE page ownership,
+DMA-BUF/sync, and AMD DC while forbidding guest VFIO/IOMMUFD, generic DMA heaps,
+userptr, and diagnostic DRM providers.
 The per-image signing private key never enters the artifact directory. Build
 and verification require it to remain a non-symlinked, build-user-owned 0600
 regular file at the kernel's pinned `certs/signing_key.pem` path; the outer
@@ -266,3 +317,16 @@ set in addition to binding the complete source lock and the certificate for
 the kernel-enforced signed-module policy. Release images must pin the kernel,
 module set, firmware bundle, signed module admission policy, and source/SBOM
 manifest for each supported hardware profile.
+
+The build wrapper treats cache ownership as part of that profile contract.
+Buildroot/toolchain identity is the only ordinary full-output lane; Linux
+source/config changes rebuild Linux and every kernel-signed module, local relay
+source changes rebuild that package, and overlay/firmware post-build policy
+regenerates only the rootfs. `build-plan` exposes the decision before mutation,
+and configuration stamps support safe resume after Kconfig reconciliation.
+Kernel/package/rootfs currency stamps are committed only after config,
+signature, manifest, and artifact verification succeeds. A compiler-cache hit
+or incremental compile is build evidence only, never runtime or hardware
+evidence. Independent signed builds need not be byte-identical because the
+module-signing identity is per image; the certificate-bound verification and
+locked-input manifest are the release proof.

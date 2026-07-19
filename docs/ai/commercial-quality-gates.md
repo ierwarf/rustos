@@ -73,10 +73,10 @@ network saturation/cancellation/backpressure plus physical-NIC captures, and
 multicore CPU-time measurements remain failed release gates until their
 evidence artifacts pass. The composite 30-second KVM GUI/input/netprobe gate is
 currently failed: the standard Linux 6.12 virtio-gpu cannot import the foreign
-SG-table DMA-BUF used by direct scanout, while QEMU's legacy VMware SVGA device
-cannot bind current vmwgfx. Only a physical i915/xe/amdgpu or pinned
-NVIDIA-open `nvidia-drm` assignment can close that runtime gate; a CPU-copy
-validation fallback is forbidden. The current Blackwell target uses the exact
+SG-table DMA-BUF used by the physical zero-copy source path, while QEMU's
+legacy VMware SVGA device cannot bind current vmwgfx. The enabled AMD profile
+can close that runtime gate only with the physical amdgpu assignment; a
+CPU-copy validation fallback is forbidden. The current Blackwell target uses the exact
 580.173.02 open-module/GSP pair and requires kernel-enforced signatures bound
 with their certificate and enforcement configuration to artifact-manifest
 schema 8. The manifest and seven named payload files must be admitted as one
@@ -98,9 +98,11 @@ physical AMD capture gates.
 
 For the enabled AMD `1002:1900` slice, source admission now additionally
 requires the signed schema-3 `amdgpu` identity and five authenticated fresh
-relay samples proving direct DMA-BUF scanout, zero relay CPU copy, at least the
-59,000 mHz measurement floor around a nominal 60 Hz mode, at most 25 ms
-commit-to-page-flip latency, and at most 2 ms nonblocking atomic-commit time.
+evidence-v2 samples proving read-only DMA-BUF source import, GPU composition,
+explicit fence, a separate three-buffer atomic-KMS output pool, zero relay CPU
+copy, no staged damage upload, at least the 59,000 mHz measurement floor around
+a nominal 60 Hz mode, at most 25 ms commit-to-page-flip latency, and at most 2
+ms nonblocking atomic-commit time.
 This instrumentation and its finite model do not close the physical gate while
 the only available AMD function remains the active L0 boot display.
 

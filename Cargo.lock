@@ -1055,6 +1055,7 @@ dependencies = [
  "clap",
  "libc",
  "rustos-driver-domain-host",
+ "serde_json",
  "sha2",
 ]
 
@@ -1792,6 +1793,7 @@ dependencies = [
  "driver-domain-protocol",
  "fatfs",
  "fs-err",
+ "libc",
  "rustos-driver-domain-host",
  "rustos-fault-injection",
  "rustos-image-admission",
