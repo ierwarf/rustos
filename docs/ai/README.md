@@ -12,6 +12,7 @@ Optimized for AI agents, not human onboarding. English-only, dense, contract-sha
 | `commands.md` | Quiet build/check/debug commands and their failure meanings. |
 | `contracts-infra.md` | Manifest/stage/build/logging/fault contracts. |
 | `contracts-abi.md` | IPC service IDs, broker syscalls, service routing contracts. |
+| `physical-gpu-status.md` | Current physical GPU evidence boundary, open userspace wait-set ABI, and continuation rules. |
 | `performance-hardening.md` | Boot/runtime bottleneck triage, provider policy, cleanup rules. |
 | `kernel-api-map.md` | Cross-crate kernel API surfaces (`kernel_*::api`) and boot order. |
 | `workflows.md` | Step recipes: add service/app/driver, modify kernel API, debug KVM lifecycle. |

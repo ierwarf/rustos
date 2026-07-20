@@ -88,6 +88,9 @@ pub const DVM_GPU_RENDER_COMPLETION_MAGIC: [u8; 8] = *b"RSGPUD01";
 pub const DVM_GPU_PRIME_COMPLETION_MAGIC: [u8; 8] = *b"RSGPUP01";
 pub const DVM_GPU_PRESENT_COMPLETION_MAGIC: [u8; 8] = *b"RSGPUF01";
 pub const DVM_GPU_RENDER_VERSION: u32 = 1;
+/// Prime v2 authenticates the selected staged-copy or direct-DMA-BUF source
+/// mode in bytes 28..32 before the host admits the first submission.
+pub const DVM_GPU_PRIME_COMPLETION_VERSION: u32 = 2;
 pub const DVM_GPU_RENDER_HEADER_BYTES: usize = 64;
 pub const DVM_GPU_RENDER_SOURCE_BYTES: usize = 64;
 pub const DVM_GPU_RENDER_COMMAND_BYTES: usize = 64;
@@ -1022,6 +1025,9 @@ pub struct DvmGpuPrimeCompletion {
     pub context_id: u32,
     pub context_epoch: u32,
     pub status: DvmGpuPrimeCompletionStatus,
+    /// Exact source transport selected by the DVM for this context. A ready
+    /// context must commit to one mode before the host can publish frames.
+    pub submit_flags: u32,
     pub fence_value: u64,
     pub duration_ns: u64,
 }
@@ -1030,11 +1036,12 @@ impl DvmGpuPrimeCompletion {
     pub fn encode(self) -> [u8; DVM_GPU_PRIME_COMPLETION_BYTES] {
         let mut bytes = [0_u8; DVM_GPU_PRIME_COMPLETION_BYTES];
         bytes[0..8].copy_from_slice(&DVM_GPU_PRIME_COMPLETION_MAGIC);
-        bytes[8..12].copy_from_slice(&DVM_GPU_RENDER_VERSION.to_le_bytes());
+        bytes[8..12].copy_from_slice(&DVM_GPU_PRIME_COMPLETION_VERSION.to_le_bytes());
         bytes[12..16].copy_from_slice(&(DVM_GPU_PRIME_COMPLETION_BYTES as u32).to_le_bytes());
         bytes[16..20].copy_from_slice(&self.context_id.to_le_bytes());
         bytes[20..24].copy_from_slice(&self.context_epoch.to_le_bytes());
         bytes[24..28].copy_from_slice(&self.status.wire().to_le_bytes());
+        bytes[28..32].copy_from_slice(&self.submit_flags.to_le_bytes());
         bytes[32..40].copy_from_slice(&self.fence_value.to_le_bytes());
         bytes[40..48].copy_from_slice(&self.duration_ns.to_le_bytes());
         bytes
@@ -1042,9 +1049,8 @@ impl DvmGpuPrimeCompletion {
 
     pub fn decode(bytes: &[u8; DVM_GPU_PRIME_COMPLETION_BYTES]) -> Option<Self> {
         if bytes[0..8] != DVM_GPU_PRIME_COMPLETION_MAGIC
-            || read_gpu_u32(bytes, 8)? != DVM_GPU_RENDER_VERSION
+            || read_gpu_u32(bytes, 8)? != DVM_GPU_PRIME_COMPLETION_VERSION
             || read_gpu_u32(bytes, 12)? != DVM_GPU_PRIME_COMPLETION_BYTES as u32
-            || bytes[28..32].iter().any(|byte| *byte != 0)
             || bytes[48..64].iter().any(|byte| *byte != 0)
         {
             return None;
@@ -1053,6 +1059,7 @@ impl DvmGpuPrimeCompletion {
             context_id: read_gpu_u32(bytes, 16)?,
             context_epoch: read_gpu_u32(bytes, 20)?,
             status: DvmGpuPrimeCompletionStatus::decode(read_gpu_u32(bytes, 24)?)?,
+            submit_flags: read_gpu_u32(bytes, 28)?,
             fence_value: read_gpu_u64(bytes, 32)?,
             duration_ns: read_gpu_u64(bytes, 40)?,
         };
@@ -1067,8 +1074,13 @@ impl DvmGpuPrimeCompletion {
                 DvmGpuPrimeCompletionStatus::Ready => {
                     self.duration_ns != 0
                         && self.duration_ns <= u64::from(DVM_GPU_PIPELINE_PRIME_MAX_US) * 1_000
+                        && matches!(
+                            self.submit_flags,
+                            DVM_GPU_ATLAS_SUBMIT_FLAG_STAGED_COPY
+                                | DVM_GPU_ATLAS_SUBMIT_FLAG_DIRECT_DMABUF
+                        )
                 }
-                _ => self.duration_ns == 0,
+                _ => self.duration_ns == 0 && self.submit_flags == 0,
             }
     }
 }
@@ -2835,6 +2847,7 @@ mod tests {
             context_id: 7,
             context_epoch: epoch,
             status: DvmGpuPrimeCompletionStatus::Ready,
+            submit_flags: super::DVM_GPU_ATLAS_SUBMIT_FLAG_STAGED_COPY,
             fence_value: 9,
             duration_ns: 400_000,
         };
@@ -2842,6 +2855,22 @@ mod tests {
             DvmGpuPrimeCompletion::decode(&completion.encode()),
             Some(completion)
         );
+        let direct = DvmGpuPrimeCompletion {
+            submit_flags: super::DVM_GPU_ATLAS_SUBMIT_FLAG_DIRECT_DMABUF,
+            ..completion
+        };
+        assert_eq!(
+            DvmGpuPrimeCompletion::decode(&direct.encode()),
+            Some(direct)
+        );
+        let ambiguous = DvmGpuPrimeCompletion {
+            submit_flags: super::DVM_GPU_ATLAS_SUBMIT_KNOWN_FLAGS,
+            ..completion
+        };
+        assert!(!ambiguous.is_valid());
+        let mut legacy = completion.encode();
+        legacy[8..12].copy_from_slice(&super::DVM_GPU_RENDER_VERSION.to_le_bytes());
+        assert_eq!(DvmGpuPrimeCompletion::decode(&legacy), None);
         timeline.complete_prime(completion).unwrap();
         timeline.signal_acquire(1).unwrap();
     }
@@ -3221,6 +3250,7 @@ mod tests {
             context_id: 7,
             context_epoch: 11,
             status: DvmGpuPrimeCompletionStatus::Ready,
+            submit_flags: super::DVM_GPU_ATLAS_SUBMIT_FLAG_STAGED_COPY,
             fence_value: 4,
             duration_ns: u64::from(super::DVM_GPU_PIPELINE_PRIME_MAX_US) * 1_000 + 1,
         };

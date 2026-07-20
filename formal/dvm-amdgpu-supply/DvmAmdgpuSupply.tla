@@ -27,6 +27,7 @@ never a reason to start a degraded relay.
 ***************************************************************************)
 
 RequiredFirmware == {
+    "dcn_3_1_4_dmcub.bin",
     "gc_11_0_1_imu.bin",
     "gc_11_0_1_me.bin",
     "gc_11_0_1_mec.bin",

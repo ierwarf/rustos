@@ -33,6 +33,7 @@
 #include <xf86drmMode.h>
 
 #include "rustos-dvm-gpu-runtime.h"
+#include "rustos-dvm-gpu-backends.h"
 
 #define IVSHMEM_VENDOR_ID "0x1af4"
 #define IVSHMEM_DEVICE_ID "0x1110"
@@ -81,10 +82,23 @@
 #define GPU_PIPELINE_PRIME_MAX_NS \
     ((uint64_t)RUSTOS_GPU_PIPELINE_PRIME_BUDGET_US * 1000ULL)
 #define GPU_RENDER_VERSION 1U
+#define GPU_PRIME_COMPLETION_VERSION 2U
+#define GPU_ATLAS_SUBMIT_FLAG_STAGED_COPY 1U
+#define GPU_ATLAS_SUBMIT_FLAG_DIRECT_DMABUF 2U
 #define SCANOUT_BUFFER_COUNT 3U
 #define NO_SCANOUT_BUFFER UINT32_MAX
 #define RUSTOS_DVM_DMABUF_DEVICE "/dev/rustos-dvm-display-dmabuf"
 #define RUSTOS_DVM_DMABUF_EXPORT_ATLAS 1U
+
+enum gpu_source_mode {
+    GPU_SOURCE_STAGED_COPY = RUSTOS_GPU_SOURCE_STAGED_COPY,
+    GPU_SOURCE_DIRECT_DMABUF = RUSTOS_GPU_SOURCE_DIRECT_DMABUF,
+};
+
+_Static_assert(GPU_ATLAS_SUBMIT_FLAG_STAGED_COPY == RUSTOS_GPU_SOURCE_STAGED_COPY,
+               "staged-copy source mode contract drift");
+_Static_assert(GPU_ATLAS_SUBMIT_FLAG_DIRECT_DMABUF == RUSTOS_GPU_SOURCE_DIRECT_DMABUF,
+               "direct-DMA-BUF source mode contract drift");
 
 struct rustos_dvm_dmabuf_request {
     uint32_t slot;
@@ -1643,6 +1657,7 @@ static int open_gpu_kms_display(const struct shared_display *shared,
     int source_fds[GPU_ATLAS_SLOT_COUNT] = {-1, -1, -1};
     uint64_t prime_started_ns;
     uint64_t prime_completed_ns;
+    const struct rustos_gpu_backend_policy *backend;
     int saved;
     if (runtime_out == NULL || prime_duration_ns == NULL || prime_present_fence == NULL) {
         errno = EINVAL;
@@ -1678,7 +1693,12 @@ static int open_gpu_kms_display(const struct shared_display *shared,
                                 shared->atlas.atlas_height,
                                 shared->atlas.atlas_stride_bytes, runtime_out) != 0)
         goto fail;
-    if (strcmp(rustos_gpu_runtime_driver(*runtime_out), "amdgpu") == 0) {
+    backend = rustos_gpu_backend_policy(rustos_gpu_runtime_driver(*runtime_out));
+    if (backend == NULL) {
+        errno = EOPNOTSUPP;
+        goto fail_runtime;
+    }
+    if (backend->source_mode == GPU_SOURCE_DIRECT_DMABUF) {
         struct stat state;
         size_t slot;
         int exporter;
@@ -1855,7 +1875,8 @@ static const uint8_t *gpu_pixel_pointer(const struct shared_display *shared,
 }
 
 static int select_gpu_submission(const struct shared_display *shared,
-                                 struct gpu_submission *submission) {
+                                 struct gpu_submission *submission,
+                                 int dmabuf_sources) {
     uint64_t selected_sequence = UINT64_MAX;
     uint32_t selected_slot = UINT32_MAX;
     uint32_t slot;
@@ -1892,7 +1913,10 @@ static int select_gpu_submission(const struct shared_display *shared,
         read_le32(record + 20U) > GPU_ATLAS_COMMAND_SLOT_BYTES - GPU_ATLAS_SUBMIT_BYTES ||
         read_le64(record + 24U) == 0U ||
         read_le64(record + 32U) != selected_sequence ||
-        read_le32(record + 40U) == 0U || read_le32(record + 44U) != 1U ||
+        read_le32(record + 40U) == 0U ||
+        read_le32(record + 44U) != (dmabuf_sources
+            ? GPU_ATLAS_SUBMIT_FLAG_DIRECT_DMABUF
+            : GPU_ATLAS_SUBMIT_FLAG_STAGED_COPY) ||
         read_le64(record + 48U) == 0U ||
         read_le32(record + 56U) > GPU_ATLAS_MAX_DAMAGE_RECTS ||
         !bytes_all_zero(record + 60U, 4U)) {
@@ -2030,7 +2054,8 @@ static int publish_gpu_completion(const struct shared_display *shared,
 }
 
 static int publish_gpu_prime(const struct shared_display *shared,
-                             uint64_t prime_duration_ns) {
+                             uint64_t prime_duration_ns,
+                             int dmabuf_sources) {
     char path[PATH_MAX];
     uint8_t completion[GPU_PRIME_COMPLETION_BYTES] = {0};
     uint32_t context_id;
@@ -2053,11 +2078,14 @@ static int publish_gpu_prime(const struct shared_display *shared,
         return -1;
     }
     memcpy(completion, GPU_PRIME_COMPLETION_MAGIC, 8U);
-    write_le32(completion + 8U, GPU_RENDER_VERSION);
+    write_le32(completion + 8U, GPU_PRIME_COMPLETION_VERSION);
     write_le32(completion + 12U, GPU_PRIME_COMPLETION_BYTES);
     write_le32(completion + 16U, context_id);
     write_le32(completion + 20U, context_epoch);
     write_le32(completion + 24U, 1U);
+    write_le32(completion + 28U, dmabuf_sources
+        ? GPU_ATLAS_SUBMIT_FLAG_DIRECT_DMABUF
+        : GPU_ATLAS_SUBMIT_FLAG_STAGED_COPY);
     write_le64(completion + 32U, fence_value);
     write_le64(completion + 40U, prime_duration_ns);
     fd = open(path, O_WRONLY | O_CLOEXEC);
@@ -2074,8 +2102,9 @@ static int publish_gpu_prime(const struct shared_display *shared,
 }
 
 static int acknowledge_gpu_host_invitation(const struct shared_display *shared,
-                                            uint64_t prime_duration_ns) {
-    if (publish_gpu_prime(shared, prime_duration_ns) != 0)
+                                            uint64_t prime_duration_ns,
+                                            int dmabuf_sources) {
+    if (publish_gpu_prime(shared, prime_duration_ns, dmabuf_sources) != 0)
         return -1;
     return acknowledge_host_invitation(shared);
 }
@@ -2131,7 +2160,8 @@ static int serve_gpu_display(struct shared_display *shared) {
             if (host_invitation_pending(shared, &invitation_pending) != 0)
                 break;
             if (invitation_pending) {
-                if (acknowledge_gpu_host_invitation(shared, prime_duration_ns) != 0)
+                if (acknowledge_gpu_host_invitation(shared, prime_duration_ns,
+                                                    dmabuf_sources) != 0)
                     break;
                 peer_ready_sent = 1;
             }
@@ -2142,7 +2172,8 @@ static int serve_gpu_display(struct shared_display *shared) {
         if (read_bytes != (ssize_t)sizeof(event_count) || event_count == 0U)
             break;
         if (!peer_ready_sent) {
-            if (acknowledge_gpu_host_invitation(shared, prime_duration_ns) != 0)
+            if (acknowledge_gpu_host_invitation(shared, prime_duration_ns,
+                                                dmabuf_sources) != 0)
                 break;
             peer_ready_sent = 1;
         }
@@ -2167,12 +2198,13 @@ static int serve_gpu_display(struct shared_display *shared) {
             uint64_t presented_ns;
             uint64_t render_time_ns;
             int acquire_fence_fd = -1;
-            int selected = select_gpu_submission(shared, &submission);
+            int selected = select_gpu_submission(shared, &submission, dmabuf_sources);
             if (selected < 0)
                 goto fail;
             if (selected == 0)
                 break;
             if (dmabuf_sources) {
+                display.setup_stage = "gpu-dmabuf-acquire";
                 acquire_fence_fd = acquire_gpu_source_fence(&display, &submission);
                 if (acquire_fence_fd < 0)
                     goto fail;

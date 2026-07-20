@@ -40,6 +40,10 @@ if ! cargo fmt --all -- --check >/dev/null 2>&1; then
   fail "cargo fmt --check failed. Run 'cargo fmt --all' and retry."
 fi
 
+if ! .codex/hooks/selftest.sh >/dev/null 2>&1; then
+  fail "RustOS agent/hook policy selftest failed. Run '.codex/hooks/selftest.sh' and repair the reported contract drift."
+fi
+
 # clippy is already run by post_edit_rust.sh after every .rs edit;
 # re-running --workspace here adds ~120s per commit for no benefit.
 exit 0

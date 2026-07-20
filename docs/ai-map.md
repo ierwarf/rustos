@@ -26,6 +26,8 @@ output outside the cached unit.
 - `docs/ai/contracts-abi.md` — IPC service IDs, broker syscalls, service routing.
 - `docs/ai/commercial-quality-gates.md` — non-negotiable completion and
   retirement gates for enabled product topologies.
+- `docs/ai/physical-gpu-status.md` — current physical GPU evidence boundary,
+  remaining generic userspace readiness ABI, and safe continuation rules.
 - `docs/ai/performance-hardening.md` — boot/runtime bottleneck and cleanup runbook.
 - Ring0/ring3 ownership decisions come from the exact broker call path,
   owning service contract, and local `RING3-MIGRATION-*` annotation. LOC

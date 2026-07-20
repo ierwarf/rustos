@@ -1,7 +1,7 @@
 name = "log-summarizer"
 description = "Read large RustOS runtime logs (logs/debugcon.log etc.) in isolation and return only a structured summary. Use whenever a log file exceeds a few hundred lines, to protect the main session's context budget."
-model = "gpt-5.5"
-model_reasoning_effort = "low"
+model = "gpt-5.6-terra"
+model_reasoning_effort = "xhigh"
 sandbox_mode = "read-only"
 nickname_candidates = ["logsum"]
 developer_instructions = """

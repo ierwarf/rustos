@@ -35,7 +35,12 @@ fi
 
 tmp=$(mktemp -d)
 cleanup() {
-    rm -f -- "$tmp/module" "$tmp/signature" "$tmp/certificate.pem"
+    rm -f -- \
+        "$tmp/module" \
+        "$tmp/signature" \
+        "$tmp/certificate.pem" \
+        "$tmp/amdgpu-firmware.actual" \
+        "$tmp/amdgpu-firmware.expected"
     rmdir -- "$tmp"
 }
 trap cleanup EXIT
@@ -116,6 +121,7 @@ if ! cmp -s "$expected_firmware" "$actual_firmware"; then
     exit 1
 fi
 amdgpu_required=(
+    "dcn_3_1_4_dmcub.bin:$AMDGPU_DCN_3_1_4_DMCUB_SHA256"
     "gc_11_0_1_imu.bin:$AMDGPU_GC_11_0_1_IMU_SHA256"
     "gc_11_0_1_me.bin:$AMDGPU_GC_11_0_1_ME_SHA256"
     "gc_11_0_1_mec.bin:$AMDGPU_GC_11_0_1_MEC_SHA256"

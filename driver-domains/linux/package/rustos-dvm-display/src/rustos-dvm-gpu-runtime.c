@@ -140,7 +140,7 @@ struct rustos_gpu_runtime {
     uint64_t completed_acquire;
     const char *stage;
     uint64_t last_content_epoch;
-    uint64_t last_generation;
+    uint64_t atlas_generation;
     uint64_t last_sequence;
     uint32_t context_id;
     uint32_t context_epoch;
@@ -683,10 +683,6 @@ int rustos_gpu_runtime_open(int drm_fd, uint32_t output_width, uint32_t output_h
     runtime->driver[version->name_len] = '\0';
     drmFreeVersion(version);
     version = NULL;
-    if (strcmp(runtime->driver, "virtio_gpu") != 0 && strcmp(runtime->driver, "amdgpu") != 0) {
-        errno = EOPNOTSUPP;
-        goto fail;
-    }
     if (drmGetCap(drm_fd, DRM_CAP_ADDFB2_MODIFIERS, &addfb2_modifiers) != 0)
         goto fail;
     runtime->addfb2_modifiers = addfb2_modifiers != 0U;
@@ -802,7 +798,7 @@ int rustos_gpu_runtime_import_dmabuf_sources(struct rustos_gpu_runtime *runtime,
     const char *gl_extensions;
     size_t index;
     if (runtime == NULL || source_fds == NULL || source_count != GPU_OUTPUT_COUNT ||
-        runtime->dmabuf_sources_ready || strcmp(runtime->driver, "amdgpu") != 0) {
+        runtime->dmabuf_sources_ready) {
         errno = EINVAL;
         return -1;
     }
@@ -811,6 +807,7 @@ int rustos_gpu_runtime_import_dmabuf_sources(struct rustos_gpu_runtime *runtime,
     gl_extensions = (const char *)glGetString(GL_EXTENSIONS);
     if (!extension_present(egl_extensions, "EGL_KHR_image_base") ||
         !extension_present(egl_extensions, "EGL_EXT_image_dma_buf_import") ||
+        !extension_present(egl_extensions, "EGL_EXT_image_dma_buf_import_modifiers") ||
         !extension_present(egl_extensions, "EGL_KHR_wait_sync") ||
         !extension_present(gl_extensions, "GL_OES_EGL_image")) {
         errno = EOPNOTSUPP;
@@ -838,6 +835,10 @@ int rustos_gpu_runtime_import_dmabuf_sources(struct rustos_gpu_runtime *runtime,
             EGL_DMA_BUF_PLANE0_FD_EXT, source_fds[index],
             EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
             EGL_DMA_BUF_PLANE0_PITCH_EXT, (EGLint)runtime->atlas_stride_bytes,
+            EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT,
+                (EGLint)(DRM_FORMAT_MOD_LINEAR & 0xffffffffULL),
+            EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT,
+                (EGLint)(DRM_FORMAT_MOD_LINEAR >> 32),
             EGL_NONE,
         };
         if (source_fds[index] < 0) {
@@ -978,10 +979,16 @@ int rustos_gpu_runtime_render_batch(struct rustos_gpu_runtime *runtime,
         (damage_count != 0U && damage == NULL) || damage_count > 64U ||
         batch == NULL || frame == NULL ||
         generation == 0U || sequence == 0U ||
-        atlas_bytes != (size_t)runtime->atlas_stride_bytes * runtime->atlas_height ||
-        parse_batch(runtime, batch, batch_bytes, &header, &source) != 0 ||
-        source.binding_slot != binding_slot || source.generation != generation ||
-        generation <= runtime->last_generation ||
+        atlas_bytes != (size_t)runtime->atlas_stride_bytes * runtime->atlas_height) {
+        return reject_source_acquire_fence(source_acquire_fence_fd, EPROTO);
+    }
+    errno = 0;
+    if (parse_batch(runtime, batch, batch_bytes, &header, &source) != 0) {
+        int saved = errno == 0 ? EPROTO : errno;
+        return reject_source_acquire_fence(source_acquire_fence_fd, saved);
+    }
+    if (source.binding_slot != binding_slot || source.generation != generation ||
+        (runtime->atlas_generation != 0U && generation != runtime->atlas_generation) ||
         sequence <= runtime->last_sequence ||
         header.submit_value != runtime->expected_submit + 1U ||
         header.acquire_value <= runtime->completed_acquire ||
@@ -989,8 +996,7 @@ int rustos_gpu_runtime_render_batch(struct rustos_gpu_runtime *runtime,
         (runtime->expected_submit != 0U &&
          (header.context_id != runtime->context_id ||
           header.context_epoch != runtime->context_epoch))) {
-        return reject_source_acquire_fence(source_acquire_fence_fd,
-                                           errno == 0 ? EPROTO : 0);
+        return reject_source_acquire_fence(source_acquire_fence_fd, EPROTO);
     }
     for (index = 0U; index < damage_count; index++) {
         uint64_t x_end = (uint64_t)damage[index].x + damage[index].width;
@@ -1132,7 +1138,7 @@ int rustos_gpu_runtime_render_batch(struct rustos_gpu_runtime *runtime,
     if (finish_frame(runtime, frame) != 0)
         return -1;
     runtime->expected_submit = header.submit_value;
-    runtime->last_generation = generation;
+    runtime->atlas_generation = generation;
     runtime->last_sequence = sequence;
     return 0;
 }

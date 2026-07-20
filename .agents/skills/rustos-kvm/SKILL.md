@@ -10,6 +10,7 @@ description: Prepare and diagnose RustOS KVM and Linux DVM parallel-boot runs. U
 - KVM parallel-boot runner: `tools/xtask/src/kvm.rs`
 - Linux DVM appliance: `driver-domains/linux/`
 - Generated runtime inputs: `build/kvm/`
+- Physical GPU continuation status: `docs/ai/physical-gpu-status.md`
 
 ## Validation order
 
@@ -51,6 +52,34 @@ QEMU. Its accepted relay marker is explicitly
 DMA-BUF import or direct scanout evidence. Treat a legacy
 `dmabuf-direct-scanout` marker as rejected, and never restore a CPU-frame
 renderer merely to make the virtual gate pass.
+
+For physical GPU work, prefer the vendor-neutral
+`--physical-gpu <BDF> --gpu-firmware <path>` interface. It resolves one sealed
+PCI/DRM/backend profile; unknown devices and ambiguous registered render nodes
+fail closed. The currently certified physical profile is AMD `1002:1900` and
+interprets the firmware input as a relocated VFCT. Do not add a vendor name to
+the common readiness, DMA-BUF, fence, or KMS mechanisms. Add a profile and
+backend-registry entry only with matching firmware, reset/recovery,
+format/modifier, fence, KMS, and physical performance evidence.
+The current non-commercial physical lane disables PCI reset and consequently
+allows one launch attempt per host boot. Its boot-ID claim is failure-sticky;
+after any guest failure, require a cold boot with the target bound to VFIO
+before its native host driver initializes. Repeating QEMU in the same boot is
+dirty-device evidence, not a useful retry.
+
+Classify physical evidence before proposing another launch. A coherent,
+responsive panel proves the visual regression only; it does not prove a frame
+rate, latency distribution, reset, revoke, or recovery. The current AMD run has
+operator-observed stable visual/input behavior after the atlas and bounded
+input-readiness fixes. Further FPS capture is user-deferred, so do not rerun
+hardware or convert that observation into a 60 FPS pass.
+
+Do not misdiagnose the remaining userspace ABI as a GPU compositor failure.
+uiserver's private input reader safely uses bounded `STATS`-then-`READ`, but
+generic indefinite `poll`/`epoll` still lacks a capability-bound cross-service
+wait set with readiness generations, atomic check-arm-recheck, timeout,
+cancellation, fd lifetime, and restart/revoke semantics. Read
+`docs/ai/physical-gpu-status.md` before changing that boundary.
 
 ## Boundaries
 

@@ -17,17 +17,18 @@ use driver_domain_protocol::{
     DVM_GPU_ATLAS_COMMAND_SLOT_BYTES, DVM_GPU_ATLAS_CONTEXT_EPOCH_OFFSET,
     DVM_GPU_ATLAS_CONTEXT_ID_OFFSET, DVM_GPU_ATLAS_DAMAGE_BYTES, DVM_GPU_ATLAS_POOL_HEADER_OFFSET,
     DVM_GPU_ATLAS_PRIME_COMPLETION_OFFSET, DVM_GPU_ATLAS_PRIME_FENCE_OFFSET,
-    DVM_GPU_ATLAS_SUBMIT_BYTES, DVM_GPU_ATLAS_SUBMIT_FLAG_STAGED_COPY,
-    DVM_GPU_PRIME_COMPLETION_BYTES, DVM_GPU_RENDER_HEADER_BYTES, DVM_GPU_RENDER_MAX_BATCH_BYTES,
-    DVM_GPU_RENDER_MAX_IN_FLIGHT, DVM_GPU_RENDER_SOURCE_BYTES,
-    DVM_GUI_SURFACE_POOL_DVM_RECORD_OFFSET, DVM_GUI_SURFACE_POOL_DVM_SEQUENCE_OFFSET,
-    DVM_GUI_SURFACE_POOL_HEADER_BYTES, DVM_GUI_SURFACE_POOL_HOST_ACK_OFFSET,
-    DVM_GUI_SURFACE_POOL_HOST_RECORD_OFFSET, DVM_GUI_SURFACE_POOL_INVITATION_OFFSET,
-    DVM_GUI_SURFACE_POOL_READY_ACK_OFFSET, DVM_GUI_SURFACE_POOL_READY_CONFIRMATION_OFFSET,
-    DVM_GUI_SURFACE_SLOT_COUNT, DvmDisplayDamage, DvmGpuAtlasCompletion, DvmGpuAtlasDamage,
-    DvmGpuAtlasPoolHeader, DvmGpuAtlasSubmit, DvmGpuPrimeCompletion, DvmGpuPrimeCompletionStatus,
-    DvmGpuRenderBatchHeader, DvmGpuRenderSource, DvmGuiSurfaceMessage, DvmGuiSurfaceMessageKind,
-    DvmGuiSurfacePoolHeader, dvm_gpu_atlas_completion_ack_offset, dvm_gpu_atlas_completion_offset,
+    DVM_GPU_ATLAS_SUBMIT_BYTES, DVM_GPU_ATLAS_SUBMIT_FLAG_DIRECT_DMABUF,
+    DVM_GPU_ATLAS_SUBMIT_FLAG_STAGED_COPY, DVM_GPU_PRIME_COMPLETION_BYTES,
+    DVM_GPU_RENDER_HEADER_BYTES, DVM_GPU_RENDER_MAX_BATCH_BYTES, DVM_GPU_RENDER_MAX_IN_FLIGHT,
+    DVM_GPU_RENDER_SOURCE_BYTES, DVM_GUI_SURFACE_POOL_DVM_RECORD_OFFSET,
+    DVM_GUI_SURFACE_POOL_DVM_SEQUENCE_OFFSET, DVM_GUI_SURFACE_POOL_HEADER_BYTES,
+    DVM_GUI_SURFACE_POOL_HOST_ACK_OFFSET, DVM_GUI_SURFACE_POOL_HOST_RECORD_OFFSET,
+    DVM_GUI_SURFACE_POOL_INVITATION_OFFSET, DVM_GUI_SURFACE_POOL_READY_ACK_OFFSET,
+    DVM_GUI_SURFACE_POOL_READY_CONFIRMATION_OFFSET, DVM_GUI_SURFACE_SLOT_COUNT, DvmDisplayDamage,
+    DvmGpuAtlasCompletion, DvmGpuAtlasDamage, DvmGpuAtlasPoolHeader, DvmGpuAtlasSubmit,
+    DvmGpuPrimeCompletion, DvmGpuPrimeCompletionStatus, DvmGpuRenderBatchHeader,
+    DvmGpuRenderSource, DvmGuiSurfaceMessage, DvmGuiSurfaceMessageKind, DvmGuiSurfacePoolHeader,
+    dvm_gpu_atlas_completion_ack_offset, dvm_gpu_atlas_completion_offset,
     dvm_gpu_atlas_completion_sequence_offset, dvm_gpu_atlas_damage_is_valid,
     dvm_gpu_atlas_invitation_offset,
 };
@@ -91,6 +92,7 @@ static GPU_ATLAS_STRIDE_BYTES: AtomicU32 = AtomicU32::new(0);
 static GPU_NEXT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static GPU_CONTEXT_EPOCH: AtomicU32 = AtomicU32::new(GPU_INITIAL_CONTEXT_EPOCH);
 static GPU_PRIME_DURATION_NS: AtomicU64 = AtomicU64::new(0);
+static GPU_SUBMIT_FLAGS: AtomicU32 = AtomicU32::new(0);
 static GPU_SESSION_SUBMISSIONS: AtomicU64 = AtomicU64::new(0);
 static GPU_SUBMIT_LOCK: AtomicBool = AtomicBool::new(false);
 static GPU_SLOT_STATE: [AtomicU8; DVM_GPU_RENDER_MAX_IN_FLIGHT as usize] = [
@@ -155,6 +157,7 @@ pub(crate) struct GpuAtlasInfo {
     pub context_epoch: u32,
     pub prime_fence_value: u64,
     pub prime_duration_ns: u64,
+    pub submit_flags: u32,
 }
 
 /// The display ABI must distinguish a transient saturated pool from a
@@ -283,6 +286,7 @@ fn try_install_serialized() -> bool {
     GPU_NEXT_SEQUENCE.store(0, Ordering::Release);
     GPU_CONTEXT_EPOCH.store(GPU_INITIAL_CONTEXT_EPOCH, Ordering::Release);
     GPU_PRIME_DURATION_NS.store(0, Ordering::Release);
+    GPU_SUBMIT_FLAGS.store(0, Ordering::Release);
     GPU_SESSION_SUBMISSIONS.store(0, Ordering::Release);
     GPU_SUBMIT_LOCK.store(false, Ordering::Release);
     for slot in 0..DVM_GPU_RENDER_MAX_IN_FLIGHT as usize {
@@ -382,6 +386,7 @@ pub(crate) fn gpu_atlas_info() -> Option<GpuAtlasInfo> {
         context_epoch: GPU_CONTEXT_EPOCH.load(Ordering::Acquire),
         prime_fence_value: GPU_PRIME_FENCE_VALUE,
         prime_duration_ns: GPU_PRIME_DURATION_NS.load(Ordering::Acquire),
+        submit_flags: GPU_SUBMIT_FLAGS.load(Ordering::Acquire),
     };
     (info.width != 0
         && info.height != 0
@@ -390,8 +395,12 @@ pub(crate) fn gpu_atlas_info() -> Option<GpuAtlasInfo> {
         && GPU_ATLAS_OFFSET.load(Ordering::Acquire) != 0
         && GPU_ATLAS_SLOT_BYTES.load(Ordering::Acquire) != 0
         && info.context_epoch != 0
-        && info.prime_duration_ns != 0)
-        .then_some(info)
+        && info.prime_duration_ns != 0
+        && matches!(
+            info.submit_flags,
+            DVM_GPU_ATLAS_SUBMIT_FLAG_STAGED_COPY | DVM_GPU_ATLAS_SUBMIT_FLAG_DIRECT_DMABUF
+        ))
+    .then_some(info)
 }
 
 /// Publish one immutable private-compositor atlas snapshot and its bounded
@@ -479,13 +488,21 @@ pub(crate) fn try_submit_gpu_atlas(
         revoke_transport("gpu-session-submit-counter-exhausted", control_sequence);
         return DvmGpuSubmitOutcome::Unavailable;
     };
+    let submit_flags = GPU_SUBMIT_FLAGS.load(Ordering::Acquire);
+    if !matches!(
+        submit_flags,
+        DVM_GPU_ATLAS_SUBMIT_FLAG_STAGED_COPY | DVM_GPU_ATLAS_SUBMIT_FLAG_DIRECT_DMABUF
+    ) {
+        GPU_SLOT_STATE[slot].store(GPU_SLOT_FREE, Ordering::Release);
+        return DvmGpuSubmitOutcome::Unavailable;
+    }
     let submit = DvmGpuAtlasSubmit {
         slot: binding_slot,
         batch_bytes: batch.len() as u32,
         generation: source.generation,
         sequence,
         context_epoch: header.context_epoch,
-        flags: DVM_GPU_ATLAS_SUBMIT_FLAG_STAGED_COPY,
+        flags: submit_flags,
         content_epoch: source.content_epoch,
         damage_count: damage.len() as u32,
     };
@@ -1044,6 +1061,7 @@ fn drain_dvm_control() {
         GUI_DVM_PEER_READY.store(false, Ordering::Release);
         GUI_DVM_EXPECTED_INVITATION.store(0, Ordering::Release);
         GPU_PRIME_DURATION_NS.store(0, Ordering::Release);
+        GPU_SUBMIT_FLAGS.store(0, Ordering::Release);
         GPU_SESSION_SUBMISSIONS.store(0, Ordering::Release);
         reset_gpu_slots();
         // A future relay must not mistake an old confirmation for approval of
@@ -1072,6 +1090,7 @@ fn drain_dvm_control() {
             return;
         };
         GPU_PRIME_DURATION_NS.store(prime.duration_ns, Ordering::Release);
+        GPU_SUBMIT_FLAGS.store(prime.submit_flags, Ordering::Release);
         GUI_DVM_PEER_READY.store(true, Ordering::Release);
         write_u64(DVM_GUI_SURFACE_POOL_READY_CONFIRMATION_OFFSET, expected);
         // The first host present can legitimately precede Linux-DVM boot. In
@@ -1113,6 +1132,7 @@ fn drain_dvm_control() {
 
 fn revoke_transport(reason: &str, sequence: u64) {
     TRANSPORT_REVOKED.store(true, Ordering::Release);
+    GPU_SUBMIT_FLAGS.store(0, Ordering::Release);
     GUI_DVM_PEER_READY.store(false, Ordering::Release);
     GUI_DVM_EXPECTED_INVITATION.store(0, Ordering::Release);
     GUI_DVM_ACKED_CONTROL_SEQUENCE.store(sequence, Ordering::Release);

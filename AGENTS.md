@@ -109,6 +109,8 @@ make an incomplete primary route appear successful.
 
 See `docs/ai-map.md`. Key: `Cargo.toml`, `tools/xtask/src/cli.rs`,
 `kernel/src/main.rs`, `kernel/*/src/api.rs`, `libs/runtime-control/src/lib.rs`.
+For physical GPU continuation, read `docs/ai/physical-gpu-status.md` before
+opening source or re-running hardware.
 
 ## Reporting Discipline
 

@@ -71,6 +71,9 @@ struct GpuAtlasSlot {
     surface: DisplaySurfaceCreate,
     _surface_fd: OwnedFd,
     mapping: SurfaceMapping,
+    /// Last complete atlas snapshot retained by this specific backing slot.
+    /// Zero means the slot has never carried a submitted snapshot.
+    content_epoch: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -289,6 +292,7 @@ impl GpuCompositor {
                 surface,
                 _surface_fd: surface_fd,
                 mapping,
+                content_epoch: 0,
             });
         }
         slots.sort_by_key(|slot| slot.surface.reserved);
@@ -313,6 +317,15 @@ impl GpuCompositor {
                 context_id: info.context_id,
                 context_epoch: info.context_epoch,
                 status: DvmGpuPrimeCompletionStatus::Ready,
+                submit_flags: match info.flags {
+                    rustos_user_abi::device::DISPLAY_GPU_INFO_FLAG_STAGED_COPY => {
+                        driver_domain_protocol::DVM_GPU_ATLAS_SUBMIT_FLAG_STAGED_COPY
+                    }
+                    rustos_user_abi::device::DISPLAY_GPU_INFO_FLAG_DIRECT_DMABUF => {
+                        driver_domain_protocol::DVM_GPU_ATLAS_SUBMIT_FLAG_DIRECT_DMABUF
+                    }
+                    _ => return Err(EINVAL),
+                },
                 fence_value: info.prime_fence_value,
                 duration_ns: info.prime_duration_ns,
             })
@@ -449,19 +462,33 @@ impl GpuCompositor {
             )
             .map_err(gpu_scene_errno)?;
         let encoded = batch.encode().map_err(gpu_scene_errno)?;
+        // Damage is relative to the immediately preceding complete contents of
+        // this backing slot, not merely to the last globally submitted frame.
+        // Triple-buffer rotation normally revisits an older slot; in that case
+        // a partial patch would expose stale or zero pixels and visibly
+        // alternate complete/incomplete frames.  Fail over to a complete
+        // snapshot until the selected slot is the exact predecessor.
+        let submit_damage = snapshot_damage_for_slot(
+            self.slots[slot_index].content_epoch,
+            self.next_content_epoch,
+            damage.as_slice(),
+            self.info.atlas_width,
+            self.info.atlas_height,
+        )?;
         copy_damage_to_slot(
             self.atlas.as_slice(),
             &mut self.slots[slot_index].mapping,
             self.info.atlas_stride_bytes as usize / size_of::<u32>(),
-            damage.as_slice(),
+            submit_damage.as_slice(),
         )?;
         let surface_handle = self.slots[slot_index].surface.handle;
         display_gpu_submit(
             self.display_fd,
             surface_handle,
-            damage.as_slice(),
+            submit_damage.as_slice(),
             encoded.as_slice(),
         )?;
+        self.slots[slot_index].content_epoch = self.next_content_epoch;
         self.pending.push(PendingGpuFrame {
             slot_index,
             surface_handle,
@@ -471,11 +498,18 @@ impl GpuCompositor {
             if !self.retire_oldest(true)? {
                 return Err(EINVAL);
             }
+            let (source_path, zero_copy) = match self.info.flags {
+                rustos_user_abi::device::DISPLAY_GPU_INFO_FLAG_STAGED_COPY => ("staged-copy", 0),
+                rustos_user_abi::device::DISPLAY_GPU_INFO_FLAG_DIRECT_DMABUF => ("dmabuf", 1),
+                _ => return Err(EINVAL),
+            };
             let active_contract = format!(
-                "uiserver: gpu-compositor active contract=3 source-path=staged-copy zero-copy=0 public-abi=0 atlas={}x{} damage-rects={}",
+                "uiserver: gpu-compositor active contract=3 source-path={} zero-copy={} public-abi=0 atlas={}x{} damage-rects={}",
+                source_path,
+                zero_copy,
                 self.info.atlas_width,
                 self.info.atlas_height,
-                damage.len(),
+                submit_damage.len(),
             );
             // This one-shot transition is release evidence. Do not let a full
             // asynchronous observability queue erase it.
@@ -607,6 +641,28 @@ fn damage_from_rect(rect: Rect) -> DvmGpuAtlasDamage {
     }
 }
 
+fn snapshot_damage_for_slot(
+    retained_epoch: u64,
+    current_epoch: u64,
+    requested: &[DvmGpuAtlasDamage],
+    atlas_width: u32,
+    atlas_height: u32,
+) -> Result<Vec<DvmGpuAtlasDamage>, i32> {
+    let predecessor = current_epoch.checked_sub(1).ok_or(EINVAL)?;
+    if retained_epoch != 0 && retained_epoch == predecessor {
+        return Ok(requested.to_vec());
+    }
+    if atlas_width == 0 || atlas_height == 0 {
+        return Err(EINVAL);
+    }
+    Ok(vec![DvmGpuAtlasDamage {
+        x: 0,
+        y: 0,
+        width: atlas_width,
+        height: atlas_height,
+    }])
+}
+
 fn copy_damage_to_slot(
     atlas: &[u32],
     mapping: &mut SurfaceMapping,
@@ -639,8 +695,9 @@ fn gpu_scene_errno(_error: GpuSceneError) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        difference_bounds, gpu_provider_admission, next_frame_deadline, GpuProviderAdmission, Rect,
-        DISPLAY_INFO_FLAG_DVM_SCANOUT, DISPLAY_INFO_FLAG_GPU_COMPOSITOR, GPU_FRAME_INTERVAL,
+        difference_bounds, gpu_provider_admission, next_frame_deadline, snapshot_damage_for_slot,
+        DvmGpuAtlasDamage, GpuProviderAdmission, Rect, DISPLAY_INFO_FLAG_DVM_SCANOUT,
+        DISPLAY_INFO_FLAG_GPU_COMPOSITOR, GPU_FRAME_INTERVAL,
     };
     use crate::sys::DisplayInfo;
     use std::time::{Duration, Instant};
@@ -718,6 +775,44 @@ mod tests {
         assert_eq!(
             next_frame_deadline(origin, origin + Duration::from_millis(49)),
             origin + Duration::from_millis(64)
+        );
+    }
+
+    #[test]
+    fn snapshot_damage_keeps_partial_patch_for_exact_slot_predecessor() {
+        let requested = [DvmGpuAtlasDamage {
+            x: 7,
+            y: 11,
+            width: 13,
+            height: 17,
+        }];
+        assert_eq!(
+            snapshot_damage_for_slot(8, 9, &requested, 1600, 900),
+            Ok(requested.to_vec())
+        );
+    }
+
+    #[test]
+    fn snapshot_damage_forces_full_copy_for_uninitialized_or_stale_slot() {
+        let requested = [DvmGpuAtlasDamage {
+            x: 7,
+            y: 11,
+            width: 13,
+            height: 17,
+        }];
+        let full = vec![DvmGpuAtlasDamage {
+            x: 0,
+            y: 0,
+            width: 1600,
+            height: 900,
+        }];
+        assert_eq!(
+            snapshot_damage_for_slot(0, 1, &requested, 1600, 900),
+            Ok(full.clone())
+        );
+        assert_eq!(
+            snapshot_damage_for_slot(6, 9, &requested, 1600, 900),
+            Ok(full)
         );
     }
 }

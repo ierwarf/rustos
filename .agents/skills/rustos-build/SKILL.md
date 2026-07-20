@@ -66,10 +66,11 @@ unsafe complete `BR2_*` transition. Kernel inputs, local relay inputs, and
 rootfs/post-build inputs must appear as their narrower named lanes. Run
 `make -C driver-domains/linux selftest-config-cache` after changing this policy.
 
-The AMD `1002:1900` profile post-build seals the rootfs to the 12 names in
+The AMD `1002:1900` profile post-build seals the rootfs to the 13 names in
 `board/amdgpu-firmware-1002-1900.txt`. Changing only that list or post-build
-policy invalidates the rootfs image, not the host toolchain. Verification must
-reject both missing and extra AMD firmware.
+policy reinstalls the cached `linux-firmware` package into the already-pruned
+target tree, then invalidates the rootfs image, not the host toolchain.
+Verification must reject both missing and extra AMD firmware.
 
 Release rootfs generation keeps the `.cpio.xz` ABI but uses the wrapper's
 fixed-block parallel XZ contract. Do not invoke Buildroot directly or replace
@@ -96,6 +97,13 @@ wrapper's `ccache-stats` target to measure hits. A reusable external Buildroot
 SDK is the next cold-build optimization, but adopting one requires a pinned
 SDK hash, relocation check, toolchain ABI/config equivalence, and provenance;
 do not switch the defconfig to an unverified host or distribution toolchain.
+
+Keep `BR2_PER_PACKAGE_DIRECTORIES` disabled for this profile. Buildroot then
+uses its own `.NOTPARALLEL` guard for the package graph while `BR2_JLEVEL=0`
+still parallelizes compilation inside each package. Do not enable Buildroot's
+experimental top-level parallel mode merely to shorten a cold build; it changes
+host/target directory semantics used by the wrapper and is documented upstream
+as known to fail in non-unusual cases.
 
 ## DVM Integration Decision
 

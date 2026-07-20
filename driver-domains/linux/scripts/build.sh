@@ -350,6 +350,14 @@ overlay_input_hash() {
     ) | sha256sum | awk '{print $1}'
 }
 
+amdgpu_firmware_input_hash() {
+    (
+        cd "$ROOT"
+        sha256sum board/amdgpu-firmware-1002-1900.txt
+        LC_ALL=C grep '^AMDGPU_.*_SHA256=' sources.lock
+    ) | sha256sum | awk '{print $1}'
+}
+
 overlay_file_manifest() {
     (
         cd "$ROOT/board/overlay"
@@ -489,6 +497,7 @@ print_build_plan() {
     local config_stamp="$BUILD_DIR/.rustos-config-input-v3.sha256"
     local structural_stamp="$BUILD_DIR/.rustos-structural-config-input-v2.sha256"
     local kernel_stamp="$BUILD_DIR/.rustos-kernel-config-input-v1.sha256"
+    local firmware_stamp="$BUILD_DIR/.rustos-amdgpu-firmware-input-v1.sha256"
     local desired
     local service
     local service_stamp
@@ -549,6 +558,11 @@ print_build_plan() {
             lane_count=$((lane_count + 1))
         fi
     done
+    if ! test -f "$firmware_stamp" \
+        || test "$(cat "$firmware_stamp")" != "$(amdgpu_firmware_input_hash)"; then
+        printf 'lane=linux-firmware-reinstall+rootfs\n'
+        lane_count=$((lane_count + 1))
+    fi
     if ! test -f "$BUILD_DIR/.rustos-overlay-input.sha256" \
         || test "$(cat "$BUILD_DIR/.rustos-overlay-input.sha256")" != "$(overlay_input_hash)"; then
         printf 'lane=rootfs-overlay-or-policy\n'
@@ -625,6 +639,8 @@ prepare_mutable_inputs() {
     local kernel_current
     local kernel_build="$BUILD_DIR/build/linux-${LINUX_VERSION}"
     local target_modules="$BUILD_DIR/target/lib/modules/${LINUX_VERSION}"
+    local firmware_stamp="$BUILD_DIR/.rustos-amdgpu-firmware-input-v1.sha256"
+    local firmware_current
     local overlay_stamp="$BUILD_DIR/.rustos-overlay-input.sha256"
     local overlay_files_stamp="$BUILD_DIR/.rustos-overlay-files-v1"
     local overlay_current
@@ -633,6 +649,7 @@ prepare_mutable_inputs() {
     local service_current
 
     kernel_current="$(kernel_config_input_hash)"
+    firmware_current="$(amdgpu_firmware_input_hash)"
     overlay_current="$(overlay_input_hash)"
 
     # Linux Kconfig changes invalidate only Linux and the two packages that
@@ -663,6 +680,22 @@ prepare_mutable_inputs() {
         fi
     done
 
+    # The post-build policy prunes linux-firmware in target/ to the sealed AMD
+    # profile. If that profile later gains a required payload, regenerating the
+    # rootfs alone cannot restore the file that was already deleted from the
+    # mutable target tree. Reinstall only the cached linux-firmware package;
+    # this restores its target files without rebuilding the package, kernel,
+    # toolchain, Mesa, or LLVM, after which post-build prunes the exact profile.
+    if ! test -f "$firmware_stamp" \
+        || test "$(cat "$firmware_stamp")" != "$firmware_current"; then
+        if find "$BUILD_DIR/build" -maxdepth 2 \
+            -path '*/linux-firmware-*/.stamp_target_installed' -print -quit |
+            grep -q .; then
+            make_buildroot linux-firmware-reinstall
+        fi
+        rm -f -- "$BUILD_DIR/images/rootfs.cpio.xz"
+    fi
+
     # An overlay change must produce a new initramfs even when no package
     # target changed. Deleting just the generated rootfs asks Buildroot to run
     # target-finalize and rebuild the image; it does not invalidate packages or
@@ -681,6 +714,8 @@ commit_mutable_input_stamps() {
         write_stamp "$BUILD_DIR/.${service}-input-v1.sha256" "$(local_service_input_hash "$service")"
     done
     write_stamp "$BUILD_DIR/.rustos-overlay-input.sha256" "$(overlay_input_hash)"
+    write_stamp "$BUILD_DIR/.rustos-amdgpu-firmware-input-v1.sha256" \
+        "$(amdgpu_firmware_input_hash)"
     write_stamp "$BUILD_DIR/.rustos-kernel-config-input-v1.sha256" "$(kernel_config_input_hash)"
     write_overlay_file_manifest "$BUILD_DIR/.rustos-overlay-files-v1"
 }

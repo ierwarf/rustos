@@ -315,7 +315,7 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
   deliberately `DMA_TO_DEVICE` mapping, so the display device receives
   read-only DMA authority and there is no relay CPU copy or guest-writable
   source mapping. Since the producer is in another VM, import is additionally
-  rejected unless the AMD attachment reports coherent DMA; guest-side cache
+  rejected unless the certified physical attachment reports coherent DMA; guest-side cache
   maintenance is not misrepresented as cross-VM producer synchronization.
   After an MSI-X publication, the root-only exporter validates
   the exact live slot, generation, sequence, acquire value, and bounded batch,
@@ -357,7 +357,12 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
   relay
   nevertheless preserves the fixed shared ABI and can scale only when a
   display backend genuinely requires a different mode. KVM still proves the
-  bounded control apertures. The enabled AMD path has a source-level DMA-BUF
+  bounded control apertures. Prime-completion v2 binds the backend-selected
+  staged-copy or direct-DMA-BUF mode before host submission, and the direct
+  contract requires explicit one-plane linear ARGB8888 modifier import. The
+  sealed registry currently enables only virtio staged-copy and AMD direct
+  DMA-BUF; later physical drivers require their own registry/evidence entry.
+  The enabled AMD path has a source-level DMA-BUF
   import, GPU-composition, explicit-fence, and atomic-page-flip consumer, but
   its hardware gate remains failed until the assigned device supplies that
   evidence. The Linux appliance selects a display-class
@@ -399,7 +404,23 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
   most 20 seconds for each process, then escalates only that recorded PID.
   Each relay may retry a transient device-readiness error internally, but a
   restart must never leave a second framebuffer consumer or Ethernet producer.
-- The physical AMD display profile is PCI `1002:1900` (Phoenix/HawkPoint GC
+- Physical-GPU launch is selected through a sealed profile registry. A profile
+  binds PCI vendor/device identity, expected DRM driver, DVM backend class,
+  guest address, and firmware-table kind. The common QEMU IOMMUFD/VFIO,
+  DMA-BUF, fence, KMS, and readiness path contains no vendor fallback. The DVM
+  proof and relay consume one shared backend registry and publish
+  `backend-class=<virtual-staged|physical-direct> certification=registered`;
+  unknown profiles, unknown DRM drivers, and multiple eligible render nodes
+  fail closed. `--physical-gpu` and `--gpu-firmware` are the generic lab CLI;
+  the old AMD option names are compatibility aliases only. The reset-disabled
+  lab writes one atomic launch claim keyed by the host boot ID before starting
+  either guest and refuses every second attempt in that boot. A failed or hard
+  timed-out assignment therefore requires a cold boot; it cannot be retried as
+  if driver exit had reset the hardware.
+  GPU prime and steady-state evidence are independently bounded to 1024 and
+  2048 bytes. Any serialization overflow withdraws evidence and is surfaced by
+  KVM as an immediate DVM GPU publication failure, never a readiness timeout.
+- The currently certified physical AMD display profile is PCI `1002:1900` (Phoenix/HawkPoint GC
   11.0.1). DVM image verification requires the signed `amdgpu.ko` plus its
   exact GC 11.0.1, PSP 13.0.4, SDMA 6.0.1, and VCN 4.0.2 firmware files; a
   broad Buildroot `linux-firmware` selection alone is not supply evidence.

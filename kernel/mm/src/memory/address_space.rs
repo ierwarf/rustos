@@ -831,11 +831,6 @@ impl Drop for ProcessAddressSpace {
             panic!("cannot drop the active process address space");
         }
 
-        let mut authoritative_frames = self.collect_authoritative_owned_frames();
-        if authoritative_frames.is_empty() {
-            authoritative_frames.push(self.pml4_frame_phys);
-        }
-
         let mut recorded_frames = self.owned_frames.clone();
         recorded_frames.sort_unstable();
         recorded_frames.dedup();
@@ -847,8 +842,18 @@ impl Drop for ProcessAddressSpace {
                 recorded_frames.len(),
             );
         }
+        if recorded_frames.is_empty() {
+            crate::debug::println!(
+                "process address space: missing ownership ledger root={:#x}",
+                self.pml4_frame_phys,
+            );
+            recorded_frames.push(self.pml4_frame_phys);
+        }
 
-        for frame_phys in authoritative_frames {
+        // owned_frames is the allocation ledger. A page-table walk is not an
+        // ownership oracle because shared memfd and device mappings install
+        // borrowed leaf frames which their backing objects must release.
+        for frame_phys in recorded_frames {
             if frame_phys == 0 || frame_phys % PAGE_4KIB_U64 != 0 {
                 crate::debug::println!(
                     "process address space: skipping invalid owned frame root={:#x} frame={:#x}",
@@ -1075,72 +1080,6 @@ enum UserPageLookup {
 }
 
 impl ProcessAddressSpace {
-    fn collect_authoritative_owned_frames(&self) -> Vec<u64> {
-        let mut frames = Vec::new();
-        frames.push(self.pml4_frame_phys);
-
-        let root = self.root_table_ref();
-        let pml4_entry = &root[USER_PML4_INDEX];
-        if pml4_entry.is_unused() || pml4_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
-            return frames;
-        }
-
-        let pdpt_phys = pml4_entry.addr().as_u64();
-        if is_page_aligned(pdpt_phys) && pdpt_phys != 0 {
-            frames.push(pdpt_phys);
-        }
-        let pdpt = unsafe { kernel_vm::phys_to_table_ref(pml4_entry.addr()) };
-        for pdpt_entry in pdpt.iter() {
-            if pdpt_entry.is_unused() {
-                continue;
-            }
-            if pdpt_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
-                let phys = pdpt_entry.addr().as_u64();
-                if is_page_aligned(phys) && phys != 0 {
-                    frames.push(phys);
-                }
-                continue;
-            }
-
-            let pd_phys = pdpt_entry.addr().as_u64();
-            if is_page_aligned(pd_phys) && pd_phys != 0 {
-                frames.push(pd_phys);
-            }
-            let pd = unsafe { kernel_vm::phys_to_table_ref(pdpt_entry.addr()) };
-            for pd_entry in pd.iter() {
-                if pd_entry.is_unused() {
-                    continue;
-                }
-                if pd_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
-                    let phys = pd_entry.addr().as_u64();
-                    if is_page_aligned(phys) && phys != 0 {
-                        frames.push(phys);
-                    }
-                    continue;
-                }
-
-                let pt_phys = pd_entry.addr().as_u64();
-                if is_page_aligned(pt_phys) && pt_phys != 0 {
-                    frames.push(pt_phys);
-                }
-                let pt = unsafe { kernel_vm::phys_to_table_ref(pd_entry.addr()) };
-                for pt_entry in pt.iter() {
-                    if pt_entry.is_unused() {
-                        continue;
-                    }
-                    let phys = pt_entry.addr().as_u64();
-                    if is_page_aligned(phys) && phys != 0 {
-                        frames.push(phys);
-                    }
-                }
-            }
-        }
-
-        frames.sort_unstable();
-        frames.dedup();
-        frames
-    }
-
     fn lookup_user_page_state(&self, virt: VirtAddr) -> UserPageLookup {
         if !is_user_addr(virt.as_u64()) {
             return UserPageLookup::NotUser;

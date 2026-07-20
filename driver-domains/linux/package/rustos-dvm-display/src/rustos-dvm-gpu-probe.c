@@ -27,6 +27,8 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+
+#include "rustos-dvm-gpu-backends.h"
 #include <xf86drm.h>
 
 #ifndef EGL_PLATFORM_GBM_KHR
@@ -90,6 +92,8 @@
 #ifndef GPU_PRIME_EVIDENCE_TEMP
 #define GPU_PRIME_EVIDENCE_TEMP "/run/rustos-dvm/gpu-pipeline-prime-v1.env.tmp"
 #endif
+#define GPU_PRIME_EVIDENCE_MAX_BYTES 1024U
+#define GPU_EVIDENCE_MAX_BYTES 2048U
 
 struct gpu_batch_header {
     uint32_t command_count;
@@ -157,6 +161,7 @@ struct gpu_executor {
     GLint use_texture_uniform;
     char driver[64];
     char renderer[160];
+    const struct rustos_gpu_backend_policy *backend;
     GLsync source_acquire_fence;
     uint64_t source_acquire_value;
     uint64_t source_acquire_completed;
@@ -584,18 +589,55 @@ static int create_program(struct gpu_executor *executor) {
     return 0;
 }
 
-static int open_drm_render_node(char *path, size_t path_size) {
+static int open_registered_render_node(struct gpu_executor *executor, char *path,
+                                       size_t path_size) {
     unsigned int minor;
+    int selected = -1;
+    if (executor == NULL || path == NULL || path_size == 0U) {
+        errno = EINVAL;
+        return -1;
+    }
     for (minor = 128U; minor < 192U; minor++) {
         int fd;
+        drmVersionPtr version;
+        const struct rustos_gpu_backend_policy *backend;
+        char driver[sizeof(executor->driver)];
         if (snprintf(path, path_size, "/dev/dri/renderD%u", minor) >= (int)path_size)
             break;
         fd = open(path, O_RDWR | O_CLOEXEC);
-        if (fd >= 0)
-            return fd;
+        if (fd < 0)
+            continue;
+        version = drmGetVersion(fd);
+        if (version == NULL || version->name == NULL || version->name_len == 0U ||
+            (size_t)version->name_len >= sizeof(executor->driver)) {
+            if (version != NULL)
+                drmFreeVersion(version);
+            close(fd);
+            continue;
+        }
+        memcpy(driver, version->name, (size_t)version->name_len);
+        driver[version->name_len] = '\0';
+        backend = rustos_gpu_backend_policy(driver);
+        if (backend == NULL) {
+            drmFreeVersion(version);
+            close(fd);
+            continue;
+        }
+        if (selected >= 0) {
+            drmFreeVersion(version);
+            close(fd);
+            close(selected);
+            errno = EEXIST;
+            return -1;
+        }
+        strcpy(executor->driver, driver);
+        executor->backend = backend;
+        selected = fd;
+        drmFreeVersion(version);
     }
-    errno = ENODEV;
-    return -1;
+    if (selected < 0)
+        errno = ENODEV;
+    return selected;
 }
 
 static int renderer_contains(const char *renderer, const char *needle) {
@@ -618,15 +660,17 @@ static int contains_software_renderer(const char *renderer) {
            renderer_contains(renderer, "swrast");
 }
 
-static int renderer_matches_amd_path(const struct gpu_executor *executor) {
-    int amd_renderer;
+static int renderer_matches_backend(const struct gpu_executor *executor) {
+    const struct rustos_gpu_backend_policy *backend;
     if (executor == NULL || contains_software_renderer(executor->renderer))
         return 0;
-    amd_renderer = renderer_contains(executor->renderer, "amd") ||
-                   renderer_contains(executor->renderer, "radeon");
-    if (strcmp(executor->driver, "virtio_gpu") == 0)
-        return amd_renderer && renderer_contains(executor->renderer, "virgl");
-    return strcmp(executor->driver, "amdgpu") == 0 && amd_renderer;
+    backend = executor->backend;
+    if (backend == NULL || backend->renderer_token_a == NULL)
+        return 0;
+    if (renderer_contains(executor->renderer, backend->renderer_token_a))
+        return 1;
+    return backend->renderer_token_b != NULL &&
+           renderer_contains(executor->renderer, backend->renderer_token_b);
 }
 
 static int open_executor(struct gpu_executor *executor) {
@@ -640,7 +684,6 @@ static int open_executor(struct gpu_executor *executor) {
         EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8, EGL_NONE,
     };
     const EGLint context_attributes[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};
-    drmVersionPtr version;
     const GLubyte *renderer;
     char node_path[64];
     static const GLfloat vertices[] = {
@@ -658,28 +701,9 @@ static int open_executor(struct gpu_executor *executor) {
     executor->display = EGL_NO_DISPLAY;
     executor->context = EGL_NO_CONTEXT;
     executor->surface = EGL_NO_SURFACE;
-    executor->drm_fd = open_drm_render_node(node_path, sizeof(node_path));
+    executor->drm_fd = open_registered_render_node(executor, node_path, sizeof(node_path));
     if (executor->drm_fd < 0)
         return -1;
-    version = drmGetVersion(executor->drm_fd);
-    if (version == NULL || version->name == NULL || version->name_len == 0) {
-        if (version != NULL)
-            drmFreeVersion(version);
-        errno = ENODEV;
-        return -1;
-    }
-    if ((size_t)version->name_len >= sizeof(executor->driver)) {
-        drmFreeVersion(version);
-        errno = EOVERFLOW;
-        return -1;
-    }
-    memcpy(executor->driver, version->name, (size_t)version->name_len);
-    executor->driver[version->name_len] = '\0';
-    drmFreeVersion(version);
-    if (strcmp(executor->driver, "virtio_gpu") != 0 && strcmp(executor->driver, "amdgpu") != 0) {
-        errno = EOPNOTSUPP;
-        return -1;
-    }
     executor->gbm = gbm_create_device(executor->drm_fd);
     if (executor->gbm == NULL)
         return -1;
@@ -711,7 +735,7 @@ static int open_executor(struct gpu_executor *executor) {
         return -1;
     }
     strcpy(executor->renderer, (const char *)renderer);
-    if (!renderer_matches_amd_path(executor)) {
+    if (!renderer_matches_backend(executor)) {
         errno = EOPNOTSUPP;
         return -1;
     }
@@ -1246,7 +1270,7 @@ static void sanitize(char *text) {
 // proof.  The init script uses this independently so a blocked EGL/GL setup
 // cannot be mistaken for a merely slow first frame.
 static int publish_prime_evidence(const struct gpu_executor *executor, uint64_t prime_us) {
-    char evidence[512];
+    char evidence[GPU_PRIME_EVIDENCE_MAX_BYTES];
     char renderer[sizeof(executor->renderer)];
     int length;
     int fd;
@@ -1255,9 +1279,11 @@ static int publish_prime_evidence(const struct gpu_executor *executor, uint64_t 
     sanitize(renderer);
     length = snprintf(evidence, sizeof(evidence),
                       "GPU_PIPELINE_PRIME_SCHEMA=1\nCONTRACT_VERSION=1\nDRM_DRIVER=%s\n"
-                      "GL_RENDERER=%s\nGPU_PIPELINE_PRIME_US=%llu\n"
+                      "GL_RENDERER=%s\nBACKEND_CLASS=%s\nBACKEND_CERTIFICATION=registered\n"
+                      "GPU_PIPELINE_PRIME_US=%llu\n"
                       "GPU_PIPELINE_PRIME_TIMEOUT_US=%u\nEXPLICIT_ACQUIRE_FENCE=yes\n",
-                      executor->driver, renderer, (unsigned long long)prime_us,
+                      executor->driver, renderer, executor->backend->backend_class,
+                      (unsigned long long)prime_us,
                       GPU_PIPELINE_PRIME_TIMEOUT_US);
     if (length <= 0 || (size_t)length >= sizeof(evidence)) {
         errno = EOVERFLOW;
@@ -1287,7 +1313,7 @@ static int publish_evidence(const struct gpu_executor *executor, uint64_t prime_
                             uint64_t fps_milli, uint64_t average_us, uint64_t maximum_us,
                             uint64_t wall_maximum_us, uint64_t frame_hash_a,
                             uint64_t frame_hash_b, int performance_target_met) {
-    char evidence[1024];
+    char evidence[GPU_EVIDENCE_MAX_BYTES];
     char renderer[sizeof(executor->renderer)];
     int length;
     int fd;
@@ -1297,7 +1323,8 @@ static int publish_evidence(const struct gpu_executor *executor, uint64_t prime_
     length = snprintf(
         evidence, sizeof(evidence),
         "GPU_COMPOSITOR_EVIDENCE_SCHEMA=1\nCONTRACT_VERSION=1\nDRM_DRIVER=%s\n"
-        "GL_RENDERER=%s\nFIXED_COMMANDS=clear,solid-quad,textured-quad\n"
+        "GL_RENDERER=%s\nBACKEND_CLASS=%s\nBACKEND_CERTIFICATION=registered\n"
+        "FIXED_COMMANDS=clear,solid-quad,textured-quad\n"
         "EXPLICIT_GPU_FENCE=yes\nEXPLICIT_ACQUIRE_FENCE=yes\nRAW_COMMANDS=no\nAPPLICATION_SHADERS=no\n"
         "NEGATIVE_CONTRACT_CASES=5\n"
         "DEVICE_WRITE_TO_RUSTOS_SOURCE=no\nSOFTWARE_RENDERER=no\nPROOF_FRAMES=%u\n"
@@ -1312,7 +1339,8 @@ static int publish_evidence(const struct gpu_executor *executor, uint64_t prime_
         "FRAME_HASH_B=%016llx\nFRAME_HASH_STABLE=yes\nFRAME_HASH_DYNAMIC=yes\n"
         "SOURCE_MODE=synthetic-read-only-contract\nPUBLIC_USERSPACE_ABI=no\n"
         "RUSTOS_UI_CONNECTED=no\nSCANOUT_CONNECTED=no\nPHYSICAL_ZERO_COPY=no\n",
-        executor->driver, renderer, GPU_PROOF_FRAMES, (unsigned long long)prime_us,
+        executor->driver, renderer, executor->backend->backend_class, GPU_PROOF_FRAMES,
+        (unsigned long long)prime_us,
         GPU_PIPELINE_PRIME_TIMEOUT_US, (unsigned long long)fps_milli,
         (unsigned long long)average_us, (unsigned long long)maximum_us,
         (unsigned long long)wall_maximum_us, performance_target_met ? "yes" : "no",
@@ -1518,7 +1546,8 @@ static int serve(void) {
             "scheduler=rr priority=%u rttime-soft-us=%u rttime-hard-us=%u "
             "rttime-hard-action=terminate "
             "scheduler-restored=normal "
-            "performance-target=%d hardware=amd scope-public-abi=0 scope-ui-connected=0 "
+            "performance-target=%d backend-class=%s certification=registered "
+            "scope-public-abi=0 scope-ui-connected=0 "
             "scope-scanout=0\n",
             executor.driver, executor.renderer, (unsigned long long)((prime_ns + 999U) / 1000U),
             GPU_PROOF_FRAMES,
@@ -1526,7 +1555,7 @@ static int serve(void) {
             (unsigned long long)maximum_us, (unsigned long long)wall_maximum_us,
             (unsigned long long)frame_hash_a, (unsigned long long)frame_hash_b,
             GPU_PROOF_RR_PRIORITY, GPU_PROOF_RTTIME_SOFT_US, GPU_PROOF_RTTIME_HARD_US,
-            performance_target_met);
+            performance_target_met, executor.backend->backend_class);
     while (!stop_requested) {
         sleep(GPU_HEALTH_INTERVAL_SECONDS);
         if (stop_requested)

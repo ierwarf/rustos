@@ -662,6 +662,7 @@ pub(crate) fn validate_boot_contract(output_width: u32, output_height: u32) -> b
                 context_id: BOOT_CONTEXT_ID,
                 context_epoch: BOOT_CONTEXT_EPOCH,
                 status: driver_domain_protocol::DvmGpuPrimeCompletionStatus::Ready,
+                submit_flags: driver_domain_protocol::DVM_GPU_ATLAS_SUBMIT_FLAG_STAGED_COPY,
                 fence_value: 1,
                 duration_ns: 1,
             })
@@ -719,6 +720,7 @@ mod tests {
                 context_id: 9,
                 context_epoch: 4,
                 status: driver_domain_protocol::DvmGpuPrimeCompletionStatus::Ready,
+                submit_flags: driver_domain_protocol::DVM_GPU_ATLAS_SUBMIT_FLAG_STAGED_COPY,
                 fence_value: 1,
                 duration_ns: 1,
             })

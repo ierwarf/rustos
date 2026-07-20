@@ -50,8 +50,8 @@ statusMessage = "Checking for destructive shell"
 [[hooks.PreToolUse.hooks]]
 type = "command"
 command = '"$(git rev-parse --show-toplevel)/.codex/hooks/pre_commit.sh"'
-timeout = 30
-statusMessage = "Pre-commit fmt check"
+timeout = 45
+statusMessage = "Pre-commit policy / fmt checks"
 
 [[hooks.PostToolUse]]
 matcher = "^(apply_patch|Edit|Write)$"

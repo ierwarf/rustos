@@ -35,7 +35,8 @@ failure output as the primary debugging context.
 | `make -C driver-domains/linux dev-display` | compile only the cached DVM display package; no rootfs or artifact is created | `out/buildroot-output/target/` only | cold/stale configuration; run `build` first |
 | `make -C driver-domains/linux dev-net` | compile only the cached DVM network package; no rootfs or artifact is created | `out/buildroot-output/target/` only | cold/stale configuration; run `build` first |
 | `cargo xtask kvm-smoke` | concurrently boot Linux DVM and RustOS with QEMU/KVM | `build/kvm/` | unavailable `/dev/kvm`, guest exit, missing readiness marker |
-| `cargo xtask kvm-smoke --timeout 30 --gui-dvm-surfaces --physical-amdgpu <BDF> --amd-vfct <TABLE>` | explicitly non-commercial dirty-device lab run: boot RustOS and a display-only DVM with QEMU 11.0 or newer VFIO PCI-BAR DMA-BUF mapping, execute the real `uiserver` GPU scene through the already-bound AMD VFIO function, and scan it out on the physical connector; the runner never binds, unbinds, or resets the device and attaches no network device | `build/kvm/` plus the physical display | unsafe AMD/VFIO/IOMMUFD/VFCT state, inaccessible per-device `/dev/vfio/devices/vfioN` cdev, unavailable VFIO BAR DMA-BUF support, inherited memlock below 4 GiB, missing end-to-end GPU completion, or guest exit; never counts as supervised reset/revoke evidence |
+| `cargo xtask kvm-smoke --timeout 30 --gui-dvm-surfaces --physical-gpu <BDF> --gpu-firmware <TABLE>` | explicitly non-commercial physical-GPU lab run through the sealed device-profile registry; the current registered profile is AMD `1002:1900` with a relocated VFCT. QEMU 11.0 or newer uses IOMMUFD and VFIO PCI-BAR DMA-BUF mapping, executes the real `uiserver` GPU scene, and scans it out on the physical connector. Because this lane disables reset, an atomic boot-ID claim permits exactly one launch attempt per host boot. The runner never binds, unbinds, or resets the device and attaches no network device. `--physical-amdgpu`/`--amd-vfct` remain compatibility aliases | `build/kvm/` plus the physical display | repeated launch in one boot, unknown/ambiguous profile, unsafe VFIO/IOMMUFD/profile firmware state, inaccessible per-device cdev, unavailable VFIO BAR DMA-BUF support, inherited memlock below 4 GiB, reset-dirty driver probe, missing end-to-end GPU completion, or guest exit; never counts as supervised reset/revoke evidence |
+| `tools/prepare-physical-amdgpu-vfio-lab.sh [--check] [AMD_VFCT]` | prepare only GA403UM AMD `1002:1900` for the non-commercial physical-QEMU lab lane: require a pre-unbound or already-correct function, singleton IOMMU group, disabled reset and idle-D3, cleared bus mastering, limited cdev ACLs, inherited memlock, IOMMUFD probe, and physical dry-run; never unbinds, resets, starts QEMU, or admits another VFIO function | AMD `0000:65:00.0` VFIO binding and transient sysfs/ACL/rlimit state; `build/kvm/` dry-run inputs | wrong hardware, active host driver, another VFIO function, unsafe reset/DMA state, missing access, invalid VFCT, or failed dry-run |
 | `cargo xtask kvm-run` | start the interactive Linux-DVM display session; it waits for an atomic three-buffer/page-flip-ready scanout before exposing the window, then records real pointer ingress and healthy idle UI ticks when QEMU closes | `build/kvm/` | unavailable GUI backend, `/dev/kvm`, display readiness failure, missing real pointer evidence, or a guest exit |
 | `cargo run -p rustos-hostd -- discover` | read host IOMMU groups | none | IOMMU unavailable or unreadable sysfs |
 | `cargo run -p rustos-hostd -- preflight --plan <file>` | require complete, non-protected IOMMU-group ownership and reject live `boot_vga`/connected DRM displays | none | incomplete group, declared host-critical BDF, or active L0 display |
@@ -126,6 +127,13 @@ completed build, Buildroot's official `graph-build` facility may be run through
 the wrapper during performance work to attribute duration by package; do not
 infer build cost from artifact size.
 
+The profile intentionally leaves `BR2_PER_PACKAGE_DIRECTORIES` disabled.
+Buildroot's `.NOTPARALLEL` guard therefore serializes the package graph while
+`BR2_JLEVEL=0` retains automatic parallel compilation inside each package.
+Do not enable the documented experimental top-level parallel mode as a speed
+shortcut; its per-package host/target directory semantics are not admitted by
+the current overlay, signing, or verification wrapper.
+
 The stronger cold-build optimization is a separately produced, checksummed
 Buildroot SDK consumed as a custom external toolchain. Buildroot explicitly
 recommends that backend when internal-toolchain rebuild time is excessive.
@@ -158,12 +166,21 @@ key. The release contract is the exact certificate-bound module verification,
 locked inputs, normalized packaging, and artifact manifest. Never strip or
 otherwise mutate a `.ko` after its signature is attached.
 
+Schema 8 is an exact locked-input and artifact manifest, not a CycloneDX SBOM
+or Buildroot `legal-info` bundle. Those standardized release-provenance outputs
+require a separate schema/admission change and are not fabricated by this
+build. Their absence does not invalidate the functional appliance build, but
+the schema-8 manifest must not be described as standardized SBOM evidence.
+
 Settle a physical-DVM kernel envelope before its first integration build. The
 AMD display envelope explicitly pins ZONE_DEVICE page ownership, DMA-BUF/sync,
 AMD DC/KMS, and the absence of nested VFIO/IOMMUFD, generic DMA heaps, userptr,
 and diagnostic DRM providers. The post-build step seals AMDGPU firmware to
 `board/amdgpu-firmware-1002-1900.txt`; changes to that rootfs-only profile
-regenerate the image while preserving the host toolchain.
+first reinstall the cached `linux-firmware` package into the mutable target
+tree, then regenerate the image while preserving the host toolchain, kernel,
+Mesa, and LLVM. This restoration is required because the previous post-build
+pass deliberately pruned every firmware file outside the sealed profile.
 
 `cargo xtask dev-plan` never executes the printed commands. `now` is the
 edit-loop set. `stable-batch` is ordered and should run once after the related
@@ -180,7 +197,13 @@ fallback.
 - The default marker is `rootd: core services ready, spawning initd via loaderd`;
   repeat `--expect <marker>` for each additional RustOS milestone.
 - `--dry-run` verifies DVM artifacts and prepares `build/kvm/` without
-  launching QEMU.
+  launching QEMU. It creates missing log files but never truncates evidence
+  from the preceding real run; only a new real launch rotates the active log
+  set.
+- Physical-GPU smoke readiness treats any compositor `offline` record as a
+  terminal failure and requires four consecutive zero-copy frames with GPU and
+  present fences. Four frames traverse the three-slot pool and prove one slot
+  reuse; this is a lifecycle smoke gate, not sustained-FPS evidence.
 - The DVM's `agent-v1-control` contract makes a host-authenticated KVM-vsock
   health, PCI-inventory, driver-inventory, and `input-stream` handshake. L0 validates keyboard
   and relative-pointer evdev records before forwarding sequenced, checksummed
@@ -279,6 +302,7 @@ fallback.
 
 ## Docs verification
 
+- `.codex/hooks/selftest.sh` for the versioned agent/hook policy bundle.
 - `mdbook build` if `mdbook` exists.
 - Inspect markdown links with pattern `\[[^]]+\]\(([^)#]+\.md)`.
 - Top-level human docs should include `[English](#english) | [한국어](#korean)`.

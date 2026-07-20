@@ -42,6 +42,20 @@ expect_quiet_allow() {
   exit 1
 }
 
+expect_match() {
+  local name="$1"
+  local file="$2"
+  local pattern="$3"
+
+  if grep -Eq -- "$pattern" "$file"; then
+    pass "$name"
+    return
+  fi
+
+  printf 'not ok - %s: %s lacks required contract\n' "$name" "$file" >&2
+  exit 1
+}
+
 expect_deny \
   "destructive rm is denied" \
   .codex/hooks/pre_bash_destructive.sh \
@@ -71,5 +85,37 @@ expect_deny \
   "prompt token is denied" \
   .codex/hooks/user_prompt_policy.sh \
   "$(jq -n --arg prompt 'token sk-testtesttesttesttesttest1234567890' '{prompt:$prompt}')"
+
+expect_match \
+  "root policy routes physical GPU work" \
+  AGENTS.md \
+  'docs/ai/physical-gpu-status\.md'
+
+expect_match \
+  "task router classifies physical GPU work" \
+  docs/ai/task-router.md \
+  'Physical GPU/VFIO continuation'
+
+expect_match \
+  "physical status preserves deferred FPS gate" \
+  docs/ai/physical-gpu-status.md \
+  'user-deferred'
+
+expect_match \
+  "physical status names the generic wait ABI" \
+  docs/ai/physical-gpu-status.md \
+  'atomic check-arm-recheck'
+
+expect_match \
+  "KVM skill distinguishes the userspace ABI" \
+  .agents/skills/rustos-kvm/SKILL.md \
+  'cross-service'
+
+for agent in .codex/agents/*.toml; do
+  expect_match "$(basename "$agent") uses repository model" "$agent" \
+    '^model = "gpt-5\.6-terra"$'
+  expect_match "$(basename "$agent") uses repository reasoning" "$agent" \
+    '^model_reasoning_effort = "xhigh"$'
+done
 
 printf 'RustOS Codex hook selftest passed\n'

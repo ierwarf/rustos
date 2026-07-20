@@ -70,19 +70,18 @@ three-slot GPU atlas transport. In QEMU it proves only
 claim the physical AMD DMA-BUF source import, explicit-fence, or atomic-scanout
 path, and no retired CPU-frame or zero-atlas relay is accepted as a fallback.
 
-The explicitly non-commercial `--physical-amdgpu <BDF> --amd-vfct <TABLE>`
-variant replaces the virtual GPU with one already-bound AMD `1002:1900` VFIO
-function and disables QEMU networking. It never changes a driver binding or
-resets the device. Readiness still requires a completed real `uiserver` scene
-submission, DVM GPU rendering, DMA-BUF acquire, and physical atomic KMS
-page-flip; DRM initialization or a test pattern is insufficient. The command
-requires direct read/write IOMMUFD/VFIO access and at least 4 GiB inherited
-memlock. Because timeout cleanup can leave the GPU dirty, this diagnostic path
-is not commercial lifecycle, reset, revoke, or recovery evidence. QEMU 10.2.1
-also attempts an unsupported IOMMUFD peer-to-peer map for an mmap-able PCI BAR
-on this APU, so this lab-only launch disables VFIO BAR mmap and the PCI ROM BAR.
-That permits functional diagnosis but slows MMIO; neither a successful boot nor
-FPS measured with this workaround closes the commercial performance gate.
+The explicitly non-commercial `--physical-gpu <BDF> --gpu-firmware <TABLE>`
+variant replaces the virtual GPU with one already-bound VFIO function selected
+through the sealed profile registry and disables QEMU networking. The current
+registered profile is AMD `1002:1900`; `--physical-amdgpu` and `--amd-vfct` are
+compatibility aliases. The runner never changes a driver binding or resets the
+device. Readiness still requires a completed real `uiserver` scene submission,
+DVM GPU rendering, DMA-BUF acquire, and physical atomic KMS page-flip; DRM
+initialization or a test pattern is insufficient. QEMU 11.0 or newer, direct
+IOMMUFD/VFIO access, and at least 4 GiB inherited memlock are required. Because
+the resetless lane can leave the GPU dirty, it permits one launch per cold host
+boot and is not commercial lifecycle, reset, revoke, recovery, or quantitative
+performance evidence.
 
 `--min-ui-fps <fps>` patches only the private KVM disk to enable uiserver and
 WayClick profiles. It requires consecutive render/input windows, balanced
@@ -157,18 +156,16 @@ fixed-command GPU composition만 증명합니다. 물리 DMA-BUF import나 direc
 scanout 증거로 간주하지 않으며, 폐기한 CPU-frame/zero-atlas relay를 fallback으로
 허용하지 않습니다.
 
-명시적인 비상용 진단 옵션인 `--physical-amdgpu <BDF> --amd-vfct <TABLE>`은
-가상 GPU 대신 이미 `vfio-pci`에 바인딩된 AMD `1002:1900` 장치를 연결하고
-QEMU 네트워크를 끕니다. 실행기는 드라이버 바인딩과 reset을 변경하지 않습니다.
-통과하려면 실제 `uiserver` 장면 제출 완료, DVM GPU 렌더링, DMA-BUF acquire,
-물리 atomic KMS page-flip이 모두 관측되어야 하며 DRM 초기화나 테스트 패턴만으로는
-통과하지 않습니다. 직접 읽기/쓰기가 가능한 IOMMUFD/VFIO와 상속된 4 GiB 이상의
-memlock이 필요합니다. timeout 종료는 GPU를 dirty 상태로 남길 수 있으므로 이 경로는
-상용 수명주기, reset, revoke, 복구 증거가 아닙니다. 이 APU에서 QEMU 10.2.1은
-mmap 가능한 PCI BAR를 지원되지 않는 IOMMUFD P2P 영역으로 매핑하려 하므로, 이
-실험 경로에서만 VFIO BAR mmap과 PCI ROM BAR를 끕니다. 이는 기능 진단을 위한
-것이고 MMIO가 느려질 수 있으므로, 이 상태의 부팅이나 FPS는 상용 성능 게이트를
-닫지 못합니다.
+명시적인 비상용 진단 옵션인 `--physical-gpu <BDF> --gpu-firmware <TABLE>`은
+가상 GPU 대신 sealed profile registry가 선택한 이미 `vfio-pci`에 바인딩된 장치를
+연결하고 QEMU 네트워크를 끕니다. 현재 등록된 profile은 AMD `1002:1900`이며
+`--physical-amdgpu`와 `--amd-vfct`는 호환 alias입니다. 실행기는 드라이버 바인딩과
+reset을 변경하지 않습니다. 통과하려면 실제 `uiserver` 장면 제출 완료, DVM GPU
+렌더링, DMA-BUF acquire, 물리 atomic KMS page-flip이 모두 관측되어야 하며 DRM
+초기화나 테스트 패턴만으로는 통과하지 않습니다. QEMU 11.0 이상, 직접 읽기/쓰기가
+가능한 IOMMUFD/VFIO, 상속된 4 GiB 이상의 memlock이 필요합니다. resetless 경로는
+GPU를 dirty 상태로 남길 수 있어 cold host boot마다 한 번만 실행하며, 상용
+수명주기, reset, revoke, 복구 또는 정량 성능 증거가 아닙니다.
 
 `--min-ui-fps <fps>`는 private KVM disk에서만 uiserver와 WayClick profile을
 활성화합니다. 연속 render/input window, callback gap이 제한되고 commit/

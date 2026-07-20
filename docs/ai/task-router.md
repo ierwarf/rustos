@@ -17,6 +17,7 @@ set settles. The printed plan is not validation evidence.
 | Build/check issue | `commands.md` | exact failing command output, then `tools/xtask/src/build/` range found by search |
 | Development-speed/tooling change | `commands.md`, `token-policy.md` | for DVM builds, read the `DVM build-speed contract` before the exact wrapper range; otherwise read the exact `tools/xtask/src/dev.rs` or validation-runner range found by search |
 | Run/KVM/debug issue | `commands.md`, `repo-map.md` | exact `tools/xtask/src/kvm.rs` range found by search; inspect `build/kvm/` only through focused reads |
+| Physical GPU/VFIO continuation | `physical-gpu-status.md`, `commands.md` | `contracts-abi.md` for the ownership boundary, then only the exact hostd/xtask/DVM relay range named by the failed gate; do not rerun hardware before classifying the existing evidence |
 | Package/stage/registry issue | `contracts-infra.md` | affected `RUSTOS.package.toml`, then exact `package_manifest.rs` or `stage/mod.rs` range |
 | Kernel API/change | `kernel-api-map.md` | relevant `kernel/*/src/api.rs`, then backing module range found by symbol search |
 | Kernel boot-order change | `kernel-api-map.md`, `contracts-infra.md` | `kernel/src/main.rs`, then exact `kernel/executive/src/boot.rs` range |

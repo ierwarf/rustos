@@ -21,12 +21,12 @@ use console_abi::{
 pub(crate) use console_abi::{ConsoleSessionInfo, ConsoleStateInfo};
 pub(crate) use device_abi::{
     DisplayGpuCompletionQuery, DisplayGpuInfo, DisplayInfo, DisplaySurfaceCreate, InputEvent,
-    DISPLAY_GPU_ABI_VERSION, DISPLAY_GPU_INFO_FLAG_STAGED_COPY,
-    DISPLAY_GPU_SUBMIT_FLAG_STAGED_COPY, INPUT_ACTION_NONE, INPUT_ACTION_PRESSED,
-    INPUT_ACTION_RELEASED, INPUT_ACTION_REPEATED, INPUT_KIND_KEYBOARD, INPUT_KIND_POINTER_BUTTON,
-    INPUT_KIND_POINTER_MOTION, INPUT_KIND_POINTER_POSITION, INPUT_KIND_POINTER_SCROLL,
-    PIXEL_FORMAT_BGRA8888, POINTER_BUTTON_LEFT, POINTER_BUTTON_MIDDLE, POINTER_BUTTON_RIGHT,
-    POINTER_BUTTON_X1, POINTER_BUTTON_X2,
+    DISPLAY_GPU_ABI_VERSION, DISPLAY_GPU_INFO_FLAG_DIRECT_DMABUF,
+    DISPLAY_GPU_INFO_FLAG_STAGED_COPY, DISPLAY_GPU_SUBMIT_FLAG_STAGED_COPY, INPUT_ACTION_NONE,
+    INPUT_ACTION_PRESSED, INPUT_ACTION_RELEASED, INPUT_ACTION_REPEATED, INPUT_KIND_KEYBOARD,
+    INPUT_KIND_POINTER_BUTTON, INPUT_KIND_POINTER_MOTION, INPUT_KIND_POINTER_POSITION,
+    INPUT_KIND_POINTER_SCROLL, PIXEL_FORMAT_BGRA8888, POINTER_BUTTON_LEFT, POINTER_BUTTON_MIDDLE,
+    POINTER_BUTTON_RIGHT, POINTER_BUTTON_X1, POINTER_BUTTON_X2,
 };
 use device_abi::{
     DisplayGpuDamage, DisplayGpuSubmitRequest, DisplayPresentRectRequest, DisplayPresentRequest,
@@ -34,6 +34,7 @@ use device_abi::{
 };
 
 const SYS_READ: usize = 0;
+const SYS_POLL: usize = 7;
 const SYS_MMAP: usize = 9;
 const SYS_MUNMAP: usize = 11;
 const SYS_IOCTL: usize = 16;
@@ -52,6 +53,11 @@ const AT_FDCWD: isize = -100;
 const O_RDONLY: usize = 0;
 const O_RDWR: usize = 2;
 const O_NONBLOCK: usize = 0o4000;
+
+const POLLIN: i16 = 0x001;
+const POLLERR: i16 = 0x008;
+const POLLHUP: i16 = 0x010;
+const POLLNVAL: i16 = 0x020;
 
 const PROT_READ: usize = 0x1;
 const PROT_WRITE: usize = 0x2;
@@ -113,6 +119,14 @@ struct LinuxInputEvent {
     kind: u16,
     code: u16,
     value: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct LinuxPollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
 }
 
 #[derive(Default)]
@@ -637,7 +651,10 @@ pub(crate) fn display_gpu_get_info(fd: RawFd) -> Result<DisplayGpuInfo, i32> {
     let mut info = DisplayGpuInfo::default();
     ioctl_with_mut(fd, DISPLAY_IOCTL_GPU_GET_INFO, &mut info)?;
     if info.version != DISPLAY_GPU_ABI_VERSION
-        || info.flags != DISPLAY_GPU_INFO_FLAG_STAGED_COPY
+        || !matches!(
+            info.flags,
+            DISPLAY_GPU_INFO_FLAG_STAGED_COPY | DISPLAY_GPU_INFO_FLAG_DIRECT_DMABUF
+        )
         || info.atlas_width == 0
         || info.atlas_height == 0
         || info.atlas_stride_bytes < info.atlas_width.saturating_mul(4)
@@ -795,6 +812,15 @@ pub(crate) fn read_input(fds: &[OwnedFd], events: &mut [InputEvent]) -> Result<u
     }
     if running_on_rustos() {
         let fd = fds[0].as_raw_fd();
+        // A direct inputd READ is a stateful authorize/read transaction with
+        // the generic service IPC deadline.  Never start it merely to discover
+        // that the queue is empty: the 0-time poll path performs the existing
+        // 16 ms-bounded, non-consuming STATS recheck first.  This keeps an idle
+        // or wedged input service from pinning uiserver's reader until its
+        // process-wide watchdog fires and withdraws the display compositor.
+        if !input_fd_ready(fd)? {
+            return Ok(0);
+        }
         let bytes = match read(
             fd,
             events.as_mut_ptr().cast::<c_void>(),
@@ -848,6 +874,27 @@ pub(crate) fn read_input(fds: &[OwnedFd], events: &mut [InputEvent]) -> Result<u
         }
     }
     Ok(written)
+}
+
+fn input_fd_ready(fd: RawFd) -> Result<bool, i32> {
+    let mut poll_fd = LinuxPollFd {
+        fd,
+        events: POLLIN,
+        revents: 0,
+    };
+    let ready = unsafe { syscall3(SYS_POLL, (&mut poll_fd as *mut LinuxPollFd) as usize, 1, 0) };
+    let ready = syscall_usize(ready)?;
+    if ready == 0 {
+        return Ok(false);
+    }
+    input_poll_revents(poll_fd.revents)
+}
+
+fn input_poll_revents(revents: i16) -> Result<bool, i32> {
+    if revents & (POLLERR | POLLHUP | POLLNVAL) != 0 {
+        return Err(5);
+    }
+    Ok(revents & POLLIN != 0)
 }
 
 fn translate_linux_input_event(
@@ -1358,9 +1405,9 @@ unsafe fn syscall1(number: usize, arg0: usize) -> isize {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{
-        translate_linux_input_event, trusted_ui_status, InputTranslationState, LinuxInputEvent,
-        LinuxInputTimeval, EV_KEY, INPUT_ACTION_PRESSED, INPUT_ACTION_RELEASED,
-        INPUT_KIND_KEYBOARD,
+        input_poll_revents, translate_linux_input_event, trusted_ui_status, InputTranslationState,
+        LinuxInputEvent, LinuxInputTimeval, EV_KEY, INPUT_ACTION_PRESSED, INPUT_ACTION_RELEASED,
+        INPUT_KIND_KEYBOARD, POLLERR, POLLHUP, POLLIN, POLLNVAL,
     };
     use rustos_user_abi::{device, syscall};
 
@@ -1405,6 +1452,16 @@ mod tests {
             ),
             baseline | syscall::UISERVER_TRUSTED_UI_STATUS_DVM_SCANOUT
         );
+    }
+
+    #[test]
+    fn input_poll_requires_readable_without_hiding_terminal_status() {
+        assert_eq!(input_poll_revents(0), Ok(false));
+        assert_eq!(input_poll_revents(POLLIN), Ok(true));
+        for terminal in [POLLERR, POLLHUP, POLLNVAL] {
+            assert_eq!(input_poll_revents(terminal), Err(5));
+            assert_eq!(input_poll_revents(POLLIN | terminal), Err(5));
+        }
     }
 }
 

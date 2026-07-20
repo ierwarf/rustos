@@ -43,7 +43,7 @@ passes TLC.
 | A DVM reconnect or disconnect retains old Ctrl/Alt/key/button state, a reset waits behind stale queued input, or a retired epoch injects into the next session | dvm-input-revocation | kernel/io-manager/src/input/dvm_frames.rs, kernel/io-manager/src/input/event_queue.rs, services/inputd/src/main.rs, drivers/libs/keyboard-core/src/lib.rs |
 | A DVM gains a write path to the host-owned ring, L0 produces after vector setup but before a live policy consumer, producer/consumer exceed the fixed aperture, normal traffic consumes cleanup reserve, IRQ decodes or moves cursors, revoke leaves decoder/input authority live, a stale/malformed record reaches inputd, recovery reallocates a permanent MSI-X vector or leaks an MMIO mapping, or finite committed work never drains | dvm-input-ring | libs/driver-domain-protocol/src/lib.rs, libs/driver-domain-host/src/{lib.rs,ivshmem.rs}, kernel/io-manager/src/input/{dvm_ring.rs,dvm_frames.rs}, kernel/compat/src/user/syscall/linux/{input_broker_ops.rs,service_ops/poll_epoll.rs} |
 | A DVM-backed scanout/input path, a compromised DVM relay, or a lost presentation/input channel is mistaken for a trusted-attention path and permits a privileged prompt | trusted-ui-boundary | kernel/io-manager/src/io/dvm_display.rs, kernel/io-manager/src/io/gui.rs, libs/rustos-user-abi/src/{device,syscall}.rs, services/uiserver/src/sys.rs |
-| A generic `poll`/`epoll` caller drains the DVM ring, the MSI-X worker transfer is absent from the ownership model, a finite `STATS` reply or authorized direct read loses/replays an event, uiserver waits on ring0 after inputd has moved the only record to service policy, or a missed reader cadence accumulates burst credit | input-readiness | kernel/io-manager/src/input/event_queue.rs, kernel/compat/src/user/syscall/linux/{ipc_ops.rs,service_ops/poll_epoll.rs,service_ops/ipc_helpers.rs}, services/inputd/src/main.rs, services/uiserver/src/input_loop.rs |
+| A generic `poll`/`epoll` caller drains the DVM ring, the MSI-X worker transfer is absent from the ownership model, a finite `STATS` reply or readiness-gated read loses/replays an event, uiserver starts the stateful inputd READ merely to discover an empty queue, waits on ring0 after inputd has moved the only record to service policy, or accumulates burst credit after a missed reader cadence | input-readiness | kernel/io-manager/src/input/event_queue.rs, kernel/compat/src/user/syscall/linux/{ipc_ops.rs,service_ops/poll_epoll.rs,service_ops/ipc_helpers.rs}, services/inputd/src/main.rs, services/uiserver/src/{input_loop.rs,sys.rs} |
 | A recovering console-policy service makes uiserver wait in the input/present loop, a keyboard burst grows an unbounded queue, a queue-full event disappears without telemetry, FIFO delivery is reordered, or a blocked console call prevents local input feedback | ui-frame-budget | services/uiserver/src/{input_loop.rs,main.rs}, services/uiserver/src/app/{input.rs,runtime.rs} |
 | Input and Wayland damage are split across redundant early presentations; a Wayland frame callback runs without a previous real presentation or damage-free cadence permit; missed timer pulses accumulate callback credit; or pending damage/callback work can remain live forever under the declared scheduler/timer fairness assumptions | wayland-frame-pacing | services/uiserver/src/{main.rs,wayland.rs} |
 | A DVM KVM selftest keeps sending accepted relative input after its pointer has clamped at a screen edge, producing a false low-FPS result instead of sustained visual work | ui-input-motion | driver-domains/linux/package/rustos-dvm-agent/src/rustos-dvm-agent.c, services/uiserver/src/{input_loop.rs,main.rs} |
@@ -52,18 +52,18 @@ passes TLC.
 | A topology-only VFIO preflight, unsigned/foreign/expired release authorization, retired durable-lease schema, partial IOMMU-group binding, or mismatched DVM artifact/device policy becomes an active device assignment | vfio-release-authorization | tools/hostd/src/main.rs and libs/driver-domain-host/src/lib.rs |
 | An absent, unopenable, or ioctl-incompatible IOMMUFD, insufficient QEMU memlock/pinning budget, or invalid runtime input is discovered only after VFIO binding; a plan omission detaches the L0 boot display or a connected DRM display; a reset fallback affects a PCI function outside the admitted IOMMU group; VFIO idle-D3 restores bus mastering while the device still has an identity mapping; an AMD launch lacks an exact checksummed VFCT/ATOM VBIOS snapshot; a mutable/symlinked launch artifact changes after authorization; a physical display DVM executes before its exact runtime identity is durable, launches without a complete-group reset or non-identity IOMMUFD, reports ready without authenticated control, treats a signaled/nonzero child exit as success, restores a dirty/live device, signals a PID-reused process without an exact pidfd, or enables excluded physical network/block assignment | dvm-commercial-lifecycle | tools/hostd/src/{main.rs,runtime.rs} and libs/driver-domain-host/src/lib.rs |
 | A schema-8 DVM release omits or substitutes a companion config, source lock, certificate, or control contract; uses an unknown/duplicate manifest or control-contract key; is published through an unsafe or pre-existing path; changes after verification; or gains launch authority without hostd independently rechecking and snapshotting the co-located eight-file bundle | dvm-release-bundle | driver-domains/linux/scripts/{write-manifest,verify-release-artifacts,stage-release}.sh, tools/xtask/src/kvm.rs, and tools/hostd/src/runtime.rs |
-| A physical AMD display DVM omits an exact host-PCI-matched checksummed VFCT image, accepts a partial/mismatched subsystem pair or malformed non-ATOM VBIOS, changes payload bytes while relocating to the fixed guest BDF, supplies an invalid/mutable/non-private QEMU ACPI table, or omits the exact AMD `1002:1900` GC/PSP/SDMA/VCN firmware; or a Blackwell profile uses the proprietary kernel flavor, mismatches NVIDIA module and GSP releases, admits an unsigned module or unbound signing certificate, loads a host-selected module name instead of the assigned PCI modalias, admits UVM/CUDA authority, starts its relay after partial KMS initialization, or ships restricted firmware without redistribution authorization | dvm-amdgpu-supply and dvm-display-driver-supply | tools/hostd/src/runtime.rs; driver-domains/linux/{sources.lock,Config.in,configs/rustos_linux_dvm_x86_64_defconfig,board/linux.fragment,scripts/verify-module-signatures.sh}; package/rustos-dvm-nvidia-open; and board/overlay/etc/init.d/S48rustos-dvm-net |
+| A physical AMD display DVM omits an exact host-PCI-matched checksummed VFCT image, accepts a partial/mismatched subsystem pair or malformed non-ATOM VBIOS, changes payload bytes while relocating to the fixed guest BDF, supplies an invalid/mutable/non-private QEMU ACPI table, or omits the exact AMD `1002:1900` DCN/GC/PSP/SDMA/VCN firmware; or a Blackwell profile uses the proprietary kernel flavor, mismatches NVIDIA module and GSP releases, admits an unsigned module or unbound signing certificate, loads a host-selected module name instead of the assigned PCI modalias, admits UVM/CUDA authority, starts its relay after partial KMS initialization, or ships restricted firmware without redistribution authorization | dvm-amdgpu-supply and dvm-display-driver-supply | tools/hostd/src/runtime.rs; driver-domains/linux/{sources.lock,Config.in,configs/rustos_linux_dvm_x86_64_defconfig,board/linux.fragment,scripts/verify-module-signatures.sh}; package/rustos-dvm-nvidia-open; and board/overlay/etc/init.d/S48rustos-dvm-net |
 | A physical display release binds a non-AMD or replaced PCI identity; the DVM reports a different DRM driver/device; a CPU-copy path, stale/replayed sample, sub-threshold page-flip rate, or excessive page-flip/atomic-commit latency is accepted as commercial readiness | dvm-amdgpu-evidence | libs/driver-domain-host/src/lib.rs; tools/hostd/src/runtime.rs; driver-domains/linux/package/rustos-dvm-{agent,display}/src |
 | Another driver domain reuses a vsock CID, IOMMU group, or PCI function; a fleet policy changes after release binding; or a signed release names a different fleet | driver-domain-fleet | tools/hostd/src/main.rs and libs/driver-domain-host/src/lib.rs |
 | GUI-DVM scheduling races RustOS for ivshmem peer 0, a GUI DVM connects without the pinned RustOS peer, or either peer disconnects and a replacement reuses the stale pair | ivshmem-pairing | libs/driver-domain-host/src/ivshmem.rs and tools/xtask/src/kvm.rs |
-| A GUI-DVM overwrites a host-owned writing/ready surface; concurrent host writers advance the snapshot generation; accepts an odd, forged, stale, or unacknowledged release; loses a pre-module invitation or post-ready confirmation; retains readiness after offline; leaks stale startup slots; fabricates capacity under a saturated pool; reuses stale or different-source pixels for a damage-only snapshot; regresses the displayed generation; or treats an unavailable multi-domain focus authority as valid | gui-dvm-surface and gui-dvm-pixel-authority | tools/xtask/src/kvm.rs, kernel/io-manager/src/io/{dvm_display.rs,gui/backend.rs}, kernel/compat/src/user/{sysops/device.rs,syscall/linux/device_broker_ops.rs}, services/uiserver/src/main.rs, and driver-domains/linux/package/rustos-dvm-display/src/{rustos_dvm_ivshmem_uio.c,rustos-dvm-display.c} |
-| A physical GUI-DVM grants device-write DMA authority to a source, samples before the exact RustOS producer release is materialized and server-waited, replays an acquire fd, returns a source before GPU completion, releases an old GBM output before its replacement page-flip fence, displays a newer ready source ahead of an older generation, reuses a stale source/output generation, publishes evidence without the complete DMA-BUF/GPU/fence/atomic-KMS chain, or retains DMA authority after offline | dvm-atomic-scanout (source/model matched; physical gate failed) | `rustos_dvm_ivshmem_uio.c` validates the exact live source and exports read-only DMA-BUFs plus one-use acquire `sync_file`s; `rustos-dvm-gpu-runtime.c` imports/server-waits them for AMD-only GLES composition into a separate three-buffer GBM pool; `rustos-dvm-display.c` owns ordered release, render fence, atomic page flip, and evidence publication. Physical import/scanout and sustained-rate capture remain required. |
+| A GUI-DVM overwrites a host-owned writing/ready surface; concurrent host writers advance the snapshot generation; accepts an odd, forged, stale, or unacknowledged release; loses a pre-module invitation or post-ready confirmation; retains readiness after offline; leaks stale startup slots; fabricates capacity under a saturated pool; reuses stale or different-source pixels for a damage-only snapshot; regresses the displayed generation; or treats an unavailable multi-domain focus authority as valid | gui-dvm-surface and gui-dvm-pixel-authority | tools/xtask/src/kvm.rs, kernel/io-manager/src/io/{dvm_display.rs,gui/backend.rs}, kernel/compat/src/user/{sysops/device.rs,syscall/linux/device_broker_ops.rs}, services/uiserver/src/{main.rs,gpu_runtime.rs}, and driver-domains/linux/package/rustos-dvm-display/src/{rustos_dvm_ivshmem_uio.c,rustos-dvm-display.c} |
+| A physical GUI-DVM grants device-write DMA authority to a source, samples before the exact RustOS producer release is materialized and server-waited, replays an acquire fd, imports an implicit/unknown layout, returns a source before GPU completion, releases an old GBM output before its replacement page-flip fence, displays a newer ready source ahead of an older generation, reuses a stale source/output generation, publishes evidence without the complete DMA-BUF/GPU/fence/atomic-KMS chain, or retains DMA authority after offline | dvm-atomic-scanout (source/model matched; physical gate failed) | `rustos_dvm_ivshmem_uio.c` validates the exact live source and exports read-only DMA-BUFs plus one-use acquire `sync_file`s; the driver-neutral runtime requires explicit one-plane linear ARGB8888 import and server-waits the acquire fence before GLES composition into a separate three-buffer GBM pool; the sealed registry currently certifies only AMD direct-DMA-BUF and virtio staged-copy. The latest physical run proved sustained real-frame DMA-BUF/GPU/fence/atomic-KMS operation, but the newly found RustOS backing-slot visual corruption and the offline revoke/recovery capture remain failed gates. |
 | A GPU compositor accepts an address, raw command buffer, application shader, unbounded work, fabricated/unmeasured pipeline prime, a prime or completion from a stale context epoch, more than three live submissions, execution before its acquire fence, device-write authority to a RustOS source, CPU fallback as GPU success, or source/output reuse before its release/present fence | dvm-gpu-compositor | libs/driver-domain-protocol/src/lib.rs, services/uiserver/src/{gpu_scene.rs,gpu_runtime.rs}, kernel/io-manager/src/io/dvm_display.rs, driver-domains/linux/package/rustos-dvm-display/src, and tools/xtask/src/{build/mod.rs,kvm.rs} |
 | The private AMD/virtio GPU proof measures boot-time scheduler starvation as GPU latency; gains priority equal to or above the display/input relays; runs before exact 50/100 ms bound readback; publishes evidence before exact policy/limit restoration; survives a hard-limit or restore failure; or retains realtime authority in its long-lived health loop | dvm-gpu-proof-scheduler | driver-domains/linux/package/rustos-dvm-display/src/rustos-dvm-gpu-probe.c and tools/xtask/src/{build/mod.rs,kvm.rs} |
 | The display-DVM relay installs or enters realtime scheduling before host authentication, starts while admission is partial, outranks input, runs without exact continuous-CPU-bound readback, retries after uncertain policy/limit restoration, or survives a Linux hard-limit/restore failure with relay authority | dvm-display-scheduler | driver-domains/linux/package/rustos-dvm-display/src/rustos-dvm-display.c and tools/xtask/src/{build/mod.rs,kvm.rs} |
 | A duplicate display relay publishes readiness; a partial, stale, or cross-mode ready file is accepted; amdgpu local health admits the staged virtio payload instead of the exact DMA-BUF/GPU/fence/atomic-KMS schema; a relay fault retains local health during scheduler restoration; a hard-limit/process exit retains readiness authority; or repeated pre-rename crashes accumulate candidate files | dvm-display-readiness | driver-domains/linux/package/rustos-dvm-display/src/rustos-dvm-display.c, driver-domains/linux/package/rustos-dvm-agent/src/rustos-dvm-agent.c, and tools/xtask/src/{build/mod.rs,kvm.rs} |
 | A late DVM GPU provider blocks the UI thread while allocating its atlas, promotes from a clear-only/unrepresentative or stale prime, promotes before the retained scene/first GPU frame, accepts a short or drifted provider pitch, hides a mandatory DVM path behind software success, or remains indefinitely armed after initialization/revoke | dvm-gpu-admission | services/uiserver/src/{gpu_runtime.rs,gpu_scene.rs,render.rs,sys.rs}, libs/rustos-user-abi/src/device.rs, kernel/{io-manager,ps} display-surface paths, and driver-domains/linux/package/rustos-dvm-display/src |
-| A private UI frame publishes commands without its immutable atlas generation, initializes a new DVM texture from partial/no damage, overlaps damage records, executes texture updates out of submission order, reuses an atlas while the DVM still has read authority, executes a QEMU frame without its staged upload, reports staged copy as zero copy, presents before the GPU fence, reuses the old front before the KMS present fence, or retains source authority across revoke/reset | dvm-gpu-atlas-transport | libs/driver-domain-protocol/src/lib.rs, services/uiserver/src/{gpu_scene.rs,gpu_runtime.rs}, kernel/io-manager/src/io/dvm_display.rs, and driver-domains/linux/package/rustos-dvm-display/src |
+| A private UI frame publishes commands without its immutable atlas generation, admits an unregistered or backend/mode-mismatched GPU profile, uses an old or ambiguous prime source-mode value, submits a mode different from the authenticated prime, initializes a new DVM texture from partial/no damage, applies partial damage to a backing slot that is not the exact preceding snapshot, overlaps damage records, executes texture updates out of submission order, reuses an atlas while the DVM still has read authority, executes a QEMU frame without its staged upload, reports staged copy as zero copy, presents before the GPU fence, reuses the old front before the KMS present fence, or retains source authority across revoke/reset | dvm-gpu-atlas-transport | libs/driver-domain-protocol/src/lib.rs, services/uiserver/src/{gpu_scene.rs,gpu_runtime.rs}, kernel/io-manager/src/io/dvm_display.rs, and driver-domains/linux/package/rustos-dvm-display/src |
 | Concurrent GUI-DVM install calls allocate duplicate MSI-X vectors; malformed/absent BARs retain either mapping; an MSI/provider-registration failure retains mappings; or a revoked GUI transport reopens through a fallback path | gui-dvm-install | kernel/io-manager/src/io/dvm_display.rs |
 | A deadline-bounded IPC caller remains blocked after a reply, endpoint owner exit, or timeout; a late reply revives a cancelled call | ipc-reply-deadline | kernel/ipc-runtime/src/ipc/mod.rs and kernel/compat/src/user/syscall/linux/ipc_ops.rs |
 | A wake between arm and commit is lost, a timer-expired task remains blocked, or a retired task is selected/woken through stale scheduler state | scheduler-wakeup | kernel/ps/src/multitask/scheduler.rs, kernel/ps/src/multitask/current.rs, and kernel/ps/src/multitask/irq.rs |
@@ -126,9 +126,10 @@ capture passed independent GPU proof, RustOS rendering, DVM relay
 performance/fences, and display lifecycle with no compositor revoke or offline
 marker. Its sole failed predicate was input: 92--102 accepted events/s, zero
 drop/slow/error/backlog, and at most 35 ms reader age still contained 61--153
-ms inter-event gaps. The dedicated uiserver reader now bypasses the
-ring0/service-queue lost-wake race with a non-accumulating 4 ms direct-read
-cadence. The agent now grants only an authenticated live input stream SCHED_RR
+ms inter-event gaps. The dedicated uiserver reader used a non-accumulating
+4 ms direct-read cadence to bypass the ring0/service-queue lost-wake race; the
+later physical stall described below replaces that unsafe empty-queue probe
+with the bounded STATS readiness gate. The agent now grants only an authenticated live input stream SCHED_RR
 priority 10 under a 50/100 ms soft/hard `RLIMIT_RTTIME` guard, and both KVM and
 physical launch descriptions select the verified dynamic kernel's full
 preemption mode. Boundary profiling then proved DVM-to-L0 delivery was already
@@ -220,9 +221,12 @@ three-buffer atomic-KMS pool, and no staged CPU copy; the agent and relay
 payloads are source-cross-checked. The physical source path now validates the
 exact live invitation and bounded batch in the kernel, returns a non-replayable
 `sync_file` for the completed RustOS CPU release, and inserts an EGL server wait
-before sampling. The current `dev_pagemap` ownership change has source and model
-evidence only: its required cold DVM compile/package step is deliberately
-deferred, so compile, signed-artifact, and hardware evidence remain failed.
+before sampling. The current `dev_pagemap` ownership change now has source,
+model, cold DVM compile, module-signature, and schema-8 package evidence. The
+module-safe ownership check uses each valid PFN's `struct page::pgmap` identity
+instead of the kernel-private `pgmap_pfn_valid` symbol; external-module modpost
+and the final 39-module signature verification passed. Physical hardware
+evidence remains failed.
 The scope remains private (`scope-public-abi=0`): an application 3D ABI is not
 claimed, and physical DMA-BUF import/page-flip/rate plus VFIO fault/reset/revoke
 captures remain failed gates.
@@ -300,8 +304,9 @@ later 2 GiB schema-8 run fully unpacked the initramfs and launched the DVM
 agent, but a second amdgpu initialization after the prior hard QEMU timeout
 failed at PSP ring creation. This is dirty-device evidence, not an artifact
 failure, and it leaves repeatable physical launch failed. The bounded KVM
-runner now has an explicitly non-commercial physical-AMD mode that accepts
-only an already-bound `1002:1900` singleton IOMMU group, a private checksummed
+runner now has an explicitly non-commercial physical-GPU profile mode. Its
+only certified profile accepts an already-bound AMD `1002:1900` singleton
+IOMMU group and a private checksummed
 guest-`00:08.0` VFCT, writable IOMMUFD/VFIO character devices, disabled reset
 methods, disabled PCI bus mastering, `disable_idle_d3=Y`, and at least 4 GiB
 inherited memlock. It supplies one QEMU IOMMUFD object, the VFIO function, no
@@ -312,7 +317,24 @@ test pattern cannot pass. A read-only dry-run passed these device, artifact,
 and command-input gates on 2026-07-20, with the expected warning that the agent
 process inherited only 8 MiB memlock. No QEMU guest was launched by that
 dry-run, so physical RustOS output, throughput, graceful cleanup, and
-repeatability remain failed hardware gates. A later operator launch inherited
+repeatability remain failed hardware gates. The 2026-07-21 operator rerun again
+proved successful IOMMUFD mapping and VFCT discovery, but failed at
+`PSP create ring failed` before the DRM render node existed. That run therefore
+did not exercise the corrected first-frame DMA-BUF mode contract; it is another
+reset-dirty device capture. The runner now diagnoses this class before the
+30-second readiness timeout and records an atomic boot-ID claim so the
+reset-disabled lane cannot launch twice in one host boot. A subsequent clean
+early-VFIO cold-boot run on 2026-07-21 successfully initialized PSP, SMU, DMUB,
+DCN, GFX/compute/SDMA rings, registered amdgpu DRM, and mapped the VFIO BARs
+and pixel pool through IOMMUFD. It then failed before publishing the GPU-ready
+contract because the newly extended backend evidence exceeded its former
+1024-byte serialization buffer (`errno=75`). The evidence writer now has a
+checked 2048-byte bound and the KVM runner reports publication failure
+immediately. At that stage the source fix had not yet received a new cold-boot
+physical rerun, and the successful driver initialization was not frame,
+scanout, FPS, reset, or revoke evidence. Later paragraphs record the subsequent
+reruns.
+An earlier operator launch inherited
 the required memlock and started both guests, but QEMU aborted before DVM boot:
 IOMMUFD rejected the repository-local ext4 `virtio-pmem` mapping at guest IOVA
 `0x100000000` for 128 MiB with `EINVAL`. RustOS independently reached the
@@ -328,8 +350,74 @@ map an mmap-able AMD PCI BAR into IOMMUFD for peer-to-peer DMA at guest IOVA
 kernel produced serial output. The non-commercial runner now disables VFIO BAR
 mmap and the ROM BAR and records focused mapping traces. This is a functional
 diagnostic workaround with slower MMIO, not commercial performance evidence;
-no post-workaround hardware rerun is yet claimed, so all physical output and
-performance gates remain failed. The release image now
+the QEMU 11.0 post-workaround rerun subsequently mapped the read-only pixel
+pool, guest RAM, and AMD BAR regions through IOMMUFD, fetched the relocated
+ATOM VBIOS, and entered AMDGPU IP discovery. It then failed closed before KMS
+because the twelve-file sealed rootfs omitted the DCN 3.1.4 DMCUB firmware.
+The corrected schema-8 artifact seals and digest-verifies all thirteen
+DCN/GC/PSP/SDMA/VCN payloads, including `dcn_3_1_4_dmcub.bin`. Its physical
+rerun loaded DMUB, initialized DCN 3.1.4, passed gfx/compute/SDMA IB tests,
+registered DRM/fbcon, imported all three read-only DMA-BUF sources, and
+completed the initial fenced atomic KMS prime. The first RustOS frame then
+failed at the DMA-BUF acquire ioctl with `EPERM`: the host submit record carried
+staged-copy while the direct importer required direct-DMA-BUF. Prime-completion
+ABI v2 now authenticates the selected mode, RustOS caches that exact value, and
+the DVM requires it on every submit; old, unknown, zero, or ambiguous modes fail
+closed. The fixed direct path also requires explicit linear-modifier EGL import.
+The same earlier capture exposed a RustOS cleanup defect: address-space teardown
+treated borrowed memfd leaf mappings as owned frames and later double-freed one
+when the backing object dropped. Teardown now frees only its explicit allocation
+ledger, and the latest run did not reproduce that panic. The corrected source
+was rebuilt and the next clean early-VFIO run passed the parallel KVM gate,
+authenticated control, the private 120-frame AMDGPU proof, three-source
+read-only DMA-BUF import, explicit acquire/render/present fences, and the first
+real RustOS frame's atomic page flip. `uiserver` promoted the physical zero-copy
+compositor twice, matching the two frames visible on the panel. Each relay
+instance then stopped after exactly one real frame at `gpu-batch-validate`: the
+consumer incorrectly required the fixed atlas mapping generation to increase
+on every frame, while all three imported slots correctly share one
+provider-epoch generation and advance only sequence/content epoch. The runtime
+and TLA model now preserve that mapping generation within an epoch, reject an
+actual in-epoch rebind, and keep sequence/content-epoch replay checks. The old
+smoke predicate could return success after the first readiness
+marker even when the next serial record took the compositor offline; the runner
+now fails immediately on any offline record and requires four consecutive
+fenced zero-copy frames, traversing the three-slot pool plus one reuse. The
+fixed DVM artifact and next clean physical run passed the parallel KVM gate.
+The panel continuously displayed the RustOS UI and accepted pointer motion;
+22 consecutive relay samples advanced through content epoch 1200 at roughly
+54--62 FPS, with matching page-flip/GPU-fence/present-fence counts, zero relay
+CPU copy, about 5--6.4 ms average page-flip latency, and an observed 11.736 ms
+maximum. The visual output nevertheless flickered rapidly. Source inspection
+found that three RustOS atlas backing slots rotated while each received only
+the latest global damage rectangle: the two older slots therefore alternated
+stale or zero pixels even though the DVM GPU/KMS pipeline remained healthy.
+`uiserver` now records each slot's retained content epoch and permits partial
+damage only for the exact predecessor; an uninitialized or older slot receives
+a complete atlas snapshot. This source fix has unit, workspace-check, RustOS
+image-build, and existing DVM artifact-verification evidence. The next
+cold-boot physical visual rerun confirmed a coherent, non-flickering RustOS
+screen and completed the 224-event absolute-pointer square with zero input
+drops, errors, backlog, or cursor mismatch. It then exposed an independent
+availability defect: after the final synthetic event, uiserver started one
+more stateful inputd authorize/read transaction solely to probe an empty queue.
+That IPC remained active for 3,156 ms (`read_attempts=1218`,
+`completed_reads=1217`), and the input watchdog terminated uiserver, leaving
+the last physical scanout frozen. The DVM remained healthy through five
+matched page-flip/GPU-fence/present-fence samples with zero relay CPU copy;
+there was no GPU/KMS offline record. Uiserver now performs the existing
+16 ms-bounded, non-consuming STATS readiness recheck before entering READ, and
+the input-readiness model no longer permits the direct empty-queue probe. Unit
+tests, the RustOS workspace/image build, existing DVM artifact verification,
+and the 563,876-state input-readiness model pass. In the next cold-boot rerun,
+the operator reported that the physical RustOS screen remained visually
+coherent and responsive; neither rapid flicker nor the post-input frozen frame
+recurred. This closes those two visual regressions but is qualitative evidence,
+not a throughput measurement. The earlier short capture contained only
+31.785--55.081 FPS relay samples, and the user explicitly deferred further FPS
+capture. The 60 FPS gate therefore remains unaccepted rather than silently
+passing; supervised reset/recovery also remains a failed hardware gate. The
+release image now
 selects and verifies Buildroot `acpid` with the exact power-button
 `/sbin/poweroff` action; hostd uses a private QMP handshake and accepts normal
 shutdown only after actual QEMU exit, with bounded TERM/KILL as failed-run

@@ -15,11 +15,11 @@ use driver_domain_protocol::{
 use crate::io::gui;
 use crate::memory::paging;
 use crate::user::abi::device::{
-    self, DISPLAY_GPU_ABI_VERSION, DISPLAY_GPU_INFO_FLAG_STAGED_COPY,
-    DISPLAY_GPU_SUBMIT_FLAG_STAGED_COPY, DISPLAY_INFO_FLAG_GPU_COMPOSITOR,
-    DISPLAY_SURFACE_FLAG_GPU_ATLAS, DisplayGpuCompletionQuery, DisplayGpuDamage, DisplayGpuInfo,
-    DisplayGpuSubmitRequest, DisplayInfo, DisplayPresentRectRequest, DisplayPresentRequest,
-    DisplaySurfaceCreate, PIXEL_FORMAT_BGRA8888,
+    self, DISPLAY_GPU_ABI_VERSION, DISPLAY_GPU_INFO_FLAG_DIRECT_DMABUF,
+    DISPLAY_GPU_INFO_FLAG_STAGED_COPY, DISPLAY_GPU_SUBMIT_FLAG_STAGED_COPY,
+    DISPLAY_INFO_FLAG_GPU_COMPOSITOR, DISPLAY_SURFACE_FLAG_GPU_ATLAS, DisplayGpuCompletionQuery,
+    DisplayGpuDamage, DisplayGpuInfo, DisplayGpuSubmitRequest, DisplayInfo,
+    DisplayPresentRectRequest, DisplayPresentRequest, DisplaySurfaceCreate, PIXEL_FORMAT_BGRA8888,
 };
 use crate::user::handles::{DisplaySurfaceHandle, KernelHandle};
 use crate::user::process_state::UserProcessState;
@@ -113,7 +113,15 @@ pub(crate) fn ioctl(
                 crate::io::dvm_display::gpu_atlas_info().ok_or(DeviceError::DisplayUnavailable)?;
             let info = DisplayGpuInfo {
                 version: DISPLAY_GPU_ABI_VERSION,
-                flags: DISPLAY_GPU_INFO_FLAG_STAGED_COPY,
+                flags: match gpu.submit_flags {
+                    driver_domain_protocol::DVM_GPU_ATLAS_SUBMIT_FLAG_STAGED_COPY => {
+                        DISPLAY_GPU_INFO_FLAG_STAGED_COPY
+                    }
+                    driver_domain_protocol::DVM_GPU_ATLAS_SUBMIT_FLAG_DIRECT_DMABUF => {
+                        DISPLAY_GPU_INFO_FLAG_DIRECT_DMABUF
+                    }
+                    _ => return Err(DeviceError::DisplayUnavailable),
+                },
                 atlas_width: gpu.width,
                 atlas_height: gpu.height,
                 atlas_stride_bytes: gpu.stride_bytes,

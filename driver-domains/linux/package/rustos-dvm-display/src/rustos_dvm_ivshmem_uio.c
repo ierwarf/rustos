@@ -74,6 +74,7 @@
 #define RUSTOS_GPU_ATLAS_PRIME_FENCE_OFFSET 2152
 #define RUSTOS_GPU_PRIME_COMPLETION_BYTES 64
 #define RUSTOS_GPU_RENDER_VERSION 1
+#define RUSTOS_GPU_PRIME_COMPLETION_VERSION 2
 #define RUSTOS_GPU_RENDER_HEADER_BYTES 64
 #define RUSTOS_GPU_RENDER_SOURCE_BYTES 64
 #define RUSTOS_GPU_RENDER_COMMAND_BYTES 64
@@ -84,6 +85,7 @@
 #define RUSTOS_GPU_ATLAS_FLAG_DVM_READ_ONLY 1
 #define RUSTOS_GPU_ATLAS_EXPORT_FLAG 1
 #define RUSTOS_GPU_ATLAS_SUBMIT_FLAG_DIRECT_DMABUF 2
+#define RUSTOS_GPU_ATLAS_SUBMIT_FLAG_STAGED_COPY 1
 
 #define RUSTOS_GUI_MESSAGE_VERSION 1
 #define RUSTOS_GUI_MESSAGE_KIND_PRESENT 1
@@ -148,6 +150,17 @@ static const u8 rustos_gpu_prime_completion_magic[] = "RSGPUP01";
 static int rustos_dvm_gpu_acquire_sync_fd(struct rustos_dvm_ivshmem *state,
 					   unsigned long argument);
 
+static bool rustos_dvm_pgmap_owns_pfn(struct dev_pagemap *pgmap,
+				      unsigned long pfn)
+{
+	struct page *page;
+
+	if (!pgmap || !pfn_valid(pfn))
+		return false;
+	page = pfn_to_page(pfn);
+	return is_zone_device_page(page) && page->pgmap == pgmap;
+}
+
 static struct sg_table *rustos_dvm_dmabuf_map(struct dma_buf_attachment *attachment,
 					      enum dma_data_direction direction)
 {
@@ -183,8 +196,12 @@ static struct sg_table *rustos_dvm_dmabuf_map(struct dma_buf_attachment *attachm
 	for_each_sg(table->sgl, entry, pages, index) {
 		unsigned long pfn = PHYS_PFN(export->phys) + index;
 
-		if (!pfn_valid(pfn) || !pgmap_pfn_valid(export->pgmap, pfn) ||
-		    pfn_to_page(pfn)->pgmap != export->pgmap) {
+		/*
+		 * pgmap_pfn_valid() is an in-kernel helper, not an exported module
+		 * symbol. The page's zone and pgmap identity are the module-safe
+		 * ownership check and reject PFNs outside this dev_pagemap.
+		 */
+		if (!rustos_dvm_pgmap_owns_pfn(export->pgmap, pfn)) {
 			pr_err_ratelimited("rustos-dvm-display: DMA-BUF page-map ownership lost pfn=%#lx\n",
 					   pfn);
 			sg_free_table(table);
@@ -300,8 +317,7 @@ static long rustos_dvm_dmabuf_ioctl(struct file *file, unsigned int command,
 		return -EOVERFLOW;
 	}
 	export->pgmap = get_dev_pagemap(PHYS_PFN(export->phys), NULL);
-	if (!export->pgmap ||
-	    !pgmap_pfn_valid(export->pgmap, PHYS_PFN(end_phys))) {
+	if (!rustos_dvm_pgmap_owns_pfn(export->pgmap, PHYS_PFN(end_phys))) {
 		put_dev_pagemap(export->pgmap);
 		kfree(export);
 		return -ENXIO;
@@ -694,10 +710,14 @@ static bool rustos_dvm_valid_gpu_prime(struct rustos_dvm_ivshmem *state,
 
 	if (!state || !record ||
 	    memcmp(record, rustos_gpu_prime_completion_magic, 8) ||
-	    rustos_dvm_read_le32(record + 8) != RUSTOS_GPU_RENDER_VERSION ||
+	    rustos_dvm_read_le32(record + 8) != RUSTOS_GPU_PRIME_COMPLETION_VERSION ||
 	    rustos_dvm_read_le32(record + 12) != RUSTOS_GPU_PRIME_COMPLETION_BYTES ||
 	    rustos_dvm_read_le32(record + 24) != RUSTOS_GPU_PRIME_READY ||
-	    memchr_inv(record + 28, 0, 4) || memchr_inv(record + 48, 0, 16))
+	    (rustos_dvm_read_le32(record + 28) !=
+		     RUSTOS_GPU_ATLAS_SUBMIT_FLAG_STAGED_COPY &&
+	     rustos_dvm_read_le32(record + 28) !=
+		     RUSTOS_GPU_ATLAS_SUBMIT_FLAG_DIRECT_DMABUF) ||
+	    memchr_inv(record + 48, 0, 16))
 		return false;
 	context_id = rustos_dvm_read_le32(record + 16);
 	context_epoch = rustos_dvm_read_le32(record + 20);

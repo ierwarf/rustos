@@ -6,8 +6,10 @@ Private RustOS UI-atlas to display-DVM ownership contract.
 
 One frame atomically publishes one immutable atlas slot and one fixed command
 batch. QEMU may stage the published pixels once into a virtio-GPU texture, but
-that mode can never claim zero copy. Physical AMD may instead grant device-read
-DMA-BUF authority. Both modes release the source after the GPU fence. The old
+that mode can never claim zero copy. A registered physical backend may instead
+grant device-read DMA-BUF authority. Backend certification is separate from
+the common frame mechanism: only a registered backend-class/mode pair enters
+the state machine. Both modes release the source after the GPU fence. The old
 front output is released only by a later presentation fence.
 
 Concrete owners:
@@ -22,6 +24,10 @@ CONSTANTS Slots, Values, Outputs, MaxEpoch, MaxGeneration
 StagedCopy == "staged-copy"
 DirectDmaBuf == "dmabuf"
 Modes == {StagedCopy, DirectDmaBuf}
+LinearArgb8888 == "argb8888-linear-1plane"
+VirtualStaged == "virtual-staged"
+PhysicalDirect == "physical-direct"
+BackendClasses == {VirtualStaged, PhysicalDirect}
 
 NoDamage == "none"
 PartialDamage == "partial"
@@ -50,7 +56,10 @@ NoOutput == 99
 
 LiveBatches == {Queued, Executing, GpuDone}
 
-VARIABLES mode,
+VARIABLES backendClass,
+          mode,
+          wireSubmitMode,
+          sourceLayout,
           epoch,
           online,
           publishedValue,
@@ -75,20 +84,27 @@ VARIABLES mode,
           zeroCopyEvidence,
           cpuComposedAccepted
 
-vars == <<mode, epoch, online, publishedValue, slotState, slotEpoch,
+vars == <<backendClass, mode, wireSubmitMode, sourceLayout, epoch, online, publishedValue, slotState, slotEpoch,
           slotGeneration, batchState, batchSlot, batchEpoch, batchGeneration,
           batchDamage, stagedCopied, textureValue, gpuFence, presentFence, outputState, outputValue,
           batchOutput, frontOutput, sourceReadAuthority, sourceWriteAuthority,
           zeroCopyEvidence, cpuComposedAccepted>>
 
 Init ==
-    /\ mode \in Modes
+    /\ backendClass \in BackendClasses
+    /\ mode = IF backendClass = VirtualStaged THEN StagedCopy ELSE DirectDmaBuf
+    \* The DVM prime completion authenticates the selected source mode. The
+    \* host caches that exact value as the immutable submit-record mode.
+    /\ wireSubmitMode = mode
+    /\ sourceLayout = LinearArgb8888
     /\ epoch = 1
     /\ online = TRUE
     /\ publishedValue = 0
     /\ slotState = [s \in Slots |-> Free]
     /\ slotEpoch = [s \in Slots |-> 0]
-    /\ slotGeneration = [s \in Slots |-> 0]
+    \* Mapping generation identifies the fixed imported atlas pool for this
+    \* provider epoch. Per-frame freshness is carried by the batch value.
+    /\ slotGeneration = [s \in Slots |-> epoch]
     /\ batchState = [v \in Values |-> Idle]
     /\ batchSlot = [v \in Values |-> NoSlot]
     /\ batchEpoch = [v \in Values |-> 0]
@@ -111,10 +127,10 @@ BeginWrite(s) ==
     /\ online
     /\ s \in Slots
     /\ slotState[s] = Free
-    /\ slotGeneration[s] < MaxGeneration
+    /\ slotGeneration[s] = epoch
     /\ slotState' = [slotState EXCEPT ![s] = Writing]
     /\ slotEpoch' = [slotEpoch EXCEPT ![s] = epoch]
-    /\ UNCHANGED <<mode, epoch, online, publishedValue, slotGeneration,
+    /\ UNCHANGED <<backendClass, mode, wireSubmitMode, sourceLayout, epoch, online, publishedValue, slotGeneration,
                   batchState, batchSlot, batchEpoch, batchGeneration,
                   batchDamage, stagedCopied, textureValue, gpuFence,
                   presentFence, outputState,
@@ -124,26 +140,25 @@ BeginWrite(s) ==
 
 PublishBatch(s, v, damage) ==
     /\ online
+    /\ wireSubmitMode = mode
     /\ s \in Slots
     /\ v \in Values
     /\ v = publishedValue + 1
     /\ batchState[v] = Idle
     /\ slotState[s] = Writing
     /\ slotEpoch[s] = epoch
-    /\ slotGeneration[s] < MaxGeneration
+    /\ slotGeneration[s] = epoch
     /\ damage \in DamageKinds
     /\ (v = 1 => damage = FullDamage)
     /\ slotState' = [slotState EXCEPT ![s] = Published]
-    /\ slotGeneration' =
-         [slotGeneration EXCEPT ![s] = @ + 1]
     /\ publishedValue' = v
     /\ batchState' = [batchState EXCEPT ![v] = Queued]
     /\ batchSlot' = [batchSlot EXCEPT ![v] = s]
     /\ batchEpoch' = [batchEpoch EXCEPT ![v] = epoch]
     /\ batchGeneration' =
-         [batchGeneration EXCEPT ![v] = slotGeneration[s] + 1]
+         [batchGeneration EXCEPT ![v] = slotGeneration[s]]
     /\ batchDamage' = [batchDamage EXCEPT ![v] = damage]
-    /\ UNCHANGED <<mode, epoch, online, slotEpoch, stagedCopied, gpuFence,
+    /\ UNCHANGED <<backendClass, mode, wireSubmitMode, sourceLayout, epoch, online, slotEpoch, slotGeneration, stagedCopied, gpuFence,
                   presentFence, outputState, outputValue, batchOutput,
                   frontOutput, sourceReadAuthority, sourceWriteAuthority,
                   textureValue, zeroCopyEvidence, cpuComposedAccepted>>
@@ -157,7 +172,7 @@ AcquireBatch(v) ==
     /\ slotState[batchSlot[v]] = Published
     /\ slotGeneration[batchSlot[v]] = batchGeneration[v]
     /\ slotState' = [slotState EXCEPT ![batchSlot[v]] = Acquired]
-    /\ UNCHANGED <<mode, epoch, online, publishedValue, slotEpoch,
+    /\ UNCHANGED <<backendClass, mode, wireSubmitMode, sourceLayout, epoch, online, publishedValue, slotEpoch,
                   slotGeneration, batchState, batchSlot, batchEpoch,
                   batchGeneration, batchDamage, stagedCopied, textureValue,
                   gpuFence, presentFence,
@@ -174,7 +189,7 @@ StageCopy(v) ==
     /\ batchSlot[v] \in Slots
     /\ slotState[batchSlot[v]] = Acquired
     /\ stagedCopied' = [stagedCopied EXCEPT ![v] = TRUE]
-    /\ UNCHANGED <<mode, epoch, online, publishedValue, slotState, slotEpoch,
+    /\ UNCHANGED <<backendClass, mode, wireSubmitMode, sourceLayout, epoch, online, publishedValue, slotState, slotEpoch,
                   slotGeneration, batchState, batchSlot, batchEpoch,
                   batchGeneration, batchDamage, textureValue, gpuFence,
                   presentFence, outputState,
@@ -201,7 +216,7 @@ BeginGpu(v, o) ==
     /\ batchOutput' = [batchOutput EXCEPT ![v] = o]
     /\ textureValue' = v
     /\ sourceReadAuthority' = sourceReadAuthority \cup {batchSlot[v]}
-    /\ UNCHANGED <<mode, epoch, online, publishedValue, slotEpoch,
+    /\ UNCHANGED <<backendClass, mode, wireSubmitMode, sourceLayout, epoch, online, publishedValue, slotEpoch,
                   slotGeneration, batchSlot, batchEpoch, batchGeneration,
                   batchDamage, stagedCopied, gpuFence, presentFence, frontOutput,
                   sourceWriteAuthority, zeroCopyEvidence,
@@ -218,7 +233,7 @@ CompleteGpu(v) ==
     /\ slotState' = [slotState EXCEPT ![batchSlot[v]] = Released]
     /\ gpuFence' = [gpuFence EXCEPT ![v] = TRUE]
     /\ sourceReadAuthority' = sourceReadAuthority \ {batchSlot[v]}
-    /\ UNCHANGED <<mode, epoch, online, publishedValue, slotEpoch,
+    /\ UNCHANGED <<backendClass, mode, wireSubmitMode, sourceLayout, epoch, online, publishedValue, slotEpoch,
                   slotGeneration, batchSlot, batchEpoch, batchGeneration,
                   batchDamage, stagedCopied, textureValue, presentFence,
                   outputState, outputValue,
@@ -232,7 +247,7 @@ ReportZeroCopy(v) ==
     /\ batchState[v] \in {GpuDone, Presented}
     /\ gpuFence[v]
     /\ zeroCopyEvidence' = zeroCopyEvidence \cup {v}
-    /\ UNCHANGED <<mode, epoch, online, publishedValue, slotState, slotEpoch,
+    /\ UNCHANGED <<backendClass, mode, wireSubmitMode, sourceLayout, epoch, online, publishedValue, slotState, slotEpoch,
                   slotGeneration, batchState, batchSlot, batchEpoch,
                   batchGeneration, batchDamage, stagedCopied, textureValue,
                   gpuFence, presentFence,
@@ -259,7 +274,7 @@ Present(v) ==
             ELSE IF o = frontOutput THEN 0
             ELSE outputValue[o]]
        /\ frontOutput' = target
-    /\ UNCHANGED <<mode, epoch, online, publishedValue, slotState, slotEpoch,
+    /\ UNCHANGED <<backendClass, mode, wireSubmitMode, sourceLayout, epoch, online, publishedValue, slotState, slotEpoch,
                   slotGeneration, batchSlot, batchEpoch, batchGeneration,
                   batchDamage, stagedCopied, textureValue, gpuFence,
                   batchOutput, sourceReadAuthority,
@@ -275,7 +290,7 @@ RecycleAtlas(s) ==
          /\ batchGeneration[v] = slotGeneration[s]
          /\ gpuFence[v]
     /\ slotState' = [slotState EXCEPT ![s] = Free]
-    /\ UNCHANGED <<mode, epoch, online, publishedValue, slotEpoch,
+    /\ UNCHANGED <<backendClass, mode, wireSubmitMode, sourceLayout, epoch, online, publishedValue, slotEpoch,
                   slotGeneration, batchState, batchSlot, batchEpoch,
                   batchGeneration, batchDamage, stagedCopied, textureValue,
                   gpuFence, presentFence,
@@ -294,7 +309,7 @@ Revoke ==
     /\ frontOutput' = NoOutput
     /\ sourceReadAuthority' = {}
     /\ sourceWriteAuthority' = {}
-    /\ UNCHANGED <<mode, epoch, publishedValue, slotEpoch, slotGeneration,
+    /\ UNCHANGED <<backendClass, mode, wireSubmitMode, sourceLayout, epoch, publishedValue, slotEpoch, slotGeneration,
                   batchSlot, batchEpoch, batchGeneration, stagedCopied,
                   batchDamage, textureValue, gpuFence, presentFence,
                   batchOutput, zeroCopyEvidence,
@@ -308,6 +323,7 @@ Reset ==
     /\ publishedValue' = 0
     /\ slotState' = [s \in Slots |-> Free]
     /\ slotEpoch' = [s \in Slots |-> 0]
+    /\ slotGeneration' = [s \in Slots |-> epoch + 1]
     /\ batchState' = [v \in Values |-> Idle]
     /\ batchSlot' = [v \in Values |-> NoSlot]
     /\ batchEpoch' = [v \in Values |-> 0]
@@ -325,7 +341,7 @@ Reset ==
     /\ sourceWriteAuthority' = {}
     /\ zeroCopyEvidence' = {}
     /\ cpuComposedAccepted' = FALSE
-    /\ UNCHANGED <<mode, slotGeneration>>
+    /\ UNCHANGED <<backendClass, mode, wireSubmitMode, sourceLayout>>
 
 Stutter == UNCHANGED vars
 
@@ -345,7 +361,10 @@ Next ==
     \/ Stutter
 
 TypeOK ==
+    /\ backendClass \in BackendClasses
     /\ mode \in Modes
+    /\ wireSubmitMode \in Modes
+    /\ sourceLayout = LinearArgb8888
     /\ epoch \in 1..MaxEpoch
     /\ online \in BOOLEAN
     /\ publishedValue \in 0..Cardinality(Values)
@@ -373,6 +392,20 @@ TypeOK ==
     /\ cpuComposedAccepted \in BOOLEAN
 
 FixedTripleAtlas == Cardinality(Slots) = 3
+
+AtlasMappingGenerationIsProviderEpoch ==
+    \A s \in Slots : slotGeneration[s] = epoch
+
+SubmitModeMatchesAuthenticatedPrime == wireSubmitMode = mode
+
+BackendModeIsRegistered ==
+    \/ /\ backendClass = VirtualStaged
+       /\ mode = StagedCopy
+    \/ /\ backendClass = PhysicalDirect
+       /\ mode = DirectDmaBuf
+
+DirectImportUsesExplicitLinearLayout ==
+    mode = DirectDmaBuf => sourceLayout = LinearArgb8888
 
 QueuedNamesPublishedAtlas ==
     \A v \in Values : batchState[v] = Queued =>
@@ -404,11 +437,13 @@ TextureUpdatesAreOrdered ==
         textureValue >= v
 
 GpuFenceReleasesAtlas ==
-    \A v \in Values : batchState[v] \in {GpuDone, Presented} =>
-        /\ gpuFence[v]
-        /\ ((batchSlot[v] \in Slots /\
-             slotGeneration[batchSlot[v]] = batchGeneration[v]) =>
-                batchSlot[v] \notin sourceReadAuthority)
+    /\ \A v \in Values : batchState[v] \in {GpuDone, Presented} => gpuFence[v]
+    /\ \A s \in sourceReadAuthority :
+        \E v \in Values :
+            /\ batchState[v] = Executing
+            /\ batchSlot[v] = s
+            /\ batchEpoch[v] = epoch
+            /\ slotGeneration[s] = batchGeneration[v]
 
 PresentRequiresGpuFence ==
     \A v \in Values : batchState[v] = Presented =>

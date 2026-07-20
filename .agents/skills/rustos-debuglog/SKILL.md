@@ -25,6 +25,7 @@ whole-file reads.
 | Service startup failures | `rg -n 'service.*(failed\|crashed\|exit)' logs/debugcon.log \| tail -n 30` |
 | Stalls / watchdogs | `rg -n 'stall\|timeout\|deadline' logs/debugcon.log \| tail -n 30` |
 | UI / surface issues | `rg -n 'wayclick profile\|uiserver wayland callback profile\|uiserver profile\|display (not available\|unavailable)\|black frame' build/kvm/rustos-debugcon.log \| tail -n 30` |
+| Physical GPU ownership split | `rg -n 'input watchdog\|gpu-compositor (active\|offline)\|physical-gpu-frame\|page-flip\|present-fence' build/kvm/{rustos-debugcon,linux-dvm-serial}.log \| tail -n 30` |
 | IPC / broker round-trips | `rg -n 'BROKER\|ipc\|fast.?path' logs/debugcon.log \| tail -n 30` |
 
 For a slow Wayland client, compare three independent rates before editing:
@@ -41,6 +42,14 @@ narrows it further to the client/server AF_UNIX data plane. High SHM copy time
 instead points to damage/copy amplification. A callback without a matching
 buffer release is a different lifetime bug. Treat a `--min-ui-fps` failure as
 evidence; do not average independent good windows into success.
+
+For a physical display freeze, separate owners before editing. A uiserver input
+watchdog with matched DVM GPU/page-flip/present fences and no compositor-offline
+record is a userspace readiness failure, not GPU/KMS loss. Rapid visual flicker
+with advancing matched fences can instead be stale multi-slot atlas content.
+The latest operator-observed physical rerun did not reproduce either symptom;
+see `docs/ai/physical-gpu-status.md`. Do not request another FPS run merely to
+diagnose the still-open generic wait-set ABI.
 
 ## Reporting
 

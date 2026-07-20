@@ -61,6 +61,7 @@ fn validate_dvm_gpu_contract(config: &Config) -> Result<()> {
     let module_path = source_root.join("rustos_dvm_ivshmem_uio.c");
     let runtime_path = source_root.join("rustos-dvm-gpu-runtime.c");
     let runtime_header_path = source_root.join("rustos-dvm-gpu-runtime.h");
+    let backend_header_path = source_root.join("rustos-dvm-gpu-backends.h");
     let relay = fs::read_to_string(&relay_path)
         .with_context(|| format!("read DVM GPU relay contract {}", relay_path.display()))?;
     let agent = fs::read_to_string(&agent_path)
@@ -69,6 +70,12 @@ fn validate_dvm_gpu_contract(config: &Config) -> Result<()> {
         .with_context(|| format!("read DVM GPU module contract {}", module_path.display()))?;
     let probe = fs::read_to_string(&probe_path)
         .with_context(|| format!("read DVM GPU proof contract {}", probe_path.display()))?;
+    let backend_header = fs::read_to_string(&backend_header_path).with_context(|| {
+        format!(
+            "read DVM GPU backend registry {}",
+            backend_header_path.display()
+        )
+    })?;
     let runtime = fs::read_to_string(&runtime_path)
         .with_context(|| format!("read DVM GPU runtime contract {}", runtime_path.display()))?;
     let runtime_header = fs::read_to_string(&runtime_header_path).with_context(|| {
@@ -99,6 +106,59 @@ fn validate_dvm_gpu_contract(config: &Config) -> Result<()> {
         &module_path,
         &format!("#define RUSTOS_GPU_ATLAS_VERSION {version}"),
     )?;
+    let prime_version = driver_domain_protocol::DVM_GPU_PRIME_COMPLETION_VERSION;
+    require_contract_token(
+        &relay,
+        &relay_path,
+        &format!("#define GPU_PRIME_COMPLETION_VERSION {prime_version}U"),
+    )?;
+    require_contract_token(
+        &module,
+        &module_path,
+        &format!("#define RUSTOS_GPU_PRIME_COMPLETION_VERSION {prime_version}"),
+    )?;
+    for (relay_name, module_name, value) in [
+        (
+            "GPU_ATLAS_SUBMIT_FLAG_STAGED_COPY",
+            "RUSTOS_GPU_ATLAS_SUBMIT_FLAG_STAGED_COPY",
+            driver_domain_protocol::DVM_GPU_ATLAS_SUBMIT_FLAG_STAGED_COPY,
+        ),
+        (
+            "GPU_ATLAS_SUBMIT_FLAG_DIRECT_DMABUF",
+            "RUSTOS_GPU_ATLAS_SUBMIT_FLAG_DIRECT_DMABUF",
+            driver_domain_protocol::DVM_GPU_ATLAS_SUBMIT_FLAG_DIRECT_DMABUF,
+        ),
+    ] {
+        require_contract_token(
+            &relay,
+            &relay_path,
+            &format!("#define {relay_name} {value}U"),
+        )?;
+        require_contract_token(
+            &module,
+            &module_path,
+            &format!("#define {module_name} {value}"),
+        )?;
+    }
+    for token in [
+        "{\"virtio_gpu\", RUSTOS_GPU_BACKEND_VIRTUAL_STAGED,",
+        "{\"amdgpu\", RUSTOS_GPU_BACKEND_PHYSICAL_DIRECT,",
+        "#define RUSTOS_GPU_SOURCE_STAGED_COPY 1U",
+        "#define RUSTOS_GPU_SOURCE_DIRECT_DMABUF 2U",
+    ] {
+        require_contract_token(&backend_header, &backend_header_path, token)?;
+    }
+    for token in [
+        "#define GPU_PRIME_EVIDENCE_MAX_BYTES 1024U",
+        "#define GPU_EVIDENCE_MAX_BYTES 2048U",
+        "char evidence[GPU_PRIME_EVIDENCE_MAX_BYTES];",
+        "char evidence[GPU_EVIDENCE_MAX_BYTES];",
+    ] {
+        require_contract_token(&probe, &probe_path, token)?;
+    }
+    for (source, path) in [(&relay, &relay_path), (&probe, &probe_path)] {
+        require_contract_token(source, path, "#include \"rustos-dvm-gpu-backends.h\"")?;
+    }
     for (name, magic) in [
         (
             "GPU_RENDER_COMPLETION_MAGIC",
@@ -212,7 +272,12 @@ fn validate_dvm_gpu_contract(config: &Config) -> Result<()> {
     require_contract_token(
         &runtime,
         &runtime_path,
-        "generation <= runtime->last_generation ||",
+        "(runtime->atlas_generation != 0U && generation != runtime->atlas_generation) ||",
+    )?;
+    require_contract_token(
+        &runtime,
+        &runtime_path,
+        "runtime->atlas_generation = generation;",
     )?;
     require_contract_token(
         &runtime,

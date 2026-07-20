@@ -207,8 +207,41 @@ Initialization or first-frame timeout is terminal, and malformed layers never
 hide behind the transient retained-scene wait.
 In QEMU, changed atlas rectangles take one explicit staged upload into the
 virtio-GPU texture and evidence is labelled `source-path=staged-copy
-zero-copy=0`. On physical AMD, the same logical source is a read-only DMA-BUF
-import. The kernel validates the exact live source generation and acquire value,
+zero-copy=0`. On a registered physical backend, the same logical source is a read-only DMA-BUF
+import. Prime-completion ABI v2 authenticates that selected source mode before
+the host can publish a frame; every submit record must carry the same single
+mode for the life of that context. The sealed backend registry currently admits
+only `virtio_gpu` with staged copy and `amdgpu` with direct DMA-BUF. The shared
+`rustos-dvm-gpu-backends.h` registry is consumed by both the proof executor and
+display relay, and evidence names the exact `backend-class` plus
+`certification=registered`; the KVM gate checks those fields against the
+selected host profile instead of assuming virgl-on-AMD. Multiple eligible
+render nodes are rejected as ambiguous rather than silently picking one. Render,
+import, fence, and KMS mechanisms are driver-neutral; a later physical driver
+requires a separately reviewed registry entry and hardware evidence, never an
+optimistic fallback. The current DMA-BUF contract is deliberately one-plane
+ARGB8888 with an explicit `DRM_FORMAT_MOD_LINEAR` modifier and requires EGL
+modifier import support. Supporting another layout requires a new versioned
+format/plane/modifier descriptor and producer/consumer intersection rather than
+driver-name inference.
+Prime and steady-state evidence use separate checked 1024-byte and 2048-byte
+serialization bounds. Overflow is terminal and removes both evidence files;
+the KVM runner reports that publication failure immediately rather than
+converting it into a generic readiness timeout.
+
+This follows the common commercial split: buffer allocation and usage are
+negotiated separately from the rendering API, the exported buffer is opaque,
+and acquire/release fences carry ownership between producer, GPU, and display.
+Linux DRM validates format/modifier pairs and atomic plane state; Android's
+gralloc/BufferQueue/HWC split likewise negotiates usage and returns completion
+fences; virtio-GPU uses its own negotiated resource/blob features instead of
+being mislabeled as native DMA-BUF zero copy.
+
+The kernel validates the exact live source mapping generation and acquire
+value. That mapping generation remains fixed for the three imported atlas slots
+during one provider/context epoch; each publication instead advances sequence
+and content epoch. The relay rejects an in-epoch mapping-generation change
+without mistaking normal slot rotation or reuse for a DMA-BUF rebind. It
 materializes the completed CPU release as a non-replayable `sync_file`, and EGL
 server-waits it before GLES sampling. The display adapter owns the complete
 fixed pixel aperture as one `MEMORY_DEVICE_GENERIC` `dev_pagemap`; every export
@@ -252,6 +285,10 @@ cannot be followed by a GPU burst. This keeps a small margin above the 60 FPS
 gate without the previously observed 90-100 FPS saturation.
 
 References: [Linux DMA-BUF buffer exchange](https://docs.kernel.org/userspace-api/dma-buf-alloc-exchange.html),
+[Linux DMA-BUF sharing and synchronization](https://docs.kernel.org/driver-api/dma-buf.html),
+[Linux atomic KMS](https://docs.kernel.org/gpu/drm-kms.html),
+[virtio-GPU](https://docs.oasis-open.org/virtio/virtio/v1.3/virtio-v1.3.html),
+[Android BufferQueue/gralloc](https://source.android.com/docs/core/graphics/arch-bq-gralloc),
 [Wayland `wl_shm` buffer stride](https://wayland.freedesktop.org/docs/html/apa.html),
 [Linux DRM/KMS userspace API](https://docs.kernel.org/gpu/drm-uapi.html),
 [Khronos EGL native-fence contract](https://registry.khronos.org/EGL/extensions/ANDROID/EGL_ANDROID_native_fence_sync.txt),
@@ -315,8 +352,10 @@ not a host-primary-GPU or boot-disk profile. Manifest schema 8 exposes the
 exact NVIDIA release digest, non-redistribution status, and admitted KMS module
 set in addition to binding the complete source lock and the certificate for
 the kernel-enforced signed-module policy. Release images must pin the kernel,
-module set, firmware bundle, signed module admission policy, and source/SBOM
-manifest for each supported hardware profile.
+module set, firmware bundle, signed module admission policy, and source/artifact
+manifest for each supported hardware profile. Schema 8 currently provides the
+locked source/artifact manifest only; it does not claim a CycloneDX SBOM or
+Buildroot `legal-info` bundle.
 
 The build wrapper treats cache ownership as part of that profile contract.
 Buildroot/toolchain identity is the only ordinary full-output lane; Linux

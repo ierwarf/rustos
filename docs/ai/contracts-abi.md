@@ -194,8 +194,11 @@ explicit device/context error invalidates the epoch.
 The only commands are clear, solid quad, and textured quad with bounded
 fixed-point depth/rotation/tilt/perspective parameters. A batch cannot contain a
 shader, GPU virtual address, DMA-BUF fd, arbitrary command-buffer byte, or
-peer-selected queue. The atlas token binds one exact physical slot, generation,
-geometry, stride, and content epoch. A batch that binds a second source, uses a
+peer-selected queue. The atlas token binds one exact physical slot, mapping
+generation, geometry, stride, and content epoch. Mapping generation is fixed
+across all three imported slots for one provider/context epoch; slot rotation
+and reuse advance sequence and content epoch without pretending to rebind the
+DMA-BUF. A batch that binds a second source, uses a
 slot outside `0..2`, names an empty/out-of-atlas subrectangle, or rebinds a token
 is a protocol error. RustOS owns the context id, epoch, monotonic
 acquire/submit/completion/release values, queue admission, and reset.
@@ -226,7 +229,14 @@ implements `source-path=staged-copy zero-copy=0`: only damaged atlas rectangles
 are copied once into a virtio-GPU texture, after which the fixed GLES commands
 perform the actual composition into a DVM-private output. This is a valid
 GPU-composition test but can never satisfy the physical zero-copy gate. The
-physical AMD `source-path=dmabuf zero-copy=1` implementation opens the root-only
+v2 prime-completion record authenticates exactly one of those modes before the
+host exposes GPU readiness. RustOS caches the selected mode for the context and
+must stamp that same single value into every submit; zero, unknown, ambiguous,
+legacy-v1, or cross-mode records fail closed. The private `DisplayGpuInfo`
+reports the selected backend mode to uiserver, but application Wayland clients
+still receive no GPU command or DMA-BUF ABI.
+
+The physical `source-path=dmabuf zero-copy=1` implementation opens the root-only
 exporter, imports all three immutable atlas slots as EGLImages, samples them
 read-only in the same fixed GLES vocabulary only after the exact kernel-issued
 acquire `sync_file` has been server-waited, emits a native GPU completion fence,
@@ -240,6 +250,13 @@ CPU-composed-frame renderer remain retired. Direct scanout without composition
 is only a possible later optimization for one opaque, untransformed full-screen
 source; it is not claimed by evidence-v2 or required for ordinary multi-layer
 frames.
+The source descriptor is currently fixed to one-plane ARGB8888, provider-owned
+stride, and explicit `DRM_FORMAT_MOD_LINEAR`; the direct path requires EGL
+modifier-import support. The sealed backend registry certifies only
+`virtio_gpu` staged-copy and `amdgpu` direct-DMA-BUF today. The executor itself
+contains no vendor-specific render/import branch. Enabling a later physical GPU
+requires a new registry entry, supply/evidence gates, and a versioned descriptor
+extension if its producer/consumer format-modifier intersection differs.
 The DVM relay-to-agent readiness lock is mode-exact. Virtio fallback retains
 schema 2 with `MODE=gpu-compositor-staged-copy`, `ZERO_COPY=0`,
 `GPU_COMPOSITION=1`, and `EXPLICIT_FENCE=1`. An amdgpu-bound agent instead
@@ -482,18 +499,29 @@ policy remains with the owning service.
   inputd cannot freeze the UI poll loop behind the generic service timeout; a
   retry sees either unchanged ingress or the already-transferred policy record.
   The endpoint server still blocks in `SYS_RUSTOS_IPC_RECV` while idle.
-- Finite RustOS-native input polls may use readiness-then-read safely:
+- Finite RustOS-native input polls and uiserver use readiness-then-read safely:
   `INPUTD_IPC_OP_STATS` and `INPUTD_IPC_OP_READ` both refresh ingress before
   observing policy state, and the finite poll loop rechecks service policy on
-  each timer tick. The latency-sensitive uiserver path uses its already
-  nonblocking native input fd directly from a dedicated reader thread on a
-  cumulative 4 ms cadence; missed slots never accumulate burst credit. This
-  bounds the current pre-ABI service-queue wake gap without moving input policy
-  or transport-consumer authority out of inputd. A service-owned readiness
+  each timer tick. The latency-sensitive uiserver reader performs a zero-time
+  poll, whose non-consuming `STATS` request has the 16 ms IPC bound above,
+  before entering the stateful authorized `READ`; it never starts that generic
+  30-second service transaction merely to discover an empty queue. The reader
+  retains its cumulative 4 ms cadence, so missed slots never accumulate burst
+  credit. This bounds the current pre-ABI service-queue wake gap without moving
+  input policy or transport-consumer authority out of inputd. A service-owned readiness
   object is still required before generic indefinite input poll/epoll can be a
   passed commercial userspace-ABI gate: the MSI-X worker may otherwise move the
   last ring0-visible record into inputd policy between a STATS probe and waiter
   registration.
+- That input object is one provider of the broader cross-service wait-set ABI.
+  Today `epoll_wait` makes one vfsd query without implementing its timeout, and
+  uiserver cannot atomically wait on its changing Wayland client-fd set together
+  with input and runtime deadlines. The common ABI must carry capability-bound
+  subscriptions and readiness generations with atomic check-arm-recheck,
+  cancellation, close/dup/fork/exec lifetime, peer-close/error, restart/revoke,
+  and bounded backpressure semantics. Ring0 retains token validation and wake
+  substrate but never inspects a service-private queue. See
+  `physical-gpu-status.md` for the current implementation/evidence boundary.
 - KVM latency evidence records input arrival at uiserver queue consumption,
   before a GPU backpressure retry may leave the turn. The previous end-of-turn
   sample counted consumed input and cursor motion but skipped their timestamp
