@@ -12,6 +12,10 @@ mod service_ops;
 mod support;
 mod syscalld_ops;
 
+pub(crate) fn service_deferred_transfer_releases() -> usize {
+    ipc_ops::service_deferred_transfer_releases()
+}
+
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::convert::TryFrom;
@@ -31,13 +35,13 @@ use syscalld_ops::*;
 
 use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_SESSIOND,
-    COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_READ, COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_WRITE,
-    COMMERCIAL_MAX_SESSIOND_OP_CONSOLE_ROUTE, COMMERCIAL_MAX_SESSIOND_OP_TTY_LINE_DISCIPLINE,
-    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, DevmgrdDeviceIoctlRequest,
-    DevmgrdDeviceIoctlResponse, DevmgrdDeviceOpenRequest, DevmgrdDeviceOpenResponse,
-    INPUT_STATS_FLAG_PENDING_COALESCED, INPUT_STATS_FLAG_PENDING_POINTER_POSITION,
-    INPUTD_ACCESS_EVDEV, INPUTD_ACCESS_NATIVE, INPUTD_IPC_ABI_VERSION,
-    INPUTD_IPC_OP_AUTHORIZE_READ, INPUTD_IPC_OP_READ, INPUTD_IPC_OP_STATS,
+    COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_READ, COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_READINESS,
+    COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_WRITE, COMMERCIAL_MAX_SESSIOND_OP_CONSOLE_ROUTE,
+    COMMERCIAL_MAX_SESSIOND_OP_TTY_LINE_DISCIPLINE, CommercialMaxProtocolRequest,
+    CommercialMaxProtocolResponse, DevmgrdDeviceIoctlRequest, DevmgrdDeviceIoctlResponse,
+    DevmgrdDeviceOpenRequest, DevmgrdDeviceOpenResponse, INPUT_STATS_FLAG_PENDING_COALESCED,
+    INPUT_STATS_FLAG_PENDING_POINTER_POSITION, INPUTD_ACCESS_EVDEV, INPUTD_ACCESS_NATIVE,
+    INPUTD_IPC_ABI_VERSION, INPUTD_IPC_OP_AUTHORIZE_READ, INPUTD_IPC_OP_READ, INPUTD_IPC_OP_STATS,
     INPUTD_READ_FLAG_NONBLOCK, INPUTD_READ_PAYLOAD_CAPACITY, IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY,
     IPC_SERVICE_DEVMGRD, IPC_SERVICE_INPUTD, IPC_SERVICE_NETD, IPC_SERVICE_PROCD,
     IPC_SERVICE_SESSIOND, IPC_SERVICE_VFSD, IPC_WAIT_SERVICE_ENDPOINT_ABI_VERSION,
@@ -48,17 +52,19 @@ use rustos_user_abi::syscall::{
     LinuxSigActionWire, LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse, LinuxTimespecWire,
     NETD_IPC_ABI_VERSION, NETD_IPC_PAYLOAD_CAPACITY, NETD_IPC_REQUEST_HEADER_SIZE,
     NETD_IPC_RESPONSE_FLAG_LATENCY_HANDOFF, NETD_IPC_RESPONSE_HEADER_SIZE, NETD_POLL_MODE_QUERY,
-    NETD_POLL_MODE_WAIT, NETD_RECVMSG_PAYLOAD_HEADER_SIZE, NETD_SENDMSG_PAYLOAD_HEADER_SIZE,
-    NetdIpcRequest, NetdIpcResponse, PROCD_OP_EXECVE, PROCD_OP_EXECVEAT, PROCD_OP_FORK,
-    PROCD_OP_RT_SIGACTION, PROCD_OP_RT_SIGPROCMASK, PROCD_OP_SELECT_SIGNAL, PROCD_OP_WAIT4,
-    PROCD_PATH_CAPACITY, PROCD_SELECT_SIGNAL_HANDLER, PROCD_SELECT_SIGNAL_IGNORE,
-    PROCD_SELECT_SIGNAL_NONE, PROCD_SELECT_SIGNAL_TERMINATE, ProcdIpcRequest, ProcdIpcResponse,
-    RustosIpcWaitServiceEndpointArgs, RustosUserRegisters, SYS_RUSTOS_PROC_ACTIVATE_BROKER,
-    SYS_RUSTOS_PROC_CANCEL_EXEC_BROKER, SYS_RUSTOS_PROC_SET_WINDOWS_RUNTIME_BROKER,
-    SYS_RUSTOS_SCHED_DEMOTE_SELF, SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_LINUX_ACCEPT,
-    SYSCALL_OFFLOAD_OP_LINUX_BIND, SYSCALL_OFFLOAD_OP_LINUX_BRK,
-    SYSCALL_OFFLOAD_OP_LINUX_CLOCK_GETTIME, SYSCALL_OFFLOAD_OP_LINUX_CLOCK_NANOSLEEP,
-    SYSCALL_OFFLOAD_OP_LINUX_CLOSE, SYSCALL_OFFLOAD_OP_LINUX_CONNECT, SYSCALL_OFFLOAD_OP_LINUX_DUP,
+    NETD_RECVMSG_PAYLOAD_HEADER_SIZE, NETD_SENDMSG_PAYLOAD_HEADER_SIZE, NetdIpcRequest,
+    NetdIpcResponse, PROCD_OP_EXECVE, PROCD_OP_EXECVEAT, PROCD_OP_FORK, PROCD_OP_RT_SIGACTION,
+    PROCD_OP_RT_SIGPROCMASK, PROCD_OP_SELECT_SIGNAL, PROCD_OP_WAIT4, PROCD_PATH_CAPACITY,
+    PROCD_SELECT_SIGNAL_HANDLER, PROCD_SELECT_SIGNAL_IGNORE, PROCD_SELECT_SIGNAL_NONE,
+    PROCD_SELECT_SIGNAL_TERMINATE, ProcdIpcRequest, ProcdIpcResponse,
+    RustosIpcWaitServiceEndpointArgs, RustosUserRegisters, SESSIOND_CONSOLE_READINESS_LIVE,
+    SESSIOND_CONSOLE_READINESS_MASK, SESSIOND_CONSOLE_READINESS_READY,
+    SYS_RUSTOS_PROC_ACTIVATE_BROKER, SYS_RUSTOS_PROC_CANCEL_EXEC_BROKER,
+    SYS_RUSTOS_PROC_SET_WINDOWS_RUNTIME_BROKER, SYS_RUSTOS_SCHED_DEMOTE_SELF,
+    SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_LINUX_ACCEPT, SYSCALL_OFFLOAD_OP_LINUX_BIND,
+    SYSCALL_OFFLOAD_OP_LINUX_BRK, SYSCALL_OFFLOAD_OP_LINUX_CLOCK_GETTIME,
+    SYSCALL_OFFLOAD_OP_LINUX_CLOCK_NANOSLEEP, SYSCALL_OFFLOAD_OP_LINUX_CLOSE,
+    SYSCALL_OFFLOAD_OP_LINUX_CONNECT, SYSCALL_OFFLOAD_OP_LINUX_DUP,
     SYSCALL_OFFLOAD_OP_LINUX_GET_ROBUST_LIST, SYSCALL_OFFLOAD_OP_LINUX_GETEGID,
     SYSCALL_OFFLOAD_OP_LINUX_GETEUID, SYSCALL_OFFLOAD_OP_LINUX_GETGID,
     SYSCALL_OFFLOAD_OP_LINUX_GETPEERNAME, SYSCALL_OFFLOAD_OP_LINUX_GETPGID,
@@ -86,7 +92,11 @@ use rustos_user_abi::syscall::{
     VFS_IPC_OP_READ, VFS_IPC_OP_READLINKAT, VFS_IPC_OP_STATX, VFS_IPC_OP_UMOUNT2,
     VFS_IPC_OP_UNLINKAT, VFS_IPC_OP_WRITE, VFS_IPC_PATH_CAPACITY, VFS_IPC_PAYLOAD_CAPACITY,
     VFS_IPC_REQUEST_PAYLOAD_CAPACITY, VFS_POLL_QUERY_EPOLL_CREATE, VFS_POLL_QUERY_EPOLL_CTL,
-    VFS_POLL_QUERY_EPOLL_WAIT, VFS_POLL_QUERY_POLL, VfsIpcRequest, VfsIpcResponse,
+    VFS_POLL_QUERY_EPOLL_PURGE_OBJECT, VFS_POLL_QUERY_EPOLL_REF, VFS_POLL_QUERY_EPOLL_SNAPSHOT,
+    VFS_POLL_QUERY_EPOLL_UNREF, VFS_POLL_QUERY_POLL, VfsIpcRequest, VfsIpcResponse,
+    WAITSET_ABI_VERSION, WAITSET_GLOBAL_OBJECT_ID, WAITSET_MAX_INTERESTS, WAITSET_PROVIDER_INPUTD,
+    WAITSET_PROVIDER_MAX, WAITSET_PROVIDER_NETD, WAITSET_PROVIDER_SESSIOND, WAITSET_PROVIDER_VFSD,
+    WaitSetInterestWire,
 };
 
 use super::SyscallFrame;
@@ -98,6 +108,7 @@ use crate::user::sysops::usermem;
 
 const LINUX_EPERM: i64 = 1;
 const LINUX_E2BIG: i64 = 7;
+const LINUX_EEXIST: i64 = 17;
 const LINUX_ENOEXEC: i64 = 8;
 const LINUX_EINTR: i64 = 4;
 const LINUX_EIO: i64 = 5;
@@ -229,13 +240,20 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
         linux_abi::SYS_FTRUNCATE => syscall_linux_vfs_ftruncate(frame.rdi, frame.rsi),
         linux_abi::SYS_FSTAT => syscall_linux_vfs_fstat(frame.rdi, frame.rsi),
         linux_abi::SYS_POLL => syscall_linux_poll(frame.rdi, frame.rsi, frame.rdx as i64),
-        linux_abi::SYS_PPOLL => syscall_linux_ppoll(frame.rdi, frame.rsi, frame.rdx, frame.r10),
+        linux_abi::SYS_PPOLL => {
+            syscall_linux_ppoll(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8)
+        }
         linux_abi::SYS_EPOLL_WAIT => {
             syscall_linux_epoll_wait(frame.rdi, frame.rsi, frame.rdx, frame.r10 as i64)
         }
-        linux_abi::SYS_EPOLL_PWAIT => {
-            syscall_linux_epoll_wait(frame.rdi, frame.rsi, frame.rdx, frame.r10 as i64)
-        }
+        linux_abi::SYS_EPOLL_PWAIT => syscall_linux_epoll_pwait(
+            frame.rdi,
+            frame.rsi,
+            frame.rdx,
+            frame.r10 as i64,
+            frame.r8,
+            frame.r9,
+        ),
         linux_abi::SYS_EPOLL_CTL => {
             syscall_linux_epoll_ctl(frame.rdi, frame.rsi, frame.rdx, frame.r10)
         }
@@ -494,7 +512,10 @@ fn syscall_process_exit(status: u64, exit_group: bool) -> u64 {
 }
 
 pub(crate) fn record_linux_process_termination(process_id: u64, wait_status: i32) {
-    let _ = multitask::mark_user_process_exiting(process_id);
+    if multitask::mark_user_process_exiting_once(process_id) != Some(true) {
+        return;
+    }
+    release_all_service_handle_refs(process_id);
     ipc_ops::cleanup_service_endpoints_for_process(process_id);
     cleanup_proc_broker_state_for_process(process_id);
     let _ = multitask::note_process_exit_status(process_id, wait_status);

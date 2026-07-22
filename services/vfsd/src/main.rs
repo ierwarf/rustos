@@ -18,28 +18,35 @@ use rustos_user_abi::linux as linux_abi;
 use rustos_user_abi::syscall::{
     CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
     CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, VfsIpcRequest, VfsIpcResponse,
-    COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS,
-    COMMERCIAL_MAX_PROTOCOL_VFSD, COMMERCIAL_MAX_VFSD_OP_DIRECTORY_CURSOR,
-    COMMERCIAL_MAX_VFSD_OP_FD_TABLE_PLAN, COMMERCIAL_MAX_VFSD_OP_FILE_CURSOR,
-    COMMERCIAL_MAX_VFSD_OP_METADATA_POLICY, COMMERCIAL_MAX_VFSD_OP_MOUNT_GRAPH,
-    COMMERCIAL_MAX_VFSD_OP_PATH_RESOLVE, IPC_SERVICE_VFSD, LINUX_STATX_SIZE, LINUX_STAT_SIZE,
-    SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_LINUX_ACCESS, SYSCALL_OFFLOAD_OP_LINUX_CHDIR,
+    WaitSetInterestWire, WaitSetSignalBrokerArgs, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
+    COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS, COMMERCIAL_MAX_PROTOCOL_VFSD,
+    COMMERCIAL_MAX_VFSD_OP_DIRECTORY_CURSOR, COMMERCIAL_MAX_VFSD_OP_FD_TABLE_PLAN,
+    COMMERCIAL_MAX_VFSD_OP_FILE_CURSOR, COMMERCIAL_MAX_VFSD_OP_METADATA_POLICY,
+    COMMERCIAL_MAX_VFSD_OP_MOUNT_GRAPH, COMMERCIAL_MAX_VFSD_OP_PATH_RESOLVE, IPC_SERVICE_VFSD,
+    LINUX_STATX_SIZE, LINUX_STAT_SIZE, SYSCALL_OFFLOAD_ABI_VERSION,
+    SYSCALL_OFFLOAD_OP_LINUX_ACCESS, SYSCALL_OFFLOAD_OP_LINUX_CHDIR,
     SYSCALL_OFFLOAD_OP_LINUX_CLOSE, SYSCALL_OFFLOAD_OP_LINUX_DUP, SYSCALL_OFFLOAD_OP_LINUX_FCNTL,
     SYSCALL_OFFLOAD_OP_LINUX_GETCWD, SYSCALL_OFFLOAD_OP_LINUX_GETDENTS64,
     SYSCALL_OFFLOAD_OP_LINUX_MKDIR, SYSCALL_OFFLOAD_OP_LINUX_MOUNT,
     SYSCALL_OFFLOAD_OP_LINUX_NEWFSTATAT, SYSCALL_OFFLOAD_OP_LINUX_OPENAT,
     SYSCALL_OFFLOAD_OP_LINUX_READLINKAT, SYSCALL_OFFLOAD_OP_LINUX_STATX,
-    SYSCALL_OFFLOAD_OP_LINUX_UMOUNT2, SYSCALL_OFFLOAD_OP_LINUX_UNLINKAT, VFS_IPC_ABI_VERSION,
-    VFS_IPC_OP_ACCESS, VFS_IPC_OP_CHDIR, VFS_IPC_OP_CLOSE, VFS_IPC_OP_DUP, VFS_IPC_OP_FCNTL,
-    VFS_IPC_OP_FSTAT, VFS_IPC_OP_FTRUNCATE, VFS_IPC_OP_GETCWD, VFS_IPC_OP_GETDENTS64,
-    VFS_IPC_OP_LSEEK, VFS_IPC_OP_MKDIR, VFS_IPC_OP_MOUNT, VFS_IPC_OP_NEWFSTATAT, VFS_IPC_OP_OPENAT,
-    VFS_IPC_OP_POLL_QUERY, VFS_IPC_OP_PREAD64, VFS_IPC_OP_READ, VFS_IPC_OP_READLINKAT,
-    VFS_IPC_OP_STATX, VFS_IPC_OP_UMOUNT2, VFS_IPC_OP_UNLINKAT, VFS_IPC_OP_WRITE,
-    VFS_IPC_PATH_CAPACITY, VFS_IPC_PAYLOAD_CAPACITY, VFS_POLL_QUERY_EPOLL_CREATE,
-    VFS_POLL_QUERY_EPOLL_CTL, VFS_POLL_QUERY_EPOLL_WAIT, VFS_POLL_QUERY_POLL,
+    SYSCALL_OFFLOAD_OP_LINUX_UMOUNT2, SYSCALL_OFFLOAD_OP_LINUX_UNLINKAT,
+    SYS_RUSTOS_WAITSET_SIGNAL_BROKER, VFS_IPC_ABI_VERSION, VFS_IPC_OP_ACCESS, VFS_IPC_OP_CHDIR,
+    VFS_IPC_OP_CLOSE, VFS_IPC_OP_DUP, VFS_IPC_OP_FCNTL, VFS_IPC_OP_FSTAT, VFS_IPC_OP_FTRUNCATE,
+    VFS_IPC_OP_GETCWD, VFS_IPC_OP_GETDENTS64, VFS_IPC_OP_LSEEK, VFS_IPC_OP_MKDIR, VFS_IPC_OP_MOUNT,
+    VFS_IPC_OP_NEWFSTATAT, VFS_IPC_OP_OPENAT, VFS_IPC_OP_POLL_QUERY, VFS_IPC_OP_PREAD64,
+    VFS_IPC_OP_READ, VFS_IPC_OP_READLINKAT, VFS_IPC_OP_STATX, VFS_IPC_OP_UMOUNT2,
+    VFS_IPC_OP_UNLINKAT, VFS_IPC_OP_WRITE, VFS_IPC_PATH_CAPACITY, VFS_IPC_PAYLOAD_CAPACITY,
+    VFS_POLL_QUERY_EPOLL_CREATE, VFS_POLL_QUERY_EPOLL_CTL, VFS_POLL_QUERY_EPOLL_PURGE_OBJECT,
+    VFS_POLL_QUERY_EPOLL_REF, VFS_POLL_QUERY_EPOLL_SNAPSHOT, VFS_POLL_QUERY_EPOLL_UNREF,
+    VFS_POLL_QUERY_POLL, WAITSET_ABI_VERSION, WAITSET_GLOBAL_OBJECT_ID, WAITSET_MAX_INTERESTS,
+    WAITSET_PROVIDER_VFSD,
 };
 use storage_fat::{FatDirEntry, FatDisk, FatNodeKind, FatVolume};
-use vfsd::{mkdir_policy, persistent_mutation_status, unlink_policy};
+use vfsd::{
+    mkdir_policy, persistent_mutation_status, unlink_policy, WaitSetInterestKey,
+    WaitSetInterestRecord, WaitSetRegistry, WaitSetRegistryError,
+};
 
 mod block;
 mod devmgrd;
@@ -68,7 +75,9 @@ pub(crate) const ENODEV: i32 = 19;
 pub(crate) const ENOTDIR: i32 = 20;
 pub(crate) const EISDIR: i32 = 21;
 pub(crate) const EINVAL: i32 = 22;
+pub(crate) const ENOSPC: i32 = 28;
 pub(crate) const EROFS: i32 = 30;
+pub(crate) const EOVERFLOW: i32 = 75;
 
 const fn max_usize(a: usize, b: usize) -> usize {
     if a > b {
@@ -267,7 +276,8 @@ struct VfsState {
     /// re-reads `/`, `/dev`, library directories, etc.; FAT traversal per call
     /// is expensive enough to dominate boot time when libc walks PATH.
     dir_entries_cache: BTreeMap<String, Vec<DirEntry>>,
-    epolls: BTreeMap<u64, EpollState>,
+    epolls: WaitSetRegistry,
+    readiness_generation: u64,
     next_handle: u64,
     mount_generation: u64,
     cache_generation: u64,
@@ -281,17 +291,6 @@ struct RemoteHandle {
     len: u64,
     refs: u64,
     status_flags: u64,
-}
-
-#[derive(Clone)]
-struct EpollInterest {
-    events: u32,
-    data: u64,
-}
-
-#[derive(Clone)]
-struct EpollState {
-    interests: BTreeMap<u64, EpollInterest>,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -316,7 +315,8 @@ impl VfsState {
             handles: BTreeMap::new(),
             metadata_cache: BTreeMap::new(),
             dir_entries_cache: BTreeMap::new(),
-            epolls: BTreeMap::new(),
+            epolls: WaitSetRegistry::default(),
+            readiness_generation: 1,
             next_handle: 1,
             mount_generation: 1,
             cache_generation: 1,
@@ -471,16 +471,41 @@ impl VfsState {
     }
 
     fn vfs_poll_query(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
+        let mut mutated = false;
         match request.arg0 {
             VFS_POLL_QUERY_POLL => self.vfs_poll_once(request, response),
-            VFS_POLL_QUERY_EPOLL_CREATE => {
-                self.epolls.entry(request.remote_id).or_insert(EpollState {
-                    interests: BTreeMap::new(),
-                });
+            VFS_POLL_QUERY_EPOLL_CREATE => match self.epolls.create(request.remote_id) {
+                Ok(()) => mutated = true,
+                Err(err) => response.status = waitset_registry_status(err),
+            },
+            VFS_POLL_QUERY_EPOLL_CTL => {
+                self.vfs_epoll_ctl(request, response);
+                mutated = response.status == 0;
             }
-            VFS_POLL_QUERY_EPOLL_CTL => self.vfs_epoll_ctl(request, response),
-            VFS_POLL_QUERY_EPOLL_WAIT => self.vfs_epoll_wait(request, response),
+            VFS_POLL_QUERY_EPOLL_SNAPSHOT => self.vfs_epoll_snapshot(request, response),
+            VFS_POLL_QUERY_EPOLL_REF => match self.epolls.acquire(request.remote_id) {
+                Ok(()) => mutated = true,
+                Err(err) => response.status = waitset_registry_status(err),
+            },
+            VFS_POLL_QUERY_EPOLL_UNREF => match self.epolls.release(request.remote_id) {
+                Ok(()) => mutated = true,
+                Err(err) => response.status = waitset_registry_status(err),
+            },
+            VFS_POLL_QUERY_EPOLL_PURGE_OBJECT => {
+                let Ok(provider) = u16::try_from(request.arg1) else {
+                    response.status = EINVAL;
+                    return;
+                };
+                if provider == 0 || request.arg2 == 0 {
+                    response.status = EINVAL;
+                    return;
+                }
+                mutated = self.epolls.purge(provider, request.arg2);
+            }
             _ => response.status = EINVAL,
+        }
+        if mutated {
+            self.advance_readiness_generation();
         }
     }
 
@@ -514,66 +539,90 @@ impl VfsState {
     }
 
     fn vfs_epoll_ctl(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
-        let Some(epoll) = self.epolls.get_mut(&request.remote_id) else {
+        let Some(interest) = epoll_interest_from_request(request) else {
             response.status = EINVAL;
             return;
         };
-        match request.arg1 {
-            linux_abi::EPOLL_CTL_ADD => {
-                if epoll.interests.contains_key(&request.fd) {
-                    response.status = EEXIST;
-                    return;
-                }
-                let Some(interest) = epoll_interest_from_request(request) else {
-                    response.status = EINVAL;
-                    return;
-                };
-                epoll.interests.insert(request.fd, interest);
+        let result = match request.arg1 {
+            linux_abi::EPOLL_CTL_ADD => self.epolls.add(request.remote_id, interest),
+            linux_abi::EPOLL_CTL_MOD => self.epolls.modify(request.remote_id, interest),
+            linux_abi::EPOLL_CTL_DEL => self.epolls.delete(request.remote_id, interest.key),
+            _ => {
+                response.status = EINVAL;
+                return;
             }
-            linux_abi::EPOLL_CTL_MOD => {
-                if !epoll.interests.contains_key(&request.fd) {
-                    response.status = ENOENT;
-                    return;
-                }
-                let Some(interest) = epoll_interest_from_request(request) else {
-                    response.status = EINVAL;
-                    return;
-                };
-                epoll.interests.insert(request.fd, interest);
-            }
-            linux_abi::EPOLL_CTL_DEL => {
-                if epoll.interests.remove(&request.fd).is_none() {
-                    response.status = ENOENT;
-                }
-            }
-            _ => response.status = EINVAL,
+        };
+        if let Err(err) = result {
+            response.status = waitset_registry_status(err);
         }
     }
 
-    fn vfs_epoll_wait(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
-        const EPOLL_EVENT_SIZE: usize = size_of::<linux_abi::LinuxEpollEvent>();
-        let Some(epoll) = self.epolls.get(&request.remote_id) else {
+    fn vfs_epoll_snapshot(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
+        let maxevents = request.arg1 as usize;
+        let wire_size = size_of::<WaitSetInterestWire>();
+        let capacity = response.payload.len() / wire_size;
+        if maxevents == 0 || maxevents > WAITSET_MAX_INTERESTS || maxevents > capacity {
             response.status = EINVAL;
             return;
-        };
-        let maxevents = request.arg1 as usize;
-        let max_payload_events = response.payload.len() / EPOLL_EVENT_SIZE;
-        let mut written = 0usize;
-        for interest in epoll.interests.values() {
-            if written >= maxevents || written >= max_payload_events {
-                break;
-            }
-            let events = poll_ready_bits(interest.events);
-            if events == 0 {
-                continue;
-            }
-            let offset = written * EPOLL_EVENT_SIZE;
-            response.payload[offset..offset + 4].copy_from_slice(&events.to_le_bytes());
-            response.payload[offset + 4..offset + 12].copy_from_slice(&interest.data.to_le_bytes());
-            written += 1;
         }
-        response.value = written as u64;
-        response.payload_len = (written * EPOLL_EVENT_SIZE) as u32;
+        let interests = match self.epolls.snapshot(request.remote_id, maxevents) {
+            Ok(interests) => interests,
+            Err(err) => {
+                response.status = waitset_registry_status(err);
+                return;
+            }
+        };
+        for (written, interest) in interests.iter().enumerate() {
+            let wire = WaitSetInterestWire {
+                abi_version: WAITSET_ABI_VERSION,
+                provider: interest.key.provider,
+                flags: 0,
+                target_fd: interest.key.target_fd,
+                object_id: interest.key.object_id,
+                provider_epoch: interest.key.provider_epoch,
+                events: interest.events,
+                reserved0: 0,
+                data: interest.data,
+            };
+            let bytes = unsafe {
+                core::slice::from_raw_parts(
+                    (&wire as *const WaitSetInterestWire).cast::<u8>(),
+                    wire_size,
+                )
+            };
+            let offset = written * wire_size;
+            response.payload[offset..offset + wire_size].copy_from_slice(bytes);
+        }
+        response.value = interests.len() as u64;
+        response.aux = self.readiness_generation;
+        response.payload_len = (interests.len() * wire_size) as u32;
+    }
+
+    fn advance_readiness_generation(&mut self) {
+        self.readiness_generation = self
+            .readiness_generation
+            .checked_add(1)
+            .expect("vfsd readiness generation exhausted");
+        #[cfg(not(test))]
+        {
+            let args = WaitSetSignalBrokerArgs {
+                abi_version: WAITSET_ABI_VERSION,
+                provider: WAITSET_PROVIDER_VFSD,
+                flags: 0,
+                object_id: WAITSET_GLOBAL_OBJECT_ID,
+                generation: self.readiness_generation,
+                reserved0: 0,
+            };
+            let status = unsafe {
+                rustos_svc_runtime::syscall::syscall1(
+                    SYS_RUSTOS_WAITSET_SIGNAL_BROKER,
+                    (&args as *const WaitSetSignalBrokerArgs) as u64,
+                )
+            };
+            if status < 0 {
+                panic!("vfsd readiness generation publication failed");
+            }
+        }
     }
 
     fn linux_statx(
@@ -1277,14 +1326,43 @@ fn poll_ready_bits(requested: u32) -> u32 {
             | linux_abi::EPOLLHUP)
 }
 
-fn epoll_interest_from_request(request: &VfsIpcRequest) -> Option<EpollInterest> {
-    const EPOLL_EVENT_SIZE: usize = size_of::<linux_abi::LinuxEpollEvent>();
-    if request.payload_len as usize != EPOLL_EVENT_SIZE {
+fn waitset_registry_status(err: WaitSetRegistryError) -> i32 {
+    match err {
+        WaitSetRegistryError::Exists => EEXIST,
+        WaitSetRegistryError::NotFound => ENOENT,
+        WaitSetRegistryError::Capacity => ENOSPC,
+        WaitSetRegistryError::Overflow => EOVERFLOW,
+    }
+}
+
+fn epoll_interest_from_request(request: &VfsIpcRequest) -> Option<WaitSetInterestRecord> {
+    let wire_size = size_of::<WaitSetInterestWire>();
+    if request.payload_len as usize != wire_size {
         return None;
     }
-    Some(EpollInterest {
-        events: u32::from_le_bytes(request.payload[0..4].try_into().ok()?),
-        data: u64::from_le_bytes(request.payload[4..12].try_into().ok()?),
+    let wire = unsafe {
+        core::ptr::read_unaligned(request.payload.as_ptr().cast::<WaitSetInterestWire>())
+    };
+    if wire.abi_version != WAITSET_ABI_VERSION
+        || wire.flags != 0
+        || wire.reserved0 != 0
+        || wire.target_fd != request.fd
+        || wire.provider == 0
+        || wire.provider > rustos_user_abi::syscall::WAITSET_PROVIDER_MAX
+        || wire.object_id == 0
+        || wire.provider_epoch == 0
+    {
+        return None;
+    }
+    Some(WaitSetInterestRecord {
+        key: WaitSetInterestKey {
+            target_fd: wire.target_fd,
+            provider: wire.provider,
+            object_id: wire.object_id,
+            provider_epoch: wire.provider_epoch,
+        },
+        events: wire.events,
+        data: wire.data,
     })
 }
 

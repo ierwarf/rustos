@@ -46,6 +46,7 @@ pub(super) fn syscall_linux_rustos_input_stats_broker(args_ptr: u64) -> u64 {
             | (snapshot.pending_pointer_position as u32
                 * INPUT_STATS_FLAG_PENDING_POINTER_POSITION),
         reserved0: 0,
+        readiness_generation: 0,
     };
 
     match usermem::write_current_user_struct(args.out_stats_ptr, &stats) {

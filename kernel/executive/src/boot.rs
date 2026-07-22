@@ -412,6 +412,7 @@ pub fn housekeeping_once() -> usize {
 
     trace_service_phase("reap");
     work += ps_api::service_deferred_work();
+    work += compat_api::syscall::service_deferred_transfer_releases();
 
     trace_service_phase("heartbeat");
     // Emit the once-per-second wall-clock heartbeat outside IRQ context. The

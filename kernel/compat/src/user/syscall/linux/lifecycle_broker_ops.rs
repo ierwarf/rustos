@@ -82,9 +82,10 @@ pub(super) fn syscall_linux_rustos_rootd_terminate_broker(args_ptr: u64) -> u64 
     if !multitask::terminate_user_process(args.target_pid) {
         return linux_errno(LINUX_ESRCH);
     }
-    if !multitask::mark_user_process_exiting(args.target_pid) {
+    if multitask::mark_user_process_exiting_once(args.target_pid) != Some(true) {
         return linux_errno(LINUX_ESRCH);
     }
+    release_all_service_handle_refs(args.target_pid);
     ipc_ops::cleanup_service_endpoints_for_process(args.target_pid);
     let _ = super::super::cleanup_proc_broker_state_for_process(args.target_pid);
     // A fixed SIGKILL status prevents rootd policy from forging application

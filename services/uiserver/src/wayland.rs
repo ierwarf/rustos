@@ -1,10 +1,10 @@
 use std::ffi::CString;
 use std::io::ErrorKind;
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, TryRecvError, TrySendError};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -61,6 +61,11 @@ const SLOW_WAYLAND_TICK_MS: u128 = 16;
 
 static WAYLAND_DISPATCH_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static WAYLAND_SLOW_TICK_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+static WAYLAND_READINESS_WAKE_LOGGED: AtomicBool = AtomicBool::new(false);
+
+fn claim_wayland_rearm(needs_rearm: &AtomicBool) -> bool {
+    needs_rearm.swap(false, Ordering::AcqRel)
+}
 
 fn post_protocol_error<I: Resource>(resource: &I, message: String) {
     diag_line(format!("uiserver: wayland protocol error: {message}"));
@@ -101,6 +106,12 @@ pub(crate) struct WaylandCompositor {
     acceptor: WaylandAcceptor,
     clients: Vec<ClientId>,
     state: WaylandState,
+    readiness: Option<WaylandReadiness>,
+}
+
+struct WaylandReadiness {
+    rearm_sender: SyncSender<()>,
+    needs_rearm: Arc<AtomicBool>,
 }
 
 struct WaylandAcceptor {
@@ -176,7 +187,76 @@ impl WaylandCompositor {
             acceptor,
             clients: Vec::new(),
             state,
+            readiness: None,
         })
+    }
+
+    pub(crate) fn attach_readiness_waker(
+        &mut self,
+        ui_wake_sender: SyncSender<()>,
+    ) -> std::io::Result<()> {
+        if self.readiness.is_some() {
+            return Err(std::io::Error::new(
+                ErrorKind::AlreadyExists,
+                "Wayland readiness waiter already attached",
+            ));
+        }
+        let poll_fd = self.display.backend().poll_fd().as_raw_fd();
+        let duplicated = unsafe { libc::fcntl(poll_fd, libc::F_DUPFD_CLOEXEC, 3) };
+        if duplicated < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let owned_fd = unsafe { OwnedFd::from_raw_fd(duplicated) };
+        let (rearm_sender, rearm_receiver) = sync_channel::<()>(1);
+        let needs_rearm = Arc::new(AtomicBool::new(false));
+        let worker_needs_rearm = Arc::clone(&needs_rearm);
+        thread::Builder::new()
+            .name(String::from("wayland-readiness"))
+            .spawn(move || {
+                require_background_thread_class();
+                let mut event = libc::epoll_event { events: 0, u64: 0 };
+                loop {
+                    let ready =
+                        unsafe { libc::epoll_wait(owned_fd.as_raw_fd(), &mut event, 1, -1) };
+                    if ready < 0 {
+                        let err = std::io::Error::last_os_error();
+                        if err.kind() == ErrorKind::Interrupted {
+                            continue;
+                        }
+                        diag_line(format!("uiserver: Wayland readiness wait failed: {err}"));
+                        std::process::exit(134);
+                    }
+                    if ready == 0 {
+                        continue;
+                    }
+                    if !WAYLAND_READINESS_WAKE_LOGGED.swap(true, Ordering::AcqRel) {
+                        diag_line("uiserver: Wayland readiness wake observed");
+                    }
+                    worker_needs_rearm.store(true, Ordering::Release);
+                    let _ = ui_wake_sender.try_send(());
+                    if rearm_receiver.recv().is_err() {
+                        break;
+                    }
+                }
+            })?;
+        self.readiness = Some(WaylandReadiness {
+            rearm_sender,
+            needs_rearm,
+        });
+        diag_line("uiserver: Wayland readiness waiter ready");
+        Ok(())
+    }
+
+    pub(crate) fn rearm_readiness(&self) {
+        let Some(readiness) = self.readiness.as_ref() else {
+            return;
+        };
+        if claim_wayland_rearm(&readiness.needs_rearm)
+            && readiness.rearm_sender.try_send(()).is_err()
+        {
+            diag_line("uiserver: Wayland readiness rearm failed");
+            std::process::exit(134);
+        }
     }
 
     pub(crate) fn tick(&mut self) -> bool {
@@ -593,9 +673,20 @@ fn surface_damage_rect(x: i32, y: i32, width: i32, height: i32) -> Option<Rect> 
 #[cfg(test)]
 mod tests {
     use super::{
-        checked_wayland_pixel_count, validate_wayland_buffer_layout, wayland_nonnegative_i32,
-        WaylandWindowSnapshot, MAX_WAYLAND_BUFFER_DIMENSION, MAX_WAYLAND_SHM_POOL_BYTES,
+        checked_wayland_pixel_count, claim_wayland_rearm, validate_wayland_buffer_layout,
+        wayland_nonnegative_i32, WaylandWindowSnapshot, MAX_WAYLAND_BUFFER_DIMENSION,
+        MAX_WAYLAND_SHM_POOL_BYTES,
     };
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn wayland_readiness_requires_one_dispatch_before_rearm() {
+        let needs_rearm = AtomicBool::new(true);
+        assert!(claim_wayland_rearm(&needs_rearm));
+        assert!(!claim_wayland_rearm(&needs_rearm));
+        needs_rearm.store(true, Ordering::Release);
+        assert!(claim_wayland_rearm(&needs_rearm));
+    }
     use crate::canvas::Rect;
     use std::sync::Arc;
 

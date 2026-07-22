@@ -287,6 +287,10 @@ pub fn mark_user_process_exiting(process_id: u64) -> bool {
     process_table::mark_process_exiting(process_id).is_some()
 }
 
+pub fn mark_user_process_exiting_once(process_id: u64) -> Option<bool> {
+    process_table::mark_process_exiting_once(process_id)
+}
+
 /// Unknown process IDs fail closed: callers must never publish authority for a
 /// process that is absent from the process table.
 pub fn is_user_process_exiting(process_id: u64) -> bool {

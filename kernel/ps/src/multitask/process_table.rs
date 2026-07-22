@@ -391,6 +391,21 @@ pub fn mark_process_exiting(process_id: u64) -> Option<()> {
     Some(())
 }
 
+/// Atomically marks the process exiting and reports whether this call won the
+/// transition. Resource owners use the `true` result to perform exactly-once
+/// service-side open-description teardown under concurrent exit_group calls.
+pub fn mark_process_exiting_once(process_id: u64) -> Option<bool> {
+    let mut table = PROCESS_TABLE.lock();
+    let object = table
+        .slots
+        .iter_mut()
+        .filter_map(|slot| slot.object.as_deref_mut())
+        .find(|object| object.process_id == process_id)?;
+    let first = !object.exiting;
+    object.exiting = true;
+    Some(first)
+}
+
 pub fn is_process_exiting(process_id: u64) -> Option<bool> {
     let table = PROCESS_TABLE.lock();
     table
@@ -507,6 +522,12 @@ mod tests {
     use crate::memory::paging::ProcessAddressSpace;
     use crate::user::process_state::UserProcessState;
 
+    // These tests exercise the one global process table and call the global
+    // reaper. Running them concurrently lets one test reap another test's
+    // exited slot, turning exact lifecycle assertions into scheduler-order
+    // flakes. Keep only this shared-state group serialized.
+    static PROCESS_TABLE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn new_state() -> UserProcessState {
         UserProcessState::new(
             ProcessAddressSpace::empty_for_tests(),
@@ -521,6 +542,9 @@ mod tests {
 
     #[test]
     fn retained_ref_delays_reclaim_until_drop() {
+        let _guard = PROCESS_TABLE_TEST_LOCK
+            .lock()
+            .expect("process table test lock");
         let handle = create_process(42, new_state()).expect("process handle");
         let retained = retain_process(handle).expect("retained process");
         detach_task(handle).expect("detach");
@@ -543,6 +567,9 @@ mod tests {
 
     #[test]
     fn leader_thread_retirement_does_not_mark_live_process_exited() {
+        let _guard = PROCESS_TABLE_TEST_LOCK
+            .lock()
+            .expect("process table test lock");
         let handle = create_process(43, new_state()).expect("process handle");
         attach_task(handle).expect("second thread");
         assert_eq!(thread_count_by_pid(43), Some(2));
@@ -558,6 +585,9 @@ mod tests {
 
     #[test]
     fn exiting_process_rejects_new_thread_attachment() {
+        let _guard = PROCESS_TABLE_TEST_LOCK
+            .lock()
+            .expect("process table test lock");
         let handle = create_process(44, new_state()).expect("process handle");
         mark_process_exiting(44).expect("mark exiting");
 

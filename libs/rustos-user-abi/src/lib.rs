@@ -124,7 +124,14 @@ mod tests {
         assert_eq!(syscall::DEVMGRD_IOCTL_LINUX_TTY_TCSETSW, 0x5403);
         assert_eq!(syscall::DEVMGRD_IOCTL_LINUX_TTY_TCSETSF, 0x5404);
         assert_eq!(syscall::DEVMGRD_IOCTL_LINUX_TTY_FIONREAD, 0x541b);
-        assert_eq!(syscall::INPUTD_IPC_ABI_VERSION, 2);
+        assert_eq!(syscall::INPUTD_IPC_ABI_VERSION, 3);
+        assert_eq!(syscall::VFS_IPC_ABI_VERSION, 2);
+        assert_eq!(syscall::NETD_IPC_ABI_VERSION, 3);
+        assert_eq!(syscall::SYS_RUSTOS_WAITSET_SIGNAL_BROKER, 0x5255_003f);
+        assert_eq!(syscall::WAITSET_PROVIDER_SESSIOND, 4);
+        assert_eq!(syscall::WAITSET_PROVIDER_MAX, 4);
+        assert_eq!(size_of::<syscall::WaitSetSignalBrokerArgs>(), 32);
+        assert_eq!(size_of::<syscall::WaitSetInterestWire>(), 48);
         assert_eq!(syscall::INPUTD_IPC_OP_DRAIN_INGEST, 4);
         assert_eq!(syscall::INPUTD_IPC_OP_READ, 5);
         assert_eq!(syscall::INPUTD_INGRESS_KIND_POINTER_PACKET, 2);
@@ -183,6 +190,11 @@ mod tests {
         assert_eq!(syscall::COMMERCIAL_MAX_NETD_OP_PACKET_LEASE, 5);
         assert_eq!(syscall::COMMERCIAL_MAX_DRIVERD_OP_PROVIDER_SELECT, 4);
         assert_eq!(syscall::COMMERCIAL_MAX_SESSIOND_OP_UI_BOOTSTRAP, 5);
+        assert_eq!(
+            syscall::COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_READINESS,
+            0x102
+        );
+        assert_eq!(syscall::SESSIOND_CONSOLE_READINESS_MASK, 0b11);
         assert_eq!(syscall::COMMERCIAL_MAX_SERVICE_DRIVERD_OP_MMIO_LEASE, 2);
         assert_eq!(syscall::COMMERCIAL_MAX_SERVICE_DRIVERD_OP_IRQ_ROUTE, 3);
         assert_eq!(syscall::COMMERCIAL_MAX_SERVICE_DRIVERD_OP_DMA_BUFFER, 4);

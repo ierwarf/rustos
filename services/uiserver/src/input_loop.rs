@@ -1,6 +1,6 @@
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError};
 use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
@@ -19,12 +19,11 @@ use crate::sys::{
 use crate::wayland::WaylandCompositor;
 
 const SLOW_INPUT_READ_THRESHOLD_MS: u128 = 50;
-// Until inputd exports a service-owned readiness object, its MSI-X ingestion
-// worker can move the last ring0-visible record into the service queue between
-// a generic poll probe and waiter registration.  The uiserver reader therefore
-// uses its already-nonblocking native input fd directly on a short cumulative
-// cadence.  This stays off the UI thread and bounds the pre-ABI lost-wake
-// window without granting uiserver transport-consumer authority.
+// The common wait set now exports inputd's service-owned readiness generation.
+// Keep this bounded compatibility cadence until the dedicated reader itself is
+// moved onto that ABI; its shared wake channel also receives the Wayland
+// backend's aggregate-epoll wake and therefore lets the UI loop wait on input,
+// client traffic, and its runtime deadline without polling clients every 16 ms.
 const INPUT_READER_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(4);
 const INPUT_READER_QUEUE_CAPACITY: usize = INPUT_EVENT_BATCH * 64;
 const INPUT_READER_WATCHDOG_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
@@ -35,6 +34,7 @@ const MAX_WAYLAND_POINTER_FLUSH_EVENTS: u64 = 16;
 pub(crate) struct InputReader {
     receiver: Receiver<InputEvent>,
     wake_receiver: Receiver<()>,
+    wake_sender: SyncSender<()>,
     stats: Arc<InputReaderStats>,
 }
 
@@ -92,6 +92,10 @@ impl InputReader {
         match self.wake_receiver.recv_timeout(duration) {
             Ok(()) | Err(RecvTimeoutError::Disconnected) | Err(RecvTimeoutError::Timeout) => {}
         }
+    }
+
+    pub(crate) fn wake_sender(&self) -> SyncSender<()> {
+        self.wake_sender.clone()
     }
 
     pub(crate) fn snapshot(&self) -> InputReaderSnapshot {
@@ -193,6 +197,7 @@ fn wait_for_next_input_probe(stats: &InputReaderStats, deadline: &mut Instant) {
 pub(crate) fn start_input_reader(input_fds: Vec<OwnedFd>) -> InputReader {
     let (sender, receiver) = mpsc::sync_channel::<InputEvent>(INPUT_READER_QUEUE_CAPACITY);
     let (wake_sender, wake_receiver) = mpsc::sync_channel::<()>(1);
+    let shared_wake_sender = wake_sender.clone();
     let stats = Arc::new(InputReaderStats::new());
     let reader_stats = Arc::clone(&stats);
     thread::Builder::new()
@@ -332,6 +337,7 @@ pub(crate) fn start_input_reader(input_fds: Vec<OwnedFd>) -> InputReader {
     InputReader {
         receiver,
         wake_receiver,
+        wake_sender: shared_wake_sender,
         stats,
     }
 }

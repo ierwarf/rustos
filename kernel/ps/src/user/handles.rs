@@ -62,6 +62,8 @@ pub enum IpcTransferRegistryError {
 lazy_static! {
     static ref IPC_TRANSFER_OBJECTS: Mutex<BTreeMap<u64, TransferredHandleEntry>> =
         Mutex::new(BTreeMap::new());
+    static ref IPC_DEFERRED_TRANSFER_DROPS: Mutex<Vec<TransferredHandleEntry>> =
+        Mutex::new(Vec::new());
 }
 
 static NEXT_IPC_TRANSFER_ID: AtomicU64 = AtomicU64::new(1);
@@ -70,9 +72,16 @@ pub fn register_ipc_transfer_entries(
     entries: Vec<TransferredHandleEntry>,
 ) -> Result<Vec<KernelTransferredHandle>, IpcTransferRegistryError> {
     let mut objects = IPC_TRANSFER_OBJECTS.lock();
-    if objects.len().saturating_add(entries.len()) > MAX_PENDING_IPC_TRANSFER_OBJECTS {
+    let deferred = IPC_DEFERRED_TRANSFER_DROPS.lock();
+    if objects
+        .len()
+        .saturating_add(deferred.len())
+        .saturating_add(entries.len())
+        > MAX_PENDING_IPC_TRANSFER_OBJECTS
+    {
         return Err(IpcTransferRegistryError::Exhausted);
     }
+    drop(deferred);
 
     let mut inserted_ids = Vec::with_capacity(entries.len());
     let mut descriptors = Vec::with_capacity(entries.len());
@@ -130,9 +139,23 @@ pub fn drop_ipc_transfer_descriptors(descriptors: &[KernelTransferredHandle]) {
         return;
     }
     let mut objects = IPC_TRANSFER_OBJECTS.lock();
+    let mut deferred = IPC_DEFERRED_TRANSFER_DROPS.lock();
     for descriptor in descriptors {
-        objects.remove(&descriptor.transfer_id());
+        let matches = objects.get(&descriptor.transfer_id()).is_some_and(|entry| {
+            entry.ipc_descriptor(descriptor.transfer_id()) == Some(*descriptor)
+        });
+        if matches && let Some(entry) = objects.remove(&descriptor.transfer_id()) {
+            // Registration accounts pending and deferred entries against one
+            // shared ceiling, so moving ownership here cannot exceed it.
+            deferred.push(entry);
+        }
     }
+}
+
+pub fn take_deferred_ipc_transfer_drops(limit: usize) -> Vec<TransferredHandleEntry> {
+    let mut deferred = IPC_DEFERRED_TRANSFER_DROPS.lock();
+    let count = limit.min(deferred.len());
+    deferred.drain(..count).collect()
 }
 
 fn allocate_ipc_transfer_id(objects: &BTreeMap<u64, TransferredHandleEntry>) -> Option<u64> {
@@ -280,18 +303,7 @@ impl KernelHandle {
                     ConsoleStreamKind::Error => 2,
                 },
             ),
-            Self::Device(device) => HandleToken::new(
-                HandleOwner::Io,
-                ((match device.device_id() {
-                    crate::io::device::DeviceId::Console => 0_u64,
-                    crate::io::device::DeviceId::Display => 1_u64,
-                    crate::io::device::DeviceId::Input => 2_u64,
-                }) << 8)
-                    | match device.access_kind() {
-                        crate::io::device::DeviceAccessKind::Native => 0_u64,
-                        crate::io::device::DeviceAccessKind::Evdev => 1_u64,
-                    },
-            ),
+            Self::Device(device) => HandleToken::new(HandleOwner::Io, device.token_id()),
             Self::Epoll(epoll) => HandleToken::new(HandleOwner::Compat, epoll.token_id()),
             Self::InetSocket(socket) => HandleToken::new(HandleOwner::Compat, socket.token_id()),
             Self::Memfd(memfd) => HandleToken::new(HandleOwner::Compat, memfd.token_id()),
@@ -456,4 +468,25 @@ fn file_rights_from_status_flags(status_flags: u64) -> FileHandleRights {
         rights = rights.union(FileHandleRights::NONBLOCK);
     }
     rights
+}
+
+#[cfg(test)]
+mod transfer_registry_tests {
+    use super::*;
+    use crate::io::device::{DeviceAccessKind, DeviceId};
+
+    #[test]
+    fn cancelled_transfer_moves_its_open_description_to_deferred_cleanup() {
+        let token = u64::MAX - 701;
+        let device =
+            DeviceHandle::from_parts_with_token(DeviceId::Input, DeviceAccessKind::Evdev, token);
+        let entry = HandleEntry::new(KernelHandle::Device(device), 0, linux_abi::O_RDONLY);
+        let transferred = TransferredHandleEntry::from_entry(entry).expect("transferable input");
+        let descriptors =
+            register_ipc_transfer_entries(alloc::vec![transferred]).expect("register transfer");
+        drop_ipc_transfer_descriptors(&descriptors);
+        let dropped = take_deferred_ipc_transfer_drops(1);
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0].entry().handle().device_handle(), Some(device));
+    }
 }

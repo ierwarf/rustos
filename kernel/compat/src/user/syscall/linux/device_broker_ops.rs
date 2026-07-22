@@ -3,7 +3,7 @@ use super::*;
 use core::mem::size_of;
 
 use crate::user::sysops::device::{self, DeviceSysopError};
-use kernel_object::api::device::DeviceAccessKind;
+use kernel_object::api::device::{DeviceAccessKind, DeviceId};
 use kernel_object::api::handle::{DeviceHandleRights, HandleRights};
 use rustos_user_abi::syscall::{
     DEVMGRD_DEVICE_ACCESS_EVDEV, DEVMGRD_DEVICE_ACCESS_NATIVE, DEVMGRD_DEVICE_ID_CONSOLE,
@@ -46,17 +46,42 @@ pub(super) fn syscall_linux_rustos_device_open_broker(args_ptr: u64) -> u64 {
         return linux_errno(LINUX_EACCES);
     }
 
-    let handle = multitask::KernelHandle::Device(crate::io::device::DeviceHandle::with_access(
-        device_id, access,
-    ));
-    match multitask::with_current_user_process_state_mut(|_, _, process_state| {
+    let device_handle = crate::io::device::DeviceHandle::with_access(device_id, access);
+    let input_token = if device_id == DeviceId::Input {
+        let input_access = match access {
+            DeviceAccessKind::Native => INPUTD_ACCESS_NATIVE,
+            DeviceAccessKind::Evdev => INPUTD_ACCESS_EVDEV,
+        };
+        if let Err(errno) = waitset_broker_ops::register_input_open_description(
+            device_handle.token_id(),
+            input_access,
+        ) {
+            return linux_errno(errno);
+        }
+        Some(device_handle.token_id())
+    } else {
+        None
+    };
+    let handle = multitask::KernelHandle::Device(device_handle);
+    let installed = multitask::with_current_user_process_state_mut(|_, _, process_state| {
         process_state
             .handles_mut()
             .install_with_open_flags_and_rights(handle, args.open_flags, rights)
-    }) {
+    });
+    match installed {
         Some(Some(fd)) => fd,
-        Some(None) => linux_errno(LINUX_EMFILE),
-        None => linux_errno(LINUX_EINVAL),
+        Some(None) => {
+            if let Some(token) = input_token {
+                let _ = waitset_broker_ops::release_input_open_description(token);
+            }
+            linux_errno(LINUX_EMFILE)
+        }
+        None => {
+            if let Some(token) = input_token {
+                let _ = waitset_broker_ops::release_input_open_description(token);
+            }
+            linux_errno(LINUX_EINVAL)
+        }
     }
 }
 

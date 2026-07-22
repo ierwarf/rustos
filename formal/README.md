@@ -104,6 +104,7 @@ and counterexamples are retained under `build/formal/`.
 | dvm-input-ring/DvmInputRing | L0 producer, fixed ivshmem ring, RustOS MSI-X leaf, inputd broker | only L0 advances producer and only the broker advances consumer; 2,048 fixed 32-byte slots retain cleanup reserve; continuous production requires both an armed vector and a successful policy-backed client poll; DVM tamper attempts cannot mutate the ring; IRQ only wakes; malformed/stale records cannot reach inputd; revoke clears transport/consumer readiness and decoder authority; a boot-wide bounded recovery budget reuses one pinned vector; fairness drains or revokes finite committed work |
 | trusted-ui-boundary/TrustedUiBoundary | DVM display/input provenance, GUI backend, uiserver trusted-UI status | a privileged prompt requires independently attested scanout and human input; DVM compromise, provider loss, or independent-attestation revocation cancels it; a DVM transport may never self-attest |
 | input-readiness/InputReadiness | ring0 ingress queue, finite poll substrate, inputd worker, uiserver reader | the MSI-X worker, bounded STATS readiness recheck, and readiness-gated read are explicit transfer races; every record has exactly one ring0, policy, or delivered owner and service policy drains under consumer fairness |
+| userspace-wait-set/UserspaceWaitSet | vfsd epoll registry, syscall-scoped poll sets, netd/inputd readiness providers, compat wait-token and deadline substrate | each poll/epoll wait registers exact observed generations, rechecks providers while runnable, arms the scheduler, and verifies waiter presence before commit; readiness is re-queried before return and each service query is bounded by the application deadline; timeout, unmasked-signal interruption, revoke, dup/fork/close/exec, and last-reference retirement settle without a lost wake or stale provider authority |
 | input-ingestion-worker/InputIngestionWorker | ring0 DVM input wake leaf and inputd ingestion worker | only the capability-gated worker may claim policy-consumer readiness or advance committed records; wake/arm races are cursor-rechecked, every turn is bounded, and finite work eventually drains without granting drain authority to client poll |
 | ui-frame-budget/UiFrameBudget | uiserver input loop, console-command worker, frame/present loop | console-policy IPC has bounded FIFO admission and one delivery owner; overload is recorded; an in-flight policy call cannot make local redraw debt wait; active-input feedback is eventually presented |
 | wayland-accept-isolation/WaylandAcceptIsolation | uiserver bounded accept worker and netd-backed socket path | a stalled cross-service accept never owns the UI tick; accepted streams cross one bounded completion queue, overload closes the new client, and queued clients eventually settle under the declared worker/UI fairness |
@@ -135,7 +136,7 @@ and counterexamples are retained under `build/formal/`.
 | clocksource-deadline/ClocksourceDeadline | invariant-TSC/HPET clocksource, PIT clockevent, scheduler sleep identity | elapsed time never derives from delivered RTC-edge count; a delayed event catches every absolute deadline crossed by a clocksource jump; only a calibrated source is admitted; sleep identity is the exact scheduler task id even while syscall code holds the process-table lock |
 | scheduler-admission/SchedulerAdmission | runtimed launch-catalog admission | a launch record is not a realtime capability: all non-UI requests are clamped below System admission even when registry input is hostile; only the exact trusted UI executable receives its pinned System weight; pending admission eventually settles |
 | ipc-priority-inheritance/IpcPriorityInheritance | scheduler effective classes and compat synchronous IPC | a live reply capability owns the only priority donation; System class propagates through nested calls; completion, cancellation, and task exit revoke it; System work wins until its bounded burst is exhausted, then one ready User turn is mandatory |
-| ipc-handle-transfer/IpcHandleTransfer | process handle substrate, IPC runtime, compat IPC syscalls | a transferred descriptor is either installed or dropped exactly once; queue cancellation, peer-close, invalid receiver output, caller exit, and owner exit after dequeue leave no registry entry; batch transfer is all-or-nothing |
+| ipc-handle-transfer/IpcHandleTransfer | process handle substrate, IPC runtime, compat IPC syscalls | a transferred descriptor is either installed or dropped exactly once; every exported service-backed description owns a matching service reference which installation adopts or bounded deferred cleanup releases; queue cancellation, peer-close, invalid receiver output, caller exit, and owner exit after dequeue leave no registry entry; batch transfer is all-or-nothing |
 | ipc-endpoint-ownership/IpcEndpointOwnership | kernel IPC runtime, compat IPC syscalls, process handle table | a process-owned endpoint/reply may be served by its worker threads but cannot be received, replied to, or handle-drained by a foreign process; transferred handles install before a reply becomes terminal; process exit kills the endpoint, revokes queued/received and installed process-local transfer authority, and cannot be followed by enqueue revival through the dead numeric endpoint; every descriptor installation stays within the process ceiling and a full-table rejection is non-destructive |
 | proc-broker-session/ProcBrokerSession | process broker, loaderd, Linux process teardown | exact loader ownership and inherited console-session binding; mapping/runtime state only in a live prepare session; commit attempt is terminal; deferred children stay inert until activation; owner exit aborts every uncommitted or in-flight prepare before publication |
 | exec-ticket/ExecTicket | procd, loaderd, process broker, Linux thread/process teardown | exact live PID/TID ticket binding; mismatched cancel/exec cannot consume a ticket; one-shot execution and pre-image register handoff; target-thread exit and exec sibling retirement retain no ticket or transition authority |
@@ -223,10 +224,27 @@ an application read. Finite poll and the latency-sensitive uiserver reader
 invoke bounded `INPUTD_IPC_OP_STATS` readiness rechecks before an authorized
 nonblocking read on a cumulative cadence. Both operations refresh ingress
 under the inputd queue lock, and every transfer retains exact ownership and provenance.
-The general indefinite-poll service readiness object remains a failed next-ABI
-gate rather than being inferred from a ring0 wake. Reader identity and key
-translation remain covered by the ABI, revocation model, and KVM input-stream
-gate.
+The generic wait-set separately models the service-owned readiness generation,
+exact provider epoch, arm/recheck race, and descriptor lifetime. Reader identity
+and key translation remain covered by the input ABI, revocation model, and KVM
+input-stream gate.
+
+`userspace-wait-set` is the cross-provider availability and lifetime boundary.
+vfsd owns persistent epoll membership, compat builds bounded transient poll
+sets, and netd/inputd own readiness truth and generations. Ring0 stores only
+bounded task wait tokens, validates the exact live
+service endpoint epoch, supplies deadline wakeup, and re-queries provider state
+before returning an event. A provider restart or last reference close wakes and
+revokes a pending wait instead of allowing numeric-token reuse to revive stale
+authority. ppoll/epoll_pwait temporarily replace the calling thread's signal
+mask around that wait and treat unmasked delivery as interruption. The finite
+model includes the check-to-arm race, signal/timeout race,
+provider restart/recovery, and dup/fork/close/exec reference changes.
+The concrete check-to-arm refinement keeps service IPC outside the scheduler
+arm: it registers observations, rechecks providers, arms, then tests that the
+same waiter records remain. Each provider query is capped by both 16 ms and the
+remaining syscall deadline; `ipc-reply-deadline` supplies the compositional
+bounded-call guarantee below this model.
 
 `ui-frame-budget` begins after that input ownership transfer. Keyboard routing
 and console focus updates cross the `uiserver -> devmgrd -> runtimed` policy

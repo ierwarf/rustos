@@ -383,8 +383,29 @@ fn is_linux_at_fdcwd_for_vfs(dirfd: u64) -> bool {
 }
 
 pub fn call_vfs_ipc_request(request: &VfsIpcRequest) -> Result<VfsIpcResponse, i64> {
+    call_vfs_ipc_request_impl(request, None)
+}
+
+pub fn call_vfs_ipc_request_with_timeout(
+    request: &VfsIpcRequest,
+    timeout_ms: u64,
+) -> Result<VfsIpcResponse, i64> {
+    call_vfs_ipc_request_impl(request, Some(timeout_ms.max(1)))
+}
+
+fn call_vfs_ipc_request_impl(
+    request: &VfsIpcRequest,
+    timeout_ms: Option<u64>,
+) -> Result<VfsIpcResponse, i64> {
     let start_ticks = crate::arch::rtc::ticks();
-    let response = ipc_ops::call_service_endpoint(IPC_SERVICE_VFSD, as_bytes(request))?;
+    let response = match timeout_ms {
+        Some(timeout_ms) => ipc_ops::call_service_endpoint_with_timeout(
+            IPC_SERVICE_VFSD,
+            as_bytes(request),
+            timeout_ms,
+        )?,
+        None => ipc_ops::call_service_endpoint(IPC_SERVICE_VFSD, as_bytes(request))?,
+    };
     let detail = vfs_request_log_detail(request);
     log_slow_service_call(
         "vfsd",
@@ -425,6 +446,10 @@ pub fn should_try_devmgrd_open(path: &str) -> bool {
 // RING3-MIGRATION-REFERENCE END: vfsd/devmgrd device-route substrate exception.
 
 pub fn current_input_device_access(fd: u64) -> Option<(u16, u64)> {
+    current_input_device_description(fd).map(|(_, access, flags)| (access, flags))
+}
+
+pub fn current_input_device_description(fd: u64) -> Option<(u64, u16, u64)> {
     multitask::with_current_user_process_state(|_, _, process_state| {
         let entry = process_state.handles().get_entry(fd)?;
         if !entry.rights().allows_read() {
@@ -439,7 +464,7 @@ pub fn current_input_device_access(fd: u64) -> Option<(u16, u64)> {
             kernel_object::api::device::DeviceAccessKind::Native => INPUTD_ACCESS_NATIVE,
             kernel_object::api::device::DeviceAccessKind::Evdev => INPUTD_ACCESS_EVDEV,
         };
-        Some((access, entry.status_flags()))
+        Some((device.token_id(), access, entry.status_flags()))
     })
     .flatten()
 }
@@ -526,11 +551,17 @@ fn call_inputd_ipc_request(request: &InputdIpcRequest) -> Result<InputdIpcRespon
     Ok(response)
 }
 
-pub fn input_device_has_pending_events(fd: u64) -> Result<bool, i64> {
+pub fn input_device_readiness_for_access_with_timeout(
+    access: u16,
+    timeout_ms: u64,
+) -> Result<(bool, u64), i64> {
+    if !matches!(access, INPUTD_ACCESS_NATIVE | INPUTD_ACCESS_EVDEV) {
+        return Err(LINUX_EINVAL);
+    }
     let mut request = InputdIpcRequest {
         version: INPUTD_IPC_ABI_VERSION,
         op: INPUTD_IPC_OP_STATS,
-        fd,
+        access,
         requested_len: 1,
         ..InputdIpcRequest::default()
     };
@@ -541,7 +572,7 @@ pub fn input_device_has_pending_events(fd: u64) -> Result<bool, i64> {
     let response = ipc_ops::call_service_endpoint_with_timeout(
         IPC_SERVICE_INPUTD,
         as_bytes(&request),
-        INPUTD_READINESS_IPC_TIMEOUT_MS,
+        timeout_ms.max(1).min(INPUTD_READINESS_IPC_TIMEOUT_MS),
     )?;
     if response.len() != size_of::<InputdIpcResponse>() {
         return Err(LINUX_EINVAL);
@@ -556,9 +587,15 @@ pub fn input_device_has_pending_events(fd: u64) -> Result<bool, i64> {
     if response.status != 0 {
         return Err(response.status.unsigned_abs() as i64);
     }
+    if response.stats.readiness_generation == 0 {
+        return Err(LINUX_EINVAL);
+    }
     let pending_flags =
         INPUT_STATS_FLAG_PENDING_COALESCED | INPUT_STATS_FLAG_PENDING_POINTER_POSITION;
-    Ok(response.stats.queued != 0 || response.stats.flags & pending_flags != 0)
+    Ok((
+        response.stats.queued != 0 || response.stats.flags & pending_flags != 0,
+        response.stats.readiness_generation,
+    ))
 }
 
 pub fn current_console_session_is_system() -> bool {
@@ -566,6 +603,54 @@ pub fn current_console_session_is_system() -> bool {
         .map(|snapshot| snapshot.console_session().is_system())
         // A missing user task must not be elevated into the system console.
         .unwrap_or(false)
+}
+
+pub fn console_readiness_via_sessiond_with_timeout(
+    session_handle: u64,
+    timeout_ms: u64,
+) -> Result<(bool, bool, u64), i64> {
+    if session_handle == 0 {
+        return Err(LINUX_EINVAL);
+    }
+    let snapshot = multitask::current_user_snapshot().ok_or(LINUX_EINVAL)?;
+    if snapshot.console_session().is_system() || snapshot.console_session().raw() != session_handle
+    {
+        return Err(LINUX_EPERM);
+    }
+    let mut request = CommercialMaxProtocolRequest::default();
+    request.header.version = COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
+    request.header.protocol = COMMERCIAL_MAX_PROTOCOL_SESSIOND;
+    request.header.op = COMMERCIAL_MAX_SESSIOND_OP_CONSOLE_ROUTE;
+    request.header.service_id = IPC_SERVICE_SESSIOND;
+    request.header.subject_pid = snapshot.process_id();
+    request.header.subject_tid = snapshot.thread_id();
+    request.arg0 = COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_READINESS;
+    request.arg2 = session_handle;
+    let response = ipc_ops::call_service_endpoint_with_timeout(
+        IPC_SERVICE_SESSIOND,
+        as_bytes(&request),
+        timeout_ms.max(1).min(16),
+    )?;
+    if response.len() != size_of::<CommercialMaxProtocolResponse>() {
+        return Err(LINUX_EINVAL);
+    }
+    let response = read_unaligned::<CommercialMaxProtocolResponse>(response.as_slice());
+    ipc_ops::validate_commercial_response_envelope(&request, &response)?;
+    if response.status != 0 {
+        return Err(response.status.unsigned_abs() as i64);
+    }
+    if response.descriptor_count != 1
+        || response.payload_len != 0
+        || response.value1 == 0
+        || response.value0 & !SESSIOND_CONSOLE_READINESS_MASK != 0
+    {
+        return Err(LINUX_EINVAL);
+    }
+    Ok((
+        response.value0 & SESSIOND_CONSOLE_READINESS_READY != 0,
+        response.value0 & SESSIOND_CONSOLE_READINESS_LIVE != 0,
+        response.value1,
+    ))
 }
 
 pub fn console_read_via_sessiond(user_ptr: u64, user_len: usize) -> Result<u64, i64> {
@@ -717,6 +802,14 @@ fn call_sessiond_console_route(
                 return Err(LINUX_EINVAL);
             }
         }
+        COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_READINESS => {
+            if response.payload_len != 0
+                || response.value1 == 0
+                || response.value0 & !SESSIOND_CONSOLE_READINESS_MASK != 0
+            {
+                return Err(LINUX_EINVAL);
+            }
+        }
         _ => return Err(LINUX_EINVAL),
     }
     Ok(response)
@@ -745,6 +838,7 @@ pub fn open_device_via_devmgrd(path: &str, flags: u64) -> Result<u64, i64> {
         1,
     )?;
     if response.len() != size_of::<DevmgrdDeviceOpenResponse>() {
+        ipc_ops::drop_transfer_entries(entries);
         return Err(LINUX_EINVAL);
     }
     let response = read_unaligned::<DevmgrdDeviceOpenResponse>(response.as_slice());
@@ -752,24 +846,46 @@ pub fn open_device_via_devmgrd(path: &str, flags: u64) -> Result<u64, i64> {
         || response.op != rustos_user_abi::syscall::DEVMGRD_IPC_OP_OPEN
         || response.reserved0 != 0
     {
+        ipc_ops::drop_transfer_entries(entries);
         return Err(LINUX_EINVAL);
     }
     if response.status != 0 {
+        ipc_ops::drop_transfer_entries(entries);
         return Err(response.status.unsigned_abs() as i64);
     }
     if entries.len() != 1 {
+        ipc_ops::drop_transfer_entries(entries);
         return Err(LINUX_EINVAL);
     }
     let mut entries = entries.into_iter();
     let Some(entry) = entries.next() else {
         return Err(LINUX_EINVAL);
     };
+    let input_token = match entry.entry().handle() {
+        multitask::KernelHandle::Device(device)
+            if device.device_id() == kernel_object::api::device::DeviceId::Input =>
+        {
+            Some(device.token_id())
+        }
+        _ => None,
+    };
     let Some(fd) = multitask::with_current_user_process_state_mut(|_, _, process_state| {
         process_state.handles_mut().install_transferred(entry)
     }) else {
+        if let Some(token) = input_token {
+            ipc_ops::release_input_transfer_token(token);
+        }
         return Err(LINUX_EINVAL);
     };
-    fd.ok_or(LINUX_EMFILE)
+    match fd {
+        Some(fd) => Ok(fd),
+        None => {
+            if let Some(token) = input_token {
+                ipc_ops::release_input_transfer_token(token);
+            }
+            Err(LINUX_EMFILE)
+        }
+    }
 }
 
 pub fn ioctl_tty_via_sessiond(fd: u64, request_number: u64, arg: u64) -> Result<u64, i64> {
@@ -1120,13 +1236,34 @@ pub fn call_inputd_read_request(request: &InputdIpcRequest) -> Result<InputdRead
 }
 
 pub fn call_netd_ipc_request(request: &NetdIpcRequest) -> Result<NetdIpcResponse, i64> {
+    call_netd_ipc_request_impl(request, None)
+}
+
+pub fn call_netd_ipc_request_with_timeout(
+    request: &NetdIpcRequest,
+    timeout_ms: u64,
+) -> Result<NetdIpcResponse, i64> {
+    call_netd_ipc_request_impl(request, Some(timeout_ms.max(1)))
+}
+
+fn call_netd_ipc_request_impl(
+    request: &NetdIpcRequest,
+    timeout_ms: Option<u64>,
+) -> Result<NetdIpcResponse, i64> {
     let start_ticks = crate::arch::rtc::ticks();
     let request_len = NETD_IPC_REQUEST_HEADER_SIZE
         .checked_add(request.payload_len as usize)
         .filter(|len| *len <= size_of::<NetdIpcRequest>())
         .ok_or(LINUX_EINVAL)?;
-    let response =
-        ipc_ops::call_service_endpoint(IPC_SERVICE_NETD, &as_bytes(request)[..request_len])?;
+    let request_bytes = &as_bytes(request)[..request_len];
+    let response = match timeout_ms {
+        Some(timeout_ms) => ipc_ops::call_service_endpoint_with_timeout(
+            IPC_SERVICE_NETD,
+            request_bytes,
+            timeout_ms,
+        )?,
+        None => ipc_ops::call_service_endpoint(IPC_SERVICE_NETD, request_bytes)?,
+    };
     let elapsed_ms = ticks_elapsed_ms(start_ticks, crate::arch::rtc::ticks());
     log_slow_service_call(
         "netd",

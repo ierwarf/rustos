@@ -18,31 +18,35 @@ ownership, and `formal/COVERAGE.md` for acceptance status.
   supervised reset/revoke, or host recovery. Further FPS capture is explicitly
   user-deferred and must stay unaccepted in `formal/COVERAGE.md`.
 
-## Remaining userspace ABI
+## Userspace wait-set ABI
 
-The open ABI is a generic capability-bound wait set, not a missing GPU renderer
-or a private Wayland protocol:
+The generic capability-bound wait set is not a missing GPU renderer or a
+private Wayland protocol. Its source/model implementation now has these owners:
 
-1. `epoll_wait` currently performs one vfsd readiness query and does not honor
-   its timeout as a durable wait.
-2. uiserver dispatches Wayland clients nonblocking, but its idle wait cannot
-   atomically include the Wayland backend's changing client-fd set alongside
-   input and runtime deadlines.
-3. inputd's worker can transfer the last raw input record into its private
-   policy queue between a readiness probe and ring0 waiter registration.
+1. vfsd owns bounded epoll membership keyed by provider object and exact
+   service epoch, rather than by a reusable numeric fd.
+2. netd/inputd own readiness truth and publish monotonic generations.
+3. compat owns only bounded task wait tokens, check-register-service-recheck,
+   scheduler arm plus exact waiter-presence recheck, deadline/cancel wakeup,
+   and the final authoritative provider recheck. Provider queries use at most
+   16 ms and never exceed the remaining finite wait deadline.
+4. service object references follow dup/fork/close/CLOEXEC/process exit, and a
+   provider restart wakes then revokes old-epoch waits.
 
-The next ABI needs service-owned readiness generations/subscriptions, an
-atomic check-arm-recheck operation, timeout and cancellation, fd lifetime
-across close/dup/fork/exec, peer-close/error delivery, service restart/revoke,
-and bounded queue/backpressure rules. Ring0 may own wait tokens, user-copy, and
-sleep/wakeup substrate; it must not inspect inputd, netd, vfsd, or uiserver
-private queues or regain their policy.
+The source and finite-model boundary is implemented. Uiserver now duplicates
+Wayland-server's aggregate backend epoll open description into a demoted waiter,
+merges that wake with its input wake, and rearms only after client dispatch. Its
+runtime deadline remains the bounded fallback rather than the sole Wayland wake
+source. Bounded QEMU/KVM timeout, readiness, close, restart, and WayClick
+evidence is still required before commercial runtime acceptance, and the 55 FPS
+gate stays unaccepted until those measurements pass. Ring0 must continue to
+avoid inspecting inputd, netd, vfsd, or uiserver private queues.
 
-The existing uiserver input reader is a safe bounded bridge, not that general
-ABI. It performs a zero-time poll whose inputd `STATS` request has a 16 ms
-deadline before starting an authorized `READ`, preventing an empty-queue read
-from freezing uiserver. Do not remove it until the generic wait-set ABI has
-equivalent lost-wake and restart evidence.
+The existing uiserver input reader remains a safe bounded bridge. It performs a
+zero-time poll whose inputd `STATS` request has a 16 ms deadline before starting
+an authorized `READ`, preventing an empty-queue read from freezing uiserver. Do
+not remove it until the common wait-set path has equivalent runtime lost-wake
+and restart evidence.
 
 ## Continuation rules
 

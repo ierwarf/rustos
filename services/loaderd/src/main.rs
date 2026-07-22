@@ -376,6 +376,7 @@ fn handle_request(received: usize, request: &LoaderSpawnRequest) -> HandledLoade
         flags: 0,
         reserved0: 0,
     };
+    debug_line(&format!("loaderd: prepare begin exec={exec_path}"));
     let prepare_handle = syscall1(
         SYS_RUSTOS_PROC_PREPARE_BROKER,
         (&prepare_args as *const RustosProcPrepareBrokerArgs) as u64,
@@ -386,6 +387,7 @@ fn handle_request(received: usize, request: &LoaderSpawnRequest) -> HandledLoade
         response.status = (-prepare_handle) as i32;
         return spawn_response(response);
     }
+    debug_line(&format!("loaderd: prepare done exec={exec_path}"));
     let prepared = match map_executable_segments(
         fd,
         exec_path,

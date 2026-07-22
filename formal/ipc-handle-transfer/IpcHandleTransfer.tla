@@ -10,12 +10,14 @@ Concrete owners:
   * kernel/compat/src/user/syscall/linux/ipc_ops.rs
   * kernel/ps/src/multitask/current.rs
 
-The descriptor registry owns the duplicated handle entry until exactly one of:
+The descriptor registry owns the duplicated handle entry and, for a
+service-backed open description, one matching service reference until exactly one of:
 the receiving process installs it, an enqueue/dequeue/peer-close/caller-exit
 cleanup discards it.  The IPC runtime intentionally carries only opaque
 KernelTransferredHandle values, while the process substrate owns the actual
 handle entries.  This separation is safe only if every path that removes an
-endpoint message returns its descriptors to the substrate.
+endpoint message returns its descriptors to the substrate and every accepted
+installation adopts the already-acquired service reference.
 
 Linearization points: registry insertion, endpoint enqueue/dequeue, pre-dequeue
 receiver-output validation, registry
@@ -47,14 +49,16 @@ OutputInvalid == "invalid"
 
 VARIABLES transferState,
           registryPresent,
+          serviceRef,
           messageState,
           receiverOutput
 
-vars == <<transferState, registryPresent, messageState, receiverOutput>>
+vars == <<transferState, registryPresent, serviceRef, messageState, receiverOutput>>
 
 Init ==
     /\ transferState = [descriptor \in Descriptors |-> Source]
     /\ registryPresent = [descriptor \in Descriptors |-> FALSE]
+    /\ serviceRef = [descriptor \in Descriptors |-> FALSE]
     /\ messageState = NoMessage
     /\ receiverOutput = OutputReady
 
@@ -62,6 +66,7 @@ ExportBatch ==
     /\ \A descriptor \in Descriptors : transferState[descriptor] = Source
     /\ transferState' = [descriptor \in Descriptors |-> Exported]
     /\ registryPresent' = [descriptor \in Descriptors |-> TRUE]
+    /\ serviceRef' = [descriptor \in Descriptors |-> TRUE]
     /\ UNCHANGED <<messageState, receiverOutput>>
 
 EnqueueBatch ==
@@ -71,12 +76,13 @@ EnqueueBatch ==
     /\ messageState = NoMessage
     /\ transferState' = [descriptor \in Descriptors |-> Queued]
     /\ messageState' = QueuedMessage
-    /\ UNCHANGED <<registryPresent, receiverOutput>>
+    /\ UNCHANGED <<registryPresent, serviceRef, receiverOutput>>
 
 RejectEnqueue ==
     /\ \A descriptor \in Descriptors : transferState[descriptor] = Exported
     /\ transferState' = [descriptor \in Descriptors |-> Dropped]
     /\ registryPresent' = [descriptor \in Descriptors |-> FALSE]
+    /\ serviceRef' = [descriptor \in Descriptors |-> FALSE]
     /\ messageState' = CancelledMessage
     /\ UNCHANGED receiverOutput
 
@@ -84,7 +90,7 @@ SetInvalidReceiverOutput ==
     /\ messageState = QueuedMessage
     /\ receiverOutput = OutputReady
     /\ receiverOutput' = OutputInvalid
-    /\ UNCHANGED <<transferState, registryPresent, messageState>>
+    /\ UNCHANGED <<transferState, registryPresent, serviceRef, messageState>>
 
 (*******************************************************************************
 The runtime's capacity check leaves the message queued. If a later user-output
@@ -97,6 +103,7 @@ RejectReceivedBatch ==
     /\ \A descriptor \in Descriptors : transferState[descriptor] = Queued
     /\ transferState' = [descriptor \in Descriptors |-> Dropped]
     /\ registryPresent' = [descriptor \in Descriptors |-> FALSE]
+    /\ serviceRef' = [descriptor \in Descriptors |-> FALSE]
     /\ messageState' = CancelledMessage
     /\ UNCHANGED receiverOutput
 
@@ -108,7 +115,7 @@ ReceiveBatch ==
         /\ registryPresent[descriptor]
     /\ transferState' = [descriptor \in Descriptors |-> Received]
     /\ messageState' = ReceivedMessage
-    /\ UNCHANGED <<registryPresent, receiverOutput>>
+    /\ UNCHANGED <<registryPresent, serviceRef, receiverOutput>>
 
 InstallBatch ==
     /\ messageState = ReceivedMessage
@@ -118,7 +125,7 @@ InstallBatch ==
     /\ transferState' = [descriptor \in Descriptors |-> Installed]
     /\ registryPresent' = [descriptor \in Descriptors |-> FALSE]
     /\ messageState' = NoMessage
-    /\ UNCHANGED receiverOutput
+    /\ UNCHANGED <<serviceRef, receiverOutput>>
 
 \* A peer can die after dequeue but before the process substrate installs the
 \* descriptors.  This is distinct from a queued-message close: the registry
@@ -131,6 +138,7 @@ EndpointOwnerExitsWithReceivedBatch ==
         /\ registryPresent[descriptor]
     /\ transferState' = [descriptor \in Descriptors |-> Dropped]
     /\ registryPresent' = [descriptor \in Descriptors |-> FALSE]
+    /\ serviceRef' = [descriptor \in Descriptors |-> FALSE]
     /\ messageState' = CancelledMessage
     /\ UNCHANGED receiverOutput
 
@@ -139,6 +147,7 @@ CallerCancelsQueuedBatch ==
     /\ \A descriptor \in Descriptors : transferState[descriptor] = Queued
     /\ transferState' = [descriptor \in Descriptors |-> Dropped]
     /\ registryPresent' = [descriptor \in Descriptors |-> FALSE]
+    /\ serviceRef' = [descriptor \in Descriptors |-> FALSE]
     /\ messageState' = CancelledMessage
     /\ UNCHANGED receiverOutput
 
@@ -146,13 +155,14 @@ EndpointOwnerCloses ==
     /\ messageState = QueuedMessage
     /\ \A descriptor \in Descriptors : transferState[descriptor] = Queued
     /\ messageState' = PeerClosedMessage
-    /\ UNCHANGED <<transferState, registryPresent, receiverOutput>>
+    /\ UNCHANGED <<transferState, registryPresent, serviceRef, receiverOutput>>
 
 CallerObservesPeerClose ==
     /\ messageState = PeerClosedMessage
     /\ \A descriptor \in Descriptors : transferState[descriptor] = Queued
     /\ transferState' = [descriptor \in Descriptors |-> Dropped]
     /\ registryPresent' = [descriptor \in Descriptors |-> FALSE]
+    /\ serviceRef' = [descriptor \in Descriptors |-> FALSE]
     /\ messageState' = CancelledMessage
     /\ UNCHANGED receiverOutput
 
@@ -166,6 +176,7 @@ CallerExitsWithQueuedBatch ==
     /\ \A descriptor \in Descriptors : transferState[descriptor] = Queued
     /\ transferState' = [descriptor \in Descriptors |-> Dropped]
     /\ registryPresent' = [descriptor \in Descriptors |-> FALSE]
+    /\ serviceRef' = [descriptor \in Descriptors |-> FALSE]
     /\ messageState' = CancelledMessage
     /\ UNCHANGED receiverOutput
 
@@ -188,6 +199,7 @@ TypeOK ==
     /\ transferState \in [Descriptors -> {Source, Exported, Queued, Received,
                                            Installed, Dropped}]
     /\ registryPresent \in [Descriptors -> BOOLEAN]
+    /\ serviceRef \in [Descriptors -> BOOLEAN]
     /\ messageState \in {NoMessage, QueuedMessage, ReceivedMessage,
                           PeerClosedMessage, CancelledMessage}
     /\ receiverOutput \in {OutputReady, OutputInvalid}
@@ -196,6 +208,11 @@ RegistryContainsExactlyLiveDescriptors ==
     \A descriptor \in Descriptors :
         registryPresent[descriptor] <=>
             transferState[descriptor] \in {Exported, Queued, Received}
+
+ServiceReferenceCoversEveryPublishedOrInstalledDescription ==
+    \A descriptor \in Descriptors :
+        serviceRef[descriptor] <=>
+            transferState[descriptor] \in {Exported, Queued, Received, Installed}
 
 BatchTransferIsAllOrNothing ==
     \A first, second \in Descriptors :

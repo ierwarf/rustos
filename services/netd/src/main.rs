@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::io::Write;
 use std::mem::size_of;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, LockResult, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant as StdInstant};
@@ -37,7 +37,14 @@ use rustos_user_abi::syscall::{
     SYS_RUSTOS_IPC_RECV, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
     SYS_RUSTOS_NET_BROKER,
 };
-use smoltcp::iface::{Config as SmolConfig, Interface, SocketHandle, SocketSet};
+#[cfg(not(test))]
+use rustos_user_abi::syscall::{
+    WaitSetSignalBrokerArgs, SYS_RUSTOS_WAITSET_SIGNAL_BROKER, WAITSET_ABI_VERSION,
+    WAITSET_GLOBAL_OBJECT_ID, WAITSET_PROVIDER_NETD,
+};
+use smoltcp::iface::{
+    Config as SmolConfig, Interface, PollIngressSingleResult, PollResult, SocketHandle, SocketSet,
+};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::tcp;
 use smoltcp::time::Instant as SmolInstant;
@@ -54,6 +61,7 @@ const MAX_PENDING_BLOCKING_REQUESTS: usize = 32;
 static PENDING_BLOCKING_REQUESTS: AtomicUsize = AtomicUsize::new(0);
 static PENDING_LOCAL_POLLS: AtomicUsize = AtomicUsize::new(0);
 static ACTIVE_BLOCKING_WORKERS: AtomicUsize = AtomicUsize::new(0);
+static READINESS_GENERATION: AtomicU64 = AtomicU64::new(1);
 const MAX_LISTEN_BACKLOG: usize = 128;
 const SOCKET_BUFFER_CAPACITY: usize = 1024 * 1024;
 const SOCKET_CONTROL_BUFFER_CAPACITY: usize = 64 * 1024;
@@ -71,6 +79,13 @@ const LOCAL_SOCKET_POLL_WAIT_BUDGET: Duration = Duration::from_secs(5);
 // turned a healthy transitional aperture into a permanent ENODEV for netprobe.
 const AUTHENTICATED_CONTROL_WAIT: Duration = Duration::from_secs(5);
 const AUTHENTICATED_CONTROL_RETRY: Duration = Duration::from_millis(4);
+/// The DVM packet ring has no interrupt edge exposed to userspace. Keep the
+/// provider-side ingress check bounded and substantially below an interactive
+/// deadline; only an actual smoltcp socket-state transition advances the
+/// public wait-set generation. Each turn processes at most the fixed ingress
+/// budget before yielding, even if a hostile producer keeps refilling the ring.
+const INET_READINESS_POLL_INTERVAL: Duration = Duration::from_millis(1);
+const INET_READINESS_POLL_BUDGET: usize = 32;
 const QEMU_USERNET_ADDR: Ipv4Address = Ipv4Address::new(10, 0, 2, 15);
 const QEMU_USERNET_GATEWAY: Ipv4Address = Ipv4Address::new(10, 0, 2, 2);
 const QEMU_USERNET_MAC: EthernetAddress = EthernetAddress([0x52, 0x54, 0x00, 0x12, 0x34, 0x56]);
@@ -103,6 +118,7 @@ fn main() {
 
 fn serve(endpoint: u64) {
     start_blocking_workers();
+    start_inet_readiness_worker();
     for worker_index in 1..NETD_REQUEST_WORKERS {
         let name = format!("netd-rpc-{worker_index}");
         if thread::Builder::new()
@@ -114,6 +130,33 @@ fn serve(endpoint: u64) {
         }
     }
     serve_request_loop(endpoint);
+}
+
+fn start_inet_readiness_worker() {
+    if thread::Builder::new()
+        .name("netd-inet-readiness".to_owned())
+        .spawn(inet_readiness_worker_loop)
+        .is_err()
+    {
+        debug_line("netd: INET readiness worker unavailable");
+        std::process::exit(134);
+    }
+}
+
+fn inet_readiness_worker_loop() {
+    loop {
+        let readiness_changed = {
+            let mut state = net_state().lock().unwrap();
+            state
+                .inet
+                .as_mut()
+                .is_some_and(|stack| stack.poll_budget(INET_READINESS_POLL_BUDGET))
+        };
+        if readiness_changed {
+            advance_readiness_generation();
+        }
+        thread::sleep(INET_READINESS_POLL_INTERVAL);
+    }
 }
 
 fn serve_request_loop(endpoint: u64) {
@@ -477,11 +520,15 @@ fn run_blocking_request(request: &NetdIpcRequest, response: &mut NetdIpcResponse
             thread::sleep(Duration::from_millis(1));
             status = poll_inet_connect(request);
         }
-        return if status == libc::EINPROGRESS {
+        let status = if status == libc::EINPROGRESS {
             libc::ETIMEDOUT
         } else {
             status
         };
+        if status == 0 {
+            advance_readiness_generation();
+        }
+        return status;
     }
 
     for _ in 0..INET_IO_POLL_BUDGET {
@@ -513,11 +560,11 @@ fn reply_commercial_request(reply_cap: u64, request: &CommercialMaxProtocolReque
 }
 
 fn dispatch_request(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
-    match request.op {
+    let status = match request.op {
         SYSCALL_OFFLOAD_OP_LINUX_SOCKET => handle_socket(request, response),
         SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR => handle_socketpair(request, response),
         SYSCALL_OFFLOAD_OP_LINUX_DUP => handle_dup(request),
-        SYSCALL_OFFLOAD_OP_LINUX_CLOSE => handle_close(request),
+        SYSCALL_OFFLOAD_OP_LINUX_CLOSE => handle_close(request, response),
         SYSCALL_OFFLOAD_OP_LINUX_BIND => handle_bind(request),
         SYSCALL_OFFLOAD_OP_LINUX_LISTEN => handle_listen(request),
         SYSCALL_OFFLOAD_OP_LINUX_ACCEPT => handle_accept(request, response),
@@ -535,6 +582,66 @@ fn dispatch_request(request: &NetdIpcRequest, response: &mut NetdIpcResponse) ->
         SYSCALL_OFFLOAD_OP_LINUX_GETSOCKOPT => handle_getsockopt(request, response),
         SYSCALL_OFFLOAD_OP_LINUX_SHUTDOWN => handle_shutdown(request),
         _ => libc::EINVAL,
+    };
+    if status == 0 && request_mutates_readiness(request.op) {
+        advance_readiness_generation();
+    }
+    status
+}
+
+fn request_mutates_readiness(op: u16) -> bool {
+    matches!(
+        op,
+        SYSCALL_OFFLOAD_OP_LINUX_SOCKET
+            | SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR
+            | SYSCALL_OFFLOAD_OP_LINUX_DUP
+            | SYSCALL_OFFLOAD_OP_LINUX_CLOSE
+            | SYSCALL_OFFLOAD_OP_LINUX_BIND
+            | SYSCALL_OFFLOAD_OP_LINUX_LISTEN
+            | SYSCALL_OFFLOAD_OP_LINUX_ACCEPT
+            | SYSCALL_OFFLOAD_OP_LINUX_CONNECT
+            | SYSCALL_OFFLOAD_OP_LINUX_SENDTO
+            | SYSCALL_OFFLOAD_OP_LINUX_SENDMSG
+            | SYSCALL_OFFLOAD_OP_LINUX_RECVFROM
+            | SYSCALL_OFFLOAD_OP_LINUX_RECVMSG
+            | SYSCALL_OFFLOAD_OP_LINUX_SHUTDOWN
+    )
+}
+
+fn advance_readiness_generation() {
+    let generation = READINESS_GENERATION
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
+            generation.checked_add(1)
+        })
+        .unwrap_or_else(|_| {
+            debug_line("netd: readiness generation exhausted");
+            std::process::exit(134);
+        })
+        + 1;
+    publish_readiness_generation(generation);
+}
+
+fn publish_readiness_generation(generation: u64) {
+    #[cfg(test)]
+    let _ = generation;
+    #[cfg(not(test))]
+    {
+        let args = WaitSetSignalBrokerArgs {
+            abi_version: WAITSET_ABI_VERSION,
+            provider: WAITSET_PROVIDER_NETD,
+            flags: 0,
+            object_id: WAITSET_GLOBAL_OBJECT_ID,
+            generation,
+            reserved0: 0,
+        };
+        let result = syscall1(
+            SYS_RUSTOS_WAITSET_SIGNAL_BROKER,
+            (&args as *const WaitSetSignalBrokerArgs) as u64,
+        );
+        if result < 0 {
+            debug_line("netd: readiness generation publication failed");
+            std::process::exit(134);
+        }
     }
 }
 
@@ -735,16 +842,31 @@ impl InetStack {
         self.sockets.remove(handle);
     }
 
-    fn poll(&mut self) {
-        let _ = self
+    fn poll_one(&mut self) -> (bool, bool) {
+        let now = smol_now();
+        self.iface.poll_maintenance(now);
+        let ingress = self
             .iface
-            .poll(smol_now(), &mut self.device, &mut self.sockets);
+            .poll_ingress_single(now, &mut self.device, &mut self.sockets);
+        let egress = self
+            .iface
+            .poll_egress(now, &mut self.device, &mut self.sockets);
+        (
+            !matches!(ingress, PollIngressSingleResult::None),
+            poll_turn_changes_readiness(ingress, egress),
+        )
     }
 
-    fn poll_budget(&mut self, budget: usize) {
+    fn poll_budget(&mut self, budget: usize) -> bool {
+        let mut readiness_changed = false;
         for _ in 0..budget {
-            self.poll();
+            let (processed_ingress, changed) = self.poll_one();
+            readiness_changed |= changed;
+            if !processed_ingress {
+                break;
+            }
         }
+        readiness_changed
     }
 
     fn next_ephemeral_port(&mut self) -> u16 {
@@ -756,6 +878,11 @@ impl InetStack {
         };
         port
     }
+}
+
+fn poll_turn_changes_readiness(ingress: PollIngressSingleResult, egress: PollResult) -> bool {
+    matches!(ingress, PollIngressSingleResult::SocketStateChanged)
+        || matches!(egress, PollResult::SocketStateChanged)
 }
 
 struct BrokerDevice;
@@ -947,11 +1074,12 @@ fn handle_dup(request: &NetdIpcRequest) -> i32 {
     0
 }
 
-fn handle_close(request: &NetdIpcRequest) -> i32 {
+fn handle_close(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
     let mut state = net_state().lock().unwrap();
     if let Some(socket) = state.inet_sockets.get_mut(&request.socket_token) {
         if socket.refs > 1 {
             socket.refs -= 1;
+            response.value = socket.refs as u64;
             return 0;
         }
         let Some(socket) = state.inet_sockets.remove(&request.socket_token) else {
@@ -968,6 +1096,7 @@ fn handle_close(request: &NetdIpcRequest) -> i32 {
     };
     if socket.refs > 1 {
         socket.refs -= 1;
+        response.value = socket.refs as u64;
         return 0;
     }
     let Some(socket) = state.sockets.remove(&request.socket_token) else {
@@ -1445,17 +1574,24 @@ fn handle_inet_poll(request: &NetdIpcRequest, response: &mut NetdIpcResponse) ->
 }
 
 fn handle_poll_socket(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
-    if inet_socket_exists(request.socket_token) {
-        return handle_inet_poll(request, response);
-    }
-    let state = net_state().lock().unwrap();
-    match unix_socket_revents(&state, request.socket_token, request.arg1 as u32) {
-        Ok(revents) => {
-            response.value = revents as u64;
-            0
+    let status = if inet_socket_exists(request.socket_token) {
+        handle_inet_poll(request, response)
+    } else {
+        let state = net_state().lock().unwrap();
+        match unix_socket_revents(&state, request.socket_token, request.arg1 as u32) {
+            Ok(revents) => {
+                response.value = revents as u64;
+                0
+            }
+            Err(errno) => errno,
         }
-        Err(errno) => errno,
+    };
+    if status == 0 {
+        response.payload[..8]
+            .copy_from_slice(&READINESS_GENERATION.load(Ordering::Acquire).to_le_bytes());
+        response.payload_len = 8;
     }
+    status
 }
 
 fn unix_socket_revents(state: &NetState, token: u64, requested: u32) -> Result<u32, i32> {
@@ -1937,7 +2073,7 @@ fn discard_unpublished_socket_tokens(socket_token: u64, token_a: u64, token_b: u
             socket_token: token,
             ..NetdIpcRequest::default()
         };
-        let _ = handle_close(&request);
+        let _ = handle_close(&request, &mut NetdIpcResponse::default());
     }
 }
 
@@ -2055,10 +2191,27 @@ fn await_authenticated_packet_provider() -> Result<(), i32> {
 #[cfg(test)]
 mod packet_provider_state_tests {
     use super::{
-        packet_provider_state_from_wire, PacketProviderState, NET_BROKER_PACKET_STATUS_ACTIVE,
+        packet_provider_state_from_wire, poll_turn_changes_readiness, PacketProviderState,
+        PollIngressSingleResult, PollResult, NET_BROKER_PACKET_STATUS_ACTIVE,
         NET_BROKER_PACKET_STATUS_AWAITING_AUTHENTICATED_CONTROL,
         NET_BROKER_PACKET_STATUS_UNAVAILABLE,
     };
+
+    #[test]
+    fn inet_ingress_publishes_only_socket_state_transitions() {
+        assert!(poll_turn_changes_readiness(
+            PollIngressSingleResult::SocketStateChanged,
+            PollResult::None,
+        ));
+        assert!(poll_turn_changes_readiness(
+            PollIngressSingleResult::PacketProcessed,
+            PollResult::SocketStateChanged,
+        ));
+        assert!(!poll_turn_changes_readiness(
+            PollIngressSingleResult::PacketProcessed,
+            PollResult::None,
+        ));
+    }
 
     #[test]
     fn packet_provider_wire_states_are_explicit_and_fail_closed() {
@@ -2192,7 +2345,7 @@ mod local_socket_poll_tests {
     }
 
     #[test]
-    fn netd_v2_rejects_the_retired_fixed_size_wire_frame() {
+    fn netd_v3_rejects_the_retired_fixed_size_wire_frame() {
         let request = NetdIpcRequest {
             version: NETD_IPC_ABI_VERSION,
             op: SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET,

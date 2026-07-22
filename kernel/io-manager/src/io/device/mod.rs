@@ -74,14 +74,15 @@ impl From<kernel_object::api::device::DeviceAccessKind> for DeviceAccessKind {
 pub struct DeviceHandle {
     device_id: DeviceId,
     access_kind: DeviceAccessKind,
+    token: u64,
 }
 
 impl DeviceHandle {
-    pub const fn from_parts(device_id: DeviceId, access_kind: DeviceAccessKind) -> Self {
-        Self {
-            device_id,
-            access_kind,
-        }
+    pub fn from_parts(device_id: DeviceId, access_kind: DeviceAccessKind) -> Self {
+        Self::from_object_handle(kernel_object::api::device::DeviceHandle::with_access(
+            device_id.into(),
+            access_kind.into(),
+        ))
     }
 
     pub const fn device_id(self) -> DeviceId {
@@ -92,8 +93,12 @@ impl DeviceHandle {
         self.access_kind
     }
 
-    pub const fn into_object_handle(self) -> kernel_object::api::device::DeviceHandle {
-        kernel_object::api::device::DeviceHandle::with_access(
+    pub const fn token_id(self) -> u64 {
+        self.token
+    }
+
+    pub fn into_object_handle(self) -> kernel_object::api::device::DeviceHandle {
+        kernel_object::api::device::DeviceHandle::from_parts_with_token(
             match self.device_id {
                 DeviceId::Console => kernel_object::api::device::DeviceId::Console,
                 DeviceId::Display => kernel_object::api::device::DeviceId::Display,
@@ -103,21 +108,23 @@ impl DeviceHandle {
                 DeviceAccessKind::Native => kernel_object::api::device::DeviceAccessKind::Native,
                 DeviceAccessKind::Evdev => kernel_object::api::device::DeviceAccessKind::Evdev,
             },
+            self.token,
         )
     }
 
     pub const fn from_object_handle(handle: kernel_object::api::device::DeviceHandle) -> Self {
-        Self::from_parts(
-            match handle.device_id() {
+        Self {
+            device_id: match handle.device_id() {
                 kernel_object::api::device::DeviceId::Console => DeviceId::Console,
                 kernel_object::api::device::DeviceId::Display => DeviceId::Display,
                 kernel_object::api::device::DeviceId::Input => DeviceId::Input,
             },
-            match handle.access_kind() {
+            access_kind: match handle.access_kind() {
                 kernel_object::api::device::DeviceAccessKind::Native => DeviceAccessKind::Native,
                 kernel_object::api::device::DeviceAccessKind::Evdev => DeviceAccessKind::Evdev,
             },
-        )
+            token: handle.token_id(),
+        }
     }
 }
 
@@ -199,5 +206,6 @@ mod tests {
         let restored = DeviceHandle::from_object_handle(object);
         assert_eq!(restored.device_id(), DeviceId::Input);
         assert_eq!(restored.access_kind(), DeviceAccessKind::Evdev);
+        assert_eq!(restored.token_id(), handle.token_id());
     }
 }

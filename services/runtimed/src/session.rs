@@ -15,14 +15,17 @@ use rustos_user_abi::device::{InputEvent, INPUT_ACTION_RELEASED, INPUT_KIND_KEYB
 use rustos_user_abi::linux::LinuxTermios;
 use rustos_user_abi::syscall::{
     CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
-    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse,
+    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, WaitSetSignalBrokerArgs,
     COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_SESSIOND,
-    COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_READ, COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_WRITE,
-    COMMERCIAL_MAX_SESSIOND_OP_CONSOLE_ROUTE, COMMERCIAL_MAX_SESSIOND_OP_FOREGROUND_FOCUS,
-    COMMERCIAL_MAX_SESSIOND_OP_SESSION_GRAPH, COMMERCIAL_MAX_SESSIOND_OP_TTY_LINE_DISCIPLINE,
-    COMMERCIAL_MAX_SESSIOND_OP_UI_BOOTSTRAP, IPC_SERVICE_DEVMGRD, IPC_SERVICE_SESSIOND,
-    SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
-    SYS_RUSTOS_IPC_TRY_RECV,
+    COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_READ, COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_READINESS,
+    COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_WRITE, COMMERCIAL_MAX_SESSIOND_OP_CONSOLE_ROUTE,
+    COMMERCIAL_MAX_SESSIOND_OP_FOREGROUND_FOCUS, COMMERCIAL_MAX_SESSIOND_OP_SESSION_GRAPH,
+    COMMERCIAL_MAX_SESSIOND_OP_TTY_LINE_DISCIPLINE, COMMERCIAL_MAX_SESSIOND_OP_UI_BOOTSTRAP,
+    IPC_SERVICE_DEVMGRD, IPC_SERVICE_SESSIOND, SESSIOND_CONSOLE_READINESS_LIVE,
+    SESSIOND_CONSOLE_READINESS_READY, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
+    SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_IPC_TRY_RECV,
+    SYS_RUSTOS_WAITSET_SIGNAL_BROKER, WAITSET_ABI_VERSION, WAITSET_GLOBAL_OBJECT_ID,
+    WAITSET_PROVIDER_SESSIOND,
 };
 
 use super::{
@@ -38,10 +41,20 @@ const OUTPUT_BUFFER_CAPACITY: usize = 4096;
 const SERVICE_ENDPOINT_READY_ATTEMPTS: u32 = 4096;
 const SERVICE_ENDPOINT_REGISTER_ATTEMPTS: u32 = 65_536;
 
-#[derive(Default)]
 pub(crate) struct SessionRuntime {
     sessions: BTreeMap<u64, TtySessionState>,
     output_generation: u64,
+    input_readiness_generation: u64,
+}
+
+impl Default for SessionRuntime {
+    fn default() -> Self {
+        Self {
+            sessions: BTreeMap::new(),
+            output_generation: 0,
+            input_readiness_generation: 1,
+        }
+    }
 }
 
 impl SessionRuntime {
@@ -50,7 +63,14 @@ impl SessionRuntime {
     }
 
     pub(crate) fn remove_session(&mut self, session: u64) {
-        self.sessions.remove(&session);
+        if self.sessions.remove(&session).is_some() {
+            self.input_readiness_generation = self
+                .input_readiness_generation
+                .checked_add(1)
+                .expect("sessiond input readiness generation exhausted");
+            #[cfg(not(test))]
+            publish_input_readiness(self.input_readiness_generation);
+        }
     }
 
     fn session_mut(&mut self, session: u64) -> &mut TtySessionState {
@@ -75,19 +95,29 @@ impl SessionRuntime {
         Some(state.snapshot_output(dest))
     }
 
-    fn handle_input_event(&mut self, session: u64, event: InputEvent) -> Result<(), i32> {
+    fn handle_input_event(&mut self, session: u64, event: InputEvent) -> Result<bool, i32> {
         if event.kind != INPUT_KIND_KEYBOARD {
-            return Ok(());
+            return Ok(false);
         }
         if event.action == INPUT_ACTION_RELEASED {
-            return Ok(());
+            return Ok(false);
         }
-        let state = self.session_mut(session);
-        let changed = state.on_key_event(event)?;
+        let (changed, became_ready) = {
+            let state = self.session_mut(session);
+            let was_ready = !state.input.is_empty();
+            let changed = state.on_key_event(event)?;
+            (changed, !was_ready && !state.input.is_empty())
+        };
         if changed {
             self.output_generation = self.output_generation.wrapping_add(1).max(1);
         }
-        Ok(())
+        if became_ready {
+            self.input_readiness_generation = self
+                .input_readiness_generation
+                .checked_add(1)
+                .expect("sessiond input readiness generation exhausted");
+        }
+        Ok(became_ready)
     }
 
     fn termios(&mut self, session: u64) -> LinuxTermios {
@@ -104,6 +134,20 @@ impl SessionRuntime {
 
     fn output_generation(&self) -> u64 {
         self.output_generation
+    }
+
+    fn input_readiness_generation(&self) -> u64 {
+        self.input_readiness_generation
+    }
+
+    fn input_readiness_snapshot(&self, session: u64) -> (bool, bool, u64) {
+        (
+            self.sessions
+                .get(&session)
+                .is_some_and(|state| !state.input.is_empty()),
+            self.sessions.contains_key(&session),
+            self.input_readiness_generation,
+        )
     }
 }
 
@@ -583,6 +627,7 @@ fn session_op_accepts_ioctl(op: u16, request_number: u64) -> bool {
                 | console_abi::CONSOLE_IOCTL_BIND_CURRENT_SESSION
                 | console_abi::CONSOLE_IOCTL_SET_SESSION_STATE
                 | COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_READ
+                | COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_READINESS
                 | COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_WRITE
         ),
         COMMERCIAL_MAX_SESSIOND_OP_FOREGROUND_FOCUS => {
@@ -671,6 +716,24 @@ fn handle_console_route_request(
             response.value0 = read as u64;
             0
         }
+        COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_READINESS => {
+            let session = request.arg2;
+            if session == 0 || request.payload_len != 0 || request.arg3 != 0 {
+                return libc::EINVAL;
+            }
+            let (ready, live, generation) = state.session_runtime.input_readiness_snapshot(session);
+            response.value0 = if ready {
+                SESSIOND_CONSOLE_READINESS_READY
+            } else {
+                0
+            } | if live {
+                SESSIOND_CONSOLE_READINESS_LIVE
+            } else {
+                0
+            };
+            response.value1 = generation;
+            0
+        }
         console_abi::CONSOLE_IOCTL_SNAPSHOT_SESSION_OUTPUT => {
             if request.payload_len as usize != size_of::<ConsoleSnapshotSessionOutputRequest>() {
                 return libc::EINVAL;
@@ -708,7 +771,12 @@ fn handle_console_route_request(
                 .session_runtime
                 .handle_input_event(input.session_handle, input.event)
             {
-                Ok(()) => 0,
+                Ok(became_ready) => {
+                    if became_ready {
+                        publish_input_readiness(state.session_runtime.input_readiness_generation());
+                    }
+                    0
+                }
                 Err(errno) => errno,
             }
         }
@@ -720,6 +788,26 @@ fn handle_console_route_request(
                 .count() as u64;
             0
         }
+    }
+}
+
+fn publish_input_readiness(generation: u64) {
+    let args = WaitSetSignalBrokerArgs {
+        abi_version: WAITSET_ABI_VERSION,
+        provider: WAITSET_PROVIDER_SESSIOND,
+        flags: 0,
+        object_id: WAITSET_GLOBAL_OBJECT_ID,
+        generation,
+        reserved0: 0,
+    };
+    let status = unsafe {
+        libc::syscall(
+            SYS_RUSTOS_WAITSET_SIGNAL_BROKER as libc::c_long,
+            (&args as *const WaitSetSignalBrokerArgs) as u64,
+        ) as i64
+    };
+    if status < 0 {
+        boot_line("sessiond: input readiness publication failed");
     }
 }
 
@@ -992,5 +1080,53 @@ mod tests {
         let mut line = [0_u8; 8];
         let read = runtime.read_from_session(session, &mut line);
         assert_eq!(&line[..read], b"pwd\n");
+    }
+
+    #[test]
+    fn console_readiness_generation_advances_only_when_input_becomes_ready() {
+        let mut runtime = SessionRuntime::default();
+        let session = 9;
+        runtime.create_session(session);
+        let initial = runtime.input_readiness_generation();
+
+        assert!(!runtime
+            .handle_input_event(session, key_event(30, b'x'))
+            .expect("canonical edit is accepted but not readable"));
+        assert_eq!(runtime.input_readiness_generation(), initial);
+        assert!(runtime
+            .handle_input_event(session, key_event(KeyCode::Enter as u32, b'\n'))
+            .expect("enter makes the canonical line readable"));
+        assert_eq!(runtime.input_readiness_generation(), initial + 1);
+
+        assert!(!runtime
+            .handle_input_event(session, key_event(KeyCode::Enter as u32, b'\n'))
+            .expect("already-ready input does not republish"));
+        assert_eq!(runtime.input_readiness_generation(), initial + 1);
+
+        let mut drained = [0_u8; 8];
+        assert_ne!(runtime.read_from_session(session, &mut drained), 0);
+        assert!(runtime
+            .handle_input_event(session, key_event(KeyCode::Enter as u32, b'\n'))
+            .expect("a new empty-to-ready transition republishes"));
+        assert_eq!(runtime.input_readiness_generation(), initial + 2);
+    }
+
+    #[test]
+    fn console_close_revokes_readiness_without_resurrecting_the_session() {
+        let mut runtime = SessionRuntime::default();
+        let session = 10;
+        runtime.create_session(session);
+        let generation = runtime.input_readiness_generation();
+        assert_eq!(
+            runtime.input_readiness_snapshot(session),
+            (false, true, generation)
+        );
+
+        runtime.remove_session(session);
+        assert_eq!(
+            runtime.input_readiness_snapshot(session),
+            (false, false, generation + 1)
+        );
+        assert!(!runtime.sessions.contains_key(&session));
     }
 }

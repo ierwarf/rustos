@@ -789,6 +789,16 @@ fn run() -> Result<(), i32> {
     diag_line("uiserver: wayland initialize begin");
     let wayland_init_started = Instant::now();
     let mut wayland = WaylandCompositor::initialize(state.display.width, state.display.height);
+    if let Some(compositor) = wayland.as_mut() {
+        compositor
+            .attach_readiness_waker(input_events.wake_sender())
+            .map_err(|err| {
+                diag_line(format!(
+                    "uiserver: Wayland readiness waiter initialization failed: {err}"
+                ));
+                libc::EIO
+            })?;
+    }
     diag_line("uiserver: wayland initialize done");
     log_boot_stage(wayland_init_started, "wayland_initialize");
     sys::mark_display_policy_ready();
@@ -926,7 +936,9 @@ fn run() -> Result<(), i32> {
         watchdog.enter(UI_PHASE_WAYLAND);
         if let Some(compositor) = wayland.as_mut() {
             if service_wayland {
-                if compositor.tick() {
+                let wayland_changed = compositor.tick();
+                compositor.rearm_readiness();
+                if wayland_changed {
                     let wayland_dirty = state.sync_wayland_windows(compositor.window_snapshots());
                     compositor.clear_window_damage();
                     let focus_dirty = phase_result(

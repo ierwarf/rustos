@@ -67,6 +67,10 @@ pub const SYS_RUSTOS_ROOTD_TERMINATE_BROKER: u64 = 0x5255_003c;
 /// inputd may use this to wait for an MSI-X-published ingress batch; input
 /// policy and translation remain in the service.
 pub const SYS_RUSTOS_INPUT_WAIT_BROKER: u64 = 0x5255_003e;
+/// Capability-gated publication of a service-owned readiness generation.
+/// Ring0 uses the record only to wake already-armed generic wait-set tokens;
+/// the provider remains the authority for the subsequent readiness recheck.
+pub const SYS_RUSTOS_WAITSET_SIGNAL_BROKER: u64 = 0x5255_003f;
 /// Irreversibly removes the caller's base System scheduling admission.
 ///
 /// This is deliberately a self-demotion only: it never accepts a requested
@@ -238,7 +242,7 @@ pub const MM_BROKER_FD_RIGHT_READ: u64 = 1 << 0;
 pub const MM_BROKER_FD_RIGHT_WRITE: u64 = 1 << 1;
 pub const MM_BROKER_FD_RIGHT_MAP: u64 = 1 << 2;
 pub const MM_BROKER_PATH_CAPACITY: usize = 128;
-pub const VFS_IPC_ABI_VERSION: u16 = 1;
+pub const VFS_IPC_ABI_VERSION: u16 = 2;
 pub const VFS_IPC_OP_OPENAT: u16 = 1;
 pub const VFS_IPC_OP_CLOSE: u16 = 2;
 pub const VFS_IPC_OP_DUP: u16 = 3;
@@ -265,7 +269,50 @@ pub const VFS_IPC_OP_LIFECYCLE: u16 = 23;
 pub const VFS_POLL_QUERY_POLL: u64 = 1;
 pub const VFS_POLL_QUERY_EPOLL_CREATE: u64 = 2;
 pub const VFS_POLL_QUERY_EPOLL_CTL: u64 = 3;
-pub const VFS_POLL_QUERY_EPOLL_WAIT: u64 = 4;
+pub const VFS_POLL_QUERY_EPOLL_SNAPSHOT: u64 = 4;
+pub const VFS_POLL_QUERY_EPOLL_REF: u64 = 5;
+pub const VFS_POLL_QUERY_EPOLL_UNREF: u64 = 6;
+pub const VFS_POLL_QUERY_EPOLL_PURGE_OBJECT: u64 = 7;
+
+pub const WAITSET_ABI_VERSION: u16 = 1;
+pub const WAITSET_PROVIDER_VFSD: u16 = 1;
+pub const WAITSET_PROVIDER_NETD: u16 = 2;
+pub const WAITSET_PROVIDER_INPUTD: u16 = 3;
+pub const WAITSET_PROVIDER_SESSIOND: u16 = 4;
+pub const WAITSET_PROVIDER_MAX: u16 = WAITSET_PROVIDER_SESSIOND;
+pub const WAITSET_GLOBAL_OBJECT_ID: u64 = 0;
+pub const WAITSET_MAX_INTERESTS: usize = 512;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WaitSetSignalBrokerArgs {
+    pub abi_version: u16,
+    pub provider: u16,
+    pub flags: u32,
+    pub object_id: u64,
+    pub generation: u64,
+    pub reserved0: u64,
+}
+
+/// vfsd-owned epoll interest snapshot. `target_fd` preserves Linux's
+/// descriptor-key semantics, while `(provider, object_id)` binds the entry to
+/// the underlying open description so fd-number reuse cannot retarget it.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WaitSetInterestWire {
+    pub abi_version: u16,
+    pub provider: u16,
+    pub flags: u32,
+    pub target_fd: u64,
+    pub object_id: u64,
+    /// Exact provider endpoint publication epoch. Revoke or restart advances
+    /// it and prevents a reused endpoint or numeric object token from reviving
+    /// a stale interest.
+    pub provider_epoch: u64,
+    pub events: u32,
+    pub reserved0: u32,
+    pub data: u64,
+}
 pub const VFS_IPC_PATH_CAPACITY: usize = 512;
 pub const VFS_IPC_REQUEST_PAYLOAD_CAPACITY: usize = 512;
 pub const VFS_IPC_PAYLOAD_CAPACITY: usize = 32 * 1024;
@@ -310,7 +357,7 @@ pub const ROOTD_LEASE_STATE_RUNNING: u16 = 1;
 pub const ROOTD_LEASE_STATE_EXITED: u16 = 2;
 pub const ROOTD_LEASE_STATE_RESTART_PENDING: u16 = 3;
 pub const ROOTD_LEASE_STATE_FAILED: u16 = 4;
-pub const NETD_IPC_ABI_VERSION: u16 = 2;
+pub const NETD_IPC_ABI_VERSION: u16 = 3;
 pub const NETD_IPC_PAYLOAD_CAPACITY: usize = 32 * 1024;
 /// Netd v2 sends only the fixed header plus `payload_len`; the unused tail of
 /// the in-memory transport buffer is not copied through the kernel IPC path.
@@ -532,6 +579,11 @@ pub const COMMERCIAL_MAX_SESSIOND_OP_FOREGROUND_FOCUS: u16 = 4;
 pub const COMMERCIAL_MAX_SESSIOND_OP_UI_BOOTSTRAP: u16 = 5;
 pub const COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_READ: u64 = 0x100;
 pub const COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_WRITE: u64 = 0x101;
+pub const COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_READINESS: u64 = 0x102;
+pub const SESSIOND_CONSOLE_READINESS_READY: u64 = 1 << 0;
+pub const SESSIOND_CONSOLE_READINESS_LIVE: u64 = 1 << 1;
+pub const SESSIOND_CONSOLE_READINESS_MASK: u64 =
+    SESSIOND_CONSOLE_READINESS_READY | SESSIOND_CONSOLE_READINESS_LIVE;
 pub const COMMERCIAL_MAX_PAGERD_OP_BACKING_OBJECT: u16 = 1;
 pub const COMMERCIAL_MAX_PAGERD_OP_PAGE_CACHE_POLICY: u16 = 2;
 pub const COMMERCIAL_MAX_PAGERD_OP_FAULT_RESOLVE: u16 = 3;
@@ -932,6 +984,10 @@ pub struct InputStatsWire {
     pub dropped_lossy: u64,
     pub flags: u32,
     pub reserved0: u32,
+    /// inputd-owned monotonic generation of its policy queue readiness.
+    /// Consumers must recheck `queued` after arming a wait token; this value
+    /// is never itself treated as proof that an event remains consumable.
+    pub readiness_generation: u64,
 }
 
 pub const INPUT_STATS_FLAG_PENDING_COALESCED: u32 = 1 << 0;
@@ -939,7 +995,7 @@ pub const INPUT_STATS_FLAG_PENDING_POINTER_POSITION: u32 = 1 << 1;
 /// Version 2 adds the report-atomic absolute pointer position member to
 /// `InputIngressWire`.  The size/layout change is intentionally incompatible
 /// with version 1 so a mixed kernel/inputd image fails closed.
-pub const INPUTD_IPC_ABI_VERSION: u16 = 2;
+pub const INPUTD_IPC_ABI_VERSION: u16 = 3;
 pub const INPUTD_IPC_OP_PING: u16 = 1;
 pub const INPUTD_IPC_OP_STATS: u16 = 2;
 pub const INPUTD_IPC_OP_AUTHORIZE_READ: u16 = 3;
@@ -2552,7 +2608,7 @@ mod syscall_tests {
     }
 
     #[test]
-    fn netd_v2_wire_headers_exclude_the_reserved_payload_tail() {
+    fn netd_v3_wire_headers_exclude_the_reserved_payload_tail() {
         assert_eq!(NETD_IPC_REQUEST_HEADER_SIZE, 120);
         assert_eq!(NETD_IPC_RESPONSE_HEADER_SIZE, 32);
         assert_eq!(

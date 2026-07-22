@@ -27,6 +27,11 @@ use rustos_user_abi::syscall::{
     SYS_RUSTOS_INPUT_STATS_BROKER, SYS_RUSTOS_INPUT_WAIT_BROKER, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
     SYS_RUSTOS_IPC_RECV, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
 };
+#[cfg(not(test))]
+use rustos_user_abi::syscall::{
+    WaitSetSignalBrokerArgs, SYS_RUSTOS_WAITSET_SIGNAL_BROKER, WAITSET_ABI_VERSION,
+    WAITSET_GLOBAL_OBJECT_ID, WAITSET_PROVIDER_INPUTD,
+};
 
 // The DVM ingestion worker waits on the MSI-X-published ring and transfers
 // bounded batches into this user-space queue independently of app reads. App
@@ -48,7 +53,6 @@ impl PointerSurface {
     }
 }
 
-#[derive(Default)]
 struct InputQueue {
     events: VecDeque<input_evdev::InputEvent>,
     dvm_keyboard: KeyboardDriver,
@@ -61,6 +65,26 @@ struct InputQueue {
     published_pointer_buttons: u8,
     dvm_pointer_position: Option<(i32, i32)>,
     read_authorizations: VecDeque<InputReadAuthorization>,
+    readiness_generation: u64,
+}
+
+impl Default for InputQueue {
+    fn default() -> Self {
+        Self {
+            events: VecDeque::new(),
+            dvm_keyboard: KeyboardDriver::default(),
+            dvm_keyboard_observed: false,
+            dvm_pointer_observed: false,
+            pointer_surface: PointerSurface::default(),
+            dropped_discrete: 0,
+            dropped_lossy: 0,
+            dvm_pointer_buttons: 0,
+            published_pointer_buttons: 0,
+            dvm_pointer_position: None,
+            read_authorizations: VecDeque::new(),
+            readiness_generation: 1,
+        }
+    }
 }
 
 type SharedInputQueue = Arc<Mutex<InputQueue>>;
@@ -115,7 +139,11 @@ impl InputQueue {
         if !self.make_room_for(event) {
             return;
         }
+        let was_empty = self.events.is_empty();
         self.events.push_back(event);
+        if was_empty {
+            self.advance_readiness_generation(true);
+        }
     }
 
     fn make_room_for(&mut self, event: input_evdev::InputEvent) -> bool {
@@ -148,7 +176,21 @@ impl InputQueue {
     }
 
     fn pop_front(&mut self) -> Option<input_evdev::InputEvent> {
-        self.events.pop_front()
+        let event = self.events.pop_front();
+        if event.is_some() && self.events.is_empty() {
+            self.advance_readiness_generation(false);
+        }
+        event
+    }
+
+    fn advance_readiness_generation(&mut self, publish: bool) {
+        self.readiness_generation = self
+            .readiness_generation
+            .checked_add(1)
+            .expect("inputd readiness generation exhausted");
+        if publish {
+            publish_readiness_generation(self.readiness_generation);
+        }
     }
 
     fn set_pointer_surface(&mut self, width: u32, height: u32, generation: u64) -> Result<(), i32> {
@@ -406,6 +448,18 @@ mod tests {
             modifiers: 0,
             text: 0,
         }
+    }
+
+    #[test]
+    fn readiness_generation_closes_empty_queue_lost_wake_window() {
+        let mut queue = InputQueue::default();
+        let initial = queue.readiness_generation;
+        queue.push(pointer_motion(1, 0));
+        assert_eq!(queue.readiness_generation, initial + 1);
+        queue.push(pointer_motion(2, 0));
+        assert_eq!(queue.readiness_generation, initial + 1);
+        assert!(queue.pop_front().is_some());
+        assert_eq!(queue.readiness_generation, initial + 2);
     }
 
     fn pointer_packet(buttons: u8, dx: i16, dy: i16) -> InputPointerPacketWire {
@@ -1174,7 +1228,32 @@ fn fetch_stats(queue: &InputQueue) -> Result<InputStatsWire, i32> {
         .dropped_discrete
         .saturating_add(queue.dropped_discrete);
     stats.dropped_lossy = stats.dropped_lossy.saturating_add(queue.dropped_lossy);
+    stats.readiness_generation = queue.readiness_generation;
     Ok(stats)
+}
+
+fn publish_readiness_generation(generation: u64) {
+    #[cfg(test)]
+    let _ = generation;
+    #[cfg(not(test))]
+    {
+        let args = WaitSetSignalBrokerArgs {
+            abi_version: WAITSET_ABI_VERSION,
+            provider: WAITSET_PROVIDER_INPUTD,
+            flags: 0,
+            object_id: WAITSET_GLOBAL_OBJECT_ID,
+            generation,
+            reserved0: 0,
+        };
+        let result = syscall1(
+            SYS_RUSTOS_WAITSET_SIGNAL_BROKER,
+            (&args as *const WaitSetSignalBrokerArgs) as u64,
+        );
+        if result < 0 {
+            debug_line("inputd: readiness generation publication failed");
+            std::process::exit(134);
+        }
+    }
 }
 
 fn dispatch_commercial_request(

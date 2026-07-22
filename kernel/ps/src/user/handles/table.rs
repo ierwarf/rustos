@@ -295,6 +295,23 @@ impl HandleTable {
         }
     }
 
+    /// Stable descriptor snapshot for service-side open-description lifecycle
+    /// accounting. Callers must release the process-table lock before doing
+    /// IPC; the cloned handles are authority-free identifiers, not new fds.
+    pub fn entries_snapshot(&self, cloexec_only: bool) -> Vec<(u64, HandleEntry)> {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                let entry = entry.as_ref()?;
+                if cloexec_only && entry.fd_flags() & FD_CLOEXEC == 0 {
+                    return None;
+                }
+                Some((FIRST_DYNAMIC_FD as u64 + index as u64, entry.clone()))
+            })
+            .collect()
+    }
+
     pub fn duplicate_min(&mut self, fd: u64, min_fd: u64, close_on_exec: bool) -> Option<u64> {
         if min_fd > MAX_DYNAMIC_FD {
             return None;
@@ -439,6 +456,36 @@ mod tests {
 
         assert!(table.get(keep_fd.expect("keep descriptor")).is_some());
         assert!(table.get(drop_fd.expect("cloexec descriptor")).is_none());
+    }
+
+    #[test]
+    fn lifecycle_snapshot_is_descriptor_exact_and_filters_cloexec() {
+        let mut table = HandleTable::new();
+        let keep_fd = table
+            .install_entry(HandleEntry::new(
+                KernelHandle::VfsDirectory(VfsDirectoryHandle::new("/keep".into(), vec![])),
+                0,
+                0,
+            ))
+            .unwrap();
+        let cloexec_fd = table
+            .install_entry(HandleEntry::new(
+                KernelHandle::VfsDirectory(VfsDirectoryHandle::new("/exec".into(), vec![])),
+                FD_CLOEXEC,
+                0,
+            ))
+            .unwrap();
+
+        let all = table.entries_snapshot(false);
+        assert_eq!(
+            all.iter()
+                .map(|(fd, _)| *fd)
+                .collect::<alloc::vec::Vec<_>>(),
+            vec![keep_fd, cloexec_fd]
+        );
+        let cloexec = table.entries_snapshot(true);
+        assert_eq!(cloexec.len(), 1);
+        assert_eq!(cloexec[0].0, cloexec_fd);
     }
 
     #[test]

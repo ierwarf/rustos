@@ -15,6 +15,8 @@ mod lifecycle_broker_ops;
 mod net_broker_ops;
 #[path = "storage_broker_ops.rs"]
 mod storage_broker_ops;
+#[path = "waitset_broker_ops.rs"]
+pub(crate) mod waitset_broker_ops;
 
 use device_broker_ops::*;
 use driver_broker_ops::*;
@@ -22,6 +24,7 @@ use input_broker_ops::*;
 use lifecycle_broker_ops::*;
 use net_broker_ops::*;
 use storage_broker_ops::*;
+use waitset_broker_ops::*;
 
 pub(super) use device_broker_ops::device_sysop_error_to_linux_errno;
 
@@ -39,6 +42,7 @@ pub(super) fn is_linux_rustos_broker_syscall(syscall_number: u64) -> bool {
             | linux_abi::SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER
             | linux_abi::SYS_RUSTOS_ROOTD_WAIT_BROKER
             | linux_abi::SYS_RUSTOS_ROOTD_TERMINATE_BROKER
+            | linux_abi::SYS_RUSTOS_WAITSET_SIGNAL_BROKER
     )
 }
 
@@ -72,6 +76,9 @@ pub(super) fn dispatch_linux_rustos_broker_syscall(frame: &SyscallFrame) -> u64 
         }
         linux_abi::SYS_RUSTOS_ROOTD_TERMINATE_BROKER => {
             syscall_linux_rustos_rootd_terminate_broker(frame.rdi)
+        }
+        linux_abi::SYS_RUSTOS_WAITSET_SIGNAL_BROKER => {
+            syscall_linux_rustos_waitset_signal_broker(frame.rdi)
         }
         _ => linux_errno(LINUX_ENOSYS),
     }

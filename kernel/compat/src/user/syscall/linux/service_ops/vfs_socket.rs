@@ -87,11 +87,15 @@ pub fn syscall_linux_vfs_openat(dirfd: u64, path_ptr: u64, flags: u64, mode: u64
 }
 
 pub fn syscall_linux_vfs_close(fd: u64) -> u64 {
+    let epoll_token = current_epoll_handle(fd).map(|epoll| epoll.token_id());
+    let input_token = current_input_device_description(fd).map(|(token, _, _)| token);
+    let mut closed_socket = None;
     if current_socket_fd(fd) {
         let result = syscall_linux_net4(SYSCALL_OFFLOAD_OP_LINUX_CLOSE, fd, 0, 0, 0);
         if is_linux_error(result) {
             return result;
         }
+        closed_socket = current_socket_token(fd).map(|token| (token, result));
     } else if let Some(remote) = current_remote_vfs_handle(fd) {
         let mut request = new_vfs_request(VFS_IPC_OP_CLOSE);
         request.fd = fd;
@@ -101,13 +105,31 @@ pub fn syscall_linux_vfs_close(fd: u64) -> u64 {
         {
             return linux_errno(errno);
         }
+    } else if let Some(token) = epoll_token
+        && let Err(errno) = update_vfs_epoll_ref(token, false)
+    {
+        return linux_errno(errno);
     }
-    match multitask::with_current_user_process_state_mut(|_, _, process_state| {
+    let result = match multitask::with_current_user_process_state_mut(|_, _, process_state| {
         process_state.handles_mut().close(fd)
     }) {
         Some(Some(_)) => 0,
         _ => linux_errno(LINUX_EBADF),
+    };
+    if result == 0
+        && let Some((token, remaining_refs)) = closed_socket
+        && remaining_refs == 0
+    {
+        let _ = purge_vfs_epoll_object(WAITSET_PROVIDER_NETD, token);
     }
+    if result == 0
+        && let Some(token) = input_token
+        && super::super::broker_ops::waitset_broker_ops::release_input_open_description(token)
+            == Ok(true)
+    {
+        let _ = purge_vfs_epoll_object(WAITSET_PROVIDER_INPUTD, token);
+    }
+    result
 }
 
 pub fn syscall_linux_vfs_dup(oldfd: u64, newfd: u64, flags: u64, mode: VfsDupMode) -> u64 {
@@ -117,7 +139,14 @@ pub fn syscall_linux_vfs_dup(oldfd: u64, newfd: u64, flags: u64, mode: VfsDupMod
 
     let socket_token = current_socket_token(oldfd);
     let remote = current_remote_vfs_handle(oldfd);
-    if socket_token.is_none() && remote.is_none() && !current_fd_exists(oldfd) {
+    let epoll_token = current_epoll_handle(oldfd).map(|epoll| epoll.token_id());
+    let input_token = current_input_device_description(oldfd).map(|(token, _, _)| token);
+    if socket_token.is_none()
+        && remote.is_none()
+        && epoll_token.is_none()
+        && input_token.is_none()
+        && !current_fd_exists(oldfd)
+    {
         return linux_errno(LINUX_EBADF);
     }
     if matches!(mode, VfsDupMode::Dup2) && oldfd == newfd {
@@ -128,13 +157,25 @@ pub fn syscall_linux_vfs_dup(oldfd: u64, newfd: u64, flags: u64, mode: VfsDupMod
     }
 
     let close_on_exec = flags & linux_abi::O_CLOEXEC != 0;
-    let replaced_socket = match (socket_token, mode) {
-        (Some(_), VfsDupMode::Dup2 | VfsDupMode::Dup3) => current_socket_token(newfd),
-        _ => None,
+    let replaced_socket = match mode {
+        VfsDupMode::Dup => None,
+        VfsDupMode::Dup2 | VfsDupMode::Dup3 => current_socket_token(newfd),
     };
     let replaced_remote = match mode {
         VfsDupMode::Dup => None,
         VfsDupMode::Dup2 | VfsDupMode::Dup3 => current_remote_vfs_handle(newfd),
+    };
+    let replaced_epoll = match mode {
+        VfsDupMode::Dup => None,
+        VfsDupMode::Dup2 | VfsDupMode::Dup3 => {
+            current_epoll_handle(newfd).map(|epoll| epoll.token_id())
+        }
+    };
+    let replaced_input = match mode {
+        VfsDupMode::Dup => None,
+        VfsDupMode::Dup2 | VfsDupMode::Dup3 => {
+            current_input_device_description(newfd).map(|(token, _, _)| token)
+        }
     };
     if let Some(token) = socket_token {
         if let Err(errno) = call_netd_socket_token_op(SYSCALL_OFFLOAD_OP_LINUX_DUP, token) {
@@ -153,6 +194,32 @@ pub fn syscall_linux_vfs_dup(oldfd: u64, newfd: u64, flags: u64, mode: VfsDupMod
             }
             return linux_errno(errno);
         }
+    }
+    if let Some(token) = epoll_token
+        && let Err(errno) = update_vfs_epoll_ref(token, true)
+    {
+        if let Some(token) = socket_token {
+            let _ = call_netd_socket_token_op(SYSCALL_OFFLOAD_OP_LINUX_CLOSE, token);
+        }
+        if let Some(remote) = remote.as_ref() {
+            let _ = call_vfs_remote_close(remote.remote_id());
+        }
+        return linux_errno(errno);
+    }
+    if let Some(token) = input_token
+        && let Err(errno) =
+            super::super::broker_ops::waitset_broker_ops::acquire_input_open_description(token)
+    {
+        if let Some(token) = socket_token {
+            let _ = call_netd_socket_token_op(SYSCALL_OFFLOAD_OP_LINUX_CLOSE, token);
+        }
+        if let Some(remote) = remote.as_ref() {
+            let _ = call_vfs_remote_close(remote.remote_id());
+        }
+        if let Some(token) = epoll_token {
+            let _ = update_vfs_epoll_ref(token, false);
+        }
+        return linux_errno(errno);
     }
     let result = multitask::with_current_user_process_state_mut(|_, _, process_state| match mode {
         VfsDupMode::Dup => process_state.handles_mut().duplicate_min(oldfd, 0, false),
@@ -173,14 +240,32 @@ pub fn syscall_linux_vfs_dup(oldfd: u64, newfd: u64, flags: u64, mode: VfsDupMod
         if let Some(remote) = remote.as_ref() {
             let _ = call_vfs_remote_close(remote.remote_id());
         }
+        if let Some(token) = epoll_token {
+            let _ = update_vfs_epoll_ref(token, false);
+        }
+        if let Some(token) = input_token {
+            let _ =
+                super::super::broker_ops::waitset_broker_ops::release_input_open_description(token);
+        }
         return linux_errno(duplicate_install_errno(mode));
     };
 
     if let Some(token) = replaced_socket {
-        let _ = call_netd_socket_token_op(SYSCALL_OFFLOAD_OP_LINUX_CLOSE, token);
+        if call_netd_socket_token_op(SYSCALL_OFFLOAD_OP_LINUX_CLOSE, token) == Ok(0) {
+            let _ = purge_vfs_epoll_object(WAITSET_PROVIDER_NETD, token);
+        }
     }
     if let Some(remote) = replaced_remote {
         let _ = call_vfs_remote_close(remote.remote_id());
+    }
+    if let Some(token) = replaced_epoll {
+        let _ = update_vfs_epoll_ref(token, false);
+    }
+    if let Some(token) = replaced_input
+        && super::super::broker_ops::waitset_broker_ops::release_input_open_description(token)
+            == Ok(true)
+    {
+        let _ = purge_vfs_epoll_object(WAITSET_PROVIDER_INPUTD, token);
     }
     fd
 }
@@ -199,7 +284,14 @@ pub fn syscall_linux_vfs_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
             }
             let socket_token = current_socket_token(fd);
             let remote = current_remote_vfs_handle(fd);
-            if socket_token.is_none() && remote.is_none() && !current_fd_exists(fd) {
+            let epoll_token = current_epoll_handle(fd).map(|epoll| epoll.token_id());
+            let input_token = current_input_device_description(fd).map(|(token, _, _)| token);
+            if socket_token.is_none()
+                && remote.is_none()
+                && epoll_token.is_none()
+                && input_token.is_none()
+                && !current_fd_exists(fd)
+            {
                 return linux_errno(LINUX_EBADF);
             }
             if let Some(token) = socket_token {
@@ -220,6 +312,34 @@ pub fn syscall_linux_vfs_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
                     return linux_errno(errno);
                 }
             }
+            if let Some(token) = epoll_token
+                && let Err(errno) = update_vfs_epoll_ref(token, true)
+            {
+                if let Some(token) = socket_token {
+                    let _ = call_netd_socket_token_op(SYSCALL_OFFLOAD_OP_LINUX_CLOSE, token);
+                }
+                if let Some(remote) = remote.as_ref() {
+                    let _ = call_vfs_remote_close(remote.remote_id());
+                }
+                return linux_errno(errno);
+            }
+            if let Some(token) = input_token
+                && let Err(errno) =
+                    super::super::broker_ops::waitset_broker_ops::acquire_input_open_description(
+                        token,
+                    )
+            {
+                if let Some(token) = socket_token {
+                    let _ = call_netd_socket_token_op(SYSCALL_OFFLOAD_OP_LINUX_CLOSE, token);
+                }
+                if let Some(remote) = remote.as_ref() {
+                    let _ = call_vfs_remote_close(remote.remote_id());
+                }
+                if let Some(token) = epoll_token {
+                    let _ = update_vfs_epoll_ref(token, false);
+                }
+                return linux_errno(errno);
+            }
             let close_on_exec = cmd == linux_abi::F_DUPFD_CLOEXEC;
             let result = multitask::with_current_user_process_state_mut(|_, _, process_state| {
                 process_state
@@ -235,6 +355,12 @@ pub fn syscall_linux_vfs_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
                     }
                     if let Some(remote) = remote.as_ref() {
                         let _ = call_vfs_remote_close(remote.remote_id());
+                    }
+                    if let Some(token) = epoll_token {
+                        let _ = update_vfs_epoll_ref(token, false);
+                    }
+                    if let Some(token) = input_token {
+                        let _ = super::super::broker_ops::waitset_broker_ops::release_input_open_description(token);
                     }
                     linux_errno(LINUX_EMFILE)
                 }
@@ -346,6 +472,19 @@ mod tests {
         assert_eq!(duplicate_install_errno(VfsDupMode::Dup), LINUX_EMFILE);
         assert_eq!(duplicate_install_errno(VfsDupMode::Dup2), LINUX_EBADF);
         assert_eq!(duplicate_install_errno(VfsDupMode::Dup3), LINUX_EBADF);
+    }
+
+    #[test]
+    fn transferred_input_description_keeps_the_waitset_service_reference() {
+        let device = kernel_object::api::device::DeviceHandle::from_parts_with_token(
+            kernel_object::api::device::DeviceId::Input,
+            kernel_object::api::device::DeviceAccessKind::Evdev,
+            u64::MAX - 811,
+        );
+        assert_eq!(
+            service_handle_ref_for_handle(&multitask::KernelHandle::Device(device)),
+            Some(ServiceHandleRef::Input(device.token_id()))
+        );
     }
 }
 
@@ -535,6 +674,13 @@ fn call_vfs_remote_close(remote_id: u64) -> Result<(), i64> {
     let mut request = new_vfs_request(VFS_IPC_OP_CLOSE);
     request.remote_id = remote_id;
     call_vfs_ipc_request(&request).and_then(|response| ensure_vfs_status(&response))
+}
+
+fn call_vfs_remote_close_bounded(remote_id: u64) -> Result<(), i64> {
+    let mut request = new_vfs_request(VFS_IPC_OP_CLOSE);
+    request.remote_id = remote_id;
+    call_vfs_ipc_request_with_timeout(&request, 16)
+        .and_then(|response| ensure_vfs_status(&response))
 }
 
 fn read_local_vfs_file<F>(user_ptr: u64, user_len: u64, mut read: F) -> u64
@@ -753,7 +899,7 @@ fn current_socket_token_and_flags(fd: u64) -> Option<(u64, u64)> {
     .flatten()
 }
 
-fn new_netd_socket_request(op: u16, socket_token: u64) -> NetdIpcRequest {
+pub fn new_netd_socket_request(op: u16, socket_token: u64) -> NetdIpcRequest {
     let mut request = NetdIpcRequest {
         version: NETD_IPC_ABI_VERSION,
         op,
@@ -773,9 +919,171 @@ fn new_netd_socket_request(op: u16, socket_token: u64) -> NetdIpcRequest {
     request
 }
 
-fn call_netd_socket_token_op(op: u16, socket_token: u64) -> Result<u64, i64> {
+pub fn call_netd_socket_token_op(op: u16, socket_token: u64) -> Result<u64, i64> {
     let request = new_netd_socket_request(op, socket_token);
     call_netd_ipc_request(&request).map(|response| response.value)
+}
+
+fn call_netd_socket_token_op_bounded(op: u16, socket_token: u64) -> Result<u64, i64> {
+    let request = new_netd_socket_request(op, socket_token);
+    call_netd_ipc_request_with_timeout(&request, 16).map(|response| response.value)
+}
+
+pub fn poll_netd_socket_token(
+    socket_token: u64,
+    events: u32,
+    timeout_ms: u64,
+) -> Result<(u32, u64), i64> {
+    let mut request = new_netd_socket_request(SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET, socket_token);
+    request.arg1 = events as u64;
+    request.arg2 = NETD_POLL_MODE_QUERY;
+    let response = call_netd_ipc_request_with_timeout(&request, timeout_ms)?;
+    if response.payload_len != 8 {
+        return Err(LINUX_EINVAL);
+    }
+    let generation =
+        u64::from_le_bytes(response.payload[..8].try_into().map_err(|_| LINUX_EINVAL)?);
+    if generation == 0 {
+        return Err(LINUX_EINVAL);
+    }
+    Ok((response.value as u32, generation))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ServiceHandleRef {
+    Socket(u64),
+    RemoteVfs(u64),
+    Epoll(u64),
+    Input(u64),
+}
+
+pub fn acquire_fork_service_handle_refs(process_id: u64) -> Result<Vec<ServiceHandleRef>, i64> {
+    let refs = snapshot_service_handle_refs(process_id, false)?;
+    let mut acquired = Vec::with_capacity(refs.len());
+    for handle_ref in refs {
+        if let Err(errno) = acquire_service_handle_ref(handle_ref) {
+            release_service_handle_refs(&acquired);
+            return Err(errno);
+        }
+        acquired.push(handle_ref);
+    }
+    Ok(acquired)
+}
+
+pub fn snapshot_cloexec_service_handle_refs(process_id: u64) -> Result<Vec<ServiceHandleRef>, i64> {
+    snapshot_service_handle_refs(process_id, true)
+}
+
+pub fn release_all_service_handle_refs(process_id: u64) {
+    if let Ok(refs) = snapshot_service_handle_refs(process_id, false) {
+        release_service_handle_refs(&refs);
+    }
+}
+
+pub fn release_service_handle_refs(refs: &[ServiceHandleRef]) {
+    for handle_ref in refs.iter().copied().rev() {
+        match handle_ref {
+            ServiceHandleRef::Socket(token) => {
+                if call_netd_socket_token_op(SYSCALL_OFFLOAD_OP_LINUX_CLOSE, token) == Ok(0) {
+                    let _ = purge_vfs_epoll_object(WAITSET_PROVIDER_NETD, token);
+                }
+            }
+            ServiceHandleRef::RemoteVfs(remote_id) => {
+                let _ = call_vfs_remote_close(remote_id);
+            }
+            ServiceHandleRef::Epoll(token) => {
+                let _ = update_vfs_epoll_ref(token, false);
+            }
+            ServiceHandleRef::Input(token) => {
+                if super::super::broker_ops::waitset_broker_ops::release_input_open_description(
+                    token,
+                ) == Ok(true)
+                {
+                    let _ = purge_vfs_epoll_object(WAITSET_PROVIDER_INPUTD, token);
+                }
+            }
+        }
+    }
+}
+
+pub fn release_service_handle_refs_bounded(refs: &[ServiceHandleRef]) {
+    for handle_ref in refs.iter().copied().rev() {
+        match handle_ref {
+            ServiceHandleRef::Socket(token) => {
+                if call_netd_socket_token_op_bounded(SYSCALL_OFFLOAD_OP_LINUX_CLOSE, token) == Ok(0)
+                {
+                    let _ = purge_vfs_epoll_object_bounded(WAITSET_PROVIDER_NETD, token);
+                }
+            }
+            ServiceHandleRef::RemoteVfs(remote_id) => {
+                let _ = call_vfs_remote_close_bounded(remote_id);
+            }
+            ServiceHandleRef::Epoll(token) => {
+                let _ = update_vfs_epoll_ref(token, false);
+            }
+            ServiceHandleRef::Input(token) => {
+                if super::super::broker_ops::waitset_broker_ops::release_input_open_description(
+                    token,
+                ) == Ok(true)
+                {
+                    let _ = purge_vfs_epoll_object_bounded(WAITSET_PROVIDER_INPUTD, token);
+                }
+            }
+        }
+    }
+}
+
+pub fn service_handle_ref_for_handle(handle: &multitask::KernelHandle) -> Option<ServiceHandleRef> {
+    match handle {
+        multitask::KernelHandle::Socket(socket) => {
+            Some(ServiceHandleRef::Socket(socket.token_id()))
+        }
+        multitask::KernelHandle::InetSocket(socket) => {
+            Some(ServiceHandleRef::Socket(socket.token_id()))
+        }
+        multitask::KernelHandle::RemoteVfs(remote) => {
+            Some(ServiceHandleRef::RemoteVfs(remote.remote_id()))
+        }
+        multitask::KernelHandle::Epoll(epoll) => Some(ServiceHandleRef::Epoll(epoll.token_id())),
+        multitask::KernelHandle::Device(device)
+            if device.device_id() == kernel_object::api::device::DeviceId::Input =>
+        {
+            Some(ServiceHandleRef::Input(device.token_id()))
+        }
+        _ => None,
+    }
+}
+
+fn snapshot_service_handle_refs(
+    process_id: u64,
+    cloexec_only: bool,
+) -> Result<Vec<ServiceHandleRef>, i64> {
+    multitask::with_process_state_by_pid(process_id, |state| {
+        state
+            .handles()
+            .entries_snapshot(cloexec_only)
+            .into_iter()
+            .filter_map(|(_, entry)| service_handle_ref_for_handle(entry.handle()))
+            .collect()
+    })
+    .ok_or(LINUX_ESRCH)
+}
+
+pub fn acquire_service_handle_ref(handle_ref: ServiceHandleRef) -> Result<(), i64> {
+    match handle_ref {
+        ServiceHandleRef::Socket(token) => {
+            call_netd_socket_token_op(SYSCALL_OFFLOAD_OP_LINUX_DUP, token).map(|_| ())
+        }
+        ServiceHandleRef::RemoteVfs(remote_id) => {
+            let mut request = new_vfs_request(VFS_IPC_OP_DUP);
+            request.remote_id = remote_id;
+            call_vfs_ipc_request(&request).and_then(|response| ensure_vfs_status(&response))
+        }
+        ServiceHandleRef::Epoll(token) => update_vfs_epoll_ref(token, true),
+        ServiceHandleRef::Input(token) => {
+            super::super::broker_ops::waitset_broker_ops::acquire_input_open_description(token)
+        }
+    }
 }
 
 fn call_netd_socket_payload(fd: u64, op: u16, payload: &[u8]) -> Result<u64, i64> {

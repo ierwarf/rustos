@@ -23,6 +23,13 @@ IPC service IDs, broker syscalls, handle transfer, and service routing. For pack
 - Stays resident as `IPC_SERVICE_ROOTD`; serves only the versioned
   `COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR` contract and tracks
   `CoreServiceLeaseWire` via `SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER`.
+- Bootstrap policy services must not perform a rootd-authorized service lookup
+  merely to prove that an empty maintenance queue is empty. In particular,
+  procd's lifecycle drain returns before looking up syscalld when it drained no
+  events. When events do exist, it resolves the endpoint before taking signal
+  policy locks and releases those locks before making the syscalld call. This
+  prevents the `rootd -> loaderd -> procd -> rootd` authorization cycle that
+  otherwise blocks the first initd prepare transaction.
 
 ## IPC Service Registry
 
@@ -85,6 +92,11 @@ values that do not match the kernel-stamped sender PID/TID. The sender-stamped
 recv path is not a generic app IPC ABI. rootd's supervisor loop must yield
 between nonblocking receive turns rather than sleep-polling, because service
 endpoint registration synchronously depends on rootd capability replies.
+No service may hold a local policy/state lock across service discovery or a
+synchronous cross-service call. Early-boot maintenance paths additionally
+skip discovery when their drained work set is empty. A new bootstrap
+dependency must either be covered by rootd's declared readiness order or use a
+bounded, explicit ready handshake; startup scheduling luck is not readiness.
 
 | ID | Service | Capability (`IPC_SERVICE_CAP_*`) | Owns |
 |----|---------|----------------------------------|------|
@@ -452,9 +464,31 @@ policy remains with the owning service.
 - `mount`/`umount2` route to vfsd → gated `SYS_RUSTOS_VFS_*_BROKER` for kernel mount-table mutation. Do not reintroduce direct generic-app `linux_ops::mount`/`umount2` paths.
 - `poll`/`ppoll`/`epoll_*` route generic fd readiness policy and epoll
   interest state through `VFS_IPC_OP_POLL_QUERY`; socket readiness is `netd`
-  policy and input readiness is `inputd` policy plus the narrow native-input
-  wait/completion substrate. Ring0 keeps fd-table validation, epoll token
-  handles, user-copy, and bounded timeout sleeping.
+  policy, input readiness is `inputd` policy plus the narrow native-input
+  wait/completion substrate, and non-system console-input readiness is
+  `sessiond` policy. sessiond advances its generation only on an empty-to-ready
+  line-discipline transition; the readiness query is non-consuming and bounded
+  by the application's remaining deadline. Console output/error remain
+  immediately writable. Closing a session advances the same generation and a
+  subsequent query returns non-live, which compat exposes as `POLLHUP` without
+  recreating the removed session. Persistent epoll admission for console descriptors is
+  deliberately rejected until console handles carry a unique open-description
+  identity; a reusable session or numeric fd must not masquerade as that
+  lifetime. Ring0 keeps fd-table validation, epoll token
+  handles, user-copy, a bounded provider-wait registry, and deadline wakeup.
+  Both persistent epoll sets and syscall-scoped multi-fd poll sets use the same
+  generation-based path: check, register the exact observed generations,
+  recheck through ordinary service IPC while the task remains runnable, arm
+  the scheduler, then verify that every registered waiter still exists before
+  commit. A provider signal removes its waiter before wake, so an event in the
+  recheck-to-arm window is detected without nesting an IPC block inside an
+  already armed scheduler block. Every readiness IPC is capped at the shorter
+  of the remaining syscall deadline and 16 ms; an infinite application wait
+  therefore cannot turn a wedged provider into an unbounded kernel-service
+  call. `ppoll`/`epoll_pwait` atomically
+  apply their temporary signal mask, reject a non-native sigset size, and
+  return `EINTR` for a pending unmasked signal; SIGKILL/SIGSTOP can never be
+  added to the temporary mask.
 - Legacy `SYS_RUSTOS_{STATX,STAT,READLINK,ACCESS,GETCWD,CHDIR}_METADATA`: no generic-app VFS policy in ring0 after vfsd registers. Pre-vfsd bootstrap + registered policy-service callers retain direct kernel metadata access.
 - `SYS_RUSTOS_BLOCK_BROKER`: narrow boot-volume read broker, gated by `VFS_POLICY`, accepts `RustosBlockBrokerArgs`. Does not depend on `storaged`.
 
@@ -499,29 +533,45 @@ policy remains with the owning service.
   inputd cannot freeze the UI poll loop behind the generic service timeout; a
   retry sees either unchanged ingress or the already-transferred policy record.
   The endpoint server still blocks in `SYS_RUSTOS_IPC_RECV` while idle.
-- Finite RustOS-native input polls and uiserver use readiness-then-read safely:
+- RustOS-native input polls and uiserver use readiness-then-read safely:
   `INPUTD_IPC_OP_STATS` and `INPUTD_IPC_OP_READ` both refresh ingress before
-  observing policy state, and the finite poll loop rechecks service policy on
-  each timer tick. The latency-sensitive uiserver reader performs a zero-time
+  observing policy state, and generic poll/epoll rechecks service policy after
+  every generation wake before returning an event. The latency-sensitive
+  uiserver reader performs a zero-time
   poll, whose non-consuming `STATS` request has the 16 ms IPC bound above,
   before entering the stateful authorized `READ`; it never starts that generic
   30-second service transaction merely to discover an empty queue. The reader
   retains its cumulative 4 ms cadence, so missed slots never accumulate burst
-  credit. This bounds the current pre-ABI service-queue wake gap without moving
-  input policy or transport-consumer authority out of inputd. A service-owned readiness
-  object is still required before generic indefinite input poll/epoll can be a
-  passed commercial userspace-ABI gate: the MSI-X worker may otherwise move the
-  last ring0-visible record into inputd policy between a STATS probe and waiter
-  registration.
-- That input object is one provider of the broader cross-service wait-set ABI.
-  Today `epoll_wait` makes one vfsd query without implementing its timeout, and
-  uiserver cannot atomically wait on its changing Wayland client-fd set together
-  with input and runtime deadlines. The common ABI must carry capability-bound
-  subscriptions and readiness generations with atomic check-arm-recheck,
-  cancellation, close/dup/fork/exec lifetime, peer-close/error, restart/revoke,
-  and bounded backpressure semantics. Ring0 retains token validation and wake
-  substrate but never inspects a service-private queue. See
-  `physical-gpu-status.md` for the current implementation/evidence boundary.
+  credit. Inputd now also publishes a monotonic service-owned readiness
+  generation when its policy queue changes from empty to nonempty. Generic
+  poll/epoll observes that generation without moving input policy or transport-
+  consumer authority out of inputd.
+- Inputd is one provider of the common cross-service wait-set ABI. vfsd owns a
+  bounded interest registry keyed by provider object identity and exact service
+  epoch; netd and inputd own readiness truth and monotonic generations. Compat
+  performs check, bounded waiter registration, provider recheck while runnable,
+  scheduler arm, exact waiter-presence recheck, commit, and a final
+  authoritative provider recheck. It supplies finite/infinite
+  timeout and signal-cancellation substrate but never inspects a
+  service-private queue. Empty transient poll sets still use the same scheduler
+  arm plus deadline/signal wake rather than spinning.
+- Wait interests follow open-description lifetime rather than reusable numeric
+  descriptors. Socket and epoll service references are acquired by dup/fork,
+  released by close/CLOEXEC/process exit, and purged after the final reference.
+  IPC descriptor export likewise acquires the service-backed open-description
+  reference before publication; successful installation adopts it, while
+  cancellation or rejection moves it to the process substrate's bounded
+  deferred-drop queue. That queue shares the 1,024-entry admission ceiling
+  with live transfers, and housekeeping releases at most 32 entries per turn
+  through bounded provider cleanup, so task retirement cannot orphan input or
+  socket readiness authority.
+  A provider restart advances endpoint authority, wakes matching waiters, and
+  makes the old epoch fail closed instead of accepting a reused token. Unsupported
+  edge-trigger and one-shot flags are rejected until their service-owned
+  rearm contracts exist; they are never silently approximated.
+- The source/model boundary is implemented, but runtime acceptance still needs
+  the current change set's bounded QEMU/KVM event and timeout evidence. See
+  `physical-gpu-status.md` for that evidence boundary.
 - KVM latency evidence records input arrival at uiserver queue consumption,
   before a GPU backpressure retry may leave the turn. The previous end-of-turn
   sample counted consumed input and cursor motion but skipped their timestamp
@@ -663,10 +713,14 @@ netd invokes gated `SYS_RUSTOS_NET_BROKER` with target pid. Net broker arg struc
 Four fixed netd request receivers prevent an unrelated caller from serializing
 all local AF_UNIX work. Blocking INET connect/send/recv waits run in a separate
 fixed eight-worker pool that releases the shared network-state lock between
-polls; there is no thread-per-request fallback. A single indefinite socket
-`poll` issues one event-driven `WAIT` request and consumes that reply directly,
-without a `QUERY`-`WAIT`-`QUERY` sequence. Finite and multi-fd polling retains
-the bounded compatibility loop.
+polls; there is no thread-per-request fallback. All socket poll/epoll waits now
+query netd readiness generation, register the shared bounded wait token, and
+re-query before sleeping and after wake. Because the DVM packet ring currently
+exposes no userspace interrupt edge, netd owns one fixed 1 ms INET ingress
+worker; one bounded smoltcp poll per turn publishes a generation only when
+smoltcp reports a socket-state transition. The worker admits at most 32
+ingress packets before yielding. This lets new external packets wake
+an already-sleeping generic wait without moving network policy into ring0.
 
 This removes avoidable copies and waits, but standard AF_UNIX data still makes
 a synchronous compat-to-netd service round trip for every send/receive. The
@@ -677,23 +731,17 @@ artifact's settled standard-client windows reach 35.894--41.776 FPS,
 compositor callback wait is normally 2--4 ms, and the private GPU proof reaches
 110.389 FPS with 9.057/14.392 ms average/maximum GPU time.
 The remaining limit is therefore not a private rendering API, ordinary
-`wl_shm` copy, or the GPU proof. uiserver currently dispatches Wayland clients
-nonblocking but waits only on input and a deadline capped at 16 ms; its Wayland
-backend aggregate poll fd is not part of that wait. Consequently a client
-commit made immediately after its frame callback cannot wake uiserver and
-waits for the next 16 ms compatibility poll. Linux `epoll_wait` also
-ignores its timeout argument and performs one vfsd query, while netd's
-event-driven wait covers only a single indefinite socket poll. A shared fast
-data/readiness plane requires a separately designed general userspace ABI:
-netd must mint the endpoint capability and own namespace/options policy; the
-data plane needs bounded asymmetric rings, monotonic readiness generations,
-ordered stream/short-I/O semantics, peer-close and shutdown, descriptor and
-credential transfer, fork/dup/exec lifetime, and revoke recovery. Designs such
-as Zircon IOBuffer show why the shared regions, endpoint lifetime, access
-rights, signaling, and peer closure must be one object contract:
-<https://fuchsia.dev/fuchsia-src/reference/kernel_objects/io_buffer>. Until
-that boundary is implemented, modeled, and reviewed, the 55 FPS gate remains
-failed rather than being hidden behind a special WayClick or compositor path.
+`wl_shm` copy, or the GPU proof. The generic wait-set now gives ordinary Linux
+applications a bounded aggregate wait over vfsd-owned interests backed by
+netd/inputd readiness generations, exact provider epochs, and monotonic
+deadlines. It deliberately leaves socket data and namespace/options policy in
+netd and does not add a WayClick-specific route. Wayland-server's existing
+backend epoll fd aggregates the changing client set; uiserver duplicates that
+open description into a demoted readiness worker, merges its single-capacity
+wake with the input reader's wake, and rearms only after main-loop dispatch. A
+client commit can therefore wake the main loop before its runtime deadline.
+Runtime/QEMU evidence remains a release gate; source/model completion alone
+does not satisfy the 55 FPS gate.
 
 ## Process Policy Surface (`procd`)
 

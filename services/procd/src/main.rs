@@ -87,6 +87,7 @@ fn service_main() {
     // A replacement procd must not wait for sixteen new requests before it
     // acknowledges evidence accumulated while its predecessor was absent.
     drain_lifecycle_events();
+    ipc::debug_line("procd: lifecycle drain ready");
     serve(endpoint as u64);
 }
 
@@ -188,16 +189,25 @@ fn drain_lifecycle_events() {
         return;
     }
     let drained = count as usize;
-    let mut process_policy = PROCESS_SIGNAL_POLICY.lock();
-    let mut thread_policy = THREAD_SIGNAL_POLICY.lock();
+    if !lifecycle_drain_needs_syscalld_lookup(drained) {
+        return;
+    }
     let syscalld_endpoint = ipc::lookup_service_endpoint(IPC_SERVICE_LINUX_SYSCALLD);
     for event in &events[..drained] {
         if event.event == LIFECYCLE_EVENT_EXIT {
-            process_policy.remove(&event.pid);
-            thread_policy.retain(|(pid, _), _| *pid != event.pid);
+            {
+                PROCESS_SIGNAL_POLICY.lock().remove(&event.pid);
+                THREAD_SIGNAL_POLICY
+                    .lock()
+                    .retain(|(pid, _), _| *pid != event.pid);
+            }
             notify_syscalld_process_exit(syscalld_endpoint, event.pid);
         }
     }
+}
+
+fn lifecycle_drain_needs_syscalld_lookup(drained: usize) -> bool {
+    drained != 0
 }
 
 fn notify_syscalld_process_exit(endpoint: i64, dead_pid: u64) {
@@ -263,6 +273,7 @@ fn handle_commercial_request(
     }
     match request.header.op {
         COMMERCIAL_MAX_PROCD_OP_PROCESS_PREPARE => {
+            ipc::debug_line("procd: process prepare request");
             let format = request.arg0 as u16;
             response.value0 = u64::from(format);
             response.value1 = PROC_BROKER_ABI_VERSION as u64;

@@ -40,6 +40,10 @@ pub mod syscall {
             vector, error_code, cr2, rip, rsp,
         )
     }
+
+    pub fn service_deferred_transfer_releases() -> usize {
+        crate::user::syscall::linux::service_deferred_transfer_releases()
+    }
 }
 
 pub use syscall::init as init_syscalls;

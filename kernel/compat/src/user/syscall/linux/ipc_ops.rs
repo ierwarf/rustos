@@ -32,6 +32,8 @@ static SERVICE_ENDPOINT_OWNERS: [AtomicU64; MAX_SERVICE_ENDPOINTS] =
     [const { AtomicU64::new(0) }; MAX_SERVICE_ENDPOINTS];
 static SERVICE_ENDPOINT_CAPS: [AtomicU64; MAX_SERVICE_ENDPOINTS] =
     [const { AtomicU64::new(0) }; MAX_SERVICE_ENDPOINTS];
+static SERVICE_ENDPOINT_EPOCHS: [AtomicU64; MAX_SERVICE_ENDPOINTS] =
+    [const { AtomicU64::new(0) }; MAX_SERVICE_ENDPOINTS];
 // Publication, revocation, and process-exit cleanup must share one mutation
 // critical section. The endpoint itself remains the lock-free commit point for
 // readers, but a second registrar or an exiting process must not interleave
@@ -163,6 +165,8 @@ fn record_service_endpoint_milestone(
 /// stale endpoint가 남아 있으면 이후 호출자가 wait_for_reply에서 무한 대기하게 되므로
 /// 반드시 프로세스 종료 경로에서 호출해야 한다.
 pub(crate) fn cleanup_service_endpoints_for_process(process_id: u64) {
+    let mut revoked_services = [0_u64; MAX_SERVICE_ENDPOINTS];
+    let mut revoked_count = 0usize;
     let registry_mutation = SERVICE_ENDPOINT_REGISTRY_MUTATION.lock();
     if SERVICE_ENDPOINT_OWNERS[linux_abi::IPC_SERVICE_LINUX_SYSCALLD as usize]
         .load(Ordering::Acquire)
@@ -172,6 +176,7 @@ pub(crate) fn cleanup_service_endpoints_for_process(process_id: u64) {
     }
     for i in 0..MAX_SERVICE_ENDPOINTS {
         if SERVICE_ENDPOINT_OWNERS[i].load(Ordering::Acquire) == process_id {
+            advance_service_endpoint_epoch(i).expect("service endpoint epoch exhausted");
             SERVICE_ENDPOINTS[i].store(0, Ordering::Release);
             SERVICE_ENDPOINT_OWNERS[i].store(0, Ordering::Release);
             SERVICE_ENDPOINT_CAPS[i].store(0, Ordering::Release);
@@ -181,9 +186,15 @@ pub(crate) fn cleanup_service_endpoints_for_process(process_id: u64) {
                 i,
                 process_id
             );
+            revoked_services[revoked_count] = i as u64;
+            revoked_count += 1;
         }
     }
     drop(registry_mutation);
+    for service_id in revoked_services.into_iter().take(revoked_count) {
+        super::broker_ops::waitset_broker_ops::revoke_waitset_provider(service_id);
+    }
+    super::broker_ops::waitset_broker_ops::remove_waitset_waiters_for_process(process_id);
     wake_exited_service_endpoint_waiters(process_id);
 }
 
@@ -244,7 +255,7 @@ fn service_index(service_id: u64) -> Option<usize> {
     (index < MAX_SERVICE_ENDPOINTS).then_some(index)
 }
 
-fn process_owns_live_service_endpoint(process_id: u64, service_id: u64) -> bool {
+pub(crate) fn process_owns_live_service_endpoint(process_id: u64, service_id: u64) -> bool {
     let Some(index) = service_index(service_id) else {
         return false;
     };
@@ -252,6 +263,28 @@ fn process_owns_live_service_endpoint(process_id: u64, service_id: u64) -> bool 
     SERVICE_ENDPOINTS[index].load(Ordering::Acquire) != 0
         && SERVICE_ENDPOINT_OWNERS[index].load(Ordering::Acquire) == process_id
         && !multitask::is_user_process_exiting(process_id)
+}
+
+pub(crate) fn service_endpoint_epoch(service_id: u64) -> Option<u64> {
+    let index = service_index(service_id)?;
+    let _registry = SERVICE_ENDPOINT_REGISTRY_MUTATION.lock();
+    let endpoint = SERVICE_ENDPOINTS[index].load(Ordering::Acquire);
+    let owner = SERVICE_ENDPOINT_OWNERS[index].load(Ordering::Acquire);
+    let epoch = SERVICE_ENDPOINT_EPOCHS[index].load(Ordering::Acquire);
+    (endpoint != 0 && owner != 0 && epoch != 0 && !multitask::is_user_process_exiting(owner))
+        .then_some(epoch)
+}
+
+fn next_service_endpoint_epoch(current: u64) -> Option<u64> {
+    current.checked_add(1).filter(|next| *next != 0)
+}
+
+/// Called only while `SERVICE_ENDPOINT_REGISTRY_MUTATION` is held.
+fn advance_service_endpoint_epoch(index: usize) -> Result<u64, i64> {
+    let current = SERVICE_ENDPOINT_EPOCHS[index].load(Ordering::Relaxed);
+    let next = next_service_endpoint_epoch(current).ok_or(LINUX_EOVERFLOW)?;
+    SERVICE_ENDPOINT_EPOCHS[index].store(next, Ordering::Release);
+    Ok(next)
 }
 
 /// Cross-class handoff is scheduler authority. Accept it only from the live
@@ -424,6 +457,16 @@ pub(super) fn syscall_linux_rustos_ipc_register_linux_syscall_endpoint(endpoint:
         .store(capability, Ordering::Release);
     SERVICE_ENDPOINT_OWNERS[linux_abi::IPC_SERVICE_LINUX_SYSCALLD as usize]
         .store(process_id, Ordering::Release);
+    if let Err(errno) =
+        advance_service_endpoint_epoch(linux_abi::IPC_SERVICE_LINUX_SYSCALLD as usize)
+    {
+        SERVICE_ENDPOINT_CAPS[linux_abi::IPC_SERVICE_LINUX_SYSCALLD as usize]
+            .store(0, Ordering::Release);
+        SERVICE_ENDPOINT_OWNERS[linux_abi::IPC_SERVICE_LINUX_SYSCALLD as usize]
+            .store(0, Ordering::Release);
+        drop(registry_mutation);
+        return linux_errno(errno);
+    }
     SERVICE_ENDPOINTS[linux_abi::IPC_SERVICE_LINUX_SYSCALLD as usize]
         .store(endpoint, Ordering::Release);
     LINUX_SYSCALL_ENDPOINT.store(endpoint, Ordering::Release);
@@ -485,7 +528,9 @@ pub(super) fn syscall_linux_rustos_ipc_register_service_endpoint(
         SERVICE_ENDPOINTS[index].store(0, Ordering::Release);
         SERVICE_ENDPOINT_OWNERS[index].store(0, Ordering::Release);
         SERVICE_ENDPOINT_CAPS[index].store(0, Ordering::Release);
+        advance_service_endpoint_epoch(index).expect("service endpoint epoch exhausted");
         drop(registry_mutation);
+        super::broker_ops::waitset_broker_ops::revoke_waitset_provider(service_id);
         record_service_endpoint_milestone("ipc-service-revoke", service_id, process_id, 0);
         ipc_trace!("ipc service revoked: service={}", service_id);
         return 0;
@@ -525,6 +570,12 @@ pub(super) fn syscall_linux_rustos_ipc_register_service_endpoint(
     }
     SERVICE_ENDPOINT_CAPS[index].store(capability, Ordering::Release);
     SERVICE_ENDPOINT_OWNERS[index].store(process_id, Ordering::Release);
+    if let Err(errno) = advance_service_endpoint_epoch(index) {
+        SERVICE_ENDPOINT_CAPS[index].store(0, Ordering::Release);
+        SERVICE_ENDPOINT_OWNERS[index].store(0, Ordering::Release);
+        drop(registry_mutation);
+        return linux_errno(errno);
+    }
     // Publish the endpoint last. Acquire readers that observe it also observe
     // the rootd-authorized owner and capability written above.
     SERVICE_ENDPOINTS[index].store(endpoint, Ordering::Release);
@@ -1845,7 +1896,23 @@ pub(super) fn export_current_fds_for_transfer(
     };
     let entries = entries?;
 
-    multitask::register_ipc_transfer_entries(entries).map_err(ipc_transfer_error_to_linux_errno)
+    let service_refs = service_transfer_refs(&entries);
+    let mut acquired_refs = Vec::with_capacity(service_refs.len());
+    for handle_ref in service_refs.iter().copied() {
+        if let Err(errno) = super::service_ops::acquire_service_handle_ref(handle_ref) {
+            super::service_ops::release_service_handle_refs(&acquired_refs);
+            return Err(errno);
+        }
+        acquired_refs.push(handle_ref);
+    }
+
+    match multitask::register_ipc_transfer_entries(entries) {
+        Ok(descriptors) => Ok(descriptors),
+        Err(err) => {
+            super::service_ops::release_service_handle_refs(&acquired_refs);
+            Err(ipc_transfer_error_to_linux_errno(err))
+        }
+    }
 }
 
 fn read_user_fd_array(fds_ptr: u64, fd_count: usize) -> Result<Vec<i32>, i64> {
@@ -1909,6 +1976,7 @@ pub(super) fn install_transfer_descriptors_for_current_process(
     descriptors: &[KernelTransferredHandle],
 ) -> Result<Vec<i32>, i64> {
     let entries = take_transfer_entries(descriptors)?;
+    let service_refs = service_transfer_refs(&entries);
     let Some(fds) = multitask::with_current_user_process_state_mut(|_, _, process_state| {
         if !process_state
             .handles()
@@ -1919,18 +1987,32 @@ pub(super) fn install_transfer_descriptors_for_current_process(
         let mut fds = Vec::with_capacity(entries.len());
         for entry in entries {
             let Some(fd) = process_state.handles_mut().install_transferred(entry) else {
+                for installed in fds.iter().copied() {
+                    let _ = process_state.handles_mut().close(installed as u64);
+                }
                 return Err(LINUX_EMFILE);
             };
             let Ok(fd) = i32::try_from(fd) else {
+                let _ = process_state.handles_mut().close(fd);
+                for installed in fds.iter().copied() {
+                    let _ = process_state.handles_mut().close(installed as u64);
+                }
                 return Err(LINUX_EOVERFLOW);
             };
             fds.push(fd);
         }
         Ok(fds)
     }) else {
+        super::service_ops::release_service_handle_refs_bounded(&service_refs);
         return Err(LINUX_EINVAL);
     };
-    fds
+    match fds {
+        Ok(fds) => Ok(fds),
+        Err(errno) => {
+            super::service_ops::release_service_handle_refs_bounded(&service_refs);
+            Err(errno)
+        }
+    }
 }
 
 fn take_transfer_entries(
@@ -1944,6 +2026,41 @@ pub(super) fn drop_transfer_descriptors(descriptors: &[KernelTransferredHandle])
         return;
     }
     multitask::drop_ipc_transfer_descriptors(descriptors);
+    let _ = service_deferred_transfer_releases();
+}
+
+pub(crate) fn service_deferred_transfer_releases() -> usize {
+    const MAX_RELEASES_PER_TURN: usize = 32;
+    let entries = multitask::take_deferred_ipc_transfer_drops(MAX_RELEASES_PER_TURN);
+    let count = entries.len();
+    release_transfer_entries(&entries);
+    count
+}
+
+pub(super) fn drop_transfer_entries(entries: Vec<multitask::TransferredHandleEntry>) {
+    release_transfer_entries(&entries);
+}
+
+fn service_transfer_refs(
+    entries: &[multitask::TransferredHandleEntry],
+) -> Vec<super::service_ops::ServiceHandleRef> {
+    entries
+        .iter()
+        .filter_map(|entry| {
+            super::service_ops::service_handle_ref_for_handle(entry.entry().handle())
+        })
+        .collect()
+}
+
+fn release_transfer_entries(entries: &[multitask::TransferredHandleEntry]) {
+    let refs = service_transfer_refs(entries);
+    super::service_ops::release_service_handle_refs_bounded(&refs);
+}
+
+pub(super) fn release_input_transfer_token(token: u64) {
+    super::service_ops::release_service_handle_refs_bounded(&[
+        super::service_ops::ServiceHandleRef::Input(token),
+    ]);
 }
 
 fn ipc_transfer_error_to_linux_errno(err: multitask::IpcTransferRegistryError) -> i64 {
@@ -2060,6 +2177,13 @@ fn log_slow_ipc_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_endpoint_epoch_changes_on_every_publication_boundary() {
+        assert_eq!(next_service_endpoint_epoch(0), Some(1));
+        assert_eq!(next_service_endpoint_epoch(1), Some(2));
+        assert_eq!(next_service_endpoint_epoch(u64::MAX), None);
+    }
 
     fn matching_commercial_response()
     -> (CommercialMaxProtocolRequest, CommercialMaxProtocolResponse) {

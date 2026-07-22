@@ -75,7 +75,7 @@ failed infrastructure gates rather than implied successes:
 | Wrong supervisor/PID becomes a post-init policy service, another sender rebinds a running exact-PID lease, or initd/sessiond exit leaves a dependent lease or capability live | post-init-leases | services/rootd/src/main.rs |
 | A crashed core service restarts in the same scheduler turn, unrelated lifecycle work starves monotonic backoff progress, a pending restart never settles or fails closed, retry budget is consumed without elapsed backoff, old service authority survives pending/failed recovery, an initial/restarted loader activation failure leaves a suspended child, rootd and procd steal lifecycle events from one shared consumer queue, or queue/copyout pressure silently discards the exit evidence needed to revoke a lease or policy cache | rootd-restart-backoff | services/rootd/src/main.rs, services/procd/src/main.rs, and kernel/compat/src/user/syscall/linux/{lifecycle_broker_ops.rs,offload_ops.rs} |
 | An observed initd exit leaves any descendant policy authority live, a defensive recovery cut duplicates an imported post-init service, reclaims a ready exact-PID service, lets repeated sibling failures starve monotonic deadline progress, fails to eventually adopt/reclaim an imported recovery, leaves an endpoint-less stale child authoritative past its deadline, or permits uiserver authority after any ancestor in its reporter chain exits | post-init-supervisor-recovery and post-init-leases | services/rootd/src/main.rs, services/initd/src/main.rs, and kernel/compat/src/user/syscall/linux/lifecycle_broker_ops.rs |
-| A core dependency or restart sequence starts initd incorrectly, or a live core process that never registers its endpoint exhausts neither its twenty supervised readiness intervals nor the finite combined restart budget | rootd-bootstrap | services/rootd/src/main.rs |
+| A core dependency or restart sequence starts initd incorrectly, a live core process that never registers its endpoint exhausts neither its twenty supervised readiness intervals nor the finite combined restart budget, or an empty procd maintenance drain synchronously looks up syscalld and closes a `rootd -> loaderd -> procd -> rootd` authorization cycle | rootd-bootstrap plus source/runtime boot witness | services/rootd/src/main.rs and services/procd/src/main.rs |
 | A same-CID process lacks the per-launch challenge proof yet gains control authority; a foreign DVM, mismatched reply, stale input epoch, or out-of-order relay frame gains authority | dvm-control-relay | libs/driver-domain-host/src/lib.rs, driver-domains/linux/package/rustos-dvm-agent/src/rustos-dvm-agent.c, kernel/io-manager/src/input/dvm_frames.rs |
 | A same-CID unprivileged process discovers the static control listener and holds its setup slot, delaying the launch agent before HMAC validation | dvm-control-endpoint | libs/driver-domain-host/src/lib.rs, tools/{hostd,xtask}/src, driver-domains/linux/package/rustos-dvm-agent/src/rustos-dvm-agent.c |
 | A dead DVM control agent, stale or malformed ready file, unsafe state directory, partially written candidate, or one-shot announcement is accepted as live local readiness; repeated pre-rename crashes accumulate unbounded candidates | dvm-agent-readiness | driver-domains/linux/package/rustos-dvm-agent/src/rustos-dvm-agent.c and driver-domains/linux/board/overlay/etc/init.d/S50rustos-dvm |
@@ -86,6 +86,7 @@ failed infrastructure gates rather than implied successes:
 | A generic client poll claims DVM transport-consumer authority, a wake/arm race strands committed input, an ingestion turn drains without a bound or starves recovery work, or finite committed records never reach inputd policy under the declared worker fairness | input-ingestion-worker | kernel/compat/src/user/syscall/linux/input_broker_ops.rs and services/inputd/src/main.rs |
 | A DVM-backed scanout/input path, a compromised DVM relay, or a lost presentation/input channel is mistaken for a trusted-attention path and permits a privileged prompt | trusted-ui-boundary | kernel/io-manager/src/io/dvm_display.rs, kernel/io-manager/src/io/gui.rs, libs/rustos-user-abi/src/{device,syscall}.rs, services/uiserver/src/sys.rs |
 | A generic `poll`/`epoll` caller drains the DVM ring, the MSI-X worker transfer is absent from the ownership model, a finite `STATS` reply or readiness-gated read loses/replays an event, uiserver starts the stateful inputd READ merely to discover an empty queue, waits on ring0 after inputd has moved the only record to service policy, or accumulates burst credit after a missed reader cadence | input-readiness | kernel/io-manager/src/input/event_queue.rs, kernel/compat/src/user/syscall/linux/{ipc_ops.rs,service_ops/poll_epoll.rs,service_ops/ipc_helpers.rs}, services/inputd/src/main.rs, services/uiserver/src/{input_loop.rs,sys.rs} |
+| A provider changes readiness between an epoll check and waiter arm, a timeout races a signal, a restarted service revives a stale token, numeric-fd reuse retargets an old interest, a closed console session is silently recreated, or dup/fork/close/exec prematurely destroys or retains the service object behind an open description | userspace-wait-set | libs/rustos-user-abi/src/syscall.rs, kernel/compat/src/user/syscall/linux/{waitset_broker_ops.rs,ipc_ops.rs,proc_broker_ops.rs,lifecycle_broker_ops.rs,service_ops/poll_epoll.rs,service_ops/vfs_socket.rs}, kernel/ps/src/user/handles/table.rs, and services/{vfsd,netd,inputd,runtimed}/src |
 | A recovering console-policy service makes uiserver wait in the input/present loop, a keyboard burst grows an unbounded queue, a queue-full event disappears without telemetry, FIFO delivery is reordered, or a blocked console call prevents local input feedback | ui-frame-budget | services/uiserver/src/{input_loop.rs,main.rs}, services/uiserver/src/app/{input.rs,runtime.rs} |
 | Input and Wayland damage are split across redundant early presentations; a Wayland frame callback runs without a previous real presentation or damage-free cadence permit; missed timer pulses accumulate callback credit; or pending damage/callback work can remain live forever under the declared scheduler/timer fairness assumptions | wayland-frame-pacing | services/uiserver/src/{main.rs,wayland.rs} |
 | A netd-backed blocking accept owns the uiserver frame loop, accepted clients accumulate without a bound, overload leaks a client stream, or a queued accepted client never settles under the declared accept/UI fairness | wayland-accept-isolation | services/uiserver/src/wayland.rs and services/netd/src/main.rs |
@@ -115,13 +116,22 @@ failed infrastructure gates rather than implied successes:
 | A mutable or malformed runtime launch record requests strict System weight for an ordinary app, or UI weight is granted to a path that merely resembles the trusted UI executable | scheduler-admission | services/runtimed/src/{main.rs,spawn.rs} |
 | A catalog child becomes runnable before runtimed records its PID, or an activated child never receives its one-shot first turn while UI/input IPC handoffs remain busy | deferred-start, scheduler-cpu-distribution | services/runtimed/src/spawn.rs and kernel/ps/src/multitask/scheduler.rs |
 | A System caller waits on a User broker or nested User policy server without reply-scoped donation; a critical DVM/UI flood exceeds its two-dispatch System bound while User work is ready; a completed/cancelled/exited reply leaks an inherited System class; or a foreign/malformed netd response creates latency authority | ipc-priority-inheritance, scheduler-cpu-distribution | kernel/ps/src/multitask/{scheduler.rs,current.rs}, kernel/compat/src/user/syscall/linux/ipc_ops.rs |
-| Opaque IPC descriptors remain in the pending registry after queue cancellation, peer-close, invalid receiver output, or any scheduler retirement; retired task/process owners retain endpoint authority; one batch is partially installed | ipc-handle-transfer | kernel/ps/src/user/handles.rs, kernel/ipc-runtime/src/ipc/mod.rs, kernel/compat/src/user/syscall/linux/ipc_ops.rs, and kernel/ps/src/multitask/scheduler.rs |
+| Opaque IPC descriptors remain in the pending registry after queue cancellation, peer-close, invalid receiver output, or any scheduler retirement; a transferred service-backed open description loses or leaks its service reference; retired task/process owners retain endpoint authority; one batch is partially installed | ipc-handle-transfer | kernel/ps/src/user/handles.rs, kernel/ipc-runtime/src/ipc/mod.rs, kernel/compat/src/user/syscall/linux/{ipc_ops.rs,service_ops/vfs_socket.rs}, kernel/ps/src/multitask/scheduler.rs, and kernel/executive/src/boot.rs |
 | A foreign process receives a process-owned endpoint, completes a guessed reply capability, installs attached handles, prevents worker-thread service, leaves authority after owner-process exit, revives a dead numeric endpoint by enqueueing after its owner exits, any ordinary, transfer, `dup2`, or `F_DUPFD` install expands the ring-0 descriptor table beyond its declared ceiling or partially installs a capacity-rejected transfer batch, a malformed/locally rejected vfsd open retains remote authority, or a failed socket/socketpair/accept publication leaks new netd tokens or a partial fd pair | ipc-endpoint-ownership | kernel/ipc-runtime/src/ipc/mod.rs, kernel/compat/src/user/syscall/linux/{ipc_ops.rs,net_broker_ops.rs}, kernel/ps/src/multitask/current.rs, kernel/ps/src/user/handles/table.rs, kernel/compat/src/user/syscall/linux/service_ops/{ipc_helpers.rs,vfs_socket.rs}, and services/netd/src/main.rs |
 | A stale or foreign loader process maps/commits a prepare handle, a rejected commit retains mappings, loader exit leaks uncommitted broker state, or an in-flight prepare publishes after owner-exit cleanup | proc-broker-session | kernel/compat/src/user/syscall/linux/proc_broker_ops.rs and services/loaderd/src/main.rs |
 | Wrong PID/TID cancellation or exec consumes another target's ticket; target-thread exit or exec sibling retirement retains ticket/register handoff state; an image becomes schedulable before its register handoff exists | exec-ticket | services/procd/src/main.rs, services/loaderd/src/main.rs, kernel/compat/src/user/syscall/linux/proc_broker_ops.rs, kernel/compat/src/user/syscall/linux.rs, and kernel/compat/src/user/syscall/linux/support.rs |
 | Any commercial service accepts a wrong-version, reserved-flag, or out-of-bounds request envelope; rootd or storaged accepts a retired private request, interprets a truncated request as a valid operation, silently ignores fields not consumed by the selected storage operation, accepts an upper-bit alias after narrowing an operation argument, or leaves a synchronous caller blocked by dropping a malformed-size request without a reply; or a kernel/initd/runtimed/devmgrd client accepts a response whose subject, service, ticket, reserved fields, nested lengths, descriptor count, or operation-specific result shape does not match its request | source-only: commercial-service-envelope (no registered TLA model) | libs/rustos-user-abi/src/syscall.rs, services/{rootd,procd,storaged,initd,devmgrd,inputd,vfsd,syscalld,netd,loaderd}/src/main.rs, services/{runtimed/src/session.rs,uiserver/src/sys.rs}, services/runtimed/src/spawn.rs, and kernel/compat/src/user/syscall/linux/{ipc_ops.rs,proc_broker_ops.rs,service_ops/ipc_helpers.rs} |
 
 ## Release-blocking proof gaps
+
+The normal procd bootstrap path now returns from an empty lifecycle drain
+before rootd-authorized syscalld discovery, and bounded QEMU reaches initd.
+A replacement procd that begins with queued lifecycle evidence can still need
+that discovery before entering its receive loop. Commercial restart acceptance
+therefore remains blocked on an explicit dependency handoff or bounded
+asynchronous notification path that cannot participate in a
+`rootd -> loaderd -> procd -> rootd` cycle; the empty-start runtime witness is
+not evidence for that recovery topology.
 
 Dedicated finite abstractions now cover raw ELF/PE parser admission, page-table
 lifecycle, DMA-domain isolation, authenticated boot-file contents, DVM packet
@@ -288,18 +298,33 @@ marker. The exact 55-FPS command still failed. The gate requires three
 consecutive balanced WayClick windows at 55 FPS with at most a 50 ms callback
 gap and does not combine disjoint compositor, client, or relay windows.
 
-Source inspection isolates the remaining OS userspace event/readiness gap.
-uiserver dispatches Wayland clients nonblocking, but its idle wait listens only
-for input and a deadline capped by the 16 ms runtime cadence; it does not include
-the Wayland backend aggregate poll fd. The Linux compatibility `epoll_wait`
-entry point currently ignores its timeout argument and performs one vfsd
-readiness query. The existing event-driven netd wait covers only one indefinite
-socket poll, while a Wayland display requires an aggregate wait over multiple
-client fds. Closing that gap correctly requires a general capability-bound
-cross-provider wait-set/readiness ABI with timeout and lost-wake semantics, fd
-lifetime across dup/fork/exec, peer close, descriptor and credential transfer,
-bounded data rings, and revoke recovery. That scope is the failed next-ABI gate,
-not permission for a WayClick-specific shortcut.
+The generic userspace wait-set implementation now replaces the single-snapshot
+`epoll_wait`: vfsd owns bounded interest sets, netd/inputd/sessiond publish monotonic
+readiness generations, and compat uses atomic check-arm-recheck with monotonic
+deadlines. The same bounded broker now covers transient multi-fd `poll` sets,
+polling an epoll descriptor, unmasked-signal cancellation, and the temporary
+signal masks of `ppoll`/`epoll_pwait`. Interests bind provider object identity
+plus the exact service epoch,
+not a reusable numeric fd; provider restart revokes sleepers. Open-description
+references are acquired for dup/fork and released for close/CLOEXEC/process exit,
+with last-close purge. Uiserver's demoted readiness worker waits on Wayland-
+server's existing aggregate epoll fd, merges its one-slot notification with the
+input wake, and requires main-loop dispatch before rearm. This closes the
+source/model portion of the failed next-ABI gate without a WayClick-specific
+route. It is not runtime acceptance until the bounded QEMU/KVM wait/event
+evidence recorded by this change set passes.
+The concrete refinement does not issue service IPC from an already scheduler-
+armed task: it registers exact observations, rechecks while runnable, arms,
+then verifies waiter presence. Every provider query is capped at 16 ms and at
+the remaining finite wait deadline, preventing a 30-second generic service
+timeout from overriding `poll`/`epoll_wait`.
+Sessiond's provider covers non-system console input in transient `poll` sets:
+the readiness query reports the line-discipline queue without consuming it and
+the generation advances on empty-to-ready transitions and session removal;
+removed sessions return `POLLHUP` and are not recreated by the query. Console descriptors
+remain rejected by persistent `epoll_ctl` until they have a unique
+open-description identity with exact close/dup/fork/exec lifetime; accepting a
+session number or numeric fd here would reintroduce stale-interest revival.
 
 The relay cleanup also closed a source/model mismatch. The mandatory V3 atlas
 header is nonzero, so the former `serve_display` direct-DMA-BUF branch was
@@ -336,11 +361,13 @@ compositor-offline, or `display not available` marker. Performance remains a
 failed gate: after the 29.862 FPS startup sample, relay windows were
 50.730--59.105 FPS, while settled balanced WayClick commit/callback/release
 windows were 35.894--41.776 FPS. uiserver itself rendered at 53.789--57.886 FPS
-in those windows and its Wayland callback waits were normally 2--4 ms. The
-remaining deterministic frame loss is the userspace readiness boundary: after
-a callback, the client commit cannot wake uiserver and waits for its next 16 ms
-poll. Closing it requires the separately scoped cross-provider wait-set ABI;
-the result is not accepted as 55/60 FPS success.
+in those windows and its Wayland callback waits were normally 2--4 ms. That
+artifact's remaining deterministic frame loss was the then-missing userspace
+readiness boundary: after a callback, the client commit could not wake uiserver
+and waited for its next 16 ms poll. The current cross-provider wait-set
+source/model closes that mechanism, including external INET ingress, but the
+result is still not accepted as 55/60 FPS success until the current bounded
+QEMU/KVM rerun records event and timeout evidence.
 The later scheduler/readiness-hardening artifact passed incremental C
 compilation, schema-8 packaging, signature/artifact verification, and KVM input
 preparation, but was deliberately not booted or rerun for WayClick performance.

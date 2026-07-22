@@ -62,6 +62,7 @@ scheduler-cpu-distribution/SchedulerCpuDistribution	temporal	intentional-termina
 scheduler-thread-demotion/SchedulerThreadDemotion	safety	intentional-terminal	thread restoration may terminate	120	900	exhaustive	no	no	no
 scheduler-wakeup/SchedulerWakeup	temporal	intentional-terminal	retired task outcome is terminal	120	900	exhaustive	no	no	no
 trusted-ui-boundary/TrustedUiBoundary	safety	intentional-terminal	prompt authority may revoke	120	900	exhaustive	no	no	no
+userspace-wait-set/UserspaceWaitSet	temporal	intentional-terminal	wait may return readiness timeout or revoke	120	900	exhaustive	no	no	no
 ui-frame-budget/UiFrameBudget	temporal	intentional-terminal	bounded frame epoch may stop	120	900	exhaustive	no	no	no
 ui-input-motion/UiInputMotion	temporal	intentional-terminal	bounded motion trace may stop	120	900	exhaustive	no	no	no
 vfio-release-authorization/VfioReleaseAuthorization	safety	intentional-terminal	release decision is terminal	120	900	exhaustive	no	no	no
