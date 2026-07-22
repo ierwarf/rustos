@@ -30,8 +30,8 @@ pub fn syscall_linux_vfs_lseek(fd: u64, offset: i64, whence: u64) -> u64 {
 }
 
 pub fn syscall_linux_vfs_fstat(fd: u64, stat_ptr: u64) -> u64 {
-    if fd <= 2 {
-        return write_bootstrap_stat(stat_ptr, fd + 1, 0);
+    if let Some(multitask::KernelHandle::Console(console)) = current_kernel_handle(fd) {
+        return write_bootstrap_stat(stat_ptr, console.token_id(), 0);
     }
     if let Some(memfd) = current_memfd_handle(fd) {
         return write_bootstrap_stat(
@@ -302,21 +302,6 @@ pub fn write_linux_epoll_event(
 }
 
 pub fn current_kernel_handle(fd: u64) -> Option<multitask::KernelHandle> {
-    if fd == 0 {
-        return Some(multitask::KernelHandle::Console(
-            multitask::ConsoleStreamKind::Input,
-        ));
-    }
-    if fd == 1 {
-        return Some(multitask::KernelHandle::Console(
-            multitask::ConsoleStreamKind::Output,
-        ));
-    }
-    if fd == 2 {
-        return Some(multitask::KernelHandle::Console(
-            multitask::ConsoleStreamKind::Error,
-        ));
-    }
     multitask::with_current_user_process_state(|_, _, process_state| {
         process_state.handles().get(fd).cloned()
     })
@@ -487,6 +472,9 @@ pub fn syscall_linux_ioctl(fd: u64, request_number: u64, arg: u64) -> u64 {
     };
     match route {
         rustos_user_abi::syscall::DEVMGRD_IOCTL_ROUTE_SESSIOND_TTY => {
+            if !current_kernel_handle(fd).is_some_and(|handle| is_console_handle(&handle)) {
+                return linux_errno(LINUX_ENOTTY);
+            }
             match ioctl_tty_via_sessiond(fd, request_number, arg) {
                 Ok(value) => value,
                 Err(errno) => linux_errno(errno),
@@ -514,6 +502,10 @@ pub fn syscall_linux_ioctl(fd: u64, request_number: u64, arg: u64) -> u64 {
         }
         _ => linux_errno(LINUX_EINVAL),
     }
+}
+
+fn is_console_handle(handle: &multitask::KernelHandle) -> bool {
+    matches!(handle, multitask::KernelHandle::Console(_))
 }
 
 fn ioctl_is_direct_display_present(request_number: u64) -> bool {
@@ -1182,7 +1174,18 @@ fn write_current_sockopt_payload(
 
 #[cfg(test)]
 mod tests {
-    use super::ioctl_is_display_policy_request;
+    use super::{ioctl_is_display_policy_request, is_console_handle};
+    use crate::multitask;
+
+    #[test]
+    fn tty_policy_route_requires_an_actual_console_open_description() {
+        let console = multitask::KernelHandle::Console(multitask::ConsoleHandle::new(
+            multitask::ConsoleStreamKind::Input,
+        ));
+        let epoll = multitask::KernelHandle::Epoll(multitask::EpollHandle::new());
+        assert!(is_console_handle(&console));
+        assert!(!is_console_handle(&epoll));
+    }
 
     #[test]
     fn ui_policy_direct_set_is_limited_to_display_contracts() {

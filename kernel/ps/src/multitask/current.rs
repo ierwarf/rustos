@@ -203,7 +203,7 @@ pub fn current_console_session() -> Option<ConsoleSessionHandle> {
 pub fn exec_current_user_process(
     address_space: ProcessAddressSpace,
     bootstrap: super::UserTaskBootstrap,
-) -> bool {
+) -> Option<alloc::vec::Vec<crate::user::handles::KernelHandle>> {
     interrupts::without_interrupts(|| unsafe {
         scheduler_mut().exec_current_user_process(address_space, bootstrap)
     })
@@ -214,7 +214,7 @@ pub fn exec_user_process_by_pid(
     thread_id: u64,
     address_space: ProcessAddressSpace,
     bootstrap: super::UserTaskBootstrap,
-) -> bool {
+) -> Option<alloc::vec::Vec<crate::user::handles::KernelHandle>> {
     interrupts::without_interrupts(|| unsafe {
         scheduler_mut().exec_user_process_by_pid(process_id, thread_id, address_space, bootstrap)
     })

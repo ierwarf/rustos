@@ -73,9 +73,9 @@ failed infrastructure gates rather than implied successes:
 | Concurrent registration wins after another registrar or exit cleanup has observed an empty endpoint, or a reader combines endpoint/owner/capability fields from different revoke/republication generations | endpoint-publication | kernel/compat/src/user/syscall/linux/ipc_ops.rs and kernel/ps/src/multitask/process_table.rs |
 | A child runs before exact supervisor lease admission, activation/endpoint timeout leaves a hidden child, or runtimed continues launching after exact child retirement becomes uncertain | deferred-start | services/rootd/src/main.rs, services/runtimed/src/spawn.rs, and services/loaderd/src/main.rs |
 | Wrong supervisor/PID becomes a post-init policy service, another sender rebinds a running exact-PID lease, or initd/sessiond exit leaves a dependent lease or capability live | post-init-leases | services/rootd/src/main.rs |
-| A crashed core service restarts in the same scheduler turn, unrelated lifecycle work starves monotonic backoff progress, a pending restart never settles or fails closed, retry budget is consumed without elapsed backoff, old service authority survives pending/failed recovery, an initial/restarted loader activation failure leaves a suspended child, rootd and procd steal lifecycle events from one shared consumer queue, or queue/copyout pressure silently discards the exit evidence needed to revoke a lease or policy cache | rootd-restart-backoff | services/rootd/src/main.rs, services/procd/src/main.rs, and kernel/compat/src/user/syscall/linux/{lifecycle_broker_ops.rs,offload_ops.rs} |
+| A crashed core service restarts in the same scheduler turn, unrelated lifecycle work starves monotonic backoff progress, a pending restart never settles or fails closed, retry budget is consumed without elapsed backoff, old service authority survives pending/failed recovery, an initial/restarted loader activation failure leaves a suspended child, rootd/procd/syscalld steal lifecycle events from one shared consumer queue, syscalld recovery waits synchronously on procd/rootd, or queue/copyout pressure silently discards the exit evidence needed to revoke a lease or policy cache | rootd-restart-backoff | services/{rootd,procd,syscalld}/src, and kernel/compat/src/user/syscall/linux/{lifecycle_broker_ops.rs,offload_ops.rs} |
 | An observed initd exit leaves any descendant policy authority live, a defensive recovery cut duplicates an imported post-init service, reclaims a ready exact-PID service, lets repeated sibling failures starve monotonic deadline progress, fails to eventually adopt/reclaim an imported recovery, leaves an endpoint-less stale child authoritative past its deadline, or permits uiserver authority after any ancestor in its reporter chain exits | post-init-supervisor-recovery and post-init-leases | services/rootd/src/main.rs, services/initd/src/main.rs, and kernel/compat/src/user/syscall/linux/lifecycle_broker_ops.rs |
-| A core dependency or restart sequence starts initd incorrectly, a live core process that never registers its endpoint exhausts neither its twenty supervised readiness intervals nor the finite combined restart budget, or an empty procd maintenance drain synchronously looks up syscalld and closes a `rootd -> loaderd -> procd -> rootd` authorization cycle | rootd-bootstrap plus source/runtime boot witness | services/rootd/src/main.rs and services/procd/src/main.rs |
+| A core dependency or restart sequence starts initd incorrectly, a live core process that never registers its endpoint exhausts neither its twenty supervised readiness intervals nor the finite combined restart budget, or queued procd/syscalld maintenance synchronously discovers another service and closes a `rootd -> loaderd -> procd -> rootd` authorization cycle | rootd-bootstrap plus source/runtime boot witness | services/{rootd,procd,syscalld}/src/main.rs |
 | A same-CID process lacks the per-launch challenge proof yet gains control authority; a foreign DVM, mismatched reply, stale input epoch, or out-of-order relay frame gains authority | dvm-control-relay | libs/driver-domain-host/src/lib.rs, driver-domains/linux/package/rustos-dvm-agent/src/rustos-dvm-agent.c, kernel/io-manager/src/input/dvm_frames.rs |
 | A same-CID unprivileged process discovers the static control listener and holds its setup slot, delaying the launch agent before HMAC validation | dvm-control-endpoint | libs/driver-domain-host/src/lib.rs, tools/{hostd,xtask}/src, driver-domains/linux/package/rustos-dvm-agent/src/rustos-dvm-agent.c |
 | A dead DVM control agent, stale or malformed ready file, unsafe state directory, partially written candidate, or one-shot announcement is accepted as live local readiness; repeated pre-rename crashes accumulate unbounded candidates | dvm-agent-readiness | driver-domains/linux/package/rustos-dvm-agent/src/rustos-dvm-agent.c and driver-domains/linux/board/overlay/etc/init.d/S50rustos-dvm |
@@ -86,7 +86,9 @@ failed infrastructure gates rather than implied successes:
 | A generic client poll claims DVM transport-consumer authority, a wake/arm race strands committed input, an ingestion turn drains without a bound or starves recovery work, or finite committed records never reach inputd policy under the declared worker fairness | input-ingestion-worker | kernel/compat/src/user/syscall/linux/input_broker_ops.rs and services/inputd/src/main.rs |
 | A DVM-backed scanout/input path, a compromised DVM relay, or a lost presentation/input channel is mistaken for a trusted-attention path and permits a privileged prompt | trusted-ui-boundary | kernel/io-manager/src/io/dvm_display.rs, kernel/io-manager/src/io/gui.rs, libs/rustos-user-abi/src/{device,syscall}.rs, services/uiserver/src/sys.rs |
 | A generic `poll`/`epoll` caller drains the DVM ring, the MSI-X worker transfer is absent from the ownership model, a finite `STATS` reply or readiness-gated read loses/replays an event, uiserver starts the stateful inputd READ merely to discover an empty queue, waits on ring0 after inputd has moved the only record to service policy, or accumulates burst credit after a missed reader cadence | input-readiness | kernel/io-manager/src/input/event_queue.rs, kernel/compat/src/user/syscall/linux/{ipc_ops.rs,service_ops/poll_epoll.rs,service_ops/ipc_helpers.rs}, services/inputd/src/main.rs, services/uiserver/src/{input_loop.rs,sys.rs} |
-| A provider changes readiness between an epoll check and waiter arm, a timeout races a signal, a restarted service revives a stale token, numeric-fd reuse retargets an old interest, a closed console session is silently recreated, or dup/fork/close/exec prematurely destroys or retains the service object behind an open description | userspace-wait-set | libs/rustos-user-abi/src/syscall.rs, kernel/compat/src/user/syscall/linux/{waitset_broker_ops.rs,ipc_ops.rs,proc_broker_ops.rs,lifecycle_broker_ops.rs,service_ops/poll_epoll.rs,service_ops/vfs_socket.rs}, kernel/ps/src/user/handles/table.rs, and services/{vfsd,netd,inputd,runtimed}/src |
+| A provider changes readiness between an epoll check and waiter arm, an internal 16 ms provider timeout replaces the application's deadline or hides readiness already found on another fd, a timeout races a signal, a restarted service revives a stale token or aborts the aggregate wait instead of returning per-interest HUP, provider epoch is part of the registration key and creates duplicate/undeletable interests after restart, DEL incorrectly requires the unavailable provider's current epoch, numeric-fd reuse retargets an old interest, dup acquires one provider object then commits a concurrently reused source fd or releases a stale snapshot instead of the target actually replaced, fork clones one fd table but reacquires provider refs from a later live-parent snapshot, a closed console session is silently recreated by stale read/write/TTY/input traffic, a transient syscall snapshot is mistaken for an fd and suppresses final-close purge, a nonblocking console read re-enters the blocking retry loop after readiness is consumed, fd 0--2 bypass normal close/dup replacement semantics, a TTY ioctl route treats a closed/reused non-console fd as the caller's console, a wedged provider makes close/CLOEXEC/exit wait without a bound, or dup/fork/close/exec/exit prematurely destroys or retains the service object behind an open description | userspace-wait-set | libs/rustos-user-abi/src/syscall.rs, kernel/compat/src/user/syscall/linux/{waitset_broker_ops.rs,ipc_ops.rs,proc_broker_ops.rs,lifecycle_broker_ops.rs,service_ops/{ipc_helpers.rs,poll_epoll.rs,vfs_meta.rs,vfs_socket.rs}}, kernel/ps/src/user/handles/{table.rs,handles.rs}, and services/{vfsd,netd,inputd,runtimed}/src |
+| A timed-out state mutation is applied twice, an operation-ID alias changes its meaning, an unresolved replay entry is silently evicted, a service restart publishes an endpoint before retained state is replayed, a stale revision rolls policy backward, or remote VFS dup/fork/transfer depends on an uncertain provider-side increment | service-mutation-recovery | libs/rustos-user-abi/src/syscall.rs, services/rootd/src/{main.rs,service_checkpoint.rs}, services/{vfsd,netd}/src/main.rs, and kernel/compat/src/user/syscall/linux/service_ops/{ipc_helpers.rs,vfs_socket.rs} |
+| Multiboot publishes an absent/deterministic seed, an ordinary process reads the entropy substrate, a policy service requests an unbounded copyout, or Linux `getrandom`/service capability tokens are derived from public PID/TID/counter state instead of boot entropy | source-only: entropy-broker-boundary (no registered TLA model) | boot/boot-protocol/src/lib.rs, kernel/nucleus-core/src/multiboot2.rs, libs/boot-random/src/lib.rs, libs/rustos-user-abi/src/syscall.rs, kernel/compat/src/user/syscall/linux/{broker_ops.rs,entropy_broker_ops.rs}, and services/{syscalld,netd}/src |
 | A recovering console-policy service makes uiserver wait in the input/present loop, a keyboard burst grows an unbounded queue, a queue-full event disappears without telemetry, FIFO delivery is reordered, or a blocked console call prevents local input feedback | ui-frame-budget | services/uiserver/src/{input_loop.rs,main.rs}, services/uiserver/src/app/{input.rs,runtime.rs} |
 | Input and Wayland damage are split across redundant early presentations; a Wayland frame callback runs without a previous real presentation or damage-free cadence permit; missed timer pulses accumulate callback credit; or pending damage/callback work can remain live forever under the declared scheduler/timer fairness assumptions | wayland-frame-pacing | services/uiserver/src/{main.rs,wayland.rs} |
 | A netd-backed blocking accept owns the uiserver frame loop, accepted clients accumulate without a bound, overload leaks a client stream, or a queued accepted client never settles under the declared accept/UI fairness | wayland-accept-isolation | services/uiserver/src/wayland.rs and services/netd/src/main.rs |
@@ -124,14 +126,55 @@ failed infrastructure gates rather than implied successes:
 
 ## Release-blocking proof gaps
 
-The normal procd bootstrap path now returns from an empty lifecycle drain
-before rootd-authorized syscalld discovery, and bounded QEMU reaches initd.
-A replacement procd that begins with queued lifecycle evidence can still need
-that discovery before entering its receive loop. Commercial restart acceptance
-therefore remains blocked on an explicit dependency handoff or bounded
-asynchronous notification path that cannot participate in a
-`rootd -> loaderd -> procd -> rootd` cycle; the empty-start runtime witness is
-not evidence for that recovery topology.
+Procd and syscalld now consume independent kernel fan-out queues and perform no
+cross-service discovery while draining. A replacement procd can therefore
+rebase queued signal-policy evidence before serving, while a replacement
+syscalld rebases queued credential/MM evidence before its first request. The
+former procd-to-syscalld process-exit request was retired, removing both the
+bootstrap dependency cycle and its unauthenticated PID-shaped cleanup surface.
+The restart topology has an earlier bounded 30-second QEMU witness in addition
+to its source/model evidence: boot reached initd and repeatedly drained the expected
+no-input-device child exits without recreating the rootd/loaderd/procd cycle or
+stalling lifecycle progress. That image predates the current entropy and
+checkpoint changes and is not current-change runtime evidence. Live KVM
+acceptance remains a separate unclaimed
+gate because the launcher correctly rejected the host NVIDIA render node.
+
+Provider reference mutations now carry kernel-minted 128-bit operation IDs.
+Netd reserves replay capacity before mutation, retains the exact result until a
+kernel ACK, rejects aliases, and never evicts an unresolved result. Compat
+retries the same identity and keeps unresolved mutation/ACK work in a bounded
+reconciliation queue. Remote VFS dup/fork/transfer no longer mutates a remote
+refcount at all: the kernel fd table owns descriptor references and vfsd sees
+only initial open and idempotent final close. This closes the ambiguous remote
+increment/decrement mechanism instead of adding compensating guesses.
+
+The vfsd capability boundary now combines three independent checks. Rootd
+admits lookup only on an explicit service dependency edge; object IDs are
+kernel-minted boot-entropy capabilities preserved across dup/fork/transfer; and
+vfsd/netd compare payload identity with the kernel-stamped IPC sender. A
+service PID or a difficult-to-guess token alone is not accepted as authority.
+The entropy source itself is a capability-gated boot-CSPRNG broker; the retired
+PID/TID/counter generator is not a security fallback.
+
+Vfsd commits epoll refcounts and complete interest records to rootd's
+authenticated, versioned opaque checkpoint before local publication. A
+replacement vfsd scans and validates the checkpoint, reconstructs its registry,
+and only then creates/publishes the endpoint; malformed or partial replay fails
+closed. The `service-mutation-recovery` model covers unique commit revisions,
+crash, replay-before-publication, and reconciliation. Live crash-injection/QEMU
+evidence for the replacement-service path remains an acceptance gate; passing
+source/model checks alone does not claim that runtime evidence.
+
+Ordinary vfsd open descriptions remain service-local: normalized path, cursor,
+length/content generation, and mutable status flags are lost when vfsd is
+replaced, so a still-live kernel `RemoteVfs` capability receives `EBADF` after
+restart. The checkpoint store also retains closed epoll tombstones without an
+acknowledged compaction generation, making its 32,768-record bound a permanent
+long-churn ceiling. Both require a durable open-description schema plus
+replayable final-mutation acknowledgement/compaction; retrying the operation or
+silently reopening at cursor zero is forbidden. This is a critical unimplemented
+restart-continuity gate, not covered by `service-mutation-recovery`.
 
 Dedicated finite abstractions now cover raw ELF/PE parser admission, page-table
 lifecycle, DMA-domain isolation, authenticated boot-file contents, DVM packet
@@ -146,23 +189,21 @@ equivalence and runtime fault evidence still require independent artifacts.
 Commercial release remains blocked until the same properties have source
 conformance plus runtime fault evidence.
 
-The current IPC handle-receive proof covers invalid output rejected before
-dequeue and descriptor-table capacity rejected before the first installation.
-It does not cover a second thread changing the receiver's output mapping after
-validation: today the descriptors can be installed and the later numeric-FD
-copyout can still fail. Closing that transactional gap needs descriptor-slot
-reservation plus copyout/commit (or an equivalent non-reusable generation), so
-it remains an explicit unimplemented gate rather than a claimed all-or-nothing
-source property.
+IPC handle receive now reserves descriptor slots invisibly, copies the complete
+numeric result, then publishes the whole batch at one descriptor-table commit
+point. Reservation generations survive ordinary concurrency and prevent a
+stale pre-exec transaction from cancelling or committing into numerically
+reused slots; fork does not inherit reservations, while exec/exit revoke them.
+Runtime output-remap fault injection remains required acceptance evidence, but
+the former partially visible installation path is no longer present in source.
 
-The newly closed provider-publication paths reclaim vfsd objects and netd
-tokens when local fd admission, pair installation, or pair copyout fails.
-Process teardown still drops the local handle table without a complete,
-acknowledged cross-service close sweep for every surviving remote VFS/socket
-object. Closing that broader lifecycle requires a bounded provider-revoke
-protocol (including provider restart and failed acknowledgement), so it remains
-an explicit unimplemented gate rather than being hidden by the narrower
-publication rollback proof.
+Provider-publication rollback reclaims vfsd objects and netd tokens when local
+fd admission, pair installation, or pair copyout fails. Process close, CLOEXEC,
+exit, fork rollback, and cancelled transfer use the same descriptor-exact
+cleanup: remote VFS closes are final-reference-only and idempotently queued;
+netd closes retain replay state through explicit ACK. Queue/capacity failure is
+observable and fail-closed. Runtime provider-crash injection remains required
+to accept the complete teardown topology.
 
 The signal proof now includes SIGSTOP instead of silently omitting it from the
 finite configuration. RustOS currently maps default SIGSTOP to process
@@ -303,16 +344,27 @@ The generic userspace wait-set implementation now replaces the single-snapshot
 readiness generations, and compat uses atomic check-arm-recheck with monotonic
 deadlines. The same bounded broker now covers transient multi-fd `poll` sets,
 polling an epoll descriptor, unmasked-signal cancellation, and the temporary
-signal masks of `ppoll`/`epoll_pwait`. Interests bind provider object identity
-plus the exact service epoch,
-not a reusable numeric fd; provider restart revokes sleepers. Open-description
+signal masks of `ppoll`/`epoll_pwait`. Interests bind the target fd plus stable
+provider object identity, so fd reuse cannot retarget an old open description;
+the observed epoch is mutable registration state that only explicit MOD may
+replace after restart. Open-description
 references are acquired for dup/fork and released for close/CLOEXEC/process exit,
-with last-close purge. Uiserver's demoted readiness worker waits on Wayland-
+with last-close purge. Fork acquires from the frozen child fd-table clone, and
+exec releases only the exact handles retired by its process-table commit, so a
+sibling close/reuse cannot redirect either transaction. ADD/MOD pins the exact
+target description through the vfsd mutation; its final guard release performs
+the ordinary last-close purge, preventing purge-before-insert resurrection.
+The ring0 waiter array is sized from the scheduler task ceiling times the
+provider ceiling, so maximum legal task occupancy cannot exhaust the registry
+before every task has one waiter for every provider.
+Uiserver's demoted readiness worker waits on Wayland-
 server's existing aggregate epoll fd, merges its one-slot notification with the
 input wake, and requires main-loop dispatch before rearm. This closes the
 source/model portion of the failed next-ABI gate without a WayClick-specific
-route. It is not runtime acceptance until the bounded QEMU/KVM wait/event
-evidence recorded by this change set passes.
+route. The bounded QEMU boot witness establishes lifecycle progress through
+initd, but does not replace the still-unclaimed live KVM wait/event workload:
+host admission correctly rejected the available NVIDIA render node before
+launch.
 The concrete refinement does not issue service IPC from an already scheduler-
 armed task: it registers exact observations, rechecks while runnable, arms,
 then verifies waiter presence. Every provider query is capped at 16 ms and at
@@ -321,10 +373,10 @@ timeout from overriding `poll`/`epoll_wait`.
 Sessiond's provider covers non-system console input in transient `poll` sets:
 the readiness query reports the line-discipline queue without consuming it and
 the generation advances on empty-to-ready transitions and session removal;
-removed sessions return `POLLHUP` and are not recreated by the query. Console descriptors
-remain rejected by persistent `epoll_ctl` until they have a unique
-open-description identity with exact close/dup/fork/exec lifetime; accepting a
-session number or numeric fd here would reintroduce stale-interest revival.
+removed sessions return `POLLHUP` and are not recreated by the query. Console
+descriptors now use a unique open-description identity with exact
+close/dup/fork/exec lifetime in persistent `epoll_ctl`; neither a reusable
+session number nor the numeric fd is treated as that identity.
 
 The relay cleanup also closed a source/model mismatch. The mandatory V3 atlas
 header is nonzero, so the former `serve_display` direct-DMA-BUF branch was

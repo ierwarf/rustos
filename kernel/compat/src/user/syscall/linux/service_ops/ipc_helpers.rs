@@ -1,4 +1,5 @@
 use super::*;
+use alloc::collections::VecDeque;
 use alloc::string::String;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -11,6 +12,27 @@ const MAX_SLOW_SERVICE_CALL_LOGS: usize = 128;
 // IPC deadline. Stateful authorize/read calls retain their completion wait
 // until the ABI carries a cancellable authorization lease.
 const INPUTD_READINESS_IPC_TIMEOUT_MS: u64 = 16;
+const PENDING_VFS_MUTATION_CAPACITY: usize = 32 * 1024;
+const PENDING_VFS_PAYLOAD_CAPACITY: usize = 64;
+
+#[derive(Clone)]
+struct PendingVfsMutation {
+    op: u16,
+    fd: u64,
+    remote_id: u64,
+    arg0: u64,
+    arg1: u64,
+    arg2: u64,
+    operation_hi: u64,
+    operation_lo: u64,
+    payload_len: u32,
+    payload: [u8; PENDING_VFS_PAYLOAD_CAPACITY],
+}
+
+lazy_static::lazy_static! {
+    static ref PENDING_VFS_MUTATIONS: spin::Mutex<VecDeque<PendingVfsMutation>> =
+        spin::Mutex::new(VecDeque::new());
+}
 
 static SLOW_SERVICE_CALL_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 
@@ -332,8 +354,21 @@ pub fn new_vfs_request(op: u16) -> VfsIpcRequest {
         op,
         ..VfsIpcRequest::default()
     };
+    let mut operation = [0_u8; 16];
+    nucleus_core::util::random::Random::new().fill_bytes(&mut operation);
+    request.operation_hi = u64::from_le_bytes(operation[..8].try_into().unwrap());
+    request.operation_lo = u64::from_le_bytes(operation[8..].try_into().unwrap());
+    if request.operation_hi == 0 && request.operation_lo == 0 {
+        request.operation_lo = 1;
+    }
     populate_vfs_identity(&mut request);
     request
+}
+
+pub fn mint_service_object_id() -> u64 {
+    let mut bytes = [0_u8; 8];
+    nucleus_core::util::random::Random::new().fill_bytes(&mut bytes);
+    u64::from_le_bytes(bytes).max(1)
 }
 
 pub fn populate_vfs_identity(request: &mut VfsIpcRequest) {
@@ -397,14 +432,51 @@ fn call_vfs_ipc_request_impl(
     request: &VfsIpcRequest,
     timeout_ms: Option<u64>,
 ) -> Result<VfsIpcResponse, i64> {
+    drain_pending_vfs_mutations();
     let start_ticks = crate::arch::rtc::ticks();
-    let response = match timeout_ms {
-        Some(timeout_ms) => ipc_ops::call_service_endpoint_with_timeout(
-            IPC_SERVICE_VFSD,
-            as_bytes(request),
-            timeout_ms,
-        )?,
-        None => ipc_ops::call_service_endpoint(IPC_SERVICE_VFSD, as_bytes(request))?,
+    let replay_safe_mutation = request.op == VFS_IPC_OP_CLOSE
+        || request.op == VFS_IPC_OP_POLL_QUERY
+            && matches!(
+                request.arg0,
+                VFS_POLL_QUERY_EPOLL_CREATE
+                    | VFS_POLL_QUERY_EPOLL_CTL
+                    | VFS_POLL_QUERY_EPOLL_REF
+                    | VFS_POLL_QUERY_EPOLL_UNREF
+                    | VFS_POLL_QUERY_EPOLL_PURGE_OBJECT
+            );
+    let attempts = if timeout_ms.is_some() && replay_safe_mutation {
+        3
+    } else {
+        1
+    };
+    let mut response = None;
+    let mut last_errno = LINUX_ETIMEDOUT;
+    for _ in 0..attempts {
+        let result = match timeout_ms {
+            Some(timeout_ms) => ipc_ops::call_service_endpoint_with_timeout(
+                IPC_SERVICE_VFSD,
+                as_bytes(request),
+                timeout_ms,
+            ),
+            None => ipc_ops::call_service_endpoint(IPC_SERVICE_VFSD, as_bytes(request)),
+        };
+        match result {
+            Ok(bytes) => {
+                response = Some(bytes);
+                break;
+            }
+            Err(errno) if errno == LINUX_ETIMEDOUT && attempts > 1 => last_errno = errno,
+            Err(errno) => return Err(errno),
+        }
+    }
+    let response = match response {
+        Some(response) => response,
+        None => {
+            if replay_safe_mutation {
+                enqueue_pending_vfs_mutation(request)?;
+            }
+            return Err(last_errno);
+        }
     };
     let detail = vfs_request_log_detail(request);
     log_slow_service_call(
@@ -417,11 +489,87 @@ fn call_vfs_ipc_request_impl(
         detail.as_deref(),
     );
     if response.len() != size_of::<VfsIpcResponse>() {
+        if replay_safe_mutation {
+            enqueue_pending_vfs_mutation(request)?;
+        }
         return Err(LINUX_EINVAL);
     }
     let response = read_unaligned::<VfsIpcResponse>(response.as_slice());
-    validate_vfs_response_envelope(request.op, &response)?;
+    if let Err(errno) = validate_vfs_response_envelope(request.op, &response) {
+        if replay_safe_mutation {
+            enqueue_pending_vfs_mutation(request)?;
+        }
+        return Err(errno);
+    }
     Ok(response)
+}
+
+fn enqueue_pending_vfs_mutation(request: &VfsIpcRequest) -> Result<(), i64> {
+    let payload_len = request.payload_len as usize;
+    if payload_len > PENDING_VFS_PAYLOAD_CAPACITY {
+        return Err(LINUX_EINVAL);
+    }
+    let mut queue = PENDING_VFS_MUTATIONS.lock();
+    if queue.iter().any(|entry| {
+        entry.operation_hi == request.operation_hi && entry.operation_lo == request.operation_lo
+    }) {
+        return Ok(());
+    }
+    if queue.len() == PENDING_VFS_MUTATION_CAPACITY {
+        return Err(LINUX_ENOSPC);
+    }
+    let mut payload = [0_u8; PENDING_VFS_PAYLOAD_CAPACITY];
+    payload[..payload_len].copy_from_slice(&request.payload[..payload_len]);
+    queue.push_back(PendingVfsMutation {
+        op: request.op,
+        fd: request.fd,
+        remote_id: request.remote_id,
+        arg0: request.arg0,
+        arg1: request.arg1,
+        arg2: request.arg2,
+        operation_hi: request.operation_hi,
+        operation_lo: request.operation_lo,
+        payload_len: request.payload_len,
+        payload,
+    });
+    Ok(())
+}
+
+fn drain_pending_vfs_mutations() {
+    for _ in 0..8 {
+        let Some(pending) = PENDING_VFS_MUTATIONS.lock().pop_front() else {
+            return;
+        };
+        let mut request = new_vfs_request(pending.op);
+        request.fd = pending.fd;
+        request.remote_id = pending.remote_id;
+        request.arg0 = pending.arg0;
+        request.arg1 = pending.arg1;
+        request.arg2 = pending.arg2;
+        request.operation_hi = pending.operation_hi;
+        request.operation_lo = pending.operation_lo;
+        request.payload_len = pending.payload_len;
+        let payload_len = pending.payload_len as usize;
+        request.payload[..payload_len].copy_from_slice(&pending.payload[..payload_len]);
+        let completed =
+            ipc_ops::call_service_endpoint_with_timeout(IPC_SERVICE_VFSD, as_bytes(&request), 16)
+                .ok()
+                .and_then(|bytes| {
+                    (bytes.len() == size_of::<VfsIpcResponse>())
+                        .then(|| read_unaligned::<VfsIpcResponse>(&bytes))
+                })
+                .is_some_and(|response| {
+                    validate_vfs_response_envelope(request.op, &response).is_ok()
+                        && (response.status == 0
+                            || response.status == LINUX_EBADF as i32
+                            || response.status == LINUX_ENOENT as i32
+                            || response.status == LINUX_ESTALE as i32)
+                });
+        if !completed {
+            PENDING_VFS_MUTATIONS.lock().push_front(pending);
+            return;
+        }
+    }
 }
 
 fn validate_vfs_response_envelope(request_op: u16, response: &VfsIpcResponse) -> Result<(), i64> {
@@ -653,7 +801,11 @@ pub fn console_readiness_via_sessiond_with_timeout(
     ))
 }
 
-pub fn console_read_via_sessiond(user_ptr: u64, user_len: usize) -> Result<u64, i64> {
+pub fn console_read_via_sessiond(
+    user_ptr: u64,
+    user_len: usize,
+    nonblocking: bool,
+) -> Result<u64, i64> {
     if user_len == 0 {
         return Ok(0);
     }
@@ -682,8 +834,8 @@ pub fn console_read_via_sessiond(user_ptr: u64, user_len: usize) -> Result<u64, 
             return Err(LINUX_EINVAL);
         }
         if read == 0 {
-            if copied != 0 {
-                break;
+            if let Some(result) = empty_console_read_result(nonblocking, copied) {
+                return result;
             }
             multitask::yield_now();
             crate::arch::rtc::sleep(1);
@@ -699,6 +851,16 @@ pub fn console_read_via_sessiond(user_ptr: u64, user_len: usize) -> Result<u64, 
         }
     }
     Ok(copied as u64)
+}
+
+fn empty_console_read_result(nonblocking: bool, copied: usize) -> Option<Result<u64, i64>> {
+    if copied != 0 {
+        Some(Ok(copied as u64))
+    } else if nonblocking {
+        Some(Err(LINUX_EAGAIN))
+    } else {
+        None
+    }
 }
 
 pub fn console_write_via_sessiond(user_ptr: u64, user_len: usize) -> Result<u64, i64> {
@@ -1366,6 +1528,13 @@ fn log_slow_service_call(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_nonblocking_console_read_returns_eagain_without_retry() {
+        assert_eq!(empty_console_read_result(true, 0), Some(Err(LINUX_EAGAIN)));
+        assert_eq!(empty_console_read_result(false, 0), None);
+        assert_eq!(empty_console_read_result(true, 7), Some(Ok(7)));
+    }
 
     #[test]
     fn vfs_response_envelope_rejects_oversized_payload_before_slice_use() {

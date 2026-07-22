@@ -158,6 +158,7 @@ pub(crate) fn validate_linux_request(request: &LinuxSyscallOffloadRequest) -> Re
 
 pub(crate) fn validate_vfs_request(request: &VfsIpcRequest) -> Result<(), i32> {
     if request.version != VFS_IPC_ABI_VERSION
+        || (request.operation_hi == 0 && request.operation_lo == 0)
         || request.path_len as usize > VFS_IPC_PATH_CAPACITY
         || request.payload_len as usize > VFS_IPC_REQUEST_PAYLOAD_CAPACITY
     {

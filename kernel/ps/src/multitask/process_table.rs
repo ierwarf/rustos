@@ -336,7 +336,7 @@ pub fn replace_for_exec(
     linux_memory_map: crate::user::linux::LinuxMemoryMapState,
     linux_runtime_profile: crate::user::linux::LinuxRuntimeProfile,
     exec_path: &str,
-) -> Option<()> {
+) -> Option<alloc::vec::Vec<crate::user::handles::KernelHandle>> {
     let process = retain_process(handle)?;
     process.with_state_mut(|_, state| {
         // State replacement and the process-table exit marker are one
@@ -347,7 +347,7 @@ pub fn replace_for_exec(
         if !exec_may_replace(object) {
             return None;
         }
-        state.replace_for_exec(
+        let closed = state.replace_for_exec(
             address_space,
             linux_process_state,
             linux_memory_map,
@@ -356,7 +356,7 @@ pub fn replace_for_exec(
         );
         object.mm_generation = ProcessTable::next_generation(object.mm_generation);
         object.queued_for_reap = false;
-        Some(())
+        Some(closed)
     })
 }
 

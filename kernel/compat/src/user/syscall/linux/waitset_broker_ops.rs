@@ -11,7 +11,8 @@ use rustos_user_abi::syscall::{
 };
 use spin::Mutex;
 
-const WAITSET_WAITER_CAPACITY: usize = 256;
+const WAITSET_WAITER_CAPACITY: usize =
+    multitask::MAX_SCHEDULER_TASKS * WAITSET_PROVIDER_MAX as usize;
 const INPUT_OPEN_DESCRIPTION_CAPACITY: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -257,10 +258,10 @@ fn provider_for_service(service_id: u64) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ProviderObservation, acquire_input_open_description, generation_advances,
-        input_open_description_access, provider_for_service, register_input_open_description,
-        register_waitset_waiters, release_input_open_description, remove_waitset_waiters,
-        service_for_provider, waitset_waiters_match,
+        ProviderObservation, WAITSET_WAITER_CAPACITY, acquire_input_open_description,
+        generation_advances, input_open_description_access, provider_for_service,
+        register_input_open_description, register_waitset_waiters, release_input_open_description,
+        remove_waitset_waiters, service_for_provider, waitset_waiters_match,
     };
     use rustos_user_abi::syscall::{
         INPUTD_ACCESS_EVDEV, IPC_SERVICE_INPUTD, IPC_SERVICE_NETD, IPC_SERVICE_SESSIOND,
@@ -274,6 +275,15 @@ mod tests {
         assert!(!generation_advances(7, 7));
         assert!(!generation_advances(7, 6));
         assert!(generation_advances(7, 8));
+    }
+
+    #[test]
+    fn waiter_capacity_covers_every_scheduler_task_provider_pair() {
+        assert_eq!(
+            WAITSET_WAITER_CAPACITY,
+            super::multitask::MAX_SCHEDULER_TASKS
+                * rustos_user_abi::syscall::WAITSET_PROVIDER_MAX as usize
+        );
     }
 
     #[test]

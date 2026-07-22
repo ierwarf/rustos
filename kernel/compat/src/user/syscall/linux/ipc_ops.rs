@@ -1957,19 +1957,83 @@ fn install_received_handles(
     fd_count_ptr: u64,
 ) -> Result<(), i64> {
     validate_received_handle_outputs(fds_ptr, fd_count_ptr, descriptors.len())?;
-    let fds = install_transfer_descriptors_for_current_process(descriptors)?;
+    let entries = take_transfer_entries(descriptors)?;
+    let service_refs = service_transfer_refs(&entries);
+    let Some(slots) = multitask::with_current_user_process_state_mut(|_, _, process_state| {
+        process_state.handles_mut().reserve_slots(entries.len())
+    }) else {
+        super::service_ops::release_service_handle_refs_bounded(&service_refs);
+        return Err(LINUX_EINVAL);
+    };
+    let Some((reservation_id, slots)) = slots else {
+        super::service_ops::release_service_handle_refs_bounded(&service_refs);
+        return Err(LINUX_EMFILE);
+    };
+    let fds = match slots
+        .iter()
+        .copied()
+        .map(i32::try_from)
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(fds) => fds,
+        Err(_) => {
+            cancel_received_handle_reservations(reservation_id, &slots);
+            super::service_ops::release_service_handle_refs_bounded(&service_refs);
+            return Err(LINUX_EOVERFLOW);
+        }
+    };
 
     if !fds.is_empty() {
         let bytes = unsafe {
             core::slice::from_raw_parts(fds.as_ptr().cast::<u8>(), fds.len() * size_of::<i32>())
         };
-        usermem::write_current_user_bytes(fds_ptr, bytes)
-            .map_err(address_space_error_to_linux_errno)?;
+        if let Err(err) = usermem::write_current_user_bytes(fds_ptr, bytes) {
+            cancel_received_handle_reservations(reservation_id, &slots);
+            super::service_ops::release_service_handle_refs_bounded(&service_refs);
+            return Err(address_space_error_to_linux_errno(err));
+        }
     }
-    let count = u16::try_from(fds.len()).map_err(|_| LINUX_EOVERFLOW)?;
-    usermem::write_current_user_bytes(fd_count_ptr, &count.to_ne_bytes())
-        .map_err(address_space_error_to_linux_errno)?;
-    Ok(())
+    let count = match u16::try_from(fds.len()) {
+        Ok(count) => count,
+        Err(_) => {
+            cancel_received_handle_reservations(reservation_id, &slots);
+            super::service_ops::release_service_handle_refs_bounded(&service_refs);
+            return Err(LINUX_EOVERFLOW);
+        }
+    };
+    if let Err(err) = usermem::write_current_user_bytes(fd_count_ptr, &count.to_ne_bytes()) {
+        cancel_received_handle_reservations(reservation_id, &slots);
+        super::service_ops::release_service_handle_refs_bounded(&service_refs);
+        return Err(address_space_error_to_linux_errno(err));
+    }
+    let committed = multitask::with_current_user_process_state_mut(|_, _, process_state| {
+        process_state
+            .handles_mut()
+            .commit_reserved_transfers(reservation_id, &slots, entries)
+    });
+    match committed {
+        Some(Ok(())) => Ok(()),
+        Some(Err(entries)) => {
+            cancel_received_handle_reservations(reservation_id, &slots);
+            drop(entries);
+            super::service_ops::release_service_handle_refs_bounded(&service_refs);
+            Err(LINUX_EBUSY)
+        }
+        None => {
+            // The closure capture drops the uncommitted entries, including
+            // their console references, when the process disappears.
+            super::service_ops::release_service_handle_refs_bounded(&service_refs);
+            Err(LINUX_EINVAL)
+        }
+    }
+}
+
+fn cancel_received_handle_reservations(reservation_id: u64, slots: &[u64]) {
+    let _ = multitask::with_current_user_process_state_mut(|_, _, process_state| {
+        process_state
+            .handles_mut()
+            .cancel_reservations(reservation_id, slots);
+    });
 }
 
 pub(super) fn install_transfer_descriptors_for_current_process(
@@ -1984,7 +2048,7 @@ pub(super) fn install_transfer_descriptors_for_current_process(
         {
             return Err(LINUX_EMFILE);
         }
-        let mut fds = Vec::with_capacity(entries.len());
+        let mut fds: Vec<i32> = Vec::with_capacity(entries.len());
         for entry in entries {
             let Some(fd) = process_state.handles_mut().install_transferred(entry) else {
                 for installed in fds.iter().copied() {

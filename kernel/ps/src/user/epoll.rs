@@ -1,8 +1,6 @@
 // RING3-MIGRATION-REFERENCE START: already migrated: vfsd/netd own epoll
 // readiness policy. Ring0 keeps epoll token storage and fd-table handle
 // substrate only.
-use core::sync::atomic::{AtomicU64, Ordering};
-
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum EpollError {
     Busy,
@@ -23,9 +21,10 @@ pub struct EpollInterestSnapshot {
 
 impl EpollHandle {
     pub fn new() -> Self {
-        static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
+        let mut bytes = [0_u8; 8];
+        nucleus_core::util::random::Random::new().fill_bytes(&mut bytes);
         Self {
-            token: NEXT_TOKEN.fetch_add(1, Ordering::Relaxed),
+            token: u64::from_le_bytes(bytes).max(1),
         }
     }
 

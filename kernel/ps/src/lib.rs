@@ -35,7 +35,9 @@ pub(crate) mod debug {
 
 pub(crate) mod io {
     pub(crate) mod device {
-        pub(crate) use kernel_object::api::device::{DeviceAccessKind, DeviceHandle, DeviceId};
+        #[cfg(test)]
+        pub(crate) use kernel_object::api::device::DeviceId;
+        pub(crate) use kernel_object::api::device::{DeviceAccessKind, DeviceHandle};
     }
 
     pub(crate) mod session {

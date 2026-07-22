@@ -4,8 +4,8 @@
 use super::*;
 
 use rustos_user_abi::syscall::{
-    IPC_SERVICE_CAP_PROCESS_POLICY, IPC_SERVICE_CAP_ROOT_SUPERVISOR, LifecycleDrainBrokerArgs,
-    RustosRootdTerminateBrokerArgs,
+    IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY, IPC_SERVICE_CAP_PROCESS_POLICY,
+    IPC_SERVICE_CAP_ROOT_SUPERVISOR, LifecycleDrainBrokerArgs, RustosRootdTerminateBrokerArgs,
 };
 
 /// A supervisor may defer a restart but must not turn the timer substrate into
@@ -21,20 +21,34 @@ fn rootd_terminate_args_are_valid(args: &RustosRootdTerminateBrokerArgs) -> bool
     args.abi_version == 1 && args.reserved0 == 0 && args.flags == 0 && args.target_pid != 0
 }
 
+fn lifecycle_drain_args_are_valid(args: &LifecycleDrainBrokerArgs) -> bool {
+    args.abi_version == rustos_user_abi::syscall::PROC_BROKER_ABI_VERSION
+        && args.reserved0 == 0
+        && args.reserved1 == 0
+        && args.reserved2 == 0
+}
+
 pub(super) fn syscall_linux_rustos_lifecycle_drain_broker(args_ptr: u64) -> u64 {
     let is_process_policy =
         ipc_ops::current_process_has_service_capability(IPC_SERVICE_CAP_PROCESS_POLICY);
     let is_root_supervisor =
         ipc_ops::current_process_has_service_capability(IPC_SERVICE_CAP_ROOT_SUPERVISOR);
-    if !is_process_policy && !is_root_supervisor {
+    let is_linux_syscall_policy =
+        ipc_ops::current_process_has_service_capability(IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY);
+    if !is_process_policy && !is_root_supervisor && !is_linux_syscall_policy {
         return linux_errno(LINUX_EPERM);
     }
     let args = match usermem::read_current_user_struct::<LifecycleDrainBrokerArgs>(args_ptr) {
         Ok(args) => args,
         Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
     };
+    if !lifecycle_drain_args_are_valid(&args) {
+        return linux_errno(LINUX_EINVAL);
+    }
     let consumer = if is_root_supervisor {
         offload_ops::LifecycleConsumer::RootSupervisor
+    } else if is_linux_syscall_policy {
+        offload_ops::LifecycleConsumer::LinuxSyscallPolicy
     } else {
         offload_ops::LifecycleConsumer::ProcessPolicy
     };
@@ -102,8 +116,27 @@ pub(super) fn syscall_linux_rustos_rootd_terminate_broker(args_ptr: u64) -> u64 
 
 #[cfg(test)]
 mod tests {
-    use super::{rootd_terminate_args_are_valid, rootd_wait_delay_is_valid};
-    use rustos_user_abi::syscall::RustosRootdTerminateBrokerArgs;
+    use super::{
+        lifecycle_drain_args_are_valid, rootd_terminate_args_are_valid, rootd_wait_delay_is_valid,
+    };
+    use rustos_user_abi::syscall::{LifecycleDrainBrokerArgs, RustosRootdTerminateBrokerArgs};
+
+    #[test]
+    fn lifecycle_drain_requires_exact_v1_zero_reserved_envelope() {
+        let valid = LifecycleDrainBrokerArgs {
+            abi_version: rustos_user_abi::syscall::PROC_BROKER_ABI_VERSION,
+            ..LifecycleDrainBrokerArgs::default()
+        };
+        assert!(lifecycle_drain_args_are_valid(&valid));
+        assert!(!lifecycle_drain_args_are_valid(&LifecycleDrainBrokerArgs {
+            abi_version: valid.abi_version.wrapping_add(1),
+            ..valid
+        }));
+        assert!(!lifecycle_drain_args_are_valid(&LifecycleDrainBrokerArgs {
+            reserved2: 1,
+            ..valid
+        }));
+    }
 
     #[test]
     fn rootd_wait_delay_is_strictly_bounded() {

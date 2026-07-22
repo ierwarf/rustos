@@ -6,6 +6,7 @@ use crate::user::memfd::MemfdHandle;
 use crate::user::socket::SocketHandle;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -45,6 +46,131 @@ pub enum ConsoleStreamKind {
     Input,
     Output,
     Error,
+}
+
+#[derive(Debug)]
+struct ConsoleOpenDescription {
+    token: u64,
+    stream: ConsoleStreamKind,
+}
+
+/// One Linux console open description. Cloning this handle models dup/fork;
+/// the token remains stable until the last descriptor reference is dropped.
+#[derive(Clone, Debug)]
+pub struct ConsoleHandle {
+    description: Arc<ConsoleOpenDescription>,
+}
+
+static NEXT_CONSOLE_OPEN_DESCRIPTION_TOKEN: AtomicU64 = AtomicU64::new(1);
+const CONSOLE_OPEN_DESCRIPTION_CAPACITY: usize = 256;
+
+lazy_static! {
+    static ref CONSOLE_OPEN_DESCRIPTIONS: Mutex<BTreeMap<u64, ConsoleDescriptionRegistryEntry>> =
+        Mutex::new(BTreeMap::new());
+}
+
+struct ConsoleDescriptionRegistryEntry {
+    description: Weak<ConsoleOpenDescription>,
+    stream: ConsoleStreamKind,
+    descriptor_refs: usize,
+}
+
+impl ConsoleHandle {
+    pub fn new(stream: ConsoleStreamKind) -> Self {
+        let token = NEXT_CONSOLE_OPEN_DESCRIPTION_TOKEN
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                (current != 0).then(|| current.checked_add(1)).flatten()
+            })
+            .expect("console open-description token exhausted");
+        let description = Arc::new(ConsoleOpenDescription { token, stream });
+        let mut descriptions = CONSOLE_OPEN_DESCRIPTIONS.lock();
+        descriptions.retain(|_, entry| entry.description.strong_count() != 0);
+        assert!(
+            descriptions.len() < CONSOLE_OPEN_DESCRIPTION_CAPACITY,
+            "console open-description registry exhausted"
+        );
+        descriptions.insert(
+            token,
+            ConsoleDescriptionRegistryEntry {
+                description: Arc::downgrade(&description),
+                stream,
+                descriptor_refs: 1,
+            },
+        );
+        drop(descriptions);
+        Self { description }
+    }
+
+    pub fn token_id(&self) -> u64 {
+        self.description.token
+    }
+
+    pub fn stream(&self) -> ConsoleStreamKind {
+        self.description.stream
+    }
+
+    /// True after the final descriptor-table reference has been removed.
+    /// Transient syscall snapshots deliberately do not affect this count.
+    pub fn is_last_reference(&self) -> bool {
+        CONSOLE_OPEN_DESCRIPTIONS
+            .lock()
+            .get(&self.token_id())
+            .is_none_or(|entry| entry.descriptor_refs == 0)
+    }
+
+    pub(crate) fn acquire_descriptor_reference(&self) {
+        assert!(
+            self.try_acquire_descriptor_reference(),
+            "live console description missing from registry"
+        );
+    }
+
+    /// Pins one still-live descriptor-table reference for a cross-service
+    /// transaction. Returns false after final close and never resurrects a
+    /// zero-reference console description.
+    pub fn try_acquire_descriptor_reference(&self) -> bool {
+        let mut descriptions = CONSOLE_OPEN_DESCRIPTIONS.lock();
+        let Some(entry) = descriptions.get_mut(&self.token_id()) else {
+            return false;
+        };
+        if entry.descriptor_refs == 0 || entry.description.strong_count() == 0 {
+            return false;
+        }
+        entry.descriptor_refs = entry
+            .descriptor_refs
+            .checked_add(1)
+            .expect("console descriptor reference count exhausted");
+        true
+    }
+
+    /// Drops one fd-table reference and reports whether it was the final one.
+    pub fn release_descriptor_reference(&self) -> bool {
+        let mut descriptions = CONSOLE_OPEN_DESCRIPTIONS.lock();
+        let entry = descriptions
+            .get_mut(&self.token_id())
+            .expect("live console description missing from registry");
+        assert!(
+            entry.descriptor_refs != 0,
+            "console descriptor reference count underflow"
+        );
+        entry.descriptor_refs -= 1;
+        entry.descriptor_refs == 0
+    }
+
+    pub fn token_is_live(token: u64) -> bool {
+        Self::stream_for_token(token).is_some()
+    }
+
+    pub fn stream_for_token(token: u64) -> Option<ConsoleStreamKind> {
+        if token == 0 {
+            return None;
+        }
+        CONSOLE_OPEN_DESCRIPTIONS
+            .lock()
+            .get(&token)
+            .filter(|entry| entry.descriptor_refs != 0 && entry.description.strong_count() != 0)
+            .map(|entry| entry.stream)
+    }
 }
 
 // The pending transfer registry belongs to the process/handle substrate rather
@@ -170,7 +296,7 @@ fn allocate_ipc_transfer_id(objects: &BTreeMap<u64, TransferredHandleEntry>) -> 
 
 #[derive(Debug, Clone)]
 pub enum KernelHandle {
-    Console(ConsoleStreamKind),
+    Console(ConsoleHandle),
     Device(DeviceHandle),
     Epoll(EpollHandle),
     InetSocket(InetSocketHandle),
@@ -295,14 +421,7 @@ impl InetSocketHandle {
 impl KernelHandle {
     pub(crate) fn token(&self) -> HandleToken {
         match self {
-            Self::Console(stream) => HandleToken::new(
-                HandleOwner::Ps,
-                match stream {
-                    ConsoleStreamKind::Input => 0,
-                    ConsoleStreamKind::Output => 1,
-                    ConsoleStreamKind::Error => 2,
-                },
-            ),
+            Self::Console(console) => HandleToken::new(HandleOwner::Ps, console.token_id()),
             Self::Device(device) => HandleToken::new(HandleOwner::Io, device.token_id()),
             Self::Epoll(epoll) => HandleToken::new(HandleOwner::Compat, epoll.token_id()),
             Self::InetSocket(socket) => HandleToken::new(HandleOwner::Compat, socket.token_id()),
@@ -334,9 +453,16 @@ impl KernelHandle {
         }
     }
 
-    pub const fn console_stream(&self) -> Option<ConsoleStreamKind> {
+    pub fn console_stream(&self) -> Option<ConsoleStreamKind> {
         match self {
-            Self::Console(stream) => Some(*stream),
+            Self::Console(console) => Some(console.stream()),
+            _ => None,
+        }
+    }
+
+    pub fn console_handle(&self) -> Option<&ConsoleHandle> {
+        match self {
+            Self::Console(handle) => Some(handle),
             _ => None,
         }
     }
@@ -488,5 +614,28 @@ mod transfer_registry_tests {
         let dropped = take_deferred_ipc_transfer_drops(1);
         assert_eq!(dropped.len(), 1);
         assert_eq!(dropped[0].entry().handle().device_handle(), Some(device));
+    }
+
+    #[test]
+    fn console_token_liveness_tracks_descriptor_references_not_snapshots() {
+        let handle = ConsoleHandle::new(ConsoleStreamKind::Input);
+        let token = handle.token_id();
+        assert!(ConsoleHandle::token_is_live(token));
+
+        handle.acquire_descriptor_reference();
+        let duplicated = handle.clone();
+        assert!(!handle.release_descriptor_reference());
+        drop(handle);
+        assert!(ConsoleHandle::token_is_live(token));
+        assert_eq!(
+            ConsoleHandle::stream_for_token(token),
+            Some(ConsoleStreamKind::Input)
+        );
+
+        assert!(duplicated.release_descriptor_reference());
+        assert!(!duplicated.try_acquire_descriptor_reference());
+        drop(duplicated);
+        assert!(!ConsoleHandle::token_is_live(token));
+        assert_eq!(ConsoleHandle::stream_for_token(token), None);
     }
 }

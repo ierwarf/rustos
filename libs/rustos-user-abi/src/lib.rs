@@ -125,9 +125,10 @@ mod tests {
         assert_eq!(syscall::DEVMGRD_IOCTL_LINUX_TTY_TCSETSF, 0x5404);
         assert_eq!(syscall::DEVMGRD_IOCTL_LINUX_TTY_FIONREAD, 0x541b);
         assert_eq!(syscall::INPUTD_IPC_ABI_VERSION, 3);
-        assert_eq!(syscall::VFS_IPC_ABI_VERSION, 2);
-        assert_eq!(syscall::NETD_IPC_ABI_VERSION, 3);
+        assert_eq!(syscall::VFS_IPC_ABI_VERSION, 3);
+        assert_eq!(syscall::NETD_IPC_ABI_VERSION, 4);
         assert_eq!(syscall::SYS_RUSTOS_WAITSET_SIGNAL_BROKER, 0x5255_003f);
+        assert_eq!(syscall::SYS_RUSTOS_ENTROPY_BROKER, 0x5255_0040);
         assert_eq!(syscall::WAITSET_PROVIDER_SESSIOND, 4);
         assert_eq!(syscall::WAITSET_PROVIDER_MAX, 4);
         assert_eq!(size_of::<syscall::WaitSetSignalBrokerArgs>(), 32);

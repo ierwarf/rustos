@@ -62,6 +62,17 @@ or launch policy.
 | `build/image/EFI/BOOT/BOOTX64.EFI` | UEFI entry (GRUB-generated) |
 | `build/image/nucleus.elf.sig` | Kernel payload signature |
 
+### Boot entropy
+
+- The GRUB Multiboot2 handoff must populate `BootInfo.rng_seed` with 256 bits
+  obtained from CPU `RDSEED`, falling back to bounded `RDRAND` retries only
+  when necessary. An all-zero seed or a CPU exposing neither instruction is a
+  terminal boot-admission failure; deterministic PID/time/counter mixing is
+  not a fallback.
+- `BootInfo::validate_staged`, the Multiboot2 adapter, and `boot-random::init`
+  independently reject an unavailable seed before userspace or any
+  capability-minting path becomes live.
+
 ### Registries
 
 - `system/registry/system/desktop-programs.tsv`

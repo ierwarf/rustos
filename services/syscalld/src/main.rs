@@ -8,10 +8,12 @@ use core::mem::size_of;
 use core::panic::PanicInfo;
 
 use rustos_svc_runtime::ipc;
+use rustos_svc_runtime::syscall::syscall1;
 use rustos_user_abi::syscall::{
     CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
-    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, LinuxSyscallOffloadRequest,
-    LinuxSyscallOffloadResponse, Win32SyscallOffloadRequest, Win32SyscallOffloadResponse,
+    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, LifecycleDrainBrokerArgs,
+    LifecycleEventWire, LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse,
+    Win32SyscallOffloadRequest, Win32SyscallOffloadResponse,
     COMMERCIAL_MAX_PAGERD_OP_BACKING_OBJECT, COMMERCIAL_MAX_PAGERD_OP_FAULT_RESOLVE,
     COMMERCIAL_MAX_PAGERD_OP_PAGE_CACHE_POLICY, COMMERCIAL_MAX_PAGERD_OP_WRITEBACK_POLICY,
     COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS,
@@ -20,7 +22,8 @@ use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_SYSCALLD_OP_CREDS_LIMITS, COMMERCIAL_MAX_SYSCALLD_OP_LINUX_POLICY,
     COMMERCIAL_MAX_SYSCALLD_OP_MM_POLICY, COMMERCIAL_MAX_SYSCALLD_OP_RANDOM_POLICY,
     COMMERCIAL_MAX_SYSCALLD_OP_WIN32_POLICY, IPC_MAX_INLINE_BYTES, IPC_SERVICE_LINUX_SYSCALLD,
-    IPC_SERVICE_PAGERD, SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_LINUX_ARCH_PRCTL_POLICY,
+    IPC_SERVICE_PAGERD, LIFECYCLE_DRAIN_MAX_EVENTS, LIFECYCLE_EVENT_EXIT, PROC_BROKER_ABI_VERSION,
+    SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_LINUX_ARCH_PRCTL_POLICY,
     SYSCALL_OFFLOAD_OP_LINUX_BRK, SYSCALL_OFFLOAD_OP_LINUX_CLOCK_GETTIME,
     SYSCALL_OFFLOAD_OP_LINUX_CLOCK_NANOSLEEP, SYSCALL_OFFLOAD_OP_LINUX_FUTEX_POLICY,
     SYSCALL_OFFLOAD_OP_LINUX_GETEGID, SYSCALL_OFFLOAD_OP_LINUX_GETEUID,
@@ -31,15 +34,15 @@ use rustos_user_abi::syscall::{
     SYSCALL_OFFLOAD_OP_LINUX_MEMFD_CREATE, SYSCALL_OFFLOAD_OP_LINUX_MMAP,
     SYSCALL_OFFLOAD_OP_LINUX_MPROTECT, SYSCALL_OFFLOAD_OP_LINUX_MUNMAP,
     SYSCALL_OFFLOAD_OP_LINUX_NANOSLEEP, SYSCALL_OFFLOAD_OP_LINUX_PRLIMIT64,
-    SYSCALL_OFFLOAD_OP_LINUX_PROCESS_EXIT, SYSCALL_OFFLOAD_OP_LINUX_RSEQ,
-    SYSCALL_OFFLOAD_OP_LINUX_SCHED_GETAFFINITY, SYSCALL_OFFLOAD_OP_LINUX_SETGID,
-    SYSCALL_OFFLOAD_OP_LINUX_SETPGID, SYSCALL_OFFLOAD_OP_LINUX_SETSID,
-    SYSCALL_OFFLOAD_OP_LINUX_SETUID, SYSCALL_OFFLOAD_OP_LINUX_SET_ROBUST_LIST,
-    SYSCALL_OFFLOAD_OP_LINUX_UMASK, SYSCALL_OFFLOAD_OP_LINUX_UNAME,
-    SYSCALL_OFFLOAD_OP_WIN32_ALLOC_VIRTUAL_MEMORY, SYSCALL_OFFLOAD_OP_WIN32_CLOSE,
-    SYSCALL_OFFLOAD_OP_WIN32_DELAY_EXECUTION, SYSCALL_OFFLOAD_OP_WIN32_EXIT_PROCESS,
-    SYSCALL_OFFLOAD_OP_WIN32_GET_CONSOLE_MODE, SYSCALL_OFFLOAD_OP_WIN32_READ_FILE,
-    SYSCALL_OFFLOAD_OP_WIN32_WRITE_FILE, SYSCALL_OFFLOAD_PATH_CAPACITY,
+    SYSCALL_OFFLOAD_OP_LINUX_RSEQ, SYSCALL_OFFLOAD_OP_LINUX_SCHED_GETAFFINITY,
+    SYSCALL_OFFLOAD_OP_LINUX_SETGID, SYSCALL_OFFLOAD_OP_LINUX_SETPGID,
+    SYSCALL_OFFLOAD_OP_LINUX_SETSID, SYSCALL_OFFLOAD_OP_LINUX_SETUID,
+    SYSCALL_OFFLOAD_OP_LINUX_SET_ROBUST_LIST, SYSCALL_OFFLOAD_OP_LINUX_UMASK,
+    SYSCALL_OFFLOAD_OP_LINUX_UNAME, SYSCALL_OFFLOAD_OP_WIN32_ALLOC_VIRTUAL_MEMORY,
+    SYSCALL_OFFLOAD_OP_WIN32_CLOSE, SYSCALL_OFFLOAD_OP_WIN32_DELAY_EXECUTION,
+    SYSCALL_OFFLOAD_OP_WIN32_EXIT_PROCESS, SYSCALL_OFFLOAD_OP_WIN32_GET_CONSOLE_MODE,
+    SYSCALL_OFFLOAD_OP_WIN32_READ_FILE, SYSCALL_OFFLOAD_OP_WIN32_WRITE_FILE,
+    SYSCALL_OFFLOAD_PATH_CAPACITY, SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER,
     WIN32_SYSCALL_OFFLOAD_ABI_VERSION,
 };
 
@@ -80,6 +83,8 @@ fn service_main() {
     }
 
     ipc::debug_line("syscalld: pager policy endpoint registered");
+    drain_lifecycle_events();
+    ipc::debug_line("syscalld: lifecycle drain ready");
     serve(endpoint as u64);
 }
 
@@ -101,10 +106,45 @@ fn serve(endpoint: u64) {
             continue;
         }
 
+        // Apply every queued exit before interpreting the next request. This
+        // local broker drain is bounded and cannot wait on another service,
+        // so syscalld recovery never participates in a bootstrap IPC cycle.
+        drain_lifecycle_events();
         let response = handle_request(received as usize, &request);
         let reply = unsafe { ipc::reply(reply_cap, response.as_ptr(), response.len()) };
         if reply < 0 {
             ipc::debug_line("syscalld: reply failed");
+        }
+    }
+}
+
+fn drain_lifecycle_events() {
+    let mut events = [LifecycleEventWire::default(); LIFECYCLE_DRAIN_MAX_EVENTS];
+    let mut count = 0_u32;
+    let args = LifecycleDrainBrokerArgs {
+        abi_version: PROC_BROKER_ABI_VERSION,
+        out_events_ptr: events.as_mut_ptr() as u64,
+        out_capacity: LIFECYCLE_DRAIN_MAX_EVENTS as u32,
+        out_count_ptr: &mut count as *mut u32 as u64,
+        ..LifecycleDrainBrokerArgs::default()
+    };
+    let ret = unsafe {
+        syscall1(
+            SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER,
+            (&args as *const LifecycleDrainBrokerArgs) as u64,
+        )
+    };
+    if ret < 0 {
+        // EOVERFLOW means at least one process identity is unknown. Any
+        // failure is handled identically so stale credential/MM authority can
+        // never survive an uncertain lifecycle baseline.
+        linux_policy::clear_process_policy();
+        ipc::debug_line("syscalld: lifecycle evidence reset after drain failure");
+        return;
+    }
+    for event in &events[..count as usize] {
+        if event.event == LIFECYCLE_EVENT_EXIT {
+            linux_policy::handle_process_exit_pid(event.pid);
         }
     }
 }
@@ -384,7 +424,6 @@ fn handle_linux_request(
         SYSCALL_OFFLOAD_OP_LINUX_MEMFD_CREATE => {
             linux_policy::handle_memfd_create(request, response)
         }
-        SYSCALL_OFFLOAD_OP_LINUX_PROCESS_EXIT => linux_policy::handle_process_exit(request),
         _ => response.status = errno::EINVAL,
     }
 }
@@ -444,8 +483,7 @@ fn validate_request(received: usize, request: &LinuxSyscallOffloadRequest) -> Re
         | SYSCALL_OFFLOAD_OP_LINUX_MMAP
         | SYSCALL_OFFLOAD_OP_LINUX_MPROTECT
         | SYSCALL_OFFLOAD_OP_LINUX_MUNMAP
-        | SYSCALL_OFFLOAD_OP_LINUX_MEMFD_CREATE
-        | SYSCALL_OFFLOAD_OP_LINUX_PROCESS_EXIT => Ok(()),
+        | SYSCALL_OFFLOAD_OP_LINUX_MEMFD_CREATE => Ok(()),
         _ => Err(errno::EINVAL),
     }
 }

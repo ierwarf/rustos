@@ -24,12 +24,16 @@ IPC service IDs, broker syscalls, handle transfer, and service routing. For pack
   `COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR` contract and tracks
   `CoreServiceLeaseWire` via `SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER`.
 - Bootstrap policy services must not perform a rootd-authorized service lookup
-  merely to prove that an empty maintenance queue is empty. In particular,
-  procd's lifecycle drain returns before looking up syscalld when it drained no
-  events. When events do exist, it resolves the endpoint before taking signal
-  policy locks and releases those locks before making the syscalld call. This
-  prevents the `rootd -> loaderd -> procd -> rootd` authorization cycle that
-  otherwise blocks the first initd prepare transaction.
+  while rebasing private maintenance state. Rootd, procd, and syscalld therefore
+  own independent bounded lifecycle fan-out queues. Procd consumes exit evidence
+  only for signal policy; syscalld consumes the same evidence directly before
+  interpreting its next request and owns credential/MM-policy cleanup. Neither
+  service calls the other or rootd during the drain, so queued recovery evidence
+  cannot close a `rootd -> loaderd -> procd -> rootd` authorization cycle.
+- Every lifecycle drain requires the exact current ABI version and zero reserved
+  fields. Rootd overflow is sticky and terminal. Procd/syscalld overflow rebases
+  only the affected private queue after its owner clears all cached per-process
+  authority.
 
 ## IPC Service Registry
 
@@ -114,6 +118,12 @@ bounded, explicit ready handshake; startup scheduling luck is not readiness.
 | 13 | service-driver (reserved) | `SERVICE_DRIVER_POLICY` | Reserved non-DVM privileged-resource coordination; no endpoint is admitted until a capability-gated broker exists |
 
 Broker authorization checks the caller's registered service capability — **not** its executable path.
+`SYS_RUSTOS_ENTROPY_BROKER` is limited to the Linux-syscall and network-policy
+capabilities and returns at most one inline-IPC payload of bytes from the
+boot-seeded ChaCha20 substrate. Syscalld still owns Linux `getrandom` flag,
+length, and error policy; netd still owns token collision/admission policy.
+PID/TID/counter-derived pseudo-random output is forbidden for credentials,
+object capabilities, ASLR material, and Linux `getrandom`.
 Until a standalone `pagerd` lease exists, `syscalld` may register the reserved `IPC_SERVICE_PAGERD` endpoint and receive `PAGER_POLICY`; rootd must treat that as an explicit compatibility delegation, not a generic multi-service registration rule.
 `initd` must not be spawned until that delegated pager endpoint is registered;
 otherwise dynamic loader page-fault/backing policy can deadlock behind rootd's
@@ -456,10 +466,37 @@ policy remains with the owning service.
 ## VFS Surface (`vfsd`)
 
 - Protocol: `VfsIpcRequest`/`VfsIpcResponse` (separate from `LinuxSyscallOffloadRequest`) for service-owned handles + chunked I/O.
+- Vfsd remote and epoll object IDs are kernel-minted, boot-entropy-backed
+  capabilities, not counters or caller-selected fd numbers. The exact token is
+  preserved by dup/fork/IPC transfer, while rootd admits service lookup only on
+  the declared caller-to-provider dependency edge. Vfsd receives the
+  kernel-stamped sender identity and rejects a conflicting payload PID/TID.
+  These checks are cumulative: sender identity never substitutes for object
+  capability possession, and token obscurity never substitutes for the rootd
+  dependency graph.
 - Kernel fd tables mirror service-owned objects as `KernelHandle::RemoteVfs`.
 - VFS device open responses use `VfsIpcResponse.aux` for device access metadata such as `INPUTD_ACCESS_*`; ring0 read paths must not classify `/dev/input*` by path string after the remote handle is installed.
 - Linux `openat` installs `KernelHandle::RemoteVfs` for regular files + directories after vfsd registration.
-- Linux `close`/`dup`/`dup2`/`dup3`/`fcntl`/`getdents64` route through vfsd before app fd-table mutation. vfsd is the only intended caller of `SYS_RUSTOS_FD_*_BROKER`; gated by `VFS_POLICY`. Generic apps must not call directly.
+- Linux `dup`/`dup2`/`dup3` acquire the exact service-side
+  reference before publishing the local duplicate. `close` removes the local
+  descriptor first, then performs token-addressed provider release; a wedged
+  vfsd/netd cannot retain a reusable numeric fd or block process retirement.
+  All close/dup/fork/CLOEXEC/exit provider reference operations and matching
+  epoll purges use the 16 ms cancellable internal IPC path. vfsd is the only
+  intended caller of `SYS_RUSTOS_FD_*_BROKER`; gated by `VFS_POLICY`.
+  Generic apps must not call those brokers directly.
+  Fork clones the address space and fd table in one process-state snapshot;
+  provider refs are acquired from that frozen child table before publication.
+  Resnapshotting the live parent afterward is forbidden because a sibling
+  close/reuse could bind the child fd to one object and the provider ref to
+  another.
+  Exec cleanup is likewise derived only from the exact `KernelHandle` values
+  removed by the atomic process-table CLOEXEC commit; a pre-commit CLOEXEC
+  snapshot is not cleanup authority.
+- A devmgrd ioctl route is policy advice, not fd identity. Compat must resolve
+  the live fd-table entry again before dispatch: sessiond TTY operations require
+  an actual `KernelHandle::Console`, so a closed/reused ordinary file fd
+  receives `ENOTTY` and cannot read or mutate the caller's console policy.
 - `LinuxSyscallOffloadRequest.arg0..arg3` carry 64-bit fd-control args (target fd, cmd, arg, flags). **Do not pack pointer/flag values into the 32-bit `mask` field.**
 - `mount`/`umount2` route to vfsd → gated `SYS_RUSTOS_VFS_*_BROKER` for kernel mount-table mutation. Do not reintroduce direct generic-app `linux_ops::mount`/`umount2` paths.
 - `poll`/`ppoll`/`epoll_*` route generic fd readiness policy and epoll
@@ -468,13 +505,26 @@ policy remains with the owning service.
   wait/completion substrate, and non-system console-input readiness is
   `sessiond` policy. sessiond advances its generation only on an empty-to-ready
   line-discipline transition; the readiness query is non-consuming and bounded
-  by the application's remaining deadline. Console output/error remain
-  immediately writable. Closing a session advances the same generation and a
-  subsequent query returns non-live, which compat exposes as `POLLHUP` without
-  recreating the removed session. Persistent epoll admission for console descriptors is
-  deliberately rejected until console handles carry a unique open-description
-  identity; a reusable session or numeric fd must not masquerade as that
-  lifetime. Ring0 keeps fd-table validation, epoll token
+  by the application's remaining deadline. Live console output/error are
+  immediately writable, but they observe the same session generation so close
+  becomes `POLLHUP` even when the caller requested only hangup events.
+  Closing a session advances that generation and a subsequent query returns non-live, which compat exposes as `POLLHUP` without
+  recreating the removed session. Stdin/stdout/stderr are real fd-table entries,
+  not numeric exceptions. Each console open description carries an unforgeable
+  monotonic token shared by dup/fork and retired only after final close,
+  CLOEXEC, or process exit. Persistent epoll binds every non-system console
+  stream to that token plus the
+  exact sessiond endpoint epoch; final retirement purges the matching vfsd
+  interest, and a stale token fails closed even if purge delivery failed.
+  EPOLL_CTL_ADD/MOD pins the exact provider or console open description across
+  the vfsd mutation. Releasing that transaction guard performs normal
+  last-close purge, so a concurrent final close cannot purge first and then
+  leave a newly inserted interest for a retired object.
+  `O_NONBLOCK` is read from the same fd-table snapshot as the console
+  handle; an empty sessiond read returns `EAGAIN` instead of re-entering
+  the blocking retry loop after a readiness race.
+  System-console bootstrap input remains a deliberate non-persistent exception
+  because it has no sessiond-owned readiness generation. Ring0 keeps fd-table validation, epoll token
   handles, user-copy, a bounded provider-wait registry, and deadline wakeup.
   Both persistent epoll sets and syscall-scoped multi-fd poll sets use the same
   generation-based path: check, register the exact observed generations,
@@ -482,13 +532,23 @@ policy remains with the owning service.
   the scheduler, then verify that every registered waiter still exists before
   commit. A provider signal removes its waiter before wake, so an event in the
   recheck-to-arm window is detected without nesting an IPC block inside an
-  already armed scheduler block. Every readiness IPC is capped at the shorter
+  already armed scheduler block. The bounded waiter registry derives its
+  capacity from the scheduler task ceiling times the provider ceiling; every
+  schedulable task can therefore arm one observation for every provider
+  without an artificial mid-capacity `ENOSPC` failure. Every readiness IPC is
+  capped at the shorter
   of the remaining syscall deadline and 16 ms; an infinite application wait
   therefore cannot turn a wedged provider into an unbounded kernel-service
   call. `ppoll`/`epoll_pwait` atomically
   apply their temporary signal mask, reject a non-native sigset size, and
   return `EINTR` for a pending unmasked signal; SIGKILL/SIGSTOP can never be
   added to the temporary mask.
+- A vfsd epoll membership key is `target_fd + provider + open-description
+  object_id`. The provider endpoint epoch is record state, never part of that
+  identity: after restart, duplicate `ADD` remains `EEXIST`, `MOD`
+  replaces the stale epoch, and `DEL` removes the exact registration.
+  A stale epoch therefore fails closed but cannot create an undeletable or
+  duplicate interest.
 - Legacy `SYS_RUSTOS_{STATX,STAT,READLINK,ACCESS,GETCWD,CHDIR}_METADATA`: no generic-app VFS policy in ring0 after vfsd registers. Pre-vfsd bootstrap + registered policy-service callers retain direct kernel metadata access.
 - `SYS_RUSTOS_BLOCK_BROKER`: narrow boot-volume read broker, gated by `VFS_POLICY`, accepts `RustosBlockBrokerArgs`. Does not depend on `storaged`.
 
@@ -547,30 +607,93 @@ policy remains with the owning service.
   poll/epoll observes that generation without moving input policy or transport-
   consumer authority out of inputd.
 - Inputd is one provider of the common cross-service wait-set ABI. vfsd owns a
-  bounded interest registry keyed by provider object identity and exact service
-  epoch; netd and inputd own readiness truth and monotonic generations. Compat
+  bounded interest registry keyed by the target fd plus stable provider object
+  identity, matching Linux's fd/open-description pair; the observed service
+  epoch is mutable registration state, so an explicit MOD can rebind an
+  existing interest after provider restart without creating an undeletable
+  duplicate. Netd and inputd own readiness truth and monotonic generations. Compat
   performs check, bounded waiter registration, provider recheck while runnable,
   scheduler arm, exact waiter-presence recheck, commit, and a final
   authoritative provider recheck. It supplies finite/infinite
   timeout and signal-cancellation substrate but never inspects a
   service-private queue. Empty transient poll sets still use the same scheduler
   arm plus deadline/signal wake rather than spinning.
+  A 16 ms internal provider-query timeout never becomes the Linux-visible
+  application timeout: readiness already found elsewhere in the same scan is
+  returned immediately, otherwise the scan retries until the caller's original
+  deadline or an unmasked signal settles it.
 - Wait interests follow open-description lifetime rather than reusable numeric
   descriptors. Socket and epoll service references are acquired by dup/fork,
   released by close/CLOEXEC/process exit, and purged after the final reference.
+  Remote VFS descriptor references are different: the kernel fd table is their
+  sole refcount authority, so dup/fork/transfer performs no ambiguous remote
+  increment. Vfsd receives only initial open and idempotent final close.
+  Dup/fcntl snapshots one source handle token, acquires its provider reference,
+  then revalidates that token under the fd-table lock before commit. Exact-fd
+  replacement returns the handle actually retired at that linearization point,
+  so concurrent close/reuse cannot redirect either acquisition or cleanup.
   IPC descriptor export likewise acquires the service-backed open-description
   reference before publication; successful installation adopts it, while
   cancellation or rejection moves it to the process substrate's bounded
   deferred-drop queue. That queue shares the 1,024-entry admission ceiling
   with live transfers, and housekeeping releases at most 32 entries per turn
-  through bounded provider cleanup, so task retirement cannot orphan input or
-  socket readiness authority.
+  through bounded provider cleanup, so task retirement neither waits without a
+  bound nor silently drops locally queued cleanup.
+  Every remaining provider-side reference mutation carries a kernel-minted
+  128-bit operation ID. Netd reserves a bounded replay slot before applying a
+  mutation, replays the exact result, rejects operation-ID aliases, and retains
+  completion until the kernel ACK. Compat retries the same operation ID and
+  keeps unresolved mutation/ACK work in a bounded fail-closed reconciliation
+  queue. Vfsd epoll mutations are committed to rootd's authenticated service
+  checkpoint before local publication and exact retries cannot advance a
+  revision twice. Queue exhaustion is `ENOSPC`, never fabricated success or
+  silent eviction.
   A provider restart advances endpoint authority, wakes matching waiters, and
-  makes the old epoch fail closed instead of accepting a reused token. Unsupported
+  reports the affected interest as `ERR|HUP` instead of failing the aggregate
+  wait or accepting a reused token. The stale epoch remains revoked until an
+  explicit MOD rebinds it or DEL removes it; DEL validates only the stable
+  fd/open-description key and remains available while the provider is down.
+  Unsupported
   edge-trigger and one-shot flags are rejected until their service-owned
   rearm contracts exist; they are never silently approximated.
-- The source/model boundary is implemented, but runtime acceptance still needs
-  the current change set's bounded QEMU/KVM event and timeout evidence. See
+  On vfsd restart, rootd returns the versioned opaque vfsd checkpoint only to
+  the current authenticated vfsd lease. The replacement reconstructs epoll
+  refcounts and every provider/object/epoch/events/data interest before it
+  creates or publishes its endpoint; malformed, duplicate, stale, or partial
+  replay fails closed. Ring0 does not mirror service policy as a fallback.
+  Crash-injection runtime evidence is still required before release acceptance.
+  This epoll recovery contract does **not** yet cover ordinary remote VFS open
+  descriptions. Commercial restart continuity additionally requires vfsd to
+  durably bind each live remote capability to its normalized path identity,
+  kind, cursor, length/content generation, mutable status flags, and terminal
+  close revision before publishing the corresponding mutation. A replacement
+  must restore that state before endpoint publication, while kernel-owned
+  descriptor refcounts remain authoritative; path reopen, cursor reset, or an
+  `EBADF` retry is not an acceptable substitute. Checkpoint deletion also needs
+  an explicit acknowledgement/compaction generation so closed capabilities do
+  not consume the fixed rootd store forever without making an uncertain final
+  mutation replayable. Until source, crash injection, and long-churn capacity
+  evidence exist, supervised vfsd restart with live ordinary files is a release
+  blocker.
+- Standard input, output, and error descriptors are ordinary Arc-backed console
+  open descriptions rather than numeric fd exceptions. Sessiond-backed output
+  and error report `POLLOUT` only while their exact session remains live and
+  report `POLLHUP` after revoke. An empty `O_NONBLOCK` console read returns
+  `EAGAIN` from the first bounded sessiond reply and never re-enters the blocking
+  retry loop. Session close is terminal for that session generation: stale
+  read, write, TTY, and input-injection requests return `ENODEV` and cannot
+  recreate service state or turn a HUP token live again.
+  Console liveness counts only descriptor-table ownership: temporary syscall
+  snapshots do not postpone the final-close purge or suppress its waiter wake.
+- The latest bounded 30-second QEMU witness predates the current entropy,
+  checkpoint, and transactional-FD changes. It reached initd and repeatedly
+  delivered the expected no-input-device child exits without a
+  rootd/loaderd/procd authorization cycle, panic, or stalled lifecycle drain,
+  but it must not be cited as runtime evidence for this change set. A newly
+  signed image and current-source boot/crash-injection capture remain required.
+  The repository KVM launcher also passes its dry-run contract checks, while
+  the physical live-KVM gate remains separately unclaimed because host
+  admission correctly rejects the available NVIDIA render node. See
   `physical-gpu-status.md` for that evidence boundary.
 - KVM latency evidence records input arrival at uiserver queue consumption,
   before a GPU backpressure retry may leave the turn. The previous end-of-turn

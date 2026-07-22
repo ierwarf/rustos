@@ -17,13 +17,16 @@ use rustos_svc_runtime::ipc;
 use rustos_user_abi::linux as linux_abi;
 use rustos_user_abi::syscall::{
     CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
-    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, VfsIpcRequest, VfsIpcResponse,
-    WaitSetInterestWire, WaitSetSignalBrokerArgs, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
-    COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS, COMMERCIAL_MAX_PROTOCOL_VFSD,
-    COMMERCIAL_MAX_VFSD_OP_DIRECTORY_CURSOR, COMMERCIAL_MAX_VFSD_OP_FD_TABLE_PLAN,
-    COMMERCIAL_MAX_VFSD_OP_FILE_CURSOR, COMMERCIAL_MAX_VFSD_OP_METADATA_POLICY,
-    COMMERCIAL_MAX_VFSD_OP_MOUNT_GRAPH, COMMERCIAL_MAX_VFSD_OP_PATH_RESOLVE, IPC_SERVICE_VFSD,
-    LINUX_STATX_SIZE, LINUX_STAT_SIZE, SYSCALL_OFFLOAD_ABI_VERSION,
+    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, ServiceCheckpointRecordWire,
+    VfsIpcRequest, VfsIpcResponse, WaitSetInterestWire, WaitSetSignalBrokerArgs,
+    COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS,
+    COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR, COMMERCIAL_MAX_PROTOCOL_VFSD,
+    COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE,
+    COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_SCAN, COMMERCIAL_MAX_VFSD_OP_DIRECTORY_CURSOR,
+    COMMERCIAL_MAX_VFSD_OP_FD_TABLE_PLAN, COMMERCIAL_MAX_VFSD_OP_FILE_CURSOR,
+    COMMERCIAL_MAX_VFSD_OP_METADATA_POLICY, COMMERCIAL_MAX_VFSD_OP_MOUNT_GRAPH,
+    COMMERCIAL_MAX_VFSD_OP_PATH_RESOLVE, IPC_SERVICE_ROOTD, IPC_SERVICE_VFSD, LINUX_STATX_SIZE,
+    LINUX_STAT_SIZE, SERVICE_CHECKPOINT_FLAG_TOMBSTONE, SYSCALL_OFFLOAD_ABI_VERSION,
     SYSCALL_OFFLOAD_OP_LINUX_ACCESS, SYSCALL_OFFLOAD_OP_LINUX_CHDIR,
     SYSCALL_OFFLOAD_OP_LINUX_CLOSE, SYSCALL_OFFLOAD_OP_LINUX_DUP, SYSCALL_OFFLOAD_OP_LINUX_FCNTL,
     SYSCALL_OFFLOAD_OP_LINUX_GETCWD, SYSCALL_OFFLOAD_OP_LINUX_GETDENTS64,
@@ -44,8 +47,8 @@ use rustos_user_abi::syscall::{
 };
 use storage_fat::{FatDirEntry, FatDisk, FatNodeKind, FatVolume};
 use vfsd::{
-    mkdir_policy, persistent_mutation_status, unlink_policy, WaitSetInterestKey,
-    WaitSetInterestRecord, WaitSetRegistry, WaitSetRegistryError,
+    mkdir_policy, persistent_mutation_status, unlink_policy, valid_checkpoint_record,
+    WaitSetInterestKey, WaitSetInterestRecord, WaitSetRegistry, WaitSetRegistryError,
 };
 
 mod block;
@@ -69,6 +72,7 @@ use util::{
 pub(crate) const ENOENT: i32 = 2;
 pub(crate) const EIO: i32 = 5;
 pub(crate) const EAGAIN: i32 = 11;
+pub(crate) const EACCES: i32 = 13;
 pub(crate) const EBADF: i32 = 9;
 pub(crate) const EEXIST: i32 = 17;
 pub(crate) const ENODEV: i32 = 19;
@@ -148,6 +152,8 @@ const SEEK_END: u64 = 2;
 const O_CREAT: u64 = 0o100;
 const O_TRUNC: u64 = 0o1000;
 const O_DIRECTORY: u64 = 0o200000;
+const CHECKPOINT_EPOLL_TAG: u64 = 1;
+type CheckpointRevisionKey = (u64, u64, u64, u64);
 
 // AT_FDCWD as u64 (represents -100 in twos complement, or 0xFFFF_FFFF_FFFF_FF9C)
 pub(crate) const AT_FDCWD_U64: u64 = (-100_i64) as u64;
@@ -177,6 +183,11 @@ fn panic(_info: &PanicInfo<'_>) -> ! {
 pub extern "C" fn rust_eh_personality() {}
 
 fn service_main() {
+    let mut state = VfsState::new();
+    if state.restore_waitset_checkpoint().is_err() {
+        ipc::debug_line("vfsd: checkpoint replay failed");
+        return;
+    }
     let endpoint = ipc::endpoint_create();
     if endpoint < 0 {
         ipc::debug_line("vfsd: endpoint create failed");
@@ -189,20 +200,23 @@ fn service_main() {
         return;
     }
     ipc::debug_line("vfsd: vfs policy endpoint registered");
-    serve(endpoint as u64);
+    serve(endpoint as u64, state);
 }
 
-fn serve(endpoint: u64) {
-    let mut state = VfsState::new();
+fn serve(endpoint: u64, mut state: VfsState) {
     loop {
         let mut request = MaybeUninit::<VfsRecvBuffer>::uninit();
         let mut reply_cap = 0_u64;
+        let mut sender_pid = 0_u64;
+        let mut sender_tid = 0_u64;
         let received = unsafe {
-            ipc::recv(
+            ipc::recv_with_sender(
                 endpoint,
                 request.as_mut_ptr().cast::<u8>(),
                 VFS_RECV_BYTES,
                 &mut reply_cap as *mut u64,
+                &mut sender_pid as *mut u64,
+                &mut sender_tid as *mut u64,
             )
         };
         if received < 0 {
@@ -216,7 +230,11 @@ fn serve(endpoint: u64) {
         let reply = if received as usize == size_of::<VfsIpcRequest>() {
             let request = unsafe { &*request.as_ptr().cast::<VfsIpcRequest>() };
             let response = reset_vfs_response_slot(request.op);
-            state.handle_vfs_request(request, unsafe { &mut *response });
+            if request.pid != sender_pid || request.tid != sender_tid {
+                unsafe { (*response).status = EACCES };
+            } else {
+                state.handle_vfs_request(request, unsafe { &mut *response });
+            }
             unsafe {
                 ipc::reply(
                     reply_cap,
@@ -226,7 +244,17 @@ fn serve(endpoint: u64) {
             }
         } else if received as usize == size_of::<CommercialMaxProtocolRequest>() {
             let request = unsafe { &*request.as_ptr().cast::<CommercialMaxProtocolRequest>() };
-            let response = state.handle_commercial_request(request);
+            let response = if request.header.subject_pid != sender_pid
+                || request.header.subject_tid != sender_tid
+            {
+                CommercialMaxProtocolResponse {
+                    header: request.header,
+                    status: EACCES,
+                    ..CommercialMaxProtocolResponse::default()
+                }
+            } else {
+                state.handle_commercial_request(request)
+            };
             unsafe {
                 ipc::reply(
                     reply_cap,
@@ -236,7 +264,15 @@ fn serve(endpoint: u64) {
             }
         } else if received as usize == size_of::<LinuxSyscallOffloadRequest>() {
             let request = unsafe { &*request.as_ptr().cast::<LinuxSyscallOffloadRequest>() };
-            let response = state.handle_linux_request(request);
+            let response = if request.pid != sender_pid || request.tid != sender_tid {
+                LinuxSyscallOffloadResponse {
+                    op: request.op,
+                    status: EACCES,
+                    ..LinuxSyscallOffloadResponse::default()
+                }
+            } else {
+                state.handle_linux_request(request)
+            };
             unsafe {
                 ipc::reply(
                     reply_cap,
@@ -277,6 +313,8 @@ struct VfsState {
     /// is expensive enough to dominate boot time when libc walks PATH.
     dir_entries_cache: BTreeMap<String, Vec<DirEntry>>,
     epolls: WaitSetRegistry,
+    checkpoint_revisions: BTreeMap<CheckpointRevisionKey, u64>,
+    checkpoint_operations: BTreeMap<CheckpointRevisionKey, (u64, u64)>,
     readiness_generation: u64,
     next_handle: u64,
     mount_generation: u64,
@@ -316,11 +354,131 @@ impl VfsState {
             metadata_cache: BTreeMap::new(),
             dir_entries_cache: BTreeMap::new(),
             epolls: WaitSetRegistry::default(),
+            checkpoint_revisions: BTreeMap::new(),
+            checkpoint_operations: BTreeMap::new(),
             readiness_generation: 1,
             next_handle: 1,
             mount_generation: 1,
             cache_generation: 1,
         }
+    }
+
+    fn restore_waitset_checkpoint(&mut self) -> Result<(), i32> {
+        let mut cursor = 0_u64;
+        let mut records = Vec::new();
+        loop {
+            let response = call_rootd_checkpoint(
+                COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_SCAN,
+                cursor,
+                None,
+            )?;
+            let wire_size = size_of::<ServiceCheckpointRecordWire>();
+            let record_count = response.payload_len as usize / wire_size;
+            if response.payload_len as usize % wire_size != 0
+                || response.value1 as usize != record_count
+                || cursor
+                    .checked_add(record_count as u64)
+                    .is_none_or(|next| response.value0 != next)
+            {
+                return Err(EIO);
+            }
+            for offset in (0..response.payload_len as usize).step_by(wire_size) {
+                let record = unsafe {
+                    core::ptr::read_unaligned(
+                        response.payload[offset..]
+                            .as_ptr()
+                            .cast::<ServiceCheckpointRecordWire>(),
+                    )
+                };
+                let key = checkpoint_revision_key(&record);
+                if !valid_checkpoint_record(&record)
+                    || self
+                        .checkpoint_revisions
+                        .insert(key, record.revision)
+                        .is_some()
+                    || self
+                        .checkpoint_operations
+                        .insert(key, (record.operation_hi, record.operation_lo))
+                        .is_some()
+                {
+                    return Err(EIO);
+                }
+                records.push(record);
+            }
+            if response.value1 == 0 {
+                break;
+            }
+            if response.value0 == cursor {
+                return Err(EIO);
+            }
+            cursor = response.value0;
+        }
+
+        for record in records.iter().filter(|record| {
+            record.parent_hi == 0
+                && record.parent_lo == 0
+                && record.key_lo == CHECKPOINT_EPOLL_TAG
+                && record.flags & SERVICE_CHECKPOINT_FLAG_TOMBSTONE == 0
+        }) {
+            if record.value_len != 8 {
+                return Err(EIO);
+            }
+            let refs = u64::from_le_bytes(record.value[..8].try_into().map_err(|_| EIO)?);
+            self.epolls.restore(record.key_hi, refs).map_err(|_| EIO)?;
+        }
+        for record in records.iter().filter(|record| {
+            record.parent_lo == CHECKPOINT_EPOLL_TAG
+                && record.flags & SERVICE_CHECKPOINT_FLAG_TOMBSTONE == 0
+        }) {
+            if record.value_len as usize != size_of::<WaitSetInterestWire>() {
+                return Err(EIO);
+            }
+            let wire = unsafe {
+                core::ptr::read_unaligned(record.value.as_ptr().cast::<WaitSetInterestWire>())
+            };
+            let interest = waitset_interest_from_wire(&wire).ok_or(EIO)?;
+            let (key_hi, key_lo) = checkpoint_interest_key(&interest);
+            if record.key_hi != key_hi || record.key_lo != key_lo {
+                return Err(EIO);
+            }
+            self.epolls
+                .add(record.parent_hi, interest)
+                .map_err(|_| EIO)?;
+        }
+        Ok(())
+    }
+
+    fn checkpoint_mutate(
+        &mut self,
+        request: &VfsIpcRequest,
+        mut record: ServiceCheckpointRecordWire,
+    ) -> Result<bool, i32> {
+        let key = checkpoint_revision_key(&record);
+        let current = self.checkpoint_revisions.get(&key).copied().unwrap_or(0);
+        record.revision = current.checked_add(1).ok_or(EOVERFLOW)?;
+        record.operation_hi = request.operation_hi;
+        record.operation_lo = request.operation_lo;
+        let response = call_rootd_checkpoint(
+            COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE,
+            0,
+            Some(&record),
+        )?;
+        if response.payload_len != 0 || response.value0 != record.revision || response.value1 > 1 {
+            return Err(EIO);
+        }
+        self.checkpoint_revisions.insert(key, record.revision);
+        self.checkpoint_operations
+            .insert(key, (record.operation_hi, record.operation_lo));
+        Ok(response.value1 == 1)
+    }
+
+    fn checkpoint_operation_replayed(
+        &self,
+        request: &VfsIpcRequest,
+        key: CheckpointRevisionKey,
+    ) -> bool {
+        self.checkpoint_operations.get(&key).copied()
+            == Some((request.operation_hi, request.operation_lo))
     }
 
     fn invalidate_caches_if_remounted(&mut self) {
@@ -474,23 +632,67 @@ impl VfsState {
         let mut mutated = false;
         match request.arg0 {
             VFS_POLL_QUERY_POLL => self.vfs_poll_once(request, response),
-            VFS_POLL_QUERY_EPOLL_CREATE => match self.epolls.create(request.remote_id) {
-                Ok(()) => mutated = true,
-                Err(err) => response.status = waitset_registry_status(err),
-            },
+            VFS_POLL_QUERY_EPOLL_CREATE => {
+                let key = checkpoint_epoll_key(request.remote_id);
+                if self.checkpoint_operation_replayed(request, key) {
+                    return;
+                }
+                let mut candidate = self.epolls.clone();
+                if let Err(err) = candidate.create(request.remote_id) {
+                    response.status = waitset_registry_status(err);
+                    return;
+                }
+                let record = checkpoint_epoll_record(request.remote_id, 1, false);
+                if let Err(errno) = self.checkpoint_mutate(request, record) {
+                    response.status = errno;
+                    return;
+                }
+                self.epolls = candidate;
+                mutated = true;
+            }
             VFS_POLL_QUERY_EPOLL_CTL => {
                 self.vfs_epoll_ctl(request, response);
                 mutated = response.status == 0;
             }
             VFS_POLL_QUERY_EPOLL_SNAPSHOT => self.vfs_epoll_snapshot(request, response),
-            VFS_POLL_QUERY_EPOLL_REF => match self.epolls.acquire(request.remote_id) {
-                Ok(()) => mutated = true,
-                Err(err) => response.status = waitset_registry_status(err),
-            },
-            VFS_POLL_QUERY_EPOLL_UNREF => match self.epolls.release(request.remote_id) {
-                Ok(()) => mutated = true,
-                Err(err) => response.status = waitset_registry_status(err),
-            },
+            VFS_POLL_QUERY_EPOLL_REF | VFS_POLL_QUERY_EPOLL_UNREF => {
+                let key = checkpoint_epoll_key(request.remote_id);
+                if self.checkpoint_operation_replayed(request, key) {
+                    return;
+                }
+                let refs = match self.epolls.refs(request.remote_id) {
+                    Ok(refs) => refs,
+                    Err(err) => {
+                        response.status = waitset_registry_status(err);
+                        return;
+                    }
+                };
+                let mut candidate = self.epolls.clone();
+                let (next_refs, tombstone) = if request.arg0 == VFS_POLL_QUERY_EPOLL_REF {
+                    if let Err(err) = candidate.acquire(request.remote_id) {
+                        response.status = waitset_registry_status(err);
+                        return;
+                    }
+                    (refs.checked_add(1).unwrap_or(0), false)
+                } else {
+                    if let Err(err) = candidate.release(request.remote_id) {
+                        response.status = waitset_registry_status(err);
+                        return;
+                    }
+                    (refs.saturating_sub(1), refs == 1)
+                };
+                if next_refs == 0 && !tombstone {
+                    response.status = EOVERFLOW;
+                    return;
+                }
+                let record = checkpoint_epoll_record(request.remote_id, next_refs, tombstone);
+                if let Err(errno) = self.checkpoint_mutate(request, record) {
+                    response.status = errno;
+                    return;
+                }
+                self.epolls = candidate;
+                mutated = true;
+            }
             VFS_POLL_QUERY_EPOLL_PURGE_OBJECT => {
                 let Ok(provider) = u16::try_from(request.arg1) else {
                     response.status = EINVAL;
@@ -500,7 +702,20 @@ impl VfsState {
                     response.status = EINVAL;
                     return;
                 }
-                mutated = self.epolls.purge(provider, request.arg2);
+                let interests = self.epolls.matching_interests(provider, request.arg2);
+                let mut candidate = self.epolls.clone();
+                mutated = candidate.purge(provider, request.arg2);
+                for (token, interest) in interests {
+                    let record = checkpoint_interest_record(token, interest, true);
+                    let key = checkpoint_revision_key(&record);
+                    if !self.checkpoint_operation_replayed(request, key) {
+                        if let Err(errno) = self.checkpoint_mutate(request, record) {
+                            response.status = errno;
+                            return;
+                        }
+                    }
+                }
+                self.epolls = candidate;
             }
             _ => response.status = EINVAL,
         }
@@ -543,10 +758,17 @@ impl VfsState {
             response.status = EINVAL;
             return;
         };
+        let tombstone = request.arg1 == linux_abi::EPOLL_CTL_DEL;
+        let checkpoint = checkpoint_interest_record(request.remote_id, interest, tombstone);
+        let checkpoint_key = checkpoint_revision_key(&checkpoint);
+        if self.checkpoint_operation_replayed(request, checkpoint_key) {
+            return;
+        }
+        let mut candidate = self.epolls.clone();
         let result = match request.arg1 {
-            linux_abi::EPOLL_CTL_ADD => self.epolls.add(request.remote_id, interest),
-            linux_abi::EPOLL_CTL_MOD => self.epolls.modify(request.remote_id, interest),
-            linux_abi::EPOLL_CTL_DEL => self.epolls.delete(request.remote_id, interest.key),
+            linux_abi::EPOLL_CTL_ADD => candidate.add(request.remote_id, interest),
+            linux_abi::EPOLL_CTL_MOD => candidate.modify(request.remote_id, interest),
+            linux_abi::EPOLL_CTL_DEL => candidate.delete(request.remote_id, interest.key),
             _ => {
                 response.status = EINVAL;
                 return;
@@ -554,7 +776,13 @@ impl VfsState {
         };
         if let Err(err) = result {
             response.status = waitset_registry_status(err);
+            return;
         }
+        if let Err(errno) = self.checkpoint_mutate(request, checkpoint) {
+            response.status = errno;
+            return;
+        }
+        self.epolls = candidate;
     }
 
     fn vfs_epoll_snapshot(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
@@ -579,7 +807,7 @@ impl VfsState {
                 flags: 0,
                 target_fd: interest.key.target_fd,
                 object_id: interest.key.object_id,
-                provider_epoch: interest.key.provider_epoch,
+                provider_epoch: interest.provider_epoch,
                 events: interest.events,
                 reserved0: 0,
                 data: interest.data,
@@ -724,7 +952,7 @@ impl VfsState {
             response.status = EINVAL;
             return;
         };
-        match self.open_remote(path, request.flags) {
+        match self.open_remote(request.arg3, path, request.flags) {
             Ok((id, handle)) => {
                 let mut payload = [0_u8; 32];
                 payload[0..8].copy_from_slice(&id.to_le_bytes());
@@ -811,7 +1039,7 @@ impl VfsState {
             };
             resolved_path.as_str()
         };
-        match self.open_remote(path, request.arg0) {
+        match self.open_remote(request.arg3, path, request.arg0) {
             Ok((id, handle)) => {
                 response.remote_id = id;
                 response.handle_kind = handle_kind_u16(handle.kind);
@@ -1089,7 +1317,15 @@ impl VfsState {
         normalize_absolute_path(base.as_str(), path)
     }
 
-    fn open_remote(&mut self, path: &str, flags: u64) -> Result<(u64, RemoteHandle), i32> {
+    fn open_remote(
+        &mut self,
+        proposed_id: u64,
+        path: &str,
+        flags: u64,
+    ) -> Result<(u64, RemoteHandle), i32> {
+        if proposed_id == 0 || self.handles.contains_key(&proposed_id) {
+            return Err(EINVAL);
+        }
         let metadata = self.metadata(path)?;
         if flags & O_DIRECTORY != 0 && metadata.kind != RemoteKind::Directory {
             return Err(ENOTDIR);
@@ -1097,8 +1333,8 @@ impl VfsState {
         if flags & (O_CREAT | O_TRUNC) != 0 {
             return Err(EROFS);
         }
-        let id = self.next_handle;
-        self.next_handle = self.next_handle.checked_add(1).unwrap_or(1);
+        let id = proposed_id;
+        self.next_handle = self.next_handle.saturating_add(1).max(1);
         let handle = RemoteHandle {
             kind: metadata.kind,
             path: path.to_string(),
@@ -1317,6 +1553,158 @@ impl VfsState {
     }
 }
 
+fn call_rootd_checkpoint(
+    op: u16,
+    cursor: u64,
+    record: Option<&ServiceCheckpointRecordWire>,
+) -> Result<CommercialMaxProtocolResponse, i32> {
+    let endpoint = ipc::lookup_service_endpoint(IPC_SERVICE_ROOTD);
+    if endpoint < 0 {
+        return Err((-endpoint) as i32);
+    }
+    let pid = unsafe { rustos_svc_runtime::syscall::syscall0(linux_abi::SYS_GETPID) };
+    let tid = unsafe { rustos_svc_runtime::syscall::syscall0(linux_abi::SYS_GETTID) };
+    if pid <= 0 || tid <= 0 {
+        return Err(EIO);
+    }
+    let mut request = CommercialMaxProtocolRequest::default();
+    request.header.version = COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
+    request.header.protocol = COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR;
+    request.header.op = op;
+    request.header.subject_pid = pid as u64;
+    request.header.subject_tid = tid as u64;
+    request.arg0 = IPC_SERVICE_VFSD;
+    request.arg1 = cursor;
+    if let Some(record) = record {
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                (record as *const ServiceCheckpointRecordWire).cast::<u8>(),
+                size_of::<ServiceCheckpointRecordWire>(),
+            )
+        };
+        request.payload_len = bytes.len() as u32;
+        request.payload[..bytes.len()].copy_from_slice(bytes);
+    }
+    let mut response = CommercialMaxProtocolResponse::default();
+    let received = unsafe {
+        ipc::call(
+            endpoint as u64,
+            (&request as *const CommercialMaxProtocolRequest).cast::<u8>(),
+            size_of::<CommercialMaxProtocolRequest>(),
+            (&mut response as *mut CommercialMaxProtocolResponse).cast::<u8>(),
+            size_of::<CommercialMaxProtocolResponse>(),
+        )
+    };
+    if received as usize != size_of::<CommercialMaxProtocolResponse>()
+        || !response.is_valid_envelope_for(&request)
+        || response.descriptor_count != 0
+    {
+        return Err(EIO);
+    }
+    if response.status != 0 {
+        return Err(response.status);
+    }
+    Ok(response)
+}
+
+fn checkpoint_revision_key(record: &ServiceCheckpointRecordWire) -> CheckpointRevisionKey {
+    (
+        record.parent_hi,
+        record.parent_lo,
+        record.key_hi,
+        record.key_lo,
+    )
+}
+
+fn checkpoint_epoll_key(token: u64) -> CheckpointRevisionKey {
+    (0, 0, token, CHECKPOINT_EPOLL_TAG)
+}
+
+fn checkpoint_epoll_record(token: u64, refs: u64, tombstone: bool) -> ServiceCheckpointRecordWire {
+    let mut record = ServiceCheckpointRecordWire {
+        key_hi: token,
+        key_lo: CHECKPOINT_EPOLL_TAG,
+        ..ServiceCheckpointRecordWire::default()
+    };
+    if tombstone {
+        record.flags = SERVICE_CHECKPOINT_FLAG_TOMBSTONE;
+    } else {
+        record.value_len = 8;
+        record.value[..8].copy_from_slice(&refs.to_le_bytes());
+    }
+    record
+}
+
+fn checkpoint_interest_record(
+    epoll_token: u64,
+    interest: WaitSetInterestRecord,
+    tombstone: bool,
+) -> ServiceCheckpointRecordWire {
+    let (key_hi, key_lo) = checkpoint_interest_key(&interest);
+    let mut record = ServiceCheckpointRecordWire {
+        key_hi,
+        key_lo,
+        parent_hi: epoll_token,
+        parent_lo: CHECKPOINT_EPOLL_TAG,
+        ..ServiceCheckpointRecordWire::default()
+    };
+    if tombstone {
+        record.flags = SERVICE_CHECKPOINT_FLAG_TOMBSTONE;
+        return record;
+    }
+    let wire = WaitSetInterestWire {
+        abi_version: WAITSET_ABI_VERSION,
+        provider: interest.key.provider,
+        flags: 0,
+        target_fd: interest.key.target_fd,
+        object_id: interest.key.object_id,
+        provider_epoch: interest.provider_epoch,
+        events: interest.events,
+        reserved0: 0,
+        data: interest.data,
+    };
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (&wire as *const WaitSetInterestWire).cast::<u8>(),
+            size_of::<WaitSetInterestWire>(),
+        )
+    };
+    record.value_len = bytes.len() as u32;
+    record.value[..bytes.len()].copy_from_slice(bytes);
+    record
+}
+
+fn checkpoint_interest_key(interest: &WaitSetInterestRecord) -> (u64, u64) {
+    (
+        interest.key.object_id,
+        (u64::from(interest.key.provider) << 48) | interest.key.target_fd,
+    )
+}
+
+fn waitset_interest_from_wire(wire: &WaitSetInterestWire) -> Option<WaitSetInterestRecord> {
+    if wire.abi_version != WAITSET_ABI_VERSION
+        || wire.flags != 0
+        || wire.reserved0 != 0
+        || wire.provider == 0
+        || wire.provider > rustos_user_abi::syscall::WAITSET_PROVIDER_MAX
+        || wire.target_fd > u16::MAX as u64
+        || wire.object_id == 0
+        || wire.provider_epoch == 0
+    {
+        return None;
+    }
+    Some(WaitSetInterestRecord {
+        key: WaitSetInterestKey {
+            target_fd: wire.target_fd,
+            provider: wire.provider,
+            object_id: wire.object_id,
+        },
+        provider_epoch: wire.provider_epoch,
+        events: wire.events,
+        data: wire.data,
+    })
+}
+
 fn poll_ready_bits(requested: u32) -> u32 {
     requested
         & (linux_abi::EPOLLIN
@@ -1343,27 +1731,10 @@ fn epoll_interest_from_request(request: &VfsIpcRequest) -> Option<WaitSetInteres
     let wire = unsafe {
         core::ptr::read_unaligned(request.payload.as_ptr().cast::<WaitSetInterestWire>())
     };
-    if wire.abi_version != WAITSET_ABI_VERSION
-        || wire.flags != 0
-        || wire.reserved0 != 0
-        || wire.target_fd != request.fd
-        || wire.provider == 0
-        || wire.provider > rustos_user_abi::syscall::WAITSET_PROVIDER_MAX
-        || wire.object_id == 0
-        || wire.provider_epoch == 0
-    {
+    if wire.target_fd != request.fd {
         return None;
     }
-    Some(WaitSetInterestRecord {
-        key: WaitSetInterestKey {
-            target_fd: wire.target_fd,
-            provider: wire.provider,
-            object_id: wire.object_id,
-            provider_epoch: wire.provider_epoch,
-        },
-        events: wire.events,
-        data: wire.data,
-    })
+    waitset_interest_from_wire(&wire)
 }
 
 fn validate_commercial_request(request: &CommercialMaxProtocolRequest) -> Result<(), i32> {
@@ -1503,10 +1874,36 @@ mod tests {
 
     #[test]
     fn vfs_requests_validate_inline_shape() {
-        let request = VfsIpcRequest::default();
+        let request = VfsIpcRequest {
+            operation_lo: 1,
+            ..VfsIpcRequest::default()
+        };
         assert_eq!(validate_vfs_request(&request), Ok(()));
         assert!(size_of::<VfsIpcRequest>() <= IPC_MAX_INLINE_BYTES);
         assert!(size_of::<VfsIpcResponse>() <= IPC_MAX_INLINE_BYTES);
+    }
+
+    #[test]
+    fn waitset_checkpoint_keys_are_parent_scoped_and_round_trip_wire() {
+        let interest = WaitSetInterestRecord {
+            key: WaitSetInterestKey {
+                target_fd: 7,
+                provider: rustos_user_abi::syscall::WAITSET_PROVIDER_NETD,
+                object_id: 0xfeed_beef,
+            },
+            provider_epoch: 9,
+            events: linux_abi::EPOLLIN,
+            data: 11,
+        };
+        let record = checkpoint_interest_record(44, interest, false);
+        assert_eq!(record.parent_hi, 44);
+        assert_eq!(record.parent_lo, CHECKPOINT_EPOLL_TAG);
+        assert_eq!(record.value_len as usize, size_of::<WaitSetInterestWire>());
+        let wire = unsafe {
+            core::ptr::read_unaligned(record.value.as_ptr().cast::<WaitSetInterestWire>())
+        };
+        assert_eq!(waitset_interest_from_wire(&wire), Some(interest));
+        assert_eq!(size_of::<ServiceCheckpointRecordWire>(), 128);
     }
 
     #[test]

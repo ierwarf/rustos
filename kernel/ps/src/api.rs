@@ -1,7 +1,8 @@
 pub use crate::multitask::{
     CurrentKernelStackScope, CurrentUserSnapshot, DEFAULT_USER_TASK_WEIGHT_MICROS,
-    RetainedCurrentUserAddressSpace, RetainedCurrentUserProcessState, SpawnTaskError, Thread,
-    UserFaultDisposition, UserStackState, UserTaskBootstrap, UserTaskRegisters, WaitChildResult,
+    MAX_SCHEDULER_TASKS, RetainedCurrentUserAddressSpace, RetainedCurrentUserProcessState,
+    SpawnTaskError, Thread, UserFaultDisposition, UserStackState, UserTaskBootstrap,
+    UserTaskRegisters, WaitChildResult,
 };
 pub use crate::multitask::{
     activate_suspended_user_task, arm_block_current_task, block_current_task,
@@ -24,11 +25,12 @@ pub use crate::multitask::{
 pub use crate::user::abi::UserAbi;
 pub use crate::user::epoll::{EpollError, EpollHandle, EpollInterestSnapshot};
 pub use crate::user::handles::{
-    ConsoleStreamKind, DisplaySurfaceHandle, FD_CLOEXEC, FIRST_DYNAMIC_FD, FileHandleSeekError,
-    FileHandleSeekWhence, HandleEntry, HandleTable, InetSocketHandle, IpcTransferRegistryError,
-    KernelHandle, MAX_DYNAMIC_FD, RemoteVfsHandle, RemoteVfsHandleKind, TransferredHandleEntry,
-    VfsDirectoryEntry, VfsDirectoryEntryKind, VfsDirectoryHandle, drop_ipc_transfer_descriptors,
-    register_ipc_transfer_entries, take_deferred_ipc_transfer_drops, take_ipc_transfer_entries,
+    ConsoleHandle, ConsoleStreamKind, DisplaySurfaceHandle, FD_CLOEXEC, FIRST_DYNAMIC_FD,
+    FileHandleSeekError, FileHandleSeekWhence, HandleEntry, HandleTable, InetSocketHandle,
+    IpcTransferRegistryError, KernelHandle, MAX_DYNAMIC_FD, RemoteVfsHandle, RemoteVfsHandleKind,
+    TransferredHandleEntry, VfsDirectoryEntry, VfsDirectoryEntryKind, VfsDirectoryHandle,
+    drop_ipc_transfer_descriptors, register_ipc_transfer_entries, take_deferred_ipc_transfer_drops,
+    take_ipc_transfer_entries,
 };
 pub use crate::user::linux::{
     LinuxMemoryMapState, LinuxProcessImageInfo, LinuxProcessLaunch, LinuxProcessState,

@@ -71,6 +71,10 @@ pub const SYS_RUSTOS_INPUT_WAIT_BROKER: u64 = 0x5255_003e;
 /// Ring0 uses the record only to wake already-armed generic wait-set tokens;
 /// the provider remains the authority for the subsequent readiness recheck.
 pub const SYS_RUSTOS_WAITSET_SIGNAL_BROKER: u64 = 0x5255_003f;
+/// Capability-gated access to the boot-entropy substrate. Policy services use
+/// this only to obtain opaque random bytes; Linux flag and length policy stays
+/// in syscalld and object admission stays in the owning service.
+pub const SYS_RUSTOS_ENTROPY_BROKER: u64 = 0x5255_0040;
 /// Irreversibly removes the caller's base System scheduling admission.
 ///
 /// This is deliberately a self-demotion only: it never accepts a requested
@@ -242,7 +246,7 @@ pub const MM_BROKER_FD_RIGHT_READ: u64 = 1 << 0;
 pub const MM_BROKER_FD_RIGHT_WRITE: u64 = 1 << 1;
 pub const MM_BROKER_FD_RIGHT_MAP: u64 = 1 << 2;
 pub const MM_BROKER_PATH_CAPACITY: usize = 128;
-pub const VFS_IPC_ABI_VERSION: u16 = 2;
+pub const VFS_IPC_ABI_VERSION: u16 = 3;
 pub const VFS_IPC_OP_OPENAT: u16 = 1;
 pub const VFS_IPC_OP_CLOSE: u16 = 2;
 pub const VFS_IPC_OP_DUP: u16 = 3;
@@ -357,7 +361,7 @@ pub const ROOTD_LEASE_STATE_RUNNING: u16 = 1;
 pub const ROOTD_LEASE_STATE_EXITED: u16 = 2;
 pub const ROOTD_LEASE_STATE_RESTART_PENDING: u16 = 3;
 pub const ROOTD_LEASE_STATE_FAILED: u16 = 4;
-pub const NETD_IPC_ABI_VERSION: u16 = 3;
+pub const NETD_IPC_ABI_VERSION: u16 = 4;
 pub const NETD_IPC_PAYLOAD_CAPACITY: usize = 32 * 1024;
 /// Netd v2 sends only the fixed header plus `payload_len`; the unused tail of
 /// the in-memory transport buffer is not copied through the kernel IPC path.
@@ -380,6 +384,9 @@ pub const NETD_RECVMSG_PAYLOAD_HEADER_SIZE: usize = 16;
 pub const NET_BROKER_OP_PACKET_STATUS: u16 = 0x8001;
 pub const NET_BROKER_OP_PACKET_TX: u16 = 0x8002;
 pub const NET_BROKER_OP_PACKET_RX: u16 = 0x8003;
+/// Kernel-only acknowledgement that retires one completed replay-safe
+/// dup/close operation from netd's bounded reconciliation table.
+pub const NETD_IPC_OP_REF_ACK: u16 = 0x8004;
 pub const NET_BROKER_PACKET_MTU: usize = 1514;
 /// No validated DVM Ethernet aperture is currently mapped.
 pub const NET_BROKER_PACKET_STATUS_UNAVAILABLE: u64 = 0;
@@ -514,6 +521,16 @@ pub const COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_QUERY: u16 = 8;
 /// Revoke and, when still live, terminate an unrecoverable post-init lease.
 /// Only the current initd may reclaim its own service classes.
 pub const COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM: u16 = 9;
+/// Store one versioned, service-owned checkpoint record.  Rootd authenticates
+/// the current service lease and retains the opaque record across a supervised
+/// service restart; it never interprets the service-private value bytes.
+pub const COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE: u16 = 10;
+/// Return a bounded page of the authenticated service's checkpoint records.
+pub const COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_SCAN: u16 = 11;
+pub const SERVICE_CHECKPOINT_ABI_VERSION: u16 = 1;
+pub const SERVICE_CHECKPOINT_FLAG_TOMBSTONE: u16 = 1 << 0;
+pub const SERVICE_CHECKPOINT_VALUE_CAPACITY: usize = 64;
+pub const SERVICE_CHECKPOINT_MAX_RECORDS: usize = 32 * 1024;
 pub const COMMERCIAL_MAX_PROCD_OP_PROCESS_PREPARE: u16 = 1;
 pub const COMMERCIAL_MAX_PROCD_OP_EXEC_TICKET: u16 = 2;
 pub const COMMERCIAL_MAX_PROCD_OP_FORK_PLAN: u16 = 3;
@@ -698,6 +715,45 @@ impl Default for CommercialMaxCapabilityLeaseWire {
             reserved0: 0,
             reserved1: 0,
             label: [0; COMMERCIAL_MAX_PROTOCOL_NAME_CAPACITY],
+        }
+    }
+}
+
+/// Opaque, rootd-retained service checkpoint record. `(key_hi, key_lo)` is
+/// unique inside one service namespace. A non-zero parent makes child records
+/// depend on that parent; tombstoning a parent atomically tombstones every
+/// child so a partially replayed object cannot be revived. `revision`
+/// advances by exactly one and the 128-bit operation id makes retries safe.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ServiceCheckpointRecordWire {
+    pub version: u16,
+    pub flags: u16,
+    pub value_len: u32,
+    pub key_hi: u64,
+    pub key_lo: u64,
+    pub parent_hi: u64,
+    pub parent_lo: u64,
+    pub operation_hi: u64,
+    pub operation_lo: u64,
+    pub revision: u64,
+    pub value: [u8; SERVICE_CHECKPOINT_VALUE_CAPACITY],
+}
+
+impl Default for ServiceCheckpointRecordWire {
+    fn default() -> Self {
+        Self {
+            version: SERVICE_CHECKPOINT_ABI_VERSION,
+            flags: 0,
+            value_len: 0,
+            key_hi: 0,
+            key_lo: 0,
+            parent_hi: 0,
+            parent_lo: 0,
+            operation_hi: 0,
+            operation_lo: 0,
+            revision: 0,
+            value: [0; SERVICE_CHECKPOINT_VALUE_CAPACITY],
         }
     }
 }
@@ -1206,6 +1262,10 @@ pub struct VfsIpcRequest {
     pub arg1: u64,
     pub arg2: u64,
     pub arg3: u64,
+    /// Kernel-minted id retained across a bounded retry. Mutating service
+    /// operations use it as the replay identity in rootd's checkpoint store.
+    pub operation_hi: u64,
+    pub operation_lo: u64,
     pub path_len: u32,
     pub payload_len: u32,
     pub path: [u8; VFS_IPC_PATH_CAPACITY],
@@ -1232,6 +1292,8 @@ impl Default for VfsIpcRequest {
             arg1: 0,
             arg2: 0,
             arg3: 0,
+            operation_hi: 0,
+            operation_lo: 0,
             path_len: 0,
             payload_len: 0,
             path: [0; VFS_IPC_PATH_CAPACITY],
@@ -1651,6 +1713,8 @@ pub struct NetdIpcRequest {
     pub arg3: u64,
     pub arg4: u64,
     pub arg5: u64,
+    pub operation_hi: u64,
+    pub operation_lo: u64,
     pub reserved0: u64,
     pub socket_token: u64,
     pub status_flags: u64,
@@ -1677,6 +1741,8 @@ impl Default for NetdIpcRequest {
             arg3: 0,
             arg4: 0,
             arg5: 0,
+            operation_hi: 0,
+            operation_lo: 0,
             reserved0: 0,
             socket_token: 0,
             status_flags: 0,
@@ -2608,8 +2674,8 @@ mod syscall_tests {
     }
 
     #[test]
-    fn netd_v3_wire_headers_exclude_the_reserved_payload_tail() {
-        assert_eq!(NETD_IPC_REQUEST_HEADER_SIZE, 120);
+    fn netd_v4_wire_headers_exclude_the_reserved_payload_tail() {
+        assert_eq!(NETD_IPC_REQUEST_HEADER_SIZE, 136);
         assert_eq!(NETD_IPC_RESPONSE_HEADER_SIZE, 32);
         assert_eq!(
             size_of::<NetdIpcRequest>(),

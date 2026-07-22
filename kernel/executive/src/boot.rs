@@ -273,7 +273,10 @@ pub fn initialize_kernel(boot_info_ptr: *const BootInfo) {
     announce_ready("RTC", b"RTC initialized.\r\n");
     mm_api::boot::paging_smoke_test();
 
-    random::init(boot_info);
+    assert!(
+        random::init(boot_info),
+        "refusing to initialize the CSPRNG without boot entropy"
+    );
     announce_ready("Random", b"Random initialized.\r\n");
 
     compat_api::init_syscalls();

@@ -40,6 +40,13 @@ pub fn syscall_linux_poll(fds_ptr: u64, nfds: u64, timeout_ms: i64) -> u64 {
             {
                 return 0;
             }
+            Err(LINUX_ETIMEDOUT) => {
+                if current_wait_was_interrupted() {
+                    return linux_errno(LINUX_EINTR);
+                }
+                multitask::cond_resched();
+                continue;
+            }
             Err(errno) => return linux_errno(errno),
         };
         if first.ready != 0 {
@@ -77,6 +84,14 @@ pub fn syscall_linux_poll(fds_ptr: u64, nfds: u64, timeout_ms: i64) -> u64 {
             {
                 super::super::broker_ops::waitset_broker_ops::remove_waitset_waiters(task_id);
                 return 0;
+            }
+            Err(LINUX_ETIMEDOUT) => {
+                super::super::broker_ops::waitset_broker_ops::remove_waitset_waiters(task_id);
+                if current_wait_was_interrupted() {
+                    return linux_errno(LINUX_EINTR);
+                }
+                multitask::cond_resched();
+                continue;
             }
             Err(errno) => {
                 super::super::broker_ops::waitset_broker_ops::remove_waitset_waiters(task_id);
@@ -138,6 +153,7 @@ pub fn syscall_linux_poll(fds_ptr: u64, nfds: u64, timeout_ms: i64) -> u64 {
 #[derive(Debug)]
 struct PollReadinessState {
     ready: u64,
+    provider_timed_out: bool,
     observations: Vec<super::super::broker_ops::waitset_broker_ops::ProviderObservation>,
 }
 
@@ -152,6 +168,7 @@ fn collect_poll_readiness(
     }
     let mut state = PollReadinessState {
         ready: 0,
+        provider_timed_out: false,
         observations: Vec::with_capacity(WAITSET_PROVIDER_MAX as usize),
     };
     for index in 0..nfds {
@@ -165,7 +182,14 @@ fn collect_poll_readiness(
         let revents = if fd < 0 {
             0
         } else {
-            collect_one_poll_fd(fd as u64, events, deadline_tick, &mut state)?
+            match collect_one_poll_fd(fd as u64, events, deadline_tick, &mut state) {
+                Ok(revents) => revents,
+                Err(LINUX_ETIMEDOUT) => {
+                    state.provider_timed_out = true;
+                    0
+                }
+                Err(errno) => return Err(errno),
+            }
         };
         if revents != 0 {
             state.ready += 1;
@@ -174,7 +198,16 @@ fn collect_poll_readiness(
         usermem::write_current_user_bytes(entry_ptr, &entry)
             .map_err(address_space_error_to_linux_errno)?;
     }
+    require_completed_provider_scan(state.provider_timed_out, state.ready != 0)?;
     Ok(state)
+}
+
+fn require_completed_provider_scan(timed_out: bool, has_ready: bool) -> Result<(), i64> {
+    if timed_out && !has_ready {
+        Err(LINUX_ETIMEDOUT)
+    } else {
+        Ok(())
+    }
 }
 
 fn collect_one_poll_fd(
@@ -190,20 +223,32 @@ fn collect_one_poll_fd(
         poll_ready_bits(events | linux_abi::POLLERR as u32 | linux_abi::POLLHUP as u32);
     match handle {
         multitask::KernelHandle::Socket(socket) => {
-            let (revents, generation) = poll_netd_socket_token(
+            let (revents, generation) = match poll_netd_socket_token(
                 socket.token_id(),
                 events,
                 waitset_provider_query_timeout_ms(deadline_tick),
-            )?;
+            ) {
+                Ok(result) => result,
+                Err(errno) if provider_revoke_events(errno).is_some() => {
+                    return Ok(provider_revoke_events(errno).unwrap());
+                }
+                Err(errno) => return Err(errno),
+            };
             note_poll_observation(state, WAITSET_PROVIDER_NETD, generation);
             Ok(revents & ready_mask)
         }
         multitask::KernelHandle::InetSocket(socket) => {
-            let (revents, generation) = poll_netd_socket_token(
+            let (revents, generation) = match poll_netd_socket_token(
                 socket.token_id(),
                 events,
                 waitset_provider_query_timeout_ms(deadline_tick),
-            )?;
+            ) {
+                Ok(result) => result,
+                Err(errno) if provider_revoke_events(errno).is_some() => {
+                    return Ok(provider_revoke_events(errno).unwrap());
+                }
+                Err(errno) => return Err(errno),
+            };
             note_poll_observation(state, WAITSET_PROVIDER_NETD, generation);
             Ok(revents & ready_mask)
         }
@@ -227,10 +272,16 @@ fn collect_one_poll_fd(
             {
                 return Err(LINUX_EBADF);
             }
-            let (ready, generation) = input_device_readiness_for_access_with_timeout(
+            let (ready, generation) = match input_device_readiness_for_access_with_timeout(
                 access,
                 waitset_provider_query_timeout_ms(deadline_tick),
-            )?;
+            ) {
+                Ok(result) => result,
+                Err(errno) if provider_revoke_events(errno).is_some() => {
+                    return Ok(provider_revoke_events(errno).unwrap());
+                }
+                Err(errno) => return Err(errno),
+            };
             note_poll_observation(state, WAITSET_PROVIDER_INPUTD, generation);
             Ok(if ready {
                 events & (linux_abi::POLLIN as u32 | linux_abi::POLLPRI as u32)
@@ -238,31 +289,72 @@ fn collect_one_poll_fd(
                 0
             })
         }
-        multitask::KernelHandle::Console(multitask::ConsoleStreamKind::Input)
-            if !current_console_session_is_system() =>
+        multitask::KernelHandle::Console(console)
+            if console.stream() == multitask::ConsoleStreamKind::Input
+                && !current_console_session_is_system() =>
         {
             let session = multitask::current_console_session()
                 .ok_or(LINUX_EBADF)?
                 .raw();
-            let (ready, live, generation) = console_readiness_via_sessiond_with_timeout(
+            let (ready, live, generation) = match console_readiness_via_sessiond_with_timeout(
                 session,
                 waitset_provider_query_timeout_ms(deadline_tick),
-            )?;
+            ) {
+                Ok(result) => result,
+                Err(errno) if provider_revoke_events(errno).is_some() => {
+                    return Ok(provider_revoke_events(errno).unwrap());
+                }
+                Err(errno) => return Err(errno),
+            };
             note_poll_observation(state, WAITSET_PROVIDER_SESSIOND, generation);
-            Ok(if !live {
-                linux_abi::POLLHUP as u32
-            } else if ready {
-                events & linux_abi::POLLIN as u32
-            } else {
-                0
-            })
+            Ok(console_ready_events(console.stream(), live, ready, events))
         }
-        multitask::KernelHandle::Console(multitask::ConsoleStreamKind::Output)
-        | multitask::KernelHandle::Console(multitask::ConsoleStreamKind::Error) => {
+        multitask::KernelHandle::Console(console)
+            if matches!(
+                console.stream(),
+                multitask::ConsoleStreamKind::Output | multitask::ConsoleStreamKind::Error
+            ) && !current_console_session_is_system() =>
+        {
+            let session = multitask::current_console_session()
+                .ok_or(LINUX_EBADF)?
+                .raw();
+            let (_, live, generation) = match console_readiness_via_sessiond_with_timeout(
+                session,
+                waitset_provider_query_timeout_ms(deadline_tick),
+            ) {
+                Ok(result) => result,
+                Err(errno) if provider_revoke_events(errno).is_some() => {
+                    return Ok(provider_revoke_events(errno).unwrap());
+                }
+                Err(errno) => return Err(errno),
+            };
+            note_poll_observation(state, WAITSET_PROVIDER_SESSIOND, generation);
+            Ok(console_ready_events(console.stream(), live, false, events))
+        }
+        multitask::KernelHandle::Console(console)
+            if matches!(
+                console.stream(),
+                multitask::ConsoleStreamKind::Output | multitask::ConsoleStreamKind::Error
+            ) =>
+        {
             Ok(events & linux_abi::POLLOUT as u32)
         }
-        _ => poll_vfs_revents(fd, events, deadline_tick),
+        _ => match poll_vfs_revents(fd, events, deadline_tick) {
+            Ok(revents) => Ok(revents),
+            Err(errno) if provider_revoke_events(errno).is_some() => {
+                Ok(provider_revoke_events(errno).unwrap())
+            }
+            Err(errno) => Err(errno),
+        },
     }
+}
+
+fn provider_revoke_events(errno: i64) -> Option<u32> {
+    matches!(
+        errno,
+        LINUX_EBADF | LINUX_ENODEV | LINUX_EPIPE | LINUX_ENOSYS
+    )
+    .then_some(linux_abi::POLLERR as u32 | linux_abi::POLLHUP as u32)
 }
 
 fn waitset_provider_query_timeout_ms(deadline_tick: Option<u64>) -> u64 {
@@ -352,6 +444,24 @@ fn poll_ready_bits(requested: u32) -> u32 {
             | linux_abi::POLLOUT as u32
             | linux_abi::POLLERR as u32
             | linux_abi::POLLHUP as u32)
+}
+
+fn console_ready_events(
+    stream: multitask::ConsoleStreamKind,
+    live: bool,
+    input_ready: bool,
+    requested: u32,
+) -> u32 {
+    if !live {
+        return linux_abi::POLLHUP as u32;
+    }
+    match stream {
+        multitask::ConsoleStreamKind::Input if input_ready => requested & linux_abi::POLLIN as u32,
+        multitask::ConsoleStreamKind::Output | multitask::ConsoleStreamKind::Error => {
+            requested & linux_abi::POLLOUT as u32
+        }
+        _ => 0,
+    }
 }
 
 pub fn syscall_linux_ppoll(
@@ -453,9 +563,14 @@ pub fn syscall_linux_epoll_create1(flags: u64) -> u64 {
     let mut request = new_vfs_request(VFS_IPC_OP_POLL_QUERY);
     request.arg0 = VFS_POLL_QUERY_EPOLL_CREATE;
     request.remote_id = epoll.token_id();
-    if let Err(errno) =
-        call_vfs_ipc_request(&request).and_then(|response| ensure_vfs_status(&response))
+    if let Err(errno) = call_vfs_ipc_request_with_timeout(&request, 16)
+        .and_then(|response| ensure_vfs_status(&response))
     {
+        // A timeout can race the service commit. The token is globally unique
+        // and not yet published in the fd table, so an idempotent bounded
+        // unref safely removes a possibly-created orphan and otherwise gets
+        // ENOENT without affecting another epoll object.
+        let _ = update_vfs_epoll_ref_bounded(epoll.token_id(), false);
         return linux_errno(errno);
     }
     let fd_flags = if flags & linux_abi::EPOLL_CLOEXEC != 0 {
@@ -497,16 +612,33 @@ pub fn syscall_linux_epoll_ctl(epfd: u64, op: u64, fd: u64, event_ptr: u64) -> u
     request.fd = fd;
     request.remote_id = epoll.token_id();
 
-    let (provider, object_id, provider_epoch) = match epoll_interest_target(fd) {
+    if !matches!(
+        op,
+        linux_abi::EPOLL_CTL_ADD | linux_abi::EPOLL_CTL_MOD | linux_abi::EPOLL_CTL_DEL
+    ) {
+        return linux_errno(LINUX_EINVAL);
+    }
+    let target = match epoll_interest_target(fd) {
         Ok(target) => target,
         Err(errno) => return linux_errno(errno),
     };
+    let provider_epoch = if epoll_ctl_requires_live_provider_epoch(op) {
+        match waitset_provider_epoch(target.provider) {
+            Ok(epoch) => epoch,
+            Err(errno) => return linux_errno(errno),
+        }
+    } else {
+        // DEL is keyed only by target fd plus open-description identity. Keep
+        // the wire structurally valid without making cleanup depend on a live
+        // provider or its replacement epoch.
+        1
+    };
     let mut wire = WaitSetInterestWire {
         abi_version: WAITSET_ABI_VERSION,
-        provider,
+        provider: target.provider,
         flags: 0,
         target_fd: fd,
-        object_id,
+        object_id: target.object_id,
         provider_epoch,
         ..WaitSetInterestWire::default()
     };
@@ -515,12 +647,6 @@ pub fn syscall_linux_epoll_ctl(epfd: u64, op: u64, fd: u64, event_ptr: u64) -> u
         linux_abi::EPOLL_CTL_ADD | linux_abi::EPOLL_CTL_MOD => {
             if event_ptr == 0 {
                 return linux_errno(LINUX_EINVAL);
-            }
-            let Some(handle) = current_kernel_handle(fd) else {
-                return linux_errno(LINUX_EBADF);
-            };
-            if matches!(handle, multitask::KernelHandle::Epoll(_)) {
-                return linux_errno(LINUX_EOPNOTSUPP);
             }
             let (events, data) = match read_linux_epoll_event(event_ptr) {
                 Ok(event) => event,
@@ -533,7 +659,7 @@ pub fn syscall_linux_epoll_ctl(epfd: u64, op: u64, fd: u64, event_ptr: u64) -> u
             wire.data = data;
         }
         linux_abi::EPOLL_CTL_DEL => {}
-        _ => return linux_errno(LINUX_EINVAL),
+        _ => unreachable!(),
     }
 
     request.payload_len = WAITSET_INTEREST_SIZE as u32;
@@ -545,7 +671,20 @@ pub fn syscall_linux_epoll_ctl(epfd: u64, op: u64, fd: u64, event_ptr: u64) -> u
     };
     request.payload[..WAITSET_INTEREST_SIZE].copy_from_slice(bytes);
 
-    match call_vfs_ipc_request(&request).and_then(|response| ensure_vfs_status(&response)) {
+    let guard = if epoll_ctl_requires_live_provider_epoch(op) {
+        match acquire_epoll_target_guard(&target.handle) {
+            Ok(guard) => Some(guard),
+            Err(errno) => return linux_errno(errno),
+        }
+    } else {
+        None
+    };
+    let result = call_vfs_ipc_request_with_timeout(&request, 16)
+        .and_then(|response| ensure_vfs_status(&response));
+    if let Some(guard) = guard {
+        release_epoll_target_guard(guard);
+    }
+    match result {
         Ok(()) => 0,
         Err(errno) => linux_errno(errno),
     }
@@ -588,6 +727,13 @@ pub fn syscall_linux_epoll_wait(
             {
                 return 0;
             }
+            Err(LINUX_ETIMEDOUT) => {
+                if current_wait_was_interrupted() {
+                    return linux_errno(LINUX_EINTR);
+                }
+                multitask::cond_resched();
+                continue;
+            }
             Err(errno) => return linux_errno(errno),
         };
         if !first.ready.is_empty() {
@@ -623,6 +769,14 @@ pub fn syscall_linux_epoll_wait(
             {
                 super::super::broker_ops::waitset_broker_ops::remove_waitset_waiters(task_id);
                 return 0;
+            }
+            Err(LINUX_ETIMEDOUT) => {
+                super::super::broker_ops::waitset_broker_ops::remove_waitset_waiters(task_id);
+                if current_wait_was_interrupted() {
+                    return linux_errno(LINUX_EINTR);
+                }
+                multitask::cond_resched();
+                continue;
             }
             Err(errno) => {
                 super::super::broker_ops::waitset_broker_ops::remove_waitset_waiters(task_id);
@@ -687,35 +841,84 @@ struct EpollReadinessState {
     observations: Vec<super::super::broker_ops::waitset_broker_ops::ProviderObservation>,
 }
 
-fn epoll_interest_target(fd: u64) -> Result<(u16, u64, u64), i64> {
-    let handle = current_kernel_handle(fd).ok_or(LINUX_EBADF)?;
-    match handle {
-        multitask::KernelHandle::Socket(socket) => Ok((
-            WAITSET_PROVIDER_NETD,
-            socket.token_id(),
-            waitset_provider_epoch(WAITSET_PROVIDER_NETD)?,
-        )),
-        multitask::KernelHandle::InetSocket(socket) => Ok((
-            WAITSET_PROVIDER_NETD,
-            socket.token_id(),
-            waitset_provider_epoch(WAITSET_PROVIDER_NETD)?,
-        )),
-        multitask::KernelHandle::Device(_) => current_input_device_description(fd)
-            .map(|(token, access, _)| {
-                if super::super::broker_ops::waitset_broker_ops::input_open_description_access(
-                    token,
-                ) != Some(access)
-                {
-                    return Err(LINUX_EBADF);
-                }
-                Ok((
-                    WAITSET_PROVIDER_INPUTD,
-                    token,
-                    waitset_provider_epoch(WAITSET_PROVIDER_INPUTD)?,
-                ))
-            })
-            .ok_or(LINUX_EPERM)?,
-        _ => Err(LINUX_EPERM),
+fn epoll_ctl_requires_live_provider_epoch(op: u64) -> bool {
+    op != linux_abi::EPOLL_CTL_DEL
+}
+
+struct EpollInterestTarget {
+    provider: u16,
+    object_id: u64,
+    handle: multitask::KernelHandle,
+}
+
+enum EpollTargetGuard {
+    Service(ServiceHandleRef),
+    Console(multitask::ConsoleHandle),
+}
+
+fn epoll_interest_target(fd: u64) -> Result<EpollInterestTarget, i64> {
+    let entry = multitask::with_current_user_process_state(|_, _, process_state| {
+        process_state.handles().get_entry(fd).cloned()
+    })
+    .flatten()
+    .ok_or(LINUX_EBADF)?;
+    let handle = entry.handle().clone();
+    let (provider, object_id) = match &handle {
+        multitask::KernelHandle::Socket(socket) => (WAITSET_PROVIDER_NETD, socket.token_id()),
+        multitask::KernelHandle::InetSocket(socket) => (WAITSET_PROVIDER_NETD, socket.token_id()),
+        multitask::KernelHandle::Device(device)
+            if entry.rights().allows_read()
+                && device.device_id() == kernel_object::api::device::DeviceId::Input =>
+        {
+            let access = match device.access_kind() {
+                kernel_object::api::device::DeviceAccessKind::Native => INPUTD_ACCESS_NATIVE,
+                kernel_object::api::device::DeviceAccessKind::Evdev => INPUTD_ACCESS_EVDEV,
+            };
+            if super::super::broker_ops::waitset_broker_ops::input_open_description_access(
+                device.token_id(),
+            ) != Some(access)
+            {
+                return Err(LINUX_EBADF);
+            }
+            (WAITSET_PROVIDER_INPUTD, device.token_id())
+        }
+        multitask::KernelHandle::Console(console) if !current_console_session_is_system() => {
+            (WAITSET_PROVIDER_SESSIOND, console.token_id())
+        }
+        _ => return Err(LINUX_EPERM),
+    };
+    Ok(EpollInterestTarget {
+        provider,
+        object_id,
+        handle,
+    })
+}
+
+fn acquire_epoll_target_guard(handle: &multitask::KernelHandle) -> Result<EpollTargetGuard, i64> {
+    if let Some(handle_ref) = service_handle_ref_for_handle(handle) {
+        acquire_service_handle_ref(handle_ref)?;
+        return Ok(EpollTargetGuard::Service(handle_ref));
+    }
+    if let multitask::KernelHandle::Console(console) = handle {
+        if console.try_acquire_descriptor_reference() {
+            return Ok(EpollTargetGuard::Console(console.clone()));
+        }
+        return Err(LINUX_EBADF);
+    }
+    Err(LINUX_EPERM)
+}
+
+fn release_epoll_target_guard(guard: EpollTargetGuard) {
+    match guard {
+        EpollTargetGuard::Service(handle_ref) => {
+            release_service_handle_refs_bounded(&[handle_ref]);
+        }
+        EpollTargetGuard::Console(console) => {
+            if console.release_descriptor_reference() {
+                let _ =
+                    purge_vfs_epoll_object_bounded(WAITSET_PROVIDER_SESSIOND, console.token_id());
+            }
+        }
     }
 }
 
@@ -723,6 +926,7 @@ fn waitset_provider_epoch(provider: u16) -> Result<u64, i64> {
     let service_id = match provider {
         WAITSET_PROVIDER_NETD => IPC_SERVICE_NETD,
         WAITSET_PROVIDER_INPUTD => IPC_SERVICE_INPUTD,
+        WAITSET_PROVIDER_SESSIOND => IPC_SERVICE_SESSIOND,
         _ => return Err(LINUX_EINVAL),
     };
     ipc_ops::service_endpoint_epoch(service_id).ok_or(LINUX_ENOSYS)
@@ -774,18 +978,28 @@ fn collect_epoll_readiness(
         {
             return Err(LINUX_EINVAL);
         }
-        if waitset_provider_epoch(wire.provider)? != wire.provider_epoch {
-            return Err(LINUX_EIO);
-        }
-        interests.push(wire);
+        let revoked = match waitset_provider_epoch(wire.provider) {
+            Ok(current_epoch) => current_epoch != wire.provider_epoch,
+            Err(errno) if provider_revoke_events(errno).is_some() => true,
+            Err(errno) => return Err(errno),
+        };
+        interests.push((wire, revoked));
     }
 
     let mut ready = Vec::new();
     let mut netd_generation = None;
     let mut input_generation = None;
-    for interest in interests {
-        let revents =
-            match interest.provider {
+    let mut sessiond_generation = None;
+    let mut provider_timed_out = false;
+    for (interest, revoked) in interests {
+        if revoked {
+            if ready.len() < maxevents {
+                ready.push((linux_abi::EPOLLERR | linux_abi::EPOLLHUP, interest.data));
+            }
+            continue;
+        }
+        let queried = (|| -> Result<u32, i64> {
+            Ok(match interest.provider {
                 WAITSET_PROVIDER_NETD => {
                     let (revents, generation) = poll_netd_socket_token(
                         interest.object_id,
@@ -812,12 +1026,39 @@ fn collect_epoll_readiness(
                         0
                     }
                 }
+                WAITSET_PROVIDER_SESSIOND => {
+                    let stream = multitask::ConsoleHandle::stream_for_token(interest.object_id)
+                        .ok_or(LINUX_EBADF)?;
+                    let session = multitask::current_console_session()
+                        .ok_or(LINUX_EBADF)?
+                        .raw();
+                    let (is_ready, live, generation) = console_readiness_via_sessiond_with_timeout(
+                        session,
+                        waitset_provider_query_timeout_ms(deadline_tick),
+                    )?;
+                    sessiond_generation = Some(generation);
+                    console_ready_events(stream, live, is_ready, interest.events)
+                }
                 _ => return Err(LINUX_EIO),
+            })
+        })();
+        let revents =
+            match queried {
+                Ok(revents) => revents,
+                Err(LINUX_ETIMEDOUT) => {
+                    provider_timed_out = true;
+                    continue;
+                }
+                Err(errno) if provider_revoke_events(errno).is_some() => {
+                    linux_abi::EPOLLERR | linux_abi::EPOLLHUP
+                }
+                Err(errno) => return Err(errno),
             } & poll_ready_bits(interest.events | linux_abi::EPOLLERR | linux_abi::EPOLLHUP);
         if revents != 0 && ready.len() < maxevents {
             ready.push((revents, interest.data));
         }
     }
+    require_completed_provider_scan(provider_timed_out, !ready.is_empty())?;
 
     let mut observations = Vec::with_capacity(3);
     observations.push(
@@ -845,6 +1086,15 @@ fn collect_epoll_readiness(
             },
         );
     }
+    if let Some(generation) = sessiond_generation {
+        observations.push(
+            super::super::broker_ops::waitset_broker_ops::ProviderObservation {
+                provider: WAITSET_PROVIDER_SESSIOND,
+                object_id: WAITSET_GLOBAL_OBJECT_ID,
+                generation,
+            },
+        );
+    }
     Ok(EpollReadinessState {
         ready,
         observations,
@@ -864,6 +1114,18 @@ fn write_epoll_ready_events(events_ptr: u64, ready: &[(u32, u64)]) -> u64 {
 }
 
 pub fn update_vfs_epoll_ref(token: u64, acquire: bool) -> Result<(), i64> {
+    update_vfs_epoll_ref_bounded(token, acquire)
+}
+
+pub fn update_vfs_epoll_ref_bounded(token: u64, acquire: bool) -> Result<(), i64> {
+    update_vfs_epoll_ref_with_timeout(token, acquire, Some(16))
+}
+
+fn update_vfs_epoll_ref_with_timeout(
+    token: u64,
+    acquire: bool,
+    timeout_ms: Option<u64>,
+) -> Result<(), i64> {
     let mut request = new_vfs_request(VFS_IPC_OP_POLL_QUERY);
     request.arg0 = if acquire {
         VFS_POLL_QUERY_EPOLL_REF
@@ -871,11 +1133,15 @@ pub fn update_vfs_epoll_ref(token: u64, acquire: bool) -> Result<(), i64> {
         VFS_POLL_QUERY_EPOLL_UNREF
     };
     request.remote_id = token;
-    call_vfs_ipc_request(&request).and_then(|response| ensure_vfs_status(&response))
+    let response = match timeout_ms {
+        Some(timeout_ms) => call_vfs_ipc_request_with_timeout(&request, timeout_ms),
+        None => call_vfs_ipc_request(&request),
+    }?;
+    ensure_vfs_status(&response)
 }
 
 pub fn purge_vfs_epoll_object(provider: u16, object_id: u64) -> Result<(), i64> {
-    purge_vfs_epoll_object_with_timeout(provider, object_id, None)
+    purge_vfs_epoll_object_bounded(provider, object_id)
 }
 
 pub fn purge_vfs_epoll_object_bounded(provider: u16, object_id: u64) -> Result<(), i64> {
@@ -904,7 +1170,9 @@ fn purge_vfs_epoll_object_with_timeout(
 #[cfg(test)]
 mod tests {
     use super::{
-        PollReadinessState, note_poll_observation, sanitize_wait_signal_mask,
+        EpollTargetGuard, PollReadinessState, acquire_epoll_target_guard, console_ready_events,
+        epoll_ctl_requires_live_provider_epoch, linux_abi, multitask, note_poll_observation,
+        provider_revoke_events, require_completed_provider_scan, sanitize_wait_signal_mask,
         waitset_provider_query_timeout_ms_from_ticks,
     };
     use alloc::vec::Vec;
@@ -912,9 +1180,41 @@ mod tests {
     use rustos_user_abi::syscall::{WAITSET_PROVIDER_INPUTD, WAITSET_PROVIDER_NETD};
 
     #[test]
+    fn console_output_is_writable_only_while_its_session_is_live() {
+        assert_eq!(
+            console_ready_events(
+                multitask::ConsoleStreamKind::Output,
+                true,
+                false,
+                linux_abi::POLLOUT as u32,
+            ),
+            linux_abi::POLLOUT as u32
+        );
+        assert_eq!(
+            console_ready_events(
+                multitask::ConsoleStreamKind::Error,
+                false,
+                false,
+                linux_abi::POLLHUP as u32,
+            ),
+            linux_abi::POLLHUP as u32
+        );
+        assert_eq!(
+            console_ready_events(
+                multitask::ConsoleStreamKind::Input,
+                true,
+                false,
+                linux_abi::POLLIN as u32,
+            ),
+            0
+        );
+    }
+
+    #[test]
     fn provider_observations_are_deduplicated_and_keep_the_newest_generation() {
         let mut state = PollReadinessState {
             ready: 0,
+            provider_timed_out: false,
             observations: Vec::new(),
         };
         note_poll_observation(&mut state, WAITSET_PROVIDER_NETD, 7);
@@ -953,5 +1253,59 @@ mod tests {
             waitset_provider_query_timeout_ms_from_ticks(10, 11, 100),
             10
         );
+    }
+
+    #[test]
+    fn provider_timeout_never_hides_readiness_found_earlier_in_the_scan() {
+        assert_eq!(require_completed_provider_scan(true, true), Ok(()));
+        assert_eq!(require_completed_provider_scan(false, false), Ok(()));
+        assert_eq!(
+            require_completed_provider_scan(true, false),
+            Err(super::LINUX_ETIMEDOUT)
+        );
+    }
+
+    #[test]
+    fn provider_revoke_is_reported_per_fd_as_error_and_hup() {
+        let expected = linux_abi::POLLERR as u32 | linux_abi::POLLHUP as u32;
+        for errno in [
+            super::LINUX_EBADF,
+            super::LINUX_ENODEV,
+            super::LINUX_EPIPE,
+            super::LINUX_ENOSYS,
+        ] {
+            assert_eq!(provider_revoke_events(errno), Some(expected));
+        }
+        assert_eq!(provider_revoke_events(super::LINUX_EIO), None);
+        assert_eq!(provider_revoke_events(super::LINUX_ETIMEDOUT), None);
+    }
+
+    #[test]
+    fn epoll_delete_does_not_require_a_live_provider_epoch() {
+        assert!(epoll_ctl_requires_live_provider_epoch(
+            linux_abi::EPOLL_CTL_ADD
+        ));
+        assert!(epoll_ctl_requires_live_provider_epoch(
+            linux_abi::EPOLL_CTL_MOD
+        ));
+        assert!(!epoll_ctl_requires_live_provider_epoch(
+            linux_abi::EPOLL_CTL_DEL
+        ));
+    }
+
+    #[test]
+    fn epoll_ctl_guard_pins_console_across_concurrent_final_close() {
+        let console = multitask::ConsoleHandle::new(multitask::ConsoleStreamKind::Input);
+        let token = console.token_id();
+        let guard = acquire_epoll_target_guard(&multitask::KernelHandle::Console(console.clone()))
+            .expect("live console target");
+
+        assert!(!console.release_descriptor_reference());
+        assert!(multitask::ConsoleHandle::token_is_live(token));
+        let EpollTargetGuard::Console(pinned) = guard else {
+            panic!("console target must use a console guard");
+        };
+        assert!(pinned.release_descriptor_reference());
+        assert!(!multitask::ConsoleHandle::token_is_live(token));
     }
 }

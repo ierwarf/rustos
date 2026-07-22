@@ -7,6 +7,8 @@ use super::*;
 mod device_broker_ops;
 #[path = "driver_broker_ops.rs"]
 mod driver_broker_ops;
+#[path = "entropy_broker_ops.rs"]
+mod entropy_broker_ops;
 #[path = "input_broker_ops.rs"]
 mod input_broker_ops;
 #[path = "lifecycle_broker_ops.rs"]
@@ -20,6 +22,7 @@ pub(crate) mod waitset_broker_ops;
 
 use device_broker_ops::*;
 use driver_broker_ops::*;
+use entropy_broker_ops::*;
 use input_broker_ops::*;
 use lifecycle_broker_ops::*;
 use net_broker_ops::*;
@@ -43,6 +46,7 @@ pub(super) fn is_linux_rustos_broker_syscall(syscall_number: u64) -> bool {
             | linux_abi::SYS_RUSTOS_ROOTD_WAIT_BROKER
             | linux_abi::SYS_RUSTOS_ROOTD_TERMINATE_BROKER
             | linux_abi::SYS_RUSTOS_WAITSET_SIGNAL_BROKER
+            | linux_abi::SYS_RUSTOS_ENTROPY_BROKER
     )
 }
 
@@ -79,6 +83,9 @@ pub(super) fn dispatch_linux_rustos_broker_syscall(frame: &SyscallFrame) -> u64 
         }
         linux_abi::SYS_RUSTOS_WAITSET_SIGNAL_BROKER => {
             syscall_linux_rustos_waitset_signal_broker(frame.rdi)
+        }
+        linux_abi::SYS_RUSTOS_ENTROPY_BROKER => {
+            syscall_linux_rustos_entropy_broker(frame.rdi, frame.rsi)
         }
         _ => linux_errno(LINUX_ENOSYS),
     }

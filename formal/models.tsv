@@ -50,6 +50,7 @@ network-payload-session/NetworkPayloadSession	safety	intentional-terminal	payloa
 page-table-lifecycle/PageTableLifecycle	safety	intentional-terminal	mapping lifecycle may complete	120	900	exhaustive	no	no	no
 persistent-mutation-admission/PersistentMutationAdmission	safety	intentional-terminal	mutation admission decision is terminal	30	120	exhaustive	no	no	no
 post-init-leases/PostInitLeases	safety	intentional-terminal	service lease may terminate	120	900	exhaustive	no	no	no
+service-mutation-recovery/ServiceMutationRecovery	safety	intentional-terminal	bounded mutation sequence may terminate	120	900	exhaustive	no	no	no
 post-init-supervisor-recovery/PostInitSupervisorRecovery	temporal	intentional-terminal	recovery outcome may terminate	120	900	exhaustive	no	no	no
 proc-broker-session/ProcBrokerSession	safety	intentional-terminal	prepare session outcome is terminal	120	900	exhaustive	no	no	no
 process-address-space-lifetime/ProcessAddressSpaceLifetime	temporal	intentional-terminal	process state may exit and reclaim	30	120	exhaustive	no	no	no

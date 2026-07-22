@@ -93,7 +93,7 @@ and counterexamples are retained under `build/formal/`.
 | endpoint-publication/EndpointPublication | kernel compat IPC registry, process-table exit marker | writers and reader snapshots share one registry critical section; an exit marker aborts in-flight publication; lookup/capability authority needs one exact running-owner generation; cleanup leaves no terminal authority |
 | deferred-start/DeferredStart | loaderd, rootd, initd, runtimed | suspended child is inert; only its designated supervisor admits it; activation is single-use; endpoint follows activation; activation/timeout failure retires the exact child or stops the unhealthy supervisor before another launch |
 | post-init-leases/PostInitLeases | rootd post-init readiness and restart policy | only initd or the live sessiond/runtimed service may report its child; capability and lookup authority require a complete live reporter chain; reporter exit revokes the bounded descendant closure in the same rootd turn; a foreign live-lease rebind preserves PID/reporter/capability; exact PID idempotency; no capability before report; restart budget never underflows |
-| rootd-restart-backoff/RootdRestartBackoff | rootd core-service recovery, lifecycle fan-out, and timer substrate | exit revokes old authority; external time cannot be starved by unrelated lifecycle work and every pending restart eventually settles or fails the supervisor closed; activation failure retires the exact suspended child before another retry; rootd and procd drain independent bounded queues; root evidence overflow is terminal while policy overflow clears its cache before rebase; retry budget is finite and monotonic |
+| rootd-restart-backoff/RootdRestartBackoff | rootd core-service recovery, lifecycle fan-out, and timer substrate | exit revokes old authority; external time cannot be starved by unrelated lifecycle work and every pending restart eventually settles or fails the supervisor closed; activation failure retires the exact suspended child before another retry; rootd, procd, and syscalld drain independent bounded queues without cross-service lookup; root evidence overflow is terminal while each policy overflow clears only its owning cache before rebase; retry budget is finite and monotonic |
 | post-init-supervisor-recovery/PostInitSupervisorRecovery | rootd/initd post-init recovery and dependent UI revocation | normal initd exit revokes the complete reporter closure before replacement; a defensive recovery cut adopts only an exact ready endpoint; external monotonic time cannot be starved by repeated sibling recovery, every imported recovery eventually adopts or reclaims, and reclaim clears all process/endpoint authority while cascading from sessiond to uiserver |
 | dvm-control-relay/DvmControlRelay | L0 hostd, Linux DVM agent, RDI3 input receiver | launch-bound CID and exact HELLO issue a fresh challenge; only its HMAC proof permits WELCOME; allowlisted probes, stale/mismatched replies, and replay fail closed; a completed probe gates a fresh relay epoch |
 | dvm-control-endpoint/DvmControlEndpoint | L0 hostd/xtask, Linux DVM agent | only the root-only launch-secret holder derives the per-launch vsock listener port; a same-CID untrusted process cannot reserve setup; a reached endpoint still requires the separate HMAC proof |
@@ -104,7 +104,8 @@ and counterexamples are retained under `build/formal/`.
 | dvm-input-ring/DvmInputRing | L0 producer, fixed ivshmem ring, RustOS MSI-X leaf, inputd broker | only L0 advances producer and only the broker advances consumer; 2,048 fixed 32-byte slots retain cleanup reserve; continuous production requires both an armed vector and a successful policy-backed client poll; DVM tamper attempts cannot mutate the ring; IRQ only wakes; malformed/stale records cannot reach inputd; revoke clears transport/consumer readiness and decoder authority; a boot-wide bounded recovery budget reuses one pinned vector; fairness drains or revokes finite committed work |
 | trusted-ui-boundary/TrustedUiBoundary | DVM display/input provenance, GUI backend, uiserver trusted-UI status | a privileged prompt requires independently attested scanout and human input; DVM compromise, provider loss, or independent-attestation revocation cancels it; a DVM transport may never self-attest |
 | input-readiness/InputReadiness | ring0 ingress queue, finite poll substrate, inputd worker, uiserver reader | the MSI-X worker, bounded STATS readiness recheck, and readiness-gated read are explicit transfer races; every record has exactly one ring0, policy, or delivered owner and service policy drains under consumer fairness |
-| userspace-wait-set/UserspaceWaitSet | vfsd epoll registry, syscall-scoped poll sets, netd/inputd readiness providers, compat wait-token and deadline substrate | each poll/epoll wait registers exact observed generations, rechecks providers while runnable, arms the scheduler, and verifies waiter presence before commit; readiness is re-queried before return and each service query is bounded by the application deadline; timeout, unmasked-signal interruption, revoke, dup/fork/close/exec, and last-reference retirement settle without a lost wake or stale provider authority |
+| userspace-wait-set/UserspaceWaitSet | vfsd epoll registry, syscall-scoped poll sets, netd/inputd/sessiond readiness providers, compat wait-token and deadline substrate | each poll/epoll wait registers exact observed generations, rechecks providers while runnable, arms the scheduler, and verifies waiter presence before commit; readiness is re-queried before return and each service query is bounded by the application deadline; registration identity excludes provider epoch so MOD can rebind after downstream-provider restart without duplicate/undeletable interests; timeout, unmasked-signal interruption, revoke, dup/fork/close/exec, and last-reference retirement settle without a lost wake; vfsd restart composition is covered by `service-mutation-recovery` and still requires runtime crash injection |
+| service-mutation-recovery/ServiceMutationRecovery | rootd-retained vfsd checkpoint, netd replay ledger, compat reconciliation queues | unique operation IDs advance one revision at most once; committed state survives service crash; replacement endpoints publish only after local state equals the retained checkpoint; an unresolved commit remains explicit until reply/reconciliation |
 | input-ingestion-worker/InputIngestionWorker | ring0 DVM input wake leaf and inputd ingestion worker | only the capability-gated worker may claim policy-consumer readiness or advance committed records; wake/arm races are cursor-rechecked, every turn is bounded, and finite work eventually drains without granting drain authority to client poll |
 | ui-frame-budget/UiFrameBudget | uiserver input loop, console-command worker, frame/present loop | console-policy IPC has bounded FIFO admission and one delivery owner; overload is recorded; an in-flight policy call cannot make local redraw debt wait; active-input feedback is eventually presented |
 | wayland-accept-isolation/WaylandAcceptIsolation | uiserver bounded accept worker and netd-backed socket path | a stalled cross-service accept never owns the UI tick; accepted streams cross one bounded completion queue, overload closes the new client, and queued clients eventually settle under the declared worker/UI fairness |
@@ -231,20 +232,46 @@ input-stream gate.
 
 `userspace-wait-set` is the cross-provider availability and lifetime boundary.
 vfsd owns persistent epoll membership, compat builds bounded transient poll
-sets, and netd/inputd own readiness truth and generations. Ring0 stores only
+sets, and netd/inputd/sessiond own readiness truth and generations. Registration
+identity combines the target fd with its stable provider object, matching the
+Linux fd/open-description pair; its observed endpoint epoch is mutable state
+that only explicit MOD may replace after restart. DEL uses the stable identity
+and remains available without a live provider epoch. Ring0 stores only
 bounded task wait tokens, validates the exact live
 service endpoint epoch, supplies deadline wakeup, and re-queries provider state
-before returning an event. A provider restart or last reference close wakes and
-revokes a pending wait instead of allowing numeric-token reuse to revive stale
-authority. ppoll/epoll_pwait temporarily replace the calling thread's signal
+before returning an event. Waiter capacity is derived from the scheduler task
+ceiling times the provider ceiling, covering every task/provider pair. A
+provider restart or last reference close wakes and
+revokes a pending wait; the affected interest reports per-fd `ERR|HUP` while
+unrelated readiness remains visible, instead of allowing numeric-token reuse or
+aborting the aggregate wait. ppoll/epoll_pwait temporarily replace the calling thread's signal
 mask around that wait and treat unmasked delivery as interruption. The finite
 model includes the check-to-arm race, signal/timeout race,
-provider restart/recovery, and dup/fork/close/exec reference changes.
+provider restart/recovery, dup/fork/close/exec reference changes, terminal
+console-session close without stale-operation resurrection, console output/HUP
+readiness, and nonblocking empty-read termination.
+Concrete dup/fcntl uses token snapshot, provider-ref acquisition, locked token
+recheck, and exact replaced-handle return as one two-phase linearization.
+Fork acquires provider refs from the same frozen child fd-table clone it will
+publish, while exec cleanup consumes only the exact handles returned by its
+atomic CLOEXEC commit. EPOLL_CTL_ADD/MOD pins the target description through
+the vfsd mutation and applies ordinary last-close purge when that guard is the
+final reference.
 The concrete check-to-arm refinement keeps service IPC outside the scheduler
 arm: it registers observations, rechecks providers, arms, then tests that the
 same waiter records remain. Each provider query is capped by both 16 ms and the
 remaining syscall deadline; `ipc-reply-deadline` supplies the compositional
-bounded-call guarantee below this model.
+bounded-call guarantee below this model. An internal query timeout cannot hide
+readiness already found in the scan and otherwise retries under the original
+application deadline rather than escaping as an early `ETIMEDOUT`.
+`service-mutation-recovery` composes with this model for provider mutations.
+Kernel-minted operation IDs, netd's ACK-retained replay ledger, compat's bounded
+reconciliation queue, and rootd's authenticated vfsd checkpoint close the
+former uncertain-outcome mechanism at source/model level. Vfsd replays epoll
+state before endpoint publication, and object admission combines boot-entropy
+capabilities, kernel-stamped senders, and rootd dependency edges. Runtime
+service-crash injection remains an acceptance gate; source/model success is not
+reported as that missing runtime evidence.
 
 `ui-frame-budget` begins after that input ownership transfer. Keyboard routing
 and console focus updates cross the `uiserver -> devmgrd -> runtimed` policy

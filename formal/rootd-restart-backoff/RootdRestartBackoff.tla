@@ -15,11 +15,11 @@ one rootd-capability-gated bounded wait. The model includes an observed exit,
 the mandatory deferred-restart state, success/failure of a later launch, and
 authority publication. The lifecycle evidence slice additionally models the
 bounded append-only exit queue, exclusive drain snapshot, partial copyout,
-commit, and sticky overflow paths. Rootd and procd receive independent fan-out
-queues: draining process-policy evidence cannot consume supervisor evidence,
-and process-policy overflow clears its cached authority before rebasing. It
-abstracts loader protocol bytes, individual queue order, and scheduler time
-granularity.
+commit, and sticky overflow paths. Rootd, procd, and syscalld receive
+independent fan-out queues: draining either policy queue cannot consume
+supervisor evidence, and policy overflow clears the owning service's cached
+authority before rebasing. It abstracts loader protocol bytes, individual
+queue order, and scheduler time granularity.
 *******************************************************************************)
 
 CONSTANTS Services, MaxRestarts, Backoff, MaxTick, LifecycleEvents
@@ -39,16 +39,17 @@ DrainStates == {DrainIdle, DrainSnapshotted, DrainEventsCopied, DrainCountCopied
 VARIABLES state, budget, published, retryAfter, clock, attempts,
           failedActivationChild, supervisorHealthy, lifecycleEvidenceComplete,
           lifecycleQueue, drainSnapshot, drainStage, policyLifecycleQueue,
-          policyCacheAuthoritative, recordedLifecycleEvidence,
-          rootConsumedEvidence
+          policyCacheAuthoritative, syscallLifecycleQueue,
+          syscallCacheAuthoritative, recordedLifecycleEvidence, rootConsumedEvidence
 
 vars == <<state, budget, published, retryAfter, clock, attempts,
           failedActivationChild, supervisorHealthy, lifecycleEvidenceComplete,
           lifecycleQueue, drainSnapshot, drainStage, policyLifecycleQueue,
-          policyCacheAuthoritative, recordedLifecycleEvidence,
-          rootConsumedEvidence>>
+          policyCacheAuthoritative, syscallLifecycleQueue,
+          syscallCacheAuthoritative, recordedLifecycleEvidence, rootConsumedEvidence>>
 
-policyEvidenceVars == <<policyLifecycleQueue, policyCacheAuthoritative>>
+policyEvidenceVars == <<policyLifecycleQueue, policyCacheAuthoritative,
+                        syscallLifecycleQueue, syscallCacheAuthoritative>>
 rootEvidenceHistoryVars == <<recordedLifecycleEvidence, rootConsumedEvidence>>
 
 Init ==
@@ -66,6 +67,8 @@ Init ==
     /\ drainStage = DrainIdle
     /\ policyLifecycleQueue = {}
     /\ policyCacheAuthoritative = TRUE
+    /\ syscallLifecycleQueue = {}
+    /\ syscallCacheAuthoritative = TRUE
     /\ recordedLifecycleEvidence = {}
     /\ rootConsumedEvidence = {}
 
@@ -222,10 +225,12 @@ RecordLifecycleEvidence(event) ==
     /\ event \in LifecycleEvents \ recordedLifecycleEvidence
     /\ lifecycleQueue' = lifecycleQueue \cup {event}
     /\ policyLifecycleQueue' = policyLifecycleQueue \cup {event}
+    /\ syscallLifecycleQueue' = syscallLifecycleQueue \cup {event}
     /\ recordedLifecycleEvidence' = recordedLifecycleEvidence \cup {event}
     /\ UNCHANGED <<state, budget, published, retryAfter, clock, attempts,
                   failedActivationChild, supervisorHealthy, lifecycleEvidenceComplete,
                   drainSnapshot, drainStage, policyCacheAuthoritative,
+                  syscallCacheAuthoritative,
                   rootConsumedEvidence>>
 
 BeginLifecycleDrain ==
@@ -299,14 +304,15 @@ LifecycleEvidenceOverflows ==
     /\ UNCHANGED rootEvidenceHistoryVars
 
 \* procd owns a separate fan-out queue. Its successful drain cannot consume
-\* rootd evidence. If only this queue overflows, procd clears every cached
-\* process/thread policy and rebases this queue without weakening rootd.
+\* rootd or syscalld evidence. If only this queue overflows, procd clears every
+\* cached process/thread policy and rebases this queue without weakening rootd.
 CommitPolicyLifecycleDrain ==
     /\ policyLifecycleQueue # {}
     /\ policyLifecycleQueue' = {}
     /\ UNCHANGED <<state, budget, published, retryAfter, clock, attempts,
                   failedActivationChild, supervisorHealthy, lifecycleEvidenceComplete,
-                  lifecycleQueue, drainSnapshot, drainStage, policyCacheAuthoritative>>
+                  lifecycleQueue, drainSnapshot, drainStage, policyCacheAuthoritative,
+                  syscallLifecycleQueue, syscallCacheAuthoritative>>
     /\ UNCHANGED rootEvidenceHistoryVars
 
 PolicyLifecycleOverflowRebases ==
@@ -315,7 +321,30 @@ PolicyLifecycleOverflowRebases ==
     /\ policyCacheAuthoritative' = FALSE
     /\ UNCHANGED <<state, budget, published, retryAfter, clock, attempts,
                   failedActivationChild, supervisorHealthy, lifecycleEvidenceComplete,
-                  lifecycleQueue, drainSnapshot, drainStage>>
+                  lifecycleQueue, drainSnapshot, drainStage,
+                  syscallLifecycleQueue, syscallCacheAuthoritative>>
+    /\ UNCHANGED rootEvidenceHistoryVars
+
+\* syscalld independently consumes the same exit evidence before interpreting
+\* its next request. Overflow revokes every cached credential/MM policy before
+\* the private queue is rebased and never consumes rootd or procd evidence.
+CommitSyscallLifecycleDrain ==
+    /\ syscallLifecycleQueue # {}
+    /\ syscallLifecycleQueue' = {}
+    /\ UNCHANGED <<state, budget, published, retryAfter, clock, attempts,
+                  failedActivationChild, supervisorHealthy, lifecycleEvidenceComplete,
+                  lifecycleQueue, drainSnapshot, drainStage, policyLifecycleQueue,
+                  policyCacheAuthoritative, syscallCacheAuthoritative>>
+    /\ UNCHANGED rootEvidenceHistoryVars
+
+SyscallLifecycleOverflowRebases ==
+    /\ syscallLifecycleQueue = LifecycleEvents
+    /\ syscallLifecycleQueue' = {}
+    /\ syscallCacheAuthoritative' = FALSE
+    /\ UNCHANGED <<state, budget, published, retryAfter, clock, attempts,
+                  failedActivationChild, supervisorHealthy, lifecycleEvidenceComplete,
+                  lifecycleQueue, drainSnapshot, drainStage, policyLifecycleQueue,
+                  policyCacheAuthoritative>>
     /\ UNCHANGED rootEvidenceHistoryVars
 
 Next ==
@@ -336,6 +365,8 @@ Next ==
     \/ LifecycleEvidenceOverflows
     \/ CommitPolicyLifecycleDrain
     \/ PolicyLifecycleOverflowRebases
+    \/ CommitSyscallLifecycleDrain
+    \/ SyscallLifecycleOverflowRebases
 
 TypeOK ==
     /\ state \in [Services -> LeaseStates]
@@ -352,6 +383,8 @@ TypeOK ==
     /\ drainStage \in DrainStates
     /\ policyLifecycleQueue \subseteq LifecycleEvents
     /\ policyCacheAuthoritative \in BOOLEAN
+    /\ syscallLifecycleQueue \subseteq LifecycleEvents
+    /\ syscallCacheAuthoritative \in BOOLEAN
     /\ recordedLifecycleEvidence \subseteq LifecycleEvents
     /\ rootConsumedEvidence \subseteq LifecycleEvents
 
@@ -393,6 +426,10 @@ RootLifecycleEvidenceIsNeverLost ==
 
 PolicyRebaseCannotConsumeRootEvidence ==
     ~policyCacheAuthoritative =>
+        recordedLifecycleEvidence = lifecycleQueue \cup rootConsumedEvidence
+
+SyscallRebaseCannotConsumeRootEvidence ==
+    ~syscallCacheAuthoritative =>
         recordedLifecycleEvidence = lifecycleQueue \cup rootConsumedEvidence
 
 PendingRestartEventuallySettles ==

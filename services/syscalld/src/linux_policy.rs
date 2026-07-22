@@ -1,7 +1,6 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::mem::size_of;
-use core::sync::atomic::{AtomicU64, Ordering};
 
 use rustos_user_abi::syscall::{
     LinuxRlimit, LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse, LinuxTimespecWire,
@@ -12,7 +11,8 @@ use rustos_user_abi::syscall::{
     MM_BROKER_OP_DESCRIBE_FD, MM_BROKER_OP_MAP_ANON, MM_BROKER_OP_MAP_DEVICE_SHARED,
     MM_BROKER_OP_MAP_FILE_PRIVATE, MM_BROKER_OP_MAP_MEMFD_SHARED, MM_BROKER_OP_PROTECT,
     MM_BROKER_OP_QUERY_LAYOUT, MM_BROKER_OP_UNMAP, PROC_BROKER_USER_SPACE_BASE,
-    PROC_BROKER_USER_SPACE_END_EXCLUSIVE, SYSCALL_OFFLOAD_PAYLOAD_CAPACITY, SYS_RUSTOS_MM_BROKER,
+    PROC_BROKER_USER_SPACE_END_EXCLUSIVE, SYSCALL_OFFLOAD_PAYLOAD_CAPACITY,
+    SYS_RUSTOS_ENTROPY_BROKER, SYS_RUSTOS_MM_BROKER,
 };
 use spin::Mutex;
 
@@ -22,6 +22,7 @@ const DEFAULT_UMASK: u32 = 0o022;
 const GETRANDOM_MAX_BYTES: u32 = (SYSCALL_OFFLOAD_PAYLOAD_CAPACITY as u32) & !3;
 const GETRANDOM_FLAG_NONBLOCK: u64 = 0x0001;
 const GETRANDOM_FLAG_RANDOM: u64 = 0x0002;
+const GETRANDOM_FLAG_INSECURE: u64 = 0x0004;
 const FUTEX_WAIT: u64 = 0;
 const FUTEX_WAKE: u64 = 1;
 const FUTEX_REQUEUE: u64 = 3;
@@ -474,7 +475,11 @@ pub(crate) fn handle_getrandom(
     request: &LinuxSyscallOffloadRequest,
     response: &mut LinuxSyscallOffloadResponse,
 ) {
-    if request.arg0 & !(GETRANDOM_FLAG_NONBLOCK | GETRANDOM_FLAG_RANDOM) != 0 {
+    let allowed = GETRANDOM_FLAG_NONBLOCK | GETRANDOM_FLAG_RANDOM | GETRANDOM_FLAG_INSECURE;
+    if request.arg0 & !allowed != 0
+        || request.arg0 & (GETRANDOM_FLAG_RANDOM | GETRANDOM_FLAG_INSECURE)
+            == GETRANDOM_FLAG_RANDOM | GETRANDOM_FLAG_INSECURE
+    {
         response.status = errno::EINVAL;
         return;
     }
@@ -485,7 +490,22 @@ pub(crate) fn handle_getrandom(
         return;
     }
     let len = requested_len.min(GETRANDOM_MAX_BYTES) as usize;
-    fill_random_bytes(&mut response.payload[..len], request.pid, request.tid);
+    let result = unsafe {
+        rustos_svc_runtime::syscall::syscall2(
+            SYS_RUSTOS_ENTROPY_BROKER,
+            response.payload.as_mut_ptr() as u64,
+            len as u64,
+        )
+    };
+    if result != len as i64 {
+        response.status = if result < 0 {
+            i32::try_from(-result).unwrap_or(errno::EINVAL)
+        } else {
+            errno::EINVAL
+        };
+        response.payload_len = 0;
+        return;
+    }
     response.status = 0;
     response.payload_len = len as u32;
 }
@@ -611,27 +631,6 @@ pub(crate) fn handle_arch_prctl_policy(
         _ => response.status = errno::EINVAL,
     }
     response.payload_len = 0;
-}
-
-fn fill_random_bytes(dest: &mut [u8], pid: u64, tid: u64) {
-    static COUNTER: AtomicU64 = AtomicU64::new(0x9E37_79B9_7F4A_7C15);
-    let mut state = COUNTER.fetch_add(0xA076_1D64_78BD_642F, Ordering::Relaxed)
-        ^ pid.wrapping_mul(0xBF58_476D_1CE4_E5B9)
-        ^ tid.wrapping_mul(0x94D0_49BB_1331_11EB);
-    for chunk in dest.chunks_mut(8) {
-        state = splitmix64(state);
-        let bytes = state.to_le_bytes();
-        for (dst, src) in chunk.iter_mut().zip(bytes.iter()) {
-            *dst = *src;
-        }
-    }
-}
-
-fn splitmix64(mut z: u64) -> u64 {
-    z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
 }
 
 fn read_u64(bytes: &[u8], offset: usize) -> u64 {
@@ -1242,10 +1241,14 @@ fn mm_broker_call(args: &RustosMmBrokerArgs) -> Result<(), i32> {
     }
 }
 
-pub(crate) fn handle_process_exit(request: &LinuxSyscallOffloadRequest) {
-    let dead_pid = request.pid;
+pub(crate) fn handle_process_exit_pid(dead_pid: u64) {
     PROCESS_POLICY.lock().remove(&dead_pid);
     MM_POLICY.lock().remove(&dead_pid);
+}
+
+pub(crate) fn clear_process_policy() {
+    PROCESS_POLICY.lock().clear();
+    MM_POLICY.lock().clear();
 }
 
 fn mmap_offset(request: &LinuxSyscallOffloadRequest) -> u64 {
@@ -1517,6 +1520,21 @@ mod tests {
         let mut response = LinuxSyscallOffloadResponse::default();
         handle_getrandom(&request, &mut response);
         assert_eq!(response.status, errno::EINVAL);
+
+        let request = LinuxSyscallOffloadRequest {
+            arg0: GETRANDOM_FLAG_RANDOM | GETRANDOM_FLAG_INSECURE,
+            ..LinuxSyscallOffloadRequest::default()
+        };
+        handle_getrandom(&request, &mut response);
+        assert_eq!(response.status, errno::EINVAL);
+
+        let request = LinuxSyscallOffloadRequest {
+            arg0: GETRANDOM_FLAG_INSECURE,
+            ..LinuxSyscallOffloadRequest::default()
+        };
+        handle_getrandom(&request, &mut response);
+        assert_eq!(response.status, 0);
+        assert_eq!(response.payload_len, 0);
     }
 
     fn write_timespec(request: &mut LinuxSyscallOffloadRequest, ts: LinuxTimespecWire) {

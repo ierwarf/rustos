@@ -18,7 +18,7 @@ use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_NETD_OP_PACKET_LEASE, COMMERCIAL_MAX_NETD_OP_ROUTE_POLICY,
     COMMERCIAL_MAX_NETD_OP_SOCKET_NAMESPACE, COMMERCIAL_MAX_NETD_OP_SOCKET_OPTIONS,
     COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS,
-    COMMERCIAL_MAX_PROTOCOL_NETD, IPC_SERVICE_NETD, NETD_IPC_ABI_VERSION,
+    COMMERCIAL_MAX_PROTOCOL_NETD, IPC_SERVICE_NETD, NETD_IPC_ABI_VERSION, NETD_IPC_OP_REF_ACK,
     NETD_IPC_REQUEST_HEADER_SIZE, NETD_IPC_RESPONSE_FLAG_LATENCY_HANDOFF,
     NETD_IPC_RESPONSE_HEADER_SIZE, NETD_POLL_MODE_QUERY, NETD_POLL_MODE_WAIT,
     NETD_RECVMSG_PAYLOAD_HEADER_SIZE, NETD_SENDMSG_PAYLOAD_HEADER_SIZE, NET_BROKER_OP_PACKET_RX,
@@ -34,13 +34,13 @@ use rustos_user_abi::syscall::{
     SYSCALL_OFFLOAD_OP_LINUX_SENDTO, SYSCALL_OFFLOAD_OP_LINUX_SETSOCKOPT,
     SYSCALL_OFFLOAD_OP_LINUX_SHUTDOWN, SYSCALL_OFFLOAD_OP_LINUX_SOCKET,
     SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR, SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
-    SYS_RUSTOS_IPC_RECV, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
-    SYS_RUSTOS_NET_BROKER,
+    SYS_RUSTOS_IPC_RECV_WITH_SENDER, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT,
+    SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_NET_BROKER,
 };
 #[cfg(not(test))]
 use rustos_user_abi::syscall::{
-    WaitSetSignalBrokerArgs, SYS_RUSTOS_WAITSET_SIGNAL_BROKER, WAITSET_ABI_VERSION,
-    WAITSET_GLOBAL_OBJECT_ID, WAITSET_PROVIDER_NETD,
+    WaitSetSignalBrokerArgs, SYS_RUSTOS_ENTROPY_BROKER, SYS_RUSTOS_WAITSET_SIGNAL_BROKER,
+    WAITSET_ABI_VERSION, WAITSET_GLOBAL_OBJECT_ID, WAITSET_PROVIDER_NETD,
 };
 use smoltcp::iface::{
     Config as SmolConfig, Interface, PollIngressSingleResult, PollResult, SocketHandle, SocketSet,
@@ -58,10 +58,27 @@ const RECV_BACKOFF: Duration = Duration::from_millis(1);
 const NETD_REQUEST_WORKERS: usize = 4;
 const BLOCKING_WORKER_COUNT: usize = 8;
 const MAX_PENDING_BLOCKING_REQUESTS: usize = 32;
+const REF_REPLAY_CAPACITY: usize = 4096;
 static PENDING_BLOCKING_REQUESTS: AtomicUsize = AtomicUsize::new(0);
 static PENDING_LOCAL_POLLS: AtomicUsize = AtomicUsize::new(0);
 static ACTIVE_BLOCKING_WORKERS: AtomicUsize = AtomicUsize::new(0);
 static READINESS_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy)]
+struct RefReplayEntry {
+    operation_hi: u64,
+    operation_lo: u64,
+    op: u16,
+    socket_token: u64,
+    status: i32,
+    value: u64,
+    complete: bool,
+}
+
+fn ref_replay_log() -> &'static Mutex<VecDeque<RefReplayEntry>> {
+    static LOG: OnceLock<Mutex<VecDeque<RefReplayEntry>>> = OnceLock::new();
+    LOG.get_or_init(|| Mutex::new(VecDeque::with_capacity(REF_REPLAY_CAPACITY)))
+}
 const MAX_LISTEN_BACKLOG: usize = 128;
 const SOCKET_BUFFER_CAPACITY: usize = 1024 * 1024;
 const SOCKET_CONTROL_BUFFER_CAPACITY: usize = 64 * 1024;
@@ -164,12 +181,16 @@ fn serve_request_loop(endpoint: u64) {
         service_local_poll_waiters();
         let mut request = NetdIpcRequest::default();
         let mut reply_cap = 0_u64;
-        let received = syscall4(
-            SYS_RUSTOS_IPC_RECV,
+        let mut sender_pid = 0_u64;
+        let mut sender_tid = 0_u64;
+        let received = syscall6(
+            SYS_RUSTOS_IPC_RECV_WITH_SENDER,
             endpoint,
             (&mut request as *mut NetdIpcRequest) as u64,
             size_of::<NetdIpcRequest>() as u64,
             (&mut reply_cap as *mut u64) as u64,
+            (&mut sender_pid as *mut u64) as u64,
+            (&mut sender_tid as *mut u64) as u64,
         );
         if received < 0 {
             thread::sleep(RECV_BACKOFF);
@@ -187,7 +208,13 @@ fn serve_request_loop(endpoint: u64) {
             if commercial_request.header.version == COMMERCIAL_MAX_PROTOCOL_ABI_VERSION
                 && commercial_request.header.protocol == COMMERCIAL_MAX_PROTOCOL_NETD
             {
-                let reply = reply_commercial_request(reply_cap, commercial_request);
+                let reply = if commercial_request.header.subject_pid == sender_pid
+                    && commercial_request.header.subject_tid == sender_tid
+                {
+                    reply_commercial_request(reply_cap, commercial_request)
+                } else {
+                    reply_commercial_error(reply_cap, commercial_request, libc::EACCES)
+                };
                 if reply < 0 {
                     let _ = writeln!(std::io::stderr(), "netd: reply failed errno={}", -reply);
                 }
@@ -201,6 +228,7 @@ fn serve_request_loop(endpoint: u64) {
             ..NetdIpcResponse::default()
         };
         response.status = match validate_request(received as usize, &request) {
+            Ok(()) if request.pid != sender_pid || request.tid != sender_tid => libc::EACCES,
             Ok(()) if is_deferred_local_poll_request(&request) => {
                 let status = handle_poll_socket(&request, &mut response);
                 if status == 0 && response.value == 0 {
@@ -559,7 +587,39 @@ fn reply_commercial_request(reply_cap: u64, request: &CommercialMaxProtocolReque
     )
 }
 
+fn reply_commercial_error(
+    reply_cap: u64,
+    request: &CommercialMaxProtocolRequest,
+    status: i32,
+) -> i64 {
+    let response = CommercialMaxProtocolResponse {
+        header: request.header,
+        status,
+        ..CommercialMaxProtocolResponse::default()
+    };
+    syscall3(
+        SYS_RUSTOS_IPC_REPLY,
+        reply_cap,
+        (&response as *const CommercialMaxProtocolResponse) as u64,
+        size_of::<CommercialMaxProtocolResponse>() as u64,
+    )
+}
+
 fn dispatch_request(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
+    if request.op == NETD_IPC_OP_REF_ACK {
+        return acknowledge_ref_result(request);
+    }
+    let replay_safe_ref = matches!(
+        request.op,
+        SYSCALL_OFFLOAD_OP_LINUX_DUP | SYSCALL_OFFLOAD_OP_LINUX_CLOSE
+    );
+    if replay_safe_ref {
+        match begin_ref_result(request, response) {
+            Ok(RefReplayAction::Replay(status)) => return status,
+            Ok(RefReplayAction::Execute) => {}
+            Err(errno) => return errno,
+        }
+    }
     let status = match request.op {
         SYSCALL_OFFLOAD_OP_LINUX_SOCKET => handle_socket(request, response),
         SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR => handle_socketpair(request, response),
@@ -586,7 +646,126 @@ fn dispatch_request(request: &NetdIpcRequest, response: &mut NetdIpcResponse) ->
     if status == 0 && request_mutates_readiness(request.op) {
         advance_readiness_generation();
     }
+    if replay_safe_ref {
+        complete_ref_result(request, response, status);
+    }
     status
+}
+
+enum RefReplayAction {
+    Execute,
+    Replay(i32),
+}
+
+fn begin_ref_result(
+    request: &NetdIpcRequest,
+    response: &mut NetdIpcResponse,
+) -> Result<RefReplayAction, i32> {
+    if request.operation_hi == 0 && request.operation_lo == 0 {
+        return Err(libc::EINVAL);
+    }
+    let mut log = ref_replay_log().lock().map_err(|_| libc::EIO)?;
+    if let Some(entry) = log.iter().find(|entry| {
+        entry.operation_hi == request.operation_hi && entry.operation_lo == request.operation_lo
+    }) {
+        if entry.op != request.op || entry.socket_token != request.socket_token {
+            return Err(libc::EPROTO);
+        }
+        if !entry.complete {
+            return Err(libc::EBUSY);
+        }
+        response.value = entry.value;
+        return Ok(RefReplayAction::Replay(entry.status));
+    }
+    if log.len() == REF_REPLAY_CAPACITY {
+        return Err(libc::ENOSPC);
+    }
+    log.push_back(RefReplayEntry {
+        operation_hi: request.operation_hi,
+        operation_lo: request.operation_lo,
+        op: request.op,
+        socket_token: request.socket_token,
+        status: libc::EINPROGRESS,
+        value: 0,
+        complete: false,
+    });
+    Ok(RefReplayAction::Execute)
+}
+
+fn complete_ref_result(request: &NetdIpcRequest, response: &NetdIpcResponse, status: i32) {
+    let Ok(mut log) = ref_replay_log().lock() else {
+        debug_line("netd: ref replay completion lock poisoned");
+        std::process::exit(134);
+    };
+    let Some(entry) = log.iter_mut().find(|entry| {
+        entry.operation_hi == request.operation_hi && entry.operation_lo == request.operation_lo
+    }) else {
+        debug_line("netd: ref replay reservation lost");
+        std::process::exit(134);
+    };
+    entry.status = status;
+    entry.value = response.value;
+    entry.complete = true;
+}
+
+fn acknowledge_ref_result(request: &NetdIpcRequest) -> i32 {
+    if request.operation_hi == 0 && request.operation_lo == 0
+        || !matches!(
+            request.arg0 as u16,
+            SYSCALL_OFFLOAD_OP_LINUX_DUP | SYSCALL_OFFLOAD_OP_LINUX_CLOSE
+        )
+    {
+        return libc::EINVAL;
+    }
+    let Ok(mut log) = ref_replay_log().lock() else {
+        return libc::EIO;
+    };
+    let Some(index) = log.iter().position(|entry| {
+        entry.operation_hi == request.operation_hi && entry.operation_lo == request.operation_lo
+    }) else {
+        return 0;
+    };
+    let entry = log[index];
+    if entry.op != request.arg0 as u16 || entry.socket_token != request.socket_token {
+        return libc::EPROTO;
+    }
+    if !entry.complete {
+        return libc::EBUSY;
+    }
+    log.remove(index);
+    0
+}
+
+#[cfg(test)]
+mod ref_replay_tests {
+    use super::*;
+
+    #[test]
+    fn close_retry_replays_exact_result_and_rejects_operation_alias() {
+        let request = NetdIpcRequest {
+            version: NETD_IPC_ABI_VERSION,
+            op: SYSCALL_OFFLOAD_OP_LINUX_CLOSE,
+            pid: 1,
+            tid: 1,
+            socket_token: u64::MAX - 7,
+            operation_hi: 0xfeed,
+            operation_lo: 0xbeef,
+            ..NetdIpcRequest::default()
+        };
+        let mut first = NetdIpcResponse::default();
+        assert_eq!(dispatch_request(&request, &mut first), libc::EBADF);
+        let mut retry = NetdIpcResponse::default();
+        assert_eq!(dispatch_request(&request, &mut retry), libc::EBADF);
+
+        let aliased = NetdIpcRequest {
+            socket_token: request.socket_token - 1,
+            ..request
+        };
+        assert_eq!(
+            dispatch_request(&aliased, &mut NetdIpcResponse::default()),
+            libc::EPROTO
+        );
+    }
 }
 
 fn request_mutates_readiness(op: u16) -> bool {
@@ -665,6 +844,14 @@ fn validate_request(received: usize, request: &NetdIpcRequest) -> Result<(), i32
     {
         return Err(libc::EINVAL);
     }
+    if matches!(
+        request.op,
+        SYSCALL_OFFLOAD_OP_LINUX_DUP | SYSCALL_OFFLOAD_OP_LINUX_CLOSE | NETD_IPC_OP_REF_ACK
+    ) && request.operation_hi == 0
+        && request.operation_lo == 0
+    {
+        return Err(libc::EINVAL);
+    }
     match request.op {
         SYSCALL_OFFLOAD_OP_LINUX_SOCKET
         | SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR
@@ -683,7 +870,8 @@ fn validate_request(received: usize, request: &NetdIpcRequest) -> Result<(), i32
         | SYSCALL_OFFLOAD_OP_LINUX_SENDMSG
         | SYSCALL_OFFLOAD_OP_LINUX_RECVMSG
         | SYSCALL_OFFLOAD_OP_LINUX_RECVFROM
-        | SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET => Ok(()),
+        | SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET
+        | NETD_IPC_OP_REF_ACK => Ok(()),
         _ => Err(libc::EINVAL),
     }
 }
@@ -764,7 +952,6 @@ impl Default for SocketOptions {
 }
 
 struct NetState {
-    next_token: u64,
     sockets: BTreeMap<u64, UnixSocket>,
     inet_sockets: BTreeMap<u64, InetSocket>,
     bindings: BTreeMap<String, u64>,
@@ -774,7 +961,6 @@ struct NetState {
 impl NetState {
     fn new() -> Self {
         Self {
-            next_token: 1,
             sockets: BTreeMap::new(),
             inet_sockets: BTreeMap::new(),
             bindings: BTreeMap::new(),
@@ -782,10 +968,8 @@ impl NetState {
         }
     }
 
-    fn allocate_token(&mut self) -> u64 {
-        let token = self.next_token.max(1);
-        self.next_token = token.saturating_add(1).max(1);
-        token
+    fn token_available(&self, token: u64) -> bool {
+        token != 0 && !self.sockets.contains_key(&token) && !self.inet_sockets.contains_key(&token)
     }
 
     fn inet_stack(&mut self) -> Result<&mut InetStack, i32> {
@@ -794,6 +978,37 @@ impl NetState {
         }
         Ok(self.inet.as_mut().unwrap())
     }
+}
+
+fn mint_socket_token() -> Result<u64, i32> {
+    for _ in 0..16 {
+        let mut token = 0_u64;
+        #[cfg(not(test))]
+        let read = syscall2(
+            SYS_RUSTOS_ENTROPY_BROKER,
+            (&mut token as *mut u64).cast::<u8>() as u64,
+            size_of::<u64>() as u64,
+        );
+        // Host tests do not implement RustOS-private syscalls. Exercise the
+        // same rejection/collision logic with the host CSPRNG, never a
+        // deterministic fallback.
+        #[cfg(test)]
+        let read = unsafe {
+            libc::syscall(
+                libc::SYS_getrandom,
+                (&mut token as *mut u64).cast::<u8>(),
+                size_of::<u64>(),
+                0,
+            )
+        };
+        if read == size_of::<u64>() as i64 && token != 0 {
+            return Ok(token);
+        }
+        if read < 0 {
+            return Err(last_errno());
+        }
+    }
+    Err(libc::EAGAIN)
 }
 
 fn net_state() -> &'static Mutex<NetState> {
@@ -960,8 +1175,14 @@ fn handle_socket(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i3
         if let Err(errno) = await_authenticated_packet_provider() {
             return errno;
         }
+        let token = match mint_socket_token() {
+            Ok(token) => token,
+            Err(errno) => return errno,
+        };
         let mut state = net_state().lock().unwrap();
-        let token = state.allocate_token();
+        if !state.token_available(token) {
+            return libc::EAGAIN;
+        }
         let tcp = match state.inet_stack() {
             Ok(stack) => stack.add_tcp_socket(),
             Err(errno) => return errno,
@@ -981,8 +1202,14 @@ fn handle_socket(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i3
         return libc::EAFNOSUPPORT;
     }
 
+    let token = match mint_socket_token() {
+        Ok(token) => token,
+        Err(errno) => return errno,
+    };
     let mut state = net_state().lock().unwrap();
-    let token = state.allocate_token();
+    if !state.token_available(token) {
+        return libc::EAGAIN;
+    }
     state.sockets.insert(
         token,
         UnixSocket {
@@ -1006,9 +1233,18 @@ fn handle_socketpair(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -
         return libc::EAFNOSUPPORT;
     }
     let credentials = request_credentials(request);
+    let left = match mint_socket_token() {
+        Ok(token) => token,
+        Err(errno) => return errno,
+    };
+    let right = match mint_socket_token() {
+        Ok(token) => token,
+        Err(errno) => return errno,
+    };
     let mut state = net_state().lock().unwrap();
-    let left = state.allocate_token();
-    let right = state.allocate_token();
+    if left == right || !state.token_available(left) || !state.token_available(right) {
+        return libc::EAGAIN;
+    }
     state.sockets.insert(
         left,
         UnixSocket {
@@ -1175,11 +1411,17 @@ fn handle_connect(request: &NetdIpcRequest) -> i32 {
         Err(errno) => return errno,
     };
     let credentials = request_credentials(request);
+    let accepted = match mint_socket_token() {
+        Ok(token) => token,
+        Err(errno) => return errno,
+    };
     let mut state = net_state().lock().unwrap();
     let Some(listener_token) = state.bindings.get(&path).copied() else {
         return libc::ENOENT;
     };
-    let accepted = state.allocate_token();
+    if !state.token_available(accepted) {
+        return libc::EAGAIN;
+    }
     let is_wayland = is_wayland_path(path.as_str());
     let Some(client) = state.sockets.get_mut(&request.socket_token) else {
         return libc::EBADF;
@@ -2345,7 +2587,7 @@ mod local_socket_poll_tests {
     }
 
     #[test]
-    fn netd_v3_rejects_the_retired_fixed_size_wire_frame() {
+    fn netd_v4_rejects_the_retired_fixed_size_wire_frame() {
         let request = NetdIpcRequest {
             version: NETD_IPC_ABI_VERSION,
             op: SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET,
@@ -2643,8 +2885,8 @@ fn syscall3(number: u64, arg0: u64, arg1: u64, arg2: u64) -> i64 {
     unsafe { libc::syscall(number as libc::c_long, arg0, arg1, arg2) as i64 }
 }
 
-fn syscall4(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> i64 {
-    unsafe { libc::syscall(number as libc::c_long, arg0, arg1, arg2, arg3) as i64 }
+fn syscall6(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i64 {
+    unsafe { libc::syscall(number as libc::c_long, arg0, arg1, arg2, arg3, arg4, arg5) as i64 }
 }
 
 fn register_service_endpoint(service_id: u64, endpoint: u64) -> i64 {

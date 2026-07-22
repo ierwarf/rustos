@@ -73,21 +73,17 @@ impl SessionRuntime {
         }
     }
 
-    fn session_mut(&mut self, session: u64) -> &mut TtySessionState {
-        self.sessions.entry(session).or_default()
-    }
-
-    fn write_to_session(&mut self, session: u64, bytes: &[u8]) -> usize {
-        let state = self.session_mut(session);
+    fn write_to_session(&mut self, session: u64, bytes: &[u8]) -> Option<usize> {
+        let state = self.sessions.get_mut(&session)?;
         let written = state.write(bytes);
         if written != 0 {
             self.output_generation = self.output_generation.wrapping_add(1).max(1);
         }
-        written
+        Some(written)
     }
 
-    fn read_from_session(&mut self, session: u64, dest: &mut [u8]) -> usize {
-        self.session_mut(session).read_input(dest)
+    fn read_from_session(&mut self, session: u64, dest: &mut [u8]) -> Option<usize> {
+        Some(self.sessions.get_mut(&session)?.read_input(dest))
     }
 
     fn snapshot_output(&self, session: u64, dest: &mut [u8]) -> Option<usize> {
@@ -103,7 +99,7 @@ impl SessionRuntime {
             return Ok(false);
         }
         let (changed, became_ready) = {
-            let state = self.session_mut(session);
+            let state = self.sessions.get_mut(&session).ok_or(libc::ENODEV)?;
             let was_ready = !state.input.is_empty();
             let changed = state.on_key_event(event)?;
             (changed, !was_ready && !state.input.is_empty())
@@ -120,16 +116,20 @@ impl SessionRuntime {
         Ok(became_ready)
     }
 
-    fn termios(&mut self, session: u64) -> LinuxTermios {
-        self.session_mut(session).termios
+    fn termios(&self, session: u64) -> Option<LinuxTermios> {
+        self.sessions.get(&session).map(|state| state.termios)
     }
 
-    fn set_termios(&mut self, session: u64, termios: LinuxTermios, flush_input: bool) {
-        self.session_mut(session).set_termios(termios, flush_input);
+    fn set_termios(&mut self, session: u64, termios: LinuxTermios, flush_input: bool) -> bool {
+        let Some(state) = self.sessions.get_mut(&session) else {
+            return false;
+        };
+        state.set_termios(termios, flush_input);
+        true
     }
 
-    fn pending_input_len(&mut self, session: u64) -> usize {
-        self.session_mut(session).input.len()
+    fn pending_input_len(&self, session: u64) -> Option<usize> {
+        self.sessions.get(&session).map(|state| state.input.len())
     }
 
     fn output_generation(&self) -> u64 {
@@ -656,7 +656,9 @@ fn handle_tty_line_request(
     response.capability = session_capability("tty-line", request.header.op);
     match request.arg0 {
         LINUX_TCGETS => {
-            let termios = state.session_runtime.termios(session);
+            let Some(termios) = state.session_runtime.termios(session) else {
+                return libc::ENODEV;
+            };
             copy_payload(response, super::util::as_bytes(&termios))
         }
         LINUX_TCSETS | LINUX_TCSETSW | LINUX_TCSETSF => {
@@ -664,13 +666,19 @@ fn handle_tty_line_request(
                 return libc::EINVAL;
             }
             let termios = super::util::read_unaligned::<LinuxTermios>(&request.payload);
-            state
+            if !state
                 .session_runtime
-                .set_termios(session, termios, request.arg0 == LINUX_TCSETSF);
+                .set_termios(session, termios, request.arg0 == LINUX_TCSETSF)
+            {
+                return libc::ENODEV;
+            }
             0
         }
         LINUX_FIONREAD => {
-            response.value0 = state.session_runtime.pending_input_len(session) as u64;
+            let Some(pending) = state.session_runtime.pending_input_len(session) else {
+                return libc::ENODEV;
+            };
+            response.value0 = pending as u64;
             0
         }
         _ => libc::ENOTTY,
@@ -697,10 +705,13 @@ fn handle_console_route_request(
                 return libc::EINVAL;
             }
             let payload_len = request.payload_len as usize;
-            response.value0 = state
+            let Some(written) = state
                 .session_runtime
                 .write_to_session(session, &request.payload[..payload_len])
-                as u64;
+            else {
+                return libc::ENODEV;
+            };
+            response.value0 = written as u64;
             0
         }
         COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_READ => {
@@ -709,9 +720,12 @@ fn handle_console_route_request(
             if session == 0 || capacity == 0 {
                 return libc::EINVAL;
             }
-            let read = state
+            let Some(read) = state
                 .session_runtime
-                .read_from_session(session, &mut response.payload[..capacity]);
+                .read_from_session(session, &mut response.payload[..capacity])
+            else {
+                return libc::ENODEV;
+            };
             response.payload_len = read as u32;
             response.value0 = read as u64;
             0
@@ -1045,6 +1059,7 @@ mod tests {
     use super::SessionRuntime;
     use keyboard_core::KeyCode;
     use rustos_user_abi::device::{InputEvent, INPUT_ACTION_PRESSED, INPUT_KIND_KEYBOARD};
+    use rustos_user_abi::linux::LinuxTermios;
 
     fn key_event(code: u32, text: u8) -> InputEvent {
         InputEvent {
@@ -1071,14 +1086,19 @@ mod tests {
         }
 
         let mut before_enter = [0_u8; 8];
-        assert_eq!(runtime.read_from_session(session, &mut before_enter), 0);
+        assert_eq!(
+            runtime.read_from_session(session, &mut before_enter),
+            Some(0)
+        );
 
         runtime
             .handle_input_event(session, key_event(KeyCode::Enter as u32, b'\n'))
             .expect("enter should commit the edited line");
 
         let mut line = [0_u8; 8];
-        let read = runtime.read_from_session(session, &mut line);
+        let read = runtime
+            .read_from_session(session, &mut line)
+            .expect("live session read");
         assert_eq!(&line[..read], b"pwd\n");
     }
 
@@ -1104,7 +1124,7 @@ mod tests {
         assert_eq!(runtime.input_readiness_generation(), initial + 1);
 
         let mut drained = [0_u8; 8];
-        assert_ne!(runtime.read_from_session(session, &mut drained), 0);
+        assert_ne!(runtime.read_from_session(session, &mut drained), Some(0));
         assert!(runtime
             .handle_input_event(session, key_event(KeyCode::Enter as u32, b'\n'))
             .expect("a new empty-to-ready transition republishes"));
@@ -1123,6 +1143,22 @@ mod tests {
         );
 
         runtime.remove_session(session);
+        assert_eq!(
+            runtime.input_readiness_snapshot(session),
+            (false, false, generation + 1)
+        );
+        assert!(!runtime.sessions.contains_key(&session));
+
+        let mut input = [0_u8; 1];
+        assert_eq!(runtime.read_from_session(session, &mut input), None);
+        assert_eq!(runtime.write_to_session(session, b"stale"), None);
+        assert!(runtime.termios(session).is_none());
+        assert!(!runtime.set_termios(session, LinuxTermios::default_console(), false));
+        assert_eq!(runtime.pending_input_len(session), None);
+        assert_eq!(
+            runtime.handle_input_event(session, key_event(30, b'x')),
+            Err(libc::ENODEV)
+        );
         assert_eq!(
             runtime.input_readiness_snapshot(session),
             (false, false, generation + 1)

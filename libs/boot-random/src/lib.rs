@@ -5,7 +5,7 @@ use core::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use boot_protocol::BootInfo;
+use boot_protocol::{BootInfo, rng_seed_usable};
 use rand_chacha::ChaCha20Rng;
 use rand_core::{Rng, SeedableRng};
 use spin::Mutex;
@@ -17,8 +17,13 @@ pub struct Random {
 static RNG_SEED: Mutex<[u8; 32]> = Mutex::new([0; 32]);
 static RNG_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-pub fn init(boot_info: &BootInfo) {
+#[must_use]
+pub fn init(boot_info: &BootInfo) -> bool {
+    if !rng_seed_usable(boot_info.rng_seed) {
+        return false;
+    }
     *RNG_SEED.lock() = boot_info.rng_seed;
+    true
 }
 
 impl Random {

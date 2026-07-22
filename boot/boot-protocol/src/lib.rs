@@ -339,6 +339,7 @@ pub enum BootInfoValidationError {
     NullPointer,
     MagicMismatch,
     VersionMismatch,
+    InvalidRngSeed,
     InvalidFramebuffer,
     InvalidKernelImage,
     InvalidMemoryMap,
@@ -352,6 +353,7 @@ impl BootInfoValidationError {
             Self::NullPointer => "boot info pointer is null",
             Self::MagicMismatch => "boot info magic mismatch",
             Self::VersionMismatch => "boot info version mismatch",
+            Self::InvalidRngSeed => "boot info random seed is unavailable",
             Self::InvalidFramebuffer => "boot info framebuffer is invalid",
             Self::InvalidKernelImage => "boot info kernel image is invalid",
             Self::InvalidMemoryMap => "boot info memory map is invalid",
@@ -368,6 +370,9 @@ impl BootInfo {
         }
         if self.version != BOOT_INFO_VERSION {
             return Err(BootInfoValidationError::VersionMismatch);
+        }
+        if !rng_seed_usable(self.rng_seed) {
+            return Err(BootInfoValidationError::InvalidRngSeed);
         }
 
         self.framebuffer.validate()?;
@@ -482,6 +487,16 @@ mod tests {
     #[test]
     fn validates_final_boot_info() {
         assert!(valid_boot_info().validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_an_all_zero_rng_seed() {
+        let mut info = valid_boot_info();
+        info.rng_seed = [0; 32];
+        assert_eq!(
+            info.validate_staged(),
+            Err(BootInfoValidationError::InvalidRngSeed)
+        );
     }
 
     #[test]

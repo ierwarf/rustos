@@ -48,6 +48,10 @@ pub use self::current::{
     with_current_user_process_and_linux_thread_state_mut, with_current_user_process_state,
     with_current_user_process_state_mut, with_process_state_by_pid, with_process_state_by_pid_mut,
 };
+
+/// Upper bound for simultaneously schedulable task identities. Cross-crate
+/// bounded registries must derive capacity from this value rather than copy it.
+pub const MAX_SCHEDULER_TASKS: usize = scheduler::MAX_TASK;
 #[allow(unused_imports)]
 pub(crate) use self::irq::{
     clear_deferred_reschedule_request, cond_resched, request_deferred_reschedule,

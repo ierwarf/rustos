@@ -17,8 +17,9 @@ Recorded on 2026-07-22 before a session switch:
 - `formal/COVERAGE.md` is the acceptance ledger. Re-run the gate relevant to a
   new claim; do not turn a recorded model result into current source or runtime
   evidence.
-- Physical GPU state, evidence limits, and the open generic userspace wait-set
-  ABI live only in `physical-gpu-status.md`. Do not start, bind, reset, or retry
+- Physical GPU state, evidence limits, and the generic userspace wait-set's
+  remaining release gates live only in `physical-gpu-status.md`. Do not start,
+  bind, reset, or retry
   hardware merely because a new session began.
 - Documentation, skill, hook, Serena, formal-model, and RustOS-only changes do
   not require a Linux DVM rebuild. Route any real DVM change through the

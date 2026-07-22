@@ -90,17 +90,20 @@ window, then 20 settled one-second windows at 33.348--45.705 FPS with normally
 did not recur, but neither the startup delay nor the steady throughput passes
 its release gate.
 
-The remaining fault is in the OS userspace event/readiness boundary. The
-upstream Wayland server contract exposes one aggregate `poll_fd()` that a
-compositor must monitor before dispatching readable clients. uiserver instead
-dispatches nonblocking and, when idle, waits only for input or a deadline capped
-at 16 ms. RustOS's current Linux `epoll_wait` path also ignores the timeout and
-performs one vfsd readiness query. Correcting this is a general cross-provider
-wait-set ABI, not a local WayClick fix: timeout and lost-wake closure, fd
-lifetime, peer close, descriptor/credential transfer, bounded data rings, and
-revoke recovery must be one capability contract. Its scope is deliberately
-left as a failed next-ABI gate. Fuchsia's peered IOBuffer is a useful
-commercial-OS reference for the object shape, not an ABI to copy verbatim:
+The OS userspace event/readiness boundary is now implemented as a general
+cross-provider wait set rather than a WayClick-specific route. uiserver waits
+the Wayland server's aggregate epoll fd together with its input notification;
+compat honors finite/infinite application deadlines and performs atomic
+check-register-recheck-arm-presence-check against service-owned generations.
+Open-description lifetime, provider epoch revoke, per-interest `ERR|HUP`, and
+bounded close/dup/fork/exec cleanup are source/model covered. State mutations
+now use exact operation IDs with replay/reconciliation, vfsd restores its
+rootd-retained authenticated epoll checkpoint before endpoint publication, and
+service objects use boot-entropy capabilities plus sender/dependency checks.
+Runtime crash injection and the live KVM workload remain unclaimed; host
+admission rejects the available NVIDIA render node. Fuchsia's
+peered IOBuffer remains a useful commercial-OS reference for the object shape,
+not an ABI to copy verbatim:
 <https://fuchsia.dev/fuchsia-src/reference/kernel_objects/io_buffer>.
 
 ### Console Hosting
@@ -200,15 +203,18 @@ WayClick 33.348--45.705 FPS, 보통 1--5 ms의 compositor callback wait,
 revoke, context loss, `display not available`은 재발하지 않았지만 startup
 지연과 정상 운용 55 FPS gate는 모두 실패 상태입니다.
 
-남은 결함은 OS userspace event/readiness 경계입니다. upstream Wayland
-server는 compositor가 aggregate `poll_fd()`를 감시하고 readable일 때
-client를 dispatch할 것을 요구합니다. 현재 uiserver는 nonblocking dispatch
-후 input 또는 최대 16 ms deadline만 기다리고, RustOS Linux `epoll_wait`는
-timeout을 사용하지 않은 채 vfsd readiness query 한 번만 수행합니다.
-올바른 수정은 timeout/lost-wake, fd lifetime, peer close,
-descriptor/credential transfer, bounded data ring, revoke recovery를 함께
-다루는 범용 cross-provider wait-set ABI입니다. 범위가 크므로 WayClick 전용
-우회로를 만들지 않고 실패한 next-ABI gate로 남깁니다.
+OS userspace event/readiness 경계는 이제 WayClick 전용 경로가 아니라 범용
+cross-provider wait set으로 구현되어 있습니다. uiserver는 Wayland server의
+aggregate epoll fd와 input notification을 함께 기다리고, compat는 유한/무한
+application deadline과 service-owned generation에 대한
+check-register-recheck-arm-presence-check를 수행합니다. open-description
+lifetime, provider epoch revoke, interest별 `ERR|HUP`, bounded
+close/dup/fork/exec cleanup은 source/model 검증 범위입니다. 원격 상태변경은
+동일 operation ID replay/reconciliation을 사용하고, vfsd는 endpoint 공개 전
+rootd의 인증된 epoll checkpoint를 복구하며, service object는 boot entropy
+capability와 sender/dependency 검사를 함께 사용합니다. 남은 release gate는
+runtime crash injection과 NVIDIA host admission 때문에 실행하지 못한 live
+KVM workload이며, 이를 source/model 성공으로 대체해 기록하지 않습니다.
 
 ### Console hosting
 

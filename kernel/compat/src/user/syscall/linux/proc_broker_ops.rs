@@ -829,24 +829,30 @@ pub(super) fn syscall_linux_rustos_proc_exec_target_broker(args_ptr: u64) -> u64
         }
         transitions.insert(args.target_tid, transition);
     }
-    let cloexec_service_refs = match snapshot_cloexec_service_handle_refs(args.target_pid) {
-        Ok(refs) => refs,
-        Err(errno) => {
-            EXEC_TRANSITIONS.lock().remove(&args.target_tid);
-            return linux_errno(errno);
-        }
-    };
-    if multitask::exec_user_process_by_pid(
+    if let Some(closed_handles) = multitask::exec_user_process_by_pid(
         args.target_pid,
         args.target_tid,
         prepared.address_space,
         prepared.bootstrap,
     ) {
         // The process-table commit has already removed CLOEXEC descriptors.
-        // Retire their matching service references before publishing the new
-        // image back to the caller; a provider restart independently revokes
-        // any call that cannot complete this bounded cleanup.
-        release_service_handle_refs(&cloexec_service_refs);
+        // Derive cleanup from the exact handles retired by that commit, never
+        // from an earlier fd snapshot that a sibling can close/reuse before
+        // replacement. A provider restart independently revokes any call that
+        // cannot complete this bounded cleanup.
+        let cloexec_service_refs: Vec<_> = closed_handles
+            .iter()
+            .filter_map(service_handle_ref_for_handle)
+            .collect();
+        let cloexec_console_handles: Vec<_> = closed_handles
+            .into_iter()
+            .filter_map(|handle| match handle {
+                multitask::KernelHandle::Console(console) => Some(console),
+                _ => None,
+            })
+            .collect();
+        release_service_handle_refs_bounded(&cloexec_service_refs);
+        purge_closed_console_handles(cloexec_console_handles, true);
         // Linux exec retires every sibling thread. Their exact tickets and
         // handoffs can no longer become valid after the scheduler clears those
         // slots, so release them with the same target identity boundary.
@@ -952,7 +958,7 @@ pub(super) fn syscall_linux_rustos_proc_fork_broker(args_ptr: u64) -> u64 {
     // Reserve every service-owned open-description reference before the child
     // becomes runnable. A child close must not be able to retire a socket,
     // remote VFS handle, or epoll object still referenced by its parent.
-    let inherited_service_refs = match acquire_fork_service_handle_refs(args.source_pid) {
+    let inherited_service_refs = match acquire_cloned_service_handle_refs(&child_state) {
         Ok(refs) => refs,
         Err(errno) => return linux_errno(errno),
     };

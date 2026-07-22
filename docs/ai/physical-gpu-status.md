@@ -23,23 +23,31 @@ ownership, and `formal/COVERAGE.md` for acceptance status.
 The generic capability-bound wait set is not a missing GPU renderer or a
 private Wayland protocol. Its source/model implementation now has these owners:
 
-1. vfsd owns bounded epoll membership keyed by provider object and exact
-   service epoch, rather than by a reusable numeric fd.
+1. vfsd owns bounded epoll membership keyed by target fd plus stable provider
+   open-description identity. The observed service epoch is mutable state, not
+   part of the key, so MOD can rebind after restart and DEL remains available
+   while the provider is down.
 2. netd/inputd own readiness truth and publish monotonic generations.
 3. compat owns only bounded task wait tokens, check-register-service-recheck,
    scheduler arm plus exact waiter-presence recheck, deadline/cancel wakeup,
    and the final authoritative provider recheck. Provider queries use at most
    16 ms and never exceed the remaining finite wait deadline.
 4. service object references follow dup/fork/close/CLOEXEC/process exit, and a
-   provider restart wakes then revokes old-epoch waits.
+   downstream netd/inputd/sessiond restart wakes then revokes old-epoch waits.
+   Netd mutations use ACK-retained exact replay; remote VFS descriptor refs are
+   kernel-local; and vfsd restores rootd-retained epoll state before publishing
+   a replacement endpoint.
 
 The source and finite-model boundary is implemented. Uiserver now duplicates
 Wayland-server's aggregate backend epoll open description into a demoted waiter,
 merges that wake with its input wake, and rearms only after client dispatch. Its
 runtime deadline remains the bounded fallback rather than the sole Wayland wake
-source. Bounded QEMU/KVM timeout, readiness, close, restart, and WayClick
-evidence is still required before commercial runtime acceptance, and the 55 FPS
-gate stays unaccepted until those measurements pass. Ring0 must continue to
+source. The bounded 30-second QEMU boot witness reaches initd without a
+lifecycle cycle, but the live KVM wait/event workload remains unclaimed because
+host admission rejects the available NVIDIA render node. Runtime timeout,
+readiness, close, vfsd checkpoint replay, restart, and WayClick evidence is still
+required before commercial acceptance, and the 55 FPS gate stays unaccepted
+until those measurements pass. Ring0 must continue to
 avoid inspecting inputd, netd, vfsd, or uiserver private queues.
 
 The existing uiserver input reader remains a safe bounded bridge. It performs a

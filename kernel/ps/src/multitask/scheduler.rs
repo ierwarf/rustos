@@ -2792,30 +2792,30 @@ impl Scheduler {
         &mut self,
         address_space: ProcessAddressSpace,
         mut bootstrap: UserTaskBootstrap,
-    ) -> bool {
+    ) -> Option<Vec<crate::user::handles::KernelHandle>> {
         let slot = self.current_task;
         let Some(current_context) = self.contexts[slot] else {
-            return false;
+            return None;
         };
         if !current_context.user_mode {
-            return false;
+            return None;
         }
 
         let Some(process_handle) = current_context.process_handle else {
-            return false;
+            return None;
         };
         let Some(linux_process_state) = bootstrap.linux_process_state.take() else {
-            return false;
+            return None;
         };
         let Some(linux_memory_map) = bootstrap.linux_memory_map.take() else {
-            return false;
+            return None;
         };
         let Some(linux_runtime_profile) = bootstrap.linux_runtime_profile.take() else {
-            return false;
+            return None;
         };
 
         let Some(process_id) = current_context.process_id else {
-            return false;
+            return None;
         };
         let exec_path = String::from(bootstrap.exec_path());
         let (sibling_slots, sibling_count) =
@@ -2836,7 +2836,7 @@ impl Scheduler {
 
         {
             let Some(context) = self.contexts[slot].as_mut() else {
-                return false;
+                return None;
             };
             context.address_space_root = new_root;
             context.user_abi = Some(bootstrap.abi);
@@ -2858,7 +2858,7 @@ impl Scheduler {
         });
 
         crate::memory::paging::load_address_space_phys(PhysAddr::new(new_root));
-        process_table::replace_for_exec(
+        let closed_handles = process_table::replace_for_exec(
             process_handle,
             address_space,
             linux_process_state,
@@ -2873,7 +2873,7 @@ impl Scheduler {
         }
 
         FsBase::write(VirtAddr::new(new_fs_base));
-        true
+        Some(closed_handles)
     }
 
     pub(super) fn exec_user_process_by_pid(
@@ -2882,24 +2882,24 @@ impl Scheduler {
         thread_id: u64,
         address_space: ProcessAddressSpace,
         mut bootstrap: UserTaskBootstrap,
-    ) -> bool {
+    ) -> Option<Vec<crate::user::handles::KernelHandle>> {
         let Some(slot) = self.find_linux_thread_slot(process_id, thread_id) else {
-            return false;
+            return None;
         };
         let Some(current_context) = self.contexts[slot] else {
-            return false;
+            return None;
         };
         let Some(process_handle) = current_context.process_handle else {
-            return false;
+            return None;
         };
         let Some(linux_process_state) = bootstrap.linux_process_state.take() else {
-            return false;
+            return None;
         };
         let Some(linux_memory_map) = bootstrap.linux_memory_map.take() else {
-            return false;
+            return None;
         };
         let Some(linux_runtime_profile) = bootstrap.linux_runtime_profile.take() else {
-            return false;
+            return None;
         };
         let exec_path = String::from(bootstrap.exec_path());
         let (sibling_slots, sibling_count) =
@@ -2924,7 +2924,7 @@ impl Scheduler {
 
         {
             let Some(context) = self.contexts[slot].as_mut() else {
-                return false;
+                return None;
             };
             context.saved_rsp = saved_rsp;
             context.address_space_root = new_root;
@@ -2949,7 +2949,7 @@ impl Scheduler {
             crate::memory::paging::load_address_space_phys(PhysAddr::new(new_root));
             FsBase::write(VirtAddr::new(new_fs_base));
         }
-        process_table::replace_for_exec(
+        let closed_handles = process_table::replace_for_exec(
             process_handle,
             address_space,
             linux_process_state,
@@ -2962,7 +2962,7 @@ impl Scheduler {
         for sibling_slot in sibling_slots.iter().take(sibling_count) {
             self.clear_slot(*sibling_slot);
         }
-        true
+        Some(closed_handles)
     }
 
     pub(super) fn linux_thread_snapshot_by_ids(

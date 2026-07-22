@@ -4,12 +4,12 @@
 use alloc::vec::Vec;
 use rustos_user_abi::syscall::{
     SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
-    SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_RECV,
+    SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_RECV, SYS_RUSTOS_IPC_RECV_WITH_SENDER,
     SYS_RUSTOS_IPC_REGISTER_LINUX_SYSCALL_ENDPOINT, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT,
     SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_IPC_TRY_RECV,
 };
 
-use crate::syscall::{syscall0, syscall1, syscall2, syscall3, syscall4, syscall5};
+use crate::syscall::{syscall0, syscall1, syscall2, syscall3, syscall4, syscall5, syscall6};
 
 #[inline]
 pub fn endpoint_create() -> i64 {
@@ -74,6 +74,28 @@ pub unsafe fn recv(
         request_buf as u64,
         request_capacity as u64,
         reply_cap_out as u64,
+    )
+}
+
+/// Receive one request together with the kernel-stamped sender identity.
+/// Policy services must use this form whenever request fields claim a PID/TID.
+#[inline]
+pub unsafe fn recv_with_sender(
+    endpoint: u64,
+    request_buf: *mut u8,
+    request_capacity: usize,
+    reply_cap_out: *mut u64,
+    sender_pid_out: *mut u64,
+    sender_tid_out: *mut u64,
+) -> i64 {
+    syscall6(
+        SYS_RUSTOS_IPC_RECV_WITH_SENDER,
+        endpoint,
+        request_buf as u64,
+        request_capacity as u64,
+        reply_cap_out as u64,
+        sender_pid_out as u64,
+        sender_tid_out as u64,
     )
 }
 

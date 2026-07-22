@@ -4,6 +4,10 @@
 // complete production supervisor graph is unreachable only in that harness.
 #![cfg_attr(test, allow(dead_code, unused_imports))]
 
+extern crate alloc;
+
+mod service_checkpoint;
+
 #[cfg(not(test))]
 use core::alloc::{GlobalAlloc, Layout};
 use core::arch::asm;
@@ -20,28 +24,31 @@ use rustos_user_abi::syscall::{
     CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
     CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, CoreServiceLeaseWire,
     LifecycleDrainBrokerArgs, LifecycleEventWire, LoaderSpawnRequest, LoaderSpawnResponse,
-    RustosRootdTerminateBrokerArgs, COMMERCIAL_MAX_CAPABILITY_OP_LEASE_GRANT,
-    COMMERCIAL_MAX_CAPABILITY_OP_LEASE_RENEW, COMMERCIAL_MAX_CAPABILITY_OP_LEASE_REVOKE,
-    COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_CAPABILITY,
-    COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS, COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR,
-    COMMERCIAL_MAX_ROOTD_OP_BOOTSTRAP_MANIFEST, COMMERCIAL_MAX_ROOTD_OP_CORE_SERVICE_LEASE,
-    COMMERCIAL_MAX_ROOTD_OP_DEPENDENCY_GRAPH, COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_QUERY,
-    COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM, COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL,
-    COMMERCIAL_MAX_ROOTD_OP_RESTART_POLICY, COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY,
-    COMMERCIAL_MAX_ROOTD_OP_SERVICE_LOOKUP, IPC_SERVICE_DEVMGRD, IPC_SERVICE_INPUTD,
-    IPC_SERVICE_LINUX_SYSCALLD, IPC_SERVICE_LOADERD, IPC_SERVICE_NETD, IPC_SERVICE_PAGERD,
-    IPC_SERVICE_PROCD, IPC_SERVICE_ROOTD, IPC_SERVICE_SESSIOND, IPC_SERVICE_STORAGED,
-    IPC_SERVICE_UISERVER, IPC_SERVICE_VFSD, LIFECYCLE_DRAIN_MAX_EVENTS, LIFECYCLE_EVENT_EXIT,
-    LOADER_OP_ACTIVATE, LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES,
-    LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_EXEC_PATH_CAPACITY, LOADER_SPAWN_FLAG_DEFER_START,
-    ROOTD_LEASE_STATE_EXITED, ROOTD_LEASE_STATE_FAILED, ROOTD_LEASE_STATE_RESTART_PENDING,
-    ROOTD_LEASE_STATE_RUNNING, SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_IPC_CALL,
-    SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
-    SYS_RUSTOS_IPC_RECV_WITH_SENDER, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT,
-    SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER, SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER,
+    RustosRootdTerminateBrokerArgs, ServiceCheckpointRecordWire,
+    COMMERCIAL_MAX_CAPABILITY_OP_LEASE_GRANT, COMMERCIAL_MAX_CAPABILITY_OP_LEASE_RENEW,
+    COMMERCIAL_MAX_CAPABILITY_OP_LEASE_REVOKE, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
+    COMMERCIAL_MAX_PROTOCOL_CAPABILITY, COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS,
+    COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR, COMMERCIAL_MAX_ROOTD_OP_BOOTSTRAP_MANIFEST,
+    COMMERCIAL_MAX_ROOTD_OP_CORE_SERVICE_LEASE, COMMERCIAL_MAX_ROOTD_OP_DEPENDENCY_GRAPH,
+    COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_QUERY, COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM,
+    COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL, COMMERCIAL_MAX_ROOTD_OP_RESTART_POLICY,
+    COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY, COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE,
+    COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_SCAN, COMMERCIAL_MAX_ROOTD_OP_SERVICE_LOOKUP,
+    IPC_SERVICE_DEVMGRD, IPC_SERVICE_INPUTD, IPC_SERVICE_LINUX_SYSCALLD, IPC_SERVICE_LOADERD,
+    IPC_SERVICE_NETD, IPC_SERVICE_PAGERD, IPC_SERVICE_PROCD, IPC_SERVICE_ROOTD,
+    IPC_SERVICE_SESSIOND, IPC_SERVICE_STORAGED, IPC_SERVICE_UISERVER, IPC_SERVICE_VFSD,
+    LIFECYCLE_DRAIN_MAX_EVENTS, LIFECYCLE_EVENT_EXIT, LOADER_OP_ACTIVATE, LOADER_OP_SPAWN_EXEC,
+    LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES, LOADER_SPAWN_ENV_BYTES,
+    LOADER_SPAWN_EXEC_PATH_CAPACITY, LOADER_SPAWN_FLAG_DEFER_START, ROOTD_LEASE_STATE_EXITED,
+    ROOTD_LEASE_STATE_FAILED, ROOTD_LEASE_STATE_RESTART_PENDING, ROOTD_LEASE_STATE_RUNNING,
+    SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
+    SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_RECV_WITH_SENDER,
+    SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
+    SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER, SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER,
     SYS_RUSTOS_ROOTD_TERMINATE_BROKER, SYS_RUSTOS_ROOTD_WAIT_BROKER, SYS_RUSTOS_SPAWN_EXEC,
     TASK_WEIGHT_INTERACTIVE_FLAG,
 };
+use service_checkpoint::ServiceCheckpointStore;
 
 const SYS_SCHED_YIELD: u64 = 24;
 const SPAWN_FLAG_LOGICAL_ADMIN: u64 = 1;
@@ -283,6 +290,7 @@ pub extern "C" fn _start() -> ! {
         post_init_lease(POST_INIT_MANIFEST[4]),
         post_init_lease(POST_INIT_MANIFEST[5]),
     ];
+    let mut service_checkpoints = ServiceCheckpointStore::new();
 
     // The bootstrap manifest is the rootd-owned policy boundary for direct
     // early spawn, dependency readiness, restart fallback, and advertised
@@ -303,7 +311,13 @@ pub extern "C" fn _start() -> ! {
     debug_line(b"rootd: core services spawned, waiting for readiness\n");
     while !service_dependencies_ready(INITD_LEASE_INDEX) {
         drain_lifecycle_events(&mut leases, &mut post_init_leases);
-        serve_rootd_once(endpoint, &leases, &mut post_init_leases, false);
+        serve_rootd_once(
+            endpoint,
+            &leases,
+            &mut post_init_leases,
+            &mut service_checkpoints,
+            false,
+        );
         restart_failed_leases(&mut leases);
         supervise_core_readiness(&mut leases);
         if !service_dependencies_ready(INITD_LEASE_INDEX) {
@@ -312,13 +326,24 @@ pub extern "C" fn _start() -> ! {
     }
 
     debug_line(b"rootd: core services ready, spawning initd via loaderd\n");
-    spawn_initd_via_loaderd(endpoint, &mut leases, &mut post_init_leases);
+    spawn_initd_via_loaderd(
+        endpoint,
+        &mut leases,
+        &mut post_init_leases,
+        &mut service_checkpoints,
+    );
 
     debug_line(b"rootd: initd spawned\n");
     yield_now();
     loop {
         drain_lifecycle_events(&mut leases, &mut post_init_leases);
-        serve_rootd_once(endpoint, &leases, &mut post_init_leases, false);
+        serve_rootd_once(
+            endpoint,
+            &leases,
+            &mut post_init_leases,
+            &mut service_checkpoints,
+            false,
+        );
         restart_failed_leases(&mut leases);
         supervisor_idle();
     }
@@ -420,6 +445,7 @@ fn spawn_initd_via_loaderd(
     endpoint: u64,
     leases: &mut [Lease],
     post_init_leases: &mut [PostInitLease],
+    service_checkpoints: &mut ServiceCheckpointStore,
 ) {
     let mut attempts = 0_u64;
     while attempts < INITD_SPAWN_MAX_ATTEMPTS as u64 {
@@ -452,7 +478,13 @@ fn spawn_initd_via_loaderd(
                     debug_line(b"rootd: initd loader spawn retry\n");
                 }
                 drain_lifecycle_events(leases, post_init_leases);
-                serve_rootd_once(endpoint, leases, post_init_leases, false);
+                serve_rootd_once(
+                    endpoint,
+                    leases,
+                    post_init_leases,
+                    service_checkpoints,
+                    false,
+                );
                 restart_failed_leases(leases);
                 yield_now();
             }
@@ -621,6 +653,7 @@ fn serve_rootd_once(
     endpoint: u64,
     leases: &[Lease],
     post_init_leases: &mut [PostInitLease],
+    service_checkpoints: &mut ServiceCheckpointStore,
     blocking: bool,
 ) {
     if endpoint == 0 {
@@ -659,6 +692,7 @@ fn serve_rootd_once(
         &request,
         leases,
         post_init_leases,
+        service_checkpoints,
         IpcSenderIdentity {
             pid: sender_pid,
             tid: sender_tid,
@@ -686,6 +720,7 @@ fn reply_commercial_max_request(
     request: &CommercialMaxProtocolRequest,
     leases: &[Lease],
     post_init_leases: &mut [PostInitLease],
+    service_checkpoints: &mut ServiceCheckpointStore,
     sender: IpcSenderIdentity,
 ) {
     let mut response = CommercialMaxProtocolResponse {
@@ -705,6 +740,7 @@ fn reply_commercial_max_request(
             request,
             leases,
             post_init_leases,
+            service_checkpoints,
             &mut response,
             sender,
         ) {
@@ -762,7 +798,9 @@ fn validate_commercial_max_request(
             | COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY
             | COMMERCIAL_MAX_ROOTD_OP_SERVICE_LOOKUP
             | COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_QUERY
-            | COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM => {
+            | COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM
+            | COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE
+            | COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_SCAN => {
                 validate_sender_subject(request, sender)
             }
             _ => Err(22),
@@ -798,6 +836,7 @@ fn fill_commercial_max_response(
     request: &CommercialMaxProtocolRequest,
     leases: &[Lease],
     post_init_leases: &mut [PostInitLease],
+    service_checkpoints: &mut ServiceCheckpointStore,
     response: &mut CommercialMaxProtocolResponse,
     sender: IpcSenderIdentity,
 ) -> Result<(), i32> {
@@ -857,6 +896,57 @@ fn fill_commercial_max_response(
             reclaim_post_init_lease(leases, post_init_leases, request, sender)?;
             response.value0 = request.arg0;
             response.value1 = 0;
+            Ok(())
+        }
+        COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE => {
+            authorize_current_service_namespace(leases, post_init_leases, request.arg0, sender)?;
+            if request.path_len != 0
+                || request.payload_len as usize != size_of::<ServiceCheckpointRecordWire>()
+                || request.arg1 != 0
+                || request.arg2 != 0
+                || request.arg3 != 0
+            {
+                return Err(22);
+            }
+            let record = unsafe {
+                core::ptr::read_unaligned(
+                    request
+                        .payload
+                        .as_ptr()
+                        .cast::<ServiceCheckpointRecordWire>(),
+                )
+            };
+            let duplicate = service_checkpoints.mutate(request.arg0, record)?;
+            response.value0 = record.revision;
+            response.value1 = u64::from(duplicate);
+            Ok(())
+        }
+        COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_SCAN => {
+            authorize_current_service_namespace(leases, post_init_leases, request.arg0, sender)?;
+            if request.path_len != 0
+                || request.payload_len != 0
+                || request.arg2 != 0
+                || request.arg3 != 0
+            {
+                return Err(22);
+            }
+            let wire_size = size_of::<ServiceCheckpointRecordWire>();
+            let max = response.payload.len() / wire_size;
+            let cursor = usize::try_from(request.arg1).map_err(|_| 22)?;
+            let (records, next) = service_checkpoints.scan(request.arg0, cursor, max)?;
+            for (index, record) in records.iter().enumerate() {
+                let bytes = unsafe {
+                    core::slice::from_raw_parts(
+                        (record as *const ServiceCheckpointRecordWire).cast::<u8>(),
+                        wire_size,
+                    )
+                };
+                let offset = index * wire_size;
+                response.payload[offset..offset + wire_size].copy_from_slice(bytes);
+            }
+            response.value0 = next as u64;
+            response.value1 = records.len() as u64;
+            response.payload_len = (records.len() * wire_size) as u32;
             Ok(())
         }
         _ => Err(22),
@@ -1063,6 +1153,10 @@ fn rootd_capability_mask(op: u16) -> u64 {
         COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL => 1 << 4,
         COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY => 1 << 5,
         COMMERCIAL_MAX_ROOTD_OP_SERVICE_LOOKUP => 1 << 6,
+        COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_QUERY => 1 << 7,
+        COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM => 1 << 8,
+        COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE => 1 << 9,
+        COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_SCAN => 1 << 10,
         _ => 0,
     }
 }
@@ -1358,16 +1452,81 @@ fn authorize_service_lookup_for_subject(
     if service_policy_capability(request.arg0) == 0 {
         return Err(22);
     }
-    if leases.iter().any(|lease| {
-        lease.pid == request.header.subject_pid && lease.state == ROOTD_LEASE_STATE_RUNNING
-    }) || post_init_leases.iter().any(|lease| {
-        lease.pid == request.header.subject_pid
-            && lease.state == ROOTD_LEASE_STATE_RUNNING
-            && post_init_lease_reporter_is_live(leases, post_init_leases, lease.reporter_pid)
-    }) {
+    let subject_service = current_service_id_for_sender(
+        leases,
+        post_init_leases,
+        IpcSenderIdentity {
+            pid: request.header.subject_pid,
+            tid: request.header.subject_tid,
+        },
+    )?;
+    if service_dependency_allowed(subject_service, request.arg0) {
         Ok(())
     } else {
         Err(13)
+    }
+}
+
+fn authorize_current_service_namespace(
+    leases: &[Lease],
+    post_init_leases: &[PostInitLease],
+    service_id: u64,
+    sender: IpcSenderIdentity,
+) -> Result<(), i32> {
+    if service_id == 0
+        || current_service_id_for_sender(leases, post_init_leases, sender)? != service_id
+    {
+        return Err(13);
+    }
+    Ok(())
+}
+
+fn current_service_id_for_sender(
+    leases: &[Lease],
+    post_init_leases: &[PostInitLease],
+    sender: IpcSenderIdentity,
+) -> Result<u64, i32> {
+    if sender.pid == 0 || sender.tid == 0 {
+        return Err(22);
+    }
+    if let Some(lease) = leases
+        .iter()
+        .find(|lease| lease.pid == sender.pid && lease.state == ROOTD_LEASE_STATE_RUNNING)
+    {
+        return Ok(lease.service_id);
+    }
+    post_init_leases
+        .iter()
+        .find(|lease| {
+            lease.pid == sender.pid
+                && lease.state == ROOTD_LEASE_STATE_RUNNING
+                && post_init_lease_reporter_is_live(leases, post_init_leases, lease.reporter_pid)
+        })
+        .map(|lease| lease.service_id)
+        .ok_or(13)
+}
+
+fn service_dependency_allowed(subject: u64, target: u64) -> bool {
+    match subject {
+        INITD_LEASE_ID => matches!(
+            target,
+            IPC_SERVICE_NETD
+                | IPC_SERVICE_DEVMGRD
+                | IPC_SERVICE_INPUTD
+                | IPC_SERVICE_STORAGED
+                | IPC_SERVICE_SESSIOND
+        ),
+        IPC_SERVICE_VFSD => target == IPC_SERVICE_DEVMGRD,
+        IPC_SERVICE_PROCD => target == IPC_SERVICE_LOADERD,
+        IPC_SERVICE_SESSIOND => matches!(
+            target,
+            IPC_SERVICE_LOADERD | IPC_SERVICE_DEVMGRD | IPC_SERVICE_UISERVER
+        ),
+        IPC_SERVICE_UISERVER => target == IPC_SERVICE_INPUTD,
+        IPC_SERVICE_DEVMGRD => {
+            matches!(target, IPC_SERVICE_SESSIOND | IPC_SERVICE_UISERVER)
+        }
+        _ => false,
     }
 }
 
@@ -1887,6 +2046,53 @@ mod tests {
             arg1: pid,
             ..CommercialMaxProtocolRequest::default()
         }
+    }
+
+    #[test]
+    fn service_lookup_uses_the_declared_dependency_edge_not_generic_liveness() {
+        let mut leases = leases_with_live_initd(41);
+        leases[1].pid = 52;
+        leases[1].state = ROOTD_LEASE_STATE_RUNNING;
+        let post_init = [];
+        let mut request = CommercialMaxProtocolRequest::default();
+        request.header.subject_pid = 52;
+        request.header.subject_tid = 7;
+        request.arg0 = IPC_SERVICE_DEVMGRD;
+        assert_eq!(
+            authorize_service_lookup_for_subject(&leases, &post_init, &request),
+            Ok(())
+        );
+        request.arg0 = IPC_SERVICE_NETD;
+        assert_eq!(
+            authorize_service_lookup_for_subject(&leases, &post_init, &request),
+            Err(13)
+        );
+    }
+
+    #[test]
+    fn checkpoint_namespace_is_bound_to_the_current_service_lease() {
+        let mut leases = leases_with_live_initd(41);
+        leases[1].pid = 52;
+        leases[1].state = ROOTD_LEASE_STATE_RUNNING;
+        let post_init = [];
+        assert_eq!(
+            authorize_current_service_namespace(
+                &leases,
+                &post_init,
+                IPC_SERVICE_VFSD,
+                IpcSenderIdentity { pid: 52, tid: 7 },
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            authorize_current_service_namespace(
+                &leases,
+                &post_init,
+                IPC_SERVICE_PROCD,
+                IpcSenderIdentity { pid: 52, tid: 7 },
+            ),
+            Err(13)
+        );
     }
 
     #[test]

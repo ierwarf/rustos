@@ -6,7 +6,7 @@ use x86_64::VirtAddr;
 use x86_64::structures::paging::PageTableFlags;
 
 use crate::memory::paging::{self, AddressSpaceError, ProcessAddressSpace, UserRegion};
-use crate::user::handles::HandleTable;
+use crate::user::handles::{HandleTable, KernelHandle};
 use crate::user::linux::{
     CLOCK_MONOTONIC, CLOCK_REALTIME, LinuxMemoryMapState, LinuxProcessState, LinuxRuntimeProfile,
     LinuxSigAction, MAX_SIGNAL_NUMBER, SIG_IGN,
@@ -568,7 +568,7 @@ impl UserProcessState {
         linux_memory_map: LinuxMemoryMapState,
         linux_runtime_profile: LinuxRuntimeProfile,
         exec_path: &str,
-    ) {
+    ) -> Vec<KernelHandle> {
         let preserved_ignored = self
             .linux_sigactions
             .map(|action| action.handler == SIG_IGN);
@@ -581,7 +581,7 @@ impl UserProcessState {
         );
         let cwd = self.cwd.clone();
         let mut handles = core::mem::take(&mut self.handles);
-        handles.close_cloexec();
+        let closed = handles.close_cloexec();
 
         let mut fresh = Self::new(
             address_space,
@@ -607,6 +607,7 @@ impl UserProcessState {
         }
 
         *self = fresh;
+        closed
     }
 
     pub fn map_zeroed_pages_from_mapping_cursor(

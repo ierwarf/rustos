@@ -42,16 +42,20 @@ pub(crate) fn call_remote_vfs_read_bytes(
 lazy_static! {
     static ref ROOTD_LIFECYCLE_EVENTS: Mutex<Vec<LifecycleEventWire>> = Mutex::new(Vec::new());
     static ref PROCD_LIFECYCLE_EVENTS: Mutex<Vec<LifecycleEventWire>> = Mutex::new(Vec::new());
+    static ref SYSCALLD_LIFECYCLE_EVENTS: Mutex<Vec<LifecycleEventWire>> = Mutex::new(Vec::new());
 }
 static ROOTD_LIFECYCLE_EVENTS_OVERFLOWED: AtomicBool = AtomicBool::new(false);
 static PROCD_LIFECYCLE_EVENTS_OVERFLOWED: AtomicBool = AtomicBool::new(false);
+static SYSCALLD_LIFECYCLE_EVENTS_OVERFLOWED: AtomicBool = AtomicBool::new(false);
 static ROOTD_LIFECYCLE_DRAIN_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static PROCD_LIFECYCLE_DRAIN_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+static SYSCALLD_LIFECYCLE_DRAIN_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum LifecycleConsumer {
     RootSupervisor,
     ProcessPolicy,
+    LinuxSyscallPolicy,
 }
 
 impl LifecycleConsumer {
@@ -59,6 +63,7 @@ impl LifecycleConsumer {
         match self {
             Self::RootSupervisor => &ROOTD_LIFECYCLE_EVENTS,
             Self::ProcessPolicy => &PROCD_LIFECYCLE_EVENTS,
+            Self::LinuxSyscallPolicy => &SYSCALLD_LIFECYCLE_EVENTS,
         }
     }
 
@@ -66,6 +71,7 @@ impl LifecycleConsumer {
         match self {
             Self::RootSupervisor => &ROOTD_LIFECYCLE_EVENTS_OVERFLOWED,
             Self::ProcessPolicy => &PROCD_LIFECYCLE_EVENTS_OVERFLOWED,
+            Self::LinuxSyscallPolicy => &SYSCALLD_LIFECYCLE_EVENTS_OVERFLOWED,
         }
     }
 
@@ -73,6 +79,7 @@ impl LifecycleConsumer {
         match self {
             Self::RootSupervisor => &ROOTD_LIFECYCLE_DRAIN_IN_PROGRESS,
             Self::ProcessPolicy => &PROCD_LIFECYCLE_DRAIN_IN_PROGRESS,
+            Self::LinuxSyscallPolicy => &SYSCALLD_LIFECYCLE_DRAIN_IN_PROGRESS,
         }
     }
 }
@@ -116,12 +123,14 @@ pub(crate) fn record_process_exit(pid: u64, parent_pid: u64, exit_status: i32) {
     for consumer in [
         LifecycleConsumer::RootSupervisor,
         LifecycleConsumer::ProcessPolicy,
+        LifecycleConsumer::LinuxSyscallPolicy,
     ] {
         let mut events = consumer.events().lock();
         if !push_lifecycle_event(&mut events, event) {
             // Each consumer owns independent evidence. Rootd treats overflow
-            // as terminal; procd discards all cached policy after observing
-            // its overflow and then resumes from an empty queue.
+            // as terminal; policy services discard all cached per-process
+            // state after observing their private overflow and then resume
+            // from an empty queue.
             consumer.overflowed().store(true, Ordering::Release);
         }
     }
@@ -183,11 +192,11 @@ fn lifecycle_overflow_requires_rebase(
     if !overflowed.load(Ordering::Acquire) {
         return false;
     }
-    if consumer == LifecycleConsumer::ProcessPolicy {
-        // procd treats EOVERFLOW as a command to forget every cached policy.
-        // Clearing this consumer's private queue and sticky bit under the same
-        // lock gives it a safe empty baseline without weakening rootd's fatal
-        // evidence rule.
+    if consumer != LifecycleConsumer::RootSupervisor {
+        // procd and syscalld treat EOVERFLOW as a command to forget every
+        // cached per-process policy. Clearing only that consumer's private
+        // queue and sticky bit under the same lock gives it a safe empty
+        // baseline without weakening rootd's fatal evidence rule.
         events.clear();
         overflowed.store(false, Ordering::Release);
     }
@@ -262,14 +271,18 @@ mod tests {
         };
         let mut rootd = Vec::new();
         let mut procd = Vec::new();
+        let mut syscalld = Vec::new();
         assert!(push_lifecycle_event(&mut rootd, event));
         assert!(push_lifecycle_event(&mut procd, event));
+        assert!(push_lifecycle_event(&mut syscalld, event));
 
         rootd.drain(..1);
 
         assert!(rootd.is_empty());
         assert_eq!(procd.len(), 1);
         assert_eq!(procd[0].pid, 7);
+        assert_eq!(syscalld.len(), 1);
+        assert_eq!(syscalld[0].pid, 7);
 
         let procd_overflow = AtomicBool::new(true);
         assert!(lifecycle_overflow_requires_rebase(
@@ -279,6 +292,15 @@ mod tests {
         ));
         assert!(procd.is_empty());
         assert!(!procd_overflow.load(Ordering::Acquire));
+
+        let syscalld_overflow = AtomicBool::new(true);
+        assert!(lifecycle_overflow_requires_rebase(
+            LifecycleConsumer::LinuxSyscallPolicy,
+            &mut syscalld,
+            &syscalld_overflow,
+        ));
+        assert!(syscalld.is_empty());
+        assert!(!syscalld_overflow.load(Ordering::Acquire));
 
         let rootd_overflow = AtomicBool::new(true);
         rootd.push(event);

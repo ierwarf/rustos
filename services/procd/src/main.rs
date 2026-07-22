@@ -15,16 +15,15 @@ use rustos_svc_runtime::syscall::{syscall1, syscall5};
 use rustos_user_abi::syscall::{
     CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
     CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, LifecycleDrainBrokerArgs,
-    LifecycleEventWire, LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse,
-    LoaderSpawnRequest, LoaderSpawnResponse, ProcdIpcRequest, ProcdIpcResponse,
+    LifecycleEventWire, LoaderSpawnRequest, LoaderSpawnResponse, ProcdIpcRequest, ProcdIpcResponse,
     RustosProcAuthorizeExecBrokerArgs, RustosProcCancelExecBrokerArgs, RustosProcForkBrokerArgs,
     RustosProcSignalQueueBrokerArgs, COMMERCIAL_MAX_PROCD_OP_EXEC_TICKET,
     COMMERCIAL_MAX_PROCD_OP_FORK_PLAN, COMMERCIAL_MAX_PROCD_OP_PROCESS_PREPARE,
     COMMERCIAL_MAX_PROCD_OP_SESSION_MEMBERSHIP, COMMERCIAL_MAX_PROCD_OP_SIGNAL_POLICY,
     COMMERCIAL_MAX_PROCD_OP_THREAD_PLAN, COMMERCIAL_MAX_PROCD_OP_WAIT_NAMESPACE,
     COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_PROCD, IPC_MAX_INLINE_BYTES,
-    IPC_SERVICE_LINUX_SYSCALLD, IPC_SERVICE_LOADERD, IPC_SERVICE_PROCD, LIFECYCLE_DRAIN_MAX_EVENTS,
-    LIFECYCLE_EVENT_EXIT, LINUX_SIGACTION_SIZE, LOADER_OP_EXEC_TARGET, LOADER_REQUEST_ABI_VERSION,
+    IPC_SERVICE_LOADERD, IPC_SERVICE_PROCD, LIFECYCLE_DRAIN_MAX_EVENTS, LIFECYCLE_EVENT_EXIT,
+    LINUX_SIGACTION_SIZE, LOADER_OP_EXEC_TARGET, LOADER_REQUEST_ABI_VERSION,
     LOADER_SPAWN_MAX_ARG_COUNT, LOADER_SPAWN_MAX_ENV_COUNT, PROCD_ARG_BYTES, PROCD_ENV_BYTES,
     PROCD_IPC_ABI_VERSION, PROCD_OP_EXECVE, PROCD_OP_EXECVEAT, PROCD_OP_FORK,
     PROCD_OP_RT_SIGACTION, PROCD_OP_RT_SIGPROCMASK, PROCD_OP_SELECT_SIGNAL, PROCD_OP_SIGALTSTACK,
@@ -32,8 +31,7 @@ use rustos_user_abi::syscall::{
     PROCD_PAYLOAD_CAPACITY, PROCD_SELECT_SIGNAL_HANDLER, PROCD_SELECT_SIGNAL_IGNORE,
     PROCD_SELECT_SIGNAL_NONE, PROCD_SELECT_SIGNAL_TERMINATE, PROC_BROKER_ABI_VERSION,
     PROC_BROKER_FORMAT_ELF64, PROC_BROKER_FORMAT_PE64, PROC_BROKER_USER_SPACE_BASE,
-    PROC_BROKER_USER_SPACE_END_EXCLUSIVE, SYSCALL_OFFLOAD_ABI_VERSION,
-    SYSCALL_OFFLOAD_OP_LINUX_PROCESS_EXIT, SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER,
+    PROC_BROKER_USER_SPACE_END_EXCLUSIVE, SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER,
     SYS_RUSTOS_PROC_AUTHORIZE_EXEC_BROKER, SYS_RUSTOS_PROC_CANCEL_EXEC_BROKER,
     SYS_RUSTOS_PROC_FORK_BROKER, SYS_RUSTOS_PROC_SIGNAL_QUEUE_BROKER,
 };
@@ -92,7 +90,6 @@ fn service_main() {
 }
 
 fn serve(endpoint: u64) {
-    let mut drain_counter = 0u32;
     loop {
         let mut request = [0_u8; IPC_MAX_INLINE_BYTES];
         let mut reply_cap = 0_u64;
@@ -109,15 +106,14 @@ fn serve(endpoint: u64) {
             continue;
         }
 
+        // Apply queued exit evidence before any PID-keyed policy lookup. The
+        // drain is a bounded local broker call and never discovers syscalld or
+        // rootd, so it cannot recreate the bootstrap authorization cycle.
+        drain_lifecycle_events();
         let response = handle_wire_request(received as usize, &request);
         let reply = unsafe { ipc::reply(reply_cap, response.as_ptr(), response.len()) };
         if reply < 0 {
             ipc::debug_line("procd: reply failed");
-        }
-
-        drain_counter = drain_counter.wrapping_add(1);
-        if drain_counter.is_multiple_of(16) {
-            drain_lifecycle_events();
         }
     }
 }
@@ -188,50 +184,14 @@ fn drain_lifecycle_events() {
         ipc::debug_line("procd: lifecycle evidence reset after drain failure");
         return;
     }
-    let drained = count as usize;
-    if !lifecycle_drain_needs_syscalld_lookup(drained) {
-        return;
-    }
-    let syscalld_endpoint = ipc::lookup_service_endpoint(IPC_SERVICE_LINUX_SYSCALLD);
-    for event in &events[..drained] {
+    for event in &events[..count as usize] {
         if event.event == LIFECYCLE_EVENT_EXIT {
-            {
-                PROCESS_SIGNAL_POLICY.lock().remove(&event.pid);
-                THREAD_SIGNAL_POLICY
-                    .lock()
-                    .retain(|(pid, _), _| *pid != event.pid);
-            }
-            notify_syscalld_process_exit(syscalld_endpoint, event.pid);
+            PROCESS_SIGNAL_POLICY.lock().remove(&event.pid);
+            THREAD_SIGNAL_POLICY
+                .lock()
+                .retain(|(pid, _), _| *pid != event.pid);
         }
     }
-}
-
-fn lifecycle_drain_needs_syscalld_lookup(drained: usize) -> bool {
-    drained != 0
-}
-
-fn notify_syscalld_process_exit(endpoint: i64, dead_pid: u64) {
-    if endpoint < 0 || dead_pid == 0 {
-        return;
-    }
-    let request = LinuxSyscallOffloadRequest {
-        version: SYSCALL_OFFLOAD_ABI_VERSION,
-        op: SYSCALL_OFFLOAD_OP_LINUX_PROCESS_EXIT,
-        pid: dead_pid,
-        tid: dead_pid,
-        ..LinuxSyscallOffloadRequest::default()
-    };
-    let mut response = LinuxSyscallOffloadResponse::default();
-    let _ = unsafe {
-        syscall5(
-            SYS_RUSTOS_IPC_CALL,
-            endpoint as u64,
-            (&request as *const LinuxSyscallOffloadRequest) as u64,
-            size_of::<LinuxSyscallOffloadRequest>() as u64,
-            (&mut response as *mut LinuxSyscallOffloadResponse) as u64,
-            size_of::<LinuxSyscallOffloadResponse>() as u64,
-        )
-    };
 }
 
 fn handle_request(received: usize, request: &ProcdIpcRequest) -> ProcdIpcResponse {

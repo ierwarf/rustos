@@ -11,11 +11,19 @@ Concrete owners:
     check-register-provider-recheck-scheduler-arm-presence-check substrate.
 
 The model combines the high-risk races: a provider transition between check
-and sleep, timeout competing with a signal, provider restart/revoke, and open
-description references inherited by dup/fork then retired by close/exec.
+and sleep, timeout competing with a signal, provider restart/revoke, explicit
+MOD rebind of a stable registration identity to the new provider epoch, and
+open-description references inherited by dup/fork then retired by close/exec.
+The terminal revoked outcome refines to per-interest ERR/HUP; unrelated ready
+interests in the same aggregate wait remain reportable.
+DuplicateObject/ForkObject abstract a concrete two-phase commit that rechecks
+the source handle token under the fd-table lock and retires the exact replaced
+target before publishing the new descriptor.
 ArmRecheck abstracts the concrete final provider recheck plus waiter-presence
 test; service IPC completes before the scheduler arm and is independently
-bounded by the ipc-reply-deadline contract and the application deadline.
+bounded by the ipc-reply-deadline contract and the application deadline. A
+provider-query timeout is an allowed nonterminal stutter/retry: it cannot erase
+readiness found elsewhere in the scan or create an early terminal timeout.
 *******************************************************************************)
 
 CONSTANTS MaxGeneration, MaxEpoch, MaxTime, WaitBound, MaxRefs, MaxIngress
@@ -51,12 +59,12 @@ BeginWait ==
     /\ epollRefs > 0
     /\ now + WaitBound <= MaxTime
     /\ observedGeneration' = generation
-    /\ observedEpoch' = epoch
     /\ deadline' = now + WaitBound
-    /\ waitState' = IF ~providerLive THEN "returned-revoked"
+    /\ waitState' = IF ~providerLive \/ epoch # observedEpoch
+                     THEN "returned-revoked"
                      ELSE IF ready THEN "returned-ready" ELSE "armed"
-    /\ UNCHANGED <<generation, epoch, providerLive, ready, now, objectRefs,
-                   epollRefs, ingressBacklog>>
+    /\ UNCHANGED <<generation, epoch, providerLive, ready, observedEpoch, now,
+                   objectRefs, epollRefs, ingressBacklog>>
 
 ExternalIngress ==
     /\ providerLive
@@ -132,14 +140,13 @@ SignalCancel ==
 ResolveWake ==
     /\ waitState = "woken"
     /\ observedGeneration' = generation
-    /\ observedEpoch' = epoch
     /\ waitState' = IF ~providerLive \/ epoch # observedEpoch \/ epollRefs = 0
                      THEN "returned-revoked"
                      ELSE IF ready THEN "returned-ready"
                      ELSE IF now >= deadline THEN "returned-timeout"
                      ELSE "armed"
-    /\ UNCHANGED <<generation, epoch, providerLive, ready, deadline, now,
-                   objectRefs, epollRefs, ingressBacklog>>
+    /\ UNCHANGED <<generation, epoch, providerLive, ready, observedEpoch,
+                   deadline, now, objectRefs, epollRefs, ingressBacklog>>
 
 ProviderRestart ==
     /\ providerLive
@@ -163,6 +170,7 @@ ProviderRecover ==
                    ingressBacklog>>
 
 DuplicateObject ==
+    /\ objectRefs > 0
     /\ objectRefs < MaxRefs
     /\ waitState \notin TerminalStates
     /\ objectRefs' = objectRefs + 1
@@ -170,6 +178,8 @@ DuplicateObject ==
                    observedGeneration, observedEpoch, deadline, now, epollRefs,
                    ingressBacklog>>
 
+\* Concrete fork acquires provider refs from the same frozen HandleTable clone
+\* that is published in the child, never from a later live-parent resnapshot.
 ForkObject == DuplicateObject
 
 CloseObject ==
@@ -184,9 +194,12 @@ CloseObject ==
     /\ UNCHANGED <<epoch, providerLive, observedGeneration, observedEpoch,
                    deadline, now, epollRefs, ingressBacklog>>
 
+\* Concrete exec returns the exact CLOEXEC handles retired by the atomic
+\* process-table replacement; provider cleanup is derived from that list.
 ExecCloseObject == CloseObject
 
 DuplicateEpoll ==
+    /\ epollRefs > 0
     /\ epollRefs < MaxRefs
     /\ waitState \notin TerminalStates
     /\ epollRefs' = epollRefs + 1
@@ -212,6 +225,29 @@ Tick ==
                    observedGeneration, observedEpoch, deadline, objectRefs,
                    epollRefs, ingressBacklog>>
 
+\* Concrete ADD/MOD pins a still-live target open description across the vfsd
+\* mutation. Its final guard release performs the same last-close purge, so a
+\* purge-before-ADD race cannot recreate a retired interest. MOD retains the
+\* target-fd/open-description key and replaces only the stale endpoint epoch.
+\* ADD cannot create a second key for the same registration, and DEL uses that
+\* stable key regardless of epoch.
+ModifyInterestEpoch ==
+    /\ waitState = "idle"
+    /\ providerLive
+    /\ objectRefs > 0
+    /\ epoch # observedEpoch
+    /\ observedEpoch' = epoch
+    /\ UNCHANGED <<generation, epoch, providerLive, ready, waitState,
+                   observedGeneration, deadline, now, objectRefs, epollRefs,
+                   ingressBacklog>>
+
+ResetWait ==
+    /\ waitState \in TerminalStates
+    /\ waitState' = "idle"
+    /\ deadline' = 0
+    /\ UNCHANGED <<generation, epoch, providerLive, ready, observedGeneration,
+                   observedEpoch, now, objectRefs, epollRefs, ingressBacklog>>
+
 TerminalStutter ==
     /\ waitState \in TerminalStates
     /\ UNCHANGED vars
@@ -228,6 +264,8 @@ Next ==
     \/ ResolveWake
     \/ ProviderRestart
     \/ ProviderRecover
+    \/ ModifyInterestEpoch
+    \/ ResetWait
     \/ DuplicateObject
     \/ ForkObject
     \/ CloseObject
@@ -272,6 +310,8 @@ RevokedProviderCannotReturnReady ==
         waitState # "returned-ready"
 
 ReferenceCountsNeverUnderflow == objectRefs >= 0 /\ epollRefs >= 0
+
+ClosedDescriptionCannotRegainReadiness == objectRefs = 0 => ~ready
 
 ActiveWaitEventuallySettles ==
     waitState \in {"armed", "sleeping", "woken"} ~> waitState \in TerminalStates

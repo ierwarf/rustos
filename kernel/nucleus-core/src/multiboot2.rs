@@ -1,3 +1,7 @@
+use core::arch::{
+    asm,
+    x86_64::{__cpuid, __cpuid_count},
+};
 use core::cell::UnsafeCell;
 use core::mem::size_of;
 use core::ptr;
@@ -5,12 +9,15 @@ use core::ptr;
 use boot_protocol::{
     BOOT_INFO_MAGIC, BOOT_INFO_VERSION, BootExtentManifest, BootInfo, BootMemoryKind,
     BootMemoryMap, BootMemoryRegion, BootPixelFormat, BootVolumeIdentity, FramebufferInfo,
-    NucleusImageInfo,
+    NucleusImageInfo, rng_seed_usable,
 };
 
 const MULTIBOOT2_BOOTLOADER_MAGIC: u32 = 0x36d7_6289;
 const PAGE_SIZE: u64 = 4096;
 const MAX_BOOT_MEMORY_REGIONS: usize = 256;
+const CPUID_RDRAND: u32 = 1 << 30;
+const CPUID_RDSEED: u32 = 1 << 18;
+const HARDWARE_RNG_RETRIES: usize = 128;
 
 const TAG_END: u32 = 0;
 const TAG_MODULE: u32 = 3;
@@ -97,11 +104,14 @@ pub fn build_boot_info(magic: u32, mbi_addr: u32) -> *const BootInfo {
     let image_end = unsafe { kernel_image_end() };
     let image_size = image_end.saturating_sub(load_base).max(PAGE_SIZE);
 
+    let Some(rng_seed) = hardware_rng_seed() else {
+        fatal();
+    };
     let boot_info = BootInfo {
         magic: BOOT_INFO_MAGIC,
         version: BOOT_INFO_VERSION,
         _reserved0: 0,
-        rng_seed: [0; 32],
+        rng_seed,
         acpi_rsdp_addr: tags.acpi_rsdp_addr().unwrap_or(0),
         boot_volume: BootVolumeIdentity::empty(),
         framebuffer,
@@ -129,6 +139,67 @@ pub fn build_boot_info(magic: u32, mbi_addr: u32) -> *const BootInfo {
         ptr::write(BOOT_INFO_STORAGE.0.get(), boot_info);
         BOOT_INFO_STORAGE.0.get().cast_const()
     }
+}
+
+fn hardware_rng_seed() -> Option<[u8; 32]> {
+    let max_leaf = __cpuid(0).eax;
+    if max_leaf < 1 {
+        return None;
+    }
+    let rdrand = __cpuid(1).ecx & CPUID_RDRAND != 0;
+    let rdseed = max_leaf >= 7 && __cpuid_count(7, 0).ebx & CPUID_RDSEED != 0;
+    if !rdrand && !rdseed {
+        return None;
+    }
+
+    let mut seed = [0_u8; 32];
+    for chunk in seed.chunks_exact_mut(size_of::<u64>()) {
+        let word = (rdseed.then(rdseed64).flatten()).or_else(|| rdrand.then(rdrand64).flatten())?;
+        chunk.copy_from_slice(&word.to_le_bytes());
+    }
+    rng_seed_usable(seed).then_some(seed)
+}
+
+fn rdseed64() -> Option<u64> {
+    for _ in 0..HARDWARE_RNG_RETRIES {
+        let mut value = 0_u64;
+        let mut success = 0_u8;
+        unsafe {
+            asm!(
+                "rdseed {value}",
+                "setc {success}",
+                value = out(reg) value,
+                success = out(reg_byte) success,
+                options(nomem, nostack),
+            );
+        }
+        if success != 0 {
+            return Some(value);
+        }
+        core::hint::spin_loop();
+    }
+    None
+}
+
+fn rdrand64() -> Option<u64> {
+    for _ in 0..HARDWARE_RNG_RETRIES {
+        let mut value = 0_u64;
+        let mut success = 0_u8;
+        unsafe {
+            asm!(
+                "rdrand {value}",
+                "setc {success}",
+                value = out(reg) value,
+                success = out(reg_byte) success,
+                options(nomem, nostack),
+            );
+        }
+        if success != 0 {
+            return Some(value);
+        }
+        core::hint::spin_loop();
+    }
+    None
 }
 
 struct Tags {
