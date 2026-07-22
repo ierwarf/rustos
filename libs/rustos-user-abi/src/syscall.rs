@@ -683,6 +683,17 @@ impl Default for CommercialMaxProtocolRequest {
     }
 }
 
+impl CommercialMaxProtocolRequest {
+    /// Validates the transport envelope shared by every commercial protocol.
+    /// Protocol and operation-specific fields remain the service's responsibility.
+    pub fn has_valid_envelope(&self) -> bool {
+        self.header.version == COMMERCIAL_MAX_PROTOCOL_ABI_VERSION
+            && self.header.flags == 0
+            && self.path_len as usize <= self.path.len()
+            && self.payload_len as usize <= self.payload.len()
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CommercialMaxProtocolResponse {
@@ -718,6 +729,29 @@ impl Default for CommercialMaxProtocolResponse {
             reserved1: 0,
             payload: [0; COMMERCIAL_MAX_PROTOCOL_PAYLOAD_CAPACITY],
         }
+    }
+}
+
+impl CommercialMaxProtocolResponse {
+    /// Validates the transport envelope shared by every commercial protocol.
+    /// Operation-specific response fields remain the caller's responsibility.
+    pub fn is_valid_envelope_for(&self, request: &CommercialMaxProtocolRequest) -> bool {
+        let descriptor_count = usize::from(self.descriptor_count);
+        self.header == request.header
+            && self.reserved0 == 0
+            && self.reserved1 == 0
+            && self.payload_len as usize <= self.payload.len()
+            && descriptor_count <= self.descriptors.len()
+            && self.capability.label_len as usize <= self.capability.label.len()
+            && self.capability.reserved0 == 0
+            && self.capability.reserved1 == 0
+            && !self.descriptors[..descriptor_count]
+                .iter()
+                .any(|descriptor| {
+                    descriptor.name_len as usize > descriptor.name.len()
+                        || descriptor.reserved0 != 0
+                        || descriptor.reserved1 != 0
+                })
     }
 }
 
@@ -2418,16 +2452,57 @@ mod syscall_tests {
     use core::mem::size_of;
 
     use super::{
-        IPC_MAX_INLINE_BYTES, LINUX_RLIMIT_SIZE, LINUX_SIGACTION_SIZE, LINUX_STATX_SIZE,
-        LINUX_TIMESPEC_SIZE, LINUX_UTSNAME_SIZE, LinuxRlimit, LinuxSigActionWire,
-        LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse, LinuxTimespecWire, LinuxUtsName,
-        NETD_IPC_PAYLOAD_CAPACITY, NETD_IPC_REQUEST_HEADER_SIZE, NETD_IPC_RESPONSE_HEADER_SIZE,
-        NetdIpcRequest, NetdIpcResponse, SYSCALL_OFFLOAD_ABI_VERSION,
-        SYSCALL_OFFLOAD_OP_LINUX_ARCH_PRCTL_POLICY, SYSCALL_OFFLOAD_OP_LINUX_MPROTECT,
-        SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET, SYSCALL_OFFLOAD_OP_LINUX_STATX,
-        SYSCALL_OFFLOAD_PATH_CAPACITY, SYSCALL_OFFLOAD_PAYLOAD_CAPACITY, VFS_IPC_ABI_VERSION,
-        VFS_IPC_OP_OPENAT, VfsIpcRequest, VfsIpcResponse,
+        CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, IPC_MAX_INLINE_BYTES,
+        LINUX_RLIMIT_SIZE, LINUX_SIGACTION_SIZE, LINUX_STATX_SIZE, LINUX_TIMESPEC_SIZE,
+        LINUX_UTSNAME_SIZE, LinuxRlimit, LinuxSigActionWire, LinuxSyscallOffloadRequest,
+        LinuxSyscallOffloadResponse, LinuxTimespecWire, LinuxUtsName, NETD_IPC_PAYLOAD_CAPACITY,
+        NETD_IPC_REQUEST_HEADER_SIZE, NETD_IPC_RESPONSE_HEADER_SIZE, NetdIpcRequest,
+        NetdIpcResponse, SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_LINUX_ARCH_PRCTL_POLICY,
+        SYSCALL_OFFLOAD_OP_LINUX_MPROTECT, SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET,
+        SYSCALL_OFFLOAD_OP_LINUX_STATX, SYSCALL_OFFLOAD_PATH_CAPACITY,
+        SYSCALL_OFFLOAD_PAYLOAD_CAPACITY, VFS_IPC_ABI_VERSION, VFS_IPC_OP_OPENAT, VfsIpcRequest,
+        VfsIpcResponse,
     };
+
+    #[test]
+    fn commercial_response_envelope_matches_exact_request_and_bounds_nested_fields() {
+        let mut request = CommercialMaxProtocolRequest::default();
+        request.header.protocol = 7;
+        request.header.op = 3;
+        request.header.service_id = 11;
+        request.header.subject_pid = 13;
+        request.header.subject_tid = 17;
+        request.header.ticket = 19;
+        let mut response = CommercialMaxProtocolResponse {
+            header: request.header,
+            ..CommercialMaxProtocolResponse::default()
+        };
+        assert!(response.is_valid_envelope_for(&request));
+
+        response.header.ticket += 1;
+        assert!(!response.is_valid_envelope_for(&request));
+        response.header = request.header;
+        response.descriptor_count = 1;
+        response.descriptors[0].name_len = (response.descriptors[0].name.len() + 1) as u16;
+        assert!(!response.is_valid_envelope_for(&request));
+        response.descriptors[0].name_len = 0;
+        response.capability.reserved1 = 1;
+        assert!(!response.is_valid_envelope_for(&request));
+    }
+
+    #[test]
+    fn commercial_request_envelope_rejects_reserved_flags_and_oversized_lengths() {
+        let mut request = CommercialMaxProtocolRequest::default();
+        assert!(request.has_valid_envelope());
+        request.header.flags = 1;
+        assert!(!request.has_valid_envelope());
+        request.header.flags = 0;
+        request.payload_len = (request.payload.len() + 1) as u32;
+        assert!(!request.has_valid_envelope());
+        request.payload_len = 0;
+        request.path_len = (request.path.len() + 1) as u32;
+        assert!(!request.has_valid_envelope());
+    }
 
     #[test]
     fn statx_offload_messages_fit_inline_ipc_v1() {

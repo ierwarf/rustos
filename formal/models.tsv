@@ -1,0 +1,69 @@
+# model	class	deadlock_policy	deadlock_reason	pr_timeout_s	nightly_timeout_s	nightly_mode	apalache	tlaps	trace
+boot-volume-admission/BootVolumeAdmission	safety	intentional-terminal	admission decision is terminal	120	900	exhaustive	no	no	no
+clocksource-deadline/ClocksourceDeadline	temporal	intentional-terminal	retired or released waits are terminal	120	900	exhaustive	no	no	no
+deferred-start/DeferredStart	temporal	intentional-terminal	launch outcome is terminal	120	900	exhaustive	no	no	no
+devmgrd-sessiond-isolation/DevmgrdSessiondIsolation	temporal	intentional-terminal	bounded request outcome is terminal	120	900	exhaustive	no	no	no
+dma-iommu-isolation/DmaIommuIsolation	safety	intentional-terminal	revoked domain outcome is terminal	120	900	exhaustive+simulate	no	no	no
+driver-domain-fleet/DriverDomainFleet	safety	intentional-terminal	fleet admission outcome is terminal	120	900	exhaustive	no	no	no
+dual-abi-byte-parser/DualAbiByteParser	temporal	intentional-terminal	parser admission outcome is terminal	120	900	exhaustive	no	no	no
+dual-abi-image-admission/DualAbiImageAdmission	temporal	intentional-terminal	image admission outcome is terminal	120	900	exhaustive	no	no	no
+dvm-absolute-pointer/DvmAbsolutePointer	temporal	intentional-terminal	bounded input session may terminate	120	900	exhaustive	no	no	no
+dvm-agent-readiness/DvmAgentReadiness	temporal	intentional-terminal	readiness publication may terminate	120	900	exhaustive	no	no	no
+dvm-amdgpu-evidence/DvmAmdgpuEvidence	safety	intentional-terminal	evidence decision is terminal	120	900	exhaustive	no	no	no
+dvm-amdgpu-supply/DvmAmdgpuSupply	safety	intentional-terminal	driver supply decision is terminal	120	900	exhaustive	no	no	no
+dvm-atomic-scanout/DvmAtomicScanout	safety	intentional-terminal	display epoch may revoke	120	900	exhaustive+simulate	no	no	no
+dvm-commercial-lifecycle/DvmCommercialLifecycle	safety	intentional-terminal	lease lifecycle may quarantine or stop	120	900	exhaustive+simulate	no	no	no
+dvm-control-endpoint/DvmControlEndpoint	temporal	intentional-terminal	control setup outcome is terminal	120	900	exhaustive	no	no	no
+dvm-control-relay/DvmControlRelay	temporal	intentional-terminal	control session may close	120	900	exhaustive	no	no	no
+dvm-display-driver-supply/DvmDisplayDriverSupply	safety	intentional-terminal	driver supply decision is terminal	120	900	exhaustive	no	no	no
+dvm-display-readiness/DvmDisplayReadiness	temporal	intentional-terminal	display readiness may revoke	120	900	exhaustive	no	no	no
+dvm-display-scheduler/DvmDisplayScheduler	temporal	intentional-terminal	scheduler admission may fail terminally	120	900	exhaustive	no	no	no
+dvm-gpu-admission/DvmGpuAdmission	temporal	intentional-terminal	GPU admission may reject or revoke	120	900	exhaustive	no	no	no
+dvm-gpu-atlas-transport/DvmGpuAtlasTransport	safety	intentional-terminal	transport epoch may revoke	120	900	exhaustive	no	no	no
+dvm-gpu-compositor/DvmGpuCompositor	temporal	intentional-terminal	compositor epoch may revoke	300	1200	exhaustive	no	no	no
+dvm-gpu-proof-scheduler/DvmGpuProofScheduler	temporal	intentional-terminal	measurement process terminates	120	900	exhaustive	no	no	no
+dvm-input-revocation/DvmInputRevocation	safety	intentional-terminal	input session may end	120	900	exhaustive	no	no	no
+dvm-input-ring/DvmInputRing	temporal	intentional-terminal	ring epoch may revoke	120	900	exhaustive	no	no	no
+dvm-input-selftest/DvmInputSelftest	temporal	intentional-terminal	selftest process terminates	120	900	exhaustive	no	no	no
+dvm-network-control/DvmNetworkControl	safety	intentional-terminal	network session may end	120	900	exhaustive	no	no	no
+dvm-network-ring/DvmNetworkRing	safety	intentional-terminal	ring epoch may revoke	120	900	exhaustive	no	no	no
+dvm-release-bundle/DvmReleaseBundle	safety	intentional-terminal	bundle admission decision is terminal	120	900	exhaustive	no	no	no
+endpoint-publication/EndpointPublication	safety	intentional-terminal	publisher process may exit	120	900	exhaustive	no	yes	no
+endpoint-registry/EndpointRegistry	temporal	intentional-terminal	endpoint wait may settle terminally	120	900	exhaustive	no	no	no
+exec-ticket/ExecTicket	safety	intentional-terminal	ticket outcome is terminal	120	900	exhaustive+simulate	yes	no	no
+filesystem-content-integrity/FilesystemContentIntegrity	temporal	intentional-terminal	verified read decision is terminal	120	900	exhaustive	no	no	no
+futex-waiter-lifecycle/FutexWaiterLifecycle	safety	intentional-terminal	waiter wake timeout or exit is terminal	30	120	exhaustive	no	no	no
+gui-dvm-install/GuiDvmInstall	temporal	intentional-terminal	install decision is one-shot	120	900	exhaustive	no	no	no
+gui-dvm-pixel-authority/GuiDvmPixelAuthority	safety	intentional-terminal	pixel authority epoch may revoke	120	900	exhaustive	no	no	no
+gui-dvm-surface/GuiDvmSurface	temporal	intentional-terminal	surface epoch may revoke	120	900	exhaustive	no	no	no
+input-ingestion-worker/InputIngestionWorker	temporal	intentional-terminal	worker session may revoke	120	900	exhaustive	no	no	no
+input-readiness/InputReadiness	temporal	intentional-terminal	readiness wait may settle terminally	120	900	exhaustive	no	no	no
+ipc-endpoint-ownership/IpcEndpointOwnership	safety	intentional-terminal	message or owner may terminate	120	900	exhaustive	no	no	no
+ipc-handle-transfer/IpcHandleTransfer	safety	intentional-terminal	transfer outcome is terminal	120	900	exhaustive+simulate	yes	no	no
+ipc-priority-inheritance/IpcPriorityInheritance	safety	intentional-terminal	IPC call may resolve or cancel	120	900	exhaustive	no	no	no
+ipc-reply-deadline/IpcReplyDeadline	temporal	intentional-terminal	IPC wait outcome is terminal	120	900	exhaustive	no	no	no
+ivshmem-pairing/IvshmemPairing	temporal	intentional-terminal	peer pairing may disconnect	120	900	exhaustive	no	no	no
+memfd-seal-lifecycle/MemfdSealLifecycle	safety	intentional-terminal	sealed object may retain stable mappings	30	120	exhaustive	no	no	no
+msi-vector-lifecycle/MsiVectorLifecycle	safety	intentional-terminal	permanent vector pool may exhaust	30	120	exhaustive	no	no	no
+netd-deferred-reply/NetdDeferredReply	temporal	intentional-terminal	deferred request resolves or is rejected	30	120	exhaustive	no	no	no
+network-payload-session/NetworkPayloadSession	safety	intentional-terminal	payload decision is terminal	120	900	exhaustive	no	no	no
+page-table-lifecycle/PageTableLifecycle	safety	intentional-terminal	mapping lifecycle may complete	120	900	exhaustive	no	no	no
+persistent-mutation-admission/PersistentMutationAdmission	safety	intentional-terminal	mutation admission decision is terminal	30	120	exhaustive	no	no	no
+post-init-leases/PostInitLeases	safety	intentional-terminal	service lease may terminate	120	900	exhaustive	no	no	no
+post-init-supervisor-recovery/PostInitSupervisorRecovery	temporal	intentional-terminal	recovery outcome may terminate	120	900	exhaustive	no	no	no
+proc-broker-session/ProcBrokerSession	safety	intentional-terminal	prepare session outcome is terminal	120	900	exhaustive	no	no	no
+process-address-space-lifetime/ProcessAddressSpaceLifetime	temporal	intentional-terminal	process state may exit and reclaim	30	120	exhaustive	no	no	no
+process-signal-delivery/ProcessSignalDelivery	safety	intentional-terminal	signal disposition may terminate the process	30	120	exhaustive	no	no	no
+rootd-bootstrap/RootdBootstrap	temporal	intentional-terminal	bootstrap outcome is terminal	120	900	exhaustive	no	no	no
+rootd-restart-backoff/RootdRestartBackoff	temporal	intentional-terminal	restart budget may terminate	120	900	exhaustive	no	no	no
+runtime-control-rpc/RuntimeControlRpc	safety	intentional-terminal	one response resolves the RPC	120	900	exhaustive	no	no	yes
+scheduler-admission/SchedulerAdmission	temporal	intentional-terminal	admission decision is terminal	120	900	exhaustive	no	no	no
+scheduler-cpu-distribution/SchedulerCpuDistribution	temporal	intentional-terminal	bounded schedule may stop	120	900	exhaustive+simulate	no	no	no
+scheduler-thread-demotion/SchedulerThreadDemotion	safety	intentional-terminal	thread restoration may terminate	120	900	exhaustive	no	no	no
+scheduler-wakeup/SchedulerWakeup	temporal	intentional-terminal	retired task outcome is terminal	120	900	exhaustive	no	no	no
+trusted-ui-boundary/TrustedUiBoundary	safety	intentional-terminal	prompt authority may revoke	120	900	exhaustive	no	no	no
+ui-frame-budget/UiFrameBudget	temporal	intentional-terminal	bounded frame epoch may stop	120	900	exhaustive	no	no	no
+ui-input-motion/UiInputMotion	temporal	intentional-terminal	bounded motion trace may stop	120	900	exhaustive	no	no	no
+vfio-release-authorization/VfioReleaseAuthorization	safety	intentional-terminal	release decision is terminal	120	900	exhaustive	no	no	no
+wayland-accept-isolation/WaylandAcceptIsolation	temporal	intentional-terminal	accept decision is terminal	120	900	exhaustive	no	no	no
+wayland-frame-pacing/WaylandFramePacing	temporal	intentional-terminal	bounded pacing epoch may stop	120	900	exhaustive	no	no	no

@@ -8,9 +8,9 @@ set -euo pipefail
 INPUT="$(cat)"
 
 payload="$(printf '%s' "$INPUT" | jq -r '
-  .tool_input.command // .tool_input.file_path // .tool_input.path //
-  .arguments.command // .arguments.file_path // .arguments.path //
-  .params.command // .params.file_path // .params.path //
+  .tool_input.command // .tool_input.file_path // .tool_input.path // .tool_input.relative_path //
+  .arguments.command // .arguments.file_path // .arguments.path // .arguments.relative_path //
+  .params.command // .params.file_path // .params.path // .params.relative_path //
   empty
 ' 2>/dev/null || true)"
 

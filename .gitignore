@@ -1,8 +1,20 @@
 # Rust / Cargo outputs
 /target/
+**/target/
 
 # RustOS generated images, artifacts, registries, and mdBook output
 /build/
+
+# Formal tool working directories. Stable evidence belongs under build/formal;
+# solver caches and generated intermediates must never enter source control.
+/.tlacache/
+/_apalache-out/
+**/_apalache-out/
+**/__pycache__/
+/result_output_dir/
+/states/
+/formal/fuzz/artifacts/
+/formal/fuzz/target/
 /docs/book/
 /docs/src/
 
@@ -17,12 +29,44 @@
 /perf.data.old
 *.profraw
 *.profdata
+*.gcda
+*.gcno
+/core
+/core.*
+hs_err_pid*.log
+replay_pid*.log
 
-# Local editor settings
+# Python and local tool caches
+*.py[cod]
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+/.coverage
+/htmlcov/
+/.cache/
+/compile_commands.json
+/rust-project.json
+
+# Local environment and editor byproducts. Project-shared .vscode/ is tracked.
+/.env
+/.env.local
+/.direnv/
+/.fleet/
 /.idea/
 *.swp
 *.swo
 *~
+*.tmp
+*.bak
+*.orig
+*.rej
+.#*
+
+# Host desktop metadata
+.DS_Store
+Thumbs.db
+Desktop.ini
+.nfs*
 
 # Local scratch files
 /settings.rs

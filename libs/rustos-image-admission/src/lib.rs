@@ -970,7 +970,9 @@ mod verification {
             flags: kani::any(),
         };
         let entry = kani::any();
-        if admit_image(entry, &[region], 0x1000, 0x9000, false).is_ok() {
+        let accepted = admit_image(entry, &[region], 0x1000, 0x9000, false).is_ok();
+        kani::cover!(accepted);
+        if accepted {
             let end = region.start.checked_add(region.len).unwrap();
             assert!(region.start >= 0x1000);
             assert!(end <= 0x9000);
@@ -983,7 +985,9 @@ mod verification {
     #[kani::proof]
     fn accepted_elf_segment_is_bounded_and_wx_exclusive() {
         let ph: [u8; ELF64_PROGRAM_HEADER_SIZE] = kani::any();
-        if let Ok(region) = admit_elf64_load_segment(&ph, 0x2000, 0x1000, 0x20_000) {
+        let result = admit_elf64_load_segment(&ph, 0x2000, 0x1000, 0x20_000);
+        kani::cover!(result.is_ok());
+        if let Ok(region) = result {
             let end = region.start.checked_add(region.len).unwrap();
             assert!(region.start >= 0x1000);
             assert!(end <= 0x20_000);
@@ -997,10 +1001,9 @@ mod verification {
     #[kani::proof]
     fn rebased_pe_without_relocations_is_rejected() {
         let mut image: [u8; 8] = kani::any();
-        assert_eq!(
-            apply_pe64_base_relocations(&mut image, 0x1000, 0x2000, 0, 0, 0),
-            Err(ByteAdmissionError::MissingRelocations)
-        );
+        let result = apply_pe64_base_relocations(&mut image, 0x1000, 0x2000, 0, 0, 0);
+        kani::cover!(result == Err(ByteAdmissionError::MissingRelocations));
+        assert_eq!(result, Err(ByteAdmissionError::MissingRelocations));
     }
 
     #[kani::proof]
@@ -1015,7 +1018,9 @@ mod verification {
         image[36..40].copy_from_slice(&10_u32.to_le_bytes());
         image[40..42].copy_from_slice(&entry.to_le_bytes());
 
-        if let Ok(patched) = apply_pe64_base_relocations(&mut image, 0x1000, 0x2000, 32, 10, 0) {
+        let result = apply_pe64_base_relocations(&mut image, 0x1000, 0x2000, 32, 10, 0);
+        kani::cover!(result.is_ok());
+        if let Ok(patched) = result {
             let decoded_kind = relocation_kind & 0x0f;
             assert!(
                 decoded_kind == PE64_RELOC_ABSOLUTE as u8 || decoded_kind == PE64_RELOC_DIR64 as u8
@@ -1043,7 +1048,9 @@ mod verification {
         image[72..74].copy_from_slice(b"d\0");
         image[82..84].copy_from_slice(b"f\0");
 
-        if let Ok(summary) = validate_pe64_import_table(&image, 8, 40, 1) {
+        let result = validate_pe64_import_table(&image, 8, 40, 1);
+        kani::cover!(result.is_ok());
+        if let Ok(summary) = result {
             assert_eq!(summary.descriptors, 1);
             assert_eq!(summary.imports, 1);
             if entry & PE64_ORDINAL_FLAG != 0 {
@@ -1062,6 +1069,7 @@ mod verification {
     #[kani::proof]
     fn little_endian_byte_fields_are_decoded_exactly() {
         let bytes: [u8; 8] = kani::any();
+        kani::cover!(bytes[0] == 0 && bytes[7] == u8::MAX);
         assert_eq!(
             read_u16(&bytes, 0),
             Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
@@ -1081,6 +1089,7 @@ mod verification {
         let raw_offset: u32 = kani::any();
         let characteristics: u32 = kani::any();
         let mut section = [0_u8; PE64_SECTION_HEADER_SIZE];
+        kani::cover!(virtual_size == 0 && characteristics == u32::MAX);
         section[8..12].copy_from_slice(&virtual_size.to_le_bytes());
         section[12..16].copy_from_slice(&virtual_address.to_le_bytes());
         section[16..20].copy_from_slice(&raw_size.to_le_bytes());
@@ -1097,9 +1106,9 @@ mod verification {
     #[kani::proof]
     fn accepted_pe_section_is_bounded_and_wx_exclusive() {
         let section: [u8; PE64_SECTION_HEADER_SIZE] = kani::any();
-        if let Ok((summary, Some(region))) =
-            admit_pe64_section(&section, 0x400000, 0x1000, 0x1000, 0x200, 0x20_000)
-        {
+        let result = admit_pe64_section(&section, 0x400000, 0x1000, 0x1000, 0x200, 0x20_000);
+        kani::cover!(matches!(&result, Ok((_, Some(_)))));
+        if let Ok((summary, Some(region))) = result {
             assert_ne!(
                 summary.characteristics & (PE64_SCN_WRITE | PE64_SCN_EXECUTE),
                 PE64_SCN_WRITE | PE64_SCN_EXECUTE

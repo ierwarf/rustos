@@ -1,0 +1,22 @@
+[package]
+name = "rustos-formal-fuzz"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "=0.4.13"
+driver-domain-protocol = { path = "../../libs/driver-domain-protocol" }
+rustos-image-admission = { path = "../../libs/rustos-image-admission" }
+
+[[bin]]
+name = "wire_and_image_admission"
+path = "fuzz_targets/wire_and_image_admission.rs"
+test = false
+doc = false
+bench = false

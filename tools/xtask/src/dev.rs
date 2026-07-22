@@ -113,6 +113,7 @@ fn classify_changes(root: &Path, paths: &[PathBuf]) -> DevPlan {
 
     let mut formal_models = BTreeSet::new();
     let mut formal_infrastructure_changed = false;
+    let mut formal_source_changed = false;
     let mut dvm_paths = Vec::new();
     let mut needs_rust_check = false;
     let mut needs_kvm_dry_run = false;
@@ -156,6 +157,12 @@ fn classify_changes(root: &Path, paths: &[PathBuf]) -> DevPlan {
 
         plan.scopes.insert("rustos");
         needs_rust_check = true;
+        if path.starts_with("libs/runtime-control")
+            || path.starts_with("libs/rustos-image-admission")
+            || path.starts_with("libs/driver-domain-protocol")
+        {
+            formal_source_changed = true;
+        }
         if path == Path::new("tools/xtask/src/kvm.rs")
             || path_text.starts_with("libs/driver-domain-")
             || path.starts_with("services/uiserver")
@@ -170,11 +177,19 @@ fn classify_changes(root: &Path, paths: &[PathBuf]) -> DevPlan {
     }
 
     if formal_infrastructure_changed {
-        plan.push_now("bash formal/run-all-tlc.sh");
+        plan.push_now("bash formal/selftest.sh");
+        plan.push_stable("bash formal/verify-all.sh --profile pr");
     } else {
+        if !formal_models.is_empty() {
+            plan.push_now("bash formal/selftest.sh");
+        }
         for model in formal_models {
             plan.push_now(format!("bash formal/run-tlc.sh {model}"));
         }
+    }
+
+    if formal_source_changed {
+        plan.push_stable("bash formal/verify-all.sh --profile pr");
     }
 
     if needs_rust_check {
@@ -324,13 +339,30 @@ mod tests {
     }
 
     #[test]
-    fn formal_runner_change_runs_full_suite() {
+    fn formal_runner_change_batches_full_proof_gate() {
         let root = tempfile::tempdir().unwrap();
         let plan = classify_changes(root.path(), &[PathBuf::from("formal/run-tlc.sh")]);
-        assert!(plan.now.contains(&"bash formal/run-all-tlc.sh".to_owned()));
+        assert!(plan.now.contains(&"bash formal/selftest.sh".to_owned()));
+        assert!(
+            plan.stable_batch
+                .contains(&"bash formal/verify-all.sh --profile pr".to_owned())
+        );
         assert!(
             plan.now
                 .contains(&"bash -n -- 'formal/run-tlc.sh'".to_owned())
+        );
+    }
+
+    #[test]
+    fn formal_source_change_batches_full_proof_gate() {
+        let root = tempfile::tempdir().unwrap();
+        let plan = classify_changes(
+            root.path(),
+            &[PathBuf::from("libs/runtime-control/src/lib.rs")],
+        );
+        assert!(
+            plan.stable_batch
+                .contains(&"bash formal/verify-all.sh --profile pr".to_owned())
         );
     }
 

@@ -1,15 +1,22 @@
 # RustOS proof infrastructure
 
-`formal/verify-all.sh` is the PR-sized formal gate. It runs pinned TLC models
-and pinned Kani proof harnesses. A result is evidence only for the property and
-scope named below; it is never promoted into an implementation-wide claim.
+`formal/verify-all.sh --profile pr` is the bounded merge gate;
+`--profile nightly` adds independent bug-finding and proof lanes. A result is
+evidence only for the property and scope named below; it is never promoted
+into an implementation-wide or certification claim.
 
 | Layer | Tool | What it establishes | What it does not establish |
 | --- | --- | --- | --- |
 | Concurrent contract | TLC, automatic local workers and fixed fingerprint seed | Every state in the configured finite model preserves its listed invariant | Rust source equivalence, CPU memory ordering, hardware behavior, or identical state-discovery order across worker counts |
-| Inductive model theorem | TLAPS when a model carries a checked proof | The stated mathematical safety theorem | Temporal liveness not expressed by the checked theorem |
-| Rust boundary | Kani `#[kani::proof]` | The named harness over every symbolic value within its explicit unwind bounds | Whole-workspace concurrency, unmodeled I/O, compiler, or hardware correctness |
+| Symbolic refinement pilot | Apalache | Typed bounded SMT exploration of the exact pilot abstraction | Equivalence to the larger TLC model or unbounded safety |
+| Inductive model theorem | TLAPS | The stated mathematical theorem; currently one endpoint-publication definition lemma | Inductiveness of every model invariant or temporal liveness |
+| Rust boundary | Kani `#[kani::proof]` plus mandatory `kani::cover!` witnesses | The named harness over every symbolic value within its explicit unwind bounds, with non-vacuous admitted paths | Whole-workspace concurrency, unmodeled I/O, compiler, or hardware correctness |
 | Unbounded proof kernel | Verus | The named state partition for all values in the Verus theorem | Equivalence to RustOS source unless a mapped Kani/test gate also exists |
+| Rust undefined behavior | Miri | Executed host-test paths avoid the UB classes modeled by the pinned interpreter | Untested paths, kernel target behavior, races, or hardware |
+| Synchronization kernel | Loom | Every enumerated interleaving in the small endpoint publication/exit proof kernel preserves revocation | Source equivalence outside the mapped algorithm or unbounded thread counts |
+| Parser exploration | Rust libFuzzer plus Clang libFuzzer/ASan/UBSan | Bounded coverage-guided executions do not crash the selected Rust and exact Linux-DVM C parsers | Exhaustiveness, sustained corpus quality, or target-device behavior |
+| Source trace replay | `run-runtime-traces.sh` | Concrete `runtime-control` source outcomes conform to the registered TLA action/result matrix | Production fleet telemetry or every model transition |
+| Source decision witnesses | `run-source-conformance.sh` | Thirty-three unique exact unit tests execute the source decisions mapped to eighteen high-risk lifecycle, RPC, and IPC models; a duplicate, missing, renamed, or filtered witness fails the gate | Full transition-system equivalence, concurrency beyond the tested decision, target hardware, or the other registered models |
 | Integration | focused Rust tests and bounded DVM/KVM smoke | Concrete owner wiring and observable regression behavior | Exhaustive state exploration |
 
 ## Finding acceptance rule
@@ -35,7 +42,13 @@ not a bug. Keep it in `CONFORMANCE.md` until it is resolved.
   then run `bash formal/run-kani.sh`.
 - Verus is pinned with archive hash in `verus.lock`; initialize it with
   `bash formal/setup-verus.sh`, then run `bash formal/run-verus.sh`.
-- The full gate is `bash formal/verify-all.sh`. It uses no Kani flags that
+- Apalache and TLAPS archives are version/hash pinned in their lock files.
+  Their current pilots are typed exec-ticket/handle-transfer refinements and
+  one unbounded endpoint-publication lemma.
+- Kani 0.67 does not expose native SARIF. `normalize-kani-results.py` converts
+  its human output into stable summary JSON and SARIF, and fails any harness
+  with no satisfied cover witness. Failed runs request Kani concrete playback.
+- The full merge gate is `bash formal/verify-all.sh --profile pr`. It uses no Kani flags that
   weaken the analysis such as `--ignore-global-asm`.
 
 The first Rust proof target is `runtime-control::response_payload_len`: a

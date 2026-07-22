@@ -1,0 +1,4 @@
+interface:
+  display_name: "RustOS Session Handoff"
+  short_description: "Resume RustOS work without losing checkout state"
+  default_prompt: "Use $rustos-session-handoff to resume this RustOS checkout safely."

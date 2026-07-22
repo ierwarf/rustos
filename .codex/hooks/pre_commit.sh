@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Codex PreToolUse hook for Bash tool when the command is a git commit.
 #
-# Runs `cargo fmt --check` and `cargo clippy` before the commit lands so
-# the agent doesn't push style/lint regressions. Bypassable only by the
+# Runs formatting and repository-policy checks before the commit lands so
+# the agent doesn't push structural regressions. Bypassable only by the
 # user explicitly invoking with --no-verify (which pre_bash_destructive
 # will already block — by design).
 
@@ -11,7 +11,9 @@ set -euo pipefail
 INPUT="$(cat)"
 
 cmd="$(printf '%s' "$INPUT" | jq -r '
-  .tool_input.command // .arguments.command // .params.command // empty
+  .tool_input.command // .tool_input.cmd //
+  .arguments.command // .arguments.cmd //
+  .params.command // .params.cmd // empty
 ' 2>/dev/null || true)"
 
 if [[ ! "$cmd" =~ git[[:space:]]+commit ]]; then
@@ -44,6 +46,7 @@ if ! .codex/hooks/selftest.sh >/dev/null 2>&1; then
   fail "RustOS agent/hook policy selftest failed. Run '.codex/hooks/selftest.sh' and repair the reported contract drift."
 fi
 
-# clippy is already run by post_edit_rust.sh after every .rs edit;
-# re-running --workspace here adds ~120s per commit for no benefit.
+# `cargo xtask check` is run by the post-edit hook for changed Rust content.
+# Generic workspace clippy is not claimed here: it lacks xtask's generated
+# build configuration and is not currently an admitted repository gate.
 exit 0

@@ -12,8 +12,6 @@ mod service_ops;
 mod support;
 mod syscalld_ops;
 
-pub(crate) use ipc_ops::cleanup_service_endpoints_for_process;
-
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::convert::TryFrom;
@@ -117,6 +115,7 @@ const LINUX_ENODEV: i64 = 19;
 const LINUX_ENOTDIR: i64 = 20;
 const LINUX_ENOTSOCK: i64 = 88;
 const LINUX_ENOTTY: i64 = 25;
+const LINUX_EMFILE: i64 = 24;
 const LINUX_EOPNOTSUPP: i64 = 95;
 const LINUX_EAFNOSUPPORT: i64 = 97;
 const LINUX_EPIPE: i64 = 32;
@@ -482,15 +481,7 @@ fn syscall_process_exit(status: u64, exit_group: bool) -> u64 {
         let last_thread = multitask::current_user_process_thread_count().unwrap_or(1) <= 1;
         if exit_group || last_thread {
             let wait_status = ((status as i32) & 0xff) << 8;
-            let _ = multitask::mark_user_process_exiting(process_id);
-            ipc_ops::cleanup_service_endpoints_for_process(process_id);
-            cleanup_proc_broker_state_for_process(process_id);
-            let _ = multitask::note_process_exit_status(process_id, wait_status);
-            let parent = multitask::parent_process_id_of(process_id).unwrap_or(0);
-            if parent != 0 {
-                multitask::queue_linux_signal(parent, parent, linux_abi::SIGCHLD as u64);
-            }
-            offload_ops::record_process_exit(process_id, parent, wait_status);
+            record_linux_process_termination(process_id, wait_status);
         } else {
             cleanup_proc_broker_exec_state_for_thread(process_id, thread_id);
         }
@@ -499,6 +490,50 @@ fn syscall_process_exit(status: u64, exit_group: bool) -> u64 {
         multitask::exit_current_user_process()
     } else {
         multitask::exit_current_user_task()
+    }
+}
+
+pub(crate) fn record_linux_process_termination(process_id: u64, wait_status: i32) {
+    let _ = multitask::mark_user_process_exiting(process_id);
+    ipc_ops::cleanup_service_endpoints_for_process(process_id);
+    cleanup_proc_broker_state_for_process(process_id);
+    let _ = multitask::note_process_exit_status(process_id, wait_status);
+    let parent = multitask::parent_process_id_of(process_id).unwrap_or(0);
+    if parent != 0 {
+        multitask::queue_linux_signal(parent, parent, linux_abi::SIGCHLD as u64);
+    }
+    offload_ops::record_process_exit(process_id, parent, wait_status);
+}
+
+pub(crate) fn record_linux_process_fault_termination(process_id: u64, vector: u8) {
+    record_linux_process_termination(process_id, linux_fault_wait_status(vector));
+}
+
+fn linux_fault_wait_status(vector: u8) -> i32 {
+    // Linux reports the terminating signal in the low seven wait-status
+    // bits. Match its x86 exception classes for the traps RustOS retires
+    // directly instead of delivering a catchable signal frame.
+    match vector {
+        0 | 9 | 16 | 19 => 8, // SIGFPE
+        1 | 3 => 5,           // SIGTRAP
+        6 => 4,               // SIGILL
+        11 | 12 | 17 => 7,    // SIGBUS
+        _ => 11,              // SIGSEGV
+    }
+}
+
+#[cfg(test)]
+mod process_termination_tests {
+    use super::linux_fault_wait_status;
+
+    #[test]
+    fn x86_user_faults_have_linux_wait_signal_status() {
+        assert_eq!(linux_fault_wait_status(0), 8);
+        assert_eq!(linux_fault_wait_status(3), 5);
+        assert_eq!(linux_fault_wait_status(6), 4);
+        assert_eq!(linux_fault_wait_status(7), 11);
+        assert_eq!(linux_fault_wait_status(11), 7);
+        assert_eq!(linux_fault_wait_status(14), 11);
     }
 }
 

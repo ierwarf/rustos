@@ -108,6 +108,26 @@ pub(super) fn deliver_pending_signals_if_needed(frame: &mut SyscallFrame) -> boo
         return false;
     }
     let signal = response.signal as u64;
+    let commit_thread_state = if response.action != PROCD_SELECT_SIGNAL_NONE {
+        // procd owns disposition policy, but ring0 still owns the pending-bit
+        // substrate. Revalidate its answer against the exact snapshot used by
+        // this delivery attempt so a stale or malformed reply cannot clear,
+        // terminate, or redirect execution for a non-pending/masked signal.
+        let Some(current_thread_state) = multitask::current_linux_thread_state() else {
+            return false;
+        };
+        if !signal_selection_is_current(
+            current_thread_state.pending_signals,
+            current_thread_state.signal_mask,
+            signal,
+            response.action,
+        ) {
+            return false;
+        }
+        Some(current_thread_state)
+    } else {
+        None
+    };
     match response.action {
         PROCD_SELECT_SIGNAL_NONE => {}
         PROCD_SELECT_SIGNAL_IGNORE => {
@@ -117,14 +137,7 @@ pub(super) fn deliver_pending_signals_if_needed(frame: &mut SyscallFrame) -> boo
             clear_current_pending_signal(signal);
             if let Some(process_id) = multitask::current_user_process_id() {
                 let wait_status = signal as i32;
-                let _ = multitask::mark_user_process_exiting(process_id);
-                ipc_ops::cleanup_service_endpoints_for_process(process_id);
-                super::cleanup_proc_broker_state_for_process(process_id);
-                let _ = multitask::note_process_exit_status(process_id, wait_status);
-                let parent = multitask::parent_process_id_of(process_id).unwrap_or(0);
-                if parent != 0 {
-                    multitask::queue_linux_signal(parent, parent, linux_abi::SIGCHLD as u64);
-                }
+                super::record_linux_process_termination(process_id, wait_status);
             }
             multitask::exit_current_user_process();
         }
@@ -134,10 +147,17 @@ pub(super) fn deliver_pending_signals_if_needed(frame: &mut SyscallFrame) -> boo
             }
             let action =
                 read_unaligned::<LinuxSigActionWire>(&response.payload[..LINUX_SIGACTION_SIZE]);
-            if action.handler == 0 || action.restorer == 0 {
+            if !valid_user_signal_target(action.handler)
+                || !valid_user_signal_target(action.restorer)
+            {
                 return false;
             }
-            if install_rt_signal_frame(frame, signal, thread_state.signal_mask, action).is_ok() {
+            let Some(commit_thread_state) = commit_thread_state else {
+                return false;
+            };
+            if install_rt_signal_frame(frame, signal, commit_thread_state.signal_mask, action)
+                .is_ok()
+            {
                 clear_current_pending_signal(signal);
                 return true;
             }
@@ -158,7 +178,7 @@ pub(super) fn syscall_linux_rt_sigreturn(frame: &mut SyscallFrame) -> u64 {
     let _ = multitask::with_current_user_process_and_linux_thread_state_mut(
         |_, _, _, _, linux_thread_state| {
             if let Some(state) = linux_thread_state.as_mut() {
-                state.signal_mask = saved.uc.uc_sigmask;
+                state.signal_mask = sanitize_signal_mask(saved.uc.uc_sigmask);
                 state.signal_stack = linux_signal_stack_from_stack_t(saved.uc.uc_stack);
             }
         },
@@ -183,7 +203,36 @@ fn read_rt_signal_frame(rsp: u64) -> Result<LinuxRtSigFrame, i64> {
 }
 
 fn validate_rt_signal_frame(frame: &LinuxRtSigFrame) -> bool {
-    frame.pretcode != 0 && frame.uc.uc_mcontext.rip != 0 && frame.uc.uc_mcontext.rsp != 0
+    valid_user_signal_target(frame.pretcode)
+        && valid_user_signal_target(frame.uc.uc_mcontext.rip)
+        && valid_user_signal_target(frame.uc.uc_mcontext.rsp)
+}
+
+fn valid_user_signal_target(address: u64) -> bool {
+    (paging::USER_SPACE_BASE..paging::USER_SPACE_END_EXCLUSIVE).contains(&address)
+}
+
+fn sanitize_signal_mask(mask: u64) -> u64 {
+    let unblockable = crate::user::sysops::linux::linux_signal_bit(linux_abi::SIGKILL as u64)
+        .unwrap_or(0)
+        | crate::user::sysops::linux::linux_signal_bit(linux_abi::SIGSTOP as u64).unwrap_or(0);
+    mask & !unblockable
+}
+
+fn signal_selection_is_current(pending: u64, mask: u64, signal: u64, action: u16) -> bool {
+    let Some(bit) = crate::user::sysops::linux::linux_signal_bit(signal) else {
+        return false;
+    };
+    if pending & bit == 0 || mask & bit != 0 {
+        return false;
+    }
+    match action {
+        PROCD_SELECT_SIGNAL_IGNORE | PROCD_SELECT_SIGNAL_HANDLER => {
+            signal != linux_abi::SIGKILL as u64 && signal != linux_abi::SIGSTOP as u64
+        }
+        PROCD_SELECT_SIGNAL_TERMINATE => true,
+        _ => false,
+    }
 }
 
 fn install_rt_signal_frame(
@@ -229,7 +278,7 @@ fn install_rt_signal_frame(
     let _ = multitask::with_current_user_process_and_linux_thread_state_mut(
         |_, _, _, _, linux_thread_state| {
             if let Some(state) = linux_thread_state.as_mut() {
-                state.signal_mask = saved_mask | action.mask | signal_bit;
+                state.signal_mask = sanitize_signal_mask(saved_mask | action.mask | signal_bit);
                 if using_altstack {
                     state.signal_stack.flags |= linux_abi::SS_ONSTACK;
                 }
@@ -376,4 +425,63 @@ pub(super) fn syscall_check(frame: &SyscallFrame) -> Result<(), u64> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn signal_selection_revalidates_pending_mask_and_uncatchable_policy() {
+        let catchable = linux_abi::SIGCHLD as u64;
+        let catchable_bit = crate::user::sysops::linux::linux_signal_bit(catchable).unwrap();
+        assert!(signal_selection_is_current(
+            catchable_bit,
+            0,
+            catchable,
+            PROCD_SELECT_SIGNAL_HANDLER,
+        ));
+        assert!(!signal_selection_is_current(
+            0,
+            0,
+            catchable,
+            PROCD_SELECT_SIGNAL_HANDLER,
+        ));
+        assert!(!signal_selection_is_current(
+            catchable_bit,
+            catchable_bit,
+            catchable,
+            PROCD_SELECT_SIGNAL_HANDLER,
+        ));
+
+        let kill = linux_abi::SIGKILL as u64;
+        let kill_bit = crate::user::sysops::linux::linux_signal_bit(kill).unwrap();
+        assert!(!signal_selection_is_current(
+            kill_bit,
+            0,
+            kill,
+            PROCD_SELECT_SIGNAL_IGNORE,
+        ));
+        assert!(!signal_selection_is_current(
+            kill_bit,
+            0,
+            kill,
+            PROCD_SELECT_SIGNAL_HANDLER,
+        ));
+        assert!(signal_selection_is_current(
+            kill_bit,
+            0,
+            kill,
+            PROCD_SELECT_SIGNAL_TERMINATE,
+        ));
+    }
+
+    #[test]
+    fn restored_signal_mask_cannot_block_kill_or_stop() {
+        let kill = crate::user::sysops::linux::linux_signal_bit(linux_abi::SIGKILL as u64).unwrap();
+        let stop = crate::user::sysops::linux::linux_signal_bit(linux_abi::SIGSTOP as u64).unwrap();
+        let catchable =
+            crate::user::sysops::linux::linux_signal_bit(linux_abi::SIGCHLD as u64).unwrap();
+        assert_eq!(sanitize_signal_mask(kill | stop | catchable), catchable);
+    }
 }

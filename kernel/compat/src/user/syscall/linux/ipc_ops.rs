@@ -194,7 +194,12 @@ pub(super) fn current_process_has_service_capability(capability: u64) -> bool {
     let Some(process_id) = multitask::current_user_process_id() else {
         return false;
     };
-    if multitask::is_user_process_exiting(process_id) {
+    let _registry = SERVICE_ENDPOINT_REGISTRY_MUTATION.lock();
+    current_process_has_service_capability_locked(capability, process_id)
+}
+
+fn current_process_has_service_capability_locked(capability: u64, process_id: u64) -> bool {
+    if capability == 0 || multitask::is_user_process_exiting(process_id) {
         return false;
     }
     SERVICE_ENDPOINTS
@@ -202,10 +207,8 @@ pub(super) fn current_process_has_service_capability(capability: u64) -> bool {
         .zip(SERVICE_ENDPOINT_OWNERS.iter())
         .zip(SERVICE_ENDPOINT_CAPS.iter())
         .any(|((endpoint, owner), caps)| {
-            // Endpoint publication is the registration commit point. Before
-            // it becomes visible, a pre-published owner/capability pair must
-            // fail closed; after revocation it must no longer authorize a
-            // broker even if another CPU still observes either stale field.
+            // Readers share the mutation critical section so this three-field
+            // tuple cannot combine generations during revoke/republication.
             endpoint.load(Ordering::Acquire) != 0
                 && owner.load(Ordering::Acquire) == process_id
                 && caps.load(Ordering::Acquire) & capability == capability
@@ -220,6 +223,11 @@ fn current_process_can_lookup_service_endpoint() -> bool {
 
 fn service_endpoint_raw(service_id: u64) -> Option<u64> {
     let index = service_index(service_id)?;
+    let _registry = SERVICE_ENDPOINT_REGISTRY_MUTATION.lock();
+    service_endpoint_raw_locked(index)
+}
+
+fn service_endpoint_raw_locked(index: usize) -> Option<u64> {
     let endpoint = SERVICE_ENDPOINTS[index].load(Ordering::Acquire);
     if endpoint == 0 {
         return Some(0);
@@ -240,6 +248,7 @@ fn process_owns_live_service_endpoint(process_id: u64, service_id: u64) -> bool 
     let Some(index) = service_index(service_id) else {
         return false;
     };
+    let _registry = SERVICE_ENDPOINT_REGISTRY_MUTATION.lock();
     SERVICE_ENDPOINTS[index].load(Ordering::Acquire) != 0
         && SERVICE_ENDPOINT_OWNERS[index].load(Ordering::Acquire) == process_id
         && !multitask::is_user_process_exiting(process_id)
@@ -460,8 +469,9 @@ pub(super) fn syscall_linux_rustos_ipc_register_service_endpoint(
             return 0;
         }
         if owner != process_id
-            && !current_process_has_service_capability(
+            && !current_process_has_service_capability_locked(
                 rustos_user_abi::syscall::IPC_SERVICE_CAP_ROOT_SUPERVISOR,
+                process_id,
             )
         {
             record_service_endpoint_milestone(
@@ -541,6 +551,16 @@ fn service_capability(service_id: u64) -> Result<u64, i64> {
     }
 }
 
+pub(super) fn validate_commercial_response_envelope(
+    request: &CommercialMaxProtocolRequest,
+    response: &CommercialMaxProtocolResponse,
+) -> Result<(), i64> {
+    if !response.is_valid_envelope_for(request) {
+        return Err(LINUX_EINVAL);
+    }
+    Ok(())
+}
+
 fn service_capability_via_rootd(service_id: u64) -> Result<u64, i64> {
     let mut request = CommercialMaxProtocolRequest::default();
     request.header.version = rustos_user_abi::syscall::COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
@@ -557,13 +577,8 @@ fn service_capability_via_rootd(service_id: u64) -> Result<u64, i64> {
         return Err(LINUX_EINVAL);
     }
     let response = read_unaligned::<CommercialMaxProtocolResponse>(response.as_slice());
-    if response.header.version != rustos_user_abi::syscall::COMMERCIAL_MAX_PROTOCOL_ABI_VERSION
-        || response.header.protocol
-            != rustos_user_abi::syscall::COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR
-        || response.header.op
-            != rustos_user_abi::syscall::COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY
-        || response.payload_len != 0
-    {
+    validate_commercial_response_envelope(&request, &response)?;
+    if response.descriptor_count != 0 || response.payload_len != 0 || response.value1 != 0 {
         return Err(LINUX_EINVAL);
     }
     if response.status != 0 {
@@ -639,7 +654,7 @@ pub(super) fn syscall_linux_rustos_ipc_wait_service_endpoint(args_ptr: u64) -> u
             Ok(None) => {}
             Err(errno) => return linux_errno(errno),
         }
-        if !multitask::is_user_task_alive(args.expected_pid) {
+        if multitask::is_user_process_exiting(args.expected_pid) {
             remove_service_endpoint_waiter(task_id);
             crate::arch::rtc::disarm_sleep_waiter(task_id);
             return linux_errno(LINUX_ESRCH);
@@ -676,7 +691,7 @@ pub(super) fn syscall_linux_rustos_ipc_wait_service_endpoint(args_ptr: u64) -> u
                 return linux_errno(errno);
             }
         }
-        if !multitask::is_user_task_alive(args.expected_pid)
+        if multitask::is_user_process_exiting(args.expected_pid)
             || crate::arch::rtc::ticks() >= deadline_tick
         {
             remove_service_endpoint_waiter(task_id);
@@ -707,6 +722,7 @@ fn service_endpoint_for_expected_process(
     expected_pid: u64,
 ) -> Result<Option<u64>, i64> {
     let index = service_index(service_id).ok_or(LINUX_EINVAL)?;
+    let _registry = SERVICE_ENDPOINT_REGISTRY_MUTATION.lock();
     let endpoint = SERVICE_ENDPOINTS[index].load(Ordering::Acquire);
     if endpoint == 0 {
         return Ok(None);
@@ -737,11 +753,11 @@ fn authorize_service_lookup_via_rootd(service_id: u64) -> Result<(), i64> {
         return Err(LINUX_EINVAL);
     }
     let response = read_unaligned::<CommercialMaxProtocolResponse>(response.as_slice());
-    if response.header.version != rustos_user_abi::syscall::COMMERCIAL_MAX_PROTOCOL_ABI_VERSION
-        || response.header.protocol
-            != rustos_user_abi::syscall::COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR
-        || response.header.op != rustos_user_abi::syscall::COMMERCIAL_MAX_ROOTD_OP_SERVICE_LOOKUP
+    validate_commercial_response_envelope(&request, &response)?;
+    if response.descriptor_count != 0
         || response.payload_len != 0
+        || response.value0 != service_id
+        || response.value1 != 0
     {
         return Err(LINUX_EINVAL);
     }
@@ -1894,9 +1910,17 @@ pub(super) fn install_transfer_descriptors_for_current_process(
 ) -> Result<Vec<i32>, i64> {
     let entries = take_transfer_entries(descriptors)?;
     let Some(fds) = multitask::with_current_user_process_state_mut(|_, _, process_state| {
+        if !process_state
+            .handles()
+            .can_install_additional(entries.len())
+        {
+            return Err(LINUX_EMFILE);
+        }
         let mut fds = Vec::with_capacity(entries.len());
         for entry in entries {
-            let fd = process_state.handles_mut().install_transferred(entry);
+            let Some(fd) = process_state.handles_mut().install_transferred(entry) else {
+                return Err(LINUX_EMFILE);
+            };
             let Ok(fd) = i32::try_from(fd) else {
                 return Err(LINUX_EOVERFLOW);
             };
@@ -2036,6 +2060,69 @@ fn log_slow_ipc_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn matching_commercial_response()
+    -> (CommercialMaxProtocolRequest, CommercialMaxProtocolResponse) {
+        let mut request = CommercialMaxProtocolRequest::default();
+        request.header.protocol =
+            rustos_user_abi::syscall::COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR;
+        request.header.op = rustos_user_abi::syscall::COMMERCIAL_MAX_ROOTD_OP_SERVICE_LOOKUP;
+        request.header.service_id = linux_abi::IPC_SERVICE_ROOTD;
+        request.header.subject_pid = 41;
+        request.header.subject_tid = 43;
+        request.header.ticket = 47;
+        let response = CommercialMaxProtocolResponse {
+            header: request.header,
+            ..CommercialMaxProtocolResponse::default()
+        };
+        (request, response)
+    }
+
+    #[test]
+    fn commercial_response_envelope_is_bound_to_request_and_bounded() {
+        let (request, response) = matching_commercial_response();
+        assert_eq!(
+            validate_commercial_response_envelope(&request, &response),
+            Ok(())
+        );
+
+        let mut wrong_subject = response;
+        wrong_subject.header.subject_tid += 1;
+        assert_eq!(
+            validate_commercial_response_envelope(&request, &wrong_subject),
+            Err(LINUX_EINVAL)
+        );
+
+        let mut reserved = response;
+        reserved.reserved1 = 1;
+        assert_eq!(
+            validate_commercial_response_envelope(&request, &reserved),
+            Err(LINUX_EINVAL)
+        );
+
+        let mut too_many_descriptors = response;
+        too_many_descriptors.descriptor_count = (too_many_descriptors.descriptors.len() + 1) as u16;
+        assert_eq!(
+            validate_commercial_response_envelope(&request, &too_many_descriptors),
+            Err(LINUX_EINVAL)
+        );
+
+        let mut oversized_capability_label = response;
+        oversized_capability_label.capability.label_len =
+            (oversized_capability_label.capability.label.len() + 1) as u16;
+        assert_eq!(
+            validate_commercial_response_envelope(&request, &oversized_capability_label),
+            Err(LINUX_EINVAL)
+        );
+
+        let mut malformed_descriptor = response;
+        malformed_descriptor.descriptor_count = 1;
+        malformed_descriptor.descriptors[0].reserved0 = 1;
+        assert_eq!(
+            validate_commercial_response_envelope(&request, &malformed_descriptor),
+            Err(LINUX_EINVAL)
+        );
+    }
 
     fn ready_netd_poll_response() -> [u8; NETD_IPC_RESPONSE_HEADER_SIZE] {
         let mut response = [0_u8; NETD_IPC_RESPONSE_HEADER_SIZE];

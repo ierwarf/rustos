@@ -2669,6 +2669,8 @@ mod verification {
         let code: u16 = kani::any();
         let value: u8 = kani::any();
         let result = RustosInputFrame::linux_evdev_key(epoch, sequence, code, value);
+        kani::cover!(result.is_ok());
+        kani::cover!(result.is_err());
 
         if epoch == 0 || sequence == 0 || code == 0 || code > LINUX_EVDEV_KEY_MAX || value > 2 {
             assert!(result.is_err());
@@ -2708,6 +2710,8 @@ mod verification {
             wheel_horizontal,
             buttons,
         );
+        kani::cover!(result.is_ok());
+        kani::cover!(result.is_err());
 
         if epoch == 0 || sequence == 0 || buttons & !RUSTOS_POINTER_BUTTON_MASK != 0 {
             assert!(result.is_err());

@@ -14,9 +14,11 @@ Concrete owners and source anchors:
 
 The model abstracts ABI bytes and PID allocation. A service has exactly one
 rootd lease slot; `reporter` is the supervisor PID/generation that admitted it.
-After initd crashes, the next initd must adopt only a live exact-PID endpoint.
-An endpoint-less lease blocks replacement until its deadline, at which point
-reclaim clears its authority and cascades to descendants reported by it.
+The normal observed initd-exit transition revokes every descendant immediately.
+The defensive reconciliation cut separately starts a new initd with imported
+live leases: it may adopt only a live exact-PID endpoint. An endpoint-less
+lease blocks replacement until its deadline, at which point reclaim clears its
+authority and cascades to descendants reported by it.
 *******************************************************************************)
 
 CONSTANT MaxTick
@@ -39,33 +41,43 @@ vars == <<currentInitd, state, live, endpoint, reporter, recovery, deadline,
           tracked, clock>>
 
 Init ==
-    /\ currentInitd = "old"
-    /\ state = [service \in Services |-> Ready]
+    /\ currentInitd \in {"old", "new"}
+    \* Recovery may start at any cut through the old supervisor's bounded
+    \* admit -> endpoint-ready transaction.  Restricting Init to Ready made
+    \* LateEndpointReady dead code and silently omitted the crash race that
+    \* this model exists to check.
+    /\ state \in [Services -> {Admitted, Ready}]
+    /\ state["sessiond"] # Ready => state["uiserver"] # Ready
     /\ live = [service \in Services |-> TRUE]
-    /\ endpoint = [service \in Services |-> TRUE]
+    /\ endpoint = [service \in Services |-> state[service] = Ready]
     /\ reporter = [service \in Services |-> "old"]
-    /\ recovery = [service \in Services |-> FALSE]
-    /\ deadline = [service \in Services |-> 0]
-    /\ tracked = [service \in Services |-> TRUE]
+    /\ recovery = [service \in Services |->
+          currentInitd = "new" /\ service \in InitdManaged /\ state[service] # Empty]
+    /\ deadline = [service \in Services |->
+          IF currentInitd = "new" /\ service \in InitdManaged /\ state[service] # Empty
+          THEN 2 ELSE 0]
+    /\ tracked = [service \in Services |->
+          currentInitd = "old" /\ state[service] = Ready]
     /\ clock = 0
 
-\* Initd exits while its reported children remain. The new initd deliberately
-\* knows none of them until it checks the exact-PID endpoint.
+\* Rootd observes initd exit before it starts the replacement. The reporter
+\* closure is revoked in that same turn; no child keeps policy authority while
+\* waiting for its own later lifecycle record.
 CrashAndReplaceInitd ==
     /\ currentInitd = "old"
     \* Every post-crash adoption/reclaim window must fit inside the finite
     \* TLC clock; otherwise a final-tick replacement would hide the deadline.
     /\ clock <= MaxTick - 2
     /\ currentInitd' = "new"
-    /\ recovery' = [service \in Services |->
-          service \in InitdManaged /\ state[service] # Empty]
+    /\ state' = [service \in Services |-> Exited]
+    /\ live' = [service \in Services |-> FALSE]
+    /\ endpoint' = [service \in Services |-> FALSE]
+    /\ recovery' = [service \in Services |-> service \in InitdManaged]
     /\ deadline' = [service \in Services |->
-          IF service \in InitdManaged /\ state[service] # Empty
-          THEN clock + 2 ELSE deadline[service]]
+          IF service \in InitdManaged THEN clock ELSE deadline[service]]
     /\ tracked' = [service \in Services |->
-          IF service \in InitdManaged /\ state[service] # Empty
-          THEN FALSE ELSE tracked[service]]
-    /\ UNCHANGED <<state, live, endpoint, reporter, clock>>
+          IF service \in InitdManaged THEN FALSE ELSE tracked[service]]
+    /\ UNCHANGED <<reporter, clock>>
 
 \* A child can still finish endpoint registration after its old supervisor
 \* dies. That is safe only because adoption validates the lease's exact PID.
@@ -116,6 +128,9 @@ ReclaimStaleLease(service) ==
     /\ recovery' = [recovery EXCEPT ![service] = FALSE]
     /\ tracked' = [tracked EXCEPT ![service] = FALSE]
     /\ UNCHANGED <<currentInitd, deadline, clock>>
+
+SettleRecovery(service) ==
+    AdoptExactReadyLease(service) \/ ReclaimStaleLease(service)
 
 LaunchReplacement(service) ==
     /\ service \in InitdManaged
@@ -192,5 +207,10 @@ ReadyRecoveryHasExactEndpoint ==
         recovery[service] /\ state[service] = Ready =>
             live[service] /\ endpoint[service]
 
+RecoveryEventuallySettles ==
+    \A service \in InitdManaged: recovery[service] ~> ~recovery[service]
+
 Spec == Init /\ [][Next]_vars
+        /\ SF_vars(AdvanceClock)
+        /\ \A service \in InitdManaged: WF_vars(SettleRecovery(service))
 ================================================================================

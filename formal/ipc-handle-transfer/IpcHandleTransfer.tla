@@ -17,9 +17,14 @@ KernelTransferredHandle values, while the process substrate owns the actual
 handle entries.  This separation is safe only if every path that removes an
 endpoint message returns its descriptors to the substrate.
 
-Linearization points: registry insertion, endpoint enqueue/dequeue, registry
+Linearization points: registry insertion, endpoint enqueue/dequeue, pre-dequeue
+receiver-output validation, registry
 take for installation, registry drop for cancellation/rejection, and caller
 observation of a PeerClosed response.
+
+The finite model does not claim the still-unimplemented post-validation
+user-mapping race between descriptor installation and numeric-FD copyout; that
+transactional reservation/commit gap is tracked as a failed coverage gate.
 *******************************************************************************)
 
 CONSTANTS Descriptors

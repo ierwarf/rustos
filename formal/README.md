@@ -13,6 +13,16 @@ source transition or cleanup owner changes.
 exhaustive TLC result from the separate checks for clock horizon, freshness,
 terminal cleanup, and named liveness assumptions.
 
+## Registered gates and evidence
+
+`models.tsv` is the sole executable-model registry. `selftest.sh` rejects an
+unregistered primary TLA source or TLA/CFG pair, orphaned config, missing invariant/property,
+unexplained terminal deadlock policy, missing conformance mapping, or a pilot
+flag without its corresponding executable artifact. A `temporal` row must use
+`SPECIFICATION Spec`; configuring `INIT`/`NEXT` directly would silently bypass
+the fairness assumptions written into `Spec`. Do not add a model only to
+`run-all-tlc.sh`; that list is generated from the registry.
+
 ## Run the PR suite
 
 Java 11 or later plus curl and sha256sum are required. The runner fetches the
@@ -20,13 +30,24 @@ TLC jar named in [tla2tools.lock](tla2tools.lock), verifies its SHA-256, and
 stores it outside the worktree. TLC state files also stay in a temporary
 directory.
 
-    bash formal/run-all-tlc.sh
+    bash formal/run-all-tlc.sh --profile pr
 
 The full formal gate also runs the Rust implementation proofs:
 
     bash formal/setup-kani.sh   # once per pinned Kani version
     bash formal/setup-verus.sh  # once per pinned Verus release
-    bash formal/verify-all.sh
+    bash formal/verify-all.sh --profile pr
+
+The scheduled/manual nightly tier changes TLC fingerprint and seed, retains
+single-worker reproducibility, adds fixed-seed long-trace simulation only for
+registry-selected models, and runs Miri, Loom, Apalache, TLAPS, and bounded
+Rust/C libFuzzer campaigns:
+
+    bash formal/verify-all.sh --profile nightly
+
+Set up its pinned optional tools with `setup-miri.sh`, `setup-fuzz.sh`,
+`setup-apalache.sh`, and `setup-tlaps.sh`. Tool archives are hash checked and
+installed below user caches; no setup script changes host packages.
 
 `PROOF-INFRA.md` records the evidence boundary and the rule for accepting a
 counterexample as an implementation bug. Do not treat a solver limitation or
@@ -36,13 +57,15 @@ Run an individual model with:
 
     bash formal/run-tlc.sh endpoint-registry/EndpointRegistry
 
-The runner uses TLC's automatic local worker count and a fixed fingerprint seed.
-This preserves exhaustive invariant checking while avoiding a repository-wide
-single-core bottleneck. Worker scheduling can change exploration order; use
-`TLC_WORKERS=1` when a serial reproduction is needed, or set any positive
-integer for a bounded worker count. The bounded models intentionally reach a
-finite cutoff, so the runner disables TLC's deadlock report; configured
-invariants remain mandatory.
+The runner uses TLC's automatic local worker count and fixed PR fingerprint and
+seed. Worker scheduling can change exploration order; use `TLC_WORKERS=1` for
+a serial reproduction. Deadlock handling is per-model in `models.tsv`:
+`check` requires a deadlock-free state graph, while `intentional-terminal`
+must name why a finite protocol is allowed to stop and passes TLC's `-deadlock`
+flag (which disables deadlock reporting). TLC expression coverage is retained;
+in TLC 1.7.4 a `0:N` action was evaluated but produced no new state, so only an
+evaluation count of zero is a coverage failure. Logs, normalized summaries,
+and counterexamples are retained under `build/formal/`.
 
 ## Models and required properties
 
@@ -53,17 +76,25 @@ invariants remain mandatory.
 | dual-abi-image-admission/DualAbiImageAdmission | loaderd plus `rustos-image-admission` | ELF64 and PE64 plans share one bounded, non-overlapping W^X gate; a main entry must belong to executable memory; only an entryless PE DLL may use entry zero; rejected plans never map |
 | dual-abi-byte-parser/DualAbiByteParser | loaderd plus `rustos-image-admission` | a bounded ELF64/PE64 header, table, relocation and import parse must settle before mapping; rejected or subsequently mutated snapshots never map |
 | page-table-lifecycle/PageTableLifecycle | `kernel-mm` process address spaces | only live user frames map into user pages; every map/protect/unmap preserves W^X and removes unmapped access authority |
+| process-address-space-lifetime/ProcessAddressSpaceLifetime | `kernel-ps` process table and `UserProcessState` | every state/address-space access holds one retained process reference and the per-process mutex; exit freezes the address-space epoch, stale exec cannot clear it, a prepared thread attachment cannot publish after exit and must release its unpublished stack, and reclamation waits for all authority to disappear |
+| futex-waiter-lifecycle/FutexWaiterLifecycle | Linux futex scheduler substrate | a task owns at most one bounded waiter and original identity; requeue changes only its active key; keyed wake, key-independent timeout/spurious wake, and ABI-aware current-thread exit leave one explicit terminal outcome and no futex-table authority; forced foreign-thread cleanup remains a failed source gate |
+| process-signal-delivery/ProcessSignalDelivery | procd policy, HAL fault handoff, and ring0 signal substrate | ring0 consumes only a still-pending unmasked signal; SIGKILL can only terminate and SIGSTOP can only enter a distinct stopped state; neither may be masked, ignored, or handled; invalid user targets and stale policy replies cannot redirect execution; a recoverable user fault retains process and task-IPC authority while a fatal final-thread fault publishes lifecycle evidence and revokes both; source stop/resume conformance remains failed |
+| netd-deferred-reply/NetdDeferredReply | netd AF_UNIX deferred poll queue | the global reservation includes mutex-queued and worker-detached batches; admission stays bounded and each accepted request makes exactly one terminal reply attempt, including queue poison failure |
+| memfd-seal-lifecycle/MemfdSealLifecycle | `kernel-ps` memfd object | atomic seal installation respects `F_SEAL_SEAL`; write sealing requires zero writable mappings; both truncate and EOF-extending write respect grow/shrink seals; mapping counters remain bounded |
+| msi-vector-lifecycle/MsiVectorLifecycle | kernel HAL MSI allocator | allocation is an exact monotonic prefix; only an allocated vector accepts one handler, and an APIC-ready exact handler is required to create a route; vectors are never rebound or recycled |
+| persistent-mutation-admission/PersistentMutationAdmission | vfsd persistent-volume dispatch | the current writable-feature constant is false, so journal/recovery placeholders cannot authorize persistent mutation; volatile `/run` policy never advances persistent state |
 | dma-iommu-isolation/DmaIommuIsolation | L0 hostd plus kernel I/O substrate | device ownership is exact, mappings remain in the assigned domain aperture, revocation removes mappings, and the finite map set stays bounded |
 | filesystem-content-integrity/FilesystemContentIntegrity | signed boot extent manifest plus kernel boot-volume reader | only bytes matching the manifest digest verify; corrupted content fails closed and an unavailable medium terminates the read |
 | network-payload-session/NetworkPayloadSession | DVM Ethernet transport plus netd | only bounded ARP/IPv4 payloads from an active authenticated epoch are delivered; malformed frames are dropped while advancing the sole consumer cursor |
 | scheduler-cpu-distribution/SchedulerCpuDistribution | `kernel-ps` scheduler | every continuously runnable User task receives a turn after the two-dispatch System bound or its per-task ready-age limit; a bounded, deduplicated User latency FIFO drops stale owners and cannot exceed its eight-pick burst; per-task CPU accounting remains bounded in the checked horizon |
-| rootd-bootstrap/RootdBootstrap | rootd, loaderd, IPC endpoint wait | core dependency gate before initd; exact PID lease; endpoint/capability lifecycle; bounded waits; single initd launch |
+| scheduler-thread-demotion/SchedulerThreadDemotion | `kernel-ps` scheduler and uiserver helper threads | self-demotion cannot discard a live reply-scoped donation; untrusted or blocking UI helpers lose inherited System class before entering their loops, while input/present authority remains explicit |
+| rootd-bootstrap/RootdBootstrap | rootd, loaderd, IPC endpoint wait | core dependency gate before initd; exact PID lease; endpoint/capability lifecycle; a five-second endpoint deadline retires an unready child before bounded restart; single initd launch |
 | endpoint-registry/EndpointRegistry | kernel compat IPC registry, rootd capability decision | publication is capability-complete; revoke/exit leave no authority; exact-PID wait cannot succeed on stale or foreign state |
-| endpoint-publication/EndpointPublication | kernel compat IPC registry, process-table exit marker | registry writers are serialized; an exit marker aborts in-flight publication; lookup/capability authority needs an exact running owner; cleanup leaves no terminal authority |
-| deferred-start/DeferredStart | loaderd, rootd, initd, runtimed | suspended child is inert; only its designated supervisor admits it; activation is single-use; endpoint follows activation |
-| post-init-leases/PostInitLeases | rootd post-init readiness and restart policy | only the designated supervisor may report; a foreign live-lease rebind preserves PID/reporter/capability; exact PID idempotency; no capability before report; restart budget never underflows |
-| rootd-restart-backoff/RootdRestartBackoff | rootd core-service recovery and timer substrate | exit revokes old authority; restart is delayed before every replacement; only a successful post-delay retry publishes fresh authority; retry budget is finite and monotonic |
-| post-init-supervisor-recovery/PostInitSupervisorRecovery | rootd/initd post-init recovery and dependent UI revocation | a new initd adopts only an exact ready endpoint; an endpoint-less old lease blocks duplicate launch only for a bounded window; reclaim clears all process/endpoint authority and cascades from sessiond to uiserver |
+| endpoint-publication/EndpointPublication | kernel compat IPC registry, process-table exit marker | writers and reader snapshots share one registry critical section; an exit marker aborts in-flight publication; lookup/capability authority needs one exact running-owner generation; cleanup leaves no terminal authority |
+| deferred-start/DeferredStart | loaderd, rootd, initd, runtimed | suspended child is inert; only its designated supervisor admits it; activation is single-use; endpoint follows activation; activation/timeout failure retires the exact child or stops the unhealthy supervisor before another launch |
+| post-init-leases/PostInitLeases | rootd post-init readiness and restart policy | only initd or the live sessiond/runtimed service may report its child; capability and lookup authority require a complete live reporter chain; reporter exit revokes the bounded descendant closure in the same rootd turn; a foreign live-lease rebind preserves PID/reporter/capability; exact PID idempotency; no capability before report; restart budget never underflows |
+| rootd-restart-backoff/RootdRestartBackoff | rootd core-service recovery, lifecycle fan-out, and timer substrate | exit revokes old authority; external time cannot be starved by unrelated lifecycle work and every pending restart eventually settles or fails the supervisor closed; activation failure retires the exact suspended child before another retry; rootd and procd drain independent bounded queues; root evidence overflow is terminal while policy overflow clears its cache before rebase; retry budget is finite and monotonic |
+| post-init-supervisor-recovery/PostInitSupervisorRecovery | rootd/initd post-init recovery and dependent UI revocation | normal initd exit revokes the complete reporter closure before replacement; a defensive recovery cut adopts only an exact ready endpoint; external monotonic time cannot be starved by repeated sibling recovery, every imported recovery eventually adopts or reclaims, and reclaim clears all process/endpoint authority while cascading from sessiond to uiserver |
 | dvm-control-relay/DvmControlRelay | L0 hostd, Linux DVM agent, RDI3 input receiver | launch-bound CID and exact HELLO issue a fresh challenge; only its HMAC proof permits WELCOME; allowlisted probes, stale/mismatched replies, and replay fail closed; a completed probe gates a fresh relay epoch |
 | dvm-control-endpoint/DvmControlEndpoint | L0 hostd/xtask, Linux DVM agent | only the root-only launch-secret holder derives the per-launch vsock listener port; a same-CID untrusted process cannot reserve setup; a reached endpoint still requires the separate HMAC proof |
 | dvm-agent-readiness/DvmAgentReadiness | Linux DVM control agent and init owner | local health requires an initialized live serving process holding the atomically installed exact ready inode; stale, malformed, symlinked, partial, announced-only, or post-exit state fails closed, and one fixed candidate bounds crash residue |
@@ -73,7 +104,9 @@ invariants remain mandatory.
 | dvm-input-ring/DvmInputRing | L0 producer, fixed ivshmem ring, RustOS MSI-X leaf, inputd broker | only L0 advances producer and only the broker advances consumer; 2,048 fixed 32-byte slots retain cleanup reserve; continuous production requires both an armed vector and a successful policy-backed client poll; DVM tamper attempts cannot mutate the ring; IRQ only wakes; malformed/stale records cannot reach inputd; revoke clears transport/consumer readiness and decoder authority; a boot-wide bounded recovery budget reuses one pinned vector; fairness drains or revokes finite committed work |
 | trusted-ui-boundary/TrustedUiBoundary | DVM display/input provenance, GUI backend, uiserver trusted-UI status | a privileged prompt requires independently attested scanout and human input; DVM compromise, provider loss, or independent-attestation revocation cancels it; a DVM transport may never self-attest |
 | input-readiness/InputReadiness | ring0 ingress queue, finite poll substrate, inputd worker, uiserver reader | the MSI-X worker, bounded STATS readiness recheck, and readiness-gated read are explicit transfer races; every record has exactly one ring0, policy, or delivered owner and service policy drains under consumer fairness |
+| input-ingestion-worker/InputIngestionWorker | ring0 DVM input wake leaf and inputd ingestion worker | only the capability-gated worker may claim policy-consumer readiness or advance committed records; wake/arm races are cursor-rechecked, every turn is bounded, and finite work eventually drains without granting drain authority to client poll |
 | ui-frame-budget/UiFrameBudget | uiserver input loop, console-command worker, frame/present loop | console-policy IPC has bounded FIFO admission and one delivery owner; overload is recorded; an in-flight policy call cannot make local redraw debt wait; active-input feedback is eventually presented |
+| wayland-accept-isolation/WaylandAcceptIsolation | uiserver bounded accept worker and netd-backed socket path | a stalled cross-service accept never owns the UI tick; accepted streams cross one bounded completion queue, overload closes the new client, and queued clients eventually settle under the declared worker/UI fairness |
 | wayland-frame-pacing/WaylandFramePacing | uiserver main present loop and Wayland frame callbacks | input and Wayland damage are consumed by one coalesced presentation; a callback requires one previous-presentation or callback-only cadence permit; permits do not accumulate; pending damage and callbacks eventually progress under named fairness assumptions |
 | ui-input-motion/UiInputMotion | DVM KVM input selftest and uiserver present loop | the test pointer reverses both axes before permanent edge clamping; every initial cursor position yields bounded visible work, and every accepted visible-motion epoch is eventually presented |
 | dvm-input-selftest/DvmInputSelftest | DVM KVM selftest evdev selection, bounded guest scheduler admission, and host input relay | the synthetic composite device cannot emit without absolute pointer capability plus a verified SCHED_RR/RLIMIT_RTTIME guard; limit installation and scheduler admission are separate, rollback/restore must settle, and uncertain restore terminates all process authority; exactly one non-printable keyboard probe precedes pointer-only cycles; every generated position consumes one non-accumulating monotonic cadence permit and produces one pointer position |
@@ -88,6 +121,7 @@ invariants remain mandatory.
 | driver-domain-fleet/DriverDomainFleet | hostd fleet policy and signed release gate | a fleet member is exactly encoded; CIDs, IOMMU groups, and representative PCI functions are globally disjoint; policy is immutable after sealing; only a signed release bound to that fleet can activate a member |
 | ivshmem-pairing/IvshmemPairing | launch-private ivshmem broker and KVM launcher | the RustOS QEMU connection is observed as peer 0 before GUI-DVM launch; peer 1 cannot exist without peer 0; disconnect fails the complete pair closed and no reconnect can reuse the assignment |
 | gui-dvm-surface/GuiDvmSurface | RustOS compositor to the sole supported GUI-DVM transport | `RSGUI002` has exactly three host-provisioned slots, exact even PRESENT/RELEASE generations, one outstanding DVM control record, module-latched pre-boot invitations, offline confirmation clearing, saturated-pool re-invitation, and stale-slot reclamation. It asserts bounded backpressure without fabricating capacity. Multi-domain focus is unavailable and rejected by the source rather than modeled as authority. |
+| gui-dvm-pixel-authority/GuiDvmPixelAuthority | RustOS surface producer, uiserver, and GUI-DVM consumer | damage-only publication may reuse pixels only from the exact preceding snapshot; every slot has one writer/reader owner and monotonic generation, and revoke removes stale pixel authority before a later epoch |
 | dvm-atomic-scanout/DvmAtomicScanout | explicit physical-AMD DMA-BUF/GPU/KMS relay mode | source/model matched, hardware gate failed: the complete 128 MiB pixel backing must first be DMA-pinnable and mapped into the VFIO IOAS, then only a coherent DMA attachment may import all three read-only sources; the kernel names the exact oldest live generation in a non-replayable acquire `sync_file`, and EGL server-waits it before composition into a separate three-buffer GBM output pool; GPU and page-flip fences precede source/output reuse; device-write DMA authority to sources is absent; evidence requires the complete chain; offline revokes both pools. Physical import, scanout, and sustained-rate evidence remain required. |
 | dvm-gpu-compositor/DvmGpuCompositor | uiserver private scene compiler and Linux DVM fixed GLES executor | a bounded OS-owned context admits only clear, solid-quad, and textured-quad commands with host-bound read-only source tokens; only a measured prime record for the current host-selected epoch enables the asynchronous three-entry queue; acquire, completion, release, and presentation are monotonic fence states; raw commands, application shaders, CPU fallback success, and device writes to RustOS sources are impossible; a 16.667 ms target miss retains the prior front and live epoch, while the separate 50 ms hard timeout or revoke invalidates the full epoch and stale completions cannot revive it |
 | dvm-gpu-proof-scheduler/DvmGpuProofScheduler | private AMD/virtio GPU proof process | only the finite post-prime measurement may use bounded SCHED_RR priority 8; limit installation, admission, and exact restore readback are distinct states; it remains below display/input relays; success and ordinary failure restore normal policy before evidence, while hard-limit or uncertain-restore termination publishes no evidence; the health loop has no realtime authority |
@@ -102,8 +136,8 @@ invariants remain mandatory.
 | scheduler-admission/SchedulerAdmission | runtimed launch-catalog admission | a launch record is not a realtime capability: all non-UI requests are clamped below System admission even when registry input is hostile; only the exact trusted UI executable receives its pinned System weight; pending admission eventually settles |
 | ipc-priority-inheritance/IpcPriorityInheritance | scheduler effective classes and compat synchronous IPC | a live reply capability owns the only priority donation; System class propagates through nested calls; completion, cancellation, and task exit revoke it; System work wins until its bounded burst is exhausted, then one ready User turn is mandatory |
 | ipc-handle-transfer/IpcHandleTransfer | process handle substrate, IPC runtime, compat IPC syscalls | a transferred descriptor is either installed or dropped exactly once; queue cancellation, peer-close, invalid receiver output, caller exit, and owner exit after dequeue leave no registry entry; batch transfer is all-or-nothing |
-| ipc-endpoint-ownership/IpcEndpointOwnership | kernel IPC runtime, compat IPC syscalls, process handle table | a process-owned endpoint/reply may be served by its worker threads but cannot be received, replied to, or handle-drained by a foreign process; transferred handles install before a reply becomes terminal; process exit revokes queued/received authority; sparse descriptor duplication never grows beyond the process ceiling |
-| proc-broker-session/ProcBrokerSession | process broker, loaderd, Linux process teardown | exact loader ownership and inherited console-session binding; mapping/runtime state only in a live prepare session; commit attempt is terminal; deferred children stay inert until activation; owner exit aborts every uncommitted prepare |
+| ipc-endpoint-ownership/IpcEndpointOwnership | kernel IPC runtime, compat IPC syscalls, process handle table | a process-owned endpoint/reply may be served by its worker threads but cannot be received, replied to, or handle-drained by a foreign process; transferred handles install before a reply becomes terminal; process exit kills the endpoint, revokes queued/received and installed process-local transfer authority, and cannot be followed by enqueue revival through the dead numeric endpoint; every descriptor installation stays within the process ceiling and a full-table rejection is non-destructive |
+| proc-broker-session/ProcBrokerSession | process broker, loaderd, Linux process teardown | exact loader ownership and inherited console-session binding; mapping/runtime state only in a live prepare session; commit attempt is terminal; deferred children stay inert until activation; owner exit aborts every uncommitted or in-flight prepare before publication |
 | exec-ticket/ExecTicket | procd, loaderd, process broker, Linux thread/process teardown | exact live PID/TID ticket binding; mismatched cancel/exec cannot consume a ticket; one-shot execution and pre-image register handoff; target-thread exit and exec sibling retirement retain no ticket or transition authority |
 
 The rootd-bootstrap model covers the supervisor transaction for core services

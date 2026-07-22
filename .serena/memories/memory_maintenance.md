@@ -6,7 +6,7 @@
 - Initially, agents are provided with the list of all memories (names only).
 - Agents should read `mem:core` as the top-level entry point (graph root).
   This memory should contain references to other memories covering major project domains.
-  The referenced memories shall, in turn, shall contain references to even more specific memories, and so on.
+  The referenced memories shall, in turn, contain references to even more specific memories, and so on.
   The depth of the graph shall depend on the project complexity.
 - Use topics/folders to group related memories in order to make the content structure explicit.
   Folders can mirror project structure (e.g. modules like frontend/backend) or topics like debugging, architecture, etc.
@@ -26,6 +26,7 @@ Keep guidance durable and generalizable, not task-local.
 
 Add or update memories only with stable, non-obvious project conventions that avoid complex rediscovery in the future.
 Do not add: quick-read facts; generic language/framework knowledge; one-off task notes; volatile line-level details; behavior likely to change soon.
+Keep volatile goal, dirty-worktree, blocker, and handoff state in `docs/ai/session-handoff.md`, not in durable Serena memories.
 
 ## Maintenance Actions
 

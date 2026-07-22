@@ -1,0 +1,61 @@
+name: Formal nightly
+
+on:
+  schedule:
+    - cron: "17 18 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: formal-nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  formal-nightly:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+    - name: Cache formal toolchains
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      with:
+        path: |
+          ~/.cargo/bin/cargo-kani
+          ~/.cargo/bin/kani
+          ~/.kani
+          ~/.cache/rustos/tla
+          ~/.cache/rustos/verus
+          ~/.cache/rustos/apalache
+          ~/.cache/rustos/tlaps
+          ~/.cache/miri
+          ~/.cargo/bin/cargo-fuzz
+          ~/.cargo/registry
+        key: ${{ runner.os }}-formal-nightly-${{ hashFiles('formal/tla2tools.lock', 'formal/kani.lock', 'formal/verus.lock', 'formal/apalache.lock', 'formal/tlaps.lock', 'formal/fuzz.lock', 'formal/models.tsv', 'rust-toolchain.toml') }}
+        restore-keys: |
+          ${{ runner.os }}-formal-nightly-
+          ${{ runner.os }}-formal-
+    - name: Install Java for TLC
+      uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4
+      with:
+        distribution: temurin
+        java-version: "17"
+    - name: Install pinned formal tools
+      run: |
+        bash formal/setup-kani.sh
+        bash formal/setup-verus.sh
+        bash formal/setup-miri.sh
+        bash formal/setup-fuzz.sh
+        bash formal/setup-apalache.sh
+        bash formal/setup-tlaps.sh
+    - name: Run deterministic and randomized formal gates
+      run: bash formal/verify-all.sh --profile nightly
+    - name: Upload formal evidence
+      if: always()
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      with:
+        name: formal-nightly-evidence
+        path: build/formal
+        if-no-files-found: error
+        retention-days: 30

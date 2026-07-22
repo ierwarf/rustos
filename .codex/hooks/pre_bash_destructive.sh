@@ -10,7 +10,9 @@ set -euo pipefail
 INPUT="$(cat)"
 
 cmd="$(printf '%s' "$INPUT" | jq -r '
-  .tool_input.command // .arguments.command // .params.command // empty
+  .tool_input.command // .tool_input.cmd //
+  .arguments.command // .arguments.cmd //
+  .params.command // .params.cmd // empty
 ' 2>/dev/null || true)"
 
 if [[ -z "$cmd" ]]; then
@@ -55,9 +57,13 @@ fi
 
 # Direct shell writes into generated/vendor/log paths. Build tools such as
 # cargo/xtask are allowed to write these trees through their own commands.
-if [[ "$cmd" =~ (^[[:space:]]*|[[:space:];|&])[[:alnum:]_./-]*(cp|mv|install|rsync|tee|truncate|sed)[[:space:]] ]] \
+if [[ "$cmd" =~ (^[[:space:]]*|[[:space:];|&])[[:alnum:]_./-]*(cp|mv|install|rsync|tee|truncate)[[:space:]] ]] \
   && [[ "$cmd" =~ $write_protected_path_re ]]; then
   block "direct shell write to generated/vendor/log path"
+fi
+if [[ "$cmd" =~ (^[[:space:]]*|[[:space:];|&])sed[[:space:]]+(-[^[:space:]]*i[^[:space:]]*|--in-place([=[:space:]]|$)) ]] \
+  && [[ "$cmd" =~ $write_protected_path_re ]]; then
+  block "in-place sed write to generated/vendor/log path"
 fi
 if [[ "$cmd" =~ (>|>>)[[:space:]]*(\./)?(build|target|vendor|logs|Cargo\.lock|perf\.data)(/|[[:space:]]|$) ]]; then
   block "redirection into generated/vendor/log path"

@@ -88,8 +88,10 @@ Block(task) ==
     /\ task \in ready
     /\ ready' = ready \ {task}
     /\ readyAge' = [readyAge EXCEPT ![task] = 0]
-    /\ latencyHints' = SelectSeq(latencyHints, LAMBDA hinted: hinted # task)
-    /\ UNCHANGED <<runtime, last, systemBurst, latencyBurst>>
+    \* Keep queued hints until the consumer observes that their owner is no
+    \* longer runnable.  Eagerly filtering here made DropStaleLatencyHint
+    \* unreachable and failed to model the producer/consumer race.
+    /\ UNCHANGED <<runtime, last, systemBurst, latencyBurst, latencyHints>>
 
 Wake(task) ==
     /\ task \notin ready
@@ -114,8 +116,12 @@ Spec ==
     /\ [][Next]_vars
     /\ WF_vars(DispatchAnySystem)
     /\ \A task \in UserTasks: SF_vars(DispatchUser(task))
-    /\ WF_vars(DispatchLatency)
-    /\ WF_vars(DropStaleLatencyHint)
+    \* A producer can repeatedly make the queue head runnable/unrunnable.
+    \* Weak fairness permits that flicker to starve every later hint forever;
+    \* the consumer polling contract therefore requires strong fairness for
+    \* both consuming a runnable head and dropping an observed stale head.
+    /\ SF_vars(DispatchLatency)
+    /\ SF_vars(DropStaleLatencyHint)
 
 TypeOK ==
     /\ ready \in SUBSET Tasks

@@ -147,12 +147,12 @@ impl RetainedCurrentUserProcessState {
         self.abi
     }
 
-    pub fn process_state(&self) -> &UserProcessState {
-        self.process.state()
+    pub fn with_process_state<R>(&self, f: impl FnOnce(&UserProcessState) -> R) -> R {
+        self.process.with_state(|_, state| f(state))
     }
 
-    pub fn address_space(&self) -> &ProcessAddressSpace {
-        self.process.state().address_space()
+    pub fn with_address_space<R>(&self, f: impl FnOnce(&ProcessAddressSpace) -> R) -> R {
+        self.process.with_state(|_, state| f(state.address_space()))
     }
 }
 
@@ -182,12 +182,12 @@ impl RetainedCurrentUserAddressSpace {
         self.process_id
     }
 
-    pub fn process_state(&self) -> &UserProcessState {
-        self.process.state()
+    pub fn with_process_state<R>(&self, f: impl FnOnce(&UserProcessState) -> R) -> R {
+        self.process.with_state(|_, state| f(state))
     }
 
-    pub fn address_space(&self) -> &ProcessAddressSpace {
-        self.process.state().address_space()
+    pub fn with_address_space<R>(&self, f: impl FnOnce(&ProcessAddressSpace) -> R) -> R {
+        self.process.with_state(|_, state| f(state.address_space()))
     }
 }
 

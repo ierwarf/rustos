@@ -239,26 +239,27 @@ pub fn with_current_user_linux_state_mut<R>(
         &mut Option<LinuxThreadState>,
     ) -> R,
 ) -> Option<R> {
-    let (process_id, tid, abi, mut process, mut linux_thread_state) =
+    let (process_id, tid, abi, process, mut linux_thread_state) =
         retain_current_linux_thread_binding()?;
     let linux_thread_state = unsafe { linux_thread_state.as_mut() };
-    let (address_space, linux_process_state) = process
-        .state_mut()
-        .address_space_and_linux_process_state_mut();
-    Some(f(
-        process_id,
-        tid,
-        abi,
-        address_space,
-        linux_process_state,
-        linux_thread_state,
-    ))
+    Some(process.with_state_mut(|_, state| {
+        let (address_space, linux_process_state) =
+            state.address_space_and_linux_process_state_mut();
+        f(
+            process_id,
+            tid,
+            abi,
+            address_space,
+            linux_process_state,
+            linux_thread_state,
+        )
+    }))
 }
 
 pub fn with_current_user_process_state_mut<R>(
     f: impl FnOnce(u64, UserAbi, &mut UserProcessState) -> R,
 ) -> Option<R> {
-    let (thread_id, abi, mut process) = retain_current_user_process_binding()?;
+    let (thread_id, abi, process) = retain_current_user_process_binding()?;
     Some(process.with_state_mut(|_, process_state| f(thread_id, abi, process_state)))
 }
 
@@ -308,7 +309,7 @@ pub fn wait_for_child(parent_process_id: u64, target_pid: i64) -> WaitChildResul
 
 pub fn with_current_mm<R>(f: impl FnOnce(&ProcessAddressSpace) -> R) -> Option<R> {
     let (_, _, process) = retain_current_user_process_binding()?;
-    Some(f(process.state().address_space()))
+    Some(process.with_state(|_, state| f(state.address_space())))
 }
 
 pub fn with_current_process_credentials<R>(
@@ -329,7 +330,7 @@ pub fn retain_current_user_process_state() -> Option<RetainedCurrentUserProcessS
 pub fn with_current_process_state_mut<R>(
     f: impl FnOnce(u64, &mut UserProcessState) -> R,
 ) -> Option<R> {
-    let mut process = retain_current_process_ref()?;
+    let process = retain_current_process_ref()?;
     Some(process.with_state_mut(f))
 }
 
@@ -348,16 +349,10 @@ pub fn with_process_state_by_pid<R>(
 pub fn with_current_user_process_and_linux_thread_state_mut<R>(
     f: impl FnOnce(u64, u64, UserAbi, &mut UserProcessState, &mut Option<LinuxThreadState>) -> R,
 ) -> Option<R> {
-    let (process_id, tid, abi, mut process, mut linux_thread_state) =
+    let (process_id, tid, abi, process, mut linux_thread_state) =
         retain_current_linux_thread_binding()?;
     let linux_thread_state = unsafe { linux_thread_state.as_mut() };
-    Some(f(
-        process_id,
-        tid,
-        abi,
-        process.state_mut(),
-        linux_thread_state,
-    ))
+    Some(process.with_state_mut(|_, state| f(process_id, tid, abi, state, linux_thread_state)))
 }
 
 pub fn queue_linux_signal(process_id: u64, task_id: u64, signal: u64) -> bool {
@@ -437,24 +432,6 @@ pub fn halt_current_retired_task() -> ! {
 
 pub(crate) fn exit_current_task() -> ! {
     interrupts::without_interrupts(|| unsafe {
-        if let Some(task_id) = scheduler_ref().current_task_id() {
-            let endpoint_wake_set = {
-                kernel_ipc_runtime::api::remove_endpoint_waiters_for_task(task_id);
-                let discarded = kernel_ipc_runtime::api::cancel_endpoint_calls_for_task(task_id);
-                crate::user::handles::drop_ipc_transfer_descriptors(discarded.as_slice());
-                kernel_ipc_runtime::api::fail_endpoints_owned_by_task(
-                    task_id,
-                    kernel_ipc_runtime::api::IpcError::PeerClosed,
-                )
-            };
-            let scheduler = scheduler_mut();
-            for task_id in endpoint_wake_set.callers {
-                let _ = scheduler.wake_task(task_id);
-            }
-            for task_id in endpoint_wake_set.receivers {
-                let _ = scheduler.wake_task(task_id);
-            }
-        }
         scheduler_mut().exit_current_task();
     });
     halt_current_retired_task()
@@ -465,39 +442,7 @@ pub fn exit_current_user_task() -> ! {
 }
 
 pub fn exit_current_user_process() -> ! {
-    let process_id = current_user_process_id();
     interrupts::without_interrupts(|| unsafe {
-        let (task_ids, task_count) = scheduler_ref().current_process_task_ids();
-        for task_id in task_ids.into_iter().take(task_count) {
-            kernel_ipc_runtime::api::remove_endpoint_waiters_for_task(task_id);
-            let discarded = kernel_ipc_runtime::api::cancel_endpoint_calls_for_task(task_id);
-            crate::user::handles::drop_ipc_transfer_descriptors(discarded.as_slice());
-            let endpoint_wake_set = kernel_ipc_runtime::api::fail_endpoints_owned_by_task(
-                task_id,
-                kernel_ipc_runtime::api::IpcError::PeerClosed,
-            );
-            let scheduler = scheduler_mut();
-            for caller in endpoint_wake_set.callers {
-                let _ = scheduler.wake_task(caller);
-            }
-            for receiver in endpoint_wake_set.receivers {
-                let _ = scheduler.wake_task(receiver);
-            }
-        }
-        if let Some(process_id) = process_id {
-            scheduler_mut().release_ipc_priorities_for_process(process_id);
-            let endpoint_wake_set = kernel_ipc_runtime::api::fail_endpoints_owned_by_process(
-                process_id,
-                kernel_ipc_runtime::api::IpcError::PeerClosed,
-            );
-            let scheduler = scheduler_mut();
-            for caller in endpoint_wake_set.callers {
-                let _ = scheduler.wake_task(caller);
-            }
-            for receiver in endpoint_wake_set.receivers {
-                let _ = scheduler.wake_task(receiver);
-            }
-        }
         scheduler_mut().exit_current_process();
     });
     halt_current_retired_task()

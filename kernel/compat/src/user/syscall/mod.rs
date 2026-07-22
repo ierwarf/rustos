@@ -24,6 +24,33 @@ const USER_RFLAGS_FORBIDDEN_MASK: u64 = RFlags::TRAP_FLAG.bits()
     | RFlags::IOPL_HIGH.bits()
     | RFlags::VIRTUAL_8086_MODE.bits();
 
+pub(crate) fn retire_current_linux_task_due_to_fault(
+    vector: u8,
+    error_code: Option<u64>,
+    cr2: u64,
+    rip: u64,
+    rsp: u64,
+) -> multitask::UserFaultDisposition {
+    let final_process_thread = multitask::current_user_process_id().and_then(|process_id| {
+        (multitask::current_user_process_thread_count().unwrap_or(1) <= 1).then_some(process_id)
+    });
+    let disposition =
+        multitask::retire_current_user_task_due_to_fault(vector, error_code, cr2, rip, rsp);
+    if let Some(process_id) = fault_termination_process(disposition, final_process_thread) {
+        linux::record_linux_process_fault_termination(process_id, vector);
+    }
+    disposition
+}
+
+fn fault_termination_process(
+    disposition: multitask::UserFaultDisposition,
+    final_process_thread: Option<u64>,
+) -> Option<u64> {
+    (disposition == multitask::UserFaultDisposition::Retired)
+        .then_some(final_process_thread)
+        .flatten()
+}
+
 #[repr(C)]
 pub(crate) struct SyscallFrame {
     user_rsp: u64,
@@ -188,7 +215,7 @@ pub(super) fn validate_syscall_entry_or_terminate(frame: &SyscallFrame) -> UserA
             frame.user_rflags,
             frame.rax,
         );
-        let disposition = multitask::retire_current_user_task_due_to_fault(
+        let disposition = retire_current_linux_task_due_to_fault(
             GENERAL_PROTECTION_VECTOR,
             Some(0),
             0,
@@ -324,10 +351,31 @@ fn trace_syscall_exit(_frame: &SyscallFrame, _abi: UserAbi, _result: u64) {}
 #[cfg(test)]
 mod tests {
     use super::{
-        SyscallFrame, syscall_return_contract, user_address_is_sysret_safe,
-        user_rflags_are_sysret_safe,
+        SyscallFrame, fault_termination_process, syscall_return_contract,
+        user_address_is_sysret_safe, user_rflags_are_sysret_safe,
     };
     use crate::memory::paging;
+    use crate::multitask::UserFaultDisposition;
+
+    #[test]
+    fn only_retired_final_thread_commits_fault_termination() {
+        assert_eq!(
+            fault_termination_process(UserFaultDisposition::Resumed, Some(41)),
+            None
+        );
+        assert_eq!(
+            fault_termination_process(UserFaultDisposition::Unhandled, Some(41)),
+            None
+        );
+        assert_eq!(
+            fault_termination_process(UserFaultDisposition::Retired, None),
+            None
+        );
+        assert_eq!(
+            fault_termination_process(UserFaultDisposition::Retired, Some(41)),
+            Some(41)
+        );
+    }
 
     fn valid_frame() -> SyscallFrame {
         SyscallFrame {

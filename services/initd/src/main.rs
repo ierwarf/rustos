@@ -179,26 +179,35 @@ fn main() {
                     running_packages.insert(entry.package_id.clone());
                     retry_state.remove(entry.exec.as_str());
                     if let Err(err) = report_rootd_service_lease(entry.exec.as_str(), pid) {
-                        fail_closed(&format!(
+                        fail_closed_after_child_cleanup(
+                            pid,
+                            &format!(
                             "initd: fatal rootd lease report failed exec={} pid={pid} errno={err}",
                             entry.exec
-                        ));
+                        ),
+                        );
                     }
                     boot_line(&format!(
                         "initd: rootd lease report ok exec={} pid={pid}",
                         entry.exec
                     ));
                     if let Err(err) = activate_spawned_service(pid) {
-                        fail_closed(&format!(
+                        fail_closed_after_child_cleanup(
+                            pid,
+                            &format!(
                             "initd: fatal service activation failed exec={} pid={pid} errno={err}",
                             entry.exec
-                        ));
+                        ),
+                        );
                     }
                     if let Err(err) = wait_reported_service_endpoint(entry.exec.as_str(), pid) {
-                        fail_closed(&format!(
+                        fail_closed_after_child_cleanup(
+                            pid,
+                            &format!(
                             "initd: fatal service endpoint not ready exec={} pid={pid} errno={err}",
                             entry.exec
-                        ));
+                        ),
+                        );
                     }
                     boot_line(&format!(
                         "initd: service endpoint ready exec={} pid={pid}",
@@ -626,9 +635,9 @@ fn call_rootd_supervisor(
         return Err((-call) as i32);
     }
     if call as usize != size_of::<CommercialMaxProtocolResponse>()
-        || response.header.version != COMMERCIAL_MAX_PROTOCOL_ABI_VERSION
-        || response.header.protocol != COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR
-        || response.header.op != op
+        || !response.is_valid_envelope_for(&request)
+        || response.descriptor_count != 0
+        || response.payload_len != 0
     {
         return Err(libc::EINVAL);
     }
@@ -680,9 +689,11 @@ fn report_rootd_service_lease_inner(service_id: u64, exec_path: &str, pid: u64) 
         return Err((-call) as i32);
     }
     if call as usize != size_of::<CommercialMaxProtocolResponse>()
-        || response.header.version != COMMERCIAL_MAX_PROTOCOL_ABI_VERSION
-        || response.header.protocol != COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR
-        || response.header.op != COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL
+        || !response.is_valid_envelope_for(&request)
+        || response.descriptor_count != 0
+        || response.payload_len != 0
+        || response.value0 != service_id
+        || response.value1 != pid
     {
         return Err(libc::EINVAL);
     }
@@ -796,6 +807,37 @@ fn fail_closed(message: &str) -> ! {
     boot_line(message);
     observability_client::error!("initd", service, "{message}");
     std::process::exit(111);
+}
+
+fn cleanup_spawned_service(
+    pid: i32,
+    terminate: impl FnOnce(i32) -> Result<(), i32>,
+) -> Result<(), i32> {
+    if pid <= 0 {
+        return Err(libc::EINVAL);
+    }
+    match terminate(pid) {
+        Ok(()) | Err(libc::ESRCH) => Ok(()),
+        Err(errno) => Err(errno),
+    }
+}
+
+fn terminate_spawned_service(pid: i32) -> Result<(), i32> {
+    let status =
+        unsafe { libc::syscall(libc::SYS_tgkill as libc::c_long, pid, pid, libc::SIGKILL) as i32 };
+    if status < 0 {
+        return Err(last_errno());
+    }
+    Ok(())
+}
+
+fn fail_closed_after_child_cleanup(pid: i32, message: &str) -> ! {
+    if let Err(errno) = cleanup_spawned_service(pid, terminate_spawned_service) {
+        fail_closed(&format!(
+            "{message}; exact child cleanup rejected cleanup_errno={errno}"
+        ));
+    }
+    fail_closed(message)
 }
 
 fn spawn_exec(exec_path: &str, env: &[CString]) -> Result<i32, i32> {
@@ -976,5 +1018,29 @@ fn boot_line(message: &str) {
         let mut line = message.as_bytes().to_vec();
         line.push(b'\n');
         let _ = libc::syscall(0x5255_0001 as libc::c_long, line.as_ptr(), line.len());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cleanup_spawned_service;
+
+    #[test]
+    fn failed_service_cleanup_accepts_only_exact_retirement_or_esrch() {
+        let mut retired = 0;
+        assert_eq!(
+            cleanup_spawned_service(81, |pid| {
+                retired = pid;
+                Ok(())
+            }),
+            Ok(())
+        );
+        assert_eq!(retired, 81);
+        assert_eq!(cleanup_spawned_service(82, |_| Err(libc::ESRCH)), Ok(()));
+        assert_eq!(
+            cleanup_spawned_service(83, |_| Err(libc::EPERM)),
+            Err(libc::EPERM)
+        );
+        assert_eq!(cleanup_spawned_service(0, |_| Ok(())), Err(libc::EINVAL));
     }
 }

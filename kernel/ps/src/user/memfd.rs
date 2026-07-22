@@ -124,11 +124,11 @@ impl MemfdHandle {
 
         let mut open = self.inner.lock();
         let mut state = open.object.state.lock();
-        check_write_seal(&state)?;
         let end = open
             .cursor
             .checked_add(src.len())
             .ok_or(MemfdError::InvalidArgument)?;
+        check_write_seals(&state, end)?;
         ensure_len_locked(&mut state, end)?;
         write_at_locked(state.frames.as_slice(), open.cursor, src);
         drop(state);
@@ -236,10 +236,10 @@ impl MemfdHandle {
         let start_page = offset / PAGE_SIZE;
         let end_page = end.div_ceil(PAGE_SIZE);
         let frames = state.frames[start_page..end_page].to_vec();
-        state.mapping_count = state.mapping_count.saturating_add(1);
-        if writable {
-            state.writable_mapping_count = state.writable_mapping_count.saturating_add(1);
-        }
+        let (mapping_count, writable_mapping_count) =
+            next_mapping_counts(state.mapping_count, state.writable_mapping_count, writable)?;
+        state.mapping_count = mapping_count;
+        state.writable_mapping_count = writable_mapping_count;
         drop(state);
 
         Ok((
@@ -281,11 +281,30 @@ impl Drop for MemfdObject {
     }
 }
 
-fn check_write_seal(state: &MemfdState) -> Result<(), MemfdError> {
+fn check_write_seals(state: &MemfdState, end: usize) -> Result<(), MemfdError> {
     if state.seals & linux_abi::F_SEAL_WRITE as u32 != 0 {
         return Err(MemfdError::PermissionDenied);
     }
+    if end > state.len && state.seals & linux_abi::F_SEAL_GROW as u32 != 0 {
+        return Err(MemfdError::PermissionDenied);
+    }
     Ok(())
+}
+
+fn next_mapping_counts(
+    mapping_count: usize,
+    writable_mapping_count: usize,
+    writable: bool,
+) -> Result<(usize, usize), MemfdError> {
+    let mapping_count = mapping_count.checked_add(1).ok_or(MemfdError::Busy)?;
+    let writable_mapping_count = if writable {
+        writable_mapping_count
+            .checked_add(1)
+            .ok_or(MemfdError::Busy)?
+    } else {
+        writable_mapping_count
+    };
+    Ok((mapping_count, writable_mapping_count))
 }
 
 fn ensure_len_locked(state: &mut MemfdState, len: usize) -> Result<(), MemfdError> {
@@ -325,6 +344,36 @@ fn align_up_len(len: usize) -> Option<usize> {
         Some(len)
     } else {
         len.checked_add(PAGE_SIZE - rem)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn memfd_seals_reject_growth_and_mapping_counter_overflow() {
+        let state = MemfdState {
+            name: String::from("test"),
+            len: PAGE_SIZE,
+            frames: Vec::new(),
+            seals: linux_abi::F_SEAL_GROW as u32,
+            mapping_count: 0,
+            writable_mapping_count: 0,
+        };
+        assert_eq!(check_write_seals(&state, PAGE_SIZE), Ok(()));
+        assert_eq!(
+            check_write_seals(&state, PAGE_SIZE + 1),
+            Err(MemfdError::PermissionDenied)
+        );
+        assert_eq!(
+            next_mapping_counts(usize::MAX, 0, false),
+            Err(MemfdError::Busy)
+        );
+        assert_eq!(
+            next_mapping_counts(1, usize::MAX, true),
+            Err(MemfdError::Busy)
+        );
     }
 }
 

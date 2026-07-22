@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::io::Write;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::{Condvar, LockResult, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant as StdInstant};
 
@@ -52,6 +52,7 @@ const NETD_REQUEST_WORKERS: usize = 4;
 const BLOCKING_WORKER_COUNT: usize = 8;
 const MAX_PENDING_BLOCKING_REQUESTS: usize = 32;
 static PENDING_BLOCKING_REQUESTS: AtomicUsize = AtomicUsize::new(0);
+static PENDING_LOCAL_POLLS: AtomicUsize = AtomicUsize::new(0);
 static ACTIVE_BLOCKING_WORKERS: AtomicUsize = AtomicUsize::new(0);
 const MAX_LISTEN_BACKLOG: usize = 128;
 const SOCKET_BUFFER_CAPACITY: usize = 1024 * 1024;
@@ -365,12 +366,13 @@ fn local_poll_waiters() -> &'static Mutex<VecDeque<DeferredLocalPoll>> {
 }
 
 fn defer_local_poll_request(request: NetdIpcRequest, reply_cap: u64) -> bool {
-    let Ok(mut waiters) = local_poll_waiters().lock() else {
-        return false;
-    };
-    if waiters.len() >= MAX_PENDING_BLOCKING_REQUESTS {
+    if !reserve_pending_slot(&PENDING_LOCAL_POLLS, MAX_PENDING_BLOCKING_REQUESTS) {
         return false;
     }
+    let Ok(mut waiters) = local_poll_waiters().lock() else {
+        release_pending_slot(&PENDING_LOCAL_POLLS);
+        return false;
+    };
     waiters.push_back(DeferredLocalPoll {
         request: Box::new(request),
         reply_cap,
@@ -383,12 +385,7 @@ fn defer_local_poll_request(request: NetdIpcRequest, reply_cap: u64) -> bool {
 /// completed here without creating or waking an unrelated worker task. This
 /// preserves the IPC reply handoff from netd directly to the waiting client.
 fn service_local_poll_waiters() {
-    let pending = {
-        let Ok(mut waiters) = local_poll_waiters().lock() else {
-            return;
-        };
-        std::mem::take(&mut *waiters)
-    };
+    let (pending, queue_poisoned) = take_deferred_queue(local_poll_waiters().lock());
     if pending.is_empty() {
         return;
     }
@@ -401,7 +398,9 @@ fn service_local_poll_waiters() {
             op: waiter.request.op,
             ..NetdIpcResponse::default()
         };
-        response.status = if now >= waiter.deadline {
+        response.status = if queue_poisoned {
+            libc::EIO
+        } else if now >= waiter.deadline {
             libc::EAGAIN
         } else {
             handle_poll_socket(&waiter.request, &mut response)
@@ -414,12 +413,57 @@ fn service_local_poll_waiters() {
             response.reserved1 = NETD_IPC_RESPONSE_FLAG_LATENCY_HANDOFF;
         }
         let _ = reply_netd_response(waiter.reply_cap, &response);
+        release_pending_slot(&PENDING_LOCAL_POLLS);
     }
     if !still_waiting.is_empty() {
-        if let Ok(mut waiters) = local_poll_waiters().lock() {
-            waiters.extend(still_waiting);
+        match local_poll_waiters().lock() {
+            Ok(mut waiters) => waiters.extend(still_waiting),
+            Err(_) => {
+                // The queue is no longer usable. Resolve every detached
+                // request and release its reservation rather than leaking
+                // reply capabilities or permanently exhausting admission.
+                for waiter in still_waiting {
+                    let response = NetdIpcResponse {
+                        version: NETD_IPC_ABI_VERSION,
+                        op: waiter.request.op,
+                        status: libc::EIO,
+                        ..NetdIpcResponse::default()
+                    };
+                    let _ = reply_netd_response(waiter.reply_cap, &response);
+                    release_pending_slot(&PENDING_LOCAL_POLLS);
+                }
+            }
         }
     }
+}
+
+fn take_deferred_queue<T>(locked: LockResult<MutexGuard<'_, VecDeque<T>>>) -> (VecDeque<T>, bool) {
+    match locked {
+        Ok(mut waiters) => (std::mem::take(&mut *waiters), false),
+        Err(poisoned) => {
+            // Rust poisoning reports that a previous owner unwound, not that
+            // VecDeque memory is invalid. Drain the structurally valid queue
+            // and fail every reserved request instead of leaking the global
+            // bound and reply capabilities forever.
+            let mut waiters = poisoned.into_inner();
+            (std::mem::take(&mut *waiters), true)
+        }
+    }
+}
+
+fn reserve_pending_slot(counter: &AtomicUsize, limit: usize) -> bool {
+    counter
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+            (pending < limit).then_some(pending + 1)
+        })
+        .is_ok()
+}
+
+fn release_pending_slot(counter: &AtomicUsize) {
+    let released = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+        pending.checked_sub(1)
+    });
+    debug_assert!(released.is_ok(), "pending request counter underflow");
 }
 
 fn run_blocking_request(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
@@ -1875,10 +1919,26 @@ fn call_net_broker(
         (&args as *const RustosNetBrokerArgs) as u64,
     );
     if result < 0 {
-        return last_errno();
+        let errno = last_errno();
+        discard_unpublished_socket_tokens(socket_token, token_a, token_b);
+        return errno;
     }
     response.value = result as u64;
     0
+}
+
+fn discard_unpublished_socket_tokens(socket_token: u64, token_a: u64, token_b: u64) {
+    let tokens = [socket_token, token_a, token_b];
+    for (index, token) in tokens.iter().copied().enumerate() {
+        if token == 0 || tokens[..index].contains(&token) {
+            continue;
+        }
+        let request = NetdIpcRequest {
+            socket_token: token,
+            ..NetdIpcRequest::default()
+        };
+        let _ = handle_close(&request);
+    }
 }
 
 fn request_msg_flags(request: &NetdIpcRequest) -> u64 {
@@ -2023,6 +2083,33 @@ mod packet_provider_state_tests {
 #[cfg(test)]
 mod local_socket_poll_tests {
     use super::*;
+
+    #[test]
+    fn pending_slot_reservation_is_global_and_bounded() {
+        let pending = AtomicUsize::new(0);
+        assert!(reserve_pending_slot(&pending, 2));
+        assert!(reserve_pending_slot(&pending, 2));
+        assert!(!reserve_pending_slot(&pending, 2));
+        release_pending_slot(&pending);
+        assert!(reserve_pending_slot(&pending, 2));
+        assert_eq!(pending.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn poisoned_deferred_queue_is_drained_for_fail_closed_replies() {
+        let queue = Mutex::new(VecDeque::from([1_u8, 2_u8]));
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                let _held = queue.lock().unwrap();
+                panic!("poison test queue");
+            });
+            assert!(worker.join().is_err());
+        });
+        let (drained, poisoned) = take_deferred_queue(queue.lock());
+        assert!(poisoned);
+        assert_eq!(drained, VecDeque::from([1_u8, 2_u8]));
+        assert!(queue.lock().unwrap_err().into_inner().is_empty());
+    }
 
     fn connected_socket(peer: u64) -> UnixSocket {
         UnixSocket {
@@ -2239,11 +2326,7 @@ fn clamp_socket_buffer(value: i32) -> i32 {
 }
 
 fn validate_commercial_request(request: &CommercialMaxProtocolRequest) -> Result<(), i32> {
-    if request.header.version != COMMERCIAL_MAX_PROTOCOL_ABI_VERSION
-        || request.header.protocol != COMMERCIAL_MAX_PROTOCOL_NETD
-        || request.path_len as usize > request.path.len()
-        || request.payload_len as usize > request.payload.len()
-    {
+    if !request.has_valid_envelope() || request.header.protocol != COMMERCIAL_MAX_PROTOCOL_NETD {
         return Err(libc::EINVAL);
     }
     match request.header.op {

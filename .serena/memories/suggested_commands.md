@@ -1,5 +1,6 @@
 # RustOS Suggested Commands
 
+- `cargo xtask dev-plan` — classify fast edit-loop checks and one-time stable-batch gates; routing only, not evidence.
 - `cargo xtask check` — fast validation for layering/manifests/workspace; primary low-cost check.
 - `cargo xtask build` — full OS build plus staging into `build/`.
 - `cargo xtask build-kernel` / `cargo xtask build-user` / `cargo xtask build-driver-modules` — scoped builds.
@@ -13,5 +14,6 @@
 - `cargo xtask ring3-inventory` — authoritative ring0/ring3 migration marker inventory; use `migration_candidate_loc` for real migration work and `cleanup_debt_loc` for legacy delete/retire work.
 - `cargo test -p module-tests` — module tests.
 - `git diff --check` — whitespace/conflict-marker sanity.
+- `.codex/hooks/selftest.sh` and `tools/check-dev-environment.sh --ai` — project AI hook/config/MCP launch-contract checks.
 - QEMU-focused runs should prefer `--summarize-log`, `--expect`, and focused log searches instead of reading whole log files.
 - Do not bypass hooks (`--no-verify`, `--no-gpg-sign`, etc.); hook output is primary evidence.

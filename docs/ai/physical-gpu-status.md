@@ -50,6 +50,11 @@ equivalent lost-wake and restart evidence.
   skill, hook, or formal-model changes. Reuse the verified artifact.
 - The resetless physical lab lane permits one launch attempt per cold host
   boot. A retry in the same boot is dirty-device evidence, not validation.
+- Persistent GA403UM early binding is owned by
+  `tools/configure-amdgpu-vfio-early-bind.sh`; remove it only through
+  `tools/remove-amdgpu-vfio-early-bind.sh`. Both are read-only unless passed
+  `--apply`, update initramfs only after exact-policy validation, and never
+  perform a live unbind, reset, reboot, or poweroff.
 - Do not bind, unbind, reset, or otherwise mutate a physical GPU merely to
   collect deferred performance evidence. Keep vendor-specific policy inside a
   sealed profile and vendor-neutral transport in common code.

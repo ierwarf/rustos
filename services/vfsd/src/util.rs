@@ -1,4 +1,3 @@
-use alloc::format;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -12,7 +11,7 @@ use super::linux_types::{LinuxStat, LinuxStatx, LinuxSyscallOffloadResponse};
 use super::{DirEntry, Metadata, RemoteKind};
 use super::{
     AT_FDCWD_U32, AT_FDCWD_U64, BOOT_DIRECTORY_MODE_BITS, BOOT_FILE_MODE_BITS, DEFAULT_BLOCK_SIZE,
-    DEVICE_FILE_MODE_BITS, DT_CHR, DT_DIR, DT_REG, EINVAL, EROFS,
+    DEVICE_FILE_MODE_BITS, DT_CHR, DT_DIR, DT_REG, EINVAL,
 };
 use storage_core::StorageError;
 use storage_fat::FatError;
@@ -186,23 +185,6 @@ pub(super) fn vfs_request_path(request: &VfsIpcRequest) -> Option<&str> {
         return None;
     }
     core::str::from_utf8(&request.path[..len]).ok()
-}
-
-pub(super) fn mkdir_policy(path: &str, euid: u32) -> i32 {
-    let run_user_path = format!("/run/user/{euid}");
-    if path == "/run" || path == "/run/user" || path == run_user_path.as_str() {
-        0
-    } else {
-        EROFS
-    }
-}
-
-pub(super) fn unlink_policy(path: &str) -> i32 {
-    if path.starts_with("/run/") {
-        super::ENOENT
-    } else {
-        EROFS
-    }
 }
 
 pub(super) fn as_bytes<T>(value: &T) -> &[u8] {

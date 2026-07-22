@@ -12,6 +12,7 @@ use crate::ipc_core::{
 use kernel_object::api::handle::{HandleRights, HandleToken};
 use spin::Mutex;
 #[cfg(not(test))]
+#[cfg(not(any(test, feature = "host-test")))]
 use x86_64::instructions::interrupts;
 
 #[cfg(not(test))]
@@ -391,7 +392,7 @@ impl IpcObjectTable {
 static IPC_OBJECTS: Mutex<IpcObjectTable> = Mutex::new(IpcObjectTable::new());
 
 fn with_ipc_objects<R>(f: impl FnOnce(&mut IpcObjectTable) -> R) -> R {
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "host-test")))]
     {
         interrupts::without_interrupts(|| {
             let mut objects = IPC_OBJECTS.lock();
@@ -399,7 +400,7 @@ fn with_ipc_objects<R>(f: impl FnOnce(&mut IpcObjectTable) -> R) -> R {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "host-test"))]
     {
         let mut objects = IPC_OBJECTS.lock();
         f(&mut objects)
@@ -407,7 +408,7 @@ fn with_ipc_objects<R>(f: impl FnOnce(&mut IpcObjectTable) -> R) -> R {
 }
 
 fn with_ipc_objects_ref<R>(f: impl FnOnce(&IpcObjectTable) -> R) -> R {
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "host-test")))]
     {
         interrupts::without_interrupts(|| {
             let objects = IPC_OBJECTS.lock();
@@ -415,7 +416,7 @@ fn with_ipc_objects_ref<R>(f: impl FnOnce(&IpcObjectTable) -> R) -> R {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "host-test"))]
     {
         let objects = IPC_OBJECTS.lock();
         f(&objects)

@@ -83,6 +83,10 @@ fn service_main() {
         return;
     }
     ipc::debug_line("procd: process policy endpoint registered");
+    // Rebase this generation's private fan-out queue before serving policy.
+    // A replacement procd must not wait for sixteen new requests before it
+    // acknowledges evidence accumulated while its predecessor was absent.
+    drain_lifecycle_events();
     serve(endpoint as u64);
 }
 
@@ -175,6 +179,12 @@ fn drain_lifecycle_events() {
         )
     };
     if ret < 0 {
+        // This consumer has independent lifecycle evidence. Any failed drain,
+        // especially EOVERFLOW, makes cached per-process policy identities
+        // suspect; forget them all before accepting another request.
+        PROCESS_SIGNAL_POLICY.lock().clear();
+        THREAD_SIGNAL_POLICY.lock().clear();
+        ipc::debug_line("procd: lifecycle evidence reset after drain failure");
         return;
     }
     let drained = count as usize;
@@ -328,19 +338,23 @@ fn validate_request(received: usize, request: &ProcdIpcRequest) -> Result<(), i3
 }
 
 fn validate_commercial_request(request: &CommercialMaxProtocolRequest) -> Result<(), i32> {
-    if request.header.version != COMMERCIAL_MAX_PROTOCOL_ABI_VERSION
+    if !request.has_valid_envelope()
         || request.header.protocol != COMMERCIAL_MAX_PROTOCOL_PROCD
-        || request.path_len as usize > request.path.len()
-        || request.payload_len as usize > request.payload.len()
+        || request.path_len != 0
+        || request.payload_len != 0
     {
         return Err(EINVAL);
     }
     match request.header.op {
         COMMERCIAL_MAX_PROCD_OP_PROCESS_PREPARE => {
             if !matches!(
-                request.arg0 as u16,
-                PROC_BROKER_FORMAT_ELF64 | PROC_BROKER_FORMAT_PE64
-            ) {
+                request.arg0,
+                value if value == u64::from(PROC_BROKER_FORMAT_ELF64)
+                    || value == u64::from(PROC_BROKER_FORMAT_PE64)
+            ) || request.arg1 != 0
+                || request.arg2 != 0
+                || request.arg3 != 0
+            {
                 return Err(EINVAL);
             }
             Ok(())
@@ -350,7 +364,11 @@ fn validate_commercial_request(request: &CommercialMaxProtocolRequest) -> Result
         | COMMERCIAL_MAX_PROCD_OP_THREAD_PLAN
         | COMMERCIAL_MAX_PROCD_OP_SIGNAL_POLICY
         | COMMERCIAL_MAX_PROCD_OP_WAIT_NAMESPACE
-        | COMMERCIAL_MAX_PROCD_OP_SESSION_MEMBERSHIP => Ok(()),
+        | COMMERCIAL_MAX_PROCD_OP_SESSION_MEMBERSHIP
+            if request.arg0 == 0 && request.arg1 == 0 && request.arg2 == 0 && request.arg3 == 0 =>
+        {
+            Ok(())
+        }
         _ => Err(EINVAL),
     }
 }

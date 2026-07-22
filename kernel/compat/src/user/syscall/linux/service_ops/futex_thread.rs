@@ -337,25 +337,25 @@ fn futex_wait(
     let actual = match usermem::read_current_user_u32(uaddr) {
         Ok(actual) => actual,
         Err(err) => {
-            clear_futex_waiter(task_id, key);
+            clear_futex_waiter(task_id);
             let _ = multitask::cancel_block_current_task();
             return Err(address_space_error_to_linux_errno(err));
         }
     };
     if actual != expected {
-        clear_futex_waiter(task_id, key);
+        clear_futex_waiter(task_id);
         let _ = multitask::cancel_block_current_task();
         return Err(LINUX_EAGAIN);
     }
     if deadline_tick.is_some_and(|deadline| crate::arch::rtc::ticks() >= deadline) {
-        clear_futex_waiter(task_id, key);
+        clear_futex_waiter(task_id);
         let _ = multitask::cancel_block_current_task();
         return Err(LINUX_ETIMEDOUT);
     }
     if let Some(deadline) = deadline_tick
         && !crate::arch::rtc::arm_sleep_waiter_until_tick(task_id, deadline)
     {
-        clear_futex_waiter(task_id, key);
+        clear_futex_waiter(task_id);
         let _ = multitask::cancel_block_current_task();
         return Err(LINUX_EBUSY);
     }
@@ -363,13 +363,16 @@ fn futex_wait(
         Some(true) => multitask::yield_now(),
         Some(false) => {}
         None => {
-            clear_futex_waiter(task_id, key);
+            clear_futex_waiter(task_id);
             crate::arch::rtc::disarm_sleep_waiter(task_id);
             return Err(LINUX_EINVAL);
         }
     }
     crate::arch::rtc::disarm_sleep_waiter(task_id);
-    let still_waiting = take_futex_waiter(task_id, key);
+    // REQUEUE may have changed the key while this task slept. Cleanup is tied
+    // to task identity, not the key captured before blocking, so timeout and
+    // spurious-wake paths cannot strand a waiter in the bounded table.
+    let still_waiting = take_futex_waiter(task_id);
     if still_waiting && deadline_tick.is_some_and(|deadline| crate::arch::rtc::ticks() >= deadline)
     {
         Err(LINUX_ETIMEDOUT)
@@ -504,12 +507,12 @@ fn futex_requeue_inner(
 }
 
 fn current_futex_waiter_context() -> Result<(u64, FutexKey), i64> {
-    multitask::with_current_user_process_state_mut(|pid, abi, process_state| {
+    multitask::with_current_user_process_state_mut(|task_id, abi, process_state| {
         if abi != crate::user::abi::UserAbi::Linux {
             return Err(LINUX_ENOSYS);
         }
         Ok((
-            pid,
+            task_id,
             FutexKey {
                 address_space_root: process_state.address_space_root(),
                 uaddr: 0,
@@ -524,6 +527,12 @@ fn register_futex_waiter(waiter: FutexWaiter) -> Result<(), i64> {
     let mut free_slot = None;
     for slot in 0..waiters.len() {
         match waiters[slot] {
+            Some(existing) if existing.task_id == waiter.task_id => {
+                // A task can own at most one scheduler wait. Treat a second
+                // registration as an invariant violation rather than hiding
+                // the older entry and consuming another bounded slot.
+                return Err(LINUX_EBUSY);
+            }
             Some(existing) if !multitask::is_user_task_alive(existing.task_id) => {
                 waiters[slot] = None;
                 if free_slot.is_none() {
@@ -541,16 +550,20 @@ fn register_futex_waiter(waiter: FutexWaiter) -> Result<(), i64> {
     Ok(())
 }
 
-fn clear_futex_waiter(task_id: u64, key: FutexKey) {
-    let _ = take_futex_waiter(task_id, key);
+fn clear_futex_waiter(task_id: u64) {
+    let _ = take_futex_waiter(task_id);
 }
 
-fn take_futex_waiter(task_id: u64, key: FutexKey) -> bool {
+fn take_futex_waiter(task_id: u64) -> bool {
     let mut waiters = FUTEX_WAITERS.lock();
+    take_futex_waiter_from(&mut waiters[..], task_id)
+}
+
+fn take_futex_waiter_from(waiters: &mut [Option<FutexWaiter>], task_id: u64) -> bool {
     let mut removed = false;
     for slot in 0..waiters.len() {
         if waiters[slot]
-            .map(|waiter| waiter.task_id == task_id && waiter.key == key)
+            .map(|waiter| waiter.task_id == task_id)
             .unwrap_or(false)
         {
             waiters[slot] = None;
@@ -633,6 +646,10 @@ fn requeue_futex_waiters(
 }
 
 pub fn cleanup_linux_thread_exit() {
+    if let Some(task_id) = multitask::current_user_thread_id() {
+        clear_futex_waiter(task_id);
+        crate::arch::rtc::disarm_sleep_waiter(task_id);
+    }
     let clear_child_tid = multitask::with_current_user_linux_state_mut(
         |_, _, abi, address_space, _, linux_thread_state| {
             if abi != crate::user::abi::UserAbi::Linux {
@@ -807,5 +824,38 @@ pub fn syscall_linux_rseq(area_ptr: u64, len: u64, flags: u64, signature: u64) -
     match call_syscalld(request).and_then(|response| ensure_empty_syscalld_response(&response)) {
         Ok(()) => 0,
         Err(errno) => linux_errno(errno),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn task_identity_cleanup_removes_a_requeued_waiter() {
+        let original = FutexKey {
+            address_space_root: 0x1000,
+            uaddr: 0x2000,
+        };
+        let requeued = FutexKey {
+            uaddr: 0x3000,
+            ..original
+        };
+        let mut waiters = [
+            Some(FutexWaiter {
+                key: requeued,
+                task_id: 7,
+                bitset: linux_abi::FUTEX_BITSET_MATCH_ANY,
+            }),
+            Some(FutexWaiter {
+                key: original,
+                task_id: 8,
+                bitset: linux_abi::FUTEX_BITSET_MATCH_ANY,
+            }),
+        ];
+
+        assert!(take_futex_waiter_from(&mut waiters, 7));
+        assert!(waiters[0].is_none());
+        assert_eq!(waiters[1].unwrap().task_id, 8);
     }
 }

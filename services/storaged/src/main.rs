@@ -364,11 +364,8 @@ fn list_descriptors() -> Result<Vec<StorageBlockDescriptorWire>, i32> {
 }
 
 fn validate_commercial_request(request: &CommercialMaxProtocolRequest) -> Result<(), i32> {
-    if request.header.version != COMMERCIAL_MAX_PROTOCOL_ABI_VERSION
+    if !request.has_valid_envelope()
         || request.header.protocol != COMMERCIAL_MAX_PROTOCOL_STORAGED
-        || request.header.flags != 0
-        || request.path_len as usize > request.path.len()
-        || request.payload_len as usize > request.payload.len()
         || request.payload_len != 0
         || request.arg0 != 0
         || request.arg1 != 0

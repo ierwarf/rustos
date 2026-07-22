@@ -1,6 +1,6 @@
 // RING3-MIGRATION-REFERENCE START: capability-broker exception: procd/rootd
 // own lifecycle event routing and restart policy. Ring0 keeps capability-gated
-// exit-event collection substrate.
+// per-consumer exit-event fan-out and collection substrate.
 use super::*;
 
 use rustos_user_abi::syscall::{
@@ -33,7 +33,12 @@ pub(super) fn syscall_linux_rustos_lifecycle_drain_broker(args_ptr: u64) -> u64 
         Ok(args) => args,
         Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
     };
-    match offload_ops::drain_lifecycle_events(&args) {
+    let consumer = if is_root_supervisor {
+        offload_ops::LifecycleConsumer::RootSupervisor
+    } else {
+        offload_ops::LifecycleConsumer::ProcessPolicy
+    };
+    match offload_ops::drain_lifecycle_events(&args, consumer) {
         Ok(count) => count,
         Err(errno) => linux_errno(errno),
     }

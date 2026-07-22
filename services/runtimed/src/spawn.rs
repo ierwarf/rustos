@@ -97,12 +97,7 @@ pub(super) fn spawn_tracked_process(
     if is_ui_server {
         if let Err(err) = report_rootd_service_lease(IPC_SERVICE_UISERVER, entry.exec.as_str(), pid)
         {
-            // The child is still start-suspended, so it cannot race endpoint
-            // registration against the failed supervisor transaction. Make
-            // it runnable solely so the normal signal/lifecycle path can
-            // retire it, then fail this launch closed.
-            let _ = activate_spawned_process(pid);
-            let _ = terminate_pid(pid);
+            retire_failed_spawn_or_abort(pid, "rootd-lease-report");
             release_failed_session(state, session_handle);
             return Err(err);
         }
@@ -110,8 +105,7 @@ pub(super) fn spawn_tracked_process(
     let desktop_file_id = entry.desktop_file_id.clone();
     let inserted_session_handle = session_handle.unwrap_or(0);
     if state.running.contains_key(&pid) {
-        let _ = activate_spawned_process(pid);
-        let _ = terminate_pid(pid);
+        retire_failed_spawn_or_abort(pid, "duplicate-pid");
         release_failed_session(state, session_handle);
         return Err(libc::EEXIST);
     }
@@ -130,14 +124,14 @@ pub(super) fn spawn_tracked_process(
 
     if let Err(err) = activate_spawned_process(pid) {
         state.running.remove(&pid);
-        let _ = terminate_pid(pid);
+        retire_failed_spawn_or_abort(pid, "loader-activate");
         release_failed_session(state, session_handle);
         return Err(err);
     }
     if is_ui_server {
         if let Err(err) = wait_for_service_endpoint(IPC_SERVICE_UISERVER, pid) {
             state.running.remove(&pid);
-            let _ = terminate_pid(pid);
+            retire_failed_spawn_or_abort(pid, "endpoint-wait");
             release_failed_session(state, session_handle);
             return Err(err);
         }
@@ -161,6 +155,27 @@ fn release_failed_session(state: &mut BrokerState, session_handle: Option<u64>) 
     super::session::clear_focused_session_if(state, session);
     if let Ok(console_fd) = ensure_console_fd(state) {
         let _ = close_console_session(console_fd, session);
+    }
+}
+
+fn cleanup_failed_spawn(
+    pid: i32,
+    terminate: impl FnOnce(i32) -> Result<(), i32>,
+) -> Result<(), i32> {
+    if pid <= 0 {
+        return Err(libc::EINVAL);
+    }
+    match terminate(pid) {
+        Ok(()) | Err(libc::ESRCH) => Ok(()),
+        Err(errno) => Err(errno),
+    }
+}
+
+fn retire_failed_spawn_or_abort(pid: i32, stage: &str) {
+    if let Err(errno) = cleanup_failed_spawn(pid, terminate_pid) {
+        panic!(
+            "runtimed: fatal failed-spawn cleanup rejected stage={stage} pid={pid} errno={errno}"
+        );
     }
 }
 
@@ -196,10 +211,11 @@ fn report_rootd_service_lease(service_id: u64, exec_path: &str, pid: i32) -> Res
         return Err((-call) as i32);
     }
     if call as usize != size_of::<CommercialMaxProtocolResponse>()
-        || response.header.version != COMMERCIAL_MAX_PROTOCOL_ABI_VERSION
-        || response.header.protocol != COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR
-        || response.header.op != COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL
+        || !response.is_valid_envelope_for(&request)
+        || response.descriptor_count != 0
         || response.payload_len != 0
+        || response.value0 != service_id
+        || response.value1 != u64::try_from(pid).map_err(|_| libc::EINVAL)?
     {
         return Err(libc::EINVAL);
     }
@@ -680,7 +696,10 @@ fn last_errno() -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{admitted_task_weight_micros, build_exec_argv, build_exec_env_with_defaults};
+    use super::{
+        admitted_task_weight_micros, build_exec_argv, build_exec_env_with_defaults,
+        cleanup_failed_spawn,
+    };
     use crate::{
         MAX_UNTRUSTED_TASK_WEIGHT_MICROS, UI_SERVER_EXEC_PATH, UI_SERVER_TASK_WEIGHT_MICROS,
     };
@@ -760,5 +779,24 @@ mod tests {
             build_exec_argv("apps/demo\0demo.elf", &[]),
             Err(libc::EINVAL)
         );
+    }
+
+    #[test]
+    fn failed_spawn_cleanup_accepts_only_exact_retirement_or_esrch() {
+        let mut retired = 0;
+        assert_eq!(
+            cleanup_failed_spawn(77, |pid| {
+                retired = pid;
+                Ok(())
+            }),
+            Ok(())
+        );
+        assert_eq!(retired, 77);
+        assert_eq!(cleanup_failed_spawn(78, |_| Err(libc::ESRCH)), Ok(()));
+        assert_eq!(
+            cleanup_failed_spawn(79, |_| Err(libc::EPERM)),
+            Err(libc::EPERM)
+        );
+        assert_eq!(cleanup_failed_spawn(0, |_| Ok(())), Err(libc::EINVAL));
     }
 }

@@ -482,7 +482,8 @@ fn drm_ioctl_create_dumb(
     surface.set_shared_region(region);
     let handle = process_state
         .handles_mut()
-        .install(KernelHandle::DisplaySurface(surface));
+        .install(KernelHandle::DisplaySurface(surface))
+        .ok_or(DeviceSysopError::TryAgain)?;
     create.handle = u32::try_from(handle).map_err(|_| DeviceSysopError::InvalidArgument)?;
     create.pitch = surface.stride_bytes();
     create.size = surface.mapping_len();

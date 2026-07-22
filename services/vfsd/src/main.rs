@@ -39,6 +39,7 @@ use rustos_user_abi::syscall::{
     VFS_POLL_QUERY_EPOLL_CTL, VFS_POLL_QUERY_EPOLL_WAIT, VFS_POLL_QUERY_POLL,
 };
 use storage_fat::{FatDirEntry, FatDisk, FatNodeKind, FatVolume};
+use vfsd::{mkdir_policy, persistent_mutation_status, unlink_policy};
 
 mod block;
 mod devmgrd;
@@ -53,8 +54,8 @@ use linux_types::{
 };
 use util::{
     build_linux_stat, build_linux_statx, encode_dirent, handle_kind_u16, is_at_fdcwd,
-    linux_request_path, map_fat_error, mkdir_policy, normalize_absolute_path, path_inode,
-    unlink_policy, vfs_request_path, write_payload_bytes, write_vfs_payload_bytes,
+    linux_request_path, map_fat_error, normalize_absolute_path, path_inode, vfs_request_path,
+    write_payload_bytes, write_vfs_payload_bytes,
 };
 
 // Linux errno constants (x86_64)
@@ -444,10 +445,14 @@ impl VfsState {
             VFS_IPC_OP_DUP => self.vfs_dup(request, response),
             VFS_IPC_OP_READ => self.vfs_read(request, response, None),
             VFS_IPC_OP_PREAD64 => self.vfs_read(request, response, Some(request.arg0)),
-            VFS_IPC_OP_WRITE => response.status = EROFS,
+            VFS_IPC_OP_WRITE => {
+                response.status = persistent_mutation_status(request.op).unwrap_or(EINVAL)
+            }
             VFS_IPC_OP_LSEEK => self.vfs_lseek(request, response),
             VFS_IPC_OP_FSTAT => self.vfs_fstat(request, response),
-            VFS_IPC_OP_FTRUNCATE => response.status = EROFS,
+            VFS_IPC_OP_FTRUNCATE => {
+                response.status = persistent_mutation_status(request.op).unwrap_or(EINVAL)
+            }
             VFS_IPC_OP_GETDENTS64 => self.vfs_getdents64(request, response),
             VFS_IPC_OP_FCNTL => self.vfs_fcntl(request, response),
             VFS_IPC_OP_STATX => self.vfs_path_statx(request, response),
@@ -1284,11 +1289,7 @@ fn epoll_interest_from_request(request: &VfsIpcRequest) -> Option<EpollInterest>
 }
 
 fn validate_commercial_request(request: &CommercialMaxProtocolRequest) -> Result<(), i32> {
-    if request.header.version != COMMERCIAL_MAX_PROTOCOL_ABI_VERSION
-        || request.header.protocol != COMMERCIAL_MAX_PROTOCOL_VFSD
-        || request.path_len as usize > request.path.len()
-        || request.payload_len as usize > request.payload.len()
-    {
+    if !request.has_valid_envelope() || request.header.protocol != COMMERCIAL_MAX_PROTOCOL_VFSD {
         return Err(EINVAL);
     }
     match request.header.op {

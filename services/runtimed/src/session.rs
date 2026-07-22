@@ -500,11 +500,7 @@ fn handle_session_request(
     state: &mut BrokerState,
     response: &mut CommercialMaxProtocolResponse,
 ) -> i32 {
-    if request.header.version != COMMERCIAL_MAX_PROTOCOL_ABI_VERSION
-        || request.header.protocol != COMMERCIAL_MAX_PROTOCOL_SESSIOND
-        || request.header.flags != 0
-        || request.path_len as usize > request.path.len()
-        || request.payload_len as usize > request.payload.len()
+    if !request.has_valid_envelope() || request.header.protocol != COMMERCIAL_MAX_PROTOCOL_SESSIOND
     {
         return libc::EINVAL;
     }

@@ -1,0 +1,10 @@
+[package]
+name = "rustos-loom-proof-kernel"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dev-dependencies]
+loom = "=0.7.2"

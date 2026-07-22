@@ -30,7 +30,7 @@ timeout = 5
 statusMessage = "Checking file size / allow-list"
 
 [[hooks.PreToolUse]]
-matcher = "^(apply_patch|Edit|Write)$"
+matcher = "^(apply_patch|Edit|Write|mcp__serena__(create_text_file|insert_after_symbol|insert_before_symbol|rename_symbol|replace_content|replace_in_files|replace_symbol_body|safe_delete_symbol))$"
 
 [[hooks.PreToolUse.hooks]]
 type = "command"
@@ -39,7 +39,7 @@ timeout = 5
 statusMessage = "Checking edit path policy"
 
 [[hooks.PreToolUse]]
-matcher = "^Bash$"
+matcher = "^(Bash|exec_command|mcp__serena__execute_shell_command)$"
 
 [[hooks.PreToolUse.hooks]]
 type = "command"
@@ -54,7 +54,7 @@ timeout = 45
 statusMessage = "Pre-commit policy / fmt checks"
 
 [[hooks.PostToolUse]]
-matcher = "^(apply_patch|Edit|Write)$"
+matcher = "^(apply_patch|Edit|Write|mcp__serena__(create_text_file|insert_after_symbol|insert_before_symbol|rename_symbol|replace_content|replace_in_files|replace_symbol_body|safe_delete_symbol))$"
 
 [[hooks.PostToolUse.hooks]]
 type = "command"
@@ -81,17 +81,16 @@ statusMessage = "Loading RustOS hook context"
 
 # --------------------------------------------------------------------------
 # MCP servers (project-scoped)
-# All three servers are active. Binaries:
-#   ripgrep  — npx mcp-ripgrep (npm)
-#   serena   — uvx from serena-mcp (~/.local/bin/uvx via astral uv)
-#   github   — ~/.local/bin/github-mcp-server (github/github-mcp-server v1.0.5),
-#              with GITHUB_PERSONAL_ACCESS_TOKEN fallback from `gh auth token`
+# Project-declared servers are exact-version inputs. Session-provided app or
+# plugin connectors are configured outside this repository.
+#   ripgrep  — mcp-ripgrep 0.4.0 (npm)
+#   serena   — serena-agent 1.6.0 (PyPI through uvx)
 # --------------------------------------------------------------------------
 
 [mcp_servers.ripgrep]
 command = "npx"
-args = ["-y", "mcp-ripgrep"]
+args = ["-y", "mcp-ripgrep@0.4.0"]
 
 [mcp_servers.serena]
 command = "uvx"
-args = ["--from", "serena-agent", "serena", "start-mcp-server"]
+args = ["--from", "serena-agent==1.6.0", "serena", "start-mcp-server"]

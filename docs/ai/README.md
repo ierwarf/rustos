@@ -8,6 +8,7 @@ Optimized for AI agents, not human onboarding. English-only, dense, contract-sha
 | --- | --- |
 | `token-policy.md` | Mandatory operating policy: context budget, forbidden paths, when to stop. |
 | `task-router.md` | Task → smallest context set. Read after `token-policy.md`. |
+| `session-handoff.md` | Volatile checkout state and safe new-session resume sequence. |
 | `repo-map.md` | Source ownership and canonical entrypoints. Deeper than `docs/ai-map.md`. |
 | `commands.md` | Quiet build/check/debug commands and their failure meanings. |
 | `contracts-infra.md` | Manifest/stage/build/logging/fault contracts. |

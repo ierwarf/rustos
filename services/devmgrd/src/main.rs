@@ -595,10 +595,7 @@ fn call_sessiond_ioctl(
         return Err(errno);
     }
     if result as usize != size_of::<CommercialMaxProtocolResponse>()
-        || response.header.version != COMMERCIAL_MAX_PROTOCOL_ABI_VERSION
-        || response.header.protocol != COMMERCIAL_MAX_PROTOCOL_SESSIOND
-        || response.header.op != op
-        || response.payload_len as usize > response.payload.len()
+        || !response.is_valid_envelope_for(&request)
     {
         return Err(libc::EINVAL);
     }
@@ -709,9 +706,7 @@ fn authorize_session_ioctl(op: u16, request_number: u64) -> Result<(), i32> {
         return Err(last_errno());
     }
     if result as usize != size_of::<CommercialMaxProtocolResponse>()
-        || response.header.version != COMMERCIAL_MAX_PROTOCOL_ABI_VERSION
-        || response.header.protocol != COMMERCIAL_MAX_PROTOCOL_SESSIOND
-        || response.header.op != op
+        || !response.is_valid_envelope_for(&request)
     {
         return Err(libc::EINVAL);
     }
@@ -751,9 +746,7 @@ fn authorize_uiserver_ioctl(op: u16, request_number: u64) -> Result<(), i32> {
         return Err(last_errno());
     }
     if result as usize != size_of::<CommercialMaxProtocolResponse>()
-        || response.header.version != COMMERCIAL_MAX_PROTOCOL_ABI_VERSION
-        || response.header.protocol != COMMERCIAL_MAX_PROTOCOL_UISERVER
-        || response.header.op != op
+        || !response.is_valid_envelope_for(&request)
     {
         return Err(libc::EINVAL);
     }
@@ -765,12 +758,7 @@ fn authorize_uiserver_ioctl(op: u16, request_number: u64) -> Result<(), i32> {
 }
 
 fn validate_commercial_request(request: &CommercialMaxProtocolRequest) -> Result<(), i32> {
-    if request.header.version != COMMERCIAL_MAX_PROTOCOL_ABI_VERSION
-        || request.header.protocol != COMMERCIAL_MAX_PROTOCOL_DEVMGRD
-        || request.header.flags != 0
-        || request.path_len as usize > request.path.len()
-        || request.payload_len as usize > request.payload.len()
-    {
+    if !request.has_valid_envelope() || request.header.protocol != COMMERCIAL_MAX_PROTOCOL_DEVMGRD {
         return Err(libc::EINVAL);
     }
     match request.header.op {

@@ -1,72 +1,24 @@
 #!/usr/bin/env bash
-# Run every fast, PR-sized RustOS formal model.
-set -eo pipefail
+# Run every registry-admitted RustOS formal model.
+set -euo pipefail
 
-models='
-boot-volume-admission/BootVolumeAdmission
-runtime-control-rpc/RuntimeControlRpc
-dual-abi-image-admission/DualAbiImageAdmission
-dual-abi-byte-parser/DualAbiByteParser
-page-table-lifecycle/PageTableLifecycle
-dma-iommu-isolation/DmaIommuIsolation
-filesystem-content-integrity/FilesystemContentIntegrity
-network-payload-session/NetworkPayloadSession
-scheduler-cpu-distribution/SchedulerCpuDistribution
-rootd-bootstrap/RootdBootstrap
-endpoint-registry/EndpointRegistry
-endpoint-publication/EndpointPublication
-deferred-start/DeferredStart
-post-init-leases/PostInitLeases
-rootd-restart-backoff/RootdRestartBackoff
-post-init-supervisor-recovery/PostInitSupervisorRecovery
-dvm-control-relay/DvmControlRelay
-dvm-control-endpoint/DvmControlEndpoint
-dvm-agent-readiness/DvmAgentReadiness
-dvm-network-ring/DvmNetworkRing
-dvm-network-control/DvmNetworkControl
-dvm-input-revocation/DvmInputRevocation
-dvm-input-ring/DvmInputRing
-trusted-ui-boundary/TrustedUiBoundary
-input-readiness/InputReadiness
-input-ingestion-worker/InputIngestionWorker
-ui-frame-budget/UiFrameBudget
-wayland-accept-isolation/WaylandAcceptIsolation
-wayland-frame-pacing/WaylandFramePacing
-ui-input-motion/UiInputMotion
-dvm-input-selftest/DvmInputSelftest
-dvm-absolute-pointer/DvmAbsolutePointer
-devmgrd-sessiond-isolation/DevmgrdSessiondIsolation
-vfio-release-authorization/VfioReleaseAuthorization
-driver-domain-fleet/DriverDomainFleet
-ivshmem-pairing/IvshmemPairing
-gui-dvm-surface/GuiDvmSurface
-dvm-atomic-scanout/DvmAtomicScanout
-dvm-gpu-compositor/DvmGpuCompositor
-dvm-gpu-proof-scheduler/DvmGpuProofScheduler
-dvm-display-scheduler/DvmDisplayScheduler
-dvm-display-readiness/DvmDisplayReadiness
-dvm-gpu-admission/DvmGpuAdmission
-dvm-gpu-atlas-transport/DvmGpuAtlasTransport
-dvm-commercial-lifecycle/DvmCommercialLifecycle
-dvm-release-bundle/DvmReleaseBundle
-dvm-display-driver-supply/DvmDisplayDriverSupply
-dvm-amdgpu-supply/DvmAmdgpuSupply
-dvm-amdgpu-evidence/DvmAmdgpuEvidence
-gui-dvm-pixel-authority/GuiDvmPixelAuthority
-gui-dvm-install/GuiDvmInstall
-ipc-reply-deadline/IpcReplyDeadline
-scheduler-wakeup/SchedulerWakeup
-scheduler-thread-demotion/SchedulerThreadDemotion
-clocksource-deadline/ClocksourceDeadline
-scheduler-admission/SchedulerAdmission
-ipc-priority-inheritance/IpcPriorityInheritance
-ipc-handle-transfer/IpcHandleTransfer
-ipc-endpoint-ownership/IpcEndpointOwnership
-proc-broker-session/ProcBrokerSession
-exec-ticket/ExecTicket
-'
+profile=pr
+if [[ $# -eq 2 && "$1" == --profile ]]; then
+    profile="$2"
+elif [[ $# -ne 0 ]]; then
+    echo "usage: bash formal/run-all-tlc.sh [--profile pr|nightly]" >&2
+    exit 2
+fi
+[[ "$profile" == pr || "$profile" == nightly ]] || { echo "invalid TLC profile: $profile" >&2; exit 2; }
 
-for model in $models; do
-    echo "== TLC: $model =="
-    bash formal/run-tlc.sh "$model"
-done
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+bash formal/selftest.sh
+
+while IFS=$'\t' read -r model _class _deadlock _reason _pr_timeout _nightly_timeout nightly_mode _apalache _tlaps _trace; do
+    [[ -z "$model" || "$model" == \#* ]] && continue
+    bash formal/run-tlc.sh --profile "$profile" "$model"
+    if [[ "$profile" == nightly && "$nightly_mode" == exhaustive+simulate ]]; then
+        bash formal/run-tlc-simulate.sh "$model"
+    fi
+done < formal/models.tsv

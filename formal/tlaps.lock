@@ -1,0 +1,5 @@
+version=1.5.0
+release=202210041448
+archive=tlaps-1.5.0-x86_64-linux-gnu-inst.bin
+sha256=ebb7a3f271bdb564f74cb0a2767ef7b9ff7045621a9be7c50d363a03c2e6f08a
+url=https://github.com/tlaplus/tlapm/releases/download/202210041448/tlaps-1.5.0-x86_64-linux-gnu-inst.bin

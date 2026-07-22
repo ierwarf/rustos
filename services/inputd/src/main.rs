@@ -374,13 +374,14 @@ fn keyboard_action_to_inputd(action: KeyAction) -> u16 {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{
-        apply_dvm_ingress_wire, ingest_batch_needs_immediate_retry, DvmIngressLogState, InputQueue,
-        INPUTD_INGEST_MAX_EVENTS,
+        apply_dvm_ingress_wire, ingest_batch_needs_immediate_retry, validate_commercial_request,
+        DvmIngressLogState, InputQueue, INPUTD_INGEST_MAX_EVENTS,
     };
     use rustos_user_abi::syscall::{
-        InputIngressWire, InputPointerPacketWire, InputPointerPositionWire, InputdIpcRequest,
-        INPUTD_ACCESS_NATIVE, INPUTD_INGRESS_FLAG_DVM_SOURCE, INPUTD_INGRESS_FLAG_RESET_STATE,
-        INPUTD_INGRESS_KIND_DVM_LINUX_KEY,
+        CommercialMaxProtocolRequest, InputIngressWire, InputPointerPacketWire,
+        InputPointerPositionWire, InputdIpcRequest, COMMERCIAL_MAX_INPUTD_OP_INPUT_READER,
+        COMMERCIAL_MAX_PROTOCOL_INPUTD, INPUTD_ACCESS_NATIVE, INPUTD_INGRESS_FLAG_DVM_SOURCE,
+        INPUTD_INGRESS_FLAG_RESET_STATE, INPUTD_INGRESS_KIND_DVM_LINUX_KEY,
     };
 
     fn pointer_motion(dx: i32, dy: i32) -> input_evdev::InputEvent {
@@ -660,6 +661,18 @@ mod tests {
             super::consume_read_authorization(&mut queue, &matching),
             None
         );
+    }
+
+    #[test]
+    fn commercial_reader_rejects_noncanonical_access_values() {
+        let mut request = CommercialMaxProtocolRequest::default();
+        request.header.protocol = COMMERCIAL_MAX_PROTOCOL_INPUTD;
+        request.header.op = COMMERCIAL_MAX_INPUTD_OP_INPUT_READER;
+        request.arg0 = u64::from(INPUTD_ACCESS_NATIVE);
+        assert_eq!(validate_commercial_request(&request), Ok(()));
+
+        request.arg0 |= 1_u64 << 32;
+        assert_eq!(validate_commercial_request(&request), Err(libc::EINVAL));
     }
 }
 
@@ -1176,10 +1189,13 @@ fn dispatch_commercial_request(
             write_stats_payload(queue, response)
         }
         COMMERCIAL_MAX_INPUTD_OP_INPUT_READER => {
-            let access = request.arg0 as u16;
-            response.value0 = match access {
-                INPUTD_ACCESS_NATIVE => request.arg1.min(INPUTD_MAX_NATIVE_READ_BYTES),
-                INPUTD_ACCESS_EVDEV => request.arg1.min(INPUTD_MAX_EVDEV_READ_BYTES),
+            response.value0 = match request.arg0 {
+                value if value == u64::from(INPUTD_ACCESS_NATIVE) => {
+                    request.arg1.min(INPUTD_MAX_NATIVE_READ_BYTES)
+                }
+                value if value == u64::from(INPUTD_ACCESS_EVDEV) => {
+                    request.arg1.min(INPUTD_MAX_EVDEV_READ_BYTES)
+                }
                 _ => return Err(libc::EINVAL),
             };
             response.capability = input_capability("reader", request.header.op);
@@ -1218,17 +1234,20 @@ fn dispatch_commercial_request(
 }
 
 fn validate_commercial_request(request: &CommercialMaxProtocolRequest) -> Result<(), i32> {
-    if request.header.version != COMMERCIAL_MAX_PROTOCOL_ABI_VERSION
-        || request.header.protocol != COMMERCIAL_MAX_PROTOCOL_INPUTD
-        || request.header.flags != 0
-        || request.path_len as usize > request.path.len()
-        || request.payload_len as usize > request.payload.len()
-    {
+    if !request.has_valid_envelope() || request.header.protocol != COMMERCIAL_MAX_PROTOCOL_INPUTD {
         return Err(libc::EINVAL);
     }
     match request.header.op {
+        COMMERCIAL_MAX_INPUTD_OP_INPUT_READER
+            if matches!(
+                request.arg0,
+                value if value == u64::from(INPUTD_ACCESS_NATIVE)
+                    || value == u64::from(INPUTD_ACCESS_EVDEV)
+            ) =>
+        {
+            Ok(())
+        }
         COMMERCIAL_MAX_INPUTD_OP_INPUT_INGEST
-        | COMMERCIAL_MAX_INPUTD_OP_INPUT_READER
         | COMMERCIAL_MAX_INPUTD_OP_EVDEV_TRANSLATE
         | COMMERCIAL_MAX_INPUTD_OP_LAYOUT_POLICY
         | COMMERCIAL_MAX_INPUTD_OP_DROP_POLICY

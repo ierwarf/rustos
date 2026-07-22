@@ -285,6 +285,7 @@ pub fn call_procd(request: &ProcdIpcRequest) -> Result<ProcdIpcResponse, i64> {
         return Err(LINUX_EINVAL);
     }
     let response = read_unaligned::<ProcdIpcResponse>(response.as_slice());
+    validate_procd_response_envelope(request.op, &response)?;
     log_slow_service_call(
         "procd",
         request.op,
@@ -295,6 +296,21 @@ pub fn call_procd(request: &ProcdIpcRequest) -> Result<ProcdIpcResponse, i64> {
         None,
     );
     Ok(response)
+}
+
+fn validate_procd_response_envelope(
+    request_op: u16,
+    response: &ProcdIpcResponse,
+) -> Result<(), i64> {
+    if response.version != rustos_user_abi::syscall::PROCD_IPC_ABI_VERSION
+        || response.op != request_op
+        || response.reserved0 != 0
+        || response.reserved1 != 0
+        || response.payload_len as usize > response.payload.len()
+    {
+        return Err(LINUX_EINVAL);
+    }
+    Ok(())
 }
 
 pub fn ensure_empty_procd_response(response: &ProcdIpcResponse) -> Result<(), i64> {
@@ -383,13 +399,19 @@ pub fn call_vfs_ipc_request(request: &VfsIpcRequest) -> Result<VfsIpcResponse, i
         return Err(LINUX_EINVAL);
     }
     let response = read_unaligned::<VfsIpcResponse>(response.as_slice());
+    validate_vfs_response_envelope(request.op, &response)?;
+    Ok(response)
+}
+
+fn validate_vfs_response_envelope(request_op: u16, response: &VfsIpcResponse) -> Result<(), i64> {
     if response.version != VFS_IPC_ABI_VERSION
-        || response.op != request.op
+        || response.op != request_op
         || response.reserved0 != 0
+        || response.payload_len as usize > response.payload.len()
     {
         return Err(LINUX_EINVAL);
     }
-    Ok(response)
+    Ok(())
 }
 
 // RING3-MIGRATION-REFERENCE START: bootstrap-device-route exception: vfsd and
@@ -675,17 +697,27 @@ fn call_sessiond_console_route(
         return Err(LINUX_EINVAL);
     }
     let response = read_unaligned::<CommercialMaxProtocolResponse>(response.as_slice());
-    if response.header.version != COMMERCIAL_MAX_PROTOCOL_ABI_VERSION
-        || response.header.protocol != COMMERCIAL_MAX_PROTOCOL_SESSIOND
-        || response.header.op != COMMERCIAL_MAX_SESSIOND_OP_CONSOLE_ROUTE
-        || response.payload_len as usize > response.payload.len()
-        || response.reserved0 != 0
-        || response.reserved1 != 0
-    {
+    ipc_ops::validate_commercial_response_envelope(&request, &response)?;
+    if response.descriptor_count != 1 {
         return Err(LINUX_EINVAL);
     }
     if response.status != 0 {
         return Err(response.status.unsigned_abs() as i64);
+    }
+    match route_request {
+        COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_READ => {
+            if response.payload_len as usize > read_capacity
+                || response.value0 != u64::from(response.payload_len)
+            {
+                return Err(LINUX_EINVAL);
+            }
+        }
+        COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_WRITE => {
+            if response.payload_len != 0 || response.value0 as usize > payload.len() {
+                return Err(LINUX_EINVAL);
+            }
+        }
+        _ => return Err(LINUX_EINVAL),
     }
     Ok(response)
 }
@@ -737,7 +769,7 @@ pub fn open_device_via_devmgrd(path: &str, flags: u64) -> Result<u64, i64> {
     }) else {
         return Err(LINUX_EINVAL);
     };
-    Ok(fd)
+    fd.ok_or(LINUX_EMFILE)
 }
 
 pub fn ioctl_tty_via_sessiond(fd: u64, request_number: u64, arg: u64) -> Result<u64, i64> {
@@ -777,13 +809,8 @@ pub fn ioctl_tty_via_sessiond(fd: u64, request_number: u64, arg: u64) -> Result<
         return Err(LINUX_EINVAL);
     }
     let response = read_unaligned::<CommercialMaxProtocolResponse>(response.as_slice());
-    if response.header.version != COMMERCIAL_MAX_PROTOCOL_ABI_VERSION
-        || response.header.protocol != COMMERCIAL_MAX_PROTOCOL_SESSIOND
-        || response.header.op != COMMERCIAL_MAX_SESSIOND_OP_TTY_LINE_DISCIPLINE
-        || response.payload_len as usize > response.payload.len()
-        || response.reserved0 != 0
-        || response.reserved1 != 0
-    {
+    ipc_ops::validate_commercial_response_envelope(&request, &response)?;
+    if response.descriptor_count != 1 {
         return Err(LINUX_EINVAL);
     }
     if response.status != 0 {
@@ -802,8 +829,16 @@ pub fn ioctl_tty_via_sessiond(fd: u64, request_number: u64, arg: u64) -> Result<
             .map_err(address_space_error_to_linux_errno)?;
             Ok(0)
         }
-        linux_abi::TCSETS | linux_abi::TCSETSW | linux_abi::TCSETSF => Ok(0),
+        linux_abi::TCSETS | linux_abi::TCSETSW | linux_abi::TCSETSF => {
+            if response.payload_len != 0 {
+                return Err(LINUX_EINVAL);
+            }
+            Ok(0)
+        }
         linux_abi::FIONREAD => {
+            if response.payload_len != 0 {
+                return Err(LINUX_EINVAL);
+            }
             let pending = response.value0.min(i32::MAX as u64) as i32;
             usermem::write_current_user_bytes(arg, as_bytes(&pending))
                 .map_err(address_space_error_to_linux_errno)?;
@@ -1187,6 +1222,52 @@ fn log_slow_service_call(
             pid,
             tid,
             status_or_len,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vfs_response_envelope_rejects_oversized_payload_before_slice_use() {
+        let mut response = VfsIpcResponse {
+            version: VFS_IPC_ABI_VERSION,
+            op: VFS_IPC_OP_OPENAT,
+            ..VfsIpcResponse::default()
+        };
+        assert_eq!(
+            validate_vfs_response_envelope(VFS_IPC_OP_OPENAT, &response),
+            Ok(())
+        );
+
+        response.payload_len = response.payload.len() as u32 + 1;
+        assert_eq!(
+            validate_vfs_response_envelope(VFS_IPC_OP_OPENAT, &response),
+            Err(LINUX_EINVAL)
+        );
+    }
+
+    #[test]
+    fn procd_response_envelope_rejects_cross_op_and_oversized_payload() {
+        let mut response = ProcdIpcResponse {
+            op: PROCD_OP_SELECT_SIGNAL,
+            ..ProcdIpcResponse::default()
+        };
+        assert_eq!(
+            validate_procd_response_envelope(PROCD_OP_SELECT_SIGNAL, &response),
+            Ok(())
+        );
+        assert_eq!(
+            validate_procd_response_envelope(PROCD_OP_EXECVE, &response),
+            Err(LINUX_EINVAL)
+        );
+
+        response.payload_len = response.payload.len() as u32 + 1;
+        assert_eq!(
+            validate_procd_response_envelope(PROCD_OP_SELECT_SIGNAL, &response),
+            Err(LINUX_EINVAL)
         );
     }
 }

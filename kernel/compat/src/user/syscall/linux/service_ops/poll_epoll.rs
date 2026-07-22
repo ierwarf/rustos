@@ -370,7 +370,8 @@ pub fn syscall_linux_epoll_create1(flags: u64) -> u64 {
                 linux_abi::O_RDONLY,
             ))
     }) {
-        Some(fd) => fd,
+        Some(Some(fd)) => fd,
+        Some(None) => linux_errno(LINUX_EMFILE),
         None => linux_errno(LINUX_ENOSYS),
     }
 }

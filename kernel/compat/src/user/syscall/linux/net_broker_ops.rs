@@ -120,18 +120,14 @@ fn broker_socketpair(args: &RustosNetBrokerArgs) -> Result<u64, i64> {
         return Err(LINUX_EAFNOSUPPORT);
     }
     let open_flags = args.arg1 & (linux_abi::SOCK_NONBLOCK | linux_abi::SOCK_CLOEXEC);
-    let left_fd = install_process_handle(
-        args.process_id,
+    install_process_socket_pair(
+        args,
         multitask::KernelHandle::Socket(multitask::SocketHandle::from_token(
             args.arg4,
             linux_abi::AF_UNIX,
             linux_abi::SOCK_STREAM,
             args.arg2,
         )),
-        open_flags,
-    )?;
-    let right_fd = install_process_handle(
-        args.process_id,
         multitask::KernelHandle::Socket(multitask::SocketHandle::from_token(
             args.arg5,
             linux_abi::AF_UNIX,
@@ -139,9 +135,7 @@ fn broker_socketpair(args: &RustosNetBrokerArgs) -> Result<u64, i64> {
             args.arg2,
         )),
         open_flags,
-    )?;
-    write_process_i32_pair(args.process_id, args.arg3, left_fd as i32, right_fd as i32)?;
-    Ok(0)
+    )
 }
 
 fn broker_accept(args: &RustosNetBrokerArgs) -> Result<u64, i64> {
@@ -183,37 +177,66 @@ fn install_process_handle(
     handle: multitask::KernelHandle,
     open_flags: u64,
 ) -> Result<u64, i64> {
-    multitask::with_process_state_by_pid_mut(process_id, |process_state| {
+    let Some(fd) = multitask::with_process_state_by_pid_mut(process_id, |process_state| {
         process_state
             .handles_mut()
             .install_with_open_flags(handle, open_flags)
-    })
-    .ok_or(LINUX_ESRCH)
-}
-
-fn write_process_i32_pair(process_id: u64, ptr: u64, left: i32, right: i32) -> Result<(), i64> {
-    if ptr == 0 {
-        return Err(LINUX_EINVAL);
-    }
-    let mut bytes = [0_u8; 8];
-    bytes[..4].copy_from_slice(&left.to_ne_bytes());
-    bytes[4..].copy_from_slice(&right.to_ne_bytes());
-    write_process_bytes(process_id, ptr, &bytes)
-}
-
-fn write_process_bytes(process_id: u64, ptr: u64, bytes: &[u8]) -> Result<(), i64> {
-    if ptr == 0 && !bytes.is_empty() {
-        return Err(LINUX_EFAULT);
-    }
-    let Some(result) = multitask::with_process_state_by_pid_mut(process_id, |process_state| {
-        process_state
-            .address_space()
-            .validate_user_write_buffer(VirtAddr::new(ptr), bytes.len())?;
-        process_state
-            .address_space()
-            .copy_into_user(VirtAddr::new(ptr), bytes)
     }) else {
         return Err(LINUX_ESRCH);
     };
-    result.map_err(address_space_error_to_linux_errno)
+    fd.ok_or(LINUX_EMFILE)
+}
+
+fn install_process_socket_pair(
+    args: &RustosNetBrokerArgs,
+    left: multitask::KernelHandle,
+    right: multitask::KernelHandle,
+    open_flags: u64,
+) -> Result<u64, i64> {
+    if args.arg3 == 0 {
+        return Err(LINUX_EINVAL);
+    }
+    let Some(result) = multitask::with_process_state_by_pid_mut(args.process_id, |process_state| {
+        process_state
+            .address_space()
+            .validate_user_write_buffer(VirtAddr::new(args.arg3), 8)
+            .map_err(address_space_error_to_linux_errno)?;
+        if !process_state.handles().can_install_additional(2) {
+            return Err(LINUX_EMFILE);
+        }
+        let Some(left_fd) = process_state
+            .handles_mut()
+            .install_with_open_flags(left, open_flags)
+        else {
+            return Err(LINUX_EMFILE);
+        };
+        let Some(right_fd) = process_state
+            .handles_mut()
+            .install_with_open_flags(right, open_flags)
+        else {
+            let _ = process_state.handles_mut().close(left_fd);
+            return Err(LINUX_EMFILE);
+        };
+        let (Ok(left_fd_i32), Ok(right_fd_i32)) = (i32::try_from(left_fd), i32::try_from(right_fd))
+        else {
+            let _ = process_state.handles_mut().close(left_fd);
+            let _ = process_state.handles_mut().close(right_fd);
+            return Err(LINUX_EMFILE);
+        };
+        let mut bytes = [0_u8; 8];
+        bytes[..4].copy_from_slice(&left_fd_i32.to_ne_bytes());
+        bytes[4..].copy_from_slice(&right_fd_i32.to_ne_bytes());
+        if let Err(error) = process_state
+            .address_space()
+            .copy_into_user(VirtAddr::new(args.arg3), &bytes)
+        {
+            let _ = process_state.handles_mut().close(left_fd);
+            let _ = process_state.handles_mut().close(right_fd);
+            return Err(address_space_error_to_linux_errno(error));
+        }
+        Ok(0)
+    }) else {
+        return Err(LINUX_ESRCH);
+    };
+    result
 }

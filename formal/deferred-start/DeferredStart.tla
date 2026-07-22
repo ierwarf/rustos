@@ -39,11 +39,13 @@ VARIABLES procState,
           waitPid,
           waitDeadline,
           issuedPids,
+          supervisorHealthy,
+          uncertainPid,
           now
 
 vars == <<procState, procPid, leasePid, spawnSupervisor, admittedSupervisor,
           endpointPid, activationCount, waitState, waitPid, waitDeadline,
-          issuedPids, now>>
+          issuedPids, supervisorHealthy, uncertainPid, now>>
 
 Init ==
     /\ procState = [s \in Services |-> Absent]
@@ -57,9 +59,12 @@ Init ==
     /\ waitPid = [s \in Services |-> NoPid]
     /\ waitDeadline = [s \in Services |-> 0]
     /\ issuedPids = {}
+    /\ supervisorHealthy = TRUE
+    /\ uncertainPid = NoPid
     /\ now = 0
 
 SpawnDeferred(s, p, supervisor) ==
+    /\ supervisorHealthy
     /\ s \in Services
     /\ p \in Pids \ issuedPids
     /\ supervisor = SupervisorFor(s)
@@ -72,9 +77,10 @@ SpawnDeferred(s, p, supervisor) ==
     /\ waitPid' = [waitPid EXCEPT ![s] = NoPid]
     /\ waitDeadline' = [waitDeadline EXCEPT ![s] = 0]
     /\ issuedPids' = issuedPids \cup {p}
-    /\ UNCHANGED <<leasePid, endpointPid, activationCount, now>>
+    /\ UNCHANGED <<leasePid, endpointPid, activationCount, supervisorHealthy, uncertainPid, now>>
 
 AdmitLease(s, supervisor) ==
+    /\ supervisorHealthy
     /\ s \in Services
     /\ supervisor = SupervisorFor(s)
     /\ procState[s] = Suspended
@@ -85,9 +91,10 @@ AdmitLease(s, supervisor) ==
     /\ admittedSupervisor' = [admittedSupervisor EXCEPT ![s] = supervisor]
     /\ UNCHANGED <<procState, procPid, spawnSupervisor, endpointPid,
                   activationCount, waitState, waitPid, waitDeadline,
-                  issuedPids, now>>
+                  issuedPids, supervisorHealthy, uncertainPid, now>>
 
 Activate(s, supervisor) ==
+    /\ supervisorHealthy
     /\ s \in Services
     /\ supervisor = SupervisorFor(s)
     /\ procState[s] = Suspended
@@ -104,9 +111,10 @@ Activate(s, supervisor) ==
     /\ waitPid' = [waitPid EXCEPT ![s] = procPid[s]]
     /\ waitDeadline' = [waitDeadline EXCEPT ![s] = now + WaitTimeout]
     /\ UNCHANGED <<procPid, leasePid, spawnSupervisor, admittedSupervisor,
-                  endpointPid, issuedPids, now>>
+                  endpointPid, issuedPids, supervisorHealthy, uncertainPid, now>>
 
 RegisterEndpoint(s) ==
+    /\ supervisorHealthy
     /\ s \in Services
     /\ procState[s] = Running
     /\ procPid[s] = leasePid[s]
@@ -118,9 +126,10 @@ RegisterEndpoint(s) ==
     /\ waitState' = [waitState EXCEPT ![s] = Ready]
     /\ UNCHANGED <<procState, procPid, leasePid, spawnSupervisor,
                   admittedSupervisor, activationCount, waitPid, waitDeadline,
-                  issuedPids, now>>
+                  issuedPids, supervisorHealthy, uncertainPid, now>>
 
 Exit(s) ==
+    /\ supervisorHealthy
     /\ s \in Services
     /\ procState[s] \in {Suspended, Running}
     /\ procState' = [procState EXCEPT ![s] = Exited]
@@ -132,28 +141,107 @@ Exit(s) ==
     /\ waitState' = [waitState EXCEPT ![s] = Failed]
     /\ waitPid' = [waitPid EXCEPT ![s] = NoPid]
     /\ waitDeadline' = [waitDeadline EXCEPT ![s] = 0]
-    /\ UNCHANGED <<activationCount, issuedPids, now>>
+    /\ UNCHANGED <<activationCount, issuedPids, supervisorHealthy, uncertainPid, now>>
+
+ActivationFailsAndCleans(s, supervisor) ==
+    /\ supervisorHealthy
+    /\ s \in Services
+    /\ supervisor = SupervisorFor(s)
+    /\ procState[s] = Suspended
+    /\ leasePid[s] = procPid[s]
+    /\ admittedSupervisor[s] = supervisor
+    /\ procState' = [procState EXCEPT ![s] = Exited]
+    /\ procPid' = [procPid EXCEPT ![s] = NoPid]
+    /\ leasePid' = [leasePid EXCEPT ![s] = NoPid]
+    /\ spawnSupervisor' = [spawnSupervisor EXCEPT ![s] = NoSupervisor]
+    /\ admittedSupervisor' = [admittedSupervisor EXCEPT ![s] = NoSupervisor]
+    /\ waitState' = [waitState EXCEPT ![s] = Failed]
+    /\ UNCHANGED <<endpointPid, activationCount, waitPid, waitDeadline, issuedPids,
+                  supervisorHealthy, uncertainPid, now>>
+
+ActivationCleanupFails(s, supervisor) ==
+    /\ supervisorHealthy
+    /\ s \in Services
+    /\ supervisor = SupervisorFor(s)
+    /\ procState[s] = Suspended
+    /\ leasePid[s] = procPid[s]
+    /\ admittedSupervisor[s] = supervisor
+    /\ supervisorHealthy' = FALSE
+    /\ uncertainPid' = procPid[s]
+    /\ UNCHANGED <<procState, procPid, leasePid, spawnSupervisor, admittedSupervisor,
+                  endpointPid, activationCount, waitState, waitPid, waitDeadline,
+                  issuedPids, now>>
 
 AdvanceTime ==
+    /\ supervisorHealthy
     /\ now < MaxTime
     /\ now' = now + 1
+    /\ procState' =
+         [s \in Services |->
+            IF waitState[s] = Waiting /\ now + 1 >= waitDeadline[s]
+            THEN Exited
+            ELSE procState[s]]
+    /\ procPid' =
+         [s \in Services |->
+            IF waitState[s] = Waiting /\ now + 1 >= waitDeadline[s]
+            THEN NoPid
+            ELSE procPid[s]]
+    /\ leasePid' =
+         [s \in Services |->
+            IF waitState[s] = Waiting /\ now + 1 >= waitDeadline[s]
+            THEN NoPid
+            ELSE leasePid[s]]
+    /\ spawnSupervisor' =
+         [s \in Services |->
+            IF waitState[s] = Waiting /\ now + 1 >= waitDeadline[s]
+            THEN NoSupervisor
+            ELSE spawnSupervisor[s]]
+    /\ admittedSupervisor' =
+         [s \in Services |->
+            IF waitState[s] = Waiting /\ now + 1 >= waitDeadline[s]
+            THEN NoSupervisor
+            ELSE admittedSupervisor[s]]
+    /\ endpointPid' =
+         [s \in Services |->
+            IF waitState[s] = Waiting /\ now + 1 >= waitDeadline[s]
+            THEN NoPid
+            ELSE endpointPid[s]]
     /\ waitState' =
          [s \in Services |->
             IF waitState[s] = Waiting /\ now + 1 >= waitDeadline[s]
             THEN TimedOut
             ELSE waitState[s]]
-    /\ UNCHANGED <<procState, procPid, leasePid, spawnSupervisor,
-                  admittedSupervisor, endpointPid, activationCount, waitPid,
-                  waitDeadline, issuedPids>>
+    /\ waitPid' =
+         [s \in Services |->
+            IF waitState[s] = Waiting /\ now + 1 >= waitDeadline[s]
+            THEN NoPid
+            ELSE waitPid[s]]
+    /\ UNCHANGED <<activationCount, waitDeadline, issuedPids, supervisorHealthy, uncertainPid>>
+
+TimeoutCleanupFails(s) ==
+    /\ supervisorHealthy
+    /\ s \in Services
+    /\ now < MaxTime
+    /\ waitState[s] = Waiting
+    /\ now + 1 >= waitDeadline[s]
+    /\ now' = now + 1
+    /\ supervisorHealthy' = FALSE
+    /\ uncertainPid' = procPid[s]
+    /\ waitState' = [waitState EXCEPT ![s] = TimedOut]
+    /\ UNCHANGED <<procState, procPid, leasePid, spawnSupervisor, admittedSupervisor,
+                  endpointPid, activationCount, waitPid, waitDeadline, issuedPids>>
 
 Next ==
     \/ \E s \in Services, p \in Pids, supervisor \in Supervisors :
         SpawnDeferred(s, p, supervisor)
     \/ \E s \in Services, supervisor \in Supervisors : AdmitLease(s, supervisor)
     \/ \E s \in Services, supervisor \in Supervisors : Activate(s, supervisor)
+    \/ \E s \in Services, supervisor \in Supervisors :
+        ActivationFailsAndCleans(s, supervisor) \/ ActivationCleanupFails(s, supervisor)
     \/ \E s \in Services : RegisterEndpoint(s)
     \/ \E s \in Services : Exit(s)
     \/ AdvanceTime
+    \/ \E s \in Services : TimeoutCleanupFails(s)
 
 TypeOK ==
     /\ Services \subseteq STRING
@@ -175,6 +263,8 @@ TypeOK ==
     /\ waitPid \in [Services -> (Pids \cup {NoPid})]
     /\ waitDeadline \in [Services -> 0..MaxTime]
     /\ issuedPids \subseteq Pids
+    /\ supervisorHealthy \in BOOLEAN
+    /\ uncertainPid \in Pids \cup {NoPid}
     /\ now \in 0..MaxTime
 
 SuspendedChildrenAreInert ==
@@ -219,13 +309,17 @@ ExitedChildrenLeaveNoBindings ==
             /\ endpointPid[s] = NoPid
             /\ spawnSupervisor[s] = NoSupervisor
             /\ admittedSupervisor[s] = NoSupervisor
-            /\ waitState[s] = IF procState[s] = Absent THEN Idle ELSE Failed
             /\ waitPid[s] = NoPid
-            /\ waitDeadline[s] = 0
+            /\ IF procState[s] = Absent
+                  THEN waitState[s] = Idle /\ waitDeadline[s] = 0
+                  ELSE
+                    /\ waitState[s] \in {Failed, TimedOut}
+                    /\ waitState[s] = Failed => waitDeadline[s] = 0
+                    /\ waitState[s] = TimedOut => 0 < waitDeadline[s] /\ waitDeadline[s] <= now
 
 WaitOutcomeIsBounded ==
     \A s \in Services:
-        /\ waitState[s] = Waiting => now < waitDeadline[s]
+        /\ waitState[s] = Waiting => now < waitDeadline[s] \/ ~supervisorHealthy
         /\ waitState[s] = TimedOut => now >= waitDeadline[s]
         /\ waitState[s] = Ready =>
             /\ endpointPid[s] = waitPid[s]
@@ -233,7 +327,14 @@ WaitOutcomeIsBounded ==
 
 WaitEventuallySettles ==
     \A s \in Services:
-        waitState[s] = Waiting ~> waitState[s] # Waiting
+        waitState[s] = Waiting ~> waitState[s] # Waiting \/ ~supervisorHealthy
+
+HealthySupervisorHasNoUncertainChild ==
+    supervisorHealthy <=> uncertainPid = NoPid
+
+UncertainCleanupCannotHavePublishedEndpoint ==
+    uncertainPid # NoPid =>
+        \A s \in Services: procPid[s] = uncertainPid => endpointPid[s] = NoPid
 
 AllLivePidsWereIssued ==
     \A s \in Services:

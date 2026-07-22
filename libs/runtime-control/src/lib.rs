@@ -1038,6 +1038,32 @@ mod tests {
     };
     use std::path::Path;
 
+    fn runtime_rpc_outcome(result: Result<usize, i32>, request_op: u16) -> (&'static str, usize) {
+        match result {
+            Ok(bytes) => {
+                let count = if request_op == OP_SNAPSHOT_RUNNING_PROGRAMS {
+                    bytes / std::mem::size_of::<super::RuntimeRunningProgram>()
+                } else {
+                    0
+                };
+                ("success", count)
+            }
+            Err(errno) if errno == libc::EOVERFLOW => ("overflow", 0),
+            Err(errno) if errno == libc::EPROTO => ("protocol", 0),
+            Err(_) => ("server-error", 0),
+        }
+    }
+
+    fn op_name(op: u16) -> &'static str {
+        match op {
+            super::OP_SNAPSHOT_RUNNING_PROGRAMS => "snapshot",
+            super::OP_REQUEST_LAUNCH_PATH => "launch",
+            super::OP_REQUEST_TERMINATE => "terminate",
+            super::OP_NOTIFY_READY => "ready",
+            _ => "unknown",
+        }
+    }
+
     #[test]
     fn parse_exec_tokens_handles_quotes_and_placeholders() {
         let tokens = parse_exec_tokens("\"apps/shell/shell.elf\" --login %f");
@@ -1161,6 +1187,60 @@ mod tests {
             Err(libc::EPROTO)
         );
     }
+
+    #[test]
+    fn emit_runtime_control_rpc_formal_trace() {
+        let Some(output) = std::env::var_os("RUSTOS_FORMAL_TRACE_OUT") else {
+            return;
+        };
+        let cases = [
+            (
+                OP_SNAPSHOT_RUNNING_PROGRAMS,
+                OP_SNAPSHOT_RUNNING_PROGRAMS,
+                0,
+                2,
+            ),
+            (
+                OP_SNAPSHOT_RUNNING_PROGRAMS,
+                OP_SNAPSHOT_RUNNING_PROGRAMS,
+                0,
+                65,
+            ),
+            (OP_REQUEST_LAUNCH_PATH, OP_REQUEST_LAUNCH_PATH, 0, 0),
+            (OP_REQUEST_LAUNCH_PATH, OP_REQUEST_LAUNCH_PATH, 0, 1),
+            (OP_REQUEST_LAUNCH_PATH, OP_SNAPSHOT_RUNNING_PROGRAMS, 0, 0),
+            (OP_REQUEST_LAUNCH_PATH, 0, -libc::EIO, 0),
+        ];
+        let mut trace = std::fs::File::create(output).expect("create formal trace");
+        use std::io::Write as _;
+        for (sequence, (request_op, response_op, status, count)) in cases.into_iter().enumerate() {
+            let request = RuntimeRequest {
+                op: request_op,
+                ..RuntimeRequest::default()
+            };
+            let response = RuntimeResponse {
+                version: PROTOCOL_VERSION,
+                op: response_op,
+                status,
+                count,
+            };
+            let (outcome, payload_count) =
+                runtime_rpc_outcome(response_payload_len(&request, &response), request_op);
+            let status_kind = if status == 0 { "ok" } else { "server-error" };
+            writeln!(
+                trace,
+                "{{\"schema\":\"rustos-formal-trace-v1\",\"model\":\"runtime-control-rpc/RuntimeControlRpc\",\"sequence\":{},\"action\":\"ReceiveResponse\",\"request_op\":\"{}\",\"response_op\":\"{}\",\"status\":\"{}\",\"version\":\"current\",\"count\":{},\"outcome\":\"{}\",\"payload_count\":{}}}",
+                sequence,
+                op_name(request_op),
+                op_name(response_op),
+                status_kind,
+                count,
+                outcome,
+                payload_count,
+            )
+            .expect("write formal trace");
+        }
+    }
 }
 
 #[cfg(kani)]
@@ -1185,6 +1265,7 @@ mod verification {
             status: 0,
             count: kani::any(),
         };
+        kani::cover!(request_op != response_op);
         assert_eq!(response_payload_len(&request, &response), Err(libc::EPROTO));
     }
 
@@ -1202,6 +1283,7 @@ mod verification {
             status: 0,
             count,
         };
+        kani::cover!(count > MAX_RUNTIME_PROGRAMS as u32);
         assert_eq!(
             response_payload_len(&request, &response),
             Err(libc::EOVERFLOW)
@@ -1217,6 +1299,7 @@ mod verification {
             status: i32::MIN,
             count: 0,
         };
+        kani::cover!(response.status == i32::MIN);
         assert_eq!(response_payload_len(&request, &response), Err(libc::EPROTO));
     }
 
@@ -1234,6 +1317,7 @@ mod verification {
             status: 0,
             count,
         };
+        kani::cover!(count > 0);
         assert_eq!(response_payload_len(&request, &response), Err(libc::EPROTO));
     }
 
@@ -1251,6 +1335,7 @@ mod verification {
             status: -errno,
             count: kani::any(),
         };
+        kani::cover!(errno > 0);
         assert_eq!(response_payload_len(&request, &response), Err(errno));
     }
 }

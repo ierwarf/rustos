@@ -719,11 +719,7 @@ fn validate_request(received: usize, request: &LoaderSpawnRequest) -> Result<(),
 }
 
 fn validate_commercial_request(request: &CommercialMaxProtocolRequest) -> Result<(), i32> {
-    if request.header.version != COMMERCIAL_MAX_PROTOCOL_ABI_VERSION
-        || request.header.protocol != COMMERCIAL_MAX_PROTOCOL_LOADERD
-        || request.path_len as usize > request.path.len()
-        || request.payload_len as usize > request.payload.len()
-    {
+    if !request.has_valid_envelope() || request.header.protocol != COMMERCIAL_MAX_PROTOCOL_LOADERD {
         return Err(EINVAL);
     }
     match request.header.op {

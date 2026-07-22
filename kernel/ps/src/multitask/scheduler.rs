@@ -1386,7 +1386,10 @@ impl Scheduler {
             panic!("scheduler root kernel task cannot be retired");
         }
 
-        if let Some(task_id) = self.starts[slot].map(|start| start.id) {
+        let task_id = self.starts[slot].map(|start| start.id);
+        let process =
+            self.contexts[slot].and_then(|context| context.process_handle.zip(context.process_id));
+        if let Some(task_id) = task_id {
             self.release_ipc_priorities_for_task(task_id);
         }
         self.retired[slot] = true;
@@ -1395,6 +1398,54 @@ impl Scheduler {
             context.ready = false;
         }
         self.retire_reasons[slot] = Some(reason);
+        if let Some(task_id) = task_id {
+            self.cleanup_ipc_authority_for_task(task_id);
+        }
+        if let Some((process_handle, process_id)) = process
+            && !self
+                .contexts
+                .iter()
+                .enumerate()
+                .any(|(candidate, context)| {
+                    candidate != slot
+                        && !self.retired[candidate]
+                        && context.is_some_and(|context| {
+                            context.user_mode && context.process_handle == Some(process_handle)
+                        })
+                })
+        {
+            self.cleanup_ipc_authority_for_process(process_id);
+        }
+    }
+
+    fn cleanup_ipc_authority_for_task(&mut self, task_id: u64) {
+        kernel_ipc_runtime::api::remove_endpoint_waiters_for_task(task_id);
+        let discarded = kernel_ipc_runtime::api::cancel_endpoint_calls_for_task(task_id);
+        crate::user::handles::drop_ipc_transfer_descriptors(discarded.as_slice());
+        let endpoint_wake_set = kernel_ipc_runtime::api::fail_endpoints_owned_by_task(
+            task_id,
+            kernel_ipc_runtime::api::IpcError::PeerClosed,
+        );
+        for caller in endpoint_wake_set.callers {
+            let _ = self.wake_task(caller);
+        }
+        for receiver in endpoint_wake_set.receivers {
+            let _ = self.wake_task(receiver);
+        }
+    }
+
+    fn cleanup_ipc_authority_for_process(&mut self, process_id: u64) {
+        self.release_ipc_priorities_for_process(process_id);
+        let endpoint_wake_set = kernel_ipc_runtime::api::fail_endpoints_owned_by_process(
+            process_id,
+            kernel_ipc_runtime::api::IpcError::PeerClosed,
+        );
+        for caller in endpoint_wake_set.callers {
+            let _ = self.wake_task(caller);
+        }
+        for receiver in endpoint_wake_set.receivers {
+            let _ = self.wake_task(receiver);
+        }
     }
 
     fn allocate_stack_storage(&mut self, slot: usize) -> Option<()> {
@@ -1991,8 +2042,12 @@ impl Scheduler {
         for slot in FIRST_DYNAMIC_TASK_SLOT..MAX_TASK {
             if self.contexts[slot].is_none() {
                 self.reset_stack_storage(slot)?;
+                if process_table::attach_task(process_handle).is_none() {
+                    self.release_stack_storage(slot);
+                    return None;
+                }
                 if let Some(thread_state) = bootstrap.windows_thread_state {
-                    let init_result = process_table::with_process_state_mut(
+                    let Some(init_result) = process_table::with_process_state_mut(
                         process_handle,
                         |_, process_state| {
                             process::initialize_windows_thread_identifiers(
@@ -2002,12 +2057,17 @@ impl Scheduler {
                                 id,
                             )
                         },
-                    )?;
+                    ) else {
+                        let _ = process_table::detach_task(process_handle);
+                        self.release_stack_storage(slot);
+                        return None;
+                    };
                     if let Err(error) = init_result {
+                        let _ = process_table::detach_task(process_handle);
+                        self.release_stack_storage(slot);
                         panic!("failed to initialize windows thread ids: {:?}", error);
                     }
                 }
-                process_table::attach_task(process_handle)?;
                 let (kernel_stack_base, kernel_stack_top) = self.stack_bounds(slot);
                 self.contexts[slot] = Some(TaskContext {
                     saved_rsp: self
@@ -3018,30 +3078,6 @@ impl Scheduler {
         (slots, count)
     }
 
-    pub(super) fn current_process_task_ids(&self) -> ([u64; MAX_TASK], usize) {
-        let mut task_ids = [0_u64; MAX_TASK];
-        let Some(process_handle) =
-            self.contexts[self.current_task].and_then(|context| context.process_handle)
-        else {
-            return (task_ids, 0);
-        };
-        let mut count = 0usize;
-        for slot in 1..MAX_TASK {
-            if self.retired[slot]
-                || self.contexts[slot].and_then(|context| context.process_handle)
-                    != Some(process_handle)
-            {
-                continue;
-            }
-            let Some(task_id) = self.starts[slot].map(|start| start.id) else {
-                continue;
-            };
-            task_ids[count] = task_id;
-            count += 1;
-        }
-        (task_ids, count)
-    }
-
     #[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
     fn try_grow_current_user_stack_on_fault(
         &mut self,
@@ -3626,6 +3662,7 @@ mod tests {
     use crate::multitask::{UserTaskBootstrap, noop_task_entry, process_table};
     use crate::user::abi::UserAbi;
     use crate::user::process_state::UserProcessState;
+    use kernel_ipc_runtime::api::IpcError;
 
     fn test_user_context(handle: process_table::ProcessHandle) -> TaskContext {
         TaskContext {
@@ -3692,40 +3729,6 @@ mod tests {
     }
 
     #[test]
-    fn current_process_task_ids_excludes_other_and_retired_tasks() {
-        let mut scheduler = Box::new(Scheduler::new());
-        let owner = test_process(11);
-        let other = test_process(22);
-
-        scheduler.current_task = 1;
-        scheduler.contexts[1] = Some(test_user_context(owner));
-        scheduler.contexts[2] = Some(test_user_context(owner));
-        scheduler.contexts[3] = Some(test_user_context(other));
-        scheduler.contexts[4] = Some(test_user_context(owner));
-        scheduler.starts[1] = Some(TaskStart {
-            entry: noop_task_entry,
-            id: 101,
-        });
-        scheduler.starts[2] = Some(TaskStart {
-            entry: noop_task_entry,
-            id: 102,
-        });
-        scheduler.starts[3] = Some(TaskStart {
-            entry: noop_task_entry,
-            id: 201,
-        });
-        scheduler.starts[4] = Some(TaskStart {
-            entry: noop_task_entry,
-            id: 103,
-        });
-        scheduler.retired[4] = true;
-
-        let (task_ids, count) = scheduler.current_process_task_ids();
-        assert_eq!(count, 2);
-        assert_eq!(&task_ids[..count], &[101, 102]);
-    }
-
-    #[test]
     fn terminate_user_process_retires_every_live_sibling() {
         let mut scheduler = Box::new(Scheduler::new());
         let owner = test_process(41);
@@ -3751,6 +3754,75 @@ mod tests {
         assert!(scheduler.retired[1]);
         assert!(scheduler.retired[2]);
         assert!(!scheduler.retired[3]);
+    }
+
+    #[test]
+    fn retirement_revokes_task_and_process_ipc_authority() {
+        let mut scheduler = Box::new(Scheduler::new());
+        let owner = test_process(94);
+        scheduler.contexts[1] = Some(test_user_context(owner));
+        scheduler.starts[1] = Some(TaskStart {
+            entry: noop_task_entry,
+            id: 941,
+        });
+
+        let task_endpoint =
+            kernel_ipc_runtime::api::create_endpoint_for_task(941).expect("task-owned endpoint");
+        let process_endpoint = kernel_ipc_runtime::api::create_endpoint_for_process(94)
+            .expect("process-owned endpoint");
+        let (task_reply, _) =
+            kernel_ipc_runtime::api::enqueue_endpoint_call(task_endpoint, 951, b"task")
+                .expect("task call");
+        let (process_reply, _) =
+            kernel_ipc_runtime::api::enqueue_endpoint_call(process_endpoint, 952, b"process")
+                .expect("process call");
+
+        scheduler.retire_slot(
+            1,
+            super::TaskRetireReason::Terminated {
+                requested_by_pid: None,
+            },
+        );
+
+        assert_eq!(
+            kernel_ipc_runtime::api::take_endpoint_response(task_reply),
+            Err(IpcError::PeerClosed)
+        );
+        assert_eq!(
+            kernel_ipc_runtime::api::take_endpoint_response(process_reply),
+            Err(IpcError::PeerClosed)
+        );
+        assert_eq!(
+            kernel_ipc_runtime::api::enqueue_endpoint_call(task_endpoint, 953, b"late-task"),
+            Err(IpcError::InvalidHandle)
+        );
+        assert_eq!(
+            kernel_ipc_runtime::api::enqueue_endpoint_call(process_endpoint, 954, b"late-process"),
+            Err(IpcError::InvalidHandle)
+        );
+    }
+
+    #[test]
+    fn rejected_thread_attachment_releases_unpublished_stack() {
+        let mut scheduler = Box::new(Scheduler::new());
+        let owner = test_process(95);
+        scheduler.current_task = 1;
+        scheduler.contexts[1] = Some(test_user_context(owner));
+        process_table::mark_process_exiting(95).expect("mark exiting");
+        let base = crate::memory::paging::USER_SPACE_BASE;
+        let bootstrap = UserTaskBootstrap::new(
+            UserAbi::Linux,
+            x86_64::VirtAddr::new(base + 0x2_000),
+            x86_64::VirtAddr::new(base + 0x4_000),
+        );
+
+        assert_eq!(
+            scheduler
+                .allocate_user_thread_slot(951, bootstrap, 0, 0, super::RFLAGS_RESERVED_BIT_1,),
+            None
+        );
+        assert!(scheduler.contexts[2].is_none());
+        assert!(scheduler.stacks[2].is_none());
     }
 
     #[test]

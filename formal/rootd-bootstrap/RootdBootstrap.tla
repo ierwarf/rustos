@@ -171,13 +171,42 @@ Exit(s) ==
 AdvanceTime ==
     /\ now < MaxTime
     /\ now' = now + 1
+    /\ procState' =
+         [s \in Services |->
+            IF waitState[s] = Waiting /\ now + 1 >= waitDeadline[s]
+            THEN Exited
+            ELSE procState[s]]
+    /\ procPid' =
+         [s \in Services |->
+            IF waitState[s] = Waiting /\ now + 1 >= waitDeadline[s]
+            THEN NoPid
+            ELSE procPid[s]]
+    /\ leasePid' =
+         [s \in Services |->
+            IF waitState[s] = Waiting /\ now + 1 >= waitDeadline[s]
+            THEN NoPid
+            ELSE leasePid[s]]
+    /\ endpointPid' =
+         [s \in Services |->
+            IF waitState[s] = Waiting /\ now + 1 >= waitDeadline[s]
+            THEN NoPid
+            ELSE endpointPid[s]]
+    /\ capabilityPid' =
+         [s \in Services |->
+            IF waitState[s] = Waiting /\ now + 1 >= waitDeadline[s]
+            THEN NoPid
+            ELSE capabilityPid[s]]
     /\ waitState' =
          [s \in Services |->
             IF waitState[s] = Waiting /\ now + 1 >= waitDeadline[s]
             THEN TimedOut
             ELSE waitState[s]]
-    /\ UNCHANGED <<procState, procPid, leasePid, endpointPid, capabilityPid,
-                  attempts, waitPid, waitDeadline, initdAuthorized, issuedPids>>
+    /\ waitPid' =
+         [s \in Services |->
+            IF waitState[s] = Waiting /\ now + 1 >= waitDeadline[s]
+            THEN NoPid
+            ELSE waitPid[s]]
+    /\ UNCHANGED <<attempts, waitDeadline, initdAuthorized, issuedPids>>
 
 Next ==
     \/ \E s \in CoreServices, p \in Pids : StartCore(s, p)
@@ -268,9 +297,10 @@ LifecycleBindingsAreConsistent ==
             /\ leasePid[s] = NoPid
             /\ endpointPid[s] = NoPid
             /\ capabilityPid[s] = NoPid
-            /\ waitState[s] = Failed
             /\ waitPid[s] = NoPid
-            /\ waitDeadline[s] = 0
+            /\ waitState[s] \in {Failed, TimedOut}
+            /\ waitState[s] = Failed => waitDeadline[s] = 0
+            /\ waitState[s] = TimedOut => 0 < waitDeadline[s] /\ waitDeadline[s] <= now
 
 WaitPhaseMatchesBindings ==
     \A s \in Services:

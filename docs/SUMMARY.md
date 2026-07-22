@@ -40,6 +40,7 @@
 - [AI Agent Reference](ai/README.md)
 - [Token Policy](ai/token-policy.md)
 - [Task Router](ai/task-router.md)
+- [Session Handoff](ai/session-handoff.md)
 - [Repo Map](ai/repo-map.md)
 - [Commands](ai/commands.md)
 - [Contracts](ai/contracts.md)

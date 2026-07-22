@@ -125,11 +125,15 @@ impl HandleTable {
         }
     }
 
-    pub fn install(&mut self, handle: KernelHandle) -> u64 {
+    pub fn install(&mut self, handle: KernelHandle) -> Option<u64> {
         self.install_with_open_flags(handle, 0)
     }
 
-    pub fn install_with_open_flags(&mut self, handle: KernelHandle, open_flags: u64) -> u64 {
+    pub fn install_with_open_flags(
+        &mut self,
+        handle: KernelHandle,
+        open_flags: u64,
+    ) -> Option<u64> {
         let fd_flags = if open_flags & linux_abi::O_CLOEXEC != 0 {
             FD_CLOEXEC
         } else {
@@ -144,7 +148,7 @@ impl HandleTable {
         handle: KernelHandle,
         open_flags: u64,
         rights: HandleRights,
-    ) -> u64 {
+    ) -> Option<u64> {
         let fd_flags = if open_flags & linux_abi::O_CLOEXEC != 0 {
             FD_CLOEXEC
         } else {
@@ -159,12 +163,15 @@ impl HandleTable {
         ))
     }
 
-    pub fn install_entry(&mut self, entry: HandleEntry) -> u64 {
+    pub fn install_entry(&mut self, entry: HandleEntry) -> Option<u64> {
         self.install_entry_min(entry, FIRST_DYNAMIC_FD as u64)
     }
 
-    pub fn install_entry_min(&mut self, entry: HandleEntry, min_fd: u64) -> u64 {
-        let start_index = dynamic_index(min_fd.max(FIRST_DYNAMIC_FD as u64)).unwrap_or(0);
+    pub fn install_entry_min(&mut self, entry: HandleEntry, min_fd: u64) -> Option<u64> {
+        if min_fd > MAX_DYNAMIC_FD {
+            return None;
+        }
+        let start_index = dynamic_index(min_fd.max(FIRST_DYNAMIC_FD as u64))?;
         if let Some(index) = self
             .entries
             .iter()
@@ -173,14 +180,17 @@ impl HandleTable {
             .find_map(|(index, entry)| entry.is_none().then_some(index))
         {
             self.entries[index] = Some(entry);
-            return FIRST_DYNAMIC_FD as u64 + index as u64;
+            return Some(FIRST_DYNAMIC_FD as u64 + index as u64);
         }
 
+        if self.entries.len() >= max_dynamic_entries() {
+            return None;
+        }
         if self.entries.len() < start_index {
             self.entries.resize_with(start_index, || None);
         }
         self.entries.push(Some(entry));
-        FIRST_DYNAMIC_FD as u64 + (self.entries.len() - 1) as u64
+        Some(FIRST_DYNAMIC_FD as u64 + (self.entries.len() - 1) as u64)
     }
 
     pub fn get(&self, fd: u64) -> Option<&KernelHandle> {
@@ -205,7 +215,7 @@ impl HandleTable {
         TransferredHandleEntry::from_entry(self.get_entry(fd)?.clone())
     }
 
-    pub fn install_transferred(&mut self, transferred: TransferredHandleEntry) -> u64 {
+    pub fn install_transferred(&mut self, transferred: TransferredHandleEntry) -> Option<u64> {
         self.install_entry(transferred.into_entry())
     }
 
@@ -213,8 +223,14 @@ impl HandleTable {
         &mut self,
         transferred: TransferredHandleEntry,
         min_fd: u64,
-    ) -> u64 {
+    ) -> Option<u64> {
         self.install_entry_min(transferred.into_entry(), min_fd)
+    }
+
+    pub fn can_install_additional(&self, count: usize) -> bool {
+        let reusable = self.entries.iter().filter(|entry| entry.is_none()).count();
+        let appendable = max_dynamic_entries().saturating_sub(self.entries.len());
+        count <= reusable.saturating_add(appendable)
     }
 
     pub fn display_surface_count(&self) -> usize {
@@ -235,15 +251,23 @@ impl HandleTable {
         })
     }
 
-    pub fn ensure_entry_capacity(&mut self, index: usize) {
-        if self.entries.len() <= index {
-            self.entries.resize_with(index + 1, || None);
+    fn ensure_entry_capacity(&mut self, index: usize) -> Option<()> {
+        let required = index.checked_add(1)?;
+        if required > max_dynamic_entries() {
+            return None;
         }
+        if self.entries.len() < required {
+            self.entries.resize_with(required, || None);
+        }
+        Some(())
     }
 
     pub fn replace_entry(&mut self, fd: u64, entry: Option<HandleEntry>) -> Option<()> {
+        if fd > MAX_DYNAMIC_FD {
+            return None;
+        }
         let index = dynamic_index(fd)?;
-        self.ensure_entry_capacity(index);
+        self.ensure_entry_capacity(index)?;
         self.entries[index] = entry;
         Some(())
     }
@@ -272,12 +296,12 @@ impl HandleTable {
     }
 
     pub fn duplicate_min(&mut self, fd: u64, min_fd: u64, close_on_exec: bool) -> Option<u64> {
-        if min_fd > MAX_DYNAMIC_FD || self.entries.len() >= max_dynamic_entries() {
+        if min_fd > MAX_DYNAMIC_FD {
             return None;
         }
         let mut entry = self.get_entry(fd)?.clone();
         entry.set_fd_flags(if close_on_exec { FD_CLOEXEC } else { 0 });
-        Some(self.install_entry_min(entry, min_fd))
+        self.install_entry_min(entry, min_fd)
     }
 
     pub fn duplicate_exact(&mut self, fd: u64, new_fd: u64, close_on_exec: bool) -> Option<u64> {
@@ -288,7 +312,7 @@ impl HandleTable {
         let mut entry = self.get_entry(fd)?.clone();
         entry.set_fd_flags(if close_on_exec { FD_CLOEXEC } else { 0 });
         let index = dynamic_index(new_fd)?;
-        self.ensure_entry_capacity(index);
+        self.ensure_entry_capacity(index)?;
         self.entries[index] = Some(entry);
         Some(new_fd)
     }
@@ -367,6 +391,7 @@ mod tests {
 
     use super::{
         FD_CLOEXEC, HandleEntry, HandleTable, KernelHandle, MAX_DYNAMIC_FD, VfsDirectoryHandle,
+        max_dynamic_entries,
     };
     use crate::memory::paging::UserRegion;
     use crate::user::linux as linux_abi;
@@ -390,9 +415,9 @@ mod tests {
             vec![],
         )));
 
-        assert_eq!(fd0, 3);
-        assert_eq!(fd1, 4);
-        assert_eq!(fd2, 5);
+        assert_eq!(fd0, Some(3));
+        assert_eq!(fd1, Some(4));
+        assert_eq!(fd2, Some(5));
     }
 
     #[test]
@@ -412,8 +437,8 @@ mod tests {
 
         table.close_cloexec();
 
-        assert!(table.get(keep_fd).is_some());
-        assert!(table.get(drop_fd).is_none());
+        assert!(table.get(keep_fd.expect("keep descriptor")).is_some());
+        assert!(table.get(drop_fd.expect("cloexec descriptor")).is_none());
     }
 
     #[test]
@@ -449,10 +474,16 @@ mod tests {
         ));
 
         assert_eq!(
-            table.duplicate_exact(source_fd, target_fd, true),
-            Some(target_fd)
+            table.duplicate_exact(
+                source_fd.expect("source descriptor"),
+                target_fd.expect("target descriptor"),
+                true,
+            ),
+            target_fd
         );
-        let replaced = table.get_entry(target_fd).expect("duplicated entry");
+        let replaced = table
+            .get_entry(target_fd.expect("target descriptor"))
+            .expect("duplicated entry");
         assert_eq!(replaced.fd_flags() & FD_CLOEXEC, FD_CLOEXEC);
         match replaced.handle() {
             KernelHandle::VfsDirectory(dir) => assert_eq!(dir.path(), "/source"),
@@ -471,7 +502,9 @@ mod tests {
             linux_abi::O_RDONLY,
         ));
 
-        let target_fd = table.duplicate_exact(source_fd, 10, false).expect("dup");
+        let target_fd = table
+            .duplicate_exact(source_fd.expect("source descriptor"), 10, false)
+            .expect("dup");
 
         assert_eq!(table.get_entry(target_fd).expect("target").rights(), rights);
     }
@@ -485,11 +518,19 @@ mod tests {
         )));
 
         assert_eq!(
-            table.duplicate_exact(source_fd, MAX_DYNAMIC_FD + 1, false),
+            table.duplicate_exact(
+                source_fd.expect("source descriptor"),
+                MAX_DYNAMIC_FD + 1,
+                false,
+            ),
             None
         );
         assert_eq!(
-            table.duplicate_min(source_fd, MAX_DYNAMIC_FD + 1, false),
+            table.duplicate_min(
+                source_fd.expect("source descriptor"),
+                MAX_DYNAMIC_FD + 1,
+                false,
+            ),
             None
         );
         assert_eq!(table.entries.len(), 1);
@@ -505,7 +546,11 @@ mod tests {
             linux_abi::O_RDONLY,
         ));
 
-        assert!(table.duplicate_for_transfer(source_fd).is_none());
+        assert!(
+            table
+                .duplicate_for_transfer(source_fd.expect("source descriptor"))
+                .is_none()
+        );
     }
 
     #[test]
@@ -517,7 +562,7 @@ mod tests {
             linux_abi::O_RDONLY | linux_abi::O_NONBLOCK,
         ));
         let transferred = source
-            .duplicate_for_transfer(source_fd)
+            .duplicate_for_transfer(source_fd.expect("source descriptor"))
             .expect("transferable source fd");
         assert!(transferred.ipc_descriptor(0).is_none());
         let descriptor = transferred
@@ -528,7 +573,9 @@ mod tests {
         assert!(descriptor.rights().allows_transfer());
 
         let mut target = HandleTable::new();
-        let target_fd = target.install_transferred(transferred);
+        let target_fd = target
+            .install_transferred(transferred)
+            .expect("target descriptor");
         let target_entry = target.get_entry(target_fd).expect("target fd");
         assert_eq!(target_entry.fd_flags() & FD_CLOEXEC, FD_CLOEXEC);
         assert_ne!(target_entry.status_flags() & linux_abi::O_NONBLOCK, 0);
@@ -544,7 +591,7 @@ mod tests {
         )));
 
         let transferred = table
-            .duplicate_for_transfer(dir_fd)
+            .duplicate_for_transfer(dir_fd.expect("directory descriptor"))
             .expect("directory fd should be transferable");
         assert!(transferred.entry().rights().allows_transfer());
     }
@@ -560,7 +607,7 @@ mod tests {
         ));
 
         let transferred = table
-            .duplicate_for_transfer(display_fd)
+            .duplicate_for_transfer(display_fd.expect("device descriptor"))
             .expect("device fd should be transferable after policy approval");
         assert!(transferred.entry().rights().allows_transfer());
     }
@@ -608,5 +655,36 @@ mod tests {
 
         let disjoint = table.surface_overlap_segments(0x5000_0000, 0x5000_1000);
         assert!(disjoint.is_empty());
+    }
+
+    #[test]
+    fn dynamic_install_never_exceeds_descriptor_ceiling() {
+        let mut table = HandleTable::new();
+        let occupied = HandleEntry::new(
+            KernelHandle::VfsDirectory(VfsDirectoryHandle::new("/occupied".into(), vec![])),
+            0,
+            linux_abi::O_RDONLY,
+        );
+        table.entries.resize(max_dynamic_entries(), Some(occupied));
+        table.entries[max_dynamic_entries() - 1] = None;
+
+        let last = table.install_entry_min(
+            HandleEntry::new(
+                KernelHandle::VfsDirectory(VfsDirectoryHandle::new("/last".into(), vec![])),
+                0,
+                linux_abi::O_RDONLY,
+            ),
+            MAX_DYNAMIC_FD,
+        );
+        assert_eq!(last, Some(MAX_DYNAMIC_FD));
+        assert_eq!(table.entries.len(), max_dynamic_entries());
+        assert!(!table.can_install_additional(1));
+
+        let rejected = table.install(KernelHandle::VfsDirectory(VfsDirectoryHandle::new(
+            "/overflow".into(),
+            vec![],
+        )));
+        assert_eq!(rejected, None);
+        assert_eq!(table.entries.len(), max_dynamic_entries());
     }
 }

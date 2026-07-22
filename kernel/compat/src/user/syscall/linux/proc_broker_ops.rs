@@ -115,8 +115,11 @@ pub(super) fn syscall_linux_rustos_proc_prepare_broker(args_ptr: u64) -> u64 {
         return linux_errno(LINUX_EPERM);
     };
     let mut prepares = PROC_PREPARES.lock();
-    if prepares.len() >= MAX_PROC_PREPARES {
-        return linux_errno(LINUX_EAGAIN);
+    if let Err(errno) = proc_prepare_publication_status(
+        multitask::is_user_process_exiting(owner_pid),
+        prepares.len(),
+    ) {
+        return linux_errno(errno);
     }
     let Some(handle) = allocate_prepare_handle(&prepares) else {
         return linux_errno(LINUX_EAGAIN);
@@ -1284,6 +1287,20 @@ fn allocate_prepare_handle(prepares: &BTreeMap<u64, ProcPrepareState>) -> Option
     None
 }
 
+fn proc_prepare_publication_status(owner_exiting: bool, pending: usize) -> Result<(), i64> {
+    // procd authorization runs before the registry lock. Process teardown sets
+    // the exit marker before taking this same lock for cleanup, so publication
+    // must revalidate the marker here or it can recreate a prepare after the
+    // final cleanup pass and permanently consume one of the bounded slots.
+    if owner_exiting {
+        return Err(LINUX_ESRCH);
+    }
+    if pending >= MAX_PROC_PREPARES {
+        return Err(LINUX_EAGAIN);
+    }
+    Ok(())
+}
+
 fn allocate_exec_ticket(tickets: &BTreeMap<u64, ExecTicketState>) -> Option<u64> {
     for _ in 0..MAX_EXEC_TICKETS {
         let ticket = NEXT_EXEC_TICKET.fetch_add(1, Ordering::Relaxed).max(1);
@@ -1320,16 +1337,18 @@ fn procd_process_prepare_policy(format: u16) -> Result<(), i64> {
         return Err(LINUX_EINVAL);
     }
     let response = read_unaligned::<CommercialMaxProtocolResponse>(response.as_slice());
-    if response.header.version != COMMERCIAL_MAX_PROTOCOL_ABI_VERSION
-        || response.header.protocol != COMMERCIAL_MAX_PROTOCOL_PROCD
-        || response.header.op != COMMERCIAL_MAX_PROCD_OP_PROCESS_PREPARE
+    ipc_ops::validate_commercial_response_envelope(&request, &response)?;
+    if response.payload_len != 0
+        || response.descriptor_count != 1
+        || response.value0 != u64::from(format)
+        || response.value1 != PROC_BROKER_ABI_VERSION as u64
     {
         return Err(LINUX_EINVAL);
     }
     if response.status == 0 {
         Ok(())
     } else {
-        Err(i64::from(response.status))
+        Err(response.status.unsigned_abs() as i64)
     }
 }
 // RING3-MIGRATION-REFERENCE END: procd-owned process-prepare admission substrate exception.
@@ -1466,5 +1485,18 @@ mod tests {
         assert_eq!(validate_complete_file_copy(4096, 4096), Ok(()));
         assert_eq!(validate_complete_file_copy(4096, 4095), Err(LINUX_EIO));
         assert_eq!(validate_complete_file_copy(1, 0), Err(LINUX_EIO));
+    }
+
+    #[test]
+    fn exited_prepare_owner_cannot_republish_after_cleanup() {
+        assert_eq!(proc_prepare_publication_status(true, 0), Err(LINUX_ESRCH));
+        assert_eq!(
+            proc_prepare_publication_status(false, MAX_PROC_PREPARES),
+            Err(LINUX_EAGAIN)
+        );
+        assert_eq!(
+            proc_prepare_publication_status(false, MAX_PROC_PREPARES - 1),
+            Ok(())
+        );
     }
 }

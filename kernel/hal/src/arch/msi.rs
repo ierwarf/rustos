@@ -100,7 +100,7 @@ pub fn allocate_vector() -> Option<u8> {
 /// Register a leaf IRQ callback for an allocated vector. A vector cannot be
 /// rebound, preventing a later driver from stealing an event source.
 pub fn register_handler(vector: u8, handler: MsiHandler) -> bool {
-    let Some(index) = vector_index(vector) else {
+    let Some(index) = vector_index(vector).filter(|_| vector_was_allocated(vector)) else {
         return false;
     };
     HANDLERS[index]
@@ -111,7 +111,11 @@ pub fn register_handler(vector: u8, handler: MsiHandler) -> bool {
 /// Return the exact xAPIC MSI address/data tuple for a registered vector.
 /// The caller writes it into a device MSI-X table while that table is masked.
 pub fn message_for(vector: u8) -> Option<MsiMessage> {
-    if !LOCAL_APIC_READY.load(Ordering::Acquire) || !vector_is_valid(vector) {
+    let index = vector_index(vector)?;
+    if !LOCAL_APIC_READY.load(Ordering::Acquire)
+        || !vector_was_allocated(vector)
+        || HANDLERS[index].load(Ordering::Acquire) == 0
+    {
         return None;
     }
     let leaf1 = __cpuid(1);
@@ -140,6 +144,14 @@ fn vector_index(vector: u8) -> Option<usize> {
     vector_is_valid(vector).then_some((vector - MSI_VECTOR_FIRST) as usize)
 }
 
+fn vector_was_allocated(vector: u8) -> bool {
+    vector_is_allocated_at_cursor(vector, NEXT_VECTOR.load(Ordering::Acquire))
+}
+
+const fn vector_is_allocated_at_cursor(vector: u8, next_vector: u8) -> bool {
+    vector_is_valid(vector) && vector < next_vector
+}
+
 fn end_of_interrupt() {
     let base = LOCAL_APIC_BASE.load(Ordering::Acquire);
     if base == 0 {
@@ -152,7 +164,9 @@ fn end_of_interrupt() {
 
 #[cfg(test)]
 mod tests {
-    use super::{MSI_VECTOR_FIRST, MSI_VECTOR_LAST, vector_is_valid};
+    use super::{
+        MSI_VECTOR_FIRST, MSI_VECTOR_LAST, vector_is_allocated_at_cursor, vector_is_valid,
+    };
 
     #[test]
     fn msi_vector_pool_excludes_exceptions_pic_and_spurious_vectors() {
@@ -160,5 +174,22 @@ mod tests {
         assert!(vector_is_valid(MSI_VECTOR_FIRST));
         assert!(vector_is_valid(MSI_VECTOR_LAST));
         assert!(!vector_is_valid(0xe0));
+    }
+
+    #[test]
+    fn unallocated_vector_has_no_registration_authority() {
+        assert!(!vector_is_allocated_at_cursor(
+            MSI_VECTOR_FIRST,
+            MSI_VECTOR_FIRST
+        ));
+        assert!(vector_is_allocated_at_cursor(
+            MSI_VECTOR_FIRST,
+            MSI_VECTOR_FIRST + 1
+        ));
+        assert!(!vector_is_allocated_at_cursor(0x20, MSI_VECTOR_FIRST + 1));
+        assert!(!vector_is_allocated_at_cursor(
+            MSI_VECTOR_FIRST + 1,
+            MSI_VECTOR_FIRST + 1
+        ));
     }
 }

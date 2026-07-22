@@ -36,35 +36,53 @@ pub fn syscall_linux_vfs_openat(dirfd: u64, path_ptr: u64, flags: u64, mode: u64
     if let Err(errno) = ensure_vfs_status(&response) {
         return linux_errno(errno);
     }
+    let remote_id = response.remote_id;
+    if remote_id == 0 {
+        return linux_errno(LINUX_EINVAL);
+    }
     let kind = match response.handle_kind {
         VFS_IPC_HANDLE_KIND_FILE => multitask::RemoteVfsHandleKind::File,
         VFS_IPC_HANDLE_KIND_DIR => multitask::RemoteVfsHandleKind::Directory,
         VFS_IPC_HANDLE_KIND_DEVICE => multitask::RemoteVfsHandleKind::Device,
-        _ => return linux_errno(LINUX_EINVAL),
+        _ => {
+            let _ = call_vfs_remote_close(remote_id);
+            return linux_errno(LINUX_EINVAL);
+        }
     };
     let handle_path = if response.payload_len > 0 {
         let len = response.payload_len as usize;
         match core::str::from_utf8(&response.payload[..len]) {
             Ok(path) => alloc::string::String::from(path),
-            Err(_) => return linux_errno(LINUX_EINVAL),
+            Err(_) => {
+                let _ = call_vfs_remote_close(remote_id);
+                return linux_errno(LINUX_EINVAL);
+            }
         }
     } else {
         alloc::string::String::from(path.as_str())
     };
     let handle = multitask::KernelHandle::RemoteVfs(multitask::RemoteVfsHandle::new(
-        response.remote_id,
+        remote_id,
         kind,
         handle_path,
         response.value,
         response.aux as u16,
     ));
-    match multitask::with_current_user_process_state_mut(|_, _, process_state| {
+    let installed = multitask::with_current_user_process_state_mut(|_, _, process_state| {
         process_state
             .handles_mut()
             .install_with_open_flags(handle, flags)
-    }) {
-        Some(fd) => fd,
-        None => linux_errno(LINUX_EINVAL),
+    });
+    match installed {
+        Some(Some(fd)) => fd,
+        Some(None) => {
+            let _ = call_vfs_remote_close(remote_id);
+            linux_errno(LINUX_EMFILE)
+        }
+        None => {
+            let _ = call_vfs_remote_close(remote_id);
+            linux_errno(LINUX_EINVAL)
+        }
     }
 }
 
@@ -155,7 +173,7 @@ pub fn syscall_linux_vfs_dup(oldfd: u64, newfd: u64, flags: u64, mode: VfsDupMod
         if let Some(remote) = remote.as_ref() {
             let _ = call_vfs_remote_close(remote.remote_id());
         }
-        return linux_errno(LINUX_EBADF);
+        return linux_errno(duplicate_install_errno(mode));
     };
 
     if let Some(token) = replaced_socket {
@@ -218,7 +236,7 @@ pub fn syscall_linux_vfs_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
                     if let Some(remote) = remote.as_ref() {
                         let _ = call_vfs_remote_close(remote.remote_id());
                     }
-                    linux_errno(LINUX_EBADF)
+                    linux_errno(LINUX_EMFILE)
                 }
             }
         }
@@ -309,6 +327,25 @@ pub fn syscall_linux_vfs_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
                 Err(errno) => linux_errno(errno),
             }
         }
+    }
+}
+
+fn duplicate_install_errno(mode: VfsDupMode) -> i64 {
+    match mode {
+        VfsDupMode::Dup => LINUX_EMFILE,
+        VfsDupMode::Dup2 | VfsDupMode::Dup3 => LINUX_EBADF,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn descriptor_exhaustion_is_not_reported_as_a_bad_source_fd() {
+        assert_eq!(duplicate_install_errno(VfsDupMode::Dup), LINUX_EMFILE);
+        assert_eq!(duplicate_install_errno(VfsDupMode::Dup2), LINUX_EBADF);
+        assert_eq!(duplicate_install_errno(VfsDupMode::Dup3), LINUX_EBADF);
     }
 }
 

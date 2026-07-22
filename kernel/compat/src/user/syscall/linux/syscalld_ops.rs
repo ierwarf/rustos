@@ -310,7 +310,8 @@ pub(super) fn syscall_linux_memfd_create(name_ptr: u64, flags: u64) -> u64 {
                 linux_abi::O_RDWR,
             ))
     }) {
-        Some(fd) => fd,
+        Some(Some(fd)) => fd,
+        Some(None) => linux_errno(LINUX_EMFILE),
         None => linux_errno(LINUX_ENOSYS),
     }
 }
@@ -364,13 +365,22 @@ pub(super) fn call_syscalld(
         return Err(LINUX_EINVAL);
     }
     let response = read_unaligned::<LinuxSyscallOffloadResponse>(response.as_slice());
+    validate_syscalld_response_envelope(request.op, &response)?;
+    Ok(response)
+}
+
+fn validate_syscalld_response_envelope(
+    request_op: u16,
+    response: &LinuxSyscallOffloadResponse,
+) -> Result<(), i64> {
     if response.version != SYSCALL_OFFLOAD_ABI_VERSION
-        || response.op != request.op
+        || response.op != request_op
         || response.reserved0 != 0
+        || response.payload_len as usize > response.payload.len()
     {
         return Err(LINUX_EINVAL);
     }
-    Ok(response)
+    Ok(())
 }
 
 pub(super) fn ensure_empty_syscalld_response(
@@ -408,4 +418,27 @@ pub(super) fn as_bytes<T>(value: &T) -> &[u8] {
 pub(super) fn read_unaligned<T: Copy>(bytes: &[u8]) -> T {
     assert!(bytes.len() >= size_of::<T>());
     unsafe { bytes.as_ptr().cast::<T>().read_unaligned() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn syscalld_response_envelope_rejects_oversized_payload_before_slice_use() {
+        let mut response = LinuxSyscallOffloadResponse {
+            op: SYSCALL_OFFLOAD_OP_LINUX_GETRANDOM,
+            ..LinuxSyscallOffloadResponse::default()
+        };
+        assert_eq!(
+            validate_syscalld_response_envelope(SYSCALL_OFFLOAD_OP_LINUX_GETRANDOM, &response,),
+            Ok(())
+        );
+
+        response.payload_len = response.payload.len() as u32 + 1;
+        assert_eq!(
+            validate_syscalld_response_envelope(SYSCALL_OFFLOAD_OP_LINUX_GETRANDOM, &response,),
+            Err(LINUX_EINVAL)
+        );
+    }
 }

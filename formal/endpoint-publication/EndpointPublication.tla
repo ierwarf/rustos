@@ -8,9 +8,10 @@ observable wait contract.
 Concrete owner: kernel/compat/src/user/syscall/linux/ipc_ops.rs
 Lifecycle marker owner: kernel/ps/src/multitask/process_table.rs
 
-Endpoint publication is lock-free for readers, but its three backing fields
-(capability, owner, endpoint) are not a single hardware word.  A mutation
-critical section serializes registration, revoke, and cleanup.  Process exit
+Endpoint publication uses three backing fields (capability, owner, endpoint)
+that are not a single hardware word. One registry critical section serializes
+registration, revoke, cleanup, and each reader snapshot so a reader cannot mix
+an old endpoint with a newly published owner/capability generation. Process exit
 sets an exit marker before attempting cleanup; a registrar that observes that
 marker while holding the mutation lock aborts rather than publishing.  Readers
 derive authority only from a running owner, so the marker fails lookup and
@@ -195,6 +196,11 @@ PublicationIsCapabilityComplete ==
         /\ capabilityOwner = endpointOwner
         /\ endpointOwner \in issuedPids
 
+ObservableRegistryTupleIsAllOrNone ==
+    endpointValue = NoEndpoint =>
+        /\ endpointOwner = NoPid
+        /\ capabilityOwner = NoPid
+
 ObservableAuthorityHasLiveExactOwner ==
     EffectiveEndpoint # NoEndpoint =>
         /\ processState[endpointOwner] = Running
@@ -236,5 +242,15 @@ AllPublishedIdentitiesWereIssued ==
     /\ capabilityOwner # NoPid => capabilityOwner \in issuedPids
     /\ preparingPid # NoPid => preparingPid \in issuedPids
     /\ cleanupPid # NoPid => cleanupPid \in issuedPids
+
+(***************************************************************************
+TLAPS pilot: this is an unbounded mathematical consequence of the same
+EffectiveEndpoint definition checked by TLC. It is intentionally narrow; the
+inductiveness of the full state invariant remains a later proof obligation.
+***************************************************************************)
+THEOREM EffectiveEndpointRequiresRunningOwner ==
+    TypeOK /\ EffectiveEndpoint # NoEndpoint
+        => processState[endpointOwner] = Running
+<1>1. QED BY DEF EffectiveEndpoint
 
 =============================================================================

@@ -2,6 +2,24 @@
 
 Package/stage schemas, runtime control, kernel API, build, fault injection, logging, docs. For service/IPC/broker ABI: `contracts-abi.md`.
 
+## Repository Execution Infrastructure
+
+- `tools/check-dev-environment.sh` is the read-only prerequisite diagnosis
+  entrypoint. Its optional modes correspond to AI, documentation, formal,
+  physical-GPU, and release work; it never installs tools or mutates the host.
+- Project MCP launchers in `.codex/config.toml` use exact package versions.
+  Version changes are reviewed inputs, not an implicit update at agent startup.
+  Serena and ripgrep are scoped discovery accelerators; their absence falls
+  back to local `rg` and is never OS acceptance evidence.
+- `session-handoff.md` owns volatile continuation state. It is kept out of the
+  stable prompt prefix and must not duplicate durable contracts or gate output.
+- GitHub Actions use a fixed Ubuntu image, commit-pinned actions, bounded job
+  timeouts, and pull-request concurrency cancellation. The check job validates
+  shell syntax and the hook contract before compiling RustOS.
+- The Rust post-edit hook may reuse success only for an identical hash of all
+  staged, unstaged, and untracked content in the same canonical worktree.
+  Elapsed time alone is never evidence that a later edit passed.
+
 ## Package Manifest
 
 - File: `RUSTOS.package.toml`. Parser: `tools/xtask/src/package_manifest.rs`.
@@ -63,6 +81,36 @@ or launch policy.
 - `fd_transfer_stress=true` passes `--fd-transfer-stress` to `abifuzz`; keep it
   separate from default ABI smoke because SCM_RIGHTS stress can perturb UI
   launch diagnostics.
+
+### Formal verification infrastructure
+
+- `formal/models.tsv` is the only TLA model inventory. Run
+  `bash formal/selftest.sh`; never hand-maintain a second model list. The
+  selftest requires both primary `.tla` sources and `.cfg` files to match the
+  registry exactly; only the separately registered Apalache pilot directory is
+  excluded from that primary-source comparison. Every registered model must
+  also have a direct entry in `formal/README.md`, `formal/COVERAGE.md`, and
+  `formal/CONFORMANCE.md` so execution, failed-gate ownership, and source
+  correspondence cannot drift independently.
+- PR evidence is `bash formal/verify-all.sh --profile pr`: exhaustive finite
+  TLC, non-vacuous Kani, Verus, and concrete runtime trace replay.
+- Nightly evidence is `bash formal/verify-all.sh --profile nightly`: the PR
+  tier plus selected fixed-seed simulation, Miri, Loom, Apalache, TLAPS, and
+  bounded Rust/C libFuzzer lanes. Simulation and fuzzing are bug finding, not
+  exhaustive proof.
+- Every `intentional-terminal` model must retain its reason in the registry.
+  Every `temporal` model must configure `SPECIFICATION Spec`; direct
+  `INIT`/`NEXT` configuration bypasses the fairness formula and is rejected by
+  `formal/selftest.sh`.
+  TLC's `-deadlock` option disables deadlock checking; never describe it as
+  enabling the check. TLC 1.7.4 action coverage is `new-states:evaluations`, so
+  `0:N` is exercised convergence and only an evaluation count of zero fails.
+- Stable summaries, SARIF, normalized counterexamples, runtime traces, and
+  solver output belong under `build/formal/`. Solver caches and `_apalache-out`
+  directories are ignored and must not be committed.
+- A pilot flag in `models.tsv` must resolve to an executable proof/trace file.
+  `formal/COVERAGE.md` owns the explicit gap between these pilots and a
+  certification-grade assurance case.
 
 ## Runtime Control
 

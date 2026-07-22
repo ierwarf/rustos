@@ -25,4 +25,13 @@ if [[ "$installed" != "$version" ]]; then
 fi
 
 cd "$repo_root"
-"$binary" formal/verus-proof-kernel/runtime_response.rs
+artifact_dir="${VERUS_ARTIFACT_DIR:-$repo_root/build/formal/verus}"
+mkdir -p "$artifact_dir"
+if ! "$binary" formal/verus-proof-kernel/runtime_response.rs >"$artifact_dir/verus.log" 2>&1; then
+    tail -n 80 "$artifact_dir/verus.log" >&2
+    exit 1
+fi
+jq -n --arg version "$version" \
+    '{schema:"rustos-verus-evidence-v1",status:"passed",tool:{name:"Verus",version:$version},proof_file:"formal/verus-proof-kernel/runtime_response.rs"}' \
+    >"$artifact_dir/summary.json"
+printf 'Verus proof kernel passed version=%s\n' "$version"

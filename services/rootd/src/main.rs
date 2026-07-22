@@ -56,6 +56,8 @@ const _: () = assert!(CORE_SERVICE_WEIGHT_MICROS & TASK_WEIGHT_INTERACTIVE_FLAG 
 const _: () = assert!(INITD_WEIGHT_MICROS & TASK_WEIGHT_INTERACTIVE_FLAG == 0);
 const BOOTSTRAP_SPAWN_MAX_ATTEMPTS: u32 = 64;
 const INITD_SPAWN_MAX_ATTEMPTS: u32 = 64;
+const CORE_READINESS_POLL_INTERVAL_MS: u32 = 250;
+const CORE_READINESS_POLL_MAX: u32 = 20;
 
 const SYSCALLD_EXEC: &[u8] = b"services/syscalld/syscalld.elf\0";
 const VFSD_EXEC: &[u8] = b"services/vfsd/vfsd.elf\0";
@@ -248,6 +250,7 @@ struct Lease {
     state: u16,
     exit_status: i32,
     weight_micros: u64,
+    readiness_polls_remaining: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -302,7 +305,10 @@ pub extern "C" fn _start() -> ! {
         drain_lifecycle_events(&mut leases, &mut post_init_leases);
         serve_rootd_once(endpoint, &leases, &mut post_init_leases, false);
         restart_failed_leases(&mut leases);
-        yield_now();
+        supervise_core_readiness(&mut leases);
+        if !service_dependencies_ready(INITD_LEASE_INDEX) {
+            wait_for_restart_backoff(CORE_READINESS_POLL_INTERVAL_MS);
+        }
     }
 
     debug_line(b"rootd: core services ready, spawning initd via loaderd\n");
@@ -328,6 +334,7 @@ fn lease(spec: BootstrapServiceSpec) -> Lease {
         state: rustos_user_abi::syscall::ROOTD_LEASE_STATE_EMPTY,
         exit_status: 0,
         weight_micros: spec.weight_micros,
+        readiness_polls_remaining: CORE_READINESS_POLL_MAX,
     }
 }
 
@@ -378,6 +385,7 @@ fn spawn_tracked_with_attempts(lease: &mut Lease, max_attempts: u32) -> Result<(
                 lease.pid = pid;
                 lease.state = ROOTD_LEASE_STATE_RUNNING;
                 lease.exit_status = 0;
+                lease.readiness_polls_remaining = CORE_READINESS_POLL_MAX;
                 return Ok(());
             }
             Err(errno) => {
@@ -429,6 +437,13 @@ fn spawn_initd_via_loaderd(
                     debug_line(b"rootd: initd activated\n");
                     return;
                 }
+                cleanup_failed_initial_activation(
+                    &mut leases[INITD_LEASE_INDEX],
+                    terminate_service_process,
+                )
+                .unwrap_or_else(|_| {
+                    fail_closed(b"rootd: fatal initial-activation child cleanup rejected\n")
+                });
                 fail_closed(b"rootd: fatal initd activation failed\n");
             }
             Err(_) => {
@@ -451,6 +466,36 @@ fn service_ready(service_id: u64) -> bool {
         return false;
     }
     syscall1(SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, service_id) > 0
+}
+
+fn readiness_timeout_due(lease: &mut Lease, ready: bool) -> bool {
+    if ready {
+        lease.readiness_polls_remaining = CORE_READINESS_POLL_MAX;
+        return false;
+    }
+    if lease.state != ROOTD_LEASE_STATE_RUNNING || lease.pid == 0 {
+        return false;
+    }
+    if lease.readiness_polls_remaining == 0 {
+        return true;
+    }
+    lease.readiness_polls_remaining -= 1;
+    false
+}
+
+fn supervise_core_readiness(leases: &mut [Lease]) {
+    for lease in leases.iter_mut().take(INITD_LEASE_INDEX) {
+        let ready = service_ready(lease.service_id);
+        if !readiness_timeout_due(lease, ready) {
+            continue;
+        }
+        if terminate_service_process(lease.pid).is_err() {
+            fail_closed(b"rootd: fatal unready core-service cleanup rejected\n");
+        }
+        lease.state = ROOTD_LEASE_STATE_EXITED;
+        lease.exit_status = -110;
+        debug_line(b"rootd: core service readiness timed out\n");
+    }
 }
 
 fn service_dependencies_ready(index: usize) -> bool {
@@ -479,7 +524,7 @@ fn drain_lifecycle_events(leases: &mut [Lease], post_init_leases: &mut [PostInit
         (&args as *const LifecycleDrainBrokerArgs) as u64,
     ) < 0
     {
-        return;
+        fail_closed(b"rootd: fatal lifecycle evidence drain rejected\n");
     }
     for event in events.iter().take(count as usize) {
         if event.event != LIFECYCLE_EVENT_EXIT {
@@ -510,15 +555,65 @@ fn revoke_post_init_dependents(post_init_leases: &mut [PostInitLease], reporter_
     if reporter_pid == 0 {
         return;
     }
-    for lease in post_init_leases.iter_mut() {
-        if lease.reporter_pid != reporter_pid || lease.state != ROOTD_LEASE_STATE_RUNNING {
-            continue;
+    revoke_post_init_dependents_with(
+        post_init_leases,
+        reporter_pid,
+        revoke_service_endpoint,
+        terminate_service_process,
+    )
+    .unwrap_or_else(|_| {
+        fail_closed(b"rootd: fatal dependent post-init lease termination rejected\n")
+    });
+}
+
+fn revoke_post_init_dependents_with(
+    post_init_leases: &mut [PostInitLease],
+    reporter_pid: u64,
+    mut revoke_endpoint: impl FnMut(u64) -> Result<(), i32>,
+    mut terminate: impl FnMut(u64) -> Result<(), i32>,
+) -> Result<(), i32> {
+    // The graph is fixed and acyclic by admission policy: initd reports the
+    // post-init services, and sessiond alone may report uiserver. Revoke the
+    // complete descendant closure in this rootd turn so a child cannot retain
+    // capability authority until its parent's later lifecycle notification.
+    let mut reporters = [0_u64; POST_INIT_MANIFEST.len() + 1];
+    reporters[0] = reporter_pid;
+    let mut reporter_count = 1_usize;
+    let mut cursor = 0_usize;
+    while cursor < reporter_count {
+        let current_reporter = reporters[cursor];
+        cursor += 1;
+        for lease in post_init_leases.iter_mut() {
+            if lease.reporter_pid != current_reporter || lease.state != ROOTD_LEASE_STATE_RUNNING {
+                continue;
+            }
+            let child_pid = lease.pid;
+            // Endpoint revocation is the authority linearization point. A
+            // terminate request may return before the scheduler completes
+            // process teardown, so waiting for exit cleanup would leave a
+            // stale cached capability window.
+            revoke_endpoint(lease.service_id)?;
+            terminate(child_pid)?;
+            lease.state = ROOTD_LEASE_STATE_EXITED;
+            lease.exit_status = 9;
+            if child_pid != 0 && !reporters[..reporter_count].contains(&child_pid) {
+                if reporter_count == reporters.len() {
+                    return Err(75);
+                }
+                reporters[reporter_count] = child_pid;
+                reporter_count += 1;
+            }
         }
-        if terminate_post_init_process(lease.pid).is_err() {
-            fail_closed(b"rootd: fatal dependent post-init lease termination rejected\n");
-        }
-        lease.state = ROOTD_LEASE_STATE_EXITED;
-        lease.exit_status = 9;
+    }
+    Ok(())
+}
+
+fn revoke_service_endpoint(service_id: u64) -> Result<(), i32> {
+    let status = syscall2(SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, service_id, 0);
+    if status < 0 {
+        Err((-status) as i32)
+    } else {
+        Ok(())
     }
 }
 
@@ -654,11 +749,7 @@ fn validate_commercial_max_request(
     request: &CommercialMaxProtocolRequest,
     sender: IpcSenderIdentity,
 ) -> Result<(), i32> {
-    if request.header.version != COMMERCIAL_MAX_PROTOCOL_ABI_VERSION
-        || request.header.flags != 0
-        || request.path_len as usize > request.path.len()
-        || request.payload_len as usize > request.payload.len()
-    {
+    if !request.has_valid_envelope() {
         return Err(22);
     }
     match request.header.protocol {
@@ -1006,6 +1097,7 @@ fn service_capability_for_subject(
         return Err(22);
     }
     if let Some(capability) = post_init_reported_service_capability(
+        leases,
         post_init_leases,
         request.arg0,
         request.header.subject_pid,
@@ -1123,11 +1215,13 @@ fn reclaim_post_init_lease(
     // cross-domain UI endpoint behind when initd replaces the session lease.
     for lease in post_init_leases.iter() {
         if lease.reporter_pid == target.pid && lease.state == ROOTD_LEASE_STATE_RUNNING {
-            terminate_post_init_process(lease.pid)?;
+            revoke_service_endpoint(lease.service_id)?;
+            terminate_service_process(lease.pid)?;
         }
     }
     if target.state == ROOTD_LEASE_STATE_RUNNING {
-        terminate_post_init_process(target.pid)?;
+        revoke_service_endpoint(target.service_id)?;
+        terminate_service_process(target.pid)?;
     }
     for lease in post_init_leases.iter_mut() {
         if lease.pid == target.pid || lease.reporter_pid == target.pid {
@@ -1140,7 +1234,7 @@ fn reclaim_post_init_lease(
     Ok(())
 }
 
-fn terminate_post_init_process(pid: u64) -> Result<(), i32> {
+fn terminate_service_process(pid: u64) -> Result<(), i32> {
     if pid == 0 {
         return Err(22);
     }
@@ -1208,6 +1302,7 @@ fn authorize_post_init_lease_reporter(
 }
 
 fn post_init_reported_service_capability(
+    leases: &[Lease],
     post_init_leases: &[PostInitLease],
     service_id: u64,
     subject_pid: u64,
@@ -1218,9 +1313,38 @@ fn post_init_reported_service_capability(
             lease.service_id == service_id
                 && lease.pid == subject_pid
                 && lease.state == ROOTD_LEASE_STATE_RUNNING
+                && post_init_lease_reporter_is_live(leases, post_init_leases, lease.reporter_pid)
         })
         .map(|lease| service_policy_capability(lease.service_id))
         .filter(|capability| *capability != 0)
+}
+
+fn post_init_lease_reporter_is_live(
+    leases: &[Lease],
+    post_init_leases: &[PostInitLease],
+    reporter_pid: u64,
+) -> bool {
+    let mut current = reporter_pid;
+    for _ in 0..=post_init_leases.len() {
+        if current == 0 {
+            return false;
+        }
+        if leases
+            .iter()
+            .any(|lease| lease.pid == current && lease.state == ROOTD_LEASE_STATE_RUNNING)
+        {
+            return true;
+        }
+        let Some(reporter_lease) = post_init_leases
+            .iter()
+            .find(|lease| lease.pid == current && lease.state == ROOTD_LEASE_STATE_RUNNING)
+        else {
+            return false;
+        };
+        current = reporter_lease.reporter_pid;
+    }
+    // A cycle or chain longer than the fixed lease set has no trusted root.
+    false
 }
 
 fn authorize_service_lookup_for_subject(
@@ -1237,7 +1361,9 @@ fn authorize_service_lookup_for_subject(
     if leases.iter().any(|lease| {
         lease.pid == request.header.subject_pid && lease.state == ROOTD_LEASE_STATE_RUNNING
     }) || post_init_leases.iter().any(|lease| {
-        lease.pid == request.header.subject_pid && lease.state == ROOTD_LEASE_STATE_RUNNING
+        lease.pid == request.header.subject_pid
+            && lease.state == ROOTD_LEASE_STATE_RUNNING
+            && post_init_lease_reporter_is_live(leases, post_init_leases, lease.reporter_pid)
     }) {
         Ok(())
     } else {
@@ -1329,9 +1455,12 @@ fn restart_failed_leases(leases: &mut [Lease]) {
                 lease.restart_budget -= 1;
                 lease.state = ROOTD_LEASE_STATE_RUNNING;
                 lease.exit_status = 0;
+                lease.readiness_polls_remaining = CORE_READINESS_POLL_MAX;
                 if deferred_start && activate_exec_via_loaderd(pid).is_err() {
-                    lease.state = ROOTD_LEASE_STATE_RESTART_PENDING;
-                    lease.exit_status = -11;
+                    cleanup_failed_restart_activation(lease, terminate_service_process)
+                        .unwrap_or_else(|_| {
+                            fail_closed(b"rootd: fatal failed-activation child cleanup rejected\n")
+                        });
                     restart_backoff_ms = restart_backoff_ms.max(lease.backoff_ms);
                 }
             }
@@ -1351,6 +1480,38 @@ fn restart_failed_leases(leases: &mut [Lease]) {
     if restart_backoff_ms != 0 {
         wait_for_restart_backoff(restart_backoff_ms);
     }
+}
+
+fn cleanup_failed_restart_activation(
+    lease: &mut Lease,
+    terminate: impl FnOnce(u64) -> Result<(), i32>,
+) -> Result<(), i32> {
+    let pid = lease.pid;
+    if pid == 0 {
+        return Err(22);
+    }
+    // A failed ACTIVATE leaves the loader-created child suspended. Retrying
+    // without retiring that exact PID leaks a task/process slot on every
+    // attempt and eventually prevents all service recovery.
+    terminate(pid)?;
+    lease.pid = 0;
+    lease.state = ROOTD_LEASE_STATE_RESTART_PENDING;
+    lease.exit_status = -11;
+    Ok(())
+}
+
+fn cleanup_failed_initial_activation(
+    lease: &mut Lease,
+    terminate: impl FnOnce(u64) -> Result<(), i32>,
+) -> Result<(), i32> {
+    if lease.pid == 0 {
+        return Err(22);
+    }
+    terminate(lease.pid)?;
+    lease.pid = 0;
+    lease.state = ROOTD_LEASE_STATE_FAILED;
+    lease.exit_status = -11;
+    Ok(())
 }
 
 /// Apply the rootd-owned retry delay with a capability-gated timer substrate.
@@ -1786,5 +1947,122 @@ mod tests {
             ),
             Err(13)
         );
+    }
+
+    #[test]
+    fn reporter_exit_cascades_and_capability_requires_live_reporter_chain() {
+        let initd_pid = 41;
+        let mut leases = leases_with_live_initd(initd_pid);
+        let mut post_init = [
+            post_init_lease(POST_INIT_MANIFEST[4]),
+            post_init_lease(POST_INIT_MANIFEST[5]),
+        ];
+        post_init[0].pid = 73;
+        post_init[0].reporter_pid = initd_pid;
+        post_init[0].state = ROOTD_LEASE_STATE_RUNNING;
+        post_init[1].pid = 74;
+        post_init[1].reporter_pid = 73;
+        post_init[1].state = ROOTD_LEASE_STATE_RUNNING;
+
+        assert_eq!(
+            post_init_reported_service_capability(&leases, &post_init, IPC_SERVICE_UISERVER, 74,),
+            Some(rustos_user_abi::syscall::IPC_SERVICE_CAP_UI_POLICY)
+        );
+        leases[INITD_LEASE_INDEX].state = ROOTD_LEASE_STATE_EXITED;
+        assert_eq!(
+            post_init_reported_service_capability(&leases, &post_init, IPC_SERVICE_UISERVER, 74,),
+            None
+        );
+
+        let mut terminated = [0_u64; 2];
+        let mut terminated_count = 0_usize;
+        let mut revoked = [0_u64; 2];
+        let mut revoked_count = 0_usize;
+        assert_eq!(
+            revoke_post_init_dependents_with(
+                &mut post_init,
+                initd_pid,
+                |service_id| {
+                    revoked[revoked_count] = service_id;
+                    revoked_count += 1;
+                    Ok(())
+                },
+                |pid| {
+                    terminated[terminated_count] = pid;
+                    terminated_count += 1;
+                    Ok(())
+                },
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            &revoked[..revoked_count],
+            &[IPC_SERVICE_SESSIOND, IPC_SERVICE_UISERVER]
+        );
+        assert_eq!(&terminated[..terminated_count], &[73, 74]);
+        assert!(post_init
+            .iter()
+            .all(|lease| lease.state == ROOTD_LEASE_STATE_EXITED));
+    }
+
+    #[test]
+    fn failed_restart_activation_retires_exact_suspended_child() {
+        let mut failed = lease(BOOTSTRAP_MANIFEST[INITD_LEASE_INDEX]);
+        failed.pid = 77;
+        failed.state = ROOTD_LEASE_STATE_RUNNING;
+        failed.exit_status = 0;
+        let mut terminated = 0;
+
+        assert_eq!(
+            cleanup_failed_restart_activation(&mut failed, |pid| {
+                terminated = pid;
+                Ok(())
+            }),
+            Ok(())
+        );
+        assert_eq!(terminated, 77);
+        assert_eq!(failed.pid, 0);
+        assert_eq!(failed.state, ROOTD_LEASE_STATE_RESTART_PENDING);
+        assert_eq!(failed.exit_status, -11);
+
+        let mut uncertain = lease(BOOTSTRAP_MANIFEST[INITD_LEASE_INDEX]);
+        uncertain.pid = 88;
+        uncertain.state = ROOTD_LEASE_STATE_RUNNING;
+        assert_eq!(
+            cleanup_failed_restart_activation(&mut uncertain, |_| Err(5)),
+            Err(5)
+        );
+        assert_eq!(uncertain.pid, 88);
+        assert_eq!(uncertain.state, ROOTD_LEASE_STATE_RUNNING);
+
+        let mut initial = lease(BOOTSTRAP_MANIFEST[INITD_LEASE_INDEX]);
+        initial.pid = 91;
+        initial.state = ROOTD_LEASE_STATE_RUNNING;
+        assert_eq!(
+            cleanup_failed_initial_activation(&mut initial, |pid| {
+                assert_eq!(pid, 91);
+                Ok(())
+            }),
+            Ok(())
+        );
+        assert_eq!(initial.pid, 0);
+        assert_eq!(initial.state, ROOTD_LEASE_STATE_FAILED);
+        assert_eq!(initial.exit_status, -11);
+    }
+
+    #[test]
+    fn core_readiness_budget_is_bounded_and_resets_only_on_readiness() {
+        let mut core = lease(BOOTSTRAP_MANIFEST[0]);
+        core.pid = 101;
+        core.state = ROOTD_LEASE_STATE_RUNNING;
+
+        for _ in 0..CORE_READINESS_POLL_MAX {
+            assert!(!readiness_timeout_due(&mut core, false));
+        }
+        assert!(readiness_timeout_due(&mut core, false));
+
+        assert!(!readiness_timeout_due(&mut core, true));
+        assert_eq!(core.readiness_polls_remaining, CORE_READINESS_POLL_MAX);
+        assert!(!readiness_timeout_due(&mut core, false));
     }
 }

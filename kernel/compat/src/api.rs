@@ -27,9 +27,18 @@ pub mod syscall {
         set_linux_compat_stack_guard, with_kernel_gs_base,
     };
 
-    /// 프로세스 종료(정상/비정상) 시 해당 프로세스가 소유한 IPC 서비스 엔드포인트를 모두 해제한다.
-    pub fn cleanup_service_endpoints_for_process(process_id: u64) {
-        crate::user::syscall::linux::cleanup_service_endpoints_for_process(process_id);
+    /// Classify one x86 user exception and commit Linux process cleanup only
+    /// after the scheduler actually retires its final thread.
+    pub fn retire_current_linux_task_due_to_fault(
+        vector: u8,
+        error_code: Option<u64>,
+        cr2: u64,
+        rip: u64,
+        rsp: u64,
+    ) -> kernel_ps::api::UserFaultDisposition {
+        crate::user::syscall::retire_current_linux_task_due_to_fault(
+            vector, error_code, cr2, rip, rsp,
+        )
     }
 }
 

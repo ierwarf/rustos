@@ -451,10 +451,7 @@ fn validate_request(received: usize, request: &LinuxSyscallOffloadRequest) -> Re
 }
 
 fn validate_commercial_request(request: &CommercialMaxProtocolRequest) -> Result<(), i32> {
-    if request.header.version != COMMERCIAL_MAX_PROTOCOL_ABI_VERSION
-        || request.path_len as usize > request.path.len()
-        || request.payload_len as usize > request.payload.len()
-    {
+    if !request.has_valid_envelope() {
         return Err(errno::EINVAL);
     }
     match request.header.protocol {

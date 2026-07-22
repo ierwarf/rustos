@@ -15,3 +15,6 @@ rustos-user-abi = { path = "../../libs/rustos-user-abi", features = ["linux-comp
 lazy_static = { version = "1.4", features = ["spin_no_std"] }
 spin = "0.10.0"
 x86_64 = { version = "0.15.4", default-features = false, features = ["instructions", "abi_x86_interrupt"] }
+
+[dev-dependencies]
+kernel-ipc-runtime = { path = "../ipc-runtime", features = ["host-test"] }

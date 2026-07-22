@@ -1,32 +1,38 @@
 #!/usr/bin/env bash
 # Codex PreToolUse hook for Read/file-access tools.
-#
-# Reads a JSON event from stdin describing the pending tool call and
-# writes a JSON decision to stdout. Blocks reads of large logs, build
-# artifacts, and other token-bombs that should be filtered with rg/tail
-# instead.
-#
-# Wired in .codex/config.toml (project-scoped) under [[hooks.PreToolUse]]
-# with a matcher that targets the Read tool (and any file-reading variants).
+# Blocks whole-file token bombs while allowing an explicitly bounded text read.
 
 set -euo pipefail
 
 INPUT="$(cat)"
 
-# Extract the candidate path. Codex's exact event schema can vary across
-# versions, so probe the common shapes and fall back to allow.
+# Codex and MCP adapters use slightly different event shapes. Unknown shapes
+# fail open so a hook-schema drift does not disable the development session.
 path="$(printf '%s' "$INPUT" | jq -r '
-  .tool_input.file_path // .tool_input.path //
-  .tool_input.relative_path //
-  .arguments.file_path // .arguments.path //
-  .arguments.relative_path //
-  .params.file_path  // .params.path  //
-  .params.relative_path //
-  empty
+  .tool_input.file_path // .tool_input.path // .tool_input.relative_path //
+  .arguments.file_path // .arguments.path // .arguments.relative_path //
+  .params.file_path // .params.path // .params.relative_path // empty
 ' 2>/dev/null || true)"
 
-if [[ -z "$path" ]]; then
-  exit 0
+[[ -z "$path" ]] && exit 0
+
+range_start="$(printf '%s' "$INPUT" | jq -r '
+  .tool_input.start_line // .arguments.start_line // .params.start_line //
+  .tool_input.offset // .arguments.offset // .params.offset // empty
+' 2>/dev/null || true)"
+range_end="$(printf '%s' "$INPUT" | jq -r '
+  .tool_input.end_line // .arguments.end_line // .params.end_line // empty
+' 2>/dev/null || true)"
+range_limit="$(printf '%s' "$INPUT" | jq -r '
+  .tool_input.limit // .arguments.limit // .params.limit // empty
+' 2>/dev/null || true)"
+
+bounded=0
+if [[ "$range_start" =~ ^[0-9]+$ && "$range_end" =~ ^[0-9]+$ ]] \
+  && (( range_end >= range_start && range_end - range_start < 200 )); then
+  bounded=1
+elif [[ "$range_limit" =~ ^[0-9]+$ ]] && (( range_limit > 0 && range_limit <= 200 )); then
+  bounded=1
 fi
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -36,41 +42,9 @@ case "$path" in
   *) rel_path="$path" ;;
 esac
 
-# Hard-block extensions / directories regardless of size.
-case "$rel_path" in
-  logs/*.log|logs/*.txt|*/logs/*.log|*/logs/*.txt|*.pcap|*.bin|*.iso|*.img|perf.data|*/perf.data|target/*|*/target/*|build/*|*/build/*|vendor/*|*/vendor/*|Cargo.lock|*/Cargo.lock)
-    msg="Blocked: $rel_path is in the do-not-inspect set (logs/target/build/vendor/Cargo.lock/binary). \
-Use rg, tail -n, or sed -n line ranges instead. \
-See AGENTS.md > Do Not Inspect By Default."
-    jq -n --arg m "$msg" '{
-      hookSpecificOutput: {
-        hookEventName: "PreToolUse",
-        permissionDecision: "deny",
-        permissionDecisionReason: $m
-      },
-      decision: "block",
-      reason: $m
-    }'
-    exit 0
-    ;;
-esac
-
-case "$path" in
-  /*) fs_path="$path" ;;
-  *) fs_path="$REPO_ROOT/$path" ;;
-esac
-
-if [[ ! -e "$fs_path" ]]; then
-  exit 0
-fi
-
-# Size gate for everything else: 256KB soft limit.
-size=$(stat -c%s -- "$fs_path" 2>/dev/null || echo 0)
-if (( size > 262144 )); then
-  msg="Blocked: $rel_path is ${size} bytes (>256KB). \
-Use rg/tail/sed line ranges, or summarize via the log-summarizer subagent. \
-If you genuinely need a full read, ask the user first."
-  jq -n --arg m "$msg" '{
+deny() {
+  local reason="$1"
+  jq -n --arg m "$reason" '{
     hookSpecificOutput: {
       hookEventName: "PreToolUse",
       permissionDecision: "deny",
@@ -80,6 +54,38 @@ If you genuinely need a full read, ask the user first."
     reason: $m
   }'
   exit 0
+}
+
+# Binary artifact reads are never useful model context, even with a range.
+case "$rel_path" in
+  *.pcap|*.bin|*.iso|*.img|perf.data|*/perf.data)
+    deny "Blocked binary read: $rel_path. Inspect metadata or use the owning verification command."
+    ;;
+esac
+
+# Protected text trees are allowed only when the caller supplied a small range.
+case "$rel_path" in
+  logs/*|*/logs/*|target/*|*/target/*|build/*|*/build/*|vendor/*|*/vendor/*|Cargo.lock|*/Cargo.lock)
+    if (( bounded == 1 )); then
+      exit 0
+    fi
+    deny "Blocked whole-file read of $rel_path. Use rg or request at most 200 focused lines; see docs/ai/token-policy.md."
+    ;;
+esac
+
+case "$path" in
+  /*) fs_path="$path" ;;
+  *) fs_path="$REPO_ROOT/$path" ;;
+esac
+
+[[ -e "$fs_path" ]] || exit 0
+
+# Large ordinary files follow the same bounded-read escape hatch. No user
+# approval is needed for a focused read that already satisfies repository
+# token policy.
+size="$(stat -c%s -- "$fs_path" 2>/dev/null || echo 0)"
+if (( size > 262144 && bounded == 0 )); then
+  deny "Blocked whole-file read of $rel_path (${size} bytes). Search first or request at most 200 focused lines."
 fi
 
 exit 0

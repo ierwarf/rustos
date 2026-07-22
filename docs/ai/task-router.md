@@ -14,6 +14,7 @@ set settles. The printed plan is not validation evidence.
 
 | User task | Read first | Then read only if needed |
 | --- | --- | --- |
+| Resume prior work / prepare session handoff | `session-handoff.md` | live goal state, `git status --short`, then the one focused owner document named by the current request |
 | Build/check issue | `commands.md` | exact failing command output, then `tools/xtask/src/build/` range found by search |
 | Development-speed/tooling change | `commands.md`, `token-policy.md` | for DVM builds, read the `DVM build-speed contract` before the exact wrapper range; otherwise read the exact `tools/xtask/src/dev.rs` or validation-runner range found by search |
 | Run/KVM/debug issue | `commands.md`, `repo-map.md` | exact `tools/xtask/src/kvm.rs` range found by search; inspect `build/kvm/` only through focused reads |

@@ -57,11 +57,13 @@ VARIABLES ownerState,
           childSession,
           childDeferred,
           childConsole,
-          childInheritedConsole
+          childInheritedConsole,
+          prepareIntentOwner,
+          prepareIntentSession
 
 vars == <<ownerState, sessionState, sessionOwner, mappingCount, runtimeSet,
           childState, childSession, childDeferred, childConsole,
-          childInheritedConsole>>
+          childInheritedConsole, prepareIntentOwner, prepareIntentSession>>
 
 Uncommitted(state) == state \in {Prepared, Mapped, Ready}
 
@@ -76,16 +78,50 @@ Init ==
     /\ childDeferred = [pid \in Pids |-> FALSE]
     /\ childConsole = [pid \in Pids |-> NoConsole]
     /\ childInheritedConsole = [pid \in Pids |-> FALSE]
+    /\ prepareIntentOwner = NoOwner
+    /\ prepareIntentSession = NoOwner
 
-Prepare(owner, session) ==
+\* procd policy authorization happens outside PROC_PREPARES. Process exit may
+\* complete cleanup while that call is in flight, so publication is a separate
+\* transition and must revalidate the exit marker under the prepare-table lock.
+BeginPrepare(owner, session) ==
     /\ owner \in Owners
     /\ session \in Sessions
     /\ ownerState[owner] = Alive
     /\ sessionState[session] = Free
+    /\ prepareIntentOwner = NoOwner
+    /\ prepareIntentSession = NoOwner
+    /\ prepareIntentOwner' = owner
+    /\ prepareIntentSession' = session
+    /\ UNCHANGED <<ownerState, sessionState, sessionOwner, mappingCount,
+                  runtimeSet, childState, childSession, childDeferred,
+                  childConsole, childInheritedConsole>>
+
+PublishPrepare(owner, session) ==
+    /\ owner \in Owners
+    /\ session \in Sessions
+    /\ prepareIntentOwner = owner
+    /\ prepareIntentSession = session
+    /\ ownerState[owner] = Alive
+    /\ sessionState[session] = Free
     /\ sessionState' = [sessionState EXCEPT ![session] = Prepared]
     /\ sessionOwner' = [sessionOwner EXCEPT ![session] = owner]
+    /\ prepareIntentOwner' = NoOwner
+    /\ prepareIntentSession' = NoOwner
     /\ UNCHANGED <<ownerState, mappingCount, runtimeSet, childState, childSession,
                   childDeferred, childConsole, childInheritedConsole>>
+
+RejectPrepareAfterExit(owner, session) ==
+    /\ owner \in Owners
+    /\ session \in Sessions
+    /\ prepareIntentOwner = owner
+    /\ prepareIntentSession = session
+    /\ ownerState[owner] = Exited
+    /\ prepareIntentOwner' = NoOwner
+    /\ prepareIntentSession' = NoOwner
+    /\ UNCHANGED <<ownerState, sessionState, sessionOwner, mappingCount,
+                  runtimeSet, childState, childSession, childDeferred,
+                  childConsole, childInheritedConsole>>
 
 MapSegment(owner, session) ==
     /\ owner \in Owners
@@ -97,7 +133,8 @@ MapSegment(owner, session) ==
     /\ sessionState' = [sessionState EXCEPT ![session] = Mapped]
     /\ mappingCount' = [mappingCount EXCEPT ![session] = mappingCount[session] + 1]
     /\ UNCHANGED <<ownerState, sessionOwner, runtimeSet, childState, childSession,
-                  childDeferred, childConsole, childInheritedConsole>>
+                  childDeferred, childConsole, childInheritedConsole,
+                  prepareIntentOwner, prepareIntentSession>>
 
 SetRuntimeMetadata(owner, session) ==
     /\ owner \in Owners
@@ -110,7 +147,8 @@ SetRuntimeMetadata(owner, session) ==
     /\ sessionState' = [sessionState EXCEPT ![session] = Ready]
     /\ runtimeSet' = [runtimeSet EXCEPT ![session] = TRUE]
     /\ UNCHANGED <<ownerState, sessionOwner, mappingCount, childState,
-                  childSession, childDeferred, childConsole, childInheritedConsole>>
+                  childSession, childDeferred, childConsole, childInheritedConsole,
+                  prepareIntentOwner, prepareIntentSession>>
 
 Abort(owner, session) ==
     /\ owner \in Owners
@@ -122,7 +160,8 @@ Abort(owner, session) ==
     /\ mappingCount' = [mappingCount EXCEPT ![session] = 0]
     /\ runtimeSet' = [runtimeSet EXCEPT ![session] = FALSE]
     /\ UNCHANGED <<ownerState, sessionOwner, childState, childSession,
-                  childDeferred, childConsole, childInheritedConsole>>
+                  childDeferred, childConsole, childInheritedConsole,
+                  prepareIntentOwner, prepareIntentSession>>
 
 (*******************************************************************************
 Commit removes the prepare handle before the subsequent argument/image checks.
@@ -139,7 +178,8 @@ RejectCommit(owner, session) ==
     /\ mappingCount' = [mappingCount EXCEPT ![session] = 0]
     /\ runtimeSet' = [runtimeSet EXCEPT ![session] = FALSE]
     /\ UNCHANGED <<ownerState, sessionOwner, childState, childSession,
-                  childDeferred, childConsole, childInheritedConsole>>
+                  childDeferred, childConsole, childInheritedConsole,
+                  prepareIntentOwner, prepareIntentSession>>
 
 Commit(owner, session, pid, deferred, requestedConsole) ==
     /\ owner \in Owners
@@ -161,7 +201,8 @@ Commit(owner, session, pid, deferred, requestedConsole) ==
         IF requestedConsole = NoConsole THEN OwnerConsole(owner) ELSE requestedConsole]
     /\ childInheritedConsole' = [childInheritedConsole EXCEPT ![pid] =
         requestedConsole = NoConsole]
-    /\ UNCHANGED <<ownerState, sessionOwner>>
+    /\ UNCHANGED <<ownerState, sessionOwner, prepareIntentOwner,
+                  prepareIntentSession>>
 
 ActivateDeferredChild(pid) ==
     /\ pid \in Pids
@@ -170,7 +211,7 @@ ActivateDeferredChild(pid) ==
     /\ childState' = [childState EXCEPT ![pid] = Running]
     /\ UNCHANGED <<ownerState, sessionState, sessionOwner, mappingCount,
                   runtimeSet, childSession, childDeferred, childConsole,
-                  childInheritedConsole>>
+                  childInheritedConsole, prepareIntentOwner, prepareIntentSession>>
 
 ExitChild(pid) ==
     /\ pid \in Pids
@@ -178,7 +219,7 @@ ExitChild(pid) ==
     /\ childState' = [childState EXCEPT ![pid] = ChildExited]
     /\ UNCHANGED <<ownerState, sessionState, sessionOwner, mappingCount,
                   runtimeSet, childSession, childDeferred, childConsole,
-                  childInheritedConsole>>
+                  childInheritedConsole, prepareIntentOwner, prepareIntentSession>>
 
 (*******************************************************************************
 Rust process teardown removes all live ProcPrepareState entries for the exiting
@@ -202,10 +243,13 @@ ExitOwner(owner) ==
             IF sessionOwner[session] = owner /\ Uncommitted(sessionState[session])
             THEN FALSE ELSE runtimeSet[session]]
     /\ UNCHANGED <<sessionOwner, childState, childSession, childDeferred,
-                  childConsole, childInheritedConsole>>
+                  childConsole, childInheritedConsole, prepareIntentOwner,
+                  prepareIntentSession>>
 
 Next ==
-    \/ \E owner \in Owners, session \in Sessions : Prepare(owner, session)
+    \/ \E owner \in Owners, session \in Sessions : BeginPrepare(owner, session)
+    \/ \E owner \in Owners, session \in Sessions : PublishPrepare(owner, session)
+    \/ \E owner \in Owners, session \in Sessions : RejectPrepareAfterExit(owner, session)
     \/ \E owner \in Owners, session \in Sessions : MapSegment(owner, session)
     \/ \E owner \in Owners, session \in Sessions : SetRuntimeMetadata(owner, session)
     \/ \E owner \in Owners, session \in Sessions : Abort(owner, session)
@@ -238,6 +282,8 @@ TypeOK ==
     /\ childDeferred \in [Pids -> BOOLEAN]
     /\ childConsole \in [Pids -> ConsoleSessions \cup {NoConsole}]
     /\ childInheritedConsole \in [Pids -> BOOLEAN]
+    /\ prepareIntentOwner \in Owners \cup {NoOwner}
+    /\ prepareIntentSession \in Sessions \cup {NoOwner}
 
 EveryLiveSessionHasItsExactAliveOwner ==
     \A session \in Sessions :
@@ -285,5 +331,14 @@ ExitedOwnerRetainsNoLivePrepareAuthority ==
         ownerState[owner] = Exited =>
             \A session \in Sessions :
                 sessionOwner[session] = owner => ~Uncommitted(sessionState[session])
+
+PrepareIntentHasNoPublishedAuthority ==
+    prepareIntentOwner # NoOwner =>
+        /\ prepareIntentSession \in Sessions
+        /\ sessionState[prepareIntentSession] = Free
+        /\ sessionOwner[prepareIntentSession] = NoOwner
+
+NoPrepareSessionWithoutAnIntentOwner ==
+    prepareIntentOwner = NoOwner <=> prepareIntentSession = NoOwner
 
 =============================================================================

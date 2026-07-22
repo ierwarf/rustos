@@ -5,7 +5,9 @@ EXTENDS Naturals, FiniteSets
 Models the externally observable IPC service registry. Endpoint publication is
 the registration commit point: an effective capability and an exact-PID wait
 may succeed only after the service endpoint is visible. Revoke and process
-exit fail closed before stale bindings can authorize a broker.
+exit fail closed before stale bindings can authorize a broker. `waitPid` is a
+process identity, not its initial thread identity: retiring a leader thread
+while another process thread remains cannot produce `WaitExited`.
 ***************************************************************************)
 
 CONSTANTS Services, Pids, Waiters, WaitTimeout, MaxTime

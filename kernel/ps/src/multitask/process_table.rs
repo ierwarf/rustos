@@ -1,5 +1,4 @@
 use alloc::boxed::Box;
-use core::cell::UnsafeCell;
 use core::ptr::NonNull;
 
 use spin::Mutex;
@@ -32,7 +31,7 @@ impl ProcessHandle {
 pub struct ProcessRef {
     handle: ProcessHandle,
     process_id: u64,
-    state_ptr: NonNull<UserProcessState>,
+    state_ptr: NonNull<Mutex<UserProcessState>>,
 }
 
 impl ProcessRef {
@@ -40,25 +39,14 @@ impl ProcessRef {
         self.process_id
     }
 
-    pub fn state(&self) -> &UserProcessState {
-        unsafe { self.state_ptr.as_ref() }
-    }
-
-    pub fn state_mut(&mut self) -> &mut UserProcessState {
-        unsafe {
-            self.state_ptr
-                .as_ptr()
-                .as_mut()
-                .expect("process state pointer must be valid")
-        }
-    }
-
     pub fn with_state<R>(&self, f: impl FnOnce(u64, &UserProcessState) -> R) -> R {
-        f(self.process_id, self.state())
+        let state = unsafe { self.state_ptr.as_ref() }.lock();
+        f(self.process_id, &state)
     }
 
-    pub fn with_state_mut<R>(&mut self, f: impl FnOnce(u64, &mut UserProcessState) -> R) -> R {
-        f(self.process_id, self.state_mut())
+    pub fn with_state_mut<R>(&self, f: impl FnOnce(u64, &mut UserProcessState) -> R) -> R {
+        let mut state = unsafe { self.state_ptr.as_ref() }.lock();
+        f(self.process_id, &mut state)
     }
 }
 
@@ -78,11 +66,8 @@ struct ProcessObject {
     queued_for_reap: bool,
     exit_status: Option<i32>,
     waited: bool,
-    state: UnsafeCell<UserProcessState>,
+    state: Mutex<UserProcessState>,
 }
-
-unsafe impl Send for ProcessObject {}
-unsafe impl Sync for ProcessObject {}
 
 impl ProcessObject {
     fn new(process_id: u64, parent_process_id: Option<u64>, state: UserProcessState) -> Self {
@@ -96,12 +81,12 @@ impl ProcessObject {
             queued_for_reap: false,
             exit_status: None,
             waited: parent_process_id.is_none(),
-            state: UnsafeCell::new(state),
+            state: Mutex::new(state),
         }
     }
 
-    fn state_ptr(&self) -> NonNull<UserProcessState> {
-        NonNull::new(self.state.get()).expect("process state pointer must not be null")
+    fn state_ptr(&self) -> NonNull<Mutex<UserProcessState>> {
+        NonNull::from(&self.state)
     }
 }
 
@@ -202,11 +187,13 @@ pub fn create_process_with_parent(
 pub fn attach_task(handle: ProcessHandle) -> Option<()> {
     let mut table = PROCESS_TABLE.lock();
     let object = table.lookup_object_mut(handle)?;
+    if object.exiting {
+        return None;
+    }
     let ref_count = object.ref_count.checked_add(1)?;
     let thread_count = object.thread_count.checked_add(1)?;
     object.ref_count = ref_count;
     object.thread_count = thread_count;
-    object.exiting = false;
     Some(())
 }
 
@@ -315,25 +302,23 @@ pub fn with_process_state<R>(
     f: impl FnOnce(u64, &UserProcessState) -> R,
 ) -> Option<R> {
     let process = retain_process(handle)?;
-    let process_id = process.process_id();
-    Some(f(process_id, process.state()))
+    Some(process.with_state(f))
 }
 
 pub fn with_process_state_mut<R>(
     handle: ProcessHandle,
     f: impl FnOnce(u64, &mut UserProcessState) -> R,
 ) -> Option<R> {
-    let mut process = retain_process(handle)?;
-    let process_id = process.process_id();
-    Some(f(process_id, process.state_mut()))
+    let process = retain_process(handle)?;
+    Some(process.with_state_mut(f))
 }
 
 pub fn with_process_state_by_pid_mut<R>(
     process_id: u64,
     f: impl FnOnce(&mut UserProcessState) -> R,
 ) -> Option<R> {
-    let mut process = retain_process_by_pid(process_id)?;
-    Some(f(process.state_mut()))
+    let process = retain_process_by_pid(process_id)?;
+    Some(process.with_state_mut(|_, state| f(state)))
 }
 
 pub fn with_process_state_by_pid<R>(
@@ -341,7 +326,7 @@ pub fn with_process_state_by_pid<R>(
     f: impl FnOnce(&UserProcessState) -> R,
 ) -> Option<R> {
     let process = retain_process_by_pid(process_id)?;
-    Some(f(process.state()))
+    Some(process.with_state(|_, state| f(state)))
 }
 
 pub fn replace_for_exec(
@@ -352,21 +337,31 @@ pub fn replace_for_exec(
     linux_runtime_profile: crate::user::linux::LinuxRuntimeProfile,
     exec_path: &str,
 ) -> Option<()> {
-    let mut table = PROCESS_TABLE.lock();
-    let object = table.lookup_object_mut(handle)?;
-    unsafe {
-        (*object.state.get()).replace_for_exec(
+    let process = retain_process(handle)?;
+    process.with_state_mut(|_, state| {
+        // State replacement and the process-table exit marker are one
+        // transaction. If exit won the table lock, a stale exec preparation
+        // must not mutate the address space or clear the exit decision.
+        let mut table = PROCESS_TABLE.lock();
+        let object = table.lookup_object_mut(handle)?;
+        if !exec_may_replace(object) {
+            return None;
+        }
+        state.replace_for_exec(
             address_space,
             linux_process_state,
             linux_memory_map,
             linux_runtime_profile,
             exec_path,
         );
-    }
-    object.mm_generation = ProcessTable::next_generation(object.mm_generation);
-    object.exiting = false;
-    object.queued_for_reap = false;
-    Some(())
+        object.mm_generation = ProcessTable::next_generation(object.mm_generation);
+        object.queued_for_reap = false;
+        Some(())
+    })
+}
+
+fn exec_may_replace(object: &ProcessObject) -> bool {
+    !object.exiting
 }
 
 pub fn note_process_exit_status(process_id: u64, status: i32) -> Option<()> {
@@ -505,7 +500,10 @@ pub fn reap_exited_processes() -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{create_process, detach_task, reap_exited_processes, retain_process};
+    use super::{
+        ProcessObject, attach_task, create_process, detach_task, is_process_exiting,
+        mark_process_exiting, reap_exited_processes, retain_process, thread_count_by_pid,
+    };
     use crate::memory::paging::ProcessAddressSpace;
     use crate::user::process_state::UserProcessState;
 
@@ -528,6 +526,46 @@ mod tests {
         detach_task(handle).expect("detach");
         assert_eq!(reap_exited_processes(), 0);
         drop(retained);
+        assert_eq!(reap_exited_processes(), 1);
+    }
+
+    #[test]
+    fn process_address_space_and_exec_exit_are_serialized() {
+        let mut object = ProcessObject::new(7, None, new_state());
+        let held = object.state.lock();
+        assert!(object.state.try_lock().is_none());
+        drop(held);
+        assert!(object.state.try_lock().is_some());
+        assert!(super::exec_may_replace(&object));
+        object.exiting = true;
+        assert!(!super::exec_may_replace(&object));
+    }
+
+    #[test]
+    fn leader_thread_retirement_does_not_mark_live_process_exited() {
+        let handle = create_process(43, new_state()).expect("process handle");
+        attach_task(handle).expect("second thread");
+        assert_eq!(thread_count_by_pid(43), Some(2));
+
+        detach_task(handle).expect("leader detach");
+
+        assert_eq!(thread_count_by_pid(43), Some(1));
+        assert_eq!(is_process_exiting(43), Some(false));
+        detach_task(handle).expect("last thread detach");
+        assert_eq!(is_process_exiting(43), Some(true));
+        assert_eq!(reap_exited_processes(), 1);
+    }
+
+    #[test]
+    fn exiting_process_rejects_new_thread_attachment() {
+        let handle = create_process(44, new_state()).expect("process handle");
+        mark_process_exiting(44).expect("mark exiting");
+
+        assert_eq!(attach_task(handle), None);
+        assert_eq!(thread_count_by_pid(44), Some(1));
+        assert_eq!(is_process_exiting(44), Some(true));
+
+        detach_task(handle).expect("detach final thread");
         assert_eq!(reap_exited_processes(), 1);
     }
 }

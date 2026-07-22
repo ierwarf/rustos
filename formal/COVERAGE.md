@@ -17,6 +17,38 @@ passes TLC.
 5. Keep one source-level validation: a focused Rust test, cargo xtask check,
    or a bounded KVM smoke expectation.
 
+## Verification-infrastructure coverage
+
+The executable registry currently admits 68 TLC model/config pairs and records
+their class, per-tier timeout, explicit deadlock policy, nightly simulation,
+and cross-tool pilots. The PR tier runs registry selftest, twenty-seven exact source
+decision witnesses for seventeen high-risk models, exhaustive TLC, non-vacuous
+Kani, Verus, and a source-produced runtime trace. The nightly tier
+also runs selected TLC simulation, Miri, Loom, two typed Apalache refinements,
+one TLAPS theorem, and bounded Rust/C coverage-guided fuzzing. Every tool emits
+or retains evidence below `build/formal`; CI uploads that directory even when a
+gate fails.
+
+This is not QNX-class or safety-certification evidence. The following remain
+failed infrastructure gates rather than implied successes:
+
+- only one model has a TLAPS theorem, and it proves a definitional owner lemma,
+  not the full inductive invariant or temporal liveness argument;
+- the two Apalache files are deliberately smaller refinements and have no
+  machine-checked refinement mapping back to their full TLC models;
+- one source boundary emits a replayable action trace, and seventeen models
+  have exact source-decision witnesses; `runtime-control-rpc` is in both sets,
+  none of those unit witnesses is full transition-system equivalence, and 51
+  models still lack either mapping;
+- Loom covers one proof kernel, not the actual scheduler/IPC atomics under the
+  complete Rust memory model, and the C/Rust fuzz corpus has no long-term
+  coverage floor, corpus minimization service, or regression SLA;
+- requirements, hazards, assumptions, source, proof obligations, tests, and
+  release evidence do not yet have immutable bidirectional IDs and review
+  signatures; tool qualification and independent verification are absent;
+- hardware fault injection, WCET/interrupt-latency analysis, freedom-from-
+  interference evidence, and target compiler/binary equivalence remain open.
+
 ## Current high-risk coverage
 
 | Risk | Model | Source anchor |
@@ -24,17 +56,26 @@ passes TLC.
 | A malformed ELF64 or PE64 plan maps outside the process window, overlaps another region, creates a writable executable image, or starts outside executable memory | dual-abi-image-admission | libs/rustos-image-admission/src/lib.rs and services/loaderd/src/main.rs |
 | A malformed ELF64/PE64 byte table, relocation, import, or changed post-parse snapshot reaches a process mapping | dual-abi-byte-parser | libs/rustos-image-admission/src/lib.rs, services/loaderd/src/main.rs, and kernel/compat/src/user/syscall/linux/proc_broker_ops.rs |
 | A user page aliases a kernel/dead frame, remains W+X, or retains access authority after unmap | page-table-lifecycle | kernel/mm/src/memory/address_space.rs |
+| Two threads obtain concurrent mutable process/address-space state, exit races after state replacement but before exec clears the exit marker, a prepared thread attachment publishes after exit or leaks its unpublished stack on rejection, thread count grows beyond its exit-time ceiling, exec mutates a frozen exited epoch, or reclamation frees retained/task/stack authority | process-address-space-lifetime | kernel/ps/src/multitask/{process_table.rs,current.rs,scheduler.rs} |
+| A futex task owns duplicate waiters, requeue followed by timeout leaves a stale old-key entry, or ABI-aware current-thread exit retains futex-table authority | futex-waiter-lifecycle | kernel/compat/src/user/syscall/linux/service_ops/futex_thread.rs |
+| A stale/malformed procd reply consumes a masked or non-pending signal, installs a non-user handler/restorer, permits SIGKILL ignore/handler or non-termination, permits SIGSTOP ignore/handler or process termination instead of a distinct stopped state, restores either unblockable mask through `rt_sigreturn`, termination retains pending authority, a terminated process has no rootd/procd lifecycle evidence, a recovered user fault revokes a live endpoint, or fatal final-thread retirement leaves process/task-IPC authority live | process-signal-delivery | services/procd/src/main.rs, kernel/executive/src/lib.rs, kernel/compat/src/user/syscall/linux/{support.rs,offload_ops.rs}, and kernel/ps/src/multitask/{current.rs,scheduler.rs} |
+| Concurrent netd workers detach deferred poll batches and admit beyond the global bound, an accepted request stays queued/detached forever, queue poisoning strands reservations/reply capabilities, a failed reply is confused with delivery, or a request attempts more than one terminal reply | netd-deferred-reply | services/netd/src/main.rs |
+| A memfd installs `F_SEAL_WRITE` with a writable mapping, changes seals after `F_SEAL_SEAL`, shrinks live backing, overflows mapping accounting, or lets an EOF-extending write bypass `F_SEAL_GROW` | memfd-seal-lifecycle | kernel/ps/src/user/memfd.rs |
+| An unallocated MSI vector accepts a handler/device route, a vector is rebound, or permanent route identity is recycled | msi-vector-lifecycle | kernel/hal/src/arch/msi.rs |
+| A persistent write/create/truncate/unlink becomes authoritative while the writable feature is disabled or with partial crash-recovery evidence, or volatile `/run` policy is confused with persistent mutation | persistent-mutation-admission | services/vfsd/src/{lib.rs,main.rs} |
 | A device maps outside its assigned DMA aperture or keeps DMA authority after domain revoke | dma-iommu-isolation | tools/hostd/src/main.rs, libs/driver-domain-host/src/lib.rs, and kernel/io-manager/src/driver/iommu.rs |
+| A supplied boot-volume identity silently degrades into discovery, identity-free Multiboot2 boot proceeds without immutable extent evidence, or ambiguous FAT candidates select an arbitrary root volume | boot-volume-admission | kernel/io-manager/src/storage/{block.rs,block/boot.rs,boot_volume.rs} and libs/storage-core/src/lib.rs |
 | Boot extents return content different from the authenticated staged file | filesystem-content-integrity | tools/xtask/src/stage/mod.rs and kernel/io-manager/src/storage/boot_volume.rs |
 | A malformed checksum, fragment, unsupported EtherType, or stale session payload reaches netd | network-payload-session | libs/driver-domain-protocol/src/lib.rs and kernel/io-manager/src/io/dvm_network.rs |
 | Continuously runnable System work consumes every dispatch while User work remains runnable; one busy User hides another past its ready-age bound; or a latency handoff FIFO overwrites an owner, admits duplicates/System tasks, retains stale owners, grows without bound, or consumes an unbounded dispatch burst | scheduler-cpu-distribution | kernel/ps/src/multitask/scheduler.rs and kernel/compat/src/user/syscall/linux/ipc_ops.rs |
+| A uiserver helper inherits permanent System scheduling authority, or self-demotion erases a live reply-scoped priority donation before the reply terminates | scheduler-thread-demotion | kernel/ps/src/multitask/scheduler.rs, kernel/compat/src/user/syscall/linux/scheduler_ops.rs, and services/uiserver/src/{sys.rs,main.rs,input_loop.rs,runtime_sync.rs} |
 | Stale service endpoint or capability after revoke/exit | endpoint-registry | kernel/compat/src/user/syscall/linux/ipc_ops.rs |
-| Concurrent registration wins after another registrar or exit cleanup has observed an empty endpoint | endpoint-publication | kernel/compat/src/user/syscall/linux/ipc_ops.rs and kernel/ps/src/multitask/process_table.rs |
-| Child runs before exact supervisor lease admission | deferred-start | services/rootd/src/main.rs and services/loaderd/src/main.rs |
-| Wrong supervisor/PID becomes a post-init policy service, or another sender rebinds a running exact-PID lease | post-init-leases | services/rootd/src/main.rs |
-| A crashed core service restarts in the same scheduler turn, exhausts its retry budget without elapsed backoff, or retains old service authority during pending/failed recovery | rootd-restart-backoff | services/rootd/src/main.rs and kernel/compat/src/user/syscall/linux/lifecycle_broker_ops.rs |
-| A restarted initd duplicates a surviving post-init service, reclaims a ready exact-PID service, leaves an endpoint-less stale child authoritative past its deadline, or permits uiserver authority after its sessiond reporter exits | post-init-supervisor-recovery | services/rootd/src/main.rs, services/initd/src/main.rs, and kernel/compat/src/user/syscall/linux/lifecycle_broker_ops.rs |
-| Core dependency or restart sequence starts initd incorrectly | rootd-bootstrap | services/rootd/src/main.rs |
+| Concurrent registration wins after another registrar or exit cleanup has observed an empty endpoint, or a reader combines endpoint/owner/capability fields from different revoke/republication generations | endpoint-publication | kernel/compat/src/user/syscall/linux/ipc_ops.rs and kernel/ps/src/multitask/process_table.rs |
+| A child runs before exact supervisor lease admission, activation/endpoint timeout leaves a hidden child, or runtimed continues launching after exact child retirement becomes uncertain | deferred-start | services/rootd/src/main.rs, services/runtimed/src/spawn.rs, and services/loaderd/src/main.rs |
+| Wrong supervisor/PID becomes a post-init policy service, another sender rebinds a running exact-PID lease, or initd/sessiond exit leaves a dependent lease or capability live | post-init-leases | services/rootd/src/main.rs |
+| A crashed core service restarts in the same scheduler turn, unrelated lifecycle work starves monotonic backoff progress, a pending restart never settles or fails closed, retry budget is consumed without elapsed backoff, old service authority survives pending/failed recovery, an initial/restarted loader activation failure leaves a suspended child, rootd and procd steal lifecycle events from one shared consumer queue, or queue/copyout pressure silently discards the exit evidence needed to revoke a lease or policy cache | rootd-restart-backoff | services/rootd/src/main.rs, services/procd/src/main.rs, and kernel/compat/src/user/syscall/linux/{lifecycle_broker_ops.rs,offload_ops.rs} |
+| An observed initd exit leaves any descendant policy authority live, a defensive recovery cut duplicates an imported post-init service, reclaims a ready exact-PID service, lets repeated sibling failures starve monotonic deadline progress, fails to eventually adopt/reclaim an imported recovery, leaves an endpoint-less stale child authoritative past its deadline, or permits uiserver authority after any ancestor in its reporter chain exits | post-init-supervisor-recovery and post-init-leases | services/rootd/src/main.rs, services/initd/src/main.rs, and kernel/compat/src/user/syscall/linux/lifecycle_broker_ops.rs |
+| A core dependency or restart sequence starts initd incorrectly, or a live core process that never registers its endpoint exhausts neither its twenty supervised readiness intervals nor the finite combined restart budget | rootd-bootstrap | services/rootd/src/main.rs |
 | A same-CID process lacks the per-launch challenge proof yet gains control authority; a foreign DVM, mismatched reply, stale input epoch, or out-of-order relay frame gains authority | dvm-control-relay | libs/driver-domain-host/src/lib.rs, driver-domains/linux/package/rustos-dvm-agent/src/rustos-dvm-agent.c, kernel/io-manager/src/input/dvm_frames.rs |
 | A same-CID unprivileged process discovers the static control listener and holds its setup slot, delaying the launch agent before HMAC validation | dvm-control-endpoint | libs/driver-domain-host/src/lib.rs, tools/{hostd,xtask}/src, driver-domains/linux/package/rustos-dvm-agent/src/rustos-dvm-agent.c |
 | A dead DVM control agent, stale or malformed ready file, unsafe state directory, partially written candidate, or one-shot announcement is accepted as live local readiness; repeated pre-rename crashes accumulate unbounded candidates | dvm-agent-readiness | driver-domains/linux/package/rustos-dvm-agent/src/rustos-dvm-agent.c and driver-domains/linux/board/overlay/etc/init.d/S50rustos-dvm |
@@ -42,11 +83,14 @@ passes TLC.
 | A mapped DVM Ethernet aperture remains usable after its authenticated control session ends, a stale end tears down a newer session, or DVM-writable data-plane state creates network authority | dvm-network-control | libs/driver-domain-host/src/lib.rs, kernel/io-manager/src/input/dvm_frames.rs, kernel/io-manager/src/io/dvm_network.rs |
 | A DVM reconnect or disconnect retains old Ctrl/Alt/key/button state, a reset waits behind stale queued input, or a retired epoch injects into the next session | dvm-input-revocation | kernel/io-manager/src/input/dvm_frames.rs, kernel/io-manager/src/input/event_queue.rs, services/inputd/src/main.rs, drivers/libs/keyboard-core/src/lib.rs |
 | A DVM gains a write path to the host-owned ring, L0 produces after vector setup but before a live policy consumer, producer/consumer exceed the fixed aperture, normal traffic consumes cleanup reserve, IRQ decodes or moves cursors, revoke leaves decoder/input authority live, a stale/malformed record reaches inputd, recovery reallocates a permanent MSI-X vector or leaks an MMIO mapping, or finite committed work never drains | dvm-input-ring | libs/driver-domain-protocol/src/lib.rs, libs/driver-domain-host/src/{lib.rs,ivshmem.rs}, kernel/io-manager/src/input/{dvm_ring.rs,dvm_frames.rs}, kernel/compat/src/user/syscall/linux/{input_broker_ops.rs,service_ops/poll_epoll.rs} |
+| A generic client poll claims DVM transport-consumer authority, a wake/arm race strands committed input, an ingestion turn drains without a bound or starves recovery work, or finite committed records never reach inputd policy under the declared worker fairness | input-ingestion-worker | kernel/compat/src/user/syscall/linux/input_broker_ops.rs and services/inputd/src/main.rs |
 | A DVM-backed scanout/input path, a compromised DVM relay, or a lost presentation/input channel is mistaken for a trusted-attention path and permits a privileged prompt | trusted-ui-boundary | kernel/io-manager/src/io/dvm_display.rs, kernel/io-manager/src/io/gui.rs, libs/rustos-user-abi/src/{device,syscall}.rs, services/uiserver/src/sys.rs |
 | A generic `poll`/`epoll` caller drains the DVM ring, the MSI-X worker transfer is absent from the ownership model, a finite `STATS` reply or readiness-gated read loses/replays an event, uiserver starts the stateful inputd READ merely to discover an empty queue, waits on ring0 after inputd has moved the only record to service policy, or accumulates burst credit after a missed reader cadence | input-readiness | kernel/io-manager/src/input/event_queue.rs, kernel/compat/src/user/syscall/linux/{ipc_ops.rs,service_ops/poll_epoll.rs,service_ops/ipc_helpers.rs}, services/inputd/src/main.rs, services/uiserver/src/{input_loop.rs,sys.rs} |
 | A recovering console-policy service makes uiserver wait in the input/present loop, a keyboard burst grows an unbounded queue, a queue-full event disappears without telemetry, FIFO delivery is reordered, or a blocked console call prevents local input feedback | ui-frame-budget | services/uiserver/src/{input_loop.rs,main.rs}, services/uiserver/src/app/{input.rs,runtime.rs} |
 | Input and Wayland damage are split across redundant early presentations; a Wayland frame callback runs without a previous real presentation or damage-free cadence permit; missed timer pulses accumulate callback credit; or pending damage/callback work can remain live forever under the declared scheduler/timer fairness assumptions | wayland-frame-pacing | services/uiserver/src/{main.rs,wayland.rs} |
+| A netd-backed blocking accept owns the uiserver frame loop, accepted clients accumulate without a bound, overload leaks a client stream, or a queued accepted client never settles under the declared accept/UI fairness | wayland-accept-isolation | services/uiserver/src/wayland.rs and services/netd/src/main.rs |
 | A DVM KVM selftest keeps sending accepted relative input after its pointer has clamped at a screen edge, producing a false low-FPS result instead of sustained visual work | ui-input-motion | driver-domains/linux/package/rustos-dvm-agent/src/rustos-dvm-agent.c, services/uiserver/src/{input_loop.rs,main.rs} |
+| A partial X/Y report publishes an absolute pointer position, a duplicate complete report produces phantom motion, an out-of-bounds coordinate reaches UI state, ownership is duplicated between pipeline stages, or finite accepted absolute-position work never reaches presentation | dvm-absolute-pointer | driver-domains/linux/package/rustos-dvm-agent/src/rustos-dvm-agent.c, libs/driver-domain-{protocol,host}/src, kernel/io-manager/src/input/{dvm_frames.rs,event_queue.rs}, services/inputd/src/main.rs, and services/uiserver/src/app/input.rs |
 | A composite DVM selftest device is selected only as a keyboard, silently loses pointer events, emits during partial scheduler admission, grants unbounded or unverified RT CPU authority, reconnects after an uncertain scheduler/RT-limit restore, lets unrelated ready poll fds starve its monotonic cadence, accumulates catch-up bursts, or turns a long motion proof into repeated keyboard/console input | dvm-input-selftest | driver-domains/linux/package/rustos-dvm-agent/src/rustos-dvm-agent.c and tools/xtask/src/{build/mod.rs,kvm.rs} |
 | A recovering sessiond call holds devmgrd's only receiver, starving unrelated input/device work; or a sessiond ioctl burst grows without bound, silently drops, or reorders work | devmgrd-sessiond-isolation | services/devmgrd/src/main.rs |
 | A topology-only VFIO preflight, unsigned/foreign/expired release authorization, retired durable-lease schema, partial IOMMU-group binding, or mismatched DVM artifact/device policy becomes an active device assignment | vfio-release-authorization | tools/hostd/src/main.rs and libs/driver-domain-host/src/lib.rs |
@@ -71,11 +115,11 @@ passes TLC.
 | A mutable or malformed runtime launch record requests strict System weight for an ordinary app, or UI weight is granted to a path that merely resembles the trusted UI executable | scheduler-admission | services/runtimed/src/{main.rs,spawn.rs} |
 | A catalog child becomes runnable before runtimed records its PID, or an activated child never receives its one-shot first turn while UI/input IPC handoffs remain busy | deferred-start, scheduler-cpu-distribution | services/runtimed/src/spawn.rs and kernel/ps/src/multitask/scheduler.rs |
 | A System caller waits on a User broker or nested User policy server without reply-scoped donation; a critical DVM/UI flood exceeds its two-dispatch System bound while User work is ready; a completed/cancelled/exited reply leaks an inherited System class; or a foreign/malformed netd response creates latency authority | ipc-priority-inheritance, scheduler-cpu-distribution | kernel/ps/src/multitask/{scheduler.rs,current.rs}, kernel/compat/src/user/syscall/linux/ipc_ops.rs |
-| Opaque IPC descriptors remain in the pending registry after queue cancellation, peer-close, invalid receiver output, or caller exit; one batch is partially installed | ipc-handle-transfer | kernel/ps/src/user/handles.rs, kernel/ipc-runtime/src/ipc/mod.rs, kernel/compat/src/user/syscall/linux/ipc_ops.rs, and kernel/ps/src/multitask/current.rs |
-| A foreign process receives a process-owned endpoint, completes a guessed reply capability, installs attached handles, prevents worker-thread service, leaves authority after owner-process exit, or makes `dup2`/`F_DUPFD` sparsely expand a ring-0 descriptor table | ipc-endpoint-ownership | kernel/ipc-runtime/src/ipc/mod.rs, kernel/compat/src/user/syscall/linux/ipc_ops.rs, kernel/ps/src/multitask/current.rs, kernel/ps/src/user/handles/table.rs, and kernel/compat/src/user/syscall/linux/service_ops/vfs_socket.rs |
-| A stale or foreign loader process maps/commits a prepare handle, a rejected commit retains mappings, or loader exit leaks uncommitted broker state | proc-broker-session | kernel/compat/src/user/syscall/linux/proc_broker_ops.rs and services/loaderd/src/main.rs |
+| Opaque IPC descriptors remain in the pending registry after queue cancellation, peer-close, invalid receiver output, or any scheduler retirement; retired task/process owners retain endpoint authority; one batch is partially installed | ipc-handle-transfer | kernel/ps/src/user/handles.rs, kernel/ipc-runtime/src/ipc/mod.rs, kernel/compat/src/user/syscall/linux/ipc_ops.rs, and kernel/ps/src/multitask/scheduler.rs |
+| A foreign process receives a process-owned endpoint, completes a guessed reply capability, installs attached handles, prevents worker-thread service, leaves authority after owner-process exit, revives a dead numeric endpoint by enqueueing after its owner exits, any ordinary, transfer, `dup2`, or `F_DUPFD` install expands the ring-0 descriptor table beyond its declared ceiling or partially installs a capacity-rejected transfer batch, a malformed/locally rejected vfsd open retains remote authority, or a failed socket/socketpair/accept publication leaks new netd tokens or a partial fd pair | ipc-endpoint-ownership | kernel/ipc-runtime/src/ipc/mod.rs, kernel/compat/src/user/syscall/linux/{ipc_ops.rs,net_broker_ops.rs}, kernel/ps/src/multitask/current.rs, kernel/ps/src/user/handles/table.rs, kernel/compat/src/user/syscall/linux/service_ops/{ipc_helpers.rs,vfs_socket.rs}, and services/netd/src/main.rs |
+| A stale or foreign loader process maps/commits a prepare handle, a rejected commit retains mappings, loader exit leaks uncommitted broker state, or an in-flight prepare publishes after owner-exit cleanup | proc-broker-session | kernel/compat/src/user/syscall/linux/proc_broker_ops.rs and services/loaderd/src/main.rs |
 | Wrong PID/TID cancellation or exec consumes another target's ticket; target-thread exit or exec sibling retirement retains ticket/register handoff state; an image becomes schedulable before its register handoff exists | exec-ticket | services/procd/src/main.rs, services/loaderd/src/main.rs, kernel/compat/src/user/syscall/linux/proc_broker_ops.rs, kernel/compat/src/user/syscall/linux.rs, and kernel/compat/src/user/syscall/linux/support.rs |
-| Rootd or storaged accepts a retired private request envelope, interprets a truncated request as a valid operation, silently ignores fields not consumed by the selected storage operation, or leaves a synchronous caller blocked by dropping a malformed-size request without a reply | commercial-service-envelope | services/rootd/src/main.rs, services/storaged/src/main.rs, and libs/rustos-user-abi/src/syscall.rs |
+| Any commercial service accepts a wrong-version, reserved-flag, or out-of-bounds request envelope; rootd or storaged accepts a retired private request, interprets a truncated request as a valid operation, silently ignores fields not consumed by the selected storage operation, accepts an upper-bit alias after narrowing an operation argument, or leaves a synchronous caller blocked by dropping a malformed-size request without a reply; or a kernel/initd/runtimed/devmgrd client accepts a response whose subject, service, ticket, reserved fields, nested lengths, descriptor count, or operation-specific result shape does not match its request | source-only: commercial-service-envelope (no registered TLA model) | libs/rustos-user-abi/src/syscall.rs, services/{rootd,procd,storaged,initd,devmgrd,inputd,vfsd,syscalld,netd,loaderd}/src/main.rs, services/{runtimed/src/session.rs,uiserver/src/sys.rs}, services/runtimed/src/spawn.rs, and kernel/compat/src/user/syscall/linux/{ipc_ops.rs,proc_broker_ops.rs,service_ops/ipc_helpers.rs} |
 
 ## Release-blocking proof gaps
 
@@ -91,6 +135,56 @@ close the release gates: arbitrary-length multi-block/multi-descriptor parser
 equivalence and runtime fault evidence still require independent artifacts.
 Commercial release remains blocked until the same properties have source
 conformance plus runtime fault evidence.
+
+The current IPC handle-receive proof covers invalid output rejected before
+dequeue and descriptor-table capacity rejected before the first installation.
+It does not cover a second thread changing the receiver's output mapping after
+validation: today the descriptors can be installed and the later numeric-FD
+copyout can still fail. Closing that transactional gap needs descriptor-slot
+reservation plus copyout/commit (or an equivalent non-reusable generation), so
+it remains an explicit unimplemented gate rather than a claimed all-or-nothing
+source property.
+
+The newly closed provider-publication paths reclaim vfsd objects and netd
+tokens when local fd admission, pair installation, or pair copyout fails.
+Process teardown still drops the local handle table without a complete,
+acknowledged cross-service close sweep for every surviving remote VFS/socket
+object. Closing that broader lifecycle requires a bounded provider-revoke
+protocol (including provider restart and failed acknowledgement), so it remains
+an explicit unimplemented gate rather than being hidden by the narrower
+publication rollback proof.
+
+The signal proof now includes SIGSTOP instead of silently omitting it from the
+finite configuration. RustOS currently maps default SIGSTOP to process
+termination and has no complete scheduler stop/SIGCONT/wait-status lifecycle.
+That cross-subsystem behavior is an unimplemented source-conformance gate; the
+passing model describes the required distinction and is not evidence that the
+current implementation provides it.
+
+Scheduler retirement now closes generic task/process IPC authority for normal,
+forced, invalid-context, and fault exits. Linux forced/fault termination still
+lacks a complete per-thread `clear_child_tid` plus robust-futex owner-death walk
+for every retired sibling. That requires a bounded target-thread user-memory
+cleanup protocol rather than calling the current-thread helper on foreign
+contexts, so it remains a separate unimplemented Linux-compatibility gate.
+
+Scheduler-internal saved-context validation can retire a corrupted Linux task
+without crossing the ABI-aware compatibility layer that publishes the terminal
+wait status to rootd/procd. IPC authority is revoked by the common scheduler
+retirement primitive, but lifecycle evidence for this path remains incomplete.
+Closing it requires a bounded deferred retirement-notification channel rather
+than calling service IPC while holding scheduler state, so it remains an
+explicit unimplemented gate.
+
+The futex lifecycle proof covers the compatibility layer's current-thread
+cleanup, not arbitrary scheduler retirement. Forced, fault, and invalid-context
+retirement can bypass exact target-task removal from the compatibility futex
+table and RTC sleep-wait table until opportunistic scavenging or the deadline.
+Repeated long-deadline forced retirements can therefore retain bounded table
+slots. Closing this requires the same deferred target-thread retirement
+notification protocol as `clear_child_tid`/robust-futex cleanup; it remains an
+explicit unimplemented gate and is not claimed by the passing futex model.
+
 The virtual compositor topology now intentionally uses one staged upload into
 virtio-GPU and labels it `source-path=staged-copy zero-copy=0`; it cannot close
 the physical DMA-BUF-source/atomic-scanout gate. A bounded QEMU capture reached the

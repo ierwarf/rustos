@@ -3,6 +3,9 @@ name = "kernel-ipc-runtime"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+host-test = []
+
 [dependencies]
 kernel-mm = { path = "../mm" }
 kernel-object = { path = "../object" }

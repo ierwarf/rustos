@@ -10,13 +10,15 @@ set -euo pipefail
 INPUT="$(cat)"
 
 path="$(printf '%s' "$INPUT" | jq -r '
-  .tool_input.file_path // .arguments.file_path // .params.file_path // empty
+  .tool_input.file_path // .tool_input.relative_path //
+  .arguments.file_path // .arguments.relative_path //
+  .params.file_path // .params.relative_path // empty
 ' 2>/dev/null || true)"
 cmd="$(printf '%s' "$INPUT" | jq -r '
   .tool_input.command // .arguments.command // .params.command // empty
 ' 2>/dev/null || true)"
 
-REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd -P)"
 case "$path" in
   /*) abs_path="$path" ;;
   "") abs_path="" ;;
@@ -34,27 +36,40 @@ case "$abs_path" in
     ;;
 esac
 
-# Skip repeated checks within a 30-second window: if the last successful
-# xtask check completed less than 30s ago, the workspace hasn't had time
-# to accumulate new errors worth re-checking.
-STAMP="/tmp/.rustos_xtask_ok"
-now=$(date +%s)
-if [[ -f "$STAMP" ]]; then
-  last=$(cat "$STAMP" 2>/dev/null || echo 0)
-  if (( now - last < 120 )); then
-    exit 0
-  fi
+cd "$REPO_ROOT"
+
+# Cache only an identical worktree state. A time-only global stamp can
+# incorrectly skip a second edit, another clone, or another worktree. Hash the
+# tracked, staged, and untracked content and namespace the stamp by the
+# canonical repository path instead.
+repo_key="$(printf '%s' "$REPO_ROOT" | sha256sum | awk '{print $1}')"
+STAMP="${TMPDIR:-/tmp}/rustos-xtask-ok-${repo_key}"
+workspace_fingerprint="$({
+  git diff --no-ext-diff --binary
+  git diff --cached --no-ext-diff --binary
+  while IFS= read -r -d '' file; do
+    printf 'untracked:%q:' "$file"
+    if [[ -L "$file" ]]; then
+      printf 'symlink:%s\n' "$(readlink -- "$file")"
+    elif [[ -f "$file" ]]; then
+      sha256sum -- "$file"
+    else
+      stat --printf='special:%F:%s:%f\n' -- "$file"
+    fi
+  done < <(git ls-files --others --exclude-standard -z)
+} | sha256sum | awk '{print $1}')"
+
+if [[ -f "$STAMP" ]] && [[ "$(cat "$STAMP" 2>/dev/null || true)" == "$workspace_fingerprint" ]]; then
+  exit 0
 fi
 
-cd "$REPO_ROOT"
 log="$(mktemp)"
+trap 'rm -f "$log"' EXIT
 if timeout 90 cargo xtask check >"$log" 2>&1; then
-  rm -f "$log"
-  date +%s >"$STAMP"
+  printf '%s\n' "$workspace_fingerprint" >"$STAMP"
   exit 0
 fi
 
 tail="$(tail -n 40 "$log")"
-rm -f "$log"
 jq -n --arg m "cargo xtask check failed (tail):
 $tail" '{systemMessage:$m}'

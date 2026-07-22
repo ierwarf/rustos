@@ -20,6 +20,8 @@ output outside the cached unit.
 - `AGENTS.md` — root operating instructions.
 - `docs/ai/token-policy.md` — context budget and forbidden paths.
 - `docs/ai/task-router.md` — smallest context set by task type.
+- `docs/ai/session-handoff.md` — volatile checkout state for session
+  continuation only; not part of the stable prefix.
 - `docs/ai/repo-map.md` — source ownership and canonical entrypoints (deeper).
 - `docs/ai/commands.md` — quiet build/check commands and focused debug commands.
 - `docs/ai/contracts-infra.md` — manifest/stage/build/logging/fault contracts.

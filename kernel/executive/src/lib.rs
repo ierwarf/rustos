@@ -47,18 +47,24 @@ mod hal_hooks {
         rip: u64,
         rsp: u64,
     ) -> hal_api::UserFaultDisposition {
-        // fault로 종료되는 프로세스의 IPC 엔드포인트를 즉시 해제한다.
-        // 정상 종료는 syscall_process_exit에서 처리하므로 여기서는 fault 경우만 커버한다.
-        if let Some(process_id) = ps_api::current_user_process_id() {
-            if ps_api::current_user_process_thread_count().unwrap_or(1) <= 1 {
-                compat_api::syscall::cleanup_service_endpoints_for_process(process_id);
-            }
-        }
-        match ps_api::retire_current_user_task_due_to_fault(vector, error_code, cr2, rip, rsp) {
+        let linux_abi =
+            uses_linux_fault_policy(ps_api::current_user_snapshot().map(|snapshot| snapshot.abi()));
+        let disposition = if linux_abi {
+            compat_api::syscall::retire_current_linux_task_due_to_fault(
+                vector, error_code, cr2, rip, rsp,
+            )
+        } else {
+            ps_api::retire_current_user_task_due_to_fault(vector, error_code, cr2, rip, rsp)
+        };
+        match disposition {
             ps_api::UserFaultDisposition::Resumed => hal_api::UserFaultDisposition::Resumed,
             ps_api::UserFaultDisposition::Retired => hal_api::UserFaultDisposition::Retired,
             ps_api::UserFaultDisposition::Unhandled => hal_api::UserFaultDisposition::Unhandled,
         }
+    }
+
+    fn uses_linux_fault_policy(abi: Option<ps_api::UserAbi>) -> bool {
+        abi == Some(ps_api::UserAbi::Linux)
     }
 
     fn current_user_snapshot() -> Option<hal_api::CurrentUserSnapshot> {
@@ -126,6 +132,19 @@ mod hal_hooks {
         hal_api::register_heartbeat_hooks(hal_api::HeartbeatHooks {
             snapshot: Some(heartbeat_snapshot),
         });
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::uses_linux_fault_policy;
+        use kernel_ps::api::UserAbi;
+
+        #[test]
+        fn linux_fault_policy_is_not_applied_to_windows_abi() {
+            assert!(uses_linux_fault_policy(Some(UserAbi::Linux)));
+            assert!(!uses_linux_fault_policy(Some(UserAbi::Windows)));
+            assert!(!uses_linux_fault_policy(None));
+        }
     }
 }
 

@@ -92,6 +92,17 @@ ServerErrorRetainsFailure ==
 CrossRpcSuccessIsImpossible ==
     responseOp # requestOp => outcome # "success"
 
+NonSuccessHasNoPayloadAuthority ==
+    outcome # "success" => payloadCount = 0
+
+OverflowIsSnapshotOnly ==
+    outcome = "overflow" =>
+        /\ requestOp = "snapshot"
+        /\ responseOp = requestOp
+        /\ version = "current"
+        /\ status = "ok"
+        /\ count > MaxPrograms
+
 ResolvedResponseIsTerminal == responseReceived => outcome # "pending"
 
 Spec == Init /\ [][Next]_vars

@@ -8,6 +8,6 @@ set -euo pipefail
 jq -n '{
   hookSpecificOutput: {
     hookEventName: "SessionStart",
-    additionalContext: "RustOS hook context: route through docs/ai/token-policy.md and docs/ai/task-router.md; for physical GPU work read docs/ai/physical-gpu-status.md before source or hardware; do not read logs/target/build/vendor/Cargo.lock wholesale; preserve Linux ELF and Windows PE compatibility; keep kernel policy evacuation service-owned; never treat visual output or model evidence as quantitative physical performance; run repo hooks and prefer cargo xtask check for broad validation."
+    additionalContext: "RustOS hook context: read the AGENTS.md stable prefix and route through docs/ai/task-router.md. For continued work, read docs/ai/session-handoff.md, query live goal state, and audit git status before editing; preserve the dirty worktree. Prefer Serena/ripgrep but fall back to local rg when MCP is unavailable. For physical GPU work read docs/ai/physical-gpu-status.md before source or hardware. Never treat visual or model output as physical performance evidence. After edits use cargo xtask dev-plan; run the lanes it selects."
   }
 }'

@@ -303,11 +303,8 @@ fn validate_display_policy_request(
     request: &syscall_abi::CommercialMaxProtocolRequest,
 ) -> Result<(), i32> {
     if received != size_of::<syscall_abi::CommercialMaxProtocolRequest>()
-        || request.header.version != syscall_abi::COMMERCIAL_MAX_PROTOCOL_ABI_VERSION
+        || !request.has_valid_envelope()
         || request.header.protocol != syscall_abi::COMMERCIAL_MAX_PROTOCOL_UISERVER
-        || request.header.flags != 0
-        || request.path_len as usize > request.path.len()
-        || request.payload_len as usize > request.payload.len()
     {
         return Err(libc::EINVAL);
     }

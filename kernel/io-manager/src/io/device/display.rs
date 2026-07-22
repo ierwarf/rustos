@@ -97,7 +97,8 @@ pub(crate) fn ioctl(
             };
             let handle = process_state
                 .handles_mut()
-                .install(KernelHandle::DisplaySurface(surface));
+                .install(KernelHandle::DisplaySurface(surface))
+                .ok_or(DeviceError::TryAgain)?;
             create.handle = u32::try_from(handle).map_err(|_| DeviceError::InvalidArgument)?;
             create.bytes_per_pixel = surface.bytes_per_pixel();
             create.stride_bytes = surface.stride_bytes();

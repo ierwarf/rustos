@@ -3,8 +3,9 @@ EXTENDS Naturals, FiniteSets
 
 (***************************************************************************
 Models rootd post-init lease admission and restart budgets. Initd owns the
-netd launch report and runtimed owns the uiserver report. A capability is
-granted only to the exact running PID that an authorized supervisor reported.
+netd and sessiond launch reports, while the live sessiond/runtimed service owns
+the uiserver report. A capability is granted only to the exact running PID
+whose complete reporter chain terminates at the live initd lease.
 An attempted re-registration by any other actor is a stateful rejection: it
 may be observed for diagnostics, but cannot change the live PID, reporter, or
 capability binding.
@@ -17,7 +18,7 @@ NoSupervisor == "none"
 NoService == "none-service"
 NoActor == "none-actor"
 InitdSupervisor == "initd"
-RuntimedSupervisor == "runtimed"
+SessiondSupervisor == "sessiond"
 Intruder == "intruder"
 Actors == Supervisors \cup {Intruder}
 
@@ -28,7 +29,10 @@ Exited == "exited"
 Failed == "failed"
 
 SupervisorFor(s) ==
-    IF s = "netd" THEN InitdSupervisor ELSE RuntimedSupervisor
+    IF s \in {"netd", "sessiond"} THEN InitdSupervisor ELSE SessiondSupervisor
+
+Dependents(s) == IF s = "sessiond" THEN {"uiserver"} ELSE {}
+Cascade(s) == {s} \cup Dependents(s)
 
 VARIABLES leaseState,
           leasePid,
@@ -36,6 +40,7 @@ VARIABLES leaseState,
           capabilityPid,
           restartRemaining,
           restartCount,
+          supervisorAlive,
           issuedPids,
           lastRebindService,
           lastRebindActor,
@@ -44,7 +49,7 @@ VARIABLES leaseState,
           lastRebindCapabilityPid
 
 vars == <<leaseState, leasePid, reportedBy, capabilityPid, restartRemaining,
-          restartCount, issuedPids, lastRebindService, lastRebindActor,
+          restartCount, supervisorAlive, issuedPids, lastRebindService, lastRebindActor,
           lastRebindLeasePid, lastRebindReporter, lastRebindCapabilityPid>>
 
 Init ==
@@ -54,6 +59,7 @@ Init ==
     /\ capabilityPid = [s \in Services |-> NoPid]
     /\ restartRemaining = [s \in Services |-> InitialRestartBudget]
     /\ restartCount = [s \in Services |-> 0]
+    /\ supervisorAlive = [supervisor \in Supervisors |-> supervisor = InitdSupervisor]
     /\ issuedPids = {}
     /\ lastRebindService = NoService
     /\ lastRebindActor = NoActor
@@ -72,23 +78,29 @@ InitialLaunch(s, p, supervisor) ==
     /\ s \in Services
     /\ p \in Pids \ issuedPids
     /\ supervisor = SupervisorFor(s)
+    /\ supervisorAlive[supervisor]
     /\ leaseState[s] = Unlaunched
     /\ leaseState' = [leaseState EXCEPT ![s] = PendingReport]
     /\ leasePid' = [leasePid EXCEPT ![s] = p]
     /\ reportedBy' = [reportedBy EXCEPT ![s] = NoSupervisor]
     /\ issuedPids' = issuedPids \cup {p}
     /\ ClearRebindAttempt
-    /\ UNCHANGED <<capabilityPid, restartRemaining, restartCount>>
+    /\ UNCHANGED <<capabilityPid, restartRemaining, restartCount, supervisorAlive>>
 
 ReportReadiness(s, p, supervisor) ==
     /\ s \in Services
     /\ p \in Pids
     /\ supervisor = SupervisorFor(s)
+    /\ supervisorAlive[supervisor]
     /\ leaseState[s] = PendingReport
     /\ leasePid[s] = p
     /\ reportedBy[s] = NoSupervisor
     /\ leaseState' = [leaseState EXCEPT ![s] = Running]
     /\ reportedBy' = [reportedBy EXCEPT ![s] = supervisor]
+    /\ supervisorAlive' =
+        IF s = "sessiond"
+        THEN [supervisorAlive EXCEPT ![SessiondSupervisor] = TRUE]
+        ELSE supervisorAlive
     /\ ClearRebindAttempt
     /\ UNCHANGED <<leasePid, capabilityPid, restartRemaining, restartCount, issuedPids>>
 
@@ -98,19 +110,32 @@ GrantCapability(s, p) ==
     /\ leaseState[s] = Running
     /\ leasePid[s] = p
     /\ reportedBy[s] = SupervisorFor(s)
+    /\ supervisorAlive[reportedBy[s]]
     /\ capabilityPid[s] = NoPid
     /\ capabilityPid' = [capabilityPid EXCEPT ![s] = p]
     /\ ClearRebindAttempt
-    /\ UNCHANGED <<leaseState, leasePid, reportedBy, restartRemaining,
+    /\ UNCHANGED <<leaseState, leasePid, reportedBy, restartRemaining, supervisorAlive,
                   restartCount, issuedPids>>
 
 Exit(s) ==
     /\ s \in Services
     /\ leaseState[s] \in {PendingReport, Running}
-    /\ leaseState' = [leaseState EXCEPT ![s] = Exited]
-    /\ leasePid' = [leasePid EXCEPT ![s] = NoPid]
-    /\ reportedBy' = [reportedBy EXCEPT ![s] = NoSupervisor]
-    /\ capabilityPid' = [capabilityPid EXCEPT ![s] = NoPid]
+    /\ leaseState' = [service \in Services |->
+        IF service \in Cascade(s) /\ leaseState[service] \in {PendingReport, Running}
+        THEN Exited ELSE leaseState[service]]
+    /\ leasePid' = [service \in Services |->
+        IF service \in Cascade(s) /\ leaseState[service] \in {PendingReport, Running}
+        THEN NoPid ELSE leasePid[service]]
+    /\ reportedBy' = [service \in Services |->
+        IF service \in Cascade(s) /\ leaseState[service] \in {PendingReport, Running}
+        THEN NoSupervisor ELSE reportedBy[service]]
+    /\ capabilityPid' = [service \in Services |->
+        IF service \in Cascade(s) /\ leaseState[service] \in {PendingReport, Running}
+        THEN NoPid ELSE capabilityPid[service]]
+    /\ supervisorAlive' =
+        IF s = "sessiond"
+        THEN [supervisorAlive EXCEPT ![SessiondSupervisor] = FALSE]
+        ELSE supervisorAlive
     /\ ClearRebindAttempt
     /\ UNCHANGED <<restartRemaining, restartCount, issuedPids>>
 
@@ -118,6 +143,7 @@ Restart(s, p, supervisor) ==
     /\ s \in Services
     /\ p \in Pids \ issuedPids
     /\ supervisor = SupervisorFor(s)
+    /\ supervisorAlive[supervisor]
     /\ leaseState[s] = Exited
     /\ restartRemaining[s] > 0
     /\ leaseState' = [leaseState EXCEPT ![s] = PendingReport]
@@ -127,7 +153,7 @@ Restart(s, p, supervisor) ==
     /\ restartCount' = [restartCount EXCEPT ![s] = @ + 1]
     /\ issuedPids' = issuedPids \cup {p}
     /\ ClearRebindAttempt
-    /\ UNCHANGED <<capabilityPid>>
+    /\ UNCHANGED <<capabilityPid, supervisorAlive>>
 
 Exhaust(s) ==
     /\ s \in Services
@@ -135,8 +161,30 @@ Exhaust(s) ==
     /\ restartRemaining[s] = 0
     /\ leaseState' = [leaseState EXCEPT ![s] = Failed]
     /\ ClearRebindAttempt
-    /\ UNCHANGED <<leasePid, reportedBy, capabilityPid, restartRemaining,
+    /\ UNCHANGED <<leasePid, reportedBy, capabilityPid, restartRemaining, supervisorAlive,
                   restartCount, issuedPids>>
+
+SupervisorExit(supervisor) ==
+    \* initd is the external root of this reporter graph. Its observed exit
+    \* synchronously revokes sessiond and the UI descendant in the same rootd
+    \* turn; a later sessiond lifecycle record is not needed for authority.
+    /\ supervisor = InitdSupervisor
+    /\ supervisorAlive[supervisor]
+    /\ supervisorAlive' = [role \in Supervisors |-> FALSE]
+    /\ leaseState' = [s \in Services |->
+        IF leaseState[s] \in {PendingReport, Running}
+        THEN Exited ELSE leaseState[s]]
+    /\ leasePid' = [s \in Services |->
+        IF leaseState[s] \in {PendingReport, Running}
+        THEN NoPid ELSE leasePid[s]]
+    /\ reportedBy' = [s \in Services |->
+        IF leaseState[s] \in {PendingReport, Running}
+        THEN NoSupervisor ELSE reportedBy[s]]
+    /\ capabilityPid' = [s \in Services |->
+        IF leaseState[s] \in {PendingReport, Running}
+        THEN NoPid ELSE capabilityPid[s]]
+    /\ ClearRebindAttempt
+    /\ UNCHANGED <<restartRemaining, restartCount, issuedPids>>
 
 \* This corresponds to rootd rejecting a readiness registration when a live
 \* lease has the same exact child PID but a different `reporter_pid` sender.
@@ -153,7 +201,7 @@ RejectForeignRebind(s, actor) ==
     /\ lastRebindReporter' = reportedBy[s]
     /\ lastRebindCapabilityPid' = capabilityPid[s]
     /\ UNCHANGED <<leaseState, leasePid, reportedBy, capabilityPid,
-                  restartRemaining, restartCount, issuedPids>>
+                  restartRemaining, restartCount, supervisorAlive, issuedPids>>
 
 Next ==
     \/ \E s \in Services, p \in Pids, supervisor \in Supervisors :
@@ -165,11 +213,12 @@ Next ==
     \/ \E s \in Services, p \in Pids, supervisor \in Supervisors :
         Restart(s, p, supervisor)
     \/ \E s \in Services : Exhaust(s)
+    \/ \E supervisor \in Supervisors : SupervisorExit(supervisor)
     \/ \E s \in Services, actor \in Actors : RejectForeignRebind(s, actor)
 
 TypeOK ==
-    /\ Services = {"netd", "uiserver"}
-    /\ Supervisors = {InitdSupervisor, RuntimedSupervisor}
+    /\ Services = {"netd", "sessiond", "uiserver"}
+    /\ Supervisors = {InitdSupervisor, SessiondSupervisor}
     /\ Pids \subseteq Nat
     /\ NoPid \notin Pids
     /\ InitialRestartBudget \in Nat
@@ -179,6 +228,7 @@ TypeOK ==
     /\ capabilityPid \in [Services -> (Pids \cup {NoPid})]
     /\ restartRemaining \in [Services -> 0..InitialRestartBudget]
     /\ restartCount \in [Services -> 0..InitialRestartBudget]
+    /\ supervisorAlive \in [Supervisors -> BOOLEAN]
     /\ issuedPids \subseteq Pids
     /\ lastRebindService \in Services \cup {NoService}
     /\ lastRebindActor \in Actors \cup {NoActor}
@@ -198,7 +248,12 @@ RunningLeaseWasReportedByOwner ==
         leaseState[s] = Running =>
             /\ leasePid[s] # NoPid
             /\ reportedBy[s] = SupervisorFor(s)
+            /\ supervisorAlive[reportedBy[s]]
             /\ capabilityPid[s] \in {NoPid, leasePid[s]}
+
+LiveLeaseRequiresLiveSupervisor ==
+    \A s \in Services:
+        leaseState[s] \in {PendingReport, Running} => supervisorAlive[SupervisorFor(s)]
 
 CapabilityNeedsExactRunningReportedPid ==
     \A s \in Services:
@@ -206,6 +261,14 @@ CapabilityNeedsExactRunningReportedPid ==
             /\ leaseState[s] = Running
             /\ capabilityPid[s] = leasePid[s]
             /\ reportedBy[s] = SupervisorFor(s)
+            /\ supervisorAlive[reportedBy[s]]
+
+ReporterChainEndsAtLiveInitd ==
+    /\ leaseState["sessiond"] = Running => supervisorAlive[InitdSupervisor]
+    /\ leaseState["uiserver"] = Running =>
+        /\ leaseState["sessiond"] = Running
+        /\ supervisorAlive[SessiondSupervisor]
+        /\ supervisorAlive[InitdSupervisor]
 
 TerminalLeasesClearAuthority ==
     \A s \in Services:

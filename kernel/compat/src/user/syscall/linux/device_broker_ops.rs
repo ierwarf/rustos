@@ -54,7 +54,8 @@ pub(super) fn syscall_linux_rustos_device_open_broker(args_ptr: u64) -> u64 {
             .handles_mut()
             .install_with_open_flags_and_rights(handle, args.open_flags, rights)
     }) {
-        Some(fd) => fd,
+        Some(Some(fd)) => fd,
+        Some(None) => linux_errno(LINUX_EMFILE),
         None => linux_errno(LINUX_EINVAL),
     }
 }
