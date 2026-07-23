@@ -18,17 +18,19 @@ use std::io::{Read, Write};
 use std::mem::size_of;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 pub use driver_domain_protocol::{
-    DVM_INPUT_RING_APERTURE_BYTES, DVM_INPUT_RING_FLAG_POLICY_CONSUMER_READY,
-    DVM_INPUT_RING_FLAG_RUSTOS_READY, DVM_INPUT_RING_HEADER_BYTES, DVM_INPUT_RING_PRODUCER_OFFSET,
-    DVM_INPUT_RING_RECORD_BYTES, DVM_INPUT_RING_SLOT_COUNT, DvmInputFrameError, DvmInputRingHeader,
-    LINUX_EVDEV_KEY_MAX, RUSTOS_INPUT_FRAME_BYTES, RUSTOS_POINTER_BUTTON_MASK,
-    RUSTOS_POINTER_POSITION_MAX_X, RUSTOS_POINTER_POSITION_MAX_Y, RustosInputFrame,
+    DVM_BLOCK_DATA_SLOT_BYTES, DVM_BLOCK_KNOWN_FEATURES, DVM_BLOCK_QUEUE_DEPTH,
+    DVM_BLOCK_REQUIRED_FEATURES, DVM_INPUT_RING_APERTURE_BYTES,
+    DVM_INPUT_RING_FLAG_POLICY_CONSUMER_READY, DVM_INPUT_RING_FLAG_RUSTOS_READY,
+    DVM_INPUT_RING_HEADER_BYTES, DVM_INPUT_RING_PRODUCER_OFFSET, DVM_INPUT_RING_RECORD_BYTES,
+    DVM_INPUT_RING_SLOT_COUNT, DvmInputFrameError, DvmInputRingHeader, LINUX_EVDEV_KEY_MAX,
+    RUSTOS_INPUT_FRAME_BYTES, RUSTOS_POINTER_BUTTON_MASK, RUSTOS_POINTER_POSITION_MAX_X,
+    RUSTOS_POINTER_POSITION_MAX_Y, RustosInputFrame,
 };
 
 /// The DVM control listener port is derived from the owner-private per-launch
@@ -40,7 +42,7 @@ pub const MAX_CONTROL_FRAME: usize = 4 * 1024;
 pub const LINUX_DVM_ROLE: &str = "linux-driver-domain";
 
 const INPUT_RELAY_MAX_SEQUENCE: u32 = u32::MAX - 1024;
-const INPUT_STREAM_REQUEST_ID: u32 = 5;
+const INPUT_STREAM_REQUEST_ID: u32 = 6;
 // The Linux DVM relay coalesces relative pointer samples to 125Hz; L0 still
 // enforces the resulting physical transport budget against a compromised or
 // buggy DVM before it commits the fixed shared-memory input ring.
@@ -276,6 +278,7 @@ impl ControlContract {
                 "device-inventory",
                 "driver-inventory",
                 "display-evidence-v2",
+                "block-evidence-v1",
                 "input-stream",
             ]
         {
@@ -413,6 +416,9 @@ pub enum DeviceTransport {
     Disabled,
     /// Fixed RDI3 records in the host-owned input ring plus one MSI-X wake.
     InputRingMsix,
+    /// Address-free fixed block request/completion rings plus separate
+    /// request/completion MSI-X edges.
+    BlockRingMsix,
     /// Read-only RustOS snapshot slots exported by the GUI DVM as DMA-BUFs
     /// and imported as GPU composition sources; explicit fences then hand a
     /// separate three-buffer output pool to DVM-owned atomic DRM/KMS.
@@ -424,6 +430,7 @@ impl DeviceTransport {
         match value {
             "disabled" => Ok(Self::Disabled),
             "input-ring-msix" if key == DeviceClass::Input.policy_key() => Ok(Self::InputRingMsix),
+            "block-ring-msix" if key == DeviceClass::Block.policy_key() => Ok(Self::BlockRingMsix),
             "display-dmabuf-kms" if key == DeviceClass::Display.policy_key() => {
                 Ok(Self::DisplayDmaBufKms)
             }
@@ -442,6 +449,69 @@ pub struct DriverDomainPolicy {
     qemu_sha256: String,
     transports: BTreeMap<DeviceClass, DeviceTransport>,
     physical_display: Option<PhysicalDisplayPolicy>,
+    physical_storage: Option<PhysicalStoragePolicy>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PhysicalStoragePolicy {
+    driver: String,
+    pci_vendor: u16,
+    pci_device: u16,
+    handoff_timeout_ms: u64,
+    reset_timeout_ms: u64,
+}
+
+impl PhysicalStoragePolicy {
+    pub fn driver(&self) -> &str {
+        &self.driver
+    }
+
+    pub const fn pci_vendor(&self) -> u16 {
+        self.pci_vendor
+    }
+
+    pub const fn pci_device(&self) -> u16 {
+        self.pci_device
+    }
+
+    pub const fn handoff_timeout_ms(&self) -> u64 {
+        self.handoff_timeout_ms
+    }
+
+    pub const fn reset_timeout_ms(&self) -> u64 {
+        self.reset_timeout_ms
+    }
+
+    pub fn validate_evidence(
+        &self,
+        evidence: &DvmBlockEvidence,
+        expected_generation: u64,
+        expected_block_name: &str,
+    ) -> Result<()> {
+        if evidence.generation != expected_generation
+            || evidence.driver != self.driver
+            || evidence.pci_vendor != self.pci_vendor
+            || evidence.pci_device != self.pci_device
+            || evidence.block_name != expected_block_name
+        {
+            bail!("DVM block evidence does not match the signed controller and handoff epoch");
+        }
+        if evidence.capacity_sectors == 0
+            || evidence.logical_block_size < 512
+            || !evidence.logical_block_size.is_power_of_two()
+            || !evidence.logical_block_size.is_multiple_of(512)
+            || evidence.physical_block_size < evidence.logical_block_size
+            || !evidence
+                .physical_block_size
+                .is_multiple_of(evidence.logical_block_size)
+            || evidence.features & !DVM_BLOCK_KNOWN_FEATURES != 0
+            || evidence.features & DVM_BLOCK_REQUIRED_FEATURES != DVM_BLOCK_REQUIRED_FEATURES
+            || evidence.read_only
+        {
+            bail!("DVM block evidence violates the writable block transport contract");
+        }
+        Ok(())
+    }
 }
 
 /// Signed admission and runtime-evidence thresholds for the enabled physical
@@ -599,10 +669,28 @@ impl DriverDomainPolicy {
             "DISPLAY_MAX_SAMPLE_AGE_MS",
             "DISPLAY_REQUIRED_CONSECUTIVE_SAMPLES",
         ];
+        const REQUIRED_V4: [&str; 15] = [
+            "DRIVER_DOMAIN_POLICY_SCHEMA",
+            "DOMAIN_ID",
+            "QEMU_SHA256",
+            "INPUT_TRANSPORT",
+            "NETWORK_TRANSPORT",
+            "BLOCK_TRANSPORT",
+            "DISPLAY_TRANSPORT",
+            "STORAGE_DRIVER",
+            "STORAGE_PCI_VENDOR",
+            "STORAGE_PCI_DEVICE",
+            "STORAGE_REQUIRED_FEATURES",
+            "STORAGE_QUEUE_DEPTH",
+            "STORAGE_DATA_SLOT_BYTES",
+            "STORAGE_HANDOFF_TIMEOUT_MS",
+            "STORAGE_RESET_TIMEOUT_MS",
+        ];
         let schema = launch_plan_value(&values, "DRIVER_DOMAIN_POLICY_SCHEMA", label)?;
         let required = match schema {
             "2" => &REQUIRED_V2[..],
             "3" => &REQUIRED_V3[..],
+            "4" => &REQUIRED_V4[..],
             _ => bail!("unsupported {label} schema"),
         };
         if values.len() != required.len()
@@ -625,6 +713,10 @@ impl DriverDomainPolicy {
                 class,
                 DeviceTransport::parse(launch_plan_value(&values, key, label)?, key, label)?,
             );
+        }
+        if schema != "4" && transports.get(&DeviceClass::Block) != Some(&DeviceTransport::Disabled)
+        {
+            bail!("{label} block transport requires the physical storage schema");
         }
         let physical_display = if schema == "3" {
             if transports.get(&DeviceClass::Display) != Some(&DeviceTransport::DisplayDmaBufKms)
@@ -689,11 +781,76 @@ impl DriverDomainPolicy {
         } else {
             None
         };
+        let physical_storage = if schema == "4" {
+            if transports.get(&DeviceClass::Block) != Some(&DeviceTransport::BlockRingMsix)
+                || transports.get(&DeviceClass::Input) != Some(&DeviceTransport::Disabled)
+                || transports.get(&DeviceClass::Network) != Some(&DeviceTransport::Disabled)
+                || transports.get(&DeviceClass::Display) != Some(&DeviceTransport::Disabled)
+            {
+                bail!("{label} schema 4 is reserved for the physical storage-only DVM");
+            }
+            let driver = launch_plan_value(&values, "STORAGE_DRIVER", label)?.to_owned();
+            if !matches!(driver.as_str(), "nvme" | "ahci") {
+                bail!("{label} storage driver must be nvme or ahci");
+            }
+            let pci_vendor = parse_pci_id(
+                launch_plan_value(&values, "STORAGE_PCI_VENDOR", label)?,
+                "STORAGE_PCI_VENDOR",
+                label,
+            )?;
+            let pci_device = parse_pci_id(
+                launch_plan_value(&values, "STORAGE_PCI_DEVICE", label)?,
+                "STORAGE_PCI_DEVICE",
+                label,
+            )?;
+            if launch_plan_value(&values, "STORAGE_REQUIRED_FEATURES", label)? != "flush" {
+                bail!("{label} storage transport must require flush");
+            }
+            let queue_depth = parse_bounded_policy_u64(
+                &values,
+                "STORAGE_QUEUE_DEPTH",
+                1,
+                u32::MAX as u64,
+                label,
+            )?;
+            if queue_depth != u64::from(DVM_BLOCK_QUEUE_DEPTH) {
+                bail!("{label} storage queue depth does not match the block ABI");
+            }
+            let data_slot_bytes = parse_bounded_policy_u64(
+                &values,
+                "STORAGE_DATA_SLOT_BYTES",
+                512,
+                u32::MAX as u64,
+                label,
+            )?;
+            if data_slot_bytes != u64::from(DVM_BLOCK_DATA_SLOT_BYTES) {
+                bail!("{label} storage data slot size does not match the block ABI");
+            }
+            let handoff_timeout_ms = parse_bounded_policy_u64(
+                &values,
+                "STORAGE_HANDOFF_TIMEOUT_MS",
+                100,
+                30_000,
+                label,
+            )?;
+            let reset_timeout_ms =
+                parse_bounded_policy_u64(&values, "STORAGE_RESET_TIMEOUT_MS", 100, 30_000, label)?;
+            Some(PhysicalStoragePolicy {
+                driver,
+                pci_vendor,
+                pci_device,
+                handoff_timeout_ms,
+                reset_timeout_ms,
+            })
+        } else {
+            None
+        };
         Ok(Self {
             domain_id,
             qemu_sha256,
             transports,
             physical_display,
+            physical_storage,
         })
     }
 
@@ -713,6 +870,10 @@ impl DriverDomainPolicy {
             .get(&class)
             .copied()
             .expect("driver-domain policy has every fixed class")
+    }
+
+    pub fn physical_storage(&self) -> Option<&PhysicalStoragePolicy> {
+        self.physical_storage.as_ref()
     }
 
     pub fn qemu_sha256(&self) -> &str {
@@ -1354,9 +1515,67 @@ pub fn validate_physical_display_identity(
     })
 }
 
+/// Bind a storage-only DVM to exactly one signed controller function.  A
+/// companion function would inherit direct DMA authority over the same
+/// IOMMUFD domain, so schema 4 deliberately rejects it instead of treating the
+/// complete group as an implicit storage allow-list.
+pub fn validate_physical_storage_assignment(
+    lease: &ValidatedLease,
+    sysfs_root: &Path,
+    policy: &PhysicalStoragePolicy,
+) -> Result<String> {
+    let bdf = validate_physical_storage_identity(lease, sysfs_root, policy)?;
+    let driver_path =
+        fs::canonicalize(sysfs_root.join("bus/pci/devices").join(&bdf).join("driver"))
+            .with_context(|| {
+                format!("resolve current driver for physical storage controller {bdf}")
+            })?;
+    let driver = driver_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("invalid current driver for physical storage controller {bdf}"))?;
+    if driver != policy.driver {
+        bail!(
+            "physical storage controller {bdf} is bound to {driver:?}, expected {:?}",
+            policy.driver
+        );
+    }
+    Ok(bdf)
+}
+
+/// Recheck immutable PCI identity after vfio-pci binding and before every DVM
+/// launch.  The class/prog-if match prevents an AHCI or NVMe policy from
+/// admitting a different storage programming interface with the same IDs.
+pub fn validate_physical_storage_identity(
+    lease: &ValidatedLease,
+    sysfs_root: &Path,
+    policy: &PhysicalStoragePolicy,
+) -> Result<String> {
+    let [bdf] = lease.pci_bdfs.as_slice() else {
+        bail!("physical storage IOMMU group must contain exactly one PCI function");
+    };
+    let device = sysfs_root.join("bus/pci/devices").join(bdf);
+    let vendor = read_sysfs_pci_hex(&device.join("vendor"), 0xffff, "vendor", bdf)? as u16;
+    let device_id = read_sysfs_pci_hex(&device.join("device"), 0xffff, "device", bdf)? as u16;
+    let class = read_sysfs_pci_hex(&device.join("class"), 0xff_ffff, "class", bdf)?;
+    let expected_class = match policy.driver.as_str() {
+        "nvme" => 0x010802,
+        "ahci" => 0x010601,
+        _ => bail!("unsupported signed physical storage driver"),
+    };
+    if vendor != policy.pci_vendor || device_id != policy.pci_device || class != expected_class {
+        bail!(
+            "physical storage controller {bdf} identity {vendor:04x}:{device_id:04x} class={class:06x} does not match signed policy {:04x}:{:04x} class={expected_class:06x}",
+            policy.pci_vendor,
+            policy.pci_device
+        );
+    }
+    Ok(bdf.clone())
+}
+
 fn read_sysfs_pci_hex(path: &Path, maximum: u32, field: &str, bdf: &str) -> Result<u32> {
     let source = fs::read_to_string(path)
-        .with_context(|| format!("read PCI {field} for physical display assignment {bdf}"))?;
+        .with_context(|| format!("read PCI {field} for physical device assignment {bdf}"))?;
     let value = source
         .trim()
         .strip_prefix("0x")
@@ -1383,6 +1602,33 @@ pub struct VfioLeaseRecord {
     /// Empty means that the kernel reported no override (`(null)`).
     pub original_driver_overrides: BTreeMap<String, String>,
     release_binding: Option<VfioReleaseBinding>,
+    storage_binding: Option<StorageLeaseBinding>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StorageLeaseBinding {
+    controller_bdf: String,
+    block_name: String,
+    aperture_path: PathBuf,
+    generation: u64,
+}
+
+impl StorageLeaseBinding {
+    pub fn controller_bdf(&self) -> &str {
+        &self.controller_bdf
+    }
+
+    pub fn block_name(&self) -> &str {
+        &self.block_name
+    }
+
+    pub fn aperture_path(&self) -> &Path {
+        &self.aperture_path
+    }
+
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1392,6 +1638,55 @@ pub enum VfioLeaseState {
 }
 
 impl VfioLeaseRecord {
+    pub fn bind_storage_handoff(
+        &mut self,
+        controller_bdf: &str,
+        block_name: &str,
+        aperture_path: &Path,
+        generation: u64,
+    ) -> Result<()> {
+        if self.state != VfioLeaseState::Prepared || self.storage_binding.is_some() {
+            bail!("VFIO lease storage handoff may be bound exactly once while prepared");
+        }
+        validate_pci_bdf(controller_bdf, "storage handoff binding")?;
+        if !self.original_drivers.contains_key(controller_bdf) {
+            bail!("storage handoff controller is outside the complete VFIO lease");
+        }
+        if block_name.is_empty()
+            || block_name.len() > 64
+            || !block_name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        {
+            bail!("invalid storage handoff block name");
+        }
+        if generation == 0 || !aperture_path.is_absolute() {
+            bail!("invalid storage handoff aperture epoch");
+        }
+        let aperture = aperture_path
+            .to_str()
+            .ok_or_else(|| anyhow!("storage handoff aperture path is not UTF-8"))?;
+        if aperture.is_empty()
+            || aperture.len() > 4096
+            || aperture
+                .bytes()
+                .any(|byte| byte.is_ascii_control() || byte == b'=')
+        {
+            bail!("invalid storage handoff aperture path");
+        }
+        self.storage_binding = Some(StorageLeaseBinding {
+            controller_bdf: controller_bdf.to_owned(),
+            block_name: block_name.to_owned(),
+            aperture_path: aperture_path.to_path_buf(),
+            generation,
+        });
+        Ok(())
+    }
+
+    pub fn storage_handoff(&self) -> Option<&StorageLeaseBinding> {
+        self.storage_binding.as_ref()
+    }
+
     pub fn dvm_artifact_manifest_sha256(&self) -> Result<&str> {
         self.release_binding
             .as_ref()
@@ -1446,6 +1741,7 @@ impl VfioLeaseRecord {
             original_drivers,
             original_driver_overrides,
             release_binding,
+            storage_binding: None,
         })
     }
 
@@ -1471,8 +1767,22 @@ impl VfioLeaseRecord {
         let binding = self.release_binding.as_ref().ok_or_else(|| {
             anyhow!("durable VFIO lease lacks signed release authorization evidence")
         })?;
+        let (storage_controller, storage_block, storage_aperture, storage_generation) = self
+            .storage_binding
+            .as_ref()
+            .map_or(("none", "none", "none", 0), |storage| {
+                (
+                    storage.controller_bdf.as_str(),
+                    storage.block_name.as_str(),
+                    storage
+                        .aperture_path
+                        .to_str()
+                        .expect("validated storage aperture is UTF-8"),
+                    storage.generation,
+                )
+            });
         Ok(format!(
-            "VFIO_LEASE_SCHEMA=3\nLEASE_STATE={state}\nDOMAIN_ID={}\nDVM_GUEST_CID={}\nIOMMU_GROUP={}\nORIGINAL_DRIVERS={drivers}\nORIGINAL_DRIVER_OVERRIDES={overrides}\nRELEASE_MANIFEST_SHA256={}\nDVM_ARTIFACT_MANIFEST_SHA256={}\nDEVICE_POLICY_SHA256={}\nFLEET_POLICY_SHA256={}\nAUTHORIZED_AT_UNIX={}\nAUTHORIZATION_NOT_AFTER_UNIX={}\n",
+            "VFIO_LEASE_SCHEMA=4\nLEASE_STATE={state}\nDOMAIN_ID={}\nDVM_GUEST_CID={}\nIOMMU_GROUP={}\nORIGINAL_DRIVERS={drivers}\nORIGINAL_DRIVER_OVERRIDES={overrides}\nRELEASE_MANIFEST_SHA256={}\nDVM_ARTIFACT_MANIFEST_SHA256={}\nDEVICE_POLICY_SHA256={}\nFLEET_POLICY_SHA256={}\nAUTHORIZED_AT_UNIX={}\nAUTHORIZATION_NOT_AFTER_UNIX={}\nSTORAGE_CONTROLLER_BDF={storage_controller}\nSTORAGE_BLOCK_NAME={storage_block}\nSTORAGE_APERTURE={storage_aperture}\nSTORAGE_GENERATION={storage_generation}\n",
             self.domain_id,
             self.dvm_guest_cid,
             self.iommu_group,
@@ -1487,7 +1797,7 @@ impl VfioLeaseRecord {
 
     fn parse(source: &str, label: &str) -> Result<Self> {
         let values = parse_launch_plan_values(source, label)?;
-        const V3_REQUIRED: [&str; 13] = [
+        const V4_REQUIRED: [&str; 17] = [
             "VFIO_LEASE_SCHEMA",
             "LEASE_STATE",
             "DOMAIN_ID",
@@ -1501,13 +1811,17 @@ impl VfioLeaseRecord {
             "FLEET_POLICY_SHA256",
             "AUTHORIZED_AT_UNIX",
             "AUTHORIZATION_NOT_AFTER_UNIX",
+            "STORAGE_CONTROLLER_BDF",
+            "STORAGE_BLOCK_NAME",
+            "STORAGE_APERTURE",
+            "STORAGE_GENERATION",
         ];
         let schema = launch_plan_value(&values, "VFIO_LEASE_SCHEMA", label)?;
         let release_binding = match schema {
-            "3" if values.len() == V3_REQUIRED.len()
+            "4" if values.len() == V4_REQUIRED.len()
                 && !values
                     .keys()
-                    .any(|key| !V3_REQUIRED.contains(&key.as_str())) =>
+                    .any(|key| !V4_REQUIRED.contains(&key.as_str())) =>
             {
                 Some(VfioReleaseBinding::new(
                     launch_plan_value(&values, "RELEASE_MANIFEST_SHA256", label)?,
@@ -1584,7 +1898,7 @@ impl VfioLeaseRecord {
         {
             bail!("{label} driver-override snapshot does not match original drivers");
         }
-        Ok(Self {
+        let mut record = Self {
             state,
             domain_id,
             dvm_guest_cid,
@@ -1592,7 +1906,30 @@ impl VfioLeaseRecord {
             original_drivers,
             original_driver_overrides,
             release_binding,
-        })
+            storage_binding: None,
+        };
+        let storage_controller = launch_plan_value(&values, "STORAGE_CONTROLLER_BDF", label)?;
+        let storage_block = launch_plan_value(&values, "STORAGE_BLOCK_NAME", label)?;
+        let storage_aperture = launch_plan_value(&values, "STORAGE_APERTURE", label)?;
+        let storage_generation = launch_plan_value(&values, "STORAGE_GENERATION", label)?
+            .parse::<u64>()
+            .context("invalid STORAGE_GENERATION")?;
+        match (
+            storage_controller,
+            storage_block,
+            storage_aperture,
+            storage_generation,
+        ) {
+            ("none", "none", "none", 0) => {}
+            (controller, block, aperture, generation) if generation != 0 => {
+                let parsed_state = record.state;
+                record.state = VfioLeaseState::Prepared;
+                record.bind_storage_handoff(controller, block, Path::new(aperture), generation)?;
+                record.state = parsed_state;
+            }
+            _ => bail!("incomplete storage handoff binding in {label}"),
+        }
+        Ok(record)
     }
 }
 
@@ -2269,6 +2606,7 @@ pub struct ProbeResult {
     pub inventory_count: u32,
     pub driver_inventory: DvmDriverInventory,
     pub display_evidence: Option<DvmDisplayEvidence>,
+    pub block_evidence: Option<DvmBlockEvidence>,
 }
 
 /// DVM-local driver binding snapshot. These values prove only that the Linux
@@ -2280,6 +2618,21 @@ pub struct DvmDriverInventory {
     pub virtio_gpu_bound: bool,
     pub display_driver_bound: bool,
     pub display_relay_ready: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DvmBlockEvidence {
+    pub generation: u64,
+    pub driver: String,
+    pub pci_vendor: u16,
+    pub pci_device: u16,
+    pub guest_pci_bdf: String,
+    pub block_name: String,
+    pub capacity_sectors: u64,
+    pub logical_block_size: u32,
+    pub physical_block_size: u32,
+    pub features: u64,
+    pub read_only: bool,
 }
 
 /// One fresh, relay-produced physical page-flip sample returned through the
@@ -2902,13 +3255,128 @@ impl HostControlListener {
         };
         let display = request(connection, 4, "display-evidence-v2")?;
         let display_evidence = parse_display_evidence(&display)?;
+        let block = request(connection, 5, "block-evidence-v1")?;
+        let block_evidence = parse_block_evidence(&block)?;
         Ok(ProbeResult {
             peer_cid: self.expected_dvm_cid,
             inventory_count,
             driver_inventory,
             display_evidence,
+            block_evidence,
         })
     }
+}
+
+fn parse_block_evidence(fields: &BTreeMap<String, String>) -> Result<Option<DvmBlockEvidence>> {
+    const REQUIRED: [&str; 14] = [
+        "id",
+        "op",
+        "status",
+        "generation",
+        "driver",
+        "pci-vendor",
+        "pci-device",
+        "guest-pci-bdf",
+        "block-name",
+        "capacity-sectors",
+        "logical-block-size",
+        "physical-block-size",
+        "features",
+        "read-only",
+    ];
+    if !has_exact_fields(fields, &REQUIRED)
+        || fields.get("op") != Some(&"block-evidence-v1".to_owned())
+    {
+        bail!("invalid Linux DVM block evidence response");
+    }
+    match fields.get("status").map(String::as_str) {
+        Some("unavailable") => {
+            for key in [
+                "generation",
+                "capacity-sectors",
+                "logical-block-size",
+                "physical-block-size",
+            ] {
+                if fields.get(key).map(String::as_str) != Some("0") {
+                    bail!("nonzero field in unavailable Linux DVM block evidence");
+                }
+            }
+            if fields.get("driver").map(String::as_str) != Some("missing")
+                || fields.get("pci-vendor").map(String::as_str) != Some("0000")
+                || fields.get("pci-device").map(String::as_str) != Some("0000")
+                || fields.get("guest-pci-bdf").map(String::as_str) != Some("none")
+                || fields.get("block-name").map(String::as_str) != Some("none")
+                || fields.get("features").map(String::as_str) != Some("0000000000000000")
+                || fields.get("read-only").map(String::as_str) != Some("no")
+            {
+                bail!("invalid unavailable Linux DVM block evidence sentinel");
+            }
+            Ok(None)
+        }
+        Some("ok") => {
+            let driver = fields
+                .get("driver")
+                .ok_or_else(|| anyhow!("Linux DVM block evidence omitted driver"))?
+                .to_owned();
+            validate_driver_name(&driver, "Linux DVM block evidence")?;
+            if !matches!(driver.as_str(), "nvme" | "ahci") {
+                bail!("Linux DVM block evidence names an unsupported driver");
+            }
+            let guest_pci_bdf = fields
+                .get("guest-pci-bdf")
+                .ok_or_else(|| anyhow!("Linux DVM block evidence omitted guest PCI BDF"))?
+                .to_owned();
+            validate_pci_bdf(&guest_pci_bdf, "Linux DVM block evidence")?;
+            let block_name = fields
+                .get("block-name")
+                .ok_or_else(|| anyhow!("Linux DVM block evidence omitted block name"))?
+                .to_owned();
+            if block_name.is_empty()
+                || block_name.len() > 64
+                || !block_name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+            {
+                bail!("invalid Linux DVM block evidence block name");
+            }
+            let features = parse_fixed_hex_u64(
+                fields
+                    .get("features")
+                    .ok_or_else(|| anyhow!("Linux DVM block evidence omitted features"))?,
+                "features",
+            )?;
+            let evidence = DvmBlockEvidence {
+                generation: parse_display_u64(fields, "generation")?,
+                driver,
+                pci_vendor: parse_pci_id_field(fields, "pci-vendor")?,
+                pci_device: parse_pci_id_field(fields, "pci-device")?,
+                guest_pci_bdf,
+                block_name,
+                capacity_sectors: parse_display_u64(fields, "capacity-sectors")?,
+                logical_block_size: parse_display_u64(fields, "logical-block-size")?
+                    .try_into()
+                    .context("Linux DVM logical block size exceeds u32")?,
+                physical_block_size: parse_display_u64(fields, "physical-block-size")?
+                    .try_into()
+                    .context("Linux DVM physical block size exceeds u32")?,
+                features,
+                read_only: parse_display_bool(fields, "read-only")?,
+            };
+            if evidence.generation == 0 {
+                bail!("Linux DVM block evidence has a zero generation");
+            }
+            Ok(Some(evidence))
+        }
+        _ => bail!("invalid Linux DVM block evidence status"),
+    }
+}
+
+fn parse_fixed_hex_u64(value: &str, key: &str) -> Result<u64> {
+    if value.len() != 16 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("invalid Linux DVM block evidence {key}");
+    }
+    u64::from_str_radix(value, 16)
+        .with_context(|| format!("invalid Linux DVM block evidence {key}"))
 }
 
 fn parse_display_evidence(fields: &BTreeMap<String, String>) -> Result<Option<DvmDisplayEvidence>> {
@@ -3638,14 +4106,15 @@ mod tests {
         LinuxEvdevKeyEvent, ReleaseAuthorization, RustosInputFrame, SysfsVfioOps, ValidatedLease,
         VfioLeaseRecord, VfioLeaseState, VfioOps, VfioReleaseBinding, acquire_vfio_lease,
         allocate_input_epoch, control_proof, inspect_vfio_lease, inspect_vfio_lease_preflight,
-        parse_display_evidence, parse_linux_evdev_input_event, parse_message, reset_vfio_group,
-        restore_vfio_lease, validate_hello, validate_host_display_assignment,
-        validate_physical_display_assignment, validate_reset_scope_assignment,
+        parse_block_evidence, parse_display_evidence, parse_linux_evdev_input_event, parse_message,
+        reset_vfio_group, restore_vfio_lease, validate_hello, validate_host_display_assignment,
+        validate_physical_display_assignment, validate_physical_storage_assignment,
+        validate_physical_storage_identity, validate_reset_scope_assignment,
         validate_vfio_bind_dma_quiescence,
     };
     use anyhow::Result;
 
-    const VALID: &str = "CONTROL_SCHEMA=1\nCONTROL_PROTOCOL=agent-v1\nCONTROL_STATE=control\nCONTROL_TRANSPORT=kvm-vsock\nCONTROL_AUTHENTICATION=dvm-agent-hmac-sha256-v1\nCONTROL_CAPABILITIES=health,device-inventory,driver-inventory,display-evidence-v2,input-stream\n";
+    const VALID: &str = "CONTROL_SCHEMA=1\nCONTROL_PROTOCOL=agent-v1\nCONTROL_STATE=control\nCONTROL_TRANSPORT=kvm-vsock\nCONTROL_AUTHENTICATION=dvm-agent-hmac-sha256-v1\nCONTROL_CAPABILITIES=health,device-inventory,driver-inventory,display-evidence-v2,block-evidence-v1,input-stream\n";
 
     #[test]
     fn relay_epochs_are_monotonic_and_fail_closed_before_reuse() {
@@ -3667,6 +4136,7 @@ mod tests {
                 "device-inventory",
                 "driver-inventory",
                 "display-evidence-v2",
+                "block-evidence-v1",
                 "input-stream"
             ]
         );
@@ -3685,12 +4155,12 @@ mod tests {
     #[test]
     fn hello_is_bound_to_the_exact_control_contract() {
         let contract = ControlContract::parse(VALID, "test").unwrap();
-        let hello = "HELLO\nrole=linux-driver-domain\nprotocol=agent-v1\nstate=control\ntransport=kvm-vsock\nauthentication=dvm-agent-hmac-sha256-v1\ncapabilities=health,device-inventory,driver-inventory,display-evidence-v2,input-stream";
+        let hello = "HELLO\nrole=linux-driver-domain\nprotocol=agent-v1\nstate=control\ntransport=kvm-vsock\nauthentication=dvm-agent-hmac-sha256-v1\ncapabilities=health,device-inventory,driver-inventory,display-evidence-v2,block-evidence-v1,input-stream";
         assert!(validate_hello(hello, &contract).is_ok());
         assert!(
             validate_hello(
                 &hello.replace(
-                    "health,device-inventory,driver-inventory,display-evidence-v2,input-stream",
+                    "health,device-inventory,driver-inventory,display-evidence-v2,block-evidence-v1,input-stream",
                     "health"
                 ),
                 &contract
@@ -3704,7 +4174,7 @@ mod tests {
     fn control_secret_and_proof_bind_each_session() {
         assert!(ControlSecret::from_bytes([0; CONTROL_SECRET_BYTES]).is_err());
         let secret = ControlSecret::from_bytes([0x5a; CONTROL_SECRET_BYTES]).unwrap();
-        let hello = "HELLO\nrole=linux-driver-domain\nprotocol=agent-v1\nstate=control\ntransport=kvm-vsock\nauthentication=dvm-agent-hmac-sha256-v1\ncapabilities=health,device-inventory,driver-inventory,display-evidence-v2,input-stream";
+        let hello = "HELLO\nrole=linux-driver-domain\nprotocol=agent-v1\nstate=control\ntransport=kvm-vsock\nauthentication=dvm-agent-hmac-sha256-v1\ncapabilities=health,device-inventory,driver-inventory,display-evidence-v2,block-evidence-v1,input-stream";
         let first = control_proof(&secret, &[1; CONTROL_SECRET_BYTES], hello).unwrap();
         assert_eq!(
             first,
@@ -3829,21 +4299,56 @@ mod tests {
     }
 
     #[test]
+    fn block_evidence_is_exact_epoch_bound_and_writable() {
+        let policy = DriverDomainPolicy::parse(
+            &format!(
+                "DRIVER_DOMAIN_POLICY_SCHEMA=4\nDOMAIN_ID=linux-dvm-storage0\nQEMU_SHA256={}\nINPUT_TRANSPORT=disabled\nNETWORK_TRANSPORT=disabled\nBLOCK_TRANSPORT=block-ring-msix\nDISPLAY_TRANSPORT=disabled\nSTORAGE_DRIVER=nvme\nSTORAGE_PCI_VENDOR=144d\nSTORAGE_PCI_DEVICE=a80b\nSTORAGE_REQUIRED_FEATURES=flush\nSTORAGE_QUEUE_DEPTH=64\nSTORAGE_DATA_SLOT_BYTES=65536\nSTORAGE_HANDOFF_TIMEOUT_MS=5000\nSTORAGE_RESET_TIMEOUT_MS=5000\n",
+                "a".repeat(64)
+            ),
+            "block-evidence-policy",
+        )
+        .unwrap();
+        let message = parse_message(
+            "RESPONSE\nid=5\nop=block-evidence-v1\nstatus=ok\ngeneration=9\ndriver=nvme\npci-vendor=144d\npci-device=a80b\nguest-pci-bdf=0000:00:04.0\nblock-name=nvme0n1\ncapacity-sectors=1048576\nlogical-block-size=512\nphysical-block-size=4096\nfeatures=0000000000000019\nread-only=no",
+        )
+        .unwrap();
+        let evidence = parse_block_evidence(&message.fields).unwrap().unwrap();
+        policy
+            .physical_storage()
+            .unwrap()
+            .validate_evidence(&evidence, 9, "nvme0n1")
+            .unwrap();
+        assert!(
+            policy
+                .physical_storage()
+                .unwrap()
+                .validate_evidence(&evidence, 10, "nvme0n1")
+                .is_err()
+        );
+
+        let unavailable = parse_message(
+            "RESPONSE\nid=5\nop=block-evidence-v1\nstatus=unavailable\ngeneration=0\ndriver=missing\npci-vendor=0000\npci-device=0000\nguest-pci-bdf=none\nblock-name=none\ncapacity-sectors=0\nlogical-block-size=0\nphysical-block-size=0\nfeatures=0000000000000000\nread-only=no",
+        )
+        .unwrap();
+        assert!(parse_block_evidence(&unavailable.fields).unwrap().is_none());
+    }
+
+    #[test]
     fn input_stream_requires_bounded_exact_key_and_pointer_events() {
         let event =
-            parse_message("EVENT\nid=5\nop=input-stream\ntype=key\ncode=30\nvalue=1").unwrap();
+            parse_message("EVENT\nid=6\nop=input-stream\ntype=key\ncode=30\nvalue=1").unwrap();
         assert_eq!(
             parse_linux_evdev_input_event(&event, INPUT_STREAM_REQUEST_ID, "input-stream").unwrap(),
             super::LinuxEvdevInputEvent::Key(super::LinuxEvdevKeyEvent { code: 30, value: 1 })
         );
         let malformed =
-            parse_message("EVENT\nid=5\nop=input-stream\ntype=key\ncode=768\nvalue=1").unwrap();
+            parse_message("EVENT\nid=6\nop=input-stream\ntype=key\ncode=768\nvalue=1").unwrap();
         assert!(
             parse_linux_evdev_input_event(&malformed, INPUT_STREAM_REQUEST_ID, "input-stream")
                 .is_err()
         );
         let pointer = parse_message(
-            "EVENT\nid=5\nop=input-stream\ntype=pointer\ndx=-4\ndy=2\nwheel-v=1\nwheel-h=0\nbuttons=3",
+            "EVENT\nid=6\nop=input-stream\ntype=pointer\ndx=-4\ndy=2\nwheel-v=1\nwheel-h=0\nbuttons=3",
         )
         .unwrap();
         assert!(
@@ -3851,7 +4356,7 @@ mod tests {
                 .is_ok()
         );
         let invalid_buttons = parse_message(
-            "EVENT\nid=5\nop=input-stream\ntype=pointer\ndx=0\ndy=0\nwheel-v=0\nwheel-h=0\nbuttons=32",
+            "EVENT\nid=6\nop=input-stream\ntype=pointer\ndx=0\ndy=0\nwheel-v=0\nwheel-h=0\nbuttons=32",
         )
         .unwrap();
         assert!(
@@ -3863,7 +4368,7 @@ mod tests {
             .is_err()
         );
         let position = parse_message(
-            "EVENT\nid=5\nop=input-stream\ntype=pointer-position\nx=800\ny=450\nwheel-v=0\nwheel-h=0\nbuttons=0",
+            "EVENT\nid=6\nop=input-stream\ntype=pointer-position\nx=800\ny=450\nwheel-v=0\nwheel-h=0\nbuttons=0",
         )
         .unwrap();
         assert!(
@@ -3871,7 +4376,7 @@ mod tests {
                 .is_ok()
         );
         let invalid_position = parse_message(
-            "EVENT\nid=5\nop=input-stream\ntype=pointer-position\nx=1600\ny=450\nwheel-v=0\nwheel-h=0\nbuttons=0",
+            "EVENT\nid=6\nop=input-stream\ntype=pointer-position\nx=1600\ny=450\nwheel-v=0\nwheel-h=0\nbuttons=0",
         )
         .unwrap();
         assert!(
@@ -3956,6 +4461,34 @@ mod tests {
             "wrong-vendor",
         )
         .is_err());
+    }
+
+    #[test]
+    fn storage_policy_binds_exact_block_abi_and_driver() {
+        let policy = DriverDomainPolicy::parse(
+            &format!(
+                "DRIVER_DOMAIN_POLICY_SCHEMA=4\nDOMAIN_ID=linux-dvm-storage0\nQEMU_SHA256={}\nINPUT_TRANSPORT=disabled\nNETWORK_TRANSPORT=disabled\nBLOCK_TRANSPORT=block-ring-msix\nDISPLAY_TRANSPORT=disabled\nSTORAGE_DRIVER=nvme\nSTORAGE_PCI_VENDOR=144d\nSTORAGE_PCI_DEVICE=a80b\nSTORAGE_REQUIRED_FEATURES=flush\nSTORAGE_QUEUE_DEPTH=64\nSTORAGE_DATA_SLOT_BYTES=65536\nSTORAGE_HANDOFF_TIMEOUT_MS=5000\nSTORAGE_RESET_TIMEOUT_MS=5000\n",
+                "a".repeat(64)
+            ),
+            "storage-policy",
+        )
+        .unwrap();
+        assert_eq!(
+            policy.transport_for(DeviceClass::Block),
+            DeviceTransport::BlockRingMsix
+        );
+        let storage = policy.physical_storage().unwrap();
+        assert_eq!(storage.driver(), "nvme");
+        assert_eq!(storage.pci_vendor(), 0x144d);
+        assert_eq!(storage.pci_device(), 0xa80b);
+        assert_eq!(storage.handoff_timeout_ms(), 5000);
+        assert_eq!(storage.reset_timeout_ms(), 5000);
+
+        let wrong_geometry = format!(
+            "DRIVER_DOMAIN_POLICY_SCHEMA=4\nDOMAIN_ID=linux-dvm-storage0\nQEMU_SHA256={}\nINPUT_TRANSPORT=disabled\nNETWORK_TRANSPORT=disabled\nBLOCK_TRANSPORT=block-ring-msix\nDISPLAY_TRANSPORT=disabled\nSTORAGE_DRIVER=nvme\nSTORAGE_PCI_VENDOR=144d\nSTORAGE_PCI_DEVICE=a80b\nSTORAGE_REQUIRED_FEATURES=flush\nSTORAGE_QUEUE_DEPTH=63\nSTORAGE_DATA_SLOT_BYTES=65536\nSTORAGE_HANDOFF_TIMEOUT_MS=5000\nSTORAGE_RESET_TIMEOUT_MS=5000\n",
+            "a".repeat(64)
+        );
+        assert!(DriverDomainPolicy::parse(&wrong_geometry, "storage-policy").is_err());
     }
 
     #[test]
@@ -4174,6 +4707,51 @@ mod tests {
     }
 
     #[test]
+    fn physical_storage_assignment_is_one_exact_signed_controller() {
+        let sysfs = TestSysfs::new(&[(21, &["0000:04:00.0"])]);
+        let lease = ValidatedLease {
+            domain_id: "linux-dvm-storage0".to_owned(),
+            dvm_guest_cid: 6,
+            iommu_group: 21,
+            pci_bdfs: vec!["0000:04:00.0".to_owned()],
+        };
+        let policy = DriverDomainPolicy::parse(
+            &format!(
+                "DRIVER_DOMAIN_POLICY_SCHEMA=4\nDOMAIN_ID=linux-dvm-storage0\nQEMU_SHA256={}\nINPUT_TRANSPORT=disabled\nNETWORK_TRANSPORT=disabled\nBLOCK_TRANSPORT=block-ring-msix\nDISPLAY_TRANSPORT=disabled\nSTORAGE_DRIVER=nvme\nSTORAGE_PCI_VENDOR=144d\nSTORAGE_PCI_DEVICE=a80b\nSTORAGE_REQUIRED_FEATURES=flush\nSTORAGE_QUEUE_DEPTH=64\nSTORAGE_DATA_SLOT_BYTES=65536\nSTORAGE_HANDOFF_TIMEOUT_MS=5000\nSTORAGE_RESET_TIMEOUT_MS=5000\n",
+                "a".repeat(64)
+            ),
+            "physical-storage-test",
+        )
+        .unwrap();
+        let storage = policy.physical_storage().unwrap();
+        sysfs.write_pci_attr("0000:04:00.0", "vendor", "0x144d\n");
+        sysfs.write_pci_attr("0000:04:00.0", "device", "0xa80b\n");
+        sysfs.write_pci_attr("0000:04:00.0", "class", "0x010802\n");
+        sysfs.bind_driver("0000:04:00.0", "nvme");
+        assert_eq!(
+            validate_physical_storage_assignment(&lease, sysfs.path(), storage).unwrap(),
+            "0000:04:00.0"
+        );
+
+        sysfs.bind_driver("0000:04:00.0", "vfio-pci");
+        assert_eq!(
+            validate_physical_storage_identity(&lease, sysfs.path(), storage).unwrap(),
+            "0000:04:00.0"
+        );
+        assert!(validate_physical_storage_assignment(&lease, sysfs.path(), storage).is_err());
+
+        sysfs.write_pci_attr("0000:04:00.0", "class", "0x010601\n");
+        assert!(validate_physical_storage_identity(&lease, sysfs.path(), storage).is_err());
+        let with_companion = ValidatedLease {
+            pci_bdfs: vec!["0000:04:00.0".to_owned(), "0000:04:00.1".to_owned()],
+            ..lease
+        };
+        assert!(
+            validate_physical_storage_identity(&with_companion, sysfs.path(), storage).is_err()
+        );
+    }
+
+    #[test]
     fn vfio_acquire_and_restore_are_transactional() {
         let lease = validated_lease(&["0000:02:00.0", "0000:02:00.1"]);
         let mut ops = FakeVfioOps::with_drivers(&[
@@ -4335,6 +4913,7 @@ mod tests {
             )]),
             original_driver_overrides: BTreeMap::from([("0000:02:00.0".to_owned(), String::new())]),
             release_binding: Some(release_binding()),
+            storage_binding: None,
         };
         store.create_prepared(&record, 150).unwrap();
         assert_eq!(
@@ -4346,6 +4925,27 @@ mod tests {
             store.load("linux-dvm-net0").unwrap().state,
             VfioLeaseState::Active
         );
+        store.remove("linux-dvm-net0").unwrap();
+    }
+
+    #[test]
+    fn durable_storage_lease_binds_exact_aperture_epoch() {
+        let root = TestSysfs::new(&[]);
+        let store = FileLeaseStore::new(root.path().join("leases"));
+        let lease = validated_lease(&["0000:02:00.0"]);
+        let ops = FakeVfioOps::with_drivers(&[("0000:02:00.0", Some("nvme"))]);
+        let mut record = inspect_vfio_lease(&lease, &ops, release_binding()).unwrap();
+        let aperture = root.path().join("block.ivshmem");
+        record
+            .bind_storage_handoff("0000:02:00.0", "nvme0n1", &aperture, 7)
+            .unwrap();
+        store.create_prepared(&record, 150).unwrap();
+        let loaded = store.load("linux-dvm-net0").unwrap();
+        let storage = loaded.storage_handoff().unwrap();
+        assert_eq!(storage.controller_bdf(), "0000:02:00.0");
+        assert_eq!(storage.block_name(), "nvme0n1");
+        assert_eq!(storage.aperture_path(), aperture);
+        assert_eq!(storage.generation(), 7);
         store.remove("linux-dvm-net0").unwrap();
     }
 

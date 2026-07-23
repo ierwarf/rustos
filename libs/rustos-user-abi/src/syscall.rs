@@ -34,7 +34,6 @@ pub const SYS_RUSTOS_DRIVER_PROBE_ALIAS_BROKER: u64 = 0x5255_0021;
 pub const SYS_RUSTOS_SERVICE_DRIVER_RESOURCE_BROKER: u64 = 0x5255_0022;
 pub const SYS_RUSTOS_NET_BROKER: u64 = 0x5255_0023;
 pub const SYS_RUSTOS_BLOCK_BROKER: u64 = 0x5255_0024;
-pub const SYS_RUSTOS_STORAGE_LIST_BROKER: u64 = 0x5255_0025;
 pub const SYS_RUSTOS_INPUT_STATS_BROKER: u64 = 0x5255_0026;
 pub const SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER: u64 = 0x5255_0027;
 pub const SYS_RUSTOS_PROC_MAP_DATA_BROKER: u64 = 0x5255_0028;
@@ -50,7 +49,6 @@ pub const SYS_RUSTOS_PROC_MAP_FILE_BATCH_BROKER: u64 = 0x5255_0030;
 pub const SYS_RUSTOS_PROC_SET_LINUX_RUNTIME_BROKER: u64 = 0x5255_0031;
 pub const SYS_RUSTOS_DEVICE_OPEN_BROKER: u64 = 0x5255_0032;
 pub const SYS_RUSTOS_INPUT_INGEST_BROKER: u64 = 0x5255_0033;
-pub const SYS_RUSTOS_BOOT_EXTENT_BROKER: u64 = 0x5255_0034;
 pub const SYS_RUSTOS_IPC_TRY_RECV: u64 = 0x5255_0035;
 pub const SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER: u64 = 0x5255_0036;
 pub const SYS_RUSTOS_DRIVER_SYMBOL_EVENT_BROKER: u64 = 0x5255_0037;
@@ -75,6 +73,18 @@ pub const SYS_RUSTOS_WAITSET_SIGNAL_BROKER: u64 = 0x5255_003f;
 /// this only to obtain opaque random bytes; Linux flag and length policy stays
 /// in syscalld and object admission stays in the owning service.
 pub const SYS_RUSTOS_ENTROPY_BROKER: u64 = 0x5255_0040;
+/// Vfsd-only access to exact immutable entries in the signed early-system
+/// image. This is file bootstrap, never a physical-block or namespace ABI.
+pub const SYS_RUSTOS_EARLY_SYSTEM_BROKER: u64 = 0x5255_0041;
+/// Verifies that one kernel-stamped sender PID is the current live owner of a
+/// named service endpoint. Policy services use this only for explicit
+/// service-to-service delegation; direct callers must still bind claimed
+/// subject PID/TID fields to `IPC_RECV_WITH_SENDER`.
+pub const SYS_RUSTOS_IPC_VALIDATE_SERVICE_OWNER: u64 = 0x5255_0042;
+/// Rootd-only proof that one suspended target was minted for the exact
+/// kernel-stamped loader requester and still carries that unconsumed
+/// activation authority.
+pub const SYS_RUSTOS_PROC_VALIDATE_DEFERRED_SPAWN_BROKER: u64 = 0x5255_0043;
 /// Irreversibly removes the caller's base System scheduling admission.
 ///
 /// This is deliberately a self-demotion only: it never accepts a requested
@@ -118,6 +128,11 @@ pub const IPC_SERVICE_SESSIOND: u64 = 11;
 pub const IPC_SERVICE_PAGERD: u64 = 12;
 pub const IPC_SERVICE_SERVICE_DRIVERD: u64 = 13;
 pub const IPC_SERVICE_UISERVER: u64 = 14;
+/// Identity-only publication for the current rootd-supervised init policy
+/// process.  The endpoint is not a request API: it gives brokers a
+/// restart-sensitive, kernel-verified owner identity for privileged launch
+/// authorization.
+pub const IPC_SERVICE_INITD: u64 = 15;
 pub const IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY: u64 = 1 << 0;
 pub const IPC_SERVICE_CAP_VFS_POLICY: u64 = 1 << 1;
 pub const IPC_SERVICE_CAP_NET_POLICY: u64 = 1 << 2;
@@ -132,6 +147,7 @@ pub const IPC_SERVICE_CAP_SESSION_POLICY: u64 = 1 << 10;
 pub const IPC_SERVICE_CAP_PAGER_POLICY: u64 = 1 << 11;
 pub const IPC_SERVICE_CAP_SERVICE_DRIVER_POLICY: u64 = 1 << 12;
 pub const IPC_SERVICE_CAP_UI_POLICY: u64 = 1 << 13;
+pub const IPC_SERVICE_CAP_INIT_POLICY: u64 = 1 << 14;
 pub const IPC_SERVICE_CAP_BOOTSTRAP_POLICY: u64 = IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY
     | IPC_SERVICE_CAP_VFS_POLICY
     | IPC_SERVICE_CAP_NET_POLICY
@@ -246,7 +262,7 @@ pub const MM_BROKER_FD_RIGHT_READ: u64 = 1 << 0;
 pub const MM_BROKER_FD_RIGHT_WRITE: u64 = 1 << 1;
 pub const MM_BROKER_FD_RIGHT_MAP: u64 = 1 << 2;
 pub const MM_BROKER_PATH_CAPACITY: usize = 128;
-pub const VFS_IPC_ABI_VERSION: u16 = 3;
+pub const VFS_IPC_ABI_VERSION: u16 = 4;
 pub const VFS_IPC_OP_OPENAT: u16 = 1;
 pub const VFS_IPC_OP_CLOSE: u16 = 2;
 pub const VFS_IPC_OP_DUP: u16 = 3;
@@ -326,7 +342,13 @@ pub struct WaitSetInterestWire {
 }
 pub const VFS_IPC_PATH_CAPACITY: usize = 512;
 pub const VFS_IPC_REQUEST_PAYLOAD_CAPACITY: usize = 512;
-pub const VFS_IPC_PAYLOAD_CAPACITY: usize = 32 * 1024;
+/// Fixed bytes preceding `VfsIpcResponse::payload` in the version-4 wire ABI.
+///
+/// Keeping the response exactly one maximum inline IPC message lets a remote
+/// file mapping consume one transport reply per kernel copy window without
+/// creating a second shared-memory data plane.
+pub const VFS_IPC_RESPONSE_HEADER_BYTES: usize = 40;
+pub const VFS_IPC_PAYLOAD_CAPACITY: usize = IPC_MAX_INLINE_BYTES - VFS_IPC_RESPONSE_HEADER_BYTES;
 pub const VFS_IPC_HANDLE_KIND_FILE: u16 = 1;
 pub const VFS_IPC_HANDLE_KIND_DIR: u16 = 2;
 pub const VFS_IPC_HANDLE_KIND_DEVICE: u16 = 3;
@@ -407,10 +429,24 @@ pub const VFS_LIFECYCLE_EXEC_CLOEXEC: u16 = 2;
 pub const VFS_LIFECYCLE_EXIT: u16 = 3;
 pub const VFS_LIFECYCLE_DUP: u16 = 4;
 pub const VFS_LIFECYCLE_CLOSE: u16 = 5;
-pub const BLOCK_BROKER_ABI_VERSION: u16 = 1;
-pub const BLOCK_BROKER_OP_BOOT_INFO: u16 = 1;
-pub const BLOCK_BROKER_OP_BOOT_READ: u16 = 2;
+pub const BLOCK_BROKER_ABI_VERSION: u16 = 3;
+pub const BLOCK_BROKER_OP_DVM_INFO: u16 = 1;
+pub const BLOCK_BROKER_OP_DVM_SUBMIT_READ: u16 = 2;
+pub const BLOCK_BROKER_OP_DVM_SUBMIT_WRITE: u16 = 3;
+pub const BLOCK_BROKER_OP_DVM_SUBMIT_FLUSH: u16 = 4;
+pub const BLOCK_BROKER_OP_DVM_COLLECT: u16 = 5;
+pub const BLOCK_BROKER_OP_DVM_CANCEL: u16 = 6;
+pub const BLOCK_BROKER_OP_DVM_WAIT: u16 = 7;
+pub const BLOCK_BROKER_FLAG_FUA: u32 = 1 << 0;
+pub const BLOCK_BROKER_KNOWN_FLAGS: u32 = BLOCK_BROKER_FLAG_FUA;
+pub const BLOCK_BROKER_INFO_FLAG_READ_ONLY: u32 = 1 << 0;
 pub const BLOCK_BROKER_MAX_IO_BYTES: usize = 64 * 1024;
+pub const EARLY_SYSTEM_BROKER_ABI_VERSION: u16 = 1;
+pub const EARLY_SYSTEM_BROKER_OP_INFO: u16 = 1;
+pub const EARLY_SYSTEM_BROKER_OP_READ: u16 = 2;
+pub const EARLY_SYSTEM_BROKER_PATH_CAPACITY: usize = 96;
+pub const EARLY_SYSTEM_BROKER_MAX_IO_BYTES: usize = 4096;
+pub const BLOCK_BROKER_WAIT_MAX_TIMEOUT_MS: u64 = 30_000;
 pub const LINUX_STAT_SIZE: usize = 0x90;
 pub const LINUX_STATX_SIZE: usize = 0x100;
 pub const LINUX_RLIMIT_SIZE: usize = 0x10;
@@ -419,10 +455,24 @@ pub const LINUX_CPUSET_BYTES: usize = 8;
 pub const LINUX_DEFAULT_STACK_RLIMIT_BYTES: u64 = 8 * 1024 * 1024;
 pub const LINUX_TIMESPEC_SIZE: usize = 16;
 pub const LINUX_SIGACTION_SIZE: usize = 32;
-pub const LOADER_REQUEST_ABI_VERSION: u16 = 1;
+pub const LOADER_REQUEST_ABI_VERSION: u16 = 2;
 pub const LOADER_OP_SPAWN_EXEC: u16 = 1;
 pub const LOADER_OP_EXEC_TARGET: u16 = 2;
 pub const LOADER_OP_ACTIVATE: u16 = 3;
+
+/// Static half of the loader authority contract. Services and ring0 must pair
+/// this role matrix with a live kernel-owned service publication check at the
+/// moment of admission/commit; a numeric PID or endpoint is never authority.
+pub const fn loader_service_role_allows_operation(op: u16, service_id: u64) -> bool {
+    match op {
+        LOADER_OP_SPAWN_EXEC => matches!(
+            service_id,
+            IPC_SERVICE_ROOTD | IPC_SERVICE_INITD | IPC_SERVICE_SESSIOND
+        ),
+        LOADER_OP_EXEC_TARGET => service_id == IPC_SERVICE_PROCD,
+        _ => false,
+    }
+}
 pub const LOADER_SPAWN_EXEC_PATH_CAPACITY: usize = 256;
 pub const LOADER_SPAWN_ARG_BYTES: usize = 1024;
 pub const LOADER_SPAWN_ENV_BYTES: usize = 2048;
@@ -451,7 +501,13 @@ pub const PROCD_SELECT_SIGNAL_NONE: u16 = 0;
 pub const PROCD_SELECT_SIGNAL_IGNORE: u16 = 1;
 pub const PROCD_SELECT_SIGNAL_TERMINATE: u16 = 2;
 pub const PROCD_SELECT_SIGNAL_HANDLER: u16 = 3;
-pub const PROC_BROKER_ABI_VERSION: u16 = 1;
+pub const PROC_BROKER_ABI_VERSION: u16 = 2;
+/// Lifecycle fan-out is an independent contract. Do not couple its wire
+/// version to process prepare/commit ABI revisions.
+pub const LIFECYCLE_DRAIN_BROKER_ABI_VERSION: u16 = 1;
+/// Root-supervisor termination is versioned independently from every other
+/// process broker operation.
+pub const ROOTD_TERMINATE_BROKER_ABI_VERSION: u16 = 1;
 pub const PROC_BROKER_FORMAT_ELF64: u16 = 1;
 pub const PROC_BROKER_FORMAT_PE64: u16 = 2;
 pub const PROC_BROKER_MAP_READ: u64 = 1 << 0;
@@ -484,14 +540,8 @@ pub const DRIVER_LOAD_POLICY_DISPLAY_PREFERRED_SCANOUT: u64 = 1 << 2;
 pub const DRIVER_LOAD_POLICY_KNOWN_FLAGS: u64 =
     DRIVER_LOAD_POLICY_DISPLAY_PRIMARY | DRIVER_LOAD_POLICY_DISPLAY_FALLBACK;
 pub const STORAGE_LIST_PATH_CAPACITY: usize = 64;
-pub const STORAGE_LIST_MAX_DESCRIPTORS: usize = 16;
 pub const STORAGE_FLAG_READONLY: u32 = 1 << 0;
-pub const STORAGE_AHCI_POLICY_FLAG_DMA_64: u32 = 1 << 0;
-pub const STORAGE_AHCI_POLICY_FLAG_SINGLE_SLOT: u32 = 1 << 1;
-pub const STORAGED_POLICY_ABI_VERSION: u16 = 1;
-pub const BOOT_EXTENT_PATH_CAPACITY: usize = 256;
-pub const BOOT_EXTENT_MAX_EXTENTS: usize = 16;
-pub const BOOT_EXTENT_FLAG_READONLY: u32 = 1 << 0;
+pub const STORAGE_TRANSPORT_DVM_BLOCK: u32 = 4;
 pub const LIFECYCLE_DRAIN_MAX_EVENTS: usize = 32;
 pub const LIFECYCLE_EVENT_EXIT: u16 = 1;
 pub const LIFECYCLE_EVENT_FORK: u16 = 2;
@@ -587,10 +637,18 @@ pub const COMMERCIAL_MAX_INPUTD_OP_POINTER_SURFACE_POLICY: u16 = 11;
 pub const COMMERCIAL_MAX_STORAGED_OP_BLOCK_INVENTORY: u16 = 1;
 pub const COMMERCIAL_MAX_STORAGED_OP_PARTITION_SCAN: u16 = 2;
 pub const COMMERCIAL_MAX_STORAGED_OP_ROOT_VOLUME_SELECT: u16 = 3;
-pub const COMMERCIAL_MAX_STORAGED_OP_BOOT_EXTENT_LEASE: u16 = 4;
 pub const COMMERCIAL_MAX_STORAGED_OP_VOLUME_METADATA: u16 = 5;
-pub const COMMERCIAL_MAX_STORAGED_OP_AHCI_POLICY: u16 = 6;
-pub const COMMERCIAL_MAX_STORAGED_OP_NVME_POLICY: u16 = 7;
+pub const COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_INFO: u16 = 8;
+pub const COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_READ: u16 = 9;
+pub const COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_WRITE: u16 = 10;
+pub const COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_FLUSH: u16 = 11;
+pub const COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_READ_BULK: u16 = 12;
+pub const COMMERCIAL_MAX_STORAGED_BLOCK_FLAG_FUA: u64 = 1 << 0;
+/// Fixed bytes preceding `StoragedBulkReadResponse::payload`.
+pub const STORAGED_BULK_READ_RESPONSE_HEADER_BYTES: usize = 80;
+/// The largest block-aligned read reply that fits in one inline IPC message.
+pub const STORAGED_BULK_READ_PAYLOAD_CAPACITY: usize =
+    IPC_MAX_INLINE_BYTES - STORAGED_BULK_READ_RESPONSE_HEADER_BYTES;
 pub const COMMERCIAL_MAX_NETD_OP_SOCKET_NAMESPACE: u16 = 1;
 pub const COMMERCIAL_MAX_NETD_OP_SOCKET_OPTIONS: u16 = 2;
 pub const COMMERCIAL_MAX_NETD_OP_ADDRESS_BIND: u16 = 3;
@@ -814,6 +872,27 @@ impl CommercialMaxProtocolRequest {
             && self.path_len as usize <= self.path.len()
             && self.payload_len as usize <= self.payload.len()
     }
+
+    /// Binds caller-controlled subject fields to the identity stamped by the
+    /// kernel at receive time. A zero identity is never a wildcard.
+    pub fn subject_is_exact_sender(&self, sender_pid: u64, sender_tid: u64) -> bool {
+        identity_is_exact_sender(
+            self.header.subject_pid,
+            self.header.subject_tid,
+            sender_pid,
+            sender_tid,
+        )
+    }
+}
+
+/// Common zero-trust identity rule for service ingress.
+pub const fn identity_is_exact_sender(
+    claimed_pid: u64,
+    claimed_tid: u64,
+    sender_pid: u64,
+    sender_tid: u64,
+) -> bool {
+    claimed_pid != 0 && claimed_tid != 0 && claimed_pid == sender_pid && claimed_tid == sender_tid
 }
 
 #[repr(C)]
@@ -874,6 +953,65 @@ impl CommercialMaxProtocolResponse {
                         || descriptor.reserved0 != 0
                         || descriptor.reserved1 != 0
                 })
+    }
+}
+
+/// Dedicated large reply for storaged reads.
+///
+/// The request keeps using `CommercialMaxProtocolRequest`; only the response
+/// is specialized.  This preserves the generic control ABI while allowing a
+/// block-aligned read to use the full inline IPC budget.  Callers must validate
+/// every binding field before exposing the payload to a filesystem parser.
+#[repr(C)]
+pub struct StoragedBulkReadResponse {
+    pub header: CommercialMaxProtocolHeader,
+    pub status: i32,
+    pub payload_len: u32,
+    pub generation: u64,
+    pub lba: u64,
+    pub block_count: u64,
+    pub reserved0: u64,
+    pub payload: [u8; STORAGED_BULK_READ_PAYLOAD_CAPACITY],
+}
+
+impl StoragedBulkReadResponse {
+    /// A const zero value suitable for a single-owner service response slot.
+    /// The service overwrites the complete header and zeroes the slot before
+    /// every reply, preventing data from a prior caller from leaking.
+    pub const fn zeroed() -> Self {
+        Self {
+            header: CommercialMaxProtocolHeader {
+                version: 0,
+                protocol: 0,
+                op: 0,
+                flags: 0,
+                service_id: 0,
+                subject_pid: 0,
+                subject_tid: 0,
+                ticket: 0,
+            },
+            status: 0,
+            payload_len: 0,
+            generation: 0,
+            lba: 0,
+            block_count: 0,
+            reserved0: 0,
+            payload: [0; STORAGED_BULK_READ_PAYLOAD_CAPACITY],
+        }
+    }
+
+    pub fn is_valid_envelope_for(&self, request: &CommercialMaxProtocolRequest) -> bool {
+        self.header == request.header
+            && self.reserved0 == 0
+            && self.payload_len as usize <= self.payload.len()
+    }
+}
+
+impl Default for StoragedBulkReadResponse {
+    fn default() -> Self {
+        let mut response = Self::zeroed();
+        response.header.version = COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
+        response
     }
 }
 
@@ -952,93 +1090,6 @@ impl Default for StorageBlockDescriptorWire {
             path: [0; STORAGE_LIST_PATH_CAPACITY],
         }
     }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct StoragedAhciPolicyWire {
-    pub abi_version: u16,
-    pub reserved0: u16,
-    pub flags: u32,
-    pub command_slot: u32,
-    pub prdt_entries: u32,
-    pub max_transfer_bytes: u32,
-    pub logical_block_size: u32,
-    pub wait_spins: u32,
-    pub max_ports: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct StoragedNvmePolicyWire {
-    pub abi_version: u16,
-    pub reserved0: u16,
-    pub flags: u32,
-    pub admin_queue_depth: u32,
-    pub io_queue_depth: u32,
-    pub max_transfer_bytes: u32,
-    pub page_bytes: u32,
-    pub wait_spins: u32,
-    pub max_namespaces: u32,
-    pub reserved1: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct StorageListBrokerArgs {
-    pub abi_version: u16,
-    pub reserved0: u16,
-    pub reserved1: u32,
-    pub out_descriptors_ptr: u64,
-    pub out_capacity: u32,
-    pub reserved2: u32,
-    pub out_count_ptr: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct BootExtentWire {
-    pub disk_offset: u64,
-    pub len: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct BootExtentLeaseWire {
-    pub path_len: u32,
-    pub flags: u32,
-    pub file_len: u64,
-    pub hash_or_generation: u64,
-    pub extent_count: u32,
-    pub reserved0: u32,
-    pub extents: [BootExtentWire; BOOT_EXTENT_MAX_EXTENTS],
-    pub path: [u8; BOOT_EXTENT_PATH_CAPACITY],
-}
-
-impl Default for BootExtentLeaseWire {
-    fn default() -> Self {
-        Self {
-            path_len: 0,
-            flags: 0,
-            file_len: 0,
-            hash_or_generation: 0,
-            extent_count: 0,
-            reserved0: 0,
-            extents: [BootExtentWire::default(); BOOT_EXTENT_MAX_EXTENTS],
-            path: [0; BOOT_EXTENT_PATH_CAPACITY],
-        }
-    }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct RustosBootExtentBrokerArgs {
-    pub abi_version: u16,
-    pub flags: u16,
-    pub reserved0: u32,
-    pub path_ptr: u64,
-    pub path_len: u64,
-    pub out_lease_ptr: u64,
 }
 
 #[repr(C)]
@@ -1247,13 +1298,67 @@ pub struct LifecycleDrainBrokerArgs {
 pub struct RustosBlockBrokerArgs {
     pub abi_version: u16,
     pub op: u16,
-    pub reserved0: u32,
+    pub flags: u32,
     pub lba: u64,
     pub block_count: u64,
     pub buffer_ptr: u64,
     pub buffer_len: u64,
-    pub out_logical_block_size_ptr: u64,
-    pub out_block_count_ptr: u64,
+    pub timeout_ms: u64,
+    pub reserved0: u64,
+    pub ticket: DvmBlockTicketWire,
+    pub out_ticket_ptr: u64,
+    pub out_info_ptr: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EarlySystemBrokerArgs {
+    pub abi_version: u16,
+    pub op: u16,
+    pub path_len: u32,
+    pub offset: u64,
+    pub buffer_ptr: u64,
+    pub buffer_len: u64,
+    pub out_file_len_ptr: u64,
+    pub reserved0: u64,
+    pub path: [u8; EARLY_SYSTEM_BROKER_PATH_CAPACITY],
+}
+
+impl Default for EarlySystemBrokerArgs {
+    fn default() -> Self {
+        Self {
+            abi_version: 0,
+            op: 0,
+            path_len: 0,
+            offset: 0,
+            buffer_ptr: 0,
+            buffer_len: 0,
+            out_file_len_ptr: 0,
+            reserved0: 0,
+            path: [0; EARLY_SYSTEM_BROKER_PATH_CAPACITY],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DvmBlockTicketWire {
+    pub generation: u64,
+    pub request_id: u64,
+    pub data_slot: u32,
+    pub reserved0: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DvmBlockInfoWire {
+    pub generation: u64,
+    pub capacity_sectors: u64,
+    pub features: u64,
+    pub logical_block_size: u32,
+    pub physical_block_size: u32,
+    pub flags: u32,
+    pub reserved0: u32,
 }
 
 #[repr(C)]
@@ -2002,7 +2107,9 @@ pub struct RustosProcExecTargetBrokerArgs {
     pub envp_ptr: u64,
     pub console_session: u64,
     pub weight_micros: u64,
-    pub reserved1: u64,
+    /// Kernel-stamped sender PID observed by loaderd.  Ring0 revalidates that
+    /// this process still owns the procd endpoint at commit time.
+    pub requester_pid: u64,
 }
 
 #[repr(C)]
@@ -2184,7 +2291,9 @@ pub struct RustosProcCommitBrokerArgs {
     pub flags: u64,
     pub console_session: u64,
     pub weight_micros: u64,
-    pub reserved0: u64,
+    /// Kernel-stamped immediate caller of loaderd's spawn request. For a
+    /// deferred spawn this identity becomes the sole activation authority.
+    pub requester_pid: u64,
 }
 
 #[repr(C)]
@@ -2194,6 +2303,18 @@ pub struct RustosProcActivateBrokerArgs {
     pub reserved0: u16,
     pub flags: u32,
     pub target_pid: u64,
+    /// Exact process that requested the corresponding deferred spawn.
+    pub requester_pid: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RustosProcValidateDeferredSpawnBrokerArgs {
+    pub abi_version: u16,
+    pub reserved0: u16,
+    pub flags: u32,
+    pub target_pid: u64,
+    pub requester_pid: u64,
 }
 
 #[repr(C)]
@@ -2288,7 +2409,9 @@ pub struct LoaderSpawnRequest {
     pub env_count: u16,
     pub argv_bytes_len: u32,
     pub env_bytes_len: u32,
-    pub reserved0: u64,
+    /// Immediate caller PID. Loaderd must compare this with the kernel-stamped
+    /// IPC sender before acting on any target PID or exec ticket.
+    pub requester_pid: u64,
     pub exec_path: [u8; LOADER_SPAWN_EXEC_PATH_CAPACITY],
     pub argv_bytes: [u8; LOADER_SPAWN_ARG_BYTES],
     pub env_bytes: [u8; LOADER_SPAWN_ENV_BYTES],
@@ -2310,11 +2433,17 @@ impl Default for LoaderSpawnRequest {
             env_count: 0,
             argv_bytes_len: 0,
             env_bytes_len: 0,
-            reserved0: 0,
+            requester_pid: 0,
             exec_path: [0; LOADER_SPAWN_EXEC_PATH_CAPACITY],
             argv_bytes: [0; LOADER_SPAWN_ARG_BYTES],
             env_bytes: [0; LOADER_SPAWN_ENV_BYTES],
         }
+    }
+}
+
+impl LoaderSpawnRequest {
+    pub const fn requester_is_exact_sender(&self, sender_pid: u64) -> bool {
+        self.requester_pid != 0 && self.requester_pid == sender_pid
     }
 }
 
@@ -2337,6 +2466,17 @@ pub struct RustosIpcWaitServiceEndpointArgs {
     pub service_id: u64,
     pub expected_pid: u64,
     pub timeout_ms: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RustosIpcValidateServiceOwnerArgs {
+    pub abi_version: u16,
+    pub reserved0: u16,
+    pub flags: u32,
+    pub service_id: u64,
+    pub process_id: u64,
+    pub reserved1: u64,
 }
 
 #[repr(C)]
@@ -2588,16 +2728,22 @@ mod syscall_tests {
     use core::mem::size_of;
 
     use super::{
-        CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, IPC_MAX_INLINE_BYTES,
-        LINUX_RLIMIT_SIZE, LINUX_SIGACTION_SIZE, LINUX_STATX_SIZE, LINUX_TIMESPEC_SIZE,
-        LINUX_UTSNAME_SIZE, LinuxRlimit, LinuxSigActionWire, LinuxSyscallOffloadRequest,
-        LinuxSyscallOffloadResponse, LinuxTimespecWire, LinuxUtsName, NETD_IPC_PAYLOAD_CAPACITY,
-        NETD_IPC_REQUEST_HEADER_SIZE, NETD_IPC_RESPONSE_HEADER_SIZE, NetdIpcRequest,
-        NetdIpcResponse, SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_LINUX_ARCH_PRCTL_POLICY,
-        SYSCALL_OFFLOAD_OP_LINUX_MPROTECT, SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET,
-        SYSCALL_OFFLOAD_OP_LINUX_STATX, SYSCALL_OFFLOAD_PATH_CAPACITY,
-        SYSCALL_OFFLOAD_PAYLOAD_CAPACITY, VFS_IPC_ABI_VERSION, VFS_IPC_OP_OPENAT, VfsIpcRequest,
-        VfsIpcResponse,
+        CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, IPC_ABI_VERSION,
+        IPC_MAX_INLINE_BYTES, IPC_SERVICE_DEVMGRD, IPC_SERVICE_INITD, IPC_SERVICE_PROCD,
+        IPC_SERVICE_ROOTD, IPC_SERVICE_SESSIOND, LINUX_RLIMIT_SIZE, LINUX_SIGACTION_SIZE,
+        LINUX_STATX_SIZE, LINUX_TIMESPEC_SIZE, LINUX_UTSNAME_SIZE, LOADER_OP_ACTIVATE,
+        LOADER_OP_EXEC_TARGET, LOADER_OP_SPAWN_EXEC, LinuxRlimit, LinuxSigActionWire,
+        LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse, LinuxTimespecWire, LinuxUtsName,
+        LoaderSpawnRequest, NETD_IPC_PAYLOAD_CAPACITY, NETD_IPC_REQUEST_HEADER_SIZE,
+        NETD_IPC_RESPONSE_HEADER_SIZE, NetdIpcRequest, NetdIpcResponse,
+        RustosIpcValidateServiceOwnerArgs, STORAGED_BULK_READ_PAYLOAD_CAPACITY,
+        STORAGED_BULK_READ_RESPONSE_HEADER_BYTES, SYSCALL_OFFLOAD_ABI_VERSION,
+        SYSCALL_OFFLOAD_OP_LINUX_ARCH_PRCTL_POLICY, SYSCALL_OFFLOAD_OP_LINUX_MPROTECT,
+        SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET, SYSCALL_OFFLOAD_OP_LINUX_STATX,
+        SYSCALL_OFFLOAD_PATH_CAPACITY, SYSCALL_OFFLOAD_PAYLOAD_CAPACITY, StoragedBulkReadResponse,
+        VFS_IPC_ABI_VERSION, VFS_IPC_OP_OPENAT, VFS_IPC_PAYLOAD_CAPACITY,
+        VFS_IPC_RESPONSE_HEADER_BYTES, VfsIpcRequest, VfsIpcResponse, identity_is_exact_sender,
+        loader_service_role_allows_operation,
     };
 
     #[test]
@@ -2641,11 +2787,108 @@ mod syscall_tests {
     }
 
     #[test]
+    fn service_subject_identity_is_never_a_zero_or_foreign_wildcard() {
+        let mut request = CommercialMaxProtocolRequest::default();
+        assert!(!request.subject_is_exact_sender(17, 19));
+        request.header.subject_pid = 17;
+        request.header.subject_tid = 19;
+        assert!(request.subject_is_exact_sender(17, 19));
+        assert!(!request.subject_is_exact_sender(17, 20));
+        assert!(!identity_is_exact_sender(17, 0, 17, 0));
+    }
+
+    #[test]
+    fn loader_requester_identity_is_bound_to_the_kernel_sender() {
+        let mut request = LoaderSpawnRequest::default();
+        assert!(!request.requester_is_exact_sender(23));
+        request.requester_pid = 23;
+        assert!(request.requester_is_exact_sender(23));
+        assert!(!request.requester_is_exact_sender(29));
+
+        let owner = RustosIpcValidateServiceOwnerArgs {
+            abi_version: IPC_ABI_VERSION,
+            service_id: IPC_SERVICE_DEVMGRD,
+            process_id: 23,
+            ..RustosIpcValidateServiceOwnerArgs::default()
+        };
+        assert_eq!(owner.flags, 0);
+        assert_eq!(owner.reserved0, 0);
+        assert_eq!(owner.reserved1, 0);
+    }
+
+    #[test]
+    fn privileged_loader_operations_have_an_explicit_service_role_matrix() {
+        for service_id in [IPC_SERVICE_ROOTD, IPC_SERVICE_INITD, IPC_SERVICE_SESSIOND] {
+            assert!(loader_service_role_allows_operation(
+                LOADER_OP_SPAWN_EXEC,
+                service_id,
+            ));
+        }
+        assert!(!loader_service_role_allows_operation(
+            LOADER_OP_SPAWN_EXEC,
+            IPC_SERVICE_PROCD,
+        ));
+        assert!(loader_service_role_allows_operation(
+            LOADER_OP_EXEC_TARGET,
+            IPC_SERVICE_PROCD,
+        ));
+        assert!(!loader_service_role_allows_operation(
+            LOADER_OP_EXEC_TARGET,
+            IPC_SERVICE_ROOTD,
+        ));
+        assert!(!loader_service_role_allows_operation(
+            LOADER_OP_ACTIVATE,
+            IPC_SERVICE_ROOTD,
+        ));
+    }
+
+    #[test]
+    fn storaged_bulk_read_response_fills_one_exact_inline_message() {
+        assert_eq!(
+            core::mem::offset_of!(StoragedBulkReadResponse, payload),
+            STORAGED_BULK_READ_RESPONSE_HEADER_BYTES
+        );
+        assert_eq!(
+            STORAGED_BULK_READ_PAYLOAD_CAPACITY,
+            IPC_MAX_INLINE_BYTES - STORAGED_BULK_READ_RESPONSE_HEADER_BYTES
+        );
+        assert_eq!(size_of::<StoragedBulkReadResponse>(), IPC_MAX_INLINE_BYTES);
+    }
+
+    #[test]
+    fn storaged_bulk_read_response_binds_the_complete_request_header() {
+        let mut request = CommercialMaxProtocolRequest::default();
+        request.header.protocol = 5;
+        request.header.op = 12;
+        request.header.ticket = 19;
+        let mut response = StoragedBulkReadResponse::default();
+        response.header = request.header;
+        assert!(response.is_valid_envelope_for(&request));
+
+        response.header.ticket += 1;
+        assert!(!response.is_valid_envelope_for(&request));
+        response.header = request.header;
+        response.reserved0 = 1;
+        assert!(!response.is_valid_envelope_for(&request));
+        response.reserved0 = 0;
+        response.payload_len = (response.payload.len() + 1) as u32;
+        assert!(!response.is_valid_envelope_for(&request));
+    }
+
+    #[test]
     fn statx_offload_messages_fit_inline_ipc_v1() {
         assert!(size_of::<LinuxSyscallOffloadRequest>() <= IPC_MAX_INLINE_BYTES);
         assert!(size_of::<LinuxSyscallOffloadResponse>() <= IPC_MAX_INLINE_BYTES);
         assert!(size_of::<VfsIpcRequest>() <= IPC_MAX_INLINE_BYTES);
-        assert!(size_of::<VfsIpcResponse>() <= IPC_MAX_INLINE_BYTES);
+        assert_eq!(
+            core::mem::offset_of!(VfsIpcResponse, payload),
+            VFS_IPC_RESPONSE_HEADER_BYTES
+        );
+        assert_eq!(size_of::<VfsIpcResponse>(), IPC_MAX_INLINE_BYTES);
+        assert_eq!(
+            VFS_IPC_PAYLOAD_CAPACITY,
+            IPC_MAX_INLINE_BYTES - VFS_IPC_RESPONSE_HEADER_BYTES
+        );
         assert_eq!(LINUX_STATX_SIZE, 0x100);
         assert_eq!(SYSCALL_OFFLOAD_PATH_CAPACITY, 256);
         assert_eq!(SYSCALL_OFFLOAD_PAYLOAD_CAPACITY, 0x200);

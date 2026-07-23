@@ -11,17 +11,20 @@ use rustos_driver_domain_host::{
     LaunchPlan, ReleaseAuthorization, SysfsVfioOps, ValidatedLease, VfioOps, VfioReleaseBinding,
     acquire_vfio_lease, inspect_vfio_lease, inspect_vfio_lease_preflight, restore_vfio_lease,
     validate_host_display_assignment, validate_physical_display_assignment,
-    validate_reset_scope_assignment, validate_vfio_bind_dma_quiescence,
+    validate_physical_storage_assignment, validate_reset_scope_assignment,
+    validate_vfio_bind_dma_quiescence,
 };
 
 mod runtime;
+mod storage;
 
 use runtime::{
-    RuntimeStore, SuperviseConfig, export_amdgpu_guest_vfct, export_amdgpu_vbios,
-    preflight_physical_runtime_inputs, probe_iommufd, recover_domain, supervise_domain,
-    verify_artifacts,
+    RuntimeStore, StorageSuperviseConfig, SuperviseConfig, export_amdgpu_guest_vfct,
+    export_amdgpu_vbios, preflight_physical_runtime_inputs, probe_iommufd, recover_domain,
+    supervise_domain, supervise_storage_domain, verify_artifacts,
 };
 use runtime::{sha256_file, trusted_canonical_regular_file};
+use storage::{prepare_storage_handoff, revoke_storage_aperture};
 
 #[derive(Parser)]
 #[command(
@@ -160,6 +163,13 @@ enum Command {
         /// Exact production QEMU admitted by the signed device policy before VFIO binding.
         #[arg(long, default_value = "/usr/bin/qemu-system-x86_64")]
         qemu: PathBuf,
+        /// Owner-private fixed block aperture initialized before storage ownership transfer.
+        #[arg(long)]
+        block_aperture: Option<PathBuf>,
+        #[arg(long, default_value = "/dev")]
+        device_root: PathBuf,
+        #[arg(long, default_value = "/proc")]
+        proc_root: PathBuf,
     },
     /// Show or explicitly restore the original host drivers from a durable VFIO lease.
     Release {
@@ -194,6 +204,31 @@ enum Command {
         display_doorbell: PathBuf,
         #[arg(long)]
         display_pixels: PathBuf,
+        #[arg(long, default_value_t = 30)]
+        timeout_secs: u64,
+    },
+    /// Supervise one already-authorized physical storage DVM through an
+    /// authenticated block-ready epoch, bounded shutdown, revoke, reset, and
+    /// original-driver restore.
+    SuperviseStorage {
+        #[arg(long)]
+        plan: PathBuf,
+        #[arg(long, default_value = "/sys")]
+        sysfs_root: PathBuf,
+        #[arg(long, default_value = "/run/rustos-hostd/leases")]
+        state_root: PathBuf,
+        #[arg(long, default_value = "/run/rustos-hostd/domains")]
+        runtime_root: PathBuf,
+        #[arg(long, default_value = "/usr/bin/qemu-system-x86_64")]
+        qemu: PathBuf,
+        #[arg(long)]
+        dvm_artifact_manifest: PathBuf,
+        #[arg(long)]
+        device_policy: PathBuf,
+        #[arg(long)]
+        block_doorbell: PathBuf,
+        #[arg(long)]
+        block_aperture: PathBuf,
         #[arg(long, default_value_t = 30)]
         timeout_secs: u64,
     },
@@ -423,8 +458,11 @@ fn main() -> Result<()> {
             device_policy,
             fleet_policy,
             qemu,
+            block_aperture,
+            device_root,
+            proc_root,
         } => {
-            let lease = validate_assignment_plan(&plan, &sysfs_root)?;
+            let lease = validate_plan(&plan, &sysfs_root)?;
             let mut ops = SysfsVfioOps::new(&sysfs_root);
             let mut activation_policy = None;
             let release_binding = if activate {
@@ -469,19 +507,62 @@ fn main() -> Result<()> {
             if !activate {
                 return Ok(());
             }
+            let policy = activation_policy
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("missing activation device policy"))?;
+            let mut storage_handoff = if let Some(physical_storage) = policy.physical_storage() {
+                let aperture = required_path(block_aperture, "--block-aperture")?;
+                Some(prepare_storage_handoff(
+                    &lease,
+                    &sysfs_root,
+                    &device_root,
+                    &proc_root,
+                    physical_storage,
+                    &aperture,
+                )?)
+            } else {
+                if block_aperture.is_some() {
+                    anyhow::bail!("--block-aperture is valid only for physical storage schema 4");
+                }
+                None
+            };
+            if let Some(guard) = &storage_handoff {
+                let evidence = guard.evidence();
+                record.bind_storage_handoff(
+                    &evidence.controller_bdf,
+                    &evidence.block_name,
+                    &evidence.aperture_path,
+                    evidence.header.generation,
+                )?;
+            }
             let store = FileLeaseStore::new(state_root);
             store.create_prepared(&record, current_unix_time()?)?;
             let final_assignment_check = (|| {
-                validate_host_display_assignment(&lease, &sysfs_root)?;
                 validate_reset_scope_assignment(&lease, &sysfs_root)?;
                 validate_vfio_bind_dma_quiescence(&sysfs_root)?;
-                let policy = activation_policy
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("missing activation device policy"))?;
-                let physical_display = policy.physical_display().ok_or_else(|| {
-                    anyhow::anyhow!("activation device policy is not physical schema 3")
-                })?;
-                validate_physical_display_assignment(&lease, &sysfs_root, physical_display)
+                match (policy.physical_display(), policy.physical_storage()) {
+                    (Some(physical_display), None) => {
+                        validate_host_display_assignment(&lease, &sysfs_root)?;
+                        validate_physical_display_assignment(&lease, &sysfs_root, physical_display)
+                    }
+                    (None, Some(physical_storage)) => {
+                        let bdf = validate_physical_storage_assignment(
+                            &lease,
+                            &sysfs_root,
+                            physical_storage,
+                        )?;
+                        if storage_handoff
+                            .as_ref()
+                            .is_none_or(|guard| guard.evidence().controller_bdf != bdf)
+                        {
+                            anyhow::bail!(
+                                "physical storage identity changed after the exclusive handoff freeze"
+                            );
+                        }
+                        Ok(())
+                    }
+                    _ => anyhow::bail!("activation policy is not one physical schema"),
+                }
             })();
             if let Err(error) = final_assignment_check {
                 let cleanup_error = store.remove(&record.domain_id).err();
@@ -510,10 +591,21 @@ fn main() -> Result<()> {
                     "VFIO device binding was rolled back because lease activation record failed: {error:#}"
                 );
             }
+            let storage_evidence = storage_handoff.take().map(|guard| guard.commit());
             println!(
                 "rustos-hostd: VFIO lease active domain={} iommu_group={}",
                 record.domain_id, record.iommu_group
             );
+            if let Some(evidence) = storage_evidence {
+                println!(
+                    "rustos-hostd: storage handoff committed domain={} controller={} block={} generation={} aperture={}",
+                    record.domain_id,
+                    evidence.controller_bdf,
+                    evidence.block_name,
+                    evidence.header.generation,
+                    evidence.aperture_path.display()
+                );
+            }
         }
         Command::Release {
             plan,
@@ -534,6 +626,16 @@ fn main() -> Result<()> {
             );
             if !activate {
                 return Ok(());
+            }
+            if record.storage_handoff().is_some()
+                && record.state == rustos_driver_domain_host::VfioLeaseState::Active
+            {
+                anyhow::bail!(
+                    "active storage leases must use recover with the runtime store so the exact DVM process is terminated before aperture revocation"
+                );
+            }
+            if let Some(storage) = record.storage_handoff() {
+                revoke_storage_aperture(storage.aperture_path(), storage.generation())?;
             }
             let mut ops = SysfsVfioOps::new(sysfs_root);
             restore_vfio_lease(&record, &mut ops)?;
@@ -594,6 +696,42 @@ fn main() -> Result<()> {
             println!(
                 "rustos-hostd: recovered DVM lease domain={} iommu_group={}",
                 lease.domain_id, lease.iommu_group
+            );
+        }
+        Command::SuperviseStorage {
+            plan,
+            sysfs_root,
+            state_root,
+            runtime_root,
+            qemu,
+            dvm_artifact_manifest,
+            device_policy,
+            block_doorbell,
+            block_aperture,
+            timeout_secs,
+        } => {
+            let lease = validate_plan(&plan, &sysfs_root)?;
+            let lease_store = FileLeaseStore::new(&state_root);
+            let mut record = lease_store.load(&lease.domain_id)?;
+            validate_record_matches_lease(&record, &lease)?;
+            let runtime_store = RuntimeStore::new(runtime_root);
+            let status = supervise_storage_domain(
+                &mut record,
+                &sysfs_root,
+                &runtime_store,
+                StorageSuperviseConfig {
+                    qemu: &qemu,
+                    artifact_manifest: &dvm_artifact_manifest,
+                    device_policy: &device_policy,
+                    block_doorbell: &block_doorbell,
+                    block_aperture: &block_aperture,
+                    setup_timeout: Duration::from_secs(timeout_secs.clamp(1, 30)),
+                },
+            )?;
+            lease_store.remove(&lease.domain_id)?;
+            println!(
+                "rustos-hostd: supervised storage DVM stopped domain={} status={status}",
+                lease.domain_id
             );
         }
         Command::VerifyArtifacts {

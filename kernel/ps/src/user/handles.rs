@@ -294,6 +294,14 @@ fn allocate_ipc_transfer_id(objects: &BTreeMap<u64, TransferredHandleEntry>) -> 
     None
 }
 
+fn allocate_nonwrapping_identity(counter: &AtomicU64) -> Option<u64> {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            (current != 0).then(|| current.checked_add(1)).flatten()
+        })
+        .ok()
+}
+
 #[derive(Debug, Clone)]
 pub enum KernelHandle {
     Console(ConsoleHandle),
@@ -340,16 +348,16 @@ impl RemoteVfsHandle {
         path: String,
         len: u64,
         device_access: u16,
-    ) -> Self {
+    ) -> Option<Self> {
         static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
-        Self {
-            token: NEXT_TOKEN.fetch_add(1, Ordering::Relaxed),
+        Some(Self {
+            token: allocate_nonwrapping_identity(&NEXT_TOKEN)?,
             remote_id,
             kind,
             path,
             len,
             device_access,
-        }
+        })
     }
 
     pub const fn token_id(&self) -> u64 {
@@ -382,14 +390,14 @@ impl RemoteVfsHandle {
 }
 
 impl InetSocketHandle {
-    pub fn new(domain: u64, type_: u64, protocol: u64) -> Self {
+    pub fn new(domain: u64, type_: u64, protocol: u64) -> Option<Self> {
         static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
-        Self {
-            token: NEXT_TOKEN.fetch_add(1, Ordering::Relaxed),
+        Some(Self {
+            token: allocate_nonwrapping_identity(&NEXT_TOKEN)?,
             domain,
             type_,
             protocol,
-        }
+        })
     }
 
     pub const fn from_token(token: u64, domain: u64, type_: u64, protocol: u64) -> Self {
@@ -599,6 +607,15 @@ fn file_rights_from_status_flags(status_flags: u64) -> FileHandleRights {
 #[cfg(test)]
 mod transfer_registry_tests {
     use super::*;
+
+    #[test]
+    fn authority_identity_exhaustion_fails_closed_before_wrap() {
+        let counter = AtomicU64::new(1);
+        assert_eq!(allocate_nonwrapping_identity(&counter), Some(1));
+        let exhausted = AtomicU64::new(u64::MAX);
+        assert_eq!(allocate_nonwrapping_identity(&exhausted), None);
+        assert_eq!(exhausted.load(Ordering::Relaxed), u64::MAX);
+    }
     use crate::io::device::{DeviceAccessKind, DeviceId};
 
     #[test]

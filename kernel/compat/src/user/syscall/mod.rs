@@ -179,11 +179,15 @@ unsafe extern "C" {
 #[unsafe(no_mangle)]
 extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> u64 {
     let frame = unsafe { &mut *frame };
+    let user_simd = multitask::SyscallUserSimdSnapshot::capture()
+        .expect("nested syscall SIMD capture or missing current task");
     let abi = validate_syscall_entry_or_terminate(frame);
     trace_syscall_entry(frame, abi);
-    multitask::save_current_simd_state();
     let result = dispatch_syscall(frame, abi);
-    multitask::restore_current_simd_state();
+    assert!(
+        user_simd.restore(),
+        "syscall SIMD restore no longer owns the entering task"
+    );
     let return_abi = validate_syscall_entry_or_terminate(frame);
     // Wakeups raised while servicing another syscall are handled by the next
     // ordinary PIT tick. Never enter the software scheduler from a live

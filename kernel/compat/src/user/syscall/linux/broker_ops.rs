@@ -7,6 +7,8 @@ use super::*;
 mod device_broker_ops;
 #[path = "driver_broker_ops.rs"]
 mod driver_broker_ops;
+#[path = "early_system_broker_ops.rs"]
+mod early_system_broker_ops;
 #[path = "entropy_broker_ops.rs"]
 mod entropy_broker_ops;
 #[path = "input_broker_ops.rs"]
@@ -15,18 +17,16 @@ mod input_broker_ops;
 mod lifecycle_broker_ops;
 #[path = "net_broker_ops.rs"]
 mod net_broker_ops;
-#[path = "storage_broker_ops.rs"]
-mod storage_broker_ops;
 #[path = "waitset_broker_ops.rs"]
 pub(crate) mod waitset_broker_ops;
 
 use device_broker_ops::*;
 use driver_broker_ops::*;
+use early_system_broker_ops::*;
 use entropy_broker_ops::*;
 use input_broker_ops::*;
 use lifecycle_broker_ops::*;
 use net_broker_ops::*;
-use storage_broker_ops::*;
 use waitset_broker_ops::*;
 
 pub(super) use device_broker_ops::device_sysop_error_to_linux_errno;
@@ -36,7 +36,6 @@ pub(super) fn is_linux_rustos_broker_syscall(syscall_number: u64) -> bool {
         syscall_number,
         linux_abi::SYS_RUSTOS_SERVICE_DRIVER_RESOURCE_BROKER
             | linux_abi::SYS_RUSTOS_NET_BROKER
-            | linux_abi::SYS_RUSTOS_STORAGE_LIST_BROKER
             | linux_abi::SYS_RUSTOS_INPUT_STATS_BROKER
             | linux_abi::SYS_RUSTOS_INPUT_INGEST_BROKER
             | linux_abi::SYS_RUSTOS_INPUT_WAIT_BROKER
@@ -47,6 +46,7 @@ pub(super) fn is_linux_rustos_broker_syscall(syscall_number: u64) -> bool {
             | linux_abi::SYS_RUSTOS_ROOTD_TERMINATE_BROKER
             | linux_abi::SYS_RUSTOS_WAITSET_SIGNAL_BROKER
             | linux_abi::SYS_RUSTOS_ENTROPY_BROKER
+            | linux_abi::SYS_RUSTOS_EARLY_SYSTEM_BROKER
     )
 }
 
@@ -56,9 +56,6 @@ pub(super) fn dispatch_linux_rustos_broker_syscall(frame: &SyscallFrame) -> u64 
             syscall_linux_rustos_service_driver_resource_broker(frame.rdi)
         }
         linux_abi::SYS_RUSTOS_NET_BROKER => syscall_linux_rustos_net_broker(frame.rdi),
-        linux_abi::SYS_RUSTOS_STORAGE_LIST_BROKER => {
-            syscall_linux_rustos_storage_list_broker(frame.rdi)
-        }
         linux_abi::SYS_RUSTOS_INPUT_STATS_BROKER => {
             syscall_linux_rustos_input_stats_broker(frame.rdi)
         }
@@ -86,6 +83,9 @@ pub(super) fn dispatch_linux_rustos_broker_syscall(frame: &SyscallFrame) -> u64 
         }
         linux_abi::SYS_RUSTOS_ENTROPY_BROKER => {
             syscall_linux_rustos_entropy_broker(frame.rdi, frame.rsi)
+        }
+        linux_abi::SYS_RUSTOS_EARLY_SYSTEM_BROKER => {
+            syscall_linux_rustos_early_system_broker(frame.rdi)
         }
         _ => linux_errno(LINUX_ENOSYS),
     }

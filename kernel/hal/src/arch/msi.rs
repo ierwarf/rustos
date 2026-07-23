@@ -7,7 +7,7 @@
 //! handler cannot allocate, block, or acquire a policy-service lock.
 
 use core::arch::x86_64::__cpuid;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use x86_64::registers::model_specific::Msr;
 
@@ -34,9 +34,20 @@ pub struct MsiMessage {
 
 static HANDLERS: [AtomicUsize; MSI_VECTOR_COUNT] =
     [const { AtomicUsize::new(0) }; MSI_VECTOR_COUNT];
-static NEXT_VECTOR: AtomicU8 = AtomicU8::new(MSI_VECTOR_FIRST);
+static ALLOCATED: [AtomicBool; MSI_VECTOR_COUNT] =
+    [const { AtomicBool::new(false) }; MSI_VECTOR_COUNT];
+static ALLOCATION_CURSOR: AtomicUsize = AtomicUsize::new(0);
 static LOCAL_APIC_BASE: AtomicUsize = AtomicUsize::new(0);
 static LOCAL_APIC_READY: AtomicBool = AtomicBool::new(false);
+
+/// A not-yet-published interrupt vector. Failed MSI-X setup drops the lease,
+/// clears its exact handler, and returns the slot to the bounded pool. Only a
+/// fully programmed, still-masked device may commit the reservation.
+pub struct MsiVectorLease {
+    vector: u8,
+    handler: usize,
+    committed: bool,
+}
 
 /// Enable the local xAPIC path necessary for MSI delivery. This intentionally
 /// fails closed on x2APIC-only configuration: extended-destination and
@@ -81,49 +92,97 @@ pub const fn vector_is_valid(vector: u8) -> bool {
     vector >= MSI_VECTOR_FIRST && vector <= MSI_VECTOR_LAST
 }
 
-/// Allocate one permanently reserved vector. GUI-DVM uses one notification
-/// vector; a future device may request another only through this bounded pool.
-pub fn allocate_vector() -> Option<u8> {
-    let mut current = NEXT_VECTOR.load(Ordering::Acquire);
-    loop {
-        if !vector_is_valid(current) {
+impl MsiVectorLease {
+    /// Reserve one vector without publishing any registration authority.
+    pub fn allocate() -> Option<Self> {
+        let start = ALLOCATION_CURSOR.fetch_add(1, Ordering::AcqRel) % MSI_VECTOR_COUNT;
+        for offset in 0..MSI_VECTOR_COUNT {
+            let index = (start + offset) % MSI_VECTOR_COUNT;
+            if ALLOCATED[index]
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some(Self {
+                    vector: MSI_VECTOR_FIRST + index as u8,
+                    handler: 0,
+                    committed: false,
+                });
+            }
+        }
+        None
+    }
+
+    pub const fn vector(&self) -> u8 {
+        self.vector
+    }
+
+    /// Bind exactly one leaf handler to this unpublished lease.
+    pub fn register_handler(&mut self, handler: MsiHandler) -> bool {
+        if self.handler != 0 {
+            return false;
+        }
+        let Some(index) = vector_index(self.vector) else {
+            return false;
+        };
+        if !vector_has_registration_authority(self.vector, ALLOCATED[index].load(Ordering::Acquire))
+        {
+            return false;
+        }
+        let raw = handler as usize;
+        if HANDLERS[index]
+            .compare_exchange(0, raw, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        self.handler = raw;
+        true
+    }
+
+    /// Return the exact xAPIC MSI tuple only for this lease's live handler.
+    pub fn message(&self) -> Option<MsiMessage> {
+        let index = vector_index(self.vector)?;
+        if self.handler == 0
+            || !LOCAL_APIC_READY.load(Ordering::Acquire)
+            || !ALLOCATED[index].load(Ordering::Acquire)
+            || HANDLERS[index].load(Ordering::Acquire) != self.handler
+        {
             return None;
         }
-        let next = current.checked_add(1).unwrap_or(0);
-        match NEXT_VECTOR.compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => return Some(current),
-            Err(observed) => current = observed,
+        let leaf1 = __cpuid(1);
+        let apic_id = (leaf1.ebx >> 24) as u64;
+        Some(MsiMessage {
+            address: 0xfee0_0000 | (apic_id << 12),
+            data: u32::from(self.vector),
+        })
+    }
+
+    /// Publish the reservation after the masked MSI-X entry is complete.
+    pub fn commit(mut self) -> u8 {
+        self.committed = true;
+        self.vector
+    }
+}
+
+impl Drop for MsiVectorLease {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let Some(index) = vector_index(self.vector) else {
+            return;
+        };
+        let handler_released = if self.handler == 0 {
+            HANDLERS[index].load(Ordering::Acquire) == 0
+        } else {
+            HANDLERS[index]
+                .compare_exchange(self.handler, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        };
+        if handler_released {
+            ALLOCATED[index].store(false, Ordering::Release);
         }
     }
-}
-
-/// Register a leaf IRQ callback for an allocated vector. A vector cannot be
-/// rebound, preventing a later driver from stealing an event source.
-pub fn register_handler(vector: u8, handler: MsiHandler) -> bool {
-    let Some(index) = vector_index(vector).filter(|_| vector_was_allocated(vector)) else {
-        return false;
-    };
-    HANDLERS[index]
-        .compare_exchange(0, handler as usize, Ordering::AcqRel, Ordering::Acquire)
-        .is_ok()
-}
-
-/// Return the exact xAPIC MSI address/data tuple for a registered vector.
-/// The caller writes it into a device MSI-X table while that table is masked.
-pub fn message_for(vector: u8) -> Option<MsiMessage> {
-    let index = vector_index(vector)?;
-    if !LOCAL_APIC_READY.load(Ordering::Acquire)
-        || !vector_was_allocated(vector)
-        || HANDLERS[index].load(Ordering::Acquire) == 0
-    {
-        return None;
-    }
-    let leaf1 = __cpuid(1);
-    let apic_id = (leaf1.ebx >> 24) as u64;
-    Some(MsiMessage {
-        address: 0xfee0_0000 | (apic_id << 12),
-        data: u32::from(vector),
-    })
 }
 
 /// Called only from the generic MSI IDT entries. The callback must only set a
@@ -144,12 +203,8 @@ fn vector_index(vector: u8) -> Option<usize> {
     vector_is_valid(vector).then_some((vector - MSI_VECTOR_FIRST) as usize)
 }
 
-fn vector_was_allocated(vector: u8) -> bool {
-    vector_is_allocated_at_cursor(vector, NEXT_VECTOR.load(Ordering::Acquire))
-}
-
-const fn vector_is_allocated_at_cursor(vector: u8, next_vector: u8) -> bool {
-    vector_is_valid(vector) && vector < next_vector
+const fn vector_has_registration_authority(vector: u8, allocated: bool) -> bool {
+    vector_is_valid(vector) && allocated
 }
 
 fn end_of_interrupt() {
@@ -164,8 +219,11 @@ fn end_of_interrupt() {
 
 #[cfg(test)]
 mod tests {
+    use core::sync::atomic::Ordering;
+
     use super::{
-        MSI_VECTOR_FIRST, MSI_VECTOR_LAST, vector_is_allocated_at_cursor, vector_is_valid,
+        ALLOCATED, HANDLERS, MSI_VECTOR_FIRST, MSI_VECTOR_LAST, MsiVectorLease,
+        vector_has_registration_authority, vector_index, vector_is_valid,
     };
 
     #[test]
@@ -178,18 +236,26 @@ mod tests {
 
     #[test]
     fn unallocated_vector_has_no_registration_authority() {
-        assert!(!vector_is_allocated_at_cursor(
-            MSI_VECTOR_FIRST,
-            MSI_VECTOR_FIRST
-        ));
-        assert!(vector_is_allocated_at_cursor(
-            MSI_VECTOR_FIRST,
-            MSI_VECTOR_FIRST + 1
-        ));
-        assert!(!vector_is_allocated_at_cursor(0x20, MSI_VECTOR_FIRST + 1));
-        assert!(!vector_is_allocated_at_cursor(
-            MSI_VECTOR_FIRST + 1,
-            MSI_VECTOR_FIRST + 1
-        ));
+        assert!(!vector_has_registration_authority(MSI_VECTOR_FIRST, false));
+        assert!(vector_has_registration_authority(MSI_VECTOR_FIRST, true));
+        assert!(!vector_has_registration_authority(0x20, true));
+    }
+
+    #[test]
+    fn failed_unpublished_vector_lease_revokes_exact_handler_and_slot() {
+        fn handler(_vector: u8) {}
+
+        let mut lease = MsiVectorLease::allocate().expect("bounded test vector");
+        let index = vector_index(lease.vector()).expect("allocated vector index");
+        assert!(ALLOCATED[index].load(Ordering::Acquire));
+        assert!(lease.register_handler(handler));
+        assert_eq!(
+            HANDLERS[index].load(Ordering::Acquire),
+            handler as *const () as usize
+        );
+
+        drop(lease);
+        assert_eq!(HANDLERS[index].load(Ordering::Acquire), 0);
+        assert!(!ALLOCATED[index].load(Ordering::Acquire));
     }
 }

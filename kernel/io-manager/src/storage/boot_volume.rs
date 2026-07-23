@@ -1,95 +1,24 @@
-// RING3-MIGRATION-REFERENCE START: bootstrap exception: vfsd/storaged own
-// post-bootstrap root extent leases and normal runtime boot-volume policy.
-// Ring0 keeps boot info, bootloader-supplied root extent reads, and physical
-// boot-volume substrate until vfsd/storaged can serve the root filesystem.
-#![cfg_attr(not(test), allow(dead_code))]
-
-use alloc::boxed::Box;
-use alloc::string::{String, ToString};
-use alloc::vec;
+// Ring0 bootstrap storage is deliberately limited to one immutable,
+// bootloader-authenticated early-system image. Normal files and every mutable
+// block operation belong to vfsd/storaged and the storage DVM.
 use alloc::vec::Vec;
 use boot_protocol::{
-    BootExtentManifest, BootInfo, BootVolumeIdentity, BootVolumeTransport, FramebufferInfo,
+    BootInfo, BootVolumeIdentity, BootVolumeTransport, EARLY_SYSTEM_ENTRY_BYTES,
+    EARLY_SYSTEM_HEADER_BYTES, EARLY_SYSTEM_PAYLOAD_ALIGNMENT, EarlySystemEntry, EarlySystemHeader,
+    FramebufferInfo, valid_early_system_path,
 };
 use core::ptr;
-use core::sync::atomic::{AtomicPtr, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU8, Ordering};
 use sha2::{Digest, Sha256};
 
-use crate::sync::{KernelSpinLock as Mutex, KernelWaitLock};
-use fatfs::{IoBase, Read, Seek, SeekFrom, Write};
-use storage_core::BlockDevice;
-
-use crate::storage::fat::{self, DiskIoError};
-
-pub use crate::storage::fat::{BootVolumeDirEntry, BootVolumeMetadata};
-
 static BOOT_INFO_PTR: AtomicPtr<BootInfo> = AtomicPtr::new(ptr::null_mut());
-static PHYSICAL_BOOT_BLOCK_DEVICE_OPENER: Mutex<Option<PhysicalBootBlockDeviceOpener>> =
-    Mutex::new(None);
 static BOOTSTRAP_PHASE: AtomicU8 = AtomicU8::new(BootstrapPhase::EarlyBootstrap as u8);
 
-pub type PhysicalBootBlockDeviceOpener =
-    fn(BootVolumeIdentity) -> core::result::Result<Box<dyn BlockDevice>, fatfs::Error<DiskIoError>>;
-
-type BootVolumeFs = fat::MountedFatVolume<Box<dyn BlockDevice>>;
-type PhysicalBootVolumeFileInner<'a> = storage_fat::FatFile<'a, Box<dyn BlockDevice>>;
-const BOOT_VOLUME_READ_CHUNK_CAP: usize = 64 * 1024;
-const ROOT_EXTENT_READ_CHUNK_CAP: usize = 512 * 1024;
-const ROOT_EXTENT_FILE_CACHE_CAPACITY: usize = 8;
-const ROOT_EXTENT_FILE_CACHE_MAX_ENTRY_BYTES: usize = 768 * 1024;
-const ROOT_EXTENT_FILE_CACHE_MAX_BYTES: usize = 2 * 1024 * 1024;
-const ROOT_CONTENT_CHUNK_BYTES: usize = 64 * 1024;
-
-static ROOT_FILE_EXTENTS: KernelWaitLock<RootFileExtentState> =
-    KernelWaitLock::new(RootFileExtentState::Uninitialized);
-static ROOT_EXTENT_FILE_CACHE: KernelWaitLock<Vec<RootExtentFileCacheEntry>> =
-    KernelWaitLock::new(Vec::new());
-static ROOT_EXTENT_LOGS_REMAINING: AtomicUsize = AtomicUsize::new(32);
-
-#[derive(Clone, Debug)]
-struct RootFileExtent {
-    offset: u64,
-    len: u64,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct BootFileExtent {
-    pub offset: u64,
-    pub len: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BootFileExtentLease {
-    pub len: u64,
-    pub generation: u64,
-    pub extents: Vec<BootFileExtent>,
-}
-
-#[derive(Clone, Debug)]
-struct RootFileExtentEntry {
-    path: String,
-    len: u64,
-    extents: Vec<RootFileExtent>,
-    chunk_sha256: Vec<[u8; 32]>,
-}
-
-#[derive(Debug)]
-struct RootExtentFileCacheEntry {
-    path: String,
-    chunk_index: Option<usize>,
-    bytes: Vec<u8>,
-}
-
-#[derive(Debug)]
-struct RootFileExtentTable {
-    entries: Vec<RootFileExtentEntry>,
-}
-
-#[derive(Debug)]
-enum RootFileExtentState {
-    Uninitialized,
-    Ready(RootFileExtentTable),
-    Disabled,
+pub enum BootstrapImageError {
+    NotFound,
+    Unavailable,
+    Invalid,
 }
 
 #[repr(u8)]
@@ -111,12 +40,6 @@ impl BootstrapPhase {
         }
     }
 }
-
-pub struct PhysicalBootVolume {
-    fs: BootVolumeFs,
-}
-
-pub struct PhysicalBootVolumeFile<'a>(PhysicalBootVolumeFileInner<'a>);
 
 pub fn init_boot_info(boot_info_ptr: *const BootInfo) {
     BOOT_INFO_PTR.store(boot_info_ptr.cast_mut(), Ordering::Release);
@@ -143,7 +66,6 @@ fn set_bootstrap_phase(phase: BootstrapPhase) {
 }
 
 pub fn enter_kernel_vfs_runtime() {
-    seal_boot_volume_fat_runtime();
     set_bootstrap_phase(BootstrapPhase::KernelVfsReady);
 }
 
@@ -155,843 +77,147 @@ pub fn boot_framebuffer_info() -> Option<FramebufferInfo> {
     boot_info().map(|info| info.framebuffer)
 }
 
+/// Boot-volume identity is diagnostic input only. Ring0 never opens the
+/// controller or volume named by it.
 pub fn boot_volume_identity() -> Option<BootVolumeIdentity> {
     let identity = boot_info()?.boot_volume;
     identity.is_present().then_some(identity)
-}
-
-/// Multiboot2 supplies the root extent manifest but not a physical-volume
-/// identity. In that format, the block substrate may use only an unambiguous
-/// FAT volume selected for this manifest; it may never guess when an identity
-/// was supplied but did not match.
-pub fn boot_extent_manifest_present() -> bool {
-    boot_extent_manifest().is_some()
 }
 
 pub fn boot_volume_transport_hint() -> Option<BootVolumeTransport> {
     Some(boot_info()?.boot_volume.transport())
 }
 
-pub fn set_physical_boot_block_device_opener(opener: PhysicalBootBlockDeviceOpener) {
-    *PHYSICAL_BOOT_BLOCK_DEVICE_OPENER.lock() = Some(opener);
-}
-
-impl IoBase for PhysicalBootVolumeFile<'_> {
-    type Error = fatfs::Error<DiskIoError>;
-}
-
-impl Read for PhysicalBootVolumeFile<'_> {
-    fn read(&mut self, buf: &mut [u8]) -> core::result::Result<usize, fatfs::Error<DiskIoError>> {
-        self.0.read(buf)
-    }
-}
-
-impl Write for PhysicalBootVolumeFile<'_> {
-    fn write(&mut self, buf: &[u8]) -> core::result::Result<usize, fatfs::Error<DiskIoError>> {
-        self.0.write(buf)
-    }
-
-    fn flush(&mut self) -> core::result::Result<(), fatfs::Error<DiskIoError>> {
-        self.0.flush()
-    }
-}
-
-impl Seek for PhysicalBootVolumeFile<'_> {
-    fn seek(&mut self, pos: SeekFrom) -> core::result::Result<u64, fatfs::Error<DiskIoError>> {
-        self.0.seek(pos)
-    }
-}
-
-impl PhysicalBootVolumeFile<'_> {
-    pub fn truncate(&mut self) -> core::result::Result<(), fatfs::Error<DiskIoError>> {
-        self.0.truncate()
-    }
-}
-
-fn read_file_to_vec_from_fs(
-    fs: &BootVolumeFs,
-    path: &str,
-) -> core::result::Result<Vec<u8>, fatfs::Error<DiskIoError>> {
-    let len = usize::try_from(fs.metadata(path)?.len).map_err(|_| fatfs::Error::InvalidInput)?;
-    let mut bytes = vec![0_u8; len];
-    let read = read_file_into_from_fs(fs, path, &mut bytes, |_, _| {})?;
-    bytes.truncate(read);
-    Ok(bytes)
-}
-
-fn normalized_extent_path(path: &str) -> Option<&str> {
-    let path = path.strip_prefix('/').unwrap_or(path);
-    (!path.is_empty() && !path.contains("..")).then_some(path)
-}
-
-fn ensure_root_file_extent_table_loaded() {
-    if !matches!(
-        *ROOT_FILE_EXTENTS.lock(),
-        RootFileExtentState::Uninitialized
-    ) {
-        return;
-    }
-
-    if kernel_vfs_runtime_active() {
-        crate::debug::warn!(
-            storage,
-            "boot volume extents: late load rejected phase={:?}",
-            bootstrap_phase()
-        );
-        *ROOT_FILE_EXTENTS.lock() = RootFileExtentState::Disabled;
-        return;
-    }
-
-    let loaded = match load_root_file_extent_table() {
-        Ok(table) => {
-            crate::debug::info!(
-                storage,
-                "boot volume extents: loaded entries={}",
-                table.entries.len()
-            );
-            RootFileExtentState::Ready(table)
-        }
-        Err(err) => {
-            crate::debug::warn!(storage, "boot volume extents: disabled error={:?}", err);
-            RootFileExtentState::Disabled
-        }
+pub fn read_file_to_vec(path: &str) -> Result<Vec<u8>, BootstrapImageError> {
+    let Some(image) = early_system_image_bytes()? else {
+        return Err(BootstrapImageError::Unavailable);
     };
-
-    let mut cache = ROOT_FILE_EXTENTS.lock();
-    if matches!(*cache, RootFileExtentState::Uninitialized) {
-        *cache = loaded;
-    }
+    early_system_payload(image, path)?
+        .map(Vec::from)
+        .ok_or(BootstrapImageError::NotFound)
 }
 
-fn seal_boot_volume_fat_runtime() {
-    ensure_root_file_extent_table_loaded();
-    crate::debug::info!(storage, "boot volume helper: extent manifest sealed");
+pub fn file_len(path: &str) -> Result<u64, BootstrapImageError> {
+    let Some(image) = early_system_image_bytes()? else {
+        return Err(BootstrapImageError::Unavailable);
+    };
+    let payload = early_system_payload(image, path)?.ok_or(BootstrapImageError::NotFound)?;
+    u64::try_from(payload.len()).map_err(|_| BootstrapImageError::Invalid)
 }
 
-fn read_file_to_vec_from_extents(
-    path: &str,
-) -> core::result::Result<Option<Vec<u8>>, fatfs::Error<DiskIoError>> {
-    let Some(path) = normalized_extent_path(path) else {
-        return Ok(None);
-    };
-    ensure_root_file_extent_table_loaded();
-    let cache = ROOT_FILE_EXTENTS.lock();
-    let entry = match &*cache {
-        RootFileExtentState::Ready(table) => table.find(path).cloned(),
-        _ => None,
-    };
-    drop(cache);
-    let Some(entry) = entry else {
-        if path.starts_with("system/registry/") {
-            crate::debug::warn!(storage, "boot volume extents: miss path={}", path);
-        }
-        return Ok(None);
-    };
-    trace_extent_read(entry.path.as_str(), entry.len);
-    if let Some(bytes) = root_extent_file_cache_lookup(entry.path.as_str(), None) {
-        return Ok(Some(bytes));
-    }
-    let bytes = read_extent_entry(&entry)?;
-    verify_all_content_chunks(&entry, &bytes)?;
-    root_extent_file_cache_store(entry.path.as_str(), None, &bytes);
-    Ok(Some(bytes))
-}
-
-pub fn read_file_range_from_extents(
+/// Reads only an admitted early-system entry. `Ok(None)` means that the
+/// immutable bootstrap image does not own this path, so callers may ask vfsd;
+/// it never means that physical disk fallback is permitted.
+pub fn read_file_range(
     path: &str,
     file_offset: u64,
     dest: &mut [u8],
-) -> core::result::Result<Option<usize>, fatfs::Error<DiskIoError>> {
-    let Some(path) = normalized_extent_path(path) else {
+) -> Result<Option<usize>, BootstrapImageError> {
+    let Some(image) = early_system_image_bytes()? else {
         return Ok(None);
     };
-    ensure_root_file_extent_table_loaded();
-    let cache = ROOT_FILE_EXTENTS.lock();
-    let entry = match &*cache {
-        RootFileExtentState::Ready(table) => table.find(path).cloned(),
-        _ => None,
-    };
-    drop(cache);
-    let Some(entry) = entry else {
+    let Some(payload) = early_system_payload(image, path)? else {
         return Ok(None);
     };
-    if dest.is_empty() || file_offset >= entry.len {
+    let offset = usize::try_from(file_offset).map_err(|_| BootstrapImageError::Invalid)?;
+    if offset >= payload.len() || dest.is_empty() {
         return Ok(Some(0));
     }
-
-    let requested = dest
-        .len()
-        .min(usize::try_from(entry.len - file_offset).map_err(|_| fatfs::Error::InvalidInput)?);
-    let mut copied = 0usize;
-    while copied < requested {
-        let logical_offset = file_offset
-            .checked_add(copied as u64)
-            .ok_or(fatfs::Error::InvalidInput)?;
-        let chunk_index = usize::try_from(logical_offset / ROOT_CONTENT_CHUNK_BYTES as u64)
-            .map_err(|_| fatfs::Error::InvalidInput)?;
-        let chunk_start = (chunk_index as u64)
-            .checked_mul(ROOT_CONTENT_CHUNK_BYTES as u64)
-            .ok_or(fatfs::Error::InvalidInput)?;
-        let chunk_len =
-            usize::try_from((entry.len - chunk_start).min(ROOT_CONTENT_CHUNK_BYTES as u64))
-                .map_err(|_| fatfs::Error::InvalidInput)?;
-        let chunk = match root_extent_file_cache_lookup(entry.path.as_str(), Some(chunk_index)) {
-            Some(bytes) => bytes,
-            None => {
-                let mut bytes = vec![0_u8; chunk_len];
-                read_extent_entry_range(&entry, chunk_start, &mut bytes)?;
-                verify_content_chunk(&entry, chunk_index, &bytes)?;
-                root_extent_file_cache_store(entry.path.as_str(), Some(chunk_index), &bytes);
-                bytes
-            }
-        };
-        let within_chunk = usize::try_from(logical_offset - chunk_start)
-            .map_err(|_| fatfs::Error::InvalidInput)?;
-        let count = (requested - copied).min(chunk.len().saturating_sub(within_chunk));
-        if count == 0 {
-            return Err(fatfs::Error::UnexpectedEof);
-        }
-        dest[copied..copied + count].copy_from_slice(&chunk[within_chunk..within_chunk + count]);
-        copied += count;
-    }
-    Ok(Some(copied))
+    let count = dest.len().min(payload.len() - offset);
+    dest[..count].copy_from_slice(&payload[offset..offset + count]);
+    Ok(Some(count))
 }
 
-fn metadata_from_extents(
-    path: &str,
-) -> core::result::Result<Option<BootVolumeMetadata>, fatfs::Error<DiskIoError>> {
-    let Some(path) = normalized_extent_path(path) else {
+fn normalized_bootstrap_path(path: &str) -> Option<&str> {
+    let path = path.strip_prefix('/').unwrap_or(path);
+    (!path.is_empty() && !path.contains("..") && valid_early_system_path(path.as_bytes()))
+        .then_some(path)
+}
+
+fn early_system_image_bytes() -> Result<Option<&'static [u8]>, BootstrapImageError> {
+    let Some(info) = boot_info() else {
         return Ok(None);
     };
-    ensure_root_file_extent_table_loaded();
-    let cache = ROOT_FILE_EXTENTS.lock();
-    let RootFileExtentState::Ready(table) = &*cache else {
+    let image = info.early_system_image;
+    if !image.is_present() {
         return Ok(None);
-    };
-    Ok(table.find(path).map(|entry| BootVolumeMetadata {
-        kind: storage_fat::FatNodeKind::File,
-        len: entry.len,
+    }
+    image.validate().map_err(|_| BootstrapImageError::Invalid)?;
+    let len = usize::try_from(image.len).map_err(|_| BootstrapImageError::Invalid)?;
+    // SAFETY: BootInfo admission validates the immutable bootloader module
+    // range, and boot memory retains it for the entire bootstrap lifetime.
+    Ok(Some(unsafe {
+        core::slice::from_raw_parts(image.ptr as *const u8, len)
     }))
 }
 
-fn trace_extent_read(path: &str, len: u64) {
-    if ROOT_EXTENT_LOGS_REMAINING
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
-            remaining.checked_sub(1)
-        })
-        .is_ok()
-    {
-        crate::debug::info!(
-            storage,
-            "boot volume extents: read path={} len={}",
-            path,
-            len
-        );
-    }
-}
-
-fn root_extent_file_cache_lookup(path: &str, chunk_index: Option<usize>) -> Option<Vec<u8>> {
-    let mut cache = ROOT_EXTENT_FILE_CACHE.lock();
-    let index = cache
-        .iter()
-        .position(|entry| entry.path == path && entry.chunk_index == chunk_index)?;
-    let entry = cache.remove(index);
-    let bytes = entry.bytes.clone();
-    cache.push(entry);
-    Some(bytes)
-}
-
-fn root_extent_file_cache_store(path: &str, chunk_index: Option<usize>, bytes: &[u8]) {
-    if bytes.is_empty() || bytes.len() > ROOT_EXTENT_FILE_CACHE_MAX_ENTRY_BYTES {
-        return;
-    }
-    let mut cache = ROOT_EXTENT_FILE_CACHE.lock();
-    if let Some(index) = cache
-        .iter()
-        .position(|entry| entry.path == path && entry.chunk_index == chunk_index)
-    {
-        let mut entry = cache.remove(index);
-        entry.bytes.clear();
-        entry.bytes.extend_from_slice(bytes);
-        cache.push(entry);
-        return;
-    }
-    while cache.len() >= ROOT_EXTENT_FILE_CACHE_CAPACITY
-        || root_extent_file_cache_bytes(&cache).saturating_add(bytes.len())
-            > ROOT_EXTENT_FILE_CACHE_MAX_BYTES
-    {
-        if cache.is_empty() {
-            break;
-        }
-        cache.remove(0);
-    }
-    cache.push(RootExtentFileCacheEntry {
-        path: path.to_string(),
-        chunk_index,
-        bytes: bytes.to_vec(),
-    });
-}
-
-fn root_extent_file_cache_bytes(cache: &[RootExtentFileCacheEntry]) -> usize {
-    cache.iter().map(|entry| entry.bytes.len()).sum()
-}
-
-pub fn boot_file_extent_lease(
+fn early_system_payload<'a>(
+    bytes: &'a [u8],
     path: &str,
-) -> core::result::Result<Option<BootFileExtentLease>, fatfs::Error<DiskIoError>> {
-    let Some(path) = normalized_extent_path(path) else {
+) -> Result<Option<&'a [u8]>, BootstrapImageError> {
+    let Some(path) = normalized_bootstrap_path(path) else {
         return Ok(None);
     };
-    ensure_root_file_extent_table_loaded();
-    let cache = ROOT_FILE_EXTENTS.lock();
-    let RootFileExtentState::Ready(table) = &*cache else {
-        return Ok(None);
-    };
-    Ok(table.find(path).map(|entry| BootFileExtentLease {
-        len: entry.len,
-        generation: root_file_extent_generation(entry),
-        extents: entry
-            .extents
-            .iter()
-            .map(|extent| BootFileExtent {
-                offset: extent.offset,
-                len: extent.len,
-            })
-            .collect(),
-    }))
-}
+    let header = EarlySystemHeader::decode(bytes).ok_or(BootstrapImageError::Invalid)?;
+    if usize::try_from(header.total_bytes).ok() != Some(bytes.len()) {
+        return Err(BootstrapImageError::Invalid);
+    }
 
-fn root_file_extent_generation(entry: &RootFileExtentEntry) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in entry.path.as_bytes() {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    for value in [entry.len] {
-        for byte in value.to_le_bytes() {
-            hash ^= byte as u64;
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-    }
-    for extent in &entry.extents {
-        for value in [extent.offset, extent.len] {
-            for byte in value.to_le_bytes() {
-                hash ^= byte as u64;
-                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-            }
-        }
-    }
-    for digest in &entry.chunk_sha256 {
-        for byte in digest {
-            hash ^= *byte as u64;
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-    }
-    hash.max(1)
-}
-
-impl RootFileExtentTable {
-    fn find(&self, path: &str) -> Option<&RootFileExtentEntry> {
-        self.entries.iter().find(|entry| entry.path == path)
-    }
-}
-
-fn load_root_file_extent_table()
--> core::result::Result<RootFileExtentTable, fatfs::Error<DiskIoError>> {
-    if let Some(manifest) = boot_extent_manifest() {
-        crate::debug::info!(
-            storage,
-            "boot volume extents: manifest ptr={:#x} len={}",
-            manifest.ptr,
-            manifest.len
-        );
-        crate::debug::info!(
-            storage,
-            "boot volume extents: loading BootInfo manifest len={}",
-            manifest.len
-        );
-        let bytes = unsafe {
-            core::slice::from_raw_parts(
-                manifest.ptr as *const u8,
-                usize::try_from(manifest.len).map_err(|_| fatfs::Error::InvalidInput)?,
+    let entry_count =
+        usize::try_from(header.entry_count).map_err(|_| BootstrapImageError::Invalid)?;
+    let mut previous: Option<EarlySystemEntry> = None;
+    let mut previous_payload_end = header.payload_offset;
+    let mut found = None;
+    for index in 0..entry_count {
+        let start = EARLY_SYSTEM_HEADER_BYTES
+            .checked_add(
+                index
+                    .checked_mul(EARLY_SYSTEM_ENTRY_BYTES)
+                    .ok_or(BootstrapImageError::Invalid)?,
             )
-        };
-        let table = parse_root_file_extent_table(bytes).map_err(|_| fatfs::Error::InvalidInput)?;
-        crate::debug::info!(
-            storage,
-            "boot volume extents: parsed entries={}",
-            table.entries.len()
-        );
-        return Ok(table);
-    }
-
-    crate::debug::warn!(storage, "boot volume extents: missing BootInfo manifest");
-    Err(fatfs::Error::Io(DiskIoError::NotPresent))
-}
-
-fn parse_root_file_extent_table(bytes: &[u8]) -> Result<RootFileExtentTable, ()> {
-    let text = core::str::from_utf8(bytes).map_err(|_| ())?;
-    let mut entries = Vec::new();
-    for raw_line in text.lines() {
-        let line = raw_line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let path = registry_field(line, "path").ok_or(())?;
-        let len = registry_field(line, "len")
-            .ok_or(())?
-            .parse::<u64>()
-            .map_err(|_| ())?;
-        let extents = parse_extent_list(registry_field(line, "extents").ok_or(())?)?;
-        let chunk_sha256 = parse_sha256_list(registry_field(line, "sha256_chunks").ok_or(())?)?;
-        let path = normalized_extent_path(path).ok_or(())?.to_string();
-        let expected_chunks =
-            usize::try_from(len.div_ceil(ROOT_CONTENT_CHUNK_BYTES as u64)).map_err(|_| ())?;
-        if chunk_sha256.len() != expected_chunks
-            || entries
-                .iter()
-                .any(|entry: &RootFileExtentEntry| entry.path == path)
+            .ok_or(BootstrapImageError::Invalid)?;
+        let end = start
+            .checked_add(EARLY_SYSTEM_ENTRY_BYTES)
+            .ok_or(BootstrapImageError::Invalid)?;
+        let record = bytes.get(start..end).ok_or(BootstrapImageError::Invalid)?;
+        let entry = EarlySystemEntry::decode(record, header).ok_or(BootstrapImageError::Invalid)?;
+        let entry_path = entry.path_bytes().ok_or(BootstrapImageError::Invalid)?;
+        if previous
+            .as_ref()
+            .and_then(EarlySystemEntry::path_bytes)
+            .is_some_and(|previous_path| previous_path >= entry_path)
+            || !entry
+                .payload_offset
+                .is_multiple_of(EARLY_SYSTEM_PAYLOAD_ALIGNMENT)
+            || entry.payload_offset < previous_payload_end
         {
-            return Err(());
+            return Err(BootstrapImageError::Invalid);
         }
-        entries.push(RootFileExtentEntry {
-            path,
-            len,
-            extents,
-            chunk_sha256,
-        });
-    }
-    validate_extent_table(&entries)?;
-    Ok(RootFileExtentTable { entries })
-}
-
-fn parse_sha256_list(text: &str) -> Result<Vec<[u8; 32]>, ()> {
-    if text.is_empty() {
-        return Ok(Vec::new());
-    }
-    text.split(',').map(parse_sha256).collect()
-}
-
-fn parse_sha256(text: &str) -> Result<[u8; 32], ()> {
-    if text.len() != 64 {
-        return Err(());
-    }
-    let mut digest = [0_u8; 32];
-    for (index, byte) in digest.iter_mut().enumerate() {
-        let start = index * 2;
-        let high = hex_nibble(text.as_bytes()[start]).ok_or(())?;
-        let low = hex_nibble(text.as_bytes()[start + 1]).ok_or(())?;
-        *byte = (high << 4) | low;
-    }
-    Ok(digest)
-}
-
-fn hex_nibble(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        _ => None,
-    }
-}
-
-fn validate_extent_table(entries: &[RootFileExtentEntry]) -> Result<(), ()> {
-    let mut physical_ranges = Vec::new();
-    for entry in entries {
-        let mut total = 0_u64;
-        for extent in &entry.extents {
-            let end = extent.offset.checked_add(extent.len).ok_or(())?;
-            if physical_ranges
-                .iter()
-                .any(|&(start, previous_end)| extent.offset < previous_end && start < end)
-            {
-                return Err(());
-            }
-            physical_ranges.push((extent.offset, end));
-            total = total.checked_add(extent.len).ok_or(())?;
+        let payload_end = entry
+            .payload_offset
+            .checked_add(entry.payload_len)
+            .ok_or(BootstrapImageError::Invalid)?;
+        if entry_path == path.as_bytes() {
+            found = Some((entry.payload_offset, payload_end, entry.sha256));
         }
-        if total != entry.len || (entry.len == 0 && !entry.extents.is_empty()) {
-            return Err(());
-        }
+        previous_payload_end = payload_end;
+        previous = Some(entry);
     }
-    Ok(())
-}
-
-fn registry_field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
-    line.split('\t').find_map(|field| {
-        let (field_key, value) = field.split_once('=')?;
-        (field_key == key).then_some(value)
-    })
-}
-
-fn parse_extent_list(text: &str) -> Result<Vec<RootFileExtent>, ()> {
-    let mut extents = Vec::new();
-    if text.is_empty() {
-        return Ok(extents);
-    }
-    for item in text.split(',') {
-        let (offset, len) = item.split_once(':').ok_or(())?;
-        let offset = offset.parse::<u64>().map_err(|_| ())?;
-        let len = len.parse::<u64>().map_err(|_| ())?;
-        if len == 0 {
-            continue;
-        }
-        extents.push(RootFileExtent { offset, len });
-    }
-    Ok(extents)
-}
-
-fn read_extent_entry(
-    entry: &RootFileExtentEntry,
-) -> core::result::Result<Vec<u8>, fatfs::Error<DiskIoError>> {
-    let len = usize::try_from(entry.len).map_err(|_| fatfs::Error::InvalidInput)?;
-    let mut bytes = vec![0_u8; len];
-    let mut written = 0usize;
-    let handle = crate::storage::block::current_boot_volume_handle()
-        .ok_or(fatfs::Error::Io(DiskIoError::NotPresent))?;
-    let mut device = crate::storage::block::FatRegistryDevice::new(handle);
-    let block_size = Some(device.logical_block_size())
-        .filter(|block_size| *block_size != 0)
-        .ok_or(fatfs::Error::Io(DiskIoError::NotPresent))?;
-
-    for extent in &entry.extents {
-        if written == bytes.len() {
-            break;
-        }
-        let extent_offset =
-            usize::try_from(extent.offset).map_err(|_| fatfs::Error::InvalidInput)?;
-        let extent_len = usize::try_from(extent.len).map_err(|_| fatfs::Error::InvalidInput)?;
-        let readable = extent_len.min(bytes.len() - written);
-        if readable == 0 {
-            continue;
-        }
-        read_extent_bytes(
-            &mut device,
-            block_size,
-            extent_offset,
-            readable,
-            &mut bytes[written..written + readable],
-        )?;
-        written += readable;
-    }
-    if written != bytes.len() {
-        return Err(fatfs::Error::UnexpectedEof);
-    }
-    Ok(bytes)
-}
-
-fn read_extent_entry_range(
-    entry: &RootFileExtentEntry,
-    file_offset: u64,
-    dest: &mut [u8],
-) -> core::result::Result<(), fatfs::Error<DiskIoError>> {
-    let request_end = file_offset
-        .checked_add(dest.len() as u64)
-        .ok_or(fatfs::Error::InvalidInput)?;
-    if request_end > entry.len {
-        return Err(fatfs::Error::UnexpectedEof);
-    }
-    let handle = crate::storage::block::current_boot_volume_handle()
-        .ok_or(fatfs::Error::Io(DiskIoError::NotPresent))?;
-    let mut device = crate::storage::block::FatRegistryDevice::new(handle);
-    let block_size = Some(device.logical_block_size())
-        .filter(|block_size| *block_size != 0)
-        .ok_or(fatfs::Error::Io(DiskIoError::NotPresent))?;
-
-    let mut logical_start = 0_u64;
-    let mut written = 0usize;
-    for extent in &entry.extents {
-        let logical_end = logical_start
-            .checked_add(extent.len)
-            .ok_or(fatfs::Error::InvalidInput)?;
-        let overlap_start = file_offset.max(logical_start);
-        let overlap_end = request_end.min(logical_end);
-        if overlap_start < overlap_end {
-            let physical_offset = extent
-                .offset
-                .checked_add(overlap_start - logical_start)
-                .ok_or(fatfs::Error::InvalidInput)?;
-            let count = usize::try_from(overlap_end - overlap_start)
-                .map_err(|_| fatfs::Error::InvalidInput)?;
-            read_extent_bytes(
-                &mut device,
-                block_size,
-                usize::try_from(physical_offset).map_err(|_| fatfs::Error::InvalidInput)?,
-                count,
-                &mut dest[written..written + count],
-            )?;
-            written += count;
-            if written == dest.len() {
-                break;
-            }
-        }
-        logical_start = logical_end;
-    }
-    if written != dest.len() {
-        return Err(fatfs::Error::UnexpectedEof);
-    }
-    Ok(())
-}
-
-fn verify_all_content_chunks(
-    entry: &RootFileExtentEntry,
-    bytes: &[u8],
-) -> core::result::Result<(), fatfs::Error<DiskIoError>> {
-    if bytes.len() as u64 != entry.len {
-        return Err(fatfs::Error::UnexpectedEof);
-    }
-    for (chunk_index, chunk) in bytes.chunks(ROOT_CONTENT_CHUNK_BYTES).enumerate() {
-        verify_content_chunk(entry, chunk_index, chunk)?;
-    }
-    Ok(())
-}
-
-fn verify_content_chunk(
-    entry: &RootFileExtentEntry,
-    chunk_index: usize,
-    bytes: &[u8],
-) -> core::result::Result<(), fatfs::Error<DiskIoError>> {
-    let expected = entry
-        .chunk_sha256
-        .get(chunk_index)
-        .ok_or(fatfs::Error::InvalidInput)?;
-    let actual: [u8; 32] = Sha256::digest(bytes).into();
-    if &actual != expected {
-        crate::debug::error!(
-            storage,
-            "boot volume content digest mismatch path={} chunk={}",
-            entry.path,
-            chunk_index
-        );
-        return Err(fatfs::Error::InvalidInput);
-    }
-    Ok(())
-}
-
-fn read_extent_bytes(
-    device: &mut crate::storage::block::FatRegistryDevice,
-    block_size: usize,
-    mut offset: usize,
-    mut len: usize,
-    dest: &mut [u8],
-) -> core::result::Result<(), fatfs::Error<DiskIoError>> {
-    let mut done = 0usize;
-    while len != 0 {
-        let block_offset = offset % block_size;
-        let aligned_offset = offset - block_offset;
-        let chunk_payload = len.min(ROOT_EXTENT_READ_CHUNK_CAP);
-        let read_len = (block_offset + chunk_payload).div_ceil(block_size) * block_size;
-        let lba = (aligned_offset / block_size) as u64;
-        let mut scratch = vec![0_u8; read_len];
-        device
-            .read_blocks(lba, scratch.as_mut_slice())
-            .map_err(fatfs::Error::Io)?;
-        dest[done..done + chunk_payload]
-            .copy_from_slice(&scratch[block_offset..block_offset + chunk_payload]);
-        done += chunk_payload;
-        offset += chunk_payload;
-        len -= chunk_payload;
-        if len != 0 {
-            crate::multitask::cond_resched();
-        }
-    }
-    Ok(())
-}
-fn read_file_into_from_fs(
-    fs: &BootVolumeFs,
-    path: &str,
-    dest: &mut [u8],
-    mut after_chunk: impl FnMut(usize, usize),
-) -> core::result::Result<usize, fatfs::Error<DiskIoError>> {
-    let mut file = fs.open_file(path)?;
-    let mut done = 0usize;
-    while done < dest.len() {
-        let remaining = dest.len() - done;
-        let chunk_len = remaining.min(BOOT_VOLUME_READ_CHUNK_CAP);
-        let count = file.read(&mut dest[done..done + chunk_len])?;
-        after_chunk(done, count);
-        if count == 0 {
-            break;
-        }
-        done += count;
-        if done < dest.len() {
-            crate::multitask::cond_resched();
-        }
-    }
-    Ok(done)
-}
-
-impl PhysicalBootVolume {
-    pub fn open(
-        identity: BootVolumeIdentity,
-    ) -> core::result::Result<Self, fatfs::Error<DiskIoError>> {
-        if identity.validate().is_err() || !identity.is_present() {
-            return Err(fatfs::Error::Io(DiskIoError::NotPresent));
-        }
-        let opener = (*PHYSICAL_BOOT_BLOCK_DEVICE_OPENER.lock())
-            .ok_or(fatfs::Error::Io(DiskIoError::NotPresent))?;
-        let device = opener(identity)?;
-        let fs = fat::open_volume(device)?;
-        Ok(Self { fs })
+    if previous_payload_end != header.total_bytes {
+        return Err(BootstrapImageError::Invalid);
     }
 
-    pub fn open_current() -> core::result::Result<Self, fatfs::Error<DiskIoError>> {
-        let identity = boot_volume_identity().ok_or(fatfs::Error::Io(DiskIoError::NotPresent))?;
-        Self::open(identity)
+    let Some((start, end, expected_digest)) = found else {
+        return Ok(None);
+    };
+    let start = usize::try_from(start).map_err(|_| BootstrapImageError::Invalid)?;
+    let end = usize::try_from(end).map_err(|_| BootstrapImageError::Invalid)?;
+    let payload = bytes.get(start..end).ok_or(BootstrapImageError::Invalid)?;
+    let digest: [u8; 32] = Sha256::digest(payload).into();
+    if digest != expected_digest {
+        return Err(BootstrapImageError::Invalid);
     }
-
-    pub fn open_or_create_truncated_file(
-        &self,
-        path: &str,
-    ) -> core::result::Result<PhysicalBootVolumeFile<'_>, fatfs::Error<DiskIoError>> {
-        let mut file = self.create_file(path)?;
-        file.seek(SeekFrom::Start(0))?;
-        file.truncate()?;
-        file.seek(SeekFrom::Start(0))?;
-        Ok(file)
-    }
-
-    pub fn open_or_create_append_file(
-        &self,
-        path: &str,
-    ) -> core::result::Result<PhysicalBootVolumeFile<'_>, fatfs::Error<DiskIoError>> {
-        let mut file = self.create_file(path)?;
-        file.seek(SeekFrom::End(0))?;
-        Ok(file)
-    }
-
-    pub fn open_file(
-        &self,
-        path: &str,
-    ) -> core::result::Result<PhysicalBootVolumeFile<'_>, fatfs::Error<DiskIoError>> {
-        self.fs.open_file(path).map(PhysicalBootVolumeFile)
-    }
-
-    pub fn create_file(
-        &self,
-        path: &str,
-    ) -> core::result::Result<PhysicalBootVolumeFile<'_>, fatfs::Error<DiskIoError>> {
-        self.fs.create_file(path).map(PhysicalBootVolumeFile)
-    }
-
-    pub fn metadata(
-        &self,
-        path: &str,
-    ) -> core::result::Result<BootVolumeMetadata, fatfs::Error<DiskIoError>> {
-        self.fs.metadata(path)
-    }
-
-    pub fn read_dir(
-        &self,
-        path: &str,
-    ) -> core::result::Result<Vec<BootVolumeDirEntry>, fatfs::Error<DiskIoError>> {
-        self.fs.read_dir(path)
-    }
-
-    pub fn create_dir(&self, path: &str) -> core::result::Result<(), fatfs::Error<DiskIoError>> {
-        self.fs.create_dir(path)
-    }
-
-    pub fn remove_file(&self, path: &str) -> core::result::Result<(), fatfs::Error<DiskIoError>> {
-        self.fs.remove_file(path)
-    }
-
-    pub fn remove_dir(&self, path: &str) -> core::result::Result<(), fatfs::Error<DiskIoError>> {
-        self.fs.remove_dir(path)
-    }
-
-    pub fn rename(
-        &self,
-        src: &str,
-        dst: &str,
-    ) -> core::result::Result<(), fatfs::Error<DiskIoError>> {
-        self.fs.rename(src, dst)
-    }
-
-    pub fn read_file_to_vec(
-        &self,
-        path: &str,
-    ) -> core::result::Result<Vec<u8>, fatfs::Error<DiskIoError>> {
-        read_file_to_vec_from_fs(&self.fs, path)
-    }
-
-    pub fn read_file_into(
-        &self,
-        path: &str,
-        dest: &mut [u8],
-    ) -> core::result::Result<usize, fatfs::Error<DiskIoError>> {
-        read_file_into_from_fs(&self.fs, path, dest, |_, _| {})
-    }
-
-    pub fn append_bytes(
-        &self,
-        path: &str,
-        bytes: &[u8],
-        flush: bool,
-    ) -> core::result::Result<(), fatfs::Error<DiskIoError>> {
-        let mut file = self.open_or_create_append_file(path)?;
-        let mut written = 0usize;
-        while written < bytes.len() {
-            let count = file.write(&bytes[written..])?;
-            if count == 0 {
-                return Err(fatfs::Error::Io(DiskIoError::WriteZero));
-            }
-            written += count;
-        }
-        if flush {
-            file.flush()?;
-        }
-        Ok(())
-    }
-
-    pub fn close(self) -> core::result::Result<(), fatfs::Error<DiskIoError>> {
-        self.fs.unmount()
-    }
-}
-
-pub fn read_file_to_vec(path: &str) -> core::result::Result<Vec<u8>, fatfs::Error<DiskIoError>> {
-    if let Some(bytes) = read_file_to_vec_from_extents(path)? {
-        return Ok(bytes);
-    }
-    if path == "services/rootd/rootd.elf" {
-        let (state, entries) = match &*ROOT_FILE_EXTENTS.lock() {
-            RootFileExtentState::Uninitialized => ("uninitialized", 0),
-            RootFileExtentState::Ready(table) => ("ready", table.entries.len()),
-            RootFileExtentState::Disabled => ("disabled", 0),
-        };
-        crate::debug::warn!(
-            storage,
-            "boot volume extents: services/rootd lookup state={} entries={}",
-            state,
-            entries
-        );
-    }
-    Err(fatfs::Error::NotFound)
-}
-
-pub fn read_file_into(
-    path: &str,
-    dest: &mut [u8],
-) -> core::result::Result<usize, fatfs::Error<DiskIoError>> {
-    if let Some(bytes) = read_file_to_vec_from_extents(path)? {
-        let len = bytes.len().min(dest.len());
-        dest[..len].copy_from_slice(&bytes[..len]);
-        return Ok(len);
-    }
-    Err(fatfs::Error::NotFound)
-}
-
-pub fn metadata(path: &str) -> core::result::Result<BootVolumeMetadata, fatfs::Error<DiskIoError>> {
-    if let Some(metadata) = metadata_from_extents(path)? {
-        return Ok(metadata);
-    }
-    Err(fatfs::Error::NotFound)
-}
-
-pub fn read_dir(
-    path: &str,
-) -> core::result::Result<Vec<BootVolumeDirEntry>, fatfs::Error<DiskIoError>> {
-    let _ = path;
-    Err(fatfs::Error::Io(DiskIoError::Unsupported))
+    Ok(Some(payload))
 }
 
 fn boot_info() -> Option<&'static BootInfo> {
@@ -999,61 +225,42 @@ fn boot_info() -> Option<&'static BootInfo> {
     unsafe { BootInfo::from_ptr(boot_info_ptr.cast_const()) }.ok()
 }
 
-fn boot_extent_manifest() -> Option<BootExtentManifest> {
-    let manifest = boot_info()?.boot_extent_manifest;
-    manifest.validate().is_ok().then_some(manifest)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{RootFileExtentEntry, parse_root_file_extent_table, verify_all_content_chunks};
-    use alloc::string::ToString;
+    use super::{BootstrapImageError, early_system_payload};
     use alloc::vec;
+    use boot_protocol::{
+        EARLY_SYSTEM_ENTRY_BYTES, EARLY_SYSTEM_HEADER_BYTES, EarlySystemEntry, EarlySystemHeader,
+    };
     use sha2::{Digest, Sha256};
 
     #[test]
-    fn root_extent_manifest_binds_exact_file_content_and_coverage() {
-        let payload = b"rootd bootstrap payload";
+    fn early_system_lookup_verifies_exact_path_and_payload_digest() {
+        let payload = b"rootd early payload";
+        let header = EarlySystemHeader::new(1, 4096, 4096 + payload.len() as u64).unwrap();
         let digest: [u8; 32] = Sha256::digest(payload).into();
-        let digest_hex = digest
-            .iter()
-            .map(|byte| alloc::format!("{byte:02x}"))
-            .collect::<alloc::string::String>();
-        let manifest = alloc::format!(
-            "path=/services/rootd/rootd.elf\tlen={}\textents=4096:{}\tsha256_chunks={}\n",
-            payload.len(),
-            payload.len(),
-            digest_hex,
+        let entry = EarlySystemEntry::new(
+            b"services/rootd/rootd.elf",
+            4096,
+            payload.len() as u64,
+            digest,
+        )
+        .unwrap();
+        let mut image = vec![0_u8; header.total_bytes as usize];
+        image[..EARLY_SYSTEM_HEADER_BYTES].copy_from_slice(&header.encode().unwrap());
+        image[EARLY_SYSTEM_HEADER_BYTES..EARLY_SYSTEM_HEADER_BYTES + EARLY_SYSTEM_ENTRY_BYTES]
+            .copy_from_slice(&entry.encode(header).unwrap());
+        image[4096..].copy_from_slice(payload);
+
+        assert_eq!(
+            early_system_payload(&image, "/services/rootd/rootd.elf").unwrap(),
+            Some(payload.as_slice())
         );
-        let table = parse_root_file_extent_table(manifest.as_bytes()).unwrap();
-        assert_eq!(table.entries.len(), 1);
-        assert!(verify_all_content_chunks(&table.entries[0], payload).is_ok());
-        assert!(verify_all_content_chunks(&table.entries[0], b"mutated payload").is_err());
-    }
-
-    #[test]
-    fn root_extent_manifest_rejects_aliases_gaps_and_digest_shape() {
-        let digest = "00".repeat(32);
-        let duplicate = alloc::format!(
-            "path=/a\tlen=1\textents=1:1\tsha256_chunks={digest}\n\
-             path=/a\tlen=1\textents=2:1\tsha256_chunks={digest}\n"
+        assert_eq!(early_system_payload(&image, "/services/missing"), Ok(None));
+        image[4096] ^= 0xff;
+        assert_eq!(
+            early_system_payload(&image, "/services/rootd/rootd.elf"),
+            Err(BootstrapImageError::Invalid)
         );
-        assert!(parse_root_file_extent_table(duplicate.as_bytes()).is_err());
-
-        let short_coverage =
-            alloc::format!("path=/a\tlen=2\textents=1:1\tsha256_chunks={digest}\n");
-        assert!(parse_root_file_extent_table(short_coverage.as_bytes()).is_err());
-
-        let bad_digest = b"path=/a\tlen=1\textents=1:1\tsha256_chunks=abcd\n";
-        assert!(parse_root_file_extent_table(bad_digest).is_err());
-
-        let empty = RootFileExtentEntry {
-            path: "/empty".to_string(),
-            len: 0,
-            extents: vec![],
-            chunk_sha256: vec![],
-        };
-        assert!(verify_all_content_chunks(&empty, &[]).is_ok());
     }
 }
-// RING3-MIGRATION-REFERENCE END: vfsd/storaged-owned boot-volume policy bootstrap exception.

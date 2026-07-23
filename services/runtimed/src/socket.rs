@@ -6,6 +6,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::time::Instant;
 
 use runtime_control::RuntimeRunningProgram;
+use rustos_user_abi::syscall::IPC_SERVICE_UISERVER;
 
 use super::{
     boot_line, LAUNCH_TARGET_NEW_SESSION, MAX_POLICY_LAUNCH_ATTEMPTS_PER_TICK,
@@ -15,6 +16,11 @@ use super::{
     UI_SERVER_EXEC_PATH,
 };
 use super::{BrokerState, LaunchEntry, RuntimeRequest, RuntimeResponse};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RuntimePeerCredentials {
+    pid: i32,
+}
 
 pub(super) fn bind_listener(path: &str) -> Result<UnixListener, i32> {
     let started_at = Instant::now();
@@ -106,9 +112,9 @@ pub(super) fn service_listener(listener: &UnixListener, state: &mut BrokerState)
     let mut did_work = false;
     for _ in 0..MAX_RUNTIME_CLIENTS_PER_TICK {
         match accept_runtime_client(listener) {
-            Ok((mut stream, _)) => {
+            Ok((mut stream, peer)) => {
                 did_work = true;
-                if let Err(err) = service_stream(&mut stream, state) {
+                if let Err(err) = service_stream(&mut stream, peer, state) {
                     let _ = super::util::write_response(
                         &mut stream,
                         RuntimeResponse {
@@ -138,7 +144,9 @@ pub(super) fn service_listener(listener: &UnixListener, state: &mut BrokerState)
     did_work
 }
 
-fn accept_runtime_client(listener: &UnixListener) -> std::io::Result<(UnixStream, ())> {
+fn accept_runtime_client(
+    listener: &UnixListener,
+) -> std::io::Result<(UnixStream, RuntimePeerCredentials)> {
     let fd = unsafe {
         libc::accept4(
             listener.as_raw_fd(),
@@ -150,16 +158,78 @@ fn accept_runtime_client(listener: &UnixListener) -> std::io::Result<(UnixStream
     if fd < 0 {
         return Err(std::io::Error::last_os_error());
     }
-    Ok((unsafe { UnixStream::from_raw_fd(fd) }, ()))
+    let stream = unsafe { UnixStream::from_raw_fd(fd) };
+    let peer = runtime_peer_credentials(stream.as_raw_fd())?;
+    Ok((stream, peer))
 }
 
-fn service_stream(stream: &mut UnixStream, state: &mut BrokerState) -> Result<(), i32> {
+fn runtime_peer_credentials(fd: i32) -> std::io::Result<RuntimePeerCredentials> {
+    let mut credentials = unsafe { std::mem::zeroed::<libc::ucred>() };
+    let mut credentials_len = size_of::<libc::ucred>() as libc::socklen_t;
+    let status = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut credentials as *mut libc::ucred).cast::<libc::c_void>(),
+            &mut credentials_len,
+        )
+    };
+    if status < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if credentials_len as usize != size_of::<libc::ucred>() || credentials.pid <= 0 {
+        return Err(std::io::Error::from_raw_os_error(libc::EPROTO));
+    }
+    Ok(RuntimePeerCredentials {
+        pid: credentials.pid,
+    })
+}
+
+fn runtime_request_role_authorized(op: u16, is_uiserver: bool, is_logical_admin: bool) -> bool {
+    match op {
+        OP_NOTIFY_READY => is_uiserver,
+        OP_SNAPSHOT_RUNNING_PROGRAMS | OP_REQUEST_LAUNCH_PATH | OP_REQUEST_TERMINATE => {
+            is_uiserver || is_logical_admin
+        }
+        _ => false,
+    }
+}
+
+fn authorize_runtime_request(
+    request: &RuntimeRequest,
+    peer: RuntimePeerCredentials,
+    state: &BrokerState,
+) -> Result<(), i32> {
+    if peer.pid <= 0 {
+        return Err(libc::EACCES);
+    }
+    let peer_pid = peer.pid as u64;
+    let is_uiserver =
+        rustos_svc_runtime::ipc::validate_service_owner(IPC_SERVICE_UISERVER, peer_pid) >= 0;
+    let is_logical_admin = state
+        .running
+        .get(&peer.pid)
+        .is_some_and(|process| process.logical_admin);
+    if runtime_request_role_authorized(request.op, is_uiserver, is_logical_admin) {
+        Ok(())
+    } else {
+        Err(libc::EACCES)
+    }
+}
+
+fn service_stream(
+    stream: &mut UnixStream,
+    peer: RuntimePeerCredentials,
+    state: &mut BrokerState,
+) -> Result<(), i32> {
     let mut request = RuntimeRequest::default();
     read_exact_retry(stream, super::util::as_bytes_mut(&mut request))?;
     if request.version != PROTOCOL_VERSION {
         return Err(libc::EPROTO);
     }
     super::util::validate_runtime_request(&request)?;
+    authorize_runtime_request(&request, peer, state)?;
 
     match request.op {
         OP_SNAPSHOT_RUNNING_PROGRAMS => handle_snapshot(stream, state),
@@ -507,4 +577,37 @@ fn last_errno() -> i32 {
     std::io::Error::last_os_error()
         .raw_os_error()
         .unwrap_or(libc::EIO)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        runtime_request_role_authorized, OP_NOTIFY_READY, OP_REQUEST_LAUNCH_PATH,
+        OP_REQUEST_TERMINATE, OP_SNAPSHOT_RUNNING_PROGRAMS,
+    };
+
+    #[test]
+    fn runtime_control_mutations_require_live_uiserver_or_logical_admin() {
+        for op in [
+            OP_SNAPSHOT_RUNNING_PROGRAMS,
+            OP_REQUEST_LAUNCH_PATH,
+            OP_REQUEST_TERMINATE,
+        ] {
+            assert!(runtime_request_role_authorized(op, true, false));
+            assert!(runtime_request_role_authorized(op, false, true));
+            assert!(!runtime_request_role_authorized(op, false, false));
+        }
+
+        assert!(runtime_request_role_authorized(
+            OP_NOTIFY_READY,
+            true,
+            false
+        ));
+        assert!(!runtime_request_role_authorized(
+            OP_NOTIFY_READY,
+            false,
+            true
+        ));
+        assert!(!runtime_request_role_authorized(u16::MAX, true, true));
+    }
 }

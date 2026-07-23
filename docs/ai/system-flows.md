@@ -5,6 +5,26 @@ rules stay in `contracts-abi.md`; build and proof infrastructure stays in
 `contracts-infra.md`. The executable source of truth for the flows below is
 `formal/system-flows.tsv`, checked by `formal/check-system-flows.sh`.
 
+## Zero-trust service request composition
+
+Every published endpoint follows one end-to-end chain: rootd admits endpoint
+discovery, the kernel stamps the immediate sender, the receiving service
+validates exact wire shape plus direct identity or a live service-owner
+delegation, the subsystem owner rechecks object rights and generation, and the
+caller admits only an exact request-bound response. A check performed by an
+earlier hop is evidence, never authority for a later hop. The executable flow
+is `zero-trust-e2e`; the per-subsystem inventory is
+`formal/trust-boundaries.tsv`.
+Identity-blind receive wrappers are intentionally absent from
+`rustos-svc-runtime`; `formal/check-zero-trust-ingress.sh` rejects direct raw
+receive use by any service and requires every published endpoint source to be
+registered with explicit identity, delegation, object, and response policy.
+`formal/zero-trust-subsystems.tsv` extends the same gate to boot/image parsers,
+user memory, all DVM shared-memory consumers, local service sockets, and network
+frames. The checker discovers new `dvm_*.rs` and service listener sources and
+fails until shape, authority, revoke/generation, model, and source witnesses are
+declared.
+
 ## Why this layer exists
 
 Local contracts do not prove that their composition is safe. A correct
@@ -67,8 +87,20 @@ they are not an exception to RustOS kernel/service lifecycle contracts.
 | `endpoint-lifecycle` | create → owner/epoch publication → same-process worker use → non-final or final exit | IPC runtime, compat registry, process table | continued process ownership, final revoke, stale-publication rejection |
 | `service-restart` | observed exit → revoke → bounded backoff → checkpoint rebase → new epoch publication or terminal failure | `rootd`, retained checkpoint owner, compat registry | recovered service or failed supervisor |
 | `service-bootstrap` | raw ELF entry → stack-aligned Rust supervisor → non-final helper handoff → initd activation → manifest-derived dependency lookup | `rootd`, `kernel-compat`, `kernel-ps`, `initd` | aligned admission, preserved process authority, declared lookup success, undeclared/contract-error rejection |
-| `boot-volume-read` | exact range validation → bounded broker chunks → physical dispatch | `vfsd`, compat block broker, `kernel/io-manager` | complete, invalid request, timeout, revoke, transport failure |
+| `root-authority` | first rootd-owned endpoint → sealed boot owner → exact lease authorization → publisher endpoint-owner proof → same-rootd-epoch commit | `rootd`, compat registry, IPC runtime | published root/service authority, foreign root reclaim rejection, stale grant rejection |
+| `service-call-authority` | authorized lookup → exact process/endpoint-epoch grant → call admission → response, revoke, or process-exit cleanup | compat registry, IPC runtime | owner/grantee success, guessed endpoint rejection, stale grant revoke |
+| `runtime-control-ingress` | accept → `SO_PEERCRED` PID → live uiserver/logical-admin role check → dispatch or deny | `netd`, `runtimed`, signed launch registry | authorized command, foreign denial, service/process revoke |
+| `boot-storage-handoff` | exclusive whole-device freeze → bounded host flush → VFIO assignment → durable exact runtime record → generation-authenticated DVM readiness → exact-exit revoke → host restore or quarantine | `hostd`, storage DVM, `storaged` | active DVM volume, ordered recovery, stale-readiness rejection, quarantine |
+| `dvm-block-startup` | fixed-aperture install → initial generation check → waiter registration → provider publication → atomic recheck → generation-bound FLUSH round trip → volume use | `kernel/io-manager`, `kernel-compat`, storage DVM, `storaged` | proven active volume, bounded timeout, transport revoke |
+| `deferred-process-activation` | deferred spawn → kernel-owned exact requester binding → optional loader restart → one-shot activation or requester-exit revoke | `loaderd`, `kernel-compat`, `kernel-ps` | runnable target, denied foreign caller, revoked suspended target |
+| `loader-request-authority` | identity-only initd publication → kernel-stamped loader sender → live role admission → image loading → terminal ring0 role revalidation | `rootd`, `initd`, `sessiond`, `procd`, `loaderd`, `kernel-compat` | committed spawn/exec, foreign denial, restart/revoke denial |
+| `post-init-service-authority` | deferred child creation → exact `(target, supervisor)` ring0 proof → declared-path match → lease publication → endpoint-owner capability | `initd`, `sessiond`, `rootd`, `loaderd`, `kernel-compat` | live service lease, malformed/foreign denial, reporter-exit cascade |
+| `durable-block-mutation` | live-generation admission → WRITE/FUA submission → accepted completion → FLUSH or stable completion → durable-through operation ID | `storaged`, compat block broker, `kernel/io-manager`, storage DVM | durable, timeout/cancel, generation revoke |
+| `dvm-volume-io` | exact range validation → bounded broker chunks → generation-bound DVM dispatch | `vfsd`, `storaged`, compat block broker, `kernel/io-manager` | complete, invalid request, timeout, revoke, transport failure |
+| `remote-file-map` | mapping admission → immutable early-system or DVM-volume ownership → source-bounded reads → exact-length copy → address-space commit | `loaderd`, `vfsd`, `kernel-compat`, `kernel/mm` | mapped, short-read abort, immutable-owner loss, transport failure |
 | `memory-map` | canonical checked range → page install → W^X protection changes → unmap | compat MM broker, `kernel/mm` | mapped, rejected, unmapped |
+| `syscall-simd-lifecycle` | trust-boundary user snapshot → kernel continuation → optional block/preemption → exact-task restore | `kernel-compat`, `kernel-ps` | returned, nested capture rejection, wrong-task restore rejection |
+| `pci-resource-discovery` | disable command decode → probe/restore low BAR → probe/restore optional high BAR → lowest-mask-bit size decode → command restore/publication | `kernel-hal` | exact resource, invalid-mask rejection, fully restored hardware |
 
 ## External design baselines
 

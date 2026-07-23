@@ -10,6 +10,7 @@ fontdue = "0.9.3"
 [dependencies]
 driver-domain-protocol = { path = "../../libs/driver-domain-protocol" }
 observability-client = { path = "../../libs/observability-client" }
+rustos-svc-runtime = { path = "../../libs/rustos-svc-runtime" }
 rustos-user-abi = { path = "../../libs/rustos-user-abi" }
 embedded-graphics = "0.8"
 keyboard-core = { path = "../../drivers/libs/keyboard-core" }

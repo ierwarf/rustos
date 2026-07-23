@@ -19,3 +19,6 @@ object = { version = "0.38.1", default-features = false, features = ["read_core"
 spin = "0.10.0"
 x86_64 = { version = "0.15.4", default-features = false, features = ["instructions", "abi_x86_interrupt"] }
 xmas-elf = { version = "0.9", default-features = false }
+
+[dev-dependencies]
+boot-random = { path = "../../libs/boot-random", features = ["deterministic-test-seed"] }

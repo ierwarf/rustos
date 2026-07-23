@@ -50,7 +50,7 @@ pub(crate) fn commit_prepared_executable(
                 flags: request.flags as u64,
                 console_session: request.console_session,
                 weight_micros: request.weight_micros,
-                reserved0: 0,
+                requester_pid: request.requester_pid,
             };
             unsafe {
                 syscall1(
@@ -73,6 +73,7 @@ pub(crate) fn commit_prepared_executable(
                 envp_ptr,
                 console_session: request.console_session,
                 weight_micros: request.weight_micros,
+                requester_pid: request.requester_pid,
                 ..RustosProcExecTargetBrokerArgs::default()
             };
             unsafe {

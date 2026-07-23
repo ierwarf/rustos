@@ -7,9 +7,9 @@ use core::mem::size_of;
 use core::ptr;
 
 use boot_protocol::{
-    BOOT_INFO_MAGIC, BOOT_INFO_VERSION, BootExtentManifest, BootInfo, BootMemoryKind,
-    BootMemoryMap, BootMemoryRegion, BootPixelFormat, BootVolumeIdentity, FramebufferInfo,
-    NucleusImageInfo, rng_seed_usable,
+    BOOT_INFO_MAGIC, BOOT_INFO_VERSION, BootInfo, BootMemoryKind, BootMemoryMap, BootMemoryRegion,
+    BootPixelFormat, BootVolumeIdentity, EarlySystemImage, FramebufferInfo, NucleusImageInfo,
+    rng_seed_usable,
 };
 
 const MULTIBOOT2_BOOTLOADER_MAGIC: u32 = 0x36d7_6289;
@@ -27,7 +27,7 @@ const TAG_ACPI_OLD: u32 = 14;
 const TAG_ACPI_NEW: u32 = 15;
 const TAG_EFI_MMAP: u32 = 17;
 const TAG_LOAD_BASE_ADDR: u32 = 21;
-const ROOT_EXTENTS_MODULE_CMDLINE: &[u8] = b"rustos-root-extents";
+const EARLY_SYSTEM_MODULE_CMDLINE: &[u8] = b"rustos-early-system";
 
 #[repr(C)]
 struct RawTag {
@@ -126,9 +126,10 @@ pub fn build_boot_info(magic: u32, mbi_addr: u32) -> *const BootInfo {
             entry_count: entry_count as u32,
             _reserved0: 0,
         },
-        boot_extent_manifest: tags
-            .root_extent_manifest()
-            .unwrap_or_else(BootExtentManifest::empty),
+        _reserved_storage_bootstrap: [0; 2],
+        early_system_image: tags
+            .early_system_image()
+            .unwrap_or_else(EarlySystemImage::empty),
     };
 
     if boot_info.validate().is_err() {
@@ -335,9 +336,15 @@ impl Tags {
         }
     }
 
-    fn root_extent_manifest(&self) -> Option<BootExtentManifest> {
+    fn early_system_image(&self) -> Option<EarlySystemImage> {
+        let (ptr, len) = self.module_range_by_cmdline(EARLY_SYSTEM_MODULE_CMDLINE)?;
+        Some(EarlySystemImage { ptr, len })
+    }
+
+    fn module_range_by_cmdline(&self, expected_cmdline: &[u8]) -> Option<(u64, u64)> {
         let mut cursor = self.base + 8;
         let end = self.base.checked_add(self.total_size)?;
+        let mut found = None;
         while cursor + size_of::<RawTag>() <= end {
             let tag = unsafe { &*(cursor as *const RawTag) };
             if tag.ty == TAG_END {
@@ -347,19 +354,20 @@ impl Tags {
                 return None;
             }
             if tag.ty == TAG_MODULE {
-                if let Some(manifest) = self.root_extent_manifest_from_module_tag(tag)
-                    && manifest.is_present()
-                {
-                    return Some(manifest);
+                if let Some(range) = self.module_range_from_tag(tag, expected_cmdline) {
+                    if found.is_some() {
+                        return None;
+                    }
+                    found = Some(range);
                 }
             }
             cursor = align_up(cursor + tag.size as usize, 8)?;
         }
-        None
+        found
     }
 
-    fn root_extent_manifest_from_module_tag(&self, tag: &RawTag) -> Option<BootExtentManifest> {
-        if (tag.size as usize) < size_of::<RawModuleTag>() + ROOT_EXTENTS_MODULE_CMDLINE.len() {
+    fn module_range_from_tag(&self, tag: &RawTag, expected_cmdline: &[u8]) -> Option<(u64, u64)> {
+        if (tag.size as usize) < size_of::<RawModuleTag>() + expected_cmdline.len() {
             return None;
         }
         let raw = unsafe { ptr::read_unaligned(tag as *const RawTag as *const RawModuleTag) };
@@ -373,13 +381,10 @@ impl Tags {
         let cmdline =
             unsafe { core::slice::from_raw_parts(cmdline_start as *const u8, cmdline_len) };
         let cmdline = cmdline.split(|byte| *byte == 0).next().unwrap_or(cmdline);
-        if cmdline != ROOT_EXTENTS_MODULE_CMDLINE {
+        if cmdline != expected_cmdline {
             return None;
         }
-        Some(BootExtentManifest {
-            ptr: start,
-            len: end - start,
-        })
+        Some((start, end - start))
     }
 
     fn find_tag(&self, ty: u32) -> Option<&RawTag> {
@@ -472,7 +477,8 @@ const fn empty_boot_info() -> BootInfo {
         framebuffer: FramebufferInfo::empty(),
         nucleus_image: NucleusImageInfo::empty(),
         memory_map: BootMemoryMap::empty(),
-        boot_extent_manifest: BootExtentManifest::empty(),
+        _reserved_storage_bootstrap: [0; 2],
+        early_system_image: EarlySystemImage::empty(),
     }
 }
 
@@ -598,21 +604,29 @@ mod tests {
 
         assert_eq!(tags.acpi_rsdp_addr(), None);
         assert_eq!(tags.load_base_addr(), None);
-        assert_eq!(tags.root_extent_manifest(), None);
         assert_eq!(tags.write_memory_map(&mut regions), 0);
     }
 
     #[test]
-    fn finds_root_extent_manifest_module() {
+    fn finds_one_early_system_module_and_rejects_duplicates() {
         let mut mbi = mbi_header();
-        push_module_tag(&mut mbi, 0x4000, 0x4800, b"ignored-module");
-        push_module_tag(&mut mbi, 0x5000, 0x5400, ROOT_EXTENTS_MODULE_CMDLINE);
+        push_module_tag(&mut mbi, 0x6000, 0x7000, EARLY_SYSTEM_MODULE_CMDLINE);
         finish_mbi(&mut mbi);
-
         let tags = unsafe { Tags::new(mbi.as_ptr() as usize) };
-        let manifest = tags.root_extent_manifest().expect("root extents module");
-        assert_eq!(manifest.ptr, 0x5000);
-        assert_eq!(manifest.len, 0x400);
+        assert_eq!(
+            tags.early_system_image(),
+            Some(EarlySystemImage {
+                ptr: 0x6000,
+                len: 0x1000
+            })
+        );
+
+        let mut duplicate = mbi_header();
+        push_module_tag(&mut duplicate, 0x6000, 0x7000, EARLY_SYSTEM_MODULE_CMDLINE);
+        push_module_tag(&mut duplicate, 0x8000, 0x9000, EARLY_SYSTEM_MODULE_CMDLINE);
+        finish_mbi(&mut duplicate);
+        let tags = unsafe { Tags::new(duplicate.as_ptr() as usize) };
+        assert_eq!(tags.early_system_image(), None);
     }
 
     fn tags_with_framebuffer(red_position: u8, blue_position: u8) -> Vec<u8> {

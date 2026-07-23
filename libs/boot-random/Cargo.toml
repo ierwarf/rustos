@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+[features]
+# Unit-test harnesses that exercise token minting without running the boot
+# executive may opt into one explicit deterministic master. Production builds
+# never enable this feature and still fail closed before boot entropy init.
+deterministic-test-seed = []
+
 [dependencies]
 boot-protocol = { path = "../../boot/boot-protocol" }
 rand_chacha = { version = "0.10", default-features = false }

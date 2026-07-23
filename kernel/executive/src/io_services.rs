@@ -1,7 +1,5 @@
 extern crate alloc;
 
-use alloc::string::String;
-use alloc::vec::Vec;
 use boot_protocol::{BootInfo, BootVolumeIdentity, BootVolumeTransport};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -24,17 +22,6 @@ pub(crate) struct InputEventQueueDebugSnapshot {
     pub pending_pointer_position: bool,
     pub dropped_discrete: u64,
     pub dropped_lossy: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct BlockDescriptor {
-    pub id: u32,
-    pub path: String,
-    pub transport: storage_core::TransportKind,
-    pub readonly: bool,
-    pub logical_block_size: usize,
-    pub start_block: u64,
-    pub block_count: u64,
 }
 
 mod backend {
@@ -94,6 +81,10 @@ mod backend {
         kernel_io_manager::api::boot::init_dvm_network_provider()
     }
 
+    pub(crate) fn init_dvm_block_provider() -> bool {
+        kernel_io_manager::api::boot::init_dvm_block_provider()
+    }
+
     pub(crate) fn gui_try_present_panic_blackout() -> bool {
         kernel_io_manager::api::io::gui::try_present_panic_blackout()
     }
@@ -130,29 +121,6 @@ mod backend {
         kernel_io_manager::api::boot::enter_userspace_runtime();
     }
 
-    pub(crate) fn register_boot_volume_opener() {
-        kernel_io_manager::api::block::register_boot_volume_opener();
-    }
-
-    pub(crate) fn init_block_devices() {
-        kernel_io_manager::api::block::init_block_devices();
-    }
-
-    pub(crate) fn block_descriptors() -> Vec<BlockDescriptor> {
-        kernel_io_manager::api::block::descriptors()
-            .into_iter()
-            .map(|descriptor| BlockDescriptor {
-                id: descriptor.id,
-                path: descriptor.path,
-                transport: descriptor.transport,
-                readonly: descriptor.readonly,
-                logical_block_size: descriptor.logical_block_size,
-                start_block: descriptor.start_block,
-                block_count: descriptor.block_count,
-            })
-            .collect()
-    }
-
     pub(crate) fn init_input() {
         kernel_io_manager::api::input::init();
     }
@@ -172,10 +140,9 @@ mod backend {
 }
 
 pub(crate) use backend::{
-    block_descriptors, boot_volume_identity, boot_volume_transport_hint, bootstrap_phase,
-    console_write, enter_kernel_vfs_runtime, enter_userspace_runtime, gui_init,
-    gui_try_present_panic_blackout, init_block_devices, init_boot_info, init_dvm_display_provider,
-    init_dvm_network_provider, init_input, init_vfs, input_debug_snapshot,
-    register_boot_volume_opener, system_console_session_raw, tty_init, userspace_display_active,
-    userspace_ready,
+    boot_volume_identity, boot_volume_transport_hint, bootstrap_phase, console_write,
+    enter_kernel_vfs_runtime, enter_userspace_runtime, gui_init, gui_try_present_panic_blackout,
+    init_boot_info, init_dvm_block_provider, init_dvm_display_provider, init_dvm_network_provider,
+    init_input, init_vfs, input_debug_snapshot, system_console_session_raw, tty_init,
+    userspace_display_active, userspace_ready,
 };

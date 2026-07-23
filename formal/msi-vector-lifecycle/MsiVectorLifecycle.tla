@@ -3,59 +3,78 @@ EXTENDS Naturals, FiniteSets
 
 (***************************************************************************
 Owner: kernel HAL x86 MSI allocator and leaf handler table.
-Linearization points: monotonic vector allocation and one-shot handler CAS.
-Only an allocated vector with an installed handler may yield a device route;
-vectors are permanent and never rebound or recycled in this lifecycle.
+Linearization points: free-slot lease CAS, exact handler CAS, lease commit, and
+exact unpublished rollback. Failed MSI-X setup clears its handler before the
+slot becomes reusable. Only a committed lease with its exact handler may yield
+a device route; committed vectors remain permanent in this kernel lifetime.
 ***************************************************************************)
 
 CONSTANTS FirstVector, LastVector, Devices
 Vectors == FirstVector..LastVector
 NoDevice == "none"
-VARIABLES nextVector, allocated, handlerOwner, apicReady, routed, routeOwner
-vars == <<nextVector, allocated, handlerOwner, apicReady, routed, routeOwner>>
+VARIABLES leased, committed, handlerOwner, apicReady, routed, routeOwner
+vars == <<leased, committed, handlerOwner, apicReady, routed, routeOwner>>
 
 Init ==
-    /\ nextVector = FirstVector /\ allocated = {} /\ apicReady = FALSE
+    /\ leased = {} /\ committed = {} /\ apicReady = FALSE
     /\ routed = {}
     /\ handlerOwner = [v \in Vectors |-> NoDevice]
     /\ routeOwner = [v \in Vectors |-> NoDevice]
 
-Allocate ==
-    /\ nextVector <= LastVector
-    /\ allocated' = allocated \cup {nextVector}
-    /\ nextVector' = nextVector + 1
-    /\ UNCHANGED <<handlerOwner, apicReady, routed, routeOwner>>
+Allocate(v) ==
+    /\ v \notin leased
+    /\ leased' = leased \cup {v}
+    /\ UNCHANGED <<committed, handlerOwner, apicReady, routed, routeOwner>>
 
 InitializeApic ==
     /\ ~apicReady /\ apicReady' = TRUE
-    /\ UNCHANGED <<nextVector, allocated, handlerOwner, routed, routeOwner>>
+    /\ UNCHANGED <<leased, committed, handlerOwner, routed, routeOwner>>
 
 Register(v, d) ==
-    /\ v \in allocated /\ handlerOwner[v] = NoDevice /\ d \in Devices
+    /\ v \in leased /\ v \notin committed
+    /\ handlerOwner[v] = NoDevice /\ d \in Devices
     /\ handlerOwner' = [handlerOwner EXCEPT ![v] = d]
-    /\ UNCHANGED <<nextVector, allocated, apicReady, routed, routeOwner>>
+    /\ UNCHANGED <<leased, committed, apicReady, routed, routeOwner>>
+
+Commit(v, d) ==
+    /\ v \in leased /\ v \notin committed /\ handlerOwner[v] = d
+    /\ committed' = committed \cup {v}
+    /\ UNCHANGED <<leased, handlerOwner, apicReady, routed, routeOwner>>
+
+Rollback(v, d) ==
+    /\ v \in leased /\ v \notin committed /\ v \notin routed
+    /\ handlerOwner[v] \in {NoDevice, d}
+    /\ leased' = leased \ {v}
+    /\ handlerOwner' = [handlerOwner EXCEPT ![v] = NoDevice]
+    /\ UNCHANGED <<committed, apicReady, routed, routeOwner>>
 
 Route(v, d) ==
-    /\ apicReady /\ v \in allocated /\ handlerOwner[v] = d /\ v \notin routed
+    /\ apicReady /\ v \in committed /\ handlerOwner[v] = d /\ v \notin routed
     /\ routed' = routed \cup {v}
     /\ routeOwner' = [routeOwner EXCEPT ![v] = d]
-    /\ UNCHANGED <<nextVector, allocated, handlerOwner, apicReady>>
+    /\ UNCHANGED <<leased, committed, handlerOwner, apicReady>>
 
 Next ==
-    \/ Allocate \/ InitializeApic
-    \/ \E v \in Vectors, d \in Devices: Register(v, d) \/ Route(v, d)
+    \/ InitializeApic
+    \/ \E v \in Vectors: Allocate(v)
+    \/ \E v \in Vectors, d \in Devices:
+        Register(v, d) \/ Commit(v, d) \/ Rollback(v, d) \/ Route(v, d)
 Spec == Init /\ [][Next]_vars
 
 TypeOK ==
-    /\ nextVector \in FirstVector..(LastVector + 1)
-    /\ allocated \in SUBSET Vectors /\ apicReady \in BOOLEAN
+    /\ leased \in SUBSET Vectors /\ committed \in SUBSET Vectors
+    /\ apicReady \in BOOLEAN
     /\ routed \in SUBSET Vectors
     /\ handlerOwner \in [Vectors -> Devices \cup {NoDevice}]
     /\ routeOwner \in [Vectors -> Devices \cup {NoDevice}]
-HandlerRequiresAllocation == \A v \in Vectors: handlerOwner[v] # NoDevice => v \in allocated
+HandlerRequiresLease == \A v \in Vectors: handlerOwner[v] # NoDevice => v \in leased
+CommittedRequiresExactHandler ==
+    \A v \in committed: handlerOwner[v] # NoDevice
 RouteRequiresExactHandler == \A v \in routed: routeOwner[v] = handlerOwner[v] /\ handlerOwner[v] # NoDevice
-NoUnallocatedRoute == routed \subseteq allocated
-AllocatedPrefixMatchesCursor == allocated = FirstVector..(nextVector - 1)
+CommittedStaysLeased == committed \subseteq leased
+NoUncommittedRoute == routed \subseteq committed
+FreeSlotHasNoHandler ==
+    \A v \in Vectors \ leased: handlerOwner[v] = NoDevice
 MessageAuthorityRequiresReadyApic == routed # {} => apicReady
 
 =============================================================================

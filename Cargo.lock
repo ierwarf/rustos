@@ -545,6 +545,7 @@ dependencies = [
  "keyboard-core",
  "libc",
  "observability-client",
+ "rustos-svc-runtime",
  "rustos-user-abi",
 ]
 
@@ -564,6 +565,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 name = "kernel-compat"
 version = "0.1.0"
 dependencies = [
+ "boot-random",
  "kernel-hal",
  "kernel-io-manager",
  "kernel-ipc-runtime",
@@ -619,7 +621,6 @@ dependencies = [
  "driver-domain-protocol",
  "elf",
  "embedded-graphics",
- "fatfs",
  "heapless",
  "hidreport",
  "input-evdev",
@@ -635,8 +636,6 @@ dependencies = [
  "sha2",
  "smoltcp",
  "spin 0.10.0",
- "storage-core",
- "storage-fat",
  "tock-registers",
  "virtio-drivers",
  "vte",
@@ -687,6 +686,7 @@ dependencies = [
 name = "kernel-ps"
 version = "0.1.0"
 dependencies = [
+ "boot-random",
  "kernel-hal",
  "kernel-ipc-runtime",
  "kernel-lowlevel",
@@ -1017,6 +1017,7 @@ dependencies = [
  "libc",
  "observability-client",
  "runtime-control",
+ "rustos-svc-runtime",
  "rustos-user-abi",
 ]
 
@@ -1053,6 +1054,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "driver-domain-protocol",
  "libc",
  "rustos-driver-domain-host",
  "serde_json",
@@ -1239,7 +1241,6 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 name = "storage-core"
 version = "0.1.0"
 dependencies = [
- "boot-protocol",
  "fatfs",
 ]
 
@@ -1257,6 +1258,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "observability-client",
+ "rustos-svc-runtime",
  "rustos-user-abi",
 ]
 
@@ -1409,6 +1411,7 @@ dependencies = [
  "libc",
  "observability-client",
  "runtime-control",
+ "rustos-svc-runtime",
  "rustos-user-abi",
  "vte",
  "wayland-protocols",
@@ -1789,6 +1792,7 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "boot-protocol",
  "clap",
  "driver-domain-protocol",
  "fatfs",

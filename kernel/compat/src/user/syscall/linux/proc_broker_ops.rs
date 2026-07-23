@@ -13,18 +13,21 @@ use lazy_static::lazy_static;
 use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_PROCD_OP_PROCESS_PREPARE, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
     COMMERCIAL_MAX_PROTOCOL_PROCD, CommercialMaxProtocolRequest, CommercialMaxProtocolResponse,
-    IPC_SERVICE_CAP_PROCESS_LOADER, IPC_SERVICE_CAP_PROCESS_POLICY, LOADER_SPAWN_ARG_BYTES,
-    LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_FLAG_DEFER_START, LOADER_SPAWN_FLAG_IMMEDIATE_HANDOFF,
-    LOADER_SPAWN_MAX_ARG_COUNT, LOADER_SPAWN_MAX_ENV_COUNT, PROC_BROKER_ABI_VERSION,
-    PROC_BROKER_BATCH_CAPACITY, PROC_BROKER_FORMAT_ELF64, PROC_BROKER_FORMAT_PE64,
-    PROC_BROKER_LINUX_INTERP_PATH_CAPACITY, PROC_BROKER_MAP_EXEC, PROC_BROKER_MAP_PRIVATE,
-    PROC_BROKER_MAP_READ, PROC_BROKER_MAP_WRITE, PROC_BROKER_USER_SPACE_BASE,
-    PROC_BROKER_USER_SPACE_END_EXCLUSIVE, RustosProcAbortBrokerArgs, RustosProcActivateBrokerArgs,
-    RustosProcAuthorizeExecBrokerArgs, RustosProcCancelExecBrokerArgs, RustosProcCommitBrokerArgs,
-    RustosProcExecTargetBrokerArgs, RustosProcForkBrokerArgs, RustosProcMapDataBrokerArgs,
-    RustosProcMapFileBatchBrokerArgs, RustosProcMapFileBrokerArgs, RustosProcMapZeroedBrokerArgs,
-    RustosProcPrepareBrokerArgs, RustosProcSetLinuxRuntimeBrokerArgs,
-    RustosProcSetWindowsRuntimeBrokerArgs, RustosProcSignalQueueBrokerArgs, RustosUserRegisters,
+    IPC_SERVICE_CAP_PROCESS_LOADER, IPC_SERVICE_CAP_PROCESS_POLICY,
+    IPC_SERVICE_CAP_ROOT_SUPERVISOR, IPC_SERVICE_INITD, IPC_SERVICE_PROCD, IPC_SERVICE_ROOTD,
+    IPC_SERVICE_SESSIOND, LOADER_SPAWN_ARG_BYTES, LOADER_SPAWN_ENV_BYTES,
+    LOADER_SPAWN_FLAG_DEFER_START, LOADER_SPAWN_FLAG_IMMEDIATE_HANDOFF, LOADER_SPAWN_MAX_ARG_COUNT,
+    LOADER_SPAWN_MAX_ENV_COUNT, PROC_BROKER_ABI_VERSION, PROC_BROKER_BATCH_CAPACITY,
+    PROC_BROKER_FORMAT_ELF64, PROC_BROKER_FORMAT_PE64, PROC_BROKER_LINUX_INTERP_PATH_CAPACITY,
+    PROC_BROKER_MAP_EXEC, PROC_BROKER_MAP_PRIVATE, PROC_BROKER_MAP_READ, PROC_BROKER_MAP_WRITE,
+    PROC_BROKER_USER_SPACE_BASE, PROC_BROKER_USER_SPACE_END_EXCLUSIVE, RustosProcAbortBrokerArgs,
+    RustosProcActivateBrokerArgs, RustosProcAuthorizeExecBrokerArgs,
+    RustosProcCancelExecBrokerArgs, RustosProcCommitBrokerArgs, RustosProcExecTargetBrokerArgs,
+    RustosProcForkBrokerArgs, RustosProcMapDataBrokerArgs, RustosProcMapFileBatchBrokerArgs,
+    RustosProcMapFileBrokerArgs, RustosProcMapZeroedBrokerArgs, RustosProcPrepareBrokerArgs,
+    RustosProcSetLinuxRuntimeBrokerArgs, RustosProcSetWindowsRuntimeBrokerArgs,
+    RustosProcSignalQueueBrokerArgs, RustosProcValidateDeferredSpawnBrokerArgs,
+    RustosUserRegisters, VFS_IPC_PAYLOAD_CAPACITY, loader_service_role_allows_operation,
 };
 use spin::Mutex;
 
@@ -33,6 +36,7 @@ const SPAWN_FLAG_LOGICAL_ADMIN: u64 = 1;
 const MAX_PROC_PREPARES: usize = 128;
 const MAX_MAPPINGS_PER_PREPARE: usize = 4096;
 const MAX_EXEC_TICKETS: usize = 128;
+const MAX_DEFERRED_ACTIVATIONS: usize = 128;
 const FILE_COPY_CHUNK: usize = 64 * 1024;
 
 static NEXT_PREPARE_HANDLE: AtomicU64 = AtomicU64::new(1);
@@ -42,6 +46,12 @@ lazy_static! {
     static ref PROC_PREPARES: Mutex<BTreeMap<u64, ProcPrepareState>> = Mutex::new(BTreeMap::new());
     static ref EXEC_TICKETS: Mutex<BTreeMap<u64, ExecTicketState>> = Mutex::new(BTreeMap::new());
     static ref EXEC_TRANSITIONS: Mutex<BTreeMap<u64, ExecTransitionState>> =
+        Mutex::new(BTreeMap::new());
+    /// A deferred process is inert until the exact process that requested its
+    /// creation consumes this one-shot authority. Keeping this in ring0 makes
+    /// the authority survive loaderd restart without trusting a replayed
+    /// userspace PID claim.
+    static ref DEFERRED_ACTIVATIONS: Mutex<BTreeMap<u64, u64>> =
         Mutex::new(BTreeMap::new());
 }
 
@@ -133,6 +143,12 @@ pub(super) fn syscall_linux_rustos_proc_prepare_broker(args_ptr: u64) -> u64 {
             windows_runtime: None,
             linux_runtime: None,
         },
+    );
+    nucleus_core::debug::record_milestone(
+        nucleus_core::debug::LogCategory::Compat,
+        "proc-prepare-published",
+        handle,
+        u64::from(args.format),
     );
     handle
 }
@@ -231,6 +247,12 @@ pub(super) fn syscall_linux_rustos_proc_map_file_batch_broker(args_ptr: u64) -> 
             flags: entry.flags,
         });
     }
+    nucleus_core::debug::record_milestone(
+        nucleus_core::debug::LogCategory::Compat,
+        "proc-map-file-batch",
+        args.prepare_handle,
+        count as u64,
+    );
     0
 }
 
@@ -299,6 +321,12 @@ pub(super) fn syscall_linux_rustos_proc_set_linux_runtime_broker(args_ptr: u64) 
         runtime_search_paths: Vec::new(),
     };
     state.linux_runtime = Some((info, args.actual_entry));
+    nucleus_core::debug::record_milestone(
+        nucleus_core::debug::LogCategory::Compat,
+        "proc-linux-runtime-published",
+        args.prepare_handle,
+        args.phnum,
+    );
     0
 }
 
@@ -494,13 +522,19 @@ pub(super) fn syscall_linux_rustos_proc_commit_broker(args_ptr: u64) -> u64 {
     const KNOWN_SPAWN_FLAGS: u64 = SPAWN_FLAG_LOGICAL_ADMIN
         | LOADER_SPAWN_FLAG_IMMEDIATE_HANDOFF as u64
         | LOADER_SPAWN_FLAG_DEFER_START as u64;
-    if args.reserved0 != 0
+    if args.requester_pid == 0
         || args.prepare_handle == 0
         || args.flags & !KNOWN_SPAWN_FLAGS != 0
         || args.flags & LOADER_SPAWN_FLAG_IMMEDIATE_HANDOFF as u64 != 0
             && args.flags & LOADER_SPAWN_FLAG_DEFER_START as u64 != 0
     {
         return linux_errno(LINUX_EINVAL);
+    }
+    if multitask::is_user_process_exiting(args.requester_pid) {
+        return linux_errno(LINUX_ESRCH);
+    }
+    if !requester_owns_live_spawn_role(args.requester_pid) {
+        return linux_errno(LINUX_EPERM);
     }
     let state = {
         let mut prepares = PROC_PREPARES.lock();
@@ -544,10 +578,22 @@ pub(super) fn syscall_linux_rustos_proc_commit_broker(args_ptr: u64) -> u64 {
         argv: argv_refs.as_slice(),
         env: env_refs.as_slice(),
     };
+    nucleus_core::debug::record_milestone(
+        nucleus_core::debug::LogCategory::Compat,
+        "proc-commit-address-space-begin",
+        args.prepare_handle,
+        state.mappings.len() as u64,
+    );
     let address_space = match address_space_from_mappings(&state.mappings) {
         Ok(address_space) => address_space,
         Err(errno) => return linux_errno(errno),
     };
+    nucleus_core::debug::record_milestone(
+        nucleus_core::debug::LogCategory::Compat,
+        "proc-commit-address-space-done",
+        args.prepare_handle,
+        state.mappings.len() as u64,
+    );
     let session = if args.console_session == 0 {
         match multitask::current_user_snapshot() {
             Some(snapshot) => snapshot.console_session(),
@@ -599,6 +645,12 @@ pub(super) fn syscall_linux_rustos_proc_commit_broker(args_ptr: u64) -> u64 {
         }
         _ => return linux_errno(LINUX_EINVAL),
     };
+    nucleus_core::debug::record_milestone(
+        nucleus_core::debug::LogCategory::Compat,
+        "proc-commit-prepare-done",
+        args.prepare_handle,
+        state.format as u64,
+    );
     let spawned = if args.flags & LOADER_SPAWN_FLAG_DEFER_START as u64 != 0 {
         crate::user::process::spawn_prepared_process_suspended(prepared, args.weight_micros)
     } else if args.flags & LOADER_SPAWN_FLAG_IMMEDIATE_HANDOFF as u64 != 0 {
@@ -607,7 +659,29 @@ pub(super) fn syscall_linux_rustos_proc_commit_broker(args_ptr: u64) -> u64 {
         crate::user::process::spawn_prepared_process_for_loader_reply(prepared, args.weight_micros)
     };
     match spawned {
-        Ok(spawned) => spawned.pid,
+        Ok(spawned) => {
+            if args.flags & LOADER_SPAWN_FLAG_DEFER_START as u64 != 0 {
+                let mut activations = DEFERRED_ACTIVATIONS.lock();
+                if activations.len() >= MAX_DEFERRED_ACTIVATIONS
+                    || activations.contains_key(&spawned.pid)
+                {
+                    drop(activations);
+                    let _ = multitask::terminate_user_process(spawned.pid);
+                    return linux_errno(LINUX_EAGAIN);
+                }
+                activations.insert(spawned.pid, args.requester_pid);
+                drop(activations);
+                // Close the requester-exit race on both sides of publication:
+                // cleanup either observes the new entry, or this recheck
+                // consumes it and retires the still-suspended target.
+                if multitask::is_user_process_exiting(args.requester_pid) {
+                    DEFERRED_ACTIVATIONS.lock().remove(&spawned.pid);
+                    let _ = multitask::terminate_user_process(spawned.pid);
+                    return linux_errno(LINUX_ESRCH);
+                }
+            }
+            spawned.pid
+        }
         Err(err) => linux_errno(process_load_error_to_linux_errno(err)),
     }
 }
@@ -624,11 +698,58 @@ pub(super) fn syscall_linux_rustos_proc_activate_broker(args_ptr: u64) -> u64 {
         || args.reserved0 != 0
         || args.flags != 0
         || args.target_pid == 0
+        || args.requester_pid == 0
     {
         return linux_errno(LINUX_EINVAL);
     }
+    {
+        let mut activations = DEFERRED_ACTIVATIONS.lock();
+        if !consume_deferred_activation_authority(
+            &mut activations,
+            args.target_pid,
+            args.requester_pid,
+        ) {
+            return linux_errno(LINUX_EPERM);
+        }
+        // Capability consumption is the linearization point. A concurrent
+        // requester exit/revoke may win before this removal; once removed,
+        // this exact activation has already committed and cannot be replayed.
+    }
     if !multitask::activate_suspended_user_task(args.target_pid) {
         return linux_errno(LINUX_ESRCH);
+    }
+    0
+}
+
+pub(super) fn syscall_linux_rustos_proc_validate_deferred_spawn_broker(args_ptr: u64) -> u64 {
+    if !ipc_ops::current_process_has_service_capability(IPC_SERVICE_CAP_ROOT_SUPERVISOR) {
+        return linux_errno(LINUX_EPERM);
+    }
+    let args = match usermem::read_current_user_struct::<RustosProcValidateDeferredSpawnBrokerArgs>(
+        args_ptr,
+    ) {
+        Ok(args) => args,
+        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
+    };
+    if args.abi_version != PROC_BROKER_ABI_VERSION
+        || args.reserved0 != 0
+        || args.flags != 0
+        || args.target_pid == 0
+        || args.requester_pid == 0
+    {
+        return linux_errno(LINUX_EINVAL);
+    }
+    if multitask::is_user_process_exiting(args.target_pid)
+        || multitask::is_user_process_exiting(args.requester_pid)
+    {
+        return linux_errno(LINUX_ESRCH);
+    }
+    if !deferred_spawn_provenance_matches(
+        &DEFERRED_ACTIVATIONS.lock(),
+        args.target_pid,
+        args.requester_pid,
+    ) {
+        return linux_errno(LINUX_EPERM);
     }
     0
 }
@@ -722,12 +843,18 @@ pub(super) fn syscall_linux_rustos_proc_exec_target_broker(args_ptr: u64) -> u64
     };
     if args.abi_version != PROC_BROKER_ABI_VERSION
         || args.reserved0 != 0
-        || args.reserved1 != 0
+        || args.requester_pid == 0
         || args.target_pid == 0
         || args.target_tid == 0
         || args.exec_ticket == 0
     {
         return linux_errno(LINUX_EINVAL);
+    }
+    if multitask::is_user_process_exiting(args.requester_pid) {
+        return linux_errno(LINUX_ESRCH);
+    }
+    if !ipc_ops::process_owns_live_service_endpoint(args.requester_pid, IPC_SERVICE_PROCD) {
+        return linux_errno(LINUX_EPERM);
     }
     {
         let mut tickets = EXEC_TICKETS.lock();
@@ -1027,6 +1154,23 @@ pub(super) fn syscall_linux_rustos_proc_abort_broker(args_ptr: u64) -> u64 {
 /// therefore removes owner-bound prepares plus target-bound tickets and saved
 /// register transitions before the process table retires that process.
 pub(super) fn cleanup_proc_broker_state_for_process(process_id: u64) -> (usize, usize, usize) {
+    let deferred_targets = {
+        let mut activations = DEFERRED_ACTIVATIONS.lock();
+        let targets = activations
+            .iter()
+            .filter_map(|(target_pid, requester_pid)| {
+                (*requester_pid == process_id && *target_pid != process_id).then_some(*target_pid)
+            })
+            .collect::<Vec<_>>();
+        activations.retain(|target_pid, requester_pid| {
+            *target_pid != process_id && *requester_pid != process_id
+        });
+        targets
+    };
+    for target_pid in deferred_targets {
+        let _ = multitask::terminate_user_process(target_pid);
+    }
+
     let mut prepares = PROC_PREPARES.lock();
     let prepares_before = prepares.len();
     prepares.retain(|_, state| state.owner_pid != process_id);
@@ -1083,6 +1227,20 @@ fn cleanup_proc_broker_exec_state_for_siblings(process_id: u64, surviving_thread
 
 fn current_process_can_load() -> bool {
     ipc_ops::current_process_has_service_capability(IPC_SERVICE_CAP_PROCESS_LOADER)
+}
+
+/// Revalidate the original loader client at the terminal ring0 commit. This
+/// closes the long image-load window: a service restart or revoke after
+/// loaderd's admission check withdraws authority before any process is born.
+fn requester_owns_live_spawn_role(requester_pid: u64) -> bool {
+    [IPC_SERVICE_ROOTD, IPC_SERVICE_INITD, IPC_SERVICE_SESSIOND]
+        .into_iter()
+        .any(|service_id| {
+            loader_service_role_allows_operation(
+                rustos_user_abi::syscall::LOADER_OP_SPAWN_EXEC,
+                service_id,
+            ) && ipc_ops::process_owns_live_service_endpoint(requester_pid, service_id)
+        })
 }
 
 fn current_process_can_policy() -> bool {
@@ -1152,14 +1310,23 @@ fn address_space_from_mappings(
 ) -> Result<crate::memory::paging::ProcessAddressSpace, i64> {
     let mut address_space = crate::memory::paging::ProcessAddressSpace::new()
         .map_err(address_space_error_to_linux_errno)?;
-    for mapping in mappings {
+    for (index, mapping) in mappings.iter().enumerate() {
         match mapping {
             MappingEntry::Zeroed {
                 target_addr,
                 mem_len,
                 flags,
             } => {
-                map_zeroed(&mut address_space, *target_addr, *mem_len, *flags)?;
+                map_zeroed(&mut address_space, *target_addr, *mem_len, *flags).inspect_err(
+                    |errno| {
+                        nucleus_core::debug::write_debugcon_only_line(
+                            alloc::format!(
+                                "proc-commit: mapping rejected stage=zeroed index={index} target={target_addr:#x} mem_len={mem_len:#x} errno={errno}"
+                            )
+                            .as_bytes(),
+                        );
+                    },
+                )?;
             }
             MappingEntry::Data {
                 target_addr,
@@ -1168,10 +1335,28 @@ fn address_space_from_mappings(
                 data_offset,
                 data,
             } => {
-                map_zeroed(&mut address_space, *target_addr, *mem_len, *flags)?;
+                map_zeroed(&mut address_space, *target_addr, *mem_len, *flags).inspect_err(
+                    |errno| {
+                        nucleus_core::debug::write_debugcon_only_line(
+                            alloc::format!(
+                                "proc-commit: mapping rejected stage=data-map index={index} target={target_addr:#x} mem_len={mem_len:#x} data_offset={data_offset:#x} data_len={:#x} errno={errno}",
+                                data.len()
+                            )
+                            .as_bytes(),
+                        );
+                    },
+                )?;
                 let write_addr = target_addr
                     .checked_add(*data_offset)
-                    .ok_or(LINUX_EOVERFLOW)?;
+                    .ok_or_else(|| {
+                        nucleus_core::debug::write_debugcon_only_line(
+                            alloc::format!(
+                                "proc-commit: mapping rejected stage=data-address index={index} target={target_addr:#x} data_offset={data_offset:#x}"
+                            )
+                            .as_bytes(),
+                        );
+                        LINUX_EOVERFLOW
+                    })?;
                 address_space
                     .initialize_user_bytes(VirtAddr::new(write_addr), data)
                     .map_err(address_space_error_to_linux_errno)?;
@@ -1184,14 +1369,31 @@ fn address_space_from_mappings(
                 mem_len,
                 flags,
             } => {
-                map_zeroed(&mut address_space, *target_addr, *mem_len, *flags)?;
+                map_zeroed(&mut address_space, *target_addr, *mem_len, *flags).inspect_err(
+                    |errno| {
+                        nucleus_core::debug::write_debugcon_only_line(
+                            alloc::format!(
+                                "proc-commit: mapping rejected stage=file-map index={index} target={target_addr:#x} mem_len={mem_len:#x} file_offset={file_offset:#x} file_len={file_len:#x} errno={errno}"
+                            )
+                            .as_bytes(),
+                        );
+                    },
+                )?;
                 copy_file_into_address_space(
                     &mut address_space,
                     backing,
                     *target_addr,
                     *file_offset,
                     *file_len,
-                )?;
+                )
+                .inspect_err(|errno| {
+                    nucleus_core::debug::write_debugcon_only_line(
+                        alloc::format!(
+                            "proc-commit: mapping rejected stage=file-copy index={index} target={target_addr:#x} file_offset={file_offset:#x} file_len={file_len:#x} errno={errno}"
+                        )
+                        .as_bytes(),
+                    );
+                })?;
             }
         }
     }
@@ -1213,16 +1415,21 @@ fn copy_file_into_address_space(
         let read = match backing {
             PinnedFileBacking::Remote { remote_id, path } => {
                 let offset = file_offset.saturating_add(copied as u64);
-                match kernel_io_manager::api::block::read_boot_extent_file_range(
+                match kernel_io_manager::api::block::read_bootstrap_file_range(
                     path,
                     offset,
                     &mut chunk[..count],
                 ) {
                     Ok(Some(read)) => read,
                     Ok(None) => {
-                        match offload_ops::call_remote_vfs_read_bytes(*remote_id, offset, count) {
+                        let remote_count = count.min(VFS_IPC_PAYLOAD_CAPACITY);
+                        match offload_ops::call_remote_vfs_read_bytes(
+                            *remote_id,
+                            offset,
+                            remote_count,
+                        ) {
                             Ok(bytes) => {
-                                let n = bytes.len().min(count);
+                                let n = bytes.len().min(remote_count);
                                 chunk[..n].copy_from_slice(&bytes[..n]);
                                 n
                             }
@@ -1307,7 +1514,7 @@ fn page_flags(flags: u64) -> Result<PageTableFlags, i64> {
 
 fn allocate_prepare_handle(prepares: &BTreeMap<u64, ProcPrepareState>) -> Option<u64> {
     for _ in 0..MAX_PROC_PREPARES {
-        let handle = NEXT_PREPARE_HANDLE.fetch_add(1, Ordering::Relaxed).max(1);
+        let handle = allocate_nonwrapping_broker_identity(&NEXT_PREPARE_HANDLE)?;
         if !prepares.contains_key(&handle) {
             return Some(handle);
         }
@@ -1331,12 +1538,45 @@ fn proc_prepare_publication_status(owner_exiting: bool, pending: usize) -> Resul
 
 fn allocate_exec_ticket(tickets: &BTreeMap<u64, ExecTicketState>) -> Option<u64> {
     for _ in 0..MAX_EXEC_TICKETS {
-        let ticket = NEXT_EXEC_TICKET.fetch_add(1, Ordering::Relaxed).max(1);
+        let ticket = allocate_nonwrapping_broker_identity(&NEXT_EXEC_TICKET)?;
         if !tickets.contains_key(&ticket) {
             return Some(ticket);
         }
     }
     None
+}
+
+fn consume_deferred_activation_authority(
+    activations: &mut BTreeMap<u64, u64>,
+    target_pid: u64,
+    requester_pid: u64,
+) -> bool {
+    if target_pid == 0
+        || requester_pid == 0
+        || activations.get(&target_pid).copied() != Some(requester_pid)
+    {
+        return false;
+    }
+    activations.remove(&target_pid);
+    true
+}
+
+fn deferred_spawn_provenance_matches(
+    activations: &BTreeMap<u64, u64>,
+    target_pid: u64,
+    requester_pid: u64,
+) -> bool {
+    target_pid != 0
+        && requester_pid != 0
+        && activations.get(&target_pid).copied() == Some(requester_pid)
+}
+
+fn allocate_nonwrapping_broker_identity(counter: &AtomicU64) -> Option<u64> {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            (current != 0).then(|| current.checked_add(1)).flatten()
+        })
+        .ok()
 }
 
 // RING3-MIGRATION-REFERENCE START: capability-broker exception: procd owns
@@ -1502,6 +1742,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn broker_authority_identity_exhaustion_never_wraps() {
+        let counter = AtomicU64::new(u64::MAX);
+        assert_eq!(allocate_nonwrapping_broker_identity(&counter), None);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[test]
     fn file_mapping_len_must_fit_inside_memory_mapping() {
         assert_eq!(validate_file_mapping_len(4096, 4096), Ok(()));
         assert_eq!(validate_file_mapping_len(4096, 0), Ok(()));
@@ -1526,5 +1773,62 @@ mod tests {
             proc_prepare_publication_status(false, MAX_PROC_PREPARES - 1),
             Ok(())
         );
+    }
+
+    #[test]
+    fn deferred_activation_authority_is_exact_one_shot_and_nontransferable() {
+        let mut activations = BTreeMap::from([(41, 7)]);
+        assert!(deferred_spawn_provenance_matches(&activations, 41, 7));
+        assert!(!deferred_spawn_provenance_matches(&activations, 41, 8));
+        assert!(!consume_deferred_activation_authority(
+            &mut activations,
+            41,
+            8
+        ));
+        assert_eq!(activations.get(&41), Some(&7));
+        assert!(consume_deferred_activation_authority(
+            &mut activations,
+            41,
+            7
+        ));
+        assert!(!consume_deferred_activation_authority(
+            &mut activations,
+            41,
+            7
+        ));
+        assert!(!deferred_spawn_provenance_matches(&activations, 41, 7));
+    }
+
+    #[test]
+    fn loader_commit_revalidates_live_requester_role_before_consuming_authority() {
+        let source = include_str!("proc_broker_ops.rs");
+        let spawn_commit = source
+            .split("pub(super) fn syscall_linux_rustos_proc_commit_broker")
+            .nth(1)
+            .and_then(|rest| {
+                rest.split("pub(super) fn syscall_linux_rustos_proc_activate_broker")
+                    .next()
+            })
+            .expect("spawn commit broker");
+        let spawn_role = spawn_commit
+            .find("requester_owns_live_spawn_role(args.requester_pid)")
+            .expect("live spawn role recheck");
+        let prepare_consume = spawn_commit
+            .find("let state = {")
+            .expect("prepare authority consumption");
+        assert!(spawn_role < prepare_consume);
+
+        let exec_commit = source
+            .split("pub(super) fn syscall_linux_rustos_proc_exec_target_broker")
+            .nth(1)
+            .and_then(|rest| rest.split("fn exec_transition_from_prepared").next())
+            .expect("exec target broker");
+        let procd_role = exec_commit
+            .find("process_owns_live_service_endpoint(args.requester_pid, IPC_SERVICE_PROCD)")
+            .expect("live procd role recheck");
+        let ticket_consume = exec_commit
+            .find("let mut tickets = EXEC_TICKETS.lock()")
+            .expect("exec ticket consumption");
+        assert!(procd_role < ticket_consume);
     }
 }

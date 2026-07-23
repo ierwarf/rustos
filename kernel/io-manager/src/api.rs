@@ -1,6 +1,3 @@
-use alloc::string::{String, ToString};
-use alloc::vec::Vec;
-
 pub type ConsoleSessionHandle = crate::io::session::ConsoleSessionHandle;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -62,46 +59,38 @@ pub struct VfsMetadata {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct BlockHandle {
-    pub id: u32,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BlockDescriptor {
-    pub id: u32,
-    pub path: String,
-    pub transport: storage_core::TransportKind,
-    pub readonly: bool,
-    pub logical_block_size: usize,
-    pub start_block: u64,
-    pub block_count: u64,
+pub struct DvmBlockTransportInfo {
+    pub generation: u64,
+    pub capacity_sectors: u64,
+    pub logical_block_size: u32,
+    pub physical_block_size: u32,
+    pub features: u64,
+    pub read_only: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct BootPathExtent {
-    pub disk_offset: u64,
-    pub len: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BootPathExtentLease {
-    pub file_len: u64,
+pub struct DvmBlockTicket {
     pub generation: u64,
-    pub extents: Vec<BootPathExtent>,
+    pub request_id: u64,
+    pub data_slot: u32,
 }
 
-fn map_block_descriptor(
-    descriptor: crate::storage::block::BlockDeviceDescriptor,
-) -> BlockDescriptor {
-    BlockDescriptor {
-        id: descriptor.id,
-        path: descriptor.path.to_string(),
-        transport: descriptor.transport,
-        readonly: descriptor.readonly,
-        logical_block_size: descriptor.logical_block_size,
-        start_block: descriptor.start_block,
-        block_count: descriptor.block_count,
-    }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DvmBlockPoll {
+    Pending,
+    Completed(usize),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DvmBlockError {
+    Unavailable,
+    Busy,
+    Invalid,
+    Protocol,
+    Revoked,
+    DeviceFault,
+    Unsupported,
+    Cancelled,
 }
 
 fn map_bootstrap_phase(phase: crate::storage::boot_volume::BootstrapPhase) -> BootstrapPhase {
@@ -122,48 +111,115 @@ fn map_bootstrap_phase(phase: crate::storage::boot_volume::BootstrapPhase) -> Bo
 }
 
 pub mod block {
-    use super::{BlockDescriptor, BlockHandle, map_block_descriptor};
-    use storage_core::BlockDevice;
+    use super::{DvmBlockError, DvmBlockPoll, DvmBlockTicket, DvmBlockTransportInfo};
 
-    pub fn register_boot_volume_opener() {
-        crate::storage::block::register_boot_volume_opener();
-    }
-
-    pub fn init_block_devices() {
-        crate::storage::block::init();
-    }
-
-    pub fn descriptors() -> alloc::vec::Vec<BlockDescriptor> {
-        crate::storage::block::descriptors()
-            .into_iter()
-            .map(map_block_descriptor)
-            .collect()
-    }
-
-    pub fn lookup(path: &str) -> Option<BlockHandle> {
-        crate::storage::block::lookup(path).map(|handle| BlockHandle { id: handle.id() })
-    }
-
-    pub fn boot_volume_descriptor() -> Option<BlockDescriptor> {
-        crate::storage::block::current_boot_volume_handle()
-            .and_then(crate::storage::block::descriptor)
-            .map(map_block_descriptor)
-    }
-
-    pub fn read_boot_volume_blocks(lba: u64, out: &mut [u8]) -> storage_core::IoResult<()> {
-        let handle = crate::storage::block::current_boot_volume_handle()
-            .ok_or(storage_core::StorageError::NotPresent)?;
-        let mut device = crate::storage::block::FatRegistryDevice::new(handle);
-        device.read_blocks(lba, out)
-    }
-
-    pub fn read_boot_extent_file_range(
+    pub fn read_bootstrap_file_range(
         path: &str,
         offset: u64,
         out: &mut [u8],
-    ) -> storage_core::IoResult<Option<usize>> {
-        crate::storage::boot_volume::read_file_range_from_extents(path, offset, out)
-            .map_err(|_| storage_core::StorageError::DeviceFault)
+    ) -> Result<Option<usize>, crate::storage::boot_volume::BootstrapImageError> {
+        crate::storage::boot_volume::read_file_range(path, offset, out)
+    }
+
+    pub fn bootstrap_file_len(
+        path: &str,
+    ) -> Result<u64, crate::storage::boot_volume::BootstrapImageError> {
+        crate::storage::boot_volume::file_len(path)
+    }
+
+    pub fn dvm_info() -> Result<DvmBlockTransportInfo, DvmBlockError> {
+        crate::io::dvm_block::info()
+            .map(|info| DvmBlockTransportInfo {
+                generation: info.generation,
+                capacity_sectors: info.capacity_sectors,
+                logical_block_size: info.logical_block_size,
+                physical_block_size: info.physical_block_size,
+                features: info.features,
+                read_only: info.read_only,
+            })
+            .map_err(map_dvm_error)
+    }
+
+    pub fn submit_dvm_read(sector: u64, data_len: u32) -> Result<DvmBlockTicket, DvmBlockError> {
+        crate::io::dvm_block::submit_read(sector, data_len)
+            .map(map_dvm_ticket)
+            .map_err(map_dvm_error)
+    }
+
+    pub fn submit_dvm_write(
+        sector: u64,
+        data: &[u8],
+        fua: bool,
+    ) -> Result<DvmBlockTicket, DvmBlockError> {
+        crate::io::dvm_block::submit_write(sector, data, fua)
+            .map(map_dvm_ticket)
+            .map_err(map_dvm_error)
+    }
+
+    pub fn submit_dvm_flush() -> Result<DvmBlockTicket, DvmBlockError> {
+        crate::io::dvm_block::submit_flush()
+            .map(map_dvm_ticket)
+            .map_err(map_dvm_error)
+    }
+
+    pub fn poll_dvm(ticket: DvmBlockTicket, out: &mut [u8]) -> Result<DvmBlockPoll, DvmBlockError> {
+        crate::io::dvm_block::poll(unmap_dvm_ticket(ticket), out)
+            .map(|poll| match poll {
+                crate::io::dvm_block::DvmBlockPoll::Pending => DvmBlockPoll::Pending,
+                crate::io::dvm_block::DvmBlockPoll::Completed(bytes) => {
+                    DvmBlockPoll::Completed(bytes)
+                }
+            })
+            .map_err(map_dvm_error)
+    }
+
+    pub fn cancel_dvm(ticket: DvmBlockTicket) -> Result<(), DvmBlockError> {
+        crate::io::dvm_block::cancel(unmap_dvm_ticket(ticket)).map_err(map_dvm_error)
+    }
+
+    pub fn finish_dvm(ticket: DvmBlockTicket) -> Result<(), DvmBlockError> {
+        crate::io::dvm_block::finish(unmap_dvm_ticket(ticket)).map_err(map_dvm_error)
+    }
+
+    pub fn dvm_completion_or_fault_pending() -> bool {
+        crate::io::dvm_block::completion_or_fault_pending()
+    }
+
+    pub fn arm_dvm_waiter(task_id: u64) -> bool {
+        crate::io::dvm_block::arm_waiter(task_id)
+    }
+
+    pub fn disarm_dvm_waiter(task_id: u64) {
+        crate::io::dvm_block::disarm_waiter(task_id);
+    }
+
+    fn map_dvm_ticket(ticket: crate::io::dvm_block::DvmBlockTicket) -> DvmBlockTicket {
+        DvmBlockTicket {
+            generation: ticket.generation,
+            request_id: ticket.request_id,
+            data_slot: ticket.data_slot,
+        }
+    }
+
+    fn unmap_dvm_ticket(ticket: DvmBlockTicket) -> crate::io::dvm_block::DvmBlockTicket {
+        crate::io::dvm_block::DvmBlockTicket {
+            generation: ticket.generation,
+            request_id: ticket.request_id,
+            data_slot: ticket.data_slot,
+        }
+    }
+
+    fn map_dvm_error(error: crate::io::dvm_block::DvmBlockError) -> DvmBlockError {
+        match error {
+            crate::io::dvm_block::DvmBlockError::Unavailable => DvmBlockError::Unavailable,
+            crate::io::dvm_block::DvmBlockError::Busy => DvmBlockError::Busy,
+            crate::io::dvm_block::DvmBlockError::Invalid => DvmBlockError::Invalid,
+            crate::io::dvm_block::DvmBlockError::Protocol => DvmBlockError::Protocol,
+            crate::io::dvm_block::DvmBlockError::Revoked => DvmBlockError::Revoked,
+            crate::io::dvm_block::DvmBlockError::DeviceFault => DvmBlockError::DeviceFault,
+            crate::io::dvm_block::DvmBlockError::Unsupported => DvmBlockError::Unsupported,
+            crate::io::dvm_block::DvmBlockError::Cancelled => DvmBlockError::Cancelled,
+        }
     }
 }
 
@@ -184,6 +240,10 @@ pub mod boot {
 
     pub fn init_dvm_network_provider() -> bool {
         crate::io::dvm_network::try_install()
+    }
+
+    pub fn init_dvm_block_provider() -> bool {
+        crate::io::dvm_block::try_install()
     }
 
     pub fn boot_volume_transport_hint() -> Option<BootVolumeTransport> {
@@ -428,10 +488,8 @@ pub mod io {
 }
 
 pub mod vfs {
-    use super::{BootPathExtent, BootPathExtentLease, MountError, VfsError, VfsMetadata};
+    use super::{MountError, VfsError, VfsMetadata};
     use alloc::string::ToString;
-    use fatfs::Error as FatError;
-    use storage_core::StorageError;
 
     pub fn init() {}
 
@@ -510,20 +568,11 @@ pub mod vfs {
         }
     }
 
-    fn map_boot_volume_error(error: FatError<StorageError>) -> VfsError {
+    fn map_boot_volume_error(error: crate::storage::boot_volume::BootstrapImageError) -> VfsError {
         match error {
-            // A missing bootstrap transport is not evidence that the requested
-            // file is absent. Keeping these distinct prevents an HVM storage
-            // contract failure from being misdiagnosed as a missing rootd ELF.
-            FatError::Io(StorageError::NotPresent) => VfsError::Unsupported,
-            FatError::NotFound => VfsError::NotFound,
-            FatError::Io(StorageError::Unsupported) => VfsError::Unsupported,
-            FatError::InvalidInput
-            | FatError::InvalidFileNameLength
-            | FatError::UnsupportedFileNameCharacter => VfsError::InvalidArgument,
-            FatError::CorruptedFileSystem => VfsError::InvalidArgument,
-            FatError::Io(_) | FatError::UnexpectedEof => VfsError::Unsupported,
-            _ => VfsError::Unsupported,
+            crate::storage::boot_volume::BootstrapImageError::NotFound => VfsError::NotFound,
+            crate::storage::boot_volume::BootstrapImageError::Unavailable => VfsError::Unsupported,
+            crate::storage::boot_volume::BootstrapImageError::Invalid => VfsError::InvalidArgument,
         }
     }
 
@@ -534,31 +583,7 @@ pub mod vfs {
 
     pub fn boot_path_file_len_for_kernel(path: &str) -> Result<u64, VfsError> {
         let path = boot_image_path(path)?;
-        crate::storage::boot_volume::metadata(path)
-            .map(|metadata| metadata.len)
-            .map_err(map_boot_volume_error)
-    }
-
-    pub fn boot_path_extent_lease_for_kernel(
-        path: &str,
-    ) -> Result<Option<BootPathExtentLease>, VfsError> {
-        let path = boot_image_path(path)?;
-        crate::storage::boot_volume::boot_file_extent_lease(path)
-            .map(|lease| {
-                lease.map(|lease| BootPathExtentLease {
-                    file_len: lease.len,
-                    generation: lease.generation,
-                    extents: lease
-                        .extents
-                        .into_iter()
-                        .map(|extent| BootPathExtent {
-                            disk_offset: extent.offset,
-                            len: extent.len,
-                        })
-                        .collect(),
-                })
-            })
-            .map_err(map_boot_volume_error)
+        crate::storage::boot_volume::file_len(path).map_err(map_boot_volume_error)
     }
 
     pub fn readlink_for_current_process(
@@ -574,11 +599,13 @@ pub mod vfs {
         #[test]
         fn bootstrap_transport_failure_is_not_reported_as_missing_file() {
             assert_eq!(
-                map_boot_volume_error(FatError::Io(StorageError::NotPresent)),
+                map_boot_volume_error(
+                    crate::storage::boot_volume::BootstrapImageError::Unavailable
+                ),
                 VfsError::Unsupported
             );
             assert_eq!(
-                map_boot_volume_error(FatError::NotFound),
+                map_boot_volume_error(crate::storage::boot_volume::BootstrapImageError::NotFound),
                 VfsError::NotFound
             );
         }

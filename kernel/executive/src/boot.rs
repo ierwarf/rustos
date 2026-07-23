@@ -169,30 +169,12 @@ pub fn initialize_kernel(boot_info_ptr: *const BootInfo) {
             "boot volume identity unavailable",
         ),
     }
-    io_services::register_boot_volume_opener();
-    boot_log!(debug::LogLevel::Debug, 110, 0, "block init begin");
-    io_services::init_block_devices();
-    boot_log!(debug::LogLevel::Debug, 111, 0, "block init done");
     boot_log!(
-        debug::LogLevel::Debug,
-        112,
+        debug::LogLevel::Info,
+        110,
         0,
-        "block descriptor scan begin",
+        "native block providers absent; early-system bootstrap and storage DVM required",
     );
-    for descriptor in io_services::block_descriptors() {
-        boot_log!(
-            debug::LogLevel::Info,
-            113,
-            descriptor.id as u64,
-            "storage descriptor path={} transport={:?} readonly={} block_size={} start_block={} blocks={}",
-            descriptor.path,
-            descriptor.transport,
-            descriptor.readonly,
-            descriptor.logical_block_size,
-            descriptor.start_block,
-            descriptor.block_count,
-        );
-    }
     boot_log!(debug::LogLevel::Debug, 114, 0, "block descriptor scan done");
     hal_hooks::register();
 
@@ -262,6 +244,21 @@ pub fn initialize_kernel(boot_info_ptr: *const BootInfo) {
             106,
             0,
             "DVM shared network transport unavailable; network remains disabled"
+        );
+    }
+    if io_services::init_dvm_block_provider() {
+        boot_log!(
+            debug::LogLevel::Info,
+            107,
+            0,
+            "DVM shared block transport initialized"
+        );
+    } else {
+        boot_log!(
+            debug::LogLevel::Warn,
+            107,
+            0,
+            "DVM shared block transport unavailable; persistent storage remains disabled"
         );
     }
 

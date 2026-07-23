@@ -12,11 +12,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
+use driver_domain_protocol::{DVM_BLOCK_FLAG_DVM_READY, DVM_BLOCK_FLAG_RUSTOS_READY};
 use rustos_driver_domain_host::{
     ControlContract, ControlSecret, DeviceClass, DeviceTransport, DriverDomainPolicy,
     HostControlListener, PhysicalDisplayPolicy, SysfsVfioOps, ValidatedLease, VfioLeaseRecord,
     VfioLeaseState, reset_vfio_group, restore_vfio_lease, validate_host_display_assignment,
     validate_physical_display_assignment, validate_physical_display_identity,
+    validate_physical_storage_assignment, validate_physical_storage_identity,
     validate_reset_scope_assignment, validate_vfio_bind_dma_quiescence,
 };
 use sha2::{Digest, Sha256};
@@ -429,7 +431,7 @@ pub fn verify_artifacts(manifest: &Path) -> Result<VerifiedArtifacts> {
         || manifest_value(&values, "control-transport")? != "kvm-vsock"
         || manifest_value(&values, "control-authentication")? != "dvm-agent-hmac-sha256-v1"
         || manifest_value(&values, "control-capabilities")?
-            != "health,device-inventory,driver-inventory,display-evidence-v2,input-stream"
+            != "health,device-inventory,driver-inventory,display-evidence-v2,block-evidence-v1,input-stream"
         || manifest_value(&values, "buildroot_version")? != "2026.05"
         || manifest_value(&values, "linux_version")? != "6.12.94"
         || manifest_value(&values, "nvidia-open-version")? != "580.173.02"
@@ -855,20 +857,35 @@ pub fn preflight_physical_runtime_inputs(
     let device_policy = trusted_canonical_regular_file(device_policy, owner)?;
     let policy = DriverDomainPolicy::from_env_file(&device_policy)?;
     policy.validate_for_lease(lease)?;
-    if policy.transport_for(DeviceClass::Display) != DeviceTransport::DisplayDmaBufKms
-        || policy.transport_for(DeviceClass::Network) != DeviceTransport::Disabled
-        || policy.transport_for(DeviceClass::Block) != DeviceTransport::Disabled
-    {
-        bail!("physical runtime preflight requires display-dmabuf-kms with network/block disabled");
-    }
-    let physical_display = policy
-        .physical_display()
-        .ok_or_else(|| anyhow!("physical runtime preflight requires device policy schema 3"))?;
-    validate_host_display_assignment(lease, sysfs_root)?;
-    validate_physical_display_assignment(lease, sysfs_root, physical_display)?;
-    let display_bdf = validate_physical_display_identity(lease, sysfs_root, physical_display)?;
-    if physical_display.driver() == "amdgpu" {
-        validate_amdgpu_vfct_source(sysfs_root, &display_bdf)?;
+    match (policy.physical_display(), policy.physical_storage()) {
+        (Some(physical_display), None) => {
+            if policy.transport_for(DeviceClass::Display) != DeviceTransport::DisplayDmaBufKms
+                || policy.transport_for(DeviceClass::Network) != DeviceTransport::Disabled
+                || policy.transport_for(DeviceClass::Block) != DeviceTransport::Disabled
+            {
+                bail!(
+                    "physical display runtime requires display-dmabuf-kms with network/block disabled"
+                );
+            }
+            validate_host_display_assignment(lease, sysfs_root)?;
+            validate_physical_display_assignment(lease, sysfs_root, physical_display)?;
+            let display_bdf =
+                validate_physical_display_identity(lease, sysfs_root, physical_display)?;
+            if physical_display.driver() == "amdgpu" {
+                validate_amdgpu_vfct_source(sysfs_root, &display_bdf)?;
+            }
+        }
+        (None, Some(physical_storage)) => {
+            if policy.transport_for(DeviceClass::Block) != DeviceTransport::BlockRingMsix
+                || policy.transport_for(DeviceClass::Input) != DeviceTransport::Disabled
+                || policy.transport_for(DeviceClass::Network) != DeviceTransport::Disabled
+                || policy.transport_for(DeviceClass::Display) != DeviceTransport::Disabled
+            {
+                bail!("physical storage runtime requires block-ring-msix exclusively");
+            }
+            validate_physical_storage_assignment(lease, sysfs_root, physical_storage)?;
+        }
+        _ => bail!("physical runtime preflight requires exactly one physical device policy"),
     }
     validate_reset_scope_assignment(lease, sysfs_root)?;
     validate_vfio_bind_dma_quiescence(sysfs_root)?;
@@ -913,6 +930,15 @@ pub struct SuperviseConfig<'a> {
     pub setup_timeout: Duration,
 }
 
+pub struct StorageSuperviseConfig<'a> {
+    pub qemu: &'a Path,
+    pub artifact_manifest: &'a Path,
+    pub device_policy: &'a Path,
+    pub block_doorbell: &'a Path,
+    pub block_aperture: &'a Path,
+    pub setup_timeout: Duration,
+}
+
 pub fn supervise_domain(
     lease: &mut VfioLeaseRecord,
     sysfs_root: &Path,
@@ -921,6 +947,9 @@ pub fn supervise_domain(
 ) -> Result<ExitStatus> {
     if lease.state != VfioLeaseState::Active {
         bail!("DVM supervision requires an active VFIO lease");
+    }
+    if lease.storage_handoff().is_some() {
+        bail!("display DVM supervision rejects a storage-bound VFIO lease");
     }
     lease.authorization_valid_at(current_unix_time()?)?;
     let owner = unsafe { libc::geteuid() };
@@ -1080,6 +1109,181 @@ pub fn supervise_domain(
     }
 }
 
+pub fn supervise_storage_domain(
+    lease: &mut VfioLeaseRecord,
+    sysfs_root: &Path,
+    store: &RuntimeStore,
+    config: StorageSuperviseConfig<'_>,
+) -> Result<ExitStatus> {
+    if lease.state != VfioLeaseState::Active {
+        bail!("storage DVM supervision requires an active VFIO lease");
+    }
+    lease.authorization_valid_at(current_unix_time()?)?;
+    let binding = lease
+        .storage_handoff()
+        .ok_or_else(|| anyhow!("storage DVM lease lacks a durable aperture epoch"))?
+        .clone();
+    let owner = unsafe { libc::geteuid() };
+    let artifact_manifest = trusted_canonical_regular_file(config.artifact_manifest, owner)?;
+    let device_policy = trusted_canonical_regular_file(config.device_policy, owner)?;
+    verify_sha256_file(&artifact_manifest, lease.dvm_artifact_manifest_sha256()?)?;
+    verify_sha256_file(&device_policy, lease.device_policy_sha256()?)?;
+    let policy = DriverDomainPolicy::from_env_file(&device_policy)?;
+    let validated = ValidatedLease {
+        domain_id: lease.domain_id.clone(),
+        dvm_guest_cid: lease.dvm_guest_cid,
+        iommu_group: lease.iommu_group,
+        pci_bdfs: lease.original_drivers.keys().cloned().collect(),
+    };
+    policy.validate_for_lease(&validated)?;
+    if policy.transport_for(DeviceClass::Block) != DeviceTransport::BlockRingMsix
+        || policy.transport_for(DeviceClass::Input) != DeviceTransport::Disabled
+        || policy.transport_for(DeviceClass::Network) != DeviceTransport::Disabled
+        || policy.transport_for(DeviceClass::Display) != DeviceTransport::Disabled
+    {
+        bail!("supervised storage DVM requires the exclusive block-ring-msix policy");
+    }
+    let physical_storage = policy
+        .physical_storage()
+        .ok_or_else(|| anyhow!("supervised storage DVM requires device policy schema 4"))?
+        .clone();
+    let storage_bdf =
+        validate_physical_storage_identity(&validated, sysfs_root, &physical_storage)?;
+    if storage_bdf != binding.controller_bdf()
+        || lease
+            .original_drivers
+            .get(&storage_bdf)
+            .and_then(Option::as_deref)
+            != Some(physical_storage.driver())
+    {
+        bail!("durable VFIO lease does not retain the signed physical storage controller");
+    }
+    let configured_aperture = fs::canonicalize(config.block_aperture)
+        .context("canonicalize configured storage aperture")?;
+    if configured_aperture != binding.aperture_path() {
+        bail!("configured storage aperture does not match the durable handoff binding");
+    }
+    let header =
+        crate::storage::inspect_storage_aperture(binding.aperture_path(), binding.generation())?;
+    if header.flags & DVM_BLOCK_FLAG_RUSTOS_READY == 0
+        || header.flags & DVM_BLOCK_FLAG_DVM_READY != 0
+    {
+        bail!("RustOS has not exclusively admitted the clean storage transport epoch");
+    }
+    ensure_private_socket(config.block_doorbell)?;
+    let (qemu, qemu_sha256) = verify_qemu(config.qemu)?;
+    if qemu_sha256 != policy.qemu_sha256() {
+        bail!("production QEMU digest does not match the signed storage policy");
+    }
+    verify_qemu_memlock_budget()?;
+    probe_iommufd()?;
+    let artifacts = verify_artifacts(&artifact_manifest)?;
+    let contract = artifacts.control.clone();
+    let secret = ControlSecret::random()?;
+    let secret_path = store.write_secret(&lease.domain_id, &secret)?;
+    let listener = HostControlListener::bind(lease.dvm_guest_cid, contract, secret)?;
+    let runtime_dir = store.prepare_domain_dir(&lease.domain_id)?;
+    let qmp_path = match prepare_qmp_socket(&runtime_dir) {
+        Ok(path) => path,
+        Err(error) => {
+            let _ = store.remove(&lease.domain_id);
+            return Err(error).context("prepare private storage-DVM QMP endpoint");
+        }
+    };
+
+    let mut ops = SysfsVfioOps::new(sysfs_root);
+    reset_vfio_group(lease, &mut ops)?;
+    install_signal_handlers()?;
+    TERMINATE_REQUESTED.store(false, Ordering::Release);
+    let (mut child, mut launch_gate) = match spawn_storage_qemu_gated(
+        &qemu,
+        lease,
+        &artifacts,
+        &secret_path,
+        config.block_doorbell,
+        &runtime_dir,
+        &qmp_path,
+    ) {
+        Ok(child) => child,
+        Err(start_error) => {
+            let revoke = crate::storage::revoke_storage_aperture(
+                binding.aperture_path(),
+                binding.generation(),
+            );
+            let restore = revoke.and_then(|()| restore_vfio_lease(lease, &mut ops));
+            let _ = store.remove(&lease.domain_id);
+            return match restore {
+                Ok(()) => Err(start_error),
+                Err(restore_error) => Err(start_error).context(format!(
+                    "storage DVM start failed and ownership recovery failed: {restore_error:#}"
+                )),
+            };
+        }
+    };
+    let run_result = (|| {
+        let process_start_ticks = wait_for_process_start(child.id(), config.setup_timeout)?;
+        let mut record = RuntimeRecord {
+            state: RuntimeState::Starting,
+            domain_id: lease.domain_id.clone(),
+            dvm_guest_cid: lease.dvm_guest_cid,
+            iommu_group: lease.iommu_group,
+            pid: child.id(),
+            process_start_ticks,
+            launched_at_unix: current_unix_time()?,
+            qemu_sha256,
+            artifact_manifest_sha256: lease.dvm_artifact_manifest_sha256()?.to_owned(),
+            device_policy_sha256: lease.device_policy_sha256()?.to_owned(),
+            release_manifest_sha256: lease.release_manifest_sha256()?.to_owned(),
+        };
+        store.write_record(&record)?;
+        launch_gate
+            .write_all(&[1])
+            .context("release durably recorded storage-DVM launch gate")?;
+        drop(launch_gate);
+        wait_for_storage_readiness(&listener, config.setup_timeout, &physical_storage, &binding)?;
+        record.state = RuntimeState::Ready;
+        store.write_record(&record)?;
+        let status = monitor_storage_child(
+            &mut child,
+            &mut record,
+            store,
+            &listener,
+            &physical_storage,
+            &binding,
+            &qmp_path,
+        )?;
+        require_successful_child_exit(status)
+    })();
+    let stop_error = if run_result.is_err() {
+        stop_child(&mut child, &qmp_path).err()
+    } else {
+        None
+    };
+    let revoke_result =
+        crate::storage::revoke_storage_aperture(binding.aperture_path(), binding.generation());
+    let restore_result = revoke_result.and_then(|()| restore_vfio_lease(lease, &mut ops));
+    if restore_result.is_ok() {
+        store.remove(&lease.domain_id)?;
+    }
+    match (run_result, stop_error, restore_result) {
+        (Ok(status), None, Ok(())) => Ok(status),
+        (Ok(status), _, Err(restore_error)) => Err(restore_error).context(format!(
+            "storage DVM exited with {status}, but revoke/reset/restore failed; records retained"
+        )),
+        (Err(run_error), None, Ok(())) => Err(run_error),
+        (Err(run_error), Some(stop_error), Ok(())) => Err(run_error).context(format!(
+            "storage DVM supervision failed and bounded stop also failed: {stop_error:#}"
+        )),
+        (Err(run_error), stop_error, Err(restore_error)) => Err(run_error).context(format!(
+            "storage DVM supervision failed; stop={}; ownership recovery failed: {restore_error:#}",
+            stop_error
+                .map(|error| format!("failed: {error:#}"))
+                .unwrap_or_else(|| "complete".to_owned())
+        )),
+        (Ok(_), Some(_), Ok(())) => unreachable!("successful run has no stop error"),
+    }
+}
+
 fn require_successful_child_exit(status: ExitStatus) -> Result<ExitStatus> {
     if !status.success() {
         bail!("supervised DVM exited unsuccessfully: {status}");
@@ -1105,6 +1309,9 @@ pub fn recover_domain(
         }
         Err(error) if is_missing_runtime(&error) => {}
         Err(error) => return Err(error),
+    }
+    if let Some(storage) = lease.storage_handoff() {
+        crate::storage::revoke_storage_aperture(storage.aperture_path(), storage.generation())?;
     }
     let mut ops = SysfsVfioOps::new(sysfs_root);
     restore_vfio_lease(lease, &mut ops)?;
@@ -1251,6 +1458,206 @@ fn spawn_qemu_gated(
         .context("start gated supervised Linux DVM")?;
     drop(child_gate);
     Ok((child, parent_gate))
+}
+
+fn spawn_storage_qemu_gated(
+    qemu: &Path,
+    lease: &VfioLeaseRecord,
+    artifacts: &VerifiedArtifacts,
+    secret: &Path,
+    block_doorbell: &Path,
+    runtime_dir: &Path,
+    qmp_path: &Path,
+) -> Result<(Child, UnixStream)> {
+    let serial = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(runtime_dir.join("serial.log"))?;
+    let stderr = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(runtime_dir.join("qemu.stderr.log"))?;
+    let mut command = Command::new(qemu);
+    let qmp_argument = qmp_server_argument(qmp_path)?;
+    let (parent_gate, child_gate) = UnixStream::pair().context("create storage-DVM launch gate")?;
+    let parent_gate_fd = parent_gate.as_raw_fd();
+    let child_gate_fd = child_gate.as_raw_fd();
+    command
+        .arg("-name")
+        .arg(format!("rustos-dvm-{}", lease.domain_id))
+        .args([
+            "-machine",
+            "q35,accel=kvm",
+            "-cpu",
+            "host",
+            "-m",
+            DVM_GUEST_MEMORY,
+            "-smp",
+            "2",
+        ])
+        .args(["-object", "iommufd,id=iommufd0"])
+        .arg("-kernel")
+        .arg(&artifacts.kernel)
+        .arg("-initrd")
+        .arg(&artifacts.rootfs)
+        .args([
+            "-append",
+            "console=ttyS0 preempt=full",
+            "-display",
+            "none",
+            "-vga",
+            "none",
+            "-no-reboot",
+            "-nodefaults",
+        ])
+        .arg("-qmp")
+        .arg(qmp_argument)
+        .arg("-serial")
+        .arg("stdio")
+        .arg("-device")
+        .arg(format!("vhost-vsock-pci,guest-cid={}", lease.dvm_guest_cid))
+        .arg("-fw_cfg")
+        .arg(format!(
+            "name=opt/rustos/dvm-control-secret,file={}",
+            secret.display()
+        ))
+        .arg("-chardev")
+        .arg(format!(
+            "socket,id=dvm-block-doorbell,path={}",
+            block_doorbell.display()
+        ))
+        .args([
+            "-device",
+            "ivshmem-doorbell,vectors=1,chardev=dvm-block-doorbell",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(serial))
+        .stderr(Stdio::from(stderr));
+    for bdf in lease.original_drivers.keys() {
+        command
+            .arg("-device")
+            .arg(format!("vfio-pci,host={bdf},iommufd=iommufd0"));
+    }
+    unsafe {
+        command.pre_exec(move || {
+            for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+                libc::signal(signal, libc::SIG_DFL);
+            }
+            libc::umask(0o077);
+            libc::close(parent_gate_fd);
+            let mut byte = 0_u8;
+            loop {
+                let read = libc::read(child_gate_fd, (&mut byte as *mut u8).cast(), 1);
+                if read == 1 {
+                    libc::close(child_gate_fd);
+                    return Ok(());
+                }
+                if read == 0 {
+                    return Err(std::io::Error::from_raw_os_error(libc::EPIPE));
+                }
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::EINTR) {
+                    return Err(error);
+                }
+            }
+        });
+    }
+    let child = command
+        .spawn()
+        .context("start gated supervised Linux storage DVM")?;
+    drop(child_gate);
+    Ok((child, parent_gate))
+}
+
+fn validate_storage_probe(
+    probe: &rustos_driver_domain_host::ProbeResult,
+    policy: &rustos_driver_domain_host::PhysicalStoragePolicy,
+    binding: &rustos_driver_domain_host::StorageLeaseBinding,
+) -> Result<()> {
+    if probe.display_evidence.is_some() {
+        bail!("storage-only DVM unexpectedly published display evidence");
+    }
+    let evidence = probe
+        .block_evidence
+        .as_ref()
+        .ok_or_else(|| anyhow!("physical block evidence is unavailable"))?;
+    policy.validate_evidence(evidence, binding.generation(), binding.block_name())?;
+    let header =
+        crate::storage::inspect_storage_aperture(binding.aperture_path(), binding.generation())?;
+    if header.flags & (DVM_BLOCK_FLAG_RUSTOS_READY | DVM_BLOCK_FLAG_DVM_READY)
+        != DVM_BLOCK_FLAG_RUSTOS_READY | DVM_BLOCK_FLAG_DVM_READY
+        || header.capacity_sectors != evidence.capacity_sectors
+        || header.logical_block_size != evidence.logical_block_size
+        || header.physical_block_size != evidence.physical_block_size
+        || header.features != evidence.features
+    {
+        bail!("authenticated DVM block evidence does not match the live shared aperture");
+    }
+    Ok(())
+}
+
+fn wait_for_storage_readiness(
+    listener: &HostControlListener,
+    timeout: Duration,
+    policy: &rustos_driver_domain_host::PhysicalStoragePolicy,
+    binding: &rustos_driver_domain_host::StorageLeaseBinding,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    let mut last_reason = "no authenticated DVM probe".to_owned();
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match listener.probe_once(remaining.min(HEALTH_TIMEOUT)) {
+            Ok(probe) => match validate_storage_probe(&probe, policy, binding) {
+                Ok(()) => return Ok(()),
+                Err(error) => last_reason = format!("{error:#}"),
+            },
+            Err(error) => last_reason = format!("{error:#}"),
+        }
+        std::thread::sleep(SUPERVISOR_TICK);
+    }
+    bail!("DVM failed authenticated physical-storage readiness: {last_reason}")
+}
+
+fn monitor_storage_child(
+    child: &mut Child,
+    record: &mut RuntimeRecord,
+    store: &RuntimeStore,
+    listener: &HostControlListener,
+    policy: &rustos_driver_domain_host::PhysicalStoragePolicy,
+    binding: &rustos_driver_domain_host::StorageLeaseBinding,
+    qmp_path: &Path,
+) -> Result<ExitStatus> {
+    let mut next_health = Instant::now() + HEALTH_INTERVAL;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if TERMINATE_REQUESTED.load(Ordering::Acquire) {
+            record.state = RuntimeState::Stopping;
+            store.write_record(record)?;
+            let stopped = stop_child(child, qmp_path)?;
+            if stopped.kind != StopKind::CleanExit {
+                bail!(
+                    "storage DVM required forced termination after bounded ACPI shutdown: {}",
+                    stopped
+                        .qmp_failure
+                        .as_deref()
+                        .unwrap_or("unknown QMP failure")
+                );
+            }
+            return Ok(stopped.status);
+        }
+        if Instant::now() >= next_health {
+            let probe = listener
+                .probe_once(HEALTH_TIMEOUT)
+                .context("storage DVM lost authenticated health")?;
+            validate_storage_probe(&probe, policy, binding)?;
+            next_health = Instant::now() + HEALTH_INTERVAL;
+        }
+        std::thread::sleep(SUPERVISOR_TICK);
+    }
 }
 
 fn monitor_child(

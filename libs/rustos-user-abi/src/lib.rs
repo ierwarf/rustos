@@ -68,7 +68,6 @@ mod tests {
         );
         assert_eq!(syscall::SYS_RUSTOS_DEVICE_OPEN_BROKER, 0x5255_0032);
         assert_eq!(syscall::SYS_RUSTOS_INPUT_INGEST_BROKER, 0x5255_0033);
-        assert_eq!(syscall::SYS_RUSTOS_BOOT_EXTENT_BROKER, 0x5255_0034);
         assert_eq!(syscall::SYS_RUSTOS_IPC_TRY_RECV, 0x5255_0035);
         assert_eq!(syscall::SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER, 0x5255_0036);
         assert_eq!(syscall::SYS_RUSTOS_DRIVER_SYMBOL_EVENT_BROKER, 0x5255_0037);
@@ -112,6 +111,7 @@ mod tests {
         assert_eq!(syscall::IPC_SERVICE_PAGERD, 12);
         assert_eq!(syscall::IPC_SERVICE_SERVICE_DRIVERD, 13);
         assert_eq!(syscall::IPC_SERVICE_UISERVER, 14);
+        assert_eq!(syscall::IPC_SERVICE_INITD, 15);
         assert_eq!(syscall::DEVMGRD_IPC_OP_OPEN, 3);
         assert_eq!(syscall::DEVMGRD_IPC_OP_IOCTL_AUTHORIZE, 4);
         assert_eq!(syscall::DEVMGRD_IPC_OP_IOCTL_ROUTE, 5);
@@ -125,7 +125,7 @@ mod tests {
         assert_eq!(syscall::DEVMGRD_IOCTL_LINUX_TTY_TCSETSF, 0x5404);
         assert_eq!(syscall::DEVMGRD_IOCTL_LINUX_TTY_FIONREAD, 0x541b);
         assert_eq!(syscall::INPUTD_IPC_ABI_VERSION, 3);
-        assert_eq!(syscall::VFS_IPC_ABI_VERSION, 3);
+        assert_eq!(syscall::VFS_IPC_ABI_VERSION, 4);
         assert_eq!(syscall::VFS_IPC_OP_CURSOR_SETTLE, 24);
         assert_eq!(syscall::VFS_IPC_OP_CHECKPOINT_ACK, 25);
         assert_eq!(
@@ -136,17 +136,23 @@ mod tests {
         assert_eq!(syscall::NETD_IPC_ABI_VERSION, 4);
         assert_eq!(syscall::SYS_RUSTOS_WAITSET_SIGNAL_BROKER, 0x5255_003f);
         assert_eq!(syscall::SYS_RUSTOS_ENTROPY_BROKER, 0x5255_0040);
+        assert_eq!(syscall::SYS_RUSTOS_EARLY_SYSTEM_BROKER, 0x5255_0041);
+        assert_eq!(syscall::SYS_RUSTOS_IPC_VALIDATE_SERVICE_OWNER, 0x5255_0042);
         assert_eq!(syscall::WAITSET_PROVIDER_SESSIOND, 4);
         assert_eq!(syscall::WAITSET_PROVIDER_MAX, 4);
         assert_eq!(size_of::<syscall::WaitSetSignalBrokerArgs>(), 32);
         assert_eq!(size_of::<syscall::WaitSetInterestWire>(), 48);
+        assert_eq!(syscall::BLOCK_BROKER_ABI_VERSION, 3);
+        assert_eq!(syscall::BLOCK_BROKER_OP_DVM_INFO, 1);
+        assert_eq!(syscall::BLOCK_BROKER_OP_DVM_WAIT, 7);
+        assert_eq!(size_of::<syscall::RustosBlockBrokerArgs>(), 96);
+        assert_eq!(size_of::<syscall::EarlySystemBrokerArgs>(), 144);
         assert_eq!(syscall::INPUTD_IPC_OP_DRAIN_INGEST, 4);
         assert_eq!(syscall::INPUTD_IPC_OP_READ, 5);
         assert_eq!(syscall::INPUTD_INGRESS_KIND_POINTER_PACKET, 2);
         assert_eq!(syscall::INPUTD_INGRESS_KIND_POINTER_POSITION, 3);
         assert_eq!(syscall::INPUTD_INGRESS_KIND_DVM_LINUX_KEY, 10);
         assert_eq!(syscall::INPUTD_INGRESS_FLAG_DVM_SOURCE, 1 << 1);
-        assert_eq!(syscall::STORAGED_POLICY_ABI_VERSION, 1);
 
         assert!(size_of::<syscall::DevmgrdDeviceOpenRequest>() <= syscall::IPC_MAX_INLINE_BYTES);
         assert!(size_of::<syscall::DevmgrdDeviceOpenResponse>() <= syscall::IPC_MAX_INLINE_BYTES);
@@ -158,9 +164,6 @@ mod tests {
         assert_eq!(size_of::<syscall::InputPointerPositionWire>(), 16);
         assert_eq!(size_of::<syscall::InputIngressWire>(), 52);
         assert!(size_of::<syscall::InputdReadResponse>() <= syscall::IPC_MAX_INLINE_BYTES);
-        assert_eq!(size_of::<syscall::StoragedAhciPolicyWire>(), 32);
-        assert_eq!(size_of::<syscall::StoragedNvmePolicyWire>(), 36);
-        assert!(size_of::<syscall::RustosBootExtentBrokerArgs>() <= syscall::IPC_MAX_INLINE_BYTES);
         assert!(size_of::<syscall::NetdIpcRequest>() <= syscall::IPC_MAX_INLINE_BYTES);
         assert!(size_of::<syscall::NetdIpcResponse>() <= syscall::IPC_MAX_INLINE_BYTES);
     }
@@ -192,9 +195,6 @@ mod tests {
         assert_eq!(syscall::COMMERCIAL_MAX_VFSD_OP_METADATA_POLICY, 6);
         assert_eq!(syscall::COMMERCIAL_MAX_DEVMGRD_OP_DEVICE_OPEN, 2);
         assert_eq!(syscall::COMMERCIAL_MAX_INPUTD_OP_INPUT_READER, 2);
-        assert_eq!(syscall::COMMERCIAL_MAX_STORAGED_OP_BOOT_EXTENT_LEASE, 4);
-        assert_eq!(syscall::COMMERCIAL_MAX_STORAGED_OP_AHCI_POLICY, 6);
-        assert_eq!(syscall::COMMERCIAL_MAX_STORAGED_OP_NVME_POLICY, 7);
         assert_eq!(syscall::COMMERCIAL_MAX_NETD_OP_PACKET_LEASE, 5);
         assert_eq!(syscall::COMMERCIAL_MAX_DRIVERD_OP_PROVIDER_SELECT, 4);
         assert_eq!(syscall::COMMERCIAL_MAX_SESSIOND_OP_UI_BOOTSTRAP, 5);

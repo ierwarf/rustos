@@ -1,3 +1,4 @@
+pub use crate::multitask::SyscallUserSimdSnapshot;
 pub use crate::multitask::{
     CurrentKernelStackScope, CurrentUserSnapshot, DEFAULT_USER_TASK_WEIGHT_MICROS,
     MAX_SCHEDULER_TASKS, RetainedCurrentUserAddressSpace, RetainedCurrentUserProcessState,
@@ -14,9 +15,8 @@ pub use crate::multitask::{
     is_user_process_exiting, is_user_task_alive, linux_thread_snapshot_by_ids,
     mark_user_process_exiting, mark_user_process_exiting_once, note_process_exit_status,
     queue_linux_signal, release_ipc_priorities_for_process, release_ipc_priority,
-    restore_current_simd_state, save_current_simd_state, set_next_latency_pick_hint,
-    set_next_pick_hint, set_next_process_pick_hint, set_next_spawn_pick_hint,
-    spawn_user_process_state_with_parent, spawn_user_process_with_parent,
+    set_next_latency_pick_hint, set_next_pick_hint, set_next_process_pick_hint,
+    set_next_spawn_pick_hint, spawn_user_process_state_with_parent, spawn_user_process_with_parent,
     spawn_user_thread_suspended, terminate_user_process, terminate_user_task, wake_task,
     wake_user_task, with_current_mm, with_current_process_state, with_current_process_state_mut,
     with_current_user_linux_state_mut, with_current_user_process_and_linux_thread_state_mut,

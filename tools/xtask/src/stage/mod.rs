@@ -1,9 +1,13 @@
 use anyhow::{Context, anyhow, bail};
 use fs_err as fs;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use boot_protocol::{
+    EARLY_SYSTEM_ENTRY_BYTES, EARLY_SYSTEM_HEADER_BYTES, EARLY_SYSTEM_MAX_ENTRIES,
+    EARLY_SYSTEM_PAYLOAD_ALIGNMENT, EarlySystemEntry, EarlySystemHeader,
+};
 use fatfs::Seek as FatSeek;
 use fatfs::Write as FatWrite;
 use sha2::{Digest, Sha256};
@@ -21,10 +25,30 @@ use crate::util::{
 };
 
 const APPLICATIONS_DIR: &str = "usr/share/applications";
-const ROOT_FILE_EXTENTS_REGISTRY_PATH: &str = "system/registry/kernel/root-file-extents.tsv";
-const ROOT_FILE_EXTENTS_REGISTRY_SIGNATURE_PATH: &str =
-    "system/registry/kernel/root-file-extents.tsv.sig";
-const ROOT_CONTENT_CHUNK_BYTES: usize = 64 * 1024;
+const EARLY_SYSTEM_IMAGE_PATH: &str = "system/boot/early-system.img";
+const EARLY_SYSTEM_IMAGE_SIGNATURE_PATH: &str = "system/boot/early-system.img.sig";
+const EARLY_SYSTEM_BOOTSTRAP_PATHS: &[&str] = &[
+    "lib/x86_64-linux-gnu/libc.so.6",
+    "lib/x86_64-linux-gnu/libgcc_s.so.1",
+    "lib64/ld-linux-x86-64.so.2",
+    "services/devmgrd/devmgrd.elf",
+    "services/initd/initd.elf",
+    "services/inputd/inputd.elf",
+    "services/loaderd/loaderd.elf",
+    "services/netd/netd.elf",
+    "services/procd/procd.elf",
+    "services/rootd/rootd.elf",
+    "services/runtimed/runtimed.elf",
+    "services/storaged/storaged.elf",
+    "services/syscalld/syscalld.elf",
+    "services/vfsd/vfsd.elf",
+    "system/registry/compat/windows-system-dlls.txt",
+    "system/registry/system/desktop-programs.tsv",
+    "system/registry/system/linux-runtime-access.tsv",
+    "system/registry/system/runtime-env.tsv",
+    "system/registry/system/runtime-launch-programs.tsv",
+    "system/registry/system/startup-programs.tsv",
+];
 const DESKTOP_REGISTRY_PATH: &str = "system/registry/system/desktop-programs.tsv";
 const RUNTIME_LAUNCH_REGISTRY_PATH: &str = "system/registry/system/runtime-launch-programs.tsv";
 const STARTUP_REGISTRY_PATH: &str = "system/registry/system/startup-programs.tsv";
@@ -115,8 +139,107 @@ pub(crate) fn stage(config: &Config) -> Result<()> {
     write_linux_runtime_access_registry(config)?;
     write_runtime_env_registry(config)?;
     generate_dynamic_linker_cache(&config.image_dir)?;
+    write_early_system_image(config)?;
     write_boot_disk_image(config)?;
     Ok(())
+}
+
+fn write_early_system_image(config: &Config) -> Result<()> {
+    let image = build_early_system_image(&config.image_dir, EARLY_SYSTEM_BOOTSTRAP_PATHS)?;
+    let work_dir = config.build_dir.join("early-system");
+    fs::create_dir_all(&work_dir)?;
+    let image_path = work_dir.join("early-system.img");
+    let signature_path = work_dir.join("early-system.img.sig");
+    fs::write(&image_path, image)?;
+    sign_detached_for_grub(config, &image_path, &signature_path)?;
+
+    let staged_image = config.image_dir.join(EARLY_SYSTEM_IMAGE_PATH);
+    let staged_signature = config.image_dir.join(EARLY_SYSTEM_IMAGE_SIGNATURE_PATH);
+    if let Some(parent) = staged_image.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::copy(&image_path, staged_image)?;
+    fs::copy(&signature_path, staged_signature)?;
+    Ok(())
+}
+
+fn build_early_system_image(image_dir: &Path, paths: &[&str]) -> Result<Vec<u8>> {
+    if paths.is_empty() || paths.len() > EARLY_SYSTEM_MAX_ENTRIES as usize {
+        bail!("early-system allowlist count is outside the fixed ABI bound");
+    }
+    let mut paths = paths.to_vec();
+    paths.sort_unstable();
+    if paths.windows(2).any(|pair| pair[0] == pair[1]) {
+        bail!("early-system allowlist contains a duplicate path");
+    }
+
+    let table_end = EARLY_SYSTEM_HEADER_BYTES
+        .checked_add(
+            paths
+                .len()
+                .checked_mul(EARLY_SYSTEM_ENTRY_BYTES)
+                .context("early-system table size overflow")?,
+        )
+        .context("early-system table size overflow")?;
+    let payload_offset = align_early_system_offset(table_end as u64)?;
+    let mut payload_cursor = payload_offset;
+    let mut files = Vec::with_capacity(paths.len());
+    for path in paths {
+        let source = image_dir.join(path);
+        let bytes = fs::read(&source)
+            .with_context(|| format!("missing early-system bootstrap file {}", source.display()))?;
+        if bytes.is_empty() {
+            bail!("early-system bootstrap file is empty: {path}");
+        }
+        payload_cursor = align_early_system_offset(payload_cursor)?;
+        let len = u64::try_from(bytes.len()).context("early-system file is too large")?;
+        let end = payload_cursor
+            .checked_add(len)
+            .context("early-system payload size overflow")?;
+        let sha256: [u8; 32] = Sha256::digest(&bytes).into();
+        let entry = EarlySystemEntry::new(path.as_bytes(), payload_cursor, len, sha256)
+            .with_context(|| format!("invalid early-system path or range: {path}"))?;
+        files.push((entry, bytes));
+        payload_cursor = end;
+    }
+
+    let header = EarlySystemHeader::new(
+        u32::try_from(files.len()).context("early-system entry count overflow")?,
+        payload_offset,
+        payload_cursor,
+    )
+    .context("early-system header violates the fixed ABI")?;
+    let image_len =
+        usize::try_from(header.total_bytes).context("early-system image does not fit usize")?;
+    let mut image = vec![0_u8; image_len];
+    image[..EARLY_SYSTEM_HEADER_BYTES].copy_from_slice(
+        &header
+            .encode()
+            .context("early-system header encoding failed")?,
+    );
+    for (index, (entry, bytes)) in files.into_iter().enumerate() {
+        let record_start = EARLY_SYSTEM_HEADER_BYTES + index * EARLY_SYSTEM_ENTRY_BYTES;
+        let record_end = record_start + EARLY_SYSTEM_ENTRY_BYTES;
+        image[record_start..record_end].copy_from_slice(
+            &entry
+                .encode(header)
+                .context("early-system entry encoding failed")?,
+        );
+        let payload_start = usize::try_from(entry.payload_offset)
+            .context("early-system payload offset overflow")?;
+        let payload_end = payload_start
+            .checked_add(bytes.len())
+            .context("early-system payload end overflow")?;
+        image[payload_start..payload_end].copy_from_slice(&bytes);
+    }
+    Ok(image)
+}
+
+fn align_early_system_offset(value: u64) -> Result<u64> {
+    value
+        .checked_add(EARLY_SYSTEM_PAYLOAD_ALIGNMENT - 1)
+        .map(|value| value / EARLY_SYSTEM_PAYLOAD_ALIGNMENT * EARLY_SYSTEM_PAYLOAD_ALIGNMENT)
+        .context("early-system alignment overflow")
 }
 
 fn stage_manifest(config: &Config, manifest: &PackageManifest) -> Result<()> {
@@ -221,8 +344,6 @@ fn write_boot_disk_image(config: &Config) -> Result<()> {
     )?;
     image.seek(fatfs::SeekFrom::Start(0))?;
     let fs = fatfs::FileSystem::new(image, fatfs::FsOptions::new())?;
-    let mut extent_entries = Vec::new();
-    let extent_manifest;
     {
         let root = fs.root_dir();
         for file in &files {
@@ -231,66 +352,21 @@ fn write_boot_disk_image(config: &Config) -> Result<()> {
             dst.truncate()?;
             copy_host_file_to_fat(&file.source, &mut dst)?;
             dst.flush()?;
-            extent_entries.push(BootDiskExtentEntry {
-                path: format!("/{}", file.relative),
-                len: file.len,
-                extents: collect_fat_file_extents(&mut dst)?,
-                chunk_sha256: file.chunk_sha256.clone(),
-            });
         }
-        extent_manifest = write_root_file_extents_registry(&root, &extent_entries)?;
-        write_root_file_extents_signature(config, &root, extent_manifest.as_bytes())?;
     }
     fs.unmount()?;
-    verify_boot_disk_image_contract(
-        &config.boot_disk_image,
-        &files,
-        &extent_entries,
-        extent_manifest.as_str(),
-    )?;
+    verify_boot_disk_image_contract(&config.boot_disk_image, &files)?;
     Ok(())
 }
 
-struct BootDiskExtentEntry {
-    path: String,
-    len: u64,
-    extents: Vec<BootDiskFileExtent>,
-    chunk_sha256: Vec<[u8; 32]>,
-}
-
-struct BootDiskFileExtent {
-    offset: u64,
-    len: u64,
-}
-
-fn verify_boot_disk_image_contract(
-    boot_disk_image: &Path,
-    files: &[ImageFile],
-    extent_entries: &[BootDiskExtentEntry],
-    expected_manifest: &str,
-) -> Result<()> {
-    if files.len() != extent_entries.len() {
-        bail!(
-            "boot extent contract entry count mismatch: files={} extents={}",
-            files.len(),
-            extent_entries.len()
-        );
-    }
-
-    let mut raw_disk = fs::File::open(boot_disk_image)
-        .with_context(|| format!("failed to reopen boot disk {}", boot_disk_image.display()))?;
-    for (file, entry) in files.iter().zip(extent_entries) {
-        let expected_path = format!("/{}", file.relative);
-        if entry.path != expected_path || entry.len != file.len {
-            bail!(
-                "boot extent contract metadata mismatch for {}",
-                file.source.display()
-            );
-        }
-        if entry.chunk_sha256 != file.chunk_sha256 {
-            bail!("boot extent content digest mismatch for {}", entry.path);
-        }
-
+fn verify_boot_disk_image_contract(boot_disk_image: &Path, files: &[ImageFile]) -> Result<()> {
+    let image =
+        fatfs::StdIoWrapper::new(fs::File::open(boot_disk_image).with_context(|| {
+            format!("failed to reopen boot disk {}", boot_disk_image.display())
+        })?);
+    let fs = fatfs::FileSystem::new(image, fatfs::FsOptions::new())?;
+    let root = fs.root_dir();
+    for file in files {
         let expected = fs::read(&file.source)
             .with_context(|| format!("failed to reread staged source {}", file.source.display()))?;
         let expected_len = usize::try_from(file.len)
@@ -301,149 +377,17 @@ fn verify_boot_disk_image_contract(
                 file.source.display()
             );
         }
-
-        let mut actual = Vec::with_capacity(expected_len);
-        for extent in &entry.extents {
-            let extent_len = usize::try_from(extent.len)
-                .context("boot extent length does not fit host address space")?;
-            let next_len = actual
-                .len()
-                .checked_add(extent_len)
-                .context("boot extent length overflow")?;
-            if next_len > expected_len {
-                bail!("boot extents exceed staged file length for {}", entry.path);
-            }
-            raw_disk
-                .seek(SeekFrom::Start(extent.offset))
-                .with_context(|| format!("failed to seek boot extent for {}", entry.path))?;
-            let start = actual.len();
-            actual.resize(next_len, 0);
-            raw_disk
-                .read_exact(&mut actual[start..])
-                .with_context(|| format!("failed to read boot extent for {}", entry.path))?;
-        }
+        let mut staged = root
+            .open_file(file.relative.as_str())
+            .with_context(|| format!("missing staged boot-disk file {}", file.relative))?;
+        let mut actual = Vec::new();
+        staged.read_to_end(&mut actual)?;
         if actual != expected {
-            bail!("boot extent payload mismatch for {}", entry.path);
+            bail!("boot-disk payload mismatch for {}", file.relative);
         }
     }
-
-    let image =
-        fatfs::StdIoWrapper::new(fs::File::open(boot_disk_image).with_context(|| {
-            format!("failed to reopen boot disk {}", boot_disk_image.display())
-        })?);
-    let fs = fatfs::FileSystem::new(image, fatfs::FsOptions::new())?;
-    let actual_manifest = {
-        let root = fs.root_dir();
-        let mut manifest_file = root.open_file(ROOT_FILE_EXTENTS_REGISTRY_PATH)?;
-        let mut bytes = Vec::new();
-        manifest_file.read_to_end(&mut bytes)?;
-        bytes
-    };
+    drop(root);
     fs.unmount()?;
-    if actual_manifest != expected_manifest.as_bytes() {
-        bail!("boot extent manifest payload mismatch after image write");
-    }
-    Ok(())
-}
-
-fn collect_fat_file_extents<D: fatfs::ReadWriteSeek>(
-    file: &mut fatfs::File<'_, D, fatfs::DefaultTimeProvider, fatfs::LossyOemCpConverter>,
-) -> Result<Vec<BootDiskFileExtent>>
-where
-    D::Error: std::error::Error + Send + Sync + 'static,
-{
-    let mut extents: Vec<BootDiskFileExtent> = Vec::new();
-    for extent in file.extents() {
-        let extent = extent?;
-        let len = u64::from(extent.size);
-        if len == 0 {
-            continue;
-        }
-        if let Some(last) = extents.last_mut()
-            && last.offset.saturating_add(last.len) == extent.offset
-        {
-            last.len = last.len.saturating_add(len);
-            continue;
-        }
-        extents.push(BootDiskFileExtent {
-            offset: extent.offset,
-            len,
-        });
-    }
-    Ok(extents)
-}
-
-fn write_root_file_extents_registry<D: fatfs::ReadWriteSeek>(
-    root: &fatfs::Dir<'_, D, fatfs::DefaultTimeProvider, fatfs::LossyOemCpConverter>,
-    entries: &[BootDiskExtentEntry],
-) -> Result<String>
-where
-    D::Error: std::error::Error + Send + Sync + 'static,
-{
-    ensure_fat_parent_dirs(root, ROOT_FILE_EXTENTS_REGISTRY_PATH)?;
-    if root.open_file(ROOT_FILE_EXTENTS_REGISTRY_PATH).is_ok() {
-        root.remove(ROOT_FILE_EXTENTS_REGISTRY_PATH)?;
-    }
-
-    let mut content = String::new();
-    for entry in entries {
-        content.push_str("path=");
-        content.push_str(registry_value(entry.path.as_str())?.as_str());
-        content.push_str("\tlen=");
-        content.push_str(entry.len.to_string().as_str());
-        content.push_str("\textents=");
-        for (index, extent) in entry.extents.iter().enumerate() {
-            if index != 0 {
-                content.push(',');
-            }
-            content.push_str(extent.offset.to_string().as_str());
-            content.push(':');
-            content.push_str(extent.len.to_string().as_str());
-        }
-        content.push_str("\tsha256_chunks=");
-        for (index, digest) in entry.chunk_sha256.iter().enumerate() {
-            if index != 0 {
-                content.push(',');
-            }
-            content.push_str(sha256_hex(digest).as_str());
-        }
-        content.push('\n');
-    }
-
-    let mut file = root.create_file(ROOT_FILE_EXTENTS_REGISTRY_PATH)?;
-    file.truncate()?;
-    file.write_all(content.as_bytes())?;
-    file.flush()?;
-    Ok(content)
-}
-
-fn write_root_file_extents_signature<D: fatfs::ReadWriteSeek>(
-    config: &Config,
-    root: &fatfs::Dir<'_, D, fatfs::DefaultTimeProvider, fatfs::LossyOemCpConverter>,
-    manifest: &[u8],
-) -> Result<()>
-where
-    D::Error: std::error::Error + Send + Sync + 'static,
-{
-    let work_dir = config.build_dir.join("boot-extent-manifest");
-    fs::create_dir_all(&work_dir)?;
-    let manifest_path = work_dir.join("root-file-extents.tsv");
-    let signature_path = work_dir.join("root-file-extents.tsv.sig");
-    fs::write(&manifest_path, manifest)?;
-    sign_detached_for_grub(config, &manifest_path, &signature_path)?;
-
-    ensure_fat_parent_dirs(root, ROOT_FILE_EXTENTS_REGISTRY_SIGNATURE_PATH)?;
-    if root
-        .open_file(ROOT_FILE_EXTENTS_REGISTRY_SIGNATURE_PATH)
-        .is_ok()
-    {
-        root.remove(ROOT_FILE_EXTENTS_REGISTRY_SIGNATURE_PATH)?;
-    }
-    let signature = fs::read(&signature_path)?;
-    let mut file = root.create_file(ROOT_FILE_EXTENTS_REGISTRY_SIGNATURE_PATH)?;
-    file.truncate()?;
-    file.write_all(&signature)?;
-    file.flush()?;
     Ok(())
 }
 
@@ -478,7 +422,6 @@ struct ImageFile {
     source: PathBuf,
     relative: String,
     len: u64,
-    chunk_sha256: Vec<[u8; 32]>,
 }
 
 fn collect_image_files(image_dir: &Path) -> Result<Vec<ImageFile>> {
@@ -500,53 +443,15 @@ fn collect_image_files(image_dir: &Path) -> Result<Vec<ImageFile>> {
             let len = fs::metadata(&path)
                 .map_err(|err| anyhow!("failed to stat image file {}: {err}", path.display()))?
                 .len();
-            let chunk_sha256 = sha256_file_chunks(&path)?;
             Ok(ImageFile {
                 source: path,
                 relative,
                 len,
-                chunk_sha256,
             })
         })
         .collect::<Result<Vec<_>>>()?;
     files.sort_by(|lhs, rhs| lhs.relative.cmp(&rhs.relative));
     Ok(files)
-}
-
-fn sha256_file_chunks(path: &Path) -> Result<Vec<[u8; 32]>> {
-    let mut file = fs::File::open(path)
-        .with_context(|| format!("failed to hash staged file {}", path.display()))?;
-    let mut buffer = vec![0_u8; ROOT_CONTENT_CHUNK_BYTES];
-    let mut chunks = Vec::new();
-    loop {
-        let mut used = 0usize;
-        while used < buffer.len() {
-            let read = file.read(&mut buffer[used..])?;
-            if read == 0 {
-                break;
-            }
-            used += read;
-        }
-        if used == 0 {
-            break;
-        }
-        let digest: [u8; 32] = Sha256::digest(&buffer[..used]).into();
-        chunks.push(digest);
-        if used < buffer.len() {
-            break;
-        }
-    }
-    Ok(chunks)
-}
-
-fn sha256_hex(digest: &[u8; 32]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(64);
-    for byte in digest {
-        out.push(HEX[usize::from(byte >> 4)] as char);
-        out.push(HEX[usize::from(byte & 0x0f)] as char);
-    }
-    out
 }
 
 fn boot_disk_image_len(payload_bytes: u64) -> u64 {
@@ -1306,9 +1211,11 @@ fn generate_dynamic_linker_cache(image_dir: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BootDiskExtentEntry, ImageFile, collect_fat_file_extents, ensure_fat_parent_dirs,
-        registry_deps, sha256_file_chunks, verify_boot_disk_image_contract,
-        write_root_file_extents_registry,
+        EARLY_SYSTEM_BOOTSTRAP_PATHS, ImageFile, build_early_system_image, ensure_fat_parent_dirs,
+        registry_deps, verify_boot_disk_image_contract,
+    };
+    use boot_protocol::{
+        EARLY_SYSTEM_ENTRY_BYTES, EARLY_SYSTEM_HEADER_BYTES, EarlySystemEntry, EarlySystemHeader,
     };
     use fatfs::{Seek as _, Write as _};
     use std::fs::OpenOptions;
@@ -1318,6 +1225,45 @@ mod tests {
         let deps = vec!["runtimed".to_string(), "sessiond".to_string()];
 
         assert_eq!(registry_deps(&deps).unwrap(), "runtimed,sessiond");
+    }
+
+    #[test]
+    fn early_system_image_is_deterministic_sorted_and_bounded() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("services/a")).unwrap();
+        std::fs::create_dir_all(root.join("services/b")).unwrap();
+        std::fs::write(root.join("services/a/a.elf"), b"alpha").unwrap();
+        std::fs::write(root.join("services/b/b.elf"), b"beta").unwrap();
+
+        let image =
+            build_early_system_image(root, &["services/b/b.elf", "services/a/a.elf"]).unwrap();
+        let header = EarlySystemHeader::decode(&image).unwrap();
+        assert_eq!(header.entry_count, 2);
+        assert_eq!(header.total_bytes as usize, image.len());
+        let first = EarlySystemEntry::decode(
+            &image[EARLY_SYSTEM_HEADER_BYTES..EARLY_SYSTEM_HEADER_BYTES + EARLY_SYSTEM_ENTRY_BYTES],
+            header,
+        )
+        .unwrap();
+        assert_eq!(first.path_bytes(), Some(b"services/a/a.elf".as_slice()));
+        let start = first.payload_offset as usize;
+        let end = start + first.payload_len as usize;
+        assert_eq!(&image[start..end], b"alpha");
+    }
+
+    #[test]
+    fn early_system_allowlist_contains_the_minimal_dynamic_runtime_closure() {
+        for required in [
+            "lib64/ld-linux-x86-64.so.2",
+            "lib/x86_64-linux-gnu/libc.so.6",
+            "lib/x86_64-linux-gnu/libgcc_s.so.1",
+        ] {
+            assert!(
+                EARLY_SYSTEM_BOOTSTRAP_PATHS.contains(&required),
+                "missing early-system dynamic runtime dependency {required}"
+            );
+        }
     }
 
     #[test]
@@ -1342,13 +1288,11 @@ mod tests {
     }
 
     #[test]
-    fn boot_disk_extent_contract_rechecks_raw_payload_and_manifest() {
+    fn boot_disk_contract_reopens_every_staged_file() {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("rootd.elf");
         let payload = b"rootd bootstrap payload";
         std::fs::write(&source, payload).unwrap();
-        let chunk_sha256 = sha256_file_chunks(&source).unwrap();
-
         let boot_disk = temp.path().join("rustos-boot.img");
         let image_file = OpenOptions::new()
             .create(true)
@@ -1362,23 +1306,14 @@ mod tests {
         fatfs::format_volume(&mut image, fatfs::FormatVolumeOptions::new()).unwrap();
         image.seek(fatfs::SeekFrom::Start(0)).unwrap();
         let fs = fatfs::FileSystem::new(image, fatfs::FsOptions::new()).unwrap();
-        let (entry, manifest) = {
+        {
             let root = fs.root_dir();
             let relative = "services/rootd/rootd.elf";
             ensure_fat_parent_dirs(&root, relative).unwrap();
             let mut staged = root.create_file(relative).unwrap();
             staged.write_all(payload).unwrap();
             staged.flush().unwrap();
-            let entry = BootDiskExtentEntry {
-                path: format!("/{relative}"),
-                len: payload.len() as u64,
-                extents: collect_fat_file_extents(&mut staged).unwrap(),
-                chunk_sha256: chunk_sha256.clone(),
-            };
-            let manifest =
-                write_root_file_extents_registry(&root, std::slice::from_ref(&entry)).unwrap();
-            (entry, manifest)
-        };
+        }
         fs.unmount().unwrap();
 
         verify_boot_disk_image_contract(
@@ -1387,10 +1322,7 @@ mod tests {
                 source,
                 relative: "services/rootd/rootd.elf".to_string(),
                 len: payload.len() as u64,
-                chunk_sha256,
             }],
-            &[entry],
-            &manifest,
         )
         .unwrap();
     }

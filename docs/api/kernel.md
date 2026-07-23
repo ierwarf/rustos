@@ -87,7 +87,7 @@ driver integration.
 | Group | Key APIs | Notes |
 | --- | --- | --- |
 | `boot` | `init_gui`, `init_boot_info`, `boot_volume_identity`, `enter_kernel_vfs_runtime`, `enter_userspace_runtime` | Boot volume and runtime phase transitions. |
-| `block` | `register_boot_volume_opener`, `init_block_devices`, `block_descriptors`, `lookup_block` | Block device registration and lookup. |
+| `block` | `dvm_info`, `submit_dvm_read`, `submit_dvm_write`, `submit_dvm_flush`, `poll_dvm`, `cancel_dvm`, `finish_dvm` | Bounded storage-DVM transport; no physical block registry. |
 | `console` | `init_console`, `init_tty`, `write_console`, `service_console` | Kernel console and TTY service. |
 | `device` | `open`, `read_to_current_user`, `read_to_user`, `ioctl_from_user` | `/dev`-style device access from kernel/syscall paths. |
 | `tty` | session input/output and termios helpers | Console session IO. |
@@ -212,7 +212,7 @@ device, boot volume state, VFS, console, driver integration은
 | Group | Key APIs | Notes |
 | --- | --- | --- |
 | `boot` | `init_gui`, `init_boot_info`, `boot_volume_identity`, `enter_kernel_vfs_runtime`, `enter_userspace_runtime` | boot volume과 runtime phase transition |
-| `block` | `register_boot_volume_opener`, `init_block_devices`, `block_descriptors`, `lookup_block` | block device registration과 lookup |
+| `block` | `dvm_info`, `submit_dvm_read`, `submit_dvm_write`, `submit_dvm_flush`, `poll_dvm`, `cancel_dvm`, `finish_dvm` | 제한된 storage-DVM 전송 경계이며 물리 block registry는 없음 |
 | `console` | `init_console`, `init_tty`, `write_console`, `service_console` | kernel console과 TTY service |
 | `device` | `open`, `read_to_current_user`, `read_to_user`, `ioctl_from_user` | kernel/syscall path의 `/dev` style device access |
 | `tty` | session input/output and termios helpers | console session IO |

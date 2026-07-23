@@ -37,6 +37,7 @@ matching development compile after the local edit set is coherent:
 | Relay | Fast compile only | One-time integration rebuild |
 | --- | --- | --- |
 | input/control | `make -C driver-domains/linux dev-agent` | `make -C driver-domains/linux rebuild-agent` |
+| block/storage | `make -C driver-domains/linux dev-block` | `make -C driver-domains/linux rebuild-block` |
 | display | `make -C driver-domains/linux dev-display` | `make -C driver-domains/linux rebuild-display` |
 | network | `make -C driver-domains/linux dev-net` | `make -C driver-domains/linux rebuild-net` |
 

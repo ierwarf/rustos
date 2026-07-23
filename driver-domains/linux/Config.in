@@ -3,6 +3,7 @@
 menu "RustOS Linux driver-domain components"
 
 source "$BR2_EXTERNAL_RUSTOS_LINUX_DVM_PATH/package/rustos-dvm-agent/Config.in"
+source "$BR2_EXTERNAL_RUSTOS_LINUX_DVM_PATH/package/rustos-dvm-block/Config.in"
 source "$BR2_EXTERNAL_RUSTOS_LINUX_DVM_PATH/package/rustos-dvm-display/Config.in"
 source "$BR2_EXTERNAL_RUSTOS_LINUX_DVM_PATH/package/rustos-dvm-net/Config.in"
 source "$BR2_EXTERNAL_RUSTOS_LINUX_DVM_PATH/package/rustos-dvm-nvidia-open/Config.in"

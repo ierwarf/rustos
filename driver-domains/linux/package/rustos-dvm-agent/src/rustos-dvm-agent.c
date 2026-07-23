@@ -36,6 +36,7 @@
 #define READY_CANDIDATE_NAME ".ready.next"
 #define DISPLAY_READY_LOCK READY_DIR "/display-ready.lock"
 #define DISPLAY_EVIDENCE_FILE READY_DIR "/display-evidence-v2.env"
+#define BLOCK_EVIDENCE_FILE READY_DIR "/block-evidence-v1.env"
 #define CONTROL_PORT_FLOOR 49152U
 #define CONTROL_PORT_SPAN (UINT32_MAX - CONTROL_PORT_FLOOR + 1U)
 #define MAX_FRAME 4096U
@@ -131,7 +132,7 @@ struct control_contract {
     char state[32];
     char transport[32];
     char authentication[32];
-    char capabilities[96];
+    char capabilities[128];
 };
 
 struct ready_owner_guard {
@@ -152,6 +153,20 @@ struct display_evidence_sample {
     uint32_t connector_id;
     uint32_t mode_width;
     uint32_t mode_height;
+};
+
+struct block_evidence_sample {
+    uint64_t generation;
+    uint64_t capacity_sectors;
+    uint64_t features;
+    uint32_t logical_block_size;
+    uint32_t physical_block_size;
+    char driver[16];
+    char vendor[5];
+    char device[5];
+    char bdf[16];
+    char block_name[65];
+    char read_only[4];
 };
 
 static void die(const char *message) {
@@ -551,7 +566,7 @@ static void parse_contract(struct control_contract *contract) {
         strcmp(contract->state, "control") != 0 || strcmp(contract->transport, "kvm-vsock") != 0 ||
         strcmp(contract->authentication, "dvm-agent-hmac-sha256-v1") != 0 ||
         strcmp(contract->capabilities,
-               "health,device-inventory,driver-inventory,display-evidence-v2,input-stream") != 0) {
+               "health,device-inventory,driver-inventory,display-evidence-v2,block-evidence-v1,input-stream") != 0) {
         die("unsupported control contract");
     }
 }
@@ -1389,6 +1404,75 @@ static int read_display_evidence(struct display_evidence_sample *sample, uint64_
     return 0;
 }
 
+static int safe_evidence_token(const char *value, size_t maximum, int allow_colon)
+{
+    size_t index;
+    size_t length = strlen(value);
+
+    if (length == 0U || length > maximum)
+        return 0;
+    for (index = 0U; index < length; index++) {
+        unsigned char byte = (unsigned char)value[index];
+        if (!((byte >= 'a' && byte <= 'z') ||
+              (byte >= '0' && byte <= '9') || byte == '-' || byte == '_' ||
+              byte == '.' || (allow_colon && byte == ':')))
+            return 0;
+    }
+    return 1;
+}
+
+static int read_block_evidence(struct block_evidence_sample *sample)
+{
+    char state[1024];
+    int consumed = 0;
+    int length;
+
+    if (sample == NULL)
+        return -1;
+    length = read_exact_small_file(BLOCK_EVIDENCE_FILE, state, sizeof(state), 1);
+    if (length <= 0)
+        return -1;
+    memset(sample, 0, sizeof(*sample));
+    if (sscanf(
+            state,
+            "BLOCK_EVIDENCE_SCHEMA=1\nGENERATION=%" SCNu64
+            "\nDRIVER=%15s\nPCI_VENDOR=%4s\nPCI_DEVICE=%4s"
+            "\nGUEST_PCI_BDF=%15s\nBLOCK_NAME=%64s"
+            "\nCAPACITY_SECTORS=%" SCNu64
+            "\nLOGICAL_BLOCK_SIZE=%" SCNu32
+            "\nPHYSICAL_BLOCK_SIZE=%" SCNu32
+            "\nFEATURES_HEX=%16" SCNx64 "\nREAD_ONLY=%3s\n%n",
+            &sample->generation, sample->driver, sample->vendor,
+            sample->device, sample->bdf, sample->block_name,
+            &sample->capacity_sectors, &sample->logical_block_size,
+            &sample->physical_block_size, &sample->features,
+            sample->read_only, &consumed) != 11 ||
+        consumed != length || sample->generation == 0U ||
+        sample->capacity_sectors == 0U ||
+        sample->logical_block_size < 512U ||
+        (sample->logical_block_size & (sample->logical_block_size - 1U)) != 0U ||
+        sample->physical_block_size < sample->logical_block_size ||
+        sample->physical_block_size % sample->logical_block_size != 0U ||
+        (sample->features & UINT64_C(1)) == 0U ||
+        !safe_evidence_token(sample->driver, 15U, 0) ||
+        !safe_evidence_token(sample->vendor, 4U, 0) ||
+        strlen(sample->vendor) != 4U ||
+        strspn(sample->vendor, "0123456789abcdef") != 4U ||
+        !safe_evidence_token(sample->device, 4U, 0) ||
+        strlen(sample->device) != 4U ||
+        strspn(sample->device, "0123456789abcdef") != 4U ||
+        (strcmp(sample->driver, "nvme") != 0 &&
+         strcmp(sample->driver, "ahci") != 0) ||
+        !safe_evidence_token(sample->bdf, 15U, 1) ||
+        !safe_evidence_token(sample->block_name, 64U, 0) ||
+        (strcmp(sample->read_only, "yes") != 0 &&
+         strcmp(sample->read_only, "no") != 0)) {
+        errno = EPROTO;
+        return -1;
+    }
+    return 0;
+}
+
 static void pointer_mark_pending(struct pointer_state *state) {
     uint64_t now;
     if (!state->pending && monotonic_time_ns(&now) == 0) {
@@ -1758,6 +1842,34 @@ static int serve_connection(int fd, const struct control_contract *contract,
                     "staged-damage-copy=no\nwindow-ns=0\nframe-hz-milli=0\n"
                     "pageflip-completions=0\ncpu-copy-us-avg=0\npageflip-latency-us-avg=0\n"
                     "pageflip-latency-us-max=0\natomic-commit-us-avg=0",
+                    id);
+            }
+        } else if (request_id(payload, "block-evidence-v1", &id) == 0) {
+            struct block_evidence_sample evidence;
+            if (read_block_evidence(&evidence) == 0) {
+                snprintf(
+                    payload, sizeof(payload),
+                    "RESPONSE\nid=%u\nop=block-evidence-v1\nstatus=ok"
+                    "\ngeneration=%" PRIu64 "\ndriver=%s\npci-vendor=%s"
+                    "\npci-device=%s\nguest-pci-bdf=%s\nblock-name=%s"
+                    "\ncapacity-sectors=%" PRIu64 "\nlogical-block-size=%" PRIu32
+                    "\nphysical-block-size=%" PRIu32 "\nfeatures=%016" PRIx64
+                    "\nread-only=%s",
+                    id, evidence.generation, evidence.driver,
+                    evidence.vendor, evidence.device, evidence.bdf,
+                    evidence.block_name, evidence.capacity_sectors,
+                    evidence.logical_block_size,
+                    evidence.physical_block_size, evidence.features,
+                    evidence.read_only);
+            } else {
+                snprintf(
+                    payload, sizeof(payload),
+                    "RESPONSE\nid=%u\nop=block-evidence-v1"
+                    "\nstatus=unavailable\ngeneration=0\ndriver=missing"
+                    "\npci-vendor=0000\npci-device=0000\nguest-pci-bdf=none"
+                    "\nblock-name=none\ncapacity-sectors=0"
+                    "\nlogical-block-size=0\nphysical-block-size=0"
+                    "\nfeatures=0000000000000000\nread-only=no",
                     id);
             }
         } else if (request_id(payload, "input-stream", &id) == 0) {

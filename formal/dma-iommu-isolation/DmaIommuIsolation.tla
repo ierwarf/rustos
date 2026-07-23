@@ -2,15 +2,16 @@
 EXTENDS Naturals, FiniteSets, TLC
 
 (*******************************************************************************
-Owner: L0 hostd for DVM devices and kernel io-manager for boot-storage DMA.
+Owner: L0 hostd/IOMMUFD for every physical DVM device.
 Linearization point: ActivateDomain after hardware remapping and invalidation.
 No identity/no-IOMMU state may be active in a commercial topology.
+RustOS ring0 never owns a physical-storage DMA domain.
 *******************************************************************************)
 
 CONSTANTS Devices, Domains, Pages, MaxMappings, MaxEpoch
 
 NoDomain == "none"
-Allowed(dom) == IF dom = "boot" THEN {"p0"} ELSE {"p1"}
+Allowed(dom) == IF dom = "storage-dvm" THEN {"p0"} ELSE {"p1"}
 VARIABLES owner, active, mappings, rejected, invalidationEpoch
 vars == <<owner, active, mappings, rejected, invalidationEpoch>>
 

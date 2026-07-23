@@ -1,0 +1,2 @@
+# boundary	owner	source	service	authority	lifecycle
+init-policy-role	initd	services/initd/src/main.rs	IPC_SERVICE_INITD	ZERO_TRUST_IDENTITY_ONLY_ENDPOINT	process-exit-or-service-revoke

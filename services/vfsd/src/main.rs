@@ -61,6 +61,7 @@ use vfsd::{
 
 mod block;
 mod devmgrd;
+mod early_system;
 mod linux_types;
 mod util;
 
@@ -143,10 +144,8 @@ fn linux_response_for_op(op: u16) -> LinuxSyscallOffloadResponse {
 fn reset_vfs_response_slot(op: u16) -> *mut VfsIpcResponse {
     let response = core::ptr::addr_of_mut!(VFS_RESPONSE_SLOT);
     let ptr = response.cast::<u8>();
-    for offset in 0..size_of::<VfsIpcResponse>() {
-        unsafe { core::ptr::write_volatile(ptr.add(offset), 0) };
-    }
     unsafe {
+        core::ptr::write_bytes(ptr, 0, size_of::<VfsIpcResponse>());
         (*response).version = VFS_IPC_ABI_VERSION;
         (*response).op = op;
     }
@@ -1913,9 +1912,13 @@ impl VfsState {
         start: u64,
         dest: &mut [u8],
     ) -> Result<usize, i32> {
-        self.volume()?
-            .read_file_range_into(path, start, dest)
-            .map_err(map_fat_error)
+        match early_system::read(path, start, dest)? {
+            Some(read) => Ok(read),
+            None => self
+                .volume()?
+                .read_file_range_into(path, start, dest)
+                .map_err(map_fat_error),
+        }
     }
 
     fn render_getdents_payload(
@@ -1982,6 +1985,15 @@ impl VfsState {
         if let Some(entry) = self.metadata_cache.get(path) {
             return *entry;
         }
+        if let Some(len) = early_system::file_len(path)? {
+            let metadata = Metadata {
+                kind: RemoteKind::File,
+                len,
+                inode: path_inode(path.as_bytes()),
+            };
+            self.metadata_cache.insert(path.to_string(), Ok(metadata));
+            return Ok(metadata);
+        }
         let result = match self.volume()?.metadata(path) {
             Ok(meta) => Ok(Metadata {
                 kind: match meta.kind {
@@ -2034,9 +2046,21 @@ impl VfsState {
 
     fn volume(&mut self) -> Result<&FatVolume<BootBlockDevice>, i32> {
         if self.volume.is_none() {
-            let device = BootBlockDevice::open()?;
+            let device = BootBlockDevice::open().map_err(|errno| {
+                debug_line(&format!(
+                    "vfsd: volume unavailable stage=block-info errno={errno}"
+                ));
+                errno
+            })?;
             let disk = FatDisk::new(device);
-            self.volume = Some(FatVolume::from_disk(disk).map_err(map_fat_error)?);
+            self.volume = Some(FatVolume::from_disk(disk).map_err(map_fat_error).map_err(
+                |errno| {
+                    debug_line(&format!(
+                        "vfsd: volume unavailable stage=fat-admission errno={errno}"
+                    ));
+                    errno
+                },
+            )?);
         }
         Ok(self.volume.as_ref().expect("volume initialized"))
     }
@@ -2523,7 +2547,7 @@ mod tests {
         };
         assert_eq!(validate_vfs_request(&request), Ok(()));
         assert!(size_of::<VfsIpcRequest>() <= IPC_MAX_INLINE_BYTES);
-        assert!(size_of::<VfsIpcResponse>() <= IPC_MAX_INLINE_BYTES);
+        assert_eq!(size_of::<VfsIpcResponse>(), IPC_MAX_INLINE_BYTES);
     }
 
     #[test]

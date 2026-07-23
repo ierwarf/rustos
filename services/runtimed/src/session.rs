@@ -23,9 +23,9 @@ use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_SESSIOND_OP_TTY_LINE_DISCIPLINE, COMMERCIAL_MAX_SESSIOND_OP_UI_BOOTSTRAP,
     IPC_SERVICE_DEVMGRD, IPC_SERVICE_SESSIOND, SESSIOND_CONSOLE_READINESS_LIVE,
     SESSIOND_CONSOLE_READINESS_READY, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
-    SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_IPC_TRY_RECV,
-    SYS_RUSTOS_WAITSET_SIGNAL_BROKER, WAITSET_ABI_VERSION, WAITSET_GLOBAL_OBJECT_ID,
-    WAITSET_PROVIDER_SESSIOND,
+    SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
+    SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER, SYS_RUSTOS_WAITSET_SIGNAL_BROKER, WAITSET_ABI_VERSION,
+    WAITSET_GLOBAL_OBJECT_ID, WAITSET_PROVIDER_SESSIOND,
 };
 
 use super::{
@@ -503,13 +503,17 @@ pub(super) fn service_session_endpoint(endpoint: Option<u64>, state: &mut Broker
     };
     let mut request = CommercialMaxProtocolRequest::default();
     let mut reply_cap = 0_u64;
+    let mut sender_pid = 0_u64;
+    let mut sender_tid = 0_u64;
     let received = unsafe {
         libc::syscall(
-            SYS_RUSTOS_IPC_TRY_RECV as libc::c_long,
+            SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER as libc::c_long,
             endpoint,
             (&mut request as *mut CommercialMaxProtocolRequest) as u64,
             size_of::<CommercialMaxProtocolRequest>() as u64,
             (&mut reply_cap as *mut u64) as u64,
+            (&mut sender_pid as *mut u64) as u64,
+            (&mut sender_tid as *mut u64) as u64,
         ) as i64
     };
     if received < 0 {
@@ -520,8 +524,18 @@ pub(super) fn service_session_endpoint(endpoint: Option<u64>, state: &mut Broker
         ..CommercialMaxProtocolResponse::default()
     };
     response.header.version = COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
+    let direct_sender = request.subject_is_exact_sender(sender_pid, sender_tid);
+    let delegated_by_devmgrd = !direct_sender
+        && rustos_svc_runtime::ipc::validate_service_owner(IPC_SERVICE_DEVMGRD, sender_pid) >= 0;
     response.status = if received as usize != size_of::<CommercialMaxProtocolRequest>() {
         libc::EINVAL
+    } else if !session_ingress_identity_authorized(
+        &request,
+        sender_pid,
+        sender_tid,
+        delegated_by_devmgrd,
+    ) {
+        libc::EACCES
     } else {
         handle_session_request(&request, state, &mut response)
     };
@@ -537,6 +551,19 @@ pub(super) fn service_session_endpoint(endpoint: Option<u64>, state: &mut Broker
         super::spawn::debug_line("runtimed: session reply failed");
     }
     true
+}
+
+fn session_ingress_identity_authorized(
+    request: &CommercialMaxProtocolRequest,
+    sender_pid: u64,
+    sender_tid: u64,
+    delegated_by_devmgrd: bool,
+) -> bool {
+    request.subject_is_exact_sender(sender_pid, sender_tid)
+        || delegated_by_devmgrd
+            && request.header.subject_pid != 0
+            && request.header.subject_tid != 0
+            && request.header.op != COMMERCIAL_MAX_SESSIOND_OP_UI_BOOTSTRAP
 }
 
 fn handle_session_request(
@@ -1056,10 +1083,27 @@ fn merge_manifest_env_into(env: &mut Vec<String>, manifest_env: &[String]) {
 
 #[cfg(test)]
 mod tests {
-    use super::SessionRuntime;
+    use super::{session_ingress_identity_authorized, SessionRuntime};
     use keyboard_core::KeyCode;
     use rustos_user_abi::device::{InputEvent, INPUT_ACTION_PRESSED, INPUT_KIND_KEYBOARD};
     use rustos_user_abi::linux::LinuxTermios;
+    use rustos_user_abi::syscall::{
+        CommercialMaxProtocolRequest, COMMERCIAL_MAX_SESSIOND_OP_UI_BOOTSTRAP,
+    };
+
+    #[test]
+    fn session_ingress_requires_exact_sender_or_narrow_devmgrd_delegation() {
+        let mut request = CommercialMaxProtocolRequest::default();
+        request.header.subject_pid = 11;
+        request.header.subject_tid = 13;
+        assert!(session_ingress_identity_authorized(&request, 11, 13, false));
+        assert!(!session_ingress_identity_authorized(
+            &request, 17, 19, false
+        ));
+        assert!(session_ingress_identity_authorized(&request, 17, 19, true));
+        request.header.op = COMMERCIAL_MAX_SESSIOND_OP_UI_BOOTSTRAP;
+        assert!(!session_ingress_identity_authorized(&request, 17, 19, true));
+    }
 
     fn key_event(code: u32, text: u8) -> InputEvent {
         InputEvent {

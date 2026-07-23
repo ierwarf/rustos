@@ -130,9 +130,8 @@ impl ProcessTable {
         self.lookup_slot_mut(handle)?.object.as_deref_mut()
     }
 
-    fn next_generation(current: u32) -> u32 {
-        let next = current.wrapping_add(1);
-        if next == 0 { 1 } else { next }
+    fn next_generation(current: u32) -> Option<u32> {
+        current.checked_add(1).filter(|next| *next != 0)
     }
 
     fn push_reap_handle(&mut self, handle: ProcessHandle) {
@@ -159,7 +158,9 @@ fn reclaim_slot(slot: &mut ProcessSlot) -> Option<Box<ProcessObject>> {
     }
 
     let object = slot.object.take()?;
-    slot.generation = ProcessTable::next_generation(slot.generation);
+    // Generation exhaustion permanently retires this slot. Reusing generation
+    // one would let a stale ProcessHandle alias a new process.
+    slot.generation = ProcessTable::next_generation(slot.generation).unwrap_or(0);
     Some(object)
 }
 
@@ -178,7 +179,7 @@ pub fn create_process_with_parent(
         .slots
         .iter_mut()
         .enumerate()
-        .find(|(_, slot)| slot.object.is_none())?;
+        .find(|(_, slot)| slot.object.is_none() && slot.generation != 0)?;
     slot.object = Some(object);
     let handle = ProcessHandle::new(index, slot.generation);
     Some(handle)
@@ -347,6 +348,7 @@ pub fn replace_for_exec(
         if !exec_may_replace(object) {
             return None;
         }
+        let next_mm_generation = ProcessTable::next_generation(object.mm_generation)?;
         let closed = state.replace_for_exec(
             address_space,
             linux_process_state,
@@ -354,7 +356,7 @@ pub fn replace_for_exec(
             linux_runtime_profile,
             exec_path,
         );
-        object.mm_generation = ProcessTable::next_generation(object.mm_generation);
+        object.mm_generation = next_mm_generation;
         object.queued_for_reap = false;
         Some(closed)
     })
@@ -516,7 +518,7 @@ pub fn reap_exited_processes() -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        ProcessObject, attach_task, create_process, detach_task, is_process_exiting,
+        ProcessObject, ProcessTable, attach_task, create_process, detach_task, is_process_exiting,
         mark_process_exiting, reap_exited_processes, retain_process, thread_count_by_pid,
     };
     use crate::memory::paging::ProcessAddressSpace;
@@ -538,6 +540,12 @@ mod tests {
             false,
             "/test.elf",
         )
+    }
+
+    #[test]
+    fn process_generations_fail_closed_instead_of_aliasing_stale_handles() {
+        assert_eq!(ProcessTable::next_generation(1), Some(2));
+        assert_eq!(ProcessTable::next_generation(u32::MAX), None);
     }
 
     #[test]

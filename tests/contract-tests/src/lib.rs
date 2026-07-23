@@ -1,8 +1,8 @@
 #[cfg(test)]
 mod tests {
     use boot_protocol::{
-        BOOT_INFO_MAGIC, BOOT_INFO_VERSION, BootExtentManifest, BootInfo, BootMemoryKind,
-        BootMemoryMap, BootMemoryRegion, BootPixelFormat, BootVolumeIdentity, FramebufferInfo,
+        BOOT_INFO_MAGIC, BOOT_INFO_VERSION, BootInfo, BootMemoryKind, BootMemoryMap,
+        BootMemoryRegion, BootPixelFormat, BootVolumeIdentity, EarlySystemImage, FramebufferInfo,
         NucleusImageInfo,
     };
     use boot_random::{Random, init as init_random};
@@ -100,10 +100,11 @@ mod tests {
                 entry_count: memory_map.len() as u32,
                 _reserved0: 0,
             },
-            boot_extent_manifest: BootExtentManifest::empty(),
+            _reserved_storage_bootstrap: [0; 2],
+            early_system_image: EarlySystemImage::empty(),
         };
 
-        init_random(&boot_info);
+        let _ = init_random(&boot_info);
         let mut rng = Random::new();
         let value = rng.randint(-8, 24);
         assert!((-8..24).contains(&value));

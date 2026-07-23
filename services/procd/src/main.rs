@@ -11,36 +11,40 @@ use core::mem::size_of;
 use core::panic::PanicInfo;
 
 use rustos_svc_runtime::ipc;
-use rustos_svc_runtime::syscall::{syscall1, syscall5};
+use rustos_svc_runtime::syscall::{syscall0, syscall1, syscall5};
 use rustos_user_abi::syscall::{
-    CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
-    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, LifecycleDrainBrokerArgs,
-    LifecycleEventWire, LoaderSpawnRequest, LoaderSpawnResponse, ProcdIpcRequest, ProcdIpcResponse,
+    identity_is_exact_sender, CommercialMaxCapabilityLeaseWire,
+    CommercialMaxProtocolDescriptorWire, CommercialMaxProtocolRequest,
+    CommercialMaxProtocolResponse, LifecycleDrainBrokerArgs, LifecycleEventWire,
+    LoaderSpawnRequest, LoaderSpawnResponse, ProcdIpcRequest, ProcdIpcResponse,
     RustosProcAuthorizeExecBrokerArgs, RustosProcCancelExecBrokerArgs, RustosProcForkBrokerArgs,
     RustosProcSignalQueueBrokerArgs, COMMERCIAL_MAX_PROCD_OP_EXEC_TICKET,
     COMMERCIAL_MAX_PROCD_OP_FORK_PLAN, COMMERCIAL_MAX_PROCD_OP_PROCESS_PREPARE,
     COMMERCIAL_MAX_PROCD_OP_SESSION_MEMBERSHIP, COMMERCIAL_MAX_PROCD_OP_SIGNAL_POLICY,
     COMMERCIAL_MAX_PROCD_OP_THREAD_PLAN, COMMERCIAL_MAX_PROCD_OP_WAIT_NAMESPACE,
     COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_PROCD, IPC_MAX_INLINE_BYTES,
-    IPC_SERVICE_LOADERD, IPC_SERVICE_PROCD, LIFECYCLE_DRAIN_MAX_EVENTS, LIFECYCLE_EVENT_EXIT,
-    LINUX_SIGACTION_SIZE, LOADER_OP_EXEC_TARGET, LOADER_REQUEST_ABI_VERSION,
-    LOADER_SPAWN_MAX_ARG_COUNT, LOADER_SPAWN_MAX_ENV_COUNT, PROCD_ARG_BYTES, PROCD_ENV_BYTES,
-    PROCD_IPC_ABI_VERSION, PROCD_OP_EXECVE, PROCD_OP_EXECVEAT, PROCD_OP_FORK,
-    PROCD_OP_RT_SIGACTION, PROCD_OP_RT_SIGPROCMASK, PROCD_OP_SELECT_SIGNAL, PROCD_OP_SIGALTSTACK,
-    PROCD_OP_TGKILL, PROCD_OP_THREAD_PLAN, PROCD_OP_WAIT4, PROCD_PATH_CAPACITY,
-    PROCD_PAYLOAD_CAPACITY, PROCD_SELECT_SIGNAL_HANDLER, PROCD_SELECT_SIGNAL_IGNORE,
-    PROCD_SELECT_SIGNAL_NONE, PROCD_SELECT_SIGNAL_TERMINATE, PROC_BROKER_ABI_VERSION,
-    PROC_BROKER_FORMAT_ELF64, PROC_BROKER_FORMAT_PE64, PROC_BROKER_USER_SPACE_BASE,
-    PROC_BROKER_USER_SPACE_END_EXCLUSIVE, SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER,
-    SYS_RUSTOS_PROC_AUTHORIZE_EXEC_BROKER, SYS_RUSTOS_PROC_CANCEL_EXEC_BROKER,
-    SYS_RUSTOS_PROC_FORK_BROKER, SYS_RUSTOS_PROC_SIGNAL_QUEUE_BROKER,
+    IPC_SERVICE_LOADERD, IPC_SERVICE_PROCD, LIFECYCLE_DRAIN_BROKER_ABI_VERSION,
+    LIFECYCLE_DRAIN_MAX_EVENTS, LIFECYCLE_EVENT_EXIT, LINUX_SIGACTION_SIZE, LOADER_OP_EXEC_TARGET,
+    LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_MAX_ARG_COUNT, LOADER_SPAWN_MAX_ENV_COUNT,
+    PROCD_ARG_BYTES, PROCD_ENV_BYTES, PROCD_IPC_ABI_VERSION, PROCD_OP_EXECVE, PROCD_OP_EXECVEAT,
+    PROCD_OP_FORK, PROCD_OP_RT_SIGACTION, PROCD_OP_RT_SIGPROCMASK, PROCD_OP_SELECT_SIGNAL,
+    PROCD_OP_SIGALTSTACK, PROCD_OP_TGKILL, PROCD_OP_THREAD_PLAN, PROCD_OP_WAIT4,
+    PROCD_PATH_CAPACITY, PROCD_PAYLOAD_CAPACITY, PROCD_SELECT_SIGNAL_HANDLER,
+    PROCD_SELECT_SIGNAL_IGNORE, PROCD_SELECT_SIGNAL_NONE, PROCD_SELECT_SIGNAL_TERMINATE,
+    PROC_BROKER_ABI_VERSION, PROC_BROKER_FORMAT_ELF64, PROC_BROKER_FORMAT_PE64,
+    PROC_BROKER_USER_SPACE_BASE, PROC_BROKER_USER_SPACE_END_EXCLUSIVE, SYS_RUSTOS_IPC_CALL,
+    SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER, SYS_RUSTOS_PROC_AUTHORIZE_EXEC_BROKER,
+    SYS_RUSTOS_PROC_CANCEL_EXEC_BROKER, SYS_RUSTOS_PROC_FORK_BROKER,
+    SYS_RUSTOS_PROC_SIGNAL_QUEUE_BROKER,
 };
 use spin::Mutex;
 
 const EINVAL: i32 = 22;
+const EACCES: i32 = 13;
 const ENOENT: i32 = 2;
 const ENOMEM: i32 = 12;
 const ENOSYS: i32 = 38;
+const SYS_GETPID: u64 = 39;
 const AT_FDCWD: u64 = -100_i64 as u64;
 const WNOHANG: u64 = 1;
 const SS_DISABLE: u32 = 2;
@@ -93,12 +97,16 @@ fn serve(endpoint: u64) {
     loop {
         let mut request = [0_u8; IPC_MAX_INLINE_BYTES];
         let mut reply_cap = 0_u64;
+        let mut sender_pid = 0_u64;
+        let mut sender_tid = 0_u64;
         let received = unsafe {
-            ipc::recv(
+            ipc::recv_with_sender(
                 endpoint,
                 request.as_mut_ptr(),
                 request.len(),
                 &mut reply_cap as *mut u64,
+                &mut sender_pid as *mut u64,
+                &mut sender_tid as *mut u64,
             )
         };
         if received < 0 {
@@ -110,7 +118,7 @@ fn serve(endpoint: u64) {
         // drain is a bounded local broker call and never discovers syscalld or
         // rootd, so it cannot recreate the bootstrap authorization cycle.
         drain_lifecycle_events();
-        let response = handle_wire_request(received as usize, &request);
+        let response = handle_wire_request(received as usize, &request, sender_pid, sender_tid);
         let reply = unsafe { ipc::reply(reply_cap, response.as_ptr(), response.len()) };
         if reply < 0 {
             ipc::debug_line("procd: reply failed");
@@ -144,14 +152,19 @@ impl ProcdReply {
     }
 }
 
-fn handle_wire_request(received: usize, bytes: &[u8]) -> ProcdReply {
+fn handle_wire_request(
+    received: usize,
+    bytes: &[u8],
+    sender_pid: u64,
+    sender_tid: u64,
+) -> ProcdReply {
     if received == size_of::<CommercialMaxProtocolRequest>() {
         let request = read_unaligned::<CommercialMaxProtocolRequest>(bytes);
-        return ProcdReply::Commercial(handle_commercial_request(&request));
+        return ProcdReply::Commercial(handle_commercial_request(&request, sender_pid, sender_tid));
     }
     if received == size_of::<ProcdIpcRequest>() {
         let request = read_unaligned::<ProcdIpcRequest>(bytes);
-        return ProcdReply::Ipc(handle_request(received, &request));
+        return ProcdReply::Ipc(handle_request(received, &request, sender_pid, sender_tid));
     }
     ProcdReply::Ipc(ProcdIpcResponse {
         status: EINVAL,
@@ -163,7 +176,7 @@ fn drain_lifecycle_events() {
     let mut events = [LifecycleEventWire::default(); LIFECYCLE_DRAIN_MAX_EVENTS];
     let mut count: u32 = 0;
     let args = LifecycleDrainBrokerArgs {
-        abi_version: PROC_BROKER_ABI_VERSION,
+        abi_version: LIFECYCLE_DRAIN_BROKER_ABI_VERSION,
         out_events_ptr: events.as_mut_ptr() as u64,
         out_capacity: LIFECYCLE_DRAIN_MAX_EVENTS as u32,
         out_count_ptr: &mut count as *mut u32 as u64,
@@ -194,11 +207,20 @@ fn drain_lifecycle_events() {
     }
 }
 
-fn handle_request(received: usize, request: &ProcdIpcRequest) -> ProcdIpcResponse {
+fn handle_request(
+    received: usize,
+    request: &ProcdIpcRequest,
+    sender_pid: u64,
+    sender_tid: u64,
+) -> ProcdIpcResponse {
     let mut response = ProcdIpcResponse {
         op: request.op,
         ..ProcdIpcResponse::default()
     };
+    if !identity_is_exact_sender(request.pid, request.tid, sender_pid, sender_tid) {
+        response.status = EACCES;
+        return response;
+    }
     if let Err(errno) = validate_request(received, request) {
         response.status = errno;
         return response;
@@ -221,12 +243,18 @@ fn handle_request(received: usize, request: &ProcdIpcRequest) -> ProcdIpcRespons
 
 fn handle_commercial_request(
     request: &CommercialMaxProtocolRequest,
+    sender_pid: u64,
+    sender_tid: u64,
 ) -> CommercialMaxProtocolResponse {
     let mut response = CommercialMaxProtocolResponse {
         header: request.header,
         ..CommercialMaxProtocolResponse::default()
     };
     response.header.version = COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
+    if !request.subject_is_exact_sender(sender_pid, sender_tid) {
+        response.status = EACCES;
+        return response;
+    }
     if let Err(errno) = validate_commercial_request(request) {
         response.status = errno;
         return response;
@@ -454,6 +482,15 @@ fn handle_exec(request: &ProcdIpcRequest, response: &mut ProcdIpcResponse) {
         env_count: request.env_count,
         argv_bytes_len: request.argv_bytes_len,
         env_bytes_len: request.env_bytes_len,
+        requester_pid: {
+            let pid = unsafe { syscall0(SYS_GETPID) };
+            if pid <= 0 {
+                response.status = EINVAL;
+                cancel_exec_ticket(exec_ticket, request.pid, request.tid);
+                return;
+            }
+            pid as u64
+        },
         ..LoaderSpawnRequest::default()
     };
     loader_request.exec_path[..exec_path_len].copy_from_slice(exec_path.as_bytes());

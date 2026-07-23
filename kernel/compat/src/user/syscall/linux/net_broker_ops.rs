@@ -102,6 +102,7 @@ fn broker_socket(args: &RustosNetBrokerArgs) -> Result<u64, i64> {
                 multitask::InetSocketHandle::from_token(args.arg3, domain, base_type, protocol)
             } else {
                 multitask::InetSocketHandle::new(domain, base_type, protocol)
+                    .ok_or(LINUX_EOVERFLOW)?
             };
             multitask::KernelHandle::InetSocket(handle)
         }

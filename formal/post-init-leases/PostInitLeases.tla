@@ -4,8 +4,11 @@ EXTENDS Naturals, FiniteSets
 (***************************************************************************
 Models rootd post-init lease admission and restart budgets. Initd owns the
 netd and sessiond launch reports, while the live sessiond/runtimed service owns
-the uiserver report. A capability is granted only to the exact running PID
-whose complete reporter chain terminates at the live initd lease.
+the uiserver report. `InitialLaunch` is the kernel-owned deferred-spawn
+provenance: source admission additionally requires the exact declared
+executable path before `ReportReadiness`. A capability is granted only to the
+exact running PID whose complete reporter chain terminates at the live initd
+lease.
 An attempted re-registration by any other actor is a stateful rejection: it
 may be observed for diagnostics, but cannot change the live PID, reporter, or
 capability binding.
@@ -92,6 +95,7 @@ ReportReadiness(s, p, supervisor) ==
     /\ p \in Pids
     /\ supervisor = SupervisorFor(s)
     /\ supervisorAlive[supervisor]
+    /\ p \in issuedPids
     /\ leaseState[s] = PendingReport
     /\ leasePid[s] = p
     /\ reportedBy[s] = NoSupervisor

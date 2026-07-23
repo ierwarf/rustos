@@ -4,7 +4,7 @@ ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 OUT ?= $(ROOT)/out
 JOBS ?= $(shell getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
 
-.PHONY: all fetch configure build verify stage-release clean distclean print-artifacts rebuild-agent rebuild-display rebuild-net dev-agent dev-display dev-net selftest-config-cache build-plan ccache-stats profile-build
+.PHONY: all fetch configure build verify stage-release clean distclean print-artifacts rebuild-agent rebuild-block rebuild-display rebuild-net dev-agent dev-block dev-display dev-net selftest-config-cache build-plan ccache-stats profile-build
 
 all: build
 
@@ -16,6 +16,9 @@ fetch configure build verify print-artifacts selftest-config-cache build-plan cc
 rebuild-agent:
 	@OUT="$(OUT)" JOBS="$(JOBS)" "$(ROOT)/scripts/build.sh" rebuild-agent
 
+rebuild-block:
+	@OUT="$(OUT)" JOBS="$(JOBS)" "$(ROOT)/scripts/build.sh" rebuild-block
+
 rebuild-display:
 	@OUT="$(OUT)" JOBS="$(JOBS)" "$(ROOT)/scripts/build.sh" rebuild-display
 
@@ -26,6 +29,9 @@ rebuild-net:
 # manifest, or release artifact.  rebuild-* is the one-time integration step.
 dev-agent:
 	@OUT="$(OUT)" JOBS="$(JOBS)" "$(ROOT)/scripts/build.sh" dev-agent
+
+dev-block:
+	@OUT="$(OUT)" JOBS="$(JOBS)" "$(ROOT)/scripts/build.sh" dev-block
 
 dev-display:
 	@OUT="$(OUT)" JOBS="$(JOBS)" "$(ROOT)/scripts/build.sh" dev-display

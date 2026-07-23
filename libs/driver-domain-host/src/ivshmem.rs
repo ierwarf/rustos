@@ -52,6 +52,13 @@ impl IvshmemDoorbellServer {
     /// the L0 producer and receives only peer 0's one fixed eventfd; it cannot
     /// select a peer or vector at runtime.
     pub fn start_input(socket_path: &Path, shared_memory: &File) -> Result<Self> {
+        Self::start_single_vector(socket_path, shared_memory)
+    }
+
+    /// Start a strict two-peer, one-vector topology. This is shared by the
+    /// fixed input producer and address-free block request/completion rings;
+    /// the caller still owns peer ordering and the backing-file contract.
+    pub fn start_single_vector(socket_path: &Path, shared_memory: &File) -> Result<Self> {
         Self::start_with_vector_count(socket_path, shared_memory, IVSHMEM_INPUT_VECTOR_COUNT)
     }
 

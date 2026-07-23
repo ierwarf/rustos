@@ -1,6 +1,16 @@
 # model	class	deadlock_policy	deadlock_reason	pr_timeout_s	nightly_timeout_s	nightly_mode	apalache	tlaps	trace
-boot-volume-admission/BootVolumeAdmission	safety	intentional-terminal	admission decision is terminal	120	900	exhaustive	no	no	no
-boot-volume-read/BootVolumeRead	temporal	intentional-terminal	read request completes or preserves a bounded failure outcome	120	900	exhaustive	no	no	no
+authority-identity-lifecycle/AuthorityIdentityLifecycle	safety	intentional-terminal	bounded identity namespace may exhaust	30	120	exhaustive	no	no	no
+acpi-table-admission/AcpiTableAdmission	safety	intentional-terminal	malformed firmware selects no partial ECAM or HPET authority	30	120	exhaustive	no	no	no
+root-authority-publication/RootAuthorityPublication	safety	intentional-terminal	root namespace publication may revoke or exhaust	30	120	exhaustive	no	no	no
+service-call-authority/ServiceCallAuthority	safety	intentional-terminal	service endpoint publication may revoke or exhaust	30	120	exhaustive	no	no	no
+boot-storage-handoff/BootStorageHandoff	safety	intentional-terminal	handoff reaches DVM readiness, ordered host restoration, or quarantine	120	900	exhaustive	no	no	no
+commercial-service-envelope/CommercialServiceEnvelope	temporal	intentional-terminal	commercial call admits an exact reply or reaches explicit error, timeout, or peer-close	120	900	exhaustive	no	no	no
+entropy-broker-boundary/EntropyBrokerBoundary	temporal	intentional-terminal	boot entropy fails closed or an authorized bounded request serves private master output	120	900	exhaustive	no	no	no
+dvm-volume-io/DvmVolumeIo	temporal	intentional-terminal	DVM request completes or preserves a bounded failure outcome	120	900	exhaustive	no	no	no
+dvm-read-cache/DvmReadCache	temporal	intentional-terminal	cache request serves exact live data, rejects stale generation, or clears on mutation/restart	120	900	exhaustive	no	no	no
+remote-file-mapping/RemoteFileMapping	safety	intentional-terminal	exact file bytes commit or the mapping aborts without fallback or zero fill	120	900	exhaustive	no	no	no
+syscall-simd-lifecycle/SyscallSimdLifecycle	safety	intentional-terminal	syscall return restores the entering task image or remains blocked	120	900	exhaustive	no	no	no
+pci-bar-discovery/PciBarDiscovery	safety	intentional-terminal	BAR discovery publishes one restored valid resource or rejects it	120	900	exhaustive	no	no	no
 clocksource-deadline/ClocksourceDeadline	temporal	intentional-terminal	retired or released waits are terminal	120	900	exhaustive	no	no	no
 deferred-start/DeferredStart	temporal	intentional-terminal	launch outcome is terminal	120	900	exhaustive	no	no	no
 devmgrd-sessiond-isolation/DevmgrdSessiondIsolation	temporal	intentional-terminal	bounded request outcome is terminal	120	900	exhaustive	no	no	no
@@ -13,6 +23,10 @@ dvm-agent-readiness/DvmAgentReadiness	temporal	intentional-terminal	readiness pu
 dvm-amdgpu-evidence/DvmAmdgpuEvidence	safety	intentional-terminal	evidence decision is terminal	120	900	exhaustive	no	no	no
 dvm-amdgpu-supply/DvmAmdgpuSupply	safety	intentional-terminal	driver supply decision is terminal	120	900	exhaustive	no	no	no
 dvm-atomic-scanout/DvmAtomicScanout	safety	intentional-terminal	display epoch may revoke	120	900	exhaustive+simulate	no	no	no
+dvm-block-transport/DvmBlockTransport	safety	intentional-terminal	transport epoch may restart or exhaust its bounded request space	120	900	exhaustive	no	no	no
+dvm-block-startup/DvmBlockStartup	safety	intentional-terminal	startup reaches generation readiness, bounded timeout, or revoke	120	900	exhaustive	no	no	no
+deferred-process-activation/DeferredProcessActivation	safety	intentional-terminal	deferred target may activate revoke or exit	120	900	exhaustive	no	no	no
+loader-request-authority/LoaderRequestAuthority	safety	intentional-terminal	privileged loader request commits or is denied after role revalidation	30	120	exhaustive	no	no	no
 dvm-commercial-lifecycle/DvmCommercialLifecycle	safety	intentional-terminal	lease lifecycle may quarantine or stop	120	900	exhaustive+simulate	no	no	no
 dvm-control-endpoint/DvmControlEndpoint	temporal	intentional-terminal	control setup outcome is terminal	120	900	exhaustive	no	no	no
 dvm-control-relay/DvmControlRelay	temporal	intentional-terminal	control session may close	120	900	exhaustive	no	no	no
@@ -29,6 +43,7 @@ dvm-input-selftest/DvmInputSelftest	temporal	intentional-terminal	selftest proce
 dvm-network-control/DvmNetworkControl	safety	intentional-terminal	network session may end	120	900	exhaustive	no	no	no
 dvm-network-ring/DvmNetworkRing	safety	intentional-terminal	ring epoch may revoke	120	900	exhaustive	no	no	no
 dvm-release-bundle/DvmReleaseBundle	safety	intentional-terminal	bundle admission decision is terminal	120	900	exhaustive	no	no	no
+early-system-admission/EarlySystemAdmission	safety	intentional-terminal	bootstrap admission reaches DVM storage readiness or fails closed	120	900	exhaustive	no	no	no
 endpoint-publication/EndpointPublication	safety	intentional-terminal	publisher process may exit	120	900	exhaustive	no	yes	no
 endpoint-registry/EndpointRegistry	temporal	intentional-terminal	endpoint wait may settle terminally	120	900	exhaustive	no	no	no
 exception-retirement-lifecycle/ExceptionRetirementLifecycle	temporal	intentional-terminal	exception outcome is terminal	120	900	exhaustive	no	no	no
@@ -46,7 +61,7 @@ ipc-priority-inheritance/IpcPriorityInheritance	safety	intentional-terminal	IPC 
 ipc-reply-deadline/IpcReplyDeadline	temporal	intentional-terminal	IPC wait outcome is terminal	120	900	exhaustive	no	no	no
 ivshmem-pairing/IvshmemPairing	temporal	intentional-terminal	peer pairing may disconnect	120	900	exhaustive	no	no	no
 memfd-seal-lifecycle/MemfdSealLifecycle	safety	intentional-terminal	sealed object may retain stable mappings	30	120	exhaustive	no	no	no
-msi-vector-lifecycle/MsiVectorLifecycle	safety	intentional-terminal	permanent vector pool may exhaust	30	120	exhaustive	no	no	no
+msi-vector-lifecycle/MsiVectorLifecycle	safety	intentional-terminal	failed vector leases revoke before bounded committed pool reuse	30	120	exhaustive	no	no	no
 netd-deferred-reply/NetdDeferredReply	temporal	intentional-terminal	deferred request resolves or is rejected	30	120	exhaustive	no	no	no
 network-payload-session/NetworkPayloadSession	safety	intentional-terminal	payload decision is terminal	120	900	exhaustive	no	no	no
 page-table-lifecycle/PageTableLifecycle	safety	intentional-terminal	mapping lifecycle may complete	120	900	exhaustive	no	no	no
@@ -62,11 +77,13 @@ rootd-bootstrap/RootdBootstrap	temporal	intentional-terminal	bootstrap outcome i
 service-bootstrap-lifecycle/ServiceBootstrapLifecycle	temporal	intentional-terminal	service entry or dependency admission reaches an exact terminal outcome	120	900	exhaustive	no	no	no
 rootd-restart-backoff/RootdRestartBackoff	temporal	intentional-terminal	restart budget may terminate	120	900	exhaustive	no	no	no
 runtime-control-rpc/RuntimeControlRpc	safety	intentional-terminal	one response resolves the RPC	120	900	exhaustive	no	no	yes
+runtime-control-authority/RuntimeControlAuthority	safety	intentional-terminal	control request is admitted or denied	30	120	exhaustive	no	no	no
 scheduler-admission/SchedulerAdmission	temporal	intentional-terminal	admission decision is terminal	120	900	exhaustive	no	no	no
 scheduler-cpu-distribution/SchedulerCpuDistribution	temporal	intentional-terminal	bounded schedule may stop	120	900	exhaustive+simulate	no	no	no
 scheduler-thread-demotion/SchedulerThreadDemotion	safety	intentional-terminal	thread restoration may terminate	120	900	exhaustive	no	no	no
 scheduler-wakeup/SchedulerWakeup	temporal	intentional-terminal	retired task outcome is terminal	120	900	exhaustive	no	no	no
 trusted-ui-boundary/TrustedUiBoundary	safety	intentional-terminal	prompt authority may revoke	120	900	exhaustive	no	no	no
+zero-trust-service-flow/ZeroTrustServiceFlow	temporal	intentional-terminal	request may be rejected revoked timed out or admitted	120	900	exhaustive	no	no	no
 userspace-wait-set/UserspaceWaitSet	temporal	intentional-terminal	wait may return readiness timeout or revoke	120	900	exhaustive	no	no	no
 ui-frame-budget/UiFrameBudget	temporal	intentional-terminal	bounded frame epoch may stop	120	900	exhaustive	no	no	no
 ui-input-motion/UiInputMotion	temporal	intentional-terminal	bounded motion trace may stop	120	900	exhaustive	no	no	no

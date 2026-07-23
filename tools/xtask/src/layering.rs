@@ -667,7 +667,6 @@ fn validate_kernel_source_boundaries(root_dir: &Path) -> Result<()> {
     assert_max_lines(root_dir, "kernel/src/main.rs", 120)?;
     assert_max_lines(root_dir, "kernel/executive/src/lib.rs", 180)?;
     assert_max_lines(root_dir, "kernel/compat/src/user/syscall/linux.rs", 600)?;
-    assert_max_lines(root_dir, "kernel/io-manager/src/storage/block.rs", 500)?;
     assert_max_lines(root_dir, "kernel/ps/src/multitask/mod.rs", 500)?;
 
     for manager in [

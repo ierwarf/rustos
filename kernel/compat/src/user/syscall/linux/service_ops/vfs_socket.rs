@@ -132,13 +132,17 @@ pub fn syscall_linux_vfs_openat(dirfd: u64, path_ptr: u64, flags: u64, mode: u64
             return linux_errno(LINUX_EINVAL);
         }
     };
-    let handle = multitask::KernelHandle::RemoteVfs(multitask::RemoteVfsHandle::new(
+    let Some(remote_handle) = multitask::RemoteVfsHandle::new(
         remote_id,
         kind,
         handle_path,
         response.value,
         response.aux as u16,
-    ));
+    ) else {
+        release_service_handle_refs_bounded(&[ServiceHandleRef::RemoteVfs(remote_id)]);
+        return linux_errno(LINUX_EOVERFLOW);
+    };
+    let handle = multitask::KernelHandle::RemoteVfs(remote_handle);
     let installed = multitask::with_current_user_process_state_mut(|_, _, process_state| {
         process_state
             .handles_mut()

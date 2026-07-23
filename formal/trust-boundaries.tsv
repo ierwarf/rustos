@@ -1,0 +1,12 @@
+# boundary_id	owner	source	identity_evidence	delegation_evidence	object_authority	response_admission
+rootd-supervisor	rootd	services/rootd/src/main.rs	sender\.pid	-	lease-generation-and-dependency-edge	exact-commercial-response
+process-policy	procd	services/procd/src/main.rs	identity_is_exact_sender|subject_is_exact_sender	-	process-ticket-and-lifecycle-generation	exact-versioned-response
+syscall-policy	syscalld	services/syscalld/src/main.rs	identity_is_exact_sender|subject_is_exact_sender	-	per-process-policy-state	exact-versioned-response
+filesystem-policy	vfsd	services/vfsd/src/main.rs	sender_pid	-	open-description-and-provider-epoch	exact-versioned-response
+image-loader	loaderd	services/loaderd/src/main.rs	requester_pid	-	loader_service_role_allows_operation|sender_owns_any_loader_role	exact-versioned-response
+device-policy	devmgrd	services/devmgrd/src/main.rs	identity_is_exact_sender|subject_is_exact_sender	-	fd-rights-and-device-owner	exact-versioned-response
+input-policy	inputd	services/inputd/src/main.rs	identity_is_exact_sender|subject_is_exact_sender	validate_service_owner	input-reader-token-and-readiness-generation	exact-versioned-response
+storage-policy	storaged	services/storaged/src/main.rs	subject_is_exact_sender	validate_service_owner	transport-generation-and-request-ticket	exact-request-bound-response
+network-policy	netd	services/netd/src/main.rs	sender_pid	-	socket-token-and-provider-epoch	exact-versioned-response
+session-policy	runtimed	services/runtimed/src/session.rs	session_ingress_identity_authorized	validate_service_owner	session-handle-and-readiness-generation	exact-versioned-response
+display-policy	uiserver	services/uiserver/src/sys.rs	subject_is_exact_sender	validate_service_owner	surface-generation-and-display-policy	exact-versioned-response

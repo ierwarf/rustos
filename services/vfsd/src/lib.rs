@@ -6,8 +6,9 @@ use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::vec::Vec;
 use rustos_user_abi::syscall::{
-    ServiceCheckpointRecordWire, SERVICE_CHECKPOINT_ABI_VERSION, SERVICE_CHECKPOINT_FLAG_TOMBSTONE,
-    VFS_IPC_OP_FTRUNCATE, VFS_IPC_OP_WRITE, WAITSET_MAX_INTERESTS,
+    ServiceCheckpointRecordWire, EARLY_SYSTEM_BROKER_MAX_IO_BYTES, SERVICE_CHECKPOINT_ABI_VERSION,
+    SERVICE_CHECKPOINT_FLAG_TOMBSTONE, VFS_IPC_OP_FTRUNCATE, VFS_IPC_OP_WRITE,
+    WAITSET_MAX_INTERESTS,
 };
 use storage_core::{IoResult, StorageError};
 
@@ -21,7 +22,7 @@ const ENODEV: i32 = 19;
 const ENOSYS: i32 = 38;
 const ETIMEDOUT: i32 = 110;
 
-pub fn validate_boot_read_range(
+pub fn validate_dvm_block_range(
     block_size: usize,
     block_count: u64,
     lba: u64,
@@ -56,6 +57,10 @@ pub fn storage_error_from_linux_status(status: i64) -> StorageError {
 
 pub fn checked_next_generation(current: u64) -> Option<u64> {
     current.checked_add(1).filter(|next| *next != 0)
+}
+
+pub fn bounded_early_system_chunk(remaining: usize) -> usize {
+    remaining.min(EARLY_SYSTEM_BROKER_MAX_IO_BYTES)
 }
 
 pub fn cacheable_metadata_errno(errno: i32) -> bool {
@@ -409,20 +414,20 @@ mod tests {
     use alloc::vec;
 
     #[test]
-    fn boot_read_range_rejects_empty_overflow_and_end_overrun() {
+    fn dvm_block_range_rejects_empty_overflow_and_end_overrun() {
         assert_eq!(
-            validate_boot_read_range(512, 8, 0, 0),
+            validate_dvm_block_range(512, 8, 0, 0),
             Err(StorageError::InvalidInput)
         );
         assert_eq!(
-            validate_boot_read_range(512, u64::MAX, u64::MAX, 512),
+            validate_dvm_block_range(512, u64::MAX, u64::MAX, 512),
             Err(StorageError::InvalidInput)
         );
         assert_eq!(
-            validate_boot_read_range(512, 8, 7, 1024),
+            validate_dvm_block_range(512, 8, 7, 1024),
             Err(StorageError::InvalidInput)
         );
-        assert_eq!(validate_boot_read_range(512, 8, 6, 1024), Ok(()));
+        assert_eq!(validate_dvm_block_range(512, 8, 6, 1024), Ok(()));
     }
 
     #[test]
@@ -454,6 +459,19 @@ mod tests {
     fn cache_generation_never_saturates_into_false_stability() {
         assert_eq!(checked_next_generation(1), Some(2));
         assert_eq!(checked_next_generation(u64::MAX), None);
+    }
+
+    #[test]
+    fn early_system_reads_chunk_larger_vfs_buffers_to_the_broker_bound() {
+        assert_eq!(bounded_early_system_chunk(1), 1);
+        assert_eq!(
+            bounded_early_system_chunk(EARLY_SYSTEM_BROKER_MAX_IO_BYTES),
+            EARLY_SYSTEM_BROKER_MAX_IO_BYTES
+        );
+        assert_eq!(
+            bounded_early_system_chunk(EARLY_SYSTEM_BROKER_MAX_IO_BYTES * 16),
+            EARLY_SYSTEM_BROKER_MAX_IO_BYTES
+        );
     }
 
     #[test]

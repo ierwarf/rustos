@@ -10,40 +10,41 @@ use core::panic::PanicInfo;
 use rustos_svc_runtime::ipc;
 use rustos_svc_runtime::syscall::syscall1;
 use rustos_user_abi::syscall::{
-    CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
-    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, LifecycleDrainBrokerArgs,
-    LifecycleEventWire, LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse,
-    Win32SyscallOffloadRequest, Win32SyscallOffloadResponse,
-    COMMERCIAL_MAX_PAGERD_OP_BACKING_OBJECT, COMMERCIAL_MAX_PAGERD_OP_FAULT_RESOLVE,
-    COMMERCIAL_MAX_PAGERD_OP_PAGE_CACHE_POLICY, COMMERCIAL_MAX_PAGERD_OP_WRITEBACK_POLICY,
-    COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS,
-    COMMERCIAL_MAX_PROTOCOL_PAGERD, COMMERCIAL_MAX_PROTOCOL_SYSCALLD,
-    COMMERCIAL_MAX_SYSCALLD_OP_CLOCK_POLICY, COMMERCIAL_MAX_SYSCALLD_OP_COLD_SYSCALL_OFFLOAD,
-    COMMERCIAL_MAX_SYSCALLD_OP_CREDS_LIMITS, COMMERCIAL_MAX_SYSCALLD_OP_LINUX_POLICY,
-    COMMERCIAL_MAX_SYSCALLD_OP_MM_POLICY, COMMERCIAL_MAX_SYSCALLD_OP_RANDOM_POLICY,
-    COMMERCIAL_MAX_SYSCALLD_OP_WIN32_POLICY, IPC_MAX_INLINE_BYTES, IPC_SERVICE_LINUX_SYSCALLD,
-    IPC_SERVICE_PAGERD, LIFECYCLE_DRAIN_MAX_EVENTS, LIFECYCLE_EVENT_EXIT, PROC_BROKER_ABI_VERSION,
-    SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_LINUX_ARCH_PRCTL_POLICY,
-    SYSCALL_OFFLOAD_OP_LINUX_BRK, SYSCALL_OFFLOAD_OP_LINUX_CLOCK_GETTIME,
-    SYSCALL_OFFLOAD_OP_LINUX_CLOCK_NANOSLEEP, SYSCALL_OFFLOAD_OP_LINUX_FUTEX_POLICY,
-    SYSCALL_OFFLOAD_OP_LINUX_GETEGID, SYSCALL_OFFLOAD_OP_LINUX_GETEUID,
-    SYSCALL_OFFLOAD_OP_LINUX_GETGID, SYSCALL_OFFLOAD_OP_LINUX_GETPGID,
-    SYSCALL_OFFLOAD_OP_LINUX_GETPPID, SYSCALL_OFFLOAD_OP_LINUX_GETRANDOM,
-    SYSCALL_OFFLOAD_OP_LINUX_GETSID, SYSCALL_OFFLOAD_OP_LINUX_GETUID,
-    SYSCALL_OFFLOAD_OP_LINUX_GET_ROBUST_LIST, SYSCALL_OFFLOAD_OP_LINUX_MADVISE,
-    SYSCALL_OFFLOAD_OP_LINUX_MEMFD_CREATE, SYSCALL_OFFLOAD_OP_LINUX_MMAP,
-    SYSCALL_OFFLOAD_OP_LINUX_MPROTECT, SYSCALL_OFFLOAD_OP_LINUX_MUNMAP,
-    SYSCALL_OFFLOAD_OP_LINUX_NANOSLEEP, SYSCALL_OFFLOAD_OP_LINUX_PRLIMIT64,
-    SYSCALL_OFFLOAD_OP_LINUX_RSEQ, SYSCALL_OFFLOAD_OP_LINUX_SCHED_GETAFFINITY,
-    SYSCALL_OFFLOAD_OP_LINUX_SETGID, SYSCALL_OFFLOAD_OP_LINUX_SETPGID,
-    SYSCALL_OFFLOAD_OP_LINUX_SETSID, SYSCALL_OFFLOAD_OP_LINUX_SETUID,
-    SYSCALL_OFFLOAD_OP_LINUX_SET_ROBUST_LIST, SYSCALL_OFFLOAD_OP_LINUX_UMASK,
-    SYSCALL_OFFLOAD_OP_LINUX_UNAME, SYSCALL_OFFLOAD_OP_WIN32_ALLOC_VIRTUAL_MEMORY,
-    SYSCALL_OFFLOAD_OP_WIN32_CLOSE, SYSCALL_OFFLOAD_OP_WIN32_DELAY_EXECUTION,
-    SYSCALL_OFFLOAD_OP_WIN32_EXIT_PROCESS, SYSCALL_OFFLOAD_OP_WIN32_GET_CONSOLE_MODE,
-    SYSCALL_OFFLOAD_OP_WIN32_READ_FILE, SYSCALL_OFFLOAD_OP_WIN32_WRITE_FILE,
-    SYSCALL_OFFLOAD_PATH_CAPACITY, SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER,
-    WIN32_SYSCALL_OFFLOAD_ABI_VERSION,
+    identity_is_exact_sender, CommercialMaxCapabilityLeaseWire,
+    CommercialMaxProtocolDescriptorWire, CommercialMaxProtocolRequest,
+    CommercialMaxProtocolResponse, LifecycleDrainBrokerArgs, LifecycleEventWire,
+    LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse, Win32SyscallOffloadRequest,
+    Win32SyscallOffloadResponse, COMMERCIAL_MAX_PAGERD_OP_BACKING_OBJECT,
+    COMMERCIAL_MAX_PAGERD_OP_FAULT_RESOLVE, COMMERCIAL_MAX_PAGERD_OP_PAGE_CACHE_POLICY,
+    COMMERCIAL_MAX_PAGERD_OP_WRITEBACK_POLICY, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
+    COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS, COMMERCIAL_MAX_PROTOCOL_PAGERD,
+    COMMERCIAL_MAX_PROTOCOL_SYSCALLD, COMMERCIAL_MAX_SYSCALLD_OP_CLOCK_POLICY,
+    COMMERCIAL_MAX_SYSCALLD_OP_COLD_SYSCALL_OFFLOAD, COMMERCIAL_MAX_SYSCALLD_OP_CREDS_LIMITS,
+    COMMERCIAL_MAX_SYSCALLD_OP_LINUX_POLICY, COMMERCIAL_MAX_SYSCALLD_OP_MM_POLICY,
+    COMMERCIAL_MAX_SYSCALLD_OP_RANDOM_POLICY, COMMERCIAL_MAX_SYSCALLD_OP_WIN32_POLICY,
+    IPC_MAX_INLINE_BYTES, IPC_SERVICE_LINUX_SYSCALLD, IPC_SERVICE_PAGERD,
+    LIFECYCLE_DRAIN_BROKER_ABI_VERSION, LIFECYCLE_DRAIN_MAX_EVENTS, LIFECYCLE_EVENT_EXIT,
+    PROC_BROKER_ABI_VERSION, SYSCALL_OFFLOAD_ABI_VERSION,
+    SYSCALL_OFFLOAD_OP_LINUX_ARCH_PRCTL_POLICY, SYSCALL_OFFLOAD_OP_LINUX_BRK,
+    SYSCALL_OFFLOAD_OP_LINUX_CLOCK_GETTIME, SYSCALL_OFFLOAD_OP_LINUX_CLOCK_NANOSLEEP,
+    SYSCALL_OFFLOAD_OP_LINUX_FUTEX_POLICY, SYSCALL_OFFLOAD_OP_LINUX_GETEGID,
+    SYSCALL_OFFLOAD_OP_LINUX_GETEUID, SYSCALL_OFFLOAD_OP_LINUX_GETGID,
+    SYSCALL_OFFLOAD_OP_LINUX_GETPGID, SYSCALL_OFFLOAD_OP_LINUX_GETPPID,
+    SYSCALL_OFFLOAD_OP_LINUX_GETRANDOM, SYSCALL_OFFLOAD_OP_LINUX_GETSID,
+    SYSCALL_OFFLOAD_OP_LINUX_GETUID, SYSCALL_OFFLOAD_OP_LINUX_GET_ROBUST_LIST,
+    SYSCALL_OFFLOAD_OP_LINUX_MADVISE, SYSCALL_OFFLOAD_OP_LINUX_MEMFD_CREATE,
+    SYSCALL_OFFLOAD_OP_LINUX_MMAP, SYSCALL_OFFLOAD_OP_LINUX_MPROTECT,
+    SYSCALL_OFFLOAD_OP_LINUX_MUNMAP, SYSCALL_OFFLOAD_OP_LINUX_NANOSLEEP,
+    SYSCALL_OFFLOAD_OP_LINUX_PRLIMIT64, SYSCALL_OFFLOAD_OP_LINUX_RSEQ,
+    SYSCALL_OFFLOAD_OP_LINUX_SCHED_GETAFFINITY, SYSCALL_OFFLOAD_OP_LINUX_SETGID,
+    SYSCALL_OFFLOAD_OP_LINUX_SETPGID, SYSCALL_OFFLOAD_OP_LINUX_SETSID,
+    SYSCALL_OFFLOAD_OP_LINUX_SETUID, SYSCALL_OFFLOAD_OP_LINUX_SET_ROBUST_LIST,
+    SYSCALL_OFFLOAD_OP_LINUX_UMASK, SYSCALL_OFFLOAD_OP_LINUX_UNAME,
+    SYSCALL_OFFLOAD_OP_WIN32_ALLOC_VIRTUAL_MEMORY, SYSCALL_OFFLOAD_OP_WIN32_CLOSE,
+    SYSCALL_OFFLOAD_OP_WIN32_DELAY_EXECUTION, SYSCALL_OFFLOAD_OP_WIN32_EXIT_PROCESS,
+    SYSCALL_OFFLOAD_OP_WIN32_GET_CONSOLE_MODE, SYSCALL_OFFLOAD_OP_WIN32_READ_FILE,
+    SYSCALL_OFFLOAD_OP_WIN32_WRITE_FILE, SYSCALL_OFFLOAD_PATH_CAPACITY,
+    SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER, WIN32_SYSCALL_OFFLOAD_ABI_VERSION,
 };
 
 mod errno;
@@ -92,12 +93,16 @@ fn serve(endpoint: u64) {
     loop {
         let mut request = [0_u8; IPC_MAX_INLINE_BYTES];
         let mut reply_cap = 0_u64;
+        let mut sender_pid = 0_u64;
+        let mut sender_tid = 0_u64;
         let received = unsafe {
-            ipc::recv(
+            ipc::recv_with_sender(
                 endpoint,
                 request.as_mut_ptr(),
                 request.len(),
                 &mut reply_cap as *mut u64,
+                &mut sender_pid as *mut u64,
+                &mut sender_tid as *mut u64,
             )
         };
         if received < 0 {
@@ -110,7 +115,7 @@ fn serve(endpoint: u64) {
         // local broker drain is bounded and cannot wait on another service,
         // so syscalld recovery never participates in a bootstrap IPC cycle.
         drain_lifecycle_events();
-        let response = handle_request(received as usize, &request);
+        let response = handle_request(received as usize, &request, sender_pid, sender_tid);
         let reply = unsafe { ipc::reply(reply_cap, response.as_ptr(), response.len()) };
         if reply < 0 {
             ipc::debug_line("syscalld: reply failed");
@@ -122,7 +127,7 @@ fn drain_lifecycle_events() {
     let mut events = [LifecycleEventWire::default(); LIFECYCLE_DRAIN_MAX_EVENTS];
     let mut count = 0_u32;
     let args = LifecycleDrainBrokerArgs {
-        abi_version: PROC_BROKER_ABI_VERSION,
+        abi_version: LIFECYCLE_DRAIN_BROKER_ABI_VERSION,
         out_events_ptr: events.as_mut_ptr() as u64,
         out_capacity: LIFECYCLE_DRAIN_MAX_EVENTS as u32,
         out_count_ptr: &mut count as *mut u32 as u64,
@@ -178,16 +183,21 @@ impl SyscallOffloadReply {
     }
 }
 
-fn handle_request(received: usize, bytes: &[u8]) -> SyscallOffloadReply {
+fn handle_request(
+    received: usize,
+    bytes: &[u8],
+    sender_pid: u64,
+    sender_tid: u64,
+) -> SyscallOffloadReply {
     if received == size_of::<CommercialMaxProtocolRequest>() {
         let request = read_unaligned::<CommercialMaxProtocolRequest>(bytes);
-        let response = handle_commercial_request(&request);
+        let response = handle_commercial_request(&request, sender_pid, sender_tid);
         return SyscallOffloadReply::Commercial(response);
     }
     if received == size_of::<LinuxSyscallOffloadRequest>() {
         let request = read_unaligned::<LinuxSyscallOffloadRequest>(bytes);
         let mut response = LinuxSyscallOffloadResponse::default();
-        handle_linux_request(received, &request, &mut response);
+        handle_linux_request(received, &request, &mut response, sender_pid, sender_tid);
         return SyscallOffloadReply::Linux(response);
     }
     if received == size_of::<Win32SyscallOffloadRequest>() {
@@ -197,7 +207,7 @@ fn handle_request(received: usize, bytes: &[u8]) -> SyscallOffloadReply {
             op: request.op,
             ..Win32SyscallOffloadResponse::default()
         };
-        handle_win32_request(received, &request, &mut response);
+        handle_win32_request(received, &request, &mut response, sender_pid, sender_tid);
         return SyscallOffloadReply::Win32(response);
     }
     let response = LinuxSyscallOffloadResponse {
@@ -209,12 +219,18 @@ fn handle_request(received: usize, bytes: &[u8]) -> SyscallOffloadReply {
 
 fn handle_commercial_request(
     request: &CommercialMaxProtocolRequest,
+    sender_pid: u64,
+    sender_tid: u64,
 ) -> CommercialMaxProtocolResponse {
     let mut response = CommercialMaxProtocolResponse {
         header: request.header,
         ..CommercialMaxProtocolResponse::default()
     };
     response.header.version = COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
+    if !request.subject_is_exact_sender(sender_pid, sender_tid) {
+        response.status = errno::EACCES;
+        return response;
+    }
     if let Err(errno) = validate_commercial_request(request) {
         response.status = errno;
         return response;
@@ -362,8 +378,14 @@ fn handle_linux_request(
     received: usize,
     request: &LinuxSyscallOffloadRequest,
     response: &mut LinuxSyscallOffloadResponse,
+    sender_pid: u64,
+    sender_tid: u64,
 ) {
     response.op = request.op;
+    if !identity_is_exact_sender(request.pid, request.tid, sender_pid, sender_tid) {
+        response.status = errno::EACCES;
+        return;
+    }
     if let Err(errno) = validate_request(received, request) {
         response.status = errno;
         return;
@@ -432,8 +454,14 @@ fn handle_win32_request(
     received: usize,
     request: &Win32SyscallOffloadRequest,
     response: &mut Win32SyscallOffloadResponse,
+    sender_pid: u64,
+    sender_tid: u64,
 ) {
     response.op = request.op;
+    if !identity_is_exact_sender(request.pid, request.tid, sender_pid, sender_tid) {
+        response.status = 5;
+        return;
+    }
     if received != size_of::<Win32SyscallOffloadRequest>()
         || request.version != WIN32_SYSCALL_OFFLOAD_ABI_VERSION
         || request.reserved0 != 0

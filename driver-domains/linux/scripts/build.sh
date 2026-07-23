@@ -245,7 +245,8 @@ config_change_preserves_host_toolchain() {
                 if (!(key in after)) exit 1
                 if (before[key] != after[key]) {
                     changes++
-                    if (key == "BR2_ROOTFS_POST_BUILD_SCRIPT") {
+                    if (key == "BR2_ROOTFS_POST_BUILD_SCRIPT" ||
+                        key == "BR2_EXTERNAL_RUSTOS_LINUX_DVM_VERSION") {
                         continue
                     }
                     if (!(key in admitted) || before[key] != "n" || after[key] != "y") {
@@ -256,7 +257,8 @@ config_change_preserves_host_toolchain() {
             for (key in after) {
                 if (!(key in before)) {
                     changes++
-                    if (key == "BR2_ROOTFS_POST_BUILD_SCRIPT") continue
+                    if (key == "BR2_ROOTFS_POST_BUILD_SCRIPT" ||
+                        key == "BR2_EXTERNAL_RUSTOS_LINUX_DVM_VERSION") continue
                     if (!(key in admitted) || after[key] != "y") exit 1
                 }
             }
@@ -309,6 +311,14 @@ selftest_config_cache_policy() {
         'BR2_TOOLCHAIN_BUILDROOT_MUSL=y' >"$desired"
     config_change_preserves_host_toolchain "$previous" "$desired" \
         || die "rootfs-only policy change did not preserve the cache"
+    printf '%s\n' \
+        'BR2_EXTERNAL_RUSTOS_LINUX_DVM_VERSION="-gold-dirty"' \
+        'BR2_TOOLCHAIN_BUILDROOT_MUSL=y' >"$previous"
+    printf '%s\n' \
+        'BR2_EXTERNAL_RUSTOS_LINUX_DVM_VERSION="-gnew-dirty"' \
+        'BR2_TOOLCHAIN_BUILDROOT_MUSL=y' >"$desired"
+    config_change_preserves_host_toolchain "$previous" "$desired" \
+        || die "external metadata version change did not preserve the cache"
 
     cp -- "$ROOT/board/linux.fragment" "$tmp/linux.fragment"
     kernel_before="$(kernel_config_input_hash "$tmp/linux.fragment")"
@@ -328,7 +338,7 @@ local_service_input_hash() {
     local service=$1
 
     case "$service" in
-        rustos-dvm-agent|rustos-dvm-display|rustos-dvm-net) ;;
+        rustos-dvm-agent|rustos-dvm-block|rustos-dvm-display|rustos-dvm-net) ;;
         *) die "unknown local DVM service: $service" ;;
     esac
     (
@@ -550,7 +560,7 @@ print_build_plan() {
         printf 'lane=linux+signed-kernel-modules+rootfs\n'
         lane_count=$((lane_count + 1))
     fi
-    for service in rustos-dvm-agent rustos-dvm-display rustos-dvm-net; do
+    for service in rustos-dvm-agent rustos-dvm-block rustos-dvm-display rustos-dvm-net; do
         service_stamp="$BUILD_DIR/.${service}-input-v1.sha256"
         if ! test -f "$service_stamp" \
             || test "$(cat "$service_stamp")" != "$(local_service_input_hash "$service")"; then
@@ -661,6 +671,7 @@ prepare_mutable_inputs() {
         || test "$(cat "$kernel_stamp")" != "$kernel_current"; then
         if test -d "$kernel_build" || test -d "$target_modules"; then
             make_buildroot linux-dirclean
+            make_buildroot rustos-dvm-block-dirclean
             make_buildroot rustos-dvm-display-dirclean
             make_buildroot rustos-dvm-nvidia-open-dirclean
             rm -rf -- "$target_modules"
@@ -672,7 +683,7 @@ prepare_mutable_inputs() {
     # the external source tree after its first rsync. Remove only the local
     # service package directories so the next ordinary make recreates and
     # reinstalls them while retaining the verified host toolchain and kernel.
-    for service in rustos-dvm-agent rustos-dvm-display rustos-dvm-net; do
+    for service in rustos-dvm-agent rustos-dvm-block rustos-dvm-display rustos-dvm-net; do
         service_stamp="$BUILD_DIR/.${service}-input-v1.sha256"
         service_current="$(local_service_input_hash "$service")"
         if test -f "$service_stamp" && test "$(cat "$service_stamp")" != "$service_current"; then
@@ -710,7 +721,7 @@ prepare_mutable_inputs() {
 
 commit_mutable_input_stamps() {
     local service
-    for service in rustos-dvm-agent rustos-dvm-display rustos-dvm-net; do
+    for service in rustos-dvm-agent rustos-dvm-block rustos-dvm-display rustos-dvm-net; do
         write_stamp "$BUILD_DIR/.${service}-input-v1.sha256" "$(local_service_input_hash "$service")"
     done
     write_stamp "$BUILD_DIR/.rustos-overlay-input.sha256" "$(overlay_input_hash)"
@@ -764,7 +775,7 @@ rebuild_service() {
     local service=$1
 
     case "$service" in
-        rustos-dvm-agent|rustos-dvm-display|rustos-dvm-net) ;;
+        rustos-dvm-agent|rustos-dvm-block|rustos-dvm-display|rustos-dvm-net) ;;
         *) die "unknown local DVM service: $service" ;;
     esac
     prepare_sources
@@ -787,7 +798,7 @@ dev_build_service() {
     local started_seconds=$SECONDS
 
     case "$service" in
-        rustos-dvm-agent|rustos-dvm-display|rustos-dvm-net) ;;
+        rustos-dvm-agent|rustos-dvm-block|rustos-dvm-display|rustos-dvm-net) ;;
         *) die "unknown local DVM service: $service" ;;
     esac
     require_warm_dvm_configuration
@@ -854,6 +865,14 @@ main() {
             require_kernel_build_headers
             rebuild_service rustos-dvm-agent
             ;;
+        rebuild-block)
+            require_tool make
+            require_tool curl
+            require_tool sha256sum
+            require_tool tar
+            require_kernel_build_headers
+            rebuild_service rustos-dvm-block
+            ;;
         rebuild-display)
             require_tool make
             require_tool curl
@@ -873,6 +892,10 @@ main() {
         dev-agent)
             require_tool make
             dev_build_service rustos-dvm-agent
+            ;;
+        dev-block)
+            require_tool make
+            dev_build_service rustos-dvm-block
             ;;
         dev-display)
             require_tool make

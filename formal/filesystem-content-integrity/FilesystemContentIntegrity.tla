@@ -2,10 +2,10 @@
 EXTENDS Naturals, FiniteSets
 
 (*******************************************************************************
-Owner: vfsd/storaged; kernel boot-volume code is the bounded read substrate.
-Linearization point: VerifyRead, where bytes reconstructed from signed extents
-must match the staged content digest. The enabled root image is immutable;
-mutation requests fail closed rather than creating an unjournaled state.
+Owner: the bootloader-authenticated early-system image and its bounded ring0
+reader. Linearization point: VerifyRead, where one exact allowlisted payload
+must match its table digest. The bootstrap image is immutable; mutation
+requests fail closed rather than creating an unjournaled state.
 *******************************************************************************)
 
 CONSTANTS Files, Digests, MaxMutationAttempts

@@ -364,16 +364,16 @@ pub fn init(boot_info_ptr: *const BootInfo) {
             .and_then(|end| align_up(end, PAGE_SIZE))
             .unwrap_or(DIRECT_MAP_PHYS_LIMIT)
             .min(DIRECT_MAP_PHYS_LIMIT);
-        let extent_manifest = boot_info.boot_extent_manifest;
-        let extent_manifest_start = if extent_manifest.is_present() {
-            align_down(extent_manifest.ptr, PAGE_SIZE)
+        let early_system = boot_info.early_system_image;
+        let early_system_start = if early_system.is_present() {
+            align_down(early_system.ptr, PAGE_SIZE)
         } else {
             0
         };
-        let extent_manifest_end = if extent_manifest.is_present() {
-            extent_manifest
+        let early_system_end = if early_system.is_present() {
+            early_system
                 .ptr
-                .checked_add(extent_manifest.len)
+                .checked_add(early_system.len)
                 .and_then(|end| align_up(end, PAGE_SIZE))
                 .unwrap_or(0)
                 .min(DIRECT_MAP_PHYS_LIMIT)
@@ -386,7 +386,7 @@ pub fn init(boot_info_ptr: *const BootInfo) {
             bitmap_pages,
             &[
                 (image_start, image_end),
-                (extent_manifest_start, extent_manifest_end),
+                (early_system_start, early_system_end),
             ],
         ) else {
             panic!("failed to reserve physical allocator bitmap");
@@ -436,8 +436,8 @@ pub fn init(boot_info_ptr: *const BootInfo) {
             boot_info.nucleus_image.phys_start,
             boot_info.nucleus_image.size,
         );
-        if extent_manifest_start < extent_manifest_end {
-            new_state.reserve_phys_range(extent_manifest.ptr, extent_manifest.len);
+        if early_system_start < early_system_end {
+            new_state.reserve_phys_range(early_system.ptr, early_system.len);
         }
         new_state.reserve_phys_range(bitmap_phys, bitmap_pages as u64 * PAGE_SIZE);
         new_state.initialized = true;
@@ -721,7 +721,7 @@ mod tests {
     }
 
     #[test]
-    fn bitmap_backing_skips_kernel_image_and_boot_extent_manifest() {
+    fn bitmap_backing_skips_kernel_image_and_early_system() {
         let regions = [BootMemoryRegion {
             phys_start: 0x900000,
             page_count: 0x6000,

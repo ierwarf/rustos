@@ -7,7 +7,6 @@ extern crate std;
 use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
-use boot_protocol::BootVolumeIdentity;
 use core::cmp::min;
 use fatfs::IoError;
 
@@ -95,54 +94,9 @@ impl<T: BlockDevice + ?Sized> BlockDevice for &mut T {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TransportKind {
-    Ahci,
-    Nvme,
-    Usb,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PartitionInfo {
     pub start_lba: u64,
     pub block_count: u64,
-}
-
-pub struct BootVolumeLocator {
-    identity: BootVolumeIdentity,
-}
-
-impl BootVolumeLocator {
-    pub fn new(identity: BootVolumeIdentity) -> Option<Self> {
-        identity
-            .validate()
-            .ok()
-            .and_then(|_| identity.is_present().then_some(Self { identity }))
-    }
-
-    pub fn identity(&self) -> BootVolumeIdentity {
-        self.identity
-    }
-
-    pub fn matches_partition<D: BlockDevice>(
-        &self,
-        dev: &mut D,
-        partition: PartitionInfo,
-    ) -> IoResult<bool> {
-        if partition.start_lba != self.identity.volume_start_lba
-            || partition.block_count != self.identity.volume_sector_count
-        {
-            return Ok(false);
-        }
-
-        let mut slice = BlockSlice::new(&mut *dev, partition.start_lba, partition.block_count)?;
-        let block_size = slice.logical_block_size();
-        if block_size < 512 {
-            return Err(StorageError::InvalidInput);
-        }
-        let mut block = vec![0_u8; block_size];
-        slice.read_blocks(0, &mut block)?;
-        Ok(fat_volume_id_from_boot_sector(&block) == Some(self.identity.fat_volume_id))
-    }
 }
 
 pub struct BlockSlice<D: BlockDevice> {

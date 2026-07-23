@@ -41,7 +41,8 @@ const SYS_IOCTL: usize = 16;
 const SYS_OPENAT: usize = 257;
 const SYS_RUSTOS_IPC_ENDPOINT_CREATE: usize = syscall_abi::SYS_RUSTOS_IPC_ENDPOINT_CREATE as usize;
 const SYS_RUSTOS_IPC_CALL: usize = syscall_abi::SYS_RUSTOS_IPC_CALL as usize;
-const SYS_RUSTOS_IPC_RECV: usize = syscall_abi::SYS_RUSTOS_IPC_RECV as usize;
+const SYS_RUSTOS_IPC_RECV_WITH_SENDER: usize =
+    syscall_abi::SYS_RUSTOS_IPC_RECV_WITH_SENDER as usize;
 const SYS_RUSTOS_IPC_REPLY: usize = syscall_abi::SYS_RUSTOS_IPC_REPLY as usize;
 const SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT: usize =
     syscall_abi::SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT as usize;
@@ -240,13 +241,17 @@ fn serve_display_policy(endpoint: u64) {
     loop {
         let mut request = syscall_abi::CommercialMaxProtocolRequest::default();
         let mut reply_cap = 0_u64;
+        let mut sender_pid = 0_u64;
+        let mut sender_tid = 0_u64;
         let received = unsafe {
-            syscall4(
-                SYS_RUSTOS_IPC_RECV,
+            syscall6(
+                SYS_RUSTOS_IPC_RECV_WITH_SENDER,
                 endpoint as usize,
                 (&mut request as *mut syscall_abi::CommercialMaxProtocolRequest) as usize,
                 size_of::<syscall_abi::CommercialMaxProtocolRequest>(),
                 (&mut reply_cap as *mut u64) as usize,
+                (&mut sender_pid as *mut u64) as usize,
+                (&mut sender_tid as *mut u64) as usize,
             )
         };
         if is_syscall_error(received) {
@@ -258,7 +263,8 @@ fn serve_display_policy(endpoint: u64) {
             boot_line("uiserver: display policy first request received");
             first_request = false;
         }
-        let response = dispatch_display_policy_request(received as usize, &request);
+        let response =
+            dispatch_display_policy_request(received as usize, &request, sender_pid, sender_tid);
         if trace_first_request {
             boot_line("uiserver: display policy first response built");
         }
@@ -285,28 +291,41 @@ fn serve_display_policy(endpoint: u64) {
 fn dispatch_display_policy_request(
     received: usize,
     request: &syscall_abi::CommercialMaxProtocolRequest,
+    sender_pid: u64,
+    sender_tid: u64,
 ) -> syscall_abi::CommercialMaxProtocolResponse {
     let mut response = syscall_abi::CommercialMaxProtocolResponse {
         header: request.header,
         ..syscall_abi::CommercialMaxProtocolResponse::default()
     };
     response.header.version = syscall_abi::COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
-    response.status = match validate_display_policy_request(received, request) {
-        Ok(()) => fill_display_policy_response(request, &mut response),
-        Err(errno) => errno,
-    };
+    response.status =
+        match validate_display_policy_request(received, request, sender_pid, sender_tid) {
+            Ok(()) => fill_display_policy_response(request, &mut response),
+            Err(errno) => errno,
+        };
     response
 }
 
 fn validate_display_policy_request(
     received: usize,
     request: &syscall_abi::CommercialMaxProtocolRequest,
+    sender_pid: u64,
+    sender_tid: u64,
 ) -> Result<(), i32> {
     if received != size_of::<syscall_abi::CommercialMaxProtocolRequest>()
         || !request.has_valid_envelope()
         || request.header.protocol != syscall_abi::COMMERCIAL_MAX_PROTOCOL_UISERVER
     {
         return Err(libc::EINVAL);
+    }
+    if !request.subject_is_exact_sender(sender_pid, sender_tid)
+        || rustos_svc_runtime::ipc::validate_service_owner(
+            syscall_abi::IPC_SERVICE_DEVMGRD,
+            sender_pid,
+        ) < 0
+    {
+        return Err(libc::EACCES);
     }
     match request.header.op {
         syscall_abi::COMMERCIAL_MAX_UISERVER_OP_DISPLAY_READINESS

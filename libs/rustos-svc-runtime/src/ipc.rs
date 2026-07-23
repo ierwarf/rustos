@@ -3,13 +3,14 @@
 
 use alloc::vec::Vec;
 use rustos_user_abi::syscall::{
-    SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
-    SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_RECV, SYS_RUSTOS_IPC_RECV_WITH_SENDER,
-    SYS_RUSTOS_IPC_REGISTER_LINUX_SYSCALL_ENDPOINT, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT,
-    SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_IPC_TRY_RECV,
+    RustosIpcValidateServiceOwnerArgs, IPC_ABI_VERSION, SYS_RUSTOS_DEBUG_PRINT,
+    SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
+    SYS_RUSTOS_IPC_RECV_WITH_SENDER, SYS_RUSTOS_IPC_REGISTER_LINUX_SYSCALL_ENDPOINT,
+    SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
+    SYS_RUSTOS_IPC_VALIDATE_SERVICE_OWNER,
 };
 
-use crate::syscall::{syscall0, syscall1, syscall2, syscall3, syscall4, syscall5, syscall6};
+use crate::syscall::{syscall0, syscall1, syscall2, syscall3, syscall5, syscall6};
 
 #[inline]
 pub fn endpoint_create() -> i64 {
@@ -37,6 +38,27 @@ pub fn lookup_service_endpoint(service_id: u64) -> i64 {
     unsafe { syscall1(SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, service_id) }
 }
 
+/// Prove that a kernel-stamped sender PID currently owns `service_id`.
+///
+/// This is the only accepted shortcut for a delegated service-to-service
+/// request whose subject differs from the immediate sender. Callers must not
+/// cache a successful result across requests or service restart.
+#[inline]
+pub fn validate_service_owner(service_id: u64, sender_pid: u64) -> i64 {
+    let args = RustosIpcValidateServiceOwnerArgs {
+        abi_version: IPC_ABI_VERSION,
+        service_id,
+        process_id: sender_pid,
+        ..RustosIpcValidateServiceOwnerArgs::default()
+    };
+    unsafe {
+        syscall1(
+            SYS_RUSTOS_IPC_VALIDATE_SERVICE_OWNER,
+            (&args as *const RustosIpcValidateServiceOwnerArgs) as u64,
+        )
+    }
+}
+
 #[inline]
 pub unsafe fn call(
     endpoint: u64,
@@ -52,28 +74,6 @@ pub unsafe fn call(
         request_len as u64,
         reply as u64,
         reply_capacity as u64,
-    )
-}
-
-/// Block until a request arrives on `endpoint`. On success, the request bytes
-/// are placed into `request_buf` (truncated to `request_capacity`) and
-/// `reply_cap_out` receives the reply capability the service must hand back to
-/// `reply()`.
-///
-/// Returns the number of request bytes received, or a negative errno.
-#[inline]
-pub unsafe fn recv(
-    endpoint: u64,
-    request_buf: *mut u8,
-    request_capacity: usize,
-    reply_cap_out: *mut u64,
-) -> i64 {
-    syscall4(
-        SYS_RUSTOS_IPC_RECV,
-        endpoint,
-        request_buf as u64,
-        request_capacity as u64,
-        reply_cap_out as u64,
     )
 }
 
@@ -96,24 +96,6 @@ pub unsafe fn recv_with_sender(
         reply_cap_out as u64,
         sender_pid_out as u64,
         sender_tid_out as u64,
-    )
-}
-
-/// Attempt to receive a request without blocking. Returns `0` when no request
-/// is currently queued, a positive byte count on success, or a negative errno.
-#[inline]
-pub unsafe fn try_recv(
-    endpoint: u64,
-    request_buf: *mut u8,
-    request_capacity: usize,
-    reply_cap_out: *mut u64,
-) -> i64 {
-    syscall4(
-        SYS_RUSTOS_IPC_TRY_RECV,
-        endpoint,
-        request_buf as u64,
-        request_capacity as u64,
-        reply_cap_out as u64,
     )
 }
 

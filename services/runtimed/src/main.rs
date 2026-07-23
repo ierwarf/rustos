@@ -23,6 +23,7 @@ pub(crate) const MAX_UNTRUSTED_TASK_WEIGHT_MICROS: u64 = 1_000;
 pub(crate) const UI_SERVER_TASK_WEIGHT_MICROS: u64 = TASK_WEIGHT_INTERACTIVE_FLAG | 2_000;
 pub(crate) const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(2);
 pub(crate) const RETRY_BACKOFF: Duration = Duration::from_millis(100);
+const UI_BOOTSTRAP_RETRY_BACKOFF: Duration = Duration::from_millis(500);
 pub(crate) const SERVICE_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const MAX_RUNTIME_CLIENTS_PER_TICK: usize = 8;
 pub(crate) const MAX_POLICY_LAUNCH_ATTEMPTS_PER_TICK: usize = 1;
@@ -118,6 +119,7 @@ pub(crate) struct RunningProcess {
     pub(crate) exec: String,
     pub(crate) session_handle: u64,
     pub(crate) restart: bool,
+    pub(crate) logical_admin: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -192,7 +194,14 @@ fn main() {
     };
     spawn::debug_line("runtimed: runtime socket ready");
     boot_line("runtimed: runtime socket ready");
-    let session_endpoint = session::create_session_endpoint();
+    let session_endpoint = match session::create_session_endpoint() {
+        Some(endpoint) => Some(endpoint),
+        None => {
+            spawn::debug_line("runtimed: fatal session identity publication failed");
+            boot_line("runtimed: fatal session identity publication failed");
+            return;
+        }
+    };
 
     let mut state = BrokerState {
         console_fd: None,
@@ -210,23 +219,12 @@ fn main() {
         launch_catalog_retry_after: None,
         launch_catalog_last_error: None,
     };
-    spawn::debug_line("runtimed: bootstrap ui begin");
-    boot_line("runtimed: bootstrap ui begin");
-    if let Err(err) = session::bootstrap_ui_server(&mut state) {
-        observability_client::error!(
-            "runtimed",
-            service,
-            "bootstrap {} failed: errno={err}",
-            UI_SERVER_EXEC_PATH
-        );
-    } else {
-        spawn::debug_line("runtimed: bootstrap ui done");
-        boot_line("runtimed: bootstrap ui done");
-    }
+    let _ = ensure_ui_bootstrap(&mut state);
     loop {
         let mut did_work = false;
         did_work |= session::service_session_endpoint(session_endpoint, &mut state);
         did_work |= spawn::reap_children(&mut state);
+        did_work |= ensure_ui_bootstrap(&mut state);
         if state.ui_ready && !state.launch_catalog_loaded {
             did_work |= catalog::load_launch_catalog_into_state(&mut state);
         }
@@ -236,5 +234,52 @@ fn main() {
             continue;
         }
         thread::sleep(spawn::next_idle_delay(&state));
+    }
+}
+
+fn ensure_ui_bootstrap(state: &mut BrokerState) -> bool {
+    if state.ui_ready
+        || state
+            .running
+            .values()
+            .any(|process| process.exec == UI_SERVER_EXEC_PATH)
+        || state
+            .permanent_launch_failures
+            .contains_key(UI_SERVER_DESKTOP_FILE_ID)
+        || state
+            .retry_after
+            .get(UI_SERVER_DESKTOP_FILE_ID)
+            .is_some_and(|deadline| Instant::now() < *deadline)
+    {
+        return false;
+    }
+    spawn::debug_line("runtimed: bootstrap ui begin");
+    boot_line("runtimed: bootstrap ui begin");
+    match session::bootstrap_ui_server(state) {
+        Ok(()) => {
+            spawn::debug_line("runtimed: bootstrap ui done");
+            boot_line("runtimed: bootstrap ui done");
+            true
+        }
+        Err(err) => {
+            if spawn::is_permanent_launch_failure(err) {
+                state
+                    .permanent_launch_failures
+                    .insert(String::from(UI_SERVER_DESKTOP_FILE_ID), err);
+            } else {
+                state.retry_after.insert(
+                    String::from(UI_SERVER_DESKTOP_FILE_ID),
+                    Instant::now() + UI_BOOTSTRAP_RETRY_BACKOFF,
+                );
+            }
+            observability_client::error!(
+                "runtimed",
+                service,
+                "bootstrap {} failed: errno={err}; retry={}",
+                UI_SERVER_EXEC_PATH,
+                !spawn::is_permanent_launch_failure(err)
+            );
+            true
+        }
     }
 }

@@ -17,9 +17,12 @@ macro_rules! ipc_trace {
 
 const IPC_TRACE_VERBOSE: bool = false;
 const MAX_SERVICE_ENDPOINTS: usize = 16;
+// The process table admits at most 32 live process objects. One exact grant per
+// process/service pair therefore bounds the complete service-call grant set.
+const MAX_SERVICE_CALL_GRANTS: usize = 32 * MAX_SERVICE_ENDPOINTS;
 const MAX_SERVICE_ENDPOINT_WAITERS: usize = 32;
 const SLOW_IPC_THRESHOLD_MS: u64 = 10;
-const MAX_SLOW_IPC_LOGS: usize = 20;
+const MAX_SLOW_IPC_LOGS: usize = 128;
 const EARLY_IPC_SAMPLE_COUNT: usize = 6;
 const SERVICE_IPC_TIMEOUT_MS: u64 = 30_000;
 // RING3-MIGRATION-REFERENCE START: rootd should own service namespace endpoint
@@ -34,12 +37,20 @@ static SERVICE_ENDPOINT_CAPS: [AtomicU64; MAX_SERVICE_ENDPOINTS] =
     [const { AtomicU64::new(0) }; MAX_SERVICE_ENDPOINTS];
 static SERVICE_ENDPOINT_EPOCHS: [AtomicU64; MAX_SERVICE_ENDPOINTS] =
     [const { AtomicU64::new(0) }; MAX_SERVICE_ENDPOINTS];
+// Rootd is the root of the service authority graph. The first successful
+// publication permanently seals its process identity for this boot. Process
+// identities never wrap or alias, so rootd exit is fail-stop until reboot
+// instead of reopening the root namespace to an arbitrary ring3 process.
+static ROOTD_BOOTSTRAP_OWNER: AtomicU64 = AtomicU64::new(0);
 // Publication, revocation, and process-exit cleanup must share one mutation
 // critical section. The endpoint itself remains the lock-free commit point for
 // readers, but a second registrar or an exiting process must not interleave
 // between capability preparation and endpoint publication.
 static SERVICE_ENDPOINT_REGISTRY_MUTATION: Mutex<()> = Mutex::new(());
+static SERVICE_CALL_GRANTS: Mutex<[ServiceCallGrant; MAX_SERVICE_CALL_GRANTS]> =
+    Mutex::new([ServiceCallGrant::empty(); MAX_SERVICE_CALL_GRANTS]);
 // RING3-MIGRATION-REFERENCE END: rootd-owned service endpoint registry state.
+static IPC_LOG_SAMPLE_COUNT: AtomicUsize = AtomicUsize::new(0);
 static SLOW_IPC_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Copy)]
@@ -47,6 +58,29 @@ struct ServiceEndpointWaiter {
     task_id: u64,
     service_id: u64,
     expected_pid: u64,
+}
+
+#[derive(Clone, Copy)]
+struct ServiceCallGrant {
+    process_id: u64,
+    service_id: u64,
+    endpoint_epoch: u64,
+}
+
+impl ServiceCallGrant {
+    const fn empty() -> Self {
+        Self {
+            process_id: 0,
+            service_id: 0,
+            endpoint_epoch: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ServiceCapabilityAuthorization {
+    capability: u64,
+    rootd_epoch: Option<u64>,
 }
 
 lazy_static! {
@@ -70,6 +104,7 @@ pub(super) fn is_linux_rustos_ipc_syscall(syscall_number: u64) -> bool {
             | linux_abi::SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT
             | linux_abi::SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT
             | linux_abi::SYS_RUSTOS_IPC_WAIT_SERVICE_ENDPOINT
+            | linux_abi::SYS_RUSTOS_IPC_VALIDATE_SERVICE_OWNER
     )
 }
 
@@ -101,6 +136,9 @@ pub(super) fn dispatch_linux_rustos_ipc_syscall(frame: &SyscallFrame) -> u64 {
         linux_abi::SYS_RUSTOS_IPC_RECV_WITH_SENDER => syscall_linux_rustos_ipc_recv_with_sender(
             frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
         ),
+        linux_abi::SYS_RUSTOS_IPC_VALIDATE_SERVICE_OWNER => {
+            syscall_linux_rustos_ipc_validate_service_owner(frame.rdi)
+        }
         linux_abi::SYS_RUSTOS_IPC_REPLY => {
             syscall_linux_rustos_ipc_reply(frame.rdi, frame.rsi, frame.rdx)
         }
@@ -168,6 +206,10 @@ pub(crate) fn cleanup_service_endpoints_for_process(process_id: u64) {
     let mut revoked_services = [0_u64; MAX_SERVICE_ENDPOINTS];
     let mut revoked_count = 0usize;
     let registry_mutation = SERVICE_ENDPOINT_REGISTRY_MUTATION.lock();
+    {
+        let mut grants = SERVICE_CALL_GRANTS.lock();
+        clear_service_call_grants(grants.as_mut_slice(), process_id);
+    }
     if SERVICE_ENDPOINT_OWNERS[linux_abi::IPC_SERVICE_LINUX_SYSCALLD as usize]
         .load(Ordering::Acquire)
         == process_id
@@ -207,6 +249,22 @@ pub(super) fn current_process_has_service_capability(capability: u64) -> bool {
     };
     let _registry = SERVICE_ENDPOINT_REGISTRY_MUTATION.lock();
     current_process_has_service_capability_locked(capability, process_id)
+}
+
+pub(super) fn current_process_service_capability_snapshot() -> Option<(u64, u64)> {
+    let process_id = multitask::current_user_process_id()?;
+    let _registry = SERVICE_ENDPOINT_REGISTRY_MUTATION.lock();
+    let capabilities = SERVICE_ENDPOINTS
+        .iter()
+        .zip(SERVICE_ENDPOINT_OWNERS.iter())
+        .zip(SERVICE_ENDPOINT_CAPS.iter())
+        .filter(|((endpoint, owner), _)| {
+            endpoint.load(Ordering::Acquire) != 0 && owner.load(Ordering::Acquire) == process_id
+        })
+        .fold(0_u64, |caps, (_, entry_caps)| {
+            caps | entry_caps.load(Ordering::Acquire)
+        });
+    Some((process_id, capabilities))
 }
 
 fn current_process_has_service_capability_locked(capability: u64, process_id: u64) -> bool {
@@ -265,6 +323,27 @@ pub(crate) fn process_owns_live_service_endpoint(process_id: u64, service_id: u6
         && !multitask::is_user_process_exiting(process_id)
 }
 
+fn syscall_linux_rustos_ipc_validate_service_owner(args_ptr: u64) -> u64 {
+    let args =
+        match usermem::read_current_user_struct::<RustosIpcValidateServiceOwnerArgs>(args_ptr) {
+            Ok(args) => args,
+            Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
+        };
+    if args.abi_version != IPC_ABI_VERSION
+        || args.reserved0 != 0
+        || args.flags != 0
+        || args.process_id == 0
+        || args.reserved1 != 0
+        || service_index(args.service_id).is_none()
+    {
+        return linux_errno(LINUX_EINVAL);
+    }
+    if !process_owns_live_service_endpoint(args.process_id, args.service_id) {
+        return linux_errno(LINUX_EPERM);
+    }
+    0
+}
+
 pub(crate) fn service_endpoint_epoch(service_id: u64) -> Option<u64> {
     let index = service_index(service_id)?;
     let _registry = SERVICE_ENDPOINT_REGISTRY_MUTATION.lock();
@@ -277,6 +356,169 @@ pub(crate) fn service_endpoint_epoch(service_id: u64) -> Option<u64> {
 
 fn next_service_endpoint_epoch(current: u64) -> Option<u64> {
     current.checked_add(1).filter(|next| *next != 0)
+}
+
+fn rootd_bootstrap_owner_allows(sealed_owner: u64, candidate: u64) -> bool {
+    candidate != 0 && (sealed_owner == 0 || sealed_owner == candidate)
+}
+
+fn record_service_call_grant(
+    grants: &mut [ServiceCallGrant],
+    process_id: u64,
+    service_id: u64,
+    endpoint_epoch: u64,
+) -> Result<(), i64> {
+    if process_id == 0 || endpoint_epoch == 0 {
+        return Err(LINUX_EINVAL);
+    }
+    if let Some(grant) = grants
+        .iter_mut()
+        .find(|grant| grant.process_id == process_id && grant.service_id == service_id)
+    {
+        grant.endpoint_epoch = endpoint_epoch;
+        return Ok(());
+    }
+    let Some(grant) = grants.iter_mut().find(|grant| grant.process_id == 0) else {
+        return Err(LINUX_ENOSPC);
+    };
+    *grant = ServiceCallGrant {
+        process_id,
+        service_id,
+        endpoint_epoch,
+    };
+    Ok(())
+}
+
+fn has_service_call_grant(
+    grants: &[ServiceCallGrant],
+    process_id: u64,
+    service_id: u64,
+    endpoint_epoch: u64,
+) -> bool {
+    process_id != 0
+        && endpoint_epoch != 0
+        && grants.iter().any(|grant| {
+            grant.process_id == process_id
+                && grant.service_id == service_id
+                && grant.endpoint_epoch == endpoint_epoch
+        })
+}
+
+fn clear_service_call_grants(grants: &mut [ServiceCallGrant], process_id: u64) {
+    for grant in grants
+        .iter_mut()
+        .filter(|grant| grant.process_id == process_id)
+    {
+        *grant = ServiceCallGrant::empty();
+    }
+}
+
+fn rootd_authorization_epoch_matches(
+    expected_epoch: u64,
+    endpoint: u64,
+    owner: u64,
+    current_epoch: u64,
+    owner_exiting: bool,
+) -> bool {
+    endpoint != 0
+        && owner != 0
+        && current_epoch == expected_epoch
+        && expected_epoch != 0
+        && !owner_exiting
+}
+
+/// Called only while `SERVICE_ENDPOINT_REGISTRY_MUTATION` is held.
+fn service_authorization_is_current(authorization: ServiceCapabilityAuthorization) -> bool {
+    let Some(expected_epoch) = authorization.rootd_epoch else {
+        return true;
+    };
+    let index = linux_abi::IPC_SERVICE_ROOTD as usize;
+    let endpoint = SERVICE_ENDPOINTS[index].load(Ordering::Acquire);
+    let owner = SERVICE_ENDPOINT_OWNERS[index].load(Ordering::Acquire);
+    rootd_authorization_epoch_matches(
+        expected_epoch,
+        endpoint,
+        owner,
+        SERVICE_ENDPOINT_EPOCHS[index].load(Ordering::Acquire),
+        multitask::is_user_process_exiting(owner),
+    )
+}
+
+fn validate_endpoint_publication_owner(endpoint: u64, process_id: u64) -> Result<(), i64> {
+    kernel_ipc_runtime::api::authorize_endpoint_receiver_for_process(
+        KernelEndpointHandle::from_raw(endpoint),
+        process_id,
+    )
+    .map_err(ipc_error_to_linux_errno)
+}
+
+fn grant_current_process_service_call(
+    service_id: u64,
+    expected_endpoint: Option<u64>,
+    expected_owner: Option<u64>,
+) -> Result<u64, i64> {
+    let Some(index) = service_index(service_id) else {
+        return Err(LINUX_EINVAL);
+    };
+    let Some(process_id) = multitask::current_user_process_id() else {
+        return Err(LINUX_EINVAL);
+    };
+    let _registry = SERVICE_ENDPOINT_REGISTRY_MUTATION.lock();
+    let endpoint = SERVICE_ENDPOINTS[index].load(Ordering::Acquire);
+    let owner = SERVICE_ENDPOINT_OWNERS[index].load(Ordering::Acquire);
+    let epoch = SERVICE_ENDPOINT_EPOCHS[index].load(Ordering::Acquire);
+    if expected_endpoint.is_some_and(|expected| endpoint != expected)
+        || expected_owner.is_some_and(|expected| owner != expected)
+    {
+        return Err(LINUX_EAGAIN);
+    }
+    if endpoint == 0 || owner == 0 || epoch == 0 {
+        return Err(if expected_endpoint.is_some() {
+            LINUX_EAGAIN
+        } else {
+            LINUX_ENOSYS
+        });
+    }
+    if multitask::is_user_process_exiting(owner) {
+        return Err(LINUX_ESRCH);
+    }
+    {
+        let mut grants = SERVICE_CALL_GRANTS.lock();
+        record_service_call_grant(grants.as_mut_slice(), process_id, service_id, epoch)?;
+    }
+    Ok(endpoint)
+}
+
+fn authorize_current_process_ipc_call(endpoint: u64) -> Result<(), i64> {
+    if endpoint == 0 {
+        return Err(LINUX_EINVAL);
+    }
+    let Some(process_id) = multitask::current_user_process_id() else {
+        return Err(LINUX_EINVAL);
+    };
+    let registry = SERVICE_ENDPOINT_REGISTRY_MUTATION.lock();
+    for index in 0..MAX_SERVICE_ENDPOINTS {
+        if SERVICE_ENDPOINTS[index].load(Ordering::Acquire) != endpoint {
+            continue;
+        }
+        let owner = SERVICE_ENDPOINT_OWNERS[index].load(Ordering::Acquire);
+        let epoch = SERVICE_ENDPOINT_EPOCHS[index].load(Ordering::Acquire);
+        if owner == 0 || epoch == 0 || multitask::is_user_process_exiting(owner) {
+            return Err(LINUX_ESRCH);
+        }
+        let granted = if owner == process_id {
+            true
+        } else {
+            let grants = SERVICE_CALL_GRANTS.lock();
+            has_service_call_grant(grants.as_slice(), process_id, index as u64, epoch)
+        };
+        if granted {
+            return Ok(());
+        }
+        return Err(LINUX_EACCES);
+    }
+    drop(registry);
+    validate_endpoint_publication_owner(endpoint, process_id).map_err(|_| LINUX_EACCES)
 }
 
 /// Called only while `SERVICE_ENDPOINT_REGISTRY_MUTATION` is held.
@@ -430,8 +672,11 @@ pub(super) fn syscall_linux_rustos_ipc_register_linux_syscall_endpoint(endpoint:
         process_id,
         endpoint
     );
-    let capability = match service_capability(linux_abi::IPC_SERVICE_LINUX_SYSCALLD) {
-        Ok(capability) => capability,
+    if let Err(errno) = validate_endpoint_publication_owner(endpoint, process_id) {
+        return linux_errno(errno);
+    }
+    let authorization = match service_capability(linux_abi::IPC_SERVICE_LINUX_SYSCALLD) {
+        Ok(authorization) => authorization,
         Err(errno) => {
             record_service_endpoint_milestone(
                 "ipc-service-register-denied",
@@ -453,8 +698,12 @@ pub(super) fn syscall_linux_rustos_ipc_register_linux_syscall_endpoint(endpoint:
         );
         return linux_errno(LINUX_ESRCH);
     }
+    if !service_authorization_is_current(authorization) {
+        drop(registry_mutation);
+        return linux_errno(LINUX_EAGAIN);
+    }
     SERVICE_ENDPOINT_CAPS[linux_abi::IPC_SERVICE_LINUX_SYSCALLD as usize]
-        .store(capability, Ordering::Release);
+        .store(authorization.capability, Ordering::Release);
     SERVICE_ENDPOINT_OWNERS[linux_abi::IPC_SERVICE_LINUX_SYSCALLD as usize]
         .store(process_id, Ordering::Release);
     if let Err(errno) =
@@ -476,7 +725,7 @@ pub(super) fn syscall_linux_rustos_ipc_register_linux_syscall_endpoint(endpoint:
         linux_abi::IPC_SERVICE_LINUX_SYSCALLD,
         endpoint,
         process_id,
-        capability
+        authorization.capability
     );
     record_service_endpoint_milestone(
         "ipc-service-register",
@@ -535,8 +784,11 @@ pub(super) fn syscall_linux_rustos_ipc_register_service_endpoint(
         ipc_trace!("ipc service revoked: service={}", service_id);
         return 0;
     }
-    let capability = match service_capability(service_id) {
-        Ok(capability) => capability,
+    if let Err(errno) = validate_endpoint_publication_owner(endpoint, process_id) {
+        return linux_errno(errno);
+    }
+    let authorization = match service_capability(service_id) {
+        Ok(authorization) => authorization,
         Err(errno) => {
             record_service_endpoint_milestone(
                 "ipc-service-register-denied",
@@ -568,14 +820,26 @@ pub(super) fn syscall_linux_rustos_ipc_register_service_endpoint(
         );
         return linux_errno(LINUX_EBUSY);
     }
-    SERVICE_ENDPOINT_CAPS[index].store(capability, Ordering::Release);
-    SERVICE_ENDPOINT_OWNERS[index].store(process_id, Ordering::Release);
+    if !service_authorization_is_current(authorization) {
+        drop(registry_mutation);
+        return linux_errno(LINUX_EAGAIN);
+    }
+    let sealed_rootd_owner = ROOTD_BOOTSTRAP_OWNER.load(Ordering::Acquire);
+    if service_id == linux_abi::IPC_SERVICE_ROOTD
+        && !rootd_bootstrap_owner_allows(sealed_rootd_owner, process_id)
+    {
+        drop(registry_mutation);
+        return linux_errno(LINUX_EPERM);
+    }
     if let Err(errno) = advance_service_endpoint_epoch(index) {
-        SERVICE_ENDPOINT_CAPS[index].store(0, Ordering::Release);
-        SERVICE_ENDPOINT_OWNERS[index].store(0, Ordering::Release);
         drop(registry_mutation);
         return linux_errno(errno);
     }
+    if service_id == linux_abi::IPC_SERVICE_ROOTD && sealed_rootd_owner == 0 {
+        ROOTD_BOOTSTRAP_OWNER.store(process_id, Ordering::Release);
+    }
+    SERVICE_ENDPOINT_CAPS[index].store(authorization.capability, Ordering::Release);
+    SERVICE_ENDPOINT_OWNERS[index].store(process_id, Ordering::Release);
     // Publish the endpoint last. Acquire readers that observe it also observe
     // the rootd-authorized owner and capability written above.
     SERVICE_ENDPOINTS[index].store(endpoint, Ordering::Release);
@@ -585,21 +849,26 @@ pub(super) fn syscall_linux_rustos_ipc_register_service_endpoint(
         service_id,
         endpoint,
         process_id,
-        capability
+        authorization.capability
     );
     record_service_endpoint_milestone("ipc-service-register", service_id, process_id, endpoint);
     wake_registered_service_endpoint_waiters(service_id, process_id);
     0
 }
 
-fn service_capability(service_id: u64) -> Result<u64, i64> {
-    match service_capability_via_rootd(service_id) {
-        Ok(capability) => Ok(capability),
-        Err(_) if service_id == linux_abi::IPC_SERVICE_ROOTD => {
-            Ok(rustos_user_abi::syscall::IPC_SERVICE_CAP_ROOT_SUPERVISOR)
-        }
-        Err(errno) => Err(errno),
+fn service_capability(service_id: u64) -> Result<ServiceCapabilityAuthorization, i64> {
+    if service_id == linux_abi::IPC_SERVICE_ROOTD {
+        return Ok(ServiceCapabilityAuthorization {
+            capability: rustos_user_abi::syscall::IPC_SERVICE_CAP_ROOT_SUPERVISOR,
+            rootd_epoch: None,
+        });
     }
+    let rootd_epoch = service_endpoint_epoch(linux_abi::IPC_SERVICE_ROOTD).ok_or(LINUX_ENOENT)?;
+    let capability = service_capability_via_rootd(service_id)?;
+    Ok(ServiceCapabilityAuthorization {
+        capability,
+        rootd_epoch: Some(rootd_epoch),
+    })
 }
 
 pub(super) fn validate_commercial_response_envelope(
@@ -651,13 +920,10 @@ pub(super) fn syscall_linux_rustos_ipc_lookup_service_endpoint(service_id: u64) 
             return linux_errno(errno);
         }
     }
-    let Some(raw) = service_endpoint_raw(service_id) else {
-        return linux_errno(LINUX_EINVAL);
-    };
-    if raw == 0 {
-        return linux_errno(LINUX_ENOSYS);
+    match grant_current_process_service_call(service_id, None, None) {
+        Ok(endpoint) => endpoint,
+        Err(errno) => linux_errno(errno),
     }
-    raw
 }
 
 pub(super) fn syscall_linux_rustos_ipc_wait_service_endpoint(args_ptr: u64) -> u64 {
@@ -698,6 +964,15 @@ pub(super) fn syscall_linux_rustos_ipc_wait_service_endpoint(args_ptr: u64) -> u
     loop {
         match service_endpoint_for_expected_process(args.service_id, args.expected_pid) {
             Ok(Some(endpoint)) => {
+                let endpoint = match grant_current_process_service_call(
+                    args.service_id,
+                    Some(endpoint),
+                    Some(args.expected_pid),
+                ) {
+                    Ok(endpoint) => endpoint,
+                    Err(LINUX_EAGAIN) => continue,
+                    Err(errno) => return linux_errno(errno),
+                };
                 remove_service_endpoint_waiter(task_id);
                 crate::arch::rtc::disarm_sleep_waiter(task_id);
                 return endpoint;
@@ -805,15 +1080,22 @@ fn authorize_service_lookup_via_rootd(service_id: u64) -> Result<(), i64> {
     }
     let response = read_unaligned::<CommercialMaxProtocolResponse>(response.as_slice());
     validate_commercial_response_envelope(&request, &response)?;
+    if response.status != 0 {
+        if response.descriptor_count != 0
+            || response.payload_len != 0
+            || response.value0 != 0
+            || response.value1 != 0
+        {
+            return Err(LINUX_EINVAL);
+        }
+        return Err(response.status.unsigned_abs() as i64);
+    }
     if response.descriptor_count != 0
         || response.payload_len != 0
         || response.value0 != service_id
         || response.value1 != 0
     {
         return Err(LINUX_EINVAL);
-    }
-    if response.status != 0 {
-        return Err(response.status.unsigned_abs() as i64);
     }
     Ok(())
 }
@@ -826,6 +1108,9 @@ pub(super) fn syscall_linux_rustos_ipc_call(
     reply_ptr: u64,
     reply_capacity: u64,
 ) -> u64 {
+    if let Err(errno) = authorize_current_process_ipc_call(endpoint) {
+        return linux_errno(errno);
+    }
     let endpoint = KernelEndpointHandle::from_raw(endpoint);
     ipc_trace!(
         "ipc call start: endpoint={} request_ptr={:#x} request_len={} reply_ptr={:#x} reply_capacity={}",
@@ -1268,6 +1553,9 @@ pub(super) fn syscall_linux_rustos_ipc_call_with_handles(args_ptr: u64) -> u64 {
     };
     if args.reserved0 != 0 {
         return linux_errno(LINUX_EINVAL);
+    }
+    if let Err(errno) = authorize_current_process_ipc_call(args.endpoint) {
+        return linux_errno(errno);
     }
 
     let start_ticks = crate::arch::rtc::ticks();
@@ -2137,11 +2425,11 @@ fn maybe_log_slow_ipc<F>(elapsed_ms: u64, log: F)
 where
     F: FnOnce(),
 {
-    let sample_index = SLOW_IPC_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    if sample_index >= MAX_SLOW_IPC_LOGS {
+    let sample_index = IPC_LOG_SAMPLE_COUNT.fetch_add(1, Ordering::Relaxed);
+    if sample_index >= EARLY_IPC_SAMPLE_COUNT && elapsed_ms < SLOW_IPC_THRESHOLD_MS {
         return;
     }
-    if sample_index >= EARLY_IPC_SAMPLE_COUNT && elapsed_ms < SLOW_IPC_THRESHOLD_MS {
+    if SLOW_IPC_LOG_COUNT.fetch_add(1, Ordering::Relaxed) >= MAX_SLOW_IPC_LOGS {
         return;
     }
     log();
@@ -2166,7 +2454,7 @@ fn log_slow_ipc_call(
         let send_ms = ticks_elapsed_ms(export_ticks, send_ticks);
         let wait_ms = ticks_elapsed_ms(send_ticks, wait_ticks);
         let write_ms = ticks_elapsed_ms(wait_ticks, write_ticks);
-        ipc_trace!(
+        debug::println_emergency(format_args!(
             "ipc slow {}: endpoint={} total_ms={} copy_ms={} export_ms={} send_ms={} wait_ms={} write_ms={} request_len={} response_len={}",
             kind,
             endpoint,
@@ -2178,7 +2466,7 @@ fn log_slow_ipc_call(
             write_ms,
             request_len,
             response_len,
-        );
+        ));
     });
 }
 
@@ -2194,15 +2482,10 @@ fn log_slow_ipc_reply(
     maybe_log_slow_ipc(total_ms, || {
         let copy_ms = ticks_elapsed_ms(start_ticks, copy_ticks);
         let reply_ms = ticks_elapsed_ms(copy_ticks, reply_ticks);
-        ipc_trace!(
+        debug::println_emergency(format_args!(
             "ipc slow {}: reply={} total_ms={} copy_ms={} reply_ms={} response_len={}",
-            kind,
-            reply,
-            total_ms,
-            copy_ms,
-            reply_ms,
-            response_len,
-        );
+            kind, reply, total_ms, copy_ms, reply_ms, response_len,
+        ));
     });
 }
 
@@ -2221,6 +2504,41 @@ mod tests {
         assert_eq!(next_service_endpoint_epoch(0), Some(1));
         assert_eq!(next_service_endpoint_epoch(1), Some(2));
         assert_eq!(next_service_endpoint_epoch(u64::MAX), None);
+    }
+
+    #[test]
+    fn root_service_publication_is_boot_owner_sealed_and_epoch_bound() {
+        assert!(rootd_bootstrap_owner_allows(0, 41));
+        assert!(rootd_bootstrap_owner_allows(41, 41));
+        assert!(!rootd_bootstrap_owner_allows(41, 42));
+        assert!(!rootd_bootstrap_owner_allows(0, 0));
+
+        assert!(rootd_authorization_epoch_matches(7, 101, 41, 7, false));
+        assert!(!rootd_authorization_epoch_matches(7, 101, 41, 8, false));
+        assert!(!rootd_authorization_epoch_matches(7, 0, 41, 7, false));
+        assert!(!rootd_authorization_epoch_matches(7, 101, 41, 7, true));
+    }
+
+    #[test]
+    fn service_call_grants_are_exact_epoch_bounded_and_revocable() {
+        let mut grants = [ServiceCallGrant::empty(); 2];
+        assert_eq!(record_service_call_grant(&mut grants, 41, 3, 7), Ok(()));
+        assert!(has_service_call_grant(&grants, 41, 3, 7));
+        assert!(!has_service_call_grant(&grants, 42, 3, 7));
+        assert!(!has_service_call_grant(&grants, 41, 3, 8));
+
+        assert_eq!(record_service_call_grant(&mut grants, 41, 3, 8), Ok(()));
+        assert!(!has_service_call_grant(&grants, 41, 3, 7));
+        assert!(has_service_call_grant(&grants, 41, 3, 8));
+
+        assert_eq!(record_service_call_grant(&mut grants, 42, 4, 9), Ok(()));
+        assert_eq!(
+            record_service_call_grant(&mut grants, 43, 5, 10),
+            Err(LINUX_ENOSPC)
+        );
+        clear_service_call_grants(&mut grants, 41);
+        assert!(!has_service_call_grant(&grants, 41, 3, 8));
+        assert!(has_service_call_grant(&grants, 42, 4, 9));
     }
 
     fn matching_commercial_response()

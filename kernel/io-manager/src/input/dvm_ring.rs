@@ -521,11 +521,12 @@ fn arm_input_ring_interrupt(device: crate::arch::pci::PciDevice) -> Result<(), u
     }
     capability.set_function_masked(device, true);
     capability.set_enabled(device, false);
-    let vector = crate::arch::msi::allocate_vector().ok_or(INSTALL_REJECTION_VECTOR_ALLOCATION)?;
-    if !crate::arch::msi::register_handler(vector, input_ring_interrupt) {
+    let mut vector_lease =
+        crate::arch::msi::MsiVectorLease::allocate().ok_or(INSTALL_REJECTION_VECTOR_ALLOCATION)?;
+    if !vector_lease.register_handler(input_ring_interrupt) {
         return Err(INSTALL_REJECTION_HANDLER_REGISTRATION);
     }
-    let message = crate::arch::msi::message_for(vector).ok_or(INSTALL_REJECTION_MESSAGE)?;
+    let message = vector_lease.message().ok_or(INSTALL_REJECTION_MESSAGE)?;
     let table = crate::driver::mmio::map(table_resource.start, table_len, false).cast::<u8>();
     if table.is_null() {
         return Err(INSTALL_REJECTION_TABLE_MAPPING);
@@ -541,6 +542,8 @@ fn arm_input_ring_interrupt(device: crate::arch::pci::PciDevice) -> Result<(), u
     fence(Ordering::SeqCst);
     capability.set_enabled(device, true);
     capability.set_function_masked(device, false);
+    crate::driver::mmio::unmap(table.cast());
+    vector_lease.commit();
     Ok(())
 }
 

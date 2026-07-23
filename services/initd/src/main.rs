@@ -15,14 +15,15 @@ use rustos_user_abi::syscall::{
     LoaderSpawnResponse, RustosIpcWaitServiceEndpointArgs, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
     COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR, COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_QUERY,
     COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM, COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL,
-    IPC_SERVICE_DEVMGRD, IPC_SERVICE_INPUTD, IPC_SERVICE_LINUX_SYSCALLD, IPC_SERVICE_LOADERD,
-    IPC_SERVICE_NETD, IPC_SERVICE_ROOTD, IPC_SERVICE_SESSIOND, IPC_SERVICE_STORAGED,
-    IPC_SERVICE_VFSD, IPC_WAIT_SERVICE_ENDPOINT_ABI_VERSION,
+    IPC_SERVICE_DEVMGRD, IPC_SERVICE_INITD, IPC_SERVICE_INPUTD, IPC_SERVICE_LINUX_SYSCALLD,
+    IPC_SERVICE_LOADERD, IPC_SERVICE_NETD, IPC_SERVICE_ROOTD, IPC_SERVICE_SESSIOND,
+    IPC_SERVICE_STORAGED, IPC_SERVICE_VFSD, IPC_WAIT_SERVICE_ENDPOINT_ABI_VERSION,
     IPC_WAIT_SERVICE_ENDPOINT_MAX_TIMEOUT_MS, LOADER_OP_ACTIVATE, LOADER_OP_SPAWN_EXEC,
     LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES, LOADER_SPAWN_ENV_BYTES,
     LOADER_SPAWN_EXEC_PATH_CAPACITY, LOADER_SPAWN_FLAG_DEFER_START, ROOTD_LEASE_STATE_EMPTY,
     ROOTD_LEASE_STATE_EXITED, ROOTD_LEASE_STATE_RUNNING, SYS_RUSTOS_IPC_CALL,
-    SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_WAIT_SERVICE_ENDPOINT,
+    SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
+    SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_WAIT_SERVICE_ENDPOINT,
     TASK_WEIGHT_INTERACTIVE_FLAG,
 };
 
@@ -80,6 +81,11 @@ struct RootdLeaseRecovery {
 
 fn main() {
     boot_line("initd: main enter");
+    if let Err(errno) = publish_init_identity() {
+        boot_line(format!("initd: identity publication failed errno={errno}").as_str());
+        std::process::exit(1);
+    }
+    boot_line("initd: identity endpoint registered");
     let load_started = Instant::now();
     boot_line("initd: load entries begin");
     let startup_entries = load_init_entries();
@@ -259,6 +265,33 @@ fn main() {
         }
         thread::sleep(POLL_INTERVAL);
     }
+}
+
+// ZERO_TRUST_IDENTITY_ONLY_ENDPOINT: this publication has no receive or call
+// surface. Its only consumer is the kernel's exact live-owner validator.
+/// Publish a request-less service endpoint solely as a restart-sensitive
+/// identity object. Privileged brokers validate its kernel-owned publication;
+/// no caller is granted a request path to this endpoint.
+fn publish_init_identity() -> Result<u64, i32> {
+    let endpoint = unsafe { libc::syscall(SYS_RUSTOS_IPC_ENDPOINT_CREATE as libc::c_long) as i64 };
+    if endpoint <= 0 {
+        return Err(if endpoint < 0 {
+            (-endpoint) as i32
+        } else {
+            libc::EIO
+        });
+    }
+    let registered = unsafe {
+        libc::syscall(
+            SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT as libc::c_long,
+            IPC_SERVICE_INITD,
+            endpoint as u64,
+        ) as i64
+    };
+    if registered < 0 {
+        return Err((-registered) as i32);
+    }
+    Ok(endpoint as u64)
 }
 
 fn secondary_service_deferred(exec: &str, now: Instant, deadline: Option<Instant>) -> bool {
@@ -926,6 +959,7 @@ fn activate_spawned_service(pid: i32) -> Result<(), i32> {
         version: LOADER_REQUEST_ABI_VERSION,
         op: LOADER_OP_ACTIVATE,
         target_pid: u64::try_from(pid).map_err(|_| libc::EINVAL)?,
+        requester_pid: u64::from(std::process::id()),
         ..LoaderSpawnRequest::default()
     };
     let endpoint = lookup_loader_endpoint()?;
@@ -979,6 +1013,7 @@ fn build_loader_spawn_request(
         exec_path_len: exec_bytes.len() as u32,
         argv_count: u16::try_from(argv.len()).map_err(|_| libc::E2BIG)?,
         env_count: u16::try_from(env.len()).map_err(|_| libc::E2BIG)?,
+        requester_pid: u64::from(std::process::id()),
         ..LoaderSpawnRequest::default()
     };
     request.exec_path[..exec_bytes.len()].copy_from_slice(exec_bytes);
@@ -1090,5 +1125,19 @@ mod tests {
             Err(libc::EPERM)
         );
         assert_eq!(classify_service_ready_status(0), Err(libc::EPROTO));
+    }
+
+    #[test]
+    fn init_identity_is_published_before_any_loader_request_and_is_marked_requestless() {
+        let source = include_str!("main.rs");
+        let publish = source
+            .find("publish_init_identity()")
+            .expect("initd identity publication");
+        let load = source
+            .find("load_init_entries()")
+            .expect("first startup load step");
+        assert!(publish < load);
+        assert!(source.contains("ZERO_TRUST_IDENTITY_ONLY_ENDPOINT"));
+        assert!(source.contains("SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT"));
     }
 }

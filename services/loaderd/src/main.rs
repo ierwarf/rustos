@@ -17,25 +17,26 @@ use rustos_image_admission::{
     validate_pe64_import_table, ByteAdmissionError,
 };
 use rustos_user_abi::syscall::{
-    CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
-    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, LoaderSpawnRequest,
-    LoaderSpawnResponse, RustosProcAbortBrokerArgs, RustosProcActivateBrokerArgs,
-    RustosProcMapDataBrokerArgs, RustosProcMapFileBatchBrokerArgs, RustosProcMapFileBatchEntry,
-    RustosProcMapZeroedBrokerArgs, RustosProcPrepareBrokerArgs,
-    RustosProcSetLinuxRuntimeBrokerArgs, RustosProcSetWindowsRuntimeBrokerArgs,
-    COMMERCIAL_MAX_LOADERD_OP_AUXV_PLAN, COMMERCIAL_MAX_LOADERD_OP_ELF_RUNTIME_PLAN,
-    COMMERCIAL_MAX_LOADERD_OP_IMAGE_PROBE, COMMERCIAL_MAX_LOADERD_OP_IMPORT_POLICY,
-    COMMERCIAL_MAX_LOADERD_OP_INTERPRETER_PLAN, COMMERCIAL_MAX_LOADERD_OP_MAP_PLAN,
-    COMMERCIAL_MAX_LOADERD_OP_PE_RUNTIME_PLAN, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
-    COMMERCIAL_MAX_PROTOCOL_LOADERD, IPC_SERVICE_LOADERD, LOADER_OP_ACTIVATE,
-    LOADER_OP_EXEC_TARGET, LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION,
+    loader_service_role_allows_operation, CommercialMaxCapabilityLeaseWire,
+    CommercialMaxProtocolDescriptorWire, CommercialMaxProtocolRequest,
+    CommercialMaxProtocolResponse, LoaderSpawnRequest, LoaderSpawnResponse,
+    RustosProcAbortBrokerArgs, RustosProcActivateBrokerArgs, RustosProcMapDataBrokerArgs,
+    RustosProcMapFileBatchBrokerArgs, RustosProcMapFileBatchEntry, RustosProcMapZeroedBrokerArgs,
+    RustosProcPrepareBrokerArgs, RustosProcSetLinuxRuntimeBrokerArgs,
+    RustosProcSetWindowsRuntimeBrokerArgs, COMMERCIAL_MAX_LOADERD_OP_AUXV_PLAN,
+    COMMERCIAL_MAX_LOADERD_OP_ELF_RUNTIME_PLAN, COMMERCIAL_MAX_LOADERD_OP_IMAGE_PROBE,
+    COMMERCIAL_MAX_LOADERD_OP_IMPORT_POLICY, COMMERCIAL_MAX_LOADERD_OP_INTERPRETER_PLAN,
+    COMMERCIAL_MAX_LOADERD_OP_MAP_PLAN, COMMERCIAL_MAX_LOADERD_OP_PE_RUNTIME_PLAN,
+    COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_LOADERD, IPC_SERVICE_INITD,
+    IPC_SERVICE_LOADERD, IPC_SERVICE_PROCD, IPC_SERVICE_ROOTD, IPC_SERVICE_SESSIOND,
+    LOADER_OP_ACTIVATE, LOADER_OP_EXEC_TARGET, LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION,
     LOADER_SPAWN_ARG_BYTES, LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_EXEC_PATH_CAPACITY,
     LOADER_SPAWN_MAX_ARG_COUNT, LOADER_SPAWN_MAX_ENV_COUNT, PROC_BROKER_ABI_VERSION,
     PROC_BROKER_BATCH_CAPACITY, PROC_BROKER_DATA_PAYLOAD_CAPACITY, PROC_BROKER_FORMAT_ELF64,
     PROC_BROKER_FORMAT_PE64, PROC_BROKER_LINUX_INTERP_PATH_CAPACITY, PROC_BROKER_MAP_EXEC,
     PROC_BROKER_MAP_PRIVATE, PROC_BROKER_MAP_READ, PROC_BROKER_MAP_WRITE,
     PROC_BROKER_USER_SPACE_BASE, PROC_BROKER_USER_SPACE_END_EXCLUSIVE, SYS_RUSTOS_DEBUG_PRINT,
-    SYS_RUSTOS_IPC_RECV, SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_PROC_ABORT_BROKER,
+    SYS_RUSTOS_IPC_RECV_WITH_SENDER, SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_PROC_ABORT_BROKER,
     SYS_RUSTOS_PROC_ACTIVATE_BROKER, SYS_RUSTOS_PROC_MAP_DATA_BROKER,
     SYS_RUSTOS_PROC_MAP_FILE_BATCH_BROKER, SYS_RUSTOS_PROC_MAP_ZEROED_BROKER,
     SYS_RUSTOS_PROC_PREPARE_BROKER, SYS_RUSTOS_PROC_SET_LINUX_RUNTIME_BROKER,
@@ -54,6 +55,7 @@ fn panic(_info: &PanicInfo<'_>) -> ! {
     loop {}
 }
 
+#[cfg(not(test))]
 #[no_mangle]
 pub extern "C" fn rust_eh_personality() {}
 
@@ -63,6 +65,7 @@ const SYS_PREAD64: u64 = 17;
 const SYS_CLOSE: u64 = 3;
 const AT_FDCWD: u64 = (-100_i64) as u64;
 const EINVAL: i32 = 22;
+const EACCES: i32 = 13;
 const ENOEXEC: i32 = 8;
 const EOVERFLOW: i32 = 75;
 const ELF_READ_CHUNK_BYTES: usize = 256 * 1024;
@@ -162,29 +165,33 @@ fn serve(endpoint: u64) {
     loop {
         let mut request = MaybeUninit::<LoaderdRecvBuffer>::uninit();
         let mut reply_cap = 0_u64;
-        let received = syscall4(
-            SYS_RUSTOS_IPC_RECV,
+        let mut sender_pid = 0_u64;
+        let mut sender_tid = 0_u64;
+        let received = syscall6(
+            SYS_RUSTOS_IPC_RECV_WITH_SENDER,
             endpoint,
             request.as_mut_ptr() as *mut u8 as u64,
             LOADERD_RECV_BYTES as u64,
             (&mut reply_cap as *mut u64) as u64,
+            (&mut sender_pid as *mut u64) as u64,
+            (&mut sender_tid as *mut u64) as u64,
         );
         if received < 0 {
             if !recv_error_reported {
                 debug_line("loaderd: recv failed");
                 recv_error_reported = true;
             }
-            cooperate_after_spawn_step();
+            yield_after_idle_receive();
             continue;
         }
         if received == 0 {
-            cooperate_after_spawn_step();
+            yield_after_idle_receive();
             continue;
         }
         let request = unsafe {
             core::slice::from_raw_parts(request.as_ptr() as *const u8, received as usize)
         };
-        let handled = handle_wire_request(received as usize, request);
+        let handled = handle_wire_request(received as usize, request, sender_pid, sender_tid);
         let reply = syscall3(
             SYS_RUSTOS_IPC_REPLY,
             reply_cap,
@@ -241,17 +248,24 @@ impl LoaderReply {
     }
 }
 
-fn handle_wire_request(received: usize, bytes: &[u8]) -> HandledLoaderRequest {
+fn handle_wire_request(
+    received: usize,
+    bytes: &[u8],
+    sender_pid: u64,
+    sender_tid: u64,
+) -> HandledLoaderRequest {
     if received == size_of::<CommercialMaxProtocolRequest>() {
         let request = unsafe { &*bytes.as_ptr().cast::<CommercialMaxProtocolRequest>() };
         return HandledLoaderRequest {
-            reply: LoaderReply::Commercial(handle_commercial_request(request)),
+            reply: LoaderReply::Commercial(handle_commercial_request(
+                request, sender_pid, sender_tid,
+            )),
             cleanup_fds: Vec::new(),
         };
     }
     if received == size_of::<LoaderSpawnRequest>() {
         let request = unsafe { &*bytes.as_ptr().cast::<LoaderSpawnRequest>() };
-        return handle_request(received, request);
+        return handle_request(received, request, sender_pid);
     }
     spawn_response(LoaderSpawnResponse {
         status: EINVAL,
@@ -266,7 +280,11 @@ fn spawn_response(response: LoaderSpawnResponse) -> HandledLoaderRequest {
     }
 }
 
-fn handle_request(received: usize, request: &LoaderSpawnRequest) -> HandledLoaderRequest {
+fn handle_request(
+    received: usize,
+    request: &LoaderSpawnRequest,
+    sender_pid: u64,
+) -> HandledLoaderRequest {
     let mut response = LoaderSpawnResponse {
         version: LOADER_REQUEST_ABI_VERSION,
         op: request.op,
@@ -274,7 +292,15 @@ fn handle_request(received: usize, request: &LoaderSpawnRequest) -> HandledLoade
         pid: -1,
         reserved0: 0,
     };
+    if !request.requester_is_exact_sender(sender_pid) {
+        response.status = EACCES;
+        return spawn_response(response);
+    }
     if let Err(errno) = validate_request(received, request) {
+        response.status = errno;
+        return spawn_response(response);
+    }
+    if let Err(errno) = authorize_loader_operation(request.op, sender_pid) {
         response.status = errno;
         return spawn_response(response);
     }
@@ -282,6 +308,7 @@ fn handle_request(received: usize, request: &LoaderSpawnRequest) -> HandledLoade
         let args = RustosProcActivateBrokerArgs {
             abi_version: PROC_BROKER_ABI_VERSION,
             target_pid: request.target_pid,
+            requester_pid: request.requester_pid,
             ..RustosProcActivateBrokerArgs::default()
         };
         let status = syscall1(
@@ -406,7 +433,6 @@ fn handle_request(received: usize, request: &LoaderSpawnRequest) -> HandledLoade
         }
     };
     debug_line(&format!("loaderd: map done exec={exec_path}"));
-    cooperate_after_spawn_step();
     if let Some(ref result) = prepared.linux_runtime {
         if let Err(errno) = set_linux_runtime_broker(prepare_handle as u64, result) {
             debug_line("loaderd: linux runtime broker failed");
@@ -415,7 +441,6 @@ fn handle_request(received: usize, request: &LoaderSpawnRequest) -> HandledLoade
             response.status = errno;
             return spawn_response(response);
         }
-        cooperate_after_spawn_step();
     }
     if let Some(runtime) = prepared.windows_runtime {
         let status = syscall1(
@@ -430,10 +455,8 @@ fn handle_request(received: usize, request: &LoaderSpawnRequest) -> HandledLoade
             response.status = errno;
             return spawn_response(response);
         }
-        cooperate_after_spawn_step();
     }
 
-    cooperate_after_spawn_step();
     debug_line(&format!("loaderd: commit begin exec={exec_path}"));
     let pid = commit_prepared_executable(
         operation,
@@ -463,20 +486,54 @@ fn handle_request(received: usize, request: &LoaderSpawnRequest) -> HandledLoade
     }
 }
 
-fn cooperate_after_spawn_step() {
+fn authorize_loader_operation(op: u16, sender_pid: u64) -> Result<(), i32> {
+    if sender_pid == 0 {
+        return Err(EACCES);
+    }
+    if op == LOADER_OP_ACTIVATE {
+        return Ok(());
+    }
+    for service_id in [
+        IPC_SERVICE_ROOTD,
+        IPC_SERVICE_INITD,
+        IPC_SERVICE_SESSIOND,
+        IPC_SERVICE_PROCD,
+    ] {
+        if loader_service_role_allows_operation(op, service_id)
+            && rustos_svc_runtime::ipc::validate_service_owner(service_id, sender_pid) >= 0
+        {
+            return Ok(());
+        }
+    }
+    Err(EACCES)
+}
+
+fn yield_after_idle_receive() {
     let _ = syscall0(SYS_SCHED_YIELD);
 }
 
 fn handle_commercial_request(
     request: &CommercialMaxProtocolRequest,
+    sender_pid: u64,
+    sender_tid: u64,
 ) -> CommercialMaxProtocolResponse {
     let mut response = CommercialMaxProtocolResponse {
         header: request.header,
         ..CommercialMaxProtocolResponse::default()
     };
     response.header.version = COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
+    if !request.subject_is_exact_sender(sender_pid, sender_tid) {
+        response.status = EACCES;
+        return response;
+    }
     if let Err(errno) = validate_commercial_request(request) {
         response.status = errno;
+        return response;
+    }
+    if request.header.op == COMMERCIAL_MAX_LOADERD_OP_IMAGE_PROBE
+        && !sender_owns_any_loader_role(sender_pid)
+    {
+        response.status = EACCES;
         return response;
     }
     match request.header.op {
@@ -614,10 +671,9 @@ fn set_linux_runtime_broker(prepare_handle: u64, result: &ElfMapResult) -> Resul
     (status >= 0).then_some(()).ok_or((-status) as i32)
 }
 
-// 256 KiB per read amortizes the per-syscall IPC round-trip to vfsd and the
-// underlying ahci read. The previous 4 KiB chunks turned a single libc load
-// into ~500 individual storage commands, each of which paid the kernel/vfsd
-// crossing and AHCI completion latency.
+// Large bounded reads amortize the per-syscall IPC round-trip to vfsd and the
+// generation-bound DVM block transport. Small fixed-page chunks would turn one
+// image load into hundreds of cross-service storage commands.
 
 struct ElfMapResult {
     load_bias: u64,
@@ -676,7 +732,7 @@ fn map_executable_segments(
 fn validate_request(received: usize, request: &LoaderSpawnRequest) -> Result<(), i32> {
     if received != size_of::<LoaderSpawnRequest>()
         || request.version != LOADER_REQUEST_ABI_VERSION
-        || request.reserved0 != 0
+        || request.requester_pid == 0
         || request.argv_count as usize > LOADER_SPAWN_MAX_ARG_COUNT
         || request.env_count as usize > LOADER_SPAWN_MAX_ENV_COUNT
         || request.argv_bytes_len as usize > LOADER_SPAWN_ARG_BYTES
@@ -725,15 +781,53 @@ fn validate_commercial_request(request: &CommercialMaxProtocolRequest) -> Result
         return Err(EINVAL);
     }
     match request.header.op {
-        COMMERCIAL_MAX_LOADERD_OP_IMAGE_PROBE
-        | COMMERCIAL_MAX_LOADERD_OP_ELF_RUNTIME_PLAN
+        COMMERCIAL_MAX_LOADERD_OP_IMAGE_PROBE => {
+            if request.path_len == 0
+                || request.payload_len != 0
+                || request.arg0 != 0
+                || request.arg1 != 0
+                || request.arg2 != 0
+                || request.arg3 != 0
+            {
+                Err(EINVAL)
+            } else {
+                Ok(())
+            }
+        }
+        COMMERCIAL_MAX_LOADERD_OP_ELF_RUNTIME_PLAN
         | COMMERCIAL_MAX_LOADERD_OP_PE_RUNTIME_PLAN
         | COMMERCIAL_MAX_LOADERD_OP_INTERPRETER_PLAN
         | COMMERCIAL_MAX_LOADERD_OP_IMPORT_POLICY
         | COMMERCIAL_MAX_LOADERD_OP_MAP_PLAN
-        | COMMERCIAL_MAX_LOADERD_OP_AUXV_PLAN => Ok(()),
+        | COMMERCIAL_MAX_LOADERD_OP_AUXV_PLAN => {
+            if request.path_len != 0
+                || request.payload_len != 0
+                || request.arg0 != 0
+                || request.arg1 != 0
+                || request.arg2 != 0
+                || request.arg3 != 0
+            {
+                Err(EINVAL)
+            } else {
+                Ok(())
+            }
+        }
         _ => Err(EINVAL),
     }
+}
+
+fn sender_owns_any_loader_role(sender_pid: u64) -> bool {
+    sender_pid != 0
+        && [
+            IPC_SERVICE_ROOTD,
+            IPC_SERVICE_INITD,
+            IPC_SERVICE_SESSIOND,
+            IPC_SERVICE_PROCD,
+        ]
+        .into_iter()
+        .any(|service_id| {
+            rustos_svc_runtime::ipc::validate_service_owner(service_id, sender_pid) >= 0
+        })
 }
 
 fn commercial_request_path(request: &CommercialMaxProtocolRequest) -> Result<&str, i32> {
@@ -2929,6 +3023,10 @@ fn syscall3(number: u64, arg0: u64, arg1: u64, arg2: u64) -> i64 {
 
 fn syscall4(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> i64 {
     unsafe { rustos_svc_runtime::syscall::syscall4(number, arg0, arg1, arg2, arg3) }
+}
+
+fn syscall6(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i64 {
+    unsafe { rustos_svc_runtime::syscall::syscall6(number, arg0, arg1, arg2, arg3, arg4, arg5) }
 }
 
 fn debug_line(message: &str) {

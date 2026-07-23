@@ -119,6 +119,7 @@ pub(super) fn spawn_tracked_process(
             exec: entry.exec,
             session_handle: inserted_session_handle,
             restart: entry.restart,
+            logical_admin: entry.logical_admin,
         },
     );
 
@@ -379,6 +380,7 @@ fn build_loader_spawn_request(
         exec_path_len: exec_bytes.len() as u32,
         argv_count: u16::try_from(argv.len()).map_err(|_| libc::E2BIG)?,
         env_count: u16::try_from(env.len()).map_err(|_| libc::E2BIG)?,
+        requester_pid: u64::from(std::process::id()),
         ..LoaderSpawnRequest::default()
     };
     request.exec_path[..exec_bytes.len()].copy_from_slice(exec_bytes);
@@ -393,6 +395,7 @@ fn activate_spawned_process(pid: i32) -> Result<(), i32> {
         version: LOADER_REQUEST_ABI_VERSION,
         op: LOADER_OP_ACTIVATE,
         target_pid: u64::try_from(pid).map_err(|_| libc::EINVAL)?,
+        requester_pid: u64::from(std::process::id()),
         ..LoaderSpawnRequest::default()
     };
     let endpoint = lookup_loader_endpoint()?;

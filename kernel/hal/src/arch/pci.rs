@@ -366,16 +366,18 @@ impl PciDevice {
         let original_low = self.read_u32(bar_offset);
         self.write_u32(bar_offset, u32::MAX);
         let mask_low = self.read_u32(bar_offset);
-        let format_low = original_low | mask_low;
+        // Restore the low half before touching the high half. Linux sizes the
+        // standard BAR dwords independently while decode is disabled; leaving
+        // all ones in the low half while probing a 64-bit partner can make a
+        // virtual device expose a transient, nonsensical upper mask.
+        self.write_u32(bar_offset, original_low);
 
-        if (format_low & PCI_BAR_IO_SPACE) != 0 {
-            self.write_u32(bar_offset, original_low);
+        if (original_low & PCI_BAR_IO_SPACE) != 0 {
             return decode_io_resource(original_low, mask_low);
         }
 
-        let is_64bit = (format_low & PCI_BAR_MEM_TYPE_MASK) == PCI_BAR_MEM_TYPE_64;
+        let is_64bit = (original_low & PCI_BAR_MEM_TYPE_MASK) == PCI_BAR_MEM_TYPE_64;
         if is_64bit && bar_index + 1 >= self.standard_bar_count() {
-            self.write_u32(bar_offset, original_low);
             return None;
         }
 
@@ -395,7 +397,6 @@ impl PciDevice {
         if is_64bit {
             self.write_u32(bar_offset + 4, original_high);
         }
-        self.write_u32(bar_offset, original_low);
 
         decode_mem_resource(original_low, original_high, mask_low, mask_high, is_64bit)
     }
@@ -500,14 +501,7 @@ fn decode_mem_resource(
     is_64bit: bool,
 ) -> Option<PciResource> {
     let low_mask = (mask_low & PCI_BAR_MEM_ADDRESS_MASK) as u64;
-    let mut high_mask = if is_64bit { mask_high as u64 } else { 0 };
-
-    // Some firmware/QEMU combinations report an all-zero upper size probe for 64-bit BARs
-    // even when the assigned BAR lives above 4GiB. Treat that as "all upper address bits are
-    // implemented" so the computed size is driven by the meaningful low dword mask.
-    if is_64bit && high_mask == 0 && original_high != 0 && low_mask != 0 {
-        high_mask = u32::MAX as u64;
-    }
+    let high_mask = if is_64bit { mask_high as u64 } else { 0 };
 
     let mask = if is_64bit {
         (high_mask << 32) | low_mask
@@ -518,11 +512,11 @@ fn decode_mem_resource(
         return None;
     }
 
-    let size = if is_64bit {
-        (!mask).wrapping_add(1)
-    } else {
-        ((!mask & 0xffff_ffff).wrapping_add(1)) & 0xffff_ffff
-    };
+    // The least significant implemented address bit is the BAR alignment and
+    // therefore its size. This remains correct when a 64-bit BAR implements
+    // fewer than 64 address bits and legitimately returns zero in upper mask
+    // bits; two's-complement inversion incorrectly turns that into a huge BAR.
+    let size = mask & mask.wrapping_neg();
     if size == 0 {
         return None;
     }
@@ -544,12 +538,41 @@ fn decode_mem_resource(
 
 #[cfg(test)]
 mod tests {
-    use super::{PCI_MSIX_TABLE_BIR_MASK, PCI_MSIX_TABLE_OFFSET_MASK};
+    use super::{
+        PCI_BAR_MEM_TYPE_64, PCI_MSIX_TABLE_BIR_MASK, PCI_MSIX_TABLE_OFFSET_MASK,
+        decode_mem_resource,
+    };
 
     #[test]
     fn msix_table_word_preserves_bar_and_page_aligned_offset() {
         let word = 0x0012_3003_u32;
         assert_eq!(word & PCI_MSIX_TABLE_BIR_MASK, 3);
         assert_eq!(word & PCI_MSIX_TABLE_OFFSET_MASK, 0x0012_3000);
+    }
+
+    #[test]
+    fn mem64_bar_size_uses_the_lowest_implemented_mask_bit() {
+        let low_only = decode_mem_resource(
+            0x8000_0000 | PCI_BAR_MEM_TYPE_64,
+            0,
+            0xff80_0000 | PCI_BAR_MEM_TYPE_64,
+            0,
+            true,
+        )
+        .unwrap();
+        assert_eq!(low_only.start, 0x8000_0000);
+        assert_eq!(low_only.size, 8 * 1024 * 1024);
+        assert!(low_only.is_64bit);
+
+        let full_width = decode_mem_resource(
+            PCI_BAR_MEM_TYPE_64,
+            1,
+            0xff80_0000 | PCI_BAR_MEM_TYPE_64,
+            u32::MAX,
+            true,
+        )
+        .unwrap();
+        assert_eq!(full_width.start, 1_u64 << 32);
+        assert_eq!(full_width.size, 8 * 1024 * 1024);
     }
 }

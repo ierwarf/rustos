@@ -24,31 +24,32 @@ use rustos_user_abi::syscall::{
     CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
     CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, CoreServiceLeaseWire,
     LifecycleDrainBrokerArgs, LifecycleEventWire, LoaderSpawnRequest, LoaderSpawnResponse,
-    RustosRootdTerminateBrokerArgs, ServiceCheckpointRecordWire,
-    COMMERCIAL_MAX_CAPABILITY_OP_LEASE_GRANT, COMMERCIAL_MAX_CAPABILITY_OP_LEASE_RENEW,
-    COMMERCIAL_MAX_CAPABILITY_OP_LEASE_REVOKE, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
-    COMMERCIAL_MAX_PROTOCOL_CAPABILITY, COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS,
-    COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR, COMMERCIAL_MAX_ROOTD_OP_BOOTSTRAP_MANIFEST,
-    COMMERCIAL_MAX_ROOTD_OP_CORE_SERVICE_LEASE, COMMERCIAL_MAX_ROOTD_OP_DEPENDENCY_GRAPH,
-    COMMERCIAL_MAX_ROOTD_OP_LOADER_WORKER_COMPLETE, COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_QUERY,
-    COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM, COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL,
-    COMMERCIAL_MAX_ROOTD_OP_RESTART_POLICY, COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY,
-    COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_COMPACT,
+    RustosProcValidateDeferredSpawnBrokerArgs, RustosRootdTerminateBrokerArgs,
+    ServiceCheckpointRecordWire, COMMERCIAL_MAX_CAPABILITY_OP_LEASE_GRANT,
+    COMMERCIAL_MAX_CAPABILITY_OP_LEASE_RENEW, COMMERCIAL_MAX_CAPABILITY_OP_LEASE_REVOKE,
+    COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_CAPABILITY,
+    COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS, COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR,
+    COMMERCIAL_MAX_ROOTD_OP_BOOTSTRAP_MANIFEST, COMMERCIAL_MAX_ROOTD_OP_CORE_SERVICE_LEASE,
+    COMMERCIAL_MAX_ROOTD_OP_DEPENDENCY_GRAPH, COMMERCIAL_MAX_ROOTD_OP_LOADER_WORKER_COMPLETE,
+    COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_QUERY, COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM,
+    COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL, COMMERCIAL_MAX_ROOTD_OP_RESTART_POLICY,
+    COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY, COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_COMPACT,
     COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE,
     COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_SCAN, COMMERCIAL_MAX_ROOTD_OP_SERVICE_LOOKUP,
-    IPC_SERVICE_DEVMGRD, IPC_SERVICE_INPUTD, IPC_SERVICE_LINUX_SYSCALLD, IPC_SERVICE_LOADERD,
-    IPC_SERVICE_NETD, IPC_SERVICE_PAGERD, IPC_SERVICE_PROCD, IPC_SERVICE_ROOTD,
-    IPC_SERVICE_SESSIOND, IPC_SERVICE_STORAGED, IPC_SERVICE_UISERVER, IPC_SERVICE_VFSD,
-    LIFECYCLE_DRAIN_MAX_EVENTS, LIFECYCLE_EVENT_EXIT, LOADER_OP_ACTIVATE, LOADER_OP_SPAWN_EXEC,
-    LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES, LOADER_SPAWN_ENV_BYTES,
-    LOADER_SPAWN_EXEC_PATH_CAPACITY, LOADER_SPAWN_FLAG_DEFER_START, ROOTD_LEASE_STATE_EXITED,
-    ROOTD_LEASE_STATE_FAILED, ROOTD_LEASE_STATE_RESTART_PENDING, ROOTD_LEASE_STATE_RUNNING,
-    SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
-    SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_RECV_WITH_SENDER,
-    SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
-    SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER, SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER,
-    SYS_RUSTOS_ROOTD_TERMINATE_BROKER, SYS_RUSTOS_ROOTD_WAIT_BROKER, SYS_RUSTOS_SPAWN_EXEC,
-    TASK_WEIGHT_INTERACTIVE_FLAG,
+    IPC_SERVICE_DEVMGRD, IPC_SERVICE_INITD, IPC_SERVICE_INPUTD, IPC_SERVICE_LINUX_SYSCALLD,
+    IPC_SERVICE_LOADERD, IPC_SERVICE_NETD, IPC_SERVICE_PAGERD, IPC_SERVICE_PROCD,
+    IPC_SERVICE_ROOTD, IPC_SERVICE_SESSIOND, IPC_SERVICE_STORAGED, IPC_SERVICE_UISERVER,
+    IPC_SERVICE_VFSD, LIFECYCLE_DRAIN_BROKER_ABI_VERSION, LIFECYCLE_DRAIN_MAX_EVENTS,
+    LIFECYCLE_EVENT_EXIT, LOADER_OP_ACTIVATE, LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION,
+    LOADER_SPAWN_ARG_BYTES, LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_EXEC_PATH_CAPACITY,
+    LOADER_SPAWN_FLAG_DEFER_START, ROOTD_LEASE_STATE_EXITED, ROOTD_LEASE_STATE_FAILED,
+    ROOTD_LEASE_STATE_RESTART_PENDING, ROOTD_LEASE_STATE_RUNNING,
+    ROOTD_TERMINATE_BROKER_ABI_VERSION, SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_IPC_CALL,
+    SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
+    SYS_RUSTOS_IPC_RECV_WITH_SENDER, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT,
+    SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER, SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER,
+    SYS_RUSTOS_PROC_VALIDATE_DEFERRED_SPAWN_BROKER, SYS_RUSTOS_ROOTD_TERMINATE_BROKER,
+    SYS_RUSTOS_ROOTD_WAIT_BROKER, SYS_RUSTOS_SPAWN_EXEC, TASK_WEIGHT_INTERACTIVE_FLAG,
 };
 use service_checkpoint::ServiceCheckpointStore;
 
@@ -88,7 +89,7 @@ const INPUTD_EXEC: &[u8] = b"services/inputd/inputd.elf\0";
 const STORAGED_EXEC: &[u8] = b"services/storaged/storaged.elf\0";
 const RUNTIMED_EXEC: &[u8] = b"services/runtimed/runtimed.elf\0";
 const UISERVER_EXEC: &[u8] = b"services/uiserver/uiserver.elf\0";
-const INITD_LEASE_ID: u64 = 0;
+const INITD_LEASE_ID: u64 = IPC_SERVICE_INITD;
 const INITD_LEASE_INDEX: usize = 4;
 const DEP_SYSCALLD: u16 = 1 << 0;
 const DEP_VFSD: u16 = 1 << 1;
@@ -604,7 +605,7 @@ fn drain_lifecycle_events(leases: &mut [Lease], post_init_leases: &mut [PostInit
     let mut events = [LifecycleEventWire::default(); LIFECYCLE_DRAIN_MAX_EVENTS];
     let mut count = 0_u32;
     let args = LifecycleDrainBrokerArgs {
-        abi_version: 1,
+        abi_version: LIFECYCLE_DRAIN_BROKER_ABI_VERSION,
         reserved0: 0,
         reserved1: 0,
         out_events_ptr: events.as_mut_ptr() as u64,
@@ -849,12 +850,16 @@ fn validate_commercial_max_request(
     if !request.has_valid_envelope() {
         return Err(22);
     }
+    validate_sender_subject(request, sender)?;
     match request.header.protocol {
         COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR => match request.header.op {
             COMMERCIAL_MAX_ROOTD_OP_BOOTSTRAP_MANIFEST
-            | COMMERCIAL_MAX_ROOTD_OP_CORE_SERVICE_LEASE
-            | COMMERCIAL_MAX_ROOTD_OP_DEPENDENCY_GRAPH
-            | COMMERCIAL_MAX_ROOTD_OP_RESTART_POLICY => Ok(()),
+            | COMMERCIAL_MAX_ROOTD_OP_DEPENDENCY_GRAPH => {
+                validate_empty_request_body(request, false)
+            }
+            COMMERCIAL_MAX_ROOTD_OP_CORE_SERVICE_LEASE | COMMERCIAL_MAX_ROOTD_OP_RESTART_POLICY => {
+                validate_empty_request_body(request, true)
+            }
             COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL
             | COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY
             | COMMERCIAL_MAX_ROOTD_OP_SERVICE_LOOKUP
@@ -863,18 +868,44 @@ fn validate_commercial_max_request(
             | COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE
             | COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_COMPACT
             | COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_SCAN
-            | COMMERCIAL_MAX_ROOTD_OP_LOADER_WORKER_COMPLETE => {
-                validate_sender_subject(request, sender)
-            }
+            | COMMERCIAL_MAX_ROOTD_OP_LOADER_WORKER_COMPLETE => Ok(()),
             _ => Err(22),
         },
         COMMERCIAL_MAX_PROTOCOL_CAPABILITY => match request.header.op {
             COMMERCIAL_MAX_CAPABILITY_OP_LEASE_GRANT
             | COMMERCIAL_MAX_CAPABILITY_OP_LEASE_REVOKE
-            | COMMERCIAL_MAX_CAPABILITY_OP_LEASE_RENEW => Ok(()),
+            | COMMERCIAL_MAX_CAPABILITY_OP_LEASE_RENEW => {
+                if request.path_len != 0
+                    || request.payload_len != 0
+                    || request.arg2 != 0
+                    || request.arg3 != 0
+                    || request.arg0 == 0 && request.arg1 != 0
+                {
+                    Err(22)
+                } else {
+                    Ok(())
+                }
+            }
             _ => Err(22),
         },
         _ => Err(22),
+    }
+}
+
+fn validate_empty_request_body(
+    request: &CommercialMaxProtocolRequest,
+    allow_arg0: bool,
+) -> Result<(), i32> {
+    if request.path_len != 0
+        || request.payload_len != 0
+        || (!allow_arg0 && request.arg0 != 0)
+        || request.arg1 != 0
+        || request.arg2 != 0
+        || request.arg3 != 0
+    {
+        Err(22)
+    } else {
+        Ok(())
     }
 }
 
@@ -1297,7 +1328,7 @@ fn service_policy_capability(service_id: u64) -> u64 {
         IPC_SERVICE_SESSIOND => rustos_user_abi::syscall::IPC_SERVICE_CAP_SESSION_POLICY,
         IPC_SERVICE_PAGERD => rustos_user_abi::syscall::IPC_SERVICE_CAP_PAGER_POLICY,
         IPC_SERVICE_UISERVER => rustos_user_abi::syscall::IPC_SERVICE_CAP_UI_POLICY,
-        INITD_LEASE_ID => rustos_user_abi::syscall::IPC_SERVICE_CAP_ROOT_SUPERVISOR,
+        INITD_LEASE_ID => rustos_user_abi::syscall::IPC_SERVICE_CAP_INIT_POLICY,
         _ => 0,
     }
 }
@@ -1307,7 +1338,14 @@ fn service_capability_for_subject(
     post_init_leases: &mut [PostInitLease],
     request: &CommercialMaxProtocolRequest,
 ) -> Result<u64, i32> {
-    if request.arg0 == 0 || request.header.subject_pid == 0 || request.header.subject_tid == 0 {
+    if request.arg0 == 0
+        || request.arg2 != 0
+        || request.arg3 != 0
+        || request.path_len != 0
+        || request.payload_len != 0
+        || request.header.subject_pid == 0
+        || request.header.subject_tid == 0
+    {
         return Err(22);
     }
     if let Some(capability) = post_init_reported_service_capability(
@@ -1343,7 +1381,53 @@ fn register_post_init_service_lease(
     request: &CommercialMaxProtocolRequest,
     sender: IpcSenderIdentity,
 ) -> Result<(), i32> {
-    if request.arg0 == 0 || request.arg1 == 0 {
+    validate_deferred_spawn_provenance(request.arg1, sender.pid)?;
+    debug_line(b"rootd: post-init deferred-spawn provenance verified\n");
+    register_post_init_service_lease_with_provenance(
+        leases,
+        post_init_leases,
+        request,
+        sender,
+        true,
+    )
+}
+
+fn validate_deferred_spawn_provenance(target_pid: u64, requester_pid: u64) -> Result<(), i32> {
+    let args = RustosProcValidateDeferredSpawnBrokerArgs {
+        abi_version: rustos_user_abi::syscall::PROC_BROKER_ABI_VERSION,
+        target_pid,
+        requester_pid,
+        ..RustosProcValidateDeferredSpawnBrokerArgs::default()
+    };
+    let status = syscall1(
+        SYS_RUSTOS_PROC_VALIDATE_DEFERRED_SPAWN_BROKER,
+        (&args as *const RustosProcValidateDeferredSpawnBrokerArgs) as u64,
+    );
+    if status < 0 {
+        Err((-status) as i32)
+    } else if status == 0 {
+        Ok(())
+    } else {
+        Err(5)
+    }
+}
+
+fn register_post_init_service_lease_with_provenance(
+    leases: &[Lease],
+    post_init_leases: &mut [PostInitLease],
+    request: &CommercialMaxProtocolRequest,
+    sender: IpcSenderIdentity,
+    provenance_proven: bool,
+) -> Result<(), i32> {
+    if !provenance_proven {
+        return Err(13);
+    }
+    if request.arg0 == 0
+        || request.arg1 == 0
+        || request.arg2 != 0
+        || request.arg3 != 0
+        || request.payload_len != 0
+    {
         return Err(22);
     }
     authorize_post_init_lease_reporter(leases, post_init_leases, request.arg0, sender)?;
@@ -1353,15 +1437,13 @@ fn register_post_init_service_lease(
     else {
         return Err(22);
     };
-    if !request.path.is_empty() && request.path_len as usize > request.path.len() {
+    if request.path_len == 0 || request.path_len as usize > request.path.len() {
         return Err(22);
     }
-    if request.path_len != 0 {
-        let path_len = request.path_len as usize;
-        let expected = trim_nul(lease.exec_path);
-        if path_len != expected.len() || &request.path[..path_len] != expected {
-            return Err(13);
-        }
+    let path_len = request.path_len as usize;
+    let expected = trim_nul(lease.exec_path);
+    if path_len != expected.len() || &request.path[..path_len] != expected {
+        return Err(13);
     }
     if lease.state == ROOTD_LEASE_STATE_RUNNING {
         if lease.pid == request.arg1 {
@@ -1385,7 +1467,13 @@ fn query_post_init_lease<'a>(
     request: &CommercialMaxProtocolRequest,
     sender: IpcSenderIdentity,
 ) -> Result<&'a PostInitLease, i32> {
-    if request.arg0 == 0 || request.arg1 != 0 || request.path_len != 0 || request.payload_len != 0 {
+    if request.arg0 == 0
+        || request.arg1 != 0
+        || request.arg2 != 0
+        || request.arg3 != 0
+        || request.path_len != 0
+        || request.payload_len != 0
+    {
         return Err(22);
     }
     authorize_current_initd(leases, sender)?;
@@ -1404,7 +1492,13 @@ fn reclaim_post_init_lease(
     request: &CommercialMaxProtocolRequest,
     sender: IpcSenderIdentity,
 ) -> Result<(), i32> {
-    if request.arg0 == 0 || request.arg1 == 0 || request.path_len != 0 || request.payload_len != 0 {
+    if request.arg0 == 0
+        || request.arg1 == 0
+        || request.arg2 != 0
+        || request.arg3 != 0
+        || request.path_len != 0
+        || request.payload_len != 0
+    {
         return Err(22);
     }
     authorize_current_initd(leases, sender)?;
@@ -1453,7 +1547,7 @@ fn terminate_service_process(pid: u64) -> Result<(), i32> {
         return Err(22);
     }
     let args = RustosRootdTerminateBrokerArgs {
-        abi_version: 1,
+        abi_version: ROOTD_TERMINATE_BROKER_ABI_VERSION,
         target_pid: pid,
         ..RustosRootdTerminateBrokerArgs::default()
     };
@@ -1566,7 +1660,15 @@ fn authorize_service_lookup_for_subject(
     post_init_leases: &[PostInitLease],
     request: &CommercialMaxProtocolRequest,
 ) -> Result<(), i32> {
-    if request.arg0 == 0 || request.header.subject_pid == 0 || request.header.subject_tid == 0 {
+    if request.arg0 == 0
+        || request.arg1 != 0
+        || request.arg2 != 0
+        || request.arg3 != 0
+        || request.path_len != 0
+        || request.payload_len != 0
+        || request.header.subject_pid == 0
+        || request.header.subject_tid == 0
+    {
         return Err(22);
     }
     if service_policy_capability(request.arg0) == 0 {
@@ -1639,7 +1741,7 @@ fn service_dependency_allowed(subject: u64, target: u64) -> bool {
                 | IPC_SERVICE_STORAGED
                 | IPC_SERVICE_SESSIOND
         ),
-        IPC_SERVICE_VFSD => target == IPC_SERVICE_DEVMGRD,
+        IPC_SERVICE_VFSD => matches!(target, IPC_SERVICE_DEVMGRD | IPC_SERVICE_STORAGED),
         IPC_SERVICE_PROCD => target == IPC_SERVICE_LOADERD,
         IPC_SERVICE_SESSIOND => matches!(
             target,
@@ -2070,6 +2172,11 @@ fn spawn_exec_via_loaderd_blocking(path: &'static [u8], weight_micros: u64) -> R
     *request = empty_loader_spawn_request();
     request.version = LOADER_REQUEST_ABI_VERSION;
     request.op = LOADER_OP_SPAWN_EXEC;
+    let requester_pid = syscall0(SYS_GETPID);
+    if requester_pid <= 0 {
+        return Err(22);
+    }
+    request.requester_pid = requester_pid as u64;
     request.flags = SPAWN_FLAG_LOGICAL_ADMIN as u32 | LOADER_SPAWN_FLAG_DEFER_START;
     request.weight_micros = weight_micros;
     request.exec_path_len = path.len() as u32;
@@ -2116,6 +2223,11 @@ fn activate_exec_via_loaderd(pid: u64) -> Result<(), i64> {
     *request = empty_loader_spawn_request();
     request.version = LOADER_REQUEST_ABI_VERSION;
     request.op = LOADER_OP_ACTIVATE;
+    let requester_pid = syscall0(SYS_GETPID);
+    if requester_pid <= 0 {
+        return Err(22);
+    }
+    request.requester_pid = requester_pid as u64;
     request.target_pid = pid;
 
     let response = unsafe { &mut *INITD_LOADER_RESPONSE.0.get() };
@@ -2159,7 +2271,7 @@ const fn empty_loader_spawn_request() -> LoaderSpawnRequest {
         env_count: 0,
         argv_bytes_len: 0,
         env_bytes_len: 0,
-        reserved0: 0,
+        requester_pid: 0,
         exec_path: [0; LOADER_SPAWN_EXEC_PATH_CAPACITY],
         argv_bytes: [0; LOADER_SPAWN_ARG_BYTES],
         env_bytes: [0; LOADER_SPAWN_ENV_BYTES],
@@ -2409,6 +2521,24 @@ mod tests {
     }
 
     #[test]
+    fn root_supervisor_requests_require_exact_sender_and_canonical_unused_fields() {
+        let mut request = CommercialMaxProtocolRequest::default();
+        request.header.protocol = COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR;
+        request.header.op = COMMERCIAL_MAX_ROOTD_OP_BOOTSTRAP_MANIFEST;
+        request.header.subject_pid = 41;
+        request.header.subject_tid = 7;
+        let sender = IpcSenderIdentity { pid: 41, tid: 7 };
+        assert_eq!(validate_commercial_max_request(&request, sender), Ok(()));
+
+        assert_eq!(
+            validate_commercial_max_request(&request, IpcSenderIdentity { pid: 42, tid: 7 }),
+            Err(13)
+        );
+        request.arg0 = 1;
+        assert_eq!(validate_commercial_max_request(&request, sender), Err(22));
+    }
+
+    #[test]
     fn loader_worker_completion_is_same_process_and_exact_state_only() {
         let pid = syscall0(SYS_GETPID) as u64;
         let tid = syscall0(SYS_GETTID) as u64;
@@ -2455,11 +2585,19 @@ mod tests {
     }
 
     fn post_init_request(service_id: u64, pid: u64) -> CommercialMaxProtocolRequest {
-        CommercialMaxProtocolRequest {
+        let mut request = CommercialMaxProtocolRequest {
             arg0: service_id,
             arg1: pid,
             ..CommercialMaxProtocolRequest::default()
-        }
+        };
+        let spec = POST_INIT_MANIFEST
+            .iter()
+            .find(|spec| spec.service_id == service_id)
+            .expect("declared post-init service");
+        let path = trim_nul(spec.exec_path);
+        request.path[..path.len()].copy_from_slice(path);
+        request.path_len = path.len() as u32;
+        request
     }
 
     #[test]
@@ -2481,6 +2619,22 @@ mod tests {
             authorize_service_lookup_for_subject(&leases, &post_init, &request),
             Err(13)
         );
+    }
+
+    #[test]
+    fn vfsd_lookup_authority_includes_only_device_and_storage_policy() {
+        assert!(service_dependency_allowed(
+            IPC_SERVICE_VFSD,
+            IPC_SERVICE_DEVMGRD
+        ));
+        assert!(service_dependency_allowed(
+            IPC_SERVICE_VFSD,
+            IPC_SERVICE_STORAGED
+        ));
+        assert!(!service_dependency_allowed(
+            IPC_SERVICE_VFSD,
+            IPC_SERVICE_NETD
+        ));
     }
 
     #[test]
@@ -2539,7 +2693,7 @@ mod tests {
         let mut post_init = [post_init_lease(POST_INIT_MANIFEST[0])];
 
         assert_eq!(
-            register_post_init_service_lease(
+            register_post_init_service_lease_with_provenance(
                 &leases,
                 &mut post_init,
                 &request,
@@ -2547,21 +2701,83 @@ mod tests {
                     pid: initd_pid,
                     tid: 1,
                 },
+                true,
             ),
             Ok(())
         );
         assert_eq!(post_init[0].reporter_pid, initd_pid);
 
         assert_eq!(
-            register_post_init_service_lease(
+            register_post_init_service_lease_with_provenance(
                 &leases,
                 &mut post_init,
                 &request,
                 IpcSenderIdentity { pid: 99, tid: 2 },
+                true,
             ),
             Err(13)
         );
         assert_eq!(post_init[0].reporter_pid, initd_pid);
+    }
+
+    #[test]
+    fn post_init_lease_requires_the_exact_declared_executable_path() {
+        let initd_pid = 41;
+        let leases = leases_with_live_initd(initd_pid);
+        let mut post_init = [post_init_lease(POST_INIT_MANIFEST[0])];
+        let sender = IpcSenderIdentity {
+            pid: initd_pid,
+            tid: 1,
+        };
+
+        let mut missing = post_init_request(IPC_SERVICE_NETD, 71);
+        missing.path_len = 0;
+        assert_eq!(
+            register_post_init_service_lease_with_provenance(
+                &leases,
+                &mut post_init,
+                &missing,
+                sender,
+                true,
+            ),
+            Err(22)
+        );
+
+        let mut foreign = post_init_request(IPC_SERVICE_NETD, 71);
+        foreign.path[0] ^= 1;
+        assert_eq!(
+            register_post_init_service_lease_with_provenance(
+                &leases,
+                &mut post_init,
+                &foreign,
+                sender,
+                true,
+            ),
+            Err(13)
+        );
+
+        let exact = post_init_request(IPC_SERVICE_NETD, 71);
+        assert_eq!(
+            register_post_init_service_lease_with_provenance(
+                &leases,
+                &mut post_init,
+                &exact,
+                sender,
+                true,
+            ),
+            Ok(())
+        );
+        let mut another = [post_init_lease(POST_INIT_MANIFEST[0])];
+        assert_eq!(
+            register_post_init_service_lease_with_provenance(
+                &leases,
+                &mut another,
+                &exact,
+                sender,
+                false,
+            ),
+            Err(13)
+        );
     }
 
     #[test]

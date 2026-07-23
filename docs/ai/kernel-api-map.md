@@ -45,6 +45,17 @@ Do not reorder without reading `kernel/src/main.rs` and
 - **Scheduler wait primitives:** use `current_task_id`, `block_current_task`,
   `wake_task` for kernel-capable wait queues; use `*_user_*` wrappers only
   for userspace-task waits.
+- **DVM block transport:** use `kernel_io_manager::api::block::{dvm_info,
+  submit_dvm_read,submit_dvm_write,submit_dvm_flush,poll_dvm,cancel_dvm,
+  finish_dvm}` only from the `STORAGE_POLICY`-gated compat broker. MSI-X code
+  calls only the wake leaf; `storaged` owns timeout, retry, durability, and
+  volume policy. Do not expose the raw ivshmem physical range to a service or
+  route ordinary VFS callers directly to this API.
+- **Bootstrap image:** `kernel_io_manager::api::vfs::{read_path_to_vec_for_kernel,
+  boot_path_file_len_for_kernel}` and
+  `kernel_io_manager::api::block::read_bootstrap_file_range` may read only the
+  immutable early-system allowlist. No physical block descriptor, extent,
+  partition, FAT, DMA, AHCI, or NVMe API exists in io-manager.
 - **Input poll waits:** compat `poll()` only asks inputd's deadline-bounded
   `STATS` request and arms `input::event_queue` waiters. Only inputd's
   capability-gated ingest broker drains the bounded L0-owned input ring. The

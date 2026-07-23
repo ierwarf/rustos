@@ -22,8 +22,24 @@ pub(crate) fn call_remote_vfs_read_bytes(
         request.remote_id = remote_id;
         request.arg0 = offset.saturating_add(bytes.len() as u64);
         request.arg1 = chunk_len as u64;
-        let response = call_vfs_ipc_request(&request)?;
-        ensure_vfs_status(&response)?;
+        let response = call_vfs_ipc_request(&request).inspect_err(|errno| {
+            nucleus_core::debug::write_debugcon_only_line(
+                alloc::format!(
+                    "proc-commit: remote read rejected stage=vfs-transport remote_id={remote_id} offset={} len={chunk_len} errno={errno}",
+                    request.arg0,
+                )
+                .as_bytes(),
+            );
+        })?;
+        ensure_vfs_status(&response).inspect_err(|errno| {
+            nucleus_core::debug::write_debugcon_only_line(
+                alloc::format!(
+                    "proc-commit: remote read rejected stage=vfs-status remote_id={remote_id} offset={} len={chunk_len} errno={errno}",
+                    request.arg0,
+                )
+                .as_bytes(),
+            );
+        })?;
         let read = response.payload_len as usize;
         if read > chunk_len || read > response.payload.len() {
             return Err(LINUX_EINVAL);

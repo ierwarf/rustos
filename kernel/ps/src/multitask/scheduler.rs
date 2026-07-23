@@ -264,6 +264,8 @@ pub(super) struct Scheduler {
     start_suspended: [bool; MAX_TASK],
     retire_reasons: [Option<TaskRetireReason>; MAX_TASK],
     simd_states: [SimdState; MAX_TASK],
+    syscall_user_simd_states: [SimdState; MAX_TASK],
+    syscall_user_simd_active: [bool; MAX_TASK],
     starts: [Option<TaskStart>; MAX_TASK],
     stacks: [Option<Vec<u8>>; MAX_TASK],
     current_task: usize,
@@ -317,6 +319,8 @@ impl Scheduler {
             start_suspended: [false; MAX_TASK],
             retire_reasons: [None; MAX_TASK],
             simd_states: [SimdState::new(); MAX_TASK],
+            syscall_user_simd_states: [SimdState::new(); MAX_TASK],
+            syscall_user_simd_active: [false; MAX_TASK],
             starts: [None; MAX_TASK],
             stacks: [const { None }; MAX_TASK],
             current_task: 0,
@@ -716,6 +720,8 @@ impl Scheduler {
         }
 
         self.simd_states = [SimdState::new(); MAX_TASK];
+        self.syscall_user_simd_states = [SimdState::new(); MAX_TASK];
+        self.syscall_user_simd_active = [false; MAX_TASK];
         self.retired = [false; MAX_TASK];
         self.start_suspended = [false; MAX_TASK];
         self.retire_reasons = [None; MAX_TASK];
@@ -799,6 +805,8 @@ impl Scheduler {
         self.start_suspended[slot] = false;
         self.retire_reasons[slot] = None;
         self.simd_states[slot] = SimdState::new();
+        self.syscall_user_simd_states[slot] = SimdState::new();
+        self.syscall_user_simd_active[slot] = false;
         self.starts[slot] = None;
         self.release_stack_storage(slot);
     }
@@ -1801,6 +1809,7 @@ impl Scheduler {
                     windows_thread_state: None,
                 });
                 self.simd_states[slot] = SimdState::new();
+                self.syscall_user_simd_active[slot] = false;
                 self.starts[slot] = Some(TaskStart { entry, id });
                 return Some(slot);
             }
@@ -1900,6 +1909,7 @@ impl Scheduler {
                     }),
                 });
                 self.simd_states[slot] = SimdState::new();
+                self.syscall_user_simd_active[slot] = false;
                 self.starts[slot] = Some(TaskStart {
                     entry: idle_entry,
                     id,
@@ -1967,6 +1977,7 @@ impl Scheduler {
                     }),
                 });
                 self.simd_states[slot] = SimdState::new();
+                self.syscall_user_simd_active[slot] = false;
                 self.starts[slot] = Some(TaskStart {
                     entry: idle_entry,
                     id,
@@ -2031,6 +2042,7 @@ impl Scheduler {
                     windows_thread_state: None,
                 });
                 self.simd_states[slot] = SimdState::new();
+                self.syscall_user_simd_active[slot] = false;
                 self.starts[slot] = Some(TaskStart {
                     entry: super::noop_task_entry,
                     id,
@@ -2139,6 +2151,7 @@ impl Scheduler {
                     }),
                 });
                 self.simd_states[slot] = SimdState::new();
+                self.syscall_user_simd_active[slot] = false;
                 self.start_suspended[slot] = true;
                 self.starts[slot] = Some(TaskStart {
                     entry: super::noop_task_entry,
@@ -2702,6 +2715,33 @@ impl Scheduler {
         }
     }
 
+    pub(super) fn capture_current_syscall_user_simd(&mut self) -> Option<u64> {
+        let slot = self.current_task;
+        let task_id = self.starts[slot]?.id;
+        if self.syscall_user_simd_active[slot] {
+            return None;
+        }
+        unsafe {
+            save_state(&mut self.syscall_user_simd_states[slot]);
+        }
+        self.syscall_user_simd_active[slot] = true;
+        Some(task_id)
+    }
+
+    pub(super) fn restore_current_syscall_user_simd(&mut self, task_id: u64) -> bool {
+        let slot = self.current_task;
+        if self.starts[slot].is_none_or(|start| start.id != task_id)
+            || !self.syscall_user_simd_active[slot]
+        {
+            return false;
+        }
+        unsafe {
+            restore_state(&self.syscall_user_simd_states[slot]);
+        }
+        self.syscall_user_simd_active[slot] = false;
+        true
+    }
+
     pub(super) fn current_user_process_binding(
         &self,
     ) -> Option<(u64, UserAbi, ProcessHandle, ConsoleSessionHandle)> {
@@ -2887,6 +2927,7 @@ impl Scheduler {
         self.retired[slot] = false;
         self.retire_reasons[slot] = None;
         self.simd_states[slot] = SimdState::new();
+        self.syscall_user_simd_active[slot] = false;
         self.starts[slot] = Some(TaskStart {
             entry: super::noop_task_entry,
             id: process_id,
@@ -2975,6 +3016,7 @@ impl Scheduler {
         self.retired[slot] = false;
         self.retire_reasons[slot] = None;
         self.simd_states[slot] = SimdState::new();
+        self.syscall_user_simd_active[slot] = false;
         self.starts[slot] = Some(TaskStart {
             entry: super::noop_task_entry,
             id: process_id,
@@ -3707,6 +3749,8 @@ mod tests {
     use crate::user::process_state::UserProcessState;
     use kernel_ipc_runtime::api::IpcError;
 
+    static TEST_SCHEDULER_TEMPLATE: Scheduler = Scheduler::new();
+
     #[test]
     fn kernel_stack_top_is_aligned_for_sysv_rust_calls() {
         for low_bits in 0..16 {
@@ -3714,6 +3758,36 @@ mod tests {
             assert_eq!(top & 0xF, 0);
             assert!(top <= 0x10_000 + low_bits);
             assert!((0x10_000 + low_bits) - top < 16);
+        }
+    }
+
+    #[test]
+    fn syscall_user_simd_snapshot_is_disjoint_from_scheduler_continuation() {
+        let continuation_start = core::mem::offset_of!(Scheduler, simd_states);
+        let continuation_end =
+            continuation_start + core::mem::size_of::<[super::SimdState; MAX_TASK]>();
+        let snapshot_start = core::mem::offset_of!(Scheduler, syscall_user_simd_states);
+        let snapshot_end = snapshot_start + core::mem::size_of::<[super::SimdState; MAX_TASK]>();
+        let active_start = core::mem::offset_of!(Scheduler, syscall_user_simd_active);
+        let active_end = active_start + core::mem::size_of::<[bool; MAX_TASK]>();
+
+        assert!(continuation_end <= snapshot_start || snapshot_end <= continuation_start);
+        assert!(snapshot_end <= active_start || active_end <= snapshot_start);
+    }
+
+    fn boxed_scheduler() -> Box<Scheduler> {
+        let mut scheduler = Box::<Scheduler>::new_uninit();
+        unsafe {
+            // The const template owns no heap allocation: every Vec-bearing
+            // field is `None`. Copy it directly into the heap allocation so
+            // debug test threads never materialize the large SIMD arrays on
+            // their small harness stack.
+            core::ptr::copy_nonoverlapping(
+                core::ptr::addr_of!(TEST_SCHEDULER_TEMPLATE),
+                scheduler.as_mut_ptr(),
+                1,
+            );
+            scheduler.assume_init()
         }
     }
 
@@ -3762,7 +3836,7 @@ mod tests {
 
     #[test]
     fn collect_process_sibling_slots_returns_matching_user_slots_only() {
-        let mut scheduler = Box::new(Scheduler::new());
+        let mut scheduler = boxed_scheduler();
         let owner = test_process(1);
         let other = test_process(2);
 
@@ -3783,7 +3857,7 @@ mod tests {
 
     #[test]
     fn terminate_user_process_retires_every_live_sibling() {
-        let mut scheduler = Box::new(Scheduler::new());
+        let mut scheduler = boxed_scheduler();
         let owner = test_process(41);
         let other = test_process(42);
 
@@ -3811,7 +3885,7 @@ mod tests {
 
     #[test]
     fn retirement_revokes_task_and_process_ipc_authority() {
-        let mut scheduler = Box::new(Scheduler::new());
+        let mut scheduler = boxed_scheduler();
         let owner = test_process(94);
         scheduler.contexts[1] = Some(test_user_context(owner));
         scheduler.starts[1] = Some(TaskStart {
@@ -3857,7 +3931,7 @@ mod tests {
 
     #[test]
     fn rejected_thread_attachment_releases_unpublished_stack() {
-        let mut scheduler = Box::new(Scheduler::new());
+        let mut scheduler = boxed_scheduler();
         let owner = test_process(95);
         scheduler.current_task = 1;
         scheduler.contexts[1] = Some(test_user_context(owner));
@@ -3880,7 +3954,7 @@ mod tests {
 
     #[test]
     fn synchronous_ipc_donation_promotes_and_revokes_a_transitive_user_chain() {
-        let mut scheduler = Box::new(Scheduler::new());
+        let mut scheduler = boxed_scheduler();
         let interactive = test_process(61);
         let broker = test_process(62);
         let policy = test_process(63);
@@ -3933,7 +4007,7 @@ mod tests {
 
     #[test]
     fn strict_class_requires_explicit_admission_not_a_large_cfs_weight() {
-        let mut scheduler = Box::new(Scheduler::new());
+        let mut scheduler = boxed_scheduler();
         let broker = test_process(69);
         let interactive = test_process(70);
 
@@ -3950,7 +4024,7 @@ mod tests {
 
     #[test]
     fn self_demotion_removes_only_the_base_system_class() {
-        let mut scheduler = Box::new(Scheduler::new());
+        let mut scheduler = boxed_scheduler();
         let helper = test_process(73);
         let donor = test_process(74);
 
@@ -3990,7 +4064,7 @@ mod tests {
 
     #[test]
     fn bounded_system_burst_reserves_a_ready_user_turn() {
-        let mut scheduler = Box::new(Scheduler::new());
+        let mut scheduler = boxed_scheduler();
         let system = test_process(71);
         let user = test_process(72);
 
@@ -4011,7 +4085,7 @@ mod tests {
 
     #[test]
     fn oldest_overdue_user_is_reserved_before_system_burst_exhaustion() {
-        let mut scheduler = Box::new(Scheduler::new());
+        let mut scheduler = boxed_scheduler();
         let base = crate::memory::paging::USER_SPACE_BASE;
         let user_cs = crate::arch::gdt::user_code_selector().0 as u64;
         let user_ss = crate::arch::gdt::user_data_selector().0 as u64;
@@ -4061,7 +4135,7 @@ mod tests {
 
     #[test]
     fn overdue_system_task_is_forced_after_latency_bound() {
-        let mut scheduler = Box::new(Scheduler::new());
+        let mut scheduler = boxed_scheduler();
         let base = crate::memory::paging::USER_SPACE_BASE;
         let user_cs = crate::arch::gdt::user_code_selector().0 as u64;
         let user_ss = crate::arch::gdt::user_data_selector().0 as u64;
@@ -4114,7 +4188,7 @@ mod tests {
 
     #[test]
     fn spawn_handoff_is_one_shot_and_precedes_ipc_handoff() {
-        let mut scheduler = Box::new(Scheduler::new());
+        let mut scheduler = boxed_scheduler();
         let base = crate::memory::paging::USER_SPACE_BASE;
         let user_cs = crate::arch::gdt::user_code_selector().0 as u64;
         let user_ss = crate::arch::gdt::user_data_selector().0 as u64;
@@ -4183,7 +4257,7 @@ mod tests {
 
     #[test]
     fn event_wait_handoff_is_fifo_deduplicated_and_burst_bounded() {
-        let mut scheduler = Box::new(Scheduler::new());
+        let mut scheduler = boxed_scheduler();
         let base = crate::memory::paging::USER_SPACE_BASE;
         let user_cs = crate::arch::gdt::user_code_selector().0 as u64;
         let user_ss = crate::arch::gdt::user_data_selector().0 as u64;

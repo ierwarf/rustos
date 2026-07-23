@@ -2,3 +2,4 @@
 # Audited target-only leaf packages whose addition cannot change the feature
 # detection, linkage, or configuration of an already-built DVM package.
 BR2_PACKAGE_ACPID
+BR2_PACKAGE_RUSTOS_DVM_BLOCK

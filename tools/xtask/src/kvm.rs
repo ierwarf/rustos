@@ -15,10 +15,12 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use driver_domain_protocol::{
+    DVM_BLOCK_APERTURE_BYTES, DVM_BLOCK_FEATURE_FLUSH, DVM_BLOCK_FEATURE_FUA,
+    DVM_BLOCK_FLAG_DVM_READY, DVM_BLOCK_FLAG_RUSTOS_READY, DVM_BLOCK_HEADER_RECORD_BYTES,
     DVM_GPU_ATLAS_POOL_HEADER_OFFSET, DVM_GUI_SURFACE_POOL_HOST_RECORD_OFFSET,
     DVM_GUI_SURFACE_SLOT_COUNT, DVM_INPUT_RING_APERTURE_BYTES, DVM_NET_APERTURE_BYTES,
-    DvmGpuAtlasPoolHeader, DvmGuiSurfaceMessage, DvmGuiSurfacePoolHeader, DvmInputRingHeader,
-    DvmNetHeader,
+    DvmBlockHeader, DvmGpuAtlasPoolHeader, DvmGuiSurfaceMessage, DvmGuiSurfacePoolHeader,
+    DvmInputRingHeader, DvmNetHeader,
 };
 use fatfs::Seek as FatSeek;
 use fatfs::Write as FatWrite;
@@ -49,8 +51,11 @@ const DVM_CONTROL_STATE: &str = "control";
 const DVM_CONTROL_TRANSPORT: &str = "kvm-vsock";
 const DVM_CONTROL_AUTHENTICATION: &str = "dvm-agent-hmac-sha256-v1";
 const DVM_CONTROL_CAPABILITIES: &str =
-    "health,device-inventory,driver-inventory,display-evidence-v2,input-stream";
+    "health,device-inventory,driver-inventory,display-evidence-v2,block-evidence-v1,input-stream";
 const RUSTOS_BOOT_MARKER: &str = "rootd: core services ready, spawning initd via loaderd";
+const RUSTOS_INIT_IDENTITY_MARKER: &str = "initd: identity endpoint registered";
+const RUSTOS_POST_INIT_PROVENANCE_MARKER: &str =
+    "rootd: post-init deferred-spawn provenance verified";
 const RUSTOS_GPU_SCENE_COMPILER_MARKER: &str =
     "uiserver: gpu-scene compiler ready contract=3 public-abi=0 dvm-submit=1";
 const RUSTOS_GPU_ACTIVE_MARKER: &str = "uiserver: gpu-compositor active contract=3";
@@ -58,6 +63,9 @@ const DVM_KEYBOARD_INGRESS_MARKER: &str = "inputd: DVM keyboard ingress observed
 const DVM_POINTER_INGRESS_MARKER: &str = "inputd: DVM pointer ingress observed";
 const DVM_GPU_COMPOSITOR_MARKER: &str = "rustos-dvm-gpu: ready contract=1";
 const DVM_GPU_LIVE_MARKER: &str = "rustos-dvm-display: gpu-compositor primed contract=3";
+const RUSTOS_DVM_BLOCK_MARKER: &str = "dvm-block: transport installed generation=1";
+const RUSTOS_DVM_BLOCK_E2E_MARKER: &str = "storaged: dvm-block e2e flush completed generation=1";
+const DVM_BLOCK_READY_MARKER: &str = "rustos-dvm-block: ready abi=1 generation=1";
 const DVM_GPU_PIPELINE_PRIME_TIMEOUT_US: u64 = 500_000;
 const DVM_GPU_HEALTH_SAMPLES: u64 = 3;
 const PHYSICAL_GPU_SMOKE_MIN_FRAMES: usize = 4;
@@ -90,6 +98,7 @@ const DVM_GUEST_MEMORY: &str = "2048M,maxmem=3G,slots=2";
 // BAR carries only bounded control records and MSI-X doorbells.
 const DVM_DISPLAY_PIXEL_PHYS_ADDR: u64 = 0x1_0000_0000;
 const DVM_DISPLAY_FIRST_PEER_TIMEOUT: Duration = Duration::from_secs(5);
+const DVM_BLOCK_FIRST_PEER_TIMEOUT: Duration = Duration::from_secs(5);
 const INTERACTIVE_DISPLAY_READY_TIMEOUT: Duration = Duration::from_secs(15);
 const INTERACTIVE_IDLE_TICKS: usize = 3;
 const DVM_INPUT_FIRST_PEER_TIMEOUT: Duration = Duration::from_secs(5);
@@ -220,6 +229,9 @@ struct KvmLayout {
     gui_dvm_pixels: Option<PathBuf>,
     dvm_display_doorbell: Option<PathBuf>,
     dvm_network_shmem: Option<PathBuf>,
+    dvm_block_aperture: Option<PathBuf>,
+    dvm_block_doorbell: Option<PathBuf>,
+    dvm_block_disk: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -229,6 +241,7 @@ struct SmokeOptions {
     exercise_network: bool,
     gui_dvm_surfaces: bool,
     dvm_network_shmem: bool,
+    dvm_block_shmem: bool,
     physical_gpu_bdf: Option<String>,
     physical_gpu_firmware: Option<PathBuf>,
     min_ui_fps: Option<u32>,
@@ -296,7 +309,6 @@ where
     if options.physical_gpu_bdf.is_some() {
         claim_physical_gpu_launch(&layout, &options)?;
     }
-    let deadline = Instant::now() + options.timeout;
     let input_doorbell = start_dvm_input_doorbell(&layout)?;
     let input_relay_gate = Arc::new(AtomicBool::new(false));
     let control_relay = start_dvm_input_relay(
@@ -308,6 +320,7 @@ where
         Arc::clone(&input_relay_gate),
     )?;
     let display_doorbell = start_dvm_display_doorbell(&layout)?;
+    let block_doorbell = start_dvm_block_doorbell(&layout)?;
     let guest_display = smoke_guest_display(&options)?;
     let host_render_node = if guest_display != GuestDisplay::Physical {
         Some(require_host_render_node()?)
@@ -323,9 +336,14 @@ where
         guest_display,
         host_render_node.as_deref(),
         display_doorbell.as_ref(),
+        block_doorbell.as_ref(),
         &input_doorbell,
         input_relay_gate,
     )?;
+    // `--timeout` is the readiness budget promised by the CLI, not a budget
+    // for host-side doorbell setup, render-node admission, or process
+    // creation. Start it only after both guest processes exist.
+    let deadline = Instant::now() + options.timeout;
     let result: Result<ProbeResult> = (|| {
         let probe = wait_for_parallel_boot(
             &mut rustos,
@@ -335,6 +353,9 @@ where
             deadline,
             &control_relay,
         )?;
+        if options.dvm_block_shmem {
+            verify_dvm_block_ready(&layout)?;
+        }
         Ok(probe)
     })();
     stop_guest(&mut rustos);
@@ -415,15 +436,20 @@ pub(crate) fn kvm_run_command(config: &Config) -> Result<()> {
         exercise_network: false,
         gui_dvm_surfaces: true,
         dvm_network_shmem: true,
+        dvm_block_shmem: true,
         physical_gpu_bdf: None,
         physical_gpu_firmware: None,
         min_ui_fps: None,
         ui_proof_windows: DEFAULT_UI_FPS_ACTIVE_WINDOWS,
         timeout: Duration::ZERO,
-        expected_markers: vec![RUSTOS_GPU_ACTIVE_MARKER.to_owned()],
+        expected_markers: vec![
+            RUSTOS_GPU_ACTIVE_MARKER.to_owned(),
+            RUSTOS_DVM_BLOCK_MARKER.to_owned(),
+        ],
         expected_dvm_markers: vec![
             DVM_GPU_COMPOSITOR_MARKER.to_owned(),
             DVM_GPU_LIVE_MARKER.to_owned(),
+            DVM_BLOCK_READY_MARKER.to_owned(),
         ],
     };
     let layout = prepare_layout(config, &options)?;
@@ -444,6 +470,8 @@ pub(crate) fn kvm_run_command(config: &Config) -> Result<()> {
     log_kvm_start_phase("started-input-relay", started_at);
     let display_doorbell = start_dvm_display_doorbell(&layout)?;
     log_kvm_start_phase("started-display-doorbell", started_at);
+    let block_doorbell = start_dvm_block_doorbell(&layout)?;
+    log_kvm_start_phase("started-block-doorbell", started_at);
     let (mut rustos, mut dvm) = spawn_guests(
         &qemu,
         config,
@@ -453,6 +481,7 @@ pub(crate) fn kvm_run_command(config: &Config) -> Result<()> {
         GuestDisplay::DvmGtk,
         Some(&host_render_node),
         display_doorbell.as_ref(),
+        block_doorbell.as_ref(),
         &input_doorbell,
         input_relay_gate,
     )?;
@@ -540,6 +569,9 @@ options:
                        surface renderer or native-GPU path is accepted
   --dvm-network-shmem  attach the bounded RustOS↔DVM Ethernet ring; RustOS keeps
                        no native virtio-net device in this topology
+  --dvm-block-shmem    attach a private virtual NVMe namespace only to Linux
+                       DVM and the fixed RustOS↔DVM block ring; RustOS receives
+                       no native storage controller
   --physical-gpu <BDF> non-commercial lab mode: attach one already-bound GPU
                        from the sealed physical-GPU profile registry through
                        IOMMUFD instead of virtio-GPU; never binds, unbinds, or
@@ -676,6 +708,7 @@ where
         exercise_network: false,
         gui_dvm_surfaces: false,
         dvm_network_shmem: false,
+        dvm_block_shmem: false,
         physical_gpu_bdf: None,
         physical_gpu_firmware: None,
         min_ui_fps: None,
@@ -683,6 +716,8 @@ where
         timeout: Duration::from_secs(MAX_SMOKE_TIMEOUT),
         expected_markers: vec![
             RUSTOS_BOOT_MARKER.to_owned(),
+            RUSTOS_INIT_IDENTITY_MARKER.to_owned(),
+            RUSTOS_POST_INIT_PROVENANCE_MARKER.to_owned(),
             RUSTOS_GPU_SCENE_COMPILER_MARKER.to_owned(),
         ],
         expected_dvm_markers: vec![DVM_GPU_COMPOSITOR_MARKER.to_owned()],
@@ -695,6 +730,7 @@ where
             "--exercise-network" => options.exercise_network = true,
             "--gui-dvm-surfaces" => options.gui_dvm_surfaces = true,
             "--dvm-network-shmem" => options.dvm_network_shmem = true,
+            "--dvm-block-shmem" => options.dvm_block_shmem = true,
             "--physical-gpu" | "--physical-amdgpu" => {
                 if options.physical_gpu_bdf.is_some() {
                     bail!("physical GPU BDF was supplied more than once");
@@ -780,6 +816,17 @@ where
         options
             .expected_dvm_markers
             .push(DVM_GPU_LIVE_MARKER.to_owned());
+    }
+    if options.dvm_block_shmem {
+        options
+            .expected_markers
+            .push(RUSTOS_DVM_BLOCK_MARKER.to_owned());
+        options
+            .expected_markers
+            .push(RUSTOS_DVM_BLOCK_E2E_MARKER.to_owned());
+        options
+            .expected_dvm_markers
+            .push(DVM_BLOCK_READY_MARKER.to_owned());
     }
     if options.exercise_network && !options.dvm_network_shmem {
         bail!("--exercise-network requires --dvm-network-shmem");
@@ -1247,6 +1294,25 @@ fn prepare_layout(config: &Config, options: &SmokeOptions) -> Result<KvmLayout> 
     } else {
         None
     };
+    let (dvm_block_aperture, dvm_block_doorbell, dvm_block_disk) = if options.dvm_block_shmem {
+        let disk = run_dir.join("dvm-block-disk.img");
+        fs::copy(&config.boot_disk_image, &disk).with_context(|| {
+            format!(
+                "create private storage-DVM disk from {}",
+                config.boot_disk_image.display()
+            )
+        })?;
+        fs::set_permissions(&disk, std::fs::Permissions::from_mode(0o600))?;
+        let aperture = run_dir.join("dvm-block.ivshmem");
+        create_dvm_block_aperture(&aperture, &disk)?;
+        (
+            Some(aperture),
+            Some(run_dir.join("dvm-block-doorbell.sock")),
+            Some(disk),
+        )
+    } else {
+        (None, None, None)
+    };
 
     let debugcon_log = run_dir.join("rustos-debugcon.log");
     let rustos_serial_log = run_dir.join("rustos-serial.log");
@@ -1286,6 +1352,9 @@ fn prepare_layout(config: &Config, options: &SmokeOptions) -> Result<KvmLayout> 
         gui_dvm_pixels,
         dvm_display_doorbell,
         dvm_network_shmem,
+        dvm_block_aperture,
+        dvm_block_doorbell,
+        dvm_block_disk,
     })
 }
 
@@ -1368,6 +1437,48 @@ fn create_dvm_network_shmem(path: &Path) -> Result<()> {
     file.set_len(DVM_NET_REGION_BYTES)?;
     file.write_all(&header.encode())?;
     file.sync_all()?;
+    fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+fn create_dvm_block_aperture(path: &Path, disk: &Path) -> Result<()> {
+    for candidate in [path, disk] {
+        if candidate.to_string_lossy().contains(',') {
+            bail!(
+                "KVM storage-DVM path contains an unsupported QEMU option separator: {}",
+                candidate.display()
+            );
+        }
+    }
+    let disk_bytes = fs::metadata(disk)
+        .with_context(|| format!("inspect private storage-DVM disk {}", disk.display()))?
+        .len();
+    if disk_bytes == 0 || !disk_bytes.is_multiple_of(512) {
+        bail!("private storage-DVM disk must be non-empty and 512-byte aligned");
+    }
+    let header = DvmBlockHeader::new(
+        1,
+        disk_bytes / 512,
+        512,
+        512,
+        DVM_BLOCK_FEATURE_FLUSH | DVM_BLOCK_FEATURE_FUA,
+    );
+    if !header.is_valid() {
+        bail!("refusing to create invalid fixed DVM block header");
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("create DVM block aperture {}", path.display()))?;
+    file.set_len(DVM_BLOCK_APERTURE_BYTES)
+        .with_context(|| format!("size DVM block aperture {}", path.display()))?;
+    file.write_all(&header.encode())
+        .with_context(|| format!("write DVM block header {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("sync DVM block aperture {}", path.display()))?;
     fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     Ok(())
 }
@@ -1578,6 +1689,44 @@ fn verify_dvm_network_round_trip(path: &Path) -> Result<()> {
             counters.rx_producer,
             counters.rx_consumer,
         );
+    }
+    Ok(())
+}
+
+fn verify_dvm_block_ready(layout: &KvmLayout) -> Result<()> {
+    let aperture = layout
+        .dvm_block_aperture
+        .as_deref()
+        .context("storage-DVM proof lost its block aperture")?;
+    let disk = layout
+        .dvm_block_disk
+        .as_deref()
+        .context("storage-DVM proof lost its private backing disk")?;
+    let mut file = std::fs::File::open(aperture)
+        .with_context(|| format!("open live DVM block aperture {}", aperture.display()))?;
+    let mut bytes = [0_u8; DVM_BLOCK_HEADER_RECORD_BYTES];
+    file.read_exact(&mut bytes)
+        .with_context(|| format!("read live DVM block header {}", aperture.display()))?;
+    let header = DvmBlockHeader::decode(&bytes)
+        .context("live DVM block aperture contains an invalid header")?;
+    let ready = DVM_BLOCK_FLAG_RUSTOS_READY | DVM_BLOCK_FLAG_DVM_READY;
+    if header.flags & ready != ready {
+        bail!(
+            "DVM block peers did not both publish readiness flags={:#x}",
+            header.flags
+        );
+    }
+    let disk_bytes = fs::metadata(disk)
+        .with_context(|| format!("inspect live storage-DVM disk {}", disk.display()))?
+        .len();
+    if header.generation != 1
+        || disk_bytes == 0
+        || !disk_bytes.is_multiple_of(512)
+        || header.capacity_sectors != disk_bytes / 512
+        || header.logical_block_size != 512
+        || header.physical_block_size != 512
+    {
+        bail!("live DVM block geometry diverged from the private backing disk");
     }
     Ok(())
 }
@@ -2238,6 +2387,23 @@ fn start_dvm_display_doorbell(layout: &KvmLayout) -> Result<Option<IvshmemDoorbe
     Ok(Some(IvshmemDoorbellServer::start(doorbell, &backing)?))
 }
 
+fn start_dvm_block_doorbell(layout: &KvmLayout) -> Result<Option<IvshmemDoorbellServer>> {
+    let (Some(aperture), Some(doorbell)) = (
+        layout.dvm_block_aperture.as_deref(),
+        layout.dvm_block_doorbell.as_deref(),
+    ) else {
+        return Ok(None);
+    };
+    let backing = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(aperture)
+        .with_context(|| format!("open DVM block aperture {}", aperture.display()))?;
+    Ok(Some(IvshmemDoorbellServer::start_single_vector(
+        doorbell, &backing,
+    )?))
+}
+
 /// The L0 input producer is the second fixed ivshmem peer. It is started
 /// before RustOS, but not connected until `spawn_guests` proves that RustOS
 /// claimed peer 0. The DVM itself never receives this aperture or a doorbell.
@@ -2267,6 +2433,7 @@ fn spawn_guests(
     guest_display: GuestDisplay,
     host_render_node: Option<&Path>,
     display_doorbell: Option<&IvshmemDoorbellServer>,
+    block_doorbell: Option<&IvshmemDoorbellServer>,
     input_doorbell: &IvshmemDoorbellServer,
     input_relay_gate: Arc<AtomicBool>,
 ) -> Result<(Child, Child)> {
@@ -2337,6 +2504,9 @@ fn spawn_guests(
     if let Some(shared_network) = layout.dvm_network_shmem.as_deref() {
         append_dvm_network_ivshmem(&mut rustos_command, shared_network);
     }
+    if let Some(doorbell) = layout.dvm_block_doorbell.as_deref() {
+        append_dvm_block_doorbell(&mut rustos_command, doorbell);
+    }
     append_fault_injection(config, &mut rustos_command);
     rustos_command
         .stdout(Stdio::null())
@@ -2361,6 +2531,14 @@ fn spawn_guests(
         let mut rustos = rustos;
         stop_guest(&mut rustos);
         return Err(error).context("RustOS did not claim ivshmem peer ID 0 before DVM launch");
+    }
+    if let Some(block_doorbell) = block_doorbell
+        && let Err(error) = block_doorbell.wait_for_peer_count(1, DVM_BLOCK_FIRST_PEER_TIMEOUT)
+    {
+        let mut rustos = rustos;
+        stop_guest(&mut rustos);
+        return Err(error)
+            .context("RustOS did not claim block ivshmem peer ID 0 before DVM launch");
     }
 
     let mut dvm_command = Command::new(qemu);
@@ -2452,6 +2630,16 @@ fn spawn_guests(
     if let Some(shared_network) = layout.dvm_network_shmem.as_deref() {
         append_dvm_network_ivshmem(&mut dvm_command, shared_network);
     }
+    if let Some(doorbell) = layout.dvm_block_doorbell.as_deref() {
+        append_dvm_block_doorbell(&mut dvm_command, doorbell);
+        append_dvm_virtual_storage(
+            &mut dvm_command,
+            layout
+                .dvm_block_disk
+                .as_deref()
+                .context("DVM block aperture exists without a private backing disk")?,
+        );
+    }
     let dvm = match dvm_command.spawn() {
         Ok(dvm) => dvm,
         Err(error) => {
@@ -2483,6 +2671,32 @@ fn append_dvm_display_doorbell(command: &mut Command, socket_path: &Path) {
         ))
         .arg("-device")
         .arg("ivshmem-doorbell,vectors=2,chardev=dvm-display-doorbell");
+}
+
+fn append_dvm_block_doorbell(command: &mut Command, socket_path: &Path) {
+    command
+        .arg("-chardev")
+        .arg(format!(
+            "socket,id=dvm-block-doorbell,path={}",
+            socket_path.display(),
+        ))
+        .arg("-device")
+        .arg("ivshmem-doorbell,vectors=1,chardev=dvm-block-doorbell");
+}
+
+fn append_dvm_virtual_storage(command: &mut Command, disk: &Path) {
+    command
+        .arg("-drive")
+        .arg(format!(
+            "file={},format=raw,if=none,id=dvm-storage-disk,cache=none,aio=threads",
+            disk.display()
+        ))
+        .arg("-device")
+        // q35 already owns exactly one ICH9 AHCI controller. Attach the
+        // private namespace to that controller instead of adding a second
+        // NVMe controller, which would correctly fail the storage DVM's
+        // exact-single-controller admission.
+        .arg("ide-hd,drive=dvm-storage-disk,bus=ide.0,unit=0,id=dvm-storage-disk-device");
 }
 
 fn append_dvm_display_pixels(command: &mut Command, path: &Path, read_only: bool) {
@@ -3059,6 +3273,7 @@ fn wait_for_interactive_display(
 ) -> Result<()> {
     let deadline = Instant::now() + INTERACTIVE_DISPLAY_READY_TIMEOUT;
     let mut last_surface_error = None;
+    let mut last_block_error = None;
     loop {
         if let Some(status) = rustos
             .try_wait()
@@ -3095,17 +3310,33 @@ fn wait_for_interactive_display(
             },
             _ => false,
         };
+        let block_ready = if rustos_log.contains(RUSTOS_DVM_BLOCK_MARKER)
+            && rustos_log.contains(RUSTOS_DVM_BLOCK_E2E_MARKER)
+            && dvm_log.contains(DVM_BLOCK_READY_MARKER)
+        {
+            match verify_dvm_block_ready(layout) {
+                Ok(()) => true,
+                Err(error) => {
+                    last_block_error = Some(error.to_string());
+                    false
+                }
+            }
+        } else {
+            false
+        };
         if dvm_display_provider_ready(&rustos_log)
             && dvm_display_relay_ready(&dvm_log, false)
             && surface_ready
+            && block_ready
         {
             return Ok(());
         }
         if Instant::now() >= deadline {
             bail!(
-                "interactive display was not proven ready within {:?}; surface={}; inspect {} and {}",
+                "interactive display/storage was not proven ready within {:?}; surface={}; block={}; inspect {} and {}",
                 INTERACTIVE_DISPLAY_READY_TIMEOUT,
                 last_surface_error.unwrap_or_else(|| "no valid PRESENT yet".to_owned()),
+                last_block_error.unwrap_or_else(|| "no exact block readiness yet".to_owned()),
                 layout.debugcon_log.display(),
                 layout.dvm_serial_log.display(),
             );
@@ -3131,6 +3362,13 @@ fn validate_interactive_session(layout: &KvmLayout, pointer_observed: bool) -> R
             layout.dvm_serial_log.display(),
         );
     }
+    if !rustos_log.contains(RUSTOS_DVM_BLOCK_MARKER)
+        || !rustos_log.contains(RUSTOS_DVM_BLOCK_E2E_MARKER)
+        || !dvm_log.contains(DVM_BLOCK_READY_MARKER)
+    {
+        bail!("interactive KVM DVM acceptance lacks the exact block transport readiness contract");
+    }
+    verify_dvm_block_ready(layout)?;
     verify_dvm_display_surface(
         layout
             .gui_dvm_surfaces
@@ -3626,11 +3864,13 @@ fn stop_guest(guest: &mut Child) {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_UI_FPS_ACTIVE_WINDOWS, DVM_CONTROL_AUTHENTICATION, DVM_CONTROL_CAPABILITIES,
-        DVM_CONTROL_PROTOCOL, DVM_CONTROL_STATE, DVM_CONTROL_TRANSPORT, DVM_DISPLAY_REGION_BYTES,
-        DVM_GPU_COMPOSITOR_MARKER, DVM_KEYBOARD_INGRESS_MARKER, DVM_POINTER_INGRESS_MARKER,
-        DvmNetworkCounters, GuestDisplay, PHYSICAL_GPU_PROFILES, RUSTOS_BOOT_MARKER,
-        RUSTOS_GPU_SCENE_COMPILER_MARKER, VIRTUAL_GPU_EVIDENCE, WayclickProfileObservation,
+        DEFAULT_UI_FPS_ACTIVE_WINDOWS, DVM_BLOCK_READY_MARKER, DVM_CONTROL_AUTHENTICATION,
+        DVM_CONTROL_CAPABILITIES, DVM_CONTROL_PROTOCOL, DVM_CONTROL_STATE, DVM_CONTROL_TRANSPORT,
+        DVM_DISPLAY_REGION_BYTES, DVM_GPU_COMPOSITOR_MARKER, DVM_KEYBOARD_INGRESS_MARKER,
+        DVM_POINTER_INGRESS_MARKER, DvmNetworkCounters, GuestDisplay, PHYSICAL_GPU_PROFILES,
+        RUSTOS_BOOT_MARKER, RUSTOS_DVM_BLOCK_E2E_MARKER, RUSTOS_DVM_BLOCK_MARKER,
+        RUSTOS_GPU_SCENE_COMPILER_MARKER, RUSTOS_INIT_IDENTITY_MARKER,
+        RUSTOS_POST_INIT_PROVENANCE_MARKER, VIRTUAL_GPU_EVIDENCE, WayclickProfileObservation,
         append_dvm_display_pixels, append_dvm_input_devices, append_dvm_network_device,
         append_dvm_virtual_gpu, append_physical_gpu, claim_physical_gpu_launch_in,
         dvm_display_failure, dvm_display_provider_ready, dvm_display_relay_meets_fps,
@@ -3683,6 +3923,8 @@ mod tests {
             options.expected_markers,
             vec![
                 RUSTOS_BOOT_MARKER.to_owned(),
+                RUSTOS_INIT_IDENTITY_MARKER.to_owned(),
+                RUSTOS_POST_INIT_PROVENANCE_MARKER.to_owned(),
                 RUSTOS_GPU_SCENE_COMPILER_MARKER.to_owned()
             ]
         );
@@ -3711,6 +3953,18 @@ mod tests {
                 .expected_markers
                 .contains(&DVM_POINTER_INGRESS_MARKER.to_owned())
         );
+    }
+
+    #[test]
+    fn smoke_readiness_budget_starts_only_after_both_guests_spawn() {
+        let source = include_str!("kvm.rs");
+        let spawn = source
+            .find("let (mut rustos, mut dvm) = spawn_guests(")
+            .expect("parallel guest spawn");
+        let deadline = source
+            .find("let deadline = Instant::now() + options.timeout;")
+            .expect("readiness deadline");
+        assert!(spawn < deadline);
     }
 
     #[test]
@@ -3872,6 +4126,27 @@ mod tests {
             .is_err()
         );
         assert!(parse_smoke_options(vec!["--exercise-network".into()].into_iter()).is_err());
+    }
+
+    #[test]
+    fn dvm_block_mode_requires_both_peer_readiness_markers() {
+        let options = parse_smoke_options(vec!["--dvm-block-shmem".into()].into_iter()).unwrap();
+        assert!(options.dvm_block_shmem);
+        assert!(
+            options
+                .expected_markers
+                .contains(&RUSTOS_DVM_BLOCK_MARKER.to_owned())
+        );
+        assert!(
+            options
+                .expected_markers
+                .contains(&RUSTOS_DVM_BLOCK_E2E_MARKER.to_owned())
+        );
+        assert!(
+            options
+                .expected_dvm_markers
+                .contains(&DVM_BLOCK_READY_MARKER.to_owned())
+        );
     }
 
     #[test]
@@ -4414,7 +4689,7 @@ uiserver: update tick backlog=false input_drops=0 input_slow=0 input_errors=0";
 
         let hash = "0".repeat(64);
         let manifest = format!(
-            "schema=8\nid=rustos-linux-dvm-x86_64\narchitecture=x86_64\nboot=linux-bzimage+cpio-xz\ndata-plane=hostd-input-ring-msix\ncontrol-plane=agent-v1-control\ncontrol-protocol=agent-v1\ncontrol-state=control\ncontrol-transport=kvm-vsock\ncontrol-authentication=dvm-agent-hmac-sha256-v1\ncontrol-capabilities=health,device-inventory,driver-inventory,display-evidence-v2,input-stream\ncontrol-contract-sha256={hash}\nbuildroot_version=2026.05\nlinux_version=6.12.94\nnvidia-open-version=580.173.02\nnvidia-open-sha256=8d8eb9001e05a9a8a663d3d5d304feb64ef2844ee185ccdfd952786820f46e1b\nnvidia-open-redistribute=no\ndisplay-kernel-modules=i915,xe,amdgpu,nvidia-drm\nmodule-signing-enforced=yes\nmodule-signing-cert-sha256={hash}\nkernel_sha256={hash}\nrootfs_sha256={hash}\nconfig_sha256={hash}\nkernel-config-sha256={hash}\nsources_lock_sha256={hash}\n"
+            "schema=8\nid=rustos-linux-dvm-x86_64\narchitecture=x86_64\nboot=linux-bzimage+cpio-xz\ndata-plane=hostd-input-ring-msix\ncontrol-plane=agent-v1-control\ncontrol-protocol=agent-v1\ncontrol-state=control\ncontrol-transport=kvm-vsock\ncontrol-authentication=dvm-agent-hmac-sha256-v1\ncontrol-capabilities=health,device-inventory,driver-inventory,display-evidence-v2,block-evidence-v1,input-stream\ncontrol-contract-sha256={hash}\nbuildroot_version=2026.05\nlinux_version=6.12.94\nnvidia-open-version=580.173.02\nnvidia-open-sha256=8d8eb9001e05a9a8a663d3d5d304feb64ef2844ee185ccdfd952786820f46e1b\nnvidia-open-redistribute=no\ndisplay-kernel-modules=i915,xe,amdgpu,nvidia-drm\nmodule-signing-enforced=yes\nmodule-signing-cert-sha256={hash}\nkernel_sha256={hash}\nrootfs_sha256={hash}\nconfig_sha256={hash}\nkernel-config-sha256={hash}\nsources_lock_sha256={hash}\n"
         );
         let values = parse_manifest_text(&manifest, "manifest").unwrap();
         assert_eq!(validate_manifest_values(&values).unwrap(), contract);
@@ -4430,7 +4705,7 @@ uiserver: update tick backlog=false input_drops=0 input_slow=0 input_errors=0";
             "../../../driver-domains/linux/board/overlay/usr/share/rustos-dvm/control-plane-v1.env"
         );
         let invalid = contract_source.replace(
-            "CONTROL_CAPABILITIES=health,device-inventory,driver-inventory,display-evidence-v2,input-stream",
+            "CONTROL_CAPABILITIES=health,device-inventory,driver-inventory,display-evidence-v2,block-evidence-v1,input-stream",
             "CONTROL_CAPABILITIES=health,network-rx",
         );
         assert!(parse_dvm_control_contract_text(&invalid, "invalid contract").is_err());

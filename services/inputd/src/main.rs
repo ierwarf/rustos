@@ -8,24 +8,25 @@ use std::thread;
 
 use keyboard_core::{KeyAction, KeyboardDriver, KeyboardEvent};
 use rustos_user_abi::syscall::{
-    CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
-    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, InputIngestBrokerArgs,
-    InputIngressWire, InputPointerPacketWire, InputPointerPositionWire, InputStatsBrokerArgs,
-    InputStatsWire, InputdIpcRequest, InputdIpcResponse, InputdPointerSurfaceRequest,
-    InputdReadResponse, COMMERCIAL_MAX_INPUTD_OP_DROP_POLICY,
-    COMMERCIAL_MAX_INPUTD_OP_EVDEV_TRANSLATE, COMMERCIAL_MAX_INPUTD_OP_INPUT_INGEST,
-    COMMERCIAL_MAX_INPUTD_OP_INPUT_READER, COMMERCIAL_MAX_INPUTD_OP_INPUT_STATS,
-    COMMERCIAL_MAX_INPUTD_OP_LAYOUT_POLICY, COMMERCIAL_MAX_INPUTD_OP_POINTER_SURFACE_POLICY,
-    COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_INPUTD, INPUTD_ACCESS_EVDEV,
-    INPUTD_ACCESS_NATIVE, INPUTD_INGEST_MAX_EVENTS, INPUTD_INGRESS_FLAG_DVM_SOURCE,
-    INPUTD_INGRESS_FLAG_RESET_STATE, INPUTD_INGRESS_KIND_DVM_LINUX_KEY,
-    INPUTD_INGRESS_KIND_POINTER_PACKET, INPUTD_INGRESS_KIND_POINTER_POSITION,
-    INPUTD_IPC_ABI_VERSION, INPUTD_IPC_OP_AUTHORIZE_READ, INPUTD_IPC_OP_DRAIN_INGEST,
-    INPUTD_IPC_OP_PING, INPUTD_IPC_OP_READ, INPUTD_IPC_OP_SET_POINTER_SURFACE, INPUTD_IPC_OP_STATS,
-    INPUTD_READ_FLAG_NONBLOCK, INPUTD_READ_PAYLOAD_CAPACITY, IPC_MAX_INLINE_BYTES,
-    IPC_SERVICE_INPUTD, SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_INPUT_INGEST_BROKER,
-    SYS_RUSTOS_INPUT_STATS_BROKER, SYS_RUSTOS_INPUT_WAIT_BROKER, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
-    SYS_RUSTOS_IPC_RECV, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
+    identity_is_exact_sender, CommercialMaxCapabilityLeaseWire,
+    CommercialMaxProtocolDescriptorWire, CommercialMaxProtocolRequest,
+    CommercialMaxProtocolResponse, InputIngestBrokerArgs, InputIngressWire, InputPointerPacketWire,
+    InputPointerPositionWire, InputStatsBrokerArgs, InputStatsWire, InputdIpcRequest,
+    InputdIpcResponse, InputdPointerSurfaceRequest, InputdReadResponse,
+    COMMERCIAL_MAX_INPUTD_OP_DROP_POLICY, COMMERCIAL_MAX_INPUTD_OP_EVDEV_TRANSLATE,
+    COMMERCIAL_MAX_INPUTD_OP_INPUT_INGEST, COMMERCIAL_MAX_INPUTD_OP_INPUT_READER,
+    COMMERCIAL_MAX_INPUTD_OP_INPUT_STATS, COMMERCIAL_MAX_INPUTD_OP_LAYOUT_POLICY,
+    COMMERCIAL_MAX_INPUTD_OP_POINTER_SURFACE_POLICY, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
+    COMMERCIAL_MAX_PROTOCOL_INPUTD, INPUTD_ACCESS_EVDEV, INPUTD_ACCESS_NATIVE,
+    INPUTD_INGEST_MAX_EVENTS, INPUTD_INGRESS_FLAG_DVM_SOURCE, INPUTD_INGRESS_FLAG_RESET_STATE,
+    INPUTD_INGRESS_KIND_DVM_LINUX_KEY, INPUTD_INGRESS_KIND_POINTER_PACKET,
+    INPUTD_INGRESS_KIND_POINTER_POSITION, INPUTD_IPC_ABI_VERSION, INPUTD_IPC_OP_AUTHORIZE_READ,
+    INPUTD_IPC_OP_DRAIN_INGEST, INPUTD_IPC_OP_PING, INPUTD_IPC_OP_READ,
+    INPUTD_IPC_OP_SET_POINTER_SURFACE, INPUTD_IPC_OP_STATS, INPUTD_READ_FLAG_NONBLOCK,
+    INPUTD_READ_PAYLOAD_CAPACITY, IPC_MAX_INLINE_BYTES, IPC_SERVICE_INPUTD, IPC_SERVICE_UISERVER,
+    SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_INPUT_INGEST_BROKER, SYS_RUSTOS_INPUT_STATS_BROKER,
+    SYS_RUSTOS_INPUT_WAIT_BROKER, SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_RECV_WITH_SENDER,
+    SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
 };
 #[cfg(not(test))]
 use rustos_user_abi::syscall::{
@@ -825,12 +826,16 @@ fn serve(endpoint: u64) {
     loop {
         let mut request = [0_u8; IPC_MAX_INLINE_BYTES];
         let mut reply_cap = 0_u64;
-        let received = syscall4(
-            SYS_RUSTOS_IPC_RECV,
+        let mut sender_pid = 0_u64;
+        let mut sender_tid = 0_u64;
+        let received = syscall6(
+            SYS_RUSTOS_IPC_RECV_WITH_SENDER,
             endpoint,
             request.as_mut_ptr() as u64,
             request.len() as u64,
             (&mut reply_cap as *mut u64) as u64,
+            (&mut sender_pid as *mut u64) as u64,
+            (&mut sender_tid as *mut u64) as u64,
         );
         if received <= 0 {
             continue;
@@ -840,7 +845,14 @@ fn serve(endpoint: u64) {
             let request = read_unaligned::<CommercialMaxProtocolRequest>(&request);
             let reply = {
                 let mut queue = lock_input_queue(&queue);
-                reply_commercial_request(reply_cap, &request, &mut queue, &mut ingest_scratch)
+                reply_commercial_request(
+                    reply_cap,
+                    &request,
+                    sender_pid,
+                    sender_tid,
+                    &mut queue,
+                    &mut ingest_scratch,
+                )
             };
             if reply < 0 {
                 let _ = writeln!(std::io::stderr(), "inputd: reply failed errno={}", -reply);
@@ -858,7 +870,13 @@ fn serve(endpoint: u64) {
             };
             response.status = {
                 let mut queue = lock_input_queue(&queue);
-                dispatch_pointer_surface_request(&request, &mut queue)
+                if rustos_svc_runtime::ipc::validate_service_owner(IPC_SERVICE_UISERVER, sender_pid)
+                    < 0
+                {
+                    libc::EACCES
+                } else {
+                    dispatch_pointer_surface_request(&request, &mut queue)
+                }
             };
             response.approved_len = (response.status == 0) as u64;
             debug_line("inputd: pointer surface state applied");
@@ -886,6 +904,16 @@ fn serve(endpoint: u64) {
                 ..InputdReadResponse::default()
             };
             response.status = match validate(received as usize, &request) {
+                Ok(())
+                    if !identity_is_exact_sender(
+                        request.pid,
+                        request.tid,
+                        sender_pid,
+                        sender_tid,
+                    ) =>
+                {
+                    libc::EACCES
+                }
                 Ok(()) => {
                     let mut queue = lock_input_queue(&queue);
                     dispatch_read(&request, &mut response, &mut queue, &mut ingest_scratch)
@@ -905,6 +933,16 @@ fn serve(endpoint: u64) {
                 ..InputdIpcResponse::default()
             };
             response.status = match validate(received as usize, &request) {
+                Ok(())
+                    if !identity_is_exact_sender(
+                        request.pid,
+                        request.tid,
+                        sender_pid,
+                        sender_tid,
+                    ) =>
+                {
+                    libc::EACCES
+                }
                 Ok(()) => {
                     let mut queue = lock_input_queue(&queue);
                     dispatch(&request, &mut response, &mut queue, &mut ingest_scratch)
@@ -939,6 +977,8 @@ fn log_dvm_ingress_observations(queue: &SharedInputQueue, state: &DvmIngressLogS
 fn reply_commercial_request(
     reply_cap: u64,
     request: &CommercialMaxProtocolRequest,
+    sender_pid: u64,
+    sender_tid: u64,
     queue: &mut InputQueue,
     ingest_scratch: &mut [InputIngressWire],
 ) -> i64 {
@@ -947,10 +987,16 @@ fn reply_commercial_request(
         ..CommercialMaxProtocolResponse::default()
     };
     response.header.version = COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
-    response.status = validate_commercial_request(request)
-        .and_then(|_| dispatch_commercial_request(request, &mut response, queue, ingest_scratch))
-        .err()
-        .unwrap_or(0);
+    response.status = if !request.subject_is_exact_sender(sender_pid, sender_tid) {
+        libc::EACCES
+    } else {
+        validate_commercial_request(request)
+            .and_then(|_| {
+                dispatch_commercial_request(request, &mut response, queue, ingest_scratch)
+            })
+            .err()
+            .unwrap_or(0)
+    };
     syscall3(
         SYS_RUSTOS_IPC_REPLY,
         reply_cap,
@@ -1449,8 +1495,8 @@ fn syscall3(number: u64, arg0: u64, arg1: u64, arg2: u64) -> i64 {
     unsafe { libc::syscall(number as libc::c_long, arg0, arg1, arg2) as i64 }
 }
 
-fn syscall4(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> i64 {
-    unsafe { libc::syscall(number as libc::c_long, arg0, arg1, arg2, arg3) as i64 }
+fn syscall6(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i64 {
+    unsafe { libc::syscall(number as libc::c_long, arg0, arg1, arg2, arg3, arg4, arg5) as i64 }
 }
 
 fn register_service_endpoint(service_id: u64, endpoint: u64) -> i64 {

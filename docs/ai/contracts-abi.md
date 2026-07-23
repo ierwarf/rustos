@@ -64,6 +64,30 @@ service admission and capability policy owner. Endpoint revoke is owner-only
 unless the caller holds `ROOT_SUPERVISOR`.
 `SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT` is service/supervisor discovery: root-supervisor callers may use the kernel table directly; other callers are admitted through rootd `COMMERCIAL_MAX_ROOTD_OP_SERVICE_LOOKUP`. Core services and post-init services are admitted only by matching a running rootd lease. Generic apps use Linux/Win32 ABI routes and kernel compat helpers, not raw policy-service endpoint lookup.
 Service capability assignment is rootd policy: after rootd self-registration, kernel compat asks `COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY` with the registering subject PID/TID and records the returned `IPC_SERVICE_CAP_*` mask only if rootd confirms the PID matches the running lease. This includes endpoint registration through the Linux syscall ABI. Do not reintroduce a full `service_id -> capability` table in ring0.
+Rootd self-registration is a boot-only trust transition, not a permanent
+fallback. The first successful rootd publication seals its non-reusable process
+identity for the boot; revoke or exit never allows a foreign process to claim
+`IPC_SERVICE_ROOTD`. A rootd failure is therefore fail-stop until reboot unless
+a future explicit, authenticated replacement protocol is added.
+Every service publication first proves that the endpoint is owned by the
+publishing process. Non-root registration also binds rootd's authorization to
+the exact rootd endpoint epoch and rechecks that epoch under the registry
+mutation lock at commit; restart/revoke/exit between check and publish returns
+`EAGAIN` and cannot publish stale authority.
+Numeric endpoint IDs are not ambient call authority. A successful service
+lookup records a bounded process-local grant for that exact service publication
+epoch; ordinary IPC calls and calls carrying handles must present the endpoint
+under that grant. Revoke/republication invalidates it by epoch, and process exit
+removes it. Endpoints outside the live service registry are callable only by
+their owner process. Raw endpoint values are not inherited/transferable
+capabilities; future cross-process endpoint transfer must use an explicit
+typed-handle grant and lifecycle contract.
+Runtimed's Unix control socket is also an authority boundary, not a trusted
+local channel. It reads `SO_PEERCRED` and ignores caller-supplied identity.
+Snapshot, launch, and terminate require either the current live uiserver
+service owner or a running process whose immutable launch record carries the
+signed `logical_admin` bit. `UI ready` is uiserver-only. Socket path permissions
+are defense in depth and never replace this per-request authorization.
 Post-init lease reporting is ring3-owned: `initd` reports successfully spawned
 policy services to rootd with `COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL`
 (`arg0=IPC_SERVICE_*`, `arg1=pid`, `path=exec`). rootd uses that lease registry
@@ -148,10 +172,14 @@ substitutes.
 Broker authorization checks the caller's registered service capability — **not** its executable path.
 `SYS_RUSTOS_ENTROPY_BROKER` is limited to the Linux-syscall and network-policy
 capabilities and returns at most one inline-IPC payload of bytes from the
-boot-seeded ChaCha20 substrate. Syscalld still owns Linux `getrandom` flag,
-length, and error policy; netd still owns token collision/admission policy.
-PID/TID/counter-derived pseudo-random output is forbidden for credentials,
-object capabilities, ASLR material, and Linux `getrandom`.
+boot-seeded ChaCha20 substrate. Initialization is one-shot and rejects an
+absent/all-zero seed. A private master stream derives every child seed from
+master output; consumers never clone the master or form related keys by
+combining the boot seed with public PID/TID/counter state. Syscalld still owns
+Linux `getrandom` flag, length, and error policy; netd still owns token
+collision/admission policy. PID/TID/counter-derived pseudo-random output is
+forbidden for credentials, object capabilities, ASLR material, and Linux
+`getrandom`.
 Until a standalone `pagerd` lease exists, `syscalld` may register the reserved `IPC_SERVICE_PAGERD` endpoint and receive `PAGER_POLICY`; rootd must treat that as an explicit compatibility delegation, not a generic multi-service registration rule.
 `initd` must not be spawned until that delegated pager endpoint is registered;
 otherwise dynamic loader page-fault/backing policy can deadlock behind rootd's
@@ -487,6 +515,14 @@ policy remains with the owning service.
   stamped by the kernel. Payload subject fields are not trusted unless they
   match this sender identity. Use the blocking variant only when the supervisor
   has no independent event source that must be polled before the next IPC.
+- Sender binding is mandatory for every published policy-service ingress, not
+  only rootd. Direct requests require a nonzero exact PID/TID match.
+  Service-to-service delegation is explicit: the receiver rechecks
+  `SYS_RUSTOS_IPC_VALIDATE_SERVICE_OWNER` for the kernel-stamped sender PID on
+  every delegated request and never caches the result across exit, revoke, or
+  endpoint republish. Sender identity, lookup admission, object rights, object
+  generation, and exact response binding are cumulative checks. The complete
+  ingress registry is `formal/trust-boundaries.tsv`.
 - IPC stability changes are substrate only. Service restart, admission, routing,
   and policy decisions stay in `rootd`/`syscalld`/`vfsd`/`loaderd`/other owning
   services, not in new ring0 policy tables.
@@ -578,20 +614,206 @@ policy remains with the owning service.
   A stale epoch therefore fails closed but cannot create an undeletable or
   duplicate interest.
 - Legacy `SYS_RUSTOS_{STATX,STAT,READLINK,ACCESS,GETCWD,CHDIR}_METADATA`: no generic-app VFS policy in ring0 after vfsd registers. Pre-vfsd bootstrap + registered policy-service callers retain direct kernel metadata access.
-- `SYS_RUSTOS_BLOCK_BROKER`: narrow boot-volume read broker, gated by `VFS_POLICY`, accepts `RustosBlockBrokerArgs`. Does not depend on `storaged`.
+- `SYS_RUSTOS_BLOCK_BROKER` ABI v3 is DVM-only and gated by
+  `STORAGE_POLICY`. `BOOT_INFO`, `BOOT_READ`, physical descriptors, and the
+  `VFS_POLICY` lane do not exist. Operation-incompatible fields, the explicit
+  timeout, and reserved words must be zero. Tickets bind generation, request
+  ID, and transfer slot; a failed ticket copyout cancels the submitted request
+  rather than publishing ownerless work.
+- `SYS_RUSTOS_EARLY_SYSTEM_BROKER` ABI v1 is a separate vfsd-only immutable
+  bootstrap-file lane. It accepts one inline exact path from the signed
+  early-system table and provides only file length or at most 4 KiB of
+  read-only bytes. It has no enumeration, directory, physical LBA, controller,
+  mutation, or fallback operation. Vfsd owns path normalization, open
+  descriptions, cursors, checkpointing, and the overlay decision; digest and
+  exact-entry admission remain in the bounded ring0 reader.
 
 ## Storage Surface (`storaged`)
 
-- Gated `SYS_RUSTOS_STORAGE_LIST_BROKER` (gated by `STORAGE_POLICY`) enumerates kernel-discovered descriptors; no direct generic-app storage probing.
-- Storaged accepts only the versioned `CommercialMaxProtocolRequest` contract.
-  Boot extent leases are storaged policy, sourced from
-  `system/registry/kernel/root-file-extents.tsv` and returned over
-  `COMMERCIAL_MAX_STORAGED_OP_BOOT_EXTENT_LEASE`. Do not reintroduce generic
-  ring0 boot-extent policy; ring0 storage brokers remain descriptor/block
-  substrate only.
-- Root extent manifests are bootloader-supplied data, not ring0 filesystem policy. GRUB signature enforcement authenticates `system/registry/kernel/root-file-extents.tsv` before loading it as the `rustos-root-extents` multiboot2 module, and `BootInfo.boot_extent_manifest` points at that immutable memory. Each row binds an exact path and extent coverage to ordered `sha256_chunks` digests over 64-KiB file chunks. Kernel boot may parse that manifest and perform physical extent reads, but must reject duplicate paths, overlapping/inexact extents, digest-count mismatch, and content mismatch; it must not need FAT directory traversal just to discover the manifest.
-- Ring0 boot-volume FAT traversal is not part of the direct boot-file path. Entering `KernelVfsReady` must preload the root extent table from `BootInfo.boot_extent_manifest`; if the manifest is absent or a path is missing from it, direct boot-volume helpers fail closed. Directory traversal and generic FAT fallback must stay out of ring0 so namespace policy stays in `vfsd`/`storaged`.
-- AHCI/NVMe post-bootstrap selection, inventory, partition, and extent policy lives in `storaged`/`vfsd`, but physical boot-volume block reads still require kernel io-manager transport substrate. Do not delete AHCI MMIO/DMA command execution until an explicit ring3 service-driver protocol can perform real block I/O before `rootd` and `vfsd` need it.
+- Kernel storage inventory, `SYS_RUSTOS_STORAGE_LIST_BROKER`, boot extent
+  leases, raw disk offsets, and AHCI/NVMe policy replies are retired. Storaged
+  derives one DVM descriptor only from authenticated live DVM geometry.
+- Boot protocol version 18 retains the former physical extent pointer/length
+  only as two mandatory-zero reserved words. Multiboot accepts exactly one
+  `rustos-early-system` module and has no `rustos-root-extents` selector.
+- GRUB loads one signed, immutable, uncompressed early-system module containing
+  the exact bounded bootstrap allowlist needed to start rootd, the core policy
+  services and storaged. Hostd and the storage-DVM kernel/rootfs/control
+  artifacts are separately signed host inputs. The early-system fixed table uses checked
+  offsets, lengths, and per-file SHA-256 digests; pages stay reserved until no
+  bootstrap executable or registry references them. Ring0 does not gain an
+  archive decompressor, filesystem namespace, general path traversal, or
+  mutable package policy.
+- The exact allowlist includes the minimal dynamic ELF runtime closure needed
+  before storage-DVM readiness (`/lib64/ld-linux-x86-64.so.2`, `libc.so.6`,
+  and `libgcc_s.so.1`) in addition to bootstrap services and registries.
+  Missing runtime members fail image staging; boot never falls through to a
+  physical controller or an unverified host filesystem.
+- The early-system module is a bootstrap capability, not a native-storage
+  fallback. Once its manifest is admitted, rootd and loaderd may open only its
+  exact entries until storaged publishes the DVM-backed root volume. Missing,
+  duplicate, overlapping, out-of-range, digest-mismatched, or undeclared
+  entries stop bootstrap. They must never trigger NVMe/AHCI probing.
+- Vfsd resolves exact early-system files through the dedicated immutable
+  broker before consulting the DVM FAT volume. This lets loaderd start initd
+  and the fixed bootstrap closure without racing storage-DVM readiness; all
+  non-entry paths continue to the service-owned DVM volume and an invalid
+  early-system image fails closed instead of becoming a false `ENOENT`.
+- Early-system ownership is resolved before applying the broker's 4-KiB
+  transfer bound. A non-owned path returns to the DVM volume even when the
+  caller supplied a larger VFS buffer; an owned immutable entry is read in
+  bounded 4-KiB chunks. An entry that disappears between INFO and READ is
+  corruption and fails closed rather than falling through to mutable storage.
+- The boot disk is a storage-DVM backing artifact, never a ring0 mount. Xtask
+  reopens every staged FAT file after image construction and compares its
+  exact bytes; early-system creation separately requires every allowlisted
+  file, rejects duplicates/empty payloads, and signs the completed image.
+- RustOS contains no AHCI/NVMe probe, queue, DMA allocator, partition registry,
+  FAT opener, or physical-block fallback. Missing or malformed early-system
+  state stops bootstrap; it cannot reactivate physical-storage code.
+- Physical NVMe/AHCI ownership transfers exactly once on the host:
+  `exclusive whole-device open -> reject holders/mounts/swaps -> bounded
+  fsync+BLKFLSBUF -> validate exact controller and IOMMU group -> unbind the
+  signed original driver -> reset -> bind vfio-pci -> launch one storage DVM
+  with a newer generation -> authenticated check-arm-recheck readiness`.
+  Host-native and DVM authority must never overlap. Failure after detach
+  revokes the aperture before controller restoration; failed revocation
+  quarantines the controller and retains recovery records.
+- An active storage lease cannot use the direct `release --activate` path.
+  `recover` must load the durable runtime record, bind the exact PID plus
+  process start time, request bounded QMP/ACPI shutdown, observe that process
+  exit, and only then revoke the generation-bound aperture. Controller reset
+  and original-driver restoration follow aperture revocation; any failed step
+  retains the lease and quarantine evidence instead of fabricating release.
+- `driver-domain-protocol` owns the versioned, address-free DVM block wire
+  contract. Version 1 fixes one 8-MiB power-of-two PCI BAR, two 64-entry rings,
+  and 64 host-owned 64-KiB transfer slots. The unused tail after the fixed slot
+  array is reserved and grants no addressable request/data authority. Requests
+  name only a slot, launch generation, request ID, monotonic
+  mutation operation ID, sector range, and Virtio-compatible
+  READ/WRITE/FLUSH/DISCARD/WRITE_ZEROES operation. Unknown flags, reserved
+  bytes, stale generations, unaligned/overflowing ranges, read-only mutations,
+  and unsupported features fail closed.
+- Every shared block-header scalar is naturally aligned. The four 64-bit ring
+  cursors are single-copy atomic little-endian values: each ring has exactly
+  one producer and one consumer, the producer publishes its record/data before
+  a Release cursor store, and the consumer performs an Acquire cursor load
+  before reading that record/data. Header identity and geometry are immutable
+  for one generation; only readiness and ring cursors may change. RustOS
+  validates immutable fields separately from live cursors so normal peer
+  progress cannot be mistaken for corruption, while any identity, geometry,
+  feature, read-only-mode, or generation mutation revokes the aperture.
+- L0 initializes authenticated immutable geometry with both readiness bits
+  clear. RustOS alone sets `RUSTOS_READY`, only after the exact aperture and
+  its MSI-X receiver are installed, then rings peer 1. The storage DVM may
+  bind the initial aperture but must not publish `DVM_READY` until it observes
+  that RustOS bit, validates the Linux block geometry, and owns the physical
+  controller. Pre-setting either peer's bit, retaining readiness across an
+  epoch, or publishing DVM readiness first fails admission.
+- Storage-DVM relay admission reports the exact failing stage (`lock`,
+  `transport`, `header`, `block-device`, `rustos-ready`, `publish-ready`, or
+  `publish-evidence`) with the preserved errno. A generic readiness timeout is
+  not acceptable evidence for this boundary.
+- Both directions use ivshmem MSI-X vector 0 only after the corresponding
+  Release cursor publication. RustOS writes BAR0 doorbell peer 1 for requests;
+  the storage DVM writes peer 0 for completions and readiness withdrawal.
+  Doorbells are coalescible wake hints, never queue state: each consumer checks
+  its cursor before arming, arms the one event source, rechecks, and drains
+  until producer equals consumer. Startup also drains pre-existing work, so a
+  pre-boot or coalesced edge cannot require polling.
+- A physical storage domain uses signed driver-domain policy schema 4 only:
+  every non-block transport is disabled, `BLOCK_TRANSPORT=block-ring-msix`,
+  the driver is exactly `nvme` or `ahci`, PCI vendor/device, class/prog-if,
+  original host driver, and the one-function IOMMU group match exactly, FLUSH
+  is mandatory, queue depth and slot size equal the compiled ABI, and
+  handoff/reset deadlines are bounded.
+  Schema 2/3 cannot opt into the block transport, so a generic or display
+  domain cannot acquire storage authority by changing one transport string.
+- AHCI admission includes the complete minimal Linux driver closure: `ahci`
+  owns the PCI controller and signed `sd_mod` must publish its one whole-disk
+  block namespace before the relay starts. NVMe uses its native namespace
+  driver directly. Missing class-driver or namespace publication fails closed.
+- Completion authority binds the exact generation, request ID, operation ID,
+  and slot. Successful reads report no durability. Successful FUA writes and
+  FLUSH report the exact durable-through operation ID; ordinary writeback
+  completions may report only an earlier accepted mutation. DVM restart clears
+  both rings and readiness, revokes the old generation, and requires a new
+  authenticated readiness publication before requests resume.
+- Ring0's DVM block endpoint is transport substrate only. It validates one
+  exact aperture, arms exactly one MSI-X leaf that only wakes, copies bounded
+  records/data, and exposes nonblocking submit/collect/cancel plus a
+  check-arm-recheck wait. The wait accepts only a 1--30,000 ms deadline and
+  shares the RTC wake path; it never spins or applies storage policy.
+  Cancellation does not reuse a slot until the exact late completion is
+  consumed or the generation is revoked.
+- Aperture installation and provider readiness are separate composition
+  points. Before RustOS has ever observed `DVM_READY`, its absence is
+  `EAGAIN` and the wait predicate remains sleepable; it is not a fault event.
+  A newly observed ready bit is itself one wait event, closing the race where
+  the DVM publishes between storaged's failed INFO check and scheduler arm.
+  Storaged retries INFO behind that atomic waiter for at most 15 seconds in
+  one-second slices. Withdrawal after a successful observation is revoke, and
+  timeout never selects early-system or a physical-controller fallback.
+- Common PCI resource discovery disables command decoding, probes and restores
+  each standard BAR dword independently, and restores the low half of a 64-bit
+  BAR before touching its high partner. Resource size is the least significant
+  implemented address-mask bit, not a full-width two's-complement inversion,
+  so zero upper mask bits cannot turn an 8-MiB ivshmem BAR into an enormous
+  resource. This follows Linux `__pci_size_stdbars`/`__pci_read_base`; QEMU's
+  ivshmem contract assigns the shared-memory object to BAR2.
+- `storaged` binds every I/O to the current DVM generation, owns a 15-second
+  operation deadline, and cancels timed-out tickets. Control operations and
+  writes retain the generic 4-KiB commercial payload. Reads additionally use
+  operation 12 and one dedicated exact 64-KiB response: an 80-byte fixed
+  header plus at most 65,456 payload bytes. `vfsd` chooses only a
+  block-aligned prefix of that payload (60 KiB for a 4-KiB logical block) and
+  validates the echoed complete request header, generation, LBA, block count,
+  reserved word, and exact payload length before advancing its cursor. The
+  bulk operation reuses the ordinary read capability bit; it does not mint
+  wider authority. `vfsd` still obtains geometry and performs FAT
+  reads/writes/flushes only through storaged and never calls a physical
+  boot-block broker.
+- Storaged startup performs one generation-bound, non-mutating FLUSH and emits
+  its storage E2E proof only after the request crosses the block broker and
+  shared ring, the Linux DVM completes the backing-device flush, and storaged
+  consumes the exact completion. Storage-DVM KVM acceptance requires this
+  proof in addition to both peer readiness flags and exact geometry.
+- Storaged may satisfy repeated FAT metadata and executable reads from at most
+  eight validated 64-KiB read-ahead windows (512 KiB total), but it first
+  revalidates live DVM geometry and the exact caller generation on every
+  request. A hit must be wholly contained in one exact-generation window. A
+  miss submits one forward window no larger than the fixed DVM slot;
+  overlapping replacements cannot coexist, a different generation atomically
+  replaces the complete cache epoch, and every write clears all windows before
+  submission. Transport-info failure also clears them. Cached bytes therefore
+  cannot survive revoke, restart, or mutation, and the optimization adds no
+  controller authority or hidden fallback to vfsd.
+- Storaged invokes RustOS-private syscalls only through the raw
+  `rustos-svc-runtime` entrypoints. A libc wrapper must not collapse raw
+  negative results into `-1` plus TLS `errno`; transient `EAGAIN`, absence,
+  revocation, timeout, and protocol failure remain distinct across the full
+  kernel-to-vfsd path.
+- Rootd's least-authority service graph contains the explicit
+  `vfsd -> storaged` edge. Before storaged publication, lookup preserves the
+  transient registry errno; denial preserves `EACCES`. Kernel lookup validates
+  canonical error responses before applying success-only value invariants, so
+  neither state can be fabricated as `EINVAL` and cached as permanent.
+- Runtimed keeps `uiserver` outside the early-system bootstrap image. A
+  transient loader or DVM-volume error schedules a bounded 500-ms supervisor
+  retry; only the existing permanent-launch errno set disables the entry.
+  Successful spawn ownership prevents duplicates while endpoint readiness is
+  pending.
+- Design sources: Linux VFIO defines the IOMMU group as the minimum viable
+  ownership unit (`https://www.kernel.org/doc/html/latest/driver-api/vfio.html`);
+  Linux stable block queue ABI defines logical/physical sizes, FUA, discard,
+  write cache, and write-zeroes
+  (`https://www.kernel.org/doc/html/latest/admin-guide/abi-stable-files.html`);
+  QEMU ivshmem-doorbell defines the shared-memory server and interrupt-vector
+  topology (`https://www.qemu.org/docs/master/system/devices/ivshmem.html`,
+  `https://www.qemu.org/docs/master/specs/ivshmem-spec.html`); Linux sizes
+  standard BAR dwords with decoding disabled before composing a 64-bit
+  resource
+  (`https://github.com/torvalds/linux/blob/master/drivers/pci/probe.c`).
 
 ## Input Surface (`inputd`)
 
@@ -772,6 +994,12 @@ policy remains with the owning service.
 
 - Runtime launches route through `loaderd` (`IPC_SERVICE_LOADERD`), not direct `SYS_RUSTOS_SPAWN_EXEC`.
 - `SYS_RUSTOS_PROC_*_BROKER` calls fail with `EACCES` unless caller owns `PROCESS_LOADER`.
+- Loader request ABI v2 requires `requester_pid` to equal the kernel-stamped
+  IPC sender. Process broker ABI v2 carries that identity into deferred
+  commit: ring0 binds the suspended target PID to the exact requester in a
+  bounded registry. ACTIVATE consumes that pair once; foreign callers and
+  replays fail, loaderd restart cannot transfer or erase the authority, and
+  requester exit revokes the entry and retires the still-suspended target.
 - `SYS_RUSTOS_SPAWN_EXEC` restricted to `rootd` spawning the fixed bootstrap allowlist (`syscalld`, `vfsd`, `loaderd`, `procd`, `initd`). Fails closed for `initd`, generic apps, broad service restarts. rootd may use direct spawn only during fixed bootstrap + `loaderd` recovery; post-bootstrap restarts of other leases must call loaderd.
 - Linux `execve` → `procd` (target auth) → `loaderd` (image materialization). If loader materialization fails, procd must cancel the exec ticket via `SYS_RUSTOS_PROC_CANCEL_EXEC_BROKER` before replying.
 - An exec ticket binds one live, non-exiting Linux `(target_pid, target_tid)` pair. Cancel and exec-target validate that exact stored pair before consuming the ticket; a mismatched request must leave it live. The successful exec-target path publishes its register handoff before replacing the target image. Normal/signal process exit, a non-final target-thread exit, and sibling retirement caused by Linux exec remove stale ticket or handoff state.
@@ -809,10 +1037,27 @@ committing a zero-filled file tail. The TLA+ models, source-level tests, and
 
 **PE64:** PE validation, section materialization, base relocation, import/export resolution, staged system-DLL registry lookup, PEB/TEB/runtime blob construction all happen in loaderd before commit. The bounded section-header table is fetched with one `pread64`, not one policy/VFS roundtrip per section. PE64 commit includes `SYS_RUSTOS_PROC_SET_WINDOWS_RUNTIME_BROKER` after all `MAP_DATA_BROKER` ops and before `COMMIT_BROKER`. Kernel validates metadata + spawns the materialized address space but **must not** reintroduce PE import/export/system-DLL policy.
 
+A prepared remote file mapping may use a larger internal copy buffer, but each
+fallback read from vfsd is capped to the versioned VFS IPC payload.
+Bootstrap-backed reads may fill the larger buffer directly. VFS IPC version 4
+uses the maximum 64-KiB inline message with a fixed 40-byte response header and
+the remaining 65,496 bytes as payload, so one kernel copy window requires at
+most two bounded reads. The response layout and exact maximum size are source
+assertions; a larger request is chunked instead of becoming an
+executable-specific `EOVERFLOW`.
+
 Commit (`COMMIT_BROKER`) builds the child address space from recorded mappings.
 When a broker request supplies `console_session = 0`, the kernel inherits the
 exact live caller (or target thread) session. Missing process/thread state is
 `EINVAL`; it must never manufacture the privileged system session.
+One loader request is one synchronous reply-capability transaction. Image
+reads and nested policy IPC remain ordinary preemption/block points, but
+loaderd must not insert voluntary scheduler yields between mapping,
+runtime-metadata publication, and commit while retaining that reply. Such
+yields neither release ownership nor improve correctness and can expand a
+bounded launch by whole scheduler fairness windows under concurrent System
+services. The idle/failed receive loop may still yield because it owns no
+caller transaction.
 By default, commit-broker spawns do not request immediate deferred reschedule so
 `loaderd` can reply to its caller before the spawned child runs startup policy.
 Supervisors (`rootd` for initd, `initd` for post-init services, and `runtimed`
@@ -847,6 +1092,14 @@ replaces older generic hints, even across scheduling classes; stale high-class
 service hints must not block the service that the current caller is waiting on.
 A generic receiver hint is consumed when the server blocks or the scheduler
 next selects work; it must not switch away from a live syscall continuation.
+
+Every syscall captures the entering user's complete SIMD/FPU image in a
+syscall-scoped snapshot distinct from the scheduler's per-task SIMD slot. If a
+blocking syscall yields, the task slot is allowed to hold the suspended kernel
+continuation's SIMD scratch state; syscall return must restore only the
+entering-user snapshot. Reusing the scheduler slot for both lifetimes violates
+the syscall register-preservation ABI and can corrupt userspace request
+structures assembled with XMM/YMM registers after the wait.
 
 The separate local-socket completion path accepts a netd latency flag only
 from the currently registered netd endpoint, only for the exact versioned
@@ -983,5 +1236,16 @@ they do not admit a service or a module-loading path.
   only from `rootd`'s fixed manifest. Dynamic package metadata cannot set
   `TASK_WEIGHT_INTERACTIVE_FLAG`; admitted ready brokers are covered by the
   bounded System-class wait rail.
+- Privileged loader requests use service roles, never caller-supplied PIDs.
+  `SPAWN_EXEC` requires the current rootd, initd, or sessiond endpoint owner;
+  `EXEC_TARGET` requires procd. Initd's endpoint is identity-only and has no
+  receive surface. Loaderd checks on ingress and ring0 repeats the check at the
+  final commit, after image loading, so role restart/revoke invalidates the
+  request before flags, weight, console session, or target image can commit.
+- Post-init readiness is not a PID announcement. Rootd requires the exact
+  declared executable path and asks a rootd-only process broker to prove the
+  still-unconsumed deferred-spawn `(target_pid, reporter_pid)` binding before
+  publishing the lease. Capability registration then independently requires
+  the reported PID to own its endpoint; reporter exit revokes descendants.
 - `KernelSpinLock` must not be held across disk/filesystem/IPC/framebuffer-copy loops. Use `KernelWaitLock` or split the section; add `cond_resched` in long loops.
 - Boot service order: driver/input/storage policy services before UI launchers. `runtimed` waits on `devmgrd` and `storaged` endpoints before UI bootstrap.

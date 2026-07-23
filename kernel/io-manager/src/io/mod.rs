@@ -1,5 +1,6 @@
 pub mod console;
 pub mod device;
+pub(crate) mod dvm_block;
 pub(crate) mod dvm_display;
 pub(crate) mod dvm_network;
 pub mod gui;

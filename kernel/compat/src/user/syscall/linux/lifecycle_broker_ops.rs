@@ -5,7 +5,8 @@ use super::*;
 
 use rustos_user_abi::syscall::{
     IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY, IPC_SERVICE_CAP_PROCESS_POLICY,
-    IPC_SERVICE_CAP_ROOT_SUPERVISOR, LifecycleDrainBrokerArgs, RustosRootdTerminateBrokerArgs,
+    IPC_SERVICE_CAP_ROOT_SUPERVISOR, LIFECYCLE_DRAIN_BROKER_ABI_VERSION, LifecycleDrainBrokerArgs,
+    ROOTD_TERMINATE_BROKER_ABI_VERSION, RustosRootdTerminateBrokerArgs,
 };
 
 /// A supervisor may defer a restart but must not turn the timer substrate into
@@ -18,11 +19,14 @@ fn rootd_wait_delay_is_valid(millis: u64) -> bool {
 }
 
 fn rootd_terminate_args_are_valid(args: &RustosRootdTerminateBrokerArgs) -> bool {
-    args.abi_version == 1 && args.reserved0 == 0 && args.flags == 0 && args.target_pid != 0
+    args.abi_version == ROOTD_TERMINATE_BROKER_ABI_VERSION
+        && args.reserved0 == 0
+        && args.flags == 0
+        && args.target_pid != 0
 }
 
 fn lifecycle_drain_args_are_valid(args: &LifecycleDrainBrokerArgs) -> bool {
-    args.abi_version == rustos_user_abi::syscall::PROC_BROKER_ABI_VERSION
+    args.abi_version == LIFECYCLE_DRAIN_BROKER_ABI_VERSION
         && args.reserved0 == 0
         && args.reserved1 == 0
         && args.reserved2 == 0
@@ -119,12 +123,15 @@ mod tests {
     use super::{
         lifecycle_drain_args_are_valid, rootd_terminate_args_are_valid, rootd_wait_delay_is_valid,
     };
-    use rustos_user_abi::syscall::{LifecycleDrainBrokerArgs, RustosRootdTerminateBrokerArgs};
+    use rustos_user_abi::syscall::{
+        LIFECYCLE_DRAIN_BROKER_ABI_VERSION, LifecycleDrainBrokerArgs,
+        ROOTD_TERMINATE_BROKER_ABI_VERSION, RustosRootdTerminateBrokerArgs,
+    };
 
     #[test]
-    fn lifecycle_drain_requires_exact_v1_zero_reserved_envelope() {
+    fn lifecycle_drain_requires_exact_version_zero_reserved_envelope() {
         let valid = LifecycleDrainBrokerArgs {
-            abi_version: rustos_user_abi::syscall::PROC_BROKER_ABI_VERSION,
+            abi_version: LIFECYCLE_DRAIN_BROKER_ABI_VERSION,
             ..LifecycleDrainBrokerArgs::default()
         };
         assert!(lifecycle_drain_args_are_valid(&valid));
@@ -147,9 +154,9 @@ mod tests {
     }
 
     #[test]
-    fn rootd_terminate_args_require_a_v1_nonzero_target_without_flags() {
+    fn rootd_terminate_args_require_exact_version_nonzero_target_without_flags() {
         let valid = RustosRootdTerminateBrokerArgs {
-            abi_version: 1,
+            abi_version: ROOTD_TERMINATE_BROKER_ABI_VERSION,
             target_pid: 7,
             ..RustosRootdTerminateBrokerArgs::default()
         };

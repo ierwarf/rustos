@@ -62,7 +62,7 @@ pub use self::irq::{
     timer_interrupt_handler_addr, yield_now,
 };
 pub use self::spawn::{
-    restore_current_simd_state, save_current_simd_state, spawn_kernel_process, spawn_user_process,
+    SyscallUserSimdSnapshot, spawn_kernel_process, spawn_user_process,
     spawn_user_process_state_with_parent, spawn_user_process_suspended,
     spawn_user_process_with_parent, spawn_user_process_without_deferred_reschedule,
     spawn_user_thread_suspended, start,
@@ -80,6 +80,18 @@ static mut SCHEDULER: Scheduler = Scheduler::new();
 static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(0);
 static DEFERRED_RESCHEDULE_REQUESTED: AtomicU64 = AtomicU64::new(0);
 static USER_RETURN_RESCHEDULE_ARMED: AtomicU64 = AtomicU64::new(0);
+
+fn allocate_task_id_from(counter: &AtomicU64) -> Option<u64> {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .ok()
+}
+
+fn allocate_task_id() -> Option<u64> {
+    allocate_task_id_from(&NEXT_TASK_ID)
+}
 
 #[inline(always)]
 unsafe fn scheduler_mut() -> &'static mut Scheduler {
@@ -382,7 +394,7 @@ impl Thread {
     pub fn new(entry: fn(u64), weight_micros: u64) -> Self {
         Self {
             entry: kernel_fn_in_higher_half(entry),
-            id: NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed),
+            id: allocate_task_id().expect("kernel task identity exhausted"),
             pit_divisor: checked_thread_pit_divisor(weight_micros)
                 .expect("kernel thread weight must satisfy scheduler limits"),
             slot: Cell::new(None),
@@ -413,6 +425,9 @@ impl Thread {
         });
     }
 }
+
+#[cfg(test)]
+mod identity_tests;
 
 fn checked_thread_pit_divisor(weight_micros: u64) -> Result<u16, SpawnTaskError> {
     if !thread_weight_is_valid(weight_micros) {

@@ -2,12 +2,40 @@ use x86_64::VirtAddr;
 use x86_64::instructions::interrupts;
 
 use super::{
-    MAIN_THREAD_SLICE_MICROS, NEXT_TASK_ID, SpawnTaskError, UserTaskBootstrap,
+    MAIN_THREAD_SLICE_MICROS, NEXT_TASK_ID, SpawnTaskError, UserTaskBootstrap, allocate_task_id,
     checked_thread_pit_divisor, initial_task_rflags, kernel_task_entry_trampoline_addr,
-    noop_task_entry, scheduler_mut, scheduler_ref,
+    noop_task_entry, scheduler_mut,
 };
 use crate::memory::paging::ProcessAddressSpace;
 use crate::user::process_state::UserProcessState;
+
+/// Exact user SIMD/FPU image captured at a syscall trust boundary.
+///
+/// This snapshot is deliberately separate from the scheduler's per-task SIMD
+/// slot. A blocking syscall may context-switch while its kernel continuation
+/// is live; the scheduler must then save the kernel continuation's SIMD
+/// scratch state in the task slot. Reusing that slot for syscall return would
+/// expose the scratch state to userspace and corrupt registers the syscall ABI
+/// promises to preserve.
+pub struct SyscallUserSimdSnapshot {
+    task_id: u64,
+}
+
+impl SyscallUserSimdSnapshot {
+    pub fn capture() -> Option<Self> {
+        interrupts::without_interrupts(|| unsafe {
+            scheduler_mut()
+                .capture_current_syscall_user_simd()
+                .map(|task_id| Self { task_id })
+        })
+    }
+
+    pub fn restore(self) -> bool {
+        interrupts::without_interrupts(|| unsafe {
+            scheduler_mut().restore_current_syscall_user_simd(self.task_id)
+        })
+    }
+}
 
 pub fn spawn_user_process(
     address_space: ProcessAddressSpace,
@@ -61,7 +89,7 @@ fn spawn_user_process_inner(
         crate::debug::warn!(process, "fault injection: process.spawn failed");
         return Err(SpawnTaskError::NoFreeTaskSlot);
     }
-    let id = NEXT_TASK_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let id = allocate_task_id().ok_or(SpawnTaskError::NoFreeTaskSlot)?;
     let pit_divisor = checked_thread_pit_divisor(weight_micros)?;
     let user_cs = crate::arch::gdt::user_code_selector().0 as u64;
     let user_ss = crate::arch::gdt::user_data_selector().0 as u64;
@@ -109,7 +137,7 @@ pub fn spawn_user_process_state_with_parent(
         crate::debug::warn!(process, "fault injection: process.spawn failed");
         return Err(SpawnTaskError::NoFreeTaskSlot);
     }
-    let id = NEXT_TASK_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let id = allocate_task_id().ok_or(SpawnTaskError::NoFreeTaskSlot)?;
     let pit_divisor = checked_thread_pit_divisor(weight_micros)?;
     let user_cs = crate::arch::gdt::user_code_selector().0 as u64;
     let user_ss = crate::arch::gdt::user_data_selector().0 as u64;
@@ -152,7 +180,7 @@ pub fn spawn_kernel_process(
     arg0: u64,
     weight_micros: u64,
 ) -> Result<u64, SpawnTaskError> {
-    let id = NEXT_TASK_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let id = allocate_task_id().ok_or(SpawnTaskError::NoFreeTaskSlot)?;
     let pit_divisor = checked_thread_pit_divisor(weight_micros)?;
     let kernel_cs = crate::arch::gdt::kernel_code_selector().0 as u64;
     let kernel_ss = crate::arch::gdt::kernel_data_selector().0 as u64;
@@ -181,7 +209,7 @@ fn spawn_milestone_arg(slot: usize, spawned_from_user: bool, weight_micros: u64)
 }
 
 pub fn spawn_user_thread_suspended(bootstrap: UserTaskBootstrap) -> Result<u64, SpawnTaskError> {
-    let id = NEXT_TASK_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let id = allocate_task_id().ok_or(SpawnTaskError::NoFreeTaskSlot)?;
     let user_cs = crate::arch::gdt::user_code_selector().0 as u64;
     let user_ss = crate::arch::gdt::user_data_selector().0 as u64;
     let rflags = initial_task_rflags().bits();
@@ -225,16 +253,4 @@ pub fn start(entry: fn(u64)) -> ! {
             saved_rsp as *mut super::context::SavedContext,
         )
     }
-}
-
-pub fn save_current_simd_state() {
-    interrupts::without_interrupts(|| unsafe {
-        scheduler_mut().save_current_simd_state();
-    });
-}
-
-pub fn restore_current_simd_state() {
-    interrupts::without_interrupts(|| unsafe {
-        scheduler_ref().restore_current_simd_state();
-    });
 }

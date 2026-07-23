@@ -528,7 +528,7 @@ pub(crate) fn build_efi(config: &Config) -> Result<()> {
     let grub_cfg = temp_dir.join("grub.cfg");
     fs::write(
         &grub_cfg,
-        "# The standalone EFI image contains these preload modules. Load them before\n# enabling detached-signature enforcement, because Ubuntu GRUB does not ship\n# detached signatures for individual embedded modules.\ninsmod serial\nserial --speed=115200\nterminal_input serial\nterminal_output serial console\ninsmod search\ninsmod search_fs_file\ninsmod multiboot2\nset check_signatures=enforce\n# RustOS owns graphical output after the nucleus starts. Keep GRUB on the\n# firmware text/serial consoles because some OVMF GOP implementations reject\n# gfxterm's automatic mode selection.\nsearch --file --set=root /nucleus.elf\nmultiboot2 ($root)/nucleus.elf\nmodule2 ($root)/system/registry/kernel/root-file-extents.tsv rustos-root-extents\nboot\n",
+        "# The standalone EFI image contains these preload modules. Load them before\n# enabling detached-signature enforcement, because Ubuntu GRUB does not ship\n# detached signatures for individual embedded modules.\ninsmod serial\nserial --speed=115200\nterminal_input serial\nterminal_output serial console\ninsmod search\ninsmod search_fs_file\ninsmod multiboot2\nset check_signatures=enforce\n# RustOS owns graphical output after the nucleus starts. Keep GRUB on the\n# firmware text/serial consoles because some OVMF GOP implementations reject\n# gfxterm's automatic mode selection.\nsearch --file --set=root /nucleus.elf\nmultiboot2 ($root)/nucleus.elf\nmodule2 ($root)/system/boot/early-system.img rustos-early-system\nboot\n",
     )?;
     let grub_cfg_signature = temp_dir.join("grub.cfg.sig");
     sign_detached(config, &signing, &grub_cfg, &grub_cfg_signature)?;

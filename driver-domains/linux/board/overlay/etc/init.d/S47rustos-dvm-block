@@ -1,0 +1,97 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+
+run_dir=/run/rustos-dvm
+pid_file="$run_dir/block.pid"
+
+storage_controller_count() {
+    count=0
+    for device in /sys/bus/pci/devices/*; do
+        [ -r "$device/class" ] || continue
+        class=$(cat "$device/class")
+        case "$class" in
+            0x0106*|0x0108*) count=$((count + 1)) ;;
+        esac
+    done
+    echo "$count"
+}
+
+load_storage_controller() {
+    found=0
+    for device in /sys/bus/pci/devices/*; do
+        [ -r "$device/class" ] && [ -r "$device/modalias" ] || continue
+        class=$(cat "$device/class")
+        case "$class" in
+            0x0106*|0x0108*) ;;
+            *) continue ;;
+        esac
+        found=$((found + 1))
+        [ "$found" -eq 1 ] || {
+            echo "rustos-dvm-block: ambiguous assigned storage controllers" >&2
+            return 1
+        }
+        if [ ! -L "$device/driver" ]; then
+            modprobe "$(cat "$device/modalias")" || return 1
+        fi
+        [ -L "$device/driver" ] || return 1
+        driver=$(basename "$(readlink -f "$device/driver")")
+        case "$class:$driver" in
+            0x0106*:ahci)
+                # AHCI owns the controller, while sd_mod owns the block
+                # namespace below its SCSI host. Minimal DVM images have no
+                # general cold-plug daemon, so admit the complete driver
+                # closure explicitly before starting the relay.
+                modprobe sd_mod || return 1
+                ;;
+            0x0108*:nvme) ;;
+            *)
+                echo "rustos-dvm-block: controller driver mismatch class=$class driver=$driver" >&2
+                return 1
+                ;;
+        esac
+    done
+    [ "$found" -eq 1 ]
+}
+
+start() {
+    count=$(storage_controller_count)
+    [ "$count" -ne 0 ] || return 0
+    [ "$count" -eq 1 ] || {
+        echo "rustos-dvm-block: expected exactly one assigned controller, found $count" >&2
+        return 1
+    }
+    mkdir -p "$run_dir" && chmod 0700 "$run_dir" || return 1
+    if [ -r "$pid_file" ] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then
+        return 0
+    fi
+    rm -f "$pid_file"
+    load_storage_controller || return 1
+    modprobe rustos_dvm_block_uio || return 1
+    /usr/libexec/rustos-dvm-block serve </dev/null >/dev/console 2>&1 &
+    echo "$!" >"$pid_file"
+}
+
+stop() {
+    [ -r "$pid_file" ] || return 0
+    pid=$(cat "$pid_file")
+    case "$pid" in
+        ''|*[!0-9]*) rm -f "$pid_file"; return 0 ;;
+    esac
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -TERM "$pid" 2>/dev/null || true
+        attempts=0
+        while kill -0 "$pid" 2>/dev/null && [ "$attempts" -lt 20 ]; do
+            sleep 0.1
+            attempts=$((attempts + 1))
+        done
+        kill -KILL "$pid" 2>/dev/null || true
+    fi
+    rm -f "$pid_file"
+}
+
+case "$1" in
+    start) start ;;
+    stop) stop ;;
+    restart|reload) stop; start ;;
+    *) echo "usage: $0 {start|stop|restart|reload}" >&2; exit 1 ;;
+esac

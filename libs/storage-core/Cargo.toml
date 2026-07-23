@@ -5,5 +5,4 @@ edition = "2024"
 publish = false
 
 [dependencies]
-boot-protocol = { path = "../../boot/boot-protocol" }
 fatfs = { git = "https://github.com/rafalh/rust-fatfs", default-features = false, features = ["alloc", "lfn"] }

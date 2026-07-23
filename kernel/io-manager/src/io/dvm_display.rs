@@ -1334,22 +1334,22 @@ fn arm_gui_dvm_interrupts(device: crate::arch::pci::PciDevice) -> bool {
     }
     capability.set_function_masked(device, true);
     capability.set_enabled(device, false);
-    let Some(control_vector) = crate::arch::msi::allocate_vector() else {
+    let Some(mut control_lease) = crate::arch::msi::MsiVectorLease::allocate() else {
         return false;
     };
-    if !crate::arch::msi::register_handler(control_vector, gui_dvm_control_interrupt) {
+    if !control_lease.register_handler(gui_dvm_control_interrupt) {
         return false;
     }
-    let Some(offline_vector) = crate::arch::msi::allocate_vector() else {
+    let Some(mut offline_lease) = crate::arch::msi::MsiVectorLease::allocate() else {
         return false;
     };
-    if !crate::arch::msi::register_handler(offline_vector, gui_dvm_offline_interrupt) {
+    if !offline_lease.register_handler(gui_dvm_offline_interrupt) {
         return false;
     }
-    let Some(control_message) = crate::arch::msi::message_for(control_vector) else {
+    let Some(control_message) = control_lease.message() else {
         return false;
     };
-    let Some(offline_message) = crate::arch::msi::message_for(offline_vector) else {
+    let Some(offline_message) = offline_lease.message() else {
         return false;
     };
     let table = crate::driver::mmio::map(table_resource.start, table_len, false).cast::<u8>();
@@ -1373,6 +1373,9 @@ fn arm_gui_dvm_interrupts(device: crate::arch::pci::PciDevice) -> bool {
     fence(Ordering::SeqCst);
     capability.set_enabled(device, true);
     capability.set_function_masked(device, false);
+    crate::driver::mmio::unmap(table.cast());
+    control_lease.commit();
+    offline_lease.commit();
     true
 }
 

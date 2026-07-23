@@ -254,7 +254,7 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
   logs under `build/kvm/`.
 - A successful smoke requires RustOS's default `rootd` readiness marker and
   the L0 host broker to complete the DVM
-  `health,device-inventory,driver-inventory,display-evidence-v2,input-stream` handshake using launch-assigned KVM
+  `health,device-inventory,driver-inventory,display-evidence-v2,block-evidence-v1,input-stream` handshake using launch-assigned KVM
   vsock CID `4`. L0 then attaches as the fixed ivshmem peer 1 only after
   RustOS has claimed peer 0, writes only fixed RDI3 session/key/pointer frames
   into the host-owned 128 KiB input ring, and signals the one RustOS MSI-X

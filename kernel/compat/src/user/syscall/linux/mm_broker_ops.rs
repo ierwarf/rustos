@@ -430,7 +430,7 @@ fn copy_file_mapping(
         let read = match source {
             FileMappingSource::Remote { remote_id, path } => {
                 let file_offset = offset.checked_add(copied as u64).ok_or(LINUX_EOVERFLOW)?;
-                match kernel_io_manager::api::block::read_boot_extent_file_range(
+                match kernel_io_manager::api::block::read_bootstrap_file_range(
                     path,
                     file_offset,
                     &mut chunk[..count],

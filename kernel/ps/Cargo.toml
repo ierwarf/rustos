@@ -17,4 +17,5 @@ spin = "0.10.0"
 x86_64 = { version = "0.15.4", default-features = false, features = ["instructions", "abi_x86_interrupt"] }
 
 [dev-dependencies]
+boot-random = { path = "../../libs/boot-random", features = ["deterministic-test-seed"] }
 kernel-ipc-runtime = { path = "../ipc-runtime", features = ["host-test"] }
