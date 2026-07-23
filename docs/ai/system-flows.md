@@ -66,6 +66,7 @@ they are not an exception to RustOS kernel/service lifecycle contracts.
 | `vfs-open-description` | staging checkpoint → path chunks → live open → dup/fork/exec reference transitions → cursor prepare/settle → final tombstone or restart replay | `vfsd`, `rootd`, compat fd table | live, commit, cancel, restart recovery, final close |
 | `endpoint-lifecycle` | create → owner/epoch publication → same-process worker use → non-final or final exit | IPC runtime, compat registry, process table | continued process ownership, final revoke, stale-publication rejection |
 | `service-restart` | observed exit → revoke → bounded backoff → checkpoint rebase → new epoch publication or terminal failure | `rootd`, retained checkpoint owner, compat registry | recovered service or failed supervisor |
+| `service-bootstrap` | raw ELF entry → stack-aligned Rust supervisor → non-final helper handoff → initd activation → manifest-derived dependency lookup | `rootd`, `kernel-compat`, `kernel-ps`, `initd` | aligned admission, preserved process authority, declared lookup success, undeclared/contract-error rejection |
 | `boot-volume-read` | exact range validation → bounded broker chunks → physical dispatch | `vfsd`, compat block broker, `kernel/io-manager` | complete, invalid request, timeout, revoke, transport failure |
 | `memory-map` | canonical checked range → page install → W^X protection changes → unmap | compat MM broker, `kernel/mm` | mapped, rejected, unmapped |
 

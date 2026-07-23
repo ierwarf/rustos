@@ -496,10 +496,10 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
 
 fn syscall_process_exit(status: u64, exit_group: bool) -> u64 {
     let target = multitask::current_user_process_id().zip(multitask::current_user_thread_id());
+    let thread_count = multitask::current_user_process_thread_count();
     cleanup_linux_thread_exit();
     if let Some((process_id, thread_id)) = target {
-        let last_thread = multitask::current_user_process_thread_count().unwrap_or(1) <= 1;
-        if exit_group || last_thread {
+        if should_record_process_exit(exit_group, thread_count) {
             let wait_status = ((status as i32) & 0xff) << 8;
             record_linux_process_termination(process_id, wait_status);
         } else {
@@ -511,6 +511,10 @@ fn syscall_process_exit(status: u64, exit_group: bool) -> u64 {
     } else {
         multitask::exit_current_user_task()
     }
+}
+
+fn should_record_process_exit(exit_group: bool, thread_count: Option<usize>) -> bool {
+    exit_group || thread_count == Some(1)
 }
 
 pub(crate) fn record_linux_process_termination(process_id: u64, wait_status: i32) {
@@ -547,7 +551,15 @@ fn linux_fault_wait_status(vector: u8) -> i32 {
 
 #[cfg(test)]
 mod process_termination_tests {
-    use super::linux_fault_wait_status;
+    use super::{linux_fault_wait_status, should_record_process_exit};
+
+    #[test]
+    fn single_thread_exit_is_never_invented_from_missing_process_state() {
+        assert!(should_record_process_exit(true, None));
+        assert!(should_record_process_exit(false, Some(1)));
+        assert!(!should_record_process_exit(false, Some(2)));
+        assert!(!should_record_process_exit(false, None));
+    }
 
     #[test]
     fn x86_user_faults_have_linux_wait_signal_status() {

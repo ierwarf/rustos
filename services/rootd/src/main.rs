@@ -305,8 +305,19 @@ struct PostInitLease {
 }
 
 #[cfg(not(test))]
+core::arch::global_asm!(
+    ".global _start",
+    ".type _start, @function",
+    "_start:",
+    "    xor rbp, rbp",
+    "    and rsp, -16",
+    "    call __rustos_rootd_start",
+    "    ud2",
+);
+
+#[cfg(not(test))]
 #[no_mangle]
-pub extern "C" fn _start() -> ! {
+pub extern "C" fn __rustos_rootd_start() -> ! {
     debug_line(b"rootd: bootstrap enter\n");
     let endpoint = create_rootd_endpoint();
     let mut leases = [
@@ -1616,6 +1627,9 @@ fn current_service_id_for_sender(
 }
 
 fn service_dependency_allowed(subject: u64, target: u64) -> bool {
+    if bootstrap_dependency_allowed(subject, target) {
+        return true;
+    }
     match subject {
         INITD_LEASE_ID => matches!(
             target,
@@ -1637,6 +1651,22 @@ fn service_dependency_allowed(subject: u64, target: u64) -> bool {
         }
         _ => false,
     }
+}
+
+fn bootstrap_dependency_allowed(subject: u64, target: u64) -> bool {
+    let dependency_bit = match target {
+        IPC_SERVICE_LINUX_SYSCALLD => DEP_SYSCALLD,
+        IPC_SERVICE_VFSD => DEP_VFSD,
+        IPC_SERVICE_LOADERD => DEP_LOADERD,
+        IPC_SERVICE_PROCD => DEP_PROCD,
+        IPC_SERVICE_PAGERD => DEP_PAGERD,
+        _ => 0,
+    };
+    dependency_bit != 0
+        && BOOTSTRAP_MANIFEST
+            .iter()
+            .find(|service| service.service_id == subject)
+            .is_some_and(|service| service.dependency_mask & dependency_bit != 0)
 }
 
 fn service_name(path: &'static [u8]) -> &'static [u8] {
@@ -2359,6 +2389,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn raw_entry_aligns_stack_before_calling_rust() {
+        let source = include_str!("main.rs");
+        let trampoline = source
+            .split("core::arch::global_asm!(")
+            .nth(1)
+            .and_then(|rest| rest.split(");").next())
+            .expect("rootd raw entry trampoline");
+        assert!(trampoline.contains("\"    and rsp, -16\""));
+        assert!(trampoline.contains("\"    call __rustos_rootd_start\""));
+    }
+
+    #[test]
     fn loader_worker_result_is_fail_closed_and_preserves_errno() {
         assert_eq!(decode_loader_worker_result(41), Ok(41));
         assert_eq!(decode_loader_worker_result(-11), Err(11));
@@ -2439,6 +2481,28 @@ mod tests {
             authorize_service_lookup_for_subject(&leases, &post_init, &request),
             Err(13)
         );
+    }
+
+    #[test]
+    fn initd_lookup_authority_includes_every_declared_bootstrap_dependency() {
+        for service_id in [
+            IPC_SERVICE_LINUX_SYSCALLD,
+            IPC_SERVICE_VFSD,
+            IPC_SERVICE_LOADERD,
+            IPC_SERVICE_PROCD,
+            IPC_SERVICE_PAGERD,
+        ] {
+            assert!(bootstrap_dependency_allowed(INITD_LEASE_ID, service_id));
+            assert!(service_dependency_allowed(INITD_LEASE_ID, service_id));
+        }
+        assert!(!bootstrap_dependency_allowed(
+            INITD_LEASE_ID,
+            IPC_SERVICE_UISERVER
+        ));
+        assert!(!service_dependency_allowed(
+            INITD_LEASE_ID,
+            IPC_SERVICE_UISERVER
+        ));
     }
 
     #[test]

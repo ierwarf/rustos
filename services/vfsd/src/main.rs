@@ -6,6 +6,7 @@
 extern crate alloc;
 
 use alloc::collections::BTreeMap;
+use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::mem::{size_of, MaybeUninit};
@@ -1791,7 +1792,12 @@ impl VfsState {
             };
         }
 
-        let metadata = self.metadata(path)?;
+        let metadata = self.metadata(path).map_err(|errno| {
+            debug_line(&format!(
+                "vfsd: open failed stage=metadata errno={errno} path={path}"
+            ));
+            errno
+        })?;
         if flags & O_DIRECTORY != 0 && metadata.kind != RemoteKind::Directory {
             return Err(ENOTDIR);
         }
@@ -1809,8 +1815,17 @@ impl VfsState {
             last_start: flags,
             last_result: 0,
         };
-        self.checkpoint_open_description(request, id, &handle)?;
+        self.checkpoint_open_description(request, id, &handle)
+            .map_err(|errno| {
+                debug_line(&format!(
+                    "vfsd: open failed stage=checkpoint errno={errno} path={path}"
+                ));
+                errno
+            })?;
         if self.handles.insert(id, handle.clone()).is_some() {
+            debug_line(&format!(
+                "vfsd: open failed stage=install errno={EIO} path={path}"
+            ));
             return Err(EIO);
         }
         Ok((id, handle))
@@ -2069,16 +2084,44 @@ fn call_rootd_checkpoint(
             size_of::<CommercialMaxProtocolResponse>(),
         )
     };
+    let valid_envelope = response.is_valid_envelope_for(&request);
     if received as usize != size_of::<CommercialMaxProtocolResponse>()
-        || !response.is_valid_envelope_for(&request)
+        || !valid_envelope
         || response.descriptor_count != 0
     {
+        debug_line(&format!(
+            "vfsd: checkpoint transport failed op={op} received={received} expected={} envelope={} descriptors={}",
+            size_of::<CommercialMaxProtocolResponse>(),
+            u8::from(valid_envelope),
+            response.descriptor_count
+        ));
         return Err(EIO);
     }
     if response.status != 0 {
+        debug_line(&format!(
+            "vfsd: checkpoint rejected op={op} errno={} key={:016x}:{:016x}",
+            response.status,
+            record.map_or(0, |value| value.key_hi),
+            record.map_or(0, |value| value.key_lo)
+        ));
         return Err(response.status);
     }
     Ok(response)
+}
+
+fn debug_line(message: &str) {
+    let bytes = message.as_bytes();
+    let len = bytes.len().min(1023);
+    let mut line = [0_u8; 1024];
+    line[..len].copy_from_slice(&bytes[..len]);
+    line[len] = b'\n';
+    let _ = unsafe {
+        rustos_svc_runtime::syscall::syscall2(
+            linux_abi::SYS_RUSTOS_DEBUG_PRINT,
+            line.as_ptr() as u64,
+            (len + 1) as u64,
+        )
+    };
 }
 
 fn checkpoint_revision_key(record: &ServiceCheckpointRecordWire) -> CheckpointRevisionKey {

@@ -94,6 +94,7 @@ fn main() {
         .as_str(),
     );
     observability_client::info!("initd", service, "init services={}", startup_entries.len());
+    boot_line("initd: supervisor loop enter");
 
     let mut running = BTreeMap::<i32, RunningService>::new();
     let mut launched_once_packages = BTreeSet::new();
@@ -101,12 +102,16 @@ fn main() {
     let mut rootd_lease_recovery = BTreeMap::<u64, RootdLeaseRecovery>::new();
     let mut defer_secondary_services_until = None::<Instant>;
     let mut next_rootd_lease_reconciliation = Instant::now();
+    let mut initial_lease_reconciliation = true;
 
     loop {
         reap_children(&mut running, &mut retry_state);
 
         let now = Instant::now();
         if now >= next_rootd_lease_reconciliation {
+            if initial_lease_reconciliation {
+                boot_line("initd: initial lease reconciliation begin");
+            }
             reconcile_rootd_post_init_leases(
                 &startup_entries,
                 &mut running,
@@ -115,6 +120,16 @@ fn main() {
                 &mut rootd_lease_recovery,
                 now,
             );
+            if initial_lease_reconciliation {
+                boot_line(&format!(
+                    "initd: foundation endpoints syscalld={} vfsd={} loaderd={}",
+                    service_ready_status(IPC_SERVICE_LINUX_SYSCALLD),
+                    service_ready_status(IPC_SERVICE_VFSD),
+                    service_ready_status(IPC_SERVICE_LOADERD),
+                ));
+                boot_line("initd: initial lease reconciliation done");
+                initial_lease_reconciliation = false;
+            }
             next_rootd_lease_reconciliation = now + ROOTD_LEASE_RECONCILIATION_INTERVAL;
         }
 
@@ -386,7 +401,26 @@ fn service_ready_status(service_id: u64) -> i64 {
 }
 
 fn service_ready(service_id: u64) -> bool {
-    service_ready_status(service_id) > 0
+    let status = service_ready_status(service_id);
+    match classify_service_ready_status(status) {
+        Ok(ready) => ready,
+        Err(errno) => fail_closed(&format!(
+            "initd: fatal service readiness contract failure service_id={service_id} status={status} errno={errno}"
+        )),
+    }
+}
+
+fn classify_service_ready_status(status: i64) -> Result<bool, i32> {
+    if status > 0 {
+        return Ok(true);
+    }
+    if status == -(libc::ENOSYS as i64) {
+        return Ok(false);
+    }
+    if status < 0 {
+        return Err(i32::try_from(-status).unwrap_or(libc::EOVERFLOW));
+    }
+    Err(libc::EPROTO)
 }
 
 fn report_rootd_service_lease(exec_path: &str, pid: i32) -> Result<(), i32> {
@@ -1023,7 +1057,7 @@ fn boot_line(message: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::cleanup_spawned_service;
+    use super::{classify_service_ready_status, cleanup_spawned_service};
 
     #[test]
     fn failed_service_cleanup_accepts_only_exact_retirement_or_esrch() {
@@ -1042,5 +1076,19 @@ mod tests {
             Err(libc::EPERM)
         );
         assert_eq!(cleanup_spawned_service(0, |_| Ok(())), Err(libc::EINVAL));
+    }
+
+    #[test]
+    fn service_readiness_retries_only_an_unpublished_endpoint() {
+        assert_eq!(classify_service_ready_status(41), Ok(true));
+        assert_eq!(
+            classify_service_ready_status(-(libc::ENOSYS as i64)),
+            Ok(false)
+        );
+        assert_eq!(
+            classify_service_ready_status(-(libc::EPERM as i64)),
+            Err(libc::EPERM)
+        );
+        assert_eq!(classify_service_ready_status(0), Err(libc::EPROTO));
     }
 }

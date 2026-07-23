@@ -59,6 +59,7 @@ proc-broker-session/ProcBrokerSession	safety	intentional-terminal	prepare sessio
 process-address-space-lifetime/ProcessAddressSpaceLifetime	temporal	intentional-terminal	process state may exit and reclaim	30	120	exhaustive	no	no	no
 process-signal-delivery/ProcessSignalDelivery	safety	intentional-terminal	signal disposition may terminate the process	30	120	exhaustive	no	no	no
 rootd-bootstrap/RootdBootstrap	temporal	intentional-terminal	bootstrap outcome is terminal	120	900	exhaustive	no	no	no
+service-bootstrap-lifecycle/ServiceBootstrapLifecycle	temporal	intentional-terminal	service entry or dependency admission reaches an exact terminal outcome	120	900	exhaustive	no	no	no
 rootd-restart-backoff/RootdRestartBackoff	temporal	intentional-terminal	restart budget may terminate	120	900	exhaustive	no	no	no
 runtime-control-rpc/RuntimeControlRpc	safety	intentional-terminal	one response resolves the RPC	120	900	exhaustive	no	no	yes
 scheduler-admission/SchedulerAdmission	temporal	intentional-terminal	admission decision is terminal	120	900	exhaustive	no	no	no

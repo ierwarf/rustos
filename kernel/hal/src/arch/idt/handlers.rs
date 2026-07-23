@@ -209,13 +209,7 @@ fn is_user_mode(stack_frame: &InterruptStackFrame) -> bool {
 mod tests {
     #[test]
     fn general_exception_bridge_aligns_every_rust_call_boundary() {
-        for raw_rsp in [
-            0x1000_u64,
-            0x1008,
-            0x100f,
-            0x1010,
-            u64::MAX - 0x1f,
-        ] {
+        for raw_rsp in [0x1000_u64, 0x1008, 0x100f, 0x1010, u64::MAX - 0x1f] {
             let aligned = (raw_rsp & !0xf).wrapping_sub(16);
             assert_eq!(aligned & 0xf, 0);
             assert!(aligned <= raw_rsp);
