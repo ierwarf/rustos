@@ -314,13 +314,6 @@ where
     } else {
         None
     };
-    if guest_display == GuestDisplay::DvmGtk {
-        require_sole_host_render_node(
-            host_render_node
-                .as_deref()
-                .context("GTK display lost its validated host render node")?,
-        )?;
-    }
     let (mut rustos, mut dvm) = spawn_guests(
         &qemu,
         config,
@@ -437,7 +430,6 @@ pub(crate) fn kvm_run_command(config: &Config) -> Result<()> {
     log_kvm_start_phase("prepared-kvm-layout", started_at);
     require_vhost_vsock()?;
     let host_render_node = require_host_render_node()?;
-    require_sole_host_render_node(&host_render_node)?;
     log_kvm_start_phase("verified-vhost-vsock", started_at);
     let input_doorbell = start_dvm_input_doorbell(&layout)?;
     log_kvm_start_phase("started-input-doorbell", started_at);
@@ -602,6 +594,13 @@ fn qemu_display_backend(display: GuestDisplay, render_node: Option<&Path>) -> Re
     }
 }
 
+fn dvm_machine() -> &'static str {
+    // The DVM receives only the explicit virtio input devices below. Leaving
+    // q35's implicit i8042 enabled creates a second PS/2 keyboard/pointer pair,
+    // so Linux may relay a different event device than the GUI frontend feeds.
+    "q35,accel=kvm,i8042=off"
+}
+
 fn dvm_gpu_device(display: GuestDisplay) -> Option<String> {
     (display != GuestDisplay::Physical).then(|| {
         format!(
@@ -615,11 +614,41 @@ fn dvm_gpu_device(display: GuestDisplay) -> Option<String> {
     })
 }
 
-fn dvm_pointer_device() -> &'static str {
+fn dvm_keyboard_device(display: GuestDisplay) -> &'static str {
+    if display == GuestDisplay::Physical {
+        "virtio-keyboard-pci,id=dvm-keyboard"
+    } else {
+        "virtio-keyboard-pci,id=dvm-keyboard,display=dvm-virtio-gpu,head=0"
+    }
+}
+
+fn dvm_pointer_device(display: GuestDisplay) -> &'static str {
     // An absolute tablet keeps host pointer motion available while the GTK
     // window is merely hovered. The DVM agent normalizes the tablet range to
     // the fixed 1600x900 scanout before it emits the authenticated RDI3 frame.
-    "virtio-tablet-pci,id=dvm-pointer"
+    if display == GuestDisplay::Physical {
+        "virtio-tablet-pci,id=dvm-pointer"
+    } else {
+        "virtio-tablet-pci,id=dvm-pointer,display=dvm-virtio-gpu,head=0"
+    }
+}
+
+fn append_dvm_virtual_gpu(command: &mut Command, display: GuestDisplay) -> bool {
+    let Some(gpu) = dvm_gpu_device(display) else {
+        return false;
+    };
+    // QEMU resolves virtio-input's `display=` property while realizing the
+    // device. Register the target GPU console before either input device.
+    command.arg("-no-shutdown").arg("-device").arg(gpu);
+    true
+}
+
+fn append_dvm_input_devices(command: &mut Command, display: GuestDisplay) {
+    command
+        .arg("-device")
+        .arg(dvm_keyboard_device(display))
+        .arg("-device")
+        .arg(dvm_pointer_device(display));
 }
 
 fn append_dvm_network_device(command: &mut Command, display: GuestDisplay) {
@@ -2052,28 +2081,37 @@ fn require_host_render_node() -> Result<PathBuf> {
     Ok(render_node)
 }
 
-fn require_sole_host_render_node(selected: &Path) -> Result<()> {
-    let mut render_nodes = std::fs::read_dir("/dev/dri")?
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.file_name()
-                .and_then(OsStr::to_str)
-                .is_some_and(|name| name.starts_with("renderD"))
-        })
-        .collect::<Vec<_>>();
-    render_nodes.sort();
-    if render_nodes.len() != 1 || render_nodes[0].as_path() != selected {
-        bail!(
-            "QEMU GTK cannot pin rendernode; refusing ambiguous host render nodes: {}",
-            render_nodes
-                .iter()
-                .map(|path| path.display().to_string())
-                .collect::<Vec<_>>()
-                .join(",")
-        );
-    }
-    Ok(())
+fn mesa_dri_prime_for_render_node(render_node: &Path) -> Result<String> {
+    let name = render_node
+        .file_name()
+        .and_then(OsStr::to_str)
+        .filter(|name| name.starts_with("renderD"))
+        .with_context(|| {
+            format!(
+                "validated host render node has an invalid name: {}",
+                render_node.display()
+            )
+        })?;
+    let device = std::fs::canonicalize(Path::new("/sys/class/drm").join(name).join("device"))
+        .with_context(|| format!("resolve PCI identity for {}", render_node.display()))?;
+    let bdf = device
+        .file_name()
+        .and_then(OsStr::to_str)
+        .context("host render node sysfs target has no PCI BDF")?;
+    mesa_dri_prime_for_pci_bdf(bdf)
+}
+
+fn mesa_dri_prime_for_pci_bdf(bdf: &str) -> Result<String> {
+    let bdf = canonical_pci_bdf(bdf)?;
+    Ok(format!(
+        "pci-{}",
+        bdf.chars()
+            .map(|character| match character {
+                ':' | '.' => '_',
+                other => other,
+            })
+            .collect::<String>()
+    ))
 }
 
 fn require_vhost_vsock() -> Result<()> {
@@ -2143,13 +2181,22 @@ fn start_dvm_input_relay_unbounded(
         while !gate.load(Ordering::Acquire) {
             thread::sleep(Duration::from_millis(1));
         }
+        // The input ivshmem broker deliberately tears down the whole fixed
+        // topology when either peer disconnects. Keep peer 1 alive across
+        // bounded vsock setup failures; otherwise a DVM that becomes ready
+        // just after the first five-second accept deadline can never reconnect.
+        let mut sink = loop {
+            match InputRingSink::connect(&input_doorbell, &input_ring, Duration::from_secs(1)) {
+                Ok(sink) => break sink,
+                Err(error) => {
+                    eprintln!(
+                        "xtask: interactive DVM input transport not ready; retrying: {error:#}"
+                    );
+                    thread::sleep(Duration::from_millis(100));
+                }
+            }
+        };
         loop {
-            let Ok(mut sink) =
-                InputRingSink::connect(&input_doorbell, &input_ring, Duration::from_secs(1))
-            else {
-                thread::sleep(Duration::from_millis(100));
-                continue;
-            };
             if let Err(error) = listener.relay_input_once_unbounded(&mut sink) {
                 eprintln!("xtask: interactive DVM input relay disconnected: {error:#}");
                 thread::sleep(Duration::from_millis(100));
@@ -2323,12 +2370,22 @@ fn spawn_guests(
         "console=ttyS0 preempt=full"
     };
     let dvm_display = qemu_display_backend(guest_display, host_render_node)?;
+    if guest_display == GuestDisplay::DvmGtk {
+        let render_node =
+            host_render_node.context("GTK display lost its validated host render node")?;
+        let dri_prime = mesa_dri_prime_for_render_node(render_node)?;
+        eprintln!(
+            "xtask: KVM GTK renderer pinned node={} DRI_PRIME={dri_prime}",
+            render_node.display()
+        );
+        dvm_command.env("DRI_PRIME", dri_prime);
+    }
     dvm_command
         .arg("-name")
         .arg("rustos-linux-dvm-kvm")
         .args([
             "-machine",
-            "q35,accel=kvm",
+            dvm_machine(),
             "-cpu",
             "host",
             "-m",
@@ -2361,15 +2418,9 @@ fn spawn_guests(
         .arg(format!(
             "name=opt/rustos/dvm-control-secret,file={}",
             layout.dvm_control_secret.display()
-        ))
-        .arg("-device")
-        .arg("virtio-keyboard-pci,id=dvm-keyboard")
-        .arg("-device")
-        .arg(dvm_pointer_device());
+        ));
     append_dvm_network_device(&mut dvm_command, guest_display);
-    if let Some(gpu) = dvm_gpu_device(guest_display) {
-        dvm_command.arg("-no-shutdown").arg("-device").arg(gpu);
-    } else {
+    if !append_dvm_virtual_gpu(&mut dvm_command, guest_display) {
         let bdf = options
             .physical_gpu_bdf
             .as_deref()
@@ -2383,6 +2434,7 @@ fn spawn_guests(
         )?;
         append_physical_gpu(&mut dvm_command, profile, bdf, &firmware);
     }
+    append_dvm_input_devices(&mut dvm_command, guest_display);
     dvm_command
         .stdout(Stdio::null())
         .stderr(Stdio::from(std::fs::File::create(&layout.dvm_stderr_log)?));
@@ -3579,10 +3631,11 @@ mod tests {
         DVM_GPU_COMPOSITOR_MARKER, DVM_KEYBOARD_INGRESS_MARKER, DVM_POINTER_INGRESS_MARKER,
         DvmNetworkCounters, GuestDisplay, PHYSICAL_GPU_PROFILES, RUSTOS_BOOT_MARKER,
         RUSTOS_GPU_SCENE_COMPILER_MARKER, VIRTUAL_GPU_EVIDENCE, WayclickProfileObservation,
-        append_dvm_display_pixels, append_dvm_network_device, append_physical_gpu,
-        claim_physical_gpu_launch_in, dvm_display_failure, dvm_display_provider_ready,
-        dvm_display_relay_meets_fps, dvm_display_relay_ready, dvm_gpu_compositor_ready,
-        dvm_gpu_device, dvm_physical_frames_ready, dvm_pointer_device, is_sha256,
+        append_dvm_display_pixels, append_dvm_input_devices, append_dvm_network_device,
+        append_dvm_virtual_gpu, append_physical_gpu, claim_physical_gpu_launch_in,
+        dvm_display_failure, dvm_display_provider_ready, dvm_display_relay_meets_fps,
+        dvm_display_relay_ready, dvm_gpu_compositor_ready, dvm_gpu_device, dvm_machine,
+        dvm_physical_frames_ready, dvm_pointer_device, is_sha256, mesa_dri_prime_for_pci_bdf,
         parse_dvm_control_contract_text, parse_manifest_text, parse_smoke_options,
         physical_gpu_profile, prepare_runtime_log, qemu_display_backend,
         runtime_stall_or_crash_observed, select_smoke_guest_display,
@@ -4005,6 +4058,11 @@ uiserver: update tick backlog=false input_drops=0 input_slow=0 input_errors=0";
     #[test]
     fn interactive_gtk_display_uses_absolute_pointer_and_hides_host_cursor() {
         assert_eq!(
+            mesa_dri_prime_for_pci_bdf("0000:65:00.0").unwrap(),
+            "pci-0000_65_00_0"
+        );
+        assert!(mesa_dri_prime_for_pci_bdf("65:00.0").is_err());
+        assert_eq!(
             qemu_display_backend(
                 GuestDisplay::Headless,
                 Some(Path::new("/dev/dri/renderD129"))
@@ -4032,7 +4090,39 @@ uiserver: update tick backlog=false input_drops=0 input_slow=0 input_errors=0";
                 .contains("hostmem=256M")
         );
         assert!(dvm_gpu_device(GuestDisplay::Physical).is_none());
-        assert_eq!(dvm_pointer_device(), "virtio-tablet-pci,id=dvm-pointer");
+        assert_eq!(dvm_machine(), "q35,accel=kvm,i8042=off");
+        assert_eq!(
+            dvm_pointer_device(GuestDisplay::DvmGtk),
+            "virtio-tablet-pci,id=dvm-pointer,display=dvm-virtio-gpu,head=0"
+        );
+        assert_eq!(
+            dvm_pointer_device(GuestDisplay::Physical),
+            "virtio-tablet-pci,id=dvm-pointer"
+        );
+
+        let mut input = Command::new("qemu-system-x86_64");
+        assert!(append_dvm_virtual_gpu(&mut input, GuestDisplay::DvmGtk));
+        append_dvm_input_devices(&mut input, GuestDisplay::DvmGtk);
+        let input_args = input
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let gpu_position = input_args
+            .iter()
+            .position(|arg| arg.starts_with("virtio-gpu-gl-pci,id=dvm-virtio-gpu"))
+            .unwrap();
+        let keyboard_position = input_args
+            .iter()
+            .position(|arg| arg.starts_with("virtio-keyboard-pci,id=dvm-keyboard"))
+            .unwrap();
+        let pointer_position = input_args
+            .iter()
+            .position(|arg| arg.starts_with("virtio-tablet-pci,id=dvm-pointer"))
+            .unwrap();
+        assert!(gpu_position < keyboard_position);
+        assert!(keyboard_position < pointer_position);
+        assert!(input_args[keyboard_position].contains("display=dvm-virtio-gpu,head=0"));
+        assert!(input_args[pointer_position].contains("display=dvm-virtio-gpu,head=0"));
 
         let mut physical = Command::new("qemu-system-x86_64");
         append_dvm_network_device(&mut physical, GuestDisplay::Physical);

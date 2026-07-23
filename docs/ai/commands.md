@@ -216,8 +216,17 @@ fallback.
 - Headless virgl smoke discovers exactly one direct, read/write AMDGPU render
   node by sysfs vendor and bound-driver identity, then pins that exact path in
   QEMU's EGL backend. Render-node numbering is not an ABI; zero or multiple
-  AMDGPU candidates fail closed. GTK remains stricter because QEMU cannot pin
-  its render node and therefore rejects hosts with multiple render nodes.
+  AMDGPU candidates fail closed. QEMU GTK has no `rendernode` option, so
+  `kvm-run` resolves the already-validated node back to its canonical sysfs PCI
+  identity and pins Mesa OpenGL selection with exact-address `DRI_PRIME`.
+- The Linux DVM disables q35's implicit i8042 controller and exposes one
+  explicit virtio keyboard plus one absolute virtio tablet. Virtual-display
+  launches register `dvm-virtio-gpu` first and bind both input devices to its
+  head 0; this prevents PS/2/virtio source ambiguity and cross-console input.
+- Interactive input keeps the fixed L0 ivshmem producer peer alive for the
+  entire QEMU session. A bounded DVM-vsock setup timeout retries only the
+  authenticated stream; dropping and reconnecting the producer is forbidden
+  because any ivshmem peer departure terminates the fail-closed broker.
 - `--timeout <seconds>` is bounded to `1..=30` and applies only while waiting
   for expected RustOS debugcon and Linux DVM serial markers.
 - The default marker is `rootd: core services ready, spawning initd via loaderd`;
