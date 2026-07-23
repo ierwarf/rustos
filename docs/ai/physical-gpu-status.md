@@ -28,10 +28,11 @@ private Wayland protocol. Its source/model implementation now has these owners:
    part of the key, so MOD can rebind after restart and DEL remains available
    while the provider is down.
 2. netd/inputd own readiness truth and publish monotonic generations.
-3. compat owns only bounded task wait tokens, check-register-service-recheck,
-   scheduler arm plus exact waiter-presence recheck, deadline/cancel wakeup,
-   and the final authoritative provider recheck. Provider queries use at most
-   16 ms and never exceed the remaining finite wait deadline.
+3. compat owns only bounded task wait tokens and the atomic check-arm-recheck
+   composition: check-register-service-recheck, scheduler arm plus exact
+   waiter-presence recheck, deadline/cancel wakeup, and the final authoritative
+   provider recheck. Provider queries use at most 16 ms and never exceed the
+   remaining finite wait deadline.
 4. service object references follow dup/fork/close/CLOEXEC/process exit, and a
    downstream netd/inputd/sessiond restart wakes then revokes old-epoch waits.
    Netd mutations use ACK-retained exact replay; remote VFS descriptor refs are

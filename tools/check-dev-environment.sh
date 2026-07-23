@@ -65,6 +65,37 @@ else
     bad "active Rust toolchain '$active_toolchain' does not match '$expected_toolchain'"
 fi
 
+if jq -s -e '
+    .[0] as $launch
+    | .[1] as $tasks
+    | .[2] as $settings
+    | $launch.version == "0.2.0"
+      and ($launch.configurations | type) == "array"
+      and ($launch.configurations | length) == 1
+      and ($launch.configurations[0]
+        | .name == "RustOS: verified KVM desktop"
+          and .type == "node-terminal"
+          and .request == "launch"
+          and .command == "cargo xtask kvm-run"
+          and .cwd == "${workspaceFolder}")
+      and $tasks.version == "2.0.0"
+      and ($tasks.tasks | type) == "array"
+      and ($tasks.tasks | length) == 1
+      and ($tasks.tasks[0]
+        | .label == "F5: Build signed RustOS image"
+          and .type == "process"
+          and .command == "cargo"
+          and .args == ["xtask", "build"]
+          and .options.cwd == "${workspaceFolder}")
+      and ($launch.configurations[0].preLaunchTask == $tasks.tasks[0].label)
+      and ([[$launch, $tasks] | .. | strings | select(. == "build-dvm")] | length) == 0
+      and ($settings | type) == "object"
+  ' .vscode/launch.json .vscode/tasks.json .vscode/settings.json >/dev/null; then
+    ok "VS Code F5 uses signed RustOS build plus verified cached-DVM launch"
+else
+    bad "VS Code F5 launch/task contract is malformed or rebuilds the Linux DVM"
+fi
+
 if test "$CHECK_AI" -eq 1; then
     require_command npx
     require_command uvx

@@ -2,11 +2,11 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "KVM DVM: verified atomic desktop (no manual pointer grab)",
+      "name": "RustOS: verified KVM desktop",
       "type": "node-terminal",
       "request": "launch",
-      "preLaunchTask": "Prepare KVM DVM",
-      "command": "exec cargo xtask kvm-run",
+      "preLaunchTask": "F5: Build signed RustOS image",
+      "command": "cargo xtask kvm-run",
       "cwd": "${workspaceFolder}"
     }
   ]

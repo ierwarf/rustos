@@ -51,6 +51,16 @@ failure output as the primary debugging context.
 | `cargo run -p rustos-hostd -- recover --plan <file>` | recover an active lease by canonical runtime record plus exact post-open PID/start-time identity, signal only through pidfd, then reset and restore the whole group | removes runtime/lease state only after success | unsafe/stale runtime identity, unavailable pidfd, or reset/restore failure |
 | `cargo run -p rustos-hostd -- relay-input ...` | relay validated DVM Linux input into RustOS's fixed input ring | launch-owned ivshmem backing and doorbell | policy mismatch, malformed DVM event, or peer lifecycle failure |
 
+## VS Code F5 contract
+
+The single F5 configuration, `RustOS: verified KVM desktop`, first runs
+`cargo xtask build` through `F5: Build signed RustOS image`, then starts
+`cargo xtask kvm-run`. The runner verifies the existing signed Linux DVM
+bundle before QEMU starts. F5 must never run `build-dvm`; DVM source changes
+use the explicit build-plan and stable-batch lanes above. The base
+`tools/check-dev-environment.sh` gate parses all three `.vscode` JSON files,
+checks the launch/task reference, and rejects a reintroduced `build-dvm`.
+
 ## Tests and inventory
 
 | Command | Use | Writes | Common failure meaning |
