@@ -6,7 +6,10 @@ use boot_protocol::BootVolumeIdentity;
 use core::sync::atomic::Ordering;
 use storage_core::BlockDevice as SharedBlockDevice;
 
-use super::io::{cache_lookup, clear_cache_for_tests, read_cached_block, write_cached_block};
+use super::io::{
+    cache_lookup, clear_cache_for_tests, read_cached_block, validate_block_io_exact,
+    write_cached_block,
+};
 use super::registry::register_root_device;
 use super::{
     BLOCK_DEVICES, BLOCK_INIT_DONE, BLOCK_INIT_STATE, BlockDeviceOps, BlockTransportKind,
@@ -125,6 +128,26 @@ fn reset_for_tests() {
     BLOCK_DEVICES.lock().clear();
     clear_cache_for_tests();
     BLOCK_INIT_STATE.store(BLOCK_INIT_DONE, Ordering::Release);
+}
+
+#[test]
+fn exact_block_range_rejects_empty_overflow_and_end_overrun() {
+    assert_eq!(
+        validate_block_io_exact(TEST_BLOCK_SIZE, 0, 8, 0),
+        Err(DiskIoError::InvalidInput)
+    );
+    assert_eq!(
+        validate_block_io_exact(TEST_BLOCK_SIZE, u64::MAX, u64::MAX, TEST_BLOCK_SIZE),
+        Err(DiskIoError::InvalidInput)
+    );
+    assert_eq!(
+        validate_block_io_exact(TEST_BLOCK_SIZE, 7, 8, TEST_BLOCK_SIZE * 2),
+        Err(DiskIoError::InvalidInput)
+    );
+    assert_eq!(
+        validate_block_io_exact(TEST_BLOCK_SIZE, 6, 8, TEST_BLOCK_SIZE * 2),
+        Ok(())
+    );
 }
 
 fn fat_boot_sector(

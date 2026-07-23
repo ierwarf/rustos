@@ -1382,6 +1382,33 @@ impl Scheduler {
     }
 
     fn retire_slot(&mut self, slot: usize, reason: TaskRetireReason) {
+        let rust_stack_pointer: usize;
+        unsafe {
+            core::arch::asm!(
+                "mov {}, rsp",
+                out(reg) rust_stack_pointer,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+        if rust_stack_pointer & 0xF != 0 {
+            match reason {
+                TaskRetireReason::UserFault { vector, rip, .. } => {
+                    panic!(
+                        "user-fault retirement entered Rust with a misaligned call stack: vector={} rip={:#x}",
+                        vector, rip
+                    )
+                }
+                TaskRetireReason::Terminated { .. } => {
+                    panic!("termination retirement entered Rust with a misaligned call stack")
+                }
+                TaskRetireReason::CorruptedContext { .. } => {
+                    panic!("corrupted-context retirement entered Rust with a misaligned call stack")
+                }
+                TaskRetireReason::Exited => {
+                    panic!("task-exit retirement entered Rust with a misaligned call stack")
+                }
+            }
+        }
         if slot == ROOT_TASK_SLOT {
             panic!("scheduler root kernel task cannot be retired");
         }
@@ -1517,7 +1544,10 @@ impl Scheduler {
 
     fn stack_bounds(&self, slot: usize) -> (usize, usize) {
         let base = self.stack_storage(slot).as_ptr() as usize;
-        (base + TASK_STACK_GUARD_BYTES, base + TASK_STACK_SIZE)
+        (
+            base + TASK_STACK_GUARD_BYTES,
+            align_kernel_stack_top(base + TASK_STACK_SIZE),
+        )
     }
 
     fn stack_storage(&self, slot: usize) -> &[u8] {
@@ -1537,7 +1567,7 @@ impl Scheduler {
     }
 
     fn stack_top(&self, slot: usize) -> usize {
-        self.stack_bounds(slot).1 & !0xF
+        self.stack_bounds(slot).1
     }
 
     pub(super) fn current_saved_rsp(&self) -> usize {
@@ -2590,6 +2620,11 @@ impl Scheduler {
             .expect("scheduler selected an invalid task context");
         crate::memory::paging::load_address_space_phys(PhysAddr::new(current.address_space_root));
         if current.kernel_stack_top != 0 {
+            assert_eq!(
+                current.kernel_stack_top & 0xF,
+                0,
+                "scheduler selected a kernel stack top that violates the x86_64 SysV ABI"
+            );
             crate::arch::gdt::set_privilege_stack(current.kernel_stack_top);
             crate::user::syscall::set_kernel_stack_top(current.kernel_stack_top);
         }
@@ -3650,6 +3685,13 @@ fn stack_range_contains(base: u64, top: u64, start: usize, end: usize) -> bool {
     start >= base as usize && end <= top as usize
 }
 
+/// Every hardware or `syscall` transition stack top is a SysV x86_64 call
+/// boundary. Heap-backed task stacks are byte buffers and therefore do not
+/// carry a stronger allocator alignment guarantee of their own.
+const fn align_kernel_stack_top(raw_top: usize) -> usize {
+    raw_top & !0xF
+}
+
 #[cfg(test)]
 mod tests {
     use alloc::boxed::Box;
@@ -3657,12 +3699,23 @@ mod tests {
     use super::{
         ConsoleSessionHandle, MAX_CONSECUTIVE_SYSTEM_DISPATCHES, MAX_TASK, NICE_0_LOAD,
         SYSTEM_CLASS_WEIGHT_FLAG, SchedClass, Scheduler, TaskContext, TaskStart,
+        align_kernel_stack_top,
     };
     use crate::memory::paging::ProcessAddressSpace;
     use crate::multitask::{UserTaskBootstrap, noop_task_entry, process_table};
     use crate::user::abi::UserAbi;
     use crate::user::process_state::UserProcessState;
     use kernel_ipc_runtime::api::IpcError;
+
+    #[test]
+    fn kernel_stack_top_is_aligned_for_sysv_rust_calls() {
+        for low_bits in 0..16 {
+            let top = align_kernel_stack_top(0x10_000 + low_bits);
+            assert_eq!(top & 0xF, 0);
+            assert!(top <= 0x10_000 + low_bits);
+            assert!((0x10_000 + low_bits) - top < 16);
+        }
+    }
 
     fn test_user_context(handle: process_table::ProcessHandle) -> TaskContext {
         TaskContext {

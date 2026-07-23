@@ -9,9 +9,147 @@ use rustos_user_abi::syscall::{
     ServiceCheckpointRecordWire, SERVICE_CHECKPOINT_ABI_VERSION, SERVICE_CHECKPOINT_FLAG_TOMBSTONE,
     VFS_IPC_OP_FTRUNCATE, VFS_IPC_OP_WRITE, WAITSET_MAX_INTERESTS,
 };
+use storage_core::{IoResult, StorageError};
 
 pub const ENOENT: i32 = 2;
+pub const ENOTDIR: i32 = 20;
 pub const EROFS: i32 = 30;
+
+const EINTR: i32 = 4;
+const EINVAL: i32 = 22;
+const ENODEV: i32 = 19;
+const ENOSYS: i32 = 38;
+const ETIMEDOUT: i32 = 110;
+
+pub fn validate_boot_read_range(
+    block_size: usize,
+    block_count: u64,
+    lba: u64,
+    len: usize,
+) -> IoResult<()> {
+    if block_size == 0 || len == 0 || !len.is_multiple_of(block_size) {
+        return Err(StorageError::InvalidInput);
+    }
+    let requested = u64::try_from(len / block_size).map_err(|_| StorageError::InvalidInput)?;
+    let end = lba
+        .checked_add(requested)
+        .ok_or(StorageError::InvalidInput)?;
+    if end > block_count {
+        return Err(StorageError::InvalidInput);
+    }
+    Ok(())
+}
+
+pub fn storage_error_from_linux_status(status: i64) -> StorageError {
+    let errno = status
+        .checked_neg()
+        .and_then(|errno| i32::try_from(errno).ok());
+    match errno {
+        Some(EINTR) => StorageError::Interrupted,
+        Some(EINVAL) => StorageError::InvalidInput,
+        Some(ETIMEDOUT) => StorageError::Timeout,
+        Some(ENODEV) => StorageError::NotPresent,
+        Some(ENOSYS) => StorageError::Unsupported,
+        _ => StorageError::DeviceFault,
+    }
+}
+
+pub fn checked_next_generation(current: u64) -> Option<u64> {
+    current.checked_add(1).filter(|next| *next != 0)
+}
+
+pub fn cacheable_metadata_errno(errno: i32) -> bool {
+    matches!(errno, ENOENT | ENOTDIR)
+}
+
+pub const VFSD_CHECKPOINT_HANDLE_TAG: u64 = 0x4844_4c45_0000_0001;
+pub const VFSD_CHECKPOINT_PATH_TAG: u64 = 0x4850_4154_0000_0000;
+pub const VFSD_OPEN_CHECKPOINT_VERSION: u16 = 1;
+pub const VFSD_OPEN_MUTATION_STAGING: u16 = 0;
+pub const VFSD_OPEN_MUTATION_OPEN: u16 = 1;
+pub const VFSD_OPEN_MUTATION_READ: u16 = 2;
+pub const VFSD_OPEN_MUTATION_LSEEK: u16 = 3;
+pub const VFSD_OPEN_MUTATION_GETDENTS: u16 = 4;
+pub const VFSD_OPEN_MUTATION_FCNTL: u16 = 5;
+pub const VFSD_OPEN_MUTATION_STABLE: u16 = 6;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SeekPositionError {
+    InvalidWhence,
+    Negative,
+    Overflow,
+}
+
+pub fn checked_seek_position(
+    cursor: u64,
+    len: u64,
+    offset: i64,
+    whence: u64,
+) -> Result<u64, SeekPositionError> {
+    let base = match whence {
+        0 => 0_i128,
+        1 => i128::from(cursor),
+        2 => i128::from(len),
+        _ => return Err(SeekPositionError::InvalidWhence),
+    };
+    let next = base
+        .checked_add(i128::from(offset))
+        .ok_or(SeekPositionError::Overflow)?;
+    if next < 0 {
+        return Err(SeekPositionError::Negative);
+    }
+    if next > i128::from(i64::MAX) {
+        return Err(SeekPositionError::Overflow);
+    }
+    Ok(next as u64)
+}
+
+/// Service-private durable state for one ordinary VFS open description. The
+/// wire is exactly one rootd checkpoint value; path bytes are child records.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OpenDescriptionCheckpointWire {
+    pub version: u16,
+    pub kind: u16,
+    pub last_mutation: u16,
+    pub reserved0: u16,
+    pub path_len: u32,
+    pub refs: u32,
+    pub cursor: u64,
+    pub len: u64,
+    pub status_flags: u64,
+    pub content_identity: u64,
+    pub last_start: u64,
+    pub last_result: u64,
+}
+
+const _: () = assert!(core::mem::size_of::<OpenDescriptionCheckpointWire>() == 64);
+
+impl OpenDescriptionCheckpointWire {
+    pub fn valid(&self, path_capacity: usize) -> bool {
+        self.version == VFSD_OPEN_CHECKPOINT_VERSION
+            && matches!(self.kind, 1..=3)
+            && matches!(
+                self.last_mutation,
+                VFSD_OPEN_MUTATION_STAGING
+                    | VFSD_OPEN_MUTATION_OPEN
+                    | VFSD_OPEN_MUTATION_READ
+                    | VFSD_OPEN_MUTATION_LSEEK
+                    | VFSD_OPEN_MUTATION_GETDENTS
+                    | VFSD_OPEN_MUTATION_FCNTL
+                    | VFSD_OPEN_MUTATION_STABLE
+            )
+            && self.reserved0 == 0
+            && self.path_len != 0
+            && self.path_len as usize <= path_capacity
+            && self.refs == 1
+    }
+}
+
+pub fn checkpoint_path_key(remote_id: u64, chunk_index: usize) -> Option<(u64, u64)> {
+    let chunk_index = u32::try_from(chunk_index).ok()?;
+    Some((remote_id, VFSD_CHECKPOINT_PATH_TAG | u64::from(chunk_index)))
+}
 
 pub fn valid_checkpoint_record(record: &ServiceCheckpointRecordWire) -> bool {
     let value_len = record.value_len as usize;
@@ -271,6 +409,63 @@ mod tests {
     use alloc::vec;
 
     #[test]
+    fn boot_read_range_rejects_empty_overflow_and_end_overrun() {
+        assert_eq!(
+            validate_boot_read_range(512, 8, 0, 0),
+            Err(StorageError::InvalidInput)
+        );
+        assert_eq!(
+            validate_boot_read_range(512, u64::MAX, u64::MAX, 512),
+            Err(StorageError::InvalidInput)
+        );
+        assert_eq!(
+            validate_boot_read_range(512, 8, 7, 1024),
+            Err(StorageError::InvalidInput)
+        );
+        assert_eq!(validate_boot_read_range(512, 8, 6, 1024), Ok(()));
+    }
+
+    #[test]
+    fn broker_status_preserves_recoverable_storage_failures() {
+        assert_eq!(
+            storage_error_from_linux_status(-4),
+            StorageError::Interrupted
+        );
+        assert_eq!(
+            storage_error_from_linux_status(-19),
+            StorageError::NotPresent
+        );
+        assert_eq!(
+            storage_error_from_linux_status(-22),
+            StorageError::InvalidInput
+        );
+        assert_eq!(
+            storage_error_from_linux_status(-38),
+            StorageError::Unsupported
+        );
+        assert_eq!(storage_error_from_linux_status(-110), StorageError::Timeout);
+        assert_eq!(
+            storage_error_from_linux_status(i64::MIN),
+            StorageError::DeviceFault
+        );
+    }
+
+    #[test]
+    fn cache_generation_never_saturates_into_false_stability() {
+        assert_eq!(checked_next_generation(1), Some(2));
+        assert_eq!(checked_next_generation(u64::MAX), None);
+    }
+
+    #[test]
+    fn transient_metadata_failures_never_enter_the_negative_cache() {
+        assert!(cacheable_metadata_errno(ENOENT));
+        assert!(cacheable_metadata_errno(ENOTDIR));
+        assert!(!cacheable_metadata_errno(5));
+        assert!(!cacheable_metadata_errno(19));
+        assert!(!cacheable_metadata_errno(110));
+    }
+
+    #[test]
     fn persistent_mutation_admission_remains_read_only() {
         assert_eq!(persistent_mutation_status(VFS_IPC_OP_WRITE), Some(EROFS));
         assert_eq!(
@@ -300,6 +495,53 @@ mod tests {
         record.value[1] = 0;
         record.flags = 2;
         assert!(!valid_checkpoint_record(&record));
+    }
+
+    #[test]
+    fn open_description_wire_is_one_checkpoint_value_and_strictly_bounded() {
+        assert_eq!(
+            core::mem::size_of::<OpenDescriptionCheckpointWire>(),
+            rustos_user_abi::syscall::SERVICE_CHECKPOINT_VALUE_CAPACITY
+        );
+        let wire = OpenDescriptionCheckpointWire {
+            version: VFSD_OPEN_CHECKPOINT_VERSION,
+            kind: 1,
+            last_mutation: VFSD_OPEN_MUTATION_OPEN,
+            reserved0: 0,
+            path_len: 7,
+            refs: 1,
+            cursor: 0,
+            len: 11,
+            status_flags: 0,
+            content_identity: 9,
+            last_start: 0,
+            last_result: 0,
+        };
+        assert!(wire.valid(256));
+        assert!(!OpenDescriptionCheckpointWire { refs: 2, ..wire }.valid(256));
+        assert!(!OpenDescriptionCheckpointWire {
+            path_len: 257,
+            ..wire
+        }
+        .valid(256));
+        assert_ne!(checkpoint_path_key(7, 0), checkpoint_path_key(7, 1));
+    }
+
+    #[test]
+    fn seek_position_never_wraps_signed_linux_off_t() {
+        assert_eq!(checked_seek_position(9, 20, -4, 1), Ok(5));
+        assert_eq!(
+            checked_seek_position(9, 20, -21, 2),
+            Err(SeekPositionError::Negative)
+        );
+        assert_eq!(
+            checked_seek_position(i64::MAX as u64, 0, 1, 1),
+            Err(SeekPositionError::Overflow)
+        );
+        assert_eq!(
+            checked_seek_position(0, 0, 0, 99),
+            Err(SeekPositionError::InvalidWhence)
+        );
     }
 
     fn interest(fd: u64, object_id: u64) -> WaitSetInterestRecord {

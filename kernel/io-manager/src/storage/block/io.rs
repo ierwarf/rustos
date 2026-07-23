@@ -115,6 +115,10 @@ fn read_blocks_uncached_resolved(
         let remaining_blocks = (out.len() - done) / block_size;
         let chunk_blocks = remaining_blocks.min(max_blocks_per_lock);
         let chunk_len = chunk_blocks * block_size;
+        let absolute_lba = resolved
+            .start_block
+            .checked_add(chunk_lba)
+            .ok_or(DiskIoError::InvalidInput)?;
         {
             let mut device = resolved.device.lock();
             if trace {
@@ -125,21 +129,16 @@ fn read_blocks_uncached_resolved(
                     device_id as u64,
                     format!(
                         "storage uncached read: dispatch dev={} data_ptr={:#x} vtable_ptr={:#x} abs_lba={} bytes={}",
-                        device_id,
-                        data_ptr,
-                        vtable_ptr,
-                        resolved.start_block + chunk_lba,
-                        chunk_len
+                        device_id, data_ptr, vtable_ptr, absolute_lba, chunk_len
                     ),
                 );
             }
-            device.read_blocks(
-                resolved.start_block + chunk_lba,
-                &mut out[done..done + chunk_len],
-            )?;
+            device.read_blocks(absolute_lba, &mut out[done..done + chunk_len])?;
         }
         done += chunk_len;
-        chunk_lba += chunk_blocks as u64;
+        chunk_lba = chunk_lba
+            .checked_add(chunk_blocks as u64)
+            .ok_or(DiskIoError::InvalidInput)?;
         if done < out.len() {
             crate::multitask::cond_resched();
         }
@@ -172,8 +171,12 @@ pub(super) fn write_blocks_uncached_local(device_id: u32, lba: u64, input: &[u8]
         resolved.block_count,
         input.len(),
     )?;
+    let absolute_lba = resolved
+        .start_block
+        .checked_add(lba)
+        .ok_or(DiskIoError::InvalidInput)?;
     let mut device = resolved.device.lock();
-    device.write_blocks(resolved.start_block + lba, input)
+    device.write_blocks(absolute_lba, input)
 }
 
 pub(super) fn flush_uncached(device_id: u32) -> IoResult<()> {
@@ -205,9 +208,14 @@ fn resolve_root_device_locked(
         }),
         BlockDeviceKind::Slice { parent_id, .. } => {
             let mut resolved = resolve_root_device_locked(devices, *parent_id)?;
+            let parent_end = resolved.start_block.checked_add(resolved.block_count)?;
+            let slice_end = record.start_block.checked_add(record.block_count)?;
+            if record.start_block < resolved.start_block || slice_end > parent_end {
+                return None;
+            }
             resolved.readonly |= record.readonly;
             resolved.start_block = record.start_block;
-            resolved.block_count = record.block_count.min(resolved.block_count);
+            resolved.block_count = record.block_count;
             resolved.logical_block_size = record.logical_block_size;
             Some(resolved)
         }

@@ -126,6 +126,13 @@ mod tests {
         assert_eq!(syscall::DEVMGRD_IOCTL_LINUX_TTY_FIONREAD, 0x541b);
         assert_eq!(syscall::INPUTD_IPC_ABI_VERSION, 3);
         assert_eq!(syscall::VFS_IPC_ABI_VERSION, 3);
+        assert_eq!(syscall::VFS_IPC_OP_CURSOR_SETTLE, 24);
+        assert_eq!(syscall::VFS_IPC_OP_CHECKPOINT_ACK, 25);
+        assert_eq!(
+            syscall::COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_COMPACT,
+            12
+        );
+        assert_eq!(syscall::COMMERCIAL_MAX_ROOTD_OP_LOADER_WORKER_COMPLETE, 13);
         assert_eq!(syscall::NETD_IPC_ABI_VERSION, 4);
         assert_eq!(syscall::SYS_RUSTOS_WAITSET_SIGNAL_BROKER, 0x5255_003f);
         assert_eq!(syscall::SYS_RUSTOS_ENTROPY_BROKER, 0x5255_0040);

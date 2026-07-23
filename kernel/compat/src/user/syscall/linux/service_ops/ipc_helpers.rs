@@ -434,25 +434,52 @@ fn call_vfs_ipc_request_impl(
 ) -> Result<VfsIpcResponse, i64> {
     drain_pending_vfs_mutations();
     let start_ticks = crate::arch::rtc::ticks();
-    let replay_safe_mutation = request.op == VFS_IPC_OP_CLOSE
-        || request.op == VFS_IPC_OP_POLL_QUERY
-            && matches!(
-                request.arg0,
-                VFS_POLL_QUERY_EPOLL_CREATE
-                    | VFS_POLL_QUERY_EPOLL_CTL
-                    | VFS_POLL_QUERY_EPOLL_REF
-                    | VFS_POLL_QUERY_EPOLL_UNREF
-                    | VFS_POLL_QUERY_EPOLL_PURGE_OBJECT
-            );
-    let attempts = if timeout_ms.is_some() && replay_safe_mutation {
-        3
+    let replay_safe_mutation = matches!(
+        request.op,
+        VFS_IPC_OP_OPENAT
+            | VFS_IPC_OP_CLOSE
+            | VFS_IPC_OP_READ
+            | VFS_IPC_OP_LSEEK
+            | VFS_IPC_OP_GETDENTS64
+            | VFS_IPC_OP_FCNTL
+            | VFS_IPC_OP_CURSOR_SETTLE
+            | VFS_IPC_OP_CHECKPOINT_ACK
+    ) || request.op == VFS_IPC_OP_POLL_QUERY
+        && matches!(
+            request.arg0,
+            VFS_POLL_QUERY_EPOLL_CREATE
+                | VFS_POLL_QUERY_EPOLL_CTL
+                | VFS_POLL_QUERY_EPOLL_REF
+                | VFS_POLL_QUERY_EPOLL_UNREF
+                | VFS_POLL_QUERY_EPOLL_PURGE_OBJECT
+        );
+    let deferred_reconcile = matches!(
+        request.op,
+        VFS_IPC_OP_CLOSE | VFS_IPC_OP_CURSOR_SETTLE | VFS_IPC_OP_CHECKPOINT_ACK
+    ) || request.op == VFS_IPC_OP_POLL_QUERY
+        && matches!(
+            request.arg0,
+            VFS_POLL_QUERY_EPOLL_CREATE
+                | VFS_POLL_QUERY_EPOLL_CTL
+                | VFS_POLL_QUERY_EPOLL_REF
+                | VFS_POLL_QUERY_EPOLL_UNREF
+                | VFS_POLL_QUERY_EPOLL_PURGE_OBJECT
+        );
+    let total_timeout_ms = timeout_ms.or(replay_safe_mutation.then_some(30_000));
+    let attempts = if replay_safe_mutation {
+        total_timeout_ms
+            .map(|total| usize::try_from(total).unwrap_or(usize::MAX).min(3))
+            .unwrap_or(3)
+            .max(1)
     } else {
         1
     };
     let mut response = None;
     let mut last_errno = LINUX_ETIMEDOUT;
-    for _ in 0..attempts {
-        let result = match timeout_ms {
+    for attempt in 0..attempts {
+        let attempt_timeout_ms =
+            total_timeout_ms.map(|total| split_retry_timeout_ms(total, attempts, attempt));
+        let result = match attempt_timeout_ms {
             Some(timeout_ms) => ipc_ops::call_service_endpoint_with_timeout(
                 IPC_SERVICE_VFSD,
                 as_bytes(request),
@@ -465,14 +492,20 @@ fn call_vfs_ipc_request_impl(
                 response = Some(bytes);
                 break;
             }
-            Err(errno) if errno == LINUX_ETIMEDOUT && attempts > 1 => last_errno = errno,
+            Err(errno)
+                if attempts > 1
+                    && matches!(errno, LINUX_ETIMEDOUT | LINUX_EPIPE | LINUX_ENOSYS) =>
+            {
+                last_errno = errno;
+                multitask::cond_resched();
+            }
             Err(errno) => return Err(errno),
         }
     }
     let response = match response {
         Some(response) => response,
         None => {
-            if replay_safe_mutation {
+            if deferred_reconcile {
                 enqueue_pending_vfs_mutation(request)?;
             }
             return Err(last_errno);
@@ -489,19 +522,91 @@ fn call_vfs_ipc_request_impl(
         detail.as_deref(),
     );
     if response.len() != size_of::<VfsIpcResponse>() {
-        if replay_safe_mutation {
+        if deferred_reconcile {
             enqueue_pending_vfs_mutation(request)?;
         }
         return Err(LINUX_EINVAL);
     }
     let response = read_unaligned::<VfsIpcResponse>(response.as_slice());
     if let Err(errno) = validate_vfs_response_envelope(request.op, &response) {
-        if replay_safe_mutation {
+        if deferred_reconcile {
             enqueue_pending_vfs_mutation(request)?;
         }
         return Err(errno);
     }
+    if response.status == 0 && vfs_checkpoint_ack_required(request) {
+        let _ = acknowledge_vfs_checkpoint_mutation(request);
+    }
     Ok(response)
+}
+
+fn split_retry_timeout_ms(total: u64, attempts: usize, attempt: usize) -> u64 {
+    debug_assert!(attempts > 0 && attempt < attempts);
+    let attempts = attempts as u64;
+    total / attempts + u64::from((attempt as u64) < total % attempts)
+}
+
+fn vfs_checkpoint_ack_required(request: &VfsIpcRequest) -> bool {
+    request.op == VFS_IPC_OP_CLOSE
+        || request.op == VFS_IPC_OP_POLL_QUERY
+            && (request.arg0 == VFS_POLL_QUERY_EPOLL_UNREF
+                || request.arg0 == VFS_POLL_QUERY_EPOLL_PURGE_OBJECT
+                || request.arg0 == VFS_POLL_QUERY_EPOLL_CTL
+                    && request.arg1 == linux_abi::EPOLL_CTL_DEL)
+}
+
+fn acknowledge_vfs_checkpoint_mutation(original: &VfsIpcRequest) -> Result<(), i64> {
+    let mut ack = new_vfs_request(VFS_IPC_OP_CHECKPOINT_ACK);
+    ack.remote_id = original.remote_id;
+    ack.arg0 = original.operation_hi;
+    ack.arg1 = original.operation_lo;
+    ack.arg2 = u64::from(original.op);
+    ack.arg3 = if original.op == VFS_IPC_OP_POLL_QUERY {
+        original.arg0
+    } else {
+        0
+    };
+    let mut last_errno = LINUX_ETIMEDOUT;
+    for attempt in 0..3 {
+        match ipc_ops::call_service_endpoint_with_timeout(
+            IPC_SERVICE_VFSD,
+            as_bytes(&ack),
+            split_retry_timeout_ms(16, 3, attempt),
+        ) {
+            Ok(bytes) if bytes.len() == size_of::<VfsIpcResponse>() => {
+                let response = read_unaligned::<VfsIpcResponse>(&bytes);
+                if validate_vfs_response_envelope(ack.op, &response).is_ok() && response.status == 0
+                {
+                    return Ok(());
+                }
+                last_errno = if response.status == 0 {
+                    LINUX_EINVAL
+                } else {
+                    i64::from(response.status.unsigned_abs())
+                };
+            }
+            Ok(_) => last_errno = LINUX_EINVAL,
+            Err(errno) => last_errno = errno,
+        }
+        multitask::cond_resched();
+    }
+    enqueue_pending_vfs_mutation(&ack)?;
+    Err(last_errno)
+}
+
+pub fn settle_vfs_cursor_mutation(prepared: &VfsIpcRequest, commit: bool) -> Result<(), i64> {
+    let mut request = new_vfs_request(VFS_IPC_OP_CURSOR_SETTLE);
+    request.fd = prepared.fd;
+    request.remote_id = prepared.remote_id;
+    request.arg0 = prepared.operation_hi;
+    request.arg1 = prepared.operation_lo;
+    request.arg2 = if commit {
+        VFS_CURSOR_SETTLE_COMMIT
+    } else {
+        VFS_CURSOR_SETTLE_CANCEL
+    };
+    let response = call_vfs_ipc_request_with_timeout(&request, 16)?;
+    ensure_vfs_status(&response)
 }
 
 fn enqueue_pending_vfs_mutation(request: &VfsIpcRequest) -> Result<(), i64> {
@@ -511,7 +616,13 @@ fn enqueue_pending_vfs_mutation(request: &VfsIpcRequest) -> Result<(), i64> {
     }
     let mut queue = PENDING_VFS_MUTATIONS.lock();
     if queue.iter().any(|entry| {
-        entry.operation_hi == request.operation_hi && entry.operation_lo == request.operation_lo
+        if request.op == VFS_IPC_OP_CHECKPOINT_ACK {
+            entry.op == VFS_IPC_OP_CHECKPOINT_ACK
+                && entry.arg0 == request.arg0
+                && entry.arg1 == request.arg1
+        } else {
+            entry.operation_hi == request.operation_hi && entry.operation_lo == request.operation_lo
+        }
     }) {
         return Ok(());
     }
@@ -551,23 +662,22 @@ fn drain_pending_vfs_mutations() {
         request.payload_len = pending.payload_len;
         let payload_len = pending.payload_len as usize;
         request.payload[..payload_len].copy_from_slice(&pending.payload[..payload_len]);
-        let completed =
+        let response =
             ipc_ops::call_service_endpoint_with_timeout(IPC_SERVICE_VFSD, as_bytes(&request), 16)
                 .ok()
                 .and_then(|bytes| {
                     (bytes.len() == size_of::<VfsIpcResponse>())
                         .then(|| read_unaligned::<VfsIpcResponse>(&bytes))
-                })
-                .is_some_and(|response| {
-                    validate_vfs_response_envelope(request.op, &response).is_ok()
-                        && (response.status == 0
-                            || response.status == LINUX_EBADF as i32
-                            || response.status == LINUX_ENOENT as i32
-                            || response.status == LINUX_ESTALE as i32)
                 });
+        let completed = response.is_some_and(|response| {
+            validate_vfs_response_envelope(request.op, &response).is_ok() && response.status == 0
+        });
         if !completed {
             PENDING_VFS_MUTATIONS.lock().push_front(pending);
             return;
+        }
+        if vfs_checkpoint_ack_required(&request) {
+            let _ = acknowledge_vfs_checkpoint_mutation(&request);
         }
     }
 }
@@ -1553,6 +1663,45 @@ mod tests {
             validate_vfs_response_envelope(VFS_IPC_OP_OPENAT, &response),
             Err(LINUX_EINVAL)
         );
+    }
+
+    #[test]
+    fn only_tombstoning_vfs_mutations_require_visibility_ack() {
+        let close = VfsIpcRequest {
+            op: VFS_IPC_OP_CLOSE,
+            ..VfsIpcRequest::default()
+        };
+        assert!(vfs_checkpoint_ack_required(&close));
+
+        let mut poll = VfsIpcRequest {
+            op: VFS_IPC_OP_POLL_QUERY,
+            arg0: VFS_POLL_QUERY_EPOLL_CTL,
+            arg1: linux_abi::EPOLL_CTL_ADD,
+            ..VfsIpcRequest::default()
+        };
+        assert!(!vfs_checkpoint_ack_required(&poll));
+        poll.arg1 = linux_abi::EPOLL_CTL_DEL;
+        assert!(vfs_checkpoint_ack_required(&poll));
+        poll.arg0 = VFS_POLL_QUERY_EPOLL_UNREF;
+        assert!(vfs_checkpoint_ack_required(&poll));
+        poll.arg0 = VFS_POLL_QUERY_EPOLL_PURGE_OBJECT;
+        assert!(vfs_checkpoint_ack_required(&poll));
+
+        let read = VfsIpcRequest {
+            op: VFS_IPC_OP_READ,
+            ..VfsIpcRequest::default()
+        };
+        assert!(!vfs_checkpoint_ack_required(&read));
+    }
+
+    #[test]
+    fn replay_retries_share_one_total_timeout_budget() {
+        let slices = (0..3)
+            .map(|attempt| split_retry_timeout_ms(16, 3, attempt))
+            .collect::<Vec<_>>();
+        assert_eq!(slices.as_slice(), &[6, 5, 5]);
+        assert_eq!(slices.iter().sum::<u64>(), 16);
+        assert_eq!(split_retry_timeout_ms(1, 1, 0), 1);
     }
 
     #[test]

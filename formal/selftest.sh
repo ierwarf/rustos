@@ -91,6 +91,11 @@ done
 for script in formal/run-{all-tlc,tlc,tlc-simulate,kani,verus,runtime-traces,source-conformance,miri,loom,fuzz-smoke,apalache,tlaps}.sh; do
     [[ -x "$script" ]] || { echo "formal runner is not executable: $script" >&2; exit 1; }
 done
+[[ -x formal/check-system-flows.sh ]] || {
+    echo "system-flow contract checker is not executable" >&2
+    exit 1
+}
+formal/check-system-flows.sh
 rg -q 'run-source-conformance\.sh' formal/verify-all.sh || {
     echo "formal PR gate omits source conformance" >&2
     exit 1

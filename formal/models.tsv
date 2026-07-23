@@ -1,5 +1,6 @@
 # model	class	deadlock_policy	deadlock_reason	pr_timeout_s	nightly_timeout_s	nightly_mode	apalache	tlaps	trace
 boot-volume-admission/BootVolumeAdmission	safety	intentional-terminal	admission decision is terminal	120	900	exhaustive	no	no	no
+boot-volume-read/BootVolumeRead	temporal	intentional-terminal	read request completes or preserves a bounded failure outcome	120	900	exhaustive	no	no	no
 clocksource-deadline/ClocksourceDeadline	temporal	intentional-terminal	retired or released waits are terminal	120	900	exhaustive	no	no	no
 deferred-start/DeferredStart	temporal	intentional-terminal	launch outcome is terminal	120	900	exhaustive	no	no	no
 devmgrd-sessiond-isolation/DevmgrdSessiondIsolation	temporal	intentional-terminal	bounded request outcome is terminal	120	900	exhaustive	no	no	no
@@ -30,6 +31,7 @@ dvm-network-ring/DvmNetworkRing	safety	intentional-terminal	ring epoch may revok
 dvm-release-bundle/DvmReleaseBundle	safety	intentional-terminal	bundle admission decision is terminal	120	900	exhaustive	no	no	no
 endpoint-publication/EndpointPublication	safety	intentional-terminal	publisher process may exit	120	900	exhaustive	no	yes	no
 endpoint-registry/EndpointRegistry	temporal	intentional-terminal	endpoint wait may settle terminally	120	900	exhaustive	no	no	no
+exception-retirement-lifecycle/ExceptionRetirementLifecycle	temporal	intentional-terminal	exception outcome is terminal	120	900	exhaustive	no	no	no
 exec-ticket/ExecTicket	safety	intentional-terminal	ticket outcome is terminal	120	900	exhaustive+simulate	yes	no	no
 filesystem-content-integrity/FilesystemContentIntegrity	temporal	intentional-terminal	verified read decision is terminal	120	900	exhaustive	no	no	no
 futex-waiter-lifecycle/FutexWaiterLifecycle	safety	intentional-terminal	waiter wake timeout or exit is terminal	30	120	exhaustive	no	no	no
@@ -51,6 +53,7 @@ page-table-lifecycle/PageTableLifecycle	safety	intentional-terminal	mapping life
 persistent-mutation-admission/PersistentMutationAdmission	safety	intentional-terminal	mutation admission decision is terminal	30	120	exhaustive	no	no	no
 post-init-leases/PostInitLeases	safety	intentional-terminal	service lease may terminate	120	900	exhaustive	no	no	no
 service-mutation-recovery/ServiceMutationRecovery	safety	intentional-terminal	bounded mutation sequence may terminate	120	900	exhaustive	no	no	no
+vfs-open-description-recovery/VfsOpenDescriptionRecovery	safety	intentional-terminal	bounded open-description sequence may terminate	120	900	exhaustive	no	no	no
 post-init-supervisor-recovery/PostInitSupervisorRecovery	temporal	intentional-terminal	recovery outcome may terminate	120	900	exhaustive	no	no	no
 proc-broker-session/ProcBrokerSession	safety	intentional-terminal	prepare session outcome is terminal	120	900	exhaustive	no	no	no
 process-address-space-lifetime/ProcessAddressSpaceLifetime	temporal	intentional-terminal	process state may exit and reclaim	30	120	exhaustive	no	no	no

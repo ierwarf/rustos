@@ -64,7 +64,8 @@ failure output as the primary debugging context.
 | `bash formal/verify-all.sh --profile pr` | run the registered merge gate: selftest, exhaustive TLC, witness-covered Kani, Verus, and source trace replay | `build/formal/`, tool caches | invariant/proof/trace failure or missing pinned tool |
 | `bash formal/verify-all.sh --profile nightly` | add alternate TLC seed/simulation, Miri, Loom, Apalache, TLAPS, and bounded Rust/C coverage-guided fuzzing | `build/formal/`, tool/corpus caches | nightly bug-finding or proof lane failed; simulation/fuzz success is not proof |
 | `bash formal/run-runtime-traces.sh` | generate concrete `runtime-control` source outcomes and replay them against the registered TLA action matrix | `build/formal/runtime-traces/` | source/spec classification drift or malformed trace |
-| `bash formal/run-source-conformance.sh` | run thirty-four unique exact source decision witnesses mapped to eighteen high-risk lifecycle, RPC, and IPC models; rejects duplicate and zero-test entries | `build/formal/source-conformance/summary.json` | source/spec decision drift, duplicate/missing test, or filtered witness |
+| `bash formal/run-source-conformance.sh` | run the registry-scripted unique exact source decision witnesses for high-risk lifecycle, RPC, and IPC models; rejects duplicate and zero-test entries | `build/formal/source-conformance/summary.json` | source/spec decision drift, duplicate/missing test, or filtered witness |
+| `bash formal/check-system-flows.sh` | validate the machine-readable end-to-end requirement/hazard graph and every model/source/witness link | none | duplicate IDs, missing terminal path, unbounded timeout, absent model/source/test, or direct `.ko` lifecycle route |
 | `bash formal/run-apalache.sh` / `bash formal/run-tlaps.sh` | run the typed symbolic-refinement pilots and the unbounded theorem pilot | `build/formal/{apalache,tlaps}/` | type/SMT/proof failure or missing hash-pinned tool |
 | `bash formal/run-miri.sh` / `bash formal/run-loom.sh` | check selected host Rust paths for modeled UB and enumerate the endpoint publication proof-kernel interleavings | Miri cache, isolated Loom target | UB or concurrency invariant failure |
 | `bash formal/run-fuzz-smoke.sh` | run bounded libFuzzer campaigns over shared Rust admission and the exact Linux-DVM C GPU parser with ASan/UBSan | `build/formal/fuzz/`, ignored fuzz target | crash, sanitizer finding, compile failure, or wall-clock bound exceeded |
@@ -202,6 +203,11 @@ fallback.
 
 - `kvm-smoke` requires read/write `/dev/kvm` and `/dev/vhost-vsock` access plus
   `qemu-system-x86_64`; it does not alter host hypervisor configuration.
+- Headless virgl smoke discovers exactly one direct, read/write AMDGPU render
+  node by sysfs vendor and bound-driver identity, then pins that exact path in
+  QEMU's EGL backend. Render-node numbering is not an ABI; zero or multiple
+  AMDGPU candidates fail closed. GTK remains stricter because QEMU cannot pin
+  its render node and therefore rejects hosts with multiple render nodes.
 - `--timeout <seconds>` is bounded to `1..=30` and applies only while waiting
   for expected RustOS debugcon and Linux DVM serial markers.
 - The default marker is `rootd: core services ready, spawning initd via loaderd`;

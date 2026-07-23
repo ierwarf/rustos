@@ -6,7 +6,11 @@ Split into two focused files. Load only what the task needs.
   kernel API, kernel build, fault injection, logging, docs.
 - `contracts-abi.md` — kernel/userspace ABI, IPC service IDs, broker syscalls,
   handle transfer, service routing, display/scheduler contracts.
+- `system-flows.md` — cross-owner lifecycle composition and the executable
+  requirement/hazard/model/source/witness graph.
 - `performance-hardening.md` — short runbook for evidence-driven boot/runtime
   bottleneck fixes and cleanup decisions.
 
 When updating contracts: edit the file whose section owns the changed behavior.
+If a high-risk change crosses owners, also update `system-flows.md` and
+`formal/system-flows.tsv`.

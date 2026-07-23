@@ -1,9 +1,58 @@
+use core::arch::global_asm;
+
 use x86_64::registers::control::Cr2;
 use x86_64::structures::idt::InterruptStackFrame;
 
 const KEYBOARD_INTERRUPT_VECTOR: u8 = crate::arch::pic::PIC_1_OFFSET + 1;
 const MOUSE_INTERRUPT_VECTOR: u8 = crate::arch::pic::PIC_2_OFFSET + 4;
+
+// LLVM's current `x86-interrupt` error-code prologue leaves `%rsp` eight bytes
+// away from the ordinary SysV call-site contract before invoking a nested Rust
+// function. Keep the generated interrupt prologue for its complete register
+// save/restore, but cross one explicit alignment bridge before entering the
+// shared Rust exception path. The bridge also accepts already-aligned
+// no-error-code entries, so every general exception has one contract.
+global_asm!(
+    r#"
+    .global rustos_default_handler_alignment_bridge
+    .type rustos_default_handler_alignment_bridge, @function
+rustos_default_handler_alignment_bridge:
+    mov r11, rsp
+    and rsp, -16
+    sub rsp, 16
+    mov [rsp], r11
+    call rustos_default_handler_aligned
+    mov rsp, [rsp]
+    ret
+    .size rustos_default_handler_alignment_bridge, . - rustos_default_handler_alignment_bridge
+"#
+);
+
+unsafe extern "Rust" {
+    fn rustos_default_handler_alignment_bridge(
+        stack_frame: InterruptStackFrame,
+        index: u8,
+        error_code: Option<u64>,
+    );
+}
+
+// `set_general_handler!` inlines this tiny handoff into each generated
+// `x86-interrupt` wrapper. That makes the assembly bridge the first nested
+// call boundary; no ordinary Rust prologue is permitted to run on the
+// error-code wrapper's misaligned stack.
+#[inline(always)]
 pub fn default_handler(stack_frame: InterruptStackFrame, index: u8, error_code: Option<u64>) {
+    unsafe {
+        rustos_default_handler_alignment_bridge(stack_frame, index, error_code);
+    }
+}
+
+#[unsafe(no_mangle)]
+fn rustos_default_handler_aligned(
+    stack_frame: InterruptStackFrame,
+    index: u8,
+    error_code: Option<u64>,
+) {
     let cr2 = Cr2::read().map(|addr| addr.as_u64()).unwrap_or(u64::MAX);
     crate::debug::dump_recent_trace_locations("exception");
     if index == 14 {
@@ -154,6 +203,24 @@ pub extern "x86-interrupt" fn double_fault_handler(
 
 fn is_user_mode(stack_frame: &InterruptStackFrame) -> bool {
     (stack_frame.code_segment.0 & 0x3) == 0x3
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn general_exception_bridge_aligns_every_rust_call_boundary() {
+        for raw_rsp in [
+            0x1000_u64,
+            0x1008,
+            0x100f,
+            0x1010,
+            u64::MAX - 0x1f,
+        ] {
+            let aligned = (raw_rsp & !0xf).wrapping_sub(16);
+            assert_eq!(aligned & 0xf, 0);
+            assert!(aligned <= raw_rsp);
+        }
+    }
 }
 
 pub fn pic_interrupt_handler(

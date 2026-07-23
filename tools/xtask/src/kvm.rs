@@ -134,7 +134,6 @@ const NETPROBE_QEMU_ENABLED: &str = "RUSTOS_NETPROBE_QEMU=1";
 const NETPROBE_QEMU_REACHABLE_MARKER: &str = "netprobe: qemu gateway reachable";
 const DVM_GUEST_CID: u32 = 4;
 const VHOST_VSOCK_DEVICE: &str = "/dev/vhost-vsock";
-const HOST_GPU_RENDER_NODE: &str = "/dev/dri/renderD128";
 const MAX_SMOKE_TIMEOUT: u64 = 30;
 const PHYSICAL_GPU_REQUIRED_MEMLOCK: u64 = 4 * 1024 * 1024 * 1024;
 const ACPI_VFCT_HEADER_BYTES: usize = 0x4c;
@@ -310,11 +309,17 @@ where
     )?;
     let display_doorbell = start_dvm_display_doorbell(&layout)?;
     let guest_display = smoke_guest_display(&options)?;
-    if guest_display != GuestDisplay::Physical {
-        require_host_render_node()?;
-    }
+    let host_render_node = if guest_display != GuestDisplay::Physical {
+        Some(require_host_render_node()?)
+    } else {
+        None
+    };
     if guest_display == GuestDisplay::DvmGtk {
-        require_sole_host_render_node()?;
+        require_sole_host_render_node(
+            host_render_node
+                .as_deref()
+                .context("GTK display lost its validated host render node")?,
+        )?;
     }
     let (mut rustos, mut dvm) = spawn_guests(
         &qemu,
@@ -323,6 +328,7 @@ where
         &layout,
         &options,
         guest_display,
+        host_render_node.as_deref(),
         display_doorbell.as_ref(),
         &input_doorbell,
         input_relay_gate,
@@ -430,8 +436,8 @@ pub(crate) fn kvm_run_command(config: &Config) -> Result<()> {
     let layout = prepare_layout(config, &options)?;
     log_kvm_start_phase("prepared-kvm-layout", started_at);
     require_vhost_vsock()?;
-    require_host_render_node()?;
-    require_sole_host_render_node()?;
+    let host_render_node = require_host_render_node()?;
+    require_sole_host_render_node(&host_render_node)?;
     log_kvm_start_phase("verified-vhost-vsock", started_at);
     let input_doorbell = start_dvm_input_doorbell(&layout)?;
     log_kvm_start_phase("started-input-doorbell", started_at);
@@ -453,6 +459,7 @@ pub(crate) fn kvm_run_command(config: &Config) -> Result<()> {
         &layout,
         &options,
         GuestDisplay::DvmGtk,
+        Some(&host_render_node),
         display_doorbell.as_ref(),
         &input_doorbell,
         input_relay_gate,
@@ -572,22 +579,26 @@ enum GuestDisplay {
     Physical,
 }
 
-fn qemu_display_backend(display: GuestDisplay) -> &'static str {
+fn qemu_display_backend(display: GuestDisplay, render_node: Option<&Path>) -> Result<String> {
     match display {
         // Keep the noninteractive proof on the physical host render node.
         // Allowing QEMU to pick a software EGL device would fabricate GPU
         // execution evidence even though the guest-visible driver is virgl.
-        GuestDisplay::Headless => "egl-headless,rendernode=/dev/dri/renderD128",
+        GuestDisplay::Headless => {
+            let render_node =
+                render_node.context("headless KVM display requires a validated render node")?;
+            Ok(format!("egl-headless,rendernode={}", render_node.display()))
+        }
         // GTK captures keyboard focus on hover. Pointer input is supplied by
         // the absolute tablet below, so F5 never needs a manual mouse grab.
         // Force-hide the host cursor. Leaving this option unset delegates the
         // result to the frontend default and previously left the host pointer
         // visible over the guest UI on some GTK versions.
         //
-        GuestDisplay::DvmGtk => {
-            "gtk,gl=on,show-tabs=off,zoom-to-fit=off,grab-on-hover=on,show-cursor=off"
-        }
-        GuestDisplay::Physical => "none",
+        GuestDisplay::DvmGtk => Ok(
+            "gtk,gl=on,show-tabs=off,zoom-to-fit=off,grab-on-hover=on,show-cursor=off".to_owned(),
+        ),
+        GuestDisplay::Physical => Ok("none".to_owned()),
     }
 }
 
@@ -1987,42 +1998,79 @@ fn validate_physical_gpu_inputs(options: &SmokeOptions) -> Result<()> {
     Ok(())
 }
 
-fn require_host_render_node() -> Result<()> {
-    let metadata = std::fs::symlink_metadata(HOST_GPU_RENDER_NODE)
-        .with_context(|| format!("missing host render node {HOST_GPU_RENDER_NODE}"))?;
-    if metadata.file_type().is_symlink() || !metadata.file_type().is_char_device() {
-        bail!("{HOST_GPU_RENDER_NODE} must be a direct character-device render node");
+fn require_host_render_node() -> Result<PathBuf> {
+    let mut amdgpu_nodes = Vec::new();
+    for entry in std::fs::read_dir("/dev/dri").context("missing host DRM device directory")? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with("renderD") {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_char_device() {
+            bail!(
+                "{} must be a direct character-device render node",
+                path.display()
+            );
+        }
+        let sysfs = Path::new("/sys/class/drm").join(name).join("device");
+        let vendor = std::fs::read_to_string(sysfs.join("vendor"))
+            .with_context(|| format!("missing vendor identity for {}", path.display()))?;
+        let driver = std::fs::canonicalize(sysfs.join("driver"))
+            .with_context(|| format!("missing driver identity for {}", path.display()))?;
+        if vendor.trim() == "0x1002" && driver.file_name() == Some(OsStr::new("amdgpu")) {
+            amdgpu_nodes.push(path);
+        }
     }
+    amdgpu_nodes.sort();
+    let render_node = match amdgpu_nodes.as_slice() {
+        [render_node] => render_node.clone(),
+        [] => bail!("KVM virgl requires exactly one AMDGPU render node; found none"),
+        nodes => bail!(
+            "KVM virgl requires exactly one AMDGPU render node; found {}",
+            nodes
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+    };
     std::fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .open(HOST_GPU_RENDER_NODE)
+        .open(&render_node)
         .with_context(|| {
-            format!("KVM virgl requires read/write access to {HOST_GPU_RENDER_NODE}")
+            format!(
+                "KVM virgl requires read/write access to {}",
+                render_node.display()
+            )
         })?;
-    let vendor = std::fs::read_to_string("/sys/class/drm/renderD128/device/vendor")?;
-    let driver = std::fs::canonicalize("/sys/class/drm/renderD128/device/driver")?;
-    if vendor.trim() != "0x1002" || driver.file_name() != Some(OsStr::new("amdgpu")) {
-        bail!(
-            "refusing non-AMDGPU KVM render node: vendor={} driver={}",
-            vendor.trim(),
-            driver.display()
-        );
-    }
-    Ok(())
+    Ok(render_node)
 }
 
-fn require_sole_host_render_node() -> Result<()> {
+fn require_sole_host_render_node(selected: &Path) -> Result<()> {
     let mut render_nodes = std::fs::read_dir("/dev/dri")?
         .filter_map(|entry| entry.ok())
-        .filter_map(|entry| entry.file_name().into_string().ok())
-        .filter(|name| name.starts_with("renderD"))
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(|name| name.starts_with("renderD"))
+        })
         .collect::<Vec<_>>();
     render_nodes.sort();
-    if render_nodes.as_slice() != ["renderD128"] {
+    if render_nodes.len() != 1 || render_nodes[0].as_path() != selected {
         bail!(
             "QEMU GTK cannot pin rendernode; refusing ambiguous host render nodes: {}",
-            render_nodes.join(",")
+            render_nodes
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(",")
         );
     }
     Ok(())
@@ -2170,6 +2218,7 @@ fn spawn_guests(
     layout: &KvmLayout,
     options: &SmokeOptions,
     guest_display: GuestDisplay,
+    host_render_node: Option<&Path>,
     display_doorbell: Option<&IvshmemDoorbellServer>,
     input_doorbell: &IvshmemDoorbellServer,
     input_relay_gate: Arc<AtomicBool>,
@@ -2273,7 +2322,7 @@ fn spawn_guests(
     } else {
         "console=ttyS0 preempt=full"
     };
-    let dvm_display = qemu_display_backend(guest_display);
+    let dvm_display = qemu_display_backend(guest_display, host_render_node)?;
     dvm_command
         .arg("-name")
         .arg("rustos-linux-dvm-kvm")
@@ -2295,7 +2344,7 @@ fn spawn_guests(
             "-append",
             dvm_append,
             "-display",
-            dvm_display,
+            &dvm_display,
             "-vga",
             "none",
             "-no-reboot",
@@ -3956,14 +4005,22 @@ uiserver: update tick backlog=false input_drops=0 input_slow=0 input_errors=0";
     #[test]
     fn interactive_gtk_display_uses_absolute_pointer_and_hides_host_cursor() {
         assert_eq!(
-            qemu_display_backend(GuestDisplay::Headless),
-            "egl-headless,rendernode=/dev/dri/renderD128"
+            qemu_display_backend(
+                GuestDisplay::Headless,
+                Some(Path::new("/dev/dri/renderD129"))
+            )
+            .unwrap(),
+            "egl-headless,rendernode=/dev/dri/renderD129"
         );
         assert_eq!(
-            qemu_display_backend(GuestDisplay::DvmGtk),
+            qemu_display_backend(GuestDisplay::DvmGtk, None).unwrap(),
             "gtk,gl=on,show-tabs=off,zoom-to-fit=off,grab-on-hover=on,show-cursor=off"
         );
-        assert_eq!(qemu_display_backend(GuestDisplay::Physical), "none");
+        assert_eq!(
+            qemu_display_backend(GuestDisplay::Physical, None).unwrap(),
+            "none"
+        );
+        assert!(qemu_display_backend(GuestDisplay::Headless, None).is_err());
         assert!(
             dvm_gpu_device(GuestDisplay::DvmGtk)
                 .unwrap()

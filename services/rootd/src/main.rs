@@ -18,7 +18,7 @@ use core::panic::PanicInfo;
 #[cfg(not(test))]
 use core::ptr;
 use core::slice;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 
 use rustos_user_abi::syscall::{
     CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
@@ -30,9 +30,11 @@ use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_PROTOCOL_CAPABILITY, COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS,
     COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR, COMMERCIAL_MAX_ROOTD_OP_BOOTSTRAP_MANIFEST,
     COMMERCIAL_MAX_ROOTD_OP_CORE_SERVICE_LEASE, COMMERCIAL_MAX_ROOTD_OP_DEPENDENCY_GRAPH,
-    COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_QUERY, COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM,
-    COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL, COMMERCIAL_MAX_ROOTD_OP_RESTART_POLICY,
-    COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY, COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE,
+    COMMERCIAL_MAX_ROOTD_OP_LOADER_WORKER_COMPLETE, COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_QUERY,
+    COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM, COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL,
+    COMMERCIAL_MAX_ROOTD_OP_RESTART_POLICY, COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY,
+    COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_COMPACT,
+    COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE,
     COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_SCAN, COMMERCIAL_MAX_ROOTD_OP_SERVICE_LOOKUP,
     IPC_SERVICE_DEVMGRD, IPC_SERVICE_INPUTD, IPC_SERVICE_LINUX_SYSCALLD, IPC_SERVICE_LOADERD,
     IPC_SERVICE_NETD, IPC_SERVICE_PAGERD, IPC_SERVICE_PROCD, IPC_SERVICE_ROOTD,
@@ -51,6 +53,15 @@ use rustos_user_abi::syscall::{
 use service_checkpoint::ServiceCheckpointStore;
 
 const SYS_SCHED_YIELD: u64 = 24;
+const SYS_GETPID: u64 = 39;
+const SYS_CLONE: u64 = 56;
+const SYS_EXIT: u64 = 60;
+const SYS_GETTID: u64 = 186;
+const CLONE_VM: u64 = 0x0000_0100;
+const CLONE_FS: u64 = 0x0000_0200;
+const CLONE_FILES: u64 = 0x0000_0400;
+const CLONE_SIGHAND: u64 = 0x0000_0800;
+const CLONE_THREAD: u64 = 0x0001_0000;
 const SPAWN_FLAG_LOGICAL_ADMIN: u64 = 1;
 // Bootstrap IPC hosts sit on the syscall/loader/VFS causal path. Their strict
 // latency admission is fixed in rootd's immutable manifest, never accepted
@@ -186,6 +197,29 @@ static INITD_LOADER_REQUEST: RootdIpcCell<LoaderSpawnRequest> =
 static INITD_LOADER_RESPONSE: RootdIpcCell<LoaderSpawnResponse> =
     RootdIpcCell(UnsafeCell::new(empty_loader_spawn_response()));
 
+const LOADER_WORKER_IDLE: usize = 0;
+const LOADER_WORKER_RUNNING: usize = 1;
+const LOADER_WORKER_RESULT_READY: usize = 2;
+const LOADER_WORKER_COMPLETE: usize = 3;
+const LOADER_WORKER_EXITED: usize = 4;
+const LOADER_WORKER_STACK_BYTES: usize = 64 * 1024;
+
+static LOADER_WORKER_STATE: AtomicUsize = AtomicUsize::new(LOADER_WORKER_IDLE);
+static LOADER_WORKER_ENDPOINT: AtomicU64 = AtomicU64::new(0);
+static LOADER_WORKER_LEASES_PTR: AtomicUsize = AtomicUsize::new(0);
+static LOADER_WORKER_LEASES_LEN: AtomicUsize = AtomicUsize::new(0);
+static LOADER_WORKER_POST_INIT_PTR: AtomicUsize = AtomicUsize::new(0);
+static LOADER_WORKER_POST_INIT_LEN: AtomicUsize = AtomicUsize::new(0);
+static LOADER_WORKER_CHECKPOINTS_PTR: AtomicUsize = AtomicUsize::new(0);
+static LOADER_WORKER_RESULT: AtomicI64 = AtomicI64::new(0);
+
+#[repr(align(16))]
+struct LoaderWorkerStack([u8; LOADER_WORKER_STACK_BYTES]);
+
+#[cfg(not(test))]
+static mut LOADER_WORKER_STACK: LoaderWorkerStack =
+    LoaderWorkerStack([0; LOADER_WORKER_STACK_BYTES]);
+
 #[cfg(not(test))]
 const ROOTD_HEAP_BYTES: usize = 8 * 1024 * 1024;
 
@@ -318,7 +352,12 @@ pub extern "C" fn _start() -> ! {
             &mut service_checkpoints,
             false,
         );
-        restart_failed_leases(&mut leases);
+        restart_failed_leases(
+            endpoint,
+            &mut leases,
+            &mut post_init_leases,
+            &mut service_checkpoints,
+        );
         supervise_core_readiness(&mut leases);
         if !service_dependencies_ready(INITD_LEASE_INDEX) {
             wait_for_restart_backoff(CORE_READINESS_POLL_INTERVAL_MS);
@@ -344,7 +383,12 @@ pub extern "C" fn _start() -> ! {
             &mut service_checkpoints,
             false,
         );
-        restart_failed_leases(&mut leases);
+        restart_failed_leases(
+            endpoint,
+            &mut leases,
+            &mut post_init_leases,
+            &mut service_checkpoints,
+        );
         supervisor_idle();
     }
 }
@@ -450,9 +494,15 @@ fn spawn_initd_via_loaderd(
     let mut attempts = 0_u64;
     while attempts < INITD_SPAWN_MAX_ATTEMPTS as u64 {
         debug_line(b"rootd: initd spawn request to loaderd\n");
-        match spawn_exec_via_loaderd(
-            leases[INITD_LEASE_INDEX].exec_path,
-            leases[INITD_LEASE_INDEX].weight_micros,
+        let initd_path = leases[INITD_LEASE_INDEX].exec_path;
+        let initd_weight = leases[INITD_LEASE_INDEX].weight_micros;
+        match spawn_exec_via_loaderd_cooperative(
+            endpoint,
+            leases,
+            post_init_leases,
+            service_checkpoints,
+            initd_path,
+            initd_weight,
         ) {
             Ok(pid) => {
                 debug_line(b"rootd: initd loader spawn complete\n");
@@ -485,7 +535,7 @@ fn spawn_initd_via_loaderd(
                     service_checkpoints,
                     false,
                 );
-                restart_failed_leases(leases);
+                restart_failed_leases(endpoint, leases, post_init_leases, service_checkpoints);
                 yield_now();
             }
         }
@@ -800,7 +850,9 @@ fn validate_commercial_max_request(
             | COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_QUERY
             | COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM
             | COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE
-            | COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_SCAN => {
+            | COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_COMPACT
+            | COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_SCAN
+            | COMMERCIAL_MAX_ROOTD_OP_LOADER_WORKER_COMPLETE => {
                 validate_sender_subject(request, sender)
             }
             _ => Err(22),
@@ -886,6 +938,11 @@ fn fill_commercial_max_response(
             response.value0 = request.arg0;
             Ok(())
         }
+        COMMERCIAL_MAX_ROOTD_OP_LOADER_WORKER_COMPLETE => {
+            complete_loader_worker(request, sender)?;
+            response.value0 = 1;
+            Ok(())
+        }
         COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_QUERY => {
             let lease = query_post_init_lease(leases, post_init_leases, request, sender)?;
             response.value0 = lease.pid;
@@ -921,6 +978,29 @@ fn fill_commercial_max_response(
             response.value1 = u64::from(duplicate);
             Ok(())
         }
+        COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_COMPACT => {
+            authorize_current_service_namespace(leases, post_init_leases, request.arg0, sender)?;
+            if request.path_len != 0
+                || request.payload_len as usize != size_of::<ServiceCheckpointRecordWire>()
+                || request.arg1 != 0
+                || request.arg2 != 0
+                || request.arg3 != 0
+            {
+                return Err(22);
+            }
+            let proof = unsafe {
+                core::ptr::read_unaligned(
+                    request
+                        .payload
+                        .as_ptr()
+                        .cast::<ServiceCheckpointRecordWire>(),
+                )
+            };
+            let already_compacted = service_checkpoints.compact(request.arg0, proof)?;
+            response.value0 = proof.revision;
+            response.value1 = u64::from(already_compacted);
+            Ok(())
+        }
         COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_SCAN => {
             authorize_current_service_namespace(leases, post_init_leases, request.arg0, sender)?;
             if request.path_len != 0
@@ -951,6 +1031,34 @@ fn fill_commercial_max_response(
         }
         _ => Err(22),
     }
+}
+
+fn complete_loader_worker(
+    request: &CommercialMaxProtocolRequest,
+    sender: IpcSenderIdentity,
+) -> Result<(), i32> {
+    if request.path_len != 0
+        || request.payload_len != 0
+        || request.arg0 != 0
+        || request.arg1 != 0
+        || request.arg2 != 0
+        || request.arg3 != 0
+    {
+        return Err(22);
+    }
+    let rootd_pid = syscall0(SYS_GETPID);
+    if rootd_pid <= 0 || sender.pid != rootd_pid as u64 {
+        return Err(13);
+    }
+    LOADER_WORKER_STATE
+        .compare_exchange(
+            LOADER_WORKER_RESULT_READY,
+            LOADER_WORKER_COMPLETE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .map(|_| ())
+        .map_err(|_| 16)
 }
 
 fn fill_capability_response(
@@ -1157,6 +1265,7 @@ fn rootd_capability_mask(op: u16) -> u64 {
         COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM => 1 << 8,
         COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE => 1 << 9,
         COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_SCAN => 1 << 10,
+        COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_COMPACT => 1 << 11,
         _ => 0,
     }
 }
@@ -1586,9 +1695,15 @@ fn trim_nul(bytes: &'static [u8]) -> &'static [u8] {
     }
 }
 
-fn restart_failed_leases(leases: &mut [Lease]) {
+fn restart_failed_leases(
+    endpoint: u64,
+    leases: &mut [Lease],
+    post_init_leases: &mut [PostInitLease],
+    service_checkpoints: &mut ServiceCheckpointStore,
+) {
     let mut restart_backoff_ms = 0_u32;
-    for (index, lease) in leases.iter_mut().enumerate() {
+    for index in 0..leases.len() {
+        let lease = &mut leases[index];
         if !matches!(
             lease.state,
             ROOTD_LEASE_STATE_EXITED | ROOTD_LEASE_STATE_RESTART_PENDING
@@ -1608,7 +1723,15 @@ fn restart_failed_leases(leases: &mut [Lease]) {
             restart_backoff_ms = restart_backoff_ms.max(lease.backoff_ms);
             continue;
         }
-        match restart_lease(index, lease) {
+        let result = restart_lease(
+            index,
+            endpoint,
+            leases,
+            post_init_leases,
+            service_checkpoints,
+        );
+        let lease = &mut leases[index];
+        match result {
             Ok((pid, deferred_start)) => {
                 lease.pid = pid;
                 lease.restart_budget -= 1;
@@ -1682,17 +1805,225 @@ fn wait_for_restart_backoff(backoff_ms: u32) {
     }
 }
 
-fn restart_lease(index: usize, lease: &Lease) -> Result<(u64, bool), i64> {
+fn restart_lease(
+    index: usize,
+    endpoint: u64,
+    leases: &mut [Lease],
+    post_init_leases: &mut [PostInitLease],
+    service_checkpoints: &mut ServiceCheckpointStore,
+) -> Result<(u64, bool), i64> {
+    let lease = leases[index];
     if BOOTSTRAP_MANIFEST[index].restart_direct {
         return spawn_exec(lease.exec_path, lease.weight_micros).map(|pid| (pid, false));
     }
     if !service_dependencies_ready(index) || !service_ready(IPC_SERVICE_LOADERD) {
         return Err(11);
     }
-    spawn_exec_via_loaderd(lease.exec_path, lease.weight_micros).map(|pid| (pid, true))
+    spawn_exec_via_loaderd_cooperative(
+        endpoint,
+        leases,
+        post_init_leases,
+        service_checkpoints,
+        lease.exec_path,
+        lease.weight_micros,
+    )
+    .map(|pid| (pid, true))
 }
 
-fn spawn_exec_via_loaderd(path: &'static [u8], weight_micros: u64) -> Result<u64, i64> {
+fn spawn_exec_via_loaderd_cooperative(
+    endpoint: u64,
+    leases: &mut [Lease],
+    post_init_leases: &mut [PostInitLease],
+    service_checkpoints: &mut ServiceCheckpointStore,
+    path: &'static [u8],
+    weight_micros: u64,
+) -> Result<u64, i64> {
+    start_loader_supervisor_worker(endpoint, leases, post_init_leases, service_checkpoints)?;
+    debug_line(b"rootd: loader supervisor worker started\n");
+    let result = spawn_exec_via_loaderd_blocking(path, weight_micros);
+    let encoded = match result {
+        Ok(pid) => i64::try_from(pid).unwrap_or(-75),
+        Err(errno) => errno.checked_neg().unwrap_or(-75),
+    };
+    LOADER_WORKER_RESULT.store(encoded, Ordering::Relaxed);
+    LOADER_WORKER_STATE.store(LOADER_WORKER_RESULT_READY, Ordering::Release);
+    if signal_loader_worker_completion().is_err() {
+        fail_closed(b"rootd: fatal loader supervisor completion rejected\n");
+    }
+    while LOADER_WORKER_STATE.load(Ordering::Acquire) != LOADER_WORKER_EXITED {
+        yield_now();
+    }
+    let result = decode_loader_worker_result(LOADER_WORKER_RESULT.load(Ordering::Acquire));
+    LOADER_WORKER_RESULT.store(0, Ordering::Relaxed);
+    LOADER_WORKER_ENDPOINT.store(0, Ordering::Relaxed);
+    LOADER_WORKER_LEASES_PTR.store(0, Ordering::Relaxed);
+    LOADER_WORKER_LEASES_LEN.store(0, Ordering::Relaxed);
+    LOADER_WORKER_POST_INIT_PTR.store(0, Ordering::Relaxed);
+    LOADER_WORKER_POST_INIT_LEN.store(0, Ordering::Relaxed);
+    LOADER_WORKER_CHECKPOINTS_PTR.store(0, Ordering::Relaxed);
+    LOADER_WORKER_STATE.store(LOADER_WORKER_IDLE, Ordering::Release);
+    debug_line(b"rootd: loader supervisor worker completed\n");
+    result
+}
+
+fn start_loader_supervisor_worker(
+    endpoint: u64,
+    leases: &mut [Lease],
+    post_init_leases: &mut [PostInitLease],
+    service_checkpoints: &mut ServiceCheckpointStore,
+) -> Result<(), i64> {
+    LOADER_WORKER_STATE
+        .compare_exchange(
+            LOADER_WORKER_IDLE,
+            LOADER_WORKER_RUNNING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .map_err(|_| 16_i64)?;
+    LOADER_WORKER_ENDPOINT.store(endpoint, Ordering::Release);
+    LOADER_WORKER_LEASES_PTR.store(leases.as_mut_ptr() as usize, Ordering::Release);
+    LOADER_WORKER_LEASES_LEN.store(leases.len(), Ordering::Release);
+    LOADER_WORKER_POST_INIT_PTR.store(post_init_leases.as_mut_ptr() as usize, Ordering::Release);
+    LOADER_WORKER_POST_INIT_LEN.store(post_init_leases.len(), Ordering::Release);
+    LOADER_WORKER_CHECKPOINTS_PTR.store(
+        service_checkpoints as *mut ServiceCheckpointStore as usize,
+        Ordering::Release,
+    );
+    LOADER_WORKER_RESULT.store(0, Ordering::Relaxed);
+    if let Err(errno) = spawn_loader_worker_thread() {
+        LOADER_WORKER_STATE.store(LOADER_WORKER_IDLE, Ordering::Release);
+        return Err(errno);
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn spawn_loader_worker_thread() -> Result<(), i64> {
+    let stack_top = unsafe {
+        core::ptr::addr_of_mut!(LOADER_WORKER_STACK.0)
+            .cast::<u8>()
+            .add(LOADER_WORKER_STACK_BYTES) as u64
+    };
+    let flags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
+    let result: i64;
+    unsafe {
+        asm!(
+            "syscall",
+            "test rax, rax",
+            "jnz 2f",
+            "call {entry}",
+            "ud2",
+            "2:",
+            entry = sym loader_supervisor_worker_entry,
+            inlateout("rax") SYS_CLONE as i64 => result,
+            in("rdi") flags,
+            in("rsi") stack_top,
+            in("rdx") 0_u64,
+            in("r10") 0_u64,
+            in("r8") 0_u64,
+            lateout("rcx") _,
+            lateout("r11") _,
+        );
+    }
+    if result <= 0 {
+        Err(if result < 0 { -result } else { 11 })
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+fn spawn_loader_worker_thread() -> Result<(), i64> {
+    Err(38)
+}
+
+#[cfg(not(test))]
+extern "C" fn loader_supervisor_worker_entry() -> ! {
+    let endpoint = LOADER_WORKER_ENDPOINT.load(Ordering::Acquire);
+    let leases_ptr = LOADER_WORKER_LEASES_PTR.load(Ordering::Acquire) as *mut Lease;
+    let leases_len = LOADER_WORKER_LEASES_LEN.load(Ordering::Acquire);
+    let post_init_ptr = LOADER_WORKER_POST_INIT_PTR.load(Ordering::Acquire) as *mut PostInitLease;
+    let post_init_len = LOADER_WORKER_POST_INIT_LEN.load(Ordering::Acquire);
+    let checkpoints_ptr =
+        LOADER_WORKER_CHECKPOINTS_PTR.load(Ordering::Acquire) as *mut ServiceCheckpointStore;
+    if endpoint == 0 || leases_ptr.is_null() || post_init_ptr.is_null() || checkpoints_ptr.is_null()
+    {
+        LOADER_WORKER_RESULT.store(-22, Ordering::Relaxed);
+        LOADER_WORKER_STATE.store(LOADER_WORKER_EXITED, Ordering::Release);
+    } else {
+        let leases = unsafe { slice::from_raw_parts_mut(leases_ptr, leases_len) };
+        let post_init_leases = unsafe { slice::from_raw_parts_mut(post_init_ptr, post_init_len) };
+        let service_checkpoints = unsafe { &mut *checkpoints_ptr };
+        while LOADER_WORKER_STATE.load(Ordering::Acquire) != LOADER_WORKER_COMPLETE {
+            drain_lifecycle_events(leases, post_init_leases);
+            serve_rootd_once(
+                endpoint,
+                leases,
+                post_init_leases,
+                service_checkpoints,
+                true,
+            );
+        }
+        LOADER_WORKER_STATE.store(LOADER_WORKER_EXITED, Ordering::Release);
+    }
+    let _ = syscall1(SYS_EXIT, 0);
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+#[cfg(not(test))]
+fn signal_loader_worker_completion() -> Result<(), i64> {
+    let endpoint = syscall1(SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, IPC_SERVICE_ROOTD);
+    let pid = syscall0(SYS_GETPID);
+    let tid = syscall0(SYS_GETTID);
+    if endpoint <= 0 || pid <= 0 || tid <= 0 {
+        return Err(5);
+    }
+    let mut request = CommercialMaxProtocolRequest::default();
+    request.header.version = COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
+    request.header.protocol = COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR;
+    request.header.op = COMMERCIAL_MAX_ROOTD_OP_LOADER_WORKER_COMPLETE;
+    request.header.subject_pid = pid as u64;
+    request.header.subject_tid = tid as u64;
+    let mut response = CommercialMaxProtocolResponse::default();
+    let received = syscall5(
+        SYS_RUSTOS_IPC_CALL,
+        endpoint as u64,
+        (&request as *const CommercialMaxProtocolRequest) as u64,
+        size_of::<CommercialMaxProtocolRequest>() as u64,
+        (&mut response as *mut CommercialMaxProtocolResponse) as u64,
+        size_of::<CommercialMaxProtocolResponse>() as u64,
+    );
+    if received as usize != size_of::<CommercialMaxProtocolResponse>()
+        || !response.is_valid_envelope_for(&request)
+        || response.status != 0
+        || response.descriptor_count != 0
+        || response.payload_len != 0
+        || response.value0 != 1
+        || response.value1 != 0
+    {
+        return Err(5);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn signal_loader_worker_completion() -> Result<(), i64> {
+    Err(38)
+}
+
+fn decode_loader_worker_result(encoded: i64) -> Result<u64, i64> {
+    if encoded > 0 {
+        Ok(encoded as u64)
+    } else if encoded < 0 {
+        Err(encoded.checked_neg().ok_or(75)?)
+    } else {
+        Err(5)
+    }
+}
+
+fn spawn_exec_via_loaderd_blocking(path: &'static [u8], weight_micros: u64) -> Result<u64, i64> {
     let endpoint = syscall1(SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, IPC_SERVICE_LOADERD);
     if endpoint <= 0 {
         return Err(if endpoint < 0 { -endpoint } else { 11 });
@@ -2026,6 +2357,47 @@ pub unsafe extern "C" fn bcmp(lhs: *const u8, rhs: *const u8, len: usize) -> i32
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loader_worker_result_is_fail_closed_and_preserves_errno() {
+        assert_eq!(decode_loader_worker_result(41), Ok(41));
+        assert_eq!(decode_loader_worker_result(-11), Err(11));
+        assert_eq!(decode_loader_worker_result(0), Err(5));
+        assert_eq!(decode_loader_worker_result(i64::MIN), Err(75));
+    }
+
+    #[test]
+    fn loader_worker_completion_is_same_process_and_exact_state_only() {
+        let pid = syscall0(SYS_GETPID) as u64;
+        let tid = syscall0(SYS_GETTID) as u64;
+        let mut request = CommercialMaxProtocolRequest::default();
+        request.header.version = COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
+        request.header.protocol = COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR;
+        request.header.op = COMMERCIAL_MAX_ROOTD_OP_LOADER_WORKER_COMPLETE;
+        request.header.subject_pid = pid;
+        request.header.subject_tid = tid;
+        let sender = IpcSenderIdentity { pid, tid };
+
+        LOADER_WORKER_STATE.store(LOADER_WORKER_RESULT_READY, Ordering::Release);
+        assert_eq!(complete_loader_worker(&request, sender), Ok(()));
+        assert_eq!(
+            LOADER_WORKER_STATE.load(Ordering::Acquire),
+            LOADER_WORKER_COMPLETE
+        );
+        assert_eq!(complete_loader_worker(&request, sender), Err(16));
+        LOADER_WORKER_STATE.store(LOADER_WORKER_IDLE, Ordering::Release);
+
+        assert_eq!(
+            complete_loader_worker(
+                &request,
+                IpcSenderIdentity {
+                    pid: pid.saturating_add(1),
+                    tid,
+                },
+            ),
+            Err(13)
+        );
+    }
 
     fn leases_with_live_initd(initd_pid: u64) -> [Lease; 5] {
         let mut leases = [

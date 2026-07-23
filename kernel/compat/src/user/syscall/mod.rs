@@ -79,6 +79,7 @@ struct SysretReturnContract {
 }
 
 const _: [(); 128] = [(); core::mem::size_of::<SyscallFrame>()];
+const _: [(); 0] = [(); core::mem::size_of::<SyscallFrame>() % 16];
 
 pub use syscall_core::{
     activate_linux_compat_cpu_local, linux_compat_current_task_offset,
@@ -93,6 +94,13 @@ global_asm!(
         swapgs
         mov gs:[8], rsp
         mov rsp, gs:[0]
+        # The scheduler and CPU-local setter require a 16-byte-aligned stack
+        # top. Normalize again at the architectural trust boundary so a stale
+        # or independently initialized CPU-local value cannot turn an ordinary
+        # aligned Rust load/store into #GP.
+        and rsp, -16
+        # A 128-byte frame preserves call-site alignment so Rust enters with
+        # rsp % 16 == 8 as required by the x86_64 SysV ABI.
         sub rsp, 128
 
         mov [rsp + 24], rax

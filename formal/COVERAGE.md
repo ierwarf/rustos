@@ -19,11 +19,12 @@ passes TLC.
 
 ## Verification-infrastructure coverage
 
-The executable registry currently admits 68 TLC model/config pairs and records
-their class, per-tier timeout, explicit deadlock policy, nightly simulation,
-and cross-tool pilots. The PR tier runs registry selftest, twenty-seven exact source
-decision witnesses for seventeen high-risk models, exhaustive TLC, non-vacuous
-Kani, Verus, and a source-produced runtime trace. The nightly tier
+The executable registry records every TLC model/config pair, class, per-tier
+timeout, explicit deadlock policy, nightly simulation, and cross-tool pilot.
+Counts are emitted by the gates rather than duplicated here. The PR tier runs
+registry and whole-flow selftests, the script-registered exact source decision
+witnesses, exhaustive TLC, non-vacuous Kani, Verus, and a source-produced
+runtime trace. The nightly tier
 also runs selected TLC simulation, Miri, Loom, two typed Apalache refinements,
 one TLAPS theorem, and bounded Rust/C coverage-guided fuzzing. Every tool emits
 or retains evidence below `build/formal`; CI uploads that directory even when a
@@ -43,9 +44,11 @@ failed infrastructure gates rather than implied successes:
 - Loom covers one proof kernel, not the actual scheduler/IPC atomics under the
   complete Rust memory model, and the C/Rust fuzz corpus has no long-term
   coverage floor, corpus minimization service, or regression SLA;
-- requirements, hazards, assumptions, source, proof obligations, tests, and
-  release evidence do not yet have immutable bidirectional IDs and review
-  signatures; tool qualification and independent verification are absent;
+- high-risk whole-flow requirements and hazards now have stable IDs plus
+  machine-checked model/source/witness links in `system-flows.tsv`; assumptions,
+  proof obligations, runtime release evidence, review signatures, tool
+  qualification, and independent verification still lack a complete immutable
+  bidirectional assurance case;
 - hardware fault injection, WCET/interrupt-latency analysis, freedom-from-
   interference evidence, and target compiler/binary equivalence remain open.
 
@@ -55,9 +58,10 @@ failed infrastructure gates rather than implied successes:
 | --- | --- | --- |
 | A malformed ELF64 or PE64 plan maps outside the process window, overlaps another region, creates a writable executable image, or starts outside executable memory | dual-abi-image-admission | libs/rustos-image-admission/src/lib.rs and services/loaderd/src/main.rs |
 | A malformed ELF64/PE64 byte table, relocation, import, or changed post-parse snapshot reaches a process mapping | dual-abi-byte-parser | libs/rustos-image-admission/src/lib.rs, services/loaderd/src/main.rs, and kernel/compat/src/user/syscall/linux/proc_broker_ops.rs |
-| A user page aliases a kernel/dead frame, remains W+X, or retains access authority after unmap | page-table-lifecycle | kernel/mm/src/memory/address_space.rs |
+| A broker range wraps or becomes noncanonical, a mapping cursor lands inside the final page, a user page aliases a kernel/dead frame, remains W+X, or retains access authority after unmap | page-table-lifecycle | kernel/compat/src/user/syscall/linux/mm_broker_ops.rs and kernel/mm/src/memory/address_space.rs |
 | Two threads obtain concurrent mutable process/address-space state, exit races after state replacement but before exec clears the exit marker, a prepared thread attachment publishes after exit or leaks its unpublished stack on rejection, thread count grows beyond its exit-time ceiling, exec mutates a frozen exited epoch, or reclamation frees retained/task/stack authority | process-address-space-lifetime | kernel/ps/src/multitask/{process_table.rs,current.rs,scheduler.rs} |
 | A futex task owns duplicate waiters, requeue followed by timeout leaves a stale old-key entry, or ABI-aware current-thread exit retains futex-table authority | futex-waiter-lifecycle | kernel/compat/src/user/syscall/linux/service_ops/futex_thread.rs |
+| An x86 error-code exception enters ordinary Rust cleanup with a misaligned SysV call stack, a recovered user fault loses authority, non-final thread retirement revokes a live process endpoint, final retirement retains task/process wait or IPC authority, or a kernel fault is misrouted through user cleanup | exception-retirement-lifecycle | kernel/hal/src/arch/idt/handlers.rs, kernel/executive/src/lib.rs, kernel/compat/src/user/syscall/mod.rs, and kernel/ps/src/multitask/scheduler.rs |
 | A stale/malformed procd reply consumes a masked or non-pending signal, installs a non-user handler/restorer, permits SIGKILL ignore/handler or non-termination, permits SIGSTOP ignore/handler or process termination instead of a distinct stopped state, restores either unblockable mask through `rt_sigreturn`, termination retains pending authority, a terminated process has no rootd/procd lifecycle evidence, a recovered user fault revokes a live endpoint, or fatal final-thread retirement leaves process/task-IPC authority live | process-signal-delivery | services/procd/src/main.rs, kernel/executive/src/lib.rs, kernel/compat/src/user/syscall/linux/{support.rs,offload_ops.rs}, and kernel/ps/src/multitask/{current.rs,scheduler.rs} |
 | Concurrent netd workers detach deferred poll batches and admit beyond the global bound, an accepted request stays queued/detached forever, queue poisoning strands reservations/reply capabilities, a failed reply is confused with delivery, or a request attempts more than one terminal reply | netd-deferred-reply | services/netd/src/main.rs |
 | A memfd installs `F_SEAL_WRITE` with a writable mapping, changes seals after `F_SEAL_SEAL`, shrinks live backing, overflows mapping accounting, or lets an EOF-extending write bypass `F_SEAL_GROW` | memfd-seal-lifecycle | kernel/ps/src/user/memfd.rs |
@@ -65,6 +69,7 @@ failed infrastructure gates rather than implied successes:
 | A persistent write/create/truncate/unlink becomes authoritative while the writable feature is disabled or with partial crash-recovery evidence, or volatile `/run` policy is confused with persistent mutation | persistent-mutation-admission | services/vfsd/src/{lib.rs,main.rs} |
 | A device maps outside its assigned DMA aperture or keeps DMA authority after domain revoke | dma-iommu-isolation | tools/hostd/src/main.rs, libs/driver-domain-host/src/lib.rs, and kernel/io-manager/src/driver/iommu.rs |
 | A supplied boot-volume identity silently degrades into discovery, identity-free Multiboot2 boot proceeds without immutable extent evidence, or ambiguous FAT candidates select an arbitrary root volume | boot-volume-admission | kernel/io-manager/src/storage/{block.rs,block/boot.rs,boot_volume.rs} and libs/storage-core/src/lib.rs |
+| A boot-volume request is empty, unaligned, wraps its LBA, crosses an admitted slice, loses chunk accounting, collapses timeout/revocation into a generic device failure, or caches a transient metadata failure as a permanent negative | boot-volume-read | services/vfsd/src/{block.rs,lib.rs,main.rs}, kernel/compat/src/user/syscall/linux/block_broker_ops.rs, and kernel/io-manager/src/storage/block/{io.rs,registry.rs} |
 | Boot extents return content different from the authenticated staged file | filesystem-content-integrity | tools/xtask/src/stage/mod.rs and kernel/io-manager/src/storage/boot_volume.rs |
 | A malformed checksum, fragment, unsupported EtherType, or stale session payload reaches netd | network-payload-session | libs/driver-domain-protocol/src/lib.rs and kernel/io-manager/src/io/dvm_network.rs |
 | Continuously runnable System work consumes every dispatch while User work remains runnable; one busy User hides another past its ready-age bound; or a latency handoff FIFO overwrites an owner, admits duplicates/System tasks, retains stale owners, grows without bound, or consumes an unbounded dispatch burst | scheduler-cpu-distribution | kernel/ps/src/multitask/scheduler.rs and kernel/compat/src/user/syscall/linux/ipc_ops.rs |
@@ -88,6 +93,7 @@ failed infrastructure gates rather than implied successes:
 | A generic `poll`/`epoll` caller drains the DVM ring, the MSI-X worker transfer is absent from the ownership model, a finite `STATS` reply or readiness-gated read loses/replays an event, uiserver starts the stateful inputd READ merely to discover an empty queue, waits on ring0 after inputd has moved the only record to service policy, or accumulates burst credit after a missed reader cadence | input-readiness | kernel/io-manager/src/input/event_queue.rs, kernel/compat/src/user/syscall/linux/{ipc_ops.rs,service_ops/poll_epoll.rs,service_ops/ipc_helpers.rs}, services/inputd/src/main.rs, services/uiserver/src/{input_loop.rs,sys.rs} |
 | A provider changes readiness between an epoll check and waiter arm, an internal 16 ms provider timeout replaces the application's deadline or hides readiness already found on another fd, a timeout races a signal, a restarted service revives a stale token or aborts the aggregate wait instead of returning per-interest HUP, provider epoch is part of the registration key and creates duplicate/undeletable interests after restart, DEL incorrectly requires the unavailable provider's current epoch, numeric-fd reuse retargets an old interest, dup acquires one provider object then commits a concurrently reused source fd or releases a stale snapshot instead of the target actually replaced, fork clones one fd table but reacquires provider refs from a later live-parent snapshot, a closed console session is silently recreated by stale read/write/TTY/input traffic, a transient syscall snapshot is mistaken for an fd and suppresses final-close purge, a nonblocking console read re-enters the blocking retry loop after readiness is consumed, fd 0--2 bypass normal close/dup replacement semantics, a TTY ioctl route treats a closed/reused non-console fd as the caller's console, a wedged provider makes close/CLOEXEC/exit wait without a bound, or dup/fork/close/exec/exit prematurely destroys or retains the service object behind an open description | userspace-wait-set | libs/rustos-user-abi/src/syscall.rs, kernel/compat/src/user/syscall/linux/{waitset_broker_ops.rs,ipc_ops.rs,proc_broker_ops.rs,lifecycle_broker_ops.rs,service_ops/{ipc_helpers.rs,poll_epoll.rs,vfs_meta.rs,vfs_socket.rs}}, kernel/ps/src/user/handles/{table.rs,handles.rs}, and services/{vfsd,netd,inputd,runtimed}/src |
 | A timed-out state mutation is applied twice, an operation-ID alias changes its meaning, an unresolved replay entry is silently evicted, a service restart publishes an endpoint before retained state is replayed, a stale revision rolls policy backward, or remote VFS dup/fork/transfer depends on an uncertain provider-side increment | service-mutation-recovery | libs/rustos-user-abi/src/syscall.rs, services/rootd/src/{main.rs,service_checkpoint.rs}, services/{vfsd,netd}/src/main.rs, and kernel/compat/src/user/syscall/linux/service_ops/{ipc_helpers.rs,vfs_socket.rs} |
+| A partial or response-lost OPEN becomes a visible orphan, a restarted vfsd loses an ordinary open description, failed user copyout skips sequential data, close reply loss turns an exact retry into EBADF, an unacknowledged tombstone is compacted, or stale compaction erases a reused key | vfs-open-description-recovery | libs/rustos-user-abi/src/syscall.rs, services/rootd/src/{main.rs,service_checkpoint.rs}, services/vfsd/src/{lib.rs,main.rs}, and kernel/compat/src/user/syscall/linux/service_ops/{ipc_helpers.rs,vfs_meta.rs,vfs_socket.rs} |
 | Multiboot publishes an absent/deterministic seed, an ordinary process reads the entropy substrate, a policy service requests an unbounded copyout, or Linux `getrandom`/service capability tokens are derived from public PID/TID/counter state instead of boot entropy | source-only: entropy-broker-boundary (no registered TLA model) | boot/boot-protocol/src/lib.rs, kernel/nucleus-core/src/multiboot2.rs, libs/boot-random/src/lib.rs, libs/rustos-user-abi/src/syscall.rs, kernel/compat/src/user/syscall/linux/{broker_ops.rs,entropy_broker_ops.rs}, and services/{syscalld,netd}/src |
 | A recovering console-policy service makes uiserver wait in the input/present loop, a keyboard burst grows an unbounded queue, a queue-full event disappears without telemetry, FIFO delivery is reordered, or a blocked console call prevents local input feedback | ui-frame-budget | services/uiserver/src/{input_loop.rs,main.rs}, services/uiserver/src/app/{input.rs,runtime.rs} |
 | Input and Wayland damage are split across redundant early presentations; a Wayland frame callback runs without a previous real presentation or damage-free cadence permit; missed timer pulses accumulate callback credit; or pending damage/callback work can remain live forever under the declared scheduler/timer fairness assumptions | wayland-frame-pacing | services/uiserver/src/{main.rs,wayland.rs} |
@@ -166,15 +172,16 @@ crash, replay-before-publication, and reconciliation. Live crash-injection/QEMU
 evidence for the replacement-service path remains an acceptance gate; passing
 source/model checks alone does not claim that runtime evidence.
 
-Ordinary vfsd open descriptions remain service-local: normalized path, cursor,
-length/content generation, and mutable status flags are lost when vfsd is
-replaced, so a still-live kernel `RemoteVfs` capability receives `EBADF` after
-restart. The checkpoint store also retains closed epoll tombstones without an
-acknowledged compaction generation, making its 32,768-record bound a permanent
-long-churn ceiling. Both require a durable open-description schema plus
-replayable final-mutation acknowledgement/compaction; retrying the operation or
-silently reopening at cursor zero is forbidden. This is a critical unimplemented
-restart-continuity gate, not covered by `service-mutation-recovery`.
+Ordinary vfsd open descriptions now retain their normalized path, kind,
+cursor, length/content identity, and mutable status flags in rootd. OPEN uses a
+staging parent plus exact path chunks and publishes only the final record.
+Sequential read/getdents uses prepared cursor state so failed kernel copyout
+cancels rather than skipping bytes. Final close and epoll deletion retain exact
+tombstones across response loss; a separate visibility ACK authorizes rootd
+compaction, so long churn does not consume the fixed checkpoint bound and an
+old proof cannot erase a reused key. `vfs-open-description-recovery` covers
+these ordering rules. Live crash-injection remains required before runtime
+acceptance is claimed.
 
 Dedicated finite abstractions now cover raw ELF/PE parser admission, page-table
 lifecycle, DMA-domain isolation, authenticated boot-file contents, DVM packet

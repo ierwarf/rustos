@@ -5,6 +5,7 @@ use rustos_user_abi::syscall::{
 use storage_core::{BlockDevice, IoResult, StorageError};
 
 use super::EINVAL;
+use vfsd::{storage_error_from_linux_status, validate_boot_read_range};
 
 pub(super) struct BootBlockDevice {
     pub(super) block_size: usize,
@@ -52,11 +53,9 @@ impl BlockDevice for BootBlockDevice {
     }
 
     fn read_blocks(&mut self, lba: u64, out: &mut [u8]) -> IoResult<()> {
-        if self.block_size == 0
-            || !out.len().is_multiple_of(self.block_size)
-            || BLOCK_BROKER_MAX_IO_BYTES < self.block_size
-        {
-            return Err(StorageError::InvalidInput);
+        validate_boot_read_range(self.block_size, self.block_count, lba, out.len())?;
+        if BLOCK_BROKER_MAX_IO_BYTES < self.block_size {
+            return Err(StorageError::Unsupported);
         }
         let max_blocks = (BLOCK_BROKER_MAX_IO_BYTES / self.block_size) as u64;
         let mut done = 0usize;
@@ -64,10 +63,13 @@ impl BlockDevice for BootBlockDevice {
             let remaining_blocks = ((out.len() - done) / self.block_size) as u64;
             let block_count = remaining_blocks.min(max_blocks);
             let byte_len = block_count as usize * self.block_size;
+            let chunk_lba = lba
+                .checked_add((done / self.block_size) as u64)
+                .ok_or(StorageError::InvalidInput)?;
             let args = RustosBlockBrokerArgs {
                 abi_version: BLOCK_BROKER_ABI_VERSION,
                 op: BLOCK_BROKER_OP_BOOT_READ,
-                lba: lba + (done / self.block_size) as u64,
+                lba: chunk_lba,
                 block_count,
                 buffer_ptr: out[done..done + byte_len].as_mut_ptr() as u64,
                 buffer_len: byte_len as u64,
@@ -80,7 +82,7 @@ impl BlockDevice for BootBlockDevice {
                 )
             };
             if status < 0 {
-                return Err(StorageError::DeviceFault);
+                return Err(storage_error_from_linux_status(status));
             }
             done += byte_len;
         }

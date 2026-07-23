@@ -20,7 +20,7 @@ pub fn syscall_linux_vfs_lseek(fd: u64, offset: i64, whence: u64) -> u64 {
     request.remote_id = remote.remote_id();
     request.arg0 = offset as u64;
     request.arg1 = whence;
-    match call_vfs_ipc_request(&request).and_then(|response| {
+    match call_pinned_remote_vfs_request(&request).and_then(|response| {
         ensure_vfs_status(&response)?;
         Ok(response.value)
     }) {
@@ -49,7 +49,7 @@ pub fn syscall_linux_vfs_fstat(fd: u64, stat_ptr: u64) -> u64 {
     let mut request = new_vfs_request(VFS_IPC_OP_FSTAT);
     request.fd = fd;
     request.remote_id = remote.remote_id();
-    let response = match call_vfs_ipc_request(&request) {
+    let response = match call_pinned_remote_vfs_request(&request) {
         Ok(response) => response,
         Err(errno) => return linux_errno(errno),
     };
@@ -82,7 +82,8 @@ pub fn syscall_linux_vfs_ftruncate(fd: u64, len: u64) -> u64 {
     request.fd = fd;
     request.remote_id = remote.remote_id();
     request.arg0 = len;
-    match call_vfs_ipc_request(&request).and_then(|response| ensure_vfs_status(&response)) {
+    match call_pinned_remote_vfs_request(&request).and_then(|response| ensure_vfs_status(&response))
+    {
         Ok(()) => 0,
         Err(errno) => linux_errno(errno),
     }
@@ -98,25 +99,51 @@ pub fn syscall_linux_vfs_getdents64(fd: u64, user_ptr: u64, user_len: u64) -> u6
     if let Err(err) = usermem::validate_current_user_write_buffer(user_ptr, user_len) {
         return linux_errno(address_space_error_to_linux_errno(err));
     }
-    let mut request = new_vfs_request(VFS_IPC_OP_GETDENTS64);
-    request.fd = fd;
-    request.remote_id = remote.remote_id();
-    request.arg1 = user_len as u64;
-    let response = match call_vfs_ipc_request(&request) {
-        Ok(response) => response,
-        Err(errno) => return linux_errno(errno),
-    };
-    if let Err(errno) = ensure_vfs_status(&response) {
+    let remote_id = remote.remote_id();
+    if let Err(errno) = acquire_current_remote_vfs_ref(fd, remote_id) {
         return linux_errno(errno);
     }
-    let len = response.payload_len as usize;
-    if len > user_len || len > response.payload.len() {
-        return linux_errno(LINUX_EINVAL);
-    }
-    match usermem::write_current_user_bytes(user_ptr, &response.payload[..len]) {
-        Ok(()) => len as u64,
-        Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
-    }
+    let result = (|| {
+        let mut request = new_vfs_request(VFS_IPC_OP_GETDENTS64);
+        request.fd = fd;
+        request.remote_id = remote_id;
+        request.arg1 = user_len as u64;
+        let response = match call_vfs_ipc_request(&request) {
+            Ok(response) => response,
+            Err(errno) => {
+                let _ = settle_vfs_cursor_mutation(&request, false);
+                return linux_errno(errno);
+            }
+        };
+        if let Err(errno) = ensure_vfs_status(&response) {
+            return linux_errno(errno);
+        }
+        let len = response.payload_len as usize;
+        if len > user_len || len > response.payload.len() {
+            let _ = settle_vfs_cursor_mutation(&request, false);
+            return linux_errno(LINUX_EINVAL);
+        }
+        match usermem::write_current_user_bytes(user_ptr, &response.payload[..len]) {
+            Ok(()) => match settle_vfs_cursor_mutation(&request, true) {
+                Ok(()) => len as u64,
+                Err(errno) => {
+                    // Bytes are already visible; reconciliation retains the
+                    // prepared cursor until the exact COMMIT settles.
+                    if len > 0 {
+                        len as u64
+                    } else {
+                        linux_errno(errno)
+                    }
+                }
+            },
+            Err(err) => {
+                let _ = settle_vfs_cursor_mutation(&request, false);
+                linux_errno(address_space_error_to_linux_errno(err))
+            }
+        }
+    })();
+    release_service_handle_refs_bounded(&[ServiceHandleRef::RemoteVfs(remote_id)]);
+    result
 }
 
 pub fn syscall_linux_vfs_statx(
@@ -148,7 +175,7 @@ pub fn syscall_linux_vfs_statx(
     if let Err(errno) = populate_vfs_path_base(&mut request, dirfd, &path) {
         return linux_errno(errno);
     }
-    let response = match call_vfs_ipc_request(&request) {
+    let response = match call_pinned_remote_vfs_request(&request) {
         Ok(response) => response,
         Err(errno) => return linux_errno(errno),
     };
@@ -186,7 +213,7 @@ pub fn syscall_linux_vfs_newfstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, fl
     if let Err(errno) = populate_vfs_path_base(&mut request, dirfd, &path) {
         return linux_errno(errno);
     }
-    let response = match call_vfs_ipc_request(&request) {
+    let response = match call_pinned_remote_vfs_request(&request) {
         Ok(response) => response,
         Err(errno) => return linux_errno(errno),
     };
@@ -226,7 +253,7 @@ pub fn syscall_linux_vfs_readlinkat(
     if let Err(errno) = populate_vfs_path_base(&mut request, dirfd, &path) {
         return linux_errno(errno);
     }
-    let response = match call_vfs_ipc_request(&request) {
+    let response = match call_pinned_remote_vfs_request(&request) {
         Ok(response) => response,
         Err(errno) => return linux_errno(errno),
     };
@@ -251,7 +278,8 @@ pub fn syscall_linux_vfs_access(dirfd: u64, path_ptr: u64, mode: u64, flags: u64
     if let Err(errno) = populate_vfs_path_base(&mut request, dirfd, &path) {
         return linux_errno(errno);
     }
-    match call_vfs_ipc_request(&request).and_then(|response| ensure_vfs_status(&response)) {
+    match call_pinned_remote_vfs_request(&request).and_then(|response| ensure_vfs_status(&response))
+    {
         Ok(()) => 0,
         Err(errno) => linux_errno(errno),
     }
@@ -349,7 +377,7 @@ pub fn syscall_linux_vfs_getcwd(user_ptr: u64, user_len: u64) -> u64 {
         return linux_errno(address_space_error_to_linux_errno(err));
     }
     let request = new_vfs_request(VFS_IPC_OP_GETCWD);
-    let response = match call_vfs_ipc_request(&request) {
+    let response = match call_pinned_remote_vfs_request(&request) {
         Ok(response) => response,
         Err(errno) => return linux_errno(errno),
     };
@@ -378,7 +406,8 @@ pub fn syscall_linux_vfs_chdir(dirfd: u64, path_ptr: u64) -> u64 {
     if let Err(errno) = populate_vfs_path_base(&mut request, dirfd, &path) {
         return linux_errno(errno);
     }
-    match call_vfs_ipc_request(&request).and_then(|response| ensure_vfs_status(&response)) {
+    match call_pinned_remote_vfs_request(&request).and_then(|response| ensure_vfs_status(&response))
+    {
         Ok(()) => 0,
         Err(errno) => linux_errno(errno),
     }
@@ -394,7 +423,8 @@ pub fn syscall_linux_vfs_mkdir(dirfd: u64, path_ptr: u64, mode: u64) -> u64 {
     if let Err(errno) = populate_vfs_path_base(&mut request, dirfd, &path) {
         return linux_errno(errno);
     }
-    match call_vfs_ipc_request(&request).and_then(|response| ensure_vfs_status(&response)) {
+    match call_pinned_remote_vfs_request(&request).and_then(|response| ensure_vfs_status(&response))
+    {
         Ok(()) => 0,
         Err(errno) => linux_errno(errno),
     }
@@ -410,7 +440,8 @@ pub fn syscall_linux_vfs_unlinkat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 
     if let Err(errno) = populate_vfs_path_base(&mut request, dirfd, &path) {
         return linux_errno(errno);
     }
-    match call_vfs_ipc_request(&request).and_then(|response| ensure_vfs_status(&response)) {
+    match call_pinned_remote_vfs_request(&request).and_then(|response| ensure_vfs_status(&response))
+    {
         Ok(()) => 0,
         Err(errno) => linux_errno(errno),
     }
@@ -431,7 +462,8 @@ pub fn syscall_linux_vfs_mount(
     if let Err(errno) = populate_vfs_path(&mut request, &path) {
         return linux_errno(errno);
     }
-    match call_vfs_ipc_request(&request).and_then(|response| ensure_vfs_status(&response)) {
+    match call_pinned_remote_vfs_request(&request).and_then(|response| ensure_vfs_status(&response))
+    {
         Ok(()) => 0,
         Err(errno) => linux_errno(errno),
     }
@@ -447,7 +479,8 @@ pub fn syscall_linux_vfs_umount2(target_ptr: u64, flags: u64) -> u64 {
     if let Err(errno) = populate_vfs_path(&mut request, &path) {
         return linux_errno(errno);
     }
-    match call_vfs_ipc_request(&request).and_then(|response| ensure_vfs_status(&response)) {
+    match call_pinned_remote_vfs_request(&request).and_then(|response| ensure_vfs_status(&response))
+    {
         Ok(()) => 0,
         Err(errno) => linux_errno(errno),
     }

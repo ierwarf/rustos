@@ -133,6 +133,49 @@ impl ServiceCheckpointStore {
         Ok((records, next))
     }
 
+    /// Reclaims one exact tombstoned object. An absent key is already compact
+    /// and therefore succeeds, making a lost compaction reply retry-safe.
+    pub(crate) fn compact(
+        &mut self,
+        service_id: u64,
+        proof: ServiceCheckpointRecordWire,
+    ) -> Result<bool, i32> {
+        validate_wire(&proof)?;
+        if proof.flags & SERVICE_CHECKPOINT_FLAG_TOMBSTONE == 0 {
+            return Err(EINVAL);
+        }
+        let Some(index) = self.find(
+            service_id,
+            proof.parent_hi,
+            proof.parent_lo,
+            proof.key_hi,
+            proof.key_lo,
+        ) else {
+            return Ok(true);
+        };
+        if self.records[index].wire != proof {
+            return Err(ESTALE);
+        }
+        if self.records.iter().any(|record| {
+            record.service_id == service_id
+                && record.wire.parent_hi == proof.key_hi
+                && record.wire.parent_lo == proof.key_lo
+                && record.wire.flags & SERVICE_CHECKPOINT_FLAG_TOMBSTONE == 0
+        }) {
+            return Err(ESTALE);
+        }
+        self.records.retain(|record| {
+            record.service_id != service_id
+                || !((record.wire.parent_hi == proof.key_hi
+                    && record.wire.parent_lo == proof.key_lo)
+                    || (record.wire.parent_hi == proof.parent_hi
+                        && record.wire.parent_lo == proof.parent_lo
+                        && record.wire.key_hi == proof.key_hi
+                        && record.wire.key_lo == proof.key_lo))
+        });
+        Ok(false)
+    }
+
     fn find(
         &self,
         service_id: u64,
@@ -223,5 +266,45 @@ mod tests {
             .iter()
             .all(|record| record.flags == SERVICE_CHECKPOINT_FLAG_TOMBSTONE));
         assert_eq!(store.mutate(3, child), Err(ESTALE));
+    }
+
+    #[test]
+    fn exact_tombstone_compaction_is_idempotent_and_reclaims_children() {
+        let mut store = ServiceCheckpointStore::new();
+        let parent = record((9, 7), (0, 0), 1, 30);
+        let child = record((44, 8), (9, 7), 1, 31);
+        store.mutate(3, parent).unwrap();
+        store.mutate(3, child).unwrap();
+        let mut tombstone = parent;
+        tombstone.flags = SERVICE_CHECKPOINT_FLAG_TOMBSTONE;
+        tombstone.value_len = 0;
+        tombstone.value.fill(0);
+        tombstone.operation_lo = 32;
+        tombstone.revision = 2;
+        store.mutate(3, tombstone).unwrap();
+
+        assert_eq!(store.compact(3, tombstone), Ok(false));
+        assert_eq!(store.scan(3, 0, 8).unwrap().0.len(), 0);
+        assert_eq!(store.compact(3, tombstone), Ok(true));
+    }
+
+    #[test]
+    fn stale_compaction_proof_cannot_reclaim_a_reused_key() {
+        let mut store = ServiceCheckpointStore::new();
+        let first = record((12, 9), (0, 0), 1, 40);
+        store.mutate(3, first).unwrap();
+        let mut tombstone = first;
+        tombstone.flags = SERVICE_CHECKPOINT_FLAG_TOMBSTONE;
+        tombstone.value_len = 0;
+        tombstone.value.fill(0);
+        tombstone.operation_lo = 41;
+        tombstone.revision = 2;
+        store.mutate(3, tombstone).unwrap();
+        store.compact(3, tombstone).unwrap();
+
+        let replacement = record((12, 9), (0, 0), 1, 42);
+        store.mutate(3, replacement).unwrap();
+        assert_eq!(store.compact(3, tombstone), Err(ESTALE));
+        assert_eq!(store.scan(3, 0, 8).unwrap().0, vec![replacement]);
     }
 }

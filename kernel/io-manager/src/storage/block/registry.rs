@@ -48,9 +48,26 @@ fn register_partitions(root_id: u32) {
 
     let mut devices = BLOCK_DEVICES.lock();
     for (index, partition) in partitions.into_iter().enumerate() {
+        let Some(relative_end) = partition.start_lba.checked_add(partition.block_count) else {
+            continue;
+        };
+        if partition.block_count == 0 || relative_end > root.block_count {
+            continue;
+        }
+        let Some(start_block) = root.start_block.checked_add(partition.start_lba) else {
+            continue;
+        };
+        let Some(root_end) = root.start_block.checked_add(root.block_count) else {
+            continue;
+        };
+        let Some(partition_end) = start_block.checked_add(partition.block_count) else {
+            continue;
+        };
+        if partition_end > root_end {
+            continue;
+        }
         let id = devices.len() as u32;
         let partition_number = index + 1;
-        let start_block = root.start_block.saturating_add(partition.start_lba);
         devices.push(BlockDeviceRecord {
             id,
             path: alloc::format!("/dev/block{root_id}p{partition_number}"),

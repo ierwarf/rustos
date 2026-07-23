@@ -270,6 +270,13 @@ pub const VFS_IPC_OP_UMOUNT2: u16 = 20;
 pub const VFS_IPC_OP_UNLINKAT: u16 = 21;
 pub const VFS_IPC_OP_POLL_QUERY: u16 = 22;
 pub const VFS_IPC_OP_LIFECYCLE: u16 = 23;
+/// Settle a prepared cursor mutation after kernel user-copy succeeds or fails.
+pub const VFS_IPC_OP_CURSOR_SETTLE: u16 = 24;
+/// Acknowledge visibility of a successful tombstoning mutation so vfsd may
+/// reclaim its durable replay record without breaking response-loss retries.
+pub const VFS_IPC_OP_CHECKPOINT_ACK: u16 = 25;
+pub const VFS_CURSOR_SETTLE_COMMIT: u64 = 1;
+pub const VFS_CURSOR_SETTLE_CANCEL: u64 = 2;
 pub const VFS_POLL_QUERY_POLL: u64 = 1;
 pub const VFS_POLL_QUERY_EPOLL_CREATE: u64 = 2;
 pub const VFS_POLL_QUERY_EPOLL_CTL: u64 = 3;
@@ -527,6 +534,13 @@ pub const COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM: u16 = 9;
 pub const COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE: u16 = 10;
 /// Return a bounded page of the authenticated service's checkpoint records.
 pub const COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_SCAN: u16 = 11;
+/// Permanently reclaim one exact tombstoned record and all of its tombstoned
+/// children. The tombstone itself is the idempotent compaction proof.
+pub const COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_COMPACT: u16 = 12;
+/// Wake rootd's sole supervisor receiver after its same-process loader worker
+/// publishes a PID/errno result. Only another thread in the live rootd process
+/// may issue this operation; it carries no caller-selected result bytes.
+pub const COMMERCIAL_MAX_ROOTD_OP_LOADER_WORKER_COMPLETE: u16 = 13;
 pub const SERVICE_CHECKPOINT_ABI_VERSION: u16 = 1;
 pub const SERVICE_CHECKPOINT_FLAG_TOMBSTONE: u16 = 1 << 0;
 pub const SERVICE_CHECKPOINT_VALUE_CAPACITY: usize = 64;

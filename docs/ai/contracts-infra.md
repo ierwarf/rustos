@@ -105,6 +105,11 @@ or launch policy.
   correspondence cannot drift independently.
 - PR evidence is `bash formal/verify-all.sh --profile pr`: exhaustive finite
   TLC, non-vacuous Kani, Verus, and concrete runtime trace replay.
+- `formal/system-flows.tsv` is the executable cross-subsystem requirement and
+  hazard graph. `formal/check-system-flows.sh` rejects duplicate identities,
+  missing terminal paths, unbounded timeout edges, unregistered models,
+  missing source witnesses, and any direct RustOS `.ko` lifecycle exception.
+  `formal/selftest.sh` runs it before model execution.
 - Nightly evidence is `bash formal/verify-all.sh --profile nightly`: the PR
   tier plus selected fixed-seed simulation, Miri, Loom, Apalache, TLAPS, and
   bounded Rust/C libFuzzer lanes. Simulation and fuzzing are bug finding, not

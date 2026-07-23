@@ -1,6 +1,8 @@
 # AI Contracts — Kernel/Service ABI
 
 IPC service IDs, broker syscalls, handle transfer, and service routing. For package/stage/build/logging: `contracts-infra.md`.
+Cross-owner composition is indexed by `system-flows.md` and
+`formal/system-flows.tsv`; this file remains the detailed owner/wire contract.
 
 ## Kernel/Userspace ABI Surface
 
@@ -36,6 +38,14 @@ IPC service IDs, broker syscalls, handle transfer, and service routing. For pack
   authority.
 
 ## IPC Service Registry
+
+All raw and handle-carrying `SYS_RUSTOS_IPC_CALL*` waits use the same finite
+30-second service ceiling. Timeout cancels the exact reply identity and drops
+any transferred-handle authority; a late reply is invalid. Shorter provider or
+application deadlines remain authoritative and may not be widened to this
+ceiling. Server receive loops may wait for new work indefinitely because they
+hold no caller reply, but every accepted synchronous request must reach reply,
+timeout/cancel, peer-close, or owner-exit cleanup.
 
 Endpoints registered via `SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT`, looked up by stable `IPC_SERVICE_*` id. Registering endpoint `0` revokes; later lookups fail closed.
 Before final endpoint cleanup, a terminating process is marked exiting. Endpoint
@@ -87,13 +97,15 @@ threads, marks the process exiting, revokes its endpoints, clears loader
 broker state, records one fixed SIGKILL lifecycle exit, and signals its parent.
 It is teardown substrate, not a generic kill syscall or a kernel restart
 policy table.
-rootd receives supervisor requests through root-supervisor-only sender-stamped
+Rootd receives supervisor requests through endpoint-owner-only sender-stamped
 receive syscalls; both pre-init and post-init supervisor turns must drain
 lifecycle/restart state before using `SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER`, so
 a failed child cannot hide behind an indefinite rootd IPC wait. `SERVICE_CAPABILITY`,
 `SERVICE_LOOKUP`, and `READINESS_SIGNAL` must reject payload `subject_pid/tid`
 values that do not match the kernel-stamped sender PID/TID. The sender-stamped
-recv path is not a generic app IPC ABI. rootd's supervisor loop must yield
+receive path first re-authorizes the exact endpoint owner and is not a generic
+app IPC ABI; kernel-stamped sender identity does not grant policy capability.
+Rootd's supervisor loop must yield
 between nonblocking receive turns rather than sleep-polling, because service
 endpoint registration synchronously depends on rootd capability replies.
 No service may hold a local policy/state lock across service discovery or a
@@ -101,6 +113,22 @@ synchronous cross-service call. Early-boot maintenance paths additionally
 skip discovery when their drained work set is empty. A new bootstrap
 dependency must either be covered by rootd's declared readiness order or use a
 bounded, explicit ready handshake; startup scheduling luck is not readiness.
+Rootd must also remain the sole consumer of its supervisor endpoint while a
+loaderd launch is in flight. Because loaderd executable open can synchronously
+enter `vfsd`, and vfsd commits open-description state through rootd's
+checkpoint protocol, rootd may not block its supervisor thread in
+`SYS_RUSTOS_IPC_CALL` to loaderd without another receiver. It delegates the
+sole supervisor endpoint turn to exactly one same-process, fixed-stack worker
+while the original rootd thread performs the loader call. The worker blocks in
+endpoint receive, drains lifecycle evidence, and services nested loaderd/vfsd
+requests without scheduler polling. After the loader call publishes the exact
+PID or errno, the original thread issues the sender-stamped
+`COMMERCIAL_MAX_ROOTD_OP_LOADER_WORKER_COMPLETE` wake on the same endpoint;
+only that same-process request may advance `RESULT_READY` to `COMPLETE`, and
+the original thread does not touch the borrowed supervisor state until the
+worker publishes `EXITED`. The worker receives no new capability and concurrent
+jobs fail closed; direct spawn and deferred checkpointing are not permitted
+substitutes.
 
 | ID | Service | Capability (`IPC_SERVICE_CAP_*`) | Owns |
 |----|---------|----------------------------------|------|
@@ -662,19 +690,22 @@ policy remains with the owning service.
   creates or publishes its endpoint; malformed, duplicate, stale, or partial
   replay fails closed. Ring0 does not mirror service policy as a fallback.
   Crash-injection runtime evidence is still required before release acceptance.
-  This epoll recovery contract does **not** yet cover ordinary remote VFS open
-  descriptions. Commercial restart continuity additionally requires vfsd to
-  durably bind each live remote capability to its normalized path identity,
-  kind, cursor, length/content generation, mutable status flags, and terminal
-  close revision before publishing the corresponding mutation. A replacement
-  must restore that state before endpoint publication, while kernel-owned
-  descriptor refcounts remain authoritative; path reopen, cursor reset, or an
-  `EBADF` retry is not an acceptable substitute. Checkpoint deletion also needs
-  an explicit acknowledgement/compaction generation so closed capabilities do
-  not consume the fixed rootd store forever without making an uncertain final
-  mutation replayable. Until source, crash injection, and long-churn capacity
-  evidence exist, supervised vfsd restart with live ordinary files is a release
-  blocker.
+  Ordinary remote VFS open descriptions now use the same restart boundary.
+  Vfsd durably stages the parent and every normalized-path chunk before the
+  live record binds kind, cursor, length/content identity, and mutable status
+  flags to the kernel-minted capability. If the OPEN response remains
+  uncertain, compat closes the exact proposed capability; vfsd can tombstone
+  either a staging parent or the completed handle, so neither becomes an
+  ownerless fallback object. Sequential read/getdents leaves a
+  prepared cursor result until compat commits after successful user copyout or
+  cancels on failure. Kernel fd lookup and temporary reference acquisition are
+  one atomic close-exclusion step; dup/fork/transfer references remain
+  kernel-owned. Final close preserves its exact tombstone across reply loss and
+  service restart, and only a separate kernel visibility ACK authorizes exact-
+  proof rootd compaction. A stale proof cannot erase a reused key. Source,
+  focused tests, and `vfs-open-description-recovery` cover these invariants;
+  current-image crash injection and long-churn runtime evidence remain release
+  acceptance gates rather than being replaced by a path-reopen fallback.
 - Standard input, output, and error descriptors are ordinary Arc-backed console
   open descriptions rather than numeric fd exceptions. Sessiond-backed output
   and error report `POLLOUT` only while their exact session remains live and

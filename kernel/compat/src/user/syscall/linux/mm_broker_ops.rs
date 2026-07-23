@@ -120,6 +120,7 @@ fn broker_map_anon(args: &RustosMmBrokerArgs) -> Result<(), i64> {
     let len = checked_len(args.len)?;
     let start = checked_page_addr(args.addr)?;
     let page_count = page_count(len)?;
+    let mapping_end = checked_mapping_end(start, page_count)?;
     let page_flags = protection_to_page_flags(args.prot)?;
 
     let Some(result) = multitask::with_process_state_by_pid_mut(args.target_pid, |process_state| {
@@ -133,7 +134,7 @@ fn broker_map_anon(args: &RustosMmBrokerArgs) -> Result<(), i64> {
             .address_space_mut()
             .map_zeroed_user_pages_at(VirtAddr::new(start), page_count, page_flags)
             .map_err(address_space_error_to_linux_errno)?;
-        process_state.set_mapping_cursor(start.saturating_add(args.len));
+        process_state.set_mapping_cursor(mapping_end);
         Ok::<RustosMmMapBrokerResult, i64>(RustosMmMapBrokerResult {
             addr: start,
             len: args.len,
@@ -147,6 +148,7 @@ fn broker_map_anon(args: &RustosMmBrokerArgs) -> Result<(), i64> {
 fn broker_map_file_private(args: &RustosMmBrokerArgs) -> Result<(), i64> {
     let len = checked_len(args.len)?;
     let start = checked_page_addr(args.addr)?;
+    let mapping_end = checked_mapping_end(start, page_count(len)?)?;
     let page_flags = protection_to_page_flags(args.prot)?;
     let source = file_mapping_source(args.target_pid, args.fd)?;
 
@@ -156,7 +158,7 @@ fn broker_map_file_private(args: &RustosMmBrokerArgs) -> Result<(), i64> {
                 .address_space_mut()
                 .map_zeroed_user_bytes_at(VirtAddr::new(start), len, page_flags)
                 .map_err(address_space_error_to_linux_errno)?;
-            process_state.set_mapping_cursor(start.saturating_add(args.len));
+            process_state.set_mapping_cursor(mapping_end);
             Ok::<RustosMmMapBrokerResult, i64>(RustosMmMapBrokerResult {
                 addr: start,
                 len: args.len,
@@ -177,6 +179,7 @@ fn broker_map_file_private(args: &RustosMmBrokerArgs) -> Result<(), i64> {
 fn broker_map_memfd_shared(args: &RustosMmBrokerArgs) -> Result<(), i64> {
     let len = checked_len(args.len)?;
     let start = checked_page_addr(args.addr)?;
+    let mapping_end = checked_mapping_end(start, page_count(len)?)?;
     let memfd = memfd_source(args.target_pid, args.fd)?;
     let writable = args.prot & linux_abi::PROT_WRITE != 0;
     let (frames, hold) = memfd
@@ -194,7 +197,7 @@ fn broker_map_memfd_shared(args: &RustosMmBrokerArgs) -> Result<(), i64> {
             .map_existing_user_pages_at(VirtAddr::new(start), &frames, page_flags)
             .map_err(address_space_error_to_linux_errno)?;
         process_state.record_shared_memfd_mapping(start, args.len, hold);
-        process_state.set_mapping_cursor(start.saturating_add(args.len));
+        process_state.set_mapping_cursor(mapping_end);
         Ok::<RustosMmMapBrokerResult, i64>(RustosMmMapBrokerResult {
             addr: start,
             len: args.len,
@@ -210,6 +213,7 @@ fn broker_map_device_shared(args: &RustosMmBrokerArgs) -> Result<(), i64> {
     let start = checked_page_addr(args.addr)?;
     let page_flags = surface_page_flags(args.prot)?;
     let page_count = page_count(len)?;
+    checked_mapping_end(start, page_count)?;
 
     let Some(result) = multitask::with_process_state_by_pid_mut(args.target_pid, |process_state| {
         let mut surface_fd = args.fd;
@@ -425,7 +429,7 @@ fn copy_file_mapping(
         let count = (len - copied).min(chunk.len());
         let read = match source {
             FileMappingSource::Remote { remote_id, path } => {
-                let file_offset = offset.saturating_add(copied as u64);
+                let file_offset = offset.checked_add(copied as u64).ok_or(LINUX_EOVERFLOW)?;
                 match kernel_io_manager::api::block::read_boot_extent_file_range(
                     path,
                     file_offset,
@@ -454,10 +458,11 @@ fn copy_file_mapping(
             break;
         }
 
+        let dest = start.checked_add(copied as u64).ok_or(LINUX_EOVERFLOW)?;
         let Some(result) = multitask::with_process_state_by_pid_mut(target_pid, |process_state| {
             process_state
                 .address_space()
-                .initialize_user_bytes(VirtAddr::new(start + copied as u64), &chunk[..read])
+                .initialize_user_bytes(VirtAddr::new(dest), &chunk[..read])
                 .map_err(address_space_error_to_linux_errno)
         }) else {
             return Err(LINUX_ESRCH);
@@ -511,7 +516,21 @@ fn checked_page_addr(addr: u64) -> Result<u64, i64> {
     if addr == 0 || addr % PAGE_SIZE != 0 {
         return Err(LINUX_EINVAL);
     }
+    VirtAddr::try_new(addr).map_err(|_| LINUX_EINVAL)?;
     Ok(addr)
+}
+
+fn checked_mapping_end(start: u64, page_count: usize) -> Result<u64, i64> {
+    let span = u64::try_from(page_count)
+        .ok()
+        .and_then(|pages| pages.checked_mul(PAGE_SIZE))
+        .ok_or(LINUX_EOVERFLOW)?;
+    let end = start.checked_add(span).ok_or(LINUX_EOVERFLOW)?;
+    if end == 0 {
+        return Err(LINUX_EOVERFLOW);
+    }
+    VirtAddr::try_new(end - 1).map_err(|_| LINUX_EINVAL)?;
+    Ok(end)
 }
 
 fn page_count(len: usize) -> Result<usize, i64> {
@@ -556,5 +575,28 @@ fn memfd_error_to_errno(err: MemfdError) -> i64 {
         MemfdError::InvalidArgument => LINUX_EINVAL,
         MemfdError::NoMemory => LINUX_ENOMEM,
         MemfdError::PermissionDenied => LINUX_EACCES,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mapping_range_rejects_noncanonical_and_wrapping_addresses() {
+        assert_eq!(checked_page_addr(0), Err(LINUX_EINVAL));
+        assert_eq!(checked_page_addr(0x0000_8000_0000_0000), Err(LINUX_EINVAL));
+        assert_eq!(
+            checked_mapping_end(u64::MAX & !(PAGE_SIZE - 1), 2),
+            Err(LINUX_EOVERFLOW)
+        );
+    }
+
+    #[test]
+    fn mapping_cursor_advances_to_the_rounded_region_end() {
+        let start = 0x4000_0000;
+        let pages = page_count(PAGE_SIZE as usize + 1).expect("page count");
+        assert_eq!(pages, 2);
+        assert_eq!(checked_mapping_end(start, pages), Ok(start + 2 * PAGE_SIZE));
     }
 }

@@ -162,8 +162,8 @@ fn record_service_endpoint_milestone(
 }
 
 /// 프로세스 종료 시 해당 프로세스가 등록한 모든 IPC 서비스 엔드포인트를 해제한다.
-/// stale endpoint가 남아 있으면 이후 호출자가 wait_for_reply에서 무한 대기하게 되므로
-/// 반드시 프로세스 종료 경로에서 호출해야 한다.
+/// stale endpoint가 남아 있으면 이후 호출자가 finite reply deadline을
+/// 소모할 때까지 실패가 지연되므로 반드시 프로세스 종료 경로에서 호출해야 한다.
 pub(crate) fn cleanup_service_endpoints_for_process(process_id: u64) {
     let mut revoked_services = [0_u64; MAX_SERVICE_ENDPOINTS];
     let mut revoked_count = 0usize;
@@ -1003,11 +1003,9 @@ pub(super) fn syscall_linux_rustos_ipc_try_recv_with_sender(
     sender_pid_ptr: u64,
     sender_tid_ptr: u64,
 ) -> u64 {
-    if !current_process_has_service_capability(
-        rustos_user_abi::syscall::IPC_SERVICE_CAP_ROOT_SUPERVISOR,
-    ) {
-        return linux_errno(LINUX_EPERM);
-    }
+    // Sender identity is metadata on a receive capability, not rootd policy.
+    // `recv_endpoint_once_with_sender` re-authorizes the exact endpoint owner
+    // before exposing either request bytes or kernel-stamped caller identity.
     recv_endpoint_once_with_sender(
         endpoint,
         request_ptr,
@@ -1027,11 +1025,6 @@ pub(super) fn syscall_linux_rustos_ipc_recv_with_sender(
     sender_pid_ptr: u64,
     sender_tid_ptr: u64,
 ) -> u64 {
-    if !current_process_has_service_capability(
-        rustos_user_abi::syscall::IPC_SERVICE_CAP_ROOT_SUPERVISOR,
-    ) {
-        return linux_errno(LINUX_EPERM);
-    }
     let endpoint = KernelEndpointHandle::from_raw(endpoint);
     let Some(task_id) = multitask::current_task_id() else {
         return linux_errno(LINUX_EINVAL);
@@ -1301,7 +1294,7 @@ pub(super) fn syscall_linux_rustos_ipc_call_with_handles(args_ptr: u64) -> u64 {
     };
     let send_ticks = crate::arch::rtc::ticks();
 
-    let (response, reply_handles) = match wait_for_reply_with_handle_limit(
+    let (response, reply_handles) = match wait_for_service_reply_with_handle_limit(
         reply,
         rustos_user_abi::syscall::IPC_MAX_TRANSFER_HANDLES,
     ) {
@@ -1663,7 +1656,7 @@ fn enqueue_call_and_wake_with_handles(
 }
 
 fn wait_for_reply(reply: KernelReplyHandle) -> Result<Vec<u8>, i64> {
-    Ok(wait_for_reply_with_handle_limit(reply, 0)?.0)
+    Ok(wait_for_service_reply_with_handle_limit(reply, 0)?.0)
 }
 
 fn wait_for_service_reply(reply: KernelReplyHandle) -> Result<Vec<u8>, i64> {
@@ -1674,36 +1667,22 @@ fn wait_for_service_reply_with_timeout(
     reply: KernelReplyHandle,
     timeout_ms: u64,
 ) -> Result<Vec<u8>, i64> {
-    Ok(
-        wait_for_reply_with_deadline(reply, 0, Some(service_ipc_deadline_tick_after(timeout_ms)))?
-            .0,
-    )
+    Ok(wait_for_reply_with_deadline(reply, 0, service_ipc_deadline_tick_after(timeout_ms))?.0)
 }
 
 fn wait_for_service_reply_with_handle_limit(
     reply: KernelReplyHandle,
     handle_capacity: usize,
 ) -> Result<(Vec<u8>, Vec<KernelTransferredHandle>), i64> {
-    wait_for_reply_with_deadline(reply, handle_capacity, Some(service_ipc_deadline_tick()))
-}
-
-fn wait_for_reply_with_handle_limit(
-    reply: KernelReplyHandle,
-    handle_capacity: usize,
-) -> Result<(Vec<u8>, Vec<KernelTransferredHandle>), i64> {
-    wait_for_reply_with_deadline(reply, handle_capacity, None)
+    wait_for_reply_with_deadline(reply, handle_capacity, service_ipc_deadline_tick())
 }
 
 fn wait_for_reply_with_deadline(
     reply: KernelReplyHandle,
     handle_capacity: usize,
-    deadline_tick: Option<u64>,
+    deadline_tick: u64,
 ) -> Result<(Vec<u8>, Vec<KernelTransferredHandle>), i64> {
-    let caller_task_id = if deadline_tick.is_some() {
-        Some(multitask::current_task_id().ok_or(LINUX_EINVAL)?)
-    } else {
-        None
-    };
+    let caller_task_id = multitask::current_task_id().ok_or(LINUX_EINVAL)?;
     loop {
         match take_endpoint_response_for_wait(reply, handle_capacity) {
             Ok(Some(response)) => {
@@ -1748,9 +1727,7 @@ fn wait_for_reply_with_deadline(
         }
         if reply_deadline_expired(deadline_tick) {
             disarm_reply_deadline_waiter(caller_task_id);
-            if let Some(task_id) = caller_task_id {
-                let _ = multitask::wake_task(task_id);
-            }
+            let _ = multitask::wake_task(caller_task_id);
             let _ = multitask::commit_block_current_task();
             cancel_deadline_reply(reply, caller_task_id);
             return Err(LINUX_ETIMEDOUT);
@@ -1809,28 +1786,19 @@ fn service_ipc_deadline_tick_after(timeout_ms: u64) -> u64 {
     crate::arch::rtc::ticks().saturating_add(timeout_ticks)
 }
 
-fn reply_deadline_expired(deadline_tick: Option<u64>) -> bool {
-    deadline_tick.is_some_and(|deadline_tick| crate::arch::rtc::ticks() >= deadline_tick)
+fn reply_deadline_expired(deadline_tick: u64) -> bool {
+    crate::arch::rtc::ticks() >= deadline_tick
 }
 
-fn arm_reply_deadline_waiter(task_id: Option<u64>, deadline_tick: Option<u64>) -> bool {
-    if let (Some(task_id), Some(deadline_tick)) = (task_id, deadline_tick) {
-        crate::arch::rtc::arm_sleep_waiter_until_tick(task_id, deadline_tick)
-    } else {
-        true
-    }
+fn arm_reply_deadline_waiter(task_id: u64, deadline_tick: u64) -> bool {
+    crate::arch::rtc::arm_sleep_waiter_until_tick(task_id, deadline_tick)
 }
 
-fn disarm_reply_deadline_waiter(task_id: Option<u64>) {
-    if let Some(task_id) = task_id {
-        crate::arch::rtc::disarm_sleep_waiter(task_id);
-    }
+fn disarm_reply_deadline_waiter(task_id: u64) {
+    crate::arch::rtc::disarm_sleep_waiter(task_id);
 }
 
-fn cancel_deadline_reply(reply: KernelReplyHandle, caller_task_id: Option<u64>) {
-    let Some(caller_task_id) = caller_task_id else {
-        return;
-    };
+fn cancel_deadline_reply(reply: KernelReplyHandle, caller_task_id: u64) {
     let result =
         kernel_ipc_runtime::api::cancel_endpoint_call_with_transfers(reply, caller_task_id);
     if let Ok(discarded) = &result {
@@ -2241,6 +2209,12 @@ fn log_slow_ipc_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_ipc_calls_share_the_finite_service_deadline() {
+        assert!(SERVICE_IPC_TIMEOUT_MS > 0);
+        assert!(SERVICE_IPC_TIMEOUT_MS <= IPC_WAIT_SERVICE_ENDPOINT_MAX_TIMEOUT_MS);
+    }
 
     #[test]
     fn service_endpoint_epoch_changes_on_every_publication_boundary() {

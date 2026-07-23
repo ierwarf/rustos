@@ -90,15 +90,20 @@ pub fn syscall_linux_vfs_openat(dirfd: u64, path_ptr: u64, flags: u64, mode: u64
     if let Err(errno) = populate_vfs_path_base(&mut request, dirfd, &path) {
         return linux_errno(errno);
     }
-    let response = match call_vfs_ipc_request(&request) {
+    let response = match call_pinned_remote_vfs_request(&request) {
         Ok(response) => response,
-        Err(errno) => return linux_errno(errno),
+        Err(errno) => {
+            let _ = call_vfs_remote_close_bounded(request.arg3);
+            return linux_errno(errno);
+        }
     };
     if let Err(errno) = ensure_vfs_status(&response) {
+        let _ = call_vfs_remote_close_bounded(request.arg3);
         return linux_errno(errno);
     }
     let remote_id = response.remote_id;
-    if remote_id == 0 {
+    if remote_id == 0 || remote_id != request.arg3 {
+        let _ = call_vfs_remote_close_bounded(request.arg3);
         return linux_errno(LINUX_EINVAL);
     }
     if let Err(errno) = register_remote_vfs_open_description(remote_id) {
@@ -119,17 +124,13 @@ pub fn syscall_linux_vfs_openat(dirfd: u64, path_ptr: u64, flags: u64, mode: u64
             return linux_errno(LINUX_EINVAL);
         }
     };
-    let handle_path = if response.payload_len > 0 {
-        let len = response.payload_len as usize;
-        match core::str::from_utf8(&response.payload[..len]) {
-            Ok(path) => alloc::string::String::from(path),
-            Err(_) => {
-                release_service_handle_refs_bounded(&[ServiceHandleRef::RemoteVfs(remote_id)]);
-                return linux_errno(LINUX_EINVAL);
-            }
+    let len = response.payload_len as usize;
+    let handle_path = match core::str::from_utf8(&response.payload[..len]) {
+        Ok(path) if !path.is_empty() && path.starts_with('/') => alloc::string::String::from(path),
+        _ => {
+            release_service_handle_refs_bounded(&[ServiceHandleRef::RemoteVfs(remote_id)]);
+            return linux_errno(LINUX_EINVAL);
         }
-    } else {
-        alloc::string::String::from(path.as_str())
     };
     let handle = multitask::KernelHandle::RemoteVfs(multitask::RemoteVfsHandle::new(
         remote_id,
@@ -237,13 +238,14 @@ pub fn syscall_linux_vfs_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
                     request.remote_id = remote.remote_id();
                     request.arg0 = cmd;
                     request.arg1 = arg;
-                    let value = match call_vfs_ipc_request(&request).and_then(|response| {
-                        ensure_vfs_status(&response)?;
-                        Ok(response.value)
-                    }) {
-                        Ok(value) => value,
-                        Err(errno) => return linux_errno(errno),
-                    };
+                    let value =
+                        match call_pinned_remote_vfs_request(&request).and_then(|response| {
+                            ensure_vfs_status(&response)?;
+                            Ok(response.value)
+                        }) {
+                            Ok(value) => value,
+                            Err(errno) => return linux_errno(errno),
+                        };
                     if cmd == linux_abi::F_SETFL {
                         let _ = multitask::with_current_user_process_state_mut(
                             |_, _, process_state| {
@@ -299,7 +301,7 @@ pub fn syscall_linux_vfs_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
             request.remote_id = remote.remote_id();
             request.arg0 = cmd;
             request.arg1 = arg;
-            match call_vfs_ipc_request(&request).and_then(|response| {
+            match call_pinned_remote_vfs_request(&request).and_then(|response| {
                 ensure_vfs_status(&response)?;
                 Ok(response.value)
             }) {
@@ -308,6 +310,44 @@ pub fn syscall_linux_vfs_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
             }
         }
     }
+}
+
+pub fn call_pinned_remote_vfs_request(request: &VfsIpcRequest) -> Result<VfsIpcResponse, i64> {
+    if request.remote_id == 0 {
+        return call_vfs_ipc_request(request);
+    }
+    let fd = match request.op {
+        VFS_IPC_OP_OPENAT
+        | VFS_IPC_OP_STATX
+        | VFS_IPC_OP_NEWFSTATAT
+        | VFS_IPC_OP_READLINKAT
+        | VFS_IPC_OP_ACCESS
+        | VFS_IPC_OP_MKDIR
+        | VFS_IPC_OP_UNLINKAT => request.dirfd,
+        _ => request.fd,
+    };
+    acquire_current_remote_vfs_ref(fd, request.remote_id)?;
+    let result = call_vfs_ipc_request(request);
+    release_service_handle_refs_bounded(&[ServiceHandleRef::RemoteVfs(request.remote_id)]);
+    result
+}
+
+/// Atomically resolves an fd and pins its exact open description. Holding the
+/// process handle-table lock across the reference increment closes the fdget
+/// versus concurrent-close gap; a cloned handle value alone is not a pin.
+pub fn acquire_current_remote_vfs_ref(fd: u64, expected_remote_id: u64) -> Result<(), i64> {
+    multitask::with_current_user_process_state(|_, _, process_state| {
+        let remote = match process_state.handles().get(fd) {
+            Some(multitask::KernelHandle::RemoteVfs(remote))
+                if remote.remote_id() == expected_remote_id =>
+            {
+                remote
+            }
+            _ => return Err(LINUX_EBADF),
+        };
+        acquire_remote_vfs_descriptor_ref(remote.remote_id())
+    })
+    .ok_or(LINUX_EBADF)?
 }
 
 fn duplicate_install_errno(mode: VfsDupMode) -> i64 {
@@ -445,6 +485,23 @@ mod tests {
     }
 
     #[test]
+    fn exit_service_refs_come_from_the_exact_closed_handle_set() {
+        let mut handles = multitask::HandleTable::new();
+        let epoll = multitask::EpollHandle::new();
+        let token = epoll.token_id();
+        handles
+            .install(multitask::KernelHandle::Epoll(epoll))
+            .expect("epoll fd");
+
+        let closed = handles.close_all();
+        assert!(handles.entries_snapshot(false).is_empty());
+        assert_eq!(
+            service_handle_refs_from_handles(&closed),
+            vec![ServiceHandleRef::Epoll(token)]
+        );
+    }
+
+    #[test]
     fn remote_vfs_refs_are_local_and_provider_close_is_final_only() {
         let id = u64::MAX - 0x5f5;
         assert_eq!(register_remote_vfs_open_description(id), Ok(()));
@@ -534,12 +591,18 @@ fn current_console_handle_and_status_flags(fd: u64) -> Option<(multitask::Consol
 }
 
 pub fn syscall_linux_vfs_pread64(fd: u64, user_ptr: u64, user_len: u64, offset: u64) -> u64 {
+    if offset > i64::MAX as u64 {
+        return linux_errno(LINUX_EINVAL);
+    }
     if let Some(memfd) = current_memfd_handle(fd) {
         let Ok(offset) = usize::try_from(offset) else {
             return linux_errno(LINUX_EINVAL);
         };
         return read_local_vfs_file(user_ptr, user_len, |copied, chunk| {
-            memfd.read_at(offset.saturating_add(copied), chunk)
+            offset
+                .checked_add(copied)
+                .map(|position| memfd.read_at(position, chunk))
+                .unwrap_or(0)
         });
     }
     let Some(remote) = current_remote_vfs_handle(fd) else {
@@ -717,6 +780,21 @@ fn read_remote_vfs(
     user_len: u64,
     offset: Option<u64>,
 ) -> u64 {
+    if let Err(errno) = acquire_current_remote_vfs_ref(fd, remote_id) {
+        return linux_errno(errno);
+    }
+    let result = read_remote_vfs_pinned(fd, remote_id, user_ptr, user_len, offset);
+    release_service_handle_refs_bounded(&[ServiceHandleRef::RemoteVfs(remote_id)]);
+    result
+}
+
+fn read_remote_vfs_pinned(
+    fd: u64,
+    remote_id: u64,
+    user_ptr: u64,
+    user_len: u64,
+    offset: Option<u64>,
+) -> u64 {
     let Ok(user_len) = usize::try_from(user_len) else {
         return linux_errno(LINUX_EINVAL);
     };
@@ -738,29 +816,95 @@ fn read_remote_vfs(
         request.remote_id = remote_id;
         request.arg1 = chunk_len as u64;
         if let Some(offset) = offset {
-            request.arg0 = offset.saturating_add(copied as u64);
+            let Some(chunk_offset) = offset.checked_add(copied as u64) else {
+                return if copied > 0 {
+                    copied as u64
+                } else {
+                    linux_errno(LINUX_EOVERFLOW)
+                };
+            };
+            if chunk_offset > i64::MAX as u64 {
+                return if copied > 0 {
+                    copied as u64
+                } else {
+                    linux_errno(LINUX_EOVERFLOW)
+                };
+            }
+            request.arg0 = chunk_offset;
         }
         let response = match call_vfs_ipc_request(&request) {
             Ok(response) => response,
-            Err(errno) => return linux_errno(errno),
+            Err(errno) => {
+                if offset.is_none() {
+                    let _ = settle_vfs_cursor_mutation(&request, false);
+                }
+                return if copied > 0 {
+                    copied as u64
+                } else {
+                    linux_errno(errno)
+                };
+            }
         };
         if let Err(errno) = ensure_vfs_status(&response) {
-            return linux_errno(errno);
+            return if copied > 0 {
+                copied as u64
+            } else {
+                linux_errno(errno)
+            };
         }
         let read = response.payload_len as usize;
         if read > chunk_len || read > response.payload.len() {
-            return linux_errno(LINUX_EINVAL);
+            if offset.is_none() {
+                let _ = settle_vfs_cursor_mutation(&request, false);
+            }
+            return if copied > 0 {
+                copied as u64
+            } else {
+                linux_errno(LINUX_EINVAL)
+            };
         }
         if read == 0 {
+            if offset.is_none() {
+                if let Err(errno) = settle_vfs_cursor_mutation(&request, true) {
+                    return if copied > 0 {
+                        copied as u64
+                    } else {
+                        linux_errno(errno)
+                    };
+                }
+            }
             break;
         }
         let Some(dest) = user_ptr.checked_add(copied as u64) else {
-            return linux_errno(LINUX_EINVAL);
+            if offset.is_none() {
+                let _ = settle_vfs_cursor_mutation(&request, false);
+            }
+            return if copied > 0 {
+                copied as u64
+            } else {
+                linux_errno(LINUX_EINVAL)
+            };
         };
         if let Err(err) = usermem::write_current_user_bytes(dest, &response.payload[..read]) {
-            return linux_errno(address_space_error_to_linux_errno(err));
+            if offset.is_none() {
+                let _ = settle_vfs_cursor_mutation(&request, false);
+            }
+            return if copied > 0 {
+                copied as u64
+            } else {
+                linux_errno(address_space_error_to_linux_errno(err))
+            };
         }
         copied += read;
+        if offset.is_none() {
+            if let Err(errno) = settle_vfs_cursor_mutation(&request, true) {
+                return if copied > 0 {
+                    copied as u64
+                } else {
+                    linux_errno(errno)
+                };
+            }
+        }
         multitask::cond_resched();
         if read < chunk_len {
             break;
@@ -776,23 +920,30 @@ fn write_remote_vfs(fd: u64, remote_id: u64, user_ptr: u64, user_len: u64) -> u6
     if user_len == 0 {
         return 0;
     }
-    let chunk_len = user_len.min(VFS_IPC_REQUEST_PAYLOAD_CAPACITY);
-    let mut request = new_vfs_request(VFS_IPC_OP_WRITE);
-    request.fd = fd;
-    request.remote_id = remote_id;
-    request.payload_len = chunk_len as u32;
-    if let Err(err) =
-        usermem::copy_from_current_user_exact(user_ptr, &mut request.payload[..chunk_len])
-    {
-        return linux_errno(address_space_error_to_linux_errno(err));
+    if let Err(errno) = acquire_current_remote_vfs_ref(fd, remote_id) {
+        return linux_errno(errno);
     }
-    match call_vfs_ipc_request(&request).and_then(|response| {
-        ensure_vfs_status(&response)?;
-        Ok(response.value)
-    }) {
-        Ok(written) => written,
-        Err(errno) => linux_errno(errno),
-    }
+    let result = (|| {
+        let chunk_len = user_len.min(VFS_IPC_REQUEST_PAYLOAD_CAPACITY);
+        let mut request = new_vfs_request(VFS_IPC_OP_WRITE);
+        request.fd = fd;
+        request.remote_id = remote_id;
+        request.payload_len = chunk_len as u32;
+        if let Err(err) =
+            usermem::copy_from_current_user_exact(user_ptr, &mut request.payload[..chunk_len])
+        {
+            return linux_errno(address_space_error_to_linux_errno(err));
+        }
+        match call_vfs_ipc_request(&request).and_then(|response| {
+            ensure_vfs_status(&response)?;
+            Ok(response.value)
+        }) {
+            Ok(written) => written,
+            Err(errno) => linux_errno(errno),
+        }
+    })();
+    release_service_handle_refs_bounded(&[ServiceHandleRef::RemoteVfs(remote_id)]);
+    result
 }
 
 fn writev_via_write(fd: u64, iov_ptr: u64, iovcnt: u64) -> u64 {
@@ -1028,6 +1179,13 @@ fn service_handle_refs_from_table(handles: &multitask::HandleTable) -> Vec<Servi
         .collect()
 }
 
+fn service_handle_refs_from_handles(handles: &[multitask::KernelHandle]) -> Vec<ServiceHandleRef> {
+    handles
+        .iter()
+        .filter_map(service_handle_ref_for_handle)
+        .collect()
+}
+
 pub fn acquire_cloned_service_handle_refs(
     child_state: &multitask::UserProcessState,
 ) -> Result<Vec<ServiceHandleRef>, i64> {
@@ -1048,11 +1206,15 @@ pub fn acquire_cloned_service_handle_refs(
 }
 
 pub fn release_all_service_handle_refs(process_id: u64) {
-    let refs = snapshot_service_handle_refs(process_id, false).unwrap_or_default();
     let closed = multitask::with_process_state_by_pid_mut(process_id, |state| {
         state.handles_mut().close_all()
     })
     .unwrap_or_default();
+    // Derive provider releases from the exact handles removed under the
+    // process-state mutation. A pre-close snapshot races dup/close/fd reuse
+    // and can release the wrong service object or leak the one actually
+    // removed during exit.
+    let refs = service_handle_refs_from_handles(&closed);
     release_service_handle_refs_bounded(&refs);
     purge_closed_console_handles(
         closed
@@ -1161,21 +1323,6 @@ pub fn service_handle_ref_for_handle(handle: &multitask::KernelHandle) -> Option
         }
         _ => None,
     }
-}
-
-fn snapshot_service_handle_refs(
-    process_id: u64,
-    cloexec_only: bool,
-) -> Result<Vec<ServiceHandleRef>, i64> {
-    multitask::with_process_state_by_pid(process_id, |state| {
-        state
-            .handles()
-            .entries_snapshot(cloexec_only)
-            .into_iter()
-            .filter_map(|(_, entry)| service_handle_ref_for_handle(entry.handle()))
-            .collect()
-    })
-    .ok_or(LINUX_ESRCH)
 }
 
 pub fn acquire_service_handle_ref(handle_ref: ServiceHandleRef) -> Result<(), i64> {

@@ -21,34 +21,41 @@ use rustos_user_abi::syscall::{
     VfsIpcRequest, VfsIpcResponse, WaitSetInterestWire, WaitSetSignalBrokerArgs,
     COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS,
     COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR, COMMERCIAL_MAX_PROTOCOL_VFSD,
+    COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_COMPACT,
     COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE,
     COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_SCAN, COMMERCIAL_MAX_VFSD_OP_DIRECTORY_CURSOR,
     COMMERCIAL_MAX_VFSD_OP_FD_TABLE_PLAN, COMMERCIAL_MAX_VFSD_OP_FILE_CURSOR,
     COMMERCIAL_MAX_VFSD_OP_METADATA_POLICY, COMMERCIAL_MAX_VFSD_OP_MOUNT_GRAPH,
     COMMERCIAL_MAX_VFSD_OP_PATH_RESOLVE, IPC_SERVICE_ROOTD, IPC_SERVICE_VFSD, LINUX_STATX_SIZE,
-    LINUX_STAT_SIZE, SERVICE_CHECKPOINT_FLAG_TOMBSTONE, SYSCALL_OFFLOAD_ABI_VERSION,
-    SYSCALL_OFFLOAD_OP_LINUX_ACCESS, SYSCALL_OFFLOAD_OP_LINUX_CHDIR,
+    LINUX_STAT_SIZE, SERVICE_CHECKPOINT_FLAG_TOMBSTONE, SERVICE_CHECKPOINT_VALUE_CAPACITY,
+    SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_LINUX_ACCESS, SYSCALL_OFFLOAD_OP_LINUX_CHDIR,
     SYSCALL_OFFLOAD_OP_LINUX_CLOSE, SYSCALL_OFFLOAD_OP_LINUX_DUP, SYSCALL_OFFLOAD_OP_LINUX_FCNTL,
     SYSCALL_OFFLOAD_OP_LINUX_GETCWD, SYSCALL_OFFLOAD_OP_LINUX_GETDENTS64,
     SYSCALL_OFFLOAD_OP_LINUX_MKDIR, SYSCALL_OFFLOAD_OP_LINUX_MOUNT,
     SYSCALL_OFFLOAD_OP_LINUX_NEWFSTATAT, SYSCALL_OFFLOAD_OP_LINUX_OPENAT,
     SYSCALL_OFFLOAD_OP_LINUX_READLINKAT, SYSCALL_OFFLOAD_OP_LINUX_STATX,
     SYSCALL_OFFLOAD_OP_LINUX_UMOUNT2, SYSCALL_OFFLOAD_OP_LINUX_UNLINKAT,
-    SYS_RUSTOS_WAITSET_SIGNAL_BROKER, VFS_IPC_ABI_VERSION, VFS_IPC_OP_ACCESS, VFS_IPC_OP_CHDIR,
-    VFS_IPC_OP_CLOSE, VFS_IPC_OP_DUP, VFS_IPC_OP_FCNTL, VFS_IPC_OP_FSTAT, VFS_IPC_OP_FTRUNCATE,
-    VFS_IPC_OP_GETCWD, VFS_IPC_OP_GETDENTS64, VFS_IPC_OP_LSEEK, VFS_IPC_OP_MKDIR, VFS_IPC_OP_MOUNT,
-    VFS_IPC_OP_NEWFSTATAT, VFS_IPC_OP_OPENAT, VFS_IPC_OP_POLL_QUERY, VFS_IPC_OP_PREAD64,
-    VFS_IPC_OP_READ, VFS_IPC_OP_READLINKAT, VFS_IPC_OP_STATX, VFS_IPC_OP_UMOUNT2,
-    VFS_IPC_OP_UNLINKAT, VFS_IPC_OP_WRITE, VFS_IPC_PATH_CAPACITY, VFS_IPC_PAYLOAD_CAPACITY,
-    VFS_POLL_QUERY_EPOLL_CREATE, VFS_POLL_QUERY_EPOLL_CTL, VFS_POLL_QUERY_EPOLL_PURGE_OBJECT,
-    VFS_POLL_QUERY_EPOLL_REF, VFS_POLL_QUERY_EPOLL_SNAPSHOT, VFS_POLL_QUERY_EPOLL_UNREF,
-    VFS_POLL_QUERY_POLL, WAITSET_ABI_VERSION, WAITSET_GLOBAL_OBJECT_ID, WAITSET_MAX_INTERESTS,
-    WAITSET_PROVIDER_VFSD,
+    SYS_RUSTOS_WAITSET_SIGNAL_BROKER, VFS_CURSOR_SETTLE_CANCEL, VFS_CURSOR_SETTLE_COMMIT,
+    VFS_IPC_ABI_VERSION, VFS_IPC_OP_ACCESS, VFS_IPC_OP_CHDIR, VFS_IPC_OP_CHECKPOINT_ACK,
+    VFS_IPC_OP_CLOSE, VFS_IPC_OP_CURSOR_SETTLE, VFS_IPC_OP_DUP, VFS_IPC_OP_FCNTL, VFS_IPC_OP_FSTAT,
+    VFS_IPC_OP_FTRUNCATE, VFS_IPC_OP_GETCWD, VFS_IPC_OP_GETDENTS64, VFS_IPC_OP_LSEEK,
+    VFS_IPC_OP_MKDIR, VFS_IPC_OP_MOUNT, VFS_IPC_OP_NEWFSTATAT, VFS_IPC_OP_OPENAT,
+    VFS_IPC_OP_POLL_QUERY, VFS_IPC_OP_PREAD64, VFS_IPC_OP_READ, VFS_IPC_OP_READLINKAT,
+    VFS_IPC_OP_STATX, VFS_IPC_OP_UMOUNT2, VFS_IPC_OP_UNLINKAT, VFS_IPC_OP_WRITE,
+    VFS_IPC_PATH_CAPACITY, VFS_IPC_PAYLOAD_CAPACITY, VFS_POLL_QUERY_EPOLL_CREATE,
+    VFS_POLL_QUERY_EPOLL_CTL, VFS_POLL_QUERY_EPOLL_PURGE_OBJECT, VFS_POLL_QUERY_EPOLL_REF,
+    VFS_POLL_QUERY_EPOLL_SNAPSHOT, VFS_POLL_QUERY_EPOLL_UNREF, VFS_POLL_QUERY_POLL,
+    WAITSET_ABI_VERSION, WAITSET_GLOBAL_OBJECT_ID, WAITSET_MAX_INTERESTS, WAITSET_PROVIDER_VFSD,
 };
 use storage_fat::{FatDirEntry, FatDisk, FatNodeKind, FatVolume};
 use vfsd::{
+    cacheable_metadata_errno, checked_next_generation, checked_seek_position, checkpoint_path_key,
     mkdir_policy, persistent_mutation_status, unlink_policy, valid_checkpoint_record,
-    WaitSetInterestKey, WaitSetInterestRecord, WaitSetRegistry, WaitSetRegistryError,
+    OpenDescriptionCheckpointWire, SeekPositionError, WaitSetInterestKey, WaitSetInterestRecord,
+    WaitSetRegistry, WaitSetRegistryError, VFSD_CHECKPOINT_HANDLE_TAG,
+    VFSD_OPEN_CHECKPOINT_VERSION, VFSD_OPEN_MUTATION_FCNTL, VFSD_OPEN_MUTATION_GETDENTS,
+    VFSD_OPEN_MUTATION_LSEEK, VFSD_OPEN_MUTATION_OPEN, VFSD_OPEN_MUTATION_READ,
+    VFSD_OPEN_MUTATION_STABLE, VFSD_OPEN_MUTATION_STAGING,
 };
 
 mod block;
@@ -72,6 +79,7 @@ use util::{
 pub(crate) const ENOENT: i32 = 2;
 pub(crate) const EIO: i32 = 5;
 pub(crate) const EAGAIN: i32 = 11;
+pub(crate) const EBUSY: i32 = 16;
 pub(crate) const EACCES: i32 = 13;
 pub(crate) const EBADF: i32 = 9;
 pub(crate) const EEXIST: i32 = 17;
@@ -82,6 +90,7 @@ pub(crate) const EINVAL: i32 = 22;
 pub(crate) const ENOSPC: i32 = 28;
 pub(crate) const EROFS: i32 = 30;
 pub(crate) const EOVERFLOW: i32 = 75;
+pub(crate) const EOPNOTSUPP: i32 = 95;
 
 const fn max_usize(a: usize, b: usize) -> usize {
     if a > b {
@@ -144,10 +153,6 @@ fn reset_vfs_response_slot(op: u16) -> *mut VfsIpcResponse {
 }
 
 // Linux lseek whence constants
-const SEEK_SET: u64 = 0;
-const SEEK_CUR: u64 = 1;
-const SEEK_END: u64 = 2;
-
 // Linux open flags (x86_64)
 const O_CREAT: u64 = 0o100;
 const O_TRUNC: u64 = 0o1000;
@@ -315,6 +320,7 @@ struct VfsState {
     epolls: WaitSetRegistry,
     checkpoint_revisions: BTreeMap<CheckpointRevisionKey, u64>,
     checkpoint_operations: BTreeMap<CheckpointRevisionKey, (u64, u64)>,
+    checkpoint_records: BTreeMap<CheckpointRevisionKey, ServiceCheckpointRecordWire>,
     readiness_generation: u64,
     next_handle: u64,
     mount_generation: u64,
@@ -329,6 +335,9 @@ struct RemoteHandle {
     len: u64,
     refs: u64,
     status_flags: u64,
+    last_mutation: u16,
+    last_start: u64,
+    last_result: u64,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -356,6 +365,7 @@ impl VfsState {
             epolls: WaitSetRegistry::default(),
             checkpoint_revisions: BTreeMap::new(),
             checkpoint_operations: BTreeMap::new(),
+            checkpoint_records: BTreeMap::new(),
             readiness_generation: 1,
             next_handle: 1,
             mount_generation: 1,
@@ -400,6 +410,7 @@ impl VfsState {
                         .checkpoint_operations
                         .insert(key, (record.operation_hi, record.operation_lo))
                         .is_some()
+                    || self.checkpoint_records.insert(key, record).is_some()
                 {
                     return Err(EIO);
                 }
@@ -445,19 +456,156 @@ impl VfsState {
                 .add(record.parent_hi, interest)
                 .map_err(|_| EIO)?;
         }
+        self.restore_open_descriptions(&records)?;
         Ok(())
+    }
+
+    fn restore_open_descriptions(
+        &mut self,
+        records: &[ServiceCheckpointRecordWire],
+    ) -> Result<(), i32> {
+        for record in records.iter().filter(|record| {
+            record.parent_hi == 0
+                && record.parent_lo == 0
+                && record.key_lo == VFSD_CHECKPOINT_HANDLE_TAG
+                && record.flags & SERVICE_CHECKPOINT_FLAG_TOMBSTONE == 0
+        }) {
+            if record.value_len as usize != size_of::<OpenDescriptionCheckpointWire>() {
+                return Err(EIO);
+            }
+            let wire = unsafe {
+                core::ptr::read_unaligned(
+                    record
+                        .value
+                        .as_ptr()
+                        .cast::<OpenDescriptionCheckpointWire>(),
+                )
+            };
+            if !wire.valid(VFS_IPC_PATH_CAPACITY) {
+                return Err(EIO);
+            }
+            // A staging parent is a recoverable interrupted OPEN. It remains
+            // unavailable until an exact request completes every path chunk
+            // and advances the parent to OPEN.
+            if wire.last_mutation == VFSD_OPEN_MUTATION_STAGING {
+                continue;
+            }
+            let path_len = wire.path_len as usize;
+            let chunk_count = path_len.div_ceil(SERVICE_CHECKPOINT_VALUE_CAPACITY);
+            let mut path_bytes = Vec::with_capacity(path_len);
+            for chunk_index in 0..chunk_count {
+                let (key_hi, key_lo) =
+                    checkpoint_path_key(record.key_hi, chunk_index).ok_or(EIO)?;
+                let child = records
+                    .iter()
+                    .find(|candidate| {
+                        candidate.parent_hi == record.key_hi
+                            && candidate.parent_lo == VFSD_CHECKPOINT_HANDLE_TAG
+                            && candidate.key_hi == key_hi
+                            && candidate.key_lo == key_lo
+                            && candidate.flags & SERVICE_CHECKPOINT_FLAG_TOMBSTONE == 0
+                    })
+                    .ok_or(EIO)?;
+                let expected = (path_len - path_bytes.len()).min(SERVICE_CHECKPOINT_VALUE_CAPACITY);
+                if child.value_len as usize != expected {
+                    return Err(EIO);
+                }
+                path_bytes.extend_from_slice(&child.value[..expected]);
+            }
+            let live_children = records
+                .iter()
+                .filter(|candidate| {
+                    candidate.parent_hi == record.key_hi
+                        && candidate.parent_lo == VFSD_CHECKPOINT_HANDLE_TAG
+                        && candidate.flags & SERVICE_CHECKPOINT_FLAG_TOMBSTONE == 0
+                })
+                .count();
+            if live_children != chunk_count || path_bytes.len() != path_len {
+                return Err(EIO);
+            }
+            let path = str::from_utf8(&path_bytes).map_err(|_| EIO)?.to_string();
+            if !path.starts_with('/') || path_inode(path.as_bytes()) != wire.content_identity {
+                return Err(EIO);
+            }
+            let kind = remote_kind_from_u16(wire.kind).ok_or(EIO)?;
+            if self
+                .handles
+                .insert(
+                    record.key_hi,
+                    RemoteHandle {
+                        kind,
+                        path,
+                        cursor: wire.cursor,
+                        len: wire.len,
+                        refs: u64::from(wire.refs),
+                        status_flags: wire.status_flags,
+                        last_mutation: wire.last_mutation,
+                        last_start: wire.last_start,
+                        last_result: wire.last_result,
+                    },
+                )
+                .is_some()
+            {
+                return Err(EIO);
+            }
+        }
+        Ok(())
+    }
+
+    fn compact_checkpoint_proof(&mut self, proof: ServiceCheckpointRecordWire) -> Result<(), i32> {
+        call_rootd_checkpoint(
+            COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_COMPACT,
+            0,
+            Some(&proof),
+        )?;
+        self.forget_compacted_record(proof);
+        Ok(())
+    }
+
+    fn forget_compacted_record(&mut self, proof: ServiceCheckpointRecordWire) {
+        let parent_key = checkpoint_revision_key(&proof);
+        self.checkpoint_revisions.retain(|key, _| {
+            !(*key == parent_key || (key.0, key.1) == (proof.key_hi, proof.key_lo))
+        });
+        self.checkpoint_operations.retain(|key, _| {
+            !(*key == parent_key || (key.0, key.1) == (proof.key_hi, proof.key_lo))
+        });
+        self.checkpoint_records.retain(|key, _| {
+            !(*key == parent_key || (key.0, key.1) == (proof.key_hi, proof.key_lo))
+        });
     }
 
     fn checkpoint_mutate(
         &mut self,
         request: &VfsIpcRequest,
+        record: ServiceCheckpointRecordWire,
+    ) -> Result<bool, i32> {
+        self.checkpoint_mutate_with_operation(record, request.operation_hi, request.operation_lo)
+    }
+
+    fn checkpoint_mutate_with_operation(
+        &mut self,
         mut record: ServiceCheckpointRecordWire,
+        operation_hi: u64,
+        operation_lo: u64,
     ) -> Result<bool, i32> {
         let key = checkpoint_revision_key(&record);
+        if let Some(current) = self.checkpoint_records.get(&key).copied() {
+            if (current.operation_hi, current.operation_lo) == (operation_hi, operation_lo) {
+                record.revision = current.revision;
+                record.operation_hi = operation_hi;
+                record.operation_lo = operation_lo;
+                return if record == current {
+                    Ok(true)
+                } else {
+                    Err(EIO)
+                };
+            }
+        }
         let current = self.checkpoint_revisions.get(&key).copied().unwrap_or(0);
         record.revision = current.checked_add(1).ok_or(EOVERFLOW)?;
-        record.operation_hi = request.operation_hi;
-        record.operation_lo = request.operation_lo;
+        record.operation_hi = operation_hi;
+        record.operation_lo = operation_lo;
         let response = call_rootd_checkpoint(
             COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE,
             0,
@@ -469,6 +617,7 @@ impl VfsState {
         self.checkpoint_revisions.insert(key, record.revision);
         self.checkpoint_operations
             .insert(key, (record.operation_hi, record.operation_lo));
+        self.checkpoint_records.insert(key, record);
         Ok(response.value1 == 1)
     }
 
@@ -481,12 +630,77 @@ impl VfsState {
             == Some((request.operation_hi, request.operation_lo))
     }
 
+    fn checkpoint_open_description(
+        &mut self,
+        request: &VfsIpcRequest,
+        remote_id: u64,
+        handle: &RemoteHandle,
+    ) -> Result<(), i32> {
+        let path_bytes = handle.path.as_bytes();
+        if path_bytes.is_empty() || path_bytes.len() > VFS_IPC_PATH_CAPACITY {
+            return Err(EINVAL);
+        }
+        let chunk_count = path_bytes.len().div_ceil(SERVICE_CHECKPOINT_VALUE_CAPACITY);
+        let staging = checkpoint_handle_record(
+            remote_id,
+            handle,
+            VFSD_OPEN_MUTATION_STAGING,
+            request.arg0,
+            0,
+        )?;
+        let (operation_hi, operation_lo) = checkpoint_suboperation(request, 0);
+        self.checkpoint_mutate_with_operation(staging, operation_hi, operation_lo)?;
+        for chunk_index in 0..chunk_count {
+            let start = chunk_index * SERVICE_CHECKPOINT_VALUE_CAPACITY;
+            let end = (start + SERVICE_CHECKPOINT_VALUE_CAPACITY).min(path_bytes.len());
+            let record = checkpoint_path_record(remote_id, chunk_index, &path_bytes[start..end])?;
+            let (operation_hi, operation_lo) =
+                checkpoint_suboperation(request, chunk_index as u64 + 1);
+            self.checkpoint_mutate_with_operation(record, operation_hi, operation_lo)?;
+        }
+        let final_record =
+            checkpoint_handle_record(remote_id, handle, VFSD_OPEN_MUTATION_OPEN, request.arg0, 0)?;
+        let (operation_hi, operation_lo) = checkpoint_suboperation(request, chunk_count as u64 + 1);
+        self.checkpoint_mutate_with_operation(final_record, operation_hi, operation_lo)?;
+        Ok(())
+    }
+
+    fn checkpoint_handle_state(
+        &mut self,
+        request: &VfsIpcRequest,
+        remote_id: u64,
+        handle: &RemoteHandle,
+        mutation: u16,
+        last_start: u64,
+        last_result: u64,
+    ) -> Result<bool, i32> {
+        let record =
+            checkpoint_handle_record(remote_id, handle, mutation, last_start, last_result)?;
+        self.checkpoint_mutate(request, record)
+    }
+
+    fn checkpoint_close_description(
+        &mut self,
+        request: &VfsIpcRequest,
+        remote_id: u64,
+    ) -> Result<ServiceCheckpointRecordWire, i32> {
+        let tombstone = checkpoint_handle_tombstone(remote_id)?;
+        self.checkpoint_mutate(request, tombstone)?;
+        let key = checkpoint_revision_key(&tombstone);
+        self.checkpoint_records.get(&key).copied().ok_or(EIO)
+    }
+
     fn invalidate_caches_if_remounted(&mut self) {
         if self.cache_generation != self.mount_generation {
             self.metadata_cache.clear();
             self.dir_entries_cache.clear();
             self.cache_generation = self.mount_generation;
         }
+    }
+
+    fn advance_mount_generation(&mut self) -> Result<(), i32> {
+        self.mount_generation = checked_next_generation(self.mount_generation).ok_or(EOVERFLOW)?;
+        Ok(())
     }
 
     fn handle_linux_request(
@@ -506,11 +720,14 @@ impl VfsState {
             SYSCALL_OFFLOAD_OP_LINUX_GETCWD => self.linux_getcwd(request, &mut response),
             SYSCALL_OFFLOAD_OP_LINUX_CHDIR => self.linux_chdir(request, &mut response),
             SYSCALL_OFFLOAD_OP_LINUX_MKDIR => self.linux_mkdir(request, &mut response),
-            SYSCALL_OFFLOAD_OP_LINUX_OPENAT => self.linux_openat(request, &mut response),
-            SYSCALL_OFFLOAD_OP_LINUX_GETDENTS64 => self.linux_getdents64(request, &mut response),
-            SYSCALL_OFFLOAD_OP_LINUX_CLOSE => self.linux_close(request, &mut response),
-            SYSCALL_OFFLOAD_OP_LINUX_DUP => self.linux_dup(request, &mut response),
-            SYSCALL_OFFLOAD_OP_LINUX_FCNTL => self.linux_fcntl(&mut response),
+            // Stateful fd operations require the versioned VFS IPC request's
+            // operation identity. The retired generic offload envelope has no
+            // such field and cannot provide crash-safe open descriptions.
+            SYSCALL_OFFLOAD_OP_LINUX_OPENAT
+            | SYSCALL_OFFLOAD_OP_LINUX_GETDENTS64
+            | SYSCALL_OFFLOAD_OP_LINUX_CLOSE
+            | SYSCALL_OFFLOAD_OP_LINUX_DUP
+            | SYSCALL_OFFLOAD_OP_LINUX_FCNTL => response.status = EOPNOTSUPP,
             SYSCALL_OFFLOAD_OP_LINUX_MOUNT => self.linux_mount(&mut response),
             SYSCALL_OFFLOAD_OP_LINUX_UMOUNT2 => self.linux_umount2(&mut response),
             SYSCALL_OFFLOAD_OP_LINUX_UNLINKAT => self.linux_unlinkat(request, &mut response),
@@ -600,7 +817,7 @@ impl VfsState {
         match request.op {
             VFS_IPC_OP_OPENAT => self.vfs_openat(request, response),
             VFS_IPC_OP_CLOSE => self.vfs_close(request, response),
-            VFS_IPC_OP_DUP => self.vfs_dup(request, response),
+            VFS_IPC_OP_DUP => response.status = EOPNOTSUPP,
             VFS_IPC_OP_READ => self.vfs_read(request, response, None),
             VFS_IPC_OP_PREAD64 => self.vfs_read(request, response, Some(request.arg0)),
             VFS_IPC_OP_WRITE => {
@@ -613,6 +830,8 @@ impl VfsState {
             }
             VFS_IPC_OP_GETDENTS64 => self.vfs_getdents64(request, response),
             VFS_IPC_OP_FCNTL => self.vfs_fcntl(request, response),
+            VFS_IPC_OP_CURSOR_SETTLE => self.vfs_cursor_settle(request, response),
+            VFS_IPC_OP_CHECKPOINT_ACK => self.vfs_checkpoint_ack(request, response),
             VFS_IPC_OP_STATX => self.vfs_path_statx(request, response),
             VFS_IPC_OP_NEWFSTATAT => self.vfs_path_stat(request, response),
             VFS_IPC_OP_READLINKAT => response.status = ENOENT,
@@ -943,70 +1162,18 @@ impl VfsState {
         response.status = mkdir_policy(path, request.euid);
     }
 
-    fn linux_openat(
-        &mut self,
-        request: &LinuxSyscallOffloadRequest,
-        response: &mut LinuxSyscallOffloadResponse,
-    ) {
-        let Some(path) = linux_request_path(request) else {
-            response.status = EINVAL;
-            return;
-        };
-        match self.open_remote(request.arg3, path, request.flags) {
-            Ok((id, handle)) => {
-                let mut payload = [0_u8; 32];
-                payload[0..8].copy_from_slice(&id.to_le_bytes());
-                payload[8..10].copy_from_slice(&handle_kind_u16(handle.kind).to_le_bytes());
-                payload[16..24].copy_from_slice(&handle.len.to_le_bytes());
-                response.payload_len = payload.len() as u32;
-                response.payload[..payload.len()].copy_from_slice(&payload);
-            }
-            Err(errno) => response.status = errno,
-        }
-    }
-
-    fn linux_getdents64(
-        &mut self,
-        request: &LinuxSyscallOffloadRequest,
-        response: &mut LinuxSyscallOffloadResponse,
-    ) {
-        response.status = self.getdents_payload(
-            request.dirfd,
-            request.arg1 as usize,
-            &mut response.payload,
-            &mut response.payload_len,
-        );
-    }
-
-    fn linux_close(
-        &mut self,
-        request: &LinuxSyscallOffloadRequest,
-        response: &mut LinuxSyscallOffloadResponse,
-    ) {
-        response.status = self.close_remote(request.dirfd);
-    }
-
-    fn linux_dup(
-        &mut self,
-        request: &LinuxSyscallOffloadRequest,
-        response: &mut LinuxSyscallOffloadResponse,
-    ) {
-        response.status = self.dup_remote(request.dirfd);
-    }
-
-    fn linux_fcntl(&mut self, response: &mut LinuxSyscallOffloadResponse) {
-        response.payload_len = size_of::<u64>() as u32;
-        response.payload[..size_of::<u64>()].copy_from_slice(&0_u64.to_le_bytes());
-    }
-
     fn linux_mount(&mut self, response: &mut LinuxSyscallOffloadResponse) {
-        self.mount_generation = self.mount_generation.saturating_add(1);
-        response.status = 0;
+        response.status = match self.advance_mount_generation() {
+            Ok(()) => 0,
+            Err(errno) => errno,
+        };
     }
 
     fn linux_umount2(&mut self, response: &mut LinuxSyscallOffloadResponse) {
-        self.mount_generation = self.mount_generation.saturating_add(1);
-        response.status = 0;
+        response.status = match self.advance_mount_generation() {
+            Ok(()) => 0,
+            Err(errno) => errno,
+        };
     }
 
     fn linux_unlinkat(
@@ -1039,7 +1206,7 @@ impl VfsState {
             };
             resolved_path.as_str()
         };
-        match self.open_remote(request.arg3, path, request.arg0) {
+        match self.open_remote_checkpointed(request, path, request.arg0) {
             Ok((id, handle)) => {
                 response.remote_id = id;
                 response.handle_kind = handle_kind_u16(handle.kind);
@@ -1052,12 +1219,35 @@ impl VfsState {
     }
 
     fn vfs_close(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
-        response.status = self.close_remote(request.remote_id);
-    }
-
-    fn vfs_dup(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
-        response.status = self.dup_remote(request.remote_id);
-        response.remote_id = request.remote_id;
+        let key = checkpoint_handle_key(request.remote_id);
+        let Some(handle) = self.handles.get(&request.remote_id).cloned() else {
+            let Some(record) = self.checkpoint_records.get(&key).copied() else {
+                response.status = EBADF;
+                return;
+            };
+            if record.flags & SERVICE_CHECKPOINT_FLAG_TOMBSTONE != 0 {
+                if (record.operation_hi, record.operation_lo)
+                    != (request.operation_hi, request.operation_lo)
+                {
+                    response.status = EBADF;
+                }
+                return;
+            }
+            if let Err(errno) = self.checkpoint_close_description(request, request.remote_id) {
+                response.status = errno;
+            }
+            return;
+        };
+        if cursor_mutation_prepared(&handle) {
+            response.status = EBUSY;
+            return;
+        }
+        match self.checkpoint_close_description(request, request.remote_id) {
+            Ok(_) => {
+                self.handles.remove(&request.remote_id);
+            }
+            Err(errno) => response.status = errno,
+        }
     }
 
     fn vfs_read(
@@ -1067,7 +1257,7 @@ impl VfsState {
         offset: Option<u64>,
     ) {
         let len = (request.arg1 as usize).min(VFS_IPC_PAYLOAD_CAPACITY);
-        match self.read_remote_into(request.remote_id, offset, len, &mut response.payload) {
+        match self.read_remote_into(request, offset, len, &mut response.payload) {
             Ok(read) => {
                 response.payload_len = read as u32;
                 response.value = read as u64;
@@ -1077,25 +1267,59 @@ impl VfsState {
     }
 
     fn vfs_lseek(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
-        let Some(handle) = self.handles.get_mut(&request.remote_id) else {
+        let Some(handle) = self.handles.get(&request.remote_id).cloned() else {
             response.status = EBADF;
             return;
         };
-        let next = match request.arg1 {
-            SEEK_SET => request.arg0 as i64,
-            SEEK_CUR => handle.cursor as i64 + request.arg0 as i64,
-            SEEK_END => handle.len as i64 + request.arg0 as i64,
-            _ => {
+        if self.checkpoint_operation_replayed(request, checkpoint_handle_key(request.remote_id)) {
+            if handle.last_mutation != VFSD_OPEN_MUTATION_LSEEK
+                || handle.last_start != request.arg0
+                || handle.last_result != request.arg1
+            {
+                response.status = EIO;
+                return;
+            }
+            response.value = handle.cursor;
+            return;
+        }
+        if cursor_mutation_prepared(&handle) {
+            response.status = EBUSY;
+            return;
+        }
+        let next = match checked_seek_position(
+            handle.cursor,
+            handle.len,
+            request.arg0 as i64,
+            request.arg1,
+        ) {
+            Ok(next) => next,
+            Err(SeekPositionError::InvalidWhence | SeekPositionError::Negative) => {
                 response.status = EINVAL;
                 return;
             }
+            Err(SeekPositionError::Overflow) => {
+                response.status = EOVERFLOW;
+                return;
+            }
         };
-        if next < 0 {
-            response.status = EINVAL;
+        let mut candidate = handle;
+        candidate.cursor = next;
+        candidate.last_mutation = VFSD_OPEN_MUTATION_LSEEK;
+        candidate.last_start = request.arg0;
+        candidate.last_result = request.arg1;
+        if let Err(errno) = self.checkpoint_handle_state(
+            request,
+            request.remote_id,
+            &candidate,
+            VFSD_OPEN_MUTATION_LSEEK,
+            request.arg0,
+            request.arg1,
+        ) {
+            response.status = errno;
             return;
         }
-        handle.cursor = next as u64;
-        response.value = handle.cursor;
+        response.value = candidate.cursor;
+        self.handles.insert(request.remote_id, candidate);
     }
 
     fn vfs_fstat(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
@@ -1113,23 +1337,236 @@ impl VfsState {
     }
 
     fn vfs_getdents64(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
-        response.status = self.getdents_payload(
+        let Some(handle) = self.handles.get(&request.remote_id).cloned() else {
+            response.status = EBADF;
+            return;
+        };
+        let requested = (request.arg1 as usize).min(response.payload.len());
+        let replayed =
+            self.checkpoint_operation_replayed(request, checkpoint_handle_key(request.remote_id));
+        if cursor_mutation_prepared(&handle) && !replayed {
+            response.status = EBUSY;
+            return;
+        }
+        let start = if replayed {
+            let (recorded_requested, _) = unpack_u32_pair(handle.last_result);
+            if handle.last_mutation != VFSD_OPEN_MUTATION_GETDENTS
+                || recorded_requested as usize != requested
+            {
+                response.status = EIO;
+                return;
+            }
+            handle.last_start
+        } else {
+            handle.cursor
+        };
+        let start_index = match usize::try_from(start) {
+            Ok(start) => start,
+            Err(_) => {
+                response.status = EOVERFLOW;
+                return;
+            }
+        };
+        let (written, consumed) = match self.render_getdents_payload(
             request.remote_id,
-            request.arg1 as usize,
+            start_index,
+            requested,
             &mut response.payload,
-            &mut response.payload_len,
-        );
-        response.value = response.payload_len as u64;
+        ) {
+            Ok(result) => result,
+            Err(errno) => {
+                response.status = errno;
+                return;
+            }
+        };
+        if replayed {
+            let (_, recorded_consumed) = unpack_u32_pair(handle.last_result);
+            if consumed != recorded_consumed as usize {
+                response.status = EIO;
+                return;
+            }
+        } else {
+            let mut candidate = handle;
+            candidate.cursor = match candidate.cursor.checked_add(consumed as u64) {
+                Some(cursor) => cursor,
+                None => {
+                    response.status = EOVERFLOW;
+                    return;
+                }
+            };
+            candidate.last_mutation = VFSD_OPEN_MUTATION_GETDENTS;
+            candidate.last_start = start;
+            candidate.last_result = match pack_u32_pair(requested, consumed) {
+                Ok(result) => result,
+                Err(errno) => {
+                    response.status = errno;
+                    return;
+                }
+            };
+            if let Err(errno) = self.checkpoint_handle_state(
+                request,
+                request.remote_id,
+                &candidate,
+                VFSD_OPEN_MUTATION_GETDENTS,
+                start,
+                candidate.last_result,
+            ) {
+                response.status = errno;
+                return;
+            }
+            self.handles.insert(request.remote_id, candidate);
+        }
+        response.payload_len = written as u32;
+        response.value = written as u64;
     }
 
     fn vfs_fcntl(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
-        response.status = self.fcntl_remote(request.remote_id, request.arg0, request.arg1);
-        if response.status == 0 {
-            response.value = self
-                .handles
-                .get(&request.remote_id)
-                .map(|handle| handle.status_flags)
-                .unwrap_or(0);
+        const F_SETFL_MUTABLE_MASK: u64 = linux_abi::O_APPEND | linux_abi::O_NONBLOCK;
+        let Some(handle) = self.handles.get(&request.remote_id).cloned() else {
+            response.status = EBADF;
+            return;
+        };
+        if cursor_mutation_prepared(&handle)
+            && !self
+                .checkpoint_operation_replayed(request, checkpoint_handle_key(request.remote_id))
+        {
+            response.status = EBUSY;
+            return;
+        }
+        match request.arg0 {
+            linux_abi::F_GETFL => response.value = handle.status_flags,
+            linux_abi::F_SETFL => {
+                if self.checkpoint_operation_replayed(
+                    request,
+                    checkpoint_handle_key(request.remote_id),
+                ) {
+                    if handle.last_mutation != VFSD_OPEN_MUTATION_FCNTL
+                        || handle.last_start != request.arg0
+                        || handle.last_result != request.arg1
+                    {
+                        response.status = EIO;
+                        return;
+                    }
+                    response.value = handle.status_flags;
+                    return;
+                }
+                let mut candidate = handle;
+                candidate.status_flags = (candidate.status_flags & !F_SETFL_MUTABLE_MASK)
+                    | (request.arg1 & F_SETFL_MUTABLE_MASK);
+                candidate.last_mutation = VFSD_OPEN_MUTATION_FCNTL;
+                candidate.last_start = request.arg0;
+                candidate.last_result = request.arg1;
+                if let Err(errno) = self.checkpoint_handle_state(
+                    request,
+                    request.remote_id,
+                    &candidate,
+                    VFSD_OPEN_MUTATION_FCNTL,
+                    request.arg0,
+                    request.arg1,
+                ) {
+                    response.status = errno;
+                    return;
+                }
+                response.value = candidate.status_flags;
+                self.handles.insert(request.remote_id, candidate);
+            }
+            _ => response.status = EINVAL,
+        }
+    }
+
+    fn vfs_cursor_settle(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
+        let Some(handle) = self.handles.get(&request.remote_id).cloned() else {
+            response.status = EBADF;
+            return;
+        };
+        if self.checkpoint_operation_replayed(request, checkpoint_handle_key(request.remote_id)) {
+            if handle.last_mutation != VFSD_OPEN_MUTATION_STABLE {
+                response.status = EIO;
+            } else {
+                response.value = handle.cursor;
+            }
+            return;
+        }
+        if !cursor_mutation_prepared(&handle)
+            || self
+                .checkpoint_operations
+                .get(&checkpoint_handle_key(request.remote_id))
+                .copied()
+                != Some((request.arg0, request.arg1))
+            || !matches!(
+                request.arg2,
+                VFS_CURSOR_SETTLE_COMMIT | VFS_CURSOR_SETTLE_CANCEL
+            )
+            || request.arg3 != 0
+            || request.path_len != 0
+            || request.payload_len != 0
+        {
+            response.status = EINVAL;
+            return;
+        }
+        let mut candidate = handle;
+        if request.arg2 == VFS_CURSOR_SETTLE_CANCEL {
+            candidate.cursor = candidate.last_start;
+        }
+        candidate.last_mutation = VFSD_OPEN_MUTATION_STABLE;
+        candidate.last_start = 0;
+        candidate.last_result = 0;
+        if let Err(errno) = self.checkpoint_handle_state(
+            request,
+            request.remote_id,
+            &candidate,
+            VFSD_OPEN_MUTATION_STABLE,
+            0,
+            0,
+        ) {
+            response.status = errno;
+            return;
+        }
+        response.value = candidate.cursor;
+        self.handles.insert(request.remote_id, candidate);
+    }
+
+    fn vfs_checkpoint_ack(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
+        let Ok(original_op) = u16::try_from(request.arg2) else {
+            response.status = EINVAL;
+            return;
+        };
+        if (request.arg0 == 0 && request.arg1 == 0)
+            || request.fd != 0
+            || request.path_len != 0
+            || request.payload_len != 0
+            || !matches!(original_op, VFS_IPC_OP_CLOSE | VFS_IPC_OP_POLL_QUERY)
+            || (original_op == VFS_IPC_OP_CLOSE && request.arg3 != 0)
+            || (original_op == VFS_IPC_OP_POLL_QUERY
+                && !matches!(
+                    request.arg3,
+                    VFS_POLL_QUERY_EPOLL_UNREF
+                        | VFS_POLL_QUERY_EPOLL_CTL
+                        | VFS_POLL_QUERY_EPOLL_PURGE_OBJECT
+                ))
+        {
+            response.status = EINVAL;
+            return;
+        }
+        let proofs = self
+            .checkpoint_records
+            .values()
+            .copied()
+            .filter(|record| {
+                record.flags & SERVICE_CHECKPOINT_FLAG_TOMBSTONE != 0
+                    && (record.operation_hi, record.operation_lo) == (request.arg0, request.arg1)
+                    && (original_op != VFS_IPC_OP_CLOSE
+                        || (record.parent_hi == 0
+                            && record.parent_lo == 0
+                            && record.key_hi == request.remote_id
+                            && record.key_lo == VFSD_CHECKPOINT_HANDLE_TAG))
+            })
+            .collect::<Vec<_>>();
+        for proof in proofs {
+            if let Err(errno) = self.compact_checkpoint_proof(proof) {
+                response.status = errno;
+                return;
+            }
         }
     }
 
@@ -1224,13 +1661,17 @@ impl VfsState {
     }
 
     fn linux_mount_vfs(&mut self, response: &mut VfsIpcResponse) {
-        self.mount_generation = self.mount_generation.saturating_add(1);
-        response.status = 0;
+        response.status = match self.advance_mount_generation() {
+            Ok(()) => 0,
+            Err(errno) => errno,
+        };
     }
 
     fn linux_umount_vfs(&mut self, response: &mut VfsIpcResponse) {
-        self.mount_generation = self.mount_generation.saturating_add(1);
-        response.status = 0;
+        response.status = match self.advance_mount_generation() {
+            Ok(()) => 0,
+            Err(errno) => errno,
+        };
     }
 
     fn vfs_unlinkat(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
@@ -1317,15 +1758,39 @@ impl VfsState {
         normalize_absolute_path(base.as_str(), path)
     }
 
-    fn open_remote(
+    fn open_remote_checkpointed(
         &mut self,
-        proposed_id: u64,
+        request: &VfsIpcRequest,
         path: &str,
         flags: u64,
     ) -> Result<(u64, RemoteHandle), i32> {
-        if proposed_id == 0 || self.handles.contains_key(&proposed_id) {
+        let id = request.arg3;
+        if id == 0 {
             return Err(EINVAL);
         }
+        if let Some(handle) = self.handles.get(&id).cloned() {
+            let chunk_count = handle
+                .path
+                .len()
+                .div_ceil(SERVICE_CHECKPOINT_VALUE_CAPACITY);
+            let (operation_hi, operation_lo) =
+                checkpoint_suboperation(request, chunk_count as u64 + 1);
+            let key = checkpoint_handle_key(id);
+            let Some(current) = self.checkpoint_records.get(&key).copied() else {
+                return Err(EIO);
+            };
+            let mut expected =
+                checkpoint_handle_record(id, &handle, VFSD_OPEN_MUTATION_OPEN, flags, 0)?;
+            expected.revision = current.revision;
+            expected.operation_hi = operation_hi;
+            expected.operation_lo = operation_lo;
+            return if current == expected && handle.path == path {
+                Ok((id, handle))
+            } else {
+                Err(EINVAL)
+            };
+        }
+
         let metadata = self.metadata(path)?;
         if flags & O_DIRECTORY != 0 && metadata.kind != RemoteKind::Directory {
             return Err(ENOTDIR);
@@ -1333,8 +1798,6 @@ impl VfsState {
         if flags & (O_CREAT | O_TRUNC) != 0 {
             return Err(EROFS);
         }
-        let id = proposed_id;
-        self.next_handle = self.next_handle.saturating_add(1).max(1);
         let handle = RemoteHandle {
             kind: metadata.kind,
             path: path.to_string(),
@@ -1342,55 +1805,25 @@ impl VfsState {
             len: metadata.len,
             refs: 1,
             status_flags: flags & !linux_abi::O_CLOEXEC,
+            last_mutation: VFSD_OPEN_MUTATION_OPEN,
+            last_start: flags,
+            last_result: 0,
         };
-        self.handles.insert(id, handle.clone());
+        self.checkpoint_open_description(request, id, &handle)?;
+        if self.handles.insert(id, handle.clone()).is_some() {
+            return Err(EIO);
+        }
         Ok((id, handle))
-    }
-
-    fn close_remote(&mut self, id: u64) -> i32 {
-        let Some(handle) = self.handles.get_mut(&id) else {
-            return EBADF;
-        };
-        if handle.refs > 1 {
-            handle.refs -= 1;
-        } else {
-            self.handles.remove(&id);
-        }
-        0
-    }
-
-    fn dup_remote(&mut self, id: u64) -> i32 {
-        let Some(handle) = self.handles.get_mut(&id) else {
-            return EBADF;
-        };
-        handle.refs = handle.refs.saturating_add(1);
-        0
-    }
-
-    fn fcntl_remote(&mut self, id: u64, cmd: u64, arg: u64) -> i32 {
-        const F_SETFL_MUTABLE_MASK: u64 = linux_abi::O_APPEND | linux_abi::O_NONBLOCK;
-
-        let Some(handle) = self.handles.get_mut(&id) else {
-            return EBADF;
-        };
-        match cmd {
-            linux_abi::F_GETFL => 0,
-            linux_abi::F_SETFL => {
-                handle.status_flags =
-                    (handle.status_flags & !F_SETFL_MUTABLE_MASK) | (arg & F_SETFL_MUTABLE_MASK);
-                0
-            }
-            _ => EINVAL,
-        }
     }
 
     fn read_remote_into(
         &mut self,
-        id: u64,
+        request: &VfsIpcRequest,
         offset: Option<u64>,
         len: usize,
         dest: &mut [u8],
     ) -> Result<usize, i32> {
+        let id = request.remote_id;
         let (path, start, file_len) = {
             let handle = self.handles.get(&id).ok_or(EBADF)?;
             if handle.kind == RemoteKind::Device && is_input_device_node(handle.path.as_str()) {
@@ -1405,6 +1838,34 @@ impl VfsState {
                 handle.len,
             )
         };
+        if offset.is_none()
+            && self.checkpoint_operation_replayed(request, checkpoint_handle_key(id))
+        {
+            let handle = self.handles.get(&id).ok_or(EBADF)?;
+            if handle.last_mutation != VFSD_OPEN_MUTATION_READ {
+                return Err(EIO);
+            }
+            let (requested, replay_len) = unpack_u32_pair(handle.last_result);
+            if requested as usize != len
+                || replay_len as usize > len
+                || handle.last_start > file_len
+            {
+                return Err(EIO);
+            }
+            if replay_len == 0 {
+                return Ok(0);
+            }
+            let replay_len = replay_len as usize;
+            let read = self.read_file_slice_into(
+                path.as_str(),
+                handle.last_start,
+                &mut dest[..replay_len],
+            )?;
+            return (read == replay_len).then_some(read).ok_or(EIO);
+        }
+        if offset.is_none() && self.handles.get(&id).is_some_and(cursor_mutation_prepared) {
+            return Err(EBUSY);
+        }
         let available = file_len.saturating_sub(start);
         let len = len.min(available as usize).min(dest.len());
         let read = if len == 0 {
@@ -1413,9 +1874,20 @@ impl VfsState {
             self.read_file_slice_into(path.as_str(), start, &mut dest[..len])?
         };
         if offset.is_none() {
-            if let Some(handle) = self.handles.get_mut(&id) {
-                handle.cursor = handle.cursor.saturating_add(read as u64);
-            }
+            let mut candidate = self.handles.get(&id).cloned().ok_or(EBADF)?;
+            candidate.cursor = candidate.cursor.checked_add(read as u64).ok_or(EOVERFLOW)?;
+            candidate.last_mutation = VFSD_OPEN_MUTATION_READ;
+            candidate.last_start = start;
+            candidate.last_result = pack_u32_pair(len, read)?;
+            self.checkpoint_handle_state(
+                request,
+                id,
+                &candidate,
+                VFSD_OPEN_MUTATION_READ,
+                start,
+                candidate.last_result,
+            )?;
+            self.handles.insert(id, candidate);
         }
         Ok(read)
     }
@@ -1431,28 +1903,28 @@ impl VfsState {
             .map_err(map_fat_error)
     }
 
-    fn getdents_payload(
+    fn render_getdents_payload(
         &mut self,
         id: u64,
+        cursor: usize,
         user_len: usize,
         payload: &mut [u8],
-        payload_len: &mut u32,
-    ) -> i32 {
+    ) -> Result<(usize, usize), i32> {
         if user_len < 24 {
-            return EINVAL;
+            return Err(EINVAL);
         }
-        let (path, cursor) = {
+        let path = {
             let Some(handle) = self.handles.get(&id) else {
-                return EBADF;
+                return Err(EBADF);
             };
             if handle.kind != RemoteKind::Directory {
-                return ENOTDIR;
+                return Err(ENOTDIR);
             }
-            (handle.path.clone(), handle.cursor as usize)
+            handle.path.clone()
         };
         let entries = match self.dir_entries(path.as_str()) {
             Ok(entries) => entries,
-            Err(errno) => return errno,
+            Err(errno) => return Err(errno),
         };
         let mut written = 0usize;
         let mut consumed = 0usize;
@@ -1460,7 +1932,7 @@ impl VfsState {
             let record = encode_dirent(entry, index + 1);
             if written + record.len() > user_len.min(payload.len()) {
                 if written == 0 {
-                    return EINVAL;
+                    return Err(EINVAL);
                 }
                 break;
             }
@@ -1468,11 +1940,7 @@ impl VfsState {
             written += record.len();
             consumed += 1;
         }
-        if let Some(handle) = self.handles.get_mut(&id) {
-            handle.cursor = handle.cursor.saturating_add(consumed as u64);
-        }
-        *payload_len = written as u32;
-        0
+        Ok((written, consumed))
     }
 
     fn metadata(&mut self, path: &str) -> Result<Metadata, i32> {
@@ -1510,7 +1978,13 @@ impl VfsState {
             }),
             Err(err) => Err(map_fat_error(err)),
         };
-        self.metadata_cache.insert(path.to_string(), result);
+        if result.is_ok()
+            || result
+                .as_ref()
+                .is_err_and(|errno| cacheable_metadata_errno(*errno))
+        {
+            self.metadata_cache.insert(path.to_string(), result);
+        }
         result
     }
 
@@ -1616,8 +2090,134 @@ fn checkpoint_revision_key(record: &ServiceCheckpointRecordWire) -> CheckpointRe
     )
 }
 
+fn checkpoint_suboperation(request: &VfsIpcRequest, ordinal: u64) -> (u64, u64) {
+    let mut hi = request.operation_hi ^ 0x5646_5343_484b_0000_u64.rotate_left(ordinal as u32);
+    let mut lo = request
+        .operation_lo
+        .wrapping_add(ordinal.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+    if hi == 0 && lo == 0 {
+        lo = 1;
+    }
+    // Keep both assignments explicit so future wire changes cannot silently
+    // drop half of the base operation identity.
+    hi ^= ordinal.rotate_left(17);
+    if hi == 0 && lo == 0 {
+        lo = 1;
+    }
+    (hi, lo)
+}
+
+fn checkpoint_handle_record(
+    remote_id: u64,
+    handle: &RemoteHandle,
+    last_mutation: u16,
+    last_start: u64,
+    last_result: u64,
+) -> Result<ServiceCheckpointRecordWire, i32> {
+    if remote_id == 0
+        || handle.refs != 1
+        || handle.path.is_empty()
+        || handle.path.len() > VFS_IPC_PATH_CAPACITY
+    {
+        return Err(EINVAL);
+    }
+    let mut record = ServiceCheckpointRecordWire {
+        key_hi: remote_id,
+        key_lo: VFSD_CHECKPOINT_HANDLE_TAG,
+        ..ServiceCheckpointRecordWire::default()
+    };
+    let path_len = u32::try_from(handle.path.len()).map_err(|_| EOVERFLOW)?;
+    let refs = u32::try_from(handle.refs).map_err(|_| EOVERFLOW)?;
+    let wire = OpenDescriptionCheckpointWire {
+        version: VFSD_OPEN_CHECKPOINT_VERSION,
+        kind: handle_kind_u16(handle.kind),
+        last_mutation,
+        reserved0: 0,
+        path_len,
+        refs,
+        cursor: handle.cursor,
+        len: handle.len,
+        status_flags: handle.status_flags,
+        content_identity: path_inode(handle.path.as_bytes()),
+        last_start,
+        last_result,
+    };
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (&wire as *const OpenDescriptionCheckpointWire).cast::<u8>(),
+            size_of::<OpenDescriptionCheckpointWire>(),
+        )
+    };
+    record.value_len = bytes.len() as u32;
+    record.value[..bytes.len()].copy_from_slice(bytes);
+    Ok(record)
+}
+
+fn checkpoint_handle_tombstone(remote_id: u64) -> Result<ServiceCheckpointRecordWire, i32> {
+    if remote_id == 0 {
+        return Err(EINVAL);
+    }
+    Ok(ServiceCheckpointRecordWire {
+        key_hi: remote_id,
+        key_lo: VFSD_CHECKPOINT_HANDLE_TAG,
+        flags: SERVICE_CHECKPOINT_FLAG_TOMBSTONE,
+        ..ServiceCheckpointRecordWire::default()
+    })
+}
+
+fn checkpoint_path_record(
+    remote_id: u64,
+    chunk_index: usize,
+    bytes: &[u8],
+) -> Result<ServiceCheckpointRecordWire, i32> {
+    if bytes.is_empty() || bytes.len() > SERVICE_CHECKPOINT_VALUE_CAPACITY {
+        return Err(EINVAL);
+    }
+    let (key_hi, key_lo) = checkpoint_path_key(remote_id, chunk_index).ok_or(EOVERFLOW)?;
+    let mut record = ServiceCheckpointRecordWire {
+        key_hi,
+        key_lo,
+        parent_hi: remote_id,
+        parent_lo: VFSD_CHECKPOINT_HANDLE_TAG,
+        value_len: bytes.len() as u32,
+        ..ServiceCheckpointRecordWire::default()
+    };
+    record.value[..bytes.len()].copy_from_slice(bytes);
+    Ok(record)
+}
+
+fn remote_kind_from_u16(kind: u16) -> Option<RemoteKind> {
+    match kind {
+        rustos_user_abi::syscall::VFS_IPC_HANDLE_KIND_FILE => Some(RemoteKind::File),
+        rustos_user_abi::syscall::VFS_IPC_HANDLE_KIND_DIR => Some(RemoteKind::Directory),
+        rustos_user_abi::syscall::VFS_IPC_HANDLE_KIND_DEVICE => Some(RemoteKind::Device),
+        _ => None,
+    }
+}
+
+fn pack_u32_pair(first: usize, second: usize) -> Result<u64, i32> {
+    let first = u32::try_from(first).map_err(|_| EOVERFLOW)?;
+    let second = u32::try_from(second).map_err(|_| EOVERFLOW)?;
+    Ok((u64::from(first) << 32) | u64::from(second))
+}
+
+fn unpack_u32_pair(value: u64) -> (u32, u32) {
+    ((value >> 32) as u32, value as u32)
+}
+
+fn cursor_mutation_prepared(handle: &RemoteHandle) -> bool {
+    matches!(
+        handle.last_mutation,
+        VFSD_OPEN_MUTATION_READ | VFSD_OPEN_MUTATION_GETDENTS
+    )
+}
+
 fn checkpoint_epoll_key(token: u64) -> CheckpointRevisionKey {
     (0, 0, token, CHECKPOINT_EPOLL_TAG)
+}
+
+fn checkpoint_handle_key(token: u64) -> CheckpointRevisionKey {
+    (0, 0, token, VFSD_CHECKPOINT_HANDLE_TAG)
 }
 
 fn checkpoint_epoll_record(token: u64, refs: u64, tombstone: bool) -> ServiceCheckpointRecordWire {

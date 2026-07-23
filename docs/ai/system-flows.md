@@ -1,0 +1,103 @@
+# AI Contract — End-to-End System Flows
+
+This is the cross-subsystem contract index. Detailed wire layouts and owner
+rules stay in `contracts-abi.md`; build and proof infrastructure stays in
+`contracts-infra.md`. The executable source of truth for the flows below is
+`formal/system-flows.tsv`, checked by `formal/check-system-flows.sh`.
+
+## Why this layer exists
+
+Local contracts do not prove that their composition is safe. A correct
+exception decoder can still enter an ordinary Rust call on a misaligned stack;
+a correct endpoint registry can still be revoked at the wrong thread lifetime;
+a correct readiness counter can still lose a wake between query and scheduler
+arm; a durable mutation can still be exposed before recovery state is complete.
+Every high-risk flow therefore names:
+
+- a stable requirement and hazard ID;
+- the exact owner of each transition;
+- pre-state, event, and post-state;
+- every success, error, timeout, cancel, revoke, and exit terminal that exists;
+- the maximum blocking interval;
+- one registered formal model, source anchor, and exact source witness.
+
+The checker rejects duplicate IDs, missing graph exits, unbounded timeout
+transitions, unregistered models, absent source/witness mappings, and any
+reintroduced direct `.ko` route. Linux driver modules remain inside the DVM;
+they are not an exception to RustOS kernel/service lifecycle contracts.
+
+## Global composition invariants
+
+1. **One owner and one linearization point.** Each object mutation has one
+   service or kernel-substrate owner. A caller may propose an identity but may
+   not publish, revoke, or reuse it outside the owner transition.
+2. **Process objects outlive worker threads.** Endpoints, channels, open
+   descriptions, and service epochs are process- or service-owned. Non-final
+   thread retirement removes only task-local wait/reply authority. Final
+   process retirement revokes process authority exactly once.
+3. **Every control wait is bounded.** Raw and handle-carrying RustOS IPC calls
+   share the finite 30-second service ceiling. Provider readiness calls are
+   further capped at 16 ms and the remaining application deadline. Timeout
+   cancels the exact reply identity; a late reply cannot revive it.
+4. **Check, register, recheck, arm, presence-check.** A wait may commit sleep
+   only while its exact waiter identity is still installed and every observed
+   service generation/endpoint epoch remains current.
+5. **Restart changes identity.** Endpoint epoch and provider generation advance
+   across revoke/republication. Retained checkpoint state must be replayed and
+   validated before the replacement endpoint becomes discoverable.
+6. **Reference lifetime is descriptor-exact.** `dup` and `fork` retain the same
+   open description; `exec` removes only close-on-exec descriptors; only the
+   final close publishes provider teardown and wait-set purge.
+7. **No Rust exception cleanup before ABI repair.** Every general exception
+   crosses the explicit stack-alignment bridge before any nested ordinary Rust
+   call. A recoverable user fault preserves authority; fatal non-final and
+   final-thread paths have distinct cleanup.
+8. **Failure is an observable terminal, not fabricated success.** Malformed
+   envelopes, stale epochs, exhausted bounds, incomplete replay, and uncertain
+   teardown return a direct error or withdraw authority.
+
+## Registered whole flows
+
+| Flow | Ingress to terminal | Principal owners | Required terminal coverage |
+| --- | --- | --- | --- |
+| `exception-retirement` | CPU exception → alignment bridge → ring/user classification → resume, task retirement, process retirement, or kernel panic | `kernel-hal`, `kernel-executive`, `kernel-ps` | success, error, non-final exit, final exit |
+| `ipc-call` | enqueue → receive → reply, caller deadline, or server exit | `kernel-ipc-runtime`, `kernel-compat` | reply, timeout/cancel, peer revoke |
+| `waitset` | provider query → generation registration → recheck → arm/presence check → wake/recheck | provider service, `kernel-compat`, `kernel-ps` | ready, timeout, signal cancel, provider revoke |
+| `vfs-open-description` | staging checkpoint → path chunks → live open → dup/fork/exec reference transitions → cursor prepare/settle → final tombstone or restart replay | `vfsd`, `rootd`, compat fd table | live, commit, cancel, restart recovery, final close |
+| `endpoint-lifecycle` | create → owner/epoch publication → same-process worker use → non-final or final exit | IPC runtime, compat registry, process table | continued process ownership, final revoke, stale-publication rejection |
+| `service-restart` | observed exit → revoke → bounded backoff → checkpoint rebase → new epoch publication or terminal failure | `rootd`, retained checkpoint owner, compat registry | recovered service or failed supervisor |
+| `boot-volume-read` | exact range validation → bounded broker chunks → physical dispatch | `vfsd`, compat block broker, `kernel/io-manager` | complete, invalid request, timeout, revoke, transport failure |
+| `memory-map` | canonical checked range → page install → W^X protection changes → unmap | compat MM broker, `kernel/mm` | mapped, rejected, unmapped |
+
+## External design baselines
+
+These are comparison inputs, not claims of certification equivalence:
+
+- QNX Neutrino models IPC as explicit channel/connection objects and exposes
+  send-, receive-, and reply-blocked states. Its timeout/unblock and connection
+  death notifications make cancellation and peer loss part of the server
+  contract, while resource managers preserve one open control block through
+  `dup` and release it only on the last close:
+  <https://qnx.com/developers/docs/7.1/com.qnx.doc.neutrino.sys_arch/topic/ipc_Channels.html>,
+  <https://qnx.com/developers/docs/7.1/com.qnx.doc.neutrino.lib_ref/topic/c/channelcreate.html>,
+  <https://qnx.com/developers/docs/7.1/com.qnx.doc.neutrino.resmgr/topic/messages_HANDLING_open.html>.
+- seL4 capDL declares objects and capability distribution independently of the
+  loader and translates the same description into initialization and formal
+  reasoning inputs. RustOS uses this as the baseline for keeping owner,
+  authority, model, source, and witness links machine-readable:
+  <https://docs.sel4.systems/projects/capdl/index.html>.
+- PikeOS and INTEGRITY certification material treats the evaluated
+  configuration, interface documents, security target, partitioning, and
+  verification evidence as a versioned bundle. RustOS does not inherit those
+  assurance levels; the applicable lesson is that prose without traceable
+  source/proof/evidence identity is not an acceptance artifact:
+  <https://www.sysgo.com/common-criteria>,
+  <https://ghs.com/products/safety_critical/integrity_178_safety_critical.html>.
+
+## Change rule
+
+Any change that adds a high-risk cross-owner transition must update
+`system-flows.tsv` in the same change set. Add a new formal model only when no
+existing model owns the transition; otherwise add the exact source witness to
+the existing model. Low-risk local formatting, pure data conversion, and
+bounded leaf helpers do not need a flow row.

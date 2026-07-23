@@ -81,6 +81,11 @@ pub fn set_kernel_stack_top(kernel_stack_top: u64) {
     if kernel_stack_top == 0 {
         return;
     }
+    assert_eq!(
+        kernel_stack_top & 0xF,
+        0,
+        "syscall entry kernel stack top must be 16-byte aligned"
+    );
 
     unsafe {
         SYSCALL_CPU_LOCAL.kernel_stack_top = kernel_stack_top;
