@@ -267,7 +267,7 @@ static int rustos_dvm_dmabuf_open(struct inode *inode, struct file *file)
 	if (!state)
 		return -ENODEV;
 	/*
-	 * DMA-BUF import and the initial black modeset precede the relay-ready
+	 * DMA-BUF import and the local bootstrap modeset precede the relay-ready
 	 * acknowledgement. Requiring an invitation or relay_ready here creates a
 	 * lifecycle cycle in which readiness can never be reached. The module has
 	 * already validated the fixed pool and exports only device-read mappings;

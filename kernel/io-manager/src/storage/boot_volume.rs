@@ -10,9 +10,27 @@ use boot_protocol::{
 use core::ptr;
 use core::sync::atomic::{AtomicPtr, AtomicU8, Ordering};
 use sha2::{Digest, Sha256};
+use spin::Mutex;
 
 static BOOT_INFO_PTR: AtomicPtr<BootInfo> = AtomicPtr::new(ptr::null_mut());
 static BOOTSTRAP_PHASE: AtomicU8 = AtomicU8::new(BootstrapPhase::EarlyBootstrap as u8);
+const VERIFIED_PAYLOAD_CACHE_CAPACITY: usize = 128;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct VerifiedPayloadKey {
+    image_ptr: usize,
+    image_len: usize,
+    payload_offset: usize,
+    payload_len: usize,
+    expected_digest: [u8; 32],
+}
+
+/// Successful digest admission is reusable because the bootloader module is
+/// immutable for the entire boot. The cache is deliberately bounded: a
+/// malformed image cannot turn path probes into unbounded ring0 allocation.
+static VERIFIED_PAYLOADS: Mutex<
+    heapless::Vec<VerifiedPayloadKey, VERIFIED_PAYLOAD_CACHE_CAPACITY>,
+> = Mutex::new(heapless::Vec::new());
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BootstrapImageError {
@@ -42,6 +60,7 @@ impl BootstrapPhase {
 }
 
 pub fn init_boot_info(boot_info_ptr: *const BootInfo) {
+    VERIFIED_PAYLOADS.lock().clear();
     BOOT_INFO_PTR.store(boot_info_ptr.cast_mut(), Ordering::Release);
 }
 
@@ -101,7 +120,7 @@ pub fn read_file_to_vec(path: &str) -> Result<Vec<u8>, BootstrapImageError> {
     let Some(image) = early_system_image_bytes()? else {
         return Err(BootstrapImageError::Unavailable);
     };
-    early_system_payload(image, path)?
+    cached_early_system_payload(image, path)?
         .map(Vec::from)
         .ok_or(BootstrapImageError::NotFound)
 }
@@ -110,7 +129,7 @@ pub fn file_len(path: &str) -> Result<u64, BootstrapImageError> {
     let Some(image) = early_system_image_bytes()? else {
         return Err(BootstrapImageError::Unavailable);
     };
-    let payload = early_system_payload(image, path)?.ok_or(BootstrapImageError::NotFound)?;
+    let payload = cached_early_system_payload(image, path)?.ok_or(BootstrapImageError::NotFound)?;
     u64::try_from(payload.len()).map_err(|_| BootstrapImageError::Invalid)
 }
 
@@ -125,7 +144,7 @@ pub fn read_file_range(
     let Some(image) = early_system_image_bytes()? else {
         return Ok(None);
     };
-    let Some(payload) = early_system_payload(image, path)? else {
+    let Some(payload) = cached_early_system_payload(image, path)? else {
         return Ok(None);
     };
     let offset = usize::try_from(file_offset).map_err(|_| BootstrapImageError::Invalid)?;
@@ -135,6 +154,18 @@ pub fn read_file_range(
     let count = dest.len().min(payload.len() - offset);
     dest[..count].copy_from_slice(&payload[offset..offset + count]);
     Ok(Some(count))
+}
+
+/// Returns one fully admitted immutable early-system payload. The returned
+/// slice remains valid for the bootstrap lifetime and has already passed the
+/// exact entry digest check. Callers that need multiple ranges must retain
+/// this slice for the operation instead of revalidating the complete payload
+/// for every chunk.
+pub fn verified_file_bytes(path: &str) -> Result<Option<&'static [u8]>, BootstrapImageError> {
+    let Some(image) = early_system_image_bytes()? else {
+        return Ok(None);
+    };
+    cached_early_system_payload(image, path)
 }
 
 fn normalized_bootstrap_path(path: &str) -> Option<&str> {
@@ -160,10 +191,63 @@ fn early_system_image_bytes() -> Result<Option<&'static [u8]>, BootstrapImageErr
     }))
 }
 
+#[cfg(test)]
 fn early_system_payload<'a>(
     bytes: &'a [u8],
     path: &str,
 ) -> Result<Option<&'a [u8]>, BootstrapImageError> {
+    let Some((payload, expected_digest, _payload_offset)) =
+        early_system_payload_candidate(bytes, path)?
+    else {
+        return Ok(None);
+    };
+    verify_payload_digest(payload, expected_digest)?;
+    Ok(Some(payload))
+}
+
+fn cached_early_system_payload(
+    bytes: &'static [u8],
+    path: &str,
+) -> Result<Option<&'static [u8]>, BootstrapImageError> {
+    let Some((payload, expected_digest, payload_offset)) =
+        early_system_payload_candidate(bytes, path)?
+    else {
+        return Ok(None);
+    };
+    let key = VerifiedPayloadKey {
+        image_ptr: bytes.as_ptr() as usize,
+        image_len: bytes.len(),
+        payload_offset,
+        payload_len: payload.len(),
+        expected_digest,
+    };
+    if VERIFIED_PAYLOADS.lock().contains(&key) {
+        return Ok(Some(payload));
+    }
+
+    verify_payload_digest(payload, expected_digest)?;
+    let mut verified = VERIFIED_PAYLOADS.lock();
+    if !verified.contains(&key) {
+        let _ = verified.push(key);
+    }
+    Ok(Some(payload))
+}
+
+fn verify_payload_digest(
+    payload: &[u8],
+    expected_digest: [u8; 32],
+) -> Result<(), BootstrapImageError> {
+    let digest: [u8; 32] = Sha256::digest(payload).into();
+    if digest != expected_digest {
+        return Err(BootstrapImageError::Invalid);
+    }
+    Ok(())
+}
+
+fn early_system_payload_candidate<'a>(
+    bytes: &'a [u8],
+    path: &str,
+) -> Result<Option<(&'a [u8], [u8; 32], usize)>, BootstrapImageError> {
     let Some(path) = normalized_bootstrap_path(path) else {
         return Ok(None);
     };
@@ -222,11 +306,7 @@ fn early_system_payload<'a>(
     let start = usize::try_from(start).map_err(|_| BootstrapImageError::Invalid)?;
     let end = usize::try_from(end).map_err(|_| BootstrapImageError::Invalid)?;
     let payload = bytes.get(start..end).ok_or(BootstrapImageError::Invalid)?;
-    let digest: [u8; 32] = Sha256::digest(payload).into();
-    if digest != expected_digest {
-        return Err(BootstrapImageError::Invalid);
-    }
-    Ok(Some(payload))
+    Ok(Some((payload, expected_digest, start)))
 }
 
 fn boot_info() -> Option<&'static BootInfo> {

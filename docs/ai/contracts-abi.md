@@ -659,6 +659,18 @@ policy remains with the owning service.
   and the fixed bootstrap closure without racing storage-DVM readiness; all
   non-entry paths continue to the service-owned DVM volume and an invalid
   early-system image fails closed instead of becoming a false `ENOENT`.
+- On the read-only DVM root volume, vfsd may materialize a complete bounded
+  file once per mount generation and serve later `pread`/mapping windows from
+  that service-owned snapshot. Per-entry and aggregate byte ceilings are
+  mandatory; oversized files fall back to bounded range reads, remount clears
+  every cached byte, and enabling mutation requires explicit path/generation
+  invalidation before this optimization remains legal.
+- Per-file digest admission is bound to the immutable module identity, exact
+  payload range, length, and expected digest. A successful proof may be reused
+  for later bounded reads and process mappings during that boot; the cache is
+  cleared if boot identity is initialized again and is strictly bounded.
+  Reuse must never skip table/range/path validation, admit mutable DVM bytes,
+  or turn a failed digest into a cached result.
 - Early-system ownership is resolved before applying the broker's 4-KiB
   transfer bound. A non-owned path returns to the DVM volume even when the
   caller supplied a larger VFS buffer; an owned immutable entry is read in

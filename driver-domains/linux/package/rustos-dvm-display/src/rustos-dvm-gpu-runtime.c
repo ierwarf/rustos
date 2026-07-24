@@ -889,12 +889,20 @@ fail:
     return -1;
 }
 
-int rustos_gpu_runtime_render_prime(struct rustos_gpu_runtime *runtime,
-                                    struct rustos_gpu_frame *frame) {
+int rustos_gpu_runtime_render_bootstrap(struct rustos_gpu_runtime *runtime,
+                                        struct rustos_gpu_frame *frame) {
     uint8_t *pixels;
     size_t atlas_bytes;
+    uint32_t y;
     if (runtime == NULL || frame == NULL) {
         errno = EINVAL;
+        return -1;
+    }
+    if (runtime->output_width == 0U || runtime->output_height == 0U ||
+        runtime->output_width > runtime->atlas_width ||
+        runtime->output_height > runtime->atlas_height ||
+        (uint64_t)runtime->output_width * 4U > runtime->atlas_stride_bytes) {
+        errno = EPROTO;
         return -1;
     }
     atlas_bytes = (size_t)runtime->atlas_stride_bytes * runtime->atlas_height;
@@ -906,15 +914,42 @@ int rustos_gpu_runtime_render_prime(struct rustos_gpu_runtime *runtime,
     pixels = calloc(1U, atlas_bytes);
     if (pixels == NULL)
         return -1;
+    /*
+     * This is a DVM-owned lifecycle frame, not application content and not a
+     * readiness claim. Keep it visibly non-black so an operator can
+     * distinguish a progressing boot from a dead scanout, while never
+     * sampling RustOS-owned DMA-BUF pixels before the first validated release.
+     */
+    for (y = 0U; y < runtime->output_height; y++) {
+        uint8_t *row = pixels + (size_t)y * runtime->atlas_stride_bytes;
+        uint32_t x;
+        const uint8_t shade =
+            (uint8_t)(((uint64_t)y * 24U) / runtime->output_height);
+        for (x = 0U; x < runtime->output_width; x++) {
+            uint8_t *pixel = row + (size_t)x * 4U;
+            pixel[0] = (uint8_t)(38U + shade);
+            pixel[1] = (uint8_t)(24U + shade / 2U);
+            pixel[2] = (uint8_t)(12U + shade / 3U);
+            pixel[3] = UINT8_MAX;
+            if (x >= runtime->output_width * 3U / 8U &&
+                x < runtime->output_width * 5U / 8U &&
+                y >= runtime->output_height * 31U / 64U &&
+                y < runtime->output_height * 33U / 64U) {
+                pixel[0] = 245U;
+                pixel[1] = 176U;
+                pixel[2] = 56U;
+            }
+        }
+    }
     memset(frame, 0, sizeof(*frame));
     frame->in_fence_fd = -1;
     frame->budget_us = RUSTOS_GPU_PIPELINE_PRIME_BUDGET_US;
     runtime->stage = "gpu-prime-workload-clock";
     if (monotonic_ns(&frame->render_started_ns) != 0)
         goto fail;
-    /* Prime must not sample RustOS-owned DMA-BUF pixels before the first
+    /* Bootstrap must not sample RustOS-owned DMA-BUF pixels before the first
      * validated producer release. Exercise the GPU/KMS pipeline with the
-     * private zero-filled texture; the first real frame proves DMA-BUF use. */
+     * private lifecycle texture; the first real frame proves DMA-BUF use. */
     runtime->stage = "gpu-prime-internal-source";
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, runtime->source_texture);

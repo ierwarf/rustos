@@ -150,6 +150,10 @@ or launch policy.
 - `runtimed` spawns uiserver suspended, admits its rootd lease, activates it,
   and waits for the exact PID's display-policy endpoint before committing the
   tracked process.
+- `initd` admits `runtimed` as display-critical interactive work. Synchronous
+  IPC donation therefore carries the UI bootstrap priority through
+  `loaderd`, `syscalld`, and `procd`; background service traffic must not leave
+  a valid DVM scanout stuck indefinitely on its local bootstrap frame.
 
 ## Kernel API
 
@@ -401,8 +405,10 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
   require or trust stale firmware modeset state.
   The exporter device is explicitly root-only and may open before a host
   invitation so the relay can import all three read-only slots and complete an
-  initial modeset using only its private zero-filled texture. It never samples
-  a RustOS source before the first exact acquire `sync_file`. Host
+  initial modeset using only its private, visibly non-black lifecycle texture.
+  That frame communicates boot progress but grants no readiness authority and
+  is atomically replaced by the first admitted RustOS PRESENT. The relay never
+  samples a RustOS source before the first exact acquire `sync_file`. Host
   control/readiness authority is still granted
   only after those steps and an exact published invitation; requiring
   readiness at exporter open would create an impossible lifecycle cycle.

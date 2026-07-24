@@ -77,6 +77,12 @@ use util::{
     write_payload_bytes, write_vfs_payload_bytes,
 };
 
+/// Read-only DVM files are materialized once so repeated pread/mmap windows do
+/// not reopen FAT and rescan the cluster chain. Both limits are service-owned
+/// policy; exceeding either limit falls back to bounded range reads.
+const FILE_BYTES_CACHE_MAX_ENTRY_BYTES: usize = 16 * 1024 * 1024;
+const FILE_BYTES_CACHE_BUDGET_BYTES: usize = 32 * 1024 * 1024;
+
 // Linux errno constants (x86_64)
 pub(crate) const ENOENT: i32 = 2;
 pub(crate) const EIO: i32 = 5;
@@ -317,6 +323,11 @@ struct VfsState {
     /// re-reads `/`, `/dev`, library directories, etc.; FAT traversal per call
     /// is expensive enough to dominate boot time when libc walks PATH.
     dir_entries_cache: BTreeMap<String, Vec<DirEntry>>,
+    /// Complete bytes for bounded read-only files on the current mount
+    /// generation. Persistent mutation is not implemented by vfsd, and every
+    /// remount invalidates this cache before the replacement volume is used.
+    file_bytes_cache: BTreeMap<String, Vec<u8>>,
+    file_bytes_cache_bytes: usize,
     epolls: WaitSetRegistry,
     checkpoint_revisions: BTreeMap<CheckpointRevisionKey, u64>,
     checkpoint_operations: BTreeMap<CheckpointRevisionKey, (u64, u64)>,
@@ -362,6 +373,8 @@ impl VfsState {
             handles: BTreeMap::new(),
             metadata_cache: BTreeMap::new(),
             dir_entries_cache: BTreeMap::new(),
+            file_bytes_cache: BTreeMap::new(),
+            file_bytes_cache_bytes: 0,
             epolls: WaitSetRegistry::default(),
             checkpoint_revisions: BTreeMap::new(),
             checkpoint_operations: BTreeMap::new(),
@@ -694,6 +707,8 @@ impl VfsState {
         if self.cache_generation != self.mount_generation {
             self.metadata_cache.clear();
             self.dir_entries_cache.clear();
+            self.file_bytes_cache.clear();
+            self.file_bytes_cache_bytes = 0;
             self.cache_generation = self.mount_generation;
         }
     }
@@ -1914,10 +1929,43 @@ impl VfsState {
     ) -> Result<usize, i32> {
         match early_system::read(path, start, dest)? {
             Some(read) => Ok(read),
-            None => self
-                .volume()?
-                .read_file_range_into(path, start, dest)
-                .map_err(map_fat_error),
+            None => {
+                self.invalidate_caches_if_remounted();
+                if let Some(bytes) = self.file_bytes_cache.get(path) {
+                    return Ok(copy_file_cache_range(bytes, start, dest));
+                }
+
+                let file_len = self.metadata(path)?.len;
+                let cacheable_len = usize::try_from(file_len).ok().filter(|len| {
+                    *len <= FILE_BYTES_CACHE_MAX_ENTRY_BYTES
+                        && *len <= FILE_BYTES_CACHE_BUDGET_BYTES
+                });
+                if let Some(expected_len) = cacheable_len {
+                    let bytes = self
+                        .volume()?
+                        .read_file_to_vec(path)
+                        .map_err(map_fat_error)?;
+                    if bytes.len() != expected_len {
+                        return Err(EIO);
+                    }
+                    let read = copy_file_cache_range(&bytes, start, dest);
+                    if self
+                        .file_bytes_cache_bytes
+                        .checked_add(bytes.len())
+                        .is_none_or(|total| total > FILE_BYTES_CACHE_BUDGET_BYTES)
+                    {
+                        self.file_bytes_cache.clear();
+                        self.file_bytes_cache_bytes = 0;
+                    }
+                    self.file_bytes_cache_bytes += bytes.len();
+                    self.file_bytes_cache.insert(path.to_string(), bytes);
+                    return Ok(read);
+                }
+
+                self.volume()?
+                    .read_file_range_into(path, start, dest)
+                    .map_err(map_fat_error)
+            }
         }
     }
 
@@ -2065,6 +2113,18 @@ impl VfsState {
         }
         Ok(self.volume.as_ref().expect("volume initialized"))
     }
+}
+
+fn copy_file_cache_range(bytes: &[u8], start: u64, dest: &mut [u8]) -> usize {
+    let Ok(start) = usize::try_from(start) else {
+        return 0;
+    };
+    let Some(source) = bytes.get(start..) else {
+        return 0;
+    };
+    let count = source.len().min(dest.len());
+    dest[..count].copy_from_slice(&source[..count]);
+    count
 }
 
 fn call_rootd_checkpoint(
@@ -2580,6 +2640,18 @@ mod tests {
             normalize_absolute_path("/usr/lib", "../bin/app").unwrap(),
             "/usr/bin/app"
         );
+    }
+
+    #[test]
+    fn cached_file_ranges_are_exact_and_eof_bounded() {
+        let bytes = b"0123456789";
+        let mut out = [0xaa; 4];
+        assert_eq!(copy_file_cache_range(bytes, 3, &mut out), 4);
+        assert_eq!(&out, b"3456");
+        assert_eq!(copy_file_cache_range(bytes, 9, &mut out), 1);
+        assert_eq!(out[0], b'9');
+        assert_eq!(copy_file_cache_range(bytes, 10, &mut out), 0);
+        assert_eq!(copy_file_cache_range(bytes, u64::MAX, &mut out), 0);
     }
 }
 // RING3-MIGRATION-REFERENCE END: vfsd ring3-owned VFS policy.

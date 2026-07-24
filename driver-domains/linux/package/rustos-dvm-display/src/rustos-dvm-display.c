@@ -1653,7 +1653,7 @@ static int open_gpu_kms_display(const struct shared_display *shared,
                                 struct rustos_gpu_runtime **runtime_out,
                                 uint64_t *prime_duration_ns,
                                 int *prime_present_fence) {
-    struct rustos_gpu_frame black;
+    struct rustos_gpu_frame bootstrap;
     int source_fds[GPU_ATLAS_SLOT_COUNT] = {-1, -1, -1};
     uint64_t prime_started_ns;
     uint64_t prime_completed_ns;
@@ -1743,8 +1743,8 @@ static int open_gpu_kms_display(const struct shared_display *shared,
         }
         display->source_exporter_fd = exporter;
     }
-    display->setup_stage = "gpu-initial-black";
-    if (rustos_gpu_runtime_render_prime(*runtime_out, &black) != 0) {
+    display->setup_stage = "gpu-initial-bootstrap";
+    if (rustos_gpu_runtime_render_bootstrap(*runtime_out, &bootstrap) != 0) {
         saved = errno == 0 ? EIO : errno;
         display->setup_stage = rustos_gpu_runtime_stage(*runtime_out);
         rustos_gpu_runtime_close(*runtime_out);
@@ -1752,7 +1752,7 @@ static int open_gpu_kms_display(const struct shared_display *shared,
         errno = saved;
         goto fail;
     }
-    if (atomic_gpu_initial_modeset(display, *runtime_out, &black,
+    if (atomic_gpu_initial_modeset(display, *runtime_out, &bootstrap,
                                    prime_present_fence) != 0) {
         saved = errno == 0 ? EIO : errno;
         rustos_gpu_runtime_close(*runtime_out);
@@ -2145,7 +2145,7 @@ static int serve_gpu_display(struct shared_display *shared) {
         return -1;
     }
     relay_log("rustos-dvm-display: gpu-compositor primed contract=3 driver=%s renderer=%s "
-              "source-path=%s zero-copy=%u explicit-fence=1 public-abi=0 prime_us=%llu prime-present=%s\n",
+              "source-path=%s zero-copy=%u explicit-fence=1 public-abi=0 bootstrap=local-nonblack prime_us=%llu prime-present=%s\n",
               rustos_gpu_runtime_driver(runtime), rustos_gpu_runtime_renderer(runtime),
               dmabuf_sources ? "dmabuf" : "staged-copy", dmabuf_sources ? 1U : 0U,
               (unsigned long long)((prime_duration_ns + 999U) / 1000U),

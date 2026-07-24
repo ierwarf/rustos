@@ -1006,9 +1006,22 @@ fn map_elf_segments_fd(
     map_interpreter: bool,
 ) -> Result<ElfMapResult, i32> {
     let mut header = [0_u8; ELF_HEADER_SIZE];
+    debug_line(&format!(
+        "loaderd: elf map header begin handle={prepare_handle}"
+    ));
     read_exact_at(fd, 0, &mut header)?;
+    debug_line(&format!(
+        "loaderd: elf map header done handle={prepare_handle}"
+    ));
     let phdrs = read_program_headers(fd, &header)?;
+    debug_line(&format!(
+        "loaderd: elf map phdrs done handle={prepare_handle} bytes={}",
+        phdrs.len()
+    ));
     let load_bias = validate_elf_fd(fd, &header, &phdrs, dyn_load_offset)?;
+    debug_line(&format!(
+        "loaderd: elf map validation done handle={prepare_handle}"
+    ));
     let _phoff = read_u64(&header, 32);
     let e_entry = read_u64(&header, 24);
     let phentsize = read_u16(&header, 54) as u64;
@@ -1052,6 +1065,9 @@ fn map_elf_segments_fd(
         }
     }
     flush_elf_file_map_batch(prepare_handle, &mut file_maps)?;
+    debug_line(&format!(
+        "loaderd: elf main mappings done handle={prepare_handle}"
+    ));
 
     max_loaded_end = align_up(max_loaded_end, 4096)?;
 
@@ -1194,6 +1210,10 @@ fn flush_elf_file_map_batch(
     file_maps: &mut Vec<RustosProcMapFileBatchEntry>,
 ) -> Result<(), i32> {
     for chunk in file_maps.chunks(PROC_BROKER_BATCH_CAPACITY) {
+        debug_line(&format!(
+            "loaderd: elf file-map batch begin handle={prepare_handle} count={}",
+            chunk.len()
+        ));
         let mut args = RustosProcMapFileBatchBrokerArgs {
             prepare_handle,
             count: chunk.len() as u32,
@@ -1208,6 +1228,10 @@ fn flush_elf_file_map_batch(
             file_maps.clear();
             return Err((-status) as i32);
         }
+        debug_line(&format!(
+            "loaderd: elf file-map batch done handle={prepare_handle} count={}",
+            chunk.len()
+        ));
     }
     file_maps.clear();
     Ok(())

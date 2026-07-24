@@ -1408,6 +1408,21 @@ fn copy_file_into_address_space(
     file_len: u64,
 ) -> Result<(), i64> {
     let total = usize::try_from(file_len).map_err(|_| LINUX_EOVERFLOW)?;
+    if let PinnedFileBacking::Remote { path, .. } = backing {
+        match kernel_io_manager::api::block::verified_bootstrap_file_bytes(path) {
+            Ok(Some(payload)) => {
+                let start = usize::try_from(file_offset).map_err(|_| LINUX_EOVERFLOW)?;
+                let end = start.checked_add(total).ok_or(LINUX_EOVERFLOW)?;
+                let bytes = payload.get(start..end).ok_or(LINUX_EIO)?;
+                address_space
+                    .initialize_user_bytes(VirtAddr::new(target_addr), bytes)
+                    .map_err(address_space_error_to_linux_errno)?;
+                return Ok(());
+            }
+            Ok(None) => {}
+            Err(_) => return Err(LINUX_EIO),
+        }
+    }
     let mut chunk = alloc::vec![0_u8; FILE_COPY_CHUNK.min(total.max(1))];
     let mut copied = 0usize;
     while copied < total {

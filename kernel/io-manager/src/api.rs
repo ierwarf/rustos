@@ -121,6 +121,12 @@ pub mod block {
         crate::storage::boot_volume::read_file_range(path, offset, out)
     }
 
+    pub fn verified_bootstrap_file_bytes(
+        path: &str,
+    ) -> Result<Option<&'static [u8]>, crate::storage::boot_volume::BootstrapImageError> {
+        crate::storage::boot_volume::verified_file_bytes(path)
+    }
+
     pub fn bootstrap_file_len(
         path: &str,
     ) -> Result<u64, crate::storage::boot_volume::BootstrapImageError> {

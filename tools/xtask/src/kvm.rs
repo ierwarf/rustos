@@ -63,6 +63,7 @@ const DVM_KEYBOARD_INGRESS_MARKER: &str = "inputd: DVM keyboard ingress observed
 const DVM_POINTER_INGRESS_MARKER: &str = "inputd: DVM pointer ingress observed";
 const DVM_GPU_COMPOSITOR_MARKER: &str = "rustos-dvm-gpu: ready contract=1";
 const DVM_GPU_LIVE_MARKER: &str = "rustos-dvm-display: gpu-compositor primed contract=3";
+const DVM_BOOTSTRAP_FRAME_MARKER: &str = "bootstrap=local-nonblack";
 const RUSTOS_DVM_BLOCK_MARKER: &str = "dvm-block: transport installed generation=1";
 const RUSTOS_DVM_BLOCK_FIRST_COMPLETION_MARKER: &str = "dvm-block: first completion observed";
 const RUSTOS_DVM_BLOCK_E2E_MARKER: &str = "storaged: dvm-block e2e flush completed generation=1";
@@ -466,6 +467,7 @@ pub(crate) fn kvm_run_command(config: &Config, build_image: bool) -> Result<()> 
         expected_dvm_markers: vec![
             DVM_GPU_COMPOSITOR_MARKER.to_owned(),
             DVM_GPU_LIVE_MARKER.to_owned(),
+            DVM_BOOTSTRAP_FRAME_MARKER.to_owned(),
             DVM_BLOCK_READY_MARKER.to_owned(),
         ],
     };
@@ -881,6 +883,9 @@ where
         options
             .expected_dvm_markers
             .push(DVM_GPU_LIVE_MARKER.to_owned());
+        options
+            .expected_dvm_markers
+            .push(DVM_BOOTSTRAP_FRAME_MARKER.to_owned());
     }
     if options.dvm_block_shmem {
         options
@@ -3922,11 +3927,12 @@ fn stop_guest(guest: &mut Child) {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_UI_FPS_ACTIVE_WINDOWS, DVM_BLOCK_READY_MARKER, DVM_CONTROL_AUTHENTICATION,
-        DVM_CONTROL_CAPABILITIES, DVM_CONTROL_PROTOCOL, DVM_CONTROL_STATE, DVM_CONTROL_TRANSPORT,
-        DVM_DISPLAY_REGION_BYTES, DVM_GPU_COMPOSITOR_MARKER, DVM_KEYBOARD_INGRESS_MARKER,
-        DVM_POINTER_INGRESS_MARKER, DvmNetworkCounters, GuestDisplay, PHYSICAL_GPU_PROFILES,
-        RUSTOS_BOOT_MARKER, RUSTOS_DVM_BLOCK_E2E_MARKER, RUSTOS_DVM_BLOCK_FIRST_COMPLETION_MARKER,
+        DEFAULT_UI_FPS_ACTIVE_WINDOWS, DVM_BLOCK_READY_MARKER, DVM_BOOTSTRAP_FRAME_MARKER,
+        DVM_CONTROL_AUTHENTICATION, DVM_CONTROL_CAPABILITIES, DVM_CONTROL_PROTOCOL,
+        DVM_CONTROL_STATE, DVM_CONTROL_TRANSPORT, DVM_DISPLAY_REGION_BYTES,
+        DVM_GPU_COMPOSITOR_MARKER, DVM_KEYBOARD_INGRESS_MARKER, DVM_POINTER_INGRESS_MARKER,
+        DvmNetworkCounters, GuestDisplay, PHYSICAL_GPU_PROFILES, RUSTOS_BOOT_MARKER,
+        RUSTOS_DVM_BLOCK_E2E_MARKER, RUSTOS_DVM_BLOCK_FIRST_COMPLETION_MARKER,
         RUSTOS_DVM_BLOCK_FLUSH_FAULT_MARKER, RUSTOS_DVM_BLOCK_MARKER,
         RUSTOS_GPU_SCENE_COMPILER_MARKER, RUSTOS_INIT_IDENTITY_MARKER,
         RUSTOS_POST_INIT_PROVENANCE_MARKER, VIRTUAL_GPU_EVIDENCE, WayclickProfileObservation,
@@ -4030,6 +4036,11 @@ mod tests {
     fn dvm_display_mode_requires_the_observed_display_contract() {
         let options = parse_smoke_options(vec!["--gui-dvm-surfaces".into()].into_iter()).unwrap();
         assert!(options.gui_dvm_surfaces);
+        assert!(
+            options
+                .expected_dvm_markers
+                .contains(&DVM_BOOTSTRAP_FRAME_MARKER.to_owned())
+        );
         assert!(dvm_display_provider_ready(
             "[INFO ] service=uiserver uiserver: display_get_info attempt=1 width=1600 height=900 stride=7168 bpp=4 fmt=1 flags=0xe gen=1"
         ));

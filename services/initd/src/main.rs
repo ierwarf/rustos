@@ -1066,7 +1066,7 @@ fn exec_weight_micros(exec_path: &str) -> u64 {
     match exec_path {
         NETD_EXEC_PATH | DEVMGRD_EXEC_PATH => EARLY_POLICY_TASK_WEIGHT_MICROS,
         INPUTD_EXEC_PATH => TASK_WEIGHT_INTERACTIVE_FLAG | DISPLAY_CRITICAL_TASK_WEIGHT_MICROS,
-        RUNTIMED_EXEC_PATH => DISPLAY_CRITICAL_TASK_WEIGHT_MICROS,
+        RUNTIMED_EXEC_PATH => TASK_WEIGHT_INTERACTIVE_FLAG | DISPLAY_CRITICAL_TASK_WEIGHT_MICROS,
         _ => DEFAULT_INIT_TASK_WEIGHT_MICROS,
     }
 }
@@ -1092,7 +1092,10 @@ fn boot_line(message: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_service_ready_status, cleanup_spawned_service};
+    use super::{
+        classify_service_ready_status, cleanup_spawned_service, exec_weight_micros,
+        RUNTIMED_EXEC_PATH, TASK_WEIGHT_INTERACTIVE_FLAG,
+    };
 
     #[test]
     fn failed_service_cleanup_accepts_only_exact_retirement_or_esrch() {
@@ -1111,6 +1114,14 @@ mod tests {
             Err(libc::EPERM)
         );
         assert_eq!(cleanup_spawned_service(0, |_| Ok(())), Err(libc::EINVAL));
+    }
+
+    #[test]
+    fn runtimed_bootstrap_donates_interactive_priority_to_the_loader_chain() {
+        assert_ne!(
+            exec_weight_micros(RUNTIMED_EXEC_PATH) & TASK_WEIGHT_INTERACTIVE_FLAG,
+            0
+        );
     }
 
     #[test]
