@@ -783,6 +783,13 @@ policy remains with the owning service.
   Storaged retries INFO behind that atomic waiter for at most 15 seconds in
   one-second slices. Withdrawal after a successful observation is revoke, and
   timeout never selects early-system or a physical-controller fallback.
+- Vfsd treats the storaged block-info response and on-disk FAT image as
+  separate untrusted admissions. Response generation and capacity must bind
+  the exact envelope; logical sectors are one of 512, 1024, 2048, or 4096
+  bytes; physical alignment, flags, reserved fields, and total byte-length
+  multiplication are checked before allocation. `storage-fat` snapshots that
+  geometry and rejects a zero, unsupported, or overflowing device before
+  parsing its boot sector. A malformed image never publishes a mounted volume.
 - Common PCI resource discovery disables command decoding, probes and restores
   each standard BAR dword independently, and restores the low half of a 64-bit
   BAR before touching its high partner. Resource size is the least significant

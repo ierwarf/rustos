@@ -15,6 +15,7 @@ use storage_core::{BlockDevice, BlockSlice, IoResult, StorageError};
 
 pub type FatError = fatfs::Error<StorageError>;
 const FILE_READ_CHUNK_CAP: usize = 256 * 1024;
+const FAT_LOGICAL_BLOCK_SIZES: [usize; 4] = [512, 1024, 2048, 4096];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FatNodeKind {
@@ -39,19 +40,28 @@ pub struct FatDisk<D: BlockDevice> {
     dev: D,
     pos: u64,
     block_size: usize,
+    bytes_len: u64,
     scratch: Vec<u8>,
 }
 
 impl<D: BlockDevice> FatDisk<D> {
-    pub fn new(dev: D) -> Self {
+    pub fn new(dev: D) -> IoResult<Self> {
         let block_size = dev.logical_block_size();
+        let block_count = dev.block_count();
+        if !FAT_LOGICAL_BLOCK_SIZES.contains(&block_size) || block_count == 0 {
+            return Err(StorageError::InvalidInput);
+        }
+        let bytes_len = block_count
+            .checked_mul(block_size as u64)
+            .ok_or(StorageError::InvalidInput)?;
         let scratch = vec![0; block_size];
-        Self {
+        Ok(Self {
             dev,
             pos: 0,
             block_size,
+            bytes_len,
             scratch,
-        }
+        })
     }
 
     pub fn into_inner(self) -> D {
@@ -59,9 +69,7 @@ impl<D: BlockDevice> FatDisk<D> {
     }
 
     fn bytes_len(&self) -> u64 {
-        self.dev
-            .block_count()
-            .saturating_mul(self.block_size as u64)
+        self.bytes_len
     }
 
     fn ensure_in_range(&self, pos: u64) -> IoResult<()> {
@@ -195,7 +203,8 @@ pub struct FatFile<'a, D: BlockDevice>(InnerFile<'a, D>);
 
 impl<D: BlockDevice> FatVolume<D> {
     pub fn new(device: D) -> Result<Self, FatError> {
-        Self::from_disk(FatDisk::new(device))
+        let disk = FatDisk::new(device).map_err(fatfs::Error::Io)?;
+        Self::from_disk(disk)
     }
 
     pub fn from_disk(disk: FatDisk<D>) -> Result<Self, FatError> {
@@ -486,9 +495,32 @@ mod tests {
     use super::*;
     use storage_core::MemBlockDevice;
 
+    struct GeometryOnlyDevice {
+        block_size: usize,
+        block_count: u64,
+    }
+
+    impl BlockDevice for GeometryOnlyDevice {
+        fn logical_block_size(&self) -> usize {
+            self.block_size
+        }
+
+        fn block_count(&self) -> u64 {
+            self.block_count
+        }
+
+        fn read_blocks(&mut self, _lba: u64, _out: &mut [u8]) -> IoResult<()> {
+            Err(StorageError::NotPresent)
+        }
+
+        fn write_blocks(&mut self, _lba: u64, _input: &[u8]) -> IoResult<()> {
+            Err(StorageError::NotPresent)
+        }
+    }
+
     fn format_disk(block_size: usize, block_count: u64, volume_id: u32) -> MemBlockDevice {
         let mut disk = MemBlockDevice::new_zeroed(block_size, block_count);
-        let mut formatter = FatDisk::new(disk);
+        let mut formatter = FatDisk::new(disk).expect("valid FAT disk geometry");
         fatfs::format_volume(
             &mut formatter,
             fatfs::FormatVolumeOptions::new()
@@ -498,6 +530,32 @@ mod tests {
         .expect("format FAT volume");
         disk = formatter.into_inner();
         disk
+    }
+
+    #[test]
+    fn fat_disk_rejects_untrusted_or_overflowing_geometry_before_allocation() {
+        for (block_size, block_count) in [(0, 1), (511, 1), (8192, 1), (512, 0), (4096, u64::MAX)] {
+            assert!(
+                FatDisk::new(GeometryOnlyDevice {
+                    block_size,
+                    block_count,
+                })
+                .is_err()
+            );
+        }
+
+        let disk = FatDisk::new(GeometryOnlyDevice {
+            block_size: 4096,
+            block_count: 1024,
+        })
+        .expect("valid bounded geometry");
+        assert_eq!(disk.bytes_len(), 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn malformed_fat_boot_sector_fails_without_mounting() {
+        let disk = MemBlockDevice::new_zeroed(512, 4096);
+        assert!(FatVolume::new(disk).is_err());
     }
 
     #[test]

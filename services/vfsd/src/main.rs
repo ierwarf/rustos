@@ -48,7 +48,7 @@ use rustos_user_abi::syscall::{
     VFS_POLL_QUERY_EPOLL_SNAPSHOT, VFS_POLL_QUERY_EPOLL_UNREF, VFS_POLL_QUERY_POLL,
     WAITSET_ABI_VERSION, WAITSET_GLOBAL_OBJECT_ID, WAITSET_MAX_INTERESTS, WAITSET_PROVIDER_VFSD,
 };
-use storage_fat::{FatDirEntry, FatDisk, FatNodeKind, FatVolume};
+use storage_fat::{FatDirEntry, FatNodeKind, FatVolume};
 use vfsd::{
     cacheable_metadata_errno, checked_next_generation, checked_seek_position, checkpoint_path_key,
     mkdir_policy, persistent_mutation_status, unlink_policy, valid_checkpoint_record,
@@ -2052,15 +2052,16 @@ impl VfsState {
                 ));
                 errno
             })?;
-            let disk = FatDisk::new(device);
-            self.volume = Some(FatVolume::from_disk(disk).map_err(map_fat_error).map_err(
-                |errno| {
-                    debug_line(&format!(
-                        "vfsd: volume unavailable stage=fat-admission errno={errno}"
-                    ));
-                    errno
-                },
-            )?);
+            self.volume = Some(
+                FatVolume::new(device)
+                    .map_err(map_fat_error)
+                    .map_err(|errno| {
+                        debug_line(&format!(
+                            "vfsd: volume unavailable stage=fat-admission errno={errno}"
+                        ));
+                        errno
+                    })?,
+            );
         }
         Ok(self.volume.as_ref().expect("volume initialized"))
     }

@@ -4,17 +4,17 @@ use core::ptr;
 
 use rustos_user_abi::syscall::{
     CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, DvmBlockInfoWire,
-    StoragedBulkReadResponse, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
-    COMMERCIAL_MAX_PROTOCOL_STORAGED, COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_FLUSH,
-    COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_INFO, COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_READ_BULK,
-    COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_WRITE, IPC_SERVICE_STORAGED,
-    STORAGED_BULK_READ_PAYLOAD_CAPACITY, SYS_RUSTOS_IPC_CALL,
+    StoragedBulkReadResponse, BLOCK_BROKER_INFO_FLAG_READ_ONLY,
+    COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_STORAGED,
+    COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_FLUSH, COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_INFO,
+    COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_READ_BULK, COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_WRITE,
+    IPC_SERVICE_STORAGED, STORAGED_BULK_READ_PAYLOAD_CAPACITY, SYS_RUSTOS_IPC_CALL,
     SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
 };
 use storage_core::{BlockDevice, IoResult, StorageError};
 
 use super::{EINVAL, EIO, ENODEV};
-use vfsd::{storage_error_from_linux_status, validate_dvm_block_range};
+use vfsd::{admit_dvm_block_geometry, storage_error_from_linux_status, validate_dvm_block_range};
 
 const IPC_BLOCK_PAYLOAD_BYTES: usize =
     rustos_user_abi::syscall::COMMERCIAL_MAX_PROTOCOL_PAYLOAD_CAPACITY;
@@ -42,29 +42,13 @@ impl BootBlockDevice {
             });
         }
         let info = read_block_info(&response.payload).ok_or(EIO)?;
-        let block_size = usize::try_from(info.logical_block_size).map_err(|_| EINVAL)?;
-        if info.generation != response.value0
-            || info.capacity_sectors != response.value1
-            || info.generation == 0
-            || block_size < 512
-            || !block_size.is_power_of_two()
-            || !block_size.is_multiple_of(512)
-            || info.physical_block_size < info.logical_block_size
-            || !info
-                .physical_block_size
-                .is_multiple_of(info.logical_block_size)
-            || info.reserved0 != 0
-        {
-            return Err(EIO);
-        }
-        let sectors_per_block = (block_size / 512) as u64;
-        if !info.capacity_sectors.is_multiple_of(sectors_per_block) {
-            return Err(EIO);
-        }
-        let block_count = info.capacity_sectors / sectors_per_block;
-        if block_count == 0 || block_size > IPC_BLOCK_PAYLOAD_BYTES {
-            return Err(EINVAL);
-        }
+        let (block_size, block_count) = admit_dvm_block_geometry(
+            info,
+            response.value0,
+            response.value1,
+            IPC_BLOCK_PAYLOAD_BYTES,
+            BLOCK_BROKER_INFO_FLAG_READ_ONLY,
+        )?;
         Ok(Self {
             generation: info.generation,
             block_size,

@@ -6,9 +6,9 @@ use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::vec::Vec;
 use rustos_user_abi::syscall::{
-    ServiceCheckpointRecordWire, EARLY_SYSTEM_BROKER_MAX_IO_BYTES, SERVICE_CHECKPOINT_ABI_VERSION,
-    SERVICE_CHECKPOINT_FLAG_TOMBSTONE, VFS_IPC_OP_FTRUNCATE, VFS_IPC_OP_WRITE,
-    WAITSET_MAX_INTERESTS,
+    DvmBlockInfoWire, ServiceCheckpointRecordWire, EARLY_SYSTEM_BROKER_MAX_IO_BYTES,
+    SERVICE_CHECKPOINT_ABI_VERSION, SERVICE_CHECKPOINT_FLAG_TOMBSTONE, VFS_IPC_OP_FTRUNCATE,
+    VFS_IPC_OP_WRITE, WAITSET_MAX_INTERESTS,
 };
 use storage_core::{IoResult, StorageError};
 
@@ -17,6 +17,7 @@ pub const ENOTDIR: i32 = 20;
 pub const EROFS: i32 = 30;
 
 const EINTR: i32 = 4;
+const EIO: i32 = 5;
 const EINVAL: i32 = 22;
 const ENODEV: i32 = 19;
 const ENOSYS: i32 = 38;
@@ -39,6 +40,39 @@ pub fn validate_dvm_block_range(
         return Err(StorageError::InvalidInput);
     }
     Ok(())
+}
+
+pub fn admit_dvm_block_geometry(
+    info: DvmBlockInfoWire,
+    response_generation: u64,
+    response_capacity_sectors: u64,
+    maximum_block_size: usize,
+    known_flags: u32,
+) -> Result<(usize, u64), i32> {
+    let block_size = usize::try_from(info.logical_block_size).map_err(|_| EINVAL)?;
+    if info.generation != response_generation
+        || info.capacity_sectors != response_capacity_sectors
+        || info.generation == 0
+        || !matches!(block_size, 512 | 1024 | 2048 | 4096)
+        || block_size > maximum_block_size
+        || info.physical_block_size < info.logical_block_size
+        || !info
+            .physical_block_size
+            .is_multiple_of(info.logical_block_size)
+        || info.flags & !known_flags != 0
+        || info.reserved0 != 0
+    {
+        return Err(EIO);
+    }
+    let sectors_per_block = (block_size / 512) as u64;
+    if !info.capacity_sectors.is_multiple_of(sectors_per_block) {
+        return Err(EIO);
+    }
+    let block_count = info.capacity_sectors / sectors_per_block;
+    if block_count == 0 || block_count.checked_mul(block_size as u64).is_none() {
+        return Err(EINVAL);
+    }
+    Ok((block_size, block_count))
 }
 
 pub fn storage_error_from_linux_status(status: i64) -> StorageError {
@@ -428,6 +462,45 @@ mod tests {
             Err(StorageError::InvalidInput)
         );
         assert_eq!(validate_dvm_block_range(512, 8, 6, 1024), Ok(()));
+    }
+
+    #[test]
+    fn storage_geometry_rejects_provider_overflow_unknown_flags_and_foreign_binding() {
+        let valid = DvmBlockInfoWire {
+            generation: 7,
+            capacity_sectors: 8192,
+            logical_block_size: 4096,
+            physical_block_size: 4096,
+            flags: 1,
+            ..DvmBlockInfoWire::default()
+        };
+        assert_eq!(
+            admit_dvm_block_geometry(valid, 7, 8192, 64 * 1024, 1),
+            Ok((4096, 1024))
+        );
+        assert!(admit_dvm_block_geometry(valid, 8, 8192, 64 * 1024, 1).is_err());
+        assert!(admit_dvm_block_geometry(valid, 7, 4096, 64 * 1024, 1).is_err());
+        assert!(admit_dvm_block_geometry(
+            DvmBlockInfoWire { flags: 3, ..valid },
+            7,
+            8192,
+            64 * 1024,
+            1,
+        )
+        .is_err());
+
+        let overflowing = DvmBlockInfoWire {
+            capacity_sectors: u64::MAX - 7,
+            ..valid
+        };
+        assert!(admit_dvm_block_geometry(
+            overflowing,
+            overflowing.generation,
+            overflowing.capacity_sectors,
+            64 * 1024,
+            1,
+        )
+        .is_err());
     }
 
     #[test]
