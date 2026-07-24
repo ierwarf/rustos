@@ -763,6 +763,14 @@ policy remains with the owning service.
   revoked, all four cursors are zero, the generation strictly increases, and
   the successor signature verifies against the immutable early-system key.
   A stale, unsigned, or DVM-forged header remains revoked.
+- Configured `block.read`, `block.write`, and `block.flush` fault points are
+  admitted only after the current signed ready generation has been rechecked
+  and before request ID, mutation ID, transfer-slot contents, pending state,
+  producer cursor, or doorbell authority is published. They return
+  `DeviceFault` with no partial request. `block.write` covers WRITE, DISCARD,
+  and WRITE_ZEROES mutations; `block.flush` remains separate so durability
+  failure can be exercised without fabricating a successful stable-write
+  boundary.
 - Aperture revocation clears only live readiness and ring cursors. It preserves
   the signed immutable `READ_ONLY` bit, so an interrupted read-only handoff can
   be revoked repeatedly by explicit recovery without invalidating its own L0

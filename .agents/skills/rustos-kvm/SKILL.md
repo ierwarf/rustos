@@ -35,6 +35,15 @@ description: Prepare and diagnose RustOS KVM and Linux DVM parallel-boot runs. U
    cargo xtask kvm-smoke --timeout 30 --storage-dvm-only
    ```
 
+   To prove the flush failure path, use the explicit negative gate. It accepts
+   only one exact unconditional rule and fails if normal E2E flush success is
+   also observed:
+
+   ```sh
+   RUSTOS_FAULTS='block.flush=fail' cargo xtask kvm-smoke --timeout 30 \
+     --storage-dvm-only --storage-dvm-expect-flush-fault
+   ```
+
 5. Inspect only focused extracts from `build/kvm/rustos-debugcon.log` and
    `build/kvm/linux-dvm-serial.log`.
 

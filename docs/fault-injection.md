@@ -54,6 +54,7 @@ closing brackets are not accepted by that parser yet.
 | `alloc.frame` | Physical frame allocation returns `None`. |
 | `block.read` | Block device read returns `DeviceFault`. |
 | `block.write` | Block device write returns `DeviceFault`. |
+| `block.flush` | DVM block flush returns `DeviceFault` before ring publication. |
 | `display.present` | Display present is dropped. |
 | `display.provider.register` | Driver framebuffer provider registration fails. |
 | `driver.module.load` | Loadable driver module load fails. |
@@ -95,6 +96,16 @@ After changing the config, rebuild and run the bounded KVM smoke:
 ```bash
 cargo xtask build
 cargo xtask kvm-smoke --timeout 30
+```
+
+The storage-DVM flush failure has a first-class negative acceptance gate. The
+gate admits exactly one unconditional flush rule, requires both peers, exact
+geometry, and a real first completion, then rejects any fabricated flush
+success:
+
+```bash
+RUSTOS_FAULTS='block.flush=fail' cargo xtask kvm-smoke --timeout 30 \
+  --storage-dvm-only --storage-dvm-expect-flush-fault
 ```
 
 ### Adding New Points
@@ -161,6 +172,7 @@ fault.point=action
 | `alloc.frame` | 물리 frame allocation이 `None` 반환 |
 | `block.read` | block device read가 `DeviceFault` 반환 |
 | `block.write` | block device write가 `DeviceFault` 반환 |
+| `block.flush` | DVM block flush가 ring publication 전에 `DeviceFault` 반환 |
 | `display.present` | display present drop |
 | `display.provider.register` | driver framebuffer provider 등록 실패 |
 | `driver.module.load` | loadable driver module load 실패 |
@@ -202,6 +214,15 @@ config를 바꾼 뒤에는 다시 빌드하고 bounded KVM smoke를 실행합니
 ```bash
 cargo xtask build
 cargo xtask kvm-smoke --timeout 30
+```
+
+storage-DVM flush 실패는 별도의 음성(negative) acceptance gate로 검증합니다.
+정확히 하나의 무조건 flush 실패 규칙만 허용하고, 양쪽 peer, 정확한 geometry,
+실제 첫 completion을 확인한 뒤 허위 flush 성공 표식이 나오면 실패합니다.
+
+```bash
+RUSTOS_FAULTS='block.flush=fail' cargo xtask kvm-smoke --timeout 30 \
+  --storage-dvm-only --storage-dvm-expect-flush-fault
 ```
 
 ### 새 지점 추가

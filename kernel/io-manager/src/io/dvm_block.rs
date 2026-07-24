@@ -189,7 +189,25 @@ impl DvmBlockState {
         data_len: u32,
         fua: bool,
     ) -> Result<DvmBlockTicket, DvmBlockError> {
+        self.submit_with_fault_decision(operation, sector, data, data_len, fua, |operation| {
+            nucleus_core::util::fault_injection::should_fail(fault_point_for_operation(operation))
+        })
+    }
+
+    fn submit_with_fault_decision(
+        &mut self,
+        operation: DvmBlockOperation,
+        sector: u64,
+        data: &[u8],
+        data_len: u32,
+        fua: bool,
+        inject_fault: impl FnOnce(DvmBlockOperation) -> bool,
+    ) -> Result<DvmBlockTicket, DvmBlockError> {
         let header = self.current_header()?;
+        if inject_fault(operation) {
+            report_injected_fault(operation, header.generation);
+            return Err(DvmBlockError::DeviceFault);
+        }
         let consumer = load_u64(self.base, REQUEST_CONSUMER_OFFSET, Ordering::Acquire);
         if self.request_producer < consumer
             || self.request_producer.saturating_sub(consumer) >= u64::from(DVM_BLOCK_QUEUE_DEPTH)
@@ -454,6 +472,30 @@ impl DvmBlockState {
         wake_waiters();
     }
 }
+
+fn fault_point_for_operation(operation: DvmBlockOperation) -> &'static str {
+    match operation {
+        DvmBlockOperation::Read => "block.read",
+        DvmBlockOperation::Flush => "block.flush",
+        DvmBlockOperation::Write | DvmBlockOperation::Discard | DvmBlockOperation::WriteZeroes => {
+            "block.write"
+        }
+    }
+}
+
+#[cfg(not(test))]
+fn report_injected_fault(operation: DvmBlockOperation, generation: u64) {
+    nucleus_core::debug::write_debugcon_only_line(
+        alloc::format!(
+            "dvm-block: injected device fault operation={} generation={generation}",
+            fault_point_for_operation(operation)
+        )
+        .as_bytes(),
+    );
+}
+
+#[cfg(test)]
+fn report_injected_fault(_operation: DvmBlockOperation, _generation: u64) {}
 
 #[cfg(not(test))]
 fn report_peer_ready_observation() {
@@ -1227,6 +1269,70 @@ mod tests {
             Err(DvmBlockError::Protocol)
         );
         assert!(state.revoked);
+    }
+
+    #[test]
+    fn fault_points_cover_reads_mutations_and_durability() {
+        assert_eq!(
+            fault_point_for_operation(DvmBlockOperation::Read),
+            "block.read"
+        );
+        assert_eq!(
+            fault_point_for_operation(DvmBlockOperation::Write),
+            "block.write"
+        );
+        assert_eq!(
+            fault_point_for_operation(DvmBlockOperation::Discard),
+            "block.write"
+        );
+        assert_eq!(
+            fault_point_for_operation(DvmBlockOperation::WriteZeroes),
+            "block.write"
+        );
+        assert_eq!(
+            fault_point_for_operation(DvmBlockOperation::Flush),
+            "block.flush"
+        );
+
+        let (mut aperture, registers, mut state) = test_state();
+        let initial_request_id = state.next_request_id;
+        let initial_operation_id = state.next_operation_id;
+        let data = vec![0xa5_u8; 4096];
+
+        for (operation, payload, data_len) in [
+            (DvmBlockOperation::Read, &[][..], 4096),
+            (DvmBlockOperation::Write, data.as_slice(), 4096),
+            (DvmBlockOperation::Discard, &[][..], 4096),
+            (DvmBlockOperation::WriteZeroes, &[][..], 4096),
+            (DvmBlockOperation::Flush, &[][..], 0),
+        ] {
+            assert_eq!(
+                state.submit_with_fault_decision(operation, 8, payload, data_len, false, |_| true),
+                Err(DvmBlockError::DeviceFault)
+            );
+            assert_eq!(state.request_producer, 0);
+            assert_eq!(
+                load_u64(state.base, REQUEST_PRODUCER_OFFSET, Ordering::Acquire),
+                0
+            );
+            assert_eq!(state.next_request_id, initial_request_id);
+            assert_eq!(state.next_operation_id, initial_operation_id);
+            assert!(state.pending.iter().all(Option::is_none));
+            assert_eq!(registers[IVSHMEM_DOORBELL_OFFSET / 4], 0);
+        }
+
+        let request_offset = DVM_BLOCK_REQUEST_RING_OFFSET as usize;
+        assert!(
+            aperture_bytes(&mut aperture)[request_offset..request_offset + DVM_BLOCK_RECORD_BYTES]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+        assert!(
+            aperture_bytes(&mut aperture)
+                [DVM_BLOCK_DATA_OFFSET as usize..DVM_BLOCK_DATA_OFFSET as usize + data.len()]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
     }
 
     #[test]

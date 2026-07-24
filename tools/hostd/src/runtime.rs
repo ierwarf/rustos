@@ -1903,7 +1903,7 @@ fn read_qmp_message(reader: &mut impl BufRead) -> Result<serde_json::Value> {
     Ok(value)
 }
 
-fn write_qmp_command(stream: &mut UnixStream, execute: &str, id: &str) -> Result<()> {
+fn write_qmp_command(stream: &mut impl Write, execute: &str, id: &str) -> Result<()> {
     let command = serde_json::json!({"execute": execute, "id": id});
     serde_json::to_writer(&mut *stream, &command).context("encode QMP command")?;
     stream.write_all(b"\r\n")?;
@@ -1937,17 +1937,24 @@ fn request_guest_powerdown(qmp_path: &Path) -> Result<()> {
     stream.set_write_timeout(Some(QMP_IO_TIMEOUT))?;
     let reader_stream = stream.try_clone().context("clone QMP stream reader")?;
     let mut reader = BufReader::new(reader_stream);
-    let greeting = read_qmp_message(&mut reader).context("read QMP server greeting")?;
+    request_guest_powerdown_protocol(&mut stream, &mut reader)
+}
+
+fn request_guest_powerdown_protocol(
+    stream: &mut impl Write,
+    reader: &mut impl BufRead,
+) -> Result<()> {
+    let greeting = read_qmp_message(reader).context("read QMP server greeting")?;
     if !greeting
         .get("QMP")
         .is_some_and(serde_json::Value::is_object)
     {
         bail!("QMP server greeting lacks the QMP object");
     }
-    write_qmp_command(&mut stream, "qmp_capabilities", QMP_CAPABILITIES_ID)?;
-    require_qmp_response(&mut reader, QMP_CAPABILITIES_ID)?;
-    write_qmp_command(&mut stream, "system_powerdown", QMP_POWERDOWN_ID)?;
-    require_qmp_response(&mut reader, QMP_POWERDOWN_ID)?;
+    write_qmp_command(stream, "qmp_capabilities", QMP_CAPABILITIES_ID)?;
+    require_qmp_response(reader, QMP_CAPABILITIES_ID)?;
+    write_qmp_command(stream, "system_powerdown", QMP_POWERDOWN_ID)?;
+    require_qmp_response(reader, QMP_POWERDOWN_ID)?;
     Ok(())
 }
 
@@ -2484,9 +2491,7 @@ fn is_not_found(error: &anyhow::Error) -> bool {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
-    use std::os::unix::net::UnixListener;
     use std::os::unix::process::ExitStatusExt;
-    use std::sync::mpsc;
 
     fn vfct_fixture(target: AmdPciIdentity) -> Vec<u8> {
         let image_len = 0x80_usize;
@@ -2773,62 +2778,40 @@ mod tests {
 
     #[test]
     fn qmp_powerdown_negotiates_capabilities_before_shutdown() {
-        let owner = unsafe { libc::geteuid() };
-        let current = std::env::current_dir().unwrap();
-        let trusted_parent = current
-            .ancestors()
-            .find(|candidate| {
-                ensure_trusted_directory(candidate, owner, false).is_ok()
-                    && fs::metadata(candidate).is_ok_and(|metadata| metadata.mode() & 0o200 != 0)
-            })
-            .unwrap();
-        let root = trusted_parent.join(format!(
-            ".hostd-qmp-test-{}-{}",
-            std::process::id(),
-            PRIVATE_REPLACE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir(&root).unwrap();
-        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
-        let socket = root.join("qmp.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
-        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
-        let (sender, receiver) = mpsc::channel();
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .write_all(b"{\"capabilities\":[],\"QMP\":{\"version\":{}}}\r\n")
-                .unwrap();
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut commands = Vec::new();
-            for (expected_execute, expected_id) in [
-                ("qmp_capabilities", QMP_CAPABILITIES_ID),
-                ("system_powerdown", QMP_POWERDOWN_ID),
-            ] {
-                let request = read_qmp_message(&mut reader).unwrap();
-                assert_eq!(
-                    request.get("execute").and_then(serde_json::Value::as_str),
-                    Some(expected_execute)
-                );
-                assert_eq!(
-                    request.get("id").and_then(serde_json::Value::as_str),
-                    Some(expected_id)
-                );
-                commands.push(expected_execute.to_owned());
-                let response = serde_json::json!({"return": {}, "id": expected_id});
-                serde_json::to_writer(&mut stream, &response).unwrap();
-                stream.write_all(b"\r\n").unwrap();
-                stream.flush().unwrap();
-            }
-            sender.send(commands).unwrap();
-        });
-
-        request_guest_powerdown(&socket).unwrap();
-        assert_eq!(
-            receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
-            ["qmp_capabilities", "system_powerdown"]
+        let responses = format!(
+            "{{\"capabilities\":[],\"QMP\":{{\"version\":{{}}}}}}\r\n\
+             {{\"return\":{{}},\"id\":\"{QMP_CAPABILITIES_ID}\"}}\r\n\
+             {{\"return\":{{}},\"id\":\"{QMP_POWERDOWN_ID}\"}}\r\n"
         );
-        server.join().unwrap();
-        fs::remove_dir_all(root).unwrap();
+        let mut reader = BufReader::new(responses.as_bytes());
+        let mut commands = Vec::new();
+        request_guest_powerdown_protocol(&mut commands, &mut reader).unwrap();
+        let commands = String::from_utf8(commands).unwrap();
+        let commands = commands
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(commands.len(), 2);
+        assert_eq!(
+            commands[0]
+                .get("execute")
+                .and_then(serde_json::Value::as_str),
+            Some("qmp_capabilities")
+        );
+        assert_eq!(
+            commands[0].get("id").and_then(serde_json::Value::as_str),
+            Some(QMP_CAPABILITIES_ID)
+        );
+        assert_eq!(
+            commands[1]
+                .get("execute")
+                .and_then(serde_json::Value::as_str),
+            Some("system_powerdown")
+        );
+        assert_eq!(
+            commands[1].get("id").and_then(serde_json::Value::as_str),
+            Some(QMP_POWERDOWN_ID)
+        );
     }
 
     #[test]

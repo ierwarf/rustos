@@ -64,7 +64,10 @@ const DVM_POINTER_INGRESS_MARKER: &str = "inputd: DVM pointer ingress observed";
 const DVM_GPU_COMPOSITOR_MARKER: &str = "rustos-dvm-gpu: ready contract=1";
 const DVM_GPU_LIVE_MARKER: &str = "rustos-dvm-display: gpu-compositor primed contract=3";
 const RUSTOS_DVM_BLOCK_MARKER: &str = "dvm-block: transport installed generation=1";
+const RUSTOS_DVM_BLOCK_FIRST_COMPLETION_MARKER: &str = "dvm-block: first completion observed";
 const RUSTOS_DVM_BLOCK_E2E_MARKER: &str = "storaged: dvm-block e2e flush completed generation=1";
+const RUSTOS_DVM_BLOCK_FLUSH_FAULT_MARKER: &str =
+    "dvm-block: injected device fault operation=block.flush generation=1";
 const DVM_BLOCK_READY_MARKER: &str = "rustos-dvm-block: ready abi=2 generation=1";
 const DVM_GPU_PIPELINE_PRIME_TIMEOUT_US: u64 = 500_000;
 const DVM_GPU_HEALTH_SAMPLES: u64 = 3;
@@ -238,6 +241,7 @@ struct KvmLayout {
 struct SmokeOptions {
     dry_run: bool,
     storage_only: bool,
+    expect_block_flush_fault: bool,
     exercise_input: bool,
     exercise_network: bool,
     gui_dvm_surfaces: bool,
@@ -290,6 +294,11 @@ where
         return Ok(());
     }
     let options = parse_smoke_options(args.into_iter())?;
+    validate_storage_fault_expectation(
+        config.project.fault_injection.enabled,
+        &config.project.fault_injection.rules,
+        &options,
+    )?;
     let artifacts = verify_dvm_artifacts(config)?;
     let qemu = require_qemu(config)?;
     let layout = prepare_layout(config, &options)?;
@@ -434,6 +443,7 @@ pub(crate) fn kvm_run_command(config: &Config) -> Result<()> {
     let options = SmokeOptions {
         dry_run: false,
         storage_only: false,
+        expect_block_flush_fault: false,
         exercise_input: false,
         exercise_network: false,
         gui_dvm_surfaces: true,
@@ -578,6 +588,10 @@ options:
                        --dvm-block-shmem and require boot, both block peers,
                        first completion, and E2E flush without depending on UI,
                        input, network, or GPU readiness markers
+  --storage-dvm-expect-flush-fault
+                       with --storage-dvm-only and exactly block.flush=fail,
+                       require a pre-publication DeviceFault and reject any E2E
+                       flush-success marker
   --physical-gpu <BDF> non-commercial lab mode: attach one already-bound GPU
                        from the sealed physical-GPU profile registry through
                        IOMMUFD instead of virtio-GPU; never binds, unbinds, or
@@ -711,6 +725,7 @@ where
     let mut options = SmokeOptions {
         dry_run: false,
         storage_only: false,
+        expect_block_flush_fault: false,
         exercise_input: false,
         exercise_network: false,
         gui_dvm_surfaces: false,
@@ -734,6 +749,7 @@ where
         match arg.as_str() {
             "--dry-run" => options.dry_run = true,
             "--storage-dvm-only" => options.storage_only = true,
+            "--storage-dvm-expect-flush-fault" => options.expect_block_flush_fault = true,
             "--exercise-input" => options.exercise_input = true,
             "--exercise-network" => options.exercise_network = true,
             "--gui-dvm-surfaces" => options.gui_dvm_surfaces = true,
@@ -830,6 +846,9 @@ where
             .expected_dvm_markers
             .retain(|marker| marker != DVM_GPU_COMPOSITOR_MARKER);
     }
+    if options.expect_block_flush_fault && !options.storage_only {
+        bail!("--storage-dvm-expect-flush-fault requires --storage-dvm-only");
+    }
     if options.exercise_input {
         options
             .expected_markers
@@ -852,7 +871,15 @@ where
             .push(RUSTOS_DVM_BLOCK_MARKER.to_owned());
         options
             .expected_markers
-            .push(RUSTOS_DVM_BLOCK_E2E_MARKER.to_owned());
+            .push(RUSTOS_DVM_BLOCK_FIRST_COMPLETION_MARKER.to_owned());
+        options.expected_markers.push(
+            if options.expect_block_flush_fault {
+                RUSTOS_DVM_BLOCK_FLUSH_FAULT_MARKER
+            } else {
+                RUSTOS_DVM_BLOCK_E2E_MARKER
+            }
+            .to_owned(),
+        );
         options
             .expected_dvm_markers
             .push(DVM_BLOCK_READY_MARKER.to_owned());
@@ -877,6 +904,37 @@ where
         _ => bail!("--physical-gpu and --gpu-firmware must be supplied together"),
     }
     Ok(options)
+}
+
+fn validate_storage_fault_expectation(
+    enabled: bool,
+    rules: &[String],
+    options: &SmokeOptions,
+) -> Result<()> {
+    if !options.expect_block_flush_fault {
+        return Ok(());
+    }
+    if !enabled {
+        bail!(
+            "--storage-dvm-expect-flush-fault requires enabled fault injection with exactly block.flush=fail"
+        );
+    }
+    let flush_actions = rules
+        .iter()
+        .map(|rule| {
+            rustos_fault_injection::parse_rule(rule)
+                .map_err(|error| anyhow::anyhow!("invalid configured fault rule {rule:?}: {error}"))
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .filter_map(|rule| (rule.location == "block.flush").then_some(rule.action))
+        .collect::<Vec<_>>();
+    if flush_actions.as_slice() != [rustos_fault_injection::FaultAction::Fail] {
+        bail!(
+            "--storage-dvm-expect-flush-fault requires exactly one block.flush=fail rule and no competing block.flush rule"
+        );
+    }
+    Ok(())
 }
 
 fn next_value<I>(args: &mut I, option: &str) -> Result<String>
@@ -2826,6 +2884,9 @@ fn wait_for_parallel_boot(
         check_guest_running(dvm, "Linux DVM", &layout.dvm_stderr_log)?;
         let rustos_log = fs::read_to_string(&layout.debugcon_log)?;
         let dvm_log = fs::read_to_string(&layout.dvm_serial_log)?;
+        if options.expect_block_flush_fault && rustos_log.contains(RUSTOS_DVM_BLOCK_E2E_MARKER) {
+            bail!("storage-DVM flush fault proof observed an impossible E2E flush-success marker");
+        }
         if options.gui_dvm_surfaces
             && let Some(failure) = dvm_display_failure(&dvm_log, options.physical_gpu_bdf.is_some())
         {
@@ -3909,7 +3970,8 @@ mod tests {
         DVM_CONTROL_CAPABILITIES, DVM_CONTROL_PROTOCOL, DVM_CONTROL_STATE, DVM_CONTROL_TRANSPORT,
         DVM_DISPLAY_REGION_BYTES, DVM_GPU_COMPOSITOR_MARKER, DVM_KEYBOARD_INGRESS_MARKER,
         DVM_POINTER_INGRESS_MARKER, DvmNetworkCounters, GuestDisplay, PHYSICAL_GPU_PROFILES,
-        RUSTOS_BOOT_MARKER, RUSTOS_DVM_BLOCK_E2E_MARKER, RUSTOS_DVM_BLOCK_MARKER,
+        RUSTOS_BOOT_MARKER, RUSTOS_DVM_BLOCK_E2E_MARKER, RUSTOS_DVM_BLOCK_FIRST_COMPLETION_MARKER,
+        RUSTOS_DVM_BLOCK_FLUSH_FAULT_MARKER, RUSTOS_DVM_BLOCK_MARKER,
         RUSTOS_GPU_SCENE_COMPILER_MARKER, RUSTOS_INIT_IDENTITY_MARKER,
         RUSTOS_POST_INIT_PROVENANCE_MARKER, VIRTUAL_GPU_EVIDENCE, WayclickProfileObservation,
         append_dvm_display_pixels, append_dvm_input_devices, append_dvm_network_device,
@@ -3922,8 +3984,8 @@ mod tests {
         runtime_stall_or_crash_observed, select_smoke_guest_display,
         uiserver_has_interactive_slow_loop, uiserver_idle_ticks_healthy,
         uiserver_profile_input_pipeline_healthy, uiserver_profile_meets_fps,
-        validate_manifest_values, vfio_device_cdev_path, wayclick_profile_meets_fps,
-        wayclick_profile_observation,
+        validate_manifest_values, validate_storage_fault_expectation, vfio_device_cdev_path,
+        wayclick_profile_meets_fps, wayclick_profile_observation,
     };
     use std::{fs, path::Path, process::Command};
 
@@ -4181,6 +4243,11 @@ mod tests {
         assert!(
             options
                 .expected_markers
+                .contains(&RUSTOS_DVM_BLOCK_FIRST_COMPLETION_MARKER.to_owned())
+        );
+        assert!(
+            options
+                .expected_markers
                 .contains(&RUSTOS_DVM_BLOCK_E2E_MARKER.to_owned())
         );
         assert!(
@@ -4214,6 +4281,66 @@ mod tests {
         assert!(
             parse_smoke_options(
                 vec!["--storage-dvm-only".into(), "--gui-dvm-surfaces".into()].into_iter()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn storage_flush_fault_gate_requires_one_exact_fail_rule_and_rejects_success() {
+        assert!(
+            parse_smoke_options(vec!["--storage-dvm-expect-flush-fault".into()].into_iter())
+                .is_err()
+        );
+        let options = parse_smoke_options(
+            vec![
+                "--storage-dvm-only".into(),
+                "--storage-dvm-expect-flush-fault".into(),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        assert!(options.expect_block_flush_fault);
+        assert!(
+            options
+                .expected_markers
+                .contains(&RUSTOS_DVM_BLOCK_FLUSH_FAULT_MARKER.to_owned())
+        );
+        assert!(
+            !options
+                .expected_markers
+                .contains(&RUSTOS_DVM_BLOCK_E2E_MARKER.to_owned())
+        );
+        assert!(
+            validate_storage_fault_expectation(true, &["block.flush=fail".into()], &options)
+                .is_ok()
+        );
+        assert!(
+            validate_storage_fault_expectation(true, &[" block.flush = fail ".into()], &options)
+                .is_ok()
+        );
+        assert!(validate_storage_fault_expectation(false, &[], &options).is_err());
+        assert!(
+            validate_storage_fault_expectation(
+                true,
+                &["block.flush=fail-after:1".into()],
+                &options
+            )
+            .is_err()
+        );
+        assert!(
+            validate_storage_fault_expectation(
+                true,
+                &["block.flush=fail".into(), "block.flush=fail".into()],
+                &options
+            )
+            .is_err()
+        );
+        assert!(
+            validate_storage_fault_expectation(
+                true,
+                &["block.flush=fail".into(), "block.flush=off".into()],
+                &options
             )
             .is_err()
         );
