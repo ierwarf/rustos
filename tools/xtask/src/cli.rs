@@ -35,7 +35,10 @@ enum XtaskCommand {
         args: Vec<String>,
     },
     #[command(name = "kvm-run")]
-    KvmRun,
+    KvmRun {
+        #[arg(long = "build")]
+        build_image: bool,
+    },
     Selftest,
     #[command(name = "fuzz-host")]
     FuzzHost {
@@ -97,7 +100,7 @@ pub(crate) fn run() -> Result<()> {
         Some(XtaskCommand::Clean) => build::clean(&config),
         Some(XtaskCommand::DevPlan) => unreachable!("dev-plan returned before loading config"),
         Some(XtaskCommand::KvmSmoke { args }) => kvm::kvm_smoke_command(&config, args.into_iter()),
-        Some(XtaskCommand::KvmRun) => kvm::kvm_run_command(&config),
+        Some(XtaskCommand::KvmRun { build_image }) => kvm::kvm_run_command(&config, build_image),
         Some(XtaskCommand::Selftest) => testinfra::selftest(&config),
         Some(XtaskCommand::FuzzHost {
             target,

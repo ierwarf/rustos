@@ -41,7 +41,8 @@ failure output as the primary debugging context.
 | `tools/prepare-physical-amdgpu-vfio-lab.sh [--check] [AMD_VFCT]` | prepare only GA403UM AMD `1002:1900` for the non-commercial physical-QEMU lab lane: require a pre-unbound or already-correct function, singleton IOMMU group, disabled reset and idle-D3, cleared bus mastering, limited cdev ACLs, inherited memlock, IOMMUFD probe, and physical dry-run; never unbinds, resets, starts QEMU, or admits another VFIO function | AMD `0000:65:00.0` VFIO binding and transient sysfs/ACL/rlimit state; `build/kvm/` dry-run inputs | wrong hardware, active host driver, another VFIO function, unsafe reset/DMA state, missing access, invalid VFCT, or failed dry-run |
 | `tools/configure-amdgpu-vfio-early-bind.sh [--apply]` | plan by default; with `--apply`, install the exact GA403UM `1002:1900` vfio-pci ID/idle-D3 policy, amdgpu blacklist, and initramfs module entry, then update initramfs without touching the live driver | `/etc/modprobe.d/rustos-amd-vfio.conf`, `/etc/initramfs-tools/modules`, initramfs | wrong/multiple AMD displays, conflicting policy, modified owned file, duplicate module entry, or initramfs failure |
 | `tools/remove-amdgpu-vfio-early-bind.sh [--apply]` | plan by default; with `--apply`, remove only the exact RustOS policy and exact initramfs module entry, update initramfs, and leave the live device untouched so amdgpu may bind on the next cold boot | same persistent files and initramfs | modified/foreign policy, duplicate entry, separate GRUB override, or initramfs failure |
-| `cargo xtask kvm-run` | start the interactive Linux-DVM display session; it waits for an atomic three-buffer/page-flip-ready scanout before exposing the window, then records real pointer ingress and healthy idle UI ticks when QEMU closes | `build/kvm/` | unavailable GUI backend, `/dev/kvm`, display readiness failure, missing real pointer evidence, or a guest exit |
+| `cargo xtask kvm-run` | start the interactive Linux-DVM display session from the existing signed RustOS image; it reports atomic three-buffer/page-flip and storage readiness when observed without killing a progressing debug boot, then records real pointer ingress and healthy idle UI ticks when QEMU closes | `build/kvm/` | stale RustOS image, unavailable GUI backend, `/dev/kvm`, missing acceptance evidence when the window closes, or a guest exit |
+| `cargo xtask kvm-run --build` | build/sign the RustOS image and then enter the exact same verified cached-DVM interactive path; this is the sole VS Code F5 command. Interactive startup has no arbitrary absolute readiness deadline; the bounded 30-second acceptance gate remains `kvm-smoke` | signed RustOS image plus `build/kvm/` | build/sign failure, invalid cached DVM, a real guest/stall failure, or missing acceptance evidence when the window closes |
 | `cargo run -p rustos-hostd -- discover` | read host IOMMU groups | none | IOMMU unavailable or unreadable sysfs |
 | `cargo run -p rustos-hostd -- preflight --plan <file>` | require complete, non-protected IOMMU-group ownership and reject live `boot_vga`/connected DRM displays | none | incomplete group, declared host-critical BDF, or active L0 display |
 | `cargo run -p rustos-hostd -- preflight-physical --plan <file> --dvm-artifact-manifest <file> --device-policy <file> --qemu <file>` | before any VFIO bind, validate topology, live display, lease-contained reset scope, DMA-safe VFIO bind configuration, at least 4 GiB soft memlock, exact policy/QEMU/bundle, exact checksummed AMD VFCT/ATOM VBIOS, and an empty IOMMUFD IOAS allocate/destroy probe | none | unsafe/mismatched runtime input, reset scope escaping the lease, insufficient pinning budget, idle-D3 DMA window, missing/mismatched VBIOS, or unusable IOMMUFD ABI |
@@ -55,13 +56,21 @@ failure output as the primary debugging context.
 
 ## VS Code F5 contract
 
-The single F5 configuration, `RustOS: verified KVM desktop`, first runs
-`cargo xtask build` through `F5: Build signed RustOS image`, then starts
-`cargo xtask kvm-run`. The runner verifies the existing signed Linux DVM
-bundle before QEMU starts. F5 must never run `build-dvm`; DVM source changes
-use the explicit build-plan and stable-batch lanes above. The base
-`tools/check-dev-environment.sh` gate parses all three `.vscode` JSON files,
-checks the launch/task reference, and rejects a reintroduced `build-dvm`.
+The single F5 configuration, `RustOS: verified KVM desktop`, executes only
+`cargo xtask kvm-run --build`. The option builds and signs RustOS in-process,
+then the runner verifies the existing signed Linux DVM bundle before QEMU
+starts. There is no separately mutable pre-launch task. F5 must never run
+`build-dvm`; DVM source changes use the explicit build-plan and stable-batch
+lanes above. `kvm-run` observes and reports display/storage readiness while the
+interactive session remains operator-owned; it does not turn a slow but
+progressing debug boot into a false startup failure. The bounded 30-second
+readiness acceptance contract belongs to `kvm-smoke`. The repository Cargo
+config does not make optional `sccache`
+availability a prerequisite for compiling xtask; developers may opt in with
+`RUSTC_WRAPPER=sccache` when their environment supports it. The base
+`tools/check-dev-environment.sh` gate checks the one-command launch contract,
+rejects a reintroduced split task or `build-dvm`, and rejects any mandatory
+repository `rustc-wrapper`.
 
 ## Tests and inventory
 

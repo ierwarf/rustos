@@ -102,7 +102,6 @@ const DVM_GUEST_MEMORY: &str = "2048M,maxmem=3G,slots=2";
 const DVM_DISPLAY_PIXEL_PHYS_ADDR: u64 = 0x1_0000_0000;
 const DVM_DISPLAY_FIRST_PEER_TIMEOUT: Duration = Duration::from_secs(5);
 const DVM_BLOCK_FIRST_PEER_TIMEOUT: Duration = Duration::from_secs(5);
-const INTERACTIVE_DISPLAY_READY_TIMEOUT: Duration = Duration::from_secs(15);
 const INTERACTIVE_IDLE_TICKS: usize = 3;
 const DVM_INPUT_FIRST_PEER_TIMEOUT: Duration = Duration::from_secs(5);
 /// Authentication remains a five-second setup gate, but a real RustOS input
@@ -432,9 +431,15 @@ fn select_smoke_guest_display(options: &SmokeOptions, host_has_gui: bool) -> Res
 }
 
 /// Start the normal KVM driver-domain topology as an interactive session.
-/// Unlike `kvm-smoke`, this has no readiness deadline or success criteria: it
-/// remains alive until the user closes the DVM QEMU window or interrupts it.
-pub(crate) fn kvm_run_command(config: &Config) -> Result<()> {
+/// Unlike `kvm-smoke`, this is an operator-owned interactive session. It
+/// reports topology readiness when observed and remains alive until the user
+/// closes the DVM QEMU window or interrupts it. Acceptance is still enforced
+/// when the session closes; a slow but progressing debug boot is not killed by
+/// an arbitrary startup deadline.
+pub(crate) fn kvm_run_command(config: &Config, build_image: bool) -> Result<()> {
+    if build_image {
+        crate::build::build(config, false)?;
+    }
     let started_at = Instant::now();
     let artifacts = verify_dvm_artifacts(config)?;
     log_kvm_start_phase("verified-dvm-artifacts", started_at);
@@ -499,17 +504,12 @@ pub(crate) fn kvm_run_command(config: &Config) -> Result<()> {
     )?;
     log_kvm_start_phase("spawned-guests", started_at);
 
-    if let Err(error) = wait_for_interactive_display(&layout, &mut rustos, &mut dvm) {
-        stop_guest(&mut dvm);
-        stop_guest(&mut rustos);
-        return Err(error);
-    }
-
     println!(
-        "xtask: interactive KVM DVM display verified in {} ms; move the pointer into the Linux DVM window to record real-input acceptance evidence, then close it or press Ctrl-C to stop",
+        "xtask: interactive KVM DVM guests started in {} ms; readiness will be reported without terminating a progressing debug boot",
         started_at.elapsed().as_millis(),
     );
     let mut pointer_observed = false;
+    let mut readiness_verified = false;
     loop {
         if let Some(status) = dvm
             .try_wait()
@@ -522,13 +522,30 @@ pub(crate) fn kvm_run_command(config: &Config) -> Result<()> {
             validate_interactive_session(&layout, pointer_observed)?;
             return Ok(());
         }
+        if let Some(status) = rustos
+            .try_wait()
+            .context("poll interactive RustOS QEMU session")?
+        {
+            stop_guest(&mut dvm);
+            bail!("interactive RustOS QEMU session exited with {status}");
+        }
         let rustos_log = read_runtime_log_if_present(&layout.debugcon_log)?;
-        if runtime_stall_or_crash_observed(&rustos_log) {
+        let dvm_log = read_runtime_log_if_present(&layout.dvm_serial_log)?;
+        if runtime_stall_or_crash_observed(&rustos_log) || runtime_stall_or_crash_observed(&dvm_log)
+        {
             stop_guest(&mut dvm);
             stop_guest(&mut rustos);
             bail!(
-                "interactive KVM DVM session observed a RustOS watchdog, stall, or crash; inspect {}",
+                "interactive KVM DVM session observed a watchdog, stall, crash, or relay stop; inspect {} and {}",
                 layout.debugcon_log.display(),
+                layout.dvm_serial_log.display(),
+            );
+        }
+        if !readiness_verified && interactive_display_ready(&layout, &rustos_log, &dvm_log) {
+            readiness_verified = true;
+            println!(
+                "xtask: interactive KVM DVM display/storage verified in {} ms; move the pointer into the Linux DVM window to record real-input acceptance evidence, then close it or press Ctrl-C to stop",
+                started_at.elapsed().as_millis(),
             );
         }
         if !pointer_observed && rustos_log.contains(DVM_POINTER_INGRESS_MARKER) {
@@ -3368,83 +3385,22 @@ fn uiserver_idle_ticks_healthy(log: &str, required_ticks: usize) -> bool {
     false
 }
 
-fn wait_for_interactive_display(
-    layout: &KvmLayout,
-    rustos: &mut Child,
-    dvm: &mut Child,
-) -> Result<()> {
-    let deadline = Instant::now() + INTERACTIVE_DISPLAY_READY_TIMEOUT;
-    let mut last_surface_error = None;
-    let mut last_block_error = None;
-    loop {
-        if let Some(status) = rustos
-            .try_wait()
-            .context("poll RustOS QEMU during interactive display startup")?
-        {
-            bail!("RustOS QEMU exited before interactive display readiness with {status}");
-        }
-        if let Some(status) = dvm
-            .try_wait()
-            .context("poll Linux DVM QEMU during interactive display startup")?
-        {
-            bail!("Linux DVM QEMU exited before interactive display readiness with {status}");
-        }
-        let rustos_log = read_runtime_log_if_present(&layout.debugcon_log)?;
-        let dvm_log = read_runtime_log_if_present(&layout.dvm_serial_log)?;
-        if runtime_stall_or_crash_observed(&rustos_log) || runtime_stall_or_crash_observed(&dvm_log)
-        {
-            bail!(
-                "interactive display startup observed a watchdog, stall, crash, or relay stop; inspect {} and {}",
-                layout.debugcon_log.display(),
-                layout.dvm_serial_log.display(),
-            );
-        }
-        let surface_ready = match (
-            layout.gui_dvm_surfaces.as_deref(),
-            layout.gui_dvm_pixels.as_deref(),
-        ) {
-            (Some(control), Some(pixels)) => match verify_dvm_display_surface(control, pixels) {
-                Ok(()) => true,
-                Err(error) => {
-                    last_surface_error = Some(error.to_string());
-                    false
-                }
-            },
-            _ => false,
-        };
-        let block_ready = if rustos_log.contains(RUSTOS_DVM_BLOCK_MARKER)
-            && rustos_log.contains(RUSTOS_DVM_BLOCK_E2E_MARKER)
-            && dvm_log.contains(DVM_BLOCK_READY_MARKER)
-        {
-            match verify_dvm_block_ready(layout) {
-                Ok(()) => true,
-                Err(error) => {
-                    last_block_error = Some(error.to_string());
-                    false
-                }
-            }
-        } else {
-            false
-        };
-        if dvm_display_provider_ready(&rustos_log)
-            && dvm_display_relay_ready(&dvm_log, false)
-            && surface_ready
-            && block_ready
-        {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            bail!(
-                "interactive display/storage was not proven ready within {:?}; surface={}; block={}; inspect {} and {}",
-                INTERACTIVE_DISPLAY_READY_TIMEOUT,
-                last_surface_error.unwrap_or_else(|| "no valid PRESENT yet".to_owned()),
-                last_block_error.unwrap_or_else(|| "no exact block readiness yet".to_owned()),
-                layout.debugcon_log.display(),
-                layout.dvm_serial_log.display(),
-            );
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
+fn interactive_display_ready(layout: &KvmLayout, rustos_log: &str, dvm_log: &str) -> bool {
+    let surface_ready = match (
+        layout.gui_dvm_surfaces.as_deref(),
+        layout.gui_dvm_pixels.as_deref(),
+    ) {
+        (Some(control), Some(pixels)) => verify_dvm_display_surface(control, pixels).is_ok(),
+        _ => false,
+    };
+    let block_ready = rustos_log.contains(RUSTOS_DVM_BLOCK_MARKER)
+        && rustos_log.contains(RUSTOS_DVM_BLOCK_E2E_MARKER)
+        && dvm_log.contains(DVM_BLOCK_READY_MARKER)
+        && verify_dvm_block_ready(layout).is_ok();
+    dvm_display_provider_ready(rustos_log)
+        && dvm_display_relay_ready(dvm_log, false)
+        && surface_ready
+        && block_ready
 }
 
 fn validate_interactive_session(layout: &KvmLayout, pointer_observed: bool) -> Result<()> {

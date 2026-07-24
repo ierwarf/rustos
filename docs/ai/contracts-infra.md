@@ -200,7 +200,10 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
 - `RUSTOS_KERNEL_CODEGEN_UNITS` overrides kernel codegen unit count for experiments without changing userspace builds. Deprecated alias: `KERNEL_CODEGEN_UNITS`. Sweep range: `1..=256`.
 - Other knobs: `lto`, `force_frame_pointers`, `incremental` (applied as `CARGO_INCREMENTAL` on kernel Cargo invocations), `debuginfo`, `embed_bitcode`, `panic`, `relocation_model`, `strip`, `extra_rustflags`.
 - `embed_bitcode=true` required when `lto` ∈ {`thin`, `fat`}.
-- Kernel invocations disable any configured `sccache` rustc wrapper — kernel build-std/LTO flag probes are not accepted by sccache.
+- The repository does not mandate a Cargo `rustc-wrapper`: an optional cache
+  cannot be an F5 or xtask availability dependency. Developers may opt in
+  through `RUSTC_WRAPPER=sccache`; kernel invocations then disable it because
+  kernel build-std/LTO flag probes are not accepted by sccache.
 
 ### Config & Module Loader
 

@@ -5,8 +5,7 @@
       "name": "RustOS: verified KVM desktop",
       "type": "node-terminal",
       "request": "launch",
-      "preLaunchTask": "F5: Build signed RustOS image",
-      "command": "cargo xtask kvm-run",
+      "command": "exec cargo xtask kvm-run --build",
       "cwd": "${workspaceFolder}"
     }
   ]
