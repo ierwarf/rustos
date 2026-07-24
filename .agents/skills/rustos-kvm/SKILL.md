@@ -28,6 +28,13 @@ description: Prepare and diagnose RustOS KVM and Linux DVM parallel-boot runs. U
    cargo xtask kvm-smoke --expect 'runtimed: bootstrap ui done'
    ```
 
+   For storage-DVM work, use the independent profile so a GPU/UI marker cannot
+   fabricate either failure or success:
+
+   ```sh
+   cargo xtask kvm-smoke --timeout 30 --storage-dvm-only
+   ```
+
 5. Inspect only focused extracts from `build/kvm/rustos-debugcon.log` and
    `build/kvm/linux-dvm-serial.log`.
 

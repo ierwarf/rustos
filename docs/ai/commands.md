@@ -35,6 +35,7 @@ failure output as the primary debugging context.
 | `make -C driver-domains/linux dev-display` | compile only the cached DVM display package; no rootfs or artifact is created | `out/buildroot-output/target/` only | cold/stale configuration; run `build` first |
 | `make -C driver-domains/linux dev-net` | compile only the cached DVM network package; no rootfs or artifact is created | `out/buildroot-output/target/` only | cold/stale configuration; run `build` first |
 | `cargo xtask kvm-smoke` | concurrently boot Linux DVM and RustOS with QEMU/KVM | `build/kvm/` | unavailable `/dev/kvm`, guest exit, missing readiness marker |
+| `cargo xtask kvm-smoke --timeout 30 --storage-dvm-only` | independently prove the virtual storage-DVM topology: authenticated peer readiness, exact signed geometry, first completion, and E2E backing-device flush without accepting unrelated UI/GPU markers | `build/kvm/` and private DVM block disk/aperture | missing block peer, malformed geometry/signature, absent completion/flush, guest exit, or deadline |
 | `cargo xtask kvm-smoke --timeout 30 --gui-dvm-surfaces --physical-gpu <BDF> --gpu-firmware <TABLE>` | explicitly non-commercial physical-GPU lab run through the sealed device-profile registry; the current registered profile is AMD `1002:1900` with a relocated VFCT. QEMU 11.0 or newer uses IOMMUFD and VFIO PCI-BAR DMA-BUF mapping, executes the real `uiserver` GPU scene, and scans it out on the physical connector. Because this lane disables reset, an atomic boot-ID claim permits exactly one launch attempt per host boot. The runner never binds, unbinds, or resets the device and attaches no network device. `--physical-amdgpu`/`--amd-vfct` remain compatibility aliases | `build/kvm/` plus the physical display | repeated launch in one boot, unknown/ambiguous profile, unsafe VFIO/IOMMUFD/profile firmware state, inaccessible per-device cdev, unavailable VFIO BAR DMA-BUF support, inherited memlock below 4 GiB, reset-dirty driver probe, missing end-to-end GPU completion, or guest exit; never counts as supervised reset/revoke evidence |
 | `tools/prepare-physical-amdgpu-vfio-lab.sh [--check] [AMD_VFCT]` | prepare only GA403UM AMD `1002:1900` for the non-commercial physical-QEMU lab lane: require a pre-unbound or already-correct function, singleton IOMMU group, disabled reset and idle-D3, cleared bus mastering, limited cdev ACLs, inherited memlock, IOMMUFD probe, and physical dry-run; never unbinds, resets, starts QEMU, or admits another VFIO function | AMD `0000:65:00.0` VFIO binding and transient sysfs/ACL/rlimit state; `build/kvm/` dry-run inputs | wrong hardware, active host driver, another VFIO function, unsafe reset/DMA state, missing access, invalid VFCT, or failed dry-run |
 | `tools/configure-amdgpu-vfio-early-bind.sh [--apply]` | plan by default; with `--apply`, install the exact GA403UM `1002:1900` vfio-pci ID/idle-D3 policy, amdgpu blacklist, and initramfs module entry, then update initramfs without touching the live driver | `/etc/modprobe.d/rustos-amd-vfio.conf`, `/etc/initramfs-tools/modules`, initramfs | wrong/multiple AMD displays, conflicting policy, modified owned file, duplicate module entry, or initramfs failure |
@@ -229,6 +230,12 @@ fallback.
   because any ivshmem peer departure terminates the fail-closed broker.
 - `--timeout <seconds>` is bounded to `1..=30` and applies only while waiting
   for expected RustOS debugcon and Linux DVM serial markers.
+- `--storage-dvm-only` enables the private block aperture and removes only the
+  unrelated GPU-scene/compositor acceptance requirements. It still requires
+  RustOS boot/provenance, the authenticated DVM control handshake, both block
+  readiness markers, the first completion, exact live geometry, and storaged's
+  end-to-end flush. It cannot be combined with UI, input, network, FPS, or
+  physical-GPU proof options.
 - The default marker is `rootd: core services ready, spawning initd via loaderd`;
   repeat `--expect <marker>` for each additional RustOS milestone.
 - `--dry-run` verifies DVM artifacts and prepares `build/kvm/` without

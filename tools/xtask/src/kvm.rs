@@ -237,6 +237,7 @@ struct KvmLayout {
 #[derive(Debug)]
 struct SmokeOptions {
     dry_run: bool,
+    storage_only: bool,
     exercise_input: bool,
     exercise_network: bool,
     gui_dvm_surfaces: bool,
@@ -432,6 +433,7 @@ pub(crate) fn kvm_run_command(config: &Config) -> Result<()> {
     log_kvm_start_phase("resolved-qemu", started_at);
     let options = SmokeOptions {
         dry_run: false,
+        storage_only: false,
         exercise_input: false,
         exercise_network: false,
         gui_dvm_surfaces: true,
@@ -572,6 +574,10 @@ options:
   --dvm-block-shmem    attach a private virtual NVMe namespace only to Linux
                        DVM and the fixed RustOS↔DVM block ring; RustOS receives
                        no native storage controller
+  --storage-dvm-only   run the independent storage-DVM acceptance gate: enable
+                       --dvm-block-shmem and require boot, both block peers,
+                       first completion, and E2E flush without depending on UI,
+                       input, network, or GPU readiness markers
   --physical-gpu <BDF> non-commercial lab mode: attach one already-bound GPU
                        from the sealed physical-GPU profile registry through
                        IOMMUFD instead of virtio-GPU; never binds, unbinds, or
@@ -704,6 +710,7 @@ where
 {
     let mut options = SmokeOptions {
         dry_run: false,
+        storage_only: false,
         exercise_input: false,
         exercise_network: false,
         gui_dvm_surfaces: false,
@@ -726,6 +733,7 @@ where
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--dry-run" => options.dry_run = true,
+            "--storage-dvm-only" => options.storage_only = true,
             "--exercise-input" => options.exercise_input = true,
             "--exercise-network" => options.exercise_network = true,
             "--gui-dvm-surfaces" => options.gui_dvm_surfaces = true,
@@ -800,6 +808,27 @@ where
     // relay path; no QMP-only shortcut is introduced.
     if options.min_ui_fps.is_some() {
         options.exercise_input = true;
+    }
+    if options.storage_only {
+        if options.exercise_input
+            || options.exercise_network
+            || options.gui_dvm_surfaces
+            || options.dvm_network_shmem
+            || options.min_ui_fps.is_some()
+            || options.physical_gpu_bdf.is_some()
+            || options.physical_gpu_firmware.is_some()
+        {
+            bail!(
+                "--storage-dvm-only cannot be combined with UI, input, network, or physical-GPU proof options"
+            );
+        }
+        options.dvm_block_shmem = true;
+        options
+            .expected_markers
+            .retain(|marker| marker != RUSTOS_GPU_SCENE_COMPILER_MARKER);
+        options
+            .expected_dvm_markers
+            .retain(|marker| marker != DVM_GPU_COMPOSITOR_MARKER);
     }
     if options.exercise_input {
         options
@@ -2810,7 +2839,7 @@ fn wait_for_parallel_boot(
             .expected_dvm_markers
             .iter()
             .all(|marker| dvm_log.contains(marker));
-        let dvm_gpu_ready = dvm_gpu_compositor_ready(&dvm_log, gpu_evidence);
+        let dvm_gpu_ready = required_dvm_gpu_ready(options, &dvm_log, gpu_evidence);
         match control_relay.try_recv() {
             Ok(Ok(probe)) => {
                 if control_ready.replace(probe).is_some() {
@@ -2932,6 +2961,14 @@ fn wait_for_parallel_boot(
         }
         thread::sleep(Duration::from_millis(100));
     }
+}
+
+fn required_dvm_gpu_ready(
+    options: &SmokeOptions,
+    log: &str,
+    expected: GpuEvidenceExpectation,
+) -> bool {
+    options.storage_only || dvm_gpu_compositor_ready(log, expected)
 }
 
 fn dvm_gpu_compositor_ready(log: &str, expected: GpuEvidenceExpectation) -> bool {
@@ -3881,7 +3918,7 @@ mod tests {
         dvm_display_relay_ready, dvm_gpu_compositor_ready, dvm_gpu_device, dvm_machine,
         dvm_physical_frames_ready, dvm_pointer_device, is_sha256, mesa_dri_prime_for_pci_bdf,
         parse_dvm_control_contract_text, parse_manifest_text, parse_smoke_options,
-        physical_gpu_profile, prepare_runtime_log, qemu_display_backend,
+        physical_gpu_profile, prepare_runtime_log, qemu_display_backend, required_dvm_gpu_ready,
         runtime_stall_or_crash_observed, select_smoke_guest_display,
         uiserver_has_interactive_slow_loop, uiserver_idle_ticks_healthy,
         uiserver_profile_input_pipeline_healthy, uiserver_profile_meets_fps,
@@ -4150,6 +4187,35 @@ mod tests {
             options
                 .expected_dvm_markers
                 .contains(&DVM_BLOCK_READY_MARKER.to_owned())
+        );
+    }
+
+    #[test]
+    fn storage_only_gate_is_independent_of_gpu_and_enables_block_proof() {
+        let options = parse_smoke_options(vec!["--storage-dvm-only".into()].into_iter()).unwrap();
+        assert!(options.storage_only);
+        assert!(options.dvm_block_shmem);
+        assert!(
+            !options
+                .expected_markers
+                .contains(&RUSTOS_GPU_SCENE_COMPILER_MARKER.to_owned())
+        );
+        assert!(
+            !options
+                .expected_dvm_markers
+                .contains(&DVM_GPU_COMPOSITOR_MARKER.to_owned())
+        );
+        assert!(
+            options
+                .expected_markers
+                .contains(&RUSTOS_DVM_BLOCK_E2E_MARKER.to_owned())
+        );
+        assert!(required_dvm_gpu_ready(&options, "", VIRTUAL_GPU_EVIDENCE));
+        assert!(
+            parse_smoke_options(
+                vec!["--storage-dvm-only".into(), "--gui-dvm-surfaces".into()].into_iter()
+            )
+            .is_err()
         );
     }
 

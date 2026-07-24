@@ -814,6 +814,8 @@ policy remains with the owning service.
   shared ring, the Linux DVM completes the backing-device flush, and storaged
   consumes the exact completion. Storage-DVM KVM acceptance requires this
   proof in addition to both peer readiness flags and exact geometry.
+  `cargo xtask kvm-smoke --timeout 30 --storage-dvm-only` is the independent
+  acceptance gate; it cannot fail or pass because of a UI/GPU marker.
 - Storaged may satisfy repeated FAT metadata and executable reads from at most
   eight validated 64-KiB read-ahead windows (512 KiB total), but it first
   revalidates live DVM geometry and the exact caller generation on every
