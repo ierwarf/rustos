@@ -39,6 +39,23 @@ if ! diff -u <(printf '%s\n' "$implemented_socket_sources") \
     exit 1
 fi
 
+# Host-side DVM vsock and QMP readers cross a stronger trust boundary than a
+# service-local socket. Keep their complete source inventory model-bound too,
+# so a new hardware-domain control surface cannot arrive as an unreviewed
+# parser merely because it lives outside services/.
+registered_host_control_sources="$(
+    awk -F '\t' '$2 == "host-control" {print $4}' "$registry" | sort -u
+)"
+implemented_host_control_sources="$(
+    rg -l 'AF_VSOCK|VMADDR_CID|sockaddr_vm|read_qmp_message|qmp_capabilities' \
+        libs tools --glob '*.rs' | sort -u
+)"
+if ! diff -u <(printf '%s\n' "$implemented_host_control_sources") \
+    <(printf '%s\n' "$registered_host_control_sources"); then
+    echo "host control ingress does not match zero-trust subsystem registry" >&2
+    exit 1
+fi
+
 # A service must name the exact wire contract it emits. Numeric literals make
 # unrelated ABI revisions silently strand a producer or consumer, which turns
 # fail-closed admission into a boot outage instead of a localized rejection.
