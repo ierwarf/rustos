@@ -8,9 +8,9 @@ pub const MAX_BOOT_MEMORY_REGIONS: u32 = 4096;
 pub const MAX_BOOT_FRAMEBUFFER_WIDTH: u32 = 7680;
 pub const MAX_BOOT_FRAMEBUFFER_HEIGHT: u32 = 4320;
 pub const MAX_EARLY_SYSTEM_IMAGE_BYTES: u64 = 256 * 1024 * 1024;
-pub const EARLY_SYSTEM_MAGIC: [u8; 8] = *b"RSEARLY1";
-pub const EARLY_SYSTEM_VERSION: u32 = 1;
-pub const EARLY_SYSTEM_HEADER_BYTES: usize = 64;
+pub const EARLY_SYSTEM_MAGIC: [u8; 8] = *b"RSEARLY2";
+pub const EARLY_SYSTEM_VERSION: u32 = 2;
+pub const EARLY_SYSTEM_HEADER_BYTES: usize = 96;
 pub const EARLY_SYSTEM_ENTRY_BYTES: usize = 160;
 pub const EARLY_SYSTEM_MAX_ENTRIES: u32 = 64;
 pub const EARLY_SYSTEM_MAX_PATH_BYTES: usize = 96;
@@ -276,14 +276,26 @@ pub struct EarlySystemHeader {
     pub entry_count: u32,
     pub payload_offset: u64,
     pub total_bytes: u64,
+    /// Ed25519 verifying key for L0-authenticated storage transport epochs.
+    ///
+    /// The complete early-system image is admitted by the signed GRUB path,
+    /// so this key is immutable ring0 bootstrap authority. The corresponding
+    /// signing key remains on L0 and is never exposed to a storage DVM.
+    pub storage_epoch_verifying_key: [u8; 32],
 }
 
 impl EarlySystemHeader {
-    pub fn new(entry_count: u32, payload_offset: u64, total_bytes: u64) -> Option<Self> {
+    pub fn new(
+        entry_count: u32,
+        payload_offset: u64,
+        total_bytes: u64,
+        storage_epoch_verifying_key: [u8; 32],
+    ) -> Option<Self> {
         let header = Self {
             entry_count,
             payload_offset,
             total_bytes,
+            storage_epoch_verifying_key,
         };
         header.is_valid().then_some(header)
     }
@@ -300,6 +312,10 @@ impl EarlySystemHeader {
                 .is_multiple_of(EARLY_SYSTEM_PAYLOAD_ALIGNMENT)
             && self.payload_offset < self.total_bytes
             && self.total_bytes <= MAX_EARLY_SYSTEM_IMAGE_BYTES
+            && self
+                .storage_epoch_verifying_key
+                .iter()
+                .any(|byte| *byte != 0)
     }
 
     pub fn encode(self) -> Option<[u8; EARLY_SYSTEM_HEADER_BYTES]> {
@@ -315,6 +331,7 @@ impl EarlySystemHeader {
         bytes[24..32].copy_from_slice(&(EARLY_SYSTEM_HEADER_BYTES as u64).to_le_bytes());
         bytes[32..40].copy_from_slice(&self.payload_offset.to_le_bytes());
         bytes[40..48].copy_from_slice(&self.total_bytes.to_le_bytes());
+        bytes[48..80].copy_from_slice(&self.storage_epoch_verifying_key);
         Some(bytes)
     }
 
@@ -325,7 +342,7 @@ impl EarlySystemHeader {
             || read_u32(bytes, 12)? != EARLY_SYSTEM_HEADER_BYTES as u32
             || read_u32(bytes, 20)? != EARLY_SYSTEM_ENTRY_BYTES as u32
             || read_u64(bytes, 24)? != EARLY_SYSTEM_HEADER_BYTES as u64
-            || bytes[48..EARLY_SYSTEM_HEADER_BYTES]
+            || bytes[80..EARLY_SYSTEM_HEADER_BYTES]
                 .iter()
                 .any(|byte| *byte != 0)
         {
@@ -335,6 +352,7 @@ impl EarlySystemHeader {
             entry_count: read_u32(bytes, 16)?,
             payload_offset: read_u64(bytes, 32)?,
             total_bytes: read_u64(bytes, 40)?,
+            storage_epoch_verifying_key: bytes[48..80].try_into().ok()?,
         };
         header.is_valid().then_some(header)
     }
@@ -749,7 +767,7 @@ mod tests {
 
     #[test]
     fn early_system_records_are_fixed_bounded_and_canonical() {
-        let header = EarlySystemHeader::new(1, 4096, 8192).expect("header");
+        let header = EarlySystemHeader::new(1, 4096, 8192, [0x5a; 32]).expect("header");
         assert_eq!(
             EarlySystemHeader::decode(&header.encode().expect("encode")),
             Some(header)

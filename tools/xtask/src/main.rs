@@ -6,6 +6,7 @@ mod kvm;
 mod layering;
 mod package_manifest;
 mod stage;
+mod storage_epoch;
 mod testinfra;
 mod util;
 

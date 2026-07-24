@@ -2,7 +2,7 @@
 /*
  * Minimal RustOS storage-DVM ivshmem adapter.
  *
- * It binds only an exact RSDVMBL1 aperture, allocates one MSI-X vector, maps
+ * It binds only an exact RSDVMBL2 aperture, allocates one MSI-X vector, maps
  * only that fixed aperture into the relay, and converts a UIO irqcontrol write
  * into the fixed peer-0/vector-0 completion doorbell. Userspace never receives
  * raw BAR0 MMIO authority.
@@ -25,9 +25,9 @@
 #define RUSTOS_DVM_BLOCK_MSIX_VECTORS 1
 #define RUSTOS_DVM_BLOCK_UIO_NAME "rustos-dvm-block"
 
-#define RUSTOS_DVM_BLOCK_VERSION 1U
+#define RUSTOS_DVM_BLOCK_VERSION 2U
 #define RUSTOS_DVM_BLOCK_HEADER_BYTES 4096U
-#define RUSTOS_DVM_BLOCK_RECORD_BYTES 128U
+#define RUSTOS_DVM_BLOCK_RECORD_BYTES 192U
 #define RUSTOS_DVM_BLOCK_QUEUE_DEPTH 64U
 #define RUSTOS_DVM_BLOCK_SLOT_BYTES (64U * 1024U)
 #define RUSTOS_DVM_BLOCK_USED_BYTES \
@@ -46,7 +46,7 @@ static_assert((RUSTOS_DVM_BLOCK_APERTURE_BYTES &
 #define RUSTOS_DVM_BLOCK_KNOWN_FLAGS (BIT(0) | BIT(1) | BIT(2))
 
 static const u8 rustos_dvm_block_magic[8] = {
-	'R', 'S', 'D', 'V', 'M', 'B', 'L', '1'
+	'R', 'S', 'D', 'V', 'M', 'B', 'L', '2'
 };
 
 struct rustos_dvm_block_uio {
@@ -119,7 +119,8 @@ static int rustos_dvm_block_validate_aperture(struct pci_dev *pdev)
 	    (!(flags & BIT(1)) ||
 	     (flags & RUSTOS_DVM_BLOCK_FLAG_RUSTOS_READY)) &&
 	    !memchr_inv(bytes + 68U, 0, 4U) &&
-	    !memchr_inv(bytes + 104U, 0, 24U) &&
+	    memchr_inv(bytes + 104U, 0, 64U) &&
+	    !memchr_inv(bytes + 168U, 0, 24U) &&
 	    rustos_dvm_cursor_pair_valid(request_producer,
 					 request_consumer) &&
 	    rustos_dvm_cursor_pair_valid(completion_producer,

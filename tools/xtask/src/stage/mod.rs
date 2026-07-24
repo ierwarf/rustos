@@ -145,7 +145,13 @@ pub(crate) fn stage(config: &Config) -> Result<()> {
 }
 
 fn write_early_system_image(config: &Config) -> Result<()> {
-    let image = build_early_system_image(&config.image_dir, EARLY_SYSTEM_BOOTSTRAP_PATHS)?;
+    let signing_key =
+        crate::storage_epoch::load_or_create_signing_key(&config.storage_epoch_signing_key)?;
+    let image = build_early_system_image(
+        &config.image_dir,
+        EARLY_SYSTEM_BOOTSTRAP_PATHS,
+        signing_key.verifying_key().to_bytes(),
+    )?;
     let work_dir = config.build_dir.join("early-system");
     fs::create_dir_all(&work_dir)?;
     let image_path = work_dir.join("early-system.img");
@@ -163,7 +169,11 @@ fn write_early_system_image(config: &Config) -> Result<()> {
     Ok(())
 }
 
-fn build_early_system_image(image_dir: &Path, paths: &[&str]) -> Result<Vec<u8>> {
+fn build_early_system_image(
+    image_dir: &Path,
+    paths: &[&str],
+    storage_epoch_verifying_key: [u8; 32],
+) -> Result<Vec<u8>> {
     if paths.is_empty() || paths.len() > EARLY_SYSTEM_MAX_ENTRIES as usize {
         bail!("early-system allowlist count is outside the fixed ABI bound");
     }
@@ -207,6 +217,7 @@ fn build_early_system_image(image_dir: &Path, paths: &[&str]) -> Result<Vec<u8>>
         u32::try_from(files.len()).context("early-system entry count overflow")?,
         payload_offset,
         payload_cursor,
+        storage_epoch_verifying_key,
     )
     .context("early-system header violates the fixed ABI")?;
     let image_len =
@@ -1237,7 +1248,8 @@ mod tests {
         std::fs::write(root.join("services/b/b.elf"), b"beta").unwrap();
 
         let image =
-            build_early_system_image(root, &["services/b/b.elf", "services/a/a.elf"]).unwrap();
+            build_early_system_image(root, &["services/b/b.elf", "services/a/a.elf"], [0x5a; 32])
+                .unwrap();
         let header = EarlySystemHeader::decode(&image).unwrap();
         assert_eq!(header.entry_count, 2);
         assert_eq!(header.total_bytes as usize, image.len());

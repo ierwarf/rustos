@@ -1948,10 +1948,11 @@ fn read_gui_u64(bytes: &[u8; DVM_GUI_SURFACE_MESSAGE_BYTES], offset: usize) -> O
 /// RustOS peer 0 for completions or readiness withdrawal. Doorbell edges are
 /// advisory and may coalesce: consumers check the cursor before arming, arm,
 /// recheck, and drain until the authoritative ring cursors are equal.
-pub const DVM_BLOCK_MAGIC: [u8; 8] = *b"RSDVMBL1";
-pub const DVM_BLOCK_VERSION: u32 = 1;
+pub const DVM_BLOCK_MAGIC: [u8; 8] = *b"RSDVMBL2";
+pub const DVM_BLOCK_VERSION: u32 = 2;
 pub const DVM_BLOCK_HEADER_BYTES: u32 = 4096;
-pub const DVM_BLOCK_HEADER_RECORD_BYTES: usize = 128;
+pub const DVM_BLOCK_HEADER_RECORD_BYTES: usize = 192;
+pub const DVM_BLOCK_EPOCH_SIGNING_BYTES: usize = 72;
 pub const DVM_BLOCK_RECORD_BYTES: usize = 64;
 pub const DVM_BLOCK_QUEUE_DEPTH: u32 = 64;
 pub const DVM_BLOCK_DATA_SLOT_BYTES: u32 = 64 * 1024;
@@ -2005,6 +2006,11 @@ pub struct DvmBlockHeader {
     pub request_consumer: u64,
     pub completion_producer: u64,
     pub completion_consumer: u64,
+    /// Ed25519 signature over `epoch_signing_bytes()`, produced by L0.
+    ///
+    /// The DVM maps this record writable for ring progress, so the signature
+    /// is the authority boundary for immutable geometry and generation.
+    pub epoch_signature: [u8; 64],
 }
 
 impl DvmBlockHeader {
@@ -2029,7 +2035,30 @@ impl DvmBlockHeader {
             request_consumer: 0,
             completion_producer: 0,
             completion_consumer: 0,
+            epoch_signature: [0; 64],
         }
+    }
+
+    pub const fn with_epoch_signature(mut self, epoch_signature: [u8; 64]) -> Self {
+        self.epoch_signature = epoch_signature;
+        self
+    }
+
+    pub fn epoch_signing_bytes(self) -> [u8; DVM_BLOCK_EPOCH_SIGNING_BYTES] {
+        let mut bytes = [0_u8; DVM_BLOCK_EPOCH_SIGNING_BYTES];
+        bytes[0..8].copy_from_slice(&DVM_BLOCK_MAGIC);
+        bytes[8..12].copy_from_slice(&DVM_BLOCK_VERSION.to_le_bytes());
+        bytes[12..16].copy_from_slice(&DVM_BLOCK_HEADER_BYTES.to_le_bytes());
+        bytes[16..24].copy_from_slice(&self.region_bytes.to_le_bytes());
+        bytes[24..28].copy_from_slice(&self.queue_depth.to_le_bytes());
+        bytes[28..32].copy_from_slice(&self.data_slot_bytes.to_le_bytes());
+        bytes[32..40].copy_from_slice(&self.features.to_le_bytes());
+        bytes[40..48].copy_from_slice(&self.generation.to_le_bytes());
+        bytes[48..56].copy_from_slice(&self.capacity_sectors.to_le_bytes());
+        bytes[56..60].copy_from_slice(&self.logical_block_size.to_le_bytes());
+        bytes[60..64].copy_from_slice(&self.physical_block_size.to_le_bytes());
+        bytes[64..68].copy_from_slice(&(self.flags & DVM_BLOCK_FLAG_READ_ONLY).to_le_bytes());
+        bytes
     }
 
     pub fn is_valid(self) -> bool {
@@ -2051,6 +2080,7 @@ impl DvmBlockHeader {
                 || self.flags & DVM_BLOCK_FLAG_RUSTOS_READY != 0)
             && bounded_block_cursor_pair(self.request_producer, self.request_consumer)
             && bounded_block_cursor_pair(self.completion_producer, self.completion_consumer)
+            && self.epoch_signature.iter().any(|byte| *byte != 0)
     }
 
     pub fn encode(self) -> [u8; DVM_BLOCK_HEADER_RECORD_BYTES] {
@@ -2071,6 +2101,7 @@ impl DvmBlockHeader {
         bytes[80..88].copy_from_slice(&self.request_consumer.to_le_bytes());
         bytes[88..96].copy_from_slice(&self.completion_producer.to_le_bytes());
         bytes[96..104].copy_from_slice(&self.completion_consumer.to_le_bytes());
+        bytes[104..168].copy_from_slice(&self.epoch_signature);
         bytes
     }
 
@@ -2079,7 +2110,7 @@ impl DvmBlockHeader {
             || block_read_u32(bytes, 8)? != DVM_BLOCK_VERSION
             || block_read_u32(bytes, 12)? != DVM_BLOCK_HEADER_BYTES
             || bytes[68..72].iter().any(|byte| *byte != 0)
-            || bytes[104..].iter().any(|byte| *byte != 0)
+            || bytes[168..].iter().any(|byte| *byte != 0)
         {
             return None;
         }
@@ -2097,6 +2128,7 @@ impl DvmBlockHeader {
             request_consumer: block_read_u64(bytes, 80)?,
             completion_producer: block_read_u64(bytes, 88)?,
             completion_consumer: block_read_u64(bytes, 96)?,
+            epoch_signature: bytes[104..168].try_into().ok()?,
         };
         header.is_valid().then_some(header)
     }
@@ -3958,7 +3990,8 @@ mod block_transport_tests {
                 | DVM_BLOCK_FEATURE_WRITE_ZEROES
                 | DVM_BLOCK_FEATURE_FUA
                 | DVM_BLOCK_FEATURE_WRITEBACK,
-        );
+        )
+        .with_epoch_signature([0x5a; 64]);
         header.flags |= DVM_BLOCK_FLAG_RUSTOS_READY | DVM_BLOCK_FLAG_DVM_READY;
         header
     }
@@ -3980,8 +4013,12 @@ mod block_transport_tests {
         assert!(!overrun.is_valid());
 
         let mut reserved = header.encode();
-        reserved[104] = 1;
+        reserved[168] = 1;
         assert!(DvmBlockHeader::decode(&reserved).is_none());
+
+        let mut unsigned = header;
+        unsigned.epoch_signature = [0; 64];
+        assert!(!unsigned.is_valid());
     }
 
     #[test]

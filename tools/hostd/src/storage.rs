@@ -1,7 +1,8 @@
+use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io;
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{FileExt, FileTypeExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{FileExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -11,9 +12,11 @@ use driver_domain_protocol::{
     DVM_BLOCK_FEATURE_FUA, DVM_BLOCK_FEATURE_WRITE_ZEROES, DVM_BLOCK_FEATURE_WRITEBACK,
     DVM_BLOCK_FLAG_READ_ONLY, DVM_BLOCK_HEADER_RECORD_BYTES, DvmBlockHeader,
 };
+use ed25519_dalek::{Signer, SigningKey};
 use rustos_driver_domain_host::{
     PhysicalStoragePolicy, ValidatedLease, validate_physical_storage_assignment,
 };
+use sha2::{Digest, Sha256};
 
 const BLKROGET: libc::c_ulong = 0x125e;
 const BLKFLSBUF: libc::c_ulong = 0x1261;
@@ -72,6 +75,7 @@ pub fn prepare_storage_handoff(
     proc_root: &Path,
     policy: &PhysicalStoragePolicy,
     aperture_path: &Path,
+    epoch_signing_key: &SigningKey,
 ) -> Result<StorageHandoffGuard> {
     let controller_bdf = validate_physical_storage_assignment(lease, sysfs_root, policy)?;
     let block_name = discover_whole_block_device(sysfs_root, &controller_bdf)?;
@@ -91,6 +95,11 @@ pub fn prepare_storage_handoff(
     if geometry.read_only {
         header.flags |= DVM_BLOCK_FLAG_READ_ONLY;
     }
+    header = header.with_epoch_signature(
+        epoch_signing_key
+            .sign(&header.epoch_signing_bytes())
+            .to_bytes(),
+    );
     if !header.is_valid() {
         bail!("derived physical storage geometry does not satisfy the block transport ABI");
     }
@@ -106,6 +115,45 @@ pub fn prepare_storage_handoff(
         },
         committed: false,
     })
+}
+
+pub fn load_storage_epoch_signing_key(path: &Path) -> Result<SigningKey> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .with_context(|| format!("open storage epoch signing key {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .context("inspect opened storage epoch signing key")?;
+    if !metadata.file_type().is_file() {
+        bail!("storage epoch signing key must be a regular non-symlink file");
+    }
+    if metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o077 != 0
+        || metadata.len() != 32
+    {
+        bail!(
+            "storage epoch signing key must be caller-owned, mode 0600 or stricter, and exactly 32 bytes"
+        );
+    }
+    let mut seed = [0_u8; 32];
+    file.read_exact_at(&mut seed, 0)?;
+    if seed.iter().all(|byte| *byte == 0) {
+        bail!("storage epoch signing key must not be the all-zero seed");
+    }
+    let key = SigningKey::from_bytes(&seed);
+    seed.fill(0);
+    Ok(key)
+}
+
+pub fn storage_epoch_verifying_key_sha256(key: &SigningKey) -> String {
+    let digest = Sha256::digest(key.verifying_key().as_bytes());
+    let mut encoded = String::with_capacity(64);
+    for byte in digest {
+        write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    encoded
 }
 
 pub fn revoke_storage_aperture(path: &Path, expected_generation: u64) -> Result<()> {
@@ -592,9 +640,16 @@ mod tests {
         DVM_BLOCK_APERTURE_BYTES, DVM_BLOCK_FEATURE_FLUSH, DVM_BLOCK_HEADER_RECORD_BYTES,
         DvmBlockHeader,
     };
+    use ed25519_dalek::{Signer, SigningKey};
     use std::fs;
     use std::os::unix::fs::{FileExt, PermissionsExt, symlink};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn signed_header(generation: u64) -> DvmBlockHeader {
+        let key = SigningKey::from_bytes(&[0x42; 32]);
+        let header = DvmBlockHeader::new(generation, 4096, 512, 4096, DVM_BLOCK_FEATURE_FLUSH);
+        header.with_epoch_signature(key.sign(&header.epoch_signing_bytes()).to_bytes())
+    }
 
     #[test]
     fn aperture_epochs_are_clean_monotonic_and_revocable() {
@@ -611,13 +666,13 @@ mod tests {
         let path = root.join("block.ivshmem");
         let (file, canonical, generation) = prepare_aperture(&path).unwrap();
         assert_eq!(generation, 1);
-        let header = DvmBlockHeader::new(1, 4096, 512, 4096, DVM_BLOCK_FEATURE_FLUSH);
+        let header = signed_header(1);
         initialize_aperture(&file, header).unwrap();
         drop(file);
 
         let (file, _, generation) = prepare_aperture(&path).unwrap();
         assert_eq!(generation, 2);
-        let next = DvmBlockHeader::new(2, 4096, 512, 4096, DVM_BLOCK_FEATURE_FLUSH);
+        let next = signed_header(2);
         initialize_aperture(&file, next).unwrap();
         drop(file);
         revoke_storage_aperture(&canonical, 2).unwrap();

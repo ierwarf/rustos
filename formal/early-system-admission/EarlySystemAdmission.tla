@@ -21,11 +21,11 @@ early-system state therefore terminates without a physical fallback.
 
 CONSTANTS Services, RequiredBootstrap
 
-VARIABLES phase, moduleCount, tableWellFormed, declared, digestValid, loaded,
-          nativeProbe
+VARIABLES phase, moduleCount, tableWellFormed, verifyingKeyValid, declared,
+          digestValid, loaded, nativeProbe
 
-vars == <<phase, moduleCount, tableWellFormed, declared, digestValid, loaded,
-          nativeProbe>>
+vars == <<phase, moduleCount, tableWellFormed, verifyingKeyValid, declared,
+          digestValid, loaded, nativeProbe>>
 
 Phases == {"inspect", "admitted", "dvm-storage-ready", "failed"}
 
@@ -33,6 +33,7 @@ Init ==
     /\ phase = "inspect"
     /\ moduleCount \in 0..2
     /\ tableWellFormed \in BOOLEAN
+    /\ verifyingKeyValid \in BOOLEAN
     /\ declared \in SUBSET Services
     /\ digestValid \in SUBSET Services
     /\ loaded = {}
@@ -42,18 +43,19 @@ Admit ==
     /\ phase = "inspect"
     /\ moduleCount = 1
     /\ tableWellFormed
+    /\ verifyingKeyValid
     /\ RequiredBootstrap \subseteq declared
     /\ phase' = "admitted"
-    /\ UNCHANGED <<moduleCount, tableWellFormed, declared, digestValid, loaded,
-                   nativeProbe>>
+    /\ UNCHANGED <<moduleCount, tableWellFormed, verifyingKeyValid, declared,
+                   digestValid, loaded, nativeProbe>>
 
 RejectEnvelope ==
     /\ phase = "inspect"
-    /\ ~(moduleCount = 1 /\ tableWellFormed /\
+    /\ ~(moduleCount = 1 /\ tableWellFormed /\ verifyingKeyValid /\
          RequiredBootstrap \subseteq declared)
     /\ phase' = "failed"
-    /\ UNCHANGED <<moduleCount, tableWellFormed, declared, digestValid, loaded,
-                   nativeProbe>>
+    /\ UNCHANGED <<moduleCount, tableWellFormed, verifyingKeyValid, declared,
+                   digestValid, loaded, nativeProbe>>
 
 LoadOne(service) ==
     /\ phase = "admitted"
@@ -61,22 +63,22 @@ LoadOne(service) ==
     /\ service \in declared
     /\ service \in digestValid
     /\ loaded' = loaded \cup {service}
-    /\ UNCHANGED <<phase, moduleCount, tableWellFormed, declared, digestValid,
-                   nativeProbe>>
+    /\ UNCHANGED <<phase, moduleCount, tableWellFormed, verifyingKeyValid,
+                   declared, digestValid, nativeProbe>>
 
 RejectDigest ==
     /\ phase = "admitted"
     /\ \E service \in RequiredBootstrap \ loaded: service \notin digestValid
     /\ phase' = "failed"
-    /\ UNCHANGED <<moduleCount, tableWellFormed, declared, digestValid, loaded,
-                   nativeProbe>>
+    /\ UNCHANGED <<moduleCount, tableWellFormed, verifyingKeyValid, declared,
+                   digestValid, loaded, nativeProbe>>
 
 PublishDvmStorage ==
     /\ phase = "admitted"
     /\ loaded = RequiredBootstrap
     /\ phase' = "dvm-storage-ready"
-    /\ UNCHANGED <<moduleCount, tableWellFormed, declared, digestValid, loaded,
-                   nativeProbe>>
+    /\ UNCHANGED <<moduleCount, tableWellFormed, verifyingKeyValid, declared,
+                   digestValid, loaded, nativeProbe>>
 
 Next ==
     Admit
@@ -89,6 +91,7 @@ TypeOK ==
     /\ phase \in Phases
     /\ moduleCount \in 0..2
     /\ tableWellFormed \in BOOLEAN
+    /\ verifyingKeyValid \in BOOLEAN
     /\ declared \in SUBSET Services
     /\ digestValid \in SUBSET Services
     /\ loaded \in SUBSET Services
@@ -101,8 +104,11 @@ LoadedFilesAreExactAndVerified ==
 
 AdmissionRequiresUniqueWellFormedModule ==
     phase \in {"admitted", "dvm-storage-ready"} =>
-        moduleCount = 1 /\ tableWellFormed /\
+        moduleCount = 1 /\ tableWellFormed /\ verifyingKeyValid /\
         RequiredBootstrap \subseteq declared
+
+StorageEpochKeyIsImmutableAuthority ==
+    phase \in {"admitted", "dvm-storage-ready"} => verifyingKeyValid
 
 DvmStorageWaitsForBootstrap ==
     phase = "dvm-storage-ready" => loaded = RequiredBootstrap

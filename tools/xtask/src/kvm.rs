@@ -65,7 +65,7 @@ const DVM_GPU_COMPOSITOR_MARKER: &str = "rustos-dvm-gpu: ready contract=1";
 const DVM_GPU_LIVE_MARKER: &str = "rustos-dvm-display: gpu-compositor primed contract=3";
 const RUSTOS_DVM_BLOCK_MARKER: &str = "dvm-block: transport installed generation=1";
 const RUSTOS_DVM_BLOCK_E2E_MARKER: &str = "storaged: dvm-block e2e flush completed generation=1";
-const DVM_BLOCK_READY_MARKER: &str = "rustos-dvm-block: ready abi=1 generation=1";
+const DVM_BLOCK_READY_MARKER: &str = "rustos-dvm-block: ready abi=2 generation=1";
 const DVM_GPU_PIPELINE_PRIME_TIMEOUT_US: u64 = 500_000;
 const DVM_GPU_HEALTH_SAMPLES: u64 = 3;
 const PHYSICAL_GPU_SMOKE_MIN_FRAMES: usize = 4;
@@ -1304,7 +1304,7 @@ fn prepare_layout(config: &Config, options: &SmokeOptions) -> Result<KvmLayout> 
         })?;
         fs::set_permissions(&disk, std::fs::Permissions::from_mode(0o600))?;
         let aperture = run_dir.join("dvm-block.ivshmem");
-        create_dvm_block_aperture(&aperture, &disk)?;
+        create_dvm_block_aperture(&aperture, &disk, &config.storage_epoch_signing_key)?;
         (
             Some(aperture),
             Some(run_dir.join("dvm-block-doorbell.sock")),
@@ -1441,7 +1441,7 @@ fn create_dvm_network_shmem(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn create_dvm_block_aperture(path: &Path, disk: &Path) -> Result<()> {
+fn create_dvm_block_aperture(path: &Path, disk: &Path, signing_key_path: &Path) -> Result<()> {
     for candidate in [path, disk] {
         if candidate.to_string_lossy().contains(',') {
             bail!(
@@ -1456,12 +1456,16 @@ fn create_dvm_block_aperture(path: &Path, disk: &Path) -> Result<()> {
     if disk_bytes == 0 || !disk_bytes.is_multiple_of(512) {
         bail!("private storage-DVM disk must be non-empty and 512-byte aligned");
     }
-    let header = DvmBlockHeader::new(
-        1,
-        disk_bytes / 512,
-        512,
-        512,
-        DVM_BLOCK_FEATURE_FLUSH | DVM_BLOCK_FEATURE_FUA,
+    let signing_key = crate::storage_epoch::load_signing_key(signing_key_path)?;
+    let header = crate::storage_epoch::sign_epoch(
+        &signing_key,
+        DvmBlockHeader::new(
+            1,
+            disk_bytes / 512,
+            512,
+            512,
+            DVM_BLOCK_FEATURE_FLUSH | DVM_BLOCK_FEATURE_FUA,
+        ),
     );
     if !header.is_valid() {
         bail!("refusing to create invalid fixed DVM block header");

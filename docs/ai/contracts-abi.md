@@ -686,14 +686,19 @@ policy remains with the owning service.
   and original-driver restoration follow aperture revocation; any failed step
   retains the lease and quarantine evidence instead of fabricating release.
 - `driver-domain-protocol` owns the versioned, address-free DVM block wire
-  contract. Version 1 fixes one 8-MiB power-of-two PCI BAR, two 64-entry rings,
+  contract. Version 2 fixes one 8-MiB power-of-two PCI BAR, two 64-entry rings,
   and 64 host-owned 64-KiB transfer slots. The unused tail after the fixed slot
   array is reserved and grants no addressable request/data authority. Requests
   name only a slot, launch generation, request ID, monotonic
   mutation operation ID, sector range, and Virtio-compatible
   READ/WRITE/FLUSH/DISCARD/WRITE_ZEROES operation. Unknown flags, reserved
   bytes, stale generations, unaligned/overflowing ranges, read-only mutations,
-  and unsupported features fail closed.
+  and unsupported features fail closed. Its immutable geometry and generation
+  carry an Ed25519 L0 signature. The verifying key is embedded in the
+  GRUB-authenticated early-system header; the caller-owned signing key remains
+  on L0 and is never mapped into the storage DVM. Signed schema-4 policy binds
+  the SHA-256 of that verifying key, so hostd rejects an operator-supplied
+  signer for a different RustOS image before freezing the whole device.
 - Every shared block-header scalar is naturally aligned. The four 64-bit ring
   cursors are single-copy atomic little-endian values: each ring has exactly
   one producer and one consumer, the producer publishes its record/data before
@@ -703,9 +708,13 @@ policy remains with the owning service.
   validates immutable fields separately from live cursors so normal peer
   progress cannot be mistaken for corruption, while any identity, geometry,
   feature, read-only-mode, or generation mutation revokes the aperture.
-- L0 initializes authenticated immutable geometry with both readiness bits
+- L0 initializes signed immutable geometry with both readiness bits
   clear. RustOS alone sets `RUSTOS_READY`, only after the exact aperture and
-  its MSI-X receiver are installed, then rings peer 1. The storage DVM may
+  its MSI-X receiver are installed, then rings peer 1. Publication is one
+  compare-exchange from the exact verified flags snapshot; if the peer changes
+  any readiness state between verification and publication, the operation
+  fails without setting `RUSTOS_READY` and the epoch remains revoked. The
+  storage DVM may
   bind the initial aperture but must not publish `DVM_READY` until it observes
   that RustOS bit, validates the Linux block geometry, and owns the physical
   controller. Pre-setting either peer's bit, retaining readiness across an
@@ -738,7 +747,11 @@ policy remains with the owning service.
   FLUSH report the exact durable-through operation ID; ordinary writeback
   completions may report only an earlier accepted mutation. DVM restart clears
   both rings and readiness, revokes the old generation, and requires a new
-  authenticated readiness publication before requests resume.
+  authenticated readiness publication before requests resume. RustOS accepts
+  a successor aperture on the existing mapping only after the prior epoch has
+  revoked, all four cursors are zero, the generation strictly increases, and
+  the successor signature verifies against the immutable early-system key.
+  A stale, unsigned, or DVM-forged header remains revoked.
 - Ring0's DVM block endpoint is transport substrate only. It validates one
   exact aperture, arms exactly one MSI-X leaf that only wakes, copies bounded
   records/data, and exposes nonblocking submit/collect/cancel plus a
@@ -804,10 +817,16 @@ policy remains with the owning service.
   Successful spawn ownership prevents duplicates while endpoint readiness is
   pending.
 - Design sources: Linux VFIO defines the IOMMU group as the minimum viable
-  ownership unit (`https://www.kernel.org/doc/html/latest/driver-api/vfio.html`);
+  ownership unit (`https://docs.kernel.org/driver-api/vfio.html`);
+  RFC 8032 defines the Ed25519 signature encoding and verification algorithm
+  used to authenticate immutable storage transport epochs
+  (`https://www.rfc-editor.org/rfc/rfc8032.html`);
+  Linux writeback-cache control defines PREFLUSH/FUA completion ordering and
+  the rule that a successful flush makes earlier writes durable
+  (`https://docs.kernel.org/block/writeback_cache_control.html`);
   Linux stable block queue ABI defines logical/physical sizes, FUA, discard,
   write cache, and write-zeroes
-  (`https://www.kernel.org/doc/html/latest/admin-guide/abi-stable-files.html`);
+  (`https://docs.kernel.org/admin-guide/abi-stable-files.html`);
   QEMU ivshmem-doorbell defines the shared-memory server and interrupt-vector
   topology (`https://www.qemu.org/docs/master/system/devices/ivshmem.html`,
   `https://www.qemu.org/docs/master/specs/ivshmem-spec.html`); Linux sizes

@@ -34,6 +34,7 @@ pub(crate) struct Config {
     pub(crate) rustos_gpg_home: Option<PathBuf>,
     pub(crate) rustos_grub_sbat: Option<PathBuf>,
     pub(crate) rustos_grub_modules: Option<String>,
+    pub(crate) storage_epoch_signing_key: PathBuf,
     pub(crate) build_dir: PathBuf,
     pub(crate) artifact_dir: PathBuf,
     pub(crate) logs_dir: PathBuf,
@@ -104,6 +105,8 @@ impl Config {
         let rustos_gpg_home = env_path("RUSTOS_GPG_HOME");
         let rustos_grub_sbat = env_path("RUSTOS_GRUB_SBAT");
         let rustos_grub_modules = env_string("RUSTOS_GRUB_MODULES");
+        let storage_epoch_signing_key = env_path("RUSTOS_STORAGE_EPOCH_SIGNING_KEY")
+            .unwrap_or_else(|| build_dir.join("dev-storage-epoch-ed25519.key"));
         Ok(Self {
             project,
             image_asset_overlay_dir: env_path("IMAGE_ASSET_OVERLAY_DIR")
@@ -156,6 +159,7 @@ impl Config {
             rustos_gpg_home,
             rustos_grub_sbat,
             rustos_grub_modules,
+            storage_epoch_signing_key,
             build_dir,
             artifact_dir,
             logs_dir,

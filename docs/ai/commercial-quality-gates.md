@@ -107,10 +107,12 @@ This instrumentation and its finite model do not close the physical gate while
 the only available AMD function remains the active L0 boot display.
 
 The current implementation slice intentionally excludes trusted UI/multi-DVM
-focus authority and physical network/block DVM assignment. Their existing
-fail-closed or virtual-transport models remain useful, but they are not enabled
-commercial product topologies and must not inherit authority from the physical
-display-DVM lifecycle.
+focus authority and physical network DVM assignment. Physical block-DVM
+assignment is source-enabled behind signed schema-4 policy, an L0-signed
+transport epoch, exact-process supervision, VFIO/IOMMU admission, and ordered
+revoke/reset/restore. It remains a failed hardware acceptance gate until target
+NVMe and AHCI fault/reset/revoke captures pass; virtual transport evidence does
+not substitute for those captures.
 
 ## Architecture baselines
 

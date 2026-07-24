@@ -457,6 +457,7 @@ pub struct PhysicalStoragePolicy {
     driver: String,
     pci_vendor: u16,
     pci_device: u16,
+    epoch_verifying_key_sha256: String,
     handoff_timeout_ms: u64,
     reset_timeout_ms: u64,
 }
@@ -472,6 +473,10 @@ impl PhysicalStoragePolicy {
 
     pub const fn pci_device(&self) -> u16 {
         self.pci_device
+    }
+
+    pub fn epoch_verifying_key_sha256(&self) -> &str {
+        &self.epoch_verifying_key_sha256
     }
 
     pub const fn handoff_timeout_ms(&self) -> u64 {
@@ -669,7 +674,7 @@ impl DriverDomainPolicy {
             "DISPLAY_MAX_SAMPLE_AGE_MS",
             "DISPLAY_REQUIRED_CONSECUTIVE_SAMPLES",
         ];
-        const REQUIRED_V4: [&str; 15] = [
+        const REQUIRED_V4: [&str; 16] = [
             "DRIVER_DOMAIN_POLICY_SCHEMA",
             "DOMAIN_ID",
             "QEMU_SHA256",
@@ -680,6 +685,7 @@ impl DriverDomainPolicy {
             "STORAGE_DRIVER",
             "STORAGE_PCI_VENDOR",
             "STORAGE_PCI_DEVICE",
+            "STORAGE_EPOCH_VERIFYING_KEY_SHA256",
             "STORAGE_REQUIRED_FEATURES",
             "STORAGE_QUEUE_DEPTH",
             "STORAGE_DATA_SLOT_BYTES",
@@ -803,6 +809,10 @@ impl DriverDomainPolicy {
                 "STORAGE_PCI_DEVICE",
                 label,
             )?;
+            let epoch_verifying_key_sha256 = parse_sha256(
+                launch_plan_value(&values, "STORAGE_EPOCH_VERIFYING_KEY_SHA256", label)?,
+                label,
+            )?;
             if launch_plan_value(&values, "STORAGE_REQUIRED_FEATURES", label)? != "flush" {
                 bail!("{label} storage transport must require flush");
             }
@@ -839,6 +849,7 @@ impl DriverDomainPolicy {
                 driver,
                 pci_vendor,
                 pci_device,
+                epoch_verifying_key_sha256,
                 handoff_timeout_ms,
                 reset_timeout_ms,
             })
@@ -4302,12 +4313,19 @@ mod tests {
     fn block_evidence_is_exact_epoch_bound_and_writable() {
         let policy = DriverDomainPolicy::parse(
             &format!(
-                "DRIVER_DOMAIN_POLICY_SCHEMA=4\nDOMAIN_ID=linux-dvm-storage0\nQEMU_SHA256={}\nINPUT_TRANSPORT=disabled\nNETWORK_TRANSPORT=disabled\nBLOCK_TRANSPORT=block-ring-msix\nDISPLAY_TRANSPORT=disabled\nSTORAGE_DRIVER=nvme\nSTORAGE_PCI_VENDOR=144d\nSTORAGE_PCI_DEVICE=a80b\nSTORAGE_REQUIRED_FEATURES=flush\nSTORAGE_QUEUE_DEPTH=64\nSTORAGE_DATA_SLOT_BYTES=65536\nSTORAGE_HANDOFF_TIMEOUT_MS=5000\nSTORAGE_RESET_TIMEOUT_MS=5000\n",
+                "DRIVER_DOMAIN_POLICY_SCHEMA=4\nDOMAIN_ID=linux-dvm-storage0\nQEMU_SHA256={}\nINPUT_TRANSPORT=disabled\nNETWORK_TRANSPORT=disabled\nBLOCK_TRANSPORT=block-ring-msix\nDISPLAY_TRANSPORT=disabled\nSTORAGE_DRIVER=nvme\nSTORAGE_PCI_VENDOR=144d\nSTORAGE_PCI_DEVICE=a80b\nSTORAGE_EPOCH_VERIFYING_KEY_SHA256=5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a\nSTORAGE_REQUIRED_FEATURES=flush\nSTORAGE_QUEUE_DEPTH=64\nSTORAGE_DATA_SLOT_BYTES=65536\nSTORAGE_HANDOFF_TIMEOUT_MS=5000\nSTORAGE_RESET_TIMEOUT_MS=5000\n",
                 "a".repeat(64)
             ),
             "block-evidence-policy",
         )
         .unwrap();
+        assert_eq!(
+            policy
+                .physical_storage()
+                .unwrap()
+                .epoch_verifying_key_sha256(),
+            "5a".repeat(32)
+        );
         let message = parse_message(
             "RESPONSE\nid=5\nop=block-evidence-v1\nstatus=ok\ngeneration=9\ndriver=nvme\npci-vendor=144d\npci-device=a80b\nguest-pci-bdf=0000:00:04.0\nblock-name=nvme0n1\ncapacity-sectors=1048576\nlogical-block-size=512\nphysical-block-size=4096\nfeatures=0000000000000019\nread-only=no",
         )
@@ -4467,7 +4485,7 @@ mod tests {
     fn storage_policy_binds_exact_block_abi_and_driver() {
         let policy = DriverDomainPolicy::parse(
             &format!(
-                "DRIVER_DOMAIN_POLICY_SCHEMA=4\nDOMAIN_ID=linux-dvm-storage0\nQEMU_SHA256={}\nINPUT_TRANSPORT=disabled\nNETWORK_TRANSPORT=disabled\nBLOCK_TRANSPORT=block-ring-msix\nDISPLAY_TRANSPORT=disabled\nSTORAGE_DRIVER=nvme\nSTORAGE_PCI_VENDOR=144d\nSTORAGE_PCI_DEVICE=a80b\nSTORAGE_REQUIRED_FEATURES=flush\nSTORAGE_QUEUE_DEPTH=64\nSTORAGE_DATA_SLOT_BYTES=65536\nSTORAGE_HANDOFF_TIMEOUT_MS=5000\nSTORAGE_RESET_TIMEOUT_MS=5000\n",
+                "DRIVER_DOMAIN_POLICY_SCHEMA=4\nDOMAIN_ID=linux-dvm-storage0\nQEMU_SHA256={}\nINPUT_TRANSPORT=disabled\nNETWORK_TRANSPORT=disabled\nBLOCK_TRANSPORT=block-ring-msix\nDISPLAY_TRANSPORT=disabled\nSTORAGE_DRIVER=nvme\nSTORAGE_PCI_VENDOR=144d\nSTORAGE_PCI_DEVICE=a80b\nSTORAGE_EPOCH_VERIFYING_KEY_SHA256=5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a\nSTORAGE_REQUIRED_FEATURES=flush\nSTORAGE_QUEUE_DEPTH=64\nSTORAGE_DATA_SLOT_BYTES=65536\nSTORAGE_HANDOFF_TIMEOUT_MS=5000\nSTORAGE_RESET_TIMEOUT_MS=5000\n",
                 "a".repeat(64)
             ),
             "storage-policy",
@@ -4485,7 +4503,7 @@ mod tests {
         assert_eq!(storage.reset_timeout_ms(), 5000);
 
         let wrong_geometry = format!(
-            "DRIVER_DOMAIN_POLICY_SCHEMA=4\nDOMAIN_ID=linux-dvm-storage0\nQEMU_SHA256={}\nINPUT_TRANSPORT=disabled\nNETWORK_TRANSPORT=disabled\nBLOCK_TRANSPORT=block-ring-msix\nDISPLAY_TRANSPORT=disabled\nSTORAGE_DRIVER=nvme\nSTORAGE_PCI_VENDOR=144d\nSTORAGE_PCI_DEVICE=a80b\nSTORAGE_REQUIRED_FEATURES=flush\nSTORAGE_QUEUE_DEPTH=63\nSTORAGE_DATA_SLOT_BYTES=65536\nSTORAGE_HANDOFF_TIMEOUT_MS=5000\nSTORAGE_RESET_TIMEOUT_MS=5000\n",
+            "DRIVER_DOMAIN_POLICY_SCHEMA=4\nDOMAIN_ID=linux-dvm-storage0\nQEMU_SHA256={}\nINPUT_TRANSPORT=disabled\nNETWORK_TRANSPORT=disabled\nBLOCK_TRANSPORT=block-ring-msix\nDISPLAY_TRANSPORT=disabled\nSTORAGE_DRIVER=nvme\nSTORAGE_PCI_VENDOR=144d\nSTORAGE_PCI_DEVICE=a80b\nSTORAGE_EPOCH_VERIFYING_KEY_SHA256=5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a\nSTORAGE_REQUIRED_FEATURES=flush\nSTORAGE_QUEUE_DEPTH=63\nSTORAGE_DATA_SLOT_BYTES=65536\nSTORAGE_HANDOFF_TIMEOUT_MS=5000\nSTORAGE_RESET_TIMEOUT_MS=5000\n",
             "a".repeat(64)
         );
         assert!(DriverDomainPolicy::parse(&wrong_geometry, "storage-policy").is_err());
@@ -4717,7 +4735,7 @@ mod tests {
         };
         let policy = DriverDomainPolicy::parse(
             &format!(
-                "DRIVER_DOMAIN_POLICY_SCHEMA=4\nDOMAIN_ID=linux-dvm-storage0\nQEMU_SHA256={}\nINPUT_TRANSPORT=disabled\nNETWORK_TRANSPORT=disabled\nBLOCK_TRANSPORT=block-ring-msix\nDISPLAY_TRANSPORT=disabled\nSTORAGE_DRIVER=nvme\nSTORAGE_PCI_VENDOR=144d\nSTORAGE_PCI_DEVICE=a80b\nSTORAGE_REQUIRED_FEATURES=flush\nSTORAGE_QUEUE_DEPTH=64\nSTORAGE_DATA_SLOT_BYTES=65536\nSTORAGE_HANDOFF_TIMEOUT_MS=5000\nSTORAGE_RESET_TIMEOUT_MS=5000\n",
+                "DRIVER_DOMAIN_POLICY_SCHEMA=4\nDOMAIN_ID=linux-dvm-storage0\nQEMU_SHA256={}\nINPUT_TRANSPORT=disabled\nNETWORK_TRANSPORT=disabled\nBLOCK_TRANSPORT=block-ring-msix\nDISPLAY_TRANSPORT=disabled\nSTORAGE_DRIVER=nvme\nSTORAGE_PCI_VENDOR=144d\nSTORAGE_PCI_DEVICE=a80b\nSTORAGE_EPOCH_VERIFYING_KEY_SHA256=5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a\nSTORAGE_REQUIRED_FEATURES=flush\nSTORAGE_QUEUE_DEPTH=64\nSTORAGE_DATA_SLOT_BYTES=65536\nSTORAGE_HANDOFF_TIMEOUT_MS=5000\nSTORAGE_RESET_TIMEOUT_MS=5000\n",
                 "a".repeat(64)
             ),
             "physical-storage-test",

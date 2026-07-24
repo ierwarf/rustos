@@ -8,9 +8,9 @@ Concrete source contract:
   * libs/driver-domain-protocol/src/lib.rs
       DvmBlockHeader, DvmBlockRequest, DvmBlockCompletion
 
-Target integration owners which do not yet claim conformance:
-  * kernel/io-manager storage frontend
-  * storage-DVM relay
+Integration owners:
+  * kernel/io-manager signed-epoch transport frontend
+  * Linux storage-DVM relay
   * services/storaged
 
 The real wire records contain no address. A request selects only one fixed
@@ -33,18 +33,22 @@ RequestKinds == {"read", "write", "flush"}
 
 SeqToSet(sequence) == {sequence[index] : index \in 1..Len(sequence)}
 
-VARIABLES generation, dvmReady, nextRequestId, nextOperationId, requestQueue,
+VARIABLES generation, epochSigned, forgedEpochRejected, dvmReady,
+          nextRequestId, nextOperationId, requestQueue,
           active, completionQueue, durableThrough, staleEpoch,
           staleCompletionRejected, requestSignal, completionSignal,
           dvmArmed, hostArmed
 
-vars == <<generation, dvmReady, nextRequestId, nextOperationId, requestQueue,
+vars == <<generation, epochSigned, forgedEpochRejected, dvmReady,
+          nextRequestId, nextOperationId, requestQueue,
           active, completionQueue, durableThrough, staleEpoch,
           staleCompletionRejected, requestSignal, completionSignal,
           dvmArmed, hostArmed>>
 
 Init ==
     /\ generation = 1
+    /\ epochSigned = TRUE
+    /\ forgedEpochRejected = FALSE
     /\ dvmReady = TRUE
     /\ nextRequestId = 1
     /\ nextOperationId = 1
@@ -76,7 +80,8 @@ SubmitRead ==
     /\ nextRequestId' = nextRequestId + 1
     /\ requestSignal' = TRUE
     /\ dvmArmed' = FALSE
-    /\ UNCHANGED <<generation, dvmReady, nextOperationId, active,
+    /\ UNCHANGED <<generation, epochSigned, forgedEpochRejected, dvmReady,
+                   nextOperationId, active,
                    completionQueue, durableThrough, staleEpoch,
                    staleCompletionRejected, completionSignal, hostArmed>>
 
@@ -94,7 +99,8 @@ SubmitWrite(fua) ==
     /\ nextOperationId' = nextOperationId + 1
     /\ requestSignal' = TRUE
     /\ dvmArmed' = FALSE
-    /\ UNCHANGED <<generation, dvmReady, active, completionQueue,
+    /\ UNCHANGED <<generation, epochSigned, forgedEpochRejected, dvmReady,
+                   active, completionQueue,
                    durableThrough, staleEpoch, staleCompletionRejected,
                    completionSignal, hostArmed>>
 
@@ -112,7 +118,8 @@ SubmitFlush ==
     /\ nextOperationId' = nextOperationId + 1
     /\ requestSignal' = TRUE
     /\ dvmArmed' = FALSE
-    /\ UNCHANGED <<generation, dvmReady, active, completionQueue,
+    /\ UNCHANGED <<generation, epochSigned, forgedEpochRejected, dvmReady,
+                   active, completionQueue,
                    durableThrough, staleEpoch, staleCompletionRejected,
                    completionSignal, hostArmed>>
 
@@ -120,7 +127,8 @@ DvmArm ==
     /\ Len(requestQueue) = 0
     /\ active = NoRequest
     /\ dvmArmed' = TRUE
-    /\ UNCHANGED <<generation, dvmReady, nextRequestId, nextOperationId,
+    /\ UNCHANGED <<generation, epochSigned, forgedEpochRejected, dvmReady,
+                   nextRequestId, nextOperationId,
                    requestQueue, active, completionQueue, durableThrough,
                    staleEpoch, staleCompletionRejected, requestSignal,
                    completionSignal, hostArmed>>
@@ -133,7 +141,8 @@ Consume ==
     /\ requestQueue' = Tail(requestQueue)
     /\ requestSignal' = FALSE
     /\ dvmArmed' = FALSE
-    /\ UNCHANGED <<generation, dvmReady, nextRequestId, nextOperationId,
+    /\ UNCHANGED <<generation, epochSigned, forgedEpochRejected, dvmReady,
+                   nextRequestId, nextOperationId,
                    completionQueue, durableThrough, staleEpoch,
                    staleCompletionRejected, completionSignal, hostArmed>>
 
@@ -166,14 +175,16 @@ Complete ==
     /\ active' = NoRequest
     /\ completionSignal' = TRUE
     /\ hostArmed' = FALSE
-    /\ UNCHANGED <<generation, dvmReady, nextRequestId, nextOperationId,
+    /\ UNCHANGED <<generation, epochSigned, forgedEpochRejected, dvmReady,
+                   nextRequestId, nextOperationId,
                    requestQueue, staleEpoch, staleCompletionRejected,
                    requestSignal, dvmArmed>>
 
 HostArm ==
     /\ Len(completionQueue) = 0
     /\ hostArmed' = TRUE
-    /\ UNCHANGED <<generation, dvmReady, nextRequestId, nextOperationId,
+    /\ UNCHANGED <<generation, epochSigned, forgedEpochRejected, dvmReady,
+                   nextRequestId, nextOperationId,
                    requestQueue, active, completionQueue, durableThrough,
                    staleEpoch, staleCompletionRejected, requestSignal,
                    completionSignal, dvmArmed>>
@@ -183,14 +194,16 @@ ConsumeCompletion ==
     /\ completionQueue' = Tail(completionQueue)
     /\ completionSignal' = FALSE
     /\ hostArmed' = FALSE
-    /\ UNCHANGED <<generation, dvmReady, nextRequestId, nextOperationId,
+    /\ UNCHANGED <<generation, epochSigned, forgedEpochRejected, dvmReady,
+                   nextRequestId, nextOperationId,
                    requestQueue, active, durableThrough, staleEpoch,
                    staleCompletionRejected, requestSignal, dvmArmed>>
 
 CoalesceRequestSignal ==
     /\ requestSignal
     /\ requestSignal' = FALSE
-    /\ UNCHANGED <<generation, dvmReady, nextRequestId, nextOperationId,
+    /\ UNCHANGED <<generation, epochSigned, forgedEpochRejected, dvmReady,
+                   nextRequestId, nextOperationId,
                    requestQueue, active, completionQueue, durableThrough,
                    staleEpoch, staleCompletionRejected, completionSignal,
                    dvmArmed, hostArmed>>
@@ -198,7 +211,8 @@ CoalesceRequestSignal ==
 CoalesceCompletionSignal ==
     /\ completionSignal
     /\ completionSignal' = FALSE
-    /\ UNCHANGED <<generation, dvmReady, nextRequestId, nextOperationId,
+    /\ UNCHANGED <<generation, epochSigned, forgedEpochRejected, dvmReady,
+                   nextRequestId, nextOperationId,
                    requestQueue, active, completionQueue, durableThrough,
                    staleEpoch, staleCompletionRejected, requestSignal,
                    dvmArmed, hostArmed>>
@@ -207,6 +221,7 @@ Restart ==
     /\ generation < MaxGeneration
     /\ staleEpoch' = generation
     /\ generation' = generation + 1
+    /\ epochSigned' = FALSE
     /\ dvmReady' = FALSE
     /\ requestQueue' = <<>>
     /\ active' = NoRequest
@@ -218,12 +233,33 @@ Restart ==
     /\ completionSignal' = TRUE
     /\ dvmArmed' = FALSE
     /\ hostArmed' = FALSE
-    /\ UNCHANGED staleCompletionRejected
+    /\ UNCHANGED <<forgedEpochRejected, staleCompletionRejected>>
+
+HostSignEpoch ==
+    /\ ~dvmReady
+    /\ ~epochSigned
+    /\ epochSigned' = TRUE
+    /\ UNCHANGED <<generation, forgedEpochRejected, dvmReady,
+                   nextRequestId, nextOperationId, requestQueue, active,
+                   completionQueue, durableThrough, staleEpoch,
+                   staleCompletionRejected, requestSignal, completionSignal,
+                   dvmArmed, hostArmed>>
+
+RejectForgedEpoch ==
+    /\ ~dvmReady
+    /\ ~epochSigned
+    /\ forgedEpochRejected' = TRUE
+    /\ UNCHANGED <<generation, epochSigned, dvmReady, nextRequestId,
+                   nextOperationId, requestQueue, active, completionQueue,
+                   durableThrough, staleEpoch, staleCompletionRejected,
+                   requestSignal, completionSignal, dvmArmed, hostArmed>>
 
 Readmit ==
     /\ ~dvmReady
+    /\ epochSigned
     /\ dvmReady' = TRUE
-    /\ UNCHANGED <<generation, nextRequestId, nextOperationId, requestQueue,
+    /\ UNCHANGED <<generation, epochSigned, forgedEpochRejected,
+                   nextRequestId, nextOperationId, requestQueue,
                    active, completionQueue, durableThrough, staleEpoch,
                    staleCompletionRejected, requestSignal, completionSignal,
                    dvmArmed, hostArmed>>
@@ -232,7 +268,8 @@ RejectStaleCompletion ==
     /\ staleEpoch # 0
     /\ staleEpoch < generation
     /\ staleCompletionRejected' = TRUE
-    /\ UNCHANGED <<generation, dvmReady, nextRequestId, nextOperationId,
+    /\ UNCHANGED <<generation, epochSigned, forgedEpochRejected, dvmReady,
+                   nextRequestId, nextOperationId,
                    requestQueue, active, completionQueue, durableThrough,
                    staleEpoch, requestSignal, completionSignal, dvmArmed,
                    hostArmed>>
@@ -250,6 +287,8 @@ Next ==
     \/ CoalesceRequestSignal
     \/ CoalesceCompletionSignal
     \/ Restart
+    \/ HostSignEpoch
+    \/ RejectForgedEpoch
     \/ Readmit
     \/ RejectStaleCompletion
 
@@ -270,6 +309,8 @@ CompletionType(completion) ==
 
 TypeOK ==
     /\ generation \in 1..MaxGeneration
+    /\ epochSigned \in BOOLEAN
+    /\ forgedEpochRejected \in BOOLEAN
     /\ dvmReady \in BOOLEAN
     /\ nextRequestId \in 1..(MaxRequestId + 1)
     /\ nextOperationId \in 1..(MaxOperationId + 1)
@@ -316,6 +357,8 @@ RestartRevokesOldQueues ==
         /\ requestQueue = <<>>
         /\ active = NoRequest
         /\ completionQueue = <<>>
+
+ReadyEpochIsHostSigned == dvmReady => epochSigned
 
 NoSleeperMissesVisibleWork ==
     /\ (Len(requestQueue) > 0 => ~dvmArmed)

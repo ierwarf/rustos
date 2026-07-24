@@ -24,7 +24,10 @@ use runtime::{
     supervise_domain, supervise_storage_domain, verify_artifacts,
 };
 use runtime::{sha256_file, trusted_canonical_regular_file};
-use storage::{prepare_storage_handoff, revoke_storage_aperture};
+use storage::{
+    load_storage_epoch_signing_key, prepare_storage_handoff, revoke_storage_aperture,
+    storage_epoch_verifying_key_sha256,
+};
 
 #[derive(Parser)]
 #[command(
@@ -166,6 +169,9 @@ enum Command {
         /// Owner-private fixed block aperture initialized before storage ownership transfer.
         #[arg(long)]
         block_aperture: Option<PathBuf>,
+        /// Caller-owned raw Ed25519 key that signs each storage aperture epoch.
+        #[arg(long)]
+        storage_epoch_signing_key: Option<PathBuf>,
         #[arg(long, default_value = "/dev")]
         device_root: PathBuf,
         #[arg(long, default_value = "/proc")]
@@ -459,6 +465,7 @@ fn main() -> Result<()> {
             fleet_policy,
             qemu,
             block_aperture,
+            storage_epoch_signing_key,
             device_root,
             proc_root,
         } => {
@@ -512,6 +519,17 @@ fn main() -> Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("missing activation device policy"))?;
             let mut storage_handoff = if let Some(physical_storage) = policy.physical_storage() {
                 let aperture = required_path(block_aperture, "--block-aperture")?;
+                let epoch_signing_key = load_storage_epoch_signing_key(&required_path(
+                    storage_epoch_signing_key,
+                    "--storage-epoch-signing-key",
+                )?)?;
+                if storage_epoch_verifying_key_sha256(&epoch_signing_key)
+                    != physical_storage.epoch_verifying_key_sha256()
+                {
+                    anyhow::bail!(
+                        "storage epoch signing key does not match the signed device policy"
+                    );
+                }
                 Some(prepare_storage_handoff(
                     &lease,
                     &sysfs_root,
@@ -519,6 +537,7 @@ fn main() -> Result<()> {
                     &proc_root,
                     physical_storage,
                     &aperture,
+                    &epoch_signing_key,
                 )?)
             } else {
                 if block_aperture.is_some() {

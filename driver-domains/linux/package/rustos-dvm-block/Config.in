@@ -5,7 +5,7 @@ config BR2_PACKAGE_RUSTOS_DVM_BLOCK
 	help
 	  Fixed, address-free block relay for the isolated RustOS Linux storage
 	  driver domain. A dedicated MSI-X UIO adapter binds only the exact
-	  RSDVMBL1 aperture, maps that bounded aperture write-back, and exposes
+	  RSDVMBL2 aperture, maps that bounded aperture write-back, and exposes
 	  only peer-0/vector-0 notification through UIO irqcontrol. The userspace
 	  relay owns no PCI controller MMIO; Linux nvme/ahci and the block layer
 	  remain the sole physical-device implementation.

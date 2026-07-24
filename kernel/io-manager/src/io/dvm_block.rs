@@ -12,6 +12,7 @@ use driver_domain_protocol::{
     DVM_BLOCK_VERSION, DvmBlockCompletion, DvmBlockCompletionStatus, DvmBlockHeader,
     DvmBlockOperation, DvmBlockRequest,
 };
+use ed25519_dalek::{Signature, VerifyingKey};
 
 use crate::sync::KernelWaitLock;
 
@@ -44,6 +45,7 @@ const REQUEST_PRODUCER_OFFSET: usize = 72;
 const REQUEST_CONSUMER_OFFSET: usize = 80;
 const COMPLETION_PRODUCER_OFFSET: usize = 88;
 const COMPLETION_CONSUMER_OFFSET: usize = 96;
+const EPOCH_SIGNATURE_OFFSET: usize = 104;
 const QUEUE_DEPTH: usize = DVM_BLOCK_QUEUE_DEPTH as usize;
 
 static INSTALLED: AtomicBool = AtomicBool::new(false);
@@ -153,7 +155,8 @@ impl DvmBlockState {
                 == self.geometry.logical_block_size
             && load_u32(self.base, PHYSICAL_BLOCK_SIZE_OFFSET, Ordering::Acquire)
                 == self.geometry.physical_block_size
-            && load_u32(self.base, RESERVED_OFFSET, Ordering::Acquire) == 0;
+            && load_u32(self.base, RESERVED_OFFSET, Ordering::Acquire) == 0
+            && epoch_signature_matches(self.base, &self.geometry.epoch_signature);
         if !fixed_header_matches
             || flags & !DVM_BLOCK_KNOWN_FLAGS != 0
             || flags & DVM_BLOCK_FLAG_RUSTOS_READY == 0
@@ -487,7 +490,14 @@ fn report_first_completion_observation(_producer: u64, _consumer: u64, _irq_was_
 
 pub(crate) fn try_install() -> bool {
     if INSTALLED.load(Ordering::Acquire) {
-        return true;
+        let mut guard = STATE.lock();
+        return guard.as_mut().is_some_and(|state| {
+            if state.revoked {
+                try_rebind_signed_epoch(state)
+            } else {
+                true
+            }
+        });
     }
     let mut guard = STATE.lock();
     if guard.is_some() {
@@ -546,6 +556,7 @@ pub(crate) fn try_install() -> bool {
         };
         if header.region_bytes != resource.size
             || header.flags & (DVM_BLOCK_FLAG_RUSTOS_READY | DVM_BLOCK_FLAG_DVM_READY) != 0
+            || !verify_epoch_signature(header)
         {
             reject_stage = "header-state";
             crate::driver::mmio::unmap(mapped.cast());
@@ -621,13 +632,7 @@ pub(crate) fn try_install() -> bool {
         );
         return false;
     }
-    let previous_flags = fetch_or_u32(
-        state.base,
-        FLAGS_OFFSET,
-        DVM_BLOCK_FLAG_RUSTOS_READY,
-        Ordering::AcqRel,
-    );
-    if previous_flags & (DVM_BLOCK_FLAG_RUSTOS_READY | DVM_BLOCK_FLAG_DVM_READY) != 0 {
+    if !publish_rustos_ready(state.base, state.geometry.flags) {
         release_state_mappings(&state);
         return false;
     }
@@ -646,6 +651,72 @@ pub(crate) fn try_install() -> bool {
     *guard = Some(state);
     INSTALLED.store(true, Ordering::Release);
     true
+}
+
+fn try_rebind_signed_epoch(state: &mut DvmBlockState) -> bool {
+    let Ok(key_bytes) = crate::storage::boot_volume::storage_epoch_verifying_key() else {
+        return false;
+    };
+    try_rebind_signed_epoch_with_key(state, key_bytes)
+}
+
+fn try_rebind_signed_epoch_with_key(state: &mut DvmBlockState, key_bytes: [u8; 32]) -> bool {
+    let Some(header) = read_header(state.base) else {
+        return false;
+    };
+    if header.generation <= state.geometry.generation
+        || header.flags & (DVM_BLOCK_FLAG_RUSTOS_READY | DVM_BLOCK_FLAG_DVM_READY) != 0
+        || header.request_producer != 0
+        || header.request_consumer != 0
+        || header.completion_producer != 0
+        || header.completion_consumer != 0
+        || !verify_epoch_signature_with_key(header, key_bytes)
+    {
+        return false;
+    }
+    let base = state.base;
+    let doorbell = state.doorbell;
+    if !publish_rustos_ready(base, header.flags) {
+        return false;
+    }
+    let mut replacement = DvmBlockState::new(base, doorbell, header);
+    replacement.geometry.flags |= DVM_BLOCK_FLAG_RUSTOS_READY;
+    IRQ_PENDING.store(false, Ordering::Release);
+    replacement.signal_request();
+    #[cfg(not(test))]
+    nucleus_core::debug::write_debugcon_only_line(
+        alloc::format!(
+            "dvm-block: signed transport epoch rebound generation={} previous={}",
+            header.generation,
+            state.geometry.generation,
+        )
+        .as_bytes(),
+    );
+    *state = replacement;
+    true
+}
+
+fn verify_epoch_signature(header: DvmBlockHeader) -> bool {
+    let Ok(key_bytes) = crate::storage::boot_volume::storage_epoch_verifying_key() else {
+        return false;
+    };
+    verify_epoch_signature_with_key(header, key_bytes)
+}
+
+fn verify_epoch_signature_with_key(header: DvmBlockHeader, key_bytes: [u8; 32]) -> bool {
+    let Ok(key) = VerifyingKey::from_bytes(&key_bytes) else {
+        return false;
+    };
+    let signature = Signature::from_bytes(&header.epoch_signature);
+    key.verify_strict(&header.epoch_signing_bytes(), &signature)
+        .is_ok()
+}
+
+fn epoch_signature_matches(base: *mut u8, expected: &[u8; 64]) -> bool {
+    expected.iter().enumerate().all(|(offset, expected)| {
+        (unsafe { core::ptr::read_volatile(base.add(EPOCH_SIGNATURE_OFFSET + offset)) })
+            == *expected
+    })
 }
 
 fn release_state_mappings(state: &DvmBlockState) {
@@ -945,12 +1016,23 @@ fn fetch_and_u32(base: *mut u8, offset: usize, value: u32, ordering: Ordering) -
     unsafe { AtomicU32::from_ptr(address.cast::<u32>()).fetch_and(value, ordering) }
 }
 
-fn fetch_or_u32(base: *mut u8, offset: usize, value: u32, ordering: Ordering) -> u32 {
-    let address = unsafe { base.add(offset) };
+fn publish_rustos_ready(base: *mut u8, expected_flags: u32) -> bool {
+    let address = unsafe { base.add(FLAGS_OFFSET) };
     debug_assert_eq!(address.align_offset(core::mem::align_of::<AtomicU32>()), 0);
     // SAFETY: The shared header contract naturally aligns the flags field and
-    // every participant updates readiness through atomic read-modify-write.
-    unsafe { AtomicU32::from_ptr(address.cast::<u32>()).fetch_or(value, ordering) }
+    // every participant updates readiness atomically. A failed publication
+    // must not leave RustOS-ready behind: the peer may have changed its epoch
+    // state after signature verification but before this linearization point.
+    unsafe {
+        AtomicU32::from_ptr(address.cast::<u32>())
+            .compare_exchange(
+                expected_flags,
+                expected_flags | DVM_BLOCK_FLAG_RUSTOS_READY,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
 }
 
 fn load_u64(base: *mut u8, offset: usize, ordering: Ordering) -> u64 {
@@ -975,6 +1057,7 @@ mod tests {
     use driver_domain_protocol::{
         DVM_BLOCK_FEATURE_FLUSH, DVM_BLOCK_FEATURE_FUA, DVM_BLOCK_FLAG_DVM_READY,
     };
+    use ed25519_dalek::{Signer, SigningKey};
 
     fn aperture_bytes(aperture: &mut [u64]) -> &mut [u8] {
         // SAFETY: The u64 backing guarantees the production ABI's alignment;
@@ -997,7 +1080,8 @@ mod tests {
             4096,
             4096,
             DVM_BLOCK_FEATURE_FLUSH | DVM_BLOCK_FEATURE_FUA,
-        );
+        )
+        .with_epoch_signature([0x5a; 64]);
         header.flags |= DVM_BLOCK_FLAG_RUSTOS_READY | DVM_BLOCK_FLAG_DVM_READY;
         aperture_bytes(&mut aperture)[..DVM_BLOCK_HEADER_RECORD_BYTES]
             .copy_from_slice(&header.encode());
@@ -1007,6 +1091,67 @@ mod tests {
             header,
         );
         (aperture, registers, state)
+    }
+
+    #[test]
+    fn revoked_transport_accepts_only_a_signed_newer_epoch() {
+        let (mut aperture, _registers, mut state) = test_state();
+        let key = SigningKey::from_bytes(&[0x42; 32]);
+        state.revoke();
+
+        let unsigned = DvmBlockHeader::new(
+            8,
+            1024 * 1024,
+            4096,
+            4096,
+            DVM_BLOCK_FEATURE_FLUSH | DVM_BLOCK_FEATURE_FUA,
+        );
+        let forged = unsigned.with_epoch_signature([0x33; 64]);
+        aperture_bytes(&mut aperture)[..DVM_BLOCK_HEADER_RECORD_BYTES]
+            .copy_from_slice(&forged.encode());
+        assert!(!try_rebind_signed_epoch_with_key(
+            &mut state,
+            key.verifying_key().to_bytes()
+        ));
+        assert!(state.revoked);
+
+        let signed =
+            unsigned.with_epoch_signature(key.sign(&unsigned.epoch_signing_bytes()).to_bytes());
+        aperture_bytes(&mut aperture)[..DVM_BLOCK_HEADER_RECORD_BYTES]
+            .copy_from_slice(&signed.encode());
+        assert!(try_rebind_signed_epoch_with_key(
+            &mut state,
+            key.verifying_key().to_bytes()
+        ));
+        assert_eq!(state.geometry.generation, 8);
+        assert!(!state.revoked);
+        assert_ne!(
+            load_u32(state.base, FLAGS_OFFSET, Ordering::Acquire) & DVM_BLOCK_FLAG_RUSTOS_READY,
+            0
+        );
+    }
+
+    #[test]
+    fn readiness_publication_is_conditional_and_non_mutating_on_mismatch() {
+        let (_aperture, _registers, state) = test_state();
+        let original = load_u32(state.base, FLAGS_OFFSET, Ordering::Acquire);
+        assert!(!publish_rustos_ready(state.base, 0));
+        assert_eq!(
+            load_u32(state.base, FLAGS_OFFSET, Ordering::Acquire),
+            original
+        );
+
+        fetch_and_u32(
+            state.base,
+            FLAGS_OFFSET,
+            !DVM_BLOCK_FLAG_RUSTOS_READY,
+            Ordering::AcqRel,
+        );
+        assert!(publish_rustos_ready(state.base, DVM_BLOCK_FLAG_DVM_READY));
+        assert_eq!(
+            load_u32(state.base, FLAGS_OFFSET, Ordering::Acquire),
+            DVM_BLOCK_FLAG_DVM_READY | DVM_BLOCK_FLAG_RUSTOS_READY
+        );
     }
 
     #[test]

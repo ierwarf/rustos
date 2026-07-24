@@ -51,6 +51,9 @@ Do not reorder without reading `kernel/src/main.rs` and
   calls only the wake leaf; `storaged` owns timeout, retry, durability, and
   volume policy. Do not expose the raw ivshmem physical range to a service or
   route ordinary VFS callers directly to this API.
+  Initial admission and post-revoke rebind both require an L0 Ed25519 epoch
+  signature under the verifying key in the signed early-system header; shared
+  memory generation values alone are never restart authority.
 - **Bootstrap image:** `kernel_io_manager::api::vfs::{read_path_to_vec_for_kernel,
   boot_path_file_len_for_kernel}` and
   `kernel_io_manager::api::block::read_bootstrap_file_range` may read only the

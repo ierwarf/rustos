@@ -41,10 +41,10 @@ Phases == {
     "quarantined"
 }
 
-VARIABLES phase, generation, readyGeneration, apertureLive, durable,
+VARIABLES phase, generation, readyGeneration, epochSigned, apertureLive, durable,
           runtimeRecorded, exactPidExited, staleReadyRejected
 
-vars == <<phase, generation, readyGeneration, apertureLive, durable,
+vars == <<phase, generation, readyGeneration, epochSigned, apertureLive, durable,
           runtimeRecorded, exactPidExited, staleReadyRejected>>
 
 HostAuthority ==
@@ -65,6 +65,7 @@ Init ==
     /\ phase = "host-active"
     /\ generation \in 1..MaxGeneration
     /\ readyGeneration = 0
+    /\ epochSigned = FALSE
     /\ apertureLive = FALSE
     /\ durable = FALSE
     /\ runtimeRecorded = FALSE
@@ -75,21 +76,23 @@ FreezeHost ==
     /\ phase = "host-active"
     /\ phase' = "host-frozen"
     /\ apertureLive' = TRUE
-    /\ UNCHANGED <<generation, readyGeneration, durable, runtimeRecorded,
+    /\ UNCHANGED <<generation, readyGeneration, epochSigned, durable, runtimeRecorded,
                    exactPidExited, staleReadyRejected>>
 
 FlushHost ==
     /\ phase = "host-frozen"
     /\ phase' = "durable"
     /\ durable' = TRUE
+    /\ epochSigned' = TRUE
     /\ UNCHANGED <<generation, readyGeneration, apertureLive, runtimeRecorded,
                    exactPidExited, staleReadyRejected>>
 
 AssignVfio ==
     /\ phase = "durable"
     /\ durable
+    /\ epochSigned
     /\ phase' = "vfio-assigned"
-    /\ UNCHANGED <<generation, readyGeneration, apertureLive, durable,
+    /\ UNCHANGED <<generation, readyGeneration, epochSigned, apertureLive, durable,
                    runtimeRecorded, exactPidExited, staleReadyRejected>>
 
 LaunchDvm ==
@@ -98,14 +101,14 @@ LaunchDvm ==
     /\ phase' = "dvm-launched"
     /\ runtimeRecorded' = TRUE
     /\ exactPidExited' = FALSE
-    /\ UNCHANGED <<generation, readyGeneration, apertureLive, durable,
+    /\ UNCHANGED <<generation, readyGeneration, epochSigned, apertureLive, durable,
                    staleReadyRejected>>
 
 AdmitDvmReady ==
     /\ phase = "dvm-launched"
     /\ readyGeneration' = generation
     /\ phase' = "dvm-ready"
-    /\ UNCHANGED <<generation, apertureLive, durable, runtimeRecorded,
+    /\ UNCHANGED <<generation, epochSigned, apertureLive, durable, runtimeRecorded,
                    exactPidExited, staleReadyRejected>>
 
 RejectStaleReady ==
@@ -113,13 +116,13 @@ RejectStaleReady ==
     /\ readyGeneration \in 0..MaxGeneration
     /\ readyGeneration # generation
     /\ staleReadyRejected' = TRUE
-    /\ UNCHANGED <<phase, generation, readyGeneration, apertureLive, durable,
+    /\ UNCHANGED <<phase, generation, readyGeneration, epochSigned, apertureLive, durable,
                    runtimeRecorded, exactPidExited>>
 
 RequestStop ==
     /\ phase \in {"dvm-launched", "dvm-ready"}
     /\ phase' = "stop-requested"
-    /\ UNCHANGED <<generation, readyGeneration, apertureLive, durable,
+    /\ UNCHANGED <<generation, readyGeneration, epochSigned, apertureLive, durable,
                    runtimeRecorded, exactPidExited, staleReadyRejected>>
 
 ObserveExactExit ==
@@ -127,21 +130,21 @@ ObserveExactExit ==
     /\ runtimeRecorded
     /\ phase' = "dvm-exited"
     /\ exactPidExited' = TRUE
-    /\ UNCHANGED <<generation, readyGeneration, apertureLive, durable,
+    /\ UNCHANGED <<generation, readyGeneration, epochSigned, apertureLive, durable,
                    runtimeRecorded, staleReadyRejected>>
 
 AbortBeforeVfio ==
     /\ phase \in {"host-frozen", "durable"}
     /\ phase' = "host-aperture-revoked"
     /\ apertureLive' = FALSE
-    /\ UNCHANGED <<generation, readyGeneration, durable, runtimeRecorded,
+    /\ UNCHANGED <<generation, readyGeneration, epochSigned, durable, runtimeRecorded,
                    exactPidExited, staleReadyRejected>>
 
 RecoverBeforeLaunch ==
     /\ phase = "vfio-assigned"
     /\ phase' = "dvm-exited"
     /\ exactPidExited' = TRUE
-    /\ UNCHANGED <<generation, readyGeneration, apertureLive, durable,
+    /\ UNCHANGED <<generation, readyGeneration, epochSigned, apertureLive, durable,
                    runtimeRecorded, staleReadyRejected>>
 
 RevokeAperture ==
@@ -149,7 +152,7 @@ RevokeAperture ==
     /\ exactPidExited
     /\ phase' = "vfio-aperture-revoked"
     /\ apertureLive' = FALSE
-    /\ UNCHANGED <<generation, readyGeneration, durable, runtimeRecorded,
+    /\ UNCHANGED <<generation, readyGeneration, epochSigned, durable, runtimeRecorded,
                    exactPidExited, staleReadyRejected>>
 
 RestoreHost ==
@@ -157,13 +160,13 @@ RestoreHost ==
     /\ ~apertureLive
     /\ phase' = "host-restored"
     /\ runtimeRecorded' = FALSE
-    /\ UNCHANGED <<generation, readyGeneration, apertureLive, durable,
+    /\ UNCHANGED <<generation, readyGeneration, epochSigned, apertureLive, durable,
                    exactPidExited, staleReadyRejected>>
 
 Quarantine ==
     /\ phase \in {"vfio-assigned", "dvm-exited"}
     /\ phase' = "quarantined"
-    /\ UNCHANGED <<generation, readyGeneration, apertureLive, durable,
+    /\ UNCHANGED <<generation, readyGeneration, epochSigned, apertureLive, durable,
                    runtimeRecorded, exactPidExited, staleReadyRejected>>
 
 Next ==
@@ -185,6 +188,7 @@ TypeOK ==
     /\ phase \in Phases
     /\ generation \in 1..MaxGeneration
     /\ readyGeneration \in 0..MaxGeneration
+    /\ epochSigned \in BOOLEAN
     /\ apertureLive \in BOOLEAN
     /\ durable \in BOOLEAN
     /\ runtimeRecorded \in BOOLEAN
@@ -196,6 +200,7 @@ DvmRequiresVfio == DvmAuthority => VfioAuthority
 VfioRequiresDurability == VfioAuthority => durable
 DvmRequiresAperture == DvmAuthority => apertureLive
 DvmRequiresRuntimeRecord == DvmAuthority => runtimeRecorded
+DvmRequiresSignedEpoch == DvmAuthority => epochSigned
 ReadyBindsCurrentGeneration ==
     phase = "dvm-ready" => readyGeneration = generation
 RevocationRequiresExactExit ==

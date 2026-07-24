@@ -15,19 +15,22 @@ Timeout and revoke are explicit terminal outcomes.
 
 CONSTANTS MaxTime, WaitBound
 
-Phases == {"uninstalled", "armed", "ready", "proven", "using", "timed-out", "revoked"}
+Phases == {"uninstalled", "verified", "armed", "ready", "proven", "using",
+           "timed-out", "revoked"}
 WaitStates == {"idle", "registering", "sleeping", "woken"}
 TerminalPhases == {"using", "timed-out", "revoked"}
 
-VARIABLES phase, peerReady, waitState, observedReady, now, deadline,
-          dataPlaneProven, volumeUsed
+VARIABLES phase, rustosReady, peerReady, publicationFailed, waitState,
+          observedReady, now, deadline, dataPlaneProven, volumeUsed
 
-vars == <<phase, peerReady, waitState, observedReady, now, deadline,
-          dataPlaneProven, volumeUsed>>
+vars == <<phase, rustosReady, peerReady, publicationFailed, waitState,
+          observedReady, now, deadline, dataPlaneProven, volumeUsed>>
 
 Init ==
     /\ phase = "uninstalled"
+    /\ rustosReady = FALSE
     /\ peerReady = FALSE
+    /\ publicationFailed = FALSE
     /\ waitState = "idle"
     /\ observedReady = FALSE
     /\ now = 0
@@ -37,9 +40,33 @@ Init ==
 
 InstallTransport ==
     /\ phase = "uninstalled"
+    /\ phase' = "verified"
+    /\ UNCHANGED <<rustosReady, peerReady, publicationFailed, waitState,
+                   observedReady, now, deadline, dataPlaneProven, volumeUsed>>
+
+PublishRustosReady ==
+    /\ phase = "verified"
+    /\ ~peerReady
     /\ phase' = "armed"
+    /\ rustosReady' = TRUE
+    /\ publicationFailed' = FALSE
     /\ UNCHANGED <<peerReady, waitState, observedReady, now, deadline,
                    dataPlaneProven, volumeUsed>>
+
+PeerStateRace ==
+    /\ phase = "verified"
+    /\ ~peerReady
+    /\ peerReady' = TRUE
+    /\ UNCHANGED <<phase, rustosReady, publicationFailed, waitState,
+                   observedReady, now, deadline, dataPlaneProven, volumeUsed>>
+
+RejectRacedPublication ==
+    /\ phase = "verified"
+    /\ peerReady
+    /\ phase' = "revoked"
+    /\ publicationFailed' = TRUE
+    /\ UNCHANGED <<rustosReady, peerReady, waitState, observedReady, now,
+                   deadline, dataPlaneProven, volumeUsed>>
 
 BeginInfo ==
     /\ phase = "armed"
@@ -53,18 +80,20 @@ BeginInfo ==
           ELSE /\ phase' = phase
                /\ observedReady' = FALSE
                /\ waitState' = "registering"
-    /\ UNCHANGED <<peerReady, now, dataPlaneProven, volumeUsed>>
+    /\ UNCHANGED <<rustosReady, peerReady, publicationFailed, now,
+                   dataPlaneProven, volumeUsed>>
 
 PublishPeerReady ==
     /\ phase = "armed"
+    /\ rustosReady
     /\ ~peerReady
     /\ peerReady' = TRUE
     /\ waitState' =
           IF waitState \in {"registering", "sleeping"}
           THEN "woken"
           ELSE waitState
-    /\ UNCHANGED <<phase, observedReady, now, deadline, dataPlaneProven,
-                   volumeUsed>>
+    /\ UNCHANGED <<phase, rustosReady, publicationFailed, observedReady, now,
+                   deadline, dataPlaneProven, volumeUsed>>
 
 ArmRecheck ==
     /\ phase = "armed"
@@ -76,7 +105,8 @@ ArmRecheck ==
           ELSE /\ phase' = phase
                /\ observedReady' = observedReady
                /\ waitState' = "sleeping"
-    /\ UNCHANGED <<peerReady, now, deadline, dataPlaneProven, volumeUsed>>
+    /\ UNCHANGED <<rustosReady, peerReady, publicationFailed, now, deadline,
+                   dataPlaneProven, volumeUsed>>
 
 ResolveWake ==
     /\ phase = "armed"
@@ -88,14 +118,15 @@ ResolveWake ==
           ELSE /\ phase' = phase
                /\ observedReady' = observedReady
                /\ waitState' = "registering"
-    /\ UNCHANGED <<peerReady, now, deadline, dataPlaneProven, volumeUsed>>
+    /\ UNCHANGED <<rustosReady, peerReady, publicationFailed, now, deadline,
+                   dataPlaneProven, volumeUsed>>
 
 Tick ==
     /\ phase \notin TerminalPhases
     /\ now < MaxTime
     /\ now' = now + 1
-    /\ UNCHANGED <<phase, peerReady, waitState, observedReady, deadline,
-                   dataPlaneProven, volumeUsed>>
+    /\ UNCHANGED <<phase, rustosReady, peerReady, publicationFailed, waitState,
+                   observedReady, deadline, dataPlaneProven, volumeUsed>>
 
 Timeout ==
     /\ phase = "armed"
@@ -104,8 +135,8 @@ Timeout ==
     /\ ~peerReady
     /\ phase' = "timed-out"
     /\ waitState' = "idle"
-    /\ UNCHANGED <<peerReady, observedReady, now, deadline, dataPlaneProven,
-                   volumeUsed>>
+    /\ UNCHANGED <<rustosReady, peerReady, publicationFailed, observedReady,
+                   now, deadline, dataPlaneProven, volumeUsed>>
 
 ProveDataPlane ==
     /\ phase = "ready"
@@ -113,7 +144,8 @@ ProveDataPlane ==
     /\ observedReady
     /\ phase' = "proven"
     /\ dataPlaneProven' = TRUE
-    /\ UNCHANGED <<peerReady, waitState, observedReady, now, deadline, volumeUsed>>
+    /\ UNCHANGED <<rustosReady, peerReady, publicationFailed, waitState,
+                   observedReady, now, deadline, volumeUsed>>
 
 UseVolume ==
     /\ phase = "proven"
@@ -122,19 +154,23 @@ UseVolume ==
     /\ dataPlaneProven
     /\ phase' = "using"
     /\ volumeUsed' = TRUE
-    /\ UNCHANGED <<peerReady, waitState, observedReady, now, deadline,
-                   dataPlaneProven>>
+    /\ UNCHANGED <<rustosReady, peerReady, publicationFailed, waitState,
+                   observedReady, now, deadline, dataPlaneProven>>
 
 Revoke ==
     /\ phase \in {"armed", "ready", "proven"}
     /\ phase' = "revoked"
+    /\ rustosReady' = FALSE
     /\ peerReady' = FALSE
     /\ waitState' = "idle"
     /\ dataPlaneProven' = FALSE
-    /\ UNCHANGED <<observedReady, now, deadline, volumeUsed>>
+    /\ UNCHANGED <<publicationFailed, observedReady, now, deadline, volumeUsed>>
 
 Next ==
     InstallTransport
+    \/ PublishRustosReady
+    \/ PeerStateRace
+    \/ RejectRacedPublication
     \/ BeginInfo
     \/ PublishPeerReady
     \/ ArmRecheck
@@ -147,7 +183,9 @@ Next ==
 
 TypeOK ==
     /\ phase \in Phases
+    /\ rustosReady \in BOOLEAN
     /\ peerReady \in BOOLEAN
+    /\ publicationFailed \in BOOLEAN
     /\ waitState \in WaitStates
     /\ observedReady \in BOOLEAN
     /\ now \in 0..MaxTime
@@ -156,7 +194,14 @@ TypeOK ==
     /\ volumeUsed \in BOOLEAN
 
 NoUseBeforeReadiness ==
-    volumeUsed => peerReady /\ observedReady /\ dataPlaneProven /\ phase = "using"
+    volumeUsed =>
+        rustosReady /\ peerReady /\ observedReady /\ dataPlaneProven /\ phase = "using"
+
+FailedPublicationLeavesNoReadyBit ==
+    publicationFailed => ~rustosReady
+
+AdmittedPeerFollowsRustosReadiness ==
+    phase \in {"armed", "ready", "proven", "using"} /\ peerReady => rustosReady
 
 InitialNotReadyIsNonterminal ==
     phase = "armed" /\ ~peerReady => ~volumeUsed

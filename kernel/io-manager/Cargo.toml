@@ -17,6 +17,7 @@ kernel-ps = { path = "../ps" }
 boot-protocol = { path = "../../boot/boot-protocol" }
 driver-domain-protocol = { path = "../../libs/driver-domain-protocol" }
 driver-abi = { path = "../../drivers/libs/driver-abi" }
+ed25519-dalek = { version = "2", default-features = false }
 input-evdev = { path = "../../drivers/libs/input-evdev" }
 keyboard-core = { path = "../../drivers/libs/keyboard-core" }
 rustos-user-abi = { path = "../../libs/rustos-user-abi" }

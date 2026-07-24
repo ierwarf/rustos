@@ -88,6 +88,15 @@ pub fn boot_volume_transport_hint() -> Option<BootVolumeTransport> {
     Some(boot_info()?.boot_volume.transport())
 }
 
+/// Returns the L0 storage-epoch verifying key carried by the signed immutable
+/// early-system header. A storage DVM can read the shared block aperture but
+/// cannot replace this key or mint a successor transport epoch.
+pub fn storage_epoch_verifying_key() -> Result<[u8; 32], BootstrapImageError> {
+    let image = early_system_image_bytes()?.ok_or(BootstrapImageError::Unavailable)?;
+    let header = EarlySystemHeader::decode(image).ok_or(BootstrapImageError::Invalid)?;
+    Ok(header.storage_epoch_verifying_key)
+}
+
 pub fn read_file_to_vec(path: &str) -> Result<Vec<u8>, BootstrapImageError> {
     let Some(image) = early_system_image_bytes()? else {
         return Err(BootstrapImageError::Unavailable);
@@ -237,7 +246,8 @@ mod tests {
     #[test]
     fn early_system_lookup_verifies_exact_path_and_payload_digest() {
         let payload = b"rootd early payload";
-        let header = EarlySystemHeader::new(1, 4096, 4096 + payload.len() as u64).unwrap();
+        let header =
+            EarlySystemHeader::new(1, 4096, 4096 + payload.len() as u64, [0x5a; 32]).unwrap();
         let digest: [u8; 32] = Sha256::digest(payload).into();
         let entry = EarlySystemEntry::new(
             b"services/rootd/rootd.elf",

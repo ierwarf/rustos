@@ -26,13 +26,13 @@
 #include <linux/fs.h>
 
 #if __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
-#error "RustOS DVM block ABI v1 requires a little-endian relay"
+#error "RustOS DVM block ABI v2 requires a little-endian relay"
 #endif
 
-#define DVM_BLOCK_MAGIC "RSDVMBL1"
-#define DVM_BLOCK_VERSION 1U
+#define DVM_BLOCK_MAGIC "RSDVMBL2"
+#define DVM_BLOCK_VERSION 2U
 #define DVM_BLOCK_HEADER_BYTES 4096U
-#define DVM_BLOCK_HEADER_RECORD_BYTES 128U
+#define DVM_BLOCK_HEADER_RECORD_BYTES 192U
 #define DVM_BLOCK_RECORD_BYTES 64U
 #define DVM_BLOCK_QUEUE_DEPTH 64U
 #define DVM_BLOCK_DATA_SLOT_BYTES (64U * 1024U)
@@ -104,6 +104,7 @@ struct block_header {
     uint64_t request_consumer;
     uint64_t completion_producer;
     uint64_t completion_consumer;
+    uint8_t epoch_signature[64];
 };
 
 struct block_request {
@@ -274,8 +275,9 @@ static int read_header(const volatile uint8_t *base, size_t mapped_bytes,
         read_le32(base + 8U) != DVM_BLOCK_VERSION ||
         read_le32(base + 12U) != DVM_BLOCK_HEADER_BYTES ||
         !bytes_are_zero(base + 68U, 4U) ||
-        !bytes_are_zero(base + 104U,
-                        DVM_BLOCK_HEADER_RECORD_BYTES - 104U)) {
+        bytes_are_zero(base + 104U, 64U) ||
+        !bytes_are_zero(base + 168U,
+                        DVM_BLOCK_HEADER_RECORD_BYTES - 168U)) {
         errno = EPROTO;
         return -1;
     }
@@ -297,6 +299,8 @@ static int read_header(const volatile uint8_t *base, size_t mapped_bytes,
         load_cursor(base, COMPLETION_CONSUMER_OFFSET, __ATOMIC_ACQUIRE);
     header->completion_producer =
         load_cursor(base, COMPLETION_PRODUCER_OFFSET, __ATOMIC_ACQUIRE);
+    for (size_t index = 0U; index < sizeof(header->epoch_signature); index++)
+        header->epoch_signature[index] = base[104U + index];
 
     if (header->region_bytes != DVM_BLOCK_APERTURE_BYTES ||
         header->queue_depth != DVM_BLOCK_QUEUE_DEPTH ||
@@ -332,6 +336,8 @@ static bool same_immutable_header(const struct block_header *left,
            left->capacity_sectors == right->capacity_sectors &&
            left->logical_block_size == right->logical_block_size &&
            left->physical_block_size == right->physical_block_size &&
+           memcmp(left->epoch_signature, right->epoch_signature,
+                  sizeof(left->epoch_signature)) == 0 &&
            (left->flags & DVM_BLOCK_FLAG_READ_ONLY) ==
                (right->flags & DVM_BLOCK_FLAG_READ_ONLY);
 }
@@ -1349,7 +1355,7 @@ static int serve(void)
 
     failed_stage = "request-loop";
     relay_log(
-        "rustos-dvm-block: ready abi=1 generation=%" PRIu64
+        "rustos-dvm-block: ready abi=2 generation=%" PRIu64
         " controller=%s device=%s sectors=%" PRIu64
         " logical=%u physical=%u features=0x%" PRIx64
         " event=ivshmem-msix-uio\n",
