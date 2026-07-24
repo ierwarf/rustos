@@ -26,7 +26,7 @@ use runtime::{
 use runtime::{sha256_file, trusted_canonical_regular_file};
 use storage::{
     load_storage_epoch_signing_key, prepare_storage_handoff, revoke_storage_aperture,
-    storage_epoch_verifying_key_sha256,
+    storage_epoch_identity_sha256, storage_epoch_verifying_key_sha256,
 };
 
 #[derive(Parser)]
@@ -552,6 +552,7 @@ fn main() -> Result<()> {
                     &evidence.block_name,
                     &evidence.aperture_path,
                     evidence.header.generation,
+                    &storage_epoch_identity_sha256(&evidence.header),
                 )?;
             }
             let store = FileLeaseStore::new(state_root);

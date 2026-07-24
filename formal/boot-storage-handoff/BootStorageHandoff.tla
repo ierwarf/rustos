@@ -30,6 +30,7 @@ Phases == {
     "host-active",
     "host-frozen",
     "durable",
+    "epoch-bound",
     "vfio-assigned",
     "dvm-launched",
     "dvm-ready",
@@ -42,14 +43,16 @@ Phases == {
 }
 
 VARIABLES phase, generation, readyGeneration, epochSigned, apertureLive, durable,
-          runtimeRecorded, exactPidExited, staleReadyRejected
+          runtimeRecorded, exactPidExited, staleReadyRejected, readOnly,
+          revokedReadOnly, revocationRetried, epochIdentityBound
 
 vars == <<phase, generation, readyGeneration, epochSigned, apertureLive, durable,
-          runtimeRecorded, exactPidExited, staleReadyRejected>>
+          runtimeRecorded, exactPidExited, staleReadyRejected, readOnly,
+          revokedReadOnly, revocationRetried, epochIdentityBound>>
 
 HostAuthority ==
     phase \in {
-        "host-active", "host-frozen", "durable", "host-aperture-revoked",
+        "host-active", "host-frozen", "durable", "epoch-bound", "host-aperture-revoked",
         "host-restored"
     }
 
@@ -71,13 +74,18 @@ Init ==
     /\ runtimeRecorded = FALSE
     /\ exactPidExited = TRUE
     /\ staleReadyRejected = FALSE
+    /\ readOnly \in BOOLEAN
+    /\ revokedReadOnly = FALSE
+    /\ revocationRetried = FALSE
+    /\ epochIdentityBound = FALSE
 
 FreezeHost ==
     /\ phase = "host-active"
     /\ phase' = "host-frozen"
     /\ apertureLive' = TRUE
     /\ UNCHANGED <<generation, readyGeneration, epochSigned, durable, runtimeRecorded,
-                   exactPidExited, staleReadyRejected>>
+                   exactPidExited, staleReadyRejected, readOnly, revokedReadOnly,
+                   revocationRetried, epochIdentityBound>>
 
 FlushHost ==
     /\ phase = "host-frozen"
@@ -85,15 +93,28 @@ FlushHost ==
     /\ durable' = TRUE
     /\ epochSigned' = TRUE
     /\ UNCHANGED <<generation, readyGeneration, apertureLive, runtimeRecorded,
-                   exactPidExited, staleReadyRejected>>
+                   exactPidExited, staleReadyRejected, readOnly, revokedReadOnly,
+                   revocationRetried, epochIdentityBound>>
 
-AssignVfio ==
+BindEpochIdentity ==
     /\ phase = "durable"
     /\ durable
     /\ epochSigned
+    /\ phase' = "epoch-bound"
+    /\ epochIdentityBound' = TRUE
+    /\ UNCHANGED <<generation, readyGeneration, epochSigned, apertureLive, durable,
+                   runtimeRecorded, exactPidExited, staleReadyRejected, readOnly,
+                   revokedReadOnly, revocationRetried>>
+
+AssignVfio ==
+    /\ phase = "epoch-bound"
+    /\ durable
+    /\ epochSigned
+    /\ epochIdentityBound
     /\ phase' = "vfio-assigned"
     /\ UNCHANGED <<generation, readyGeneration, epochSigned, apertureLive, durable,
-                   runtimeRecorded, exactPidExited, staleReadyRejected>>
+                   runtimeRecorded, exactPidExited, staleReadyRejected, readOnly,
+                   revokedReadOnly, revocationRetried, epochIdentityBound>>
 
 LaunchDvm ==
     /\ phase = "vfio-assigned"
@@ -102,14 +123,16 @@ LaunchDvm ==
     /\ runtimeRecorded' = TRUE
     /\ exactPidExited' = FALSE
     /\ UNCHANGED <<generation, readyGeneration, epochSigned, apertureLive, durable,
-                   staleReadyRejected>>
+                   staleReadyRejected, readOnly, revokedReadOnly, revocationRetried,
+                   epochIdentityBound>>
 
 AdmitDvmReady ==
     /\ phase = "dvm-launched"
     /\ readyGeneration' = generation
     /\ phase' = "dvm-ready"
     /\ UNCHANGED <<generation, epochSigned, apertureLive, durable, runtimeRecorded,
-                   exactPidExited, staleReadyRejected>>
+                   exactPidExited, staleReadyRejected, readOnly, revokedReadOnly,
+                   revocationRetried, epochIdentityBound>>
 
 RejectStaleReady ==
     /\ phase = "dvm-launched"
@@ -117,13 +140,15 @@ RejectStaleReady ==
     /\ readyGeneration # generation
     /\ staleReadyRejected' = TRUE
     /\ UNCHANGED <<phase, generation, readyGeneration, epochSigned, apertureLive, durable,
-                   runtimeRecorded, exactPidExited>>
+                   runtimeRecorded, exactPidExited, readOnly, revokedReadOnly,
+                   revocationRetried, epochIdentityBound>>
 
 RequestStop ==
     /\ phase \in {"dvm-launched", "dvm-ready"}
     /\ phase' = "stop-requested"
     /\ UNCHANGED <<generation, readyGeneration, epochSigned, apertureLive, durable,
-                   runtimeRecorded, exactPidExited, staleReadyRejected>>
+                   runtimeRecorded, exactPidExited, staleReadyRejected, readOnly,
+                   revokedReadOnly, revocationRetried, epochIdentityBound>>
 
 ObserveExactExit ==
     /\ phase = "stop-requested"
@@ -131,29 +156,43 @@ ObserveExactExit ==
     /\ phase' = "dvm-exited"
     /\ exactPidExited' = TRUE
     /\ UNCHANGED <<generation, readyGeneration, epochSigned, apertureLive, durable,
-                   runtimeRecorded, staleReadyRejected>>
+                   runtimeRecorded, staleReadyRejected, readOnly, revokedReadOnly,
+                   revocationRetried, epochIdentityBound>>
 
 AbortBeforeVfio ==
-    /\ phase \in {"host-frozen", "durable"}
+    /\ phase \in {"host-frozen", "durable", "epoch-bound"}
     /\ phase' = "host-aperture-revoked"
     /\ apertureLive' = FALSE
+    /\ revokedReadOnly' = readOnly
     /\ UNCHANGED <<generation, readyGeneration, epochSigned, durable, runtimeRecorded,
-                   exactPidExited, staleReadyRejected>>
+                   exactPidExited, staleReadyRejected, readOnly, revocationRetried,
+                   epochIdentityBound>>
 
 RecoverBeforeLaunch ==
     /\ phase = "vfio-assigned"
     /\ phase' = "dvm-exited"
     /\ exactPidExited' = TRUE
     /\ UNCHANGED <<generation, readyGeneration, epochSigned, apertureLive, durable,
-                   runtimeRecorded, staleReadyRejected>>
+                   runtimeRecorded, staleReadyRejected, readOnly, revokedReadOnly,
+                   revocationRetried, epochIdentityBound>>
 
 RevokeAperture ==
     /\ phase = "dvm-exited"
     /\ exactPidExited
     /\ phase' = "vfio-aperture-revoked"
     /\ apertureLive' = FALSE
+    /\ revokedReadOnly' = readOnly
     /\ UNCHANGED <<generation, readyGeneration, epochSigned, durable, runtimeRecorded,
-                   exactPidExited, staleReadyRejected>>
+                   exactPidExited, staleReadyRejected, readOnly, revocationRetried,
+                   epochIdentityBound>>
+
+RetryRevocation ==
+    /\ phase \in {"host-aperture-revoked", "vfio-aperture-revoked"}
+    /\ revokedReadOnly = readOnly
+    /\ revocationRetried' = TRUE
+    /\ UNCHANGED <<phase, generation, readyGeneration, epochSigned, apertureLive,
+                   durable, runtimeRecorded, exactPidExited, staleReadyRejected,
+                   readOnly, revokedReadOnly, epochIdentityBound>>
 
 RestoreHost ==
     /\ phase \in {"host-aperture-revoked", "vfio-aperture-revoked"}
@@ -161,17 +200,20 @@ RestoreHost ==
     /\ phase' = "host-restored"
     /\ runtimeRecorded' = FALSE
     /\ UNCHANGED <<generation, readyGeneration, epochSigned, apertureLive, durable,
-                   exactPidExited, staleReadyRejected>>
+                   exactPidExited, staleReadyRejected, readOnly, revokedReadOnly,
+                   revocationRetried, epochIdentityBound>>
 
 Quarantine ==
     /\ phase \in {"vfio-assigned", "dvm-exited"}
     /\ phase' = "quarantined"
     /\ UNCHANGED <<generation, readyGeneration, epochSigned, apertureLive, durable,
-                   runtimeRecorded, exactPidExited, staleReadyRejected>>
+                   runtimeRecorded, exactPidExited, staleReadyRejected, readOnly,
+                   revokedReadOnly, revocationRetried, epochIdentityBound>>
 
 Next ==
     FreezeHost
     \/ FlushHost
+    \/ BindEpochIdentity
     \/ AssignVfio
     \/ LaunchDvm
     \/ AdmitDvmReady
@@ -181,6 +223,7 @@ Next ==
     \/ AbortBeforeVfio
     \/ RecoverBeforeLaunch
     \/ RevokeAperture
+    \/ RetryRevocation
     \/ RestoreHost
     \/ Quarantine
 
@@ -194,10 +237,15 @@ TypeOK ==
     /\ runtimeRecorded \in BOOLEAN
     /\ exactPidExited \in BOOLEAN
     /\ staleReadyRejected \in BOOLEAN
+    /\ readOnly \in BOOLEAN
+    /\ revokedReadOnly \in BOOLEAN
+    /\ revocationRetried \in BOOLEAN
+    /\ epochIdentityBound \in BOOLEAN
 
 ControllerAuthorityIsExclusive == ~(HostAuthority /\ VfioAuthority)
 DvmRequiresVfio == DvmAuthority => VfioAuthority
 VfioRequiresDurability == VfioAuthority => durable
+VfioRequiresEpochIdentity == VfioAuthority => epochIdentityBound
 DvmRequiresAperture == DvmAuthority => apertureLive
 DvmRequiresRuntimeRecord == DvmAuthority => runtimeRecorded
 DvmRequiresSignedEpoch == DvmAuthority => epochSigned
@@ -210,6 +258,12 @@ RevocationRequiresExactExit ==
 RestoreRequiresRevocation ==
     phase = "host-restored" => ~apertureLive /\ ~DvmAuthority
 QuarantineNeverRestoresHost == phase = "quarantined" => ~HostAuthority
+SignedStaticFlagsSurviveRevocation ==
+    phase \in {
+        "host-aperture-revoked", "vfio-aperture-revoked", "host-restored"
+    } => revokedReadOnly = readOnly
+RetryUsesTheSameSignedStaticFlags ==
+    revocationRetried => revokedReadOnly = readOnly
 
 Spec == Init /\ [][Next]_vars
 ===============================================================================

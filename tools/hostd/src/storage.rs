@@ -56,16 +56,31 @@ impl Drop for StorageHandoffGuard {
         if self.committed {
             return;
         }
-        let mut revoked = self.evidence.header;
-        revoked.flags = 0;
-        revoked.request_producer = 0;
-        revoked.request_consumer = 0;
-        revoked.completion_producer = 0;
-        revoked.completion_consumer = 0;
+        let revoked = revoked_storage_header(self.evidence.header);
         let _ = self.aperture.write_all_at(&revoked.encode(), 0);
         let _ = self.aperture.sync_all();
         let _ = unsafe { libc::flock(self.device.as_raw_fd(), libc::LOCK_UN) };
     }
+}
+
+fn revoked_storage_header(mut header: DvmBlockHeader) -> DvmBlockHeader {
+    // READ_ONLY is immutable signed geometry, not live readiness. Clearing it
+    // would invalidate the L0 epoch signature and make an interrupted handoff
+    // impossible to revoke idempotently during explicit recovery.
+    header.flags &= DVM_BLOCK_FLAG_READ_ONLY;
+    header.request_producer = 0;
+    header.request_consumer = 0;
+    header.completion_producer = 0;
+    header.completion_consumer = 0;
+    header
+}
+
+fn storage_header_is_revoked(header: DvmBlockHeader) -> bool {
+    header.flags & !DVM_BLOCK_FLAG_READ_ONLY == 0
+        && header.request_producer == 0
+        && header.request_consumer == 0
+        && header.completion_producer == 0
+        && header.completion_consumer == 0
 }
 
 pub fn prepare_storage_handoff(
@@ -81,8 +96,11 @@ pub fn prepare_storage_handoff(
     let block_name = discover_whole_block_device(sysfs_root, &controller_bdf)?;
     validate_block_device_idle(sysfs_root, proc_root, device_root, &block_name)?;
     let node = device_root.join(&block_name);
-    let device = open_exclusive_block_device(&node)?;
+    let (device, opened_writable) = open_exclusive_block_device(&node)?;
     let geometry = read_block_geometry(&device, sysfs_root, &block_name)?;
+    if !opened_writable && !geometry.read_only {
+        bail!("physical block device denied writable open but BLKROGET reports writable media");
+    }
     flush_block_device_bounded(&device, Duration::from_millis(policy.handoff_timeout_ms()))?;
     let (aperture, aperture_path, generation) = prepare_aperture(aperture_path)?;
     let mut header = DvmBlockHeader::new(
@@ -156,6 +174,17 @@ pub fn storage_epoch_verifying_key_sha256(key: &SigningKey) -> String {
     encoded
 }
 
+pub fn storage_epoch_identity_sha256(header: &DvmBlockHeader) -> String {
+    let mut digest = Sha256::new();
+    digest.update(header.epoch_signing_bytes());
+    digest.update(header.epoch_signature);
+    let mut encoded = String::with_capacity(64);
+    for byte in digest.finalize() {
+        write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    encoded
+}
+
 pub fn revoke_storage_aperture(path: &Path, expected_generation: u64) -> Result<()> {
     let owner = unsafe { libc::geteuid() };
     let (file, canonical) = open_private_aperture(path, false)?;
@@ -176,12 +205,7 @@ pub fn revoke_storage_aperture(path: &Path, expected_generation: u64) -> Result<
     if metadata.uid() != owner {
         bail!("storage aperture owner changed before revocation");
     }
-    let mut revoked = header;
-    revoked.flags = 0;
-    revoked.request_producer = 0;
-    revoked.request_consumer = 0;
-    revoked.completion_producer = 0;
-    revoked.completion_consumer = 0;
+    let revoked = revoked_storage_header(header);
     file.write_all_at(&revoked.encode(), 0)?;
     file.sync_all()
         .context("persist storage aperture revocation")
@@ -360,13 +384,31 @@ fn block_family_members(
     Ok(members)
 }
 
-fn open_exclusive_block_device(path: &Path) -> Result<File> {
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_EXCL)
-        .open(path)
-        .with_context(|| format!("open exclusive physical block device {}", path.display()))?;
+fn open_exclusive_block_device(path: &Path) -> Result<(File, bool)> {
+    let open = |writable| {
+        fs::OpenOptions::new()
+            .read(true)
+            .write(writable)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_EXCL)
+            .open(path)
+    };
+    let (file, opened_writable) = match open(true) {
+        Ok(file) => (file, true),
+        Err(error) if matches!(error.raw_os_error(), Some(libc::EROFS) | Some(libc::EACCES)) => (
+            open(false).with_context(|| {
+                format!(
+                    "open read-only exclusive physical block device {}",
+                    path.display()
+                )
+            })?,
+            false,
+        ),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("open exclusive physical block device {}", path.display())
+            });
+        }
+    };
     let metadata = file.metadata()?;
     if !metadata.file_type().is_block_device() {
         bail!(
@@ -377,7 +419,7 @@ fn open_exclusive_block_device(path: &Path) -> Result<File> {
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         return Err(io::Error::last_os_error()).context("lock physical block device");
     }
-    Ok(file)
+    Ok((file, opened_writable))
 }
 
 fn read_block_geometry(file: &File, sysfs_root: &Path, name: &str) -> Result<BlockGeometry> {
@@ -494,18 +536,10 @@ fn flush_block_device_bounded(file: &File, timeout: Duration) -> Result<()> {
 fn prepare_aperture(path: &Path) -> Result<(File, PathBuf, u64)> {
     let (file, canonical) = open_private_aperture(path, true)?;
     let generation = match read_aperture_header(&file)? {
-        Some(header)
-            if header.flags == 0
-                && header.request_producer == 0
-                && header.request_consumer == 0
-                && header.completion_producer == 0
-                && header.completion_consumer == 0 =>
-        {
-            header
-                .generation
-                .checked_add(1)
-                .ok_or_else(|| anyhow!("storage aperture generation exhausted"))?
-        }
+        Some(header) if storage_header_is_revoked(header) => header
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("storage aperture generation exhausted"))?,
         Some(_) => bail!("storage aperture retains an active or dirty transport epoch"),
         None => {
             let mut bytes = [0_u8; DVM_BLOCK_HEADER_RECORD_BYTES];
@@ -634,10 +668,12 @@ fn validate_device_number(value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        initialize_aperture, prepare_aperture, revoke_storage_aperture, validate_block_device_idle,
+        initialize_aperture, prepare_aperture, revoke_storage_aperture,
+        storage_epoch_identity_sha256, validate_block_device_idle,
     };
     use driver_domain_protocol::{
-        DVM_BLOCK_APERTURE_BYTES, DVM_BLOCK_FEATURE_FLUSH, DVM_BLOCK_HEADER_RECORD_BYTES,
+        DVM_BLOCK_APERTURE_BYTES, DVM_BLOCK_FEATURE_FLUSH, DVM_BLOCK_FLAG_DVM_READY,
+        DVM_BLOCK_FLAG_READ_ONLY, DVM_BLOCK_FLAG_RUSTOS_READY, DVM_BLOCK_HEADER_RECORD_BYTES,
         DvmBlockHeader,
     };
     use ed25519_dalek::{Signer, SigningKey};
@@ -648,6 +684,13 @@ mod tests {
     fn signed_header(generation: u64) -> DvmBlockHeader {
         let key = SigningKey::from_bytes(&[0x42; 32]);
         let header = DvmBlockHeader::new(generation, 4096, 512, 4096, DVM_BLOCK_FEATURE_FLUSH);
+        header.with_epoch_signature(key.sign(&header.epoch_signing_bytes()).to_bytes())
+    }
+
+    fn signed_read_only_header(generation: u64) -> DvmBlockHeader {
+        let key = SigningKey::from_bytes(&[0x42; 32]);
+        let mut header = DvmBlockHeader::new(generation, 4096, 512, 4096, DVM_BLOCK_FEATURE_FLUSH);
+        header.flags = DVM_BLOCK_FLAG_READ_ONLY;
         header.with_epoch_signature(key.sign(&header.epoch_signing_bytes()).to_bytes())
     }
 
@@ -667,6 +710,14 @@ mod tests {
         let (file, canonical, generation) = prepare_aperture(&path).unwrap();
         assert_eq!(generation, 1);
         let header = signed_header(1);
+        let identity = storage_epoch_identity_sha256(&header);
+        let mut live = header;
+        live.flags |= DVM_BLOCK_FLAG_RUSTOS_READY | DVM_BLOCK_FLAG_DVM_READY;
+        live.request_producer = 1;
+        assert_eq!(storage_epoch_identity_sha256(&live), identity);
+        let mut forged_geometry = header;
+        forged_geometry.capacity_sectors += 1;
+        assert_ne!(storage_epoch_identity_sha256(&forged_geometry), identity);
         initialize_aperture(&file, header).unwrap();
         drop(file);
 
@@ -684,8 +735,23 @@ mod tests {
         assert_eq!(revoked.flags, 0);
         assert_eq!(file.metadata().unwrap().len(), DVM_BLOCK_APERTURE_BYTES);
         drop(file);
-        let (_, _, generation) = prepare_aperture(&canonical).unwrap();
+        let (file, _, generation) = prepare_aperture(&canonical).unwrap();
         assert_eq!(generation, 3);
+        let read_only = signed_read_only_header(generation);
+        initialize_aperture(&file, read_only).unwrap();
+        drop(file);
+        revoke_storage_aperture(&canonical, generation).unwrap();
+        revoke_storage_aperture(&canonical, generation).unwrap();
+        let file = fs::OpenOptions::new().read(true).open(&canonical).unwrap();
+        let mut record = [0_u8; DVM_BLOCK_HEADER_RECORD_BYTES];
+        file.read_exact_at(&mut record, 0).unwrap();
+        let revoked = DvmBlockHeader::decode(&record).unwrap();
+        assert!(revoked.is_valid());
+        assert_eq!(revoked.generation, generation);
+        assert_eq!(revoked.flags, DVM_BLOCK_FLAG_READ_ONLY);
+        drop(file);
+        let (_, _, next_generation) = prepare_aperture(&canonical).unwrap();
+        assert_eq!(next_generation, 4);
         fs::remove_dir_all(root).unwrap();
     }
 

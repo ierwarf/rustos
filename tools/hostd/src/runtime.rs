@@ -12,14 +12,17 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
-use driver_domain_protocol::{DVM_BLOCK_FLAG_DVM_READY, DVM_BLOCK_FLAG_RUSTOS_READY};
+use driver_domain_protocol::{
+    DVM_BLOCK_FLAG_DVM_READY, DVM_BLOCK_FLAG_READ_ONLY, DVM_BLOCK_FLAG_RUSTOS_READY, DvmBlockHeader,
+};
 use rustos_driver_domain_host::{
     ControlContract, ControlSecret, DeviceClass, DeviceTransport, DriverDomainPolicy,
-    HostControlListener, PhysicalDisplayPolicy, SysfsVfioOps, ValidatedLease, VfioLeaseRecord,
-    VfioLeaseState, reset_vfio_group, restore_vfio_lease, validate_host_display_assignment,
-    validate_physical_display_assignment, validate_physical_display_identity,
-    validate_physical_storage_assignment, validate_physical_storage_identity,
-    validate_reset_scope_assignment, validate_vfio_bind_dma_quiescence,
+    DvmBlockEvidence, HostControlListener, PhysicalDisplayPolicy, SysfsVfioOps, ValidatedLease,
+    VfioLeaseRecord, VfioLeaseState, reset_vfio_group, restore_vfio_lease,
+    validate_host_display_assignment, validate_physical_display_assignment,
+    validate_physical_display_identity, validate_physical_storage_assignment,
+    validate_physical_storage_identity, validate_reset_scope_assignment,
+    validate_vfio_bind_dma_quiescence,
 };
 use sha2::{Digest, Sha256};
 
@@ -1165,6 +1168,9 @@ pub fn supervise_storage_domain(
     }
     let header =
         crate::storage::inspect_storage_aperture(binding.aperture_path(), binding.generation())?;
+    if !storage_epoch_identity_matches(&header, binding.epoch_identity_sha256()) {
+        bail!("live storage aperture no longer matches the durable signed epoch identity");
+    }
     if header.flags & DVM_BLOCK_FLAG_RUSTOS_READY == 0
         || header.flags & DVM_BLOCK_FLAG_DVM_READY != 0
     {
@@ -1586,16 +1592,26 @@ fn validate_storage_probe(
     policy.validate_evidence(evidence, binding.generation(), binding.block_name())?;
     let header =
         crate::storage::inspect_storage_aperture(binding.aperture_path(), binding.generation())?;
-    if header.flags & (DVM_BLOCK_FLAG_RUSTOS_READY | DVM_BLOCK_FLAG_DVM_READY)
-        != DVM_BLOCK_FLAG_RUSTOS_READY | DVM_BLOCK_FLAG_DVM_READY
-        || header.capacity_sectors != evidence.capacity_sectors
-        || header.logical_block_size != evidence.logical_block_size
-        || header.physical_block_size != evidence.physical_block_size
-        || header.features != evidence.features
+    if !storage_epoch_identity_matches(&header, binding.epoch_identity_sha256())
+        || header.flags & (DVM_BLOCK_FLAG_RUSTOS_READY | DVM_BLOCK_FLAG_DVM_READY)
+            != DVM_BLOCK_FLAG_RUSTOS_READY | DVM_BLOCK_FLAG_DVM_READY
+        || !block_evidence_matches_aperture(header, evidence)
     {
         bail!("authenticated DVM block evidence does not match the live shared aperture");
     }
     Ok(())
+}
+
+fn storage_epoch_identity_matches(header: &DvmBlockHeader, expected_sha256: &str) -> bool {
+    crate::storage::storage_epoch_identity_sha256(header) == expected_sha256
+}
+
+fn block_evidence_matches_aperture(header: DvmBlockHeader, evidence: &DvmBlockEvidence) -> bool {
+    header.capacity_sectors == evidence.capacity_sectors
+        && header.logical_block_size == evidence.logical_block_size
+        && header.physical_block_size == evidence.physical_block_size
+        && header.features == evidence.features
+        && (header.flags & DVM_BLOCK_FLAG_READ_ONLY != 0) == evidence.read_only
 }
 
 fn wait_for_storage_readiness(
@@ -2530,6 +2546,56 @@ mod tests {
         assert_eq!(std::mem::size_of::<IommuDestroy>(), 8);
         assert_eq!(IOMMU_IOAS_ALLOC, 0x3b81);
         assert_eq!(IOMMU_DESTROY, 0x3b80);
+    }
+
+    #[test]
+    fn storage_evidence_read_only_mode_must_match_the_signed_aperture() {
+        let mut header = DvmBlockHeader::new(
+            7,
+            4096,
+            512,
+            4096,
+            driver_domain_protocol::DVM_BLOCK_FEATURE_FLUSH,
+        );
+        header.flags =
+            DVM_BLOCK_FLAG_RUSTOS_READY | DVM_BLOCK_FLAG_DVM_READY | DVM_BLOCK_FLAG_READ_ONLY;
+        let evidence = DvmBlockEvidence {
+            generation: 7,
+            driver: "nvme".to_owned(),
+            pci_vendor: 0x144d,
+            pci_device: 0xa80b,
+            guest_pci_bdf: "0000:00:04.0".to_owned(),
+            block_name: "nvme0n1".to_owned(),
+            capacity_sectors: header.capacity_sectors,
+            logical_block_size: header.logical_block_size,
+            physical_block_size: header.physical_block_size,
+            features: header.features,
+            read_only: true,
+        };
+        assert!(block_evidence_matches_aperture(header, &evidence));
+
+        let mut forged_writable = evidence.clone();
+        forged_writable.read_only = false;
+        assert!(!block_evidence_matches_aperture(header, &forged_writable));
+        header.flags &= !DVM_BLOCK_FLAG_READ_ONLY;
+        assert!(block_evidence_matches_aperture(header, &forged_writable));
+    }
+
+    #[test]
+    fn storage_supervision_binds_the_exact_signed_epoch_identity() {
+        let mut header = DvmBlockHeader::new(
+            7,
+            4096,
+            512,
+            4096,
+            driver_domain_protocol::DVM_BLOCK_FEATURE_FLUSH,
+        );
+        header.epoch_signature = [0x5a; 64];
+        let identity = crate::storage::storage_epoch_identity_sha256(&header);
+        assert!(storage_epoch_identity_matches(&header, &identity));
+
+        header.capacity_sectors += 1;
+        assert!(!storage_epoch_identity_matches(&header, &identity));
     }
 
     #[test]

@@ -722,7 +722,11 @@ policy remains with the owning service.
 - Storage-DVM relay admission reports the exact failing stage (`lock`,
   `transport`, `header`, `block-device`, `rustos-ready`, `publish-ready`, or
   `publish-evidence`) with the preserved errno. A generic readiness timeout is
-  not acceptable evidence for this boundary.
+  not acceptable evidence for this boundary. Authenticated block evidence must
+  match the live signed aperture's capacity, logical/physical block sizes,
+  features, and read-only mode exactly. Read-only is a supported least-
+  authority transport mode, not an error or permission to report writable
+  media.
 - Both directions use ivshmem MSI-X vector 0 only after the corresponding
   Release cursor publication. RustOS writes BAR0 doorbell peer 1 for requests;
   the storage DVM writes peer 0 for completions and readiness withdrawal.
@@ -738,6 +742,13 @@ policy remains with the owning service.
   handoff/reset deadlines are bounded.
   Schema 2/3 cannot opt into the block transport, so a generic or display
   domain cannot acquire storage authority by changing one transport string.
+- The durable VFIO lease uses schema 5 and binds the SHA-256 of the exact
+  immutable epoch signing bytes plus its signature before controller
+  assignment. Generation and aperture path alone are not sufficient. Hostd
+  rechecks that identity immediately before DVM launch and again when
+  admitting readiness, so coordinated mutation of shared geometry and DVM
+  evidence cannot manufacture supervisor success. Retired lease schemas fail
+  closed instead of silently weakening this binding.
 - AHCI admission includes the complete minimal Linux driver closure: `ahci`
   owns the PCI controller and signed `sd_mod` must publish its one whole-disk
   block namespace before the relay starts. NVMe uses its native namespace
@@ -752,6 +763,11 @@ policy remains with the owning service.
   revoked, all four cursors are zero, the generation strictly increases, and
   the successor signature verifies against the immutable early-system key.
   A stale, unsigned, or DVM-forged header remains revoked.
+- Aperture revocation clears only live readiness and ring cursors. It preserves
+  the signed immutable `READ_ONLY` bit, so an interrupted read-only handoff can
+  be revoked repeatedly by explicit recovery without invalidating its own L0
+  epoch signature. Retry observes the same generation and static geometry; it
+  never mints a successor epoch or restores controller authority.
 - Ring0's DVM block endpoint is transport substrate only. It validates one
   exact aperture, arms exactly one MSI-X leaf that only wakes, copies bounded
   records/data, and exposes nonblocking submit/collect/cancel plus a

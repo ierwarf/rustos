@@ -511,9 +511,8 @@ impl PhysicalStoragePolicy {
                 .is_multiple_of(evidence.logical_block_size)
             || evidence.features & !DVM_BLOCK_KNOWN_FEATURES != 0
             || evidence.features & DVM_BLOCK_REQUIRED_FEATURES != DVM_BLOCK_REQUIRED_FEATURES
-            || evidence.read_only
         {
-            bail!("DVM block evidence violates the writable block transport contract");
+            bail!("DVM block evidence violates the block transport geometry contract");
         }
         Ok(())
     }
@@ -1622,6 +1621,7 @@ pub struct StorageLeaseBinding {
     block_name: String,
     aperture_path: PathBuf,
     generation: u64,
+    epoch_identity_sha256: String,
 }
 
 impl StorageLeaseBinding {
@@ -1640,6 +1640,10 @@ impl StorageLeaseBinding {
     pub const fn generation(&self) -> u64 {
         self.generation
     }
+
+    pub fn epoch_identity_sha256(&self) -> &str {
+        &self.epoch_identity_sha256
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1655,6 +1659,7 @@ impl VfioLeaseRecord {
         block_name: &str,
         aperture_path: &Path,
         generation: u64,
+        epoch_identity_sha256: &str,
     ) -> Result<()> {
         if self.state != VfioLeaseState::Prepared || self.storage_binding.is_some() {
             bail!("VFIO lease storage handoff may be bound exactly once while prepared");
@@ -1674,6 +1679,8 @@ impl VfioLeaseRecord {
         if generation == 0 || !aperture_path.is_absolute() {
             bail!("invalid storage handoff aperture epoch");
         }
+        let epoch_identity_sha256 =
+            parse_sha256(epoch_identity_sha256, "storage handoff epoch identity")?;
         let aperture = aperture_path
             .to_str()
             .ok_or_else(|| anyhow!("storage handoff aperture path is not UTF-8"))?;
@@ -1690,6 +1697,7 @@ impl VfioLeaseRecord {
             block_name: block_name.to_owned(),
             aperture_path: aperture_path.to_path_buf(),
             generation,
+            epoch_identity_sha256,
         });
         Ok(())
     }
@@ -1778,10 +1786,16 @@ impl VfioLeaseRecord {
         let binding = self.release_binding.as_ref().ok_or_else(|| {
             anyhow!("durable VFIO lease lacks signed release authorization evidence")
         })?;
-        let (storage_controller, storage_block, storage_aperture, storage_generation) = self
+        let (
+            storage_controller,
+            storage_block,
+            storage_aperture,
+            storage_generation,
+            storage_epoch_identity_sha256,
+        ) = self
             .storage_binding
             .as_ref()
-            .map_or(("none", "none", "none", 0), |storage| {
+            .map_or(("none", "none", "none", 0, "none"), |storage| {
                 (
                     storage.controller_bdf.as_str(),
                     storage.block_name.as_str(),
@@ -1790,10 +1804,11 @@ impl VfioLeaseRecord {
                         .to_str()
                         .expect("validated storage aperture is UTF-8"),
                     storage.generation,
+                    storage.epoch_identity_sha256.as_str(),
                 )
             });
         Ok(format!(
-            "VFIO_LEASE_SCHEMA=4\nLEASE_STATE={state}\nDOMAIN_ID={}\nDVM_GUEST_CID={}\nIOMMU_GROUP={}\nORIGINAL_DRIVERS={drivers}\nORIGINAL_DRIVER_OVERRIDES={overrides}\nRELEASE_MANIFEST_SHA256={}\nDVM_ARTIFACT_MANIFEST_SHA256={}\nDEVICE_POLICY_SHA256={}\nFLEET_POLICY_SHA256={}\nAUTHORIZED_AT_UNIX={}\nAUTHORIZATION_NOT_AFTER_UNIX={}\nSTORAGE_CONTROLLER_BDF={storage_controller}\nSTORAGE_BLOCK_NAME={storage_block}\nSTORAGE_APERTURE={storage_aperture}\nSTORAGE_GENERATION={storage_generation}\n",
+            "VFIO_LEASE_SCHEMA=5\nLEASE_STATE={state}\nDOMAIN_ID={}\nDVM_GUEST_CID={}\nIOMMU_GROUP={}\nORIGINAL_DRIVERS={drivers}\nORIGINAL_DRIVER_OVERRIDES={overrides}\nRELEASE_MANIFEST_SHA256={}\nDVM_ARTIFACT_MANIFEST_SHA256={}\nDEVICE_POLICY_SHA256={}\nFLEET_POLICY_SHA256={}\nAUTHORIZED_AT_UNIX={}\nAUTHORIZATION_NOT_AFTER_UNIX={}\nSTORAGE_CONTROLLER_BDF={storage_controller}\nSTORAGE_BLOCK_NAME={storage_block}\nSTORAGE_APERTURE={storage_aperture}\nSTORAGE_GENERATION={storage_generation}\nSTORAGE_EPOCH_IDENTITY_SHA256={storage_epoch_identity_sha256}\n",
             self.domain_id,
             self.dvm_guest_cid,
             self.iommu_group,
@@ -1808,7 +1823,7 @@ impl VfioLeaseRecord {
 
     fn parse(source: &str, label: &str) -> Result<Self> {
         let values = parse_launch_plan_values(source, label)?;
-        const V4_REQUIRED: [&str; 17] = [
+        const V5_REQUIRED: [&str; 18] = [
             "VFIO_LEASE_SCHEMA",
             "LEASE_STATE",
             "DOMAIN_ID",
@@ -1826,13 +1841,14 @@ impl VfioLeaseRecord {
             "STORAGE_BLOCK_NAME",
             "STORAGE_APERTURE",
             "STORAGE_GENERATION",
+            "STORAGE_EPOCH_IDENTITY_SHA256",
         ];
         let schema = launch_plan_value(&values, "VFIO_LEASE_SCHEMA", label)?;
         let release_binding = match schema {
-            "4" if values.len() == V4_REQUIRED.len()
+            "5" if values.len() == V5_REQUIRED.len()
                 && !values
                     .keys()
-                    .any(|key| !V4_REQUIRED.contains(&key.as_str())) =>
+                    .any(|key| !V5_REQUIRED.contains(&key.as_str())) =>
             {
                 Some(VfioReleaseBinding::new(
                     launch_plan_value(&values, "RELEASE_MANIFEST_SHA256", label)?,
@@ -1925,17 +1941,26 @@ impl VfioLeaseRecord {
         let storage_generation = launch_plan_value(&values, "STORAGE_GENERATION", label)?
             .parse::<u64>()
             .context("invalid STORAGE_GENERATION")?;
+        let storage_epoch_identity =
+            launch_plan_value(&values, "STORAGE_EPOCH_IDENTITY_SHA256", label)?;
         match (
             storage_controller,
             storage_block,
             storage_aperture,
             storage_generation,
+            storage_epoch_identity,
         ) {
-            ("none", "none", "none", 0) => {}
-            (controller, block, aperture, generation) if generation != 0 => {
+            ("none", "none", "none", 0, "none") => {}
+            (controller, block, aperture, generation, epoch_identity) if generation != 0 => {
                 let parsed_state = record.state;
                 record.state = VfioLeaseState::Prepared;
-                record.bind_storage_handoff(controller, block, Path::new(aperture), generation)?;
+                record.bind_storage_handoff(
+                    controller,
+                    block,
+                    Path::new(aperture),
+                    generation,
+                    epoch_identity,
+                )?;
                 record.state = parsed_state;
             }
             _ => bail!("incomplete storage handoff binding in {label}"),
@@ -4310,7 +4335,7 @@ mod tests {
     }
 
     #[test]
-    fn block_evidence_is_exact_epoch_bound_and_writable() {
+    fn block_evidence_is_exact_epoch_bound_and_structurally_valid() {
         let policy = DriverDomainPolicy::parse(
             &format!(
                 "DRIVER_DOMAIN_POLICY_SCHEMA=4\nDOMAIN_ID=linux-dvm-storage0\nQEMU_SHA256={}\nINPUT_TRANSPORT=disabled\nNETWORK_TRANSPORT=disabled\nBLOCK_TRANSPORT=block-ring-msix\nDISPLAY_TRANSPORT=disabled\nSTORAGE_DRIVER=nvme\nSTORAGE_PCI_VENDOR=144d\nSTORAGE_PCI_DEVICE=a80b\nSTORAGE_EPOCH_VERIFYING_KEY_SHA256=5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a\nSTORAGE_REQUIRED_FEATURES=flush\nSTORAGE_QUEUE_DEPTH=64\nSTORAGE_DATA_SLOT_BYTES=65536\nSTORAGE_HANDOFF_TIMEOUT_MS=5000\nSTORAGE_RESET_TIMEOUT_MS=5000\n",
@@ -4335,6 +4360,13 @@ mod tests {
             .physical_storage()
             .unwrap()
             .validate_evidence(&evidence, 9, "nvme0n1")
+            .unwrap();
+        let mut read_only = evidence.clone();
+        read_only.read_only = true;
+        policy
+            .physical_storage()
+            .unwrap()
+            .validate_evidence(&read_only, 9, "nvme0n1")
             .unwrap();
         assert!(
             policy
@@ -4955,7 +4987,7 @@ mod tests {
         let mut record = inspect_vfio_lease(&lease, &ops, release_binding()).unwrap();
         let aperture = root.path().join("block.ivshmem");
         record
-            .bind_storage_handoff("0000:02:00.0", "nvme0n1", &aperture, 7)
+            .bind_storage_handoff("0000:02:00.0", "nvme0n1", &aperture, 7, &"ab".repeat(32))
             .unwrap();
         store.create_prepared(&record, 150).unwrap();
         let loaded = store.load("linux-dvm-net0").unwrap();
@@ -4964,6 +4996,7 @@ mod tests {
         assert_eq!(storage.block_name(), "nvme0n1");
         assert_eq!(storage.aperture_path(), aperture);
         assert_eq!(storage.generation(), 7);
+        assert_eq!(storage.epoch_identity_sha256(), "ab".repeat(32));
         store.remove("linux-dvm-net0").unwrap();
     }
 
@@ -4974,8 +5007,12 @@ mod tests {
         let v2 = format!(
             "VFIO_LEASE_SCHEMA=2\nLEASE_STATE=prepared\nDOMAIN_ID=linux-dvm-net0\nDVM_GUEST_CID=4\nIOMMU_GROUP=15\nORIGINAL_DRIVERS=0000:02:00.0@rtsx-pci\nORIGINAL_DRIVER_OVERRIDES=0000:02:00.0@none\nRELEASE_MANIFEST_SHA256={digest}\nDVM_ARTIFACT_MANIFEST_SHA256={digest}\nDEVICE_POLICY_SHA256={digest}\nAUTHORIZED_AT_UNIX=100\nAUTHORIZATION_NOT_AFTER_UNIX=200\n"
         );
+        let v4 = format!(
+            "VFIO_LEASE_SCHEMA=4\nLEASE_STATE=prepared\nDOMAIN_ID=linux-dvm-net0\nDVM_GUEST_CID=4\nIOMMU_GROUP=15\nORIGINAL_DRIVERS=0000:02:00.0@rtsx-pci\nORIGINAL_DRIVER_OVERRIDES=0000:02:00.0@none\nRELEASE_MANIFEST_SHA256={digest}\nDVM_ARTIFACT_MANIFEST_SHA256={digest}\nDEVICE_POLICY_SHA256={digest}\nFLEET_POLICY_SHA256={digest}\nAUTHORIZED_AT_UNIX=100\nAUTHORIZATION_NOT_AFTER_UNIX=200\nSTORAGE_CONTROLLER_BDF=none\nSTORAGE_BLOCK_NAME=none\nSTORAGE_APERTURE=none\nSTORAGE_GENERATION=0\n"
+        );
         assert!(VfioLeaseRecord::parse(v1, "retired-v1").is_err());
         assert!(VfioLeaseRecord::parse(&v2, "retired-v2").is_err());
+        assert!(VfioLeaseRecord::parse(&v4, "retired-v4").is_err());
     }
 
     #[test]
