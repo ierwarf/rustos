@@ -156,11 +156,11 @@ fn default_seeds(target: FuzzTarget) -> Vec<Vec<u8>> {
         ],
         FuzzTarget::DvmManifest => vec![
             format!(
-                "schema=8\nid=rustos-linux-dvm-x86_64\narchitecture=x86_64\nboot=linux-bzimage+cpio-xz\ndata-plane=hostd-input-ring-msix\ncontrol-plane=agent-v1-control\ncontrol-protocol=agent-v1\ncontrol-state=control\ncontrol-transport=kvm-vsock\ncontrol-authentication=dvm-agent-hmac-sha256-v1\ncontrol-capabilities=health,device-inventory,driver-inventory,display-evidence-v2,block-evidence-v1,input-stream\ncontrol-contract-sha256={0}\nbuildroot_version=2026.05\nlinux_version=6.12.94\nnvidia-open-version=580.173.02\nnvidia-open-sha256=8d8eb9001e05a9a8a663d3d5d304feb64ef2844ee185ccdfd952786820f46e1b\nnvidia-open-redistribute=no\ndisplay-kernel-modules=i915,xe,amdgpu,nvidia-drm\nmodule-signing-enforced=yes\nmodule-signing-cert-sha256={0}\nkernel_sha256={0}\nrootfs_sha256={0}\nconfig_sha256={0}\nkernel-config-sha256={0}\nsources_lock_sha256={0}\n",
+                "schema=9\nid=rustos-linux-dvm-x86_64\narchitecture=x86_64\nboot=linux-bzimage+cpio-zstd\ndata-plane=hostd-input-ring-msix\ncontrol-plane=agent-v1-control\ncontrol-protocol=agent-v1\ncontrol-state=control\ncontrol-transport=kvm-vsock\ncontrol-authentication=dvm-agent-hmac-sha256-v1\ncontrol-capabilities=health,device-inventory,driver-inventory,display-evidence-v2,block-evidence-v1,input-stream\ncontrol-contract-sha256={0}\nbuildroot_version=2026.05\nlinux_version=6.12.94\nnvidia-open-version=580.173.02\nnvidia-open-sha256=8d8eb9001e05a9a8a663d3d5d304feb64ef2844ee185ccdfd952786820f46e1b\nnvidia-open-redistribute=no\ndisplay-kernel-modules=i915,xe,amdgpu,nvidia-drm\nmodule-signing-enforced=yes\nmodule-signing-cert-sha256={0}\nkernel_sha256={0}\nrootfs_sha256={0}\nconfig_sha256={0}\nkernel-config-sha256={0}\nsources_lock_sha256={0}\n",
                 "0".repeat(64)
             )
             .into_bytes(),
-            b"schema=8\nschema=8\n".to_vec(),
+            b"schema=9\nschema=9\n".to_vec(),
         ],
         FuzzTarget::HostdLaunchPlan => vec![
             b"LAUNCH_PLAN_SCHEMA=1\nDOMAIN_ID=linux-dvm-net0\nDVM_GUEST_CID=4\nIOMMU_GROUP=15\nASSIGNED_PCI_BDFS=0000:02:00.0\nHOST_PROTECTED_PCI_BDFS=none\n".to_vec(),

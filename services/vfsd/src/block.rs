@@ -1,6 +1,7 @@
 use alloc::format;
 use core::mem::size_of;
 use core::ptr;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use rustos_user_abi::syscall::{
     CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, DvmBlockInfoWire,
@@ -13,13 +14,17 @@ use rustos_user_abi::syscall::{
 };
 use storage_core::{BlockDevice, IoResult, StorageError};
 
-use super::{EINVAL, EIO, ENODEV};
+use super::{EAGAIN, EINVAL, EIO, ENODEV, ENOSYS};
 use vfsd::{admit_dvm_block_geometry, storage_error_from_linux_status, validate_dvm_block_range};
 
 const IPC_BLOCK_PAYLOAD_BYTES: usize =
     rustos_user_abi::syscall::COMMERCIAL_MAX_PROTOCOL_PAYLOAD_CAPACITY;
 static mut STORAGED_BULK_RESPONSE_SLOT: StoragedBulkReadResponse =
     StoragedBulkReadResponse::zeroed();
+// Not-ready is an expected, bounded state while the DVM proves its initial
+// generation. Keep one diagnostic transition instead of turning every glibc
+// negative probe into debugcon I/O and scheduler pressure.
+static STORAGE_NOT_READY_DIAGNOSTIC_EMITTED: AtomicBool = AtomicBool::new(false);
 
 pub(super) struct BootBlockDevice {
     pub(super) generation: u64,
@@ -190,9 +195,11 @@ fn call_storaged(
         } else {
             ENODEV
         };
-        super::debug_line(&format!(
-            "vfsd: storaged call rejected stage=lookup errno={errno}"
-        ));
+        if should_log_storage_failure(errno) {
+            super::debug_line(&format!(
+                "vfsd: storaged call rejected stage=lookup errno={errno}"
+            ));
+        }
         return Err(errno);
     }
     let mut response = CommercialMaxProtocolResponse::default();
@@ -208,9 +215,11 @@ fn call_storaged(
     };
     if received < 0 {
         let errno = (-received) as i32;
-        super::debug_line(&format!(
-            "vfsd: storaged call rejected stage=ipc-call errno={errno}"
-        ));
+        if should_log_storage_failure(errno) {
+            super::debug_line(&format!(
+                "vfsd: storaged call rejected stage=ipc-call errno={errno}"
+            ));
+        }
         return Err(errno);
     }
     if received as usize != size_of::<CommercialMaxProtocolResponse>()
@@ -220,10 +229,14 @@ fn call_storaged(
         return Err(EIO);
     }
     if response.status != 0 {
-        super::debug_line(&format!(
-            "vfsd: storaged call rejected stage=service-status op={} errno={}",
-            request.header.op, response.status
-        ));
+        if should_log_storage_failure(response.status) {
+            super::debug_line(&format!(
+                "vfsd: storaged call rejected stage=service-status op={} errno={}",
+                request.header.op, response.status
+            ));
+        }
+    } else {
+        note_storage_ready();
     }
     Ok(response)
 }
@@ -244,9 +257,11 @@ fn call_storaged_bulk(request: &CommercialMaxProtocolRequest, out: &mut [u8]) ->
         } else {
             ENODEV
         };
-        super::debug_line(&format!(
-            "vfsd: storaged bulk call rejected stage=lookup errno={errno}"
-        ));
+        if should_log_storage_failure(errno) {
+            super::debug_line(&format!(
+                "vfsd: storaged bulk call rejected stage=lookup errno={errno}"
+            ));
+        }
         return Err(errno);
     }
 
@@ -270,9 +285,11 @@ fn call_storaged_bulk(request: &CommercialMaxProtocolRequest, out: &mut [u8]) ->
     };
     if received < 0 {
         let errno = (-received) as i32;
-        super::debug_line(&format!(
-            "vfsd: storaged bulk call rejected stage=ipc-call errno={errno}"
-        ));
+        if should_log_storage_failure(errno) {
+            super::debug_line(&format!(
+                "vfsd: storaged bulk call rejected stage=ipc-call errno={errno}"
+            ));
+        }
         return Err(errno);
     }
     let response_ref = unsafe { &*response };
@@ -283,12 +300,15 @@ fn call_storaged_bulk(request: &CommercialMaxProtocolRequest, out: &mut [u8]) ->
         return Err(EIO);
     }
     if response_ref.status != 0 {
-        super::debug_line(&format!(
-            "vfsd: storaged bulk call rejected stage=service-status op={} errno={}",
-            request.header.op, response_ref.status
-        ));
+        if should_log_storage_failure(response_ref.status) {
+            super::debug_line(&format!(
+                "vfsd: storaged bulk call rejected stage=service-status op={} errno={}",
+                request.header.op, response_ref.status
+            ));
+        }
         return Err(response_ref.status);
     }
+    note_storage_ready();
     if response_ref.generation != request.arg0
         || response_ref.lba != request.arg1
         || response_ref.block_count != request.arg2
@@ -299,6 +319,19 @@ fn call_storaged_bulk(request: &CommercialMaxProtocolRequest, out: &mut [u8]) ->
     }
     out.copy_from_slice(&response_ref.payload[..out.len()]);
     Ok(())
+}
+
+pub(super) fn is_transient_storage_not_ready(errno: i32) -> bool {
+    matches!(errno, EAGAIN | ENODEV | ENOSYS)
+}
+
+fn should_log_storage_failure(errno: i32) -> bool {
+    !is_transient_storage_not_ready(errno)
+        || !STORAGE_NOT_READY_DIAGNOSTIC_EMITTED.swap(true, Ordering::AcqRel)
+}
+
+fn note_storage_ready() {
+    STORAGE_NOT_READY_DIAGNOSTIC_EMITTED.store(false, Ordering::Release);
 }
 
 fn read_block_info(payload: &[u8]) -> Option<DvmBlockInfoWire> {
@@ -336,5 +369,13 @@ mod tests {
         assert_eq!(max_blocks * block_size, 60 * 1024);
         assert!(max_blocks * block_size <= STORAGED_BULK_READ_PAYLOAD_CAPACITY);
         assert!((max_blocks + 1) * block_size > STORAGED_BULK_READ_PAYLOAD_CAPACITY);
+    }
+
+    #[test]
+    fn only_startup_storage_absence_is_diagnostic_rate_limited() {
+        assert!(is_transient_storage_not_ready(EAGAIN));
+        assert!(is_transient_storage_not_ready(ENODEV));
+        assert!(is_transient_storage_not_ready(ENOSYS));
+        assert!(!is_transient_storage_not_ready(EIO));
     }
 }

@@ -6,6 +6,7 @@
 extern crate alloc;
 
 use alloc::collections::BTreeMap;
+use alloc::ffi::CString;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -18,7 +19,8 @@ use rustos_svc_runtime::ipc;
 use rustos_user_abi::linux as linux_abi;
 use rustos_user_abi::syscall::{
     CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
-    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, ServiceCheckpointRecordWire,
+    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, IpcReplyWithHandlesArgs,
+    ServiceCheckpointRecordWire, VfsExecutableSnapshotRequest, VfsExecutableSnapshotResponse,
     VfsIpcRequest, VfsIpcResponse, WaitSetInterestWire, WaitSetSignalBrokerArgs,
     COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS,
     COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR, COMMERCIAL_MAX_PROTOCOL_VFSD,
@@ -27,16 +29,18 @@ use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_SCAN, COMMERCIAL_MAX_VFSD_OP_DIRECTORY_CURSOR,
     COMMERCIAL_MAX_VFSD_OP_FD_TABLE_PLAN, COMMERCIAL_MAX_VFSD_OP_FILE_CURSOR,
     COMMERCIAL_MAX_VFSD_OP_METADATA_POLICY, COMMERCIAL_MAX_VFSD_OP_MOUNT_GRAPH,
-    COMMERCIAL_MAX_VFSD_OP_PATH_RESOLVE, IPC_SERVICE_ROOTD, IPC_SERVICE_VFSD, LINUX_STATX_SIZE,
-    LINUX_STAT_SIZE, SERVICE_CHECKPOINT_FLAG_TOMBSTONE, SERVICE_CHECKPOINT_VALUE_CAPACITY,
-    SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_LINUX_ACCESS, SYSCALL_OFFLOAD_OP_LINUX_CHDIR,
+    COMMERCIAL_MAX_VFSD_OP_PATH_RESOLVE, IPC_SERVICE_LOADERD, IPC_SERVICE_ROOTD, IPC_SERVICE_VFSD,
+    LINUX_STATX_SIZE, LINUX_STAT_SIZE, SERVICE_CHECKPOINT_FLAG_TOMBSTONE,
+    SERVICE_CHECKPOINT_VALUE_CAPACITY, SYSCALL_OFFLOAD_ABI_VERSION,
+    SYSCALL_OFFLOAD_OP_LINUX_ACCESS, SYSCALL_OFFLOAD_OP_LINUX_CHDIR,
     SYSCALL_OFFLOAD_OP_LINUX_CLOSE, SYSCALL_OFFLOAD_OP_LINUX_DUP, SYSCALL_OFFLOAD_OP_LINUX_FCNTL,
     SYSCALL_OFFLOAD_OP_LINUX_GETCWD, SYSCALL_OFFLOAD_OP_LINUX_GETDENTS64,
     SYSCALL_OFFLOAD_OP_LINUX_MKDIR, SYSCALL_OFFLOAD_OP_LINUX_MOUNT,
     SYSCALL_OFFLOAD_OP_LINUX_NEWFSTATAT, SYSCALL_OFFLOAD_OP_LINUX_OPENAT,
     SYSCALL_OFFLOAD_OP_LINUX_READLINKAT, SYSCALL_OFFLOAD_OP_LINUX_STATX,
     SYSCALL_OFFLOAD_OP_LINUX_UMOUNT2, SYSCALL_OFFLOAD_OP_LINUX_UNLINKAT,
-    SYS_RUSTOS_WAITSET_SIGNAL_BROKER, VFS_CURSOR_SETTLE_CANCEL, VFS_CURSOR_SETTLE_COMMIT,
+    SYS_RUSTOS_IPC_REPLY_WITH_HANDLES, SYS_RUSTOS_WAITSET_SIGNAL_BROKER, VFS_CURSOR_SETTLE_CANCEL,
+    VFS_CURSOR_SETTLE_COMMIT, VFS_EXECUTABLE_SNAPSHOT_ABI_VERSION, VFS_EXECUTABLE_SNAPSHOT_OP_OPEN,
     VFS_IPC_ABI_VERSION, VFS_IPC_OP_ACCESS, VFS_IPC_OP_CHDIR, VFS_IPC_OP_CHECKPOINT_ACK,
     VFS_IPC_OP_CLOSE, VFS_IPC_OP_CURSOR_SETTLE, VFS_IPC_OP_DUP, VFS_IPC_OP_FCNTL, VFS_IPC_OP_FSTAT,
     VFS_IPC_OP_FTRUNCATE, VFS_IPC_OP_GETCWD, VFS_IPC_OP_GETDENTS64, VFS_IPC_OP_LSEEK,
@@ -51,12 +55,12 @@ use rustos_user_abi::syscall::{
 use storage_fat::{FatDirEntry, FatNodeKind, FatVolume};
 use vfsd::{
     cacheable_metadata_errno, checked_next_generation, checked_seek_position, checkpoint_path_key,
-    mkdir_policy, persistent_mutation_status, unlink_policy, valid_checkpoint_record,
-    OpenDescriptionCheckpointWire, SeekPositionError, WaitSetInterestKey, WaitSetInterestRecord,
-    WaitSetRegistry, WaitSetRegistryError, VFSD_CHECKPOINT_HANDLE_TAG,
-    VFSD_OPEN_CHECKPOINT_VERSION, VFSD_OPEN_MUTATION_FCNTL, VFSD_OPEN_MUTATION_GETDENTS,
-    VFSD_OPEN_MUTATION_LSEEK, VFSD_OPEN_MUTATION_OPEN, VFSD_OPEN_MUTATION_READ,
-    VFSD_OPEN_MUTATION_STABLE, VFSD_OPEN_MUTATION_STAGING,
+    mkdir_policy, persistent_mutation_status, should_materialize_file_cache, unlink_policy,
+    valid_checkpoint_record, OpenDescriptionCheckpointWire, SeekPositionError, WaitSetInterestKey,
+    WaitSetInterestRecord, WaitSetRegistry, WaitSetRegistryError, FILE_BYTES_CACHE_BUDGET_BYTES,
+    VFSD_CHECKPOINT_HANDLE_TAG, VFSD_OPEN_CHECKPOINT_VERSION, VFSD_OPEN_MUTATION_FCNTL,
+    VFSD_OPEN_MUTATION_GETDENTS, VFSD_OPEN_MUTATION_LSEEK, VFSD_OPEN_MUTATION_OPEN,
+    VFSD_OPEN_MUTATION_READ, VFSD_OPEN_MUTATION_STABLE, VFSD_OPEN_MUTATION_STAGING,
 };
 
 mod block;
@@ -77,16 +81,12 @@ use util::{
     write_payload_bytes, write_vfs_payload_bytes,
 };
 
-/// Read-only DVM files are materialized once so repeated pread/mmap windows do
-/// not reopen FAT and rescan the cluster chain. Both limits are service-owned
-/// policy; exceeding either limit falls back to bounded range reads.
-const FILE_BYTES_CACHE_MAX_ENTRY_BYTES: usize = 16 * 1024 * 1024;
-const FILE_BYTES_CACHE_BUDGET_BYTES: usize = 32 * 1024 * 1024;
-
 // Linux errno constants (x86_64)
 pub(crate) const ENOENT: i32 = 2;
 pub(crate) const EIO: i32 = 5;
+pub(crate) const ENOEXEC: i32 = 8;
 pub(crate) const EAGAIN: i32 = 11;
+pub(crate) const ENOMEM: i32 = 12;
 pub(crate) const EBUSY: i32 = 16;
 pub(crate) const EACCES: i32 = 13;
 pub(crate) const EBADF: i32 = 9;
@@ -97,6 +97,7 @@ pub(crate) const EISDIR: i32 = 21;
 pub(crate) const EINVAL: i32 = 22;
 pub(crate) const ENOSPC: i32 = 28;
 pub(crate) const EROFS: i32 = 30;
+pub(crate) const ENOSYS: i32 = 38;
 pub(crate) const EOVERFLOW: i32 = 75;
 pub(crate) const EOPNOTSUPP: i32 = 95;
 
@@ -111,8 +112,11 @@ const fn max_usize(a: usize, b: usize) -> usize {
 const VFS_RECV_BYTES: usize = max_usize(
     size_of::<VfsIpcRequest>(),
     max_usize(
-        size_of::<CommercialMaxProtocolRequest>(),
-        size_of::<LinuxSyscallOffloadRequest>(),
+        size_of::<VfsExecutableSnapshotRequest>(),
+        max_usize(
+            size_of::<CommercialMaxProtocolRequest>(),
+            size_of::<LinuxSyscallOffloadRequest>(),
+        ),
     ),
 );
 
@@ -134,6 +138,22 @@ static mut VFS_RESPONSE_SLOT: VfsIpcResponse = VfsIpcResponse {
     aux: 0,
     payload: [0; VFS_IPC_PAYLOAD_CAPACITY],
 };
+
+const EXECUTABLE_SNAPSHOT_MAX_BYTES: u64 = 128 * 1024 * 1024;
+const EXECUTABLE_SNAPSHOT_CACHE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+const EXECUTABLE_SNAPSHOT_WRITE_CHUNK_BYTES: usize = 256 * 1024;
+
+#[derive(Clone, Copy)]
+struct ExecutableSnapshot {
+    fd: i32,
+    file_bytes: u64,
+}
+
+struct ExecutableSnapshotOpen {
+    fd: i32,
+    file_bytes: u64,
+    close_after_reply: bool,
+}
 
 fn linux_response_for_op(op: u16) -> LinuxSyscallOffloadResponse {
     let mut response = MaybeUninit::<LinuxSyscallOffloadResponse>::uninit();
@@ -238,7 +258,10 @@ fn serve(endpoint: u64, mut state: VfsState) {
         let request = unsafe {
             core::slice::from_raw_parts(request.as_ptr() as *const u8, received as usize)
         };
-        let reply = if received as usize == size_of::<VfsIpcRequest>() {
+        let reply = if received as usize == size_of::<VfsExecutableSnapshotRequest>() {
+            let request = unsafe { &*request.as_ptr().cast::<VfsExecutableSnapshotRequest>() };
+            reply_executable_snapshot(&mut state, reply_cap, sender_pid, sender_tid, request)
+        } else if received as usize == size_of::<VfsIpcRequest>() {
             let request = unsafe { &*request.as_ptr().cast::<VfsIpcRequest>() };
             let response = reset_vfs_response_slot(request.op);
             if request.pid != sender_pid || request.tid != sender_tid {
@@ -310,6 +333,73 @@ fn serve(endpoint: u64, mut state: VfsState) {
     }
 }
 
+fn reply_executable_snapshot(
+    state: &mut VfsState,
+    reply_cap: u64,
+    sender_pid: u64,
+    sender_tid: u64,
+    request: &VfsExecutableSnapshotRequest,
+) -> i64 {
+    let mut response = VfsExecutableSnapshotResponse {
+        version: VFS_EXECUTABLE_SNAPSHOT_ABI_VERSION,
+        op: VFS_EXECUTABLE_SNAPSHOT_OP_OPEN,
+        ..VfsExecutableSnapshotResponse::default()
+    };
+    if request.requester_pid != sender_pid
+        || request.requester_tid != sender_tid
+        || rustos_svc_runtime::ipc::validate_service_owner(IPC_SERVICE_LOADERD, sender_pid) < 0
+    {
+        ipc::debug_line("vfsd: executable snapshot rejected stage=identity");
+        response.status = EACCES;
+        return unsafe {
+            ipc::reply(
+                reply_cap,
+                (&response as *const VfsExecutableSnapshotResponse).cast::<u8>(),
+                size_of::<VfsExecutableSnapshotResponse>(),
+            )
+        };
+    }
+
+    let snapshot = match state.open_executable_snapshot(request) {
+        Ok(snapshot) => snapshot,
+        Err(errno) => {
+            ipc::debug_line(
+                format!("vfsd: executable snapshot rejected stage=open errno={errno}").as_str(),
+            );
+            response.status = errno;
+            return unsafe {
+                ipc::reply(
+                    reply_cap,
+                    (&response as *const VfsExecutableSnapshotResponse).cast::<u8>(),
+                    size_of::<VfsExecutableSnapshotResponse>(),
+                )
+            };
+        }
+    };
+    response.file_bytes = snapshot.file_bytes;
+    response.mount_generation = state.mount_generation;
+    let send_fd = snapshot.fd as u64;
+    let args = IpcReplyWithHandlesArgs {
+        reply_cap,
+        response_ptr: (&response as *const VfsExecutableSnapshotResponse) as u64,
+        response_len: size_of::<VfsExecutableSnapshotResponse>() as u64,
+        send_fds_ptr: (&send_fd as *const u64) as u64,
+        send_fd_count: 1,
+        reserved0: 0,
+        reserved1: 0,
+    };
+    let reply = unsafe {
+        rustos_svc_runtime::syscall::syscall1(
+            SYS_RUSTOS_IPC_REPLY_WITH_HANDLES,
+            (&args as *const IpcReplyWithHandlesArgs) as u64,
+        )
+    };
+    if snapshot.close_after_reply {
+        close_fd(snapshot.fd);
+    }
+    reply
+}
+
 struct VfsState {
     volume: Option<FatVolume<BootBlockDevice>>,
     cwd: BTreeMap<u64, String>,
@@ -328,6 +418,12 @@ struct VfsState {
     /// remount invalidates this cache before the replacement volume is used.
     file_bytes_cache: BTreeMap<String, Vec<u8>>,
     file_bytes_cache_bytes: usize,
+    /// Terminally sealed executable images owned by the current mount
+    /// generation. Handle transfer duplicates the descriptor into loaderd;
+    /// keeping one vfsd reference lets common interpreters/DLLs be reused
+    /// without re-reading the storage DVM on every process launch.
+    executable_snapshot_cache: BTreeMap<String, ExecutableSnapshot>,
+    executable_snapshot_cache_bytes: usize,
     epolls: WaitSetRegistry,
     checkpoint_revisions: BTreeMap<CheckpointRevisionKey, u64>,
     checkpoint_operations: BTreeMap<CheckpointRevisionKey, (u64, u64)>,
@@ -365,1753 +461,77 @@ pub(crate) struct Metadata {
     pub(crate) inode: u64,
 }
 
-impl VfsState {
-    fn new() -> Self {
-        Self {
-            volume: None,
-            cwd: BTreeMap::new(),
-            handles: BTreeMap::new(),
-            metadata_cache: BTreeMap::new(),
-            dir_entries_cache: BTreeMap::new(),
-            file_bytes_cache: BTreeMap::new(),
-            file_bytes_cache_bytes: 0,
-            epolls: WaitSetRegistry::default(),
-            checkpoint_revisions: BTreeMap::new(),
-            checkpoint_operations: BTreeMap::new(),
-            checkpoint_records: BTreeMap::new(),
-            readiness_generation: 1,
-            next_handle: 1,
-            mount_generation: 1,
-            cache_generation: 1,
-        }
+include!("state_checkpoint.rs");
+include!("state_requests.rs");
+include!("state_files.rs");
+include!("state_storage.rs");
+
+fn create_terminally_sealed_snapshot(_path: &str, bytes: &[u8]) -> Result<i32, i32> {
+    let name = CString::new("vfsd-executable-snapshot").map_err(|_| EINVAL)?;
+    let fd = unsafe {
+        rustos_svc_runtime::syscall::syscall2(
+            linux_abi::SYS_MEMFD_CREATE,
+            name.as_ptr() as u64,
+            u64::from(linux_abi::MFD_CLOEXEC | linux_abi::MFD_ALLOW_SEALING),
+        )
+    } as i32;
+    if fd < 0 {
+        return Err(-fd);
     }
 
-    fn restore_waitset_checkpoint(&mut self) -> Result<(), i32> {
-        let mut cursor = 0_u64;
-        let mut records = Vec::new();
-        loop {
-            let response = call_rootd_checkpoint(
-                COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_SCAN,
-                cursor,
-                None,
-            )?;
-            let wire_size = size_of::<ServiceCheckpointRecordWire>();
-            let record_count = response.payload_len as usize / wire_size;
-            if response.payload_len as usize % wire_size != 0
-                || response.value1 as usize != record_count
-                || cursor
-                    .checked_add(record_count as u64)
-                    .is_none_or(|next| response.value0 != next)
-            {
-                return Err(EIO);
-            }
-            for offset in (0..response.payload_len as usize).step_by(wire_size) {
-                let record = unsafe {
-                    core::ptr::read_unaligned(
-                        response.payload[offset..]
-                            .as_ptr()
-                            .cast::<ServiceCheckpointRecordWire>(),
-                    )
-                };
-                let key = checkpoint_revision_key(&record);
-                if !valid_checkpoint_record(&record)
-                    || self
-                        .checkpoint_revisions
-                        .insert(key, record.revision)
-                        .is_some()
-                    || self
-                        .checkpoint_operations
-                        .insert(key, (record.operation_hi, record.operation_lo))
-                        .is_some()
-                    || self.checkpoint_records.insert(key, record).is_some()
-                {
-                    return Err(EIO);
-                }
-                records.push(record);
-            }
-            if response.value1 == 0 {
-                break;
-            }
-            if response.value0 == cursor {
-                return Err(EIO);
-            }
-            cursor = response.value0;
-        }
-
-        for record in records.iter().filter(|record| {
-            record.parent_hi == 0
-                && record.parent_lo == 0
-                && record.key_lo == CHECKPOINT_EPOLL_TAG
-                && record.flags & SERVICE_CHECKPOINT_FLAG_TOMBSTONE == 0
-        }) {
-            if record.value_len != 8 {
-                return Err(EIO);
-            }
-            let refs = u64::from_le_bytes(record.value[..8].try_into().map_err(|_| EIO)?);
-            self.epolls.restore(record.key_hi, refs).map_err(|_| EIO)?;
-        }
-        for record in records.iter().filter(|record| {
-            record.parent_lo == CHECKPOINT_EPOLL_TAG
-                && record.flags & SERVICE_CHECKPOINT_FLAG_TOMBSTONE == 0
-        }) {
-            if record.value_len as usize != size_of::<WaitSetInterestWire>() {
-                return Err(EIO);
-            }
-            let wire = unsafe {
-                core::ptr::read_unaligned(record.value.as_ptr().cast::<WaitSetInterestWire>())
-            };
-            let interest = waitset_interest_from_wire(&wire).ok_or(EIO)?;
-            let (key_hi, key_lo) = checkpoint_interest_key(&interest);
-            if record.key_hi != key_hi || record.key_lo != key_lo {
-                return Err(EIO);
-            }
-            self.epolls
-                .add(record.parent_hi, interest)
-                .map_err(|_| EIO)?;
-        }
-        self.restore_open_descriptions(&records)?;
-        Ok(())
-    }
-
-    fn restore_open_descriptions(
-        &mut self,
-        records: &[ServiceCheckpointRecordWire],
-    ) -> Result<(), i32> {
-        for record in records.iter().filter(|record| {
-            record.parent_hi == 0
-                && record.parent_lo == 0
-                && record.key_lo == VFSD_CHECKPOINT_HANDLE_TAG
-                && record.flags & SERVICE_CHECKPOINT_FLAG_TOMBSTONE == 0
-        }) {
-            if record.value_len as usize != size_of::<OpenDescriptionCheckpointWire>() {
-                return Err(EIO);
-            }
-            let wire = unsafe {
-                core::ptr::read_unaligned(
-                    record
-                        .value
-                        .as_ptr()
-                        .cast::<OpenDescriptionCheckpointWire>(),
-                )
-            };
-            if !wire.valid(VFS_IPC_PATH_CAPACITY) {
-                return Err(EIO);
-            }
-            // A staging parent is a recoverable interrupted OPEN. It remains
-            // unavailable until an exact request completes every path chunk
-            // and advances the parent to OPEN.
-            if wire.last_mutation == VFSD_OPEN_MUTATION_STAGING {
-                continue;
-            }
-            let path_len = wire.path_len as usize;
-            let chunk_count = path_len.div_ceil(SERVICE_CHECKPOINT_VALUE_CAPACITY);
-            let mut path_bytes = Vec::with_capacity(path_len);
-            for chunk_index in 0..chunk_count {
-                let (key_hi, key_lo) =
-                    checkpoint_path_key(record.key_hi, chunk_index).ok_or(EIO)?;
-                let child = records
-                    .iter()
-                    .find(|candidate| {
-                        candidate.parent_hi == record.key_hi
-                            && candidate.parent_lo == VFSD_CHECKPOINT_HANDLE_TAG
-                            && candidate.key_hi == key_hi
-                            && candidate.key_lo == key_lo
-                            && candidate.flags & SERVICE_CHECKPOINT_FLAG_TOMBSTONE == 0
-                    })
-                    .ok_or(EIO)?;
-                let expected = (path_len - path_bytes.len()).min(SERVICE_CHECKPOINT_VALUE_CAPACITY);
-                if child.value_len as usize != expected {
-                    return Err(EIO);
-                }
-                path_bytes.extend_from_slice(&child.value[..expected]);
-            }
-            let live_children = records
-                .iter()
-                .filter(|candidate| {
-                    candidate.parent_hi == record.key_hi
-                        && candidate.parent_lo == VFSD_CHECKPOINT_HANDLE_TAG
-                        && candidate.flags & SERVICE_CHECKPOINT_FLAG_TOMBSTONE == 0
-                })
-                .count();
-            if live_children != chunk_count || path_bytes.len() != path_len {
-                return Err(EIO);
-            }
-            let path = str::from_utf8(&path_bytes).map_err(|_| EIO)?.to_string();
-            if !path.starts_with('/') || path_inode(path.as_bytes()) != wire.content_identity {
-                return Err(EIO);
-            }
-            let kind = remote_kind_from_u16(wire.kind).ok_or(EIO)?;
-            if self
-                .handles
-                .insert(
-                    record.key_hi,
-                    RemoteHandle {
-                        kind,
-                        path,
-                        cursor: wire.cursor,
-                        len: wire.len,
-                        refs: u64::from(wire.refs),
-                        status_flags: wire.status_flags,
-                        last_mutation: wire.last_mutation,
-                        last_start: wire.last_start,
-                        last_result: wire.last_result,
-                    },
-                )
-                .is_some()
-            {
-                return Err(EIO);
-            }
-        }
-        Ok(())
-    }
-
-    fn compact_checkpoint_proof(&mut self, proof: ServiceCheckpointRecordWire) -> Result<(), i32> {
-        call_rootd_checkpoint(
-            COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_COMPACT,
-            0,
-            Some(&proof),
-        )?;
-        self.forget_compacted_record(proof);
-        Ok(())
-    }
-
-    fn forget_compacted_record(&mut self, proof: ServiceCheckpointRecordWire) {
-        let parent_key = checkpoint_revision_key(&proof);
-        self.checkpoint_revisions.retain(|key, _| {
-            !(*key == parent_key || (key.0, key.1) == (proof.key_hi, proof.key_lo))
-        });
-        self.checkpoint_operations.retain(|key, _| {
-            !(*key == parent_key || (key.0, key.1) == (proof.key_hi, proof.key_lo))
-        });
-        self.checkpoint_records.retain(|key, _| {
-            !(*key == parent_key || (key.0, key.1) == (proof.key_hi, proof.key_lo))
-        });
-    }
-
-    fn checkpoint_mutate(
-        &mut self,
-        request: &VfsIpcRequest,
-        record: ServiceCheckpointRecordWire,
-    ) -> Result<bool, i32> {
-        self.checkpoint_mutate_with_operation(record, request.operation_hi, request.operation_lo)
-    }
-
-    fn checkpoint_mutate_with_operation(
-        &mut self,
-        mut record: ServiceCheckpointRecordWire,
-        operation_hi: u64,
-        operation_lo: u64,
-    ) -> Result<bool, i32> {
-        let key = checkpoint_revision_key(&record);
-        if let Some(current) = self.checkpoint_records.get(&key).copied() {
-            if (current.operation_hi, current.operation_lo) == (operation_hi, operation_lo) {
-                record.revision = current.revision;
-                record.operation_hi = operation_hi;
-                record.operation_lo = operation_lo;
-                return if record == current {
-                    Ok(true)
-                } else {
-                    Err(EIO)
-                };
-            }
-        }
-        let current = self.checkpoint_revisions.get(&key).copied().unwrap_or(0);
-        record.revision = current.checked_add(1).ok_or(EOVERFLOW)?;
-        record.operation_hi = operation_hi;
-        record.operation_lo = operation_lo;
-        let response = call_rootd_checkpoint(
-            COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE,
-            0,
-            Some(&record),
-        )?;
-        if response.payload_len != 0 || response.value0 != record.revision || response.value1 > 1 {
-            return Err(EIO);
-        }
-        self.checkpoint_revisions.insert(key, record.revision);
-        self.checkpoint_operations
-            .insert(key, (record.operation_hi, record.operation_lo));
-        self.checkpoint_records.insert(key, record);
-        Ok(response.value1 == 1)
-    }
-
-    fn checkpoint_operation_replayed(
-        &self,
-        request: &VfsIpcRequest,
-        key: CheckpointRevisionKey,
-    ) -> bool {
-        self.checkpoint_operations.get(&key).copied()
-            == Some((request.operation_hi, request.operation_lo))
-    }
-
-    fn checkpoint_open_description(
-        &mut self,
-        request: &VfsIpcRequest,
-        remote_id: u64,
-        handle: &RemoteHandle,
-    ) -> Result<(), i32> {
-        let path_bytes = handle.path.as_bytes();
-        if path_bytes.is_empty() || path_bytes.len() > VFS_IPC_PATH_CAPACITY {
-            return Err(EINVAL);
-        }
-        let chunk_count = path_bytes.len().div_ceil(SERVICE_CHECKPOINT_VALUE_CAPACITY);
-        let staging = checkpoint_handle_record(
-            remote_id,
-            handle,
-            VFSD_OPEN_MUTATION_STAGING,
-            request.arg0,
-            0,
-        )?;
-        let (operation_hi, operation_lo) = checkpoint_suboperation(request, 0);
-        self.checkpoint_mutate_with_operation(staging, operation_hi, operation_lo)?;
-        for chunk_index in 0..chunk_count {
-            let start = chunk_index * SERVICE_CHECKPOINT_VALUE_CAPACITY;
-            let end = (start + SERVICE_CHECKPOINT_VALUE_CAPACITY).min(path_bytes.len());
-            let record = checkpoint_path_record(remote_id, chunk_index, &path_bytes[start..end])?;
-            let (operation_hi, operation_lo) =
-                checkpoint_suboperation(request, chunk_index as u64 + 1);
-            self.checkpoint_mutate_with_operation(record, operation_hi, operation_lo)?;
-        }
-        let final_record =
-            checkpoint_handle_record(remote_id, handle, VFSD_OPEN_MUTATION_OPEN, request.arg0, 0)?;
-        let (operation_hi, operation_lo) = checkpoint_suboperation(request, chunk_count as u64 + 1);
-        self.checkpoint_mutate_with_operation(final_record, operation_hi, operation_lo)?;
-        Ok(())
-    }
-
-    fn checkpoint_handle_state(
-        &mut self,
-        request: &VfsIpcRequest,
-        remote_id: u64,
-        handle: &RemoteHandle,
-        mutation: u16,
-        last_start: u64,
-        last_result: u64,
-    ) -> Result<bool, i32> {
-        let record =
-            checkpoint_handle_record(remote_id, handle, mutation, last_start, last_result)?;
-        self.checkpoint_mutate(request, record)
-    }
-
-    fn checkpoint_close_description(
-        &mut self,
-        request: &VfsIpcRequest,
-        remote_id: u64,
-    ) -> Result<ServiceCheckpointRecordWire, i32> {
-        let tombstone = checkpoint_handle_tombstone(remote_id)?;
-        self.checkpoint_mutate(request, tombstone)?;
-        let key = checkpoint_revision_key(&tombstone);
-        self.checkpoint_records.get(&key).copied().ok_or(EIO)
-    }
-
-    fn invalidate_caches_if_remounted(&mut self) {
-        if self.cache_generation != self.mount_generation {
-            self.metadata_cache.clear();
-            self.dir_entries_cache.clear();
-            self.file_bytes_cache.clear();
-            self.file_bytes_cache_bytes = 0;
-            self.cache_generation = self.mount_generation;
-        }
-    }
-
-    fn advance_mount_generation(&mut self) -> Result<(), i32> {
-        self.mount_generation = checked_next_generation(self.mount_generation).ok_or(EOVERFLOW)?;
-        Ok(())
-    }
-
-    fn handle_linux_request(
-        &mut self,
-        request: &LinuxSyscallOffloadRequest,
-    ) -> LinuxSyscallOffloadResponse {
-        let mut response = linux_response_for_op(request.op);
-        if let Err(errno) = validate_linux_request(request) {
-            response.status = errno;
-            return response;
-        }
-        match request.op {
-            SYSCALL_OFFLOAD_OP_LINUX_STATX => self.linux_statx(request, &mut response),
-            SYSCALL_OFFLOAD_OP_LINUX_NEWFSTATAT => self.linux_newfstatat(request, &mut response),
-            SYSCALL_OFFLOAD_OP_LINUX_READLINKAT => self.linux_readlinkat(&mut response),
-            SYSCALL_OFFLOAD_OP_LINUX_ACCESS => self.linux_access(request, &mut response),
-            SYSCALL_OFFLOAD_OP_LINUX_GETCWD => self.linux_getcwd(request, &mut response),
-            SYSCALL_OFFLOAD_OP_LINUX_CHDIR => self.linux_chdir(request, &mut response),
-            SYSCALL_OFFLOAD_OP_LINUX_MKDIR => self.linux_mkdir(request, &mut response),
-            // Stateful fd operations require the versioned VFS IPC request's
-            // operation identity. The retired generic offload envelope has no
-            // such field and cannot provide crash-safe open descriptions.
-            SYSCALL_OFFLOAD_OP_LINUX_OPENAT
-            | SYSCALL_OFFLOAD_OP_LINUX_GETDENTS64
-            | SYSCALL_OFFLOAD_OP_LINUX_CLOSE
-            | SYSCALL_OFFLOAD_OP_LINUX_DUP
-            | SYSCALL_OFFLOAD_OP_LINUX_FCNTL => response.status = EOPNOTSUPP,
-            SYSCALL_OFFLOAD_OP_LINUX_MOUNT => self.linux_mount(&mut response),
-            SYSCALL_OFFLOAD_OP_LINUX_UMOUNT2 => self.linux_umount2(&mut response),
-            SYSCALL_OFFLOAD_OP_LINUX_UNLINKAT => self.linux_unlinkat(request, &mut response),
-            _ => response.status = EINVAL,
-        }
-        response
-    }
-
-    fn handle_commercial_request(
-        &mut self,
-        request: &CommercialMaxProtocolRequest,
-    ) -> CommercialMaxProtocolResponse {
-        let mut response = CommercialMaxProtocolResponse {
-            header: request.header,
-            ..CommercialMaxProtocolResponse::default()
-        };
-        response.header.version = COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
-        if let Err(errno) = validate_commercial_request(request) {
-            response.status = errno;
-            return response;
-        }
-        match request.header.op {
-            COMMERCIAL_MAX_VFSD_OP_MOUNT_GRAPH => {
-                response.value0 = self.mount_generation;
-                response.value1 = u64::from(self.volume.is_some());
-                response.descriptor_count = 1;
-                response.descriptors[0] =
-                    vfs_descriptor("mount-graph", request.header.op, self.mount_generation, 0);
-            }
-            COMMERCIAL_MAX_VFSD_OP_PATH_RESOLVE => {
-                let path = commercial_request_path(request);
-                if let Some(path) = path {
-                    match self.metadata(path) {
-                        Ok(metadata) => {
-                            response.value0 = metadata.inode;
-                            response.value1 = metadata.len;
-                            response.capability = vfs_capability("path-resolve", request.header.op);
-                            response.descriptor_count = 1;
-                            response.descriptors[0] = vfs_descriptor(
-                                "path-resolve",
-                                request.header.op,
-                                metadata.inode,
-                                metadata.len,
-                            );
-                        }
-                        Err(errno) => response.status = errno,
-                    }
-                } else {
-                    response.status = EINVAL;
-                }
-            }
-            COMMERCIAL_MAX_VFSD_OP_FD_TABLE_PLAN => {
-                response.value0 = self.handles.len() as u64;
-                response.value1 = self.next_handle;
-                response.descriptor_count = 1;
-                response.descriptors[0] =
-                    vfs_descriptor("fd-table", request.header.op, self.handles.len() as u64, 0);
-            }
-            COMMERCIAL_MAX_VFSD_OP_DIRECTORY_CURSOR => {
-                fill_handle_descriptors(self, &mut response, RemoteKind::Directory);
-            }
-            COMMERCIAL_MAX_VFSD_OP_FILE_CURSOR => {
-                fill_handle_descriptors(self, &mut response, RemoteKind::File);
-            }
-            COMMERCIAL_MAX_VFSD_OP_METADATA_POLICY => {
-                response.value0 = self.metadata_cache.len() as u64;
-                response.value1 = self.dir_entries_cache.len() as u64;
-                response.capability = vfs_capability("metadata-policy", request.header.op);
-                response.descriptor_count = 1;
-                response.descriptors[0] = vfs_descriptor(
-                    "metadata-policy",
-                    request.header.op,
-                    self.metadata_cache.len() as u64,
-                    self.dir_entries_cache.len() as u64,
-                );
-            }
-            _ => response.status = EINVAL,
-        }
-        response
-    }
-
-    fn handle_vfs_request(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
-        if let Err(errno) = validate_vfs_request(request) {
-            response.status = errno;
-            return;
-        }
-        match request.op {
-            VFS_IPC_OP_OPENAT => self.vfs_openat(request, response),
-            VFS_IPC_OP_CLOSE => self.vfs_close(request, response),
-            VFS_IPC_OP_DUP => response.status = EOPNOTSUPP,
-            VFS_IPC_OP_READ => self.vfs_read(request, response, None),
-            VFS_IPC_OP_PREAD64 => self.vfs_read(request, response, Some(request.arg0)),
-            VFS_IPC_OP_WRITE => {
-                response.status = persistent_mutation_status(request.op).unwrap_or(EINVAL)
-            }
-            VFS_IPC_OP_LSEEK => self.vfs_lseek(request, response),
-            VFS_IPC_OP_FSTAT => self.vfs_fstat(request, response),
-            VFS_IPC_OP_FTRUNCATE => {
-                response.status = persistent_mutation_status(request.op).unwrap_or(EINVAL)
-            }
-            VFS_IPC_OP_GETDENTS64 => self.vfs_getdents64(request, response),
-            VFS_IPC_OP_FCNTL => self.vfs_fcntl(request, response),
-            VFS_IPC_OP_CURSOR_SETTLE => self.vfs_cursor_settle(request, response),
-            VFS_IPC_OP_CHECKPOINT_ACK => self.vfs_checkpoint_ack(request, response),
-            VFS_IPC_OP_STATX => self.vfs_path_statx(request, response),
-            VFS_IPC_OP_NEWFSTATAT => self.vfs_path_stat(request, response),
-            VFS_IPC_OP_READLINKAT => response.status = ENOENT,
-            VFS_IPC_OP_ACCESS => self.vfs_access(request, response),
-            VFS_IPC_OP_GETCWD => self.vfs_getcwd(request, response),
-            VFS_IPC_OP_CHDIR => self.vfs_chdir(request, response),
-            VFS_IPC_OP_MKDIR => self.vfs_mkdir(request, response),
-            VFS_IPC_OP_MOUNT => self.linux_mount_vfs(response),
-            VFS_IPC_OP_UMOUNT2 => self.linux_umount_vfs(response),
-            VFS_IPC_OP_UNLINKAT => self.vfs_unlinkat(request, response),
-            VFS_IPC_OP_POLL_QUERY => self.vfs_poll_query(request, response),
-            _ => response.status = EINVAL,
-        }
-    }
-
-    fn vfs_poll_query(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
-        let mut mutated = false;
-        match request.arg0 {
-            VFS_POLL_QUERY_POLL => self.vfs_poll_once(request, response),
-            VFS_POLL_QUERY_EPOLL_CREATE => {
-                let key = checkpoint_epoll_key(request.remote_id);
-                if self.checkpoint_operation_replayed(request, key) {
-                    return;
-                }
-                let mut candidate = self.epolls.clone();
-                if let Err(err) = candidate.create(request.remote_id) {
-                    response.status = waitset_registry_status(err);
-                    return;
-                }
-                let record = checkpoint_epoll_record(request.remote_id, 1, false);
-                if let Err(errno) = self.checkpoint_mutate(request, record) {
-                    response.status = errno;
-                    return;
-                }
-                self.epolls = candidate;
-                mutated = true;
-            }
-            VFS_POLL_QUERY_EPOLL_CTL => {
-                self.vfs_epoll_ctl(request, response);
-                mutated = response.status == 0;
-            }
-            VFS_POLL_QUERY_EPOLL_SNAPSHOT => self.vfs_epoll_snapshot(request, response),
-            VFS_POLL_QUERY_EPOLL_REF | VFS_POLL_QUERY_EPOLL_UNREF => {
-                let key = checkpoint_epoll_key(request.remote_id);
-                if self.checkpoint_operation_replayed(request, key) {
-                    return;
-                }
-                let refs = match self.epolls.refs(request.remote_id) {
-                    Ok(refs) => refs,
-                    Err(err) => {
-                        response.status = waitset_registry_status(err);
-                        return;
-                    }
-                };
-                let mut candidate = self.epolls.clone();
-                let (next_refs, tombstone) = if request.arg0 == VFS_POLL_QUERY_EPOLL_REF {
-                    if let Err(err) = candidate.acquire(request.remote_id) {
-                        response.status = waitset_registry_status(err);
-                        return;
-                    }
-                    (refs.checked_add(1).unwrap_or(0), false)
-                } else {
-                    if let Err(err) = candidate.release(request.remote_id) {
-                        response.status = waitset_registry_status(err);
-                        return;
-                    }
-                    (refs.saturating_sub(1), refs == 1)
-                };
-                if next_refs == 0 && !tombstone {
-                    response.status = EOVERFLOW;
-                    return;
-                }
-                let record = checkpoint_epoll_record(request.remote_id, next_refs, tombstone);
-                if let Err(errno) = self.checkpoint_mutate(request, record) {
-                    response.status = errno;
-                    return;
-                }
-                self.epolls = candidate;
-                mutated = true;
-            }
-            VFS_POLL_QUERY_EPOLL_PURGE_OBJECT => {
-                let Ok(provider) = u16::try_from(request.arg1) else {
-                    response.status = EINVAL;
-                    return;
-                };
-                if provider == 0 || request.arg2 == 0 {
-                    response.status = EINVAL;
-                    return;
-                }
-                let interests = self.epolls.matching_interests(provider, request.arg2);
-                let mut candidate = self.epolls.clone();
-                mutated = candidate.purge(provider, request.arg2);
-                for (token, interest) in interests {
-                    let record = checkpoint_interest_record(token, interest, true);
-                    let key = checkpoint_revision_key(&record);
-                    if !self.checkpoint_operation_replayed(request, key) {
-                        if let Err(errno) = self.checkpoint_mutate(request, record) {
-                            response.status = errno;
-                            return;
-                        }
-                    }
-                }
-                self.epolls = candidate;
-            }
-            _ => response.status = EINVAL,
-        }
-        if mutated {
-            self.advance_readiness_generation();
-        }
-    }
-
-    fn vfs_poll_once(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
-        const POLLFD_SIZE: usize = size_of::<linux_abi::LinuxPollFd>();
-        let len = request.payload_len as usize;
-        if !len.is_multiple_of(POLLFD_SIZE) || len > response.payload.len() {
-            response.status = EINVAL;
-            return;
-        }
-        let mut ready = 0_u64;
-        for offset in (0..len).step_by(POLLFD_SIZE) {
-            let fd = i32::from_le_bytes(request.payload[offset..offset + 4].try_into().unwrap());
-            let events =
-                i16::from_le_bytes(request.payload[offset + 4..offset + 6].try_into().unwrap());
-            let revents = if fd < 0 {
-                0
-            } else {
-                let ready_bits = poll_ready_bits(events as u32) as i16;
-                if ready_bits != 0 {
-                    ready += 1;
-                }
-                ready_bits
-            };
-            response.payload[offset..offset + 6]
-                .copy_from_slice(&request.payload[offset..offset + 6]);
-            response.payload[offset + 6..offset + 8].copy_from_slice(&revents.to_le_bytes());
-        }
-        response.value = ready;
-        response.payload_len = len as u32;
-    }
-
-    fn vfs_epoll_ctl(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
-        let Some(interest) = epoll_interest_from_request(request) else {
-            response.status = EINVAL;
-            return;
-        };
-        let tombstone = request.arg1 == linux_abi::EPOLL_CTL_DEL;
-        let checkpoint = checkpoint_interest_record(request.remote_id, interest, tombstone);
-        let checkpoint_key = checkpoint_revision_key(&checkpoint);
-        if self.checkpoint_operation_replayed(request, checkpoint_key) {
-            return;
-        }
-        let mut candidate = self.epolls.clone();
-        let result = match request.arg1 {
-            linux_abi::EPOLL_CTL_ADD => candidate.add(request.remote_id, interest),
-            linux_abi::EPOLL_CTL_MOD => candidate.modify(request.remote_id, interest),
-            linux_abi::EPOLL_CTL_DEL => candidate.delete(request.remote_id, interest.key),
-            _ => {
-                response.status = EINVAL;
-                return;
-            }
-        };
-        if let Err(err) = result {
-            response.status = waitset_registry_status(err);
-            return;
-        }
-        if let Err(errno) = self.checkpoint_mutate(request, checkpoint) {
-            response.status = errno;
-            return;
-        }
-        self.epolls = candidate;
-    }
-
-    fn vfs_epoll_snapshot(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
-        let maxevents = request.arg1 as usize;
-        let wire_size = size_of::<WaitSetInterestWire>();
-        let capacity = response.payload.len() / wire_size;
-        if maxevents == 0 || maxevents > WAITSET_MAX_INTERESTS || maxevents > capacity {
-            response.status = EINVAL;
-            return;
-        }
-        let interests = match self.epolls.snapshot(request.remote_id, maxevents) {
-            Ok(interests) => interests,
-            Err(err) => {
-                response.status = waitset_registry_status(err);
-                return;
-            }
-        };
-        for (written, interest) in interests.iter().enumerate() {
-            let wire = WaitSetInterestWire {
-                abi_version: WAITSET_ABI_VERSION,
-                provider: interest.key.provider,
-                flags: 0,
-                target_fd: interest.key.target_fd,
-                object_id: interest.key.object_id,
-                provider_epoch: interest.provider_epoch,
-                events: interest.events,
-                reserved0: 0,
-                data: interest.data,
-            };
-            let bytes = unsafe {
-                core::slice::from_raw_parts(
-                    (&wire as *const WaitSetInterestWire).cast::<u8>(),
-                    wire_size,
-                )
-            };
-            let offset = written * wire_size;
-            response.payload[offset..offset + wire_size].copy_from_slice(bytes);
-        }
-        response.value = interests.len() as u64;
-        response.aux = self.readiness_generation;
-        response.payload_len = (interests.len() * wire_size) as u32;
-    }
-
-    fn advance_readiness_generation(&mut self) {
-        self.readiness_generation = self
-            .readiness_generation
-            .checked_add(1)
-            .expect("vfsd readiness generation exhausted");
-        #[cfg(not(test))]
-        {
-            let args = WaitSetSignalBrokerArgs {
-                abi_version: WAITSET_ABI_VERSION,
-                provider: WAITSET_PROVIDER_VFSD,
-                flags: 0,
-                object_id: WAITSET_GLOBAL_OBJECT_ID,
-                generation: self.readiness_generation,
-                reserved0: 0,
-            };
+    let result = (|| {
+        let mut written = 0_usize;
+        while written < bytes.len() {
+            let end = written
+                .saturating_add(EXECUTABLE_SNAPSHOT_WRITE_CHUNK_BYTES)
+                .min(bytes.len());
             let status = unsafe {
-                rustos_svc_runtime::syscall::syscall1(
-                    SYS_RUSTOS_WAITSET_SIGNAL_BROKER,
-                    (&args as *const WaitSetSignalBrokerArgs) as u64,
+                rustos_svc_runtime::syscall::syscall3(
+                    linux_abi::SYS_WRITE,
+                    fd as u64,
+                    bytes[written..end].as_ptr() as u64,
+                    (end - written) as u64,
                 )
             };
             if status < 0 {
-                panic!("vfsd readiness generation publication failed");
+                return Err((-status) as i32);
             }
-        }
-    }
-
-    fn linux_statx(
-        &mut self,
-        request: &LinuxSyscallOffloadRequest,
-        response: &mut LinuxSyscallOffloadResponse,
-    ) {
-        let Some(path) = linux_request_path(request) else {
-            response.status = EINVAL;
-            return;
-        };
-        match self.metadata(path) {
-            Ok(metadata) => {
-                let statx = build_linux_statx(metadata);
-                response.payload_len = LINUX_STATX_SIZE as u32;
-                response.payload[..LINUX_STATX_SIZE].copy_from_slice(&statx);
-            }
-            Err(errno) => response.status = errno,
-        }
-    }
-
-    fn linux_newfstatat(
-        &mut self,
-        request: &LinuxSyscallOffloadRequest,
-        response: &mut LinuxSyscallOffloadResponse,
-    ) {
-        let Some(path) = linux_request_path(request) else {
-            response.status = EINVAL;
-            return;
-        };
-        match self.metadata(path) {
-            Ok(metadata) => {
-                let stat = build_linux_stat(metadata);
-                response.payload_len = LINUX_STAT_SIZE as u32;
-                response.payload[..LINUX_STAT_SIZE].copy_from_slice(&stat);
-            }
-            Err(errno) => response.status = errno,
-        }
-    }
-
-    fn linux_readlinkat(&mut self, response: &mut LinuxSyscallOffloadResponse) {
-        response.status = ENOENT;
-    }
-
-    fn linux_access(
-        &mut self,
-        request: &LinuxSyscallOffloadRequest,
-        response: &mut LinuxSyscallOffloadResponse,
-    ) {
-        let Some(path) = linux_request_path(request) else {
-            response.status = EINVAL;
-            return;
-        };
-        response.status = match self.metadata(path) {
-            Ok(_) => 0,
-            Err(errno) => errno,
-        };
-    }
-
-    fn linux_getcwd(
-        &mut self,
-        request: &LinuxSyscallOffloadRequest,
-        response: &mut LinuxSyscallOffloadResponse,
-    ) {
-        let cwd = self.cwd_for_pid(request.pid);
-        write_payload_bytes(response, cwd.as_bytes());
-    }
-
-    fn linux_chdir(
-        &mut self,
-        request: &LinuxSyscallOffloadRequest,
-        response: &mut LinuxSyscallOffloadResponse,
-    ) {
-        let Some(path) = linux_request_path(request) else {
-            response.status = EINVAL;
-            return;
-        };
-        response.status = self.chdir(request.pid, path);
-    }
-
-    fn linux_mkdir(
-        &mut self,
-        request: &LinuxSyscallOffloadRequest,
-        response: &mut LinuxSyscallOffloadResponse,
-    ) {
-        let Some(path) = linux_request_path(request) else {
-            response.status = EINVAL;
-            return;
-        };
-        response.status = mkdir_policy(path, request.euid);
-    }
-
-    fn linux_mount(&mut self, response: &mut LinuxSyscallOffloadResponse) {
-        response.status = match self.advance_mount_generation() {
-            Ok(()) => 0,
-            Err(errno) => errno,
-        };
-    }
-
-    fn linux_umount2(&mut self, response: &mut LinuxSyscallOffloadResponse) {
-        response.status = match self.advance_mount_generation() {
-            Ok(()) => 0,
-            Err(errno) => errno,
-        };
-    }
-
-    fn linux_unlinkat(
-        &mut self,
-        request: &LinuxSyscallOffloadRequest,
-        response: &mut LinuxSyscallOffloadResponse,
-    ) {
-        let Some(path) = linux_request_path(request) else {
-            response.status = EINVAL;
-            return;
-        };
-        response.status = unlink_policy(path);
-    }
-
-    fn vfs_openat(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
-        let Some(path) = vfs_request_path(request) else {
-            response.status = EINVAL;
-            return;
-        };
-        let resolved_path;
-        let path = if path.starts_with('/') {
-            path
-        } else {
-            resolved_path = match self.resolve_path(request, request.pid, request.dirfd, path) {
-                Ok(path) => path,
-                Err(errno) => {
-                    response.status = errno;
-                    return;
-                }
-            };
-            resolved_path.as_str()
-        };
-        match self.open_remote_checkpointed(request, path, request.arg0) {
-            Ok((id, handle)) => {
-                response.remote_id = id;
-                response.handle_kind = handle_kind_u16(handle.kind);
-                response.value = handle.len;
-                response.aux = device_access_for_path(handle.path.as_str());
-                write_vfs_payload_bytes(response, handle.path.as_bytes());
-            }
-            Err(errno) => response.status = errno,
-        }
-    }
-
-    fn vfs_close(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
-        let key = checkpoint_handle_key(request.remote_id);
-        let Some(handle) = self.handles.get(&request.remote_id).cloned() else {
-            let Some(record) = self.checkpoint_records.get(&key).copied() else {
-                response.status = EBADF;
-                return;
-            };
-            if record.flags & SERVICE_CHECKPOINT_FLAG_TOMBSTONE != 0 {
-                if (record.operation_hi, record.operation_lo)
-                    != (request.operation_hi, request.operation_lo)
-                {
-                    response.status = EBADF;
-                }
-                return;
-            }
-            if let Err(errno) = self.checkpoint_close_description(request, request.remote_id) {
-                response.status = errno;
-            }
-            return;
-        };
-        if cursor_mutation_prepared(&handle) {
-            response.status = EBUSY;
-            return;
-        }
-        match self.checkpoint_close_description(request, request.remote_id) {
-            Ok(_) => {
-                self.handles.remove(&request.remote_id);
-            }
-            Err(errno) => response.status = errno,
-        }
-    }
-
-    fn vfs_read(
-        &mut self,
-        request: &VfsIpcRequest,
-        response: &mut VfsIpcResponse,
-        offset: Option<u64>,
-    ) {
-        let len = (request.arg1 as usize).min(VFS_IPC_PAYLOAD_CAPACITY);
-        match self.read_remote_into(request, offset, len, &mut response.payload) {
-            Ok(read) => {
-                response.payload_len = read as u32;
-                response.value = read as u64;
-            }
-            Err(errno) => response.status = errno,
-        }
-    }
-
-    fn vfs_lseek(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
-        let Some(handle) = self.handles.get(&request.remote_id).cloned() else {
-            response.status = EBADF;
-            return;
-        };
-        if self.checkpoint_operation_replayed(request, checkpoint_handle_key(request.remote_id)) {
-            if handle.last_mutation != VFSD_OPEN_MUTATION_LSEEK
-                || handle.last_start != request.arg0
-                || handle.last_result != request.arg1
-            {
-                response.status = EIO;
-                return;
-            }
-            response.value = handle.cursor;
-            return;
-        }
-        if cursor_mutation_prepared(&handle) {
-            response.status = EBUSY;
-            return;
-        }
-        let next = match checked_seek_position(
-            handle.cursor,
-            handle.len,
-            request.arg0 as i64,
-            request.arg1,
-        ) {
-            Ok(next) => next,
-            Err(SeekPositionError::InvalidWhence | SeekPositionError::Negative) => {
-                response.status = EINVAL;
-                return;
-            }
-            Err(SeekPositionError::Overflow) => {
-                response.status = EOVERFLOW;
-                return;
-            }
-        };
-        let mut candidate = handle;
-        candidate.cursor = next;
-        candidate.last_mutation = VFSD_OPEN_MUTATION_LSEEK;
-        candidate.last_start = request.arg0;
-        candidate.last_result = request.arg1;
-        if let Err(errno) = self.checkpoint_handle_state(
-            request,
-            request.remote_id,
-            &candidate,
-            VFSD_OPEN_MUTATION_LSEEK,
-            request.arg0,
-            request.arg1,
-        ) {
-            response.status = errno;
-            return;
-        }
-        response.value = candidate.cursor;
-        self.handles.insert(request.remote_id, candidate);
-    }
-
-    fn vfs_fstat(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
-        let Some(handle) = self.handles.get(&request.remote_id) else {
-            response.status = EBADF;
-            return;
-        };
-        let stat = build_linux_stat(Metadata {
-            kind: handle.kind,
-            len: handle.len,
-            inode: path_inode(handle.path.as_bytes()),
-        });
-        response.payload_len = LINUX_STAT_SIZE as u32;
-        response.payload[..LINUX_STAT_SIZE].copy_from_slice(&stat);
-    }
-
-    fn vfs_getdents64(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
-        let Some(handle) = self.handles.get(&request.remote_id).cloned() else {
-            response.status = EBADF;
-            return;
-        };
-        let requested = (request.arg1 as usize).min(response.payload.len());
-        let replayed =
-            self.checkpoint_operation_replayed(request, checkpoint_handle_key(request.remote_id));
-        if cursor_mutation_prepared(&handle) && !replayed {
-            response.status = EBUSY;
-            return;
-        }
-        let start = if replayed {
-            let (recorded_requested, _) = unpack_u32_pair(handle.last_result);
-            if handle.last_mutation != VFSD_OPEN_MUTATION_GETDENTS
-                || recorded_requested as usize != requested
-            {
-                response.status = EIO;
-                return;
-            }
-            handle.last_start
-        } else {
-            handle.cursor
-        };
-        let start_index = match usize::try_from(start) {
-            Ok(start) => start,
-            Err(_) => {
-                response.status = EOVERFLOW;
-                return;
-            }
-        };
-        let (written, consumed) = match self.render_getdents_payload(
-            request.remote_id,
-            start_index,
-            requested,
-            &mut response.payload,
-        ) {
-            Ok(result) => result,
-            Err(errno) => {
-                response.status = errno;
-                return;
-            }
-        };
-        if replayed {
-            let (_, recorded_consumed) = unpack_u32_pair(handle.last_result);
-            if consumed != recorded_consumed as usize {
-                response.status = EIO;
-                return;
-            }
-        } else {
-            let mut candidate = handle;
-            candidate.cursor = match candidate.cursor.checked_add(consumed as u64) {
-                Some(cursor) => cursor,
-                None => {
-                    response.status = EOVERFLOW;
-                    return;
-                }
-            };
-            candidate.last_mutation = VFSD_OPEN_MUTATION_GETDENTS;
-            candidate.last_start = start;
-            candidate.last_result = match pack_u32_pair(requested, consumed) {
-                Ok(result) => result,
-                Err(errno) => {
-                    response.status = errno;
-                    return;
-                }
-            };
-            if let Err(errno) = self.checkpoint_handle_state(
-                request,
-                request.remote_id,
-                &candidate,
-                VFSD_OPEN_MUTATION_GETDENTS,
-                start,
-                candidate.last_result,
-            ) {
-                response.status = errno;
-                return;
-            }
-            self.handles.insert(request.remote_id, candidate);
-        }
-        response.payload_len = written as u32;
-        response.value = written as u64;
-    }
-
-    fn vfs_fcntl(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
-        const F_SETFL_MUTABLE_MASK: u64 = linux_abi::O_APPEND | linux_abi::O_NONBLOCK;
-        let Some(handle) = self.handles.get(&request.remote_id).cloned() else {
-            response.status = EBADF;
-            return;
-        };
-        if cursor_mutation_prepared(&handle)
-            && !self
-                .checkpoint_operation_replayed(request, checkpoint_handle_key(request.remote_id))
-        {
-            response.status = EBUSY;
-            return;
-        }
-        match request.arg0 {
-            linux_abi::F_GETFL => response.value = handle.status_flags,
-            linux_abi::F_SETFL => {
-                if self.checkpoint_operation_replayed(
-                    request,
-                    checkpoint_handle_key(request.remote_id),
-                ) {
-                    if handle.last_mutation != VFSD_OPEN_MUTATION_FCNTL
-                        || handle.last_start != request.arg0
-                        || handle.last_result != request.arg1
-                    {
-                        response.status = EIO;
-                        return;
-                    }
-                    response.value = handle.status_flags;
-                    return;
-                }
-                let mut candidate = handle;
-                candidate.status_flags = (candidate.status_flags & !F_SETFL_MUTABLE_MASK)
-                    | (request.arg1 & F_SETFL_MUTABLE_MASK);
-                candidate.last_mutation = VFSD_OPEN_MUTATION_FCNTL;
-                candidate.last_start = request.arg0;
-                candidate.last_result = request.arg1;
-                if let Err(errno) = self.checkpoint_handle_state(
-                    request,
-                    request.remote_id,
-                    &candidate,
-                    VFSD_OPEN_MUTATION_FCNTL,
-                    request.arg0,
-                    request.arg1,
-                ) {
-                    response.status = errno;
-                    return;
-                }
-                response.value = candidate.status_flags;
-                self.handles.insert(request.remote_id, candidate);
-            }
-            _ => response.status = EINVAL,
-        }
-    }
-
-    fn vfs_cursor_settle(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
-        let Some(handle) = self.handles.get(&request.remote_id).cloned() else {
-            response.status = EBADF;
-            return;
-        };
-        if self.checkpoint_operation_replayed(request, checkpoint_handle_key(request.remote_id)) {
-            if handle.last_mutation != VFSD_OPEN_MUTATION_STABLE {
-                response.status = EIO;
-            } else {
-                response.value = handle.cursor;
-            }
-            return;
-        }
-        if !cursor_mutation_prepared(&handle)
-            || self
-                .checkpoint_operations
-                .get(&checkpoint_handle_key(request.remote_id))
-                .copied()
-                != Some((request.arg0, request.arg1))
-            || !matches!(
-                request.arg2,
-                VFS_CURSOR_SETTLE_COMMIT | VFS_CURSOR_SETTLE_CANCEL
-            )
-            || request.arg3 != 0
-            || request.path_len != 0
-            || request.payload_len != 0
-        {
-            response.status = EINVAL;
-            return;
-        }
-        let mut candidate = handle;
-        if request.arg2 == VFS_CURSOR_SETTLE_CANCEL {
-            candidate.cursor = candidate.last_start;
-        }
-        candidate.last_mutation = VFSD_OPEN_MUTATION_STABLE;
-        candidate.last_start = 0;
-        candidate.last_result = 0;
-        if let Err(errno) = self.checkpoint_handle_state(
-            request,
-            request.remote_id,
-            &candidate,
-            VFSD_OPEN_MUTATION_STABLE,
-            0,
-            0,
-        ) {
-            response.status = errno;
-            return;
-        }
-        response.value = candidate.cursor;
-        self.handles.insert(request.remote_id, candidate);
-    }
-
-    fn vfs_checkpoint_ack(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
-        let Ok(original_op) = u16::try_from(request.arg2) else {
-            response.status = EINVAL;
-            return;
-        };
-        if (request.arg0 == 0 && request.arg1 == 0)
-            || request.fd != 0
-            || request.path_len != 0
-            || request.payload_len != 0
-            || !matches!(original_op, VFS_IPC_OP_CLOSE | VFS_IPC_OP_POLL_QUERY)
-            || (original_op == VFS_IPC_OP_CLOSE && request.arg3 != 0)
-            || (original_op == VFS_IPC_OP_POLL_QUERY
-                && !matches!(
-                    request.arg3,
-                    VFS_POLL_QUERY_EPOLL_UNREF
-                        | VFS_POLL_QUERY_EPOLL_CTL
-                        | VFS_POLL_QUERY_EPOLL_PURGE_OBJECT
-                ))
-        {
-            response.status = EINVAL;
-            return;
-        }
-        let proofs = self
-            .checkpoint_records
-            .values()
-            .copied()
-            .filter(|record| {
-                record.flags & SERVICE_CHECKPOINT_FLAG_TOMBSTONE != 0
-                    && (record.operation_hi, record.operation_lo) == (request.arg0, request.arg1)
-                    && (original_op != VFS_IPC_OP_CLOSE
-                        || (record.parent_hi == 0
-                            && record.parent_lo == 0
-                            && record.key_hi == request.remote_id
-                            && record.key_lo == VFSD_CHECKPOINT_HANDLE_TAG))
-            })
-            .collect::<Vec<_>>();
-        for proof in proofs {
-            if let Err(errno) = self.compact_checkpoint_proof(proof) {
-                response.status = errno;
-                return;
-            }
-        }
-    }
-
-    fn vfs_path_statx(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
-        let Some(path) = vfs_request_path(request) else {
-            response.status = EINVAL;
-            return;
-        };
-        let path = match self.resolve_path(request, request.pid, request.dirfd, path) {
-            Ok(path) => path,
-            Err(errno) => {
-                response.status = errno;
-                return;
-            }
-        };
-        match self.metadata(path.as_str()) {
-            Ok(metadata) => {
-                let statx = build_linux_statx(metadata);
-                response.payload_len = LINUX_STATX_SIZE as u32;
-                response.payload[..LINUX_STATX_SIZE].copy_from_slice(&statx);
-            }
-            Err(errno) => response.status = errno,
-        }
-    }
-
-    fn vfs_path_stat(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
-        let Some(path) = vfs_request_path(request) else {
-            response.status = EINVAL;
-            return;
-        };
-        let path = match self.resolve_path(request, request.pid, request.dirfd, path) {
-            Ok(path) => path,
-            Err(errno) => {
-                response.status = errno;
-                return;
-            }
-        };
-        match self.metadata(path.as_str()) {
-            Ok(metadata) => {
-                let stat = build_linux_stat(metadata);
-                response.payload_len = LINUX_STAT_SIZE as u32;
-                response.payload[..LINUX_STAT_SIZE].copy_from_slice(&stat);
-            }
-            Err(errno) => response.status = errno,
-        }
-    }
-
-    fn vfs_access(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
-        let Some(path) = vfs_request_path(request) else {
-            response.status = EINVAL;
-            return;
-        };
-        response.status = match self.resolve_path(request, request.pid, request.dirfd, path) {
-            Ok(path) => self.metadata(path.as_str()).err().unwrap_or(0),
-            Err(errno) => errno,
-        };
-    }
-
-    fn vfs_getcwd(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
-        let cwd = self.cwd_for_pid(request.pid);
-        write_vfs_payload_bytes(response, cwd.as_bytes());
-    }
-
-    fn vfs_chdir(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
-        let Some(path) = vfs_request_path(request) else {
-            response.status = EINVAL;
-            return;
-        };
-        let path = match self.resolve_path(request, request.pid, request.dirfd, path) {
-            Ok(path) => path,
-            Err(errno) => {
-                response.status = errno;
-                return;
-            }
-        };
-        response.status = self.chdir(request.pid, path.as_str());
-    }
-
-    fn vfs_mkdir(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
-        let Some(path) = vfs_request_path(request) else {
-            response.status = EINVAL;
-            return;
-        };
-        let path = match self.resolve_path(request, request.pid, request.dirfd, path) {
-            Ok(path) => path,
-            Err(errno) => {
-                response.status = errno;
-                return;
-            }
-        };
-        response.status = mkdir_policy(path.as_str(), request.euid);
-    }
-
-    fn linux_mount_vfs(&mut self, response: &mut VfsIpcResponse) {
-        response.status = match self.advance_mount_generation() {
-            Ok(()) => 0,
-            Err(errno) => errno,
-        };
-    }
-
-    fn linux_umount_vfs(&mut self, response: &mut VfsIpcResponse) {
-        response.status = match self.advance_mount_generation() {
-            Ok(()) => 0,
-            Err(errno) => errno,
-        };
-    }
-
-    fn vfs_unlinkat(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
-        let Some(path) = vfs_request_path(request) else {
-            response.status = EINVAL;
-            return;
-        };
-        let path = match self.resolve_path(request, request.pid, request.dirfd, path) {
-            Ok(path) => path,
-            Err(errno) => {
-                response.status = errno;
-                return;
-            }
-        };
-        response.status = unlink_policy(path.as_str());
-    }
-
-    fn cwd_for_pid(&mut self, pid: u64) -> String {
-        self.cwd
-            .entry(pid)
-            .or_insert_with(|| String::from("/"))
-            .clone()
-    }
-
-    fn chdir(&mut self, pid: u64, path: &str) -> i32 {
-        match self.metadata(path) {
-            Ok(metadata) if metadata.kind == RemoteKind::Directory => {
-                self.cwd.insert(pid, path.to_string());
-                0
-            }
-            Ok(_) => ENOTDIR,
-            Err(errno) => errno,
-        }
-    }
-
-    fn resolve_path(
-        &mut self,
-        request: &VfsIpcRequest,
-        pid: u64,
-        dirfd: u64,
-        path: &str,
-    ) -> Result<String, i32> {
-        if path.is_empty() || path.len() > VFS_IPC_PATH_CAPACITY {
-            return Err(EINVAL);
-        }
-        let base = if path.starts_with('/') {
-            "/".to_string()
-        } else if is_at_fdcwd(dirfd) {
-            if let Some(cwd) = self.cwd.get(&pid) {
-                cwd.clone()
-            } else {
-                let mut clean_relative = !path.starts_with('/');
-                for component in path.split('/') {
-                    if component.is_empty() || component == "." || component == ".." {
-                        clean_relative = false;
-                        break;
-                    }
-                }
-                if clean_relative {
-                    let mut resolved = String::with_capacity(path.len() + 1);
-                    unsafe {
-                        let bytes = resolved.as_mut_vec();
-                        bytes.push(b'/');
-                        for byte in path.as_bytes() {
-                            bytes.push(*byte);
-                        }
-                    }
-                    return Ok(resolved);
-                }
-                return normalize_absolute_path("/", path);
-            }
-        } else {
-            let base_handle_id = if request.remote_id != 0 {
-                request.remote_id
-            } else {
-                dirfd
-            };
-            let handle = self.handles.get(&base_handle_id).ok_or(EBADF)?;
-            if handle.kind != RemoteKind::Directory {
-                return Err(ENOTDIR);
-            }
-            handle.path.clone()
-        };
-        normalize_absolute_path(base.as_str(), path)
-    }
-
-    fn open_remote_checkpointed(
-        &mut self,
-        request: &VfsIpcRequest,
-        path: &str,
-        flags: u64,
-    ) -> Result<(u64, RemoteHandle), i32> {
-        let id = request.arg3;
-        if id == 0 {
-            return Err(EINVAL);
-        }
-        if let Some(handle) = self.handles.get(&id).cloned() {
-            let chunk_count = handle
-                .path
-                .len()
-                .div_ceil(SERVICE_CHECKPOINT_VALUE_CAPACITY);
-            let (operation_hi, operation_lo) =
-                checkpoint_suboperation(request, chunk_count as u64 + 1);
-            let key = checkpoint_handle_key(id);
-            let Some(current) = self.checkpoint_records.get(&key).copied() else {
+            let count = usize::try_from(status).map_err(|_| EOVERFLOW)?;
+            if count == 0 || count > end - written {
                 return Err(EIO);
-            };
-            let mut expected =
-                checkpoint_handle_record(id, &handle, VFSD_OPEN_MUTATION_OPEN, flags, 0)?;
-            expected.revision = current.revision;
-            expected.operation_hi = operation_hi;
-            expected.operation_lo = operation_lo;
-            return if current == expected && handle.path == path {
-                Ok((id, handle))
-            } else {
-                Err(EINVAL)
-            };
+            }
+            written = written.checked_add(count).ok_or(EOVERFLOW)?;
         }
 
-        let metadata = self.metadata(path).map_err(|errno| {
-            debug_line(&format!(
-                "vfsd: open failed stage=metadata errno={errno} path={path}"
-            ));
-            errno
-        })?;
-        if flags & O_DIRECTORY != 0 && metadata.kind != RemoteKind::Directory {
-            return Err(ENOTDIR);
-        }
-        if flags & (O_CREAT | O_TRUNC) != 0 {
-            return Err(EROFS);
-        }
-        let handle = RemoteHandle {
-            kind: metadata.kind,
-            path: path.to_string(),
-            cursor: 0,
-            len: metadata.len,
-            refs: 1,
-            status_flags: flags & !linux_abi::O_CLOEXEC,
-            last_mutation: VFSD_OPEN_MUTATION_OPEN,
-            last_start: flags,
-            last_result: 0,
-        };
-        self.checkpoint_open_description(request, id, &handle)
-            .map_err(|errno| {
-                debug_line(&format!(
-                    "vfsd: open failed stage=checkpoint errno={errno} path={path}"
-                ));
-                errno
-            })?;
-        if self.handles.insert(id, handle.clone()).is_some() {
-            debug_line(&format!(
-                "vfsd: open failed stage=install errno={EIO} path={path}"
-            ));
-            return Err(EIO);
-        }
-        Ok((id, handle))
-    }
-
-    fn read_remote_into(
-        &mut self,
-        request: &VfsIpcRequest,
-        offset: Option<u64>,
-        len: usize,
-        dest: &mut [u8],
-    ) -> Result<usize, i32> {
-        let id = request.remote_id;
-        let (path, start, file_len) = {
-            let handle = self.handles.get(&id).ok_or(EBADF)?;
-            if handle.kind == RemoteKind::Device && is_input_device_node(handle.path.as_str()) {
-                return Err(EAGAIN);
-            }
-            if handle.kind != RemoteKind::File {
-                return Err(EISDIR);
-            }
-            (
-                handle.path.clone(),
-                offset.unwrap_or(handle.cursor),
-                handle.len,
+        let seals = linux_abi::F_SEAL_WRITE
+            | linux_abi::F_SEAL_GROW
+            | linux_abi::F_SEAL_SHRINK
+            | linux_abi::F_SEAL_SEAL;
+        let status = unsafe {
+            rustos_svc_runtime::syscall::syscall3(
+                linux_abi::SYS_FCNTL,
+                fd as u64,
+                linux_abi::F_ADD_SEALS as u64,
+                seals as u64,
             )
         };
-        if offset.is_none()
-            && self.checkpoint_operation_replayed(request, checkpoint_handle_key(id))
-        {
-            let handle = self.handles.get(&id).ok_or(EBADF)?;
-            if handle.last_mutation != VFSD_OPEN_MUTATION_READ {
-                return Err(EIO);
-            }
-            let (requested, replay_len) = unpack_u32_pair(handle.last_result);
-            if requested as usize != len
-                || replay_len as usize > len
-                || handle.last_start > file_len
-            {
-                return Err(EIO);
-            }
-            if replay_len == 0 {
-                return Ok(0);
-            }
-            let replay_len = replay_len as usize;
-            let read = self.read_file_slice_into(
-                path.as_str(),
-                handle.last_start,
-                &mut dest[..replay_len],
-            )?;
-            return (read == replay_len).then_some(read).ok_or(EIO);
+        if status < 0 {
+            return Err((-status) as i32);
         }
-        if offset.is_none() && self.handles.get(&id).is_some_and(cursor_mutation_prepared) {
-            return Err(EBUSY);
-        }
-        let available = file_len.saturating_sub(start);
-        let len = len.min(available as usize).min(dest.len());
-        let read = if len == 0 {
-            0
-        } else {
-            self.read_file_slice_into(path.as_str(), start, &mut dest[..len])?
-        };
-        if offset.is_none() {
-            let mut candidate = self.handles.get(&id).cloned().ok_or(EBADF)?;
-            candidate.cursor = candidate.cursor.checked_add(read as u64).ok_or(EOVERFLOW)?;
-            candidate.last_mutation = VFSD_OPEN_MUTATION_READ;
-            candidate.last_start = start;
-            candidate.last_result = pack_u32_pair(len, read)?;
-            self.checkpoint_handle_state(
-                request,
-                id,
-                &candidate,
-                VFSD_OPEN_MUTATION_READ,
-                start,
-                candidate.last_result,
-            )?;
-            self.handles.insert(id, candidate);
-        }
-        Ok(read)
+        Ok(())
+    })();
+    if let Err(errno) = result {
+        close_fd(fd);
+        return Err(errno);
     }
+    Ok(fd)
+}
 
-    fn read_file_slice_into(
-        &mut self,
-        path: &str,
-        start: u64,
-        dest: &mut [u8],
-    ) -> Result<usize, i32> {
-        match early_system::read(path, start, dest)? {
-            Some(read) => Ok(read),
-            None => {
-                self.invalidate_caches_if_remounted();
-                if let Some(bytes) = self.file_bytes_cache.get(path) {
-                    return Ok(copy_file_cache_range(bytes, start, dest));
-                }
-
-                let file_len = self.metadata(path)?.len;
-                let cacheable_len = usize::try_from(file_len).ok().filter(|len| {
-                    *len <= FILE_BYTES_CACHE_MAX_ENTRY_BYTES
-                        && *len <= FILE_BYTES_CACHE_BUDGET_BYTES
-                });
-                if let Some(expected_len) = cacheable_len {
-                    let bytes = self
-                        .volume()?
-                        .read_file_to_vec(path)
-                        .map_err(map_fat_error)?;
-                    if bytes.len() != expected_len {
-                        return Err(EIO);
-                    }
-                    let read = copy_file_cache_range(&bytes, start, dest);
-                    if self
-                        .file_bytes_cache_bytes
-                        .checked_add(bytes.len())
-                        .is_none_or(|total| total > FILE_BYTES_CACHE_BUDGET_BYTES)
-                    {
-                        self.file_bytes_cache.clear();
-                        self.file_bytes_cache_bytes = 0;
-                    }
-                    self.file_bytes_cache_bytes += bytes.len();
-                    self.file_bytes_cache.insert(path.to_string(), bytes);
-                    return Ok(read);
-                }
-
-                self.volume()?
-                    .read_file_range_into(path, start, dest)
-                    .map_err(map_fat_error)
-            }
+fn close_fd(fd: i32) {
+    if fd >= 0 {
+        unsafe {
+            let _ = rustos_svc_runtime::syscall::syscall1(linux_abi::SYS_CLOSE, fd as u64);
         }
-    }
-
-    fn render_getdents_payload(
-        &mut self,
-        id: u64,
-        cursor: usize,
-        user_len: usize,
-        payload: &mut [u8],
-    ) -> Result<(usize, usize), i32> {
-        if user_len < 24 {
-            return Err(EINVAL);
-        }
-        let path = {
-            let Some(handle) = self.handles.get(&id) else {
-                return Err(EBADF);
-            };
-            if handle.kind != RemoteKind::Directory {
-                return Err(ENOTDIR);
-            }
-            handle.path.clone()
-        };
-        let entries = match self.dir_entries(path.as_str()) {
-            Ok(entries) => entries,
-            Err(errno) => return Err(errno),
-        };
-        let mut written = 0usize;
-        let mut consumed = 0usize;
-        for (index, entry) in entries.iter().enumerate().skip(cursor) {
-            let record = encode_dirent(entry, index + 1);
-            if written + record.len() > user_len.min(payload.len()) {
-                if written == 0 {
-                    return Err(EINVAL);
-                }
-                break;
-            }
-            payload[written..written + record.len()].copy_from_slice(record.as_slice());
-            written += record.len();
-            consumed += 1;
-        }
-        Ok((written, consumed))
-    }
-
-    fn metadata(&mut self, path: &str) -> Result<Metadata, i32> {
-        if path == "/" || path == "/proc" || path == "/run" {
-            return Ok(Metadata {
-                kind: RemoteKind::Directory,
-                len: 0,
-                inode: path_inode(path.as_bytes()),
-            });
-        }
-        if path == "/dev" || path.starts_with("/dev/") {
-            match devmgrd_lookup(path) {
-                Ok(kind) => {
-                    return Ok(Metadata {
-                        kind,
-                        len: 0,
-                        inode: path_inode(path.as_bytes()),
-                    });
-                }
-                Err(errno) => return Err(errno),
-            }
-        }
-        self.invalidate_caches_if_remounted();
-        if let Some(entry) = self.metadata_cache.get(path) {
-            return *entry;
-        }
-        if let Some(len) = early_system::file_len(path)? {
-            let metadata = Metadata {
-                kind: RemoteKind::File,
-                len,
-                inode: path_inode(path.as_bytes()),
-            };
-            self.metadata_cache.insert(path.to_string(), Ok(metadata));
-            return Ok(metadata);
-        }
-        let result = match self.volume()?.metadata(path) {
-            Ok(meta) => Ok(Metadata {
-                kind: match meta.kind {
-                    FatNodeKind::File => RemoteKind::File,
-                    FatNodeKind::Directory => RemoteKind::Directory,
-                },
-                len: meta.len,
-                inode: path_inode(path.as_bytes()),
-            }),
-            Err(err) => Err(map_fat_error(err)),
-        };
-        if result.is_ok()
-            || result
-                .as_ref()
-                .is_err_and(|errno| cacheable_metadata_errno(*errno))
-        {
-            self.metadata_cache.insert(path.to_string(), result);
-        }
-        result
-    }
-
-    fn dir_entries(&mut self, path: &str) -> Result<Vec<DirEntry>, i32> {
-        let mut entries = Vec::new();
-        if path == "/" {
-            entries.push(DirEntry::new("dev", RemoteKind::Directory));
-            entries.push(DirEntry::new("proc", RemoteKind::Directory));
-            entries.push(DirEntry::new("run", RemoteKind::Directory));
-        }
-        if path == "/dev" || path == "/dev/input" || path == "/dev/dri" {
-            match devmgrd_dir_entries(path) {
-                Ok(entries) => return Ok(entries),
-                Err(errno) => return Err(errno),
-            }
-        }
-        if path == "/proc" || path == "/run" {
-            return Ok(entries);
-        }
-        self.invalidate_caches_if_remounted();
-        if let Some(cached) = self.dir_entries_cache.get(path) {
-            entries.extend_from_slice(cached);
-            return Ok(entries);
-        }
-        let fat_entries = self.volume()?.read_dir(path).map_err(map_fat_error)?;
-        let resolved: Vec<DirEntry> = fat_entries.into_iter().map(DirEntry::from_fat).collect();
-        self.dir_entries_cache
-            .insert(path.to_string(), resolved.clone());
-        entries.extend(resolved);
-        Ok(entries)
-    }
-
-    fn volume(&mut self) -> Result<&FatVolume<BootBlockDevice>, i32> {
-        if self.volume.is_none() {
-            let device = BootBlockDevice::open().map_err(|errno| {
-                debug_line(&format!(
-                    "vfsd: volume unavailable stage=block-info errno={errno}"
-                ));
-                errno
-            })?;
-            self.volume = Some(
-                FatVolume::new(device)
-                    .map_err(map_fat_error)
-                    .map_err(|errno| {
-                        debug_line(&format!(
-                            "vfsd: volume unavailable stage=fat-admission errno={errno}"
-                        ));
-                        errno
-                    })?,
-            );
-        }
-        Ok(self.volume.as_ref().expect("volume initialized"))
     }
 }
 

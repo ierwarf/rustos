@@ -46,7 +46,7 @@ cargo xtask kvm-smoke --expect 'runtimed: bootstrap ui done'
 ```
 
 `build-dvm` produces a pinned Buildroot Linux driver-domain appliance and
-`verify-dvm` checks its self-contained schema-8 artifact bundle, including the
+`verify-dvm` checks its self-contained schema-9 artifact bundle, including the
 co-located source lock and host-control contract. Stage a production bundle to
 a fresh trusted path with `make -C driver-domains/linux stage-release
 DEST=/trusted/new/path`; this does not rebuild the DVM.
@@ -108,7 +108,7 @@ cargo xtask kvm-smoke --expect 'runtimed: bootstrap ui done'
 
 `build-dvm`은 고정된 Buildroot Linux driver-domain appliance를 만들고,
 `verify-dvm`은 같은 디렉터리에 함께 있는 source lock과 host-control contract를
-포함한 자기완결 schema-8 artifact bundle을 검증합니다. 운영 bundle은
+포함한 자기완결 schema-9 artifact bundle을 검증합니다. 운영 bundle은
 `make -C driver-domains/linux stage-release DEST=/trusted/new/path`로 새 신뢰
 경로에 배치하며, 이 명령은 DVM을 다시 빌드하지 않습니다.
 `kvm-smoke`는 `build/kvm/`에 private disk를 만들고 Linux DVM과 RustOS를 병렬로

@@ -23,6 +23,9 @@ pub(crate) const MAX_UNTRUSTED_TASK_WEIGHT_MICROS: u64 = 1_000;
 pub(crate) const UI_SERVER_TASK_WEIGHT_MICROS: u64 = TASK_WEIGHT_INTERACTIVE_FLAG | 2_000;
 pub(crate) const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(2);
 pub(crate) const RETRY_BACKOFF: Duration = Duration::from_millis(100);
+// A DVM-volume `EAGAIN` is an explicit readiness transition, not a failed
+// launch. Keep retry traffic below the UI-core and storage-ready paths.
+pub(crate) const STORAGE_NOT_READY_RETRY_BACKOFF: Duration = Duration::from_millis(250);
 const UI_BOOTSTRAP_RETRY_BACKOFF: Duration = Duration::from_millis(500);
 pub(crate) const SERVICE_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const MAX_RUNTIME_CLIENTS_PER_TICK: usize = 8;

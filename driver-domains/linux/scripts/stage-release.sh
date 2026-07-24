@@ -46,7 +46,7 @@ done
 
 files=(
     rustos-linux-dvm-x86_64.bzImage
-    rustos-linux-dvm-x86_64.rootfs.cpio.xz
+    rustos-linux-dvm-x86_64.rootfs.cpio.zst
     rustos-linux-dvm-x86_64.config
     rustos-linux-dvm-x86_64.kernel.config
     rustos-linux-dvm-x86_64.module-signing.x509

@@ -487,11 +487,12 @@ pub fn syscall_linux_vfs_umount2(target_ptr: u64, flags: u64) -> u64 {
 }
 
 pub fn syscall_linux_ioctl(fd: u64, request_number: u64, arg: u64) -> u64 {
-    let ui_policy_owner = ipc_ops::current_process_has_service_capability(
-        rustos_user_abi::syscall::IPC_SERVICE_CAP_UI_POLICY,
-    );
-    let route = if ioctl_is_direct_display_present(request_number)
-        || (ui_policy_owner && ioctl_is_display_policy_request(request_number))
+    let route = if ioctl_is_direct_display_present(request_number) {
+        rustos_user_abi::syscall::DEVMGRD_IOCTL_ROUTE_DIRECT
+    } else if ioctl_is_display_policy_request(request_number)
+        && ipc_ops::current_process_has_service_capability(
+            rustos_user_abi::syscall::IPC_SERVICE_CAP_UI_POLICY,
+        )
     {
         rustos_user_abi::syscall::DEVMGRD_IOCTL_ROUTE_DIRECT
     } else {

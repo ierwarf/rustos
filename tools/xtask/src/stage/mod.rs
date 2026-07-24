@@ -28,6 +28,7 @@ const APPLICATIONS_DIR: &str = "usr/share/applications";
 const EARLY_SYSTEM_IMAGE_PATH: &str = "system/boot/early-system.img";
 const EARLY_SYSTEM_IMAGE_SIGNATURE_PATH: &str = "system/boot/early-system.img.sig";
 const EARLY_SYSTEM_BOOTSTRAP_PATHS: &[&str] = &[
+    "etc/ld.so.cache",
     "lib/x86_64-linux-gnu/libc.so.6",
     "lib/x86_64-linux-gnu/libgcc_s.so.1",
     "lib64/ld-linux-x86-64.so.2",
@@ -41,6 +42,11 @@ const EARLY_SYSTEM_BOOTSTRAP_PATHS: &[&str] = &[
     "services/runtimed/runtimed.elf",
     "services/storaged/storaged.elf",
     "services/syscalld/syscalld.elf",
+    // The compositor is a core UI bootstrap dependency, not an ordinary
+    // desktop application. Keeping its signed executable in the immutable
+    // closure removes DVM-volume cold-read latency without giving ring0 any
+    // storage-controller or display-provider authority.
+    "services/uiserver/uiserver.elf",
     "services/vfsd/vfsd.elf",
     "system/registry/compat/windows-system-dlls.txt",
     "system/registry/system/desktop-programs.tsv",
@@ -1267,9 +1273,11 @@ mod tests {
     #[test]
     fn early_system_allowlist_contains_the_minimal_dynamic_runtime_closure() {
         for required in [
+            "etc/ld.so.cache",
             "lib64/ld-linux-x86-64.so.2",
             "lib/x86_64-linux-gnu/libc.so.6",
             "lib/x86_64-linux-gnu/libgcc_s.so.1",
+            "services/uiserver/uiserver.elf",
         ] {
             assert!(
                 EARLY_SYSTEM_BOOTSTRAP_PATHS.contains(&required),

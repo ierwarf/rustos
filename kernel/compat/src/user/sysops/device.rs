@@ -231,7 +231,6 @@ pub(crate) fn ioctl_current_process_fd(
     }) else {
         return Err(DeviceSysopError::Unsupported);
     };
-
     result
 }
 

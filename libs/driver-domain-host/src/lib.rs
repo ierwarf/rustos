@@ -47,6 +47,10 @@ const INPUT_STREAM_REQUEST_ID: u32 = 6;
 // enforces the resulting physical transport budget against a compromised or
 // buggy DVM before it commits the fixed shared-memory input ring.
 const INPUT_RELAY_MAX_FRAMES_PER_SECOND: u32 = 256;
+/// A full fixed ring is backpressure, not permission to drop user input. The
+/// relay may wait only within the end-to-end input latency bound before it
+/// fails closed with a transport-health diagnosis.
+const INPUT_RING_CREDIT_TIMEOUT: Duration = Duration::from_millis(50);
 // Every live hostd process allocates a relay epoch once. The fixed input ring
 // carries that epoch plus a per-epoch frame sequence, so time/PID derived
 // values are not sufficient: two rapid reconnects can collide. Stop before
@@ -2790,28 +2794,39 @@ impl InputRingSink {
     }
 
     fn write_frame(&mut self, frame: &RustosInputFrame, cleanup: bool) -> Result<()> {
-        let header = self.header()?;
-        if header.generation != self.generation || header.producer != self.producer_cursor {
-            bail!("input-ring producer lifecycle changed while L0 relay was live");
-        }
-        let required_ready =
-            DVM_INPUT_RING_FLAG_RUSTOS_READY | DVM_INPUT_RING_FLAG_POLICY_CONSUMER_READY;
-        if header.flags & required_ready != required_ready {
-            bail!("RustOS revoked input-ring transport or policy-consumer readiness");
-        }
-        let outstanding = header.producer.saturating_sub(header.consumer);
-        let cleanup_reserve = u64::from(LINUX_EVDEV_KEY_MAX) + 2;
-        let normal_limit = u64::from(DVM_INPUT_RING_SLOT_COUNT).saturating_sub(cleanup_reserve);
-        let limit = if cleanup {
-            u64::from(DVM_INPUT_RING_SLOT_COUNT)
-        } else {
-            normal_limit
+        let deadline = Instant::now()
+            .checked_add(INPUT_RING_CREDIT_TIMEOUT)
+            .ok_or_else(|| anyhow!("input-ring credit deadline overflow"))?;
+        let header = loop {
+            let header = self.header()?;
+            if header.generation != self.generation || header.producer != self.producer_cursor {
+                bail!("input-ring producer lifecycle changed while L0 relay was live");
+            }
+            let required_ready =
+                DVM_INPUT_RING_FLAG_RUSTOS_READY | DVM_INPUT_RING_FLAG_POLICY_CONSUMER_READY;
+            if header.flags & required_ready != required_ready {
+                bail!("RustOS revoked input-ring transport or policy-consumer readiness");
+            }
+            let outstanding = header.producer.saturating_sub(header.consumer);
+            let cleanup_reserve = u64::from(LINUX_EVDEV_KEY_MAX) + 2;
+            let normal_limit = u64::from(DVM_INPUT_RING_SLOT_COUNT).saturating_sub(cleanup_reserve);
+            let limit = if cleanup {
+                u64::from(DVM_INPUT_RING_SLOT_COUNT)
+            } else {
+                normal_limit
+            };
+            if outstanding < limit {
+                break header;
+            }
+            if Instant::now() >= deadline {
+                bail!(
+                    "fixed input-ring credit timeout outstanding={outstanding} limit={limit} cleanup={cleanup} timeout_ms={}",
+                    INPUT_RING_CREDIT_TIMEOUT.as_millis()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(1));
         };
-        if outstanding >= limit {
-            bail!(
-                "fixed input-ring is saturated outstanding={outstanding} limit={limit} cleanup={cleanup}"
-            );
-        }
+        let outstanding = header.producer.saturating_sub(header.consumer);
         let offset = usize::try_from(DvmInputRingHeader::record_offset(header.producer))
             .context("input-ring record offset does not fit usize")?;
         let end = offset

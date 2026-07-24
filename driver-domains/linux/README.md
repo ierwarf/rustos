@@ -51,7 +51,7 @@ It fails before downloading/building sources when neither source is valid.
 Outputs remain untracked below `out/artifacts/`:
 
 - `rustos-linux-dvm-x86_64.bzImage`
-- `rustos-linux-dvm-x86_64.rootfs.cpio.xz`
+- `rustos-linux-dvm-x86_64.rootfs.cpio.zst`
 - `rustos-linux-dvm-x86_64.config`
 - `rustos-linux-dvm-x86_64.kernel.config`
 - `rustos-linux-dvm-x86_64.module-signing.x509`
@@ -67,7 +67,7 @@ effective compiler inputs are unchanged. A second `make build` reuses both
 caches and only rebuilds invalidated inputs.
 Every installed module must carry a PKCS#7/SHA-256 signature that verifies
 against the exported per-image X.509 certificate; the private key stays a
-build-user-owned 0600 file and is never exported. Schema 8 binds both kernel
+build-user-owned 0600 file and is never exported. Schema 9 binds both kernel
 and Buildroot configurations, the certificate, source lock, NVIDIA release,
 boot artifacts, and control contract as eight co-located files in one
 self-contained bundle. `make verify` repeats these checks without rebuilding
@@ -132,7 +132,7 @@ Debian/Ubuntu에서는 첫 빌드 전에 `libelf-dev`를 설치해야 합니다.
 생성물은 추적하지 않는 `out/artifacts/` 아래에 남습니다.
 
 - `rustos-linux-dvm-x86_64.bzImage`
-- `rustos-linux-dvm-x86_64.rootfs.cpio.xz`
+- `rustos-linux-dvm-x86_64.rootfs.cpio.zst`
 - `rustos-linux-dvm-x86_64.config`
 - `rustos-linux-dvm-x86_64.kernel.config`
 - `rustos-linux-dvm-x86_64.module-signing.x509`
@@ -148,16 +148,16 @@ output tree 정리나 workspace 이동 뒤에도 object를 재사용합니다. �
 빌드합니다. `make clean`은 빌드 산출물만, `make distclean`은 이 디렉터리의 생성
 `out/`만 지웁니다.
 
-wrapper는 `.cpio.xz` 릴리스 ABI를 유지하면서 고정 4 MiB block의 병렬 `xz -1`을
-사용합니다. 현재 454 MiB rootfs 실측은 기존 Buildroot 재현 빌드 기본값
-`xz -9`의 약 79초/144 MiB에서 약 14초/182 MiB로 바뀝니다. 고정 block, 잠긴
-host XZ, 정규화된 timestamp와 최종 manifest hash가 재현 증거를 유지합니다.
-Buildroot를 직접 호출하면 이 계약을 우회하고 단일 스레드 병목을 되살리므로
-반드시 이 디렉터리의 `make` target을 사용합니다.
+wrapper는 schema-9 `.cpio.zst` 릴리스 ABI를 deterministic
+`zstd -3 -T1`로 생성하고, 남아 있는 schema-8 XZ image를 실패로 처리합니다.
+단일 compression worker, 정규화된 packaging input과 최종 manifest hash가
+host scheduling과 무관한 재현 증거를 유지하면서 guest decompression 병목을
+줄입니다. Buildroot를 직접 호출하면 이 packaging 계약을 우회하므로 반드시
+이 디렉터리의 `make` target을 사용합니다.
 
 설치되는 모든 module은 export된 image별 X.509 인증서로 검증되는
 PKCS#7/SHA-256 서명을 가져야 합니다. private key는 build 사용자 소유의 0600
-파일로만 남고 export되지 않습니다. Schema 8은 kernel/Buildroot 설정, 인증서,
+파일로만 남고 export되지 않습니다. Schema 9는 kernel/Buildroot 설정, 인증서,
 source lock, NVIDIA release, boot artifact, control contract를 같은 디렉터리의
 자기완결 8개 파일로 결속합니다. `make verify`는 appliance를 다시 빌드하지 않고
 이 조건을 재검사합니다. `make stage-release`는 기존 목적지, symlink 경로 구성요소,

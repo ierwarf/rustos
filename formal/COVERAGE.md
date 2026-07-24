@@ -130,9 +130,9 @@ failed infrastructure gates rather than implied successes:
 | The display-DVM relay installs or enters realtime scheduling before host authentication, starts while admission is partial, outranks input, runs without exact continuous-CPU-bound readback, retries after uncertain policy/limit restoration, or survives a Linux hard-limit/restore failure with relay authority | dvm-display-scheduler | driver-domains/linux/package/rustos-dvm-display/src/rustos-dvm-display.c and tools/xtask/src/{build/mod.rs,kvm.rs} |
 | A duplicate display relay publishes readiness; a partial, stale, or cross-mode ready file is accepted; amdgpu local health admits the staged virtio payload instead of the exact DMA-BUF/GPU/fence/atomic-KMS schema; a relay fault retains local health during scheduler restoration; a hard-limit/process exit retains readiness authority; or repeated pre-rename crashes accumulate candidate files | dvm-display-readiness | driver-domains/linux/package/rustos-dvm-display/src/rustos-dvm-display.c, driver-domains/linux/package/rustos-dvm-agent/src/rustos-dvm-agent.c, and tools/xtask/src/{build/mod.rs,kvm.rs} |
 | A late DVM GPU provider blocks the UI thread while allocating its atlas, promotes from a clear-only/unrepresentative or stale prime, promotes before the retained scene/first GPU frame, accepts a short or drifted provider pitch, hides a mandatory DVM path behind software success, or remains indefinitely armed after initialization/revoke | dvm-gpu-admission | services/uiserver/src/{gpu_runtime.rs,gpu_scene.rs,render.rs,sys.rs}, libs/rustos-user-abi/src/device.rs, kernel/{io-manager,ps} display-surface paths, and driver-domains/linux/package/rustos-dvm-display/src |
-| A private UI frame publishes commands without its immutable atlas generation, admits an unregistered or backend/mode-mismatched GPU profile, uses an old or ambiguous prime source-mode value, submits a mode different from the authenticated prime, initializes a new DVM texture from partial/no damage, applies partial damage to a backing slot that is not the exact preceding snapshot, overlaps damage records, executes texture updates out of submission order, reuses an atlas while the DVM still has read authority, executes a QEMU frame without its staged upload, reports staged copy as zero copy, presents before the GPU fence, reuses the old front before the KMS present fence, or retains source authority across revoke/reset | dvm-gpu-atlas-transport | libs/driver-domain-protocol/src/lib.rs, services/uiserver/src/{gpu_scene.rs,gpu_runtime.rs}, kernel/io-manager/src/io/dvm_display.rs, and driver-domains/linux/package/rustos-dvm-display/src |
+| A private UI frame publishes commands without its immutable atlas generation, admits an unregistered or backend/mode-mismatched GPU profile, uses an old or ambiguous prime source-mode value, submits a mode different from the authenticated prime, initializes a new DVM texture from partial/no damage, applies partial damage to a backing slot without an exact predecessor or complete bounded contiguous history, overlaps damage records, executes texture updates out of submission order, reuses an atlas while the DVM still has read authority, executes a QEMU frame without its staged upload, reports staged copy as zero copy, presents before the GPU fence, reuses the old front before the KMS present fence, or retains source authority across revoke/reset | dvm-gpu-atlas-transport | libs/driver-domain-protocol/src/lib.rs, services/uiserver/src/{gpu_scene.rs,gpu_runtime.rs}, kernel/io-manager/src/io/dvm_display.rs, and driver-domains/linux/package/rustos-dvm-display/src |
 | Concurrent GUI-DVM install calls allocate duplicate MSI-X vectors; malformed/absent BARs retain either mapping; an MSI/provider-registration failure retains mappings; or a revoked GUI transport reopens through a fallback path | gui-dvm-install | kernel/io-manager/src/io/dvm_display.rs |
-| A deadline-bounded IPC caller remains blocked after a reply, endpoint owner exit, or timeout; a late reply revives a cancelled call | ipc-reply-deadline | kernel/ipc-runtime/src/ipc/mod.rs and kernel/compat/src/user/syscall/linux/ipc_ops.rs |
+| A deadline-bounded IPC caller remains blocked after a reply, endpoint owner exit, or timeout; a late reply revives a cancelled call; a readiness or policy-only call silently inherits the 30 s bulk-data ceiling; a granted service lookup repeats rootd authorization; or every stable service call contends on the global endpoint mutation lock | ipc-reply-deadline | libs/rustos-user-abi/src/performance.rs, kernel/ipc-runtime/src/ipc/mod.rs, and kernel/compat/src/user/syscall/linux/ipc_ops.rs |
 | A wake between arm and commit is lost, a timer-expired task remains blocked, or a retired task is selected/woken through stale scheduler state | scheduler-wakeup | kernel/ps/src/multitask/scheduler.rs, kernel/ps/src/multitask/current.rs, and kernel/ps/src/multitask/irq.rs |
 | Monotonic time is inferred from lossy RTC interrupt count, a delayed virtual clockevent extends every deadline, an unvalidated TSC becomes authoritative, or sleep reacquires the process-table lock already held by its syscall | clocksource-deadline | kernel/hal/src/arch/{acpi.rs,clock.rs,rtc.rs}, kernel/hal/src/hooks.rs, kernel/ps/src/multitask/{current.rs,scheduler.rs,irq.rs} |
 | A mutable or malformed runtime launch record requests strict System weight for an ordinary app, or UI weight is granted to a path that merely resembles the trusted UI executable | scheduler-admission | services/runtimed/src/{main.rs,spawn.rs} |
@@ -352,8 +352,8 @@ permit from the previous real presentation before the next present. This
 matches the Wayland requirement to give a callback-driven client time to draw
 for the next refresh without creating an unpaced callback loop. Three bounded
 captures reached 35--43 FPS with balanced commit/callback/release counts;
-uiserver callback wait fell from 25--30 ms to normally 1--4 ms. The rebuilt
-schema-8 artifact's final signed 30-second capture separated a 4.961-second
+uiserver callback wait fell from 25--30 ms to normally 1--4 ms. An archived
+schema-8 capture separated a 4.961-second
 startup window at 0.403 commit FPS and 0.201 callback FPS from 20 settled
 one-second windows at 33.348--45.705 FPS. The largest settled callback gap was
 83 ms and the largest redraw was 24 ms. Compositor callback wait was normally
@@ -365,7 +365,20 @@ relay retained GPU composition, explicit fences, three scanout buffers, and no
 provider revoke, context loss, compositor-offline, or `display not available`
 marker. The exact 55-FPS command still failed. The gate requires three
 consecutive balanced WayClick windows at 55 FPS with at most a 50 ms callback
-gap and does not combine disjoint compositor, client, or relay windows.
+gap and does not combine disjoint compositor, client, or relay windows. That
+schema-8 measurement is historical diagnostic evidence, not acceptance
+evidence for the current schema-9 Zstandard appliance.
+
+The current schema-9 GUI/input boot rerun passes the independent five-second
+gate with the authenticated staged-copy compositor active on a 2048x2048
+atlas and both DVM keyboard and pointer ingress observed. Uiserver overlaps
+provider admission and atlas mapping with the CPU boot frame, then gives the
+first local GPU frame a bounded 750 ms turn before unrelated Wayland/runtime
+policy startup. In the GUI-only topology, block discovery now emits one fixed
+topology-absence record and storaged emits one matching errno transition
+instead of rescanning PCI and logging the same absence every 50 ms. This boot
+gate is not a 55-FPS WayClick proof; that separate steady-state gate remains
+required.
 
 The generic userspace wait-set implementation now replaces the single-snapshot
 `epoll_wait`: vfsd owns bounded interest sets, netd/inputd/sessiond publish monotonic
@@ -593,9 +606,11 @@ maximum. The visual output nevertheless flickered rapidly. Source inspection
 found that three RustOS atlas backing slots rotated while each received only
 the latest global damage rectangle: the two older slots therefore alternated
 stale or zero pixels even though the DVM GPU/KMS pipeline remained healthy.
-`uiserver` now records each slot's retained content epoch and permits partial
-damage only for the exact predecessor; an uninitialized or older slot receives
-a complete atlas snapshot. This source fix has unit, workspace-check, RustOS
+`uiserver` now records each slot's retained content epoch and a bounded
+contiguous damage history. An exact predecessor receives the current patch; an
+older released slot replays the complete retained history, while missing
+history or an uninitialized slot receives a complete atlas snapshot. This
+source fix has unit, workspace-check, RustOS
 image-build, and existing DVM artifact-verification evidence. The next
 cold-boot physical visual rerun confirmed a coherent, non-flickering RustOS
 screen and completed the 224-event absolute-pointer square with zero input

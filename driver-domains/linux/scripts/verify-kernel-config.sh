@@ -16,6 +16,13 @@ require_enabled() {
     }
 }
 
+require_module() {
+    grep -qx "${1}=m" "$config" || {
+        echo "rustos-linux-dvm: required kernel feature is not modular: $1" >&2
+        exit 1
+    }
+}
+
 require_disabled() {
     ! grep -Eq "^${1}=(y|m)$" "$config" || {
         echo "rustos-linux-dvm: forbidden kernel fallback enabled: $1" >&2
@@ -30,6 +37,7 @@ require_enabled CONFIG_MODULE_SIG_FORCE
 require_enabled CONFIG_MODULE_SIG_ALL
 require_enabled CONFIG_MODULE_SIG_SHA256
 require_enabled CONFIG_MODULE_SIG_KEY_TYPE_RSA
+require_enabled CONFIG_RD_ZSTD
 grep -qx 'CONFIG_MODULE_SIG_HASH="sha256"' "$config" || {
     echo "rustos-linux-dvm: module signature hash is not pinned to sha256" >&2
     exit 1
@@ -63,11 +71,15 @@ require_enabled CONFIG_SYNC_FILE
 require_enabled CONFIG_INPUT_UINPUT
 require_enabled CONFIG_DRM
 require_enabled CONFIG_DRM_VIRTIO_GPU
-require_enabled CONFIG_DRM_I915
-require_enabled CONFIG_DRM_XE
-require_enabled CONFIG_DRM_AMDGPU
+require_module CONFIG_DRM_I915
+require_module CONFIG_DRM_XE
+require_module CONFIG_DRM_AMDGPU
 require_enabled CONFIG_DRM_AMD_DC
 require_enabled CONFIG_DRM_FBDEV_EMULATION
+require_module CONFIG_BLK_DEV_SD
+require_module CONFIG_ATA
+require_module CONFIG_SATA_AHCI
+require_module CONFIG_BLK_DEV_NVME
 require_enabled CONFIG_VIRTIO_VSOCKETS
 require_disabled CONFIG_UDMABUF
 require_disabled CONFIG_DMABUF_MOVE_NOTIFY
@@ -81,3 +93,31 @@ require_disabled CONFIG_DRM_VGEM
 require_disabled CONFIG_DRM_VKMS
 require_disabled CONFIG_DRM_SIMPLEDRM
 require_disabled CONFIG_FW_LOADER_USER_HELPER
+for unused_family in \
+    CONFIG_WIRELESS \
+    CONFIG_CFG80211 \
+    CONFIG_MAC80211 \
+    CONFIG_RFKILL \
+    CONFIG_WLAN \
+    CONFIG_PCCARD \
+    CONFIG_MD \
+    CONFIG_ETHERNET \
+    CONFIG_SOUND \
+    CONFIG_MEDIA_SUPPORT \
+    CONFIG_HID \
+    CONFIG_USB_HID \
+    CONFIG_I2C_HID \
+    CONFIG_INPUT_KEYBOARD \
+    CONFIG_INPUT_MOUSE \
+    CONFIG_INPUT_JOYSTICK \
+    CONFIG_INPUT_TABLET \
+    CONFIG_INPUT_TOUCHSCREEN \
+    CONFIG_EXT4_FS \
+    CONFIG_NETWORK_FILESYSTEMS \
+    CONFIG_NET_9P \
+    CONFIG_SECURITY_SELINUX \
+    CONFIG_KEXEC \
+    CONFIG_HIBERNATION \
+    CONFIG_SUSPEND; do
+    require_disabled "$unused_family"
+done

@@ -156,7 +156,17 @@ impl ReadCacheSet {
     }
 }
 
+/// Read the current transport state without turning an ordinary not-ready
+/// observation into a service-wide startup wait. The readiness supervisor owns
+/// the bounded wait; request turns return `EAGAIN` to their caller instead.
 pub(super) fn info() -> Result<BlockInfo, i32> {
+    info_once()
+}
+
+/// Wait for asynchronous DVM bringup with the kernel's atomic
+/// check-arm-recheck waiter. Only the singleton readiness supervisor uses this
+/// path, never a caller-owned storage RPC turn.
+pub(super) fn wait_until_ready() -> Result<BlockInfo, i32> {
     let deadline = Instant::now() + STARTUP_READY_TIMEOUT;
     loop {
         match info_once() {
@@ -203,7 +213,7 @@ fn info_once() -> Result<BlockInfo, i32> {
 /// atomic check-arm-recheck waiter.  A timeout is terminal for this request;
 /// callers may retry the service operation, but no host/bootstrap storage
 /// fallback is selected.
-fn wait_for_transport_event(deadline: Instant) -> Result<(), i32> {
+pub(super) fn wait_for_transport_event(deadline: Instant) -> Result<(), i32> {
     let remaining = deadline.saturating_duration_since(Instant::now());
     let timeout_ms = bounded_wait_timeout_ms(remaining).ok_or(libc::ETIMEDOUT)?;
     let wait = RustosBlockBrokerArgs {

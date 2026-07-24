@@ -10,6 +10,7 @@ use runtime_control::{
     load_runtime_default_env, load_startup_entries, RuntimeEnvScope, StartupEntry, StartupMode,
     DEFAULT_RUNTIME_ENV_REGISTRY_PATH, DEFAULT_STARTUP_REGISTRY_PATH,
 };
+use rustos_user_abi::performance::IPC_BOOT_CONTROL_HARD_LIMIT_MS;
 use rustos_user_abi::syscall::{
     CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, LoaderSpawnRequest,
     LoaderSpawnResponse, RustosIpcWaitServiceEndpointArgs, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
@@ -46,6 +47,13 @@ const ROOTD_LEASE_REPORT_MAX_ATTEMPTS: u32 = 16;
 const DEFAULT_INIT_TASK_WEIGHT_MICROS: u64 = 1_000;
 const EARLY_POLICY_TASK_WEIGHT_MICROS: u64 = 4_000;
 const DISPLAY_CRITICAL_TASK_WEIGHT_MICROS: u64 = 2_000;
+// The signed early-system image contains runtimed, uiserver, their immutable
+// registries, and the exact dynamic-loader closure.  Storage-DVM publication
+// proves storage-policy liveness, not a prerequisite for this UI core.  Keep
+// mutable applications and DVM-volume assets behind storaged readiness, but
+// do not make the first visible desktop wait for an unrelated block FLUSH.
+const RUNTIMED_BOOTSTRAP_SERVICES: [u64; 3] =
+    [IPC_SERVICE_NETD, IPC_SERVICE_DEVMGRD, IPC_SERVICE_INPUTD];
 // Keep secondary services on the boot path. Guest Instant can be unavailable
 // during early bring-up, so time-based deferral can leave storaged deferred
 // indefinitely under KVM.
@@ -398,11 +406,7 @@ fn launch_gate_satisfied(exec: &str) -> bool {
             service_ready(IPC_SERVICE_LINUX_SYSCALLD) && service_ready(IPC_SERVICE_VFSD)
         }
         RUNTIMED_EXEC_PATH => {
-            foundation_policy_services_ready()
-                && service_ready(IPC_SERVICE_NETD)
-                && service_ready(rustos_user_abi::syscall::IPC_SERVICE_DEVMGRD)
-                && service_ready(rustos_user_abi::syscall::IPC_SERVICE_INPUTD)
-                && service_ready(IPC_SERVICE_STORAGED)
+            foundation_policy_services_ready() && runtimed_bootstrap_services_ready()
         }
         STORAGED_EXEC_PATH => {
             foundation_policy_services_ready()
@@ -412,6 +416,10 @@ fn launch_gate_satisfied(exec: &str) -> bool {
         }
         _ => foundation_policy_services_ready(),
     }
+}
+
+fn runtimed_bootstrap_services_ready() -> bool {
+    RUNTIMED_BOOTSTRAP_SERVICES.into_iter().all(service_ready)
 }
 
 fn foundation_policy_services_ready() -> bool {
@@ -616,11 +624,7 @@ fn reconcile_rootd_post_init_leases(
 }
 
 fn wait_reported_service_endpoint(exec_path: &str, pid: i32) -> Result<(), i32> {
-    wait_reported_service_endpoint_with_timeout(
-        exec_path,
-        pid,
-        IPC_WAIT_SERVICE_ENDPOINT_MAX_TIMEOUT_MS,
-    )
+    wait_reported_service_endpoint_with_timeout(exec_path, pid, IPC_BOOT_CONTROL_HARD_LIMIT_MS)
 }
 
 fn wait_reported_service_endpoint_with_timeout(
@@ -1094,8 +1098,9 @@ fn boot_line(message: &str) {
 mod tests {
     use super::{
         classify_service_ready_status, cleanup_spawned_service, exec_weight_micros,
-        RUNTIMED_EXEC_PATH, TASK_WEIGHT_INTERACTIVE_FLAG,
+        RUNTIMED_BOOTSTRAP_SERVICES, RUNTIMED_EXEC_PATH, TASK_WEIGHT_INTERACTIVE_FLAG,
     };
+    use rustos_user_abi::syscall::IPC_SERVICE_STORAGED;
 
     #[test]
     fn failed_service_cleanup_accepts_only_exact_retirement_or_esrch() {
@@ -1122,6 +1127,11 @@ mod tests {
             exec_weight_micros(RUNTIMED_EXEC_PATH) & TASK_WEIGHT_INTERACTIVE_FLAG,
             0
         );
+    }
+
+    #[test]
+    fn runtimed_bootstrap_does_not_wait_for_storage_dvm_publication() {
+        assert!(!RUNTIMED_BOOTSTRAP_SERVICES.contains(&IPC_SERVICE_STORAGED));
     }
 
     #[test]

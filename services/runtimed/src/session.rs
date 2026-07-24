@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::mem::size_of;
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use keyboard_core::KeyCode;
 use runtime_control::{
@@ -22,8 +23,7 @@ use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_SESSIOND_OP_FOREGROUND_FOCUS, COMMERCIAL_MAX_SESSIOND_OP_SESSION_GRAPH,
     COMMERCIAL_MAX_SESSIOND_OP_TTY_LINE_DISCIPLINE, COMMERCIAL_MAX_SESSIOND_OP_UI_BOOTSTRAP,
     IPC_SERVICE_DEVMGRD, IPC_SERVICE_SESSIOND, SESSIOND_CONSOLE_READINESS_LIVE,
-    SESSIOND_CONSOLE_READINESS_READY, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
-    SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
+    SESSIOND_CONSOLE_READINESS_READY, SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_REPLY,
     SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER, SYS_RUSTOS_WAITSET_SIGNAL_BROKER, WAITSET_ABI_VERSION,
     WAITSET_GLOBAL_OBJECT_ID, WAITSET_PROVIDER_SESSIOND,
 };
@@ -38,8 +38,6 @@ use super::{BrokerState, LaunchEntry};
 const INPUT_BUFFER_CAPACITY: usize = 1024;
 const EDIT_BUFFER_CAPACITY: usize = 256;
 const OUTPUT_BUFFER_CAPACITY: usize = 4096;
-const SERVICE_ENDPOINT_READY_ATTEMPTS: u32 = 4096;
-const SERVICE_ENDPOINT_REGISTER_ATTEMPTS: u32 = 65_536;
 
 pub(crate) struct SessionRuntime {
     sessions: BTreeMap<u64, TtySessionState>,
@@ -443,22 +441,38 @@ pub(super) fn bootstrap_ui_server(state: &mut BrokerState) -> Result<(), i32> {
 }
 
 fn wait_for_service_endpoint(service_id: u64) -> Result<(), i32> {
-    for _ in 0..SERVICE_ENDPOINT_READY_ATTEMPTS {
-        if super::spawn::lookup_service_endpoint(service_id) > 0 {
-            return Ok(());
-        }
-        std::thread::yield_now();
+    // Initd's deferred-start contract publishes devmgrd before it activates
+    // runtimed. Repeating policy lookup here can only amplify one unavailable
+    // dependency into thousands of rootd IPC turns. A transient violation is
+    // retried by the existing 500 ms UI-bootstrap owner.
+    let endpoint = super::spawn::lookup_service_endpoint(service_id);
+    if endpoint > 0 {
+        Ok(())
+    } else if endpoint < 0 {
+        Err((-endpoint) as i32)
+    } else {
+        Err(libc::ENOENT)
     }
-    Err(libc::ETIMEDOUT)
 }
 
 pub(super) fn create_session_endpoint() -> Option<u64> {
+    let started_at = Instant::now();
+    super::spawn::debug_line("runtimed: session endpoint create begin");
     let endpoint = unsafe { libc::syscall(SYS_RUSTOS_IPC_ENDPOINT_CREATE as libc::c_long) as i64 };
     if endpoint < 0 {
         super::spawn::debug_line("runtimed: session endpoint create failed");
         return None;
     }
-    let register = register_service_endpoint(IPC_SERVICE_SESSIOND, endpoint as u64);
+    super::spawn::debug_line(
+        format!(
+            "runtimed: session endpoint create done elapsed_ms={}",
+            started_at.elapsed().as_millis()
+        )
+        .as_str(),
+    );
+    super::spawn::debug_line("runtimed: session endpoint register begin");
+    let register =
+        rustos_svc_runtime::ipc::register_service_endpoint(IPC_SERVICE_SESSIOND, endpoint as u64);
     if register < 0 {
         super::spawn::debug_line(
             format!(
@@ -470,31 +484,13 @@ pub(super) fn create_session_endpoint() -> Option<u64> {
         return None;
     }
     super::spawn::debug_line(
-        format!("runtimed: session policy endpoint registered endpoint={endpoint}").as_str(),
+        format!(
+            "runtimed: session policy endpoint registered endpoint={endpoint} elapsed_ms={}",
+            started_at.elapsed().as_millis()
+        )
+        .as_str(),
     );
     Some(endpoint as u64)
-}
-
-fn register_service_endpoint(service_id: u64, endpoint: u64) -> i64 {
-    let mut last = 0;
-    for _ in 0..SERVICE_ENDPOINT_REGISTER_ATTEMPTS {
-        last = unsafe {
-            libc::syscall(
-                SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT as libc::c_long,
-                service_id,
-                endpoint,
-            ) as i64
-        };
-        if last >= 0 {
-            return last;
-        }
-        let errno = (-last) as i32;
-        if errno != libc::EACCES && errno != libc::EPERM && errno != libc::ENOENT {
-            return last;
-        }
-        std::thread::yield_now();
-    }
-    last
 }
 
 pub(super) fn service_session_endpoint(endpoint: Option<u64>, state: &mut BrokerState) -> bool {
@@ -1048,14 +1044,18 @@ fn ui_server_bootstrap_args_env() -> Result<(Vec<String>, Vec<String>), i32> {
     // pull the uiserver desktop entry (and the Init-scope env defaults) up
     // front. Reading from the registry warms the OnceLock cache; the catalog
     // loader thread reuses it without a second disk read.
+    boot_line("runtimed: ui bootstrap env load begin");
     let mut env =
         load_runtime_default_env(DEFAULT_RUNTIME_ENV_REGISTRY_PATH, RuntimeEnvScope::Init)
             .map_err(runtime_registry_errno)?;
+    boot_line("runtimed: ui bootstrap env load done");
+    boot_line("runtimed: ui bootstrap desktop load begin");
     let entry = load_desktop_program_entries(DEFAULT_APPLICATIONS_DIR)
         .map_err(runtime_registry_errno)?
         .into_iter()
         .find(|entry| entry.desktop_file_id == UI_SERVER_DESKTOP_FILE_ID)
         .ok_or(libc::ENOENT)?;
+    boot_line("runtimed: ui bootstrap desktop load done");
     if entry.exec != UI_SERVER_EXEC_PATH {
         return Err(libc::EINVAL);
     }

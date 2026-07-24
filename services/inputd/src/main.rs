@@ -26,7 +26,7 @@ use rustos_user_abi::syscall::{
     INPUTD_READ_PAYLOAD_CAPACITY, IPC_MAX_INLINE_BYTES, IPC_SERVICE_INPUTD, IPC_SERVICE_UISERVER,
     SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_INPUT_INGEST_BROKER, SYS_RUSTOS_INPUT_STATS_BROKER,
     SYS_RUSTOS_INPUT_WAIT_BROKER, SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_RECV_WITH_SENDER,
-    SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
+    SYS_RUSTOS_IPC_REPLY,
 };
 #[cfg(not(test))]
 use rustos_user_abi::syscall::{
@@ -742,7 +742,8 @@ fn main() {
         );
         return;
     }
-    let register = register_service_endpoint(IPC_SERVICE_INPUTD, endpoint as u64);
+    let register =
+        rustos_svc_runtime::ipc::register_service_endpoint(IPC_SERVICE_INPUTD, endpoint as u64);
     if register < 0 {
         let _ = writeln!(
             std::io::stderr(),
@@ -1497,26 +1498,6 @@ fn syscall3(number: u64, arg0: u64, arg1: u64, arg2: u64) -> i64 {
 
 fn syscall6(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i64 {
     unsafe { libc::syscall(number as libc::c_long, arg0, arg1, arg2, arg3, arg4, arg5) as i64 }
-}
-
-fn register_service_endpoint(service_id: u64, endpoint: u64) -> i64 {
-    let mut last = 0;
-    for _ in 0..65_536 {
-        last = syscall2(
-            SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT,
-            service_id,
-            endpoint,
-        );
-        if last >= 0 {
-            return last;
-        }
-        let errno = (-last) as i32;
-        if errno != libc::EACCES && errno != libc::EPERM && errno != libc::ENOENT {
-            return last;
-        }
-        thread::yield_now();
-    }
-    last
 }
 
 fn last_errno() -> i32 {

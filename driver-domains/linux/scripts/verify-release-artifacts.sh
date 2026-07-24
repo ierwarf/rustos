@@ -9,6 +9,10 @@ test -f "$manifest" && test ! -L "$manifest" || {
     echo "rustos-linux-dvm: missing release manifest: $manifest" >&2
     exit 1
 }
+test ! -e "$artifact_dir/rustos-linux-dvm-x86_64.rootfs.cpio.xz" || {
+    echo "rustos-linux-dvm: stale schema-8 XZ rootfs remains beside schema-9 artifacts" >&2
+    exit 1
+}
 
 required_keys=(
     schema id architecture boot data-plane
@@ -50,10 +54,10 @@ test "${#values[@]}" -eq "${#required_keys[@]}" || {
 }
 
 for assignment in \
-    'schema=8' \
+    'schema=9' \
     'id=rustos-linux-dvm-x86_64' \
     'architecture=x86_64' \
-    'boot=linux-bzimage+cpio-xz' \
+    'boot=linux-bzimage+cpio-zstd' \
     'data-plane=hostd-input-ring-msix' \
     'control-plane=agent-v1-control' \
     'control-protocol=agent-v1' \
@@ -94,7 +98,7 @@ while IFS=: read -r key file; do
     }
 done <<'EOF'
 kernel_sha256:rustos-linux-dvm-x86_64.bzImage
-rootfs_sha256:rustos-linux-dvm-x86_64.rootfs.cpio.xz
+rootfs_sha256:rustos-linux-dvm-x86_64.rootfs.cpio.zst
 config_sha256:rustos-linux-dvm-x86_64.config
 kernel-config-sha256:rustos-linux-dvm-x86_64.kernel.config
 module-signing-cert-sha256:rustos-linux-dvm-x86_64.module-signing.x509
@@ -141,4 +145,4 @@ for required in \
     }
 done
 
-printf 'rustos-linux-dvm: verified self-contained schema-8 release artifacts\n'
+printf 'rustos-linux-dvm: verified self-contained schema-9 release artifacts\n'

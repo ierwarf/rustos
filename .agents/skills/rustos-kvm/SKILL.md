@@ -54,7 +54,8 @@ cargo xtask kvm-smoke --timeout 30 --gui-dvm-surfaces \
   --dvm-network-shmem --min-ui-fps 55 --ui-proof-windows 3
 ```
 
-This enables uiserver and WayClick profiling only in the private KVM disk.
+This enables uiserver and WayClick profiling only in the private KVM disk and
+automatically attaches the production DVM block path needed to load those apps.
 Passing requires the same number of consecutive render/input windows, balanced
 WayClick commit/frame-callback/buffer-release windows with a bounded callback
 gap, and DVM runtime/relay windows. Never infer WayClick success from uiserver

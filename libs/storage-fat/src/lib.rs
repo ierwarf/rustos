@@ -42,6 +42,7 @@ pub struct FatDisk<D: BlockDevice> {
     block_size: usize,
     bytes_len: u64,
     scratch: Vec<u8>,
+    scratch_lba: Option<u64>,
 }
 
 impl<D: BlockDevice> FatDisk<D> {
@@ -61,7 +62,29 @@ impl<D: BlockDevice> FatDisk<D> {
             block_size,
             bytes_len,
             scratch,
+            scratch_lba: None,
         })
+    }
+
+    fn load_scratch(&mut self, lba: u64) -> IoResult<()> {
+        if self.scratch_lba != Some(lba) {
+            self.dev.read_blocks(lba, &mut self.scratch)?;
+            self.scratch_lba = Some(lba);
+        }
+        Ok(())
+    }
+
+    fn invalidate_scratch_range(&mut self, start_lba: u64, block_count: u64) {
+        let Some(cached_lba) = self.scratch_lba else {
+            return;
+        };
+        let Some(end_lba) = start_lba.checked_add(block_count) else {
+            self.scratch_lba = None;
+            return;
+        };
+        if cached_lba >= start_lba && cached_lba < end_lba {
+            self.scratch_lba = None;
+        }
     }
 
     pub fn into_inner(self) -> D {
@@ -111,7 +134,7 @@ impl<D: BlockDevice> Read for FatDisk<D> {
                     continue;
                 }
             }
-            self.dev.read_blocks(lba, &mut self.scratch)?;
+            self.load_scratch(lba)?;
             let n = min(self.block_size - off, max_read - done);
             buf[done..done + n].copy_from_slice(&self.scratch[off..off + n]);
             self.pos += n as u64;
@@ -141,6 +164,7 @@ impl<D: BlockDevice> Write for FatDisk<D> {
             if off == 0 {
                 let direct_len = ((max_write - done) / self.block_size) * self.block_size;
                 if direct_len != 0 {
+                    self.invalidate_scratch_range(lba, (direct_len / self.block_size) as u64);
                     self.dev.write_blocks(lba, &buf[done..done + direct_len])?;
                     self.pos += direct_len as u64;
                     done += direct_len;
@@ -149,11 +173,14 @@ impl<D: BlockDevice> Write for FatDisk<D> {
             }
             let n = min(self.block_size - off, max_write - done);
             if off == 0 && n == self.block_size {
+                self.invalidate_scratch_range(lba, 1);
                 self.dev.write_blocks(lba, &buf[done..done + n])?;
             } else {
-                self.dev.read_blocks(lba, &mut self.scratch)?;
+                self.load_scratch(lba)?;
                 self.scratch[off..off + n].copy_from_slice(&buf[done..done + n]);
+                self.scratch_lba = None;
                 self.dev.write_blocks(lba, &self.scratch)?;
+                self.scratch_lba = Some(lba);
             }
             self.pos += n as u64;
             done += n;
@@ -518,6 +545,34 @@ mod tests {
         }
     }
 
+    struct CountingBlockDevice {
+        inner: MemBlockDevice,
+        reads: usize,
+    }
+
+    impl BlockDevice for CountingBlockDevice {
+        fn logical_block_size(&self) -> usize {
+            self.inner.logical_block_size()
+        }
+
+        fn block_count(&self) -> u64 {
+            self.inner.block_count()
+        }
+
+        fn read_blocks(&mut self, lba: u64, out: &mut [u8]) -> IoResult<()> {
+            self.reads += 1;
+            self.inner.read_blocks(lba, out)
+        }
+
+        fn write_blocks(&mut self, lba: u64, input: &[u8]) -> IoResult<()> {
+            self.inner.write_blocks(lba, input)
+        }
+
+        fn flush(&mut self) -> IoResult<()> {
+            self.inner.flush()
+        }
+    }
+
     fn format_disk(block_size: usize, block_count: u64, volume_id: u32) -> MemBlockDevice {
         let mut disk = MemBlockDevice::new_zeroed(block_size, block_count);
         let mut formatter = FatDisk::new(disk).expect("valid FAT disk geometry");
@@ -550,6 +605,45 @@ mod tests {
         })
         .expect("valid bounded geometry");
         assert_eq!(disk.bytes_len(), 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn fat_disk_reuses_one_block_for_small_reads_and_keeps_writes_coherent() {
+        let mut inner = MemBlockDevice::new_zeroed(512, 8);
+        let initial = (0..512)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        inner.write_blocks(0, &initial).expect("seed first block");
+        let mut disk =
+            FatDisk::new(CountingBlockDevice { inner, reads: 0 }).expect("valid counting disk");
+
+        let mut first = [0_u8; 16];
+        disk.seek(SeekFrom::Start(3)).expect("seek first range");
+        disk.read(&mut first).expect("read first range");
+        assert_eq!(&first, &initial[3..19]);
+        assert_eq!(disk.dev.reads, 1);
+
+        let mut second = [0_u8; 16];
+        disk.seek(SeekFrom::Start(100)).expect("seek same block");
+        disk.read(&mut second).expect("read same block");
+        assert_eq!(&second, &initial[100..116]);
+        assert_eq!(disk.dev.reads, 1);
+
+        disk.seek(SeekFrom::Start(8)).expect("seek partial write");
+        disk.write(b"cache").expect("write cached block");
+        let mut updated = [0_u8; 5];
+        disk.seek(SeekFrom::Start(8)).expect("seek updated bytes");
+        disk.read(&mut updated).expect("read updated bytes");
+        assert_eq!(&updated, b"cache");
+        assert_eq!(disk.dev.reads, 1);
+
+        disk.seek(SeekFrom::Start(0)).expect("seek full write");
+        disk.write(&[0xa5; 512]).expect("replace full block");
+        disk.seek(SeekFrom::Start(7)).expect("seek replacement");
+        let mut replacement = [0_u8; 4];
+        disk.read(&mut replacement).expect("read replacement");
+        assert_eq!(replacement, [0xa5; 4]);
+        assert_eq!(disk.dev.reads, 2);
     }
 
     #[test]

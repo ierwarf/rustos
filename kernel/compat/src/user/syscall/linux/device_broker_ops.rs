@@ -147,7 +147,11 @@ fn session_ioctl_route_via_devmgrd(request_number: u64) -> Result<u64, i64> {
     if request.pid == 0 || request.tid == 0 {
         return Err(LINUX_EINVAL);
     }
-    let response = ipc_ops::call_service_endpoint(IPC_SERVICE_DEVMGRD, as_bytes(&request))?;
+    let response = ipc_ops::call_service_endpoint_with_class(
+        IPC_SERVICE_DEVMGRD,
+        as_bytes(&request),
+        ipc_ops::ServiceIpcClass::InteractiveControl,
+    )?;
     if response.len() != size_of::<DevmgrdDeviceIoctlResponse>() {
         return Err(LINUX_EINVAL);
     }

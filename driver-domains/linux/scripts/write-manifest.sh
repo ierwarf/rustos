@@ -16,7 +16,7 @@ source "$lock_file"
 source "$control_contract"
 
 kernel="$images/bzImage"
-rootfs="$images/rootfs.cpio.xz"
+rootfs="$images/rootfs.cpio.zst"
 config="$build_dir/.config"
 kernel_config="$build_dir/build/linux-${LINUX_VERSION}/.config"
 module_signing_cert="$build_dir/build/linux-${LINUX_VERSION}/certs/signing_key.x509"
@@ -45,7 +45,8 @@ install_artifact() {
 }
 
 install_artifact "$kernel" "$artifact_dir/rustos-linux-dvm-x86_64.bzImage"
-install_artifact "$rootfs" "$artifact_dir/rustos-linux-dvm-x86_64.rootfs.cpio.xz"
+install_artifact "$rootfs" "$artifact_dir/rustos-linux-dvm-x86_64.rootfs.cpio.zst"
+rm -f -- "$artifact_dir/rustos-linux-dvm-x86_64.rootfs.cpio.xz"
 install_artifact "$config" "$artifact_dir/rustos-linux-dvm-x86_64.config"
 install_artifact "$kernel_config" "$artifact_dir/rustos-linux-dvm-x86_64.kernel.config"
 install_artifact "$module_signing_cert" "$artifact_dir/rustos-linux-dvm-x86_64.module-signing.x509"
@@ -58,10 +59,10 @@ hash() {
 
 manifest_tmp=$(mktemp "$artifact_dir/.rustos-linux-dvm-x86_64.manifest.tmp.XXXXXX")
 {
-    echo 'schema=8'
+    echo 'schema=9'
     echo 'id=rustos-linux-dvm-x86_64'
     echo 'architecture=x86_64'
-    echo 'boot=linux-bzimage+cpio-xz'
+    echo 'boot=linux-bzimage+cpio-zstd'
     echo 'data-plane=hostd-input-ring-msix'
     printf 'control-plane=%s-%s\n' "$CONTROL_PROTOCOL" "$CONTROL_STATE"
     printf 'control-protocol=%s\n' "$CONTROL_PROTOCOL"
@@ -79,7 +80,7 @@ manifest_tmp=$(mktemp "$artifact_dir/.rustos-linux-dvm-x86_64.manifest.tmp.XXXXX
     echo 'module-signing-enforced=yes'
     printf 'module-signing-cert-sha256=%s\n' "$(hash "$artifact_dir/rustos-linux-dvm-x86_64.module-signing.x509")"
     printf 'kernel_sha256=%s\n' "$(hash "$artifact_dir/rustos-linux-dvm-x86_64.bzImage")"
-    printf 'rootfs_sha256=%s\n' "$(hash "$artifact_dir/rustos-linux-dvm-x86_64.rootfs.cpio.xz")"
+    printf 'rootfs_sha256=%s\n' "$(hash "$artifact_dir/rustos-linux-dvm-x86_64.rootfs.cpio.zst")"
     printf 'config_sha256=%s\n' "$(hash "$artifact_dir/rustos-linux-dvm-x86_64.config")"
     printf 'kernel-config-sha256=%s\n' "$(hash "$artifact_dir/rustos-linux-dvm-x86_64.kernel.config")"
     printf 'sources_lock_sha256=%s\n' "$(hash "$artifact_dir/rustos-linux-dvm-x86_64.sources.lock")"

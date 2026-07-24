@@ -1,6 +1,11 @@
 #!/bin/sh
 # SPDX-License-Identifier: MIT
 
+# Starts immediately after Buildroot's S11 module-admission turn. The block
+# DVM relay needs proc/sysfs, devtmpfs and modprobe, but has no dependency on
+# DHCP, GPU composition, networking, or the control agent. Keeping it before
+# those unrelated services prevents mutable-volume readiness from serializing
+# behind the rest of the driver domain boot.
 run_dir=/run/rustos-dvm
 pid_file="$run_dir/block.pid"
 

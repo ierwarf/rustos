@@ -12,8 +12,8 @@ use super::{
     boot_line, LAUNCH_TARGET_NEW_SESSION, MAX_POLICY_LAUNCH_ATTEMPTS_PER_TICK,
     MAX_RUNTIME_CLIENTS_PER_TICK, MAX_RUNTIME_PROGRAMS, OP_NOTIFY_READY, OP_REQUEST_LAUNCH_PATH,
     OP_REQUEST_TERMINATE, OP_SNAPSHOT_RUNNING_PROGRAMS, PROTOCOL_VERSION,
-    READY_COMPONENT_UI_SERVER, RETRY_BACKOFF, TERMINATE_TARGET_PID, TERMINATE_TARGET_SESSION,
-    UI_SERVER_EXEC_PATH,
+    READY_COMPONENT_UI_SERVER, RETRY_BACKOFF, STORAGE_NOT_READY_RETRY_BACKOFF,
+    TERMINATE_TARGET_PID, TERMINATE_TARGET_SESSION, UI_SERVER_EXEC_PATH,
 };
 use super::{BrokerState, LaunchEntry, RuntimeRequest, RuntimeResponse};
 
@@ -24,7 +24,7 @@ struct RuntimePeerCredentials {
 
 pub(super) fn bind_listener(path: &str) -> Result<UnixListener, i32> {
     let started_at = Instant::now();
-    boot_line("runtimed: bind listener begin");
+    bind_timing("begin", started_at);
 
     let socket_fd = unsafe {
         libc::socket(
@@ -36,13 +36,7 @@ pub(super) fn bind_listener(path: &str) -> Result<UnixListener, i32> {
     if socket_fd < 0 {
         return Err(last_errno());
     }
-    boot_line(
-        format!(
-            "runtimed: bind listener socket elapsed_ms={}",
-            started_at.elapsed().as_millis()
-        )
-        .as_str(),
-    );
+    bind_timing("socket", started_at);
 
     let path = CString::new(path).map_err(|_| libc::EINVAL)?;
     let unlink_rc = unsafe { libc::unlink(path.as_ptr()) };
@@ -53,13 +47,7 @@ pub(super) fn bind_listener(path: &str) -> Result<UnixListener, i32> {
             return Err(err);
         }
     }
-    boot_line(
-        format!(
-            "runtimed: bind listener unlink elapsed_ms={}",
-            started_at.elapsed().as_millis()
-        )
-        .as_str(),
-    );
+    bind_timing("unlink", started_at);
 
     let path_bytes = path.as_bytes_with_nul();
     let mut addr = unsafe { std::mem::zeroed::<libc::sockaddr_un>() };
@@ -84,28 +72,30 @@ pub(super) fn bind_listener(path: &str) -> Result<UnixListener, i32> {
         let _ = unsafe { libc::close(socket_fd) };
         return Err(err);
     }
-    boot_line(
-        format!(
-            "runtimed: bind listener bind elapsed_ms={}",
-            started_at.elapsed().as_millis()
-        )
-        .as_str(),
-    );
+    bind_timing("bind", started_at);
 
     if unsafe { libc::listen(socket_fd, 16) } < 0 {
         let err = last_errno();
         let _ = unsafe { libc::close(socket_fd) };
         return Err(err);
     }
-    boot_line(
+    bind_timing("listen", started_at);
+
+    Ok(unsafe { UnixListener::from_raw_fd(socket_fd) })
+}
+
+/// Keep the few bootstrap socket checkpoints visible in the kernel timestamp
+/// stream. They happen once per service start and make a blocked local-socket
+/// setup distinguishable from scheduler or loader delay without enabling the
+/// high-volume runtime trace.
+fn bind_timing(stage: &str, started_at: Instant) {
+    super::debug_line(
         format!(
-            "runtimed: bind listener listen elapsed_ms={}",
+            "runtimed: bind listener stage={stage} elapsed_ms={}",
             started_at.elapsed().as_millis()
         )
         .as_str(),
     );
-
-    Ok(unsafe { UnixListener::from_raw_fd(socket_fd) })
 }
 
 pub(super) fn service_listener(listener: &UnixListener, state: &mut BrokerState) -> bool {
@@ -563,14 +553,23 @@ pub(super) fn ensure_policy_launches(state: &mut BrokerState) -> bool {
                         entry.desktop_file_id,
                         entry.exec
                     );
-                    state
-                        .retry_after
-                        .insert(entry.desktop_file_id, Instant::now() + RETRY_BACKOFF);
+                    state.retry_after.insert(
+                        entry.desktop_file_id,
+                        Instant::now() + launch_retry_backoff(err),
+                    );
                 }
             }
         }
     }
     launched_any
+}
+
+fn launch_retry_backoff(errno: i32) -> std::time::Duration {
+    if errno == libc::EAGAIN {
+        STORAGE_NOT_READY_RETRY_BACKOFF
+    } else {
+        RETRY_BACKOFF
+    }
 }
 
 fn last_errno() -> i32 {
@@ -582,9 +581,10 @@ fn last_errno() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        runtime_request_role_authorized, OP_NOTIFY_READY, OP_REQUEST_LAUNCH_PATH,
-        OP_REQUEST_TERMINATE, OP_SNAPSHOT_RUNNING_PROGRAMS,
+        launch_retry_backoff, runtime_request_role_authorized, OP_NOTIFY_READY,
+        OP_REQUEST_LAUNCH_PATH, OP_REQUEST_TERMINATE, OP_SNAPSHOT_RUNNING_PROGRAMS,
     };
+    use crate::{RETRY_BACKOFF, STORAGE_NOT_READY_RETRY_BACKOFF};
 
     #[test]
     fn runtime_control_mutations_require_live_uiserver_or_logical_admin() {
@@ -609,5 +609,14 @@ mod tests {
             true
         ));
         assert!(!runtime_request_role_authorized(u16::MAX, true, true));
+    }
+
+    #[test]
+    fn storage_not_ready_launches_back_off_without_disabling_the_program() {
+        assert_eq!(
+            launch_retry_backoff(libc::EAGAIN),
+            STORAGE_NOT_READY_RETRY_BACKOFF
+        );
+        assert_eq!(launch_retry_backoff(libc::ETIMEDOUT), RETRY_BACKOFF);
     }
 }

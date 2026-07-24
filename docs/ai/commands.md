@@ -20,7 +20,7 @@ failure output as the primary debugging context.
 
 | Command | Use | Writes | Common failure meaning |
 | --- | --- | --- | --- |
-| `cargo xtask build-dvm` | build the pinned Linux DVM, cryptographically verify every installed module against its generated X.509 certificate, and emit a self-contained schema-8 bundle | `driver-domains/linux/out/` | missing Buildroot prerequisite, unsigned/foreign module, or source/artifact mismatch |
+| `cargo xtask build-dvm` | build the pinned Linux DVM, cryptographically verify every installed module against its generated X.509 certificate, and emit a self-contained schema-9 bundle | `driver-domains/linux/out/` | missing Buildroot prerequisite, unsigned/foreign module, or source/artifact mismatch |
 | `make -C driver-domains/linux build-plan` | read-only classification of the next DVM build as cold/full or explicit incremental lanes | temporary config probe only | stale Buildroot/toolchain identity, unsafe config transition, or the listed kernel/package/rootfs lanes |
 | `make -C driver-domains/linux selftest-config-cache` | prove the config admission policy and that a kernel-fragment mutation changes the kernel lane without changing the host-toolchain lane | temporary files only | cache boundary regression |
 | `make -C driver-domains/linux ccache-stats` | report Buildroot's persistent compiler-cache hits and misses | none after the cached ccache tool exists | missing/incomplete Buildroot host tools |
@@ -50,7 +50,7 @@ failure output as the primary debugging context.
 | `cargo run -p rustos-hostd -- prepare-amd-vfct --vfct <VFCT> --bdf <HOST-BDF> --output <TABLE>` | validate the host identity, relocate only its VFCT image BDF to fixed guest slot `0000:00:08.0`, recompute the ACPI checksum, and preserve the VBIOS bytes | new 0600 relocated VFCT table | any source validation failure, changed payload, invalid relocated checksum/identity, unsafe path, or existing output |
 | `sudo target/debug/rustos-hostd probe-iommufd` | exercise one empty IOMMUFD IOAS allocate/destroy round trip without binding or opening a VFIO device | none | missing administrator access or incompatible IOMMUFD userspace ABI |
 | `cargo run -p rustos-hostd -- supervise ...` | launch one signed display-only physical-device DVM with IOMMUFD, an exact private relocated AMD VFCT table supplied through ACPI at fixed guest BDF, authenticated readiness, private QMP/ACPI shutdown with actual-exit proof, bounded forced fallback, reset, and restore | private runtime record/VFCT/QMP endpoint and supervised QEMU | stale authorization, artifact/policy/QEMU/VFCT mismatch, absent IOMMUFD/reset, failed authentication, rejected/timed-out ACPI shutdown, signaled/nonzero QEMU exit, or quarantine |
-| `cargo run -p rustos-hostd -- verify-artifacts --dvm-artifact-manifest <release/rustos-linux-dvm-x86_64.manifest>` | independently admit one staged self-contained schema-8 DVM bundle | none | mutable path, missing/extra metadata, or companion-file hash mismatch |
+| `cargo run -p rustos-hostd -- verify-artifacts --dvm-artifact-manifest <release/rustos-linux-dvm-x86_64.manifest>` | independently admit one staged self-contained schema-9 DVM bundle | none | mutable path, missing/extra metadata, or companion-file hash mismatch |
 | `cargo run -p rustos-hostd -- recover --plan <file>` | recover an active lease by canonical runtime record plus exact post-open PID/start-time identity, signal only through pidfd, then reset and restore the whole group | removes runtime/lease state only after success | unsafe/stale runtime identity, unavailable pidfd, or reset/restore failure |
 | `cargo run -p rustos-hostd -- relay-input ...` | relay validated DVM Linux input into RustOS's fixed input ring | launch-owned ivshmem backing and doorbell | policy mismatch, malformed DVM event, or peer lifecycle failure |
 
@@ -127,14 +127,13 @@ one stable change set, where it regenerates the rootfs and runs the full module
 signature and artifact verification. This follows Buildroot's distinction
 between package-only rebuilds and integration builds: <https://buildroot.org/downloads/manual/manual.html>.
 
-The integration rebuild still has to regenerate the immutable initramfs, but
-the repository wrapper overrides Buildroot's reproducible single-threaded
-`xz -9` with pinned-XZ, fixed-4-MiB-block, parallel `xz -1`. The measured
-454 MiB rootfs compression falls from about 79 seconds/144 MiB to about
-14 seconds/182 MiB without changing the `.cpio.xz` boot or artifact ABI.
-Do not call Buildroot directly: doing so bypasses this speed and reproducibility
-contract. XZ worker count may vary, but the fixed block partition and locked
-tool version keep the compressed stream independent of scheduling.
+The integration rebuild still has to regenerate the immutable initramfs. The
+repository wrapper publishes schema-9 `.cpio.zst` with deterministic
+`zstd -3 -T1`, removes any stale schema-8 XZ image, and hashes the result into
+the release manifest. Do not call Buildroot directly: doing so bypasses the
+packaging, stale-artifact rejection, and reproducibility contract. The single
+compression worker deliberately makes the Zstandard frame independent of host
+worker scheduling while retaining fast guest decompression.
 
 An additive defconfig change preserves the cached Buildroot host toolchain only
 when every changed symbol is a disabled-to-`y` transition named in
@@ -153,11 +152,15 @@ package additions may be incremental only when existing optional consumers do
 not need rebuilding; removals require a clean rebuild.
 
 `BR2_CCACHE=y` and `BR2_CCACHE_USE_BASEDIR=y` keep object cache entries in
-`~/.buildroot-ccache`, outside the disposable output tree. Use `ccache-stats`
-to measure whether a repeated cold build is receiving real hits. After a
-completed build, Buildroot's official `graph-build` facility may be run through
-the wrapper during performance work to attribute duration by package; do not
-infer build cost from artifact size.
+`driver-domains/linux/out/ccache`, outside the disposable
+`buildroot-output` tree but inside the writable managed checkout. The wrapper
+exports that directory explicitly so sandboxed builds cannot inherit an
+unwritable home cache and fail halfway through LLVM. An operator may override
+it only with `RUSTOS_DVM_CCACHE_DIR`. Use `ccache-stats` to measure whether a
+repeated cold build is receiving real hits. After a completed build,
+Buildroot's official `graph-build` facility may be run through the wrapper
+during performance work to attribute duration by package; do not infer build
+cost from artifact size.
 
 The profile intentionally leaves `BR2_PER_PACKAGE_DIRECTORIES` disabled.
 Buildroot's `.NOTPARALLEL` guard therefore serializes the package graph while
@@ -198,11 +201,11 @@ key. The release contract is the exact certificate-bound module verification,
 locked inputs, normalized packaging, and artifact manifest. Never strip or
 otherwise mutate a `.ko` after its signature is attached.
 
-Schema 8 is an exact locked-input and artifact manifest, not a CycloneDX SBOM
+Schema 9 is an exact locked-input and artifact manifest, not a CycloneDX SBOM
 or Buildroot `legal-info` bundle. Those standardized release-provenance outputs
 require a separate schema/admission change and are not fabricated by this
 build. Their absence does not invalidate the functional appliance build, but
-the schema-8 manifest must not be described as standardized SBOM evidence.
+the schema-9 manifest must not be described as standardized SBOM evidence.
 
 Settle a physical-DVM kernel envelope before its first integration build. The
 AMD display envelope explicitly pins ZONE_DEVICE page ownership, DMA-BUF/sync,
@@ -322,7 +325,10 @@ fallback.
   physical NIC assignment or an L0 network control plane.
 - `--min-ui-fps <fps>` enables both `RUSTOS_UI_PROFILE` and
   `RUSTOS_WAYCLICK_PROFILE` only in the private KVM disk copy by replacing the
-  equal-length disabled values. It never alters the release boot image. The
+  equal-length disabled values. It also attaches the DVM block aperture because
+  the profiled apps are admitted from the mutable DVM-backed volume; an
+  embedded-volume or retry-only success is forbidden. It never alters the
+  release boot image. The
   proof requires the requested number of consecutive one-second windows for
   uiserver render/input health, balanced WayClick commit/frame-callback/
   buffer-release progress with at most a 50 ms callback gap, and, when enabled,

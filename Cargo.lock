@@ -338,6 +338,7 @@ name = "devmgrd"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "rustos-svc-runtime",
  "rustos-user-abi",
 ]
 
@@ -873,6 +874,7 @@ name = "netd"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "rustos-svc-runtime",
  "rustos-user-abi",
  "smoltcp",
 ]
@@ -1953,6 +1955,7 @@ dependencies = [
  "rustos-driver-domain-host",
  "rustos-fault-injection",
  "rustos-image-admission",
+ "rustos-user-abi",
  "serde",
  "sha2",
  "storage-core",

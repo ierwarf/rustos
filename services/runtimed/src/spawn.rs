@@ -1,19 +1,21 @@
 use std::ffi::CString;
+use std::fs;
 use std::mem::size_of;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::Ordering;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use rustos_user_abi::performance::IPC_BOOT_CONTROL_HARD_LIMIT_MS;
 use rustos_user_abi::syscall::{
     CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, LoaderSpawnRequest,
     LoaderSpawnResponse, RustosIpcWaitServiceEndpointArgs, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
     COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR, COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL,
     IPC_SERVICE_LOADERD, IPC_SERVICE_ROOTD, IPC_SERVICE_UISERVER,
-    IPC_WAIT_SERVICE_ENDPOINT_ABI_VERSION, IPC_WAIT_SERVICE_ENDPOINT_MAX_TIMEOUT_MS,
-    LOADER_OP_ACTIVATE, LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES,
-    LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_EXEC_PATH_CAPACITY, LOADER_SPAWN_FLAG_DEFER_START,
-    SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
-    SYS_RUSTOS_IPC_WAIT_SERVICE_ENDPOINT,
+    IPC_WAIT_SERVICE_ENDPOINT_ABI_VERSION, LOADER_OP_ACTIVATE, LOADER_OP_SPAWN_EXEC,
+    LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES, LOADER_SPAWN_ENV_BYTES,
+    LOADER_SPAWN_EXEC_PATH_CAPACITY, LOADER_SPAWN_FLAG_DEFER_START, SYS_RUSTOS_IPC_CALL,
+    SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_WAIT_SERVICE_ENDPOINT,
 };
 
 use super::{
@@ -25,10 +27,19 @@ use super::{
 };
 use super::{BrokerState, LaunchEntry, RunningProcess};
 
+const KVM_ACCEPTANCE_CONTRACT_PATH: &str = "/system/registry/system/kvm-acceptance-v1.env";
+
+#[derive(Clone, Copy)]
+struct KvmAcceptanceContract {
+    ui_profile: bool,
+    network_exercise: bool,
+}
+
 pub(super) fn spawn_tracked_process(
     state: &mut BrokerState,
-    entry: LaunchEntry,
+    mut entry: LaunchEntry,
 ) -> Result<(), i32> {
+    apply_kvm_acceptance_contract(&mut entry);
     boot_line(
         format!(
             "runtimed: spawn begin desktop_id={} exec={} console_hosted={} logical_admin={}",
@@ -146,6 +157,59 @@ pub(super) fn spawn_tracked_process(
         super::session::focus_session_after_spawn(state, inserted_session_handle);
     }
     Ok(())
+}
+
+fn apply_kvm_acceptance_contract(entry: &mut LaunchEntry) {
+    static CONTRACT: OnceLock<Option<KvmAcceptanceContract>> = OnceLock::new();
+    let Some(contract) = *CONTRACT.get_or_init(load_kvm_acceptance_contract) else {
+        return;
+    };
+    if contract.ui_profile && entry.desktop_file_id == "uiserver.desktop" {
+        upsert_env(&mut entry.env, "RUSTOS_UI_PROFILE=1");
+        upsert_env(&mut entry.env, "RUSTOS_UI_BOOT_TRACE=1");
+    }
+    if contract.ui_profile && entry.desktop_file_id == "wayclick.desktop" {
+        upsert_env(&mut entry.env, "RUSTOS_WAYCLICK_PROFILE=1");
+    }
+    if contract.network_exercise && entry.desktop_file_id == "netprobe.desktop" {
+        upsert_env(&mut entry.env, "RUSTOS_NETPROBE_QEMU=1");
+    }
+}
+
+fn load_kvm_acceptance_contract() -> Option<KvmAcceptanceContract> {
+    let contents = fs::read_to_string(KVM_ACCEPTANCE_CONTRACT_PATH).ok()?;
+    parse_kvm_acceptance_contract(contents.as_str())
+}
+
+fn parse_kvm_acceptance_contract(contents: &str) -> Option<KvmAcceptanceContract> {
+    let mut contract = false;
+    let mut ui_profile = None;
+    let mut network_exercise = None;
+    for line in contents.lines() {
+        match line {
+            "contract=rustos-kvm-acceptance-v1" if !contract => contract = true,
+            "ui_profile=0" if ui_profile.is_none() => ui_profile = Some(false),
+            "ui_profile=1" if ui_profile.is_none() => ui_profile = Some(true),
+            "network_exercise=0" if network_exercise.is_none() => network_exercise = Some(false),
+            "network_exercise=1" if network_exercise.is_none() => network_exercise = Some(true),
+            _ => return None,
+        }
+    }
+    Some(KvmAcceptanceContract {
+        ui_profile: ui_profile.filter(|_| contract)?,
+        network_exercise: network_exercise?,
+    })
+}
+
+fn upsert_env(env: &mut Vec<String>, value: &str) {
+    let key = value.split_once('=').map(|(key, _)| key).unwrap_or(value);
+    env.retain(|existing| {
+        existing
+            .split_once('=')
+            .map(|(candidate, _)| candidate != key)
+            .unwrap_or(true)
+    });
+    env.push(value.to_string());
 }
 
 fn release_failed_session(state: &mut BrokerState, session_handle: Option<u64>) {
@@ -433,7 +497,7 @@ fn wait_for_service_endpoint(service_id: u64, pid: i32) -> Result<u64, i32> {
         abi_version: IPC_WAIT_SERVICE_ENDPOINT_ABI_VERSION,
         service_id,
         expected_pid: u64::try_from(pid).map_err(|_| libc::EINVAL)?,
-        timeout_ms: IPC_WAIT_SERVICE_ENDPOINT_MAX_TIMEOUT_MS,
+        timeout_ms: IPC_BOOT_CONTROL_HARD_LIMIT_MS,
         ..RustosIpcWaitServiceEndpointArgs::default()
     };
     let result = unsafe {
@@ -701,7 +765,7 @@ fn last_errno() -> i32 {
 mod tests {
     use super::{
         admitted_task_weight_micros, build_exec_argv, build_exec_env_with_defaults,
-        cleanup_failed_spawn,
+        cleanup_failed_spawn, parse_kvm_acceptance_contract, upsert_env,
     };
     use crate::{
         MAX_UNTRUSTED_TASK_WEIGHT_MICROS, UI_SERVER_EXEC_PATH, UI_SERVER_TASK_WEIGHT_MICROS,
@@ -713,6 +777,34 @@ mod tests {
             admitted_task_weight_micros("apps/shell/shell.elf", u64::MAX),
             MAX_UNTRUSTED_TASK_WEIGHT_MICROS
         );
+    }
+
+    #[test]
+    fn private_acceptance_contract_is_exact_and_boolean() {
+        let contract = parse_kvm_acceptance_contract(
+            "contract=rustos-kvm-acceptance-v1\nui_profile=1\nnetwork_exercise=0\n",
+        )
+        .expect("valid private acceptance contract");
+        assert!(contract.ui_profile);
+        assert!(!contract.network_exercise);
+        assert!(parse_kvm_acceptance_contract("ui_profile=1\nnetwork_exercise=0\n").is_none());
+        assert!(parse_kvm_acceptance_contract(
+            "contract=rustos-kvm-acceptance-v1\nui_profile=yes\nnetwork_exercise=0\n"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn acceptance_environment_replaces_manifest_default_once() {
+        let mut env = vec![String::from("RUSTOS_UI_PROFILE=0"), String::from("A=1")];
+        upsert_env(&mut env, "RUSTOS_UI_PROFILE=1");
+        assert_eq!(
+            env.iter()
+                .filter(|value| value.starts_with("RUSTOS_UI_PROFILE="))
+                .count(),
+            1
+        );
+        assert!(env.iter().any(|value| value == "RUSTOS_UI_PROFILE=1"));
     }
 
     #[test]

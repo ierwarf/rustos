@@ -47,6 +47,17 @@ ceiling. Server receive loops may wait for new work indefinitely because they
 hold no caller reply, but every accepted synchronous request must reach reply,
 timeout/cancel, peer-close, or owner-exit cleanup.
 
+Kernel-owned cross-service calls use the typed limits in
+`rustos_user_abi::performance`, never an unlabelled copy of the 30-second
+ceiling: non-consuming readiness queries are capped at 16 ms, interactive
+policy-only calls at 100 ms, boot/control transactions at 5 seconds, and bulk
+data at 30 seconds. A call may use a shorter application deadline but cannot
+widen its class. Bulk data is reserved for operations whose external device or
+application semantics can legitimately wait; endpoint lookup, authorization,
+ioctl routing, readiness, close/dup/exec maintenance, and frame submission are
+not bulk data. The class is explicit at every kernel call site, and
+`formal/run-source-conformance.sh` rejects a broken limit ordering.
+
 Endpoints registered via `SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT`, looked up by stable `IPC_SERVICE_*` id. Registering endpoint `0` revokes; later lookups fail closed.
 Before final endpoint cleanup, a terminating process is marked exiting. Endpoint
 publication, explicit revoke, and exit cleanup share one registry mutation
@@ -82,6 +93,13 @@ removes it. Endpoints outside the live service registry are callable only by
 their owner process. Raw endpoint values are not inherited/transferable
 capabilities; future cross-process endpoint transfer must use an explicit
 typed-handle grant and lifecycle contract.
+An exact current-epoch grant also satisfies repeated lookup without another
+rootd request. The lookup still rechecks the live endpoint, owner-exit marker,
+and publication epoch under the registry lock; a miss, revoke, or republish
+returns to rootd admission. Caching an endpoint without those checks is
+forbidden, but re-authorizing an unchanged grant is a performance-contract
+violation because it converts a local table read into an avoidable synchronous
+boot/runtime dependency.
 Runtimed's Unix control socket is also an authority boundary, not a trusted
 local channel. It reads `SO_PEERCRED` and ignores caller-supplied identity.
 Snapshot, launch, and terminate require either the current live uiserver
@@ -204,6 +222,12 @@ MMIO mapping. The sole accepted GUI topology is the V3 `RSGUI002` three-slot
 GUI-DVM pool; V2, polling, a firmware framebuffer, and a native-GPU fallback
 are not parsed or selected.
 
+When the RDI3 ring reaches its normal reserve-preserving limit, L0 waits for
+consumer credit for at most 50 ms rather than dropping a valid user frame or
+spinning. Progress resumes on the observed consumer cursor; no credit before
+the deadline is a fail-closed transport-health failure. Cleanup uses its
+separately reserved lifecycle capacity and follows the same bounded rule.
+
 RDI3 preserves pointer semantics end to end. Relative evdev devices produce
 bounded delta records; absolute tablets produce bounded `0..1599 x 0..899`
 position records only after a complete `SYN_REPORT`. Partial X/Y reports are
@@ -219,10 +243,12 @@ the separate cacheable pixel device is writable only by RustOS QEMU and is
 read-only/ROM in the DVM. Every READY slot is a complete immutable snapshot,
 even when its PRESENT damage hint is partial. RustOS may construct that
 snapshot with a damage-only patch only after reclaiming a FREE slot whose
-retained pixel-content generation is the exact immediately preceding
-generation and whose source mapping is unchanged; retained content generation
-is not release authority. An uninitialized/stale slot, a source replacement,
-or full damage forces a complete copy. The DVM module requires matching
+retained pixel-content generation is either the exact immediately preceding
+generation or is covered by the complete contiguous damage history retained
+for the fixed three-slot pool, and whose source mapping is unchanged. Retained
+content generation is not release authority. An uninitialized slot, missing or
+invalid history, a source/topology replacement, or full damage forces a
+complete copy. The DVM module requires matching
 control/pixel headers, exposes only WB read-only pixel pages to its relay, and
 rejects writable VMAs. Before export, the module owns the complete fixed pixel
 aperture through one `MEMORY_DEVICE_GENERIC` `dev_pagemap`; every exported PFN
@@ -527,6 +553,40 @@ policy remains with the owning service.
   and policy decisions stay in `rootd`/`syscalld`/`vfsd`/`loaderd`/other owning
   services, not in new ring0 policy tables.
 
+## IPC Performance Acceptance
+
+- Kernel entry to the first completed private-compositor frame has a 3-second
+  optimization target and a 5-second hard acceptance limit. The KVM harness
+  starts this clock only after both guests exist and fails independently of the
+  broader 30-second readiness budget when
+  `uiserver: gpu-compositor active contract=3` is late. Storage-only validation
+  is excluded because it intentionally launches no UI.
+- A service dependency is checked once per publication epoch. Supervisors use
+  deferred-start plus exact-PID endpoint wait when they own the child. A child
+  activated behind an already-proven dependency performs at most one admitted
+  lookup and lets its bounded supervisor retry own transient failure; it may
+  not wrap a synchronous lookup in a yield/sleep retry loop.
+- A frame/present turn permits zero synchronous policy-service IPC. Display
+  submit is a direct capability-checked broker operation; provider policy,
+  catalog reads, console routing, filesystem access, and logging run outside
+  that turn. The CPU-side frame target is 8 ms and the completed frame limit is
+  16,667 us. Input arrival to visible cursor progress is capped at 50 ms.
+- Readiness check-arm-recheck may perform one query per distinct provider in
+  each scan. Duplicate FDs sharing one provider observation are deduplicated,
+  and every query uses the shorter of the remaining application deadline and
+  16 ms. A timeout cannot restart the whole scan or hide readiness already
+  found elsewhere.
+- Deferred VFS checkpoint/replay maintenance may consume at most one 1 ms
+  attempt at the start of a foreground VFS turn. It cannot drain a backlog in
+  an eight-request burst or synchronously chain a second checkpoint ACK;
+  successful replay enqueues that idempotent ACK for a later bounded turn.
+  Queue order and operation IDs retain recovery correctness while foreground
+  I/O has a fixed maintenance tax.
+- Performance diagnostics are bounded evidence: early-call samples and
+  threshold crossings only. They may not print per request, hold a policy
+  lock, allocate an unbounded record, or become a prerequisite for forward
+  progress.
+
 ## VFS Surface (`vfsd`)
 
 - Protocol: `VfsIpcRequest`/`VfsIpcResponse` (separate from `LinuxSyscallOffloadRequest`) for service-owned handles + chunked I/O.
@@ -645,10 +705,12 @@ policy remains with the owning service.
   archive decompressor, filesystem namespace, general path traversal, or
   mutable package policy.
 - The exact allowlist includes the minimal dynamic ELF runtime closure needed
-  before storage-DVM readiness (`/lib64/ld-linux-x86-64.so.2`, `libc.so.6`,
-  and `libgcc_s.so.1`) in addition to bootstrap services and registries.
-  Missing runtime members fail image staging; boot never falls through to a
-  physical controller or an unverified host filesystem.
+  before storage-DVM readiness (`/etc/ld.so.cache`,
+  `/lib64/ld-linux-x86-64.so.2`, `libc.so.6`, and `libgcc_s.so.1`) in addition
+  to bootstrap services and registries. The loader cache is part of this
+  closure so glibc's cache lookup cannot turn the first UI process into a
+  DVM-volume probe. Missing runtime members fail image staging; boot never
+  falls through to a physical controller or an unverified host filesystem.
 - The early-system module is a bootstrap capability, not a native-storage
   fallback. Once its manifest is admitted, rootd and loaderd may open only its
   exact entries until storaged publishes the DVM-backed root volume. Missing,
@@ -764,7 +826,10 @@ policy remains with the owning service.
 - AHCI admission includes the complete minimal Linux driver closure: `ahci`
   owns the PCI controller and signed `sd_mod` must publish its one whole-disk
   block namespace before the relay starts. NVMe uses its native namespace
-  driver directly. Missing class-driver or namespace publication fails closed.
+  driver directly. `ahci`, `libahci`, `libata`, `sd_mod`, `nvme`, and
+  `nvme-core` are signed modules, never built-in controller authority; the
+  `S12` storage bootstrap loads only the exact assigned PCI modalias closure.
+  Missing class-driver, signature, or namespace publication fails closed.
 - Completion authority binds the exact generation, request ID, operation ID,
   and slot. Successful reads report no durability. Successful FUA writes and
   FLUSH report the exact durable-through operation ID; ordinary writeback
@@ -836,6 +901,81 @@ policy remains with the owning service.
   proof in addition to both peer readiness flags and exact geometry.
   `cargo xtask kvm-smoke --timeout 30 --storage-dvm-only` is the independent
   acceptance gate; it cannot fail or pass because of a UI/GPU marker.
+- Storage transport availability is a separate state from the `storaged`
+  endpoint namespace publication. A registered endpoint proves only the exact
+  service owner and capability lease; it must not make a caller wait behind a
+  startup FLUSH or a different caller's `DVM_READY` wait. The startup E2E
+  proof remains generation-bound and mandatory for its acceptance gate, while
+  requests before that proof receive an explicit bounded not-ready result and
+  retry through their owning policy path. The early-system runtime/compositor
+  closure must not depend on that result: it is admitted from signed immutable
+  entries, and mutable applications or DVM-volume assets wait on their own
+  storage readiness. One response turn uses exactly the `INFO` generation that
+  matched the proof: metadata is built from that snapshot, and a stale read,
+  write, flush, or bulk-read argument returns `EAGAIN` before it can submit a
+  DVM ticket. If the sole readiness worker cannot start, storaged exits for
+  rootd revocation/restart rather than advertising an endpoint that can remain
+  not-ready indefinitely.
+- The Linux-DVM block relay starts immediately after the guest's module
+  admission turn (`S12` after Buildroot `S11modules`), before unrelated guest
+  network, display, and control-agent scripts. It still discovers exactly one
+  assigned AHCI/NVMe controller and admits the complete AHCI `sd_mod` closure
+  before opening the relay. The DVM build rejects a stale late-start script,
+  so a rootfs overlay change cannot silently re-serialize storage behind DHCP
+  or GPU startup.
+- A DVM image carrying GPU vendor modules, GPU firmware, Mesa/LLVM, and a
+  storage relay cannot satisfy the five-second mutable-volume readiness
+  requirement merely by reordering init scripts: kernel initramfs unpack is
+  itself before every service. The required bootstrap topology is therefore a
+  separate signed **storage-bootstrap DVM** with only the fixed block relay,
+  its exact AHCI/NVMe closure, the bounded block aperture, and the minimum
+  init/runtime dependencies. The full display/network DVM remains a separate
+  least-authority domain and cannot gate storage readiness. Each DVM has its
+  own image digest, launch secret/epoch, readiness generation, restart budget,
+  and revoke path; neither may borrow the other's device or controller
+  authority. A storage-bootstrap `READY` proves only its exact block DVM
+  identity, and RustOS still requires the generation-bound FLUSH completion
+  before mounting the mutable volume. A staging/validation implementation must
+  measure kernel-start-to-peer-ready independently, reject a five-second
+  breach, and prove that a display/network DVM restart neither revokes nor
+  stalls an already-live storage generation.
+- Boot diagnosis records kernel-stamped `dvm-block-transport-installed`,
+  `dvm-block-peer-ready`, and `dvm-block-first-completion` milestones together
+  with `ipc-service-capability-request`, `ipc-service-capability-reply`, and
+  `ipc-service-register`. These delimit transport admission, the first real
+  DVM completion, rootd capability latency, and endpoint publication without
+  treating debug print ordering as timing evidence. A UI-critical path above
+  five seconds is a failed performance acceptance result; the three-second
+  target is the optimization objective, not permission to bypass storage or
+  rootd authorization.
+- Physical display and storage device classes are signed loadable modules:
+  `i915`, `xe`, `amdgpu`, `nvidia-drm`, AHCI, and NVMe may be selected only by
+  a kernel-produced modalias for an assigned PCI function after the DVM is
+  live. The fixed QEMU bootstrap keeps only virtio display, block, input, and
+  network transports built in. Modularity is a lifecycle and authority
+  boundary, not permission to omit a supported vendor profile or to probe
+  unrelated devices; every packaged module remains signature-pinned and
+  artifact-verified, and NVIDIA UVM/compute stays outside the display DVM.
+- The schema-9 DVM boot artifact is one hash-bound `cpio.zst` initramfs. The
+  build uses deterministic zstd level 3 with one compression worker and the
+  kernel must advertise `CONFIG_RD_ZSTD`; an XZ artifact, schema-8 manifest,
+  stale alternate rootfs, or decompressor fallback is not launchable. This is
+  a boot-critical latency choice only: it does not weaken artifact hashing,
+  module signatures, device ownership, or the Linux/Windows application ABI.
+- The x86 arch default is only a configuration seed. Final DVM admission
+  rejects unrelated built-in driver families including wireless, PCMCIA,
+  software RAID/device-mapper, generic Ethernet vendors, sound, media, HID,
+  desktop input classes, disk/network filesystems, SELinux policy, kexec,
+  suspend, and hibernation. The fixed virtio bootstrap remains built in while
+  physical GPU and storage classes remain signed modules. A source change to
+  one external leaf module has its own Buildroot invalidation stamp and may
+  rebuild that module plus the rootfs, but never the host toolchain, Mesa,
+  LLVM, or unrelated services.
+- Runtime diagnostics are bounded observation, not an event transport. Uiserver
+  keeps its one-second aggregate heartbeat and bounded fault/cursor evidence,
+  but does not print a per-input-pulse line while a pointer moves. Input state
+  remains in the service-owned queue and its readiness generation; eliminating
+  that debug-console work cannot alter delivery, wake, or compositor policy.
 - Storaged may satisfy repeated FAT metadata and executable reads from at most
   eight validated 64-KiB read-ahead windows (512 KiB total), but it first
   revalidates live DVM geometry and the exact caller generation on every
@@ -846,21 +986,52 @@ policy remains with the owning service.
   submission. Transport-info failure also clears them. Cached bytes therefore
   cannot survive revoke, restart, or mutation, and the optimization adds no
   controller authority or hidden fallback to vfsd.
+- Vfsd's separate immutable file-byte cache is an admission-controlled
+  convenience cache, not a DVM-read substitute. It may materialize at most
+  one 16-MiB file within a 32-MiB total budget only for a zero-offset request
+  that covers that complete file. ELF headers, program-header probes, partial
+  sequential reads, and nonzero-offset reads must use the bounded FAT
+  range-read path instead. Thus a loader validation request for tens or
+  hundreds of bytes cannot silently turn into a complete executable transfer
+  across the block-DVM boundary; remount invalidation still clears every
+  materialized byte before a new generation is served. The already-open
+  read-only description's validated length bounds each range read and cache
+  decision, so vfsd must not re-open FAT metadata merely to serve a small
+  `pread`; reopen/metadata policy remains explicit at `openat` and remount.
+- The FAT adapter retains one clean logical-block scratch line across adjacent
+  small reads. Repeated directory-entry and FAT-chain reads within that block
+  therefore cause one DVM block RPC, not one RPC per parser fragment. A write
+  overlapping the line invalidates it before submission; a successful partial
+  read-modify-write republishes the updated line, while an error leaves it
+  invalid. This cache owns no dirty data and grants no authority beyond the
+  mounted block device.
 - Storaged invokes RustOS-private syscalls only through the raw
   `rustos-svc-runtime` entrypoints. A libc wrapper must not collapse raw
   negative results into `-1` plus TLS `errno`; transient `EAGAIN`, absence,
   revocation, timeout, and protocol failure remain distinct across the full
   kernel-to-vfsd path.
+- Storaged and vfsd each emit one diagnostic for a contiguous startup
+  `EAGAIN`/`ENODEV`/`ENOSYS` interval and reset that diagnostic state only after
+  one validated DVM or storaged reply. They never suppress envelope, binding,
+  I/O, or authorization errors. Runtimed keeps a DVM-not-ready launch entry
+  retryable and backs it off for 250 ms, so loader probes cannot flood the same
+  bounded transport or turn expected readiness into debug-console work while
+  the readiness owner is completing its proof.
 - Rootd's least-authority service graph contains the explicit
   `vfsd -> storaged` edge. Before storaged publication, lookup preserves the
   transient registry errno; denial preserves `EACCES`. Kernel lookup validates
   canonical error responses before applying success-only value invariants, so
   neither state can be fabricated as `EINVAL` and cached as permanent.
-- Runtimed keeps `uiserver` outside the early-system bootstrap image. A
-  transient loader or DVM-volume error schedules a bounded 500-ms supervisor
-  retry; only the existing permanent-launch errno set disables the entry.
-  Successful spawn ownership prevents duplicates while endpoint readiness is
-  pending.
+- The signed early-system closure includes the `uiserver` executable and its
+  already-required dynamic runtime, so the compositor can launch without a
+  cold DVM-volume read. This grants neither storage-controller nor display
+  authority to ring0: the DVM still owns the root volume and GPU/KMS provider,
+  and uiserver waits for its authenticated display contract. General apps,
+  WayClick, desktop assets, and mutable policy remain DVM-volume owned. A
+  transient loader or DVM display-provider error schedules a bounded 500-ms
+  supervisor retry; only the existing permanent-launch errno set disables the
+  entry. Successful spawn ownership prevents duplicates while endpoint
+  readiness is pending.
 - Design sources: Linux VFIO defines the IOMMU group as the minimum viable
   ownership unit (`https://docs.kernel.org/driver-api/vfio.html`);
   RFC 8032 defines the Ed25519 signature encoding and verification algorithm
@@ -1099,6 +1270,12 @@ committing a zero-filled file tail. The TLA+ models, source-level tests, and
 
 **ELF:** loaderd emits `PT_LOAD` mappings for main image + `PT_INTERP` via `MAP_FILE_BROKER`. Static-PIE biases: main = `PROC_BROKER_USER_SPACE_BASE + 0x0040_0000`, interpreter = `+ 0x0200_0000`. Must use `SYS_RUSTOS_PROC_SET_LINUX_RUNTIME_BROKER` for minimal launch metadata (entry, phdr, phnum, phent, brk_start, interpreter_base) — **not** raw blob streaming via `SET_IMAGE_BLOB_BROKER`. Kernel derives launch state from this metadata and the pre-built address space.
 
+The main ELF's admitted header, complete bounded program-header table, and
+derived load bias form one immutable loaderd admission snapshot for that open
+description. Segment mapping reuses it; it must not repeat the header/table
+`pread` and validation cycle after prepare. Interpreter admission remains
+independent because it owns a different open description and load bias.
+
 **PE64:** PE validation, section materialization, base relocation, import/export resolution, staged system-DLL registry lookup, PEB/TEB/runtime blob construction all happen in loaderd before commit. The bounded section-header table is fetched with one `pread64`, not one policy/VFS roundtrip per section. PE64 commit includes `SYS_RUSTOS_PROC_SET_WINDOWS_RUNTIME_BROKER` after all `MAP_DATA_BROKER` ops and before `COMMIT_BROKER`. Kernel validates metadata + spawns the materialized address space but **must not** reintroduce PE import/export/system-DLL policy.
 
 A prepared remote file mapping may use a larger internal copy buffer, but each
@@ -1136,15 +1313,15 @@ commit point.
 `LOADER_SPAWN_FLAG_IMMEDIATE_HANDOFF` remains an ABI option for a child with a
 pre-admitted ownership contract; it is not valid for normal supervised service
 bootstrap.
-Immediate handoff uses a spawn-specific scheduler hint that is consumed before
-generic IPC reply hints, so the loader's reply to the supervisor cannot
-overwrite the freshly-created child. The spawn broker must set this hint without
-requesting or taking a reschedule before returning to `loaderd`. Spawn handoff
-is an explicit bootstrap transfer and may be consumed by the next scheduler
-dispatch, including deferred syscall-exit dispatch; it may bypass the generic
-IPC strict-class guard, otherwise a ready System-class task can indefinitely
-defer a child-first handoff. A service that lacks a pre-admitted lease must not
-use this direct bootstrap handoff. IPC enqueue/reply
+Activation handoff uses a spawn-specific scheduler hint that is consumed before
+both bounded reply wakeups and generic IPC reply hints, so unrelated traffic
+cannot stretch a committed bootstrap. The spawn broker must set this hint
+without requesting or taking a reschedule before returning to `loaderd`. Spawn
+handoff is an explicit bootstrap transfer and may be consumed by the next
+scheduler dispatch, including deferred syscall-exit dispatch; it may bypass the
+generic IPC strict-class guard, otherwise a ready System-class task can
+indefinitely defer a child-first handoff. A service that lacks a pre-admitted
+lease must not use this direct bootstrap handoff. IPC enqueue/reply
 completion wakes the receiver/caller and may set a direct pick hint for any
 currently ready and
 schedulable target; already-runnable service endpoints still need a handoff when
@@ -1154,8 +1331,29 @@ reply wait before yielding so a fast service reply cannot race a not-yet-armed
 waiter. Generic IPC hints are caller-local and the newest eligible receiver
 replaces older generic hints, even across scheduling classes; stale high-class
 service hints must not block the service that the current caller is waiting on.
+A blocked caller's exact receiver handoff remains first because it is the
+causal path needed to unblock that caller. Outside that blocked-call case, a
+System continuation whose ready age reached the 10 ms recovery bound is
+selected before an unrelated generic IPC hint. The hint remains pending for
+the following dispatch. This ordering is required because loaderd can be
+preempted inside a bounded commit substrate operation while carrying a
+reply-scoped System donation; an unbounded stream of UI/network hints must not
+strand that continuation inside the kernel.
 A generic receiver hint is consumed when the server blocks or the scheduler
 next selects work; it must not switch away from a live syscall continuation.
+
+ELF file mappings cross the VFS/loader/process boundary only as one immutable
+executable snapshot. Vfsd reads the admitted file once into a bounded private
+memfd and applies
+`F_SEAL_WRITE|F_SEAL_GROW|F_SEAL_SHRINK|F_SEAL_SEAL` before publishing it.
+Loaderd validates every `PT_LOAD` range against that same sealed file and
+passes the snapshot plus original file offsets to the process broker; it does
+not reopen the pathname or duplicate segment bytes. The snapshot is bounded to
+128 MiB, and the process broker rejects live VFS handles and partially sealed
+memfds. Commit may allocate and copy page-table backing, but it must not issue
+nested vfsd/storage IPC or re-read a mutable path after validation. This closes
+the validation/commit content race, removes redundant storage reads, and keeps
+service-owned storage policy out of ring0.
 
 Every syscall captures the entering user's complete SIMD/FPU image in a
 syscall-scoped snapshot distinct from the scheduler's per-task SIMD slot. If a
@@ -1299,7 +1497,10 @@ they do not admit a service or a module-loading path.
 - Strict admission for bootstrap syscall/VFS/loader/process/pager brokers comes
   only from `rootd`'s fixed manifest. Dynamic package metadata cannot set
   `TASK_WEIGHT_INTERACTIVE_FLAG`; admitted ready brokers are covered by the
-  bounded System-class wait rail.
+  bounded System-class wait rail. In the non-blocked selection lane, an overdue
+  System continuation wins one turn before a generic IPC hint without
+  discarding that hint; otherwise reply floods can defeat the stated wait
+  bound even though each individual handoff is valid.
 - Privileged loader requests use service roles, never caller-supplied PIDs.
   `SPAWN_EXEC` requires the current rootd, initd, or sessiond endpoint owner;
   `EXEC_TARGET` requires procd. Initd's endpoint is identity-only and has no
@@ -1312,4 +1513,8 @@ they do not admit a service or a module-loading path.
   publishing the lease. Capability registration then independently requires
   the reported PID to own its endpoint; reporter exit revokes descendants.
 - `KernelSpinLock` must not be held across disk/filesystem/IPC/framebuffer-copy loops. Use `KernelWaitLock` or split the section; add `cond_resched` in long loops.
-- Boot service order: driver/input/storage policy services before UI launchers. `runtimed` waits on `devmgrd` and `storaged` endpoints before UI bootstrap.
+- Boot service order separates UI-core liveness from mutable-volume readiness.
+  `runtimed` waits on the foundation, `netd`, `devmgrd`, and `inputd`; it does
+  not wait for `storaged`, because its signed early-system closure contains the
+  first compositor and runtime registries. Applications, assets, and other
+  mutable DVM-volume paths remain storage-gated by their owning policy flow.

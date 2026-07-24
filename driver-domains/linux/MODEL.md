@@ -37,7 +37,7 @@ connected DRM connector are unconditional assignment failures, even if an
 operator omitted that BDF from the plan's protected set. Activated acquisition
 repeats the live check after durable prepare and immediately before unbind.
 `rustos-hostd preflight-physical` additionally verifies the exact production
-QEMU, display-only policy, schema-8 bundle, writable `/dev/iommu`, and a
+QEMU, display-only policy, schema-9 bundle, writable `/dev/iommu`, and a
 successful empty-IOAS allocate/destroy ioctl probe without changing a binding.
 It also requires a 4 GiB soft `RLIMIT_MEMLOCK` budget before any VFIO mutation,
 covering the fixed 2 GiB guest RAM, display backing, and bounded pinning
@@ -306,7 +306,7 @@ kernel flavor, and the NVIDIA userspace graphics stack are absent. The init
 service loads only a kernel-produced display-class PCI modalias and refuses the
 relay if NVIDIA KMS does not initialize completely. Firmware redistribution
 authorization and target-hardware evidence remain mandatory release gates.
-Artifact-manifest schema 8 makes this supply contract executable. Its exact
+Artifact-manifest schema 9 makes this supply contract executable. Its exact
 25-key vocabulary pins Buildroot 2026.05, Linux 6.12.94, NVIDIA-open 580.173.02,
 the source and boot-artifact hashes, the allowed display modules, redistribution
 posture, the enforced module-signing policy, its certificate, the exact kernel
@@ -348,12 +348,12 @@ and runtime evidence.
 
 `rustos_linux_dvm_x86_64_defconfig` is a display-DVM plus virtual
 net/USB/auxiliary-storage baseline. It may own a dedicated assigned GPU, but is
-not a host-primary-GPU or boot-disk profile. Manifest schema 8 exposes the
+not a host-primary-GPU or boot-disk profile. Manifest schema 9 exposes the
 exact NVIDIA release digest, non-redistribution status, and admitted KMS module
 set in addition to binding the complete source lock and the certificate for
 the kernel-enforced signed-module policy. Release images must pin the kernel,
 module set, firmware bundle, signed module admission policy, and source/artifact
-manifest for each supported hardware profile. Schema 8 currently provides the
+manifest for each supported hardware profile. Schema 9 currently provides the
 locked source/artifact manifest only; it does not claim a CycloneDX SBOM or
 Buildroot `legal-info` bundle.
 

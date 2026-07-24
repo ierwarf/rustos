@@ -4,7 +4,8 @@ const MAX_POLL_FDS: usize = 1024;
 const POLLFD_SIZE: usize = size_of::<linux_abi::LinuxPollFd>();
 const EPOLL_EVENT_SIZE: usize = size_of::<linux_abi::LinuxEpollEvent>();
 const WAITSET_INTEREST_SIZE: usize = size_of::<WaitSetInterestWire>();
-const WAITSET_PROVIDER_QUERY_TIMEOUT_MS: u64 = 16;
+const WAITSET_PROVIDER_QUERY_TIMEOUT_MS: u64 =
+    rustos_user_abi::performance::IPC_READINESS_QUERY_HARD_LIMIT_MS;
 
 fn decode_pollfd(bytes: &[u8]) -> Result<(i32, u32), i64> {
     let fd_bytes: [u8; 4] = bytes

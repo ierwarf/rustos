@@ -589,18 +589,14 @@ pub(crate) fn profile_line(message: &str) {
     if !ui_profile_enabled() {
         return;
     }
-    // The profile path is only enabled by the KVM acceptance harness. It is
-    // deliberately emitted by the interactive loop itself, after the frame
-    // accounting lock has been released: a User-class relay can legitimately
-    // be starved by a bounded System-class workload under strict priority
-    // scheduling, which would make an otherwise live UI unverifiable.
-    //
-    // `debug_line` maps to the kernel's try-lock debugcon sink. It never
-    // waits for a competing logger; a contended attempt is dropped and the
-    // next one-second proof window retries. Thus profiling cannot block a
-    // present or mutate production behaviour, while the harness still fails
-    // closed if it cannot collect all required windows.
-    debug_line(message);
+    // The profile path is enabled only by the KVM acceptance harness and is
+    // emitted after the accounting lock is released. Use the bounded,
+    // nonblocking diagnostics queue instead of the kernel debugcon try-lock:
+    // sustained cursor/present traffic can make every immediately-adjacent
+    // try-lock sample lose while ordinary heartbeats happen to land between
+    // writers. Queue saturation still fails closed at the harness, but
+    // contention no longer fabricates a missing one-second profile stream.
+    diag_line(message.to_string());
 }
 
 /// Production liveness telemetry. It cannot wait behind diagnostics: strict

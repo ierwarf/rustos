@@ -19,11 +19,17 @@ readonly BUILD_DIR="$OUT_DIR/buildroot-output"
 readonly ARTIFACT_DIR="$OUT_DIR/artifacts"
 readonly DEV_OUTPUT_MARKER="$BUILD_DIR/.rustos-dvm-dev-output-v1"
 readonly LIBELF_SYSROOT="${RUSTOS_DVM_LIBELF_SYSROOT:-}"
+readonly DVM_CCACHE_DIR="${RUSTOS_DVM_CCACHE_DIR:-$OUT_DIR/ccache}"
 BUILDROOT_DIR=""
 LIBELF_INCLUDE_DIR=""
 LIBELF_LIBRARY_DIR=""
 HOST_TOOL_DIR="$OUT_DIR/host-tools"
 readonly BUILD_LOCK_FILE="$ROOT/.rustos-dvm-build.lock"
+export CCACHE_DIR="$DVM_CCACHE_DIR"
+# Buildroot's setlocalversion runs from the vendored source below this checkout.
+# Do not let it climb into RustOS's worktree and refresh the unrelated parent
+# Git index on every config probe. Package-local repositories remain visible.
+export GIT_CEILING_DIRECTORIES="$(cd -- "$ROOT/../.." && pwd -P)"
 
 die() {
     echo "rustos-linux-dvm: $*" >&2
@@ -159,12 +165,9 @@ structural_config_input_hash() {
     (
         cd "$ROOT"
         # Only source/toolchain identities that cannot be reconciled from the
-        # generated BR2_* map belong here.  Linux and AMD firmware are handled
-        # by narrower lanes; the unchanged NVIDIA policy remains conservative.
-        find package/rustos-dvm-nvidia-open -type f -print0 | sort -z | xargs -0 sha256sum
-        printf '%s\n' \
-            "$BUILDROOT_VERSION" "$BUILDROOT_SHA256" \
-            "$NVIDIA_OPEN_VERSION" "$NVIDIA_OPEN_SHA256"
+        # generated BR2_* map belong here. Linux, firmware, and external
+        # device-class modules have narrower invalidation lanes below.
+        printf '%s\n' "$BUILDROOT_VERSION" "$BUILDROOT_SHA256"
     ) | sha256sum | awk '{print $1}'
 }
 
@@ -193,11 +196,11 @@ render_desired_config() {
     probe="$(mktemp -d "$OUT_DIR/config-probe.XXXXXX")"
     result=0
     make -C "$BUILDROOT_DIR" O="$probe" \
-        BR2_EXTERNAL="$ROOT" BR2_DL_DIR="$DL_DIR" \
+        BR2_EXTERNAL="$ROOT" BR2_DL_DIR="$DL_DIR" BR2_LOCALVERSION= \
         rustos_linux_dvm_x86_64_defconfig >/dev/null || result=$?
     if test "$result" -eq 0; then
         make -C "$BUILDROOT_DIR" O="$probe" \
-            BR2_EXTERNAL="$ROOT" BR2_DL_DIR="$DL_DIR" \
+            BR2_EXTERNAL="$ROOT" BR2_DL_DIR="$DL_DIR" BR2_LOCALVERSION= \
             olddefconfig >/dev/null || result=$?
     fi
     if test "$result" -eq 0; then
@@ -249,6 +252,12 @@ config_change_preserves_host_toolchain() {
                         key == "BR2_EXTERNAL_RUSTOS_LINUX_DVM_VERSION") {
                         continue
                     }
+                    if ((key == "BR2_TARGET_ROOTFS_CPIO_XZ" &&
+                         before[key] == "y" && after[key] == "n") ||
+                        (key == "BR2_TARGET_ROOTFS_CPIO_ZSTD" &&
+                         before[key] == "n" && after[key] == "y")) {
+                        continue
+                    }
                     if (!(key in admitted) || before[key] != "n" || after[key] != "y") {
                         exit 1
                     }
@@ -259,6 +268,8 @@ config_change_preserves_host_toolchain() {
                     changes++
                     if (key == "BR2_ROOTFS_POST_BUILD_SCRIPT" ||
                         key == "BR2_EXTERNAL_RUSTOS_LINUX_DVM_VERSION") continue
+                    if (key == "BR2_TARGET_ROOTFS_CPIO_ZSTD" &&
+                        after[key] == "y") continue
                     if (!(key in admitted) || after[key] != "y") exit 1
                 }
             }
@@ -319,6 +330,19 @@ selftest_config_cache_policy() {
         'BR2_TOOLCHAIN_BUILDROOT_MUSL=y' >"$desired"
     config_change_preserves_host_toolchain "$previous" "$desired" \
         || die "external metadata version change did not preserve the cache"
+    printf '%s\n' \
+        'BR2_TARGET_ROOTFS_CPIO_XZ=y' \
+        '# BR2_TARGET_ROOTFS_CPIO_ZSTD is not set' \
+        'BR2_TOOLCHAIN_BUILDROOT_MUSL=y' >"$previous"
+    printf '%s\n' \
+        '# BR2_TARGET_ROOTFS_CPIO_XZ is not set' \
+        'BR2_TARGET_ROOTFS_CPIO_ZSTD=y' \
+        'BR2_TOOLCHAIN_BUILDROOT_MUSL=y' >"$desired"
+    config_change_preserves_host_toolchain "$previous" "$desired" \
+        || die "xz-to-zstd rootfs transition did not preserve the cache"
+    if config_change_preserves_host_toolchain "$desired" "$previous"; then
+        die "zstd-to-xz rootfs downgrade incorrectly preserved the cache"
+    fi
 
     cp -- "$ROOT/board/linux.fragment" "$tmp/linux.fragment"
     kernel_before="$(kernel_config_input_hash "$tmp/linux.fragment")"
@@ -350,6 +374,15 @@ local_service_input_hash() {
     ) | sha256sum | awk '{print $1}'
 }
 
+nvidia_module_input_hash() {
+    (
+        cd "$ROOT"
+        find package/rustos-dvm-nvidia-open -type f ! -name Config.in -print0 |
+            sort -z | xargs -0 sha256sum
+        printf '%s\n' "$NVIDIA_OPEN_VERSION" "$NVIDIA_OPEN_SHA256"
+    ) | sha256sum | awk '{print $1}'
+}
+
 overlay_input_hash() {
     (
         cd "$ROOT"
@@ -365,6 +398,8 @@ amdgpu_firmware_input_hash() {
         cd "$ROOT"
         sha256sum board/amdgpu-firmware-1002-1900.txt
         LC_ALL=C grep '^AMDGPU_.*_SHA256=' sources.lock
+        LC_ALL=C grep -E '^BR2_PACKAGE_LINUX_FIRMWARE_(AMDGPU|I915|XE)=y$' \
+            configs/rustos_linux_dvm_x86_64_defconfig
     ) | sha256sum | awk '{print $1}'
 }
 
@@ -441,22 +476,22 @@ write_stamp() {
 
 make_buildroot() {
     make -C "$BUILDROOT_DIR" O="$BUILD_DIR" \
-        BR2_EXTERNAL="$ROOT" BR2_DL_DIR="$DL_DIR" "$@"
+        BR2_EXTERNAL="$ROOT" BR2_DL_DIR="$DL_DIR" BR2_LOCALVERSION= "$@"
+}
+
+invalidate_rootfs_image() {
+    rm -f -- \
+        "$BUILD_DIR/images/rootfs.cpio" \
+        "$BUILD_DIR/images/rootfs.cpio.xz" \
+        "$BUILD_DIR/images/rootfs.cpio.zst"
 }
 
 make_release_rootfs() {
-    local xz_threads=$JOBS
-
-    # Buildroot deliberately disables threaded xz for reproducible builds
-    # because its default block size depends on compression settings and host
-    # parallelism.  Fixing the block size makes the stream independent of the
-    # worker count while retaining the existing .cpio.xz boot/artifact ABI.
-    # +1 requests the multi-threaded stream format even on a one-job builder.
-    if test "$xz_threads" -eq 1; then
-        xz_threads=+1
-    fi
+    # Initramfs decompression is on the boot critical path. A fixed single
+    # worker keeps the zstd frame reproducible across developer machines;
+    # level 3 favors sub-five-second boot over a marginally smaller artifact.
     make_buildroot -j "$JOBS" \
-        "ROOTFS_CPIO_COMPRESS_CMD=xz -T $xz_threads --block-size=4MiB --memlimit-compress=70% -1 -C crc32 -c"
+        "ROOTFS_CPIO_COMPRESS_CMD=zstd -3 -q -f -T1 -c"
 }
 
 require_warm_dvm_configuration() {
@@ -508,6 +543,7 @@ print_build_plan() {
     local structural_stamp="$BUILD_DIR/.rustos-structural-config-input-v2.sha256"
     local kernel_stamp="$BUILD_DIR/.rustos-kernel-config-input-v1.sha256"
     local firmware_stamp="$BUILD_DIR/.rustos-amdgpu-firmware-input-v1.sha256"
+    local nvidia_stamp="$BUILD_DIR/.rustos-nvidia-module-input-v1.sha256"
     local desired
     local service
     local service_stamp
@@ -573,6 +609,11 @@ print_build_plan() {
         printf 'lane=linux-firmware-reinstall+rootfs\n'
         lane_count=$((lane_count + 1))
     fi
+    if ! test -f "$nvidia_stamp" \
+        || test "$(cat "$nvidia_stamp")" != "$(nvidia_module_input_hash)"; then
+        printf 'lane=rustos-dvm-nvidia-open+rootfs\n'
+        lane_count=$((lane_count + 1))
+    fi
     if ! test -f "$BUILD_DIR/.rustos-overlay-input.sha256" \
         || test "$(cat "$BUILD_DIR/.rustos-overlay-input.sha256")" != "$(overlay_input_hash)"; then
         printf 'lane=rootfs-overlay-or-policy\n'
@@ -621,7 +662,8 @@ configure() {
             fi
             if config_change_preserves_host_toolchain "$BUILD_DIR/.config" "$desired"; then
                 cp -- "$desired" "$BUILD_DIR/.config"
-                rm -f -- "$desired" "$BUILD_DIR/images/rootfs.cpio.xz"
+                rm -f -- "$desired"
+                invalidate_rootfs_image
                 make_buildroot olddefconfig >/dev/null
                 write_stamp "$stamp" "$current"
                 write_stamp "$structural_stamp" "$current_structural"
@@ -651,6 +693,8 @@ prepare_mutable_inputs() {
     local target_modules="$BUILD_DIR/target/lib/modules/${LINUX_VERSION}"
     local firmware_stamp="$BUILD_DIR/.rustos-amdgpu-firmware-input-v1.sha256"
     local firmware_current
+    local nvidia_stamp="$BUILD_DIR/.rustos-nvidia-module-input-v1.sha256"
+    local nvidia_current
     local overlay_stamp="$BUILD_DIR/.rustos-overlay-input.sha256"
     local overlay_files_stamp="$BUILD_DIR/.rustos-overlay-files-v1"
     local overlay_current
@@ -660,10 +704,11 @@ prepare_mutable_inputs() {
 
     kernel_current="$(kernel_config_input_hash)"
     firmware_current="$(amdgpu_firmware_input_hash)"
+    nvidia_current="$(nvidia_module_input_hash)"
     overlay_current="$(overlay_input_hash)"
 
-    # Linux Kconfig changes invalidate only Linux and the two packages that
-    # produce modules signed by that kernel build.  Removing the old module
+    # Linux Kconfig changes invalidate only Linux and the packages that produce
+    # modules signed by that kernel build. Removing the old module
     # directory prevents a stale signed object from surviving target-finalize.
     # The NVIDIA package is rebuilt unchanged solely because its module must be
     # signed against the new kernel; no NVIDIA source or device state is edited.
@@ -676,7 +721,7 @@ prepare_mutable_inputs() {
             make_buildroot rustos-dvm-nvidia-open-dirclean
             rm -rf -- "$target_modules"
         fi
-        rm -f -- "$BUILD_DIR/images/rootfs.cpio.xz"
+        invalidate_rootfs_image
     fi
 
     # SITE_METHOD=local is intentionally explicit: Buildroot does not watch
@@ -691,6 +736,17 @@ prepare_mutable_inputs() {
         fi
     done
 
+    # The external NVIDIA display module is a leaf package built against the
+    # already-selected kernel. Its source, version, or firmware update must not
+    # discard the host toolchain or rebuild unrelated DVM services.
+    if ! test -f "$nvidia_stamp" \
+        || test "$(cat "$nvidia_stamp")" != "$nvidia_current"; then
+        if test -d "$BUILD_DIR/build/rustos-dvm-nvidia-open-${NVIDIA_OPEN_VERSION}"; then
+            make_buildroot rustos-dvm-nvidia-open-dirclean
+        fi
+        invalidate_rootfs_image
+    fi
+
     # The post-build policy prunes linux-firmware in target/ to the sealed AMD
     # profile. If that profile later gains a required payload, regenerating the
     # rootfs alone cannot restore the file that was already deleted from the
@@ -704,7 +760,7 @@ prepare_mutable_inputs() {
             grep -q .; then
             make_buildroot linux-firmware-reinstall
         fi
-        rm -f -- "$BUILD_DIR/images/rootfs.cpio.xz"
+        invalidate_rootfs_image
     fi
 
     # An overlay change must produce a new initramfs even when no package
@@ -715,7 +771,7 @@ prepare_mutable_inputs() {
         || ! test -f "$overlay_stamp" \
         || test "$(cat "$overlay_stamp")" != "$overlay_current"; then
         sync_rootfs_overlay
-        rm -f -- "$BUILD_DIR/images/rootfs.cpio.xz"
+        invalidate_rootfs_image
     fi
 }
 
@@ -724,6 +780,8 @@ commit_mutable_input_stamps() {
     for service in rustos-dvm-agent rustos-dvm-block rustos-dvm-display rustos-dvm-net; do
         write_stamp "$BUILD_DIR/.${service}-input-v1.sha256" "$(local_service_input_hash "$service")"
     done
+    write_stamp "$BUILD_DIR/.rustos-nvidia-module-input-v1.sha256" \
+        "$(nvidia_module_input_hash)"
     write_stamp "$BUILD_DIR/.rustos-overlay-input.sha256" "$(overlay_input_hash)"
     write_stamp "$BUILD_DIR/.rustos-amdgpu-firmware-input-v1.sha256" \
         "$(amdgpu_firmware_input_hash)"
@@ -738,6 +796,19 @@ verify_config() {
 verify_kernel_config() {
     local config="$BUILD_DIR/build/linux-${LINUX_VERSION}/.config"
     "$ROOT/scripts/verify-kernel-config.sh" "$config"
+}
+
+verify_dvm_bootstrap_order() {
+    local init_dir="$BUILD_DIR/target/etc/init.d"
+    local block_start="$init_dir/S12rustos-dvm-block"
+
+    # Storage is independent of guest networking, display composition, and
+    # control-agent startup. It must start immediately after Buildroot's
+    # module-admission turn, while stale late-start names fail closed.
+    test -f "$block_start" && test -x "$block_start" && test ! -L "$block_start" || \
+        die "DVM storage bootstrap script is missing or symlinked"
+    test ! -e "$init_dir/S47rustos-dvm-block" || \
+        die "DVM storage relay must not wait behind guest networking"
 }
 
 verify_module_signatures() {
@@ -764,6 +835,7 @@ build() {
     make_release_rootfs
     verify_config
     verify_kernel_config
+    verify_dvm_bootstrap_order
     verify_module_signatures
     write_manifest
     verify_release_artifacts
@@ -782,10 +854,11 @@ rebuild_service() {
     configure
     verify_config
     make_buildroot "${service}-dirclean"
-    rm -f -- "$BUILD_DIR/images/rootfs.cpio.xz"
+        invalidate_rootfs_image
     make_release_rootfs
     verify_config
     verify_kernel_config
+    verify_dvm_bootstrap_order
     verify_module_signatures
     write_manifest
     verify_release_artifacts
@@ -804,7 +877,7 @@ dev_build_service() {
     require_warm_dvm_configuration
     # SITE_METHOD=local snapshots source during extraction. Removing only this
     # package refreshes that snapshot, compiles it, and installs it into
-    # target/. It does not regenerate rootfs.cpio.xz or release artifacts.
+    # target/. It does not regenerate rootfs.cpio.zst or release artifacts.
     make_buildroot "${service}-dirclean"
     make_buildroot -j "$JOBS" "$service"
     mark_dev_output_dirty "$service"
@@ -909,6 +982,7 @@ main() {
             assert_release_output_is_current
             verify_config
             verify_kernel_config
+            verify_dvm_bootstrap_order
             verify_module_signatures
             verify_release_artifacts
             ;;

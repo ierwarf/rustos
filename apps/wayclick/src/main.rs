@@ -147,6 +147,9 @@ fn main() {
     raw_stderr_line("wayclick: main enter");
     install_panic_hook();
     raw_stderr_line("wayclick: panic hook installed");
+    if profile_enabled() {
+        raw_stderr_line("wayclick: acceptance profile enabled");
+    }
     let conn = match connect_wayland_with_retry() {
         Ok(conn) => conn,
         Err(err) => {

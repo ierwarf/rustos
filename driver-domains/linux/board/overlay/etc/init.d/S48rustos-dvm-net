@@ -79,7 +79,6 @@ wait_gpu_pipeline_prime() {
 
 load_display_drivers() {
     device=
-    vendor=
     class=
     alias=
 

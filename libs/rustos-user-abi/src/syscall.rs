@@ -291,6 +291,11 @@ pub const VFS_IPC_OP_CURSOR_SETTLE: u16 = 24;
 /// Acknowledge visibility of a successful tombstoning mutation so vfsd may
 /// reclaim its durable replay record without breaking response-loss retries.
 pub const VFS_IPC_OP_CHECKPOINT_ACK: u16 = 25;
+/// Private loaderd-to-vfsd request for an immutable, terminally sealed file
+/// snapshot. The returned memfd is transferred out-of-band with the reply;
+/// this operation is never exposed as a Linux filesystem syscall.
+pub const VFS_EXECUTABLE_SNAPSHOT_ABI_VERSION: u16 = 1;
+pub const VFS_EXECUTABLE_SNAPSHOT_OP_OPEN: u16 = 1;
 pub const VFS_CURSOR_SETTLE_COMMIT: u64 = 1;
 pub const VFS_CURSOR_SETTLE_CANCEL: u64 = 2;
 pub const VFS_POLL_QUERY_POLL: u64 = 1;
@@ -1359,6 +1364,48 @@ pub struct DvmBlockInfoWire {
     pub physical_block_size: u32,
     pub flags: u32,
     pub reserved0: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VfsExecutableSnapshotRequest {
+    pub version: u16,
+    pub op: u16,
+    pub flags: u32,
+    pub requester_pid: u64,
+    pub requester_tid: u64,
+    pub max_bytes: u64,
+    pub path_len: u32,
+    pub reserved0: u32,
+    pub path: [u8; VFS_IPC_PATH_CAPACITY],
+}
+
+impl Default for VfsExecutableSnapshotRequest {
+    fn default() -> Self {
+        Self {
+            version: VFS_EXECUTABLE_SNAPSHOT_ABI_VERSION,
+            op: VFS_EXECUTABLE_SNAPSHOT_OP_OPEN,
+            flags: 0,
+            requester_pid: 0,
+            requester_tid: 0,
+            max_bytes: 0,
+            path_len: 0,
+            reserved0: 0,
+            path: [0; VFS_IPC_PATH_CAPACITY],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct VfsExecutableSnapshotResponse {
+    pub version: u16,
+    pub op: u16,
+    pub status: i32,
+    pub reserved0: u32,
+    pub reserved1: u32,
+    pub file_bytes: u64,
+    pub mount_generation: u64,
 }
 
 #[repr(C)]
@@ -2741,9 +2788,10 @@ mod syscall_tests {
         SYSCALL_OFFLOAD_OP_LINUX_ARCH_PRCTL_POLICY, SYSCALL_OFFLOAD_OP_LINUX_MPROTECT,
         SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET, SYSCALL_OFFLOAD_OP_LINUX_STATX,
         SYSCALL_OFFLOAD_PATH_CAPACITY, SYSCALL_OFFLOAD_PAYLOAD_CAPACITY, StoragedBulkReadResponse,
-        VFS_IPC_ABI_VERSION, VFS_IPC_OP_OPENAT, VFS_IPC_PAYLOAD_CAPACITY,
-        VFS_IPC_RESPONSE_HEADER_BYTES, VfsIpcRequest, VfsIpcResponse, identity_is_exact_sender,
-        loader_service_role_allows_operation,
+        VFS_EXECUTABLE_SNAPSHOT_ABI_VERSION, VFS_EXECUTABLE_SNAPSHOT_OP_OPEN, VFS_IPC_ABI_VERSION,
+        VFS_IPC_OP_OPENAT, VFS_IPC_PAYLOAD_CAPACITY, VFS_IPC_RESPONSE_HEADER_BYTES,
+        VfsExecutableSnapshotRequest, VfsExecutableSnapshotResponse, VfsIpcRequest, VfsIpcResponse,
+        identity_is_exact_sender, loader_service_role_allows_operation,
     };
 
     #[test]
@@ -2880,6 +2928,8 @@ mod syscall_tests {
         assert!(size_of::<LinuxSyscallOffloadRequest>() <= IPC_MAX_INLINE_BYTES);
         assert!(size_of::<LinuxSyscallOffloadResponse>() <= IPC_MAX_INLINE_BYTES);
         assert!(size_of::<VfsIpcRequest>() <= IPC_MAX_INLINE_BYTES);
+        assert!(size_of::<VfsExecutableSnapshotRequest>() <= IPC_MAX_INLINE_BYTES);
+        assert!(size_of::<VfsExecutableSnapshotResponse>() <= IPC_MAX_INLINE_BYTES);
         assert_eq!(
             core::mem::offset_of!(VfsIpcResponse, payload),
             VFS_IPC_RESPONSE_HEADER_BYTES
@@ -2919,6 +2969,13 @@ mod syscall_tests {
         assert_eq!(vfs_response.version, VFS_IPC_ABI_VERSION);
         assert_eq!(vfs_response.op, VFS_IPC_OP_OPENAT);
         assert_eq!(vfs_response.reserved0, 0);
+
+        let snapshot_request = VfsExecutableSnapshotRequest::default();
+        assert_eq!(
+            snapshot_request.version,
+            VFS_EXECUTABLE_SNAPSHOT_ABI_VERSION
+        );
+        assert_eq!(snapshot_request.op, VFS_EXECUTABLE_SNAPSHOT_OP_OPEN);
     }
 
     #[test]

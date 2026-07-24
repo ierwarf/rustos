@@ -78,9 +78,44 @@ CONFIG_BRIDGE=m
 CONFIG_VLAN_8021Q=m
 CONFIG_SCSI=y
 CONFIG_BLK_DEV_SD=m
+# Physical storage controllers are assigned after the initramfs is live.
+# Keep their device-class drivers signed and modular so the storage bootstrap
+# admits only the exact PCI modalias closure selected by S12.
+CONFIG_ATA=m
+CONFIG_SATA_AHCI=m
 CONFIG_BLK_DEV_NVME=m
 CONFIG_USB=y
 CONFIG_USB_XHCI_HCD=m
 CONFIG_USB_STORAGE=m
 CONFIG_SERIAL_8250=y
 CONFIG_SERIAL_8250_CONSOLE=y
+
+# This image is a sealed driver-domain appliance, not a general-purpose Linux
+# distribution. Keep only the virtio and assigned-device paths above. These
+# broad arch-defconfig families otherwise compile hundreds of unrelated
+# drivers into ring 3, enlarge the initramfs, and expose dormant guest ABIs.
+# CONFIG_WIRELESS is not set
+# CONFIG_CFG80211 is not set
+# CONFIG_MAC80211 is not set
+# CONFIG_RFKILL is not set
+# CONFIG_WLAN is not set
+# CONFIG_PCCARD is not set
+# CONFIG_MD is not set
+# CONFIG_ETHERNET is not set
+# CONFIG_SOUND is not set
+# CONFIG_MEDIA_SUPPORT is not set
+# CONFIG_HID is not set
+# CONFIG_USB_HID is not set
+# CONFIG_I2C_HID is not set
+# CONFIG_INPUT_KEYBOARD is not set
+# CONFIG_INPUT_MOUSE is not set
+# CONFIG_INPUT_JOYSTICK is not set
+# CONFIG_INPUT_TABLET is not set
+# CONFIG_INPUT_TOUCHSCREEN is not set
+# CONFIG_EXT4_FS is not set
+# CONFIG_NETWORK_FILESYSTEMS is not set
+# CONFIG_NET_9P is not set
+# CONFIG_SECURITY_SELINUX is not set
+# CONFIG_KEXEC is not set
+# CONFIG_HIBERNATION is not set
+# CONFIG_SUSPEND is not set

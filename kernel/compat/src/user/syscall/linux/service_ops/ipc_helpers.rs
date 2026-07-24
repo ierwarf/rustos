@@ -11,9 +11,9 @@ const MAX_SLOW_SERVICE_CALL_LOGS: usize = 128;
 // a wedged inputd cannot freeze uiserver's input loop for the generic service
 // IPC deadline. Stateful authorize/read calls retain their completion wait
 // until the ABI carries a cancellable authorization lease.
-const INPUTD_READINESS_IPC_TIMEOUT_MS: u64 = 16;
 const PENDING_VFS_MUTATION_CAPACITY: usize = 32 * 1024;
 const PENDING_VFS_PAYLOAD_CAPACITY: usize = 64;
+const FOREGROUND_VFS_MAINTENANCE_ATTEMPTS: usize = 1;
 
 #[derive(Clone)]
 struct PendingVfsMutation {
@@ -302,7 +302,11 @@ pub fn new_procd_request(op: u16) -> ProcdIpcRequest {
 
 pub fn call_procd(request: &ProcdIpcRequest) -> Result<ProcdIpcResponse, i64> {
     let start_ticks = crate::arch::rtc::ticks();
-    let response = ipc_ops::call_service_endpoint(IPC_SERVICE_PROCD, as_bytes(request))?;
+    let response = ipc_ops::call_service_endpoint_with_class(
+        IPC_SERVICE_PROCD,
+        as_bytes(request),
+        ipc_ops::ServiceIpcClass::BootControl,
+    )?;
     if response.len() != size_of::<ProcdIpcResponse>() {
         return Err(LINUX_EINVAL);
     }
@@ -480,12 +484,17 @@ fn call_vfs_ipc_request_impl(
         let attempt_timeout_ms =
             total_timeout_ms.map(|total| split_retry_timeout_ms(total, attempts, attempt));
         let result = match attempt_timeout_ms {
-            Some(timeout_ms) => ipc_ops::call_service_endpoint_with_timeout(
+            Some(timeout_ms) => ipc_ops::call_service_endpoint_with_class_deadline(
                 IPC_SERVICE_VFSD,
                 as_bytes(request),
+                ipc_ops::ServiceIpcClass::BulkData,
                 timeout_ms,
             ),
-            None => ipc_ops::call_service_endpoint(IPC_SERVICE_VFSD, as_bytes(request)),
+            None => ipc_ops::call_service_endpoint_with_class(
+                IPC_SERVICE_VFSD,
+                as_bytes(request),
+                ipc_ops::ServiceIpcClass::BulkData,
+            ),
         };
         match result {
             Ok(bytes) => {
@@ -556,21 +565,13 @@ fn vfs_checkpoint_ack_required(request: &VfsIpcRequest) -> bool {
 }
 
 fn acknowledge_vfs_checkpoint_mutation(original: &VfsIpcRequest) -> Result<(), i64> {
-    let mut ack = new_vfs_request(VFS_IPC_OP_CHECKPOINT_ACK);
-    ack.remote_id = original.remote_id;
-    ack.arg0 = original.operation_hi;
-    ack.arg1 = original.operation_lo;
-    ack.arg2 = u64::from(original.op);
-    ack.arg3 = if original.op == VFS_IPC_OP_POLL_QUERY {
-        original.arg0
-    } else {
-        0
-    };
+    let ack = vfs_checkpoint_ack_request(original);
     let mut last_errno = LINUX_ETIMEDOUT;
     for attempt in 0..3 {
-        match ipc_ops::call_service_endpoint_with_timeout(
+        match ipc_ops::call_service_endpoint_with_class_deadline(
             IPC_SERVICE_VFSD,
             as_bytes(&ack),
+            ipc_ops::ServiceIpcClass::ReadinessQuery,
             split_retry_timeout_ms(16, 3, attempt),
         ) {
             Ok(bytes) if bytes.len() == size_of::<VfsIpcResponse>() => {
@@ -592,6 +593,20 @@ fn acknowledge_vfs_checkpoint_mutation(original: &VfsIpcRequest) -> Result<(), i
     }
     enqueue_pending_vfs_mutation(&ack)?;
     Err(last_errno)
+}
+
+fn vfs_checkpoint_ack_request(original: &VfsIpcRequest) -> VfsIpcRequest {
+    let mut ack = new_vfs_request(VFS_IPC_OP_CHECKPOINT_ACK);
+    ack.remote_id = original.remote_id;
+    ack.arg0 = original.operation_hi;
+    ack.arg1 = original.operation_lo;
+    ack.arg2 = u64::from(original.op);
+    ack.arg3 = if original.op == VFS_IPC_OP_POLL_QUERY {
+        original.arg0
+    } else {
+        0
+    };
+    ack
 }
 
 pub fn settle_vfs_cursor_mutation(prepared: &VfsIpcRequest, commit: bool) -> Result<(), i64> {
@@ -647,7 +662,10 @@ fn enqueue_pending_vfs_mutation(request: &VfsIpcRequest) -> Result<(), i64> {
 }
 
 fn drain_pending_vfs_mutations() {
-    for _ in 0..8 {
+    // Deferred recovery cannot multiply one foreground read/open into eight
+    // independent 16 ms waits. One one-millisecond replay turn preserves
+    // progress while bounding head-of-line maintenance charged to the caller.
+    for _ in 0..FOREGROUND_VFS_MAINTENANCE_ATTEMPTS {
         let Some(pending) = PENDING_VFS_MUTATIONS.lock().pop_front() else {
             return;
         };
@@ -662,13 +680,17 @@ fn drain_pending_vfs_mutations() {
         request.payload_len = pending.payload_len;
         let payload_len = pending.payload_len as usize;
         request.payload[..payload_len].copy_from_slice(&pending.payload[..payload_len]);
-        let response =
-            ipc_ops::call_service_endpoint_with_timeout(IPC_SERVICE_VFSD, as_bytes(&request), 16)
-                .ok()
-                .and_then(|bytes| {
-                    (bytes.len() == size_of::<VfsIpcResponse>())
-                        .then(|| read_unaligned::<VfsIpcResponse>(&bytes))
-                });
+        let response = ipc_ops::call_service_endpoint_with_class_deadline(
+            IPC_SERVICE_VFSD,
+            as_bytes(&request),
+            ipc_ops::ServiceIpcClass::ReadinessQuery,
+            rustos_user_abi::performance::IPC_FOREGROUND_MAINTENANCE_SLICE_MS,
+        )
+        .ok()
+        .and_then(|bytes| {
+            (bytes.len() == size_of::<VfsIpcResponse>())
+                .then(|| read_unaligned::<VfsIpcResponse>(&bytes))
+        });
         let completed = response.is_some_and(|response| {
             validate_vfs_response_envelope(request.op, &response).is_ok() && response.status == 0
         });
@@ -677,7 +699,11 @@ fn drain_pending_vfs_mutations() {
             return;
         }
         if vfs_checkpoint_ack_required(&request) {
-            let _ = acknowledge_vfs_checkpoint_mutation(&request);
+            let ack = vfs_checkpoint_ack_request(&request);
+            if enqueue_pending_vfs_mutation(&ack).is_err() {
+                PENDING_VFS_MUTATIONS.lock().push_front(pending);
+                return;
+            }
         }
     }
 }
@@ -789,7 +815,11 @@ pub fn read_input_device_via_inputd(
 }
 
 fn call_inputd_ipc_request(request: &InputdIpcRequest) -> Result<InputdIpcResponse, i64> {
-    let response = ipc_ops::call_service_endpoint(IPC_SERVICE_INPUTD, as_bytes(request))?;
+    let response = ipc_ops::call_service_endpoint_with_class(
+        IPC_SERVICE_INPUTD,
+        as_bytes(request),
+        ipc_ops::ServiceIpcClass::InteractiveControl,
+    )?;
     if response.len() != size_of::<InputdIpcResponse>() {
         return Err(LINUX_EINVAL);
     }
@@ -827,10 +857,11 @@ pub fn input_device_readiness_for_access_with_timeout(
         request.pid = snapshot.process_id();
         request.tid = snapshot.thread_id();
     }
-    let response = ipc_ops::call_service_endpoint_with_timeout(
+    let response = ipc_ops::call_service_endpoint_with_class_deadline(
         IPC_SERVICE_INPUTD,
         as_bytes(&request),
-        timeout_ms.max(1).min(INPUTD_READINESS_IPC_TIMEOUT_MS),
+        ipc_ops::ServiceIpcClass::ReadinessQuery,
+        timeout_ms,
     )?;
     if response.len() != size_of::<InputdIpcResponse>() {
         return Err(LINUX_EINVAL);
@@ -884,10 +915,11 @@ pub fn console_readiness_via_sessiond_with_timeout(
     request.header.subject_tid = snapshot.thread_id();
     request.arg0 = COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_READINESS;
     request.arg2 = session_handle;
-    let response = ipc_ops::call_service_endpoint_with_timeout(
+    let response = ipc_ops::call_service_endpoint_with_class_deadline(
         IPC_SERVICE_SESSIOND,
         as_bytes(&request),
-        timeout_ms.max(1).min(16),
+        ipc_ops::ServiceIpcClass::ReadinessQuery,
+        timeout_ms,
     )?;
     if response.len() != size_of::<CommercialMaxProtocolResponse>() {
         return Err(LINUX_EINVAL);
@@ -1040,7 +1072,11 @@ fn call_sessiond_console_route(
     request.payload_len = payload.len() as u32;
 
     let start_ticks = crate::arch::rtc::ticks();
-    let response = ipc_ops::call_service_endpoint(IPC_SERVICE_SESSIOND, as_bytes(&request))?;
+    let response = ipc_ops::call_service_endpoint_with_class(
+        IPC_SERVICE_SESSIOND,
+        as_bytes(&request),
+        ipc_ops::ServiceIpcClass::BulkData,
+    )?;
     log_slow_service_call(
         "sessiond",
         request.header.op,
@@ -1183,7 +1219,11 @@ pub fn ioctl_tty_via_sessiond(fd: u64, request_number: u64, arg: u64) -> Result<
     }
 
     let start_ticks = crate::arch::rtc::ticks();
-    let response = ipc_ops::call_service_endpoint(IPC_SERVICE_SESSIOND, as_bytes(&request))?;
+    let response = ipc_ops::call_service_endpoint_with_class(
+        IPC_SERVICE_SESSIOND,
+        as_bytes(&request),
+        ipc_ops::ServiceIpcClass::InteractiveControl,
+    )?;
     log_slow_service_call(
         "sessiond",
         request.header.op,
@@ -1258,7 +1298,11 @@ pub fn ioctl_device_via_devmgrd(fd: u64, request_number: u64, arg: u64) -> Resul
     }
     populate_devmgrd_ioctl_payload(&mut request, arg)?;
     let start_ticks = crate::arch::rtc::ticks();
-    let response = ipc_ops::call_service_endpoint(IPC_SERVICE_DEVMGRD, as_bytes(&request))?;
+    let response = ipc_ops::call_service_endpoint_with_class(
+        IPC_SERVICE_DEVMGRD,
+        as_bytes(&request),
+        ipc_ops::ServiceIpcClass::InteractiveControl,
+    )?;
     log_slow_service_call(
         "devmgrd",
         request.op,
@@ -1308,7 +1352,11 @@ pub fn ioctl_route_via_devmgrd(fd: u64, request_number: u64) -> Result<u64, i64>
     }
 
     let start_ticks = crate::arch::rtc::ticks();
-    let response = ipc_ops::call_service_endpoint(IPC_SERVICE_DEVMGRD, as_bytes(&request))?;
+    let response = ipc_ops::call_service_endpoint_with_class(
+        IPC_SERVICE_DEVMGRD,
+        as_bytes(&request),
+        ipc_ops::ServiceIpcClass::InteractiveControl,
+    )?;
     log_slow_service_call(
         "devmgrd",
         request.op,
@@ -1474,7 +1522,11 @@ fn apply_devmgrd_ioctl_payload(
 
 pub fn call_inputd_read_request(request: &InputdIpcRequest) -> Result<InputdReadResponse, i64> {
     let start_ticks = crate::arch::rtc::ticks();
-    let response = ipc_ops::call_service_endpoint(IPC_SERVICE_INPUTD, as_bytes(request))?;
+    let response = ipc_ops::call_service_endpoint_with_class(
+        IPC_SERVICE_INPUTD,
+        as_bytes(request),
+        ipc_ops::ServiceIpcClass::BulkData,
+    )?;
     let detail = if request.flags & INPUTD_READ_FLAG_NONBLOCK != 0 {
         Some("nonblock")
     } else {
@@ -1529,12 +1581,17 @@ fn call_netd_ipc_request_impl(
         .ok_or(LINUX_EINVAL)?;
     let request_bytes = &as_bytes(request)[..request_len];
     let response = match timeout_ms {
-        Some(timeout_ms) => ipc_ops::call_service_endpoint_with_timeout(
+        Some(timeout_ms) => ipc_ops::call_service_endpoint_with_class_deadline(
             IPC_SERVICE_NETD,
             request_bytes,
+            ipc_ops::ServiceIpcClass::ReadinessQuery,
             timeout_ms,
         )?,
-        None => ipc_ops::call_service_endpoint(IPC_SERVICE_NETD, request_bytes)?,
+        None => ipc_ops::call_service_endpoint_with_class(
+            IPC_SERVICE_NETD,
+            request_bytes,
+            ipc_ops::ServiceIpcClass::BulkData,
+        )?,
     };
     let elapsed_ms = ticks_elapsed_ms(start_ticks, crate::arch::rtc::ticks());
     log_slow_service_call(
@@ -1702,6 +1759,15 @@ mod tests {
         assert_eq!(slices.as_slice(), &[6, 5, 5]);
         assert_eq!(slices.iter().sum::<u64>(), 16);
         assert_eq!(split_retry_timeout_ms(1, 1, 0), 1);
+    }
+
+    #[test]
+    fn foreground_vfs_maintenance_is_one_bounded_replay_turn() {
+        assert_eq!(FOREGROUND_VFS_MAINTENANCE_ATTEMPTS, 1);
+        assert_eq!(
+            rustos_user_abi::performance::IPC_FOREGROUND_MAINTENANCE_SLICE_MS,
+            1
+        );
     }
 
     #[test]

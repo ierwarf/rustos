@@ -18,12 +18,51 @@ contract file.
    helpers after the measured bottleneck is fixed.
 5. Re-run `cargo xtask check`; run KVM smoke only after code and docs agree.
 
+## Hard Limits
+
+The source of truth is `rustos_user_abi::performance`. These limits are
+acceptance contracts, not tuning defaults:
+
+| Path | Target | Hard limit | Synchronous policy IPC |
+|---|---:|---:|---:|
+| Kernel entry to interactive UI | 3 s | 5 s | One classified turn at a time |
+| UI CPU frame preparation | 8 ms | 16.667 ms completed frame | 0 |
+| First local DVM GPU activation after CPU boot frame | 750 ms | Included in 5 s boot ceiling | 0 |
+| Input arrival to visible cursor | One frame | 50 ms | 0 in frame/present |
+| Deferred VFS maintenance per foreground turn | 1 ms | 1 ms | 1 replay |
+| Readiness observation | 1 frame | 16 ms | 1 per deduplicated provider |
+| Interactive policy-only control | 16 ms | 100 ms | 1 |
+| Boot/control transaction | 100 ms | 5 s | 1 |
+| Bulk external-device data | 5 s | 30 s | 1 |
+
+Every kernel-owned service call names one class in source. A shorter caller
+deadline is allowed; widening the class is not. Repeated endpoint lookup with
+an exact current-epoch grant performs zero rootd IPC. UI render/present performs
+zero filesystem, catalog, or policy-service calls. `cargo xtask kvm-smoke`
+fails the five-second UI limit independently of its broader readiness timeout.
+`formal/run-source-conformance.sh` checks the class ordering and reply
+cancellation witnesses.
+
+The kernel service registry publishes an endpoint last and clears it first.
+The steady-state lookup path takes an epoch/endpoint snapshot, rechecks both
+after reading the owner, and acquires no global mutation lock. Three unstable
+reads fail as transient service absence; publication, revoke, and restart stay
+serialized on the writer side. This keeps the global authority transition
+explicit without turning every VFS, network, or input IPC into a shared
+cache-line write.
+
 ## Driver Boot
 
 - Linux DVM owns device drivers. RustOS validates only the fixed DVM transport.
 - Missing or invalid DVM input, display, or network transport must leave that
   device unavailable; do not install a native, firmware, or direct-virtio
   fallback.
+- PCI transport topology is fixed before services start. Once enumeration has
+  found ivshmem functions but no exact block-aperture shape, the kernel caches
+  that topology absence instead of rescanning every PCI function on every
+  storaged readiness probe. A correctly shaped aperture whose signed header is
+  not ready remains retryable. Storaged records the first readiness errno and
+  later errno transitions, not every identical 50 ms retry.
 
 ## UI Runtime
 
@@ -57,11 +96,12 @@ contract file.
   For NVIDIA, the open modules and both requested GSP images must have the same
   release identity, KMS must report the assigned PCI function as its DRM owner,
   and only page-flip events on the physical connector count as presentation.
-- The RustOS-to-DVM snapshot copy follows the same exact-predecessor rule. A
-  released slot may receive a damage-only patch only when its retained content
-  generation equals the immediately preceding published generation and the
-  compositor source mapping is unchanged. Stale slots and replacement sources
-  force a complete snapshot; release authority remains cleared independently.
+- The RustOS-to-DVM snapshot copy keeps a bounded damage history equal to the
+  fixed slot count. An exact-predecessor slot receives only the current damage;
+  an older released slot may be reconstructed by the complete contiguous
+  damage history from its retained content epoch to the new epoch. Missing,
+  discontinuous, invalid, or topology-changing history forces a complete
+  snapshot. Release authority remains cleared independently.
 - `cargo xtask kvm-run` is the real-use acceptance path: it enables no input
   self-test or private UI profiler. Startup requires an atomic three-buffer
   relay, an active RustOS provider, and a non-zero immutable source frame.
@@ -98,7 +138,9 @@ contract file.
   the next dispatch is reserved for User work. Independently, every ready User
   task has an 8 ms ready-age rail and every ready System task has a 10 ms rail.
   A selection micro-optimization must not bypass these limits or convert launch
-  weights into strict-class authority.
+  weights into strict-class authority. A blocked caller still hands directly
+  to its exact receiver, but otherwise an overdue System continuation runs
+  before a generic IPC hint; the hint is retained for the next dispatch.
 - An authenticated netd local-socket completion may enqueue only a User task in
   the deduplicated 16-entry latency FIFO. At most eight such handoffs run
   consecutively, stale tasks are discarded, and a full queue drops the new
@@ -109,6 +151,18 @@ contract file.
   Package and desktop metadata cannot request that bit. The scheduler's 10 ms
   ready-wait rail therefore covers causal core servers without making dynamic
   applications strict-priority work.
+
+## Executable Snapshot Path
+
+- Vfsd materializes one exact admitted executable file into a private memfd,
+  capped at 128 MiB, and applies terminal write/grow/shrink/seal seals before
+  transferring it to loaderd. The cache is mount-generation bound and bounded
+  independently; loaderd never publishes a live VFS handle to ring0.
+- Loaderd parses and maps the transferred immutable snapshot. The commit broker
+  allocates page-table backing and copies from that memfd only; it performs no
+  vfsd or DVM storage call. Validation therefore cannot race a later path
+  mutation, repeated segments do not repeat storage IPC, and executable commit
+  latency is independent of service reply floods.
 
 ## Cleanup Rule
 

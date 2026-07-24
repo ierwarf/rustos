@@ -106,6 +106,11 @@ formal/check-zero-trust-ingress.sh
     exit 1
 }
 formal/check-zero-trust-subsystems.sh
+[[ -x formal/check-performance-contracts.sh ]] || {
+    echo "performance contract checker is not executable" >&2
+    exit 1
+}
+formal/check-performance-contracts.sh
 rg -q 'run-source-conformance\.sh' formal/verify-all.sh || {
     echo "formal PR gate omits source conformance" >&2
     exit 1

@@ -10,6 +10,11 @@ it read-only to the Linux DVM.  Every READY slot is a complete immutable frame
 snapshot even when its PRESENT record carries a smaller damage hint.  The DVM
 may select and read that snapshot, but a write attempt is rejected without
 changing any pixel epoch.  Loss of either plane revokes the transport.
+
+The concrete three-slot producer retains one contiguous damage epoch per slot.
+This finite model abstracts that history as a generation distance no larger
+than Cardinality(Slots). Missing or discontinuous history is represented by
+HostBeginFull rather than HostBeginDamage.
 *******************************************************************************)
 
 CONSTANTS Slots, Sources, MaxGeneration, MaxRejectedWrites
@@ -103,13 +108,16 @@ HostBeginDamage(s) ==
     /\ NoHostWriter
     /\ publishedGeneration > 0
     /\ publishedGeneration < MaxGeneration
-    /\ slotContentGeneration[s] = publishedGeneration
+    /\ slotContentGeneration[s] > 0
+    /\ slotContentGeneration[s] <= publishedGeneration
+    /\ publishedGeneration - slotContentGeneration[s] <= Cardinality(Slots)
     /\ activeSource = publishedSource
     /\ slotState' = [slotState EXCEPT ![s] = Writing]
     /\ slotComplete' = [slotComplete EXCEPT ![s] = FALSE]
     /\ lastPixelWriter' = [lastPixelWriter EXCEPT ![s] = Host]
     /\ copyMode' = [copyMode EXCEPT ![s] = DamageCopy]
-    /\ copyBaseGeneration' = [copyBaseGeneration EXCEPT ![s] = publishedGeneration]
+    /\ copyBaseGeneration' =
+           [copyBaseGeneration EXCEPT ![s] = slotContentGeneration[s]]
     /\ copySource' = [copySource EXCEPT ![s] = activeSource]
     /\ UNCHANGED <<slotGeneration, slotContentGeneration, pixelEpoch,
                   activeSource, publishedSource, selectedSlot,
@@ -296,14 +304,16 @@ IdleSlotsHaveNoCopy ==
             /\ copyBaseGeneration[s] = 0
             /\ copySource[s] = NoSource
 
-DamageCopyHasExactPredecessor ==
+DamageCopyHasBoundedHistory ==
     \A s \in Slots :
         copyMode[s] = DamageCopy =>
             /\ slotState[s] = Writing
-            /\ copyBaseGeneration[s] = publishedGeneration
+            /\ copyBaseGeneration[s] > 0
+            /\ copyBaseGeneration[s] <= publishedGeneration
+            /\ publishedGeneration - copyBaseGeneration[s] <= Cardinality(Slots)
             /\ IF slotComplete[s]
                   THEN slotContentGeneration[s] = publishedGeneration + 1
-                  ELSE slotContentGeneration[s] = publishedGeneration
+                  ELSE slotContentGeneration[s] = copyBaseGeneration[s]
             /\ publishedGeneration > 0
             /\ copySource[s] = publishedSource
 

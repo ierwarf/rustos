@@ -73,9 +73,23 @@ test "$count" -gt 0 || {
     echo "rustos-linux-dvm: no installed kernel modules to verify" >&2
     exit 1
 }
-for required in nvidia nvidia-modeset nvidia-drm rustos_dvm_block_uio rustos_dvm_ivshmem_uio i915 xe amdgpu; do
+for required in \
+    nvidia \
+    nvidia-modeset \
+    nvidia-drm \
+    rustos_dvm_block_uio \
+    rustos_dvm_ivshmem_uio \
+    i915 \
+    xe \
+    amdgpu \
+    ahci \
+    libahci \
+    libata \
+    sd_mod \
+    nvme \
+    nvme-core; do
     find "$modules" -type f -name "$required.ko*" -print -quit | grep -q . || {
-        echo "rustos-linux-dvm: required signed display module missing: $required" >&2
+        echo "rustos-linux-dvm: required signed device module missing: $required" >&2
         exit 1
     }
 done

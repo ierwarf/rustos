@@ -25,6 +25,11 @@ the fairness assumptions written into `Spec`. Do not add a model only to
 `system-flows.tsv` is the cross-model lifecycle registry. Its checker binds
 stable requirement/hazard IDs to owner transitions, finite waits, one formal
 model, one source anchor, and one exact source witness before TLC runs.
+`check-performance-contracts.sh` is the source-drift gate for the shared boot,
+frame, and typed IPC limits. It also rejects unclassified compat service calls,
+service-registration retry amplification, a stable endpoint lookup that takes
+the global writer lock, synchronous policy IPC in frame/present code, unbounded
+foreground VFS recovery, and a KVM UI gate detached from the five-second limit.
 
 ## Run the PR suite
 
@@ -148,7 +153,7 @@ and counterexamples are retained under `build/formal/`.
 | driver-domain-fleet/DriverDomainFleet | hostd fleet policy and signed release gate | a fleet member is exactly encoded; CIDs, IOMMU groups, and representative PCI functions are globally disjoint; policy is immutable after sealing; only a signed release bound to that fleet can activate a member |
 | ivshmem-pairing/IvshmemPairing | launch-private ivshmem broker and KVM launcher | the RustOS QEMU connection is observed as peer 0 before GUI-DVM launch; peer 1 cannot exist without peer 0; disconnect fails the complete pair closed and no reconnect can reuse the assignment |
 | gui-dvm-surface/GuiDvmSurface | RustOS compositor to the sole supported GUI-DVM transport | `RSGUI002` has exactly three host-provisioned slots, exact even PRESENT/RELEASE generations, one outstanding DVM control record, module-latched pre-boot invitations, offline confirmation clearing, saturated-pool re-invitation, and stale-slot reclamation. It asserts bounded backpressure without fabricating capacity. Multi-domain focus is unavailable and rejected by the source rather than modeled as authority. |
-| gui-dvm-pixel-authority/GuiDvmPixelAuthority | RustOS surface producer, uiserver, and GUI-DVM consumer | damage-only publication may reuse pixels only from the exact preceding snapshot; every slot has one writer/reader owner and monotonic generation, and revoke removes stale pixel authority before a later epoch |
+| gui-dvm-pixel-authority/GuiDvmPixelAuthority | RustOS surface producer, uiserver, and GUI-DVM consumer | damage-only publication may reuse pixels only from the exact predecessor or a complete contiguous history bounded by the fixed slot count; every slot has one writer/reader owner and monotonic generation, and revoke removes stale pixel authority before a later epoch |
 | dvm-atomic-scanout/DvmAtomicScanout | explicit physical-AMD DMA-BUF/GPU/KMS relay mode | source/model matched, hardware gate failed: the complete 128 MiB pixel backing must first be DMA-pinnable and mapped into the VFIO IOAS, then only a coherent DMA attachment may import all three read-only sources; the kernel names the exact oldest live generation in a non-replayable acquire `sync_file`, and EGL server-waits it before composition into a separate three-buffer GBM output pool; GPU and page-flip fences precede source/output reuse; device-write DMA authority to sources is absent; evidence requires the complete chain; offline revokes both pools. Physical import, scanout, and sustained-rate evidence remain required. |
 | dvm-gpu-compositor/DvmGpuCompositor | uiserver private scene compiler and Linux DVM fixed GLES executor | a bounded OS-owned context admits only clear, solid-quad, and textured-quad commands with host-bound read-only source tokens; only a measured prime record for the current host-selected epoch enables the asynchronous three-entry queue; acquire, completion, release, and presentation are monotonic fence states; raw commands, application shaders, CPU fallback success, and device writes to RustOS sources are impossible; a 16.667 ms target miss retains the prior front and live epoch, while the separate 50 ms hard timeout or revoke invalidates the full epoch and stale completions cannot revive it |
 | dvm-gpu-proof-scheduler/DvmGpuProofScheduler | private AMD/virtio GPU proof process | only the finite post-prime measurement may use bounded SCHED_RR priority 8; limit installation, admission, and exact restore readback are distinct states; it remains below display/input relays; success and ordinary failure restore normal policy before evidence, while hard-limit or uncertain-restore termination publishes no evidence; the health loop has no realtime authority |
@@ -368,7 +373,10 @@ verification, and requires the signed release's fleet hash before activation.
 not arbitrary application-level wait graphs. Two policy services may
 legitimately call one another, so the model permits that cycle and checks that
 the concrete deadline, cancellation, and peer-close rules eliminate any
-permanent blocked control wait. `scheduler-wakeup` then checks the lower-level
+permanent blocked control wait. The service registry publishes the endpoint
+last, clears it first, and accepts a steady-state lookup only when endpoint and
+epoch remain unchanged across the owner read; that path does not acquire the
+writer mutation lock. `scheduler-wakeup` then checks the lower-level
 arm–timer–recheck–commit race: an early wake invalidates the same arm epoch,
 and the timer clockevent wakes due tasks before a later dispatch can select
 work. `clocksource-deadline` separates that clockevent from elapsed time: TSC

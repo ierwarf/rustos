@@ -368,6 +368,8 @@ pub(crate) fn rebuild_console_window_surface(window: &mut ConsoleWindow, focused
 
     window.surface_cache.focused = focused;
     window.surface_cache.valid = true;
+    window.surface_cache.content_version =
+        window.surface_cache.content_version.wrapping_add(1).max(1);
 }
 
 pub(super) fn paint_window_chrome(

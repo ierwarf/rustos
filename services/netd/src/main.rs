@@ -34,8 +34,7 @@ use rustos_user_abi::syscall::{
     SYSCALL_OFFLOAD_OP_LINUX_SENDTO, SYSCALL_OFFLOAD_OP_LINUX_SETSOCKOPT,
     SYSCALL_OFFLOAD_OP_LINUX_SHUTDOWN, SYSCALL_OFFLOAD_OP_LINUX_SOCKET,
     SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR, SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
-    SYS_RUSTOS_IPC_RECV_WITH_SENDER, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT,
-    SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_NET_BROKER,
+    SYS_RUSTOS_IPC_RECV_WITH_SENDER, SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_NET_BROKER,
 };
 #[cfg(not(test))]
 use rustos_user_abi::syscall::{
@@ -119,7 +118,8 @@ fn main() {
         return;
     }
 
-    let register = register_service_endpoint(IPC_SERVICE_NETD, endpoint as u64);
+    let register =
+        rustos_svc_runtime::ipc::register_service_endpoint(IPC_SERVICE_NETD, endpoint as u64);
     if register < 0 {
         let _ = writeln!(
             std::io::stderr(),
@@ -2493,17 +2493,11 @@ mod local_socket_poll_tests {
     #[test]
     fn poisoned_deferred_queue_is_drained_for_fail_closed_replies() {
         let queue = Mutex::new(VecDeque::from([1_u8, 2_u8]));
-        std::thread::scope(|scope| {
-            let worker = scope.spawn(|| {
-                let _held = queue.lock().unwrap();
-                panic!("poison test queue");
-            });
-            assert!(worker.join().is_err());
-        });
-        let (drained, poisoned) = take_deferred_queue(queue.lock());
+        let guard = queue.lock().unwrap();
+        let (drained, poisoned) = take_deferred_queue(Err(std::sync::PoisonError::new(guard)));
         assert!(poisoned);
         assert_eq!(drained, VecDeque::from([1_u8, 2_u8]));
-        assert!(queue.lock().unwrap_err().into_inner().is_empty());
+        assert!(queue.lock().unwrap().is_empty());
     }
 
     fn connected_socket(peer: u64) -> UnixSocket {
@@ -2887,26 +2881,6 @@ fn syscall3(number: u64, arg0: u64, arg1: u64, arg2: u64) -> i64 {
 
 fn syscall6(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i64 {
     unsafe { libc::syscall(number as libc::c_long, arg0, arg1, arg2, arg3, arg4, arg5) as i64 }
-}
-
-fn register_service_endpoint(service_id: u64, endpoint: u64) -> i64 {
-    let mut last = 0;
-    for _ in 0..65_536 {
-        last = syscall2(
-            SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT,
-            service_id,
-            endpoint,
-        );
-        if last >= 0 {
-            return last;
-        }
-        let errno = (-last) as i32;
-        if errno != libc::EACCES && errno != libc::EPERM && errno != libc::ENOENT {
-            return last;
-        }
-        thread::yield_now();
-    }
-    last
 }
 
 fn last_errno() -> i32 {

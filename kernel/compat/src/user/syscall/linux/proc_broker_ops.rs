@@ -7,7 +7,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use x86_64::VirtAddr;
 use x86_64::structures::paging::PageTableFlags;
 
-use crate::user::handles::{KernelHandle, RemoteVfsHandleKind};
+use crate::user::handles::KernelHandle;
 use crate::user::memfd::MemfdHandle;
 use lazy_static::lazy_static;
 use rustos_user_abi::syscall::{
@@ -27,7 +27,7 @@ use rustos_user_abi::syscall::{
     RustosProcMapFileBrokerArgs, RustosProcMapZeroedBrokerArgs, RustosProcPrepareBrokerArgs,
     RustosProcSetLinuxRuntimeBrokerArgs, RustosProcSetWindowsRuntimeBrokerArgs,
     RustosProcSignalQueueBrokerArgs, RustosProcValidateDeferredSpawnBrokerArgs,
-    RustosUserRegisters, VFS_IPC_PAYLOAD_CAPACITY, loader_service_role_allows_operation,
+    RustosUserRegisters, loader_service_role_allows_operation,
 };
 use spin::Mutex;
 
@@ -55,11 +55,7 @@ lazy_static! {
         Mutex::new(BTreeMap::new());
 }
 
-#[derive(Clone)]
-enum PinnedFileBacking {
-    Remote { remote_id: u64, path: String },
-    Memfd(MemfdHandle),
-}
+type PinnedFileBacking = MemfdHandle;
 
 #[derive(Clone)]
 enum MappingEntry {
@@ -718,6 +714,12 @@ pub(super) fn syscall_linux_rustos_proc_activate_broker(args_ptr: u64) -> u64 {
     if !multitask::activate_suspended_user_task(args.target_pid) {
         return linux_errno(LINUX_ESRCH);
     }
+    nucleus_core::debug::record_milestone(
+        nucleus_core::debug::LogCategory::Compat,
+        "proc-activate-committed",
+        args.target_pid,
+        args.requester_pid,
+    );
     0
 }
 
@@ -1408,57 +1410,15 @@ fn copy_file_into_address_space(
     file_len: u64,
 ) -> Result<(), i64> {
     let total = usize::try_from(file_len).map_err(|_| LINUX_EOVERFLOW)?;
-    if let PinnedFileBacking::Remote { path, .. } = backing {
-        match kernel_io_manager::api::block::verified_bootstrap_file_bytes(path) {
-            Ok(Some(payload)) => {
-                let start = usize::try_from(file_offset).map_err(|_| LINUX_EOVERFLOW)?;
-                let end = start.checked_add(total).ok_or(LINUX_EOVERFLOW)?;
-                let bytes = payload.get(start..end).ok_or(LINUX_EIO)?;
-                address_space
-                    .initialize_user_bytes(VirtAddr::new(target_addr), bytes)
-                    .map_err(address_space_error_to_linux_errno)?;
-                return Ok(());
-            }
-            Ok(None) => {}
-            Err(_) => return Err(LINUX_EIO),
-        }
-    }
     let mut chunk = alloc::vec![0_u8; FILE_COPY_CHUNK.min(total.max(1))];
     let mut copied = 0usize;
     while copied < total {
         let count = (total - copied).min(chunk.len());
-        let read = match backing {
-            PinnedFileBacking::Remote { remote_id, path } => {
-                let offset = file_offset.saturating_add(copied as u64);
-                match kernel_io_manager::api::block::read_bootstrap_file_range(
-                    path,
-                    offset,
-                    &mut chunk[..count],
-                ) {
-                    Ok(Some(read)) => read,
-                    Ok(None) => {
-                        let remote_count = count.min(VFS_IPC_PAYLOAD_CAPACITY);
-                        match offload_ops::call_remote_vfs_read_bytes(
-                            *remote_id,
-                            offset,
-                            remote_count,
-                        ) {
-                            Ok(bytes) => {
-                                let n = bytes.len().min(remote_count);
-                                chunk[..n].copy_from_slice(&bytes[..n]);
-                                n
-                            }
-                            Err(err) => return Err(err),
-                        }
-                    }
-                    Err(_) => return Err(LINUX_EIO),
-                }
-            }
-            PinnedFileBacking::Memfd(memfd) => {
-                let off = usize::try_from(file_offset).map_err(|_| LINUX_EINVAL)? + copied;
-                memfd.read_at(off, &mut chunk[..count])
-            }
-        };
+        let off = usize::try_from(file_offset)
+            .map_err(|_| LINUX_EINVAL)?
+            .checked_add(copied)
+            .ok_or(LINUX_EOVERFLOW)?;
+        let read = backing.read_at(off, &mut chunk[..count]);
         if read == 0 {
             break;
         }
@@ -1488,19 +1448,24 @@ fn pinned_file_backing_from_current(fd: u64) -> Result<PinnedFileBacking, i64> {
             return Err(LINUX_EACCES);
         }
         match entry.handle() {
-            KernelHandle::RemoteVfs(r) if r.kind() == RemoteVfsHandleKind::File => {
-                Ok(PinnedFileBacking::Remote {
-                    remote_id: r.remote_id(),
-                    path: r.path(),
-                })
+            KernelHandle::Memfd(memfd) if executable_snapshot_is_immutable(memfd) => {
+                Ok(memfd.clone())
             }
-            KernelHandle::Memfd(m) => Ok(PinnedFileBacking::Memfd(m.clone())),
+            KernelHandle::Memfd(_) => Err(LINUX_EACCES),
             _ => Err(LINUX_EINVAL),
         }
     }) else {
         return Err(LINUX_ESRCH);
     };
     result
+}
+
+fn executable_snapshot_is_immutable(memfd: &MemfdHandle) -> bool {
+    let required = (linux_abi::F_SEAL_WRITE
+        | linux_abi::F_SEAL_GROW
+        | linux_abi::F_SEAL_SHRINK
+        | linux_abi::F_SEAL_SEAL) as u32;
+    memfd.seals() & required == required
 }
 
 fn map_zeroed(
@@ -1609,9 +1574,10 @@ fn procd_process_prepare_policy(format: u16) -> Result<(), i64> {
     request.header.subject_pid = snapshot.process_id();
     request.header.subject_tid = snapshot.thread_id();
     request.arg0 = u64::from(format);
-    let response = match ipc_ops::call_service_endpoint(
+    let response = match ipc_ops::call_service_endpoint_with_class(
         rustos_user_abi::syscall::IPC_SERVICE_PROCD,
         as_bytes(&request),
+        ipc_ops::ServiceIpcClass::BootControl,
     ) {
         Ok(response) => response,
         Err(errno) => return Err(errno),
@@ -1775,6 +1741,23 @@ mod tests {
         assert_eq!(validate_complete_file_copy(4096, 4096), Ok(()));
         assert_eq!(validate_complete_file_copy(4096, 4095), Err(LINUX_EIO));
         assert_eq!(validate_complete_file_copy(1, 0), Err(LINUX_EIO));
+    }
+
+    #[test]
+    fn executable_file_backing_requires_a_terminally_sealed_snapshot() {
+        let snapshot = MemfdHandle::new(String::from("loader-test"), true);
+        assert!(!executable_snapshot_is_immutable(&snapshot));
+        snapshot
+            .add_seals(
+                (linux_abi::F_SEAL_WRITE | linux_abi::F_SEAL_GROW | linux_abi::F_SEAL_SHRINK)
+                    as u32,
+            )
+            .expect("partial seals");
+        assert!(!executable_snapshot_is_immutable(&snapshot));
+        snapshot
+            .add_seals(linux_abi::F_SEAL_SEAL as u32)
+            .expect("terminal seal");
+        assert!(executable_snapshot_is_immutable(&snapshot));
     }
 
     #[test]

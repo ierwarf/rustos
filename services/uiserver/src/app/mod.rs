@@ -287,6 +287,7 @@ pub(crate) struct WindowSurfaceCache {
     pub(crate) height: usize,
     pub(crate) focused: bool,
     pub(crate) valid: bool,
+    pub(crate) content_version: u64,
 }
 
 #[derive(Default)]
@@ -301,6 +302,7 @@ pub(crate) struct DesktopSurfaceCache {
     pub(crate) height: usize,
     pub(crate) background_valid: bool,
     pub(crate) chrome_valid: bool,
+    pub(crate) content_version: u64,
 }
 
 impl DesktopSurfaceCache {
@@ -375,6 +377,8 @@ impl ConsoleWindow {
             rect,
         );
         self.terminal.render_cursor_cell(&mut canvas);
+        self.surface_cache.content_version =
+            self.surface_cache.content_version.wrapping_add(1).max(1);
         Some(canvas::Rect {
             x: self.frame.x + rect.x,
             y: self.frame.y + rect.y,

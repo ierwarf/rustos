@@ -14,6 +14,7 @@ libc = "0.2"
 rustos-fault-injection = { path = "../../libs/rustos-fault-injection" }
 rustos-driver-domain-host = { path = "../../libs/driver-domain-host" }
 rustos-image-admission = { path = "../../libs/rustos-image-admission" }
+rustos-user-abi = { path = "../../libs/rustos-user-abi" }
 driver-domain-protocol = { path = "../../libs/driver-domain-protocol" }
 ed25519-dalek = "2"
 serde = { version = "1.0", features = ["derive"] }

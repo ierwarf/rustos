@@ -678,6 +678,20 @@ impl Scheduler {
         None
     }
 
+    /// Select the one-shot child-start transfer before a reply wakeup. A child
+    /// reaches this slot only after its exact supervisor consumed the
+    /// deferred-activation capability, so this order cannot open an
+    /// unsupervised execution window. It does prevent a busy wakeup stream
+    /// from stretching a committed bootstrap into whole seconds.
+    fn take_next_bootstrap_handoff_ready_slot(&mut self) -> Option<(usize, bool)> {
+        self.take_next_spawn_pick_hint_ready_slot()
+            .map(|slot| (slot, false))
+            .or_else(|| {
+                self.take_next_latency_pick_hint_ready_slot()
+                    .map(|slot| (slot, true))
+            })
+    }
+
     fn take_next_spawn_pick_hint_ready_slot(&mut self) -> Option<usize> {
         if self.next_spawn_pick_hint.is_some()
             && self
@@ -1191,6 +1205,23 @@ impl Scheduler {
             SchedClass::System,
             SYSTEM_READY_LATENCY_BOUND_MS,
         )
+    }
+
+    /// Selects an overdue strict-class continuation before an unrelated IPC
+    /// hint. A blocked caller's exact causal handoff is handled earlier in
+    /// `dispatch_schedule`; this helper covers only the ordinary runnable
+    /// case, where a continuous stream of fresh hints must not keep a
+    /// preempted System task inside a kernel transaction off-CPU forever.
+    ///
+    /// The hint remains pending when the overdue task wins, so the direct IPC
+    /// handoff is delayed by one bounded recovery turn rather than discarded.
+    fn take_overdue_system_or_pick_hint(
+        &mut self,
+        current: usize,
+        now_ticks: u64,
+    ) -> Option<usize> {
+        self.overdue_system_pick(current, now_ticks)
+            .or_else(|| self.take_next_pick_hint_ready_slot())
     }
 
     fn user_reservation_due(&self) -> bool {
@@ -2370,21 +2401,27 @@ impl Scheduler {
         self.last_min_vruntime_ns = self.min_ready_vruntime();
 
         // Pick order:
-        //  1. Bounded wakeup handoff for a task that actually slept on IPC.
-        //  2. Spawn/IPC donation hints and mandatory User fairness.
-        //  3. CFS-like class selection among ready tasks.
-        //  4. Root task as the unconditional fallback.
+        //  1. One post-admission spawn handoff. The supervisor has already
+        //     consumed the exact deferred-activation capability, so delaying
+        //     this first child turn behind unrelated reply wakeups creates an
+        //     avoidable boot-critical latency gap without improving safety.
+        //  2. Bounded wakeup handoff for a task that actually slept on IPC.
+        //  3. IPC donation hints and mandatory User fairness.
+        //  4. CFS-like class selection among ready tasks.
+        //  5. Root task as the unconditional fallback.
         // Hints short-circuit CFS only for direct handoff; otherwise vruntime
         // decides fairness.
         // A caller that committed a synchronous IPC block has no remaining
         // work until its exact receiver runs. Honor that reply-scoped direct
-        // handoff before the unrelated User reservation; selecting a polling
-        // User task here can otherwise strand the entire causal chain. Normal
-        // yields and spawn hints still remain behind the bounded reservation.
-        let latency_handoff = self.take_next_latency_pick_hint_ready_slot();
+        // handoff before the unrelated User reservation; a committed child
+        // activation is already an explicit, one-shot bootstrap transfer and
+        // must run before either category of ordinary IPC wakeup.
+        let bootstrap_handoff = self.take_next_bootstrap_handoff_ready_slot();
         let (next_idx, ipc_handoff, reserved_user_pick, latency_handoff_pick) =
-            match latency_handoff {
-                Some(woken_slot) => (woken_slot, true, None, true),
+            match bootstrap_handoff {
+                Some((woken_slot, is_latency_handoff)) => {
+                    (woken_slot, true, None, is_latency_handoff)
+                }
                 None => {
                     let blocking_ipc_handoff = self.contexts[current_slot]
                         .is_some_and(|context| context.blocked)
@@ -2395,21 +2432,18 @@ impl Scheduler {
                         None => match self.reserved_user_pick(current_slot, now_ticks) {
                             Some(user_slot) => (user_slot, false, Some(user_slot)),
                             None => {
-                                let spawn_hint = self.take_next_spawn_pick_hint_ready_slot();
-                                let hint =
-                                    spawn_hint.or_else(|| self.take_next_pick_hint_ready_slot());
-                                let overdue = self.overdue_system_pick(current_slot, now_ticks);
+                                let overdue_or_hint =
+                                    self.take_overdue_system_or_pick_hint(current_slot, now_ticks);
                                 let cfs_pick = if voluntary_yield {
                                     self.pick_min_vruntime_excluding(current_slot)
                                         .or_else(|| self.pick_min_vruntime(current_slot))
                                 } else {
                                     self.pick_min_vruntime(current_slot)
                                 };
-                                match (hint, overdue, cfs_pick) {
-                                    (Some(hint_slot), _, _) => (hint_slot, true, None),
-                                    (None, Some(overdue_slot), _) => (overdue_slot, true, None),
-                                    (None, None, Some(slot)) => (slot, false, None),
-                                    (None, None, None) => (ROOT_TASK_SLOT, false, None),
+                                match (overdue_or_hint, cfs_pick) {
+                                    (Some(handoff_slot), _) => (handoff_slot, true, None),
+                                    (None, Some(slot)) => (slot, false, None),
+                                    (None, None) => (ROOT_TASK_SLOT, false, None),
                                 }
                             }
                         },
@@ -3283,9 +3317,9 @@ impl Scheduler {
             return false;
         }
         // Activation is the supervisor's commit point. A distinct one-shot
-        // spawn hint gives the newly owned task its first turn after the
-        // loader/supervisor reply chain without letting an earlier create
-        // race supervision. Generic IPC reply hints cannot overwrite it.
+        // spawn hint gives the newly owned task its first turn without letting
+        // an earlier create race supervision. Generic IPC reply hints cannot
+        // overwrite it.
         self.set_next_spawn_pick_hint(task_id);
         true
     }
@@ -4187,6 +4221,65 @@ mod tests {
     }
 
     #[test]
+    fn overdue_system_continuation_precedes_unrelated_ipc_hint_without_losing_it() {
+        let mut scheduler = boxed_scheduler();
+        let base = crate::memory::paging::USER_SPACE_BASE;
+        let user_cs = crate::arch::gdt::user_code_selector().0 as u64;
+        let user_ss = crate::arch::gdt::user_data_selector().0 as u64;
+        let mut allocate = |task_id, offset| {
+            scheduler
+                .allocate_user_slot(
+                    task_id,
+                    ProcessAddressSpace::empty_for_tests(),
+                    UserTaskBootstrap::new(
+                        UserAbi::Linux,
+                        x86_64::VirtAddr::new(base + offset),
+                        x86_64::VirtAddr::new(base + offset + 0x1_000),
+                    ),
+                    None,
+                    crate::arch::pit::divisor_from_micros(2_000)
+                        | super::INTERACTIVE_PIT_DIVISOR_FLAG,
+                    user_cs,
+                    user_ss,
+                    super::RFLAGS_RESERVED_BIT_1,
+                    false,
+                    noop_task_entry,
+                )
+                .expect("System task slot")
+        };
+        let current = allocate(811, 0x2_000);
+        let overdue = allocate(812, 0x4_000);
+        let hinted = allocate(813, 0x6_000);
+        scheduler.contexts[overdue]
+            .as_mut()
+            .expect("overdue context")
+            .ready_since_ticks = 1;
+        scheduler.contexts[hinted]
+            .as_mut()
+            .expect("hinted context")
+            .ready_since_ticks = 0;
+        scheduler.current_task = current;
+        scheduler.set_next_pick_hint(813);
+
+        let now_ticks = crate::arch::rtc::ticks_per_second().saturating_mul(2);
+        assert_eq!(
+            scheduler.take_overdue_system_or_pick_hint(current, now_ticks),
+            Some(overdue)
+        );
+        assert_eq!(scheduler.next_pick_hint, Some(hinted));
+
+        scheduler.contexts[overdue]
+            .as_mut()
+            .expect("overdue context")
+            .ready = false;
+        assert_eq!(
+            scheduler.take_overdue_system_or_pick_hint(current, now_ticks),
+            Some(hinted)
+        );
+        assert_eq!(scheduler.next_pick_hint, None);
+    }
+
+    #[test]
     fn spawn_handoff_is_one_shot_and_precedes_ipc_handoff() {
         let mut scheduler = boxed_scheduler();
         let base = crate::memory::paging::USER_SPACE_BASE;
@@ -4253,6 +4346,48 @@ mod tests {
         scheduler.set_next_pick_hint(802);
         assert_eq!(scheduler.take_next_spawn_pick_hint_ready_slot(), Some(3));
         assert_eq!(scheduler.take_next_pick_hint_ready_slot(), Some(2));
+    }
+
+    #[test]
+    fn committed_spawn_handoff_precedes_unrelated_latency_wakeup() {
+        let mut scheduler = boxed_scheduler();
+        let base = crate::memory::paging::USER_SPACE_BASE;
+        let user_cs = crate::arch::gdt::user_code_selector().0 as u64;
+        let user_ss = crate::arch::gdt::user_data_selector().0 as u64;
+        let allocate = |scheduler: &mut Scheduler, task_id, offset| {
+            scheduler
+                .allocate_user_slot(
+                    task_id,
+                    ProcessAddressSpace::empty_for_tests(),
+                    UserTaskBootstrap::new(
+                        UserAbi::Linux,
+                        x86_64::VirtAddr::new(base + offset),
+                        x86_64::VirtAddr::new(base + offset + 0x1_000),
+                    ),
+                    None,
+                    crate::arch::pit::divisor_from_micros(100),
+                    user_cs,
+                    user_ss,
+                    super::RFLAGS_RESERVED_BIT_1,
+                    false,
+                    noop_task_entry,
+                )
+                .expect("test task slot")
+        };
+        let child_slot = allocate(&mut scheduler, 910, 0x2_000);
+        let woken_slot = allocate(&mut scheduler, 911, 0x4_000);
+
+        scheduler.set_next_spawn_pick_hint(910);
+        assert!(scheduler.set_next_latency_pick_hint(911));
+
+        assert_eq!(
+            scheduler.take_next_bootstrap_handoff_ready_slot(),
+            Some((child_slot, false))
+        );
+        assert_eq!(
+            scheduler.take_next_bootstrap_handoff_ready_slot(),
+            Some((woken_slot, true))
+        );
     }
 
     #[test]

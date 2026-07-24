@@ -49,6 +49,12 @@ const EPOCH_SIGNATURE_OFFSET: usize = 104;
 const QUEUE_DEPTH: usize = DVM_BLOCK_QUEUE_DEPTH as usize;
 
 static INSTALLED: AtomicBool = AtomicBool::new(false);
+// PCI transport topology is fixed before user services start. Once another
+// ivshmem function proves enumeration is complete but none has the exact block
+// aperture shape, repeated storaged probes must not rescan every PCI function
+// or flood debugcon. A correctly shaped but not-yet-ready block aperture is
+// deliberately not cached here and remains retryable.
+static TOPOLOGY_ABSENT: AtomicBool = AtomicBool::new(false);
 static IRQ_PENDING: AtomicBool = AtomicBool::new(false);
 static IRQ_COUNT: AtomicU64 = AtomicU64::new(0);
 static IRQ_VECTOR: AtomicU8 = AtomicU8::new(0);
@@ -173,7 +179,7 @@ impl DvmBlockState {
             return Err(DvmBlockError::Busy);
         }
         if !self.ready_observed {
-            report_peer_ready_observation();
+            report_peer_ready_observation(self.geometry.generation);
         }
         self.ready_observed = true;
         let mut header = self.geometry;
@@ -307,6 +313,7 @@ impl DvmBlockState {
                 .is_ok()
         {
             report_first_completion_observation(
+                self.geometry.generation,
                 producer,
                 self.completion_consumer,
                 irq_was_pending,
@@ -498,7 +505,13 @@ fn report_injected_fault(operation: DvmBlockOperation, generation: u64) {
 fn report_injected_fault(_operation: DvmBlockOperation, _generation: u64) {}
 
 #[cfg(not(test))]
-fn report_peer_ready_observation() {
+fn report_peer_ready_observation(generation: u64) {
+    nucleus_core::debug::record_milestone(
+        nucleus_core::debug::LogCategory::Storage,
+        "dvm-block-peer-ready",
+        generation,
+        IRQ_COUNT.load(Ordering::Acquire),
+    );
     nucleus_core::debug::write_debugcon_only_line(
         alloc::format!(
             "dvm-block: peer ready observed irq_count={} irq_pending={} vector={:#x}",
@@ -511,10 +524,21 @@ fn report_peer_ready_observation() {
 }
 
 #[cfg(test)]
-fn report_peer_ready_observation() {}
+fn report_peer_ready_observation(_generation: u64) {}
 
 #[cfg(not(test))]
-fn report_first_completion_observation(producer: u64, consumer: u64, irq_was_pending: bool) {
+fn report_first_completion_observation(
+    generation: u64,
+    producer: u64,
+    consumer: u64,
+    irq_was_pending: bool,
+) {
+    nucleus_core::debug::record_milestone(
+        nucleus_core::debug::LogCategory::Storage,
+        "dvm-block-first-completion",
+        generation,
+        producer,
+    );
     nucleus_core::debug::write_debugcon_only_line(
         alloc::format!(
             "dvm-block: first completion observed producer={} consumer={} irq_count={} irq_was_pending={}",
@@ -528,7 +552,13 @@ fn report_first_completion_observation(producer: u64, consumer: u64, irq_was_pen
 }
 
 #[cfg(test)]
-fn report_first_completion_observation(_producer: u64, _consumer: u64, _irq_was_pending: bool) {}
+fn report_first_completion_observation(
+    _generation: u64,
+    _producer: u64,
+    _consumer: u64,
+    _irq_was_pending: bool,
+) {
+}
 
 pub(crate) fn try_install() -> bool {
     if INSTALLED.load(Ordering::Acquire) {
@@ -541,6 +571,9 @@ pub(crate) fn try_install() -> bool {
             }
         });
     }
+    if TOPOLOGY_ABSENT.load(Ordering::Acquire) {
+        return false;
+    }
     let mut guard = STATE.lock();
     if guard.is_some() {
         INSTALLED.store(true, Ordering::Release);
@@ -549,6 +582,7 @@ pub(crate) fn try_install() -> bool {
     let mut installed: Option<(DvmBlockState, crate::arch::pci::PciDevice)> = None;
     let mut ambiguous = false;
     let mut candidate_count = 0_u32;
+    let mut matching_shape_count = 0_u32;
     let mut reject_stage = "no-matching-ivshmem";
     let mut rejected_shared_bar = None;
     crate::arch::pci::visit_devices(|device| {
@@ -574,6 +608,7 @@ pub(crate) fn try_install() -> bool {
             ));
             return false;
         }
+        matching_shape_count = matching_shape_count.saturating_add(1);
         if registers.is_io
             || registers.size
                 < u64::try_from(IVSHMEM_DOORBELL_OFFSET + core::mem::size_of::<u32>())
@@ -632,6 +667,11 @@ pub(crate) fn try_install() -> bool {
         false
     });
     let Some((mut state, device)) = installed else {
+        let topology_absent =
+            fixed_pci_topology_lacks_block_aperture(candidate_count, matching_shape_count);
+        if topology_absent {
+            TOPOLOGY_ABSENT.store(true, Ordering::Release);
+        }
         let diagnostic = if let Some((start, size, is_io, is_64bit)) = rejected_shared_bar {
             alloc::format!(
                 "dvm-block: install rejected stage={} ivshmem_candidates={} shared_start={:#x} shared_size={:#x} shared_io={} shared_64={}",
@@ -690,9 +730,22 @@ pub(crate) fn try_install() -> bool {
         )
         .as_bytes(),
     );
+    nucleus_core::debug::record_milestone(
+        nucleus_core::debug::LogCategory::Storage,
+        "dvm-block-transport-installed",
+        state.geometry.generation,
+        state.geometry.capacity_sectors,
+    );
     *guard = Some(state);
     INSTALLED.store(true, Ordering::Release);
     true
+}
+
+const fn fixed_pci_topology_lacks_block_aperture(
+    ivshmem_candidates: u32,
+    matching_shapes: u32,
+) -> bool {
+    ivshmem_candidates != 0 && matching_shapes == 0
 }
 
 fn try_rebind_signed_epoch(state: &mut DvmBlockState) -> bool {
@@ -1100,6 +1153,13 @@ mod tests {
         DVM_BLOCK_FEATURE_FLUSH, DVM_BLOCK_FEATURE_FUA, DVM_BLOCK_FLAG_DVM_READY,
     };
     use ed25519_dalek::{Signer, SigningKey};
+
+    #[test]
+    fn fixed_nonblock_ivshmem_topology_is_negative_cached_only_after_enumeration() {
+        assert!(!fixed_pci_topology_lacks_block_aperture(0, 0));
+        assert!(fixed_pci_topology_lacks_block_aperture(2, 0));
+        assert!(!fixed_pci_topology_lacks_block_aperture(2, 1));
+    }
 
     fn aperture_bytes(aperture: &mut [u64]) -> &mut [u8] {
         // SAFETY: The u64 backing guarantees the production ABI's alignment;

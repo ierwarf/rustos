@@ -110,6 +110,11 @@ or launch policy.
   missing terminal paths, unbounded timeout edges, unregistered models,
   missing source witnesses, and any direct RustOS `.ko` lifecycle exception.
   `formal/selftest.sh` runs it before model execution.
+- `formal/check-performance-contracts.sh` binds the shared source limits to
+  typed compat IPC, single-attempt service publication, one-turn VFS recovery,
+  and the independent KVM five-second UI gate. It runs from `selftest.sh`;
+  widening a deadline, restoring an unclassified 30-second helper, or wrapping
+  endpoint publication in a retry loop is a contract failure before TLC.
 - Nightly evidence is `bash formal/verify-all.sh --profile nightly`: the PR
   tier plus selected fixed-seed simulation, Miri, Loom, Apalache, TLAPS, and
   bounded Rust/C libFuzzer lanes. Simulation and fuzzing are bug finding, not
@@ -220,7 +225,7 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
 
 - `cargo xtask build-dvm` invokes `driver-domains/linux/Makefile`; the build
   cryptographically verifies every installed module's detached PKCS#7 payload
-  against the generated X.509 certificate. `verify-dvm` validates schema 8 plus
+  against the generated X.509 certificate. `verify-dvm` validates schema 9 plus
   kernel, rootfs, Buildroot and kernel configs, signing certificate, source
   lock, and immutable DVM control-contract SHA-256 values before a KVM guest
   starts.
@@ -443,7 +448,7 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
   then requires `nvidia`, `nvidia_modeset`, and `nvidia_drm modeset=1 fbdev=0`
   from one pinned 580.173.02 release plus the matching GSP images; a partial or
   mixed-version stack never starts the display relay.
-  Artifact-manifest schema 8 binds an exact 25-key set: Buildroot and Linux
+  Artifact-manifest schema 9 binds an exact 25-key set: Buildroot and Linux
   versions, the NVIDIA-open release and source hash, the non-redistributable
   release posture, the permitted display-module set, every boot artifact, the
   kernel-enforced module-signing certificate and exact kernel configuration,
@@ -512,7 +517,7 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
   launch, or PCI assignment. Do not turn a successful preflight into a
   passthrough claim.
 - `rustos-hostd preflight-physical` adds the complete reversible runtime gate:
-  exact display-only policy and QEMU digest, the self-contained schema-8 DVM
+  exact display-only policy and QEMU digest, the self-contained schema-9 DVM
   bundle, a writable `/dev/iommu`, successful empty-IOAS allocate/destroy
   ioctls, a soft `RLIMIT_MEMLOCK` of at least 4 GiB, the same live host-display
   safety check, and schema-3 proof that the

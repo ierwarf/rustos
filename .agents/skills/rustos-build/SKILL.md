@@ -73,14 +73,13 @@ policy reinstalls the cached `linux-firmware` package into the already-pruned
 target tree, then invalidates the rootfs image, not the host toolchain.
 Verification must reject both missing and extra AMD firmware.
 
-Release rootfs generation keeps the `.cpio.xz` ABI but uses the wrapper's
-fixed-block parallel XZ contract. Do not invoke Buildroot directly or replace
-it with the upstream reproducible-build default: that silently restores the
-single-threaded `xz -9` bottleneck. On the current 454 MiB DVM rootfs the
-measured compression step is about 14 seconds and 182 MiB, versus about
-79 seconds and 144 MiB for the old default. The fixed block size, pinned host
-XZ, normalized input timestamps, and manifest hash retain deterministic
-release evidence; `verify-dvm` remains mandatory after integration.
+Release rootfs generation publishes the schema-9 `.cpio.zst` ABI through the
+wrapper's deterministic `zstd -3 -T1` contract. Do not invoke Buildroot
+directly or change the compressor ad hoc: the wrapper removes stale XZ images,
+normalizes packaging inputs, and binds the resulting Zstandard frame into the
+release manifest. This keeps decompression fast without making worker
+scheduling part of release reproducibility; `verify-dvm` remains mandatory
+after integration.
 
 The wrapper also preserves the host toolchain for a semantically verified
 additive defconfig change only when every changed `BR2_*` value transitions

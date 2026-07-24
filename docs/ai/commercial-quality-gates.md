@@ -79,7 +79,7 @@ can close that runtime gate only with the physical amdgpu assignment; a
 CPU-copy validation fallback is forbidden. The current Blackwell target uses the exact
 580.173.02 open-module/GSP pair and requires kernel-enforced signatures bound
 with their certificate and enforcement configuration to artifact-manifest
-schema 8. The manifest and seven named payload files must be admitted as one
+schema 9. The manifest and seven named payload files must be admitted as one
 self-contained, immutable, safely staged release directory. Its
 non-redistributable firmware license, target
 connector, DMA fault, reset, and 60 FPS page-flip captures are separate failed

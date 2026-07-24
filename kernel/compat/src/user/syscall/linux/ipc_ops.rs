@@ -24,7 +24,7 @@ const MAX_SERVICE_ENDPOINT_WAITERS: usize = 32;
 const SLOW_IPC_THRESHOLD_MS: u64 = 10;
 const MAX_SLOW_IPC_LOGS: usize = 128;
 const EARLY_IPC_SAMPLE_COUNT: usize = 6;
-const SERVICE_IPC_TIMEOUT_MS: u64 = 30_000;
+const SERVICE_IPC_TIMEOUT_MS: u64 = rustos_user_abi::performance::IPC_BULK_DATA_HARD_LIMIT_MS;
 // RING3-MIGRATION-REFERENCE START: rootd should own service namespace endpoint
 // ownership and capability leases. Ring0 keeps the temporary service registry
 // table until rootd can mint narrow broker capabilities.
@@ -37,6 +37,7 @@ static SERVICE_ENDPOINT_CAPS: [AtomicU64; MAX_SERVICE_ENDPOINTS] =
     [const { AtomicU64::new(0) }; MAX_SERVICE_ENDPOINTS];
 static SERVICE_ENDPOINT_EPOCHS: [AtomicU64; MAX_SERVICE_ENDPOINTS] =
     [const { AtomicU64::new(0) }; MAX_SERVICE_ENDPOINTS];
+const SERVICE_ENDPOINT_STABLE_READ_ATTEMPTS: usize = 3;
 // Rootd is the root of the service authority graph. The first successful
 // publication permanently seals its process identity for this boot. Process
 // identities never wrap or alias, so rootd exit is fail-stop until reboot
@@ -218,10 +219,13 @@ pub(crate) fn cleanup_service_endpoints_for_process(process_id: u64) {
     }
     for i in 0..MAX_SERVICE_ENDPOINTS {
         if SERVICE_ENDPOINT_OWNERS[i].load(Ordering::Acquire) == process_id {
-            advance_service_endpoint_epoch(i).expect("service endpoint epoch exhausted");
+            // Endpoint zero is the reader-visible revoke commit point. Clear
+            // it before the tuple fields and advance the public epoch last,
+            // matching the explicit revoke path below.
             SERVICE_ENDPOINTS[i].store(0, Ordering::Release);
             SERVICE_ENDPOINT_OWNERS[i].store(0, Ordering::Release);
             SERVICE_ENDPOINT_CAPS[i].store(0, Ordering::Release);
+            advance_service_endpoint_epoch(i).expect("service endpoint epoch exhausted");
             record_service_endpoint_milestone("ipc-service-exit-revoke", i as u64, process_id, 0);
             ipc_trace!(
                 "ipc service endpoint revoked on process exit: index={} process={}",
@@ -292,20 +296,38 @@ fn current_process_can_lookup_service_endpoint() -> bool {
 
 fn service_endpoint_raw(service_id: u64) -> Option<u64> {
     let index = service_index(service_id)?;
-    let _registry = SERVICE_ENDPOINT_REGISTRY_MUTATION.lock();
-    service_endpoint_raw_locked(index)
+    // Publication stores the endpoint last and revocation clears it first.
+    // An epoch/endpoint double-read therefore gives the IPC hot path a stable
+    // tuple without bouncing the global mutation-lock cache line on every
+    // service call. A concurrent mutation is reported as transient absence;
+    // callers already treat service restart/revoke as a bounded failure.
+    for _ in 0..SERVICE_ENDPOINT_STABLE_READ_ATTEMPTS {
+        let epoch_before = SERVICE_ENDPOINT_EPOCHS[index].load(Ordering::Acquire);
+        let endpoint_before = SERVICE_ENDPOINTS[index].load(Ordering::Acquire);
+        if endpoint_before == 0 {
+            return Some(0);
+        }
+        let owner = SERVICE_ENDPOINT_OWNERS[index].load(Ordering::Acquire);
+        let endpoint_after = SERVICE_ENDPOINTS[index].load(Ordering::Acquire);
+        let epoch_after = SERVICE_ENDPOINT_EPOCHS[index].load(Ordering::Acquire);
+        if endpoint_before == endpoint_after && epoch_before == epoch_after {
+            return Some(stable_service_endpoint_snapshot(
+                endpoint_before,
+                owner,
+                multitask::is_user_process_exiting(owner),
+            ));
+        }
+        core::hint::spin_loop();
+    }
+    Some(0)
 }
 
-fn service_endpoint_raw_locked(index: usize) -> Option<u64> {
-    let endpoint = SERVICE_ENDPOINTS[index].load(Ordering::Acquire);
-    if endpoint == 0 {
-        return Some(0);
+fn stable_service_endpoint_snapshot(endpoint: u64, owner: u64, owner_exiting: bool) -> u64 {
+    if endpoint == 0 || owner == 0 || owner_exiting {
+        0
+    } else {
+        endpoint
     }
-    let owner = SERVICE_ENDPOINT_OWNERS[index].load(Ordering::Acquire);
-    if owner == 0 || multitask::is_user_process_exiting(owner) {
-        return Some(0);
-    }
-    Some(endpoint)
 }
 
 fn service_index(service_id: u64) -> Option<usize> {
@@ -487,6 +509,29 @@ fn grant_current_process_service_call(
         record_service_call_grant(grants.as_mut_slice(), process_id, service_id, epoch)?;
     }
     Ok(endpoint)
+}
+
+fn current_process_granted_service_endpoint(service_id: u64) -> Result<Option<u64>, i64> {
+    let index = service_index(service_id).ok_or(LINUX_EINVAL)?;
+    let process_id = multitask::current_user_process_id().ok_or(LINUX_EINVAL)?;
+    let _registry = SERVICE_ENDPOINT_REGISTRY_MUTATION.lock();
+    let endpoint = SERVICE_ENDPOINTS[index].load(Ordering::Acquire);
+    let owner = SERVICE_ENDPOINT_OWNERS[index].load(Ordering::Acquire);
+    let epoch = SERVICE_ENDPOINT_EPOCHS[index].load(Ordering::Acquire);
+    if endpoint == 0 || owner == 0 || epoch == 0 {
+        return Err(LINUX_ENOSYS);
+    }
+    if multitask::is_user_process_exiting(owner) {
+        return Err(LINUX_ESRCH);
+    }
+    if owner == process_id {
+        return Ok(Some(endpoint));
+    }
+    let grants = SERVICE_CALL_GRANTS.lock();
+    Ok(
+        has_service_call_grant(grants.as_slice(), process_id, service_id, epoch)
+            .then_some(endpoint),
+    )
 }
 
 fn authorize_current_process_ipc_call(endpoint: u64) -> Result<(), i64> {
@@ -864,7 +909,23 @@ fn service_capability(service_id: u64) -> Result<ServiceCapabilityAuthorization,
         });
     }
     let rootd_epoch = service_endpoint_epoch(linux_abi::IPC_SERVICE_ROOTD).ok_or(LINUX_ENOENT)?;
+    // Endpoint registration is a rare authority transition, but it is on the
+    // boot-critical path. Keep the two kernel-stamped ends of the rootd
+    // round-trip visible so a delayed registrar is not misattributed to the
+    // local endpoint table or an unrelated storage request.
+    record_service_endpoint_milestone(
+        "ipc-service-capability-request",
+        service_id,
+        multitask::current_user_process_id().unwrap_or_default(),
+        rootd_epoch,
+    );
     let capability = service_capability_via_rootd(service_id)?;
+    record_service_endpoint_milestone(
+        "ipc-service-capability-reply",
+        service_id,
+        multitask::current_user_process_id().unwrap_or_default(),
+        capability,
+    );
     Ok(ServiceCapabilityAuthorization {
         capability,
         rootd_epoch: Some(rootd_epoch),
@@ -892,7 +953,11 @@ fn service_capability_via_rootd(service_id: u64) -> Result<u64, i64> {
     request.header.subject_pid = snapshot.process_id();
     request.header.subject_tid = snapshot.thread_id();
     request.arg0 = service_id;
-    let response = call_service_endpoint(linux_abi::IPC_SERVICE_ROOTD, as_bytes(&request))?;
+    let response = call_service_endpoint_with_class(
+        linux_abi::IPC_SERVICE_ROOTD,
+        as_bytes(&request),
+        ServiceIpcClass::BootControl,
+    )?;
     if response.len() != size_of::<CommercialMaxProtocolResponse>() {
         return Err(LINUX_EINVAL);
     }
@@ -914,6 +979,13 @@ pub(super) fn syscall_linux_rustos_ipc_lookup_service_endpoint(service_id: u64) 
     ipc_trace!("ipc lookup service endpoint: service={}", service_id);
     // Rootd is the authorization broker for service lookup, so its own
     // endpoint must remain directly discoverable as bootstrap substrate.
+    if service_id != linux_abi::IPC_SERVICE_ROOTD {
+        match current_process_granted_service_endpoint(service_id) {
+            Ok(Some(endpoint)) => return endpoint,
+            Ok(None) => {}
+            Err(errno) => return linux_errno(errno),
+        }
+    }
     if service_id != linux_abi::IPC_SERVICE_ROOTD && !current_process_can_lookup_service_endpoint()
     {
         if let Err(errno) = authorize_service_lookup_via_rootd(service_id) {
@@ -1074,7 +1146,11 @@ fn authorize_service_lookup_via_rootd(service_id: u64) -> Result<(), i64> {
     request.header.subject_pid = snapshot.process_id();
     request.header.subject_tid = snapshot.thread_id();
     request.arg0 = service_id;
-    let response = call_service_endpoint(linux_abi::IPC_SERVICE_ROOTD, as_bytes(&request))?;
+    let response = call_service_endpoint_with_class(
+        linux_abi::IPC_SERVICE_ROOTD,
+        as_bytes(&request),
+        ServiceIpcClass::BootControl,
+    )?;
     if response.len() != size_of::<CommercialMaxProtocolResponse>() {
         return Err(LINUX_EINVAL);
     }
@@ -1830,11 +1906,63 @@ pub(super) fn call_linux_syscall_endpoint(request: &[u8]) -> Result<Vec<u8>, i64
     Ok(response)
 }
 
-pub(super) fn call_service_endpoint(service_id: u64, request: &[u8]) -> Result<Vec<u8>, i64> {
-    call_service_endpoint_with_timeout(service_id, request, SERVICE_IPC_TIMEOUT_MS)
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ServiceIpcClass {
+    ReadinessQuery,
+    InteractiveControl,
+    BootControl,
+    BulkData,
 }
 
-pub(super) fn call_service_endpoint_with_timeout(
+impl ServiceIpcClass {
+    pub(super) const fn timeout_ms(self) -> u64 {
+        match self {
+            Self::ReadinessQuery => rustos_user_abi::performance::IPC_READINESS_QUERY_HARD_LIMIT_MS,
+            Self::InteractiveControl => {
+                rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS
+            }
+            Self::BootControl => rustos_user_abi::performance::IPC_BOOT_CONTROL_HARD_LIMIT_MS,
+            Self::BulkData => rustos_user_abi::performance::IPC_BULK_DATA_HARD_LIMIT_MS,
+        }
+    }
+
+    const fn cap_timeout_ms(self, requested_timeout_ms: u64) -> u64 {
+        let requested = if requested_timeout_ms == 0 {
+            1
+        } else {
+            requested_timeout_ms
+        };
+        let hard_limit = self.timeout_ms();
+        if requested < hard_limit {
+            requested
+        } else {
+            hard_limit
+        }
+    }
+}
+
+pub(super) fn call_service_endpoint_with_class(
+    service_id: u64,
+    request: &[u8],
+    class: ServiceIpcClass,
+) -> Result<Vec<u8>, i64> {
+    call_service_endpoint_with_timeout(service_id, request, class.timeout_ms())
+}
+
+pub(super) fn call_service_endpoint_with_class_deadline(
+    service_id: u64,
+    request: &[u8],
+    class: ServiceIpcClass,
+    requested_timeout_ms: u64,
+) -> Result<Vec<u8>, i64> {
+    call_service_endpoint_with_timeout(
+        service_id,
+        request,
+        class.cap_timeout_ms(requested_timeout_ms),
+    )
+}
+
+fn call_service_endpoint_with_timeout(
     service_id: u64,
     request: &[u8],
     timeout_ms: u64,
@@ -2497,6 +2625,28 @@ mod tests {
     fn public_ipc_calls_share_the_finite_service_deadline() {
         assert!(SERVICE_IPC_TIMEOUT_MS > 0);
         assert!(SERVICE_IPC_TIMEOUT_MS <= IPC_WAIT_SERVICE_ENDPOINT_MAX_TIMEOUT_MS);
+        assert_eq!(
+            ServiceIpcClass::ReadinessQuery.timeout_ms(),
+            rustos_user_abi::performance::IPC_READINESS_QUERY_HARD_LIMIT_MS
+        );
+        assert_eq!(
+            ServiceIpcClass::InteractiveControl.timeout_ms(),
+            rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS
+        );
+        assert_eq!(
+            ServiceIpcClass::BootControl.timeout_ms(),
+            rustos_user_abi::performance::IPC_BOOT_CONTROL_HARD_LIMIT_MS
+        );
+        assert_eq!(
+            ServiceIpcClass::BulkData.timeout_ms(),
+            SERVICE_IPC_TIMEOUT_MS
+        );
+        assert_eq!(
+            ServiceIpcClass::ReadinessQuery.cap_timeout_ms(u64::MAX),
+            rustos_user_abi::performance::IPC_READINESS_QUERY_HARD_LIMIT_MS
+        );
+        assert_eq!(ServiceIpcClass::BootControl.cap_timeout_ms(37), 37);
+        assert_eq!(ServiceIpcClass::InteractiveControl.cap_timeout_ms(0), 1);
     }
 
     #[test]
@@ -2504,6 +2654,15 @@ mod tests {
         assert_eq!(next_service_endpoint_epoch(0), Some(1));
         assert_eq!(next_service_endpoint_epoch(1), Some(2));
         assert_eq!(next_service_endpoint_epoch(u64::MAX), None);
+    }
+
+    #[test]
+    fn stable_service_endpoint_snapshot_rejects_revoked_owners() {
+        assert_eq!(SERVICE_ENDPOINT_STABLE_READ_ATTEMPTS, 3);
+        assert_eq!(stable_service_endpoint_snapshot(47, 41, false), 47);
+        assert_eq!(stable_service_endpoint_snapshot(0, 41, false), 0);
+        assert_eq!(stable_service_endpoint_snapshot(47, 0, false), 0);
+        assert_eq!(stable_service_endpoint_snapshot(47, 41, true), 0);
     }
 
     #[test]

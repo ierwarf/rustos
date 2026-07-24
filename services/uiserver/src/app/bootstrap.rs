@@ -414,7 +414,10 @@ impl AppState {
         let console_commands = start_console_command_dispatcher(console_fd);
         boot_line("uiserver: console command dispatcher spawn done");
         boot_line("uiserver: gpu compositor init begin");
-        let gpu_compositor = Some(GpuCompositorRuntime::new(surface_state.display)?);
+        let gpu_compositor = Some(GpuCompositorRuntime::new(
+            display_fd.as_raw_fd(),
+            surface_state.display,
+        )?);
         boot_line("uiserver: gpu compositor init done");
         Ok(Self {
             display: surface_state.display,
@@ -452,7 +455,10 @@ impl AppState {
         self.surface = surface_state.surface;
         self.surface_fd = surface_state.surface_fd;
         self.frame = surface_state.frame;
-        self.gpu_compositor = Some(GpuCompositorRuntime::new(self.display)?);
+        self.gpu_compositor = Some(GpuCompositorRuntime::new(
+            self.display_fd.as_raw_fd(),
+            self.display,
+        )?);
         self.cursor_x = self.cursor_x.min(self.display.width.saturating_sub(1));
         self.cursor_y = self.cursor_y.min(self.display.height.saturating_sub(1));
         self.dragging_window = None;

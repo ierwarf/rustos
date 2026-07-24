@@ -1,8 +1,9 @@
 use std::io::Write;
 use std::mem::size_of;
 use std::slice;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 mod block;
 
@@ -18,13 +19,25 @@ use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_STORAGED_OP_ROOT_VOLUME_SELECT, COMMERCIAL_MAX_STORAGED_OP_VOLUME_METADATA,
     IPC_SERVICE_STORAGED, IPC_SERVICE_VFSD, STORAGED_BULK_READ_PAYLOAD_CAPACITY,
     STORAGE_FLAG_READONLY, STORAGE_TRANSPORT_DVM_BLOCK, SYS_RUSTOS_DEBUG_PRINT,
-    SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_RECV_WITH_SENDER,
-    SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
+    SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_RECV_WITH_SENDER, SYS_RUSTOS_IPC_REPLY,
 };
 
 const RECV_BACKOFF: Duration = Duration::from_millis(50);
+const DVM_E2E_EVENT_WAIT: Duration = Duration::from_secs(30);
 static mut STORAGED_BULK_RESPONSE_SLOT: StoragedBulkReadResponse =
     StoragedBulkReadResponse::zeroed();
+// Endpoint registration proves the service identity only. The generation is
+// published after its own read-only E2E FLUSH, and every request rebinds that
+// proof to current DVM geometry before touching storage.
+static DVM_E2E_READY_GENERATION: AtomicU64 = AtomicU64::new(0);
+// A readiness transition may cause many normal loader probes. Keep the first
+// one observable, but never let expected `EAGAIN` diagnostics become a DVM
+// boot-time work source themselves.
+static DVM_NOT_READY_DIAGNOSTIC_EMITTED: AtomicBool = AtomicBool::new(false);
+// The readiness owner may legitimately observe the same unavailable state
+// many times before a fixed DVM transport appears. Emit only errno
+// transitions; a successful generation resets the witness.
+static DVM_READINESS_LAST_ERRNO: AtomicU64 = AtomicU64::new(0);
 
 fn main() {
     observability_client::info!("storaged", service, "service started");
@@ -41,7 +54,8 @@ fn main() {
     }
     debug_line("storaged: endpoint create done");
     debug_line("storaged: endpoint register begin");
-    let register = register_service_endpoint(IPC_SERVICE_STORAGED, endpoint as u64);
+    let register =
+        rustos_svc_runtime::ipc::register_service_endpoint(IPC_SERVICE_STORAGED, endpoint as u64);
     if register < 0 {
         debug_line(format!("storaged: endpoint register failed errno={}", -register).as_str());
         let _ = writeln!(
@@ -52,18 +66,99 @@ fn main() {
         return;
     }
     debug_line("storaged: storage policy endpoint registered");
-    prove_dvm_block_end_to_end();
+    if let Err(error) = thread::Builder::new()
+        .name("storaged-dvm-ready".to_string())
+        .spawn(supervise_dvm_block_readiness)
+    {
+        debug_line(format!("storaged: dvm readiness worker failed error={error}").as_str());
+        // A published endpoint without its sole readiness owner would return
+        // `EAGAIN` forever.  Exit so rootd can revoke/restart this lease
+        // rather than presenting false storage liveness.
+        return;
+    }
     serve(endpoint as u64);
 }
 
-fn prove_dvm_block_end_to_end() {
-    let result = block::info().and_then(|info| {
-        block::flush(info.generation)?;
-        Ok(info.generation)
-    });
-    if let Ok(generation) = result {
-        debug_line(dvm_block_e2e_marker(generation).as_str());
+/// Own the only bounded DVM-ready wait outside the receive loop. Event wakes
+/// cause an exact geometry recheck; a revoke or successor generation removes
+/// the old proof before requests can use it.
+fn supervise_dvm_block_readiness() {
+    let mut proven_generation = 0_u64;
+    loop {
+        match block::wait_until_ready().and_then(|info| {
+            if info.generation == proven_generation {
+                return Ok(info.generation);
+            }
+            DVM_E2E_READY_GENERATION.store(0, Ordering::Release);
+            block::flush(info.generation)?;
+            Ok(info.generation)
+        }) {
+            Ok(generation) => {
+                if generation != proven_generation {
+                    DVM_E2E_READY_GENERATION.store(generation, Ordering::Release);
+                    note_dvm_request_ready();
+                    proven_generation = generation;
+                    debug_line(dvm_block_e2e_marker(generation).as_str());
+                }
+            }
+            Err(errno) => {
+                DVM_E2E_READY_GENERATION.store(0, Ordering::Release);
+                log_dvm_readiness_failure(errno);
+                thread::sleep(RECV_BACKOFF);
+                continue;
+            }
+        }
+        // This is an atomic check-arm-recheck sleep. Completion/revoke wakes
+        // revalidate the generation without a timer polling loop.
+        let _ = block::wait_for_transport_event(Instant::now() + DVM_E2E_EVENT_WAIT);
     }
+}
+
+fn dvm_e2e_ready_for_current_generation() -> Result<block::BlockInfo, i32> {
+    let info = block::info()?;
+    if e2e_generation_matches(
+        DVM_E2E_READY_GENERATION.load(Ordering::Acquire),
+        info.generation,
+    ) {
+        Ok(info)
+    } else {
+        Err(libc::EAGAIN)
+    }
+}
+
+const fn e2e_generation_matches(proven_generation: u64, live_generation: u64) -> bool {
+    proven_generation != 0 && proven_generation == live_generation
+}
+
+fn transient_dvm_not_ready(errno: i32) -> bool {
+    matches!(errno, libc::EAGAIN | libc::ENODEV | libc::ENOSYS)
+}
+
+fn log_dvm_readiness_failure(errno: i32) {
+    let encoded = readiness_errno_witness(errno);
+    if DVM_READINESS_LAST_ERRNO.swap(encoded, Ordering::AcqRel) != encoded {
+        debug_line(format!("storaged: dvm-block readiness wait failed errno={errno}").as_str());
+    }
+}
+
+const fn readiness_errno_witness(errno: i32) -> u64 {
+    (errno as u32 as u64).saturating_add(1)
+}
+
+fn log_dvm_request_rejection(stage: &str, op: u16, errno: i32) {
+    if !transient_dvm_not_ready(errno)
+        || !DVM_NOT_READY_DIAGNOSTIC_EMITTED.swap(true, Ordering::AcqRel)
+    {
+        let _ = writeln!(
+            std::io::stderr(),
+            "storaged: request rejected stage={stage} op={op} errno={errno}"
+        );
+    }
+}
+
+fn note_dvm_request_ready() {
+    DVM_NOT_READY_DIAGNOSTIC_EMITTED.store(false, Ordering::Release);
+    DVM_READINESS_LAST_ERRNO.store(0, Ordering::Release);
 }
 
 fn dvm_block_e2e_marker(generation: u64) -> String {
@@ -143,14 +238,15 @@ fn reply_commercial_request(reply_cap: u64, request: &CommercialMaxProtocolReque
             );
             errno
         }
-        Ok(()) => match dispatch_commercial(request, &mut response) {
-            Ok(()) => 0,
+        Ok(()) => match dvm_e2e_ready_for_current_generation()
+            .and_then(|info| dispatch_commercial(request, &mut response, info))
+        {
+            Ok(()) => {
+                note_dvm_request_ready();
+                0
+            }
             Err(errno) => {
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "storaged: request rejected stage=dispatch op={} errno={errno}",
-                    request.header.op
-                );
+                log_dvm_request_rejection("dispatch", request.header.op, errno);
                 errno
             }
         },
@@ -189,7 +285,10 @@ fn reply_bulk_read(reply_cap: u64, request: &CommercialMaxProtocolRequest) {
             );
             errno
         }
-        Ok(()) => match block::read(request.arg0, request.arg1, request.arg2) {
+        Ok(()) => match dvm_e2e_ready_for_current_generation().and_then(|info| {
+            require_request_generation(request, info)?;
+            block::read(request.arg0, request.arg1, request.arg2)
+        }) {
             Ok(bytes) if bytes.len() <= STORAGED_BULK_READ_PAYLOAD_CAPACITY => {
                 unsafe {
                     (*response).payload_len = bytes.len() as u32;
@@ -199,15 +298,12 @@ fn reply_bulk_read(reply_cap: u64, request: &CommercialMaxProtocolRequest) {
                         bytes.len(),
                     );
                 }
+                note_dvm_request_ready();
                 0
             }
             Ok(_) => libc::EOVERFLOW,
             Err(errno) => {
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "storaged: request rejected stage=dispatch op={} errno={errno}",
-                    request.header.op
-                );
+                log_dvm_request_rejection("dispatch", request.header.op, errno);
                 errno
             }
         },
@@ -233,17 +329,18 @@ fn reply_bulk_read(reply_cap: u64, request: &CommercialMaxProtocolRequest) {
 fn dispatch_commercial(
     request: &CommercialMaxProtocolRequest,
     response: &mut CommercialMaxProtocolResponse,
+    info: block::BlockInfo,
 ) -> Result<(), i32> {
     match request.header.op {
         COMMERCIAL_MAX_STORAGED_OP_BLOCK_INVENTORY | COMMERCIAL_MAX_STORAGED_OP_PARTITION_SCAN => {
-            let descriptors = list_descriptors()?;
+            let descriptors = list_descriptors(info)?;
             response.value0 = descriptors.len() as u64;
             fill_storage_descriptors(&descriptors, request.header.op, response);
             Ok(())
         }
         COMMERCIAL_MAX_STORAGED_OP_ROOT_VOLUME_SELECT
         | COMMERCIAL_MAX_STORAGED_OP_VOLUME_METADATA => {
-            let descriptor = selected_root_descriptor()?;
+            let descriptor = selected_root_descriptor(info)?;
             response.value0 = descriptor.id as u64;
             response.descriptor_count = 1;
             response.descriptors[0] = storage_descriptor(&descriptor, request.header.op);
@@ -252,7 +349,6 @@ fn dispatch_commercial(
             Ok(())
         }
         COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_INFO => {
-            let info = block::info()?;
             response.value0 = info.generation;
             response.value1 = info.capacity_sectors;
             let wire = DvmBlockInfoWire {
@@ -268,6 +364,7 @@ fn dispatch_commercial(
             Ok(())
         }
         COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_READ => {
+            require_request_generation(request, info)?;
             let bytes = block::read(request.arg0, request.arg1, request.arg2)?;
             if bytes.len() > response.payload.len() {
                 return Err(libc::EOVERFLOW);
@@ -279,6 +376,7 @@ fn dispatch_commercial(
             Ok(())
         }
         COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_WRITE => {
+            require_request_generation(request, info)?;
             let fua = request.arg3 & COMMERCIAL_MAX_STORAGED_BLOCK_FLAG_FUA != 0;
             block::write(
                 request.arg0,
@@ -291,6 +389,7 @@ fn dispatch_commercial(
             Ok(())
         }
         COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_FLUSH => {
+            require_request_generation(request, info)?;
             block::flush(request.arg0)?;
             response.value0 = request.arg0;
             Ok(())
@@ -299,8 +398,19 @@ fn dispatch_commercial(
     }
 }
 
-fn selected_root_descriptor() -> Result<StorageBlockDescriptorWire, i32> {
-    let descriptors = list_descriptors()?;
+fn require_request_generation(
+    request: &CommercialMaxProtocolRequest,
+    info: block::BlockInfo,
+) -> Result<(), i32> {
+    if request.arg0 == info.generation {
+        Ok(())
+    } else {
+        Err(libc::EAGAIN)
+    }
+}
+
+fn selected_root_descriptor(info: block::BlockInfo) -> Result<StorageBlockDescriptorWire, i32> {
+    let descriptors = list_descriptors(info)?;
     descriptors
         .iter()
         .copied()
@@ -314,8 +424,7 @@ fn root_selection_rank(descriptor: &StorageBlockDescriptorWire) -> (u8, u8, u32)
     (partition_rank, readonly_rank, descriptor.id)
 }
 
-fn list_descriptors() -> Result<Vec<StorageBlockDescriptorWire>, i32> {
-    let info = block::info()?;
+fn list_descriptors(info: block::BlockInfo) -> Result<Vec<StorageBlockDescriptorWire>, i32> {
     let sectors_per_block = u64::from(info.logical_block_size / 512);
     if sectors_per_block == 0 || !info.capacity_sectors.is_multiple_of(sectors_per_block) {
         return Err(libc::EIO);
@@ -496,26 +605,6 @@ fn syscall6(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, 
     unsafe { libc::syscall(number as libc::c_long, arg0, arg1, arg2, arg3, arg4, arg5) as i64 }
 }
 
-fn register_service_endpoint(service_id: u64, endpoint: u64) -> i64 {
-    let mut last = 0;
-    for _ in 0..65_536 {
-        last = syscall2(
-            SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT,
-            service_id,
-            endpoint,
-        );
-        if last >= 0 {
-            return last;
-        }
-        let errno = (-last) as i32;
-        if errno != libc::EACCES && errno != libc::EPERM && errno != libc::ENOENT {
-            return last;
-        }
-        thread::yield_now();
-    }
-    last
-}
-
 fn debug_line(message: &str) {
     let bytes = message.as_bytes();
     let len = bytes.len().min(1023);
@@ -575,6 +664,48 @@ mod tests {
             dvm_block_e2e_marker(7),
             "storaged: dvm-block e2e flush completed generation=7 \
              path=vfs-policy->block-broker->shared-ring->linux-dvm->backing"
+        );
+    }
+
+    #[test]
+    fn storage_requests_require_the_exact_proven_generation() {
+        assert!(e2e_generation_matches(7, 7));
+        assert!(!e2e_generation_matches(0, 7));
+        assert!(!e2e_generation_matches(7, 8));
+    }
+
+    #[test]
+    fn stale_io_generation_is_rejected_before_a_dvm_submission() {
+        let mut read = request(COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_READ);
+        read.arg0 = 7;
+        let live = block::BlockInfo {
+            generation: 8,
+            capacity_sectors: 1024,
+            logical_block_size: 512,
+            physical_block_size: 512,
+            features: 0,
+            flags: 0,
+        };
+        assert_eq!(require_request_generation(&read, live), Err(libc::EAGAIN));
+        read.arg0 = live.generation;
+        assert_eq!(require_request_generation(&read, live), Ok(()));
+    }
+
+    #[test]
+    fn only_expected_readiness_absence_is_rate_limited() {
+        assert!(transient_dvm_not_ready(libc::EAGAIN));
+        assert!(transient_dvm_not_ready(libc::ENODEV));
+        assert!(transient_dvm_not_ready(libc::ENOSYS));
+        assert!(!transient_dvm_not_ready(libc::EIO));
+        assert!(!transient_dvm_not_ready(libc::EACCES));
+        assert_ne!(readiness_errno_witness(libc::ENODEV), 0);
+        assert_eq!(
+            readiness_errno_witness(libc::ENODEV),
+            readiness_errno_witness(libc::ENODEV)
+        );
+        assert_ne!(
+            readiness_errno_witness(libc::ENODEV),
+            readiness_errno_witness(libc::EIO)
         );
     }
 }

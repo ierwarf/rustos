@@ -101,6 +101,31 @@ pub fn cacheable_metadata_errno(errno: i32) -> bool {
     matches!(errno, ENOENT | ENOTDIR)
 }
 
+/// Immutable DVM file bytes may be retained only within these service-owned
+/// bounds. The values are policy, rather than a transport capability: a cache
+/// miss must remain a bounded range read through the current storage epoch.
+pub const FILE_BYTES_CACHE_MAX_ENTRY_BYTES: usize = 16 * 1024 * 1024;
+pub const FILE_BYTES_CACHE_BUDGET_BYTES: usize = 32 * 1024 * 1024;
+
+/// Returns the exact file size only when the current request demonstrates a
+/// complete-file reuse pattern. Header probes, partial sequential reads, and
+/// nonzero-offset reads must remain bounded range reads: a `pread` is never
+/// authority to transfer bytes the caller did not request across the DVM
+/// storage boundary.
+pub fn should_materialize_file_cache(
+    file_len: u64,
+    start: u64,
+    request_len: usize,
+) -> Option<usize> {
+    let file_len = usize::try_from(file_len).ok()?;
+    (file_len > 0
+        && file_len <= FILE_BYTES_CACHE_MAX_ENTRY_BYTES
+        && file_len <= FILE_BYTES_CACHE_BUDGET_BYTES
+        && start == 0
+        && request_len >= file_len)
+        .then_some(file_len)
+}
+
 pub const VFSD_CHECKPOINT_HANDLE_TAG: u64 = 0x4844_4c45_0000_0001;
 pub const VFSD_CHECKPOINT_PATH_TAG: u64 = 0x4850_4154_0000_0000;
 pub const VFSD_OPEN_CHECKPOINT_VERSION: u16 = 1;
@@ -544,6 +569,37 @@ mod tests {
         assert_eq!(
             bounded_early_system_chunk(EARLY_SYSTEM_BROKER_MAX_IO_BYTES * 16),
             EARLY_SYSTEM_BROKER_MAX_IO_BYTES
+        );
+    }
+
+    #[test]
+    fn dvm_elf_header_probes_do_not_materialize_entire_files() {
+        assert_eq!(should_materialize_file_cache(913_960, 0, 64), None);
+        assert_eq!(should_materialize_file_cache(913_960, 0, 672), None);
+        assert_eq!(
+            should_materialize_file_cache(913_960, 4_096, 64 * 1024),
+            None
+        );
+    }
+
+    #[test]
+    fn dvm_file_cache_requires_a_complete_file_read() {
+        assert_eq!(
+            should_materialize_file_cache(20 * 1024, 0, 20 * 1024),
+            Some(20 * 1024)
+        );
+        assert_eq!(should_materialize_file_cache(913_960, 0, 64 * 1024), None);
+        assert_eq!(
+            should_materialize_file_cache(913_960, 0, 913_960),
+            Some(913_960)
+        );
+        assert_eq!(
+            should_materialize_file_cache(
+                (FILE_BYTES_CACHE_MAX_ENTRY_BYTES + 1) as u64,
+                0,
+                64 * 1024
+            ),
+            None
         );
     }
 

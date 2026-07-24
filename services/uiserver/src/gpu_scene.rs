@@ -205,6 +205,78 @@ impl<'a> GpuAtlasPacker<'a> {
         self.place(source, width, height, stride_pixels, true)
     }
 
+    pub(crate) fn write_xrgb_at(
+        &mut self,
+        destination: Rect,
+        source: &[u32],
+        stride_pixels: usize,
+    ) -> Result<(), GpuSceneError> {
+        let source_required = destination
+            .height
+            .checked_sub(1)
+            .and_then(|rows| rows.checked_mul(stride_pixels))
+            .and_then(|prefix| prefix.checked_add(destination.width));
+        if destination.is_empty()
+            || stride_pixels < destination.width
+            || source_required.is_none_or(|required| required > source.len())
+            || destination.x == 0
+            || destination.y == 0
+            || destination
+                .x
+                .checked_add(destination.width)
+                .is_none_or(|end| end >= self.width)
+            || destination
+                .y
+                .checked_add(destination.height)
+                .is_none_or(|end| end >= self.height)
+        {
+            return Err(GpuSceneError::InvalidLayer);
+        }
+        let outer_x = destination.x - Self::PADDING;
+        let outer_y = destination.y - Self::PADDING;
+        let outer_width = destination.width + Self::PADDING * 2;
+        let outer_height = destination.height + Self::PADDING * 2;
+        for row in outer_y..outer_y + outer_height {
+            let start = row
+                .checked_mul(self.stride_pixels)
+                .and_then(|offset| offset.checked_add(outer_x))
+                .ok_or(GpuSceneError::InvalidLayer)?;
+            let end = start
+                .checked_add(outer_width)
+                .ok_or(GpuSceneError::InvalidLayer)?;
+            self.pixels
+                .get_mut(start..end)
+                .ok_or(GpuSceneError::InvalidLayer)?
+                .fill(0);
+        }
+        for row in 0..destination.height {
+            let source_start = row
+                .checked_mul(stride_pixels)
+                .ok_or(GpuSceneError::InvalidLayer)?;
+            let source_end = source_start
+                .checked_add(destination.width)
+                .ok_or(GpuSceneError::InvalidLayer)?;
+            let destination_start = (destination.y + row)
+                .checked_mul(self.stride_pixels)
+                .and_then(|offset| offset.checked_add(destination.x))
+                .ok_or(GpuSceneError::InvalidLayer)?;
+            let destination_end = destination_start
+                .checked_add(destination.width)
+                .ok_or(GpuSceneError::InvalidLayer)?;
+            let source_row = source
+                .get(source_start..source_end)
+                .ok_or(GpuSceneError::InvalidLayer)?;
+            let destination_row = self
+                .pixels
+                .get_mut(destination_start..destination_end)
+                .ok_or(GpuSceneError::InvalidLayer)?;
+            for (destination, source) in destination_row.iter_mut().zip(source_row) {
+                *destination = *source | 0xff00_0000;
+            }
+        }
+        Ok(())
+    }
+
     fn place(
         &mut self,
         source: &[u32],

@@ -45,7 +45,6 @@ const MAX_SLOW_RUNTIME_REFRESH_LOGS: usize = 8;
 const MAX_WAYLAND_CALLBACK_ONLY_LOGS: usize = 8;
 const MAX_CURSOR_PIPELINE_LOGS: usize = 32;
 const UI_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
-const UI_INPUT_PULSE_INTERVAL: Duration = Duration::from_millis(40);
 const UI_WATCHDOG_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 const UI_PHASE_PANIC_THRESHOLD_MS: u64 = 3_000;
 const WAYLAND_BACKLOG_SERVICE_INTERVAL: Duration = Duration::from_millis(4);
@@ -210,6 +209,26 @@ fn prepare_drawable_update(
     drawable_update.promote_large_partial(state.surface.width, state.surface.height);
     drawable_update.split_large_partials();
     drawable_update
+}
+
+fn apply_ready_desktop_backgrounds(
+    state: &mut AppState,
+    backgrounds: &std::sync::mpsc::Receiver<render::DesktopBackground>,
+) -> bool {
+    let mut ready = false;
+    while let Ok(background) = backgrounds.try_recv() {
+        if background.width == state.surface.width as usize
+            && background.height == state.surface.height as usize
+        {
+            state.desktop_cache.width = background.width;
+            state.desktop_cache.height = background.height;
+            state.desktop_cache.background_pixels = background.pixels;
+            state.desktop_cache.background_valid = true;
+            state.desktop_cache.chrome_valid = false;
+            ready = true;
+        }
+    }
+    ready
 }
 
 fn present_drawable_update(
@@ -767,6 +786,22 @@ fn run() -> Result<(), i32> {
     diag_line("uiserver: first present done");
     boot_line("uiserver: first present done");
     log_boot_stage(first_present_started, "first_present");
+
+    // Complete the already-dispatched mandatory GPU path before unrelated
+    // Wayland, runtime-catalog, and application policy startup can compete for
+    // CPU or IPC service turns. This bounded local-only turn is not a
+    // fallback; the main loop retains the same fail-closed recovery contract.
+    let gpu_activation_deadline = Instant::now()
+        + Duration::from_millis(rustos_user_abi::performance::UI_BOOT_GPU_ACTIVATION_BUDGET_MS);
+    while Instant::now() < gpu_activation_deadline {
+        let gpu_initialized = state.poll_gpu_completions()?;
+        let background_ready = apply_ready_desktop_backgrounds(&mut state, &desktop_background);
+        if (gpu_initialized || background_ready) && state.present_gpu_update(true)? {
+            break;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+
     diag_line("uiserver: post-present init begin");
     let mut pending_update = VisualUpdate::default();
     let mut presented_cursor_x = state.cursor_x;
@@ -815,7 +850,6 @@ fn run() -> Result<(), i32> {
     let mut next_cursor_blink = Instant::now() + CURSOR_BLINK_INTERVAL;
     let mut next_cursor_motion_settle = Instant::now() + CURSOR_MOTION_SETTLE_INTERVAL;
     let mut next_loop_summary = Instant::now() + UI_HEARTBEAT_INTERVAL;
-    let mut next_input_pulse = Instant::now();
     let mut next_wayland_backlog_service = Instant::now();
     let mut next_wayland_callback_pulse = Instant::now();
     // The boot frame is a real presentation, so it grants exactly one
@@ -850,19 +884,7 @@ fn run() -> Result<(), i32> {
             pending_update.request_full();
         }
 
-        let mut background_ready = false;
-        while let Ok(background) = desktop_background.try_recv() {
-            if background.width == state.surface.width as usize
-                && background.height == state.surface.height as usize
-            {
-                state.desktop_cache.width = background.width;
-                state.desktop_cache.height = background.height;
-                state.desktop_cache.background_pixels = background.pixels;
-                state.desktop_cache.background_valid = true;
-                state.desktop_cache.chrome_valid = false;
-                background_ready = true;
-            }
-        }
+        let background_ready = apply_ready_desktop_backgrounds(&mut state, &desktop_background);
         if background_ready {
             diag_line("uiserver: desktop background ready");
             pending_update.request_full();
@@ -896,24 +918,6 @@ fn run() -> Result<(), i32> {
                     .max(previous.elapsed().as_millis().min(u128::from(u64::MAX)) as u64);
             }
             last_input_processed_at = Some(now);
-            if now >= next_input_pulse {
-                let input_reader = input_events.snapshot();
-                diag_line(format!(
-                    "uiserver: input pulse events={} cursor={},{} pointer_motion={} pointer_position={} wayland_motion_calls={} backlog={} input_raw_events={} input_events={} input_drops={} input_errors={}",
-                    input.input_events,
-                    state.cursor_x,
-                    state.cursor_y,
-                    input.pointer_motion_events,
-                    input.pointer_position_events,
-                    input.wayland_motion_calls,
-                    input.backlog_remaining,
-                    input_reader.raw_events,
-                    input_reader.delivered_events,
-                    input_reader.queue_drops,
-                    input_reader.errors,
-                ));
-                next_input_pulse = now + UI_INPUT_PULSE_INTERVAL;
-            }
         }
         processed_input_events_total =
             processed_input_events_total.saturating_add(input.input_events);
@@ -1206,6 +1210,9 @@ fn main() {
     boot_line("uiserver: main enter");
     install_panic_hook();
     boot_line("uiserver: panic hook installed");
+    if profile::enabled() {
+        diag_line("uiserver: acceptance profile enabled");
+    }
     if let Err(err) = sys::start_display_policy_endpoint() {
         sys::debug_line(&format!(
             "uiserver: display policy endpoint failed errno={err}"

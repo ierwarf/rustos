@@ -128,7 +128,9 @@ const BOOTSTRAP_MANIFEST: [BootstrapServiceSpec; 5] = [
         service_id: IPC_SERVICE_LOADERD,
         exec_path: LOADERD_EXEC,
         weight_micros: CORE_SERVICE_WEIGHT_MICROS,
-        dependency_mask: 0,
+        // loaderd requests terminally sealed executable snapshots from vfsd;
+        // it never reads mutable path-backed bytes into a commit transaction.
+        dependency_mask: DEP_VFSD,
         bootstrap_direct: true,
         restart_direct: true,
     },
@@ -2634,6 +2636,22 @@ mod tests {
         assert!(!service_dependency_allowed(
             IPC_SERVICE_VFSD,
             IPC_SERVICE_NETD
+        ));
+    }
+
+    #[test]
+    fn loaderd_lookup_authority_includes_only_immutable_vfs_source() {
+        assert!(service_dependency_allowed(
+            IPC_SERVICE_LOADERD,
+            IPC_SERVICE_VFSD
+        ));
+        assert!(!service_dependency_allowed(
+            IPC_SERVICE_LOADERD,
+            IPC_SERVICE_STORAGED
+        ));
+        assert!(!service_dependency_allowed(
+            IPC_SERVICE_LOADERD,
+            IPC_SERVICE_DEVMGRD
         ));
     }
 
