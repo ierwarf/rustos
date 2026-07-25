@@ -329,6 +329,70 @@ pub struct WaitSetSignalBrokerArgs {
     pub reserved0: u64,
 }
 
+/// Accept only the exact public wait-set signal wire shape before ring0 looks
+/// up provider authority. Keep this pure so the ABI boundary can be proved
+/// independently of scheduler and IPC state.
+pub const fn waitset_signal_shape_valid(args: &WaitSetSignalBrokerArgs) -> bool {
+    args.abi_version == WAITSET_ABI_VERSION
+        && args.provider >= WAITSET_PROVIDER_VFSD
+        && args.provider <= WAITSET_PROVIDER_MAX
+        && args.flags == 0
+        && args.object_id == WAITSET_GLOBAL_OBJECT_ID
+        && args.generation != 0
+        && args.reserved0 == 0
+}
+
+#[cfg(kani)]
+mod waitset_signal_verification {
+    use super::*;
+
+    #[kani::proof]
+    fn accepted_waitset_signal_has_exact_bounded_shape() {
+        let args = WaitSetSignalBrokerArgs {
+            abi_version: kani::any(),
+            provider: kani::any(),
+            flags: kani::any(),
+            object_id: kani::any(),
+            generation: kani::any(),
+            reserved0: kani::any(),
+        };
+        let accepted = waitset_signal_shape_valid(&args);
+        kani::cover!(accepted);
+        kani::cover!(!accepted);
+        if accepted {
+            assert_eq!(args.abi_version, WAITSET_ABI_VERSION);
+            assert!(args.provider >= WAITSET_PROVIDER_VFSD);
+            assert!(args.provider <= WAITSET_PROVIDER_MAX);
+            assert_eq!(args.flags, 0);
+            assert_eq!(args.object_id, WAITSET_GLOBAL_OBJECT_ID);
+            assert_ne!(args.generation, 0);
+            assert_eq!(args.reserved0, 0);
+        }
+    }
+
+    #[kani::proof]
+    fn malformed_waitset_signal_is_never_accepted() {
+        let args = WaitSetSignalBrokerArgs {
+            abi_version: kani::any(),
+            provider: kani::any(),
+            flags: kani::any(),
+            object_id: kani::any(),
+            generation: kani::any(),
+            reserved0: kani::any(),
+        };
+        let malformed = args.abi_version != WAITSET_ABI_VERSION
+            || args.provider < WAITSET_PROVIDER_VFSD
+            || args.provider > WAITSET_PROVIDER_MAX
+            || args.flags != 0
+            || args.object_id != WAITSET_GLOBAL_OBJECT_ID
+            || args.generation == 0
+            || args.reserved0 != 0;
+        kani::assume(malformed);
+        kani::cover!(malformed);
+        assert!(!waitset_signal_shape_valid(&args));
+    }
+}
+
 /// vfsd-owned epoll interest snapshot. `target_fd` preserves Linux's
 /// descriptor-key semantics, while `(provider, object_id)` binds the entry to
 /// the underlying open description so fd-number reuse cannot retarget it.
@@ -2636,8 +2700,35 @@ mod syscall_tests {
         VFS_EXECUTABLE_SNAPSHOT_ABI_VERSION, VFS_EXECUTABLE_SNAPSHOT_OP_OPEN, VFS_IPC_ABI_VERSION,
         VFS_IPC_OP_OPENAT, VFS_IPC_PAYLOAD_CAPACITY, VFS_IPC_RESPONSE_HEADER_BYTES,
         VfsExecutableSnapshotRequest, VfsExecutableSnapshotResponse, VfsIpcRequest, VfsIpcResponse,
-        identity_is_exact_sender, loader_service_role_allows_operation,
+        WAITSET_ABI_VERSION, WAITSET_GLOBAL_OBJECT_ID, WAITSET_PROVIDER_VFSD,
+        WaitSetSignalBrokerArgs, identity_is_exact_sender, loader_service_role_allows_operation,
+        waitset_signal_shape_valid,
     };
+
+    #[test]
+    fn waitset_signal_requires_the_exact_public_wire_shape() {
+        let valid = WaitSetSignalBrokerArgs {
+            abi_version: WAITSET_ABI_VERSION,
+            provider: WAITSET_PROVIDER_VFSD,
+            flags: 0,
+            object_id: WAITSET_GLOBAL_OBJECT_ID,
+            generation: 1,
+            reserved0: 0,
+        };
+        assert!(waitset_signal_shape_valid(&valid));
+        assert!(!waitset_signal_shape_valid(&WaitSetSignalBrokerArgs {
+            generation: 0,
+            ..valid
+        }));
+        assert!(!waitset_signal_shape_valid(&WaitSetSignalBrokerArgs {
+            provider: 0,
+            ..valid
+        }));
+        assert!(!waitset_signal_shape_valid(&WaitSetSignalBrokerArgs {
+            reserved0: 1,
+            ..valid
+        }));
+    }
 
     #[test]
     fn commercial_response_envelope_matches_exact_request_and_bounds_nested_fields() {

@@ -18,6 +18,7 @@ esac
 bash formal/selftest.sh
 bash formal/run-source-conformance.sh
 bash formal/run-all-tlc.sh --profile "$profile"
+bash formal/run-spec-mutations.sh
 bash formal/run-kani.sh
 bash formal/run-verus.sh
 bash formal/run-runtime-traces.sh

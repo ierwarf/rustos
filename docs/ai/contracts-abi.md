@@ -582,7 +582,9 @@ policy remains with the owning service.
   On timeout, compat cancels the reply cap so queued and already-received
   endpoint calls cannot be completed by a late reply. Timeout cancellation
   records an `ipc-reply-timeout` milestone with the reply cap, caller task, and
-  cancellation status.
+  cancellation status. This high-frequency milestone stays in the bounded
+  in-kernel milestone ring and appears in an explicit postmortem dump; it must
+  not emit a synchronous debugcon line for every readiness timeout.
 - Endpoint process-owner teardown wakes both pending callers and tasks blocked
   in receive on that endpoint. Task exit must also prune stale receiver
   waiters owned by the exiting task from every endpoint.
@@ -1585,7 +1587,11 @@ do not admit a service, a module-loading path, or a future ABI reuse.
 - Strict admission for bootstrap syscall/VFS/loader/process/pager brokers comes
   only from `rootd`'s fixed manifest. Dynamic package metadata cannot set
   `TASK_WEIGHT_INTERACTIVE_FLAG`; admitted ready brokers are covered by the
-  bounded System-class wait rail. In the non-blocked selection lane, an overdue
+  bounded System-class wait rail. Loaderd and vfsd surrender that base
+  admission after the exact authenticated uiserver image transaction, and
+  runtimed does so after uiserver bootstrap; later strict latency is
+  reply-scoped priority donation, not a permanent bulk-I/O privilege. In the
+  non-blocked selection lane, an overdue
   System continuation wins one turn before a generic IPC hint without
   discarding that hint; otherwise reply floods can defeat the stated wait
   bound even though each individual handoff is valid.

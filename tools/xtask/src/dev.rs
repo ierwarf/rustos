@@ -31,7 +31,35 @@ impl DevPlan {
 
 pub(crate) fn print_plan(root: &Path) -> Result<()> {
     let paths = changed_paths(root)?;
-    let plan = classify_changes(root, &paths);
+    let formal_impact = crate::formal_contracts::load_impact(root, &paths)?;
+    if !formal_impact.unmapped_high_risk.is_empty() {
+        bail!(
+            "high-risk changed paths lack a formal contract mapping: {}",
+            formal_impact
+                .unmapped_high_risk
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    let mut plan = classify_changes(root, &paths);
+    if !formal_impact.models.is_empty() {
+        plan.scopes.insert("formal-impact");
+        plan.push_now("cargo xtask formal-contracts check");
+        for model in formal_impact.models {
+            plan.push_now(format!("bash formal/run-tlc.sh {model}"));
+        }
+        for witness in formal_impact.witnesses {
+            let mut command = format!("cargo test -q -p {}", witness.package);
+            if !witness.features.is_empty() {
+                command.push_str(&format!(" --features {}", witness.features));
+            }
+            command.push_str(&format!(" {} -- --exact", witness.test));
+            plan.push_now(command);
+        }
+        plan.push_stable("bash formal/verify-all.sh --profile pr");
+    }
 
     println!("changed={}", paths.len());
     if paths.is_empty() {

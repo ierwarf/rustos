@@ -101,6 +101,28 @@ they are not an exception to RustOS kernel/service lifecycle contracts.
 | `memory-map` | canonical checked range → page install → W^X protection changes → unmap | compat MM broker, `kernel/mm` | mapped, rejected, unmapped |
 | `syscall-simd-lifecycle` | trust-boundary user snapshot → kernel continuation → optional block/preemption → exact-task restore | `kernel-compat`, `kernel-ps` | returned, nested capture rejection, wrong-task restore rejection |
 | `pci-resource-discovery` | disable command decode → probe/restore low BAR → probe/restore optional high BAR → lowest-mask-bit size decode → command restore/publication | `kernel-hal` | exact resource, invalid-mask rejection, fully restored hardware |
+| `zero-trust-e2e` | kernel-stamped receive → exact wire/identity/delegation validation → object-generation admission → request-bound response | IPC substrate, receiving service, subsystem owner, caller | admitted response, malformed/foreign denial, timeout, revoke |
+| `commercial-envelope` | exact request envelope → service dispatch → exact response envelope or peer/deadline failure | service owner, caller, IPC substrate | admitted response, malformed request/response, peer exit, timeout |
+| `entropy-boundary` | boot RNG seed admission → private master derivation → capability-gated bounded copyout | boot protocol, `kernel-executive`, `kernel-compat` | entropy delivery, zero-seed rejection, authority/shape denial |
+| `boot-info-admission` | untrusted boot record → version/size/canonical-field checks → admitted immutable boot state | boot protocol | admitted record, malformed record rejection, zero-RNG rejection |
+| `executable-image-admission` | complete ELF/PE bytes → shared range/W^X/entry admission → accepted image or rejection | image admission, `loaderd` | ELF/PE admission, W+X rejection, overflow/alias rejection |
+| `bootstrap-content-admission` | normalized early-system path → immutable record lookup → exact SHA-256 verification | boot protocol, `kernel/io-manager` | admitted bytes, path/digest/missing-record rejection |
+| `dvm-control-ingress` | secret-derived channel → exact CID/frame → nonce/session proof | host control owner, DVM agent | authenticated session, foreign/duplicate/bad-proof revoke |
+| `dvm-block-ingress` | address-free exact-generation request → bounded ring dispatch → ticket/durability-bound completion | block transport substrate, storage DVM | completion, malformed request, stale completion revoke |
+| `dvm-network-ingress` | bounded ring header → live control epoch → validated IPv4/ARP payload → exact revoke | network transport substrate, `inputd`, `netd` | frame delivery, malformed payload denial, stale/exact revoke |
+| `dvm-input-ingress` | bounded cursor-separated ring → policy-consumer admission → epoch/sequence/checksum validation | input transport substrate, `inputd` | record delivery, malformed record denial, transport revoke |
+| `dvm-display-ingress` | authenticated display header → exact-predecessor damage → complete immutable snapshot publication | display transport substrate, `uiserver` | frame publication, shape/damage denial, provider/revoke failure |
+| `dvm-read-cache` | generation-bound read miss → bounded window plan → exact-range cache publication or invalidation | `storaged` | cache hit/fill, range rejection, generation revoke |
+| `wayland-client-ingress` | local client accept → bounded request/object validation → one-generation dispatch | `uiserver` | delivered request, malformed/buffer denial, client revoke |
+| `msi-vector-ingress` | bounded vector lease → exact handler bind → masked table programming → commit or rollback | `kernel-hal` | active route, unauthorized bind denial, complete rollback |
+| `process-address-space-lifecycle` | generation retain → serialized exec/exit mutation or thread attach → frozen exit epoch → final reclaim | `kernel-ps` | committed mutation/attach, exit-race rejection, final reclaim |
+| `ipc-handle-transfer` | rights-checked export → atomic message batch → invisible receive reservation → all-or-nothing install | IPC runtime, compat, fd/open-description substrate | installed batch, export/capacity denial, timeout/peer/exec revoke |
+| `process-signal-lifecycle` | pending selection → mask/action/target recheck → handler/stop/kill or fault disposition | compat signal policy, `kernel-ps`, exception bridge | delivery, stale selection denial, recoverable fault, terminal exit |
+| `futex-wait-lifecycle` | exact task/key registration → scheduler arm → wake/requeue, deadline, or task exit cleanup | compat futex owner, `kernel-ps` | wake, timeout, exit cleanup |
+| `netd-deferred-reply-lifecycle` | global pending-slot reserve → bounded detach batch → exactly one terminal reply | `netd` | reply, capacity/queue failure, timeout |
+| `input-delivery-lifecycle` | authenticated DVM record → atomic ingestion-worker arm → bounded drain → readiness generation → authorized UI read | input transport, `inputd`, wait-set, `uiserver` | delivered event, malformed record, provider timeout, transport revoke |
+| `gpu-frame-lifecycle` | live primed provider → bounded scene/capability → address-free submit → acquire/completion/page-flip fences | `uiserver`, display substrate, Linux DVM | displayed frame, provider/scene denial, stale completion revoke, hard timeout |
+| `acpi-firmware-admission` | checksummed root SDT → atomic MCFG admission → exact HPET GAS admission or explicit legacy/no-HPET topology | `kernel-hal` | ECAM/HPET topology or explicit bounded fallback topology |
 
 ## External design baselines
 

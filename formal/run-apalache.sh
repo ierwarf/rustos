@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Cross-check two small typed refinements with a second symbolic model checker.
+# Cross-check small typed refinements with a second symbolic model checker.
 set -euo pipefail
 repo_root="$(git rev-parse --show-toplevel)"
 version="$(sed -n 's/^version=//p' "$repo_root/formal/apalache.lock")"
@@ -26,7 +26,9 @@ run_model "$repo_root/formal/apalache-pilots/ExecTicketPilot.tla" \
     TypeOK,PendingIsExactlyBound,TicketIsOneShot
 run_model "$repo_root/formal/apalache-pilots/IpcHandleTransferPilot.tla" \
     TypeOK,RegistryExactlyTracksTransfer,TerminalCannotPinAuthority
+run_model "$repo_root/formal/apalache-pilots/UserspaceWaitSetPilot.tla" \
+    TypeOK,SleepingHasExactGeneration,NoSleepWithoutWaiter,RevokedCannotSleep
 jq -n --arg version "$version" \
-    '{schema:"rustos-apalache-evidence-v1",status:"passed",tool:{name:"Apalache",version:$version},models:2,bound:8,claim:"typed bounded symbolic refinement pilots"}' \
+    '{schema:"rustos-apalache-evidence-v1",status:"passed",tool:{name:"Apalache",version:$version},models:3,bound:8,claim:"typed bounded symbolic refinement pilots"}' \
     >"$artifact_dir/summary.json"
-printf 'Apalache pilots passed models=2 version=%s\n' "$version"
+printf 'Apalache pilots passed models=3 version=%s\n' "$version"

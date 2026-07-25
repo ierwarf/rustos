@@ -91,6 +91,7 @@ struct GpuAtlasSlot {
 struct PendingGpuFrame {
     slot_index: usize,
     surface_handle: u32,
+    submitted_at: Instant,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -625,6 +626,7 @@ impl GpuCompositor {
         self.pending.push(PendingGpuFrame {
             slot_index,
             surface_handle,
+            submitted_at: Instant::now(),
         });
         self.damage_history.push_back(AtlasDamageEpoch {
             epoch: self.next_content_epoch,
@@ -744,7 +746,6 @@ impl GpuCompositor {
         let Some(frame) = self.pending.first().copied() else {
             return Ok(false);
         };
-        let deadline = blocking.then(|| Instant::now() + GPU_COMPLETION_TIMEOUT);
         loop {
             match display_gpu_query_completion(self.display_fd, frame.surface_handle) {
                 Ok(query) => {
@@ -759,8 +760,13 @@ impl GpuCompositor {
                     self.pending.remove(0);
                     return Ok(true);
                 }
-                Err(EAGAIN) if !blocking => return Ok(false),
-                Err(EAGAIN) if deadline.is_some_and(|end| Instant::now() < end) => {
+                Err(EAGAIN)
+                    if !blocking
+                        && !gpu_completion_timed_out(frame.submitted_at, Instant::now()) =>
+                {
+                    return Ok(false);
+                }
+                Err(EAGAIN) if !gpu_completion_timed_out(frame.submitted_at, Instant::now()) => {
                     thread::sleep(GPU_COMPLETION_POLL);
                 }
                 Err(EAGAIN) => return Err(ETIMEDOUT),
@@ -768,6 +774,10 @@ impl GpuCompositor {
             }
         }
     }
+}
+
+fn gpu_completion_timed_out(submitted_at: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(submitted_at) >= GPU_COMPLETION_TIMEOUT
 }
 
 fn next_frame_deadline(mut deadline: Instant, now: Instant) -> Instant {
@@ -1062,10 +1072,11 @@ fn gpu_scene_errno(_error: GpuSceneError) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        copy_atlas_damage_to_slot, difference_bounds, gpu_provider_admission, next_frame_deadline,
-        reconstruction_damage_within_budget, snapshot_damage_for_slot, AtlasDamageEpoch,
-        DvmGpuAtlasDamage, GpuProviderAdmission, Rect, DISPLAY_INFO_FLAG_DVM_SCANOUT,
-        DISPLAY_INFO_FLAG_GPU_COMPOSITOR, GPU_FRAME_INTERVAL,
+        copy_atlas_damage_to_slot, difference_bounds, gpu_completion_timed_out,
+        gpu_provider_admission, next_frame_deadline, reconstruction_damage_within_budget,
+        snapshot_damage_for_slot, AtlasDamageEpoch, DvmGpuAtlasDamage, GpuProviderAdmission, Rect,
+        DISPLAY_INFO_FLAG_DVM_SCANOUT, DISPLAY_INFO_FLAG_GPU_COMPOSITOR, GPU_COMPLETION_TIMEOUT,
+        GPU_FRAME_INTERVAL,
     };
     use crate::sys::DisplayInfo;
     use std::collections::VecDeque;
@@ -1145,6 +1156,19 @@ mod tests {
             next_frame_deadline(origin, origin + Duration::from_millis(49)),
             origin + Duration::from_millis(60)
         );
+    }
+
+    #[test]
+    fn completion_timeout_is_measured_from_submission_without_a_blocking_wait() {
+        let submitted_at = Instant::now();
+        assert!(!gpu_completion_timed_out(
+            submitted_at,
+            submitted_at + GPU_COMPLETION_TIMEOUT - Duration::from_nanos(1),
+        ));
+        assert!(gpu_completion_timed_out(
+            submitted_at,
+            submitted_at + GPU_COMPLETION_TIMEOUT,
+        ));
     }
 
     #[test]

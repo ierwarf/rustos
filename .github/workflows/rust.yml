@@ -78,6 +78,8 @@ jobs:
 
     steps:
     - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      with:
+        fetch-depth: 0
     - name: Cache formal toolchains
       uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
       with:
@@ -100,6 +102,19 @@ jobs:
       run: bash formal/setup-kani.sh
     - name: Install pinned Verus proof kernel
       run: bash formal/setup-verus.sh
+    - name: Enforce formal impact mapping for changed high-risk source
+      env:
+        PR_BASE: ${{ github.event.pull_request.base.sha }}
+        PUSH_BASE: ${{ github.event.before }}
+      run: |
+        base="$PR_BASE"
+        if [[ -z "$base" ]]; then
+          base="$PUSH_BASE"
+        fi
+        if [[ -z "$base" || "$base" =~ ^0+$ ]]; then
+          base="HEAD^"
+        fi
+        cargo xtask formal-contracts impact --base "$base"
     - name: Verify RustOS formal contracts and implementation boundaries
       run: bash formal/verify-all.sh --profile pr
     - name: Upload formal evidence

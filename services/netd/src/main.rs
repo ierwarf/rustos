@@ -11,6 +11,7 @@ use std::thread;
 use std::time::{Duration, Instant as StdInstant};
 
 use rustos_user_abi::linux as linux_abi;
+use rustos_user_abi::performance::IPC_READINESS_QUERY_HARD_LIMIT_MS;
 use rustos_user_abi::syscall::{
     CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
     CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, NetdIpcRequest, NetdIpcResponse,
@@ -91,7 +92,8 @@ const SOCKET_CONTROL_BUFFER_CAPACITY: usize = 64 * 1024;
 const INET_TCP_BUFFER_CAPACITY: usize = 16 * 1024;
 const INET_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const INET_IO_POLL_BUDGET: usize = 256;
-const LOCAL_SOCKET_POLL_WAIT_BUDGET: Duration = Duration::from_secs(5);
+const LOCAL_SOCKET_POLL_WAIT_BUDGET: Duration =
+    Duration::from_millis(IPC_READINESS_QUERY_HARD_LIMIT_MS);
 // A mapped aperture can appear before the L0-authenticated control relay has
 // delivered SESSION_START. Delay only that explicitly transitional state so a
 // boot-time client does not race into a fabricated permanent ENODEV. A truly
@@ -2699,6 +2701,14 @@ mod local_socket_poll_tests {
         };
         assert!(!is_deferred_local_poll_request(&query));
         assert!(!is_blocking_request(&query));
+    }
+
+    #[test]
+    fn local_poll_wait_budget_matches_readiness_service_cap() {
+        assert_eq!(
+            LOCAL_SOCKET_POLL_WAIT_BUDGET,
+            Duration::from_millis(IPC_READINESS_QUERY_HARD_LIMIT_MS),
+        );
     }
 
     #[test]

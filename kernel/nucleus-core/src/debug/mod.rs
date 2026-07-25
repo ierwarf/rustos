@@ -15,7 +15,6 @@ use os_observatory::sink::{RingBufferSink as ObservatoryRingBufferSink, Sink as 
 pub use rustos_observability::{LogCategory, LogLevel};
 #[cfg(rustos_debug_print_enabled)]
 use spin::{Mutex, RwLock};
-#[cfg(all(rustos_debug_print_enabled, not(test)))]
 #[cfg(rustos_debug_print_enabled)]
 include!(concat!(env!("OUT_DIR"), "/logging_build.rs"));
 
@@ -604,6 +603,7 @@ fn milestone_debugcon_visible(name: &str) -> bool {
     !matches!(
         name,
         "boot"
+            | "ipc-reply-timeout"
             | "driver-loader"
             | "module-probe-entry"
             | "module-probe-virtio-net"
@@ -1005,5 +1005,15 @@ mod tests {
             "seq=0 ts_us=0 tick=0 lvl=warn cat=debug mod=nucleus_core::debug line=0 pid=- tid=- msg=\"oldest logs dropped\"\n"
         ));
         assert!(snapshot.contains("gamma"));
+    }
+
+    #[test]
+    fn high_frequency_ipc_timeout_milestones_stay_off_debugcon() {
+        // Timeout evidence remains in the bounded milestone ring and is
+        // included in explicit postmortem dumps. Emitting one formatted
+        // debugcon line per readiness timeout would turn each byte into a KVM
+        // port-I/O exit and make the diagnostic path amplify the overload.
+        assert!(!milestone_debugcon_visible("ipc-reply-timeout"));
+        assert!(milestone_debugcon_visible("proc-commit-address-space-done"));
     }
 }

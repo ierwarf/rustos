@@ -15,8 +15,11 @@ declare -A seen_transition=()
 declare -A seen_requirement=()
 declare -A seen_hazard=()
 declare -A flow_seen=()
+declare -A flow_is_critical=()
 declare -A flow_start=()
 declare -A flow_terminal=()
+declare -A flow_terminal_kind_count=()
+declare -A seen_terminal_kind=()
 declare -A from_state=()
 declare -A continuing_target=()
 
@@ -91,12 +94,18 @@ while IFS=$'\t' read -r flow transition requirement hazard severity owner from e
     seen_requirement[$requirement]=1
     seen_hazard[$hazard]=1
     flow_seen[$flow]=1
+    [[ "$severity" != critical ]] || flow_is_critical[$flow]=1
     from_state["$flow|$from"]=1
     [[ "$from" != START ]] || flow_start[$flow]=1
     if [[ "$outcome" == continue ]]; then
         continuing_target["$flow|$to"]="$transition_key"
     else
         flow_terminal[$flow]=1
+        terminal_key="$flow|$outcome"
+        if [[ -z "${seen_terminal_kind[$terminal_key]:-}" ]]; then
+            seen_terminal_kind[$terminal_key]=1
+            flow_terminal_kind_count[$flow]=$((${flow_terminal_kind_count[$flow]:-0} + 1))
+        fi
     fi
     rows=$((rows + 1))
 done < "$registry"
@@ -104,11 +113,54 @@ done < "$registry"
 for flow in "${!flow_seen[@]}"; do
     [[ -n "${flow_start[$flow]:-}" ]] || { echo "flow has no START edge: $flow" >&2; exit 1; }
     [[ -n "${flow_terminal[$flow]:-}" ]] || { echo "flow has no terminal outcome: $flow" >&2; exit 1; }
+    # ACPI admission has several successful terminal topologies: ECAM/HPET,
+    # legacy PCI configuration, and no-HPET. Malformed firmware cannot grant
+    # partial authority, so those explicit degraded topologies are not errors.
+    if [[ -n "${flow_is_critical[$flow]:-}"
+        && "${flow_terminal_kind_count[$flow]:-0}" -lt 2
+        && "$flow" != acpi-firmware-admission ]]; then
+        echo "critical flow has only one terminal outcome class: $flow" >&2
+        exit 1
+    fi
 done
 
 for target in "${!continuing_target[@]}"; do
     [[ -n "${from_state[$target]:-}" ]] || {
         echo "continuing flow state has no outgoing transition: ${continuing_target[$target]} -> ${target#*|}" >&2
+        exit 1
+    }
+done
+
+declare -A documented_flow=()
+while IFS= read -r flow; do
+    [[ -n "$flow" ]] || continue
+    if [[ -n "${documented_flow[$flow]:-}" ]]; then
+        echo "duplicate registered-flow documentation row: $flow" >&2
+        exit 1
+    fi
+    documented_flow[$flow]=1
+done < <(
+    awk '
+        /^## Registered whole flows$/ { in_registry = 1; next }
+        in_registry && /^## / { exit }
+        in_registry && /^\| `/ {
+            row = $0
+            sub(/^\| `/, "", row)
+            sub(/`.*/, "", row)
+            print row
+        }
+    ' docs/ai/system-flows.md
+)
+
+for flow in "${!flow_seen[@]}"; do
+    [[ -n "${documented_flow[$flow]:-}" ]] || {
+        echo "executable flow is missing from docs/ai/system-flows.md: $flow" >&2
+        exit 1
+    }
+done
+for flow in "${!documented_flow[@]}"; do
+    [[ -n "${flow_seen[$flow]:-}" ]] || {
+        echo "documented flow has no executable contract: $flow" >&2
         exit 1
     }
 done

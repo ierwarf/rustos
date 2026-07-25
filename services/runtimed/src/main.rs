@@ -6,7 +6,9 @@ use std::time::{Duration, Instant};
 
 use runtime_control::{StartupMode, DEFAULT_RUNTIME_SOCKET_PATH};
 use rustos_user_abi::console as console_abi;
-use rustos_user_abi::syscall::{SYS_RUSTOS_DEBUG_PRINT, TASK_WEIGHT_INTERACTIVE_FLAG};
+use rustos_user_abi::syscall::{
+    SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_SCHED_DEMOTE_SELF, TASK_WEIGHT_INTERACTIVE_FLAG,
+};
 
 mod catalog;
 mod session;
@@ -266,6 +268,7 @@ fn ensure_ui_bootstrap(state: &mut BrokerState) -> bool {
         Ok(()) => {
             spawn::debug_line("runtimed: bootstrap ui done");
             boot_line("runtimed: bootstrap ui done");
+            require_post_ui_user_class();
             true
         }
         Err(err) => {
@@ -289,4 +292,14 @@ fn ensure_ui_bootstrap(state: &mut BrokerState) -> bool {
             true
         }
     }
+}
+
+fn require_post_ui_user_class() {
+    let status = unsafe { libc::syscall(SYS_RUSTOS_SCHED_DEMOTE_SELF as libc::c_long) as i64 };
+    if status == 0 {
+        spawn::debug_line("runtimed: post-ui scheduling class=user");
+        return;
+    }
+    spawn::debug_line("runtimed: fatal post-ui scheduling demotion failed");
+    std::process::exit(134);
 }

@@ -233,6 +233,18 @@ where
             .context("network exercise lost its shared DVM network aperture")?;
         verify_dvm_network_round_trip(shared_network)?;
     }
+    crate::formal_contracts::record_kvm_runtime_trace(
+        &config.root_dir,
+        crate::formal_contracts::KvmRuntimeObservation {
+            elapsed_ms: boot_started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+            storage: options.dvm_block_shmem,
+            input: true,
+            display: options.gui_dvm_surfaces,
+            network: options.exercise_network,
+            ui_budget: options.min_ui_fps.is_some(),
+            storage_only: options.storage_only,
+        },
+    )?;
     println!(
         "xtask: parallel KVM boot passed (RustOS + Linux DVM); control={} established authenticated L0 input relay (DVM cid={}, inventory={}, virtio-net={}, virtio-gpu={}) without QMP",
         artifacts.control.control_plane(),

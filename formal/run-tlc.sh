@@ -23,8 +23,13 @@ row="$(awk -F '\t' -v wanted="$model" '$1 == wanted { print; found++ } END { if 
 }
 IFS=$'\t' read -r _model _class deadlock_policy _reason pr_timeout nightly_timeout _nightly_mode _apalache _tlaps _trace <<< "$row"
 
-spec="$formal_dir/$model.tla"
-config="$formal_dir/$model.cfg"
+if [[ -n "${TLA_SPEC_OVERRIDE:-}${TLA_CONFIG_OVERRIDE:-}" &&
+      "${FORMAL_MUTATION_MODE:-0}" != 1 ]]; then
+    echo "TLA overrides are restricted to FORMAL_MUTATION_MODE=1" >&2
+    exit 2
+fi
+spec="${TLA_SPEC_OVERRIDE:-$formal_dir/$model.tla}"
+config="${TLA_CONFIG_OVERRIDE:-$formal_dir/$model.cfg}"
 lock="$formal_dir/tla2tools.lock"
 [[ -f "$spec" && -f "$config" ]] || { echo "missing TLA+ model or configuration for $model" >&2; exit 2; }
 

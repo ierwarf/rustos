@@ -15,10 +15,17 @@ use rustos_user_abi::syscall::{
 use storage_core::{BlockDevice, IoResult, StorageError};
 
 use super::{EAGAIN, EINVAL, EIO, ENODEV, ENOSYS};
-use vfsd::{admit_dvm_block_geometry, storage_error_from_linux_status, validate_dvm_block_range};
+use vfsd::{
+    admit_dvm_block_geometry, cooperative_bulk_yield_state, storage_error_from_linux_status,
+    validate_dvm_block_range,
+};
 
 const IPC_BLOCK_PAYLOAD_BYTES: usize =
     rustos_user_abi::syscall::COMMERCIAL_MAX_PROTOCOL_PAYLOAD_CAPACITY;
+// FAT may satisfy a large executable snapshot as hundreds of cache-hot block
+// requests after one DVM read-ahead completion. Bound the uninterrupted
+// System-class service burst independently of individual IPC chunk size.
+const BULK_COOPERATIVE_YIELD_BYTES: usize = 64 * 1024;
 static mut STORAGED_BULK_RESPONSE_SLOT: StoragedBulkReadResponse =
     StoragedBulkReadResponse::zeroed();
 // Not-ready is an expected, bounded state while the DVM proves its initial
@@ -30,6 +37,7 @@ pub(super) struct BootBlockDevice {
     pub(super) generation: u64,
     pub(super) block_size: usize,
     pub(super) block_count: u64,
+    bulk_bytes_since_yield: usize,
 }
 
 impl BootBlockDevice {
@@ -58,6 +66,7 @@ impl BootBlockDevice {
             generation: info.generation,
             block_size,
             block_count,
+            bulk_bytes_since_yield: 0,
         })
     }
 
@@ -81,6 +90,7 @@ impl BootBlockDevice {
             request.arg2 = block_count;
             call_storaged_bulk(&request, &mut out[done..done + byte_len])
                 .map_err(|errno| storage_error_from_linux_status(-(errno as i64)))?;
+            self.account_bulk_progress(byte_len);
             done += byte_len;
         }
         Ok(())
@@ -121,9 +131,22 @@ impl BootBlockDevice {
                     } as i64),
                 ));
             }
+            self.account_bulk_progress(byte_len);
             done += byte_len;
         }
         Ok(())
+    }
+
+    fn account_bulk_progress(&mut self, completed_bytes: usize) {
+        let total = self.bulk_bytes_since_yield.saturating_add(completed_bytes);
+        let (remainder, should_yield) =
+            cooperative_bulk_yield_state(total, BULK_COOPERATIVE_YIELD_BYTES);
+        self.bulk_bytes_since_yield = remainder;
+        if should_yield {
+            unsafe {
+                rustos_svc_runtime::syscall::syscall0(rustos_user_abi::linux::SYS_SCHED_YIELD);
+            }
+        }
     }
 }
 

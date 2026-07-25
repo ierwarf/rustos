@@ -24,14 +24,14 @@ dvm-amdgpu-evidence/DvmAmdgpuEvidence	safety	intentional-terminal	evidence decis
 dvm-amdgpu-supply/DvmAmdgpuSupply	safety	intentional-terminal	driver supply decision is terminal	120	900	exhaustive	no	no	no
 dvm-atomic-scanout/DvmAtomicScanout	safety	intentional-terminal	display epoch may revoke	120	900	exhaustive+simulate	no	no	no
 dvm-block-transport/DvmBlockTransport	safety	intentional-terminal	transport epoch may restart or exhaust its bounded request space	120	900	exhaustive	no	no	no
-dvm-block-startup/DvmBlockStartup	safety	intentional-terminal	startup reaches generation readiness, bounded timeout, or revoke	120	900	exhaustive	no	no	no
+dvm-block-startup/DvmBlockStartup	safety	intentional-terminal	startup reaches generation readiness, bounded timeout, or revoke	120	900	exhaustive	no	no	yes
 deferred-process-activation/DeferredProcessActivation	safety	intentional-terminal	deferred target may activate revoke or exit	120	900	exhaustive	no	no	no
 loader-request-authority/LoaderRequestAuthority	safety	intentional-terminal	privileged loader request commits or is denied after role revalidation	30	120	exhaustive	no	no	no
 dvm-commercial-lifecycle/DvmCommercialLifecycle	safety	intentional-terminal	lease lifecycle may quarantine or stop	120	900	exhaustive+simulate	no	no	no
 dvm-control-endpoint/DvmControlEndpoint	temporal	intentional-terminal	control setup outcome is terminal	120	900	exhaustive	no	no	no
 dvm-control-relay/DvmControlRelay	temporal	intentional-terminal	control session may close	120	900	exhaustive	no	no	no
 dvm-display-driver-supply/DvmDisplayDriverSupply	safety	intentional-terminal	driver supply decision is terminal	120	900	exhaustive	no	no	no
-dvm-display-readiness/DvmDisplayReadiness	temporal	intentional-terminal	display readiness may revoke	120	900	exhaustive	no	no	no
+dvm-display-readiness/DvmDisplayReadiness	temporal	intentional-terminal	display readiness may revoke	120	900	exhaustive	no	no	yes
 dvm-display-scheduler/DvmDisplayScheduler	temporal	intentional-terminal	scheduler admission may fail terminally	120	900	exhaustive	no	no	no
 dvm-gpu-admission/DvmGpuAdmission	temporal	intentional-terminal	GPU admission may reject or revoke	120	900	exhaustive	no	no	no
 dvm-gpu-atlas-transport/DvmGpuAtlasTransport	safety	intentional-terminal	transport epoch may revoke	120	900	exhaustive	no	no	no
@@ -53,7 +53,7 @@ futex-waiter-lifecycle/FutexWaiterLifecycle	safety	intentional-terminal	waiter w
 gui-dvm-install/GuiDvmInstall	temporal	intentional-terminal	install decision is one-shot	120	900	exhaustive	no	no	no
 gui-dvm-pixel-authority/GuiDvmPixelAuthority	safety	intentional-terminal	pixel authority epoch may revoke	120	900	exhaustive	no	no	no
 gui-dvm-surface/GuiDvmSurface	temporal	intentional-terminal	surface epoch may revoke	120	900	exhaustive	no	no	no
-input-ingestion-worker/InputIngestionWorker	temporal	intentional-terminal	worker session may revoke	120	900	exhaustive	no	no	no
+input-ingestion-worker/InputIngestionWorker	temporal	intentional-terminal	worker session may revoke	120	900	exhaustive	no	no	yes
 input-readiness/InputReadiness	temporal	intentional-terminal	readiness wait may settle terminally	120	900	exhaustive	no	no	no
 ipc-endpoint-ownership/IpcEndpointOwnership	safety	intentional-terminal	message or owner may terminate	120	900	exhaustive	no	no	no
 ipc-handle-transfer/IpcHandleTransfer	safety	intentional-terminal	transfer outcome is terminal	120	900	exhaustive+simulate	yes	no	no
@@ -63,17 +63,17 @@ ivshmem-pairing/IvshmemPairing	temporal	intentional-terminal	peer pairing may di
 memfd-seal-lifecycle/MemfdSealLifecycle	safety	intentional-terminal	sealed object may retain stable mappings	30	120	exhaustive	no	no	no
 msi-vector-lifecycle/MsiVectorLifecycle	safety	intentional-terminal	failed vector leases revoke before bounded committed pool reuse	30	120	exhaustive	no	no	no
 netd-deferred-reply/NetdDeferredReply	temporal	intentional-terminal	deferred request resolves or is rejected	30	120	exhaustive	no	no	no
-network-payload-session/NetworkPayloadSession	safety	intentional-terminal	payload decision is terminal	120	900	exhaustive	no	no	no
+network-payload-session/NetworkPayloadSession	safety	intentional-terminal	payload decision is terminal	120	900	exhaustive	no	no	yes
 page-table-lifecycle/PageTableLifecycle	safety	intentional-terminal	mapping lifecycle may complete	120	900	exhaustive	no	no	no
 persistent-mutation-admission/PersistentMutationAdmission	safety	intentional-terminal	mutation admission decision is terminal	30	120	exhaustive	no	no	no
 post-init-leases/PostInitLeases	safety	intentional-terminal	service lease may terminate	120	900	exhaustive	no	no	no
-service-mutation-recovery/ServiceMutationRecovery	safety	intentional-terminal	bounded mutation sequence may terminate	120	900	exhaustive	no	no	no
+service-mutation-recovery/ServiceMutationRecovery	safety	check	explicit terminal stutter preserves deadlock checking	120	900	exhaustive	no	no	no
 vfs-open-description-recovery/VfsOpenDescriptionRecovery	safety	intentional-terminal	bounded open-description sequence may terminate	120	900	exhaustive	no	no	no
 post-init-supervisor-recovery/PostInitSupervisorRecovery	temporal	intentional-terminal	recovery outcome may terminate	120	900	exhaustive	no	no	no
 proc-broker-session/ProcBrokerSession	safety	intentional-terminal	prepare session outcome is terminal	120	900	exhaustive	no	no	no
 process-address-space-lifetime/ProcessAddressSpaceLifetime	temporal	intentional-terminal	process state may exit and reclaim	30	120	exhaustive	no	no	no
 process-signal-delivery/ProcessSignalDelivery	safety	intentional-terminal	signal disposition may terminate the process	30	120	exhaustive	no	no	no
-rootd-bootstrap/RootdBootstrap	temporal	intentional-terminal	bootstrap outcome is terminal	120	900	exhaustive	no	no	no
+rootd-bootstrap/RootdBootstrap	temporal	intentional-terminal	bootstrap outcome is terminal	120	900	exhaustive	no	no	yes
 service-bootstrap-lifecycle/ServiceBootstrapLifecycle	temporal	intentional-terminal	service entry or dependency admission reaches an exact terminal outcome	120	900	exhaustive	no	no	no
 rootd-restart-backoff/RootdRestartBackoff	temporal	intentional-terminal	restart budget may terminate	120	900	exhaustive	no	no	no
 runtime-control-rpc/RuntimeControlRpc	safety	intentional-terminal	one response resolves the RPC	120	900	exhaustive	no	no	yes
@@ -84,8 +84,8 @@ scheduler-thread-demotion/SchedulerThreadDemotion	safety	intentional-terminal	th
 scheduler-wakeup/SchedulerWakeup	temporal	intentional-terminal	retired task outcome is terminal	120	900	exhaustive	no	no	no
 trusted-ui-boundary/TrustedUiBoundary	safety	intentional-terminal	prompt authority may revoke	120	900	exhaustive	no	no	no
 zero-trust-service-flow/ZeroTrustServiceFlow	temporal	intentional-terminal	request may be rejected revoked timed out or admitted	120	900	exhaustive	no	no	no
-userspace-wait-set/UserspaceWaitSet	temporal	intentional-terminal	wait may return readiness timeout or revoke	120	900	exhaustive	no	no	no
-ui-frame-budget/UiFrameBudget	temporal	intentional-terminal	bounded frame epoch may stop	120	900	exhaustive	no	no	no
+userspace-wait-set/UserspaceWaitSet	temporal	check	explicit terminal stutter preserves deadlock checking	120	900	exhaustive	yes	yes	no
+ui-frame-budget/UiFrameBudget	temporal	intentional-terminal	bounded frame epoch may stop	120	900	exhaustive	no	no	yes
 ui-input-motion/UiInputMotion	temporal	intentional-terminal	bounded motion trace may stop	120	900	exhaustive	no	no	no
 vfio-release-authorization/VfioReleaseAuthorization	safety	intentional-terminal	release decision is terminal	120	900	exhaustive	no	no	no
 wayland-accept-isolation/WaylandAcceptIsolation	temporal	intentional-terminal	accept decision is terminal	120	900	exhaustive	no	no	no

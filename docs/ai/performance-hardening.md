@@ -55,7 +55,10 @@ after reading the owner, and acquires no global mutation lock. Three unstable
 reads fail as transient service absence; publication, revoke, and restart stay
 serialized on the writer side. This keeps the global authority transition
 explicit without turning every VFS, network, or input IPC into a shared
-cache-line write.
+cache-line write. Public service-handle calls use the same stable publication
+snapshot and an exact `(caller PID, service epoch)` last-grant cache. A cache
+miss rechecks the bounded grant table; a hit never takes the registry or grant
+lock, and service restart invalidates it by advancing the epoch.
 
 ## Driver Boot
 
@@ -263,6 +266,16 @@ cache-line write.
   capped at 128 MiB, and applies terminal write/grow/shrink/seal seals before
   transferring it to loaderd. The cache is mount-generation bound and bounded
   independently; loaderd never publishes a live VFS handle to ring0.
+- Cache-hot FAT traversal after a DVM read-ahead completion yields after at
+  most 64 KiB of aggregate bulk transfer. One executable snapshot must not
+  retain a System-class direct-handoff chain long enough to miss an
+  interactive frame merely because its individual block requests are small.
+- Rootd's immutable manifest grants loaderd and vfsd System admission only for
+  the boot phase. After the authenticated uiserver snapshot/spawn completes,
+  both services irreversibly self-demote to User; runtimed does the same after
+  its uiserver bootstrap transaction. A later System caller can still donate
+  its class for one exact reply capability, while ordinary catalog launches
+  and DVM bulk reads can no longer inherit a permanent boot-time priority.
 - Loaderd parses and maps the transferred immutable snapshot. The commit broker
   allocates page-table backing and copies from that memfd only; it performs no
   vfsd or DVM storage call. Validation therefore cannot race a later path

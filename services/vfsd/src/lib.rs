@@ -97,6 +97,14 @@ pub fn bounded_early_system_chunk(remaining: usize) -> usize {
     remaining.min(EARLY_SYSTEM_BROKER_MAX_IO_BYTES)
 }
 
+pub fn cooperative_bulk_yield_state(total_bytes: usize, byte_budget: usize) -> (usize, bool) {
+    if byte_budget == 0 || total_bytes < byte_budget {
+        (total_bytes, false)
+    } else {
+        (total_bytes % byte_budget, true)
+    }
+}
+
 pub fn cacheable_metadata_errno(errno: i32) -> bool {
     matches!(errno, ENOENT | ENOTDIR)
 }
@@ -688,6 +696,20 @@ mod tests {
         assert_eq!(
             checked_seek_position(0, 0, 0, 99),
             Err(SeekPositionError::InvalidWhence)
+        );
+    }
+
+    #[test]
+    fn cache_hot_bulk_work_has_a_bounded_cooperative_burst() {
+        let budget = 64 * 1024;
+        assert_eq!(
+            cooperative_bulk_yield_state(63 * 1024, budget),
+            (63 * 1024, false)
+        );
+        assert_eq!(cooperative_bulk_yield_state(64 * 1024, budget), (0, true));
+        assert_eq!(
+            cooperative_bulk_yield_state(65 * 1024, budget),
+            (1024, true)
         );
     }
 

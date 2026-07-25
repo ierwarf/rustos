@@ -1,0 +1,106 @@
+schema = 1
+max_intentional_terminal_models = 89
+models = "formal/models.tsv"
+flows = "formal/system-flows.tsv"
+witnesses = "formal/run-source-conformance.sh"
+generated_doc = "docs/ai/formal-contracts.generated.md"
+
+[[source_mappings]]
+path = "kernel/hal/src/arch/simd.rs"
+models = ["syscall-simd-lifecycle/SyscallSimdLifecycle"]
+
+[[source_mappings]]
+path = "kernel/nucleus-core/src/debug/mod.rs"
+models = ["ui-frame-budget/UiFrameBudget"]
+
+[[source_mappings]]
+path = "kernel/ps/src/api.rs"
+models = [
+    "process-address-space-lifetime/ProcessAddressSpaceLifetime",
+    "syscall-simd-lifecycle/SyscallSimdLifecycle",
+]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/current.rs"
+models = [
+    "process-address-space-lifetime/ProcessAddressSpaceLifetime",
+    "syscall-simd-lifecycle/SyscallSimdLifecycle",
+]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/mod.rs"
+models = [
+    "process-address-space-lifetime/ProcessAddressSpaceLifetime",
+    "syscall-simd-lifecycle/SyscallSimdLifecycle",
+]
+
+[[source_mappings]]
+path = "services/vfsd/src/block.rs"
+models = [
+    "dvm-read-cache/DvmReadCache",
+    "ui-frame-budget/UiFrameBudget",
+]
+
+[[source_mappings]]
+path = "services/loaderd/src/main.rs"
+models = [
+    "loader-request-authority/LoaderRequestAuthority",
+    "ui-frame-budget/UiFrameBudget",
+]
+
+[[source_mappings]]
+path = "services/runtimed/src/main.rs"
+models = ["ui-frame-budget/UiFrameBudget"]
+
+[profiles.pr]
+evidence_max_age_hours = 168
+required_evidence = [
+    "build/formal/source-conformance/summary.json",
+    "build/formal/kani/summary.json",
+    "build/formal/verus/summary.json",
+    "build/formal/runtime-traces/runtime-control-rpc-summary.json",
+    "build/formal/runtime-traces/kvm-p0-summary.json",
+    "build/formal/mutations/summary.json",
+]
+
+[profiles.nightly]
+evidence_max_age_hours = 72
+required_evidence = [
+    "build/formal/source-conformance/summary.json",
+    "build/formal/kani/summary.json",
+    "build/formal/verus/summary.json",
+    "build/formal/runtime-traces/runtime-control-rpc-summary.json",
+    "build/formal/runtime-traces/kvm-p0-summary.json",
+    "build/formal/mutations/summary.json",
+    "build/formal/miri/summary.json",
+    "build/formal/loom/summary.json",
+    "build/formal/apalache/summary.json",
+    "build/formal/tlaps/summary.json",
+    "build/formal/fuzz/summary.json",
+]
+
+[topologies.qemu-commercial]
+required_runtime_models = [
+    "rootd-bootstrap/RootdBootstrap",
+    "dvm-block-startup/DvmBlockStartup",
+    "input-ingestion-worker/InputIngestionWorker",
+    "dvm-display-readiness/DvmDisplayReadiness",
+    "network-payload-session/NetworkPayloadSession",
+    "ui-frame-budget/UiFrameBudget",
+]
+required_artifacts = [
+    "build/rustos-boot.img",
+    "driver-domains/linux/out/artifacts/rustos-linux-dvm-x86_64.bzImage",
+    "driver-domains/linux/out/artifacts/rustos-linux-dvm-x86_64.rootfs.cpio.zst",
+]
+
+[topologies.storage-dvm]
+required_runtime_models = [
+    "rootd-bootstrap/RootdBootstrap",
+    "dvm-block-startup/DvmBlockStartup",
+]
+required_artifacts = [
+    "build/rustos-boot.img",
+    "driver-domains/linux/out/artifacts/rustos-linux-dvm-x86_64.bzImage",
+    "driver-domains/linux/out/artifacts/rustos-linux-dvm-x86_64.rootfs.cpio.zst",
+]

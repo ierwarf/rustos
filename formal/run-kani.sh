@@ -16,7 +16,7 @@ cd "$repo_root"
 artifact_dir="${KANI_ARTIFACT_DIR:-$repo_root/build/formal/kani}"
 mkdir -p "$artifact_dir"
 
-packages=(runtime-control rustos-image-admission driver-domain-protocol)
+packages=(runtime-control rustos-image-admission driver-domain-protocol rustos-user-abi)
 overall=0
 for package in "${packages[@]}"; do
     log="$artifact_dir/$package.log"

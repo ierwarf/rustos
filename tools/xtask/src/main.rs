@@ -2,6 +2,7 @@ mod build;
 mod cli;
 mod config;
 mod dev;
+mod formal_contracts;
 mod kvm;
 mod layering;
 mod package_manifest;

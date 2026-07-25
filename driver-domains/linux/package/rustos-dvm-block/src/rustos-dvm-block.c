@@ -36,6 +36,7 @@
 #define DVM_BLOCK_RECORD_BYTES 64U
 #define DVM_BLOCK_QUEUE_DEPTH 64U
 #define DVM_BLOCK_DATA_SLOT_BYTES (64U * 1024U)
+#define DVM_BLOCK_LOG_BYTES 1024U
 #define DVM_BLOCK_REQUEST_RING_OFFSET ((uint64_t)DVM_BLOCK_HEADER_BYTES)
 #define DVM_BLOCK_COMPLETION_RING_OFFSET \
     (DVM_BLOCK_REQUEST_RING_OFFSET + \
@@ -162,11 +163,23 @@ static volatile sig_atomic_t stop_requested;
 
 static void relay_log(const char *format, ...)
 {
+    char message[DVM_BLOCK_LOG_BYTES];
     va_list arguments;
+    int length;
+    int saved_errno = errno;
 
     va_start(arguments, format);
-    (void)vfprintf(stderr, format, arguments);
+    length = vsnprintf(message, sizeof(message), format, arguments);
     va_end(arguments);
+    if (length > 0) {
+        size_t bytes = (size_t)length;
+
+        if (bytes >= sizeof(message))
+            bytes = sizeof(message) - 1U;
+        while (write(STDERR_FILENO, message, bytes) < 0 && errno == EINTR)
+            ;
+    }
+    errno = saved_errno;
 }
 
 static void handle_signal(int signal_number)

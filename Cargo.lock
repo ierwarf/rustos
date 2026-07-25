@@ -1950,6 +1950,7 @@ dependencies = [
  "rustos-image-admission",
  "rustos-user-abi",
  "serde",
+ "serde_json",
  "sha2",
  "storage-core",
  "storage-fat",

@@ -206,11 +206,11 @@ fn dispatch_syscall(frame: &mut SyscallFrame, abi: UserAbi) -> u64 {
 }
 
 fn syscall_frame_security_check(frame: &SyscallFrame) -> bool {
-    multitask::current_user_snapshot().is_some() && syscall_return_contract(frame).is_some()
+    multitask::current_user_abi().is_some() && syscall_return_contract(frame).is_some()
 }
 
 pub(super) fn validate_syscall_entry_or_terminate(frame: &SyscallFrame) -> UserAbi {
-    let Some(snapshot) = multitask::current_user_snapshot() else {
+    let Some(abi) = multitask::current_user_abi() else {
         panic!(
             "rejected syscall without active user context: rip={:#x} rsp={:#x} rflags={:#x} nr={:#x}",
             frame.user_rip, frame.user_rsp, frame.user_rflags, frame.rax,
@@ -218,10 +218,11 @@ pub(super) fn validate_syscall_entry_or_terminate(frame: &SyscallFrame) -> UserA
     };
 
     if syscall_return_contract(frame).is_none() {
+        let (process_id, thread_id) = multitask::current_user_log_ids().unwrap_or_default();
         debug::println!(
             "terminating task due to unsafe syscall return contract: pid={} tid={} rip={:#x} rsp={:#x} rflags={:#x} nr={:#x}",
-            snapshot.process_id(),
-            snapshot.thread_id(),
+            process_id,
+            thread_id,
             frame.user_rip,
             frame.user_rsp,
             frame.user_rflags,
@@ -247,7 +248,7 @@ pub(super) fn validate_syscall_entry_or_terminate(frame: &SyscallFrame) -> UserA
         multitask::halt_current_retired_task();
     }
 
-    snapshot.abi()
+    abi
 }
 
 fn syscall_return_contract(frame: &SyscallFrame) -> Option<SysretReturnContract> {

@@ -5,9 +5,9 @@ use super::*;
 use alloc::collections::BTreeMap;
 use lazy_static::lazy_static;
 use rustos_user_abi::syscall::{
-    WAITSET_ABI_VERSION, WAITSET_GLOBAL_OBJECT_ID, WAITSET_PROVIDER_INPUTD, WAITSET_PROVIDER_MAX,
-    WAITSET_PROVIDER_NETD, WAITSET_PROVIDER_SESSIOND, WAITSET_PROVIDER_VFSD,
-    WaitSetSignalBrokerArgs,
+    WAITSET_GLOBAL_OBJECT_ID, WAITSET_PROVIDER_INPUTD, WAITSET_PROVIDER_MAX, WAITSET_PROVIDER_NETD,
+    WAITSET_PROVIDER_SESSIOND, WAITSET_PROVIDER_VFSD, WaitSetSignalBrokerArgs,
+    waitset_signal_shape_valid,
 };
 use spin::Mutex;
 
@@ -184,12 +184,7 @@ pub(super) fn syscall_linux_rustos_waitset_signal_broker(args_ptr: u64) -> u64 {
         Ok(args) => args,
         Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
     };
-    if args.abi_version != WAITSET_ABI_VERSION
-        || args.flags != 0
-        || args.reserved0 != 0
-        || args.object_id != WAITSET_GLOBAL_OBJECT_ID
-        || args.generation == 0
-    {
+    if !waitset_signal_shape_valid(&args) {
         return linux_errno(LINUX_EINVAL);
     }
     let Some(service_id) = service_for_provider(args.provider) else {

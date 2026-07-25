@@ -11,6 +11,7 @@ use alloc::vec::Vec;
 use core::mem::{size_of, MaybeUninit};
 #[cfg(not(test))]
 use core::panic::PanicInfo;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use rustos_image_admission::{
     admit_elf64_image, admit_pe64_image_headers, apply_pe64_base_relocations,
@@ -41,8 +42,8 @@ use rustos_user_abi::syscall::{
     SYS_RUSTOS_PROC_ABORT_BROKER, SYS_RUSTOS_PROC_ACTIVATE_BROKER, SYS_RUSTOS_PROC_MAP_DATA_BROKER,
     SYS_RUSTOS_PROC_MAP_FILE_BATCH_BROKER, SYS_RUSTOS_PROC_MAP_ZEROED_BROKER,
     SYS_RUSTOS_PROC_PREPARE_BROKER, SYS_RUSTOS_PROC_SET_LINUX_RUNTIME_BROKER,
-    SYS_RUSTOS_PROC_SET_WINDOWS_RUNTIME_BROKER, VFS_EXECUTABLE_SNAPSHOT_ABI_VERSION,
-    VFS_EXECUTABLE_SNAPSHOT_OP_OPEN, VFS_IPC_PATH_CAPACITY,
+    SYS_RUSTOS_PROC_SET_WINDOWS_RUNTIME_BROKER, SYS_RUSTOS_SCHED_DEMOTE_SELF,
+    VFS_EXECUTABLE_SNAPSHOT_ABI_VERSION, VFS_EXECUTABLE_SNAPSHOT_OP_OPEN, VFS_IPC_PATH_CAPACITY,
 };
 
 mod commit;
@@ -50,6 +51,9 @@ mod commit;
 use commit::{commit_prepared_executable, LoaderOperation};
 
 const SYS_SCHED_YIELD: u64 = 24;
+const SYS_EXIT: u64 = 60;
+const UI_SERVER_EXEC_PATH: &str = "services/uiserver/uiserver.elf";
+static POST_UI_DEMOTED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(not(test))]
 #[panic_handler]
@@ -488,9 +492,26 @@ fn handle_request(
     }
     response.pid = pid;
     debug_line(&format!("loaderd: spawn done exec={exec_path} pid={pid}"));
+    demote_after_ui_bootstrap(exec_path);
     HandledLoaderRequest {
         reply: LoaderReply::Spawn(response),
         cleanup_fds: prepared.cleanup_fds,
+    }
+}
+
+fn demote_after_ui_bootstrap(exec_path: &str) {
+    if exec_path != UI_SERVER_EXEC_PATH || POST_UI_DEMOTED.load(Ordering::Acquire) {
+        return;
+    }
+    if syscall0(SYS_RUSTOS_SCHED_DEMOTE_SELF) == 0 {
+        POST_UI_DEMOTED.store(true, Ordering::Release);
+        debug_line("loaderd: post-ui scheduling class=user");
+        return;
+    }
+    debug_line("loaderd: fatal post-ui scheduling demotion failed");
+    let _ = syscall1(SYS_EXIT, 134);
+    loop {
+        core::hint::spin_loop();
     }
 }
 

@@ -29,6 +29,11 @@ enum XtaskCommand {
     Clean,
     #[command(name = "dev-plan")]
     DevPlan,
+    #[command(name = "formal-contracts")]
+    FormalContracts {
+        #[command(subcommand)]
+        command: FormalContractsCommand,
+    },
     #[command(name = "kvm-smoke", disable_help_flag = true)]
     KvmSmoke {
         #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
@@ -66,6 +71,34 @@ enum XtaskCommand {
     },
 }
 
+#[derive(Clone, Subcommand)]
+pub(crate) enum FormalContractsCommand {
+    /// Validate the typed contract graph and generated documentation.
+    Check,
+    /// Regenerate the human-readable contract index from the typed graph.
+    Generate,
+    /// Print the formal gates affected by the current worktree or named paths.
+    Impact {
+        /// Compare committed paths in BASE...HEAD (for CI); otherwise inspect
+        /// the current worktree.
+        #[arg(long)]
+        base: Option<String>,
+        #[arg(value_name = "PATH")]
+        paths: Vec<PathBuf>,
+    },
+    /// Bind formal, build, and runtime evidence into one signed manifest.
+    Evidence {
+        #[arg(long, default_value = "pr")]
+        profile: String,
+        #[arg(long, default_value = "qemu-commercial")]
+        topology: String,
+        #[arg(long)]
+        allow_dirty: bool,
+        #[arg(long)]
+        sign: bool,
+    },
+}
+
 #[derive(Subcommand)]
 enum ConfigCommand {
     Check,
@@ -86,6 +119,10 @@ pub(crate) fn run() -> Result<()> {
         let root = env_path("ROOT_DIR").unwrap_or_else(default_root_dir);
         return crate::dev::print_plan(&root);
     }
+    if let Some(XtaskCommand::FormalContracts { command }) = &cli.command {
+        let root = env_path("ROOT_DIR").unwrap_or_else(default_root_dir);
+        return crate::formal_contracts::run(&root, command);
+    }
     if cli.command.is_none() {
         Cli::command().print_help()?;
         println!();
@@ -99,6 +136,9 @@ pub(crate) fn run() -> Result<()> {
         Some(XtaskCommand::Check { timings }) => build::check(&config, timings),
         Some(XtaskCommand::Clean) => build::clean(&config),
         Some(XtaskCommand::DevPlan) => unreachable!("dev-plan returned before loading config"),
+        Some(XtaskCommand::FormalContracts { .. }) => {
+            unreachable!("formal-contracts returned before loading config")
+        }
         Some(XtaskCommand::KvmSmoke { args }) => kvm::kvm_smoke_command(&config, args.into_iter()),
         Some(XtaskCommand::KvmRun { build_image }) => kvm::kvm_run_command(&config, build_image),
         Some(XtaskCommand::Selftest) => testinfra::selftest(&config),

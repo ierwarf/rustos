@@ -20,7 +20,7 @@ pub fn current_user_address_space() -> Option<RetainedCurrentUserAddressSpace> {
 }
 
 pub fn current_user_id() -> Option<u64> {
-    current_user_snapshot().map(|snapshot| snapshot.thread_id())
+    current_user_log_ids().map(|(_, thread_id)| thread_id)
 }
 
 pub fn current_task_id() -> Option<u64> {
@@ -36,7 +36,7 @@ pub fn user_log_ids_for_task(task_id: u64) -> Option<(u64, u64)> {
 }
 
 pub fn current_user_process_id() -> Option<u64> {
-    current_user_snapshot().map(|snapshot| snapshot.process_id())
+    current_user_log_ids().map(|(process_id, _)| process_id)
 }
 
 pub fn current_user_process_thread_count() -> Option<usize> {
@@ -53,7 +53,23 @@ pub fn current_user_stack_state() -> Option<super::UserStackState> {
 }
 
 pub fn current_user_thread_id() -> Option<u64> {
-    current_user_snapshot().map(|snapshot| snapshot.thread_id())
+    current_user_log_ids().map(|(_, thread_id)| thread_id)
+}
+
+/// Return the ABI bound to the active user task.
+///
+/// Syscall entry/return validation runs on the current task's kernel stack and
+/// needs the scheduler binding, not a mutable credential snapshot. Taking the
+/// process-state lock here made every syscall contend with unrelated threads
+/// mutating handles, mappings, signals, and other process state. The scheduler
+/// binding is read with interrupts masked so the current slot and its ABI are
+/// one coherent observation.
+pub fn current_user_abi() -> Option<UserAbi> {
+    interrupts::without_interrupts(|| unsafe {
+        scheduler_ref()
+            .current_user_process_binding()
+            .map(|(_, abi, _, _)| abi)
+    })
 }
 
 pub fn current_user_snapshot() -> Option<CurrentUserSnapshot> {

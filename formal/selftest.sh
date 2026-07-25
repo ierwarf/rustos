@@ -55,7 +55,11 @@ registered="$({
             rg -q '^THEOREM ' "$spec" || { echo "missing TLAPS theorem for $model" >&2; exit 1; }
         fi
         if [[ "$trace" == yes ]]; then
-            rg -q "model.*$model|$model" formal/check-runtime-trace.py || { echo "missing runtime trace checker for $model" >&2; exit 1; }
+            rg -q "model.*$model|$model" \
+                formal/check-runtime-trace.py formal/check-*-runtime-trace.py || {
+                echo "missing runtime trace checker for $model" >&2
+                exit 1
+            }
         fi
         printf '%s\n' "$model"
     done < "$registry"
@@ -96,6 +100,7 @@ done
     exit 1
 }
 formal/check-system-flows.sh
+cargo xtask formal-contracts check
 [[ -x formal/check-zero-trust-ingress.sh ]] || {
     echo "zero-trust ingress contract checker is not executable" >&2
     exit 1
@@ -116,6 +121,10 @@ formal/check-performance-contracts.sh
     exit 1
 }
 formal/check-kernel-policy-boundary.sh
+[[ -x formal/run-spec-mutations.sh ]] || {
+    echo "formal/run-spec-mutations.sh must be executable" >&2
+    exit 1
+}
 rg -q 'run-source-conformance\.sh' formal/verify-all.sh || {
     echo "formal PR gate omits source conformance" >&2
     exit 1

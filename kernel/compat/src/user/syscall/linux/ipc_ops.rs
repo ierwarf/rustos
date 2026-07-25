@@ -41,6 +41,15 @@ static SERVICE_ENDPOINT_CAPS: [AtomicU64; MAX_SERVICE_ENDPOINTS] =
     [const { AtomicU64::new(0) }; MAX_SERVICE_ENDPOINTS];
 static SERVICE_ENDPOINT_EPOCHS: [AtomicU64; MAX_SERVICE_ENDPOINTS] =
     [const { AtomicU64::new(0) }; MAX_SERVICE_ENDPOINTS];
+// Read-mostly authorization cache for the last process granted each service.
+// The service epoch is the revocation generation, so a restart invalidates a
+// cached hit without a writer-side broadcast. This removes the global grant
+// table lock and 512-entry scan from the common service-call path while the
+// exact grant table remains the source of truth on a miss.
+static SERVICE_LAST_GRANTED_CALLER: [AtomicU64; MAX_SERVICE_ENDPOINTS] =
+    [const { AtomicU64::new(0) }; MAX_SERVICE_ENDPOINTS];
+static SERVICE_LAST_GRANTED_EPOCH: [AtomicU64; MAX_SERVICE_ENDPOINTS] =
+    [const { AtomicU64::new(0) }; MAX_SERVICE_ENDPOINTS];
 const SERVICE_ENDPOINT_STABLE_READ_ATTEMPTS: usize = 3;
 // Rootd is the root of the service authority graph. The first successful
 // publication permanently seals its process identity for this boot. Process
@@ -86,6 +95,13 @@ impl ServiceCallGrant {
 struct ServiceCapabilityAuthorization {
     capability: u64,
     rootd_epoch: Option<u64>,
+}
+
+#[derive(Clone, Copy)]
+struct PublishedServiceEndpoint {
+    endpoint: u64,
+    owner: u64,
+    epoch: u64,
 }
 
 lazy_static! {
@@ -219,6 +235,11 @@ pub(crate) fn cleanup_service_endpoints_for_process(process_id: u64) {
         let mut grants = SERVICE_CALL_GRANTS.lock();
         clear_service_call_grants(grants.as_mut_slice(), process_id);
     }
+    for index in 0..MAX_SERVICE_ENDPOINTS {
+        if SERVICE_LAST_GRANTED_CALLER[index].load(Ordering::Acquire) == process_id {
+            SERVICE_LAST_GRANTED_CALLER[index].store(0, Ordering::Release);
+        }
+    }
     if SERVICE_ENDPOINT_OWNERS[linux_abi::IPC_SERVICE_LINUX_SYSCALLD as usize]
         .load(Ordering::Acquire)
         == process_id
@@ -304,6 +325,14 @@ fn current_process_can_lookup_service_endpoint() -> bool {
 
 fn service_endpoint_raw(service_id: u64) -> Option<u64> {
     let index = service_index(service_id)?;
+    Some(
+        stable_published_service_endpoint(index)
+            .map(|publication| publication.endpoint)
+            .unwrap_or(0),
+    )
+}
+
+fn stable_published_service_endpoint(index: usize) -> Option<PublishedServiceEndpoint> {
     // Publication stores the endpoint last and revocation clears it first.
     // An epoch/endpoint double-read therefore gives the IPC hot path a stable
     // tuple without bouncing the global mutation-lock cache line on every
@@ -313,21 +342,26 @@ fn service_endpoint_raw(service_id: u64) -> Option<u64> {
         let epoch_before = SERVICE_ENDPOINT_EPOCHS[index].load(Ordering::Acquire);
         let endpoint_before = SERVICE_ENDPOINTS[index].load(Ordering::Acquire);
         if endpoint_before == 0 {
-            return Some(0);
+            return None;
         }
         let owner = SERVICE_ENDPOINT_OWNERS[index].load(Ordering::Acquire);
         let endpoint_after = SERVICE_ENDPOINTS[index].load(Ordering::Acquire);
         let epoch_after = SERVICE_ENDPOINT_EPOCHS[index].load(Ordering::Acquire);
         if endpoint_before == endpoint_after && epoch_before == epoch_after {
-            return Some(stable_service_endpoint_snapshot(
+            let endpoint = stable_service_endpoint_snapshot(
                 endpoint_before,
                 owner,
                 multitask::is_user_process_exiting(owner),
-            ));
+            );
+            return (endpoint != 0 && epoch_before != 0).then_some(PublishedServiceEndpoint {
+                endpoint,
+                owner,
+                epoch: epoch_before,
+            });
         }
         core::hint::spin_loop();
     }
-    Some(0)
+    None
 }
 
 fn stable_service_endpoint_snapshot(endpoint: u64, owner: u64, owner_exiting: bool) -> u64 {
@@ -516,30 +550,40 @@ fn grant_current_process_service_call(
         let mut grants = SERVICE_CALL_GRANTS.lock();
         record_service_call_grant(grants.as_mut_slice(), process_id, service_id, epoch)?;
     }
+    // Publish the epoch before the caller. A reader that observes the caller
+    // with Acquire also observes the exact grant generation. Same-caller
+    // republish is safe: the old epoch can only cause a conservative miss.
+    SERVICE_LAST_GRANTED_EPOCH[index].store(epoch, Ordering::Relaxed);
+    SERVICE_LAST_GRANTED_CALLER[index].store(process_id, Ordering::Release);
     Ok(endpoint)
 }
 
 fn current_process_granted_service_endpoint(service_id: u64) -> Result<Option<u64>, i64> {
     let index = service_index(service_id).ok_or(LINUX_EINVAL)?;
     let process_id = multitask::current_user_process_id().ok_or(LINUX_EINVAL)?;
-    let _registry = SERVICE_ENDPOINT_REGISTRY_MUTATION.lock();
-    let endpoint = SERVICE_ENDPOINTS[index].load(Ordering::Acquire);
-    let owner = SERVICE_ENDPOINT_OWNERS[index].load(Ordering::Acquire);
-    let epoch = SERVICE_ENDPOINT_EPOCHS[index].load(Ordering::Acquire);
-    if endpoint == 0 || owner == 0 || epoch == 0 {
+    let Some(publication) = stable_published_service_endpoint(index) else {
         return Err(LINUX_ENOSYS);
+    };
+    if publication.owner == process_id
+        || cached_service_call_grant_matches(
+            SERVICE_LAST_GRANTED_CALLER[index].load(Ordering::Acquire),
+            SERVICE_LAST_GRANTED_EPOCH[index].load(Ordering::Relaxed),
+            process_id,
+            publication.epoch,
+        )
+    {
+        return Ok(Some(publication.endpoint));
     }
-    if multitask::is_user_process_exiting(owner) {
-        return Err(LINUX_ESRCH);
+    let granted = {
+        let grants = SERVICE_CALL_GRANTS.lock();
+        has_service_call_grant(grants.as_slice(), process_id, service_id, publication.epoch)
+    };
+    if !granted {
+        return Ok(None);
     }
-    if owner == process_id {
-        return Ok(Some(endpoint));
-    }
-    let grants = SERVICE_CALL_GRANTS.lock();
-    Ok(
-        has_service_call_grant(grants.as_slice(), process_id, service_id, epoch)
-            .then_some(endpoint),
-    )
+    SERVICE_LAST_GRANTED_EPOCH[index].store(publication.epoch, Ordering::Relaxed);
+    SERVICE_LAST_GRANTED_CALLER[index].store(process_id, Ordering::Release);
+    Ok(Some(publication.endpoint))
 }
 
 fn authorize_current_process_ipc_call(endpoint: u64) -> Result<(), i64> {
@@ -549,29 +593,52 @@ fn authorize_current_process_ipc_call(endpoint: u64) -> Result<(), i64> {
     let Some(process_id) = multitask::current_user_process_id() else {
         return Err(LINUX_EINVAL);
     };
-    let registry = SERVICE_ENDPOINT_REGISTRY_MUTATION.lock();
     for index in 0..MAX_SERVICE_ENDPOINTS {
-        if SERVICE_ENDPOINTS[index].load(Ordering::Acquire) != endpoint {
+        let Some(publication) = stable_published_service_endpoint(index) else {
+            continue;
+        };
+        if publication.endpoint != endpoint {
             continue;
         }
-        let owner = SERVICE_ENDPOINT_OWNERS[index].load(Ordering::Acquire);
-        let epoch = SERVICE_ENDPOINT_EPOCHS[index].load(Ordering::Acquire);
-        if owner == 0 || epoch == 0 || multitask::is_user_process_exiting(owner) {
-            return Err(LINUX_ESRCH);
-        }
-        let granted = if owner == process_id {
-            true
-        } else {
-            let grants = SERVICE_CALL_GRANTS.lock();
-            has_service_call_grant(grants.as_slice(), process_id, index as u64, epoch)
-        };
-        if granted {
+        if publication.owner == process_id
+            || cached_service_call_grant_matches(
+                SERVICE_LAST_GRANTED_CALLER[index].load(Ordering::Acquire),
+                SERVICE_LAST_GRANTED_EPOCH[index].load(Ordering::Relaxed),
+                process_id,
+                publication.epoch,
+            )
+        {
             return Ok(());
         }
-        return Err(LINUX_EACCES);
+        let granted = {
+            let grants = SERVICE_CALL_GRANTS.lock();
+            has_service_call_grant(
+                grants.as_slice(),
+                process_id,
+                index as u64,
+                publication.epoch,
+            )
+        };
+        if !granted {
+            return Err(LINUX_EACCES);
+        }
+        SERVICE_LAST_GRANTED_EPOCH[index].store(publication.epoch, Ordering::Relaxed);
+        SERVICE_LAST_GRANTED_CALLER[index].store(process_id, Ordering::Release);
+        return Ok(());
     }
-    drop(registry);
     validate_endpoint_publication_owner(endpoint, process_id).map_err(|_| LINUX_EACCES)
+}
+
+fn cached_service_call_grant_matches(
+    cached_process_id: u64,
+    cached_epoch: u64,
+    process_id: u64,
+    endpoint_epoch: u64,
+) -> bool {
+    process_id != 0
+        && endpoint_epoch != 0
+        && cached_process_id == process_id
+        && cached_epoch == endpoint_epoch
 }
 
 /// Called only while `SERVICE_ENDPOINT_REGISTRY_MUTATION` is held.
@@ -2762,6 +2829,15 @@ mod tests {
         assert_eq!(stable_service_endpoint_snapshot(0, 41, false), 0);
         assert_eq!(stable_service_endpoint_snapshot(47, 0, false), 0);
         assert_eq!(stable_service_endpoint_snapshot(47, 41, true), 0);
+    }
+
+    #[test]
+    fn cached_service_call_grant_is_exact_process_and_epoch() {
+        assert!(cached_service_call_grant_matches(41, 7, 41, 7));
+        assert!(!cached_service_call_grant_matches(41, 7, 42, 7));
+        assert!(!cached_service_call_grant_matches(41, 7, 41, 8));
+        assert!(!cached_service_call_grant_matches(0, 7, 0, 7));
+        assert!(!cached_service_call_grant_matches(41, 0, 41, 0));
     }
 
     #[test]

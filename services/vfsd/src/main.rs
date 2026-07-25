@@ -14,6 +14,7 @@ use core::mem::{size_of, MaybeUninit};
 #[cfg(all(not(test), not(clippy)))]
 use core::panic::PanicInfo;
 use core::str;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use rustos_svc_runtime::ipc;
 use rustos_user_abi::linux as linux_abi;
@@ -39,10 +40,11 @@ use rustos_user_abi::syscall::{
     SYSCALL_OFFLOAD_OP_LINUX_NEWFSTATAT, SYSCALL_OFFLOAD_OP_LINUX_OPENAT,
     SYSCALL_OFFLOAD_OP_LINUX_READLINKAT, SYSCALL_OFFLOAD_OP_LINUX_STATX,
     SYSCALL_OFFLOAD_OP_LINUX_UMOUNT2, SYSCALL_OFFLOAD_OP_LINUX_UNLINKAT,
-    SYS_RUSTOS_IPC_REPLY_WITH_HANDLES, SYS_RUSTOS_WAITSET_SIGNAL_BROKER, VFS_CURSOR_SETTLE_CANCEL,
-    VFS_CURSOR_SETTLE_COMMIT, VFS_EXECUTABLE_SNAPSHOT_ABI_VERSION, VFS_EXECUTABLE_SNAPSHOT_OP_OPEN,
-    VFS_IPC_ABI_VERSION, VFS_IPC_OP_ACCESS, VFS_IPC_OP_CHDIR, VFS_IPC_OP_CHECKPOINT_ACK,
-    VFS_IPC_OP_CLOSE, VFS_IPC_OP_CURSOR_SETTLE, VFS_IPC_OP_DUP, VFS_IPC_OP_FCNTL, VFS_IPC_OP_FSTAT,
+    SYS_RUSTOS_IPC_REPLY_WITH_HANDLES, SYS_RUSTOS_SCHED_DEMOTE_SELF,
+    SYS_RUSTOS_WAITSET_SIGNAL_BROKER, VFS_CURSOR_SETTLE_CANCEL, VFS_CURSOR_SETTLE_COMMIT,
+    VFS_EXECUTABLE_SNAPSHOT_ABI_VERSION, VFS_EXECUTABLE_SNAPSHOT_OP_OPEN, VFS_IPC_ABI_VERSION,
+    VFS_IPC_OP_ACCESS, VFS_IPC_OP_CHDIR, VFS_IPC_OP_CHECKPOINT_ACK, VFS_IPC_OP_CLOSE,
+    VFS_IPC_OP_CURSOR_SETTLE, VFS_IPC_OP_DUP, VFS_IPC_OP_FCNTL, VFS_IPC_OP_FSTAT,
     VFS_IPC_OP_FTRUNCATE, VFS_IPC_OP_GETCWD, VFS_IPC_OP_GETDENTS64, VFS_IPC_OP_LSEEK,
     VFS_IPC_OP_MKDIR, VFS_IPC_OP_MOUNT, VFS_IPC_OP_NEWFSTATAT, VFS_IPC_OP_OPENAT,
     VFS_IPC_OP_POLL_QUERY, VFS_IPC_OP_PREAD64, VFS_IPC_OP_READ, VFS_IPC_OP_READLINKAT,
@@ -142,6 +144,8 @@ static mut VFS_RESPONSE_SLOT: VfsIpcResponse = VfsIpcResponse {
 const EXECUTABLE_SNAPSHOT_MAX_BYTES: u64 = 128 * 1024 * 1024;
 const EXECUTABLE_SNAPSHOT_CACHE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 const EXECUTABLE_SNAPSHOT_WRITE_CHUNK_BYTES: usize = 256 * 1024;
+const UI_SERVER_EXEC_PATH: &[u8] = b"services/uiserver/uiserver.elf";
+static POST_UI_DEMOTED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy)]
 struct ExecutableSnapshot {
@@ -376,6 +380,7 @@ fn reply_executable_snapshot(
             };
         }
     };
+    demote_after_ui_bootstrap_snapshot(request);
     response.file_bytes = snapshot.file_bytes;
     response.mount_generation = state.mount_generation;
     let send_fd = snapshot.fd as u64;
@@ -398,6 +403,28 @@ fn reply_executable_snapshot(
         close_fd(snapshot.fd);
     }
     reply
+}
+
+fn demote_after_ui_bootstrap_snapshot(request: &VfsExecutableSnapshotRequest) {
+    if POST_UI_DEMOTED.load(Ordering::Acquire)
+        || request.path_len as usize != UI_SERVER_EXEC_PATH.len()
+        || &request.path[..UI_SERVER_EXEC_PATH.len()] != UI_SERVER_EXEC_PATH
+    {
+        return;
+    }
+    let status = unsafe { rustos_svc_runtime::syscall::syscall0(SYS_RUSTOS_SCHED_DEMOTE_SELF) };
+    if status == 0 {
+        POST_UI_DEMOTED.store(true, Ordering::Release);
+        debug_line("vfsd: post-ui scheduling class=user");
+        return;
+    }
+    debug_line("vfsd: fatal post-ui scheduling demotion failed");
+    unsafe {
+        rustos_svc_runtime::syscall::syscall1(linux_abi::SYS_EXIT, 134);
+    }
+    loop {
+        core::hint::spin_loop();
+    }
 }
 
 struct VfsState {

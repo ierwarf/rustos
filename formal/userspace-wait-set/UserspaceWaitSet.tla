@@ -249,7 +249,9 @@ ResetWait ==
                    observedEpoch, now, objectRefs, epollRefs, ingressBacklog>>
 
 TerminalStutter ==
-    /\ waitState \in TerminalStates
+    /\ (waitState \in TerminalStates \/
+        (waitState = "idle" /\ epollRefs = 0 /\
+         (objectRefs = 0 \/ now = MaxTime)))
     /\ UNCHANGED vars
 
 Next ==
@@ -300,6 +302,15 @@ SleepingRequiresStableRecheck ==
     waitState = "sleeping" =>
         providerLive /\ ~ready /\ generation = observedGeneration /\
         epoch = observedEpoch /\ epollRefs > 0
+
+(***************************************************************************
+TLAPS pilot: terminal Linux-visible outcomes cannot be mistaken for the
+internal scheduler sleeping state. Full inductive state exploration remains
+the responsibility of TLC and the typed Apalache refinement.
+***************************************************************************)
+THEOREM TerminalOutcomeCannotRemainSleeping ==
+    waitState \in TerminalStates => waitState # "sleeping"
+<1>1. QED BY DEF TerminalStates
 
 ReadyReturnIsAuthoritative ==
     waitState = "returned-ready" =>

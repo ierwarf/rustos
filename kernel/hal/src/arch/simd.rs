@@ -14,6 +14,7 @@ const CR4_OSXSAVE: u64 = 1 << 18;
 const CPUID_FEATURE_XSAVE: u32 = 1 << 26;
 const CPUID_FEATURE_AVX: u32 = 1 << 28;
 const CPUID_EXT_FEATURE_AVX2: u32 = 1 << 5;
+const CPUID_XSAVEOPT: u32 = 1 << 0;
 
 const XFEATURE_X87: u64 = 1 << 0;
 const XFEATURE_SSE: u64 = 1 << 1;
@@ -32,6 +33,7 @@ static XSTATE_MASK: AtomicU64 = AtomicU64::new(XFEATURE_X87 | XFEATURE_SSE);
 static SIMD_STATE_REQUIRED_BYTES: AtomicUsize = AtomicUsize::new(FXSAVE_STATE_BYTES);
 static AVX_ENABLED: AtomicBool = AtomicBool::new(false);
 static AVX2_ENABLED: AtomicBool = AtomicBool::new(false);
+static XSAVEOPT_ENABLED: AtomicBool = AtomicBool::new(false);
 
 #[repr(C, align(64))]
 #[derive(Clone, Copy)]
@@ -92,6 +94,10 @@ pub fn init() {
         XSTATE_MASK.store(requested_mask, Ordering::Release);
         AVX_ENABLED.store(avx_enabled, Ordering::Release);
         AVX2_ENABLED.store(avx2_enabled, Ordering::Release);
+        XSAVEOPT_ENABLED.store(
+            (__cpuid_count(0xD, 1).eax & CPUID_XSAVEOPT) != 0,
+            Ordering::Release,
+        );
         SIMD_MODE.store(SIMD_MODE_XSAVE, Ordering::Release);
 
         let xsave_leaf = __cpuid_count(0xD, 0);
@@ -129,6 +135,9 @@ pub fn avx2_enabled() -> bool {
 /// `area` must be writable, 64-byte aligned storage for the active SIMD mode.
 pub unsafe fn save_state(area: &mut SimdState) {
     match SIMD_MODE.load(Ordering::Acquire) {
+        SIMD_MODE_XSAVE if XSAVEOPT_ENABLED.load(Ordering::Acquire) => unsafe {
+            xsaveopt(area, XSTATE_MASK.load(Ordering::Acquire))
+        },
         SIMD_MODE_XSAVE => unsafe { xsave(area, XSTATE_MASK.load(Ordering::Acquire)) },
         _ => unsafe { fxsave(area) },
     }
@@ -311,6 +320,20 @@ unsafe fn xsave(area: &mut SimdState, mask: u64) {
     unsafe {
         asm!(
             "xsave64 [{ptr}]",
+            ptr = in(reg) area,
+            in("eax") mask as u32,
+            in("edx") (mask >> 32) as u32,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn xsaveopt(area: &mut SimdState, mask: u64) {
+    unsafe {
+        asm!(
+            "xsaveopt64 [{ptr}]",
             ptr = in(reg) area,
             in("eax") mask as u32,
             in("edx") (mask >> 32) as u32,
