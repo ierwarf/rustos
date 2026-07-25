@@ -182,10 +182,8 @@ pub(crate) fn ioctl(
                     height: rect.height,
                 });
             }
-            let (atlas_ptr, _) = surface_kernel_ptr(surface)?;
             let slot = surface.binding_slot().ok_or(DeviceError::InvalidArgument)?;
             match crate::io::dvm_display::try_submit_gpu_atlas(
-                atlas_ptr,
                 u64::from(request.surface_handle),
                 slot,
                 surface.width(),
@@ -435,8 +433,13 @@ fn create_gpu_atlas_surface(
     if surface.stride_bytes() != gpu.stride_bytes {
         return None;
     }
-    let region = crate::ipc::create_shared_region(surface.mapping_len() as usize).ok()?;
-    surface.set_shared_region(region);
+    let (phys_start, kernel_mapping, mapping_len) =
+        crate::io::dvm_display::gpu_atlas_slot_mapping(binding_slot)?;
+    if mapping_len != surface.mapping_len() as usize
+        || !surface.set_external_physical_mapping(phys_start, kernel_mapping as u64, mapping_len)
+    {
+        return None;
+    }
     Some(surface)
 }
 

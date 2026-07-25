@@ -4,9 +4,6 @@ version = "0.1.0"
 edition = "2024"
 build = "build.rs"
 
-[features]
-rustos_export_driver_symbols = []
-
 [dependencies]
 nucleus-core = { path = "../nucleus-core" }
 kernel-hal = { path = "../hal" }
@@ -16,9 +13,7 @@ kernel-ipc-runtime = { path = "../ipc-runtime" }
 kernel-ps = { path = "../ps" }
 boot-protocol = { path = "../../boot/boot-protocol" }
 driver-domain-protocol = { path = "../../libs/driver-domain-protocol" }
-driver-abi = { path = "../../drivers/libs/driver-abi" }
 ed25519-dalek = { version = "2", default-features = false }
-input-evdev = { path = "../../drivers/libs/input-evdev" }
 keyboard-core = { path = "../../drivers/libs/keyboard-core" }
 rustos-user-abi = { path = "../../libs/rustos-user-abi" }
 embedded-graphics = { version = "0.8", default-features = false }

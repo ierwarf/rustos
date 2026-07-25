@@ -162,6 +162,7 @@ pub(crate) struct GpuAtlasScene {
     pub(crate) layers: Vec<GpuSceneLayer>,
     pub(crate) cursor_source_rect: Rect,
     pub(crate) wayland_bindings: Vec<WaylandAtlasBinding>,
+    pub(crate) console_bindings: Vec<ConsoleAtlasBinding>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -169,6 +170,16 @@ pub(crate) struct WaylandAtlasBinding {
     pub(crate) surface_id: u32,
     pub(crate) content_version: u64,
     pub(crate) source_rect: Rect,
+    pub(crate) layer_index: usize,
+    pub(crate) focused: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ConsoleAtlasBinding {
+    pub(crate) session_handle: u64,
+    pub(crate) content_version: u64,
+    pub(crate) source_rect: Rect,
+    pub(crate) layer_index: usize,
     pub(crate) focused: bool,
 }
 
@@ -202,6 +213,7 @@ pub(crate) fn build_gpu_atlas_scene(
         GpuAtlasPacker::new(atlas_pixels, atlas_width, atlas_height, atlas_stride_pixels)?;
     let mut layers = Vec::new();
     let mut wayland_bindings = Vec::new();
+    let mut console_bindings = Vec::new();
     push_xrgb_gpu_layer(
         &mut packer,
         &mut layers,
@@ -232,6 +244,7 @@ pub(crate) fn build_gpu_atlas_scene(
                 surface_id: window.surface_id,
                 content_version: window.content_version,
                 source_rect,
+                layer_index: layers.len() - 1,
                 focused: false,
             });
         }
@@ -241,7 +254,14 @@ pub(crate) fn build_gpu_atlas_scene(
         .iter_mut()
         .filter(|window| !window.minimized && window.session_handle != focused_session)
     {
-        push_console_gpu_layer(&mut packer, &mut layers, atlas, window, false)?;
+        let source_rect = push_console_gpu_layer(&mut packer, &mut layers, atlas, window, false)?;
+        console_bindings.push(ConsoleAtlasBinding {
+            session_handle: window.session_handle,
+            content_version: window.surface_cache.content_version,
+            source_rect,
+            layer_index: layers.len() - 1,
+            focused: false,
+        });
     }
     if let Some(surface_id) = focused_wayland {
         if let Some(window) = state
@@ -256,6 +276,7 @@ pub(crate) fn build_gpu_atlas_scene(
                     surface_id: window.surface_id,
                     content_version: window.content_version,
                     source_rect,
+                    layer_index: layers.len() - 1,
                     focused: true,
                 });
             }
@@ -266,7 +287,15 @@ pub(crate) fn build_gpu_atlas_scene(
             .iter_mut()
             .find(|window| !window.minimized && window.session_handle == focused_session)
         {
-            push_console_gpu_layer(&mut packer, &mut layers, atlas, window, true)?;
+            let source_rect =
+                push_console_gpu_layer(&mut packer, &mut layers, atlas, window, true)?;
+            console_bindings.push(ConsoleAtlasBinding {
+                session_handle: window.session_handle,
+                content_version: window.surface_cache.content_version,
+                source_rect,
+                layer_index: layers.len() - 1,
+                focused: true,
+            });
         }
     }
     push_dock_gpu_layer(&mut packer, &mut layers, atlas, state)?;
@@ -284,6 +313,7 @@ pub(crate) fn build_gpu_atlas_scene(
         layers,
         cursor_source_rect,
         wayland_bindings,
+        console_bindings,
     })
 }
 
@@ -301,10 +331,6 @@ pub(crate) fn gpu_scene_reuse_signature(state: &AppState) -> u64 {
     mix(state.console_windows.len() as u64);
     for window in &state.console_windows {
         mix(window.session_handle);
-        mix(window.output_generation);
-        mix(window.surface_cache.content_version);
-        mix(window.frame.x as u64);
-        mix(window.frame.y as u64);
         mix(window.frame.width as u64);
         mix(window.frame.height as u64);
         mix(window.minimized as u64);
@@ -315,8 +341,6 @@ pub(crate) fn gpu_scene_reuse_signature(state: &AppState) -> u64 {
     mix(state.wayland_windows.len() as u64);
     for window in &state.wayland_windows {
         mix(u64::from(window.surface_id));
-        mix(window.frame.x as u64);
-        mix(window.frame.y as u64);
         mix(window.frame.width as u64);
         mix(window.frame.height as u64);
         mix(window.minimized as u64);
@@ -326,6 +350,127 @@ pub(crate) fn gpu_scene_reuse_signature(state: &AppState) -> u64 {
     }
     mix(state.launcher_programs.len() as u64);
     signature
+}
+
+/// Apply position-only window changes to retained GPU commands.
+///
+/// Atlas pixels are keyed by size, identity, focus, and content version. A
+/// drag changes none of those properties, so rebuilding and comparing the
+/// entire atlas would turn every pointer motion into an O(atlas pixels) path.
+/// Bindings authenticate the exact retained texture layer before its
+/// destination is changed; any topology mismatch fails closed into a full
+/// scene rebuild.
+pub(crate) fn update_gpu_layer_destinations(
+    state: &AppState,
+    layers: &mut [GpuSceneLayer],
+    wayland_bindings: &[WaylandAtlasBinding],
+    console_bindings: &[ConsoleAtlasBinding],
+) -> bool {
+    let focused_wayland = state.focused_wayland_surface_id;
+    let mut wayland_windows = state
+        .wayland_windows
+        .iter()
+        .filter(|window| !window.minimized && Some(window.surface_id) != focused_wayland)
+        .collect::<Vec<_>>();
+    if let Some(surface_id) = focused_wayland {
+        if let Some(window) = state
+            .wayland_windows
+            .iter()
+            .find(|window| !window.minimized && window.surface_id == surface_id)
+        {
+            wayland_windows.push(window);
+        }
+    }
+    if wayland_windows.len() != wayland_bindings.len() {
+        return false;
+    }
+    for (window, binding) in wayland_windows.into_iter().zip(wayland_bindings) {
+        let destination = wayland_window_outer_rect(window);
+        if window.surface_id != binding.surface_id
+            || (Some(window.surface_id) == focused_wayland) != binding.focused
+            || !update_gpu_texture_layer_destination(
+                layers,
+                binding.layer_index,
+                binding.source_rect,
+                destination,
+            )
+        {
+            return false;
+        }
+    }
+
+    let focused_session = state.focused_session_handle;
+    let mut binding_index = 0;
+    for window in state
+        .console_windows
+        .iter()
+        .filter(|window| !window.minimized && window.session_handle != focused_session)
+    {
+        let Some(binding) = console_bindings.get(binding_index) else {
+            return false;
+        };
+        binding_index += 1;
+        if binding.session_handle != window.session_handle
+            || binding.focused
+            || !update_gpu_texture_layer_destination(
+                layers,
+                binding.layer_index,
+                binding.source_rect,
+                window.frame,
+            )
+        {
+            return false;
+        }
+    }
+    if focused_wayland.is_none() && focused_session != 0 {
+        if let Some(window) = state
+            .console_windows
+            .iter()
+            .find(|window| !window.minimized && window.session_handle == focused_session)
+        {
+            let Some(binding) = console_bindings.get(binding_index) else {
+                return false;
+            };
+            binding_index += 1;
+            if binding.session_handle != window.session_handle
+                || !binding.focused
+                || !update_gpu_texture_layer_destination(
+                    layers,
+                    binding.layer_index,
+                    binding.source_rect,
+                    window.frame,
+                )
+            {
+                return false;
+            }
+        }
+    }
+    binding_index == console_bindings.len()
+}
+
+fn update_gpu_texture_layer_destination(
+    layers: &mut [GpuSceneLayer],
+    layer_index: usize,
+    source_rect: Rect,
+    destination: Rect,
+) -> bool {
+    if destination.is_empty()
+        || destination.width != source_rect.width
+        || destination.height != source_rect.height
+    {
+        return false;
+    }
+    let Some(layer) = layers.get_mut(layer_index) else {
+        return false;
+    };
+    let GpuLayerKind::Texture { region } = layer.kind else {
+        return false;
+    };
+    if region.source_rect != source_rect {
+        return false;
+    }
+    layer.destination = destination;
+    true
 }
 
 pub(crate) fn update_wayland_gpu_textures(
@@ -399,6 +544,117 @@ pub(crate) fn update_wayland_gpu_textures(
     Ok(Some(damage))
 }
 
+pub(crate) fn update_console_gpu_textures(
+    state: &mut AppState,
+    atlas_pixels: &mut [u32],
+    atlas_stride_pixels: usize,
+    bindings: &mut [ConsoleAtlasBinding],
+) -> Result<Option<Vec<Rect>>, GpuSceneError> {
+    let focused_session = state.focused_session_handle;
+    let mut binding_index = 0;
+    let mut damage = Vec::new();
+
+    for window in state
+        .console_windows
+        .iter_mut()
+        .filter(|window| !window.minimized && window.session_handle != focused_session)
+    {
+        if !update_console_gpu_texture(
+            window,
+            false,
+            atlas_pixels,
+            atlas_stride_pixels,
+            bindings,
+            &mut binding_index,
+            &mut damage,
+        )? {
+            return Ok(None);
+        }
+    }
+    if state.focused_wayland_surface_id.is_none() && focused_session != 0 {
+        if let Some(window) = state
+            .console_windows
+            .iter_mut()
+            .find(|window| !window.minimized && window.session_handle == focused_session)
+        {
+            if !update_console_gpu_texture(
+                window,
+                true,
+                atlas_pixels,
+                atlas_stride_pixels,
+                bindings,
+                &mut binding_index,
+                &mut damage,
+            )? {
+                return Ok(None);
+            }
+        }
+    }
+    if binding_index != bindings.len() {
+        return Ok(None);
+    }
+    Ok(Some(damage))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_console_gpu_texture(
+    window: &mut ConsoleWindow,
+    focused: bool,
+    atlas_pixels: &mut [u32],
+    atlas_stride_pixels: usize,
+    bindings: &mut [ConsoleAtlasBinding],
+    binding_index: &mut usize,
+    damage: &mut Vec<Rect>,
+) -> Result<bool, GpuSceneError> {
+    let Some(binding) = bindings.get_mut(*binding_index) else {
+        return Ok(false);
+    };
+    *binding_index += 1;
+    if binding.session_handle != window.session_handle || binding.focused != focused {
+        return Ok(false);
+    }
+
+    chrome::rebuild_console_window_surface(window, focused);
+    if !window.surface_cache.valid
+        || window.surface_cache.width != binding.source_rect.width
+        || window.surface_cache.height != binding.source_rect.height
+    {
+        return Ok(false);
+    }
+    if window.surface_cache.content_version == binding.content_version {
+        return Ok(true);
+    }
+
+    for row in 0..binding.source_rect.height {
+        let source_start = row
+            .checked_mul(window.surface_cache.width)
+            .ok_or(GpuSceneError::InvalidLayer)?;
+        let source_end = source_start
+            .checked_add(binding.source_rect.width)
+            .ok_or(GpuSceneError::InvalidLayer)?;
+        let destination_start = (binding.source_rect.y + row)
+            .checked_mul(atlas_stride_pixels)
+            .and_then(|offset| offset.checked_add(binding.source_rect.x))
+            .ok_or(GpuSceneError::InvalidLayer)?;
+        let destination_end = destination_start
+            .checked_add(binding.source_rect.width)
+            .ok_or(GpuSceneError::InvalidLayer)?;
+        atlas_pixels
+            .get_mut(destination_start..destination_end)
+            .ok_or(GpuSceneError::InvalidLayer)?
+            .copy_from_slice(
+                window
+                    .surface_cache
+                    .pixels
+                    .get(source_start..source_end)
+                    .ok_or(GpuSceneError::InvalidLayer)?,
+            );
+    }
+    binding.content_version = window.surface_cache.content_version;
+    damage.push(binding.source_rect);
+    Ok(true)
+}
+
 fn copy_opaque_wayland_damage_to_atlas(
     atlas_pixels: &mut [u32],
     atlas_stride_pixels: usize,
@@ -419,7 +675,10 @@ fn copy_opaque_wayland_damage_to_atlas(
         height: window.height.min(local_client.height),
     };
     let changed = window.damage.intersect(visible);
-    if changed.is_empty() || window.stride_pixels < visible.width {
+    if changed.is_empty() {
+        return Ok(Some(Rect::empty()));
+    }
+    if window.stride_pixels < visible.width {
         return Ok(None);
     }
     for row in changed.y..changed.y + changed.height {
@@ -682,6 +941,7 @@ fn push_dock_gpu_layer(
         destination.width,
         destination,
     )
+    .map(|_| ())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -694,7 +954,7 @@ fn push_xrgb_gpu_layer(
     height: usize,
     stride_pixels: usize,
     destination: Rect,
-) -> Result<(), GpuSceneError> {
+) -> Result<Rect, GpuSceneError> {
     if destination.width == 0
         || destination.height == 0
         || destination.width != width
@@ -712,7 +972,7 @@ fn push_xrgb_gpu_layer(
             region: GpuTextureRegion { atlas, source_rect },
         },
     });
-    Ok(())
+    Ok(source_rect)
 }
 
 fn push_console_gpu_layer(
@@ -721,7 +981,7 @@ fn push_console_gpu_layer(
     atlas: GpuTextureCapability,
     window: &mut ConsoleWindow,
     focused: bool,
-) -> Result<(), GpuSceneError> {
+) -> Result<Rect, GpuSceneError> {
     chrome::rebuild_console_window_surface(window, focused);
     if !window.surface_cache.valid {
         return Err(GpuSceneError::InvalidLayer);
@@ -1186,8 +1446,9 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        copy_opaque_wayland_damage_to_atlas, wayland_window_client_rect, wayland_window_outer_rect,
-        Rect, WaylandWindowSnapshot,
+        copy_opaque_wayland_damage_to_atlas, update_gpu_texture_layer_destination,
+        wayland_window_client_rect, wayland_window_outer_rect, GpuLayerKind, GpuLayerTransform,
+        GpuSceneLayer, GpuTextureCapability, GpuTextureRegion, Rect, WaylandWindowSnapshot,
     };
 
     fn snapshot(pixels: Vec<u32>, damage: Rect) -> WaylandWindowSnapshot {
@@ -1289,5 +1550,70 @@ mod tests {
             Ok(None)
         );
         assert_eq!(atlas, before);
+    }
+
+    #[test]
+    fn retained_gpu_window_move_updates_only_command_destination() {
+        let source_rect = Rect {
+            x: 32,
+            y: 48,
+            width: 96,
+            height: 64,
+        };
+        let capability = GpuTextureCapability {
+            token: 7,
+            generation: 11,
+            content_epoch: 17,
+            binding_slot: 0,
+            width: 256,
+            height: 256,
+            stride_bytes: 1024,
+        };
+        let mut layers = [GpuSceneLayer {
+            destination: Rect {
+                x: 10,
+                y: 20,
+                width: 96,
+                height: 64,
+            },
+            opacity: u8::MAX,
+            source_over: false,
+            transform: GpuLayerTransform::flat(),
+            kind: GpuLayerKind::Texture {
+                region: GpuTextureRegion {
+                    atlas: capability,
+                    source_rect,
+                },
+            },
+        }];
+        let moved = Rect {
+            x: 700,
+            y: 400,
+            width: 96,
+            height: 64,
+        };
+
+        assert!(update_gpu_texture_layer_destination(
+            &mut layers,
+            0,
+            source_rect,
+            moved
+        ));
+        assert_eq!(layers[0].destination, moved);
+        assert_eq!(
+            layers[0].kind,
+            GpuLayerKind::Texture {
+                region: GpuTextureRegion {
+                    atlas: capability,
+                    source_rect,
+                }
+            }
+        );
+        assert!(!update_gpu_texture_layer_destination(
+            &mut layers,
+            0,
+            source_rect,
+            Rect { width: 95, ..moved }
+        ));
     }
 }

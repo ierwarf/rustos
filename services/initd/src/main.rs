@@ -393,8 +393,12 @@ fn init_exec_priority(exec: &str) -> u8 {
         NETD_EXEC_PATH => 3,
         DEVMGRD_EXEC_PATH => 4,
         INPUTD_EXEC_PATH => 5,
-        STORAGED_EXEC_PATH => 6,
-        RUNTIMED_EXEC_PATH => 7,
+        // The signed early image contains the complete uiserver bootstrap
+        // closure. Start that immutable UI path before waiting for storaged's
+        // DVM-backed publication; runtimed admits the mutable launch catalog
+        // only after its later VFS reads succeed.
+        RUNTIMED_EXEC_PATH => 6,
+        STORAGED_EXEC_PATH => 7,
         _ => 8,
     }
 }
@@ -1098,7 +1102,8 @@ fn boot_line(message: &str) {
 mod tests {
     use super::{
         classify_service_ready_status, cleanup_spawned_service, exec_weight_micros,
-        RUNTIMED_BOOTSTRAP_SERVICES, RUNTIMED_EXEC_PATH, TASK_WEIGHT_INTERACTIVE_FLAG,
+        init_exec_priority, RUNTIMED_BOOTSTRAP_SERVICES, RUNTIMED_EXEC_PATH, STORAGED_EXEC_PATH,
+        TASK_WEIGHT_INTERACTIVE_FLAG,
     };
     use rustos_user_abi::syscall::IPC_SERVICE_STORAGED;
 
@@ -1132,6 +1137,10 @@ mod tests {
     #[test]
     fn runtimed_bootstrap_does_not_wait_for_storage_dvm_publication() {
         assert!(!RUNTIMED_BOOTSTRAP_SERVICES.contains(&IPC_SERVICE_STORAGED));
+        assert!(
+            init_exec_priority(RUNTIMED_EXEC_PATH) < init_exec_priority(STORAGED_EXEC_PATH),
+            "the immutable UI bootstrap must be scheduled before DVM-backed storage"
+        );
     }
 
     #[test]

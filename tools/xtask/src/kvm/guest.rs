@@ -28,7 +28,10 @@ fn spawn_guests(
             "-m",
             "2048M,maxmem=3G,slots=2",
             "-smp",
-            "2",
+            // RustOS currently schedules all user work on the BSP. A second
+            // vCPU only burns host time beside the Linux DVM and makes the
+            // wall-clock boot/FPS proof slower on low-end hosts.
+            "1",
         ])
         .arg("-bios")
         .arg(&config.ovmf_path)

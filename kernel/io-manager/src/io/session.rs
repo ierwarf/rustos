@@ -36,11 +36,6 @@ impl ConsoleSessionHandle {
             Some((self.0 as u32) as usize)
         }
     }
-
-    #[cfg(test)]
-    pub(crate) const fn for_tests(slot_index: u32, generation: u32) -> Self {
-        Self(((generation as u64) << 32) | slot_index as u64)
-    }
 }
 
 impl From<ConsoleSessionHandle> for kernel_object::api::session::ConsoleSessionHandle {

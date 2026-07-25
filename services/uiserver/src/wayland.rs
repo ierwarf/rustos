@@ -58,6 +58,7 @@ const MAX_WAYLAND_FRAME_CALLBACKS_PER_SURFACE: usize = 8;
 const MAX_WAYLAND_DISPATCH_LOGS: usize = 16;
 const MAX_WAYLAND_SLOW_TICK_LOGS: usize = 8;
 const SLOW_WAYLAND_TICK_MS: u128 = 16;
+const WAYLAND_POINTER_FRAME_INTERVAL: Duration = Duration::from_millis(15);
 
 static WAYLAND_DISPATCH_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static WAYLAND_SLOW_TICK_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -333,6 +334,7 @@ impl WaylandCompositor {
             }
         }
         let dispatch_elapsed = dispatch_started.elapsed();
+        self.state.flush_pointer_motion(false);
         let flush_started = Instant::now();
         self.flush_clients();
         let flush_elapsed = flush_started.elapsed();
@@ -673,9 +675,9 @@ fn surface_damage_rect(x: i32, y: i32, width: i32, height: i32) -> Option<Rect> 
 #[cfg(test)]
 mod tests {
     use super::{
-        checked_wayland_pixel_count, claim_wayland_rearm, validate_wayland_buffer_layout,
-        wayland_nonnegative_i32, WaylandWindowSnapshot, MAX_WAYLAND_BUFFER_DIMENSION,
-        MAX_WAYLAND_SHM_POOL_BYTES,
+        can_retain_undamaged_buffer, checked_wayland_pixel_count, claim_wayland_rearm,
+        copy_wayland_bgra_row, validate_wayland_buffer_layout, wayland_nonnegative_i32,
+        WaylandWindowSnapshot, MAX_WAYLAND_BUFFER_DIMENSION, MAX_WAYLAND_SHM_POOL_BYTES,
     };
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -716,6 +718,47 @@ mod tests {
         assert_eq!(wayland_nonnegative_i32(0), Some(0));
         assert_eq!(wayland_nonnegative_i32(42), Some(42));
         assert_eq!(wayland_nonnegative_i32(-1), None);
+    }
+
+    #[test]
+    fn wayland_argb_row_preserves_alpha() {
+        let source = [1, 2, 3, 4, 5, 6, 7, 8];
+        let mut pixels = [0_u32; 2];
+        assert!(copy_wayland_bgra_row(&source, &mut pixels, true));
+        assert_eq!(pixels, [0x0403_0201, 0x0807_0605]);
+    }
+
+    #[test]
+    fn wayland_xrgb_row_forces_opaque_alpha_across_chunk_boundary() {
+        let mut source = [0_u8; 20];
+        for (index, byte) in source.iter_mut().enumerate() {
+            *byte = index as u8;
+        }
+        let mut pixels = [0_u32; 5];
+        assert!(copy_wayland_bgra_row(&source, &mut pixels, false));
+        assert_eq!(
+            pixels,
+            [
+                0xff02_0100,
+                0xff06_0504,
+                0xff0a_0908,
+                0xff0e_0d0c,
+                0xff12_1110
+            ]
+        );
+    }
+
+    #[test]
+    fn undamaged_buffer_reuse_requires_an_exact_existing_layout() {
+        assert!(can_retain_undamaged_buffer(
+            true, 800, 520, 800, 800, 520, 800
+        ));
+        assert!(!can_retain_undamaged_buffer(
+            false, 800, 520, 800, 800, 520, 800
+        ));
+        assert!(!can_retain_undamaged_buffer(
+            true, 800, 520, 800, 801, 520, 801
+        ));
     }
 
     #[test]
@@ -765,6 +808,8 @@ struct WaylandState {
     pointer_x: u32,
     pointer_y: u32,
     pointer_button_down: bool,
+    pointer_motion_pending: bool,
+    next_pointer_motion_flush: Instant,
     dirty: bool,
     callback_profile_started: Instant,
     callback_profile_count: u64,
@@ -793,6 +838,8 @@ impl WaylandState {
             pointer_x: display_width / 2,
             pointer_y: display_height / 2,
             pointer_button_down: false,
+            pointer_motion_pending: false,
+            next_pointer_motion_flush: Instant::now(),
             dirty: false,
             callback_profile_started: Instant::now(),
             callback_profile_count: 0,
@@ -1306,29 +1353,51 @@ impl WaylandState {
         let hit = self.hit_test_pointer(self.pointer_x, self.pointer_y);
         self.update_pointer_focus(hit.clone());
         let Some(focus) = self.pointer_focus.as_ref() else {
+            self.pointer_motion_pending = false;
             return;
         };
-        if previous_x == self.pointer_x
-            && previous_y == self.pointer_y
-            && previous_surface
-                .as_ref()
-                .is_some_and(|surface| *surface == focus.surface.id())
-        {
+        let focus_unchanged = previous_surface
+            .as_ref()
+            .is_some_and(|surface| *surface == focus.surface.id());
+        if !focus_unchanged {
+            // `update_pointer_focus` already emitted an enter event carrying
+            // the exact new coordinates.
+            self.pointer_motion_pending = false;
+            self.next_pointer_motion_flush = Instant::now() + WAYLAND_POINTER_FRAME_INTERVAL;
+            return;
+        }
+        if previous_x == self.pointer_x && previous_y == self.pointer_y {
+            return;
+        }
+        self.pointer_motion_pending = true;
+        self.flush_pointer_motion(false);
+    }
+
+    fn flush_pointer_motion(&mut self, force: bool) {
+        if !self.pointer_motion_pending {
+            return;
+        }
+        let now = Instant::now();
+        if !force && now < self.next_pointer_motion_flush {
             return;
         }
         let time = self.event_time_ms();
-        for pointer in self
-            .pointer_resources
-            .iter()
-            .filter(|pointer| pointer.client_id == focus.client_id)
-        {
-            pointer
-                .resource
-                .motion(time, focus.surface_x, focus.surface_y);
-            if pointer.resource.version() >= 5 {
-                pointer.resource.frame();
+        if let Some(focus) = self.pointer_focus.as_ref() {
+            for pointer in self
+                .pointer_resources
+                .iter()
+                .filter(|pointer| pointer.client_id == focus.client_id)
+            {
+                pointer
+                    .resource
+                    .motion(time, focus.surface_x, focus.surface_y);
+                if pointer.resource.version() >= 5 {
+                    pointer.resource.frame();
+                }
             }
         }
+        self.pointer_motion_pending = false;
+        self.next_pointer_motion_flush = now + WAYLAND_POINTER_FRAME_INTERVAL;
     }
 
     fn pointer_button(&mut self, button: u32, pressed: bool) -> bool {
@@ -1353,6 +1422,9 @@ impl WaylandState {
         } else {
             self.pointer_button_down = false;
         }
+        // Preserve Wayland input ordering: the latest coalesced coordinates
+        // must be visible to the client before the button transition.
+        self.flush_pointer_motion(true);
 
         let Some(focus) = self.pointer_focus.as_ref() else {
             return false;
@@ -1917,13 +1989,8 @@ impl BufferData {
             let Some(row_pixels) = pixels.get_mut(dst_row..dst_end) else {
                 return false;
             };
-            for (target, pixel) in row_pixels.iter_mut().zip(row_bytes.chunks_exact(4)) {
-                let alpha = if self.shared.has_alpha {
-                    pixel[3]
-                } else {
-                    0xff
-                };
-                *target = u32::from_le_bytes([pixel[0], pixel[1], pixel[2], alpha]);
+            if !copy_wayland_bgra_row(row_bytes, row_pixels, self.shared.has_alpha) {
+                return false;
             }
         }
         true
@@ -1948,17 +2015,19 @@ impl BufferData {
 
         let mut pixels = Vec::new();
         pixels.try_reserve_exact(pixel_count).ok()?;
+        pixels.resize(pixel_count, 0);
         for row in 0..self.shared.height {
             let row_start = start.checked_add(row.checked_mul(self.shared.stride)?)?;
             let row_end = row_start.checked_add(width_bytes)?;
             let row_bytes = bytes.get(row_start..row_end)?;
-            for pixel in row_bytes.chunks_exact(4) {
-                let alpha = if self.shared.has_alpha {
-                    pixel[3]
-                } else {
-                    0xff
-                };
-                pixels.push(u32::from_le_bytes([pixel[0], pixel[1], pixel[2], alpha]));
+            let dst_start = row.checked_mul(self.shared.width)?;
+            let dst_end = dst_start.checked_add(self.shared.width)?;
+            if !copy_wayland_bgra_row(
+                row_bytes,
+                pixels.get_mut(dst_start..dst_end)?,
+                self.shared.has_alpha,
+            ) {
+                return None;
             }
         }
         Some((
@@ -1968,6 +2037,53 @@ impl BufferData {
             self.shared.width,
         ))
     }
+}
+
+/// Decode one validated Wayland shm row. RustOS' supported architecture is
+/// little-endian, so ARGB8888 bytes already have the native `u32` layout.
+/// XRGB8888 needs only the alpha byte forced opaque; process four pixels per
+/// iteration without an allocation or per-channel reconstruction.
+fn copy_wayland_bgra_row(src: &[u8], dst: &mut [u32], has_alpha: bool) -> bool {
+    if src.len() != dst.len().saturating_mul(4) {
+        return false;
+    }
+    if has_alpha {
+        for (target, bytes) in dst.iter_mut().zip(src.chunks_exact(4)) {
+            *target = u32::from_le_bytes(bytes.try_into().expect("four-byte pixel"));
+        }
+        return true;
+    }
+
+    const OPAQUE_4: u128 = 0xff00_0000_ff00_0000_ff00_0000_ff00_0000;
+    let mut chunks = src.chunks_exact(16);
+    let mut out = dst.chunks_exact_mut(4);
+    for (source, target) in chunks.by_ref().zip(out.by_ref()) {
+        let packed = u128::from_le_bytes(source.try_into().expect("four pixels")) | OPAQUE_4;
+        for (pixel, value) in target.iter_mut().zip(packed.to_le_bytes().chunks_exact(4)) {
+            *pixel = u32::from_le_bytes(value.try_into().expect("four-byte pixel"));
+        }
+    }
+    let remainder = chunks.remainder();
+    let output_remainder = out.into_remainder();
+    for (target, bytes) in output_remainder.iter_mut().zip(remainder.chunks_exact(4)) {
+        *target = u32::from_le_bytes(bytes.try_into().expect("four-byte pixel")) | 0xff00_0000;
+    }
+    true
+}
+
+fn can_retain_undamaged_buffer(
+    has_snapshot: bool,
+    current_width: usize,
+    current_height: usize,
+    current_stride_pixels: usize,
+    next_width: usize,
+    next_height: usize,
+    next_stride_pixels: usize,
+) -> bool {
+    has_snapshot
+        && current_width == next_width
+        && current_height == next_height
+        && current_stride_pixels == next_stride_pixels
 }
 
 fn next_content_version(current: u64) -> u64 {
@@ -2612,6 +2728,34 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for WaylandState {
                 if let Some(copy_source) = copy_source {
                     let display_width = state.display_width;
                     let display_height = state.display_height;
+                    // Attaching a same-layout buffer with no declared damage
+                    // changes buffer ownership, not visible pixels. Preserve
+                    // the compositor snapshot and avoid a full SHM read/copy.
+                    // The first buffer or a layout change still requires a
+                    // complete copy so no undefined pixels become visible.
+                    let retained_undamaged = if !has_damage {
+                        if let Ok(mut surface) = data.shared.lock() {
+                            let can_retain = can_retain_undamaged_buffer(
+                                !surface.pixels.is_empty(),
+                                surface.width,
+                                surface.height,
+                                surface.stride_pixels,
+                                copy_source.shared.width,
+                                copy_source.shared.height,
+                                copy_source.shared.width,
+                            );
+                            if can_retain {
+                                surface.current_buffer = Some(copy_source.clone());
+                                surface.last_damage = Rect::empty();
+                                mapped = true;
+                            }
+                            can_retain
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
                     if has_damage {
                         let mut completed_copy = None;
                         if let Ok(mut surface) = data.shared.lock() {
@@ -2648,7 +2792,7 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for WaylandState {
                             state.record_buffer_copy(elapsed, bytes);
                         }
                     }
-                    if !dirty {
+                    if !dirty && !retained_undamaged {
                         let copy_started = Instant::now();
                         let copied = copy_source.copy_pixels();
                         let copy_elapsed = copy_started.elapsed();

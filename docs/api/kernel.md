@@ -216,9 +216,7 @@ device, boot volume state, VFS, console, driver integration은
 | `console` | `init_console`, `init_tty`, `write_console`, `service_console` | kernel console과 TTY service |
 | `device` | `open`, `read_to_current_user`, `read_to_user`, `ioctl_from_user` | kernel/syscall path의 `/dev` style device access |
 | `tty` | session input/output and termios helpers | console session IO |
-| `driver` | `initialize_loadable_modules_for_class`, Linux runtime hooks | driver load/service integration |
-| `input` | `init_input`, interrupt handlers, service pending counters | keyboard/mouse/HID input |
-| `usb` | `init_usb`, debug counters | USB host path |
+| `input` | `init`, `service_dvm_input_pending`, `mark_dvm_policy_consumer_ready` | 고정 DVM record copy/wake substrate; framing과 input policy는 inputd 소유 |
 | `vfs` | `init_vfs`, `normalize_kernel_path`, mount/open/metadata/access/readlink helpers | current-process VFS operation |
 
 ### Object And IPC APIs

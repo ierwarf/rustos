@@ -1,15 +1,15 @@
 // RING3-MIGRATION-REFERENCE START: GUI-DVM display transport substrate.
 // Policy stays in uiserver and the GUI DVM. Ring0 only maps the exact
-// host-created three-slot pool, copies a bounded frame into a host-owned slot,
-// and handles the two fixed MSI-X leaf notifications without composing or
-// interpreting a guest command stream.
+// host-created three-slot pool, maps one slot-scoped staging capability to
+// uiserver, commits bounded command metadata, and handles the two fixed MSI-X
+// leaf notifications without composing or interpreting a guest command stream.
 use core::mem::size_of;
 use core::ptr;
 use core::sync::atomic::{
     AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence,
 };
 
-use driver_abi::{
+use crate::transport_types::{
     DISPLAY_FRAMEBUFFER_FLAG_DVM_SCANOUT, DISPLAY_FRAMEBUFFER_FLAG_PRIMARY_PROVIDER,
     DisplayFramebufferRegistration, DisplayPixelFormat,
 };
@@ -89,6 +89,13 @@ static GPU_ATLAS_SLOT_BYTES: AtomicU64 = AtomicU64::new(0);
 static GPU_ATLAS_WIDTH: AtomicU32 = AtomicU32::new(0);
 static GPU_ATLAS_HEIGHT: AtomicU32 = AtomicU32::new(0);
 static GPU_ATLAS_STRIDE_BYTES: AtomicU32 = AtomicU32::new(0);
+/// A slot mapping is installed once for the provider lifetime. Repeated
+/// compositor surface creation must not grow the MMIO mapper refcount.
+static GPU_ATLAS_SLOT_MAP_ADDR: [AtomicUsize; DVM_GPU_RENDER_MAX_IN_FLIGHT as usize] = [
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+];
 static GPU_NEXT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static GPU_CONTEXT_EPOCH: AtomicU32 = AtomicU32::new(GPU_INITIAL_CONTEXT_EPOCH);
 static GPU_PRIME_DURATION_NS: AtomicU64 = AtomicU64::new(0);
@@ -403,11 +410,52 @@ pub(crate) fn gpu_atlas_info() -> Option<GpuAtlasInfo> {
     .then_some(info)
 }
 
+pub(crate) fn gpu_atlas_slot_mapping(slot: u32) -> Option<(u64, *mut u8, usize)> {
+    let info = gpu_atlas_info()?;
+    if slot >= info.slot_count {
+        return None;
+    }
+    let slot_bytes = GPU_ATLAS_SLOT_BYTES.load(Ordering::Acquire);
+    let slot_offset = slot_bytes
+        .checked_mul(u64::from(slot))
+        .and_then(|offset| GPU_ATLAS_OFFSET.load(Ordering::Acquire).checked_add(offset))?;
+    let phys_start = GUI_DVM_PIXEL_REGION_PHYS_ADDR.checked_add(slot_offset)?;
+    let len = usize::try_from(slot_bytes).ok()?;
+    if len == 0
+        || !phys_start.is_multiple_of(4096)
+        || !slot_bytes.is_multiple_of(4096)
+        || slot_offset
+            .checked_add(slot_bytes)
+            .is_none_or(|end| end > GUI_DVM_PIXEL_REGION_BYTES)
+    {
+        return None;
+    }
+    let cached = GPU_ATLAS_SLOT_MAP_ADDR[slot as usize].load(Ordering::Acquire);
+    if cached != 0 {
+        return Some((phys_start, cached as *mut u8, len));
+    }
+    let mapping = crate::driver::mmio::map(phys_start, len, true).cast::<u8>();
+    if mapping.is_null() {
+        return None;
+    }
+    match GPU_ATLAS_SLOT_MAP_ADDR[slot as usize].compare_exchange(
+        0,
+        mapping as usize,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => Some((phys_start, mapping, len)),
+        Err(winner) => {
+            crate::driver::mmio::unmap(mapping.cast());
+            Some((phys_start, winner as *mut u8, len))
+        }
+    }
+}
+
 /// Publish one immutable private-compositor atlas snapshot and its bounded
 /// command batch. The DVM sees only the host-created slot; neither the user
 /// pointer nor a GPU address crosses the domain boundary.
 pub(crate) fn try_submit_gpu_atlas(
-    src_ptr: *const u8,
     surface_token: u64,
     binding_slot: u32,
     width: u32,
@@ -432,7 +480,6 @@ pub(crate) fn try_submit_gpu_atlas(
     let slot = binding_slot as usize;
     let initial = GPU_SESSION_SUBMISSIONS.load(Ordering::Acquire) == 0;
     if slot >= GPU_SLOT_STATE.len()
-        || src_ptr.is_null()
         || surface_token == 0
         || width != GPU_ATLAS_WIDTH.load(Ordering::Acquire)
         || height != GPU_ATLAS_HEIGHT.load(Ordering::Acquire)
@@ -506,9 +553,7 @@ pub(crate) fn try_submit_gpu_atlas(
         content_epoch: source.content_epoch,
         damage_count: damage.len() as u32,
     };
-    if !submit.matches_batch(header, source)
-        || !copy_gpu_atlas_and_batch(slot, src_ptr, damage, batch, submit)
-    {
+    if !submit.matches_batch(header, source) || !publish_gpu_batch(slot, damage, batch, submit) {
         GPU_SLOT_STATE[slot].store(GPU_SLOT_FREE, Ordering::Release);
         return DvmGpuSubmitOutcome::Invalid;
     }
@@ -639,9 +684,8 @@ fn next_gpu_sequence() -> Option<u64> {
     }
 }
 
-fn copy_gpu_atlas_and_batch(
+fn publish_gpu_batch(
     slot: usize,
-    src_ptr: *const u8,
     damage: &[DvmGpuAtlasDamage],
     batch: &[u8],
     submit: DvmGpuAtlasSubmit,
@@ -688,31 +732,6 @@ fn copy_gpu_atlas_and_batch(
         || batch_end > command_end
     {
         return false;
-    }
-    let stride_bytes = GPU_ATLAS_STRIDE_BYTES.load(Ordering::Acquire) as usize;
-    let atlas_destination = (pixels as *mut u8).wrapping_add(atlas_offset as usize);
-    for rect in damage {
-        let Some(row_bytes) = (rect.width as usize).checked_mul(size_of::<u32>()) else {
-            return false;
-        };
-        let Some(x_bytes) = (rect.x as usize).checked_mul(size_of::<u32>()) else {
-            return false;
-        };
-        for row in rect.y as usize..(rect.y + rect.height) as usize {
-            let Some(row_offset) = row
-                .checked_mul(stride_bytes)
-                .and_then(|offset| offset.checked_add(x_bytes))
-            else {
-                return false;
-            };
-            unsafe {
-                ptr::copy_nonoverlapping(
-                    src_ptr.add(row_offset),
-                    atlas_destination.add(row_offset),
-                    row_bytes,
-                );
-            }
-        }
     }
     unsafe {
         for (index, rect) in damage.iter().copied().enumerate() {

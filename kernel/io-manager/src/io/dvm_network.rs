@@ -26,9 +26,10 @@ static UNAVAILABLE_LOGGED: AtomicBool = AtomicBool::new(false);
 static STATE: KernelWaitLock<Option<DvmNetworkState>> = KernelWaitLock::new(None);
 // The fixed ivshmem header and counters are DVM-writable after installation.
 // They can describe bounded frame state, but cannot attest that the L0-vetted
-// DVM control session is still alive.  This lease is changed only by the
-// authenticated RDI1 session markers delivered through L0's input-ring path.
-static CONTROL_LEASE: KernelWaitLock<ControlLease> = KernelWaitLock::new(ControlLease::inactive());
+// DVM control session is still alive. netd selects the generation through its
+// capability-gated broker after validating the service-owned lifecycle.
+static TRANSPORT_LEASE: KernelWaitLock<TransportLease> =
+    KernelWaitLock::new(TransportLease::inactive());
 
 struct DvmNetworkState {
     base: *mut u8,
@@ -38,11 +39,11 @@ struct DvmNetworkState {
 }
 
 #[derive(Clone, Copy)]
-struct ControlLease {
+struct TransportLease {
     epoch: u32,
 }
 
-impl ControlLease {
+impl TransportLease {
     const fn inactive() -> Self {
         Self { epoch: 0 }
     }
@@ -143,7 +144,7 @@ pub(crate) fn try_install() -> bool {
             base: mapped,
             header,
             // A ring mapped after the DVM has started must not replay frames
-            // which predate the current authenticated control lease.  Do not
+            // which predate the current transport generation lease. Do not
             // rewind the DVM-visible TX producer; begin at its observed value.
             tx_producer,
             // RX is RustOS-owned state.  It may move only after the producer
@@ -186,7 +187,7 @@ pub(crate) fn transport_status() -> PacketTransportStatus {
     // not make a DVM live.  A guest-writable ready bit could be forged.  Hold
     // the lease across the state check so SESSION_END cannot race a reported
     // available transport with a later packet submission.
-    let lease = CONTROL_LEASE.lock();
+    let lease = TRANSPORT_LEASE.lock();
     if STATE.lock().is_none() {
         return PacketTransportStatus::Unavailable;
     }
@@ -201,7 +202,7 @@ pub(crate) fn transmit(frame: &[u8]) -> Result<usize, PacketError> {
     // Lock ordering is always control lease, then ring state.  Revocation
     // waits for an already-started bounded packet operation, then makes every
     // later operation fail as NoDevice rather than using an untrusted aperture.
-    let lease = CONTROL_LEASE.lock();
+    let lease = TRANSPORT_LEASE.lock();
     if !lease.is_active() {
         return Err(PacketError::NoDevice);
     }
@@ -235,7 +236,7 @@ pub(crate) fn transmit(frame: &[u8]) -> Result<usize, PacketError> {
 }
 
 pub(crate) fn receive(out: &mut [u8]) -> Result<usize, PacketError> {
-    let lease = CONTROL_LEASE.lock();
+    let lease = TRANSPORT_LEASE.lock();
     if !lease.is_active() {
         return Err(PacketError::NoDevice);
     }
@@ -275,31 +276,27 @@ fn advance_rx_consumer(state: &mut DvmNetworkState) {
     write_u32(state.base, RX_CONSUMER_OFFSET, state.rx_consumer);
 }
 
-/// Admit a network lease from an L0-authenticated RDI1 session start.
-///
-/// This is intentionally a control-plane signal only. Ethernet frames remain
-/// on the bounded ivshmem transport; the input ring never becomes a network proxy.
-/// Only the combined-DVM topology is admitted: it shares this authenticated
-/// lifecycle with input. An independently supervised network DVM is forbidden
-/// from using this API because it has no domain-specific authenticated lease.
-pub(crate) fn activate_authenticated_control(epoch: u32) -> bool {
+/// Enforce a netd-selected transport generation. The kernel validates only
+/// non-zero generation and exact-revoke semantics; input-session ownership and
+/// recovery policy remain entirely in inputd/netd.
+pub(crate) fn grant_transport_lease(epoch: u32) -> bool {
     if epoch == 0 {
         return false;
     }
 
     if !INSTALLED.load(Ordering::Acquire) && !try_install() {
-        // Remember a live authenticated control session even when PCI probing
+        // Remember a live service-selected generation even when PCI probing
         // is temporarily early. A later install starts with an empty receive
         // view and can then use this lease; no DVM header value can create it.
-        return CONTROL_LEASE.lock().activate(epoch);
+        return TRANSPORT_LEASE.lock().activate(epoch);
     }
 
-    // Readers hold CONTROL_LEASE before STATE, so reset the receive cursor
+    // Readers hold TRANSPORT_LEASE before STATE, so reset the receive cursor
     // before publishing the new lease. This drops only a bounded, validated
     // backlog from a retired session. A forged producer never advances a
     // RustOS-owned cursor during this reset.
     let (activated, discarded) = {
-        let mut lease = CONTROL_LEASE.lock();
+        let mut lease = TRANSPORT_LEASE.lock();
         let mut state = STATE.lock();
         let Some(state) = state.as_mut() else {
             return false;
@@ -310,26 +307,30 @@ pub(crate) fn activate_authenticated_control(epoch: u32) -> bool {
     if activated {
         // Do not call the logging path while either transport lock is held.
         crate::debug::println!(
-            "dvm-network: authenticated control lease active discarded_rx={}",
+            "dvm-network: transport generation lease active discarded_rx={}",
             discarded
         );
     }
     activated
 }
 
-/// Revoke exactly the L0-authenticated control lease named by SESSION_END.
-/// An old relay cleanup cannot tear down a newer session that has already
-/// replaced it. The shared aperture remains mapped, but all later RustOS
-/// packet operations fail closed until a new authenticated start arrives.
-pub(crate) fn revoke_authenticated_control(epoch: u32) -> bool {
+/// Revoke exactly the netd-selected transport generation. An old cleanup
+/// cannot tear down a newer lease.
+pub(crate) fn revoke_transport_lease(epoch: u32) -> bool {
     let revoked = {
-        let mut lease = CONTROL_LEASE.lock();
+        let mut lease = TRANSPORT_LEASE.lock();
         lease.revoke_exact(epoch)
     };
     if revoked {
-        crate::debug::println!("dvm-network: authenticated control lease revoked");
+        crate::debug::println!("dvm-network: transport generation lease revoked");
     }
     revoked
+}
+
+/// Clear any generation when netd starts or loses its service-owned state.
+/// This is capability-gated by the net broker and carries no device policy.
+pub(crate) fn reset_transport_lease() {
+    TRANSPORT_LEASE.lock().epoch = 0;
 }
 
 impl DvmNetworkState {
@@ -384,11 +385,11 @@ fn write_u32(base: *mut u8, offset: usize, value: u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::ControlLease;
+    use super::TransportLease;
 
     #[test]
     fn control_lease_requires_nonzero_epoch_and_exact_revocation() {
-        let mut lease = ControlLease::inactive();
+        let mut lease = TransportLease::inactive();
         assert!(!lease.is_active());
         assert!(!lease.activate(0));
         assert!(lease.activate(7));
@@ -401,7 +402,7 @@ mod tests {
 
     #[test]
     fn stale_cleanup_cannot_revoke_replaced_control_lease() {
-        let mut lease = ControlLease::inactive();
+        let mut lease = TransportLease::inactive();
         assert!(lease.activate(7));
         assert!(lease.activate(11));
         assert!(!lease.revoke_exact(7));

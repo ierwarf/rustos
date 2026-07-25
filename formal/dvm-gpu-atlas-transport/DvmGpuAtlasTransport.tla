@@ -467,6 +467,15 @@ ZeroCopyRequiresCompletedDirectRead ==
 
 NoDeviceWriteAuthority == sourceWriteAuthority = {}
 
+\* The service mapping is derived from the sealed provider pool, not from an
+\* address in the commit request. The mapping may remain pinned after revoke,
+\* but the state machine removes publish/read authority and a reset changes
+\* the generation before any slot can be submitted again.
+ServiceMappedSlots == Slots
+
+ExactServiceSlotCapabilities ==
+    ServiceMappedSlots = Slots
+
 NoCpuComposedGpuSuccess == ~cpuComposedAccepted
 
 OfflineRetainsNoAuthority ==

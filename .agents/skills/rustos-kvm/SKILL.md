@@ -91,12 +91,13 @@ operator-observed stable visual/input behavior after the atlas and bounded
 input-readiness fixes. Further FPS capture is user-deferred, so do not rerun
 hardware or convert that observation into a 60 FPS pass.
 
-Do not misdiagnose the remaining userspace ABI as a GPU compositor failure.
-uiserver's private input reader safely uses bounded `STATS`-then-`READ`, but
-generic indefinite `poll`/`epoll` still lacks a capability-bound cross-service
-wait set with readiness generations, atomic check-arm-recheck, timeout,
-cancellation, fd lifetime, and restart/revoke semantics. Read
-`docs/ai/physical-gpu-status.md` before changing that boundary.
+Do not misdiagnose userspace wait/recovery evidence as a GPU compositor
+failure. Generic finite/infinite `poll`/`epoll` now uses the capability-bound
+cross-service wait set with readiness generations, atomic check-arm-recheck,
+timeout/cancellation, fd lifetime, and restart/revoke semantics. Uiserver's
+bounded `STATS`-then-`READ` input bridge remains valid. Read
+`docs/ai/physical-gpu-status.md` before changing that boundary; virtual KVM
+performance does not prove the still-deferred physical reset/recovery gate.
 
 ## Boundaries
 

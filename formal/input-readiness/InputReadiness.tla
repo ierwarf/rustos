@@ -6,7 +6,7 @@ Models the RustOS DVM input readiness handoff.
 
 Concrete owners and source anchors:
   * ring0 bounded ingress and waiter wake:
-      kernel/io-manager/src/input/{event_queue.rs,dvm_ring.rs}
+      kernel/io-manager/src/input/{dvm_ring.rs,wait_queue.rs}
   * poll arm/recheck/commit:
       kernel/compat/src/user/syscall/linux/service_ops/poll_epoll.rs
   * event-driven input-policy ingestion plus poll/read refresh:

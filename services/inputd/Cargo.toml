@@ -10,4 +10,4 @@ keyboard-core = { path = "../../drivers/libs/keyboard-core" }
 libc = "0.2"
 observability-client = { path = "../../libs/observability-client" }
 rustos-svc-runtime = { path = "../../libs/rustos-svc-runtime" }
-rustos-user-abi = { path = "../../libs/rustos-user-abi" }
+rustos-user-abi = { path = "../../libs/rustos-user-abi", features = ["linux-compat-state"] }

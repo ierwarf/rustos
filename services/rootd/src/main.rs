@@ -77,6 +77,11 @@ const BOOTSTRAP_SPAWN_MAX_ATTEMPTS: u32 = 64;
 const INITD_SPAWN_MAX_ATTEMPTS: u32 = 64;
 const CORE_READINESS_POLL_INTERVAL_MS: u32 = 250;
 const CORE_READINESS_POLL_MAX: u32 = 20;
+/// A readiness poll turn must drain the already-queued control burst before
+/// entering the 250 ms hardware/service readiness backoff. Core services start
+/// concurrently and publish through this one endpoint; sleeping after one
+/// request serializes their registrations into a multi-second boot delay.
+const ROOTD_REQUEST_DRAIN_BUDGET: usize = 32;
 
 const SYSCALLD_EXEC: &[u8] = b"services/syscalld/syscalld.elf\0";
 const VFSD_EXEC: &[u8] = b"services/vfsd/vfsd.elf\0";
@@ -359,13 +364,18 @@ pub extern "C" fn __rustos_rootd_start() -> ! {
     debug_line(b"rootd: core services spawned, waiting for readiness\n");
     while !service_dependencies_ready(INITD_LEASE_INDEX) {
         drain_lifecycle_events(&mut leases, &mut post_init_leases);
-        serve_rootd_once(
-            endpoint,
-            &leases,
-            &mut post_init_leases,
-            &mut service_checkpoints,
-            false,
-        );
+        let mut served = 0;
+        while served < ROOTD_REQUEST_DRAIN_BUDGET
+            && serve_rootd_once(
+                endpoint,
+                &leases,
+                &mut post_init_leases,
+                &mut service_checkpoints,
+                false,
+            )
+        {
+            served += 1;
+        }
         restart_failed_leases(
             endpoint,
             &mut leases,
@@ -373,8 +383,10 @@ pub extern "C" fn __rustos_rootd_start() -> ! {
             &mut service_checkpoints,
         );
         supervise_core_readiness(&mut leases);
-        if !service_dependencies_ready(INITD_LEASE_INDEX) {
+        if !service_dependencies_ready(INITD_LEASE_INDEX) && served == 0 {
             wait_for_restart_backoff(CORE_READINESS_POLL_INTERVAL_MS);
+        } else if !service_dependencies_ready(INITD_LEASE_INDEX) {
+            yield_now();
         }
     }
 
@@ -390,7 +402,7 @@ pub extern "C" fn __rustos_rootd_start() -> ! {
     yield_now();
     loop {
         drain_lifecycle_events(&mut leases, &mut post_init_leases);
-        serve_rootd_once(
+        let _ = serve_rootd_once(
             endpoint,
             &leases,
             &mut post_init_leases,
@@ -719,7 +731,7 @@ fn serve_rootd_once(
     post_init_leases: &mut [PostInitLease],
     service_checkpoints: &mut ServiceCheckpointStore,
     blocking: bool,
-) {
+) -> bool {
     if endpoint == 0 {
         fail_closed(b"rootd: fatal missing supervisor endpoint\n");
     }
@@ -745,11 +757,11 @@ fn serve_rootd_once(
         if blocking {
             fail_closed(b"rootd: fatal supervisor blocking recv failed\n");
         }
-        return;
+        return false;
     }
     if received as usize != size_of::<CommercialMaxProtocolRequest>() {
         reply_commercial_max_error(reply_cap, &request, 22);
-        return;
+        return true;
     }
     reply_commercial_max_request(
         reply_cap,
@@ -762,6 +774,7 @@ fn serve_rootd_once(
             tid: sender_tid,
         },
     );
+    true
 }
 
 fn reply_commercial_max_error(reply_cap: u64, request: &CommercialMaxProtocolRequest, status: i32) {
@@ -1745,6 +1758,10 @@ fn service_dependency_allowed(subject: u64, target: u64) -> bool {
         ),
         IPC_SERVICE_VFSD => matches!(target, IPC_SERVICE_DEVMGRD | IPC_SERVICE_STORAGED),
         IPC_SERVICE_PROCD => target == IPC_SERVICE_LOADERD,
+        // Inputd alone validates the authenticated RDI session lifecycle.
+        // Its only outbound policy edge is the bounded grant/revoke handoff
+        // to netd; it cannot discover arbitrary service endpoints.
+        IPC_SERVICE_INPUTD => target == IPC_SERVICE_NETD,
         IPC_SERVICE_SESSIOND => matches!(
             target,
             IPC_SERVICE_LOADERD | IPC_SERVICE_DEVMGRD | IPC_SERVICE_UISERVER
@@ -2652,6 +2669,22 @@ mod tests {
         assert!(!service_dependency_allowed(
             IPC_SERVICE_LOADERD,
             IPC_SERVICE_DEVMGRD
+        ));
+    }
+
+    #[test]
+    fn inputd_lookup_authority_is_only_the_netd_lifecycle_handoff() {
+        assert!(service_dependency_allowed(
+            IPC_SERVICE_INPUTD,
+            IPC_SERVICE_NETD
+        ));
+        assert!(!service_dependency_allowed(
+            IPC_SERVICE_INPUTD,
+            IPC_SERVICE_DEVMGRD
+        ));
+        assert!(!service_dependency_allowed(
+            IPC_SERVICE_INPUTD,
+            IPC_SERVICE_UISERVER
         ));
     }
 

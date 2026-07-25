@@ -3,6 +3,7 @@
 // fd-table mutation, and remote-handle/socket-token installation substrate.
 use super::*;
 use alloc::collections::{BTreeMap, VecDeque};
+use rustos_user_abi::syscall::VFS_DEVICE_ACCESS_DRM_COMPAT;
 
 const PENDING_NETD_REF_CAPACITY: usize = 4096;
 const REMOTE_VFS_OPEN_DESCRIPTION_CAPACITY: usize = 32 * 1024;
@@ -75,12 +76,6 @@ pub fn syscall_linux_vfs_openat(dirfd: u64, path_ptr: u64, flags: u64, mode: u64
             path
         );
     }
-    if should_try_devmgrd_open(path.as_str()) {
-        return match open_device_via_devmgrd(path.as_str(), flags) {
-            Ok(fd) => fd,
-            Err(errno) => linux_errno(errno),
-        };
-    }
     let mut request = new_vfs_request(VFS_IPC_OP_OPENAT);
     request.arg0 = flags;
     request.arg1 = mode;
@@ -106,6 +101,35 @@ pub fn syscall_linux_vfs_openat(dirfd: u64, path_ptr: u64, flags: u64, mode: u64
         let _ = call_vfs_remote_close_bounded(request.arg3);
         return linux_errno(LINUX_EINVAL);
     }
+    let kind = match response.handle_kind {
+        VFS_IPC_HANDLE_KIND_FILE => multitask::RemoteVfsHandleKind::File,
+        VFS_IPC_HANDLE_KIND_DIR => multitask::RemoteVfsHandleKind::Directory,
+        VFS_IPC_HANDLE_KIND_DEVICE => multitask::RemoteVfsHandleKind::Device,
+        _ => {
+            let _ = call_vfs_remote_close_bounded(remote_id);
+            return linux_errno(LINUX_EINVAL);
+        }
+    };
+    let len = response.payload_len as usize;
+    let handle_path = match core::str::from_utf8(&response.payload[..len]) {
+        Ok(path) if !path.is_empty() && path.starts_with('/') => alloc::string::String::from(path),
+        _ => {
+            let _ = call_vfs_remote_close_bounded(remote_id);
+            return linux_errno(LINUX_EINVAL);
+        }
+    };
+    // vfsd owns namespace resolution and declares whether the resolved node is
+    // a device. Compat performs only the handle-transfer substrate after that
+    // service decision; it must not classify caller path strings in ring0.
+    if kind == multitask::RemoteVfsHandleKind::Device
+        && response.aux != u64::from(VFS_DEVICE_ACCESS_DRM_COMPAT)
+    {
+        let _ = call_vfs_remote_close_bounded(remote_id);
+        return match open_device_via_devmgrd(handle_path.as_str(), flags) {
+            Ok(fd) => fd,
+            Err(errno) => linux_errno(errno),
+        };
+    }
     if let Err(errno) = register_remote_vfs_open_description(remote_id) {
         // EEXIST is a capability collision and must not close the already
         // tracked description. Other local admission failures retire the new
@@ -115,23 +139,6 @@ pub fn syscall_linux_vfs_openat(dirfd: u64, path_ptr: u64, flags: u64, mode: u64
         }
         return linux_errno(errno);
     }
-    let kind = match response.handle_kind {
-        VFS_IPC_HANDLE_KIND_FILE => multitask::RemoteVfsHandleKind::File,
-        VFS_IPC_HANDLE_KIND_DIR => multitask::RemoteVfsHandleKind::Directory,
-        VFS_IPC_HANDLE_KIND_DEVICE => multitask::RemoteVfsHandleKind::Device,
-        _ => {
-            release_service_handle_refs_bounded(&[ServiceHandleRef::RemoteVfs(remote_id)]);
-            return linux_errno(LINUX_EINVAL);
-        }
-    };
-    let len = response.payload_len as usize;
-    let handle_path = match core::str::from_utf8(&response.payload[..len]) {
-        Ok(path) if !path.is_empty() && path.starts_with('/') => alloc::string::String::from(path),
-        _ => {
-            release_service_handle_refs_bounded(&[ServiceHandleRef::RemoteVfs(remote_id)]);
-            return linux_errno(LINUX_EINVAL);
-        }
-    };
     let Some(remote_handle) = multitask::RemoteVfsHandle::new(
         remote_id,
         kind,

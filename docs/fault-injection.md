@@ -57,7 +57,6 @@ closing brackets are not accepted by that parser yet.
 | `block.flush` | DVM block flush returns `DeviceFault` before ring publication. |
 | `display.present` | Display present is dropped. |
 | `display.provider.register` | Driver framebuffer provider registration fails. |
-| `driver.module.load` | Loadable driver module load fails. |
 | `input.event.enqueue` | Pointer/input event is dropped before enqueue. |
 | `pci.config.read` | Linux compat PCI config read returns an I/O-style error. |
 | `process.spawn` | User process spawn fails as if no task slot was available. |
@@ -175,7 +174,6 @@ fault.point=action
 | `block.flush` | DVM block flush가 ring publication 전에 `DeviceFault` 반환 |
 | `display.present` | display present drop |
 | `display.provider.register` | driver framebuffer provider 등록 실패 |
-| `driver.module.load` | loadable driver module load 실패 |
 | `input.event.enqueue` | pointer/input event enqueue 전 drop |
 | `pci.config.read` | Linux compat PCI config read가 I/O성 오류 반환 |
 | `process.spawn` | task slot 부족처럼 user process spawn 실패 |

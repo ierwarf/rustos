@@ -20,7 +20,9 @@ pub(crate) const MIN_EFFECTIVE_TASK_WEIGHT_MICROS: u64 = 1_000;
 /// non-UI launches below the kernel's strict System-class admission point even
 /// if a compromised or malformed registry asks for an arbitrarily high weight.
 pub(crate) const MAX_UNTRUSTED_TASK_WEIGHT_MICROS: u64 = 1_000;
-pub(crate) const UI_SERVER_TASK_WEIGHT_MICROS: u64 = TASK_WEIGHT_INTERACTIVE_FLAG | 2_000;
+pub(crate) const UI_SERVER_CATALOG_WEIGHT_MICROS: u64 = 2_000;
+pub(crate) const UI_SERVER_TASK_WEIGHT_MICROS: u64 =
+    TASK_WEIGHT_INTERACTIVE_FLAG | UI_SERVER_CATALOG_WEIGHT_MICROS;
 pub(crate) const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(2);
 pub(crate) const RETRY_BACKOFF: Duration = Duration::from_millis(100);
 // A DVM-volume `EAGAIN` is an explicit readiness transition, not a failed
@@ -60,6 +62,8 @@ pub(crate) const CONSOLE_PATH: &str = console_abi::CONSOLE_PATH;
 pub(crate) const UI_SERVER_DESKTOP_FILE_ID: &str = "uiserver.desktop";
 pub(crate) const UI_SERVER_DISPLAY_NAME: &str = "UI Server";
 pub(crate) const UI_SERVER_EXEC_PATH: &str = "services/uiserver/uiserver.elf";
+pub(crate) const UI_SERVER_BOOTSTRAP_ENV: [&str; 2] =
+    ["RUSTOS_UI_PROFILE=0", "RUSTOS_UI_BOOT_TRACE=0"];
 pub(crate) static LOADER_ENDPOINT_CACHE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SESSION_GRAPH_GENERATION: AtomicU64 = AtomicU64::new(1);
 

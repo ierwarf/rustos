@@ -313,38 +313,50 @@ pub mod network {
     pub fn receive_frame(out: &mut [u8]) -> Result<usize, PacketError> {
         crate::network::receive_frame(out)
     }
+
+    pub fn grant_dvm_transport_lease(generation: u32) -> bool {
+        crate::io::dvm_network::grant_transport_lease(generation)
+    }
+
+    pub fn revoke_dvm_transport_lease(generation: u32) -> bool {
+        crate::io::dvm_network::revoke_transport_lease(generation)
+    }
+
+    pub fn reset_dvm_transport_lease() {
+        crate::io::dvm_network::reset_transport_lease();
+    }
 }
 
 pub mod input {
-    pub mod event_queue {
-        pub use crate::input::event_queue::InputEventQueueDebugSnapshot;
+    pub mod transport {
+        pub use crate::input::dvm_ring::InputTransportDebugSnapshot;
 
-        pub fn debug_snapshot() -> InputEventQueueDebugSnapshot {
-            crate::input::event_queue::debug_snapshot()
+        pub fn debug_snapshot() -> InputTransportDebugSnapshot {
+            crate::input::dvm_ring::debug_snapshot()
         }
 
-        pub fn drain_ingress(dest: &mut [rustos_user_abi::syscall::InputIngressWire]) -> usize {
-            crate::input::event_queue::drain_ingress(dest)
+        pub fn has_pending_records() -> bool {
+            crate::input::dvm_ring::has_pending_records()
         }
 
-        pub fn has_pending_input_events() -> bool {
-            crate::input::event_queue::has_pending_input_events()
+        pub fn arm_consumer_wake() -> bool {
+            crate::input::dvm_ring::arm_consumer_wake()
         }
 
         pub fn arm_input_waiter(task_id: u64) -> bool {
-            crate::input::event_queue::arm_input_waiter(task_id)
+            crate::input::wait_queue::arm_input_waiter(task_id)
         }
 
         pub fn disarm_input_waiter(task_id: u64) {
-            crate::input::event_queue::disarm_input_waiter(task_id);
+            crate::input::wait_queue::disarm_input_waiter(task_id);
         }
 
         pub fn arm_inputd_ingestion_waiter(task_id: u64) -> bool {
-            crate::input::event_queue::arm_inputd_ingestion_waiter(task_id)
+            crate::input::wait_queue::arm_inputd_ingestion_waiter(task_id)
         }
 
         pub fn disarm_inputd_ingestion_waiter(task_id: u64) {
-            crate::input::event_queue::disarm_inputd_ingestion_waiter(task_id);
+            crate::input::wait_queue::disarm_inputd_ingestion_waiter(task_id);
         }
     }
 
@@ -355,8 +367,10 @@ pub mod input {
     /// Bounded hardware transport drain for the capability-gated Linux-DVM
     /// input ingress broker. Input policy and event translation stay in
     /// `inputd`.
-    pub fn service_dvm_input_pending() -> usize {
-        crate::input::service_dvm_input_pending()
+    pub fn service_dvm_input_pending(
+        dest: &mut [rustos_user_abi::syscall::InputDvmRecordWire],
+    ) -> usize {
+        crate::input::service_dvm_input_pending(dest)
     }
 
     pub fn mark_dvm_policy_consumer_ready() -> bool {
@@ -389,7 +403,7 @@ pub mod device {
 
     pub mod input {
         pub fn has_pending_events() -> bool {
-            crate::input::event_queue::has_pending_input_events()
+            crate::input::dvm_ring::has_pending_records()
         }
     }
 }

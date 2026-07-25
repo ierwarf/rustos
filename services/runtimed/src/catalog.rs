@@ -6,7 +6,10 @@ use runtime_control::{
     DEFAULT_RUNTIME_LAUNCH_REGISTRY_PATH,
 };
 
-use super::{boot_line, debug_line, RETRY_BACKOFF, UI_SERVER_EXEC_PATH};
+use super::{
+    boot_line, debug_line, RETRY_BACKOFF, UI_SERVER_BOOTSTRAP_ENV, UI_SERVER_CATALOG_WEIGHT_MICROS,
+    UI_SERVER_DESKTOP_FILE_ID, UI_SERVER_EXEC_PATH,
+};
 use super::{BrokerState, LaunchEntry, ProgramMetadata};
 
 pub(super) fn load_launch_catalog_into_state(state: &mut BrokerState) -> bool {
@@ -91,6 +94,7 @@ pub(super) fn load_launch_catalog(
     for entry in registry_entries.iter().cloned() {
         insert_program_metadata(&mut programs, entry);
     }
+    validate_ui_bootstrap_metadata(&programs)?;
     let autostart_entries = registry_entries
         .iter()
         .filter(|entry| entry.autostart_enabled && !entry.hidden && !entry.no_display)
@@ -110,6 +114,26 @@ pub(super) fn load_launch_catalog(
     );
 
     Ok((programs, launch_entries))
+}
+
+fn validate_ui_bootstrap_metadata(programs: &BTreeMap<String, ProgramMetadata>) -> Result<(), i32> {
+    let metadata = programs
+        .get(UI_SERVER_DESKTOP_FILE_ID)
+        .ok_or(libc::ENOENT)?;
+    let expected_env = UI_SERVER_BOOTSTRAP_ENV
+        .iter()
+        .map(|value| String::from(*value))
+        .collect::<Vec<_>>();
+    if metadata.exec != UI_SERVER_EXEC_PATH
+        || metadata.weight_micros != UI_SERVER_CATALOG_WEIGHT_MICROS
+        || metadata.logical_admin
+        || metadata.console_hosted
+        || !metadata.args.is_empty()
+        || metadata.env != expected_env
+    {
+        return Err(libc::EINVAL);
+    }
+    Ok(())
 }
 
 fn load_launch_entries(
@@ -178,7 +202,7 @@ fn load_launch_entries(
     Ok(entries)
 }
 
-fn launch_entry_priority(entry: &LaunchEntry) -> (u8, u8, &str) {
+fn launch_entry_priority(entry: &LaunchEntry) -> (u8, u8, u8, &str) {
     let service_rank = if entry.exec == UI_SERVER_EXEC_PATH {
         0
     } else if entry.exec.starts_with("services/") {
@@ -188,8 +212,18 @@ fn launch_entry_priority(entry: &LaunchEntry) -> (u8, u8, &str) {
     } else {
         1
     };
+    // netprobe is an acceptance/background traffic generator. It must not
+    // occupy the single serialized loader/VFS path before an interactive
+    // desktop client such as WayClick. Its explicit runtime dependency and
+    // KVM contract still decide whether the probe succeeds after launch.
+    let background_probe_rank = u8::from(entry.desktop_file_id == "netprobe.desktop");
     let restart_rank = u8::from(entry.restart);
-    (service_rank, restart_rank, entry.desktop_file_id.as_str())
+    (
+        service_rank,
+        background_probe_rank,
+        restart_rank,
+        entry.desktop_file_id.as_str(),
+    )
 }
 
 fn insert_program_metadata(
@@ -257,4 +291,66 @@ pub(super) fn runtime_deps_satisfied(
 ) -> bool {
     deps.iter()
         .all(|dep| running_packages.contains(dep) || launched_once_packages.contains(dep))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        launch_entry_priority, validate_ui_bootstrap_metadata, LaunchEntry, ProgramMetadata,
+        StartupMode, UI_SERVER_BOOTSTRAP_ENV, UI_SERVER_CATALOG_WEIGHT_MICROS,
+        UI_SERVER_DESKTOP_FILE_ID, UI_SERVER_EXEC_PATH,
+    };
+    use std::collections::BTreeMap;
+
+    fn app(desktop_file_id: &str) -> LaunchEntry {
+        LaunchEntry {
+            package_id: desktop_file_id.into(),
+            desktop_file_id: desktop_file_id.into(),
+            display_name: desktop_file_id.into(),
+            exec: format!("apps/{desktop_file_id}/app.elf"),
+            runtime_deps: Vec::new(),
+            restart: false,
+            weight_micros: 100,
+            logical_admin: false,
+            console_hosted: false,
+            args: Vec::new(),
+            env: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn background_network_probe_never_precedes_interactive_desktop() {
+        assert!(
+            launch_entry_priority(&app("wayclick.desktop"))
+                < launch_entry_priority(&app("netprobe.desktop"))
+        );
+    }
+
+    #[test]
+    fn sealed_ui_bootstrap_defaults_must_match_the_catalog() {
+        let metadata = ProgramMetadata {
+            package_id: String::from("uiserver"),
+            desktop_file_id: String::from(UI_SERVER_DESKTOP_FILE_ID),
+            display_name: String::from("UI Server"),
+            exec: String::from(UI_SERVER_EXEC_PATH),
+            runtime_deps: Vec::new(),
+            startup: StartupMode::Desktop,
+            weight_micros: UI_SERVER_CATALOG_WEIGHT_MICROS,
+            logical_admin: false,
+            console_hosted: false,
+            args: Vec::new(),
+            env: UI_SERVER_BOOTSTRAP_ENV
+                .iter()
+                .map(|value| String::from(*value))
+                .collect(),
+        };
+        let mut programs = BTreeMap::from([(String::from(UI_SERVER_DESKTOP_FILE_ID), metadata)]);
+        assert_eq!(validate_ui_bootstrap_metadata(&programs), Ok(()));
+        programs
+            .get_mut(UI_SERVER_DESKTOP_FILE_ID)
+            .expect("uiserver metadata")
+            .env
+            .push(String::from("UNSEALED=1"));
+        assert_eq!(validate_ui_bootstrap_metadata(&programs), Err(libc::EINVAL));
+    }
 }

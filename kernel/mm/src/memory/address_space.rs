@@ -221,12 +221,44 @@ impl ProcessAddressSpace {
         frames: &[u64],
         flags: PageTableFlags,
     ) -> Result<UserRegion, AddressSpaceError> {
+        self.map_existing_user_pages_at_with_leaf_flags(
+            start,
+            frames,
+            flags,
+            PageTableFlags::empty(),
+        )
+    }
+
+    /// Map page-aligned pre-owned frames with the x86 4-KiB PAT selector.
+    /// The caller must ensure every alias of these external frames uses the
+    /// same write-combine memory type.
+    pub fn map_existing_user_pages_at_write_combine(
+        &mut self,
+        start: VirtAddr,
+        frames: &[u64],
+        flags: PageTableFlags,
+    ) -> Result<UserRegion, AddressSpaceError> {
+        self.map_existing_user_pages_at_with_leaf_flags(
+            start,
+            frames,
+            flags,
+            PageTableFlags::HUGE_PAGE,
+        )
+    }
+
+    fn map_existing_user_pages_at_with_leaf_flags(
+        &mut self,
+        start: VirtAddr,
+        frames: &[u64],
+        flags: PageTableFlags,
+        leaf_flags: PageTableFlags,
+    ) -> Result<UserRegion, AddressSpaceError> {
         if frames.is_empty() {
             return Err(AddressSpaceError::ZeroSizedAllocation);
         }
 
         validate_user_page_range(start, frames.len())?;
-        let page_flags = normalize_user_page_flags(flags)?;
+        let page_flags = normalize_user_page_flags(flags)? | leaf_flags;
         let mut mapped_pages = Vec::with_capacity(frames.len());
 
         for (page_index, frame_phys) in frames.iter().copied().enumerate() {
@@ -449,7 +481,7 @@ impl ProcessAddressSpace {
 
         let pt = unsafe { kernel_vm::phys_to_table_ref(pd_entry.addr()) };
         let pt_entry = &pt[p1_index(virt)];
-        if pt_entry.is_unused() || pt_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+        if pt_entry.is_unused() {
             return None;
         }
 
@@ -713,11 +745,17 @@ impl ProcessAddressSpace {
 
         let pt = unsafe { kernel_vm::phys_to_table_mut(pd_entry.addr()) };
         let pt_entry = &mut pt[p1_index(virt)];
-        if pt_entry.is_unused() || pt_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+        if pt_entry.is_unused() {
             return Err(AddressSpaceError::NotMapped);
         }
 
-        pt_entry.set_addr(pt_entry.addr(), flags);
+        // Bit 7 is PS in a directory entry, but PAT in a 4-KiB leaf PTE.
+        // Preserve it across mprotect so a write-combine external mapping
+        // cannot silently become write-back and create conflicting aliases.
+        pt_entry.set_addr(
+            pt_entry.addr(),
+            preserve_4k_leaf_pat(pt_entry.flags(), flags),
+        );
         self.flush_if_active(virt);
         Ok(())
     }
@@ -747,7 +785,7 @@ impl ProcessAddressSpace {
 
         let pt = unsafe { kernel_vm::phys_to_table_mut(pd_entry.addr()) };
         let pt_entry = &mut pt[p1_index(virt)];
-        if pt_entry.is_unused() || pt_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+        if pt_entry.is_unused() {
             return None;
         }
 
@@ -1067,6 +1105,10 @@ fn normalize_user_page_flags(flags: PageTableFlags) -> Result<PageTableFlags, Ad
     Ok(flags | PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE)
 }
 
+fn preserve_4k_leaf_pat(existing: PageTableFlags, requested: PageTableFlags) -> PageTableFlags {
+    requested | (existing & PageTableFlags::HUGE_PAGE)
+}
+
 enum UserPageLookup {
     NotUser,
     MissingPml4,
@@ -1106,7 +1148,7 @@ impl ProcessAddressSpace {
 
         let pt = unsafe { kernel_vm::phys_to_table_ref(pd_entry.addr()) };
         let pt_entry = &pt[p1_index(virt)];
-        if pt_entry.is_unused() || pt_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+        if pt_entry.is_unused() {
             return UserPageLookup::MissingPt;
         }
 
@@ -1199,5 +1241,19 @@ mod tests {
             normalize_user_page_flags(PageTableFlags::HUGE_PAGE | PageTableFlags::NO_EXECUTE),
             Err(AddressSpaceError::HugePageConflict)
         );
+    }
+
+    #[test]
+    fn mprotect_preserves_write_combine_pat_on_4k_leaf() {
+        let existing = PageTableFlags::PRESENT
+            | PageTableFlags::USER_ACCESSIBLE
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::NO_EXECUTE
+            | PageTableFlags::HUGE_PAGE;
+        let requested =
+            PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE | PageTableFlags::NO_EXECUTE;
+        let preserved = preserve_4k_leaf_pat(existing, requested);
+        assert!(preserved.contains(PageTableFlags::HUGE_PAGE));
+        assert!(!preserved.contains(PageTableFlags::WRITABLE));
     }
 }

@@ -35,7 +35,6 @@ rules = [
     "block.write=off",
     "display.present=off",
     "display.provider.register=off",
-    "driver.module.load=off",
     "input.event.enqueue=off",
     "pci.config.read=off",
     "process.spawn=off",

@@ -731,6 +731,7 @@ pub(crate) fn display_gpu_submit(
     let mut request = DisplayGpuSubmitRequest {
         surface_handle,
         flags: DISPLAY_GPU_SUBMIT_FLAG_STAGED_COPY,
+        reserved: 0,
         batch_ptr: batch.as_ptr() as u64,
         batch_len: u32::try_from(batch.len()).map_err(|_| EINVAL)?,
         damage_count: u32::try_from(damage.len()).map_err(|_| EINVAL)?,
@@ -739,7 +740,6 @@ pub(crate) fn display_gpu_submit(
         } else {
             damage.as_ptr() as u64
         },
-        reserved: 0,
     };
     ioctl_with_mut(fd, DISPLAY_IOCTL_GPU_SUBMIT, &mut request)
 }

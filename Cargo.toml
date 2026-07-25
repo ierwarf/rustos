@@ -40,7 +40,6 @@ members = [
     "services/sessiond",
     "services/uiserver",
     "apps/wayclick",
-    "drivers/libs/driver-abi",
     "drivers/libs/input-evdev",
     "drivers/libs/keyboard-core",
     "tests/contract-tests",

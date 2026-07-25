@@ -43,13 +43,14 @@ The source and finite-model boundary is implemented. Uiserver now duplicates
 Wayland-server's aggregate backend epoll open description into a demoted waiter,
 merges that wake with its input wake, and rearms only after client dispatch. Its
 runtime deadline remains the bounded fallback rather than the sole Wayland wake
-source. The bounded 30-second QEMU boot witness reaches initd without a
-lifecycle cycle, but the live KVM wait/event workload remains unclaimed because
-host admission rejects the available NVIDIA render node. Runtime timeout,
-readiness, close, vfsd checkpoint replay, restart, and WayClick evidence is still
-required before commercial acceptance, and the 55 FPS gate stays unaccepted
-until those measurements pass. Ring0 must continue to
-avoid inspecting inputd, netd, vfsd, or uiserver private queues.
+source. The virtual-GPU KVM workload now proves authenticated input/network
+exercise plus three balanced WayClick windows at 62.092 FPS aggregate with a
+45 ms maximum callback gap. Source and finite-model checks cover timeout,
+readiness, close, vfsd checkpoint replay, and restart/revoke state; live
+service-crash injection remains separate unclaimed recovery evidence. This
+virtual result does not change the user-deferred physical-GPU FPS/reset gate.
+Ring0 must continue to avoid inspecting inputd, netd, vfsd, or uiserver private
+queues.
 
 The existing uiserver input reader remains a safe bounded bridge. It performs a
 zero-time poll whose inputd `STATS` request has a 16 ms deadline before starting

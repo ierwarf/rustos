@@ -230,7 +230,6 @@ version = "0.1.0"
 dependencies = [
  "boot-protocol",
  "boot-random",
- "driver-abi",
  "keyboard-core",
  "rustos-fault-injection",
  "rustos-user-abi",
@@ -357,10 +356,6 @@ name = "downcast-rs"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
-
-[[package]]
-name = "driver-abi"
-version = "0.1.0"
 
 [[package]]
 name = "driver-domain-protocol"
@@ -708,14 +703,12 @@ name = "kernel-io-manager"
 version = "0.1.0"
 dependencies = [
  "boot-protocol",
- "driver-abi",
  "driver-domain-protocol",
  "ed25519-dalek",
  "elf",
  "embedded-graphics",
  "heapless",
  "hidreport",
- "input-evdev",
  "kernel-hal",
  "kernel-ipc-runtime",
  "kernel-mm",

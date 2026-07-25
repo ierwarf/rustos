@@ -43,6 +43,12 @@ fails the five-second UI limit independently of its broader readiness timeout.
 `formal/run-source-conformance.sh` checks the class ordering and reply
 cancellation witnesses.
 
+Slow-IPC diagnostics are an observation rail, not a second workload. Each of
+the generic and typed-service paths emits at most four records per second after
+its early sample set. A sustained input or storage load therefore remains
+diagnosable across the run without paying for hundreds of emergency debugcon
+writes during the same boot second.
+
 The kernel service registry publishes an endpoint last and clears it first.
 The steady-state lookup path takes an epoch/endpoint snapshot, rechecks both
 after reading the owner, and acquires no global mutation lock. Three unstable
@@ -64,9 +70,31 @@ cache-line write.
   not ready remains retryable. Storaged records the first readiness errno and
   later errno transitions, not every identical 50 ms retry.
 
+- Storaged starts a first or random cache miss with one 64-KiB DVM block
+  ticket. A later miss must equal the exact preceding window end before it can
+  expand into at most eight contiguous tickets. It publishes that complete
+  bounded batch before waiting, so the 32-entry transport queue overlaps
+  device latency for actual sequential reads while random FAT metadata does
+  not amplify into 512-KiB traffic. Partial submission is cancelled; a
+  completion failure cancels the remainder and clears cached generation
+  authority. This is service-owned read-ahead, not a larger kernel transfer
+  slot or a bootstrap-file bypass.
+
 ## UI Runtime
 
+- Rootd's early readiness loop drains up to 32 already-queued control requests
+  per turn. The 250 ms readiness/backoff delay is permitted only when that turn
+  made no control-plane progress. Sleeping after every single registration
+  serializes the concurrently started foundation services and violates the
+  five-second boot-to-UI hard limit.
+
 - Default KVM-smoke runs keep coarse `uiserver: update tick` logs only.
+- Generic and typed slow-IPC diagnostics each emit at most one representative
+  sample per second. The synchronous debug sink cannot become an overload
+  amplifier; aggregate counters and milestones retain the dropped volume.
+- Immutable successful syscalld time admissions are process-local cached
+  exact keys. In particular, syscalld never routes its own receive-loop
+  backoff through its own IPC endpoint.
 - Detailed `uiserver profile: ...` and cursor/render pipeline diagnostics stay
   behind `RUSTOS_UI_PROFILE=1`.
 - Profile and once-per-second heartbeat summaries are emitted after accounting
@@ -76,11 +104,12 @@ cache-line write.
   interactive System-class loop. A contended debugcon attempt is dropped and a
   later one-second window retries; insufficient samples are a conservative KVM
   gate failure, never a fabricated FPS success.
-- The KVM-only self-test polls its axis-aligned 192-pixel square source at most
-  every 5 ms and sends it through the L0-owned input ring. The end-to-end
-  contract is 60 accepted updates/s: a 60 FPS gate requires three consecutive
-  active one-second windows with at least 55 accepted events, 50 presented
-  cursor moves, zero drop/slow/error/backlog, no input gap or age over 50 ms,
+- The KVM-only self-test publishes its axis-aligned 192-pixel square source on
+  a cumulative 15 ms cadence and sends it through the L0-owned input ring. The
+  end-to-end contract uses exact aggregate rates across three consecutive
+  active windows: at least 55 accepted events/s and 50 presented cursor
+  moves/s, with an 80% floor in every constituent window, zero
+  drop/slow/error/backlog, no input gap or age over 50 ms,
   exact logical/presented cursor agreement, and at least 96 pixels of travel on
   both axes. It also requires three DVM samples at or above 60 FPS with
   publish-to-page-flip time no greater than 12 ms. The DVM relay imports the
@@ -101,7 +130,77 @@ cache-line write.
   an older released slot may be reconstructed by the complete contiguous
   damage history from its retained content epoch to the new epoch. Missing,
   discontinuous, invalid, or topology-changing history forces a complete
-  snapshot. Release authority remains cleared independently.
+  snapshot. Reconstruction preserves disjoint rectangles and merges only
+  rectangles that actually overlap. It must never replace distant cursor and
+  client damage with their atlas-wide bounding box; exceeding the protocol's
+  bounded rectangle count fails over to one explicit full snapshot instead.
+  At steady state uiserver selects the completed slot with the lowest
+  reconstruction cost and refuses a stale slot when replay would touch more
+  than one eighth of the atlas. It coalesces until a recent slot completes
+  instead of converting a small interactive update into a multi-megabyte copy.
+  Release authority remains cleared independently.
+- Uiserver owns one page-aligned mapping for each exact DVM atlas slot. It
+  copies only the slot-reconstruction damage into that slot, then commits a
+  pointer-free ABI v5 record. Ring0 revalidates the slot capability and command
+  bounds but performs no per-frame pixel copy or user-page walk. The atlas
+  pages use one write-combine memory type across user and kernel aliases;
+  command pages and sibling slots are not mapped into the service. Large rows
+  use aligned non-temporal stores followed by one publication fence; ordinary
+  cache-polluting memcpy into the write-combine aperture is forbidden for a
+  full-slot reconstruction.
+- A `wl_shm` client that redraws a static surface under pointer motion must
+  damage only the clipped union of the previous and current pointer marks.
+  Switching between fully redrawn buffers does not justify full-surface
+  damage: unchanged pixels are identical and remain outside the compositor
+  copy. Semantic changes to the target, score, layout, or initial buffer still
+  force full damage. A profile-only callback commit with no content change
+  carries no fabricated damage.
+- Retained GPU console layers are versioned independently from scene topology.
+  Terminal output refreshes only that layer's atlas rectangle; it must not
+  change the structural scene signature and trigger a 2048x2048 rebuild.
+- Window position is command metadata, not atlas topology. A drag updates the
+  exact capability-bound texture layer's destination rectangle without
+  allocating, rasterizing, comparing, or copying the 2048x2048 atlas. Identity,
+  focus, visibility, ordering, or dimensions still invalidate the retained
+  binding and fail closed into a structural rebuild. The structural reuse
+  signature must therefore exclude only `frame.x` and `frame.y`.
+- Until the DVM exports an authenticated vblank deadline, uiserver submits on a
+  cumulative 15 ms cadence. This gives nominal 60 Hz scanout 1.67 ms of
+  bounded scheduler/render headroom without accumulating timer credit or
+  bursting missed frames. WayClick remains in the ordinary User class and
+  declares a 1,000-microsecond fair-share weight; it receives no System-class
+  admission. Its sustained gate uses exact aggregate counts across contiguous
+  windows, requires every window to retain at least 80% of the target, and
+  rejects any callback gap over 50 ms.
+- A layer-topology change (for example the first Wayland surface) rebuilds the
+  service-owned atlas description, but an already-active compositor compares
+  the rebuilt pixels with the retained atlas and copies only the exact changed
+  bounds into the write-combined DVM slot. Initial activation still copies a
+  complete snapshot. This prevents a new client from turning a small texture
+  admission into a 16 MiB synchronous atlas transfer on the interactive loop.
+- The input ingestion broker validates and copies one bounded batch into
+  inputd with one user-memory transfer. Revalidating the same output range
+  separately for every 48-byte record made ring consumption scale with event
+  count and could fall behind an admitted 100 Hz pointer source despite the
+  256-record turn bound.
+- Wayland pointer motion is a latest-state stream, not an unbounded event
+  queue. Uiserver emits at most one motion/frame group per 15 ms interval,
+  while focus enter/leave remains immediate and a pending coordinate is
+  force-flushed before a button transition. This bounds client dispatch work
+  without changing click coordinates or ordering.
+- A Wayland client publishes its initial registry request before entering the
+  first blocking dispatch. It must not depend on an incoming event to flush
+  the request that creates that event; later callback batches retain the same
+  explicit post-dispatch flush ordering.
+- The pre-catalog UI bootstrap reads only the signed Init environment registry.
+  Its two service-local defaults are sealed in runtimed and are revalidated
+  byte-for-byte against the generated launch catalog when that catalog is
+  admitted. Boot must not scan every desktop entry through the DVM-backed VFS
+  before spawning uiserver.
+- `initd` orders that immutable runtimed/uiserver bootstrap before storaged.
+  Mutable application discovery still fails closed until its DVM-backed VFS
+  reads succeed; the first visible desktop no longer inherits an unrelated
+  block-publication latency dependency.
 - `cargo xtask kvm-run` is the real-use acceptance path: it enables no input
   self-test or private UI profiler. Startup requires an atomic three-buffer
   relay, an active RustOS provider, and a non-zero immutable source frame.
@@ -114,9 +213,11 @@ cache-line write.
   the only non-UI helper permitted to retain the input service's System class:
   it owns a dedicated kernel wake slot rather than a shared app-poll slot,
   waits event-driven, drains one bounded 256-record broker batch, and yields
-  before any recovery batch. L0 sends an MSI-X doorbell only for the
-  empty-to-nonempty transition or cleanup, never one per pointer frame. Any
-  missing worker, cursor wait race, ring
+  before any recovery batch. The wake path batches by inputd's monotonic
+  consumer wake generation: register task, publish generation, recheck cursor,
+  then block. L0 reads that generation only after committing producer and
+  rings at most once for it. Per-record MSI-X and stale pre-commit empty
+  snapshots are both conformance failures. Any missing worker, cursor wait race, ring
   saturation, shared-waiter exhaustion, or fallback polling loop fails the
   acceptance gate.
 - An interactive service's `TASK_WEIGHT_INTERACTIVE_FLAG` admits only its
@@ -129,6 +230,10 @@ cache-line write.
 
 ## Scheduler Dispatch
 
+- The KVM proof assigns RustOS one vCPU until SMP scheduling is implemented.
+  Advertising an idle second RustOS vCPU cannot improve guest throughput and
+  steals host scheduling capacity from the Linux DVM on low-end machines.
+
 - The scheduler keeps a fixed 128-slot task table. A normal or
   voluntary-yield pick performs one table scan and records the best candidate
   for System, User, and Idle simultaneously. This preserves strict class
@@ -136,7 +241,7 @@ cache-line write.
   IPC-donation classification passes when no System task is ready.
 - At most two consecutive System dispatches may run while User work is ready;
   the next dispatch is reserved for User work. Independently, every ready User
-  task has an 8 ms ready-age rail and every ready System task has a 10 ms rail.
+  task has a 2 ms ready-age rail and every ready System task has a 2 ms rail.
   A selection micro-optimization must not bypass these limits or convert launch
   weights into strict-class authority. A blocked caller still hands directly
   to its exact receiver, but otherwise an overdue System continuation runs
@@ -148,7 +253,7 @@ cache-line write.
   it does not move AF_UNIX ownership or protocol policy into ring0.
 - `rootd`'s immutable bootstrap manifest explicitly admits only the fixed
   syscall/VFS/loader/process/pager brokers to the System latency class.
-  Package and desktop metadata cannot request that bit. The scheduler's 10 ms
+  Package and desktop metadata cannot request that bit. The scheduler's 2 ms
   ready-wait rail therefore covers causal core servers without making dynamic
   applications strict-priority work.
 

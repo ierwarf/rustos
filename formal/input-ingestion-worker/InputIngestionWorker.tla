@@ -11,11 +11,12 @@ Concrete source anchors:
   * `services/inputd/src/main.rs`: `inputd-dvm-ingress` is the sole
     event-driven worker that invokes the existing bounded ingest broker. A
     full batch yields and immediately starts another bounded broker turn; it
-    does not wait for an edge that the empty-to-nonempty producer intentionally
-    will not send while backlog remains.
-  * `kernel/io-manager/src/input/{dvm_ring,event_queue}.rs`: the MSI-X leaf
-    wakes the dedicated inputd slot independently of application poll waiters;
-    it neither decodes nor advances the consumer.
+    does not wait for a later producer record to finish admitted backlog.
+  * `kernel/io-manager/src/input/{dvm_ring,wait_queue}.rs`: inputd publishes a
+    monotonic consumer wake generation after registering its dedicated slot;
+    L0 samples it after commit and the MSI-X leaf only wakes that slot.
+    A bounded timer independently wakes the same armed task for an
+    authoritative cursor recheck if an interrupt edge is lost or coalesced.
 
 The model deliberately includes client polls as unrelated actions. They may
 establish policy readiness, but after that point they cannot be required for
@@ -30,9 +31,11 @@ Waiting == "waiting"
 Draining == "draining"
 
 VARIABLES policyConsumerReady, workerState, producer, consumer, irqPending,
+          consumerWakeGeneration, notifiedWakeGeneration,
           batchRemaining, clientPolls, inputdWakeSlot, lastConsumerOwner
 
 vars == <<policyConsumerReady, workerState, producer, consumer, irqPending,
+          consumerWakeGeneration, notifiedWakeGeneration,
           batchRemaining, clientPolls, inputdWakeSlot, lastConsumerOwner>>
 
 Outstanding == producer - consumer
@@ -44,9 +47,11 @@ Init ==
     /\ producer = 0
     /\ consumer = 0
     /\ irqPending = FALSE
+    /\ consumerWakeGeneration = 0
+    /\ notifiedWakeGeneration = 0
     /\ batchRemaining = 0
     /\ clientPolls = 0
-    /\ inputdWakeSlot = WorkerOwner
+    /\ inputdWakeSlot = NoOwner
     /\ lastConsumerOwner = NoOwner
 
 \* A real client completes the policy-backed readiness check. The worker was
@@ -56,7 +61,21 @@ SetPolicyConsumerReady ==
     /\ workerState = Waiting
     /\ policyConsumerReady' = TRUE
     /\ UNCHANGED <<workerState, producer, consumer, irqPending,
+                  consumerWakeGeneration, notifiedWakeGeneration,
                   batchRemaining, clientPolls, inputdWakeSlot, lastConsumerOwner>>
+
+\* inputd registers its task first, publishes a new single-writer generation,
+\* then rechecks producer/consumer before committing the block.
+ArmIngestionWorker ==
+    /\ policyConsumerReady
+    /\ workerState = Waiting
+    /\ inputdWakeSlot = NoOwner
+    /\ consumer = producer
+    /\ inputdWakeSlot' = WorkerOwner
+    /\ consumerWakeGeneration' = consumerWakeGeneration + 1
+    /\ UNCHANGED <<policyConsumerReady, workerState, producer, consumer,
+                  irqPending, notifiedWakeGeneration, batchRemaining,
+                  clientPolls, lastConsumerOwner>>
 
 \* L0 can produce only into a policy-ready ring with a live worker and keeps
 \* one slot reserved for authenticated cleanup.
@@ -66,9 +85,17 @@ Produce ==
     /\ producer < MaxProduced
     /\ Outstanding < NormalCapacity
     /\ producer' = producer + 1
-    /\ irqPending' = IF Outstanding = 0 THEN TRUE ELSE irqPending
+    \* L0 samples the arm generation after commit and emits at most one edge
+    \* for that generation. Records committed while the worker remains
+    \* runnable are therefore batched without weakening lost-wake safety.
+    /\ irqPending' =
+        IF consumerWakeGeneration # notifiedWakeGeneration
+        THEN TRUE
+        ELSE irqPending
+    /\ notifiedWakeGeneration' = consumerWakeGeneration
     /\ UNCHANGED <<policyConsumerReady, workerState, consumer,
-                  batchRemaining, clientPolls, inputdWakeSlot, lastConsumerOwner>>
+                  consumerWakeGeneration, batchRemaining, clientPolls,
+                  inputdWakeSlot, lastConsumerOwner>>
 
 \* The IRQ can be delayed or lost. The wait broker rechecks the raw cursors,
 \* so either an edge or outstanding work makes the worker runnable.
@@ -76,12 +103,40 @@ WakeIngestionWorker ==
     /\ workerState = Waiting
     /\ inputdWakeSlot = WorkerOwner
     /\ consumer < producer
+    /\ irqPending
     /\ workerState' = Draining
     /\ batchRemaining' = Batch
     /\ irqPending' = FALSE
     /\ inputdWakeSlot' = NoOwner
     /\ UNCHANGED <<policyConsumerReady, producer, consumer,
+                  consumerWakeGeneration, notifiedWakeGeneration,
                   clientPolls, lastConsumerOwner>>
+
+\* The finite kernel timer is independent of MSI-X delivery. It turns a lost
+\* or indefinitely coalesced interrupt into the same authoritative cursor
+\* recheck. Empty watchdog expiries are abstract stuttering steps.
+WatchdogWakeIngestionWorker ==
+    /\ workerState = Waiting
+    /\ inputdWakeSlot = WorkerOwner
+    /\ consumer < producer
+    /\ workerState' = Draining
+    /\ batchRemaining' = Batch
+    /\ inputdWakeSlot' = NoOwner
+    /\ UNCHANGED <<policyConsumerReady, producer, consumer, irqPending,
+                  consumerWakeGeneration, notifiedWakeGeneration,
+                  clientPolls, lastConsumerOwner>>
+
+\* A commit that raced before arm publication is found by the authoritative
+\* post-registration cursor recheck; it needs no fabricated interrupt.
+ObserveBacklogWithoutSleep ==
+    /\ workerState = Waiting
+    /\ inputdWakeSlot = NoOwner
+    /\ consumer < producer
+    /\ workerState' = Draining
+    /\ batchRemaining' = Batch
+    /\ UNCHANGED <<policyConsumerReady, producer, consumer, irqPending,
+                  consumerWakeGeneration, notifiedWakeGeneration,
+                  clientPolls, inputdWakeSlot, lastConsumerOwner>>
 
 \* Only the inputd worker advances RustOS's consumer cursor. Each broker
 \* invocation is bounded, even while catching up after a client stall.
@@ -93,6 +148,7 @@ DrainOne ==
     /\ batchRemaining' = batchRemaining - 1
     /\ lastConsumerOwner' = WorkerOwner
     /\ UNCHANGED <<policyConsumerReady, workerState, producer, irqPending,
+                  consumerWakeGeneration, notifiedWakeGeneration,
                   clientPolls, inputdWakeSlot>>
 
 FinishBoundedBatch ==
@@ -100,8 +156,9 @@ FinishBoundedBatch ==
     /\ batchRemaining = 0 \/ consumer = producer
     /\ workerState' = Waiting
     /\ batchRemaining' = 0
-    /\ inputdWakeSlot' = WorkerOwner
+    /\ inputdWakeSlot' = NoOwner
     /\ UNCHANGED <<policyConsumerReady, producer, consumer, irqPending,
+                  consumerWakeGeneration, notifiedWakeGeneration,
                   clientPolls, lastConsumerOwner>>
 
 \* An application may poll arbitrarily often or stop polling altogether. It
@@ -110,12 +167,16 @@ ClientPoll ==
     /\ clientPolls < MaxClientPolls
     /\ clientPolls' = clientPolls + 1
     /\ UNCHANGED <<policyConsumerReady, workerState, producer, consumer,
-                  irqPending, batchRemaining, inputdWakeSlot, lastConsumerOwner>>
+                  irqPending, consumerWakeGeneration, notifiedWakeGeneration,
+                  batchRemaining, inputdWakeSlot, lastConsumerOwner>>
 
 Next ==
     \/ SetPolicyConsumerReady
+    \/ ArmIngestionWorker
     \/ Produce
     \/ WakeIngestionWorker
+    \/ WatchdogWakeIngestionWorker
+    \/ ObserveBacklogWithoutSleep
     \/ DrainOne
     \/ FinishBoundedBatch
     \/ ClientPoll
@@ -126,6 +187,9 @@ TypeOK ==
     /\ producer \in 0..MaxProduced
     /\ consumer \in 0..MaxProduced
     /\ irqPending \in BOOLEAN
+    /\ consumerWakeGeneration \in Nat
+    /\ notifiedWakeGeneration \in Nat
+    /\ notifiedWakeGeneration <= consumerWakeGeneration
     /\ batchRemaining \in 0..Batch
     /\ clientPolls \in 0..MaxClientPolls
     /\ inputdWakeSlot \in {NoOwner, WorkerOwner}
@@ -146,7 +210,7 @@ BoundedWorkerTurn ==
     /\ workerState = Waiting => batchRemaining = 0
 
 DedicatedWakeSlot ==
-    /\ workerState = Waiting => inputdWakeSlot = WorkerOwner
+    /\ workerState = Waiting => inputdWakeSlot \in {NoOwner, WorkerOwner}
     /\ workerState = Draining => inputdWakeSlot = NoOwner
 
 ClientPollCannotOwnProgress ==
@@ -155,7 +219,10 @@ ClientPollCannotOwnProgress ==
 
 Spec ==
     Init /\ [][Next]_vars
+    /\ WF_vars(ArmIngestionWorker)
     /\ WF_vars(WakeIngestionWorker)
+    /\ WF_vars(WatchdogWakeIngestionWorker)
+    /\ WF_vars(ObserveBacklogWithoutSleep)
     /\ WF_vars(DrainOne)
     /\ WF_vars(FinishBoundedBatch)
 

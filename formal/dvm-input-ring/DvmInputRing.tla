@@ -11,8 +11,9 @@ Concrete source anchors:
       libs/driver-domain-host/src/lib.rs InputRingSink
   * RustOS peer-0 admission, MSI-X leaf, and bounded broker drain:
       kernel/io-manager/src/input/dvm_ring.rs
-  * RDI3 epoch/sequence validation and inputd ingress:
-      kernel/io-manager/src/input/dvm_frames.rs
+  * RDI3 epoch/sequence validation and inputd policy ingress:
+      services/inputd/src/dvm_protocol.rs
+      services/inputd/src/main.rs
 
 The DVM is deliberately absent from the ring's write authority. It sends
 allowlisted events to L0 on the authenticated control channel; L0 alone can

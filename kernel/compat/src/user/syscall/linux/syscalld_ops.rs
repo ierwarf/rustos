@@ -348,13 +348,74 @@ pub(super) fn request_syscalld_timespec_admission(
     flags: u64,
     ts: LinuxTimespecWire,
 ) -> Result<(), i64> {
+    if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
+        return Err(LINUX_EINVAL);
+    }
+    let absolute = flags == linux_abi::TIMER_ABSTIME as u64;
+    let cacheable = match op {
+        SYSCALL_OFFLOAD_OP_LINUX_NANOSLEEP if clock_id == 0 && flags == 0 => Some(false),
+        SYSCALL_OFFLOAD_OP_LINUX_CLOCK_NANOSLEEP
+            if flags == 0 || flags == linux_abi::TIMER_ABSTIME as u64 =>
+        {
+            Some(true)
+        }
+        _ => None,
+    };
+    let cached =
+        multitask::with_current_user_process_state(|_, _, process_state| match cacheable {
+            Some(false) => process_state.linux_nanosleep_admission_cached(),
+            Some(true) => process_state.linux_clock_nanosleep_admission_cached(clock_id, absolute),
+            None => false,
+        })
+        .unwrap_or(false);
+    if cached {
+        return Ok(());
+    }
+    if cacheable.is_some()
+        && ipc_ops::current_process_has_service_capability(IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY)
+    {
+        // syscalld is the owner of this immutable policy and must not issue a
+        // synchronous request to its own receive endpoint merely to back off
+        // that receive loop. Capability identity plus the exact local
+        // timespec/key validation above is the self-admission boundary.
+        let committed =
+            multitask::with_current_user_process_state_mut(|_, _, process_state| match cacheable {
+                Some(false) => {
+                    process_state.cache_linux_nanosleep_admission();
+                    true
+                }
+                Some(true) => {
+                    process_state.cache_linux_clock_nanosleep_admission(clock_id, absolute)
+                }
+                None => false,
+            })
+            .unwrap_or(false);
+        return if committed { Ok(()) } else { Err(LINUX_EINVAL) };
+    }
+
     let mut request = new_syscalld_request(op);
     request.arg0 = clock_id;
     request.flags = flags;
     request.path_len = LINUX_TIMESPEC_SIZE as u32;
     request.path[..size_of::<i64>()].copy_from_slice(&ts.tv_sec.to_le_bytes());
     request.path[size_of::<i64>()..LINUX_TIMESPEC_SIZE].copy_from_slice(&ts.tv_nsec.to_le_bytes());
-    call_syscalld(request).and_then(|response| ensure_empty_syscalld_response(&response))
+    call_syscalld(request).and_then(|response| ensure_empty_syscalld_response(&response))?;
+
+    let cache_committed =
+        multitask::with_current_user_process_state_mut(|_, _, process_state| match cacheable {
+            Some(false) => {
+                process_state.cache_linux_nanosleep_admission();
+                true
+            }
+            Some(true) => process_state.cache_linux_clock_nanosleep_admission(clock_id, absolute),
+            None => true,
+        })
+        .unwrap_or(false);
+    if cache_committed {
+        Ok(())
+    } else {
+        Err(LINUX_EINVAL)
+    }
 }
 
 pub(super) fn call_syscalld(

@@ -18,14 +18,16 @@ use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_NETD_OP_PACKET_LEASE, COMMERCIAL_MAX_NETD_OP_ROUTE_POLICY,
     COMMERCIAL_MAX_NETD_OP_SOCKET_NAMESPACE, COMMERCIAL_MAX_NETD_OP_SOCKET_OPTIONS,
     COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS,
-    COMMERCIAL_MAX_PROTOCOL_NETD, IPC_SERVICE_NETD, NETD_IPC_ABI_VERSION, NETD_IPC_OP_REF_ACK,
+    COMMERCIAL_MAX_PROTOCOL_NETD, IPC_SERVICE_INPUTD, IPC_SERVICE_NETD, NETD_DVM_SESSION_GRANT,
+    NETD_DVM_SESSION_REVOKE, NETD_IPC_ABI_VERSION, NETD_IPC_OP_DVM_SESSION, NETD_IPC_OP_REF_ACK,
     NETD_IPC_REQUEST_HEADER_SIZE, NETD_IPC_RESPONSE_FLAG_LATENCY_HANDOFF,
     NETD_IPC_RESPONSE_HEADER_SIZE, NETD_POLL_MODE_QUERY, NETD_POLL_MODE_WAIT,
-    NETD_RECVMSG_PAYLOAD_HEADER_SIZE, NETD_SENDMSG_PAYLOAD_HEADER_SIZE, NET_BROKER_OP_PACKET_RX,
-    NET_BROKER_OP_PACKET_STATUS, NET_BROKER_OP_PACKET_TX, NET_BROKER_PACKET_MTU,
-    NET_BROKER_PACKET_STATUS_ACTIVE, NET_BROKER_PACKET_STATUS_AWAITING_AUTHENTICATED_CONTROL,
-    NET_BROKER_PACKET_STATUS_UNAVAILABLE, SYSCALL_OFFLOAD_OP_LINUX_ACCEPT,
-    SYSCALL_OFFLOAD_OP_LINUX_BIND, SYSCALL_OFFLOAD_OP_LINUX_CLOSE,
+    NETD_RECVMSG_PAYLOAD_HEADER_SIZE, NETD_SENDMSG_PAYLOAD_HEADER_SIZE,
+    NET_BROKER_OP_PACKET_LEASE_GRANT, NET_BROKER_OP_PACKET_LEASE_RESET,
+    NET_BROKER_OP_PACKET_LEASE_REVOKE, NET_BROKER_OP_PACKET_RX, NET_BROKER_OP_PACKET_STATUS,
+    NET_BROKER_OP_PACKET_TX, NET_BROKER_PACKET_MTU, NET_BROKER_PACKET_STATUS_ACTIVE,
+    NET_BROKER_PACKET_STATUS_AWAITING_AUTHENTICATED_CONTROL, NET_BROKER_PACKET_STATUS_UNAVAILABLE,
+    SYSCALL_OFFLOAD_OP_LINUX_ACCEPT, SYSCALL_OFFLOAD_OP_LINUX_BIND, SYSCALL_OFFLOAD_OP_LINUX_CLOSE,
     SYSCALL_OFFLOAD_OP_LINUX_CONNECT, SYSCALL_OFFLOAD_OP_LINUX_DUP,
     SYSCALL_OFFLOAD_OP_LINUX_GETPEERNAME, SYSCALL_OFFLOAD_OP_LINUX_GETSOCKNAME,
     SYSCALL_OFFLOAD_OP_LINUX_GETSOCKOPT, SYSCALL_OFFLOAD_OP_LINUX_LISTEN,
@@ -62,6 +64,11 @@ static PENDING_BLOCKING_REQUESTS: AtomicUsize = AtomicUsize::new(0);
 static PENDING_LOCAL_POLLS: AtomicUsize = AtomicUsize::new(0);
 static ACTIVE_BLOCKING_WORKERS: AtomicUsize = AtomicUsize::new(0);
 static READINESS_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn dvm_session_epoch() -> &'static Mutex<u32> {
+    static EPOCH: OnceLock<Mutex<u32>> = OnceLock::new();
+    EPOCH.get_or_init(|| Mutex::new(0))
+}
 
 #[derive(Clone, Copy)]
 struct RefReplayEntry {
@@ -126,6 +133,10 @@ fn main() {
             "netd: endpoint register failed errno={}",
             -register
         );
+        return;
+    }
+    if call_packet_broker(NET_BROKER_OP_PACKET_LEASE_RESET, 0, 0).is_err() {
+        debug_line("netd: failed to reset inherited DVM transport lease");
         return;
     }
 
@@ -229,6 +240,18 @@ fn serve_request_loop(endpoint: u64) {
         };
         response.status = match validate_request(received as usize, &request) {
             Ok(()) if request.pid != sender_pid || request.tid != sender_tid => libc::EACCES,
+            Ok(()) if request.op == NETD_IPC_OP_DVM_SESSION => {
+                let status = handle_dvm_session(&request, sender_pid);
+                if status != 0 {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "netd: DVM session transition rejected status={status} epoch={} action={}",
+                        request.arg0,
+                        request.arg1
+                    );
+                }
+                status
+            }
             Ok(()) if is_deferred_local_poll_request(&request) => {
                 let status = handle_poll_socket(&request, &mut response);
                 if status == 0 && response.value == 0 {
@@ -652,6 +675,103 @@ fn dispatch_request(request: &NetdIpcRequest, response: &mut NetdIpcResponse) ->
     status
 }
 
+fn handle_dvm_session(request: &NetdIpcRequest, sender_pid: u64) -> i32 {
+    if rustos_svc_runtime::ipc::validate_service_owner(IPC_SERVICE_INPUTD, sender_pid) < 0 {
+        return libc::EACCES;
+    }
+    let Ok(epoch) = u32::try_from(request.arg0) else {
+        return libc::EINVAL;
+    };
+    if epoch == 0
+        || request.arg2 != 0
+        || request.arg3 != 0
+        || request.arg4 != 0
+        || request.arg5 != 0
+    {
+        return libc::EINVAL;
+    }
+    let Ok(mut active) = dvm_session_epoch().lock() else {
+        return libc::EIO;
+    };
+    match admit_dvm_session_transition(*active, epoch, request.arg1) {
+        Ok(DvmSessionTransition::Grant) => {
+            match call_packet_broker(NET_BROKER_OP_PACKET_LEASE_GRANT, u64::from(epoch), 0) {
+                Ok(_) => {
+                    *active = epoch;
+                    0
+                }
+                Err(errno) => errno,
+            }
+        }
+        Ok(DvmSessionTransition::Revoke) => {
+            match call_packet_broker(NET_BROKER_OP_PACKET_LEASE_REVOKE, u64::from(epoch), 0) {
+                Ok(_) => {
+                    *active = 0;
+                    0
+                }
+                Err(errno) => errno,
+            }
+        }
+        Err(errno) => errno,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DvmSessionTransition {
+    Grant,
+    Revoke,
+}
+
+fn admit_dvm_session_transition(
+    active_epoch: u32,
+    requested_epoch: u32,
+    action: u64,
+) -> Result<DvmSessionTransition, i32> {
+    if requested_epoch == 0 {
+        return Err(libc::EINVAL);
+    }
+    match action {
+        NETD_DVM_SESSION_GRANT if active_epoch == 0 || active_epoch == requested_epoch => {
+            Ok(DvmSessionTransition::Grant)
+        }
+        NETD_DVM_SESSION_GRANT => Err(libc::EBUSY),
+        NETD_DVM_SESSION_REVOKE if active_epoch == requested_epoch => {
+            Ok(DvmSessionTransition::Revoke)
+        }
+        NETD_DVM_SESSION_REVOKE => Err(libc::ESTALE),
+        _ => Err(libc::EINVAL),
+    }
+}
+
+#[cfg(test)]
+mod dvm_session_policy_tests {
+    use super::*;
+
+    #[test]
+    fn netd_session_policy_is_exact_idempotent_and_stale_safe() {
+        assert_eq!(
+            admit_dvm_session_transition(0, 7, NETD_DVM_SESSION_GRANT),
+            Ok(DvmSessionTransition::Grant)
+        );
+        assert_eq!(
+            admit_dvm_session_transition(7, 7, NETD_DVM_SESSION_GRANT),
+            Ok(DvmSessionTransition::Grant)
+        );
+        assert_eq!(
+            admit_dvm_session_transition(7, 9, NETD_DVM_SESSION_GRANT),
+            Err(libc::EBUSY)
+        );
+        assert_eq!(
+            admit_dvm_session_transition(7, 9, NETD_DVM_SESSION_REVOKE),
+            Err(libc::ESTALE)
+        );
+        assert_eq!(
+            admit_dvm_session_transition(7, 7, NETD_DVM_SESSION_REVOKE),
+            Ok(DvmSessionTransition::Revoke)
+        );
+    }
+}
+
 enum RefReplayAction {
     Execute,
     Replay(i32),
@@ -871,6 +991,7 @@ fn validate_request(received: usize, request: &NetdIpcRequest) -> Result<(), i32
         | SYSCALL_OFFLOAD_OP_LINUX_RECVMSG
         | SYSCALL_OFFLOAD_OP_LINUX_RECVFROM
         | SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET
+        | NETD_IPC_OP_DVM_SESSION
         | NETD_IPC_OP_REF_ACK => Ok(()),
         _ => Err(libc::EINVAL),
     }
@@ -2581,7 +2702,7 @@ mod local_socket_poll_tests {
     }
 
     #[test]
-    fn netd_v4_rejects_the_retired_fixed_size_wire_frame() {
+    fn netd_v5_rejects_the_retired_fixed_size_wire_frame() {
         let request = NetdIpcRequest {
             version: NETD_IPC_ABI_VERSION,
             op: SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET,

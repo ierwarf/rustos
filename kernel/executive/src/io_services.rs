@@ -45,19 +45,21 @@ mod backend {
     }
 
     fn map_input_snapshot(
-        snapshot: kernel_io_manager::api::input::event_queue::InputEventQueueDebugSnapshot,
+        snapshot: kernel_io_manager::api::input::transport::InputTransportDebugSnapshot,
     ) -> InputEventQueueDebugSnapshot {
         InputEventQueueDebugSnapshot {
-            pointer_packet_submits: snapshot.pointer_packet_submits,
-            read_calls: snapshot.read_calls,
-            read_events: snapshot.read_events,
-            lock_active: snapshot.lock_active,
-            lock_last_seq: snapshot.lock_last_seq,
+            // Heartbeat ABI names predate the ring3 decoder migration. These
+            // counters now describe raw transport progress only.
+            pointer_packet_submits: snapshot.records_copied,
+            read_calls: snapshot.broker_calls,
+            read_events: snapshot.records_copied,
+            lock_active: 0,
+            lock_last_seq: 0,
             queued: snapshot.queued,
-            pending_coalesced: snapshot.pending_coalesced,
-            pending_pointer_position: snapshot.pending_pointer_position,
-            dropped_discrete: snapshot.dropped_discrete,
-            dropped_lossy: snapshot.dropped_lossy,
+            pending_coalesced: false,
+            pending_pointer_position: false,
+            dropped_discrete: 0,
+            dropped_lossy: snapshot.revoke_count,
         }
     }
 
@@ -126,7 +128,7 @@ mod backend {
     }
 
     pub(crate) fn input_debug_snapshot() -> InputEventQueueDebugSnapshot {
-        map_input_snapshot(kernel_io_manager::api::input::event_queue::debug_snapshot())
+        map_input_snapshot(kernel_io_manager::api::input::transport::debug_snapshot())
     }
 
     pub(crate) fn init_vfs() {

@@ -26,11 +26,11 @@ use anyhow::{Context, Result, anyhow, bail};
 pub use driver_domain_protocol::{
     DVM_BLOCK_DATA_SLOT_BYTES, DVM_BLOCK_KNOWN_FEATURES, DVM_BLOCK_QUEUE_DEPTH,
     DVM_BLOCK_REQUIRED_FEATURES, DVM_INPUT_RING_APERTURE_BYTES,
-    DVM_INPUT_RING_FLAG_POLICY_CONSUMER_READY, DVM_INPUT_RING_FLAG_RUSTOS_READY,
-    DVM_INPUT_RING_HEADER_BYTES, DVM_INPUT_RING_PRODUCER_OFFSET, DVM_INPUT_RING_RECORD_BYTES,
-    DVM_INPUT_RING_SLOT_COUNT, DvmInputFrameError, DvmInputRingHeader, LINUX_EVDEV_KEY_MAX,
-    RUSTOS_INPUT_FRAME_BYTES, RUSTOS_POINTER_BUTTON_MASK, RUSTOS_POINTER_POSITION_MAX_X,
-    RUSTOS_POINTER_POSITION_MAX_Y, RustosInputFrame,
+    DVM_INPUT_RING_CONSUMER_WAKE_GENERATION_OFFSET, DVM_INPUT_RING_FLAG_POLICY_CONSUMER_READY,
+    DVM_INPUT_RING_FLAG_RUSTOS_READY, DVM_INPUT_RING_HEADER_BYTES, DVM_INPUT_RING_PRODUCER_OFFSET,
+    DVM_INPUT_RING_RECORD_BYTES, DVM_INPUT_RING_SLOT_COUNT, DvmInputFrameError, DvmInputRingHeader,
+    LINUX_EVDEV_KEY_MAX, RUSTOS_INPUT_FRAME_BYTES, RUSTOS_POINTER_BUTTON_MASK,
+    RUSTOS_POINTER_POSITION_MAX_X, RUSTOS_POINTER_POSITION_MAX_Y, RustosInputFrame,
 };
 
 /// The DVM control listener port is derived from the owner-private per-launch
@@ -2727,8 +2727,13 @@ pub trait RustosInputSink {
 
 /// Host producer for the one-way fixed ivshmem input ring. It maps the
 /// launch-owned backing file itself, commits a complete validated L0 frame,
-/// then signals RustOS's one MSI-X eventfd only for an empty-to-nonempty
-/// transition (or authenticated cleanup). No serial queue, QMP path,
+/// then signals RustOS's one MSI-X eventfd once per consumer wake generation.
+/// If that edge is lost while the generation remains armed, every two further
+/// outstanding commits issue one bounded recovery kick.
+/// The generation is sampled only after the producer cursor is committed:
+/// sampling it before commit races inputd's check-arm-recheck window and can
+/// strand a nonempty ring. This batches records while inputd is runnable
+/// without weakening the exact lost-wake contract. No serial queue, QMP path,
 /// guest-selected descriptor, or data-plane retry is retained.
 pub struct InputRingSink {
     producer: IvshmemInputProducer,
@@ -2736,6 +2741,8 @@ pub struct InputRingSink {
     mapped_len: usize,
     generation: u64,
     producer_cursor: u64,
+    notified_wake_generation: u64,
+    notified_producer_cursor: u64,
 }
 
 unsafe impl Send for InputRingSink {}
@@ -2784,6 +2791,8 @@ impl InputRingSink {
             mapped_len,
             generation: header.generation,
             producer_cursor: header.producer,
+            notified_wake_generation: header.consumer_wake_generation,
+            notified_producer_cursor: header.producer,
         })
     }
 
@@ -2826,7 +2835,6 @@ impl InputRingSink {
             }
             std::thread::sleep(Duration::from_millis(1));
         };
-        let outstanding = header.producer.saturating_sub(header.consumer);
         let offset = usize::try_from(DvmInputRingHeader::record_offset(header.producer))
             .context("input-ring record offset does not fit usize")?;
         let end = offset
@@ -2849,21 +2857,31 @@ impl InputRingSink {
                 .write_volatile(next.to_le());
         }
         self.producer_cursor = next;
-        // The inputd worker rechecks producer/consumer after it arms its
-        // dedicated wait slot, so one edge for an empty-to-nonempty transition
-        // is sufficient. Ringing for every pointer frame forces avoidable
-        // MSI-X exits and priority handoffs that compete with presentation.
-        // Cleanup remains urgent even behind normal data, because releases
-        // must not wait for an already-coalesced producer batch to empty.
-        if input_doorbell_needed(outstanding, cleanup) {
+        // Sample the consumer-owned generation only after the release-ordered
+        // producer cursor is visible. If inputd armed before this commit, L0
+        // observes the new generation and rings. If it armed after an earlier
+        // sample, inputd's post-arm cursor recheck observes this commit.
+        std::sync::atomic::fence(Ordering::Acquire);
+        let wake_generation = unsafe {
+            u64::from_le(
+                self.mapped
+                    .add(DVM_INPUT_RING_CONSUMER_WAKE_GENERATION_OFFSET)
+                    .cast::<u64>()
+                    .read_volatile(),
+            )
+        };
+        const INPUT_RING_RECOVERY_KICK_RECORDS: u64 = 2;
+        let recovery_kick = next.saturating_sub(header.consumer)
+            >= INPUT_RING_RECOVERY_KICK_RECORDS
+            && next.saturating_sub(self.notified_producer_cursor)
+                >= INPUT_RING_RECOVERY_KICK_RECORDS;
+        if wake_generation != self.notified_wake_generation || recovery_kick {
             self.producer.notify_rustos()?;
+            self.notified_wake_generation = wake_generation;
+            self.notified_producer_cursor = next;
         }
         Ok(())
     }
-}
-
-fn input_doorbell_needed(outstanding: u64, cleanup: bool) -> bool {
-    cleanup || outstanding == 0
 }
 
 impl Drop for InputRingSink {
@@ -4482,13 +4500,6 @@ mod tests {
             assert!(rate.admit(key).is_ok());
         }
         assert!(rate.admit(key).is_err());
-    }
-
-    #[test]
-    fn input_ring_doorbell_is_edge_triggered_but_cleanup_is_urgent() {
-        assert!(super::input_doorbell_needed(0, false));
-        assert!(!super::input_doorbell_needed(1, false));
-        assert!(super::input_doorbell_needed(1, true));
     }
 
     #[test]

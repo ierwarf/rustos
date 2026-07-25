@@ -19,6 +19,11 @@ const ADMIN_REQUEST_PATH_CAPACITY: usize = 96;
 const PROCESS_EXEC_PATH_CAPACITY: usize = 192;
 const LINUX_CLOCK_ADMISSION_REALTIME: u8 = 1 << 0;
 const LINUX_CLOCK_ADMISSION_MONOTONIC: u8 = 1 << 1;
+const LINUX_NANOSLEEP_ADMISSION: u8 = 1 << 2;
+const LINUX_CLOCK_NANOSLEEP_REALTIME_RELATIVE: u8 = 1 << 3;
+const LINUX_CLOCK_NANOSLEEP_REALTIME_ABSOLUTE: u8 = 1 << 4;
+const LINUX_CLOCK_NANOSLEEP_MONOTONIC_RELATIVE: u8 = 1 << 5;
+const LINUX_CLOCK_NANOSLEEP_MONOTONIC_ABSOLUTE: u8 = 1 << 6;
 pub const WINDOWS_TLS_SLOT_COUNT: usize = 64;
 pub const DEFAULT_DESKTOP_UID: u32 = 1000;
 pub const DEFAULT_DESKTOP_GID: u32 = 1000;
@@ -161,11 +166,11 @@ pub struct UserProcessState {
     linux_process_state: Option<LinuxProcessState>,
     linux_memory_map: Option<LinuxMemoryMapState>,
     linux_runtime_profile: Option<LinuxRuntimeProfile>,
-    /// Positive syscalld admission for immutable Linux clock IDs. The cache is
-    /// process-local, starts empty, and is reset by fork/exec. Unknown IDs are
-    /// never representable, so a service or caller cannot turn a malformed ID
-    /// into the kernel's monotonic fallback.
-    linux_clock_admission_mask: u8,
+    /// Positive syscalld admission for immutable Linux time-policy keys. The
+    /// cache is process-local, starts empty, and is reset by fork/exec.
+    /// Unknown clock IDs/flag combinations are never representable, so a
+    /// service or caller cannot turn malformed input into a cached grant.
+    linux_time_admission_mask: u8,
     linux_sigactions: [LinuxSigAction; MAX_SIGNAL_NUMBER + 1],
     windows_runtime: Option<WindowsProcessRuntimeState>,
     handles: HandleTable,
@@ -346,7 +351,7 @@ impl UserProcessState {
             linux_process_state,
             linux_memory_map,
             linux_runtime_profile,
-            linux_clock_admission_mask: 0,
+            linux_time_admission_mask: 0,
             linux_sigactions: [LinuxSigAction::default(); MAX_SIGNAL_NUMBER + 1],
             windows_runtime,
             handles: HandleTable::new(),
@@ -393,7 +398,7 @@ impl UserProcessState {
 
     pub fn linux_clock_admission_cached(&self, clock_id: u64) -> bool {
         linux_clock_admission_bit(clock_id)
-            .is_some_and(|bit| self.linux_clock_admission_mask & bit != 0)
+            .is_some_and(|bit| self.linux_time_admission_mask & bit != 0)
     }
 
     /// Records only a successful admission for one of the two immutable Linux
@@ -402,7 +407,30 @@ impl UserProcessState {
         let Some(bit) = linux_clock_admission_bit(clock_id) else {
             return false;
         };
-        self.linux_clock_admission_mask |= bit;
+        self.linux_time_admission_mask |= bit;
+        true
+    }
+
+    pub fn linux_nanosleep_admission_cached(&self) -> bool {
+        self.linux_time_admission_mask & LINUX_NANOSLEEP_ADMISSION != 0
+    }
+
+    pub fn cache_linux_nanosleep_admission(&mut self) {
+        self.linux_time_admission_mask |= LINUX_NANOSLEEP_ADMISSION;
+    }
+
+    pub fn linux_clock_nanosleep_admission_cached(&self, clock_id: u64, absolute: bool) -> bool {
+        linux_clock_nanosleep_admission_bit(clock_id, absolute)
+            .is_some_and(|bit| self.linux_time_admission_mask & bit != 0)
+    }
+
+    /// Records one exact successful `(clock_id, TIMER_ABSTIME)` policy key.
+    /// Returns false for unsupported IDs instead of caching a fallback.
+    pub fn cache_linux_clock_nanosleep_admission(&mut self, clock_id: u64, absolute: bool) -> bool {
+        let Some(bit) = linux_clock_nanosleep_admission_bit(clock_id, absolute) else {
+            return false;
+        };
+        self.linux_time_admission_mask |= bit;
         true
     }
 
@@ -529,7 +557,7 @@ impl UserProcessState {
             linux_process_state: self.linux_process_state,
             linux_memory_map: self.linux_memory_map.clone(),
             linux_runtime_profile: self.linux_runtime_profile.clone(),
-            linux_clock_admission_mask: 0,
+            linux_time_admission_mask: 0,
             linux_sigactions: self.linux_sigactions,
             windows_runtime: self.windows_runtime,
             handles: self.handles.clone(),
@@ -748,6 +776,20 @@ fn linux_clock_admission_bit(clock_id: u64) -> Option<u8> {
     }
 }
 
+fn linux_clock_nanosleep_admission_bit(clock_id: u64, absolute: bool) -> Option<u8> {
+    match (clock_id, absolute) {
+        (id, false) if id == CLOCK_REALTIME as u64 => Some(LINUX_CLOCK_NANOSLEEP_REALTIME_RELATIVE),
+        (id, true) if id == CLOCK_REALTIME as u64 => Some(LINUX_CLOCK_NANOSLEEP_REALTIME_ABSOLUTE),
+        (id, false) if id == CLOCK_MONOTONIC as u64 => {
+            Some(LINUX_CLOCK_NANOSLEEP_MONOTONIC_RELATIVE)
+        }
+        (id, true) if id == CLOCK_MONOTONIC as u64 => {
+            Some(LINUX_CLOCK_NANOSLEEP_MONOTONIC_ABSOLUTE)
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -803,13 +845,24 @@ mod tests {
         let mut state = linux_process_state();
         assert!(!state.linux_clock_admission_cached(CLOCK_MONOTONIC as u64));
         assert!(!state.linux_clock_admission_cached(CLOCK_REALTIME as u64));
+        assert!(!state.linux_nanosleep_admission_cached());
+        assert!(!state.linux_clock_nanosleep_admission_cached(CLOCK_MONOTONIC as u64, true));
         assert!(!state.cache_linux_clock_admission(u64::MAX));
+        assert!(!state.cache_linux_clock_nanosleep_admission(u64::MAX, false));
 
         assert!(state.cache_linux_clock_admission(CLOCK_MONOTONIC as u64));
+        state.cache_linux_nanosleep_admission();
+        assert!(state.cache_linux_clock_nanosleep_admission(CLOCK_MONOTONIC as u64, true));
         assert!(state.linux_clock_admission_cached(CLOCK_MONOTONIC as u64));
         assert!(!state.linux_clock_admission_cached(CLOCK_REALTIME as u64));
+        assert!(state.linux_nanosleep_admission_cached());
+        assert!(state.linux_clock_nanosleep_admission_cached(CLOCK_MONOTONIC as u64, true));
+        assert!(!state.linux_clock_nanosleep_admission_cached(CLOCK_MONOTONIC as u64, false));
+        assert!(!state.linux_clock_nanosleep_admission_cached(CLOCK_REALTIME as u64, true));
 
         let child = state.fork_clone(ProcessAddressSpace::empty_for_tests(), None);
         assert!(!child.linux_clock_admission_cached(CLOCK_MONOTONIC as u64));
+        assert!(!child.linux_nanosleep_admission_cached());
+        assert!(!child.linux_clock_nanosleep_admission_cached(CLOCK_MONOTONIC as u64, true));
     }
 }

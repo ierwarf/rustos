@@ -8,7 +8,8 @@ Concrete owners and source anchors:
   * L0 control listener: libs/driver-domain-host/src/lib.rs
   * Linux DVM agent: driver-domains/linux/package/rustos-dvm-agent/
     src/rustos-dvm-agent.c
-  * RDI3 receiver: kernel/io-manager/src/input/dvm_frames.rs
+  * bounded raw transport receiver: kernel/io-manager/src/input/dvm_ring.rs
+  * RDI3 policy receiver: services/inputd/src/dvm_protocol.rs
 
 The host accepts a KVM-vsock connection only from its launch-bound CID. An
 exact agent-v1-control HELLO causes L0 to issue one fresh challenge. Only the

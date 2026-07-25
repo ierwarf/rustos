@@ -12,7 +12,7 @@ use rustos_user_abi::syscall::{
     MM_BROKER_OP_MAP_DEVICE_SHARED, MM_BROKER_OP_MAP_FILE_PRIVATE, MM_BROKER_OP_MAP_MEMFD_SHARED,
     MM_BROKER_OP_PROTECT, MM_BROKER_OP_QUERY_LAYOUT, MM_BROKER_OP_UNMAP, MM_BROKER_PATH_CAPACITY,
     RustosMmBrokerArgs, RustosMmFdBrokerResult, RustosMmLayoutBrokerResult,
-    RustosMmMapBrokerResult, VFS_IPC_PAYLOAD_CAPACITY,
+    RustosMmMapBrokerResult, VFS_DEVICE_ACCESS_DRM_COMPAT, VFS_IPC_PAYLOAD_CAPACITY,
 };
 
 use crate::user::handles::{KernelHandle, RemoteVfsHandleKind};
@@ -229,7 +229,7 @@ fn broker_map_device_shared(args: &RustosMmBrokerArgs) -> Result<(), i64> {
             }
             KernelHandle::RemoteVfs(remote)
                 if remote.kind() == RemoteVfsHandleKind::Device
-                    && remote.path().as_str() == "/dev/dri/card0" =>
+                    && remote.device_access() == VFS_DEVICE_ACCESS_DRM_COMPAT =>
             {
                 if args.offset == 0 || !entry.rights().allows_read() {
                     return Err(LINUX_EINVAL);
@@ -263,15 +263,37 @@ fn broker_map_device_shared(args: &RustosMmBrokerArgs) -> Result<(), i64> {
                 len: region.end().as_u64().saturating_sub(region.start.as_u64()),
             });
         }
-        let shared_region = surface.shared_region().ok_or(LINUX_EINVAL)?;
-        let frames = crate::ipc::shared_region_frames(shared_region).ok_or(LINUX_EINVAL)?;
+        let external_mapping = surface.external_physical_mapping();
+        let frames = if let Some((phys_start, external_len)) = external_mapping {
+            if external_len != len || !phys_start.is_multiple_of(PAGE_SIZE) {
+                return Err(LINUX_EINVAL);
+            }
+            let mut frames = Vec::with_capacity(page_count);
+            for index in 0..page_count {
+                frames.push(
+                    phys_start
+                        .checked_add((index as u64).saturating_mul(PAGE_SIZE))
+                        .ok_or(LINUX_EINVAL)?,
+                );
+            }
+            frames
+        } else {
+            let shared_region = surface.shared_region().ok_or(LINUX_EINVAL)?;
+            crate::ipc::shared_region_frames(shared_region).ok_or(LINUX_EINVAL)?
+        };
         if frames.len() != page_count {
             return Err(LINUX_EINVAL);
         }
-        let region = process_state
-            .address_space_mut()
-            .map_existing_user_pages_at(VirtAddr::new(start), &frames, page_flags)
-            .map_err(address_space_error_to_linux_errno)?;
+        let region = if external_mapping.is_some() {
+            process_state
+                .address_space_mut()
+                .map_existing_user_pages_at_write_combine(VirtAddr::new(start), &frames, page_flags)
+        } else {
+            process_state
+                .address_space_mut()
+                .map_existing_user_pages_at(VirtAddr::new(start), &frames, page_flags)
+        }
+        .map_err(address_space_error_to_linux_errno)?;
         surface.set_mapped_region(region);
         let slot = process_state
             .handles_mut()

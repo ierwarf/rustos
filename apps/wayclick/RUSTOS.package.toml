@@ -12,6 +12,8 @@ path = "apps/wayclick/wayclick.elf"
 
 [[desktop.entries]]
 display_name = "WayClick"
-weight_micros = 100
+# Foreground frame-callback work shares the ordinary User scheduler class but
+# needs an explicit interactive fair-share weight under DVM input stress.
+weight_micros = 1000
 console_hosted = false
 env = ["RUSTOS_WAYCLICK_PROFILE=0"]

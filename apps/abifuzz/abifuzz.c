@@ -16,24 +16,8 @@
 #endif
 
 #define SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT 0x5255000fUL
-#define SYS_RUSTOS_SERVICE_DRIVER_RESOURCE_BROKER 0x52550022UL
 #define SYS_RUSTOS_PROC_PREPARE_BROKER 0x52550026UL
 #define IPC_SERVICE_INPUTD 8UL
-#define IPC_SERVICE_DRIVERD 5UL
-
-struct service_driver_resource_args {
-    uint16_t abi_version;
-    uint16_t op;
-    uint32_t flags;
-    uint64_t subject_pid;
-    uint64_t subject_tid;
-    uint64_t arg0;
-    uint64_t arg1;
-    uint64_t arg2;
-    uint64_t out_ptr;
-    uint64_t out_len;
-    uint64_t reserved0;
-};
 
 struct proc_prepare_args {
     uint16_t abi_version;
@@ -99,37 +83,31 @@ static void fuzz_raw_service_lookup(void) {
     errno = 0;
     long rc = syscall(SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, IPC_SERVICE_INPUTD);
     log_status("lookup-inputd", rc, errno);
-
-    errno = 0;
-    rc = syscall(SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, IPC_SERVICE_DRIVERD);
-    log_status("lookup-driverd", rc, errno);
 }
 
 static void fuzz_privileged_brokers(void) {
-    unsigned char out[64];
-    struct service_driver_resource_args resource;
-    memset(&resource, 0, sizeof(resource));
-    resource.abi_version = 1;
-    resource.op = 1;
-    resource.subject_pid = (uint64_t)getpid();
-    resource.subject_tid = (uint64_t)syscall(SYS_gettid);
-    resource.arg0 = 0xfee00000UL;
-    resource.arg1 = 0x1000UL;
-    resource.out_ptr = (uint64_t)(uintptr_t)out;
-    resource.out_len = sizeof(out);
-
-    errno = 0;
-    long rc = syscall(SYS_RUSTOS_SERVICE_DRIVER_RESOURCE_BROKER, &resource);
-    log_status("service-driver-broker", rc, errno);
-
     struct proc_prepare_args prepare;
     memset(&prepare, 0, sizeof(prepare));
     prepare.abi_version = 1;
     prepare.format = 1;
 
     errno = 0;
-    rc = syscall(SYS_RUSTOS_PROC_PREPARE_BROKER, &prepare);
+    long rc = syscall(SYS_RUSTOS_PROC_PREPARE_BROKER, &prepare);
     log_status("proc-prepare-broker", rc, errno);
+}
+
+static void verify_retired_kernel_extension_abi_closed(void) {
+    static const unsigned long retired_syscalls[] = {
+        0x52550020UL,
+        0x52550021UL,
+        0x52550022UL,
+        0x52550037UL,
+    };
+    for (size_t i = 0; i < sizeof(retired_syscalls) / sizeof(retired_syscalls[0]); ++i) {
+        errno = 0;
+        long rc = syscall(retired_syscalls[i], 0UL, 0UL, 0UL, 0UL, 0UL, 0UL);
+        log_status("retired-kernel-extension-abi", rc, errno);
+    }
 }
 
 static ssize_t send_rights(int sock, const int *rights, size_t right_count) {
@@ -487,6 +465,7 @@ int main(int argc, char **argv) {
 
     fuzz_raw_service_lookup();
     fuzz_privileged_brokers();
+    verify_retired_kernel_extension_abi_closed();
     fuzz_bad_user_pointers();
     if (fd_transfer_stress) {
         fuzz_unix_control_queue();

@@ -100,7 +100,6 @@ mod tests {
         assert_eq!(syscall::SYS_RUSTOS_INPUT_INGEST_BROKER, 0x5255_0033);
         assert_eq!(syscall::SYS_RUSTOS_IPC_TRY_RECV, 0x5255_0035);
         assert_eq!(syscall::SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER, 0x5255_0036);
-        assert_eq!(syscall::SYS_RUSTOS_DRIVER_SYMBOL_EVENT_BROKER, 0x5255_0037);
         assert_eq!(syscall::SYS_RUSTOS_IPC_RECV_WITH_SENDER, 0x5255_0038);
         assert_eq!(syscall::SYS_RUSTOS_IPC_WAIT_SERVICE_ENDPOINT, 0x5255_0039);
         assert_eq!(syscall::SYS_RUSTOS_PROC_ACTIVATE_BROKER, 0x5255_003a);
@@ -109,11 +108,6 @@ mod tests {
         assert!(
             size_of::<syscall::RustosRootdTerminateBrokerArgs>() <= syscall::IPC_MAX_INLINE_BYTES
         );
-        assert_eq!(
-            syscall::SYS_RUSTOS_SERVICE_DRIVER_RESOURCE_BROKER,
-            0x5255_0022
-        );
-        assert_eq!(size_of::<syscall::LinuxDriverSymbolEventWire>(), 192);
     }
 
     #[test]
@@ -139,7 +133,6 @@ mod tests {
         assert_eq!(syscall::IPC_SERVICE_ROOTD, 10);
         assert_eq!(syscall::IPC_SERVICE_SESSIOND, 11);
         assert_eq!(syscall::IPC_SERVICE_PAGERD, 12);
-        assert_eq!(syscall::IPC_SERVICE_SERVICE_DRIVERD, 13);
         assert_eq!(syscall::IPC_SERVICE_UISERVER, 14);
         assert_eq!(syscall::IPC_SERVICE_INITD, 15);
         assert_eq!(syscall::DEVMGRD_IPC_OP_OPEN, 3);
@@ -154,7 +147,7 @@ mod tests {
         assert_eq!(syscall::DEVMGRD_IOCTL_LINUX_TTY_TCSETSW, 0x5403);
         assert_eq!(syscall::DEVMGRD_IOCTL_LINUX_TTY_TCSETSF, 0x5404);
         assert_eq!(syscall::DEVMGRD_IOCTL_LINUX_TTY_FIONREAD, 0x541b);
-        assert_eq!(syscall::INPUTD_IPC_ABI_VERSION, 3);
+        assert_eq!(syscall::INPUTD_IPC_ABI_VERSION, 5);
         assert_eq!(syscall::VFS_IPC_ABI_VERSION, 4);
         assert_eq!(syscall::VFS_IPC_OP_CURSOR_SETTLE, 24);
         assert_eq!(syscall::VFS_IPC_OP_CHECKPOINT_ACK, 25);
@@ -163,7 +156,7 @@ mod tests {
             12
         );
         assert_eq!(syscall::COMMERCIAL_MAX_ROOTD_OP_LOADER_WORKER_COMPLETE, 13);
-        assert_eq!(syscall::NETD_IPC_ABI_VERSION, 4);
+        assert_eq!(syscall::NETD_IPC_ABI_VERSION, 5);
         assert_eq!(syscall::SYS_RUSTOS_WAITSET_SIGNAL_BROKER, 0x5255_003f);
         assert_eq!(syscall::SYS_RUSTOS_ENTROPY_BROKER, 0x5255_0040);
         assert_eq!(syscall::SYS_RUSTOS_EARLY_SYSTEM_BROKER, 0x5255_0041);
@@ -210,10 +203,8 @@ mod tests {
         assert_eq!(syscall::COMMERCIAL_MAX_PROTOCOL_INPUTD, 7);
         assert_eq!(syscall::COMMERCIAL_MAX_PROTOCOL_STORAGED, 8);
         assert_eq!(syscall::COMMERCIAL_MAX_PROTOCOL_NETD, 9);
-        assert_eq!(syscall::COMMERCIAL_MAX_PROTOCOL_DRIVERD, 10);
         assert_eq!(syscall::COMMERCIAL_MAX_PROTOCOL_SESSIOND, 11);
         assert_eq!(syscall::COMMERCIAL_MAX_PROTOCOL_PAGERD, 12);
-        assert_eq!(syscall::COMMERCIAL_MAX_PROTOCOL_SERVICE_DRIVERD, 13);
         assert_eq!(syscall::COMMERCIAL_MAX_PROTOCOL_CAPABILITY, 14);
         assert_eq!(syscall::COMMERCIAL_MAX_PROTOCOL_UISERVER, 15);
         assert_eq!(syscall::COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL, 5);
@@ -226,17 +217,12 @@ mod tests {
         assert_eq!(syscall::COMMERCIAL_MAX_DEVMGRD_OP_DEVICE_OPEN, 2);
         assert_eq!(syscall::COMMERCIAL_MAX_INPUTD_OP_INPUT_READER, 2);
         assert_eq!(syscall::COMMERCIAL_MAX_NETD_OP_PACKET_LEASE, 5);
-        assert_eq!(syscall::COMMERCIAL_MAX_DRIVERD_OP_PROVIDER_SELECT, 4);
         assert_eq!(syscall::COMMERCIAL_MAX_SESSIOND_OP_UI_BOOTSTRAP, 5);
         assert_eq!(
             syscall::COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_READINESS,
             0x102
         );
         assert_eq!(syscall::SESSIOND_CONSOLE_READINESS_MASK, 0b11);
-        assert_eq!(syscall::COMMERCIAL_MAX_SERVICE_DRIVERD_OP_MMIO_LEASE, 2);
-        assert_eq!(syscall::COMMERCIAL_MAX_SERVICE_DRIVERD_OP_IRQ_ROUTE, 3);
-        assert_eq!(syscall::COMMERCIAL_MAX_SERVICE_DRIVERD_OP_DMA_BUFFER, 4);
-        assert_eq!(syscall::COMMERCIAL_MAX_SERVICE_DRIVERD_OP_IO_PORT_LEASE, 5);
         assert_eq!(
             syscall::COMMERCIAL_MAX_UISERVER_OP_TERMINAL_PRESENT_POLICY,
             5
@@ -252,15 +238,6 @@ mod tests {
         );
         assert!(
             size_of::<syscall::CommercialMaxCapabilityLeaseWire>() <= syscall::IPC_MAX_INLINE_BYTES
-        );
-        assert_eq!(size_of::<syscall::ServiceDriverMmioLeaseWire>(), 32);
-        assert_eq!(size_of::<syscall::ServiceDriverIrqRouteWire>(), 24);
-        assert_eq!(size_of::<syscall::ServiceDriverDmaBufferWire>(), 32);
-        assert_eq!(size_of::<syscall::ServiceDriverIoPortLeaseWire>(), 16);
-        assert_eq!(size_of::<syscall::ServiceDriverIoPortValueWire>(), 8);
-        assert_eq!(
-            size_of::<syscall::RustosServiceDriverResourceBrokerArgs>(),
-            72
         );
     }
 

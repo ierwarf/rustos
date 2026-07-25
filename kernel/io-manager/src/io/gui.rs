@@ -6,11 +6,11 @@ mod framebuffer;
 
 use core::sync::atomic::{AtomicU8, Ordering};
 
-use boot_protocol::{BootInfo, FramebufferInfo};
-use driver_abi::{
+use crate::transport_types::{
     DISPLAY_FRAMEBUFFER_FLAG_DVM_SCANOUT, DISPLAY_FRAMEBUFFER_FLAG_PRIMARY_PROVIDER,
     DisplayFramebufferRegistration, DisplayPixelFormat,
 };
+use boot_protocol::{BootInfo, FramebufferInfo};
 use embedded_graphics::pixelcolor::Rgb888;
 
 use crate::user::abi::device::{DISPLAY_INFO_FLAG_DVM_SCANOUT, DISPLAY_INFO_FLAG_PRIMARY_PROVIDER};

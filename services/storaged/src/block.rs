@@ -14,6 +14,7 @@ const COMPLETION_TIMEOUT: Duration = Duration::from_secs(15);
 const STARTUP_READY_TIMEOUT: Duration = Duration::from_secs(15);
 const WAIT_SLICE_MILLIS: u64 = 1_000;
 const READ_CACHE_WINDOW_LIMIT: usize = 8;
+const READ_AHEAD_IN_FLIGHT_LIMIT: usize = READ_CACHE_WINDOW_LIMIT;
 static READ_CACHE: Mutex<ReadCacheSet> = Mutex::new(ReadCacheSet::new());
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -33,6 +34,13 @@ struct ReadCache {
     block_count: u64,
     block_size: usize,
     bytes: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReadAheadWindow {
+    lba: u64,
+    block_count: u64,
+    byte_len: usize,
 }
 
 impl ReadCache {
@@ -99,12 +107,14 @@ impl ReadCache {
 #[derive(Debug, Default)]
 struct ReadCacheSet {
     entries: Vec<ReadCache>,
+    next_read_ahead_lba: Option<(u64, u64)>,
 }
 
 impl ReadCacheSet {
     const fn new() -> Self {
         Self {
             entries: Vec::new(),
+            next_read_ahead_lba: None,
         }
     }
 
@@ -153,6 +163,15 @@ impl ReadCacheSet {
 
     fn clear(&mut self) {
         self.entries.clear();
+        self.next_read_ahead_lba = None;
+    }
+
+    fn miss_continues_read_ahead(&self, generation: u64, lba: u64) -> bool {
+        self.next_read_ahead_lba == Some((generation, lba))
+    }
+
+    fn record_read_ahead_end(&mut self, generation: u64, lba: u64) {
+        self.next_read_ahead_lba = Some((generation, lba));
     }
 }
 
@@ -258,48 +277,113 @@ pub(super) fn read(expected_generation: u64, lba: u64, block_count: u64) -> Resu
             info.logical_block_size, info.capacity_sectors
         );
     })?;
-    if let Some(bytes) = read_cache_slice(info.generation, lba, block_count, byte_len)? {
+    let (cached, continues_read_ahead) =
+        read_cache_lookup(info.generation, lba, block_count, byte_len)?;
+    if let Some(bytes) = cached {
         return Ok(bytes);
     }
+    let window_limit = if continues_read_ahead {
+        READ_AHEAD_IN_FLIGHT_LIMIT
+    } else {
+        1
+    };
+    let windows = read_ahead_plan(info, lba, block_count, window_limit)?;
+    let mut in_flight = Vec::with_capacity(windows.len());
+    for window in windows {
+        match submit(
+            BLOCK_BROKER_OP_DVM_SUBMIT_READ,
+            window.lba,
+            window.block_count,
+            0,
+            std::ptr::null(),
+            window.byte_len,
+        ) {
+            Ok(ticket) => in_flight.push((window, ticket, vec![0_u8; window.byte_len])),
+            Err(errno) => {
+                for (_, ticket, _) in in_flight {
+                    cancel_best_effort(ticket);
+                }
+                eprintln!(
+                    "storaged: dvm read rejected stage=submit lba={} blocks={} bytes={} errno={errno}",
+                    window.lba, window.block_count, window.byte_len
+                );
+                return Err(errno);
+            }
+        }
+    }
+    for index in 0..in_flight.len() {
+        let completion = {
+            let (_, ticket, prefetched) = &mut in_flight[index];
+            wait_and_collect(*ticket, Some(prefetched.as_mut_slice()))
+        };
+        if let Err(errno) = completion {
+            let (window, ticket, _) = &in_flight[index];
+            for (_, pending, _) in &in_flight[index + 1..] {
+                cancel_best_effort(*pending);
+            }
+            clear_read_cache();
+            eprintln!(
+                "storaged: dvm read rejected stage=completion request_id={} slot={} bytes={} errno={errno}",
+                ticket.request_id, ticket.data_slot, window.byte_len
+            );
+            return Err(errno);
+        }
+    }
+    let requested = in_flight
+        .first()
+        .and_then(|(_, _, bytes)| bytes.get(..byte_len))
+        .ok_or(libc::EIO)?
+        .to_vec();
+    let read_ahead_end = in_flight
+        .last()
+        .and_then(|(window, _, _)| window.lba.checked_add(window.block_count))
+        .ok_or(libc::EIO)?;
+    for (window, _, prefetched) in in_flight {
+        replace_read_cache(ReadCache {
+            generation: info.generation,
+            lba: window.lba,
+            block_count: window.block_count,
+            block_size: info.logical_block_size as usize,
+            bytes: prefetched,
+        })?;
+    }
+    record_read_ahead_end(info.generation, read_ahead_end)?;
+    Ok(requested)
+}
+
+fn read_ahead_plan(
+    info: BlockInfo,
+    lba: u64,
+    requested_blocks: u64,
+    window_limit: usize,
+) -> Result<Vec<ReadAheadWindow>, i32> {
     let max_blocks = (BLOCK_BROKER_MAX_IO_BYTES as u64) / u64::from(info.logical_block_size);
-    let capacity_blocks = info.capacity_sectors / u64::from(info.logical_block_size / 512);
-    let prefetch_blocks = capacity_blocks
-        .checked_sub(lba)
-        .ok_or(libc::EINVAL)?
-        .min(max_blocks);
-    if prefetch_blocks < block_count {
+    if max_blocks == 0
+        || requested_blocks == 0
+        || requested_blocks > max_blocks
+        || window_limit == 0
+        || window_limit > READ_AHEAD_IN_FLIGHT_LIMIT
+    {
         return Err(libc::EINVAL);
     }
-    let prefetch_len = checked_byte_len(info, lba, prefetch_blocks)?;
-    let ticket = submit(
-        BLOCK_BROKER_OP_DVM_SUBMIT_READ,
-        lba,
-        prefetch_blocks,
-        0,
-        std::ptr::null(),
-        prefetch_len,
-    )
-    .inspect_err(|errno| {
-        eprintln!(
-            "storaged: dvm read rejected stage=submit lba={lba} blocks={prefetch_blocks} bytes={prefetch_len} errno={errno}"
-        );
-    })?;
-    let mut prefetched = vec![0_u8; prefetch_len];
-    wait_and_collect(ticket, Some(prefetched.as_mut_slice())).inspect_err(|errno| {
-        eprintln!(
-            "storaged: dvm read rejected stage=completion request_id={} slot={} bytes={prefetch_len} errno={errno}",
-            ticket.request_id, ticket.data_slot
-        );
-    })?;
-    let requested = prefetched[..byte_len].to_vec();
-    replace_read_cache(ReadCache {
-        generation: info.generation,
-        lba,
-        block_count: prefetch_blocks,
-        block_size: info.logical_block_size as usize,
-        bytes: prefetched,
-    })?;
-    Ok(requested)
+    let capacity_blocks = info.capacity_sectors / u64::from(info.logical_block_size / 512);
+    let mut cursor = lba;
+    let mut remaining = capacity_blocks.checked_sub(lba).ok_or(libc::EINVAL)?;
+    if remaining < requested_blocks {
+        return Err(libc::EINVAL);
+    }
+    let mut windows = Vec::with_capacity(window_limit);
+    while remaining != 0 && windows.len() < window_limit {
+        let block_count = remaining.min(max_blocks);
+        windows.push(ReadAheadWindow {
+            lba: cursor,
+            block_count,
+            byte_len: checked_byte_len(info, cursor, block_count)?,
+        });
+        cursor = cursor.checked_add(block_count).ok_or(libc::EINVAL)?;
+        remaining -= block_count;
+    }
+    Ok(windows)
 }
 
 pub(super) fn write(
@@ -328,20 +412,28 @@ pub(super) fn write(
     wait_and_collect(ticket, None)
 }
 
-fn read_cache_slice(
+fn read_cache_lookup(
     generation: u64,
     lba: u64,
     block_count: u64,
     byte_len: usize,
-) -> Result<Option<Vec<u8>>, i32> {
-    READ_CACHE
-        .lock()
-        .map_err(|_| libc::EIO)?
-        .slice(generation, lba, block_count, byte_len)
+) -> Result<(Option<Vec<u8>>, bool), i32> {
+    let mut cache = READ_CACHE.lock().map_err(|_| libc::EIO)?;
+    let bytes = cache.slice(generation, lba, block_count, byte_len)?;
+    let continues = bytes.is_none() && cache.miss_continues_read_ahead(generation, lba);
+    Ok((bytes, continues))
 }
 
 fn replace_read_cache(cache: ReadCache) -> Result<(), i32> {
     READ_CACHE.lock().map_err(|_| libc::EIO)?.insert(cache)
+}
+
+fn record_read_ahead_end(generation: u64, lba: u64) -> Result<(), i32> {
+    READ_CACHE
+        .lock()
+        .map_err(|_| libc::EIO)?
+        .record_read_ahead_end(generation, lba);
+    Ok(())
 }
 
 fn clear_read_cache() {
@@ -641,5 +733,59 @@ mod tests {
             bounded_wait_timeout_ms(Duration::from_millis(WAIT_SLICE_MILLIS + 1)),
             Some(WAIT_SLICE_MILLIS)
         );
+    }
+
+    #[test]
+    fn read_ahead_plan_pipelines_bounded_transport_windows() {
+        let windows = read_ahead_plan(info(), 100, 2, READ_AHEAD_IN_FLIGHT_LIMIT)
+            .expect("valid read-ahead plan");
+        assert_eq!(windows.len(), READ_AHEAD_IN_FLIGHT_LIMIT);
+        assert_eq!(
+            windows[0],
+            ReadAheadWindow {
+                lba: 100,
+                block_count: 16,
+                byte_len: BLOCK_BROKER_MAX_IO_BYTES,
+            }
+        );
+        assert_eq!(windows[1].lba, 116);
+        assert!(windows
+            .windows(2)
+            .all(|pair| pair[0].lba + pair[0].block_count == pair[1].lba));
+    }
+
+    #[test]
+    fn read_ahead_plan_stops_at_device_end_and_rejects_oversize_requests() {
+        let windows = read_ahead_plan(info(), 1_020, 1, READ_AHEAD_IN_FLIGHT_LIMIT)
+            .expect("tail read-ahead plan");
+        assert_eq!(
+            windows,
+            vec![ReadAheadWindow {
+                lba: 1_020,
+                block_count: 4,
+                byte_len: 16 * 1_024,
+            }]
+        );
+        assert_eq!(
+            read_ahead_plan(info(), 100, 17, READ_AHEAD_IN_FLIGHT_LIMIT),
+            Err(libc::EINVAL)
+        );
+        assert_eq!(
+            read_ahead_plan(info(), 1_024, 1, READ_AHEAD_IN_FLIGHT_LIMIT),
+            Err(libc::EINVAL)
+        );
+        assert_eq!(read_ahead_plan(info(), 100, 1, 0), Err(libc::EINVAL));
+    }
+
+    #[test]
+    fn random_miss_stays_one_window_until_a_contiguous_boundary_miss() {
+        let mut caches = ReadCacheSet::new();
+        assert!(!caches.miss_continues_read_ahead(7, 100));
+        caches.record_read_ahead_end(7, 116);
+        assert!(caches.miss_continues_read_ahead(7, 116));
+        assert!(!caches.miss_continues_read_ahead(7, 117));
+        assert!(!caches.miss_continues_read_ahead(8, 116));
+        caches.clear();
+        assert!(!caches.miss_continues_read_ahead(7, 116));
     }
 }

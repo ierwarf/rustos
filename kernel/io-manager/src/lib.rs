@@ -48,8 +48,6 @@ pub mod driver;
 
 #[path = "input/mod.rs"]
 pub mod input;
-#[path = "input_core.rs"]
-pub mod input_core;
 
 #[path = "network/mod.rs"]
 pub(crate) mod network;
@@ -59,13 +57,4 @@ pub mod io;
 #[path = "storage/mod.rs"]
 pub mod storage;
 pub(crate) mod sync;
-#[cfg(test)]
-pub(crate) mod test_support {
-    use std::sync::{Mutex, MutexGuard};
-
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
-
-    pub(crate) fn exclusive_test() -> MutexGuard<'static, ()> {
-        TEST_LOCK.lock().expect("test lock poisoned")
-    }
-}
+pub(crate) mod transport_types;

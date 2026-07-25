@@ -331,8 +331,10 @@ fallback.
   release boot image. The
   proof requires the requested number of consecutive one-second windows for
   uiserver render/input health, balanced WayClick commit/frame-callback/
-  buffer-release progress with at most a 50 ms callback gap, and, when enabled,
-  DVM runtime plus atomic-page-flip relay throughput. One subsystem passing
+  buffer-release progress whose exact aggregate reaches the requested rate,
+  whose individual windows remain at or above 80% of that rate, and whose
+  callback gap is at most 50 ms. When enabled, it also requires DVM runtime plus
+  atomic-page-flip relay throughput. One subsystem passing
   cannot mask another subsystem's failure. Timeout diagnostics include the
   observed WayClick rate range, callback gap, and redraw maximum before the
   focused log paths. The range includes non-one-second startup windows; compare

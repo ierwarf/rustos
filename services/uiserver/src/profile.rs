@@ -15,6 +15,10 @@ struct ProfileWindow {
     input_drops: u64,
     input_slow: u64,
     input_errors: u64,
+    input_counter_baseline_valid: bool,
+    last_input_drops: u64,
+    last_input_slow: u64,
+    last_input_errors: u64,
     cursor_mismatches: u64,
     cursor_x: u32,
     cursor_y: u32,
@@ -63,6 +67,30 @@ fn record_input_arrival(window: &mut ProfileWindow, input_events: u64, now: Inst
             .input_gap_millis
             .max(duration_micros(now.duration_since(previous)) / 1_000);
     }
+}
+
+fn record_input_counter_sample(
+    window: &mut ProfileWindow,
+    input_drops: u64,
+    input_slow: u64,
+    input_errors: u64,
+) {
+    if window.input_counter_baseline_valid {
+        window.input_drops = window
+            .input_drops
+            .saturating_add(input_drops.saturating_sub(window.last_input_drops));
+        window.input_slow = window
+            .input_slow
+            .saturating_add(input_slow.saturating_sub(window.last_input_slow));
+        window.input_errors = window
+            .input_errors
+            .saturating_add(input_errors.saturating_sub(window.last_input_errors));
+    } else {
+        window.input_counter_baseline_valid = true;
+    }
+    window.last_input_drops = input_drops;
+    window.last_input_slow = input_slow;
+    window.last_input_errors = input_errors;
 }
 
 pub(crate) fn enabled() -> bool {
@@ -141,9 +169,7 @@ pub(crate) fn record_input_health(
     }
     let mut window = window().lock().unwrap();
     window.input_last_age_millis = window.input_last_age_millis.max(input_last_age_millis);
-    window.input_drops = window.input_drops.max(input_drops);
-    window.input_slow = window.input_slow.max(input_slow);
-    window.input_errors = window.input_errors.max(input_errors);
+    record_input_counter_sample(&mut window, input_drops, input_slow, input_errors);
     window.cursor_x = cursor_x;
     window.cursor_y = cursor_y;
     window.presented_cursor_x = presented_cursor_x;
@@ -287,11 +313,19 @@ pub(crate) fn maybe_emit() {
             window.throttle_spins,
         );
         let last_input_at = window.last_input_at;
+        let input_counter_baseline_valid = window.input_counter_baseline_valid;
+        let last_input_drops = window.last_input_drops;
+        let last_input_slow = window.last_input_slow;
+        let last_input_errors = window.last_input_errors;
         *window = ProfileWindow {
             started_at: Some(now),
             // Preserve the boundary timestamp so a stall spanning two
             // one-second samples cannot disappear from both windows.
             last_input_at,
+            input_counter_baseline_valid,
+            last_input_drops,
+            last_input_slow,
+            last_input_errors,
             ..ProfileWindow::default()
         };
         line
@@ -304,7 +338,7 @@ pub(crate) fn maybe_emit() {
 
 #[cfg(test)]
 mod tests {
-    use super::{record_input_arrival, ProfileWindow};
+    use super::{record_input_arrival, record_input_counter_sample, ProfileWindow};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -320,6 +354,26 @@ mod tests {
         assert_eq!(
             window.last_input_at,
             Some(start + Duration::from_millis(27))
+        );
+    }
+
+    #[test]
+    fn cumulative_input_health_is_reported_as_window_delta() {
+        let mut window = ProfileWindow::default();
+        record_input_counter_sample(&mut window, 2, 3, 4);
+        assert_eq!(
+            (window.input_drops, window.input_slow, window.input_errors),
+            (0, 0, 0)
+        );
+        record_input_counter_sample(&mut window, 2, 4, 4);
+        assert_eq!(
+            (window.input_drops, window.input_slow, window.input_errors),
+            (0, 1, 0)
+        );
+        record_input_counter_sample(&mut window, 3, 4, 6);
+        assert_eq!(
+            (window.input_drops, window.input_slow, window.input_errors),
+            (1, 1, 2)
         );
     }
 }

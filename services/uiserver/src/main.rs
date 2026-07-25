@@ -48,7 +48,13 @@ const UI_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 const UI_WATCHDOG_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 const UI_PHASE_PANIC_THRESHOLD_MS: u64 = 3_000;
 const WAYLAND_BACKLOG_SERVICE_INTERVAL: Duration = Duration::from_millis(4);
-const WAYLAND_FRAME_CALLBACK_INTERVAL: Duration = Duration::from_millis(16);
+// Keep callback-only pacing phase-locked with the DVM GPU presentation
+// cadence. A 16 ms client pulse against a 15 ms presentation clock creates a
+// beat: an otherwise healthy callback can repeatedly miss two adjacent
+// permits and exceed the 50 ms interactive-latency contract. Both clocks are
+// deliberately 15 ms, while the one-shot callback and presentation permits
+// below still prevent an unbounded client-driven loop.
+const WAYLAND_FRAME_CALLBACK_INTERVAL: Duration = Duration::from_millis(15);
 const PARTIAL_RENDER_BUDGET: Duration = Duration::from_millis(8);
 const DISPLAY_BACKPRESSURE_RETRY_DELAY: Duration = Duration::from_millis(1);
 const SLOW_LOOP_THRESHOLD: Duration = Duration::from_millis(50);
@@ -850,8 +856,10 @@ fn run() -> Result<(), i32> {
     let mut next_cursor_blink = Instant::now() + CURSOR_BLINK_INTERVAL;
     let mut next_cursor_motion_settle = Instant::now() + CURSOR_MOTION_SETTLE_INTERVAL;
     let mut next_loop_summary = Instant::now() + UI_HEARTBEAT_INTERVAL;
+    let mut loop_summary_started = Instant::now();
     let mut next_wayland_backlog_service = Instant::now();
     let mut next_wayland_callback_pulse = Instant::now();
+    let mut wayland_callback_pending = false;
     // The boot frame is a real presentation, so it grants exactly one
     // non-accumulating Wayland repaint permit. Each later successful present
     // replenishes it. Consuming the previous permit before the next present
@@ -870,6 +878,9 @@ fn run() -> Result<(), i32> {
     let mut processed_input_events_total = 0_u64;
     let mut last_input_processed_at: Option<Instant> = None;
     let mut max_input_gap_ms_window = 0_u64;
+    let mut input_drops_summary_baseline = 0_u64;
+    let mut input_slow_summary_baseline = 0_u64;
+    let mut input_errors_summary_baseline = 0_u64;
     let watchdog = UiLoopWatchdog::start(boot_started);
 
     sys::debug_line("uiserver: main loop entered");
@@ -954,6 +965,7 @@ fn run() -> Result<(), i32> {
                     pending_update.absorb(update);
                 }
                 let frame_callback_rect = compositor.pending_frame_callback_rect();
+                wayland_callback_pending = !frame_callback_rect.is_empty();
                 let callback_only = pending_update.is_empty() && !frame_callback_rect.is_empty();
                 if callback_only {
                     log_wayland_callback_only(&state, frame_callback_rect);
@@ -965,6 +977,7 @@ fn run() -> Result<(), i32> {
                     && (wayland_frame_permit || callback_only_cadence_permit)
                 {
                     compositor.consume_frame_callback_permit();
+                    wayland_callback_pending = false;
                     wayland_frame_permit = false;
                     next_wayland_callback_pulse = callback_now + WAYLAND_FRAME_CALLBACK_INTERVAL;
                 }
@@ -1044,75 +1057,6 @@ fn run() -> Result<(), i32> {
         );
         phase_timings.cursor = cursor_phase_started.elapsed();
 
-        let now = Instant::now();
-        if now >= next_loop_summary {
-            let input_reader = input_events.snapshot();
-            let console_command = state.console_command_snapshot();
-            let input_pending_reader = input_reader
-                .delivered_events
-                .saturating_sub(processed_input_events_total);
-            heartbeat_line(&format!(
-                "uiserver: update tick loops={} total_loops={} frames={} cursor_moves={} cursor={},{} presented_cursor={},{} pending_update={} pending_full={} pending_rects={} drawable_full={} drawable_rects={} backlog={} backlog_loops={} input_loop_events={} pointer_motion={} pointer_position={} wayland_motion_calls={} input_pending={} input_gap_ms={} input_wait_active={} input_wait_ms={} input_waits={}/{} input_read_active={} input_read_ms={} input_last_age_ms={} input_reads={}/{} input_raw_events={} input_events={} input_drops={} input_slow={} input_errors={} background_thread_demotions={} console_cmd_pending={} console_cmd_accepted={} console_cmd_completed={} console_cmd_rejected={} console_cmd_slow={} console_cmd_errors={} console_cmd_active={} console_cmd_active_ms={} console_windows={} wayland_windows={} focused_session={} focused_wayland={:?}",
-                loop_count,
-                total_loop_count,
-                frames_rendered_window,
-                cursor_moves_window,
-                state.cursor_x,
-                state.cursor_y,
-                presented_cursor_x,
-                presented_cursor_y,
-                !drawable_update.is_empty(),
-                pending_update.needs_full_redraw,
-                pending_update.partial_rects().len(),
-                drawable_update.needs_full_redraw,
-                drawable_update.partial_rects().len(),
-                input.backlog_remaining,
-                input_backlog_window,
-                input_events_window,
-                pointer_motion_events_window,
-                pointer_position_events_window,
-                wayland_motion_calls_window,
-                input_pending_reader,
-                max_input_gap_ms_window,
-                input_reader.wait_active,
-                input_reader.wait_elapsed_ms,
-                input_reader.completed_waits,
-                input_reader.wait_attempts,
-                input_reader.read_active,
-                input_reader.read_elapsed_ms,
-                input_reader.last_delivery_age_ms,
-                input_reader.completed_reads,
-                input_reader.read_attempts,
-                input_reader.raw_events,
-                input_reader.delivered_events,
-                input_reader.queue_drops,
-                input_reader.slow_reads,
-                input_reader.errors,
-                background_thread_demotion_count(),
-                console_command.pending,
-                console_command.accepted,
-                console_command.completed,
-                console_command.rejected,
-                console_command.slow_commands,
-                console_command.errors,
-                console_command.active,
-                console_command.active_elapsed_ms,
-                state.console_windows.len(),
-                state.wayland_windows.len(),
-                state.focused_session_handle,
-                state.focused_wayland_surface_id,
-            ));
-            next_loop_summary = now + UI_HEARTBEAT_INTERVAL;
-            loop_count = 0;
-            frames_rendered_window = 0;
-            cursor_moves_window = 0;
-            input_events_window = 0;
-            pointer_motion_events_window = 0;
-            pointer_position_events_window = 0;
-            wayland_motion_calls_window = 0;
-            input_backlog_window = 0;
-            max_input_gap_ms_window = 0;
-        }
         let main_present_started = Instant::now();
         log_cursor_pipeline_sample(
             "main-present-ready",
@@ -1174,6 +1118,97 @@ fn run() -> Result<(), i32> {
             state.cursor_x == presented_cursor_x && state.cursor_y == presented_cursor_y,
         );
 
+        let summary_now = Instant::now();
+        if summary_now >= next_loop_summary {
+            let heartbeat_elapsed_ms = summary_now
+                .duration_since(loop_summary_started)
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64;
+            let input_reader = input_events.snapshot();
+            let console_command = state.console_command_snapshot();
+            let input_pending_reader = input_reader
+                .delivered_events
+                .saturating_sub(processed_input_events_total);
+            let input_drops_window = input_reader
+                .queue_drops
+                .saturating_sub(input_drops_summary_baseline);
+            let input_slow_window = input_reader
+                .slow_reads
+                .saturating_sub(input_slow_summary_baseline);
+            let input_errors_window = input_reader
+                .errors
+                .saturating_sub(input_errors_summary_baseline);
+            heartbeat_line(&format!(
+                "uiserver: update tick elapsed_ms={} loops={} total_loops={} frames={} cursor_moves={} cursor={},{} presented_cursor={},{} pending_update={} pending_full={} pending_rects={} drawable_full={} drawable_rects={} backlog={} backlog_loops={} input_loop_events={} pointer_motion={} pointer_position={} wayland_motion_calls={} input_pending={} input_gap_ms={} input_wait_active={} input_wait_ms={} input_waits={}/{} input_read_active={} input_read_ms={} input_last_age_ms={} input_reads={}/{} input_raw_events={} input_events={} input_drops={} input_slow={} input_errors={} input_drops_window={} input_slow_window={} input_errors_window={} background_thread_demotions={} console_cmd_pending={} console_cmd_accepted={} console_cmd_completed={} console_cmd_rejected={} console_cmd_slow={} console_cmd_errors={} console_cmd_active={} console_cmd_active_ms={} console_windows={} wayland_windows={} focused_session={} focused_wayland={:?}",
+                heartbeat_elapsed_ms,
+                loop_count,
+                total_loop_count,
+                frames_rendered_window,
+                cursor_moves_window,
+                state.cursor_x,
+                state.cursor_y,
+                presented_cursor_x,
+                presented_cursor_y,
+                !pending_update.is_empty(),
+                pending_update.needs_full_redraw,
+                pending_update.partial_rects().len(),
+                drawable_update.needs_full_redraw,
+                drawable_update.partial_rects().len(),
+                input.backlog_remaining,
+                input_backlog_window,
+                input_events_window,
+                pointer_motion_events_window,
+                pointer_position_events_window,
+                wayland_motion_calls_window,
+                input_pending_reader,
+                max_input_gap_ms_window,
+                input_reader.wait_active,
+                input_reader.wait_elapsed_ms,
+                input_reader.completed_waits,
+                input_reader.wait_attempts,
+                input_reader.read_active,
+                input_reader.read_elapsed_ms,
+                input_reader.last_delivery_age_ms,
+                input_reader.completed_reads,
+                input_reader.read_attempts,
+                input_reader.raw_events,
+                input_reader.delivered_events,
+                input_reader.queue_drops,
+                input_reader.slow_reads,
+                input_reader.errors,
+                input_drops_window,
+                input_slow_window,
+                input_errors_window,
+                background_thread_demotion_count(),
+                console_command.pending,
+                console_command.accepted,
+                console_command.completed,
+                console_command.rejected,
+                console_command.slow_commands,
+                console_command.errors,
+                console_command.active,
+                console_command.active_elapsed_ms,
+                state.console_windows.len(),
+                state.wayland_windows.len(),
+                state.focused_session_handle,
+                state.focused_wayland_surface_id,
+            ));
+            next_loop_summary = summary_now + UI_HEARTBEAT_INTERVAL;
+            loop_summary_started = summary_now;
+            loop_count = 0;
+            frames_rendered_window = 0;
+            cursor_moves_window = 0;
+            input_events_window = 0;
+            pointer_motion_events_window = 0;
+            pointer_position_events_window = 0;
+            wayland_motion_calls_window = 0;
+            input_backlog_window = 0;
+            max_input_gap_ms_window = 0;
+            input_drops_summary_baseline = input_reader.queue_drops;
+            input_slow_summary_baseline = input_reader.slow_reads;
+            input_errors_summary_baseline = input_reader.errors;
+        }
+
         let sleep_started = Instant::now();
         let now = sleep_started;
         if !rendered
@@ -1185,6 +1220,12 @@ fn run() -> Result<(), i32> {
                 .min(next_console_poll)
                 .min(next_cursor_blink)
                 .min(now + RUNTIME_POLL_SLEEP);
+            if wayland_callback_pending {
+                // Input readiness remains the primary wake source, but a
+                // callback-only client must never sleep past its compositor
+                // clock merely because no input or runtime poll is pending.
+                sleep_deadline = sleep_deadline.min(next_wayland_callback_pulse);
+            }
             if state.cursor_motion_active() {
                 sleep_deadline = sleep_deadline.min(next_cursor_motion_settle);
             }

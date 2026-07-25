@@ -46,6 +46,11 @@ application deadlines remain authoritative and may not be widened to this
 ceiling. Server receive loops may wait for new work indefinitely because they
 hold no caller reply, but every accepted synchronous request must reach reply,
 timeout/cancel, peer-close, or owner-exit cleanup.
+Latency-sensitive service-to-service control uses
+`SYS_RUSTOS_IPC_CALL_BOUNDED`; the caller supplies a nonzero deadline no wider
+than the 30-second ceiling. Inputd's authenticated session notification to
+netd is capped by the 16 ms readiness rail, and timeout revokes the exact reply
+rather than leaving a late transition able to reactivate a retired generation.
 
 Kernel-owned cross-service calls use the typed limits in
 `rustos_user_abi::performance`, never an unlabelled copy of the 30-second
@@ -185,7 +190,9 @@ substitutes.
 | 10 | `rootd` | `ROOT_SUPERVISOR` | Core-service leases, restart budgets |
 | 11 | `sessiond` (reserved) | `SESSION_POLICY` | Console/TTY/session |
 | 12 | `pagerd` (reserved) | `PAGER_POLICY` | Backing/page-cache |
-| 13 | service-driver (reserved) | `SERVICE_DRIVER_POLICY` | Reserved non-DVM privileged-resource coordination; no endpoint is admitted until a capability-gated broker exists |
+Service IDs 5 and 13, their former capability bits, and raw syscall numbers
+`0x52550020..=0x52550022` plus `0x52550037` are permanently retired. They are
+not extension points and must continue to return `ENOSYS`.
 
 Broker authorization checks the caller's registered service capability — **not** its executable path.
 `SYS_RUSTOS_ENTROPY_BROKER` is limited to the Linux-syscall and network-policy
@@ -209,30 +216,34 @@ loads module images, probes module aliases, or retains native USB, PS/2, or
 virtio-net fallback providers. A missing DVM transport leaves that device
 unavailable; it must not select an alternate in-kernel provider.
 
-RustOS accepts only bounded DVM transports: RDI3 records in a host-owned 128
+RustOS accepts only bounded DVM transports: RDI1 version-3 records in a host-owned 128
 KiB ivshmem input ring with 2,048 fixed 32-byte slots and exactly one MSI-X
 wake vector; fixed layouts for display control/pixels and Ethernet frames. The DVM
 never maps the input ring. L0 is its sole producer, RustOS is its sole
 consumer, and the producer/consumer cursor cache lines are distinct. Ring0
-validates fixed headers, sequence and bounds; `inputd`, `netd`, and `uiserver`
-own policy above those transports. Input attachment is serialized, has a
+validates only aperture/header/cursor bounds and copies fixed records stamped
+with the observed transport generation. `inputd` validates RDI1
+magic/version/checksum, epoch, sequence, key/pointer bounds, and session
+lifecycle; `netd`, `storaged`, and `uiserver` own their device policy above the
+generic transport substrate. Input attachment is serialized, has a
 boot-wide eight-attempt recovery budget, and may reuse its permanent MSI-X
 vector only for the originally pinned PCI aperture; revoke releases the old
 MMIO mapping. The sole accepted GUI topology is the V3 `RSGUI002` three-slot
 GUI-DVM pool; V2, polling, a firmware framebuffer, and a native-GPU fallback
 are not parsed or selected.
 
-When the RDI3 ring reaches its normal reserve-preserving limit, L0 waits for
+When the RDI1 version-3 ring reaches its normal reserve-preserving limit, L0 waits for
 consumer credit for at most 50 ms rather than dropping a valid user frame or
 spinning. Progress resumes on the observed consumer cursor; no credit before
 the deadline is a fail-closed transport-health failure. Cleanup uses its
 separately reserved lifecycle capacity and follows the same bounded rule.
 
-RDI3 preserves pointer semantics end to end. Relative evdev devices produce
+RDI1 version 3 preserves pointer semantics end to end. Relative evdev devices produce
 bounded delta records; absolute tablets produce bounded `0..1599 x 0..899`
 position records only after a complete `SYN_REPORT`. Partial X/Y reports are
-staging state, identical positions are idempotent, and neither L0, ring0 nor
-`inputd` may reinterpret an absolute position as a relative delta. The inputd
+staging state, identical positions are idempotent, and neither L0 nor `inputd`
+may reinterpret an absolute position as a relative delta. Ring0 has no pointer
+semantics at all. The inputd
 ingress ABI uses distinct packet and position payloads so a provider cannot
 make one physical report travel through both paths.
 
@@ -330,8 +341,49 @@ cannot manufacture device loss while the bounded fence wait is still live.
 
 The transport has two explicit, non-interchangeable evidence modes. QEMU
 implements `source-path=staged-copy zero-copy=0`: only damaged atlas rectangles
-are copied once into a virtio-GPU texture, after which the fixed GLES commands
-perform the actual composition into a DVM-private output. This is a valid
+are copied once from uiserver's complete service-owned atlas into the exact
+selected host-created transport slot. Display GPU ABI v5 maps only that
+slot-scoped pixel range into uiserver with the same write-combine memory type
+as its ring0 alias; command/control pages and other slots remain unreachable.
+The commit request carries no user pointer. Ring0 validates the surface
+capability, slot, generation, bounded damage, and command batch, publishes
+metadata, and signals the DVM without touching atlas pixels. A generic
+ring0 user-copy path or a separately allocated intermediate surface is
+forbidden.
+When a rotated slot needs several contiguous epochs, uiserver retains disjoint
+damage rectangles and unions only overlapping rectangles. It must not turn
+distant cursor and client damage into their atlas-sized bounding rectangle.
+If the accumulated set exceeds `DVM_GPU_ATLAS_MAX_DAMAGE_RECTS`, the only
+allowed fallback is an explicit full-slot snapshot before publication.
+Steady-state selection prefers the exact predecessor, otherwise the cheapest
+complete reconstruction whose damage is at most one eighth of the atlas.
+When every released slot is older or more expensive, submission returns
+backpressure and the retained visual update is coalesced until a recent slot
+completes. It does not publish a partial snapshot or amplify that update into
+an avoidable full-slot copy.
+Large slot rows use aligned non-temporal stores into the write-combine mapping,
+and one store fence completes the copy before the commit ioctl publishes its
+generation. Small damage retains the ordinary bounded copy path.
+Console texture content and scene topology have separate generations.
+Output or terminal-cursor changes rebuild and copy only the bound console
+rectangle. Window position changes only the destination of the exact retained
+texture command and must not rebuild or copy atlas pixels. The binding includes
+the authenticated layer index and source rectangle; a mismatch fails closed
+into a structural rebuild. Window identity, dimensions, visibility, focus,
+title, or ordering changes force that rebuild. Content versions and `x/y`
+position alone must not alter the structural reuse signature.
+Wayland pointer motion is coalesced to the latest coordinates on the same
+15 ms frame cadence. Focus transitions still emit immediate enter/leave
+events, and button delivery first flushes any pending motion so observable
+protocol order and click coordinates remain exact.
+Runtimed's pre-catalog uiserver launch uses a sealed two-variable bootstrap
+environment and an empty argument list. Later catalog admission must match the
+same executable, weight, privilege flags, arguments, and ordered environment
+exactly; mismatch fails the catalog instead of silently drifting. The boot
+path must not enumerate the complete applications directory before uiserver.
+The DVM then uploads those damaged rectangles into a virtio-GPU texture, after
+which the fixed GLES commands perform the actual composition into a
+DVM-private output. This is a valid
 GPU-composition test but can never satisfy the physical zero-copy gate. The
 v2 prime-completion record authenticates exactly one of those modes before the
 host exposes GPU readiness. RustOS caches the selected mode for the context and
@@ -461,13 +513,15 @@ the V3 pool cannot be detached while a host slot is being copied and its fixed
 `Unavailable`; the normal present syscall never writes a firmware, native-GPU,
 or generic framebuffer substitute.
 An installed DVM Ethernet aperture is similarly not evidence of a live or
-authorized network peer. The current single-DVM topology admits RustOS
-transmit/receive only while the L0-authenticated RDI1 control session's exact
-nonzero epoch is active. `SESSION_END` revokes that epoch synchronously; an
-old end marker cannot revoke a newer epoch, and guest-writable ivshmem headers,
-ready bits, counters, or frames cannot create a lease. The L0-authenticated
-RDI3 lifecycle records carried by the fixed input ring never carry Ethernet
-data. The aperture remains
+authorized network peer. `inputd` authenticates the RDI1 session lifecycle and
+sends an identity-stamped request to `netd`; netd validates the live inputd
+service owner and chooses the exact nonzero packet generation. Only netd may
+grant/revoke that generation through its capability-gated packet broker.
+Ring0 enforces nonzero grant, exact revoke, startup reset, and bounded ring
+memory access but knows nothing about input-session semantics. An old end
+marker cannot revoke a newer generation, and guest-writable ivshmem headers,
+ready bits, counters, or frames cannot create a lease. Lifecycle records never
+carry Ethernet data. The aperture remains
 mapped after revocation so lifecycle changes do not race an unmap, but packet
 operations fail closed as `NoDevice` until a new authenticated start. A
 network-only DVM is not an enabled topology: it cannot inherit the input-DVM
@@ -487,8 +541,8 @@ The DVM flag adds the diagnostic `DVM_SCANOUT` blocker. Any path that clears a
 trusted-UI blocker must independently attest both the physical scanout and
 human-input source. A bounded ivshmem header, authenticated DVM agent, or
 primary-provider flag alone is never such an attestation.
-The reserved service-driver resource broker is not a DVM module loader and has
-no currently admitted service endpoint.
+The former driverd/service-driver broker surface is deleted. Its numeric slots
+are permanent fail-closed tombstones, not reserved future service endpoints.
 
 The retired `compat-slowpath-ring3`, `pager-slowpath-ring3`, and
 `process-slowpath-ring3` planning tables have no live ring0 source entry.
@@ -599,7 +653,11 @@ policy remains with the owning service.
   capability possession, and token obscurity never substitutes for the rootd
   dependency graph.
 - Kernel fd tables mirror service-owned objects as `KernelHandle::RemoteVfs`.
-- VFS device open responses use `VfsIpcResponse.aux` for device access metadata such as `INPUTD_ACCESS_*`; ring0 read paths must not classify `/dev/input*` by path string after the remote handle is installed.
+- VFS device open responses use `VfsIpcResponse.aux` for service-owned route
+  metadata such as `INPUTD_ACCESS_*` and `VFS_DEVICE_ACCESS_DRM_COMPAT`.
+  Compat never classifies `/dev/*` path strings: vfsd resolves the namespace,
+  then compat either transfers the devmgrd handle or retains the explicitly
+  selected DRM compatibility description.
 - Linux `openat` installs `KernelHandle::RemoteVfs` for regular files + directories after vfsd registration.
 - Linux `dup`/`dup2`/`dup3` acquire the exact service-side
   reference before publishing the local duplicate. `close` removes the local
@@ -980,7 +1038,14 @@ policy remains with the owning service.
   eight validated 64-KiB read-ahead windows (512 KiB total), but it first
   revalidates live DVM geometry and the exact caller generation on every
   request. A hit must be wholly contained in one exact-generation window. A
-  miss submits one forward window no larger than the fixed DVM slot;
+  first or noncontiguous miss submits one forward window. Only a later miss at
+  that exact window boundary may submit up to eight contiguous forward windows,
+  each no larger than one fixed DVM slot, before waiting for the first
+  completion. This uses the transport's bounded queue for proven sequential
+  demand without turning random FAT metadata probes into 512-KiB reads. No
+  window is published to the cache until the complete batch succeeds; submit
+  failure cancels every issued ticket and completion failure cancels the
+  remaining tickets and clears the cache epoch.
   overlapping replacements cannot coexist, a different generation atomically
   replaces the complete cache epoch, and every write clears all windows before
   submission. Transport-info failure also clears them. Cached bytes therefore
@@ -1063,25 +1128,45 @@ policy remains with the owning service.
   application poll-waiter set, and a dead predecessor is reclaimed before an
   inputd restart may arm it. The worker alone calls gated
   `SYS_RUSTOS_INPUT_INGEST_BROKER`, drains at most
-  `INPUTD_INGEST_MAX_EVENTS` records per turn, then yields before a recovery
+  `INPUTD_INGEST_MAX_EVENTS` generation-stamped raw records per turn, validates
+  RDI1 framing/CRC/epoch/sequence in inputd, then yields before a recovery
   batch. Thus a stalled or absent application reader cannot fill the fixed DVM
-  ring, while no periodic polling loop is introduced. L0 signals the one
-  MSI-X doorbell only on an empty-to-nonempty transition (or an authenticated
-  cleanup record); the post-arm cursor recheck makes a suppressed duplicate
-  edge safe and prevents one interrupt/context switch per pointer frame.
-- `INPUTD_IPC_OP_STATS` (the kernel's poll recheck) and an authorized
-  `INPUTD_IPC_OP_READ` also refresh ingress under the same inputd queue lock,
-  closing the wake/read race without becoming the sole progress path. Inputd
-  reports only its service-owned policy queue, returns a bounded
+  ring, while no periodic polling loop is introduced. inputd registers its
+  exact task, publishes a monotonic consumer wake generation, and rechecks the
+  producer cursor before sleeping. L0 samples that generation only after its
+  release-ordered producer commit and rings MSI-X once per new generation.
+  This closes both sides of the check-arm-recheck race while batching records
+  that arrive while the worker is already runnable. The same armed task has an
+  independent 100 ms kernel timer: a lost or indefinitely coalesced MSI-X edge
+  therefore causes an authoritative cursor recheck instead of filling the
+  ring. L0 also issues a bounded recovery kick after two additional committed
+  records remain outstanding under the same wake generation. Normal draining
+  still batches by generation; recovery therefore retries a lost edge within
+  30 ms at the 66.7 Hz acceptance source without an interrupt per record.
+  Neither the timer nor the recovery kick has record/policy authority.
+- Inputd ABI v5 retires caller-driven `INPUTD_IPC_OP_DRAIN_INGEST` and the
+  commercial INPUT_INGEST operation. `INPUTD_IPC_OP_STATS` (the kernel's poll
+  recheck) and an authorized `INPUTD_IPC_OP_READ` observe only the
+  service-owned policy queue and never advance the ring. The ingestion worker
+  performs the broker copy without holding the policy-queue mutex, then takes
+  the mutex only for bounded decoding/coalescing. This prevents a hot reader
+  from starving transport progress. The worker declares an ingestion handoff
+  before taking the queue mutex; request threads that race it release rather
+  than barge and retry only after the worker owns one bounded critical section.
+  The worker uses nonblocking try-lock plus scheduler yield, so it never parks
+  behind a missed service-local futex wake while the transport ring fills.
+  This closes the service-local priority inversion and makes the
+  single-consumer claim true in implementation rather than merely by
+  convention. Inputd returns a bounded
   `InputdReadResponse` capped at 32 KiB, and uses fixed-size ingress scratch.
   The non-consuming `STATS` probe has a 16 ms IPC reply deadline, so a wedged
   inputd cannot freeze the UI poll loop behind the generic service timeout; a
   retry sees either unchanged ingress or the already-transferred policy record.
   The endpoint server still blocks in `SYS_RUSTOS_IPC_RECV` while idle.
 - RustOS-native input polls and uiserver use readiness-then-read safely:
-  `INPUTD_IPC_OP_STATS` and `INPUTD_IPC_OP_READ` both refresh ingress before
-  observing policy state, and generic poll/epoll rechecks service policy after
-  every generation wake before returning an event. The latency-sensitive
+  the worker publishes a policy readiness generation after the empty-to-ready
+  transition, and generic poll/epoll rechecks service policy after every
+  generation wake before returning an event. The latency-sensitive
   uiserver reader performs a zero-time
   poll, whose non-consuming `STATS` request has the 16 ms IPC bound above,
   before entering the stateful authorized `READ`; it never starts that generic
@@ -1333,7 +1418,7 @@ replaces older generic hints, even across scheduling classes; stale high-class
 service hints must not block the service that the current caller is waiting on.
 A blocked caller's exact receiver handoff remains first because it is the
 causal path needed to unblock that caller. Outside that blocked-call case, a
-System continuation whose ready age reached the 10 ms recovery bound is
+System continuation whose ready age reached the 2 ms recovery bound is
 selected before an unrelated generic IPC hint. The hint remains pending for
 the following dispatch. This ordering is required because loaderd can be
 preempted inside a bounded commit substrate operation while carrying a
@@ -1393,16 +1478,13 @@ an already-sleeping generic wait without moving network policy into ring0.
 
 This removes avoidable copies and waits, but standard AF_UNIX data still makes
 a synchronous compat-to-netd service round trip for every send/receive. The
-current WayClick KVM gate proves that this path does not yet sustain 55 FPS.
-After removing uiserver's cursor-only early-present lane and moving frame
-callbacks onto a previous-presentation permit, the signed post-cleanup
-artifact's settled standard-client windows reach 35.894--41.776 FPS,
-compositor callback wait is normally 2--4 ms, and the private GPU proof reaches
-110.389 FPS with 9.057/14.392 ms average/maximum GPU time.
-The remaining limit is therefore not a private rendering API, ordinary
-`wl_shm` copy, or the GPU proof. The generic wait-set now gives ordinary Linux
-applications a bounded aggregate wait over vfsd-owned interests backed by
-netd/inputd readiness generations, exact provider epochs, and monotonic
+current WayClick KVM gate nevertheless proves this standard path sustains the
+55 FPS contract without a client-specific route. Its first accepted three
+windows matched 57, 65, and 68 commit/callback/release cycles over 3.060
+seconds (62.092 FPS aggregate) with a 45 ms maximum callback gap. The generic
+wait-set gives ordinary Linux applications a bounded aggregate wait over
+vfsd-owned interests backed by netd/inputd readiness generations, exact
+provider epochs, and monotonic
 deadlines. It deliberately leaves socket data and namespace/options policy in
 netd and does not add a WayClick-specific route. Wayland-server's existing
 backend epoll fd aggregates the changing client set; uiserver duplicates that
@@ -1426,7 +1508,13 @@ Kernel keeps only: user-copy, address-space replacement, scheduler mutation, pen
 - Linux time admission policy for `nanosleep`, `clock_gettime`,
   `clock_nanosleep`, and `ppoll` timespec validation belongs to `syscalld`.
   Ring0 keeps only current-task user-copy plus RTC/tick sleep and clock
-  substrate.
+  substrate. Successful immutable time-policy keys are cached per process and
+  reset on fork/exec; `clock_nanosleep` keys include the exact clock ID and
+  `TIMER_ABSTIME` bit, so malformed or previously unseen combinations cannot
+  reuse a grant. The live syscalld owner performs exact structural validation
+  and self-admits its own receive-loop backoff instead of synchronously calling
+  its own endpoint. This capability-bound self path is required to prevent a
+  30-second self-deadlock from surfacing as `ETIMEDOUT` to libc `nanosleep`.
 - Linux futex WAIT and WAIT_BITSET accept validated relative/absolute timeout
   timespecs and block on the RTC waiter substrate; timeout-bearing futex calls
   must not return `ENOSYS` or spin in libc retry loops. Any waiter table read by
@@ -1452,8 +1540,8 @@ Kernel keeps only: user-copy, address-space replacement, scheduler mutation, pen
 ## Commercial-Max Protocol
 
 `rustos-user-abi::syscall::CommercialMaxProtocol*` reserves versioned protocol/op
-ids for core services. Retired driverd values remain numeric ABI reservations;
-they do not admit a service or a module-loading path.
+ids for core services. Retired driverd values are permanent tombstones; they
+do not admit a service, a module-loading path, or a future ABI reuse.
 
 **Shared ABI scaffolding only** — ring0 exposes new privileged actions only when a narrow broker is implemented and capability-gated.
 
@@ -1462,7 +1550,7 @@ they do not admit a service or a module-loading path.
 - `device::DisplayInfo.flags`: `DISPLAY_INFO_FLAG_PRIMARY_PROVIDER` distinguishes a real primary provider from GRUB/firmware framebuffers (default = early console + panic output only).
 - Firmware framebuffer data is diagnostic-only and is never a presentation
   fallback. The only accepted normal provider is the validated DVM aperture.
-- Driver framebuffer registration accepts only the DVM primary-provider flag;
+- Built-in framebuffer registration accepts only the DVM primary-provider flag;
   do not infer ownership from geometry or `display_info()` presence.
 - Surface present = kernel fast path: copies validated shared-surface contents into active framebuffer + queues provider flush for bounded housekeeping. **Do not reintroduce synchronous virtio-gpu command waits into app syscall context** for normal uiserver presents.
 - The KVM virtio-gpu path is Linux DVM DRM/KMS over the fixed display aperture.
@@ -1484,7 +1572,7 @@ they do not admit a service or a module-loading path.
 - The max-burst guard rotates to another ready peer within the current
   scheduling class even when the current task's weighted vruntime still wins.
   Separately, after two consecutive System dispatches, one ready User task must
-  run before System selection resumes. Each ready User task also has an 8 ms
+  run before System selection resumes. Each ready User task also has a 2 ms
   age bound, so a single busy User task cannot consume every reserved turn.
   Authenticated User-only event handoffs use a deduplicated 16-entry FIFO and
   are capped at eight consecutive picks. These are the explicit recovery and

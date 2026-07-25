@@ -2417,7 +2417,7 @@ pub const RUSTOS_POINTER_POSITION_MAX_Y: u16 = 899;
 /// blocked. This ivshmem aperture is bounded,
 /// launch-owned, and paired with one fixed MSI-X wake vector.
 pub const DVM_INPUT_RING_MAGIC: [u8; 8] = *b"RSDVMIN1";
-pub const DVM_INPUT_RING_VERSION: u32 = 1;
+pub const DVM_INPUT_RING_VERSION: u32 = 2;
 pub const DVM_INPUT_RING_HEADER_BYTES: u32 = 4096;
 pub const DVM_INPUT_RING_RECORD_BYTES: usize = RUSTOS_INPUT_FRAME_BYTES;
 pub const DVM_INPUT_RING_SLOT_COUNT: u32 = 2048;
@@ -2427,6 +2427,12 @@ pub const DVM_INPUT_RING_SLOT_COUNT: u32 = 2048;
 pub const DVM_INPUT_RING_FLAGS_OFFSET: usize = 32;
 pub const DVM_INPUT_RING_PRODUCER_OFFSET: usize = 64;
 pub const DVM_INPUT_RING_CONSUMER_OFFSET: usize = 128;
+/// Monotonic wake generation written only by RustOS after it has registered
+/// the inputd waiter and before the authoritative producer recheck. L0 reads
+/// it only after publishing a record and rings MSI-X once per new generation.
+/// Keeping this beside the consumer cursor preserves single-writer cache-line
+/// ownership while closing the stale empty-snapshot lost-wake race.
+pub const DVM_INPUT_RING_CONSUMER_WAKE_GENERATION_OFFSET: usize = 136;
 pub const DVM_INPUT_RING_ENCODED_BYTES: usize = 192;
 pub const DVM_INPUT_RING_FLAG_READY: u32 = 1;
 /// Set only by RustOS after it has validated the aperture and armed the one
@@ -2456,6 +2462,7 @@ pub struct DvmInputRingHeader {
     pub flags: u32,
     pub producer: u64,
     pub consumer: u64,
+    pub consumer_wake_generation: u64,
     pub generation: u64,
 }
 
@@ -2466,6 +2473,7 @@ impl DvmInputRingHeader {
             flags: DVM_INPUT_RING_FLAG_READY,
             producer: 0,
             consumer: 0,
+            consumer_wake_generation: 0,
             generation,
         }
     }
@@ -2508,6 +2516,9 @@ impl DvmInputRingHeader {
             .copy_from_slice(&self.producer.to_le_bytes());
         bytes[DVM_INPUT_RING_CONSUMER_OFFSET..DVM_INPUT_RING_CONSUMER_OFFSET + 8]
             .copy_from_slice(&self.consumer.to_le_bytes());
+        bytes[DVM_INPUT_RING_CONSUMER_WAKE_GENERATION_OFFSET
+            ..DVM_INPUT_RING_CONSUMER_WAKE_GENERATION_OFFSET + 8]
+            .copy_from_slice(&self.consumer_wake_generation.to_le_bytes());
         bytes
     }
 
@@ -2523,7 +2534,11 @@ impl DvmInputRingHeader {
             || bytes[64 + 8..DVM_INPUT_RING_CONSUMER_OFFSET]
                 .iter()
                 .any(|byte| *byte != 0)
-            || bytes[DVM_INPUT_RING_CONSUMER_OFFSET + 8..]
+            || bytes
+                [DVM_INPUT_RING_CONSUMER_OFFSET + 8..DVM_INPUT_RING_CONSUMER_WAKE_GENERATION_OFFSET]
+                .iter()
+                .any(|byte| *byte != 0)
+            || bytes[DVM_INPUT_RING_CONSUMER_WAKE_GENERATION_OFFSET + 8..]
                 .iter()
                 .any(|byte| *byte != 0)
         {
@@ -2543,6 +2558,12 @@ impl DvmInputRingHeader {
             ),
             consumer: u64::from_le_bytes(
                 bytes[DVM_INPUT_RING_CONSUMER_OFFSET..DVM_INPUT_RING_CONSUMER_OFFSET + 8]
+                    .try_into()
+                    .ok()?,
+            ),
+            consumer_wake_generation: u64::from_le_bytes(
+                bytes[DVM_INPUT_RING_CONSUMER_WAKE_GENERATION_OFFSET
+                    ..DVM_INPUT_RING_CONSUMER_WAKE_GENERATION_OFFSET + 8]
                     .try_into()
                     .ok()?,
             ),
@@ -3214,16 +3235,16 @@ mod tests {
         DVM_GPU_FIXED_ONE, DVM_GPU_NO_OUTPUT, DVM_GPU_NO_SOURCE, DVM_GPU_PIXEL_FORMAT_BGRA8888,
         DVM_GPU_RENDER_FLAG_PRESENT_ON_COMPLETE, DVM_GPU_SOURCE_REQUIRED_FLAGS,
         DVM_INPUT_RING_APERTURE_BYTES, DVM_INPUT_RING_CONSUMER_OFFSET,
-        DVM_INPUT_RING_FLAG_POLICY_CONSUMER_READY, DVM_INPUT_RING_FLAG_RUSTOS_READY,
-        DVM_INPUT_RING_PRODUCER_OFFSET, DVM_NET_APERTURE_BYTES, DVM_NET_FLAG_DVM_READY,
-        DVM_NET_MIN_REGION_BYTES, DvmDisplayDamage, DvmDisplayHeader, DvmGpuPipelineState,
-        DvmGpuPresentCompletion, DvmGpuPrimeCompletion, DvmGpuPrimeCompletionStatus,
-        DvmGpuRenderBatchHeader, DvmGpuRenderCommand, DvmGpuRenderCommandKind,
-        DvmGpuRenderCompletion, DvmGpuRenderCompletionStatus, DvmGpuRenderSource, DvmGpuTimeline,
-        DvmGpuTimelineError, DvmGuiSurfaceMessage, DvmInputRingHeader, DvmNetHeader, ETHERTYPE_ARP,
-        ETHERTYPE_IPV4, EthernetFrameError, RUSTOS_INPUT_KIND_KEY,
-        RUSTOS_INPUT_KIND_POINTER_POSITION, RUSTOS_INPUT_VERSION, RustosInputFrame,
-        dvm_gpu_render_batch_is_valid, validate_dvm_ethernet_frame,
+        DVM_INPUT_RING_CONSUMER_WAKE_GENERATION_OFFSET, DVM_INPUT_RING_FLAG_POLICY_CONSUMER_READY,
+        DVM_INPUT_RING_FLAG_RUSTOS_READY, DVM_INPUT_RING_PRODUCER_OFFSET, DVM_NET_APERTURE_BYTES,
+        DVM_NET_FLAG_DVM_READY, DVM_NET_MIN_REGION_BYTES, DvmDisplayDamage, DvmDisplayHeader,
+        DvmGpuPipelineState, DvmGpuPresentCompletion, DvmGpuPrimeCompletion,
+        DvmGpuPrimeCompletionStatus, DvmGpuRenderBatchHeader, DvmGpuRenderCommand,
+        DvmGpuRenderCommandKind, DvmGpuRenderCompletion, DvmGpuRenderCompletionStatus,
+        DvmGpuRenderSource, DvmGpuTimeline, DvmGpuTimelineError, DvmGuiSurfaceMessage,
+        DvmInputRingHeader, DvmNetHeader, ETHERTYPE_ARP, ETHERTYPE_IPV4, EthernetFrameError,
+        RUSTOS_INPUT_KIND_KEY, RUSTOS_INPUT_KIND_POINTER_POSITION, RUSTOS_INPUT_VERSION,
+        RustosInputFrame, dvm_gpu_render_batch_is_valid, validate_dvm_ethernet_frame,
     };
 
     #[test]
@@ -3912,8 +3933,21 @@ mod tests {
             DVM_INPUT_RING_CONSUMER_OFFSET % core::mem::align_of::<u64>(),
             0
         );
+        assert_eq!(
+            DVM_INPUT_RING_CONSUMER_WAKE_GENERATION_OFFSET % core::mem::align_of::<u64>(),
+            0
+        );
         assert!(DVM_INPUT_RING_PRODUCER_OFFSET + 8 <= DVM_INPUT_RING_CONSUMER_OFFSET);
         assert!(DVM_INPUT_RING_CONSUMER_OFFSET - DVM_INPUT_RING_PRODUCER_OFFSET >= 64);
+        assert!(
+            DVM_INPUT_RING_CONSUMER_OFFSET + 8 <= DVM_INPUT_RING_CONSUMER_WAKE_GENERATION_OFFSET
+        );
+
+        let armed = DvmInputRingHeader {
+            consumer_wake_generation: 17,
+            ..header
+        };
+        assert_eq!(DvmInputRingHeader::decode(&armed.encode()), Some(armed));
 
         let mut reserved = header.encode();
         reserved[72] = 1;

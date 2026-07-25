@@ -22,7 +22,11 @@ const MAX_SERVICE_ENDPOINTS: usize = 16;
 const MAX_SERVICE_CALL_GRANTS: usize = 32 * MAX_SERVICE_ENDPOINTS;
 const MAX_SERVICE_ENDPOINT_WAITERS: usize = 32;
 const SLOW_IPC_THRESHOLD_MS: u64 = 10;
-const MAX_SLOW_IPC_LOGS: usize = 128;
+// Debugcon is a synchronous, globally contended device. One representative
+// slow sample per second preserves observability without letting a degraded
+// socket workload consume the CPU needed to recover the UI and its service
+// owners. Counters and milestones retain the aggregate evidence.
+const MAX_SLOW_IPC_LOGS_PER_SECOND: usize = 1;
 const EARLY_IPC_SAMPLE_COUNT: usize = 6;
 const SERVICE_IPC_TIMEOUT_MS: u64 = rustos_user_abi::performance::IPC_BULK_DATA_HARD_LIMIT_MS;
 // RING3-MIGRATION-REFERENCE START: rootd should own service namespace endpoint
@@ -52,7 +56,7 @@ static SERVICE_CALL_GRANTS: Mutex<[ServiceCallGrant; MAX_SERVICE_CALL_GRANTS]> =
     Mutex::new([ServiceCallGrant::empty(); MAX_SERVICE_CALL_GRANTS]);
 // RING3-MIGRATION-REFERENCE END: rootd-owned service endpoint registry state.
 static IPC_LOG_SAMPLE_COUNT: AtomicUsize = AtomicUsize::new(0);
-static SLOW_IPC_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+static SLOW_IPC_LOG_RATE_STATE: AtomicU64 = AtomicU64::new(u64::MAX);
 
 #[derive(Clone, Copy)]
 struct ServiceEndpointWaiter {
@@ -93,6 +97,7 @@ pub(super) fn is_linux_rustos_ipc_syscall(syscall_number: u64) -> bool {
         syscall_number,
         linux_abi::SYS_RUSTOS_IPC_ENDPOINT_CREATE
             | linux_abi::SYS_RUSTOS_IPC_CALL
+            | linux_abi::SYS_RUSTOS_IPC_CALL_BOUNDED
             | linux_abi::SYS_RUSTOS_IPC_RECV
             | linux_abi::SYS_RUSTOS_IPC_TRY_RECV
             | linux_abi::SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER
@@ -123,6 +128,9 @@ pub(super) fn dispatch_linux_rustos_ipc_syscall(frame: &SyscallFrame) -> u64 {
             );
             syscall_linux_rustos_ipc_call(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8)
         }
+        linux_abi::SYS_RUSTOS_IPC_CALL_BOUNDED => syscall_linux_rustos_ipc_call_bounded(
+            frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
+        ),
         linux_abi::SYS_RUSTOS_IPC_RECV => {
             syscall_linux_rustos_ipc_recv(frame.rdi, frame.rsi, frame.rdx, frame.r10)
         }
@@ -1184,6 +1192,49 @@ pub(super) fn syscall_linux_rustos_ipc_call(
     reply_ptr: u64,
     reply_capacity: u64,
 ) -> u64 {
+    syscall_linux_rustos_ipc_call_with_timeout(
+        endpoint,
+        request_ptr,
+        request_len,
+        reply_ptr,
+        reply_capacity,
+        SERVICE_IPC_TIMEOUT_MS,
+    )
+}
+
+pub(super) fn syscall_linux_rustos_ipc_call_bounded(
+    endpoint: u64,
+    request_ptr: u64,
+    request_len: u64,
+    reply_ptr: u64,
+    reply_capacity: u64,
+    timeout_ms: u64,
+) -> u64 {
+    if !bounded_ipc_call_timeout_is_valid(timeout_ms) {
+        return linux_errno(LINUX_EINVAL);
+    }
+    syscall_linux_rustos_ipc_call_with_timeout(
+        endpoint,
+        request_ptr,
+        request_len,
+        reply_ptr,
+        reply_capacity,
+        timeout_ms,
+    )
+}
+
+const fn bounded_ipc_call_timeout_is_valid(timeout_ms: u64) -> bool {
+    timeout_ms > 0 && timeout_ms <= SERVICE_IPC_TIMEOUT_MS
+}
+
+fn syscall_linux_rustos_ipc_call_with_timeout(
+    endpoint: u64,
+    request_ptr: u64,
+    request_len: u64,
+    reply_ptr: u64,
+    reply_capacity: u64,
+    timeout_ms: u64,
+) -> u64 {
     if let Err(errno) = authorize_current_process_ipc_call(endpoint) {
         return linux_errno(errno);
     }
@@ -1219,7 +1270,7 @@ pub(super) fn syscall_linux_rustos_ipc_call(
     );
     let send_ticks = crate::arch::rtc::ticks();
     ipc_trace!("ipc call waiting: endpoint={}", endpoint.raw());
-    let response = match wait_for_reply(reply) {
+    let response = match wait_for_service_reply_with_timeout(reply, timeout_ms) {
         Ok(response) => response,
         Err(errno) => return linux_errno(errno),
     };
@@ -2071,10 +2122,6 @@ fn enqueue_call_and_wake_with_handles(
     Ok(reply)
 }
 
-fn wait_for_reply(reply: KernelReplyHandle) -> Result<Vec<u8>, i64> {
-    Ok(wait_for_service_reply_with_handle_limit(reply, 0)?.0)
-}
-
 fn wait_for_service_reply(reply: KernelReplyHandle) -> Result<Vec<u8>, i64> {
     wait_for_service_reply_with_timeout(reply, SERVICE_IPC_TIMEOUT_MS)
 }
@@ -2557,10 +2604,44 @@ where
     if sample_index >= EARLY_IPC_SAMPLE_COUNT && elapsed_ms < SLOW_IPC_THRESHOLD_MS {
         return;
     }
-    if SLOW_IPC_LOG_COUNT.fetch_add(1, Ordering::Relaxed) >= MAX_SLOW_IPC_LOGS {
+    let ticks_per_second = crate::arch::rtc::ticks_per_second().max(1);
+    let window = crate::arch::rtc::ticks() / ticks_per_second;
+    if !diagnostic_rate_limit_permit(
+        &SLOW_IPC_LOG_RATE_STATE,
+        window,
+        MAX_SLOW_IPC_LOGS_PER_SECOND as u8,
+    ) {
         return;
     }
     log();
+}
+
+pub(super) fn diagnostic_rate_limit_permit(state: &AtomicU64, window: u64, limit: u8) -> bool {
+    if limit == 0 {
+        return false;
+    }
+    const COUNT_BITS: u32 = 8;
+    const COUNT_MASK: u64 = (1_u64 << COUNT_BITS) - 1;
+    let window = window.min(u64::MAX >> COUNT_BITS);
+    loop {
+        let previous = state.load(Ordering::Relaxed);
+        let previous_window = previous >> COUNT_BITS;
+        let previous_count = (previous & COUNT_MASK) as u8;
+        let next = if previous_window != window {
+            (window << COUNT_BITS) | 1
+        } else {
+            if previous_count >= limit {
+                return false;
+            }
+            previous + 1
+        };
+        if state
+            .compare_exchange_weak(previous, next, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            return true;
+        }
+    }
 }
 
 fn log_slow_ipc_call(
@@ -2645,8 +2726,26 @@ mod tests {
             ServiceIpcClass::ReadinessQuery.cap_timeout_ms(u64::MAX),
             rustos_user_abi::performance::IPC_READINESS_QUERY_HARD_LIMIT_MS
         );
+        assert!(!bounded_ipc_call_timeout_is_valid(0));
+        assert!(bounded_ipc_call_timeout_is_valid(
+            rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS
+        ));
+        assert!(!bounded_ipc_call_timeout_is_valid(
+            SERVICE_IPC_TIMEOUT_MS + 1
+        ));
         assert_eq!(ServiceIpcClass::BootControl.cap_timeout_ms(37), 37);
         assert_eq!(ServiceIpcClass::InteractiveControl.cap_timeout_ms(0), 1);
+    }
+
+    #[test]
+    fn diagnostic_rate_limit_is_exact_per_time_window() {
+        let state = AtomicU64::new(u64::MAX);
+        for _ in 0..4 {
+            assert!(diagnostic_rate_limit_permit(&state, 7, 4));
+        }
+        assert!(!diagnostic_rate_limit_permit(&state, 7, 4));
+        assert!(diagnostic_rate_limit_permit(&state, 8, 4));
+        assert!(!diagnostic_rate_limit_permit(&state, 8, 0));
     }
 
     #[test]

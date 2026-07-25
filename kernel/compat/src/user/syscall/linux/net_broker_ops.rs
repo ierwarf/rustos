@@ -1,7 +1,8 @@
 use super::*;
 
 use rustos_user_abi::syscall::{
-    IPC_SERVICE_CAP_NET_POLICY, NET_BROKER_OP_PACKET_RX, NET_BROKER_OP_PACKET_STATUS,
+    IPC_SERVICE_CAP_NET_POLICY, NET_BROKER_OP_PACKET_LEASE_GRANT, NET_BROKER_OP_PACKET_LEASE_RESET,
+    NET_BROKER_OP_PACKET_LEASE_REVOKE, NET_BROKER_OP_PACKET_RX, NET_BROKER_OP_PACKET_STATUS,
     NET_BROKER_OP_PACKET_TX, RustosNetBrokerArgs,
 };
 use x86_64::VirtAddr;
@@ -33,8 +34,44 @@ fn dispatch_net_broker(args: &RustosNetBrokerArgs) -> Result<u64, i64> {
         NET_BROKER_OP_PACKET_STATUS => broker_packet_status(),
         NET_BROKER_OP_PACKET_TX => broker_packet_tx(args),
         NET_BROKER_OP_PACKET_RX => broker_packet_rx(args),
+        NET_BROKER_OP_PACKET_LEASE_GRANT => broker_packet_lease(args, true),
+        NET_BROKER_OP_PACKET_LEASE_REVOKE => broker_packet_lease(args, false),
+        NET_BROKER_OP_PACKET_LEASE_RESET => broker_packet_lease_reset(args),
         _ => Err(LINUX_EINVAL),
     }
+}
+
+fn broker_packet_lease_reset(args: &RustosNetBrokerArgs) -> Result<u64, i64> {
+    if args.arg0 != 0
+        || args.arg1 != 0
+        || args.arg2 != 0
+        || args.arg3 != 0
+        || args.arg4 != 0
+        || args.arg5 != 0
+    {
+        return Err(LINUX_EINVAL);
+    }
+    kernel_io_manager::api::network::reset_dvm_transport_lease();
+    Ok(0)
+}
+
+fn broker_packet_lease(args: &RustosNetBrokerArgs, grant: bool) -> Result<u64, i64> {
+    let generation = u32::try_from(args.arg0).map_err(|_| LINUX_EINVAL)?;
+    if generation == 0
+        || args.arg1 != 0
+        || args.arg2 != 0
+        || args.arg3 != 0
+        || args.arg4 != 0
+        || args.arg5 != 0
+    {
+        return Err(LINUX_EINVAL);
+    }
+    let changed = if grant {
+        kernel_io_manager::api::network::grant_dvm_transport_lease(generation)
+    } else {
+        kernel_io_manager::api::network::revoke_dvm_transport_lease(generation)
+    };
+    if changed { Ok(1) } else { Err(LINUX_ESTALE) }
 }
 
 fn broker_packet_status() -> Result<u64, i64> {

@@ -111,6 +111,11 @@ formal/check-zero-trust-subsystems.sh
     exit 1
 }
 formal/check-performance-contracts.sh
+[[ -x formal/check-kernel-policy-boundary.sh ]] || {
+    echo "kernel policy boundary checker is not executable" >&2
+    exit 1
+}
+formal/check-kernel-policy-boundary.sh
 rg -q 'run-source-conformance\.sh' formal/verify-all.sh || {
     echo "formal PR gate omits source conformance" >&2
     exit 1

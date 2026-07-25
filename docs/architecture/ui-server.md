@@ -73,22 +73,33 @@ the upstream Wayland protocol and client event-loop contracts:
 <https://wayland.freedesktop.org/docs/html/apa.html> and
 <https://wayland.freedesktop.org/docs/html/apb.html>.
 
-The current bounded KVM proof keeps the contract honest: uiserver and the DVM
-relay can remain near the refresh rate while WayClick misses the 55 FPS gate on
-the service-owned AF_UNIX transport. That is an OS transport/scheduling
-performance failure, not permission to add a client-specific compositor path.
-uiserver therefore performs one coalesced present after input, Wayland, and
-runtime damage collection; the retired cursor-only early-present lane must not
-return. A successful real presentation grants one non-accumulating callback
-permit that is consumed before the next present, giving a standard client time
-to draw for the next refresh. Callback-only commits use a separate 16 ms
-cadence, so an invisible or backpressured client cannot create an unbounded
-loop. The rebuilt artifact's final signed capture had one 4.961-second startup
-window, then 20 settled one-second windows at 33.348--45.705 FPS with normally
-1--5 ms compositor callback wait and 0.488--2.074 ms average full-frame
-`wl_shm` copy time. Provider revoke, context loss, and `display not available`
-did not recur, but neither the startup delay nor the steady throughput passes
-its release gate.
+The bounded KVM proof keeps the contract honest without a client-specific
+compositor path. Uiserver performs one coalesced present after input, Wayland,
+and runtime damage collection; the retired cursor-only early-present lane must
+not return. A successful real presentation grants one non-accumulating
+callback permit that is consumed before the next present, giving a standard
+client time to draw for the next refresh. Damage-free callback-only commits use
+the same 15 ms monotonic cadence as DVM GPU presentation, and a pending
+callback deadline participates in the main wait. This removes the 15/16 ms
+beat and prevents the compositor from sleeping past client work while still
+forbidding accumulated timer credit and unbounded callback loops.
+
+The final bounded capture passed the exact sustained 55 FPS gate. Its first
+accepted three contiguous WayClick windows delivered 57, 65, and 68 matched
+commit/callback/release cycles over 3.060 seconds (62.092 FPS aggregate), with
+per-window callback rates of 56.394--67.342 FPS and a 45 ms maximum callback
+gap. The corresponding uiserver and authenticated DVM relay windows also
+passed their FPS, input-loss, cursor, fence-count, and backlog gates. Initial
+window-topology repacking remains separately bounded to 100 ms before the first
+profile window; any later loop above 50 ms still fails acceptance.
+
+Window movement is not a topology change. The retained scene binds each visible
+window identity and atlas source rectangle to one exact GPU layer index, then a
+drag changes only that command's destination rectangle. Position is excluded
+from the structural signature; dimensions, focus, visibility, title, ordering,
+or any binding mismatch still force a fail-closed rebuild. This prevents
+pointer-rate dragging from allocating, rasterizing, comparing, and copying a
+complete 2048x2048 atlas on every motion.
 
 The OS userspace event/readiness boundary is now implemented as a general
 cross-provider wait set rather than a WayClick-specific route. uiserver waits
@@ -188,20 +199,31 @@ WayClick도 일반 client event queue와 blocking dispatch loop를 사용합니�
 `wl_surface.frame` callback은 commit에 연결되는 one-shot이며,
 `wl_buffer.release`를 받은 뒤에만 buffer를 재사용합니다. profile 모드는
 callback마다 대표 redraw를 더 요청할 뿐 protocol이나 GPU 전용 app API를
-바꾸지 않습니다. 현재 KVM에서 uiserver/DVM relay가 refresh rate 근처를
-유지해도 WayClick의 55 FPS gate가 실패하는 것은 AF_UNIX transport와
-scheduler의 OS 성능 실패로 기록하며, client 전용 우회로를 만들 근거로
-삼지 않습니다.
+바꾸지 않습니다.
 uiserver는 input, Wayland, runtime damage를 모은 뒤 한 번만 present하며,
 폐기한 cursor-only early-present 경로를 다시 두지 않습니다. 실제 present
 성공은 누적되지 않는 callback permit 하나를 만들고, 다음 present 전에
 소비해 client가 다음 refresh용 frame을 미리 그릴 시간을 줍니다.
-callback-only commit은 별도 16 ms cadence를 사용합니다. 재빌드한 artifact의
-최종 서명 실행은 4.961초 startup window 하나와, 그 뒤 20개 1초 window에서
-WayClick 33.348--45.705 FPS, 보통 1--5 ms의 compositor callback wait,
-0.488--2.074 ms의 평균 full-frame `wl_shm` copy를 기록했습니다. provider
-revoke, context loss, `display not available`은 재발하지 않았지만 startup
-지연과 정상 운용 55 FPS gate는 모두 실패 상태입니다.
+damage가 없는 callback-only commit은 DVM GPU present와 같은 15 ms
+monotonic cadence를 사용하고, pending callback deadline도 main wait에
+포함됩니다. 따라서 15/16 ms beat와 callback deadline을 넘긴 sleep을
+없애면서 timer credit 누적이나 무제한 callback loop는 허용하지 않습니다.
+
+최종 bounded capture는 sustained 55 FPS gate를 통과했습니다. 최초로
+인정된 연속 3개 WayClick window는 3.060초 동안 commit/callback/release를
+각각 57, 65, 68회 정확히 일치시켜 aggregate 62.092 FPS를 기록했고,
+window별 callback rate는 56.394--67.342 FPS, 최대 callback gap은
+45 ms였습니다. 같은 구간의 uiserver와 인증된 DVM relay도 FPS,
+input-loss, cursor, fence count, backlog gate를 통과했습니다. 첫 profile
+이전의 최초 window-topology repack은 별도 100 ms bound를 적용하고,
+그 이후 50 ms를 넘는 loop는 계속 acceptance 실패입니다.
+
+창 이동은 topology 변경이 아닙니다. retained scene은 각 visible window의
+identity와 atlas source rectangle을 정확한 GPU layer index에 묶고, drag 중에는
+그 command의 destination rectangle만 바꿉니다. 위치는 structural signature에서
+제외하지만 dimensions, focus, visibility, title, ordering이나 binding 불일치는
+fail-closed 전체 rebuild를 강제합니다. 따라서 pointer motion마다 2048x2048
+atlas 전체를 할당, rasterize, 비교, 복사하던 경로는 허용되지 않습니다.
 
 OS userspace event/readiness 경계는 이제 WayClick 전용 경로가 아니라 범용
 cross-provider wait set으로 구현되어 있습니다. uiserver는 Wayland server의

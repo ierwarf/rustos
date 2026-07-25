@@ -7,18 +7,24 @@ Models authenticated control-lease gating for the fixed DVM Ethernet ring.
 Concrete owners and source anchors:
   * L0-authenticated RDI1 session lifecycle:
     libs/driver-domain-host/src/lib.rs
-  * host-owned input-ring receiver and exact epoch ordering:
-    kernel/io-manager/src/input/dvm_frames.rs
-  * ivshmem network gate:
+  * input protocol decoding and lifecycle handoff:
+    services/inputd/src/dvm_protocol.rs
+    services/inputd/src/main.rs
+  * exact service-owned epoch admission and revocation:
+    services/netd/src/main.rs
+  * capability-gated ivshmem transport lease:
     kernel/io-manager/src/io/dvm_network.rs
 
 The Ethernet ivshmem header/counters are intentionally not an authority
 channel: after mapping, the DVM may write its data-plane counters. L0 emits
 RDI1 SESSION_START only after the launch-bound HMAC control handshake and
 SESSION_END while disconnect cleanup is still serialized by the same epoch.
-The model permits arbitrary DVM writes before, during, and after a lease, but
-only a live authenticated lease permits RustOS to accept a network transmit or
-receive. An old cleanup must not revoke a replacement lease.
+Inputd validates that protocol and hands an exact epoch transition to netd over
+a bounded authenticated IPC call. Netd owns lifecycle policy; ring0 only
+enforces the capability-gated transport lease selected by netd. The model
+permits arbitrary DVM writes before, during, and after a lease, but only a live
+authenticated lease permits RustOS to accept a network transmit or receive. An
+old cleanup must not revoke a replacement lease.
 
 This model deliberately abstracts fixed-ring cursor bounds; those are checked
 by dvm-network-ring/DvmNetworkRing. It instead proves the lifecycle condition

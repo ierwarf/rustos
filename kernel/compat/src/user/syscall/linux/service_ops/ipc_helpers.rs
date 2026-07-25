@@ -1,11 +1,14 @@
 use super::*;
 use alloc::collections::VecDeque;
 use alloc::string::String;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 const EARLY_SERVICE_CALL_SAMPLES: usize = 6;
 const SLOW_SERVICE_CALL_THRESHOLD_MS: u64 = 10;
-const MAX_SLOW_SERVICE_CALL_LOGS: usize = 128;
+// Typed service calls share the synchronous debug sink with the generic IPC
+// path. Bound diagnostic work independently to one representative sample per
+// second so the act of reporting overload cannot sustain that overload.
+const MAX_SLOW_SERVICE_CALL_LOGS_PER_SECOND: usize = 1;
 // A readiness probe cannot consume an event: it only transfers authenticated
 // ingress into inputd's policy queue. Bound that safe, idempotent operation so
 // a wedged inputd cannot freeze uiserver's input loop for the generic service
@@ -34,7 +37,8 @@ lazy_static::lazy_static! {
         spin::Mutex::new(VecDeque::new());
 }
 
-static SLOW_SERVICE_CALL_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+static SERVICE_CALL_SAMPLE_COUNT: AtomicUsize = AtomicUsize::new(0);
+static SLOW_SERVICE_CALL_LOG_RATE_STATE: AtomicU64 = AtomicU64::new(u64::MAX);
 
 // RING3-MIGRATION-REFERENCE START: bootstrap-device-route exception: rootd owns
 // the bootstrap manifest/restart policy and loaderd owns normal spawn policy.
@@ -718,16 +722,6 @@ fn validate_vfs_response_envelope(request_op: u16, response: &VfsIpcResponse) ->
     }
     Ok(())
 }
-
-// RING3-MIGRATION-REFERENCE START: bootstrap-device-route exception: vfsd and
-// devmgrd own explicit device path routing. Ring0 keeps this fixed pre-devmgrd
-// mirror set plus IPC/open-fd transfer helper.
-pub fn should_try_devmgrd_open(path: &str) -> bool {
-    ipc_ops::service_registered(IPC_SERVICE_DEVMGRD)
-        && path.starts_with("/dev/")
-        && !matches!(path, "/dev/input" | "/dev/dri")
-}
-// RING3-MIGRATION-REFERENCE END: vfsd/devmgrd device-route substrate exception.
 
 pub fn current_input_device_access(fd: u64) -> Option<(u16, u64)> {
     current_input_device_description(fd).map(|(_, access, flags)| (access, flags))
@@ -1661,11 +1655,17 @@ fn log_slow_service_call(
     status_or_len: i64,
     detail: Option<&str>,
 ) {
-    let sample_index = SLOW_SERVICE_CALL_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    if sample_index >= MAX_SLOW_SERVICE_CALL_LOGS {
+    let sample_index = SERVICE_CALL_SAMPLE_COUNT.fetch_add(1, Ordering::Relaxed);
+    if sample_index >= EARLY_SERVICE_CALL_SAMPLES && elapsed_ms < SLOW_SERVICE_CALL_THRESHOLD_MS {
         return;
     }
-    if sample_index >= EARLY_SERVICE_CALL_SAMPLES && elapsed_ms < SLOW_SERVICE_CALL_THRESHOLD_MS {
+    let ticks_per_second = crate::arch::rtc::ticks_per_second().max(1);
+    let window = crate::arch::rtc::ticks() / ticks_per_second;
+    if !super::super::ipc_ops::diagnostic_rate_limit_permit(
+        &SLOW_SERVICE_CALL_LOG_RATE_STATE,
+        window,
+        MAX_SLOW_SERVICE_CALL_LOGS_PER_SECOND as u8,
+    ) {
         return;
     }
     if let Some(detail) = detail {

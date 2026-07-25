@@ -89,14 +89,14 @@ const SCHED_MAX_BURST_NS: u64 = 20_000_000;
 /// strict-class tasks indefinitely. This is a dispatch-latency rail, not a
 /// CPU-share boost: once the bound expires the oldest ready System task gets
 /// one turn, after which normal weighted vruntime resumes.
-const SYSTEM_READY_LATENCY_BOUND_MS: u64 = 10;
+const SYSTEM_READY_LATENCY_BOUND_MS: u64 = 2;
 /// A ready fair-class task must run soon enough to consume a compositor frame
 /// callback before the following 60 Hz refresh. The bound is per task, not a
 /// class-wide dispatch ratio: one User turn after a System burst can still
 /// become multi-second latency when several services and applications share
-/// that turn. Eight milliseconds leaves drawing and commit headroom inside a
-/// 16.67 ms frame while preserving the stricter IPC handoff path above it.
-const USER_READY_LATENCY_BOUND_MS: u64 = 8;
+/// that turn. Two milliseconds bounds rotation across several clients while
+/// leaving drawing and commit headroom inside a 16.67 ms frame.
+const USER_READY_LATENCY_BOUND_MS: u64 = 2;
 // Initial vruntime offset for newly-spawned tasks relative to current
 // min_vruntime. Keep this near min-granularity: a larger multi-ms penalty
 // leaves freshly spawned services behind polling System peers during boot.

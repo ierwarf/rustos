@@ -13,7 +13,7 @@ pub const DISPLAY_INFO_FLAG_DVM_SCANOUT: u32 = 1 << 2;
 /// This does not expose an application graphics ABI.
 pub const DISPLAY_INFO_FLAG_GPU_COMPOSITOR: u32 = 1 << 3;
 pub const DISPLAY_SURFACE_FLAG_GPU_ATLAS: u32 = 1;
-pub const DISPLAY_GPU_ABI_VERSION: u32 = 3;
+pub const DISPLAY_GPU_ABI_VERSION: u32 = 5;
 pub const DISPLAY_GPU_INFO_FLAG_STAGED_COPY: u32 = 1;
 pub const DISPLAY_GPU_INFO_FLAG_DIRECT_DMABUF: u32 = 1 << 1;
 pub const DISPLAY_GPU_SUBMIT_FLAG_STAGED_COPY: u32 = 1;
@@ -188,11 +188,13 @@ pub struct DisplayGpuDamage {
 pub struct DisplayGpuSubmitRequest {
     pub surface_handle: u32,
     pub flags: u32,
+    /// Reserved in ABI v5. Atlas pixels are written through the exact
+    /// slot-scoped surface mapping before this commit request.
+    pub reserved: u64,
     pub batch_ptr: u64,
     pub batch_len: u32,
     pub damage_count: u32,
     pub damage_ptr: u64,
-    pub reserved: u64,
 }
 
 #[repr(C)]

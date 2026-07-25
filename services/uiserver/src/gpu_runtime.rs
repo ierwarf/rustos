@@ -1,6 +1,7 @@
 use core::mem::size_of;
 use std::collections::VecDeque;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -17,8 +18,9 @@ use crate::gpu_scene::{
     GpuLayerKind, GpuSceneCompiler, GpuSceneError, GpuSceneLayer, GpuTextureCapability,
 };
 use crate::render::{
-    build_gpu_atlas_scene, gpu_cursor_layer, gpu_scene_reuse_signature, update_gpu_cursor_texture,
-    update_wayland_gpu_textures, GpuAtlasScene, WaylandAtlasBinding,
+    build_gpu_atlas_scene, gpu_cursor_layer, gpu_scene_reuse_signature,
+    update_console_gpu_textures, update_gpu_cursor_texture, update_gpu_layer_destinations,
+    update_wayland_gpu_textures, ConsoleAtlasBinding, GpuAtlasScene, WaylandAtlasBinding,
 };
 use crate::sys::{
     debug_line, diag_line, display_create_gpu_atlas_surface, display_get_info,
@@ -32,13 +34,20 @@ const GPU_READY_TIMEOUT: Duration = Duration::from_secs(20);
 const GPU_FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 const GPU_COMPLETION_TIMEOUT: Duration = Duration::from_millis(50);
 const GPU_COMPLETION_POLL: Duration = Duration::from_micros(100);
+const GPU_SLOW_SUBMIT_THRESHOLD: Duration = Duration::from_millis(8);
+const MAX_GPU_SLOW_SUBMIT_LOGS: usize = 24;
+const MAX_RECONSTRUCTION_DAMAGE_NUMERATOR: u64 = 1;
+const MAX_RECONSTRUCTION_DAMAGE_DENOMINATOR: u64 = 8;
 // QEMU has no trustworthy display-vblank clock to export to uiserver yet.
-// Pace the private compositor just above 60 Hz instead of submitting at the
-// input-source rate. A cumulative deadline avoids drift, and missed slots are
-// skipped rather than burst, preserving one bounded frame of backpressure.
-const GPU_FRAME_INTERVAL: Duration = Duration::from_millis(16);
+// Pace the private compositor at 66.7 Hz instead of submitting at the
+// input-source rate. Until the DVM exports a trustworthy vblank deadline, the
+// 1.67 ms lead is the bounded scheduling/render margin needed to complete a
+// nominal 60 Hz frame before scanout. A cumulative deadline avoids drift, and
+// missed slots are skipped rather than burst.
+const GPU_FRAME_INTERVAL: Duration = Duration::from_millis(15);
 const ETIMEDOUT: i32 = 110;
 const EIO: i32 = 5;
+static GPU_SLOW_SUBMIT_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GpuProviderAdmission {
@@ -101,6 +110,7 @@ pub(crate) struct GpuCompositor {
     cursor_motion: CursorMotion,
     retained_scene_signature: u64,
     wayland_bindings: Vec<WaylandAtlasBinding>,
+    console_bindings: Vec<ConsoleAtlasBinding>,
     next_slot: usize,
     next_content_epoch: u64,
     damage_history: VecDeque<AtlasDamageEpoch>,
@@ -367,6 +377,7 @@ impl GpuCompositor {
                 cursor_motion: CursorMotion::stationary(),
                 retained_scene_signature: 0,
                 wayland_bindings: Vec::new(),
+                console_bindings: Vec::new(),
                 next_slot: 0,
                 next_content_epoch: 1,
                 damage_history: VecDeque::with_capacity(info.slot_count as usize + 1),
@@ -380,20 +391,36 @@ impl GpuCompositor {
     }
 
     pub(crate) fn present(&mut self, state: &mut AppState, scene_dirty: bool) -> Result<bool, i32> {
+        let total_started = Instant::now();
         while self.retire_oldest(false)? {}
+        let retire_elapsed = total_started.elapsed();
         let submission_started = Instant::now();
         if self.active && submission_started < self.next_submission_at {
             return Err(EAGAIN);
         }
-        let Some(slot_index) = self.select_submission_slot() else {
+        let Some(slot_index) = self.select_submission_slot()? else {
             // Steady-state completion waits never own the UI thread. The
             // retained update is retried after the next input/Wayland turn.
             return Err(EAGAIN);
         };
+        let prepare_started = Instant::now();
+        let mut rebuild_allocate_elapsed = Duration::ZERO;
+        let mut rebuild_scene_elapsed = Duration::ZERO;
+        let mut rebuild_difference_elapsed = Duration::ZERO;
         let mut damage = Vec::new();
         let current_scene_signature = gpu_scene_reuse_signature(state);
         let mut full_rebuild = !self.active
             || (scene_dirty && current_scene_signature != self.retained_scene_signature);
+        if scene_dirty && !full_rebuild {
+            if !update_gpu_layer_destinations(
+                state,
+                self.layers.as_mut_slice(),
+                self.wayland_bindings.as_slice(),
+                self.console_bindings.as_slice(),
+            ) {
+                full_rebuild = true;
+            }
+        }
         if scene_dirty && !full_rebuild {
             match update_wayland_gpu_textures(
                 state,
@@ -408,14 +435,31 @@ impl GpuCompositor {
                 Some(changed) => damage.extend(changed.into_iter().map(damage_from_rect)),
                 None => full_rebuild = true,
             }
+            if !full_rebuild {
+                match update_console_gpu_textures(
+                    state,
+                    self.atlas.as_mut_slice(),
+                    self.info.atlas_stride_bytes as usize / size_of::<u32>(),
+                    self.console_bindings.as_mut_slice(),
+                )
+                .map_err(gpu_scene_errno)?
+                {
+                    Some(changed) => damage.extend(changed.into_iter().map(damage_from_rect)),
+                    None => full_rebuild = true,
+                }
+            }
         }
         if full_rebuild {
+            let allocate_started = Instant::now();
             let mut next_atlas = vec![0_u32; self.atlas.len()];
+            rebuild_allocate_elapsed = allocate_started.elapsed();
             let capability = self.capability_for_slot(slot_index, self.next_content_epoch)?;
+            let scene_started = Instant::now();
             let GpuAtlasScene {
                 layers,
                 cursor_source_rect,
                 wayland_bindings,
+                console_bindings,
             } = match build_gpu_atlas_scene(
                 state,
                 next_atlas.as_mut_slice(),
@@ -438,17 +482,34 @@ impl GpuCompositor {
                 }
                 Err(err) => return Err(gpu_scene_errno(err)),
             };
-            damage = vec![DvmGpuAtlasDamage {
-                x: 0,
-                y: 0,
-                width: self.info.atlas_width,
-                height: self.info.atlas_height,
-            }];
+            rebuild_scene_elapsed = scene_started.elapsed();
+            let difference_started = Instant::now();
+            damage = if self.active {
+                difference_bounds(
+                    self.atlas.as_slice(),
+                    next_atlas.as_slice(),
+                    self.info.atlas_width as usize,
+                    self.info.atlas_height as usize,
+                    self.info.atlas_stride_bytes as usize / size_of::<u32>(),
+                )
+                .map(damage_from_rect)
+                .into_iter()
+                .collect()
+            } else {
+                vec![DvmGpuAtlasDamage {
+                    x: 0,
+                    y: 0,
+                    width: self.info.atlas_width,
+                    height: self.info.atlas_height,
+                }]
+            };
+            rebuild_difference_elapsed = difference_started.elapsed();
             self.atlas = next_atlas;
             self.layers = layers;
             self.cursor_source_rect = Some(cursor_source_rect);
             self.cursor_motion = state.cursor_motion;
             self.wayland_bindings = wayland_bindings;
+            self.console_bindings = console_bindings;
             self.retained_scene_signature = gpu_scene_reuse_signature(state);
         } else if state.cursor_motion != self.cursor_motion {
             let cursor_source_rect = self.cursor_source_rect.ok_or(EINVAL)?;
@@ -496,27 +557,70 @@ impl GpuCompositor {
         // a partial patch would expose stale or zero pixels and visibly
         // alternate complete/incomplete frames.  Fail over to a complete
         // snapshot until the selected slot is the exact predecessor.
+        let retained_epoch = self.slots[slot_index].content_epoch;
+        let source_damage_pixels = damage.iter().fold(0_u64, |total, rect| {
+            total.saturating_add(u64::from(rect.width) * u64::from(rect.height))
+        });
         let submit_damage = snapshot_damage_for_slot(
-            self.slots[slot_index].content_epoch,
+            retained_epoch,
             self.next_content_epoch,
             damage.as_slice(),
             &self.damage_history,
             self.info.atlas_width,
             self.info.atlas_height,
         )?;
-        copy_damage_to_slot(
+        let prepare_elapsed = prepare_started.elapsed();
+        let surface_handle = self.slots[slot_index].surface.handle;
+        let copy_started = Instant::now();
+        copy_atlas_damage_to_slot(
+            self.slots[slot_index].mapping.pixels_mut(),
             self.atlas.as_slice(),
-            &mut self.slots[slot_index].mapping,
             self.info.atlas_stride_bytes as usize / size_of::<u32>(),
             submit_damage.as_slice(),
+            self.info.atlas_width,
+            self.info.atlas_height,
         )?;
-        let surface_handle = self.slots[slot_index].surface.handle;
+        let copy_elapsed = copy_started.elapsed();
+        let submit_started = Instant::now();
         display_gpu_submit(
             self.display_fd,
             surface_handle,
             submit_damage.as_slice(),
             encoded.as_slice(),
         )?;
+        let submit_elapsed = submit_started.elapsed();
+        let total_elapsed = total_started.elapsed();
+        if total_elapsed >= GPU_SLOW_SUBMIT_THRESHOLD
+            && GPU_SLOW_SUBMIT_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < MAX_GPU_SLOW_SUBMIT_LOGS
+        {
+            let damage_pixels = submit_damage.iter().fold(0_u64, |total, rect| {
+                total.saturating_add(u64::from(rect.width) * u64::from(rect.height))
+            });
+            let history_first = self.damage_history.front().map_or(0, |entry| entry.epoch);
+            let history_last = self.damage_history.back().map_or(0, |entry| entry.epoch);
+            diag_line(format!(
+                "uiserver: slow gpu submit total_us={} retire_us={} prepare_us={} rebuild_allocate_us={} rebuild_scene_us={} rebuild_difference_us={} copy_us={} ioctl_us={} damage_rects={} damage_pixels={} source_damage_pixels={} full_rebuild={} slot={} retained_epoch={} current_epoch={} history={}..{} batch_bytes={} pending={}",
+                total_elapsed.as_micros(),
+                retire_elapsed.as_micros(),
+                prepare_elapsed.as_micros(),
+                rebuild_allocate_elapsed.as_micros(),
+                rebuild_scene_elapsed.as_micros(),
+                rebuild_difference_elapsed.as_micros(),
+                copy_elapsed.as_micros(),
+                submit_elapsed.as_micros(),
+                submit_damage.len(),
+                damage_pixels,
+                source_damage_pixels,
+                full_rebuild,
+                slot_index,
+                retained_epoch,
+                self.next_content_epoch,
+                history_first,
+                history_last,
+                encoded.len(),
+                self.pending.len(),
+            ));
+        }
         self.slots[slot_index].content_epoch = self.next_content_epoch;
         self.pending.push(PendingGpuFrame {
             slot_index,
@@ -562,8 +666,8 @@ impl GpuCompositor {
     /// snapshot. Reusing it is safe only after the DVM completion releases
     /// that slot, and lets ordinary cursor/damage updates stay incremental
     /// instead of forcing a full atlas copy on every round-robin turn.
-    fn select_submission_slot(&self) -> Option<usize> {
-        let predecessor = self.next_content_epoch.checked_sub(1)?;
+    fn select_submission_slot(&self) -> Result<Option<usize>, i32> {
+        let predecessor = self.next_content_epoch.checked_sub(1).ok_or(EINVAL)?;
         let is_pending = |slot_index| {
             self.pending
                 .iter()
@@ -572,12 +676,42 @@ impl GpuCompositor {
         for offset in 0..self.slots.len() {
             let slot_index = (self.next_slot + offset) % self.slots.len();
             if !is_pending(slot_index) && self.slots[slot_index].content_epoch == predecessor {
-                return Some(slot_index);
+                return Ok(Some(slot_index));
             }
         }
-        (0..self.slots.len())
-            .map(|offset| (self.next_slot + offset) % self.slots.len())
-            .find(|&slot_index| !is_pending(slot_index))
+        if !self.active {
+            return Ok((0..self.slots.len())
+                .map(|offset| (self.next_slot + offset) % self.slots.len())
+                .find(|&slot_index| !is_pending(slot_index)));
+        }
+
+        let mut best = None;
+        for offset in 0..self.slots.len() {
+            let slot_index = (self.next_slot + offset) % self.slots.len();
+            if is_pending(slot_index) {
+                continue;
+            }
+            let reconstruction = snapshot_damage_for_slot(
+                self.slots[slot_index].content_epoch,
+                self.next_content_epoch,
+                &[],
+                &self.damage_history,
+                self.info.atlas_width,
+                self.info.atlas_height,
+            )?;
+            let pixels = damage_pixel_count(reconstruction.as_slice());
+            if !reconstruction_damage_within_budget(
+                pixels,
+                self.info.atlas_width,
+                self.info.atlas_height,
+            ) {
+                continue;
+            }
+            if best.is_none_or(|(_, best_pixels)| pixels < best_pixels) {
+                best = Some((slot_index, pixels));
+            }
+        }
+        Ok(best.map(|(slot_index, _)| slot_index))
     }
 
     pub(crate) fn poll_completions(&mut self) -> Result<(), i32> {
@@ -699,6 +833,105 @@ fn damage_from_rect(rect: Rect) -> DvmGpuAtlasDamage {
     }
 }
 
+fn damage_pixel_count(damage: &[DvmGpuAtlasDamage]) -> u64 {
+    damage.iter().fold(0_u64, |total, rect| {
+        total.saturating_add(u64::from(rect.width) * u64::from(rect.height))
+    })
+}
+
+fn reconstruction_damage_within_budget(pixels: u64, atlas_width: u32, atlas_height: u32) -> bool {
+    let atlas_pixels = u64::from(atlas_width).saturating_mul(u64::from(atlas_height));
+    pixels.saturating_mul(MAX_RECONSTRUCTION_DAMAGE_DENOMINATOR)
+        <= atlas_pixels.saturating_mul(MAX_RECONSTRUCTION_DAMAGE_NUMERATOR)
+}
+
+fn copy_atlas_damage_to_slot(
+    destination: &mut [u32],
+    source: &[u32],
+    stride_pixels: usize,
+    damage: &[DvmGpuAtlasDamage],
+    atlas_width: u32,
+    atlas_height: u32,
+) -> Result<(), i32> {
+    let required = stride_pixels
+        .checked_mul(atlas_height as usize)
+        .ok_or(EINVAL)?;
+    if stride_pixels < atlas_width as usize
+        || destination.len() < required
+        || source.len() < required
+    {
+        return Err(EINVAL);
+    }
+    validate_damage(damage, atlas_width, atlas_height)?;
+    let mut used_streaming_store = false;
+    for rect in damage {
+        let width = rect.width as usize;
+        let x = rect.x as usize;
+        for row in rect.y as usize..(rect.y + rect.height) as usize {
+            let start = row
+                .checked_mul(stride_pixels)
+                .and_then(|offset| offset.checked_add(x))
+                .ok_or(EINVAL)?;
+            let end = start.checked_add(width).ok_or(EINVAL)?;
+            let destination_row = destination.get_mut(start..end).ok_or(EINVAL)?;
+            let source_row = source.get(start..end).ok_or(EINVAL)?;
+            used_streaming_store |=
+                copy_row_to_write_combining_mapping(destination_row, source_row);
+        }
+    }
+    finish_write_combining_copy(used_streaming_store);
+    Ok(())
+}
+
+fn copy_row_to_write_combining_mapping(destination: &mut [u32], source: &[u32]) -> bool {
+    debug_assert_eq!(destination.len(), source.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SSE2 is mandatory on x86-64. Streaming stores avoid the read-for-
+        // ownership traffic and cache pollution caused by a normal memcpy into
+        // the write-combine atlas aperture. Keep tiny damage on the compiler's
+        // scalar/vector copy path; setup and the final fence cost more there.
+        const STREAMING_STORE_MIN_PIXELS: usize = 64;
+        if destination.len() >= STREAMING_STORE_MIN_PIXELS {
+            use core::arch::x86_64::{__m128i, _mm_loadu_si128, _mm_stream_si128};
+
+            let alignment_pixels =
+                ((16 - (destination.as_mut_ptr() as usize & 15)) & 15) / size_of::<u32>();
+            let prefix = alignment_pixels.min(destination.len());
+            destination[..prefix].copy_from_slice(&source[..prefix]);
+
+            let mut index = prefix;
+            while index + 4 <= destination.len() {
+                // SAFETY: `index + 4` is bounded above. The source load may be
+                // unaligned; the destination prefix makes every streaming
+                // store 16-byte aligned as required by `_mm_stream_si128`.
+                unsafe {
+                    let value = _mm_loadu_si128(source.as_ptr().add(index).cast::<__m128i>());
+                    _mm_stream_si128(destination.as_mut_ptr().add(index).cast::<__m128i>(), value);
+                }
+                index += 4;
+            }
+            destination[index..].copy_from_slice(&source[index..]);
+            return true;
+        }
+    }
+
+    destination.copy_from_slice(source);
+    false
+}
+
+fn finish_write_combining_copy(used_streaming_store: bool) {
+    #[cfg(target_arch = "x86_64")]
+    if used_streaming_store {
+        // SAFETY: SSE2 is part of the x86-64 baseline. The fence makes all
+        // non-temporal slot writes globally visible before the commit ioctl
+        // publishes the generation and signals the DVM.
+        unsafe {
+            core::arch::x86_64::_mm_sfence();
+        }
+    }
+}
+
 fn snapshot_damage_for_slot(
     retained_epoch: u64,
     current_epoch: u64,
@@ -723,7 +956,7 @@ fn snapshot_damage_for_slot(
     }
 
     let mut expected_epoch = retained_epoch.checked_add(1).ok_or(EINVAL)?;
-    let mut union = None;
+    let mut accumulated = Vec::new();
     for entry in history {
         if entry.epoch < expected_epoch {
             continue;
@@ -734,19 +967,23 @@ fn snapshot_damage_for_slot(
         if entry.epoch != expected_epoch {
             return Ok(full_atlas_damage(atlas_width, atlas_height));
         }
-        accumulate_damage(
-            &mut union,
+        if !accumulate_damage(
+            &mut accumulated,
             entry.damage.as_slice(),
             atlas_width,
             atlas_height,
-        )?;
+        )? {
+            return Ok(full_atlas_damage(atlas_width, atlas_height));
+        }
         expected_epoch = expected_epoch.checked_add(1).ok_or(EINVAL)?;
     }
     if expected_epoch != current_epoch {
         return Ok(full_atlas_damage(atlas_width, atlas_height));
     }
-    accumulate_damage(&mut union, requested, atlas_width, atlas_height)?;
-    Ok(union.into_iter().collect())
+    if !accumulate_damage(&mut accumulated, requested, atlas_width, atlas_height)? {
+        return Ok(full_atlas_damage(atlas_width, atlas_height));
+    }
+    Ok(accumulated)
 }
 
 fn full_atlas_damage(atlas_width: u32, atlas_height: u32) -> Vec<DvmGpuAtlasDamage> {
@@ -774,57 +1011,48 @@ fn validate_damage(
 }
 
 fn accumulate_damage(
-    union: &mut Option<DvmGpuAtlasDamage>,
+    accumulated: &mut Vec<DvmGpuAtlasDamage>,
     damage: &[DvmGpuAtlasDamage],
     atlas_width: u32,
     atlas_height: u32,
-) -> Result<(), i32> {
+) -> Result<bool, i32> {
     validate_damage(damage, atlas_width, atlas_height)?;
     for rect in damage {
-        let right = rect.x.checked_add(rect.width).ok_or(EINVAL)?;
-        let bottom = rect.y.checked_add(rect.height).ok_or(EINVAL)?;
-        *union = Some(match *union {
-            Some(current) => {
-                let current_right = current.x.checked_add(current.width).ok_or(EINVAL)?;
-                let current_bottom = current.y.checked_add(current.height).ok_or(EINVAL)?;
-                let x = current.x.min(rect.x);
-                let y = current.y.min(rect.y);
-                DvmGpuAtlasDamage {
-                    x,
-                    y,
-                    width: current_right.max(right).checked_sub(x).ok_or(EINVAL)?,
-                    height: current_bottom.max(bottom).checked_sub(y).ok_or(EINVAL)?,
-                }
+        let mut merged = *rect;
+        let mut index = 0;
+        while index < accumulated.len() {
+            if accumulated[index].overlaps(merged) {
+                merged = damage_union(accumulated.remove(index), merged)?;
+                // The larger union may now overlap an earlier rectangle.
+                index = 0;
+            } else {
+                index += 1;
             }
-            None => *rect,
-        });
-    }
-    Ok(())
-}
-
-fn copy_damage_to_slot(
-    atlas: &[u32],
-    mapping: &mut SurfaceMapping,
-    stride: usize,
-    damage: &[DvmGpuAtlasDamage],
-) -> Result<(), i32> {
-    let destination = mapping.pixels_mut();
-    for rect in damage {
-        let x = rect.x as usize;
-        let width = rect.width as usize;
-        for y in rect.y as usize..(rect.y + rect.height) as usize {
-            let start = y
-                .checked_mul(stride)
-                .and_then(|offset| offset.checked_add(x))
-                .ok_or(EINVAL)?;
-            let end = start.checked_add(width).ok_or(EINVAL)?;
-            destination
-                .get_mut(start..end)
-                .ok_or(EINVAL)?
-                .copy_from_slice(atlas.get(start..end).ok_or(EINVAL)?);
+        }
+        accumulated.push(merged);
+        if accumulated.len() > driver_domain_protocol::DVM_GPU_ATLAS_MAX_DAMAGE_RECTS as usize {
+            return Ok(false);
         }
     }
-    Ok(())
+    Ok(true)
+}
+
+fn damage_union(
+    left: DvmGpuAtlasDamage,
+    right: DvmGpuAtlasDamage,
+) -> Result<DvmGpuAtlasDamage, i32> {
+    let left_right = left.x.checked_add(left.width).ok_or(EINVAL)?;
+    let left_bottom = left.y.checked_add(left.height).ok_or(EINVAL)?;
+    let right_right = right.x.checked_add(right.width).ok_or(EINVAL)?;
+    let right_bottom = right.y.checked_add(right.height).ok_or(EINVAL)?;
+    let x = left.x.min(right.x);
+    let y = left.y.min(right.y);
+    Ok(DvmGpuAtlasDamage {
+        x,
+        y,
+        width: left_right.max(right_right).checked_sub(x).ok_or(EINVAL)?,
+        height: left_bottom.max(right_bottom).checked_sub(y).ok_or(EINVAL)?,
+    })
 }
 
 fn gpu_scene_errno(_error: GpuSceneError) -> i32 {
@@ -834,9 +1062,10 @@ fn gpu_scene_errno(_error: GpuSceneError) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        difference_bounds, gpu_provider_admission, next_frame_deadline, snapshot_damage_for_slot,
-        AtlasDamageEpoch, DvmGpuAtlasDamage, GpuProviderAdmission, Rect,
-        DISPLAY_INFO_FLAG_DVM_SCANOUT, DISPLAY_INFO_FLAG_GPU_COMPOSITOR, GPU_FRAME_INTERVAL,
+        copy_atlas_damage_to_slot, difference_bounds, gpu_provider_admission, next_frame_deadline,
+        reconstruction_damage_within_budget, snapshot_damage_for_slot, AtlasDamageEpoch,
+        DvmGpuAtlasDamage, GpuProviderAdmission, Rect, DISPLAY_INFO_FLAG_DVM_SCANOUT,
+        DISPLAY_INFO_FLAG_GPU_COMPOSITOR, GPU_FRAME_INTERVAL,
     };
     use crate::sys::DisplayInfo;
     use std::collections::VecDeque;
@@ -914,7 +1143,7 @@ mod tests {
         );
         assert_eq!(
             next_frame_deadline(origin, origin + Duration::from_millis(49)),
-            origin + Duration::from_millis(64)
+            origin + Duration::from_millis(60)
         );
     }
 
@@ -930,6 +1159,47 @@ mod tests {
             snapshot_damage_for_slot(8, 9, &requested, &VecDeque::new(), 1600, 900),
             Ok(requested.to_vec())
         );
+    }
+
+    #[test]
+    fn slot_mapping_copy_changes_only_validated_damage() {
+        let source = (0_u32..32).collect::<Vec<_>>();
+        let mut destination = vec![u32::MAX; 32];
+        let damage = [DvmGpuAtlasDamage {
+            x: 2,
+            y: 1,
+            width: 3,
+            height: 2,
+        }];
+        copy_atlas_damage_to_slot(&mut destination, &source, 8, &damage, 8, 4)
+            .expect("copy bounded atlas damage");
+        for index in 0..32 {
+            let x = index % 8;
+            let y = index / 8;
+            if (2..5).contains(&x) && (1..3).contains(&y) {
+                assert_eq!(destination[index], source[index]);
+            } else {
+                assert_eq!(destination[index], u32::MAX);
+            }
+        }
+    }
+
+    #[test]
+    fn slot_mapping_streams_large_unaligned_rows_exactly() {
+        let source = (0_u32..257).collect::<Vec<_>>();
+        let mut allocation = vec![u32::MAX; 258];
+        let destination = &mut allocation[1..258];
+        let damage = [DvmGpuAtlasDamage {
+            x: 1,
+            y: 0,
+            width: 255,
+            height: 1,
+        }];
+        copy_atlas_damage_to_slot(destination, &source, 257, &damage, 257, 1)
+            .expect("stream bounded atlas damage");
+        assert_eq!(destination[0], u32::MAX);
+        assert_eq!(&destination[1..256], &source[1..256]);
+        assert_eq!(destination[256], u32::MAX);
     }
 
     #[test]
@@ -986,12 +1256,62 @@ mod tests {
         }];
         assert_eq!(
             snapshot_damage_for_slot(6, 9, &requested, &history, 1600, 900),
+            Ok(vec![
+                DvmGpuAtlasDamage {
+                    x: 10,
+                    y: 20,
+                    width: 4,
+                    height: 5,
+                },
+                DvmGpuAtlasDamage {
+                    x: 30,
+                    y: 40,
+                    width: 6,
+                    height: 7,
+                },
+                DvmGpuAtlasDamage {
+                    x: 50,
+                    y: 60,
+                    width: 8,
+                    height: 9,
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn snapshot_damage_merges_only_overlapping_history() {
+        let history = VecDeque::from([AtlasDamageEpoch {
+            epoch: 2,
+            damage: vec![DvmGpuAtlasDamage {
+                x: 10,
+                y: 10,
+                width: 10,
+                height: 10,
+            }],
+        }]);
+        let requested = [DvmGpuAtlasDamage {
+            x: 15,
+            y: 15,
+            width: 10,
+            height: 10,
+        }];
+        assert_eq!(
+            snapshot_damage_for_slot(1, 3, &requested, &history, 1600, 900),
             Ok(vec![DvmGpuAtlasDamage {
                 x: 10,
-                y: 20,
-                width: 48,
-                height: 49,
+                y: 10,
+                width: 15,
+                height: 15,
             }])
         );
+    }
+
+    #[test]
+    fn slot_reconstruction_budget_rejects_atlas_amplification() {
+        assert!(reconstruction_damage_within_budget(100 * 100, 1600, 900));
+        assert!(reconstruction_damage_within_budget(180_000, 1600, 900));
+        assert!(!reconstruction_damage_within_budget(180_001, 1600, 900));
+        assert!(!reconstruction_damage_within_budget(1600 * 900, 1600, 900));
     }
 }

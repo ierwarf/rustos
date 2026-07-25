@@ -5,9 +5,13 @@ EXTENDS Naturals, Sequences, FiniteSets
 Models DVM input-session revocation.
 
 Concrete owners and source anchors:
-  * RDI3 epoch replacement: kernel/io-manager/src/input/dvm_frames.rs
-  * priority reset queue barrier: kernel/io-manager/src/input/event_queue.rs
-  * reset-wire admission and synthetic key releases: services/inputd/src/main.rs
+  * raw transport-generation reset barrier:
+      kernel/io-manager/src/input/dvm_ring.rs
+  * RDI3 epoch replacement and priority queue reset:
+      services/inputd/src/dvm_protocol.rs
+      services/inputd/src/main.rs
+  * reset-wire admission and synthetic key releases:
+      services/inputd/src/main.rs
   * provider key-state reset: drivers/libs/keyboard-core/src/lib.rs
 
 The model abstracts frame CRC/serial parsing and mouse motion. A queued key

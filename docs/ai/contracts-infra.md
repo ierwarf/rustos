@@ -218,7 +218,10 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
 
 - `cargo xtask config check` validates effective config.
 - `cargo xtask config show` prints effective kernel build config.
-- Driver module loading must be stable across `codegen_units=1..=256` × `opt_level=0..=3` sweep. Loader policy may ignore relocations targeting non-loaded or non-ALLOC debug sections; loaded text/data relocations must still resolve through explicit ABI surfaces.
+- RustOS has no loadable kernel-module code-generation matrix. Linux DVM
+  modules are built and signed only by the DVM build plan; RustOS release
+  validation instead proves the retired module syscalls remain `ENOSYS` across
+  supported optimization profiles.
 - Linux compat load failures: write first disallowed/unresolved external symbol to debugcon directly. **Do not** rely only on category-filtered logs for module ABI diagnostics.
 
 ## KVM Launch
@@ -270,7 +273,8 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
   vsock CID `4`. L0 then attaches as the fixed ivshmem peer 1 only after
   RustOS has claimed peer 0, writes only fixed RDI3 session/key/pointer frames
   into the host-owned 128 KiB input ring, and signals the one RustOS MSI-X
-  eventfd; QMP is not launched and the DVM never maps that aperture. The DVM
+  eventfd at most once per inputd-published consumer wake generation; QMP is
+  not launched and the DVM never maps that aperture. The DVM
   discovers one keyboard and one relative or absolute pointer by evdev capabilities, not
   by a QEMU product name. A guest that exits or merely starts cannot pass. The
   smoke proves endpoint setup only: it does not fabricate an input event. A
@@ -283,9 +287,9 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
   ingress markers. The composite device advertises pointer selection capability,
   emits one non-printable F12 keyboard proof, then emits pointer-only absolute positions;
   it never emits printable keys or clicks. It traces a 192-pixel axis-aligned
-  square for 4,000 cycles (a bounded 40-second source window that covers the
+  square for 2,667 cycles (a bounded 40-second source window that covers the
   public 30-second gate plus guest admission), with source polling no faster
-  than 10 ms. After L0 authenticates and requests the input stream, the agent
+  than 15 ms. After L0 authenticates and requests the input stream, the agent
   admits only that live streaming interval to guest `SCHED_RR` priority 10 and
   first installs a 50 ms soft/100 ms hard `RLIMIT_RTTIME` continuous-CPU
   ceiling. It reads the policy and priority back, fails the stream closed if
@@ -299,9 +303,15 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
   the same 50/100 ms continuous-CPU ceiling, verifies the installed policy,
   and restores it on every relay exit; display therefore cannot outrank the
   priority-10 input relay or retain realtime authority while retrying. A
-  `--min-ui-fps` proof requires three consecutive active one-second windows at
-  the requested uiserver and DVM rate, at least 55 accepted events and 50
-  presented cursor moves, zero loss/slow/error/backlog, at most 50 ms input
+  `--min-ui-fps` proof requires three consecutive active one-second uiserver
+  and DVM windows at the requested rate. WayClick must reach the requested
+  exact aggregate callback and commit rate across the same contiguous window
+  count, every constituent window must reach at least 80% of that rate, and
+  every commit/callback/release count must balance. Across the same contiguous
+  uiserver input windows, exact aggregate rates must reach 55 accepted
+  events/s and 50 presented cursor moves/s, and every constituent window must
+  retain at least 80% of each rate. It also requires zero
+  loss/slow/error/backlog, at most 50 ms input
   gap/age, exact logical/presented cursor agreement, and at least 96 pixels of
   travel on both axes. An absent or dropped sample fails the gate. No QMP
   socket, host-to-DVM input RPC, or production default path is added.
@@ -323,6 +333,10 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
   equal-length disabled anchor `RUSTOS_UI_PROFILE=0`, which is changed to `1`
   without changing its extent length. `uiserver` emits one-second profile
   windows with integer `frame_hz_milli`; the runner requires `N * 1000`.
+  WayClick publishes exact counts and elapsed milliseconds, so its aggregate
+  acceptance is calculated from totals instead of rounded, phase-sensitive
+  one-second sample rates; the 80% per-window floor and 50 ms maximum callback
+  gap prevent bursts from masking a stall.
   Release images retain the disabled value.
 - Every KVM smoke now attaches `virtio-gpu-gl-pci` to the Linux DVM and uses
   virgl through the exact AMD `/dev/dri/renderD128` host render node. The

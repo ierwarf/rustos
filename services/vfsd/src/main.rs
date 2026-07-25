@@ -1011,6 +1011,7 @@ fn device_access_for_path(path: &str) -> u64 {
     match path {
         "/dev/input0" => rustos_user_abi::syscall::INPUTD_ACCESS_NATIVE as u64,
         "/dev/input/event0" => rustos_user_abi::syscall::INPUTD_ACCESS_EVDEV as u64,
+        "/dev/dri/card0" => rustos_user_abi::syscall::VFS_DEVICE_ACCESS_DRM_COMPAT as u64,
         _ => 0,
     }
 }

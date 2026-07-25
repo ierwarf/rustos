@@ -8,9 +8,12 @@ use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering,
 
 use driver_domain_protocol::{
     DVM_INPUT_RING_APERTURE_BYTES, DVM_INPUT_RING_CONSUMER_OFFSET,
-    DVM_INPUT_RING_FLAG_POLICY_CONSUMER_READY, DVM_INPUT_RING_FLAG_RUSTOS_READY,
-    DVM_INPUT_RING_FLAGS_OFFSET, DVM_INPUT_RING_PRODUCER_OFFSET, DVM_INPUT_RING_RECORD_BYTES,
-    DVM_INPUT_RING_SLOT_COUNT, DvmInputRingHeader,
+    DVM_INPUT_RING_CONSUMER_WAKE_GENERATION_OFFSET, DVM_INPUT_RING_FLAG_POLICY_CONSUMER_READY,
+    DVM_INPUT_RING_FLAG_RUSTOS_READY, DVM_INPUT_RING_FLAGS_OFFSET, DVM_INPUT_RING_PRODUCER_OFFSET,
+    DVM_INPUT_RING_RECORD_BYTES, DVM_INPUT_RING_SLOT_COUNT, DvmInputRingHeader,
+};
+use rustos_user_abi::syscall::{
+    INPUTD_DVM_RECORD_BYTES, INPUTD_DVM_RECORD_FLAG_RESET, InputDvmRecordWire,
 };
 
 const IVSHMEM_VENDOR_ID: u16 = 0x1af4;
@@ -53,6 +56,13 @@ static IRQ_PENDING: AtomicBool = AtomicBool::new(false);
 static SHARED_ADDR: AtomicUsize = AtomicUsize::new(0);
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 static CONSUMER: AtomicU64 = AtomicU64::new(0);
+static CONSUMER_WAKE_GENERATION: AtomicU64 = AtomicU64::new(0);
+/// Non-zero when inputd must observe a revocation barrier before any record
+/// from a later transport generation. The broker consumes this atomically.
+static RESET_PENDING_GENERATION: AtomicU64 = AtomicU64::new(0);
+static BROKER_CALLS: AtomicU64 = AtomicU64::new(0);
+static RECORDS_COPIED: AtomicU64 = AtomicU64::new(0);
+static REVOKE_COUNT: AtomicU64 = AtomicU64::new(0);
 
 const INSTALL_REJECTION_NONE: u8 = 0;
 const INSTALL_REJECTION_ATTACH_BUDGET: u8 = 1;
@@ -150,6 +160,7 @@ fn try_install_serialized() -> bool {
     SHARED_ADDR.store(ring.mapped as usize, Ordering::Release);
     GENERATION.store(ring.header.generation, Ordering::Release);
     CONSUMER.store(ring.header.consumer, Ordering::Release);
+    CONSUMER_WAKE_GENERATION.store(ring.header.consumer_wake_generation, Ordering::Release);
     INSTALLED.store(true, Ordering::Release);
     crate::debug::info!(
         input,
@@ -205,18 +216,41 @@ fn admitted_policy_ready_flags(flags: u32) -> Option<u32> {
 /// Drain a bounded batch only on inputd's broker call. The interrupt callback
 /// merely wakes a sleeping poll waiter; it cannot parse a DVM frame or acquire
 /// the decoder lock.
-pub(crate) fn service_pending() -> usize {
-    if !INSTALLED.load(Ordering::Acquire) && !try_install() {
+pub(crate) fn service_pending(dest: &mut [InputDvmRecordWire]) -> usize {
+    BROKER_CALLS.fetch_add(1, Ordering::Relaxed);
+    if dest.is_empty() {
         return 0;
+    }
+    let reset_generation = RESET_PENDING_GENERATION.swap(0, Ordering::AcqRel);
+    let mut written = 0;
+    if reset_generation != 0 {
+        dest[0] = InputDvmRecordWire {
+            transport_generation: reset_generation,
+            flags: INPUTD_DVM_RECORD_FLAG_RESET,
+            len: 0,
+            reserved0: 0,
+            bytes: [0; INPUTD_DVM_RECORD_BYTES],
+        };
+        written = 1;
+        if written == dest.len() {
+            RECORDS_COPIED.fetch_add(1, Ordering::Relaxed);
+            return written;
+        }
+    }
+    if !INSTALLED.load(Ordering::Acquire) && !try_install() {
+        RECORDS_COPIED.fetch_add(written as u64, Ordering::Relaxed);
+        return written;
     }
     let mapped = SHARED_ADDR.load(Ordering::Acquire) as *mut u8;
     if mapped.is_null() {
-        return 0;
+        RECORDS_COPIED.fetch_add(written as u64, Ordering::Relaxed);
+        return written;
     }
     let _ = IRQ_PENDING.swap(false, Ordering::AcqRel);
     let Some(header) = read_header(mapped) else {
         revoke("header-invalid");
-        return 0;
+        RECORDS_COPIED.fetch_add(written as u64, Ordering::Relaxed);
+        return written;
     };
     let generation = GENERATION.load(Ordering::Acquire);
     let mut consumer = CONSUMER.load(Ordering::Acquire);
@@ -226,14 +260,15 @@ pub(crate) fn service_pending() -> usize {
         || header.producer.saturating_sub(consumer) > u64::from(DVM_INPUT_RING_SLOT_COUNT)
     {
         revoke("cursor-or-generation-invalid");
-        return 0;
+        RECORDS_COPIED.fetch_add(written as u64, Ordering::Relaxed);
+        return written;
     }
     // Pairs with L0's release fence before it advances `producer`. No record
     // bytes may be observed before the validated cursor becomes visible.
     fence(Ordering::Acquire);
     let available = header.producer - consumer;
-    let count = available.min(MAX_RECORDS_PER_BROKER_TURN);
-    let mut accepted = 0;
+    let capacity = (dest.len() - written) as u64;
+    let count = available.min(MAX_RECORDS_PER_BROKER_TURN).min(capacity);
     for _ in 0..count {
         let Some(offset) = DvmInputRingHeader::record_offset(consumer)
             .try_into()
@@ -245,13 +280,21 @@ pub(crate) fn service_pending() -> usize {
             })
         else {
             revoke("record-offset-invalid");
-            return accepted;
+            RECORDS_COPIED.fetch_add(written as u64, Ordering::Relaxed);
+            return written;
         };
         let mut record = [0_u8; DVM_INPUT_RING_RECORD_BYTES];
         for (index, byte) in record.iter_mut().enumerate() {
             *byte = unsafe { mapped.add(offset + index).read_volatile() };
         }
-        accepted += super::dvm_frames::consume_record(&record);
+        dest[written] = InputDvmRecordWire {
+            transport_generation: generation,
+            flags: 0,
+            len: DVM_INPUT_RING_RECORD_BYTES as u16,
+            reserved0: 0,
+            bytes: record,
+        };
+        written += 1;
         consumer = consumer.saturating_add(1);
     }
     fence(Ordering::Release);
@@ -262,7 +305,38 @@ pub(crate) fn service_pending() -> usize {
             .write_volatile(consumer.to_le());
     }
     CONSUMER.store(consumer, Ordering::Release);
-    accepted
+    RECORDS_COPIED.fetch_add(written as u64, Ordering::Relaxed);
+    written
+}
+
+/// Publish the consumer side of the inputd check-arm-recheck contract.
+///
+/// The waiter must already be registered before this generation is written.
+/// L0 samples it only after committing a producer cursor and rings at most
+/// once per generation. This gives batching under load without relying on a
+/// stale empty/nonempty snapshot or an interrupt for every record.
+pub(crate) fn arm_consumer_wake() -> bool {
+    if !INSTALLED.load(Ordering::Acquire) {
+        return false;
+    }
+    let mapped = SHARED_ADDR.load(Ordering::Acquire) as *mut u8;
+    if mapped.is_null() {
+        return false;
+    }
+    let current = CONSUMER_WAKE_GENERATION.load(Ordering::Acquire);
+    let Some(next) = current.checked_add(1) else {
+        revoke("consumer-wake-generation-wrapped");
+        return false;
+    };
+    fence(Ordering::Release);
+    unsafe {
+        mapped
+            .add(DVM_INPUT_RING_CONSUMER_WAKE_GENERATION_OFFSET)
+            .cast::<u64>()
+            .write_volatile(next.to_le());
+    }
+    CONSUMER_WAKE_GENERATION.store(next, Ordering::Release);
+    true
 }
 
 /// Read-only poll recheck for the arm/recheck/commit protocol. An MSI-X edge
@@ -271,6 +345,9 @@ pub(crate) fn service_pending() -> usize {
 /// include the raw producer/consumer state, not only the decoded ingress
 /// queue; otherwise that edge is lost and a finite poll can sleep forever.
 pub(crate) fn has_pending_records() -> bool {
+    if RESET_PENDING_GENERATION.load(Ordering::Acquire) != 0 {
+        return true;
+    }
     if IRQ_PENDING.load(Ordering::Acquire) {
         return true;
     }
@@ -299,7 +376,7 @@ fn input_ring_interrupt(_vector: u8) {
     IRQ_PENDING.store(true, Ordering::Release);
     // This is a wake-only leaf. It does not inspect shared bytes, consume a
     // record, allocate, or execute input policy in interrupt context.
-    super::event_queue::wake_input_waiters();
+    super::wait_queue::wake_input_waiters();
 }
 
 fn revoke(reason: &str) {
@@ -316,12 +393,32 @@ fn revoke(reason: &str) {
     }
     release_mapping(mapped);
     IRQ_PENDING.store(false, Ordering::Release);
-    // L0 can no longer deliver authenticated releases after revocation, so
-    // revoke decoder/network authority and force a policy-visible reset
-    // locally. Otherwise a malformed cursor/header could leave a key or
-    // pointer button logically pressed.
-    super::dvm_frames::revoke_active_session();
+    CONSUMER_WAKE_GENERATION.store(0, Ordering::Release);
+    // The kernel does not decode or own input/network policy. Publish a
+    // generation-stamped barrier so inputd can revoke its state and notify
+    // netd before accepting records from any replacement generation.
+    let generation = GENERATION.load(Ordering::Acquire).max(1);
+    RESET_PENDING_GENERATION.store(generation, Ordering::Release);
+    REVOKE_COUNT.fetch_add(1, Ordering::Relaxed);
+    super::wait_queue::wake_input_waiters();
     crate::debug::warn!(input, "dvm-input-ring: transport revoked reason={}", reason);
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct InputTransportDebugSnapshot {
+    pub broker_calls: u64,
+    pub records_copied: u64,
+    pub queued: usize,
+    pub revoke_count: u64,
+}
+
+pub(crate) fn debug_snapshot() -> InputTransportDebugSnapshot {
+    InputTransportDebugSnapshot {
+        broker_calls: BROKER_CALLS.load(Ordering::Relaxed),
+        records_copied: RECORDS_COPIED.load(Ordering::Relaxed),
+        queued: usize::from(has_pending_records()),
+        revoke_count: REVOKE_COUNT.load(Ordering::Relaxed),
+    }
 }
 
 fn reject_install(reason: u8) {

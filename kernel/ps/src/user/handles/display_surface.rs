@@ -27,6 +27,7 @@ pub struct DisplaySurfaceHandle {
     /// the global IPC objects lock (with interrupts disabled) on every present.
     shared_region_kernel_addr: u64,
     shared_region_kernel_len: u64,
+    external_phys_start: u64,
     mapped_region: Option<UserRegion>,
 }
 
@@ -119,6 +120,7 @@ impl DisplaySurfaceHandle {
             shared_region: None,
             shared_region_kernel_addr: 0,
             shared_region_kernel_len: 0,
+            external_phys_start: 0,
             mapped_region: None,
         })
     }
@@ -176,13 +178,43 @@ impl DisplaySurfaceHandle {
     /// for the lifetime of the surface — shared regions are pinned to fixed
     /// physical frames at creation time.
     pub fn shared_region_kernel_mapping(self) -> Option<(*mut u8, usize)> {
-        if self.shared_region.is_none() || self.shared_region_kernel_addr == 0 {
+        if self.shared_region_kernel_addr == 0 {
             return None;
         }
         Some((
             self.shared_region_kernel_addr as *mut u8,
             self.shared_region_kernel_len as usize,
         ))
+    }
+
+    pub fn set_external_physical_mapping(
+        &mut self,
+        phys_start: u64,
+        kernel_addr: u64,
+        len: usize,
+    ) -> bool {
+        if !self.is_gpu_atlas()
+            || self.shared_region.is_some()
+            || self.external_phys_start != 0
+            || self.mapped_region.is_some()
+            || phys_start == 0
+            || kernel_addr == 0
+            || !phys_start.is_multiple_of(PAGE_SIZE)
+            || len as u64 != self.mapping_len
+            || phys_start.checked_add(self.mapping_len).is_none()
+        {
+            return false;
+        }
+        self.shared_region = None;
+        self.shared_region_kernel_addr = kernel_addr;
+        self.shared_region_kernel_len = len as u64;
+        self.external_phys_start = phys_start;
+        true
+    }
+
+    pub fn external_physical_mapping(self) -> Option<(u64, usize)> {
+        (self.external_phys_start != 0)
+            .then_some((self.external_phys_start, self.mapping_len as usize))
     }
 
     pub fn set_shared_region(&mut self, region: KernelSharedRegionHandle) {
@@ -228,6 +260,24 @@ mod tests {
         assert_eq!(surface.stride_bytes(), 7168);
         assert_eq!(surface.frame_len(), 7168 * 900);
         assert_eq!(surface.mapping_len(), 6_451_200);
+    }
+
+    #[test]
+    fn gpu_atlas_accepts_only_exact_page_aligned_external_mapping() {
+        let mut surface =
+            DisplaySurfaceHandle::new_gpu_atlas(2048, 2048, PIXEL_FORMAT_BGRA8888, 1, 2)
+                .expect("valid atlas");
+        assert!(!surface.set_external_physical_mapping(0x1234, 0xffff_8000_0000_1234, 4096));
+        assert!(surface.set_external_physical_mapping(
+            0x4000_0000,
+            0xffff_8000_4000_0000,
+            surface.mapping_len() as usize,
+        ));
+        assert_eq!(
+            surface.external_physical_mapping(),
+            Some((0x4000_0000, surface.mapping_len() as usize))
+        );
+        assert!(surface.shared_region().is_none());
     }
 
     #[test]

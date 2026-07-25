@@ -160,10 +160,25 @@ pub(super) fn spawn_tracked_process(
 }
 
 fn apply_kvm_acceptance_contract(entry: &mut LaunchEntry) {
-    static CONTRACT: OnceLock<Option<KvmAcceptanceContract>> = OnceLock::new();
-    let Some(contract) = *CONTRACT.get_or_init(load_kvm_acceptance_contract) else {
-        return;
+    // The private acceptance file is deliberately outside the signed
+    // early-system extent set. uiserver is launched before storaged and may
+    // therefore observe it as unavailable, while later application launches
+    // can read it through the admitted DVM volume. Cache only a successfully
+    // parsed contract: negative caching would permanently discard WayClick
+    // and netprobe proof authority based on one expected bootstrap miss.
+    static CONTRACT: OnceLock<KvmAcceptanceContract> = OnceLock::new();
+    let contract = if let Some(contract) = CONTRACT.get().copied() {
+        contract
+    } else {
+        let Some(contract) = load_kvm_acceptance_contract() else {
+            return;
+        };
+        let _ = CONTRACT.set(contract);
+        CONTRACT.get().copied().unwrap_or(contract)
     };
+    if !contract.ui_profile && !contract.network_exercise {
+        return;
+    }
     if contract.ui_profile && entry.desktop_file_id == "uiserver.desktop" {
         upsert_env(&mut entry.env, "RUSTOS_UI_PROFILE=1");
         upsert_env(&mut entry.env, "RUSTOS_UI_BOOT_TRACE=1");

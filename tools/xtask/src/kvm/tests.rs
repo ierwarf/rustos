@@ -485,6 +485,21 @@ mod tests {
             60,
             DEFAULT_UI_FPS_ACTIVE_WINDOWS,
         ));
+        let phase_shifted = concat!(
+            "wayclick profile: elapsed_ms=1007 commit_hz_milli=67472 callback_hz_milli=67472 commits=68 callbacks=68 buffer_releases=68 max_callback_gap_ms=40\n",
+            "wayclick profile: elapsed_ms=1026 commit_hz_milli=53587 callback_hz_milli=53587 commits=55 callbacks=55 buffer_releases=55 max_callback_gap_ms=45\n",
+            "wayclick profile: elapsed_ms=1044 commit_hz_milli=54549 callback_hz_milli=54549 commits=57 callbacks=57 buffer_releases=57 max_callback_gap_ms=50"
+        );
+        assert!(wayclick_profile_meets_fps(
+            phase_shifted,
+            55,
+            DEFAULT_UI_FPS_ACTIVE_WINDOWS,
+        ));
+        assert!(!wayclick_profile_meets_fps(
+            &phase_shifted.replace("max_callback_gap_ms=50", "max_callback_gap_ms=51"),
+            55,
+            DEFAULT_UI_FPS_ACTIVE_WINDOWS,
+        ));
         assert_eq!(
             wayclick_profile_observation(&wayclick),
             Some(WayclickProfileObservation {
@@ -517,6 +532,57 @@ mod tests {
              rustos-dvm-display: stats elapsed_ms=1000 frame_hz_milli=60000 pageflip_completions=60 relay_cpu_copy_us_avg=0 atomic_commit_us_avg=1000 gpu_render_us_avg=9000 gpu_render_us_max=16668 gpu_fence_completions=60 present_fence_completions=60",
             60,
             DEFAULT_UI_FPS_ACTIVE_WINDOWS,
+        ));
+    }
+
+    #[test]
+    fn ui_fps_gate_accepts_post_present_production_heartbeats() {
+        let window = |cursor: &str| {
+            format!(
+                "uiserver: update tick elapsed_ms=1000 loops=200 total_loops=200 frames=60 cursor_moves=60 cursor={cursor} presented_cursor={cursor} backlog=false backlog_loops=0 input_loop_events=60 input_gap_ms=20 input_last_age_ms=5 input_drops=0 input_slow=0 input_errors=0 background_thread_demotions=7"
+            )
+        };
+        let log = [
+            window("800,450"),
+            window("992,450"),
+            window("992,642"),
+        ]
+        .join("\n");
+        assert!(uiserver_profile_meets_fps(&log, 55, 3));
+        assert!(uiserver_profile_input_pipeline_healthy(
+            &log,
+            3,
+            Some(55)
+        ));
+        assert!(!uiserver_profile_input_pipeline_healthy(
+            &log.replace("presented_cursor=992,642", "presented_cursor=991,642"),
+            3,
+            Some(55)
+        ));
+    }
+
+    #[test]
+    fn ui_input_gate_uses_exact_rolling_rates_without_hiding_a_stall() {
+        let log = [
+            "uiserver: update tick elapsed_ms=1000 frames=61 cursor_moves=49 cursor=800,555 presented_cursor=800,555 backlog=false input_loop_events=58 input_gap_ms=50 input_last_age_ms=9 input_drops_window=0 input_slow_window=0 input_errors_window=0 background_thread_demotions=10",
+            "uiserver: update tick elapsed_ms=1000 frames=61 cursor_moves=49 cursor=893,450 presented_cursor=893,450 backlog=false input_loop_events=58 input_gap_ms=50 input_last_age_ms=9 input_drops_window=0 input_slow_window=0 input_errors_window=0 background_thread_demotions=10",
+            "uiserver: update tick elapsed_ms=1007 frames=65 cursor_moves=55 cursor=992,555 presented_cursor=992,555 backlog=false input_loop_events=66 input_gap_ms=34 input_last_age_ms=1 input_drops_window=0 input_slow_window=0 input_errors_window=0 background_thread_demotions=10",
+        ]
+        .join("\n");
+        assert!(uiserver_profile_input_pipeline_healthy(
+            &log,
+            3,
+            Some(55)
+        ));
+        assert!(!uiserver_profile_input_pipeline_healthy(
+            &log.replacen("input_gap_ms=50", "input_gap_ms=51", 1),
+            3,
+            Some(55)
+        ));
+        assert!(!uiserver_profile_input_pipeline_healthy(
+            &log.replacen("cursor_moves=49", "cursor_moves=39", 1),
+            3,
+            Some(55)
         ));
     }
 
@@ -569,15 +635,20 @@ uiserver: update tick backlog=false input_drops=0 input_slow=0 input_errors=0";
     }
 
     #[test]
-    fn ui_fps_gate_ignores_pre_window_slow_loop_but_not_interactive_one() {
+    fn ui_fps_gate_separates_bounded_topology_startup_from_steady_frames() {
         assert!(!uiserver_has_interactive_slow_loop(
             "uiserver: slow loop iter_ms=72 wayland_ms=70 console_windows=0 wayland_windows=0"
         ));
-        assert!(uiserver_has_interactive_slow_loop(
+        assert!(!uiserver_has_interactive_slow_loop(
             "uiserver: slow loop iter_ms=72 wayland_ms=70 console_windows=1 wayland_windows=0"
         ));
         assert!(uiserver_has_interactive_slow_loop(
-            "uiserver: slow loop iter_ms=72 wayland_ms=70 console_windows=0 wayland_windows=1"
+            "uiserver: slow loop iter_ms=101 wayland_ms=99 console_windows=0 wayland_windows=1"
+        ));
+        assert!(uiserver_has_interactive_slow_loop(
+            "uiserver: slow loop iter_ms=72 wayland_ms=70 console_windows=1 wayland_windows=0\n\
+wayclick profile: elapsed_ms=1000 callbacks=60\n\
+uiserver: slow loop iter_ms=51 wayland_ms=0 present_ms=51 console_windows=1 wayland_windows=1"
         ));
     }
 
@@ -813,9 +884,9 @@ uiserver: update tick backlog=false input_drops=0 input_slow=0 input_errors=0";
         assert!(source.contains("UI_SET_ABSBIT, ABS_X"));
         assert!(source.contains("UI_SET_ABSBIT, ABS_Y"));
         assert!(source.contains("selftest->motion_phase == 0U"));
-        assert!(source.contains("#define INPUT_SELFTEST_CYCLES 4000U"));
+        assert!(source.contains("#define INPUT_SELFTEST_CYCLES 2667U"));
         assert!(source.contains("#define INPUT_SELFTEST_LEG_CYCLES 64U"));
-        assert!(source.contains("#define INPUT_SELFTEST_POLL_MS 10"));
+        assert!(source.contains("#define INPUT_SELFTEST_POLL_MS 15"));
         assert!(source.contains("#define INPUT_RELAY_RR_PRIORITY 10"));
         assert!(source.contains("#define INPUT_RELAY_RTTIME_SOFT_US 50000U"));
         assert!(source.contains("#define INPUT_RELAY_RTTIME_HARD_US 100000U"));

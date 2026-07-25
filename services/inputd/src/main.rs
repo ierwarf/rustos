@@ -3,30 +3,33 @@ use std::io::Write;
 use std::mem::size_of;
 use std::slice;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::thread;
+
+mod dvm_protocol;
 
 use keyboard_core::{KeyAction, KeyboardDriver, KeyboardEvent};
 use rustos_user_abi::syscall::{
     identity_is_exact_sender, CommercialMaxCapabilityLeaseWire,
     CommercialMaxProtocolDescriptorWire, CommercialMaxProtocolRequest,
-    CommercialMaxProtocolResponse, InputIngestBrokerArgs, InputIngressWire, InputPointerPacketWire,
-    InputPointerPositionWire, InputStatsBrokerArgs, InputStatsWire, InputdIpcRequest,
-    InputdIpcResponse, InputdPointerSurfaceRequest, InputdReadResponse,
-    COMMERCIAL_MAX_INPUTD_OP_DROP_POLICY, COMMERCIAL_MAX_INPUTD_OP_EVDEV_TRANSLATE,
-    COMMERCIAL_MAX_INPUTD_OP_INPUT_INGEST, COMMERCIAL_MAX_INPUTD_OP_INPUT_READER,
+    CommercialMaxProtocolResponse, InputDvmRecordWire, InputIngestBrokerArgs, InputIngressWire,
+    InputPointerPacketWire, InputPointerPositionWire, InputStatsBrokerArgs, InputStatsWire,
+    InputdIpcRequest, InputdIpcResponse, InputdPointerSurfaceRequest, InputdReadResponse,
+    NetdIpcRequest, NetdIpcResponse, COMMERCIAL_MAX_INPUTD_OP_DROP_POLICY,
+    COMMERCIAL_MAX_INPUTD_OP_EVDEV_TRANSLATE, COMMERCIAL_MAX_INPUTD_OP_INPUT_READER,
     COMMERCIAL_MAX_INPUTD_OP_INPUT_STATS, COMMERCIAL_MAX_INPUTD_OP_LAYOUT_POLICY,
     COMMERCIAL_MAX_INPUTD_OP_POINTER_SURFACE_POLICY, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
     COMMERCIAL_MAX_PROTOCOL_INPUTD, INPUTD_ACCESS_EVDEV, INPUTD_ACCESS_NATIVE,
     INPUTD_INGEST_MAX_EVENTS, INPUTD_INGRESS_FLAG_DVM_SOURCE, INPUTD_INGRESS_FLAG_RESET_STATE,
     INPUTD_INGRESS_KIND_DVM_LINUX_KEY, INPUTD_INGRESS_KIND_POINTER_PACKET,
     INPUTD_INGRESS_KIND_POINTER_POSITION, INPUTD_IPC_ABI_VERSION, INPUTD_IPC_OP_AUTHORIZE_READ,
-    INPUTD_IPC_OP_DRAIN_INGEST, INPUTD_IPC_OP_PING, INPUTD_IPC_OP_READ,
-    INPUTD_IPC_OP_SET_POINTER_SURFACE, INPUTD_IPC_OP_STATS, INPUTD_READ_FLAG_NONBLOCK,
-    INPUTD_READ_PAYLOAD_CAPACITY, IPC_MAX_INLINE_BYTES, IPC_SERVICE_INPUTD, IPC_SERVICE_UISERVER,
-    SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_INPUT_INGEST_BROKER, SYS_RUSTOS_INPUT_STATS_BROKER,
-    SYS_RUSTOS_INPUT_WAIT_BROKER, SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_RECV_WITH_SENDER,
-    SYS_RUSTOS_IPC_REPLY,
+    INPUTD_IPC_OP_PING, INPUTD_IPC_OP_READ, INPUTD_IPC_OP_SET_POINTER_SURFACE, INPUTD_IPC_OP_STATS,
+    INPUTD_READ_FLAG_NONBLOCK, INPUTD_READ_PAYLOAD_CAPACITY, IPC_MAX_INLINE_BYTES,
+    IPC_SERVICE_INPUTD, IPC_SERVICE_NETD, IPC_SERVICE_UISERVER, NETD_DVM_SESSION_GRANT,
+    NETD_DVM_SESSION_REVOKE, NETD_IPC_ABI_VERSION, NETD_IPC_OP_DVM_SESSION,
+    NETD_IPC_REQUEST_HEADER_SIZE, SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_INPUT_INGEST_BROKER,
+    SYS_RUSTOS_INPUT_STATS_BROKER, SYS_RUSTOS_INPUT_WAIT_BROKER, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
+    SYS_RUSTOS_IPC_RECV_WITH_SENDER, SYS_RUSTOS_IPC_REPLY,
 };
 #[cfg(not(test))]
 use rustos_user_abi::syscall::{
@@ -67,6 +70,7 @@ struct InputQueue {
     dvm_pointer_position: Option<(i32, i32)>,
     read_authorizations: VecDeque<InputReadAuthorization>,
     readiness_generation: u64,
+    dvm_decoder: dvm_protocol::DvmDecoder,
 }
 
 impl Default for InputQueue {
@@ -84,11 +88,17 @@ impl Default for InputQueue {
             dvm_pointer_position: None,
             read_authorizations: VecDeque::new(),
             readiness_generation: 1,
+            dvm_decoder: dvm_protocol::DvmDecoder::default(),
         }
     }
 }
 
-type SharedInputQueue = Arc<Mutex<InputQueue>>;
+struct SharedInputQueueState {
+    queue: Mutex<InputQueue>,
+    ingestion_waiting: AtomicBool,
+}
+
+type SharedInputQueue = Arc<SharedInputQueueState>;
 
 #[derive(Default)]
 struct DvmIngressLogState {
@@ -106,10 +116,37 @@ impl DvmIngressLogState {
 }
 
 fn lock_input_queue(queue: &SharedInputQueue) -> MutexGuard<'_, InputQueue> {
-    queue.lock().unwrap_or_else(|_| {
-        debug_line("inputd: input queue synchronization failed");
-        std::process::exit(134);
-    })
+    loop {
+        while queue.ingestion_waiting.load(Ordering::Acquire) {
+            thread::yield_now();
+        }
+        let guard = queue.queue.lock().unwrap_or_else(|_| {
+            debug_line("inputd: input queue synchronization failed");
+            std::process::exit(134);
+        });
+        if !queue.ingestion_waiting.load(Ordering::Acquire) {
+            return guard;
+        }
+        drop(guard);
+        thread::yield_now();
+    }
+}
+
+fn lock_input_queue_for_ingestion(queue: &SharedInputQueue) -> MutexGuard<'_, InputQueue> {
+    queue.ingestion_waiting.store(true, Ordering::Release);
+    loop {
+        match queue.queue.try_lock() {
+            Ok(guard) => {
+                queue.ingestion_waiting.store(false, Ordering::Release);
+                return guard;
+            }
+            Err(TryLockError::WouldBlock) => thread::yield_now(),
+            Err(TryLockError::Poisoned(_)) => {
+                debug_line("inputd: input queue synchronization failed");
+                std::process::exit(134);
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -417,8 +454,9 @@ fn keyboard_action_to_inputd(action: KeyAction) -> u16 {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{
-        apply_dvm_ingress_wire, ingest_batch_needs_immediate_retry, validate_commercial_request,
-        DvmIngressLogState, InputQueue, INPUTD_INGEST_MAX_EVENTS,
+        apply_dvm_ingress_wire, ingest_batch_needs_immediate_retry, lock_input_queue,
+        lock_input_queue_for_ingestion, validate_commercial_request, DvmIngressLogState,
+        InputQueue, SharedInputQueueState, INPUTD_INGEST_MAX_EVENTS,
     };
     use rustos_user_abi::syscall::{
         CommercialMaxProtocolRequest, InputIngressWire, InputPointerPacketWire,
@@ -426,6 +464,9 @@ mod tests {
         COMMERCIAL_MAX_PROTOCOL_INPUTD, INPUTD_ACCESS_NATIVE, INPUTD_INGRESS_FLAG_DVM_SOURCE,
         INPUTD_INGRESS_FLAG_RESET_STATE, INPUTD_INGRESS_KIND_DVM_LINUX_KEY,
     };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{mpsc, Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     fn pointer_motion(dx: i32, dy: i32) -> input_evdev::InputEvent {
         input_evdev::InputEvent {
@@ -437,6 +478,46 @@ mod tests {
             modifiers: 0,
             text: 0,
         }
+    }
+
+    #[test]
+    fn ingestion_handoff_prevents_hot_reader_mutex_barging() {
+        let queue = Arc::new(SharedInputQueueState {
+            queue: Mutex::new(InputQueue::default()),
+            ingestion_waiting: AtomicBool::new(false),
+        });
+        let held = queue.queue.lock().unwrap();
+        let (tx, rx) = mpsc::channel();
+
+        let ingestion_queue = Arc::clone(&queue);
+        let ingestion_tx = tx.clone();
+        let ingestion = std::thread::spawn(move || {
+            let _guard = lock_input_queue_for_ingestion(&ingestion_queue);
+            ingestion_tx.send("ingestion").unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !queue.ingestion_waiting.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "ingestion did not declare handoff"
+            );
+            std::thread::yield_now();
+        }
+
+        let reader_queue = Arc::clone(&queue);
+        let reader = std::thread::spawn(move || {
+            let _guard = lock_input_queue(&reader_queue);
+            tx.send("reader").unwrap();
+        });
+        drop(held);
+
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "ingestion"
+        );
+        assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), "reader");
+        ingestion.join().unwrap();
+        reader.join().unwrap();
     }
 
     fn pointer_position(x: i32, y: i32) -> input_evdev::InputEvent {
@@ -765,7 +846,7 @@ fn start_dvm_ingestion_worker(queue: SharedInputQueue, log_state: Arc<DvmIngress
     let result = thread::Builder::new()
         .name(String::from("inputd-dvm-ingress"))
         .spawn(move || {
-            let mut ingest_scratch = vec![InputIngressWire::default(); INPUTD_INGEST_MAX_EVENTS];
+            let mut ingest_scratch = vec![InputDvmRecordWire::default(); INPUTD_INGEST_MAX_EVENTS];
             let mut retry_without_wait = false;
             loop {
                 if !retry_without_wait {
@@ -774,26 +855,34 @@ fn start_dvm_ingestion_worker(queue: SharedInputQueue, log_state: Arc<DvmIngress
                         std::process::exit(134);
                     }
                 }
-                let drained = {
-                    let mut queue = lock_input_queue(&queue);
-                    match drain_ingest(&mut queue, &mut ingest_scratch) {
-                        Ok(count) => count,
-                        Err(errno) => {
-                            debug_line(&format!(
-                                "inputd: DVM ingestion drain failed errno={errno}"
-                            ));
-                            std::process::exit(134);
-                        }
+                let drained = match drain_transport(&mut ingest_scratch) {
+                    Ok(count) => count,
+                    Err(errno) => {
+                        debug_line(&format!("inputd: DVM ingestion drain failed errno={errno}"));
+                        std::process::exit(134);
                     }
                 };
-                log_dvm_ingress_observations(&queue, &log_state);
+                let observations = {
+                    let mut queue = lock_input_queue_for_ingestion(&queue);
+                    if let Err(errno) = apply_ingest_records(&mut queue, &ingest_scratch[..drained])
+                    {
+                        debug_line(&format!(
+                            "inputd: DVM ingestion decode failed errno={errno}"
+                        ));
+                        std::process::exit(134);
+                    }
+                    queue.take_dvm_ingress_observations()
+                };
+                log_dvm_ingress_observation_flags(&log_state, observations);
                 retry_without_wait = ingest_batch_needs_immediate_retry(drained);
                 if retry_without_wait {
                     // A hostile or recovering producer cannot retain the
                     // interactive class across unbounded batches. Continue
                     // after the yield without waiting for another MSI-X edge:
-                    // a full batch is proof that backlog may remain, and L0
-                    // intentionally rings only on empty-to-nonempty.
+                    // a full batch is proof that backlog may remain. L0 rings
+                    // every committed record to close the stale-cursor wake
+                    // race, but this worker does not depend on a later record
+                    // arriving to finish an already-admitted batch.
                     thread::yield_now();
                 }
             }
@@ -818,12 +907,12 @@ fn wait_for_dvm_ingress() -> Result<(), i32> {
 }
 
 fn serve(endpoint: u64) {
-    let queue = Arc::new(Mutex::new(InputQueue::default()));
+    let queue = Arc::new(SharedInputQueueState {
+        queue: Mutex::new(InputQueue::default()),
+        ingestion_waiting: AtomicBool::new(false),
+    });
     let dvm_ingress_log_state = Arc::new(DvmIngressLogState::default());
     start_dvm_ingestion_worker(Arc::clone(&queue), Arc::clone(&dvm_ingress_log_state));
-    // This buffer is reused by request handlers. Do not allocate a new 96 KiB
-    // wire batch for every client read.
-    let mut ingest_scratch = vec![InputIngressWire::default(); INPUTD_INGEST_MAX_EVENTS];
     loop {
         let mut request = [0_u8; IPC_MAX_INLINE_BYTES];
         let mut reply_cap = 0_u64;
@@ -846,14 +935,7 @@ fn serve(endpoint: u64) {
             let request = read_unaligned::<CommercialMaxProtocolRequest>(&request);
             let reply = {
                 let mut queue = lock_input_queue(&queue);
-                reply_commercial_request(
-                    reply_cap,
-                    &request,
-                    sender_pid,
-                    sender_tid,
-                    &mut queue,
-                    &mut ingest_scratch,
-                )
+                reply_commercial_request(reply_cap, &request, sender_pid, sender_tid, &mut queue)
             };
             if reply < 0 {
                 let _ = writeln!(std::io::stderr(), "inputd: reply failed errno={}", -reply);
@@ -917,7 +999,7 @@ fn serve(endpoint: u64) {
                 }
                 Ok(()) => {
                     let mut queue = lock_input_queue(&queue);
-                    dispatch_read(&request, &mut response, &mut queue, &mut ingest_scratch)
+                    dispatch_read(&request, &mut response, &mut queue)
                 }
                 Err(errno) => errno,
             };
@@ -946,7 +1028,7 @@ fn serve(endpoint: u64) {
                 }
                 Ok(()) => {
                     let mut queue = lock_input_queue(&queue);
-                    dispatch(&request, &mut response, &mut queue, &mut ingest_scratch)
+                    dispatch(&request, &mut response, &mut queue)
                 }
                 Err(errno) => errno,
             };
@@ -965,7 +1047,14 @@ fn serve(endpoint: u64) {
 }
 
 fn log_dvm_ingress_observations(queue: &SharedInputQueue, state: &DvmIngressLogState) {
-    let (dvm_keyboard, dvm_pointer) = lock_input_queue(queue).take_dvm_ingress_observations();
+    let observations = lock_input_queue(queue).take_dvm_ingress_observations();
+    log_dvm_ingress_observation_flags(state, observations);
+}
+
+fn log_dvm_ingress_observation_flags(
+    state: &DvmIngressLogState,
+    (dvm_keyboard, dvm_pointer): (bool, bool),
+) {
     let (log_keyboard, log_pointer) = state.claim(dvm_keyboard, dvm_pointer);
     if log_keyboard {
         debug_line("inputd: DVM keyboard ingress observed");
@@ -981,7 +1070,6 @@ fn reply_commercial_request(
     sender_pid: u64,
     sender_tid: u64,
     queue: &mut InputQueue,
-    ingest_scratch: &mut [InputIngressWire],
 ) -> i64 {
     let mut response = CommercialMaxProtocolResponse {
         header: request.header,
@@ -992,9 +1080,7 @@ fn reply_commercial_request(
         libc::EACCES
     } else {
         validate_commercial_request(request)
-            .and_then(|_| {
-                dispatch_commercial_request(request, &mut response, queue, ingest_scratch)
-            })
+            .and_then(|_| dispatch_commercial_request(request, &mut response, queue))
             .err()
             .unwrap_or(0)
     };
@@ -1010,41 +1096,20 @@ fn dispatch(
     request: &InputdIpcRequest,
     response: &mut InputdIpcResponse,
     queue: &mut InputQueue,
-    ingest_scratch: &mut [InputIngressWire],
 ) -> i32 {
     match request.op {
         INPUTD_IPC_OP_PING => {
             response.approved_len = request.requested_len;
             0
         }
-        INPUTD_IPC_OP_STATS => {
-            // `poll(2)` obtains readiness through this operation. Refresh the
-            // DVM-backed ingress before answering so an input-ring record that woke a
-            // kernel poll waiter is visible to the same readiness recheck.
-            //
-            // Keep this transfer request-driven. An idle background turn must
-            // not remove ingress after a reader arms a ring0 poll wait, because
-            // it cannot complete that wait itself.
-            match drain_ingest(queue, ingest_scratch).and_then(|_| fetch_stats(queue)) {
-                Ok(stats) => {
-                    response.stats = stats;
-                    0
-                }
-                Err(errno) => errno,
-            }
-        }
-        INPUTD_IPC_OP_AUTHORIZE_READ => authorize_read(request, response, queue),
-        INPUTD_IPC_OP_DRAIN_INGEST => match drain_ingest(queue, ingest_scratch) {
-            Ok(count) => {
-                response.approved_len = count as u64;
-                match fetch_stats(queue) {
-                    Ok(stats) => response.stats = stats,
-                    Err(errno) => return errno,
-                }
+        INPUTD_IPC_OP_STATS => match fetch_stats(queue) {
+            Ok(stats) => {
+                response.stats = stats;
                 0
             }
             Err(errno) => errno,
         },
+        INPUTD_IPC_OP_AUTHORIZE_READ => authorize_read(request, response, queue),
         _ => libc::EINVAL,
     }
 }
@@ -1070,7 +1135,6 @@ fn dispatch_read(
     request: &InputdIpcRequest,
     response: &mut InputdReadResponse,
     queue: &mut InputQueue,
-    ingest_scratch: &mut [InputIngressWire],
 ) -> i32 {
     if request.pid == 0 || request.tid == 0 || request.fd > i32::MAX as u64 {
         return libc::EINVAL;
@@ -1078,9 +1142,6 @@ fn dispatch_read(
     let Some(approved_len) = consume_read_authorization(queue, request) else {
         return libc::EACCES;
     };
-    if let Err(errno) = drain_ingest(queue, ingest_scratch) {
-        return errno;
-    }
     let requested = request
         .requested_len
         .min(approved_len)
@@ -1101,8 +1162,13 @@ fn dispatch_read(
     0
 }
 
-fn drain_ingest(queue: &mut InputQueue, events: &mut [InputIngressWire]) -> Result<usize, i32> {
-    if events.len() != INPUTD_INGEST_MAX_EVENTS {
+fn drain_transport(records: &mut [InputDvmRecordWire]) -> Result<usize, i32> {
+    if records.len() != INPUTD_INGEST_MAX_EVENTS {
+        debug_line(&format!(
+            "inputd: invalid ingest scratch length={} expected={}",
+            records.len(),
+            INPUTD_INGEST_MAX_EVENTS
+        ));
         return Err(libc::EINVAL);
     }
     let mut count = 0_u32;
@@ -1110,8 +1176,8 @@ fn drain_ingest(queue: &mut InputQueue, events: &mut [InputIngressWire]) -> Resu
         abi_version: INPUTD_IPC_ABI_VERSION,
         reserved0: 0,
         reserved1: 0,
-        out_events_ptr: events.as_mut_ptr() as u64,
-        out_capacity: events.len() as u32,
+        out_records_ptr: records.as_mut_ptr() as u64,
+        out_capacity: records.len() as u32,
         reserved2: 0,
         out_count_ptr: (&mut count as *mut u32) as u64,
     };
@@ -1120,13 +1186,112 @@ fn drain_ingest(queue: &mut InputQueue, events: &mut [InputIngressWire]) -> Resu
         (&args as *const InputIngestBrokerArgs) as u64,
     );
     if result < 0 {
-        return Err(last_errno());
+        let errno = last_errno();
+        debug_line(&format!(
+            "inputd: ingest broker syscall rejected raw={result} errno={errno}"
+        ));
+        return Err(errno);
     }
-    let count = (count as usize).min(events.len());
-    for wire in events.iter().take(count) {
-        apply_dvm_ingress_wire(queue, wire);
+    Ok((count as usize).min(records.len()))
+}
+
+fn apply_ingest_records(queue: &mut InputQueue, records: &[InputDvmRecordWire]) -> Result<(), i32> {
+    for record in records {
+        apply_dvm_record(queue, record)?;
     }
-    Ok(count)
+    Ok(())
+}
+
+fn apply_dvm_record(queue: &mut InputQueue, record: &InputDvmRecordWire) -> Result<(), i32> {
+    let outcome = queue.dvm_decoder.consume(record);
+    if let Some(epoch) = outcome.revoke_epoch {
+        if let Err(errno) = notify_netd_dvm_session(epoch, NETD_DVM_SESSION_REVOKE) {
+            queue.dvm_decoder = dvm_protocol::DvmDecoder::default();
+            queue.reset_dvm_input();
+            return Err(errno);
+        }
+    }
+    if outcome.reset_input {
+        queue.reset_dvm_input();
+    }
+    if let Some(epoch) = outcome.grant_epoch {
+        if let Err(errno) = notify_netd_dvm_session(epoch, NETD_DVM_SESSION_GRANT) {
+            queue.dvm_decoder = dvm_protocol::DvmDecoder::default();
+            queue.reset_dvm_input();
+            return Err(errno);
+        }
+    }
+    if let Some(wire) = outcome.event {
+        apply_dvm_ingress_wire(queue, &wire);
+    }
+    Ok(())
+}
+
+fn notify_netd_dvm_session(epoch: u32, action: u64) -> Result<(), i32> {
+    if epoch == 0 || !matches!(action, NETD_DVM_SESSION_GRANT | NETD_DVM_SESSION_REVOKE) {
+        return Err(libc::EINVAL);
+    }
+    let endpoint = rustos_svc_runtime::ipc::lookup_service_endpoint(IPC_SERVICE_NETD);
+    if endpoint < 0 {
+        let errno = (-endpoint).try_into().unwrap_or(libc::EIO);
+        debug_line(&format!(
+            "inputd: netd DVM session lookup failed errno={errno}"
+        ));
+        return Err(errno);
+    }
+    let pid = syscall0(rustos_user_abi::linux::SYS_GETPID);
+    let tid = syscall0(rustos_user_abi::linux::SYS_GETTID);
+    if pid <= 0 || tid <= 0 {
+        debug_line(&format!(
+            "inputd: netd DVM session identity failed pid={pid} tid={tid}"
+        ));
+        return Err(libc::ESRCH);
+    }
+    let request = NetdIpcRequest {
+        version: NETD_IPC_ABI_VERSION,
+        op: NETD_IPC_OP_DVM_SESSION,
+        pid: pid as u64,
+        tid: tid as u64,
+        arg0: u64::from(epoch),
+        arg1: action,
+        ..NetdIpcRequest::default()
+    };
+    let mut response = NetdIpcResponse::default();
+    let received = unsafe {
+        rustos_svc_runtime::ipc::call_bounded(
+            endpoint as u64,
+            (&request as *const NetdIpcRequest).cast(),
+            NETD_IPC_REQUEST_HEADER_SIZE,
+            (&mut response as *mut NetdIpcResponse).cast(),
+            size_of::<NetdIpcResponse>(),
+            rustos_user_abi::performance::IPC_READINESS_QUERY_HARD_LIMIT_MS,
+        )
+    };
+    if received < 0 {
+        let errno = (-received).try_into().unwrap_or(libc::EIO);
+        debug_line(&format!(
+            "inputd: netd DVM session call failed errno={errno}"
+        ));
+        return Err(errno);
+    }
+    if received as usize != rustos_user_abi::syscall::NETD_IPC_RESPONSE_HEADER_SIZE
+        || response.version != NETD_IPC_ABI_VERSION
+        || response.op != NETD_IPC_OP_DVM_SESSION
+    {
+        debug_line(&format!(
+            "inputd: netd DVM session response malformed received={received} version={} op={}",
+            response.version, response.op
+        ));
+        return Err(libc::EPROTO);
+    }
+    if response.status != 0 {
+        debug_line(&format!(
+            "inputd: netd DVM session rejected status={} epoch={epoch} action={action}",
+            response.status
+        ));
+        return Err(response.status);
+    }
+    Ok(())
 }
 
 fn apply_dvm_ingress_wire(queue: &mut InputQueue, wire: &InputIngressWire) {
@@ -1307,13 +1472,8 @@ fn dispatch_commercial_request(
     request: &CommercialMaxProtocolRequest,
     response: &mut CommercialMaxProtocolResponse,
     queue: &mut InputQueue,
-    ingest_scratch: &mut [InputIngressWire],
 ) -> Result<(), i32> {
     match request.header.op {
-        COMMERCIAL_MAX_INPUTD_OP_INPUT_INGEST => {
-            response.value0 = drain_ingest(queue, ingest_scratch)? as u64;
-            write_stats_payload(queue, response)
-        }
         COMMERCIAL_MAX_INPUTD_OP_INPUT_READER => {
             response.value0 = match request.arg0 {
                 value if value == u64::from(INPUTD_ACCESS_NATIVE) => {
@@ -1373,8 +1533,7 @@ fn validate_commercial_request(request: &CommercialMaxProtocolRequest) -> Result
         {
             Ok(())
         }
-        COMMERCIAL_MAX_INPUTD_OP_INPUT_INGEST
-        | COMMERCIAL_MAX_INPUTD_OP_EVDEV_TRANSLATE
+        COMMERCIAL_MAX_INPUTD_OP_EVDEV_TRANSLATE
         | COMMERCIAL_MAX_INPUTD_OP_LAYOUT_POLICY
         | COMMERCIAL_MAX_INPUTD_OP_DROP_POLICY
         | COMMERCIAL_MAX_INPUTD_OP_INPUT_STATS
@@ -1409,7 +1568,6 @@ fn validate(received: usize, request: &InputdIpcRequest) -> Result<(), i32> {
         INPUTD_IPC_OP_PING => Ok(()),
         INPUTD_IPC_OP_STATS => Ok(()),
         INPUTD_IPC_OP_AUTHORIZE_READ => Ok(()),
-        INPUTD_IPC_OP_DRAIN_INGEST => Ok(()),
         INPUTD_IPC_OP_READ => Ok(()),
         _ => Err(libc::EINVAL),
     }
@@ -1451,7 +1609,6 @@ fn input_capability(label: &str, op: u16) -> CommercialMaxCapabilityLeaseWire {
 
 fn input_capability_mask(op: u16) -> u64 {
     match op {
-        COMMERCIAL_MAX_INPUTD_OP_INPUT_INGEST => 1 << 0,
         COMMERCIAL_MAX_INPUTD_OP_INPUT_READER => 1 << 1,
         COMMERCIAL_MAX_INPUTD_OP_EVDEV_TRANSLATE => 1 << 2,
         COMMERCIAL_MAX_INPUTD_OP_LAYOUT_POLICY => 1 << 3,

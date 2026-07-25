@@ -85,8 +85,10 @@ performance evidence.
 
 `--min-ui-fps <fps>` patches only the private KVM disk to enable uiserver and
 WayClick profiles. It requires consecutive render/input windows, balanced
-WayClick commit/frame-callback/buffer-release windows with bounded callback
-gaps, and the requested DVM relay windows when GUI-DVM surfaces are enabled.
+WayClick commit/frame-callback/buffer-release progress whose exact aggregate
+rate reaches the target, every constituent window reaches at least 80% of the
+target, and no callback gap exceeds 50 ms. It also requires the requested DVM
+relay windows when GUI-DVM surfaces are enabled.
 It does not lower or infer one result from another. A timeout reports the
 observed WayClick window count, commit/callback rate range, largest callback
 gap, and largest redraw time directly in the error so diagnosis does not
@@ -168,9 +170,10 @@ GPU를 dirty 상태로 남길 수 있어 cold host boot마다 한 번만 실행�
 수명주기, reset, revoke, 복구 또는 정량 성능 증거가 아닙니다.
 
 `--min-ui-fps <fps>`는 private KVM disk에서만 uiserver와 WayClick profile을
-활성화합니다. 연속 render/input window, callback gap이 제한되고 commit/
-frame-callback/buffer-release가 균형을 이룬 WayClick window, GUI-DVM surface를
-사용할 때 요청된 DVM relay window를 각각 요구합니다. 한 경로의 수치로
+활성화합니다. 연속 render/input window, 전체 구간의 정확한 commit/callback
+rate가 목표 이상이고 각 window도 목표의 80% 이상이며 callback gap이 50 ms
+이하이고 commit/frame-callback/buffer-release가 균형을 이룬 WayClick 증거,
+GUI-DVM surface를 사용할 때 요청된 DVM relay window를 각각 요구합니다. 한 경로의 수치로
 다른 경로의 실패를 대신 통과시키지 않습니다. timeout 오류에는 관측된
 WayClick window 수, commit/callback rate 범위, 최대 callback gap과 최대
 redraw 시간이 함께 표시됩니다. 이 관측에는 1초가 아닌 startup window도

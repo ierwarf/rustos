@@ -7,7 +7,6 @@ mod tests {
     };
     use boot_random::{Random, init as init_random};
     use core::mem::size_of;
-    use driver_abi::{DisplayFramebufferRegistration, PointerPacket};
     use keyboard_core::{KeyAction, KeyCode, KeyboardDriver, Modifiers, ScanCodeSet};
     use rustos_fault_injection::{FaultAction, parse_rule};
     use rustos_user_abi::{console, device, ui};
@@ -35,12 +34,6 @@ mod tests {
         assert_eq!(event.code, KeyCode::ArrowUp);
         assert_eq!(event.action, KeyAction::Pressed);
         assert_eq!(event.text, None);
-    }
-
-    #[test]
-    fn active_transport_abi_layout_is_stable() {
-        assert_eq!(size_of::<DisplayFramebufferRegistration>(), 56);
-        assert_eq!(size_of::<PointerPacket>(), 12);
     }
 
     #[test]

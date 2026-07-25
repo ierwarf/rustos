@@ -13,6 +13,7 @@ use crate::multitask;
 use crate::user::handles::{DisplaySurfaceHandle, KernelHandle, RemoteVfsHandleKind};
 use crate::user::process_state::UserProcessState;
 use rustos_user_abi::device as device_abi;
+use rustos_user_abi::syscall::VFS_DEVICE_ACCESS_DRM_COMPAT;
 
 const DRM_IOCTL_BASE: u8 = b'd';
 const DRM_MODE_CONNECTED: u32 = 1;
@@ -251,28 +252,14 @@ fn ioctl_via_process_state(
             device_ns::ioctl_from_user(*device_handle, process_state, request, arg)
                 .map_err(map_device_error)
         }
-        KernelHandle::RemoteVfs(remote) if remote.kind() == RemoteVfsHandleKind::Device => {
-            let path = remote.path();
-            ioctl_remote_device(process_state, path.as_str(), request, arg)
+        KernelHandle::RemoteVfs(remote)
+            if remote.kind() == RemoteVfsHandleKind::Device
+                && remote.device_access() == VFS_DEVICE_ACCESS_DRM_COMPAT =>
+        {
+            ioctl_display_device(process_state, request, arg)
         }
         _ => Err(DeviceSysopError::Unsupported),
     }
-}
-
-fn ioctl_remote_device(
-    process_state: &mut UserProcessState,
-    path: &str,
-    request: u64,
-    arg: u64,
-) -> Result<u64, DeviceSysopError> {
-    if is_display_device_path(path) {
-        return ioctl_display_device(process_state, request, arg);
-    }
-    Err(DeviceSysopError::Unsupported)
-}
-
-fn is_display_device_path(path: &str) -> bool {
-    matches!(path, "/dev/display0" | "/dev/dri/card0")
 }
 
 fn ioctl_display_device(

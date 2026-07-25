@@ -270,9 +270,7 @@ impl<'a> GpuAtlasPacker<'a> {
                 .pixels
                 .get_mut(destination_start..destination_end)
                 .ok_or(GpuSceneError::InvalidLayer)?;
-            for (destination, source) in destination_row.iter_mut().zip(source_row) {
-                *destination = *source | 0xff00_0000;
-            }
+            copy_xrgb_opaque_row(destination_row, source_row);
         }
         Ok(())
     }
@@ -369,9 +367,7 @@ impl<'a> GpuAtlasPacker<'a> {
                 .get_mut(destination_start..destination_end)
                 .ok_or(GpuSceneError::InvalidLayer)?;
             if force_opaque {
-                for (destination, source) in destination_row.iter_mut().zip(source_row) {
-                    *destination = *source | 0xff00_0000;
-                }
+                copy_xrgb_opaque_row(destination_row, source_row);
             } else {
                 destination_row.copy_from_slice(source_row);
             }
@@ -381,6 +377,49 @@ impl<'a> GpuAtlasPacker<'a> {
         self.next_y = outer_y;
         self.row_height = row_height.max(outer_height);
         Ok(destination)
+    }
+}
+
+/// Convert one XRGB row to the compositor's opaque BGRA atlas format.
+///
+/// Desktop and window topology rebuilds copy several million pixels before
+/// the first interactive frame. Keeping the conversion as a per-pixel
+/// iterator made that one-time rebuild exceed the 50 ms UI-loop contract on
+/// modest hosts. SSE2 is part of the x86-64 baseline, and this private helper
+/// preserves the exact `source | 0xff00_0000` semantics for every pixel.
+#[inline]
+fn copy_xrgb_opaque_row(destination: &mut [u32], source: &[u32]) {
+    debug_assert_eq!(destination.len(), source.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        use core::arch::x86_64::{
+            __m128i, _mm_loadu_si128, _mm_or_si128, _mm_set1_epi32, _mm_storeu_si128,
+        };
+
+        let opaque = unsafe { _mm_set1_epi32(0xff00_0000_u32 as i32) };
+        let mut index = 0;
+        while index + 4 <= destination.len() {
+            // SAFETY: both four-pixel ranges are bounded by the loop
+            // condition, and the unaligned load/store intrinsics accept the
+            // row alignment provided by arbitrary atlas rectangles.
+            unsafe {
+                let pixels = _mm_loadu_si128(source.as_ptr().add(index).cast::<__m128i>());
+                _mm_storeu_si128(
+                    destination.as_mut_ptr().add(index).cast::<__m128i>(),
+                    _mm_or_si128(pixels, opaque),
+                );
+            }
+            index += 4;
+        }
+        for (destination, source) in destination[index..].iter_mut().zip(&source[index..]) {
+            *destination = *source | 0xff00_0000;
+        }
+        return;
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    for (destination, source) in destination.iter_mut().zip(source) {
+        *destination = *source | 0xff00_0000;
     }
 }
 
@@ -932,6 +971,29 @@ mod tests {
         assert_eq!(pixels[1 * 8 + 5], 5);
         assert_eq!(pixels[0], 0);
         assert_eq!(pixels[4], 0);
+    }
+
+    #[test]
+    fn xrgb_row_conversion_preserves_color_and_forces_opaque_alpha() {
+        let source = [
+            0x0000_0000,
+            0x0012_3456,
+            0x7f65_4321,
+            0xffab_cdef,
+            0x0001_0203,
+        ];
+        let mut destination = [0_u32; 5];
+        copy_xrgb_opaque_row(&mut destination, &source);
+        assert_eq!(
+            destination,
+            [
+                0xff00_0000,
+                0xff12_3456,
+                0xff65_4321,
+                0xffab_cdef,
+                0xff01_0203,
+            ]
+        );
     }
 
     #[test]

@@ -4,10 +4,10 @@
 use alloc::vec::Vec;
 use rustos_user_abi::syscall::{
     RustosIpcValidateServiceOwnerArgs, IPC_ABI_VERSION, SYS_RUSTOS_DEBUG_PRINT,
-    SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
-    SYS_RUSTOS_IPC_RECV_WITH_SENDER, SYS_RUSTOS_IPC_REGISTER_LINUX_SYSCALL_ENDPOINT,
-    SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
-    SYS_RUSTOS_IPC_VALIDATE_SERVICE_OWNER,
+    SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_IPC_CALL_BOUNDED, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
+    SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_RECV_WITH_SENDER,
+    SYS_RUSTOS_IPC_REGISTER_LINUX_SYSCALL_ENDPOINT, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT,
+    SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_IPC_VALIDATE_SERVICE_OWNER,
 };
 
 use crate::syscall::{syscall0, syscall1, syscall2, syscall3, syscall5, syscall6};
@@ -74,6 +74,28 @@ pub unsafe fn call(
         request_len as u64,
         reply as u64,
         reply_capacity as u64,
+    )
+}
+
+/// Call one endpoint with an explicit finite deadline. `timeout_ms` must be
+/// non-zero and no larger than the kernel's global service ceiling.
+#[inline]
+pub unsafe fn call_bounded(
+    endpoint: u64,
+    request: *const u8,
+    request_len: usize,
+    reply: *mut u8,
+    reply_capacity: usize,
+    timeout_ms: u64,
+) -> i64 {
+    syscall6(
+        SYS_RUSTOS_IPC_CALL_BOUNDED,
+        endpoint,
+        request as u64,
+        request_len as u64,
+        reply as u64,
+        reply_capacity as u64,
+        timeout_ms,
     )
 }
 

@@ -29,9 +29,8 @@ pub const SYS_RUSTOS_PROC_COMMIT_BROKER: u64 = 0x5255_001c;
 pub const SYS_RUSTOS_PROC_ABORT_BROKER: u64 = 0x5255_001d;
 pub const SYS_RUSTOS_MM_BROKER: u64 = 0x5255_001e;
 pub const SYS_RUSTOS_DEVICE_IOCTL_BROKER: u64 = 0x5255_001f;
-pub const SYS_RUSTOS_DRIVER_LOAD_MODULE_BROKER: u64 = 0x5255_0020;
-pub const SYS_RUSTOS_DRIVER_PROBE_ALIAS_BROKER: u64 = 0x5255_0021;
-pub const SYS_RUSTOS_SERVICE_DRIVER_RESOURCE_BROKER: u64 = 0x5255_0022;
+// 0x5255_0020..=0x5255_0022 are permanently retired. RustOS has no
+// loadable-kernel-module or userspace hardware-driver ABI; do not reuse them.
 pub const SYS_RUSTOS_NET_BROKER: u64 = 0x5255_0023;
 pub const SYS_RUSTOS_BLOCK_BROKER: u64 = 0x5255_0024;
 pub const SYS_RUSTOS_INPUT_STATS_BROKER: u64 = 0x5255_0026;
@@ -51,7 +50,8 @@ pub const SYS_RUSTOS_DEVICE_OPEN_BROKER: u64 = 0x5255_0032;
 pub const SYS_RUSTOS_INPUT_INGEST_BROKER: u64 = 0x5255_0033;
 pub const SYS_RUSTOS_IPC_TRY_RECV: u64 = 0x5255_0035;
 pub const SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER: u64 = 0x5255_0036;
-pub const SYS_RUSTOS_DRIVER_SYMBOL_EVENT_BROKER: u64 = 0x5255_0037;
+// 0x5255_0037 is permanently retired with the removed kernel-module symbol
+// event ABI; do not reuse it.
 pub const SYS_RUSTOS_IPC_RECV_WITH_SENDER: u64 = 0x5255_0038;
 pub const SYS_RUSTOS_IPC_WAIT_SERVICE_ENDPOINT: u64 = 0x5255_0039;
 pub const SYS_RUSTOS_PROC_ACTIVATE_BROKER: u64 = 0x5255_003a;
@@ -85,6 +85,10 @@ pub const SYS_RUSTOS_IPC_VALIDATE_SERVICE_OWNER: u64 = 0x5255_0042;
 /// kernel-stamped loader requester and still carries that unconsumed
 /// activation authority.
 pub const SYS_RUSTOS_PROC_VALIDATE_DEFERRED_SPAWN_BROKER: u64 = 0x5255_0043;
+/// Raw byte-only IPC call with an explicit finite caller deadline in
+/// milliseconds. The kernel clamps it to the global service ceiling and
+/// cancels the exact reply identity on timeout.
+pub const SYS_RUSTOS_IPC_CALL_BOUNDED: u64 = 0x5255_0044;
 /// Irreversibly removes the caller's base System scheduling admission.
 ///
 /// This is deliberately a self-demotion only: it never accepts a requested
@@ -118,7 +122,7 @@ pub const IPC_SERVICE_LINUX_SYSCALLD: u64 = 1;
 pub const IPC_SERVICE_VFSD: u64 = 2;
 pub const IPC_SERVICE_NETD: u64 = 3;
 pub const IPC_SERVICE_DEVMGRD: u64 = 4;
-pub const IPC_SERVICE_DRIVERD: u64 = 5;
+// Service identity 5 is permanently unassigned.
 pub const IPC_SERVICE_LOADERD: u64 = 6;
 pub const IPC_SERVICE_STORAGED: u64 = 7;
 pub const IPC_SERVICE_INPUTD: u64 = 8;
@@ -126,7 +130,7 @@ pub const IPC_SERVICE_PROCD: u64 = 9;
 pub const IPC_SERVICE_ROOTD: u64 = 10;
 pub const IPC_SERVICE_SESSIOND: u64 = 11;
 pub const IPC_SERVICE_PAGERD: u64 = 12;
-pub const IPC_SERVICE_SERVICE_DRIVERD: u64 = 13;
+// Service identity 13 is permanently unassigned.
 pub const IPC_SERVICE_UISERVER: u64 = 14;
 /// Identity-only publication for the current rootd-supervised init policy
 /// process.  The endpoint is not a request API: it gives brokers a
@@ -137,7 +141,7 @@ pub const IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY: u64 = 1 << 0;
 pub const IPC_SERVICE_CAP_VFS_POLICY: u64 = 1 << 1;
 pub const IPC_SERVICE_CAP_NET_POLICY: u64 = 1 << 2;
 pub const IPC_SERVICE_CAP_DEVICE_POLICY: u64 = 1 << 3;
-pub const IPC_SERVICE_CAP_DRIVER_POLICY: u64 = 1 << 4;
+// Capability bit 4 is permanently unassigned.
 pub const IPC_SERVICE_CAP_PROCESS_LOADER: u64 = 1 << 5;
 pub const IPC_SERVICE_CAP_STORAGE_POLICY: u64 = 1 << 6;
 pub const IPC_SERVICE_CAP_INPUT_POLICY: u64 = 1 << 7;
@@ -145,14 +149,13 @@ pub const IPC_SERVICE_CAP_PROCESS_POLICY: u64 = 1 << 8;
 pub const IPC_SERVICE_CAP_ROOT_SUPERVISOR: u64 = 1 << 9;
 pub const IPC_SERVICE_CAP_SESSION_POLICY: u64 = 1 << 10;
 pub const IPC_SERVICE_CAP_PAGER_POLICY: u64 = 1 << 11;
-pub const IPC_SERVICE_CAP_SERVICE_DRIVER_POLICY: u64 = 1 << 12;
+// Capability bit 12 is permanently unassigned.
 pub const IPC_SERVICE_CAP_UI_POLICY: u64 = 1 << 13;
 pub const IPC_SERVICE_CAP_INIT_POLICY: u64 = 1 << 14;
 pub const IPC_SERVICE_CAP_BOOTSTRAP_POLICY: u64 = IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY
     | IPC_SERVICE_CAP_VFS_POLICY
     | IPC_SERVICE_CAP_NET_POLICY
     | IPC_SERVICE_CAP_DEVICE_POLICY
-    | IPC_SERVICE_CAP_DRIVER_POLICY
     | IPC_SERVICE_CAP_PROCESS_LOADER;
 pub const SYSCALL_OFFLOAD_ABI_VERSION: u16 = 1;
 pub const SYSCALL_OFFLOAD_OP_LINUX_STATX: u16 = 1;
@@ -218,7 +221,7 @@ pub const SYSCALL_OFFLOAD_OP_LINUX_MMAP: u16 = 60;
 pub const SYSCALL_OFFLOAD_OP_LINUX_MPROTECT: u16 = 61;
 pub const SYSCALL_OFFLOAD_OP_LINUX_MUNMAP: u16 = 62;
 pub const SYSCALL_OFFLOAD_OP_LINUX_MEMFD_CREATE: u16 = 63;
-pub const SYSCALL_OFFLOAD_OP_DRIVER_LOAD_POLICY: u16 = 64;
+// Operation 64 is permanently retired with the module-load policy ABI.
 pub const SYSCALL_OFFLOAD_OP_LINUX_PROCESS_EXIT: u16 = 65;
 pub const SYSCALL_OFFLOAD_OP_LINUX_FUTEX_POLICY: u16 = 66;
 pub const SYSCALL_OFFLOAD_OP_LINUX_ARCH_PRCTL_POLICY: u16 = 67;
@@ -357,6 +360,10 @@ pub const VFS_IPC_PAYLOAD_CAPACITY: usize = IPC_MAX_INLINE_BYTES - VFS_IPC_RESPO
 pub const VFS_IPC_HANDLE_KIND_FILE: u16 = 1;
 pub const VFS_IPC_HANDLE_KIND_DIR: u16 = 2;
 pub const VFS_IPC_HANDLE_KIND_DEVICE: u16 = 3;
+/// vfsd-selected compatibility route for `/dev/dri/card0`. Compat may retain
+/// a remote VFS device description only for this explicit service decision;
+/// it must not classify the path in ring0.
+pub const VFS_DEVICE_ACCESS_DRM_COMPAT: u16 = 0x0100;
 pub const DEVMGRD_IPC_ABI_VERSION: u16 = 1;
 pub const DEVMGRD_IPC_OP_LOOKUP: u16 = 1;
 pub const DEVMGRD_IPC_OP_READDIR: u16 = 2;
@@ -395,7 +402,7 @@ pub const ROOTD_LEASE_STATE_RUNNING: u16 = 1;
 pub const ROOTD_LEASE_STATE_EXITED: u16 = 2;
 pub const ROOTD_LEASE_STATE_RESTART_PENDING: u16 = 3;
 pub const ROOTD_LEASE_STATE_FAILED: u16 = 4;
-pub const NETD_IPC_ABI_VERSION: u16 = 4;
+pub const NETD_IPC_ABI_VERSION: u16 = 5;
 pub const NETD_IPC_PAYLOAD_CAPACITY: usize = 32 * 1024;
 /// Netd v2 sends only the fixed header plus `payload_len`; the unused tail of
 /// the in-memory transport buffer is not copied through the kernel IPC path.
@@ -418,9 +425,20 @@ pub const NETD_RECVMSG_PAYLOAD_HEADER_SIZE: usize = 16;
 pub const NET_BROKER_OP_PACKET_STATUS: u16 = 0x8001;
 pub const NET_BROKER_OP_PACKET_TX: u16 = 0x8002;
 pub const NET_BROKER_OP_PACKET_RX: u16 = 0x8003;
+/// Grant or revoke the kernel-enforced generation lease for the bounded DVM
+/// Ethernet aperture. Only netd's service capability may invoke these broker
+/// operations; the lifecycle policy that chooses a generation stays in netd.
+pub const NET_BROKER_OP_PACKET_LEASE_GRANT: u16 = 0x8004;
+pub const NET_BROKER_OP_PACKET_LEASE_REVOKE: u16 = 0x8005;
+pub const NET_BROKER_OP_PACKET_LEASE_RESET: u16 = 0x8006;
 /// Kernel-only acknowledgement that retires one completed replay-safe
 /// dup/close operation from netd's bounded reconciliation table.
 pub const NETD_IPC_OP_REF_ACK: u16 = 0x8004;
+/// inputd-to-netd authenticated DVM lifecycle notification. `arg0` is the
+/// non-zero transport epoch and `arg1` is one of `NETD_DVM_SESSION_*`.
+pub const NETD_IPC_OP_DVM_SESSION: u16 = 0x8005;
+pub const NETD_DVM_SESSION_GRANT: u64 = 1;
+pub const NETD_DVM_SESSION_REVOKE: u64 = 2;
 pub const NET_BROKER_PACKET_MTU: usize = 1514;
 /// No validated DVM Ethernet aperture is currently mapped.
 pub const NET_BROKER_PACKET_STATUS_UNAVAILABLE: u64 = 0;
@@ -524,26 +542,6 @@ pub const PROC_BROKER_USER_SPACE_END_EXCLUSIVE: u64 = 2 << 39;
 pub const PROC_BROKER_DATA_PAYLOAD_CAPACITY: usize = 4096;
 pub const PROC_BROKER_BATCH_CAPACITY: usize = 8;
 pub const PROC_BROKER_LINUX_INTERP_PATH_CAPACITY: usize = 256;
-pub const DRIVER_BROKER_NAME_CAPACITY: usize = 64;
-pub const DRIVER_BROKER_PATH_CAPACITY: usize = 256;
-pub const DRIVER_BROKER_ALIAS_CAPACITY: usize = 256;
-pub const DRIVER_CLASS_DISPLAY: u32 = 1;
-pub const DRIVER_CLASS_INPUT: u32 = 2;
-pub const DRIVER_CLASS_NETWORK: u32 = 3;
-pub const DRIVER_CLASS_USB: u32 = 4;
-pub const DRIVER_CLASS_STORAGE: u32 = 5;
-pub const DRIVER_BUS_PLATFORM: u32 = 1;
-pub const DRIVER_BUS_SERIO: u32 = 2;
-pub const DRIVER_BUS_USB: u32 = 3;
-pub const DRIVER_BUS_PCI: u32 = 4;
-pub const DRIVER_BUS_VIRTIO: u32 = 5;
-pub const DRIVER_LOAD_POLICY_DISPLAY_PRIMARY: u64 = 1 << 0;
-pub const DRIVER_LOAD_POLICY_DISPLAY_FALLBACK: u64 = 1 << 1;
-/// Retired: preferred scanout sizing is driverd/provider policy and must not
-/// be interpreted by the ring0 module-load broker.
-pub const DRIVER_LOAD_POLICY_DISPLAY_PREFERRED_SCANOUT: u64 = 1 << 2;
-pub const DRIVER_LOAD_POLICY_KNOWN_FLAGS: u64 =
-    DRIVER_LOAD_POLICY_DISPLAY_PRIMARY | DRIVER_LOAD_POLICY_DISPLAY_FALLBACK;
 pub const STORAGE_LIST_PATH_CAPACITY: usize = 64;
 pub const STORAGE_FLAG_READONLY: u32 = 1 << 0;
 pub const STORAGE_TRANSPORT_DVM_BLOCK: u32 = 4;
@@ -565,10 +563,10 @@ pub const COMMERCIAL_MAX_PROTOCOL_DEVMGRD: u16 = 6;
 pub const COMMERCIAL_MAX_PROTOCOL_INPUTD: u16 = 7;
 pub const COMMERCIAL_MAX_PROTOCOL_STORAGED: u16 = 8;
 pub const COMMERCIAL_MAX_PROTOCOL_NETD: u16 = 9;
-pub const COMMERCIAL_MAX_PROTOCOL_DRIVERD: u16 = 10;
+// Protocol identity 10 is permanently unassigned.
 pub const COMMERCIAL_MAX_PROTOCOL_SESSIOND: u16 = 11;
 pub const COMMERCIAL_MAX_PROTOCOL_PAGERD: u16 = 12;
-pub const COMMERCIAL_MAX_PROTOCOL_SERVICE_DRIVERD: u16 = 13;
+// Protocol identity 13 is permanently unassigned.
 pub const COMMERCIAL_MAX_PROTOCOL_CAPABILITY: u16 = 14;
 pub const COMMERCIAL_MAX_PROTOCOL_UISERVER: u16 = 15;
 pub const COMMERCIAL_MAX_ROOTD_OP_BOOTSTRAP_MANIFEST: u16 = 1;
@@ -632,6 +630,8 @@ pub const COMMERCIAL_MAX_DEVMGRD_OP_DEVICE_OPEN: u16 = 2;
 pub const COMMERCIAL_MAX_DEVMGRD_OP_IOCTL_AUTHORIZE: u16 = 3;
 pub const COMMERCIAL_MAX_DEVMGRD_OP_DEVICE_MAP: u16 = 4;
 pub const COMMERCIAL_MAX_DEVMGRD_OP_DEVICE_EVENT_SUBSCRIBE: u16 = 5;
+/// Retired in inputd ABI v5. Kept as a numeric tombstone so a stale client is
+/// rejected instead of being reinterpreted as another operation.
 pub const COMMERCIAL_MAX_INPUTD_OP_INPUT_INGEST: u16 = 1;
 pub const COMMERCIAL_MAX_INPUTD_OP_INPUT_READER: u16 = 2;
 pub const COMMERCIAL_MAX_INPUTD_OP_EVDEV_TRANSLATE: u16 = 3;
@@ -660,12 +660,6 @@ pub const COMMERCIAL_MAX_NETD_OP_ADDRESS_BIND: u16 = 3;
 pub const COMMERCIAL_MAX_NETD_OP_ROUTE_POLICY: u16 = 4;
 pub const COMMERCIAL_MAX_NETD_OP_PACKET_LEASE: u16 = 5;
 pub const COMMERCIAL_MAX_NETD_OP_FD_TRANSFER: u16 = 6;
-pub const COMMERCIAL_MAX_DRIVERD_OP_DRIVER_PLAN: u16 = 1;
-pub const COMMERCIAL_MAX_DRIVERD_OP_MODULE_LOAD_AUTHORIZE: u16 = 2;
-pub const COMMERCIAL_MAX_DRIVERD_OP_SYMBOL_POLICY: u16 = 3;
-pub const COMMERCIAL_MAX_DRIVERD_OP_PROVIDER_SELECT: u16 = 4;
-pub const COMMERCIAL_MAX_DRIVERD_OP_RETRY_BUDGET: u16 = 5;
-pub const COMMERCIAL_MAX_DRIVERD_OP_FALLBACK_POLICY: u16 = 6;
 pub const COMMERCIAL_MAX_SESSIOND_OP_SESSION_GRAPH: u16 = 1;
 pub const COMMERCIAL_MAX_SESSIOND_OP_TTY_LINE_DISCIPLINE: u16 = 2;
 pub const COMMERCIAL_MAX_SESSIOND_OP_CONSOLE_ROUTE: u16 = 3;
@@ -682,40 +676,6 @@ pub const COMMERCIAL_MAX_PAGERD_OP_BACKING_OBJECT: u16 = 1;
 pub const COMMERCIAL_MAX_PAGERD_OP_PAGE_CACHE_POLICY: u16 = 2;
 pub const COMMERCIAL_MAX_PAGERD_OP_FAULT_RESOLVE: u16 = 3;
 pub const COMMERCIAL_MAX_PAGERD_OP_WRITEBACK_POLICY: u16 = 4;
-pub const COMMERCIAL_MAX_SERVICE_DRIVERD_OP_DRIVER_INSTANCE: u16 = 1;
-pub const COMMERCIAL_MAX_SERVICE_DRIVERD_OP_MMIO_LEASE: u16 = 2;
-pub const COMMERCIAL_MAX_SERVICE_DRIVERD_OP_IRQ_ROUTE: u16 = 3;
-pub const COMMERCIAL_MAX_SERVICE_DRIVERD_OP_DMA_BUFFER: u16 = 4;
-pub const COMMERCIAL_MAX_SERVICE_DRIVERD_OP_IO_PORT_LEASE: u16 = 5;
-pub const SERVICE_DRIVER_RESOURCE_BROKER_ABI_VERSION: u16 = 1;
-pub const SERVICE_DRIVER_RESOURCE_OP_MMIO_LEASE: u16 = 1;
-pub const SERVICE_DRIVER_RESOURCE_OP_IRQ_ROUTE: u16 = 2;
-pub const SERVICE_DRIVER_RESOURCE_OP_DMA_BUFFER: u16 = 3;
-pub const SERVICE_DRIVER_RESOURCE_OP_IO_PORT_LEASE: u16 = 4;
-pub const SERVICE_DRIVER_RESOURCE_OP_IO_PORT_READ: u16 = 5;
-pub const SERVICE_DRIVER_RESOURCE_OP_IO_PORT_WRITE: u16 = 6;
-pub const DRIVER_SYMBOL_EVENT_BROKER_ABI_VERSION: u16 = 1;
-pub const DRIVER_SYMBOL_EVENT_OP_DRAIN: u16 = 1;
-pub const DRIVER_SYMBOL_EVENT_SYMBOL_CAPACITY: usize = 64;
-pub const DRIVER_SYMBOL_EVENT_MODULE_CAPACITY: usize = 64;
-pub const DRIVER_SYMBOL_EVENT_CONTEXT_PROBE_INIT: u16 = 1;
-pub const DRIVER_SYMBOL_EVENT_CONTEXT_PCI_RESOURCE: u16 = 2;
-pub const DRIVER_SYMBOL_EVENT_CONTEXT_PCI_CONFIG: u16 = 3;
-pub const DRIVER_SYMBOL_EVENT_CONTEXT_DEVICE_MODEL: u16 = 4;
-pub const DRIVER_SYMBOL_EVENT_CONTEXT_RESOURCE_LEASE: u16 = 5;
-pub const DRIVER_SYMBOL_EVENT_CONTEXT_WORKQUEUE_TIMER: u16 = 6;
-pub const DRIVER_SYMBOL_EVENT_SCOPE_PCI: u16 = 1;
-pub const DRIVER_SYMBOL_EVENT_SCOPE_USB: u16 = 2;
-pub const DRIVER_SYMBOL_EVENT_SCOPE_HID: u16 = 3;
-pub const DRIVER_SYMBOL_EVENT_SCOPE_DEVICE_MODEL: u16 = 4;
-pub const DRIVER_SYMBOL_EVENT_SCOPE_VIRTIO: u16 = 5;
-pub const DRIVER_SYMBOL_EVENT_SCOPE_DRM: u16 = 6;
-pub const DRIVER_SYMBOL_EVENT_SCOPE_NETDEV: u16 = 7;
-pub const DRIVER_SYMBOL_EVENT_SCOPE_DMA: u16 = 8;
-pub const DRIVER_SYMBOL_EVENT_SCOPE_MMIO: u16 = 9;
-pub const DRIVER_SYMBOL_EVENT_SCOPE_IRQ: u16 = 10;
-pub const DRIVER_SYMBOL_EVENT_SCOPE_WORKQUEUE: u16 = 11;
-pub const DRIVER_SYMBOL_EVENT_FLAG_DROPPED_BEFORE: u32 = 1 << 0;
 pub const COMMERCIAL_MAX_UISERVER_OP_DISPLAY_READINESS: u16 = 1;
 pub const COMMERCIAL_MAX_UISERVER_OP_DISPLAY_METADATA: u16 = 2;
 pub const COMMERCIAL_MAX_UISERVER_OP_SURFACE_POLICY: u16 = 3;
@@ -1021,53 +981,6 @@ impl Default for StoragedBulkReadResponse {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct ServiceDriverMmioLeaseWire {
-    pub phys_start: u64,
-    pub byte_len: u64,
-    pub cache_policy: u32,
-    pub flags: u32,
-    pub lease_id: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct ServiceDriverIrqRouteWire {
-    pub irq: u32,
-    pub vector: u32,
-    pub flags: u32,
-    pub reserved0: u32,
-    pub route_id: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct ServiceDriverDmaBufferWire {
-    pub byte_len: u64,
-    pub alignment: u64,
-    pub flags: u32,
-    pub reserved0: u32,
-    pub buffer_id: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct ServiceDriverIoPortLeaseWire {
-    pub port_start: u16,
-    pub port_count: u16,
-    pub flags: u32,
-    pub lease_id: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct ServiceDriverIoPortValueWire {
-    pub value: u32,
-    pub width: u16,
-    pub reserved0: u16,
-}
-
-#[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StorageBlockDescriptorWire {
     pub id: u32,
@@ -1118,13 +1031,16 @@ pub struct InputStatsWire {
 
 pub const INPUT_STATS_FLAG_PENDING_COALESCED: u32 = 1 << 0;
 pub const INPUT_STATS_FLAG_PENDING_POINTER_POSITION: u32 = 1 << 1;
-/// Version 2 adds the report-atomic absolute pointer position member to
-/// `InputIngressWire`.  The size/layout change is intentionally incompatible
-/// with version 1 so a mixed kernel/inputd image fails closed.
-pub const INPUTD_IPC_ABI_VERSION: u16 = 3;
+/// Version 5 makes the MSI-X-woken inputd worker the sole transport consumer.
+/// Client STATS/READ operations observe only the service-owned policy queue
+/// and can no longer advance the DVM ring. The kernel broker transfers only
+/// fixed, generation-stamped transport records. Mixed images fail closed at
+/// the broker version gate.
+pub const INPUTD_IPC_ABI_VERSION: u16 = 5;
 pub const INPUTD_IPC_OP_PING: u16 = 1;
 pub const INPUTD_IPC_OP_STATS: u16 = 2;
 pub const INPUTD_IPC_OP_AUTHORIZE_READ: u16 = 3;
+/// Retired in ABI v5; stale requests receive `EINVAL`.
 pub const INPUTD_IPC_OP_DRAIN_INGEST: u16 = 4;
 pub const INPUTD_IPC_OP_READ: u16 = 5;
 pub const INPUTD_IPC_OP_SET_POINTER_SURFACE: u16 = 6;
@@ -1132,6 +1048,8 @@ pub const INPUTD_ACCESS_NATIVE: u16 = 1;
 pub const INPUTD_ACCESS_EVDEV: u16 = 2;
 pub const INPUTD_READ_PAYLOAD_CAPACITY: usize = 32 * 1024;
 pub const INPUTD_INGEST_MAX_EVENTS: usize = 256;
+pub const INPUTD_DVM_RECORD_BYTES: usize = 32;
+pub const INPUTD_DVM_RECORD_FLAG_RESET: u32 = 1 << 0;
 pub const INPUTD_READ_FLAG_NONBLOCK: u32 = 1 << 0;
 pub const INPUTD_INGRESS_KIND_POINTER_PACKET: u16 = 2;
 pub const INPUTD_INGRESS_KIND_POINTER_POSITION: u16 = 3;
@@ -1154,7 +1072,7 @@ pub struct InputStatsBrokerArgs {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct InputKeyboardEventWire {
     pub action: u16,
     pub reserved0: u16,
@@ -1164,7 +1082,7 @@ pub struct InputKeyboardEventWire {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct InputPointerPacketWire {
     pub buttons: u8,
     pub reserved0: [u8; 3],
@@ -1175,7 +1093,7 @@ pub struct InputPointerPacketWire {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct InputPointerPositionWire {
     pub buttons: u8,
     pub reserved0: [u8; 3],
@@ -1186,7 +1104,7 @@ pub struct InputPointerPositionWire {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct InputIngressWire {
     pub kind: u16,
     pub access: u16,
@@ -1197,12 +1115,35 @@ pub struct InputIngressWire {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InputDvmRecordWire {
+    /// Kernel-observed generation of the fixed shared-memory transport.
+    pub transport_generation: u64,
+    pub flags: u32,
+    pub len: u16,
+    pub reserved0: u16,
+    pub bytes: [u8; INPUTD_DVM_RECORD_BYTES],
+}
+
+impl Default for InputDvmRecordWire {
+    fn default() -> Self {
+        Self {
+            transport_generation: 0,
+            flags: 0,
+            len: 0,
+            reserved0: 0,
+            bytes: [0; INPUTD_DVM_RECORD_BYTES],
+        }
+    }
+}
+
+#[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct InputIngestBrokerArgs {
     pub abi_version: u16,
     pub reserved0: u16,
     pub reserved1: u32,
-    pub out_events_ptr: u64,
+    pub out_records_ptr: u64,
     pub out_capacity: u32,
     pub reserved2: u32,
     pub out_count_ptr: u64,
@@ -1498,102 +1439,6 @@ impl Default for VfsIpcResponse {
             payload: [0; VFS_IPC_PAYLOAD_CAPACITY],
         }
     }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct RustosDriverLoadModuleBrokerArgs {
-    pub name_ptr: u64,
-    pub name_len: u64,
-    pub class: u32,
-    pub bus: u32,
-    pub path_ptr: u64,
-    pub path_len: u64,
-    pub linux_driver_names_ptr: u64,
-    pub linux_driver_names_len: u64,
-    pub policy_flags: u64,
-    pub preferred_width: u32,
-    pub preferred_height: u32,
-    pub reserved0: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct RustosDriverProbeAliasBrokerArgs {
-    pub alias_ptr: u64,
-    pub alias_len: u64,
-    pub class: u32,
-    pub bus: u32,
-    pub reserved0: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct RustosServiceDriverResourceBrokerArgs {
-    pub abi_version: u16,
-    pub op: u16,
-    pub flags: u32,
-    pub subject_pid: u64,
-    pub subject_tid: u64,
-    pub arg0: u64,
-    pub arg1: u64,
-    pub arg2: u64,
-    pub out_ptr: u64,
-    pub out_len: u64,
-    pub reserved0: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct LinuxDriverSymbolEventWire {
-    pub sequence: u64,
-    pub dropped_before: u64,
-    pub class: u32,
-    pub bus: u32,
-    pub context: u16,
-    pub scope: u16,
-    pub flags: u32,
-    pub arg0: u64,
-    pub arg1: u64,
-    pub arg2: u64,
-    pub symbol_len: u16,
-    pub module_len: u16,
-    pub reserved0: u32,
-    pub symbol: [u8; DRIVER_SYMBOL_EVENT_SYMBOL_CAPACITY],
-    pub module: [u8; DRIVER_SYMBOL_EVENT_MODULE_CAPACITY],
-}
-
-impl Default for LinuxDriverSymbolEventWire {
-    fn default() -> Self {
-        Self {
-            sequence: 0,
-            dropped_before: 0,
-            class: 0,
-            bus: 0,
-            context: 0,
-            scope: 0,
-            flags: 0,
-            arg0: 0,
-            arg1: 0,
-            arg2: 0,
-            symbol_len: 0,
-            module_len: 0,
-            reserved0: 0,
-            symbol: [0; DRIVER_SYMBOL_EVENT_SYMBOL_CAPACITY],
-            module: [0; DRIVER_SYMBOL_EVENT_MODULE_CAPACITY],
-        }
-    }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct RustosDriverSymbolEventBrokerArgs {
-    pub abi_version: u16,
-    pub op: u16,
-    pub flags: u32,
-    pub out_ptr: u64,
-    pub out_len: u64,
-    pub reserved0: u64,
 }
 
 #[repr(C)]
@@ -2988,7 +2833,7 @@ mod syscall_tests {
     }
 
     #[test]
-    fn netd_v4_wire_headers_exclude_the_reserved_payload_tail() {
+    fn netd_v5_wire_headers_exclude_the_reserved_payload_tail() {
         assert_eq!(NETD_IPC_REQUEST_HEADER_SIZE, 136);
         assert_eq!(NETD_IPC_RESPONSE_HEADER_SIZE, 32);
         assert_eq!(

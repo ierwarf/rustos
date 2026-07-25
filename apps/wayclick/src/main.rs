@@ -162,6 +162,14 @@ fn main() {
     let qh = event_queue.handle();
     conn.display().get_registry(&qh, ());
     raw_stderr_line("wayclick: registry requested");
+    // The initial registry request has no incoming event to wake a client that
+    // enters its first blocking dispatch before the buffered write reaches
+    // netd. Publish it explicitly; all later request batches use the matching
+    // post-dispatch flush below.
+    if let Err(err) = conn.flush() {
+        raw_stderr_line(&format!("wayclick: initial flush failed: {err:?}"));
+        return;
+    }
 
     let mut state = GameState::new();
     while state.running {
@@ -210,6 +218,7 @@ struct GameState {
     target_x: i32,
     target_y: i32,
     target_radius: i32,
+    pending_damage: DamageRegion,
     profile: FrameProfile,
 }
 
@@ -240,6 +249,7 @@ impl GameState {
             target_x: 0,
             target_y: 0,
             target_radius: 34,
+            pending_damage: DamageRegion::full(),
             profile: FrameProfile::new(),
         };
         state.reseed_target();
@@ -361,10 +371,87 @@ impl GameState {
         self.redraw_pending = false;
         self.frame_callback = Some(surface.frame(qh, ()));
         surface.attach(Some(&wl_buffer), 0, 0);
-        surface.damage(0, 0, WIDTH as i32, HEIGHT as i32);
+        if let Some((x, y, width, height)) = self.pending_damage.take() {
+            surface.damage(x, y, width, height);
+        }
         surface.commit();
         self.profile.commits = self.profile.commits.saturating_add(1);
         self.profile.record_redraw(redraw_started.elapsed());
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct DamageRegion {
+    bounds: Option<(i32, i32, i32, i32)>,
+}
+
+impl DamageRegion {
+    const fn full() -> Self {
+        Self {
+            bounds: Some((0, 0, WIDTH as i32, HEIGHT as i32)),
+        }
+    }
+
+    fn include_cursor(&mut self, x: f64, y: f64) {
+        self.include_rect(x as i32 - 10, y as i32 - 10, 21, 21);
+    }
+
+    fn include_rect(&mut self, x: i32, y: i32, width: i32, height: i32) {
+        let left = x.clamp(0, WIDTH as i32);
+        let top = y.clamp(0, HEIGHT as i32);
+        let right = x.saturating_add(width).clamp(0, WIDTH as i32);
+        let bottom = y.saturating_add(height).clamp(0, HEIGHT as i32);
+        if right <= left || bottom <= top {
+            return;
+        }
+        self.bounds = Some(match self.bounds {
+            None => (left, top, right - left, bottom - top),
+            Some((old_x, old_y, old_width, old_height)) => {
+                let union_left = old_x.min(left);
+                let union_top = old_y.min(top);
+                let union_right = old_x.saturating_add(old_width).max(right);
+                let union_bottom = old_y.saturating_add(old_height).max(bottom);
+                (
+                    union_left,
+                    union_top,
+                    union_right - union_left,
+                    union_bottom - union_top,
+                )
+            }
+        });
+    }
+
+    fn mark_full(&mut self) {
+        *self = Self::full();
+    }
+
+    fn take(&mut self) -> Option<(i32, i32, i32, i32)> {
+        self.bounds.take()
+    }
+}
+
+#[cfg(test)]
+mod damage_tests {
+    use super::*;
+
+    #[test]
+    fn cursor_damage_unions_old_and_new_positions_without_full_surface_copy() {
+        let mut damage = DamageRegion::default();
+        damage.include_cursor(100.0, 120.0);
+        damage.include_cursor(112.0, 128.0);
+        assert_eq!(damage.take(), Some((90, 110, 33, 29)));
+        assert_eq!(damage.take(), None);
+    }
+
+    #[test]
+    fn cursor_damage_is_clipped_and_state_changes_force_full_damage() {
+        let mut damage = DamageRegion::default();
+        damage.include_cursor(2.0, 3.0);
+        assert_eq!(damage.take(), Some((0, 0, 13, 14)));
+        damage.include_cursor(WIDTH as f64 - 1.0, HEIGHT as f64 - 1.0);
+        assert_eq!(damage.take(), Some((789, 509, 11, 11)));
+        damage.mark_full();
+        assert_eq!(damage.take(), Some((0, 0, WIDTH as i32, HEIGHT as i32)));
     }
 }
 
@@ -538,6 +625,22 @@ impl GameState {
         if let Some(toplevel) = self.toplevel.as_ref() {
             self.update_title(toplevel);
         }
+        self.pending_damage.mark_full();
+        self.request_redraw(qh);
+    }
+
+    fn update_pointer(&mut self, inside: bool, x: f64, y: f64, qh: &QueueHandle<Self>) {
+        if self.pointer_inside {
+            self.pending_damage
+                .include_cursor(self.cursor_x, self.cursor_y);
+        }
+        self.pointer_inside = inside;
+        self.cursor_x = x;
+        self.cursor_y = y;
+        if self.pointer_inside {
+            self.pending_damage
+                .include_cursor(self.cursor_x, self.cursor_y);
+        }
         self.request_redraw(qh);
     }
 }
@@ -573,6 +676,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for GameState {
                         state.buffer_available.push(true);
                     }
                     if state.configured {
+                        state.pending_damage.mark_full();
                         state.request_redraw(qh);
                     }
                 }
@@ -622,6 +726,7 @@ impl Dispatch<xdg_surface::XdgSurface, ()> for GameState {
         if let xdg_surface::Event::Configure { serial } = event {
             xdg_surface.ack_configure(serial);
             state.configured = true;
+            state.pending_damage.mark_full();
             state.request_redraw(qh);
         }
     }
@@ -679,14 +784,10 @@ impl Dispatch<wl_pointer::WlPointer, ()> for GameState {
                 ..
             } => {
                 state.profile.pointer_updates = state.profile.pointer_updates.saturating_add(1);
-                state.pointer_inside = true;
-                state.cursor_x = surface_x;
-                state.cursor_y = surface_y;
-                state.request_redraw(qh);
+                state.update_pointer(true, surface_x, surface_y, qh);
             }
             wl_pointer::Event::Leave { .. } => {
-                state.pointer_inside = false;
-                state.request_redraw(qh);
+                state.update_pointer(false, state.cursor_x, state.cursor_y, qh);
             }
             wl_pointer::Event::Motion {
                 surface_x,
@@ -694,9 +795,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for GameState {
                 ..
             } => {
                 state.profile.pointer_updates = state.profile.pointer_updates.saturating_add(1);
-                state.cursor_x = surface_x;
-                state.cursor_y = surface_y;
-                state.request_redraw(qh);
+                state.update_pointer(true, surface_x, surface_y, qh);
             }
             wl_pointer::Event::Button {
                 button,
