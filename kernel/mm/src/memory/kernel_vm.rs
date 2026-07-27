@@ -96,6 +96,7 @@ pub static KERNEL_PML4: Mutex<PML4<KERNEL_PML4_SIZE_GB>> = Mutex::new(PML4 {
     split_pt: [const { PageTable::new() }; DIRECT_MAP_SPLIT_TABLES],
     split_blocks: [SPLIT_BLOCK_UNMAPPED; DIRECT_MAP_SPLIT_TABLES],
 });
+static DIRECT_MAP_UPDATE_SERIALIZER: Mutex<()> = Mutex::new(());
 
 #[repr(C)]
 pub struct PML4<const SIZE_GB: usize> {
@@ -431,6 +432,75 @@ impl<const SIZE_GB: usize> PML4<SIZE_GB> {
         Ok(())
     }
 
+    fn prepare_page_range_update(
+        &mut self,
+        phys_start: u64,
+        size: u64,
+    ) -> Result<(), &'static str> {
+        if size == 0 {
+            return Err("direct-map protection range is empty");
+        }
+        let start = align_down(phys_start, PAGE_4KIB);
+        let end = align_up(
+            phys_start
+                .checked_add(size)
+                .ok_or("direct-map protection range overflow")?,
+            PAGE_4KIB,
+        )
+        .ok_or("direct-map protection range overflow")?;
+        if end > DIRECT_MAP_PHYS_LIMIT || start >= end {
+            return Err("direct-map protection range exceeds mapped physical limit");
+        }
+
+        let mut required_splits = 0usize;
+        let mut cursor = start;
+        while cursor < end {
+            let block_index = cursor / HUGE_2MIB;
+            let block_start = block_index * HUGE_2MIB;
+            let block_end = block_start + HUGE_2MIB;
+            let entry = self.pd_entry_ref(block_index);
+            if entry.is_unused() {
+                return Err("direct-map protection range contains an unmapped block");
+            }
+            let already_split = self.find_split_slot(block_index).is_some();
+            if !already_split && !entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+                return Err("direct-map leaf table has no owned split slot");
+            }
+            let covers_full_block = cursor == block_start && block_end <= end;
+            if !covers_full_block && !already_split {
+                required_splits = required_splits.saturating_add(1);
+            }
+            cursor = block_end.min(end);
+        }
+        let available_splits = self
+            .split_blocks
+            .iter()
+            .filter(|block| **block == SPLIT_BLOCK_UNMAPPED)
+            .count();
+        if required_splits > available_splits {
+            return Err("direct-map split table budget exhausted");
+        }
+
+        // Split only the partial boundary blocks before changing any requested
+        // permission. A split preserves the effective flags of every leaf.
+        // Once this phase succeeds, each bounded mutation batch is infallible;
+        // callers can never observe a false return after partial permission
+        // changes.
+        cursor = start;
+        while cursor < end {
+            let block_index = cursor / HUGE_2MIB;
+            let block_start = block_index * HUGE_2MIB;
+            let block_end = block_start + HUGE_2MIB;
+            let covers_full_block = cursor == block_start && block_end <= end;
+            if !covers_full_block && self.find_split_slot(block_index).is_none() {
+                self.ensure_split_block_table(block_index)
+                    .ok_or("direct-map split preparation failed")?;
+            }
+            cursor = block_end.min(end);
+        }
+        Ok(())
+    }
+
     fn direct_map_phys_flags(&self, phys_addr: u64) -> Option<PageTableFlags> {
         if phys_addr >= DIRECT_MAP_PHYS_LIMIT {
             return None;
@@ -664,6 +734,16 @@ fn update_direct_map_range_flags_batched(
     let Some((mut cursor, end)) = direct_map_update_bounds(phys_addr, size) else {
         return false;
     };
+    let _update_guard = DIRECT_MAP_UPDATE_SERIALIZER.lock();
+    let prepared = interrupts::without_interrupts(|| {
+        KERNEL_PML4
+            .lock()
+            .prepare_page_range_update(cursor, end - cursor)
+            .is_ok()
+    });
+    if !prepared {
+        return false;
+    }
 
     while cursor < end {
         let chunk_end = cursor
@@ -676,7 +756,10 @@ fn update_direct_map_range_flags_batched(
                 .is_ok()
         });
         if !updated {
-            return false;
+            panic!(
+                "prepared direct-map permission transaction failed after mutation began: start={:#x} end={:#x}",
+                phys_addr, end
+            );
         }
         cursor = chunk_end;
     }
@@ -1073,6 +1156,41 @@ fn write_u64_to_memory(addr: u64, value: u64) {
 
 fn mmio_slot_base(slot: usize) -> u64 {
     MMIO_WINDOW_BASE + slot as u64 * HUGE_2MIB
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn direct_map_update_bounds_are_aligned_nonempty_and_nonwrapping() {
+        assert_eq!(
+            direct_map_update_bounds(0x2_001, 1),
+            Some((0x2_000, 0x3_000))
+        );
+        assert_eq!(direct_map_update_bounds(0x2_000, 0), None);
+        assert_eq!(direct_map_update_bounds(u64::MAX, 2), None);
+        assert_eq!(direct_map_update_bounds(DIRECT_MAP_PHYS_LIMIT, 1), None);
+        assert_eq!(
+            direct_map_update_bounds(DIRECT_MAP_PHYS_LIMIT - 1, 1),
+            Some((DIRECT_MAP_PHYS_LIMIT - PAGE_4KIB, DIRECT_MAP_PHYS_LIMIT))
+        );
+    }
+
+    #[test]
+    fn kernel_segment_protection_rejects_writable_executable_authority() {
+        assert!(kernel_segment_flag_delta(objelf::PF_W | objelf::PF_X).is_err());
+
+        let (exec_add, exec_remove) =
+            kernel_segment_flag_delta(objelf::PF_X).expect("executable segment");
+        assert!(!exec_add.contains(PageTableFlags::WRITABLE));
+        assert!(exec_remove.contains(PageTableFlags::WRITABLE));
+        assert!(exec_remove.contains(PageTableFlags::NO_EXECUTE));
+
+        let (write_add, _) = kernel_segment_flag_delta(objelf::PF_W).expect("writable segment");
+        assert!(write_add.contains(PageTableFlags::WRITABLE));
+        assert!(write_add.contains(PageTableFlags::NO_EXECUTE));
+    }
 }
 
 fn map_mmio_range_internal(phys_addr: u64, size: usize, write_combine: bool) -> Option<u64> {

@@ -121,19 +121,39 @@ pub(crate) struct ContractManifest {
     pub schema: u32,
     pub max_intentional_terminal_models: usize,
     pub models: PathBuf,
+    pub model_bindings: PathBuf,
     pub flows: PathBuf,
+    pub scenarios: PathBuf,
     pub witnesses: PathBuf,
     pub generated_doc: PathBuf,
     #[serde(default)]
     pub source_mappings: Vec<SourceMapping>,
+    #[serde(default)]
+    pub risk_surfaces: Vec<RiskSurface>,
     pub profiles: BTreeMap<String, EvidenceProfile>,
     pub topologies: BTreeMap<String, EvidenceTopology>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ModelBinding {
+    pub model: String,
+    pub role: String,
+    pub flow: String,
+    pub rationale: String,
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct SourceMapping {
     pub path: PathBuf,
     pub models: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct RiskSurface {
+    pub path: PathBuf,
+    pub severity: String,
+    pub flows: Vec<String>,
+    pub reason: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -144,15 +164,34 @@ pub(crate) struct EvidenceProfile {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct EvidenceTopology {
+    pub runtime_scenario: String,
+    pub hard_deadline_ms: u64,
     pub required_runtime_models: Vec<String>,
     pub required_artifacts: Vec<PathBuf>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ProductScenarioStep {
+    pub scenario: String,
+    pub topology: String,
+    pub sequence: usize,
+    pub step: String,
+    pub flow: String,
+    pub transition: String,
+    pub model: String,
+    pub log: String,
+    pub marker: String,
+    pub requires: Vec<String>,
+    pub deadline_ms: u64,
 }
 
 #[derive(Debug)]
 pub(crate) struct ContractRegistry {
     pub manifest: ContractManifest,
     pub models: BTreeMap<String, ModelRecord>,
+    pub model_bindings: Vec<ModelBinding>,
     pub transitions: Vec<Transition>,
+    pub scenarios: Vec<ProductScenarioStep>,
     pub witnesses: BTreeSet<WitnessRecord>,
 }
 
@@ -178,16 +217,20 @@ impl ContractRegistry {
             .with_context(|| format!("read {}", manifest_path.display()))?;
         let manifest: ContractManifest =
             toml::from_str(&manifest_text).context("parse formal/contracts.toml")?;
-        if manifest.schema != 1 {
+        if manifest.schema != 3 {
             bail!("unsupported formal contract schema {}", manifest.schema);
         }
         let models = parse_models(&root.join(&manifest.models))?;
+        let model_bindings = parse_model_bindings(&root.join(&manifest.model_bindings))?;
         let transitions = parse_transitions(&root.join(&manifest.flows))?;
+        let scenarios = parse_product_scenarios(&root.join(&manifest.scenarios))?;
         let witnesses = parse_witnesses(&root.join(&manifest.witnesses))?;
         Ok(Self {
             manifest,
             models,
+            model_bindings,
             transitions,
+            scenarios,
             witnesses,
         })
     }
@@ -265,11 +308,295 @@ impl ContractRegistry {
         for (flow, graph) in self.flow_graphs() {
             validate_flow_graph(flow, &graph)?;
         }
-        for topology in self.manifest.topologies.values() {
+        let flow_ids = self
+            .transitions
+            .iter()
+            .map(|transition| transition.flow.as_str())
+            .collect::<BTreeSet<_>>();
+        let mut bound_models = self
+            .transitions
+            .iter()
+            .map(|transition| transition.model.as_str())
+            .collect::<BTreeSet<_>>();
+        let mut binding_keys = BTreeSet::new();
+        for binding in &self.model_bindings {
+            if !self.models.contains_key(&binding.model) {
+                bail!("model binding uses unknown model {}", binding.model);
+            }
+            if !matches!(binding.role.as_str(), "refinement" | "evidence") {
+                bail!(
+                    "model binding {} has invalid role {}",
+                    binding.model,
+                    binding.role
+                );
+            }
+            if !flow_ids.contains(binding.flow.as_str()) {
+                bail!(
+                    "model binding {} uses unknown whole flow {}",
+                    binding.model,
+                    binding.flow
+                );
+            }
+            if binding.rationale.trim().is_empty() {
+                bail!("model binding {} lacks a rationale", binding.model);
+            }
+            if !binding_keys.insert((&binding.model, &binding.flow)) {
+                bail!(
+                    "duplicate model binding {} -> {}",
+                    binding.model,
+                    binding.flow
+                );
+            }
+            if binding.role == "refinement"
+                && !self
+                    .witnesses
+                    .iter()
+                    .any(|witness| witness.model == binding.model)
+            {
+                bail!(
+                    "refinement model binding {} -> {} lacks an exact source witness",
+                    binding.model,
+                    binding.flow
+                );
+            }
+            bound_models.insert(binding.model.as_str());
+        }
+        let orphan_models = self
+            .models
+            .keys()
+            .map(String::as_str)
+            .filter(|model| !bound_models.contains(model))
+            .collect::<Vec<_>>();
+        if !orphan_models.is_empty() {
+            bail!(
+                "formal models are not bound to a whole flow: {}",
+                orphan_models.join(", ")
+            );
+        }
+        let mut scenario_groups: BTreeMap<(&str, &str), Vec<&ProductScenarioStep>> =
+            BTreeMap::new();
+        for step in &self.scenarios {
+            scenario_groups
+                .entry((step.scenario.as_str(), step.topology.as_str()))
+                .or_default()
+                .push(step);
+        }
+        for ((scenario, topology), steps) in &mut scenario_groups {
+            if !self.manifest.topologies.contains_key(*topology) {
+                bail!("product scenario {scenario} uses unknown topology {topology}");
+            }
+            steps.sort_by_key(|step| step.sequence);
+            let mut step_names = BTreeSet::new();
+            let mut completed: BTreeMap<&str, (&str, u64)> = BTreeMap::new();
+            for (expected_sequence, step) in steps.iter().enumerate() {
+                if step.sequence != expected_sequence {
+                    bail!(
+                        "product scenario {scenario}/{topology} sequence is not contiguous at {}",
+                        step.step
+                    );
+                }
+                if !step_names.insert(step.step.as_str()) {
+                    bail!(
+                        "product scenario {scenario}/{topology} repeats step {}",
+                        step.step
+                    );
+                }
+                if !matches!(step.log.as_str(), "rustos" | "dvm") {
+                    bail!(
+                        "product scenario {scenario}/{topology} step {} uses invalid log {}",
+                        step.step,
+                        step.log
+                    );
+                }
+                if step.marker.is_empty() || step.marker.contains(['\n', '\r', '\t']) {
+                    bail!(
+                        "product scenario {scenario}/{topology} step {} has an invalid marker",
+                        step.step
+                    );
+                }
+                if step.requires.is_empty() {
+                    bail!(
+                        "product scenario {scenario}/{topology} step {} has no prerequisite",
+                        step.step
+                    );
+                }
+                let requires_start = step.requires.iter().any(|required| required == "START");
+                if requires_start && step.requires.len() != 1 {
+                    bail!(
+                        "product scenario {scenario}/{topology} step {} mixes START with step prerequisites",
+                        step.step
+                    );
+                }
+                let transition = self
+                    .transitions
+                    .iter()
+                    .find(|transition| {
+                        transition.flow == step.flow && transition.id == step.transition
+                    })
+                    .with_context(|| {
+                        format!(
+                            "product scenario {scenario}/{topology} step {} uses unknown transition {}/{}",
+                            step.step, step.flow, step.transition
+                        )
+                    })?;
+                if requires_start {
+                    if transition.from != "START" {
+                        bail!(
+                            "product scenario {scenario}/{topology} root step {} must transition from START, found {}",
+                            step.step,
+                            transition.from
+                        );
+                    }
+                } else {
+                    let mut predecessor_states = BTreeSet::new();
+                    let mut prerequisite_names = BTreeSet::new();
+                    for required in &step.requires {
+                        if !prerequisite_names.insert(required.as_str()) {
+                            bail!(
+                                "product scenario {scenario}/{topology} step {} repeats prerequisite {required}",
+                                step.step
+                            );
+                        }
+                        let Some((state, deadline_ms)) = completed.get(required.as_str()) else {
+                            bail!(
+                                "product scenario {scenario}/{topology} step {} requires missing or later step {required}",
+                                step.step
+                            );
+                        };
+                        if *deadline_ms > step.deadline_ms {
+                            bail!(
+                                "product scenario {scenario}/{topology} step {} deadline {} ms precedes prerequisite {required} deadline {} ms",
+                                step.step,
+                                step.deadline_ms,
+                                deadline_ms
+                            );
+                        }
+                        predecessor_states.insert(*state);
+                    }
+                    if !predecessor_states.contains(transition.from.as_str()) {
+                        bail!(
+                            "product scenario {scenario}/{topology} step {} transition starts at {}, outside prerequisite states {:?}",
+                            step.step,
+                            transition.from,
+                            predecessor_states
+                        );
+                    }
+                }
+                if expected_sequence + 1 == steps.len() {
+                    if transition.outcome != Outcome::Success {
+                        bail!(
+                            "product scenario {scenario}/{topology} terminal step {} is not a success outcome",
+                            step.step
+                        );
+                    }
+                } else if transition.outcome != Outcome::Continue {
+                    bail!(
+                        "product scenario {scenario}/{topology} intermediate step {} is not a continue outcome",
+                        step.step
+                    );
+                }
+                let model_refines_flow = transition.model == step.model
+                    || self.model_bindings.iter().any(|binding| {
+                        binding.model == step.model
+                            && binding.flow == step.flow
+                            && binding.role == "refinement"
+                    });
+                if !model_refines_flow {
+                    bail!(
+                        "product scenario {scenario}/{topology} step {} model {} does not refine flow {}",
+                        step.step,
+                        step.model,
+                        step.flow
+                    );
+                }
+                let model = self.models.get(&step.model).with_context(|| {
+                    format!(
+                        "product scenario {scenario}/{topology} step {} uses unknown model {}",
+                        step.step, step.model
+                    )
+                })?;
+                if !model.trace {
+                    bail!(
+                        "product scenario {scenario}/{topology} step {} uses model without runtime trace: {}",
+                        step.step,
+                        step.model
+                    );
+                }
+                if transition.max_wait_ms > step.deadline_ms {
+                    bail!(
+                        "product scenario {scenario}/{topology} step {} absolute deadline {} ms is below transition {}/{} bound {} ms",
+                        step.step,
+                        step.deadline_ms,
+                        step.flow,
+                        step.transition,
+                        transition.max_wait_ms
+                    );
+                }
+                completed.insert(
+                    step.step.as_str(),
+                    (transition.to.as_str(), step.deadline_ms),
+                );
+            }
+            let terminal = steps
+                .last()
+                .expect("validated product scenario group is nonempty");
+            let mut reaches_terminal = BTreeSet::from([terminal.step.as_str()]);
+            loop {
+                let before = reaches_terminal.len();
+                for step in steps.iter() {
+                    if reaches_terminal.contains(step.step.as_str()) {
+                        reaches_terminal.extend(step.requires.iter().map(String::as_str));
+                    }
+                }
+                if reaches_terminal.len() == before {
+                    break;
+                }
+            }
+            let orphaned = steps
+                .iter()
+                .map(|step| step.step.as_str())
+                .filter(|step| !reaches_terminal.contains(step))
+                .collect::<Vec<_>>();
+            if !orphaned.is_empty() {
+                bail!(
+                    "product scenario {scenario}/{topology} has branches not joined by terminal step {}: {}",
+                    terminal.step,
+                    orphaned.join(", ")
+                );
+            }
+        }
+        for (topology_name, topology) in &self.manifest.topologies {
             if topology.required_runtime_models.is_empty() || topology.required_artifacts.is_empty()
             {
                 bail!("evidence topology must bind runtime models and binary artifacts");
             }
+            if topology.runtime_scenario.trim().is_empty() || topology.hard_deadline_ms == 0 {
+                bail!(
+                    "evidence topology {topology_name} must bind a runtime scenario and hard deadline"
+                );
+            }
+            let scenario_steps = scenario_groups
+                .get(&(topology.runtime_scenario.as_str(), topology_name.as_str()))
+                .with_context(|| {
+                    format!(
+                        "evidence topology {topology_name} lacks product scenario {}",
+                        topology.runtime_scenario
+                    )
+                })?;
+            let final_deadline = scenario_steps
+                .last()
+                .map(|step| step.deadline_ms)
+                .unwrap_or(0);
+            if final_deadline != topology.hard_deadline_ms {
+                bail!(
+                    "evidence topology {topology_name} deadline {} does not equal scenario terminal deadline {final_deadline}",
+                    topology.hard_deadline_ms
+                );
+            }
+            let scenario_models = scenario_steps
+                .iter()
+                .map(|step| step.model.as_str())
+                .collect::<BTreeSet<_>>();
             let mut runtime_models = BTreeSet::new();
             for model in &topology.required_runtime_models {
                 if !runtime_models.insert(model) {
@@ -280,6 +607,12 @@ impl ContractRegistry {
                 };
                 if !record.trace {
                     bail!("evidence topology requires model without runtime trace: {model}");
+                }
+                if !scenario_models.contains(model.as_str()) {
+                    bail!(
+                        "evidence topology {topology_name} requires runtime model absent from scenario {}: {model}",
+                        topology.runtime_scenario
+                    );
                 }
             }
             let mut artifacts = BTreeSet::new();
@@ -338,6 +671,75 @@ impl ContractRegistry {
                 }
             }
         }
+        let mut risk_paths = BTreeSet::new();
+        for surface in &self.manifest.risk_surfaces {
+            if !root.join(&surface.path).is_file() {
+                bail!(
+                    "formal risk surface does not exist: {}",
+                    surface.path.display()
+                );
+            }
+            if !risk_paths.insert(&surface.path) {
+                bail!(
+                    "formal risk surface is repeated: {}",
+                    surface.path.display()
+                );
+            }
+            if !matches!(surface.severity.as_str(), "critical" | "high") {
+                bail!(
+                    "formal risk surface {} must be critical or high, not {}",
+                    surface.path.display(),
+                    surface.severity
+                );
+            }
+            if surface.reason.trim().is_empty() {
+                bail!(
+                    "formal risk surface {} lacks an inclusion reason",
+                    surface.path.display()
+                );
+            }
+            if surface.flows.is_empty() {
+                bail!(
+                    "formal risk surface {} has no whole-flow coverage",
+                    surface.path.display()
+                );
+            }
+            let mut surface_flows = BTreeSet::new();
+            for flow in &surface.flows {
+                if !surface_flows.insert(flow) {
+                    bail!(
+                        "formal risk surface {} repeats flow {flow}",
+                        surface.path.display()
+                    );
+                }
+                if !flow_ids.contains(flow.as_str()) {
+                    bail!(
+                        "formal risk surface {} uses unknown whole flow {flow}",
+                        surface.path.display()
+                    );
+                }
+                let exact_transition = self.transitions.iter().any(|transition| {
+                    transition.flow == *flow && transition.source == surface.path
+                });
+                let mapped_flow_model = self.manifest.source_mappings.iter().any(|mapping| {
+                    mapping.path == surface.path
+                        && mapping.models.iter().any(|model| {
+                            self.transitions.iter().any(|transition| {
+                                transition.flow == *flow && transition.model == *model
+                            }) || self
+                                .model_bindings
+                                .iter()
+                                .any(|binding| binding.model == *model && binding.flow == *flow)
+                        })
+                });
+                if !exact_transition && !mapped_flow_model {
+                    bail!(
+                        "formal risk surface {} claims flow {flow} without an exact transition or model mapping",
+                        surface.path.display()
+                    );
+                }
+            }
+        }
         Ok(())
     }
 
@@ -372,7 +774,27 @@ impl ContractRegistry {
                     }
                 }
             }
-            if !matched && is_high_risk_source(path) {
+            for surface in &self.manifest.risk_surfaces {
+                if surface.path != *path {
+                    continue;
+                }
+                matched = true;
+                for transition in self
+                    .transitions
+                    .iter()
+                    .filter(|transition| surface.flows.contains(&transition.flow))
+                {
+                    impact.models.insert(transition.model.clone());
+                    if let Some(witness) = self.witnesses.iter().find(|witness| {
+                        witness.model == transition.model
+                            && witness.package == transition.witness_package
+                            && witness.test == transition.witness_test
+                    }) {
+                        impact.witnesses.insert(witness.clone());
+                    }
+                }
+            }
+            if !matched && is_unregistered_high_risk_source(path) {
                 impact.unmapped_high_risk.insert(path.clone());
             }
         }
@@ -400,18 +822,24 @@ impl ContractRegistry {
             .sum::<usize>();
         output.push_str(&format!(
             "- Schema: `{}`\n- Registry SHA-256: `{registry_hash}`\n\
-             - Models: `{}`\n- Whole flows: `{}`\n- Transitions: `{}`\n\
+            - Models: `{}`\n- Whole flows: `{}`\n- Transitions: `{}`\n\
+             - Product runtime scenarios: `{}`\n\
              - Exact source witnesses: `{}`\n- Apalache pilots: `{apalache}`\n\
              - TLAPS theorem models: `{tlaps}`\n- Runtime-traced models: `{runtime_trace}`\n\
              - Intentional-terminal exceptions: `{intentional_terminal}` (ceiling `{}`)\n\
              - Cyclic strongly connected components: `{cyclic_sccs}`\n\
+             - Supporting model bindings: `{}`\n\
+             - Explicit critical/high risk surfaces: `{}`\n\
              - Additional source mappings: `{}`\n\n",
             self.manifest.schema,
             self.models.len(),
             self.flow_count(),
             self.transitions.len(),
+            scenario_groups_count(&self.scenarios),
             self.witnesses.len(),
             self.manifest.max_intentional_terminal_models,
+            self.model_bindings.len(),
+            self.manifest.risk_surfaces.len(),
             self.manifest.source_mappings.len()
         ));
         output.push_str(
@@ -688,14 +1116,36 @@ fn closure<'a>(start: &'a str, edges: &BTreeMap<&'a str, BTreeSet<&'a str>>) -> 
     visited
 }
 
-fn is_high_risk_source(path: &Path) -> bool {
+fn is_unregistered_high_risk_source(path: &Path) -> bool {
     let path = path.to_string_lossy();
-    path.ends_with(".rs")
-        && (path.starts_with("kernel/")
-            || path.starts_with("services/")
-            || path.starts_with("libs/rustos-user-abi/")
-            || path.starts_with("libs/driver-domain-")
-            || path.starts_with("tools/hostd/"))
+    if !path.ends_with(".rs") {
+        return false;
+    }
+    let in_authority_boundary = path.starts_with("kernel/")
+        || path.starts_with("services/")
+        || path.starts_with("libs/rustos-user-abi/")
+        || path.starts_with("libs/driver-domain-")
+        || path.starts_with("tools/hostd/");
+    if !in_authority_boundary {
+        return false;
+    }
+    let file = path.rsplit('/').next().unwrap_or_default();
+    matches!(
+        file,
+        "api.rs"
+            | "main.rs"
+            | "scheduler.rs"
+            | "process_table.rs"
+            | "process_state.rs"
+            | "current.rs"
+            | "irq.rs"
+            | "handlers.rs"
+            | "ipc.rs"
+            | "memfd.rs"
+    ) || file.ends_with("_ops.rs")
+        || path.contains("/broker_ops/")
+        || path.contains("/io/dvm_")
+        || path.contains("/input/dvm_")
 }
 
 fn parse_models(path: &Path) -> Result<BTreeMap<String, ModelRecord>> {
@@ -766,6 +1216,32 @@ fn parse_models(path: &Path) -> Result<BTreeMap<String, ModelRecord>> {
     Ok(models)
 }
 
+fn parse_model_bindings(path: &Path) -> Result<Vec<ModelBinding>> {
+    let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let mut bindings = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if fields.len() != 4 {
+            bail!(
+                "{}:{} has {} model binding fields",
+                path.display(),
+                index + 1,
+                fields.len()
+            );
+        }
+        bindings.push(ModelBinding {
+            model: fields[0].to_owned(),
+            role: fields[1].to_owned(),
+            flow: fields[2].to_owned(),
+            rationale: fields[3].to_owned(),
+        });
+    }
+    Ok(bindings)
+}
+
 fn parse_transitions(path: &Path) -> Result<Vec<Transition>> {
     let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let mut transitions = Vec::new();
@@ -803,6 +1279,59 @@ fn parse_transitions(path: &Path) -> Result<Vec<Transition>> {
         });
     }
     Ok(transitions)
+}
+
+fn parse_product_scenarios(path: &Path) -> Result<Vec<ProductScenarioStep>> {
+    let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let mut steps = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if fields.len() != 11 {
+            bail!(
+                "{}:{} has {} product scenario fields",
+                path.display(),
+                index + 1,
+                fields.len()
+            );
+        }
+        steps.push(ProductScenarioStep {
+            scenario: fields[0].to_owned(),
+            topology: fields[1].to_owned(),
+            sequence: fields[2].parse().with_context(|| {
+                format!("{}:{} invalid scenario sequence", path.display(), index + 1)
+            })?,
+            step: fields[3].to_owned(),
+            flow: fields[4].to_owned(),
+            transition: fields[5].to_owned(),
+            model: fields[6].to_owned(),
+            log: fields[7].to_owned(),
+            marker: fields[8].to_owned(),
+            requires: fields[9]
+                .split(',')
+                .map(str::trim)
+                .filter(|required| !required.is_empty())
+                .map(str::to_owned)
+                .collect(),
+            deadline_ms: fields[10].parse().with_context(|| {
+                format!("{}:{} invalid scenario deadline", path.display(), index + 1)
+            })?,
+        });
+    }
+    if steps.is_empty() {
+        bail!("product scenario registry is empty");
+    }
+    Ok(steps)
+}
+
+fn scenario_groups_count(steps: &[ProductScenarioStep]) -> usize {
+    steps
+        .iter()
+        .map(|step| (step.scenario.as_str(), step.topology.as_str()))
+        .collect::<BTreeSet<_>>()
+        .len()
 }
 
 fn parse_witnesses(path: &Path) -> Result<BTreeSet<WitnessRecord>> {
@@ -873,7 +1402,9 @@ fn registry_hash(registry: &ContractRegistry) -> String {
     );
     for path in [
         &registry.manifest.models,
+        &registry.manifest.model_bindings,
         &registry.manifest.flows,
+        &registry.manifest.scenarios,
         &registry.manifest.witnesses,
         &registry.manifest.generated_doc,
     ] {
@@ -895,6 +1426,17 @@ fn registry_hash(registry: &ContractRegistry) -> String {
         hasher.update(model.nightly_timeout_s.to_le_bytes());
         hasher.update([model.apalache as u8, model.tlaps as u8, model.trace as u8]);
     }
+    for binding in &registry.model_bindings {
+        for field in [
+            binding.model.as_str(),
+            binding.role.as_str(),
+            binding.flow.as_str(),
+            binding.rationale.as_str(),
+        ] {
+            hasher.update(field.as_bytes());
+            hasher.update([0]);
+        }
+    }
     for transition in &registry.transitions {
         for value in [
             transition.flow.as_str(),
@@ -913,6 +1455,27 @@ fn registry_hash(registry: &ContractRegistry) -> String {
         }
         hasher.update(transition.max_wait_ms.to_le_bytes());
     }
+    for step in &registry.scenarios {
+        for field in [
+            step.scenario.as_str(),
+            step.topology.as_str(),
+            step.step.as_str(),
+            step.flow.as_str(),
+            step.transition.as_str(),
+            step.model.as_str(),
+            step.log.as_str(),
+            step.marker.as_str(),
+        ] {
+            hasher.update(field.as_bytes());
+            hasher.update([0]);
+        }
+        for required in &step.requires {
+            hasher.update(required.as_bytes());
+            hasher.update([0]);
+        }
+        hasher.update(step.sequence.to_le_bytes());
+        hasher.update(step.deadline_ms.to_le_bytes());
+    }
     for witness in &registry.witnesses {
         hasher.update(witness.model.as_bytes());
         hasher.update([0]);
@@ -930,6 +1493,18 @@ fn registry_hash(registry: &ContractRegistry) -> String {
             hasher.update([0]);
         }
     }
+    for surface in &registry.manifest.risk_surfaces {
+        hasher.update(surface.path.as_os_str().as_encoded_bytes());
+        hasher.update([0]);
+        hasher.update(surface.severity.as_bytes());
+        hasher.update([0]);
+        for flow in &surface.flows {
+            hasher.update(flow.as_bytes());
+            hasher.update([0]);
+        }
+        hasher.update(surface.reason.as_bytes());
+        hasher.update([0]);
+    }
     for (profile, contract) in &registry.manifest.profiles {
         hasher.update(profile.as_bytes());
         hasher.update([0]);
@@ -942,6 +1517,9 @@ fn registry_hash(registry: &ContractRegistry) -> String {
     for (topology, contract) in &registry.manifest.topologies {
         hasher.update(topology.as_bytes());
         hasher.update([0]);
+        hasher.update(contract.runtime_scenario.as_bytes());
+        hasher.update([0]);
+        hasher.update(contract.hard_deadline_ms.to_le_bytes());
         for model in &contract.required_runtime_models {
             hasher.update(model.as_bytes());
             hasher.update([0]);
@@ -956,7 +1534,11 @@ fn registry_hash(registry: &ContractRegistry) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{BTreeMap, BTreeSet, FlowGraph, cyclic_scc_count};
+    use std::path::Path;
+
+    use super::{
+        BTreeMap, BTreeSet, FlowGraph, cyclic_scc_count, is_unregistered_high_risk_source,
+    };
 
     #[test]
     fn strongly_connected_cycle_with_terminal_exit_is_counted_once() {
@@ -978,5 +1560,24 @@ mod tests {
             incoming,
         };
         assert_eq!(cyclic_scc_count(&graph), 1);
+    }
+
+    #[test]
+    fn high_risk_fallback_targets_stateful_boundaries_not_every_rust_file() {
+        assert!(is_unregistered_high_risk_source(Path::new(
+            "kernel/ps/src/multitask/scheduler.rs"
+        )));
+        assert!(is_unregistered_high_risk_source(Path::new(
+            "services/newpolicyd/src/main.rs"
+        )));
+        assert!(is_unregistered_high_risk_source(Path::new(
+            "kernel/compat/src/user/syscall/linux/new_broker_ops.rs"
+        )));
+        assert!(!is_unregistered_high_risk_source(Path::new(
+            "services/uiserver/src/color.rs"
+        )));
+        assert!(!is_unregistered_high_risk_source(Path::new(
+            "kernel/ps/src/debug_format.rs"
+        )));
     }
 }

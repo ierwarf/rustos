@@ -70,7 +70,6 @@ struct InputQueue {
     dvm_pointer_position: Option<(i32, i32)>,
     read_authorizations: VecDeque<InputReadAuthorization>,
     readiness_generation: u64,
-    dvm_decoder: dvm_protocol::DvmDecoder,
 }
 
 impl Default for InputQueue {
@@ -88,7 +87,6 @@ impl Default for InputQueue {
             dvm_pointer_position: None,
             read_authorizations: VecDeque::new(),
             readiness_generation: 1,
-            dvm_decoder: dvm_protocol::DvmDecoder::default(),
         }
     }
 }
@@ -454,10 +452,11 @@ fn keyboard_action_to_inputd(action: KeyAction) -> u16 {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{
-        apply_dvm_ingress_wire, ingest_batch_needs_immediate_retry, lock_input_queue,
-        lock_input_queue_for_ingestion, validate_commercial_request, DvmIngressLogState,
-        InputQueue, SharedInputQueueState, INPUTD_INGEST_MAX_EVENTS,
+        apply_dvm_ingress_wire, apply_dvm_outcomes, ingest_batch_needs_immediate_retry,
+        lock_input_queue, lock_input_queue_for_ingestion, validate_commercial_request,
+        DvmIngressLogState, InputQueue, SharedInputQueueState, INPUTD_INGEST_MAX_EVENTS,
     };
+    use crate::dvm_protocol::DvmOutcome;
     use rustos_user_abi::syscall::{
         CommercialMaxProtocolRequest, InputIngressWire, InputPointerPacketWire,
         InputPointerPositionWire, InputdIpcRequest, COMMERCIAL_MAX_INPUTD_OP_INPUT_READER,
@@ -518,6 +517,56 @@ mod tests {
         assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), "reader");
         ingestion.join().unwrap();
         reader.join().unwrap();
+    }
+
+    #[test]
+    fn session_authority_sync_never_holds_the_policy_queue_lock() {
+        let queue = Arc::new(SharedInputQueueState {
+            queue: Mutex::new(InputQueue::default()),
+            ingestion_waiting: AtomicBool::new(false),
+        });
+        let mut pending_events = Vec::new();
+        let outcomes = [DvmOutcome {
+            grant_epoch: Some(7),
+            ..DvmOutcome::default()
+        }];
+        let mut observed_unlocked = false;
+
+        let result = apply_dvm_outcomes(&queue, outcomes, &mut pending_events, |epoch, action| {
+            observed_unlocked = queue.queue.try_lock().is_ok();
+            assert_eq!(epoch, 7);
+            assert_eq!(action, super::NETD_DVM_SESSION_GRANT);
+            Ok(())
+        });
+
+        assert_eq!(result, Ok((false, false)));
+        assert!(observed_unlocked);
+    }
+
+    #[test]
+    fn failed_session_authority_sync_resets_without_killing_ring_progress() {
+        let queue = Arc::new(SharedInputQueueState {
+            queue: Mutex::new(InputQueue::default()),
+            ingestion_waiting: AtomicBool::new(false),
+        });
+        lock_input_queue_for_ingestion(&queue).push(pointer_motion(4, 2));
+        let mut pending_events = Vec::new();
+        let outcomes = [DvmOutcome {
+            revoke_epoch: Some(9),
+            reset_input: true,
+            ..DvmOutcome::default()
+        }];
+
+        assert_eq!(
+            apply_dvm_outcomes(&queue, outcomes, &mut pending_events, |_, _| {
+                Err(libc::ETIMEDOUT)
+            }),
+            Err(libc::ETIMEDOUT)
+        );
+        // Already-published events remain ordered for readers; the failed
+        // session contributes no pending event and resets provider state.
+        assert_eq!(lock_input_queue(&queue).len(), 1);
+        assert!(pending_events.is_empty());
     }
 
     fn pointer_position(x: i32, y: i32) -> input_evdev::InputEvent {
@@ -847,7 +896,12 @@ fn start_dvm_ingestion_worker(queue: SharedInputQueue, log_state: Arc<DvmIngress
         .name(String::from("inputd-dvm-ingress"))
         .spawn(move || {
             let mut ingest_scratch = vec![InputDvmRecordWire::default(); INPUTD_INGEST_MAX_EVENTS];
+            let mut pending_events = Vec::with_capacity(INPUTD_INGEST_MAX_EVENTS);
+            let mut decoder = dvm_protocol::DvmDecoder::default();
             let mut retry_without_wait = false;
+            let mut total_drained = 0_u64;
+            let mut next_progress_report = 1_u64;
+            let mut nonempty_batches = 0_u64;
             loop {
                 if !retry_without_wait {
                     if let Err(errno) = wait_for_dvm_ingress() {
@@ -862,17 +916,50 @@ fn start_dvm_ingestion_worker(queue: SharedInputQueue, log_state: Arc<DvmIngress
                         std::process::exit(134);
                     }
                 };
-                let observations = {
-                    let mut queue = lock_input_queue_for_ingestion(&queue);
-                    if let Err(errno) = apply_ingest_records(&mut queue, &ingest_scratch[..drained])
-                    {
+                let outcomes = ingest_scratch[..drained]
+                    .iter()
+                    .map(|record| decoder.consume(record));
+                total_drained = total_drained.saturating_add(drained as u64);
+                if drained != 0 {
+                    nonempty_batches = nonempty_batches.saturating_add(1);
+                }
+                let report_progress = drained != 0
+                    && (nonempty_batches <= 8 || total_drained >= next_progress_report);
+                if report_progress {
+                    debug_line(&format!(
+                        "inputd: DVM transport progress records={total_drained} batch={drained} batch_seq={nonempty_batches} stage=decoded"
+                    ));
+                }
+                let observations = match apply_dvm_outcomes(
+                    &queue,
+                    outcomes,
+                    &mut pending_events,
+                    notify_netd_dvm_session,
+                ) {
+                    Ok(observations) => observations,
+                    Err(errno) => {
+                        // The ring consumer must remain live even when the
+                        // cross-service session-authority handshake fails.
+                        // Reset the decoder and drop this session fail-closed;
+                        // a later authenticated SESSION_START may recover.
+                        // Exiting here leaves a still-ready fixed ring with no
+                        // consumer and eventually turns a bounded IPC failure
+                        // into a permanent host credit stall.
+                        decoder = dvm_protocol::DvmDecoder::default();
                         debug_line(&format!(
-                            "inputd: DVM ingestion decode failed errno={errno}"
+                            "inputd: DVM session authority sync failed errno={errno}; session reset"
                         ));
-                        std::process::exit(134);
+                        (false, false)
                     }
-                    queue.take_dvm_ingress_observations()
                 };
+                if report_progress {
+                    debug_line(&format!(
+                        "inputd: DVM transport progress records={total_drained} batch={drained} batch_seq={nonempty_batches} stage=published"
+                    ));
+                    if total_drained >= next_progress_report {
+                        next_progress_report = total_drained.saturating_add(256);
+                    }
+                }
                 log_dvm_ingress_observation_flags(&log_state, observations);
                 retry_without_wait = ingest_batch_needs_immediate_retry(drained);
                 if retry_without_wait {
@@ -1195,36 +1282,45 @@ fn drain_transport(records: &mut [InputDvmRecordWire]) -> Result<usize, i32> {
     Ok((count as usize).min(records.len()))
 }
 
-fn apply_ingest_records(queue: &mut InputQueue, records: &[InputDvmRecordWire]) -> Result<(), i32> {
-    for record in records {
-        apply_dvm_record(queue, record)?;
+fn apply_dvm_outcomes(
+    queue: &SharedInputQueue,
+    outcomes: impl IntoIterator<Item = dvm_protocol::DvmOutcome>,
+    pending_events: &mut Vec<InputIngressWire>,
+    mut notify_session: impl FnMut(u32, u64) -> Result<(), i32>,
+) -> Result<(bool, bool), i32> {
+    pending_events.clear();
+    for outcome in outcomes {
+        if outcome.reset_input {
+            pending_events.clear();
+            lock_input_queue_for_ingestion(queue).reset_dvm_input();
+        }
+        for (epoch, action) in [
+            (outcome.revoke_epoch, NETD_DVM_SESSION_REVOKE),
+            (outcome.grant_epoch, NETD_DVM_SESSION_GRANT),
+        ] {
+            let Some(epoch) = epoch else {
+                continue;
+            };
+            // Never retain inputd's policy queue mutex across service
+            // discovery or synchronous netd IPC. Apart from avoiding a
+            // lock-order cycle, this lets the endpoint server answer bounded
+            // STATS requests while the session-authority transition settles.
+            if let Err(errno) = notify_session(epoch, action) {
+                pending_events.clear();
+                lock_input_queue_for_ingestion(queue).reset_dvm_input();
+                return Err(errno);
+            }
+        }
+        if let Some(wire) = outcome.event {
+            pending_events.push(wire);
+        }
     }
-    Ok(())
-}
 
-fn apply_dvm_record(queue: &mut InputQueue, record: &InputDvmRecordWire) -> Result<(), i32> {
-    let outcome = queue.dvm_decoder.consume(record);
-    if let Some(epoch) = outcome.revoke_epoch {
-        if let Err(errno) = notify_netd_dvm_session(epoch, NETD_DVM_SESSION_REVOKE) {
-            queue.dvm_decoder = dvm_protocol::DvmDecoder::default();
-            queue.reset_dvm_input();
-            return Err(errno);
-        }
+    let mut queue = lock_input_queue_for_ingestion(queue);
+    for wire in pending_events.drain(..) {
+        apply_dvm_ingress_wire(&mut queue, &wire);
     }
-    if outcome.reset_input {
-        queue.reset_dvm_input();
-    }
-    if let Some(epoch) = outcome.grant_epoch {
-        if let Err(errno) = notify_netd_dvm_session(epoch, NETD_DVM_SESSION_GRANT) {
-            queue.dvm_decoder = dvm_protocol::DvmDecoder::default();
-            queue.reset_dvm_input();
-            return Err(errno);
-        }
-    }
-    if let Some(wire) = outcome.event {
-        apply_dvm_ingress_wire(queue, &wire);
-    }
-    Ok(())
+    Ok(queue.take_dvm_ingress_observations())
 }
 
 fn notify_netd_dvm_session(epoch: u32, action: u64) -> Result<(), i32> {

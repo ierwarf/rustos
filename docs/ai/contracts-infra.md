@@ -104,7 +104,9 @@ or launch policy.
   `formal/CONFORMANCE.md` so execution, failed-gate ownership, and source
   correspondence cannot drift independently.
 - PR evidence is `bash formal/verify-all.sh --profile pr`: exhaustive finite
-  TLC, non-vacuous Kani, Verus, and concrete runtime trace replay.
+  TLC, non-vacuous Kani, Verus, concrete runtime trace replay, native
+  Linux/Windows ABI reference comparison, a bounded restart/crash-consistency
+  matrix, and source-level implementation mutation sensitivity.
 - `formal/system-flows.tsv` is the executable cross-subsystem requirement and
   hazard graph. `formal/check-system-flows.sh` rejects duplicate identities,
   missing terminal paths, unbounded timeout edges, unregistered models,
@@ -117,8 +119,20 @@ or launch policy.
   endpoint publication in a retry loop is a contract failure before TLC.
 - Nightly evidence is `bash formal/verify-all.sh --profile nightly`: the PR
   tier plus selected fixed-seed simulation, Miri, Loom, Apalache, TLAPS, and
-  bounded Rust/C libFuzzer lanes. Simulation and fuzzing are bug finding, not
-  exhaustive proof.
+  bounded Rust/C libFuzzer lanes, plus pinned address/thread instrumentation
+  over the registered host-testable critical/high boundaries. Simulation,
+  instrumentation, and fuzzing are bug finding, not exhaustive proof.
+- `formal/{sanitizer-targets,recovery-scenarios,implementation-mutations}.tsv`
+  are executable inventories, not coverage prose. Each runner rejects missing
+  source witnesses, unsupported classes, zero-test filters, unbounded
+  deadlines, compile-only mutant failures, and stale registry anchors.
+- Proof claims are configuration-scoped. `formal/proof-assumptions.tsv` names
+  the assembly, hardware, boot, DMA, toolchain, external-kernel, tracing,
+  hypervisor, physical-hardware, and side-channel assumptions below the current
+  evidence. `formal/verified-configurations.tsv` binds positive and negative
+  QEMU evidence to their exact topology and explicitly excludes physical
+  hardware. A model pass cannot be reported as covering an absent assumption
+  or configuration.
 - Every `intentional-terminal` model must retain its reason in the registry.
   Every `temporal` model must configure `SPECIFICATION Spec`; direct
   `INIT`/`NEXT` configuration bypasses the fairness formula and is rejected by
@@ -659,9 +673,20 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
 
 ### Current Fault Points
 
-`alloc.frame`, `block.read`, `block.write`, `display.present`, `display.provider.register`, `driver.module.load`, `input.event.enqueue`, `pci.config.read`, `process.spawn`, `socket.recv`, `socket.send`, `virtio-gpu.control.submit`.
+The closed registry is `formal/fault-scenarios.tsv` and currently contains
+`alloc.frame`, `block.read`, `block.write`, `block.flush`,
+`display.present`, `display.provider.register`, and `process.spawn`.
+Configuration and guest admission reject unknown, retired, and duplicate
+points. Normal product configuration keeps injection disabled; an
+`RUSTOS_FAULTS` override replaces the matching `off` rule instead of appending
+a shadowed duplicate. Only `block.flush` currently claims a negative KVM
+acceptance profile; the registry labels the remaining runtime gaps explicitly.
 
-Add new points only at realistic failure boundaries: allocation, block IO, device registration, queue submit, process spawn, IPC/socket send/recv, driver probe/load. **Do not scatter fault checks through arbitrary helper functions.**
+Add new points only at realistic failure boundaries: allocation, block IO,
+device registration, queue submit, or process spawn. Ring3-owned input/network
+policy and DVM-owned hardware drivers need an owner-local fault channel and
+must not be advertised as kernel points before that channel exists. **Do not
+scatter fault checks through arbitrary helper functions.**
 
 `config/rustos.toml` may use normal TOML formatting for fault rules (including multiline arrays); logging extraction must ignore non-logging sections.
 

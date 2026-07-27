@@ -143,8 +143,8 @@ fn default_seeds(target: FuzzTarget) -> Vec<Vec<u8>> {
     match target {
         FuzzTarget::FaultRules => vec![
             b"display.present=fail".to_vec(),
-            b"pci.config.read=fail-after:3;virtio.queue=rate:1".to_vec(),
-            b"alloc.page=drop-every:32".to_vec(),
+            b"process.spawn=fail-after:3;block.read=rate:1".to_vec(),
+            b"alloc.frame=drop-every:32".to_vec(),
         ],
         FuzzTarget::ProjectConfig => vec![
             b"[kernel.build]\ncodegen_units=1\nopt_level=\"2\"\noverflow_checks=true\ndebug_assertions=false\nlto=\"off\"\nforce_frame_pointers=true\nincremental=false\ndebuginfo=\"1\"\nembed_bitcode=false\npanic=\"abort\"\nrelocation_model=\"none\"\nstrip=\"none\"\nextra_rustflags=[]\n[fault_injection]\nenabled=false\nrules=[]\n".to_vec(),

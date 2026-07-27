@@ -120,6 +120,7 @@ pub(super) fn is_linux_rustos_ipc_syscall(syscall_number: u64) -> bool {
             | linux_abi::SYS_RUSTOS_IPC_RECV_WITH_SENDER
             | linux_abi::SYS_RUSTOS_IPC_REPLY
             | linux_abi::SYS_RUSTOS_IPC_CALL_WITH_HANDLES
+            | linux_abi::SYS_RUSTOS_IPC_CALL_WITH_HANDLES_BOUNDED
             | linux_abi::SYS_RUSTOS_IPC_RECV_WITH_HANDLES
             | linux_abi::SYS_RUSTOS_IPC_REPLY_WITH_HANDLES
             | linux_abi::SYS_RUSTOS_IPC_REGISTER_LINUX_SYSCALL_ENDPOINT
@@ -169,6 +170,9 @@ pub(super) fn dispatch_linux_rustos_ipc_syscall(frame: &SyscallFrame) -> u64 {
         }
         linux_abi::SYS_RUSTOS_IPC_CALL_WITH_HANDLES => {
             syscall_linux_rustos_ipc_call_with_handles(frame.rdi)
+        }
+        linux_abi::SYS_RUSTOS_IPC_CALL_WITH_HANDLES_BOUNDED => {
+            syscall_linux_rustos_ipc_call_with_handles_bounded(frame.rdi, frame.rsi)
         }
         linux_abi::SYS_RUSTOS_IPC_RECV_WITH_HANDLES => {
             syscall_linux_rustos_ipc_recv_with_handles(frame.rdi)
@@ -268,9 +272,20 @@ pub(crate) fn cleanup_service_endpoints_for_process(process_id: u64) {
     drop(registry_mutation);
     for service_id in revoked_services.into_iter().take(revoked_count) {
         super::broker_ops::waitset_broker_ops::revoke_waitset_provider(service_id);
+        if service_exit_requires_input_policy_withdrawal(service_id) {
+            // The fixed DVM ring publishes a separate policy-consumer lease.
+            // Service endpoint revocation must withdraw it in the same
+            // process-exit turn; otherwise L0 keeps producing into a ring
+            // whose sole semantic consumer no longer exists.
+            kernel_io_manager::api::input::transport::withdraw_policy_consumer();
+        }
     }
     super::broker_ops::waitset_broker_ops::remove_waitset_waiters_for_process(process_id);
     wake_exited_service_endpoint_waiters(process_id);
+}
+
+fn service_exit_requires_input_policy_withdrawal(service_id: u64) -> bool {
+    service_id == linux_abi::IPC_SERVICE_INPUTD
 }
 
 pub(super) fn current_process_has_service_capability(capability: u64) -> bool {
@@ -1718,10 +1733,9 @@ pub(super) fn syscall_linux_rustos_ipc_reply(
     // endpoint again, so donate the remaining quantum to the original caller
     // instead of round-robining away from a freshly-completed reply.
     if latency_handoff && multitask::set_next_latency_pick_hint(task_id) {
-        // The generic deferred-reschedule bit is intentionally cleared on
-        // syscall exit. Arm the existing user-return PIT edge so this trusted
-        // event wakeup is observed promptly without switching away from a
-        // live kernel syscall continuation.
+        // The common syscall tail consumes this request with IF enabled,
+        // preserving the live kernel continuation while handing one bounded
+        // turn to the exact awakened caller.
         multitask::request_user_return_reschedule();
     } else {
         multitask::set_next_pick_hint(task_id);
@@ -1738,6 +1752,20 @@ pub(super) fn syscall_linux_rustos_ipc_reply(
 }
 
 pub(super) fn syscall_linux_rustos_ipc_call_with_handles(args_ptr: u64) -> u64 {
+    syscall_linux_rustos_ipc_call_with_handles_timeout(args_ptr, SERVICE_IPC_TIMEOUT_MS)
+}
+
+pub(super) fn syscall_linux_rustos_ipc_call_with_handles_bounded(
+    args_ptr: u64,
+    timeout_ms: u64,
+) -> u64 {
+    if !bounded_ipc_call_timeout_is_valid(timeout_ms) {
+        return linux_errno(LINUX_EINVAL);
+    }
+    syscall_linux_rustos_ipc_call_with_handles_timeout(args_ptr, timeout_ms)
+}
+
+fn syscall_linux_rustos_ipc_call_with_handles_timeout(args_ptr: u64, timeout_ms: u64) -> u64 {
     let args = match usermem::read_current_user_struct::<
         rustos_user_abi::syscall::IpcCallWithHandlesArgs,
     >(args_ptr)
@@ -1776,9 +1804,10 @@ pub(super) fn syscall_linux_rustos_ipc_call_with_handles(args_ptr: u64) -> u64 {
     };
     let send_ticks = crate::arch::rtc::ticks();
 
-    let (response, reply_handles) = match wait_for_service_reply_with_handle_limit(
+    let (response, reply_handles) = match wait_for_service_reply_with_handle_limit_after(
         reply,
         rustos_user_abi::syscall::IPC_MAX_TRANSFER_HANDLES,
+        timeout_ms,
     ) {
         Ok(response) => response,
         Err(errno) => return linux_errno(errno),
@@ -2204,7 +2233,19 @@ fn wait_for_service_reply_with_handle_limit(
     reply: KernelReplyHandle,
     handle_capacity: usize,
 ) -> Result<(Vec<u8>, Vec<KernelTransferredHandle>), i64> {
-    wait_for_reply_with_deadline(reply, handle_capacity, service_ipc_deadline_tick())
+    wait_for_service_reply_with_handle_limit_after(reply, handle_capacity, SERVICE_IPC_TIMEOUT_MS)
+}
+
+fn wait_for_service_reply_with_handle_limit_after(
+    reply: KernelReplyHandle,
+    handle_capacity: usize,
+    timeout_ms: u64,
+) -> Result<(Vec<u8>, Vec<KernelTransferredHandle>), i64> {
+    wait_for_reply_with_deadline(
+        reply,
+        handle_capacity,
+        service_ipc_deadline_tick_after(timeout_ms),
+    )
 }
 
 fn wait_for_reply_with_deadline(
@@ -2300,10 +2341,6 @@ fn take_endpoint_response_for_wait(
         }
         Err(err) => Err(ipc_error_to_linux_errno(err)),
     }
-}
-
-fn service_ipc_deadline_tick() -> u64 {
-    service_ipc_deadline_tick_after(SERVICE_IPC_TIMEOUT_MS)
 }
 
 fn service_ipc_deadline_tick_after(timeout_ms: u64) -> u64 {
@@ -2800,6 +2837,10 @@ mod tests {
         assert!(!bounded_ipc_call_timeout_is_valid(
             SERVICE_IPC_TIMEOUT_MS + 1
         ));
+        assert_eq!(
+            rustos_user_abi::syscall::SYS_RUSTOS_IPC_CALL_WITH_HANDLES_BOUNDED,
+            0x5255_0045
+        );
         assert_eq!(ServiceIpcClass::BootControl.cap_timeout_ms(37), 37);
         assert_eq!(ServiceIpcClass::InteractiveControl.cap_timeout_ms(0), 1);
     }
@@ -2838,6 +2879,16 @@ mod tests {
         assert!(!cached_service_call_grant_matches(41, 7, 41, 8));
         assert!(!cached_service_call_grant_matches(0, 7, 0, 7));
         assert!(!cached_service_call_grant_matches(41, 0, 41, 0));
+    }
+
+    #[test]
+    fn inputd_owner_exit_withdraws_the_separate_ring_policy_lease() {
+        assert!(service_exit_requires_input_policy_withdrawal(
+            linux_abi::IPC_SERVICE_INPUTD
+        ));
+        assert!(!service_exit_requires_input_policy_withdrawal(
+            linux_abi::IPC_SERVICE_NETD
+        ));
     }
 
     #[test]

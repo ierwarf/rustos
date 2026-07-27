@@ -1,0 +1,13 @@
+# point	severity	owner	source	expected_failure	runtime_evidence	source_witness
+alloc.frame	critical	kernel-mm	kernel/mm/src/memory/phys.rs	allocation-returns-none-before-allocator-mutation	source-test	kernel-mm:allocation_fault_gate_prevents_allocator_mutation
+block.flush	critical	kernel-io-manager	kernel/io-manager/src/io/dvm_block.rs	device-fault-after-generation-bound-completion	kvm-storage	kernel-io-manager:fault_points_cover_reads_mutations_and_durability
+block.read	high	kernel-io-manager	kernel/io-manager/src/io/dvm_block.rs	device-fault-before-ring-publication	source-test	kernel-io-manager:fault_points_cover_reads_mutations_and_durability
+block.write	critical	kernel-io-manager	kernel/io-manager/src/io/dvm_block.rs	device-fault-before-ring-publication	source-test	kernel-io-manager:fault_points_cover_reads_mutations_and_durability
+display.present	critical	kernel-io-manager	kernel/io-manager/src/io/gui/backend.rs	present-is-rejected-before-provider-mutation	source-test	kernel-io-manager:present_fault_gate_prevents_backend_mutation
+display.provider.register	critical	kernel-io-manager	kernel/io-manager/src/io/gui.rs	provider-publication-is-rejected-before-registration	source-test	kernel-io-manager:provider_fault_gate_prevents_registration
+handle.commit	critical	kernel-ps	kernel/ps/src/user/handles/table.rs	transfer-commit-fails-before-descriptor-publication	source-test	kernel-ps:handle_fault_boundaries_preserve_reservation_atomicity
+handle.reserve	critical	kernel-ps	kernel/ps/src/user/handles/table.rs	reservation-fails-before-slot-ownership-mutation	source-test	kernel-ps:handle_fault_boundaries_preserve_reservation_atomicity
+ipc.endpoint.enqueue	critical	kernel-ipc-runtime	kernel/ipc-runtime/src/ipc/mod.rs	call-fails-before-message-or-reply-publication	source-test	kernel-ipc-runtime:endpoint_fault_boundaries_fail_before_queue_or_reply_mutation
+ipc.endpoint.reply	critical	kernel-ipc-runtime	kernel/ipc-runtime/src/ipc/mod.rs	reply-fails-without-consuming-cap-or-publishing-response	source-test	kernel-ipc-runtime:endpoint_fault_boundaries_fail_before_queue_or_reply_mutation
+process.spawn	critical	kernel-ps	kernel/ps/src/multitask/spawn.rs	spawn-fails-before-task-id-publication	source-test	kernel-ps:spawn_fault_gate_prevents_publication
+waitset.register	critical	kernel-compat	kernel/compat/src/user/syscall/linux/waitset_broker_ops.rs	registration-fails-before-replacing-existing-observations	source-test	kernel-compat:waitset_registration_fault_preserves_existing_observations

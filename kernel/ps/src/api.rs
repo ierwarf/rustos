@@ -46,8 +46,8 @@ pub fn current_console_session() -> Option<kernel_object::api::session::ConsoleS
     crate::multitask::current_console_session()
 }
 
-pub fn clear_deferred_reschedule_request() {
-    crate::multitask::clear_deferred_reschedule_request();
+pub fn reschedule_deferred_from_interruptible_syscall() {
+    crate::multitask::reschedule_deferred_from_interruptible_syscall();
 }
 
 pub fn request_deferred_reschedule() {

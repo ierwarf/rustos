@@ -11,6 +11,7 @@ use driver_domain_protocol::{
     DvmGpuAtlasCompletion, DvmGpuAtlasDamage, DvmGpuPrimeCompletion, DvmGpuPrimeCompletionStatus,
 };
 use rustos_user_abi::device::{DISPLAY_INFO_FLAG_DVM_SCANOUT, DISPLAY_INFO_FLAG_GPU_COMPOSITOR};
+use rustos_user_abi::syscall::PRODUCT_MILESTONE_DISPLAY_READY;
 
 use crate::app::{AppState, CursorMotion};
 use crate::canvas::Rect;
@@ -106,6 +107,7 @@ pub(crate) struct GpuCompositor {
     slots: Vec<GpuAtlasSlot>,
     compiler: GpuSceneCompiler,
     atlas: Vec<u32>,
+    scratch_atlas: Vec<u32>,
     layers: Vec<GpuSceneLayer>,
     cursor_source_rect: Option<Rect>,
     cursor_motion: CursorMotion,
@@ -365,6 +367,7 @@ impl GpuCompositor {
                 duration_ns: info.prime_duration_ns,
             })
             .map_err(gpu_scene_errno)?;
+        let atlas_pixels = logical_bytes / size_of::<u32>();
         Ok(Some(GpuInitialization {
             display: current_display,
             compositor: Self {
@@ -372,7 +375,8 @@ impl GpuCompositor {
                 info,
                 slots,
                 compiler,
-                atlas: vec![0_u32; logical_bytes / size_of::<u32>()],
+                atlas: vec![0_u32; atlas_pixels],
+                scratch_atlas: vec![0_u32; atlas_pixels],
                 layers: Vec::new(),
                 cursor_source_rect: None,
                 cursor_motion: CursorMotion::stationary(),
@@ -452,7 +456,7 @@ impl GpuCompositor {
         }
         if full_rebuild {
             let allocate_started = Instant::now();
-            let mut next_atlas = vec![0_u32; self.atlas.len()];
+            self.scratch_atlas.fill(0);
             rebuild_allocate_elapsed = allocate_started.elapsed();
             let capability = self.capability_for_slot(slot_index, self.next_content_epoch)?;
             let scene_started = Instant::now();
@@ -463,7 +467,7 @@ impl GpuCompositor {
                 console_bindings,
             } = match build_gpu_atlas_scene(
                 state,
-                next_atlas.as_mut_slice(),
+                self.scratch_atlas.as_mut_slice(),
                 self.info.atlas_width as usize,
                 self.info.atlas_height as usize,
                 self.info.atlas_stride_bytes as usize / size_of::<u32>(),
@@ -488,7 +492,7 @@ impl GpuCompositor {
             damage = if self.active {
                 difference_bounds(
                     self.atlas.as_slice(),
-                    next_atlas.as_slice(),
+                    self.scratch_atlas.as_slice(),
                     self.info.atlas_width as usize,
                     self.info.atlas_height as usize,
                     self.info.atlas_stride_bytes as usize / size_of::<u32>(),
@@ -505,7 +509,7 @@ impl GpuCompositor {
                 }]
             };
             rebuild_difference_elapsed = difference_started.elapsed();
-            self.atlas = next_atlas;
+            core::mem::swap(&mut self.atlas, &mut self.scratch_atlas);
             self.layers = layers;
             self.cursor_source_rect = Some(cursor_source_rect);
             self.cursor_motion = state.cursor_motion;
@@ -656,6 +660,11 @@ impl GpuCompositor {
             // This one-shot transition is release evidence. Do not let a full
             // asynchronous observability queue erase it.
             debug_line(&active_contract);
+            let _ = rustos_svc_runtime::ipc::product_milestone(
+                PRODUCT_MILESTONE_DISPLAY_READY,
+                self.info.generation,
+                self.next_content_epoch,
+            );
             diag_line(active_contract);
         }
         self.active = true;

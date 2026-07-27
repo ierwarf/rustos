@@ -110,6 +110,10 @@ fn prepare_layout(config: &Config, options: &SmokeOptions) -> Result<KvmLayout> 
     let dvm_stderr_log = run_dir.join("linux-dvm-qemu.stderr.log");
     let dvm_input_ring = run_dir.join("dvm-input.ivshmem");
     let dvm_input_doorbell = run_dir.join("dvm-input-doorbell.sock");
+    let rustos_monitor = run_dir.join("rustos-monitor.sock");
+    if rustos_monitor.exists() {
+        fs::remove_file(&rustos_monitor)?;
+    }
     let dvm_control_secret = run_dir.join("linux-dvm-control.secret");
     let control_secret = ControlSecret::random()?;
     fs::write(&dvm_control_secret, control_secret.as_hex())?;
@@ -135,6 +139,7 @@ fn prepare_layout(config: &Config, options: &SmokeOptions) -> Result<KvmLayout> 
         dvm_stderr_log,
         dvm_input_ring,
         dvm_input_doorbell,
+        rustos_monitor,
         dvm_control_secret,
         _display_backing_dir: display_backing_dir,
         gui_dvm_surfaces,

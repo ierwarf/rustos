@@ -232,6 +232,7 @@ dependencies = [
  "boot-random",
  "keyboard-core",
  "rustos-fault-injection",
+ "rustos-image-admission",
  "rustos-user-abi",
 ]
 
@@ -735,6 +736,7 @@ version = "0.1.0"
 dependencies = [
  "kernel-mm",
  "kernel-object",
+ "rustos-fault-injection",
  "rustos-user-abi",
  "spin 0.10.0",
  "x86_64",
@@ -1104,6 +1106,7 @@ checksum = "0c8d0fd677905edcbeedbf2edb6494d676f0e98d54d5cf9bda0b061cb8fb8aba"
 name = "rootd"
 version = "0.1.0"
 dependencies = [
+ "rustos-svc-runtime",
  "rustos-user-abi",
 ]
 
@@ -1161,6 +1164,9 @@ dependencies = [
 [[package]]
 name = "rustos-fault-injection"
 version = "0.1.0"
+dependencies = [
+ "spin 0.10.0",
+]
 
 [[package]]
 name = "rustos-hostd"

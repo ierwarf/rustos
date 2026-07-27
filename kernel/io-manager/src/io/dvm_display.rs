@@ -961,6 +961,17 @@ fn snapshot_copy_plan(
     })
 }
 
+fn contiguous_snapshot_copy_len(
+    plan: SnapshotCopyPlan,
+    surface_width: usize,
+    stride_bytes: usize,
+) -> Option<usize> {
+    if plan.x != 0 || plan.width != surface_width {
+        return None;
+    }
+    plan.height.checked_mul(stride_bytes)
+}
+
 fn copy_into_slot(
     slot: usize,
     src_ptr: *const u8,
@@ -1029,7 +1040,14 @@ fn copy_into_slot(
     else {
         return false;
     };
-    if end > POOL_SLOT_BYTES.load(Ordering::Acquire) as usize {
+    let contiguous_copy_len = contiguous_snapshot_copy_len(plan, width, stride_bytes);
+    let Some(copy_end) = contiguous_copy_len
+        .map(|copy_len| row_offset.checked_add(copy_len))
+        .unwrap_or(Some(end))
+    else {
+        return false;
+    };
+    if copy_end > POOL_SLOT_BYTES.load(Ordering::Acquire) as usize {
         warn_rejected("copy-exceeds-slot");
         return false;
     }
@@ -1038,14 +1056,23 @@ fn copy_into_slot(
         return false;
     }
     unsafe {
-        let mut source = src_ptr.add(row_offset);
-        let mut destination = (pixels as *mut u8).add(slot_offset + row_offset);
-        for _ in 0..copy_height {
-            // The pixel pool is reserved WB memory; the ivshmem BAR carries
-            // control records only and is never used as a bulk-copy target.
-            ptr::copy_nonoverlapping(source, destination, row_bytes);
-            source = source.add(stride_bytes);
-            destination = destination.add(stride_bytes);
+        let source = src_ptr.add(row_offset);
+        let destination = (pixels as *mut u8).add(slot_offset + row_offset);
+        if let Some(copy_len) = contiguous_copy_len {
+            // Full-width snapshots are contiguous in both mappings. One bulk
+            // copy avoids a syscall-scale memcpy setup for every scanline,
+            // which is especially costly on the first cold QEMU frame.
+            ptr::copy_nonoverlapping(source, destination, copy_len);
+        } else {
+            let mut source = source;
+            let mut destination = destination;
+            for _ in 0..copy_height {
+                // The pixel pool is reserved WB memory; the ivshmem BAR carries
+                // control records only and is never used as a bulk-copy target.
+                ptr::copy_nonoverlapping(source, destination, row_bytes);
+                source = source.add(stride_bytes);
+                destination = destination.add(stride_bytes);
+            }
         }
     }
     fence(Ordering::SeqCst);
@@ -1585,8 +1612,8 @@ mod tests {
     use driver_domain_protocol::{DvmDisplayDamage, DvmGuiSurfacePoolHeader};
 
     use super::{
-        DvmPresentOutcome, SnapshotCopyPlan, damage_bounds, header_fits_resource,
-        snapshot_copy_plan, try_publish_full,
+        DvmPresentOutcome, SnapshotCopyPlan, contiguous_snapshot_copy_len, damage_bounds,
+        header_fits_resource, snapshot_copy_plan, try_publish_full,
     };
 
     #[test]
@@ -1649,6 +1676,34 @@ mod tests {
             snapshot_copy_plan(DvmDisplayDamage::full(), 1600, 900, 40, 40, true),
             complete
         );
+    }
+
+    #[test]
+    fn full_width_snapshot_uses_one_bounded_bulk_copy() {
+        let full = SnapshotCopyPlan {
+            x: 0,
+            y: 0,
+            width: 1600,
+            height: 900,
+            incremental: false,
+        };
+        assert_eq!(
+            contiguous_snapshot_copy_len(full, 1600, 1600 * 4),
+            Some(1600 * 900 * 4)
+        );
+        assert_eq!(
+            contiguous_snapshot_copy_len(full, 1600, 1600 * 4 + 64),
+            Some((1600 * 4 + 64) * 900)
+        );
+
+        let partial = SnapshotCopyPlan {
+            x: 10,
+            y: 20,
+            width: 30,
+            height: 40,
+            incremental: true,
+        };
+        assert_eq!(contiguous_snapshot_copy_len(partial, 1600, 1600 * 4), None);
     }
 
     #[test]

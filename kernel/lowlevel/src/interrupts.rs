@@ -94,6 +94,19 @@ pub fn trigger_software_schedule() {
     });
 }
 
+/// Enter the software scheduler while preserving an IF-enabled kernel
+/// continuation. This is the only safe direct-reschedule path from a live
+/// syscall body; callers must have enabled interrupts before entering it.
+pub fn trigger_software_schedule_interruptible() {
+    assert!(
+        interrupts::are_enabled(),
+        "interruptible software schedule requires IF=1"
+    );
+    unsafe {
+        software_schedule_trap();
+    }
+}
+
 #[unsafe(no_mangle)]
 extern "C" fn timer_interrupt_dispatch(context_ptr: *mut SavedContext) -> *mut SavedContext {
     dispatch(&TIMER_INTERRUPT_DISPATCH, context_ptr)

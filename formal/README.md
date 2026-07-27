@@ -25,6 +25,36 @@ the fairness assumptions written into `Spec`. Do not add a model only to
 `system-flows.tsv` is the cross-model lifecycle registry. Its checker binds
 stable requirement/hazard IDs to owner transitions, finite waits, one formal
 model, one source anchor, and one exact source witness before TLC runs.
+`product-scenarios.tsv` composes those local transitions into exact KVM
+topologies with explicit prerequisites and absolute deadlines. Sequence is a
+stable topological identifier, not a claim that independent branches finish in
+that wall-clock order. The `product-boot/ProductBoot` model runs display and
+storage admission in parallel after input policy, joins both before the first
+presented frame, and requires an exact executable image to be sealed and
+activated. The storage-only branch terminates only after its generation-bound
+data plane.
+`fault-scenarios.tsv` is the closed fault-point/evidence registry; its checker
+rejects phantom and duplicate rules and requires every critical/high point to
+resolve to exactly one executable source witness. The durability fault also
+requires the bounded storage-DVM negative KVM gate.
+`abi-divergences.tsv`, `recovery-scenarios.tsv`,
+`implementation-mutations.tsv`, and `sanitizer-targets.tsv` close four
+independent source-evidence gaps: native dual-ABI drift, bounded
+restart/crash-consistency outcomes, test sensitivity to real implementation
+regressions, and instrumented host-testable critical/high boundaries. Their
+runners reject stale exceptions, missing transition classes, zero-test
+filters, compile-only mutant failures, and unbounded execution.
+`verify-all.sh` emits a profile verification-run seal only after every selected
+gate succeeds. That seal hashes the complete source tree and every normalized
+gate/TLC artifact; commercial evidence rejects a stale, partial, or mixed-source
+run. KVM product traces separately bind the exact source tree, RustOS boot
+image, and verified DVM manifest used for the observed run.
+`proof-assumptions.tsv` explicitly lists the assembly, hardware, boot, DMA,
+toolchain, external-kernel, observability, hypervisor, physical-hardware, and
+side-channel assumptions below those proofs. `verified-configurations.tsv`
+limits each evidence claim to one exact platform/topology. The proof-boundary
+checker rejects missing assumption classes, unknown references, unsealed
+profiles, and any attempt to inherit QEMU evidence into physical hardware.
 `check-performance-contracts.sh` is the source-drift gate for the shared boot,
 frame, and typed IPC limits. It also rejects unclassified compat service calls,
 service-registration retry amplification, a stable endpoint lookup that takes
@@ -100,6 +130,8 @@ and counterexamples are retained under `build/formal/`.
 | dual-abi-image-admission/DualAbiImageAdmission | loaderd plus `rustos-image-admission` | ELF64 and PE64 plans share one bounded, non-overlapping W^X gate; a main entry must belong to executable memory; only an entryless PE DLL may use entry zero; rejected plans never map |
 | dual-abi-byte-parser/DualAbiByteParser | loaderd plus `rustos-image-admission` | a bounded ELF64/PE64 header, table, relocation and import parse must settle before mapping; rejected or subsequently mutated snapshots never map |
 | page-table-lifecycle/PageTableLifecycle | compat MM broker and `kernel-mm` process address spaces | broker ranges are canonical, non-wrapping, and page-rounded before mutation; only live user frames map into user pages; every map/protect/unmap preserves W^X and removes unmapped access authority |
+| physical-frame-lifecycle/PhysicalFrameLifecycle | `kernel-mm` boot physical-frame allocator | only aligned firmware-usable frames below the direct-map ceiling enter the free set; kernel/module reservations are monotonic before allocation; allocation and exact release preserve single ownership; invalid/double release and exhaustion fail without minting capacity |
+| service-heap-lifecycle/ServiceHeapLifecycle | `rustos-svc-runtime` allocator, syscalld VM policy, xtask KVM health oracle | dropped service allocations return exact spans to an address-ordered coalescing free set; growth occurs only after no reusable span fits; Linux mapping hints wrap to released gaps; allocation and fatal core-service failures are explicit failed runtime evidence |
 | process-address-space-lifetime/ProcessAddressSpaceLifetime | `kernel-ps` process table and `UserProcessState` | every state/address-space access holds one retained process reference and the per-process mutex; exit freezes the address-space epoch, stale exec cannot clear it, a prepared thread attachment cannot publish after exit and must release its unpublished stack, and reclamation waits for all authority to disappear |
 | futex-waiter-lifecycle/FutexWaiterLifecycle | Linux futex scheduler substrate | a task owns at most one bounded waiter and original identity; requeue changes only its active key; keyed wake, key-independent timeout/spurious wake, and ABI-aware current-thread exit leave one explicit terminal outcome and no futex-table authority; forced foreign-thread cleanup remains a failed source gate |
 | process-signal-delivery/ProcessSignalDelivery | procd policy, HAL fault handoff, and ring0 signal substrate | ring0 consumes only a still-pending unmasked signal; SIGKILL can only terminate and SIGSTOP can only enter a distinct stopped state; neither may be masked, ignored, or handled; invalid user targets and stale policy replies cannot redirect execution; a recoverable user fault retains process and task-IPC authority while a fatal final-thread fault publishes lifecycle evidence and revokes both; source stop/resume conformance remains failed |
@@ -411,3 +443,11 @@ state spaces in the corresponding cfg files. It does not prove Rust code
 equivalence, ELF or PE loader memory safety, full CPU-time fairness, device-DMA
 safety, or filesystem data integrity. Add a focused Rust test or KVM
 expectation for every real-code path whose contract changes.
+
+Equivalent concrete operations may be quotiented only when they have identical
+state, authority, timeout, and terminal effects. The model must name that
+equivalence class and the exact concrete vocabulary/bounds must remain covered
+by source conformance. `DvmGpuCompositor` therefore explores one abstract
+fixed-command class while retaining three in-flight values and three outputs;
+it does not multiply the state graph by three command labels that no invariant
+can distinguish.

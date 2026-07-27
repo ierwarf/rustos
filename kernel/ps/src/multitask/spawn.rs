@@ -85,12 +85,8 @@ fn spawn_user_process_inner(
     defer_reschedule: bool,
     start_suspended: bool,
 ) -> Result<u64, SpawnTaskError> {
-    if nucleus_core::util::fault_injection::should_fail("process.spawn") {
-        crate::debug::warn!(process, "fault injection: process.spawn failed");
-        return Err(SpawnTaskError::NoFreeTaskSlot);
-    }
-    let id = allocate_task_id().ok_or(SpawnTaskError::NoFreeTaskSlot)?;
-    let pit_divisor = checked_thread_pit_divisor(weight_micros)?;
+    let (id, pit_divisor) =
+        prepare_user_spawn(weight_micros, process_spawn_faulted(), allocate_task_id)?;
     let user_cs = crate::arch::gdt::user_code_selector().0 as u64;
     let user_ss = crate::arch::gdt::user_data_selector().0 as u64;
     let rflags = initial_task_rflags().bits();
@@ -127,18 +123,46 @@ fn spawn_user_process_inner(
     Ok(id)
 }
 
+fn process_spawn_faulted() -> bool {
+    if nucleus_core::util::fault_injection::should_fail("process.spawn") {
+        crate::debug::warn!(process, "fault injection: process.spawn failed");
+        true
+    } else {
+        false
+    }
+}
+
+fn allocate_task_id_after_fault_gate(
+    faulted: bool,
+    allocate: impl FnOnce() -> Option<u64>,
+) -> Result<u64, SpawnTaskError> {
+    if faulted {
+        Err(SpawnTaskError::NoFreeTaskSlot)
+    } else {
+        allocate().ok_or(SpawnTaskError::NoFreeTaskSlot)
+    }
+}
+
+fn prepare_user_spawn(
+    weight_micros: u64,
+    faulted: bool,
+    allocate: impl FnOnce() -> Option<u64>,
+) -> Result<(u64, u16), SpawnTaskError> {
+    // Validate the request before consuming a non-reusable task identity.  An
+    // invalid userspace weight must be a side-effect-free admission failure.
+    let pit_divisor = checked_thread_pit_divisor(weight_micros)?;
+    let id = allocate_task_id_after_fault_gate(faulted, allocate)?;
+    Ok((id, pit_divisor))
+}
+
 pub fn spawn_user_process_state_with_parent(
     process_state: UserProcessState,
     bootstrap: UserTaskBootstrap,
     parent_process_id: Option<u64>,
     weight_micros: u64,
 ) -> Result<u64, SpawnTaskError> {
-    if nucleus_core::util::fault_injection::should_fail("process.spawn") {
-        crate::debug::warn!(process, "fault injection: process.spawn failed");
-        return Err(SpawnTaskError::NoFreeTaskSlot);
-    }
-    let id = allocate_task_id().ok_or(SpawnTaskError::NoFreeTaskSlot)?;
-    let pit_divisor = checked_thread_pit_divisor(weight_micros)?;
+    let (id, pit_divisor) =
+        prepare_user_spawn(weight_micros, process_spawn_faulted(), allocate_task_id)?;
     let user_cs = crate::arch::gdt::user_code_selector().0 as u64;
     let user_ss = crate::arch::gdt::user_data_selector().0 as u64;
     let rflags = initial_task_rflags().bits();
@@ -174,14 +198,45 @@ pub fn spawn_user_process_state_with_parent(
     Ok(id)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spawn_fault_gate_prevents_publication() {
+        let allocator_called = core::cell::Cell::new(false);
+        assert_eq!(
+            allocate_task_id_after_fault_gate(true, || {
+                allocator_called.set(true);
+                Some(7)
+            }),
+            Err(SpawnTaskError::NoFreeTaskSlot)
+        );
+        assert!(!allocator_called.get());
+    }
+
+    #[test]
+    fn invalid_spawn_weight_does_not_consume_identity() {
+        let allocator_called = core::cell::Cell::new(false);
+        assert_eq!(
+            prepare_user_spawn(0, false, || {
+                allocator_called.set(true);
+                Some(7)
+            }),
+            Err(SpawnTaskError::InvalidWeightMicros)
+        );
+        assert!(!allocator_called.get());
+    }
+}
+
 pub fn spawn_kernel_process(
     process_state: UserProcessState,
     entry: VirtAddr,
     arg0: u64,
     weight_micros: u64,
 ) -> Result<u64, SpawnTaskError> {
-    let id = allocate_task_id().ok_or(SpawnTaskError::NoFreeTaskSlot)?;
     let pit_divisor = checked_thread_pit_divisor(weight_micros)?;
+    let id = allocate_task_id().ok_or(SpawnTaskError::NoFreeTaskSlot)?;
     let kernel_cs = crate::arch::gdt::kernel_code_selector().0 as u64;
     let kernel_ss = crate::arch::gdt::kernel_data_selector().0 as u64;
     let rflags = initial_task_rflags().bits();

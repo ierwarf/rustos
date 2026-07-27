@@ -318,6 +318,157 @@ fn read_runtime_log_if_present(path: &Path) -> Result<String> {
     }
 }
 
+#[derive(Debug, Serialize)]
+struct KvmFailureLog {
+    path: String,
+    bytes: usize,
+    sha256: String,
+    latest_guest_ts_us: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct KvmCausalEvent {
+    guest: &'static str,
+    source_line: usize,
+    guest_ts_us: Option<u64>,
+    record: String,
+}
+
+#[derive(Debug, Serialize)]
+struct KvmFailureSummary<'a> {
+    schema: &'static str,
+    status: &'static str,
+    reason: &'a str,
+    boot_elapsed_ms: u64,
+    missing_rustos_markers: &'a [String],
+    missing_dvm_markers: &'a [String],
+    rustos_log: KvmFailureLog,
+    dvm_log: KvmFailureLog,
+    causal_tail: Vec<KvmCausalEvent>,
+}
+
+fn structured_guest_timestamp_us(line: &str) -> Option<u64> {
+    line.split_ascii_whitespace().find_map(|field| {
+        field
+            .strip_prefix("ts_us=")
+            .and_then(|value| value.parse().ok())
+    })
+}
+
+fn latest_guest_timestamp_us(log: &str) -> Option<u64> {
+    log.lines().filter_map(structured_guest_timestamp_us).max()
+}
+
+fn guest_deadline_reached(log: &str, deadline_ms: u64) -> bool {
+    latest_guest_timestamp_us(log)
+        .is_some_and(|timestamp_us| timestamp_us >= deadline_ms.saturating_mul(1_000))
+}
+
+fn runtime_log_sha256(log: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(log.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn causal_record(line: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "milestone: name=",
+        "loaderd: executable snapshot",
+        "loaderd: immutable executable snapshot",
+        "vfsd: executable snapshot",
+        "vfsd: volume-read",
+        "storaged:",
+        "dvm-block:",
+        "rootd:",
+        "uiserver: gpu",
+        "wayclick:",
+        "inputd: DVM",
+        "rustos-dvm-",
+        "watchdog",
+        "scheduler long ready wait:",
+        "memory allocation of ",
+        "fatal service endpoint not ready",
+        "ipc-service-exit-revoke",
+    ];
+    MARKERS.iter().any(|marker| line.contains(marker))
+}
+
+fn causal_tail(rustos_log: &str, dvm_log: &str) -> Vec<KvmCausalEvent> {
+    const MAX_EVENTS: usize = 64;
+    const MAX_RECORD_BYTES: usize = 512;
+
+    let mut events = [("rustos", rustos_log), ("linux-dvm", dvm_log)]
+        .into_iter()
+        .flat_map(|(guest, log)| {
+            log.lines().enumerate().filter_map(move |(index, line)| {
+                if !causal_record(line) {
+                    return None;
+                }
+                let mut record = line.trim().to_owned();
+                record.truncate(record.floor_char_boundary(MAX_RECORD_BYTES));
+                Some(KvmCausalEvent {
+                    guest,
+                    source_line: index + 1,
+                    guest_ts_us: structured_guest_timestamp_us(line),
+                    record,
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    events.sort_by_key(|event| {
+        (
+            event.guest_ts_us.unwrap_or(u64::MAX),
+            event.guest,
+            event.source_line,
+        )
+    });
+    if events.len() > MAX_EVENTS {
+        events.drain(..events.len() - MAX_EVENTS);
+    }
+    events
+}
+
+fn write_kvm_failure_summary(
+    layout: &KvmLayout,
+    reason: &str,
+    boot_elapsed: Duration,
+    rustos_log: &str,
+    dvm_log: &str,
+    missing_rustos_markers: &[String],
+    missing_dvm_markers: &[String],
+) -> Result<PathBuf> {
+    let summary = KvmFailureSummary {
+        schema: "rustos-kvm-failure-evidence-v1",
+        status: "failed",
+        reason,
+        boot_elapsed_ms: boot_elapsed.as_millis().try_into().unwrap_or(u64::MAX),
+        missing_rustos_markers,
+        missing_dvm_markers,
+        rustos_log: KvmFailureLog {
+            path: layout.debugcon_log.display().to_string(),
+            bytes: rustos_log.len(),
+            sha256: runtime_log_sha256(rustos_log),
+            latest_guest_ts_us: latest_guest_timestamp_us(rustos_log),
+        },
+        dvm_log: KvmFailureLog {
+            path: layout.dvm_serial_log.display().to_string(),
+            bytes: dvm_log.len(),
+            sha256: runtime_log_sha256(dvm_log),
+            latest_guest_ts_us: latest_guest_timestamp_us(dvm_log),
+        },
+        causal_tail: causal_tail(rustos_log, dvm_log),
+    };
+    let path = layout.run_dir.join("failure-summary.json");
+    let temporary = layout.run_dir.join("failure-summary.json.tmp");
+    let mut encoded = serde_json::to_vec_pretty(&summary)?;
+    encoded.push(b'\n');
+    fs::write(&temporary, encoded)
+        .with_context(|| format!("write temporary KVM failure evidence {}", temporary.display()))?;
+    fs::rename(&temporary, &path)
+        .with_context(|| format!("publish KVM failure evidence {}", path.display()))?;
+    Ok(path)
+}
+
 fn uiserver_idle_ticks_healthy(log: &str, required_ticks: usize) -> bool {
     let mut consecutive = 0_usize;
     for line in log.lines() {
@@ -360,6 +511,7 @@ fn interactive_display_ready(layout: &KvmLayout, rustos_log: &str, dvm_log: &str
         && dvm_display_relay_ready(dvm_log, false)
         && surface_ready
         && block_ready
+        && rustos_log.contains(WAYCLICK_FIRST_FRAME_MARKER)
 }
 
 fn validate_interactive_session(layout: &KvmLayout, pointer_observed: bool) -> Result<()> {
@@ -384,6 +536,9 @@ fn validate_interactive_session(layout: &KvmLayout, pointer_observed: bool) -> R
         || !dvm_log.contains(DVM_BLOCK_READY_MARKER)
     {
         bail!("interactive KVM DVM acceptance lacks the exact block transport readiness contract");
+    }
+    if !rustos_log.contains(WAYCLICK_FIRST_FRAME_MARKER) {
+        bail!("interactive KVM DVM acceptance lacks a presented WayClick first frame");
     }
     verify_dvm_block_ready(layout)?;
     verify_dvm_display_surface(
@@ -689,6 +844,8 @@ fn runtime_stall_or_crash_observed(log: &str) -> bool {
         "[drm:virtio_gpu_dequeue_ctrl_func] *ERROR*",
         "panicked at ",
         "fatal runtime error",
+        "memory allocation of ",
+        "fatal service endpoint not ready",
         "BUG:",
     ];
     log.lines()

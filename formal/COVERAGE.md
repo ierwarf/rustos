@@ -26,9 +26,22 @@ registry and whole-flow selftests, the script-registered exact source decision
 witnesses, exhaustive TLC, non-vacuous Kani, Verus, and a source-produced
 runtime trace. The nightly tier
 also runs selected TLC simulation, Miri, Loom, two typed Apalache refinements,
-one TLAPS theorem, and bounded Rust/C coverage-guided fuzzing. Every tool emits
-or retains evidence below `build/formal`; CI uploads that directory even when a
-gate fails.
+one TLAPS theorem, bounded Rust/C coverage-guided fuzzing, and pinned
+address/thread instrumentation. The PR tier also executes native
+Linux/Windows ABI reference comparison, checkpoint/service/storage recovery
+scenarios, and source-level implementation mutations with a required 100%
+critical/high kill ratio. Every tool emits or retains evidence below
+`build/formal`; CI uploads that directory even when a gate fails.
+
+The product-boot composition gate closes the local-deadline gap:
+kernel-stamped runtime markers must refine one registered dependency DAG and
+reach the first WayClick frame or the storage-only terminal within the
+topology's five-second absolute deadline. Independent display and storage
+branches may complete in either order, but every declared predecessor must
+precede its dependent event and every branch must join the terminal. A
+successful component marker cannot substitute for a missing later stage. The fault-scenario gate
+separately rejects names that no source boundary implements and never upgrades
+a source-only point into runtime fault evidence.
 
 This is not QNX-class or safety-certification evidence. The following remain
 failed infrastructure gates rather than implied successes:
@@ -67,6 +80,8 @@ failed infrastructure gates rather than implied successes:
 | A malformed ELF64 or PE64 plan maps outside the process window, overlaps another region, creates a writable executable image, or starts outside executable memory | dual-abi-image-admission | libs/rustos-image-admission/src/lib.rs and services/loaderd/src/main.rs |
 | A malformed ELF64/PE64 byte table, relocation, import, or changed post-parse snapshot reaches a process mapping | dual-abi-byte-parser | libs/rustos-image-admission/src/lib.rs, services/loaderd/src/main.rs, and kernel/compat/src/user/syscall/linux/proc_broker_ops.rs |
 | A broker range wraps or becomes noncanonical, a mapping cursor lands inside the final page, a user page aliases a kernel/dead frame, remains W+X, or retains access authority after unmap | page-table-lifecycle | kernel/compat/src/user/syscall/linux/mm_broker_ops.rs and kernel/mm/src/memory/address_space.rs |
+| Firmware ranges publish an unaligned or out-of-direct-map frame, kernel/module reservations remain allocatable, allocation aliases a live frame, invalid/double release mints capacity, or exhaustion fabricates a frame | physical-frame-lifecycle | kernel/mm/src/memory/phys.rs |
+| Dropped transient service allocations consume memory forever, adjacent freed spans remain fragmented, growth occurs while a reusable span fits, the Linux mmap cursor cannot wrap to a released gap, or allocator/core-service failure leaves a live QEMU window classified healthy | service-heap-lifecycle | libs/rustos-svc-runtime/src/allocator.rs, services/syscalld/src/linux_policy.rs, and tools/xtask/src/kvm/evidence.rs |
 | Two threads obtain concurrent mutable process/address-space state, exit races after state replacement but before exec clears the exit marker, a prepared thread attachment publishes after exit or leaks its unpublished stack on rejection, thread count grows beyond its exit-time ceiling, exec mutates a frozen exited epoch, or reclamation frees retained/task/stack authority | process-address-space-lifetime | kernel/ps/src/multitask/{process_table.rs,current.rs,scheduler.rs} |
 | A futex task owns duplicate waiters, requeue followed by timeout leaves a stale old-key entry, or ABI-aware current-thread exit retains futex-table authority | futex-waiter-lifecycle | kernel/compat/src/user/syscall/linux/service_ops/futex_thread.rs |
 | An x86 error-code exception enters ordinary Rust cleanup with a misaligned SysV call stack, a recovered user fault loses authority, non-final thread retirement revokes a live process endpoint, final retirement retains task/process wait or IPC authority, or a kernel fault is misrouted through user cleanup | exception-retirement-lifecycle | kernel/hal/src/arch/idt/handlers.rs, kernel/executive/src/lib.rs, kernel/compat/src/user/syscall/mod.rs, and kernel/ps/src/multitask/scheduler.rs |

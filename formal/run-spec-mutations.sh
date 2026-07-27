@@ -57,11 +57,61 @@ rg -q 'SleepingRequiresStableRecheck|Invariant.*violated|Error: Invariant' \
     tail -n 80 "$mutation_root/run.log" >&2
     exit 1
 }
+
+product_source="$repo_root/formal/product-boot/ProductBoot.tla"
+product_mutant="$mutation_root/ProductBoot.tla"
+product_config="$mutation_root/ProductBoot.cfg"
+cp "$product_source" "$product_mutant"
+cp "$repo_root/formal/product-boot/ProductBoot.cfg" "$product_config"
+python3 - "$product_mutant" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text()
+start = text.index("PresentFirstFrame ==")
+end = text.index("\nDeadlineMissed ==", start)
+mutant = '''PresentFirstFrame ==
+    /\\ mode = Interactive
+    /\\ phase = WaylandReady
+    /\\ phase' = Presented
+    /\\ firstFrame' = TRUE
+    /\\ UNCHANGED <<mode, now, displayProven, snapshotSealed, imageCommitted, appActive,
+                  waylandConnected, storageProven>>
+'''
+path.write_text(text[:start] + mutant + text[end:])
+PY
+
+set +e
+FORMAL_MUTATION_MODE=1 \
+TLA_SPEC_OVERRIDE="$product_mutant" \
+TLA_CONFIG_OVERRIDE="$product_config" \
+TLA_ARTIFACT_DIR="$mutation_root/product-evidence" \
+bash "$repo_root/formal/run-tlc.sh" product-boot/ProductBoot \
+    >"$mutation_root/product-run.log" 2>&1
+product_result=$?
+set -e
+if [[ "$product_result" -eq 0 ]]; then
+    echo "product-boot premature first-frame mutant escaped all registered invariants" >&2
+    exit 1
+fi
+rg -q 'PresentedHasCompleteAuthorityChain|NoPartialImageBecomesActive|Invariant.*violated|Error: Invariant' \
+    "$mutation_root/product-run.log" "$mutation_root/product-evidence" || {
+    echo "product-boot mutant failed for an unrelated reason" >&2
+    tail -n 80 "$mutation_root/product-run.log" >&2
+    exit 1
+}
+
 summary_dir="$repo_root/build/formal/mutations"
 mkdir -p "$summary_dir"
 jq -n \
     --arg source_sha256 "$(sha256sum "$source_spec" | awk '{print $1}')" \
     --arg mutant_sha256 "$(sha256sum "$mutant" | awk '{print $1}')" \
-    '{schema:"rustos-formal-mutation-evidence-v1",status:"passed",model:"userspace-wait-set/UserspaceWaitSet",mutation:"remove-check-arm-readiness-recheck",source_sha256:$source_sha256,mutant_sha256:$mutant_sha256,expected_result:"invariant-rejected"}' \
+    --arg product_source_sha256 "$(sha256sum "$product_source" | awk '{print $1}')" \
+    --arg product_mutant_sha256 "$(sha256sum "$product_mutant" | awk '{print $1}')" \
+    '{schema:"rustos-formal-mutation-evidence-v2",status:"passed",mutations:[
+        {model:"userspace-wait-set/UserspaceWaitSet",mutation:"remove-check-arm-readiness-recheck",source_sha256:$source_sha256,mutant_sha256:$mutant_sha256,expected_result:"invariant-rejected"},
+        {model:"product-boot/ProductBoot",mutation:"present-first-frame-before-image-admission",source_sha256:$product_source_sha256,mutant_sha256:$product_mutant_sha256,expected_result:"invariant-rejected"}
+    ]}' \
     >"$summary_dir/summary.json"
-printf 'Formal mutation gate passed: lost-wake mutant rejected\n'
+printf 'Formal mutation gate passed: lost-wake and premature-frame mutants rejected\n'

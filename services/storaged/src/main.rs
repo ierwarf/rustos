@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 mod block;
 
+use rustos_user_abi::performance::DVM_STORAGE_BOOT_READY_HARD_LIMIT_MS;
 use rustos_user_abi::syscall::{
     CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
     CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, DvmBlockInfoWire,
@@ -17,9 +18,10 @@ use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_READ, COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_READ_BULK,
     COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_WRITE, COMMERCIAL_MAX_STORAGED_OP_PARTITION_SCAN,
     COMMERCIAL_MAX_STORAGED_OP_ROOT_VOLUME_SELECT, COMMERCIAL_MAX_STORAGED_OP_VOLUME_METADATA,
-    IPC_SERVICE_STORAGED, IPC_SERVICE_VFSD, STORAGED_BULK_READ_PAYLOAD_CAPACITY,
-    STORAGE_FLAG_READONLY, STORAGE_TRANSPORT_DVM_BLOCK, SYS_RUSTOS_DEBUG_PRINT,
-    SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_RECV_WITH_SENDER, SYS_RUSTOS_IPC_REPLY,
+    IPC_SERVICE_STORAGED, IPC_SERVICE_VFSD, PRODUCT_MILESTONE_STORAGE_READY,
+    STORAGED_BULK_READ_PAYLOAD_CAPACITY, STORAGE_FLAG_READONLY, STORAGE_TRANSPORT_DVM_BLOCK,
+    SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_RECV_WITH_SENDER,
+    SYS_RUSTOS_IPC_REPLY,
 };
 
 const RECV_BACKOFF: Duration = Duration::from_millis(50);
@@ -85,12 +87,13 @@ fn main() {
 fn supervise_dvm_block_readiness() {
     let mut proven_generation = 0_u64;
     loop {
-        match block::wait_until_ready().and_then(|info| {
+        let deadline = Instant::now() + Duration::from_millis(DVM_STORAGE_BOOT_READY_HARD_LIMIT_MS);
+        match block::wait_until_ready(deadline).and_then(|info| {
             if info.generation == proven_generation {
                 return Ok(info.generation);
             }
             DVM_E2E_READY_GENERATION.store(0, Ordering::Release);
-            block::flush(info.generation)?;
+            block::flush_before(info.generation, deadline)?;
             Ok(info.generation)
         }) {
             Ok(generation) => {
@@ -99,6 +102,11 @@ fn supervise_dvm_block_readiness() {
                     note_dvm_request_ready();
                     proven_generation = generation;
                     debug_line(dvm_block_e2e_marker(generation).as_str());
+                    let _ = rustos_svc_runtime::ipc::product_milestone(
+                        PRODUCT_MILESTONE_STORAGE_READY,
+                        generation,
+                        0,
+                    );
                 }
             }
             Err(errno) => {
@@ -188,12 +196,34 @@ fn serve(endpoint: u64) {
             continue;
         }
         if received as usize != size_of::<CommercialMaxProtocolRequest>() {
+            let _ = writeln!(
+                std::io::stderr(),
+                "storaged: request rejected stage=request-size received={} expected={} reply_cap={}",
+                received,
+                size_of::<CommercialMaxProtocolRequest>(),
+                reply_cap
+            );
             reply_commercial_error(reply_cap, &request, libc::EINVAL);
             continue;
         }
-        if !request.subject_is_exact_sender(sender_pid, sender_tid)
-            || rustos_svc_runtime::ipc::validate_service_owner(IPC_SERVICE_VFSD, sender_pid) < 0
-        {
+        let exact_sender = request.subject_is_exact_sender(sender_pid, sender_tid);
+        let owner_status = if exact_sender {
+            rustos_svc_runtime::ipc::validate_service_owner(IPC_SERVICE_VFSD, sender_pid)
+        } else {
+            -(libc::EACCES as i64)
+        };
+        if !exact_sender || owner_status < 0 {
+            let _ = writeln!(
+                std::io::stderr(),
+                "storaged: request rejected stage=sender-authority sender_pid={} sender_tid={} subject_pid={} subject_tid={} exact_sender={} owner_errno={} reply_cap={}",
+                sender_pid,
+                sender_tid,
+                request.header.subject_pid,
+                request.header.subject_tid,
+                exact_sender,
+                owner_status.saturating_neg(),
+                reply_cap
+            );
             reply_commercial_error(reply_cap, &request, libc::EACCES);
             continue;
         }
@@ -215,7 +245,13 @@ fn reply_commercial_error(reply_cap: u64, request: &CommercialMaxProtocolRequest
         size_of::<CommercialMaxProtocolResponse>() as u64,
     );
     if reply < 0 {
-        let _ = writeln!(std::io::stderr(), "storaged: reply failed errno={}", -reply);
+        let _ = writeln!(
+            std::io::stderr(),
+            "storaged: reply failed op={} reply_cap={} errno={}",
+            request.header.op,
+            reply_cap,
+            -reply
+        );
     }
 }
 

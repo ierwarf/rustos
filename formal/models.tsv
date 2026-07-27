@@ -11,6 +11,7 @@ dvm-read-cache/DvmReadCache	temporal	intentional-terminal	cache request serves e
 remote-file-mapping/RemoteFileMapping	safety	intentional-terminal	exact file bytes commit or the mapping aborts without fallback or zero fill	120	900	exhaustive	no	no	no
 syscall-simd-lifecycle/SyscallSimdLifecycle	safety	intentional-terminal	syscall return restores the entering task image or remains blocked	120	900	exhaustive	no	no	no
 pci-bar-discovery/PciBarDiscovery	safety	intentional-terminal	BAR discovery publishes one restored valid resource or rejects it	120	900	exhaustive	no	no	no
+physical-frame-lifecycle/PhysicalFrameLifecycle	safety	check	explicit all-reserved terminal stutter preserves deadlock checking	120	900	exhaustive	no	no	no
 clocksource-deadline/ClocksourceDeadline	temporal	intentional-terminal	retired or released waits are terminal	120	900	exhaustive	no	no	no
 deferred-start/DeferredStart	temporal	intentional-terminal	launch outcome is terminal	120	900	exhaustive	no	no	no
 devmgrd-sessiond-isolation/DevmgrdSessiondIsolation	temporal	intentional-terminal	bounded request outcome is terminal	120	900	exhaustive	no	no	no
@@ -63,7 +64,7 @@ ivshmem-pairing/IvshmemPairing	temporal	intentional-terminal	peer pairing may di
 memfd-seal-lifecycle/MemfdSealLifecycle	safety	intentional-terminal	sealed object may retain stable mappings	30	120	exhaustive	no	no	no
 msi-vector-lifecycle/MsiVectorLifecycle	safety	intentional-terminal	failed vector leases revoke before bounded committed pool reuse	30	120	exhaustive	no	no	no
 netd-deferred-reply/NetdDeferredReply	temporal	intentional-terminal	deferred request resolves or is rejected	30	120	exhaustive	no	no	no
-network-payload-session/NetworkPayloadSession	safety	intentional-terminal	payload decision is terminal	120	900	exhaustive	no	no	yes
+network-payload-session/NetworkPayloadSession	safety	intentional-terminal	payload decision is terminal	120	900	exhaustive	no	no	no
 page-table-lifecycle/PageTableLifecycle	safety	intentional-terminal	mapping lifecycle may complete	120	900	exhaustive	no	no	no
 persistent-mutation-admission/PersistentMutationAdmission	safety	intentional-terminal	mutation admission decision is terminal	30	120	exhaustive	no	no	no
 post-init-leases/PostInitLeases	safety	intentional-terminal	service lease may terminate	120	900	exhaustive	no	no	no
@@ -75,6 +76,7 @@ process-address-space-lifetime/ProcessAddressSpaceLifetime	temporal	intentional-
 process-signal-delivery/ProcessSignalDelivery	safety	intentional-terminal	signal disposition may terminate the process	30	120	exhaustive	no	no	no
 rootd-bootstrap/RootdBootstrap	temporal	intentional-terminal	bootstrap outcome is terminal	120	900	exhaustive	no	no	yes
 service-bootstrap-lifecycle/ServiceBootstrapLifecycle	temporal	intentional-terminal	service entry or dependency admission reaches an exact terminal outcome	120	900	exhaustive	no	no	no
+service-heap-lifecycle/ServiceHeapLifecycle	safety	check	explicit terminal allocation-failure stutter preserves deadlock checking	30	120	exhaustive	no	no	no
 rootd-restart-backoff/RootdRestartBackoff	temporal	intentional-terminal	restart budget may terminate	120	900	exhaustive	no	no	no
 runtime-control-rpc/RuntimeControlRpc	safety	intentional-terminal	one response resolves the RPC	120	900	exhaustive	no	no	yes
 runtime-control-authority/RuntimeControlAuthority	safety	intentional-terminal	control request is admitted or denied	30	120	exhaustive	no	no	no
@@ -90,3 +92,4 @@ ui-input-motion/UiInputMotion	temporal	intentional-terminal	bounded motion trace
 vfio-release-authorization/VfioReleaseAuthorization	safety	intentional-terminal	release decision is terminal	120	900	exhaustive	no	no	no
 wayland-accept-isolation/WaylandAcceptIsolation	temporal	intentional-terminal	accept decision is terminal	120	900	exhaustive	no	no	no
 wayland-frame-pacing/WaylandFramePacing	temporal	intentional-terminal	bounded pacing epoch may stop	120	900	exhaustive	no	no	no
+product-boot/ProductBoot	temporal	intentional-terminal	product boot reaches a complete topology terminal or an explicit bounded failure	30	120	exhaustive	no	no	yes

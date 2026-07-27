@@ -23,6 +23,10 @@ const ENODEV: i32 = 19;
 const ENOSYS: i32 = 38;
 const ETIMEDOUT: i32 = 110;
 
+pub fn executable_snapshot_marker(path: &str, file_len: usize) -> alloc::string::String {
+    format!("vfsd: executable snapshot sealed path={path} bytes={file_len}")
+}
+
 pub fn validate_dvm_block_range(
     block_size: usize,
     block_count: u64,
@@ -480,6 +484,13 @@ mod tests {
     use super::*;
     use alloc::vec;
 
+    #[test]
+    fn executable_snapshot_marker_binds_path_and_exact_length() {
+        assert_eq!(
+            executable_snapshot_marker("apps/wayclick/wayclick.elf", 916_224),
+            "vfsd: executable snapshot sealed path=apps/wayclick/wayclick.elf bytes=916224"
+        );
+    }
     #[test]
     fn dvm_block_range_rejects_empty_overflow_and_end_overrun() {
         assert_eq!(

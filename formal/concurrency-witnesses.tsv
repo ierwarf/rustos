@@ -1,0 +1,4 @@
+# proof_test	production_source	production_symbol	invariant
+exit_and_publication_never_leave_authority_live	kernel/compat/src/user/syscall/linux/ipc_ops.rs	cleanup_service_endpoints_for_process	exit-revoke-and-publication-serialize-under-registry-lock
+readiness_change_cannot_be_lost_across_arm	kernel/compat/src/user/syscall/linux/service_ops/poll_epoll.rs	syscall_linux_epoll_wait	check-register-recheck-arm-verify-commit
+stable_endpoint_snapshot_never_admits_a_torn_publication	kernel/compat/src/user/syscall/linux/ipc_ops.rs	stable_published_service_endpoint	epoch-and-endpoint-double-read-admits-owned-publication

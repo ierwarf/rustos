@@ -1,13 +1,303 @@
-schema = 1
-max_intentional_terminal_models = 89
+schema = 3
+max_intentional_terminal_models = 90
 models = "formal/models.tsv"
+model_bindings = "formal/model-bindings.tsv"
 flows = "formal/system-flows.tsv"
+scenarios = "formal/product-scenarios.tsv"
 witnesses = "formal/run-source-conformance.sh"
 generated_doc = "docs/ai/formal-contracts.generated.md"
+
+[[risk_surfaces]]
+path = "kernel/hal/src/arch/idt/handlers.rs"
+severity = "critical"
+flows = ["exception-retirement"]
+reason = "Privilege transition and fault retirement can corrupt or halt the whole system."
+
+[[risk_surfaces]]
+path = "kernel/hal/src/arch/acpi.rs"
+severity = "critical"
+flows = ["acpi-firmware-admission", "monotonic-deadline-lifecycle"]
+reason = "Untrusted firmware tables select hardware resources and the monotonic clock source."
+
+[[risk_surfaces]]
+path = "kernel/hal/src/arch/clock.rs"
+severity = "critical"
+flows = ["monotonic-deadline-lifecycle"]
+reason = "Every timeout, scheduling age, and recovery deadline depends on one monotonic domain."
+
+[[risk_surfaces]]
+path = "kernel/hal/src/arch/rtc.rs"
+severity = "critical"
+flows = ["monotonic-deadline-lifecycle", "scheduler-lifecycle"]
+reason = "Deadline ownership and wake delivery must not lose, duplicate, or indefinitely delay a waiter."
+
+[[risk_surfaces]]
+path = "kernel/hal/src/arch/msi.rs"
+severity = "critical"
+flows = ["msi-vector-ingress"]
+reason = "Device interrupt admission crosses an untrusted hardware-to-kernel boundary."
+
+[[risk_surfaces]]
+path = "kernel/hal/src/arch/pci.rs"
+severity = "critical"
+flows = ["pci-resource-discovery"]
+reason = "BAR discovery controls physical MMIO ownership and must reject malformed resources."
+
+[[risk_surfaces]]
+path = "kernel/hal/src/arch/gdt.rs"
+severity = "critical"
+flows = ["exception-retirement"]
+reason = "Privilege stacks and segment selectors determine safe exception and syscall entry."
+
+[[risk_surfaces]]
+path = "kernel/lowlevel/src/interrupts.rs"
+severity = "critical"
+flows = ["exception-retirement"]
+reason = "Interrupt exclusion and saved-context layout are foundational ring0 concurrency contracts."
+
+[[risk_surfaces]]
+path = "kernel/ipc-runtime/src/ipc/mod.rs"
+severity = "critical"
+flows = ["ipc-call", "endpoint-lifecycle", "ipc-handle-transfer", "root-authority", "service-call-authority"]
+reason = "IPC queues, replies, endpoint owners, and transferred capabilities are the microkernel authority spine."
+
+[[risk_surfaces]]
+path = "kernel/mm/src/memory/address_space.rs"
+severity = "critical"
+flows = ["memory-map", "user-memory-access"]
+reason = "Page-table mutations control isolation, W xor X, and physical-frame ownership."
+
+[[risk_surfaces]]
+path = "kernel/mm/src/memory/kernel_vm.rs"
+severity = "critical"
+flows = ["kernel-memory-protection"]
+reason = "Kernel image W xor X, direct-map permissions, and MMIO windows share the active kernel page tables."
+
+[[risk_surfaces]]
+path = "kernel/mm/src/memory/phys.rs"
+severity = "critical"
+flows = ["physical-frame-lifecycle"]
+reason = "Frame reservation, allocation, and one-time release determine all physical memory ownership."
+
+[[risk_surfaces]]
+path = "kernel/mm/src/api.rs"
+severity = "critical"
+flows = ["kernel-memory-protection", "physical-frame-lifecycle", "user-memory-access"]
+reason = "The public MM substrate API exposes page tables, frames, and user-copy backing to other ring0 crates."
+
+[[risk_surfaces]]
+path = "libs/rustos-svc-runtime/src/allocator.rs"
+severity = "critical"
+flows = ["service-heap-lifecycle"]
+reason = "Every long-lived policy service shares this allocator; cumulative leaks or corrupt reuse can terminate multiple core owners."
+
+[[risk_surfaces]]
+path = "services/syscalld/src/linux_policy.rs"
+severity = "critical"
+flows = ["memory-map", "service-heap-lifecycle"]
+reason = "Userspace Linux VM policy owns address-hint reuse and fixed-map validation ordering; rejected requests must not destructively mutate an existing address space."
+
+[[risk_surfaces]]
+path = "services/syscalld/src/mmap_policy.rs"
+severity = "critical"
+flows = ["memory-map"]
+reason = "Pure mmap classification must accept the complete backing contract before destructive MAP_FIXED replacement is allowed."
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/process_table.rs"
+severity = "critical"
+flows = ["process-address-space-lifecycle", "endpoint-lifecycle"]
+reason = "Process generation, exit, address-space, and endpoint lifetime share one identity boundary."
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler.rs"
+severity = "critical"
+flows = ["scheduler-lifecycle", "scheduler-dispatch", "process-address-space-lifecycle", "exception-retirement", "endpoint-lifecycle", "syscall-simd-lifecycle"]
+reason = "Task state, CPU fairness, wake races, retirement, and context integrity converge here."
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/current.rs"
+severity = "critical"
+flows = ["scheduler-lifecycle", "scheduler-dispatch", "monotonic-deadline-lifecycle", "user-memory-access"]
+reason = "Current-task access is the interrupt-excluded gateway to scheduler and process generation state."
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/irq.rs"
+severity = "critical"
+flows = ["scheduler-lifecycle", "scheduler-dispatch", "monotonic-deadline-lifecycle"]
+reason = "Timer and software-reschedule entry order controls deadline wake and preemption."
+
+[[risk_surfaces]]
+path = "kernel/ps/src/user/sysops/usermem.rs"
+severity = "critical"
+flows = ["user-memory-access"]
+reason = "Every syscall copyin and copyout crosses untrusted process memory through this range gate."
+
+[[risk_surfaces]]
+path = "kernel/ps/src/api.rs"
+severity = "critical"
+flows = ["process-address-space-lifecycle", "syscall-simd-lifecycle", "user-memory-access"]
+reason = "The public process substrate API exposes task, process, address-space, and ABI lifetime operations."
+
+[[risk_surfaces]]
+path = "kernel/ps/src/user/handles/table.rs"
+severity = "critical"
+flows = ["ipc-handle-transfer", "vfs-open-description"]
+reason = "Descriptor duplication, exec, close, and transfer determine capability lifetime."
+
+[[risk_surfaces]]
+path = "kernel/compat/src/user/syscall/linux/ipc_ops.rs"
+severity = "critical"
+flows = ["ipc-call", "endpoint-lifecycle", "root-authority", "service-call-authority", "commercial-envelope", "input-delivery-lifecycle"]
+reason = "User ABI IPC admission binds callers to service generations and finite reply deadlines."
+
+[[risk_surfaces]]
+path = "kernel/compat/src/user/syscall/linux/proc_broker_ops.rs"
+severity = "critical"
+flows = ["deferred-process-activation", "loader-request-authority", "post-init-service-authority", "remote-file-map"]
+reason = "Loader transactions mutate process identity, mappings, handles, and executable authority."
+
+[[risk_surfaces]]
+path = "kernel/compat/src/user/syscall/linux/mm_broker_ops.rs"
+severity = "critical"
+flows = ["memory-map"]
+reason = "Untrusted mapping requests cross into the ring0 page-table substrate."
+
+[[risk_surfaces]]
+path = "kernel/compat/src/user/syscall/linux/service_ops/poll_epoll.rs"
+severity = "critical"
+flows = ["waitset", "input-delivery-lifecycle"]
+reason = "General wait ABI correctness depends on atomic observation, arm, timeout, signal, and revoke."
+
+[[risk_surfaces]]
+path = "kernel/compat/src/user/syscall/linux/waitset_broker_ops.rs"
+severity = "critical"
+flows = ["waitset"]
+reason = "Provider generations and waiter ownership close readiness lost-wake windows."
+
+[[risk_surfaces]]
+path = "kernel/compat/src/user/syscall/linux/service_ops/futex_thread.rs"
+severity = "critical"
+flows = ["futex-wait-lifecycle"]
+reason = "Futex wait, requeue, timeout, signal, and task exit share mutable waiter ownership."
+
+[[risk_surfaces]]
+path = "kernel/compat/src/user/syscall/linux/block_broker_ops.rs"
+severity = "critical"
+flows = ["dvm-block-startup"]
+reason = "Storage startup waits must fail closed without fabricating provider readiness."
+
+[[risk_surfaces]]
+path = "kernel/io-manager/src/io/dvm_block.rs"
+severity = "critical"
+flows = ["dvm-block-ingress", "dvm-block-startup", "dvm-volume-io", "durable-block-mutation"]
+reason = "Shared-ring storage authority, slot reuse, mutation durability, and revoke are data-loss boundaries."
+
+[[risk_surfaces]]
+path = "kernel/io-manager/src/input/dvm_ring.rs"
+severity = "critical"
+flows = ["dvm-input-ingress", "input-delivery-lifecycle"]
+reason = "Input transport has a single consumer lease and must preserve wake and generation ownership."
+
+[[risk_surfaces]]
+path = "kernel/io-manager/src/io/dvm_display.rs"
+severity = "critical"
+flows = ["dvm-display-ingress"]
+reason = "Display snapshots and damage bounds cross an untrusted shared-memory boundary."
+
+[[risk_surfaces]]
+path = "kernel/io-manager/src/api.rs"
+severity = "critical"
+flows = ["input-delivery-lifecycle"]
+reason = "The public device substrate API exposes consumer lease and transport state across ring0 crates."
+
+[[risk_surfaces]]
+path = "services/rootd/src/main.rs"
+severity = "critical"
+flows = ["service-bootstrap", "service-restart", "post-init-service-authority", "dvm-network-ingress", "service-heap-lifecycle"]
+reason = "Rootd owns the service authority graph, restart generations, bootstrap dependency policy, and the first reclaiming service heap."
+
+[[risk_surfaces]]
+path = "services/loaderd/src/main.rs"
+severity = "critical"
+flows = ["loader-request-authority"]
+reason = "Loaderd admits executable images and coordinates the transactional process loader."
+
+[[risk_surfaces]]
+path = "services/vfsd/src/main.rs"
+severity = "critical"
+flows = ["vfs-open-description", "remote-file-map"]
+reason = "Vfsd owns durable open-description state and filesystem policy."
+
+[[risk_surfaces]]
+path = "services/storaged/src/block.rs"
+severity = "critical"
+flows = ["dvm-block-startup", "dvm-read-cache"]
+reason = "Storaged binds provider generation, geometry, read-ahead, cancellation, and cache invalidation."
+
+[[risk_surfaces]]
+path = "services/inputd/src/main.rs"
+severity = "critical"
+flows = ["input-delivery-lifecycle"]
+reason = "Inputd owns readiness publication, policy queue progress, and transport consumer lifetime."
+
+[[risk_surfaces]]
+path = "services/netd/src/main.rs"
+severity = "critical"
+flows = ["dvm-network-ingress", "netd-deferred-reply-lifecycle"]
+reason = "Netd owns packet admission and deferred socket reply settlement."
+
+[[risk_surfaces]]
+path = "services/runtimed/src/spawn.rs"
+severity = "critical"
+flows = ["scheduler-dispatch"]
+reason = "Runtime launch policy is the only user-space admission path into strict scheduling class."
+
+[[risk_surfaces]]
+path = "services/runtimed/src/socket.rs"
+severity = "critical"
+flows = ["runtime-control-ingress"]
+reason = "Runtime control peers can mutate process and desktop lifecycle."
+
+[[risk_surfaces]]
+path = "services/uiserver/src/wayland.rs"
+severity = "critical"
+flows = ["wayland-client-ingress"]
+reason = "Untrusted Wayland objects, buffers, callbacks, and disconnects share compositor state."
+
+[[risk_surfaces]]
+path = "services/uiserver/src/gpu_runtime.rs"
+severity = "critical"
+flows = ["dvm-display-ingress", "gpu-frame-lifecycle"]
+reason = "Frame submission, completion, timeout, and provider revoke directly affect interactive availability."
 
 [[source_mappings]]
 path = "kernel/hal/src/arch/simd.rs"
 models = ["syscall-simd-lifecycle/SyscallSimdLifecycle"]
+
+[[source_mappings]]
+path = "kernel/compat/src/user/syscall/linux/debug_ops.rs"
+models = ["product-boot/ProductBoot"]
+
+[[source_mappings]]
+path = "kernel/hal/src/arch/clock.rs"
+models = ["clocksource-deadline/ClocksourceDeadline"]
+
+[[source_mappings]]
+path = "kernel/hal/src/arch/gdt.rs"
+models = ["exception-retirement-lifecycle/ExceptionRetirementLifecycle"]
+
+[[source_mappings]]
+path = "kernel/lowlevel/src/interrupts.rs"
+models = ["exception-retirement-lifecycle/ExceptionRetirementLifecycle"]
+
+[[source_mappings]]
+path = "kernel/mm/src/api.rs"
+models = [
+    "page-table-lifecycle/PageTableLifecycle",
+    "physical-frame-lifecycle/PhysicalFrameLifecycle",
+    "process-address-space-lifetime/ProcessAddressSpaceLifetime",
+]
 
 [[source_mappings]]
 path = "kernel/nucleus-core/src/debug/mod.rs"
@@ -23,8 +313,21 @@ models = [
 [[source_mappings]]
 path = "kernel/ps/src/multitask/current.rs"
 models = [
+    "clocksource-deadline/ClocksourceDeadline",
+    "ipc-priority-inheritance/IpcPriorityInheritance",
     "process-address-space-lifetime/ProcessAddressSpaceLifetime",
+    "scheduler-cpu-distribution/SchedulerCpuDistribution",
+    "scheduler-thread-demotion/SchedulerThreadDemotion",
+    "scheduler-wakeup/SchedulerWakeup",
     "syscall-simd-lifecycle/SyscallSimdLifecycle",
+]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/irq.rs"
+models = [
+    "clocksource-deadline/ClocksourceDeadline",
+    "scheduler-cpu-distribution/SchedulerCpuDistribution",
+    "scheduler-wakeup/SchedulerWakeup",
 ]
 
 [[source_mappings]]
@@ -33,6 +336,28 @@ models = [
     "process-address-space-lifetime/ProcessAddressSpaceLifetime",
     "syscall-simd-lifecycle/SyscallSimdLifecycle",
 ]
+
+[[source_mappings]]
+path = "kernel/compat/src/user/syscall/linux/ipc_ops.rs"
+models = [
+    "input-ingestion-worker/InputIngestionWorker",
+    "service-call-authority/ServiceCallAuthority",
+]
+
+[[source_mappings]]
+path = "kernel/io-manager/src/api.rs"
+models = ["input-ingestion-worker/InputIngestionWorker"]
+
+[[source_mappings]]
+path = "kernel/io-manager/src/input/dvm_ring.rs"
+models = [
+    "dvm-input-ring/DvmInputRing",
+    "input-ingestion-worker/InputIngestionWorker",
+]
+
+[[source_mappings]]
+path = "services/inputd/src/main.rs"
+models = ["input-ingestion-worker/InputIngestionWorker"]
 
 [[source_mappings]]
 path = "services/vfsd/src/block.rs"
@@ -52,6 +377,41 @@ models = [
 path = "services/runtimed/src/main.rs"
 models = ["ui-frame-budget/UiFrameBudget"]
 
+[[source_mappings]]
+path = "services/rootd/src/main.rs"
+models = ["service-heap-lifecycle/ServiceHeapLifecycle"]
+
+[[source_mappings]]
+path = "libs/rustos-svc-runtime/src/allocator.rs"
+models = ["service-heap-lifecycle/ServiceHeapLifecycle"]
+
+[[source_mappings]]
+path = "services/syscalld/src/linux_policy.rs"
+models = [
+    "page-table-lifecycle/PageTableLifecycle",
+    "service-heap-lifecycle/ServiceHeapLifecycle",
+]
+
+[[source_mappings]]
+path = "services/syscalld/src/vma_policy.rs"
+models = ["service-heap-lifecycle/ServiceHeapLifecycle"]
+
+[[source_mappings]]
+path = "services/syscalld/src/mmap_policy.rs"
+models = ["page-table-lifecycle/PageTableLifecycle"]
+
+[[source_mappings]]
+path = "services/syscalld/src/main.rs"
+models = ["page-table-lifecycle/PageTableLifecycle"]
+
+[[source_mappings]]
+path = "services/syscalld/src/lib.rs"
+models = ["page-table-lifecycle/PageTableLifecycle"]
+
+[[source_mappings]]
+path = "tools/xtask/src/kvm/evidence.rs"
+models = ["service-heap-lifecycle/ServiceHeapLifecycle"]
+
 [profiles.pr]
 evidence_max_age_hours = 168
 required_evidence = [
@@ -60,6 +420,10 @@ required_evidence = [
     "build/formal/verus/summary.json",
     "build/formal/runtime-traces/runtime-control-rpc-summary.json",
     "build/formal/runtime-traces/kvm-p0-summary.json",
+    "build/formal/fault-scenarios/summary.json",
+    "build/formal/abi-differential/summary.json",
+    "build/formal/recovery-scenarios/summary.json",
+    "build/formal/implementation-mutations/summary.json",
     "build/formal/mutations/summary.json",
 ]
 
@@ -71,6 +435,11 @@ required_evidence = [
     "build/formal/verus/summary.json",
     "build/formal/runtime-traces/runtime-control-rpc-summary.json",
     "build/formal/runtime-traces/kvm-p0-summary.json",
+    "build/formal/fault-scenarios/summary.json",
+    "build/formal/abi-differential/summary.json",
+    "build/formal/recovery-scenarios/summary.json",
+    "build/formal/implementation-mutations/summary.json",
+    "build/formal/sanitizers/summary.json",
     "build/formal/mutations/summary.json",
     "build/formal/miri/summary.json",
     "build/formal/loom/summary.json",
@@ -80,12 +449,14 @@ required_evidence = [
 ]
 
 [topologies.qemu-commercial]
+runtime_scenario = "interactive-boot"
+hard_deadline_ms = 5000
 required_runtime_models = [
     "rootd-bootstrap/RootdBootstrap",
     "dvm-block-startup/DvmBlockStartup",
     "input-ingestion-worker/InputIngestionWorker",
     "dvm-display-readiness/DvmDisplayReadiness",
-    "network-payload-session/NetworkPayloadSession",
+    "product-boot/ProductBoot",
     "ui-frame-budget/UiFrameBudget",
 ]
 required_artifacts = [
@@ -95,9 +466,23 @@ required_artifacts = [
 ]
 
 [topologies.storage-dvm]
+runtime_scenario = "storage-boot"
+hard_deadline_ms = 5000
 required_runtime_models = [
     "rootd-bootstrap/RootdBootstrap",
     "dvm-block-startup/DvmBlockStartup",
+]
+required_artifacts = [
+    "build/rustos-boot.img",
+    "driver-domains/linux/out/artifacts/rustos-linux-dvm-x86_64.bzImage",
+    "driver-domains/linux/out/artifacts/rustos-linux-dvm-x86_64.rootfs.cpio.zst",
+]
+
+[topologies.qemu-control]
+runtime_scenario = "control-smoke"
+hard_deadline_ms = 5000
+required_runtime_models = [
+    "rootd-bootstrap/RootdBootstrap",
 ]
 required_artifacts = [
     "build/rustos-boot.img",

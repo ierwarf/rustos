@@ -7,7 +7,7 @@ use rustos_user_abi::syscall::{
     SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_IPC_CALL_BOUNDED, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
     SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_RECV_WITH_SENDER,
     SYS_RUSTOS_IPC_REGISTER_LINUX_SYSCALL_ENDPOINT, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT,
-    SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_IPC_VALIDATE_SERVICE_OWNER,
+    SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_IPC_VALIDATE_SERVICE_OWNER, SYS_RUSTOS_PRODUCT_MILESTONE,
 };
 
 use crate::syscall::{syscall0, syscall1, syscall2, syscall3, syscall5, syscall6};
@@ -145,4 +145,13 @@ pub fn debug_line(message: &str) {
             line.len() as u64,
         );
     }
+}
+
+/// Emit a fixed-name, kernel-timestamped product acceptance milestone.
+///
+/// The marker is diagnostic evidence only. It does not grant or transfer any
+/// service authority.
+#[inline]
+pub fn product_milestone(milestone: u64, arg0: u64, arg1: u64) -> i64 {
+    unsafe { syscall3(SYS_RUSTOS_PRODUCT_MILESTONE, milestone, arg0, arg1) }
 }

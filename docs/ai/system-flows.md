@@ -43,8 +43,13 @@ Every high-risk flow therefore names:
 
 The checker rejects duplicate IDs, missing graph exits, unbounded timeout
 transitions, unregistered models, absent source/witness mappings, and any
-reintroduced direct `.ko` route. Linux driver modules remain inside the DVM;
-they are not an exception to RustOS kernel/service lifecycle contracts.
+reintroduced direct `.ko` route. `formal/contracts.toml` also names every
+audited critical/high source surface, while `formal/model-bindings.tsv` binds
+supporting refinement and evidence models to a production whole flow. An
+orphan model or a risk surface that only names a model without an exact
+transition/source mapping fails the registry. Linux driver modules remain
+inside the DVM; they are not an exception to RustOS kernel/service lifecycle
+contracts.
 
 ## Global composition invariants
 
@@ -75,6 +80,24 @@ they are not an exception to RustOS kernel/service lifecycle contracts.
 8. **Failure is an observable terminal, not fabricated success.** Malformed
    envelopes, stale epochs, exhausted bounds, incomplete replay, and uncertain
    teardown return a direct error or withdraw authority.
+9. **A scheduler block has one exact epoch.** Only a current, runnable,
+   non-retired task may arm. Wake clears the arm before commit; commit refuses
+   a raced wake; cancel requires a live arm; retirement removes all runnable,
+   donation, and wait authority.
+10. **All elapsed-time decisions share one validated monotonic domain.**
+    Calendar RTC state never owns timeouts. A delayed clockevent catches every
+    absolute deadline at or before the current source time, and cancel, wake,
+    or owner exit removes the exact timer owner.
+11. **Usercopy retains one process generation through validation and copy.**
+    Copyin/copyout rejects kernel, noncanonical, wrapping, unmapped, and
+    wrong-permission spans before dereference. Exec and exit serialize against
+    the retained address-space state; a partial stale-generation copy is not a
+    valid outcome.
+12. **Physical frames and kernel mappings have disjoint authority.** Boot-owned
+    and allocator-metadata frames never enter the free set. Allocation consumes
+    one exact free frame/run, only an allocated frame may be released, kernel
+    image mappings are W xor X, and MMIO/direct-map permission changes require
+    one aligned nonwrapping range inside the admitted aperture.
 
 ## Registered whole flows
 
@@ -98,7 +121,7 @@ they are not an exception to RustOS kernel/service lifecycle contracts.
 | `durable-block-mutation` | live-generation admission → WRITE/FUA submission → accepted completion → FLUSH or stable completion → durable-through operation ID | `storaged`, compat block broker, `kernel/io-manager`, storage DVM | durable, timeout/cancel, generation revoke |
 | `dvm-volume-io` | exact range validation → bounded broker chunks → generation-bound DVM dispatch | `vfsd`, `storaged`, compat block broker, `kernel/io-manager` | complete, invalid request, timeout, revoke, transport failure |
 | `remote-file-map` | mapping admission → immutable early-system or DVM-volume ownership → one-time immutable digest proof or generation-bound source reads → exact-length copy → address-space commit | `loaderd`, `vfsd`, `kernel-compat`, `kernel/mm` | mapped, digest/range rejection, short-read abort, immutable-owner loss, transport failure |
-| `memory-map` | canonical checked range → page install → W^X protection changes → unmap | compat MM broker, `kernel/mm` | mapped, rejected, unmapped |
+| `memory-map` | canonical checked range → flags/backing plan → fixed-replace prevalidation → page install → complete-span protection preflight → W^X PTE commit → unmap | `syscalld`, compat MM broker, `kernel/mm` | mapped, non-destructive rejection, atomically admitted protection, unmapped |
 | `syscall-simd-lifecycle` | trust-boundary user snapshot → kernel continuation → optional block/preemption → exact-task restore | `kernel-compat`, `kernel-ps` | returned, nested capture rejection, wrong-task restore rejection |
 | `pci-resource-discovery` | disable command decode → probe/restore low BAR → probe/restore optional high BAR → lowest-mask-bit size decode → command restore/publication | `kernel-hal` | exact resource, invalid-mask rejection, fully restored hardware |
 | `zero-trust-e2e` | kernel-stamped receive → exact wire/identity/delegation validation → object-generation admission → request-bound response | IPC substrate, receiving service, subsystem owner, caller | admitted response, malformed/foreign denial, timeout, revoke |
@@ -120,9 +143,17 @@ they are not an exception to RustOS kernel/service lifecycle contracts.
 | `process-signal-lifecycle` | pending selection → mask/action/target recheck → handler/stop/kill or fault disposition | compat signal policy, `kernel-ps`, exception bridge | delivery, stale selection denial, recoverable fault, terminal exit |
 | `futex-wait-lifecycle` | exact task/key registration → scheduler arm → wake/requeue, deadline, or task exit cleanup | compat futex owner, `kernel-ps` | wake, timeout, exit cleanup |
 | `netd-deferred-reply-lifecycle` | global pending-slot reserve → bounded detach batch → exactly one terminal reply | `netd` | reply, capacity/queue failure, timeout |
-| `input-delivery-lifecycle` | authenticated DVM record → atomic ingestion-worker arm → bounded drain → readiness generation → authorized UI read | input transport, `inputd`, wait-set, `uiserver` | delivered event, malformed record, provider timeout, transport revoke |
+| `input-delivery-lifecycle` | authenticated DVM record → atomic ingestion-worker arm → bounded drain → unlocked bounded session-authority sync → readiness generation → authorized UI read | input transport, `inputd`, `netd`, wait-set, `uiserver` | delivered event, malformed record, authority/session reset, consumer-owner exit/rearm, provider timeout, transport revoke |
 | `gpu-frame-lifecycle` | live primed provider → bounded scene/capability → address-free submit → acquire/completion/page-flip fences | `uiserver`, display substrate, Linux DVM | displayed frame, provider/scene denial, stale completion revoke, hard timeout |
 | `acpi-firmware-admission` | checksummed root SDT → atomic MCFG admission → exact HPET GAS admission or explicit legacy/no-HPET topology | `kernel-hal` | ECAM/HPET topology or explicit bounded fallback topology |
+| `scheduler-lifecycle` | runnable current task → exact arm → raced wake/cancel or committed block → wake/deadline/retirement | `kernel-ps`, `kernel-hal` | wake success, raced-wake cancel, bounded timeout, terminal retirement |
+| `scheduler-dispatch` | source-pinned class admission → optional reply-scoped donation/demotion → bounded System burst or overdue/latency User dispatch | `runtimed`, `kernel-ps` | User dispatch, donation completion/cancel/revoke, base-class demotion |
+| `monotonic-deadline-lifecycle` | validated invariant-TSC/HPET source → exact task/deadline arm → recheck/commit → clockevent/nondeadline wake, cancel, timeout, or retirement | `kernel-hal`, `kernel-ps` | source rejection, wake success, cancel, bounded timeout, owner exit |
+| `user-memory-access` | retain exact process generation → canonical checked range → readable/writable live page spans → complete copy or rejection | `kernel-ps`, `kernel-mm` | complete copy, range/page-access rejection, exec/exit revoke |
+| `kernel-memory-protection` | checked kernel ELF segments → W xor X direct-map protection → bounded MMIO map/unmap | `kernel-mm` | protected image, exact MMIO lifecycle, W+X/range rejection |
+| `physical-frame-lifecycle` | trimmed boot memory map → kernel/early-system/bitmap reservation → exact free-run allocation → one-time release | `kernel-mm` | allocated/reusable frame, exhaustion, invalid/double/reserved free rejection |
+| `service-heap-lifecycle` | one-time kernel bootstrap region → aligned live allocation → exact one-time release → address-ordered coalescing → unlock → bounded grow only after no-fit | `rustos-svc-runtime`, `syscalld`, KVM evidence | reusable span, no lock held across pager wait, duplicate-release rejection, bounded peak-resident growth, explicit allocation failure |
+| `commercial-product-boot` | core readiness → concurrent input/display/storage milestones → exact sealed executable snapshot → first presented WayClick frame; the storage-only branch ends at its proven data plane | `rootd`, input/display/storage owners, `vfsd`, `loaderd`, WayClick, KVM evidence | five-second interactive/storage success, stage timeout, generation revoke, no partial-image success |
 
 ## External design baselines
 
@@ -136,6 +167,18 @@ These are comparison inputs, not claims of certification equivalence:
   <https://qnx.com/developers/docs/7.1/com.qnx.doc.neutrino.sys_arch/topic/ipc_Channels.html>,
   <https://qnx.com/developers/docs/7.1/com.qnx.doc.neutrino.lib_ref/topic/c/channelcreate.html>,
   <https://qnx.com/developers/docs/7.1/com.qnx.doc.neutrino.resmgr/topic/messages_HANDLING_open.html>.
+- QNX resource constraints reserve capacity for core services and require a
+  proxy server to charge work to the constrained client rather than silently
+  consuming the server reserve. RustOS applies the same separation at the
+  service allocator boundary: transient client work must be reclaimable and
+  an exhausted allocation is a visible health failure, never cumulative
+  bump-heap loss:
+  <https://www.qnx.com/developers/docs/8.0/com.qnx.doc.neutrino.prog/topic/process_resource_constraint.html>.
+- Linux PSI distinguishes partial pressure from a full stall and supports
+  threshold-triggered monitoring. RustOS uses that as the baseline for future
+  CPU/memory/IO pressure epochs; raw log volume or the last printed line is not
+  a progress oracle:
+  <https://docs.kernel.org/accounting/psi.html>.
 - seL4 capDL declares objects and capability distribution independently of the
   loader and translates the same description into initialization and formal
   reasoning inputs. RustOS uses this as the baseline for keeping owner,
@@ -154,5 +197,10 @@ These are comparison inputs, not claims of certification equivalence:
 Any change that adds a high-risk cross-owner transition must update
 `system-flows.tsv` in the same change set. Add a new formal model only when no
 existing model owns the transition; otherwise add the exact source witness to
-the existing model. Low-risk local formatting, pure data conversion, and
-bounded leaf helpers do not need a flow row.
+the existing model. A supporting model must also appear in
+`model-bindings.tsv`; adding a critical/high owner file requires an explicit
+`risk_surfaces` entry. The fallback impact detector is intentionally limited to
+stateful APIs, service entrypoints, broker operations, scheduler/process/IRQ
+owners, and DVM transports. Low-risk local formatting, pure data conversion,
+diagnostic rendering, and bounded leaf helpers do not need a flow row and no
+longer inherit a blanket “all kernel/services Rust is high risk” classification.

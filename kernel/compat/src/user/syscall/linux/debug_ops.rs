@@ -31,8 +31,51 @@ pub(super) fn syscall_linux_rustos_debug_print(user_ptr: u64, user_len: u64) -> 
     written as u64
 }
 
+fn product_milestone_name(milestone: u64) -> Option<(&'static str, bool)> {
+    match milestone {
+        linux_abi::PRODUCT_MILESTONE_ROOT_CORE_READY => Some(("product-root-core-ready", false)),
+        linux_abi::PRODUCT_MILESTONE_DISPLAY_READY => Some(("product-display-ready", true)),
+        linux_abi::PRODUCT_MILESTONE_STORAGE_READY => Some(("product-storage-ready", true)),
+        linux_abi::PRODUCT_MILESTONE_EXECUTABLE_SNAPSHOT_SEALED => {
+            Some(("product-executable-snapshot-sealed", true))
+        }
+        linux_abi::PRODUCT_MILESTONE_FIRST_FRAME => Some(("product-first-frame", false)),
+        _ => None,
+    }
+}
+
+pub(super) fn syscall_linux_rustos_product_milestone(milestone: u64, arg0: u64, arg1: u64) -> u64 {
+    let Some((name, requires_nonzero_arg0)) = product_milestone_name(milestone) else {
+        return linux_errno(LINUX_EINVAL);
+    };
+    if requires_nonzero_arg0 && arg0 == 0 {
+        return linux_errno(LINUX_EINVAL);
+    }
+    debug::record_milestone(debug::LogCategory::Compat, name, arg0, arg1);
+    0
+}
+
 pub(super) fn linux_errno(errno: i64) -> u64 {
     (-errno) as u64
+}
+
+#[cfg(test)]
+mod product_milestone_tests {
+    use super::*;
+
+    #[test]
+    fn product_milestones_are_a_closed_fixed_name_vocabulary() {
+        assert_eq!(
+            product_milestone_name(linux_abi::PRODUCT_MILESTONE_ROOT_CORE_READY),
+            Some(("product-root-core-ready", false))
+        );
+        assert_eq!(
+            product_milestone_name(linux_abi::PRODUCT_MILESTONE_EXECUTABLE_SNAPSHOT_SEALED),
+            Some(("product-executable-snapshot-sealed", true))
+        );
+        assert_eq!(product_milestone_name(0), None);
+        assert_eq!(product_milestone_name(u64::MAX), None);
+    }
 }
 
 #[cfg_attr(not(rustos_debug_print_enabled), allow(dead_code, unused_variables))]

@@ -13,7 +13,21 @@ RUSTOS_FORMAL_TRACE_OUT="$trace" \
 python3 formal/check-runtime-trace.py "$trace" \
     --summary "$artifact_dir/runtime-control-rpc-summary.json"
 if [[ -f "$artifact_dir/kvm-p0.jsonl" ]]; then
+    topology="$(python3 - "$artifact_dir/kvm-p0.jsonl" <<'PY'
+import json
+import sys
+for line in open(sys.argv[1], encoding="utf-8"):
+    if line.strip():
+        print(json.loads(line)["topology"])
+        break
+else:
+    raise SystemExit("KVM trace is empty")
+PY
+)"
     python3 formal/check-kvm-runtime-trace.py "$artifact_dir/kvm-p0.jsonl" \
+        --root "$repo_root" \
+        --registry "$repo_root/formal/product-scenarios.tsv" \
+        --topology "$topology" \
         --summary "$artifact_dir/kvm-p0-summary.json"
 elif [[ "${FORMAL_REQUIRE_KVM_TRACE:-0}" == 1 ]]; then
     echo "required KVM P0 runtime trace is missing" >&2

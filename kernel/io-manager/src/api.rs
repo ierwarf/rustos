@@ -358,6 +358,10 @@ pub mod input {
         pub fn disarm_inputd_ingestion_waiter(task_id: u64) {
             crate::input::wait_queue::disarm_inputd_ingestion_waiter(task_id);
         }
+
+        pub fn withdraw_policy_consumer() {
+            crate::input::dvm_ring::withdraw_policy_consumer();
+        }
     }
 
     pub fn init() {

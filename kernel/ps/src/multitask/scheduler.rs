@@ -1457,11 +1457,19 @@ impl Scheduler {
             self.contexts[slot].and_then(|context| context.process_handle.zip(context.process_id));
         if let Some(task_id) = task_id {
             self.release_ipc_priorities_for_task(task_id);
+            // Deadline ownership is task-scoped, not slot-scoped. Retire it
+            // before the scheduler can recycle storage or a delayed
+            // clockevent can attempt to wake a terminal task.
+            kernel_hal::api::arch::rtc::disarm_sleep_waiter(task_id);
         }
         self.retired[slot] = true;
         self.pending_reap = true;
         if let Some(context) = self.contexts[slot].as_mut() {
             context.ready = false;
+            context.ready_since_ticks = 0;
+            context.blocked = false;
+            context.blocked_since_ticks = 0;
+            context.wake_armed = false;
         }
         self.retire_reasons[slot] = Some(reason);
         if let Some(task_id) = task_id {
@@ -3376,10 +3384,13 @@ impl Scheduler {
 
     pub(super) fn block_current_user_task(&mut self) -> bool {
         let slot = self.current_task;
+        if self.retired[slot] || self.start_suspended[slot] {
+            return false;
+        }
         let Some(context) = self.contexts[slot].as_mut() else {
             return false;
         };
-        if !context.user_mode {
+        if !context.user_mode || context.blocked {
             return false;
         }
 
@@ -3393,10 +3404,13 @@ impl Scheduler {
 
     pub(super) fn block_current_task(&mut self) -> bool {
         let slot = self.current_task;
+        if slot == ROOT_TASK_SLOT || self.retired[slot] || self.start_suspended[slot] {
+            return false;
+        }
         let Some(context) = self.contexts[slot].as_mut() else {
             return false;
         };
-        if slot == ROOT_TASK_SLOT {
+        if context.blocked {
             return false;
         }
 
@@ -3415,12 +3429,21 @@ impl Scheduler {
     /// sleeping with a lost wakeup.
     pub(super) fn arm_block_current_task(&mut self) -> bool {
         let slot = self.current_task;
+        if slot == ROOT_TASK_SLOT || self.retired[slot] || self.start_suspended[slot] {
+            return false;
+        }
         let Some(context) = self.contexts[slot].as_mut() else {
             return false;
         };
-        if slot == ROOT_TASK_SLOT {
+        if context.blocked {
             return false;
         }
+        // A dispatched context is not on the ready queue. A prior raced wake
+        // may have marked this still-running task ready; the caller has
+        // already rechecked that condition before a new arm, so consume that
+        // stale runnable mark before publishing the next wait epoch.
+        context.ready = false;
+        context.ready_since_ticks = 0;
         context.wake_armed = true;
         true
     }
@@ -3430,12 +3453,17 @@ impl Scheduler {
     /// must not mark it blocked.
     pub(super) fn cancel_block_current_task(&mut self) -> bool {
         let slot = self.current_task;
+        if slot == ROOT_TASK_SLOT || self.retired[slot] || self.start_suspended[slot] {
+            return false;
+        }
         let Some(context) = self.contexts[slot].as_mut() else {
             return false;
         };
-        if slot == ROOT_TASK_SLOT {
+        if context.blocked || !context.wake_armed {
             return false;
         }
+        context.ready = false;
+        context.ready_since_ticks = 0;
         context.wake_armed = false;
         true
     }
@@ -3446,11 +3474,19 @@ impl Scheduler {
     /// `None` on invalid context.
     pub(super) fn commit_block_current_task(&mut self) -> Option<bool> {
         let slot = self.current_task;
+        if slot == ROOT_TASK_SLOT || self.retired[slot] || self.start_suspended[slot] {
+            return None;
+        }
         let context = self.contexts[slot].as_mut()?;
-        if slot == ROOT_TASK_SLOT {
+        if context.blocked {
             return None;
         }
         if !context.wake_armed {
+            // `wake_task` makes the current context ready to record the race,
+            // but it never stopped executing. Consume that transient queue
+            // mark before returning to the caller's condition loop.
+            context.ready = false;
+            context.ready_since_ticks = 0;
             return Some(false);
         }
         context.wake_armed = false;
@@ -4037,6 +4073,66 @@ mod tests {
         assert_eq!(scheduler.slot_class(2), Some(SchedClass::System));
         assert!(scheduler.release_ipc_priority(12));
         assert_eq!(scheduler.slot_class(2), Some(SchedClass::User));
+    }
+
+    #[test]
+    fn scheduler_block_arm_is_exact_race_safe_and_terminally_revoked() {
+        let mut scheduler = boxed_scheduler();
+        let base = crate::memory::paging::USER_SPACE_BASE;
+        let user_cs = crate::arch::gdt::user_code_selector().0 as u64;
+        let user_ss = crate::arch::gdt::user_data_selector().0 as u64;
+        let slot = scheduler
+            .allocate_user_slot(
+                690,
+                ProcessAddressSpace::empty_for_tests(),
+                UserTaskBootstrap::new(
+                    UserAbi::Linux,
+                    x86_64::VirtAddr::new(base + 0x2_000),
+                    x86_64::VirtAddr::new(base + 0x4_000),
+                ),
+                None,
+                crate::arch::pit::divisor_from_micros(100),
+                user_cs,
+                user_ss,
+                super::RFLAGS_RESERVED_BIT_1,
+                false,
+                noop_task_entry,
+            )
+            .expect("user slot");
+        scheduler.current_task = slot;
+        scheduler.contexts[slot]
+            .as_mut()
+            .expect("dispatched context")
+            .ready = false;
+
+        assert!(scheduler.arm_block_current_task());
+        assert!(scheduler.contexts[slot].expect("context").wake_armed);
+        assert!(scheduler.wake_task(690));
+        assert!(!scheduler.contexts[slot].expect("context").wake_armed);
+        assert_eq!(scheduler.commit_block_current_task(), Some(false));
+        assert!(!scheduler.contexts[slot].expect("context").ready);
+
+        assert!(scheduler.arm_block_current_task());
+        assert_eq!(scheduler.commit_block_current_task(), Some(true));
+        let blocked = scheduler.contexts[slot].expect("context");
+        assert!(blocked.blocked);
+        assert!(!blocked.ready);
+        assert!(!scheduler.arm_block_current_task());
+        assert!(!scheduler.cancel_block_current_task());
+
+        assert!(scheduler.wake_task(690));
+        assert!(scheduler.contexts[slot].expect("context").ready);
+        scheduler.contexts[slot]
+            .as_mut()
+            .expect("redispatched context")
+            .ready = false;
+        assert!(scheduler.arm_block_current_task());
+        scheduler.retire_slot(slot, super::TaskRetireReason::Exited);
+        let retired = scheduler.contexts[slot].expect("retired context");
+        assert!(scheduler.retired[slot]);
+        assert!(!retired.wake_armed);
+        assert!(!scheduler.wake_task(690));
+        assert_eq!(scheduler.commit_block_current_task(), None);
     }
 
     #[test]

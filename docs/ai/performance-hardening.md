@@ -142,6 +142,11 @@ lock, and service restart invalidates it by advancing the epoch.
   than one eighth of the atlas. It coalesces until a recent slot completes
   instead of converting a small interactive update into a multi-megabyte copy.
   Release authority remains cleared independently.
+- The non-GPU fixed-pool path copies a full-width snapshot with one bounded
+  contiguous bulk transfer when source and destination strides match. Falling
+  back to one copy operation per scanline for that common case is a failed
+  cold-frame latency gate; partial or padded rows retain the checked row-wise
+  copy.
 - Uiserver owns one page-aligned mapping for each exact DVM atlas slot. It
   copies only the slot-reconstruction damage into that slot, then commits a
   pointer-free ABI v5 record. Ring0 revalidates the slot capability and command
@@ -204,6 +209,11 @@ lock, and service restart invalidates it by advancing the epoch.
   Mutable application discovery still fails closed until its DVM-backed VFS
   reads succeed; the first visible desktop no longer inherits an unrelated
   block-publication latency dependency.
+- A failed catalog launch records a per-entry consecutive-failure count and
+  applies bounded exponential backoff (100 ms base, 5 s cap; storage-not-ready
+  starts at 250 ms). Success clears both the deadline and count. A failed
+  loader/VFS/storage dependency therefore cannot turn three desktop entries
+  into a 10 Hz spawn/log storm while still retaining automatic recovery.
 - `cargo xtask kvm-run` is the real-use acceptance path: it enables no input
   self-test or private UI profiler. Startup requires an atomic three-buffer
   relay, an active RustOS provider, and a non-zero immutable source frame.
@@ -223,6 +233,12 @@ lock, and service restart invalidates it by advancing the epoch.
   snapshots are both conformance failures. Any missing worker, cursor wait race, ring
   saturation, shared-waiter exhaustion, or fallback polling loop fails the
   acceptance gate.
+- Inputd decodes one fixed ingress batch in its sole worker and takes the
+  policy queue lock once for ordinary event publication. It never holds that
+  lock across the bounded netd session-authority call. A transition failure
+  resets and drops that session while retaining ring-consumer progress;
+  inputd process exit separately clears policy readiness and old-owner records
+  before a replacement worker may rearm.
 - An interactive service's `TASK_WEIGHT_INTERACTIVE_FLAG` admits only its
   input/present and directly latency-bound workers. POSIX clone inherits that
   base class, so catalog loading, runtime polling, console refresh, logging,

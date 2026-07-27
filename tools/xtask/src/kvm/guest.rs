@@ -66,7 +66,12 @@ fn spawn_guests(
             "file,id=serial,path={},append=off",
             layout.rustos_serial_log.display()
         ))
-        .args(["-serial", "chardev:serial"]);
+        .args(["-serial", "chardev:serial"])
+        .arg("-monitor")
+        .arg(format!(
+            "unix:{},server,nowait",
+            layout.rustos_monitor.display()
+        ));
     append_dvm_input_doorbell(&mut rustos_command, &layout.dvm_input_doorbell);
     if let Some(doorbell) = layout.dvm_display_doorbell.as_deref() {
         append_dvm_display_doorbell(&mut rustos_command, doorbell);
@@ -378,11 +383,51 @@ fn wait_for_parallel_boot(
         let dvm_log = fs::read_to_string(&layout.dvm_serial_log)?;
         if !options.storage_only
             && !rustos_log.contains(RUSTOS_GPU_ACTIVE_MARKER)
-            && boot_started.elapsed() >= Duration::from_millis(BOOT_TO_UI_HARD_LIMIT_MS)
+            && guest_deadline_reached(&rustos_log, BOOT_TO_UI_HARD_LIMIT_MS)
         {
+            let reason = format!(
+                "RustOS interactive UI missed the {} ms boot acceptance limit",
+                BOOT_TO_UI_HARD_LIMIT_MS
+            );
+            let missing_rustos = vec![RUSTOS_GPU_ACTIVE_MARKER.to_owned()];
+            let evidence = write_kvm_failure_summary(
+                layout,
+                &reason,
+                boot_started.elapsed(),
+                &rustos_log,
+                &dvm_log,
+                &missing_rustos,
+                &[],
+            )?;
             bail!(
-                "RustOS interactive UI missed the {} ms boot acceptance limit; missing={RUSTOS_GPU_ACTIVE_MARKER:?}; inspect {} and {}",
-                BOOT_TO_UI_HARD_LIMIT_MS,
+                "{reason}; missing={RUSTOS_GPU_ACTIVE_MARKER:?}; evidence={}; inspect {} and {}",
+                evidence.display(),
+                layout.debugcon_log.display(),
+                layout.dvm_serial_log.display(),
+            );
+        }
+        if !options.storage_only
+            && options.dvm_block_shmem
+            && !rustos_log.contains(WAYCLICK_FIRST_FRAME_MARKER)
+            && guest_deadline_reached(&rustos_log, BOOT_TO_UI_HARD_LIMIT_MS)
+        {
+            let reason = format!(
+                "RustOS user-visible desktop missed the {} ms boot acceptance limit",
+                BOOT_TO_UI_HARD_LIMIT_MS
+            );
+            let missing_rustos = vec![WAYCLICK_FIRST_FRAME_MARKER.to_owned()];
+            let evidence = write_kvm_failure_summary(
+                layout,
+                &reason,
+                boot_started.elapsed(),
+                &rustos_log,
+                &dvm_log,
+                &missing_rustos,
+                &[],
+            )?;
+            bail!(
+                "{reason}; missing={WAYCLICK_FIRST_FRAME_MARKER:?}; evidence={}; inspect {} and {}",
+                evidence.display(),
                 layout.debugcon_log.display(),
                 layout.dvm_serial_log.display(),
             );
@@ -411,10 +456,22 @@ fn wait_for_parallel_boot(
                 }
             }
             Ok(Err(error)) => {
-                if control_ready.is_some() {
-                    bail!("Linux DVM input relay failed after readiness: {error:#}");
-                }
-                bail!("Linux DVM input relay failed before readiness: {error:#}");
+                let phase = if control_ready.is_some() {
+                    "after readiness"
+                } else {
+                    "before readiness"
+                };
+                let reason = format!("Linux DVM input relay failed {phase}: {error:#}");
+                let evidence = write_kvm_failure_summary(
+                    layout,
+                    &reason,
+                    boot_started.elapsed(),
+                    &rustos_log,
+                    &dvm_log,
+                    &[],
+                    &[],
+                )?;
+                bail!("{reason}; evidence={}", evidence.display());
             }
             Err(mpsc::TryRecvError::Empty) => {}
             Err(mpsc::TryRecvError::Disconnected) if control_ready.is_none() => {
@@ -494,9 +551,21 @@ fn wait_for_parallel_boot(
                 .filter(|marker| !dvm_log.contains(marker.as_str()))
                 .cloned()
                 .collect::<Vec<_>>();
+            let reason = format!(
+                "KVM parallel boot did not reach readiness within {:?}",
+                options.timeout
+            );
+            let evidence = write_kvm_failure_summary(
+                layout,
+                &reason,
+                boot_started.elapsed(),
+                &rustos_log,
+                &dvm_log,
+                &missing_rustos,
+                &missing_dvm,
+            )?;
             bail!(
-                "KVM parallel boot did not reach readiness within {:?}; RustOS missing={:?}; Linux-DVM missing={:?}; dvm-gpu-ready={}; ui-fps-ready={} (render={} input={} wayclick={} rustos-runtime={} dvm-relay={} dvm-runtime={}); wayclick-observed={:?}; dvm-display-ready={}; physical-gpu-frames-ready={}; dvm-network-ready={}; dvm-network-traffic-ready={}; host-input-relay-pending={}; input-ring={}/{} flags={:#x}; network-ring={:?}; inspect {}, {}, {}, and {}",
-                options.timeout,
+                "{reason}; RustOS missing={:?}; Linux-DVM missing={:?}; dvm-gpu-ready={}; ui-fps-ready={} (render={} input={} wayclick={} rustos-runtime={} dvm-relay={} dvm-runtime={}); wayclick-observed={:?}; dvm-display-ready={}; physical-gpu-frames-ready={}; dvm-network-ready={}; dvm-network-traffic-ready={}; host-input-relay-pending={}; input-ring={}/{} flags={:#x}; network-ring={:?}; evidence={}; inspect {}, {}, {}, and {}",
                 missing_rustos,
                 missing_dvm,
                 dvm_gpu_ready,
@@ -517,6 +586,7 @@ fn wait_for_parallel_boot(
                 input.consumer,
                 input.flags,
                 dvm_network,
+                evidence.display(),
                 layout.debugcon_log.display(),
                 layout.dvm_serial_log.display(),
                 layout.rustos_stderr_log.display(),

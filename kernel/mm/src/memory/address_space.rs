@@ -176,7 +176,16 @@ impl ProcessAddressSpace {
         validate_user_page_range(start, page_count)?;
 
         let page_flags = normalize_user_page_flags(flags)?;
-        let mut mapped_pages = Vec::with_capacity(page_count);
+        let mut mapped_pages = Vec::new();
+        mapped_pages
+            .try_reserve_exact(page_count)
+            .map_err(|_| AddressSpaceError::OutOfFrames)?;
+        self.owned_frames
+            .try_reserve_exact(page_count)
+            .map_err(|_| AddressSpaceError::OutOfFrames)?;
+        self.regions
+            .try_reserve(1)
+            .map_err(|_| AddressSpaceError::OutOfFrames)?;
 
         for page_index in 0..page_count {
             let virt = page_addr(start, page_index)?;
@@ -259,7 +268,13 @@ impl ProcessAddressSpace {
 
         validate_user_page_range(start, frames.len())?;
         let page_flags = normalize_user_page_flags(flags)? | leaf_flags;
-        let mut mapped_pages = Vec::with_capacity(frames.len());
+        let mut mapped_pages = Vec::new();
+        mapped_pages
+            .try_reserve_exact(frames.len())
+            .map_err(|_| AddressSpaceError::OutOfFrames)?;
+        self.regions
+            .try_reserve(1)
+            .map_err(|_| AddressSpaceError::OutOfFrames)?;
 
         for (page_index, frame_phys) in frames.iter().copied().enumerate() {
             let virt = page_addr(start, page_index)?;
@@ -298,7 +313,11 @@ impl ProcessAddressSpace {
     ) -> Result<usize, AddressSpaceError> {
         validate_user_page_range(start, page_count)?;
 
-        let mut frames = Vec::with_capacity(page_count);
+        let updated_regions = self.plan_region_subtraction(start, page_count)?;
+        let mut frames = Vec::new();
+        frames
+            .try_reserve_exact(page_count)
+            .map_err(|_| AddressSpaceError::OutOfFrames)?;
         for page_index in 0..page_count {
             let virt = page_addr(start, page_index)?;
             let phys = self
@@ -306,6 +325,9 @@ impl ProcessAddressSpace {
                 .ok_or(AddressSpaceError::NotMapped)?;
             if phys.as_u64() % PAGE_4KIB_U64 != 0 {
                 return Err(AddressSpaceError::NotMapped);
+            }
+            if !self.owned_frames.contains(&phys.as_u64()) || frames.contains(&phys.as_u64()) {
+                return Err(AddressSpaceError::InvalidFrameOwnership);
             }
             frames.push(phys.as_u64());
         }
@@ -323,7 +345,7 @@ impl ProcessAddressSpace {
             phys::free_frame(PhysAddr::new(frame_phys));
         }
 
-        self.subtract_region_range(start, page_count)?;
+        self.regions = updated_regions;
         Ok(page_count)
     }
 
@@ -334,13 +356,24 @@ impl ProcessAddressSpace {
     ) -> Result<usize, AddressSpaceError> {
         validate_user_page_range(start, page_count)?;
 
+        let updated_regions = self.plan_region_subtraction(start, page_count)?;
+        for page_index in 0..page_count {
+            let virt = page_addr(start, page_index)?;
+            let phys = self
+                .translate_user(virt)
+                .ok_or(AddressSpaceError::NotMapped)?;
+            if !phys.as_u64().is_multiple_of(PAGE_4KIB_U64) {
+                return Err(AddressSpaceError::NotMapped);
+            }
+        }
+
         for page_index in 0..page_count {
             let virt = page_addr(start, page_index)?;
             self.unmap_user_page(virt)
                 .ok_or(AddressSpaceError::NotMapped)?;
         }
 
-        self.subtract_region_range(start, page_count)?;
+        self.regions = updated_regions;
         Ok(page_count)
     }
 
@@ -362,6 +395,17 @@ impl ProcessAddressSpace {
     ) -> Result<(), AddressSpaceError> {
         validate_user_page_range(start, page_count)?;
         let page_flags = normalize_user_page_flags(flags)?;
+
+        if !validate_protection_span(page_count, |page_index| {
+            page_addr(start, page_index).ok().is_some_and(|virt| {
+                matches!(
+                    self.lookup_user_page_state(virt),
+                    UserPageLookup::Present { .. }
+                )
+            })
+        }) {
+            return Err(AddressSpaceError::NotMapped);
+        }
 
         for page_index in 0..page_count {
             let virt = page_addr(start, page_index)?;
@@ -795,15 +839,23 @@ impl ProcessAddressSpace {
         Some(frame_phys)
     }
 
-    fn subtract_region_range(
-        &mut self,
+    fn plan_region_subtraction(
+        &self,
         start: VirtAddr,
         page_count: usize,
-    ) -> Result<(), AddressSpaceError> {
+    ) -> Result<Vec<UserRegion>, AddressSpaceError> {
         let end = page_addr(start, page_count)?;
         let start_u64 = start.as_u64();
         let end_u64 = end.as_u64();
-        let mut updated = Vec::with_capacity(self.regions.len() + 1);
+        let capacity = self
+            .regions
+            .len()
+            .checked_add(1)
+            .ok_or(AddressSpaceError::AddressOverflow)?;
+        let mut updated = Vec::new();
+        updated
+            .try_reserve_exact(capacity)
+            .map_err(|_| AddressSpaceError::OutOfFrames)?;
         let mut touched = false;
 
         for region in self.regions.iter().copied() {
@@ -841,8 +893,7 @@ impl ProcessAddressSpace {
             return Err(AddressSpaceError::NotMapped);
         }
 
-        self.regions = updated;
-        Ok(())
+        Ok(updated)
     }
 }
 
@@ -918,6 +969,10 @@ fn rollback_user_pages(space: &mut ProcessAddressSpace, pages: &[(VirtAddr, u64)
         let unmapped = space.unmap_user_page(virt);
         if unmapped.map(|phys| phys.as_u64()) != Some(frame_phys) {
             panic!("user page rollback mismatch");
+        }
+        if space.owned_frames.contains(&frame_phys) {
+            let removed = remove_owned_frame(&mut space.owned_frames, frame_phys);
+            debug_assert!(removed.is_ok());
         }
         phys::free_frame(PhysAddr::new(frame_phys));
     }
@@ -1008,6 +1063,13 @@ fn validate_user_page_range(start: VirtAddr, page_count: usize) -> Result<(), Ad
     }
 
     Ok(())
+}
+
+fn validate_protection_span<F>(page_count: usize, mut page_is_present: F) -> bool
+where
+    F: FnMut(usize) -> bool,
+{
+    (0..page_count).all(&mut page_is_present)
 }
 
 fn byte_len_to_page_count(byte_len: usize) -> Result<usize, AddressSpaceError> {
@@ -1255,5 +1317,50 @@ mod tests {
         let preserved = preserve_4k_leaf_pat(existing, requested);
         assert!(preserved.contains(PageTableFlags::HUGE_PAGE));
         assert!(!preserved.contains(PageTableFlags::WRITABLE));
+    }
+
+    #[test]
+    fn protection_span_preflight_rejects_a_hole_before_commit() {
+        let mut visited = 0;
+        let accepted = validate_protection_span(4, |page_index| {
+            assert_eq!(page_index, visited);
+            visited += 1;
+            page_index != 2
+        });
+        assert!(!accepted);
+        assert_eq!(visited, 3);
+
+        assert!(validate_protection_span(4, |_| true));
+    }
+
+    #[test]
+    fn unmap_region_plan_is_complete_before_metadata_commit() {
+        let mut space = ProcessAddressSpace::empty_for_tests();
+        let start = VirtAddr::new(USER_SPACE_BASE);
+        space.regions.push(UserRegion {
+            start,
+            page_count: 4,
+        });
+        let original = space.regions.clone();
+
+        let plan = space
+            .plan_region_subtraction(VirtAddr::new(USER_SPACE_BASE + PAGE_4KIB_U64), 2)
+            .unwrap();
+        assert_eq!(space.regions, original);
+        assert_eq!(plan.len(), 2);
+        assert_eq!(
+            plan[0],
+            UserRegion {
+                start,
+                page_count: 1,
+            }
+        );
+        assert_eq!(
+            plan[1],
+            UserRegion {
+                start: VirtAddr::new(USER_SPACE_BASE + 3 * PAGE_4KIB_U64),
+                page_count: 1,
+            }
+        );
     }
 }

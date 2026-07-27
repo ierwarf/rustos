@@ -114,29 +114,30 @@ pub(crate) fn present_bgra8888_from_kernel(
     height: usize,
     stride_bytes: usize,
 ) -> GuiPresentOutcome {
-    crate::io::dvm_display::ensure_installed_before_present();
-    if display_present_faulted() {
-        return GuiPresentOutcome::Unavailable;
-    }
-    // A display ioctl may arrive through an entry path with interrupts masked.
-    // Presentation must never turn that into a spurious device removal or wait
-    // on a contended backend lock.  A busy compositor has an explicit
-    // non-blocking drop outcome; the next damage update will repaint it.
-    let dvm_published = match try_with_framebuffer_nonblocking(|_| {
-        crate::io::dvm_display::try_publish_full(src_ptr, width, height, stride_bytes)
-    }) {
-        Ok(value) => value,
-        Err(()) => return GuiPresentOutcome::Backpressured,
-    };
-    match dvm_published {
-        Some(crate::io::dvm_display::DvmPresentOutcome::Presented) => GuiPresentOutcome::Presented,
-        Some(crate::io::dvm_display::DvmPresentOutcome::Backpressured) => {
-            GuiPresentOutcome::Backpressured
+    with_display_present_fault_gate(display_present_faulted(), || {
+        crate::io::dvm_display::ensure_installed_before_present();
+        // A display ioctl may arrive through an entry path with interrupts masked.
+        // Presentation must never turn that into a spurious device removal or wait
+        // on a contended backend lock.  A busy compositor has an explicit
+        // non-blocking drop outcome; the next damage update will repaint it.
+        let dvm_published = match try_with_framebuffer_nonblocking(|_| {
+            crate::io::dvm_display::try_publish_full(src_ptr, width, height, stride_bytes)
+        }) {
+            Ok(value) => value,
+            Err(()) => return GuiPresentOutcome::Backpressured,
+        };
+        match dvm_published {
+            Some(crate::io::dvm_display::DvmPresentOutcome::Presented) => {
+                GuiPresentOutcome::Presented
+            }
+            Some(crate::io::dvm_display::DvmPresentOutcome::Backpressured) => {
+                GuiPresentOutcome::Backpressured
+            }
+            Some(crate::io::dvm_display::DvmPresentOutcome::Unavailable) | None => {
+                GuiPresentOutcome::Unavailable
+            }
         }
-        Some(crate::io::dvm_display::DvmPresentOutcome::Unavailable) | None => {
-            GuiPresentOutcome::Unavailable
-        }
-    }
+    })
 }
 
 pub(crate) fn present_bgra8888_rect_from_kernel(
@@ -146,33 +147,45 @@ pub(crate) fn present_bgra8888_rect_from_kernel(
     stride_bytes: usize,
     rect: FramebufferRect,
 ) -> GuiPresentOutcome {
-    crate::io::dvm_display::ensure_installed_before_present();
-    if display_present_faulted() {
-        return GuiPresentOutcome::Unavailable;
-    }
-    let dvm_published = match try_with_framebuffer_nonblocking(|_| {
-        crate::io::dvm_display::try_publish_rect(
-            src_ptr,
-            width,
-            height,
-            stride_bytes,
-            rect.x as u32,
-            rect.y as u32,
-            rect.width as u32,
-            rect.height as u32,
-        )
-    }) {
-        Ok(value) => value,
-        Err(()) => return GuiPresentOutcome::Backpressured,
-    };
-    match dvm_published {
-        Some(crate::io::dvm_display::DvmPresentOutcome::Presented) => GuiPresentOutcome::Presented,
-        Some(crate::io::dvm_display::DvmPresentOutcome::Backpressured) => {
-            GuiPresentOutcome::Backpressured
+    with_display_present_fault_gate(display_present_faulted(), || {
+        crate::io::dvm_display::ensure_installed_before_present();
+        let dvm_published = match try_with_framebuffer_nonblocking(|_| {
+            crate::io::dvm_display::try_publish_rect(
+                src_ptr,
+                width,
+                height,
+                stride_bytes,
+                rect.x as u32,
+                rect.y as u32,
+                rect.width as u32,
+                rect.height as u32,
+            )
+        }) {
+            Ok(value) => value,
+            Err(()) => return GuiPresentOutcome::Backpressured,
+        };
+        match dvm_published {
+            Some(crate::io::dvm_display::DvmPresentOutcome::Presented) => {
+                GuiPresentOutcome::Presented
+            }
+            Some(crate::io::dvm_display::DvmPresentOutcome::Backpressured) => {
+                GuiPresentOutcome::Backpressured
+            }
+            Some(crate::io::dvm_display::DvmPresentOutcome::Unavailable) | None => {
+                GuiPresentOutcome::Unavailable
+            }
         }
-        Some(crate::io::dvm_display::DvmPresentOutcome::Unavailable) | None => {
-            GuiPresentOutcome::Unavailable
-        }
+    })
+}
+
+fn with_display_present_fault_gate(
+    faulted: bool,
+    present: impl FnOnce() -> GuiPresentOutcome,
+) -> GuiPresentOutcome {
+    if faulted {
+        GuiPresentOutcome::Unavailable
+    } else {
+        present()
     }
 }
 
@@ -244,5 +257,23 @@ fn framebuffer_info_is_valid(info: FramebufferInfo) -> bool {
     };
 
     min_size <= size
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn present_fault_gate_prevents_backend_mutation() {
+        let backend_called = core::cell::Cell::new(false);
+        assert_eq!(
+            with_display_present_fault_gate(true, || {
+                backend_called.set(true);
+                GuiPresentOutcome::Presented
+            }),
+            GuiPresentOutcome::Unavailable
+        );
+        assert!(!backend_called.get());
+    }
 }
 // RING3-MIGRATION-REFERENCE END: uiserver/DVM-owned display backend substrate exception.

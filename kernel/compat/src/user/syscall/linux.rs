@@ -163,6 +163,9 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
             syscall_linux_vfs_unlinkat(linux_abi::AT_FDCWD as u64, frame.rdi, 0)
         }
         linux_abi::SYS_RUSTOS_DEBUG_PRINT => syscall_linux_rustos_debug_print(frame.rdi, frame.rsi),
+        linux_abi::SYS_RUSTOS_PRODUCT_MILESTONE => {
+            syscall_linux_rustos_product_milestone(frame.rdi, frame.rsi, frame.rdx)
+        }
         linux_abi::SYS_RUSTOS_SPAWN_EXEC => syscall_linux_loader_spawn_exec(
             frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
         ),
@@ -525,6 +528,12 @@ pub(crate) fn record_linux_process_termination(process_id: u64, wait_status: i32
     if multitask::mark_user_process_exiting_once(process_id) != Some(true) {
         return;
     }
+    nucleus_core::debug::record_milestone(
+        nucleus_core::debug::LogCategory::Compat,
+        "linux-process-termination",
+        process_id,
+        wait_status as u32 as u64,
+    );
     release_all_service_handle_refs(process_id);
     ipc_ops::cleanup_service_endpoints_for_process(process_id);
     cleanup_proc_broker_state_for_process(process_id);

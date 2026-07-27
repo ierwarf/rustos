@@ -9,10 +9,10 @@ use runtime_control::RuntimeRunningProgram;
 use rustos_user_abi::syscall::IPC_SERVICE_UISERVER;
 
 use super::{
-    boot_line, LAUNCH_TARGET_NEW_SESSION, MAX_POLICY_LAUNCH_ATTEMPTS_PER_TICK,
-    MAX_RUNTIME_CLIENTS_PER_TICK, MAX_RUNTIME_PROGRAMS, OP_NOTIFY_READY, OP_REQUEST_LAUNCH_PATH,
-    OP_REQUEST_TERMINATE, OP_SNAPSHOT_RUNNING_PROGRAMS, PROTOCOL_VERSION,
-    READY_COMPONENT_UI_SERVER, RETRY_BACKOFF, STORAGE_NOT_READY_RETRY_BACKOFF,
+    boot_line, LAUNCH_TARGET_NEW_SESSION, MAX_LAUNCH_RETRY_BACKOFF,
+    MAX_POLICY_LAUNCH_ATTEMPTS_PER_TICK, MAX_RUNTIME_CLIENTS_PER_TICK, MAX_RUNTIME_PROGRAMS,
+    OP_NOTIFY_READY, OP_REQUEST_LAUNCH_PATH, OP_REQUEST_TERMINATE, OP_SNAPSHOT_RUNNING_PROGRAMS,
+    PROTOCOL_VERSION, READY_COMPONENT_UI_SERVER, RETRY_BACKOFF, STORAGE_NOT_READY_RETRY_BACKOFF,
     TERMINATE_TARGET_PID, TERMINATE_TARGET_SESSION, UI_SERVER_EXEC_PATH,
 };
 use super::{BrokerState, LaunchEntry, RuntimeRequest, RuntimeResponse};
@@ -494,10 +494,7 @@ pub(super) fn ensure_policy_launches(state: &mut BrokerState) -> bool {
             continue;
         }
         if !entry.exec.starts_with("services/") && !super::spawn::loader_endpoint_ready() {
-            state.retry_after.insert(
-                entry.desktop_file_id.clone(),
-                Instant::now() + RETRY_BACKOFF,
-            );
+            schedule_launch_retry(state, entry.desktop_file_id.as_str(), libc::ENOSYS);
             continue;
         }
 
@@ -544,7 +541,10 @@ pub(super) fn ensure_policy_launches(state: &mut BrokerState) -> bool {
                     );
                     state
                         .permanent_launch_failures
-                        .insert(entry.desktop_file_id, err);
+                        .insert(entry.desktop_file_id.clone(), err);
+                    state
+                        .launch_failure_counts
+                        .remove(entry.desktop_file_id.as_str());
                 } else {
                     observability_client::error!(
                         "runtimed",
@@ -553,10 +553,7 @@ pub(super) fn ensure_policy_launches(state: &mut BrokerState) -> bool {
                         entry.desktop_file_id,
                         entry.exec
                     );
-                    state.retry_after.insert(
-                        entry.desktop_file_id,
-                        Instant::now() + launch_retry_backoff(err),
-                    );
+                    schedule_launch_retry(state, entry.desktop_file_id.as_str(), err);
                 }
             }
         }
@@ -564,12 +561,27 @@ pub(super) fn ensure_policy_launches(state: &mut BrokerState) -> bool {
     launched_any
 }
 
-fn launch_retry_backoff(errno: i32) -> std::time::Duration {
-    if errno == libc::EAGAIN {
+fn launch_retry_backoff(errno: i32, consecutive_failures: u32) -> std::time::Duration {
+    let base = if errno == libc::EAGAIN {
         STORAGE_NOT_READY_RETRY_BACKOFF
     } else {
         RETRY_BACKOFF
-    }
+    };
+    let exponent = consecutive_failures.saturating_sub(1).min(6);
+    base.saturating_mul(1_u32 << exponent)
+        .min(MAX_LAUNCH_RETRY_BACKOFF)
+}
+
+pub(super) fn schedule_launch_retry(state: &mut BrokerState, desktop_file_id: &str, errno: i32) {
+    let consecutive_failures = state
+        .launch_failure_counts
+        .entry(desktop_file_id.to_string())
+        .and_modify(|count| *count = count.saturating_add(1))
+        .or_insert(1);
+    state.retry_after.insert(
+        desktop_file_id.to_string(),
+        Instant::now() + launch_retry_backoff(errno, *consecutive_failures),
+    );
 }
 
 fn last_errno() -> i32 {
@@ -584,7 +596,7 @@ mod tests {
         launch_retry_backoff, runtime_request_role_authorized, OP_NOTIFY_READY,
         OP_REQUEST_LAUNCH_PATH, OP_REQUEST_TERMINATE, OP_SNAPSHOT_RUNNING_PROGRAMS,
     };
-    use crate::{RETRY_BACKOFF, STORAGE_NOT_READY_RETRY_BACKOFF};
+    use crate::{MAX_LAUNCH_RETRY_BACKOFF, RETRY_BACKOFF, STORAGE_NOT_READY_RETRY_BACKOFF};
 
     #[test]
     fn runtime_control_mutations_require_live_uiserver_or_logical_admin() {
@@ -614,9 +626,13 @@ mod tests {
     #[test]
     fn storage_not_ready_launches_back_off_without_disabling_the_program() {
         assert_eq!(
-            launch_retry_backoff(libc::EAGAIN),
+            launch_retry_backoff(libc::EAGAIN, 1),
             STORAGE_NOT_READY_RETRY_BACKOFF
         );
-        assert_eq!(launch_retry_backoff(libc::ETIMEDOUT), RETRY_BACKOFF);
+        assert_eq!(launch_retry_backoff(libc::ETIMEDOUT, 1), RETRY_BACKOFF);
+        assert_eq!(
+            launch_retry_backoff(libc::EIO, 64),
+            MAX_LAUNCH_RETRY_BACKOFF
+        );
     }
 }

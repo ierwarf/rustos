@@ -327,6 +327,20 @@ impl HandleTable {
     /// Reserves dynamic descriptor numbers without publishing handles through
     /// `get_entry`. This is the prepare phase for transactional IPC receive.
     pub fn reserve_slots(&mut self, count: usize) -> Option<(u64, Vec<u64>)> {
+        self.reserve_slots_faultable(
+            count,
+            nucleus_core::util::fault_injection::should_fail("handle.reserve"),
+        )
+    }
+
+    fn reserve_slots_faultable(
+        &mut self,
+        count: usize,
+        injected_failure: bool,
+    ) -> Option<(u64, Vec<u64>)> {
+        if injected_failure {
+            return None;
+        }
         let occupied = self.standard.iter().filter(|entry| entry.is_some()).count()
             + self.entries.iter().filter(|entry| entry.is_some()).count();
         let total = (FIRST_DYNAMIC_FD as usize).saturating_add(max_dynamic_entries());
@@ -384,10 +398,26 @@ impl HandleTable {
         slots: &[u64],
         entries: Vec<TransferredHandleEntry>,
     ) -> Result<(), Vec<TransferredHandleEntry>> {
+        self.commit_reserved_transfers_faultable(
+            reservation_id,
+            slots,
+            entries,
+            nucleus_core::util::fault_injection::should_fail("handle.commit"),
+        )
+    }
+
+    fn commit_reserved_transfers_faultable(
+        &mut self,
+        reservation_id: u64,
+        slots: &[u64],
+        entries: Vec<TransferredHandleEntry>,
+        injected_failure: bool,
+    ) -> Result<(), Vec<TransferredHandleEntry>> {
         if slots.len() != entries.len()
             || slots.iter().any(|&fd| {
                 self.reserved.get(&fd) != Some(&reservation_id) || self.get_entry(fd).is_some()
             })
+            || injected_failure
         {
             return Err(entries);
         }
@@ -927,6 +957,36 @@ mod tests {
         assert!(table.get_entry(3).is_some());
         assert!(!table.is_reserved(0));
         assert!(!table.is_reserved(3));
+    }
+
+    #[test]
+    fn handle_fault_boundaries_preserve_reservation_atomicity() {
+        let mut table = HandleTable::new();
+        assert!(
+            table.reserve_slots_faultable(1, true).is_none(),
+            "injected reserve failure must not allocate a reservation"
+        );
+        assert!(!table.is_reserved(3));
+
+        let (reservation_id, slots) = table.reserve_slots(1).expect("reserve slot");
+        let transferred = super::TransferredHandleEntry::from_entry(HandleEntry::new(
+            KernelHandle::VfsDirectory(VfsDirectoryHandle::new("/faultable".into(), vec![])),
+            0,
+            0,
+        ))
+        .expect("transferable directory");
+        let entries = table
+            .commit_reserved_transfers_faultable(reservation_id, &slots, vec![transferred], true)
+            .expect_err("injected commit failure");
+        assert_eq!(entries.len(), 1);
+        assert!(table.get_entry(slots[0]).is_none());
+        assert!(table.is_reserved(slots[0]));
+
+        table
+            .commit_reserved_transfers(reservation_id, &slots, entries)
+            .expect("retry exact reservation");
+        assert!(table.get_entry(slots[0]).is_some());
+        assert!(!table.is_reserved(slots[0]));
     }
 
     #[test]

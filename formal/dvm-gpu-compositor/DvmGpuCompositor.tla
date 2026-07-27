@@ -11,9 +11,11 @@ Concrete owners:
 
 RustOS owns context admission, bounded queueing, source capabilities, and the
 monotonic submit timeline. The DVM receives only device-read source authority
-and DVM-private render targets. It may execute Clear, SolidQuad, or
-TexturedQuad through built-in shaders; it never accepts an address, raw GPU
-command buffer, or application shader. A timeout or revoke invalidates the
+and DVM-private render targets. Clear, SolidQuad, and TexturedQuad have the same
+lifecycle and authority effects, so this state machine quotients them into one
+fixed-command equivalence class; the exact three-command vocabulary and bounds
+remain source-conformance requirements. The DVM never accepts an address, raw
+GPU command buffer, or application shader. A timeout or revoke invalidates the
 whole epoch and every unfinished submission. A new epoch cannot accept a stale
 completion from an earlier renderer instance. Built-in shader translation and
 pipeline creation are a distinct bounded context-prime phase; no admitted
@@ -41,7 +43,7 @@ NoOutput == 99
 
 LiveStates == {Queued, Acquired, Executing, GpuDone}
 SettledStates == {Presented, Rejected}
-FixedCommands == {"clear", "solid-quad", "textured-quad"}
+FixedCommands == {"fixed-command"}
 
 VARIABLES epoch,
           contextActive,

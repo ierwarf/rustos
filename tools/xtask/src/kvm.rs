@@ -30,6 +30,8 @@ use rustos_driver_domain_host::{
     IvshmemDoorbellServer, ProbeResult,
 };
 use rustos_user_abi::performance::BOOT_TO_UI_HARD_LIMIT_MS;
+use serde::Serialize;
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 use crate::Result;
@@ -60,6 +62,7 @@ const RUSTOS_POST_INIT_PROVENANCE_MARKER: &str =
 const RUSTOS_GPU_SCENE_COMPILER_MARKER: &str =
     "uiserver: gpu-scene compiler ready contract=3 public-abi=0 dvm-submit=1";
 const RUSTOS_GPU_ACTIVE_MARKER: &str = "uiserver: gpu-compositor active contract=3";
+const WAYCLICK_FIRST_FRAME_MARKER: &str = "wayclick: first frame presented";
 const DVM_KEYBOARD_INGRESS_MARKER: &str = "inputd: DVM keyboard ingress observed";
 const DVM_POINTER_INGRESS_MARKER: &str = "inputd: DVM pointer ingress observed";
 const DVM_GPU_COMPOSITOR_MARKER: &str = "rustos-dvm-gpu: ready contract=1";

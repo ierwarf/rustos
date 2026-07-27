@@ -17,6 +17,7 @@ use rustos_image_admission::{
     admit_elf64_image, admit_pe64_image_headers, apply_pe64_base_relocations,
     validate_pe64_import_table, ByteAdmissionError,
 };
+use rustos_user_abi::performance::EXECUTABLE_SNAPSHOT_HARD_LIMIT_MS;
 use rustos_user_abi::syscall::{
     loader_service_role_allows_operation, CommercialMaxCapabilityLeaseWire,
     CommercialMaxProtocolDescriptorWire, CommercialMaxProtocolRequest,
@@ -38,12 +39,13 @@ use rustos_user_abi::syscall::{
     PROC_BROKER_FORMAT_ELF64, PROC_BROKER_FORMAT_PE64, PROC_BROKER_LINUX_INTERP_PATH_CAPACITY,
     PROC_BROKER_MAP_EXEC, PROC_BROKER_MAP_PRIVATE, PROC_BROKER_MAP_READ, PROC_BROKER_MAP_WRITE,
     PROC_BROKER_USER_SPACE_BASE, PROC_BROKER_USER_SPACE_END_EXCLUSIVE, SYS_RUSTOS_DEBUG_PRINT,
-    SYS_RUSTOS_IPC_CALL_WITH_HANDLES, SYS_RUSTOS_IPC_RECV_WITH_SENDER, SYS_RUSTOS_IPC_REPLY,
-    SYS_RUSTOS_PROC_ABORT_BROKER, SYS_RUSTOS_PROC_ACTIVATE_BROKER, SYS_RUSTOS_PROC_MAP_DATA_BROKER,
-    SYS_RUSTOS_PROC_MAP_FILE_BATCH_BROKER, SYS_RUSTOS_PROC_MAP_ZEROED_BROKER,
-    SYS_RUSTOS_PROC_PREPARE_BROKER, SYS_RUSTOS_PROC_SET_LINUX_RUNTIME_BROKER,
-    SYS_RUSTOS_PROC_SET_WINDOWS_RUNTIME_BROKER, SYS_RUSTOS_SCHED_DEMOTE_SELF,
-    VFS_EXECUTABLE_SNAPSHOT_ABI_VERSION, VFS_EXECUTABLE_SNAPSHOT_OP_OPEN, VFS_IPC_PATH_CAPACITY,
+    SYS_RUSTOS_IPC_CALL_WITH_HANDLES_BOUNDED, SYS_RUSTOS_IPC_RECV_WITH_SENDER,
+    SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_PROC_ABORT_BROKER, SYS_RUSTOS_PROC_ACTIVATE_BROKER,
+    SYS_RUSTOS_PROC_MAP_DATA_BROKER, SYS_RUSTOS_PROC_MAP_FILE_BATCH_BROKER,
+    SYS_RUSTOS_PROC_MAP_ZEROED_BROKER, SYS_RUSTOS_PROC_PREPARE_BROKER,
+    SYS_RUSTOS_PROC_SET_LINUX_RUNTIME_BROKER, SYS_RUSTOS_PROC_SET_WINDOWS_RUNTIME_BROKER,
+    SYS_RUSTOS_SCHED_DEMOTE_SELF, VFS_EXECUTABLE_SNAPSHOT_ABI_VERSION,
+    VFS_EXECUTABLE_SNAPSHOT_OP_OPEN, VFS_IPC_PATH_CAPACITY,
 };
 
 mod commit;
@@ -211,8 +213,8 @@ fn serve(endpoint: u64) {
     }
 }
 
-// IPC replies are written immediately; boxing the commercial response would
-// leak from this early service's bump allocator.
+// IPC replies are written immediately; keep the hot response path allocation
+// free even though the service allocator now reclaims dropped spans.
 #[allow(clippy::large_enum_variant)]
 enum LoaderReply {
     Spawn(LoaderSpawnResponse),
@@ -684,13 +686,26 @@ fn open_immutable_file_snapshot(path: &str) -> Result<i32, i32> {
         recv_fds_ptr: received_fd.as_mut_ptr() as u64,
         recv_fd_count_ptr: (&mut received_fd_count as *mut u16) as u64,
     };
-    let status = syscall1(
-        SYS_RUSTOS_IPC_CALL_WITH_HANDLES,
-        (&args as *const IpcCallWithHandlesArgs) as u64,
-    );
+    debug_line(&format!(
+        "loaderd: executable snapshot call begin exec={path} timeout_ms={EXECUTABLE_SNAPSHOT_HARD_LIMIT_MS}"
+    ));
+    let status = unsafe {
+        rustos_svc_runtime::syscall::syscall2(
+            SYS_RUSTOS_IPC_CALL_WITH_HANDLES_BOUNDED,
+            (&args as *const IpcCallWithHandlesArgs) as u64,
+            EXECUTABLE_SNAPSHOT_HARD_LIMIT_MS,
+        )
+    };
     if status < 0 {
+        debug_line(&format!(
+            "loaderd: executable snapshot call failed exec={path} errno={}",
+            -status
+        ));
         return Err((-status) as i32);
     }
+    debug_line(&format!(
+        "loaderd: executable snapshot call replied exec={path} bytes={status} handles={received_fd_count}"
+    ));
     let close_received = |count: u16, fds: &[u64; 1]| {
         for fd in fds.iter().take(usize::from(count).min(fds.len())) {
             let _ = syscall1(SYS_CLOSE, *fd);

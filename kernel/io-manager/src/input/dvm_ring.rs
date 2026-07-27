@@ -199,13 +199,82 @@ pub(crate) fn mark_policy_consumer_ready() -> bool {
     if flags == header.flags {
         return true;
     }
+    // A replacement inputd must never inherit records committed for a dead
+    // policy owner. The producer is required to stop while the policy-ready
+    // bit is clear, but one already-admitted commit may race that withdrawal.
+    // Retire all pre-admission records before publishing the new owner.
+    if header.producer != header.consumer {
+        fence(Ordering::Release);
+        write_u64(mapped, DVM_INPUT_RING_CONSUMER_OFFSET, header.producer);
+        CONSUMER.store(header.producer, Ordering::Release);
+        RESET_PENDING_GENERATION.store(header.generation, Ordering::Release);
+    }
     write_u32(
         mapped,
         DVM_INPUT_RING_FLAGS_OFFSET,
         flags | DVM_INPUT_RING_FLAG_POLICY_CONSUMER_READY,
     );
     fence(Ordering::SeqCst);
+    crate::debug::record_milestone(
+        crate::debug::LogCategory::Input,
+        "dvm-input-policy-ready",
+        header.generation,
+        header.producer,
+    );
     true
+}
+
+/// Withdraw inputd's policy-consumer lease without reallocating the pinned
+/// transport or MSI-X vector.
+///
+/// Process-exit cleanup invokes this after revoking inputd's service endpoint.
+/// Clearing the shared ready bit first stops new L0 admission; advancing the
+/// consumer cursor then retires records that no longer have a live semantic
+/// owner. A replacement inputd receives a generation-stamped reset barrier
+/// before it may publish policy readiness again.
+pub(crate) fn withdraw_policy_consumer() {
+    if !INSTALLED.load(Ordering::Acquire) {
+        super::wait_queue::wake_input_waiters();
+        return;
+    }
+    let mapped = SHARED_ADDR.load(Ordering::Acquire) as *mut u8;
+    if mapped.is_null() {
+        super::wait_queue::wake_input_waiters();
+        return;
+    }
+    let flags = read_u32(mapped, DVM_INPUT_RING_FLAGS_OFFSET);
+    write_u32(
+        mapped,
+        DVM_INPUT_RING_FLAGS_OFFSET,
+        flags & !DVM_INPUT_RING_FLAG_POLICY_CONSUMER_READY,
+    );
+    fence(Ordering::SeqCst);
+
+    let Some(header) = read_header(mapped) else {
+        revoke("policy-consumer-exit-header-invalid");
+        return;
+    };
+    let generation = GENERATION.load(Ordering::Acquire);
+    let consumer = CONSUMER.load(Ordering::Acquire);
+    if header.generation != generation
+        || header.consumer != consumer
+        || header.producer < consumer
+        || header.producer.saturating_sub(consumer) > u64::from(DVM_INPUT_RING_SLOT_COUNT)
+    {
+        revoke("policy-consumer-exit-lifecycle-invalid");
+        return;
+    }
+    fence(Ordering::Release);
+    write_u64(mapped, DVM_INPUT_RING_CONSUMER_OFFSET, header.producer);
+    CONSUMER.store(header.producer, Ordering::Release);
+    IRQ_PENDING.store(false, Ordering::Release);
+    RESET_PENDING_GENERATION.store(generation.max(1), Ordering::Release);
+    super::wait_queue::wake_input_waiters();
+    crate::debug::warn!(
+        input,
+        "dvm-input-ring: policy consumer withdrawn generation={}",
+        generation
+    );
 }
 
 fn admitted_policy_ready_flags(flags: u32) -> Option<u32> {
@@ -677,6 +746,10 @@ fn write_u32(base: *mut u8, offset: usize, value: u32) {
     unsafe { base.add(offset).cast::<u32>().write_volatile(value.to_le()) }
 }
 
+fn write_u64(base: *mut u8, offset: usize, value: u64) {
+    unsafe { base.add(offset).cast::<u64>().write_volatile(value.to_le()) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -690,5 +763,20 @@ mod tests {
         let admitted = transport_ready | DVM_INPUT_RING_FLAG_POLICY_CONSUMER_READY;
         assert_eq!(admitted_policy_ready_flags(transport_ready), Some(admitted));
         assert_eq!(admitted_policy_ready_flags(admitted), Some(admitted));
+    }
+
+    #[test]
+    fn policy_consumer_withdrawal_preserves_transport_but_stops_production() {
+        let provider_ready = driver_domain_protocol::DVM_INPUT_RING_FLAG_READY;
+        let transport_ready = provider_ready | DVM_INPUT_RING_FLAG_RUSTOS_READY;
+        let admitted = transport_ready | DVM_INPUT_RING_FLAG_POLICY_CONSUMER_READY;
+        assert_eq!(
+            admitted & !DVM_INPUT_RING_FLAG_POLICY_CONSUMER_READY,
+            transport_ready
+        );
+        assert_eq!(
+            admitted_policy_ready_flags(admitted & !DVM_INPUT_RING_FLAG_POLICY_CONSUMER_READY),
+            Some(admitted)
+        );
     }
 }

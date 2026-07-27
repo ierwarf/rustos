@@ -25,22 +25,22 @@ debug = "info"
 heartbeat = "info"
 
 [fault_injection]
-# Runtime fault profiles are enabled for hardening runs. The default rule is
-# non-failing; replace "off" with fail, drop-every:N, fail-after:N, or rate:N
-# to exercise a fault path.
-enabled = true
+# Normal boots do not pay the fault-rule lock on hot allocation/device paths.
+# Hardening runs enable one exact registered rule through RUSTOS_FAULTS.
+enabled = false
 rules = [
     "alloc.frame=off",
+    "block.flush=off",
     "block.read=off",
     "block.write=off",
     "display.present=off",
     "display.provider.register=off",
-    "input.event.enqueue=off",
-    "pci.config.read=off",
+    "handle.commit=off",
+    "handle.reserve=off",
+    "ipc.endpoint.enqueue=off",
+    "ipc.endpoint.reply=off",
     "process.spawn=off",
-    "socket.recv=off",
-    "socket.send=off",
-    "virtio-gpu.control.submit=off",
+    "waitset.register=off",
 ]
 
 [fuzzing]

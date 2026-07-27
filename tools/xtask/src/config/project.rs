@@ -444,13 +444,33 @@ fn apply_fault_env_overrides(fault: &mut FaultInjectionConfig) -> Result<()> {
     }
     if let Some(value) = env_string("RUSTOS_FAULTS") {
         fault.enabled = true;
-        fault.rules.extend(
-            value
-                .split(';')
-                .map(str::trim)
-                .filter(|rule| !rule.is_empty())
-                .map(str::to_owned),
-        );
+        apply_fault_rule_overrides(fault, &value)?;
+    }
+    Ok(())
+}
+
+fn apply_fault_rule_overrides(fault: &mut FaultInjectionConfig, value: &str) -> Result<()> {
+    let mut override_locations = Vec::new();
+    for rule in value
+        .split(';')
+        .map(str::trim)
+        .filter(|rule| !rule.is_empty())
+    {
+        let parsed = rustos_fault_injection::parse_rule(rule)
+            .map_err(|err| anyhow!("invalid RUSTOS_FAULTS entry {rule:?}: {err}"))?;
+        if override_locations.contains(&parsed.location) {
+            bail!(
+                "RUSTOS_FAULTS repeats fault point {} in one override",
+                parsed.location
+            );
+        }
+        override_locations.push(parsed.location.clone());
+        fault.rules.retain(|current| {
+            rustos_fault_injection::parse_rule(current)
+                .map(|registered| registered.location != parsed.location)
+                .unwrap_or(true)
+        });
+        fault.rules.push(rule.to_owned());
     }
     Ok(())
 }
@@ -557,9 +577,23 @@ fn validate_kernel_build(build: &KernelBuildConfig) -> Result<()> {
 }
 
 fn validate_fault_injection(fault: &FaultInjectionConfig) -> Result<()> {
+    let mut locations = Vec::new();
     for rule in &fault.rules {
-        rustos_fault_injection::parse_rule(rule)
+        let parsed = rustos_fault_injection::parse_rule(rule)
             .map_err(|err| anyhow!("invalid fault_injection.rules entry {rule:?}: {err}"))?;
+        if !rustos_fault_injection::is_registered_fault_point(parsed.location.as_str()) {
+            bail!(
+                "fault_injection.rules entry names an unimplemented or retired point: {}",
+                parsed.location
+            );
+        }
+        if locations.contains(&parsed.location) {
+            bail!(
+                "fault_injection.rules repeats point {}; one rule must own each boundary",
+                parsed.location
+            );
+        }
+        locations.push(parsed.location);
     }
     Ok(())
 }
@@ -625,4 +659,44 @@ pub(crate) fn effective_config_toml(config: &ProjectConfig) -> String {
         lock_telemetry.warn_wait_cycles,
         lock_telemetry.warn_hold_cycles,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FaultInjectionConfig, apply_fault_rule_overrides, validate_fault_injection};
+
+    #[test]
+    fn fault_override_replaces_the_default_instead_of_being_shadowed() {
+        let mut fault = FaultInjectionConfig {
+            enabled: false,
+            rules: vec![
+                "block.flush=off".to_owned(),
+                "display.present=off".to_owned(),
+            ],
+        };
+        apply_fault_rule_overrides(&mut fault, "block.flush=fail").unwrap();
+        assert_eq!(
+            fault.rules,
+            vec![
+                "display.present=off".to_owned(),
+                "block.flush=fail".to_owned()
+            ]
+        );
+        validate_fault_injection(&fault).unwrap();
+    }
+
+    #[test]
+    fn fault_config_rejects_phantom_and_duplicate_points() {
+        let phantom = FaultInjectionConfig {
+            enabled: true,
+            rules: vec!["socket.send=fail".to_owned()],
+        };
+        assert!(validate_fault_injection(&phantom).is_err());
+
+        let duplicate = FaultInjectionConfig {
+            enabled: true,
+            rules: vec!["block.read=off".to_owned(), "block.read=fail".to_owned()],
+        };
+        assert!(validate_fault_injection(&duplicate).is_err());
+    }
 }

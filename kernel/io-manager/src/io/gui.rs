@@ -57,13 +57,25 @@ pub fn init(_boot_info_ptr: *const BootInfo) {
 pub unsafe extern "C" fn register_driver_framebuffer(
     framebuffer: *const DisplayFramebufferRegistration,
 ) -> i32 {
-    if nucleus_core::util::fault_injection::should_fail("display.provider.register") {
+    let faulted = nucleus_core::util::fault_injection::should_fail("display.provider.register");
+    if faulted {
         crate::debug::warn!(
             display,
             "fault injection: display.provider.register rejected framebuffer"
         );
-        return -5;
     }
+    with_provider_registration_fault_gate(faulted, || unsafe {
+        register_driver_framebuffer_inner(framebuffer)
+    })
+}
+
+fn with_provider_registration_fault_gate(faulted: bool, register: impl FnOnce() -> i32) -> i32 {
+    if faulted { -5 } else { register() }
+}
+
+unsafe fn register_driver_framebuffer_inner(
+    framebuffer: *const DisplayFramebufferRegistration,
+) -> i32 {
     let Some(framebuffer) = (unsafe { framebuffer.as_ref() }) else {
         return -22;
     };
@@ -150,7 +162,7 @@ mod tests {
     use super::{
         DISPLAY_FRAMEBUFFER_FLAG_DVM_SCANOUT, DISPLAY_FRAMEBUFFER_FLAG_PRIMARY_PROVIDER,
         DISPLAY_INFO_FLAG_DVM_SCANOUT, DISPLAY_INFO_FLAG_PRIMARY_PROVIDER,
-        display_flags_from_driver_registration,
+        display_flags_from_driver_registration, with_provider_registration_fault_gate,
     };
 
     #[test]
@@ -165,6 +177,19 @@ mod tests {
             ),
             DISPLAY_INFO_FLAG_PRIMARY_PROVIDER | DISPLAY_INFO_FLAG_DVM_SCANOUT
         );
+    }
+
+    #[test]
+    fn provider_fault_gate_prevents_registration() {
+        let registration_called = core::cell::Cell::new(false);
+        assert_eq!(
+            with_provider_registration_fault_gate(true, || {
+                registration_called.set(true);
+                0
+            }),
+            -5
+        );
+        assert!(!registration_called.get());
     }
 }
 

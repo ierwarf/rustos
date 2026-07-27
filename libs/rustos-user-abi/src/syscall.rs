@@ -89,6 +89,24 @@ pub const SYS_RUSTOS_PROC_VALIDATE_DEFERRED_SPAWN_BROKER: u64 = 0x5255_0043;
 /// milliseconds. The kernel clamps it to the global service ceiling and
 /// cancels the exact reply identity on timeout.
 pub const SYS_RUSTOS_IPC_CALL_BOUNDED: u64 = 0x5255_0044;
+/// Handle-transferring IPC call with an explicit finite caller deadline in
+/// milliseconds. The argument block is `IpcCallWithHandlesArgs`; the second
+/// syscall argument is the timeout. Timeout cancellation revokes the exact
+/// reply and every in-flight transfer descriptor just like the byte-only
+/// bounded call.
+pub const SYS_RUSTOS_IPC_CALL_WITH_HANDLES_BOUNDED: u64 = 0x5255_0045;
+/// Emits one kernel-timestamped, fixed-name product acceptance milestone.
+///
+/// This is observability only: it grants no authority and accepts only the
+/// closed identifiers below. The kernel stamps the live process/thread
+/// identity and monotonic timestamp into the structured debug record.
+pub const SYS_RUSTOS_PRODUCT_MILESTONE: u64 = 0x5255_0046;
+
+pub const PRODUCT_MILESTONE_ROOT_CORE_READY: u64 = 1;
+pub const PRODUCT_MILESTONE_DISPLAY_READY: u64 = 2;
+pub const PRODUCT_MILESTONE_STORAGE_READY: u64 = 3;
+pub const PRODUCT_MILESTONE_EXECUTABLE_SNAPSHOT_SEALED: u64 = 4;
+pub const PRODUCT_MILESTONE_FIRST_FRAME: u64 = 5;
 /// Irreversibly removes the caller's base System scheduling admission.
 ///
 /// This is deliberately a self-demotion only: it never accepts a requested

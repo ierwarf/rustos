@@ -1,11 +1,10 @@
-use alloc::string::String;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering};
-
-use spin::Mutex;
 use x86_64::instructions::port::Port;
 
-use rustos_fault_injection::{FaultAction, parse_rules};
+use rustos_fault_injection::{
+    clear_runtime_rules, configured_runtime_rule_count, install_runtime_rules,
+    runtime_rules_enabled,
+};
 
 const FW_CFG_SIGNATURE: u16 = 0x0000;
 const FW_CFG_FILE_DIR: u16 = 0x0019;
@@ -14,9 +13,6 @@ const FW_CFG_DATA_PORT: u16 = 0x0511;
 const FW_CFG_FILE_NAME_LEN: usize = 56;
 const FAULT_FW_CFG_NAME: &[u8] = b"opt/rustos/fault-injection";
 const MAX_FAULT_SPEC_BYTES: usize = 4096;
-
-static ENABLED: AtomicBool = AtomicBool::new(false);
-static RULES: Mutex<Vec<RuntimeFaultRule>> = Mutex::new(Vec::new());
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FaultInitStatus {
@@ -32,13 +28,6 @@ pub struct FaultInitReport {
     pub status: FaultInitStatus,
     pub rule_count: usize,
     pub spec_len: usize,
-}
-
-struct RuntimeFaultRule {
-    location: String,
-    action: FaultAction,
-    hits: u64,
-    rng: u64,
 }
 
 pub fn init_from_qemu_fw_cfg() -> FaultInitReport {
@@ -66,7 +55,7 @@ pub fn init_from_qemu_fw_cfg() -> FaultInitReport {
             spec_len,
         };
     };
-    let Ok(parsed) = parse_rules(spec) else {
+    let Ok(rule_count) = install_runtime_rules(spec) else {
         clear_rules();
         return FaultInitReport {
             status: FaultInitStatus::InvalidSpec,
@@ -74,19 +63,6 @@ pub fn init_from_qemu_fw_cfg() -> FaultInitReport {
             spec_len,
         };
     };
-
-    let mut runtime_rules = RULES.lock();
-    runtime_rules.clear();
-    for rule in parsed {
-        runtime_rules.push(RuntimeFaultRule {
-            rng: seed_for_location(rule.location.as_bytes()),
-            location: rule.location,
-            action: rule.action,
-            hits: 0,
-        });
-    }
-    let rule_count = runtime_rules.len();
-    ENABLED.store(rule_count != 0, Ordering::Release);
     FaultInitReport {
         status: FaultInitStatus::Loaded,
         rule_count,
@@ -95,51 +71,19 @@ pub fn init_from_qemu_fw_cfg() -> FaultInitReport {
 }
 
 pub fn is_enabled() -> bool {
-    ENABLED.load(Ordering::Acquire)
+    runtime_rules_enabled()
 }
 
 pub fn should_fail(location: &str) -> bool {
-    if !is_enabled() {
-        return false;
-    }
-    let mut rules = RULES.lock();
-    for rule in rules.iter_mut() {
-        if rule.location != location {
-            continue;
-        }
-        return rule.next_should_fail();
-    }
-    false
+    rustos_fault_injection::should_fail(location)
 }
 
 pub fn configured_rule_count() -> usize {
-    RULES.lock().len()
+    configured_runtime_rule_count()
 }
 
 fn clear_rules() {
-    RULES.lock().clear();
-    ENABLED.store(false, Ordering::Release);
-}
-
-impl RuntimeFaultRule {
-    fn next_should_fail(&mut self) -> bool {
-        self.hits = self.hits.saturating_add(1);
-        match self.action {
-            FaultAction::Fail => true,
-            FaultAction::Off => false,
-            FaultAction::DropEvery(n) => n != 0 && self.hits.is_multiple_of(u64::from(n)),
-            FaultAction::FailAfter(n) => self.hits > n,
-            FaultAction::RatePermille(rate) => {
-                if rate == 0 {
-                    return false;
-                }
-                if rate >= 1000 {
-                    return true;
-                }
-                next_rng(&mut self.rng) % 1000 < u64::from(rate)
-            }
-        }
-    }
+    clear_runtime_rules();
 }
 
 fn read_qemu_fw_cfg_file(name: &[u8]) -> Option<Vec<u8>> {
@@ -216,49 +160,31 @@ fn fw_cfg_name_matches(entry_name: &[u8; FW_CFG_FILE_NAME_LEN], expected: &[u8])
     &entry_name[..actual_len] == expected
 }
 
-fn seed_for_location(location: &[u8]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for byte in location {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash | 1
-}
-
-fn next_rng(state: &mut u64) -> u64 {
-    *state ^= *state << 13;
-    *state ^= *state >> 7;
-    *state ^= *state << 17;
-    *state
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{RuntimeFaultRule, seed_for_location};
-    use rustos_fault_injection::FaultAction;
+    use rustos_fault_injection::{clear_runtime_rules, install_runtime_rules, should_fail};
+    use std::sync::Mutex;
+
+    static TEST_RULES: Mutex<()> = Mutex::new(());
 
     #[test]
     fn drop_every_rule_fires_on_interval() {
-        let mut rule = RuntimeFaultRule {
-            location: "display.present".into(),
-            action: FaultAction::DropEvery(3),
-            hits: 0,
-            rng: seed_for_location(b"display.present"),
-        };
-        assert!(!rule.next_should_fail());
-        assert!(!rule.next_should_fail());
-        assert!(rule.next_should_fail());
+        let _guard = TEST_RULES.lock().expect("fault-rule test lock");
+        clear_runtime_rules();
+        install_runtime_rules("display.present=drop-every:3").unwrap();
+        assert!(!should_fail("display.present"));
+        assert!(!should_fail("display.present"));
+        assert!(should_fail("display.present"));
+        clear_runtime_rules();
     }
 
     #[test]
     fn fail_after_rule_fires_after_threshold() {
-        let mut rule = RuntimeFaultRule {
-            location: "pci.config.read".into(),
-            action: FaultAction::FailAfter(1),
-            hits: 0,
-            rng: seed_for_location(b"pci.config.read"),
-        };
-        assert!(!rule.next_should_fail());
-        assert!(rule.next_should_fail());
+        let _guard = TEST_RULES.lock().expect("fault-rule test lock");
+        clear_runtime_rules();
+        install_runtime_rules("process.spawn=fail-after:1").unwrap();
+        assert!(!should_fail("process.spawn"));
+        assert!(should_fail("process.spawn"));
+        clear_runtime_rules();
     }
 }

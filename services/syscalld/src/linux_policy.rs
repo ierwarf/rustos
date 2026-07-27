@@ -17,6 +17,10 @@ use rustos_user_abi::syscall::{
 use spin::Mutex;
 
 use crate::errno;
+use crate::mmap_policy::{
+    parse_mmap_sharing, plan_mmap, MmapFdKind, MmapPlan, MmapPlanError, MAP_PRIVATE,
+};
+use crate::vma_policy::{next_fit_with_wrap, AddressRange};
 
 const DEFAULT_UMASK: u32 = 0o022;
 const GETRANDOM_MAX_BYTES: u32 = (SYSCALL_OFFLOAD_PAYLOAD_CAPACITY as u32) & !3;
@@ -34,9 +38,6 @@ const FUTEX_CLOCK_REALTIME: u64 = 256;
 const FUTEX_CMD_MASK: u64 = !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
 
 const PAGE_SIZE: u64 = 4096;
-const MAP_TYPE: u64 = 0x0f;
-const MAP_SHARED: u64 = 0x01;
-const MAP_PRIVATE: u64 = 0x02;
 const MAP_FIXED: u64 = 0x10;
 const MAP_ANONYMOUS: u64 = 0x20;
 const MAP_DENYWRITE: u64 = 0x0800;
@@ -137,6 +138,16 @@ enum MmVmaKind {
     FilePrivate,
     MemfdShared,
     DeviceShared,
+}
+
+impl AddressRange for MmVma {
+    fn start(&self) -> u64 {
+        self.start
+    }
+
+    fn end(&self) -> u64 {
+        self.end
+    }
 }
 
 pub(crate) fn handle_uname(response: &mut LinuxSyscallOffloadResponse) {
@@ -856,19 +867,59 @@ pub(crate) fn handle_mmap(
         return;
     }
 
+    let anonymous = flags & MAP_ANONYMOUS != 0;
+    let sharing = match parse_mmap_sharing(flags) {
+        Ok(sharing) => sharing,
+        Err(_) => {
+            response.status = errno::EINVAL;
+            return;
+        }
+    };
+    let fd_kind = if !anonymous {
+        let fd_info = match describe_fd(request.pid, fd) {
+            Ok(info) => info,
+            Err(errno) => {
+                response.status = errno;
+                return;
+            }
+        };
+        Some(match fd_info.kind {
+            MM_BROKER_FD_KIND_FILE => MmapFdKind::File,
+            MM_BROKER_FD_KIND_MEMFD => MmapFdKind::Memfd,
+            MM_BROKER_FD_KIND_DISPLAY_SURFACE => MmapFdKind::DisplaySurface,
+            MM_BROKER_FD_KIND_DEVICE => MmapFdKind::Device,
+            _ => MmapFdKind::Other,
+        })
+    } else {
+        None
+    };
+    let plan = match plan_mmap(anonymous, sharing, prot == 0, fd_kind) {
+        Ok(plan) => plan,
+        Err(MmapPlanError::AccessDenied) => {
+            response.status = errno::EACCES;
+            return;
+        }
+        Err(MmapPlanError::InvalidFlags | MmapPlanError::InvalidBacking) => {
+            response.status = errno::EINVAL;
+            return;
+        }
+    };
+
     if fixed {
-        if let Err(errno) = unmap_populated_range(request.pid, &state, addr, addr + map_len) {
+        if let Err(errno) = replace_fixed_range_after_prevalidation(
+            request.pid,
+            &mut state,
+            addr,
+            addr + map_len,
+            plan,
+        ) {
             response.status = errno;
             return;
         }
-        remove_vma_range(&mut state, addr, addr + map_len);
     }
 
-    let anonymous = flags & MAP_ANONYMOUS != 0;
-    let shared = flags & MAP_TYPE == MAP_SHARED;
-    let private = flags & MAP_TYPE == MAP_PRIVATE || flags & MAP_TYPE == 0;
-    let (op, kind) = if anonymous && private {
-        if prot == 0 {
+    let (op, kind) = match plan {
+        MmapPlan::Reserved => {
             insert_vma(
                 &mut state,
                 MmVma {
@@ -884,41 +935,10 @@ pub(crate) fn handle_mmap(
             copy_payload(response, &addr);
             return;
         }
-        (MM_BROKER_OP_MAP_ANON, MmVmaKind::Anonymous)
-    } else if !anonymous && private {
-        let fd_info = match describe_fd(request.pid, fd) {
-            Ok(info) => info,
-            Err(errno) => {
-                response.status = errno;
-                return;
-            }
-        };
-        if fd_info.kind != MM_BROKER_FD_KIND_FILE {
-            response.status = errno::EINVAL;
-            return;
-        }
-        (MM_BROKER_OP_MAP_FILE_PRIVATE, MmVmaKind::FilePrivate)
-    } else if !anonymous && shared {
-        let fd_info = match describe_fd(request.pid, fd) {
-            Ok(info) => info,
-            Err(errno) => {
-                response.status = errno;
-                return;
-            }
-        };
-        match fd_info.kind {
-            MM_BROKER_FD_KIND_MEMFD => (MM_BROKER_OP_MAP_MEMFD_SHARED, MmVmaKind::MemfdShared),
-            MM_BROKER_FD_KIND_DISPLAY_SURFACE | MM_BROKER_FD_KIND_DEVICE => {
-                (MM_BROKER_OP_MAP_DEVICE_SHARED, MmVmaKind::DeviceShared)
-            }
-            _ => {
-                response.status = errno::EACCES;
-                return;
-            }
-        }
-    } else {
-        response.status = errno::EINVAL;
-        return;
+        MmapPlan::Anonymous => (MM_BROKER_OP_MAP_ANON, MmVmaKind::Anonymous),
+        MmapPlan::FilePrivate => (MM_BROKER_OP_MAP_FILE_PRIVATE, MmVmaKind::FilePrivate),
+        MmapPlan::MemfdShared => (MM_BROKER_OP_MAP_MEMFD_SHARED, MmVmaKind::MemfdShared),
+        MmapPlan::DeviceShared => (MM_BROKER_OP_MAP_DEVICE_SHARED, MmVmaKind::DeviceShared),
     };
 
     match broker_map(request.pid, op, addr, map_len, prot, flags, fd, offset) {
@@ -1227,6 +1247,18 @@ fn unmap_populated_range(pid: u64, state: &MmPolicyState, start: u64, end: u64) 
     Ok(())
 }
 
+fn replace_fixed_range_after_prevalidation(
+    pid: u64,
+    state: &mut MmPolicyState,
+    start: u64,
+    end: u64,
+    _validated_plan: MmapPlan,
+) -> Result<(), i32> {
+    unmap_populated_range(pid, state, start, end)?;
+    remove_vma_range(state, start, end);
+    Ok(())
+}
+
 fn mm_broker_call(args: &RustosMmBrokerArgs) -> Result<(), i32> {
     let ret = unsafe {
         rustos_svc_runtime::syscall::syscall1(
@@ -1283,28 +1315,22 @@ fn align_up(value: u64) -> Option<u64> {
 }
 
 fn find_free_region(state: &MmPolicyState, requested: u64, len: u64) -> Result<u64, i32> {
-    let mut cursor = align_up(if requested != 0 {
+    let lower_bound =
+        align_up(state.brk_mapped_end.max(state.user_range_start)).ok_or(errno::ENOMEM)?;
+    let hint = if requested != 0 {
         requested
     } else {
-        state.mmap_next.max(state.brk_mapped_end)
-    })
-    .ok_or(errno::ENOMEM)?;
-    cursor = cursor.max(state.user_range_start);
-    loop {
-        let end = cursor.checked_add(len).ok_or(errno::ENOMEM)?;
-        if end > state.user_range_end {
-            return Err(errno::ENOMEM);
-        }
-        if let Some(conflict) = state
-            .vmas
-            .iter()
-            .find(|vma| cursor < vma.end && end > vma.start)
-        {
-            cursor = align_up(conflict.end).ok_or(errno::ENOMEM)?;
-            continue;
-        }
-        return Ok(cursor);
-    }
+        state.mmap_next
+    };
+    next_fit_with_wrap(
+        &state.vmas,
+        lower_bound,
+        state.user_range_end,
+        hint,
+        len,
+        PAGE_SIZE,
+    )
+    .ok_or(errno::ENOMEM)
 }
 
 fn upsert_heap_vma(state: &mut MmPolicyState) {

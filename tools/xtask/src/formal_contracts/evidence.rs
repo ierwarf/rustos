@@ -59,7 +59,12 @@ pub(super) fn write_evidence(
         .topologies
         .get(topology)
         .with_context(|| format!("unknown formal evidence topology {topology}"))?;
-    validate_runtime_trace(root, topology, &topology_contract.required_runtime_models)?;
+    validate_runtime_trace(
+        root,
+        topology,
+        topology_contract.runtime_scenario.as_str(),
+        &topology_contract.required_runtime_models,
+    )?;
     let git_commit = git_output(root, &["rev-parse", "HEAD"])?;
     let dirty = !git_output(root, &["status", "--porcelain=v1"])?.is_empty();
     if dirty && !allow_dirty {
@@ -74,7 +79,9 @@ pub(super) fn write_evidence(
         [
             Path::new("formal/contracts.toml"),
             registry.manifest.models.as_path(),
+            registry.manifest.model_bindings.as_path(),
             registry.manifest.flows.as_path(),
+            registry.manifest.scenarios.as_path(),
             registry.manifest.witnesses.as_path(),
             registry.manifest.generated_doc.as_path(),
         ],
@@ -84,6 +91,9 @@ pub(super) fn write_evidence(
         .iter()
         .map(|path| root.join(path))
         .collect::<Vec<_>>();
+    let verification_run = root.join(format!("build/formal/verification-run/{profile}.json"));
+    validate_verification_run(root, profile, &source_tree_sha256, &verification_run)?;
+    verification_paths.push(verification_run);
     for path in &verification_paths {
         validate_passed_evidence(path)?;
     }
@@ -171,7 +181,12 @@ pub(super) fn write_evidence(
     Ok(())
 }
 
-fn validate_runtime_trace(root: &Path, topology: &str, required_models: &[String]) -> Result<()> {
+fn validate_runtime_trace(
+    root: &Path,
+    topology: &str,
+    scenario: &str,
+    required_models: &[String],
+) -> Result<()> {
     let summary_path = root.join("build/formal/runtime-traces/kvm-p0-summary.json");
     let summary: serde_json::Value = serde_json::from_slice(
         &fs::read(&summary_path)
@@ -180,8 +195,54 @@ fn validate_runtime_trace(root: &Path, topology: &str, required_models: &[String
     if summary.get("status").and_then(serde_json::Value::as_str) != Some("passed") {
         bail!("KVM runtime trace summary is not passed");
     }
+    if summary.get("schema").and_then(serde_json::Value::as_str)
+        != Some("rustos-kvm-formal-trace-evidence-v4")
+    {
+        bail!("KVM runtime trace summary uses a stale evidence schema");
+    }
+    let source_hash = summary
+        .get("source_tree_sha256")
+        .and_then(serde_json::Value::as_str)
+        .context("KVM runtime trace summary lacks its source-tree hash")?;
+    if source_hash != source_tree_hash(root)? {
+        bail!("KVM runtime trace was not recorded from the current source tree");
+    }
+    for (field, relative) in [
+        ("rustos_boot_image_sha256", "build/rustos-boot.img"),
+        (
+            "dvm_manifest_sha256",
+            "driver-domains/linux/out/artifacts/rustos-linux-dvm-x86_64.manifest",
+        ),
+    ] {
+        let recorded = summary
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .with_context(|| format!("KVM runtime trace summary lacks {field}"))?;
+        if recorded != hash_file(&root.join(relative))? {
+            bail!("KVM runtime trace is stale for launched artifact {relative}");
+        }
+    }
     if summary.get("topology").and_then(serde_json::Value::as_str) != Some(topology) {
         bail!("KVM runtime trace topology does not match evidence topology {topology}");
+    }
+    if summary.get("scenario").and_then(serde_json::Value::as_str) != Some(scenario) {
+        bail!("KVM runtime trace scenario does not match evidence topology {topology}");
+    }
+    let trace_path = root.join("build/formal/runtime-traces/kvm-p0.jsonl");
+    let trace_hash = summary
+        .get("trace_sha256")
+        .and_then(serde_json::Value::as_str)
+        .context("KVM runtime trace summary lacks its trace hash")?;
+    if trace_hash != hash_file(&trace_path)? {
+        bail!("KVM runtime trace summary does not bind the current trace");
+    }
+    let scenario_path = root.join("formal/product-scenarios.tsv");
+    let scenario_hash = summary
+        .get("scenario_registry_sha256")
+        .and_then(serde_json::Value::as_str)
+        .context("KVM runtime trace summary lacks its scenario registry hash")?;
+    if scenario_hash != hash_file(&scenario_path)? {
+        bail!("KVM runtime trace summary is stale for the product scenario registry");
     }
     let models = summary
         .get("models")
@@ -228,6 +289,51 @@ fn validate_passed_evidence(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn validate_verification_run(
+    root: &Path,
+    profile: &str,
+    source_tree_sha256: &str,
+    path: &Path,
+) -> Result<()> {
+    validate_passed_evidence(path)?;
+    let value: serde_json::Value = serde_json::from_slice(&fs::read(path)?)?;
+    if value.get("schema").and_then(serde_json::Value::as_str)
+        != Some("rustos-formal-verification-run-v1")
+        || value.get("profile").and_then(serde_json::Value::as_str) != Some(profile)
+        || value
+            .get("source_tree_sha256")
+            .and_then(serde_json::Value::as_str)
+            != Some(source_tree_sha256)
+    {
+        bail!("formal verification run does not bind the current profile and source tree");
+    }
+    let artifacts = value
+        .get("artifacts")
+        .and_then(serde_json::Value::as_array)
+        .context("formal verification run lacks its artifact set")?;
+    if artifacts.is_empty() {
+        bail!("formal verification run has an empty artifact set");
+    }
+    let mut observed = std::collections::BTreeSet::new();
+    for artifact in artifacts {
+        let relative = artifact
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .context("formal verification run artifact lacks path")?;
+        if !observed.insert(relative) {
+            bail!("formal verification run repeats artifact {relative}");
+        }
+        let recorded = artifact
+            .get("sha256")
+            .and_then(serde_json::Value::as_str)
+            .context("formal verification run artifact lacks hash")?;
+        if recorded != hash_file(&root.join(relative))? {
+            bail!("formal verification run artifact is stale: {relative}");
+        }
+    }
+    Ok(())
+}
+
 fn validate_tlc_evidence(root: &Path, model: &str, path: &Path) -> Result<()> {
     validate_passed_evidence(path)?;
     let value: serde_json::Value = serde_json::from_slice(&fs::read(path)?)?;
@@ -264,7 +370,7 @@ fn evidence_mtime(path: PathBuf) -> Result<u64> {
         .as_secs())
 }
 
-fn source_tree_hash(root: &Path) -> Result<String> {
+pub(super) fn source_tree_hash(root: &Path) -> Result<String> {
     let output = Command::new("git")
         .args([
             "ls-files",
@@ -285,25 +391,18 @@ fn source_tree_hash(root: &Path) -> Result<String> {
         .filter(|path| !path.is_empty())
         .map(|path| {
             std::str::from_utf8(path)
-                .map(PathBuf::from)
+                .map(str::to_owned)
                 .context("source tree contains a non-UTF-8 path")
         })
         .collect::<Result<Vec<_>>>()?;
     paths.sort();
     let mut hasher = Sha256::new();
     for relative in paths {
-        hasher.update(relative.as_os_str().as_encoded_bytes());
+        hasher.update(relative.as_bytes());
         hasher.update([0]);
-        let mut file = fs::File::open(root.join(&relative))
-            .with_context(|| format!("hash source {}", relative.display()))?;
-        let mut buffer = [0_u8; 64 * 1024];
-        loop {
-            let read = file.read(&mut buffer)?;
-            if read == 0 {
-                break;
-            }
-            hasher.update(&buffer[..read]);
-        }
+        hasher.update(
+            fs::read(root.join(&relative)).with_context(|| format!("hash source {relative}"))?,
+        );
         hasher.update([0]);
     }
     Ok(format!("{:x}", hasher.finalize()))
@@ -320,7 +419,7 @@ fn hash_files<'a>(root: &Path, paths: impl IntoIterator<Item = &'a Path>) -> Res
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn hash_file(path: &Path) -> Result<String> {
+pub(super) fn hash_file(path: &Path) -> Result<String> {
     let mut file = fs::File::open(path)?;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];

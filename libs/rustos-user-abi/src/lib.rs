@@ -12,6 +12,7 @@ pub mod ioctl;
 pub mod performance;
 pub mod syscall;
 pub mod ui;
+pub mod windows;
 
 #[cfg(test)]
 mod tests {

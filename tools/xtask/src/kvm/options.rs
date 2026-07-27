@@ -70,6 +70,7 @@ struct KvmLayout {
     dvm_stderr_log: PathBuf,
     dvm_input_ring: PathBuf,
     dvm_input_doorbell: PathBuf,
+    rustos_monitor: PathBuf,
     dvm_control_secret: PathBuf,
     // Keep the private tmpfs directory alive until both QEMU children have
     // exited. Dropping it then removes both DMA-pinnable display backings.
@@ -233,18 +234,25 @@ where
             .context("network exercise lost its shared DVM network aperture")?;
         verify_dvm_network_round_trip(shared_network)?;
     }
-    crate::formal_contracts::record_kvm_runtime_trace(
-        &config.root_dir,
-        crate::formal_contracts::KvmRuntimeObservation {
-            elapsed_ms: boot_started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
-            storage: options.dvm_block_shmem,
-            input: true,
-            display: options.gui_dvm_surfaces,
-            network: options.exercise_network,
-            ui_budget: options.min_ui_fps.is_some(),
-            storage_only: options.storage_only,
-        },
-    )?;
+    // A deliberately failed flush is a negative fault proof, not a successful
+    // storage-ready scenario. Replaying it through the positive product trace
+    // would either fabricate readiness or reject an otherwise valid fault run.
+    if !options.expect_block_flush_fault {
+        crate::formal_contracts::record_kvm_runtime_trace(
+            &config.root_dir,
+            crate::formal_contracts::KvmRuntimeObservation {
+                elapsed_ms: boot_started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+                storage: options.dvm_block_shmem,
+                input: true,
+                display: options.gui_dvm_surfaces,
+                network: options.exercise_network,
+                ui_budget: options.min_ui_fps.is_some(),
+                storage_only: options.storage_only,
+            },
+            &layout.debugcon_log,
+            &layout.dvm_serial_log,
+        )?;
+    }
     println!(
         "xtask: parallel KVM boot passed (RustOS + Linux DVM); control={} established authenticated L0 input relay (DVM cid={}, inventory={}, virtio-net={}, virtio-gpu={}) without QMP",
         artifacts.control.control_plane(),
@@ -323,6 +331,7 @@ pub(crate) fn kvm_run_command(config: &Config, build_image: bool) -> Result<()> 
         expected_markers: vec![
             RUSTOS_GPU_ACTIVE_MARKER.to_owned(),
             RUSTOS_DVM_BLOCK_MARKER.to_owned(),
+            WAYCLICK_FIRST_FRAME_MARKER.to_owned(),
         ],
         expected_dvm_markers: vec![
             DVM_GPU_COMPOSITOR_MARKER.to_owned(),
@@ -365,10 +374,12 @@ pub(crate) fn kvm_run_command(config: &Config, build_image: bool) -> Result<()> 
         input_relay_gate,
     )?;
     log_kvm_start_phase("spawned-guests", started_at);
+    let interactive_boot_started = Instant::now();
 
     println!(
-        "xtask: interactive KVM DVM guests started in {} ms; readiness will be reported without terminating a progressing debug boot",
+        "xtask: interactive KVM DVM guests started in {} ms; user-visible first-frame readiness is required within {} ms of guest monotonic boot time",
         started_at.elapsed().as_millis(),
+        BOOT_TO_UI_HARD_LIMIT_MS,
     );
     let mut pointer_observed = false;
     let mut readiness_verified = false;
@@ -393,17 +404,77 @@ pub(crate) fn kvm_run_command(config: &Config, build_image: bool) -> Result<()> 
         }
         let rustos_log = read_runtime_log_if_present(&layout.debugcon_log)?;
         let dvm_log = read_runtime_log_if_present(&layout.dvm_serial_log)?;
-        if runtime_stall_or_crash_observed(&rustos_log) || runtime_stall_or_crash_observed(&dvm_log)
+        if !rustos_log.contains(WAYCLICK_FIRST_FRAME_MARKER)
+            && guest_deadline_reached(&rustos_log, BOOT_TO_UI_HARD_LIMIT_MS)
         {
+            let reason = format!(
+                "interactive RustOS missed the {} ms user-visible boot limit",
+                BOOT_TO_UI_HARD_LIMIT_MS
+            );
+            let missing_rustos = vec![WAYCLICK_FIRST_FRAME_MARKER.to_owned()];
+            let evidence = write_kvm_failure_summary(
+                &layout,
+                &reason,
+                interactive_boot_started.elapsed(),
+                &rustos_log,
+                &dvm_log,
+                &missing_rustos,
+                &[],
+            )?;
             stop_guest(&mut dvm);
             stop_guest(&mut rustos);
             bail!(
-                "interactive KVM DVM session observed a watchdog, stall, crash, or relay stop; inspect {} and {}",
+                "{reason}; missing={WAYCLICK_FIRST_FRAME_MARKER:?}; evidence={}; inspect {} and {}",
+                evidence.display(),
+                layout.debugcon_log.display(),
+                layout.dvm_serial_log.display(),
+            );
+        }
+        if runtime_stall_or_crash_observed(&rustos_log) || runtime_stall_or_crash_observed(&dvm_log)
+        {
+            let reason =
+                "interactive KVM DVM session observed a watchdog, stall, crash, or relay stop";
+            let evidence = write_kvm_failure_summary(
+                &layout,
+                reason,
+                interactive_boot_started.elapsed(),
+                &rustos_log,
+                &dvm_log,
+                &[],
+                &[],
+            )?;
+            stop_guest(&mut dvm);
+            stop_guest(&mut rustos);
+            bail!(
+                "{reason}; evidence={}; inspect {} and {}",
+                evidence.display(),
                 layout.debugcon_log.display(),
                 layout.dvm_serial_log.display(),
             );
         }
         if !readiness_verified && interactive_display_ready(&layout, &rustos_log, &dvm_log) {
+            if let Err(error) = crate::formal_contracts::record_kvm_runtime_trace(
+                &config.root_dir,
+                crate::formal_contracts::KvmRuntimeObservation {
+                    elapsed_ms: interactive_boot_started
+                        .elapsed()
+                        .as_millis()
+                        .try_into()
+                        .unwrap_or(u64::MAX),
+                    storage: true,
+                    input: true,
+                    display: true,
+                    network: false,
+                    ui_budget: false,
+                    storage_only: false,
+                },
+                &layout.debugcon_log,
+                &layout.dvm_serial_log,
+            ) {
+                stop_guest(&mut dvm);
+                stop_guest(&mut rustos);
+                return Err(error).context("record interactive product boot trace");
+            }
             readiness_verified = true;
             println!(
                 "xtask: interactive KVM DVM display/storage verified in {} ms; move the pointer into the Linux DVM window to record real-input acceptance evidence, then close it or press Ctrl-C to stop",
@@ -766,6 +837,11 @@ where
         options
             .expected_dvm_markers
             .push(DVM_BLOCK_READY_MARKER.to_owned());
+        if options.gui_dvm_surfaces && !options.expect_block_flush_fault {
+            options
+                .expected_markers
+                .push(WAYCLICK_FIRST_FRAME_MARKER.to_owned());
+        }
     }
     if options.exercise_network && !options.dvm_network_shmem {
         bail!("--exercise-network requires --dvm-network-shmem");

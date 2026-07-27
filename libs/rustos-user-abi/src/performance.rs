@@ -27,6 +27,13 @@ pub const IPC_FOREGROUND_MAINTENANCE_SLICE_MS: u64 = 1;
 pub const IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS: u64 = 100;
 /// Boot/control work that may hash, validate, or commit service state.
 pub const IPC_BOOT_CONTROL_HARD_LIMIT_MS: u64 = 5_000;
+/// One immutable executable snapshot on an interactive launch path. The
+/// remaining boot/launch budget must still cover image validation, mapping,
+/// activation, Wayland configure, and the first presented frame.
+pub const EXECUTABLE_SNAPSHOT_HARD_LIMIT_MS: u64 = 2_000;
+/// One shared absolute deadline covers DVM block readiness and its first
+/// generation-bound flush proof during product boot.
+pub const DVM_STORAGE_BOOT_READY_HARD_LIMIT_MS: u64 = 4_000;
 /// Bulk data operations whose external device may legitimately be slow.
 pub const IPC_BULK_DATA_HARD_LIMIT_MS: u64 = 30_000;
 
@@ -46,4 +53,6 @@ const _: () = assert!(UI_BOOT_GPU_ACTIVATION_BUDGET_MS < BOOT_TO_UI_HARD_LIMIT_M
 const _: () = assert!(IPC_FOREGROUND_MAINTENANCE_SLICE_MS < IPC_READINESS_QUERY_HARD_LIMIT_MS);
 const _: () = assert!(IPC_READINESS_QUERY_HARD_LIMIT_MS < IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS);
 const _: () = assert!(IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS < IPC_BOOT_CONTROL_HARD_LIMIT_MS);
+const _: () = assert!(EXECUTABLE_SNAPSHOT_HARD_LIMIT_MS < IPC_BOOT_CONTROL_HARD_LIMIT_MS);
+const _: () = assert!(DVM_STORAGE_BOOT_READY_HARD_LIMIT_MS < BOOT_TO_UI_HARD_LIMIT_MS);
 const _: () = assert!(IPC_BOOT_CONTROL_HARD_LIMIT_MS < IPC_BULK_DATA_HARD_LIMIT_MS);

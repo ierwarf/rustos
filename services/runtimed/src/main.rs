@@ -27,6 +27,7 @@ pub(crate) const UI_SERVER_TASK_WEIGHT_MICROS: u64 =
     TASK_WEIGHT_INTERACTIVE_FLAG | UI_SERVER_CATALOG_WEIGHT_MICROS;
 pub(crate) const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(2);
 pub(crate) const RETRY_BACKOFF: Duration = Duration::from_millis(100);
+pub(crate) const MAX_LAUNCH_RETRY_BACKOFF: Duration = Duration::from_secs(5);
 // A DVM-volume `EAGAIN` is an explicit readiness transition, not a failed
 // launch. Keep retry traffic below the UI-core and storage-ready paths.
 pub(crate) const STORAGE_NOT_READY_RETRY_BACKOFF: Duration = Duration::from_millis(250);
@@ -154,6 +155,7 @@ pub(crate) struct BrokerState {
     pub(crate) running: BTreeMap<i32, RunningProcess>,
     pub(crate) launched_once: BTreeSet<String>,
     pub(crate) retry_after: BTreeMap<String, Instant>,
+    pub(crate) launch_failure_counts: BTreeMap<String, u32>,
     pub(crate) permanent_launch_failures: BTreeMap<String, i32>,
     pub(crate) launch_entries: Vec<LaunchEntry>,
     pub(crate) programs: BTreeMap<String, ProgramMetadata>,
@@ -220,6 +222,7 @@ fn main() {
         running: BTreeMap::new(),
         launched_once: BTreeSet::new(),
         retry_after: BTreeMap::new(),
+        launch_failure_counts: BTreeMap::new(),
         permanent_launch_failures: BTreeMap::new(),
         launch_entries: Vec::new(),
         programs: BTreeMap::new(),

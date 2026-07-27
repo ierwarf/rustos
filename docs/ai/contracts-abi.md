@@ -901,13 +901,14 @@ policy remains with the owning service.
   the successor signature verifies against the immutable early-system key.
   A stale, unsigned, or DVM-forged header remains revoked.
 - Configured `block.read`, `block.write`, and `block.flush` fault points are
-  admitted only after the current signed ready generation has been rechecked
-  and before request ID, mutation ID, transfer-slot contents, pending state,
-  producer cursor, or doorbell authority is published. They return
-  `DeviceFault` with no partial request. `block.write` covers WRITE, DISCARD,
-  and WRITE_ZEROES mutations; `block.flush` remains separate so durability
-  failure can be exercised without fabricating a successful stable-write
-  boundary.
+  admitted only after the current signed ready generation has been rechecked.
+  The exact request is then published and must receive a generation-bound DVM
+  completion before RustOS substitutes `DeviceFault` for the caller-visible
+  result. This exercises the real transport and models the conservative
+  outcome of an operation whose device result is uncertain; it never
+  fabricates success. `block.write` covers WRITE, DISCARD, and WRITE_ZEROES
+  mutations; `block.flush` remains separate so durability failure can be
+  exercised without claiming a successful stable-write boundary.
 - Aperture revocation clears only live readiness and ring cursors. It preserves
   the signed immutable `READ_ONLY` bit, so an interrupted read-only handoff can
   be revoked repeatedly by explicit recovery without invalidating its own L0
@@ -925,9 +926,10 @@ policy remains with the owning service.
   `EAGAIN` and the wait predicate remains sleepable; it is not a fault event.
   A newly observed ready bit is itself one wait event, closing the race where
   the DVM publishes between storaged's failed INFO check and scheduler arm.
-  Storaged retries INFO behind that atomic waiter for at most 15 seconds in
-  one-second slices. Withdrawal after a successful observation is revoke, and
-  timeout never selects early-system or a physical-controller fallback.
+  Storaged applies one shared four-second product-boot deadline to the INFO
+  wait and first generation-bound FLUSH proof, using one-second wait slices.
+  Withdrawal after a successful observation is revoke, and timeout never
+  selects early-system or a physical-controller fallback.
 - Vfsd treats the storaged block-info response and on-disk FAT image as
   separate untrusted admissions. Response generation and capacity must bind
   the exact envelope; logical sectors are one of 512, 1024, 2048, or 4096
@@ -1146,12 +1148,26 @@ policy remains with the owning service.
   still batches by generation; recovery therefore retries a lost edge within
   30 ms at the 66.7 Hz acceptance source without an interrupt per record.
   Neither the timer nor the recovery kick has record/policy authority.
+- The RDI decoder is owned exclusively by the ingestion worker, not by the
+  shared policy queue. Session start/end may require a bounded netd authority
+  transition, but inputd releases the queue lock before service discovery or
+  synchronous IPC. Events from a newly granted epoch are not published until
+  that transition succeeds. A failed transition resets the decoder and input
+  provider state while the worker continues draining the fixed ring, so a
+  bounded authority failure cannot become an unbounded producer-credit stall.
+- Inputd endpoint-owner exit withdraws the ring's separate policy-consumer
+  lease in the same kernel cleanup turn. RustOS clears policy readiness before
+  retiring old-owner records and publishes a reset barrier. A replacement
+  inputd discards any commit that raced withdrawal, observes the reset, and
+  only then rearms policy readiness; neither a dead process nor its records can
+  remain the semantic consumer of a live transport.
 - Inputd ABI v5 retires caller-driven `INPUTD_IPC_OP_DRAIN_INGEST` and the
   commercial INPUT_INGEST operation. `INPUTD_IPC_OP_STATS` (the kernel's poll
   recheck) and an authorized `INPUTD_IPC_OP_READ` observe only the
   service-owned policy queue and never advance the ring. The ingestion worker
-  performs the broker copy without holding the policy-queue mutex, then takes
-  the mutex only for bounded decoding/coalescing. This prevents a hot reader
+  performs the broker copy and RDI decoding without holding the policy-queue
+  mutex, then takes the mutex once per ordinary batch for bounded
+  coalescing/publication. This prevents a hot reader
   from starving transport progress. The worker declares an ingestion handoff
   before taking the queue mutex; request threads that race it release rather
   than barge and retry only after the worker owns one bounded critical section.
@@ -1537,6 +1553,37 @@ Kernel keeps only: user-copy, address-space replacement, scheduler mutation, pen
   failure terminates the UI process instead of letting those workers contend
   with input/present at System priority.
 - Linux `memfd_create`: policy validation in syscalld; kernel performs handle install + read/write/truncate/seal (current handles, user memory).
+- Static-PIE policy services receive one kernel-mapped bootstrap heap, but its
+  runtime allocator is reclaiming rather than bump-only. Every allocation owns
+  an exact header-described span; `dealloc` returns that span to an
+  address-ordered free list and adjacent spans coalesce. Additional anonymous
+  regions remain mapped for the service generation to avoid pager re-entry,
+  but are requested only after no reusable span fits. The bootstrap region is
+  admitted once, a consumed allocation cookie cannot be released twice, and
+  the allocator spin lock is released before the synchronous grow syscall.
+  Therefore a syscalld/pager wait cannot make every other service thread spin
+  behind the heap lock, and cumulative UI, IPC, and parsing traffic is bounded
+  by peak live service memory rather than process lifetime traffic.
+- `syscalld` owns the post-bootstrap Linux mapping cursor. A non-fixed
+  `mmap(NULL, ...)` performs next-fit search from the cursor and, after reaching
+  the user limit, wraps once to the first post-heap gap. `munmap` holes are
+  reusable; a monotonically increasing hint is not allocation ownership and
+  cannot by itself cause `ENOMEM`.
+- `syscalld` classifies mmap flags and validates the backing descriptor into a
+  closed mapping plan before any `MAP_FIXED` unmap. Invalid file/device/shared
+  combinations return their Linux errno without deleting a live mapping.
+- Kernel `mprotect` validates that every page in the requested span is a live
+  4-KiB user mapping before changing the first leaf PTE. A hole or huge-page
+  conflict rejects the whole request without leaving a partially protected
+  range.
+- User unmap preflights every leaf, frame-ownership entry, and the complete
+  post-unmap region ledger before removing the first PTE. Metadata allocation
+  failure is reported as `OutOfFrames`; it cannot abort mid-commit or leave
+  page tables and the address-space region ledger describing different spans.
+- An allocator failure, `fatal service endpoint not ready`, watchdog, or
+  scheduler-stall marker is a failed KVM health outcome and is retained in the
+  bounded causal evidence. No interactive frozen window may remain classified
+  as a healthy session merely because QEMU itself is still running.
 - Windows syscall policy: `Win32SyscallOffloadRequest`/`Response` + `SYSCALL_OFFLOAD_OP_WIN32_*` range. Kernel dispatcher calls service policy first, validates ABI/status, and must fail closed with a non-success NTSTATUS on malformed or denied responses before performing only the narrow privileged action.
 
 ## Commercial-Max Protocol

@@ -102,6 +102,7 @@ struct PendingRequest {
     request: DvmBlockRequest,
     completion: Option<DvmBlockCompletion>,
     cancelled: bool,
+    inject_device_fault: bool,
 }
 
 struct DvmBlockState {
@@ -210,10 +211,7 @@ impl DvmBlockState {
         inject_fault: impl FnOnce(DvmBlockOperation) -> bool,
     ) -> Result<DvmBlockTicket, DvmBlockError> {
         let header = self.current_header()?;
-        if inject_fault(operation) {
-            report_injected_fault(operation, header.generation);
-            return Err(DvmBlockError::DeviceFault);
-        }
+        let inject_device_fault = inject_fault(operation);
         let consumer = load_u64(self.base, REQUEST_CONSUMER_OFFSET, Ordering::Acquire);
         if self.request_producer < consumer
             || self.request_producer.saturating_sub(consumer) >= u64::from(DVM_BLOCK_QUEUE_DEPTH)
@@ -225,19 +223,20 @@ impl DvmBlockState {
             return Err(DvmBlockError::Busy);
         }
         let request_id = self.next_request_id;
-        self.next_request_id = self
+        let next_request_id = self
             .next_request_id
             .checked_add(1)
             .ok_or(DvmBlockError::Revoked)?;
-        let operation_id = if matches!(operation, DvmBlockOperation::Read) {
-            0
+        let (operation_id, next_operation_id) = if matches!(operation, DvmBlockOperation::Read) {
+            (0, self.next_operation_id)
         } else {
             let operation_id = self.next_operation_id;
-            self.next_operation_id = self
-                .next_operation_id
-                .checked_add(1)
-                .ok_or(DvmBlockError::Revoked)?;
-            operation_id
+            (
+                operation_id,
+                self.next_operation_id
+                    .checked_add(1)
+                    .ok_or(DvmBlockError::Revoked)?,
+            )
         };
         let request = DvmBlockRequest {
             generation: header.generation,
@@ -256,19 +255,34 @@ impl DvmBlockState {
             return Err(DvmBlockError::Invalid);
         }
 
-        if !data.is_empty() {
-            let destination = data_slot(self, slot).ok_or(DvmBlockError::Protocol)?;
+        // Read/mutation failure injection models admission failure and must not
+        // consume an ID, slot, cursor, ring record, data slot, or doorbell.
+        // Flush is the one deliberate exception: its negative KVM gate proves
+        // a real generation-bound completion before reporting durability loss.
+        if inject_device_fault && !matches!(operation, DvmBlockOperation::Flush) {
+            return Err(DvmBlockError::DeviceFault);
+        }
+        let data_destination = if data.is_empty() {
+            None
+        } else {
+            Some(data_slot(self, slot).ok_or(DvmBlockError::Protocol)?)
+        };
+        let request_destination =
+            request_record(self, self.request_producer).ok_or(DvmBlockError::Protocol)?;
+
+        self.next_request_id = next_request_id;
+        self.next_operation_id = next_operation_id;
+        if let Some(destination) = data_destination {
             unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), destination, data.len()) };
         }
         self.pending[slot] = Some(PendingRequest {
             request,
             completion: None,
             cancelled: false,
+            inject_device_fault,
         });
         let record = request.encode();
-        let destination =
-            request_record(self, self.request_producer).ok_or(DvmBlockError::Protocol)?;
-        write_record(destination, &record);
+        write_record(request_destination, &record);
         self.request_producer += 1;
         store_u64(
             self.base,
@@ -341,6 +355,15 @@ impl DvmBlockState {
                 self.revoke();
                 return Err(DvmBlockError::Protocol);
             }
+            let completion = if pending.inject_device_fault {
+                report_injected_fault(pending.request.operation, self.geometry.generation);
+                DvmBlockCompletion {
+                    status: DvmBlockCompletionStatus::IoError,
+                    ..completion
+                }
+            } else {
+                completion
+            };
             pending.completion = Some(completion);
             let cancelled = pending.cancelled;
             self.completion_consumer += 1;
@@ -1354,45 +1377,70 @@ mod tests {
             "block.flush"
         );
 
-        let (mut aperture, registers, mut state) = test_state();
-        let initial_request_id = state.next_request_id;
-        let initial_operation_id = state.next_operation_id;
-        let data = vec![0xa5_u8; 4096];
-
-        for (operation, payload, data_len) in [
+        for (operation, data, data_len) in [
             (DvmBlockOperation::Read, &[][..], 4096),
-            (DvmBlockOperation::Write, data.as_slice(), 4096),
-            (DvmBlockOperation::Discard, &[][..], 4096),
-            (DvmBlockOperation::WriteZeroes, &[][..], 4096),
-            (DvmBlockOperation::Flush, &[][..], 0),
+            (DvmBlockOperation::Write, &[0x5a_u8; 4096][..], 4096),
         ] {
+            let (mut aperture, registers, mut state) = test_state();
+            let request_id = state.next_request_id;
+            let operation_id = state.next_operation_id;
             assert_eq!(
-                state.submit_with_fault_decision(operation, 8, payload, data_len, false, |_| true),
+                state.submit_with_fault_decision(operation, 8, data, data_len, false, |_| true),
                 Err(DvmBlockError::DeviceFault)
             );
+            assert_eq!(state.next_request_id, request_id);
+            assert_eq!(state.next_operation_id, operation_id);
             assert_eq!(state.request_producer, 0);
+            assert!(state.pending.iter().all(Option::is_none));
             assert_eq!(
                 load_u64(state.base, REQUEST_PRODUCER_OFFSET, Ordering::Acquire),
                 0
             );
-            assert_eq!(state.next_request_id, initial_request_id);
-            assert_eq!(state.next_operation_id, initial_operation_id);
-            assert!(state.pending.iter().all(Option::is_none));
             assert_eq!(registers[IVSHMEM_DOORBELL_OFFSET / 4], 0);
+            assert!(
+                aperture_bytes(&mut aperture)
+                    [DVM_BLOCK_DATA_OFFSET as usize..DVM_BLOCK_DATA_OFFSET as usize + 4096]
+                    .iter()
+                    .all(|byte| *byte == 0)
+            );
         }
 
+        let (mut aperture, registers, mut state) = test_state();
+        let ticket = state
+            .submit_with_fault_decision(DvmBlockOperation::Flush, 0, &[], 0, false, |_| true)
+            .expect("fault injection must preserve a real DVM request/completion round trip");
+        assert_eq!(state.request_producer, 1);
+        assert_eq!(
+            load_u64(state.base, REQUEST_PRODUCER_OFFSET, Ordering::Acquire),
+            1
+        );
+        assert_ne!(registers[IVSHMEM_DOORBELL_OFFSET / 4], 0);
+
         let request_offset = DVM_BLOCK_REQUEST_RING_OFFSET as usize;
-        assert!(
-            aperture_bytes(&mut aperture)[request_offset..request_offset + DVM_BLOCK_RECORD_BYTES]
-                .iter()
-                .all(|byte| *byte == 0)
-        );
-        assert!(
-            aperture_bytes(&mut aperture)
-                [DVM_BLOCK_DATA_OFFSET as usize..DVM_BLOCK_DATA_OFFSET as usize + data.len()]
-                .iter()
-                .all(|byte| *byte == 0)
-        );
+        let request = DvmBlockRequest::decode(
+            &aperture_bytes(&mut aperture)[request_offset..request_offset + DVM_BLOCK_RECORD_BYTES]
+                .try_into()
+                .unwrap(),
+        )
+        .unwrap();
+        let completion = DvmBlockCompletion {
+            generation: request.generation,
+            request_id: request.request_id,
+            operation_id: request.operation_id,
+            status: DvmBlockCompletionStatus::Success,
+            data_slot: request.data_slot,
+            completed_bytes: 0,
+            durable_through_operation_id: request.operation_id,
+        };
+        let completion_offset = DVM_BLOCK_COMPLETION_RING_OFFSET as usize;
+        aperture_bytes(&mut aperture)
+            [completion_offset..completion_offset + DVM_BLOCK_RECORD_BYTES]
+            .copy_from_slice(&completion.encode());
+        store_u64(state.base, REQUEST_CONSUMER_OFFSET, 1, Ordering::Release);
+        store_u64(state.base, COMPLETION_PRODUCER_OFFSET, 1, Ordering::Release);
+        assert_eq!(state.poll(ticket, &mut []), Err(DvmBlockError::DeviceFault));
+        state.finish(ticket).unwrap();
+        assert!(state.pending.iter().all(Option::is_none));
     }
 
     #[test]
@@ -1430,6 +1478,29 @@ mod tests {
         );
         assert!(state.pending[ticket.data_slot as usize].is_none());
         assert!(!state.revoked);
+    }
+
+    #[test]
+    fn invalid_submission_does_not_consume_request_or_operation_identity() {
+        let (_aperture, registers, mut state) = test_state();
+        let request_id = state.next_request_id;
+        let operation_id = state.next_operation_id;
+        assert_eq!(
+            state.submit_with_fault_decision(
+                DvmBlockOperation::Write,
+                u64::MAX,
+                &[0_u8; 4096],
+                4096,
+                false,
+                |_| false,
+            ),
+            Err(DvmBlockError::Invalid)
+        );
+        assert_eq!(state.next_request_id, request_id);
+        assert_eq!(state.next_operation_id, operation_id);
+        assert_eq!(state.request_producer, 0);
+        assert!(state.pending.iter().all(Option::is_none));
+        assert_eq!(registers[IVSHMEM_DOORBELL_OFFSET / 4], 0);
     }
 
     #[test]

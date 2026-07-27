@@ -1,0 +1,54 @@
+# model	role	whole_flow	rationale
+authority-identity-lifecycle/AuthorityIdentityLifecycle	refinement	root-authority	Non-reusable process and task identities refine root and delegated authority lifetime.
+clocksource-deadline/ClocksourceDeadline	refinement	monotonic-deadline-lifecycle	The clocksource model proves the deadline flow's time-domain and catch-up invariants.
+deferred-start/DeferredStart	refinement	deferred-process-activation	Suspended creation and one-shot activation refine the process activation transaction.
+devmgrd-sessiond-isolation/DevmgrdSessiondIsolation	refinement	service-call-authority	Bounded policy-worker isolation refines nested service-call progress and cancellation.
+dma-iommu-isolation/DmaIommuIsolation	refinement	boot-storage-handoff	IOMMU ownership and DMA revocation refine physical device handoff.
+driver-domain-fleet/DriverDomainFleet	refinement	boot-storage-handoff	Signed fleet exclusivity refines DVM provider admission and retirement.
+dual-abi-byte-parser/DualAbiByteParser	refinement	executable-image-admission	Bounded byte parsing refines native ELF and PE image admission.
+dvm-absolute-pointer/DvmAbsolutePointer	refinement	dvm-input-ingress	Absolute pointer validation refines authenticated input ingress.
+dvm-agent-readiness/DvmAgentReadiness	refinement	dvm-control-ingress	Agent publication and process-lifetime readiness refine DVM control admission.
+dvm-amdgpu-evidence/DvmAmdgpuEvidence	evidence	gpu-frame-lifecycle	AMDGPU evidence is an acceptance witness for the production frame lifecycle.
+dvm-amdgpu-supply/DvmAmdgpuSupply	refinement	gpu-frame-lifecycle	Driver supply and exact device ownership refine GPU provider admission.
+dvm-atomic-scanout/DvmAtomicScanout	refinement	gpu-frame-lifecycle	Atomic scanout ownership refines frame commit and rollback.
+dvm-commercial-lifecycle/DvmCommercialLifecycle	refinement	boot-storage-handoff	Durable DVM identity and quarantine ordering refine device handoff recovery.
+dvm-control-relay/DvmControlRelay	refinement	dvm-control-ingress	Relay generation and cancellation refine authenticated DVM control ingress.
+dvm-display-driver-supply/DvmDisplayDriverSupply	refinement	gpu-frame-lifecycle	Display driver supply refines real-provider readiness.
+dvm-display-scheduler/DvmDisplayScheduler	refinement	gpu-frame-lifecycle	Display scheduling budgets refine frame admission and completion.
+dvm-gpu-admission/DvmGpuAdmission	refinement	gpu-frame-lifecycle	GPU authority and generation checks refine provider admission.
+dvm-gpu-atlas-transport/DvmGpuAtlasTransport	refinement	gpu-frame-lifecycle	Atlas bounds and ownership refine frame payload transport.
+dvm-gpu-proof-scheduler/DvmGpuProofScheduler	evidence	gpu-frame-lifecycle	Proof scheduling binds runtime evidence to the production frame lifecycle.
+dvm-input-revocation/DvmInputRevocation	refinement	dvm-input-ingress	Provider revoke and stale-generation denial refine input ingress.
+dvm-input-selftest/DvmInputSelftest	evidence	dvm-input-ingress	Self-test evidence exercises the same authenticated input transport.
+dvm-network-control/DvmNetworkControl	refinement	dvm-network-ingress	Control lease lifetime refines network ingress generation ownership.
+dvm-release-bundle/DvmReleaseBundle	evidence	boot-storage-handoff	Signed release-bundle evidence binds the exact launched DVM artifacts.
+endpoint-registry/EndpointRegistry	refinement	endpoint-lifecycle	Registry publication and stale epoch rejection refine endpoint lifetime.
+exec-ticket/ExecTicket	refinement	deferred-process-activation	Exact requester and target identity refine the activation transaction.
+gui-dvm-install/GuiDvmInstall	evidence	gpu-frame-lifecycle	GUI DVM installation evidence is bound to the real provider lifecycle.
+gui-dvm-pixel-authority/GuiDvmPixelAuthority	refinement	gpu-frame-lifecycle	Pixel authority and revoke refine GPU frame ownership.
+gui-dvm-surface/GuiDvmSurface	refinement	gpu-frame-lifecycle	Surface bounds and generation ownership refine frame payload admission.
+input-readiness/InputReadiness	refinement	input-delivery-lifecycle	Check-arm-recheck readiness refines policy queue delivery.
+ipc-priority-inheritance/IpcPriorityInheritance	refinement	scheduler-dispatch	Reply-scoped donation refines scheduler dependency progress.
+ivshmem-pairing/IvshmemPairing	refinement	dvm-control-ingress	Exact peer pairing and disconnect refine DVM control lifetime.
+memfd-seal-lifecycle/MemfdSealLifecycle	refinement	memory-map	Seal, mapping, resize, and release serialize shared-memory mapping authority.
+network-payload-session/NetworkPayloadSession	refinement	dvm-network-ingress	Packet shape and session generation refine DVM network ingress.
+persistent-mutation-admission/PersistentMutationAdmission	refinement	durable-block-mutation	Mutation authorization refines durable write admission.
+post-init-supervisor-recovery/PostInitSupervisorRecovery	refinement	post-init-service-authority	Supervisor restart and backoff refine post-init service authority.
+proc-broker-session/ProcBrokerSession	refinement	deferred-process-activation	Prepare-session owner exit and cleanup refine process activation.
+rootd-bootstrap/RootdBootstrap	refinement	service-bootstrap	Root bootstrap ordering refines the first service graph transition.
+runtime-control-rpc/RuntimeControlRpc	refinement	runtime-control-ingress	One-response RPC settlement refines runtime-control ingress.
+service-heap-lifecycle/ServiceHeapLifecycle	refinement	service-heap-lifecycle	Exact allocation ownership, release reuse, exhausted-capacity growth, and explicit failure refine long-lived service memory lifetime.
+scheduler-admission/SchedulerAdmission	refinement	scheduler-dispatch	Strict-class admission refines scheduler dispatch authority.
+scheduler-cpu-distribution/SchedulerCpuDistribution	refinement	scheduler-dispatch	Bounded class bursts and per-task wait age refine dispatch fairness.
+scheduler-thread-demotion/SchedulerThreadDemotion	refinement	scheduler-dispatch	Base-class demotion and donation preservation refine effective class.
+scheduler-wakeup/SchedulerWakeup	refinement	scheduler-lifecycle	Arm, wake, commit, cancel, and retire refine task wait lifetime.
+trusted-ui-boundary/TrustedUiBoundary	refinement	wayland-client-ingress	Trusted prompt authority refines untrusted client ingress.
+ui-frame-budget/UiFrameBudget	refinement	gpu-frame-lifecycle	Main-loop budget and worker isolation refine frame progress.
+ui-input-motion/UiInputMotion	refinement	input-delivery-lifecycle	Motion coalescing and bounded delivery refine input lifecycle.
+vfio-release-authorization/VfioReleaseAuthorization	refinement	boot-storage-handoff	Exact release authorization refines VFIO handback.
+wayland-frame-pacing/WaylandFramePacing	refinement	gpu-frame-lifecycle	Coalesced presentation and callback permits refine frame completion.
+rootd-bootstrap/RootdBootstrap	refinement	commercial-product-boot	Root bootstrap readiness refines the first absolute product boot deadline.
+input-ingestion-worker/InputIngestionWorker	refinement	commercial-product-boot	Authenticated policy-consumer readiness refines the interactive input milestone.
+dvm-display-readiness/DvmDisplayReadiness	refinement	commercial-product-boot	Generation-bound display admission refines the interactive provider milestone.
+dvm-block-startup/DvmBlockStartup	refinement	commercial-product-boot	Generation-bound block readiness refines both product boot topologies.
+ui-frame-budget/UiFrameBudget	refinement	commercial-product-boot	The first presented frame refines the user-visible interactive terminal.

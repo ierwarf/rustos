@@ -85,4 +85,46 @@ mod tests {
             assert!(!(slept && generation > observed && !woke));
         });
     }
+
+    #[derive(Default)]
+    struct StableEndpoint {
+        epoch: AtomicUsize,
+        endpoint: AtomicUsize,
+        owner: AtomicUsize,
+    }
+
+    /// Mirrors the compat service registry exactly: registration advances the
+    /// epoch first, publishes owner next, and publishes endpoint last; readers
+    /// accept only equal epoch/endpoint double reads. Observing the endpoint's
+    /// release therefore admits neither the old epoch nor an unowned tuple.
+    #[test]
+    fn stable_endpoint_snapshot_never_admits_a_torn_publication() {
+        loom::model(|| {
+            let registry = Arc::new(StableEndpoint::default());
+            let writer_side = Arc::clone(&registry);
+            let writer = thread::spawn(move || {
+                writer_side.epoch.fetch_add(1, Ordering::AcqRel);
+                writer_side.owner.store(42, Ordering::Release);
+                writer_side.endpoint.store(7, Ordering::Release);
+            });
+            let reader_side = Arc::clone(&registry);
+            let reader = thread::spawn(move || {
+                let before = reader_side.epoch.load(Ordering::Acquire);
+                let endpoint_before = reader_side.endpoint.load(Ordering::Acquire);
+                let owner = reader_side.owner.load(Ordering::Acquire);
+                let endpoint_after = reader_side.endpoint.load(Ordering::Acquire);
+                let after = reader_side.epoch.load(Ordering::Acquire);
+                if before == after
+                    && endpoint_before == endpoint_after
+                    && endpoint_before != 0
+                {
+                    assert_eq!(before, 1);
+                    assert_eq!(endpoint_before, 7);
+                    assert_eq!(owner, 42);
+                }
+            });
+            writer.join().unwrap();
+            reader.join().unwrap();
+        });
+    }
 }

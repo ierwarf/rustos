@@ -473,7 +473,6 @@ int main(int argc, char **argv) {
     } else {
         debug_write("abifuzz: fd-transfer-stress skipped");
     }
-
     debug_write("abifuzz: done");
     printf("abifuzz: done\r\n");
     fflush(stdout);

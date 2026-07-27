@@ -56,7 +56,8 @@ registered="$({
         fi
         if [[ "$trace" == yes ]]; then
             rg -q "model.*$model|$model" \
-                formal/check-runtime-trace.py formal/check-*-runtime-trace.py || {
+                formal/check-runtime-trace.py formal/check-*-runtime-trace.py \
+                formal/product-scenarios.tsv || {
                 echo "missing runtime trace checker for $model" >&2
                 exit 1
             }
@@ -92,9 +93,33 @@ done < <(find formal -mindepth 2 -maxdepth 2 -name '*.cfg' | sort)
 for lock in formal/tla2tools.lock formal/kani.lock formal/verus.lock formal/apalache.lock formal/tlaps.lock; do
     [[ -s "$lock" ]] || { echo "missing tool lock: $lock" >&2; exit 1; }
 done
-for script in formal/run-{all-tlc,tlc,tlc-simulate,kani,verus,runtime-traces,source-conformance,miri,loom,fuzz-smoke,apalache,tlaps}.sh; do
+for script in formal/run-{all-tlc,tlc,tlc-simulate,kani,verus,runtime-traces,source-conformance,miri,loom,fuzz-smoke,apalache,tlaps,abi-differential,recovery-scenarios,implementation-mutations,sanitizers}.sh; do
     [[ -x "$script" ]] || { echo "formal runner is not executable: $script" >&2; exit 1; }
 done
+for registry in \
+    formal/abi-divergences.tsv \
+    formal/fault-scenarios.tsv \
+    formal/implementation-mutations.tsv \
+    formal/recovery-scenarios.tsv \
+    formal/sanitizer-targets.tsv; do
+    [[ -s "$registry" ]] || {
+        echo "formal executable-evidence registry is missing: $registry" >&2
+        exit 1
+    }
+done
+[[ -x formal/write-verification-run.py ]] || {
+    echo "formal verification-run sealer is not executable" >&2
+    exit 1
+}
+[[ -x formal/test-verification-run-freshness.py ]] || {
+    echo "formal verification-run freshness selftest is not executable" >&2
+    exit 1
+}
+python3 formal/test-verification-run-freshness.py
+[[ -s formal/concurrency-witnesses.tsv ]] || {
+    echo "formal concurrency witness registry is missing" >&2
+    exit 1
+}
 [[ -x formal/check-system-flows.sh ]] || {
     echo "system-flow contract checker is not executable" >&2
     exit 1
@@ -121,6 +146,7 @@ formal/check-performance-contracts.sh
     exit 1
 }
 formal/check-kernel-policy-boundary.sh
+python3 formal/check-proof-boundaries.py
 [[ -x formal/run-spec-mutations.sh ]] || {
     echo "formal/run-spec-mutations.sh must be executable" >&2
     exit 1

@@ -12,7 +12,8 @@ purpose. It is for hardening recovery paths, not for random breakage.
 The current path is:
 
 1. Rules live in `config/rustos.toml` under `[fault_injection]`.
-2. When enabled, `cargo xtask kvm-smoke` passes the rules through QEMU fw_cfg
+2. Normal boots keep injection disabled. When a hardening run enables it,
+   `cargo xtask kvm-smoke` passes the rules through QEMU fw_cfg
    `opt/rustos/fault-injection`.
 3. The kernel reads that fw_cfg file during boot after the heap is initialized.
 4. Selected kernel boundaries call `should_fail("fault.point")`.
@@ -43,9 +44,9 @@ Actions:
 | `fail-after:N` | Let N calls pass, then fail later calls. |
 | `rate:N` | Fail about N out of 1000 calls. |
 
-Keep the `rules = [...]` array on one physical line for now. The current logging
-cfg generator also scans `config/rustos.toml`, and standalone multiline array
-closing brackets are not accepted by that parser yet.
+Normal TOML array formatting is accepted. Configuration admission parses the
+TOML structure and rejects duplicate, unknown, or retired fault points before
+the image can be staged.
 
 ### Fault Points
 
@@ -54,15 +55,15 @@ closing brackets are not accepted by that parser yet.
 | `alloc.frame` | Physical frame allocation returns `None`. |
 | `block.read` | Block device read returns `DeviceFault`. |
 | `block.write` | Block device write returns `DeviceFault`. |
-| `block.flush` | DVM block flush returns `DeviceFault` before ring publication. |
+| `block.flush` | A real generation-bound DVM flush completion is observed, then the caller receives `DeviceFault` without a durability-success claim. |
 | `display.present` | Display present is dropped. |
 | `display.provider.register` | Driver framebuffer provider registration fails. |
-| `input.event.enqueue` | Pointer/input event is dropped before enqueue. |
-| `pci.config.read` | Linux compat PCI config read returns an I/O-style error. |
+| `handle.commit` | A reserved descriptor transfer fails before any slot is committed. |
+| `handle.reserve` | Descriptor reservation fails before table ownership changes. |
+| `ipc.endpoint.enqueue` | Endpoint call admission fails before allocating or queueing message/reply state. |
+| `ipc.endpoint.reply` | Endpoint reply admission fails before consuming the one-shot reply or publishing response data. |
 | `process.spawn` | User process spawn fails as if no task slot was available. |
-| `socket.recv` | Socket receive returns a retryable error. |
-| `socket.send` | Socket send returns a retryable error. |
-| `virtio-gpu.control.submit` | VirtIO GPU control command submission fails. |
+| `waitset.register` | Wait-set registration fails before replacing the caller's existing provider observations. |
 
 ### Examples
 
@@ -82,12 +83,12 @@ enabled = true
 rules = ["block.read=fail-after:50"]
 ```
 
-Inject a low-rate IPC/socket send failure:
+Inject a low-rate process-spawn failure:
 
 ```toml
 [fault_injection]
 enabled = true
-rules = ["socket.send=rate:5"]
+rules = ["process.spawn=rate:5"]
 ```
 
 After changing the config, rebuild and run the bounded KVM smoke:
@@ -97,7 +98,10 @@ cargo xtask build
 cargo xtask kvm-smoke --timeout 30
 ```
 
-The storage-DVM flush failure has a first-class negative acceptance gate. The
+`formal/fault-scenarios.tsv` is the closed registry. Unknown, duplicate, and
+retired points fail both host configuration and guest admission instead of
+silently doing nothing. The storage-DVM flush failure has a first-class
+negative acceptance gate. The
 gate admits exactly one unconditional flush rule, requires both peers, exact
 geometry, and a real first completion, then rejects any fabricated flush
 success:
@@ -111,8 +115,8 @@ RUSTOS_FAULTS='block.flush=fail' cargo xtask kvm-smoke --timeout 30 \
 
 Add fault points at real failure boundaries, not inside arbitrary helper
 functions. Good places are allocator, block I/O, device registration, queue
-submit, process spawn, socket/IPC send and receive, and driver probe or load
-boundaries.
+submit, and process spawn. Ring3 input/network policy and DVM hardware drivers
+need an owner-local channel before their points can enter this kernel registry.
 
 Use the existing shared parser in `libs/rustos-fault-injection` and the kernel
 runtime in `kernel/nucleus-core/src/util/fault_injection.rs`. Do not invent a
@@ -129,7 +133,8 @@ RustOS fault injection은 OS의 중요한 경계가 일부러 실패한 것처�
 현재 흐름은 이렇습니다.
 
 1. 규칙은 `config/rustos.toml`의 `[fault_injection]`에 둡니다.
-2. 활성화하면 `cargo xtask kvm-smoke`가 규칙을 QEMU fw_cfg
+2. 일반 부팅에서는 injection을 비활성화합니다. 하드닝 실행에서 활성화하면
+   `cargo xtask kvm-smoke`가 규칙을 QEMU fw_cfg
    `opt/rustos/fault-injection`으로 넘깁니다.
 3. 커널은 heap 초기화 직후 부팅 중 fw_cfg 파일을 읽습니다.
 4. 선택된 커널 경계가 `should_fail("fault.point")`를 호출합니다.
@@ -160,9 +165,9 @@ fault.point=action
 | `fail-after:N` | N번은 통과시키고 이후 호출 실패 |
 | `rate:N` | 1000번 중 대략 N번 실패 |
 
-현재는 `rules = [...]` 배열을 한 줄에 유지하세요. 기존 logging cfg generator가
-`config/rustos.toml` 전체를 같이 스캔하기 때문에, 독립된 줄의 multiline 배열
-닫는 대괄호를 아직 받아들이지 못합니다.
+일반 TOML 배열 형식을 사용할 수 있습니다. 설정 admission은 TOML 구조를
+파싱하고, 중복되거나 등록되지 않았거나 폐기된 fault point를 이미지 staging
+전에 거부합니다.
 
 ### Fault Point
 
@@ -171,15 +176,15 @@ fault.point=action
 | `alloc.frame` | 물리 frame allocation이 `None` 반환 |
 | `block.read` | block device read가 `DeviceFault` 반환 |
 | `block.write` | block device write가 `DeviceFault` 반환 |
-| `block.flush` | DVM block flush가 ring publication 전에 `DeviceFault` 반환 |
+| `block.flush` | 실제 generation-bound DVM flush completion 뒤 caller에 `DeviceFault`를 반환하며 durability 성공은 게시하지 않음 |
 | `display.present` | display present drop |
 | `display.provider.register` | driver framebuffer provider 등록 실패 |
-| `input.event.enqueue` | pointer/input event enqueue 전 drop |
-| `pci.config.read` | Linux compat PCI config read가 I/O성 오류 반환 |
+| `handle.commit` | 예약된 descriptor transfer가 slot commit 전에 실패 |
+| `handle.reserve` | descriptor reservation이 table ownership 변경 전에 실패 |
+| `ipc.endpoint.enqueue` | endpoint call admission이 message/reply 할당 또는 queue 전에 실패 |
+| `ipc.endpoint.reply` | endpoint reply admission이 one-shot reply 소비 또는 response publish 전에 실패 |
 | `process.spawn` | task slot 부족처럼 user process spawn 실패 |
-| `socket.recv` | socket receive가 retry 가능한 오류 반환 |
-| `socket.send` | socket send가 retry 가능한 오류 반환 |
-| `virtio-gpu.control.submit` | VirtIO GPU control command 제출 실패 |
+| `waitset.register` | wait-set 등록이 기존 provider observation 교체 전에 실패 |
 
 ### 예시
 
@@ -199,12 +204,12 @@ enabled = true
 rules = ["block.read=fail-after:50"]
 ```
 
-낮은 확률의 IPC/socket send 실패:
+낮은 확률의 process spawn 실패:
 
 ```toml
 [fault_injection]
 enabled = true
-rules = ["socket.send=rate:5"]
+rules = ["process.spawn=rate:5"]
 ```
 
 config를 바꾼 뒤에는 다시 빌드하고 bounded KVM smoke를 실행합니다.
@@ -214,6 +219,8 @@ cargo xtask build
 cargo xtask kvm-smoke --timeout 30
 ```
 
+`formal/fault-scenarios.tsv`가 닫힌 registry이며, 알 수 없거나 중복되거나
+폐기된 point는 조용히 무시되지 않고 host/guest admission에서 실패합니다.
 storage-DVM flush 실패는 별도의 음성(negative) acceptance gate로 검증합니다.
 정확히 하나의 무조건 flush 실패 규칙만 허용하고, 양쪽 peer, 정확한 geometry,
 실제 첫 completion을 확인한 뒤 허위 flush 성공 표식이 나오면 실패합니다.
@@ -226,8 +233,9 @@ RUSTOS_FAULTS='block.flush=fail' cargo xtask kvm-smoke --timeout 30 \
 ### 새 지점 추가
 
 fault point는 아무 helper에나 넣지 말고 실제 실패 경계에 넣으세요. 좋은 위치는
-allocator, block I/O, device registration, queue submit, process spawn,
-socket/IPC send/receive, driver probe/load 경계입니다.
+allocator, block I/O, device registration, queue submit, process spawn
+경계입니다. Ring3 input/network policy와 DVM hardware driver는 소유자 로컬
+채널이 생기기 전에는 kernel registry에 넣지 않습니다.
 
 규칙 파싱은 `libs/rustos-fault-injection`, 커널 런타임은
 `kernel/nucleus-core/src/util/fault_injection.rs`를 사용하세요. 특정

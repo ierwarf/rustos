@@ -31,7 +31,17 @@ pub(crate) fn retire_current_linux_task_due_to_fault(
     rip: u64,
     rsp: u64,
 ) -> multitask::UserFaultDisposition {
-    let final_process_thread = multitask::current_user_process_id().and_then(|process_id| {
+    let faulting_process = multitask::current_user_process_id();
+    let faulting_thread = multitask::current_user_thread_id().unwrap_or(0);
+    if let Some(process_id) = faulting_process {
+        debug::record_milestone(
+            debug::LogCategory::Compat,
+            "linux-user-fault",
+            (process_id << 32) | (faulting_thread & u32::MAX as u64),
+            ((vector as u64) << 56) | (rip & 0x00ff_ffff_ffff_ffff),
+        );
+    }
+    let final_process_thread = faulting_process.and_then(|process_id| {
         (multitask::current_user_process_thread_count().unwrap_or(1) <= 1).then_some(process_id)
     });
     let disposition =
@@ -189,11 +199,11 @@ extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> u64 {
         "syscall SIMD restore no longer owns the entering task"
     );
     let return_abi = validate_syscall_entry_or_terminate(frame);
-    // Wakeups raised while servicing another syscall are handled by the next
-    // ordinary PIT tick. Never enter the software scheduler from a live
-    // syscall continuation. sched_yield separately arms a short one-shot edge
-    // which is consumed only after the CPU has returned to a user frame.
-    multitask::clear_deferred_reschedule_request();
+    // The syscall body runs with IF=1, so this software interrupt preserves
+    // an interruptible kernel continuation. The scheduler may switch here and
+    // later resume the exact syscall before restoring the entering user SIMD
+    // image. This closes hot-syscall starvation without a high-rate PIT retry.
+    multitask::reschedule_deferred_from_interruptible_syscall();
     trace_syscall_exit(frame, return_abi, result);
     result
 }

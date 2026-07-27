@@ -22,7 +22,7 @@ use rustos_user_abi::syscall::{
     IPC_WAIT_SERVICE_ENDPOINT_MAX_TIMEOUT_MS, LOADER_OP_ACTIVATE, LOADER_OP_SPAWN_EXEC,
     LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES, LOADER_SPAWN_ENV_BYTES,
     LOADER_SPAWN_EXEC_PATH_CAPACITY, LOADER_SPAWN_FLAG_DEFER_START, ROOTD_LEASE_STATE_EMPTY,
-    ROOTD_LEASE_STATE_EXITED, ROOTD_LEASE_STATE_RUNNING, SYS_RUSTOS_IPC_CALL,
+    ROOTD_LEASE_STATE_EXITED, ROOTD_LEASE_STATE_RUNNING, SYS_RUSTOS_IPC_CALL_BOUNDED,
     SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
     SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_WAIT_SERVICE_ENDPOINT,
     TASK_WEIGHT_INTERACTIVE_FLAG,
@@ -698,12 +698,13 @@ fn call_rootd_supervisor(
     let mut response = CommercialMaxProtocolResponse::default();
     let call = unsafe {
         libc::syscall(
-            SYS_RUSTOS_IPC_CALL as libc::c_long,
+            SYS_RUSTOS_IPC_CALL_BOUNDED as libc::c_long,
             endpoint,
             (&request as *const CommercialMaxProtocolRequest) as u64,
             size_of::<CommercialMaxProtocolRequest>() as u64,
             (&mut response as *mut CommercialMaxProtocolResponse) as u64,
             size_of::<CommercialMaxProtocolResponse>() as u64,
+            IPC_BOOT_CONTROL_HARD_LIMIT_MS,
         ) as i64
     };
     if call < 0 {
@@ -752,12 +753,13 @@ fn report_rootd_service_lease_inner(service_id: u64, exec_path: &str, pid: u64) 
     let mut response = CommercialMaxProtocolResponse::default();
     let call = unsafe {
         libc::syscall(
-            SYS_RUSTOS_IPC_CALL as libc::c_long,
+            SYS_RUSTOS_IPC_CALL_BOUNDED as libc::c_long,
             endpoint,
             (&request as *const CommercialMaxProtocolRequest) as u64,
             size_of::<CommercialMaxProtocolRequest>() as u64,
             (&mut response as *mut CommercialMaxProtocolResponse) as u64,
             size_of::<CommercialMaxProtocolResponse>() as u64,
+            IPC_BOOT_CONTROL_HARD_LIMIT_MS,
         ) as i64
     };
     if call < 0 {
@@ -934,12 +936,13 @@ fn spawn_exec_via_loaderd(exec_path: &str, env: &[CString]) -> Result<i32, i32> 
     ));
     let call = unsafe {
         libc::syscall(
-            SYS_RUSTOS_IPC_CALL as libc::c_long,
+            SYS_RUSTOS_IPC_CALL_BOUNDED as libc::c_long,
             endpoint,
             (&request as *const LoaderSpawnRequest) as u64,
             size_of::<LoaderSpawnRequest>() as u64,
             (&mut response as *mut LoaderSpawnResponse) as u64,
             size_of::<LoaderSpawnResponse>() as u64,
+            IPC_BOOT_CONTROL_HARD_LIMIT_MS,
         ) as i64
     };
     if call < 0 {
@@ -974,12 +977,13 @@ fn activate_spawned_service(pid: i32) -> Result<(), i32> {
     let mut response = LoaderSpawnResponse::default();
     let call = unsafe {
         libc::syscall(
-            SYS_RUSTOS_IPC_CALL as libc::c_long,
+            SYS_RUSTOS_IPC_CALL_BOUNDED as libc::c_long,
             endpoint,
             (&request as *const LoaderSpawnRequest) as u64,
             size_of::<LoaderSpawnRequest>() as u64,
             (&mut response as *mut LoaderSpawnResponse) as u64,
             size_of::<LoaderSpawnResponse>() as u64,
+            IPC_BOOT_CONTROL_HARD_LIMIT_MS,
         ) as i64
     };
     if call < 0 {

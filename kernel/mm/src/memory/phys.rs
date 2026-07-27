@@ -447,11 +447,24 @@ pub fn init(boot_info_ptr: *const BootInfo) {
 }
 
 pub fn alloc_frame() -> Option<PhysAddr> {
-    if nucleus_core::util::fault_injection::should_fail("alloc.frame") {
-        crate::debug::warn!(memory, "fault injection: alloc.frame failed");
-        return None;
+    alloc_frame_with_fault_gate(
+        nucleus_core::util::fault_injection::should_fail("alloc.frame"),
+        || crate::debug::warn!(memory, "fault injection: alloc.frame failed"),
+        || alloc_contiguous(1),
+    )
+}
+
+fn alloc_frame_with_fault_gate(
+    faulted: bool,
+    on_fault: impl FnOnce(),
+    allocate: impl FnOnce() -> Option<PhysAddr>,
+) -> Option<PhysAddr> {
+    if faulted {
+        on_fault();
+        None
+    } else {
+        allocate()
     }
-    alloc_contiguous(1)
 }
 
 pub fn alloc_contiguous(page_count: usize) -> Option<PhysAddr> {
@@ -682,6 +695,25 @@ mod tests {
         let _ = state.free_frame_locked(first);
         let reused = state.alloc_contiguous_locked(1).unwrap();
         assert_eq!(reused.as_u64(), 0);
+    }
+
+    #[test]
+    fn allocation_fault_gate_prevents_allocator_mutation() {
+        let allocation_called = core::cell::Cell::new(false);
+        let fault_reported = core::cell::Cell::new(false);
+        assert_eq!(
+            alloc_frame_with_fault_gate(
+                true,
+                || fault_reported.set(true),
+                || {
+                    allocation_called.set(true);
+                    Some(PhysAddr::new(PAGE_SIZE))
+                },
+            ),
+            None
+        );
+        assert!(fault_reported.get());
+        assert!(!allocation_called.get());
     }
 
     #[test]

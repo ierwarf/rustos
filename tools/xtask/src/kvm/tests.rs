@@ -14,9 +14,10 @@ mod tests {
         RUSTOS_POST_INIT_PROVENANCE_MARKER, VIRTUAL_GPU_EVIDENCE, WayclickProfileObservation,
         append_dvm_display_pixels, append_dvm_input_devices, append_dvm_network_device,
         append_dvm_virtual_gpu, append_physical_gpu, claim_physical_gpu_launch_in,
-        dvm_display_failure, dvm_display_provider_ready, dvm_display_relay_meets_fps,
+        causal_tail, dvm_display_failure, dvm_display_provider_ready, dvm_display_relay_meets_fps,
         dvm_display_relay_ready, dvm_gpu_compositor_ready, dvm_gpu_device, dvm_machine,
-        dvm_physical_frames_ready, dvm_pointer_device, is_sha256, mesa_dri_prime_for_pci_bdf,
+        dvm_physical_frames_ready, dvm_pointer_device, guest_deadline_reached, is_sha256,
+        mesa_dri_prime_for_pci_bdf,
         parse_dvm_control_contract_text, parse_manifest_text, parse_smoke_options,
         physical_gpu_profile, prepare_runtime_log, qemu_display_backend, required_dvm_gpu_ready,
         runtime_stall_or_crash_observed, select_smoke_guest_display,
@@ -112,10 +113,18 @@ mod tests {
     fn interactive_ui_boot_has_an_independent_five_second_gate() {
         assert_eq!(BOOT_TO_UI_HARD_LIMIT_MS, 5_000);
         let source = include_str!("guest.rs");
-        assert!(source.contains("boot_started.elapsed()"));
+        assert!(source.contains("guest_deadline_reached"));
         assert!(source.contains("BOOT_TO_UI_HARD_LIMIT_MS"));
         assert!(source.contains("RUSTOS_GPU_ACTIVE_MARKER"));
         assert!(source.contains("!options.storage_only"));
+        assert!(!guest_deadline_reached(
+            "seq=1 ts_us=4999999 milestone",
+            BOOT_TO_UI_HARD_LIMIT_MS,
+        ));
+        assert!(guest_deadline_reached(
+            "seq=2 ts_us=5000000 milestone",
+            BOOT_TO_UI_HARD_LIMIT_MS,
+        ));
     }
 
     #[test]
@@ -587,7 +596,7 @@ mod tests {
     }
 
     #[test]
-    fn ui_profile_gate_rejects_tremble_loss_and_stalls() {
+    fn ui_runtime_health_rejects_allocator_and_core_service_failure_markers() {
         let healthy = "uiserver profile: elapsed_ms=1000 frame_hz_milli=60000 input_events=60 input_gap_ms=20 input_last_age_ms=5 input_drops=0 input_slow=0 input_errors=0 cursor_mismatches=0 cursor=800,450 presented_cursor=800,450 background_thread_demotions=7 backlog=0 cursor_moves=60\n\
 uiserver profile: elapsed_ms=1000 frame_hz_milli=60000 input_events=60 input_gap_ms=20 input_last_age_ms=5 input_drops=0 input_slow=0 input_errors=0 cursor_mismatches=0 cursor=992,450 presented_cursor=992,450 background_thread_demotions=7 backlog=0 cursor_moves=60\n\
 uiserver profile: elapsed_ms=1000 frame_hz_milli=60000 input_events=60 input_gap_ms=20 input_last_age_ms=5 input_drops=0 input_slow=0 input_errors=0 cursor_mismatches=0 cursor=992,642 presented_cursor=992,642 background_thread_demotions=7 backlog=0 cursor_moves=60";
@@ -617,9 +626,33 @@ uiserver profile: elapsed_ms=1000 frame_hz_milli=60000 input_events=60 input_gap
         assert!(runtime_stall_or_crash_observed(
             "[drm:virtio_gpu_dequeue_ctrl_func] *ERROR* response 0x1200 (command 0x105)"
         ));
+        assert!(runtime_stall_or_crash_observed(
+            "memory allocation of 1664000 bytes failed"
+        ));
+        assert!(runtime_stall_or_crash_observed(
+            "initd: fatal service endpoint not ready exec=services/runtimed/runtimed.elf"
+        ));
         assert!(!runtime_stall_or_crash_observed(
             "uiserver: panic hook installed"
         ));
+    }
+
+    #[test]
+    fn failure_evidence_keeps_only_bounded_causal_records() {
+        let rustos = "unrelated payload\n\
+milestone: name=product-root-core-ready pid=1 tid=1 ts_us=100\n\
+vfsd: volume-read begin path=apps/wayclick/wayclick.elf ts_us=200";
+        let dvm = "rustos-dvm-block: ready abi=2 generation=1 ts_us=150\nsecret payload";
+        let events = causal_tail(rustos, dvm);
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].guest_ts_us, Some(100));
+        assert_eq!(events[1].guest_ts_us, Some(150));
+        assert_eq!(events[2].guest_ts_us, Some(200));
+        assert!(
+            events
+                .iter()
+                .all(|event| !event.record.contains("unrelated") && !event.record.contains("secret"))
+        );
     }
 
     #[test]

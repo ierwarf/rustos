@@ -721,10 +721,29 @@ pub fn enqueue_endpoint_call_with_handles(
     request: &[u8],
     attached_handles: &[KernelTransferredHandle],
 ) -> Result<(KernelReplyHandle, Option<u64>), IpcError> {
+    enqueue_endpoint_call_with_handles_faultable(
+        endpoint,
+        caller_task_id,
+        request,
+        attached_handles,
+        rustos_fault_injection::should_fail("ipc.endpoint.enqueue"),
+    )
+}
+
+fn enqueue_endpoint_call_with_handles_faultable(
+    endpoint: KernelEndpointHandle,
+    caller_task_id: u64,
+    request: &[u8],
+    attached_handles: &[KernelTransferredHandle],
+    injected_failure: bool,
+) -> Result<(KernelReplyHandle, Option<u64>), IpcError> {
     if request.is_empty() || request.len() > MAX_ENDPOINT_INLINE_MESSAGE_BYTES {
         return Err(IpcError::InvalidArgument);
     }
     validate_endpoint_transfer_handles(attached_handles)?;
+    if injected_failure {
+        return Err(IpcError::NoMemory);
+    }
 
     with_ipc_objects(|objects| {
         let Some(endpoint_object) = objects.endpoints.get(&endpoint.raw()) else {
@@ -948,10 +967,27 @@ pub fn complete_endpoint_reply_with_handles(
     response: &[u8],
     attached_handles: &[KernelTransferredHandle],
 ) -> Result<u64, IpcError> {
+    complete_endpoint_reply_with_handles_faultable(
+        reply,
+        response,
+        attached_handles,
+        rustos_fault_injection::should_fail("ipc.endpoint.reply"),
+    )
+}
+
+fn complete_endpoint_reply_with_handles_faultable(
+    reply: KernelReplyHandle,
+    response: &[u8],
+    attached_handles: &[KernelTransferredHandle],
+    injected_failure: bool,
+) -> Result<u64, IpcError> {
     if response.len() > MAX_ENDPOINT_INLINE_MESSAGE_BYTES {
         return Err(IpcError::InvalidArgument);
     }
     validate_endpoint_transfer_handles(attached_handles)?;
+    if injected_failure {
+        return Err(IpcError::NoMemory);
+    }
 
     with_ipc_objects(|objects| {
         let Some(reply_object) = objects.replies.get_mut(&reply.raw()) else {
@@ -1040,10 +1076,29 @@ fn complete_endpoint_reply_with_handles_for_owner(
     response: &[u8],
     attached_handles: &[KernelTransferredHandle],
 ) -> Result<u64, IpcError> {
+    complete_endpoint_reply_with_handles_for_owner_faultable(
+        reply,
+        receiver_owner,
+        response,
+        attached_handles,
+        rustos_fault_injection::should_fail("ipc.endpoint.reply"),
+    )
+}
+
+fn complete_endpoint_reply_with_handles_for_owner_faultable(
+    reply: KernelReplyHandle,
+    receiver_owner: EndpointOwner,
+    response: &[u8],
+    attached_handles: &[KernelTransferredHandle],
+    injected_failure: bool,
+) -> Result<u64, IpcError> {
     if response.len() > MAX_ENDPOINT_INLINE_MESSAGE_BYTES {
         return Err(IpcError::InvalidArgument);
     }
     validate_endpoint_transfer_handles(attached_handles)?;
+    if injected_failure {
+        return Err(IpcError::NoMemory);
+    }
 
     with_ipc_objects(|objects| {
         let Some(reply_object) = objects.replies.get_mut(&reply.raw()) else {
@@ -1781,6 +1836,42 @@ mod tests {
                 super::take_endpoint_response(reply),
                 Err(IpcError::InvalidHandle)
             );
+        });
+    }
+
+    #[test]
+    fn endpoint_fault_boundaries_fail_before_queue_or_reply_mutation() {
+        with_isolated_ipc_test(|| {
+            let endpoint = super::create_endpoint().expect("create endpoint");
+            assert_eq!(
+                super::enqueue_endpoint_call_with_handles_faultable(
+                    endpoint,
+                    41,
+                    b"request",
+                    &[],
+                    true,
+                ),
+                Err(IpcError::NoMemory)
+            );
+            assert_eq!(recv_endpoint(endpoint), Ok(None));
+
+            let (reply, _) =
+                super::enqueue_endpoint_call(endpoint, 41, b"request").expect("enqueue call");
+            let (server_reply, _) = recv_endpoint(endpoint)
+                .expect("receive result")
+                .expect("receive queued request");
+            assert_eq!(server_reply, reply);
+            assert_eq!(
+                super::complete_endpoint_reply_with_handles_faultable(
+                    reply,
+                    b"response",
+                    &[],
+                    true,
+                ),
+                Err(IpcError::NoMemory)
+            );
+            assert_eq!(super::take_endpoint_response(reply), Ok(None));
+            assert_eq!(super::complete_endpoint_reply(reply, b"response"), Ok(41));
         });
     }
 

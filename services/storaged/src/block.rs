@@ -11,7 +11,6 @@ use rustos_user_abi::syscall::{
 };
 
 const COMPLETION_TIMEOUT: Duration = Duration::from_secs(15);
-const STARTUP_READY_TIMEOUT: Duration = Duration::from_secs(15);
 const WAIT_SLICE_MILLIS: u64 = 1_000;
 const READ_CACHE_WINDOW_LIMIT: usize = 8;
 const READ_AHEAD_IN_FLIGHT_LIMIT: usize = READ_CACHE_WINDOW_LIMIT;
@@ -185,8 +184,7 @@ pub(super) fn info() -> Result<BlockInfo, i32> {
 /// Wait for asynchronous DVM bringup with the kernel's atomic
 /// check-arm-recheck waiter. Only the singleton readiness supervisor uses this
 /// path, never a caller-owned storage RPC turn.
-pub(super) fn wait_until_ready() -> Result<BlockInfo, i32> {
-    let deadline = Instant::now() + STARTUP_READY_TIMEOUT;
+pub(super) fn wait_until_ready(deadline: Instant) -> Result<BlockInfo, i32> {
     loop {
         match info_once() {
             Ok(info) => return Ok(info),
@@ -443,6 +441,10 @@ fn clear_read_cache() {
 }
 
 pub(super) fn flush(expected_generation: u64) -> Result<(), i32> {
+    flush_before(expected_generation, Instant::now() + COMPLETION_TIMEOUT)
+}
+
+pub(super) fn flush_before(expected_generation: u64, deadline: Instant) -> Result<(), i32> {
     require_generation(info()?, expected_generation)?;
     let mut ticket = DvmBlockTicketWire::default();
     let args = RustosBlockBrokerArgs {
@@ -453,7 +455,7 @@ pub(super) fn flush(expected_generation: u64) -> Result<(), i32> {
     };
     syscall_block(&args)?;
     validate_ticket(ticket)?;
-    wait_and_collect(ticket, None)
+    wait_and_collect_before(ticket, None, deadline)
 }
 
 fn submit(
@@ -481,12 +483,16 @@ fn submit(
     Ok(ticket)
 }
 
-fn wait_and_collect(
+fn wait_and_collect(ticket: DvmBlockTicketWire, read_buffer: Option<&mut [u8]>) -> Result<(), i32> {
+    wait_and_collect_before(ticket, read_buffer, Instant::now() + COMPLETION_TIMEOUT)
+}
+
+fn wait_and_collect_before(
     ticket: DvmBlockTicketWire,
     mut read_buffer: Option<&mut [u8]>,
+    deadline: Instant,
 ) -> Result<(), i32> {
     validate_ticket(ticket)?;
-    let deadline = Instant::now() + COMPLETION_TIMEOUT;
     loop {
         let (buffer_ptr, buffer_len) = read_buffer.as_deref_mut().map_or((0, 0), |buffer| {
             (buffer.as_mut_ptr() as u64, buffer.len() as u64)

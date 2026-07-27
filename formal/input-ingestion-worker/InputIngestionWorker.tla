@@ -23,12 +23,14 @@ establish policy readiness, but after that point they cannot be required for
 consumer progress, and they can never advance the fixed-ring cursor.
 *******************************************************************************)
 
-CONSTANTS Slots, Batch, MaxProduced, MaxClientPolls
+CONSTANTS Slots, Batch, MaxProduced, MaxClientPolls, MaxWakeGeneration
 
 NoOwner == "none"
 WorkerOwner == "inputd-ingestion-worker"
 Waiting == "waiting"
 Draining == "draining"
+Syncing == "syncing-authority"
+Exited == "exited"
 
 VARIABLES policyConsumerReady, workerState, producer, consumer, irqPending,
           consumerWakeGeneration, notifiedWakeGeneration,
@@ -71,6 +73,7 @@ ArmIngestionWorker ==
     /\ workerState = Waiting
     /\ inputdWakeSlot = NoOwner
     /\ consumer = producer
+    /\ consumerWakeGeneration < MaxWakeGeneration
     /\ inputdWakeSlot' = WorkerOwner
     /\ consumerWakeGeneration' = consumerWakeGeneration + 1
     /\ UNCHANGED <<policyConsumerReady, workerState, producer, consumer,
@@ -81,7 +84,7 @@ ArmIngestionWorker ==
 \* one slot reserved for authenticated cleanup.
 Produce ==
     /\ policyConsumerReady
-    /\ workerState \in {Waiting, Draining}
+    /\ workerState \in {Waiting, Draining, Syncing}
     /\ producer < MaxProduced
     /\ Outstanding < NormalCapacity
     /\ producer' = producer + 1
@@ -151,6 +154,53 @@ DrainOne ==
                   consumerWakeGeneration, notifiedWakeGeneration,
                   clientPolls, inputdWakeSlot>>
 
+\* Session start/end synchronizes the authenticated DVM epoch with netd.
+\* `Syncing` denotes that inputd has released its policy queue lock before the
+\* bounded cross-service IPC. A sync failure resets the uncommitted decoder
+\* session and resumes draining; it cannot kill the sole ring consumer.
+BeginAuthoritySync ==
+    /\ workerState = Draining
+    /\ workerState' = Syncing
+    /\ UNCHANGED <<policyConsumerReady, producer, consumer, irqPending,
+                  consumerWakeGeneration, notifiedWakeGeneration,
+                  batchRemaining, clientPolls, inputdWakeSlot,
+                  lastConsumerOwner>>
+
+\* Success and failure both settle the in-flight IPC before the worker resumes.
+\* The source witnesses distinguish decoder reset; the composition needs only
+\* the common lifecycle edge because neither outcome owns ring progress.
+SettleAuthoritySync ==
+    /\ workerState = Syncing
+    /\ workerState' = Draining
+    /\ UNCHANGED <<policyConsumerReady, producer, consumer, irqPending,
+                  consumerWakeGeneration, notifiedWakeGeneration,
+                  batchRemaining, clientPolls, inputdWakeSlot,
+                  lastConsumerOwner>>
+
+\* Process-exit cleanup revokes the service endpoint and the independent fixed
+\* ring producer-admission lease as one lifecycle transition. Records admitted
+\* for the dead owner are retired before a replacement worker may rearm.
+ConsumerOwnerExit ==
+    /\ workerState \in {Waiting, Draining, Syncing}
+    /\ policyConsumerReady' = FALSE
+    /\ workerState' = Exited
+    /\ consumer' = producer
+    /\ irqPending' = FALSE
+    /\ inputdWakeSlot' = NoOwner
+    /\ batchRemaining' = 0
+    /\ UNCHANGED <<producer, consumerWakeGeneration,
+                  notifiedWakeGeneration, clientPolls,
+                  lastConsumerOwner>>
+
+RestartWorker ==
+    /\ workerState = Exited
+    /\ ~policyConsumerReady
+    /\ workerState' = Waiting
+    /\ UNCHANGED <<policyConsumerReady, producer, consumer, irqPending,
+                  consumerWakeGeneration, notifiedWakeGeneration,
+                  batchRemaining, clientPolls, inputdWakeSlot,
+                  lastConsumerOwner>>
+
 FinishBoundedBatch ==
     /\ workerState = Draining
     /\ batchRemaining = 0 \/ consumer = producer
@@ -178,17 +228,21 @@ Next ==
     \/ WatchdogWakeIngestionWorker
     \/ ObserveBacklogWithoutSleep
     \/ DrainOne
+    \/ BeginAuthoritySync
+    \/ SettleAuthoritySync
+    \/ ConsumerOwnerExit
+    \/ RestartWorker
     \/ FinishBoundedBatch
     \/ ClientPoll
 
 TypeOK ==
     /\ policyConsumerReady \in BOOLEAN
-    /\ workerState \in {Waiting, Draining}
+    /\ workerState \in {Waiting, Draining, Syncing, Exited}
     /\ producer \in 0..MaxProduced
     /\ consumer \in 0..MaxProduced
     /\ irqPending \in BOOLEAN
-    /\ consumerWakeGeneration \in Nat
-    /\ notifiedWakeGeneration \in Nat
+    /\ consumerWakeGeneration \in 0..MaxWakeGeneration
+    /\ notifiedWakeGeneration \in 0..MaxWakeGeneration
     /\ notifiedWakeGeneration <= consumerWakeGeneration
     /\ batchRemaining \in 0..Batch
     /\ clientPolls \in 0..MaxClientPolls
@@ -200,7 +254,7 @@ CursorBound ==
     /\ Outstanding <= Slots
 
 AdmissionHasIndependentConsumer ==
-    policyConsumerReady => workerState \in {Waiting, Draining}
+    policyConsumerReady => workerState \in {Waiting, Draining, Syncing}
 
 OnlyWorkerAdvancesConsumer ==
     lastConsumerOwner \in {NoOwner, WorkerOwner}
@@ -211,7 +265,10 @@ BoundedWorkerTurn ==
 
 DedicatedWakeSlot ==
     /\ workerState = Waiting => inputdWakeSlot \in {NoOwner, WorkerOwner}
-    /\ workerState = Draining => inputdWakeSlot = NoOwner
+    /\ workerState \in {Draining, Syncing, Exited} => inputdWakeSlot = NoOwner
+
+ExitedWorkerCannotRetainProducerAdmission ==
+    workerState = Exited => ~policyConsumerReady
 
 ClientPollCannotOwnProgress ==
     /\ clientPolls \in 0..MaxClientPolls
@@ -224,10 +281,14 @@ Spec ==
     /\ WF_vars(WatchdogWakeIngestionWorker)
     /\ WF_vars(ObserveBacklogWithoutSleep)
     /\ WF_vars(DrainOne)
+    /\ WF_vars(SettleAuthoritySync)
+    /\ WF_vars(ConsumerOwnerExit)
+    /\ WF_vars(RestartWorker)
     /\ WF_vars(FinishBoundedBatch)
 
 \* Since L0 has a finite admitted production budget in this model, every
-\* outstanding record drains without relying on a later app poll.
-RingEventuallyDrains ==
-    []((consumer < producer) => <>(consumer = producer))
+\* outstanding record drains or loses producer admission through the exact
+\* policy-owner failure terminal, without relying on a later app poll.
+RingEventuallySettles ==
+    []((consumer < producer) => <>(consumer = producer \/ ~policyConsumerReady))
 =============================================================================

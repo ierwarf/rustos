@@ -587,7 +587,7 @@ fn build_linux_process_image(
 }
 
 /// Pre-map a fixed bootstrap heap region for static-PIE policy services so
-/// `rustos-svc-runtime` can hand the address out to its bump allocator before
+/// `rustos-svc-runtime` can seed its reclaiming allocator before
 /// any of the dynamic Linux runtime (and thus syscalld/vfsd) is available.
 /// Modeled on the seL4 BootInfo pattern where the kernel hands the root task
 /// pre-existing memory caps. Idempotent on failure: errors propagate as

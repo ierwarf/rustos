@@ -22,6 +22,9 @@ const TARGET_GOAL: u32 = 20;
 const BTN_LEFT: u32 = 0x110;
 const SHM_BUFFER_COUNT: usize = 2;
 const SYS_RUSTOS_DEBUG_PRINT: usize = 0x5255_0001;
+const SYS_RUSTOS_PRODUCT_MILESTONE: usize = 0x5255_0046;
+const PRODUCT_MILESTONE_FIRST_FRAME: usize = 5;
+const FIRST_FRAME_PRESENTED_MARKER: &str = "wayclick: first frame presented";
 const DEFAULT_XDG_RUNTIME_DIR: &str = "/run/user/1000";
 const DEFAULT_WAYLAND_DISPLAY: &str = "wayland-0";
 
@@ -72,6 +75,23 @@ unsafe fn syscall2(number: usize, arg0: usize, arg1: usize) -> isize {
             inlateout("rax") number as isize => result,
             in("rdi") arg0 as isize,
             in("rsi") arg1 as isize,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    result
+}
+
+unsafe fn syscall3(number: usize, arg0: usize, arg1: usize, arg2: usize) -> isize {
+    let result: isize;
+    unsafe {
+        asm!(
+            "syscall",
+            inlateout("rax") number as isize => result,
+            in("rdi") arg0 as isize,
+            in("rsi") arg1 as isize,
+            in("rdx") arg2 as isize,
             lateout("rcx") _,
             lateout("r11") _,
             options(nostack),
@@ -453,6 +473,14 @@ mod damage_tests {
         damage.mark_full();
         assert_eq!(damage.take(), Some((0, 0, WIDTH as i32, HEIGHT as i32)));
     }
+
+    #[test]
+    fn first_frame_marker_is_the_user_visible_boot_terminal() {
+        assert_eq!(
+            FIRST_FRAME_PRESENTED_MARKER,
+            "wayclick: first frame presented"
+        );
+    }
 }
 
 struct FrameProfile {
@@ -828,6 +856,15 @@ impl Dispatch<wl_callback::WlCallback, ()> for GameState {
                 state.frame_callback = None;
                 if !state.first_frame_presented {
                     state.first_frame_presented = true;
+                    let _ = unsafe {
+                        syscall3(
+                            SYS_RUSTOS_PRODUCT_MILESTONE,
+                            PRODUCT_MILESTONE_FIRST_FRAME,
+                            0,
+                            0,
+                        )
+                    };
+                    raw_stderr_line(FIRST_FRAME_PRESENTED_MARKER);
                     if state.auto_exit_after_first_frame {
                         raw_stderr_line("wayclick: auto-exit after first frame");
                         state.running = false;

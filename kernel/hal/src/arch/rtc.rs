@@ -36,6 +36,7 @@ static RTC_LAST_INPUT_PACKET_SUBMIT_COUNT: AtomicU64 = AtomicU64::new(0);
 static RTC_LAST_INPUT_READ_CALL_COUNT: AtomicU64 = AtomicU64::new(0);
 static RTC_LAST_INPUT_READ_EVENT_COUNT: AtomicU64 = AtomicU64::new(0);
 static RTC_LAST_LINUX_IRQ_LOCK_DEPTH: AtomicU64 = AtomicU64::new(0);
+static RTC_SLEEP_LOCK_MISSES: AtomicU64 = AtomicU64::new(0);
 static RTC_SLEEP_WAITERS: Mutex<SleepWaiterTable> = Mutex::new(SleepWaiterTable::new());
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -533,16 +534,39 @@ pub fn arm_sleep_waiter_until_tick(task_id: u64, wake_tick: u64) -> bool {
 }
 
 pub fn disarm_sleep_waiter(task_id: u64) {
+    #[cfg(target_os = "none")]
     interrupts::without_interrupts(|| RTC_SLEEP_WAITERS.lock().remove_task(task_id));
+    #[cfg(not(target_os = "none"))]
+    RTC_SLEEP_WAITERS.lock().remove_task(task_id);
 }
 
 fn wake_ready_sleepers(now: u64) {
     loop {
-        let Some(task_id) = RTC_SLEEP_WAITERS.lock().take_ready(now) else {
+        // Clockevent handlers must never spin on state owned by the
+        // interrupted context. Registration/cancellation mask interrupts
+        // while mutating the table, so a transient collision is safely
+        // retried by the next PIT/RTC edge. This keeps one late clockevent
+        // from turning a bounded sleeper deadline into a system-wide lockup.
+        let Some(ready_task) = try_take_ready_sleep_waiter(&RTC_SLEEP_WAITERS, now) else {
+            if RTC_SLEEP_LOCK_MISSES.fetch_add(1, Ordering::Relaxed) == 0 {
+                crate::debug::println!("rtc: sleep-waiter lock collision deferred");
+            }
+            return;
+        };
+        let Some(task_id) = ready_task else {
             return;
         };
         let _ = crate::hooks::wake_user_task(task_id);
     }
+}
+
+/// `None` means the table is transiently owned by process context and the
+/// interrupt must return without spinning. `Some(None)` means the table was
+/// observed and contains no expired task.
+fn try_take_ready_sleep_waiter(waiters: &Mutex<SleepWaiterTable>, now: u64) -> Option<Option<u64>> {
+    waiters
+        .try_lock()
+        .map(|mut waiters| waiters.take_ready(now))
 }
 
 #[cfg(test)]
@@ -633,5 +657,42 @@ mod tests {
         assert_eq!(sleep_deadline_from_ticks(10_000, 1), 10_002);
         assert_eq!(sleep_deadline_from_ticks(10_000, 8), 10_009);
         assert_eq!(sleep_deadline_from_ticks(u64::MAX - 1, 1), u64::MAX);
+    }
+
+    #[test]
+    fn sleep_waiter_update_expiry_and_cancel_preserve_exact_task_ownership() {
+        let mut waiters = SleepWaiterTable::new();
+        assert!(waiters.insert_or_update(SleepWaiter {
+            task_id: 41,
+            wake_tick: 10,
+        }));
+        assert!(waiters.insert_or_update(SleepWaiter {
+            task_id: 42,
+            wake_tick: 5,
+        }));
+        assert!(waiters.insert_or_update(SleepWaiter {
+            task_id: 41,
+            wake_tick: 3,
+        }));
+
+        assert_eq!(waiters.take_ready(2), None);
+        assert_eq!(waiters.take_ready(3), Some(41));
+        waiters.remove_task(42);
+        assert_eq!(waiters.take_ready(u64::MAX), None);
+    }
+
+    #[test]
+    fn sleep_waiter_clockevent_collision_is_nonblocking_and_retryable() {
+        let waiters = Mutex::new(SleepWaiterTable::new());
+        {
+            let mut owner = waiters.lock();
+            assert!(owner.insert_or_update(SleepWaiter {
+                task_id: 77,
+                wake_tick: 4,
+            }));
+            assert_eq!(try_take_ready_sleep_waiter(&waiters, 4), None);
+        }
+        assert_eq!(try_take_ready_sleep_waiter(&waiters, 4), Some(Some(77)));
+        assert_eq!(try_take_ready_sleep_waiter(&waiters, 4), Some(None));
     }
 }

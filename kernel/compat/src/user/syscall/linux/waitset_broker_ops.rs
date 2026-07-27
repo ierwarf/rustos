@@ -88,6 +88,20 @@ pub(crate) fn register_waitset_waiters(
     process_id: u64,
     observations: &[ProviderObservation],
 ) -> Result<(), i64> {
+    register_waitset_waiters_faultable(
+        task_id,
+        process_id,
+        observations,
+        nucleus_core::util::fault_injection::should_fail("waitset.register"),
+    )
+}
+
+fn register_waitset_waiters_faultable(
+    task_id: u64,
+    process_id: u64,
+    observations: &[ProviderObservation],
+    injected_failure: bool,
+) -> Result<(), i64> {
     if task_id == 0
         || process_id == 0
         || observations.is_empty()
@@ -100,6 +114,9 @@ pub(crate) fn register_waitset_waiters(
         })
     {
         return Err(LINUX_EINVAL);
+    }
+    if injected_failure {
+        return Err(LINUX_EBUSY);
     }
     let mut waiters = WAITSET_WAITERS.lock();
     for slot in waiters.iter_mut() {
@@ -255,8 +272,9 @@ mod tests {
     use super::{
         ProviderObservation, WAITSET_WAITER_CAPACITY, acquire_input_open_description,
         generation_advances, input_open_description_access, provider_for_service,
-        register_input_open_description, register_waitset_waiters, release_input_open_description,
-        remove_waitset_waiters, service_for_provider, waitset_waiters_match,
+        register_input_open_description, register_waitset_waiters,
+        register_waitset_waiters_faultable, release_input_open_description, remove_waitset_waiters,
+        service_for_provider, waitset_waiters_match,
     };
     use rustos_user_abi::syscall::{
         INPUTD_ACCESS_EVDEV, IPC_SERVICE_INPUTD, IPC_SERVICE_NETD, IPC_SERVICE_SESSIOND,
@@ -339,5 +357,29 @@ mod tests {
         assert!(waitset_waiters_match(task_id, process_id, &observations));
         remove_waitset_waiters(task_id);
         assert!(!waitset_waiters_match(task_id, process_id, &observations));
+    }
+
+    #[test]
+    fn waitset_registration_fault_preserves_existing_observations() {
+        let task_id = u64::MAX - 201;
+        let process_id = u64::MAX - 202;
+        let original = [ProviderObservation {
+            provider: WAITSET_PROVIDER_NETD,
+            object_id: WAITSET_GLOBAL_OBJECT_ID,
+            generation: 11,
+        }];
+        let replacement = [ProviderObservation {
+            provider: WAITSET_PROVIDER_VFSD,
+            object_id: WAITSET_GLOBAL_OBJECT_ID,
+            generation: 12,
+        }];
+        register_waitset_waiters(task_id, process_id, &original).expect("register waiter");
+        assert_eq!(
+            register_waitset_waiters_faultable(task_id, process_id, &replacement, true),
+            Err(super::LINUX_EBUSY)
+        );
+        assert!(waitset_waiters_match(task_id, process_id, &original));
+        assert!(!waitset_waiters_match(task_id, process_id, &replacement));
+        remove_waitset_waiters(task_id);
     }
 }

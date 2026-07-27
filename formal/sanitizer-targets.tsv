@@ -1,0 +1,22 @@
+# id	sanitizer	package	features	test_target	severity	owner
+address-driver-protocol	address	driver-domain-protocol	std	lib	critical	dvm-contract
+address-image-admission	address	rustos-image-admission	-	lib	critical	loaderd
+address-ipc-runtime	address	kernel-ipc-runtime	host-test	lib	critical	kernel-ipc-runtime
+address-kernel-compat	address	kernel-compat	-	lib	critical	kernel-compat
+address-kernel-io-manager	address	kernel-io-manager	-	lib	critical	kernel-io-manager
+address-kernel-mm	address	kernel-mm	-	lib	critical	kernel-mm
+address-kernel-ps	address	kernel-ps	-	lib	critical	kernel-ps
+address-rootd	address	rootd	host-test	all	critical	rootd
+address-runtime-control	address	runtime-control	-	lib	high	runtimed
+address-service-runtime	address	rustos-svc-runtime	-	lib	critical	service-runtime
+address-storage-core	address	storage-core	-	lib	critical	storaged
+address-syscalld	address	syscalld	-	lib	critical	syscalld
+address-vfsd	address	vfsd	-	lib	critical	vfsd
+thread-ipc-runtime	thread	kernel-ipc-runtime	host-test	lib	critical	kernel-ipc-runtime
+thread-kernel-compat	thread	kernel-compat	-	lib	critical	kernel-compat
+thread-kernel-io-manager	thread	kernel-io-manager	-	lib	critical	kernel-io-manager
+thread-kernel-mm	thread	kernel-mm	-	lib	critical	kernel-mm
+thread-kernel-ps	thread	kernel-ps	-	lib	critical	kernel-ps
+thread-rootd	thread	rootd	host-test	all	critical	rootd
+thread-runtime-control	thread	runtime-control	-	lib	high	runtimed
+thread-service-runtime	thread	rustos-svc-runtime	-	lib	critical	service-runtime

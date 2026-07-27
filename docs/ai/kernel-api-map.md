@@ -63,7 +63,10 @@ Do not reorder without reading `kernel/src/main.rs` and
   `STATS` request and arms `input::event_queue` waiters. Only inputd's
   capability-gated ingest broker drains the bounded L0-owned input ring. The
   one MSI-X leaf only wakes; it never decodes. There is no USB, PS/2, serial,
-  or native fallback.
+  or native fallback. Compat process-exit cleanup invokes
+  `input::transport::withdraw_policy_consumer` only when the live inputd
+  endpoint owner exits; this clears producer admission and old-owner records
+  without moving decode or input policy into ring0.
 - **Scheduler preemption:** `cond_resched`/`reschedule_if_requested` only at
   Linux-style safe points outside spinlocked or IRQ-off regions. Timer IRQs
   should request reschedule for user-task kernel frames, not blindly switch

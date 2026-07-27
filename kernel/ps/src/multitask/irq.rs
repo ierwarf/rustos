@@ -5,8 +5,6 @@ use super::{
     scheduler::Scheduler, scheduler_initialized, scheduler_mut,
 };
 
-const USER_RETURN_RESCHEDULE_MICROS: u64 = 100;
-
 pub fn timer_interrupt_handler_addr() -> u64 {
     crate::lowlevel::interrupts::timer_interrupt_handler_addr()
 }
@@ -45,11 +43,10 @@ extern "C" fn timer_interrupt_dispatch(context_ptr: *mut SavedContext) -> *mut S
             crate::arch::pic::send_eoi(crate::arch::pic::PIC_1_OFFSET);
             return context_ptr;
         }
-        // A voluntary userspace yield cannot switch from its syscall kernel
-        // continuation: doing so saves an IF-cleared kernel frame and can
-        // strand every runnable user task. The short PIT edge is armed in the
-        // syscall and consumed only after an interrupt observes a user frame.
+        // A real user-frame clockevent consumes any request not already
+        // serviced by the IF-enabled common syscall tail.
         USER_RETURN_RESCHEDULE_ARMED.store(0, core::sync::atomic::Ordering::Release);
+        DEFERRED_RESCHEDULE_REQUESTED.store(0, core::sync::atomic::Ordering::Release);
         scheduler.save_current_simd_state();
         let (next_rsp, next_pit_divisor) = scheduler.on_timer_interrupt(current_rsp);
         crate::arch::pit::set_divisor(0, next_pit_divisor);
@@ -89,6 +86,7 @@ extern "C" fn rtc_interrupt_dispatch(context_ptr: *mut SavedContext) -> *mut Sav
 
     let next_rsp = unsafe {
         let scheduler = scheduler_mut();
+        DEFERRED_RESCHEDULE_REQUESTED.store(0, core::sync::atomic::Ordering::Release);
         scheduler.save_current_simd_state();
         let (next_rsp, _next_pit_divisor) = scheduler.on_timer_interrupt(current_rsp);
         scheduler.prepare_current_task_execution();
@@ -125,32 +123,38 @@ pub fn cond_resched() {
     reschedule_if_requested();
 }
 
-pub fn clear_deferred_reschedule_request() {
-    DEFERRED_RESCHEDULE_REQUESTED.store(0, core::sync::atomic::Ordering::Release);
+/// Consume a timer or latency-handoff request from the common syscall tail.
+///
+/// The syscall entry deliberately executes with IF=1. A software interrupt
+/// raised here therefore saves an IF-enabled kernel continuation, so the
+/// scheduler may switch away and later resume it safely. Clearing the request
+/// without switching starves peer services; programming a short periodic PIT
+/// instead creates a VM-exit storm under long syscalls.
+pub fn reschedule_deferred_from_interruptible_syscall() {
+    if consume_syscall_tail_reschedule(
+        &DEFERRED_RESCHEDULE_REQUESTED,
+        &USER_RETURN_RESCHEDULE_ARMED,
+    ) {
+        crate::lowlevel::interrupts::trigger_software_schedule_interruptible();
+    }
+}
+
+fn consume_syscall_tail_reschedule(
+    deferred: &core::sync::atomic::AtomicU64,
+    user_return: &core::sync::atomic::AtomicU64,
+) -> bool {
+    let deferred = deferred.swap(0, core::sync::atomic::Ordering::AcqRel);
+    let user_return = user_return.swap(0, core::sync::atomic::Ordering::AcqRel);
+    deferred != 0 || user_return != 0
 }
 
 pub(crate) fn request_deferred_reschedule() {
     DEFERRED_RESCHEDULE_REQUESTED.store(1, core::sync::atomic::Ordering::Release);
 }
 
-/// Requests a voluntary switch at the first timer edge that observes a user
-/// frame. Reprogramming is one-shot: a tight sched_yield loop cannot keep
-/// pushing the deadline away by restarting the PIT counter on every syscall.
+/// Requests a voluntary switch in the common interruptible syscall tail.
 pub(crate) fn request_user_return_reschedule() {
-    if USER_RETURN_RESCHEDULE_ARMED
-        .compare_exchange(
-            0,
-            1,
-            core::sync::atomic::Ordering::AcqRel,
-            core::sync::atomic::Ordering::Acquire,
-        )
-        .is_ok()
-    {
-        crate::arch::pit::set_divisor(
-            0,
-            crate::arch::pit::divisor_from_micros(USER_RETURN_RESCHEDULE_MICROS),
-        );
-    }
+    USER_RETURN_RESCHEDULE_ARMED.store(1, core::sync::atomic::Ordering::Release);
 }
 
 extern "C" fn software_schedule_interrupt_dispatch(
@@ -179,4 +183,28 @@ pub fn yield_now() {
     interrupts::without_interrupts(|| {
         crate::lowlevel::interrupts::trigger_software_schedule();
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    use super::consume_syscall_tail_reschedule;
+
+    #[test]
+    fn syscall_tail_consumes_every_deferred_or_handoff_request_exactly_once() {
+        let deferred = AtomicU64::new(0);
+        let handoff = AtomicU64::new(0);
+        assert!(!consume_syscall_tail_reschedule(&deferred, &handoff));
+
+        deferred.store(1, Ordering::Release);
+        assert!(consume_syscall_tail_reschedule(&deferred, &handoff));
+        assert!(!consume_syscall_tail_reschedule(&deferred, &handoff));
+
+        deferred.store(1, Ordering::Release);
+        handoff.store(1, Ordering::Release);
+        assert!(consume_syscall_tail_reschedule(&deferred, &handoff));
+        assert_eq!(deferred.load(Ordering::Acquire), 0);
+        assert_eq!(handoff.load(Ordering::Acquire), 0);
+    }
 }

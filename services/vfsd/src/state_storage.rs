@@ -289,6 +289,7 @@ impl VfsState {
             return Err(EINVAL);
         }
         let path = normalize_absolute_path("/", raw_path)?;
+        let early_system_owned = early_system::file_len(path.as_str())?.is_some();
 
         self.invalidate_caches_if_remounted();
         if let Some(snapshot) = self.executable_snapshot_cache.get(path.as_str()).copied() {
@@ -307,6 +308,15 @@ impl VfsState {
             return Err(if metadata.len == 0 { ENOEXEC } else { EOVERFLOW });
         }
         let file_len = usize::try_from(metadata.len).map_err(|_| EOVERFLOW)?;
+        if !early_system_owned {
+            ipc::debug_line(
+                format!(
+                    "vfsd: executable snapshot volume-read begin path={} bytes={file_len}",
+                    path.as_str()
+                )
+                .as_str(),
+            );
+        }
         let mut bytes = Vec::new();
         bytes.try_reserve_exact(file_len).map_err(|_| ENOMEM)?;
         bytes.resize(file_len, 0);
@@ -314,7 +324,24 @@ impl VfsState {
         if read != file_len {
             return Err(EIO);
         }
+        if !early_system_owned {
+            ipc::debug_line(
+                format!(
+                    "vfsd: executable snapshot volume-read done path={} bytes={read}",
+                    path.as_str()
+                )
+                .as_str(),
+            );
+        }
         let fd = create_terminally_sealed_snapshot(path.as_str(), bytes.as_slice())?;
+        if !early_system_owned {
+            ipc::debug_line(executable_snapshot_marker(path.as_str(), file_len).as_str());
+            let _ = ipc::product_milestone(
+                PRODUCT_MILESTONE_EXECUTABLE_SNAPSHOT_SEALED,
+                file_len as u64,
+                0,
+            );
+        }
 
         if file_len > EXECUTABLE_SNAPSHOT_CACHE_BUDGET_BYTES {
             return Ok(ExecutableSnapshotOpen {

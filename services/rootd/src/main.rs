@@ -8,15 +8,11 @@ extern crate alloc;
 
 mod service_checkpoint;
 
-#[cfg(not(test))]
-use core::alloc::{GlobalAlloc, Layout};
 use core::arch::asm;
 use core::cell::UnsafeCell;
 use core::mem::size_of;
 #[cfg(not(test))]
 use core::panic::PanicInfo;
-#[cfg(not(test))]
-use core::ptr;
 use core::slice;
 use core::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 
@@ -42,14 +38,15 @@ use rustos_user_abi::syscall::{
     IPC_SERVICE_VFSD, LIFECYCLE_DRAIN_BROKER_ABI_VERSION, LIFECYCLE_DRAIN_MAX_EVENTS,
     LIFECYCLE_EVENT_EXIT, LOADER_OP_ACTIVATE, LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION,
     LOADER_SPAWN_ARG_BYTES, LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_EXEC_PATH_CAPACITY,
-    LOADER_SPAWN_FLAG_DEFER_START, ROOTD_LEASE_STATE_EXITED, ROOTD_LEASE_STATE_FAILED,
-    ROOTD_LEASE_STATE_RESTART_PENDING, ROOTD_LEASE_STATE_RUNNING,
+    LOADER_SPAWN_FLAG_DEFER_START, PRODUCT_MILESTONE_ROOT_CORE_READY, ROOTD_LEASE_STATE_EXITED,
+    ROOTD_LEASE_STATE_FAILED, ROOTD_LEASE_STATE_RESTART_PENDING, ROOTD_LEASE_STATE_RUNNING,
     ROOTD_TERMINATE_BROKER_ABI_VERSION, SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_IPC_CALL,
     SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
     SYS_RUSTOS_IPC_RECV_WITH_SENDER, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT,
     SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER, SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER,
-    SYS_RUSTOS_PROC_VALIDATE_DEFERRED_SPAWN_BROKER, SYS_RUSTOS_ROOTD_TERMINATE_BROKER,
-    SYS_RUSTOS_ROOTD_WAIT_BROKER, SYS_RUSTOS_SPAWN_EXEC, TASK_WEIGHT_INTERACTIVE_FLAG,
+    SYS_RUSTOS_PROC_VALIDATE_DEFERRED_SPAWN_BROKER, SYS_RUSTOS_PRODUCT_MILESTONE,
+    SYS_RUSTOS_ROOTD_TERMINATE_BROKER, SYS_RUSTOS_ROOTD_WAIT_BROKER, SYS_RUSTOS_SPAWN_EXEC,
+    TASK_WEIGHT_INTERACTIVE_FLAG,
 };
 use service_checkpoint::ServiceCheckpointStore;
 
@@ -238,57 +235,6 @@ struct RootdHeap([u8; ROOTD_HEAP_BYTES]);
 #[cfg(not(test))]
 static mut ROOTD_HEAP: RootdHeap = RootdHeap([0; ROOTD_HEAP_BYTES]);
 
-#[cfg(not(test))]
-struct RootdBumpAllocator {
-    cursor: AtomicUsize,
-}
-
-#[cfg(not(test))]
-unsafe impl Sync for RootdBumpAllocator {}
-
-#[cfg(not(test))]
-impl RootdBumpAllocator {
-    const fn new() -> Self {
-        Self {
-            cursor: AtomicUsize::new(0),
-        }
-    }
-}
-
-#[cfg(not(test))]
-#[global_allocator]
-static ROOTD_ALLOCATOR: RootdBumpAllocator = RootdBumpAllocator::new();
-
-#[cfg(not(test))]
-unsafe impl GlobalAlloc for RootdBumpAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let align = layout.align().max(1);
-        let size = layout.size();
-        let base = core::ptr::addr_of_mut!(ROOTD_HEAP.0).cast::<u8>() as usize;
-        let mut cursor = self.cursor.load(Ordering::Relaxed);
-        loop {
-            let aligned = (cursor + align - 1) & !(align - 1);
-            let Some(new_cursor) = aligned.checked_add(size) else {
-                return ptr::null_mut();
-            };
-            if new_cursor > ROOTD_HEAP_BYTES {
-                return ptr::null_mut();
-            }
-            match self.cursor.compare_exchange(
-                cursor,
-                new_cursor,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return (base + aligned) as *mut u8,
-                Err(observed) => cursor = observed,
-            }
-        }
-    }
-
-    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {}
-}
-
 #[derive(Clone, Copy)]
 struct Lease {
     service_id: u64,
@@ -326,6 +272,12 @@ core::arch::global_asm!(
 #[cfg(not(test))]
 #[no_mangle]
 pub extern "C" fn __rustos_rootd_start() -> ! {
+    unsafe {
+        rustos_svc_runtime::allocator::init(rustos_svc_runtime::BootstrapHeap {
+            base: core::ptr::addr_of_mut!(ROOTD_HEAP.0).cast::<u8>() as usize,
+            len: ROOTD_HEAP_BYTES,
+        });
+    }
     debug_line(b"rootd: bootstrap enter\n");
     let endpoint = create_rootd_endpoint();
     let mut leases = [
@@ -391,6 +343,12 @@ pub extern "C" fn __rustos_rootd_start() -> ! {
     }
 
     debug_line(b"rootd: core services ready, spawning initd via loaderd\n");
+    let _ = syscall3(
+        SYS_RUSTOS_PRODUCT_MILESTONE,
+        PRODUCT_MILESTONE_ROOT_CORE_READY,
+        0,
+        0,
+    );
     spawn_initd_via_loaderd(
         endpoint,
         &mut leases,
@@ -2464,36 +2422,8 @@ pub extern "C" fn rust_eh_personality() {}
 #[no_mangle]
 /// # Safety
 ///
-/// `dest` must be valid and writable for `len` bytes.
-pub unsafe extern "C" fn memset(dest: *mut u8, value: i32, len: usize) -> *mut u8 {
-    let mut offset = 0usize;
-    while offset < len {
-        dest.add(offset).write(value as u8);
-        offset += 1;
-    }
-    dest
-}
-
-#[cfg(not(test))]
-#[no_mangle]
-/// # Safety
-///
-/// `src` and `dest` must be valid for `len` bytes and must not overlap.
-pub unsafe extern "C" fn memcpy(dest: *mut u8, src: *const u8, len: usize) -> *mut u8 {
-    let mut offset = 0usize;
-    while offset < len {
-        dest.add(offset).write(src.add(offset).read());
-        offset += 1;
-    }
-    dest
-}
-
-#[cfg(not(test))]
-#[no_mangle]
-/// # Safety
-///
 /// `lhs` and `rhs` must be valid for `len` bytes.
-pub unsafe extern "C" fn memcmp(lhs: *const u8, rhs: *const u8, len: usize) -> i32 {
+pub unsafe extern "C" fn bcmp(lhs: *const u8, rhs: *const u8, len: usize) -> i32 {
     let mut offset = 0usize;
     while offset < len {
         let left = lhs.add(offset).read();
@@ -2504,15 +2434,6 @@ pub unsafe extern "C" fn memcmp(lhs: *const u8, rhs: *const u8, len: usize) -> i
         offset += 1;
     }
     0
-}
-
-#[cfg(not(test))]
-#[no_mangle]
-/// # Safety
-///
-/// `lhs` and `rhs` must be valid for `len` bytes.
-pub unsafe extern "C" fn bcmp(lhs: *const u8, rhs: *const u8, len: usize) -> i32 {
-    memcmp(lhs, rhs, len)
 }
 
 #[cfg(test)]
@@ -2529,6 +2450,23 @@ mod tests {
             .expect("rootd raw entry trampoline");
         assert!(trampoline.contains("\"    and rsp, -16\""));
         assert!(trampoline.contains("\"    call __rustos_rootd_start\""));
+    }
+
+    #[test]
+    fn production_root_installs_reclaiming_heap_before_first_allocation() {
+        let source = include_str!("main.rs");
+        let entry = source
+            .split("pub extern \"C\" fn __rustos_rootd_start() -> ! {")
+            .nth(1)
+            .expect("rootd production entry");
+        let allocator = entry
+            .find("rustos_svc_runtime::allocator::init")
+            .expect("reclaiming allocator initialization");
+        let first_service_action = entry
+            .find("debug_line(b\"rootd: bootstrap enter")
+            .expect("first rootd service action");
+        assert!(allocator < first_service_action);
+        assert_eq!(source.matches("RootdBumpAllocator").count(), 1);
     }
 
     #[test]

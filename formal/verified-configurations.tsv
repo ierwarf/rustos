@@ -1,0 +1,6 @@
+id	platform	topology	evidence_profile	properties	assumptions	status
+qemu-dvm-interactive	x86_64-qemu-kvm	rustos-plus-linux-dvm-gui-input-network-block	pr	boot-dag,zero-trust-boundaries,service-lifecycles,55fps-three-windows,network-roundtrip,storage-roundtrip	ASM-001,HW-001,BOOT-001,DMA-001,TOOL-001,DVM-001,TRACE-001,QEMU-001	evidence-complete
+qemu-dvm-storage-fault	x86_64-qemu-kvm	rustos-plus-linux-dvm-block	pr-negative	block-generation-binding,real-completion-before-injected-failure,no-false-flush-success	ASM-001,HW-001,BOOT-001,DMA-001,TOOL-001,DVM-001,TRACE-001,QEMU-001	evidence-complete
+linux-dvm-bundle	x86_64-linux-dvm	signed-kernel-rootfs-agent-artifacts	artifact	module-signatures,source-lock,manifest,control-contract	TOOL-001,DVM-001	artifact-only
+physical-x86_64	x86_64-hardware	native-boot-with-dvm	none	none	ASM-001,HW-001,BOOT-001,DMA-001,TOOL-001,DVM-001,PHY-001	excluded
+physical-amd-display	x86_64-amd-hardware	vfio-iommufd-physical-scanout	none	none	ASM-001,HW-001,BOOT-001,DMA-001,TOOL-001,DVM-001,PHY-001	excluded

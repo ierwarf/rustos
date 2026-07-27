@@ -14,7 +14,7 @@ use rustos_user_abi::syscall::{
     IPC_SERVICE_LOADERD, IPC_SERVICE_ROOTD, IPC_SERVICE_UISERVER,
     IPC_WAIT_SERVICE_ENDPOINT_ABI_VERSION, LOADER_OP_ACTIVATE, LOADER_OP_SPAWN_EXEC,
     LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES, LOADER_SPAWN_ENV_BYTES,
-    LOADER_SPAWN_EXEC_PATH_CAPACITY, LOADER_SPAWN_FLAG_DEFER_START, SYS_RUSTOS_IPC_CALL,
+    LOADER_SPAWN_EXEC_PATH_CAPACITY, LOADER_SPAWN_FLAG_DEFER_START, SYS_RUSTOS_IPC_CALL_BOUNDED,
     SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_WAIT_SERVICE_ENDPOINT,
 };
 
@@ -22,7 +22,7 @@ use super::{
     boot_line, AT_FDCWD, CONSOLE_PATH, CONSOLE_SESSION_STATE_LOADING_IMAGE,
     CONSOLE_SESSION_STATE_RUNNING, CONSOLE_SESSION_STATE_SPAWNING, DEFAULT_USER_TASK_WEIGHT_MICROS,
     IDLE_POLL_INTERVAL, LOADER_ENDPOINT_CACHE, MAX_UNTRUSTED_TASK_WEIGHT_MICROS,
-    MIN_EFFECTIVE_TASK_WEIGHT_MICROS, O_RDWR, RETRY_BACKOFF, SYS_OPENAT, UI_SERVER_EXEC_PATH,
+    MIN_EFFECTIVE_TASK_WEIGHT_MICROS, O_RDWR, SYS_OPENAT, UI_SERVER_EXEC_PATH,
     UI_SERVER_TASK_WEIGHT_MICROS,
 };
 use super::{BrokerState, LaunchEntry, RunningProcess};
@@ -150,6 +150,7 @@ pub(super) fn spawn_tracked_process(
         boot_line(format!("runtimed: uiserver endpoint ready pid={pid}").as_str());
     }
     state.retry_after.remove(desktop_file_id.as_str());
+    state.launch_failure_counts.remove(desktop_file_id.as_str());
     if inserted_session_handle != 0 {
         let _ = ensure_console_fd(state)?;
         let _ = CONSOLE_SESSION_STATE_SPAWNING;
@@ -279,12 +280,13 @@ fn report_rootd_service_lease(service_id: u64, exec_path: &str, pid: i32) -> Res
     let mut response = CommercialMaxProtocolResponse::default();
     let call = unsafe {
         libc::syscall(
-            SYS_RUSTOS_IPC_CALL as libc::c_long,
+            SYS_RUSTOS_IPC_CALL_BOUNDED as libc::c_long,
             endpoint,
             (&request as *const CommercialMaxProtocolRequest) as u64,
             size_of::<CommercialMaxProtocolRequest>() as u64,
             (&mut response as *mut CommercialMaxProtocolResponse) as u64,
             size_of::<CommercialMaxProtocolResponse>() as u64,
+            IPC_BOOT_CONTROL_HARD_LIMIT_MS,
         ) as i64
     };
     if call < 0 {
@@ -344,9 +346,11 @@ pub(super) fn reap_children(state: &mut BrokerState) -> bool {
                     }
                 }
                 if process.restart {
-                    state
-                        .retry_after
-                        .insert(process.desktop_file_id, Instant::now() + RETRY_BACKOFF);
+                    super::socket::schedule_launch_retry(
+                        state,
+                        process.desktop_file_id.as_str(),
+                        libc::ECHILD,
+                    );
                 }
             }
             continue;
@@ -395,12 +399,13 @@ pub(super) fn spawn_exec(
     let mut response = LoaderSpawnResponse::default();
     let call = unsafe {
         libc::syscall(
-            SYS_RUSTOS_IPC_CALL as libc::c_long,
+            SYS_RUSTOS_IPC_CALL_BOUNDED as libc::c_long,
             endpoint,
             (&request as *const LoaderSpawnRequest) as u64,
             size_of::<LoaderSpawnRequest>() as u64,
             (&mut response as *mut LoaderSpawnResponse) as u64,
             size_of::<LoaderSpawnResponse>() as u64,
+            IPC_BOOT_CONTROL_HARD_LIMIT_MS,
         ) as i64
     };
     if call < 0 {
@@ -481,12 +486,13 @@ fn activate_spawned_process(pid: i32) -> Result<(), i32> {
     let mut response = LoaderSpawnResponse::default();
     let call = unsafe {
         libc::syscall(
-            SYS_RUSTOS_IPC_CALL as libc::c_long,
+            SYS_RUSTOS_IPC_CALL_BOUNDED as libc::c_long,
             endpoint,
             (&request as *const LoaderSpawnRequest) as u64,
             size_of::<LoaderSpawnRequest>() as u64,
             (&mut response as *mut LoaderSpawnResponse) as u64,
             size_of::<LoaderSpawnResponse>() as u64,
+            IPC_BOOT_CONTROL_HARD_LIMIT_MS,
         ) as i64
     };
     if call < 0 {

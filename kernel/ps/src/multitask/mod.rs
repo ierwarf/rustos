@@ -55,8 +55,8 @@ pub use self::current::{
 pub const MAX_SCHEDULER_TASKS: usize = scheduler::MAX_TASK;
 #[allow(unused_imports)]
 pub(crate) use self::irq::{
-    clear_deferred_reschedule_request, cond_resched, request_deferred_reschedule,
-    request_user_return_reschedule, reschedule_if_requested,
+    cond_resched, request_deferred_reschedule, request_user_return_reschedule,
+    reschedule_deferred_from_interruptible_syscall, reschedule_if_requested,
 };
 pub use self::irq::{
     rtc_interrupt_handler_addr, software_schedule_interrupt_handler_addr,

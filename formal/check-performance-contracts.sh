@@ -17,6 +17,7 @@ for witness in \
     'IPC_READINESS_QUERY_HARD_LIMIT_MS: u64 = 16' \
     'IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS: u64 = 100' \
     'IPC_BOOT_CONTROL_HARD_LIMIT_MS: u64 = 5_000' \
+    'DVM_STORAGE_BOOT_READY_HARD_LIMIT_MS: u64 = 4_000' \
     'IPC_BULK_DATA_HARD_LIMIT_MS: u64 = 30_000' \
     'UI_FRAME_MAX_SYNCHRONOUS_POLICY_IPC: u32 = 0' \
     'SERVICE_LOOKUP_MAX_IPC_WITH_EXACT_GRANT: u32 = 0' \
@@ -62,7 +63,9 @@ rg -Fq 'const SERVICE_ENDPOINT_STABLE_READ_ATTEMPTS: usize = 3;' "$ipc_ops" || {
     echo "service endpoint stable-read bound drifted" >&2
     exit 1
 }
-service_lookup_body=$(sed -n '/^fn service_endpoint_raw(/,/^}/p' "$ipc_ops")
+service_lookup_body=$(sed -n \
+    '/^fn service_endpoint_raw(/,/^fn stable_service_endpoint_snapshot(/p' \
+    "$ipc_ops")
 if grep -Fq 'SERVICE_ENDPOINT_REGISTRY_MUTATION.lock()' <<<"$service_lookup_body"; then
     echo "stable service endpoint lookup reacquired the global mutation lock" >&2
     exit 1
@@ -151,6 +154,14 @@ rg -Fq 'background_probe_rank' services/runtimed/src/catalog.rs || {
     echo "background network probe can block the interactive launch path" >&2
     exit 1
 }
+rg -Fq 'launch_failure_counts' services/runtimed/src/socket.rs || {
+    echo "runtimed launch failures can retry without a consecutive-failure circuit breaker" >&2
+    exit 1
+}
+rg -Fq 'MAX_LAUNCH_RETRY_BACKOFF' services/runtimed/src/socket.rs || {
+    echo "runtimed launch retry backoff is not explicitly capped" >&2
+    exit 1
+}
 rg -Fq 'RUSTOS_GPU_ACTIVE_MARKER' tools/xtask/src/kvm/guest.rs || {
     echo "KVM interactive boot gate lost the first completed GPU frame witness" >&2
     exit 1
@@ -179,6 +190,14 @@ rg -Fq 'update_gpu_layer_destinations(' services/uiserver/src/gpu_runtime.rs || 
     echo "window movement can again force a complete GPU atlas rebuild" >&2
     exit 1
 }
+rg -Fq 'scratch_atlas: Vec<u32>' services/uiserver/src/gpu_runtime.rs || {
+    echo "GPU full-scene rebuild lost its reusable scratch atlas" >&2
+    exit 1
+}
+if rg -Fq 'vec![0_u32; self.atlas.len()]' services/uiserver/src/gpu_runtime.rs; then
+    echo "GPU full-scene rebuild regained a per-frame atlas allocation" >&2
+    exit 1
+fi
 for forbidden in \
     'mix(window.frame.x as u64);' \
     'mix(window.frame.y as u64);'; do

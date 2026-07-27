@@ -8,4 +8,5 @@ boot-protocol = { path = "../../boot/boot-protocol" }
 boot-random = { path = "../../libs/boot-random" }
 keyboard-core = { path = "../../drivers/libs/keyboard-core" }
 rustos-fault-injection = { path = "../../libs/rustos-fault-injection" }
-rustos-user-abi = { path = "../../libs/rustos-user-abi" }
+rustos-image-admission = { path = "../../libs/rustos-image-admission" }
+rustos-user-abi = { path = "../../libs/rustos-user-abi", features = ["linux-compat-state"] }

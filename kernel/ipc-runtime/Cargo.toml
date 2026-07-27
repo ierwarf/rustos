@@ -9,6 +9,7 @@ host-test = []
 [dependencies]
 kernel-mm = { path = "../mm" }
 kernel-object = { path = "../object" }
+rustos-fault-injection = { path = "../../libs/rustos-fault-injection" }
 rustos-user-abi = { path = "../../libs/rustos-user-abi" }
 spin = "0.10.0"
 x86_64 = { version = "0.15.4", default-features = false, features = ["instructions", "abi_x86_interrupt"] }
