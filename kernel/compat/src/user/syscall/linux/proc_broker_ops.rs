@@ -780,14 +780,19 @@ pub(super) fn syscall_linux_rustos_proc_activate_broker(args_ptr: u64) -> u64 {
     if !deferred_spawn_provenance_matches(&activations, args.target_pid, args.requester_pid) {
         return linux_errno(LINUX_EPERM);
     }
-    if !multitask::activate_suspended_user_task(args.target_pid) {
+    if !multitask::activate_suspended_user_tasks_with_commit(
+        core::slice::from_ref(&args.target_pid),
+        || {
+            assert_eq!(
+                activations.remove(&args.target_pid),
+                Some(args.requester_pid),
+                "proc activation invariant: preflighted authority disappeared while locked"
+            );
+        },
+    ) {
         return linux_errno(LINUX_ESRCH);
     }
-    assert_eq!(
-        activations.remove(&args.target_pid),
-        Some(args.requester_pid),
-        "proc activation invariant: committed authority disappeared while locked"
-    );
+    drop(activations);
     // Runnable publication and one-shot capability consumption are one
     // ProcBrokerRegistry -> Scheduler critical section. Requester cleanup can
     // win before it or observe the committed child after it, never between.

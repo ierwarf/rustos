@@ -360,6 +360,12 @@ kernel-stamped sender; ring0 owns only the bounded atomic publication:
 - `ProcBrokerRegistry -> Scheduler` is the only lock order;
 - all capability and scheduler preflight completes before any runnable bit,
   spawn FIFO entry, or capability consumption changes;
+- after both preflights, exact one-shot capability consumption runs while both
+  owners remain held and strictly before scheduler publication; failure during
+  this bounded commit leaves every target suspended and panics fail-closed;
+- the capability-registry guard is released before milestone or diagnostic
+  output, so newly runnable siblings cannot contend on a preempted logging
+  owner;
 - successful publication queues every sibling in cohort order before the
   loader reply; the scheduler gives exactly that bounded cohort its FIFO
   first-turn prefix before resuming the synchronous loader reply chain;

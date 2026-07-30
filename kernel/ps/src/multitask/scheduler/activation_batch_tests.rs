@@ -5,6 +5,7 @@ use super::{INTERACTIVE_PIT_DIVISOR_FLAG, RFLAGS_RESERVED_BIT_1, Scheduler};
 use crate::memory::paging::ProcessAddressSpace;
 use crate::multitask::{UserTaskBootstrap, noop_task_entry};
 use crate::user::abi::UserAbi;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 #[test]
 fn spawn_handoff_is_fifo_deduplicated_and_precedes_ipc_handoff() {
@@ -46,6 +47,19 @@ fn spawn_handoff_is_fifo_deduplicated_and_precedes_ipc_handoff() {
     assert!(scheduler.start_suspended[first]);
     assert!(scheduler.start_suspended[second]);
     assert_eq!(scheduler.spawn_pick_hints.len(), 0);
+    let authority_commit_started = AtomicBool::new(false);
+    let failed_commit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        scheduler.activate_suspended_user_tasks_with_commit(&[802, 803], || {
+            authority_commit_started.store(true, Ordering::Release);
+            panic!("injected authority commit failure");
+        })
+    }));
+    assert!(failed_commit.is_err());
+    assert!(authority_commit_started.load(Ordering::Acquire));
+    assert!(scheduler.start_suspended[first]);
+    assert!(scheduler.start_suspended[second]);
+    assert_eq!(scheduler.atomic_activation_handoff_remaining, 0);
+    assert!(scheduler.atomic_activation_pick_hints.is_empty());
     scheduler.set_next_spawn_pick_hint(804);
     assert!(scheduler.activate_suspended_user_tasks(&[802, 803]));
     assert_eq!(scheduler.atomic_activation_handoff_remaining, 2);

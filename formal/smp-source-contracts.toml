@@ -53,6 +53,26 @@ scope = "kernel/ps/src/multitask/scheduler.rs"
 regex = '(?s)fn retire_exec_sibling_slot[^{]*\{(?:(?!\n    fn).)*process_table::detach_task\s*\('
 reason = "exec sibling process detachment must run from deferred side-effect custody"
 
+[[forbidden_patterns]]
+scope = "kernel/compat/src/user/syscall/linux/proc_broker_ops/activation_batch.rs"
+regex = '\bactivate_suspended_user_tasks\s*\(targets\)'
+reason = "batch activation must consume exact authority inside the scheduler preflight-to-publication transaction"
+
+[[forbidden_patterns]]
+scope = "kernel/compat/src/user/syscall/linux/proc_broker_ops.rs"
+regex = '\bactivate_suspended_user_task\s*\(args\.target_pid\)'
+reason = "single process activation must consume exact authority inside the scheduler preflight-to-publication transaction"
+
+[[forbidden_patterns]]
+scope = "kernel/compat/src/user/syscall/linux/proc_broker_ops/activation_batch.rs"
+regex = '(?s)let mut activations = DEFERRED_ACTIVATIONS\.lock\(\);(?:(?!drop\(activations\)).)*record_milestone'
+reason = "batch activation evidence must run only after the capability registry guard is released"
+
+[[forbidden_patterns]]
+scope = "kernel/compat/src/user/syscall/linux/proc_broker_ops.rs"
+regex = '(?s)fn syscall_linux_rustos_proc_activate_broker.*?let mut activations = DEFERRED_ACTIVATIONS\.lock\(\);(?:(?!drop\(activations\)).)*record_milestone'
+reason = "single activation evidence must run only after the capability registry guard is released"
+
 # Each named authority must remain a bounded dense logical-CPU array. This
 # rejects accidental regression to a scalar singleton even when the scalar is
 # atomic and therefore invisible to a data-race detector.

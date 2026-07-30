@@ -55,15 +55,19 @@ pub(in crate::user::syscall::linux) fn syscall_linux_rustos_proc_activate_batch_
     }) {
         return linux_errno(LINUX_EPERM);
     }
-    if !multitask::activate_suspended_user_tasks(targets) {
+    if !multitask::activate_suspended_user_tasks_with_commit(targets, || {
+        for target_pid in targets.iter().copied() {
+            assert_eq!(
+                activations.remove(&target_pid),
+                Some(args.requester_pid),
+                "proc activation batch invariant: preflighted authority disappeared while locked"
+            );
+        }
+    }) {
         return linux_errno(LINUX_ESRCH);
     }
+    drop(activations);
     for target_pid in targets.iter().copied() {
-        assert_eq!(
-            activations.remove(&target_pid),
-            Some(args.requester_pid),
-            "proc activation batch invariant: committed authority disappeared while locked"
-        );
         nucleus_core::debug::record_milestone(
             nucleus_core::debug::LogCategory::Compat,
             "proc-activate-batch-member",
@@ -92,14 +96,22 @@ mod tests {
             .find("deferred_spawn_provenance_matches")
             .expect("exact authority preflight");
         let publish = source
-            .find("multitask::activate_suspended_user_tasks")
-            .expect("atomic scheduler publication");
+            .find("multitask::activate_suspended_user_tasks_with_commit")
+            .expect("atomic scheduler transaction");
         let consume = source
             .find("activations.remove(&target_pid)")
             .expect("one-shot capability consumption");
+        let unlock = source
+            .find("drop(activations)")
+            .expect("capability registry release");
+        let evidence = source
+            .find("nucleus_core::debug::record_milestone")
+            .expect("post-transaction evidence");
         assert!(lock < authority);
         assert!(authority < publish);
         assert!(publish < consume);
+        assert!(consume < unlock);
+        assert!(unlock < evidence);
         assert!(source.contains("targets[..index].contains(&target_pid)"));
         assert!(source.contains("args.target_pids[target_count..]"));
     }

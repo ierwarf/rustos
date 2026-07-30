@@ -1289,6 +1289,8 @@ required_evidence = [
     "build/formal/smp-source-assumptions/summary.json",
 ]
 required_models = [
+    "atomic-process-activation-batch/AtomicProcessActivationBatch",
+    "bootstrap-activation-handoff/BootstrapActivationHandoff",
     "cpu-affinity-observation/CpuAffinityObservation",
     "task-affinity-lifecycle/TaskAffinityLifecycle",
     "cpu-topology-admission/CpuTopologyAdmission",

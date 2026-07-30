@@ -222,6 +222,24 @@ pub fn activate_suspended_user_tasks(task_ids: &[u64]) -> bool {
     })
 }
 
+/// Runs one bounded authority commit between complete scheduler preflight and
+/// runnable publication while retaining the global scheduler owner.
+///
+/// The callback executes under the caller's outer capability-registry guard
+/// and the scheduler raw lock. It must only perform infallible, allocation-free
+/// authority consumption and must never log, block, or acquire another lock.
+pub fn activate_suspended_user_tasks_with_commit<F>(task_ids: &[u64], commit_authority: F) -> bool
+where
+    F: FnOnce(),
+{
+    // SAFETY: interrupt exclusion prevents same-CPU reentry and
+    // `scheduler_mut` retains the global scheduler owner across the bounded
+    // authority callback and runnable publication.
+    interrupts::without_interrupts(|| unsafe {
+        scheduler_mut().activate_suspended_user_tasks_with_commit(task_ids, commit_authority)
+    })
+}
+
 pub fn terminate_user_task(task_id: u64) -> bool {
     let terminated = interrupts::without_interrupts(|| unsafe {
         let requested_by_pid = scheduler_ref().current_user_id();

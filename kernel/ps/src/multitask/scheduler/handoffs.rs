@@ -19,6 +19,29 @@ impl Scheduler {
         self.activate_suspended_user_tasks(core::slice::from_ref(&task_id))
     }
 
+    pub(in crate::multitask) fn activate_suspended_user_tasks_with_commit<F>(
+        &mut self,
+        task_ids: &[u64],
+        commit_authority: F,
+    ) -> bool
+    where
+        F: FnOnce(),
+    {
+        if !self.preflight_suspended_user_tasks(task_ids) {
+            return false;
+        }
+
+        // The caller owns the outer capability registry and the documented
+        // ProcBrokerRegistry -> Scheduler lock order. Consume that exact
+        // authority after every scheduler preflight succeeds but before any
+        // target becomes runnable. The callback must be bounded, infallible,
+        // allocation-free registry mutation; a panic leaves every target
+        // suspended and fails closed.
+        commit_authority();
+        self.publish_suspended_user_tasks(task_ids);
+        true
+    }
+
     /// Atomically publishes a bounded supervisor-selected sibling set.
     ///
     /// The first pass is a rollback-free preflight under the global scheduler
@@ -27,6 +50,10 @@ impl Scheduler {
     /// pass cannot fail without ring0 state corruption, so such a mismatch is
     /// fatal rather than leaving a partially activated startup cohort.
     pub(in crate::multitask) fn activate_suspended_user_tasks(&mut self, task_ids: &[u64]) -> bool {
+        self.activate_suspended_user_tasks_with_commit(task_ids, || {})
+    }
+
+    fn preflight_suspended_user_tasks(&self, task_ids: &[u64]) -> bool {
         if task_ids.is_empty() {
             return false;
         }
@@ -60,6 +87,10 @@ impl Scheduler {
             task_ids.len() <= MAX_ATOMIC_ACTIVATION_HANDOFFS,
             "scheduler activation invariant: cohort exceeds bounded first-turn custody"
         );
+        true
+    }
+
+    fn publish_suspended_user_tasks(&mut self, task_ids: &[u64]) {
         let prioritize_atomic_cohort = task_ids.len() > 1;
         if prioritize_atomic_cohort {
             assert!(
@@ -96,7 +127,6 @@ impl Scheduler {
         if prioritize_atomic_cohort {
             self.atomic_activation_handoff_remaining = task_ids.len();
         }
-        true
     }
 
     /// Retains every exact peer required by a committed synchronous call or

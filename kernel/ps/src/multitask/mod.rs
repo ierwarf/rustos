@@ -35,10 +35,11 @@ use crate::user::process_state::{
 };
 
 pub use self::current::{
-    activate_suspended_user_task, activate_suspended_user_tasks, any_user_process_state,
-    arm_block_current_task, cancel_block_current_task, complete_retired_task_cleanup,
-    current_console_session, current_linux_thread_state, current_task_id, current_user_abi,
-    current_user_address_space, current_user_id, current_user_log_ids, current_user_process_id,
+    activate_suspended_user_task, activate_suspended_user_tasks,
+    activate_suspended_user_tasks_with_commit, any_user_process_state, arm_block_current_task,
+    cancel_block_current_task, complete_retired_task_cleanup, current_console_session,
+    current_linux_thread_state, current_task_id, current_user_abi, current_user_address_space,
+    current_user_id, current_user_log_ids, current_user_process_id,
     current_user_process_thread_count, current_user_snapshot, current_user_stack_state,
     current_user_thread_id, current_user_wait_binding, demote_current_user_task_to_user_class,
     exec_current_user_process, exec_user_process_by_pid, exit_current_user_process,
