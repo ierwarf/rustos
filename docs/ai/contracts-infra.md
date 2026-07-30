@@ -233,14 +233,16 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
   sleepable ordering is rejected. Raw-to-blocking nesting is rejected;
   sleepable-to-raw leaf acquisition is dependency-tracked and cycle-checked,
   including successful nonblocking external try-locks.
-- While the product scheduler is BSP-only, every boot-image
-  `TrackedSpinLock` guard increments one task-preemption depth without masking
-  unrelated device interrupts. The software scheduler rejects every handoff
-  while that depth is non-zero. Code under such a guard must still be bounded,
-  non-blocking, and allocation-free; a lock shared with an IRQ leaf must also
-  wrap its process-context access in `without_interrupts`. SMP enablement is
-  gated on per-CPU preemption accounting, current-task publication, and
-  raw-spin stacks; task-owned sleepable stacks are already identity-scoped.
+- Every boot-image `TrackedSpinLock` guard increments the acquisition CPU's
+  task-preemption depth without masking unrelated device interrupts. It
+  captures the dense CPU index and architectural APIC identity; release
+  validates both plus positive nesting depth before unlocking. The software
+  scheduler rejects every handoff while that CPU's depth is non-zero. Code
+  under such a guard remains bounded, non-blocking, and allocation-free; a lock
+  shared with an IRQ leaf must also wrap process-context access in
+  `without_interrupts`. Per-CPU current-task publication and raw-spin stacks
+  are mandatory SMP authority, while task-owned sleepable stacks remain
+  identity-scoped. `scheduler-cpu-ownership` is the executable refinement.
 - `boot-random` sits below `nucleus-core`, so its one master-seed lock cannot
   use `TrackedSpinLock`. Its only critical section derives one 32-byte child
   seed under local IRQ exclusion; no caller may hold the raw master lock across
@@ -740,6 +742,14 @@ scatter fault checks through arbitrary helper functions.**
 - Config is mostly build-time cfg — rebuild after changes.
 - Kernel macros: `crate::debug::{trace,debug,info,warn,error}`.
 - Userspace macros: `observability_client::{trace,debug,info,warn,error}`.
+- Synchronous `SYS_RUSTOS_DEBUG_PRINT` is a console sink, not a free tracing
+  buffer. Success-path phase logs inside loader/service loops must use a
+  `RUSTOS_LOGGING_BOOT_TRACE_ENABLED` gate; commercial defaults compile them
+  out. Terminal failure diagnostics, stable acceptance milestones, and one
+  bounded completion marker remain unconditional.
+- Repeated recoverable warnings use one-time or rate-limited publication with
+  an aggregate counter. Never let console traffic extend an IPC deadline or
+  become a boot scheduling dependency.
 
 ## Docs
 

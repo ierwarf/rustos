@@ -583,17 +583,18 @@ pub fn syscall_linux_epoll_create1(flags: u64) -> u64 {
         return linux_errno(LINUX_EINVAL);
     }
     let epoll = multitask::EpollHandle::new();
+    let epoll_token = epoll.token_id();
     let mut request = new_vfs_request(VFS_IPC_OP_POLL_QUERY);
     request.arg0 = VFS_POLL_QUERY_EPOLL_CREATE;
-    request.remote_id = epoll.token_id();
+    request.remote_id = epoll_token;
     if let Err(errno) = call_vfs_ipc_request_with_timeout(&request, 16)
         .and_then(|response| ensure_vfs_status(&response))
     {
         // A timeout can race the service commit. The token is globally unique
         // and not yet published in the fd table, so an idempotent bounded
-        // unref safely removes a possibly-created orphan and otherwise gets
+        // retire safely removes a possibly-created orphan and otherwise gets
         // ENOENT without affecting another epoll object.
-        let _ = update_vfs_epoll_ref_bounded(epoll.token_id(), false);
+        let _ = retire_vfs_epoll_bounded(epoll_token);
         return linux_errno(errno);
     }
     let fd_flags = if flags & linux_abi::EPOLL_CLOEXEC != 0 {
@@ -612,11 +613,11 @@ pub fn syscall_linux_epoll_create1(flags: u64) -> u64 {
     }) {
         Some(Some(fd)) => fd,
         Some(None) => {
-            let _ = update_vfs_epoll_ref(epoll.token_id(), false);
+            let _ = retire_vfs_epoll(epoll_token);
             linux_errno(LINUX_EMFILE)
         }
         None => {
-            let _ = update_vfs_epoll_ref(epoll.token_id(), false);
+            let _ = retire_vfs_epoll(epoll_token);
             linux_errno(LINUX_ENOSYS)
         }
     }
@@ -928,7 +929,7 @@ fn epoll_interest_target(fd: u64) -> Result<EpollInterestTarget, i64> {
 
 fn acquire_epoll_target_guard(handle: &multitask::KernelHandle) -> Result<EpollTargetGuard, i64> {
     if let Some(handle_ref) = service_handle_ref_for_handle(handle) {
-        acquire_service_handle_ref(handle_ref)?;
+        acquire_service_handle_ref(&handle_ref)?;
         return Ok(EpollTargetGuard::Service(handle_ref));
     }
     if let multitask::KernelHandle::Console(console) = handle {
@@ -1145,25 +1146,17 @@ fn write_epoll_ready_events(events_ptr: u64, ready: &[(u32, u64)]) -> u64 {
     ready.len() as u64
 }
 
-pub fn update_vfs_epoll_ref(token: u64, acquire: bool) -> Result<(), i64> {
-    update_vfs_epoll_ref_bounded(token, acquire)
+pub fn retire_vfs_epoll(token: u64) -> Result<(), i64> {
+    retire_vfs_epoll_bounded(token)
 }
 
-pub fn update_vfs_epoll_ref_bounded(token: u64, acquire: bool) -> Result<(), i64> {
-    update_vfs_epoll_ref_with_timeout(token, acquire, Some(16))
+pub fn retire_vfs_epoll_bounded(token: u64) -> Result<(), i64> {
+    retire_vfs_epoll_with_timeout(token, Some(16))
 }
 
-fn update_vfs_epoll_ref_with_timeout(
-    token: u64,
-    acquire: bool,
-    timeout_ms: Option<u64>,
-) -> Result<(), i64> {
+fn retire_vfs_epoll_with_timeout(token: u64, timeout_ms: Option<u64>) -> Result<(), i64> {
     let mut request = new_vfs_request(VFS_IPC_OP_POLL_QUERY);
-    request.arg0 = if acquire {
-        VFS_POLL_QUERY_EPOLL_REF
-    } else {
-        VFS_POLL_QUERY_EPOLL_UNREF
-    };
+    request.arg0 = VFS_POLL_QUERY_EPOLL_RETIRE;
     request.remote_id = token;
     let response = match timeout_ms {
         Some(timeout_ms) => call_vfs_ipc_request_with_timeout(&request, timeout_ms),

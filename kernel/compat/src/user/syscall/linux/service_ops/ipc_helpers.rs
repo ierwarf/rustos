@@ -471,8 +471,7 @@ fn vfs_request_is_replay_safe(request: &VfsIpcRequest) -> bool {
             request.arg0,
             VFS_POLL_QUERY_EPOLL_CREATE
                 | VFS_POLL_QUERY_EPOLL_CTL
-                | VFS_POLL_QUERY_EPOLL_REF
-                | VFS_POLL_QUERY_EPOLL_UNREF
+                | VFS_POLL_QUERY_EPOLL_RETIRE
                 | VFS_POLL_QUERY_EPOLL_PURGE_OBJECT
                 | VFS_POLL_QUERY_EPOLL_SNAPSHOT
         )
@@ -493,8 +492,7 @@ fn call_vfs_ipc_request_impl(
             request.arg0,
             VFS_POLL_QUERY_EPOLL_CREATE
                 | VFS_POLL_QUERY_EPOLL_CTL
-                | VFS_POLL_QUERY_EPOLL_REF
-                | VFS_POLL_QUERY_EPOLL_UNREF
+                | VFS_POLL_QUERY_EPOLL_RETIRE
                 | VFS_POLL_QUERY_EPOLL_PURGE_OBJECT
         );
     let total_timeout_ms = timeout_ms.or(replay_safe_request.then_some(30_000));
@@ -586,7 +584,7 @@ fn split_retry_timeout_ms(total: u64, attempts: usize, attempt: usize) -> u64 {
 fn vfs_checkpoint_ack_required(request: &VfsIpcRequest) -> bool {
     request.op == VFS_IPC_OP_CLOSE
         || request.op == VFS_IPC_OP_POLL_QUERY
-            && (request.arg0 == VFS_POLL_QUERY_EPOLL_UNREF
+            && (request.arg0 == VFS_POLL_QUERY_EPOLL_RETIRE
                 || request.arg0 == VFS_POLL_QUERY_EPOLL_PURGE_OBJECT
                 || request.arg0 == VFS_POLL_QUERY_EPOLL_CTL
                     && request.arg1 == linux_abi::EPOLL_CTL_DEL)
@@ -1781,7 +1779,7 @@ mod tests {
         assert!(!vfs_checkpoint_ack_required(&poll));
         poll.arg1 = linux_abi::EPOLL_CTL_DEL;
         assert!(vfs_checkpoint_ack_required(&poll));
-        poll.arg0 = VFS_POLL_QUERY_EPOLL_UNREF;
+        poll.arg0 = VFS_POLL_QUERY_EPOLL_RETIRE;
         assert!(vfs_checkpoint_ack_required(&poll));
         poll.arg0 = VFS_POLL_QUERY_EPOLL_PURGE_OBJECT;
         assert!(vfs_checkpoint_ack_required(&poll));

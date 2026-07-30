@@ -1,4 +1,4 @@
-//! BSP-only kernel entry and one-way higher-half bootstrap.
+//! BSP kernel entry, one-way higher-half bootstrap, and SMP handoff.
 //!
 //! - **Owner:** The kernel entry owns architectural admission ordering until
 //!   `kernel-executive` assumes the initialized substrate.
@@ -8,8 +8,9 @@
 //! - **Lifecycle:** Enter with interrupts disabled, establish descriptor and
 //!   memory state, cross once to the higher half, initialize owners in dependency
 //!   order, start scheduling, and never return.
-//! - **Concurrency:** Bootstrap is BSP-only and interrupts remain disabled until
-//!   the scheduler and handlers are ready; RustOS does not claim SMP support.
+//! - **Concurrency:** Early bootstrap is BSP-only and interrupts remain
+//!   disabled until the scheduler, handlers, and admitted AP-private state are
+//!   ready; later execution follows the SMP contract.
 //! - **Failure:** Invalid boot metadata, allocator failure, or subsystem
 //!   initialization failure terminates through the bounded panic path.
 //! - **Forbidden:** No policy decision, AP startup, inherited interrupt enable,

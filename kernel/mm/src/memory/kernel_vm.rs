@@ -694,10 +694,7 @@ pub fn current_root_phys() -> PhysAddr {
 }
 
 pub fn load_address_space_phys(root_phys: PhysAddr) {
-    interrupts::without_interrupts(|| unsafe {
-        let frame = PhysFrame::containing_address(root_phys);
-        Cr3::write(frame, Cr3Flags::empty());
-    });
+    kernel_hal::api::arch::tlb::activate_address_space(root_phys);
 }
 
 pub fn with_kernel_address_space<R>(f: impl FnOnce() -> R) -> R {
@@ -752,6 +749,7 @@ fn update_direct_map_range_flags_batched(
     let Some((mut cursor, end)) = direct_map_update_bounds(phys_addr, size) else {
         return false;
     };
+    let _tlb_guard = kernel_hal::api::arch::tlb::begin_global_mapping_mutation();
     let _update_guard = DIRECT_MAP_UPDATE_SERIALIZER.lock();
     let prepared = interrupts::without_interrupts(|| {
         KERNEL_PML4
@@ -857,6 +855,7 @@ pub fn unmap_mmio_range(virt_addr: u64, size: usize) -> bool {
     };
     let block_count = (span / HUGE_2MIB + 1) as usize;
 
+    let _tlb_guard = kernel_hal::api::arch::tlb::begin_global_mapping_mutation();
     interrupts::without_interrupts(|| {
         let mut pml4 = KERNEL_PML4.lock();
         pml4.unmap_mmio_blocks(virt_base, block_count)
@@ -1192,6 +1191,7 @@ fn map_mmio_range_internal(phys_addr: u64, size: usize, write_combine: bool) -> 
         MMIO_UNCACHED_FLAGS
     };
 
+    let _tlb_guard = kernel_hal::api::arch::tlb::begin_global_mapping_mutation();
     interrupts::without_interrupts(|| {
         let mut pml4 = KERNEL_PML4.lock();
         pml4.ensure_current_root_mmio_window_entry();

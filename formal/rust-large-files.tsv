@@ -18,6 +18,7 @@ libs/rustos-image-admission/src/lib.rs	1518	image-admission	Split ELF, PE, regio
 libs/rustos-user-abi/src/linux.rs	1531	user-abi	Split Linux constants and structures by syscall family.
 libs/rustos-user-abi/src/syscall.rs	2998	user-abi	Split kernel mechanism ABI from service broker protocol families.
 services/inputd/src/main.rs	1816	inputd	Split ingress admission, queue/readiness, service RPC, and runtime.
+services/initd/src/main.rs	1333	initd	Split loader wire calls, rootd lease reconciliation, and child supervision into typed modules.
 services/netd/src/main.rs	3057	netd	Split device ingress, socket state, routing policy, service RPC, and tests.
 services/rootd/src/main.rs	2935	rootd	Split bootstrap graph, authority leases, restart policy, and checkpoints.
 services/syscalld/src/linux_policy.rs	1532	syscalld	Split process, memory, entropy, credential, and advisory policies.

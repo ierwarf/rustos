@@ -18,12 +18,13 @@ use core::ptr::NonNull;
 
 use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
 
+use super::process_state_lock::ProcessStateLock;
 use crate::memory::paging::ProcessAddressSpace;
 use crate::user::process_state::UserProcessState;
 
 const MAX_PROCESS_OBJECTS: usize = 32;
 pub const MAX_THREADS_PER_PROCESS: usize = 32;
-type ProcessStateLock = TrackedSpinLock<UserProcessState, { LockClass::ProcessState as u8 }>;
+type ProcessTableLock = TrackedSpinLock<ProcessTable, { LockClass::ProcessTable as u8 }>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ChildStateChange {
@@ -54,7 +55,7 @@ impl ProcessHandle {
 pub struct ProcessRef {
     handle: ProcessHandle,
     process_id: u64,
-    state_ptr: NonNull<ProcessStateLock>,
+    state_ptr: NonNull<ProcessStateLock<UserProcessState>>,
 }
 
 impl ProcessRef {
@@ -85,12 +86,13 @@ struct ProcessObject {
     ref_count: usize,
     thread_count: usize,
     mm_generation: u32,
+    exec_in_progress: bool,
     exiting: bool,
     queued_for_reap: bool,
     exit_status: Option<i32>,
     child_state_change: Option<ChildStateChange>,
     waited: bool,
-    state: ProcessStateLock,
+    state: ProcessStateLock<UserProcessState>,
 }
 
 impl ProcessObject {
@@ -101,6 +103,7 @@ impl ProcessObject {
             ref_count: 1,
             thread_count: 1,
             mm_generation: 1,
+            exec_in_progress: false,
             exiting: false,
             queued_for_reap: false,
             exit_status: None,
@@ -110,7 +113,7 @@ impl ProcessObject {
         }
     }
 
-    fn state_ptr(&self) -> NonNull<ProcessStateLock> {
+    fn state_ptr(&self) -> NonNull<ProcessStateLock<UserProcessState>> {
         NonNull::from(&self.state)
     }
 }
@@ -169,8 +172,7 @@ impl ProcessTable {
     }
 }
 
-static PROCESS_TABLE: TrackedSpinLock<ProcessTable, { LockClass::ProcessTable as u8 }> =
-    TrackedSpinLock::new(ProcessTable::new());
+static PROCESS_TABLE: ProcessTableLock = ProcessTableLock::new(ProcessTable::new());
 
 fn reclaim_slot(slot: &mut ProcessSlot) -> Option<Box<ProcessObject>> {
     let object = slot.object.as_mut()?;
@@ -216,7 +218,7 @@ pub fn create_process_with_parent(
 pub fn attach_task(handle: ProcessHandle) -> Option<()> {
     let mut table = PROCESS_TABLE.lock();
     let object = table.lookup_object_mut(handle)?;
-    if object.exiting {
+    if object.exiting || object.exec_in_progress {
         return None;
     }
     if object.thread_count >= MAX_THREADS_PER_PROCESS {
@@ -389,13 +391,34 @@ pub fn replace_for_exec(
             exec_path,
         );
         object.mm_generation = next_mm_generation;
+        object.exec_in_progress = false;
         object.queued_for_reap = false;
         Some(closed)
     })
 }
 
 fn exec_may_replace(object: &ProcessObject) -> bool {
-    !object.exiting
+    object.exec_in_progress && !object.exiting && object.thread_count == 1
+}
+
+pub fn begin_exec(handle: ProcessHandle) -> Option<()> {
+    let mut table = PROCESS_TABLE.lock();
+    let object = table.lookup_object_mut(handle)?;
+    if object.exiting || object.exec_in_progress {
+        return None;
+    }
+    object.exec_in_progress = true;
+    Some(())
+}
+
+pub fn cancel_exec(handle: ProcessHandle) -> bool {
+    let mut table = PROCESS_TABLE.lock();
+    let Some(object) = table.lookup_object_mut(handle) else {
+        return false;
+    };
+    let was_in_progress = object.exec_in_progress;
+    object.exec_in_progress = false;
+    was_in_progress
 }
 
 pub fn note_process_exit_status(process_id: u64, status: i32) -> Option<()> {
@@ -602,10 +625,11 @@ fn reset_for_tests() {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::{
-        ProcessObject, ProcessTable, WaitResult, attach_task, create_process,
-        create_process_with_parent, detach_task, is_process_exiting, mark_process_exiting,
-        note_process_continued, note_process_exit_status, note_process_stopped,
-        reap_exited_processes, retain_process, thread_count_by_pid, wait_for_child,
+        ProcessObject, ProcessTable, WaitResult, attach_task, begin_exec, cancel_exec,
+        create_process, create_process_with_parent, detach_task, is_process_exiting,
+        mark_process_exiting, note_process_continued, note_process_exit_status,
+        note_process_stopped, reap_exited_processes, retain_process, thread_count_by_pid,
+        wait_for_child,
     };
     use crate::memory::paging::ProcessAddressSpace;
     use crate::user::process_state::UserProcessState;
@@ -672,9 +696,30 @@ pub(crate) mod tests {
         assert!(object.state.try_lock().is_none());
         drop(held);
         assert!(object.state.try_lock().is_some());
+        assert!(!super::exec_may_replace(&object));
+        object.exec_in_progress = true;
         assert!(super::exec_may_replace(&object));
+        object.thread_count = 2;
+        assert!(!super::exec_may_replace(&object));
+        object.thread_count = 1;
         object.exiting = true;
         assert!(!super::exec_may_replace(&object));
+    }
+
+    #[test]
+    fn exec_seal_rejects_thread_attachment_until_cancel() {
+        let _isolation = isolate_process_table();
+        let handle = create_process(48, new_state()).expect("process handle");
+
+        begin_exec(handle).expect("begin exec");
+        assert_eq!(attach_task(handle), None);
+        assert_eq!(thread_count_by_pid(48), Some(1));
+        assert!(cancel_exec(handle));
+        attach_task(handle).expect("attach after exec cancellation");
+
+        detach_task(handle).expect("detach sibling");
+        detach_task(handle).expect("detach leader");
+        assert_eq!(reap_exited_processes(), 1);
     }
 
     #[test]

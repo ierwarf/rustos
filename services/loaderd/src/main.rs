@@ -38,36 +38,40 @@ use rustos_user_abi::performance::EXECUTABLE_SNAPSHOT_HARD_LIMIT_MS;
 use rustos_user_abi::syscall::{
     loader_service_role_allows_operation, CommercialMaxCapabilityLeaseWire,
     CommercialMaxProtocolDescriptorWire, CommercialMaxProtocolRequest,
-    CommercialMaxProtocolResponse, IpcCallWithHandlesArgs, LoaderSpawnRequest, LoaderSpawnResponse,
-    RustosProcAbortBrokerArgs, RustosProcActivateBrokerArgs, RustosProcMapDataBrokerArgs,
-    RustosProcMapFileBatchBrokerArgs, RustosProcMapFileBatchEntry, RustosProcMapZeroedBrokerArgs,
-    RustosProcPrepareBrokerArgs, RustosProcSetLinuxRuntimeBrokerArgs,
-    RustosProcSetWindowsRuntimeBrokerArgs, VfsExecutableSnapshotRequest,
-    VfsExecutableSnapshotResponse, COMMERCIAL_MAX_LOADERD_OP_AUXV_PLAN,
-    COMMERCIAL_MAX_LOADERD_OP_ELF_RUNTIME_PLAN, COMMERCIAL_MAX_LOADERD_OP_IMAGE_PROBE,
-    COMMERCIAL_MAX_LOADERD_OP_IMPORT_POLICY, COMMERCIAL_MAX_LOADERD_OP_INTERPRETER_PLAN,
-    COMMERCIAL_MAX_LOADERD_OP_MAP_PLAN, COMMERCIAL_MAX_LOADERD_OP_PE_RUNTIME_PLAN,
-    COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_LOADERD, IPC_SERVICE_INITD,
-    IPC_SERVICE_LOADERD, IPC_SERVICE_PROCD, IPC_SERVICE_ROOTD, IPC_SERVICE_SESSIOND,
-    IPC_SERVICE_VFSD, LOADER_OP_ACTIVATE, LOADER_OP_EXEC_TARGET, LOADER_OP_SPAWN_EXEC,
-    LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES, LOADER_SPAWN_ENV_BYTES,
-    LOADER_SPAWN_EXEC_PATH_CAPACITY, LOADER_SPAWN_MAX_ARG_COUNT, LOADER_SPAWN_MAX_ENV_COUNT,
-    PROC_BROKER_ABI_VERSION, PROC_BROKER_BATCH_CAPACITY, PROC_BROKER_DATA_PAYLOAD_CAPACITY,
-    PROC_BROKER_FORMAT_ELF64, PROC_BROKER_FORMAT_PE64, PROC_BROKER_LINUX_INTERP_PATH_CAPACITY,
-    PROC_BROKER_MAP_EXEC, PROC_BROKER_MAP_PRIVATE, PROC_BROKER_MAP_READ, PROC_BROKER_MAP_WRITE,
+    CommercialMaxProtocolResponse, IpcCallWithHandlesArgs, LoaderActivateBatchRequest,
+    LoaderActivateBatchResponse, LoaderSpawnRequest, LoaderSpawnResponse,
+    RustosProcAbortBrokerArgs, RustosProcActivateBatchBrokerArgs, RustosProcActivateBrokerArgs,
+    RustosProcMapDataBrokerArgs, RustosProcMapFileBatchBrokerArgs, RustosProcMapFileBatchEntry,
+    RustosProcMapZeroedBrokerArgs, RustosProcPrepareBrokerArgs,
+    RustosProcSetLinuxRuntimeBrokerArgs, RustosProcSetWindowsRuntimeBrokerArgs,
+    VfsExecutableSnapshotRequest, VfsExecutableSnapshotResponse,
+    COMMERCIAL_MAX_LOADERD_OP_AUXV_PLAN, COMMERCIAL_MAX_LOADERD_OP_ELF_RUNTIME_PLAN,
+    COMMERCIAL_MAX_LOADERD_OP_IMAGE_PROBE, COMMERCIAL_MAX_LOADERD_OP_IMPORT_POLICY,
+    COMMERCIAL_MAX_LOADERD_OP_INTERPRETER_PLAN, COMMERCIAL_MAX_LOADERD_OP_MAP_PLAN,
+    COMMERCIAL_MAX_LOADERD_OP_PE_RUNTIME_PLAN, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
+    COMMERCIAL_MAX_PROTOCOL_LOADERD, IPC_SERVICE_INITD, IPC_SERVICE_LOADERD, IPC_SERVICE_PROCD,
+    IPC_SERVICE_ROOTD, IPC_SERVICE_SESSIOND, IPC_SERVICE_VFSD, LOADER_ACTIVATE_BATCH_ABI_VERSION,
+    LOADER_ACTIVATE_BATCH_MAX_TARGETS, LOADER_OP_ACTIVATE, LOADER_OP_ACTIVATE_BATCH,
+    LOADER_OP_EXEC_TARGET, LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION,
+    LOADER_SPAWN_ARG_BYTES, LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_EXEC_PATH_CAPACITY,
+    LOADER_SPAWN_MAX_ARG_COUNT, LOADER_SPAWN_MAX_ENV_COUNT, PROC_BROKER_ABI_VERSION,
+    PROC_BROKER_BATCH_CAPACITY, PROC_BROKER_DATA_PAYLOAD_CAPACITY, PROC_BROKER_FORMAT_ELF64,
+    PROC_BROKER_FORMAT_PE64, PROC_BROKER_LINUX_INTERP_PATH_CAPACITY, PROC_BROKER_MAP_EXEC,
+    PROC_BROKER_MAP_PRIVATE, PROC_BROKER_MAP_READ, PROC_BROKER_MAP_WRITE,
     PROC_BROKER_USER_SPACE_BASE, PROC_BROKER_USER_SPACE_END_EXCLUSIVE, SYS_RUSTOS_DEBUG_PRINT,
     SYS_RUSTOS_IPC_CALL_WITH_HANDLES_BOUNDED, SYS_RUSTOS_IPC_RECV_WITH_SENDER,
-    SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_PROC_ABORT_BROKER, SYS_RUSTOS_PROC_ACTIVATE_BROKER,
-    SYS_RUSTOS_PROC_MAP_DATA_BROKER, SYS_RUSTOS_PROC_MAP_FILE_BATCH_BROKER,
-    SYS_RUSTOS_PROC_MAP_ZEROED_BROKER, SYS_RUSTOS_PROC_PREPARE_BROKER,
-    SYS_RUSTOS_PROC_SET_LINUX_RUNTIME_BROKER, SYS_RUSTOS_PROC_SET_WINDOWS_RUNTIME_BROKER,
-    SYS_RUSTOS_SCHED_DEMOTE_SELF, VFS_EXECUTABLE_SNAPSHOT_ABI_VERSION,
-    VFS_EXECUTABLE_SNAPSHOT_OP_OPEN, VFS_IPC_PATH_CAPACITY,
+    SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_PROC_ABORT_BROKER, SYS_RUSTOS_PROC_ACTIVATE_BATCH_BROKER,
+    SYS_RUSTOS_PROC_ACTIVATE_BROKER, SYS_RUSTOS_PROC_MAP_DATA_BROKER,
+    SYS_RUSTOS_PROC_MAP_FILE_BATCH_BROKER, SYS_RUSTOS_PROC_MAP_ZEROED_BROKER,
+    SYS_RUSTOS_PROC_PREPARE_BROKER, SYS_RUSTOS_PROC_SET_LINUX_RUNTIME_BROKER,
+    SYS_RUSTOS_PROC_SET_WINDOWS_RUNTIME_BROKER, SYS_RUSTOS_SCHED_DEMOTE_SELF,
+    VFS_EXECUTABLE_SNAPSHOT_ABI_VERSION, VFS_EXECUTABLE_SNAPSHOT_OP_OPEN, VFS_IPC_PATH_CAPACITY,
 };
 
 mod commit;
 
 use commit::{commit_prepared_executable, LoaderOperation};
+use loaderd::completion_demotion_due;
 
 const SYS_SCHED_YIELD: u64 = 24;
 const SYS_EXIT: u64 = 60;
@@ -213,6 +217,8 @@ fn serve(endpoint: u64) {
             yield_after_idle_receive();
             continue;
         }
+        // SAFETY: `received` is a successful bounded receive length no larger
+        // than the initialized request buffer; the slice cannot outlive it.
         let request = unsafe {
             core::slice::from_raw_parts(request.as_ptr() as *const u8, received as usize)
         };
@@ -225,6 +231,12 @@ fn serve(endpoint: u64) {
         );
         if reply < 0 {
             rustos_svc_runtime::ipc::debug_line("loaderd: reply failed");
+        } else if completion_demotion_due(reply, handled.demote_after_reply) {
+            // CONTRACT: The terminal spawn reply transfers the prepared UI
+            // child to initd before loaderd drops its boot-critical class.
+            // Demoting while the reply capability is still live can strand
+            // the blocked supervisor behind ordinary User work.
+            demote_after_ui_bootstrap_reply();
         }
         close_fds(&handled.cleanup_fds);
     }
@@ -235,12 +247,14 @@ fn serve(endpoint: u64) {
 #[allow(clippy::large_enum_variant)]
 enum LoaderReply {
     Spawn(LoaderSpawnResponse),
+    ActivateBatch(LoaderActivateBatchResponse),
     Commercial(CommercialMaxProtocolResponse),
 }
 
 struct HandledLoaderRequest {
     reply: LoaderReply,
     cleanup_fds: Vec<i32>,
+    demote_after_reply: bool,
 }
 
 const LOADERD_RECV_BYTES: usize =
@@ -260,6 +274,9 @@ impl LoaderReply {
     fn as_ptr(&self) -> *const u8 {
         match self {
             Self::Spawn(response) => (response as *const LoaderSpawnResponse).cast::<u8>(),
+            Self::ActivateBatch(response) => {
+                (response as *const LoaderActivateBatchResponse).cast::<u8>()
+            }
             Self::Commercial(response) => {
                 (response as *const CommercialMaxProtocolResponse).cast::<u8>()
             }
@@ -269,6 +286,7 @@ impl LoaderReply {
     fn len(&self) -> usize {
         match self {
             Self::Spawn(_) => size_of::<LoaderSpawnResponse>(),
+            Self::ActivateBatch(_) => size_of::<LoaderActivateBatchResponse>(),
             Self::Commercial(_) => size_of::<CommercialMaxProtocolResponse>(),
         }
     }
@@ -287,7 +305,12 @@ fn handle_wire_request(
                 request, sender_pid, sender_tid,
             )),
             cleanup_fds: Vec::new(),
+            demote_after_reply: false,
         };
+    }
+    if received == size_of::<LoaderActivateBatchRequest>() {
+        let request = unsafe { &*bytes.as_ptr().cast::<LoaderActivateBatchRequest>() };
+        return handle_activate_batch_request(request, sender_pid);
     }
     if received == size_of::<LoaderSpawnRequest>() {
         let request = unsafe { &*bytes.as_ptr().cast::<LoaderSpawnRequest>() };
@@ -299,10 +322,72 @@ fn handle_wire_request(
     })
 }
 
+fn handle_activate_batch_request(
+    request: &LoaderActivateBatchRequest,
+    sender_pid: u64,
+) -> HandledLoaderRequest {
+    let mut response = LoaderActivateBatchResponse {
+        version: LOADER_ACTIVATE_BATCH_ABI_VERSION,
+        op: LOADER_OP_ACTIVATE_BATCH,
+        ..LoaderActivateBatchResponse::default()
+    };
+    let target_count = usize::from(request.target_count);
+    if !request.requester_is_exact_sender(sender_pid) {
+        response.status = EACCES;
+    } else if request.version != LOADER_ACTIVATE_BATCH_ABI_VERSION
+        || request.op != LOADER_OP_ACTIVATE_BATCH
+        || request.flags != 0
+        || request.reserved0 != 0
+        || request.reserved1 != 0
+        || target_count == 0
+        || target_count > LOADER_ACTIVATE_BATCH_MAX_TARGETS
+        || !activate_batch_targets_valid(&request.target_pids[..target_count])
+        || request.target_pids[target_count..]
+            .iter()
+            .any(|target_pid| *target_pid != 0)
+    {
+        response.status = EINVAL;
+    } else if let Err(errno) = authorize_loader_operation(request.op, sender_pid) {
+        response.status = errno;
+    } else {
+        let args = RustosProcActivateBatchBrokerArgs {
+            abi_version: PROC_BROKER_ABI_VERSION,
+            target_count: request.target_count,
+            requester_pid: request.requester_pid,
+            target_pids: request.target_pids,
+            ..RustosProcActivateBatchBrokerArgs::default()
+        };
+        let status = syscall1(
+            SYS_RUSTOS_PROC_ACTIVATE_BATCH_BROKER,
+            (&args as *const RustosProcActivateBatchBrokerArgs) as u64,
+        );
+        if status < 0 {
+            response.status = (-status) as i32;
+        } else {
+            response.activated_count = u32::from(request.target_count);
+        }
+    }
+    HandledLoaderRequest {
+        reply: LoaderReply::ActivateBatch(response),
+        cleanup_fds: Vec::new(),
+        demote_after_reply: false,
+    }
+}
+
+fn activate_batch_targets_valid(target_pids: &[u64]) -> bool {
+    !target_pids.is_empty()
+        && target_pids
+            .iter()
+            .copied()
+            .enumerate()
+            .all(|(index, pid)| pid != 0 && !target_pids[..index].contains(&pid))
+}
+
 fn spawn_response(response: LoaderSpawnResponse) -> HandledLoaderRequest {
     HandledLoaderRequest {
         reply: LoaderReply::Spawn(response),
         cleanup_fds: Vec::new(),
+        demote_after_reply: false,
     }
 }
 
@@ -370,7 +455,7 @@ fn handle_request(
             return spawn_response(response);
         }
     };
-    debug_line(&format!("loaderd: spawn begin exec={exec_path}"));
+    trace_line(&format!("loaderd: spawn begin exec={exec_path}"));
     let fd = match open_immutable_file_snapshot(exec_path) {
         Ok(fd) => fd,
         Err(errno) => {
@@ -381,8 +466,8 @@ fn handle_request(
             return spawn_response(response);
         }
     };
-    debug_line(&format!("loaderd: open done exec={exec_path}"));
-    debug_line(&format!("loaderd: validate begin exec={exec_path}"));
+    trace_line(&format!("loaderd: open done exec={exec_path}"));
+    trace_line(&format!("loaderd: validate begin exec={exec_path}"));
     let executable_admission = match validate_executable_fd(fd) {
         Ok(admission) => admission,
         Err(errno) => {
@@ -393,7 +478,7 @@ fn handle_request(
         }
     };
     let executable_format = executable_admission.format();
-    debug_line(&format!("loaderd: validate done exec={exec_path}"));
+    trace_line(&format!("loaderd: validate done exec={exec_path}"));
     if !operation.allows_format(executable_format) {
         let _ = syscall1(SYS_CLOSE, fd as u64);
         response.status = ENOEXEC;
@@ -435,7 +520,7 @@ fn handle_request(
         flags: 0,
         reserved0: 0,
     };
-    debug_line(&format!("loaderd: prepare begin exec={exec_path}"));
+    trace_line(&format!("loaderd: prepare begin exec={exec_path}"));
     let prepare_handle = syscall1(
         SYS_RUSTOS_PROC_PREPARE_BROKER,
         (&prepare_args as *const RustosProcPrepareBrokerArgs) as u64,
@@ -446,7 +531,7 @@ fn handle_request(
         response.status = (-prepare_handle) as i32;
         return spawn_response(response);
     }
-    debug_line(&format!("loaderd: prepare done exec={exec_path}"));
+    trace_line(&format!("loaderd: prepare done exec={exec_path}"));
     let prepared = match map_executable_segments(
         fd,
         exec_path,
@@ -457,14 +542,16 @@ fn handle_request(
     ) {
         Ok(prepared) => prepared,
         Err(errno) => {
-            debug_line("loaderd: map executable failed");
+            debug_line(&format!(
+                "loaderd: map executable failed exec={exec_path} errno={errno}"
+            ));
             let _ = syscall1(SYS_CLOSE, fd as u64);
             abort_prepare(prepare_handle as u64, errno as u64);
             response.status = errno;
             return spawn_response(response);
         }
     };
-    debug_line(&format!("loaderd: map done exec={exec_path}"));
+    trace_line(&format!("loaderd: map done exec={exec_path}"));
     if let Some(ref result) = prepared.linux_runtime {
         if let Err(errno) = set_linux_runtime_broker(prepare_handle as u64, result) {
             debug_line("loaderd: linux runtime broker failed");
@@ -489,7 +576,7 @@ fn handle_request(
         }
     }
 
-    debug_line(&format!("loaderd: commit begin exec={exec_path}"));
+    trace_line(&format!("loaderd: commit begin exec={exec_path}"));
     let pid = commit_prepared_executable(
         operation,
         request,
@@ -512,15 +599,15 @@ fn handle_request(
     }
     response.pid = pid;
     debug_line(&format!("loaderd: spawn done exec={exec_path} pid={pid}"));
-    demote_after_ui_bootstrap(exec_path);
     HandledLoaderRequest {
         reply: LoaderReply::Spawn(response),
         cleanup_fds: prepared.cleanup_fds,
+        demote_after_reply: exec_path == UI_SERVER_EXEC_PATH,
     }
 }
 
-fn demote_after_ui_bootstrap(exec_path: &str) {
-    if exec_path != UI_SERVER_EXEC_PATH || POST_UI_DEMOTED.load(Ordering::Acquire) {
+fn demote_after_ui_bootstrap_reply() {
+    if POST_UI_DEMOTED.load(Ordering::Acquire) {
         return;
     }
     if syscall0(SYS_RUSTOS_SCHED_DEMOTE_SELF) == 0 {
@@ -539,7 +626,7 @@ fn authorize_loader_operation(op: u16, sender_pid: u64) -> Result<(), i32> {
     if sender_pid == 0 {
         return Err(EACCES);
     }
-    if op == LOADER_OP_ACTIVATE {
+    if matches!(op, LOADER_OP_ACTIVATE | LOADER_OP_ACTIVATE_BATCH) {
         return Ok(());
     }
     for service_id in [
@@ -704,7 +791,7 @@ fn open_immutable_file_snapshot(path: &str) -> Result<i32, i32> {
         recv_fds_ptr: received_fd.as_mut_ptr() as u64,
         recv_fd_count_ptr: (&mut received_fd_count as *mut u16) as u64,
     };
-    debug_line(&format!(
+    trace_line(&format!(
         "loaderd: executable snapshot call begin exec={path} timeout_ms={EXECUTABLE_SNAPSHOT_HARD_LIMIT_MS}"
     ));
     let status = unsafe {
@@ -721,7 +808,7 @@ fn open_immutable_file_snapshot(path: &str) -> Result<i32, i32> {
         ));
         return Err((-status) as i32);
     }
-    debug_line(&format!(
+    trace_line(&format!(
         "loaderd: executable snapshot call replied exec={path} bytes={status} handles={received_fd_count}"
     ));
     let close_received = |count: u16, fds: &[u64; 1]| {
@@ -945,4 +1032,24 @@ fn debug_line(message: &str) {
         line.as_ptr() as u64,
         (len + 1) as u64,
     );
+}
+
+#[inline]
+fn trace_line(message: &str) {
+    if option_env!("RUSTOS_LOGGING_BOOT_TRACE_ENABLED") == Some("true") {
+        debug_line(message);
+    }
+}
+
+#[cfg(test)]
+mod activation_batch_tests {
+    use super::activate_batch_targets_valid;
+
+    #[test]
+    fn activation_batch_targets_are_nonzero_and_unique() {
+        assert!(activate_batch_targets_valid(&[11, 12, 13]));
+        assert!(!activate_batch_targets_valid(&[]));
+        assert!(!activate_batch_targets_valid(&[11, 0]));
+        assert!(!activate_batch_targets_valid(&[11, 12, 11]));
+    }
 }

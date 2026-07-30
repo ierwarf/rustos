@@ -10,8 +10,22 @@
 
 int main(void) {
     SYSTEM_INFO info;
+    BOOL (WINAPI *query_affinity)(HANDLE, PDWORD_PTR, PDWORD_PTR) =
+        GetProcessAffinityMask;
+    BOOL (WINAPI *set_process_affinity)(HANDLE, DWORD_PTR) =
+        SetProcessAffinityMask;
+    DWORD_PTR (WINAPI *set_thread_affinity)(HANDLE, DWORD_PTR) =
+        SetThreadAffinityMask;
+    DWORD (WINAPI *get_current_processor)(void) =
+        GetCurrentProcessorNumber;
     GetSystemInfo(&info);
+    (void)query_affinity;
+    (void)set_process_affinity;
+    (void)set_thread_affinity;
+    (void)get_current_processor;
     PAIR("bool_false", FALSE);
+    PAIR("current_process_pseudo", (ULONG_PTR)GetCurrentProcess());
+    PAIR("current_thread_pseudo", (ULONG_PTR)GetCurrentThread());
     PAIR("error_invalid_function", ERROR_INVALID_FUNCTION);
     PAIR("error_invalid_handle", ERROR_INVALID_HANDLE);
     PAIR("error_invalid_parameter", ERROR_INVALID_PARAMETER);
@@ -40,6 +54,7 @@ int main(void) {
     PAIR("size_image_optional_header64", sizeof(IMAGE_OPTIONAL_HEADER64));
     PAIR("size_image_section_header", sizeof(IMAGE_SECTION_HEADER));
     PAIR("size_image_thunk_data64", sizeof(IMAGE_THUNK_DATA64));
+    PAIR("size_system_info", sizeof(SYSTEM_INFO));
     PAIR32("status_invalid_handle", STATUS_INVALID_HANDLE);
     PAIR32("status_invalid_parameter", STATUS_INVALID_PARAMETER);
     PAIR32("status_invalid_system_service", STATUS_INVALID_SYSTEM_SERVICE);

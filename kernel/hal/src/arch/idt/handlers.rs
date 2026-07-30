@@ -1,4 +1,4 @@
-//! x86_64 exception and interrupt admission for the BSP.
+//! x86_64 exception and interrupt admission for every online CPU.
 //!
 //! - **Owner:** `kernel-hal` owns CPU-entry decoding; policy and user-fault
 //!   disposition belong to registered executive/compat hooks.
@@ -136,8 +136,9 @@ fn rustos_default_handler_aligned(
         );
     }
 
+    let logical_cpu = nucleus_core::util::lockdep::current_cpu_index();
     panic!(
-        "Unhandled exception: vector = {}, error code = {:?}, cr2 = {:#x}, rip = {:#x}, cs = {:#x}, rflags = {:#x}, rsp = {:#x}, ss = {:#x}",
+        "Unhandled exception: vector = {}, error code = {:?}, cr2 = {:#x}, rip = {:#x}, cs = {:#x}, rflags = {:#x}, rsp = {:#x}, ss = {:#x}, cpu = {}, apic = {:#x}, task_owner = {:?}, irq_depth = {}, preempt_depth = {}, raw_class = {:?}, last_dispatch = {:?}, last_scheduler_observation = {:?}",
         index,
         error_code,
         cr2,
@@ -146,6 +147,14 @@ fn rustos_default_handler_aligned(
         stack_frame.cpu_flags.bits(),
         stack_frame.stack_pointer.as_u64(),
         stack_frame.stack_segment.0,
+        logical_cpu,
+        nucleus_core::util::lockdep::hardware_apic_id(),
+        nucleus_core::util::lockdep::current_task_owner(),
+        nucleus_core::util::lockdep::irq_context_depth(),
+        nucleus_core::util::lockdep::preemption_depth(),
+        nucleus_core::util::lockdep::current_lock_class(),
+        nucleus_core::util::lockdep::scheduler_dispatch_witness(logical_cpu),
+        nucleus_core::util::lockdep::scheduler_observation_witness(logical_cpu),
     );
 }
 
@@ -284,6 +293,13 @@ pub extern "x86-interrupt" fn keyboard_interrupt_eoi_handler(_stack_frame: Inter
 pub extern "x86-interrupt" fn mouse_interrupt_eoi_handler(_stack_frame: InterruptStackFrame) {
     let _irq_context = nucleus_core::util::lockdep::enter_irq_context();
     crate::arch::pic::send_eoi(MOUSE_INTERRUPT_VECTOR);
+}
+
+/// Flush one generation-bound mailbox without acquiring a sender or scheduler
+/// lock. The leaf publishes its acknowledgement before the local APIC EOI.
+pub extern "x86-interrupt" fn tlb_shootdown_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    let _irq_context = nucleus_core::util::lockdep::enter_irq_context();
+    crate::arch::tlb_shootdown::on_interrupt();
 }
 
 #[cfg(test)]

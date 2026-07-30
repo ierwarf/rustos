@@ -108,6 +108,10 @@ struct SysretReturnContract {
 
 const _: [(); 128] = [(); core::mem::size_of::<SyscallFrame>()];
 const _: [(); 0] = [(); core::mem::size_of::<SyscallFrame>() % 16];
+const SYSCALL_ENTRY_XMM_BYTES: usize = 16 * 16;
+const SYSCALL_ENTRY_STACK_BYTES: usize =
+    core::mem::size_of::<SyscallFrame>() + SYSCALL_ENTRY_XMM_BYTES;
+const _: [(); 384] = [(); SYSCALL_ENTRY_STACK_BYTES];
 
 pub use syscall_core::{
     activate_linux_compat_cpu_local, linux_compat_current_task_offset,
@@ -127,9 +131,34 @@ global_asm!(
         # or independently initialized CPU-local value cannot turn an ordinary
         # aligned Rust load/store into #GP.
         and rsp, -16
-        # A 128-byte frame preserves call-site alignment so Rust enters with
-        # rsp % 16 == 8 as required by the x86_64 SysV ABI.
-        sub rsp, 128
+        # Preserve every architectural XMM register before the first Rust
+        # instruction. The compiler may use XMM scratch in syscall_dispatch's
+        # prologue, before SyscallUserSimdSnapshot::capture can execute. The
+        # full FPU/XSAVE snapshot still owns x87/MXCSR/YMM state; this entry
+        # prefix closes the otherwise unobservable pre-capture window.
+        #
+        # The complete 384-byte allocation preserves call-site alignment so
+        # Rust enters with rsp % 16 == 8 as required by the x86_64 SysV ABI.
+        sub rsp, {stack_bytes}
+
+        # SIMD-ENTRY-SAVE-BEGIN
+        movdqu [rsp + {frame_bytes} + 0x00], xmm0
+        movdqu [rsp + {frame_bytes} + 0x10], xmm1
+        movdqu [rsp + {frame_bytes} + 0x20], xmm2
+        movdqu [rsp + {frame_bytes} + 0x30], xmm3
+        movdqu [rsp + {frame_bytes} + 0x40], xmm4
+        movdqu [rsp + {frame_bytes} + 0x50], xmm5
+        movdqu [rsp + {frame_bytes} + 0x60], xmm6
+        movdqu [rsp + {frame_bytes} + 0x70], xmm7
+        movdqu [rsp + {frame_bytes} + 0x80], xmm8
+        movdqu [rsp + {frame_bytes} + 0x90], xmm9
+        movdqu [rsp + {frame_bytes} + 0xA0], xmm10
+        movdqu [rsp + {frame_bytes} + 0xB0], xmm11
+        movdqu [rsp + {frame_bytes} + 0xC0], xmm12
+        movdqu [rsp + {frame_bytes} + 0xD0], xmm13
+        movdqu [rsp + {frame_bytes} + 0xE0], xmm14
+        movdqu [rsp + {frame_bytes} + 0xF0], xmm15
+        # SIMD-ENTRY-SAVE-END
 
         mov [rsp + 24], rax
         mov rax, gs:[8]
@@ -158,6 +187,25 @@ global_asm!(
         call syscall_dispatch
         cli
 
+        # SIMD-ENTRY-RESTORE-BEGIN
+        movdqu xmm0, [rsp + {frame_bytes} + 0x00]
+        movdqu xmm1, [rsp + {frame_bytes} + 0x10]
+        movdqu xmm2, [rsp + {frame_bytes} + 0x20]
+        movdqu xmm3, [rsp + {frame_bytes} + 0x30]
+        movdqu xmm4, [rsp + {frame_bytes} + 0x40]
+        movdqu xmm5, [rsp + {frame_bytes} + 0x50]
+        movdqu xmm6, [rsp + {frame_bytes} + 0x60]
+        movdqu xmm7, [rsp + {frame_bytes} + 0x70]
+        movdqu xmm8, [rsp + {frame_bytes} + 0x80]
+        movdqu xmm9, [rsp + {frame_bytes} + 0x90]
+        movdqu xmm10, [rsp + {frame_bytes} + 0xA0]
+        movdqu xmm11, [rsp + {frame_bytes} + 0xB0]
+        movdqu xmm12, [rsp + {frame_bytes} + 0xC0]
+        movdqu xmm13, [rsp + {frame_bytes} + 0xD0]
+        movdqu xmm14, [rsp + {frame_bytes} + 0xE0]
+        movdqu xmm15, [rsp + {frame_bytes} + 0xF0]
+        # SIMD-ENTRY-RESTORE-END
+
         mov rdi, [rsp + 32]
         mov rsi, [rsp + 40]
         mov rdx, [rsp + 48]
@@ -176,7 +224,9 @@ global_asm!(
         swapgs
         sysretq
     .size syscall_entry, . - syscall_entry
- "#
+ "#,
+    frame_bytes = const core::mem::size_of::<SyscallFrame>(),
+    stack_bytes = const SYSCALL_ENTRY_STACK_BYTES,
 );
 
 pub fn init() {
@@ -492,5 +542,32 @@ mod tests {
             resume < validation,
             "SYSRET validation must follow the last possible continuation resume"
         );
+    }
+
+    #[test]
+    fn syscall_entry_preserves_xmm_before_any_rust_dispatch() {
+        let source = include_str!("mod.rs");
+        let save = source
+            .split("# SIMD-ENTRY-SAVE-BEGIN")
+            .nth(1)
+            .and_then(|rest| rest.split("# SIMD-ENTRY-SAVE-END").next())
+            .expect("assembly XMM entry save");
+        let restore = source
+            .split("# SIMD-ENTRY-RESTORE-BEGIN")
+            .nth(1)
+            .and_then(|rest| rest.split("# SIMD-ENTRY-RESTORE-END").next())
+            .expect("assembly XMM return restore");
+        let dispatch = source.find("call syscall_dispatch").expect("Rust dispatch");
+        let save_begin = source
+            .find("# SIMD-ENTRY-SAVE-BEGIN")
+            .expect("XMM save marker");
+        let restore_begin = source
+            .find("# SIMD-ENTRY-RESTORE-BEGIN")
+            .expect("XMM restore marker");
+
+        assert_eq!(save.matches("movdqu [rsp +").count(), 16);
+        assert_eq!(restore.matches("movdqu xmm").count(), 16);
+        assert!(save_begin < dispatch);
+        assert!(dispatch < restore_begin);
     }
 }

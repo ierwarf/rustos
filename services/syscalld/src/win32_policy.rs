@@ -3,15 +3,20 @@ use rustos_user_abi::syscall::{
     SYSCALL_OFFLOAD_OP_WIN32_ALLOC_VIRTUAL_MEMORY, SYSCALL_OFFLOAD_OP_WIN32_CLOSE,
     SYSCALL_OFFLOAD_OP_WIN32_DELAY_EXECUTION, SYSCALL_OFFLOAD_OP_WIN32_EXIT_PROCESS,
     SYSCALL_OFFLOAD_OP_WIN32_FREE_VIRTUAL_MEMORY, SYSCALL_OFFLOAD_OP_WIN32_GET_CONSOLE_MODE,
-    SYSCALL_OFFLOAD_OP_WIN32_PROTECT_VIRTUAL_MEMORY, SYSCALL_OFFLOAD_OP_WIN32_QUERY_VIRTUAL_MEMORY,
-    SYSCALL_OFFLOAD_OP_WIN32_READ_FILE, SYSCALL_OFFLOAD_OP_WIN32_SET_CONSOLE_MODE,
-    SYSCALL_OFFLOAD_OP_WIN32_WRITE_FILE,
+    SYSCALL_OFFLOAD_OP_WIN32_GET_CURRENT_PROCESSOR_NUMBER,
+    SYSCALL_OFFLOAD_OP_WIN32_PROTECT_VIRTUAL_MEMORY,
+    SYSCALL_OFFLOAD_OP_WIN32_QUERY_PROCESS_AFFINITY,
+    SYSCALL_OFFLOAD_OP_WIN32_QUERY_SYSTEM_INFORMATION,
+    SYSCALL_OFFLOAD_OP_WIN32_QUERY_VIRTUAL_MEMORY, SYSCALL_OFFLOAD_OP_WIN32_READ_FILE,
+    SYSCALL_OFFLOAD_OP_WIN32_SET_CONSOLE_MODE, SYSCALL_OFFLOAD_OP_WIN32_SET_PROCESS_AFFINITY,
+    SYSCALL_OFFLOAD_OP_WIN32_SET_THREAD_AFFINITY, SYSCALL_OFFLOAD_OP_WIN32_WRITE_FILE,
 };
 use rustos_user_abi::windows::{
-    BOOL_FALSE, ERROR_INVALID_FUNCTION, ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER,
-    HANDLE_CURRENT_PROCESS, HANDLE_STDERR, HANDLE_STDIN, HANDLE_STDOUT, MEM_COMMIT, MEM_RELEASE,
-    MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_NOACCESS, PAGE_READONLY,
-    PAGE_READWRITE, PAGE_SIZE,
+    BOOL_FALSE, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_FUNCTION, ERROR_INVALID_HANDLE,
+    ERROR_INVALID_LEVEL, ERROR_INVALID_PARAMETER, HANDLE_CURRENT_PROCESS, HANDLE_CURRENT_THREAD,
+    HANDLE_STDERR, HANDLE_STDIN, HANDLE_STDOUT, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE,
+    PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
+    PAGE_SIZE,
 };
 
 const MAX_CONSOLE_IO_BYTES: u64 = 1024 * 1024;
@@ -32,12 +37,60 @@ pub(crate) fn handle_request(
         SYSCALL_OFFLOAD_OP_WIN32_FREE_VIRTUAL_MEMORY => validate_virtual_free(request),
         SYSCALL_OFFLOAD_OP_WIN32_PROTECT_VIRTUAL_MEMORY => validate_virtual_protect(request),
         SYSCALL_OFFLOAD_OP_WIN32_QUERY_VIRTUAL_MEMORY => validate_virtual_query(request),
+        SYSCALL_OFFLOAD_OP_WIN32_QUERY_SYSTEM_INFORMATION => {
+            validate_query_system_information(request)
+        }
+        SYSCALL_OFFLOAD_OP_WIN32_QUERY_PROCESS_AFFINITY => validate_query_process_affinity(request),
+        SYSCALL_OFFLOAD_OP_WIN32_SET_PROCESS_AFFINITY => validate_set_process_affinity(request),
+        SYSCALL_OFFLOAD_OP_WIN32_SET_THREAD_AFFINITY => validate_set_thread_affinity(request),
+        SYSCALL_OFFLOAD_OP_WIN32_GET_CURRENT_PROCESSOR_NUMBER => {
+            validate_get_current_processor_number(request)
+        }
         _ => Err(ERROR_INVALID_FUNCTION),
     };
     if let Err(error) = denied {
         response.status = error;
         response.result = BOOL_FALSE;
     }
+}
+
+fn validate_query_process_affinity(request: &Win32SyscallOffloadRequest) -> Result<(), u32> {
+    syscalld::affinity_policy::admit_windows_query_process_affinity(request)
+        .map(|_| ())
+        .ok_or(ERROR_INVALID_PARAMETER)
+}
+
+fn validate_set_process_affinity(request: &Win32SyscallOffloadRequest) -> Result<(), u32> {
+    syscalld::affinity_policy::admit_windows_set_process_affinity(request)
+        .map(|_| ())
+        .ok_or(ERROR_INVALID_PARAMETER)
+}
+
+fn validate_set_thread_affinity(request: &Win32SyscallOffloadRequest) -> Result<(), u32> {
+    syscalld::affinity_policy::admit_windows_set_thread_affinity(request)
+        .map(|_| ())
+        .ok_or(ERROR_INVALID_PARAMETER)
+}
+
+fn validate_get_current_processor_number(request: &Win32SyscallOffloadRequest) -> Result<(), u32> {
+    if request.arg0 != 0 || request.arg1 != 0 || request.arg2 != 0 || request.arg3 != 0 {
+        return Err(ERROR_INVALID_PARAMETER);
+    }
+    syscalld::affinity_policy::admit_windows_online_mask(request)
+        .map(|_| ())
+        .ok_or(ERROR_INVALID_PARAMETER)
+}
+
+fn validate_query_system_information(request: &Win32SyscallOffloadRequest) -> Result<(), u32> {
+    use syscalld::affinity_policy::WindowsTopologyError;
+
+    syscalld::affinity_policy::admit_windows_basic_information(request)
+        .map(|_| ())
+        .map_err(|error| match error {
+            WindowsTopologyError::InvalidClass => ERROR_INVALID_LEVEL,
+            WindowsTopologyError::InvalidPointerOrStamp => ERROR_INVALID_PARAMETER,
+            WindowsTopologyError::BufferTooSmall => ERROR_INSUFFICIENT_BUFFER,
+        })
 }
 
 fn validate_write_file(request: &Win32SyscallOffloadRequest) -> Result<(), u32> {
@@ -64,7 +117,11 @@ fn validate_console_io(buffer: u64, len: u64, overlapped: u64) -> Result<(), u32
 fn validate_close(request: &Win32SyscallOffloadRequest) -> Result<(), u32> {
     if matches!(
         request.arg0,
-        HANDLE_STDIN | HANDLE_STDOUT | HANDLE_STDERR | HANDLE_CURRENT_PROCESS
+        HANDLE_STDIN
+            | HANDLE_STDOUT
+            | HANDLE_STDERR
+            | HANDLE_CURRENT_PROCESS
+            | HANDLE_CURRENT_THREAD
     ) {
         Ok(())
     } else {

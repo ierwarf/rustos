@@ -9,6 +9,8 @@ use core::fmt;
 #[cfg(rustos_debug_print_enabled)]
 use core::fmt::Write as _;
 #[cfg(rustos_debug_print_enabled)]
+use core::hint::spin_loop;
+#[cfg(rustos_debug_print_enabled)]
 use core::sync::atomic::{AtomicU64, Ordering};
 #[cfg(rustos_debug_print_enabled)]
 use os_observatory::sink::{RingBufferSink as ObservatoryRingBufferSink, Sink as ObservatorySink};
@@ -36,6 +38,8 @@ const TEXT_RING_CAPACITY: usize = RUSTOS_LOGGING_RING_BUFFER_BYTES;
 const SYNTHETIC_WARNING_MODULE_PATH: &str = "nucleus_core::debug";
 #[cfg(rustos_debug_print_enabled)]
 const MILESTONE_CAPACITY: usize = 128;
+#[cfg(rustos_debug_print_enabled)]
+const REQUIRED_MILESTONE_OUTPUT_ATTEMPTS: usize = 1 << 20;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CurrentUserLogContext {
@@ -557,45 +561,68 @@ fn emit_milestone_debugcon_line(record: MilestoneRecord) {
         return;
     }
     let user_context = current_user_context();
-    if let Some(_guard) = try_debug_output_lock() {
-        let mut writer = DebugconWriter;
-        let log_seq = LOG_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let _ = write!(
-            writer,
-            "seq={} ts_us={} tick={} lvl=info cat={} mod={} line=0 pid=",
-            log_seq,
-            record.ts_us,
-            record.tick,
-            record.category.as_str(),
-            SYNTHETIC_WARNING_MODULE_PATH,
-        );
-        match user_context.map(|context| context.process_id) {
-            Some(process_id) => {
-                let _ = write!(writer, "{process_id}");
+    // Commercial acceptance gates must not confuse a busy debug sink with a
+    // missing CPU or product transition. These milestones are one-shot and
+    // retry the nonblocking output lock for a fixed bound; ordinary diagnostic
+    // traffic remains best-effort.
+    let attempts = if milestone_requires_reliable_output(record.name) {
+        REQUIRED_MILESTONE_OUTPUT_ATTEMPTS
+    } else {
+        1
+    };
+    for _ in 0..attempts {
+        if let Some(_guard) = try_debug_output_lock() {
+            let mut writer = DebugconWriter;
+            let log_seq = LOG_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let _ = write!(
+                writer,
+                "seq={} ts_us={} tick={} lvl=info cat={} mod={} line=0 pid=",
+                log_seq,
+                record.ts_us,
+                record.tick,
+                record.category.as_str(),
+                SYNTHETIC_WARNING_MODULE_PATH,
+            );
+            match user_context.map(|context| context.process_id) {
+                Some(process_id) => {
+                    let _ = write!(writer, "{process_id}");
+                }
+                None => {
+                    let _ = writer.write_str("-");
+                }
             }
-            None => {
-                let _ = writer.write_str("-");
+            let _ = writer.write_str(" tid=");
+            match user_context.map(|context| context.thread_id) {
+                Some(thread_id) => {
+                    let _ = write!(writer, "{thread_id}");
+                }
+                None => {
+                    let _ = writer.write_str("-");
+                }
             }
+            let _ = write!(
+                writer,
+                " msg=\"milestone seq={} cat={} name={} arg0={:#x} arg1={:#x}\"\r\n",
+                record.seq,
+                record.category.as_str(),
+                record.name,
+                record.arg0,
+                record.arg1,
+            );
+            return;
         }
-        let _ = writer.write_str(" tid=");
-        match user_context.map(|context| context.thread_id) {
-            Some(thread_id) => {
-                let _ = write!(writer, "{thread_id}");
-            }
-            None => {
-                let _ = writer.write_str("-");
-            }
-        }
-        let _ = write!(
-            writer,
-            " msg=\"milestone seq={} cat={} name={} arg0={:#x} arg1={:#x}\"\r\n",
-            record.seq,
-            record.category.as_str(),
-            record.name,
-            record.arg0,
-            record.arg1,
-        );
+        spin_loop();
     }
+}
+
+#[cfg(rustos_debug_print_enabled)]
+fn milestone_requires_reliable_output(name: &str) -> bool {
+    name.starts_with("smp-")
+        || name.starts_with("product-")
+        || name == "dvm-block-first-completion"
+        || name == "task-context-corrupted"
+        || name == "linux-user-fault"
+        || name == "linux-thread-clone-rejected"
 }
 
 #[cfg(rustos_debug_print_enabled)]
@@ -1015,5 +1042,20 @@ mod tests {
         // port-I/O exit and make the diagnostic path amplify the overload.
         assert!(!milestone_debugcon_visible("ipc-reply-timeout"));
         assert!(milestone_debugcon_visible("proc-commit-address-space-done"));
+    }
+
+    #[test]
+    fn acceptance_milestones_retry_the_contended_debug_sink() {
+        assert!(milestone_requires_reliable_output("smp-cpu-online"));
+        assert!(milestone_requires_reliable_output("product-storage-ready"));
+        assert!(milestone_requires_reliable_output(
+            "dvm-block-first-completion"
+        ));
+        assert!(milestone_requires_reliable_output("task-context-corrupted"));
+        assert!(milestone_requires_reliable_output("linux-user-fault"));
+        assert!(milestone_requires_reliable_output(
+            "linux-thread-clone-rejected"
+        ));
+        assert!(!milestone_requires_reliable_output("ipc-reply-rejected"));
     }
 }

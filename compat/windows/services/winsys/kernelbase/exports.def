@@ -11,8 +11,11 @@ EXPORTS
     GetCommandLineW
     GetConsoleMode
     GetCurrentProcess
+    GetCurrentProcessorNumber
     GetCurrentProcessId
+    GetCurrentThread
     GetCurrentThreadId
+    GetProcessAffinityMask
     GetEnvironmentStringsA
     GetEnvironmentStringsW
     GetFileType
@@ -24,6 +27,10 @@ EXPORTS
     GetProcessHeap
     GetProcAddress
     GetStdHandle
+    GetSystemInfo
+    GetNativeSystemInfo
+    GetActiveProcessorCount
+    GetActiveProcessorGroupCount
     HeapAlloc
     HeapFree
     HeapReAlloc
@@ -36,6 +43,8 @@ EXPORTS
     WideCharToMultiByte
     ReadFile
     SetConsoleMode
+    SetProcessAffinityMask
+    SetThreadAffinityMask
     SetLastError
     SetUnhandledExceptionFilter
     Sleep

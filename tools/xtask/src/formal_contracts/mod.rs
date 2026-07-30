@@ -9,6 +9,9 @@ use anyhow::Context;
 use crate::Result;
 use crate::cli::FormalContractsCommand;
 
+#[cfg(test)]
+pub(crate) use evidence::validated_smp_launch_evidence_for_tests;
+pub(crate) use evidence::{ValidatedSmpLaunchEvidence, validate_smp_launch_evidence};
 pub(crate) use registry::{ContractImpact, ContractRegistry};
 pub(crate) use runtime_trace::{KvmRuntimeObservation, record_kvm_runtime_trace};
 

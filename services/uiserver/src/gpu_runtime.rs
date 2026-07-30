@@ -357,17 +357,45 @@ impl GpuCompositor {
         let logical_bytes = usize::try_from(info.atlas_stride_bytes)
             .ok()
             .and_then(|stride| stride.checked_mul(info.atlas_height as usize))
-            .ok_or(EINVAL)?;
+            .ok_or_else(|| {
+                debug_line("uiserver: GPU initialization rejected stage=atlas-size-overflow");
+                EINVAL
+            })?;
         if logical_bytes == 0 || !logical_bytes.is_multiple_of(size_of::<u32>()) {
+            debug_line(&format!(
+                "uiserver: GPU initialization rejected stage=atlas-size bytes={logical_bytes}"
+            ));
             return Err(EINVAL);
         }
         let mut slots = Vec::with_capacity(info.slot_count as usize);
-        for _ in 0..info.slot_count {
-            let surface = display_create_gpu_atlas_surface(display_fd, info)?;
-            let raw_fd = i32::try_from(surface.handle).map_err(|_| EINVAL)?;
+        for slot_index in 0..info.slot_count {
+            let surface = display_create_gpu_atlas_surface(display_fd, info).map_err(|errno| {
+                debug_line(&format!(
+                    "uiserver: GPU initialization rejected stage=create-atlas slot={slot_index} errno={errno}"
+                ));
+                errno
+            })?;
+            let raw_fd = i32::try_from(surface.handle).map_err(|_| {
+                debug_line(&format!(
+                    "uiserver: GPU initialization rejected stage=atlas-fd slot={slot_index} handle={}",
+                    surface.handle
+                ));
+                EINVAL
+            })?;
             let surface_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
-            let mapping_len = usize::try_from(surface.mapping_len).map_err(|_| EINVAL)?;
-            let mapping = map_surface(surface_fd.as_raw_fd(), mapping_len)?;
+            let mapping_len = usize::try_from(surface.mapping_len).map_err(|_| {
+                debug_line(&format!(
+                    "uiserver: GPU initialization rejected stage=atlas-map-size slot={slot_index} bytes={}",
+                    surface.mapping_len
+                ));
+                EINVAL
+            })?;
+            let mapping = map_surface(surface_fd.as_raw_fd(), mapping_len).map_err(|errno| {
+                debug_line(&format!(
+                    "uiserver: GPU initialization rejected stage=atlas-map slot={slot_index} errno={errno}"
+                ));
+                errno
+            })?;
             slots.push(GpuAtlasSlot {
                 surface,
                 _surface_fd: surface_fd,
@@ -382,34 +410,60 @@ impl GpuCompositor {
                 .enumerate()
                 .any(|(index, slot)| slot.surface.reserved as usize != index)
         {
+            debug_line("uiserver: GPU initialization rejected stage=atlas-slot-identity");
             return Err(EINVAL);
         }
         let mut compiler =
-            GpuSceneCompiler::new(info.context_id, info.context_epoch).map_err(gpu_scene_errno)?;
+            GpuSceneCompiler::new(info.context_id, info.context_epoch).map_err(|error| {
+                let errno = gpu_scene_errno(error);
+                debug_line(&format!(
+                    "uiserver: GPU initialization rejected stage=compiler-create errno={errno}"
+                ));
+                errno
+            })?;
         compiler
             .begin_prime(info.prime_fence_value)
-            .map_err(gpu_scene_errno)?;
+            .map_err(|error| {
+                let errno = gpu_scene_errno(error);
+                debug_line(&format!(
+                "uiserver: GPU initialization rejected stage=compiler-prime-begin errno={errno}"
+            ));
+                errno
+            })?;
         // GPU_GET_INFO carries the DVM-produced, kernel-module-validated
         // completion for the fixed GLES pipeline and initial KMS frame. The
         // local scheduler advances only from that measured transport record.
+        let submit_flags = match info.flags {
+            rustos_user_abi::device::DISPLAY_GPU_INFO_FLAG_STAGED_COPY => {
+                driver_domain_protocol::DVM_GPU_ATLAS_SUBMIT_FLAG_STAGED_COPY
+            }
+            rustos_user_abi::device::DISPLAY_GPU_INFO_FLAG_DIRECT_DMABUF => {
+                driver_domain_protocol::DVM_GPU_ATLAS_SUBMIT_FLAG_DIRECT_DMABUF
+            }
+            _ => {
+                debug_line(&format!(
+                    "uiserver: GPU initialization rejected stage=provider-flags flags={:#x}",
+                    info.flags
+                ));
+                return Err(EINVAL);
+            }
+        };
         compiler
             .complete_prime(DvmGpuPrimeCompletion {
                 context_id: info.context_id,
                 context_epoch: info.context_epoch,
                 status: DvmGpuPrimeCompletionStatus::Ready,
-                submit_flags: match info.flags {
-                    rustos_user_abi::device::DISPLAY_GPU_INFO_FLAG_STAGED_COPY => {
-                        driver_domain_protocol::DVM_GPU_ATLAS_SUBMIT_FLAG_STAGED_COPY
-                    }
-                    rustos_user_abi::device::DISPLAY_GPU_INFO_FLAG_DIRECT_DMABUF => {
-                        driver_domain_protocol::DVM_GPU_ATLAS_SUBMIT_FLAG_DIRECT_DMABUF
-                    }
-                    _ => return Err(EINVAL),
-                },
+                submit_flags,
                 fence_value: info.prime_fence_value,
                 duration_ns: info.prime_duration_ns,
             })
-            .map_err(gpu_scene_errno)?;
+            .map_err(|error| {
+                let errno = gpu_scene_errno(error);
+                debug_line(&format!(
+                    "uiserver: GPU initialization rejected stage=compiler-prime-complete errno={errno}"
+                ));
+                errno
+            })?;
         let atlas_pixels = logical_bytes / size_of::<u32>();
         Ok(Some(GpuInitialization {
             display: current_display,

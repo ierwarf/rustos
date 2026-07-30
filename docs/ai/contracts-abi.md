@@ -703,13 +703,16 @@ policy remains with the owning service.
   then compat either transfers the devmgrd handle or retains the explicitly
   selected DRM compatibility description.
 - Linux `openat` installs `KernelHandle::RemoteVfs` for regular files + directories after vfsd registration.
-- Linux `dup`/`dup2`/`dup3` acquire the exact service-side
-  reference before publishing the local duplicate. `close` removes the local
-  descriptor first, then performs token-addressed provider release; a wedged
-  vfsd/netd cannot retain a reusable numeric fd or block process retirement.
-  All close/dup/fork/CLOEXEC/exit provider reference operations and matching
-  epoll purges use the 16 ms cancellable internal IPC path. vfsd is the only
-  intended caller of `SYS_RUSTOS_FD_*_BROKER`; gated by `VFS_POLICY`.
+- Linux `dup`/`dup2`/`dup3` acquire the exact open-description reference before
+  publishing the local duplicate. Socket and input descriptions cross their
+  service boundary; remote VFS and epoll descriptor references are counted
+  locally by the kernel fd substrate. Epoll sends only create and final-retire
+  mutations to vfsd, so a routine `fcntl(F_DUPFD*)` cannot inherit vfsd
+  scheduling latency. `close` removes the local descriptor first, then performs
+  any token-addressed final provider release; a wedged vfsd/netd cannot retain
+  a reusable numeric fd or block process retirement. Cross-service cleanup and
+  matching epoll purges use the 16 ms cancellable internal IPC path. vfsd is
+  the only intended caller of `SYS_RUSTOS_FD_*_BROKER`; gated by `VFS_POLICY`.
   Generic apps must not call those brokers directly.
   Fork clones the address space and fd table in one process-state snapshot;
   provider refs are acquired from that frozen child table before publication.
@@ -1246,16 +1249,15 @@ policy remains with the owning service.
 - RustOS-native input polls and uiserver use readiness-then-read safely:
   the worker publishes a policy readiness generation after the empty-to-ready
   transition, and generic poll/epoll rechecks service policy after every
-  generation wake before returning an event. The latency-sensitive
-  uiserver reader performs a zero-time
-  poll, whose non-consuming `STATS` request has the 16 ms IPC bound above,
-  before entering the stateful authorized `READ`; it never starts that generic
-  30-second service transaction merely to discover an empty queue. The reader
-  retains its cumulative 4 ms cadence, so missed slots never accumulate burst
-  credit. Inputd now also publishes a monotonic service-owned readiness
-  generation when its policy queue changes from empty to nonempty. Generic
-  poll/epoll observes that generation without moving input policy or transport-
-  consumer authority out of inputd.
+  generation wake before returning an event. The latency-sensitive uiserver
+  reader registers every input open description in one epoll instance, blocks
+  without a probe cadence, and enters the stateful authorized `READ` only after
+  positive readiness. An endpoint revoke wakes the same wait as ERR/HUP and is
+  fail-closed. The reader is demoted before its first wait, so empty input
+  cannot create System-class polling traffic or canceled reply capabilities.
+  Inputd's monotonic service-owned readiness generation therefore supplies the
+  only empty-to-ready wake authority without moving policy or transport-
+  consumer ownership out of inputd.
 - Inputd is one provider of the common cross-service wait-set ABI. vfsd owns a
   bounded interest registry keyed by the target fd plus stable provider object
   identity, matching Linux's fd/open-description pair; the observed service
@@ -1273,11 +1275,13 @@ policy remains with the owning service.
   returned immediately, otherwise the scan retries until the caller's original
   deadline or an unmasked signal settles it.
 - Wait interests follow open-description lifetime rather than reusable numeric
-  descriptors. Socket and epoll service references are acquired by dup/fork,
-  released by close/CLOEXEC/process exit, and purged after the final reference.
-  Remote VFS descriptor references are different: the kernel fd table is their
-  sole refcount authority, so dup/fork/transfer performs no ambiguous remote
-  increment. Vfsd receives only initial open and idempotent final close.
+  descriptors. Socket and input service references are acquired by
+  dup/fork/transfer and released by close/CLOEXEC/process exit. Epoll and remote
+  VFS descriptor references are kernel-local: transient syscall snapshots do
+  not count, zero cannot be resurrected, and only the initial create/open plus
+  idempotent final retire/close crosses into vfsd. This removes a synchronous
+  policy-service dependency from descriptor duplication while preserving the
+  Linux rule that dup/fork share one open file description.
   Dup/fcntl snapshots one source handle token, acquires its provider reference,
   then revalidates that token under the fd-table lock before commit. Exact-fd
   replacement returns the handle actually retired at that linearization point,
@@ -1405,6 +1409,20 @@ policy remains with the owning service.
   bounded registry. ACTIVATE consumes that pair once; foreign callers and
   replays fail, loaderd restart cannot transfer or erase the authority, and
   requester exit revokes the entry and retires the still-suspended target.
+- `LoaderActivateBatchRequest` v1 / `LOADER_OP_ACTIVATE_BATCH` carries one
+  requester and 1..=8 unique nonzero target PIDs; the unused fixed-array tail
+  and every reserved field are zero. Loaderd rebinds the requester to the
+  kernel-stamped sender before invoking
+  `SYS_RUSTOS_PROC_ACTIVATE_BATCH_BROKER`. Ring0 holds the deferred-activation
+  registry and then the scheduler lock, preflights every exact capability and
+  suspended saved context, publishes the complete cohort, and consumes all
+  capabilities before releasing either owner. For a multi-target batch
+  admitted into an empty spawn FIFO, kernel-ps gives exactly those 2..=8
+  members their FIFO first turns before the synchronous loader reply resumes.
+  Later single spawns cannot extend that prefix, so reply delay remains ABI
+  bounded. Any validation failure changes no member. A post-preflight mismatch
+  is ring0 corruption and panics instead of exposing a partially runnable
+  startup cohort.
 - `SYS_RUSTOS_SPAWN_EXEC` restricted to `rootd` spawning the fixed bootstrap allowlist (`syscalld`, `vfsd`, `loaderd`, `procd`, `initd`). Fails closed for `initd`, generic apps, broad service restarts. rootd may use direct spawn only during fixed bootstrap + `loaderd` recovery; post-bootstrap restarts of other leases must call loaderd.
 - Linux `execve` → `procd` (target auth) → `loaderd` (image materialization). If loader materialization fails, procd must cancel the exec ticket via `SYS_RUSTOS_PROC_CANCEL_EXEC_BROKER` before replying.
 - An exec ticket binds one live, non-exiting Linux `(target_pid, target_tid)` pair. Cancel and exec-target validate that exact stored pair before consuming the ticket; a mismatched request must leave it live. The successful exec-target path publishes its register handoff before replacing the target image. Normal/signal process exit, a non-final target-thread exit, and sibling retirement caused by Linux exec remove stale ticket or handoff state.
@@ -1483,6 +1501,16 @@ through the exact-PID endpoint wait syscall. Activation is single-use, fails
 closed for an unknown, exited, already-running, or non-suspended PID, and
 publishes one spawn-specific scheduler handoff only after this supervisor
 commit point.
+
+Initd batches only siblings whose declared dependency/barrier state is already
+satisfied. Pending independent children remain suspended while their exact
+rootd leases are reported; before a consumer waits on those children, initd
+atomically activates the pending cohort. Netd/devmgrd/inputd therefore publish
+as one cohort before their endpoint barrier, and runtimed/storaged may publish
+together only after that barrier. Batch membership remains initd policy;
+ring0 accepts only the fixed atomic mechanism. The scheduler enqueues every
+member in the existing allocation-free spawn FIFO before loaderd replies, so a
+later child launch cannot overwrite or jump ahead of an earlier sibling.
 
 `LOADER_SPAWN_FLAG_IMMEDIATE_HANDOFF` remains an ABI option for a child with a
 pre-admitted ownership contract; it is not valid for normal supervised service
@@ -1604,6 +1632,18 @@ Kernel keeps only: user-copy, address-space replacement, scheduler mutation, pen
   and self-admits its own receive-loop backoff instead of synchronously calling
   its own endpoint. This capability-bound self path is required to prevent a
   30-second self-deadlock from surfacing as `ETIMEDOUT` to libc `nanosleep`.
+- Linux `sched_getaffinity` and `sched_setaffinity` are versioned two-owner
+  operations. Ring0 resolves the target TID inside the authenticated caller
+  process, snapshots its effective task mask and the exact dense commercial
+  `Online` mask, and stamps `(online bitmap, popcount, observation_version,
+  target_process_id, effective_task_mask)` into the syscalld request. Syscalld
+  admits the ABI shape and exact target owner; ring0 re-resolves and commits
+  after the policy reply. `sched_getaffinity` returns exactly eight kernel mask
+  bytes, while `sched_setaffinity` follows Linux semantics by intersecting the
+  requested mask with Online and rejecting only an empty result. A short
+  `cpusetsize`, forged owner, empty effective mask, stale version, count
+  mismatch, or task mask outside Online fails closed. Returning the whole
+  Online mask for a pinned thread or fabricating CPU zero is forbidden.
 - Linux futex WAIT and WAIT_BITSET accept validated relative/absolute timeout
   timespecs and block on the RTC waiter substrate; timeout-bearing futex calls
   must not return `ENOSYS` or spin in libc retry loops. Any waiter table read by
@@ -1616,9 +1656,10 @@ Kernel keeps only: user-copy, address-space replacement, scheduler mutation, pen
   `list_op_pending` are examined, PI-tagged entries remain explicitly
   unsupported, a word changes only while its TID bits still name the retiring
   thread, `FUTEX_WAITERS` is preserved, `FUTEX_OWNER_DIED` is installed, and
-  one matching waiter is woken. This user-word transition is serialized by the
-  current BSP topology. AP enablement is forbidden until address-space-aware
-  atomic user-u32 compare-exchange replaces the BSP read/write sequence.
+  one matching waiter is woken. The live implementation retains the exact
+  process mapping and uses address-space-aware acquire-load plus bounded
+  AcqRel atomic user-u32 compare-exchange; a BSP read/modify/write sequence is
+  forbidden.
 - `exit_group` and default fatal-signal termination retire every thread in the
   target process only after publishing the process-exiting state. New thread
   attachment and process-scoped authority admission must reject that state;
@@ -1671,6 +1712,17 @@ Kernel keeps only: user-copy, address-space replacement, scheduler mutation, pen
   bounded causal evidence. No interactive frozen window may remain classified
   as a healthy session merely because QEMU itself is still running.
 - Windows syscall policy: `Win32SyscallOffloadRequest`/`Response` + `SYSCALL_OFFLOAD_OP_WIN32_*` range. Kernel dispatcher calls service policy first, validates ABI/status, and must fail closed with a non-success NTSTATUS on malformed or denied responses before performing only the narrow privileged action.
+- Windows CPU affinity uses the documented current-process and current-thread
+  pseudo handles in the first fixed single-group envelope.
+  `GetProcessAffinityMask` returns the scheduler-owned process mask and exact
+  Online system mask; `SetProcessAffinityMask` atomically updates every live
+  thread in the current process; `SetThreadAffinityMask` returns the previous
+  nonzero mask and rejects escape from the process mask; and
+  `GetCurrentProcessorNumber` returns the dense logical CPU that executes the
+  syscall return path. The private ntdll transport normalizes NTSTATUS failures
+  before kernelbase applies Win32 BOOL/zero/previous-mask semantics. Other
+  process or thread handles return `ERROR_INVALID_HANDLE`; they are not
+  silently treated as current.
 
 ## Commercial-Max Protocol
 
@@ -1687,6 +1739,12 @@ do not admit a service, a module-loading path, or a future ABI reuse.
   fallback. The only accepted normal provider is the validated DVM aperture.
 - Built-in framebuffer registration accepts only the DVM primary-provider flag;
   do not infer ownership from geometry or `display_info()` presence.
+- Display readiness is a two-stage observation. The bootstrap `display_get_info`
+  snapshot must carry both primary-provider and DVM-scanout provenance; it may
+  precede GPU-atlas creation. The later kernel-stamped
+  `product-display-ready` milestone proves successful current-epoch GPU
+  promotion. Acceptance must require both observations and must not require the
+  later GPU-compositor bit to have existed in the earlier immutable snapshot.
 - Surface present = kernel fast path: copies validated shared-surface contents into active framebuffer + queues provider flush for bounded housekeeping. **Do not reintroduce synchronous virtio-gpu command waits into app syscall context** for normal uiserver presents.
 - Display ioctl is an explicit two-phase transaction: provider discovery,
   aperture mapping, and any wait-capable setup run before acquiring process
@@ -1759,14 +1817,15 @@ do not admit a service, a module-loading path, or a future ABI reuse.
   `block_current_task` / `block_current_user_task` entry points are removed;
   bootstrap TTY and every other wait must use the same exact arm/commit
   lifecycle.
-- The currently enabled RustOS topology is BSP-only: QEMU supplies one RustOS
-  vCPU, the scheduler and syscall-local state have one global instance, and
-  there is no AP bring-up, CPU-online state machine, per-CPU run queue, or
-  scheduling IPI protocol. APIC-ID-indexed lock diagnostics and SMP-safe wait
-  wording are forward contracts, not evidence that SMP is implemented.
-  `RUSTOS_SMP_READINESS` in the KVM launcher rejects a RustOS vCPU count above
-  one until those properties plus TLB shootdown and translated atomic robust
-  futex cleanup are all declared complete.
+- The current SMP correctness substrate includes AP bring-up, a CPU-online
+  state machine, CPU-local architectural/lockdep/current-task state,
+  reschedule IPI, TLB shootdown, cross-CPU lifetime barriers, and translated
+  atomic robust-futex cleanup. It still uses one serialized scheduler state
+  and broadcast reschedule fan-out rather than the required per-CPU run queues
+  and targeted load balancing. `RUSTOS_SMP_READINESS` is therefore a
+  source-bound admission gate, not a release claim: multi-vCPU commercial
+  acceptance remains closed until the full contract and 1/2/4/8-vCPU
+  qualification matrix in `smp-contract.md` pass.
 - Process-broker registries are fixed-capacity and allocation-free while
   locked. A prepare reserves its mapping-pointer capacity before publication;
   file/data/zero mappings are constructed before acquisition. Removing a

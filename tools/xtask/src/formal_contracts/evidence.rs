@@ -15,6 +15,43 @@ use crate::Result;
 
 const DEFAULT_GRUB_DEV_KEY: &str = "RustOS Dev GRUB <rustos-dev-grub@example.invalid>";
 
+pub(crate) struct ValidatedSmpLaunchEvidence {
+    _private: (),
+}
+
+pub(crate) fn validate_smp_launch_evidence(
+    root: &Path,
+    profile_name: &str,
+) -> Result<ValidatedSmpLaunchEvidence> {
+    let registry = ContractRegistry::load(root)?;
+    registry.validate(root)?;
+    registry.check_generated_doc(root)?;
+    let profile = registry
+        .manifest
+        .profiles
+        .get(profile_name)
+        .context("formal registry lacks the SMP launch evidence profile")?;
+    let source_tree_sha256 = source_tree_hash(root)?;
+    let verification_run = root.join(format!("build/formal/verification-run/{profile_name}.json"));
+    validate_verification_run(root, profile_name, &source_tree_sha256, &verification_run)?;
+    let generated_unix = evidence_mtime(verification_run)?;
+    let expires_unix = generated_unix
+        .checked_add(profile.evidence_max_age_hours.saturating_mul(3600))
+        .context("SMP launch evidence expiry overflow")?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    if now > expires_unix {
+        bail!(
+            "SMP launch evidence profile {profile_name} expired at {expires_unix}; rerun its verification command"
+        );
+    }
+    Ok(ValidatedSmpLaunchEvidence { _private: () })
+}
+
+#[cfg(test)]
+pub(crate) fn validated_smp_launch_evidence_for_tests() -> ValidatedSmpLaunchEvidence {
+    ValidatedSmpLaunchEvidence { _private: () }
+}
+
 #[derive(Serialize)]
 struct EvidenceManifest {
     schema: &'static str,
@@ -297,15 +334,20 @@ fn validate_verification_run(
 ) -> Result<()> {
     validate_passed_evidence(path)?;
     let value: serde_json::Value = serde_json::from_slice(&fs::read(path)?)?;
-    if value.get("schema").and_then(serde_json::Value::as_str)
-        != Some("rustos-formal-verification-run-v1")
-        || value.get("profile").and_then(serde_json::Value::as_str) != Some(profile)
-        || value
-            .get("source_tree_sha256")
-            .and_then(serde_json::Value::as_str)
-            != Some(source_tree_sha256)
+    let observed_schema = value.get("schema").and_then(serde_json::Value::as_str);
+    let observed_profile = value.get("profile").and_then(serde_json::Value::as_str);
+    let observed_source = value
+        .get("source_tree_sha256")
+        .and_then(serde_json::Value::as_str);
+    if observed_schema != Some("rustos-formal-verification-run-v1")
+        || observed_profile != Some(profile)
+        || observed_source != Some(source_tree_sha256)
     {
-        bail!("formal verification run does not bind the current profile and source tree");
+        bail!(
+            "formal verification run binding mismatch: schema={observed_schema:?} \
+             profile={observed_profile:?} expected_profile={profile:?} \
+             source={observed_source:?} expected_source={source_tree_sha256}"
+        );
     }
     let artifacts = value
         .get("artifacts")

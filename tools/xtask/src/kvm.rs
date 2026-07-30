@@ -57,6 +57,8 @@ const DVM_CONTROL_CAPABILITIES: &str =
     "health,device-inventory,driver-inventory,display-evidence-v2,block-evidence-v1,input-stream";
 const RUSTOS_BOOT_MARKER: &str = "rootd: core services ready, spawning initd via loaderd";
 const RUSTOS_INIT_IDENTITY_MARKER: &str = "initd: identity endpoint registered";
+const RUSTOS_BOOT_MILESTONE: &str = "name=product-root-core-ready";
+const RUSTOS_INIT_IDENTITY_MILESTONE: &str = "name=product-init-identity-ready";
 const RUSTOS_POST_INIT_PROVENANCE_MARKER: &str =
     "rootd: post-init deferred-spawn provenance verified";
 const RUSTOS_GPU_SCENE_COMPILER_MARKER: &str =
@@ -70,7 +72,9 @@ const DVM_GPU_LIVE_MARKER: &str = "rustos-dvm-display: gpu-compositor primed con
 const DVM_BOOTSTRAP_FRAME_MARKER: &str = "bootstrap=local-nonblack";
 const RUSTOS_DVM_BLOCK_MARKER: &str = "dvm-block: transport installed generation=1";
 const RUSTOS_DVM_BLOCK_FIRST_COMPLETION_MARKER: &str = "dvm-block: first completion observed";
+const RUSTOS_DVM_BLOCK_FIRST_COMPLETION_MILESTONE: &str = "name=dvm-block-first-completion";
 const RUSTOS_DVM_BLOCK_E2E_MARKER: &str = "storaged: dvm-block e2e flush completed generation=1";
+const RUSTOS_DVM_BLOCK_E2E_MILESTONE: &str = "name=product-storage-ready";
 const RUSTOS_DVM_BLOCK_FLUSH_FAULT_MARKER: &str =
     "dvm-block: injected device fault operation=block.flush generation=1";
 const GUI_DVM_OFFLINE_MARKER: &str = "gui-dvm: peer offline lease revoked";
@@ -157,7 +161,61 @@ const ACPI_VFCT_IMAGE_HEADER_BYTES: usize = 28;
 const ACPI_VFCT_IMAGE_LENGTH_OFFSET: usize = 24;
 const ACPI_VFCT_MAX_BYTES: usize = 4 * 1024 * 1024;
 
+fn rustos_marker_present(log: &str, marker: &str) -> bool {
+    log.contains(marker)
+        || marker == RUSTOS_BOOT_MARKER
+            && (log.contains(RUSTOS_BOOT_MILESTONE)
+                // The bounded milestone/debugcon channel may drop one
+                // contended record. Init identity is a strict causal successor:
+                // rootd cannot spawn initd before the core-ready transition.
+                || log.contains(RUSTOS_INIT_IDENTITY_MILESTONE))
+        || marker == RUSTOS_INIT_IDENTITY_MARKER && log.contains(RUSTOS_INIT_IDENTITY_MILESTONE)
+        || marker == RUSTOS_DVM_BLOCK_FIRST_COMPLETION_MARKER
+            && log.contains(RUSTOS_DVM_BLOCK_FIRST_COMPLETION_MILESTONE)
+        || marker == RUSTOS_DVM_BLOCK_E2E_MARKER && log.contains(RUSTOS_DVM_BLOCK_E2E_MILESTONE)
+}
+
+#[cfg(test)]
+mod marker_tests {
+    use super::*;
+
+    #[test]
+    fn storage_acceptance_accepts_the_reliable_kernel_milestones() {
+        let log = "name=dvm-block-first-completion\nname=product-storage-ready";
+        assert!(rustos_marker_present(
+            log,
+            RUSTOS_DVM_BLOCK_FIRST_COMPLETION_MARKER
+        ));
+        assert!(rustos_marker_present(log, RUSTOS_DVM_BLOCK_E2E_MARKER));
+    }
+}
+
+fn smp_runtime_missing_markers(log: &str, rustos_vcpus: u8) -> Vec<String> {
+    let mut missing = Vec::new();
+    for logical_cpu in 0..rustos_vcpus {
+        for name in [
+            "smp-cpu-online",
+            "smp-cpu-idle-enter",
+            "smp-cpu-first-clockevent",
+            "smp-cpu-first-user-dispatch",
+        ] {
+            let marker = format!("name={name} arg0=0x{logical_cpu:x}");
+            if !log.contains(marker.as_str()) {
+                missing.push(marker);
+            }
+        }
+        if rustos_vcpus > 1 {
+            let marker = format!("name=smp-cpu-first-reschedule-ipi arg0=0x{logical_cpu:x}");
+            if !log.contains(marker.as_str()) {
+                missing.push(marker);
+            }
+        }
+    }
+    missing
+}
+
 include!("kvm/options.rs");
+include!("kvm/manifest.rs");
 include!("kvm/help.rs");
 include!("kvm/layout.rs");
 include!("kvm/guest.rs");

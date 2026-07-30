@@ -16,9 +16,15 @@
 //!   `service-call-authority`, `commercial-envelope`, and
 //!   `input-delivery-lifecycle`.
 use super::*;
+
+mod subject;
+
 use alloc::vec::Vec;
 use core::mem::size_of;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+pub(super) use subject::{
+    current_process_has_service_capability, current_process_with_service_capability,
+};
 
 use kernel_ipc_runtime::api::{KernelEndpointHandle, KernelReplyHandle, KernelTransferredHandle};
 use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
@@ -368,17 +374,6 @@ pub(crate) fn cleanup_service_endpoints_for_process(process_id: u64) {
 
 fn service_exit_requires_input_policy_withdrawal(service_id: u64) -> bool {
     service_id == linux_abi::IPC_SERVICE_INPUTD
-}
-
-pub(super) fn current_process_has_service_capability(capability: u64) -> bool {
-    if capability == 0 {
-        return false;
-    }
-    let Some(process_id) = multitask::current_user_process_id() else {
-        return false;
-    };
-    let _registry = SERVICE_ENDPOINT_REGISTRY_MUTATION.lock();
-    current_process_has_service_capability_locked(capability, process_id)
 }
 
 pub(super) fn current_process_service_capability_snapshot() -> Option<(u64, u64)> {
@@ -744,53 +739,6 @@ fn advance_service_endpoint_epoch(index: usize) -> Result<u64, i64> {
     let next = next_service_endpoint_epoch(current).ok_or(LINUX_EOVERFLOW)?;
     SERVICE_ENDPOINT_EPOCHS[index].store(next, Ordering::Release);
     Ok(next)
-}
-
-/// Cross-class handoff is scheduler authority. Accept it only from the live
-/// netd endpoint and only on an exact compact-v2 local-socket wait/data reply.
-fn netd_response_requests_latency_handoff(response: &[u8], is_live_netd_owner: bool) -> bool {
-    if !is_live_netd_owner || response.len() < NETD_IPC_RESPONSE_HEADER_SIZE {
-        return false;
-    }
-    let version = u16::from_ne_bytes([response[0], response[1]]);
-    let op = u16::from_ne_bytes([response[2], response[3]]);
-    let status = i32::from_ne_bytes([response[4], response[5], response[6], response[7]]);
-    let reserved0 = u32::from_ne_bytes([response[8], response[9], response[10], response[11]]);
-    let value = u64::from_ne_bytes([
-        response[16],
-        response[17],
-        response[18],
-        response[19],
-        response[20],
-        response[21],
-        response[22],
-        response[23],
-    ]);
-    let payload_len =
-        u32::from_ne_bytes([response[24], response[25], response[26], response[27]]) as usize;
-    let flags = u32::from_ne_bytes([response[28], response[29], response[30], response[31]]);
-    let authorized_op = matches!(
-        op,
-        SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET
-            | SYSCALL_OFFLOAD_OP_LINUX_SENDTO
-            | SYSCALL_OFFLOAD_OP_LINUX_SENDMSG
-            | SYSCALL_OFFLOAD_OP_LINUX_RECVFROM
-            | SYSCALL_OFFLOAD_OP_LINUX_RECVMSG
-    );
-    let successful_event_or_transfer = status == 0 && value != 0;
-    let completed_nonblocking_recv_drain = status == LINUX_EAGAIN as i32
-        && value == 0
-        && payload_len == 0
-        && matches!(
-            op,
-            SYSCALL_OFFLOAD_OP_LINUX_RECVFROM | SYSCALL_OFFLOAD_OP_LINUX_RECVMSG
-        );
-    version == NETD_IPC_ABI_VERSION
-        && authorized_op
-        && (successful_event_or_transfer || completed_nonblocking_recv_drain)
-        && reserved0 == 0
-        && flags == NETD_IPC_RESPONSE_FLAG_LATENCY_HANDOFF
-        && NETD_IPC_RESPONSE_HEADER_SIZE.checked_add(payload_len) == Some(response.len())
 }
 
 fn register_service_endpoint_waiter(waiter: ServiceEndpointWaiter) -> bool {
@@ -1769,30 +1717,28 @@ pub(super) fn syscall_linux_rustos_ipc_reply(
     let Some(receiver_process_id) = multitask::current_user_process_id() else {
         return linux_errno(LINUX_EINVAL);
     };
-    let live_netd_owner = process_owns_live_service_endpoint(receiver_process_id, IPC_SERVICE_NETD);
-    let latency_handoff =
-        netd_response_requests_latency_handoff(response.as_slice(), live_netd_owner);
     let task_id = match kernel_ipc_runtime::api::complete_endpoint_reply_for_process(
         KernelReplyHandle::from_raw(reply),
         receiver_process_id,
         response.as_slice(),
     ) {
         Ok(task_id) => task_id,
-        Err(err) => return linux_errno(ipc_error_to_linux_errno(err)),
+        Err(err) => {
+            record_ipc_reply_rejection(reply, receiver_process_id, err);
+            return linux_errno(ipc_error_to_linux_errno(err));
+        }
     };
     let _ = multitask::release_ipc_priority(reply);
     let reply_ticks = crate::arch::rtc::ticks();
-    let _ = multitask::wake_task(task_id);
+    let woke = multitask::wake_task(task_id);
     // Direct hand-back to the caller: the service is about to wait on its
     // endpoint again, so donate the remaining quantum to the original caller
     // instead of round-robining away from a freshly-completed reply.
-    if latency_handoff && multitask::set_next_latency_pick_hint(task_id) {
-        // The common syscall tail consumes this request with IF enabled,
-        // preserving the live kernel continuation while handing one bounded
-        // turn to the exact awakened caller.
-        multitask::request_user_return_reschedule();
-    } else {
-        multitask::set_next_pick_hint(task_id);
+    if woke && multitask::set_next_synchronous_pick_hint(task_id) {
+        // The common syscall tail consumes this request with IF enabled. The
+        // shared synchronous IPC FIFO is burst-bounded, so direct hand-back
+        // cannot erase the scheduler's overdue-task fairness turn.
+        multitask::request_deferred_reschedule();
     }
     log_slow_ipc_reply(
         "reply",
@@ -2072,13 +2018,14 @@ pub(super) fn syscall_linux_rustos_ipc_reply_with_handles(args_ptr: u64) -> u64 
         Ok(task_id) => task_id,
         Err(err) => {
             drop_transfer_descriptors(send_handles.as_slice());
+            record_ipc_reply_rejection(args.reply_cap, receiver_process_id, err);
             return linux_errno(ipc_error_to_linux_errno(err));
         }
     };
     let _ = multitask::release_ipc_priority(args.reply_cap);
-    let _ = multitask::wake_task(task_id);
-    multitask::set_next_pick_hint(task_id);
-    multitask::request_deferred_reschedule();
+    if multitask::wake_task(task_id) && multitask::set_next_synchronous_pick_hint(task_id) {
+        multitask::request_deferred_reschedule();
+    }
     0
 }
 
@@ -2264,7 +2211,7 @@ fn enqueue_call_and_wake_with_handles(
         // reply wait before yielding, so a fast service reply cannot race a
         // not-yet-armed waiter. `wait_for_reply` performs the actual yield
         // after the wait state is committed.
-        multitask::set_next_pick_hint(receiver_task_id);
+        let _ = multitask::set_next_synchronous_pick_hint(receiver_task_id);
     }
     Ok(reply)
 }
@@ -2314,15 +2261,16 @@ fn wait_for_reply_with_deadline(
             Ok(None) => {}
             Err(errno) => {
                 disarm_reply_deadline_waiter(caller_task_id);
+                record_ipc_reply_wait_failure(reply, caller_task_id, errno);
                 return Err(errno);
             }
         }
         if reply_deadline_expired(deadline_tick) {
-            cancel_deadline_reply(reply, caller_task_id);
+            cancel_reply_wait(reply, caller_task_id, ReplyCancelReason::DeadlineBeforeArm);
             return Err(LINUX_ETIMEDOUT);
         }
         if !multitask::arm_block_current_task() {
-            cancel_deadline_reply(reply, caller_task_id);
+            cancel_reply_wait(reply, caller_task_id, ReplyCancelReason::InvalidArm);
             return Err(LINUX_EINVAL);
         }
         if !arm_reply_deadline_waiter(caller_task_id, deadline_tick) {
@@ -2344,13 +2292,14 @@ fn wait_for_reply_with_deadline(
             Err(errno) => {
                 disarm_reply_deadline_waiter(caller_task_id);
                 let _ = multitask::cancel_block_current_task();
+                record_ipc_reply_wait_failure(reply, caller_task_id, errno);
                 return Err(errno);
             }
         }
         if reply_deadline_expired(deadline_tick) {
             disarm_reply_deadline_waiter(caller_task_id);
             let _ = multitask::wake_task(caller_task_id);
-            cancel_deadline_reply(reply, caller_task_id);
+            cancel_reply_wait(reply, caller_task_id, ReplyCancelReason::DeadlineAfterArm);
             return Err(LINUX_ETIMEDOUT);
         }
         match multitask::commit_block_current_task_and_yield() {
@@ -2363,7 +2312,7 @@ fn wait_for_reply_with_deadline(
             }
             None => {
                 disarm_reply_deadline_waiter(caller_task_id);
-                cancel_deadline_reply(reply, caller_task_id);
+                cancel_reply_wait(reply, caller_task_id, ReplyCancelReason::InvalidCommit);
                 return Err(LINUX_EINVAL);
             }
         }
@@ -2416,7 +2365,16 @@ fn disarm_reply_deadline_waiter(task_id: u64) {
     crate::arch::rtc::disarm_sleep_waiter(task_id);
 }
 
-fn cancel_deadline_reply(reply: KernelReplyHandle, caller_task_id: u64) {
+#[repr(u64)]
+#[derive(Clone, Copy)]
+enum ReplyCancelReason {
+    DeadlineBeforeArm = 1,
+    InvalidArm = 2,
+    DeadlineAfterArm = 3,
+    InvalidCommit = 4,
+}
+
+fn cancel_reply_wait(reply: KernelReplyHandle, caller_task_id: u64, reason: ReplyCancelReason) {
     let result =
         kernel_ipc_runtime::api::cancel_endpoint_call_with_transfers(reply, caller_task_id);
     if let Ok(discarded) = &result {
@@ -2424,17 +2382,33 @@ fn cancel_deadline_reply(reply: KernelReplyHandle, caller_task_id: u64) {
         drop_transfer_descriptors(discarded.as_slice());
     }
     let status = u64::from(result.is_err());
+    let milestone = match reason {
+        ReplyCancelReason::DeadlineBeforeArm | ReplyCancelReason::DeadlineAfterArm => {
+            "ipc-reply-timeout"
+        }
+        ReplyCancelReason::InvalidArm | ReplyCancelReason::InvalidCommit => "ipc-reply-cancelled",
+    };
     debug::record_milestone(
         debug::LogCategory::Compat,
-        "ipc-reply-timeout",
+        milestone,
         reply.raw(),
-        ((caller_task_id & 0xffff_ffff) << 32) | status,
+        ((caller_task_id & 0xffff_ffff) << 32) | ((reason as u64) << 1) | status,
     );
     ipc_trace!(
-        "ipc reply timeout: reply={} caller={} cancel={:?}",
+        "ipc reply cancellation: reply={} caller={} reason={} cancel={:?}",
         reply.raw(),
         caller_task_id,
+        reason as u64,
         result
+    );
+}
+
+fn record_ipc_reply_wait_failure(reply: KernelReplyHandle, caller_task_id: u64, errno: i64) {
+    debug::record_milestone(
+        debug::LogCategory::Compat,
+        "ipc-reply-wait-failed",
+        reply.raw(),
+        ((caller_task_id & 0xffff_ffff) << 32) | (errno.unsigned_abs() & 0xffff_ffff),
     );
 }
 
@@ -2484,8 +2458,8 @@ pub(super) fn export_current_fds_for_transfer(
 
     let service_refs = service_transfer_refs(&entries);
     let mut acquired_refs = Vec::with_capacity(service_refs.len());
-    for handle_ref in service_refs.iter().copied() {
-        if let Err(errno) = super::service_ops::acquire_service_handle_ref(handle_ref) {
+    for handle_ref in service_refs {
+        if let Err(errno) = super::service_ops::acquire_service_handle_ref(&handle_ref) {
             super::service_ops::release_service_handle_refs(&acquired_refs);
             return Err(errno);
         }
@@ -2744,6 +2718,30 @@ fn ipc_error_to_linux_errno(err: kernel_ipc_runtime::api::IpcError) -> i64 {
         kernel_ipc_runtime::api::IpcError::BufferTooSmall => LINUX_EOVERFLOW,
         kernel_ipc_runtime::api::IpcError::NoMemory => LINUX_ENOMEM,
     }
+}
+
+fn record_ipc_reply_rejection(
+    reply: u64,
+    receiver_process_id: u64,
+    err: kernel_ipc_runtime::api::IpcError,
+) {
+    let reason = match err {
+        kernel_ipc_runtime::api::IpcError::InvalidHandle => 1_u64,
+        kernel_ipc_runtime::api::IpcError::PermissionDenied => 2,
+        kernel_ipc_runtime::api::IpcError::PeerClosed => 3,
+        kernel_ipc_runtime::api::IpcError::BufferTooSmall => 4,
+        kernel_ipc_runtime::api::IpcError::InvalidArgument => 5,
+        kernel_ipc_runtime::api::IpcError::NoMemory => 6,
+    };
+    // FAILURE-TELEMETRY: reply rejection is rare and is otherwise collapsed
+    // into Linux errno. Preserve the exact capability and kernel reason so an
+    // SMP ownership race cannot masquerade as an ordinary EINVAL.
+    nucleus_core::debug::record_milestone(
+        nucleus_core::debug::LogCategory::Compat,
+        "ipc-reply-rejected",
+        reply,
+        ((receiver_process_id & 0xffff_ffff) << 32) | reason,
+    );
 }
 
 fn ticks_elapsed_ms(start_ticks: u64, end_ticks: u64) -> u64 {
@@ -3088,49 +3086,5 @@ mod tests {
             validate_commercial_response_envelope(&request, &malformed_descriptor),
             Err(LINUX_EINVAL)
         );
-    }
-
-    fn ready_netd_poll_response() -> [u8; NETD_IPC_RESPONSE_HEADER_SIZE] {
-        let mut response = [0_u8; NETD_IPC_RESPONSE_HEADER_SIZE];
-        response[0..2].copy_from_slice(&NETD_IPC_ABI_VERSION.to_ne_bytes());
-        response[2..4].copy_from_slice(&SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET.to_ne_bytes());
-        response[16..24].copy_from_slice(&1_u64.to_ne_bytes());
-        response[28..32].copy_from_slice(&NETD_IPC_RESPONSE_FLAG_LATENCY_HANDOFF.to_ne_bytes());
-        response
-    }
-
-    #[test]
-    fn only_live_netd_authorized_socket_response_requests_latency_handoff() {
-        let response = ready_netd_poll_response();
-        assert!(netd_response_requests_latency_handoff(&response, true));
-        assert!(!netd_response_requests_latency_handoff(&response, false));
-
-        let mut wrong_op = response;
-        wrong_op[2..4].copy_from_slice(&SYSCALL_OFFLOAD_OP_LINUX_BIND.to_ne_bytes());
-        assert!(!netd_response_requests_latency_handoff(&wrong_op, true));
-
-        let mut local_data = response;
-        local_data[2..4].copy_from_slice(&SYSCALL_OFFLOAD_OP_LINUX_RECVMSG.to_ne_bytes());
-        assert!(netd_response_requests_latency_handoff(&local_data, true));
-
-        let mut no_readiness = response;
-        no_readiness[16..24].copy_from_slice(&0_u64.to_ne_bytes());
-        assert!(!netd_response_requests_latency_handoff(&no_readiness, true));
-
-        let mut completed_drain = no_readiness;
-        completed_drain[2..4].copy_from_slice(&SYSCALL_OFFLOAD_OP_LINUX_RECVMSG.to_ne_bytes());
-        completed_drain[4..8].copy_from_slice(&(LINUX_EAGAIN as i32).to_ne_bytes());
-        assert!(netd_response_requests_latency_handoff(
-            &completed_drain,
-            true
-        ));
-
-        let mut unknown_flags = response;
-        unknown_flags[28..32]
-            .copy_from_slice(&(NETD_IPC_RESPONSE_FLAG_LATENCY_HANDOFF | (1 << 31)).to_ne_bytes());
-        assert!(!netd_response_requests_latency_handoff(
-            &unknown_flags,
-            true
-        ));
     }
 }

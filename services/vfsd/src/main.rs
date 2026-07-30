@@ -65,9 +65,8 @@ use rustos_user_abi::syscall::{
     VFS_IPC_OP_POLL_QUERY, VFS_IPC_OP_PREAD64, VFS_IPC_OP_READ, VFS_IPC_OP_READLINKAT,
     VFS_IPC_OP_STATX, VFS_IPC_OP_UMOUNT2, VFS_IPC_OP_UNLINKAT, VFS_IPC_OP_WRITE,
     VFS_IPC_PATH_CAPACITY, VFS_IPC_PAYLOAD_CAPACITY, VFS_POLL_QUERY_EPOLL_CREATE,
-    VFS_POLL_QUERY_EPOLL_CTL, VFS_POLL_QUERY_EPOLL_PURGE_OBJECT, VFS_POLL_QUERY_EPOLL_REF,
-    VFS_POLL_QUERY_EPOLL_SNAPSHOT, VFS_POLL_QUERY_EPOLL_UNREF, VFS_POLL_QUERY_POLL,
-    WAITSET_ABI_VERSION, WAITSET_MAX_INTERESTS,
+    VFS_POLL_QUERY_EPOLL_CTL, VFS_POLL_QUERY_EPOLL_PURGE_OBJECT, VFS_POLL_QUERY_EPOLL_RETIRE,
+    VFS_POLL_QUERY_EPOLL_SNAPSHOT, VFS_POLL_QUERY_POLL, WAITSET_ABI_VERSION, WAITSET_MAX_INTERESTS,
 };
 #[cfg(not(test))]
 use rustos_user_abi::syscall::{
@@ -78,7 +77,8 @@ use storage_fat::{FatDirEntry, FatNodeKind, FatVolume};
 use vfsd::{
     cacheable_metadata_errno, checked_next_generation, checked_seek_position, checkpoint_path_key,
     executable_snapshot_marker, mkdir_policy, persistent_mutation_status,
-    should_materialize_file_cache, unlink_policy, valid_checkpoint_record,
+    reply_failure_diagnostic_due, should_materialize_file_cache,
+    ui_bootstrap_snapshot_reply_completed, unlink_policy, valid_checkpoint_record,
     OpenDescriptionCheckpointWire, SeekPositionError, WaitSetInterestKey, WaitSetInterestRecord,
     WaitSetRegistry, WaitSetRegistryError, FILE_BYTES_CACHE_BUDGET_BYTES,
     VFSD_CHECKPOINT_HANDLE_TAG, VFSD_OPEN_CHECKPOINT_VERSION, VFSD_OPEN_MUTATION_FCNTL,
@@ -261,6 +261,7 @@ fn service_main() {
 }
 
 fn serve(endpoint: u64, mut state: VfsState) {
+    let mut reply_failures = 0_u64;
     loop {
         let mut request = MaybeUninit::<VfsRecvBuffer>::uninit();
         let mut reply_cap = 0_u64;
@@ -354,7 +355,13 @@ fn serve(endpoint: u64, mut state: VfsState) {
             }
         };
         if reply < 0 {
-            ipc::debug_line("vfsd: reply failed");
+            reply_failures = reply_failures.saturating_add(1);
+            if reply_failure_diagnostic_due(reply_failures) {
+                ipc::debug_line(&format!(
+                    "vfsd: reply failed errno={} total={reply_failures}",
+                    -reply
+                ));
+            }
         }
     }
 }
@@ -402,7 +409,6 @@ fn reply_executable_snapshot(
             };
         }
     };
-    demote_after_ui_bootstrap_snapshot(request);
     response.file_bytes = snapshot.file_bytes;
     response.mount_generation = state.mount_generation;
     let send_fd = snapshot.fd as u64;
@@ -424,14 +430,22 @@ fn reply_executable_snapshot(
     if snapshot.close_after_reply {
         close_fd(snapshot.fd);
     }
+    if ui_bootstrap_snapshot_reply_completed(
+        &request.path,
+        request.path_len as usize,
+        UI_SERVER_EXEC_PATH,
+        reply,
+    ) {
+        // CONTRACT: The terminal handle-bearing reply must wake loaderd before
+        // vfsd drops its boot-critical class. Otherwise the live reply
+        // capability can retain a blocked System caller behind User work.
+        demote_after_ui_bootstrap_snapshot_reply();
+    }
     reply
 }
 
-fn demote_after_ui_bootstrap_snapshot(request: &VfsExecutableSnapshotRequest) {
-    if POST_UI_DEMOTED.load(Ordering::Acquire)
-        || request.path_len as usize != UI_SERVER_EXEC_PATH.len()
-        || &request.path[..UI_SERVER_EXEC_PATH.len()] != UI_SERVER_EXEC_PATH
-    {
+fn demote_after_ui_bootstrap_snapshot_reply() {
+    if POST_UI_DEMOTED.load(Ordering::Acquire) {
         return;
     }
     let status = unsafe { rustos_svc_runtime::syscall::syscall0(SYS_RUSTOS_SCHED_DEMOTE_SELF) };
@@ -817,7 +831,7 @@ fn checkpoint_handle_key(token: u64) -> CheckpointRevisionKey {
     (0, 0, token, VFSD_CHECKPOINT_HANDLE_TAG)
 }
 
-fn checkpoint_epoll_record(token: u64, refs: u64, tombstone: bool) -> ServiceCheckpointRecordWire {
+fn checkpoint_epoll_record(token: u64, tombstone: bool) -> ServiceCheckpointRecordWire {
     let mut record = ServiceCheckpointRecordWire {
         key_hi: token,
         key_lo: CHECKPOINT_EPOLL_TAG,
@@ -825,9 +839,6 @@ fn checkpoint_epoll_record(token: u64, refs: u64, tombstone: bool) -> ServiceChe
     };
     if tombstone {
         record.flags = SERVICE_CHECKPOINT_FLAG_TOMBSTONE;
-    } else {
-        record.value_len = 8;
-        record.value[..8].copy_from_slice(&refs.to_le_bytes());
     }
     record
 }
@@ -1068,6 +1079,7 @@ fn device_access_for_path(path: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use rustos_user_abi::syscall::IPC_MAX_INLINE_BYTES;
 
     #[test]
@@ -1102,6 +1114,19 @@ mod tests {
         };
         assert_eq!(waitset_interest_from_wire(&wire), Some(interest));
         assert_eq!(size_of::<ServiceCheckpointRecordWire>(), 128);
+    }
+
+    #[test]
+    fn epoll_checkpoint_records_store_liveness_not_descriptor_refcounts() {
+        let live = checkpoint_epoll_record(44, false);
+        assert_eq!(live.key_hi, 44);
+        assert_eq!(live.key_lo, CHECKPOINT_EPOLL_TAG);
+        assert_eq!(live.value_len, 0);
+        assert_eq!(live.flags & SERVICE_CHECKPOINT_FLAG_TOMBSTONE, 0);
+
+        let retired = checkpoint_epoll_record(44, true);
+        assert_ne!(retired.flags & SERVICE_CHECKPOINT_FLAG_TOMBSTONE, 0);
+        assert_eq!(retired.value_len, 0);
     }
 
     #[test]

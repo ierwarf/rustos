@@ -298,7 +298,7 @@ pub fn current_memfd_handle(fd: u64) -> Option<multitask::MemfdHandle> {
 pub fn current_epoll_handle(fd: u64) -> Option<multitask::EpollHandle> {
     multitask::with_current_user_process_state(|_, _, process_state| {
         match process_state.handles().get(fd) {
-            Some(multitask::KernelHandle::Epoll(epoll)) => Some(*epoll),
+            Some(multitask::KernelHandle::Epoll(epoll)) => Some(epoll.clone()),
             _ => None,
         }
     })

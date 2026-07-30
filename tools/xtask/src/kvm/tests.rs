@@ -21,7 +21,8 @@ mod tests {
         guest_cid_for_process, guest_deadline_reached, is_sha256, mesa_dri_prime_for_pci_bdf,
         parse_dvm_control_contract_text, parse_manifest_text, parse_smoke_options,
         physical_gpu_profile, prepare_runtime_log, qemu_display_backend, required_dvm_gpu_ready,
-        RustosSmpReadiness, RUSTOS_SMP_READINESS,
+        rustos_marker_present, RustosSmpReadiness, RUSTOS_SMP_READINESS,
+        smp_runtime_missing_markers,
         runtime_stall_or_crash_observed, select_smoke_guest_display,
         uiserver_has_interactive_slow_loop, uiserver_idle_ticks_healthy,
         uiserver_profile_input_pipeline_healthy, uiserver_profile_meets_fps,
@@ -33,25 +34,58 @@ mod tests {
     #[test]
     fn rustos_smp_topology_is_machine_gated_on_complete_prerequisites() {
         assert_eq!(RUSTOS_SMP_READINESS.rustos_vcpus, 1);
-        assert!(!RUSTOS_SMP_READINESS.prerequisites_complete());
-        assert!(RUSTOS_SMP_READINESS.validate().is_ok());
+        assert!(RUSTOS_SMP_READINESS.validate(None).is_ok());
 
         let incomplete_multi = RustosSmpReadiness {
             rustos_vcpus: 2,
             ..RUSTOS_SMP_READINESS
         };
-        assert!(incomplete_multi.validate().is_err());
+        assert!(incomplete_multi.validate(None).is_err());
 
-        let complete_multi = RustosSmpReadiness {
-            rustos_vcpus: 2,
-            per_cpu_scheduler: true,
-            per_cpu_syscall_state: true,
-            cpu_online_state_machine: true,
-            reschedule_ipi: true,
-            tlb_shootdown: true,
-            atomic_robust_futex_cleanup: true,
-        };
-        assert!(complete_multi.validate().is_ok());
+        let evidence = crate::formal_contracts::validated_smp_launch_evidence_for_tests();
+        assert!(incomplete_multi.validate(Some(&evidence)).is_ok());
+    }
+
+    #[test]
+    fn rustos_smp_runtime_requires_every_requested_cpu_event_class() {
+        let mut log = String::new();
+        for cpu in 0..2 {
+            for name in [
+                "smp-cpu-online",
+                "smp-cpu-idle-enter",
+                "smp-cpu-first-clockevent",
+                "smp-cpu-first-user-dispatch",
+                "smp-cpu-first-reschedule-ipi",
+            ] {
+                log.push_str(format!("name={name} arg0=0x{cpu:x} arg1=0x1\n").as_str());
+            }
+        }
+        assert!(smp_runtime_missing_markers(&log, 2).is_empty());
+        let incomplete = log.replace(
+            "name=smp-cpu-first-user-dispatch arg0=0x1 arg1=0x1\n",
+            "",
+        );
+        assert_eq!(
+            smp_runtime_missing_markers(&incomplete, 2),
+            vec!["name=smp-cpu-first-user-dispatch arg0=0x1"]
+        );
+    }
+
+    #[test]
+    fn smp_boot_acceptance_uses_kernel_stamped_milestones_when_text_interleaves() {
+        let log = "seq=107 msg=\"milestone name=product-root-core-ready\"\n\
+seq=119 msg=\"milestone name=product-init-identity-ready\"";
+        assert!(rustos_marker_present(log, RUSTOS_BOOT_MARKER));
+        assert!(rustos_marker_present(log, RUSTOS_INIT_IDENTITY_MARKER));
+        assert!(!rustos_marker_present(log, RUSTOS_GPU_SCENE_COMPILER_MARKER));
+
+        let successor_only =
+            "seq=119 msg=\"milestone name=product-init-identity-ready arg0=0x0 arg1=0x0\"";
+        assert!(rustos_marker_present(successor_only, RUSTOS_BOOT_MARKER));
+        assert!(rustos_marker_present(
+            successor_only,
+            RUSTOS_INIT_IDENTITY_MARKER
+        ));
     }
 
     #[test]
@@ -135,6 +169,66 @@ mod tests {
     }
 
     #[test]
+    fn smp_iteration_is_bounded_and_cannot_claim_acceptance() {
+        let options = parse_smoke_options(
+            vec![
+                "--rustos-vcpus".into(),
+                "2".into(),
+                "--smp-iteration".into(),
+                "--timeout".into(),
+                "30".into(),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        assert!(options.smp_iteration);
+        assert_eq!(options.rustos_vcpus, 2);
+        assert!(
+            parse_smoke_options(
+                vec![
+                    "--rustos-vcpus".into(),
+                    "2".into(),
+                    "--smp-iteration".into(),
+                    "--timeout".into(),
+                    "31".into(),
+                ]
+                .into_iter()
+            )
+            .is_err()
+        );
+        assert!(
+            parse_smoke_options(
+                vec![
+                    "--rustos-vcpus".into(),
+                    "2".into(),
+                    "--smp-iteration".into(),
+                    "--timeout".into(),
+                    "30".into(),
+                    "--min-ui-fps".into(),
+                    "55".into(),
+                ]
+                .into_iter()
+            )
+            .is_err()
+        );
+        assert!(
+            parse_smoke_options(
+                vec![
+                    "--rustos-vcpus".into(),
+                    "2".into(),
+                    "--smp-iteration".into(),
+                    "--timeout".into(),
+                    "30".into(),
+                    "--recovery-probe".into(),
+                    "all".into(),
+                ]
+                .into_iter()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn input_exercise_requires_both_ring3_ingress_markers() {
         let options = parse_smoke_options(vec!["--exercise-input".into()].into_iter()).unwrap();
         assert!(options.exercise_input);
@@ -190,10 +284,15 @@ mod tests {
                 .contains(&DVM_BOOTSTRAP_FRAME_MARKER.to_owned())
         );
         assert!(dvm_display_provider_ready(
-            "[INFO ] service=uiserver uiserver: display_get_info attempt=1 width=1600 height=900 stride=7168 bpp=4 fmt=1 flags=0xe gen=1"
+            "[INFO ] service=uiserver uiserver: display_get_info attempt=1 width=1600 height=900 stride=7168 bpp=4 fmt=1 flags=0x6 gen=1\n\
+             seq=9 msg=\"milestone name=product-display-ready arg0=0x1 arg1=0x1\""
         ));
         assert!(!dvm_display_provider_ready(
             "[INFO ] service=uiserver uiserver: display_get_info attempt=1 width=1600 height=900 stride=7168 bpp=4 fmt=1 flags=0x6 gen=1"
+        ));
+        assert!(!dvm_display_provider_ready(
+            "[INFO ] service=uiserver uiserver: display_get_info attempt=1 width=1600 height=900 stride=7168 bpp=4 fmt=1 flags=0x4 gen=1\n\
+             seq=9 msg=\"milestone name=product-display-ready arg0=0x1 arg1=0x1\""
         ));
         assert!(dvm_display_relay_ready(
             "rustos-dvm-display: peer readiness sent event=ivshmem-msix-uio\n\
@@ -497,7 +596,7 @@ mod tests {
             .find("stop_guest(rustos);")
             .expect("fresh reboot stops the old RustOS process");
         let spawn = source
-            .find("*rustos = spawn_rustos_guest(self.qemu, self.config, self.layout, false)?;")
+            .find("*rustos = spawn_rustos_guest(")
             .expect("fresh reboot launches a new RustOS process");
         let archive = source
             .find("archive_recovery_log(&self.layout.debugcon_log)?;")

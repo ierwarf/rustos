@@ -4,6 +4,9 @@ use linux_raw_sys::{
     auxvec as linux_auxvec, general as linux, ioctl as linux_ioctl, net as linux_net,
 };
 
+mod task;
+pub use task::*;
+
 macro_rules! raw_u64 {
     ($($name:ident = $source:path;)+) => {
         $(pub const $name: u64 = $source as u64;)+
@@ -85,11 +88,6 @@ raw_u64! {
     SYS_SETGID = linux::__NR_setgid;
     SYS_SIGALTSTACK = linux::__NR_sigaltstack;
     SYS_ARCH_PRCTL = linux::__NR_arch_prctl;
-    SYS_GETTID = linux::__NR_gettid;
-    SYS_FUTEX = linux::__NR_futex;
-    SYS_EXECVE = linux::__NR_execve;
-    SYS_SCHED_GETAFFINITY = linux::__NR_sched_getaffinity;
-    SYS_SET_TID_ADDRESS = linux::__NR_set_tid_address;
     SYS_CLOCK_GETTIME = linux::__NR_clock_gettime;
     SYS_CLOCK_NANOSLEEP = linux::__NR_clock_nanosleep;
     SYS_EXIT = linux::__NR_exit;

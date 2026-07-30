@@ -1,0 +1,128 @@
+schema = "rustos-smp-source-contracts-v1"
+
+# These patterns have no valid runtime interpretation in the supported SMP
+# envelope. Legitimate BSP boot mechanisms use explicit lifecycle APIs and
+# comments; they do not retain a generic single-CPU fallback.
+[[forbidden_patterns]]
+scope = "kernel/**/*.rs"
+regex = '(?m)^[ \t]*(?:pub(?:\([^)]*\))?[ \t]+)?static[ \t]+mut\b'
+reason = "mutable kernel statics require a synchronization or immutable-publication owner"
+
+[[forbidden_patterns]]
+scope = "kernel/**/*.rs"
+regex = '\b(?:hardware_)?apic_id\s*(?:\(\))?\s+as\s+usize\b'
+reason = "raw APIC IDs are identities, never dense per-CPU array indexes"
+
+[[forbidden_patterns]]
+scope = "kernel/**/*.rs"
+regex = '\bcurrent_(?:cpu|logical)_index\(\)\s*\.\s*unwrap_or(?:_default)?\s*\('
+reason = "a missing current CPU identity cannot silently become CPU zero"
+
+[[forbidden_patterns]]
+scope = "kernel/**/*.rs"
+regex = 'RustOS does not claim SMP support'
+reason = "the enabled kernel must not retain the obsolete BSP-only product contract"
+
+[[forbidden_patterns]]
+scope = "kernel/ps/**/*.rs"
+regex = '(?m)^//![ \t]+BSP task scheduler\b'
+reason = "runtime scheduler ownership is SMP-wide"
+
+[[forbidden_patterns]]
+scope = "kernel/hal/src/arch/rtc.rs"
+regex = '(?m)^//![ \t]+BSP deadline registry\b'
+reason = "deadline wake delivery is admitted for every online CPU"
+
+[[forbidden_patterns]]
+scope = "kernel/ps/src/multitask/scheduler.rs"
+regex = 'crate::debug::println!'
+reason = "the scheduler raw owner cannot enter synchronous logging"
+
+[[forbidden_patterns]]
+scope = "kernel/ps/src/multitask/scheduler.rs"
+regex = '(?s)pub\(super\) fn reap_inactive_retired_slots[^{]*\{(?:(?!\n    pub\(super\) fn).)*process_table::reap_exited_processes\s*\('
+reason = "process destruction must run after the scheduler raw owner is released"
+
+[[forbidden_patterns]]
+scope = "kernel/ps/src/multitask/scheduler.rs"
+regex = 'kernel_hal::api::arch::rtc::disarm_sleep_waiter|kernel_ipc_runtime::api::(?:remove_endpoint_waiters_for_task|cancel_endpoint_calls_for_task|fail_endpoints_owned_by_(?:task|process))'
+reason = "timer and IPC retirement side effects must run after the scheduler raw owner is released"
+
+[[forbidden_patterns]]
+scope = "kernel/ps/src/multitask/scheduler.rs"
+regex = '(?s)fn retire_exec_sibling_slot[^{]*\{(?:(?!\n    fn).)*process_table::detach_task\s*\('
+reason = "exec sibling process detachment must run from deferred side-effect custody"
+
+# Each named authority must remain a bounded dense logical-CPU array. This
+# rejects accidental regression to a scalar singleton even when the scalar is
+# atomic and therefore invisible to a data-race detector.
+[[per_cpu_statics]]
+path = "kernel/hal/src/arch/gdt.rs"
+names = ["RING0_STACKS", "DOUBLE_FAULT_STACKS", "TSS_SLOTS", "GDT_SLOTS"]
+capacity = "MAX_SUPPORTED_CPUS"
+
+[[per_cpu_statics]]
+path = "kernel/hal/src/arch/msi.rs"
+names = ["LOCAL_APIC_READY"]
+capacity = "MAX_SUPPORTED_CPUS"
+
+[[per_cpu_statics]]
+path = "kernel/hal/src/arch/timer.rs"
+names = ["NEXT_DEADLINE"]
+capacity = "MAX_SUPPORTED_CPUS"
+
+[[per_cpu_statics]]
+path = "kernel/hal/src/arch/tlb_shootdown.rs"
+names = [
+    "ACTIVE_ROOT",
+    "SHOOTDOWN_ELIGIBLE",
+    "REQUEST_ROOT",
+    "REQUEST_GENERATION",
+    "ACK_GENERATION",
+]
+capacity = "MAX_SUPPORTED_CPUS"
+
+[[per_cpu_statics]]
+path = "kernel/ps/src/user/syscall.rs"
+names = [
+    "SYSCALL_CPU_LOCALS",
+    "SYSCALL_BOOTSTRAP_STACKS",
+    "SYSCALL_CPU_LOCAL_STATES",
+]
+capacity = "MAX_SUPPORTED_CPUS"
+
+[[per_cpu_statics]]
+path = "kernel/ps/src/multitask/cpu_local.rs"
+names = [
+    "CURRENT_TASK_SLOTS",
+    "CURRENT_TASK_ACTIVE",
+    "TRANSITION_FROM_SLOTS",
+    "TRANSITION_ACTIVE",
+]
+capacity = "MAX_TRACKED_CPUS"
+
+[[per_cpu_statics]]
+path = "kernel/ps/src/multitask/mod.rs"
+names = ["DEFERRED_RESCHEDULE_REQUESTED", "USER_RETURN_RESCHEDULE_ARMED"]
+capacity = "MAX_TRACKED_CPUS"
+
+[[per_cpu_statics]]
+path = "kernel/ps/src/multitask/irq.rs"
+names = [
+    "AP_FIRST_WORK_DISPATCH_RECORDED",
+    "CPU_FIRST_CLOCKEVENT_RECORDED",
+    "CPU_FIRST_USER_DISPATCH_RECORDED",
+    "CPU_FIRST_RESCHEDULE_IPI_RECORDED",
+]
+capacity = "MAX_TRACKED_CPUS"
+
+[[per_cpu_statics]]
+path = "kernel/nucleus-core/src/util/lockdep.rs"
+names = [
+    "PREEMPT_DISABLE_DEPTH",
+    "PREEMPT_PENDING_DEPTH",
+    "IRQ_CONTEXT_DEPTH",
+    "CURRENT_TASK_OWNER",
+    "CPU_APIC_IDENTITIES",
+]
+capacity = "MAX_TRACKED_CPUS"

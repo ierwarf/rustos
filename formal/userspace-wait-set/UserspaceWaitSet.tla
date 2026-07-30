@@ -14,6 +14,8 @@ The model combines the high-risk races: a provider transition between check
 and sleep, timeout competing with a signal, provider restart/revoke, explicit
 MOD rebind of a stable registration identity to the new provider epoch, and
 open-description references inherited by dup/fork then retired by close/exec.
+`epollRefs` is the ring0 fd-table count; vfsd sees only create and the durable
+final-retire mutation, so DuplicateEpoll is deliberately service-IPC-free.
 The terminal revoked outcome refines to per-interest ERR/HUP; unrelated ready
 interests in the same aggregate wait remain reportable.
 DuplicateObject/ForkObject abstract a concrete two-phase commit that rechecks

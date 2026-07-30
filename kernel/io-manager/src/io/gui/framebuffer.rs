@@ -78,6 +78,8 @@ pub(crate) struct Framebuffer {
     dirty_tiles: [[bool; MAX_DIRTY_COLS]; MAX_DIRTY_ROWS],
 }
 
+// SAFETY: a Framebuffer owns its mapping lease and mutable tile state; moving
+// that unique value transfers ownership and cannot create an alias.
 unsafe impl Send for Framebuffer {}
 
 impl Framebuffer {

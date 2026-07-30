@@ -22,9 +22,13 @@
 //!   `interrupt-return`.
 
 use core::arch::x86_64::__cpuid;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::hint::spin_loop;
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
+use x86_64::instructions::interrupts;
 use x86_64::registers::model_specific::Msr;
+
+use super::acpi::MAX_SUPPORTED_CPUS;
 
 pub const MSI_VECTOR_FIRST: u8 = 0x40;
 pub const MSI_VECTOR_LAST: u8 = 0xdf;
@@ -35,9 +39,20 @@ const APIC_BASE_ENABLE: u64 = 1 << 11;
 const APIC_BASE_X2APIC: u64 = 1 << 10;
 const APIC_SPURIOUS_VECTOR_OFFSET: usize = 0x0f0;
 const APIC_EOI_OFFSET: usize = 0x0b0;
+const APIC_ICR_LOW_OFFSET: usize = 0x300;
+const APIC_ICR_HIGH_OFFSET: usize = 0x310;
 const APIC_SPURIOUS_ENABLE: u32 = 1 << 8;
 const APIC_SPURIOUS_VECTOR: u32 = 0xff;
+const APIC_ICR_DELIVERY_STATUS: u32 = 1 << 12;
+const APIC_ICR_LEVEL_ASSERT: u32 = 1 << 14;
+const APIC_ICR_TRIGGER_LEVEL: u32 = 1 << 15;
+const APIC_DELIVERY_MODE_FIXED: u32 = 0b000 << 8;
+const APIC_DELIVERY_MODE_INIT: u32 = 0b101 << 8;
+const APIC_DELIVERY_MODE_STARTUP: u32 = 0b110 << 8;
 const CPUID_FEATURE_APIC: u32 = 1 << 9;
+const INIT_SETTLE_NS: u64 = 10_000_000;
+const SIPI_SETTLE_NS: u64 = 200_000;
+const ICR_DELIVERY_TIMEOUT_NS: u64 = 100_000_000;
 
 pub type MsiHandler = fn(u8);
 
@@ -53,7 +68,18 @@ static ALLOCATED: [AtomicBool; MSI_VECTOR_COUNT] =
     [const { AtomicBool::new(false) }; MSI_VECTOR_COUNT];
 static ALLOCATION_CURSOR: AtomicUsize = AtomicUsize::new(0);
 static LOCAL_APIC_BASE: AtomicUsize = AtomicUsize::new(0);
-static LOCAL_APIC_READY: AtomicBool = AtomicBool::new(false);
+static LOCAL_APIC_PHYSICAL_BASE: AtomicU64 = AtomicU64::new(0);
+static LOCAL_APIC_READY: [AtomicBool; MAX_SUPPORTED_CPUS] =
+    [const { AtomicBool::new(false) }; MAX_SUPPORTED_CPUS];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StartupIpiError {
+    InterruptsEnabled,
+    LocalApicUnavailable,
+    UnsupportedDestination,
+    InvalidVector,
+    DeliveryTimeout,
+}
 
 /// A not-yet-published interrupt vector. Failed MSI-X setup drops the lease,
 /// clears its exact handler, and returns the slot to the bounded pool. Only a
@@ -64,12 +90,69 @@ pub struct MsiVectorLease {
     committed: bool,
 }
 
-/// Enable the local xAPIC path necessary for MSI delivery. This intentionally
-/// fails closed on x2APIC-only configuration: extended-destination and
-/// interrupt-remapping support must be introduced as one coherent substrate,
-/// not guessed from a truncated xAPIC destination ID.
+pub fn physical_base() -> Option<u64> {
+    let leaf1 = __cpuid(1);
+    if leaf1.edx & CPUID_FEATURE_APIC == 0 {
+        return None;
+    }
+    let apic_base = unsafe { Msr::new(IA32_APIC_BASE).read() };
+    if apic_base & APIC_BASE_X2APIC != 0 {
+        return None;
+    }
+    let physical_base = apic_base & APIC_BASE_ADDRESS_MASK;
+    (physical_base != 0).then_some(physical_base)
+}
+
+/// Bind the admitted local-APIC physical page to one kernel-mm-owned,
+/// uncacheable MMIO mapping before any CPU accesses APIC registers.
+pub fn configure_mmio(expected_physical_base: u64, virtual_base: u64) -> bool {
+    if expected_physical_base == 0
+        || virtual_base == 0
+        || !expected_physical_base.is_multiple_of(4096)
+        || !virtual_base.is_multiple_of(4096)
+        || physical_base() != Some(expected_physical_base)
+    {
+        return false;
+    }
+    let Ok(virtual_base) = usize::try_from(virtual_base) else {
+        return false;
+    };
+    // ORDERING: Acquire observes the complete one-time physical/virtual
+    // mapping publication before comparing an idempotent configuration.
+    let published_phys = LOCAL_APIC_PHYSICAL_BASE.load(Ordering::Acquire);
+    let published_virt = LOCAL_APIC_BASE.load(Ordering::Acquire);
+    if published_phys != 0 || published_virt != 0 {
+        return published_phys == expected_physical_base && published_virt == virtual_base;
+    }
+    if LOCAL_APIC_PHYSICAL_BASE
+        .compare_exchange(
+            0,
+            expected_physical_base,
+            // ORDERING: AcqRel claims the unique physical mapping identity.
+            Ordering::AcqRel,
+            // ORDERING: Acquire observes the winning mapping identity.
+            Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return false;
+    }
+    // ORDERING: Release publishes the kernel-mm mapping only after the exact
+    // physical APIC page has been claimed above.
+    LOCAL_APIC_BASE.store(virtual_base, Ordering::Release);
+    true
+}
+
+/// Enable the local xAPIC path on the executing logical CPU. Extended x2APIC
+/// destinations remain outside the release envelope until interrupt remapping
+/// and MSI destination ownership are introduced together.
 pub fn init() -> bool {
-    if LOCAL_APIC_READY.load(Ordering::Acquire) {
+    let logical_index = nucleus_core::util::lockdep::current_cpu_index();
+    if logical_index >= MAX_SUPPORTED_CPUS {
+        return false;
+    }
+    // ORDERING: Acquire pairs with this CPU's completed SVR publication.
+    if LOCAL_APIC_READY[logical_index].load(Ordering::Acquire) {
         return true;
     }
     let leaf1 = __cpuid(1);
@@ -89,18 +172,210 @@ pub fn init() -> bool {
         }
     }
     let physical_base = apic_base & APIC_BASE_ADDRESS_MASK;
-    if physical_base == 0 {
+    // ORDERING: Acquire observes the admitted physical/virtual mapping pair
+    // before this CPU accesses the local register page.
+    if physical_base == 0 || LOCAL_APIC_PHYSICAL_BASE.load(Ordering::Acquire) != physical_base {
         return false;
     }
-    let base = kernel_lowlevel::address::higher_half_addr(physical_base) as usize;
+    let base = LOCAL_APIC_BASE.load(Ordering::Acquire);
+    if base == 0 {
+        return false;
+    }
+    // SAFETY: kernel-mm admitted this exact uncacheable page, and this CPU has
+    // architectural ownership of its local APIC register view.
     unsafe {
         let spurious = (base + APIC_SPURIOUS_VECTOR_OFFSET) as *mut u32;
         let current = spurious.read_volatile();
         spurious.write_volatile((current & !0xff) | APIC_SPURIOUS_ENABLE | APIC_SPURIOUS_VECTOR);
     }
-    LOCAL_APIC_BASE.store(base, Ordering::Release);
-    LOCAL_APIC_READY.store(true, Ordering::Release);
+    // ORDERING: Release publishes completed SVR programming for this CPU.
+    LOCAL_APIC_READY[logical_index].store(true, Ordering::Release);
     true
+}
+
+pub(super) fn local_apic_base_for_current_cpu() -> Option<usize> {
+    let logical_index = nucleus_core::util::lockdep::current_cpu_index();
+    if logical_index >= MAX_SUPPORTED_CPUS
+        || !LOCAL_APIC_READY[logical_index].load(Ordering::Acquire)
+    {
+        return None;
+    }
+    let base = LOCAL_APIC_BASE.load(Ordering::Acquire);
+    (base != 0).then_some(base)
+}
+
+/// Send the architected INIT-SIPI-SIPI sequence from the BSP to one admitted
+/// xAPIC destination. The single mailbox is safe because callers wait for the
+/// exact AP generation to acknowledge before targeting another CPU.
+pub fn start_application_processor(
+    apic_id: u32,
+    startup_vector: u8,
+) -> Result<(), StartupIpiError> {
+    if interrupts::are_enabled() {
+        return Err(StartupIpiError::InterruptsEnabled);
+    }
+    let logical_index = nucleus_core::util::lockdep::current_cpu_index();
+    // ORDERING: Acquire forbids ICR writes until this BSP's complete local
+    // APIC programming is visible.
+    if logical_index >= MAX_SUPPORTED_CPUS
+        || !LOCAL_APIC_READY[logical_index].load(Ordering::Acquire)
+    {
+        return Err(StartupIpiError::LocalApicUnavailable);
+    }
+    if apic_id > u32::from(u8::MAX) || apic_id == nucleus_core::util::lockdep::hardware_apic_id() {
+        return Err(StartupIpiError::UnsupportedDestination);
+    }
+    if startup_vector == 0 {
+        return Err(StartupIpiError::InvalidVector);
+    }
+
+    let (destination, init_assert, init_deassert, startup_command) =
+        startup_icr_words(apic_id, startup_vector).expect("validated xAPIC startup tuple");
+    crate::debug::record_milestone(
+        crate::debug::LogCategory::Boot,
+        "smp-init-assert-begin",
+        u64::from(apic_id),
+        u64::from(init_assert),
+    );
+    write_icr(destination, init_assert)?;
+    crate::debug::record_milestone(
+        crate::debug::LogCategory::Boot,
+        "smp-init-assert-complete",
+        u64::from(apic_id),
+        0,
+    );
+    write_icr(destination, init_deassert)?;
+    crate::debug::record_milestone(
+        crate::debug::LogCategory::Boot,
+        "smp-init-deassert-complete",
+        u64::from(apic_id),
+        0,
+    );
+    busy_wait_ns(INIT_SETTLE_NS);
+    crate::debug::record_milestone(
+        crate::debug::LogCategory::Boot,
+        "smp-init-settled",
+        u64::from(apic_id),
+        0,
+    );
+    write_icr(destination, startup_command)?;
+    crate::debug::record_milestone(
+        crate::debug::LogCategory::Boot,
+        "smp-first-sipi-complete",
+        u64::from(apic_id),
+        u64::from(startup_vector),
+    );
+    busy_wait_ns(SIPI_SETTLE_NS);
+    write_icr(destination, startup_command)?;
+    crate::debug::record_milestone(
+        crate::debug::LogCategory::Boot,
+        "smp-second-sipi-complete",
+        u64::from(apic_id),
+        u64::from(startup_vector),
+    );
+    Ok(())
+}
+
+/// Deliver the private reschedule vector to one already-online xAPIC CPU.
+///
+/// Runtime callers may invoke this with interrupts enabled. The ICR high/low
+/// pair is serialized locally with interrupts excluded; the scheduler's
+/// per-CPU request flag provides the cross-CPU work publication.
+pub fn send_reschedule_ipi(apic_id: u32) -> Result<(), StartupIpiError> {
+    send_private_fixed_ipi(apic_id, super::idt::RESCHEDULE_IPI_VECTOR)
+}
+
+pub fn send_tlb_shootdown_ipi(apic_id: u32) -> Result<(), StartupIpiError> {
+    send_private_fixed_ipi(apic_id, super::idt::TLB_SHOOTDOWN_IPI_VECTOR)
+}
+
+fn send_private_fixed_ipi(apic_id: u32, vector: u8) -> Result<(), StartupIpiError> {
+    let logical_index = nucleus_core::util::lockdep::current_cpu_index();
+    // ORDERING: Acquire forbids an ICR write until this CPU's local APIC has
+    // completed SVR programming.
+    if logical_index >= MAX_SUPPORTED_CPUS
+        || !LOCAL_APIC_READY[logical_index].load(Ordering::Acquire)
+    {
+        return Err(StartupIpiError::LocalApicUnavailable);
+    }
+    if apic_id > u32::from(u8::MAX) || apic_id == nucleus_core::util::lockdep::hardware_apic_id() {
+        return Err(StartupIpiError::UnsupportedDestination);
+    }
+
+    let (destination, command) =
+        fixed_icr_words(apic_id, vector).ok_or(StartupIpiError::InvalidVector)?;
+    interrupts::without_interrupts(|| write_icr(destination, command))
+}
+
+fn startup_icr_words(apic_id: u32, startup_vector: u8) -> Option<(u32, u32, u32, u32)> {
+    if apic_id > u32::from(u8::MAX) || startup_vector == 0 {
+        return None;
+    }
+    Some((
+        apic_id << 24,
+        APIC_DELIVERY_MODE_INIT | APIC_ICR_LEVEL_ASSERT | APIC_ICR_TRIGGER_LEVEL,
+        APIC_DELIVERY_MODE_INIT | APIC_ICR_TRIGGER_LEVEL,
+        APIC_DELIVERY_MODE_STARTUP | u32::from(startup_vector),
+    ))
+}
+
+fn fixed_icr_words(apic_id: u32, vector: u8) -> Option<(u32, u32)> {
+    if apic_id > u32::from(u8::MAX)
+        || vector < 32
+        || u32::from(vector) == APIC_SPURIOUS_VECTOR
+        || (MSI_VECTOR_FIRST..=MSI_VECTOR_LAST).contains(&vector)
+    {
+        return None;
+    }
+    Some((
+        apic_id << 24,
+        APIC_DELIVERY_MODE_FIXED | APIC_ICR_LEVEL_ASSERT | u32::from(vector),
+    ))
+}
+
+fn write_icr(destination: u32, command: u32) -> Result<(), StartupIpiError> {
+    wait_for_icr_idle()?;
+    // ORDERING: Acquire observes the immutable admitted MMIO base before the
+    // volatile high/low ICR transaction.
+    let base = LOCAL_APIC_BASE.load(Ordering::Acquire);
+    if base == 0 {
+        return Err(StartupIpiError::LocalApicUnavailable);
+    }
+    // SAFETY: only the BSP boot owner sends startup IPIs with interrupts
+    // excluded, and both pointers address the admitted local-APIC MMIO page.
+    unsafe {
+        ((base + APIC_ICR_HIGH_OFFSET) as *mut u32).write_volatile(destination);
+        ((base + APIC_ICR_LOW_OFFSET) as *mut u32).write_volatile(command);
+    }
+    wait_for_icr_idle()
+}
+
+fn wait_for_icr_idle() -> Result<(), StartupIpiError> {
+    // ORDERING: Acquire observes the immutable admitted MMIO base before
+    // polling hardware delivery state.
+    let base = LOCAL_APIC_BASE.load(Ordering::Acquire);
+    if base == 0 {
+        return Err(StartupIpiError::LocalApicUnavailable);
+    }
+    let start = super::clock::monotonic_nanos();
+    loop {
+        // SAFETY: the configured mapping owns the complete local-APIC page.
+        let command = unsafe { ((base + APIC_ICR_LOW_OFFSET) as *const u32).read_volatile() };
+        if command & APIC_ICR_DELIVERY_STATUS == 0 {
+            return Ok(());
+        }
+        if super::clock::monotonic_nanos().saturating_sub(start) >= ICR_DELIVERY_TIMEOUT_NS {
+            return Err(StartupIpiError::DeliveryTimeout);
+        }
+        spin_loop();
+    }
+}
+
+fn busy_wait_ns(duration_ns: u64) {
+    let start = super::clock::monotonic_nanos();
+    while super::clock::monotonic_nanos().saturating_sub(start) < duration_ns {
+        spin_loop();
+    }
 }
 
 pub const fn vector_is_valid(vector: u8) -> bool {
@@ -158,7 +433,8 @@ impl MsiVectorLease {
     pub fn message(&self) -> Option<MsiMessage> {
         let index = vector_index(self.vector)?;
         if self.handler == 0
-            || !LOCAL_APIC_READY.load(Ordering::Acquire)
+            || !LOCAL_APIC_READY[nucleus_core::util::lockdep::current_cpu_index()]
+                .load(Ordering::Acquire)
             || !ALLOCATED[index].load(Ordering::Acquire)
             || HANDLERS[index].load(Ordering::Acquire) != self.handler
         {
@@ -225,14 +501,28 @@ const fn vector_has_registration_authority(vector: u8, allocated: bool) -> bool 
     vector_is_valid(vector) && allocated
 }
 
-fn end_of_interrupt() {
+pub fn local_apic_eoi() {
+    let logical_index = nucleus_core::util::lockdep::current_cpu_index();
+    // ORDERING: Acquire proves this CPU completed SVR initialization before
+    // acknowledging any published MSI handler.
+    assert!(
+        logical_index < MAX_SUPPORTED_CPUS
+            && LOCAL_APIC_READY[logical_index].load(Ordering::Acquire),
+        "local APIC EOI attempted before per-CPU initialization"
+    );
+    // ORDERING: Acquire observes the immutable MMIO mapping paired with the
+    // per-CPU readiness publication.
     let base = LOCAL_APIC_BASE.load(Ordering::Acquire);
-    if base == 0 {
-        return;
-    }
+    assert_ne!(base, 0, "local APIC EOI has no admitted MMIO mapping");
+    // SAFETY: the executing CPU initialized its local APIC against the admitted
+    // mapping before any MSI vector could be published.
     unsafe {
         ((base + APIC_EOI_OFFSET) as *mut u32).write_volatile(0);
     }
+}
+
+fn end_of_interrupt() {
+    local_apic_eoi();
 }
 
 #[cfg(test)]
@@ -240,8 +530,10 @@ mod tests {
     use core::sync::atomic::Ordering;
 
     use super::{
-        ALLOCATED, HANDLERS, MSI_VECTOR_FIRST, MSI_VECTOR_LAST, MsiVectorLease,
-        vector_has_registration_authority, vector_index, vector_is_valid,
+        ALLOCATED, APIC_DELIVERY_MODE_FIXED, APIC_DELIVERY_MODE_INIT, APIC_DELIVERY_MODE_STARTUP,
+        APIC_ICR_LEVEL_ASSERT, APIC_ICR_TRIGGER_LEVEL, HANDLERS, MSI_VECTOR_FIRST, MSI_VECTOR_LAST,
+        MsiVectorLease, fixed_icr_words, startup_icr_words, vector_has_registration_authority,
+        vector_index, vector_is_valid,
     };
 
     #[test]
@@ -277,5 +569,38 @@ mod tests {
         drop(lease);
         assert_eq!(HANDLERS[index].load(Ordering::Acquire), 0);
         assert!(!ALLOCATED[index].load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn startup_ipi_sequence_uses_exact_destination_and_vector() {
+        let (destination, init_assert, init_deassert, sipi) =
+            startup_icr_words(7, 8).expect("valid xAPIC startup");
+        assert_eq!(destination, 7 << 24);
+        assert_eq!(
+            init_assert,
+            APIC_DELIVERY_MODE_INIT | APIC_ICR_LEVEL_ASSERT | APIC_ICR_TRIGGER_LEVEL
+        );
+        assert_eq!(
+            init_deassert,
+            APIC_DELIVERY_MODE_INIT | APIC_ICR_TRIGGER_LEVEL
+        );
+        assert_eq!(sipi, APIC_DELIVERY_MODE_STARTUP | 8);
+        assert!(startup_icr_words(256, 8).is_none());
+        assert!(startup_icr_words(7, 0).is_none());
+    }
+
+    #[test]
+    fn fixed_reschedule_ipi_uses_exact_destination_and_private_vector() {
+        let vector = super::super::idt::RESCHEDULE_IPI_VECTOR;
+        let (destination, command) = fixed_icr_words(0x5a, vector).expect("valid reschedule IPI");
+        assert_eq!(destination, 0x5a00_0000);
+        assert_eq!(
+            command,
+            APIC_DELIVERY_MODE_FIXED | APIC_ICR_LEVEL_ASSERT | u32::from(vector)
+        );
+        assert!(fixed_icr_words(0x100, vector).is_none());
+        assert!(fixed_icr_words(1, MSI_VECTOR_FIRST).is_none());
+        assert!(fixed_icr_words(1, 0xff).is_none());
+        assert!(fixed_icr_words(1, super::super::idt::TLB_SHOOTDOWN_IPI_VECTOR).is_some());
     }
 }

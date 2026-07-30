@@ -52,6 +52,14 @@ pub enum FreeFrameError {
     AlreadyFree,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FixedRangeClaimError {
+    NotInitialized,
+    InvalidRange,
+    OutsideUsableMemory,
+    AlreadyOwned,
+}
+
 struct PhysAllocatorState {
     initialized: bool,
     bitmap_ptr: *mut u64,
@@ -66,6 +74,8 @@ struct PhysAllocatorState {
     bitmap_page_count: usize,
 }
 
+// SAFETY: the state is reachable only through PHYS_ALLOCATOR, whose tracked
+// raw-spin guard serializes every mutation and pins the holder to one CPU.
 unsafe impl Send for PhysAllocatorState {}
 
 #[derive(Clone, Copy)]
@@ -176,6 +186,52 @@ impl PhysAllocatorState {
         }
         self.free_frames = self.free_frames.saturating_sub(reserved);
         reserved
+    }
+
+    fn claim_fixed_range_locked(
+        &mut self,
+        phys_start: u64,
+        byte_len: u64,
+    ) -> Result<(), FixedRangeClaimError> {
+        if !self.initialized {
+            return Err(FixedRangeClaimError::NotInitialized);
+        }
+        if byte_len == 0
+            || !phys_start.is_multiple_of(PAGE_SIZE)
+            || !byte_len.is_multiple_of(PAGE_SIZE)
+        {
+            return Err(FixedRangeClaimError::InvalidRange);
+        }
+        let end = phys_start
+            .checked_add(byte_len)
+            .ok_or(FixedRangeClaimError::InvalidRange)?;
+        let allocator_end = (self.frame_count as u64)
+            .checked_mul(PAGE_SIZE)
+            .ok_or(FixedRangeClaimError::InvalidRange)?;
+        if end > allocator_end {
+            return Err(FixedRangeClaimError::OutsideUsableMemory);
+        }
+
+        let start_frame = usize::try_from(phys_start / PAGE_SIZE)
+            .map_err(|_| FixedRangeClaimError::InvalidRange)?;
+        let page_count = usize::try_from(byte_len / PAGE_SIZE)
+            .map_err(|_| FixedRangeClaimError::InvalidRange)?;
+        let end_frame = start_frame
+            .checked_add(page_count)
+            .ok_or(FixedRangeClaimError::InvalidRange)?;
+        if !(start_frame..end_frame).all(|frame| frame_is_boot_usable(self, frame)) {
+            return Err(FixedRangeClaimError::OutsideUsableMemory);
+        }
+        if (start_frame..end_frame).any(|frame| self.is_used(frame)) {
+            return Err(FixedRangeClaimError::AlreadyOwned);
+        }
+
+        self.mark_range_used(start_frame, page_count);
+        self.free_frames = self
+            .free_frames
+            .checked_sub(page_count)
+            .expect("fixed physical claim exceeded the free-frame count");
+        Ok(())
     }
 
     fn alloc_contiguous_locked(&mut self, page_count: usize) -> Option<PhysAddr> {
@@ -402,6 +458,11 @@ pub fn init(boot_info_ptr: *const BootInfo) {
             &[
                 (image_start, image_end),
                 (early_system_start, early_system_end),
+                (
+                    nucleus_core::ap_trampoline::TRAMPOLINE_PHYS,
+                    nucleus_core::ap_trampoline::TRAMPOLINE_PHYS
+                        + nucleus_core::ap_trampoline::RESERVED_BYTES,
+                ),
             ],
         ) else {
             panic!("failed to reserve physical allocator bitmap");
@@ -467,6 +528,17 @@ pub fn alloc_frame() -> Option<PhysAddr> {
         || crate::debug::warn!(memory, "fault injection: alloc.frame failed"),
         || alloc_contiguous(1),
     )
+}
+
+/// Atomically remove one exact page-aligned boot-usable range from the general
+/// allocator. Architecture bootstrap code uses this only after resolving the
+/// complete fixed range and before writing any byte into it.
+pub fn claim_fixed_range(phys_start: u64, byte_len: u64) -> Result<(), FixedRangeClaimError> {
+    irq_safe(|| {
+        PHYS_ALLOCATOR
+            .lock()
+            .claim_fixed_range_locked(phys_start, byte_len)
+    })
 }
 
 fn alloc_frame_with_fault_gate(
@@ -711,6 +783,40 @@ mod tests {
         let _ = state.free_frame_locked(first);
         let reused = state.alloc_contiguous_locked(1).unwrap();
         assert_eq!(reused.as_u64(), 0);
+    }
+
+    #[test]
+    fn fixed_range_claim_is_atomic_exact_and_not_reallocatable() {
+        let mut bitmap = [u64::MAX; 1];
+        let mut state = test_state(&mut bitmap, 16, 0);
+        let free_before = state.free_frames;
+
+        assert_eq!(
+            state.claim_fixed_range_locked(PAGE_SIZE * 4, PAGE_SIZE * 2),
+            Ok(())
+        );
+        assert_eq!(state.free_frames, free_before - 2);
+        assert!(state.is_used(4));
+        assert!(state.is_used(5));
+        assert_eq!(
+            state.claim_fixed_range_locked(PAGE_SIZE * 4, PAGE_SIZE),
+            Err(FixedRangeClaimError::AlreadyOwned)
+        );
+        assert_eq!(
+            state.claim_fixed_range_locked(PAGE_SIZE * 8 + 1, PAGE_SIZE),
+            Err(FixedRangeClaimError::InvalidRange)
+        );
+
+        let allocated: alloc::vec::Vec<_> = (0..state.free_frames)
+            .map(|_| {
+                state
+                    .alloc_contiguous_locked(1)
+                    .expect("remaining frame must allocate")
+                    .as_u64()
+            })
+            .collect();
+        assert!(!allocated.contains(&(PAGE_SIZE * 4)));
+        assert!(!allocated.contains(&(PAGE_SIZE * 5)));
     }
 
     #[test]

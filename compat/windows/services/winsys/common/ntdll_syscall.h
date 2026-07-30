@@ -14,6 +14,11 @@
 #define NTDLL_API_NtFreeVirtualMemory 0x1014u
 #define NTDLL_API_NtProtectVirtualMemory 0x1015u
 #define NTDLL_API_NtQueryVirtualMemory 0x1046u
+#define NTDLL_API_NtQuerySystemInformation 0x1047u
+#define NTDLL_API_RtlRustosQueryProcessAffinity 0x1048u
+#define NTDLL_API_RtlRustosSetProcessAffinity 0x1049u
+#define NTDLL_API_RtlRustosSetThreadAffinity 0x104Au
+#define NTDLL_API_RtlRustosGetCurrentProcessorNumber 0x104Bu
 
 static __inline ULONGLONG ntdll_syscall6(
     UINT nr,

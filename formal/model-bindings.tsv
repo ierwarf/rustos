@@ -1,5 +1,8 @@
 # model	role	whole_flow	rationale
 authority-identity-lifecycle/AuthorityIdentityLifecycle	refinement	root-authority	Non-reusable process and task identities refine root and delegated authority lifetime.
+atomic-process-activation-batch/AtomicProcessActivationBatch	refinement	atomic-process-activation-batch	Exact requester binding, complete capability/task preflight, atomic runnable publication, one-shot consumption, and requester-exit revoke refine startup cohort activation.
+cpu-affinity-observation/CpuAffinityObservation	refinement	cpu-affinity-observation	Kernel-stamped dense Online topology and strict service-side validation refine Linux and Windows logical processor observations without exposing raw APIC identity.
+task-affinity-lifecycle/TaskAffinityLifecycle	refinement	task-affinity-lifecycle	Nonempty Online-subset task and process masks, exact target ownership, forced migration, previous-mask return, fork inheritance, exec preservation, and current-processor observation refine Linux and Windows affinity ABI.
 clocksource-deadline/ClocksourceDeadline	refinement	monotonic-deadline-lifecycle	The clocksource model proves the deadline flow's time-domain and catch-up invariants.
 deferred-start/DeferredStart	refinement	deferred-process-activation	Suspended creation and one-shot activation refine the process activation transaction.
 devmgrd-sessiond-isolation/DevmgrdSessiondIsolation	refinement	service-call-authority	Bounded policy-worker isolation refines nested service-call progress and cancellation.
@@ -35,14 +38,24 @@ memfd-seal-lifecycle/MemfdSealLifecycle	refinement	memory-map	Seal, mapping, res
 network-payload-session/NetworkPayloadSession	refinement	dvm-network-ingress	Packet shape and session generation refine DVM network ingress.
 persistent-mutation-admission/PersistentMutationAdmission	refinement	durable-block-mutation	Mutation authorization refines durable write admission.
 post-init-supervisor-recovery/PostInitSupervisorRecovery	refinement	post-init-service-authority	Supervisor restart and backoff refine post-init service authority.
+post-init-bootstrap-barrier/PostInitBootstrapBarrier	refinement	post-init-bootstrap-barrier	Independent service activation may overlap, but only exact PID-bound endpoint admission opens the consumer barrier.
 proc-broker-session/ProcBrokerSession	refinement	deferred-process-activation	Prepare-session owner exit and cleanup refine process activation.
 rootd-bootstrap/RootdBootstrap	refinement	service-bootstrap	Root bootstrap ordering refines the first service graph transition.
 runtime-control-rpc/RuntimeControlRpc	refinement	runtime-control-ingress	One-response RPC settlement refines runtime-control ingress.
 service-heap-lifecycle/ServiceHeapLifecycle	refinement	service-heap-lifecycle	Exact allocation ownership, release reuse, exhausted-capacity growth, and explicit failure refine long-lived service memory lifetime.
 scheduler-admission/SchedulerAdmission	refinement	scheduler-dispatch	Strict-class admission refines scheduler dispatch authority.
 scheduler-cpu-distribution/SchedulerCpuDistribution	refinement	scheduler-dispatch	Bounded class bursts and per-task wait age refine dispatch fairness.
-scheduler-thread-demotion/SchedulerThreadDemotion	refinement	scheduler-dispatch	Base-class demotion and donation preservation refine effective class.
+scheduler-thread-demotion/SchedulerThreadDemotion	refinement	scheduler-dispatch	Base-class demotion, terminal bootstrap-reply custody, and donation preservation refine effective class.
 scheduler-wakeup/SchedulerWakeup	refinement	scheduler-lifecycle	Arm, token-only wake of a running task with no published frame, blocked-frame wake, atomic commit-reschedule, exact dispatch, waiter cleanup before timer acknowledgement, cancel, and retire refine task wait lifetime.
+smp-release-admission/SmpReleaseAdmission	refinement	smp-release-admission	All-or-nothing multi-vCPU prerequisite admission prevents configuration from masquerading as SMP evidence.
+smp-reschedule-ipi/SmpRescheduleIpi	refinement	smp-reschedule-ipi-lifecycle	Per-CPU durable requests, coalesced fixed IPIs, locked deferral, and safe-point consumption refine cross-CPU rescheduling.
+scheduler-cpu-ownership/SchedulerCpuOwnership	refinement	scheduler-cpu-ownership	CPU-local current-task uniqueness, two-phase incoming reservation and outgoing-stack retention through the assembly RSP switch, IRQ-atomic pending-to-held acquisition, exact preemption-unit accounting, guard pinning, safe dispatch, and fail-closed invalid release refine scheduler execution ownership.
+bootstrap-activation-handoff/BootstrapActivationHandoff	refinement	bootstrap-activation-handoff	Bounded FIFO activation retention, stale removal, overdue-turn preservation, and exact first dispatch refine supervisor-committed child handoff.
+synchronous-ipc-handoff/SynchronousIpcHandoff	refinement	scheduler-dispatch	Call enqueue and successful reply completion, bounded FIFO retention, exact peer dispatch, stale removal, and a forced fairness turn refine synchronous hand-back.
+tlb-shootdown-lifecycle/TlbShootdownLifecycle	refinement	tlb-shootdown-lifecycle	Serialized activation and mutation, exact target generations, acknowledgements, and reclaim admission refine address-space translation lifetime.
+cross-cpu-task-retirement/CrossCpuTaskRetirement	refinement	cross-cpu-task-retirement	Process exec sealing, remote target quiescence, sibling retirement, generation replacement, final shootdown, and reclaim refine cross-CPU process lifetime.
+robust-futex-owner-death/RobustFutexOwnerDeath	refinement	thread-exit-futex-cleanup	Aligned user-word admission, atomic owner-death compare-exchange, bounded retry, release clear_child_tid store, and post-publication wake refine Linux thread-exit cleanup.
+per-cpu-clockevent-lifecycle/PerCpuClockeventLifecycle	refinement	per-cpu-clockevent-lifecycle	Local timer programming before AP Online, deadline delivery, strict-future rearm, scheduler turn, and local EOI refine per-CPU preemption.
 syscall-simd-lifecycle/SyscallSimdLifecycle	refinement	syscall-simd-lifecycle	Exact user SIMD and syscall-entry-frame ownership, published kernel continuation lifetime, post-resume SYSRET validation, and owner-only return refine the complete syscall transition.
 syscall-scheduler-continuation/SyscallSchedulerContinuation	refinement	syscall-simd-lifecycle	Atomic arm-race-or-publish, blocked wake, dispatch consumption, retained syscall frame, and post-resume validation compose scheduler and syscall lifetime.
 sigchld-notification/SigchldNotification	refinement	process-signal-lifecycle	Coalesced stop continue and exit causes refine process-directed SIGCHLD delivery and SA_NOCLDSTOP suppression.

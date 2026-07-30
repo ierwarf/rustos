@@ -8,9 +8,9 @@
 //! - **Concurrency:** Admission is boot-serialized on the BSP.
 //! - **Failure:** Malformed optional topology is rejected with an explicit
 //!   bounded fallback only where the architecture contract permits it.
-//! - **Forbidden:** No unchecked firmware pointer, partial MCFG publication,
-//!   or fabricated timer topology.
-//! - **Evidence:** `acpi-firmware-admission` and
+//! - **Forbidden:** No unchecked firmware pointer, partial MCFG/MADT
+//!   publication, raw-APIC-ID array indexing, or fabricated timer topology.
+//! - **Evidence:** `acpi-firmware-admission`, `cpu-topology-admission`, and
 //!   `monotonic-deadline-lifecycle`.
 use boot_protocol::BootInfo;
 use spin::Mutex;
@@ -21,15 +21,103 @@ const SDT_HEADER_LEN: usize = 36;
 const MCFG_HEADER_LEN: usize = 44;
 const MCFG_ENTRY_LEN: usize = 16;
 const HPET_TABLE_LEN: usize = 56;
+const MADT_HEADER_LEN: usize = 44;
+const MADT_LOCAL_APIC: u8 = 0;
+const MADT_LOCAL_APIC_ADDRESS_OVERRIDE: u8 = 5;
+const MADT_LOCAL_X2APIC: u8 = 9;
+const MADT_PROCESSOR_ENABLED: u32 = 1;
+const MADT_PROCESSOR_ONLINE_CAPABLE: u32 = 2;
 const ACPI_ADDRESS_SPACE_SYSTEM_MEMORY: u8 = 0;
 const ACPI_GAS_ACCESS_QWORD: u8 = 4;
 const MAX_MCFG_REGIONS: usize = 8;
 const MAX_RSDP_BYTES: usize = 4096;
 const MAX_ACPI_SDT_BYTES: usize = 1024 * 1024;
+pub const MAX_SUPPORTED_CPUS: usize = 8;
 const PCI_ECAM_BUS_BYTES: u64 = 1 << 20;
 const IDENTITY_MAPPED_PHYS_LIMIT: u64 = 512 * 1024 * 1024 * 1024;
 
 static ACPI_STATE: Mutex<AcpiState> = Mutex::new(AcpiState::new());
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CpuDescriptor {
+    pub logical_index: u8,
+    pub firmware_uid: u32,
+    pub apic_id: u32,
+    pub uses_x2apic_id: bool,
+}
+
+impl CpuDescriptor {
+    const fn empty() -> Self {
+        Self {
+            logical_index: u8::MAX,
+            firmware_uid: u32::MAX,
+            apic_id: u32::MAX,
+            uses_x2apic_id: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CpuTopology {
+    local_apic_address: u64,
+    cpu_count: usize,
+    cpus: [CpuDescriptor; MAX_SUPPORTED_CPUS],
+}
+
+impl CpuTopology {
+    const fn empty() -> Self {
+        Self {
+            local_apic_address: 0,
+            cpu_count: 0,
+            cpus: [CpuDescriptor::empty(); MAX_SUPPORTED_CPUS],
+        }
+    }
+
+    pub fn local_apic_address(self) -> u64 {
+        self.local_apic_address
+    }
+
+    pub fn cpu_count(self) -> usize {
+        self.cpu_count
+    }
+
+    pub fn cpus(&self) -> &[CpuDescriptor] {
+        &self.cpus[..self.cpu_count]
+    }
+
+    fn normalize_bsp_first(mut self, bsp_apic_id: u32) -> Option<Self> {
+        let bsp_position = self.cpus[..self.cpu_count]
+            .iter()
+            .position(|cpu| cpu.apic_id == bsp_apic_id)?;
+        self.cpus.swap(0, bsp_position);
+        for (logical_index, cpu) in self.cpus[..self.cpu_count].iter_mut().enumerate() {
+            cpu.logical_index =
+                u8::try_from(logical_index).expect("admitted CPU count exceeds logical index");
+        }
+        Some(self)
+    }
+
+    fn push_cpu(&mut self, firmware_uid: u32, apic_id: u32, uses_x2apic_id: bool) -> bool {
+        if self.cpu_count >= self.cpus.len()
+            || self.cpus[..self.cpu_count]
+                .iter()
+                .any(|cpu| cpu.firmware_uid == firmware_uid || cpu.apic_id == apic_id)
+        {
+            return false;
+        }
+        let Ok(logical_index) = u8::try_from(self.cpu_count) else {
+            return false;
+        };
+        self.cpus[self.cpu_count] = CpuDescriptor {
+            logical_index,
+            firmware_uid,
+            apic_id,
+            uses_x2apic_id,
+        };
+        self.cpu_count += 1;
+        true
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PciConfigRegion {
@@ -89,6 +177,7 @@ impl PciConfigRegion {
 struct AcpiState {
     rsdp_addr: u64,
     hpet_address: u64,
+    cpu_topology: CpuTopology,
     region_count: usize,
     regions: [PciConfigRegion; MAX_MCFG_REGIONS],
 }
@@ -98,6 +187,7 @@ impl AcpiState {
         Self {
             rsdp_addr: 0,
             hpet_address: 0,
+            cpu_topology: CpuTopology::empty(),
             region_count: 0,
             regions: [PciConfigRegion::empty(); MAX_MCFG_REGIONS],
         }
@@ -106,6 +196,7 @@ impl AcpiState {
     fn reset(&mut self, rsdp_addr: u64) {
         self.rsdp_addr = rsdp_addr;
         self.hpet_address = 0;
+        self.cpu_topology = CpuTopology::empty();
         self.region_count = 0;
         self.regions = [PciConfigRegion::empty(); MAX_MCFG_REGIONS];
     }
@@ -139,6 +230,18 @@ pub fn init(boot_info_ptr: *const BootInfo) {
     }
 
     let rsdp_addr = state.rsdp_addr;
+    if let Some(topology) = load_cpu_topology(rsdp_addr).and_then(|topology| {
+        topology.normalize_bsp_first(nucleus_core::util::lockdep::hardware_apic_id())
+    }) {
+        state.cpu_topology = topology;
+        crate::debug::println!(
+            "ACPI MADT admitted: {} logical CPU(s), local APIC at {:#x}.",
+            topology.cpu_count(),
+            topology.local_apic_address(),
+        );
+    } else {
+        crate::debug::println!("ACPI MADT CPU topology unavailable or unsupported.");
+    }
     if load_mcfg_regions(rsdp_addr, &mut state) {
         crate::debug::println!(
             "ACPI MCFG loaded from {:#x}: {} region(s).",
@@ -159,6 +262,21 @@ pub fn init(boot_info_ptr: *const BootInfo) {
 pub fn hpet_address() -> Option<u64> {
     let address = ACPI_STATE.lock().hpet_address;
     (address != 0).then_some(address)
+}
+
+pub fn cpu_topology() -> Option<CpuTopology> {
+    let topology = ACPI_STATE.lock().cpu_topology;
+    (topology.cpu_count != 0).then_some(topology)
+}
+
+#[cfg(test)]
+pub(super) fn test_topology(cpus: &[(u32, u32, bool)]) -> CpuTopology {
+    let mut topology = CpuTopology::empty();
+    topology.local_apic_address = 0xfee0_0000;
+    for &(firmware_uid, apic_id, uses_x2apic_id) in cpus {
+        assert!(topology.push_cpu(firmware_uid, apic_id, uses_x2apic_id));
+    }
+    topology
 }
 
 pub fn pci_config_address(
@@ -200,6 +318,115 @@ pub fn for_each_pci_bus_region(mut visit: impl FnMut(u16, u8, u8) -> bool) {
 
 fn boot_info_from_ptr(boot_info_ptr: *const BootInfo) -> Option<&'static BootInfo> {
     unsafe { BootInfo::from_ptr(boot_info_ptr) }.ok()
+}
+
+fn load_cpu_topology(rsdp_addr: u64) -> Option<CpuTopology> {
+    let (root_addr, entry_size) = root_sdt_from_rsdp(rsdp_addr)?;
+    let root_table = sdt_bytes(root_addr)?;
+    let entries = root_sdt_entries(root_table, entry_size)?;
+    let mut index = 0;
+    while index + entry_size <= entries.len() {
+        let table_addr = if entry_size == 8 {
+            le_u64(&entries[index..index + 8])
+        } else {
+            le_u32(&entries[index..index + 4]) as u64
+        };
+        if table_addr == 0 {
+            return None;
+        }
+        if let Some(table) = sdt_bytes(table_addr)
+            && &table[..4] == b"APIC"
+        {
+            return parse_madt_table(table);
+        }
+        index += entry_size;
+    }
+    None
+}
+
+fn parse_madt_table(table: &[u8]) -> Option<CpuTopology> {
+    if table.len() < MADT_HEADER_LEN || &table[..4] != b"APIC" {
+        return None;
+    }
+    let mut topology = CpuTopology::empty();
+    topology.local_apic_address = u64::from(le_u32(&table[36..40]));
+    if le_u32(&table[40..44]) & !1 != 0 {
+        return None;
+    }
+
+    let mut address_overridden = false;
+    let mut index = MADT_HEADER_LEN;
+    while index < table.len() {
+        let header_end = index.checked_add(2)?;
+        if header_end > table.len() {
+            return None;
+        }
+        let entry_type = table[index];
+        let entry_len = usize::from(table[index + 1]);
+        if entry_len < 2 {
+            return None;
+        }
+        let entry_end = index.checked_add(entry_len)?;
+        if entry_end > table.len() {
+            return None;
+        }
+        let entry = &table[index..entry_end];
+        match entry_type {
+            MADT_LOCAL_APIC => {
+                if entry_len != 8 {
+                    return None;
+                }
+                let flags = le_u32(&entry[4..8]);
+                if flags & !(MADT_PROCESSOR_ENABLED | MADT_PROCESSOR_ONLINE_CAPABLE) != 0 {
+                    return None;
+                }
+                if flags & MADT_PROCESSOR_ONLINE_CAPABLE != 0 && flags & MADT_PROCESSOR_ENABLED == 0
+                {
+                    // Fixed-CPU commercial topology does not admit hot-add-only CPUs.
+                    return None;
+                }
+                if flags & MADT_PROCESSOR_ENABLED != 0
+                    && !topology.push_cpu(u32::from(entry[2]), u32::from(entry[3]), false)
+                {
+                    return None;
+                }
+            }
+            MADT_LOCAL_X2APIC => {
+                if entry_len != 16 || le_u16(&entry[2..4]) != 0 {
+                    return None;
+                }
+                let flags = le_u32(&entry[8..12]);
+                if flags & !(MADT_PROCESSOR_ENABLED | MADT_PROCESSOR_ONLINE_CAPABLE) != 0 {
+                    return None;
+                }
+                if flags & MADT_PROCESSOR_ONLINE_CAPABLE != 0 && flags & MADT_PROCESSOR_ENABLED == 0
+                {
+                    return None;
+                }
+                if flags & MADT_PROCESSOR_ENABLED != 0
+                    && !topology.push_cpu(le_u32(&entry[12..16]), le_u32(&entry[4..8]), true)
+                {
+                    return None;
+                }
+            }
+            MADT_LOCAL_APIC_ADDRESS_OVERRIDE => {
+                if entry_len != 12 || le_u16(&entry[2..4]) != 0 || address_overridden {
+                    return None;
+                }
+                topology.local_apic_address = le_u64(&entry[4..12]);
+                address_overridden = true;
+            }
+            _ => {}
+        }
+        index = entry_end;
+    }
+
+    let apic_end = topology.local_apic_address.checked_add(4096)?;
+    (topology.cpu_count != 0
+        && topology.local_apic_address != 0
+        && topology.local_apic_address.is_multiple_of(4096)
+        && apic_end <= IDENTITY_MAPPED_PHYS_LIMIT)
+        .then_some(topology)
 }
 
 fn load_mcfg_regions(rsdp_addr: u64, state: &mut AcpiState) -> bool {
@@ -431,10 +658,12 @@ fn le_u64(bytes: &[u8]) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use alloc::{vec, vec::Vec};
+
     use super::{
-        ACPI_GAS_ACCESS_QWORD, AcpiState, HPET_TABLE_LEN, MCFG_ENTRY_LEN, MCFG_HEADER_LEN,
-        PCI_ECAM_BUS_BYTES, PciConfigRegion, parse_hpet_table, parse_mcfg_table, root_sdt_entries,
-        validated_mcfg_region,
+        ACPI_GAS_ACCESS_QWORD, AcpiState, HPET_TABLE_LEN, MADT_HEADER_LEN, MAX_SUPPORTED_CPUS,
+        MCFG_ENTRY_LEN, MCFG_HEADER_LEN, PCI_ECAM_BUS_BYTES, PciConfigRegion, parse_hpet_table,
+        parse_madt_table, parse_mcfg_table, root_sdt_entries, validated_mcfg_region,
     };
 
     fn one_mcfg_entry(
@@ -521,5 +750,91 @@ mod tests {
         table[43] = ACPI_GAS_ACCESS_QWORD;
         table[44..52].copy_from_slice(&0xfed0_0001_u64.to_le_bytes());
         assert!(parse_hpet_table(&table).is_none());
+    }
+
+    fn madt_header(extra_bytes: usize) -> Vec<u8> {
+        let mut table = vec![0_u8; MADT_HEADER_LEN + extra_bytes];
+        let table_len = table.len() as u32;
+        table[..4].copy_from_slice(b"APIC");
+        table[4..8].copy_from_slice(&table_len.to_le_bytes());
+        table[36..40].copy_from_slice(&0xfee0_0000_u32.to_le_bytes());
+        table[40..44].copy_from_slice(&1_u32.to_le_bytes());
+        table
+    }
+
+    #[test]
+    fn madt_cpu_topology_is_dense_unique_bounded_and_atomic() {
+        let mut table = madt_header(24);
+        table[44..52].copy_from_slice(&[0, 8, 7, 3, 1, 0, 0, 0]);
+        table[52] = 9;
+        table[53] = 16;
+        table[56..60].copy_from_slice(&0x1234_u32.to_le_bytes());
+        table[60..64].copy_from_slice(&1_u32.to_le_bytes());
+        table[64..68].copy_from_slice(&42_u32.to_le_bytes());
+
+        let topology = parse_madt_table(&table).expect("valid mixed MADT topology");
+        assert_eq!(topology.local_apic_address(), 0xfee0_0000);
+        assert_eq!(topology.cpu_count(), 2);
+        assert_eq!(topology.cpus()[0].logical_index, 0);
+        assert_eq!(topology.cpus()[0].firmware_uid, 7);
+        assert_eq!(topology.cpus()[0].apic_id, 3);
+        assert!(!topology.cpus()[0].uses_x2apic_id);
+        assert_eq!(topology.cpus()[1].logical_index, 1);
+        assert_eq!(topology.cpus()[1].firmware_uid, 42);
+        assert_eq!(topology.cpus()[1].apic_id, 0x1234);
+        assert!(topology.cpus()[1].uses_x2apic_id);
+
+        let mut duplicate = table;
+        duplicate[64..68].copy_from_slice(&7_u32.to_le_bytes());
+        assert!(parse_madt_table(&duplicate).is_none());
+
+        let mut too_many = madt_header((MAX_SUPPORTED_CPUS + 1) * 8);
+        for cpu in 0..=MAX_SUPPORTED_CPUS {
+            let offset = MADT_HEADER_LEN + cpu * 8;
+            too_many[offset..offset + 8].copy_from_slice(&[0, 8, cpu as u8, cpu as u8, 1, 0, 0, 0]);
+        }
+        assert!(parse_madt_table(&too_many).is_none());
+    }
+
+    #[test]
+    fn madt_normalizes_the_executing_bsp_to_logical_cpu_zero() {
+        let mut table = madt_header(24);
+        table[44..52].copy_from_slice(&[0, 8, 7, 3, 1, 0, 0, 0]);
+        table[52] = 9;
+        table[53] = 16;
+        table[56..60].copy_from_slice(&0x1234_u32.to_le_bytes());
+        table[60..64].copy_from_slice(&1_u32.to_le_bytes());
+        table[64..68].copy_from_slice(&42_u32.to_le_bytes());
+
+        let topology = parse_madt_table(&table)
+            .and_then(|topology| topology.normalize_bsp_first(0x1234))
+            .expect("BSP must be present in the admitted topology");
+        assert_eq!(topology.cpus()[0].apic_id, 0x1234);
+        assert_eq!(topology.cpus()[0].logical_index, 0);
+        assert_eq!(topology.cpus()[1].apic_id, 3);
+        assert_eq!(topology.cpus()[1].logical_index, 1);
+        assert!(
+            parse_madt_table(&table)
+                .and_then(|topology| topology.normalize_bsp_first(0x99))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn madt_rejects_truncation_hot_add_only_and_bad_apic_override() {
+        let mut truncated = madt_header(3);
+        truncated[44..47].copy_from_slice(&[0, 8, 0]);
+        assert!(parse_madt_table(&truncated).is_none());
+
+        let mut hot_add_only = madt_header(8);
+        hot_add_only[44..52].copy_from_slice(&[0, 8, 0, 0, 2, 0, 0, 0]);
+        assert!(parse_madt_table(&hot_add_only).is_none());
+
+        let mut bad_override = madt_header(20);
+        bad_override[44..52].copy_from_slice(&[0, 8, 0, 0, 1, 0, 0, 0]);
+        bad_override[52] = 5;
+        bad_override[53] = 12;
+        bad_override[56..64].copy_from_slice(&0xfee0_0001_u64.to_le_bytes());
+        assert!(parse_madt_table(&bad_override).is_none());
     }
 }

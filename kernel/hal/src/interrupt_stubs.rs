@@ -1,3 +1,18 @@
+//! Ring0 interrupt entry, saved-frame dispatch, and stack-handoff assembly.
+//!
+//! - **Owner:** kernel-hal owns the x86_64 interrupt stack-switch boundary.
+//! - **Boundary:** dispatcher-returned frame pointers cross from Rust policy
+//!   back into assembly only after complete saved-context validation.
+//! - **Lifecycle:** save the outgoing frame, select an incoming frame, switch
+//!   `rsp`, commit scheduler ownership, restore, and `iretq`.
+//! - **Concurrency:** the post-`rsp` callback is the only edge allowed to
+//!   release the outgoing task stack for another CPU.
+//! - **Failure:** invalid frames or missing ownership ordering fail closed in
+//!   scheduler validation and transition assertions.
+//! - **Forbidden:** no outgoing-stack release before `rsp` changes and no
+//!   register restore before transition commit.
+//! - **Evidence:** `scheduler-cpu-ownership` and `exception-retirement`.
+
 use core::arch::global_asm;
 
 global_asm!(
@@ -76,6 +91,16 @@ global_asm!(
         iretq
     .endm
 
+    .macro COMMIT_CONTEXT_SWITCH
+        // A kernel-frame pointer may be only 8-byte aligned. Preserve the
+        // exact incoming frame in callee-saved r12 while establishing the
+        // SysV-required 16-byte pre-call alignment on the incoming stack.
+        mov r12, rsp
+        and rsp, -16
+        call scheduler_context_switch_commit_dispatch
+        mov rsp, r12
+    .endm
+
     .global timer_interrupt_handler
     .type timer_interrupt_handler, @function
     timer_interrupt_handler:
@@ -107,6 +132,7 @@ global_asm!(
         // SysV x86_64 requires 16-byte alignment before `call`.
         call timer_interrupt_dispatch
         mov rsp, rax
+        COMMIT_CONTEXT_SWITCH
 
         test byte ptr [rsp + 0x190], 0x3
         jz 3f
@@ -157,6 +183,7 @@ global_asm!(
         // SysV x86_64 requires 16-byte alignment before `call`.
         call rtc_interrupt_dispatch
         mov rsp, rax
+        COMMIT_CONTEXT_SWITCH
 
         test byte ptr [rsp + 0x190], 0x3
         jz 6f
@@ -206,6 +233,7 @@ global_asm!(
         and rsp, -16
         call software_schedule_interrupt_dispatch
         mov rsp, rax
+        COMMIT_CONTEXT_SWITCH
 
         test byte ptr [rsp + 0x190], 0x3
         jz 9f
@@ -225,6 +253,56 @@ global_asm!(
 
     .size software_schedule_interrupt_handler, . - software_schedule_interrupt_handler
 
+    .global reschedule_ipi_interrupt_handler
+    .type reschedule_ipi_interrupt_handler, @function
+    reschedule_ipi_interrupt_handler:
+        test byte ptr [rsp + 8], 0x3
+        jnz 10f
+        push 0
+        push 1
+10:
+        SAVE_CONTEXT
+
+        mov rax, [rsp + 0x178]
+        cmp rax, 1
+        je 11f
+        mov rax, [rsp + 0x178]
+        mov rcx, [rsp + 0x180]
+        mov rdx, [rsp + 0x188]
+        mov rsi, [rsp + 0x190]
+        mov rdi, [rsp + 0x198]
+        mov [rsp + 0x178], rsi
+        mov [rsp + 0x180], rdi
+        mov [rsp + 0x188], rax
+        mov [rsp + 0x190], rcx
+        mov [rsp + 0x198], rdx
+11:
+
+        cld
+        mov rdi, rsp
+        and rsp, -16
+        call reschedule_ipi_interrupt_dispatch
+        mov rsp, rax
+        COMMIT_CONTEXT_SWITCH
+
+        test byte ptr [rsp + 0x190], 0x3
+        jz 12f
+        mov rax, [rsp + 0x178]
+        mov rcx, [rsp + 0x180]
+        mov rdx, [rsp + 0x188]
+        mov rsi, [rsp + 0x190]
+        mov rdi, [rsp + 0x198]
+        mov [rsp + 0x178], rdx
+        mov [rsp + 0x180], rsi
+        mov [rsp + 0x188], rdi
+        mov [rsp + 0x190], rax
+        mov [rsp + 0x198], rcx
+        RESTORE_CONTEXT_AND_IRET 0x178
+12:
+        RESTORE_CONTEXT_AND_IRET 0x188
+
+    .size reschedule_ipi_interrupt_handler, . - reschedule_ipi_interrupt_handler
+
     .global restore_kernel_saved_context
     .type restore_kernel_saved_context, @function
     restore_kernel_saved_context:
@@ -240,3 +318,29 @@ global_asm!(
     .size software_schedule_trap, . - software_schedule_trap
 "#
 );
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn scheduler_commit_call_aligns_and_restores_incoming_rsp() {
+        let source = include_str!("interrupt_stubs.rs");
+        let contract = r#".macro COMMIT_CONTEXT_SWITCH
+        // A kernel-frame pointer may be only 8-byte aligned. Preserve the
+        // exact incoming frame in callee-saved r12 while establishing the
+        // SysV-required 16-byte pre-call alignment on the incoming stack.
+        mov r12, rsp
+        and rsp, -16
+        call scheduler_context_switch_commit_dispatch
+        mov rsp, r12
+    .endm"#;
+        assert!(
+            source.contains(contract),
+            "scheduler stack-commit call lost its aligned incoming-frame boundary"
+        );
+        assert_eq!(
+            source.matches("\n        COMMIT_CONTEXT_SWITCH\n").count(),
+            4,
+            "every scheduling interrupt return must commit the stack transition"
+        );
+    }
+}

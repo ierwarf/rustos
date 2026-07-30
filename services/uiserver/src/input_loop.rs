@@ -1,4 +1,4 @@
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
@@ -19,12 +19,6 @@ use crate::sys::{
 use crate::wayland::WaylandCompositor;
 
 const SLOW_INPUT_READ_THRESHOLD_MS: u128 = 50;
-// The common wait set now exports inputd's service-owned readiness generation.
-// Keep this bounded compatibility cadence until the dedicated reader itself is
-// moved onto that ABI; its shared wake channel also receives the Wayland
-// backend's aggregate-epoll wake and therefore lets the UI loop wait on input,
-// client traffic, and its runtime deadline without polling clients every 16 ms.
-const INPUT_READER_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(4);
 const INPUT_READER_QUEUE_CAPACITY: usize = INPUT_EVENT_BATCH * 64;
 const INPUT_READER_WATCHDOG_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 const INPUT_READER_PANIC_THRESHOLD_MS: u64 = 3_000;
@@ -210,35 +204,41 @@ impl InputReaderStats {
     }
 }
 
-fn next_input_probe_deadline(previous: Instant, now: Instant) -> Instant {
-    let scheduled = previous
-        .checked_add(INPUT_READER_PROBE_INTERVAL)
-        .unwrap_or(now);
-    if scheduled > now {
-        scheduled
-    } else {
-        now.checked_add(INPUT_READER_PROBE_INTERVAL).unwrap_or(now)
+fn create_input_wait_epoll(input_fds: &[OwnedFd]) -> Result<OwnedFd, i32> {
+    if input_fds.is_empty() {
+        return Err(libc::ENODEV);
     }
-}
-
-fn wait_for_next_input_probe(stats: &InputReaderStats, deadline: &mut Instant) {
-    let now = Instant::now();
-    *deadline = next_input_probe_deadline(*deadline, now);
-    stats
-        .wait_started_ms
-        .store(stats.elapsed_ms(), Ordering::Release);
-    stats.wait_active.store(true, Ordering::Release);
-    stats.wait_attempts.fetch_add(1, Ordering::Relaxed);
-    if let Some(duration) = deadline.checked_duration_since(now) {
-        if !duration.is_zero() {
-            thread::sleep(duration);
+    let raw_epoll = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+    if raw_epoll < 0 {
+        return Err(std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO));
+    }
+    let epoll = unsafe { OwnedFd::from_raw_fd(raw_epoll) };
+    for (index, input_fd) in input_fds.iter().enumerate() {
+        let mut event = libc::epoll_event {
+            events: (libc::EPOLLIN | libc::EPOLLERR | libc::EPOLLHUP) as u32,
+            u64: index as u64 + 1,
+        };
+        let status = unsafe {
+            libc::epoll_ctl(
+                epoll.as_raw_fd(),
+                libc::EPOLL_CTL_ADD,
+                input_fd.as_raw_fd(),
+                &mut event,
+            )
+        };
+        if status < 0 {
+            return Err(std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO));
         }
     }
-    stats.wait_active.store(false, Ordering::Release);
-    stats.completed_waits.fetch_add(1, Ordering::Relaxed);
+    Ok(epoll)
 }
 
-pub(crate) fn start_input_reader(input_fds: Vec<OwnedFd>) -> InputReader {
+pub(crate) fn start_input_reader(input_fds: Vec<OwnedFd>) -> Result<InputReader, i32> {
+    let input_wait_epoll = create_input_wait_epoll(&input_fds)?;
     let (sender, receiver) = mpsc::sync_channel::<InputEvent>(INPUT_READER_QUEUE_CAPACITY);
     let wake_generation = Arc::new(AtomicU64::new(0));
     let shared_wake_sender = UiWakeSender {
@@ -252,10 +252,47 @@ pub(crate) fn start_input_reader(input_fds: Vec<OwnedFd>) -> InputReader {
         .name(String::from("uiserver-input-reader"))
         .spawn(move || {
             boot_line("uiserver: input reader worker enter");
+            require_background_thread_class();
             let mut events = [InputEvent::default(); INPUT_EVENT_BATCH];
+            let mut readiness = [libc::epoll_event { events: 0, u64: 0 }; 8];
             let mut first_read = true;
-            let mut next_probe_deadline = Instant::now();
             loop {
+                reader_stats
+                    .wait_started_ms
+                    .store(reader_stats.elapsed_ms(), Ordering::Release);
+                reader_stats.wait_active.store(true, Ordering::Release);
+                reader_stats.wait_attempts.fetch_add(1, Ordering::Relaxed);
+                let ready = loop {
+                    let ready = unsafe {
+                        libc::epoll_wait(
+                            input_wait_epoll.as_raw_fd(),
+                            readiness.as_mut_ptr(),
+                            readiness.len() as i32,
+                            -1,
+                        )
+                    };
+                    if ready >= 0 {
+                        break ready as usize;
+                    }
+                    let errno = std::io::Error::last_os_error()
+                        .raw_os_error()
+                        .unwrap_or(libc::EIO);
+                    if errno != libc::EINTR {
+                        diag_line(format!(
+                            "uiserver input watchdog panic: readiness wait failed errno={errno}"
+                        ));
+                        std::process::exit(134);
+                    }
+                };
+                reader_stats.wait_active.store(false, Ordering::Release);
+                reader_stats.completed_waits.fetch_add(1, Ordering::Relaxed);
+                if readiness[..ready]
+                    .iter()
+                    .any(|event| event.events & (libc::EPOLLERR | libc::EPOLLHUP) as u32 != 0)
+                {
+                    diag_line("uiserver input watchdog panic: input provider revoked");
+                    std::process::exit(134);
+                }
                 if first_read {
                     boot_line("uiserver: input reader first nonblocking read begin");
                 }
@@ -277,7 +314,6 @@ pub(crate) fn start_input_reader(input_fds: Vec<OwnedFd>) -> InputReader {
                     Err(errno) => {
                         reader_stats.errors.fetch_add(1, Ordering::Relaxed);
                         diag_line(format!("uiserver: input reader failed errno={errno}"));
-                        wait_for_next_input_probe(&reader_stats, &mut next_probe_deadline);
                         continue;
                     }
                 };
@@ -291,7 +327,6 @@ pub(crate) fn start_input_reader(input_fds: Vec<OwnedFd>) -> InputReader {
                     ));
                 }
                 if read_count == 0 {
-                    wait_for_next_input_probe(&reader_stats, &mut next_probe_deadline);
                     continue;
                 }
                 reader_stats
@@ -343,38 +378,27 @@ pub(crate) fn start_input_reader(input_fds: Vec<OwnedFd>) -> InputReader {
         .spawn(move || {
             require_background_thread_class();
             loop {
-            thread::sleep(INPUT_READER_WATCHDOG_INTERVAL);
-            let snapshot = watchdog_stats.snapshot();
-            if snapshot.wait_active && snapshot.wait_elapsed_ms >= INPUT_READER_PANIC_THRESHOLD_MS {
-                diag_line(format!(
-                    "uiserver input watchdog panic: bounded probe sleep stalled elapsed_ms={} wait_attempts={} completed_waits={} read_attempts={} completed_reads={} raw_events={} delivered_events={} queue_drops={} slow_reads={} errors={}",
-                    snapshot.wait_elapsed_ms,
-                    snapshot.wait_attempts,
-                    snapshot.completed_waits,
-                    snapshot.read_attempts,
-                    snapshot.completed_reads,
-                    snapshot.raw_events,
-                    snapshot.delivered_events,
-                    snapshot.queue_drops,
-                    snapshot.slow_reads,
-                    snapshot.errors,
-                ));
-                std::process::exit(134);
-            }
-            if snapshot.read_active && snapshot.read_elapsed_ms >= INPUT_READER_PANIC_THRESHOLD_MS {
-                diag_line(format!(
-                    "uiserver input watchdog panic: read_input blocked elapsed_ms={} read_attempts={} completed_reads={} raw_events={} delivered_events={} queue_drops={} slow_reads={} errors={}",
-                    snapshot.read_elapsed_ms,
-                    snapshot.read_attempts,
-                    snapshot.completed_reads,
-                    snapshot.raw_events,
-                    snapshot.delivered_events,
-                    snapshot.queue_drops,
-                    snapshot.slow_reads,
-                    snapshot.errors,
-                ));
-                std::process::exit(134);
-            }
+                thread::sleep(INPUT_READER_WATCHDOG_INTERVAL);
+                let snapshot = watchdog_stats.snapshot();
+                // An input reader blocked in epoll_wait is healthy: provider
+                // readiness and revoke own its wakeup. Only a post-readiness
+                // read may consume this watchdog's bounded progress budget.
+                if snapshot.read_active
+                    && snapshot.read_elapsed_ms >= INPUT_READER_PANIC_THRESHOLD_MS
+                {
+                    diag_line(format!(
+                        "uiserver input watchdog panic: read_input blocked elapsed_ms={} read_attempts={} completed_reads={} raw_events={} delivered_events={} queue_drops={} slow_reads={} errors={}",
+                        snapshot.read_elapsed_ms,
+                        snapshot.read_attempts,
+                        snapshot.completed_reads,
+                        snapshot.raw_events,
+                        snapshot.delivered_events,
+                        snapshot.queue_drops,
+                        snapshot.slow_reads,
+                        snapshot.errors,
+                    ));
+                    std::process::exit(134);
+                }
             }
         })
         .unwrap_or_else(|_| {
@@ -382,13 +406,13 @@ pub(crate) fn start_input_reader(input_fds: Vec<OwnedFd>) -> InputReader {
             std::process::exit(134);
         });
 
-    InputReader {
+    Ok(InputReader {
         receiver,
         wake_sender: shared_wake_sender,
         wake_generation,
         observed_wake_generation: AtomicU64::new(0),
         stats,
-    }
+    })
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -669,13 +693,14 @@ pub(crate) fn sleep_until_input_or(
 #[cfg(test)]
 mod tests {
     use super::{
-        next_input_probe_deadline, InputReader, InputReaderBatchCoalescer, InputReaderStats,
-        UiWakeSender, INPUT_EVENT_BATCH, INPUT_READER_PROBE_INTERVAL,
+        create_input_wait_epoll, InputReader, InputReaderBatchCoalescer, InputReaderStats,
+        UiWakeSender, INPUT_EVENT_BATCH,
     };
     use crate::sys::{
         InputEvent, INPUT_ACTION_NONE, INPUT_ACTION_PRESSED, INPUT_KIND_KEYBOARD,
         INPUT_KIND_POINTER_MOTION, INPUT_KIND_POINTER_POSITION,
     };
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{mpsc, Arc};
     use std::thread;
@@ -788,24 +813,36 @@ mod tests {
     }
 
     #[test]
-    fn input_reader_probe_deadline_does_not_accumulate_missed_slots() {
-        let base = std::time::Instant::now();
-        let missed = base + INPUT_READER_PROBE_INTERVAL * 4;
-
+    fn input_reader_uses_blocking_epoll_readiness_not_probe_cadence() {
+        let mut pipe_fds = [-1_i32; 2];
         assert_eq!(
-            next_input_probe_deadline(base, missed),
-            missed + INPUT_READER_PROBE_INTERVAL
+            unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) },
+            0
         );
-    }
+        let read_fd = unsafe { OwnedFd::from_raw_fd(pipe_fds[0]) };
+        let write_fd = unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) };
+        let input_fds = [read_fd];
+        let epoll = create_input_wait_epoll(&input_fds).expect("epoll input wait");
 
-    #[test]
-    fn input_reader_probe_deadline_preserves_the_next_future_slot() {
-        let base = std::time::Instant::now();
-        let now = base + INPUT_READER_PROBE_INTERVAL / 2;
-
+        let byte = [1_u8];
         assert_eq!(
-            next_input_probe_deadline(base, now),
-            base + INPUT_READER_PROBE_INTERVAL
+            unsafe {
+                libc::write(
+                    write_fd.as_raw_fd(),
+                    byte.as_ptr().cast::<libc::c_void>(),
+                    byte.len(),
+                )
+            },
+            1
         );
+        let mut event = libc::epoll_event { events: 0, u64: 0 };
+        assert_eq!(
+            unsafe { libc::epoll_wait(epoll.as_raw_fd(), &mut event, 1, 0) },
+            1
+        );
+        let event_data = event.u64;
+        let event_mask = event.events;
+        assert_eq!(event_data, 1);
+        assert_ne!(event_mask & libc::EPOLLIN as u32, 0);
     }
 }

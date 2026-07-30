@@ -8,6 +8,9 @@ const KEYBOARD_INTERRUPT_VECTOR: u8 = crate::arch::pic::PIC_1_OFFSET + 1;
 const MOUSE_INTERRUPT_VECTOR: u8 = crate::arch::pic::PIC_2_OFFSET + 4;
 const RTC_INTERRUPT_VECTOR: u8 = crate::arch::pic::PIC_2_OFFSET;
 pub(crate) const SOFTWARE_SCHEDULE_VECTOR: u8 = 0x30;
+pub(crate) const RESCHEDULE_IPI_VECTOR: u8 = 0xe0;
+pub(crate) const TLB_SHOOTDOWN_IPI_VECTOR: u8 = 0xe1;
+pub(crate) const LOCAL_TIMER_VECTOR: u8 = 0xe2;
 
 lazy_static! {
     pub static ref IDT: InterruptDescriptorTable = {
@@ -40,9 +43,16 @@ lazy_static! {
             idt[SOFTWARE_SCHEDULE_VECTOR].set_handler_addr(VirtAddr::new(
                 crate::lowlevel::interrupts::software_schedule_interrupt_handler_addr(),
             ));
+            idt[RESCHEDULE_IPI_VECTOR].set_handler_addr(VirtAddr::new(
+                crate::lowlevel::interrupts::reschedule_ipi_interrupt_handler_addr(),
+            ));
+            idt[LOCAL_TIMER_VECTOR].set_handler_addr(VirtAddr::new(
+                crate::lowlevel::interrupts::timer_interrupt_handler_addr(),
+            ));
         }
         idt[KEYBOARD_INTERRUPT_VECTOR].set_handler_fn(keyboard_interrupt_eoi_handler);
         idt[MOUSE_INTERRUPT_VECTOR].set_handler_fn(mouse_interrupt_eoi_handler);
+        idt[TLB_SHOOTDOWN_IPI_VECTOR].set_handler_fn(tlb_shootdown_interrupt_handler);
 
         idt
     };

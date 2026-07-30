@@ -9,10 +9,13 @@ if [[ $# -eq 3 && "$1" == --profile ]]; then
 elif [[ $# -eq 1 ]]; then
     model="$1"
 else
-    echo "usage: bash formal/run-tlc.sh [--profile pr|nightly] <model/path-without-extension>" >&2
+    echo "usage: bash formal/run-tlc.sh [--profile pr|smp-iteration|nightly] <model/path-without-extension>" >&2
     exit 2
 fi
-[[ "$profile" == pr || "$profile" == nightly ]] || { echo "invalid TLC profile: $profile" >&2; exit 2; }
+[[ "$profile" == pr || "$profile" == smp-iteration || "$profile" == nightly ]] || {
+    echo "invalid TLC profile: $profile" >&2
+    exit 2
+}
 
 repo_root="$(git rev-parse --show-toplevel)"
 formal_dir="$repo_root/formal"
@@ -54,8 +57,11 @@ if [[ ! -f "$jar" ]] || ! verify_jar "$jar"; then
     mv "$tmp_jar" "$jar"
 fi
 
-if [[ "$profile" == pr ]]; then
+if [[ "$profile" == pr || "$profile" == smp-iteration ]]; then
     timeout_seconds="$pr_timeout"
+    if [[ "$profile" == smp-iteration && "$timeout_seconds" -gt 30 ]]; then
+        timeout_seconds=30
+    fi
     workers="${TLC_WORKERS:-auto}"
     fingerprint="${TLC_FP:-0}"
     seed="${TLC_SEED:-1}"

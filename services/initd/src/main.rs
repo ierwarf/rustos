@@ -1,3 +1,22 @@
+//! Post-root bootstrap, service dependency, and exact child-lease supervisor.
+//!
+//! - **Owner:** `initd` owns the signed startup graph and post-init children;
+//!   rootd remains the authority for exact service leases.
+//! - **Boundary:** Registry entries, loader replies, rootd lease state, child
+//!   exits, and service endpoint publications are untrusted inputs.
+//! - **Lifecycle:** Publish init identity, reconcile leases, create children
+//!   suspended, activate exact PIDs, admit endpoint ownership, and supervise
+//!   restart or terminal cleanup.
+//! - **Concurrency:** The supervisor loop serializes graph mutation; only
+//!   independent child initialization overlaps before an explicit barrier.
+//! - **Failure:** Malformed state, foreign ownership, timeout, or uncertain
+//!   cleanup terminates initd after bounded exact-child cleanup.
+//! - **Forbidden:** No activation-as-readiness, fabricated dependency,
+//!   unbounded wait, foreign PID adoption, or policy fallback in ring0.
+//! - **Evidence:** `service-bootstrap-lifecycle`,
+//!   `post-init-bootstrap-barrier`, `atomic-process-activation-batch`, and
+//!   `post-init-supervisor-recovery`.
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
 use std::io::Write;
@@ -19,13 +38,23 @@ use rustos_user_abi::syscall::{
     IPC_SERVICE_DEVMGRD, IPC_SERVICE_INITD, IPC_SERVICE_INPUTD, IPC_SERVICE_LINUX_SYSCALLD,
     IPC_SERVICE_LOADERD, IPC_SERVICE_NETD, IPC_SERVICE_ROOTD, IPC_SERVICE_SESSIOND,
     IPC_SERVICE_STORAGED, IPC_SERVICE_VFSD, IPC_WAIT_SERVICE_ENDPOINT_ABI_VERSION,
-    IPC_WAIT_SERVICE_ENDPOINT_MAX_TIMEOUT_MS, LOADER_OP_ACTIVATE, LOADER_OP_SPAWN_EXEC,
-    LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES, LOADER_SPAWN_ENV_BYTES,
-    LOADER_SPAWN_EXEC_PATH_CAPACITY, LOADER_SPAWN_FLAG_DEFER_START, ROOTD_LEASE_STATE_EMPTY,
-    ROOTD_LEASE_STATE_EXITED, ROOTD_LEASE_STATE_RUNNING, SYS_RUSTOS_IPC_CALL_BOUNDED,
-    SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
-    SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_WAIT_SERVICE_ENDPOINT,
+    IPC_WAIT_SERVICE_ENDPOINT_MAX_TIMEOUT_MS, LOADER_ACTIVATE_BATCH_MAX_TARGETS,
+    LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES,
+    LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_EXEC_PATH_CAPACITY, LOADER_SPAWN_FLAG_DEFER_START,
+    PRODUCT_MILESTONE_INIT_IDENTITY_READY, ROOTD_LEASE_STATE_EMPTY, ROOTD_LEASE_STATE_EXITED,
+    ROOTD_LEASE_STATE_RUNNING, SYS_RUSTOS_IPC_CALL_BOUNDED, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
+    SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT,
+    SYS_RUSTOS_IPC_WAIT_SERVICE_ENDPOINT, SYS_RUSTOS_PRODUCT_MILESTONE,
     TASK_WEIGHT_INTERACTIVE_FLAG,
+};
+
+mod activation;
+mod bootstrap_barrier;
+
+use activation::activate_pending_services;
+use bootstrap_barrier::{
+    bootstrap_endpoint_admissions_complete, consumer_requires_bootstrap_barrier,
+    endpoint_admission_may_overlap, RUNTIMED_BOOTSTRAP_SERVICES,
 };
 
 const INITD_EXEC_PATH: &str = "services/initd/initd.elf";
@@ -52,8 +81,6 @@ const DISPLAY_CRITICAL_TASK_WEIGHT_MICROS: u64 = 2_000;
 // proves storage-policy liveness, not a prerequisite for this UI core.  Keep
 // mutable applications and DVM-volume assets behind storaged readiness, but
 // do not make the first visible desktop wait for an unrelated block FLUSH.
-const RUNTIMED_BOOTSTRAP_SERVICES: [u64; 3] =
-    [IPC_SERVICE_NETD, IPC_SERVICE_DEVMGRD, IPC_SERVICE_INPUTD];
 // Keep secondary services on the boot path. Guest Instant can be unavailable
 // during early bring-up, so time-based deferral can leave storaged deferred
 // indefinitely under KVM.
@@ -73,6 +100,9 @@ struct RunningService {
     package_id: String,
     exec: String,
     restart: bool,
+    /// Exact `(service_id, pid)` endpoint ownership has been observed after
+    /// activation. A running child is not dependency authority until true.
+    endpoint_ready: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -94,6 +124,18 @@ fn main() {
         std::process::exit(1);
     }
     boot_line("initd: identity endpoint registered");
+    // Debugcon bytes from multiple CPUs may interleave. The kernel-stamped
+    // milestone is the durable acceptance witness for this authority boundary.
+    // SAFETY: the milestone ABI accepts only three scalar values and returns
+    // no borrowed memory or authority; the fixed identity is already live.
+    let _ = unsafe {
+        libc::syscall(
+            SYS_RUSTOS_PRODUCT_MILESTONE as libc::c_long,
+            PRODUCT_MILESTONE_INIT_IDENTITY_READY,
+            0_u64,
+            0_u64,
+        )
+    };
     let load_started = Instant::now();
     boot_line("initd: load entries begin");
     let startup_entries = load_init_entries();
@@ -147,21 +189,45 @@ fn main() {
             next_rootd_lease_reconciliation = now + ROOTD_LEASE_RECONCILIATION_INTERVAL;
         }
 
-        let mut running_packages = running
+        let mut spawned_packages = running
             .values()
+            .map(|service| service.package_id.clone())
+            .collect::<BTreeSet<_>>();
+        let mut ready_packages = running
+            .values()
+            .filter(|service| service.endpoint_ready)
             .map(|service| service.package_id.clone())
             .collect::<BTreeSet<_>>();
         let now = Instant::now();
         let mut launched_this_round = false;
+        let mut pending_activations = Vec::<i32>::with_capacity(LOADER_ACTIVATE_BATCH_MAX_TARGETS);
         for entry in startup_entries.iter() {
             if !runtime_deps_satisfied(
                 &entry.runtime_deps,
-                &running_packages,
+                &ready_packages,
                 &launched_once_packages,
             ) {
                 continue;
             }
-            if !launch_gate_satisfied(entry.exec.as_str()) {
+            if consumer_requires_bootstrap_barrier(entry.exec.as_str()) {
+                if !bootstrap_endpoint_admissions_complete(&running)
+                    && !pending_activations.is_empty()
+                {
+                    activate_pending_services(
+                        &mut pending_activations,
+                        &mut running,
+                        &mut ready_packages,
+                        &mut launched_once_packages,
+                        &mut defer_secondary_services_until,
+                    );
+                }
+                settle_bootstrap_endpoint_barrier(
+                    &mut running,
+                    &mut ready_packages,
+                    &mut launched_once_packages,
+                );
+            }
+            if !launch_gate_satisfied(entry.exec.as_str(), &running) {
                 continue;
             }
             if secondary_service_deferred(entry.exec.as_str(), now, defer_secondary_services_until)
@@ -186,15 +252,24 @@ fn main() {
             }
 
             if entry.restart {
-                if running_packages.contains(&entry.package_id) {
+                if spawned_packages.contains(&entry.package_id) {
                     continue;
                 }
-            } else if running_packages.contains(&entry.package_id)
+            } else if spawned_packages.contains(&entry.package_id)
                 || launched_once_packages.contains(entry.package_id.as_str())
             {
                 continue;
             }
 
+            if pending_activations.len() == LOADER_ACTIVATE_BATCH_MAX_TARGETS {
+                activate_pending_services(
+                    &mut pending_activations,
+                    &mut running,
+                    &mut ready_packages,
+                    &mut launched_once_packages,
+                    &mut defer_secondary_services_until,
+                );
+            }
             match spawn_exec(entry.exec.as_str(), &init_env) {
                 Ok(pid) => {
                     running.insert(
@@ -203,13 +278,15 @@ fn main() {
                             package_id: entry.package_id.clone(),
                             exec: entry.exec.clone(),
                             restart: entry.restart,
+                            endpoint_ready: false,
                         },
                     );
-                    running_packages.insert(entry.package_id.clone());
+                    spawned_packages.insert(entry.package_id.clone());
                     retry_state.remove(entry.exec.as_str());
+                    pending_activations.push(pid);
                     if let Err(err) = report_rootd_service_lease(entry.exec.as_str(), pid) {
-                        fail_closed_after_child_cleanup(
-                            pid,
+                        fail_closed_after_children_cleanup(
+                            &pending_activations,
                             &format!(
                             "initd: fatal rootd lease report failed exec={} pid={pid} errno={err}",
                             entry.exec
@@ -220,39 +297,7 @@ fn main() {
                         "initd: rootd lease report ok exec={} pid={pid}",
                         entry.exec
                     ));
-                    if let Err(err) = activate_spawned_service(pid) {
-                        fail_closed_after_child_cleanup(
-                            pid,
-                            &format!(
-                            "initd: fatal service activation failed exec={} pid={pid} errno={err}",
-                            entry.exec
-                        ),
-                        );
-                    }
-                    if let Err(err) = wait_reported_service_endpoint(entry.exec.as_str(), pid) {
-                        fail_closed_after_child_cleanup(
-                            pid,
-                            &format!(
-                            "initd: fatal service endpoint not ready exec={} pid={pid} errno={err}",
-                            entry.exec
-                        ),
-                        );
-                    }
-                    boot_line(&format!(
-                        "initd: service endpoint ready exec={} pid={pid}",
-                        entry.exec
-                    ));
-                    if !entry.restart {
-                        launched_once_packages.insert(entry.package_id.clone());
-                    }
-                    if entry.exec == RUNTIMED_EXEC_PATH
-                        && !SECONDARY_SERVICE_DEFER_AFTER_RUNTIMED.is_zero()
-                    {
-                        defer_secondary_services_until =
-                            Some(Instant::now() + SECONDARY_SERVICE_DEFER_AFTER_RUNTIMED);
-                    }
                     launched_this_round = true;
-                    thread::yield_now();
                     continue;
                 }
                 Err(err) => {
@@ -267,6 +312,13 @@ fn main() {
             }
         }
 
+        activate_pending_services(
+            &mut pending_activations,
+            &mut running,
+            &mut ready_packages,
+            &mut launched_once_packages,
+            &mut defer_secondary_services_until,
+        );
         if launched_this_round {
             thread::yield_now();
             continue;
@@ -281,6 +333,8 @@ fn main() {
 /// identity object. Privileged brokers validate its kernel-owned publication;
 /// no caller is granted a request path to this endpoint.
 fn publish_init_identity() -> Result<u64, i32> {
+    // SAFETY: The endpoint-create syscall takes no user pointers; its signed
+    // return is validated before it becomes publication authority.
     let endpoint = unsafe { libc::syscall(SYS_RUSTOS_IPC_ENDPOINT_CREATE as libc::c_long) as i64 };
     if endpoint <= 0 {
         return Err(if endpoint < 0 {
@@ -289,6 +343,8 @@ fn publish_init_identity() -> Result<u64, i32> {
             libc::EIO
         });
     }
+    // SAFETY: Both arguments are validated scalar ABI values and `endpoint`
+    // names the live object returned above.
     let registered = unsafe {
         libc::syscall(
             SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT as libc::c_long,
@@ -403,27 +459,77 @@ fn init_exec_priority(exec: &str) -> u8 {
     }
 }
 
-fn launch_gate_satisfied(exec: &str) -> bool {
+fn settle_bootstrap_endpoint_barrier(
+    running: &mut BTreeMap<i32, RunningService>,
+    ready_packages: &mut BTreeSet<String>,
+    launched_once_packages: &mut BTreeSet<String>,
+) {
+    let pending = running
+        .iter()
+        .filter(|(_, service)| {
+            endpoint_admission_may_overlap(service.exec.as_str()) && !service.endpoint_ready
+        })
+        .map(|(pid, _)| *pid)
+        .collect::<Vec<_>>();
+    for pid in pending {
+        admit_running_service_endpoint(running, ready_packages, launched_once_packages, pid);
+    }
+}
+
+fn admit_running_service_endpoint(
+    running: &mut BTreeMap<i32, RunningService>,
+    ready_packages: &mut BTreeSet<String>,
+    launched_once_packages: &mut BTreeSet<String>,
+    pid: i32,
+) {
+    let (exec, package_id, restart) = running
+        .get(&pid)
+        .map(|service| {
+            (
+                service.exec.clone(),
+                service.package_id.clone(),
+                service.restart,
+            )
+        })
+        .unwrap_or_else(|| fail_closed(&format!("initd: endpoint barrier lost pid={pid}")));
+    if let Err(err) = wait_reported_service_endpoint(exec.as_str(), pid) {
+        fail_closed_after_child_cleanup(
+            pid,
+            &format!("initd: fatal service endpoint not ready exec={exec} pid={pid} errno={err}"),
+        );
+    }
+    let service = running
+        .get_mut(&pid)
+        .unwrap_or_else(|| fail_closed(&format!("initd: endpoint admission lost pid={pid}")));
+    service.endpoint_ready = true;
+    ready_packages.insert(package_id.clone());
+    if !restart {
+        launched_once_packages.insert(package_id);
+    }
+    boot_line(&format!(
+        "initd: service endpoint ready exec={exec} pid={pid}"
+    ));
+}
+
+fn launch_gate_satisfied(exec: &str, running: &BTreeMap<i32, RunningService>) -> bool {
     match exec {
         SYSCALLD_EXEC_PATH | VFSD_EXEC_PATH => true,
         LOADERD_EXEC_PATH => {
             service_ready(IPC_SERVICE_LINUX_SYSCALLD) && service_ready(IPC_SERVICE_VFSD)
         }
         RUNTIMED_EXEC_PATH => {
-            foundation_policy_services_ready() && runtimed_bootstrap_services_ready()
+            foundation_policy_services_ready() && runtimed_bootstrap_services_ready(running)
         }
         STORAGED_EXEC_PATH => {
-            foundation_policy_services_ready()
-                && service_ready(IPC_SERVICE_NETD)
-                && service_ready(rustos_user_abi::syscall::IPC_SERVICE_DEVMGRD)
-                && service_ready(rustos_user_abi::syscall::IPC_SERVICE_INPUTD)
+            foundation_policy_services_ready() && runtimed_bootstrap_services_ready(running)
         }
         _ => foundation_policy_services_ready(),
     }
 }
 
-fn runtimed_bootstrap_services_ready() -> bool {
-    RUNTIMED_BOOTSTRAP_SERVICES.into_iter().all(service_ready)
+fn runtimed_bootstrap_services_ready(running: &BTreeMap<i32, RunningService>) -> bool {
+    bootstrap_endpoint_admissions_complete(running)
+        && RUNTIMED_BOOTSTRAP_SERVICES.into_iter().all(service_ready)
 }
 
 fn foundation_policy_services_ready() -> bool {
@@ -437,6 +543,8 @@ fn foundation_policy_services_ready() -> bool {
 }
 
 fn service_ready_status(service_id: u64) -> i64 {
+    // SAFETY: The lookup ABI accepts one scalar service identity and returns
+    // a signed endpoint/status value without dereferencing user memory.
     unsafe {
         libc::syscall(
             SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT as libc::c_long,
@@ -571,6 +679,7 @@ fn reconcile_rootd_post_init_leases(
                                 package_id: entry.package_id.clone(),
                                 exec: entry.exec.clone(),
                                 restart: entry.restart,
+                                endpoint_ready: true,
                             },
                         );
                         if !entry.restart {
@@ -636,16 +745,11 @@ fn wait_reported_service_endpoint_with_timeout(
     pid: i32,
     timeout_ms: u64,
 ) -> Result<(), i32> {
-    let Some(service_id) = rootd_service_id_for_exec(exec_path) else {
+    let Some(args) = endpoint_wait_args(exec_path, pid, timeout_ms)? else {
         return Ok(());
     };
-    let args = RustosIpcWaitServiceEndpointArgs {
-        abi_version: IPC_WAIT_SERVICE_ENDPOINT_ABI_VERSION,
-        service_id,
-        expected_pid: u64::try_from(pid).map_err(|_| libc::EINVAL)?,
-        timeout_ms,
-        ..RustosIpcWaitServiceEndpointArgs::default()
-    };
+    // SAFETY: `args` is a fully initialized ABI record that remains live for
+    // the bounded syscall, which only reads this exact-sized record.
     let status = unsafe {
         libc::syscall(
             SYS_RUSTOS_IPC_WAIT_SERVICE_ENDPOINT as libc::c_long,
@@ -656,9 +760,30 @@ fn wait_reported_service_endpoint_with_timeout(
         return Err((-status) as i32);
     }
     boot_line(&format!(
-        "initd: endpoint ready event exec={exec_path} service_id={service_id} pid={pid}"
+        "initd: endpoint ready event exec={exec_path} service_id={} pid={pid}",
+        args.service_id
     ));
     Ok(())
+}
+
+fn endpoint_wait_args(
+    exec_path: &str,
+    pid: i32,
+    timeout_ms: u64,
+) -> Result<Option<RustosIpcWaitServiceEndpointArgs>, i32> {
+    let Some(service_id) = rootd_service_id_for_exec(exec_path) else {
+        return Ok(None);
+    };
+    if timeout_ms > IPC_WAIT_SERVICE_ENDPOINT_MAX_TIMEOUT_MS {
+        return Err(libc::EINVAL);
+    }
+    Ok(Some(RustosIpcWaitServiceEndpointArgs {
+        abi_version: IPC_WAIT_SERVICE_ENDPOINT_ABI_VERSION,
+        service_id,
+        expected_pid: u64::try_from(pid).map_err(|_| libc::EINVAL)?,
+        timeout_ms,
+        ..RustosIpcWaitServiceEndpointArgs::default()
+    }))
 }
 
 fn rootd_post_init_lease_query(service_id: u64) -> Result<(u64, u16), i32> {
@@ -696,6 +821,8 @@ fn call_rootd_supervisor(
     request.arg0 = arg0;
     request.arg1 = arg1;
     let mut response = CommercialMaxProtocolResponse::default();
+    // SAFETY: Request and response are initialized, exact-sized ABI records
+    // and remain exclusively live for the duration of the bounded call.
     let call = unsafe {
         libc::syscall(
             SYS_RUSTOS_IPC_CALL_BOUNDED as libc::c_long,
@@ -734,6 +861,17 @@ fn rootd_service_id_for_exec(exec_path: &str) -> Option<u64> {
     }
 }
 
+fn rootd_exec_for_service_id(service_id: u64) -> Option<&'static str> {
+    match service_id {
+        IPC_SERVICE_NETD => Some(NETD_EXEC_PATH),
+        IPC_SERVICE_DEVMGRD => Some(DEVMGRD_EXEC_PATH),
+        IPC_SERVICE_INPUTD => Some(INPUTD_EXEC_PATH),
+        IPC_SERVICE_STORAGED => Some(STORAGED_EXEC_PATH),
+        IPC_SERVICE_SESSIOND => Some(RUNTIMED_EXEC_PATH),
+        _ => None,
+    }
+}
+
 fn report_rootd_service_lease_inner(service_id: u64, exec_path: &str, pid: u64) -> Result<(), i32> {
     let endpoint = lookup_service_endpoint(IPC_SERVICE_ROOTD)?;
     let mut request = CommercialMaxProtocolRequest::default();
@@ -751,6 +889,8 @@ fn report_rootd_service_lease_inner(service_id: u64, exec_path: &str, pid: u64) 
     request.path_len = path.len() as u32;
     request.path[..path.len()].copy_from_slice(path);
     let mut response = CommercialMaxProtocolResponse::default();
+    // SAFETY: Request and response are initialized, exact-sized ABI records
+    // and remain exclusively live for the duration of the bounded call.
     let call = unsafe {
         libc::syscall(
             SYS_RUSTOS_IPC_CALL_BOUNDED as libc::c_long,
@@ -781,6 +921,8 @@ fn report_rootd_service_lease_inner(service_id: u64, exec_path: &str, pid: u64) 
 }
 
 fn lookup_service_endpoint(service_id: u64) -> Result<u64, i32> {
+    // SAFETY: The lookup ABI takes one scalar service identity and returns a
+    // signed value that is checked before conversion to an endpoint handle.
     let endpoint = unsafe {
         libc::syscall(
             SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT as libc::c_long,
@@ -797,6 +939,7 @@ fn lookup_service_endpoint(service_id: u64) -> Result<u64, i32> {
 }
 
 fn current_tid() -> u64 {
+    // SAFETY: gettid takes no pointers and returns the calling thread identity.
     unsafe { libc::syscall(libc::SYS_gettid as libc::c_long) as u64 }
 }
 
@@ -815,6 +958,8 @@ fn reap_children(
 ) {
     loop {
         let mut status = 0_i32;
+        // SAFETY: `status` is writable for the syscall duration, WNOHANG makes
+        // the operation bounded, and the optional rusage pointer is null.
         let pid = unsafe {
             libc::syscall(
                 libc::SYS_wait4 as libc::c_long,
@@ -900,6 +1045,8 @@ fn cleanup_spawned_service(
 }
 
 fn terminate_spawned_service(pid: i32) -> Result<(), i32> {
+    // SAFETY: tgkill receives only the exact positive process/thread identity
+    // already checked by `cleanup_spawned_service` and a fixed signal.
     let status =
         unsafe { libc::syscall(libc::SYS_tgkill as libc::c_long, pid, pid, libc::SIGKILL) as i32 };
     if status < 0 {
@@ -909,9 +1056,21 @@ fn terminate_spawned_service(pid: i32) -> Result<(), i32> {
 }
 
 fn fail_closed_after_child_cleanup(pid: i32, message: &str) -> ! {
-    if let Err(errno) = cleanup_spawned_service(pid, terminate_spawned_service) {
+    fail_closed_after_children_cleanup(&[pid], message)
+}
+
+fn fail_closed_after_children_cleanup(pids: &[i32], message: &str) -> ! {
+    let mut first_cleanup_error = None;
+    for pid in pids.iter().copied() {
+        if let Err(errno) = cleanup_spawned_service(pid, terminate_spawned_service) {
+            if first_cleanup_error.is_none() {
+                first_cleanup_error = Some((pid, errno));
+            }
+        }
+    }
+    if let Some((pid, errno)) = first_cleanup_error {
         fail_closed(&format!(
-            "{message}; exact child cleanup rejected cleanup_errno={errno}"
+            "{message}; exact child cleanup rejected pid={pid} cleanup_errno={errno}"
         ));
     }
     fail_closed(message)
@@ -934,6 +1093,8 @@ fn spawn_exec_via_loaderd(exec_path: &str, env: &[CString]) -> Result<i32, i32> 
     boot_line(&format!(
         "initd: loader call begin exec={exec_path} endpoint={endpoint}"
     ));
+    // SAFETY: Request and response are initialized, exact-sized ABI records
+    // and remain exclusively live for the duration of the bounded call.
     let call = unsafe {
         libc::syscall(
             SYS_RUSTOS_IPC_CALL_BOUNDED as libc::c_long,
@@ -963,45 +1124,6 @@ fn spawn_exec_via_loaderd(exec_path: &str, env: &[CString]) -> Result<i32, i32> 
         "initd: loader spawn returned exec={exec_path} pid={pid}"
     ));
     Ok(pid)
-}
-
-fn activate_spawned_service(pid: i32) -> Result<(), i32> {
-    let request = LoaderSpawnRequest {
-        version: LOADER_REQUEST_ABI_VERSION,
-        op: LOADER_OP_ACTIVATE,
-        target_pid: u64::try_from(pid).map_err(|_| libc::EINVAL)?,
-        requester_pid: u64::from(std::process::id()),
-        ..LoaderSpawnRequest::default()
-    };
-    let endpoint = lookup_loader_endpoint()?;
-    let mut response = LoaderSpawnResponse::default();
-    let call = unsafe {
-        libc::syscall(
-            SYS_RUSTOS_IPC_CALL_BOUNDED as libc::c_long,
-            endpoint,
-            (&request as *const LoaderSpawnRequest) as u64,
-            size_of::<LoaderSpawnRequest>() as u64,
-            (&mut response as *mut LoaderSpawnResponse) as u64,
-            size_of::<LoaderSpawnResponse>() as u64,
-            IPC_BOOT_CONTROL_HARD_LIMIT_MS,
-        ) as i64
-    };
-    if call < 0 {
-        LOADER_ENDPOINT_CACHE.store(0, Ordering::Relaxed);
-        return Err((-call) as i32);
-    }
-    if call as usize != size_of::<LoaderSpawnResponse>()
-        || response.version != LOADER_REQUEST_ABI_VERSION
-        || response.op != LOADER_OP_ACTIVATE
-        || response.pid != i64::from(pid)
-    {
-        return Err(libc::EINVAL);
-    }
-    if response.status != 0 {
-        return Err(response.status);
-    }
-    boot_line(&format!("initd: service activated pid={pid}"));
-    Ok(())
 }
 
 fn build_loader_spawn_request(
@@ -1058,6 +1180,8 @@ fn lookup_loader_endpoint() -> Result<u64, i32> {
     if cached != 0 {
         return Ok(cached);
     }
+    // SAFETY: The lookup ABI takes one fixed scalar service identity; the
+    // signed result is validated before entering the process-local cache.
     let endpoint = unsafe {
         libc::syscall(
             SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT as libc::c_long,
@@ -1095,6 +1219,8 @@ fn boot_line(message: &str) {
         let _ = std::io::stderr().write_all(b"\n");
         return;
     }
+    // SAFETY: The diagnostic syscall copies the byte slice synchronously;
+    // `line` remains live and immutable for the syscall duration.
     unsafe {
         let mut line = message.as_bytes().to_vec();
         line.push(b'\n');
@@ -1105,9 +1231,9 @@ fn boot_line(message: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_service_ready_status, cleanup_spawned_service, exec_weight_micros,
-        init_exec_priority, RUNTIMED_BOOTSTRAP_SERVICES, RUNTIMED_EXEC_PATH, STORAGED_EXEC_PATH,
-        TASK_WEIGHT_INTERACTIVE_FLAG,
+        classify_service_ready_status, cleanup_spawned_service, endpoint_wait_args,
+        exec_weight_micros, init_exec_priority, RUNTIMED_BOOTSTRAP_SERVICES, RUNTIMED_EXEC_PATH,
+        STORAGED_EXEC_PATH, TASK_WEIGHT_INTERACTIVE_FLAG,
     };
     use rustos_user_abi::syscall::IPC_SERVICE_STORAGED;
 
@@ -1145,6 +1271,23 @@ mod tests {
             init_exec_priority(RUNTIMED_EXEC_PATH) < init_exec_priority(STORAGED_EXEC_PATH),
             "the immutable UI bootstrap must be scheduled before DVM-backed storage"
         );
+    }
+
+    #[test]
+    fn endpoint_barrier_wait_is_exact_pid_bound_and_bounded() {
+        let args = endpoint_wait_args(super::NETD_EXEC_PATH, 73, 17)
+            .expect("valid wait")
+            .expect("service wait");
+        assert_eq!(args.expected_pid, 73);
+        assert_eq!(args.timeout_ms, 17);
+        assert_eq!(args.service_id, rustos_user_abi::syscall::IPC_SERVICE_NETD);
+        assert!(endpoint_wait_args(super::NETD_EXEC_PATH, -1, 17).is_err());
+        assert!(endpoint_wait_args(
+            super::NETD_EXEC_PATH,
+            73,
+            rustos_user_abi::syscall::IPC_WAIT_SERVICE_ENDPOINT_MAX_TIMEOUT_MS + 1,
+        )
+        .is_err());
     }
 
     #[test]

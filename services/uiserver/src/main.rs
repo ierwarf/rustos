@@ -768,7 +768,7 @@ fn run() -> Result<(), i32> {
     // without a live consumer. The bounded reader channel safely queues and
     // coalesces events until the render loop begins draining it.
     boot_line("uiserver: input reader spawn begin");
-    let input_events = input_loop::start_input_reader(std::mem::take(&mut state.input_fds));
+    let input_events = input_loop::start_input_reader(std::mem::take(&mut state.input_fds))?;
     boot_line("uiserver: input reader spawn done");
     boot_line("uiserver: run initialize done");
     sys::publish_display_policy_metadata(state.display);

@@ -1,3 +1,10 @@
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserFaultDisposition {
+    Resumed,
+    Retired,
+    Unhandled,
+}
+
 /// Exact identity of a retired user task whose subsystem-local wait records
 /// must be removed before the scheduler may recycle its slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

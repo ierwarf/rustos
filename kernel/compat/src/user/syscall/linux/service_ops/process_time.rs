@@ -424,7 +424,10 @@ fn sleep_clock_nanosleep_substrate(clock_id: u64, flags: u64, ts: LinuxTimespecW
 // procd owns clone/process admission policy. Ring0 keeps task creation plus
 // fixed futex/time ABI validation and scheduler wait/deadline substrate.
 pub fn syscall_linux_clone(frame: &SyscallFrame) -> u64 {
-    clone_linux_thread(frame, frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8)
+    record_clone_result(
+        1,
+        clone_linux_thread(frame, frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8),
+    )
 }
 
 pub fn syscall_linux_futex(
@@ -468,14 +471,30 @@ pub fn syscall_linux_clone3(frame: &SyscallFrame) -> u64 {
             None => return linux_errno(LINUX_EINVAL),
         }
     };
-    clone_linux_thread(
-        frame,
-        args.flags | (args.exit_signal & linux_abi::CSIGNAL),
-        child_stack,
-        args.parent_tid,
-        args.child_tid,
-        args.tls,
+    record_clone_result(
+        3,
+        clone_linux_thread(
+            frame,
+            args.flags | (args.exit_signal & linux_abi::CSIGNAL),
+            child_stack,
+            args.parent_tid,
+            args.child_tid,
+            args.tls,
+        ),
     )
+}
+
+fn record_clone_result(kind: u64, result: u64) -> u64 {
+    let signed = result as i64;
+    if signed < 0 {
+        nucleus_core::debug::record_milestone(
+            nucleus_core::debug::LogCategory::Compat,
+            "linux-thread-clone-rejected",
+            kind,
+            signed.unsigned_abs(),
+        );
+    }
+    result
 }
 // RING3-MIGRATION-REFERENCE END: procd-owned clone policy and scheduler substrate exception.
 

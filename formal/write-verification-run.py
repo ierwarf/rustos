@@ -57,7 +57,7 @@ def require_fresh(path: Path, marker_mtime_ns: int) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, required=True)
-    parser.add_argument("--profile", choices=("pr", "nightly"), required=True)
+    parser.add_argument("--profile", required=True)
     parser.add_argument("--not-before", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
@@ -65,17 +65,23 @@ def main() -> int:
     contracts = tomllib.loads(
         (root / "formal/contracts.toml").read_text(encoding="utf-8")
     )
+    profiles = contracts["profiles"]
+    if args.profile not in profiles:
+        raise ValueError(f"unknown formal verification profile: {args.profile}")
+    profile = profiles[args.profile]
     required = [
         root / path
-        for path in contracts["profiles"][args.profile]["required_evidence"]
+        for path in profile["required_evidence"]
         if not path.endswith("/kvm-p0-summary.json")
     ]
-    models = []
-    for line in (root / contracts["models"]).read_text(
-        encoding="utf-8"
-    ).splitlines():
-        if line and not line.startswith("#"):
-            models.append(line.split("\t", 1)[0])
+    models = profile.get("required_models")
+    if models is None:
+        models = []
+        for line in (root / contracts["models"]).read_text(
+            encoding="utf-8"
+        ).splitlines():
+            if line and not line.startswith("#"):
+                models.append(line.split("\t", 1)[0])
     required.extend(
         root
         / "build/formal/tlc"

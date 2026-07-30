@@ -168,24 +168,26 @@ fn serve(endpoint: u64) {
     start_inet_readiness_worker();
     for worker_index in 1..NETD_REQUEST_WORKERS {
         let name = format!("netd-rpc-{worker_index}");
-        if thread::Builder::new()
+        if let Err(error) = thread::Builder::new()
             .name(name)
             .spawn(move || serve_request_loop(endpoint))
-            .is_err()
         {
-            debug_line("netd: request worker unavailable");
+            debug_line(&format!(
+                "netd: request worker unavailable index={worker_index} error={error}"
+            ));
         }
     }
     serve_request_loop(endpoint);
 }
 
 fn start_inet_readiness_worker() {
-    if thread::Builder::new()
+    if let Err(error) = thread::Builder::new()
         .name("netd-inet-readiness".to_owned())
         .spawn(inet_readiness_worker_loop)
-        .is_err()
     {
-        debug_line("netd: INET readiness worker unavailable");
+        debug_line(&format!(
+            "netd: INET readiness worker unavailable error={error}"
+        ));
         std::process::exit(134);
     }
 }
@@ -403,17 +405,34 @@ fn blocking_request_queue() -> &'static BlockingRequestQueue {
 
 fn start_blocking_workers() {
     let queue = blocking_request_queue();
+    let mut last_error = None;
     for index in 0..BLOCKING_WORKER_COUNT {
-        let spawned = thread::Builder::new()
+        match thread::Builder::new()
             .name(format!("netd-wait-{index}"))
-            .spawn(blocking_worker_loop);
-        if spawned.is_ok() {
-            ACTIVE_BLOCKING_WORKERS.fetch_add(1, Ordering::AcqRel);
+            .spawn(blocking_worker_loop)
+        {
+            Ok(_) => {
+                ACTIVE_BLOCKING_WORKERS.fetch_add(1, Ordering::AcqRel);
+            }
+            Err(error) => last_error = Some(error),
         }
     }
-    if ACTIVE_BLOCKING_WORKERS.load(Ordering::Acquire) == 0 {
-        debug_line("netd: blocking worker pool unavailable");
+    let active = ACTIVE_BLOCKING_WORKERS.load(Ordering::Acquire);
+    if active == 0 {
+        debug_line(&format!(
+            "netd: blocking worker pool unavailable error={}",
+            last_error
+                .as_ref()
+                .map_or_else(|| "unknown".to_owned(), ToString::to_string)
+        ));
     } else {
+        if let Some(error) = last_error {
+            debug_line(&format!(
+                "netd: blocking worker pool partially admitted active={} requested={} error={error}",
+                active,
+                BLOCKING_WORKER_COUNT,
+            ));
+        }
         queue.available.notify_all();
     }
 }
@@ -769,33 +788,7 @@ fn admit_dvm_session_transition(
 }
 
 #[cfg(test)]
-mod dvm_session_policy_tests {
-    use super::*;
-
-    #[test]
-    fn netd_session_policy_is_exact_idempotent_and_stale_safe() {
-        assert_eq!(
-            admit_dvm_session_transition(0, 7, NETD_DVM_SESSION_GRANT),
-            Ok(DvmSessionTransition::Grant)
-        );
-        assert_eq!(
-            admit_dvm_session_transition(7, 7, NETD_DVM_SESSION_GRANT),
-            Ok(DvmSessionTransition::Grant)
-        );
-        assert_eq!(
-            admit_dvm_session_transition(7, 9, NETD_DVM_SESSION_GRANT),
-            Err(libc::EBUSY)
-        );
-        assert_eq!(
-            admit_dvm_session_transition(7, 9, NETD_DVM_SESSION_REVOKE),
-            Err(libc::ESTALE)
-        );
-        assert_eq!(
-            admit_dvm_session_transition(7, 7, NETD_DVM_SESSION_REVOKE),
-            Ok(DvmSessionTransition::Revoke)
-        );
-    }
-}
+mod dvm_session_policy_tests;
 
 enum RefReplayAction {
     Execute,

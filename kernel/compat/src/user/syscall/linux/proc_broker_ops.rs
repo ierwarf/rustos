@@ -13,13 +13,19 @@
 //! - **Forbidden:** No runnable-before-commit child, raw image parsing in
 //!   ring0, pathname authority, or stale prepare-session reuse.
 //! - **Evidence:** `deferred-process-activation`,
-//!   `loader-request-authority`, `post-init-service-authority`, and
-//!   `remote-file-map`.
+//!   `atomic-process-activation-batch`, `loader-request-authority`,
+//!   `post-init-service-authority`, and `remote-file-map`.
 use super::*;
+
+mod activation_batch;
+mod authority;
+
+pub(super) use activation_batch::syscall_linux_rustos_proc_activate_batch_broker;
 
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
+use authority::{current_loader_process_id, prepare_owned_by, procd_process_prepare_policy};
 use core::sync::atomic::{AtomicU64, Ordering};
 use heapless::index_map::FnvIndexMap;
 use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
@@ -29,8 +35,6 @@ use x86_64::structures::paging::PageTableFlags;
 use crate::user::handles::KernelHandle;
 use crate::user::memfd::MemfdHandle;
 use rustos_user_abi::syscall::{
-    COMMERCIAL_MAX_PROCD_OP_PROCESS_PREPARE, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
-    COMMERCIAL_MAX_PROTOCOL_PROCD, CommercialMaxProtocolRequest, CommercialMaxProtocolResponse,
     IPC_SERVICE_CAP_PROCESS_LOADER, IPC_SERVICE_CAP_PROCESS_POLICY,
     IPC_SERVICE_CAP_ROOT_SUPERVISOR, IPC_SERVICE_INITD, IPC_SERVICE_PROCD, IPC_SERVICE_ROOTD,
     IPC_SERVICE_SESSIOND, LOADER_SPAWN_ARG_BYTES, LOADER_SPAWN_ENV_BYTES,
@@ -145,12 +149,9 @@ pub(super) fn syscall_linux_rustos_proc_prepare_broker(args_ptr: u64) -> u64 {
     if args.abi_version != PROC_BROKER_ABI_VERSION || args.reserved0 != 0 {
         return linux_errno(LINUX_EINVAL);
     }
-    if let Err(errno) = procd_process_prepare_policy(args.format) {
-        return linux_errno(errno);
-    }
-
-    let Some(owner_pid) = multitask::current_user_process_id() else {
-        return linux_errno(LINUX_EPERM);
+    let owner_pid = match procd_process_prepare_policy(args.format) {
+        Ok(owner_pid) => owner_pid,
+        Err(errno) => return linux_errno(errno),
     };
     {
         let prepares = PROC_PREPARES.lock();
@@ -205,9 +206,9 @@ pub(super) fn syscall_linux_rustos_proc_prepare_broker(args_ptr: u64) -> u64 {
 }
 
 pub(super) fn syscall_linux_rustos_proc_map_file_broker(args_ptr: u64) -> u64 {
-    if !current_process_can_load() {
+    let Some(loader_pid) = current_loader_process_id() else {
         return linux_errno(LINUX_EPERM);
-    }
+    };
     let args = match usermem::read_current_user_struct::<RustosProcMapFileBrokerArgs>(args_ptr) {
         Ok(args) => args,
         Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
@@ -237,7 +238,7 @@ pub(super) fn syscall_linux_rustos_proc_map_file_broker(args_ptr: u64) -> u64 {
     let Some(state) = prepares.get_mut(&args.prepare_handle) else {
         return linux_errno(LINUX_EINVAL);
     };
-    if !prepare_owned_by_current(state) {
+    if !prepare_owned_by(state, loader_pid) {
         return linux_errno(LINUX_EPERM);
     }
     if state.mappings.len() >= MAX_MAPPINGS_PER_PREPARE {
@@ -248,9 +249,14 @@ pub(super) fn syscall_linux_rustos_proc_map_file_broker(args_ptr: u64) -> u64 {
 }
 
 pub(super) fn syscall_linux_rustos_proc_map_file_batch_broker(args_ptr: u64) -> u64 {
-    if !current_process_can_load() {
+    let Some(current_pid) = current_loader_process_id() else {
+        nucleus_core::debug::println_emergency(format_args!(
+            "proc-map-file-batch denied stage=capability pid={:?} preempt_depth={}",
+            multitask::current_user_process_id(),
+            nucleus_core::util::lockdep::preemption_depth()
+        ));
         return linux_errno(LINUX_EPERM);
-    }
+    };
     let args = match usermem::read_current_user_struct::<RustosProcMapFileBatchBrokerArgs>(args_ptr)
     {
         Ok(args) => args,
@@ -290,7 +296,13 @@ pub(super) fn syscall_linux_rustos_proc_map_file_batch_broker(args_ptr: u64) -> 
     let Some(state) = prepares.get_mut(&args.prepare_handle) else {
         return linux_errno(LINUX_EINVAL);
     };
-    if !prepare_owned_by_current(state) {
+    if current_pid != state.owner_pid {
+        let owner_pid = state.owner_pid;
+        drop(prepares);
+        nucleus_core::debug::println_emergency(format_args!(
+            "proc-map-file-batch denied stage=owner handle={} owner_pid={} current_pid={}",
+            args.prepare_handle, owner_pid, current_pid
+        ));
         return linux_errno(LINUX_EPERM);
     }
     if state.mappings.len() + count > MAX_MAPPINGS_PER_PREPARE {
@@ -312,9 +324,9 @@ pub(super) fn syscall_linux_rustos_proc_map_file_batch_broker(args_ptr: u64) -> 
 }
 
 pub(super) fn syscall_linux_rustos_proc_set_linux_runtime_broker(args_ptr: u64) -> u64 {
-    if !current_process_can_load() {
+    let Some(loader_pid) = current_loader_process_id() else {
         return linux_errno(LINUX_EPERM);
-    }
+    };
     let args =
         match usermem::read_current_user_struct::<RustosProcSetLinuxRuntimeBrokerArgs>(args_ptr) {
             Ok(args) => args,
@@ -369,7 +381,7 @@ pub(super) fn syscall_linux_rustos_proc_set_linux_runtime_broker(args_ptr: u64) 
     let Some(state) = prepares.get_mut(&args.prepare_handle) else {
         return linux_errno(LINUX_EINVAL);
     };
-    if !prepare_owned_by_current(state) {
+    if !prepare_owned_by(state, loader_pid) {
         return linux_errno(LINUX_EPERM);
     }
     if state.format != PROC_BROKER_FORMAT_ELF64 || state.linux_runtime.is_some() {
@@ -387,9 +399,9 @@ pub(super) fn syscall_linux_rustos_proc_set_linux_runtime_broker(args_ptr: u64) 
 }
 
 pub(super) fn syscall_linux_rustos_proc_map_zeroed_broker(args_ptr: u64) -> u64 {
-    if !current_process_can_load() {
+    let Some(loader_pid) = current_loader_process_id() else {
         return linux_errno(LINUX_EPERM);
-    }
+    };
     let args = match usermem::read_current_user_struct::<RustosProcMapZeroedBrokerArgs>(args_ptr) {
         Ok(args) => args,
         Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
@@ -409,7 +421,7 @@ pub(super) fn syscall_linux_rustos_proc_map_zeroed_broker(args_ptr: u64) -> u64 
     let Some(state) = prepares.get_mut(&args.prepare_handle) else {
         return linux_errno(LINUX_EINVAL);
     };
-    if !prepare_owned_by_current(state) {
+    if !prepare_owned_by(state, loader_pid) {
         return linux_errno(LINUX_EPERM);
     }
     if state.mappings.len() >= MAX_MAPPINGS_PER_PREPARE {
@@ -420,9 +432,9 @@ pub(super) fn syscall_linux_rustos_proc_map_zeroed_broker(args_ptr: u64) -> u64 
 }
 
 pub(super) fn syscall_linux_rustos_proc_map_data_broker(args_ptr: u64) -> u64 {
-    if !current_process_can_load() {
+    let Some(loader_pid) = current_loader_process_id() else {
         return linux_errno(LINUX_EPERM);
-    }
+    };
     let args = match usermem::read_current_user_struct::<RustosProcMapDataBrokerArgs>(args_ptr) {
         Ok(args) => args,
         Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
@@ -449,7 +461,7 @@ pub(super) fn syscall_linux_rustos_proc_map_data_broker(args_ptr: u64) -> u64 {
     let Some(state) = prepares.get_mut(&args.prepare_handle) else {
         return linux_errno(LINUX_EINVAL);
     };
-    if !prepare_owned_by_current(state) {
+    if !prepare_owned_by(state, loader_pid) {
         return linux_errno(LINUX_EPERM);
     }
     if state.mappings.len() >= MAX_MAPPINGS_PER_PREPARE {
@@ -460,9 +472,9 @@ pub(super) fn syscall_linux_rustos_proc_map_data_broker(args_ptr: u64) -> u64 {
 }
 
 pub(super) fn syscall_linux_rustos_proc_set_windows_runtime_broker(args_ptr: u64) -> u64 {
-    if !current_process_can_load() {
+    let Some(loader_pid) = current_loader_process_id() else {
         return linux_errno(LINUX_EPERM);
-    }
+    };
     let args = match usermem::read_current_user_struct::<RustosProcSetWindowsRuntimeBrokerArgs>(
         args_ptr,
     ) {
@@ -511,7 +523,7 @@ pub(super) fn syscall_linux_rustos_proc_set_windows_runtime_broker(args_ptr: u64
     let Some(state) = prepares.get_mut(&args.prepare_handle) else {
         return linux_errno(LINUX_EINVAL);
     };
-    if !prepare_owned_by_current(state) {
+    if !prepare_owned_by(state, loader_pid) {
         return linux_errno(LINUX_EPERM);
     }
     if state.format != PROC_BROKER_FORMAT_PE64 || state.windows_runtime.is_some() {
@@ -570,9 +582,9 @@ pub(super) fn syscall_linux_rustos_proc_set_windows_runtime_broker(args_ptr: u64
 }
 
 pub(super) fn syscall_linux_rustos_proc_commit_broker(args_ptr: u64) -> u64 {
-    if !current_process_can_load() {
+    let Some(loader_pid) = current_loader_process_id() else {
         return linux_errno(LINUX_EPERM);
-    }
+    };
     let args = match usermem::read_current_user_struct::<RustosProcCommitBrokerArgs>(args_ptr) {
         Ok(args) => args,
         Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
@@ -598,7 +610,7 @@ pub(super) fn syscall_linux_rustos_proc_commit_broker(args_ptr: u64) -> u64 {
         let mut prepares = PROC_PREPARES.lock();
         match prepares.get(&args.prepare_handle) {
             None => return linux_errno(LINUX_EINVAL),
-            Some(s) if !prepare_owned_by_current(s) => return linux_errno(LINUX_EPERM),
+            Some(s) if !prepare_owned_by(s, loader_pid) => return linux_errno(LINUX_EPERM),
             _ => {}
         }
         prepares.remove(&args.prepare_handle).unwrap()
@@ -764,22 +776,21 @@ pub(super) fn syscall_linux_rustos_proc_activate_broker(args_ptr: u64) -> u64 {
     {
         return linux_errno(LINUX_EINVAL);
     }
-    {
-        let mut activations = DEFERRED_ACTIVATIONS.lock();
-        if !consume_deferred_activation_authority(
-            &mut activations,
-            args.target_pid,
-            args.requester_pid,
-        ) {
-            return linux_errno(LINUX_EPERM);
-        }
-        // Capability consumption is the linearization point. A concurrent
-        // requester exit/revoke may win before this removal; once removed,
-        // this exact activation has already committed and cannot be replayed.
+    let mut activations = DEFERRED_ACTIVATIONS.lock();
+    if !deferred_spawn_provenance_matches(&activations, args.target_pid, args.requester_pid) {
+        return linux_errno(LINUX_EPERM);
     }
     if !multitask::activate_suspended_user_task(args.target_pid) {
         return linux_errno(LINUX_ESRCH);
     }
+    assert_eq!(
+        activations.remove(&args.target_pid),
+        Some(args.requester_pid),
+        "proc activation invariant: committed authority disappeared while locked"
+    );
+    // Runnable publication and one-shot capability consumption are one
+    // ProcBrokerRegistry -> Scheduler critical section. Requester cleanup can
+    // win before it or observe the committed child after it, never between.
     nucleus_core::debug::record_milestone(
         nucleus_core::debug::LogCategory::Compat,
         "proc-activate-committed",
@@ -907,9 +918,9 @@ pub(super) fn syscall_linux_rustos_proc_cancel_exec_broker(args_ptr: u64) -> u64
 }
 
 pub(super) fn syscall_linux_rustos_proc_exec_target_broker(args_ptr: u64) -> u64 {
-    if !current_process_can_load() {
+    let Some(loader_pid) = current_loader_process_id() else {
         return linux_errno(LINUX_EPERM);
-    }
+    };
     let args = match usermem::read_current_user_struct::<RustosProcExecTargetBrokerArgs>(args_ptr) {
         Ok(args) => args,
         Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
@@ -943,7 +954,7 @@ pub(super) fn syscall_linux_rustos_proc_exec_target_broker(args_ptr: u64) -> u64
         let mut prepares = PROC_PREPARES.lock();
         match prepares.get(&args.prepare_handle) {
             None => return linux_errno(LINUX_EINVAL),
-            Some(s) if !prepare_owned_by_current(s) => return linux_errno(LINUX_EPERM),
+            Some(s) if !prepare_owned_by(s, loader_pid) => return linux_errno(LINUX_EPERM),
             _ => {}
         }
         prepares.remove(&args.prepare_handle).unwrap()
@@ -1204,9 +1215,9 @@ pub(super) fn syscall_linux_rustos_proc_signal_queue_broker(args_ptr: u64) -> u6
 }
 
 pub(super) fn syscall_linux_rustos_proc_abort_broker(args_ptr: u64) -> u64 {
-    if !current_process_can_load() {
+    let Some(loader_pid) = current_loader_process_id() else {
         return linux_errno(LINUX_EPERM);
-    }
+    };
     let args = match usermem::read_current_user_struct::<RustosProcAbortBrokerArgs>(args_ptr) {
         Ok(args) => args,
         Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
@@ -1216,7 +1227,7 @@ pub(super) fn syscall_linux_rustos_proc_abort_broker(args_ptr: u64) -> u64 {
     }
     let mut prepares = PROC_PREPARES.lock();
     if let Some(state) = prepares.get(&args.prepare_handle)
-        && !prepare_owned_by_current(state)
+        && !prepare_owned_by(state, loader_pid)
     {
         return linux_errno(LINUX_EPERM);
     }
@@ -1337,10 +1348,6 @@ fn requester_owns_live_spawn_role(requester_pid: u64) -> bool {
 
 fn current_process_can_policy() -> bool {
     ipc_ops::current_process_has_service_capability(IPC_SERVICE_CAP_PROCESS_POLICY)
-}
-
-fn prepare_owned_by_current(state: &ProcPrepareState) -> bool {
-    multitask::current_user_process_id() == Some(state.owner_pid)
 }
 
 fn user_registers_to_task_registers(
@@ -1616,6 +1623,7 @@ fn allocate_exec_ticket(tickets: &ExecTicketRegistry) -> Option<u64> {
     None
 }
 
+#[cfg(test)]
 fn consume_deferred_activation_authority(
     activations: &mut DeferredActivationRegistry,
     target_pid: u64,
@@ -1648,46 +1656,6 @@ fn allocate_nonwrapping_broker_identity(counter: &AtomicU64) -> Option<u64> {
         })
         .ok()
 }
-
-// RING3-MIGRATION-REFERENCE START: capability-broker exception: procd owns
-// process-prepare admission policy. Ring0 keeps the capability-gated broker
-// handle table and calls procd before allocating privileged prepare state.
-fn procd_process_prepare_policy(format: u16) -> Result<(), i64> {
-    let Some(snapshot) = multitask::current_user_snapshot() else {
-        return Err(LINUX_EPERM);
-    };
-    let mut request = CommercialMaxProtocolRequest::default();
-    request.header.version = COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
-    request.header.protocol = COMMERCIAL_MAX_PROTOCOL_PROCD;
-    request.header.op = COMMERCIAL_MAX_PROCD_OP_PROCESS_PREPARE;
-    request.header.service_id = rustos_user_abi::syscall::IPC_SERVICE_PROCD;
-    request.header.subject_pid = snapshot.process_id();
-    request.header.subject_tid = snapshot.thread_id();
-    request.arg0 = u64::from(format);
-    let response = ipc_ops::call_service_endpoint_with_class(
-        rustos_user_abi::syscall::IPC_SERVICE_PROCD,
-        as_bytes(&request),
-        ipc_ops::ServiceIpcClass::BootControl,
-    )?;
-    if response.len() != core::mem::size_of::<CommercialMaxProtocolResponse>() {
-        return Err(LINUX_EINVAL);
-    }
-    let response = read_unaligned::<CommercialMaxProtocolResponse>(response.as_slice());
-    ipc_ops::validate_commercial_response_envelope(&request, &response)?;
-    if response.payload_len != 0
-        || response.descriptor_count != 1
-        || response.value0 != u64::from(format)
-        || response.value1 != PROC_BROKER_ABI_VERSION as u64
-    {
-        return Err(LINUX_EINVAL);
-    }
-    if response.status == 0 {
-        Ok(())
-    } else {
-        Err(response.status.unsigned_abs() as i64)
-    }
-}
-// RING3-MIGRATION-REFERENCE END: procd-owned process-prepare admission substrate exception.
 
 fn validate_mapping_region(target_addr: u64, mem_len: u64, flags: u64) -> Result<(), i64> {
     if mem_len == 0

@@ -135,9 +135,12 @@ rg -Fq 'BOOT_TO_UI_HARD_LIMIT_MS' tools/xtask/src/kvm/guest.rs || {
     echo "KVM interactive boot gate is not bound to the shared hard limit" >&2
     exit 1
 }
-rg -Fq 'RustOS currently schedules all user work on the BSP' \
-    tools/xtask/src/kvm/guest.rs || {
-    echo "KVM topology regained an idle RustOS vCPU that contends with the DVM" >&2
+rg -Fq 'rustos_vcpus: 1,' tools/xtask/src/kvm/guest.rs || {
+    echo "default KVM topology regained an unrequested RustOS vCPU that contends with the DVM" >&2
+    exit 1
+}
+rg -Fq '.arg(rustos_vcpus.to_string())' tools/xtask/src/kvm/guest.rs || {
+    echo "explicit KVM SMP topology is no longer bound to the admitted RustOS vCPU count" >&2
     exit 1
 }
 rg -Fq 'const SYSTEM_READY_LATENCY_BOUND_MS: u64 = 2;' \
@@ -240,6 +243,16 @@ fi
 rg -Fq 'init_exec_priority(RUNTIMED_EXEC_PATH) < init_exec_priority(STORAGED_EXEC_PATH)' \
     services/initd/src/main.rs || {
     echo "immutable UI bootstrap is again ordered behind DVM-backed storaged" >&2
+    exit 1
+}
+rg -Uq 'let reply = syscall3\([\s\S]{0,700}completion_demotion_due\(reply, handled\.demote_after_reply\)' \
+    services/loaderd/src/main.rs || {
+    echo "loaderd can demote before its terminal UI spawn reply completes" >&2
+    exit 1
+}
+rg -Uq 'let reply = unsafe \{[\s\S]{0,1400}if ui_bootstrap_snapshot_reply_completed\(' \
+    services/vfsd/src/main.rs || {
+    echo "vfsd can demote before its terminal UI snapshot reply completes" >&2
     exit 1
 }
 rg -Fq '_mm_stream_si128' services/uiserver/src/gpu_runtime.rs || {
@@ -402,6 +415,78 @@ for witness in \
 done
 rg -Fq 'difference_bounds(' services/uiserver/src/gpu_runtime.rs || {
     echo "uiserver topology rebuild lost retained-atlas differential damage" >&2
+    exit 1
+}
+loaderd_main=services/loaderd/src/main.rs
+rg -Fq 'fn trace_line(message: &str)' "$loaderd_main" &&
+    rg -Fq 'option_env!("RUSTOS_LOGGING_BOOT_TRACE_ENABLED") == Some("true")' \
+        "$loaderd_main" || {
+    echo "loaderd success-path tracing is no longer controlled by the boot-trace contract" >&2
+    exit 1
+}
+for phase in \
+    'loaderd: open done' \
+    'loaderd: validate begin' \
+    'loaderd: prepare begin' \
+    'loaderd: commit begin'; do
+    rg -Fq "trace_line(&format!(\"$phase" "$loaderd_main" || {
+        echo "loaderd synchronous debug output regained a boot hot-path phase: $phase" >&2
+        exit 1
+    }
+done
+rg -Uq 'trace_line\(&format!\(\n[[:space:]]*"loaderd: executable snapshot call begin' \
+    "$loaderd_main" || {
+    echo "loaderd executable snapshot trace regained synchronous console output" >&2
+    exit 1
+}
+rg -Fq 'reply_failure_diagnostic_due(reply_failures)' services/vfsd/src/main.rs || {
+    echo "vfsd reply cancellation diagnostics are no longer rate bounded" >&2
+    exit 1
+}
+rg -Fq 'reply_failure_diagnostics_are_first_then_exponentially_rate_limited' \
+    services/vfsd/src/lib.rs || {
+    echo "vfsd reply diagnostic rate bound lost its executable witness" >&2
+    exit 1
+}
+rg -Fq 'const LOCAL_MEMFD_IO_CHUNK_BYTES: usize = 64 * 1024;' \
+    kernel/compat/src/user/syscall/linux/service_ops/local_memfd_io.rs || {
+    echo "local memfd I/O regained sub-page lock and reschedule amplification" >&2
+    exit 1
+}
+if rg -Fq 'let mut chunk = [0_u8; 256];' \
+    kernel/compat/src/user/syscall/linux/service_ops/local_memfd_io.rs \
+    kernel/compat/src/user/syscall/linux/service_ops/vfs_socket.rs; then
+    echo "local memfd write regained its 256-byte scheduler amplification loop" >&2
+    exit 1
+fi
+rg -Fq 'sync_pick_hints: SlotHandoffQueue<MAX_TASK>' \
+    kernel/ps/src/multitask/scheduler.rs || {
+    echo "synchronous IPC peers no longer have complete bounded FIFO custody" >&2
+    exit 1
+}
+rg -Uq 'let atomic_activation_handoff = self\.take_next_atomic_activation_handoff_ready_slot\(\);[\s\S]{0,500}let sync_handoff = if atomic_activation_handoff\.is_none\(\)[\s\S]{0,500}take_next_synchronous_pick_hint_ready_slot\(\)[\s\S]{0,800}match atomic_activation_handoff[\s\S]{0,800}match sync_handoff[\s\S]{0,500}mandatory_overdue_pick' \
+    kernel/ps/src/multitask/scheduler.rs || {
+    echo "atomic activation or synchronous IPC handoff no longer precedes unrelated overdue work" >&2
+    exit 1
+}
+if [ "$(rg -c 'set_next_synchronous_pick_hint\(task_id\)' \
+    kernel/compat/src/user/syscall/linux/ipc_ops.rs)" -lt 2 ]; then
+    echo "one IPC reply ABI bypasses terminal caller handoff custody" >&2
+    exit 1
+fi
+rg -Fq 'set_next_synchronous_pick_hint(receiver_task_id)' \
+    kernel/compat/src/user/syscall/linux/ipc_ops.rs || {
+    echo "IPC call enqueue bypasses exact receiver handoff custody" >&2
+    exit 1
+}
+rg -Fq 'set_next_process_pick_hint(receiver_process_id)' \
+    kernel/compat/src/user/syscall/linux/ipc_ops.rs || {
+    echo "process-owned IPC call enqueue bypasses runnable receiver custody" >&2
+    exit 1
+}
+rg -Fq 'synchronous_ipc_handoff_is_fifo_deduplicated_and_fairness_bounded' \
+    kernel/ps/src/multitask/scheduler/synchronous_handoff_tests.rs || {
+    echo "synchronous IPC handoff lost its executable fairness witness" >&2
     exit 1
 }
 

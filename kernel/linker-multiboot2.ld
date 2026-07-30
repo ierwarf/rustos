@@ -25,6 +25,7 @@ SECTIONS
   .rodata : ALIGN(4096)
   {
     *(.note.gnu.build-id)
+    KEEP(*(.rodata.ap_trampoline))
     *(.rodata .rodata.*)
     *(.srodata .srodata.*)
     *(.eh_frame_hdr)
@@ -58,6 +59,9 @@ SECTIONS
 
   . = ALIGN(4096);
   _end = .;
+
+  ASSERT((rustos_ap_trampoline_end - rustos_ap_trampoline_start) <= 4096,
+         "AP trampoline exceeds its executable page")
 
   /DISCARD/ :
   {

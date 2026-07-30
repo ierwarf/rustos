@@ -34,6 +34,8 @@ output outside the cached unit.
 - `docs/ai/physical-gpu-status.md` — current physical GPU evidence boundary,
   remaining generic userspace readiness ABI, and safe continuation rules.
 - `docs/ai/performance-hardening.md` — boot/runtime bottleneck and cleanup runbook.
+- `docs/ai/smp-contract.md` — normative x86_64 CPU topology, AP startup,
+  per-CPU state, IPI, scheduler, TLB, lifetime, panic, and release gates.
 - Ring0/ring3 ownership decisions come from the exact broker call path,
   owning service contract, and local `RING3-MIGRATION-*` annotation. LOC
   inventory is not an architecture gate.

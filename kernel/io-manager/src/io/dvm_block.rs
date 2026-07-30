@@ -138,7 +138,7 @@ struct DvmBlockState {
     ready_observed: bool,
 }
 
-// The mapping is kernel-lifetime and every access is serialized by STATE.
+// SAFETY: STATE serializes the kernel-lifetime mapping, so moving it cannot create an alias.
 unsafe impl Send for DvmBlockState {}
 
 impl DvmBlockState {

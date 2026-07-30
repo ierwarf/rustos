@@ -1,3 +1,14 @@
+//! Windows kernelbase compatibility exports over the private ntdll transport.
+//!
+//! Owner: kernelbase owns Win32 return/LastError semantics; syscalld owns policy.
+//! Boundary: untrusted PE64 pointers and handles cross into fixed ntdll calls.
+//! Lifecycle: validate arguments, make one transport call, publish output only
+//! after success. Concurrency: no shared mutable affinity state is cached here.
+//! Failure: invalid arguments/handles or NTSTATUS failures return FALSE/zero and
+//! set LastError. Forbidden: no implicit foreign handle, fabricated topology,
+//! partial output, or host API fallback. Evidence: cpu-affinity-observation,
+//! task-affinity-lifecycle, and formal/abi-reference/windows_probe.c.
+
 #include "ntdll_exports.h"
 #include "windows_runtime.h"
 
@@ -267,6 +278,86 @@ void *GetStdHandle(DWORD handle_id)
     }
 }
 
+static BOOL rustos_query_basic_system_information(
+    RUSTOS_SYSTEM_BASIC_INFORMATION *basic)
+{
+    ULONG returned = 0;
+    unsigned index;
+    BYTE *bytes = (BYTE *)basic;
+    if (basic == NULL) {
+        return FALSE;
+    }
+    for (index = 0; index < sizeof(*basic); index++) {
+        bytes[index] = 0;
+    }
+    return NtQuerySystemInformation(
+        0,
+        basic,
+        (ULONG)sizeof(*basic),
+        &returned) == 0
+        && returned == sizeof(*basic)
+        && basic->number_of_processors > 0
+        && (BYTE)basic->number_of_processors <= 8u;
+}
+
+void GetSystemInfo(RUSTOS_SYSTEM_INFO *info)
+{
+    RUSTOS_SYSTEM_BASIC_INFORMATION basic;
+    unsigned index;
+    BYTE *bytes = (BYTE *)info;
+    if (info == NULL) {
+        return;
+    }
+    for (index = 0; index < sizeof(*info); index++) {
+        bytes[index] = 0;
+    }
+    if (!rustos_query_basic_system_information(&basic)) {
+        return;
+    }
+    info->architecture.processor.wProcessorArchitecture = 9u;
+    info->dwPageSize = 4096u;
+    info->lpMinimumApplicationAddress = (PVOID)0x0000008000000000ULL;
+    info->lpMaximumApplicationAddress = (PVOID)0x000000ffffffffffULL;
+    info->dwNumberOfProcessors = (DWORD)(BYTE)basic.number_of_processors;
+    /*
+     * RustOS admits one dense fixed processor group of at most eight logical
+     * CPUs. SYSTEM_BASIC_INFORMATION exposes only the count; its other fields
+     * are reserved by Microsoft and must stay zero. Derive the documented
+     * SYSTEM_INFO mask from that admitted dense topology instead of exporting
+     * a private value through a reserved field.
+     */
+    info->dwActiveProcessorMask =
+        (((DWORD_PTR)1u << info->dwNumberOfProcessors) - (DWORD_PTR)1u);
+    info->dwProcessorType = 8664u;
+    info->dwAllocationGranularity = 65536u;
+}
+
+void GetNativeSystemInfo(RUSTOS_SYSTEM_INFO *info)
+{
+    GetSystemInfo(info);
+}
+
+DWORD GetActiveProcessorCount(WORD group_number)
+{
+    RUSTOS_SYSTEM_BASIC_INFORMATION basic;
+    if (group_number != 0u && group_number != 0xffffu) {
+        rustos_set_last_error(RUSTOS_ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    if (!rustos_query_basic_system_information(&basic)) {
+        rustos_set_last_error(RUSTOS_ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    rustos_set_last_error(RUSTOS_ERROR_SUCCESS);
+    return (DWORD)(BYTE)basic.number_of_processors;
+}
+
+WORD GetActiveProcessorGroupCount(void)
+{
+    RUSTOS_SYSTEM_BASIC_INFORMATION basic;
+    return rustos_query_basic_system_information(&basic) ? 1u : 0u;
+}
+
 BOOL WriteFile(
     void *handle,
     const void *buffer,
@@ -512,6 +603,11 @@ void *GetCurrentProcess(void)
     return (void *)RUSTOS_HANDLE_CURRENT_PROCESS;
 }
 
+void *GetCurrentThread(void)
+{
+    return (void *)RUSTOS_HANDLE_CURRENT_THREAD;
+}
+
 DWORD GetCurrentProcessId(void)
 {
     return rustos_current_process_id_value();
@@ -520,6 +616,67 @@ DWORD GetCurrentProcessId(void)
 DWORD GetCurrentThreadId(void)
 {
     return rustos_current_thread_id_value();
+}
+
+BOOL GetProcessAffinityMask(
+    void *process,
+    DWORD_PTR *process_mask,
+    DWORD_PTR *system_mask)
+{
+    if (process != (void *)RUSTOS_HANDLE_CURRENT_PROCESS) {
+        rustos_set_last_error(RUSTOS_ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+    if (process_mask == NULL || system_mask == NULL) {
+        rustos_set_last_error(RUSTOS_ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    if (!RtlRustosQueryProcessAffinity(process, process_mask, system_mask)) {
+        rustos_set_last_error(RUSTOS_ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    rustos_set_last_error(RUSTOS_ERROR_SUCCESS);
+    return TRUE;
+}
+
+BOOL SetProcessAffinityMask(void *process, DWORD_PTR process_mask)
+{
+    if (process != (void *)RUSTOS_HANDLE_CURRENT_PROCESS) {
+        rustos_set_last_error(RUSTOS_ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+    if (process_mask == 0u
+        || !RtlRustosSetProcessAffinity(process, process_mask)) {
+        rustos_set_last_error(RUSTOS_ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    rustos_set_last_error(RUSTOS_ERROR_SUCCESS);
+    return TRUE;
+}
+
+DWORD_PTR SetThreadAffinityMask(void *thread, DWORD_PTR thread_mask)
+{
+    DWORD_PTR previous;
+    if (thread != (void *)RUSTOS_HANDLE_CURRENT_THREAD) {
+        rustos_set_last_error(RUSTOS_ERROR_INVALID_HANDLE);
+        return 0u;
+    }
+    if (thread_mask == 0u) {
+        rustos_set_last_error(RUSTOS_ERROR_INVALID_PARAMETER);
+        return 0u;
+    }
+    previous = RtlRustosSetThreadAffinity(thread, thread_mask);
+    if (previous == 0u) {
+        rustos_set_last_error(RUSTOS_ERROR_INVALID_PARAMETER);
+        return 0u;
+    }
+    rustos_set_last_error(RUSTOS_ERROR_SUCCESS);
+    return previous;
+}
+
+DWORD GetCurrentProcessorNumber(void)
+{
+    return RtlRustosGetCurrentProcessorNumber();
 }
 
 void DeleteCriticalSection(void *critical_section)
@@ -733,4 +890,3 @@ int FreeLibrary(void *module)
     (void)module;
     return 0;
 }
-

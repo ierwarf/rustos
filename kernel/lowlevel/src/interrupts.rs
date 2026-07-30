@@ -68,15 +68,19 @@ const _: [(); 0x198] = [(); mem::offset_of!(SavedContext, rflags)];
 const _: [(); 0x1a0] = [(); mem::size_of::<SavedContext>()];
 
 pub type InterruptDispatch = extern "C" fn(*mut SavedContext) -> *mut SavedContext;
+pub type ContextSwitchCommit = extern "C" fn();
 
 static TIMER_INTERRUPT_DISPATCH: AtomicUsize = AtomicUsize::new(0);
 static RTC_INTERRUPT_DISPATCH: AtomicUsize = AtomicUsize::new(0);
 static SOFTWARE_SCHEDULE_INTERRUPT_DISPATCH: AtomicUsize = AtomicUsize::new(0);
+static RESCHEDULE_IPI_INTERRUPT_DISPATCH: AtomicUsize = AtomicUsize::new(0);
+static CONTEXT_SWITCH_COMMIT: AtomicUsize = AtomicUsize::new(0);
 
 unsafe extern "C" {
     fn timer_interrupt_handler();
     fn rtc_scheduler_interrupt_handler();
     fn software_schedule_interrupt_handler();
+    fn reschedule_ipi_interrupt_handler();
     fn software_schedule_trap();
 }
 
@@ -92,6 +96,10 @@ pub fn software_schedule_interrupt_handler_addr() -> u64 {
     higher_half_addr(software_schedule_interrupt_handler as *const () as usize as u64)
 }
 
+pub fn reschedule_ipi_interrupt_handler_addr() -> u64 {
+    higher_half_addr(reschedule_ipi_interrupt_handler as *const () as usize as u64)
+}
+
 pub fn register_timer_interrupt_dispatch(callback: InterruptDispatch) {
     TIMER_INTERRUPT_DISPATCH.store(callback as usize, Ordering::Release);
 }
@@ -102,6 +110,18 @@ pub fn register_rtc_interrupt_dispatch(callback: InterruptDispatch) {
 
 pub fn register_software_schedule_interrupt_dispatch(callback: InterruptDispatch) {
     SOFTWARE_SCHEDULE_INTERRUPT_DISPATCH.store(callback as usize, Ordering::Release);
+}
+
+pub fn register_reschedule_ipi_interrupt_dispatch(callback: InterruptDispatch) {
+    // ORDERING: Release publishes the complete scheduler callback before any
+    // CPU can receive the private reschedule vector.
+    RESCHEDULE_IPI_INTERRUPT_DISPATCH.store(callback as usize, Ordering::Release);
+}
+
+pub fn register_context_switch_commit(callback: ContextSwitchCommit) {
+    // ORDERING: Release publishes the stack-handoff commit callback before
+    // scheduler interrupts may expose an outgoing stack transition.
+    CONTEXT_SWITCH_COMMIT.store(callback as usize, Ordering::Release);
 }
 
 pub fn trigger_software_schedule() {
@@ -138,6 +158,30 @@ extern "C" fn software_schedule_interrupt_dispatch(
     context_ptr: *mut SavedContext,
 ) -> *mut SavedContext {
     dispatch(&SOFTWARE_SCHEDULE_INTERRUPT_DISPATCH, context_ptr)
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn reschedule_ipi_interrupt_dispatch(
+    context_ptr: *mut SavedContext,
+) -> *mut SavedContext {
+    dispatch(&RESCHEDULE_IPI_INTERRUPT_DISPATCH, context_ptr)
+}
+
+/// Called by the interrupt stubs only after `rsp` names the selected incoming
+/// frame. Until this boundary, scheduler ownership intentionally retains the
+/// outgoing task stack as a second CPU-local transition owner.
+#[unsafe(no_mangle)]
+extern "C" fn scheduler_context_switch_commit_dispatch() {
+    // ORDERING: Acquire observes the registered exact callback before the
+    // assembly boundary delegates outgoing-owner release.
+    let callback_addr = CONTEXT_SWITCH_COMMIT.load(Ordering::Acquire);
+    if callback_addr == 0 {
+        return;
+    }
+    // SAFETY: only `register_context_switch_commit` can publish this address,
+    // and it accepts the exact `extern "C" fn()` type.
+    let callback = unsafe { mem::transmute::<usize, ContextSwitchCommit>(callback_addr) };
+    callback();
 }
 
 fn dispatch(slot: &AtomicUsize, context_ptr: *mut SavedContext) -> *mut SavedContext {

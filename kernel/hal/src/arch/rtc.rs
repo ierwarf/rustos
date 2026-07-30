@@ -1,4 +1,4 @@
-//! BSP deadline registry and clockevent wake delivery.
+//! Global monotonic deadline registry and per-CPU clockevent wake delivery.
 //!
 //! - **Owner:** `kernel-hal` owns deadline records; the scheduler owns task
 //!   block epochs and callers own condition rechecks.
@@ -335,7 +335,14 @@ pub fn init() {
 pub fn on_interrupt() {
     let _irq_context = nucleus_core::util::lockdep::enter_irq_context();
     let interrupt_count = RTC_TICKS.fetch_add(1, Ordering::AcqRel).saturating_add(1);
-    service_clock_event();
+    // A timer may interrupt the narrow acquisition/release window of any raw
+    // lock. Preserve hardware accounting and acknowledgement, but defer
+    // scheduler-facing sleeper callbacks until preemption is permitted again.
+    // Absolute deadlines make the next clockevent an exact catch-up, not a
+    // relative-time extension.
+    if !nucleus_core::util::lockdep::preemption_disabled() {
+        service_clock_event();
+    }
     // Only emit the diagnostic when we observe more than one in-flight tick
     // (re-entrance or a missed completion). In the steady state delta is
     // always 1 — logging that every few ticks dominates the debugcon stream

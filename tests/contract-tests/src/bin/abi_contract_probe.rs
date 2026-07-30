@@ -64,12 +64,16 @@ fn linux_probe() {
     pair("sys_epoll_wait", linux::SYS_EPOLL_WAIT);
     pair("sys_mmap", linux::SYS_MMAP);
     pair("sys_recvmsg", linux::SYS_RECVMSG);
+    pair("sys_sched_getaffinity", linux::SYS_SCHED_GETAFFINITY);
+    pair("sys_sched_setaffinity", linux::SYS_SCHED_SETAFFINITY);
     pair("sys_sendmsg", linux::SYS_SENDMSG);
     pair("sys_socketpair", linux::SYS_SOCKETPAIR);
 }
 
 fn windows_probe() {
     pair("bool_false", windows::BOOL_FALSE);
+    pair("current_process_pseudo", windows::HANDLE_CURRENT_PROCESS);
+    pair("current_thread_pseudo", windows::HANDLE_CURRENT_THREAD);
     pair("error_invalid_function", windows::ERROR_INVALID_FUNCTION);
     pair("error_invalid_handle", windows::ERROR_INVALID_HANDLE);
     pair("error_invalid_parameter", windows::ERROR_INVALID_PARAMETER);
@@ -98,6 +102,10 @@ fn windows_probe() {
     pair("size_image_optional_header64", 240);
     pair("size_image_section_header", PE64_SECTION_HEADER_SIZE);
     pair("size_image_thunk_data64", PE64_IMPORT_THUNK_BYTES);
+    pair(
+        "size_system_info",
+        core::mem::size_of::<windows::WindowsSystemInfo>(),
+    );
     pair("status_invalid_handle", windows::STATUS_INVALID_HANDLE);
     pair(
         "status_invalid_parameter",

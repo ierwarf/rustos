@@ -57,18 +57,25 @@ or a certified product. Their primary documentation is design input:
 This contract applies to every Rust source file and is strictest for
 `critical` and `high` entries in `formal/contracts.toml`.
 
-RustOS is currently BSP-only. A diagnostic APIC ID, an array sized for future
-CPUs, or an atomic variable is not SMP support. Do not enable a second RustOS
-vCPU until a separate change supplies and verifies:
+RustOS has an implemented SMP correctness substrate under active
+qualification; commercial SMP acceptance remains closed. AP startup,
+CPU-local architectural state, reschedule IPI, TLB shootdown, cross-CPU
+lifetime, and atomic futex cleanup do not by themselves prove scalable
+scheduling or a supported multi-vCPU product. A second RustOS vCPU may be
+admitted only through the source-bound SMP release gate, and that gate must
+continue to require:
 
 - CPU-online/offline state and AP startup;
 - per-CPU scheduler, syscall, interrupt, preemption, and lockdep state;
 - IPI wake/reschedule and TLB-shootdown protocols;
 - cross-CPU task and process lifetime ownership;
+- per-CPU run queues with bounded targeted wake and load balancing;
 - multicore memory-order litmus, stress, and recovery evidence.
 
-SMP preparation may remove global assumptions, but it must not advertise or
-silently exercise AP execution.
+The current serialized global scheduler and broadcast reschedule fan-out are
+correctness scaffolding, not completion of the per-CPU run-queue contract.
+No document, launcher flag, or readiness marker may advertise commercial SMP
+until the 1/2/4/8-vCPU qualification matrix passes.
 
 ## One owner and one lifecycle
 
@@ -129,6 +136,12 @@ waits still use finite provider calls and remain interruptible/revocable.
   held. Lock order must be visible to lockdep; do not bypass it with an
   untracked lock or hand-written spinning.
 - Never split an atomic scheduler transition into “commit now, yield later.”
+- A supervisor may publish several already-prepared siblings only through one
+  bounded activation transaction. Validate the complete unique target set,
+  every exact requester capability, and every suspended scheduler context
+  before changing any member. Acquire `ProcBrokerRegistry` before `Scheduler`;
+  after preflight, partial publication or partial capability consumption is a
+  kernel invariant violation and panics.
 - An atomic operation must state which publication it orders. `Relaxed` is
   allowed only for a value whose correctness is independent of ordering or
   when another named synchronization edge carries the order.

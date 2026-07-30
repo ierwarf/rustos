@@ -40,6 +40,7 @@ fn product_milestone_name(milestone: u64) -> Option<(&'static str, bool)> {
             Some(("product-executable-snapshot-sealed", true))
         }
         linux_abi::PRODUCT_MILESTONE_FIRST_FRAME => Some(("product-first-frame", false)),
+        PRODUCT_MILESTONE_INIT_IDENTITY_READY => Some(("product-init-identity-ready", false)),
         _ => None,
     }
 }
@@ -76,6 +77,10 @@ mod product_milestone_tests {
         assert_eq!(
             product_milestone_name(linux_abi::PRODUCT_MILESTONE_EXECUTABLE_SNAPSHOT_SEALED),
             Some(("product-executable-snapshot-sealed", true))
+        );
+        assert_eq!(
+            product_milestone_name(PRODUCT_MILESTONE_INIT_IDENTITY_READY),
+            Some(("product-init-identity-ready", false))
         );
         assert_eq!(product_milestone_name(0), None);
         assert_eq!(product_milestone_name(u64::MAX), None);

@@ -29,6 +29,46 @@ use rustos_user_abi::syscall::{
     IPC_SERVICE_CAP_STORAGE_POLICY, RustosBlockBrokerArgs,
 };
 
+static BLOCK_BROKER_REJECTION_COUNT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+fn log_block_broker_rejection(stage: &str, args: &RustosBlockBrokerArgs) {
+    let count = BLOCK_BROKER_REJECTION_COUNT
+        .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+        .saturating_add(1);
+    // A malformed caller can otherwise turn synchronous debugcon into the
+    // dominant ring0 workload. Preserve the first witnesses and logarithmic
+    // aggregate progress without amplifying a fault into a boot-wide stall.
+    if count > 4 && !count.is_power_of_two() {
+        return;
+    }
+    let (pid, tid) = multitask::current_user_log_ids().unwrap_or((0, 0));
+    nucleus_core::debug::write_debugcon_only_line(
+        alloc::format!(
+            "dvm-block: broker rejected stage={} count={} pid={} tid={} op={} abi={} expected={} flags={:#x} reserved={:#x} lba={} blocks={} buffer={:#x}/{} timeout_ms={} ticket={}:{} out_ticket={:#x} out_info={:#x}",
+            stage,
+            count,
+            pid,
+            tid,
+            args.op,
+            args.abi_version,
+            BLOCK_BROKER_ABI_VERSION,
+            args.flags,
+            args.reserved0,
+            args.lba,
+            args.block_count,
+            args.buffer_ptr,
+            args.buffer_len,
+            args.timeout_ms,
+            args.ticket.generation,
+            args.ticket.request_id,
+            args.out_ticket_ptr,
+            args.out_info_ptr,
+        )
+        .as_bytes(),
+    );
+}
+
 pub(super) fn syscall_linux_rustos_block_broker(args_ptr: u64) -> u64 {
     let args = match usermem::read_current_user_struct::<RustosBlockBrokerArgs>(args_ptr) {
         Ok(args) => args,
@@ -38,13 +78,7 @@ pub(super) fn syscall_linux_rustos_block_broker(args_ptr: u64) -> u64 {
         || args.reserved0 != 0
         || args.flags & !BLOCK_BROKER_KNOWN_FLAGS != 0
     {
-        nucleus_core::debug::write_debugcon_only_line(
-            alloc::format!(
-                "dvm-block: broker rejected stage=envelope abi={} expected={} flags={:#x} reserved={:#x}",
-                args.abi_version, BLOCK_BROKER_ABI_VERSION, args.flags, args.reserved0,
-            )
-            .as_bytes(),
-        );
+        log_block_broker_rejection("envelope", &args);
         return linux_errno(LINUX_EINVAL);
     }
 
@@ -100,7 +134,12 @@ fn broker_dvm(args: &RustosBlockBrokerArgs) -> u64 {
     };
     match result {
         Ok(value) => value,
-        Err(errno) => linux_errno(errno),
+        Err(errno) => {
+            if errno == LINUX_EINVAL {
+                log_block_broker_rejection("operation", args);
+            }
+            linux_errno(errno)
+        }
     }
 }
 

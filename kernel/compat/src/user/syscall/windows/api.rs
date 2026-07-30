@@ -1,3 +1,16 @@
+//! Windows syscall-number decode owned by the narrow ring0 frame adapter.
+//!
+//! - **Owner:** kernel-compat owns number decoding; syscalld owns Win32 policy.
+//! - **Boundary:** untrusted PE64 syscall numbers become one closed `Api` enum.
+//! - **Lifecycle:** decode an exact fixed number, dispatch once, then discard
+//!   the enum with the syscall frame.
+//! - **Concurrency:** immutable constants and pure decoding require no lock.
+//! - **Failure:** unknown, tombstoned, or out-of-range numbers are rejected.
+//! - **Forbidden:** no dynamic registration, alias, host syscall inference, or
+//!   policy implementation in this module.
+//! - **Evidence:** `cpu-affinity-observation`, `task-affinity-lifecycle`, and
+//!   the Windows ABI differential probe.
+
 // RING3-MIGRATION-REFERENCE START: decode exception: syscalld/loaderd own Win32
 // syscall policy. Ring0 keeps syscall number decode substrate.
 const SYSCALL_BASE: u64 = 0x1000;
@@ -16,6 +29,11 @@ pub enum Api {
     NtFreeVirtualMemory = 20,
     NtProtectVirtualMemory = 21,
     NtQueryVirtualMemory = 70,
+    NtQuerySystemInformation = 71,
+    RustosQueryProcessAffinity = 72,
+    RustosSetProcessAffinity = 73,
+    RustosSetThreadAffinity = 74,
+    RustosGetCurrentProcessorNumber = 75,
 }
 
 impl Api {
@@ -51,6 +69,21 @@ impl Api {
             }
             value if value == Self::NtQueryVirtualMemory.syscall_number() => {
                 Some(Self::NtQueryVirtualMemory)
+            }
+            value if value == Self::NtQuerySystemInformation.syscall_number() => {
+                Some(Self::NtQuerySystemInformation)
+            }
+            value if value == Self::RustosQueryProcessAffinity.syscall_number() => {
+                Some(Self::RustosQueryProcessAffinity)
+            }
+            value if value == Self::RustosSetProcessAffinity.syscall_number() => {
+                Some(Self::RustosSetProcessAffinity)
+            }
+            value if value == Self::RustosSetThreadAffinity.syscall_number() => {
+                Some(Self::RustosSetThreadAffinity)
+            }
+            value if value == Self::RustosGetCurrentProcessorNumber.syscall_number() => {
+                Some(Self::RustosGetCurrentProcessorNumber)
             }
             _ => None,
         }

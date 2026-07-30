@@ -23,6 +23,25 @@ const ENODEV: i32 = 19;
 const ENOSYS: i32 = 38;
 const ETIMEDOUT: i32 = 110;
 
+/// Bounds synchronous-console amplification from cancelled reply bursts.
+pub fn reply_failure_diagnostic_due(total: u64) -> bool {
+    total == 1 || (total.is_power_of_two() && total.trailing_zeros() % 3 == 0)
+}
+
+/// Admits post-bootstrap demotion only after the exact terminal UI snapshot
+/// reply succeeds.
+pub fn ui_bootstrap_snapshot_reply_completed(
+    request_path: &[u8],
+    declared_len: usize,
+    expected_path: &[u8],
+    reply: i64,
+) -> bool {
+    reply >= 0
+        && request_path
+            .get(..declared_len)
+            .is_some_and(|path| path == expected_path)
+}
+
 pub fn executable_snapshot_marker(path: &str, file_len: usize) -> alloc::string::String {
     format!("vfsd: executable snapshot sealed path={path} bytes={file_len}")
 }
@@ -271,7 +290,6 @@ pub struct WaitSetRegistry {
 #[derive(Clone)]
 struct WaitSetEpoll {
     interests: BTreeMap<WaitSetInterestKey, WaitSetInterestRecord>,
-    refs: u64,
     cursor: usize,
 }
 
@@ -284,59 +302,31 @@ impl WaitSetRegistry {
             token,
             WaitSetEpoll {
                 interests: BTreeMap::new(),
-                refs: 1,
                 cursor: 0,
             },
         );
         Ok(())
     }
 
-    pub fn acquire(&mut self, token: u64) -> Result<(), WaitSetRegistryError> {
-        let epoll = self
-            .epolls
-            .get_mut(&token)
-            .ok_or(WaitSetRegistryError::NotFound)?;
-        epoll.refs = epoll
-            .refs
-            .checked_add(1)
-            .ok_or(WaitSetRegistryError::Overflow)?;
-        Ok(())
-    }
-
-    pub fn refs(&self, token: u64) -> Result<u64, WaitSetRegistryError> {
-        self.epolls
-            .get(&token)
-            .map(|epoll| epoll.refs)
-            .ok_or(WaitSetRegistryError::NotFound)
-    }
-
-    pub fn restore(&mut self, token: u64, refs: u64) -> Result<(), WaitSetRegistryError> {
-        if token == 0 || refs == 0 || self.epolls.contains_key(&token) {
+    pub fn restore(&mut self, token: u64) -> Result<(), WaitSetRegistryError> {
+        if token == 0 || self.epolls.contains_key(&token) {
             return Err(WaitSetRegistryError::Exists);
         }
         self.epolls.insert(
             token,
             WaitSetEpoll {
                 interests: BTreeMap::new(),
-                refs,
                 cursor: 0,
             },
         );
         Ok(())
     }
 
-    pub fn release(&mut self, token: u64) -> Result<(), WaitSetRegistryError> {
-        let refs = self
-            .epolls
-            .get(&token)
-            .map(|epoll| epoll.refs)
-            .ok_or(WaitSetRegistryError::NotFound)?;
-        if refs > 1 {
-            self.epolls.get_mut(&token).unwrap().refs = refs - 1;
-        } else {
-            self.epolls.remove(&token);
-        }
-        Ok(())
+    pub fn retire(&mut self, token: u64) -> Result<(), WaitSetRegistryError> {
+        self.epolls
+            .remove(&token)
+            .map(|_| ())
+            .ok_or(WaitSetRegistryError::NotFound)
     }
 
     pub fn add(
@@ -483,6 +473,37 @@ pub fn unlink_policy(path: &str) -> i32 {
 mod tests {
     use super::*;
     use alloc::vec;
+
+    #[test]
+    fn reply_failure_diagnostics_are_first_then_exponentially_rate_limited() {
+        let reported = (1..=70)
+            .filter(|total| reply_failure_diagnostic_due(*total))
+            .collect::<Vec<_>>();
+        assert_eq!(reported, [1, 8, 64]);
+    }
+
+    #[test]
+    fn ui_bootstrap_demotion_requires_successful_terminal_snapshot_reply() {
+        let path = b"services/uiserver/uiserver.elf";
+        assert!(!ui_bootstrap_snapshot_reply_completed(
+            path,
+            path.len(),
+            path,
+            -22
+        ));
+        assert!(ui_bootstrap_snapshot_reply_completed(
+            path,
+            path.len(),
+            path,
+            0
+        ));
+        assert!(!ui_bootstrap_snapshot_reply_completed(
+            path,
+            path.len() - 1,
+            path,
+            0
+        ));
+    }
 
     #[test]
     fn executable_snapshot_marker_binds_path_and_exact_length() {
@@ -752,6 +773,19 @@ mod tests {
             registry.snapshot(41, WAITSET_MAX_INTERESTS).unwrap(),
             vec![interest(5, 102)]
         );
+    }
+
+    #[test]
+    fn epoll_registry_has_one_service_lifetime_until_final_retire() {
+        let mut registry = WaitSetRegistry::default();
+        registry.create(73).unwrap();
+        assert!(registry.snapshot(73, 1).is_ok());
+        registry.retire(73).unwrap();
+        assert_eq!(
+            registry.snapshot(73, 1),
+            Err(WaitSetRegistryError::NotFound)
+        );
+        assert_eq!(registry.retire(73), Err(WaitSetRegistryError::NotFound));
     }
 
     #[test]

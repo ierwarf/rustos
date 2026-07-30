@@ -970,7 +970,7 @@ fn start_dvm_ingestion_worker(queue: SharedInputQueue, log_state: Arc<DvmIngress
                     nonempty_batches = nonempty_batches.saturating_add(1);
                 }
                 let report_progress = drained != 0
-                    && (nonempty_batches <= 8 || total_drained >= next_progress_report);
+                    && (nonempty_batches == 1 || total_drained >= next_progress_report); // First proof, then interval-bound to avoid debugcon boot serialization.
                 if report_progress {
                     debug_line(&format!(
                         "inputd: DVM transport progress records={total_drained} batch={drained} batch_seq={nonempty_batches} stage=decoded"

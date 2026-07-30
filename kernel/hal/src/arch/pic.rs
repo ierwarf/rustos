@@ -2,6 +2,7 @@ use lazy_static::lazy_static;
 use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
 use pic8259::ChainedPics;
 use x86_64::instructions::interrupts;
+use x86_64::instructions::port::Port;
 
 pub const PIC_1_OFFSET: u8 = 0x20;
 pub const PIC_2_OFFSET: u8 = 0x28;
@@ -9,6 +10,9 @@ pub const PIC_2_OFFSET: u8 = 0x28;
 const MAX_IRQ: u8 = 15;
 const CASCADE_IRQ: u8 = 2;
 const ALL_IRQS_MASKED: u8 = u8::MAX;
+const PIC_1_COMMAND_PORT: u16 = 0x20;
+const PIC_2_COMMAND_PORT: u16 = 0xa0;
+const END_OF_INTERRUPT: u8 = 0x20;
 
 lazy_static! {
     pub static ref PICS: TrackedSpinLock<ChainedPics, { LockClass::LegacyPic as u8 }> =
@@ -72,7 +76,19 @@ pub fn send_eoi(interrupt_vector: u8) {
         );
     }
 
+    assert_eq!(
+        nucleus_core::util::lockdep::current_cpu_index(),
+        0,
+        "legacy PIC interrupt routed to non-BSP CPU"
+    );
+    // IRQ acknowledgement is a leaf hardware operation, not PIC policy
+    // mutation. Legacy PIC delivery is BSP-only, and x86 interrupt gates
+    // exclude same-CPU reentry, so taking the configuration spin lock here
+    // would only create an IRQ-to-process lock inversion.
     unsafe {
-        PICS.lock().notify_end_of_interrupt(interrupt_vector);
+        if interrupt_vector >= PIC_2_OFFSET {
+            Port::<u8>::new(PIC_2_COMMAND_PORT).write(END_OF_INTERRUPT);
+        }
+        Port::<u8>::new(PIC_1_COMMAND_PORT).write(END_OF_INTERRUPT);
     }
 }

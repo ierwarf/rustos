@@ -100,6 +100,8 @@ impl WaitQueue {
     }
 }
 
+// SAFETY: the raw-spin state plus scheduler-owned waiter handoff serializes
+// access to T, and the Send bound permits unique ownership to cross CPUs.
 unsafe impl<T: ?Sized + Send, const CLASS: u8> Send for KernelWaitLock<T, CLASS> {}
 unsafe impl<T: ?Sized + Send, const CLASS: u8> Sync for KernelWaitLock<T, CLASS> {}
 

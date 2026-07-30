@@ -18,7 +18,16 @@ pub mod windows;
 mod tests {
     use core::mem::size_of;
 
-    use super::{console, device, performance, syscall, ui};
+    use super::{console, device, performance, syscall, ui, windows};
+
+    #[test]
+    fn windows_topology_observation_keeps_reserved_fields_zero() {
+        let basic = windows::WindowsSystemBasicInformation::from_online_count(8);
+        assert_eq!(basic.reserved1, [0; 24]);
+        assert_eq!(basic.reserved2, [0; 4]);
+        assert_eq!(basic.number_of_processors, 8);
+        assert_eq!(basic.reserved3, [0; 7]);
+    }
 
     #[test]
     fn display_abi_layout_is_stable() {
@@ -83,6 +92,12 @@ mod tests {
             size_of::<syscall::RustosProcActivateBrokerArgs>() <= syscall::IPC_MAX_INLINE_BYTES
         );
         assert!(
+            size_of::<syscall::RustosProcActivateBatchBrokerArgs>()
+                <= syscall::IPC_MAX_INLINE_BYTES
+        );
+        assert!(size_of::<syscall::LoaderActivateBatchRequest>() <= syscall::IPC_MAX_INLINE_BYTES);
+        assert!(size_of::<syscall::LoaderActivateBatchResponse>() <= syscall::IPC_MAX_INLINE_BYTES);
+        assert!(
             size_of::<syscall::RustosIpcWaitServiceEndpointArgs>() <= syscall::IPC_MAX_INLINE_BYTES
         );
         assert!(
@@ -108,6 +123,7 @@ mod tests {
         assert_eq!(syscall::SYS_RUSTOS_IPC_RECV_WITH_SENDER, 0x5255_0038);
         assert_eq!(syscall::SYS_RUSTOS_IPC_WAIT_SERVICE_ENDPOINT, 0x5255_0039);
         assert_eq!(syscall::SYS_RUSTOS_PROC_ACTIVATE_BROKER, 0x5255_003a);
+        assert_eq!(syscall::SYS_RUSTOS_PROC_ACTIVATE_BATCH_BROKER, 0x5255_0047);
         assert_eq!(syscall::SYS_RUSTOS_ROOTD_WAIT_BROKER, 0x5255_003b);
         assert_eq!(syscall::SYS_RUSTOS_ROOTD_TERMINATE_BROKER, 0x5255_003c);
         assert!(
@@ -153,7 +169,7 @@ mod tests {
         assert_eq!(syscall::DEVMGRD_IOCTL_LINUX_TTY_TCSETSF, 0x5404);
         assert_eq!(syscall::DEVMGRD_IOCTL_LINUX_TTY_FIONREAD, 0x541b);
         assert_eq!(syscall::INPUTD_IPC_ABI_VERSION, 5);
-        assert_eq!(syscall::VFS_IPC_ABI_VERSION, 4);
+        assert_eq!(syscall::VFS_IPC_ABI_VERSION, 5);
         assert_eq!(syscall::VFS_IPC_OP_CURSOR_SETTLE, 24);
         assert_eq!(syscall::VFS_IPC_OP_CHECKPOINT_ACK, 25);
         assert_eq!(

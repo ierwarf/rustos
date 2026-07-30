@@ -24,6 +24,12 @@ use x86_64::instructions::{interrupts, tlb};
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::{PageTable, PageTableFlags};
 
+use kernel_hal::api::arch::tlb::{AddressSpaceMutationGuard, begin_address_space_mutation};
+
+mod atomic_user;
+mod rollback;
+use rollback::{rollback_external_user_pages, rollback_user_pages};
+
 use crate::memory::{kernel_vm, phys};
 
 const ENTRIES_PER_TABLE: usize = 512;
@@ -202,16 +208,17 @@ impl ProcessAddressSpace {
         self.regions
             .try_reserve(1)
             .map_err(|_| AddressSpaceError::OutOfFrames)?;
+        let mut mutation = begin_address_space_mutation(self.root_phys());
 
         for page_index in 0..page_count {
             let virt = page_addr(start, page_index)?;
             if self.translate_user(virt).is_some() {
-                rollback_user_pages(self, &mapped_pages);
+                rollback_user_pages(self, &mapped_pages, &mut mutation);
                 return Err(AddressSpaceError::AlreadyMapped);
             }
 
             let Some(frame_phys) = phys::alloc_frame() else {
-                rollback_user_pages(self, &mapped_pages);
+                rollback_user_pages(self, &mapped_pages, &mut mutation);
                 return Err(AddressSpaceError::OutOfFrames);
             };
 
@@ -221,7 +228,7 @@ impl ProcessAddressSpace {
 
             if let Err(err) = self.map_user_page(virt, frame_phys, page_flags) {
                 phys::free_frame(frame_phys);
-                rollback_user_pages(self, &mapped_pages);
+                rollback_user_pages(self, &mapped_pages, &mut mutation);
                 return Err(err);
             }
 
@@ -230,7 +237,7 @@ impl ProcessAddressSpace {
 
         for &(_, frame_phys) in &mapped_pages {
             if let Err(err) = track_owned_frame(&mut self.owned_frames, frame_phys) {
-                rollback_user_pages(self, &mapped_pages);
+                rollback_user_pages(self, &mapped_pages, &mut mutation);
                 return Err(err);
             }
         }
@@ -291,15 +298,16 @@ impl ProcessAddressSpace {
         self.regions
             .try_reserve(1)
             .map_err(|_| AddressSpaceError::OutOfFrames)?;
+        let mut mutation = begin_address_space_mutation(self.root_phys());
 
         for (page_index, frame_phys) in frames.iter().copied().enumerate() {
             let virt = page_addr(start, page_index)?;
             if self.translate_user(virt).is_some() {
-                rollback_external_user_pages(self, &mapped_pages);
+                rollback_external_user_pages(self, &mapped_pages, &mut mutation);
                 return Err(AddressSpaceError::AlreadyMapped);
             }
             if let Err(err) = self.map_user_page(virt, PhysAddr::new(frame_phys), page_flags) {
-                rollback_external_user_pages(self, &mapped_pages);
+                rollback_external_user_pages(self, &mapped_pages, &mut mutation);
                 return Err(err);
             }
             mapped_pages.push(virt);
@@ -348,6 +356,7 @@ impl ProcessAddressSpace {
             frames.push(phys.as_u64());
         }
 
+        let mut mutation = begin_address_space_mutation(self.root_phys());
         for page_index in 0..page_count {
             let virt = page_addr(start, page_index)?;
             let unmapped = self
@@ -355,6 +364,7 @@ impl ProcessAddressSpace {
                 .ok_or(AddressSpaceError::NotMapped)?;
             debug_assert_eq!(Some(unmapped.as_u64()), frames.get(page_index).copied());
         }
+        mutation.flush_before_reclaim();
 
         for frame_phys in frames {
             remove_owned_frame(&mut self.owned_frames, frame_phys)?;
@@ -383,6 +393,7 @@ impl ProcessAddressSpace {
             }
         }
 
+        let _mutation = begin_address_space_mutation(self.root_phys());
         for page_index in 0..page_count {
             let virt = page_addr(start, page_index)?;
             self.unmap_user_page(virt)
@@ -423,6 +434,7 @@ impl ProcessAddressSpace {
             return Err(AddressSpaceError::NotMapped);
         }
 
+        let _mutation = begin_address_space_mutation(self.root_phys());
         for page_index in 0..page_count {
             let virt = page_addr(start, page_index)?;
             self.protect_user_page(virt, page_flags)?;
@@ -931,6 +943,14 @@ impl Drop for ProcessAddressSpace {
             return;
         }
 
+        // Cross-CPU lifetime invariant: the scheduler/process retirement
+        // barrier must remove every remote owner before any page-table frame is
+        // reclaimed. A conservative global shootdown also removes translations
+        // cached before those CPUs switched roots; measured range/root-specific
+        // retirement can replace it later without weakening this ordering.
+        let reclaim_barrier =
+            kernel_hal::api::arch::tlb::begin_address_space_retirement(self.root_phys());
+        drop(reclaim_barrier);
         let (current_frame, _) = Cr3::read();
         if current_frame.start_address() == self.root_phys() {
             panic!("cannot drop the active process address space");
@@ -977,26 +997,6 @@ impl Drop for ProcessAddressSpace {
                 );
             }
         }
-    }
-}
-
-fn rollback_user_pages(space: &mut ProcessAddressSpace, pages: &[(VirtAddr, u64)]) {
-    for &(virt, frame_phys) in pages.iter().rev() {
-        let unmapped = space.unmap_user_page(virt);
-        if unmapped.map(|phys| phys.as_u64()) != Some(frame_phys) {
-            panic!("user page rollback mismatch");
-        }
-        if space.owned_frames.contains(&frame_phys) {
-            let removed = remove_owned_frame(&mut space.owned_frames, frame_phys);
-            debug_assert!(removed.is_ok());
-        }
-        phys::free_frame(PhysAddr::new(frame_phys));
-    }
-}
-
-fn rollback_external_user_pages(space: &mut ProcessAddressSpace, pages: &[VirtAddr]) {
-    for &virt in pages.iter().rev() {
-        let _ = space.unmap_user_page(virt);
     }
 }
 

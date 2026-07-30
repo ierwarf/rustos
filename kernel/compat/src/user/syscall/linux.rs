@@ -30,6 +30,7 @@ use debug_ops::*;
 use error_ops::*;
 use memory_ops::*;
 use mm_broker_ops::*;
+use proc_broker_ops::syscall_linux_rustos_proc_activate_batch_broker as proc_activate_batch;
 use proc_broker_ops::*;
 use scheduler_ops::*;
 use service_ops::*;
@@ -60,10 +61,11 @@ use rustos_user_abi::syscall::{
     NetdIpcResponse, PROCD_OP_EXECVE, PROCD_OP_EXECVEAT, PROCD_OP_FORK, PROCD_OP_RT_SIGACTION,
     PROCD_OP_RT_SIGPROCMASK, PROCD_OP_SELECT_SIGNAL, PROCD_OP_WAIT4, PROCD_PATH_CAPACITY,
     PROCD_SELECT_SIGNAL_HANDLER, PROCD_SELECT_SIGNAL_IGNORE, PROCD_SELECT_SIGNAL_NONE,
-    PROCD_SELECT_SIGNAL_STOP, PROCD_SELECT_SIGNAL_TERMINATE, ProcdIpcRequest, ProcdIpcResponse,
-    RustosIpcValidateServiceOwnerArgs, RustosIpcWaitServiceEndpointArgs, RustosUserRegisters,
-    SESSIOND_CONSOLE_READINESS_LIVE, SESSIOND_CONSOLE_READINESS_MASK,
-    SESSIOND_CONSOLE_READINESS_READY, SYS_RUSTOS_PROC_ACTIVATE_BROKER,
+    PROCD_SELECT_SIGNAL_STOP, PROCD_SELECT_SIGNAL_TERMINATE, PRODUCT_MILESTONE_INIT_IDENTITY_READY,
+    ProcdIpcRequest, ProcdIpcResponse, RustosIpcValidateServiceOwnerArgs,
+    RustosIpcWaitServiceEndpointArgs, RustosUserRegisters, SESSIOND_CONSOLE_READINESS_LIVE,
+    SESSIOND_CONSOLE_READINESS_MASK, SESSIOND_CONSOLE_READINESS_READY,
+    SYS_RUSTOS_PROC_ACTIVATE_BATCH_BROKER, SYS_RUSTOS_PROC_ACTIVATE_BROKER,
     SYS_RUSTOS_PROC_CANCEL_EXEC_BROKER, SYS_RUSTOS_PROC_SET_WINDOWS_RUNTIME_BROKER,
     SYS_RUSTOS_SCHED_DEMOTE_SELF, SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_LINUX_ACCEPT,
     SYSCALL_OFFLOAD_OP_LINUX_BIND, SYSCALL_OFFLOAD_OP_LINUX_BRK, SYSCALL_OFFLOAD_OP_LINUX_CLOSE,
@@ -80,26 +82,27 @@ use rustos_user_abi::syscall::{
     SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET, SYSCALL_OFFLOAD_OP_LINUX_PRLIMIT64,
     SYSCALL_OFFLOAD_OP_LINUX_RECVFROM, SYSCALL_OFFLOAD_OP_LINUX_RECVMSG,
     SYSCALL_OFFLOAD_OP_LINUX_RSEQ, SYSCALL_OFFLOAD_OP_LINUX_SCHED_GETAFFINITY,
-    SYSCALL_OFFLOAD_OP_LINUX_SENDMSG, SYSCALL_OFFLOAD_OP_LINUX_SENDTO,
-    SYSCALL_OFFLOAD_OP_LINUX_SET_ROBUST_LIST, SYSCALL_OFFLOAD_OP_LINUX_SETGID,
-    SYSCALL_OFFLOAD_OP_LINUX_SETPGID, SYSCALL_OFFLOAD_OP_LINUX_SETSID,
-    SYSCALL_OFFLOAD_OP_LINUX_SETSOCKOPT, SYSCALL_OFFLOAD_OP_LINUX_SETUID,
-    SYSCALL_OFFLOAD_OP_LINUX_SHUTDOWN, SYSCALL_OFFLOAD_OP_LINUX_SOCKET,
-    SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR, SYSCALL_OFFLOAD_OP_LINUX_UMASK,
-    SYSCALL_OFFLOAD_OP_LINUX_UNAME, SYSCALL_OFFLOAD_PAYLOAD_CAPACITY, VFS_CURSOR_SETTLE_CANCEL,
-    VFS_CURSOR_SETTLE_COMMIT, VFS_IPC_ABI_VERSION, VFS_IPC_HANDLE_KIND_DEVICE,
-    VFS_IPC_HANDLE_KIND_DIR, VFS_IPC_HANDLE_KIND_FILE, VFS_IPC_OP_ACCESS, VFS_IPC_OP_CHDIR,
-    VFS_IPC_OP_CHECKPOINT_ACK, VFS_IPC_OP_CLOSE, VFS_IPC_OP_CURSOR_SETTLE, VFS_IPC_OP_FCNTL,
-    VFS_IPC_OP_FSTAT, VFS_IPC_OP_FTRUNCATE, VFS_IPC_OP_GETCWD, VFS_IPC_OP_GETDENTS64,
-    VFS_IPC_OP_LSEEK, VFS_IPC_OP_MKDIR, VFS_IPC_OP_MOUNT, VFS_IPC_OP_NEWFSTATAT, VFS_IPC_OP_OPENAT,
+    SYSCALL_OFFLOAD_OP_LINUX_SCHED_SETAFFINITY, SYSCALL_OFFLOAD_OP_LINUX_SENDMSG,
+    SYSCALL_OFFLOAD_OP_LINUX_SENDTO, SYSCALL_OFFLOAD_OP_LINUX_SET_ROBUST_LIST,
+    SYSCALL_OFFLOAD_OP_LINUX_SETGID, SYSCALL_OFFLOAD_OP_LINUX_SETPGID,
+    SYSCALL_OFFLOAD_OP_LINUX_SETSID, SYSCALL_OFFLOAD_OP_LINUX_SETSOCKOPT,
+    SYSCALL_OFFLOAD_OP_LINUX_SETUID, SYSCALL_OFFLOAD_OP_LINUX_SHUTDOWN,
+    SYSCALL_OFFLOAD_OP_LINUX_SOCKET, SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR,
+    SYSCALL_OFFLOAD_OP_LINUX_UMASK, SYSCALL_OFFLOAD_OP_LINUX_UNAME,
+    SYSCALL_OFFLOAD_PAYLOAD_CAPACITY, VFS_CURSOR_SETTLE_CANCEL, VFS_CURSOR_SETTLE_COMMIT,
+    VFS_IPC_ABI_VERSION, VFS_IPC_HANDLE_KIND_DEVICE, VFS_IPC_HANDLE_KIND_DIR,
+    VFS_IPC_HANDLE_KIND_FILE, VFS_IPC_OP_ACCESS, VFS_IPC_OP_CHDIR, VFS_IPC_OP_CHECKPOINT_ACK,
+    VFS_IPC_OP_CLOSE, VFS_IPC_OP_CURSOR_SETTLE, VFS_IPC_OP_FCNTL, VFS_IPC_OP_FSTAT,
+    VFS_IPC_OP_FTRUNCATE, VFS_IPC_OP_GETCWD, VFS_IPC_OP_GETDENTS64, VFS_IPC_OP_LSEEK,
+    VFS_IPC_OP_MKDIR, VFS_IPC_OP_MOUNT, VFS_IPC_OP_NEWFSTATAT, VFS_IPC_OP_OPENAT,
     VFS_IPC_OP_POLL_QUERY, VFS_IPC_OP_PREAD64, VFS_IPC_OP_READ, VFS_IPC_OP_READLINKAT,
     VFS_IPC_OP_STATX, VFS_IPC_OP_UMOUNT2, VFS_IPC_OP_UNLINKAT, VFS_IPC_OP_WRITE,
     VFS_IPC_PATH_CAPACITY, VFS_IPC_PAYLOAD_CAPACITY, VFS_IPC_REQUEST_PAYLOAD_CAPACITY,
     VFS_POLL_QUERY_EPOLL_CREATE, VFS_POLL_QUERY_EPOLL_CTL, VFS_POLL_QUERY_EPOLL_PURGE_OBJECT,
-    VFS_POLL_QUERY_EPOLL_REF, VFS_POLL_QUERY_EPOLL_SNAPSHOT, VFS_POLL_QUERY_EPOLL_UNREF,
-    VFS_POLL_QUERY_POLL, VfsIpcRequest, VfsIpcResponse, WAITSET_ABI_VERSION,
-    WAITSET_GLOBAL_OBJECT_ID, WAITSET_MAX_INTERESTS, WAITSET_PROVIDER_INPUTD, WAITSET_PROVIDER_MAX,
-    WAITSET_PROVIDER_NETD, WAITSET_PROVIDER_SESSIOND, WAITSET_PROVIDER_VFSD, WaitSetInterestWire,
+    VFS_POLL_QUERY_EPOLL_RETIRE, VFS_POLL_QUERY_EPOLL_SNAPSHOT, VFS_POLL_QUERY_POLL, VfsIpcRequest,
+    VfsIpcResponse, WAITSET_ABI_VERSION, WAITSET_GLOBAL_OBJECT_ID, WAITSET_MAX_INTERESTS,
+    WAITSET_PROVIDER_INPUTD, WAITSET_PROVIDER_MAX, WAITSET_PROVIDER_NETD,
+    WAITSET_PROVIDER_SESSIOND, WAITSET_PROVIDER_VFSD, WaitSetInterestWire,
 };
 
 use super::SyscallFrame;
@@ -190,6 +193,7 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
             syscall_linux_rustos_proc_commit_broker(frame.rdi)
         }
         SYS_RUSTOS_PROC_ACTIVATE_BROKER => syscall_linux_rustos_proc_activate_broker(frame.rdi),
+        SYS_RUSTOS_PROC_ACTIVATE_BATCH_BROKER => proc_activate_batch(frame.rdi),
         linux_abi::SYS_RUSTOS_PROC_VALIDATE_DEFERRED_SPAWN_BROKER => {
             syscall_linux_rustos_proc_validate_deferred_spawn_broker(frame.rdi)
         }
@@ -314,6 +318,9 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
         }
         linux_abi::SYS_SCHED_GETAFFINITY => {
             syscall_linux_syscalld_sched_getaffinity(frame.rdi, frame.rsi, frame.rdx)
+        }
+        linux_abi::SYS_SCHED_SETAFFINITY => {
+            syscall_linux_syscalld_sched_setaffinity(frame.rdi, frame.rsi, frame.rdx)
         }
         linux_abi::SYS_GETUID => syscall_linux_syscalld_id_getter(SYSCALL_OFFLOAD_OP_LINUX_GETUID),
         linux_abi::SYS_GETGID => syscall_linux_syscalld_id_getter(SYSCALL_OFFLOAD_OP_LINUX_GETGID),
@@ -567,27 +574,7 @@ fn linux_fault_wait_status(vector: u8) -> i32 {
 }
 
 #[cfg(test)]
-mod process_termination_tests {
-    use super::{linux_fault_wait_status, should_record_process_exit};
-
-    #[test]
-    fn single_thread_exit_is_never_invented_from_missing_process_state() {
-        assert!(should_record_process_exit(true, None));
-        assert!(should_record_process_exit(false, Some(1)));
-        assert!(!should_record_process_exit(false, Some(2)));
-        assert!(!should_record_process_exit(false, None));
-    }
-
-    #[test]
-    fn x86_user_faults_have_linux_wait_signal_status() {
-        assert_eq!(linux_fault_wait_status(0), 8);
-        assert_eq!(linux_fault_wait_status(3), 5);
-        assert_eq!(linux_fault_wait_status(6), 4);
-        assert_eq!(linux_fault_wait_status(7), 11);
-        assert_eq!(linux_fault_wait_status(11), 7);
-        assert_eq!(linux_fault_wait_status(14), 11);
-    }
-}
+mod process_termination_tests;
 
 #[derive(Clone, Copy)]
 enum VfsDupMode {

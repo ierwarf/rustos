@@ -4,7 +4,8 @@ EXTENDS Naturals
 (*******************************************************************************
 Models the two distinct SIMD/FPU lifetimes that coexist when a syscall blocks:
 
-  * the exact userspace image captured at the syscall trust boundary; and
+  * the exact userspace image captured at the assembly syscall trust boundary,
+    before any compiler-generated Rust prologue may use SIMD scratch; and
   * the scheduler slot holding a suspended kernel continuation's SIMD scratch.
 
 Preemption may freely replace the scheduler image but cannot alter the syscall

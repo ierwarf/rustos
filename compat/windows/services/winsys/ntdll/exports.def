@@ -7,9 +7,14 @@ EXPORTS
     NtGetConsoleMode
     NtProtectVirtualMemory
     NtQueryVirtualMemory
+    NtQuerySystemInformation
     NtReadFile
     NtSetConsoleMode
     NtWriteFile
+    RtlRustosGetCurrentProcessorNumber
+    RtlRustosQueryProcessAffinity
+    RtlRustosSetProcessAffinity
+    RtlRustosSetThreadAffinity
     RtlAllocateHeap
     RtlDeleteCriticalSection
     RtlEnterCriticalSection

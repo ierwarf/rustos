@@ -758,6 +758,7 @@ version = "0.1.0"
 dependencies = [
  "boot-protocol",
  "buddy_system_allocator",
+ "kernel-hal",
  "kernel-lowlevel",
  "nucleus-core",
  "object",

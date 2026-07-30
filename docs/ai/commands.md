@@ -274,7 +274,11 @@ fallback.
   marker, retains peer/geometry/first-completion admission, and fails
   immediately if a flush-success marker appears.
 - The default marker is `rootd: core services ready, spawning initd via loaderd`;
-  repeat `--expect <marker>` for each additional RustOS milestone.
+  its kernel-stamped `product-root-core-ready` record is equivalent. Because
+  the bounded observability channel may drop one contended record, the strictly
+  later kernel-stamped `product-init-identity-ready` milestone also proves this
+  gate: rootd cannot spawn initd before the core-ready transition. Repeat
+  `--expect <marker>` for each additional RustOS milestone.
 - `--dry-run` verifies DVM artifacts and prepares `build/kvm/` without
   launching QEMU. It creates missing log files but never truncates evidence
   from the preceding real run; only a new real launch rotates the active log
@@ -359,6 +363,17 @@ fallback.
   observed WayClick rate range, callback gap, and redraw maximum before the
   focused log paths. The range includes non-one-second startup windows; compare
   their elapsed time with later one-second windows before attributing a stall.
+- `--rustos-vcpus <1..=8>` selects the RustOS guest topology for SMP
+  qualification. The launcher rejects counts above one unless every compiled
+  scheduler, syscall, CPU-online, reschedule-IPI, TLB, robust-futex, and
+  per-CPU-clockevent prerequisite is admitted. This option selects a test
+  topology; it is not release evidence without the matching bounded run.
+- Iterative SMP debugging uses `bash formal/verify-smp-iteration.sh` followed
+  by `cargo xtask kvm-smoke --timeout 30 --rustos-vcpus <2|4|8>
+  --smp-iteration`. The exact-tree seal covers source conformance and the
+  bounded high-risk SMP model set. `--smp-iteration` rejects runs longer than
+  30 seconds and cannot be combined with FPS, recovery, or physical-GPU
+  acceptance. Remove it and use the full PR seal for any release claim.
 - A full-minute active proof uses
   `cargo xtask kvm-smoke --timeout 90 --gui-dvm-surfaces --min-ui-fps 55
   --ui-proof-windows 60`. The 90-second host deadline includes boot and

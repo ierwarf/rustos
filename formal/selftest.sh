@@ -154,6 +154,11 @@ formal/check-performance-contracts.sh
     exit 1
 }
 formal/check-rust-source-contracts.py
+[[ -x formal/check-smp-source-assumptions.py ]] || {
+    echo "SMP source-assumption checker is not executable" >&2
+    exit 1
+}
+formal/check-smp-source-assumptions.py
 [[ -x formal/check-kernel-policy-boundary.sh ]] || {
     echo "kernel policy boundary checker is not executable" >&2
     exit 1

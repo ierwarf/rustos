@@ -58,10 +58,10 @@ Do not reorder without reading `kernel/src/main.rs` and
   task-scoped waiter registries must join that cleanup boundary. The retirement
   value also freezes `clear_child_tid` and the Linux robust-list head/length so
   forced and exec-sibling cleanup does not depend on current-task state.
-  RustOS currently boots and schedules only the BSP. APIC-ID-indexed
-  diagnostics do not imply AP bring-up or SMP scheduling; adding SMP requires
-  explicit per-CPU scheduler/syscall state, CPU-online transitions, and an IPI
-  wake/reschedule protocol.
+  RustOS now boots admitted APs, publishes disjoint per-CPU scheduler/syscall
+  state, uses fixed reschedule/TLB vectors, and arms one local TSC-deadline
+  clockevent per AP. Commercial admission still requires compatibility
+  topology/affinity ABI plus complete 1/2/4/8 runtime and recovery evidence.
 - **Raw spin critical sections:** use
   `nucleus_core::util::lockdep::TrackedSpinLock` with one stable class per
   logical lock type. On the BSP boot image its guard increments the task

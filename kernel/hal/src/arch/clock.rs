@@ -101,6 +101,14 @@ pub fn current_source() -> Option<ClockSourceInfo> {
     }
 }
 
+pub fn invariant_tsc_frequency_hz() -> Option<u64> {
+    // ORDERING: Acquire observes the frequency fields published before the
+    // invariant-TSC source selector's Release store.
+    (SOURCE.load(Ordering::Acquire) == SOURCE_INVARIANT_TSC)
+        .then(|| TSC_HZ.load(Ordering::Acquire))
+        .filter(|frequency| *frequency != 0)
+}
+
 pub fn monotonic_nanos() -> u64 {
     match SOURCE.load(Ordering::Acquire) {
         SOURCE_INVARIANT_TSC => {

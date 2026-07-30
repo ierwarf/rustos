@@ -79,6 +79,8 @@ required_keys = {
         "size_statx",
     },
     "windows": {
+        "current_process_pseudo",
+        "current_thread_pseudo",
         "error_invalid_handle",
         "image_file_machine_amd64",
         "image_nt_optional_hdr64_magic",

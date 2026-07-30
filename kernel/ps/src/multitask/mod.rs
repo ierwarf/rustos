@@ -1,6 +1,9 @@
 mod context;
+mod cpu_local;
 mod current;
+mod deferred_wake;
 mod irq;
+mod process_state_lock;
 mod process_table;
 mod retirement;
 mod scheduler;
@@ -8,7 +11,7 @@ mod spawn;
 
 use core::{
     cell::Cell,
-    mem, ptr,
+    mem,
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -17,7 +20,10 @@ use x86_64::instructions::{hlt, interrupts};
 use x86_64::registers::rflags::RFlags;
 use x86_64::registers::segmentation::{CS, SS, Segment};
 
-use self::scheduler::Scheduler;
+use self::cpu_local::{
+    current_cpu_task_slot_admitted, publish_cpu_current_task, scheduler_mut, scheduler_ref,
+    task_slot_is_running,
+};
 use crate::io::session::ConsoleSessionHandle;
 use crate::memory::paging::ProcessAddressSpace;
 use crate::user::abi::UserAbi;
@@ -29,27 +35,31 @@ use crate::user::process_state::{
 };
 
 pub use self::current::{
-    activate_suspended_user_task, any_user_process_state, arm_block_current_task,
-    cancel_block_current_task, complete_retired_task_cleanup, current_console_session,
-    current_linux_thread_state, current_task_id, current_user_abi, current_user_address_space,
-    current_user_id, current_user_log_ids, current_user_process_id,
+    activate_suspended_user_task, activate_suspended_user_tasks, any_user_process_state,
+    arm_block_current_task, cancel_block_current_task, complete_retired_task_cleanup,
+    current_console_session, current_linux_thread_state, current_task_id, current_user_abi,
+    current_user_address_space, current_user_id, current_user_log_ids, current_user_process_id,
     current_user_process_thread_count, current_user_snapshot, current_user_stack_state,
     current_user_thread_id, current_user_wait_binding, demote_current_user_task_to_user_class,
     exec_current_user_process, exec_user_process_by_pid, exit_current_user_process,
     exit_current_user_task, halt_current_retired_task, inherit_ipc_priority,
     inherit_ipc_priority_for_process, is_user_process_exiting, is_user_task_alive,
-    linux_thread_snapshot_by_ids, mark_user_process_exiting, mark_user_process_exiting_once,
-    next_retired_task_cleanup, note_process_exit_status, parent_process_id_of,
-    queue_linux_process_sigchld, queue_linux_signal, release_ipc_priorities_for_process,
-    release_ipc_priority, retain_current_user_process_state, retire_current_user_task_due_to_fault,
-    service_deferred_work, set_next_latency_pick_hint, set_next_pick_hint,
-    set_next_process_pick_hint, set_next_spawn_pick_hint, stop_current_linux_process,
-    terminate_user_process, terminate_user_task, user_log_ids_for_task, wait_for_child, wake_task,
-    wake_user_task, with_current_mm, with_current_process_credentials, with_current_process_state,
-    with_current_process_state_mut, with_current_user_linux_state_mut,
+    linux_task_affinity, linux_thread_snapshot_by_ids, mark_user_process_exiting,
+    mark_user_process_exiting_once, next_retired_task_cleanup, note_process_exit_status,
+    parent_process_id_of, queue_linux_process_sigchld, queue_linux_signal,
+    release_ipc_priorities_for_process, release_ipc_priority, retain_current_user_process_state,
+    retire_current_user_task_due_to_fault, service_deferred_work, set_linux_task_affinity,
+    set_next_latency_pick_hint, set_next_pick_hint, set_next_process_pick_hint,
+    set_next_spawn_pick_hint, set_next_synchronous_pick_hint, set_windows_current_thread_affinity,
+    set_windows_process_affinity, stop_current_linux_process, terminate_user_process,
+    terminate_user_task, user_log_ids_for_task, wait_for_child, wake_task, wake_user_task,
+    windows_process_affinity, with_current_mm, with_current_process_credentials,
+    with_current_process_state, with_current_process_state_mut, with_current_user_linux_state_mut,
     with_current_user_process_and_linux_thread_state_mut, with_current_user_process_state,
     with_current_user_process_state_mut, with_process_state_by_pid, with_process_state_by_pid_mut,
 };
+pub use self::retirement::UserFaultDisposition;
+pub use self::scheduler::{AffinityCommit, AffinityError, ProcessAffinitySnapshot};
 
 /// Upper bound for simultaneously schedulable task identities. Cross-crate
 /// bounded registries must derive capacity from this value rather than copy it.
@@ -67,7 +77,7 @@ pub use self::spawn::{
     SyscallUserSimdSnapshot, spawn_kernel_process, spawn_user_process,
     spawn_user_process_state_with_parent, spawn_user_process_suspended,
     spawn_user_process_with_parent, spawn_user_process_without_deferred_reschedule,
-    spawn_user_thread_suspended, start,
+    spawn_user_thread_suspended, start, start_secondary_cpu,
 };
 
 const MAIN_THREAD_SLICE_MICROS: u64 = 1_000;
@@ -78,10 +88,11 @@ pub const DEFAULT_USER_TASK_WEIGHT_MICROS: u64 = 100;
 const USER_TASK_EXEC_PATH_CAPACITY: usize = 192;
 const USER_STACK_PAGE_SIZE: u64 = 4096;
 
-static mut SCHEDULER: Scheduler = Scheduler::new();
 static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(0);
-static DEFERRED_RESCHEDULE_REQUESTED: AtomicU64 = AtomicU64::new(0);
-static USER_RETURN_RESCHEDULE_ARMED: AtomicU64 = AtomicU64::new(0);
+static DEFERRED_RESCHEDULE_REQUESTED: [AtomicU64; nucleus_core::util::lockdep::MAX_TRACKED_CPUS] =
+    [const { AtomicU64::new(0) }; nucleus_core::util::lockdep::MAX_TRACKED_CPUS];
+static USER_RETURN_RESCHEDULE_ARMED: [AtomicU64; nucleus_core::util::lockdep::MAX_TRACKED_CPUS] =
+    [const { AtomicU64::new(0) }; nucleus_core::util::lockdep::MAX_TRACKED_CPUS];
 
 fn allocate_task_id_from(counter: &AtomicU64) -> Option<u64> {
     counter
@@ -93,16 +104,6 @@ fn allocate_task_id_from(counter: &AtomicU64) -> Option<u64> {
 
 fn allocate_task_id() -> Option<u64> {
     allocate_task_id_from(&NEXT_TASK_ID)
-}
-
-#[inline(always)]
-unsafe fn scheduler_mut() -> &'static mut Scheduler {
-    unsafe { &mut *ptr::addr_of_mut!(SCHEDULER) }
-}
-
-#[inline(always)]
-unsafe fn scheduler_ref() -> &'static Scheduler {
-    unsafe { &*ptr::addr_of!(SCHEDULER) }
 }
 
 fn scheduler_initialized() -> bool {
@@ -117,6 +118,7 @@ pub fn mark_root_idle() {
     interrupts::without_interrupts(|| unsafe {
         scheduler_mut().mark_root_idle();
     });
+    crate::debug::record_milestone(crate::debug::LogCategory::Sched, "smp-cpu-idle-enter", 0, 1);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -490,11 +492,4 @@ extern "C" fn task_entry_trampoline() -> ! {
 
     (task.entry)(task.id);
     current::exit_current_task();
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UserFaultDisposition {
-    Resumed,
-    Retired,
-    Unhandled,
 }

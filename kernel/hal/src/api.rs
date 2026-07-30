@@ -41,6 +41,18 @@ pub mod arch {
     pub mod simd {
         pub use crate::arch::simd::*;
     }
+
+    pub mod tlb {
+        pub use crate::arch::tlb_shootdown::{
+            AddressSpaceMutationGuard, activate_address_space, admit_current_cpu_online,
+            assert_address_space_inactive, begin_address_space_mutation,
+            begin_address_space_retirement, begin_global_mapping_mutation,
+        };
+    }
+
+    pub mod timer {
+        pub use crate::arch::timer::{arm_next_tick, init_current_cpu};
+    }
 }
 
 pub mod boot {
@@ -50,12 +62,17 @@ pub mod boot {
         crate::arch::gdt::init();
     }
 
+    pub fn init_gdt_for_cpu(logical_index: usize) {
+        crate::arch::gdt::init_for_cpu(logical_index);
+    }
+
     pub fn init_idt() {
         crate::arch::idt::init();
     }
 
     pub fn init_acpi(boot_info_ptr: *const BootInfo) {
         crate::arch::acpi::init(boot_info_ptr);
+        crate::arch::smp::stage_discovered_topology();
     }
 
     pub fn init_clocksource() -> Option<crate::arch::clock::ClockSourceInfo> {
@@ -80,6 +97,60 @@ pub mod boot {
 }
 
 pub mod cpu {
+    pub use crate::arch::acpi::{CpuDescriptor, CpuTopology, MAX_SUPPORTED_CPUS};
+    pub use crate::arch::smp::{CpuLifecycleSnapshot, CpuLifecycleState};
+
+    pub fn topology() -> Option<CpuTopology> {
+        crate::arch::acpi::cpu_topology()
+    }
+
+    pub fn discovered_count() -> usize {
+        crate::arch::smp::cpu_count()
+    }
+
+    pub fn admitted_online_mask() -> u64 {
+        crate::arch::smp::admitted_online_mask()
+    }
+
+    pub fn lifecycle_snapshot(logical_index: u8) -> Option<CpuLifecycleSnapshot> {
+        crate::arch::smp::snapshot(logical_index)
+    }
+
+    pub fn transition_lifecycle(
+        logical_index: u8,
+        expected_generation: u64,
+        next: CpuLifecycleState,
+    ) {
+        crate::arch::smp::transition(logical_index, expected_generation, next);
+    }
+
+    pub fn ap_bootstrap_stack_top(logical_index: u8, expected_generation: u64) -> u64 {
+        crate::arch::smp::ap_bootstrap_stack_top(logical_index, expected_generation)
+    }
+
+    pub fn ap_bootstrap_stack_bounds(logical_index: u8, expected_generation: u64) -> (u64, u64) {
+        crate::arch::smp::ap_bootstrap_stack_bounds(logical_index, expected_generation)
+    }
+
+    pub fn local_apic_physical_base() -> Option<u64> {
+        crate::arch::msi::physical_base()
+    }
+
+    pub fn configure_local_apic_mmio(physical_base: u64, virtual_base: u64) -> bool {
+        crate::arch::msi::configure_mmio(physical_base, virtual_base)
+    }
+
+    pub fn init_local_apic() -> bool {
+        crate::arch::msi::init()
+    }
+
+    pub fn start_application_processor(
+        apic_id: u32,
+        startup_vector: u8,
+    ) -> Result<(), crate::arch::msi::StartupIpiError> {
+        crate::arch::msi::start_application_processor(apic_id, startup_vector)
+    }
+
     pub fn init_simd() {
         crate::arch::simd::init();
     }
@@ -109,12 +180,18 @@ pub mod interrupts {
 
     pub fn init_pic() {
         crate::arch::pic::init();
-        let _ = crate::arch::msi::init();
+        assert!(
+            crate::arch::msi::init(),
+            "local APIC initialization requires one admitted uncacheable MMIO mapping"
+        );
         kernel_lowlevel::interrupts::register_timer_interrupt_dispatch(
             super::timer_interrupt_default_dispatch,
         );
         kernel_lowlevel::interrupts::register_software_schedule_interrupt_dispatch(
             super::software_schedule_interrupt_default_dispatch,
+        );
+        kernel_lowlevel::interrupts::register_reschedule_ipi_interrupt_dispatch(
+            super::reschedule_ipi_interrupt_default_dispatch,
         );
     }
 
@@ -184,5 +261,12 @@ extern "C" fn rtc_interrupt_default_dispatch(context_ptr: *mut SavedContext) -> 
 extern "C" fn software_schedule_interrupt_default_dispatch(
     context_ptr: *mut SavedContext,
 ) -> *mut SavedContext {
+    context_ptr
+}
+
+extern "C" fn reschedule_ipi_interrupt_default_dispatch(
+    context_ptr: *mut SavedContext,
+) -> *mut SavedContext {
+    crate::arch::msi::local_apic_eoi();
     context_ptr
 }

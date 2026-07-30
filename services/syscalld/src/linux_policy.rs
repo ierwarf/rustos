@@ -24,14 +24,13 @@ use core::mem::size_of;
 use rustos_user_abi::syscall::{
     LinuxRlimit, LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse, LinuxUtsName,
     RustosMmBrokerArgs, RustosMmFdBrokerResult, RustosMmLayoutBrokerResult,
-    RustosMmMapBrokerResult, LINUX_CPUSET_BYTES, LINUX_DEFAULT_STACK_RLIMIT_BYTES,
-    LINUX_RLIMIT_SIZE, MM_BROKER_ABI_VERSION, MM_BROKER_FD_KIND_DEVICE,
-    MM_BROKER_FD_KIND_DISPLAY_SURFACE, MM_BROKER_FD_KIND_FILE, MM_BROKER_FD_KIND_MEMFD,
-    MM_BROKER_OP_DESCRIBE_FD, MM_BROKER_OP_MAP_ANON, MM_BROKER_OP_MAP_DEVICE_SHARED,
-    MM_BROKER_OP_MAP_FILE_PRIVATE, MM_BROKER_OP_MAP_MEMFD_SHARED, MM_BROKER_OP_PROTECT,
-    MM_BROKER_OP_QUERY_LAYOUT, MM_BROKER_OP_UNMAP, PROC_BROKER_USER_SPACE_BASE,
-    PROC_BROKER_USER_SPACE_END_EXCLUSIVE, SYSCALL_OFFLOAD_PAYLOAD_CAPACITY,
-    SYS_RUSTOS_ENTROPY_BROKER, SYS_RUSTOS_MM_BROKER,
+    RustosMmMapBrokerResult, LINUX_DEFAULT_STACK_RLIMIT_BYTES, LINUX_RLIMIT_SIZE,
+    MM_BROKER_ABI_VERSION, MM_BROKER_FD_KIND_DEVICE, MM_BROKER_FD_KIND_DISPLAY_SURFACE,
+    MM_BROKER_FD_KIND_FILE, MM_BROKER_FD_KIND_MEMFD, MM_BROKER_OP_DESCRIBE_FD,
+    MM_BROKER_OP_MAP_ANON, MM_BROKER_OP_MAP_DEVICE_SHARED, MM_BROKER_OP_MAP_FILE_PRIVATE,
+    MM_BROKER_OP_MAP_MEMFD_SHARED, MM_BROKER_OP_PROTECT, MM_BROKER_OP_QUERY_LAYOUT,
+    MM_BROKER_OP_UNMAP, PROC_BROKER_USER_SPACE_BASE, PROC_BROKER_USER_SPACE_END_EXCLUSIVE,
+    SYSCALL_OFFLOAD_PAYLOAD_CAPACITY, SYS_RUSTOS_ENTROPY_BROKER, SYS_RUSTOS_MM_BROKER,
 };
 use spin::Mutex;
 
@@ -204,27 +203,6 @@ pub(crate) fn handle_prlimit64(
         response.status = 0;
         response.payload_len = 0;
     }
-}
-
-pub(crate) fn handle_sched_getaffinity(
-    request: &LinuxSyscallOffloadRequest,
-    response: &mut LinuxSyscallOffloadResponse,
-) {
-    let target_pid = request.dirfd;
-    let requested_len = request.flags as usize;
-    if requested_len == 0 {
-        response.status = errno::EINVAL;
-        return;
-    }
-    if target_pid != 0 && target_pid != request.pid {
-        response.status = errno::ESRCH;
-        return;
-    }
-    let payload_len = requested_len.min(LINUX_CPUSET_BYTES);
-    response.payload.fill(0);
-    response.payload[0] = 0x1;
-    response.status = 0;
-    response.payload_len = payload_len as u32;
 }
 
 pub(crate) fn handle_id(

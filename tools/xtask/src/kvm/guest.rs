@@ -3,45 +3,37 @@
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RustosSmpReadiness {
     rustos_vcpus: u8,
-    per_cpu_scheduler: bool,
-    per_cpu_syscall_state: bool,
-    cpu_online_state_machine: bool,
-    reschedule_ipi: bool,
-    tlb_shootdown: bool,
-    atomic_robust_futex_cleanup: bool,
 }
 
 const RUSTOS_SMP_READINESS: RustosSmpReadiness = RustosSmpReadiness {
     rustos_vcpus: 1,
-    per_cpu_scheduler: false,
-    per_cpu_syscall_state: false,
-    cpu_online_state_machine: false,
-    reschedule_ipi: false,
-    tlb_shootdown: false,
-    atomic_robust_futex_cleanup: false,
 };
 
 impl RustosSmpReadiness {
-    const fn prerequisites_complete(self) -> bool {
-        self.per_cpu_scheduler
-            && self.per_cpu_syscall_state
-            && self.cpu_online_state_machine
-            && self.reschedule_ipi
-            && self.tlb_shootdown
-            && self.atomic_robust_futex_cleanup
-    }
-
-    fn validate(self) -> Result<()> {
+    fn validate(
+        self,
+        evidence: Option<&crate::formal_contracts::ValidatedSmpLaunchEvidence>,
+    ) -> Result<()> {
         if self.rustos_vcpus == 0 {
             bail!("RustOS KVM vCPU count must be nonzero");
         }
-        if self.rustos_vcpus > 1 && !self.prerequisites_complete() {
+        if self.rustos_vcpus > 1 && evidence.is_none() {
             bail!(
-                "RustOS SMP topology requested before per-CPU scheduler/syscall state, CPU-online, reschedule IPI, TLB shootdown, and atomic robust-futex cleanup are complete"
+                "RustOS SMP topology requires a fresh versioned PR verification seal bound to the exact source tree"
             );
         }
         Ok(())
     }
+}
+
+fn parse_rustos_vcpus(value: String) -> Result<u8> {
+    let count = value
+        .parse::<u8>()
+        .with_context(|| format!("invalid --rustos-vcpus value: {value}"))?;
+    if !(1..=8).contains(&count) {
+        bail!("--rustos-vcpus must be in 1..=8, got {count}");
+    }
+    Ok(count)
 }
 
 // The paired launch keeps both guest, transport, display, and relay-gate
@@ -60,7 +52,14 @@ fn spawn_guests(
     input_doorbell: &IvshmemDoorbellServer,
     input_relay_gate: Arc<AtomicBool>,
 ) -> Result<(Child, Child)> {
-    let rustos = spawn_rustos_guest(qemu, config, layout, false)?;
+    let rustos = spawn_rustos_guest(
+        qemu,
+        config,
+        layout,
+        options.rustos_vcpus,
+        options.smp_iteration,
+        false,
+    )?;
 
     if let Err(error) = input_doorbell.wait_for_peer_count(1, DVM_INPUT_FIRST_PEER_TIMEOUT) {
         let mut rustos = rustos;
@@ -109,9 +108,24 @@ fn spawn_rustos_guest(
     qemu: &Path,
     config: &Config,
     layout: &KvmLayout,
+    rustos_vcpus: u8,
+    smp_iteration: bool,
     append_logs: bool,
 ) -> Result<Child> {
-    RUSTOS_SMP_READINESS.validate()?;
+    let readiness = RustosSmpReadiness {
+        rustos_vcpus,
+        ..RUSTOS_SMP_READINESS
+    };
+    let evidence_profile = if smp_iteration { "smp-iteration" } else { "pr" };
+    let smp_evidence = (rustos_vcpus > 1)
+        .then(|| {
+            crate::formal_contracts::validate_smp_launch_evidence(
+                &config.root_dir,
+                evidence_profile,
+            )
+        })
+        .transpose()?;
+    readiness.validate(smp_evidence.as_ref())?;
     if layout.rustos_monitor.exists() {
         fs::remove_file(&layout.rustos_monitor).with_context(|| {
             format!(
@@ -133,10 +147,10 @@ fn spawn_rustos_guest(
             "2048M,maxmem=3G,slots=2",
             "-smp",
         ])
-        // RustOS currently schedules all user work on the BSP. The readiness
-        // contract above refuses a second vCPU until every AP prerequisite is
-        // explicit rather than silently booting an unused processor.
-        .arg(RUSTOS_SMP_READINESS.rustos_vcpus.to_string())
+        // The readiness contract above refuses a requested topology until all
+        // AP scheduler, syscall, lifetime, IPI, TLB, futex, and timer
+        // prerequisites are explicit. Runtime qualification remains separate.
+        .arg(rustos_vcpus.to_string())
         .arg("-bios")
         .arg(&config.ovmf_path)
         .arg("-drive")
@@ -554,7 +568,9 @@ fn wait_for_parallel_boot(
         let rustos_ready = options
             .expected_markers
             .iter()
-            .all(|marker| rustos_log.contains(marker));
+            .all(|marker| rustos_marker_present(&rustos_log, marker));
+        let smp_runtime_ready =
+            smp_runtime_missing_markers(&rustos_log, options.rustos_vcpus).is_empty();
         let dvm_ready = options
             .expected_dvm_markers
             .iter()
@@ -636,6 +652,7 @@ fn wait_for_parallel_boot(
             || (dvm_network.is_some_and(DvmNetworkCounters::round_trip_observed)
                 && rustos_log.contains(NETPROBE_QEMU_REACHABLE_MARKER));
         if rustos_ready
+            && smp_runtime_ready
             && dvm_ready
             && dvm_gpu_ready
             && ui_fps_ready
@@ -650,12 +667,16 @@ fn wait_for_parallel_boot(
         if Instant::now() >= deadline {
             let input = dvm_input_counters(&layout.dvm_input_ring)?;
             let wayclick_observed = wayclick_profile_observation(&rustos_log);
-            let missing_rustos = options
+            let mut missing_rustos = options
                 .expected_markers
                 .iter()
-                .filter(|marker| !rustos_log.contains(marker.as_str()))
+                .filter(|marker| !rustos_marker_present(&rustos_log, marker))
                 .cloned()
                 .collect::<Vec<_>>();
+            missing_rustos.extend(smp_runtime_missing_markers(
+                &rustos_log,
+                options.rustos_vcpus,
+            ));
             let missing_dvm = options
                 .expected_dvm_markers
                 .iter()
@@ -818,7 +839,14 @@ impl RecoveryHarness<'_> {
             archive_recovery_log(&self.layout.debugcon_log)?;
             archive_recovery_log(&self.layout.rustos_serial_log)?;
             archive_recovery_log(&self.layout.dvm_serial_log)?;
-            *rustos = spawn_rustos_guest(self.qemu, self.config, self.layout, false)?;
+            *rustos = spawn_rustos_guest(
+                self.qemu,
+                self.config,
+                self.layout,
+                self.options.rustos_vcpus,
+                self.options.smp_iteration,
+                false,
+            )?;
             self.input_doorbell
                 .wait_for_exact_peer_count(1, DVM_INPUT_FIRST_PEER_TIMEOUT)
                 .context("fresh RustOS guest did not reclaim the input peer")?;
@@ -970,7 +998,9 @@ fn wait_for_rustos_reboot_recovery(
             RUSTOS_POST_INIT_PROVENANCE_MARKER,
         ]
         .iter()
-        .all(|marker| rustos_log.contains(marker));
+        .all(|marker| rustos_marker_present(&rustos_log, marker));
+        let smp_runtime_ready =
+            smp_runtime_missing_markers(&rustos_log, options.rustos_vcpus).is_empty();
         // A fresh RustOS process has no predecessor lease to revoke or
         // "rebind". The uiserver active marker is emitted only after the new
         // kernel admits the DVM prime completion and publishes GPU readiness;
@@ -979,9 +1009,9 @@ fn wait_for_rustos_reboot_recovery(
         let display_ready =
             !options.gui_dvm_surfaces || rustos_log.contains(RUSTOS_GPU_ACTIVE_MARKER);
         let storage_ready = !options.dvm_block_shmem
-            || (rustos_log.contains(RUSTOS_DVM_BLOCK_MARKER)
-                && rustos_log.contains(RUSTOS_DVM_BLOCK_FIRST_COMPLETION_MARKER)
-                && rustos_log.contains(RUSTOS_DVM_BLOCK_E2E_MARKER));
+            || (rustos_marker_present(&rustos_log, RUSTOS_DVM_BLOCK_MARKER)
+                && rustos_marker_present(&rustos_log, RUSTOS_DVM_BLOCK_FIRST_COMPLETION_MARKER)
+                && rustos_marker_present(&rustos_log, RUSTOS_DVM_BLOCK_E2E_MARKER));
         let desktop_ready = !options.gui_dvm_surfaces
             || !options.dvm_block_shmem
             || rustos_log.contains(WAYCLICK_FIRST_FRAME_MARKER);
@@ -990,6 +1020,7 @@ fn wait_for_rustos_reboot_recovery(
             .iter()
             .all(|marker| dvm_log.contains(marker));
         if base_ready
+            && smp_runtime_ready
             && display_ready
             && storage_ready
             && desktop_ready

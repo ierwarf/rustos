@@ -11,8 +11,11 @@ EXPORTS
     GetCommandLineW=KERNELBASE.GetCommandLineW
     GetConsoleMode=KERNELBASE.GetConsoleMode
     GetCurrentProcess=KERNELBASE.GetCurrentProcess
+    GetCurrentProcessorNumber=KERNELBASE.GetCurrentProcessorNumber
     GetCurrentProcessId=KERNELBASE.GetCurrentProcessId
+    GetCurrentThread=KERNELBASE.GetCurrentThread
     GetCurrentThreadId=KERNELBASE.GetCurrentThreadId
+    GetProcessAffinityMask=KERNELBASE.GetProcessAffinityMask
     GetEnvironmentStringsA=KERNELBASE.GetEnvironmentStringsA
     GetEnvironmentStringsW=KERNELBASE.GetEnvironmentStringsW
     GetFileType=KERNELBASE.GetFileType
@@ -24,6 +27,10 @@ EXPORTS
     GetProcessHeap=KERNELBASE.GetProcessHeap
     GetProcAddress=KERNELBASE.GetProcAddress
     GetStdHandle=KERNELBASE.GetStdHandle
+    GetSystemInfo=KERNELBASE.GetSystemInfo
+    GetNativeSystemInfo=KERNELBASE.GetNativeSystemInfo
+    GetActiveProcessorCount=KERNELBASE.GetActiveProcessorCount
+    GetActiveProcessorGroupCount=KERNELBASE.GetActiveProcessorGroupCount
     HeapAlloc=KERNELBASE.HeapAlloc
     HeapFree=KERNELBASE.HeapFree
     HeapReAlloc=KERNELBASE.HeapReAlloc
@@ -36,6 +43,8 @@ EXPORTS
     WideCharToMultiByte=KERNELBASE.WideCharToMultiByte
     ReadFile=KERNELBASE.ReadFile
     SetConsoleMode=KERNELBASE.SetConsoleMode
+    SetProcessAffinityMask=KERNELBASE.SetProcessAffinityMask
+    SetThreadAffinityMask=KERNELBASE.SetThreadAffinityMask
     SetLastError=KERNELBASE.SetLastError
     SetUnhandledExceptionFilter=KERNELBASE.SetUnhandledExceptionFilter
     Sleep=KERNELBASE.Sleep

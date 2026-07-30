@@ -22,6 +22,7 @@ set settles. The printed plan is not validation evidence.
 | Package/stage/registry issue | `contracts-infra.md` | affected `RUSTOS.package.toml`, then exact `package_manifest.rs` or `stage/mod.rs` range |
 | Kernel API/change | `kernel-api-map.md` | relevant `kernel/*/src/api.rs`, then backing module range found by symbol search |
 | Kernel boot-order change | `kernel-api-map.md`, `contracts-infra.md` | `kernel/src/main.rs`, then exact `kernel/executive/src/boot.rs` range |
+| SMP / AP / IPI / per-CPU / TLB shootdown change | `smp-contract.md`, `kernel-api-map.md`, `contracts-infra.md` | the exact HAL, scheduler, MM, compat, or KVM gate range found by symbol search; update formal flows before enabling another vCPU |
 | Logging change | `contracts-infra.md` | `config/rustos.toml`; open `tools/build_log_cfg.rs` only after searching category/level name |
 | Fault injection change | `contracts-infra.md`, `commands.md` | `config/rustos.toml`; exact `libs/rustos-fault-injection` or `kernel/nucleus-core/src/util/fault_injection.rs` range found by search |
 | Runtime launch/session issue | `contracts-infra.md` | `libs/runtime-control/src/lib.rs`, then exact `services/runtimed/src/main.rs` range; add `contracts-abi.md` only if IPC-level routing is involved |

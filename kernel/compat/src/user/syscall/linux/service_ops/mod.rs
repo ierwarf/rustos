@@ -2,6 +2,7 @@ pub(crate) use super::*;
 
 pub mod futex_thread;
 pub mod ipc_helpers;
+mod local_memfd_io;
 pub mod poll_epoll;
 pub mod process_time;
 pub mod vfs_meta;

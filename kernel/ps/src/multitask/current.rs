@@ -1,4 +1,4 @@
-//! Interrupt-excluded access to the current BSP task and process generation.
+//! Interrupt-excluded access to the current CPU task and process generation.
 //!
 //! - **Owner:** `kernel-ps` owns the current-task identity published by the
 //!   scheduler.
@@ -18,7 +18,8 @@ use x86_64::instructions::interrupts;
 
 use super::{
     CurrentUserSnapshot, RetainedCurrentUserAddressSpace, RetainedCurrentUserProcessState,
-    UserFaultDisposition, WaitChildResult, process_table, scheduler_mut, scheduler_ref,
+    UserFaultDisposition, WaitChildResult, current_cpu_task_slot_admitted, process_table,
+    scheduler_mut, scheduler_ref,
 };
 use crate::io::session::ConsoleSessionHandle;
 use crate::memory::paging::ProcessAddressSpace;
@@ -40,10 +41,103 @@ pub fn current_user_id() -> Option<u64> {
 }
 
 pub fn current_task_id() -> Option<u64> {
+    if nucleus_core::util::lockdep::preemption_disabled() || !current_cpu_task_slot_admitted() {
+        return None;
+    }
     interrupts::without_interrupts(|| unsafe { scheduler_ref().current_task_id() })
 }
 
+pub fn linux_task_affinity(
+    target_task_id: u64,
+    online_mask: u64,
+) -> Result<u64, super::scheduler::AffinityError> {
+    if nucleus_core::util::lockdep::preemption_disabled() || !current_cpu_task_slot_admitted() {
+        return Err(super::scheduler::AffinityError::MissingTask);
+    }
+    // SAFETY: local interrupts are excluded for the complete scheduler guard;
+    // the CPU has an admitted current slot and no reference escapes the call.
+    interrupts::without_interrupts(|| unsafe {
+        scheduler_ref().linux_task_affinity(target_task_id, online_mask)
+    })
+}
+
+pub fn set_linux_task_affinity(
+    target_task_id: u64,
+    requested_mask: u64,
+    online_mask: u64,
+) -> Result<super::scheduler::AffinityCommit, super::scheduler::AffinityError> {
+    if nucleus_core::util::lockdep::preemption_disabled() || !current_cpu_task_slot_admitted() {
+        return Err(super::scheduler::AffinityError::MissingTask);
+    }
+    // SAFETY: local interrupts are excluded for the complete scheduler guard;
+    // the exact current CPU slot is admitted and the commit returns by value.
+    let commit = interrupts::without_interrupts(|| unsafe {
+        scheduler_mut().set_linux_task_affinity(target_task_id, requested_mask, online_mask)
+    })?;
+    if commit.reschedule_required {
+        super::request_deferred_reschedule();
+    }
+    Ok(commit)
+}
+
+pub fn windows_process_affinity(
+    online_mask: u64,
+) -> Result<super::scheduler::ProcessAffinitySnapshot, super::scheduler::AffinityError> {
+    if nucleus_core::util::lockdep::preemption_disabled() || !current_cpu_task_slot_admitted() {
+        return Err(super::scheduler::AffinityError::MissingTask);
+    }
+    // SAFETY: local interrupts are excluded for the complete scheduler guard;
+    // the CPU-local current task binding remains stable during the snapshot.
+    interrupts::without_interrupts(|| unsafe {
+        scheduler_ref().windows_process_affinity(online_mask)
+    })
+}
+
+pub fn set_windows_process_affinity(
+    requested_mask: u64,
+    online_mask: u64,
+) -> Result<super::scheduler::AffinityCommit, super::scheduler::AffinityError> {
+    if nucleus_core::util::lockdep::preemption_disabled() || !current_cpu_task_slot_admitted() {
+        return Err(super::scheduler::AffinityError::MissingTask);
+    }
+    // SAFETY: local interrupts are excluded for the complete scheduler guard;
+    // scheduler mutation and current-slot publication remain one critical section.
+    let commit = interrupts::without_interrupts(|| unsafe {
+        scheduler_mut().set_windows_process_affinity(requested_mask, online_mask)
+    })?;
+    if commit.reschedule_required {
+        super::request_deferred_reschedule();
+    }
+    Ok(commit)
+}
+
+pub fn set_windows_current_thread_affinity(
+    requested_mask: u64,
+    online_mask: u64,
+) -> Result<super::scheduler::AffinityCommit, super::scheduler::AffinityError> {
+    if nucleus_core::util::lockdep::preemption_disabled() || !current_cpu_task_slot_admitted() {
+        return Err(super::scheduler::AffinityError::MissingTask);
+    }
+    // SAFETY: local interrupts are excluded for the complete scheduler guard;
+    // the scheduler owns the exact current Windows thread for this mutation.
+    let commit = interrupts::without_interrupts(|| unsafe {
+        scheduler_mut().set_windows_current_thread_affinity(requested_mask, online_mask)
+    })?;
+    if commit.reschedule_required {
+        super::request_deferred_reschedule();
+    }
+    Ok(commit)
+}
+
 pub fn current_user_log_ids() -> Option<(u64, u64)> {
+    // Early AP boot deliberately records lifecycle diagnostics before the BSP
+    // admits an idle task for that CPU. Logging is observational and must not
+    // manufacture scheduler authority or turn that valid phase into a panic.
+    // The logger may run while an arbitrary raw lock is held. It must not
+    // recurse into or wait for the scheduler merely to decorate a record.
+    if nucleus_core::util::lockdep::preemption_disabled() || !current_cpu_task_slot_admitted() {
+        return None;
+    }
     interrupts::without_interrupts(|| unsafe { scheduler_ref().current_user_log_ids() })
 }
 
@@ -122,21 +216,38 @@ pub fn activate_suspended_user_task(task_id: u64) -> bool {
     })
 }
 
-pub fn terminate_user_task(task_id: u64) -> bool {
+pub fn activate_suspended_user_tasks(task_ids: &[u64]) -> bool {
     interrupts::without_interrupts(|| unsafe {
+        scheduler_mut().activate_suspended_user_tasks(task_ids)
+    })
+}
+
+pub fn terminate_user_task(task_id: u64) -> bool {
+    let terminated = interrupts::without_interrupts(|| unsafe {
         let requested_by_pid = scheduler_ref().current_user_id();
         scheduler_mut().terminate_user_task(task_id, requested_by_pid)
-    })
+    });
+    if terminated {
+        complete_retirement_side_effects();
+    }
+    terminated
 }
 
 pub fn terminate_user_process(process_id: u64) -> bool {
-    interrupts::without_interrupts(|| unsafe {
+    let terminated = interrupts::without_interrupts(|| unsafe {
         let requested_by_pid = scheduler_ref().current_user_id();
         scheduler_mut().terminate_user_process(process_id, requested_by_pid)
-    })
+    });
+    if terminated {
+        complete_retirement_side_effects();
+    }
+    terminated
 }
 
 pub fn wake_user_task(task_id: u64) -> bool {
+    if nucleus_core::util::lockdep::preemption_disabled() {
+        return super::deferred_wake::defer_current_cpu(task_id);
+    }
     interrupts::without_interrupts(|| unsafe { scheduler_mut().wake_user_task(task_id) })
 }
 
@@ -153,6 +264,9 @@ pub fn cancel_block_current_task() -> bool {
 }
 
 pub fn wake_task(task_id: u64) -> bool {
+    if nucleus_core::util::lockdep::preemption_disabled() {
+        return super::deferred_wake::defer_current_cpu(task_id);
+    }
     interrupts::without_interrupts(|| unsafe { scheduler_mut().wake_task(task_id) })
 }
 
@@ -204,6 +318,14 @@ pub fn set_next_pick_hint(task_id: u64) {
     interrupts::without_interrupts(|| unsafe { scheduler_mut().set_next_pick_hint(task_id) })
 }
 
+/// Retains one exact synchronous call/reply handoff until the receiver/caller
+/// receives its bounded direct turn or retires.
+pub fn set_next_synchronous_pick_hint(task_id: u64) -> bool {
+    interrupts::without_interrupts(|| unsafe {
+        scheduler_mut().set_next_synchronous_pick_hint(task_id)
+    })
+}
+
 pub fn set_next_latency_pick_hint(task_id: u64) -> bool {
     interrupts::without_interrupts(|| unsafe {
         scheduler_mut().set_next_latency_pick_hint(task_id)
@@ -228,9 +350,47 @@ pub fn exec_current_user_process(
     address_space: ProcessAddressSpace,
     bootstrap: super::UserTaskBootstrap,
 ) -> Option<alloc::vec::Vec<crate::user::handles::KernelHandle>> {
-    interrupts::without_interrupts(|| unsafe {
+    const EXEC_REMOTE_QUIESCE_TIMEOUT_NS: u64 = 2_000_000_000;
+
+    // SAFETY: interrupt exclusion prevents same-CPU scheduler reentry; the
+    // scheduler access guard serializes every remote CPU.
+    let process_handle =
+        interrupts::without_interrupts(|| unsafe { scheduler_ref().current_process_handle() })?;
+    super::process_table::begin_exec(process_handle)?;
+    let start = crate::arch::clock::monotonic_nanos();
+    loop {
+        // SAFETY: one bounded barrier step holds the same scheduler exclusion.
+        let ready = interrupts::without_interrupts(|| unsafe {
+            scheduler_mut().quiesce_current_exec_siblings()
+        });
+        match ready {
+            Some(true) => break,
+            Some(false) => {}
+            None => {
+                let _ = super::process_table::cancel_exec(process_handle);
+                return None;
+            }
+        }
+        if crate::arch::clock::monotonic_nanos().saturating_sub(start)
+            >= EXEC_REMOTE_QUIESCE_TIMEOUT_NS
+        {
+            panic!(
+                "scheduler invariant: exec timed out quiescing remote process threads handle={process_handle:?}"
+            );
+        }
+        super::cond_resched();
+        core::hint::spin_loop();
+    }
+
+    // SAFETY: replacement is one scheduler-serialized state transition.
+    let result = interrupts::without_interrupts(|| unsafe {
         scheduler_mut().exec_current_user_process(address_space, bootstrap)
-    })
+    });
+    complete_retirement_side_effects();
+    if result.is_none() {
+        let _ = super::process_table::cancel_exec(process_handle);
+    }
+    result
 }
 
 pub fn exec_user_process_by_pid(
@@ -239,9 +399,61 @@ pub fn exec_user_process_by_pid(
     address_space: ProcessAddressSpace,
     bootstrap: super::UserTaskBootstrap,
 ) -> Option<alloc::vec::Vec<crate::user::handles::KernelHandle>> {
-    interrupts::without_interrupts(|| unsafe {
+    const EXEC_REMOTE_QUIESCE_TIMEOUT_NS: u64 = 2_000_000_000;
+
+    // SAFETY: interrupt exclusion prevents same-CPU scheduler reentry; the
+    // scheduler access guard serializes every remote CPU.
+    let process_handle = interrupts::without_interrupts(|| unsafe {
+        scheduler_ref().process_handle_for_thread(process_id, thread_id)
+    })?;
+    super::process_table::begin_exec(process_handle)?;
+    let start = crate::arch::clock::monotonic_nanos();
+    loop {
+        // SAFETY: one bounded barrier step holds the same scheduler exclusion.
+        let ready = interrupts::without_interrupts(|| unsafe {
+            scheduler_mut().quiesce_exec_target_and_siblings(process_id, thread_id, process_handle)
+        });
+        match ready {
+            Some(true) => break,
+            Some(false) => {}
+            None => {
+                let _ = super::process_table::cancel_exec(process_handle);
+                // SAFETY: exact target state is restored under scheduler
+                // serialization before returning failure.
+                interrupts::without_interrupts(|| unsafe {
+                    scheduler_mut().cancel_exec_target_quiesce(
+                        process_id,
+                        thread_id,
+                        process_handle,
+                    );
+                });
+                return None;
+            }
+        }
+        if crate::arch::clock::monotonic_nanos().saturating_sub(start)
+            >= EXEC_REMOTE_QUIESCE_TIMEOUT_NS
+        {
+            panic!(
+                "scheduler invariant: target exec timed out quiescing remote threads process={process_id} thread={thread_id}"
+            );
+        }
+        super::cond_resched();
+        core::hint::spin_loop();
+    }
+
+    // SAFETY: replacement is one scheduler-serialized state transition.
+    let result = interrupts::without_interrupts(|| unsafe {
         scheduler_mut().exec_user_process_by_pid(process_id, thread_id, address_space, bootstrap)
-    })
+    });
+    complete_retirement_side_effects();
+    if result.is_none() {
+        let _ = super::process_table::cancel_exec(process_handle);
+        // SAFETY: exact target quiesce state is cleared under the same guard.
+        interrupts::without_interrupts(|| unsafe {
+            scheduler_mut().cancel_exec_target_quiesce(process_id, thread_id, process_handle);
+        });
+    }
+    result
 }
 
 pub fn linux_thread_snapshot_by_ids(
@@ -470,9 +682,11 @@ pub fn retire_current_user_task_due_to_fault(
     rip: u64,
     rsp: u64,
 ) -> UserFaultDisposition {
-    interrupts::without_interrupts(|| unsafe {
+    let disposition = interrupts::without_interrupts(|| unsafe {
         scheduler_mut().retire_current_user_task_due_to_fault(vector, error_code, cr2, rip, rsp)
-    })
+    });
+    complete_retirement_side_effects();
+    disposition
 }
 
 pub fn halt_current_retired_task() -> ! {
@@ -485,6 +699,7 @@ pub(crate) fn exit_current_task() -> ! {
     interrupts::without_interrupts(|| unsafe {
         scheduler_mut().exit_current_task();
     });
+    complete_retirement_side_effects();
     halt_current_retired_task()
 }
 
@@ -496,11 +711,44 @@ pub fn exit_current_user_process() -> ! {
     interrupts::without_interrupts(|| unsafe {
         scheduler_mut().exit_current_process();
     });
+    complete_retirement_side_effects();
     halt_current_retired_task()
 }
 
 pub fn service_deferred_work() -> usize {
-    interrupts::without_interrupts(|| unsafe { scheduler_mut().reap_inactive_retired_slots() })
+    // SAFETY: one fixed cleanup token is detached while local interrupts and
+    // every remote scheduler mutation are excluded; no borrow escapes.
+    let retirement_side_effect =
+        interrupts::without_interrupts(|| unsafe { scheduler_mut().take_retirement_side_effect() });
+    let completed_side_effect = usize::from(retirement_side_effect.is_some());
+    if let Some(retirement_side_effect) = retirement_side_effect {
+        retirement_side_effect.complete(|task_id| {
+            let _ = wake_task(task_id);
+        });
+    }
+    let retired_slot =
+        interrupts::without_interrupts(|| unsafe { scheduler_mut().reap_inactive_retired_slots() });
+    let reaped_slot = usize::from(retired_slot.is_some());
+    if let Some(retired_slot) = retired_slot {
+        retired_slot.complete();
+    }
+    completed_side_effect + reaped_slot + process_table::reap_exited_processes()
+}
+
+fn complete_retirement_side_effects() {
+    loop {
+        // SAFETY: token detachment is one bounded scheduler mutation and the
+        // owned token is completed only after this guard has been dropped.
+        let side_effect = interrupts::without_interrupts(|| unsafe {
+            scheduler_mut().take_retirement_side_effect()
+        });
+        let Some(side_effect) = side_effect else {
+            return;
+        };
+        side_effect.complete(|task_id| {
+            let _ = wake_task(task_id);
+        });
+    }
 }
 
 pub fn next_retired_task_cleanup() -> Option<super::RetiredTaskCleanup> {

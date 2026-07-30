@@ -1,3 +1,14 @@
+//! Private ntdll syscall transport wrappers for the fixed RustOS Win32 ABI.
+//!
+//! Owner: ntdll owns register marshalling only; kernelbase owns Win32 surface
+//! semantics and syscalld owns policy. Boundary: PE64 arguments enter ring0 and
+//! signed NTSTATUS/values return. Lifecycle: marshal one exact call and normalize
+//! failure before exposing BOOL or mask results. Concurrency: wrappers retain no
+//! shared mutable state. Failure: non-success NTSTATUS becomes the documented
+//! zero/false result. Forbidden: no host syscall number, retry fallback, pointer
+//! reinterpretation, or error-as-success conversion. Evidence:
+//! task-affinity-lifecycle and the Windows ABI differential probe.
+
 #include "../common/ntdll_exports.h"
 #include "../common/ntdll_syscall.h"
 
@@ -90,4 +101,55 @@ SIZE_T NtQueryVirtualMemory(const void *addr, void *info, SIZE_T len)
         (ULONGLONG)addr,
         (ULONGLONG)info,
         len);
+}
+
+LONG NtQuerySystemInformation(
+    ULONG information_class,
+    void *information,
+    ULONG information_len,
+    ULONG *return_len)
+{
+    return (LONG)ntdll_syscall4(
+        NTDLL_API_NtQuerySystemInformation,
+        information_class,
+        (ULONGLONG)information,
+        information_len,
+        (ULONGLONG)return_len);
+}
+
+BOOL RtlRustosQueryProcessAffinity(
+    void *process,
+    DWORD_PTR *process_mask,
+    DWORD_PTR *system_mask)
+{
+    ULONGLONG result = ntdll_syscall3(
+        NTDLL_API_RtlRustosQueryProcessAffinity,
+        (ULONGLONG)process,
+        (ULONGLONG)process_mask,
+        (ULONGLONG)system_mask);
+    return result == TRUE ? TRUE : FALSE;
+}
+
+BOOL RtlRustosSetProcessAffinity(void *process, DWORD_PTR process_mask)
+{
+    ULONGLONG result = ntdll_syscall2(
+        NTDLL_API_RtlRustosSetProcessAffinity,
+        (ULONGLONG)process,
+        process_mask);
+    return result == TRUE ? TRUE : FALSE;
+}
+
+DWORD_PTR RtlRustosSetThreadAffinity(void *thread, DWORD_PTR thread_mask)
+{
+    ULONGLONG result = ntdll_syscall2(
+        NTDLL_API_RtlRustosSetThreadAffinity,
+        (ULONGLONG)thread,
+        thread_mask);
+    return result > 0u && result <= 0xffu ? (DWORD_PTR)result : 0u;
+}
+
+DWORD RtlRustosGetCurrentProcessorNumber(void)
+{
+    ULONGLONG result = ntdll_syscall0(NTDLL_API_RtlRustosGetCurrentProcessorNumber);
+    return result <= 7u ? (DWORD)result : 0u;
 }

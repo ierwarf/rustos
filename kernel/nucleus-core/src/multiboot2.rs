@@ -80,7 +80,11 @@ struct RawModuleTag {
 struct BootInfoStorage(UnsafeCell<BootInfo>);
 struct MemoryMapStorage(UnsafeCell<[BootMemoryRegion; MAX_BOOT_MEMORY_REGIONS]>);
 
+// SAFETY: BSP bootstrap is the sole writer before publication; all later
+// CPUs receive immutable references after the boot handoff.
 unsafe impl Sync for BootInfoStorage {}
+// SAFETY: BSP bootstrap is the sole writer before publication; the admitted
+// memory-map array is immutable before any AP or runtime reader can observe it.
 unsafe impl Sync for MemoryMapStorage {}
 
 static BOOT_INFO_STORAGE: BootInfoStorage = BootInfoStorage(UnsafeCell::new(empty_boot_info()));

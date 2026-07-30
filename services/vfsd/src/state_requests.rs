@@ -159,7 +159,7 @@ impl VfsState {
                     response.status = waitset_registry_status(err);
                     return;
                 }
-                let record = checkpoint_epoll_record(request.remote_id, 1, false);
+                let record = checkpoint_epoll_record(request.remote_id, false);
                 if let Err(errno) = self.checkpoint_mutate(request, record) {
                     response.status = errno;
                     return;
@@ -172,37 +172,17 @@ impl VfsState {
                 mutated = response.status == 0;
             }
             VFS_POLL_QUERY_EPOLL_SNAPSHOT => self.vfs_epoll_snapshot(request, response),
-            VFS_POLL_QUERY_EPOLL_REF | VFS_POLL_QUERY_EPOLL_UNREF => {
+            VFS_POLL_QUERY_EPOLL_RETIRE => {
                 let key = checkpoint_epoll_key(request.remote_id);
                 if self.checkpoint_operation_replayed(request, key) {
                     return;
                 }
-                let refs = match self.epolls.refs(request.remote_id) {
-                    Ok(refs) => refs,
-                    Err(err) => {
-                        response.status = waitset_registry_status(err);
-                        return;
-                    }
-                };
                 let mut candidate = self.epolls.clone();
-                let (next_refs, tombstone) = if request.arg0 == VFS_POLL_QUERY_EPOLL_REF {
-                    if let Err(err) = candidate.acquire(request.remote_id) {
-                        response.status = waitset_registry_status(err);
-                        return;
-                    }
-                    (refs.checked_add(1).unwrap_or(0), false)
-                } else {
-                    if let Err(err) = candidate.release(request.remote_id) {
-                        response.status = waitset_registry_status(err);
-                        return;
-                    }
-                    (refs.saturating_sub(1), refs == 1)
-                };
-                if next_refs == 0 && !tombstone {
-                    response.status = EOVERFLOW;
+                if let Err(err) = candidate.retire(request.remote_id) {
+                    response.status = waitset_registry_status(err);
                     return;
                 }
-                let record = checkpoint_epoll_record(request.remote_id, next_refs, tombstone);
+                let record = checkpoint_epoll_record(request.remote_id, true);
                 if let Err(errno) = self.checkpoint_mutate(request, record) {
                     response.status = errno;
                     return;

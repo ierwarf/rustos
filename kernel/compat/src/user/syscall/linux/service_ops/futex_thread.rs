@@ -24,6 +24,7 @@ use x86_64::VirtAddr;
 const FUTEX_WAITERS_CAPACITY: usize = 256;
 const ROBUST_LIST_HEAD_SIZE: u64 = 24;
 const ROBUST_LIST_LIMIT: usize = 2_048;
+const ROBUST_CMPXCHG_RETRY_LIMIT: usize = 64;
 const FUTEX_WAITERS_BIT: u32 = 0x8000_0000;
 const FUTEX_OWNER_DIED_BIT: u32 = 0x4000_0000;
 const FUTEX_TID_MASK: u32 = 0x3fff_ffff;
@@ -697,14 +698,6 @@ fn read_user_u64(address_space: &paging::ProcessAddressSpace, address: u64) -> O
     Some(u64::from_le_bytes(bytes))
 }
 
-fn read_user_u32(address_space: &paging::ProcessAddressSpace, address: u64) -> Option<u32> {
-    let mut bytes = [0_u8; 4];
-    address_space
-        .copy_from_user(VirtAddr::new(address), &mut bytes)
-        .ok()?;
-    Some(u32::from_le_bytes(bytes))
-}
-
 fn cleanup_robust_futex(
     address_space: &paging::ProcessAddressSpace,
     address_space_root: u64,
@@ -715,29 +708,32 @@ fn cleanup_robust_futex(
     let Some(futex_address) = robust_futex_address(entry, futex_offset) else {
         return false;
     };
-    let Some(value) = read_user_u32(address_space, futex_address) else {
+    let Ok(mut value) = address_space.atomic_load_user_u32(futex_address) else {
         return false;
     };
-    let Some((owner_died, had_waiters)) = robust_owner_death_value(value, task_id) else {
-        return false;
-    };
-    if address_space
-        .copy_into_user(VirtAddr::new(futex_address), &owner_died.to_le_bytes())
-        .is_err()
-    {
-        return false;
+    for _ in 0..ROBUST_CMPXCHG_RETRY_LIMIT {
+        let Some((owner_died, had_waiters)) = robust_owner_death_value(value, task_id) else {
+            return false;
+        };
+        match address_space.atomic_compare_exchange_user_u32(futex_address, value, owner_died) {
+            Ok(Ok(_)) => {
+                if had_waiters {
+                    let _ = wake_futex_waiters(
+                        FutexKey {
+                            address_space_root,
+                            uaddr: futex_address,
+                        },
+                        1,
+                        linux_abi::FUTEX_BITSET_MATCH_ANY,
+                    );
+                }
+                return true;
+            }
+            Ok(Err(observed)) => value = observed,
+            Err(_) => return false,
+        }
     }
-    if had_waiters {
-        let _ = wake_futex_waiters(
-            FutexKey {
-                address_space_root,
-                uaddr: futex_address,
-            },
-            1,
-            linux_abi::FUTEX_BITSET_MATCH_ANY,
-        );
-    }
-    true
+    false
 }
 
 fn cleanup_robust_list(
@@ -827,7 +823,7 @@ pub(crate) fn cleanup_retired_linux_thread_state(
         if clear_child_tid != 0
             && (clear_child_tid & 0x3) == 0
             && address_space
-                .copy_into_user(VirtAddr::new(clear_child_tid), &0_u32.to_le_bytes())
+                .atomic_store_user_u32_release(clear_child_tid, 0)
                 .is_ok()
         {
             let _ = wake_futex_waiters(

@@ -236,7 +236,10 @@ fn dvm_physical_frames_ready(log: &str) -> bool {
 /// The kernel's bootstrap trace intentionally does not promise runtime
 /// debugcon delivery. The userspace display-info ABI is the authoritative
 /// observation: the runner's fixed ivshmem header must emerge unchanged as the
-/// active primary display provider.
+/// active primary display provider. GPU promotion is a later state transition:
+/// the bootstrap query may legitimately observe the provider before the atlas
+/// exists, so the durable display-ready milestone proves that promotion instead
+/// of requiring a time-dependent flag from the earlier snapshot.
 fn dvm_display_provider_ready(log: &str) -> bool {
     let expected_stride = DvmGuiSurfacePoolHeader::new(
         DVM_DISPLAY_REGION_BYTES,
@@ -244,7 +247,7 @@ fn dvm_display_provider_ready(log: &str) -> bool {
         DVM_DISPLAY_HEIGHT,
     )
     .stride_bytes;
-    log.lines().any(|line| {
+    let provider = log.lines().any(|line| {
         let Some((_, fields)) = line.split_once("uiserver: display_get_info ") else {
             return false;
         };
@@ -256,10 +259,14 @@ fn dvm_display_provider_ready(log: &str) -> bool {
             // A DVM scanout is still the active primary provider. Requiring
             // both provenance bits prevents the smoke from accepting either a
             // generic primary framebuffer or a non-primary DVM aperture.
-            && fields
-                .split_whitespace()
-                .any(|field| field == "flags=0xe")
-    })
+            && fields.split_whitespace().any(|field| {
+                field
+                    .strip_prefix("flags=")
+                    .and_then(|value| u32::from_str_radix(value.trim_start_matches("0x"), 16).ok())
+                    .is_some_and(|flags| flags & 0x6 == 0x6)
+            })
+    });
+    provider && log.contains("name=product-display-ready")
 }
 
 fn dvm_display_relay_ready(log: &str, physical_amdgpu: bool) -> bool {

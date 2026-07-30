@@ -81,11 +81,10 @@ impl VfsState {
                 && record.key_lo == CHECKPOINT_EPOLL_TAG
                 && record.flags & SERVICE_CHECKPOINT_FLAG_TOMBSTONE == 0
         }) {
-            if record.value_len != 8 {
+            if record.value_len != 0 {
                 return Err(EIO);
             }
-            let refs = u64::from_le_bytes(record.value[..8].try_into().map_err(|_| EIO)?);
-            self.epolls.restore(record.key_hi, refs).map_err(|_| EIO)?;
+            self.epolls.restore(record.key_hi).map_err(|_| EIO)?;
         }
         for record in records.iter().filter(|record| {
             record.parent_lo == CHECKPOINT_EPOLL_TAG

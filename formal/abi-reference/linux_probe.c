@@ -62,6 +62,8 @@ int main(void) {
     PAIR("sys_epoll_wait", SYS_epoll_wait);
     PAIR("sys_mmap", SYS_mmap);
     PAIR("sys_recvmsg", SYS_recvmsg);
+    PAIR("sys_sched_getaffinity", SYS_sched_getaffinity);
+    PAIR("sys_sched_setaffinity", SYS_sched_setaffinity);
     PAIR("sys_sendmsg", SYS_sendmsg);
     PAIR("sys_socketpair", SYS_socketpair);
     return 0;

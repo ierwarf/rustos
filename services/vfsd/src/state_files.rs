@@ -353,7 +353,7 @@ impl VfsState {
             || (original_op == VFS_IPC_OP_POLL_QUERY
                 && !matches!(
                     request.arg3,
-                    VFS_POLL_QUERY_EPOLL_UNREF
+                    VFS_POLL_QUERY_EPOLL_RETIRE
                         | VFS_POLL_QUERY_EPOLL_CTL
                         | VFS_POLL_QUERY_EPOLL_PURGE_OBJECT
                 ))

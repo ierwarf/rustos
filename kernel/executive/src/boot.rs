@@ -1,4 +1,5 @@
 use boot_protocol::{BootInfo, BootVolumeTransport};
+use core::hint::spin_loop;
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, Ordering};
 use kernel_compat::api as compat_api;
@@ -13,6 +14,7 @@ use crate::{announce_ready, debug, fatal, flow_debug, flow_info, hal_hooks, io_s
 const ROOTD_EXEC_PATH: &str = "services/rootd/rootd.elf";
 const ROOTD_BOOTSTRAP_WEIGHT_MICROS: u64 = 4_000;
 const MAX_RETIRED_TASK_CLEANUPS_PER_TURN: usize = 4;
+const AP_ONLINE_PARKED_TIMEOUT_NS: u64 = 2_000_000_000;
 static PANIC_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 macro_rules! boot_log {
@@ -41,12 +43,15 @@ pub fn handle_kernel_panic(info: &PanicInfo<'_>) -> ! {
             x86_64::instructions::hlt();
         }
     }
+    write_panic_site_marker(info);
     // The first panic evidence must not acquire a display, allocator, or
     // scheduler-dependent lock. A lock-contract panic can occur while any of
     // those are inconsistent; trying to paint first recursively panics and
     // turns a diagnosable failure into an x86 triple fault.
     debug::println_emergency(format_args!("[PANIC]"));
-    debug::println_emergency(format_args!("message: {}", info.message()));
+    // Print the allocation-free static location before formatting arbitrary
+    // panic arguments. Corrupted argument state must not hide the source site
+    // behind a nested exception.
     if let Some(location) = info.location() {
         debug::println_emergency(format_args!(
             "location: {}:{}:{}",
@@ -57,8 +62,43 @@ pub fn handle_kernel_panic(info: &PanicInfo<'_>) -> ! {
     } else {
         debug::println_emergency(format_args!("location: <unknown>"));
     }
+    debug::println_emergency(format_args!("message: {}", info.message()));
     loop {
         x86_64::instructions::hlt();
+    }
+}
+
+/// Print the first panic site without formatting, locks, or allocation.
+///
+/// A second CPU can fault while the first panic is being rendered. Emitting
+/// the static file and fixed-width hexadecimal line first preserves the
+/// initiating site even when later diagnostics interleave or fault.
+fn write_panic_site_marker(info: &PanicInfo<'_>) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let Some(location) = info.location() else {
+        emergency_debugcon_bytes(b"\n!PANIC-SITE:<unknown>\n");
+        return;
+    };
+    emergency_debugcon_bytes(b"\n!PANIC-SITE:");
+    for shift in (0..8).rev() {
+        let nibble = ((location.line() >> (shift * 4)) & 0xf) as usize;
+        emergency_debugcon_bytes(&[HEX[nibble]]);
+    }
+    emergency_debugcon_bytes(b":");
+    emergency_debugcon_bytes(location.file().as_bytes());
+    emergency_debugcon_bytes(b"\n");
+}
+
+fn emergency_debugcon_bytes(bytes: &[u8]) {
+    for &byte in bytes {
+        unsafe {
+            core::arch::asm!(
+                "out dx, al",
+                in("dx") 0x00e9_u16,
+                in("al") byte,
+                options(nomem, nostack, preserves_flags)
+            );
+        }
     }
 }
 
@@ -100,6 +140,13 @@ pub unsafe fn initialize_kernel(boot_info_ptr: *const BootInfo) {
         boot_info.framebuffer.bytes_per_pixel,
     );
     mm_api::boot::init_phys(boot_info_ptr);
+    if hal_api::cpu::discovered_count() > 1 {
+        mm_api::phys::claim_fixed_range(
+            nucleus_core::ap_trampoline::TRAMPOLINE_PHYS,
+            nucleus_core::ap_trampoline::RESERVED_BYTES,
+        )
+        .expect("AP trampoline low-memory range is unavailable or already owned");
+    }
     boot_log!(
         debug::LogLevel::Info,
         104,
@@ -193,6 +240,22 @@ pub unsafe fn initialize_kernel(boot_info_ptr: *const BootInfo) {
     );
     announce_ready("Clocksource", b"Monotonic clocksource initialized.\r\n");
 
+    let local_apic_phys = hal_api::cpu::local_apic_physical_base()
+        .expect("CPUID/MSR did not expose a supported xAPIC physical page");
+    if let Some(topology) = hal_api::cpu::topology() {
+        assert_eq!(
+            topology.local_apic_address(),
+            local_apic_phys,
+            "ACPI MADT and IA32_APIC_BASE disagree on the local APIC page"
+        );
+    }
+    let local_apic_virt = mm_api::paging::map_mmio_range(local_apic_phys, 4096)
+        .expect("kernel-mm could not admit the local APIC MMIO page");
+    assert!(
+        hal_api::cpu::configure_local_apic_mmio(local_apic_phys, local_apic_virt),
+        "kernel-hal rejected the admitted local APIC MMIO mapping"
+    );
+
     // The DVM display receiver programs a masked MSI-X table entry. Its
     // bounded xAPIC/MSI substrate must therefore exist before PCI probing;
     // probing after ACPI but before `init_pic` would correctly fail closed on
@@ -265,9 +328,217 @@ pub unsafe fn initialize_kernel(boot_info_ptr: *const BootInfo) {
 
     compat_api::init_syscalls();
     announce_ready("Syscall", b"Syscall initialized.\r\n");
+    initialize_application_processors();
 
     let _ = boot_info;
     flow_info(2, "kernel initialize complete");
+}
+
+fn initialize_application_processors() {
+    use hal_api::cpu::CpuLifecycleState;
+    use nucleus_core::ap_trampoline::{
+        self, ApStartupMailbox, MAILBOX_PHYS, PAGE_SIZE, RESERVED_BYTES, STARTUP_VECTOR,
+        TRAMPOLINE_PHYS,
+    };
+
+    let cpu_count = hal_api::cpu::discovered_count();
+    assert!(
+        (1..=hal_api::cpu::MAX_SUPPORTED_CPUS).contains(&cpu_count),
+        "commercial boot requires one completely admitted CPU topology"
+    );
+    debug::record_milestone(
+        debug::LogCategory::Boot,
+        "smp-bringup-begin",
+        cpu_count as u64,
+        0,
+    );
+    let bsp =
+        hal_api::cpu::lifecycle_snapshot(0).expect("admitted CPU topology omitted the logical BSP");
+    assert_eq!(
+        bsp.state,
+        CpuLifecycleState::Starting,
+        "BSP private publication occurred outside Starting"
+    );
+    hal_api::cpu::transition_lifecycle(0, bsp.generation, CpuLifecycleState::OnlineParked);
+    if cpu_count == 1 {
+        return;
+    }
+
+    ap_trampoline::install();
+    debug::record_milestone(
+        debug::LogCategory::Boot,
+        "smp-trampoline-installed",
+        TRAMPOLINE_PHYS,
+        RESERVED_BYTES,
+    );
+    assert!(
+        mm_api::paging::mark_direct_map_range_executable(TRAMPOLINE_PHYS, PAGE_SIZE),
+        "kernel-mm could not publish the AP trampoline RX page"
+    );
+    assert!(
+        mm_api::paging::mark_direct_map_range_writable_noexec(MAILBOX_PHYS, PAGE_SIZE),
+        "kernel-mm could not preserve the AP mailbox RW/NX page"
+    );
+
+    let entry = mm_api::higher_half_addr(rustos_ap_entry as *const () as usize as u64);
+    let cr3 = mm_api::paging::kernel_root_phys().as_u64();
+    for logical_index in 1..cpu_count {
+        let logical_index =
+            u8::try_from(logical_index).expect("logical CPU index exceeds u8 capacity");
+        let discovered = hal_api::cpu::lifecycle_snapshot(logical_index)
+            .expect("admitted AP lacks a lifecycle slot");
+        assert_eq!(
+            discovered.state,
+            CpuLifecycleState::Discovered,
+            "AP startup began outside Discovered"
+        );
+        hal_api::cpu::transition_lifecycle(
+            logical_index,
+            discovered.generation,
+            CpuLifecycleState::Starting,
+        );
+        let stack_top = hal_api::cpu::ap_bootstrap_stack_top(logical_index, discovered.generation);
+        ap_trampoline::publish_mailbox(ApStartupMailbox::new(
+            discovered.generation,
+            stack_top,
+            entry,
+            cr3,
+            logical_index,
+            discovered.apic_id,
+        ));
+        hal_api::cpu::start_application_processor(discovered.apic_id, STARTUP_VECTOR)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "AP startup IPI failed: logical_cpu={} apic_id={:#x} error={:?}",
+                    logical_index, discovered.apic_id, error
+                )
+            });
+        debug::record_milestone(
+            debug::LogCategory::Boot,
+            "smp-startup-ipi-sent",
+            u64::from(logical_index),
+            u64::from(discovered.apic_id),
+        );
+
+        let started_at = hal_api::arch::clock::monotonic_nanos();
+        loop {
+            let state = hal_api::cpu::lifecycle_snapshot(logical_index)
+                .expect("starting AP lost its lifecycle slot")
+                .state;
+            if state == CpuLifecycleState::OnlineParked {
+                debug::record_milestone(
+                    debug::LogCategory::Boot,
+                    "smp-ap-online-parked",
+                    u64::from(logical_index),
+                    u64::from(discovered.apic_id),
+                );
+                break;
+            }
+            if hal_api::arch::clock::monotonic_nanos().saturating_sub(started_at)
+                >= AP_ONLINE_PARKED_TIMEOUT_NS
+            {
+                hal_api::cpu::transition_lifecycle(
+                    logical_index,
+                    discovered.generation,
+                    CpuLifecycleState::Failed,
+                );
+                panic!(
+                    "AP did not publish OnlineParked before deadline: logical_cpu={} apic_id={:#x}",
+                    logical_index, discovered.apic_id
+                );
+            }
+            spin_loop();
+        }
+    }
+
+    ap_trampoline::seal();
+    assert!(
+        mm_api::paging::mark_direct_map_range_readonly_noexec(
+            TRAMPOLINE_PHYS,
+            RESERVED_BYTES as usize,
+        ),
+        "kernel-mm could not retire AP startup pages R/NX"
+    );
+}
+
+extern "C" fn rustos_ap_entry(
+    logical_index: u64,
+    generation: u64,
+    expected_apic_id: u64,
+    mailbox_magic: u64,
+) -> ! {
+    use hal_api::cpu::CpuLifecycleState;
+
+    hal_api::disable_interrupts();
+    assert_eq!(
+        mailbox_magic,
+        nucleus_core::ap_trampoline::MAILBOX_MAGIC,
+        "AP observed a stale or torn startup mailbox"
+    );
+    let logical_index =
+        u8::try_from(logical_index).expect("AP mailbox logical index exceeds u8 capacity");
+    let expected_apic_id =
+        u32::try_from(expected_apic_id).expect("AP mailbox APIC ID exceeds u32 capacity");
+    assert_eq!(
+        nucleus_core::util::lockdep::hardware_apic_id(),
+        expected_apic_id,
+        "AP startup mailbox targeted the wrong hardware CPU"
+    );
+    assert_eq!(
+        nucleus_core::util::lockdep::current_cpu_index(),
+        usize::from(logical_index),
+        "AP startup mailbox targeted the wrong logical CPU"
+    );
+    nucleus_core::util::lockdep::bind_current_cpu_identity(logical_index, expected_apic_id);
+    let snapshot = hal_api::cpu::lifecycle_snapshot(logical_index)
+        .expect("AP startup has no published lifecycle slot");
+    assert_eq!(
+        snapshot.generation, generation,
+        "AP startup used a stale CPU generation"
+    );
+    assert_eq!(
+        snapshot.state,
+        CpuLifecycleState::Starting,
+        "AP startup entered outside Starting"
+    );
+    debug::record_milestone(
+        debug::LogCategory::Boot,
+        "smp-ap-rust-entry",
+        u64::from(logical_index),
+        u64::from(expected_apic_id),
+    );
+
+    hal_api::boot::init_gdt_for_cpu(usize::from(logical_index));
+    hal_api::init_idt();
+    hal_api::init_simd();
+    assert!(
+        hal_api::cpu::init_local_apic(),
+        "AP could not initialize its local APIC"
+    );
+    compat_api::init_syscalls();
+    hal_api::cpu::transition_lifecycle(logical_index, generation, CpuLifecycleState::OnlineParked);
+    debug::record_milestone(
+        debug::LogCategory::Boot,
+        "smp-ap-private-ready",
+        u64::from(logical_index),
+        generation,
+    );
+
+    loop {
+        let snapshot = hal_api::cpu::lifecycle_snapshot(logical_index)
+            .expect("AP scheduler admission lost its lifecycle slot");
+        assert_eq!(
+            snapshot.generation, generation,
+            "AP scheduler admission observed a stale CPU generation"
+        );
+        match snapshot.state {
+            CpuLifecycleState::OnlineParked => spin_loop(),
+            CpuLifecycleState::SchedulerReady => ps_api::boot::start_secondary_cpu(),
+            unexpected => {
+                panic!("AP scheduler admission observed invalid lifecycle state {unexpected:?}")
+            }
+        }
+    }
 }
 
 pub fn kernel_initialization_complete() -> bool {

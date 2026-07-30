@@ -10,8 +10,14 @@ generated_doc = "docs/ai/formal-contracts.generated.md"
 [[risk_surfaces]]
 path = "kernel/src/main.rs"
 severity = "critical"
-flows = ["kernel-memory-protection", "physical-frame-lifecycle", "entropy-boundary", "service-bootstrap"]
+flows = ["cpu-online-lifecycle", "kernel-memory-protection", "physical-frame-lifecycle", "entropy-boundary", "service-bootstrap"]
 reason = "The BSP entry orders every ring0 trust boundary and must not publish a partially initialized kernel."
+
+[[risk_surfaces]]
+path = "kernel/nucleus-core/src/ap_trampoline.rs"
+severity = "critical"
+flows = ["cpu-online-lifecycle", "physical-frame-lifecycle"]
+reason = "The sub-1MiB trampoline and serial mailbox cross real mode, page permissions, and CPU-generation ownership."
 
 [[risk_surfaces]]
 path = "kernel/nucleus-core/src/bootstrap_stack.rs"
@@ -28,14 +34,32 @@ reason = "Privilege transition and fault retirement can corrupt or halt the whol
 [[risk_surfaces]]
 path = "kernel/hal/src/arch/acpi.rs"
 severity = "critical"
-flows = ["acpi-firmware-admission", "monotonic-deadline-lifecycle"]
+flows = ["acpi-firmware-admission", "cpu-topology-admission", "monotonic-deadline-lifecycle"]
 reason = "Untrusted firmware tables select hardware resources and the monotonic clock source."
+
+[[risk_surfaces]]
+path = "kernel/hal/src/arch/smp.rs"
+severity = "critical"
+flows = ["cpu-online-lifecycle", "cpu-affinity-observation"]
+reason = "Logical CPU generation and online-state publication gate every future cross-CPU authority and every exported topology observation."
+
+[[risk_surfaces]]
+path = "kernel/hal/src/arch/tlb_shootdown.rs"
+severity = "critical"
+flows = ["tlb-shootdown-lifecycle", "process-address-space-lifecycle", "cross-cpu-task-retirement"]
+reason = "CR3 activation, active-root publication, fixed-IPI acknowledgement, and reclaim admission share one cross-CPU translation lifetime."
 
 [[risk_surfaces]]
 path = "kernel/hal/src/arch/clock.rs"
 severity = "critical"
-flows = ["monotonic-deadline-lifecycle"]
+flows = ["monotonic-deadline-lifecycle", "per-cpu-clockevent-lifecycle"]
 reason = "Every timeout, scheduling age, and recovery deadline depends on one monotonic domain."
+
+[[risk_surfaces]]
+path = "kernel/hal/src/arch/timer.rs"
+severity = "critical"
+flows = ["per-cpu-clockevent-lifecycle"]
+reason = "Every online AP depends on one calibrated private deadline, strict-future rearm, and exact local EOI for bounded preemption."
 
 [[risk_surfaces]]
 path = "kernel/hal/src/arch/rtc.rs"
@@ -52,8 +76,8 @@ reason = "Clock and finite-sleep admission must remain local and lock-independen
 [[risk_surfaces]]
 path = "kernel/hal/src/arch/msi.rs"
 severity = "critical"
-flows = ["msi-vector-ingress"]
-reason = "Device interrupt admission crosses an untrusted hardware-to-kernel boundary."
+flows = ["cpu-online-lifecycle", "msi-vector-ingress", "smp-reschedule-ipi-lifecycle", "per-cpu-clockevent-lifecycle"]
+reason = "Device and cross-CPU interrupt admission cross an untrusted hardware-to-kernel boundary."
 
 [[risk_surfaces]]
 path = "kernel/hal/src/arch/pci.rs"
@@ -64,14 +88,26 @@ reason = "BAR discovery controls physical MMIO ownership and must reject malform
 [[risk_surfaces]]
 path = "kernel/hal/src/arch/gdt.rs"
 severity = "critical"
-flows = ["exception-retirement"]
+flows = ["cpu-online-lifecycle", "exception-retirement"]
 reason = "Privilege stacks and segment selectors determine safe exception and syscall entry."
 
 [[risk_surfaces]]
 path = "kernel/lowlevel/src/interrupts.rs"
 severity = "critical"
-flows = ["exception-retirement"]
-reason = "Interrupt exclusion and saved-context layout are foundational ring0 concurrency contracts."
+flows = ["exception-retirement", "scheduler-cpu-ownership", "smp-reschedule-ipi-lifecycle"]
+reason = "Interrupt exclusion, callback publication, and saved-context layout are foundational ring0 concurrency contracts."
+
+[[risk_surfaces]]
+path = "kernel/hal/src/interrupt_stubs.rs"
+severity = "critical"
+flows = ["exception-retirement", "scheduler-cpu-ownership"]
+reason = "Assembly must switch to the incoming stack before releasing the outgoing task owner."
+
+[[risk_surfaces]]
+path = "kernel/nucleus-core/src/util/lockdep.rs"
+severity = "critical"
+flows = ["cpu-online-lifecycle", "scheduler-cpu-ownership"]
+reason = "Per-CPU raw-guard stacks, CPU/APIC identity, and preemption depth prohibit migration or dispatch across protected ring0 state."
 
 [[risk_surfaces]]
 path = "kernel/ipc-runtime/src/ipc/mod.rs"
@@ -82,14 +118,26 @@ reason = "IPC queues, replies, endpoint owners, owner quotas, shared backing, an
 [[risk_surfaces]]
 path = "kernel/mm/src/memory/address_space.rs"
 severity = "critical"
-flows = ["memory-map", "user-memory-access"]
-reason = "Page-table mutations control isolation, W xor X, and physical-frame ownership."
+flows = ["memory-map", "user-memory-access", "tlb-shootdown-lifecycle", "thread-exit-futex-cleanup"]
+reason = "Page-table mutations control isolation, W xor X, cross-CPU translation visibility, and physical-frame ownership."
+
+[[risk_surfaces]]
+path = "kernel/mm/src/memory/address_space/atomic_user.rs"
+severity = "critical"
+flows = ["thread-exit-futex-cleanup"]
+reason = "Robust-futex and clear_child_tid cleanup require aligned atomic user-word publication while the exact process mapping generation is retained."
 
 [[risk_surfaces]]
 path = "kernel/mm/src/memory/kernel_vm.rs"
 severity = "critical"
-flows = ["kernel-memory-protection"]
-reason = "Kernel image W xor X, direct-map permissions, and MMIO windows share the active kernel page tables."
+flows = ["kernel-memory-protection", "tlb-shootdown-lifecycle"]
+reason = "Kernel image W xor X, direct-map permissions, MMIO windows, and global shootdowns share the active kernel page tables."
+
+[[risk_surfaces]]
+path = "kernel/mm/src/memory/address_space/rollback.rs"
+severity = "critical"
+flows = ["physical-frame-lifecycle", "tlb-shootdown-lifecycle"]
+reason = "Rollback must revoke every cross-CPU translation before returning private frames or rejected external mappings."
 
 [[risk_surfaces]]
 path = "kernel/mm/src/memory/phys.rs"
@@ -118,8 +166,68 @@ reason = "Every long-lived policy service shares this allocator; cumulative leak
 [[risk_surfaces]]
 path = "services/syscalld/src/linux_policy.rs"
 severity = "critical"
-flows = ["memory-map", "service-heap-lifecycle"]
-reason = "Userspace Linux VM policy owns address-hint reuse and fixed-map validation ordering; rejected requests must not destructively mutate an existing address space."
+flows = ["memory-map", "service-heap-lifecycle", "cpu-affinity-observation", "task-affinity-lifecycle"]
+reason = "Userspace Linux VM and topology policy owns address-hint reuse, fixed-map validation ordering, and exact kernel-stamped affinity observation."
+
+[[risk_surfaces]]
+path = "services/syscalld/src/affinity_policy.rs"
+severity = "critical"
+flows = ["cpu-affinity-observation", "task-affinity-lifecycle"]
+reason = "A stale, empty, oversized, fabricated, unauthorized, or process-escaping mask must not become Linux or Windows CPU affinity state."
+
+[[risk_surfaces]]
+path = "libs/rustos-user-abi/src/syscall/affinity.rs"
+severity = "critical"
+flows = ["cpu-affinity-observation", "task-affinity-lifecycle"]
+reason = "Topology versions, operation numbers, and mask field ownership must remain exact across Linux, Windows, syscalld, and ring0."
+
+[[risk_surfaces]]
+path = "libs/rustos-user-abi/src/syscall/activation_batch.rs"
+severity = "critical"
+flows = ["atomic-process-activation-batch"]
+reason = "The bounded cohort wire must preserve exact sender binding, unique zero-tailed targets, and all-or-nothing activation semantics."
+
+[[risk_surfaces]]
+path = "kernel/compat/src/user/syscall/windows/api.rs"
+severity = "critical"
+flows = ["cpu-affinity-observation", "task-affinity-lifecycle"]
+reason = "The ring0 Windows syscall-number decoder must keep every topology and affinity operation exact and fail closed on unknown numbers."
+
+[[risk_surfaces]]
+path = "kernel/compat/src/user/syscall/windows/dispatch.rs"
+severity = "critical"
+flows = ["cpu-affinity-observation", "task-affinity-lifecycle"]
+reason = "Windows topology and affinity user-copy must consume only exact kernel-stamped scheduler state after policy admission."
+
+[[risk_surfaces]]
+path = "kernel/compat/src/user/syscall/linux/syscalld_ops.rs"
+severity = "critical"
+flows = ["cpu-affinity-observation", "task-affinity-lifecycle"]
+reason = "Linux affinity copyin, policy admission, scheduler commit, migration request, and copyout must preserve one exact task mask."
+
+[[risk_surfaces]]
+path = "compat/windows/services/winsys/common/win_types.h"
+severity = "critical"
+flows = ["cpu-affinity-observation"]
+reason = "The shared Windows topology layouts must remain Microsoft-compatible."
+
+[[risk_surfaces]]
+path = "libs/rustos-user-abi/src/windows.rs"
+severity = "critical"
+flows = ["cpu-affinity-observation", "task-affinity-lifecycle"]
+reason = "The Rust Windows topology layouts, pseudo handles, and constructors must preserve the documented public ABI and keep reserved output zero."
+
+[[risk_surfaces]]
+path = "compat/windows/services/winsys/kernelbase/exports.c"
+severity = "critical"
+flows = ["cpu-affinity-observation", "task-affinity-lifecycle"]
+reason = "Standard Win32 topology and affinity exports must preserve pseudo-handle, return-value, previous-mask, and dense logical-CPU semantics."
+
+[[risk_surfaces]]
+path = "compat/windows/services/winsys/ntdll/syscall.c"
+severity = "critical"
+flows = ["cpu-affinity-observation", "task-affinity-lifecycle"]
+reason = "The PE syscall stubs normalize private transport status so Win32 BOOL and previous-mask results cannot turn an NTSTATUS failure into success."
 
 [[risk_surfaces]]
 path = "services/syscalld/src/mmap_policy.rs"
@@ -130,7 +238,7 @@ reason = "Pure mmap classification must accept the complete backing contract bef
 [[risk_surfaces]]
 path = "kernel/ps/src/multitask/process_table.rs"
 severity = "critical"
-flows = ["process-address-space-lifecycle", "endpoint-lifecycle", "kernel-resource-lifecycle"]
+flows = ["process-address-space-lifecycle", "cross-cpu-task-retirement", "endpoint-lifecycle", "kernel-resource-lifecycle"]
 reason = "Process generation, exit, address-space, endpoint lifetime, and per-process task admission share one identity boundary."
 
 [[risk_surfaces]]
@@ -142,26 +250,68 @@ reason = "Per-process VMA backing holds must outlive descriptor close, fork exac
 [[risk_surfaces]]
 path = "kernel/ps/src/multitask/scheduler.rs"
 severity = "critical"
-flows = ["scheduler-lifecycle", "scheduler-dispatch", "process-address-space-lifecycle", "exception-retirement", "endpoint-lifecycle", "syscall-simd-lifecycle"]
+flows = ["scheduler-lifecycle", "scheduler-dispatch", "bootstrap-activation-handoff", "atomic-process-activation-batch", "scheduler-cpu-ownership", "smp-reschedule-ipi-lifecycle", "task-affinity-lifecycle", "cross-cpu-task-retirement", "process-address-space-lifecycle", "exception-retirement", "endpoint-lifecycle", "syscall-simd-lifecycle"]
 reason = "Task state, CPU fairness, wake races, retirement, and context integrity converge here."
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/affinity.rs"
+severity = "critical"
+flows = ["task-affinity-lifecycle"]
+reason = "Per-task and per-process masks, inheritance, exact previous-mask return, and forced cross-CPU migration share this scheduler authority."
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/handoff_queue.rs"
+severity = "critical"
+flows = ["bootstrap-activation-handoff", "scheduler-dispatch"]
+reason = "Committed child first-turn and synchronous call-reply authority must remain bounded, FIFO, deduplicated, and retirement-safe."
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/handoffs.rs"
+severity = "critical"
+flows = ["atomic-process-activation-batch", "bootstrap-activation-handoff", "scheduler-dispatch"]
+reason = "Activation and successful-reply admission must retain exact bounded custody while preserving a mandatory fairness turn."
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/reclaim.rs"
+severity = "critical"
+flows = ["cross-cpu-task-retirement", "process-address-space-lifecycle", "endpoint-lifecycle", "monotonic-deadline-lifecycle"]
+reason = "Scheduler metadata detachment must precede external timer, IPC, process-table, allocator, and diagnostic cleanup without holding the global raw owner."
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/cpu_local.rs"
+severity = "critical"
+flows = ["cpu-online-lifecycle", "scheduler-lifecycle", "scheduler-cpu-ownership", "smp-reschedule-ipi-lifecycle"]
+reason = "Per-CPU current-task publication is the unique running-task and cross-CPU lifetime authority."
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/smp.rs"
+severity = "critical"
+flows = ["cpu-online-lifecycle", "scheduler-lifecycle", "smp-reschedule-ipi-lifecycle", "cross-cpu-task-retirement"]
+reason = "AP idle ownership and first scheduler entry bind CPU lifecycle to one disjoint task and stack."
 
 [[risk_surfaces]]
 path = "kernel/ps/src/multitask/current.rs"
 severity = "critical"
-flows = ["scheduler-lifecycle", "scheduler-dispatch", "monotonic-deadline-lifecycle", "user-memory-access"]
+flows = ["scheduler-lifecycle", "scheduler-dispatch", "monotonic-deadline-lifecycle", "cross-cpu-task-retirement", "user-memory-access"]
 reason = "Current-task access is the interrupt-excluded gateway to scheduler and process generation state."
 
 [[risk_surfaces]]
 path = "kernel/ps/src/multitask/irq.rs"
 severity = "critical"
-flows = ["scheduler-lifecycle", "scheduler-dispatch", "monotonic-deadline-lifecycle"]
-reason = "Timer and software-reschedule entry order controls deadline wake and preemption."
+flows = ["scheduler-lifecycle", "scheduler-dispatch", "scheduler-cpu-ownership", "monotonic-deadline-lifecycle", "smp-reschedule-ipi-lifecycle", "per-cpu-clockevent-lifecycle"]
+reason = "Timer, software-reschedule, and cross-CPU IPI entry order controls deadline wake and preemption."
 
 [[risk_surfaces]]
 path = "kernel/ps/src/user/sysops/usermem.rs"
 severity = "critical"
 flows = ["user-memory-access"]
 reason = "Every syscall copyin and copyout crosses untrusted process memory through this range gate."
+
+[[risk_surfaces]]
+path = "kernel/ps/src/user/syscall.rs"
+severity = "critical"
+flows = ["cpu-online-lifecycle"]
+reason = "GS-based syscall entry state and bootstrap stacks must be private to one initialized logical CPU."
 
 [[risk_surfaces]]
 path = "kernel/ps/src/api.rs"
@@ -184,8 +334,26 @@ reason = "User ABI IPC admission binds callers to service generations and finite
 [[risk_surfaces]]
 path = "kernel/compat/src/user/syscall/linux/proc_broker_ops.rs"
 severity = "critical"
-flows = ["deferred-process-activation", "loader-request-authority", "post-init-service-authority", "remote-file-map"]
+flows = ["deferred-process-activation", "atomic-process-activation-batch", "loader-request-authority", "post-init-service-authority", "remote-file-map"]
 reason = "Loader transactions mutate process identity, mappings, handles, and executable authority."
+
+[[risk_surfaces]]
+path = "kernel/compat/src/user/syscall/linux/proc_broker_ops/activation_batch.rs"
+severity = "critical"
+flows = ["atomic-process-activation-batch"]
+reason = "The registry-to-scheduler critical section must preflight every one-shot capability before any runnable publication and consume all only after success."
+
+[[risk_surfaces]]
+path = "kernel/compat/src/user/syscall/linux/proc_broker_ops/authority.rs"
+severity = "critical"
+flows = ["deferred-process-activation", "loader-request-authority"]
+reason = "Prepare ownership must retain the exact syscall subject across blocking procd policy IPC and later raw registry mutation."
+
+[[risk_surfaces]]
+path = "kernel/compat/src/user/syscall/linux/ipc_ops/subject.rs"
+severity = "critical"
+flows = ["service-call-authority", "loader-request-authority"]
+reason = "Service capability snapshots mint the exact process identity retained across cross-service and raw-lock handoffs."
 
 [[risk_surfaces]]
 path = "kernel/compat/src/user/syscall/linux/service_ops/ipc_helpers.rs"
@@ -198,6 +366,18 @@ path = "kernel/compat/src/user/syscall/linux/service_ops/vfs_socket.rs"
 severity = "critical"
 flows = ["vfs-open-description"]
 reason = "Remote open-description references and deferred socket reference settlement share descriptor close and service restart boundaries."
+
+[[risk_surfaces]]
+path = "kernel/ps/src/user/epoll.rs"
+severity = "critical"
+flows = ["vfs-open-description", "waitset"]
+reason = "Epoll dup/fork/transfer lifetime is kernel-local and only the exact final descriptor retirement may tombstone the service object."
+
+[[risk_surfaces]]
+path = "kernel/compat/src/user/syscall/linux/service_ops/local_memfd_io.rs"
+severity = "critical"
+flows = ["vfs-open-description"]
+reason = "Bounded memfd copyin/copyout must preserve exact cursor and seal errors while preventing sub-page lock and reschedule amplification."
 
 [[risk_surfaces]]
 path = "kernel/compat/src/user/syscall/linux/mm_broker_ops.rs"
@@ -220,7 +400,7 @@ reason = "Provider generations and waiter ownership close readiness lost-wake wi
 [[risk_surfaces]]
 path = "kernel/compat/src/user/syscall/linux/service_ops/futex_thread.rs"
 severity = "critical"
-flows = ["futex-wait-lifecycle"]
+flows = ["futex-wait-lifecycle", "thread-exit-futex-cleanup"]
 reason = "Futex local admission, wait, requeue, timeout, signal, and task exit share scheduler-critical waiter ownership and must not depend on policy-service IPC."
 
 [[risk_surfaces]]
@@ -268,19 +448,37 @@ reason = "The public device substrate API exposes consumer lease and transport s
 [[risk_surfaces]]
 path = "services/rootd/src/main.rs"
 severity = "critical"
-flows = ["service-bootstrap", "service-restart", "post-init-service-authority", "dvm-network-ingress", "service-heap-lifecycle"]
+flows = ["service-bootstrap", "service-restart", "post-init-service-authority", "post-init-bootstrap-barrier", "dvm-network-ingress", "service-heap-lifecycle"]
 reason = "Rootd owns the service authority graph, restart generations, bootstrap dependency policy, and the first reclaiming service heap."
+
+[[risk_surfaces]]
+path = "services/initd/src/main.rs"
+severity = "critical"
+flows = ["service-bootstrap", "post-init-service-authority", "post-init-bootstrap-barrier", "atomic-process-activation-batch"]
+reason = "Initd owns dependency-safe activation, exact endpoint barriers, adoption, and restart admission for post-init services."
+
+[[risk_surfaces]]
+path = "services/initd/src/activation.rs"
+severity = "critical"
+flows = ["post-init-bootstrap-barrier", "atomic-process-activation-batch"]
+reason = "Initd cohort construction, exact loader response admission, cleanup, and endpoint handoff must remain bounded and all-or-nothing."
+
+[[risk_surfaces]]
+path = "services/initd/src/bootstrap_barrier.rs"
+severity = "critical"
+flows = ["post-init-bootstrap-barrier"]
+reason = "Pure barrier predicates separate spawned children from exact endpoint dependency authority."
 
 [[risk_surfaces]]
 path = "services/loaderd/src/main.rs"
 severity = "critical"
-flows = ["loader-request-authority"]
+flows = ["loader-request-authority", "scheduler-dispatch", "atomic-process-activation-batch"]
 reason = "Loaderd admits executable images and coordinates the transactional process loader."
 
 [[risk_surfaces]]
 path = "services/vfsd/src/main.rs"
 severity = "critical"
-flows = ["vfs-open-description", "remote-file-map"]
+flows = ["vfs-open-description", "remote-file-map", "scheduler-dispatch"]
 reason = "Vfsd owns durable open-description state and filesystem policy."
 
 [[risk_surfaces]]
@@ -346,10 +544,78 @@ reason = "Device discovery and delegated ioctl policy can mint kernel capabiliti
 [[source_mappings]]
 path = "kernel/src/main.rs"
 models = [
+    "cpu-online-lifecycle/CpuOnlineLifecycle",
     "page-table-lifecycle/PageTableLifecycle",
     "physical-frame-lifecycle/PhysicalFrameLifecycle",
     "entropy-broker-boundary/EntropyBrokerBoundary",
     "service-bootstrap-lifecycle/ServiceBootstrapLifecycle",
+]
+
+[[source_mappings]]
+path = "kernel/hal/src/arch/smp.rs"
+models = [
+    "cpu-affinity-observation/CpuAffinityObservation",
+    "cpu-online-lifecycle/CpuOnlineLifecycle",
+]
+
+[[source_mappings]]
+path = "kernel/nucleus-core/src/ap_trampoline.rs"
+models = [
+    "cpu-online-lifecycle/CpuOnlineLifecycle",
+    "physical-frame-lifecycle/PhysicalFrameLifecycle",
+]
+
+[[source_mappings]]
+path = "kernel/hal/src/arch/msi.rs"
+models = [
+    "cpu-online-lifecycle/CpuOnlineLifecycle",
+    "msi-vector-lifecycle/MsiVectorLifecycle",
+    "per-cpu-clockevent-lifecycle/PerCpuClockeventLifecycle",
+    "smp-reschedule-ipi/SmpRescheduleIpi",
+]
+
+[[source_mappings]]
+path = "kernel/hal/src/arch/timer.rs"
+models = ["per-cpu-clockevent-lifecycle/PerCpuClockeventLifecycle"]
+
+[[source_mappings]]
+path = "kernel/hal/src/arch/tlb_shootdown.rs"
+models = [
+    "cross-cpu-task-retirement/CrossCpuTaskRetirement",
+    "process-address-space-lifetime/ProcessAddressSpaceLifetime",
+    "tlb-shootdown-lifecycle/TlbShootdownLifecycle",
+]
+
+[[source_mappings]]
+path = "kernel/mm/src/memory/phys.rs"
+models = ["physical-frame-lifecycle/PhysicalFrameLifecycle"]
+
+[[source_mappings]]
+path = "kernel/mm/src/memory/address_space.rs"
+models = [
+    "cross-cpu-task-retirement/CrossCpuTaskRetirement",
+    "page-table-lifecycle/PageTableLifecycle",
+    "process-address-space-lifetime/ProcessAddressSpaceLifetime",
+    "robust-futex-owner-death/RobustFutexOwnerDeath",
+    "tlb-shootdown-lifecycle/TlbShootdownLifecycle",
+]
+
+[[source_mappings]]
+path = "kernel/mm/src/memory/address_space/atomic_user.rs"
+models = ["robust-futex-owner-death/RobustFutexOwnerDeath"]
+
+[[source_mappings]]
+path = "kernel/mm/src/memory/address_space/rollback.rs"
+models = [
+    "physical-frame-lifecycle/PhysicalFrameLifecycle",
+    "tlb-shootdown-lifecycle/TlbShootdownLifecycle",
+]
+
+[[source_mappings]]
+path = "kernel/mm/src/memory/kernel_vm.rs"
+models = [
+    "page-table-lifecycle/PageTableLifecycle",
+    "tlb-shootdown-lifecycle/TlbShootdownLifecycle",
 ]
 
 [[source_mappings]]
@@ -384,7 +650,16 @@ models = [
     "ivshmem-pairing/IvshmemPairing",
     "dvm-display-readiness/DvmDisplayReadiness",
     "dvm-block-transport/DvmBlockTransport",
+    "smp-release-admission/SmpReleaseAdmission",
 ]
+
+[[source_mappings]]
+path = "tools/xtask/src/kvm.rs"
+models = ["smp-release-admission/SmpReleaseAdmission"]
+
+[[source_mappings]]
+path = "tools/xtask/src/formal_contracts/evidence.rs"
+models = ["smp-release-admission/SmpReleaseAdmission"]
 
 [[source_mappings]]
 path = "tools/xtask/src/kvm/layout.rs"
@@ -399,7 +674,21 @@ models = ["product-boot/ProductBoot"]
 
 [[source_mappings]]
 path = "kernel/hal/src/arch/clock.rs"
-models = ["clocksource-deadline/ClocksourceDeadline"]
+models = [
+    "clocksource-deadline/ClocksourceDeadline",
+    "per-cpu-clockevent-lifecycle/PerCpuClockeventLifecycle",
+]
+
+[[source_mappings]]
+path = "kernel/hal/src/api.rs"
+models = [
+    "cpu-online-lifecycle/CpuOnlineLifecycle",
+    "cpu-topology-admission/CpuTopologyAdmission",
+]
+
+[[source_mappings]]
+path = "kernel/hal/src/arch/mod.rs"
+models = ["cpu-online-lifecycle/CpuOnlineLifecycle"]
 
 [[source_mappings]]
 path = "kernel/compat/src/user/syscall/linux/service_ops/process_time.rs"
@@ -407,11 +696,25 @@ models = ["clocksource-deadline/ClocksourceDeadline"]
 
 [[source_mappings]]
 path = "kernel/hal/src/arch/gdt.rs"
-models = ["exception-retirement-lifecycle/ExceptionRetirementLifecycle"]
+models = [
+    "cpu-online-lifecycle/CpuOnlineLifecycle",
+    "exception-retirement-lifecycle/ExceptionRetirementLifecycle",
+]
 
 [[source_mappings]]
 path = "kernel/lowlevel/src/interrupts.rs"
-models = ["exception-retirement-lifecycle/ExceptionRetirementLifecycle"]
+models = [
+    "exception-retirement-lifecycle/ExceptionRetirementLifecycle",
+    "scheduler-cpu-ownership/SchedulerCpuOwnership",
+    "smp-reschedule-ipi/SmpRescheduleIpi",
+]
+
+[[source_mappings]]
+path = "kernel/hal/src/interrupt_stubs.rs"
+models = [
+    "exception-retirement-lifecycle/ExceptionRetirementLifecycle",
+    "scheduler-cpu-ownership/SchedulerCpuOwnership",
+]
 
 [[source_mappings]]
 path = "kernel/mm/src/api.rs"
@@ -435,15 +738,35 @@ models = ["ui-frame-budget/UiFrameBudget"]
 [[source_mappings]]
 path = "kernel/nucleus-core/src/util/lockdep.rs"
 models = [
+    "cpu-online-lifecycle/CpuOnlineLifecycle",
     "ipc-endpoint-ownership/IpcEndpointOwnership",
     "ipc-reply-deadline/IpcReplyDeadline",
+    "scheduler-cpu-ownership/SchedulerCpuOwnership",
     "scheduler-wakeup/SchedulerWakeup",
     "service-call-authority/ServiceCallAuthority",
 ]
 
 [[source_mappings]]
 path = "kernel/compat/src/user/syscall/linux/syscalld_ops.rs"
-models = ["process-signal-delivery/ProcessSignalDelivery"]
+models = [
+    "cpu-affinity-observation/CpuAffinityObservation",
+    "process-signal-delivery/ProcessSignalDelivery",
+    "task-affinity-lifecycle/TaskAffinityLifecycle",
+]
+
+[[source_mappings]]
+path = "kernel/compat/src/user/syscall/linux/proc_broker_ops/authority.rs"
+models = [
+    "deferred-process-activation/DeferredProcessActivation",
+    "loader-request-authority/LoaderRequestAuthority",
+]
+
+[[source_mappings]]
+path = "kernel/compat/src/user/syscall/linux/ipc_ops/subject.rs"
+models = [
+    "loader-request-authority/LoaderRequestAuthority",
+    "service-call-authority/ServiceCallAuthority",
+]
 
 [[source_mappings]]
 path = "services/procd/src/main.rs"
@@ -455,6 +778,28 @@ models = [
 [[source_mappings]]
 path = "libs/rustos-user-abi/src/syscall.rs"
 models = ["sigchld-notification/SigchldNotification"]
+
+[[source_mappings]]
+path = "libs/rustos-user-abi/src/syscall/activation_batch.rs"
+models = ["atomic-process-activation-batch/AtomicProcessActivationBatch"]
+
+[[source_mappings]]
+path = "libs/rustos-user-abi/src/syscall/affinity.rs"
+models = [
+    "cpu-affinity-observation/CpuAffinityObservation",
+    "task-affinity-lifecycle/TaskAffinityLifecycle",
+]
+
+[[source_mappings]]
+path = "kernel/compat/src/user/syscall/linux/proc_broker_ops.rs"
+models = [
+    "atomic-process-activation-batch/AtomicProcessActivationBatch",
+    "deferred-process-activation/DeferredProcessActivation",
+]
+
+[[source_mappings]]
+path = "kernel/compat/src/user/syscall/linux/proc_broker_ops/activation_batch.rs"
+models = ["atomic-process-activation-batch/AtomicProcessActivationBatch"]
 
 [[source_mappings]]
 path = "kernel/compat/src/user/syscall/linux/support.rs"
@@ -472,6 +817,19 @@ models = [
 
 [[source_mappings]]
 path = "kernel/compat/src/user/syscall/linux/service_ops/vfs_socket.rs"
+models = [
+    "vfs-open-description-recovery/VfsOpenDescriptionRecovery",
+]
+
+[[source_mappings]]
+path = "kernel/ps/src/user/epoll.rs"
+models = [
+    "service-mutation-recovery/ServiceMutationRecovery",
+    "userspace-wait-set/UserspaceWaitSet",
+]
+
+[[source_mappings]]
+path = "kernel/compat/src/user/syscall/linux/service_ops/local_memfd_io.rs"
 models = [
     "vfs-open-description-recovery/VfsOpenDescriptionRecovery",
 ]
@@ -505,9 +863,31 @@ models = [
 [[source_mappings]]
 path = "kernel/ps/src/multitask/process_table.rs"
 models = [
+    "cross-cpu-task-retirement/CrossCpuTaskRetirement",
     "kernel-resource-accounting/KernelResourceAccounting",
     "process-address-space-lifetime/ProcessAddressSpaceLifetime",
 ]
+
+[[source_mappings]]
+path = "services/initd/src/main.rs"
+models = [
+    "atomic-process-activation-batch/AtomicProcessActivationBatch",
+    "post-init-bootstrap-barrier/PostInitBootstrapBarrier",
+    "post-init-leases/PostInitLeases",
+    "post-init-supervisor-recovery/PostInitSupervisorRecovery",
+    "service-bootstrap-lifecycle/ServiceBootstrapLifecycle",
+]
+
+[[source_mappings]]
+path = "services/initd/src/activation.rs"
+models = [
+    "atomic-process-activation-batch/AtomicProcessActivationBatch",
+    "post-init-bootstrap-barrier/PostInitBootstrapBarrier",
+]
+
+[[source_mappings]]
+path = "services/initd/src/bootstrap_barrier.rs"
+models = ["post-init-bootstrap-barrier/PostInitBootstrapBarrier"]
 
 [[source_mappings]]
 path = "kernel/ps/src/api.rs"
@@ -524,13 +904,19 @@ models = [
 ]
 
 [[source_mappings]]
+path = "kernel/ps/src/user/syscall.rs"
+models = ["cpu-online-lifecycle/CpuOnlineLifecycle"]
+
+[[source_mappings]]
 path = "kernel/ps/src/multitask/current.rs"
 models = [
     "clocksource-deadline/ClocksourceDeadline",
+    "cross-cpu-task-retirement/CrossCpuTaskRetirement",
     "ipc-priority-inheritance/IpcPriorityInheritance",
     "process-address-space-lifetime/ProcessAddressSpaceLifetime",
     "scheduler-cpu-distribution/SchedulerCpuDistribution",
     "scheduler-thread-demotion/SchedulerThreadDemotion",
+    "synchronous-ipc-handoff/SynchronousIpcHandoff",
     "scheduler-wakeup/SchedulerWakeup",
     "syscall-simd-lifecycle/SyscallSimdLifecycle",
 ]
@@ -539,8 +925,89 @@ models = [
 path = "kernel/ps/src/multitask/irq.rs"
 models = [
     "clocksource-deadline/ClocksourceDeadline",
+    "per-cpu-clockevent-lifecycle/PerCpuClockeventLifecycle",
+    "scheduler-cpu-ownership/SchedulerCpuOwnership",
     "scheduler-cpu-distribution/SchedulerCpuDistribution",
     "scheduler-wakeup/SchedulerWakeup",
+    "smp-reschedule-ipi/SmpRescheduleIpi",
+]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/spawn.rs"
+models = [
+    "bootstrap-activation-handoff/BootstrapActivationHandoff",
+    "cpu-online-lifecycle/CpuOnlineLifecycle",
+    "per-cpu-clockevent-lifecycle/PerCpuClockeventLifecycle",
+]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/cpu_local.rs"
+models = [
+    "cpu-online-lifecycle/CpuOnlineLifecycle",
+    "scheduler-cpu-ownership/SchedulerCpuOwnership",
+    "scheduler-wakeup/SchedulerWakeup",
+    "smp-reschedule-ipi/SmpRescheduleIpi",
+]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler.rs"
+models = [
+    "atomic-process-activation-batch/AtomicProcessActivationBatch",
+    "bootstrap-activation-handoff/BootstrapActivationHandoff",
+    "cross-cpu-task-retirement/CrossCpuTaskRetirement",
+    "scheduler-cpu-ownership/SchedulerCpuOwnership",
+    "smp-reschedule-ipi/SmpRescheduleIpi",
+    "synchronous-ipc-handoff/SynchronousIpcHandoff",
+    "task-affinity-lifecycle/TaskAffinityLifecycle",
+]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/reclaim.rs"
+models = [
+    "clocksource-deadline/ClocksourceDeadline",
+    "cross-cpu-task-retirement/CrossCpuTaskRetirement",
+    "ipc-endpoint-ownership/IpcEndpointOwnership",
+    "per-cpu-clockevent-lifecycle/PerCpuClockeventLifecycle",
+    "process-address-space-lifetime/ProcessAddressSpaceLifetime",
+]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/affinity.rs"
+models = ["task-affinity-lifecycle/TaskAffinityLifecycle"]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/activation_batch_tests.rs"
+models = [
+    "atomic-process-activation-batch/AtomicProcessActivationBatch",
+    "bootstrap-activation-handoff/BootstrapActivationHandoff",
+]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/handoff_queue.rs"
+models = [
+    "bootstrap-activation-handoff/BootstrapActivationHandoff",
+    "synchronous-ipc-handoff/SynchronousIpcHandoff",
+]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/handoffs.rs"
+models = [
+    "atomic-process-activation-batch/AtomicProcessActivationBatch",
+    "bootstrap-activation-handoff/BootstrapActivationHandoff",
+    "synchronous-ipc-handoff/SynchronousIpcHandoff",
+]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/synchronous_handoff_tests.rs"
+models = ["synchronous-ipc-handoff/SynchronousIpcHandoff"]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/smp.rs"
+models = [
+    "cpu-online-lifecycle/CpuOnlineLifecycle",
+    "cross-cpu-task-retirement/CrossCpuTaskRetirement",
+    "scheduler-wakeup/SchedulerWakeup",
+    "smp-reschedule-ipi/SmpRescheduleIpi",
 ]
 
 [[source_mappings]]
@@ -576,14 +1043,26 @@ path = "kernel/compat/src/user/syscall/linux/lifecycle_broker_ops.rs"
 models = ["futex-waiter-lifecycle/FutexWaiterLifecycle"]
 
 [[source_mappings]]
+path = "kernel/compat/src/user/syscall/linux/service_ops/futex_thread.rs"
+models = [
+    "futex-waiter-lifecycle/FutexWaiterLifecycle",
+    "robust-futex-owner-death/RobustFutexOwnerDeath",
+]
+
+[[source_mappings]]
 path = "kernel/executive/src/boot.rs"
-models = ["futex-waiter-lifecycle/FutexWaiterLifecycle"]
+models = [
+    "cpu-online-lifecycle/CpuOnlineLifecycle",
+    "futex-waiter-lifecycle/FutexWaiterLifecycle",
+    "physical-frame-lifecycle/PhysicalFrameLifecycle",
+]
 
 [[source_mappings]]
 path = "kernel/compat/src/user/syscall/linux/ipc_ops.rs"
 models = [
     "input-ingestion-worker/InputIngestionWorker",
     "service-call-authority/ServiceCallAuthority",
+    "synchronous-ipc-handoff/SynchronousIpcHandoff",
 ]
 
 [[source_mappings]]
@@ -644,9 +1123,25 @@ models = [
 [[source_mappings]]
 path = "services/loaderd/src/main.rs"
 models = [
+    "atomic-process-activation-batch/AtomicProcessActivationBatch",
     "loader-request-authority/LoaderRequestAuthority",
+    "scheduler-thread-demotion/SchedulerThreadDemotion",
     "ui-frame-budget/UiFrameBudget",
 ]
+
+[[source_mappings]]
+path = "services/loaderd/src/lib.rs"
+models = ["scheduler-thread-demotion/SchedulerThreadDemotion"]
+
+[[source_mappings]]
+path = "services/vfsd/src/main.rs"
+models = [
+    "scheduler-thread-demotion/SchedulerThreadDemotion",
+]
+
+[[source_mappings]]
+path = "services/vfsd/src/lib.rs"
+models = ["scheduler-thread-demotion/SchedulerThreadDemotion"]
 
 [[source_mappings]]
 path = "services/runtimed/src/main.rs"
@@ -654,7 +1149,10 @@ models = ["ui-frame-budget/UiFrameBudget"]
 
 [[source_mappings]]
 path = "services/rootd/src/main.rs"
-models = ["service-heap-lifecycle/ServiceHeapLifecycle"]
+models = [
+    "post-init-bootstrap-barrier/PostInitBootstrapBarrier",
+    "service-heap-lifecycle/ServiceHeapLifecycle",
+]
 
 [[source_mappings]]
 path = "libs/rustos-svc-runtime/src/allocator.rs"
@@ -663,8 +1161,63 @@ models = ["service-heap-lifecycle/ServiceHeapLifecycle"]
 [[source_mappings]]
 path = "services/syscalld/src/linux_policy.rs"
 models = [
+    "cpu-affinity-observation/CpuAffinityObservation",
     "page-table-lifecycle/PageTableLifecycle",
     "service-heap-lifecycle/ServiceHeapLifecycle",
+    "task-affinity-lifecycle/TaskAffinityLifecycle",
+]
+
+[[source_mappings]]
+path = "services/syscalld/src/affinity_policy.rs"
+models = [
+    "cpu-affinity-observation/CpuAffinityObservation",
+    "task-affinity-lifecycle/TaskAffinityLifecycle",
+]
+
+[[source_mappings]]
+path = "services/syscalld/src/win32_policy.rs"
+models = [
+    "cpu-affinity-observation/CpuAffinityObservation",
+    "task-affinity-lifecycle/TaskAffinityLifecycle",
+]
+
+[[source_mappings]]
+path = "kernel/compat/src/user/syscall/windows/api.rs"
+models = [
+    "cpu-affinity-observation/CpuAffinityObservation",
+    "task-affinity-lifecycle/TaskAffinityLifecycle",
+]
+
+[[source_mappings]]
+path = "kernel/compat/src/user/syscall/windows/dispatch.rs"
+models = [
+    "cpu-affinity-observation/CpuAffinityObservation",
+    "task-affinity-lifecycle/TaskAffinityLifecycle",
+]
+
+[[source_mappings]]
+path = "compat/windows/services/winsys/common/win_types.h"
+models = ["cpu-affinity-observation/CpuAffinityObservation"]
+
+[[source_mappings]]
+path = "libs/rustos-user-abi/src/windows.rs"
+models = [
+    "cpu-affinity-observation/CpuAffinityObservation",
+    "task-affinity-lifecycle/TaskAffinityLifecycle",
+]
+
+[[source_mappings]]
+path = "compat/windows/services/winsys/ntdll/syscall.c"
+models = [
+    "cpu-affinity-observation/CpuAffinityObservation",
+    "task-affinity-lifecycle/TaskAffinityLifecycle",
+]
+
+[[source_mappings]]
+path = "compat/windows/services/winsys/kernelbase/exports.c"
+models = [
+    "cpu-affinity-observation/CpuAffinityObservation",
+    "task-affinity-lifecycle/TaskAffinityLifecycle",
 ]
 
 [[source_mappings]]
@@ -714,6 +1267,7 @@ models = [
 evidence_max_age_hours = 168
 required_evidence = [
     "build/formal/source-conformance/summary.json",
+    "build/formal/smp-source-assumptions/summary.json",
     "build/formal/kani/summary.json",
     "build/formal/verus/summary.json",
     "build/formal/runtime-traces/runtime-control-rpc-summary.json",
@@ -725,10 +1279,36 @@ required_evidence = [
     "build/formal/mutations/summary.json",
 ]
 
+[profiles.smp-iteration]
+# This exact-tree development seal exists so a bounded multicore debugging
+# boot does not require rerunning every unrelated product model after each
+# scheduler fix. Release, FPS, and recovery evidence still require `pr`.
+evidence_max_age_hours = 24
+required_evidence = [
+    "build/formal/source-conformance/summary.json",
+    "build/formal/smp-source-assumptions/summary.json",
+]
+required_models = [
+    "cpu-affinity-observation/CpuAffinityObservation",
+    "task-affinity-lifecycle/TaskAffinityLifecycle",
+    "cpu-topology-admission/CpuTopologyAdmission",
+    "cpu-online-lifecycle/CpuOnlineLifecycle",
+    "smp-reschedule-ipi/SmpRescheduleIpi",
+    "scheduler-cpu-ownership/SchedulerCpuOwnership",
+    "tlb-shootdown-lifecycle/TlbShootdownLifecycle",
+    "cross-cpu-task-retirement/CrossCpuTaskRetirement",
+    "robust-futex-owner-death/RobustFutexOwnerDeath",
+    "per-cpu-clockevent-lifecycle/PerCpuClockeventLifecycle",
+    "syscall-simd-lifecycle/SyscallSimdLifecycle",
+    "process-address-space-lifetime/ProcessAddressSpaceLifetime",
+    "smp-release-admission/SmpReleaseAdmission",
+]
+
 [profiles.nightly]
 evidence_max_age_hours = 72
 required_evidence = [
     "build/formal/source-conformance/summary.json",
+    "build/formal/smp-source-assumptions/summary.json",
     "build/formal/kani/summary.json",
     "build/formal/verus/summary.json",
     "build/formal/runtime-traces/runtime-control-rpc-summary.json",

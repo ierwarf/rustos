@@ -1,3 +1,9 @@
+mod activation_batch;
+mod affinity;
+
+pub use activation_batch::*;
+pub use affinity::*;
+
 pub const SYS_RUSTOS_DEBUG_PRINT: u64 = 0x5255_0001;
 pub const SYS_RUSTOS_SPAWN_EXEC: u64 = 0x5255_0002;
 pub const SYS_RUSTOS_IPC_ENDPOINT_CREATE: u64 = 0x5255_0003;
@@ -101,7 +107,6 @@ pub const SYS_RUSTOS_IPC_CALL_WITH_HANDLES_BOUNDED: u64 = 0x5255_0045;
 /// closed identifiers below. The kernel stamps the live process/thread
 /// identity and monotonic timestamp into the structured debug record.
 pub const SYS_RUSTOS_PRODUCT_MILESTONE: u64 = 0x5255_0046;
-
 pub const PRODUCT_MILESTONE_ROOT_CORE_READY: u64 = 1;
 pub const PRODUCT_MILESTONE_DISPLAY_READY: u64 = 2;
 pub const PRODUCT_MILESTONE_STORAGE_READY: u64 = 3;
@@ -285,7 +290,7 @@ pub const MM_BROKER_FD_RIGHT_READ: u64 = 1 << 0;
 pub const MM_BROKER_FD_RIGHT_WRITE: u64 = 1 << 1;
 pub const MM_BROKER_FD_RIGHT_MAP: u64 = 1 << 2;
 pub const MM_BROKER_PATH_CAPACITY: usize = 128;
-pub const VFS_IPC_ABI_VERSION: u16 = 4;
+pub const VFS_IPC_ABI_VERSION: u16 = 5;
 pub const VFS_IPC_OP_OPENAT: u16 = 1;
 pub const VFS_IPC_OP_CLOSE: u16 = 2;
 pub const VFS_IPC_OP_DUP: u16 = 3;
@@ -325,9 +330,10 @@ pub const VFS_POLL_QUERY_POLL: u64 = 1;
 pub const VFS_POLL_QUERY_EPOLL_CREATE: u64 = 2;
 pub const VFS_POLL_QUERY_EPOLL_CTL: u64 = 3;
 pub const VFS_POLL_QUERY_EPOLL_SNAPSHOT: u64 = 4;
-pub const VFS_POLL_QUERY_EPOLL_REF: u64 = 5;
-pub const VFS_POLL_QUERY_EPOLL_UNREF: u64 = 6;
-pub const VFS_POLL_QUERY_EPOLL_PURGE_OBJECT: u64 = 7;
+/// Retire an epoll provider object after ring0 removes its final descriptor
+/// reference. Dup/fork/transfer reference accounting is kernel-local.
+pub const VFS_POLL_QUERY_EPOLL_RETIRE: u64 = 5;
+pub const VFS_POLL_QUERY_EPOLL_PURGE_OBJECT: u64 = 6;
 
 pub const WAITSET_ABI_VERSION: u16 = 1;
 pub const WAITSET_PROVIDER_VFSD: u16 = 1;
@@ -565,7 +571,6 @@ pub const LINUX_SIGACTION_SIZE: usize = 32;
 pub const LOADER_REQUEST_ABI_VERSION: u16 = 2;
 pub const LOADER_OP_SPAWN_EXEC: u16 = 1;
 pub const LOADER_OP_EXEC_TARGET: u16 = 2;
-pub const LOADER_OP_ACTIVATE: u16 = 3;
 
 /// Static half of the loader authority contract. Services and ring0 must pair
 /// this role matrix with a live kernel-owned service publication check at the
@@ -2282,17 +2287,6 @@ pub struct RustosProcCommitBrokerArgs {
     pub weight_micros: u64,
     /// Kernel-stamped immediate caller of loaderd's spawn request. For a
     /// deferred spawn this identity becomes the sole activation authority.
-    pub requester_pid: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct RustosProcActivateBrokerArgs {
-    pub abi_version: u16,
-    pub reserved0: u16,
-    pub flags: u32,
-    pub target_pid: u64,
-    /// Exact process that requested the corresponding deferred spawn.
     pub requester_pid: u64,
 }
 

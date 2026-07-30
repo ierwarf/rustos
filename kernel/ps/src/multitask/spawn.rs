@@ -1,10 +1,12 @@
 use x86_64::VirtAddr;
 use x86_64::instructions::interrupts;
 
+use kernel_hal::api::cpu;
+
 use super::{
     MAIN_THREAD_SLICE_MICROS, NEXT_TASK_ID, SpawnTaskError, UserTaskBootstrap, allocate_task_id,
     checked_thread_pit_divisor, initial_task_rflags, kernel_task_entry_trampoline_addr,
-    noop_task_entry, scheduler_mut,
+    noop_task_entry, publish_cpu_current_task, scheduler_mut,
 };
 use crate::memory::paging::ProcessAddressSpace;
 use crate::user::process_state::UserProcessState;
@@ -91,7 +93,7 @@ fn spawn_user_process_inner(
     let user_ss = crate::arch::gdt::user_data_selector().0 as u64;
     let rflags = initial_task_rflags().bits();
     let (spawned_from_user, slot) = interrupts::without_interrupts(|| unsafe {
-        let scheduler = scheduler_mut();
+        let mut scheduler = scheduler_mut();
         let current_is_user = scheduler.current_task_is_user_task();
         let slot = scheduler
             .allocate_user_slot(
@@ -167,7 +169,7 @@ pub fn spawn_user_process_state_with_parent(
     let user_ss = crate::arch::gdt::user_data_selector().0 as u64;
     let rflags = initial_task_rflags().bits();
     let (spawned_from_user, slot) = interrupts::without_interrupts(|| unsafe {
-        let scheduler = scheduler_mut();
+        let mut scheduler = scheduler_mut();
         let current_is_user = scheduler.current_task_is_user_task();
         let slot = scheduler
             .allocate_user_process_state_slot(
@@ -252,7 +254,7 @@ pub fn start(entry: fn(u64)) -> ! {
 
     let saved_rsp = interrupts::without_interrupts(|| unsafe {
         NEXT_TASK_ID.store(1, core::sync::atomic::Ordering::Relaxed);
-        let scheduler = scheduler_mut();
+        let mut scheduler = scheduler_mut();
         scheduler.reset(
             crate::arch::pit::divisor_from_micros(MAIN_THREAD_SLICE_MICROS),
             entry,
@@ -262,8 +264,63 @@ pub fn start(entry: fn(u64)) -> ! {
             initial_task_rflags().bits(),
             kernel_task_entry_trampoline_addr(),
         );
+        let cpu_count = cpu::discovered_count();
+        assert!(
+            (1..=nucleus_core::util::lockdep::MAX_TRACKED_CPUS).contains(&cpu_count),
+            "scheduler invariant: admitted CPU count is outside capacity"
+        );
+        let mut generations = [0_u64; nucleus_core::util::lockdep::MAX_TRACKED_CPUS];
+        for logical_index in 0..cpu_count {
+            let logical_index =
+                u8::try_from(logical_index).expect("scheduler CPU index exceeds u8 capacity");
+            let snapshot = cpu::lifecycle_snapshot(logical_index)
+                .expect("scheduler invariant: admitted CPU has no lifecycle slot");
+            assert_eq!(
+                snapshot.state,
+                cpu::CpuLifecycleState::OnlineParked,
+                "scheduler invariant: CPU admitted before OnlineParked"
+            );
+            generations[usize::from(logical_index)] = snapshot.generation;
+            if logical_index == 0 {
+                continue;
+            }
+            let id = allocate_task_id().expect("secondary idle task identity exhausted");
+            let (raw_stack_base, stack_top) =
+                cpu::ap_bootstrap_stack_bounds(logical_index, snapshot.generation);
+            let slot = scheduler.initialize_secondary_idle(
+                logical_index,
+                secondary_idle_entry,
+                id,
+                raw_stack_base,
+                stack_top,
+            );
+            publish_cpu_current_task(usize::from(logical_index), slot);
+        }
         scheduler.prepare_current_task_execution();
-        scheduler.current_saved_rsp()
+        let saved_rsp = scheduler.current_saved_rsp();
+        drop(scheduler);
+        for (logical_index, generation) in generations[..cpu_count].iter().copied().enumerate() {
+            cpu::transition_lifecycle(
+                u8::try_from(logical_index).expect("scheduler CPU index exceeds u8 capacity"),
+                generation,
+                cpu::CpuLifecycleState::SchedulerReady,
+            );
+            crate::debug::record_milestone(
+                crate::debug::LogCategory::Boot,
+                "smp-cpu-scheduler-ready",
+                logical_index as u64,
+                generation,
+            );
+        }
+        crate::arch::tlb::admit_current_cpu_online();
+        cpu::transition_lifecycle(0, generations[0], cpu::CpuLifecycleState::Online);
+        crate::debug::record_milestone(
+            crate::debug::LogCategory::Boot,
+            "smp-cpu-online",
+            0,
+            generations[0],
+        );
+        saved_rsp
     });
 
     crate::arch::pit::start_micros(0, MAIN_THREAD_SLICE_MICROS);
@@ -276,6 +333,65 @@ pub fn start(entry: fn(u64)) -> ! {
         kernel_hal::api::restore_kernel_saved_context(
             saved_rsp as *mut super::context::SavedContext,
         )
+    }
+}
+
+fn secondary_idle_entry(_arg: u64) {
+    loop {
+        x86_64::instructions::hlt();
+    }
+}
+
+pub fn start_secondary_cpu() -> ! {
+    interrupts::disable();
+    let logical_index = nucleus_core::util::lockdep::current_cpu_index();
+    assert!(
+        logical_index > 0 && logical_index < nucleus_core::util::lockdep::MAX_TRACKED_CPUS,
+        "secondary scheduler entry executed on an invalid CPU"
+    );
+    let logical_index =
+        u8::try_from(logical_index).expect("secondary scheduler CPU index exceeds u8 capacity");
+    let snapshot = cpu::lifecycle_snapshot(logical_index)
+        .expect("secondary scheduler entry has no lifecycle slot");
+    assert_eq!(
+        snapshot.state,
+        cpu::CpuLifecycleState::SchedulerReady,
+        "secondary scheduler entry occurred outside SchedulerReady"
+    );
+    unsafe {
+        scheduler_mut().prepare_secondary_idle_execution(logical_index);
+    }
+    crate::arch::tlb::admit_current_cpu_online();
+    assert!(
+        crate::arch::timer::init_current_cpu(),
+        "secondary scheduler entry could not arm its local clockevent"
+    );
+    cpu::transition_lifecycle(
+        logical_index,
+        snapshot.generation,
+        cpu::CpuLifecycleState::Online,
+    );
+    crate::debug::record_milestone(
+        crate::debug::LogCategory::Boot,
+        "smp-ap-online",
+        u64::from(logical_index),
+        snapshot.generation,
+    );
+    crate::debug::record_milestone(
+        crate::debug::LogCategory::Boot,
+        "smp-cpu-online",
+        u64::from(logical_index),
+        snapshot.generation,
+    );
+    crate::debug::record_milestone(
+        crate::debug::LogCategory::Sched,
+        "smp-cpu-idle-enter",
+        u64::from(logical_index),
+        snapshot.generation,
+    );
+
+    loop {
+        interrupts::enable_and_hlt();
     }
 }
 

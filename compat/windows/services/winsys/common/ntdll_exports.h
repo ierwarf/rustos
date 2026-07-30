@@ -25,6 +25,18 @@ void *NtAllocateVirtualMemory(void *addr, SIZE_T len, DWORD alloc_type, DWORD pr
 BOOL NtFreeVirtualMemory(void *addr, SIZE_T len, DWORD free_type);
 BOOL NtProtectVirtualMemory(void *addr, SIZE_T len, DWORD new_protect, DWORD *old_protect);
 SIZE_T NtQueryVirtualMemory(const void *addr, void *info, SIZE_T len);
+LONG NtQuerySystemInformation(
+    ULONG information_class,
+    void *information,
+    ULONG information_len,
+    ULONG *return_len);
+BOOL RtlRustosQueryProcessAffinity(
+    void *process,
+    DWORD_PTR *process_mask,
+    DWORD_PTR *system_mask);
+BOOL RtlRustosSetProcessAffinity(void *process, DWORD_PTR process_mask);
+DWORD_PTR RtlRustosSetThreadAffinity(void *thread, DWORD_PTR thread_mask);
+DWORD RtlRustosGetCurrentProcessorNumber(void);
 
 void RtlDeleteCriticalSection(void *critical_section);
 void RtlEnterCriticalSection(void *critical_section);

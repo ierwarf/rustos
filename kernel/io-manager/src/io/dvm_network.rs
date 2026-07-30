@@ -89,8 +89,8 @@ impl TransportLease {
     }
 }
 
-// The state is accessed only while STATE is held. The aperture lifetime is the
-// kernel lifetime after a successful install.
+// SAFETY: the state is accessed only while STATE is held. The aperture
+// lifetime is the kernel lifetime after a successful install.
 unsafe impl Send for DvmNetworkState {}
 
 pub(crate) fn try_install() -> bool {
