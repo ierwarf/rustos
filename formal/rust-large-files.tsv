@@ -1,0 +1,31 @@
+# path	line_limit	owner	required split boundary
+kernel/compat/src/user/process/linux.rs	1767	compat-process	Split ELF state, signal frame, and Linux task lifecycle.
+kernel/compat/src/user/syscall/linux/ipc_ops.rs	3136	compat-ipc	Split endpoint calls, shared regions, handle transfer, and tests.
+kernel/compat/src/user/syscall/linux/proc_broker_ops.rs	1920	compat-process-broker	Split spawn, exec, wait, signal, and retirement broker clients.
+kernel/compat/src/user/syscall/linux/service_ops/ipc_helpers.rs	1886	compat-service-ipc	Split typed calls, response admission, retry policy, and tests.
+kernel/compat/src/user/syscall/linux/service_ops/poll_epoll.rs	1350	compat-waitset	Split poll translation, epoll registration, waits, and lifecycle tests.
+kernel/compat/src/user/syscall/linux/service_ops/vfs_socket.rs	1603	compat-vfs	Split file-descriptor transport, socket transport, and response admission.
+kernel/io-manager/src/io/dvm_block.rs	1595	io-block	Split protocol admission, queue lifecycle, DMA aperture, and tests.
+kernel/io-manager/src/io/dvm_display.rs	1756	io-display	Split handshake, shared-surface lifecycle, present queue, and tests.
+kernel/ipc-runtime/src/ipc/mod.rs	3003	ipc-runtime	Split endpoint, reply, shared-region, accounting, and test modules.
+kernel/mm/src/memory/address_space.rs	1382	memory	Split page-table mutation, VMA admission, teardown, and tests.
+kernel/ps/src/multitask/scheduler.rs	5410	scheduler	Split run queues, wakeup, deadlines, switching, accounting, and tests.
+kernel/ps/src/user/handles/table.rs	1312	process-handles	Split table mutation, transfer transactions, retirement, and tests.
+libs/driver-domain-host/src/lib.rs	5268	driver-domain-host	Split manifest, lease, QMP, recovery, and process supervision.
+libs/driver-domain-protocol/src/lib.rs	4149	driver-domain-protocol	Split block, network, input, display, and control wire modules.
+libs/runtime-control/src/lib.rs	1341	runtime-control	Split codec, authority, command lifecycle, and tests.
+libs/rustos-image-admission/src/lib.rs	1518	image-admission	Split ELF, PE, region-plan, signature, and tests.
+libs/rustos-user-abi/src/linux.rs	1531	user-abi	Split Linux constants and structures by syscall family.
+libs/rustos-user-abi/src/syscall.rs	2998	user-abi	Split kernel mechanism ABI from service broker protocol families.
+services/inputd/src/main.rs	1816	inputd	Split ingress admission, queue/readiness, service RPC, and runtime.
+services/netd/src/main.rs	3057	netd	Split device ingress, socket state, routing policy, service RPC, and tests.
+services/rootd/src/main.rs	2935	rootd	Split bootstrap graph, authority leases, restart policy, and checkpoints.
+services/syscalld/src/linux_policy.rs	1532	syscalld	Split process, memory, entropy, credential, and advisory policies.
+services/uiserver/src/main.rs	1303	uiserver	Split bootstrap, main loop, client supervision, and diagnostics.
+services/uiserver/src/render.rs	1619	uiserver-render	Split scene planning, damage, raster/composition, and tests.
+services/uiserver/src/sys.rs	1541	uiserver-sys	Split syscall wrappers by IPC, VM, wait, input, and display.
+services/uiserver/src/wayland.rs	3190	uiserver-wayland	Split protocol objects, dispatch, surface lifecycle, and tests.
+tools/hostd/src/runtime.rs	2841	hostd	Split launch, QMP, process identity, recovery, and evidence sealing.
+tools/xtask/src/build/mod.rs	1505	xtask-build	Split build planning, signing, staging, and artifact validation.
+tools/xtask/src/formal_contracts/registry.rs	1583	xtask-formal	Split schema decode, semantic validation, generation, and tests.
+tools/xtask/src/stage/mod.rs	1349	xtask-stage	Split package staging, manifests, extents, and signing inputs.

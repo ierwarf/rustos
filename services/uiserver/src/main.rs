@@ -66,6 +66,11 @@ const UI_PHASE_WAYLAND: usize = 2;
 const UI_PHASE_RUNTIME: usize = 3;
 const UI_PHASE_CONSOLE: usize = 4;
 const UI_PHASE_MAIN_PRESENT: usize = 5;
+const UI_PHASE_WAIT_CHECK: usize = 6;
+const UI_PHASE_WAIT_DEADLINE: usize = 7;
+const UI_PHASE_WAIT_RECHECK: usize = 8;
+const UI_PHASE_WAIT_PARK: usize = 9;
+const UI_PHASE_WAIT_RETURNED: usize = 10;
 
 static FRAME_SAMPLE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static SLOW_CONSOLE_REFRESH_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -105,6 +110,7 @@ struct UiLoopWatchdog {
     boot_started: Instant,
     phase: Arc<AtomicUsize>,
     phase_started_ms: Arc<AtomicU64>,
+    last_progress_ms: Arc<AtomicU64>,
     loop_seq: Arc<AtomicU64>,
 }
 
@@ -114,10 +120,12 @@ impl UiLoopWatchdog {
             boot_started,
             phase: Arc::new(AtomicUsize::new(UI_PHASE_IDLE)),
             phase_started_ms: Arc::new(AtomicU64::new(0)),
+            last_progress_ms: Arc::new(AtomicU64::new(elapsed_ms_since(boot_started))),
             loop_seq: Arc::new(AtomicU64::new(0)),
         };
         let phase = Arc::clone(&watchdog.phase);
         let phase_started_ms = Arc::clone(&watchdog.phase_started_ms);
+        let last_progress_ms = Arc::clone(&watchdog.last_progress_ms);
         let loop_seq = Arc::clone(&watchdog.loop_seq);
         let thread_started = boot_started;
         let _ = thread::Builder::new()
@@ -127,12 +135,12 @@ impl UiLoopWatchdog {
                 loop {
                     thread::sleep(UI_WATCHDOG_CHECK_INTERVAL);
                     let phase_id = phase.load(Ordering::Acquire);
-                    if phase_id == UI_PHASE_IDLE {
-                        continue;
-                    }
-                    let started_ms = phase_started_ms.load(Ordering::Acquire);
                     let now_ms = elapsed_ms_since(thread_started);
-                    let elapsed_ms = now_ms.saturating_sub(started_ms);
+                    let elapsed_ms = if phase_id == UI_PHASE_IDLE {
+                        now_ms.saturating_sub(last_progress_ms.load(Ordering::Acquire))
+                    } else {
+                        now_ms.saturating_sub(phase_started_ms.load(Ordering::Acquire))
+                    };
                     if elapsed_ms < UI_PHASE_PANIC_THRESHOLD_MS {
                         continue;
                     }
@@ -149,6 +157,8 @@ impl UiLoopWatchdog {
     }
 
     fn begin_loop(&self, loop_id: u64) {
+        self.last_progress_ms
+            .store(elapsed_ms_since(self.boot_started), Ordering::Release);
         self.loop_seq.store(loop_id, Ordering::Release);
     }
 
@@ -174,6 +184,11 @@ fn ui_phase_name(phase: usize) -> &'static str {
         UI_PHASE_RUNTIME => "runtime",
         UI_PHASE_CONSOLE => "console",
         UI_PHASE_MAIN_PRESENT => "main-present",
+        UI_PHASE_WAIT_CHECK => "wait-check",
+        UI_PHASE_WAIT_DEADLINE => "wait-deadline",
+        UI_PHASE_WAIT_RECHECK => "wait-recheck",
+        UI_PHASE_WAIT_PARK => "wait-park",
+        UI_PHASE_WAIT_RETURNED => "wait-returned",
         _ => "idle",
     }
 }
@@ -1229,7 +1244,16 @@ fn run() -> Result<(), i32> {
             if state.cursor_motion_active() {
                 sleep_deadline = sleep_deadline.min(next_cursor_motion_settle);
             }
-            input_loop::sleep_until_input_or(&input_events, sleep_deadline);
+            input_loop::sleep_until_input_or(&input_events, sleep_deadline, |phase| {
+                watchdog.enter(match phase {
+                    input_loop::InputWaitPhase::CheckGeneration => UI_PHASE_WAIT_CHECK,
+                    input_loop::InputWaitPhase::ComputeDeadline => UI_PHASE_WAIT_DEADLINE,
+                    input_loop::InputWaitPhase::RecheckGeneration => UI_PHASE_WAIT_RECHECK,
+                    input_loop::InputWaitPhase::Park => UI_PHASE_WAIT_PARK,
+                    input_loop::InputWaitPhase::Returned => UI_PHASE_WAIT_RETURNED,
+                });
+            });
+            watchdog.leave();
         }
         phase_timings.sleep = sleep_started.elapsed();
 

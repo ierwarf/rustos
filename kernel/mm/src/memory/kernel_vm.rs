@@ -1,13 +1,27 @@
+//! Kernel image protection, direct-map permissions, and bounded MMIO windows.
+//!
+//! - **Owner:** `kernel-mm` owns active kernel page-table mutation.
+//! - **Boundary:** Linker ranges and hardware MMIO apertures are admitted
+//!   before mapping authority is published.
+//! - **Lifecycle:** Reserve, map with final permissions, publish, unmap, and
+//!   release; partial failure rolls back the complete window.
+//! - **Concurrency:** Kernel mapping mutation is serialized and never blocks
+//!   on a service while page-table state is half-applied.
+//! - **Failure:** Noncanonical, overflowing, overlapping, W+X, and unknown
+//!   unmap requests fail without changing unrelated entries.
+//! - **Forbidden:** No permanent writable executable direct map or unbounded
+//!   device mapping.
+//! - **Evidence:** `kernel-memory-protection`.
 use core::convert::TryFrom;
 use core::ptr::{addr_of, addr_of_mut};
 use core::slice;
 
 use boot_protocol::BootInfo;
+use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
 use object::LittleEndian;
 use object::elf::{
     self as objelf, FileHeader64 as RawElfHeader, ProgramHeader64 as RawProgramHeader,
 };
-use spin::Mutex;
 use x86_64::PhysAddr;
 use x86_64::VirtAddr;
 use x86_64::instructions::{interrupts, tlb};
@@ -86,7 +100,10 @@ impl MmioWindowSlot {
     }
 }
 
-pub static KERNEL_PML4: Mutex<PML4<KERNEL_PML4_SIZE_GB>> = Mutex::new(PML4 {
+pub static KERNEL_PML4: TrackedSpinLock<
+    PML4<KERNEL_PML4_SIZE_GB>,
+    { LockClass::KernelPageTable as u8 },
+> = TrackedSpinLock::new(PML4 {
     pml4: PageTable::new(),
     pdp: PageTable::new(),
     pd: [const { PageTable::new() }; KERNEL_PML4_SIZE_GB],
@@ -96,7 +113,8 @@ pub static KERNEL_PML4: Mutex<PML4<KERNEL_PML4_SIZE_GB>> = Mutex::new(PML4 {
     split_pt: [const { PageTable::new() }; DIRECT_MAP_SPLIT_TABLES],
     split_blocks: [SPLIT_BLOCK_UNMAPPED; DIRECT_MAP_SPLIT_TABLES],
 });
-static DIRECT_MAP_UPDATE_SERIALIZER: Mutex<()> = Mutex::new(());
+static DIRECT_MAP_UPDATE_SERIALIZER: TrackedSpinLock<(), { LockClass::DirectMapUpdate as u8 }> =
+    TrackedSpinLock::new(());
 
 #[repr(C)]
 pub struct PML4<const SIZE_GB: usize> {
@@ -1158,6 +1176,30 @@ fn mmio_slot_base(slot: usize) -> u64 {
     MMIO_WINDOW_BASE + slot as u64 * HUGE_2MIB
 }
 
+fn map_mmio_range_internal(phys_addr: u64, size: usize, write_combine: bool) -> Option<u64> {
+    if size == 0 {
+        return None;
+    }
+
+    let phys_block = phys_addr / HUGE_2MIB;
+    let offset = phys_addr % HUGE_2MIB;
+    let last = phys_addr.checked_add(size.saturating_sub(1) as u64)?;
+    let last_block = last / HUGE_2MIB;
+    let block_count = (last_block - phys_block + 1) as usize;
+    let flags = if write_combine {
+        MMIO_WRITE_COMBINE_FLAGS
+    } else {
+        MMIO_UNCACHED_FLAGS
+    };
+
+    interrupts::without_interrupts(|| {
+        let mut pml4 = KERNEL_PML4.lock();
+        pml4.ensure_current_root_mmio_window_entry();
+        pml4.map_mmio_blocks(phys_block, block_count, flags)
+            .map(|virt_base| virt_base + offset)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1191,28 +1233,4 @@ mod tests {
         assert!(write_add.contains(PageTableFlags::WRITABLE));
         assert!(write_add.contains(PageTableFlags::NO_EXECUTE));
     }
-}
-
-fn map_mmio_range_internal(phys_addr: u64, size: usize, write_combine: bool) -> Option<u64> {
-    if size == 0 {
-        return None;
-    }
-
-    let phys_block = phys_addr / HUGE_2MIB;
-    let offset = phys_addr % HUGE_2MIB;
-    let last = phys_addr.checked_add(size.saturating_sub(1) as u64)?;
-    let last_block = last / HUGE_2MIB;
-    let block_count = (last_block - phys_block + 1) as usize;
-    let flags = if write_combine {
-        MMIO_WRITE_COMBINE_FLAGS
-    } else {
-        MMIO_UNCACHED_FLAGS
-    };
-
-    interrupts::without_interrupts(|| {
-        let mut pml4 = KERNEL_PML4.lock();
-        pml4.ensure_current_root_mmio_window_entry();
-        pml4.map_mmio_blocks(phys_block, block_count, flags)
-            .map(|virt_base| virt_base + offset)
-    })
 }

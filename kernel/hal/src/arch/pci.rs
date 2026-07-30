@@ -1,3 +1,17 @@
+//! Transactional PCI configuration and BAR resource discovery.
+//!
+//! - **Owner:** `kernel-hal` owns privileged PCI config-space mechanism.
+//! - **Boundary:** Device-reported BAR masks, widths, and capabilities are
+//!   untrusted hardware input.
+//! - **Lifecycle:** Disable decode, probe, restore every touched register, then
+//!   publish one admitted resource or no resource.
+//! - **Concurrency:** BSP discovery is serialized; runtime mutations require
+//!   an explicit owner lease.
+//! - **Failure:** Overflow, malformed masks, unsupported layouts, and restore
+//!   mismatch reject the resource without leaving decode state altered.
+//! - **Forbidden:** No truncated BAR, guest-selected address, or partial
+//!   command-register restore.
+//! - **Evidence:** `pci-resource-discovery`.
 use core::ptr;
 
 use x86_64::instructions::port::Port;

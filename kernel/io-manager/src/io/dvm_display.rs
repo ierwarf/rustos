@@ -1,3 +1,19 @@
+//! DVM display aperture, immutable snapshot, damage, and provider substrate.
+//!
+//! - **Owner:** `kernel-io-manager` owns fixed shared-memory mechanics;
+//!   `uiserver` owns composition and the Linux DVM owns device presentation.
+//! - **Boundary:** Shared headers, slot state, geometry, pitch, damage,
+//!   generations, and completions are untrusted.
+//! - **Lifecycle:** Transactionally install matched apertures/vectors, publish
+//!   complete immutable snapshots, release exact slots, revoke provider, and
+//!   re-prime a new epoch.
+//! - **Concurrency:** IRQ callbacks mark pending only; copy/publish ordering and
+//!   provider replacement are serialized in normal context.
+//! - **Failure:** Invalid topology/damage/history, timeout, stale completion,
+//!   restart, and detach race retain the previous valid front or revoke.
+//! - **Forbidden:** No user pointer, partial snapshot publication, CPU-render
+//!   success fallback, untracked vector, or stale slot authority.
+//! - **Evidence:** `dvm-display-ingress` and `gpu-frame-lifecycle`.
 // RING3-MIGRATION-REFERENCE START: GUI-DVM display transport substrate.
 // Policy stays in uiserver and the GUI DVM. Ring0 only maps the exact
 // host-created three-slot pool, maps one slot-scoped staging capability to
@@ -187,7 +203,7 @@ pub(crate) enum DvmGpuSubmitOutcome {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DvmGpuCompletionOutcome {
-    Completed([u8; driver_domain_protocol::DVM_GPU_ATLAS_COMPLETION_SLOT_BYTES]),
+    Completed,
     Pending,
     Unavailable,
     Invalid,
@@ -378,6 +394,14 @@ pub(crate) fn ensure_installed_before_present() {
 
 pub(crate) fn gpu_atlas_info() -> Option<GpuAtlasInfo> {
     drain_dvm_control();
+    gpu_atlas_info_snapshot()
+}
+
+/// Read the already-published atlas contract without transport discovery or
+/// MMIO mutation. Display ioctls use this after their explicit preflight so
+/// the per-process handle-table critical section never nests the sleepable
+/// MMIO registry.
+pub(crate) fn gpu_atlas_info_snapshot() -> Option<GpuAtlasInfo> {
     if !INSTALLED.load(Ordering::Acquire)
         || TRANSPORT_REVOKED.load(Ordering::Acquire)
         || !GUI_DVM_PEER_READY.load(Ordering::Acquire)
@@ -575,7 +599,10 @@ pub(crate) fn try_submit_gpu_atlas(
     DvmGpuSubmitOutcome::Submitted
 }
 
-pub(crate) fn query_gpu_atlas_completion(binding_slot: u32) -> DvmGpuCompletionOutcome {
+pub(crate) fn query_gpu_atlas_completion(
+    binding_slot: u32,
+    result: &mut [u8; driver_domain_protocol::DVM_GPU_ATLAS_COMPLETION_SLOT_BYTES],
+) -> DvmGpuCompletionOutcome {
     if !INSTALLED.load(Ordering::Acquire) || TRANSPORT_REVOKED.load(Ordering::Acquire) {
         return DvmGpuCompletionOutcome::Unavailable;
     }
@@ -637,7 +664,8 @@ pub(crate) fn query_gpu_atlas_completion(binding_slot: u32) -> DvmGpuCompletionO
     GPU_SLOT_CONTEXT_EPOCH[slot].store(0, Ordering::Release);
     GPU_SLOT_SUBMIT_VALUE[slot].store(0, Ordering::Release);
     GPU_SLOT_STATE[slot].store(GPU_SLOT_FREE, Ordering::Release);
-    DvmGpuCompletionOutcome::Completed(bytes)
+    *result = bytes;
+    DvmGpuCompletionOutcome::Completed
 }
 
 fn parse_gpu_batch(
@@ -793,21 +821,20 @@ pub(crate) fn try_publish_full(
 }
 
 pub(crate) fn try_publish_rect(
-    src_ptr: *const u8,
-    width: usize,
-    height: usize,
-    stride_bytes: usize,
-    x: u32,
-    y: u32,
-    rect_width: u32,
-    rect_height: u32,
+    frame: crate::io::gui::KernelBgraFrame,
+    rect: crate::io::gui::GuiDamageRect,
 ) -> DvmPresentOutcome {
     publish_frame(
-        src_ptr,
-        width,
-        height,
-        stride_bytes,
-        DvmDisplayDamage::rect(x, y, rect_width, rect_height),
+        frame.src_ptr,
+        frame.width,
+        frame.height,
+        frame.stride_bytes,
+        DvmDisplayDamage::rect(
+            rect.x as u32,
+            rect.y as u32,
+            rect.width as u32,
+            rect.height as u32,
+        ),
     )
 }
 
@@ -1124,6 +1151,18 @@ fn drain_dvm_control() {
         };
         GPU_CONTEXT_EPOCH.store(next_epoch, Ordering::Release);
         write_u32(DVM_GPU_ATLAS_CONTEXT_EPOCH_OFFSET, next_epoch);
+        nucleus_core::debug::write_debugcon_only_line(
+            alloc::format!(
+                "gui-dvm: peer offline lease revoked context_epoch={}",
+                next_epoch
+            )
+            .as_bytes(),
+        );
+        // Recovery must not depend on unrelated cursor or client damage.
+        // Re-advertise the newest complete front immediately after revocation
+        // so a replacement DVM can prime the new context while the desktop is
+        // otherwise idle.
+        reinvite_newest_ready_slot();
     }
     if !GUI_DVM_CONTROL_IRQ_PENDING.swap(false, Ordering::AcqRel) {
         return;
@@ -1139,6 +1178,16 @@ fn drain_dvm_control() {
         GPU_SUBMIT_FLAGS.store(prime.submit_flags, Ordering::Release);
         GUI_DVM_PEER_READY.store(true, Ordering::Release);
         write_u64(DVM_GUI_SURFACE_POOL_READY_CONFIRMATION_OFFSET, expected);
+        nucleus_core::debug::write_debugcon_only_line(
+            alloc::format!(
+                "gui-dvm: peer ready lease rebound invitation={} context_epoch={}",
+                expected,
+                // ORDERING: Peer-ready Release publication precedes this
+                // diagnostic Acquire snapshot; the value is evidence only.
+                GPU_CONTEXT_EPOCH.load(Ordering::Acquire)
+            )
+            .as_bytes(),
+        );
         // The first host present can legitimately precede Linux-DVM boot. In
         // that order its original doorbell is unobservable, so confirmation
         // is also the single replay-safe wakeup that lets the DVM consume the
@@ -1608,110 +1657,6 @@ fn release_gui_mappings(mapped: *mut u8, doorbell: *mut u8) {
 }
 
 #[cfg(test)]
-mod tests {
-    use driver_domain_protocol::{DvmDisplayDamage, DvmGuiSurfacePoolHeader};
-
-    use super::{
-        DvmPresentOutcome, SnapshotCopyPlan, contiguous_snapshot_copy_len, damage_bounds,
-        header_fits_resource, snapshot_copy_plan, try_publish_full,
-    };
-
-    #[test]
-    fn pool_header_must_cover_all_three_slots() {
-        let header = DvmGuiSurfacePoolHeader::new(32 * 1024 * 1024, 1600, 900);
-        assert!(header_fits_resource(header, 32 * 1024 * 1024));
-        assert!(!header_fits_resource(header, header.region_bytes - 1));
-    }
-
-    #[test]
-    fn damage_bounds_reject_overflow_and_accept_full_frame() {
-        assert_eq!(
-            damage_bounds(driver_domain_protocol::DvmDisplayDamage::full(), 1600, 900),
-            Some((0, 0, 1600, 900))
-        );
-        assert_eq!(
-            damage_bounds(
-                driver_domain_protocol::DvmDisplayDamage::rect(1599, 899, 2, 1),
-                1600,
-                900
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn exact_predecessor_snapshot_copies_only_declared_damage() {
-        let damage = DvmDisplayDamage::rect(100, 200, 32, 48);
-        assert_eq!(
-            snapshot_copy_plan(damage, 1600, 900, 40, 40, true),
-            Some(SnapshotCopyPlan {
-                x: 100,
-                y: 200,
-                width: 32,
-                height: 48,
-                incremental: true,
-            })
-        );
-    }
-
-    #[test]
-    fn stale_or_replaced_snapshot_forces_a_complete_copy() {
-        let damage = DvmDisplayDamage::rect(100, 200, 32, 48);
-        let complete = Some(SnapshotCopyPlan {
-            x: 0,
-            y: 0,
-            width: 1600,
-            height: 900,
-            incremental: false,
-        });
-        assert_eq!(
-            snapshot_copy_plan(damage, 1600, 900, 38, 40, true),
-            complete
-        );
-        assert_eq!(
-            snapshot_copy_plan(damage, 1600, 900, 40, 40, false),
-            complete
-        );
-        assert_eq!(
-            snapshot_copy_plan(DvmDisplayDamage::full(), 1600, 900, 40, 40, true),
-            complete
-        );
-    }
-
-    #[test]
-    fn full_width_snapshot_uses_one_bounded_bulk_copy() {
-        let full = SnapshotCopyPlan {
-            x: 0,
-            y: 0,
-            width: 1600,
-            height: 900,
-            incremental: false,
-        };
-        assert_eq!(
-            contiguous_snapshot_copy_len(full, 1600, 1600 * 4),
-            Some(1600 * 900 * 4)
-        );
-        assert_eq!(
-            contiguous_snapshot_copy_len(full, 1600, 1600 * 4 + 64),
-            Some((1600 * 4 + 64) * 900)
-        );
-
-        let partial = SnapshotCopyPlan {
-            x: 10,
-            y: 20,
-            width: 30,
-            height: 40,
-            incremental: true,
-        };
-        assert_eq!(contiguous_snapshot_copy_len(partial, 1600, 1600 * 4), None);
-    }
-
-    #[test]
-    fn missing_gui_dvm_is_unavailable_not_a_fallback_provider() {
-        assert_eq!(
-            try_publish_full(core::ptr::null(), 1, 1, 4),
-            DvmPresentOutcome::Unavailable
-        );
-    }
-}
+#[path = "display_transport_tests.rs"]
+mod tests;
 // RING3-MIGRATION-REFERENCE END: GUI-DVM display transport substrate.

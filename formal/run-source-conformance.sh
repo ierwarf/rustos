@@ -10,6 +10,107 @@ records="$(mktemp)"
 seen="$(mktemp)"
 trap 'rm -f "$records" "$seen"' EXIT
 
+# The boot nucleus intentionally uses the hosted x86_64 Cargo target for its
+# object format and selects bare-metal behavior with `rustos_boot_image`.
+# `target_os = "none"` therefore compiles the host branch into the real image
+# and must never gate kernel runtime behavior.
+if boot_cfg_misuse="$(rg -n 'target_os[[:space:]]*=[[:space:]]*"none"' kernel --glob '*.rs')" \
+    && [[ -n "$boot_cfg_misuse" ]]; then
+    printf '%s\n' "$boot_cfg_misuse" >&2
+    echo 'kernel boot behavior must use cfg(rustos_boot_image), not target_os = "none"' >&2
+    exit 1
+fi
+
+# Blocking is one scheduler transition: publishing a public commit-only leaf
+# would let callers reintroduce an interruptible commit/yield gap that the
+# SchedulerWakeup model deliberately excludes.
+if split_block_api="$(rg -n 'pub fn commit_block_current_task\(' kernel/ps/src --glob '*.rs')" \
+    && [[ -n "$split_block_api" ]]; then
+    printf '%s\n' "$split_block_api" >&2
+    echo 'scheduler block commit must not be exported without its atomic reschedule' >&2
+    exit 1
+fi
+
+# The syscall entry frame remains live across an interruptible scheduler tail.
+# Its SYSRET contract must be checked after the last possible resume, not
+# before publishing a continuation that may sleep and later be consumed.
+syscall_dispatch_body="$(
+    sed -n '/^extern "C" fn syscall_dispatch(/,/^fn dispatch_syscall(/p' \
+        kernel/compat/src/user/syscall/mod.rs
+)"
+tail_reschedule_line="$(
+    grep -n -m1 'multitask::reschedule_deferred_from_interruptible_syscall();' \
+        <<<"$syscall_dispatch_body" | cut -d: -f1
+)"
+return_validation_line="$(
+    grep -n -m1 'let return_abi = validate_syscall_entry_or_terminate(frame);' \
+        <<<"$syscall_dispatch_body" | cut -d: -f1
+)"
+if [[ -z "$tail_reschedule_line" || -z "$return_validation_line" \
+    || "$return_validation_line" -le "$tail_reschedule_line" ]]; then
+    echo 'syscall SYSRET contract must be validated after the last interruptible tail resume' >&2
+    exit 1
+fi
+
+# A deadline notification is recovery authority, not proof that the resumed
+# syscall completed. Futex waiter-table cleanup must precede timer
+# acknowledgement so a stuck resume path remains observable and re-notified.
+futex_wait_body="$(
+    sed -n '/^fn futex_wait(/,/^fn futex_wait_deadline_tick(/p' \
+        kernel/compat/src/user/syscall/linux/service_ops/futex_thread.rs
+)"
+cleanup_line="$(grep -n -m1 'let still_waiting = take_futex_waiter(task_id);' <<<"$futex_wait_body" | cut -d: -f1)"
+timer_ack_line="$(
+    grep -n 'crate::arch::rtc::disarm_sleep_waiter(task_id);' <<<"$futex_wait_body" \
+        | tail -n1 | cut -d: -f1
+)"
+if [[ -z "$cleanup_line" || -z "$timer_ack_line" || "$cleanup_line" -ge "$timer_ack_line" ]]; then
+    echo 'futex resume cleanup must precede deadline timer acknowledgement' >&2
+    exit 1
+fi
+
+# Futex wait/wake is scheduler substrate. Supported opcode/flag admission must
+# complete locally before waiter/deadline registration; a synchronous syscalld
+# round trip here can stall every userspace mutex and can lose an unpark before
+# the target has installed its waiter.
+futex_impl_body="$(
+    sed -n '/^pub fn futex_impl(/,/^fn validate_futex_policy_locally(/p' \
+        kernel/compat/src/user/syscall/linux/service_ops/futex_thread.rs
+)"
+if ! grep -Fq 'validate_futex_policy_locally(op, val3)' <<<"$futex_impl_body"; then
+    echo 'futex entry must validate its supported ABI envelope locally' >&2
+    exit 1
+fi
+if grep -Eq 'call_syscalld|SYSCALL_OFFLOAD_OP_LINUX_FUTEX_POLICY' <<<"$futex_impl_body"; then
+    echo 'futex scheduler substrate must not synchronously depend on syscalld' >&2
+    exit 1
+fi
+futex_context_body="$(
+    sed -n '/^fn current_futex_waiter_context(/,/^fn current_process_is_procd_policy_owner(/p' \
+        kernel/compat/src/user/syscall/linux/service_ops/futex_thread.rs
+)"
+if ! grep -Fq 'multitask::current_user_wait_binding()' <<<"$futex_context_body"; then
+    echo 'futex key admission must use the scheduler-local current task/MM binding' >&2
+    exit 1
+fi
+if grep -Eq 'with_current_user_process_state(_mut)?' <<<"$futex_context_body"; then
+    echo 'futex key admission must not contend on the process-state lock' >&2
+    exit 1
+fi
+
+time_hot_path_body="$(
+    sed -n '/^pub fn syscall_linux_nanosleep(/,/^fn rtc_datetime_to_unix_seconds(/p' \
+        kernel/compat/src/user/syscall/linux/service_ops/process_time.rs
+)"
+if ! grep -Fq 'validate_time_hot_path_locally' <<<"$time_hot_path_body"; then
+    echo 'clock and sleep hot paths must validate their fixed ABI envelope locally' >&2
+    exit 1
+fi
+if grep -Eq 'request_syscalld|with_current_user_process_state(_mut)?' <<<"$time_hot_path_body"; then
+    echo 'clock and sleep hot paths must not depend on process-state or policy-service latency' >&2
+    exit 1
+fi
+
 checks=0
 while IFS='|' read -r model package test_name features; do
     [[ -n "$model" ]] || continue
@@ -50,10 +151,12 @@ authority-identity-lifecycle/AuthorityIdentityLifecycle|kernel-ps|user::handles:
 authority-identity-lifecycle/AuthorityIdentityLifecycle|kernel-ps|multitask::identity_tests::task_identity_exhaustion_never_wraps_to_a_live_id
 authority-identity-lifecycle/AuthorityIdentityLifecycle|kernel-ps|multitask::process_table::tests::process_generations_fail_closed_instead_of_aliasing_stale_handles
 authority-identity-lifecycle/AuthorityIdentityLifecycle|kernel-compat|user::syscall::linux::proc_broker_ops::tests::broker_authority_identity_exhaustion_never_wraps
+authority-identity-lifecycle/AuthorityIdentityLifecycle|kernel-ipc-runtime|ipc::slab::tests::removed_handle_never_aliases_reused_slot
 root-authority-publication/RootAuthorityPublication|kernel-compat|user::syscall::linux::ipc_ops::tests::root_service_publication_is_boot_owner_sealed_and_epoch_bound
 root-authority-publication/RootAuthorityPublication|kernel-ipc-runtime|ipc::tests::process_owned_endpoint_allows_worker_and_rejects_foreign_process
 service-call-authority/ServiceCallAuthority|kernel-compat|user::syscall::linux::ipc_ops::tests::service_call_grants_are_exact_epoch_bounded_and_revocable
 service-call-authority/ServiceCallAuthority|kernel-ipc-runtime|ipc::tests::process_owned_endpoint_allows_worker_and_rejects_foreign_process
+service-call-authority/ServiceCallAuthority|nucleus-core|util::lockdep::tests::dependency_walk_detects_transitive_cycle_edge
 process-address-space-lifetime/ProcessAddressSpaceLifetime|kernel-ps|multitask::process_table::tests::exiting_process_rejects_new_thread_attachment
 early-system-admission/EarlySystemAdmission|boot-protocol|tests::early_system_records_are_fixed_bounded_and_canonical
 early-system-admission/EarlySystemAdmission|boot-protocol|tests::rejects_an_all_zero_rng_seed
@@ -115,17 +218,29 @@ remote-file-mapping/RemoteFileMapping|rustos-user-abi|syscall::syscall_tests::st
 remote-file-mapping/RemoteFileMapping|vfsd|tests::early_system_reads_chunk_larger_vfs_buffers_to_the_broker_bound
 remote-file-mapping/RemoteFileMapping|kernel-compat|user::syscall::linux::proc_broker_ops::tests::truncated_file_mapping_never_commits_zero_filled_tail
 syscall-simd-lifecycle/SyscallSimdLifecycle|kernel-ps|multitask::scheduler::tests::syscall_user_simd_snapshot_is_disjoint_from_scheduler_continuation
+syscall-simd-lifecycle/SyscallSimdLifecycle|kernel-compat|user::syscall::tests::sysret_validation_follows_last_interruptible_resume
+syscall-simd-lifecycle/SyscallSimdLifecycle|kernel-compat|user::syscall::tests::sysret_contract_rejects_forbidden_rflags
+syscall-scheduler-continuation/SyscallSchedulerContinuation|kernel-ps|multitask::scheduler::tests::scheduler_block_arm_is_exact_race_safe_and_terminally_revoked
+syscall-scheduler-continuation/SyscallSchedulerContinuation|kernel-ps|multitask::scheduler::tests::raced_wake_never_validates_a_consumed_current_frame
+syscall-scheduler-continuation/SyscallSchedulerContinuation|kernel-compat|user::syscall::tests::sysret_validation_follows_last_interruptible_resume
 clocksource-deadline/ClocksourceDeadline|kernel-hal|arch::acpi::tests::hpet_gas_requires_memory_qword_zero_offset_and_aligned_range
 clocksource-deadline/ClocksourceDeadline|kernel-hal|arch::rtc::tests::sleep_deadline_uses_monotonic_ticks_with_ceil_and_saturation
 clocksource-deadline/ClocksourceDeadline|kernel-hal|arch::rtc::tests::sleep_waiter_update_expiry_and_cancel_preserve_exact_task_ownership
 clocksource-deadline/ClocksourceDeadline|kernel-hal|arch::rtc::tests::sleep_waiter_clockevent_collision_is_nonblocking_and_retryable
+clocksource-deadline/ClocksourceDeadline|kernel-compat|user::syscall::linux::service_ops::process_time::tests::time_hot_path_admission_is_local_and_complete
 clocksource-deadline/ClocksourceDeadline|kernel-ps|multitask::scheduler::tests::scheduler_block_arm_is_exact_race_safe_and_terminally_revoked
 scheduler-wakeup/SchedulerWakeup|kernel-ps|multitask::scheduler::tests::scheduler_block_arm_is_exact_race_safe_and_terminally_revoked
+scheduler-wakeup/SchedulerWakeup|kernel-ps|multitask::scheduler::tests::raced_wake_never_validates_a_consumed_current_frame
+scheduler-wakeup/SchedulerWakeup|kernel-ps|multitask::scheduler::tests::live_noncurrent_task_must_retain_one_scheduler_state_owner
+scheduler-wakeup/SchedulerWakeup|kernel-hal|hooks::tests::scheduler_callback_runs_after_hook_registry_read_guard_is_released
+scheduler-wakeup/SchedulerWakeup|kernel-compat|user::syscall::linux::broker_ops::input_broker_ops::tests::ingestion_watchdog_is_bounded_below_ring_exhaustion_time
+scheduler-wakeup/SchedulerWakeup|kernel-compat|user::syscall::linux::service_ops::futex_thread::tests::task_identity_cleanup_removes_a_requeued_waiter
 scheduler-admission/SchedulerAdmission|runtimed|spawn::tests::catalog_weight_cannot_promote_an_untrusted_program
 scheduler-admission/SchedulerAdmission|runtimed|spawn::tests::only_the_exact_ui_server_path_receives_system_weight
 scheduler-cpu-distribution/SchedulerCpuDistribution|kernel-ps|multitask::scheduler::tests::bounded_system_burst_reserves_a_ready_user_turn
 scheduler-cpu-distribution/SchedulerCpuDistribution|kernel-ps|multitask::scheduler::tests::oldest_overdue_user_is_reserved_before_system_burst_exhaustion
 scheduler-cpu-distribution/SchedulerCpuDistribution|kernel-ps|multitask::scheduler::tests::event_wait_handoff_is_fifo_deduplicated_and_burst_bounded
+scheduler-cpu-distribution/SchedulerCpuDistribution|kernel-ps|multitask::scheduler::tests::overdue_system_continuation_precedes_a_fresh_latency_handoff
 scheduler-cpu-distribution/SchedulerCpuDistribution|kernel-ps|multitask::irq::tests::syscall_tail_consumes_every_deferred_or_handoff_request_exactly_once
 scheduler-thread-demotion/SchedulerThreadDemotion|kernel-ps|multitask::scheduler::tests::self_demotion_removes_only_the_base_system_class
 ipc-priority-inheritance/IpcPriorityInheritance|kernel-ps|multitask::scheduler::tests::synchronous_ipc_donation_promotes_and_revokes_a_transitive_user_chain
@@ -175,10 +290,23 @@ service-heap-lifecycle/ServiceHeapLifecycle|xtask|kvm::tests::ui_runtime_health_
 service-heap-lifecycle/ServiceHeapLifecycle|rootd|tests::production_root_installs_reclaiming_heap_before_first_allocation|host-test
 process-address-space-lifetime/ProcessAddressSpaceLifetime|kernel-ps|multitask::scheduler::tests::rejected_thread_attachment_releases_unpublished_stack
 process-address-space-lifetime/ProcessAddressSpaceLifetime|kernel-ps|user::sysops::usermem::tests::user_virt_addr_rejects_out_of_range_without_panicking
+process-signal-delivery/ProcessSignalDelivery|kernel-ps|multitask::scheduler::tests::process_stop_is_scheduler_wide_and_sigcont_resumes_before_delivery
+process-signal-delivery/ProcessSignalDelivery|kernel-ps|multitask::process_table::tests::child_stop_and_continue_status_require_exact_wait_options
+sigchld-notification/SigchldNotification|kernel-ps|multitask::scheduler::tests::process_sigchld_prefers_leader_and_retains_exact_coalesced_causes
+sigchld-notification/SigchldNotification|rustos-user-abi|syscall::syscall_tests::nocldstop_suppresses_only_nonterminal_child_state_changes
+sigchld-notification/SigchldNotification|kernel-compat|user::syscall::linux::support::tests::sigchld_selection_cannot_clear_unselected_or_future_causes
 exception-retirement-lifecycle/ExceptionRetirementLifecycle|kernel-hal|arch::idt::handlers::tests::general_exception_bridge_aligns_every_rust_call_boundary
 exception-retirement-lifecycle/ExceptionRetirementLifecycle|kernel-compat|user::syscall::tests::only_retired_final_thread_commits_fault_termination
 exception-retirement-lifecycle/ExceptionRetirementLifecycle|kernel-ps|multitask::scheduler::tests::retirement_revokes_task_and_process_ipc_authority
 futex-waiter-lifecycle/FutexWaiterLifecycle|kernel-compat|user::syscall::linux::service_ops::futex_thread::tests::task_identity_cleanup_removes_a_requeued_waiter
+futex-waiter-lifecycle/FutexWaiterLifecycle|kernel-compat|user::syscall::linux::service_ops::futex_thread::tests::supported_futex_admission_is_local_and_complete
+futex-waiter-lifecycle/FutexWaiterLifecycle|kernel-compat|user::syscall::linux::service_ops::futex_thread::tests::retired_task_cleanup_is_exact_and_idempotent
+futex-waiter-lifecycle/FutexWaiterLifecycle|kernel-compat|user::syscall::linux::service_ops::futex_thread::tests::robust_owner_death_preserves_waiters_and_rejects_foreign_owner
+futex-waiter-lifecycle/FutexWaiterLifecycle|kernel-compat|user::syscall::linux::service_ops::futex_thread::tests::robust_futex_offset_is_checked_before_user_access
+futex-waiter-lifecycle/FutexWaiterLifecycle|kernel-ps|multitask::scheduler::tests::retired_user_slot_waits_for_exact_runtime_cleanup_ack
+kernel-resource-accounting/KernelResourceAccounting|kernel-ipc-runtime|ipc::tests::process_endpoint_quota_is_bounded_and_returned_on_exit
+kernel-resource-accounting/KernelResourceAccounting|kernel-ipc-runtime|ipc::tests::process_shared_region_quota_is_bounded_until_reclaim_completes
+kernel-resource-accounting/KernelResourceAccounting|kernel-ps|multitask::process_table::tests::one_process_cannot_consume_the_global_task_table
 input-ingestion-worker/InputIngestionWorker|inputd|tests::ingestion_handoff_prevents_hot_reader_mutex_barging
 input-ingestion-worker/InputIngestionWorker|inputd|tests::full_dvm_ingest_batch_retries_without_requiring_another_irq
 input-ingestion-worker/InputIngestionWorker|inputd|tests::readiness_generation_closes_empty_queue_lost_wake_window
@@ -196,6 +324,8 @@ userspace-wait-set/UserspaceWaitSet|kernel-compat|user::syscall::linux::service_
 userspace-wait-set/UserspaceWaitSet|kernel-compat|user::syscall::linux::service_ops::poll_epoll::tests::provider_query_timeout_never_exceeds_the_wait_deadline_or_service_cap
 userspace-wait-set/UserspaceWaitSet|kernel-compat|user::syscall::linux::service_ops::poll_epoll::tests::provider_timeout_never_hides_readiness_found_earlier_in_the_scan
 userspace-wait-set/UserspaceWaitSet|kernel-compat|user::syscall::linux::service_ops::poll_epoll::tests::provider_revoke_is_reported_per_fd_as_error_and_hup
+userspace-wait-set/UserspaceWaitSet|kernel-compat|user::syscall::linux::service_ops::poll_epoll::tests::transient_vfs_reply_break_is_retried_inside_epoll_wait
+userspace-wait-set/UserspaceWaitSet|kernel-compat|user::syscall::linux::service_ops::ipc_helpers::tests::epoll_snapshot_reads_are_retry_safe
 userspace-wait-set/UserspaceWaitSet|kernel-compat|user::syscall::linux::service_ops::poll_epoll::tests::epoll_delete_does_not_require_a_live_provider_epoch
 userspace-wait-set/UserspaceWaitSet|kernel-compat|user::syscall::linux::service_ops::poll_epoll::tests::epoll_ctl_guard_pins_console_across_concurrent_final_close
 userspace-wait-set/UserspaceWaitSet|kernel-compat|user::syscall::linux::service_ops::poll_epoll::tests::console_output_is_writable_only_while_its_session_is_live
@@ -212,6 +342,7 @@ userspace-wait-set/UserspaceWaitSet|kernel-compat|user::syscall::linux::service_
 userspace-wait-set/UserspaceWaitSet|kernel-compat|user::syscall::linux::service_ops::vfs_socket::tests::transferred_input_description_keeps_the_waitset_service_reference
 userspace-wait-set/UserspaceWaitSet|kernel-compat|user::syscall::linux::service_ops::vfs_socket::tests::fork_service_refs_come_from_the_frozen_child_handle_snapshot
 service-mutation-recovery/ServiceMutationRecovery|kernel-compat|user::syscall::linux::service_ops::vfs_socket::tests::remote_vfs_refs_are_local_and_provider_close_is_final_only
+service-mutation-recovery/ServiceMutationRecovery|kernel-compat|user::syscall::linux::service_ops::vfs_socket::tests::netd_reference_retries_share_one_total_deadline
 service-mutation-recovery/ServiceMutationRecovery|kernel-compat|user::syscall::linux::service_ops::ipc_helpers::tests::foreground_vfs_maintenance_is_one_bounded_replay_turn
 service-mutation-recovery/ServiceMutationRecovery|netd|ref_replay_tests::close_retry_replays_exact_result_and_rejects_operation_alias
 service-mutation-recovery/ServiceMutationRecovery|rootd|service_checkpoint::tests::exact_retry_is_idempotent_and_stale_retry_cannot_rollback|host-test
@@ -227,6 +358,7 @@ userspace-wait-set/UserspaceWaitSet|vfsd|tests::epoll_membership_binds_open_desc
 userspace-wait-set/UserspaceWaitSet|vfsd|tests::epoll_snapshot_rotates_a_persistently_ready_prefix
 userspace-wait-set/UserspaceWaitSet|vfsd|tests::provider_restart_updates_epoch_without_duplicating_registration_identity
 userspace-wait-set/UserspaceWaitSet|uiserver|wayland::tests::wayland_readiness_requires_one_dispatch_before_rearm
+userspace-wait-set/UserspaceWaitSet|uiserver|wayland::tests::wayland_readiness_retries_only_transient_transport_failures
 userspace-wait-set/UserspaceWaitSet|uiserver|input_loop::tests::input_reader_probe_deadline_does_not_accumulate_missed_slots
 userspace-wait-set/UserspaceWaitSet|netd|packet_provider_state_tests::inet_ingress_publishes_only_socket_state_transitions
 userspace-wait-set/UserspaceWaitSet|runtimed|session::tests::console_readiness_generation_advances_only_when_input_becomes_ready
@@ -252,7 +384,8 @@ dvm-gpu-compositor/DvmGpuCompositor|driver-domain-protocol|tests::gpu_timeline_i
 dvm-gpu-compositor/DvmGpuCompositor|uiserver|gpu_scene::tests::scene_compiler_normalizes_atlas_subrect_and_rejects_escape
 dvm-gpu-compositor/DvmGpuCompositor|uiserver|gpu_runtime::tests::slot_reconstruction_budget_rejects_atlas_amplification
 dvm-gpu-compositor/DvmGpuCompositor|uiserver|gpu_runtime::tests::frame_deadline_skips_missed_slots_without_drift_or_burst
-dvm-gpu-compositor/DvmGpuCompositor|uiserver|gpu_runtime::tests::completion_timeout_is_measured_from_submission_without_a_blocking_wait
+dvm-gpu-compositor/DvmGpuCompositor|uiserver|gpu_runtime::tests::completion_timeout_separates_activation_from_steady_state
+dvm-gpu-admission/DvmGpuAdmission|uiserver|gpu_runtime::tests::completion_timeout_separates_activation_from_steady_state
 msi-vector-lifecycle/MsiVectorLifecycle|kernel-hal|arch::msi::tests::unallocated_vector_has_no_registration_authority
 msi-vector-lifecycle/MsiVectorLifecycle|kernel-hal|arch::msi::tests::failed_unpublished_vector_lease_revokes_exact_handler_and_slot
 acpi-table-admission/AcpiTableAdmission|kernel-hal|arch::acpi::tests::root_sdt_requires_exact_signature_width_and_entry_alignment
@@ -291,8 +424,10 @@ endpoint-publication/EndpointPublication|kernel-compat|user::syscall::linux::ipc
 runtime-control-rpc/RuntimeControlRpc|runtime-control|tests::successful_response_must_echo_the_request_opcode
 runtime-control-rpc/RuntimeControlRpc|runtime-control|tests::malformed_status_and_oversized_snapshot_fail_closed
 runtime-control-authority/RuntimeControlAuthority|runtimed|socket::tests::runtime_control_mutations_require_live_uiserver_or_logical_admin
+runtime-control-authority/RuntimeControlAuthority|runtimed|socket::tests::partial_background_client_never_busy_waits_the_policy_loop
 ipc-reply-deadline/IpcReplyDeadline|kernel-ipc-runtime|ipc::tests::endpoint_cancel_dequeued_call_invalidates_late_reply
 ipc-reply-deadline/IpcReplyDeadline|kernel-ipc-runtime|ipc::tests::endpoint_cancel_rejects_wrong_caller_without_consuming_reply
+ipc-reply-deadline/IpcReplyDeadline|kernel-ipc-runtime|ipc::tests::retiring_caller_may_consume_the_exact_global_message_capacity
 ipc-reply-deadline/IpcReplyDeadline|rustos-user-abi|tests::performance_limits_are_strictly_layered
 ipc-reply-deadline/IpcReplyDeadline|kernel-compat|user::syscall::linux::ipc_ops::tests::public_ipc_calls_share_the_finite_service_deadline
 ipc-reply-deadline/IpcReplyDeadline|kernel-compat|user::syscall::linux::ipc_ops::tests::stable_service_endpoint_snapshot_rejects_revoked_owners
@@ -333,6 +468,10 @@ network-payload-session/NetworkPayloadSession|driver-domain-protocol|tests::dvm_
 post-init-supervisor-recovery/PostInitSupervisorRecovery|rootd|tests::reporter_exit_cascades_and_capability_requires_live_reporter_chain|host-test
 trusted-ui-boundary/TrustedUiBoundary|uiserver|sys::tests::trusted_ui_status_fails_closed_for_every_current_scanout
 ui-frame-budget/UiFrameBudget|uiserver|gpu_runtime::tests::frame_deadline_skips_missed_slots_without_drift_or_burst
+ui-main-loop-wakeup/UiMainLoopWakeup|uiserver|input_loop::tests::prequeued_wake_never_commits_a_timeout_sleep
+ui-main-loop-wakeup/UiMainLoopWakeup|uiserver|input_loop::tests::coalesced_notification_tokens_still_advance_readiness_generation
+ui-main-loop-wakeup/UiMainLoopWakeup|kernel-hal|arch::rtc::tests::sleep_waiter_update_expiry_and_cancel_preserve_exact_task_ownership
+ui-main-loop-wakeup/UiMainLoopWakeup|wayclick|damage_tests::first_frame_marker_is_the_user_visible_boot_terminal
 ui-input-motion/UiInputMotion|uiserver|input_loop::tests::input_reader_batch_coalesces_relative_motion
 vfio-release-authorization/VfioReleaseAuthorization|rustos-driver-domain-host|tests::release_authorization_binds_artifacts_policy_and_complete_iommu_group
 product-boot/ProductBoot|vfsd|tests::executable_snapshot_marker_binds_path_and_exact_length

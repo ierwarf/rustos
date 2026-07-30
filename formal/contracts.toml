@@ -1,11 +1,23 @@
 schema = 3
-max_intentional_terminal_models = 90
+max_intentional_terminal_models = 91
 models = "formal/models.tsv"
 model_bindings = "formal/model-bindings.tsv"
 flows = "formal/system-flows.tsv"
 scenarios = "formal/product-scenarios.tsv"
 witnesses = "formal/run-source-conformance.sh"
 generated_doc = "docs/ai/formal-contracts.generated.md"
+
+[[risk_surfaces]]
+path = "kernel/src/main.rs"
+severity = "critical"
+flows = ["kernel-memory-protection", "physical-frame-lifecycle", "entropy-boundary", "service-bootstrap"]
+reason = "The BSP entry orders every ring0 trust boundary and must not publish a partially initialized kernel."
+
+[[risk_surfaces]]
+path = "kernel/nucleus-core/src/bootstrap_stack.rs"
+severity = "critical"
+flows = ["kernel-memory-protection", "service-bootstrap"]
+reason = "The one-shot privilege stack must remain aligned, private, BSP-only, and non-reusable."
 
 [[risk_surfaces]]
 path = "kernel/hal/src/arch/idt/handlers.rs"
@@ -30,6 +42,12 @@ path = "kernel/hal/src/arch/rtc.rs"
 severity = "critical"
 flows = ["monotonic-deadline-lifecycle", "scheduler-lifecycle"]
 reason = "Deadline ownership and wake delivery must not lose, duplicate, or indefinitely delay a waiter."
+
+[[risk_surfaces]]
+path = "kernel/compat/src/user/syscall/linux/service_ops/process_time.rs"
+severity = "critical"
+flows = ["monotonic-deadline-lifecycle"]
+reason = "Clock and finite-sleep admission must remain local and lock-independent until exact timer recovery authority is armed."
 
 [[risk_surfaces]]
 path = "kernel/hal/src/arch/msi.rs"
@@ -58,8 +76,8 @@ reason = "Interrupt exclusion and saved-context layout are foundational ring0 co
 [[risk_surfaces]]
 path = "kernel/ipc-runtime/src/ipc/mod.rs"
 severity = "critical"
-flows = ["ipc-call", "endpoint-lifecycle", "ipc-handle-transfer", "root-authority", "service-call-authority"]
-reason = "IPC queues, replies, endpoint owners, and transferred capabilities are the microkernel authority spine."
+flows = ["ipc-call", "endpoint-lifecycle", "ipc-handle-transfer", "kernel-resource-lifecycle", "root-authority", "service-call-authority"]
+reason = "IPC queues, replies, endpoint owners, owner quotas, shared backing, and transferred capabilities are the microkernel authority spine."
 
 [[risk_surfaces]]
 path = "kernel/mm/src/memory/address_space.rs"
@@ -78,6 +96,12 @@ path = "kernel/mm/src/memory/phys.rs"
 severity = "critical"
 flows = ["physical-frame-lifecycle"]
 reason = "Frame reservation, allocation, and one-time release determine all physical memory ownership."
+
+[[risk_surfaces]]
+path = "kernel/mm/src/memory/heap.rs"
+severity = "critical"
+flows = ["kernel-resource-lifecycle", "physical-frame-lifecycle"]
+reason = "Every kernel allocation passes through an IRQ-off tracker and buddy allocator; unbounded validation or provenance drift can stall or corrupt ring0."
 
 [[risk_surfaces]]
 path = "kernel/mm/src/api.rs"
@@ -106,8 +130,14 @@ reason = "Pure mmap classification must accept the complete backing contract bef
 [[risk_surfaces]]
 path = "kernel/ps/src/multitask/process_table.rs"
 severity = "critical"
-flows = ["process-address-space-lifecycle", "endpoint-lifecycle"]
-reason = "Process generation, exit, address-space, and endpoint lifetime share one identity boundary."
+flows = ["process-address-space-lifecycle", "endpoint-lifecycle", "kernel-resource-lifecycle"]
+reason = "Process generation, exit, address-space, endpoint lifetime, and per-process task admission share one identity boundary."
+
+[[risk_surfaces]]
+path = "kernel/ps/src/user/process_state.rs"
+severity = "critical"
+flows = ["memory-map", "process-address-space-lifecycle"]
+reason = "Per-process VMA backing holds must outlive descriptor close, fork exactly, and release on partial unmap or exec."
 
 [[risk_surfaces]]
 path = "kernel/ps/src/multitask/scheduler.rs"
@@ -158,6 +188,18 @@ flows = ["deferred-process-activation", "loader-request-authority", "post-init-s
 reason = "Loader transactions mutate process identity, mappings, handles, and executable authority."
 
 [[risk_surfaces]]
+path = "kernel/compat/src/user/syscall/linux/service_ops/ipc_helpers.rs"
+severity = "critical"
+flows = ["vfs-open-description"]
+reason = "Bounded service mutation retries must preserve identity, ordering, and exact requeue ownership without allocator-backed critical sections."
+
+[[risk_surfaces]]
+path = "kernel/compat/src/user/syscall/linux/service_ops/vfs_socket.rs"
+severity = "critical"
+flows = ["vfs-open-description"]
+reason = "Remote open-description references and deferred socket reference settlement share descriptor close and service restart boundaries."
+
+[[risk_surfaces]]
 path = "kernel/compat/src/user/syscall/linux/mm_broker_ops.rs"
 severity = "critical"
 flows = ["memory-map"]
@@ -179,7 +221,7 @@ reason = "Provider generations and waiter ownership close readiness lost-wake wi
 path = "kernel/compat/src/user/syscall/linux/service_ops/futex_thread.rs"
 severity = "critical"
 flows = ["futex-wait-lifecycle"]
-reason = "Futex wait, requeue, timeout, signal, and task exit share mutable waiter ownership."
+reason = "Futex local admission, wait, requeue, timeout, signal, and task exit share scheduler-critical waiter ownership and must not depend on policy-service IPC."
 
 [[risk_surfaces]]
 path = "kernel/compat/src/user/syscall/linux/block_broker_ops.rs"
@@ -188,10 +230,22 @@ flows = ["dvm-block-startup"]
 reason = "Storage startup waits must fail closed without fabricating provider readiness."
 
 [[risk_surfaces]]
+path = "kernel/compat/src/user/syscall/linux/input_broker_ops.rs"
+severity = "critical"
+flows = ["input-delivery-lifecycle"]
+reason = "Input ingestion watchdog waits must atomically arm, commit, reschedule, and revoke exact waiter authority."
+
+[[risk_surfaces]]
 path = "kernel/io-manager/src/io/dvm_block.rs"
 severity = "critical"
 flows = ["dvm-block-ingress", "dvm-block-startup", "dvm-volume-io", "durable-block-mutation"]
 reason = "Shared-ring storage authority, slot reuse, mutation durability, and revoke are data-loss boundaries."
+
+[[risk_surfaces]]
+path = "kernel/io-manager/src/io/dvm_network.rs"
+severity = "critical"
+flows = ["dvm-network-ingress"]
+reason = "Shared-ring network slot addressing must reject arithmetic overflow and every out-of-bounds transport record."
 
 [[risk_surfaces]]
 path = "kernel/io-manager/src/input/dvm_ring.rs"
@@ -271,9 +325,73 @@ severity = "critical"
 flows = ["dvm-display-ingress", "gpu-frame-lifecycle"]
 reason = "Frame submission, completion, timeout, and provider revoke directly affect interactive availability."
 
+[[risk_surfaces]]
+path = "kernel/compat/src/user/syscall/linux/device_broker_ops.rs"
+severity = "critical"
+flows = ["commercial-envelope", "service-call-authority"]
+reason = "Device handles and ioctl routes cross from service policy into ring0 capability installation."
+
+[[risk_surfaces]]
+path = "kernel/ps/src/user/memfd.rs"
+severity = "critical"
+flows = ["memory-map", "physical-frame-lifecycle", "vfs-open-description"]
+reason = "Memfd seals, shared frames, cursors, and mapping counts cross descriptor and address-space lifetimes."
+
+[[risk_surfaces]]
+path = "services/devmgrd/src/main.rs"
+severity = "critical"
+flows = ["commercial-envelope", "service-call-authority"]
+reason = "Device discovery and delegated ioctl policy can mint kernel capabilities and must remain bounded and owner-authenticated."
+
+[[source_mappings]]
+path = "kernel/src/main.rs"
+models = [
+    "page-table-lifecycle/PageTableLifecycle",
+    "physical-frame-lifecycle/PhysicalFrameLifecycle",
+    "entropy-broker-boundary/EntropyBrokerBoundary",
+    "service-bootstrap-lifecycle/ServiceBootstrapLifecycle",
+]
+
+[[source_mappings]]
+path = "kernel/nucleus-core/src/bootstrap_stack.rs"
+models = [
+    "page-table-lifecycle/PageTableLifecycle",
+    "service-bootstrap-lifecycle/ServiceBootstrapLifecycle",
+]
+
 [[source_mappings]]
 path = "kernel/hal/src/arch/simd.rs"
 models = ["syscall-simd-lifecycle/SyscallSimdLifecycle"]
+
+[[source_mappings]]
+path = "kernel/io-manager/src/io/display_transport_tests.rs"
+models = ["dvm-display-readiness/DvmDisplayReadiness"]
+
+[[source_mappings]]
+path = "services/uiserver/src/gpu_runtime_tests.rs"
+models = [
+    "dvm-display-readiness/DvmDisplayReadiness",
+    "dvm-gpu-admission/DvmGpuAdmission",
+]
+
+[[source_mappings]]
+path = "libs/driver-domain-host/src/ivshmem.rs"
+models = ["ivshmem-pairing/IvshmemPairing"]
+
+[[source_mappings]]
+path = "tools/xtask/src/kvm/guest.rs"
+models = [
+    "ivshmem-pairing/IvshmemPairing",
+    "dvm-display-readiness/DvmDisplayReadiness",
+    "dvm-block-transport/DvmBlockTransport",
+]
+
+[[source_mappings]]
+path = "tools/xtask/src/kvm/layout.rs"
+models = [
+    "ivshmem-pairing/IvshmemPairing",
+    "dvm-block-transport/DvmBlockTransport",
+]
 
 [[source_mappings]]
 path = "kernel/compat/src/user/syscall/linux/debug_ops.rs"
@@ -281,6 +399,10 @@ models = ["product-boot/ProductBoot"]
 
 [[source_mappings]]
 path = "kernel/hal/src/arch/clock.rs"
+models = ["clocksource-deadline/ClocksourceDeadline"]
+
+[[source_mappings]]
+path = "kernel/compat/src/user/syscall/linux/service_ops/process_time.rs"
 models = ["clocksource-deadline/ClocksourceDeadline"]
 
 [[source_mappings]]
@@ -300,14 +422,105 @@ models = [
 ]
 
 [[source_mappings]]
+path = "kernel/mm/src/memory/heap.rs"
+models = [
+    "kernel-resource-accounting/KernelResourceAccounting",
+    "physical-frame-lifecycle/PhysicalFrameLifecycle",
+]
+
+[[source_mappings]]
 path = "kernel/nucleus-core/src/debug/mod.rs"
 models = ["ui-frame-budget/UiFrameBudget"]
+
+[[source_mappings]]
+path = "kernel/nucleus-core/src/util/lockdep.rs"
+models = [
+    "ipc-endpoint-ownership/IpcEndpointOwnership",
+    "ipc-reply-deadline/IpcReplyDeadline",
+    "scheduler-wakeup/SchedulerWakeup",
+    "service-call-authority/ServiceCallAuthority",
+]
+
+[[source_mappings]]
+path = "kernel/compat/src/user/syscall/linux/syscalld_ops.rs"
+models = ["process-signal-delivery/ProcessSignalDelivery"]
+
+[[source_mappings]]
+path = "services/procd/src/main.rs"
+models = [
+    "process-signal-delivery/ProcessSignalDelivery",
+    "sigchld-notification/SigchldNotification",
+]
+
+[[source_mappings]]
+path = "libs/rustos-user-abi/src/syscall.rs"
+models = ["sigchld-notification/SigchldNotification"]
+
+[[source_mappings]]
+path = "kernel/compat/src/user/syscall/linux/support.rs"
+models = [
+    "process-signal-delivery/ProcessSignalDelivery",
+    "sigchld-notification/SigchldNotification",
+]
+
+[[source_mappings]]
+path = "kernel/compat/src/user/syscall/linux/service_ops/ipc_helpers.rs"
+models = [
+    "service-mutation-recovery/ServiceMutationRecovery",
+    "vfs-open-description-recovery/VfsOpenDescriptionRecovery",
+]
+
+[[source_mappings]]
+path = "kernel/compat/src/user/syscall/linux/service_ops/vfs_socket.rs"
+models = [
+    "vfs-open-description-recovery/VfsOpenDescriptionRecovery",
+]
+
+[[source_mappings]]
+path = "kernel/ipc-runtime/src/ipc/mod.rs"
+models = [
+    "ipc-endpoint-ownership/IpcEndpointOwnership",
+    "ipc-handle-transfer/IpcHandleTransfer",
+    "ipc-reply-deadline/IpcReplyDeadline",
+    "kernel-resource-accounting/KernelResourceAccounting",
+]
+
+[[source_mappings]]
+path = "kernel/ipc-runtime/src/ipc/slab.rs"
+models = [
+    "authority-identity-lifecycle/AuthorityIdentityLifecycle",
+    "ipc-endpoint-ownership/IpcEndpointOwnership",
+    "ipc-handle-transfer/IpcHandleTransfer",
+]
+
+[[source_mappings]]
+path = "kernel/ipc-runtime/src/api.rs"
+models = [
+    "ipc-endpoint-ownership/IpcEndpointOwnership",
+    "ipc-handle-transfer/IpcHandleTransfer",
+    "ipc-reply-deadline/IpcReplyDeadline",
+    "kernel-resource-accounting/KernelResourceAccounting",
+]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/process_table.rs"
+models = [
+    "kernel-resource-accounting/KernelResourceAccounting",
+    "process-address-space-lifetime/ProcessAddressSpaceLifetime",
+]
 
 [[source_mappings]]
 path = "kernel/ps/src/api.rs"
 models = [
     "process-address-space-lifetime/ProcessAddressSpaceLifetime",
     "syscall-simd-lifecycle/SyscallSimdLifecycle",
+]
+
+[[source_mappings]]
+path = "kernel/ps/src/user/process_state.rs"
+models = [
+    "page-table-lifecycle/PageTableLifecycle",
+    "process-address-space-lifetime/ProcessAddressSpaceLifetime",
 ]
 
 [[source_mappings]]
@@ -333,9 +546,38 @@ models = [
 [[source_mappings]]
 path = "kernel/ps/src/multitask/mod.rs"
 models = [
+    "futex-waiter-lifecycle/FutexWaiterLifecycle",
     "process-address-space-lifetime/ProcessAddressSpaceLifetime",
     "syscall-simd-lifecycle/SyscallSimdLifecycle",
 ]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/retirement.rs"
+models = ["futex-waiter-lifecycle/FutexWaiterLifecycle"]
+
+[[source_mappings]]
+path = "kernel/compat/src/api.rs"
+models = ["futex-waiter-lifecycle/FutexWaiterLifecycle"]
+
+[[source_mappings]]
+path = "kernel/compat/src/user/syscall/mod.rs"
+models = ["futex-waiter-lifecycle/FutexWaiterLifecycle"]
+
+[[source_mappings]]
+path = "kernel/compat/src/user/syscall/linux.rs"
+models = ["futex-waiter-lifecycle/FutexWaiterLifecycle"]
+
+[[source_mappings]]
+path = "kernel/compat/src/user/syscall/linux/broker_ops.rs"
+models = ["futex-waiter-lifecycle/FutexWaiterLifecycle"]
+
+[[source_mappings]]
+path = "kernel/compat/src/user/syscall/linux/lifecycle_broker_ops.rs"
+models = ["futex-waiter-lifecycle/FutexWaiterLifecycle"]
+
+[[source_mappings]]
+path = "kernel/executive/src/boot.rs"
+models = ["futex-waiter-lifecycle/FutexWaiterLifecycle"]
 
 [[source_mappings]]
 path = "kernel/compat/src/user/syscall/linux/ipc_ops.rs"
@@ -346,7 +588,22 @@ models = [
 
 [[source_mappings]]
 path = "kernel/io-manager/src/api.rs"
-models = ["input-ingestion-worker/InputIngestionWorker"]
+models = [
+    "futex-waiter-lifecycle/FutexWaiterLifecycle",
+    "input-ingestion-worker/InputIngestionWorker",
+]
+
+[[source_mappings]]
+path = "kernel/io-manager/src/input/wait_queue.rs"
+models = ["futex-waiter-lifecycle/FutexWaiterLifecycle"]
+
+[[source_mappings]]
+path = "kernel/io-manager/src/io/tty.rs"
+models = ["futex-waiter-lifecycle/FutexWaiterLifecycle"]
+
+[[source_mappings]]
+path = "kernel/io-manager/src/sync.rs"
+models = ["scheduler-wakeup/SchedulerWakeup"]
 
 [[source_mappings]]
 path = "kernel/io-manager/src/input/dvm_ring.rs"
@@ -356,8 +613,26 @@ models = [
 ]
 
 [[source_mappings]]
+path = "kernel/io-manager/src/io/dvm_network.rs"
+models = ["dvm-network-ring/DvmNetworkRing"]
+
+[[source_mappings]]
 path = "services/inputd/src/main.rs"
 models = ["input-ingestion-worker/InputIngestionWorker"]
+
+[[source_mappings]]
+path = "services/uiserver/src/input_loop.rs"
+models = [
+    "ui-frame-budget/UiFrameBudget",
+    "ui-main-loop-wakeup/UiMainLoopWakeup",
+]
+
+[[source_mappings]]
+path = "services/uiserver/src/main.rs"
+models = [
+    "ui-frame-budget/UiFrameBudget",
+    "ui-main-loop-wakeup/UiMainLoopWakeup",
+]
 
 [[source_mappings]]
 path = "services/vfsd/src/block.rs"
@@ -411,6 +686,29 @@ models = ["page-table-lifecycle/PageTableLifecycle"]
 [[source_mappings]]
 path = "tools/xtask/src/kvm/evidence.rs"
 models = ["service-heap-lifecycle/ServiceHeapLifecycle"]
+
+[[source_mappings]]
+path = "kernel/compat/src/user/syscall/linux/device_broker_ops.rs"
+models = [
+    "commercial-service-envelope/CommercialServiceEnvelope",
+    "service-call-authority/ServiceCallAuthority",
+]
+
+[[source_mappings]]
+path = "kernel/ps/src/user/memfd.rs"
+models = [
+    "page-table-lifecycle/PageTableLifecycle",
+    "physical-frame-lifecycle/PhysicalFrameLifecycle",
+    "vfs-open-description-recovery/VfsOpenDescriptionRecovery",
+]
+
+[[source_mappings]]
+path = "services/devmgrd/src/main.rs"
+models = [
+    "commercial-service-envelope/CommercialServiceEnvelope",
+    "devmgrd-sessiond-isolation/DevmgrdSessiondIsolation",
+    "service-call-authority/ServiceCallAuthority",
+]
 
 [profiles.pr]
 evidence_max_age_hours = 168

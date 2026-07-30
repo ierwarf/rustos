@@ -80,9 +80,15 @@ into services, not back into the kernel. Use `RING3-MIGRATION-REFERENCE` /
 ownership, broker call paths, and service contracts are the migration source
 of truth.
 
-**Product goal.** Preserve native Linux ELF and Windows PE compatibility.
-Migration moves policy to user services without breaking observable app ABI;
-ring0 code removal must go through narrow explicit brokers.
+**Product goal.** RustOS is a clean modern dual-ABI microkernel system:
+preserve native Linux ELF and Windows PE64/EXE application compatibility,
+isolate Linux driver stacks in DVMs, keep policy in named user services, and
+keep ring0 small, fast, and capability-oriented. Do not preserve obsolete
+`.ko`, kernel-extension, driver-private, or undocumented compatibility merely
+because older systems exposed it. Migration must not break the explicitly
+supported observable app ABI, and ring0 code removal goes through narrow
+explicit brokers. Source-writing, lifecycle, concurrency, comment, and
+refactoring rules live in `docs/ai/core-engineering-contract.md`.
 
 ## Commercial Completion Bar
 

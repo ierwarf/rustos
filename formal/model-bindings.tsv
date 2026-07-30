@@ -30,6 +30,7 @@ gui-dvm-surface/GuiDvmSurface	refinement	gpu-frame-lifecycle	Surface bounds and 
 input-readiness/InputReadiness	refinement	input-delivery-lifecycle	Check-arm-recheck readiness refines policy queue delivery.
 ipc-priority-inheritance/IpcPriorityInheritance	refinement	scheduler-dispatch	Reply-scoped donation refines scheduler dependency progress.
 ivshmem-pairing/IvshmemPairing	refinement	dvm-control-ingress	Exact peer pairing and disconnect refine DVM control lifetime.
+kernel-resource-accounting/KernelResourceAccounting	refinement	kernel-resource-lifecycle	Owner-scoped endpoint, shared-backing, and task ceilings refine bounded kernel resource admission and reclaim.
 memfd-seal-lifecycle/MemfdSealLifecycle	refinement	memory-map	Seal, mapping, resize, and release serialize shared-memory mapping authority.
 network-payload-session/NetworkPayloadSession	refinement	dvm-network-ingress	Packet shape and session generation refine DVM network ingress.
 persistent-mutation-admission/PersistentMutationAdmission	refinement	durable-block-mutation	Mutation authorization refines durable write admission.
@@ -41,9 +42,13 @@ service-heap-lifecycle/ServiceHeapLifecycle	refinement	service-heap-lifecycle	Ex
 scheduler-admission/SchedulerAdmission	refinement	scheduler-dispatch	Strict-class admission refines scheduler dispatch authority.
 scheduler-cpu-distribution/SchedulerCpuDistribution	refinement	scheduler-dispatch	Bounded class bursts and per-task wait age refine dispatch fairness.
 scheduler-thread-demotion/SchedulerThreadDemotion	refinement	scheduler-dispatch	Base-class demotion and donation preservation refine effective class.
-scheduler-wakeup/SchedulerWakeup	refinement	scheduler-lifecycle	Arm, wake, commit, cancel, and retire refine task wait lifetime.
+scheduler-wakeup/SchedulerWakeup	refinement	scheduler-lifecycle	Arm, token-only wake of a running task with no published frame, blocked-frame wake, atomic commit-reschedule, exact dispatch, waiter cleanup before timer acknowledgement, cancel, and retire refine task wait lifetime.
+syscall-simd-lifecycle/SyscallSimdLifecycle	refinement	syscall-simd-lifecycle	Exact user SIMD and syscall-entry-frame ownership, published kernel continuation lifetime, post-resume SYSRET validation, and owner-only return refine the complete syscall transition.
+syscall-scheduler-continuation/SyscallSchedulerContinuation	refinement	syscall-simd-lifecycle	Atomic arm-race-or-publish, blocked wake, dispatch consumption, retained syscall frame, and post-resume validation compose scheduler and syscall lifetime.
+sigchld-notification/SigchldNotification	refinement	process-signal-lifecycle	Coalesced stop continue and exit causes refine process-directed SIGCHLD delivery and SA_NOCLDSTOP suppression.
 trusted-ui-boundary/TrustedUiBoundary	refinement	wayland-client-ingress	Trusted prompt authority refines untrusted client ingress.
 ui-frame-budget/UiFrameBudget	refinement	gpu-frame-lifecycle	Main-loop budget and worker isolation refine frame progress.
+ui-main-loop-wakeup/UiMainLoopWakeup	refinement	gpu-frame-lifecycle	Atomic input-or-deadline wakeup refines idle main-loop progress.
 ui-input-motion/UiInputMotion	refinement	input-delivery-lifecycle	Motion coalescing and bounded delivery refine input lifecycle.
 vfio-release-authorization/VfioReleaseAuthorization	refinement	boot-storage-handoff	Exact release authorization refines VFIO handback.
 wayland-frame-pacing/WaylandFramePacing	refinement	gpu-frame-lifecycle	Coalesced presentation and callback permits refine frame completion.
@@ -52,3 +57,4 @@ input-ingestion-worker/InputIngestionWorker	refinement	commercial-product-boot	A
 dvm-display-readiness/DvmDisplayReadiness	refinement	commercial-product-boot	Generation-bound display admission refines the interactive provider milestone.
 dvm-block-startup/DvmBlockStartup	refinement	commercial-product-boot	Generation-bound block readiness refines both product boot topologies.
 ui-frame-budget/UiFrameBudget	refinement	commercial-product-boot	The first presented frame refines the user-visible interactive terminal.
+ui-main-loop-wakeup/UiMainLoopWakeup	refinement	commercial-product-boot	Consecutive active UI windows require input and monotonic deadline wakes to remain live.

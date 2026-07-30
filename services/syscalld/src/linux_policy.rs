@@ -1,12 +1,31 @@
+//! Linux application-ABI policy owned by `syscalld`.
+//!
+//! - **Owner:** `syscalld` owns the supported Linux process, memory, entropy,
+//!   and identity policy subset; the kernel only transports and applies admitted
+//!   mechanism requests.
+//! - **Boundary:** Syscall numbers, flags, ranges, broker results, credentials,
+//!   and process generations are untrusted until operation-specific admission.
+//! - **Lifecycle:** Decode a versioned request, validate caller and state,
+//!   construct an immutable plan, commit through the narrow broker, update
+//!   service state only after success, then encode one bounded response.
+//! - **Concurrency:** Policy state is serialized without holding its lock across
+//!   a kernel broker call; address-space commits use generation-aware plans.
+//! - **Failure:** Unsupported ABI, malformed flags, stale process identity,
+//!   partial broker failure, and capacity exhaustion return explicit errno.
+//! - **Forbidden:** No raw kernel pointer, PID-only authority, accept-by-default
+//!   syscall fallback, or compatibility outside the documented modern ABI.
+//! - **Evidence:** `linux-syscall-offload`, `mm-broker`, `process-lifecycle`,
+//!   `entropy-readiness`, and `service-call-authority`.
+
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::mem::size_of;
 
 use rustos_user_abi::syscall::{
-    LinuxRlimit, LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse, LinuxTimespecWire,
-    LinuxUtsName, RustosMmBrokerArgs, RustosMmFdBrokerResult, RustosMmLayoutBrokerResult,
+    LinuxRlimit, LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse, LinuxUtsName,
+    RustosMmBrokerArgs, RustosMmFdBrokerResult, RustosMmLayoutBrokerResult,
     RustosMmMapBrokerResult, LINUX_CPUSET_BYTES, LINUX_DEFAULT_STACK_RLIMIT_BYTES,
-    LINUX_RLIMIT_SIZE, LINUX_TIMESPEC_SIZE, MM_BROKER_ABI_VERSION, MM_BROKER_FD_KIND_DEVICE,
+    LINUX_RLIMIT_SIZE, MM_BROKER_ABI_VERSION, MM_BROKER_FD_KIND_DEVICE,
     MM_BROKER_FD_KIND_DISPLAY_SURFACE, MM_BROKER_FD_KIND_FILE, MM_BROKER_FD_KIND_MEMFD,
     MM_BROKER_OP_DESCRIBE_FD, MM_BROKER_OP_MAP_ANON, MM_BROKER_OP_MAP_DEVICE_SHARED,
     MM_BROKER_OP_MAP_FILE_PRIVATE, MM_BROKER_OP_MAP_MEMFD_SHARED, MM_BROKER_OP_PROTECT,
@@ -27,16 +46,6 @@ const GETRANDOM_MAX_BYTES: u32 = (SYSCALL_OFFLOAD_PAYLOAD_CAPACITY as u32) & !3;
 const GETRANDOM_FLAG_NONBLOCK: u64 = 0x0001;
 const GETRANDOM_FLAG_RANDOM: u64 = 0x0002;
 const GETRANDOM_FLAG_INSECURE: u64 = 0x0004;
-const FUTEX_WAIT: u64 = 0;
-const FUTEX_WAKE: u64 = 1;
-const FUTEX_REQUEUE: u64 = 3;
-const FUTEX_CMP_REQUEUE: u64 = 4;
-const FUTEX_WAIT_BITSET: u64 = 9;
-const FUTEX_WAKE_BITSET: u64 = 10;
-const FUTEX_PRIVATE_FLAG: u64 = 128;
-const FUTEX_CLOCK_REALTIME: u64 = 256;
-const FUTEX_CMD_MASK: u64 = !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
-
 const PAGE_SIZE: u64 = 4096;
 const MAP_FIXED: u64 = 0x10;
 const MAP_ANONYMOUS: u64 = 0x20;
@@ -73,9 +82,6 @@ const MADV_DONTNEED_LOCKED: u64 = 24;
 const MFD_CLOEXEC: u64 = 0x0001;
 const MFD_ALLOW_SEALING: u64 = 0x0002;
 const MEMFD_NAME_MAX: usize = 249;
-const CLOCK_REALTIME: u64 = 0;
-const CLOCK_MONOTONIC: u64 = 1;
-const TIMER_ABSTIME: u64 = 1;
 const ARCH_SET_FS: u64 = 0x1002;
 const ARCH_GET_FS: u64 = 0x1003;
 
@@ -525,6 +531,11 @@ pub(crate) fn handle_set_robust_list(
     request: &LinuxSyscallOffloadRequest,
     response: &mut LinuxSyscallOffloadResponse,
 ) {
+    if request.arg1 != 24 {
+        response.status = errno::EINVAL;
+        response.payload_len = 0;
+        return;
+    }
     let mut policy = policy_db().lock();
     let state = ensure_state_with_inheritance(&mut policy, request);
     state.robust_head = request.arg0;
@@ -551,76 +562,6 @@ pub(crate) fn handle_rseq(
 ) {
     let _ = request;
     response.status = errno::ENOSYS;
-    response.payload_len = 0;
-}
-
-pub(crate) fn handle_nanosleep(
-    request: &LinuxSyscallOffloadRequest,
-    response: &mut LinuxSyscallOffloadResponse,
-) {
-    match read_valid_timespec(request) {
-        Ok(_) => {
-            response.status = 0;
-            response.payload_len = 0;
-        }
-        Err(errno) => response.status = errno,
-    }
-}
-
-pub(crate) fn handle_clock_gettime(
-    request: &LinuxSyscallOffloadRequest,
-    response: &mut LinuxSyscallOffloadResponse,
-) {
-    if !is_supported_clock_id(request.arg0) {
-        response.status = errno::EINVAL;
-        return;
-    }
-    response.status = 0;
-    response.payload_len = 0;
-}
-
-pub(crate) fn handle_clock_nanosleep(
-    request: &LinuxSyscallOffloadRequest,
-    response: &mut LinuxSyscallOffloadResponse,
-) {
-    if !is_supported_clock_id(request.arg0) || request.flags & !TIMER_ABSTIME != 0 {
-        response.status = errno::EINVAL;
-        return;
-    }
-    match read_valid_timespec(request) {
-        Ok(_) => {
-            response.status = 0;
-            response.payload_len = 0;
-        }
-        Err(errno) => response.status = errno,
-    }
-}
-
-pub(crate) fn handle_futex_policy(
-    request: &LinuxSyscallOffloadRequest,
-    response: &mut LinuxSyscallOffloadResponse,
-) {
-    let op = request.arg0;
-    let cmd = op & FUTEX_CMD_MASK;
-    let supported_flags = FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME;
-    if (op & !FUTEX_CMD_MASK) & !supported_flags != 0 {
-        response.status = errno::EINVAL;
-        return;
-    }
-    match cmd {
-        value
-            if value == FUTEX_WAIT
-                || value == FUTEX_WAKE
-                || value == FUTEX_REQUEUE
-                || value == FUTEX_CMP_REQUEUE =>
-        {
-            response.status = 0;
-        }
-        value if value == FUTEX_WAIT_BITSET || value == FUTEX_WAKE_BITSET => {
-            response.status = if request.arg1 == 0 { errno::EINVAL } else { 0 };
-        }
-        _ => response.status = errno::ENOSYS,
-    }
     response.payload_len = 0;
 }
 
@@ -655,37 +596,6 @@ fn read_u64(bytes: &[u8], offset: usize) -> u64 {
         bytes[offset + 6],
         bytes[offset + 7],
     ])
-}
-
-fn read_i64(bytes: &[u8], offset: usize) -> i64 {
-    i64::from_le_bytes([
-        bytes[offset],
-        bytes[offset + 1],
-        bytes[offset + 2],
-        bytes[offset + 3],
-        bytes[offset + 4],
-        bytes[offset + 5],
-        bytes[offset + 6],
-        bytes[offset + 7],
-    ])
-}
-
-fn read_valid_timespec(request: &LinuxSyscallOffloadRequest) -> Result<LinuxTimespecWire, i32> {
-    if request.path_len as usize != LINUX_TIMESPEC_SIZE {
-        return Err(errno::EINVAL);
-    }
-    let ts = LinuxTimespecWire {
-        tv_sec: read_i64(&request.path[..LINUX_TIMESPEC_SIZE], 0),
-        tv_nsec: read_i64(&request.path[..LINUX_TIMESPEC_SIZE], 8),
-    };
-    if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
-        return Err(errno::EINVAL);
-    }
-    Ok(ts)
-}
-
-fn is_supported_clock_id(clock_id: u64) -> bool {
-    matches!(clock_id, CLOCK_REALTIME | CLOCK_MONOTONIC)
 }
 
 fn write_uts_field(dest: &mut [u8; 65], value: &[u8]) {
@@ -1495,48 +1405,6 @@ mod tests {
     }
 
     #[test]
-    fn time_policy_validates_timespec_and_clock_ids() {
-        let mut request = LinuxSyscallOffloadRequest::default();
-        write_timespec(
-            &mut request,
-            LinuxTimespecWire {
-                tv_sec: 0,
-                tv_nsec: 1,
-            },
-        );
-        let mut response = LinuxSyscallOffloadResponse::default();
-        handle_nanosleep(&request, &mut response);
-        assert_eq!(response.status, 0);
-        assert_eq!(response.payload_len, 0);
-
-        write_timespec(
-            &mut request,
-            LinuxTimespecWire {
-                tv_sec: 0,
-                tv_nsec: 1_000_000_000,
-            },
-        );
-        handle_nanosleep(&request, &mut response);
-        assert_eq!(response.status, errno::EINVAL);
-
-        request.arg0 = CLOCK_MONOTONIC;
-        request.flags = TIMER_ABSTIME;
-        write_timespec(
-            &mut request,
-            LinuxTimespecWire {
-                tv_sec: 1,
-                tv_nsec: 0,
-            },
-        );
-        handle_clock_nanosleep(&request, &mut response);
-        assert_eq!(response.status, 0);
-
-        request.arg0 = 99;
-        handle_clock_gettime(&request, &mut response);
-        assert_eq!(response.status, errno::EINVAL);
-    }
-
-    #[test]
     fn getrandom_policy_rejects_unknown_flags() {
         let request = LinuxSyscallOffloadRequest {
             flags: 8,
@@ -1561,12 +1429,6 @@ mod tests {
         handle_getrandom(&request, &mut response);
         assert_eq!(response.status, 0);
         assert_eq!(response.payload_len, 0);
-    }
-
-    fn write_timespec(request: &mut LinuxSyscallOffloadRequest, ts: LinuxTimespecWire) {
-        request.path_len = LINUX_TIMESPEC_SIZE as u32;
-        request.path[..8].copy_from_slice(&ts.tv_sec.to_le_bytes());
-        request.path[8..16].copy_from_slice(&ts.tv_nsec.to_le_bytes());
     }
 
     #[test]

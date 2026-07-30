@@ -24,11 +24,20 @@ else:
     raise SystemExit("KVM trace is empty")
 PY
 )"
+    set +e
     python3 formal/check-kvm-runtime-trace.py "$artifact_dir/kvm-p0.jsonl" \
         --root "$repo_root" \
         --registry "$repo_root/formal/product-scenarios.tsv" \
         --topology "$topology" \
-        --summary "$artifact_dir/kvm-p0-summary.json"
+        --summary "$artifact_dir/kvm-p0-summary.json" \
+        --classify-stale
+    kvm_trace_status=$?
+    set -e
+    if [[ "$kvm_trace_status" -eq 3 && "${FORMAL_REQUIRE_KVM_TRACE:-0}" != 1 ]]; then
+        echo "optional KVM trace is stale and was not admitted as current evidence"
+    elif [[ "$kvm_trace_status" -ne 0 ]]; then
+        exit "$kvm_trace_status"
+    fi
 elif [[ "${FORMAL_REQUIRE_KVM_TRACE:-0}" == 1 ]]; then
     echo "required KVM P0 runtime trace is missing" >&2
     exit 1

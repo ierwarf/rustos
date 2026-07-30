@@ -1,3 +1,18 @@
+//! Linux process-time and sleep ABI over scheduler-local monotonic substrate.
+//!
+//! - **Owner:** Compat owns Linux argument/result semantics; HAL and
+//!   `kernel-ps` own clocks, deadlines, and task blocking.
+//! - **Boundary:** User timespecs and clock IDs are fully validated before a
+//!   waiter or copyout is published.
+//! - **Lifecycle:** Query or finite sleep follows register, arm, commit,
+//!   resume, disarm, and terminal-result ordering.
+//! - **Concurrency:** The hot path performs no policy-service IPC, allocation,
+//!   or process-state locking before waiter publication.
+//! - **Failure:** Signal, timeout, invalid clock, and task retirement return
+//!   exact Linux outcomes without leaking a waiter.
+//! - **Forbidden:** No syscalld round trip, calendar-time timeout, busy loop,
+//!   or unbounded sleep record.
+//! - **Evidence:** `monotonic-deadline-lifecycle`.
 use super::*;
 
 pub fn syscall_linux_sched_yield() -> u64 {
@@ -181,14 +196,68 @@ fn sync_current_linux_signal_mask(how: u64, requested_mask: u64) {
     );
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TimeHotPath {
+    ClockGettime,
+    Nanosleep,
+    ClockNanosleep,
+}
+
+/// Validate the fixed Linux clock/sleep ABI envelope without acquiring shared
+/// process state or synchronously entering a policy service. Clock reads and
+/// bounded sleeps are scheduler/timer substrate and must establish deadline
+/// recovery even while another same-process thread mutates unrelated state.
+fn validate_time_hot_path_locally(
+    kind: TimeHotPath,
+    clock_id: u64,
+    flags: u64,
+    timespec: Option<LinuxTimespecWire>,
+) -> Result<(), i64> {
+    match kind {
+        TimeHotPath::ClockGettime => {
+            if flags != 0 || timespec.is_some() || !is_supported_clock_id(clock_id) {
+                return Err(LINUX_EINVAL);
+            }
+        }
+        TimeHotPath::Nanosleep => {
+            if clock_id != 0 || flags != 0 {
+                return Err(LINUX_EINVAL);
+            }
+            validate_sleep_timespec(timespec.ok_or(LINUX_EINVAL)?)?;
+        }
+        TimeHotPath::ClockNanosleep => {
+            if !is_supported_clock_id(clock_id) || flags != 0 && flags != linux_abi::TIMER_ABSTIME {
+                return Err(LINUX_EINVAL);
+            }
+            validate_sleep_timespec(timespec.ok_or(LINUX_EINVAL)?)?;
+        }
+    }
+    Ok(())
+}
+
+fn is_supported_clock_id(clock_id: u64) -> bool {
+    clock_id == linux_abi::CLOCK_REALTIME || clock_id == linux_abi::CLOCK_MONOTONIC
+}
+
+fn validate_sleep_timespec(timespec: LinuxTimespecWire) -> Result<(), i64> {
+    if timespec.tv_sec < 0 || !(0..1_000_000_000).contains(&timespec.tv_nsec) {
+        return Err(LINUX_EINVAL);
+    }
+    Ok(())
+}
+
+pub(super) fn validate_relative_sleep_timespec_locally(
+    timespec: LinuxTimespecWire,
+) -> Result<(), i64> {
+    validate_time_hot_path_locally(TimeHotPath::Nanosleep, 0, 0, Some(timespec))
+}
+
 pub fn syscall_linux_nanosleep(request_ptr: u64, _remaining_ptr: u64) -> u64 {
     let ts = match usermem::read_current_user_struct::<LinuxTimespecWire>(request_ptr) {
         Ok(ts) => ts,
         Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
     };
-    if let Err(errno) =
-        request_syscalld_timespec_admission(SYSCALL_OFFLOAD_OP_LINUX_NANOSLEEP, 0, 0, ts)
-    {
+    if let Err(errno) = validate_time_hot_path_locally(TimeHotPath::Nanosleep, 0, 0, Some(ts)) {
         return linux_errno(errno);
     }
     sleep_relative_timespec_substrate(ts);
@@ -200,21 +269,9 @@ pub fn syscall_linux_clock_gettime(clock_id: u64, timespec_ptr: u64) -> u64 {
     {
         return linux_errno(address_space_error_to_linux_errno(err));
     }
-    let cached = multitask::with_current_user_process_state(|_, _, process_state| {
-        process_state.linux_clock_admission_cached(clock_id)
-    })
-    .unwrap_or(false);
-    if !cached {
-        if let Err(errno) = request_syscalld_clock_gettime_admission(clock_id) {
-            return linux_errno(errno);
-        }
-        let cached = multitask::with_current_user_process_state_mut(|_, _, process_state| {
-            process_state.cache_linux_clock_admission(clock_id)
-        })
-        .unwrap_or(false);
-        if !cached {
-            return linux_errno(LINUX_EINVAL);
-        }
+    if let Err(errno) = validate_time_hot_path_locally(TimeHotPath::ClockGettime, clock_id, 0, None)
+    {
+        return linux_errno(errno);
     }
     write_clock_timespec(clock_id, timespec_ptr)
 }
@@ -239,7 +296,7 @@ pub fn sleep_relative_timespec_substrate(ts: LinuxTimespecWire) {
 
 pub fn current_clock_timespec_substrate(clock_id: u64) -> LinuxTimespecWire {
     match clock_id {
-        id if id == linux_abi::CLOCK_REALTIME as u64 => realtime_timespec(),
+        id if id == linux_abi::CLOCK_REALTIME => realtime_timespec(),
         _ => monotonic_timespec(),
     }
 }
@@ -346,19 +403,16 @@ pub fn syscall_linux_clock_nanosleep(
         Ok(ts) => ts,
         Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
     };
-    if let Err(errno) = request_syscalld_timespec_admission(
-        SYSCALL_OFFLOAD_OP_LINUX_CLOCK_NANOSLEEP,
-        clock_id,
-        flags,
-        ts,
-    ) {
+    if let Err(errno) =
+        validate_time_hot_path_locally(TimeHotPath::ClockNanosleep, clock_id, flags, Some(ts))
+    {
         return linux_errno(errno);
     }
     sleep_clock_nanosleep_substrate(clock_id, flags, ts)
 }
 
 fn sleep_clock_nanosleep_substrate(clock_id: u64, flags: u64, ts: LinuxTimespecWire) -> u64 {
-    if flags & linux_abi::TIMER_ABSTIME as u64 != 0 {
+    if flags & linux_abi::TIMER_ABSTIME != 0 {
         sleep_until_timespec_substrate(clock_id, ts);
     } else {
         sleep_relative_timespec_substrate(ts);
@@ -367,8 +421,8 @@ fn sleep_clock_nanosleep_substrate(clock_id: u64, flags: u64, ts: LinuxTimespecW
 }
 
 // RING3-MIGRATION-REFERENCE START: scheduler-thread substrate exception:
-// procd/syscalld own clone/futex/time admission policy. Ring0 keeps scheduler
-// mutation, futex wait queues, and task creation substrate.
+// procd owns clone/process admission policy. Ring0 keeps task creation plus
+// fixed futex/time ABI validation and scheduler wait/deadline substrate.
 pub fn syscall_linux_clone(frame: &SyscallFrame) -> u64 {
     clone_linux_thread(frame, frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8)
 }
@@ -423,4 +477,59 @@ pub fn syscall_linux_clone3(frame: &SyscallFrame) -> u64 {
         args.tls,
     )
 }
-// RING3-MIGRATION-REFERENCE END: procd/syscalld-owned clone/futex/time substrate exception.
+// RING3-MIGRATION-REFERENCE END: procd-owned clone policy and scheduler substrate exception.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn time_hot_path_admission_is_local_and_complete() {
+        let valid = LinuxTimespecWire {
+            tv_sec: 0,
+            tv_nsec: 16_000_000,
+        };
+        assert_eq!(
+            validate_time_hot_path_locally(
+                TimeHotPath::ClockGettime,
+                linux_abi::CLOCK_MONOTONIC,
+                0,
+                None,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            validate_time_hot_path_locally(TimeHotPath::Nanosleep, 0, 0, Some(valid)),
+            Ok(())
+        );
+        assert_eq!(
+            validate_time_hot_path_locally(
+                TimeHotPath::ClockNanosleep,
+                linux_abi::CLOCK_REALTIME,
+                linux_abi::TIMER_ABSTIME,
+                Some(valid),
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            validate_time_hot_path_locally(TimeHotPath::ClockGettime, u64::MAX, 0, None,),
+            Err(LINUX_EINVAL)
+        );
+        assert_eq!(
+            validate_relative_sleep_timespec_locally(LinuxTimespecWire {
+                tv_sec: 0,
+                tv_nsec: 1_000_000_000,
+            }),
+            Err(LINUX_EINVAL)
+        );
+        assert_eq!(
+            validate_time_hot_path_locally(
+                TimeHotPath::ClockNanosleep,
+                linux_abi::CLOCK_MONOTONIC,
+                u64::MAX,
+                Some(valid),
+            ),
+            Err(LINUX_EINVAL)
+        );
+    }
+}

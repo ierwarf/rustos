@@ -1,3 +1,20 @@
+//! Dual-ABI executable loading and transactional process construction policy.
+//!
+//! - **Owner:** `loaderd` owns ELF/PE parsing, image admission, mapping plans,
+//!   and loader transactions; ring0 owns only privileged process/MM substrate.
+//! - **Boundary:** Executable bytes, paths, imports, relocations, caller
+//!   identity, broker replies, and filesystem snapshots are untrusted.
+//! - **Lifecycle:** Obtain immutable bytes, admit complete image, prepare a
+//!   suspended target, stage mappings/handles, commit once, activate, or retire.
+//! - **Concurrency:** Requests bind exact kernel-stamped sender and loader
+//!   publication epoch; no mutable image is reread after admission.
+//! - **Failure:** Malformed/overlapping/W+X image, short read, service restart,
+//!   timeout, requester exit, and partial mapping roll back all staged state.
+//! - **Forbidden:** No raw parser in ring0, pathname authority, runnable partial
+//!   child, Linux-kernel extension compatibility, or format-specific bypass.
+//! - **Evidence:** `executable-image-admission`,
+//!   `loader-request-authority`, `deferred-process-activation`, and
+//!   `remote-file-map`.
 #![no_std]
 #![no_main]
 
@@ -235,6 +252,7 @@ const LOADERD_RECV_BYTES: usize =
 
 #[repr(align(8))]
 // Raw IPC writes use this wrapper for alignment, not tuple-field reads.
+// LAYOUT: The backing field is intentionally accessed through raw IPC bytes.
 #[allow(dead_code)]
 struct LoaderdRecvBuffer([u8; LOADERD_RECV_BYTES]);
 
@@ -785,7 +803,7 @@ fn set_linux_runtime_broker(prepare_handle: u64, result: &ElfMapResult) -> Resul
         SYS_RUSTOS_PROC_SET_LINUX_RUNTIME_BROKER,
         (&args as *const RustosProcSetLinuxRuntimeBrokerArgs) as u64,
     );
-    (status >= 0).then_some(()).ok_or((-status) as i32)
+    syscall_unit_result(status)
 }
 
 // Large bounded reads amortize the per-syscall IPC round-trip to vfsd and the
@@ -883,6 +901,17 @@ fn align_down(value: u64, align: u64) -> u64 {
 
 fn syscall1(number: u64, arg0: u64) -> i64 {
     unsafe { rustos_svc_runtime::syscall::syscall1(number, arg0) }
+}
+
+fn syscall_unit_result(status: i64) -> Result<(), i32> {
+    if status >= 0 {
+        return Ok(());
+    }
+    let errno = status
+        .checked_neg()
+        .and_then(|errno| i32::try_from(errno).ok())
+        .unwrap_or(EOVERFLOW);
+    Err(errno)
 }
 
 fn syscall0(number: u64) -> i64 {

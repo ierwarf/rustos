@@ -1,7 +1,27 @@
+//! Root service-authority graph, bootstrap ordering, and bounded restart owner.
+//!
+//! - **Owner:** `rootd` is the first user process and owns service leases,
+//!   dependencies, restart budgets, and readiness policy.
+//! - **Boundary:** Kernel-stamped sender identity, loader results, child exits,
+//!   readiness claims, and checkpoint records are untrusted until exact lease
+//!   and generation admission.
+//! - **Lifecycle:** Seal bootstrap owner, publish core leases, supervise,
+//!   revoke on exit, back off/restart within budget, reconcile checkpoints,
+//!   and fail stop when root authority itself is lost.
+//! - **Concurrency:** No local policy/state lock is held across discovery or
+//!   synchronous service IPC; the same-process worker handles nested requests.
+//! - **Failure:** Malformed request, foreign reporter, stale checkpoint,
+//!   activation failure, restart exhaustion, and dependency loss are explicit.
+//! - **Forbidden:** No executable-path authority, PID-only lease, infinite
+//!   wait, undeclared bootstrap dependency, or weaker fallback service.
+//! - **Evidence:** `service-bootstrap`, `service-restart`,
+//!   `post-init-service-authority`, `root-authority`, and
+//!   `service-heap-lifecycle`.
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
 // The host test target intentionally omits the no_std entrypoint, so the
 // complete production supervisor graph is unreachable only in that harness.
+// TEST-HARNESS: Unit tests compile the policy graph without the service entry.
 #![cfg_attr(test, allow(dead_code, unused_imports))]
 
 extern crate alloc;

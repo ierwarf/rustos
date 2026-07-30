@@ -1,10 +1,8 @@
 use crate::io::device::DeviceHandle;
-use crate::ipc::KernelSharedRegionHandle;
 use crate::user::epoll::EpollHandle;
 use crate::user::linux as linux_abi;
 use crate::user::memfd::MemfdHandle;
 use crate::user::socket::SocketHandle;
-use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -15,8 +13,7 @@ use kernel_object::api::handle::{
     DeviceHandleRights, FileHandleRights, HandleOwner, HandleRights, HandleToken,
     SharedRegionRights, SocketHandleRights,
 };
-use lazy_static::lazy_static;
-use spin::Mutex;
+use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
 
 #[path = "handles/display_surface.rs"]
 mod display_surface;
@@ -64,12 +61,13 @@ pub struct ConsoleHandle {
 static NEXT_CONSOLE_OPEN_DESCRIPTION_TOKEN: AtomicU64 = AtomicU64::new(1);
 const CONSOLE_OPEN_DESCRIPTION_CAPACITY: usize = 256;
 
-lazy_static! {
-    static ref CONSOLE_OPEN_DESCRIPTIONS: Mutex<BTreeMap<u64, ConsoleDescriptionRegistryEntry>> =
-        Mutex::new(BTreeMap::new());
-}
+static CONSOLE_OPEN_DESCRIPTIONS: TrackedSpinLock<
+    [Option<ConsoleDescriptionRegistryEntry>; CONSOLE_OPEN_DESCRIPTION_CAPACITY],
+    { LockClass::ConsoleRegistry as u8 },
+> = TrackedSpinLock::new([const { None }; CONSOLE_OPEN_DESCRIPTION_CAPACITY]);
 
 struct ConsoleDescriptionRegistryEntry {
+    token: u64,
     description: Weak<ConsoleOpenDescription>,
     stream: ConsoleStreamKind,
     descriptor_refs: usize,
@@ -84,19 +82,23 @@ impl ConsoleHandle {
             .expect("console open-description token exhausted");
         let description = Arc::new(ConsoleOpenDescription { token, stream });
         let mut descriptions = CONSOLE_OPEN_DESCRIPTIONS.lock();
-        descriptions.retain(|_, entry| entry.description.strong_count() != 0);
-        assert!(
-            descriptions.len() < CONSOLE_OPEN_DESCRIPTION_CAPACITY,
-            "console open-description registry exhausted"
-        );
-        descriptions.insert(
+        for slot in descriptions.iter_mut() {
+            if slot.as_ref().is_some_and(|entry| {
+                entry.descriptor_refs == 0 || entry.description.strong_count() == 0
+            }) {
+                *slot = None;
+            }
+        }
+        let slot = descriptions
+            .iter_mut()
+            .find(|slot| slot.is_none())
+            .expect("console open-description registry exhausted");
+        *slot = Some(ConsoleDescriptionRegistryEntry {
             token,
-            ConsoleDescriptionRegistryEntry {
-                description: Arc::downgrade(&description),
-                stream,
-                descriptor_refs: 1,
-            },
-        );
+            description: Arc::downgrade(&description),
+            stream,
+            descriptor_refs: 1,
+        });
         drop(descriptions);
         Self { description }
     }
@@ -114,7 +116,9 @@ impl ConsoleHandle {
     pub fn is_last_reference(&self) -> bool {
         CONSOLE_OPEN_DESCRIPTIONS
             .lock()
-            .get(&self.token_id())
+            .iter()
+            .flatten()
+            .find(|entry| entry.token == self.token_id())
             .is_none_or(|entry| entry.descriptor_refs == 0)
     }
 
@@ -130,7 +134,11 @@ impl ConsoleHandle {
     /// zero-reference console description.
     pub fn try_acquire_descriptor_reference(&self) -> bool {
         let mut descriptions = CONSOLE_OPEN_DESCRIPTIONS.lock();
-        let Some(entry) = descriptions.get_mut(&self.token_id()) else {
+        let Some(entry) = descriptions
+            .iter_mut()
+            .flatten()
+            .find(|entry| entry.token == self.token_id())
+        else {
             return false;
         };
         if entry.descriptor_refs == 0 || entry.description.strong_count() == 0 {
@@ -147,7 +155,9 @@ impl ConsoleHandle {
     pub fn release_descriptor_reference(&self) -> bool {
         let mut descriptions = CONSOLE_OPEN_DESCRIPTIONS.lock();
         let entry = descriptions
-            .get_mut(&self.token_id())
+            .iter_mut()
+            .flatten()
+            .find(|entry| entry.token == self.token_id())
             .expect("live console description missing from registry");
         assert!(
             entry.descriptor_refs != 0,
@@ -167,7 +177,9 @@ impl ConsoleHandle {
         }
         CONSOLE_OPEN_DESCRIPTIONS
             .lock()
-            .get(&token)
+            .iter()
+            .flatten()
+            .find(|entry| entry.token == token)
             .filter(|entry| entry.descriptor_refs != 0 && entry.description.strong_count() != 0)
             .map(|entry| entry.stream)
     }
@@ -185,18 +197,142 @@ pub enum IpcTransferRegistryError {
     StaleDescriptor,
 }
 
-lazy_static! {
-    static ref IPC_TRANSFER_OBJECTS: Mutex<BTreeMap<u64, TransferredHandleEntry>> =
-        Mutex::new(BTreeMap::new());
-    static ref IPC_DEFERRED_TRANSFER_DROPS: Mutex<Vec<TransferredHandleEntry>> =
-        Mutex::new(Vec::new());
+struct IpcTransferSlot {
+    transfer_id: u64,
+    entry: Option<TransferredHandleEntry>,
 }
+
+impl IpcTransferSlot {
+    const fn empty() -> Self {
+        Self {
+            transfer_id: 0,
+            entry: None,
+        }
+    }
+}
+
+struct IpcTransferRegistry {
+    slots: [IpcTransferSlot; MAX_PENDING_IPC_TRANSFER_OBJECTS],
+    len: usize,
+}
+
+impl IpcTransferRegistry {
+    const fn new() -> Self {
+        Self {
+            slots: [const { IpcTransferSlot::empty() }; MAX_PENDING_IPC_TRANSFER_OBJECTS],
+            len: 0,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn contains(&self, transfer_id: u64) -> bool {
+        self.slots
+            .iter()
+            .any(|slot| slot.transfer_id == transfer_id && slot.entry.is_some())
+    }
+
+    fn get(&self, transfer_id: u64) -> Option<&TransferredHandleEntry> {
+        self.slots
+            .iter()
+            .find(|slot| slot.transfer_id == transfer_id)
+            .and_then(|slot| slot.entry.as_ref())
+    }
+
+    fn insert(&mut self, transfer_id: u64, entry: TransferredHandleEntry) -> bool {
+        if transfer_id == 0 || self.contains(transfer_id) {
+            return false;
+        }
+        let Some(slot) = self.slots.iter_mut().find(|slot| slot.entry.is_none()) else {
+            return false;
+        };
+        slot.transfer_id = transfer_id;
+        slot.entry = Some(entry);
+        self.len += 1;
+        true
+    }
+
+    fn remove(&mut self, transfer_id: u64) -> Option<TransferredHandleEntry> {
+        let slot = self
+            .slots
+            .iter_mut()
+            .find(|slot| slot.transfer_id == transfer_id)?;
+        let entry = slot.entry.take()?;
+        slot.transfer_id = 0;
+        self.len -= 1;
+        Some(entry)
+    }
+}
+
+struct DeferredTransferDropQueue {
+    entries: [Option<TransferredHandleEntry>; MAX_PENDING_IPC_TRANSFER_OBJECTS],
+    len: usize,
+}
+
+impl DeferredTransferDropQueue {
+    const fn new() -> Self {
+        Self {
+            entries: [const { None }; MAX_PENDING_IPC_TRANSFER_OBJECTS],
+            len: 0,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn push(&mut self, entry: TransferredHandleEntry) {
+        let slot = self
+            .entries
+            .get_mut(self.len)
+            .expect("deferred transfer-drop admission invariant violated");
+        *slot = Some(entry);
+        self.len += 1;
+    }
+
+    fn take_prefix(&mut self, limit: usize, output: &mut Vec<TransferredHandleEntry>) {
+        let count = limit.min(self.len);
+        for index in 0..count {
+            output.push(
+                self.entries[index]
+                    .take()
+                    .expect("deferred transfer-drop queue contains a hole"),
+            );
+        }
+        for index in count..self.len {
+            self.entries[index - count] = self.entries[index].take();
+        }
+        self.len -= count;
+    }
+}
+
+static IPC_TRANSFER_OBJECTS: TrackedSpinLock<
+    IpcTransferRegistry,
+    { LockClass::IpcTransferRegistry as u8 },
+> = TrackedSpinLock::new(IpcTransferRegistry::new());
+static IPC_DEFERRED_TRANSFER_DROPS: TrackedSpinLock<
+    DeferredTransferDropQueue,
+    { LockClass::IpcDeferredDrop as u8 },
+> =
+    // The queue shares the same admission ceiling as the live registry and owns
+    // fixed storage, so boot and task-exit bursts cannot enter the allocator while
+    // either registry lock is held. Static construction also avoids copying this
+    // large fixed store through a first-use stack frame.
+    TrackedSpinLock::new(DeferredTransferDropQueue::new());
 
 static NEXT_IPC_TRANSFER_ID: AtomicU64 = AtomicU64::new(1);
 
 pub fn register_ipc_transfer_entries(
     entries: Vec<TransferredHandleEntry>,
 ) -> Result<Vec<KernelTransferredHandle>, IpcTransferRegistryError> {
+    // Allocation is not part of the registry transaction. Keeping it outside
+    // both spin locks prevents heap contention from extending the global
+    // transfer publication critical section.
+    let mut inserted_ids = Vec::with_capacity(entries.len());
+    let mut descriptors = Vec::with_capacity(entries.len());
+    let mut rollback = Vec::with_capacity(entries.len());
     let mut objects = IPC_TRANSFER_OBJECTS.lock();
     let deferred = IPC_DEFERRED_TRANSFER_DROPS.lock();
     if objects
@@ -209,22 +345,31 @@ pub fn register_ipc_transfer_entries(
     }
     drop(deferred);
 
-    let mut inserted_ids = Vec::with_capacity(entries.len());
-    let mut descriptors = Vec::with_capacity(entries.len());
     for entry in entries {
         let Some(transfer_id) = allocate_ipc_transfer_id(&objects) else {
             for transfer_id in inserted_ids {
-                objects.remove(&transfer_id);
+                if let Some(entry) = objects.remove(transfer_id) {
+                    rollback.push(entry);
+                }
             }
+            drop(objects);
+            drop(rollback);
             return Err(IpcTransferRegistryError::Exhausted);
         };
         let Some(descriptor) = entry.ipc_descriptor(transfer_id) else {
             for transfer_id in inserted_ids {
-                objects.remove(&transfer_id);
+                if let Some(entry) = objects.remove(transfer_id) {
+                    rollback.push(entry);
+                }
             }
+            drop(objects);
+            drop(rollback);
             return Err(IpcTransferRegistryError::InvalidDescriptor);
         };
-        objects.insert(transfer_id, entry);
+        assert!(
+            objects.insert(transfer_id, entry),
+            "validated IPC transfer slot disappeared before publication"
+        );
         inserted_ids.push(transfer_id);
         descriptors.push(descriptor);
     }
@@ -234,6 +379,7 @@ pub fn register_ipc_transfer_entries(
 pub fn take_ipc_transfer_entries(
     descriptors: &[KernelTransferredHandle],
 ) -> Result<Vec<TransferredHandleEntry>, IpcTransferRegistryError> {
+    let mut entries = Vec::with_capacity(descriptors.len());
     let mut objects = IPC_TRANSFER_OBJECTS.lock();
     for (index, descriptor) in descriptors.iter().enumerate() {
         if descriptors[..index]
@@ -242,7 +388,7 @@ pub fn take_ipc_transfer_entries(
         {
             return Err(IpcTransferRegistryError::InvalidDescriptor);
         }
-        let Some(entry) = objects.get(&descriptor.transfer_id()) else {
+        let Some(entry) = objects.get(descriptor.transfer_id()) else {
             return Err(IpcTransferRegistryError::StaleDescriptor);
         };
         if entry.ipc_descriptor(descriptor.transfer_id()) != Some(*descriptor) {
@@ -250,10 +396,9 @@ pub fn take_ipc_transfer_entries(
         }
     }
 
-    let mut entries = Vec::with_capacity(descriptors.len());
     for descriptor in descriptors {
         let entry = objects
-            .remove(&descriptor.transfer_id())
+            .remove(descriptor.transfer_id())
             .expect("validated IPC transfer descriptor disappeared while taking");
         entries.push(entry);
     }
@@ -267,10 +412,10 @@ pub fn drop_ipc_transfer_descriptors(descriptors: &[KernelTransferredHandle]) {
     let mut objects = IPC_TRANSFER_OBJECTS.lock();
     let mut deferred = IPC_DEFERRED_TRANSFER_DROPS.lock();
     for descriptor in descriptors {
-        let matches = objects.get(&descriptor.transfer_id()).is_some_and(|entry| {
+        let matches = objects.get(descriptor.transfer_id()).is_some_and(|entry| {
             entry.ipc_descriptor(descriptor.transfer_id()) == Some(*descriptor)
         });
-        if matches && let Some(entry) = objects.remove(&descriptor.transfer_id()) {
+        if matches && let Some(entry) = objects.remove(descriptor.transfer_id()) {
             // Registration accounts pending and deferred entries against one
             // shared ceiling, so moving ownership here cannot exceed it.
             deferred.push(entry);
@@ -279,15 +424,16 @@ pub fn drop_ipc_transfer_descriptors(descriptors: &[KernelTransferredHandle]) {
 }
 
 pub fn take_deferred_ipc_transfer_drops(limit: usize) -> Vec<TransferredHandleEntry> {
+    let mut taken = Vec::with_capacity(limit.min(MAX_PENDING_IPC_TRANSFER_OBJECTS));
     let mut deferred = IPC_DEFERRED_TRANSFER_DROPS.lock();
-    let count = limit.min(deferred.len());
-    deferred.drain(..count).collect()
+    deferred.take_prefix(limit, &mut taken);
+    taken
 }
 
-fn allocate_ipc_transfer_id(objects: &BTreeMap<u64, TransferredHandleEntry>) -> Option<u64> {
+fn allocate_ipc_transfer_id(objects: &IpcTransferRegistry) -> Option<u64> {
     for _ in 0..MAX_PENDING_IPC_TRANSFER_OBJECTS {
         let id = NEXT_IPC_TRANSFER_ID.fetch_add(1, Ordering::Relaxed);
-        if id != 0 && !objects.contains_key(&id) {
+        if id != 0 && !objects.contains(id) {
             return Some(id);
         }
     }
@@ -310,7 +456,6 @@ pub enum KernelHandle {
     InetSocket(InetSocketHandle),
     Memfd(MemfdHandle),
     RemoteVfs(RemoteVfsHandle),
-    SharedRegion(KernelSharedRegionHandle),
     Socket(SocketHandle),
     VfsDirectory(VfsDirectoryHandle),
     DisplaySurface(DisplaySurfaceHandle),
@@ -435,7 +580,6 @@ impl KernelHandle {
             Self::InetSocket(socket) => HandleToken::new(HandleOwner::Compat, socket.token_id()),
             Self::Memfd(memfd) => HandleToken::new(HandleOwner::Compat, memfd.token_id()),
             Self::RemoteVfs(remote) => HandleToken::new(HandleOwner::Io, remote.token_id()),
-            Self::SharedRegion(region) => HandleToken::new(HandleOwner::Ipc, region.raw()),
             Self::Socket(socket) => HandleToken::new(HandleOwner::Compat, socket.token_id()),
             Self::VfsDirectory(directory) => {
                 HandleToken::new(HandleOwner::Io, directory.token_id())
@@ -454,7 +598,6 @@ impl KernelHandle {
             Self::InetSocket(_) => "inet-socket",
             Self::Memfd(_) => "memfd",
             Self::RemoteVfs(_) => "remote-vfs",
-            Self::SharedRegion(_) => "ipc-region",
             Self::Socket(_) => "socket",
             Self::VfsDirectory(_) => "vfs-dir",
             Self::DisplaySurface(_) => "display-surface",
@@ -520,11 +663,6 @@ impl KernelHandle {
                         .union(FileHandleRights::TRANSFER),
                 ),
             },
-            Self::SharedRegion(_) => HandleRights::SharedRegion(
-                SharedRegionRights::READ
-                    .union(SharedRegionRights::WRITE)
-                    .union(SharedRegionRights::MAP),
-            ),
             Self::Socket(_) => HandleRights::Socket(
                 SocketHandleRights::SEND
                     .union(SocketHandleRights::RECV)
@@ -576,9 +714,6 @@ impl KernelHandle {
             Self::VfsDirectory(directory) => alloc::string::String::from(directory.path()),
             Self::DisplaySurface(_) => {
                 alloc::format!("anon_inode:[rustos-display-surface:{}]", token.object_id())
-            }
-            Self::SharedRegion(_) => {
-                alloc::format!("anon_inode:[rustos-ipc-region:{}]", token.object_id())
             }
         }
     }

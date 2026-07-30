@@ -1,12 +1,35 @@
+//! Generational process identity and address-space lifetime registry.
+//!
+//! - **Owner:** `kernel-ps` owns process generations and final retirement.
+//! - **Boundary:** PIDs are labels; only a live `ProcessHandle` generation
+//!   authorizes mutation or retained address-space access.
+//! - **Lifecycle:** Reserve, publish, attach tasks, mark exiting, freeze final
+//!   state, queue reap, and reclaim exactly once.
+//! - **Concurrency:** Registry mutation is serialized; fallible allocation and
+//!   cross-subsystem cleanup occur outside raw critical sections.
+//! - **Failure:** Stale handles, exit races, capacity exhaustion, and duplicate
+//!   retirement reject without aliasing a reused PID/slot.
+//! - **Forbidden:** No “missing means exited,” leader-exit equals process-exit,
+//!   or current-task state used to clean a foreign retired task.
+//! - **Evidence:** `process-address-space-lifecycle`, `endpoint-lifecycle`, and
+//!   `kernel-resource-lifecycle`.
 use alloc::boxed::Box;
 use core::ptr::NonNull;
 
-use spin::Mutex;
+use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
 
 use crate::memory::paging::ProcessAddressSpace;
 use crate::user::process_state::UserProcessState;
 
 const MAX_PROCESS_OBJECTS: usize = 32;
+pub const MAX_THREADS_PER_PROCESS: usize = 32;
+type ProcessStateLock = TrackedSpinLock<UserProcessState, { LockClass::ProcessState as u8 }>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ChildStateChange {
+    Stopped(u8),
+    Continued,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ProcessHandle {
@@ -31,7 +54,7 @@ impl ProcessHandle {
 pub struct ProcessRef {
     handle: ProcessHandle,
     process_id: u64,
-    state_ptr: NonNull<Mutex<UserProcessState>>,
+    state_ptr: NonNull<ProcessStateLock>,
 }
 
 impl ProcessRef {
@@ -65,8 +88,9 @@ struct ProcessObject {
     exiting: bool,
     queued_for_reap: bool,
     exit_status: Option<i32>,
+    child_state_change: Option<ChildStateChange>,
     waited: bool,
-    state: Mutex<UserProcessState>,
+    state: ProcessStateLock,
 }
 
 impl ProcessObject {
@@ -80,12 +104,13 @@ impl ProcessObject {
             exiting: false,
             queued_for_reap: false,
             exit_status: None,
+            child_state_change: None,
             waited: parent_process_id.is_none(),
-            state: Mutex::new(state),
+            state: ProcessStateLock::new(state),
         }
     }
 
-    fn state_ptr(&self) -> NonNull<Mutex<UserProcessState>> {
+    fn state_ptr(&self) -> NonNull<ProcessStateLock> {
         NonNull::from(&self.state)
     }
 }
@@ -144,7 +169,8 @@ impl ProcessTable {
     }
 }
 
-static PROCESS_TABLE: Mutex<ProcessTable> = Mutex::new(ProcessTable::new());
+static PROCESS_TABLE: TrackedSpinLock<ProcessTable, { LockClass::ProcessTable as u8 }> =
+    TrackedSpinLock::new(ProcessTable::new());
 
 fn reclaim_slot(slot: &mut ProcessSlot) -> Option<Box<ProcessObject>> {
     let object = slot.object.as_mut()?;
@@ -173,8 +199,10 @@ pub fn create_process_with_parent(
     parent_process_id: Option<u64>,
     state: UserProcessState,
 ) -> Option<ProcessHandle> {
-    let mut table = PROCESS_TABLE.lock();
     let object = Box::new(ProcessObject::new(process_id, parent_process_id, state));
+    // Allocation and construction may enter the heap. Publish only the
+    // completed object while holding the process-table spin lock.
+    let mut table = PROCESS_TABLE.lock();
     let (index, slot) = table
         .slots
         .iter_mut()
@@ -189,6 +217,9 @@ pub fn attach_task(handle: ProcessHandle) -> Option<()> {
     let mut table = PROCESS_TABLE.lock();
     let object = table.lookup_object_mut(handle)?;
     if object.exiting {
+        return None;
+    }
+    if object.thread_count >= MAX_THREADS_PER_PROCESS {
         return None;
     }
     let ref_count = object.ref_count.checked_add(1)?;
@@ -294,6 +325,7 @@ pub fn parent_process_id_of(process_id: u64) -> Option<u64> {
 
 pub enum WaitResult {
     Exited { pid: u64, status: i32 },
+    StateChanged { pid: u64, status: i32 },
     Pending,
     NoMatchingChild,
 }
@@ -374,7 +406,31 @@ pub fn note_process_exit_status(process_id: u64, status: i32) -> Option<()> {
         .filter_map(|slot| slot.object.as_deref_mut())
         .find(|object| object.process_id == process_id)?;
     object.exit_status = Some(status);
+    object.child_state_change = None;
     object.exiting = true;
+    Some(())
+}
+
+pub fn note_process_stopped(process_id: u64, signal: u64) -> Option<()> {
+    let signal = u8::try_from(signal).ok()?;
+    let mut table = PROCESS_TABLE.lock();
+    let object = table
+        .slots
+        .iter_mut()
+        .filter_map(|slot| slot.object.as_deref_mut())
+        .find(|object| object.process_id == process_id && !object.exiting)?;
+    object.child_state_change = Some(ChildStateChange::Stopped(signal));
+    Some(())
+}
+
+pub fn note_process_continued(process_id: u64) -> Option<()> {
+    let mut table = PROCESS_TABLE.lock();
+    let object = table
+        .slots
+        .iter_mut()
+        .filter_map(|slot| slot.object.as_deref_mut())
+        .find(|object| object.process_id == process_id && !object.exiting)?;
+    object.child_state_change = Some(ChildStateChange::Continued);
     Some(())
 }
 
@@ -428,7 +484,12 @@ pub fn thread_count_by_pid(process_id: u64) -> Option<usize> {
         .map(|object| object.thread_count)
 }
 
-pub fn wait_for_child(parent_process_id: u64, target_pid: i64) -> WaitResult {
+pub fn wait_for_child(
+    parent_process_id: u64,
+    target_pid: i64,
+    include_stopped: bool,
+    include_continued: bool,
+) -> WaitResult {
     let mut table = PROCESS_TABLE.lock();
     let mut saw_child = false;
     let mut queued_handle = None;
@@ -452,16 +513,27 @@ pub fn wait_for_child(parent_process_id: u64, target_pid: i64) -> WaitResult {
         }
 
         saw_child = true;
-        let Some(status) = object.exit_status else {
-            continue;
-        };
-        object.waited = true;
-        if object.thread_count == 0 && object.ref_count == 0 && !object.queued_for_reap {
-            object.queued_for_reap = true;
-            queued_handle = Some(ProcessHandle::new(index, slot.generation));
+        if let Some(status) = object.exit_status {
+            object.waited = true;
+            if object.thread_count == 0 && object.ref_count == 0 && !object.queued_for_reap {
+                object.queued_for_reap = true;
+                queued_handle = Some(ProcessHandle::new(index, slot.generation));
+            }
+            exited = Some(WaitResult::Exited { pid, status });
+            break;
         }
-        exited = Some(WaitResult::Exited { pid, status });
-        break;
+        let status = match object.child_state_change {
+            Some(ChildStateChange::Stopped(signal)) if include_stopped => {
+                Some((i32::from(signal) << 8) | 0x7f)
+            }
+            Some(ChildStateChange::Continued) if include_continued => Some(0xffff),
+            _ => None,
+        };
+        if let Some(status) = status {
+            object.child_state_change = None;
+            exited = Some(WaitResult::StateChanged { pid, status });
+            break;
+        }
     }
 
     if let Some(handle) = queued_handle {
@@ -516,10 +588,24 @@ pub fn reap_exited_processes() -> usize {
 }
 
 #[cfg(test)]
-mod tests {
+fn reset_for_tests() {
+    let retired = {
+        let mut table = PROCESS_TABLE.lock();
+        core::mem::replace(&mut *table, ProcessTable::new())
+    };
+    // LIFECYCLE: address spaces and process-owned allocations may release
+    // memory while being dropped, so test reset follows the production reaper
+    // rule and destroys retired objects after releasing the process-table lock.
+    drop(retired);
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
     use super::{
-        ProcessObject, ProcessTable, attach_task, create_process, detach_task, is_process_exiting,
-        mark_process_exiting, reap_exited_processes, retain_process, thread_count_by_pid,
+        ProcessObject, ProcessTable, WaitResult, attach_task, create_process,
+        create_process_with_parent, detach_task, is_process_exiting, mark_process_exiting,
+        note_process_continued, note_process_exit_status, note_process_stopped,
+        reap_exited_processes, retain_process, thread_count_by_pid, wait_for_child,
     };
     use crate::memory::paging::ProcessAddressSpace;
     use crate::user::process_state::UserProcessState;
@@ -528,7 +614,25 @@ mod tests {
     // reaper. Running them concurrently lets one test reap another test's
     // exited slot, turning exact lifecycle assertions into scheduler-order
     // flakes. Keep only this shared-state group serialized.
-    static PROCESS_TABLE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(crate) static PROCESS_TABLE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    pub(crate) struct ProcessTableTestIsolation {
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for ProcessTableTestIsolation {
+        fn drop(&mut self) {
+            super::reset_for_tests();
+        }
+    }
+
+    pub(crate) fn isolate_process_table() -> ProcessTableTestIsolation {
+        let guard = PROCESS_TABLE_TEST_LOCK
+            .lock()
+            .expect("process table test lock");
+        super::reset_for_tests();
+        ProcessTableTestIsolation { _guard: guard }
+    }
 
     fn new_state() -> UserProcessState {
         UserProcessState::new(
@@ -604,6 +708,73 @@ mod tests {
         assert_eq!(is_process_exiting(44), Some(true));
 
         detach_task(handle).expect("detach final thread");
+        assert_eq!(reap_exited_processes(), 1);
+    }
+
+    #[test]
+    fn one_process_cannot_consume_the_global_task_table() {
+        let _guard = PROCESS_TABLE_TEST_LOCK
+            .lock()
+            .expect("process table test lock");
+        let handle = create_process(45, new_state()).expect("process handle");
+        for _ in 1..super::MAX_THREADS_PER_PROCESS {
+            attach_task(handle).expect("thread within per-process ceiling");
+        }
+        assert_eq!(
+            thread_count_by_pid(45),
+            Some(super::MAX_THREADS_PER_PROCESS)
+        );
+        assert_eq!(attach_task(handle), None);
+
+        for _ in 0..super::MAX_THREADS_PER_PROCESS {
+            detach_task(handle).expect("detach admitted thread");
+        }
+        assert_eq!(reap_exited_processes(), 1);
+    }
+
+    #[test]
+    fn child_stop_and_continue_status_require_exact_wait_options() {
+        let _guard = PROCESS_TABLE_TEST_LOCK
+            .lock()
+            .expect("process table test lock");
+        let parent = create_process(46, new_state()).expect("parent");
+        let child =
+            create_process_with_parent(47, Some(46), new_state()).expect("child process handle");
+
+        note_process_stopped(47, 19).expect("record stopped");
+        assert!(matches!(
+            wait_for_child(46, 47, false, false),
+            WaitResult::Pending
+        ));
+        assert!(matches!(
+            wait_for_child(46, 47, true, false),
+            WaitResult::StateChanged {
+                pid: 47,
+                status: 0x137f
+            }
+        ));
+
+        note_process_continued(47).expect("record continued");
+        assert!(matches!(
+            wait_for_child(46, 47, true, false),
+            WaitResult::Pending
+        ));
+        assert!(matches!(
+            wait_for_child(46, 47, false, true),
+            WaitResult::StateChanged {
+                pid: 47,
+                status: 0xffff
+            }
+        ));
+
+        note_process_exit_status(47, 0).expect("record child exit");
+        detach_task(child).expect("detach child");
+        assert!(matches!(
+            wait_for_child(46, 47, true, true),
+            WaitResult::Exited { pid: 47, status: 0 }
+        ));
+        assert_eq!(reap_exited_processes(), 1);
+        detach_task(parent).expect("detach parent");
         assert_eq!(reap_exited_processes(), 1);
     }
 }

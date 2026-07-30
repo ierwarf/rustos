@@ -101,6 +101,7 @@ pub(super) fn deliver_pending_signals_if_needed(frame: &mut SyscallFrame) -> boo
     }
     let mut request = new_procd_request(PROCD_OP_SELECT_SIGNAL);
     request.arg0 = thread_state.pending_signals;
+    request.arg1 = u64::from(thread_state.pending_sigchld_events);
     let Ok(response) = call_procd(&request) else {
         return false;
     };
@@ -119,8 +120,10 @@ pub(super) fn deliver_pending_signals_if_needed(frame: &mut SyscallFrame) -> boo
         if !signal_selection_is_current(
             current_thread_state.pending_signals,
             current_thread_state.signal_mask,
+            current_thread_state.pending_sigchld_events,
             signal,
             response.action,
+            response.reserved0,
         ) {
             return false;
         }
@@ -131,15 +134,24 @@ pub(super) fn deliver_pending_signals_if_needed(frame: &mut SyscallFrame) -> boo
     match response.action {
         PROCD_SELECT_SIGNAL_NONE => {}
         PROCD_SELECT_SIGNAL_IGNORE => {
-            clear_current_pending_signal(signal);
+            clear_current_pending_signal(signal, response.reserved0);
         }
         PROCD_SELECT_SIGNAL_TERMINATE => {
-            clear_current_pending_signal(signal);
+            clear_current_pending_signal(signal, response.reserved0);
             if let Some(process_id) = multitask::current_user_process_id() {
                 let wait_status = signal as i32;
                 super::record_linux_process_termination(process_id, wait_status);
             }
             multitask::exit_current_user_process();
+        }
+        PROCD_SELECT_SIGNAL_STOP => {
+            clear_current_pending_signal(signal, response.reserved0);
+            if multitask::stop_current_linux_process(signal) {
+                // The current task remains stopped until SIGCONT or SIGKILL
+                // clears the process-wide job-control state. The scheduler
+                // preserves its pre-stop ready/block state across this yield.
+                multitask::yield_now();
+            }
         }
         PROCD_SELECT_SIGNAL_HANDLER => {
             if response.payload_len as usize != LINUX_SIGACTION_SIZE {
@@ -158,7 +170,7 @@ pub(super) fn deliver_pending_signals_if_needed(frame: &mut SyscallFrame) -> boo
             if install_rt_signal_frame(frame, signal, commit_thread_state.signal_mask, action)
                 .is_ok()
             {
-                clear_current_pending_signal(signal);
+                clear_current_pending_signal(signal, response.reserved0);
                 return true;
             }
         }
@@ -187,10 +199,10 @@ pub(super) fn syscall_linux_rt_sigreturn(frame: &mut SyscallFrame) -> u64 {
 }
 
 fn read_rt_signal_frame(rsp: u64) -> Result<LinuxRtSigFrame, i64> {
-    if let Ok(saved) = usermem::read_current_user_struct::<LinuxRtSigFrame>(rsp) {
-        if validate_rt_signal_frame(&saved) {
-            return Ok(saved);
-        }
+    if let Ok(saved) = usermem::read_current_user_struct::<LinuxRtSigFrame>(rsp)
+        && validate_rt_signal_frame(&saved)
+    {
+        return Ok(saved);
     }
     let Some(frame_addr) = rsp.checked_sub(size_of::<u64>() as u64) else {
         return Err(LINUX_EFAULT);
@@ -213,26 +225,47 @@ fn valid_user_signal_target(address: u64) -> bool {
 }
 
 fn sanitize_signal_mask(mask: u64) -> u64 {
-    let unblockable = crate::user::sysops::linux::linux_signal_bit(linux_abi::SIGKILL as u64)
-        .unwrap_or(0)
-        | crate::user::sysops::linux::linux_signal_bit(linux_abi::SIGSTOP as u64).unwrap_or(0);
+    let unblockable = crate::user::sysops::linux::linux_signal_bit(linux_abi::SIGKILL).unwrap_or(0)
+        | crate::user::sysops::linux::linux_signal_bit(linux_abi::SIGSTOP).unwrap_or(0);
     mask & !unblockable
 }
 
-fn signal_selection_is_current(pending: u64, mask: u64, signal: u64, action: u16) -> bool {
+fn signal_selection_is_current(
+    pending: u64,
+    mask: u64,
+    pending_sigchld_events: u32,
+    signal: u64,
+    action: u16,
+    selected_sigchld_events: u32,
+) -> bool {
     let Some(bit) = crate::user::sysops::linux::linux_signal_bit(signal) else {
         return false;
     };
     if pending & bit == 0 || mask & bit != 0 {
         return false;
     }
+    if signal == linux_abi::SIGCHLD {
+        if selected_sigchld_events & !rustos_user_abi::syscall::PROCD_SIGCHLD_EVENT_MASK != 0
+            || selected_sigchld_events & !pending_sigchld_events != 0
+            || (pending_sigchld_events != 0 && selected_sigchld_events == 0)
+        {
+            return false;
+        }
+    } else if selected_sigchld_events != 0 {
+        return false;
+    }
     match action {
         PROCD_SELECT_SIGNAL_IGNORE | PROCD_SELECT_SIGNAL_HANDLER => {
-            signal != linux_abi::SIGKILL as u64 && signal != linux_abi::SIGSTOP as u64
+            signal != linux_abi::SIGKILL && signal != linux_abi::SIGSTOP
         }
-        PROCD_SELECT_SIGNAL_TERMINATE => true,
+        PROCD_SELECT_SIGNAL_TERMINATE => !default_stop_signal(signal),
+        PROCD_SELECT_SIGNAL_STOP => default_stop_signal(signal),
         _ => false,
     }
+}
+
+fn default_stop_signal(signal: u64) -> bool {
+    matches!(signal, 19..=22)
 }
 
 fn install_rt_signal_frame(
@@ -406,14 +439,21 @@ fn linux_rt_sigframe_info_offset() -> usize {
     unsafe { core::ptr::addr_of!((*base).info) as usize }
 }
 
-fn clear_current_pending_signal(signal: u64) {
+fn clear_current_pending_signal(signal: u64, selected_sigchld_events: u32) {
     let Some(bit) = crate::user::sysops::linux::linux_signal_bit(signal) else {
         return;
     };
     let _ = multitask::with_current_user_process_and_linux_thread_state_mut(
         |_, _, _, _, linux_thread_state| {
             if let Some(state) = linux_thread_state.as_mut() {
-                state.pending_signals &= !bit;
+                if signal == linux_abi::SIGCHLD && selected_sigchld_events != 0 {
+                    state.pending_sigchld_events &= !selected_sigchld_events;
+                    if state.pending_sigchld_events == 0 {
+                        state.pending_signals &= !bit;
+                    }
+                } else {
+                    state.pending_signals &= !bit;
+                }
             }
         },
     );
@@ -433,55 +473,124 @@ mod tests {
 
     #[test]
     fn signal_selection_revalidates_pending_mask_and_uncatchable_policy() {
-        let catchable = linux_abi::SIGCHLD as u64;
+        let catchable = linux_abi::SIGCHLD;
         let catchable_bit = crate::user::sysops::linux::linux_signal_bit(catchable).unwrap();
         assert!(signal_selection_is_current(
             catchable_bit,
             0,
+            0,
             catchable,
             PROCD_SELECT_SIGNAL_HANDLER,
+            0,
         ));
         assert!(!signal_selection_is_current(
             0,
             0,
+            0,
             catchable,
             PROCD_SELECT_SIGNAL_HANDLER,
+            0,
         ));
         assert!(!signal_selection_is_current(
             catchable_bit,
             catchable_bit,
+            0,
             catchable,
             PROCD_SELECT_SIGNAL_HANDLER,
+            0,
         ));
 
-        let kill = linux_abi::SIGKILL as u64;
+        let kill = linux_abi::SIGKILL;
         let kill_bit = crate::user::sysops::linux::linux_signal_bit(kill).unwrap();
         assert!(!signal_selection_is_current(
             kill_bit,
             0,
+            0,
             kill,
             PROCD_SELECT_SIGNAL_IGNORE,
+            0,
         ));
         assert!(!signal_selection_is_current(
             kill_bit,
             0,
+            0,
             kill,
             PROCD_SELECT_SIGNAL_HANDLER,
+            0,
         ));
         assert!(signal_selection_is_current(
             kill_bit,
             0,
+            0,
             kill,
             PROCD_SELECT_SIGNAL_TERMINATE,
+            0,
+        ));
+
+        let stop = linux_abi::SIGSTOP;
+        let stop_bit = crate::user::sysops::linux::linux_signal_bit(stop).unwrap();
+        assert!(signal_selection_is_current(
+            stop_bit,
+            0,
+            0,
+            stop,
+            PROCD_SELECT_SIGNAL_STOP,
+            0,
+        ));
+        assert!(!signal_selection_is_current(
+            stop_bit,
+            0,
+            0,
+            stop,
+            PROCD_SELECT_SIGNAL_TERMINATE,
+            0,
+        ));
+        assert!(!signal_selection_is_current(
+            stop_bit,
+            0,
+            0,
+            stop,
+            PROCD_SELECT_SIGNAL_IGNORE,
+            0,
+        ));
+    }
+
+    #[test]
+    fn sigchld_selection_cannot_clear_unselected_or_future_causes() {
+        let bit = crate::user::sysops::linux::linux_signal_bit(linux_abi::SIGCHLD).unwrap();
+        let exit = rustos_user_abi::syscall::PROCD_SIGCHLD_EVENT_EXIT;
+        let stop = rustos_user_abi::syscall::PROCD_SIGCHLD_EVENT_STOP;
+        assert!(signal_selection_is_current(
+            bit,
+            0,
+            exit | stop,
+            linux_abi::SIGCHLD,
+            PROCD_SELECT_SIGNAL_HANDLER,
+            exit,
+        ));
+        assert!(!signal_selection_is_current(
+            bit,
+            0,
+            stop,
+            linux_abi::SIGCHLD,
+            PROCD_SELECT_SIGNAL_IGNORE,
+            exit,
+        ));
+        assert!(!signal_selection_is_current(
+            bit,
+            0,
+            stop,
+            linux_abi::SIGCHLD,
+            PROCD_SELECT_SIGNAL_IGNORE,
+            0,
         ));
     }
 
     #[test]
     fn restored_signal_mask_cannot_block_kill_or_stop() {
-        let kill = crate::user::sysops::linux::linux_signal_bit(linux_abi::SIGKILL as u64).unwrap();
-        let stop = crate::user::sysops::linux::linux_signal_bit(linux_abi::SIGSTOP as u64).unwrap();
-        let catchable =
-            crate::user::sysops::linux::linux_signal_bit(linux_abi::SIGCHLD as u64).unwrap();
+        let kill = crate::user::sysops::linux::linux_signal_bit(linux_abi::SIGKILL).unwrap();
+        let stop = crate::user::sysops::linux::linux_signal_bit(linux_abi::SIGSTOP).unwrap();
+        let catchable = crate::user::sysops::linux::linux_signal_bit(linux_abi::SIGCHLD).unwrap();
         assert_eq!(sanitize_signal_mask(kill | stop | catchable), catchable);
     }
 }

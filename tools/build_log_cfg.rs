@@ -113,6 +113,8 @@ pub fn emit_log_cfgs(logging_toml: &str) {
     }
 }
 
+// GENERATED: Shared build-script source is included by consumers that select
+// different logging outputs.
 #[allow(dead_code)]
 pub fn generate_kernel_logging_build_rs(config: &LoggingConfig) -> String {
     let mut generated = format!(
@@ -134,6 +136,7 @@ pub fn generate_kernel_logging_build_rs(config: &LoggingConfig) -> String {
     generated
 }
 
+// GENERATED: Used only by the kernel logging-code generation include site.
 #[allow(dead_code)]
 pub fn generate_kernel_logging_macros_rs() -> String {
     let mut generated = String::new();
@@ -146,6 +149,7 @@ pub fn generate_kernel_logging_macros_rs() -> String {
     generated
 }
 
+// GENERATED: Used only by service/runtime logging-code generation include sites.
 #[allow(dead_code)]
 pub fn generate_user_logging_helpers_rs() -> String {
     let mut generated = String::new();
@@ -196,6 +200,8 @@ pub fn emit_lock_telemetry_cfgs(project_toml: &str) {
     }
 }
 
+// GENERATED: Some build-script include sites emit only the aggregate logging
+// configuration and intentionally omit this compatibility cfg.
 #[allow(dead_code)]
 pub fn emit_boot_trace_cfg(logging_toml: &str) {
     if parse_logging_toml(logging_toml).boot_trace_enabled {
@@ -348,6 +354,7 @@ pub fn try_parse_lock_telemetry_toml(source: &str) -> Result<LockTelemetryConfig
     Ok(config)
 }
 
+// GENERATED: Retained for generated-source conformance tests.
 #[allow(dead_code)]
 pub fn parse_bool(source: &str, name: &str) -> bool {
     let prefix = format!("pub const {name}: bool =");
@@ -438,6 +445,7 @@ fn level_name(level: u8) -> &'static str {
     }
 }
 
+// GENERATED: Helper is live only in include sites that emit category macros.
 #[allow(dead_code)]
 fn category_variant(category: &str) -> &'static str {
     match category {
@@ -462,6 +470,7 @@ fn category_variant(category: &str) -> &'static str {
     }
 }
 
+// GENERATED: Helper is live only in include sites that emit level macros.
 #[allow(dead_code)]
 fn level_variant(level: &str) -> &'static str {
     match level {
@@ -475,6 +484,7 @@ fn level_variant(level: &str) -> &'static str {
     }
 }
 
+// GENERATED: Not every shared-source consumer emits runtime level checks.
 #[allow(dead_code)]
 fn generate_compiled_level_enabled_fn(category_ty: &str, level_ty: &str) -> String {
     let mut generated = format!(
@@ -497,6 +507,7 @@ fn generate_compiled_level_enabled_fn(category_ty: &str, level_ty: &str) -> Stri
     generated
 }
 
+// GENERATED: Not every shared-source consumer emits category macros.
 #[allow(dead_code)]
 fn generate_category_macro(macro_name: &str, category_ty_prefix: &str) -> String {
     let mut generated = format!("#[doc(hidden)]\n#[macro_export]\nmacro_rules! {macro_name} {{\n");
@@ -510,6 +521,7 @@ fn generate_category_macro(macro_name: &str, category_ty_prefix: &str) -> String
     generated
 }
 
+// GENERATED: Not every shared-source consumer emits conditional log macros.
 #[allow(dead_code)]
 fn generate_if_enabled_macro(macro_name: &str) -> String {
     let mut generated = format!("#[doc(hidden)]\n#[macro_export]\nmacro_rules! {macro_name} {{\n");

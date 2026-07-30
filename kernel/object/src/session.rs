@@ -31,9 +31,4 @@ impl ConsoleSessionHandle {
     pub const fn from_parts(slot_index: u32, generation: u32) -> Self {
         Self(((generation as u64) << 32) | slot_index as u64)
     }
-
-    #[cfg(test)]
-    pub(crate) const fn for_tests(slot_index: u32, generation: u32) -> Self {
-        Self::from_parts(slot_index, generation)
-    }
 }

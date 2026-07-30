@@ -14,6 +14,49 @@ use rustos_user_abi::syscall::{
 /// rootd and deliberately fits below this cap.
 const ROOTD_WAIT_MAX_MILLIS: u64 = 1_000;
 
+/// Remove every task-scoped runtime registration that lives outside the
+/// scheduler before its retired slot may be recycled. The caller supplies the
+/// scheduler-stamped identities; no registry is allowed to infer ownership
+/// from a slot number or a possibly requeued wait key.
+pub(crate) fn cleanup_retired_task_runtime_state(
+    task_id: u64,
+    process_id: u64,
+    process_terminal: bool,
+    clear_child_tid: u64,
+    robust_list_head: u64,
+    robust_list_len: u64,
+) -> usize {
+    let mut removed = 0usize;
+    removed += service_ops::futex_thread::cleanup_retired_linux_thread_state(
+        task_id,
+        process_id,
+        clear_child_tid,
+        robust_list_head,
+        robust_list_len,
+    );
+    removed += service_ops::futex_thread::cleanup_retired_task_waiter(task_id) as usize;
+    removed += waitset_broker_ops::remove_waitset_waiters(task_id);
+    removed += ipc_ops::remove_service_endpoint_waiter(task_id);
+    removed += kernel_io_manager::api::input::transport::disarm_input_waiter(task_id) as usize;
+    removed +=
+        kernel_io_manager::api::input::transport::disarm_inputd_ingestion_waiter(task_id) as usize;
+    removed += kernel_io_manager::api::block::disarm_dvm_waiter(task_id) as usize;
+    removed += kernel_io_manager::api::tty::disarm_input_waiter(task_id) as usize;
+    if process_id != 0 {
+        let (tickets, transitions) =
+            proc_broker_ops::cleanup_proc_broker_exec_state_for_thread(process_id, task_id);
+        removed += tickets + transitions;
+        if process_terminal {
+            release_all_service_handle_refs(process_id);
+            ipc_ops::cleanup_service_endpoints_for_process(process_id);
+            let (prepares, tickets, transitions) =
+                proc_broker_ops::cleanup_proc_broker_state_for_process(process_id);
+            removed += prepares + tickets + transitions;
+        }
+    }
+    removed
+}
+
 fn rootd_wait_delay_is_valid(millis: u64) -> bool {
     (1..=ROOTD_WAIT_MAX_MILLIS).contains(&millis)
 }
@@ -95,12 +138,9 @@ pub(super) fn syscall_linux_rustos_rootd_terminate_broker(args_ptr: u64) -> u64 
         return linux_errno(LINUX_EPERM);
     }
     let parent_pid = multitask::parent_process_id_of(args.target_pid).unwrap_or(0);
-    // Retire every sibling first.  No target thread can publish new authority
-    // between this point and the cleanup below.
+    // The scheduler marks the process exiting before retiring any sibling, so
+    // no new thread or process-scoped authority can enter during teardown.
     if !multitask::terminate_user_process(args.target_pid) {
-        return linux_errno(LINUX_ESRCH);
-    }
-    if multitask::mark_user_process_exiting_once(args.target_pid) != Some(true) {
         return linux_errno(LINUX_ESRCH);
     }
     release_all_service_handle_refs(args.target_pid);
@@ -113,7 +153,10 @@ pub(super) fn syscall_linux_rustos_rootd_terminate_broker(args_ptr: u64) -> u64 
     let _ = multitask::note_process_exit_status(args.target_pid, exit_status);
     offload_ops::record_process_exit(args.target_pid, parent_pid, exit_status);
     if parent_pid != 0 {
-        multitask::queue_linux_signal(parent_pid, parent_pid, linux_abi::SIGCHLD as u64);
+        multitask::queue_linux_process_sigchld(
+            parent_pid,
+            rustos_user_abi::syscall::PROCD_SIGCHLD_EVENT_EXIT,
+        );
     }
     0
 }

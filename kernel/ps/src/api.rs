@@ -1,26 +1,44 @@
+//! Public scheduler, process, address-space, and user-state substrate API.
+//!
+//! - **Owner:** `kernel-ps`; cross-crate kernel callers use this facade.
+//! - **Boundary:** Exported task/process IDs never bypass generation, current
+//!   context, or lifecycle admission.
+//! - **Lifecycle:** APIs expose explicit create/publish, arm/commit/wake,
+//!   exec/exit, cleanup acknowledgement, and reclaim operations.
+//! - **Concurrency:** Each function documents interrupt, lock, blocking, and
+//!   callback context and adds no hidden policy-service wait.
+//! - **Failure:** Stale or missing state fails without manufacturing exit,
+//!   readiness, or authority.
+//! - **Forbidden:** No private scheduler reach-through, split block/yield, or
+//!   service policy in ring0.
+//! - **Evidence:** `scheduler-lifecycle`,
+//!   `process-address-space-lifecycle`, `syscall-simd-lifecycle`, and
+//!   `user-memory-access`.
 pub use crate::multitask::SyscallUserSimdSnapshot;
 pub use crate::multitask::{
     CurrentKernelStackScope, CurrentUserSnapshot, DEFAULT_USER_TASK_WEIGHT_MICROS,
     MAX_SCHEDULER_TASKS, RetainedCurrentUserAddressSpace, RetainedCurrentUserProcessState,
-    SpawnTaskError, Thread, UserFaultDisposition, UserStackState, UserTaskBootstrap,
-    UserTaskRegisters, WaitChildResult,
+    RetiredTaskCleanup, SpawnTaskError, Thread, UserFaultDisposition, UserStackState,
+    UserTaskBootstrap, UserTaskRegisters, WaitChildResult,
 };
 pub use crate::multitask::{
-    activate_suspended_user_task, arm_block_current_task, block_current_task,
-    block_current_user_task, cancel_block_current_task, commit_block_current_task,
-    current_linux_thread_state, current_user_address_space, current_user_process_thread_count,
-    current_user_stack_state, current_user_thread_id, demote_current_user_task_to_user_class,
+    activate_suspended_user_task, arm_block_current_task, cancel_block_current_task,
+    commit_block_current_task_and_yield, complete_retired_task_cleanup, current_linux_thread_state,
+    current_user_address_space, current_user_process_thread_count, current_user_stack_state,
+    current_user_thread_id, current_user_wait_binding, demote_current_user_task_to_user_class,
     exec_current_user_process, exec_user_process_by_pid, exit_current_user_process,
     exit_current_user_task, inherit_ipc_priority, inherit_ipc_priority_for_process,
     is_user_process_exiting, is_user_task_alive, linux_thread_snapshot_by_ids,
-    mark_user_process_exiting, mark_user_process_exiting_once, note_process_exit_status,
-    queue_linux_signal, release_ipc_priorities_for_process, release_ipc_priority,
-    set_next_latency_pick_hint, set_next_pick_hint, set_next_process_pick_hint,
-    set_next_spawn_pick_hint, spawn_user_process_state_with_parent, spawn_user_process_with_parent,
-    spawn_user_thread_suspended, terminate_user_process, terminate_user_task, wake_task,
-    wake_user_task, with_current_mm, with_current_process_state, with_current_process_state_mut,
-    with_current_user_linux_state_mut, with_current_user_process_and_linux_thread_state_mut,
-    with_current_user_process_state, with_process_state_by_pid, with_process_state_by_pid_mut,
+    mark_user_process_exiting, mark_user_process_exiting_once, next_retired_task_cleanup,
+    note_process_exit_status, queue_linux_process_sigchld, queue_linux_signal,
+    release_ipc_priorities_for_process, release_ipc_priority, set_next_latency_pick_hint,
+    set_next_pick_hint, set_next_process_pick_hint, set_next_spawn_pick_hint,
+    spawn_user_process_state_with_parent, spawn_user_process_with_parent,
+    spawn_user_thread_suspended, stop_current_linux_process, terminate_user_process,
+    terminate_user_task, wake_task, wake_user_task, with_current_mm, with_current_process_state,
+    with_current_process_state_mut, with_current_user_linux_state_mut,
+    with_current_user_process_and_linux_thread_state_mut, with_current_user_process_state,
+    with_process_state_by_pid, with_process_state_by_pid_mut,
 };
 pub use crate::user::abi::UserAbi;
 pub use crate::user::epoll::{EpollError, EpollHandle, EpollInterestSnapshot};
@@ -32,6 +50,10 @@ pub use crate::user::handles::{
     drop_ipc_transfer_descriptors, register_ipc_transfer_entries, take_deferred_ipc_transfer_drops,
     take_ipc_transfer_entries,
 };
+
+pub fn service_deferred_shared_region_reclaims(max_pages: usize) -> usize {
+    kernel_ipc_runtime::api::service_deferred_shared_region_reclaims(max_pages)
+}
 pub use crate::user::linux::{
     LinuxMemoryMapState, LinuxProcessImageInfo, LinuxProcessLaunch, LinuxProcessState,
     LinuxRuntimeProfile, LinuxSigAction, LinuxSignalStack, LinuxTermios, LinuxThreadState,
@@ -303,20 +325,12 @@ pub mod task {
         crate::multitask::yield_now();
     }
 
-    pub fn block_current_task() -> bool {
-        crate::multitask::block_current_task()
-    }
-
     pub fn arm_block_current_task() -> bool {
         crate::multitask::arm_block_current_task()
     }
 
     pub fn cancel_block_current_task() -> bool {
         crate::multitask::cancel_block_current_task()
-    }
-
-    pub fn commit_block_current_task() -> Option<bool> {
-        crate::multitask::commit_block_current_task()
     }
 
     pub fn wake_task(task_id: u64) -> bool {
@@ -327,8 +341,18 @@ pub mod task {
 pub mod wait {
     use super::WaitChildResult;
 
-    pub fn wait_for_child(parent_process_id: u64, target_pid: i64) -> WaitChildResult {
-        crate::multitask::wait_for_child(parent_process_id, target_pid)
+    pub fn wait_for_child(
+        parent_process_id: u64,
+        target_pid: i64,
+        include_stopped: bool,
+        include_continued: bool,
+    ) -> WaitChildResult {
+        crate::multitask::wait_for_child(
+            parent_process_id,
+            target_pid,
+            include_stopped,
+            include_continued,
+        )
     }
 }
 

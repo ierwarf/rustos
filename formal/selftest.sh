@@ -116,6 +116,14 @@ done
     exit 1
 }
 python3 formal/test-verification-run-freshness.py
+rg -q -- '--classify-stale' formal/run-runtime-traces.sh || {
+    echo "runtime trace gate cannot distinguish stale optional KVM evidence" >&2
+    exit 1
+}
+rg -q 'kvm_trace_status.*-eq 3' formal/run-runtime-traces.sh || {
+    echo "runtime trace gate does not quarantine stale optional KVM evidence" >&2
+    exit 1
+}
 [[ -s formal/concurrency-witnesses.tsv ]] || {
     echo "formal concurrency witness registry is missing" >&2
     exit 1
@@ -141,6 +149,11 @@ formal/check-zero-trust-subsystems.sh
     exit 1
 }
 formal/check-performance-contracts.sh
+[[ -x formal/check-rust-source-contracts.py ]] || {
+    echo "Rust source contract checker is not executable" >&2
+    exit 1
+}
+formal/check-rust-source-contracts.py
 [[ -x formal/check-kernel-policy-boundary.sh ]] || {
     echo "kernel policy boundary checker is not executable" >&2
     exit 1

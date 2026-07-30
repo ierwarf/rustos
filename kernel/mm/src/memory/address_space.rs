@@ -1,3 +1,19 @@
+//! Transactional user address-space and page-table ownership.
+//!
+//! - **Owner:** `kernel-mm` owns PTE mutation; `syscalld` owns mapping policy
+//!   and `kernel-ps` owns process-generation lifetime.
+//! - **Boundary:** User ranges, protections, backing frames, and replacement
+//!   plans are untrusted until complete-span admission.
+//! - **Lifecycle:** Reserve/validate the full plan, install atomically, retain
+//!   backing, then unmap/protect/reclaim exactly once.
+//! - **Concurrency:** Callers serialize process address-space mutation and hold
+//!   an exact process generation; no service call occurs under page-table
+//!   mutation state.
+//! - **Failure:** Overflow, alias, W+X, partial span, and allocation failure
+//!   leave the prior mapping unchanged.
+//! - **Forbidden:** No destructive `MAP_FIXED` pre-cleanup, partial protection,
+//!   guest pointer as frame authority, or hidden identity mapping.
+//! - **Evidence:** `memory-map` and `user-memory-access`.
 use alloc::vec::Vec;
 use core::cmp::min;
 use core::ptr;

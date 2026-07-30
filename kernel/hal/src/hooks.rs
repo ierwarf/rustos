@@ -52,7 +52,7 @@ pub struct TaskHooks {
     pub current_task_id: Option<fn() -> Option<u64>>,
     pub arm_block_current_task: Option<fn() -> bool>,
     pub cancel_block_current_task: Option<fn() -> bool>,
-    pub commit_block_current_task: Option<fn() -> Option<bool>>,
+    pub commit_block_current_task_and_yield: Option<fn() -> Option<bool>>,
     pub wake_user_task: Option<fn(u64) -> bool>,
     pub yield_now: Option<fn()>,
 }
@@ -83,7 +83,7 @@ static HOOKS: RwLock<HookRegistry> = RwLock::new(HookRegistry {
         current_task_id: None,
         arm_block_current_task: None,
         cancel_block_current_task: None,
-        commit_block_current_task: None,
+        commit_block_current_task_and_yield: None,
         wake_user_task: None,
         yield_now: None,
     },
@@ -105,6 +105,18 @@ pub fn register_heartbeat_hooks(hooks: HeartbeatHooks) {
     HOOKS.write().heartbeat = hooks;
 }
 
+fn task_hooks() -> TaskHooks {
+    HOOKS.read().task
+}
+
+fn interrupt_hooks() -> InterruptHooks {
+    HOOKS.read().interrupt
+}
+
+fn heartbeat_hooks() -> HeartbeatHooks {
+    HOOKS.read().heartbeat
+}
+
 pub fn retire_current_user_task_due_to_fault(
     vector: u8,
     error_code: Option<u64>,
@@ -112,16 +124,14 @@ pub fn retire_current_user_task_due_to_fault(
     rip: u64,
     rsp: u64,
 ) -> UserFaultDisposition {
-    HOOKS
-        .read()
-        .task
+    task_hooks()
         .retire_current_user_task_due_to_fault
         .map(|hook| hook(vector, error_code, cr2, rip, rsp))
         .unwrap_or(UserFaultDisposition::Unhandled)
 }
 
 pub fn halt_current_retired_task() -> ! {
-    if let Some(hook) = HOOKS.read().task.halt_current_retired_task {
+    if let Some(hook) = task_hooks().halt_current_retired_task {
         hook()
     }
 
@@ -129,81 +139,93 @@ pub fn halt_current_retired_task() -> ! {
 }
 
 pub fn current_user_snapshot() -> Option<CurrentUserSnapshot> {
-    HOOKS
-        .read()
-        .task
-        .current_user_snapshot
-        .and_then(|hook| hook())
+    task_hooks().current_user_snapshot.and_then(|hook| hook())
 }
 
 pub fn is_scheduler_initialized() -> bool {
-    HOOKS
-        .read()
-        .task
+    task_hooks()
         .is_scheduler_initialized
         .map(|hook| hook())
         .unwrap_or(false)
 }
 
 pub fn current_task_id() -> Option<u64> {
-    HOOKS.read().task.current_task_id.and_then(|hook| hook())
+    task_hooks().current_task_id.and_then(|hook| hook())
 }
 
 pub fn arm_block_current_task() -> bool {
-    HOOKS
-        .read()
-        .task
+    task_hooks()
         .arm_block_current_task
         .map(|hook| hook())
         .unwrap_or(false)
 }
 
 pub fn cancel_block_current_task() -> bool {
-    HOOKS
-        .read()
-        .task
+    task_hooks()
         .cancel_block_current_task
         .map(|hook| hook())
         .unwrap_or(false)
 }
 
-pub fn commit_block_current_task() -> Option<bool> {
-    HOOKS
-        .read()
-        .task
-        .commit_block_current_task
+pub fn commit_block_current_task_and_yield() -> Option<bool> {
+    task_hooks()
+        .commit_block_current_task_and_yield
         .and_then(|hook| hook())
 }
 
 pub fn wake_user_task(task_id: u64) -> bool {
-    HOOKS
-        .read()
-        .task
+    task_hooks()
         .wake_user_task
         .map(|hook| hook(task_id))
         .unwrap_or(false)
 }
 
 pub fn yield_now() {
-    if let Some(hook) = HOOKS.read().task.yield_now {
+    if let Some(hook) = task_hooks().yield_now {
         hook();
     }
 }
 
 pub fn dispatch_pic_irq(irq: u8) -> bool {
-    HOOKS
-        .read()
-        .interrupt
+    interrupt_hooks()
         .dispatch_pic_irq
         .map(|hook| hook(irq))
         .unwrap_or(false)
 }
 
 pub fn heartbeat_snapshot() -> HeartbeatSnapshot {
-    HOOKS
-        .read()
-        .heartbeat
+    heartbeat_hooks()
         .snapshot
         .map(|hook| hook())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    static CALLBACK_OBSERVED_UNLOCKED_REGISTRY: AtomicBool = AtomicBool::new(false);
+
+    fn inspect_registry_from_commit_callback() -> Option<bool> {
+        CALLBACK_OBSERVED_UNLOCKED_REGISTRY.store(HOOKS.try_write().is_some(), Ordering::SeqCst);
+        Some(false)
+    }
+
+    #[test]
+    fn scheduler_callback_runs_after_hook_registry_read_guard_is_released() {
+        CALLBACK_OBSERVED_UNLOCKED_REGISTRY.store(false, Ordering::SeqCst);
+        let saved = {
+            let mut registry = HOOKS.write();
+            let saved = registry.task;
+            registry.task.commit_block_current_task_and_yield =
+                Some(inspect_registry_from_commit_callback);
+            saved
+        };
+
+        assert_eq!(commit_block_current_task_and_yield(), Some(false));
+        assert!(CALLBACK_OBSERVED_UNLOCKED_REGISTRY.load(Ordering::SeqCst));
+
+        HOOKS.write().task = saved;
+    }
 }

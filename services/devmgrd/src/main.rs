@@ -1,3 +1,18 @@
+//! Device namespace, open-rights, and ioctl-routing policy service.
+//!
+//! - **Owner:** `devmgrd` owns device discovery names and the device policy
+//!   decision; `sessiond` and `uiserver` own their delegated policy classes.
+//! - **Boundary:** IPC sender identity, envelopes, paths, device IDs, rights,
+//!   ioctl numbers, nested replies, and delegated service epochs are untrusted.
+//! - **Lifecycle:** Admit one request, delegate through a bounded worker when
+//!   required, validate the exact reply, then commit through the kernel broker.
+//! - **Concurrency:** The fixed worker pool and queue bound nested policy calls;
+//!   receive progress never waits behind an unbounded delegated request.
+//! - **Failure:** Queue saturation, owner loss, timeout, malformed reply, or
+//!   broker rejection returns an explicit error without granting a handle.
+//! - **Forbidden:** No caller-selected route, silent direct fallback, rights
+//!   widening, guessed owner identity, or unbounded policy worker creation.
+//! - **Evidence:** `commercial-envelope`, `service-call-authority`.
 use std::io::Write;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -94,7 +109,7 @@ fn start_sessiond_ioctl_workers() -> SessiondIoctlWorkers {
 }
 
 impl SessiondIoctlWorkers {
-    fn try_send(&self, mut work: SessiondIoctlWork) -> Result<(), SessiondIoctlWork> {
+    fn try_send(&self, mut work: SessiondIoctlWork) -> Result<(), u64> {
         for _ in 0..self.senders.len() {
             let index = self.next_worker.fetch_add(1, Ordering::Relaxed) % self.senders.len();
             match self.senders[index].try_send(work) {
@@ -104,7 +119,7 @@ impl SessiondIoctlWorkers {
                 }
             }
         }
-        Err(work)
+        Err(work.reply_cap)
     }
 }
 
@@ -174,7 +189,7 @@ fn serve(endpoint: u64, sessiond_workers: &SessiondIoctlWorkers) {
                 {
                     match sessiond_workers.try_send(SessiondIoctlWork { reply_cap, request }) {
                         Ok(()) => continue,
-                        Err(work) => reply_device_ioctl_status(work.reply_cap, libc::EAGAIN),
+                        Err(reply_cap) => reply_device_ioctl_status(reply_cap, libc::EAGAIN),
                     }
                 } else {
                     reply_device_ioctl(reply_cap, &request)
@@ -426,6 +441,9 @@ fn reply_device_open(
         (&args as *const IpcReplyWithHandlesArgs) as u64,
     );
     if send_fd >= 0 {
+        // SAFETY: `send_fd` is the still-owned sender copy returned by this
+        // request. The IPC transfer duplicated authority; closing this exact
+        // nonnegative descriptor cannot affect the received copy.
         unsafe {
             libc::close(send_fd as libc::c_int);
         }
@@ -1060,26 +1078,38 @@ fn encode_node_entry(name: &str, kind: u16) -> Option<DevmgrdNodeEntry> {
 }
 
 fn syscall0(number: u64) -> i64 {
+    // SAFETY: This is the centralized zero-argument raw-syscall boundary; each
+    // caller supplies a RustOS ABI number whose result is decoded immediately.
     unsafe { libc::syscall(number as libc::c_long) as i64 }
 }
 
 fn syscall1(number: u64, arg0: u64) -> i64 {
+    // SAFETY: The caller constructs `arg0` according to the selected RustOS
+    // syscall ABI and retains any referenced storage through the call.
     unsafe { libc::syscall(number as libc::c_long, arg0) as i64 }
 }
 
 fn syscall2(number: u64, arg0: u64, arg1: u64) -> i64 {
+    // SAFETY: Both raw words are admitted by the caller-specific ABI wrapper;
+    // referenced buffers, if any, remain live through this synchronous call.
     unsafe { libc::syscall(number as libc::c_long, arg0, arg1) as i64 }
 }
 
 fn syscall3(number: u64, arg0: u64, arg1: u64, arg2: u64) -> i64 {
+    // SAFETY: The caller owns the typed RustOS ABI envelope represented by
+    // these three words and retains pointed-to storage until return.
     unsafe { libc::syscall(number as libc::c_long, arg0, arg1, arg2) as i64 }
 }
 
 fn syscall5(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> i64 {
+    // SAFETY: The caller validates the five-word RustOS syscall contract and
+    // keeps every referenced input/output object live for the synchronous call.
     unsafe { libc::syscall(number as libc::c_long, arg0, arg1, arg2, arg3, arg4) as i64 }
 }
 
 fn syscall6(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i64 {
+    // SAFETY: The caller validates the six-word RustOS syscall contract and
+    // keeps every referenced input/output object live for the synchronous call.
     unsafe { libc::syscall(number as libc::c_long, arg0, arg1, arg2, arg3, arg4, arg5) as i64 }
 }
 
@@ -1104,5 +1134,7 @@ fn debug_line(message: &str) {
 
 fn read_unaligned<T: Copy>(bytes: &[u8]) -> T {
     assert!(bytes.len() >= size_of::<T>());
+    // SAFETY: The length assertion covers one complete `T`; unaligned read
+    // imposes no alignment precondition and `T: Copy` permits a bitwise value.
     unsafe { bytes.as_ptr().cast::<T>().read_unaligned() }
 }

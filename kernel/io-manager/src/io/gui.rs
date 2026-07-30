@@ -40,6 +40,24 @@ pub enum GuiPresentOutcome {
     Unavailable,
 }
 
+/// Kernel-readable BGRA8888 frame view supplied by a validated display surface.
+#[derive(Clone, Copy, Debug)]
+pub struct KernelBgraFrame {
+    pub src_ptr: *const u8,
+    pub width: usize,
+    pub height: usize,
+    pub stride_bytes: usize,
+}
+
+/// Damage region within a [`KernelBgraFrame`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GuiDamageRect {
+    pub x: usize,
+    pub y: usize,
+    pub width: usize,
+    pub height: usize,
+}
+
 pub fn try_present_panic_blackout() -> bool {
     backend::try_with_framebuffer(|framebuffer| {
         framebuffer.fill(Rgb888::new(0, 0, 0));
@@ -54,6 +72,14 @@ pub fn init(_boot_info_ptr: *const BootInfo) {
     // unavailable until the validated DVM display aperture is installed.
 }
 
+/// Registers the sole validated DVM framebuffer provider.
+///
+/// # Safety
+///
+/// `framebuffer` must be null or point to a readable
+/// [`DisplayFramebufferRegistration`] for the duration of this call. The
+/// registration is copied before returning; the pointed-to object is never
+/// retained.
 pub unsafe extern "C" fn register_driver_framebuffer(
     framebuffer: *const DisplayFramebufferRegistration,
 ) -> i32 {
@@ -133,6 +159,10 @@ pub fn display_info() -> Option<GuiDisplayInfo> {
     backend::display_info()
 }
 
+pub(crate) fn display_info_snapshot() -> Option<GuiDisplayInfo> {
+    backend::display_info()
+}
+
 fn display_flags_from_driver_registration(registration_flags: u8) -> u32 {
     let mut flags = DISPLAY_INFO_FLAG_PRIMARY_PROVIDER;
     if registration_flags & DISPLAY_FRAMEBUFFER_FLAG_DVM_SCANOUT != 0 {
@@ -155,6 +185,51 @@ pub fn present_userspace_frame_from_kernel_bgra8888(
         USERSPACE_DISPLAY_MODE.store(DISPLAY_MODE_BOOT_CONSOLE, Ordering::Release);
     }
     presented
+}
+
+pub fn present_userspace_frame_rect_from_kernel_bgra8888(
+    frame: KernelBgraFrame,
+    damage: GuiDamageRect,
+) -> GuiPresentOutcome {
+    let claimed_boot_console = begin_userspace_display_transition();
+    let presented = backend::present_bgra8888_rect_from_kernel(
+        frame,
+        self::framebuffer::FramebufferRect {
+            x: damage.x,
+            y: damage.y,
+            width: damage.width,
+            height: damage.height,
+        },
+    );
+    if presented == GuiPresentOutcome::Presented {
+        finish_userspace_display_transition();
+    } else if claimed_boot_console {
+        USERSPACE_DISPLAY_MODE.store(DISPLAY_MODE_BOOT_CONSOLE, Ordering::Release);
+    }
+    presented
+}
+
+pub fn is_userspace_display_active() -> bool {
+    USERSPACE_DISPLAY_MODE.load(Ordering::Acquire) != DISPLAY_MODE_BOOT_CONSOLE
+}
+
+fn begin_userspace_display_transition() -> bool {
+    USERSPACE_DISPLAY_MODE
+        .compare_exchange(
+            DISPLAY_MODE_BOOT_CONSOLE,
+            DISPLAY_MODE_USER_TRANSITION,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
+}
+
+fn finish_userspace_display_transition() {
+    if USERSPACE_DISPLAY_MODE.swap(DISPLAY_MODE_USER_ACTIVE, Ordering::AcqRel)
+        != DISPLAY_MODE_USER_ACTIVE
+    {
+        crate::debug::println!("userspace display active");
+    }
 }
 
 #[cfg(test)]
@@ -190,60 +265,6 @@ mod tests {
             -5
         );
         assert!(!registration_called.get());
-    }
-}
-
-pub fn present_userspace_frame_rect_from_kernel_bgra8888(
-    src_ptr: *const u8,
-    width: usize,
-    height: usize,
-    stride_bytes: usize,
-    x: usize,
-    y: usize,
-    rect_width: usize,
-    rect_height: usize,
-) -> GuiPresentOutcome {
-    let claimed_boot_console = begin_userspace_display_transition();
-    let presented = backend::present_bgra8888_rect_from_kernel(
-        src_ptr,
-        width,
-        height,
-        stride_bytes,
-        self::framebuffer::FramebufferRect {
-            x,
-            y,
-            width: rect_width,
-            height: rect_height,
-        },
-    );
-    if presented == GuiPresentOutcome::Presented {
-        finish_userspace_display_transition();
-    } else if claimed_boot_console {
-        USERSPACE_DISPLAY_MODE.store(DISPLAY_MODE_BOOT_CONSOLE, Ordering::Release);
-    }
-    presented
-}
-
-pub fn is_userspace_display_active() -> bool {
-    USERSPACE_DISPLAY_MODE.load(Ordering::Acquire) != DISPLAY_MODE_BOOT_CONSOLE
-}
-
-fn begin_userspace_display_transition() -> bool {
-    USERSPACE_DISPLAY_MODE
-        .compare_exchange(
-            DISPLAY_MODE_BOOT_CONSOLE,
-            DISPLAY_MODE_USER_TRANSITION,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        )
-        .is_ok()
-}
-
-fn finish_userspace_display_transition() {
-    if USERSPACE_DISPLAY_MODE.swap(DISPLAY_MODE_USER_ACTIVE, Ordering::AcqRel)
-        != DISPLAY_MODE_USER_ACTIVE
-    {
-        crate::debug::println!("userspace display active");
     }
 }
 // RING3-MIGRATION-REFERENCE END: uiserver-owned GUI/display substrate exception.

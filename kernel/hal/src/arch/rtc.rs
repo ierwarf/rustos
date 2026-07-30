@@ -1,6 +1,22 @@
+//! BSP deadline registry and clockevent wake delivery.
+//!
+//! - **Owner:** `kernel-hal` owns deadline records; the scheduler owns task
+//!   block epochs and callers own condition rechecks.
+//! - **Boundary:** Task IDs and deadlines are admitted only from exact
+//!   scheduler context.
+//! - **Lifecycle:** Register, recheck, expire/notify, resume, and disarm retain
+//!   one exact waiter until its owner acknowledges cleanup.
+//! - **Concurrency:** The tracked deadline lock is bounded and allocation-free;
+//!   IRQ work records wakeups and leaves policy to schedulable context.
+//! - **Failure:** Cancel, nondeadline wake, timeout, and retirement are
+//!   idempotent and reject stale task identities.
+//! - **Forbidden:** No destructive “notify means remove,” calendar deadlines,
+//!   polling fallback, or callback under the registry lock.
+//! - **Evidence:** `monotonic-deadline-lifecycle`, `scheduler-lifecycle`, and
+//!   `ui-main-loop-wakeup`.
 use core::hint::spin_loop;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use spin::Mutex;
+use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
 use x86_64::instructions::{hlt, interrupts, port::Port};
 
 const CMOS_INDEX_PORT: u16 = 0x70;
@@ -22,6 +38,8 @@ const RTC_UPDATE_IN_PROGRESS: u8 = 1 << 7;
 const RTC_PERIODIC_INTERRUPT_ENABLE: u8 = 1 << 6;
 const RTC_TICKS_PER_SEC: u64 = 1024;
 const RTC_SLEEP_WAITER_CAPACITY: usize = 256;
+const RTC_SLEEP_RENOTIFY_TICKS: u64 = 8;
+const RTC_SLEEP_UNNOTIFIED_TICK: u64 = u64::MAX;
 
 static RTC_TICKS: AtomicU64 = AtomicU64::new(0);
 static RTC_TICKS_COMPLETED: AtomicU64 = AtomicU64::new(0);
@@ -37,12 +55,21 @@ static RTC_LAST_INPUT_READ_CALL_COUNT: AtomicU64 = AtomicU64::new(0);
 static RTC_LAST_INPUT_READ_EVENT_COUNT: AtomicU64 = AtomicU64::new(0);
 static RTC_LAST_LINUX_IRQ_LOCK_DEPTH: AtomicU64 = AtomicU64::new(0);
 static RTC_SLEEP_LOCK_MISSES: AtomicU64 = AtomicU64::new(0);
-static RTC_SLEEP_WAITERS: Mutex<SleepWaiterTable> = Mutex::new(SleepWaiterTable::new());
+type RtcSleepWaiterLock = TrackedSpinLock<SleepWaiterTable, { LockClass::RtcSleepWaiter as u8 }>;
+static RTC_SLEEP_WAITERS: RtcSleepWaiterLock = TrackedSpinLock::new(SleepWaiterTable::new());
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SleepWaiter {
     task_id: u64,
     wake_tick: u64,
+    last_notify_tick: u64,
+    notification_count: u32,
+}
+
+#[derive(Clone, Copy)]
+struct SleepWakeNotification {
+    task_id: u64,
+    notification_count: u32,
 }
 
 struct SleepWaiterTable {
@@ -62,6 +89,8 @@ impl SleepWaiterTable {
             match slot {
                 Some(existing) if existing.task_id == waiter.task_id => {
                     existing.wake_tick = waiter.wake_tick;
+                    existing.last_notify_tick = RTC_SLEEP_UNNOTIFIED_TICK;
+                    existing.notification_count = 0;
                     return true;
                 }
                 None if free_index.is_none() => free_index = Some(index),
@@ -76,17 +105,29 @@ impl SleepWaiterTable {
         true
     }
 
-    fn take_ready(&mut self, now: u64) -> Option<u64> {
+    fn snapshot_ready(
+        &mut self,
+        now: u64,
+        ready: &mut [SleepWakeNotification; RTC_SLEEP_WAITER_CAPACITY],
+    ) -> usize {
+        let mut ready_len = 0;
         for slot in self.slots.iter_mut() {
-            let Some(waiter) = *slot else {
+            let Some(waiter) = slot.as_mut() else {
                 continue;
             };
-            if waiter.wake_tick <= now {
-                *slot = None;
-                return Some(waiter.task_id);
+            let first_notification = waiter.last_notify_tick == RTC_SLEEP_UNNOTIFIED_TICK;
+            let retry_due = now.saturating_sub(waiter.last_notify_tick) >= RTC_SLEEP_RENOTIFY_TICKS;
+            if waiter.wake_tick <= now && (first_notification || retry_due) {
+                waiter.notification_count = waiter.notification_count.saturating_add(1);
+                ready[ready_len] = SleepWakeNotification {
+                    task_id: waiter.task_id,
+                    notification_count: waiter.notification_count,
+                };
+                ready_len += 1;
+                waiter.last_notify_tick = now;
             }
         }
-        None
+        ready_len
     }
 
     fn remove_task(&mut self, task_id: u64) {
@@ -292,6 +333,7 @@ pub fn init() {
 }
 
 pub fn on_interrupt() {
+    let _irq_context = nucleus_core::util::lockdep::enter_irq_context();
     let interrupt_count = RTC_TICKS.fetch_add(1, Ordering::AcqRel).saturating_add(1);
     service_clock_event();
     // Only emit the diagnostic when we observe more than one in-flight tick
@@ -336,6 +378,11 @@ pub fn on_interrupt() {
 /// interrupt catches up all expired waiters from the clocksource rather than
 /// extending every timeout by the number of lost RTC edges.
 pub fn service_clock_event() {
+    // Both callers are hardware clockevent leaves (PIT scheduling and RTC).
+    // Enter here rather than relying on one IDT wrapper so the shared absolute
+    // deadline table is always treated as IRQ-owned, including the low-level
+    // timer assembly path which bypasses the generic PIC handler.
+    let _irq_context = nucleus_core::util::lockdep::enter_irq_context();
     let now_ticks = ticks();
     wake_ready_sleepers(now_ticks);
     let current_second = crate::arch::clock::monotonic_nanos() / 1_000_000_000;
@@ -487,9 +534,8 @@ fn block_current_user_until(target: u64) -> bool {
         let _ = crate::hooks::cancel_block_current_task();
         return true;
     }
-    match crate::hooks::commit_block_current_task() {
+    match crate::hooks::commit_block_current_task_and_yield() {
         Some(true) => {
-            crate::hooks::yield_now();
             // A non-deadline wake may have resumed the task early. Remove its
             // stale timer record before the outer loop computes a new target.
             disarm_sleep_waiter(task_id);
@@ -513,9 +559,12 @@ fn register_sleep_waiter(task_id: u64, wake_tick: u64) -> bool {
     // spin lock; otherwise the IRQ can preempt this CPU and deadlock trying to
     // acquire the same non-reentrant lock.
     let inserted = interrupts::without_interrupts(|| {
-        RTC_SLEEP_WAITERS
-            .lock()
-            .insert_or_update(SleepWaiter { task_id, wake_tick })
+        RTC_SLEEP_WAITERS.lock().insert_or_update(SleepWaiter {
+            task_id,
+            wake_tick,
+            last_notify_tick: RTC_SLEEP_UNNOTIFIED_TICK,
+            notification_count: 0,
+        })
     });
     if inserted {
         true
@@ -534,39 +583,64 @@ pub fn arm_sleep_waiter_until_tick(task_id: u64, wake_tick: u64) -> bool {
 }
 
 pub fn disarm_sleep_waiter(task_id: u64) {
-    #[cfg(target_os = "none")]
+    #[cfg(rustos_boot_image)]
     interrupts::without_interrupts(|| RTC_SLEEP_WAITERS.lock().remove_task(task_id));
-    #[cfg(not(target_os = "none"))]
+    #[cfg(not(rustos_boot_image))]
     RTC_SLEEP_WAITERS.lock().remove_task(task_id);
 }
 
 fn wake_ready_sleepers(now: u64) {
-    loop {
-        // Clockevent handlers must never spin on state owned by the
-        // interrupted context. Registration/cancellation mask interrupts
-        // while mutating the table, so a transient collision is safely
-        // retried by the next PIT/RTC edge. This keeps one late clockevent
-        // from turning a bounded sleeper deadline into a system-wide lockup.
-        let Some(ready_task) = try_take_ready_sleep_waiter(&RTC_SLEEP_WAITERS, now) else {
-            if RTC_SLEEP_LOCK_MISSES.fetch_add(1, Ordering::Relaxed) == 0 {
-                crate::debug::println!("rtc: sleep-waiter lock collision deferred");
+    // Clockevent handlers must never spin on state owned by the interrupted
+    // context. Registration/cancellation mask interrupts while mutating the
+    // table, so a transient collision is safely retried by the next PIT/RTC
+    // edge. Expiry is only a notification: the waiter remains owned until the
+    // resumed task acknowledges it through `disarm_sleep_waiter`. Reissuing
+    // the wake on later ticks preserves the deadline as independent recovery
+    // authority if a scheduler transition is delayed or coalesced.
+    let mut ready_tasks = [SleepWakeNotification {
+        task_id: 0,
+        notification_count: 0,
+    }; RTC_SLEEP_WAITER_CAPACITY];
+    let Some(ready_len) =
+        try_snapshot_ready_sleep_waiters(&RTC_SLEEP_WAITERS, now, &mut ready_tasks)
+    else {
+        if RTC_SLEEP_LOCK_MISSES.fetch_add(1, Ordering::Relaxed) == 0 {
+            crate::debug::println!("rtc: sleep-waiter lock collision deferred");
+        }
+        return;
+    };
+    for notification in ready_tasks.into_iter().take(ready_len) {
+        let task_id = notification.task_id;
+        if notification.notification_count >= 128
+            && notification.notification_count.is_power_of_two()
+        {
+            crate::debug::println!(
+                "rtc: sleep waiter remains unacknowledged task={} now={} notifications={}",
+                task_id,
+                now,
+                notification.notification_count
+            );
+        }
+        if !crate::hooks::wake_user_task(task_id) {
+            crate::debug::println!("rtc: expired sleep waiter had no live task task={task_id}");
+            if let Some(mut waiters) = RTC_SLEEP_WAITERS.try_lock() {
+                waiters.remove_task(task_id);
             }
-            return;
-        };
-        let Some(task_id) = ready_task else {
-            return;
-        };
-        let _ = crate::hooks::wake_user_task(task_id);
+        }
     }
 }
 
 /// `None` means the table is transiently owned by process context and the
-/// interrupt must return without spinning. `Some(None)` means the table was
+/// interrupt must return without spinning. `Some(0)` means the table was
 /// observed and contains no expired task.
-fn try_take_ready_sleep_waiter(waiters: &Mutex<SleepWaiterTable>, now: u64) -> Option<Option<u64>> {
+fn try_snapshot_ready_sleep_waiters(
+    waiters: &RtcSleepWaiterLock,
+    now: u64,
+    ready: &mut [SleepWakeNotification; RTC_SLEEP_WAITER_CAPACITY],
+) -> Option<usize> {
     waiters
         .try_lock()
-        .map(|mut waiters| waiters.take_ready(now))
+        .map(|mut waiters| waiters.snapshot_ready(now, ready))
 }
 
 #[cfg(test)]
@@ -662,37 +736,85 @@ mod tests {
     #[test]
     fn sleep_waiter_update_expiry_and_cancel_preserve_exact_task_ownership() {
         let mut waiters = SleepWaiterTable::new();
+        let mut ready = [SleepWakeNotification {
+            task_id: 0,
+            notification_count: 0,
+        }; RTC_SLEEP_WAITER_CAPACITY];
         assert!(waiters.insert_or_update(SleepWaiter {
             task_id: 41,
             wake_tick: 10,
+            last_notify_tick: RTC_SLEEP_UNNOTIFIED_TICK,
+            notification_count: 0,
         }));
         assert!(waiters.insert_or_update(SleepWaiter {
             task_id: 42,
             wake_tick: 5,
+            last_notify_tick: RTC_SLEEP_UNNOTIFIED_TICK,
+            notification_count: 0,
         }));
         assert!(waiters.insert_or_update(SleepWaiter {
             task_id: 41,
             wake_tick: 3,
+            last_notify_tick: RTC_SLEEP_UNNOTIFIED_TICK,
+            notification_count: 0,
         }));
 
-        assert_eq!(waiters.take_ready(2), None);
-        assert_eq!(waiters.take_ready(3), Some(41));
+        assert_eq!(waiters.snapshot_ready(2, &mut ready), 0);
+        assert_eq!(waiters.snapshot_ready(3, &mut ready), 1);
+        assert_eq!(ready[0].task_id, 41);
+        assert_eq!(waiters.snapshot_ready(3, &mut ready), 0);
+        assert_eq!(waiters.snapshot_ready(5, &mut ready), 1);
+        assert_eq!(ready[0].task_id, 42);
+        assert_eq!(
+            waiters.snapshot_ready(3 + RTC_SLEEP_RENOTIFY_TICKS, &mut ready),
+            1
+        );
+        assert_eq!(ready[0].task_id, 41);
+        assert_eq!(ready[0].notification_count, 2);
+        // Expiry notifies but does not release the timer owner. Only the
+        // resumed task's acknowledgement removes its exact waiter.
+        waiters.remove_task(41);
         waiters.remove_task(42);
-        assert_eq!(waiters.take_ready(u64::MAX), None);
+        assert_eq!(waiters.snapshot_ready(u64::MAX, &mut ready), 0);
     }
 
     #[test]
     fn sleep_waiter_clockevent_collision_is_nonblocking_and_retryable() {
-        let waiters = Mutex::new(SleepWaiterTable::new());
+        let waiters = RtcSleepWaiterLock::new(SleepWaiterTable::new());
+        let mut ready = [SleepWakeNotification {
+            task_id: 0,
+            notification_count: 0,
+        }; RTC_SLEEP_WAITER_CAPACITY];
         {
             let mut owner = waiters.lock();
             assert!(owner.insert_or_update(SleepWaiter {
                 task_id: 77,
                 wake_tick: 4,
+                last_notify_tick: RTC_SLEEP_UNNOTIFIED_TICK,
+                notification_count: 0,
             }));
-            assert_eq!(try_take_ready_sleep_waiter(&waiters, 4), None);
+            assert_eq!(
+                try_snapshot_ready_sleep_waiters(&waiters, 4, &mut ready),
+                None
+            );
         }
-        assert_eq!(try_take_ready_sleep_waiter(&waiters, 4), Some(Some(77)));
-        assert_eq!(try_take_ready_sleep_waiter(&waiters, 4), Some(None));
+        assert_eq!(
+            try_snapshot_ready_sleep_waiters(&waiters, 4, &mut ready),
+            Some(1)
+        );
+        assert_eq!(ready[0].task_id, 77);
+        assert_eq!(
+            try_snapshot_ready_sleep_waiters(&waiters, 4, &mut ready),
+            Some(0)
+        );
+        assert_eq!(
+            try_snapshot_ready_sleep_waiters(&waiters, 4 + RTC_SLEEP_RENOTIFY_TICKS, &mut ready),
+            Some(1)
+        );
+        waiters.lock().remove_task(77);
+        assert_eq!(
+            try_snapshot_ready_sleep_waiters(&waiters, 4, &mut ready),
+            Some(0)
+        );
     }
 }

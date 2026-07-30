@@ -1,3 +1,20 @@
+//! Storage-provider generation, geometry, cache, and durability policy.
+//!
+//! - **Owner:** `storaged` owns block timeout/retry/cache/durability policy;
+//!   Compat and `kernel-io-manager` expose bounded transport.
+//! - **Boundary:** DVM readiness, signed geometry, completions, operation IDs,
+//!   and client ranges are untrusted.
+//! - **Lifecycle:** Admit provider epoch, validate/submit, settle exact ticket,
+//!   cache only complete reads, flush durable mutations, invalidate on revoke,
+//!   and rebind a newer signed epoch.
+//! - **Concurrency:** Queue/cache state is bounded and never held across a
+//!   blocking broker call.
+//! - **Failure:** Timeout, cancel, device fault, short/stale completion,
+//!   restart, and geometry change reject or invalidate before reuse.
+//! - **Forbidden:** No fabricated readiness, unsigned rebind, cache across
+//!   generation, native driver, or false FUA/flush success.
+//! - **Evidence:** `dvm-block-startup`, `dvm-read-cache`,
+//!   `dvm-volume-io`, and `durable-block-mutation`.
 use std::mem::size_of;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -126,12 +143,11 @@ impl ReadCacheSet {
     ) -> Result<Option<Vec<u8>>, i32> {
         let mut hit = None;
         for index in (0..self.entries.len()).rev() {
-            match self.entries[index].slice(generation, lba, block_count, byte_len)? {
-                Some(bytes) => {
-                    hit = Some((index, bytes));
-                    break;
-                }
-                None => {}
+            if let Some(bytes) =
+                self.entries[index].slice(generation, lba, block_count, byte_len)?
+            {
+                hit = Some((index, bytes));
+                break;
             }
         }
         let Some((index, bytes)) = hit else {

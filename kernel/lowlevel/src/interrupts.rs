@@ -1,3 +1,19 @@
+//! Architecture-stable saved-context layout and interrupt exclusion leaves.
+//!
+//! - **Owner:** `kernel-lowlevel` owns the assembly/Rust context ABI.
+//! - **Boundary:** Raw CPU frames are represented as typed kernel state only
+//!   while their exact stack publication is live.
+//! - **Lifecycle:** Entry publishes a continuation, dispatch consumes it, and
+//!   the next trap republishes a new frame; consumed storage is not durable
+//!   scheduler state.
+//! - **Concurrency:** Interrupt enable/disable transitions are explicit and
+//!   must compose with scheduler preemption depth.
+//! - **Failure:** Layout or selector drift is rejected by build/source
+//!   witnesses before runtime.
+//! - **Forbidden:** No validation of a consumed frame or assumption that a
+//!   saved stack pointer remains immutable while the task runs.
+//! - **Evidence:** `exception-retirement`, `scheduler-lifecycle`, and
+//!   `syscall-simd-lifecycle`.
 use core::mem;
 use core::sync::atomic::{AtomicUsize, Ordering};
 

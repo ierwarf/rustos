@@ -133,6 +133,7 @@ dependencies = [
  "rand_chacha",
  "rand_core 0.10.0",
  "spin 0.10.0",
+ "x86_64",
 ]
 
 [[package]]
@@ -653,6 +654,7 @@ name = "kernel-compat"
 version = "0.1.0"
 dependencies = [
  "boot-random",
+ "heapless",
  "kernel-hal",
  "kernel-io-manager",
  "kernel-ipc-runtime",
@@ -736,6 +738,7 @@ version = "0.1.0"
 dependencies = [
  "kernel-mm",
  "kernel-object",
+ "nucleus-core",
  "rustos-fault-injection",
  "rustos-user-abi",
  "spin 0.10.0",

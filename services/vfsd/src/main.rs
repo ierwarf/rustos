@@ -1,3 +1,20 @@
+//! Filesystem namespace, open-description, cursor, and readiness policy owner.
+//!
+//! - **Owner:** `vfsd` owns runtime filesystem policy; ring0 retains only the
+//!   immutable bootstrap-image substrate and fd/copy mechanism.
+//! - **Boundary:** Paths, flags, remote IDs, requests, provider epochs, and
+//!   checkpoint records are untrusted.
+//! - **Lifecycle:** Stage checkpoint, create/open, retain across dup/fork,
+//!   prepare/settle mutations, close/tombstone on final reference, and replay
+//!   only current canonical state after restart.
+//! - **Concurrency:** Object state is serialized without holding a local lock
+//!   across synchronous cross-service IPC; readiness uses generations.
+//! - **Failure:** Timeout, short I/O, malformed checkpoint, restart, stale
+//!   provider, capacity, and final close preserve exact reference ownership.
+//! - **Forbidden:** No physical-disk driver policy in ring0, polling-only
+//!   readiness, unbounded path, stale checkpoint success, or legacy fallback.
+//! - **Evidence:** `vfs-open-description`, `remote-file-map`, `waitset`, and
+//!   recovery scenarios.
 // RING3-MIGRATION-REFERENCE START: vfsd is the ring3 owner for VFS policy.
 // Marker is restored to close historical audits; this file is not ring0 debt.
 #![no_std]
@@ -22,10 +39,9 @@ use rustos_user_abi::syscall::{
     CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
     CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, IpcReplyWithHandlesArgs,
     ServiceCheckpointRecordWire, VfsExecutableSnapshotRequest, VfsExecutableSnapshotResponse,
-    VfsIpcRequest, VfsIpcResponse, WaitSetInterestWire, WaitSetSignalBrokerArgs,
-    COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS,
-    COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR, COMMERCIAL_MAX_PROTOCOL_VFSD,
-    COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_COMPACT,
+    VfsIpcRequest, VfsIpcResponse, WaitSetInterestWire, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
+    COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS, COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR,
+    COMMERCIAL_MAX_PROTOCOL_VFSD, COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_COMPACT,
     COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE,
     COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_SCAN, COMMERCIAL_MAX_VFSD_OP_DIRECTORY_CURSOR,
     COMMERCIAL_MAX_VFSD_OP_FD_TABLE_PLAN, COMMERCIAL_MAX_VFSD_OP_FILE_CURSOR,
@@ -40,11 +56,10 @@ use rustos_user_abi::syscall::{
     SYSCALL_OFFLOAD_OP_LINUX_NEWFSTATAT, SYSCALL_OFFLOAD_OP_LINUX_OPENAT,
     SYSCALL_OFFLOAD_OP_LINUX_READLINKAT, SYSCALL_OFFLOAD_OP_LINUX_STATX,
     SYSCALL_OFFLOAD_OP_LINUX_UMOUNT2, SYSCALL_OFFLOAD_OP_LINUX_UNLINKAT,
-    SYS_RUSTOS_IPC_REPLY_WITH_HANDLES, SYS_RUSTOS_SCHED_DEMOTE_SELF,
-    SYS_RUSTOS_WAITSET_SIGNAL_BROKER, VFS_CURSOR_SETTLE_CANCEL, VFS_CURSOR_SETTLE_COMMIT,
-    VFS_EXECUTABLE_SNAPSHOT_ABI_VERSION, VFS_EXECUTABLE_SNAPSHOT_OP_OPEN, VFS_IPC_ABI_VERSION,
-    VFS_IPC_OP_ACCESS, VFS_IPC_OP_CHDIR, VFS_IPC_OP_CHECKPOINT_ACK, VFS_IPC_OP_CLOSE,
-    VFS_IPC_OP_CURSOR_SETTLE, VFS_IPC_OP_DUP, VFS_IPC_OP_FCNTL, VFS_IPC_OP_FSTAT,
+    SYS_RUSTOS_IPC_REPLY_WITH_HANDLES, SYS_RUSTOS_SCHED_DEMOTE_SELF, VFS_CURSOR_SETTLE_CANCEL,
+    VFS_CURSOR_SETTLE_COMMIT, VFS_EXECUTABLE_SNAPSHOT_ABI_VERSION, VFS_EXECUTABLE_SNAPSHOT_OP_OPEN,
+    VFS_IPC_ABI_VERSION, VFS_IPC_OP_ACCESS, VFS_IPC_OP_CHDIR, VFS_IPC_OP_CHECKPOINT_ACK,
+    VFS_IPC_OP_CLOSE, VFS_IPC_OP_CURSOR_SETTLE, VFS_IPC_OP_DUP, VFS_IPC_OP_FCNTL, VFS_IPC_OP_FSTAT,
     VFS_IPC_OP_FTRUNCATE, VFS_IPC_OP_GETCWD, VFS_IPC_OP_GETDENTS64, VFS_IPC_OP_LSEEK,
     VFS_IPC_OP_MKDIR, VFS_IPC_OP_MOUNT, VFS_IPC_OP_NEWFSTATAT, VFS_IPC_OP_OPENAT,
     VFS_IPC_OP_POLL_QUERY, VFS_IPC_OP_PREAD64, VFS_IPC_OP_READ, VFS_IPC_OP_READLINKAT,
@@ -52,7 +67,12 @@ use rustos_user_abi::syscall::{
     VFS_IPC_PATH_CAPACITY, VFS_IPC_PAYLOAD_CAPACITY, VFS_POLL_QUERY_EPOLL_CREATE,
     VFS_POLL_QUERY_EPOLL_CTL, VFS_POLL_QUERY_EPOLL_PURGE_OBJECT, VFS_POLL_QUERY_EPOLL_REF,
     VFS_POLL_QUERY_EPOLL_SNAPSHOT, VFS_POLL_QUERY_EPOLL_UNREF, VFS_POLL_QUERY_POLL,
-    WAITSET_ABI_VERSION, WAITSET_GLOBAL_OBJECT_ID, WAITSET_MAX_INTERESTS, WAITSET_PROVIDER_VFSD,
+    WAITSET_ABI_VERSION, WAITSET_MAX_INTERESTS,
+};
+#[cfg(not(test))]
+use rustos_user_abi::syscall::{
+    WaitSetSignalBrokerArgs, SYS_RUSTOS_WAITSET_SIGNAL_BROKER, WAITSET_GLOBAL_OBJECT_ID,
+    WAITSET_PROVIDER_VFSD,
 };
 use storage_fat::{FatDirEntry, FatNodeKind, FatVolume};
 use vfsd::{
@@ -126,6 +146,7 @@ const VFS_RECV_BYTES: usize = max_usize(
 #[repr(align(8))]
 // Tuple storage is accessed through raw IPC buffers; the wrapper's alignment
 // rather than field reads is its purpose.
+// LAYOUT: The backing field is intentionally accessed through raw IPC bytes.
 #[allow(dead_code)]
 struct VfsRecvBuffer([u8; VFS_RECV_BYTES]);
 
@@ -500,7 +521,7 @@ fn create_terminally_sealed_snapshot(_path: &str, bytes: &[u8]) -> Result<i32, i
         rustos_svc_runtime::syscall::syscall2(
             linux_abi::SYS_MEMFD_CREATE,
             name.as_ptr() as u64,
-            u64::from(linux_abi::MFD_CLOEXEC | linux_abi::MFD_ALLOW_SEALING),
+            linux_abi::MFD_CLOEXEC | linux_abi::MFD_ALLOW_SEALING,
         )
     } as i32;
     if fd < 0 {
@@ -539,8 +560,8 @@ fn create_terminally_sealed_snapshot(_path: &str, bytes: &[u8]) -> Result<i32, i
             rustos_svc_runtime::syscall::syscall3(
                 linux_abi::SYS_FCNTL,
                 fd as u64,
-                linux_abi::F_ADD_SEALS as u64,
-                seals as u64,
+                linux_abi::F_ADD_SEALS,
+                seals,
             )
         };
         if status < 0 {

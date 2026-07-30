@@ -1,7 +1,21 @@
+//! Physical-frame admission, reservation, allocation, and one-time release.
+//!
+//! - **Owner:** `kernel-mm` owns the global physical-frame lifecycle.
+//! - **Boundary:** Boot memory-map ranges are untrusted until trimmed,
+//!   canonicalized, nonoverlapping, and reserved around kernel assets.
+//! - **Lifecycle:** Reserved or free frames become allocated, then return once
+//!   to the free set; reserved frames never enter ordinary allocation.
+//! - **Concurrency:** The allocator mutation boundary is bounded and must not
+//!   invoke callbacks or services.
+//! - **Failure:** Exhaustion is explicit; invalid, double, partial, and
+//!   reserved-range frees are rejected before mutation.
+//! - **Forbidden:** No fixed 4 KiB policy outside architecture page size, silent
+//!   wrap, or best-effort double free.
+//! - **Evidence:** `physical-frame-lifecycle`.
 use boot_protocol::{BootInfo, BootMemoryKind, BootMemoryRegion};
 use core::ptr;
 
-use spin::Mutex;
+use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
 use x86_64::PhysAddr;
 #[cfg(not(test))]
 use x86_64::instructions::interrupts;
@@ -13,7 +27,8 @@ const BITS_PER_WORD: usize = 64;
 const MAX_USABLE_RANGES: usize = 128;
 const PHYS_ALLOC_SCAN_MILESTONE_FRAMES: usize = 64 * 1024;
 
-static PHYS_ALLOCATOR: Mutex<PhysAllocatorState> = Mutex::new(PhysAllocatorState::new());
+static PHYS_ALLOCATOR: TrackedSpinLock<PhysAllocatorState, { LockClass::PhysicalAllocator as u8 }> =
+    TrackedSpinLock::new(PhysAllocatorState::new());
 
 #[inline]
 fn irq_safe<T>(f: impl FnOnce() -> T) -> T {
@@ -517,6 +532,7 @@ pub fn usable_bytes() -> u64 {
     irq_safe(|| PHYS_ALLOCATOR.lock().usable_frames as u64 * PAGE_SIZE)
 }
 
+// DIAGNOSTIC: Release kernels omit the physical-memory status printer.
 #[cfg_attr(not(rustos_debug_print_enabled), allow(dead_code))]
 pub fn free_bytes() -> u64 {
     irq_safe(|| PHYS_ALLOCATOR.lock().free_frames as u64 * PAGE_SIZE)

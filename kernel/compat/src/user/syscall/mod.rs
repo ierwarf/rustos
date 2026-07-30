@@ -52,6 +52,24 @@ pub(crate) fn retire_current_linux_task_due_to_fault(
     disposition
 }
 
+pub(crate) fn cleanup_retired_task_runtime_state(
+    task_id: u64,
+    process_id: u64,
+    process_terminal: bool,
+    clear_child_tid: u64,
+    robust_list_head: u64,
+    robust_list_len: u64,
+) -> usize {
+    linux::cleanup_retired_task_runtime_state(
+        task_id,
+        process_id,
+        process_terminal,
+        clear_child_tid,
+        robust_list_head,
+        robust_list_len,
+    )
+}
+
 fn fault_termination_process(
     disposition: multitask::UserFaultDisposition,
     final_process_thread: Option<u64>,
@@ -198,12 +216,15 @@ extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> u64 {
         user_simd.restore(),
         "syscall SIMD restore no longer owns the entering task"
     );
-    let return_abi = validate_syscall_entry_or_terminate(frame);
     // The syscall body runs with IF=1, so this software interrupt preserves
     // an interruptible kernel continuation. The scheduler may switch here and
     // later resume the exact syscall before restoring the entering user SIMD
     // image. This closes hot-syscall starvation without a high-rate PIT retry.
     multitask::reschedule_deferred_from_interruptible_syscall();
+    // The syscall frame stayed live on the task's kernel stack across that
+    // possible continuation. Revalidate the exact SYSRET boundary after the
+    // last resume so a stale pre-schedule decision can never authorize return.
+    let return_abi = validate_syscall_entry_or_terminate(frame);
     trace_syscall_exit(frame, return_abi, result);
     result
 }
@@ -451,5 +472,25 @@ mod tests {
         frame = valid_frame();
         frame.user_rflags |= x86_64::registers::rflags::RFlags::TRAP_FLAG.bits();
         assert!(syscall_return_contract(&frame).is_none());
+    }
+
+    #[test]
+    fn sysret_validation_follows_last_interruptible_resume() {
+        let source = include_str!("mod.rs");
+        let dispatch = source
+            .split("extern \"C\" fn syscall_dispatch")
+            .nth(1)
+            .and_then(|rest| rest.split("fn dispatch_syscall").next())
+            .expect("syscall dispatch body");
+        let resume = dispatch
+            .find("multitask::reschedule_deferred_from_interruptible_syscall();")
+            .expect("interruptible scheduler tail");
+        let validation = dispatch
+            .find("let return_abi = validate_syscall_entry_or_terminate(frame);")
+            .expect("post-resume SYSRET validation");
+        assert!(
+            resume < validation,
+            "SYSRET validation must follow the last possible continuation resume"
+        );
     }
 }

@@ -7,26 +7,68 @@ mod tests {
         DVM_BOOTSTRAP_FRAME_MARKER, DVM_CONTROL_AUTHENTICATION, DVM_CONTROL_CAPABILITIES,
         DVM_CONTROL_PROTOCOL, DVM_CONTROL_STATE, DVM_CONTROL_TRANSPORT, DVM_DISPLAY_REGION_BYTES,
         DVM_GPU_COMPOSITOR_MARKER, DVM_KEYBOARD_INGRESS_MARKER, DVM_POINTER_INGRESS_MARKER,
-        DvmNetworkCounters, GuestDisplay, PHYSICAL_GPU_PROFILES, RUSTOS_BOOT_MARKER,
+        DvmNetworkCounters, GuestDisplay, MAX_SMOKE_TIMEOUT, PHYSICAL_GPU_PROFILES,
+        RUSTOS_BOOT_MARKER,
         RUSTOS_DVM_BLOCK_E2E_MARKER, RUSTOS_DVM_BLOCK_FIRST_COMPLETION_MARKER,
         RUSTOS_DVM_BLOCK_FLUSH_FAULT_MARKER, RUSTOS_DVM_BLOCK_MARKER,
         RUSTOS_GPU_SCENE_COMPILER_MARKER, RUSTOS_INIT_IDENTITY_MARKER,
         RUSTOS_POST_INIT_PROVENANCE_MARKER, VIRTUAL_GPU_EVIDENCE, WayclickProfileObservation,
-        append_dvm_display_pixels, append_dvm_input_devices, append_dvm_network_device,
-        append_dvm_virtual_gpu, append_physical_gpu, claim_physical_gpu_launch_in,
-        causal_tail, dvm_display_failure, dvm_display_provider_ready, dvm_display_relay_meets_fps,
-        dvm_display_relay_ready, dvm_gpu_compositor_ready, dvm_gpu_device, dvm_machine,
-        dvm_physical_frames_ready, dvm_pointer_device, guest_deadline_reached, is_sha256,
-        mesa_dri_prime_for_pci_bdf,
+        acquire_kvm_launch_lock, append_dvm_display_pixels, append_dvm_input_devices,
+        append_dvm_network_device, append_dvm_virtual_gpu, append_physical_gpu,
+        claim_physical_gpu_launch_in, causal_tail, dvm_display_failure, dvm_display_provider_ready,
+        dvm_display_relay_meets_fps, dvm_display_relay_ready, dvm_gpu_compositor_ready,
+        dvm_gpu_device, dvm_machine, dvm_physical_frames_ready, dvm_pointer_device,
+        guest_cid_for_process, guest_deadline_reached, is_sha256, mesa_dri_prime_for_pci_bdf,
         parse_dvm_control_contract_text, parse_manifest_text, parse_smoke_options,
         physical_gpu_profile, prepare_runtime_log, qemu_display_backend, required_dvm_gpu_ready,
+        RustosSmpReadiness, RUSTOS_SMP_READINESS,
         runtime_stall_or_crash_observed, select_smoke_guest_display,
         uiserver_has_interactive_slow_loop, uiserver_idle_ticks_healthy,
         uiserver_profile_input_pipeline_healthy, uiserver_profile_meets_fps,
         validate_manifest_values, validate_storage_fault_expectation, vfio_device_cdev_path,
         wayclick_profile_meets_fps, wayclick_profile_observation,
     };
-    use std::{fs, path::Path, process::Command};
+    use std::{fs, path::Path, process::Command, time::Duration};
+
+    #[test]
+    fn rustos_smp_topology_is_machine_gated_on_complete_prerequisites() {
+        assert_eq!(RUSTOS_SMP_READINESS.rustos_vcpus, 1);
+        assert!(!RUSTOS_SMP_READINESS.prerequisites_complete());
+        assert!(RUSTOS_SMP_READINESS.validate().is_ok());
+
+        let incomplete_multi = RustosSmpReadiness {
+            rustos_vcpus: 2,
+            ..RUSTOS_SMP_READINESS
+        };
+        assert!(incomplete_multi.validate().is_err());
+
+        let complete_multi = RustosSmpReadiness {
+            rustos_vcpus: 2,
+            per_cpu_scheduler: true,
+            per_cpu_syscall_state: true,
+            cpu_online_state_machine: true,
+            reschedule_ipi: true,
+            tlb_shootdown: true,
+            atomic_robust_futex_cleanup: true,
+        };
+        assert!(complete_multi.validate().is_ok());
+    }
+
+    #[test]
+    fn kvm_launch_lock_rejects_concurrent_log_and_cid_owners() {
+        let root = tempfile::tempdir().unwrap();
+        let _owner = acquire_kvm_launch_lock(root.path()).unwrap();
+        assert!(acquire_kvm_launch_lock(root.path()).is_err());
+    }
+
+    #[test]
+    fn kvm_guest_cid_is_process_scoped_and_never_reserved() {
+        let first = guest_cid_for_process(100);
+        let second = guest_cid_for_process(101);
+        assert!(first >= 3);
+        assert_ne!(first, u32::MAX);
+        assert_ne!(first, second);
+    }
 
     #[test]
     fn dry_run_log_preparation_preserves_existing_evidence() {
@@ -78,7 +120,18 @@ mod tests {
             parse_smoke_options(vec!["--expect-dvm".into(), "gpu-extra".into()].into_iter())
                 .unwrap();
         assert!(extra.expected_dvm_markers.contains(&"gpu-extra".to_owned()));
-        assert!(parse_smoke_options(vec!["--timeout".into(), "31".into()].into_iter()).is_err());
+        assert!(
+            parse_smoke_options(
+                vec!["--timeout".into(), MAX_SMOKE_TIMEOUT.to_string()].into_iter()
+            )
+            .is_ok()
+        );
+        assert!(
+            parse_smoke_options(
+                vec!["--timeout".into(), (MAX_SMOKE_TIMEOUT + 1).to_string()].into_iter()
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -409,6 +462,51 @@ mod tests {
     }
 
     #[test]
+    fn recovery_probe_requires_fresh_rustos_and_dvm_process_epochs() {
+        let options = parse_smoke_options(
+            vec!["--recovery-probe".into(), "all".into()].into_iter(),
+        )
+        .unwrap();
+        assert!(options.recovery_probe.includes_rustos_reboot());
+        assert!(options.recovery_probe.includes_dvm_restart());
+        assert!(
+            parse_smoke_options(
+                vec![
+                    "--recovery-probe".into(),
+                    "rustos-reboot".into(),
+                    "--min-ui-fps".into(),
+                    "55".into(),
+                ]
+                .into_iter(),
+            )
+            .is_err()
+        );
+        assert!(
+            parse_smoke_options(
+                vec![
+                    "--recovery-probe".into(),
+                    "dvm-restart".into(),
+                    "--storage-dvm-only".into(),
+                ]
+                .into_iter(),
+            )
+            .is_err()
+        );
+        let source = include_str!("guest.rs");
+        let stop = source
+            .find("stop_guest(rustos);")
+            .expect("fresh reboot stops the old RustOS process");
+        let spawn = source
+            .find("*rustos = spawn_rustos_guest(self.qemu, self.config, self.layout, false)?;")
+            .expect("fresh reboot launches a new RustOS process");
+        let archive = source
+            .find("archive_recovery_log(&self.layout.debugcon_log)?;")
+            .expect("fresh reboot archives its predecessor capture");
+        assert!(stop < spawn);
+        assert!(stop < archive && archive < spawn);
+    }
+
+    #[test]
     fn dvm_network_counters_are_bounded_and_bidirectional() {
         let observed = DvmNetworkCounters {
             tx_producer: 2,
@@ -456,9 +554,41 @@ mod tests {
         )
         .unwrap();
         assert_eq!(soak.ui_proof_windows, 15);
+        let minute_soak = parse_smoke_options(
+            vec![
+                "--min-ui-fps".into(),
+                "55".into(),
+                "--ui-proof-windows".into(),
+                "60".into(),
+                "--timeout".into(),
+                "90".into(),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        assert_eq!(minute_soak.ui_proof_windows, 60);
+        assert_eq!(minute_soak.timeout, Duration::from_secs(90));
         assert!(
             parse_smoke_options(vec!["--ui-proof-windows".into(), "15".into()].into_iter())
                 .is_err()
+        );
+        assert!(
+            parse_smoke_options(
+                vec![
+                    "--min-ui-fps".into(),
+                    "55".into(),
+                    "--ui-proof-windows".into(),
+                    "61".into(),
+                ]
+                .into_iter(),
+            )
+            .is_err()
+        );
+        assert!(
+            parse_smoke_options(
+                vec!["--timeout".into(), (MAX_SMOKE_TIMEOUT + 1).to_string()].into_iter(),
+            )
+            .is_err()
         );
         assert!(
             parse_smoke_options(vec!["--min-ui-fps".into(), "241".into()].into_iter()).is_err()
@@ -917,7 +1047,7 @@ uiserver: slow loop iter_ms=51 wayland_ms=0 present_ms=51 console_windows=1 wayl
         assert!(source.contains("UI_SET_ABSBIT, ABS_X"));
         assert!(source.contains("UI_SET_ABSBIT, ABS_Y"));
         assert!(source.contains("selftest->motion_phase == 0U"));
-        assert!(source.contains("#define INPUT_SELFTEST_CYCLES 2667U"));
+        assert!(source.contains("#define INPUT_SELFTEST_CYCLES 6000U"));
         assert!(source.contains("#define INPUT_SELFTEST_LEG_CYCLES 64U"));
         assert!(source.contains("#define INPUT_SELFTEST_POLL_MS 15"));
         assert!(source.contains("#define INPUT_RELAY_RR_PRIORITY 10"));

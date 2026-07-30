@@ -31,7 +31,12 @@ FIELDS = (
 
 REQUIRED_DISRUPTIONS = {
     "checkpoint": {"before-commit", "after-commit", "partial-record", "stale-replay"},
-    "service-restart": {"restart", "stale-replay"},
+    "service-restart": {
+        "failed-activation",
+        "forced-termination",
+        "restart",
+        "stale-replay",
+    },
     "storage": {"before-commit", "after-commit", "restart", "stale-replay", "timeout"},
 }
 
@@ -43,6 +48,12 @@ ALLOWED_TERMINALS = {
     ("service-restart", "restart"): {
         "new-owner-epoch",
         "same-registration-new-epoch",
+    },
+    ("service-restart", "failed-activation"): {
+        "exact-child-retired-before-retry",
+    },
+    ("service-restart", "forced-termination"): {
+        "dependents-revoked-and-terminated",
     },
     ("service-restart", "stale-replay"): {"rejected-owner-snapshot"},
     ("storage", "before-commit"): {"no-ring-publication"},

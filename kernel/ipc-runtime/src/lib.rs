@@ -1,6 +1,6 @@
 #![no_std]
 
-#[cfg(all(feature = "host-test", target_os = "none"))]
+#[cfg(all(feature = "host-test", rustos_boot_image))]
 compile_error!("kernel-ipc-runtime host-test must never be enabled for the RustOS target");
 
 extern crate alloc;

@@ -103,13 +103,12 @@ impl VfsState {
             };
         }
 
-        let metadata = self.metadata(path).map_err(|errno| {
+        let metadata = self.metadata(path).inspect_err(|&errno| {
             if !block::is_transient_storage_not_ready(errno) {
                 debug_line(&format!(
                     "vfsd: open failed stage=metadata errno={errno} path={path}"
                 ));
             }
-            errno
         })?;
         if flags & O_DIRECTORY != 0 && metadata.kind != RemoteKind::Directory {
             return Err(ENOTDIR);
@@ -129,11 +128,10 @@ impl VfsState {
             last_result: 0,
         };
         self.checkpoint_open_description(request, id, &handle)
-            .map_err(|errno| {
+            .inspect_err(|&errno| {
                 debug_line(&format!(
                     "vfsd: open failed stage=checkpoint errno={errno} path={path}"
                 ));
-                errno
             })?;
         if self.handles.insert(id, handle.clone()).is_some() {
             debug_line(&format!(
@@ -395,10 +393,7 @@ impl VfsState {
             }
             handle.path.clone()
         };
-        let entries = match self.dir_entries(path.as_str()) {
-            Ok(entries) => entries,
-            Err(errno) => return Err(errno),
-        };
+        let entries = self.dir_entries(path.as_str())?;
         let mut written = 0usize;
         let mut consumed = 0usize;
         for (index, entry) in entries.iter().enumerate().skip(cursor) {
@@ -501,22 +496,20 @@ impl VfsState {
 
     fn volume(&mut self) -> Result<&FatVolume<BootBlockDevice>, i32> {
         if self.volume.is_none() {
-            let device = BootBlockDevice::open().map_err(|errno| {
+            let device = BootBlockDevice::open().inspect_err(|&errno| {
                 if !block::is_transient_storage_not_ready(errno) {
                     debug_line(&format!(
                         "vfsd: volume unavailable stage=block-info errno={errno}"
                     ));
                 }
-                errno
             })?;
             self.volume = Some(
                 FatVolume::new(device)
                     .map_err(map_fat_error)
-                    .map_err(|errno| {
+                    .inspect_err(|&errno| {
                         debug_line(&format!(
                             "vfsd: volume unavailable stage=fat-admission errno={errno}"
                         ));
-                        errno
                     })?,
             );
         }

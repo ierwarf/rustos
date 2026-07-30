@@ -1,7 +1,25 @@
+//! Bounded service-call helpers and deferred mutation settlement.
+//!
+//! - **Owner:** Compat owns envelope transport; each target service owns the
+//!   remote object and mutation policy.
+//! - **Boundary:** Service replies and local deferred-work records are admitted
+//!   against the exact request, process, and provider generation.
+//! - **Lifecycle:** Stage mutation, issue a finite call, commit or enqueue one
+//!   retry owner, then settle/cancel on restart, exec, close, or exit.
+//! - **Concurrency:** No local state lock is held across discovery or
+//!   synchronous IPC; empty maintenance turns perform no discovery.
+//! - **Failure:** Timeout, EPIPE, malformed response, queue full, and provider
+//!   revoke retain or withdraw exactly the correct reference.
+//! - **Forbidden:** No unbounded retry, allocate-under-lock queue growth,
+//!   fabricated success, or stale provider replay.
+//! - **Evidence:** `vfs-open-description`.
 use super::*;
-use alloc::collections::VecDeque;
 use alloc::string::String;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use nucleus_core::util::{
+    lockdep::{LockClass, TrackedSpinLock},
+    ring::RingBuffer,
+};
 
 const EARLY_SERVICE_CALL_SAMPLES: usize = 6;
 const SLOW_SERVICE_CALL_THRESHOLD_MS: u64 = 10;
@@ -15,10 +33,11 @@ const MAX_SLOW_SERVICE_CALL_LOGS_PER_SECOND: usize = 1;
 // IPC deadline. Stateful authorize/read calls retain their completion wait
 // until the ABI carries a cancellable authorization lease.
 const PENDING_VFS_MUTATION_CAPACITY: usize = 32 * 1024;
+const PENDING_VFS_MUTATION_STORAGE_CAPACITY: usize = PENDING_VFS_MUTATION_CAPACITY + 1;
 const PENDING_VFS_PAYLOAD_CAPACITY: usize = 64;
 const FOREGROUND_VFS_MAINTENANCE_ATTEMPTS: usize = 1;
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 struct PendingVfsMutation {
     op: u16,
     fd: u64,
@@ -32,10 +51,10 @@ struct PendingVfsMutation {
     payload: [u8; PENDING_VFS_PAYLOAD_CAPACITY],
 }
 
-lazy_static::lazy_static! {
-    static ref PENDING_VFS_MUTATIONS: spin::Mutex<VecDeque<PendingVfsMutation>> =
-        spin::Mutex::new(VecDeque::new());
-}
+static PENDING_VFS_MUTATIONS: TrackedSpinLock<
+    RingBuffer<PendingVfsMutation, PENDING_VFS_MUTATION_STORAGE_CAPACITY>,
+    { LockClass::VfsDeferredMutation as u8 },
+> = TrackedSpinLock::new(RingBuffer::new());
 
 static SERVICE_CALL_SAMPLE_COUNT: AtomicUsize = AtomicUsize::new(0);
 static SLOW_SERVICE_CALL_LOG_RATE_STATE: AtomicU64 = AtomicU64::new(u64::MAX);
@@ -436,13 +455,8 @@ pub fn call_vfs_ipc_request_with_timeout(
     call_vfs_ipc_request_impl(request, Some(timeout_ms.max(1)))
 }
 
-fn call_vfs_ipc_request_impl(
-    request: &VfsIpcRequest,
-    timeout_ms: Option<u64>,
-) -> Result<VfsIpcResponse, i64> {
-    drain_pending_vfs_mutations();
-    let start_ticks = crate::arch::rtc::ticks();
-    let replay_safe_mutation = matches!(
+fn vfs_request_is_replay_safe(request: &VfsIpcRequest) -> bool {
+    matches!(
         request.op,
         VFS_IPC_OP_OPENAT
             | VFS_IPC_OP_CLOSE
@@ -460,7 +474,17 @@ fn call_vfs_ipc_request_impl(
                 | VFS_POLL_QUERY_EPOLL_REF
                 | VFS_POLL_QUERY_EPOLL_UNREF
                 | VFS_POLL_QUERY_EPOLL_PURGE_OBJECT
-        );
+                | VFS_POLL_QUERY_EPOLL_SNAPSHOT
+        )
+}
+
+fn call_vfs_ipc_request_impl(
+    request: &VfsIpcRequest,
+    timeout_ms: Option<u64>,
+) -> Result<VfsIpcResponse, i64> {
+    let _ = drain_pending_vfs_mutations();
+    let start_ticks = crate::arch::rtc::ticks();
+    let replay_safe_request = vfs_request_is_replay_safe(request);
     let deferred_reconcile = matches!(
         request.op,
         VFS_IPC_OP_CLOSE | VFS_IPC_OP_CURSOR_SETTLE | VFS_IPC_OP_CHECKPOINT_ACK
@@ -473,8 +497,8 @@ fn call_vfs_ipc_request_impl(
                 | VFS_POLL_QUERY_EPOLL_UNREF
                 | VFS_POLL_QUERY_EPOLL_PURGE_OBJECT
         );
-    let total_timeout_ms = timeout_ms.or(replay_safe_mutation.then_some(30_000));
-    let attempts = if replay_safe_mutation {
+    let total_timeout_ms = timeout_ms.or(replay_safe_request.then_some(30_000));
+    let attempts = if replay_safe_request {
         total_timeout_ms
             .map(|total| usize::try_from(total).unwrap_or(usize::MAX).min(3))
             .unwrap_or(3)
@@ -634,7 +658,7 @@ fn enqueue_pending_vfs_mutation(request: &VfsIpcRequest) -> Result<(), i64> {
         return Err(LINUX_EINVAL);
     }
     let mut queue = PENDING_VFS_MUTATIONS.lock();
-    if queue.iter().any(|entry| {
+    if queue.any(|entry| {
         if request.op == VFS_IPC_OP_CHECKPOINT_ACK {
             entry.op == VFS_IPC_OP_CHECKPOINT_ACK
                 && entry.arg0 == request.arg0
@@ -645,12 +669,12 @@ fn enqueue_pending_vfs_mutation(request: &VfsIpcRequest) -> Result<(), i64> {
     }) {
         return Ok(());
     }
-    if queue.len() == PENDING_VFS_MUTATION_CAPACITY {
+    if queue.len() >= PENDING_VFS_MUTATION_CAPACITY {
         return Err(LINUX_ENOSPC);
     }
     let mut payload = [0_u8; PENDING_VFS_PAYLOAD_CAPACITY];
     payload[..payload_len].copy_from_slice(&request.payload[..payload_len]);
-    queue.push_back(PendingVfsMutation {
+    let admitted = queue.push(PendingVfsMutation {
         op: request.op,
         fd: request.fd,
         remote_id: request.remote_id,
@@ -662,17 +686,24 @@ fn enqueue_pending_vfs_mutation(request: &VfsIpcRequest) -> Result<(), i64> {
         payload_len: request.payload_len,
         payload,
     });
+    assert!(admitted, "vfs mutation admission capacity must be reserved");
     Ok(())
 }
 
-fn drain_pending_vfs_mutations() {
+pub(super) fn service_deferred_vfs_mutations() -> usize {
+    drain_pending_vfs_mutations()
+}
+
+fn drain_pending_vfs_mutations() -> usize {
     // Deferred recovery cannot multiply one foreground read/open into eight
     // independent 16 ms waits. One one-millisecond replay turn preserves
     // progress while bounding head-of-line maintenance charged to the caller.
+    let mut attempted = 0usize;
     for _ in 0..FOREGROUND_VFS_MAINTENANCE_ATTEMPTS {
-        let Some(pending) = PENDING_VFS_MUTATIONS.lock().pop_front() else {
-            return;
+        let Some(pending) = PENDING_VFS_MUTATIONS.lock().pop() else {
+            return attempted;
         };
+        attempted += 1;
         let mut request = new_vfs_request(pending.op);
         request.fd = pending.fd;
         request.remote_id = pending.remote_id;
@@ -699,17 +730,24 @@ fn drain_pending_vfs_mutations() {
             validate_vfs_response_envelope(request.op, &response).is_ok() && response.status == 0
         });
         if !completed {
-            PENDING_VFS_MUTATIONS.lock().push_front(pending);
-            return;
+            assert!(
+                PENDING_VFS_MUTATIONS.lock().push_front(pending),
+                "popped vfs mutation must have retry capacity"
+            );
+            return attempted;
         }
         if vfs_checkpoint_ack_required(&request) {
             let ack = vfs_checkpoint_ack_request(&request);
             if enqueue_pending_vfs_mutation(&ack).is_err() {
-                PENDING_VFS_MUTATIONS.lock().push_front(pending);
-                return;
+                assert!(
+                    PENDING_VFS_MUTATIONS.lock().push_front(pending),
+                    "popped vfs mutation must have retry capacity"
+                );
+                return attempted;
             }
         }
     }
+    attempted
 }
 
 fn validate_vfs_response_envelope(request_op: u16, response: &VfsIpcResponse) -> Result<(), i64> {
@@ -1692,6 +1730,10 @@ fn log_slow_service_call(
     }
 }
 
+#[allow(
+    clippy::items_after_test_module,
+    reason = "focused response-envelope tests remain adjacent to the parser while public path helpers close the module"
+)]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1759,6 +1801,19 @@ mod tests {
         assert_eq!(slices.as_slice(), &[6, 5, 5]);
         assert_eq!(slices.iter().sum::<u64>(), 16);
         assert_eq!(split_retry_timeout_ms(1, 1, 0), 1);
+    }
+
+    #[test]
+    fn epoll_snapshot_reads_are_retry_safe() {
+        let mut request = VfsIpcRequest {
+            op: VFS_IPC_OP_POLL_QUERY,
+            ..VfsIpcRequest::default()
+        };
+        request.arg0 = VFS_POLL_QUERY_EPOLL_SNAPSHOT;
+        assert!(vfs_request_is_replay_safe(&request));
+
+        request.arg0 = u64::MAX;
+        assert!(!vfs_request_is_replay_safe(&request));
     }
 
     #[test]

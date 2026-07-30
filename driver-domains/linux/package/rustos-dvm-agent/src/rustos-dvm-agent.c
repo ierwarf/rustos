@@ -52,7 +52,7 @@
 #define POINTER_BUTTON_MASK 0x1fU
 #define INPUT_SELFTEST_CMDLINE "rustos.dvm.input-selftest=1"
 #define INPUT_SELFTEST_NAME "RustOS DVM input selftest"
-#define INPUT_SELFTEST_CYCLES 2667U
+#define INPUT_SELFTEST_CYCLES 6000U
 #define INPUT_SELFTEST_POLL_MS 15
 #define INPUT_SELFTEST_INTERVAL_NS \
     ((uint64_t)INPUT_SELFTEST_POLL_MS * 1000ULL * 1000ULL)
@@ -60,9 +60,9 @@
 #define INPUT_RELAY_RR_PRIORITY 10
 #define INPUT_RELAY_RTTIME_SOFT_US 50000U
 #define INPUT_RELAY_RTTIME_HARD_US 100000U
-// Forty seconds covers the public 30-second KVM gate plus bounded guest boot
-// and stream admission time. The synthetic producer still terminates and
-// therefore cannot become an unbounded DVM workload.
+// Ninety seconds covers the longest public one-minute active proof plus
+// bounded guest boot and stream admission time. The synthetic producer still
+// terminates and therefore cannot become an unbounded DVM workload.
 // RDI3 uses a deliberately bounded serial transport. Coalescing relative
 // motion at 100Hz preserves responsive desktop input without outrunning the
 // measured end-to-end consumer; button state is forwarded immediately.

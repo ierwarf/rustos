@@ -7,6 +7,7 @@ edition = "2024"
 host-test = []
 
 [dependencies]
+nucleus-core = { path = "../nucleus-core" }
 kernel-mm = { path = "../mm" }
 kernel-object = { path = "../object" }
 rustos-fault-injection = { path = "../../libs/rustos-fault-injection" }

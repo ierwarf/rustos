@@ -35,6 +35,7 @@ failure output as the primary debugging context.
 | `make -C driver-domains/linux dev-display` | compile only the cached DVM display package; no rootfs or artifact is created | `out/buildroot-output/target/` only | cold/stale configuration; run `build` first |
 | `make -C driver-domains/linux dev-net` | compile only the cached DVM network package; no rootfs or artifact is created | `out/buildroot-output/target/` only | cold/stale configuration; run `build` first |
 | `cargo xtask kvm-smoke` | concurrently boot Linux DVM and RustOS with QEMU/KVM | `build/kvm/` | unavailable `/dev/kvm`, guest exit, missing readiness marker |
+| `cargo xtask kvm-smoke --timeout 30 --gui-dvm-surfaces --dvm-network-shmem --dvm-block-shmem --recovery-probe all` | after positive readiness, abruptly terminate and relaunch the Linux DVM and then reboot RustOS in a fresh QEMU process; require fresh authenticated control, display, storage, and service epochs rather than old log markers | `build/kvm/` and private DVM apertures | stale evidence, peer-ID drift, missing revoke/rebind, failed authenticated relay, missing fresh boot/service markers, guest exit, or deadline |
 | `cargo xtask kvm-smoke --timeout 30 --storage-dvm-only` | independently prove the virtual storage-DVM topology: authenticated peer readiness, exact signed geometry, first completion, and E2E backing-device flush without accepting unrelated UI/GPU markers | `build/kvm/` and private DVM block disk/aperture | missing block peer, malformed geometry/signature, absent completion/flush, guest exit, or deadline |
 | `RUSTOS_FAULTS='block.flush=fail' cargo xtask kvm-smoke --timeout 30 --storage-dvm-only --storage-dvm-expect-flush-fault` | prove the same storage-DVM topology independently observes a live generation-bound completion and then reports flush `DeviceFault` without emitting the E2E flush-success marker | `build/kvm/` and private DVM block disk/aperture | absent/competing fault rule, missing peer/geometry/completion/fault marker, impossible flush-success marker, guest exit, or deadline |
 | `cargo xtask kvm-smoke --timeout 30 --gui-dvm-surfaces --physical-gpu <BDF> --gpu-firmware <TABLE>` | explicitly non-commercial physical-GPU lab run through the sealed device-profile registry; the current registered profile is AMD `1002:1900` with a relocated VFCT. QEMU 11.0 or newer uses IOMMUFD and VFIO PCI-BAR DMA-BUF mapping, executes the real `uiserver` GPU scene, and scans it out on the physical connector. Because this lane disables reset, an atomic boot-ID claim permits exactly one launch attempt per host boot. The runner never binds, unbinds, or resets the device and attaches no network device. `--physical-amdgpu`/`--amd-vfct` remain compatibility aliases | `build/kvm/` plus the physical display | repeated launch in one boot, unknown/ambiguous profile, unsafe VFIO/IOMMUFD/profile firmware state, inaccessible per-device cdev, unavailable VFIO BAR DMA-BUF support, inherited memlock below 4 GiB, reset-dirty driver probe, missing end-to-end GPU completion, or guest exit; never counts as supervised reset/revoke evidence |
@@ -59,7 +60,12 @@ failure output as the primary debugging context.
 The single F5 configuration, `RustOS: verified KVM desktop`, executes only
 `cargo xtask kvm-run --build`. The option builds and signs RustOS in-process,
 then the runner verifies the existing signed Linux DVM bundle before QEMU
-starts. There is no separately mutable pre-launch task. F5 must never run
+starts. The runner holds one nonblocking launch lock across build, shared-file
+preparation, both QEMU children, and final evidence, and assigns a
+process-scoped non-reserved DVM CID to each invocation. A second F5/smoke run
+therefore fails before it can truncate logs or alias the prior vsock identity,
+while an immediate sequential rerun does not reuse a retiring vhost-vsock CID.
+There is no separately mutable pre-launch task. F5 must never run
 `build-dvm`; DVM source changes use the explicit build-plan and stable-batch
 lanes above. `kvm-run` keeps the interactive session operator-owned after
 startup, but startup itself must produce the user-visible first-frame oracle
@@ -72,6 +78,11 @@ availability a prerequisite for compiling xtask; developers may opt in with
 `tools/check-dev-environment.sh` gate checks the one-command launch contract,
 rejects a reintroduced split task or `build-dvm`, and rejects any mandatory
 repository `rustc-wrapper`.
+
+If a guest exits before debugcon can publish a panic, one diagnostic rerun may
+set `RUSTOS_KVM_QEMU_INT_TRACE=1`. The runner then records QEMU interrupt/reset
+and KVM system-exit events in `build/kvm/rustos-qemu-int.log`; this opt-in trace
+is never enabled in normal F5 or acceptance runs and is not success evidence.
 
 ## Tests and inventory
 
@@ -88,6 +99,7 @@ repository `rustc-wrapper`.
 | `bash formal/run-runtime-traces.sh` | generate concrete `runtime-control` source outcomes and replay them against the registered TLA action matrix | `build/formal/runtime-traces/` | source/spec classification drift or malformed trace |
 | `bash formal/run-source-conformance.sh` | run the registry-scripted unique exact source decision witnesses for high-risk lifecycle, RPC, and IPC models; rejects duplicate and zero-test entries | `build/formal/source-conformance/summary.json` | source/spec decision drift, duplicate/missing test, or filtered witness |
 | `bash formal/check-system-flows.sh` | validate the machine-readable end-to-end requirement/hazard graph and every model/source/witness link | none | duplicate IDs, missing terminal path, unbounded timeout, absent model/source/test, or direct `.ko` lifecycle route |
+| `formal/check-rust-source-contracts.py` | enforce critical/high Rust module contracts, unsafe/ordering documentation debt, dead-code rationale, and the 1300-line split registry | none | undocumented boundary, new source debt, stale ledger, or unregistered oversized file |
 | `bash formal/run-apalache.sh` / `bash formal/run-tlaps.sh` | run the typed symbolic-refinement pilots and the unbounded theorem pilot | `build/formal/{apalache,tlaps}/` | type/SMT/proof failure or missing hash-pinned tool |
 | `bash formal/run-miri.sh` / `bash formal/run-loom.sh` | check selected host Rust paths for modeled UB and enumerate the endpoint publication proof-kernel interleavings | Miri cache, isolated Loom target | UB or concurrency invariant failure |
 | `bash formal/run-fuzz-smoke.sh` | run bounded libFuzzer campaigns over shared Rust admission and the exact Linux-DVM C GPU parser with ASan/UBSan | `build/formal/fuzz/`, ignored fuzz target | crash, sanitizer finding, compile failure, or wall-clock bound exceeded |
@@ -244,9 +256,11 @@ fallback.
   head 0; this prevents PS/2/virtio source ambiguity and cross-console input.
 - Interactive input keeps the fixed L0 ivshmem producer peer alive for the
   entire QEMU session. A bounded DVM-vsock setup timeout retries only the
-  authenticated stream; dropping and reconnecting the producer is forbidden
-  because any ivshmem peer departure terminates the fail-closed broker.
-- `--timeout <seconds>` is bounded to `1..=30` and applies only while waiting
+  authenticated stream. The broker retains each fixed peer's eventfd lease
+  across a QEMU process replacement, but never reassigns that logical ID or
+  accepts a third peer; shared transport generations, not socket reconnect,
+  decide whether old work is admissible.
+- `--timeout <seconds>` is bounded to `1..=120` and applies only while waiting
   for expected RustOS debugcon and Linux DVM serial markers.
 - `--storage-dvm-only` enables the private block aperture and removes only the
   unrelated GPU-scene/compositor acceptance requirements. It still requires
@@ -290,8 +304,9 @@ fallback.
   pre-load invitation through its validating UIO module, returns a readiness
   acknowledgement bound to that exact generation, and permits one validated
   RELEASE until the host ACK. The second reverse vector revokes availability;
-  restart clears confirmation and a saturated pool re-invites its newest READY
-  slot. The module exports each page-aligned slot as a DMA-BUF whose device
+  a replacement relay must revoke any inherited confirmation, RustOS increments
+  the context epoch, and the newest complete READY slot is re-invited even when
+  the desktop is idle. The module exports each page-aligned slot as a DMA-BUF whose device
   mapping is read-only. The module retains a DMA-BUF exporter, but the current
   GPU-command relay does not import those GUI surface slots: the former branch
   was unreachable under the mandatory nonzero V3 atlas header and has been
@@ -344,6 +359,12 @@ fallback.
   observed WayClick rate range, callback gap, and redraw maximum before the
   focused log paths. The range includes non-one-second startup windows; compare
   their elapsed time with later one-second windows before attributing a stall.
+- A full-minute active proof uses
+  `cargo xtask kvm-smoke --timeout 90 --gui-dvm-surfaces --min-ui-fps 55
+  --ui-proof-windows 60`. The 90-second host deadline includes boot and
+  readiness headroom; acceptance still requires 60 consecutive one-second
+  uiserver, WayClick, input, and DVM-relay samples. This longer host bound does
+  not widen any guest service deadline.
 
 ## L0 VFIO lifecycle
 

@@ -13,3 +13,8 @@ pub use poll_epoll::*;
 pub use process_time::*;
 pub use vfs_meta::*;
 pub use vfs_socket::*;
+
+pub(super) fn service_deferred_handle_maintenance() -> usize {
+    vfs_socket::service_deferred_netd_refs()
+        .saturating_add(ipc_helpers::service_deferred_vfs_mutations())
+}

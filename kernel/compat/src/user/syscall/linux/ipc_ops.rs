@@ -1,11 +1,27 @@
+//! RustOS IPC syscall admission and service-publication authority.
+//!
+//! - **Owner:** Compat owns syscall envelopes and service grants; the IPC
+//!   runtime owns object mechanics and `rootd` owns service policy.
+//! - **Boundary:** User buffers, endpoint handles, service IDs, attached
+//!   handles, and claimed subjects are untrusted.
+//! - **Lifecycle:** Register/lookup grants bind one process and endpoint epoch;
+//!   call/reply/timeout/revoke remove exact request authority once.
+//! - **Concurrency:** Registry mutation uses tracked ordering and never holds a
+//!   local policy lock across synchronous service IPC.
+//! - **Failure:** Malformed envelopes, foreign owners, capacity, timeout, peer
+//!   exit, and stale publication fail without a leaked grant or late revival.
+//! - **Forbidden:** No path/name-based capability, infinite service call,
+//!   guessed endpoint authority, or re-registration after final exit.
+//! - **Evidence:** `ipc-call`, `endpoint-lifecycle`, `root-authority`,
+//!   `service-call-authority`, `commercial-envelope`, and
+//!   `input-delivery-lifecycle`.
 use super::*;
 use alloc::vec::Vec;
 use core::mem::size_of;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use kernel_ipc_runtime::api::{KernelEndpointHandle, KernelReplyHandle, KernelTransferredHandle};
-use lazy_static::lazy_static;
-use spin::Mutex;
+use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
 
 macro_rules! ipc_trace {
     ($($arg:tt)*) => {
@@ -20,7 +36,9 @@ const MAX_SERVICE_ENDPOINTS: usize = 16;
 // The process table admits at most 32 live process objects. One exact grant per
 // process/service pair therefore bounds the complete service-call grant set.
 const MAX_SERVICE_CALL_GRANTS: usize = 32 * MAX_SERVICE_ENDPOINTS;
-const MAX_SERVICE_ENDPOINT_WAITERS: usize = 32;
+// Admission is per task, not per process. Every schedulable task may wait for
+// one service publication without an artificial half-capacity failure.
+const MAX_SERVICE_ENDPOINT_WAITERS: usize = multitask::MAX_SCHEDULER_TASKS;
 const SLOW_IPC_THRESHOLD_MS: u64 = 10;
 // Debugcon is a synchronous, globally contended device. One representative
 // slow sample per second preserves observability without letting a degraded
@@ -60,9 +78,14 @@ static ROOTD_BOOTSTRAP_OWNER: AtomicU64 = AtomicU64::new(0);
 // critical section. The endpoint itself remains the lock-free commit point for
 // readers, but a second registrar or an exiting process must not interleave
 // between capability preparation and endpoint publication.
-static SERVICE_ENDPOINT_REGISTRY_MUTATION: Mutex<()> = Mutex::new(());
-static SERVICE_CALL_GRANTS: Mutex<[ServiceCallGrant; MAX_SERVICE_CALL_GRANTS]> =
-    Mutex::new([ServiceCallGrant::empty(); MAX_SERVICE_CALL_GRANTS]);
+static SERVICE_ENDPOINT_REGISTRY_MUTATION: TrackedSpinLock<
+    (),
+    { LockClass::ServiceEndpointRegistry as u8 },
+> = TrackedSpinLock::new(());
+static SERVICE_CALL_GRANTS: TrackedSpinLock<
+    [ServiceCallGrant; MAX_SERVICE_CALL_GRANTS],
+    { LockClass::ServiceCallGrant as u8 },
+> = TrackedSpinLock::new([ServiceCallGrant::empty(); MAX_SERVICE_CALL_GRANTS]);
 // RING3-MIGRATION-REFERENCE END: rootd-owned service endpoint registry state.
 static IPC_LOG_SAMPLE_COUNT: AtomicUsize = AtomicUsize::new(0);
 static SLOW_IPC_LOG_RATE_STATE: AtomicU64 = AtomicU64::new(u64::MAX);
@@ -72,6 +95,64 @@ struct ServiceEndpointWaiter {
     task_id: u64,
     service_id: u64,
     expected_pid: u64,
+}
+
+struct ServiceEndpointWaiterTable {
+    slots: [Option<ServiceEndpointWaiter>; MAX_SERVICE_ENDPOINT_WAITERS],
+}
+
+impl ServiceEndpointWaiterTable {
+    const fn new() -> Self {
+        Self {
+            slots: [None; MAX_SERVICE_ENDPOINT_WAITERS],
+        }
+    }
+
+    fn register(&mut self, waiter: ServiceEndpointWaiter) -> bool {
+        if let Some(slot) = self
+            .slots
+            .iter_mut()
+            .find(|slot| slot.is_some_and(|current| current.task_id == waiter.task_id))
+        {
+            *slot = Some(waiter);
+            return true;
+        }
+        let Some(slot) = self.slots.iter_mut().find(|slot| slot.is_none()) else {
+            return false;
+        };
+        *slot = Some(waiter);
+        true
+    }
+
+    fn remove_task(&mut self, task_id: u64) -> usize {
+        let mut removed = 0usize;
+        for slot in &mut self.slots {
+            if slot.is_some_and(|waiter| waiter.task_id == task_id) {
+                *slot = None;
+                removed += 1;
+            }
+        }
+        removed
+    }
+
+    fn take_matching(
+        &mut self,
+        mut predicate: impl FnMut(ServiceEndpointWaiter) -> bool,
+    ) -> ([u64; MAX_SERVICE_ENDPOINT_WAITERS], usize) {
+        let mut tasks = [0_u64; MAX_SERVICE_ENDPOINT_WAITERS];
+        let mut count = 0usize;
+        for slot in &mut self.slots {
+            let Some(waiter) = *slot else {
+                continue;
+            };
+            if predicate(waiter) {
+                tasks[count] = waiter.task_id;
+                count += 1;
+                *slot = None;
+            }
+        }
+        (tasks, count)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -104,9 +185,10 @@ struct PublishedServiceEndpoint {
     epoch: u64,
 }
 
-lazy_static! {
-    static ref SERVICE_ENDPOINT_WAITERS: Mutex<Vec<ServiceEndpointWaiter>> = Mutex::new(Vec::new());
-}
+static SERVICE_ENDPOINT_WAITERS: TrackedSpinLock<
+    ServiceEndpointWaiterTable,
+    { LockClass::ServiceEndpointWaiter as u8 },
+> = TrackedSpinLock::new(ServiceEndpointWaiterTable::new());
 
 pub(super) fn is_linux_rustos_ipc_syscall(syscall_number: u64) -> bool {
     matches!(
@@ -239,9 +321,9 @@ pub(crate) fn cleanup_service_endpoints_for_process(process_id: u64) {
         let mut grants = SERVICE_CALL_GRANTS.lock();
         clear_service_call_grants(grants.as_mut_slice(), process_id);
     }
-    for index in 0..MAX_SERVICE_ENDPOINTS {
-        if SERVICE_LAST_GRANTED_CALLER[index].load(Ordering::Acquire) == process_id {
-            SERVICE_LAST_GRANTED_CALLER[index].store(0, Ordering::Release);
+    for last_granted_caller in SERVICE_LAST_GRANTED_CALLER.iter() {
+        if last_granted_caller.load(Ordering::Acquire) == process_id {
+            last_granted_caller.store(0, Ordering::Release);
         }
     }
     if SERVICE_ENDPOINT_OWNERS[linux_abi::IPC_SERVICE_LINUX_SYSCALLD as usize]
@@ -712,35 +794,18 @@ fn netd_response_requests_latency_handoff(response: &[u8], is_live_netd_owner: b
 }
 
 fn register_service_endpoint_waiter(waiter: ServiceEndpointWaiter) -> bool {
-    let mut waiters = SERVICE_ENDPOINT_WAITERS.lock();
-    waiters.retain(|current| current.task_id != waiter.task_id);
-    if waiters.len() >= MAX_SERVICE_ENDPOINT_WAITERS {
-        return false;
-    }
-    waiters.push(waiter);
-    true
+    SERVICE_ENDPOINT_WAITERS.lock().register(waiter)
 }
 
-fn remove_service_endpoint_waiter(task_id: u64) {
-    SERVICE_ENDPOINT_WAITERS
-        .lock()
-        .retain(|waiter| waiter.task_id != task_id);
+pub(super) fn remove_service_endpoint_waiter(task_id: u64) -> usize {
+    SERVICE_ENDPOINT_WAITERS.lock().remove_task(task_id)
 }
 
 fn wake_registered_service_endpoint_waiters(service_id: u64, owner_pid: u64) {
-    let tasks = {
-        let mut waiters = SERVICE_ENDPOINT_WAITERS.lock();
-        let mut tasks = Vec::new();
-        waiters.retain(|waiter| {
-            let matched = waiter.service_id == service_id && waiter.expected_pid == owner_pid;
-            if matched {
-                tasks.push(waiter.task_id);
-            }
-            !matched
-        });
-        tasks
-    };
-    for task_id in tasks {
+    let (tasks, count) = SERVICE_ENDPOINT_WAITERS.lock().take_matching(|waiter| {
+        waiter.service_id == service_id && waiter.expected_pid == owner_pid
+    });
+    for task_id in tasks.into_iter().take(count) {
         if multitask::wake_task(task_id) {
             multitask::set_next_pick_hint(task_id);
         }
@@ -748,21 +813,11 @@ fn wake_registered_service_endpoint_waiters(service_id: u64, owner_pid: u64) {
 }
 
 fn wake_exited_service_endpoint_waiters(process_id: u64) {
-    let tasks = {
-        let mut waiters = SERVICE_ENDPOINT_WAITERS.lock();
-        let mut tasks = Vec::new();
-        waiters.retain(|waiter| {
-            if waiter.expected_pid == process_id {
-                tasks.push(waiter.task_id);
-                false
-            } else {
-                true
-            }
-        });
-        tasks
-    };
+    let (tasks, count) = SERVICE_ENDPOINT_WAITERS
+        .lock()
+        .take_matching(|waiter| waiter.expected_pid == process_id);
     let mut woke = false;
-    for task_id in tasks {
+    for task_id in tasks.into_iter().take(count) {
         if multitask::wake_task(task_id) {
             multitask::set_next_pick_hint(task_id);
             woke = true;
@@ -1076,11 +1131,11 @@ pub(super) fn syscall_linux_rustos_ipc_lookup_service_endpoint(service_id: u64) 
             Err(errno) => return linux_errno(errno),
         }
     }
-    if service_id != linux_abi::IPC_SERVICE_ROOTD && !current_process_can_lookup_service_endpoint()
+    if service_id != linux_abi::IPC_SERVICE_ROOTD
+        && !current_process_can_lookup_service_endpoint()
+        && let Err(errno) = authorize_service_lookup_via_rootd(service_id)
     {
-        if let Err(errno) = authorize_service_lookup_via_rootd(service_id) {
-            return linux_errno(errno);
-        }
+        return linux_errno(errno);
     }
     match grant_current_process_service_call(service_id, None, None) {
         Ok(endpoint) => endpoint,
@@ -1191,8 +1246,8 @@ pub(super) fn syscall_linux_rustos_ipc_wait_service_endpoint(args_ptr: u64) -> u
             let _ = multitask::cancel_block_current_task();
             return linux_errno(LINUX_EBUSY);
         }
-        match multitask::commit_block_current_task() {
-            Some(true) => multitask::yield_now(),
+        match multitask::commit_block_current_task_and_yield() {
+            Some(true) => {}
             Some(false) => {}
             None => {
                 remove_service_endpoint_waiter(task_id);
@@ -1363,10 +1418,10 @@ fn syscall_linux_rustos_ipc_call_with_timeout(
     if response.len() > reply_capacity {
         return linux_errno(LINUX_EOVERFLOW);
     }
-    if !response.is_empty() {
-        if let Err(err) = usermem::write_current_user_bytes(reply_ptr, response.as_slice()) {
-            return linux_errno(address_space_error_to_linux_errno(err));
-        }
+    if !response.is_empty()
+        && let Err(err) = usermem::write_current_user_bytes(reply_ptr, response.as_slice())
+    {
+        return linux_errno(address_space_error_to_linux_errno(err));
     }
     let write_ticks = crate::arch::rtc::ticks();
     log_slow_ipc_call(
@@ -1425,10 +1480,10 @@ pub(super) fn syscall_linux_rustos_ipc_recv(
                     request.len(),
                     reply.raw()
                 );
-                if !request.is_empty() {
-                    if let Err(err) = usermem::write_current_user_bytes(request_ptr, &request) {
-                        return linux_errno(address_space_error_to_linux_errno(err));
-                    }
+                if !request.is_empty()
+                    && let Err(err) = usermem::write_current_user_bytes(request_ptr, &request)
+                {
+                    return linux_errno(address_space_error_to_linux_errno(err));
                 }
                 if let Err(err) =
                     usermem::write_current_user_bytes(reply_cap_ptr, &reply.raw().to_ne_bytes())
@@ -1461,8 +1516,8 @@ pub(super) fn syscall_linux_rustos_ipc_recv(
                     let _ = multitask::cancel_block_current_task();
                     continue;
                 }
-                match multitask::commit_block_current_task() {
-                    Some(true) => multitask::yield_now(),
+                match multitask::commit_block_current_task_and_yield() {
+                    Some(true) => {}
                     Some(false) => {}
                     None => return linux_errno(LINUX_EINVAL),
                 }
@@ -1537,11 +1592,10 @@ pub(super) fn syscall_linux_rustos_ipc_recv_with_sender(
     if request_capacity > rustos_user_abi::syscall::IPC_MAX_INLINE_BYTES {
         return linux_errno(LINUX_EINVAL);
     }
-    if request_capacity > 0 {
-        if let Err(err) = usermem::validate_current_user_write_buffer(request_ptr, request_capacity)
-        {
-            return linux_errno(address_space_error_to_linux_errno(err));
-        }
+    if request_capacity > 0
+        && let Err(err) = usermem::validate_current_user_write_buffer(request_ptr, request_capacity)
+    {
+        return linux_errno(address_space_error_to_linux_errno(err));
     }
     if let Err(err) = usermem::validate_current_user_write_buffer(reply_cap_ptr, size_of::<u64>()) {
         return linux_errno(address_space_error_to_linux_errno(err));
@@ -1564,10 +1618,10 @@ pub(super) fn syscall_linux_rustos_ipc_recv_with_sender(
             Ok(Some((reply, request, _handles, caller_task_id))) => {
                 let (sender_pid, sender_tid) =
                     multitask::user_log_ids_for_task(caller_task_id).unwrap_or((0, 0));
-                if !request.is_empty() {
-                    if let Err(err) = usermem::write_current_user_bytes(request_ptr, &request) {
-                        return linux_errno(address_space_error_to_linux_errno(err));
-                    }
+                if !request.is_empty()
+                    && let Err(err) = usermem::write_current_user_bytes(request_ptr, &request)
+                {
+                    return linux_errno(address_space_error_to_linux_errno(err));
                 }
                 if let Err(err) =
                     usermem::write_current_user_bytes(reply_cap_ptr, &reply.raw().to_ne_bytes())
@@ -1604,8 +1658,8 @@ pub(super) fn syscall_linux_rustos_ipc_recv_with_sender(
                     let _ = multitask::cancel_block_current_task();
                     continue;
                 }
-                match multitask::commit_block_current_task() {
-                    Some(true) => multitask::yield_now(),
+                match multitask::commit_block_current_task_and_yield() {
+                    Some(true) => {}
                     Some(false) => continue,
                     None => return linux_errno(LINUX_EINVAL),
                 }
@@ -1821,13 +1875,12 @@ fn syscall_linux_rustos_ipc_call_with_handles_timeout(args_ptr: u64, timeout_ms:
         drop_transfer_descriptors(reply_handles.as_slice());
         return linux_errno(LINUX_EOVERFLOW);
     }
-    if reply_capacity > 0 {
-        if let Err(err) =
+    if reply_capacity > 0
+        && let Err(err) =
             usermem::validate_current_user_write_buffer(args.reply_ptr, reply_capacity)
-        {
-            drop_transfer_descriptors(reply_handles.as_slice());
-            return linux_errno(address_space_error_to_linux_errno(err));
-        }
+    {
+        drop_transfer_descriptors(reply_handles.as_slice());
+        return linux_errno(address_space_error_to_linux_errno(err));
     }
     if usize::from(args.recv_fd_capacity) < reply_handles.len() {
         drop_transfer_descriptors(reply_handles.as_slice());
@@ -1841,11 +1894,11 @@ fn syscall_linux_rustos_ipc_call_with_handles_timeout(args_ptr: u64, timeout_ms:
         drop_transfer_descriptors(reply_handles.as_slice());
         return linux_errno(errno);
     }
-    if !response.is_empty() {
-        if let Err(err) = usermem::write_current_user_bytes(args.reply_ptr, response.as_slice()) {
-            drop_transfer_descriptors(reply_handles.as_slice());
-            return linux_errno(address_space_error_to_linux_errno(err));
-        }
+    if !response.is_empty()
+        && let Err(err) = usermem::write_current_user_bytes(args.reply_ptr, response.as_slice())
+    {
+        drop_transfer_descriptors(reply_handles.as_slice());
+        return linux_errno(address_space_error_to_linux_errno(err));
     }
     if let Err(errno) = install_received_handles(
         reply_handles.as_slice(),
@@ -1903,12 +1956,11 @@ pub(super) fn syscall_linux_rustos_ipc_recv_with_handles(args_ptr: u64) -> u64 {
     if usize::from(args.recv_fd_capacity) > rustos_user_abi::syscall::IPC_MAX_TRANSFER_HANDLES {
         return linux_errno(LINUX_EINVAL);
     }
-    if request_capacity > 0 {
-        if let Err(err) =
+    if request_capacity > 0
+        && let Err(err) =
             usermem::validate_current_user_write_buffer(args.request_ptr, request_capacity)
-        {
-            return linux_errno(address_space_error_to_linux_errno(err));
-        }
+    {
+        return linux_errno(address_space_error_to_linux_errno(err));
     }
     if let Err(err) =
         usermem::validate_current_user_write_buffer(args.reply_cap_ptr, size_of::<u64>())
@@ -1936,12 +1988,11 @@ pub(super) fn syscall_linux_rustos_ipc_recv_with_handles(args_ptr: u64) -> u64 {
                     drop_transfer_descriptors(handles.as_slice());
                     return linux_errno(errno);
                 }
-                if !request.is_empty() {
-                    if let Err(err) = usermem::write_current_user_bytes(args.request_ptr, &request)
-                    {
-                        drop_transfer_descriptors(handles.as_slice());
-                        return linux_errno(address_space_error_to_linux_errno(err));
-                    }
+                if !request.is_empty()
+                    && let Err(err) = usermem::write_current_user_bytes(args.request_ptr, &request)
+                {
+                    drop_transfer_descriptors(handles.as_slice());
+                    return linux_errno(address_space_error_to_linux_errno(err));
                 }
                 if let Err(err) = usermem::write_current_user_bytes(
                     args.reply_cap_ptr,
@@ -1978,8 +2029,8 @@ pub(super) fn syscall_linux_rustos_ipc_recv_with_handles(args_ptr: u64) -> u64 {
                     let _ = multitask::cancel_block_current_task();
                     continue;
                 }
-                match multitask::commit_block_current_task() {
-                    Some(true) => multitask::yield_now(),
+                match multitask::commit_block_current_task_and_yield() {
+                    Some(true) => {}
                     Some(false) => {}
                     None => return linux_errno(LINUX_EINVAL),
                 }
@@ -2299,13 +2350,11 @@ fn wait_for_reply_with_deadline(
         if reply_deadline_expired(deadline_tick) {
             disarm_reply_deadline_waiter(caller_task_id);
             let _ = multitask::wake_task(caller_task_id);
-            let _ = multitask::commit_block_current_task();
             cancel_deadline_reply(reply, caller_task_id);
             return Err(LINUX_ETIMEDOUT);
         }
-        match multitask::commit_block_current_task() {
+        match multitask::commit_block_current_task_and_yield() {
             Some(true) => {
-                multitask::yield_now();
                 disarm_reply_deadline_waiter(caller_task_id);
             }
             Some(false) => {
@@ -2321,10 +2370,12 @@ fn wait_for_reply_with_deadline(
     }
 }
 
+type EndpointWaitResponse = (Vec<u8>, Vec<KernelTransferredHandle>);
+
 fn take_endpoint_response_for_wait(
     reply: KernelReplyHandle,
     handle_capacity: usize,
-) -> Result<Option<(Vec<u8>, Vec<KernelTransferredHandle>)>, i64> {
+) -> Result<Option<EndpointWaitResponse>, i64> {
     match kernel_ipc_runtime::api::take_endpoint_response_detailed(reply, handle_capacity) {
         Ok(kernel_ipc_runtime::api::EndpointResponseTake::Pending) => Ok(None),
         Ok(kernel_ipc_runtime::api::EndpointResponseTake::Response(response)) => {
@@ -2629,7 +2680,10 @@ pub(super) fn drop_transfer_descriptors(descriptors: &[KernelTransferredHandle])
 }
 
 pub(crate) fn service_deferred_transfer_releases() -> usize {
-    const MAX_RELEASES_PER_TURN: usize = 32;
+    // Every entry can trigger a bounded provider reconciliation. Keep the
+    // housekeeping quantum to one entry so a transfer-drop burst cannot turn
+    // dozens of individually bounded calls into a multi-frame scheduler stall.
+    const MAX_RELEASES_PER_TURN: usize = 1;
     let entries = multitask::take_deferred_ipc_transfer_drops(MAX_RELEASES_PER_TURN);
     let count = entries.len();
     release_transfer_entries(&entries);
@@ -2748,6 +2802,10 @@ pub(super) fn diagnostic_rate_limit_permit(state: &AtomicU64, window: u64, limit
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "diagnostic-only phase timestamps remain explicit so call-site ordering is reviewable"
+)]
 fn log_slow_ipc_call(
     kind: &str,
     endpoint: u64,
@@ -2808,8 +2866,10 @@ mod tests {
 
     #[test]
     fn public_ipc_calls_share_the_finite_service_deadline() {
-        assert!(SERVICE_IPC_TIMEOUT_MS > 0);
-        assert!(SERVICE_IPC_TIMEOUT_MS <= IPC_WAIT_SERVICE_ENDPOINT_MAX_TIMEOUT_MS);
+        const {
+            assert!(SERVICE_IPC_TIMEOUT_MS > 0);
+            assert!(SERVICE_IPC_TIMEOUT_MS <= IPC_WAIT_SERVICE_ENDPOINT_MAX_TIMEOUT_MS);
+        }
         assert_eq!(
             ServiceIpcClass::ReadinessQuery.timeout_ms(),
             rustos_user_abi::performance::IPC_READINESS_QUERY_HARD_LIMIT_MS
@@ -2843,6 +2903,47 @@ mod tests {
         );
         assert_eq!(ServiceIpcClass::BootControl.cap_timeout_ms(37), 37);
         assert_eq!(ServiceIpcClass::InteractiveControl.cap_timeout_ms(0), 1);
+    }
+
+    #[test]
+    fn retired_task_cleanup_removes_service_endpoint_waiter_exactly_once() {
+        let task_id = u64::MAX - 401;
+        assert!(register_service_endpoint_waiter(ServiceEndpointWaiter {
+            task_id,
+            service_id: linux_abi::IPC_SERVICE_VFSD,
+            expected_pid: u64::MAX - 402,
+        }));
+        assert_eq!(remove_service_endpoint_waiter(task_id), 1);
+        assert_eq!(remove_service_endpoint_waiter(task_id), 0);
+    }
+
+    #[test]
+    fn service_endpoint_waiter_rearm_replaces_without_allocating_another_slot() {
+        let mut table = ServiceEndpointWaiterTable::new();
+        assert!(table.register(ServiceEndpointWaiter {
+            task_id: 41,
+            service_id: linux_abi::IPC_SERVICE_VFSD,
+            expected_pid: 51,
+        }));
+        assert!(table.register(ServiceEndpointWaiter {
+            task_id: 41,
+            service_id: linux_abi::IPC_SERVICE_NETD,
+            expected_pid: 61,
+        }));
+        let (_, old_count) = table.take_matching(|waiter| waiter.expected_pid == 51);
+        assert_eq!(old_count, 0);
+        let (tasks, new_count) = table.take_matching(|waiter| waiter.expected_pid == 61);
+        assert_eq!(new_count, 1);
+        assert_eq!(tasks[0], 41);
+    }
+
+    #[test]
+    #[allow(
+        clippy::assertions_on_constants,
+        reason = "the mutation witness must compile a reduced capacity and fail at runtime"
+    )]
+    fn service_endpoint_waiter_capacity_covers_every_scheduler_task() {
+        assert!(MAX_SERVICE_ENDPOINT_WAITERS >= multitask::MAX_SCHEDULER_TASKS);
     }
 
     #[test]

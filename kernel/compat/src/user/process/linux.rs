@@ -351,6 +351,10 @@ fn elf_interpreter_path(
     Ok(None)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "bootstrap ELF mapping keeps each validated layout input explicit at the ring0 exception boundary"
+)]
 fn map_elf_image(
     elf: &ElfFile<'_>,
     header: &ElfHeaderInfo,
@@ -537,6 +541,10 @@ fn segment_page_file_copy_range(
     Ok((page_file_offset, page_file_end))
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the bootstrap image record is assembled once from independently validated ELF fields"
+)]
 fn build_linux_process_image(
     elf: &ElfFile<'_>,
     header: &ElfHeaderInfo,
@@ -689,17 +697,17 @@ pub(super) fn build_initial_memory_map(
         }
     }
 
-    if let Some(stack) = user_stack {
-        if let Some(area) = LinuxVma::new(
+    if let Some(stack) = user_stack
+        && let Some(area) = LinuxVma::new(
             stack.reserve_start,
             stack.reserve_end,
             0,
             LinuxVmaFlags::private_anon(true, true, false),
             LinuxVmaName::Label("[stack]"),
-        ) {
-            maps.insert_area(area)
-                .expect("initial stack mapping overlaps an existing VMA");
-        }
+        )
+    {
+        maps.insert_area(area)
+            .expect("initial stack mapping overlaps an existing VMA");
     }
 
     maps
@@ -1114,7 +1122,7 @@ fn elf_runtime_search_paths(
     Ok(paths)
 }
 
-fn elf_dynamic_string<'a>(strtab: &'a [u8], offset: usize) -> Result<&'a str, ProcessLoadError> {
+fn elf_dynamic_string(strtab: &[u8], offset: usize) -> Result<&str, ProcessLoadError> {
     let bytes = strtab.get(offset..).ok_or(ProcessLoadError::InvalidElf(
         "runtime search path offset is outside the string table",
     ))?;
@@ -1533,14 +1541,8 @@ fn push_stack_bytes(
 }
 
 fn make_interpreter_load_error(path: &str, error: vfs::VfsError) -> ProcessLoadError {
-    let mut stored_path = [0_u8; 128];
-    let path_bytes = path.as_bytes();
-    let path_len = path_bytes.len().min(stored_path.len());
-    stored_path[..path_len].copy_from_slice(&path_bytes[..path_len]);
-
     ProcessLoadError::InterpreterLoad {
-        path: stored_path,
-        path_len,
+        path: path.to_string(),
         error,
     }
 }

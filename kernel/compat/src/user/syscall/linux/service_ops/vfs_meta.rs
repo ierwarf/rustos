@@ -298,7 +298,7 @@ pub fn current_memfd_handle(fd: u64) -> Option<multitask::MemfdHandle> {
 pub fn current_epoll_handle(fd: u64) -> Option<multitask::EpollHandle> {
     multitask::with_current_user_process_state(|_, _, process_state| {
         match process_state.handles().get(fd) {
-            Some(multitask::KernelHandle::Epoll(epoll)) => Some(epoll.clone()),
+            Some(multitask::KernelHandle::Epoll(epoll)) => Some(*epoll),
             _ => None,
         }
     })
@@ -345,9 +345,9 @@ pub fn memfd_error_to_linux_errno(err: multitask::MemfdError) -> i64 {
     }
 }
 
-// RING3-MIGRATION-REFERENCE START: bootstrap exception: vfsd owns bootstrap
-// stat materialization. Ring0 keeps this fd 0/1/2 and memfd stat fallback until
-// bootstrap descriptors are fully represented by service-owned handles.
+// RING3-MIGRATION-REFERENCE START: vfsd owns remote-file stat materialization.
+// Ring0 materializes stat only for kernel-owned console and memfd handle kinds;
+// this is their primary substrate, not a weaker VFS fallback.
 fn write_bootstrap_stat(user_ptr: u64, inode: u64, len: u64) -> u64 {
     if let Err(err) = usermem::validate_current_user_write_buffer(user_ptr, LINUX_STAT_SIZE) {
         return linux_errno(address_space_error_to_linux_errno(err));
@@ -364,7 +364,7 @@ fn write_bootstrap_stat(user_ptr: u64, inode: u64, len: u64) -> u64 {
         Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
     }
 }
-// RING3-MIGRATION-REFERENCE END: vfsd-owned bootstrap stat fallback exception.
+// RING3-MIGRATION-REFERENCE END: kernel-owned handle stat substrate.
 
 pub fn syscall_linux_vfs_getcwd(user_ptr: u64, user_len: u64) -> u64 {
     let Ok(user_len) = usize::try_from(user_len) else {
@@ -385,7 +385,7 @@ pub fn syscall_linux_vfs_getcwd(user_ptr: u64, user_len: u64) -> u64 {
         return linux_errno(errno);
     }
     let len = response.payload_len as usize;
-    if len.checked_add(1).map_or(true, |needed| needed > user_len) {
+    if len.checked_add(1).is_none_or(|needed| needed > user_len) {
         return linux_errno(LINUX_ERANGE);
     }
     if let Err(err) = usermem::write_current_user_bytes(user_ptr, &response.payload[..len]) {
@@ -487,13 +487,11 @@ pub fn syscall_linux_vfs_umount2(target_ptr: u64, flags: u64) -> u64 {
 }
 
 pub fn syscall_linux_ioctl(fd: u64, request_number: u64, arg: u64) -> u64 {
-    let route = if ioctl_is_direct_display_present(request_number) {
-        rustos_user_abi::syscall::DEVMGRD_IOCTL_ROUTE_DIRECT
-    } else if ioctl_is_display_policy_request(request_number)
-        && ipc_ops::current_process_has_service_capability(
-            rustos_user_abi::syscall::IPC_SERVICE_CAP_UI_POLICY,
-        )
-    {
+    let route = if ioctl_is_direct_display_present(request_number)
+        || ioctl_is_display_policy_request(request_number)
+            && ipc_ops::current_process_has_service_capability(
+                rustos_user_abi::syscall::IPC_SERVICE_CAP_UI_POLICY,
+            ) {
         rustos_user_abi::syscall::DEVMGRD_IOCTL_ROUTE_DIRECT
     } else {
         match ioctl_route_via_devmgrd(fd, request_number) {
@@ -1007,7 +1005,7 @@ fn decoded_transfer_control_len(control: &[u8]) -> Result<usize, i64> {
         let visible_len = if header.cmsg_level == linux_abi::SOL_SOCKET as u32
             && header.cmsg_type == linux_abi::SCM_RIGHTS as u32
         {
-            if descriptor_size == 0 || data_len % descriptor_size != 0 {
+            if descriptor_size == 0 || !data_len.is_multiple_of(descriptor_size) {
                 return Err(LINUX_EINVAL);
             }
             let fd_bytes = (data_len / descriptor_size)
@@ -1048,7 +1046,7 @@ fn drop_encoded_transfer_descriptors(control: &[u8]) -> Result<(), i64> {
         {
             let data_start = offset + core::mem::size_of::<linux_abi::LinuxCmsghdr>();
             let data = &control[data_start..offset + cmsg_len];
-            if descriptor_size == 0 || data.len() % descriptor_size != 0 {
+            if descriptor_size == 0 || !data.len().is_multiple_of(descriptor_size) {
                 return Err(LINUX_EINVAL);
             }
             for chunk in data.chunks_exact(descriptor_size) {

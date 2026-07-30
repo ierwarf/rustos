@@ -226,9 +226,9 @@ pub const SYSCALL_OFFLOAD_OP_LINUX_WAIT4: u16 = 47;
 pub const SYSCALL_OFFLOAD_OP_LINUX_IOCTL: u16 = 48;
 pub const SYSCALL_OFFLOAD_OP_LINUX_RT_SIGACTION: u16 = 49;
 pub const SYSCALL_OFFLOAD_OP_LINUX_RT_SIGPROCMASK: u16 = 50;
-pub const SYSCALL_OFFLOAD_OP_LINUX_NANOSLEEP: u16 = 51;
-pub const SYSCALL_OFFLOAD_OP_LINUX_CLOCK_GETTIME: u16 = 52;
-pub const SYSCALL_OFFLOAD_OP_LINUX_CLOCK_NANOSLEEP: u16 = 53;
+// Operations 51..=53 are permanently retired. Clock reads and finite sleeps
+// are timer/scheduler substrate; their fixed ABI envelopes are validated
+// locally and must not depend on a policy-service round trip.
 pub const SYSCALL_OFFLOAD_OP_LINUX_SET_ROBUST_LIST: u16 = 54;
 pub const SYSCALL_OFFLOAD_OP_LINUX_GET_ROBUST_LIST: u16 = 55;
 pub const SYSCALL_OFFLOAD_OP_LINUX_RSEQ: u16 = 56;
@@ -241,7 +241,9 @@ pub const SYSCALL_OFFLOAD_OP_LINUX_MUNMAP: u16 = 62;
 pub const SYSCALL_OFFLOAD_OP_LINUX_MEMFD_CREATE: u16 = 63;
 // Operation 64 is permanently retired with the module-load policy ABI.
 pub const SYSCALL_OFFLOAD_OP_LINUX_PROCESS_EXIT: u16 = 65;
-pub const SYSCALL_OFFLOAD_OP_LINUX_FUTEX_POLICY: u16 = 66;
+// Operation 66 is permanently retired: futex opcode/flag admission is an
+// inseparable part of the ring0 scheduler wait/wake substrate and must never
+// synchronously depend on a policy service.
 pub const SYSCALL_OFFLOAD_OP_LINUX_ARCH_PRCTL_POLICY: u16 = 67;
 pub const SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET: u16 = 68;
 pub const WIN32_SYSCALL_OFFLOAD_ABI_VERSION: u16 = 1;
@@ -587,7 +589,7 @@ pub const LOADER_SPAWN_FLAG_IMMEDIATE_HANDOFF: u32 = 1 << 1;
 pub const LOADER_SPAWN_FLAG_DEFER_START: u32 = 1 << 2;
 pub const IPC_WAIT_SERVICE_ENDPOINT_ABI_VERSION: u16 = 1;
 pub const IPC_WAIT_SERVICE_ENDPOINT_MAX_TIMEOUT_MS: u64 = 30_000;
-pub const PROCD_IPC_ABI_VERSION: u16 = 1;
+pub const PROCD_IPC_ABI_VERSION: u16 = 3;
 pub const PROCD_OP_EXECVE: u16 = 1;
 pub const PROCD_OP_EXECVEAT: u16 = 2;
 pub const PROCD_OP_FORK: u16 = 3;
@@ -606,6 +608,19 @@ pub const PROCD_SELECT_SIGNAL_NONE: u16 = 0;
 pub const PROCD_SELECT_SIGNAL_IGNORE: u16 = 1;
 pub const PROCD_SELECT_SIGNAL_TERMINATE: u16 = 2;
 pub const PROCD_SELECT_SIGNAL_HANDLER: u16 = 3;
+pub const PROCD_SELECT_SIGNAL_STOP: u16 = 4;
+pub const PROCD_SIGCHLD_EVENT_EXIT: u32 = 1 << 0;
+pub const PROCD_SIGCHLD_EVENT_STOP: u32 = 1 << 1;
+pub const PROCD_SIGCHLD_EVENT_CONTINUE: u32 = 1 << 2;
+pub const PROCD_SIGCHLD_EVENT_MASK: u32 =
+    PROCD_SIGCHLD_EVENT_EXIT | PROCD_SIGCHLD_EVENT_STOP | PROCD_SIGCHLD_EVENT_CONTINUE;
+pub const PROCD_SIGACTION_SA_NOCLDSTOP: u64 = 0x0000_0001;
+
+pub const fn procd_sigchld_is_suppressed(events: u32, action_flags: u64) -> bool {
+    events != 0
+        && events & PROCD_SIGCHLD_EVENT_EXIT == 0
+        && action_flags & PROCD_SIGACTION_SA_NOCLDSTOP != 0
+}
 pub const PROC_BROKER_ABI_VERSION: u16 = 2;
 /// Lifecycle fan-out is an independent contract. Do not couple its wire
 /// version to process prepare/commit ABI revisions.
@@ -2710,6 +2725,7 @@ mod syscall_tests {
         LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse, LinuxTimespecWire, LinuxUtsName,
         LoaderSpawnRequest, NETD_IPC_PAYLOAD_CAPACITY, NETD_IPC_REQUEST_HEADER_SIZE,
         NETD_IPC_RESPONSE_HEADER_SIZE, NetdIpcRequest, NetdIpcResponse,
+        PROCD_SIGACTION_SA_NOCLDSTOP, PROCD_SIGCHLD_EVENT_EXIT, PROCD_SIGCHLD_EVENT_MASK,
         RustosIpcValidateServiceOwnerArgs, STORAGED_BULK_READ_PAYLOAD_CAPACITY,
         STORAGED_BULK_READ_RESPONSE_HEADER_BYTES, SYSCALL_OFFLOAD_ABI_VERSION,
         SYSCALL_OFFLOAD_OP_LINUX_ARCH_PRCTL_POLICY, SYSCALL_OFFLOAD_OP_LINUX_MPROTECT,
@@ -2720,8 +2736,26 @@ mod syscall_tests {
         VfsExecutableSnapshotRequest, VfsExecutableSnapshotResponse, VfsIpcRequest, VfsIpcResponse,
         WAITSET_ABI_VERSION, WAITSET_GLOBAL_OBJECT_ID, WAITSET_PROVIDER_VFSD,
         WaitSetSignalBrokerArgs, identity_is_exact_sender, loader_service_role_allows_operation,
-        waitset_signal_shape_valid,
+        procd_sigchld_is_suppressed, waitset_signal_shape_valid,
     };
+
+    #[test]
+    fn nocldstop_suppresses_only_nonterminal_child_state_changes() {
+        let stop_or_continue = PROCD_SIGCHLD_EVENT_MASK & !PROCD_SIGCHLD_EVENT_EXIT;
+        assert!(procd_sigchld_is_suppressed(
+            stop_or_continue,
+            PROCD_SIGACTION_SA_NOCLDSTOP
+        ));
+        assert!(!procd_sigchld_is_suppressed(
+            stop_or_continue | PROCD_SIGCHLD_EVENT_EXIT,
+            PROCD_SIGACTION_SA_NOCLDSTOP
+        ));
+        assert!(!procd_sigchld_is_suppressed(stop_or_continue, 0));
+        assert!(!procd_sigchld_is_suppressed(
+            0,
+            PROCD_SIGACTION_SA_NOCLDSTOP
+        ));
+    }
 
     #[test]
     fn waitset_signal_requires_the_exact_public_wire_shape() {
@@ -2863,8 +2897,10 @@ mod syscall_tests {
         request.header.protocol = 5;
         request.header.op = 12;
         request.header.ticket = 19;
-        let mut response = StoragedBulkReadResponse::default();
-        response.header = request.header;
+        let mut response = StoragedBulkReadResponse {
+            header: request.header,
+            ..StoragedBulkReadResponse::default()
+        };
         assert!(response.is_valid_envelope_for(&request));
 
         response.header.ticket += 1;
@@ -2938,7 +2974,11 @@ mod syscall_tests {
             SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET,
             SYSCALL_OFFLOAD_OP_LINUX_MPROTECT
         );
-        assert!(SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET > SYSCALL_OFFLOAD_OP_LINUX_ARCH_PRCTL_POLICY);
+        const {
+            assert!(
+                SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET > SYSCALL_OFFLOAD_OP_LINUX_ARCH_PRCTL_POLICY
+            );
+        }
     }
 
     #[test]

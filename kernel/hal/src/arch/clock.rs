@@ -1,3 +1,17 @@
+//! Validated monotonic clocksource selection and conversion.
+//!
+//! - **Owner:** `kernel-hal` owns the one kernel monotonic time domain.
+//! - **Boundary:** Firmware frequency/topology and hardware counters are
+//!   admitted before they can own scheduler, timeout, or recovery decisions.
+//! - **Lifecycle:** A source is uninitialized, validated, then immutable for
+//!   the boot; source failure cannot silently switch time domains.
+//! - **Concurrency:** Readers use the published source without allocation or
+//!   service calls.
+//! - **Failure:** Missing invariant-TSC/HPET support fails with an exact
+//!   topology result rather than calendar-time substitution.
+//! - **Forbidden:** No RTC calendar value, backwards time, or per-caller clock
+//!   policy.
+//! - **Evidence:** `monotonic-deadline-lifecycle`.
 use core::arch::asm;
 use core::arch::x86_64::__cpuid;
 use core::hint::spin_loop;
@@ -135,7 +149,10 @@ fn init_hpet() -> Option<(u64, u64, u64)> {
         }
         spin_loop();
     }
-    advanced.then_some((base, period_fs, read_hpet_counter(base)))
+    if !advanced {
+        return None;
+    }
+    Some((base, period_fs, read_hpet_counter(base)))
 }
 
 fn calibrate_tsc_with_hpet((base, period_fs, _): (u64, u64, u64)) -> Option<u64> {

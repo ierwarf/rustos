@@ -1,14 +1,13 @@
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
+use super::*;
 use lazy_static::lazy_static;
+use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
 use rustos_user_abi::syscall::{
     LIFECYCLE_DRAIN_MAX_EVENTS, LIFECYCLE_EVENT_EXIT, LifecycleDrainBrokerArgs, LifecycleEventWire,
     VFS_IPC_OP_PREAD64, VFS_IPC_PAYLOAD_CAPACITY,
 };
-use spin::Mutex;
-
-use super::*;
 
 pub(crate) fn call_remote_vfs_read_bytes(
     remote_id: u64,
@@ -56,9 +55,12 @@ pub(crate) fn call_remote_vfs_read_bytes(
 }
 
 lazy_static! {
-    static ref ROOTD_LIFECYCLE_EVENTS: Mutex<Vec<LifecycleEventWire>> = Mutex::new(Vec::new());
-    static ref PROCD_LIFECYCLE_EVENTS: Mutex<Vec<LifecycleEventWire>> = Mutex::new(Vec::new());
-    static ref SYSCALLD_LIFECYCLE_EVENTS: Mutex<Vec<LifecycleEventWire>> = Mutex::new(Vec::new());
+    static ref ROOTD_LIFECYCLE_EVENTS: TrackedSpinLock<LifecycleEventQueue, { LockClass::CompatLifecycle as u8 }> =
+        TrackedSpinLock::new(LifecycleEventQueue::new());
+    static ref PROCD_LIFECYCLE_EVENTS: TrackedSpinLock<LifecycleEventQueue, { LockClass::CompatLifecycle as u8 }> =
+        TrackedSpinLock::new(LifecycleEventQueue::new());
+    static ref SYSCALLD_LIFECYCLE_EVENTS: TrackedSpinLock<LifecycleEventQueue, { LockClass::CompatLifecycle as u8 }> =
+        TrackedSpinLock::new(LifecycleEventQueue::new());
 }
 static ROOTD_LIFECYCLE_EVENTS_OVERFLOWED: AtomicBool = AtomicBool::new(false);
 static PROCD_LIFECYCLE_EVENTS_OVERFLOWED: AtomicBool = AtomicBool::new(false);
@@ -66,6 +68,49 @@ static SYSCALLD_LIFECYCLE_EVENTS_OVERFLOWED: AtomicBool = AtomicBool::new(false)
 static ROOTD_LIFECYCLE_DRAIN_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static PROCD_LIFECYCLE_DRAIN_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static SYSCALLD_LIFECYCLE_DRAIN_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+
+struct LifecycleEventQueue {
+    events: [LifecycleEventWire; LIFECYCLE_DRAIN_MAX_EVENTS],
+    len: usize,
+}
+
+impl LifecycleEventQueue {
+    fn new() -> Self {
+        Self {
+            events: [LifecycleEventWire::default(); LIFECYCLE_DRAIN_MAX_EVENTS],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, event: LifecycleEventWire) -> bool {
+        let Some(slot) = self.events.get_mut(self.len) else {
+            return false;
+        };
+        *slot = event;
+        self.len += 1;
+        true
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn prefix(&self, count: usize) -> &[LifecycleEventWire] {
+        &self.events[..count.min(self.len)]
+    }
+
+    fn drain_prefix(&mut self, count: usize) {
+        let count = count.min(self.len);
+        self.events.copy_within(count..self.len, 0);
+        self.len -= count;
+        self.events[self.len..].fill(LifecycleEventWire::default());
+    }
+
+    fn clear(&mut self) {
+        self.events[..self.len].fill(LifecycleEventWire::default());
+        self.len = 0;
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum LifecycleConsumer {
@@ -75,7 +120,9 @@ pub(super) enum LifecycleConsumer {
 }
 
 impl LifecycleConsumer {
-    fn events(self) -> &'static Mutex<Vec<LifecycleEventWire>> {
+    fn events(
+        self,
+    ) -> &'static TrackedSpinLock<LifecycleEventQueue, { LockClass::CompatLifecycle as u8 }> {
         match self {
             Self::RootSupervisor => &ROOTD_LIFECYCLE_EVENTS,
             Self::ProcessPolicy => &PROCD_LIFECYCLE_EVENTS,
@@ -120,14 +167,6 @@ impl Drop for LifecycleDrainClaim {
     }
 }
 
-fn push_lifecycle_event(events: &mut Vec<LifecycleEventWire>, event: LifecycleEventWire) -> bool {
-    if events.len() >= LIFECYCLE_DRAIN_MAX_EVENTS {
-        return false;
-    }
-    events.push(event);
-    true
-}
-
 pub(crate) fn record_process_exit(pid: u64, parent_pid: u64, exit_status: i32) {
     let event = LifecycleEventWire {
         event: LIFECYCLE_EVENT_EXIT,
@@ -142,7 +181,7 @@ pub(crate) fn record_process_exit(pid: u64, parent_pid: u64, exit_status: i32) {
         LifecycleConsumer::LinuxSyscallPolicy,
     ] {
         let mut events = consumer.events().lock();
-        if !push_lifecycle_event(&mut events, event) {
+        if !events.push(event) {
             // Each consumer owns independent evidence. Rootd treats overflow
             // as terminal; policy services discard all cached per-process
             // state after observing their private overflow and then resume
@@ -169,14 +208,15 @@ pub(super) fn drain_lifecycle_events(
     // Never access pageable user memory while holding the lifecycle spinlock.
     // The single-consumer claim keeps another drain from changing the prefix;
     // producers may only append to it.
-    let snapshot = {
+    let mut snapshot = Vec::with_capacity(capacity);
+    {
         let mut events = queue.lock();
         if lifecycle_overflow_requires_rebase(consumer, &mut events, overflowed) {
             return Err(LINUX_EOVERFLOW);
         }
         let count = capacity.min(events.len());
-        events[..count].to_vec()
-    };
+        snapshot.extend_from_slice(events.prefix(count));
+    }
     let count = snapshot.len();
     let out_count = count as u32;
     if out_count != 0 {
@@ -196,13 +236,13 @@ pub(super) fn drain_lifecycle_events(
         return Err(LINUX_EOVERFLOW);
     }
     debug_assert!(events.len() >= count);
-    events.drain(..count);
+    events.drain_prefix(count);
     Ok(out_count as u64)
 }
 
 fn lifecycle_overflow_requires_rebase(
     consumer: LifecycleConsumer,
-    events: &mut Vec<LifecycleEventWire>,
+    events: &mut LifecycleEventQueue,
     overflowed: &AtomicBool,
 ) -> bool {
     if !overflowed.load(Ordering::Acquire) {
@@ -221,61 +261,52 @@ fn lifecycle_overflow_requires_rebase(
 
 #[cfg(test)]
 mod tests {
-    use alloc::vec;
-
     use super::*;
 
     #[test]
     fn full_lifecycle_queue_rejects_loss_instead_of_dropping_oldest_exit() {
-        let mut events = Vec::new();
+        let mut events = LifecycleEventQueue::new();
         for pid in 1..=LIFECYCLE_DRAIN_MAX_EVENTS as u64 {
-            assert!(push_lifecycle_event(
-                &mut events,
-                LifecycleEventWire {
-                    event: LIFECYCLE_EVENT_EXIT,
-                    pid,
-                    ..LifecycleEventWire::default()
-                }
-            ));
-        }
-        assert!(!push_lifecycle_event(
-            &mut events,
-            LifecycleEventWire {
+            assert!(events.push(LifecycleEventWire {
                 event: LIFECYCLE_EVENT_EXIT,
-                pid: u64::MAX,
+                pid,
                 ..LifecycleEventWire::default()
-            }
-        ));
+            }));
+        }
+        assert!(!events.push(LifecycleEventWire {
+            event: LIFECYCLE_EVENT_EXIT,
+            pid: u64::MAX,
+            ..LifecycleEventWire::default()
+        }));
         assert_eq!(events.len(), LIFECYCLE_DRAIN_MAX_EVENTS);
-        assert_eq!(events[0].pid, 1);
+        assert_eq!(events.prefix(1)[0].pid, 1);
     }
 
     #[test]
     fn lifecycle_drain_snapshot_preserves_events_appended_during_copyout() {
-        let mut events = vec![
-            LifecycleEventWire {
-                event: LIFECYCLE_EVENT_EXIT,
-                pid: 1,
-                ..LifecycleEventWire::default()
-            },
-            LifecycleEventWire {
-                event: LIFECYCLE_EVENT_EXIT,
-                pid: 2,
-                ..LifecycleEventWire::default()
-            },
-        ];
-        let snapshot = events[..1].to_vec();
-        events.push(LifecycleEventWire {
+        let mut events = LifecycleEventQueue::new();
+        assert!(events.push(LifecycleEventWire {
+            event: LIFECYCLE_EVENT_EXIT,
+            pid: 1,
+            ..LifecycleEventWire::default()
+        }));
+        assert!(events.push(LifecycleEventWire {
+            event: LIFECYCLE_EVENT_EXIT,
+            pid: 2,
+            ..LifecycleEventWire::default()
+        }));
+        let snapshot = events.prefix(1).to_vec();
+        assert!(events.push(LifecycleEventWire {
             event: LIFECYCLE_EVENT_EXIT,
             pid: 3,
             ..LifecycleEventWire::default()
-        });
+        }));
 
-        events.drain(..snapshot.len());
+        events.drain_prefix(snapshot.len());
 
         assert_eq!(events.len(), 2);
-        assert_eq!(events[0].pid, 2);
-        assert_eq!(events[1].pid, 3);
+        assert_eq!(events.prefix(2)[0].pid, 2);
+        assert_eq!(events.prefix(2)[1].pid, 3);
     }
 
     #[test]
@@ -285,20 +316,20 @@ mod tests {
             pid: 7,
             ..LifecycleEventWire::default()
         };
-        let mut rootd = Vec::new();
-        let mut procd = Vec::new();
-        let mut syscalld = Vec::new();
-        assert!(push_lifecycle_event(&mut rootd, event));
-        assert!(push_lifecycle_event(&mut procd, event));
-        assert!(push_lifecycle_event(&mut syscalld, event));
+        let mut rootd = LifecycleEventQueue::new();
+        let mut procd = LifecycleEventQueue::new();
+        let mut syscalld = LifecycleEventQueue::new();
+        assert!(rootd.push(event));
+        assert!(procd.push(event));
+        assert!(syscalld.push(event));
 
-        rootd.drain(..1);
+        rootd.drain_prefix(1);
 
-        assert!(rootd.is_empty());
+        assert_eq!(rootd.len(), 0);
         assert_eq!(procd.len(), 1);
-        assert_eq!(procd[0].pid, 7);
+        assert_eq!(procd.prefix(1)[0].pid, 7);
         assert_eq!(syscalld.len(), 1);
-        assert_eq!(syscalld[0].pid, 7);
+        assert_eq!(syscalld.prefix(1)[0].pid, 7);
 
         let procd_overflow = AtomicBool::new(true);
         assert!(lifecycle_overflow_requires_rebase(
@@ -306,7 +337,7 @@ mod tests {
             &mut procd,
             &procd_overflow,
         ));
-        assert!(procd.is_empty());
+        assert_eq!(procd.len(), 0);
         assert!(!procd_overflow.load(Ordering::Acquire));
 
         let syscalld_overflow = AtomicBool::new(true);
@@ -315,11 +346,11 @@ mod tests {
             &mut syscalld,
             &syscalld_overflow,
         ));
-        assert!(syscalld.is_empty());
+        assert_eq!(syscalld.len(), 0);
         assert!(!syscalld_overflow.load(Ordering::Acquire));
 
         let rootd_overflow = AtomicBool::new(true);
-        rootd.push(event);
+        assert!(rootd.push(event));
         assert!(lifecycle_overflow_requires_rebase(
             LifecycleConsumer::RootSupervisor,
             &mut rootd,

@@ -7,7 +7,10 @@ use crate::sync::KernelWaitLock;
 
 const OUTPUT_BUFFER_CAPACITY: usize = 4096;
 
-static CONSOLE: KernelWaitLock<ConsoleState> = KernelWaitLock::new(ConsoleState::new());
+static CONSOLE: KernelWaitLock<
+    ConsoleState,
+    { nucleus_core::util::lockdep::LockClass::ConsoleWait as u8 },
+> = KernelWaitLock::new(ConsoleState::new());
 
 pub fn write(bytes: &[u8]) -> usize {
     if bytes.is_empty() {

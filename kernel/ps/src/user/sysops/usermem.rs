@@ -1,3 +1,17 @@
+//! Exact-generation user-memory copy and range admission.
+//!
+//! - **Owner:** `kernel-ps` owns process-bound user-copy substrate.
+//! - **Boundary:** Every user pointer, length, direction, and typed layout is
+//!   untrusted.
+//! - **Lifecycle:** Retain the process generation, validate the complete live
+//!   page span, copy all bytes or none, then release the hold.
+//! - **Concurrency:** Exec/exit cannot reclaim the retained address space while
+//!   a copy is active; no service call occurs under page-table access.
+//! - **Failure:** Noncanonical, overflowing, unmapped, permission, alignment,
+//!   and short-span errors return before caller state publication.
+//! - **Forbidden:** No raw slice construction before admission, partial
+//!   authority copy, or foreign-process access by PID alone.
+//! - **Evidence:** `user-memory-access`.
 use x86_64::VirtAddr;
 
 use crate::memory::paging;

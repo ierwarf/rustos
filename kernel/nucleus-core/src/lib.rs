@@ -2,6 +2,7 @@
 
 extern crate alloc;
 
+pub mod bootstrap_stack;
 pub mod debug;
 #[cfg(any(test, all(not(test), rustos_boot_image)))]
 pub mod multiboot2;

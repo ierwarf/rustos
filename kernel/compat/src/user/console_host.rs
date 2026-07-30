@@ -91,6 +91,8 @@ impl ConsoleHostError {
         }
     }
 
+    // DIAGNOSTIC: Production releases compile out verbose console details while
+    // debug builds retain the same typed failure path.
     #[cfg_attr(not(rustos_debug_print_enabled), allow(dead_code, unused_variables))]
     pub fn log_debug_details(&self) {
         match self {
@@ -158,7 +160,7 @@ pub fn spawn_program_in_session(
     };
 
     process::spawn_bootstrap_linux_process_with_launch(program.image, program.weight_micros, launch)
-        .map(|spawned| {
+        .inspect(|spawned| {
             if trace {
                 emit_console(
                     debug::LogLevel::Debug,
@@ -172,7 +174,6 @@ pub fn spawn_program_in_session(
                     ),
                 );
             }
-            spawned
         })
         .map_err(|error| {
             let _ = session;

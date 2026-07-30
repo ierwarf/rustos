@@ -10,6 +10,10 @@ use crate::sync::KernelWaitLock;
 
 const ENABLE_FRAMEBUFFER_WRITE_COMBINE: bool = true;
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the framebuffer and fixed dirty-tile map live in one static kernel object so provider installation never allocates"
+)]
 enum BackendInstance {
     Unavailable,
     Framebuffer(FramebufferDisplayBackend),
@@ -25,8 +29,10 @@ pub(crate) struct DisplayBackend {
     generation: u64,
 }
 
-static DISPLAY_BACKEND: KernelWaitLock<DisplayBackend> =
-    KernelWaitLock::new(DisplayBackend::empty());
+static DISPLAY_BACKEND: KernelWaitLock<
+    DisplayBackend,
+    { nucleus_core::util::lockdep::LockClass::DisplayBackendWait as u8 },
+> = KernelWaitLock::new(DisplayBackend::empty());
 
 impl DisplayBackend {
     const fn empty() -> Self {
@@ -105,7 +111,11 @@ fn try_with_framebuffer_nonblocking<R>(
 }
 
 pub(crate) fn display_info() -> Option<GuiDisplayInfo> {
-    DISPLAY_BACKEND.lock().display_info()
+    // Syscall callers may hold their per-process handle table while taking a
+    // coherent display snapshot. Never sleep behind that raw state lock:
+    // transient backend publication is reported as unavailable and retried by
+    // the bounded userspace provider-admission loop.
+    DISPLAY_BACKEND.try_lock()?.display_info()
 }
 
 pub(crate) fn present_bgra8888_from_kernel(
@@ -115,7 +125,6 @@ pub(crate) fn present_bgra8888_from_kernel(
     stride_bytes: usize,
 ) -> GuiPresentOutcome {
     with_display_present_fault_gate(display_present_faulted(), || {
-        crate::io::dvm_display::ensure_installed_before_present();
         // A display ioctl may arrive through an entry path with interrupts masked.
         // Presentation must never turn that into a spurious device removal or wait
         // on a contended backend lock.  A busy compositor has an explicit
@@ -141,24 +150,19 @@ pub(crate) fn present_bgra8888_from_kernel(
 }
 
 pub(crate) fn present_bgra8888_rect_from_kernel(
-    src_ptr: *const u8,
-    width: usize,
-    height: usize,
-    stride_bytes: usize,
+    frame: super::KernelBgraFrame,
     rect: FramebufferRect,
 ) -> GuiPresentOutcome {
     with_display_present_fault_gate(display_present_faulted(), || {
-        crate::io::dvm_display::ensure_installed_before_present();
         let dvm_published = match try_with_framebuffer_nonblocking(|_| {
             crate::io::dvm_display::try_publish_rect(
-                src_ptr,
-                width,
-                height,
-                stride_bytes,
-                rect.x as u32,
-                rect.y as u32,
-                rect.width as u32,
-                rect.height as u32,
+                frame,
+                super::GuiDamageRect {
+                    x: rect.x,
+                    y: rect.y,
+                    width: rect.width,
+                    height: rect.height,
+                },
             )
         }) {
             Ok(value) => value,

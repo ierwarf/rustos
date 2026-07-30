@@ -1,3 +1,18 @@
+//! Capability-gated input transport ingestion and watchdog wait brokerage.
+//!
+//! - **Owner:** `inputd` owns decode/session/read policy; Compat admits the
+//!   exact input-service owner to bounded ring0 transport.
+//! - **Boundary:** Service identity, ring records, counts, and readiness tokens
+//!   are untrusted until owner and shape checks pass.
+//! - **Lifecycle:** Acquire consumer lease, drain bounded records, publish
+//!   readiness, arm watchdog, wake/revoke, and withdraw on owner exit.
+//! - **Concurrency:** Check/arm/commit is atomic with scheduler state; MSI-X
+//!   leaves only wake and never decode.
+//! - **Failure:** Timeout, malformed record, owner exit, session reset, queue
+//!   full, and transport revoke cannot retain a stale consumer.
+//! - **Forbidden:** No input policy in ring0, polling, native USB/PS2 fallback,
+//!   or foreign service drain.
+//! - **Evidence:** `input-delivery-lifecycle`.
 // RING3-MIGRATION-REFERENCE START: inputd should own input stats, ingress
 // admission, and event coalescing policy. Ring0 keeps bounded input ingest and
 // current-process user-copy substrate.
@@ -162,8 +177,8 @@ pub(super) fn syscall_linux_rustos_input_wait_broker() -> u64 {
             let _ = multitask::cancel_block_current_task();
             return linux_errno(LINUX_EBUSY);
         }
-        match multitask::commit_block_current_task() {
-            Some(true) => multitask::yield_now(),
+        match multitask::commit_block_current_task_and_yield() {
+            Some(true) => {}
             Some(false) => {}
             None => {
                 kernel_io_manager::api::input::transport::disarm_inputd_ingestion_waiter(task_id);

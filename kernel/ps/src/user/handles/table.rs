@@ -1,3 +1,18 @@
+//! Process descriptor table and open-description capability lifetime.
+//!
+//! - **Owner:** `kernel-ps` owns descriptor slots; provider services own the
+//!   referenced open descriptions.
+//! - **Boundary:** User fd numbers are untrusted indices and never provider
+//!   identities.
+//! - **Lifecycle:** Install, dup/fork retain, close-on-exec filter, transfer,
+//!   final close, and provider settlement preserve one exact reference count.
+//! - **Concurrency:** Table mutation is process-serialized; provider callbacks
+//!   and deferred settlement run after local mutation state is released.
+//! - **Failure:** Capacity, stale token, transfer, and provider-restart errors
+//!   leave the source descriptor and reference ledger consistent.
+//! - **Forbidden:** No fabricated standard descriptors, close-as-success after
+//!   lost settlement, or slot reuse before exact reference withdrawal.
+//! - **Evidence:** `ipc-handle-transfer` and `vfs-open-description`.
 use super::*;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -94,8 +109,8 @@ impl TransferredHandleEntry {
         if !entry.supports_transfer() {
             return None;
         }
-        if let KernelHandle::Console(console) = entry.handle() {
-            console.acquire_descriptor_reference();
+        if !acquire_entry_descriptor_reference(&entry) {
+            return None;
         }
         Some(Self { entry: Some(entry) })
     }
@@ -120,7 +135,7 @@ impl TransferredHandleEntry {
 
 impl Drop for TransferredHandleEntry {
     fn drop(&mut self) {
-        release_console_entry_reference(self.entry.as_ref());
+        release_entry_descriptor_reference(self.entry.as_ref());
     }
 }
 
@@ -147,9 +162,10 @@ impl Clone for HandleTable {
             .chain(cloned.entries.iter())
             .flatten()
         {
-            if let KernelHandle::Console(console) = entry.handle() {
-                console.acquire_descriptor_reference();
-            }
+            assert!(
+                acquire_entry_descriptor_reference(entry),
+                "fork cloned a stale descriptor-backed kernel object"
+            );
         }
         cloned
     }
@@ -483,13 +499,13 @@ impl HandleTable {
         }
         if let Some(index) = standard_index(fd) {
             let replaced = core::mem::replace(&mut self.standard[index], entry);
-            release_console_entry_reference(replaced.as_ref());
+            release_entry_descriptor_reference(replaced.as_ref());
             return Some(());
         }
         let index = dynamic_index(fd)?;
         self.ensure_entry_capacity(index)?;
         let replaced = core::mem::replace(&mut self.entries[index], entry);
-        release_console_entry_reference(replaced.as_ref());
+        release_entry_descriptor_reference(replaced.as_ref());
         Some(())
     }
 
@@ -500,7 +516,7 @@ impl HandleTable {
             let index = dynamic_index(fd)?;
             self.entries.get_mut(index)?.take()?
         };
-        release_console_entry_reference(Some(&entry));
+        release_entry_descriptor_reference(Some(&entry));
         Some(entry.into_handle())
     }
 
@@ -517,7 +533,7 @@ impl HandleTable {
                 continue;
             }
 
-            release_console_entry_reference(entry.as_ref());
+            release_entry_descriptor_reference(entry.as_ref());
             if let Some(entry) = entry.take() {
                 closed.push(entry.into_handle());
             }
@@ -530,7 +546,7 @@ impl HandleTable {
         let mut closed = Vec::new();
         for entry in self.standard.iter_mut().chain(self.entries.iter_mut()) {
             if let Some(entry) = entry.take() {
-                release_console_entry_reference(Some(&entry));
+                release_entry_descriptor_reference(Some(&entry));
                 closed.push(entry.into_handle());
             }
         }
@@ -565,15 +581,12 @@ impl HandleTable {
         }
         let mut entry = self.get_entry(fd)?.clone();
         entry.set_fd_flags(if close_on_exec { FD_CLOEXEC } else { 0 });
-        let console = console_for_entry(&entry);
-        if let Some(console) = console.as_ref() {
-            console.acquire_descriptor_reference();
+        if !acquire_entry_descriptor_reference(&entry) {
+            return None;
         }
         let installed = self.install_entry_min(entry, min_fd);
-        if installed.is_none()
-            && let Some(console) = console
-        {
-            let _ = console.release_descriptor_reference();
+        if installed.is_none() {
+            release_entry_descriptor_reference(self.get_entry(fd));
         }
         installed
     }
@@ -603,24 +616,21 @@ impl HandleTable {
         }
         let mut entry = self.get_entry(fd)?.clone();
         entry.set_fd_flags(if close_on_exec { FD_CLOEXEC } else { 0 });
-        let source_console = console_for_entry(&entry);
-        if let Some(console) = source_console.as_ref() {
-            console.acquire_descriptor_reference();
+        if !acquire_entry_descriptor_reference(&entry) {
+            return None;
         }
         if let Some(index) = standard_index(new_fd) {
             let replaced = self.standard[index].replace(entry);
-            release_console_entry_reference(replaced.as_ref());
+            release_entry_descriptor_reference(replaced.as_ref());
             return Some((new_fd, replaced.map(HandleEntry::into_handle)));
         }
         let index = dynamic_index(new_fd)?;
         if self.ensure_entry_capacity(index).is_none() {
-            if let Some(console) = source_console {
-                let _ = console.release_descriptor_reference();
-            }
+            release_entry_descriptor_reference(Some(&entry));
             return None;
         }
         let replaced = self.entries[index].replace(entry);
-        release_console_entry_reference(replaced.as_ref());
+        release_entry_descriptor_reference(replaced.as_ref());
         Some((new_fd, replaced.map(HandleEntry::into_handle)))
     }
 
@@ -679,7 +689,7 @@ impl HandleTable {
 impl Drop for HandleTable {
     fn drop(&mut self) {
         for entry in self.standard.iter().chain(self.entries.iter()).flatten() {
-            release_console_entry_reference(Some(entry));
+            release_entry_descriptor_reference(Some(entry));
         }
     }
 }
@@ -706,18 +716,33 @@ fn max_dynamic_entries() -> usize {
         .expect("dynamic descriptor ceiling must fit usize")
 }
 
-fn console_for_entry(entry: &HandleEntry) -> Option<ConsoleHandle> {
+fn acquire_entry_descriptor_reference(entry: &HandleEntry) -> bool {
     match entry.handle() {
-        KernelHandle::Console(console) => Some(console.clone()),
-        _ => None,
+        KernelHandle::Console(console) => {
+            console.acquire_descriptor_reference();
+            true
+        }
+        KernelHandle::DisplaySurface(surface) => surface
+            .shared_region()
+            .is_none_or(crate::ipc::retain_shared_region_descriptor),
+        _ => true,
     }
 }
 
-fn release_console_entry_reference(entry: Option<&HandleEntry>) {
-    if let Some(entry) = entry
-        && let KernelHandle::Console(console) = entry.handle()
-    {
-        let _ = console.release_descriptor_reference();
+fn release_entry_descriptor_reference(entry: Option<&HandleEntry>) {
+    let Some(entry) = entry else {
+        return;
+    };
+    match entry.handle() {
+        KernelHandle::Console(console) => {
+            let _ = console.release_descriptor_reference();
+        }
+        KernelHandle::DisplaySurface(surface) => {
+            if let Some(region) = surface.shared_region() {
+                crate::ipc::release_shared_region_descriptor(region);
+            }
+        }
+        _ => {}
     }
 }
 

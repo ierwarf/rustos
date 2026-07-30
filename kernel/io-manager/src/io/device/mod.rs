@@ -161,13 +161,14 @@ impl From<paging::AddressSpaceError> for DeviceError {
 
 pub fn ioctl_from_user(
     handle: DeviceHandle,
+    process_id: u64,
     process_state: &mut UserProcessState,
     request: u64,
     arg: u64,
 ) -> Result<u64, DeviceError> {
     match handle.device_id() {
         DeviceId::Console => Err(DeviceError::Unsupported),
-        DeviceId::Display => display::ioctl(process_state, request, arg),
+        DeviceId::Display => display::ioctl(process_id, process_state, request, arg),
         DeviceId::Input => Err(DeviceError::Unsupported),
     }
 }

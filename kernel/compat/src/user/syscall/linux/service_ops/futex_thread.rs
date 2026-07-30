@@ -1,13 +1,33 @@
+//! Scheduler-local Linux futex wait, wake, requeue, and owner-death substrate.
+//!
+//! - **Owner:** Compat owns fixed Linux futex semantics; `kernel-ps` owns task
+//!   blocking and process-generation user memory.
+//! - **Boundary:** User addresses, futex words, flags, counts, robust lists, and
+//!   deadlines are untrusted.
+//! - **Lifecycle:** Validate word/key, register exact waiter, recheck, arm,
+//!   commit, wake/requeue/timeout/signal, remove, and exit cleanup.
+//! - **Concurrency:** Admission avoids allocation, process-state locking, and
+//!   policy-service IPC before waiter/deadline publication.
+//! - **Failure:** Lost-wake races, timeout, signal, requeue overlap, exec,
+//!   task exit, and bounded owner-death traversal converge without stale waiters.
+//! - **Forbidden:** No syscalld hot-path call, unbounded robust-list walk,
+//!   address-only waiter identity, or removal before wake ownership settles.
+//! - **Evidence:** `futex-wait-lifecycle`.
 use super::*;
-use lazy_static::lazy_static;
+use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
 use rustos_user_abi::syscall::{
     IPC_SERVICE_CAP_PROCESS_POLICY, PROCD_OP_THREAD_PLAN,
-    SYSCALL_OFFLOAD_OP_LINUX_ARCH_PRCTL_POLICY, SYSCALL_OFFLOAD_OP_LINUX_FUTEX_POLICY,
+    SYSCALL_OFFLOAD_OP_LINUX_ARCH_PRCTL_POLICY,
 };
-use spin::Mutex;
 use x86_64::VirtAddr;
 
 const FUTEX_WAITERS_CAPACITY: usize = 256;
+const ROBUST_LIST_HEAD_SIZE: u64 = 24;
+const ROBUST_LIST_LIMIT: usize = 2_048;
+const FUTEX_WAITERS_BIT: u32 = 0x8000_0000;
+const FUTEX_OWNER_DIED_BIT: u32 = 0x4000_0000;
+const FUTEX_TID_MASK: u32 = 0x3fff_ffff;
+const ROBUST_LIST_PI_BIT: u64 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FutexKey {
@@ -22,31 +42,21 @@ struct FutexWaiter {
     bitset: u32,
 }
 
-lazy_static! {
-    static ref FUTEX_WAITERS: Mutex<[Option<FutexWaiter>; FUTEX_WAITERS_CAPACITY]> =
-        Mutex::new([None; FUTEX_WAITERS_CAPACITY]);
-}
+static FUTEX_WAITERS: TrackedSpinLock<
+    [Option<FutexWaiter>; FUTEX_WAITERS_CAPACITY],
+    { LockClass::FutexWaiter as u8 },
+> = TrackedSpinLock::new([None; FUTEX_WAITERS_CAPACITY]);
 
-// RING3-MIGRATION-REFERENCE START: scheduler-thread substrate exception:
-// syscalld owns Linux futex opcode admission policy. Ring0 keeps the scheduler
-// wait/wake queue substrate.
+// Futex opcode/flag admission is part of the scheduler wait/wake substrate.
+// Keep it local and allocation-free: putting a synchronous policy-service
+// call before waiter/deadline registration can stall every userspace mutex and
+// lets an unpark race ahead of the target's waiter installation.
 pub fn futex_impl(uaddr: u64, op: u64, val: u64, timeout_ptr: u64, uaddr2: u64, val3: u64) -> u64 {
     if (uaddr & 0x3) != 0 {
         return linux_errno(LINUX_EINVAL);
     }
-    if current_process_is_syscalld_policy_owner() {
-        if let Err(errno) = validate_futex_policy_locally(op, val3) {
-            return linux_errno(errno);
-        }
-    } else {
-        let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_FUTEX_POLICY);
-        request.arg0 = op;
-        request.arg1 = val3;
-        match call_syscalld(request).and_then(|response| ensure_empty_syscalld_response(&response))
-        {
-            Ok(()) => {}
-            Err(errno) => return linux_errno(errno),
-        }
+    if let Err(errno) = validate_futex_policy_locally(op, val3) {
+        return linux_errno(errno);
     }
     let cmd = op & linux_abi::FUTEX_CMD_MASK;
     let result = match cmd {
@@ -79,7 +89,6 @@ pub fn futex_impl(uaddr: u64, op: u64, val: u64, timeout_ptr: u64, uaddr2: u64, 
         Err(errno) => linux_errno(errno),
     }
 }
-// RING3-MIGRATION-REFERENCE END: syscalld-owned futex opcode substrate exception.
 
 fn validate_futex_policy_locally(op: u64, val3: u64) -> Result<(), i64> {
     let cmd = op & linux_abi::FUTEX_CMD_MASK;
@@ -190,6 +199,7 @@ pub fn clone_linux_thread(
             child_thread_state.rseq_len = 0;
             child_thread_state.rseq_signature = 0;
             child_thread_state.pending_signals = 0;
+            child_thread_state.pending_sigchld_events = 0;
             child_thread_state.signal_stack = linux_abi::LinuxSignalStack {
                 sp: 0,
                 flags: linux_abi::SS_DISABLE,
@@ -359,8 +369,8 @@ fn futex_wait(
         let _ = multitask::cancel_block_current_task();
         return Err(LINUX_EBUSY);
     }
-    match multitask::commit_block_current_task() {
-        Some(true) => multitask::yield_now(),
+    match multitask::commit_block_current_task_and_yield() {
+        Some(true) => {}
         Some(false) => {}
         None => {
             clear_futex_waiter(task_id);
@@ -368,13 +378,17 @@ fn futex_wait(
             return Err(LINUX_EINVAL);
         }
     }
-    crate::arch::rtc::disarm_sleep_waiter(task_id);
     // REQUEUE may have changed the key while this task slept. Cleanup is tied
     // to task identity, not the key captured before blocking, so timeout and
-    // spurious-wake paths cannot strand a waiter in the bounded table.
+    // spurious-wake paths cannot strand a waiter in the bounded table. Keep
+    // the deadline notification owned until this cleanup completes: removing
+    // timer authority before the waiter-table transaction would make a stall
+    // in the resumed kernel path indistinguishable from a completed wait.
     let still_waiting = take_futex_waiter(task_id);
-    if still_waiting && deadline_tick.is_some_and(|deadline| crate::arch::rtc::ticks() >= deadline)
-    {
+    let timed_out = still_waiting
+        && deadline_tick.is_some_and(|deadline| crate::arch::rtc::ticks() >= deadline);
+    crate::arch::rtc::disarm_sleep_waiter(task_id);
+    if timed_out {
         Err(LINUX_ETIMEDOUT)
     } else {
         // Linux permits spurious futex wakeups. A waiter removed by
@@ -396,9 +410,9 @@ fn futex_wait_deadline_tick(op: u64, timeout_ptr: u64) -> Result<Option<u64>, i6
     let ticks_per_second = crate::arch::rtc::ticks_per_second().max(1);
     let timeout_ticks = if op & linux_abi::FUTEX_CMD_MASK == linux_abi::FUTEX_WAIT_BITSET {
         let clock_id = if op & linux_abi::FUTEX_CLOCK_REALTIME != 0 {
-            linux_abi::CLOCK_REALTIME as u64
+            linux_abi::CLOCK_REALTIME
         } else {
-            linux_abi::CLOCK_MONOTONIC as u64
+            linux_abi::CLOCK_MONOTONIC
         };
         let now = process_time::current_clock_timespec_substrate(clock_id);
         timespec_delta_ticks(timeout, now, ticks_per_second)
@@ -507,19 +521,19 @@ fn futex_requeue_inner(
 }
 
 fn current_futex_waiter_context() -> Result<(u64, FutexKey), i64> {
-    multitask::with_current_user_process_state_mut(|task_id, abi, process_state| {
-        if abi != crate::user::abi::UserAbi::Linux {
-            return Err(LINUX_ENOSYS);
-        }
-        Ok((
-            task_id,
-            FutexKey {
-                address_space_root: process_state.address_space_root(),
-                uaddr: 0,
-            },
-        ))
-    })
-    .unwrap_or(Err(LINUX_ENOSYS))
+    let Some((task_id, abi, address_space_root)) = multitask::current_user_wait_binding() else {
+        return Err(LINUX_ENOSYS);
+    };
+    if abi != crate::user::abi::UserAbi::Linux {
+        return Err(LINUX_ENOSYS);
+    }
+    Ok((
+        task_id,
+        FutexKey {
+            address_space_root,
+            uaddr: 0,
+        },
+    ))
 }
 
 fn register_futex_waiter(waiter: FutexWaiter) -> Result<(), i64> {
@@ -554,6 +568,10 @@ fn clear_futex_waiter(task_id: u64) {
     let _ = take_futex_waiter(task_id);
 }
 
+pub(crate) fn cleanup_retired_task_waiter(task_id: u64) -> bool {
+    take_futex_waiter(task_id)
+}
+
 fn take_futex_waiter(task_id: u64) -> bool {
     let mut waiters = FUTEX_WAITERS.lock();
     take_futex_waiter_from(&mut waiters[..], task_id)
@@ -561,12 +579,12 @@ fn take_futex_waiter(task_id: u64) -> bool {
 
 fn take_futex_waiter_from(waiters: &mut [Option<FutexWaiter>], task_id: u64) -> bool {
     let mut removed = false;
-    for slot in 0..waiters.len() {
-        if waiters[slot]
+    for slot in waiters.iter_mut() {
+        if slot
             .map(|waiter| waiter.task_id == task_id)
             .unwrap_or(false)
         {
-            waiters[slot] = None;
+            *slot = None;
             removed = true;
         }
     }
@@ -597,6 +615,8 @@ fn wake_futex_waiters(key: FutexKey, max_wake: usize, bitset: u32) -> usize {
     for task_id in task_ids.into_iter().take(wake_count) {
         if multitask::wake_user_task(task_id) {
             woken += 1;
+        } else {
+            crate::debug::println!("futex: selected waiter had no live task task={task_id}");
         }
     }
     woken
@@ -645,30 +665,220 @@ fn requeue_futex_waiters(
     (woken, requeue_count)
 }
 
+fn robust_owner_death_value(value: u32, task_id: u64) -> Option<(u32, bool)> {
+    let task_tid = u32::try_from(task_id).ok()? & FUTEX_TID_MASK;
+    if value & FUTEX_TID_MASK != task_tid {
+        return None;
+    }
+    Some((
+        (value & FUTEX_WAITERS_BIT) | FUTEX_OWNER_DIED_BIT,
+        value & FUTEX_WAITERS_BIT != 0,
+    ))
+}
+
+fn robust_futex_address(entry: u64, offset: i64) -> Option<u64> {
+    let address = if offset >= 0 {
+        entry.checked_add(offset as u64)?
+    } else {
+        entry.checked_sub(offset.unsigned_abs())?
+    };
+    let end = address.checked_add(core::mem::size_of::<u32>() as u64)?;
+    ((address & 0x3) == 0
+        && (paging::USER_SPACE_BASE..paging::USER_SPACE_END_EXCLUSIVE).contains(&address)
+        && end <= paging::USER_SPACE_END_EXCLUSIVE)
+        .then_some(address)
+}
+
+fn read_user_u64(address_space: &paging::ProcessAddressSpace, address: u64) -> Option<u64> {
+    let mut bytes = [0_u8; 8];
+    address_space
+        .copy_from_user(VirtAddr::new(address), &mut bytes)
+        .ok()?;
+    Some(u64::from_le_bytes(bytes))
+}
+
+fn read_user_u32(address_space: &paging::ProcessAddressSpace, address: u64) -> Option<u32> {
+    let mut bytes = [0_u8; 4];
+    address_space
+        .copy_from_user(VirtAddr::new(address), &mut bytes)
+        .ok()?;
+    Some(u32::from_le_bytes(bytes))
+}
+
+fn cleanup_robust_futex(
+    address_space: &paging::ProcessAddressSpace,
+    address_space_root: u64,
+    task_id: u64,
+    entry: u64,
+    futex_offset: i64,
+) -> bool {
+    let Some(futex_address) = robust_futex_address(entry, futex_offset) else {
+        return false;
+    };
+    let Some(value) = read_user_u32(address_space, futex_address) else {
+        return false;
+    };
+    let Some((owner_died, had_waiters)) = robust_owner_death_value(value, task_id) else {
+        return false;
+    };
+    if address_space
+        .copy_into_user(VirtAddr::new(futex_address), &owner_died.to_le_bytes())
+        .is_err()
+    {
+        return false;
+    }
+    if had_waiters {
+        let _ = wake_futex_waiters(
+            FutexKey {
+                address_space_root,
+                uaddr: futex_address,
+            },
+            1,
+            linux_abi::FUTEX_BITSET_MATCH_ANY,
+        );
+    }
+    true
+}
+
+fn cleanup_robust_list(
+    address_space: &paging::ProcessAddressSpace,
+    address_space_root: u64,
+    task_id: u64,
+    robust_list_head: u64,
+    robust_list_len: u64,
+) -> usize {
+    if robust_list_head == 0 || robust_list_len != ROBUST_LIST_HEAD_SIZE {
+        return 0;
+    }
+    let Some(mut entry) = read_user_u64(address_space, robust_list_head) else {
+        return 0;
+    };
+    let Some(futex_offset) =
+        read_user_u64(address_space, robust_list_head.saturating_add(8)).map(|value| value as i64)
+    else {
+        return 0;
+    };
+    let Some(pending) = read_user_u64(address_space, robust_list_head.saturating_add(16)) else {
+        return 0;
+    };
+    let pending_entry = pending & !ROBUST_LIST_PI_BIT;
+    let mut cleaned = 0usize;
+
+    for _ in 0..ROBUST_LIST_LIMIT {
+        let current_entry = entry & !ROBUST_LIST_PI_BIT;
+        if current_entry == robust_list_head {
+            break;
+        }
+        if current_entry == 0 || entry & ROBUST_LIST_PI_BIT != 0 {
+            return cleaned;
+        }
+        let Some(next) = read_user_u64(address_space, current_entry) else {
+            return cleaned;
+        };
+        if current_entry != pending_entry
+            && cleanup_robust_futex(
+                address_space,
+                address_space_root,
+                task_id,
+                current_entry,
+                futex_offset,
+            )
+        {
+            cleaned += 1;
+        }
+        entry = next;
+    }
+
+    if pending_entry != 0
+        && pending & ROBUST_LIST_PI_BIT == 0
+        && cleanup_robust_futex(
+            address_space,
+            address_space_root,
+            task_id,
+            pending_entry,
+            futex_offset,
+        )
+    {
+        cleaned += 1;
+    }
+    cleaned
+}
+
+pub(crate) fn cleanup_retired_linux_thread_state(
+    task_id: u64,
+    process_id: u64,
+    clear_child_tid: u64,
+    robust_list_head: u64,
+    robust_list_len: u64,
+) -> usize {
+    if process_id == 0 {
+        return 0;
+    }
+    multitask::with_process_state_by_pid_mut(process_id, |process_state| {
+        let address_space_root = process_state.address_space_root();
+        let address_space = process_state.address_space();
+        let mut cleaned = cleanup_robust_list(
+            address_space,
+            address_space_root,
+            task_id,
+            robust_list_head,
+            robust_list_len,
+        );
+        if clear_child_tid != 0
+            && (clear_child_tid & 0x3) == 0
+            && address_space
+                .copy_into_user(VirtAddr::new(clear_child_tid), &0_u32.to_le_bytes())
+                .is_ok()
+        {
+            let _ = wake_futex_waiters(
+                FutexKey {
+                    address_space_root,
+                    uaddr: clear_child_tid,
+                },
+                1,
+                linux_abi::FUTEX_BITSET_MATCH_ANY,
+            );
+            cleaned += 1;
+        }
+        cleaned
+    })
+    .unwrap_or(0)
+}
+
 pub fn cleanup_linux_thread_exit() {
     if let Some(task_id) = multitask::current_user_thread_id() {
         clear_futex_waiter(task_id);
         crate::arch::rtc::disarm_sleep_waiter(task_id);
     }
-    let clear_child_tid = multitask::with_current_user_linux_state_mut(
-        |_, _, abi, address_space, _, linux_thread_state| {
+    let cleanup = multitask::with_current_user_linux_state_mut(
+        |process_id, task_id, abi, _, _, linux_thread_state| {
             if abi != crate::user::abi::UserAbi::Linux {
                 return None;
             }
             let state = linux_thread_state.as_mut()?;
-            if state.clear_child_tid == 0 {
-                return None;
-            }
-            let clear_child_tid = state.clear_child_tid;
-            let _ =
-                address_space.copy_into_user(VirtAddr::new(clear_child_tid), &0_u32.to_le_bytes());
+            let cleanup = (
+                process_id,
+                task_id,
+                state.clear_child_tid,
+                state.robust_list_head,
+                state.robust_list_len,
+            );
             state.clear_child_tid = 0;
-            Some(clear_child_tid)
+            state.robust_list_head = 0;
+            state.robust_list_len = 0;
+            Some(cleanup)
         },
     )
     .flatten();
-    if let Some(clear_child_tid) = clear_child_tid {
-        let _ = futex_wake(clear_child_tid, 1, linux_abi::FUTEX_BITSET_MATCH_ANY);
+    if let Some((process_id, task_id, clear_child_tid, robust_list_head, robust_list_len)) = cleanup
+    {
+        let _ = cleanup_retired_linux_thread_state(
+            task_id,
+            process_id,
+            clear_child_tid,
+            robust_list_head,
+            robust_list_len,
+        );
     }
 }
 
@@ -787,11 +997,41 @@ fn procd_tgkill(tgid: u64, tid: u64, signal: u64) -> u64 {
 }
 
 pub fn syscall_linux_set_robust_list(head_ptr: u64, len: u64) -> u64 {
+    if len != ROBUST_LIST_HEAD_SIZE {
+        return linux_errno(LINUX_EINVAL);
+    }
+    if head_ptr != 0
+        && (!(paging::USER_SPACE_BASE..paging::USER_SPACE_END_EXCLUSIVE).contains(&head_ptr)
+            || head_ptr
+                .checked_add(ROBUST_LIST_HEAD_SIZE)
+                .is_none_or(|end| end > paging::USER_SPACE_END_EXCLUSIVE))
+    {
+        return linux_errno(LINUX_EFAULT);
+    }
     let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_SET_ROBUST_LIST);
     request.arg0 = head_ptr;
     request.arg1 = len;
     match call_syscalld(request).and_then(|response| ensure_empty_syscalld_response(&response)) {
-        Ok(()) => 0,
+        Ok(()) => {
+            let updated =
+                multitask::with_current_user_linux_state_mut(|_, _, abi, _, _, thread_state| {
+                    if abi != crate::user::abi::UserAbi::Linux {
+                        return false;
+                    }
+                    let Some(state) = thread_state.as_mut() else {
+                        return false;
+                    };
+                    state.robust_list_head = head_ptr;
+                    state.robust_list_len = len;
+                    true
+                })
+                .unwrap_or(false);
+            if updated {
+                0
+            } else {
+                linux_errno(LINUX_ENOSYS)
+            }
+        }
         Err(errno) => linux_errno(errno),
     }
 }
@@ -806,10 +1046,24 @@ pub fn syscall_linux_get_robust_list(pid: u64, head_ptr_ptr: u64, len_ptr: u64) 
     if let Err(errno) = ensure_syscalld_payload(&response, 16) {
         return linux_errno(errno);
     }
-    if let Err(err) = usermem::write_current_user_bytes(head_ptr_ptr, &response.payload[..8]) {
+    let Some(current_process_id) = multitask::current_user_process_id() else {
+        return linux_errno(LINUX_ENOSYS);
+    };
+    let Some(current_task_id) = multitask::current_user_thread_id() else {
+        return linux_errno(LINUX_ENOSYS);
+    };
+    let target_task_id = if pid == 0 { current_task_id } else { pid };
+    let Some(snapshot) =
+        multitask::linux_thread_snapshot_by_ids(current_process_id, target_task_id)
+    else {
+        return linux_errno(LINUX_ESRCH);
+    };
+    let head = snapshot.thread_state.robust_list_head.to_le_bytes();
+    let len = snapshot.thread_state.robust_list_len.to_le_bytes();
+    if let Err(err) = usermem::write_current_user_bytes(head_ptr_ptr, &head) {
         return linux_errno(address_space_error_to_linux_errno(err));
     }
-    if let Err(err) = usermem::write_current_user_bytes(len_ptr, &response.payload[8..16]) {
+    if let Err(err) = usermem::write_current_user_bytes(len_ptr, &len) {
         return linux_errno(address_space_error_to_linux_errno(err));
     }
     0
@@ -857,5 +1111,72 @@ mod tests {
         assert!(take_futex_waiter_from(&mut waiters, 7));
         assert!(waiters[0].is_none());
         assert_eq!(waiters[1].unwrap().task_id, 8);
+    }
+
+    #[test]
+    fn supported_futex_admission_is_local_and_complete() {
+        for op in [
+            linux_abi::FUTEX_WAIT,
+            linux_abi::FUTEX_WAKE,
+            linux_abi::FUTEX_REQUEUE,
+            linux_abi::FUTEX_CMP_REQUEUE,
+            linux_abi::FUTEX_WAIT | linux_abi::FUTEX_PRIVATE_FLAG,
+            linux_abi::FUTEX_WAIT_BITSET | linux_abi::FUTEX_CLOCK_REALTIME,
+            linux_abi::FUTEX_WAKE_BITSET | linux_abi::FUTEX_PRIVATE_FLAG,
+        ] {
+            assert_eq!(
+                validate_futex_policy_locally(op, linux_abi::FUTEX_BITSET_MATCH_ANY as u64),
+                Ok(())
+            );
+        }
+        assert_eq!(
+            validate_futex_policy_locally(linux_abi::FUTEX_WAIT_BITSET, 0),
+            Err(LINUX_EINVAL)
+        );
+        assert_eq!(
+            validate_futex_policy_locally(u64::MAX, linux_abi::FUTEX_BITSET_MATCH_ANY as u64),
+            Err(LINUX_ENOSYS)
+        );
+    }
+
+    #[test]
+    fn retired_task_cleanup_is_exact_and_idempotent() {
+        let task_id = u64::MAX - 501;
+        register_futex_waiter(FutexWaiter {
+            key: FutexKey {
+                address_space_root: 0x4000,
+                uaddr: 0x5000,
+            },
+            task_id,
+            bitset: linux_abi::FUTEX_BITSET_MATCH_ANY,
+        })
+        .expect("register retired-task waiter");
+
+        assert!(cleanup_retired_task_waiter(task_id));
+        assert!(!cleanup_retired_task_waiter(task_id));
+    }
+
+    #[test]
+    fn robust_owner_death_preserves_waiters_and_rejects_foreign_owner() {
+        let task_id = 77_u64;
+        assert_eq!(
+            robust_owner_death_value(FUTEX_WAITERS_BIT | task_id as u32, task_id),
+            Some((FUTEX_WAITERS_BIT | FUTEX_OWNER_DIED_BIT, true))
+        );
+        assert_eq!(
+            robust_owner_death_value(task_id as u32, task_id),
+            Some((FUTEX_OWNER_DIED_BIT, false))
+        );
+        assert_eq!(robust_owner_death_value(78, task_id), None);
+    }
+
+    #[test]
+    fn robust_futex_offset_is_checked_before_user_access() {
+        let entry = paging::USER_SPACE_BASE + 0x100;
+        assert_eq!(robust_futex_address(entry, 16), Some(entry + 16));
+        assert_eq!(robust_futex_address(entry, -16), Some(entry - 16));
+        assert_eq!(robust_futex_address(entry, 2), None);
+        assert_eq!(robust_futex_address(u64::MAX - 3, 8), None);
+        assert_eq!(robust_futex_address(paging::USER_SPACE_BASE, -4), None);
     }
 }

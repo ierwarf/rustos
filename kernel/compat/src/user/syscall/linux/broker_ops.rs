@@ -27,6 +27,7 @@ use net_broker_ops::*;
 use waitset_broker_ops::*;
 
 pub(super) use device_broker_ops::device_sysop_error_to_linux_errno;
+pub(crate) use lifecycle_broker_ops::cleanup_retired_task_runtime_state;
 
 pub(super) fn is_linux_rustos_broker_syscall(syscall_number: u64) -> bool {
     matches!(

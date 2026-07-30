@@ -91,6 +91,9 @@ statusMessage = "Loading RustOS hook context"
 command = "npx"
 args = ["-y", "mcp-ripgrep@0.4.0"]
 
+[mcp_servers.ripgrep.tools.search]
+approval_mode = "approve"
+
 [mcp_servers.serena]
 command = "uvx"
 args = ["--from", "serena-agent==1.6.0", "serena", "start-mcp-server"]

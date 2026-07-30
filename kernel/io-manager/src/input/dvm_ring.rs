@@ -1,3 +1,18 @@
+//! Single-consumer DVM input-ring transport and generation lease.
+//!
+//! - **Owner:** `kernel-io-manager` owns bounded ingress mechanics; `inputd`
+//!   owns decode, focus/session policy, and delivery.
+//! - **Boundary:** Shared cursors, sequence, checksum-bearing records, and
+//!   consumer identity are untrusted.
+//! - **Lifecycle:** Install transport, grant one exact consumer generation,
+//!   drain bounded records, revoke/withdraw, and reject old-owner access.
+//! - **Concurrency:** MSI-X only advances pending/wake state; normal context
+//!   performs bounded copies under explicit producer/consumer ordering.
+//! - **Failure:** Malformed record, overrun, owner exit, capacity, and stale
+//!   generation terminate or withdraw the exact lease.
+//! - **Forbidden:** No decode, focus policy, native-device fallback, multiple
+//!   consumers, or polling loop in ring0.
+//! - **Evidence:** `dvm-input-ingress` and `input-delivery-lifecycle`.
 // RING3-MIGRATION-REFERENCE START: DVM input transport substrate.
 // L0 is the sole producer of this fixed ivshmem ring. Ring0 maps the exact
 // launch-created aperture, arms one MSI-X wake vector, and drains bounded
@@ -554,7 +569,10 @@ fn install_rejection_name(reason: u8) -> &'static str {
 fn consume_attach_attempt() -> bool {
     ATTACH_ATTEMPTS
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |attempts| {
-            (attempts < MAX_ATTACH_ATTEMPTS_PER_BOOT).then_some(attempts + 1)
+            if attempts >= MAX_ATTACH_ATTEMPTS_PER_BOOT {
+                return None;
+            }
+            Some(attempts + 1)
         })
         .is_ok()
 }

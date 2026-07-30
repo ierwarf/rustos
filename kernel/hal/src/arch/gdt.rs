@@ -1,3 +1,16 @@
+//! x86_64 privilege-segment and kernel-entry-stack construction.
+//!
+//! - **Owner:** `kernel-hal` owns BSP GDT/TSS publication.
+//! - **Boundary:** Selectors and stack bounds become CPU privilege-transition
+//!   authority.
+//! - **Lifecycle:** Storage is initialized completely before `lgdt`/TSS load
+//!   makes it live and remains immutable for the BSP boot.
+//! - **Concurrency:** BSP-only initialization precedes user task dispatch.
+//! - **Failure:** Invalid layout or stack topology is a boot-fatal contract
+//!   violation.
+//! - **Forbidden:** No reused user stack, mutable live descriptor, or implied
+//!   AP/SMP readiness.
+//! - **Evidence:** `exception-retirement`.
 use core::cell::UnsafeCell;
 
 use lazy_static::lazy_static;

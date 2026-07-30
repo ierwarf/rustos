@@ -5,6 +5,21 @@
 //! required for a PCI device to signal a fixed event queue. It deliberately
 //! exposes function pointers rather than a general IRQ object graph so an IRQ
 //! handler cannot allocate, block, or acquire a policy-service lock.
+//!
+//! - **Owner:** `kernel-hal` owns vector reservation, handler publication, and
+//!   local-APIC acknowledgement mechanics; the driver domain owns device policy.
+//! - **Boundary:** CPUID/MSR state, MMIO addresses, vector numbers, and handler
+//!   publication are admitted before an interrupt can become observable.
+//! - **Lifecycle:** Reserve an unpublished vector, program the masked device,
+//!   publish the handler, unmask, then mask/revoke before returning the slot.
+//! - **Concurrency:** Allocation and handler slots are atomic; IRQ dispatch is
+//!   non-blocking and allocation-free.
+//! - **Failure:** Unsupported APIC modes, exhausted vectors, invalid vectors,
+//!   and partial setup fail closed without a live handler.
+//! - **Forbidden:** No policy call, heap allocation, blocking, or vector reuse
+//!   while the prior generation can still signal.
+//! - **Evidence:** `msi-vector-lifecycle`, `irq-resource-accounting`, and
+//!   `interrupt-return`.
 
 use core::arch::x86_64::__cpuid;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -200,7 +215,10 @@ pub fn dispatch(vector: u8) {
 }
 
 fn vector_index(vector: u8) -> Option<usize> {
-    vector_is_valid(vector).then_some((vector - MSI_VECTOR_FIRST) as usize)
+    if !vector_is_valid(vector) {
+        return None;
+    }
+    Some((vector - MSI_VECTOR_FIRST) as usize)
 }
 
 const fn vector_has_registration_authority(vector: u8, allocated: bool) -> bool {
@@ -229,9 +247,11 @@ mod tests {
     #[test]
     fn msi_vector_pool_excludes_exceptions_pic_and_spurious_vectors() {
         assert!(!vector_is_valid(0x1f));
+        assert_eq!(vector_index(0x1f), None);
         assert!(vector_is_valid(MSI_VECTOR_FIRST));
         assert!(vector_is_valid(MSI_VECTOR_LAST));
         assert!(!vector_is_valid(0xe0));
+        assert_eq!(vector_index(0xe0), None);
     }
 
     #[test]

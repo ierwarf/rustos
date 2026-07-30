@@ -198,37 +198,6 @@ pub fn spawn_user_process_state_with_parent(
     Ok(id)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn spawn_fault_gate_prevents_publication() {
-        let allocator_called = core::cell::Cell::new(false);
-        assert_eq!(
-            allocate_task_id_after_fault_gate(true, || {
-                allocator_called.set(true);
-                Some(7)
-            }),
-            Err(SpawnTaskError::NoFreeTaskSlot)
-        );
-        assert!(!allocator_called.get());
-    }
-
-    #[test]
-    fn invalid_spawn_weight_does_not_consume_identity() {
-        let allocator_called = core::cell::Cell::new(false);
-        assert_eq!(
-            prepare_user_spawn(0, false, || {
-                allocator_called.set(true);
-                Some(7)
-            }),
-            Err(SpawnTaskError::InvalidWeightMicros)
-        );
-        assert!(!allocator_called.get());
-    }
-}
-
 pub fn spawn_kernel_process(
     process_state: UserProcessState,
     entry: VirtAddr,
@@ -307,5 +276,36 @@ pub fn start(entry: fn(u64)) -> ! {
         kernel_hal::api::restore_kernel_saved_context(
             saved_rsp as *mut super::context::SavedContext,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spawn_fault_gate_prevents_publication() {
+        let allocator_called = core::cell::Cell::new(false);
+        assert_eq!(
+            allocate_task_id_after_fault_gate(true, || {
+                allocator_called.set(true);
+                Some(7)
+            }),
+            Err(SpawnTaskError::NoFreeTaskSlot)
+        );
+        assert!(!allocator_called.get());
+    }
+
+    #[test]
+    fn invalid_spawn_weight_does_not_consume_identity() {
+        let allocator_called = core::cell::Cell::new(false);
+        assert_eq!(
+            prepare_user_spawn(0, false, || {
+                allocator_called.set(true);
+                Some(7)
+            }),
+            Err(SpawnTaskError::InvalidWeightMicros)
+        );
+        assert!(!allocator_called.get());
     }
 }

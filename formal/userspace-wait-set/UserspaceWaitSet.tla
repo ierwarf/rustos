@@ -22,8 +22,10 @@ target before publishing the new descriptor.
 ArmRecheck abstracts the concrete final provider recheck plus waiter-presence
 test; service IPC completes before the scheduler arm and is independently
 bounded by the ipc-reply-deadline contract and the application deadline. A
-provider-query timeout is an allowed nonterminal stutter/retry: it cannot erase
-readiness found elsewhere in the scan or create an early terminal timeout.
+A provider-query timeout or a revoked per-attempt reply capability is an
+allowed nonterminal stutter/retry under the original application deadline: it
+cannot escape as a foreign Linux epoll errno, erase readiness found elsewhere
+in the scan, or create an early terminal timeout.
 *******************************************************************************)
 
 CONSTANTS MaxGeneration, MaxEpoch, MaxTime, WaitBound, MaxRefs, MaxIngress

@@ -34,6 +34,7 @@ pub(crate) const STORAGE_NOT_READY_RETRY_BACKOFF: Duration = Duration::from_mill
 const UI_BOOTSTRAP_RETRY_BACKOFF: Duration = Duration::from_millis(500);
 pub(crate) const SERVICE_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const MAX_RUNTIME_CLIENTS_PER_TICK: usize = 8;
+pub(crate) const MAX_PENDING_RUNTIME_CLIENTS: usize = 16;
 pub(crate) const MAX_POLICY_LAUNCH_ATTEMPTS_PER_TICK: usize = 1;
 pub(crate) const PROTOCOL_VERSION: u16 = 1;
 pub(crate) const OP_SNAPSHOT_RUNNING_PROGRAMS: u16 = 1;
@@ -231,6 +232,7 @@ fn main() {
         launch_catalog_retry_after: None,
         launch_catalog_last_error: None,
     };
+    let mut runtime_connections = socket::RuntimeConnections::default();
     let _ = ensure_ui_bootstrap(&mut state);
     loop {
         let mut did_work = false;
@@ -240,8 +242,11 @@ fn main() {
         if state.ui_ready && !state.launch_catalog_loaded {
             did_work |= catalog::load_launch_catalog_into_state(&mut state);
         }
-        did_work |= socket::service_listener(&listener, &mut state);
+        // Converge signed launch policy before servicing another control
+        // client. In particular, a background snapshot client must not delay
+        // the first desktop launch after the catalog-ready transition.
         did_work |= socket::ensure_policy_launches(&mut state);
+        did_work |= socket::service_listener(&listener, &mut runtime_connections, &mut state);
         if did_work {
             continue;
         }

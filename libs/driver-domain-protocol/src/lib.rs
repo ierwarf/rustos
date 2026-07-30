@@ -1266,13 +1266,17 @@ impl DvmGpuAtlasPoolHeader {
         };
         self.region_bytes != 0
             && self.command_offset >= u64::from(DVM_GUI_SURFACE_POOL_HEADER_BYTES)
-            && self.command_offset % u64::from(DVM_GUI_SURFACE_SLOT_ALIGNMENT) == 0
+            && self
+                .command_offset
+                .is_multiple_of(u64::from(DVM_GUI_SURFACE_SLOT_ALIGNMENT))
             && DVM_GPU_ATLAS_COMMAND_SLOT_BYTES
                 >= (DVM_GPU_ATLAS_SUBMIT_BYTES
                     + DVM_GPU_ATLAS_MAX_DAMAGE_RECTS as usize * DVM_GPU_ATLAS_DAMAGE_BYTES
                     + DVM_GPU_RENDER_MAX_BATCH_BYTES) as u64
             && command_end <= self.atlas_offset
-            && self.atlas_offset % u64::from(DVM_GUI_SURFACE_SLOT_ALIGNMENT) == 0
+            && self
+                .atlas_offset
+                .is_multiple_of(u64::from(DVM_GUI_SURFACE_SLOT_ALIGNMENT))
             && self.atlas_width != 0
             && self.atlas_height != 0
             && self.atlas_width <= DVM_GPU_RENDER_MAX_DIMENSION
@@ -3576,10 +3580,13 @@ mod tests {
                     + super::DVM_GPU_ATLAS_COMPLETION_SLOT_BYTES
                         * super::DVM_GPU_RENDER_MAX_IN_FLIGHT as usize
         );
-        assert!(
-            super::DVM_GPU_ATLAS_PRIME_COMPLETION_OFFSET + super::DVM_GPU_PRIME_COMPLETION_BYTES
-                <= super::DVM_GPU_ATLAS_HOST_INVITATION_OFFSET
-        );
+        const {
+            assert!(
+                super::DVM_GPU_ATLAS_PRIME_COMPLETION_OFFSET
+                    + super::DVM_GPU_PRIME_COMPLETION_BYTES
+                    <= super::DVM_GPU_ATLAS_HOST_INVITATION_OFFSET
+            );
+        }
         assert!(
             super::DVM_GPU_ATLAS_PRIME_FENCE_OFFSET + core::mem::size_of::<u64>()
                 <= super::DVM_GUI_SURFACE_POOL_HEADER_BYTES as usize
@@ -3856,7 +3863,9 @@ mod tests {
         };
         assert!(ready.is_valid());
         assert!(ready.dvm_ready());
-        assert!(DVM_NET_APERTURE_BYTES >= DVM_NET_MIN_REGION_BYTES);
+        const {
+            assert!(DVM_NET_APERTURE_BYTES >= DVM_NET_MIN_REGION_BYTES);
+        }
         assert!(DVM_NET_APERTURE_BYTES.is_power_of_two());
     }
 
@@ -3937,11 +3946,14 @@ mod tests {
             DVM_INPUT_RING_CONSUMER_WAKE_GENERATION_OFFSET % core::mem::align_of::<u64>(),
             0
         );
-        assert!(DVM_INPUT_RING_PRODUCER_OFFSET + 8 <= DVM_INPUT_RING_CONSUMER_OFFSET);
-        assert!(DVM_INPUT_RING_CONSUMER_OFFSET - DVM_INPUT_RING_PRODUCER_OFFSET >= 64);
-        assert!(
-            DVM_INPUT_RING_CONSUMER_OFFSET + 8 <= DVM_INPUT_RING_CONSUMER_WAKE_GENERATION_OFFSET
-        );
+        const {
+            assert!(DVM_INPUT_RING_PRODUCER_OFFSET + 8 <= DVM_INPUT_RING_CONSUMER_OFFSET);
+            assert!(DVM_INPUT_RING_CONSUMER_OFFSET - DVM_INPUT_RING_PRODUCER_OFFSET >= 64);
+            assert!(
+                DVM_INPUT_RING_CONSUMER_OFFSET + 8
+                    <= DVM_INPUT_RING_CONSUMER_WAKE_GENERATION_OFFSET
+            );
+        }
 
         let armed = DvmInputRingHeader {
             consumer_wake_generation: 17,
@@ -4034,7 +4046,9 @@ mod block_transport_tests {
     fn block_header_is_fixed_bounded_and_reserved_zero() {
         let header = ready_header();
         assert!(DVM_BLOCK_APERTURE_BYTES.is_power_of_two());
-        assert!(DVM_BLOCK_USED_BYTES <= DVM_BLOCK_APERTURE_BYTES);
+        const {
+            assert!(DVM_BLOCK_USED_BYTES <= DVM_BLOCK_APERTURE_BYTES);
+        }
         assert!(header.is_valid());
         assert_eq!(DvmBlockHeader::decode(&header.encode()), Some(header));
 

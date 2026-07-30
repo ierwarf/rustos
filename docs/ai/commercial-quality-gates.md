@@ -5,6 +5,10 @@ product topology. It applies to kernel, service, DVM, boot, and tool-owned
 paths alike. "Early stage", prototype status, compatibility, or a fallback
 cannot waive a gate.
 
+The source-writing rules and product boundary are defined in
+`core-engineering-contract.md`; an implementation that violates that contract
+cannot satisfy this gate merely by passing a runtime smoke test.
+
 ## Required evidence
 
 1. **Ownership and authority** — every state transition, device aperture,

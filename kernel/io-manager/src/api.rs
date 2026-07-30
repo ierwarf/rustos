@@ -1,3 +1,20 @@
+//! Public ring0 device and bootstrap-I/O substrate API.
+//!
+//! - **Owner:** `kernel-io-manager`; services reach privileged mechanism only
+//!   through capability-gated Compat brokers.
+//! - **Boundary:** Exports preserve exact aperture, consumer, generation,
+//!   range, and bootstrap allowlist admission.
+//! - **Lifecycle:** APIs expose install/publish, bounded operation,
+//!   revoke/withdraw, and reclaim without hidden provider selection.
+//! - **Concurrency:** IRQ leaves are lock-free or bounded wake-only callbacks;
+//!   policy work remains in schedulable service context.
+//! - **Failure:** Missing provider, capacity, stale generation, and malformed
+//!   transport return exact terminal errors.
+//! - **Forbidden:** No physical disk descriptor, AHCI/NVMe policy, native
+//!   input/network fallback, raw shared-memory export, or cross-crate private
+//!   reach-through.
+//! - **Evidence:** `input-delivery-lifecycle`, DVM ingress flows, and
+//!   `bootstrap-content-admission`.
 pub type ConsoleSessionHandle = crate::io::session::ConsoleSessionHandle;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -195,8 +212,8 @@ pub mod block {
         crate::io::dvm_block::arm_waiter(task_id)
     }
 
-    pub fn disarm_dvm_waiter(task_id: u64) {
-        crate::io::dvm_block::disarm_waiter(task_id);
+    pub fn disarm_dvm_waiter(task_id: u64) -> bool {
+        crate::io::dvm_block::disarm_waiter(task_id)
     }
 
     fn map_dvm_ticket(ticket: crate::io::dvm_block::DvmBlockTicket) -> DvmBlockTicket {
@@ -347,16 +364,16 @@ pub mod input {
             crate::input::wait_queue::arm_input_waiter(task_id)
         }
 
-        pub fn disarm_input_waiter(task_id: u64) {
-            crate::input::wait_queue::disarm_input_waiter(task_id);
+        pub fn disarm_input_waiter(task_id: u64) -> bool {
+            crate::input::wait_queue::disarm_input_waiter(task_id)
         }
 
         pub fn arm_inputd_ingestion_waiter(task_id: u64) -> bool {
             crate::input::wait_queue::arm_inputd_ingestion_waiter(task_id)
         }
 
-        pub fn disarm_inputd_ingestion_waiter(task_id: u64) {
-            crate::input::wait_queue::disarm_inputd_ingestion_waiter(task_id);
+        pub fn disarm_inputd_ingestion_waiter(task_id: u64) -> bool {
+            crate::input::wait_queue::disarm_inputd_ingestion_waiter(task_id)
         }
 
         pub fn withdraw_policy_consumer() {
@@ -387,22 +404,28 @@ pub mod device {
 
     pub fn ioctl_from_user(
         handle: kernel_object::api::device::DeviceHandle,
+        process_id: u64,
         process_state: &mut crate::user::process_state::UserProcessState,
         request: u64,
         arg: u64,
     ) -> Result<u64, DeviceError> {
-        crate::io::device::ioctl_from_user(handle.into(), process_state, request, arg)
+        crate::io::device::ioctl_from_user(handle.into(), process_id, process_state, request, arg)
     }
 
     /// Exact RustOS display-device ABI entry used when VFS represents
     /// `/dev/display0` as a remote device handle. Policy routing remains in
     /// devmgrd/uiserver; this is only the common user-copy/handle substrate.
     pub fn ioctl_display_from_user(
+        process_id: u64,
         process_state: &mut crate::user::process_state::UserProcessState,
         request: u64,
         arg: u64,
     ) -> Result<u64, DeviceError> {
-        crate::io::device::display::ioctl(process_state, request, arg)
+        crate::io::device::display::ioctl(process_id, process_state, request, arg)
+    }
+
+    pub fn prepare_display_ioctl(request: u64) {
+        crate::io::device::display::prepare_ioctl(request);
     }
 
     pub mod input {
@@ -422,6 +445,10 @@ pub mod tty {
 
     pub fn pending_input_len_for_session(session: ConsoleSessionHandle) -> usize {
         crate::io::tty::pending_input_len_for_session(session)
+    }
+
+    pub fn disarm_input_waiter(task_id: u64) -> bool {
+        crate::io::tty::disarm_input_waiter(task_id)
     }
 
     pub fn termios_for_session(session: ConsoleSessionHandle) -> LinuxTermios {
@@ -459,7 +486,9 @@ pub mod session {
 pub mod io {
     pub mod gui {
         pub type GuiDisplayInfo = crate::io::gui::GuiDisplayInfo;
+        pub type GuiDamageRect = crate::io::gui::GuiDamageRect;
         pub type GuiPresentOutcome = crate::io::gui::GuiPresentOutcome;
+        pub type KernelBgraFrame = crate::io::gui::KernelBgraFrame;
 
         pub fn display_info() -> Option<GuiDisplayInfo> {
             crate::io::gui::display_info()
@@ -484,25 +513,10 @@ pub mod io {
         }
 
         pub fn present_userspace_frame_rect_from_kernel_bgra8888(
-            src_ptr: *const u8,
-            width: usize,
-            height: usize,
-            stride_bytes: usize,
-            x: usize,
-            y: usize,
-            rect_width: usize,
-            rect_height: usize,
+            frame: KernelBgraFrame,
+            damage: GuiDamageRect,
         ) -> GuiPresentOutcome {
-            crate::io::gui::present_userspace_frame_rect_from_kernel_bgra8888(
-                src_ptr,
-                width,
-                height,
-                stride_bytes,
-                x,
-                y,
-                rect_width,
-                rect_height,
-            )
+            crate::io::gui::present_userspace_frame_rect_from_kernel_bgra8888(frame, damage)
         }
 
         pub fn try_present_panic_blackout() -> bool {

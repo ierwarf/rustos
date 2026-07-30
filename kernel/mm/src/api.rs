@@ -1,3 +1,18 @@
+//! Public ring0 memory-substrate API.
+//!
+//! - **Owner:** `kernel-mm`; other kernel crates use this module rather than
+//!   private paging/frame implementations.
+//! - **Boundary:** Every exported range, mapping, user-copy backing, and MMIO
+//!   operation preserves the private implementation's complete admission.
+//! - **Lifecycle:** APIs make reservation, publication, protection, unmap, and
+//!   reclaim ownership explicit.
+//! - **Concurrency:** Callers must satisfy the documented process/IRQ/lock
+//!   context; this facade adds no hidden blocking.
+//! - **Failure:** Fallible operations return without partial publication.
+//! - **Forbidden:** No raw guest pointer, policy decision, or cross-crate
+//!   private-module reach-through.
+//! - **Evidence:** `memory-map`, `kernel-memory-protection`,
+//!   `physical-frame-lifecycle`, and `user-memory-access`.
 use boot_protocol::BootInfo;
 use core::alloc::Layout;
 use x86_64::PhysAddr;

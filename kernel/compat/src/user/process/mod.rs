@@ -1,3 +1,4 @@
+use alloc::string::String;
 use x86_64::VirtAddr;
 use x86_64::structures::paging::PageTableFlags;
 
@@ -28,8 +29,7 @@ pub enum ProcessLoadError {
     InvalidElf(&'static str),
     InvalidPe(&'static str),
     InterpreterLoad {
-        path: [u8; 128],
-        path_len: usize,
+        path: String,
         error: vfs::VfsError,
     },
     AddressSpace(AddressSpaceError),
@@ -96,12 +96,7 @@ impl ProcessLoadError {
     #[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
     pub fn log_debug_details(&self) {
         match self {
-            Self::InterpreterLoad {
-                path,
-                path_len,
-                error,
-            } => {
-                let path = core::str::from_utf8(&path[..*path_len]).unwrap_or("<non-utf8>");
+            Self::InterpreterLoad { path, error } => {
                 debug::println!("failed to load ELF interpreter {}: {:?}", path, error);
             }
             Self::UnsupportedImport {
@@ -324,10 +319,12 @@ fn prepare_loaded_process_with_launch(
     mut loaded: LoadedProcessImage,
     launch: ProcessLaunchOptions<'_>,
 ) -> Result<PreparedProcessImage, ProcessLoadError> {
-    debug_assert!(USER_STACK_RESERVE_PAGES > USER_STACK_INITIAL_COMMIT_PAGES);
-    debug_assert!(
-        USER_STACK_RESERVE_PAGES - USER_STACK_INITIAL_COMMIT_PAGES >= USER_STACK_GUARD_PAGES
-    );
+    const {
+        assert!(USER_STACK_RESERVE_PAGES > USER_STACK_INITIAL_COMMIT_PAGES);
+        assert!(
+            USER_STACK_RESERVE_PAGES - USER_STACK_INITIAL_COMMIT_PAGES >= USER_STACK_GUARD_PAGES
+        );
+    }
 
     let reserve_start =
         VirtAddr::new(USER_STACK_TOP_EXCLUSIVE - USER_STACK_RESERVE_PAGES as u64 * PAGE_SIZE);

@@ -1,3 +1,20 @@
+//! Socket namespace, packet admission, queues, and deferred-reply policy.
+//!
+//! - **Owner:** `netd` owns Linux socket semantics and DVM network policy;
+//!   ring0 owns only bounded transport and fd substrate.
+//! - **Boundary:** Client envelopes, addresses, payloads, DVM frames, sender
+//!   identity, and control epochs are untrusted.
+//! - **Lifecycle:** Create/bind/connect, enqueue bounded work, detach one
+//!   deferred reply owner, complete/timeout/close, revoke on client/provider
+//!   exit, and restart with a new epoch.
+//! - **Concurrency:** No socket/pending lock is held across synchronous IPC;
+//!   every pending slot has exactly one terminal reply.
+//! - **Failure:** Queue/capacity, malformed packet, timeout, cancellation, peer
+//!   close, client death, and DVM revoke cannot poison unrelated clients.
+//! - **Forbidden:** No socket policy in ring0, unbounded queue, single-client
+//!   global stall, stale reply, or native NIC fallback.
+//! - **Evidence:** `dvm-network-ingress`, `netd-deferred-reply-lifecycle`, and
+//!   `commercial-envelope`.
 // Provider-state tests sit beside the state machine they exercise; production
 // items intentionally continue below that test-only module.
 #![cfg_attr(test, allow(clippy::items_after_test_module))]
@@ -407,7 +424,10 @@ fn enqueue_blocking_request(request: NetdIpcRequest, reply_cap: u64) -> bool {
     }
     if PENDING_BLOCKING_REQUESTS
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
-            (pending < MAX_PENDING_BLOCKING_REQUESTS).then_some(pending + 1)
+            if pending >= MAX_PENDING_BLOCKING_REQUESTS {
+                return None;
+            }
+            Some(pending + 1)
         })
         .is_err()
     {
@@ -550,7 +570,10 @@ fn take_deferred_queue<T>(locked: LockResult<MutexGuard<'_, VecDeque<T>>>) -> (V
 fn reserve_pending_slot(counter: &AtomicUsize, limit: usize) -> bool {
     counter
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
-            (pending < limit).then_some(pending + 1)
+            if pending >= limit {
+                return None;
+            }
+            Some(pending + 1)
         })
         .is_ok()
 }

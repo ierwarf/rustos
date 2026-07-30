@@ -3,6 +3,21 @@
 //! Classification is intentionally separate from address-space mutation so a
 //! fixed mapping cannot remove an existing VMA before its flags and backing
 //! descriptor have been accepted.
+//!
+//! - **Owner:** `syscalld` owns Linux mmap flag/backing classification; the
+//!   kernel memory manager owns only the admitted mapping mechanism.
+//! - **Boundary:** Protection, sharing, anonymous, and descriptor-kind fields
+//!   are mutually validated before any address-space mutation.
+//! - **Lifecycle:** Parse flags, classify the backing, produce a side-effect-free
+//!   plan, then let the caller commit or discard that plan atomically.
+//! - **Concurrency:** Planning is pure and lock-free; generation checks belong
+//!   to the later commit boundary.
+//! - **Failure:** Ambiguous flags, unsupported backing combinations, and denied
+//!   shared mappings return a typed error without changing VMAs.
+//! - **Forbidden:** No replace-before-validate, implicit device mapping,
+//!   executable fallback, or silently widened compatibility.
+//! - **Evidence:** `mm-broker`, `process-address-space`, and
+//!   `linux-syscall-offload`.
 
 pub const MAP_TYPE: u64 = 0x0f;
 pub const MAP_SHARED: u64 = 0x01;

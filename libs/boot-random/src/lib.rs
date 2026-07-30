@@ -20,31 +20,32 @@ pub fn init(boot_info: &BootInfo) -> bool {
     if !rng_seed_usable(boot_info.rng_seed) {
         return false;
     }
-    let mut master = RNG_MASTER.lock();
-    if master.is_some() {
-        return false;
-    }
-    *master = Some(ChaCha20Rng::from_seed(boot_info.rng_seed));
-    true
+    with_rng_master(|master| {
+        if master.is_some() {
+            return false;
+        }
+        *master = Some(ChaCha20Rng::from_seed(boot_info.rng_seed));
+        true
+    })
 }
 
 impl Random {
     pub fn new() -> Self {
-        let mut master = RNG_MASTER.lock();
-        #[cfg(feature = "deterministic-test-seed")]
-        if master.is_none() {
-            *master = Some(ChaCha20Rng::from_seed([
-                0x52, 0x75, 0x73, 0x74, 0x4f, 0x53, 0x2d, 0x74, 0x65, 0x73, 0x74, 0x2d, 0x6f, 0x6e,
-                0x6c, 0x79, 0x2d, 0x43, 0x53, 0x50, 0x52, 0x4e, 0x47, 0x2d, 0x73, 0x65, 0x65, 0x64,
-                0x2d, 0x76, 0x31, 0x21,
-            ]));
-        }
-        let seed = derive_child_seed(
-            master
-                .as_mut()
-                .expect("CSPRNG used before one-time boot entropy initialization"),
-        );
-        drop(master);
+        let seed = with_rng_master(|master| {
+            #[cfg(feature = "deterministic-test-seed")]
+            if master.is_none() {
+                *master = Some(ChaCha20Rng::from_seed([
+                    0x52, 0x75, 0x73, 0x74, 0x4f, 0x53, 0x2d, 0x74, 0x65, 0x73, 0x74, 0x2d, 0x6f,
+                    0x6e, 0x6c, 0x79, 0x2d, 0x43, 0x53, 0x50, 0x52, 0x4e, 0x47, 0x2d, 0x73, 0x65,
+                    0x65, 0x64, 0x2d, 0x76, 0x31, 0x21,
+                ]));
+            }
+            derive_child_seed(
+                master
+                    .as_mut()
+                    .expect("CSPRNG used before one-time boot entropy initialization"),
+            )
+        });
         Self {
             rng: ChaCha20Rng::from_seed(seed),
         }
@@ -76,6 +77,26 @@ impl Random {
         let offset = self.uniform_below(span) as i128;
 
         (min as i128 + offset) as i64
+    }
+}
+
+fn with_rng_master<R>(f: impl FnOnce(&mut Option<ChaCha20Rng>) -> R) -> R {
+    #[cfg(rustos_boot_image)]
+    {
+        // The master lock is reached from unrelated syscall/service paths.
+        // On the current BSP scheduler, allowing a timer switch while one
+        // task derives a child seed lets a higher-class task spin forever on
+        // the preempted owner. Keep this tiny 32-byte derivation IRQ-off; the
+        // spin lock still serializes future SMP callers.
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            let mut master = RNG_MASTER.lock();
+            f(&mut master)
+        })
+    }
+    #[cfg(not(rustos_boot_image))]
+    {
+        let mut master = RNG_MASTER.lock();
+        f(&mut master)
     }
 }
 

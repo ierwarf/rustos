@@ -209,8 +209,18 @@ pub(crate) fn ioctl_process_device_handle(
     request: u64,
     arg: u64,
 ) -> Result<u64, DeviceSysopError> {
+    let Some(display_target) =
+        multitask::with_process_state_by_pid_mut(process_id, |process_state| {
+            fd_targets_display(process_state, fd)
+        })
+    else {
+        return Err(DeviceSysopError::Unsupported);
+    };
+    if display_target {
+        kernel_io_manager::api::device::prepare_display_ioctl(request);
+    }
     let Some(result) = multitask::with_process_state_by_pid_mut(process_id, |process_state| {
-        ioctl_via_process_state(process_state, fd, request, arg)
+        ioctl_via_process_state(process_id, process_state, fd, request, arg)
     }) else {
         return Err(DeviceSysopError::Unsupported);
     };
@@ -227,15 +237,45 @@ pub(crate) fn ioctl_current_process_fd(
     request: u64,
     arg: u64,
 ) -> Result<u64, DeviceSysopError> {
+    let Some(process_id) = multitask::current_user_process_id() else {
+        return Err(DeviceSysopError::Unsupported);
+    };
+    let Some(display_target) =
+        multitask::with_current_user_process_state_mut(|_, _, process_state| {
+            fd_targets_display(process_state, fd)
+        })
+    else {
+        return Err(DeviceSysopError::Unsupported);
+    };
+    if display_target {
+        kernel_io_manager::api::device::prepare_display_ioctl(request);
+    }
     let Some(result) = multitask::with_current_user_process_state_mut(|_, _, process_state| {
-        ioctl_via_process_state(process_state, fd, request, arg)
+        ioctl_via_process_state(process_id, process_state, fd, request, arg)
     }) else {
         return Err(DeviceSysopError::Unsupported);
     };
     result
 }
 
+fn fd_targets_display(process_state: &UserProcessState, fd: u64) -> bool {
+    process_state
+        .handles()
+        .get_entry(fd)
+        .is_some_and(|entry| match entry.handle() {
+            KernelHandle::Device(device_handle) => {
+                device_handle.device_id() == kernel_object::api::device::DeviceId::Display
+            }
+            KernelHandle::RemoteVfs(remote) => {
+                remote.kind() == RemoteVfsHandleKind::Device
+                    && remote.device_access() == VFS_DEVICE_ACCESS_DRM_COMPAT
+            }
+            _ => false,
+        })
+}
+
 fn ioctl_via_process_state(
+    process_id: u64,
     process_state: &mut UserProcessState,
     fd: u64,
     request: u64,
@@ -249,20 +289,21 @@ fn ioctl_via_process_state(
             if !entry.rights().allows_device_ioctl() {
                 return Err(DeviceSysopError::Unsupported);
             }
-            device_ns::ioctl_from_user(*device_handle, process_state, request, arg)
+            device_ns::ioctl_from_user(*device_handle, process_id, process_state, request, arg)
                 .map_err(map_device_error)
         }
         KernelHandle::RemoteVfs(remote)
             if remote.kind() == RemoteVfsHandleKind::Device
                 && remote.device_access() == VFS_DEVICE_ACCESS_DRM_COMPAT =>
         {
-            ioctl_display_device(process_state, request, arg)
+            ioctl_display_device(process_id, process_state, request, arg)
         }
         _ => Err(DeviceSysopError::Unsupported),
     }
 }
 
 fn ioctl_display_device(
+    process_id: u64,
     process_state: &mut UserProcessState,
     request: u64,
     arg: u64,
@@ -275,8 +316,13 @@ fn ioctl_display_device(
         | device_abi::DISPLAY_IOCTL_GPU_GET_INFO
         | device_abi::DISPLAY_IOCTL_GPU_SUBMIT
         | device_abi::DISPLAY_IOCTL_GPU_QUERY_COMPLETION => {
-            kernel_io_manager::api::device::ioctl_display_from_user(process_state, request, arg)
-                .map_err(map_device_error)
+            kernel_io_manager::api::device::ioctl_display_from_user(
+                process_id,
+                process_state,
+                request,
+                arg,
+            )
+            .map_err(map_device_error)
         }
         DRM_IOCTL_VERSION => drm_ioctl_version(process_state, arg),
         DRM_IOCTL_GET_CAP => drm_ioctl_get_cap(process_state, arg),
@@ -284,7 +330,7 @@ fn ioctl_display_device(
         DRM_IOCTL_MODE_GETCONNECTOR => drm_ioctl_get_connector(process_state, arg),
         DRM_IOCTL_MODE_GETENCODER => drm_ioctl_get_encoder(process_state, arg),
         DRM_IOCTL_MODE_GETCRTC => drm_ioctl_get_crtc(process_state, arg),
-        DRM_IOCTL_MODE_CREATE_DUMB => drm_ioctl_create_dumb(process_state, arg),
+        DRM_IOCTL_MODE_CREATE_DUMB => drm_ioctl_create_dumb(process_id, process_state, arg),
         DRM_IOCTL_MODE_MAP_DUMB => drm_ioctl_map_dumb(process_state, arg),
         DRM_IOCTL_MODE_DESTROY_DUMB => drm_ioctl_destroy_dumb(process_state, arg),
         DRM_IOCTL_MODE_ADDFB2 => drm_ioctl_addfb2(process_state, arg),
@@ -445,6 +491,7 @@ fn drm_ioctl_get_crtc(
 }
 
 fn drm_ioctl_create_dumb(
+    process_id: u64,
     process_state: &mut UserProcessState,
     arg: u64,
 ) -> Result<u64, DeviceSysopError> {
@@ -463,17 +510,24 @@ fn drm_ioctl_create_dumb(
         display.generation,
     )
     .ok_or(DeviceSysopError::InvalidArgument)?;
-    let region = crate::ipc::create_shared_region(surface.mapping_len() as usize)
-        .map_err(|_| DeviceSysopError::InvalidArgument)?;
+    let region =
+        crate::ipc::create_shared_region_for_process(process_id, surface.mapping_len() as usize)
+            .map_err(|_| DeviceSysopError::InvalidArgument)?;
     surface.set_shared_region(region);
-    let handle = process_state
+    let Some(handle) = process_state
         .handles_mut()
         .install(KernelHandle::DisplaySurface(surface))
-        .ok_or(DeviceSysopError::TryAgain)?;
+    else {
+        crate::ipc::release_shared_region_descriptor(region);
+        return Err(DeviceSysopError::TryAgain);
+    };
     create.handle = u32::try_from(handle).map_err(|_| DeviceSysopError::InvalidArgument)?;
     create.pitch = surface.stride_bytes();
     create.size = surface.mapping_len();
-    write_process_struct(process_state, arg, &create)?;
+    if let Err(error) = write_process_struct(process_state, arg, &create) {
+        let _ = process_state.handles_mut().close(handle);
+        return Err(error);
+    }
     Ok(0)
 }
 

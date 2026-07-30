@@ -1,6 +1,5 @@
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HandleOwner {
-    Ipc,
     Io,
     Compat,
     Ps,
@@ -122,7 +121,6 @@ pub enum HandleRights {
     Console,
     File(FileHandleRights),
     Device(DeviceHandleRights),
-    SharedRegion(SharedRegionRights),
     Socket(SocketHandleRights),
     Epoll,
     Memfd(FileHandleRights),
@@ -135,18 +133,14 @@ impl HandleRights {
             Self::File(rights) | Self::Memfd(rights) => rights.contains(FileHandleRights::TRANSFER),
             Self::Socket(rights) => rights.contains(SocketHandleRights::TRANSFER),
             Self::Device(rights) => rights.contains(DeviceHandleRights::TRANSFER),
-            Self::SharedRegion(rights) | Self::DisplaySurface(rights) => {
-                rights.contains(SharedRegionRights::TRANSFER)
-            }
+            Self::DisplaySurface(rights) => rights.contains(SharedRegionRights::TRANSFER),
             Self::Console | Self::Epoll => false,
         }
     }
 
     pub const fn allows_shared_map(self) -> bool {
         match self {
-            Self::SharedRegion(rights) | Self::DisplaySurface(rights) => {
-                rights.contains(SharedRegionRights::MAP)
-            }
+            Self::DisplaySurface(rights) => rights.contains(SharedRegionRights::MAP),
             Self::Device(rights) => rights.contains(DeviceHandleRights::MAP),
             _ => false,
         }
@@ -156,9 +150,7 @@ impl HandleRights {
         match self {
             Self::File(rights) | Self::Memfd(rights) => rights.contains(FileHandleRights::READ),
             Self::Device(rights) => rights.contains(DeviceHandleRights::READ),
-            Self::SharedRegion(rights) | Self::DisplaySurface(rights) => {
-                rights.contains(SharedRegionRights::READ)
-            }
+            Self::DisplaySurface(rights) => rights.contains(SharedRegionRights::READ),
             _ => false,
         }
     }
@@ -167,9 +159,7 @@ impl HandleRights {
         match self {
             Self::File(rights) | Self::Memfd(rights) => rights.contains(FileHandleRights::WRITE),
             Self::Device(rights) => rights.contains(DeviceHandleRights::WRITE),
-            Self::SharedRegion(rights) | Self::DisplaySurface(rights) => {
-                rights.contains(SharedRegionRights::WRITE)
-            }
+            Self::DisplaySurface(rights) => rights.contains(SharedRegionRights::WRITE),
             _ => false,
         }
     }

@@ -273,6 +273,19 @@ if rg -n 'visit_user_read_spans|source_ptr' \
     exit 1
 fi
 
+heap_tracker=kernel/mm/src/memory/heap.rs
+record_alloc_body="$(
+    sed -n '/^    fn record_alloc(/,/^    fn begin_dealloc(/p' "$heap_tracker"
+)"
+grep -Fq 'self.insert_active(ptr, layout.size(), layout.align())' <<<"$record_alloc_body" || {
+    echo "kernel allocation hot path lost its direct active-table insertion" >&2
+    exit 1
+}
+if grep -Eq 'freed|quarantine|is_recently_freed|for |while ' <<<"$record_alloc_body"; then
+    echo "kernel allocation hot path regained a quarantine scan" >&2
+    exit 1
+fi
+
 wayclick=apps/wayclick/src/main.rs
 rg -Fq '.include_cursor(self.cursor_x, self.cursor_y)' "$wayclick" || {
     echo "WayClick pointer motion lost its bounded damage accumulator" >&2
@@ -304,17 +317,23 @@ rg -Fq 'const MAX_SLOW_SERVICE_CALL_LOGS_PER_SECOND: usize = 1;' \
     echo "typed service IPC slow logging is no longer rate-bounded" >&2
     exit 1
 }
-rg -Fq 'linux_clock_nanosleep_admission_cached' \
-    kernel/compat/src/user/syscall/linux/syscalld_ops.rs || {
-    echo "Linux time policy regained per-sleep synchronous syscalld IPC" >&2
+time_hot_path="$(
+    sed -n '/^pub fn syscall_linux_nanosleep(/,/^fn rtc_datetime_to_unix_seconds(/p' \
+        kernel/compat/src/user/syscall/linux/service_ops/process_time.rs
+)"
+grep -Fq 'validate_time_hot_path_locally' <<<"$time_hot_path" || {
+    echo "Linux time hot path lost local fixed-envelope admission" >&2
     exit 1
 }
-rg -Fq 'IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY' \
-    kernel/compat/src/user/syscall/linux/syscalld_ops.rs || {
-    echo "syscalld receive backoff can again synchronously call its own endpoint" >&2
+if grep -Eq 'request_syscalld|with_current_user_process_state(_mut)?' <<<"$time_hot_path"; then
+    echo "Linux time hot path regained synchronous policy or process-state latency" >&2
     exit 1
-}
-
+fi
+if rg -Fq 'linux_clock_nanosleep_admission_cached' \
+    kernel/compat/src/user/syscall/linux/syscalld_ops.rs; then
+    echo "retired per-process Linux time admission cache was reintroduced" >&2
+    exit 1
+fi
 storaged_block=services/storaged/src/block.rs
 rg -Fq 'const READ_AHEAD_IN_FLIGHT_LIMIT: usize = READ_CACHE_WINDOW_LIMIT;' \
     "$storaged_block" || {
@@ -371,10 +390,11 @@ rg -Fq 'write_current_user_bytes(args.out_records_ptr, bytes)' \
     exit 1
 }
 for witness in \
-    'ingestion_waiting: AtomicBool' \
+    'handoff: Mutex<InputQueueHandoff>' \
+    'handoff_changed: Condvar' \
     'lock_input_queue_for_ingestion' \
-    'queue.queue.try_lock()' \
-    'if !queue.ingestion_waiting.load(Ordering::Acquire)'; do
+    'queue.handoff_changed.wait(handoff)' \
+    'if !handoff.ingestion_waiting'; do
     rg -Fq "$witness" services/inputd/src/main.rs || {
         echo "inputd lost its worker-first queue handoff: $witness" >&2
         exit 1

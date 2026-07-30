@@ -1,3 +1,19 @@
+//! Runtime launch and strict scheduling-class admission.
+//!
+//! - **Owner:** `runtimed` owns app/session launch policy; loaderd/procd own
+//!   executable and process policy and `kernel-ps` owns scheduling mechanism.
+//! - **Boundary:** Launch manifests, executable names, caller credentials,
+//!   environment, and requested scheduling class are untrusted.
+//! - **Lifecycle:** Resolve a signed declaration, prepare/launch exact child,
+//!   admit optional class once, publish session ownership, or retire failure.
+//! - **Concurrency:** Launch state is bounded and no mutable registry lock is
+//!   held across loader calls.
+//! - **Failure:** Unknown program, foreign caller, capacity, timeout, loader
+//!   restart, and activation failure clean up the exact suspended child.
+//! - **Forbidden:** No caller-selected strict priority, pathname bypass,
+//!   implicit fallback program, or scheduler policy in ring0.
+//! - **Evidence:** `scheduler-dispatch`, `deferred-process-activation`, and
+//!   `runtime-control-ingress`.
 use std::ffi::CString;
 use std::fs;
 use std::mem::size_of;

@@ -93,8 +93,10 @@ impl VisualUpdate {
     }
 
     pub(crate) fn partial(rect: canvas::Rect) -> Self {
-        let mut update = Self::default();
-        update.scene_dirty = !rect.is_empty();
+        let mut update = Self {
+            scene_dirty: !rect.is_empty(),
+            ..Self::default()
+        };
         update.add_partial_rect(rect);
         update
     }

@@ -1,6 +1,6 @@
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
@@ -33,9 +33,29 @@ const MAX_WAYLAND_POINTER_FLUSH_EVENTS: u64 = 16;
 
 pub(crate) struct InputReader {
     receiver: Receiver<InputEvent>,
-    wake_receiver: Receiver<()>,
-    wake_sender: SyncSender<()>,
+    wake_sender: UiWakeSender,
+    wake_generation: Arc<AtomicU64>,
+    observed_wake_generation: AtomicU64,
     stats: Arc<InputReaderStats>,
+}
+
+/// Coalesced UI-loop readiness publisher.
+///
+/// The generation is the authoritative readiness edge. The capacity-one
+/// generation is the scheduler-independent notification token. The main loop
+/// samples it around a bounded compositor deadline; repeated publications may
+/// coalesce but can never erase an input or Wayland edge.
+#[derive(Clone)]
+pub(crate) struct UiWakeSender {
+    generation: Arc<AtomicU64>,
+    thread: thread::Thread,
+}
+
+impl UiWakeSender {
+    pub(crate) fn signal(&self) {
+        self.generation.fetch_add(1, Ordering::Release);
+        self.thread.unpark();
+    }
 }
 
 struct InputReaderStats {
@@ -78,29 +98,53 @@ impl InputReader {
         self.receiver.try_recv()
     }
 
-    fn wait_for_wake_until(&self, deadline: Instant) {
-        match self.wake_receiver.try_recv() {
-            Ok(()) | Err(TryRecvError::Disconnected) => return,
-            Err(TryRecvError::Empty) => {}
+    fn wait_for_wake_until(&self, deadline: Instant, mut trace: impl FnMut(InputWaitPhase)) {
+        trace(InputWaitPhase::CheckGeneration);
+        let published_generation = self.wake_generation.load(Ordering::Acquire);
+        let observed_generation = self
+            .observed_wake_generation
+            .swap(published_generation, Ordering::AcqRel);
+        if published_generation != observed_generation {
+            return;
         }
+        trace(InputWaitPhase::ComputeDeadline);
         let Some(duration) = deadline.checked_duration_since(Instant::now()) else {
             return;
         };
         if duration.is_zero() {
             return;
         }
-        match self.wake_receiver.recv_timeout(duration) {
-            Ok(()) | Err(RecvTimeoutError::Disconnected) | Err(RecvTimeoutError::Timeout) => {}
+        trace(InputWaitPhase::RecheckGeneration);
+        let rechecked_generation = self.wake_generation.load(Ordering::Acquire);
+        if rechecked_generation != published_generation {
+            self.observed_wake_generation
+                .store(rechecked_generation, Ordering::Release);
+            return;
         }
+        // The generation closes the check/arm race; the parker is only a
+        // coalescing notification mechanism. Its timed deadline remains an
+        // independent recovery authority even when publications coalesce.
+        trace(InputWaitPhase::Park);
+        thread::park_timeout(duration);
+        trace(InputWaitPhase::Returned);
     }
 
-    pub(crate) fn wake_sender(&self) -> SyncSender<()> {
+    pub(crate) fn wake_sender(&self) -> UiWakeSender {
         self.wake_sender.clone()
     }
 
     pub(crate) fn snapshot(&self) -> InputReaderSnapshot {
         self.stats.snapshot()
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InputWaitPhase {
+    CheckGeneration,
+    ComputeDeadline,
+    RecheckGeneration,
+    Park,
+    Returned,
 }
 
 impl InputReaderStats {
@@ -196,8 +240,12 @@ fn wait_for_next_input_probe(stats: &InputReaderStats, deadline: &mut Instant) {
 
 pub(crate) fn start_input_reader(input_fds: Vec<OwnedFd>) -> InputReader {
     let (sender, receiver) = mpsc::sync_channel::<InputEvent>(INPUT_READER_QUEUE_CAPACITY);
-    let (wake_sender, wake_receiver) = mpsc::sync_channel::<()>(1);
-    let shared_wake_sender = wake_sender.clone();
+    let wake_generation = Arc::new(AtomicU64::new(0));
+    let shared_wake_sender = UiWakeSender {
+        generation: Arc::clone(&wake_generation),
+        thread: thread::current(),
+    };
+    let reader_wake_sender = shared_wake_sender.clone();
     let stats = Arc::new(InputReaderStats::new());
     let reader_stats = Arc::clone(&stats);
     thread::Builder::new()
@@ -280,7 +328,7 @@ pub(crate) fn start_input_reader(input_fds: Vec<OwnedFd>) -> InputReader {
                     reader_stats
                         .last_delivery_ms
                         .store(reader_stats.elapsed_ms(), Ordering::Release);
-                    let _ = wake_sender.try_send(());
+                    reader_wake_sender.signal();
                 }
             }
         })
@@ -336,8 +384,9 @@ pub(crate) fn start_input_reader(input_fds: Vec<OwnedFd>) -> InputReader {
 
     InputReader {
         receiver,
-        wake_receiver,
         wake_sender: shared_wake_sender,
+        wake_generation,
+        observed_wake_generation: AtomicU64::new(0),
         stats,
     }
 }
@@ -609,20 +658,28 @@ pub(crate) fn sleep_until(deadline: Instant) {
     }
 }
 
-pub(crate) fn sleep_until_input_or(events: &InputReader, deadline: Instant) {
-    events.wait_for_wake_until(deadline);
+pub(crate) fn sleep_until_input_or(
+    events: &InputReader,
+    deadline: Instant,
+    trace: impl FnMut(InputWaitPhase),
+) {
+    events.wait_for_wake_until(deadline, trace);
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        next_input_probe_deadline, InputReaderBatchCoalescer, INPUT_EVENT_BATCH,
-        INPUT_READER_PROBE_INTERVAL,
+        next_input_probe_deadline, InputReader, InputReaderBatchCoalescer, InputReaderStats,
+        UiWakeSender, INPUT_EVENT_BATCH, INPUT_READER_PROBE_INTERVAL,
     };
     use crate::sys::{
         InputEvent, INPUT_ACTION_NONE, INPUT_ACTION_PRESSED, INPUT_KIND_KEYBOARD,
         INPUT_KIND_POINTER_MOTION, INPUT_KIND_POINTER_POSITION,
     };
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{mpsc, Arc};
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     fn event(kind: u16, value0: i32, value1: i32) -> InputEvent {
         InputEvent {
@@ -646,6 +703,42 @@ mod tests {
             modifiers: 0,
             text: b'a' as u32,
         }
+    }
+
+    #[test]
+    fn prequeued_wake_never_commits_a_timeout_sleep() {
+        let (_event_sender, event_receiver) = mpsc::sync_channel(1);
+        let wake_generation = Arc::new(AtomicU64::new(0));
+        let wake_sender = UiWakeSender {
+            generation: Arc::clone(&wake_generation),
+            thread: thread::current(),
+        };
+        wake_sender.signal();
+        let reader = InputReader {
+            receiver: event_receiver,
+            wake_sender,
+            wake_generation,
+            observed_wake_generation: AtomicU64::new(0),
+            stats: Arc::new(InputReaderStats::new()),
+        };
+
+        let started = Instant::now();
+        reader.wait_for_wake_until(started + Duration::from_secs(1), |_| {});
+        assert!(started.elapsed() < Duration::from_millis(50));
+    }
+
+    #[test]
+    fn coalesced_notification_tokens_still_advance_readiness_generation() {
+        let generation = Arc::new(AtomicU64::new(0));
+        let wake = UiWakeSender {
+            generation: Arc::clone(&generation),
+            thread: thread::current(),
+        };
+
+        wake.signal();
+        wake.signal();
+
+        assert_eq!(generation.load(Ordering::Acquire), 2);
     }
 
     #[test]

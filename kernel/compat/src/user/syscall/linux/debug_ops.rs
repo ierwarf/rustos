@@ -59,6 +59,10 @@ pub(super) fn linux_errno(errno: i64) -> u64 {
     (-errno) as u64
 }
 
+#[allow(
+    clippy::items_after_test_module,
+    reason = "the closed-vocabulary contract test is kept adjacent to the product milestone decoder"
+)]
 #[cfg(test)]
 mod product_milestone_tests {
     use super::*;
@@ -78,6 +82,7 @@ mod product_milestone_tests {
     }
 }
 
+// DIAGNOSTIC: Secondary syscall tracing is present only in diagnostic kernels.
 #[cfg_attr(not(rustos_debug_print_enabled), allow(dead_code, unused_variables))]
 pub(super) fn debug_log_secondary_linux_syscall(frame: &SyscallFrame) {
     if !debug::enabled!(compat, debug) {
@@ -131,6 +136,7 @@ pub(super) fn debug_log_secondary_linux_syscall(frame: &SyscallFrame) {
     }
 }
 
+// DIAGNOSTIC: User-path rendering is compiled only with syscall diagnostics.
 #[cfg_attr(not(rustos_debug_print_enabled), allow(dead_code))]
 pub(super) fn debug_user_path(path_ptr: u64) -> String {
     match usermem::read_current_user_c_string(path_ptr, 256) {

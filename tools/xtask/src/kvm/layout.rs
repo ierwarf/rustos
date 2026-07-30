@@ -131,6 +131,7 @@ fn prepare_layout(config: &Config, options: &SmokeOptions) -> Result<KvmLayout> 
 
     Ok(KvmLayout {
         run_dir,
+        guest_cid: guest_cid_for_process(std::process::id()),
         runtime_disk,
         debugcon_log,
         rustos_serial_log,
@@ -279,6 +280,69 @@ fn create_dvm_block_aperture(path: &Path, disk: &Path, signing_key_path: &Path) 
         .with_context(|| format!("sync DVM block aperture {}", path.display()))?;
     fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     Ok(())
+}
+
+/// Publish a new L0-authorized block transport epoch without replacing the
+/// backing file while RustOS still maps it.
+///
+/// The caller must first prove that the DVM peer has exited. RustOS may retain
+/// the mapping, but it will reject the changed generation, revoke every
+/// predecessor request, and admit this zero-cursor epoch only after verifying
+/// its signature. This is the storage equivalent of check-revoke-rebind; it
+/// never teaches either guest to accept the predecessor's mutable ring state.
+fn rotate_dvm_block_epoch(
+    path: &Path,
+    disk: &Path,
+    signing_key_path: &Path,
+) -> Result<u64> {
+    let disk_bytes = fs::metadata(disk)
+        .with_context(|| format!("inspect private storage-DVM disk {}", disk.display()))?
+        .len();
+    if disk_bytes == 0 || !disk_bytes.is_multiple_of(512) {
+        bail!("private storage-DVM disk must remain non-empty and 512-byte aligned");
+    }
+    let signing_key = crate::storage_epoch::load_signing_key(signing_key_path)?;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("open live DVM block aperture {}", path.display()))?;
+    let mut bytes = [0_u8; DVM_BLOCK_HEADER_RECORD_BYTES];
+    file.read_exact(&mut bytes)
+        .with_context(|| format!("read live DVM block header {}", path.display()))?;
+    let predecessor = DvmBlockHeader::decode(&bytes)
+        .context("live DVM block aperture contains an invalid predecessor header")?;
+    let expected_signature = crate::storage_epoch::sign_epoch(
+        &signing_key,
+        predecessor.with_epoch_signature([0; 64]),
+    )
+    .epoch_signature;
+    if predecessor.epoch_signature != expected_signature {
+        bail!("refusing to rotate a DVM block epoch not authorized by this L0");
+    }
+    if predecessor.capacity_sectors != disk_bytes / 512 {
+        bail!("live DVM block epoch geometry diverged from its private backing disk");
+    }
+    let generation = predecessor
+        .generation
+        .checked_add(1)
+        .context("DVM block transport generation exhausted")?;
+    let successor = crate::storage_epoch::sign_epoch(
+        &signing_key,
+        DvmBlockHeader::new(
+            generation,
+            predecessor.capacity_sectors,
+            predecessor.logical_block_size,
+            predecessor.physical_block_size,
+            predecessor.features,
+        ),
+    );
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(&successor.encode())
+        .with_context(|| format!("publish successor DVM block header {}", path.display()))?;
+    file.sync_data()
+        .with_context(|| format!("sync successor DVM block header {}", path.display()))?;
+    Ok(generation)
 }
 
 /// Allocate the production GUI-DVM three-surface pool for the KVM topology.
@@ -1039,6 +1103,7 @@ fn require_vhost_vsock() -> Result<()> {
 fn start_dvm_input_relay(
     config: &Config,
     timeout: Duration,
+    guest_cid: u32,
     input_doorbell: PathBuf,
     input_ring: PathBuf,
     control_secret_path: PathBuf,
@@ -1047,7 +1112,7 @@ fn start_dvm_input_relay(
     let contract_path = dvm_dir(config).join(DVM_CONTROL_CONTRACT);
     let contract = HostControlContract::from_env_file(&contract_path)?;
     let control_secret = ControlSecret::from_hex_file(&control_secret_path)?;
-    let listener = HostControlListener::bind(DVM_GUEST_CID, contract, control_secret)?;
+    let listener = HostControlListener::bind(guest_cid, contract, control_secret)?;
     // Preserve both the one-time readiness proof and a terminal relay error.
     // A one-slot channel can otherwise drop an error that races immediately
     // after readiness, turning a broken input stream into an unrelated timeout.
@@ -1077,6 +1142,7 @@ fn start_dvm_input_relay(
 
 fn start_dvm_input_relay_unbounded(
     config: &Config,
+    guest_cid: u32,
     input_doorbell: PathBuf,
     input_ring: PathBuf,
     control_secret_path: PathBuf,
@@ -1085,7 +1151,7 @@ fn start_dvm_input_relay_unbounded(
     let contract_path = dvm_dir(config).join(DVM_CONTROL_CONTRACT);
     let contract = HostControlContract::from_env_file(&contract_path)?;
     let control_secret = ControlSecret::from_hex_file(&control_secret_path)?;
-    let listener = HostControlListener::bind(DVM_GUEST_CID, contract, control_secret)?;
+    let listener = HostControlListener::bind(guest_cid, contract, control_secret)?;
     thread::spawn(move || {
         while !gate.load(Ordering::Acquire) {
             thread::sleep(Duration::from_millis(1));

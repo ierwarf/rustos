@@ -10,6 +10,7 @@ dvm-volume-io/DvmVolumeIo	temporal	intentional-terminal	DVM request completes or
 dvm-read-cache/DvmReadCache	temporal	intentional-terminal	cache request serves exact live data, rejects stale generation, or clears on mutation/restart	120	900	exhaustive	no	no	no
 remote-file-mapping/RemoteFileMapping	safety	intentional-terminal	exact file bytes commit or the mapping aborts without fallback or zero fill	120	900	exhaustive	no	no	no
 syscall-simd-lifecycle/SyscallSimdLifecycle	safety	intentional-terminal	syscall return restores the entering task image or remains blocked	120	900	exhaustive	no	no	no
+syscall-scheduler-continuation/SyscallSchedulerContinuation	safety	check	explicit returned or retired terminal stutter preserves deadlock checking	120	900	exhaustive	no	no	no
 pci-bar-discovery/PciBarDiscovery	safety	intentional-terminal	BAR discovery publishes one restored valid resource or rejects it	120	900	exhaustive	no	no	no
 physical-frame-lifecycle/PhysicalFrameLifecycle	safety	check	explicit all-reserved terminal stutter preserves deadlock checking	120	900	exhaustive	no	no	no
 clocksource-deadline/ClocksourceDeadline	temporal	intentional-terminal	retired or released waits are terminal	120	900	exhaustive	no	no	no
@@ -50,7 +51,7 @@ endpoint-registry/EndpointRegistry	temporal	intentional-terminal	endpoint wait m
 exception-retirement-lifecycle/ExceptionRetirementLifecycle	temporal	intentional-terminal	exception outcome is terminal	120	900	exhaustive	no	no	no
 exec-ticket/ExecTicket	safety	intentional-terminal	ticket outcome is terminal	120	900	exhaustive+simulate	yes	no	no
 filesystem-content-integrity/FilesystemContentIntegrity	temporal	intentional-terminal	verified read decision is terminal	120	900	exhaustive	no	no	no
-futex-waiter-lifecycle/FutexWaiterLifecycle	safety	intentional-terminal	waiter wake timeout or exit is terminal	30	120	exhaustive	no	no	no
+futex-waiter-lifecycle/FutexWaiterLifecycle	temporal	intentional-terminal	waiter wake timeout or retirement cleanup is terminal	30	120	exhaustive	no	no	no
 gui-dvm-install/GuiDvmInstall	temporal	intentional-terminal	install decision is one-shot	120	900	exhaustive	no	no	no
 gui-dvm-pixel-authority/GuiDvmPixelAuthority	safety	intentional-terminal	pixel authority epoch may revoke	120	900	exhaustive	no	no	no
 gui-dvm-surface/GuiDvmSurface	temporal	intentional-terminal	surface epoch may revoke	120	900	exhaustive	no	no	no
@@ -61,6 +62,7 @@ ipc-handle-transfer/IpcHandleTransfer	safety	intentional-terminal	transfer outco
 ipc-priority-inheritance/IpcPriorityInheritance	safety	intentional-terminal	IPC call may resolve or cancel	120	900	exhaustive	no	no	no
 ipc-reply-deadline/IpcReplyDeadline	temporal	intentional-terminal	IPC wait outcome is terminal	120	900	exhaustive	no	no	no
 ivshmem-pairing/IvshmemPairing	temporal	intentional-terminal	peer pairing may disconnect	120	900	exhaustive	no	no	no
+kernel-resource-accounting/KernelResourceAccounting	temporal	intentional-terminal	deferred backing reclaim eventually returns exact owner quota	30	120	exhaustive	no	no	no
 memfd-seal-lifecycle/MemfdSealLifecycle	safety	intentional-terminal	sealed object may retain stable mappings	30	120	exhaustive	no	no	no
 msi-vector-lifecycle/MsiVectorLifecycle	safety	intentional-terminal	failed vector leases revoke before bounded committed pool reuse	30	120	exhaustive	no	no	no
 netd-deferred-reply/NetdDeferredReply	temporal	intentional-terminal	deferred request resolves or is rejected	30	120	exhaustive	no	no	no
@@ -74,6 +76,7 @@ post-init-supervisor-recovery/PostInitSupervisorRecovery	temporal	intentional-te
 proc-broker-session/ProcBrokerSession	safety	intentional-terminal	prepare session outcome is terminal	120	900	exhaustive	no	no	no
 process-address-space-lifetime/ProcessAddressSpaceLifetime	temporal	intentional-terminal	process state may exit and reclaim	30	120	exhaustive	no	no	no
 process-signal-delivery/ProcessSignalDelivery	safety	intentional-terminal	signal disposition may terminate the process	30	120	exhaustive	no	no	no
+sigchld-notification/SigchldNotification	safety	check	toggle and queue actions keep the coalescing protocol live	30	120	exhaustive	no	no	no
 rootd-bootstrap/RootdBootstrap	temporal	intentional-terminal	bootstrap outcome is terminal	120	900	exhaustive	no	no	yes
 service-bootstrap-lifecycle/ServiceBootstrapLifecycle	temporal	intentional-terminal	service entry or dependency admission reaches an exact terminal outcome	120	900	exhaustive	no	no	no
 service-heap-lifecycle/ServiceHeapLifecycle	safety	check	explicit terminal allocation-failure stutter preserves deadlock checking	30	120	exhaustive	no	no	no
@@ -88,6 +91,7 @@ trusted-ui-boundary/TrustedUiBoundary	safety	intentional-terminal	prompt authori
 zero-trust-service-flow/ZeroTrustServiceFlow	temporal	intentional-terminal	request may be rejected revoked timed out or admitted	120	900	exhaustive	no	no	no
 userspace-wait-set/UserspaceWaitSet	temporal	check	explicit terminal stutter preserves deadlock checking	120	900	exhaustive	yes	yes	no
 ui-frame-budget/UiFrameBudget	temporal	intentional-terminal	bounded frame epoch may stop	120	900	exhaustive	no	no	yes
+ui-main-loop-wakeup/UiMainLoopWakeup	temporal	check	explicit terminal stutter preserves deadlock checking	120	900	exhaustive	no	no	no
 ui-input-motion/UiInputMotion	temporal	intentional-terminal	bounded motion trace may stop	120	900	exhaustive	no	no	no
 vfio-release-authorization/VfioReleaseAuthorization	safety	intentional-terminal	release decision is terminal	120	900	exhaustive	no	no	no
 wayland-accept-isolation/WaylandAcceptIsolation	temporal	intentional-terminal	accept decision is terminal	120	900	exhaustive	no	no	no

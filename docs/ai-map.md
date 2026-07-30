@@ -28,6 +28,9 @@ output outside the cached unit.
 - `docs/ai/contracts-abi.md` — IPC service IDs, broker syscalls, service routing.
 - `docs/ai/commercial-quality-gates.md` — non-negotiable completion and
   retirement gates for enabled product topologies.
+- `docs/ai/core-engineering-contract.md` — product intent plus mandatory
+  lifecycle, concurrency, ABI, comment, refactoring, and review rules for all
+  Rust source.
 - `docs/ai/physical-gpu-status.md` — current physical GPU evidence boundary,
   remaining generic userspace readiness ABI, and safe continuation rules.
 - `docs/ai/performance-hardening.md` — boot/runtime bottleneck and cleanup runbook.

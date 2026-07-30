@@ -1,4 +1,23 @@
+//! Bounded GPU/DVM provider admission, submission, completion, and revoke.
+//!
+//! - **Owner:** `uiserver` owns scene/frame policy; the DVM owns driver/GPU
+//!   execution and ring0 exposes fixed address-free substrate.
+//! - **Boundary:** Provider descriptors, surface generations, damage, command
+//!   batches, acquire/completion/present fences, and timings are untrusted.
+//! - **Lifecycle:** Prime provider, admit exact context/slot, submit bounded
+//!   frame, accept exact completion, present/release, timeout/revoke epoch, and
+//!   re-prime before new admission.
+//! - **Concurrency:** UI thread never blocks on late allocation or unbounded
+//!   fence work; old and new provider epochs cannot share authority.
+//! - **Failure:** Prime/frame timeout, malformed completion, device loss,
+//!   restart, stale fence, and slot mismatch retain the last valid front or
+//!   revoke explicitly.
+//! - **Forbidden:** No CPU-render success fallback, client shader/raw command,
+//!   address-bearing submit, clear-only prime, or stale completion revival.
+//! - **Evidence:** `dvm-display-ingress`, `gpu-frame-lifecycle`, and
+//!   `commercial-product-boot`.
 use core::mem::size_of;
+use std::boxed::Box;
 use std::collections::VecDeque;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -33,6 +52,10 @@ use crate::sys::{
 const GPU_READY_RETRY: Duration = Duration::from_millis(50);
 const GPU_READY_TIMEOUT: Duration = Duration::from_secs(20);
 const GPU_FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
+// An idle desktop may have no completion syscall to drain the kernel's
+// wake-only DVM offline IRQ. Probe the descriptor at a bounded low rate so
+// process replacement is detected without adding one syscall to every frame.
+const GPU_PROVIDER_HEALTH_INTERVAL: Duration = Duration::from_millis(100);
 const GPU_COMPLETION_TIMEOUT: Duration = Duration::from_millis(50);
 const GPU_COMPLETION_POLL: Duration = Duration::from_micros(100);
 const GPU_SLOW_SUBMIT_THRESHOLD: Duration = Duration::from_millis(8);
@@ -120,6 +143,7 @@ pub(crate) struct GpuCompositor {
     pending: Vec<PendingGpuFrame>,
     active: bool,
     activation_deadline: Instant,
+    next_health_probe: Instant,
     next_submission_at: Instant,
     scene_wait_logged: bool,
 }
@@ -138,7 +162,7 @@ pub(crate) enum GpuCompositorRuntime {
         next_probe: Instant,
         initialization: Option<Receiver<GpuInitializationResult>>,
     },
-    Active(GpuCompositor),
+    Active(Box<GpuCompositor>),
 }
 
 impl GpuCompositorRuntime {
@@ -166,15 +190,34 @@ impl GpuCompositorRuntime {
     ) -> Result<bool, i32> {
         match self {
             Self::SoftwareFallback => Ok(false),
-            Self::Active(compositor) => match compositor.poll_completions() {
-                Ok(()) => Ok(false),
-                Err(ENODEV) => {
-                    debug_line("uiserver: DVM GPU compositor offline; bounded recovery started");
-                    *self = Self::waiting(Instant::now());
-                    Ok(false)
+            Self::Active(compositor) => {
+                let now = Instant::now();
+                if now >= compositor.next_health_probe {
+                    compositor.next_health_probe = now + GPU_PROVIDER_HEALTH_INTERVAL;
+                    let current_display = display_get_info(display_fd)?;
+                    if !same_display_contract(*display, current_display) {
+                        return Err(ESTALE);
+                    }
+                    if gpu_provider_admission(current_display) != GpuProviderAdmission::Ready {
+                        debug_line(
+                            "uiserver: DVM GPU provider lease withdrawn; bounded recovery started",
+                        );
+                        *self = Self::waiting(now);
+                        return Ok(false);
+                    }
                 }
-                Err(err) => Err(err),
-            },
+                match compositor.poll_completions() {
+                    Ok(()) => Ok(false),
+                    Err(ENODEV) => {
+                        debug_line(
+                            "uiserver: DVM GPU compositor offline; bounded recovery started",
+                        );
+                        *self = Self::waiting(Instant::now());
+                        Ok(false)
+                    }
+                    Err(err) => Err(err),
+                }
+            }
             Self::Waiting {
                 deadline,
                 next_probe,
@@ -192,7 +235,7 @@ impl GpuCompositorRuntime {
                                 return Err(ESTALE);
                             }
                             *display = initialized.display;
-                            *self = Self::Active(initialized.compositor);
+                            *self = Self::Active(Box::new(initialized.compositor));
                             debug_line(
                                 "uiserver: GPU atlas initialization completed off UI thread",
                             );
@@ -389,6 +432,7 @@ impl GpuCompositor {
                 pending: Vec::with_capacity(info.slot_count as usize),
                 active: false,
                 activation_deadline: Instant::now() + GPU_FIRST_FRAME_TIMEOUT,
+                next_health_probe: Instant::now() + GPU_PROVIDER_HEALTH_INTERVAL,
                 next_submission_at: Instant::now(),
                 scene_wait_logged: false,
             },
@@ -416,15 +460,16 @@ impl GpuCompositor {
         let current_scene_signature = gpu_scene_reuse_signature(state);
         let mut full_rebuild = !self.active
             || (scene_dirty && current_scene_signature != self.retained_scene_signature);
-        if scene_dirty && !full_rebuild {
-            if !update_gpu_layer_destinations(
+        if scene_dirty
+            && !full_rebuild
+            && !update_gpu_layer_destinations(
                 state,
                 self.layers.as_mut_slice(),
                 self.wayland_bindings.as_slice(),
                 self.console_bindings.as_slice(),
-            ) {
-                full_rebuild = true;
-            }
+            )
+        {
+            full_rebuild = true;
         }
         if scene_dirty && !full_rebuild {
             match update_wayland_gpu_textures(
@@ -756,6 +801,13 @@ impl GpuCompositor {
             return Ok(false);
         };
         loop {
+            let now = Instant::now();
+            let timed_out = gpu_completion_timed_out(
+                frame.submitted_at,
+                self.activation_deadline,
+                self.active,
+                now,
+            );
             match display_gpu_query_completion(self.display_fd, frame.surface_handle) {
                 Ok(query) => {
                     let completion =
@@ -769,13 +821,10 @@ impl GpuCompositor {
                     self.pending.remove(0);
                     return Ok(true);
                 }
-                Err(EAGAIN)
-                    if !blocking
-                        && !gpu_completion_timed_out(frame.submitted_at, Instant::now()) =>
-                {
+                Err(EAGAIN) if !blocking && !timed_out => {
                     return Ok(false);
                 }
-                Err(EAGAIN) if !gpu_completion_timed_out(frame.submitted_at, Instant::now()) => {
+                Err(EAGAIN) if !timed_out => {
                     thread::sleep(GPU_COMPLETION_POLL);
                 }
                 Err(EAGAIN) => return Err(ETIMEDOUT),
@@ -785,8 +834,21 @@ impl GpuCompositor {
     }
 }
 
-fn gpu_completion_timed_out(submitted_at: Instant, now: Instant) -> bool {
-    now.saturating_duration_since(submitted_at) >= GPU_COMPLETION_TIMEOUT
+fn gpu_completion_timed_out(
+    submitted_at: Instant,
+    activation_deadline: Instant,
+    active: bool,
+    now: Instant,
+) -> bool {
+    if active {
+        now.saturating_duration_since(submitted_at) >= GPU_COMPLETION_TIMEOUT
+    } else {
+        // Initial provider activation already has a product-bounded deadline.
+        // Reusing the steady-state 50 ms recovery limit here made a healthy
+        // first frame fail nondeterministically under host scheduling load,
+        // despite the explicit five-second first-frame contract.
+        now >= activation_deadline
+    }
 }
 
 fn next_frame_deadline(mut deadline: Instant, now: Instant) -> Instant {
@@ -1079,272 +1141,5 @@ fn gpu_scene_errno(_error: GpuSceneError) -> i32 {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{
-        copy_atlas_damage_to_slot, difference_bounds, gpu_completion_timed_out,
-        gpu_provider_admission, next_frame_deadline, reconstruction_damage_within_budget,
-        snapshot_damage_for_slot, AtlasDamageEpoch, DvmGpuAtlasDamage, GpuProviderAdmission, Rect,
-        DISPLAY_INFO_FLAG_DVM_SCANOUT, DISPLAY_INFO_FLAG_GPU_COMPOSITOR, GPU_COMPLETION_TIMEOUT,
-        GPU_FRAME_INTERVAL,
-    };
-    use crate::sys::DisplayInfo;
-    use std::collections::VecDeque;
-    use std::time::{Duration, Instant};
-
-    fn display_with_flags(flags: u32) -> DisplayInfo {
-        DisplayInfo {
-            width: 1600,
-            height: 900,
-            stride_bytes: 7168,
-            bytes_per_pixel: 4,
-            pixel_format: 1,
-            flags,
-            generation: 1,
-        }
-    }
-
-    #[test]
-    fn dvm_gpu_admission_waits_without_hiding_behind_software() {
-        assert_eq!(
-            gpu_provider_admission(display_with_flags(0)),
-            GpuProviderAdmission::SoftwareFallback
-        );
-        assert_eq!(
-            gpu_provider_admission(display_with_flags(DISPLAY_INFO_FLAG_DVM_SCANOUT)),
-            GpuProviderAdmission::WaitForDvmGpu
-        );
-        assert_eq!(
-            gpu_provider_admission(display_with_flags(
-                DISPLAY_INFO_FLAG_DVM_SCANOUT | DISPLAY_INFO_FLAG_GPU_COMPOSITOR,
-            )),
-            GpuProviderAdmission::Ready
-        );
-        assert_eq!(
-            gpu_provider_admission(display_with_flags(DISPLAY_INFO_FLAG_GPU_COMPOSITOR)),
-            GpuProviderAdmission::Invalid
-        );
-    }
-
-    #[test]
-    fn difference_bounds_is_empty_for_identical_atlases() {
-        let atlas = vec![0_u32; 4 * 3];
-        assert_eq!(difference_bounds(&atlas, &atlas, 4, 3, 4), None);
-    }
-
-    #[test]
-    fn difference_bounds_covers_only_the_changed_rectangle() {
-        let previous = vec![0_u32; 6 * 4];
-        let mut next = previous.clone();
-        next[1 + 6] = 1;
-        next[4 + 3 * 6] = 2;
-        assert_eq!(
-            difference_bounds(&previous, &next, 5, 4, 6),
-            Some(Rect {
-                x: 1,
-                y: 1,
-                width: 4,
-                height: 3,
-            })
-        );
-    }
-
-    #[test]
-    fn difference_bounds_rejects_incompatible_geometry() {
-        assert_eq!(difference_bounds(&[0; 4], &[0; 5], 2, 2, 2), None);
-        assert_eq!(difference_bounds(&[0; 4], &[0; 4], 3, 2, 2), None);
-    }
-
-    #[test]
-    fn frame_deadline_skips_missed_slots_without_drift_or_burst() {
-        let origin = Instant::now();
-        assert_eq!(
-            next_frame_deadline(origin, origin),
-            origin + GPU_FRAME_INTERVAL
-        );
-        assert_eq!(
-            next_frame_deadline(origin, origin + Duration::from_millis(49)),
-            origin + Duration::from_millis(60)
-        );
-    }
-
-    #[test]
-    fn completion_timeout_is_measured_from_submission_without_a_blocking_wait() {
-        let submitted_at = Instant::now();
-        assert!(!gpu_completion_timed_out(
-            submitted_at,
-            submitted_at + GPU_COMPLETION_TIMEOUT - Duration::from_nanos(1),
-        ));
-        assert!(gpu_completion_timed_out(
-            submitted_at,
-            submitted_at + GPU_COMPLETION_TIMEOUT,
-        ));
-    }
-
-    #[test]
-    fn snapshot_damage_keeps_partial_patch_for_exact_slot_predecessor() {
-        let requested = [DvmGpuAtlasDamage {
-            x: 7,
-            y: 11,
-            width: 13,
-            height: 17,
-        }];
-        assert_eq!(
-            snapshot_damage_for_slot(8, 9, &requested, &VecDeque::new(), 1600, 900),
-            Ok(requested.to_vec())
-        );
-    }
-
-    #[test]
-    fn slot_mapping_copy_changes_only_validated_damage() {
-        let source = (0_u32..32).collect::<Vec<_>>();
-        let mut destination = vec![u32::MAX; 32];
-        let damage = [DvmGpuAtlasDamage {
-            x: 2,
-            y: 1,
-            width: 3,
-            height: 2,
-        }];
-        copy_atlas_damage_to_slot(&mut destination, &source, 8, &damage, 8, 4)
-            .expect("copy bounded atlas damage");
-        for index in 0..32 {
-            let x = index % 8;
-            let y = index / 8;
-            if (2..5).contains(&x) && (1..3).contains(&y) {
-                assert_eq!(destination[index], source[index]);
-            } else {
-                assert_eq!(destination[index], u32::MAX);
-            }
-        }
-    }
-
-    #[test]
-    fn slot_mapping_streams_large_unaligned_rows_exactly() {
-        let source = (0_u32..257).collect::<Vec<_>>();
-        let mut allocation = vec![u32::MAX; 258];
-        let destination = &mut allocation[1..258];
-        let damage = [DvmGpuAtlasDamage {
-            x: 1,
-            y: 0,
-            width: 255,
-            height: 1,
-        }];
-        copy_atlas_damage_to_slot(destination, &source, 257, &damage, 257, 1)
-            .expect("stream bounded atlas damage");
-        assert_eq!(destination[0], u32::MAX);
-        assert_eq!(&destination[1..256], &source[1..256]);
-        assert_eq!(destination[256], u32::MAX);
-    }
-
-    #[test]
-    fn snapshot_damage_forces_full_copy_for_uninitialized_or_stale_slot() {
-        let requested = [DvmGpuAtlasDamage {
-            x: 7,
-            y: 11,
-            width: 13,
-            height: 17,
-        }];
-        let full = vec![DvmGpuAtlasDamage {
-            x: 0,
-            y: 0,
-            width: 1600,
-            height: 900,
-        }];
-        assert_eq!(
-            snapshot_damage_for_slot(0, 1, &requested, &VecDeque::new(), 1600, 900),
-            Ok(full.clone())
-        );
-        assert_eq!(
-            snapshot_damage_for_slot(6, 9, &requested, &VecDeque::new(), 1600, 900),
-            Ok(full)
-        );
-    }
-
-    #[test]
-    fn snapshot_damage_replays_bounded_history_for_rotated_slot() {
-        let history = VecDeque::from([
-            AtlasDamageEpoch {
-                epoch: 7,
-                damage: vec![DvmGpuAtlasDamage {
-                    x: 10,
-                    y: 20,
-                    width: 4,
-                    height: 5,
-                }],
-            },
-            AtlasDamageEpoch {
-                epoch: 8,
-                damage: vec![DvmGpuAtlasDamage {
-                    x: 30,
-                    y: 40,
-                    width: 6,
-                    height: 7,
-                }],
-            },
-        ]);
-        let requested = [DvmGpuAtlasDamage {
-            x: 50,
-            y: 60,
-            width: 8,
-            height: 9,
-        }];
-        assert_eq!(
-            snapshot_damage_for_slot(6, 9, &requested, &history, 1600, 900),
-            Ok(vec![
-                DvmGpuAtlasDamage {
-                    x: 10,
-                    y: 20,
-                    width: 4,
-                    height: 5,
-                },
-                DvmGpuAtlasDamage {
-                    x: 30,
-                    y: 40,
-                    width: 6,
-                    height: 7,
-                },
-                DvmGpuAtlasDamage {
-                    x: 50,
-                    y: 60,
-                    width: 8,
-                    height: 9,
-                },
-            ])
-        );
-    }
-
-    #[test]
-    fn snapshot_damage_merges_only_overlapping_history() {
-        let history = VecDeque::from([AtlasDamageEpoch {
-            epoch: 2,
-            damage: vec![DvmGpuAtlasDamage {
-                x: 10,
-                y: 10,
-                width: 10,
-                height: 10,
-            }],
-        }]);
-        let requested = [DvmGpuAtlasDamage {
-            x: 15,
-            y: 15,
-            width: 10,
-            height: 10,
-        }];
-        assert_eq!(
-            snapshot_damage_for_slot(1, 3, &requested, &history, 1600, 900),
-            Ok(vec![DvmGpuAtlasDamage {
-                x: 10,
-                y: 10,
-                width: 15,
-                height: 15,
-            }])
-        );
-    }
-
-    #[test]
-    fn slot_reconstruction_budget_rejects_atlas_amplification() {
-        assert!(reconstruction_damage_within_budget(100 * 100, 1600, 900));
-        assert!(reconstruction_damage_within_budget(180_000, 1600, 900));
-        assert!(!reconstruction_damage_within_budget(180_001, 1600, 900));
-        assert!(!reconstruction_damage_within_budget(1600 * 900, 1600, 900));
-    }
-}
+#[path = "gpu_runtime_tests.rs"]
+mod tests;

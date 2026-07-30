@@ -28,9 +28,37 @@ use super::{DeviceError, read_user_struct, write_user_struct};
 
 const MAX_DISPLAY_SURFACES_PER_PROCESS: usize = 4;
 
+pub(crate) fn prepare_ioctl(request: u64) {
+    if matches!(
+        request,
+        device::DISPLAY_IOCTL_GET_INFO
+            | device::DISPLAY_IOCTL_CREATE_SURFACE
+            | device::DISPLAY_IOCTL_PRESENT
+            | device::DISPLAY_IOCTL_PRESENT_RECT
+            | device::DISPLAY_IOCTL_GPU_GET_INFO
+            | device::DISPLAY_IOCTL_GPU_SUBMIT
+            | device::DISPLAY_IOCTL_GPU_QUERY_COMPLETION
+    ) {
+        // Transport discovery and MMIO publication can take the sleepable
+        // MMIO registry. Run it before compat pins the process handle table;
+        // the ioctl itself revalidates the fd and all generation-stamped
+        // objects after this phase.
+        let _ = gui::display_info();
+        if let Some(gpu) = crate::io::dvm_display::gpu_atlas_info() {
+            // Atlas slots are a fixed, ABI-bounded set. Publish every mapping
+            // here so surface selection under the process lock is cache-only.
+            for slot in 0..gpu.slot_count {
+                if crate::io::dvm_display::gpu_atlas_slot_mapping(slot).is_none() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
 fn display_info() -> Result<DisplayInfo, DeviceError> {
-    let info = gui::display_info().ok_or(DeviceError::DisplayUnavailable)?;
-    let flags = if crate::io::dvm_display::gpu_atlas_info().is_some() {
+    let info = gui::display_info_snapshot().ok_or(DeviceError::DisplayUnavailable)?;
+    let flags = if crate::io::dvm_display::gpu_atlas_info_snapshot().is_some() {
         info.flags | DISPLAY_INFO_FLAG_GPU_COMPOSITOR
     } else {
         info.flags
@@ -46,6 +74,7 @@ fn display_info() -> Result<DisplayInfo, DeviceError> {
 }
 
 pub(crate) fn ioctl(
+    process_id: u64,
     process_state: &mut UserProcessState,
     request: u64,
     arg: u64,
@@ -73,10 +102,16 @@ pub(crate) fn ioctl(
                 if create.width != display.width || create.height != display.height {
                     return Err(DeviceError::InvalidArgument);
                 }
-                create_surface(create.width, create.height, create.pixel_format, display)
-                    .ok_or(DeviceError::InvalidArgument)?
+                create_surface(
+                    process_id,
+                    create.width,
+                    create.height,
+                    create.pixel_format,
+                    display,
+                )
+                .ok_or(DeviceError::InvalidArgument)?
             } else if create.flags == DISPLAY_SURFACE_FLAG_GPU_ATLAS {
-                let gpu = crate::io::dvm_display::gpu_atlas_info()
+                let gpu = crate::io::dvm_display::gpu_atlas_info_snapshot()
                     .ok_or(DeviceError::DisplayUnavailable)?;
                 if create.width != gpu.width || create.height != gpu.height {
                     return Err(DeviceError::InvalidArgument);
@@ -95,23 +130,31 @@ pub(crate) fn ioctl(
             } else {
                 return Err(DeviceError::InvalidArgument);
             };
-            let handle = process_state
+            let Some(handle) = process_state
                 .handles_mut()
                 .install(KernelHandle::DisplaySurface(surface))
-                .ok_or(DeviceError::TryAgain)?;
+            else {
+                if let Some(region) = surface.shared_region() {
+                    crate::ipc::release_shared_region_descriptor(region);
+                }
+                return Err(DeviceError::TryAgain);
+            };
             create.handle = u32::try_from(handle).map_err(|_| DeviceError::InvalidArgument)?;
             create.bytes_per_pixel = surface.bytes_per_pixel();
             create.stride_bytes = surface.stride_bytes();
             create.reserved = surface.binding_slot().unwrap_or(0);
             create.mapping_len = surface.mapping_len();
             create.generation = surface.generation();
-            write_user_struct(process_state.address_space(), arg, &create)?;
+            if let Err(error) = write_user_struct(process_state.address_space(), arg, &create) {
+                let _ = process_state.handles_mut().close(handle);
+                return Err(error);
+            }
             Ok(0)
         }
         device::DISPLAY_IOCTL_GPU_GET_INFO => {
             let display = display_info()?;
-            let gpu =
-                crate::io::dvm_display::gpu_atlas_info().ok_or(DeviceError::DisplayUnavailable)?;
+            let gpu = crate::io::dvm_display::gpu_atlas_info_snapshot()
+                .ok_or(DeviceError::DisplayUnavailable)?;
             let info = DisplayGpuInfo {
                 version: DISPLAY_GPU_ABI_VERSION,
                 flags: match gpu.submit_flags {
@@ -212,9 +255,8 @@ pub(crate) fn ioctl(
             }
             let surface = gpu_atlas_surface(process_state, query.surface_handle)?;
             let slot = surface.binding_slot().ok_or(DeviceError::InvalidArgument)?;
-            match crate::io::dvm_display::query_gpu_atlas_completion(slot) {
-                crate::io::dvm_display::DvmGpuCompletionOutcome::Completed(completion) => {
-                    query.completion = completion;
+            match crate::io::dvm_display::query_gpu_atlas_completion(slot, &mut query.completion) {
+                crate::io::dvm_display::DvmGpuCompletionOutcome::Completed => {
                     write_user_struct(process_state.address_space(), arg, &query)?;
                     Ok(0)
                 }
@@ -276,7 +318,8 @@ fn gpu_atlas_surface(
         Some(_) | None => return Err(DeviceError::InvalidArgument),
     };
     let display = display_info()?;
-    let gpu = crate::io::dvm_display::gpu_atlas_info().ok_or(DeviceError::DisplayUnavailable)?;
+    let gpu =
+        crate::io::dvm_display::gpu_atlas_info_snapshot().ok_or(DeviceError::DisplayUnavailable)?;
     if !surface.is_gpu_atlas()
         || surface.generation() != display.generation
         || surface.width() != gpu.width
@@ -360,14 +403,18 @@ pub(crate) fn present_surface_rect(
     validate_surface_mapping(surface, region)?;
     let (ptr, _) = surface_kernel_ptr(surface)?;
     match gui::present_userspace_frame_rect_from_kernel_bgra8888(
-        ptr,
-        surface.width() as usize,
-        surface.height() as usize,
-        surface.stride_bytes() as usize,
-        x,
-        y,
-        width,
-        height,
+        gui::KernelBgraFrame {
+            src_ptr: ptr,
+            width: surface.width() as usize,
+            height: surface.height() as usize,
+            stride_bytes: surface.stride_bytes() as usize,
+        },
+        gui::GuiDamageRect {
+            x,
+            y,
+            width,
+            height,
+        },
     ) {
         gui::GuiPresentOutcome::Presented => Ok(()),
         gui::GuiPresentOutcome::Backpressured => Err(DeviceError::TryAgain),
@@ -388,6 +435,7 @@ fn align_up_u64(value: u64, align: u64) -> Option<u64> {
 }
 
 fn create_surface(
+    process_id: u64,
     width: u32,
     height: u32,
     pixel_format: u32,
@@ -403,7 +451,9 @@ fn create_surface(
         pixel_format,
         display.generation,
     )?;
-    let region = crate::ipc::create_shared_region(surface.mapping_len() as usize).ok()?;
+    let region =
+        crate::ipc::create_shared_region_for_process(process_id, surface.mapping_len() as usize)
+            .ok()?;
     surface.set_shared_region(region);
     Some(surface)
 }
@@ -415,7 +465,7 @@ fn create_gpu_atlas_surface(
     display: DisplayInfo,
     binding_slot: u32,
 ) -> Option<DisplaySurfaceHandle> {
-    let gpu = crate::io::dvm_display::gpu_atlas_info()?;
+    let gpu = crate::io::dvm_display::gpu_atlas_info_snapshot()?;
     if width != gpu.width
         || height != gpu.height
         || pixel_format != display.pixel_format

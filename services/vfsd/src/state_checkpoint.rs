@@ -34,7 +34,7 @@ impl VfsState {
             )?;
             let wire_size = size_of::<ServiceCheckpointRecordWire>();
             let record_count = response.payload_len as usize / wire_size;
-            if response.payload_len as usize % wire_size != 0
+            if !(response.payload_len as usize).is_multiple_of(wire_size)
                 || response.value1 as usize != record_count
                 || cursor
                     .checked_add(record_count as u64)

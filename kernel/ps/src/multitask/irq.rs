@@ -1,3 +1,19 @@
+//! BSP timer and software-reschedule entry ordering.
+//!
+//! - **Owner:** `kernel-ps` owns scheduling decisions; HAL owns interrupt
+//!   acknowledgement and clockevent delivery.
+//! - **Boundary:** Interrupt frames and deferred-reschedule requests enter the
+//!   scheduler only at architecture-defined safe points.
+//! - **Lifecycle:** Wake deadlines, publish/validate the trapped continuation,
+//!   select, hand off, then acknowledge in the required order.
+//! - **Concurrency:** Entry runs with interrupts excluded and tracked IRQ
+//!   context; arbitrary kernel frames are not blindly preempted.
+//! - **Failure:** Invalid user continuation retires the exact task; root/kernel
+//!   continuation corruption is fatal.
+//! - **Forbidden:** No policy in IRQ context, early acknowledgement that loses
+//!   a deadline, or SMP/IPI behavior implied by local APIC use.
+//! - **Evidence:** `scheduler-lifecycle`, `scheduler-dispatch`, and
+//!   `monotonic-deadline-lifecycle`.
 use x86_64::instructions::interrupts;
 
 use super::{
@@ -26,12 +42,26 @@ pub(crate) fn install_interrupt_dispatch_callbacks() {
 }
 
 extern "C" fn timer_interrupt_dispatch(context_ptr: *mut SavedContext) -> *mut SavedContext {
+    // The low-level timer assembly enters this function directly rather than
+    // the generic PIC wrapper, so publish the IRQ context for the complete
+    // clockevent, scheduler, PIT, and EOI transaction.
+    let _irq_context = nucleus_core::util::lockdep::enter_irq_context();
     // Expire sleepers against invariant-TSC/HPET time before selecting the
     // next task. This is deliberately independent of how many PIT/RTC edges
     // the hypervisor delivered: one delayed edge catches up every absolute
     // deadline that passed while the vCPU was descheduled.
     crate::arch::rtc::service_clock_event();
     if !scheduler_initialized() {
+        crate::arch::pic::send_eoi(crate::arch::pic::PIC_1_OFFSET);
+        return context_ptr;
+    }
+    // A task may have published its blocked/retired state immediately before
+    // completing a bounded raw-lock transaction. That state alone must not
+    // authorize the timer path to switch stacks while the preemption guard is
+    // live. The eventual explicit scheduler handoff below the lock remains the
+    // sole transition point.
+    if nucleus_core::util::lockdep::preemption_disabled() {
+        DEFERRED_RESCHEDULE_REQUESTED.store(1, core::sync::atomic::Ordering::Release);
         crate::arch::pic::send_eoi(crate::arch::pic::PIC_1_OFFSET);
         return context_ptr;
     }
@@ -114,6 +144,9 @@ fn timer_interrupted_kernel_frame(context_ptr: *const SavedContext, scheduler: &
 }
 
 pub fn reschedule_if_requested() {
+    if nucleus_core::util::lockdep::preemption_disabled() {
+        return;
+    }
     if DEFERRED_RESCHEDULE_REQUESTED.swap(0, core::sync::atomic::Ordering::AcqRel) != 0 {
         yield_now();
     }
@@ -131,6 +164,9 @@ pub fn cond_resched() {
 /// without switching starves peer services; programming a short periodic PIT
 /// instead creates a VM-exit storm under long syscalls.
 pub fn reschedule_deferred_from_interruptible_syscall() {
+    if nucleus_core::util::lockdep::preemption_disabled() {
+        return;
+    }
     if consume_syscall_tail_reschedule(
         &DEFERRED_RESCHEDULE_REQUESTED,
         &USER_RETURN_RESCHEDULE_ARMED,
@@ -160,6 +196,12 @@ pub(crate) fn request_user_return_reschedule() {
 extern "C" fn software_schedule_interrupt_dispatch(
     context_ptr: *mut SavedContext,
 ) -> *mut SavedContext {
+    assert!(
+        !nucleus_core::util::lockdep::preemption_disabled(),
+        "software scheduler entered while raw spin lock held depth={} class={:?}",
+        nucleus_core::util::lockdep::preemption_depth(),
+        nucleus_core::util::lockdep::current_lock_class()
+    );
     if !scheduler_initialized() {
         return context_ptr;
     }
@@ -180,9 +222,39 @@ extern "C" fn software_schedule_interrupt_dispatch(
 }
 
 pub fn yield_now() {
+    assert!(
+        !nucleus_core::util::lockdep::preemption_disabled(),
+        "task yielded while raw spin lock held depth={} class={:?}",
+        nucleus_core::util::lockdep::preemption_depth(),
+        nucleus_core::util::lockdep::current_lock_class()
+    );
     interrupts::without_interrupts(|| {
         crate::lowlevel::interrupts::trigger_software_schedule();
     });
+}
+
+/// Linearizes a successful block commit with the software schedule trap.
+///
+/// A separate `commit_block_current_task(); yield_now();` sequence leaves an
+/// interruptible gap in which a wake can make the still-executing task
+/// runnable before it nevertheless enters the voluntary schedule path. Keep
+/// interrupts excluded from the scheduler state transition through the trap,
+/// matching the formal `CommitCurrentBlock` transition where a blocked task
+/// ceases to own the CPU at the same linearization point.
+pub fn commit_block_current_task_and_yield() -> Option<bool> {
+    assert!(
+        !nucleus_core::util::lockdep::preemption_disabled(),
+        "task blocked while raw spin lock held depth={} class={:?}",
+        nucleus_core::util::lockdep::preemption_depth(),
+        nucleus_core::util::lockdep::current_lock_class()
+    );
+    interrupts::without_interrupts(|| {
+        let committed = unsafe { scheduler_mut().commit_block_current_task() };
+        if committed == Some(true) {
+            crate::lowlevel::interrupts::trigger_software_schedule();
+        }
+        committed
+    })
 }
 
 #[cfg(test)]

@@ -79,6 +79,11 @@ def main() -> int:
     parser.add_argument("--registry", type=Path, required=True)
     parser.add_argument("--topology", required=True)
     parser.add_argument("--summary", type=Path, required=True)
+    parser.add_argument(
+        "--classify-stale",
+        action="store_true",
+        help="return 3, not a validation failure, when only bound inputs are stale",
+    )
     args = parser.parse_args()
 
     failures: list[str] = []
@@ -239,6 +244,7 @@ def main() -> int:
             / "driver-domains/linux/out/artifacts/rustos-linux-dvm-x86_64.manifest"
         ).read_bytes()
     ).hexdigest()
+    stale_inputs: list[str] = []
     if events:
         for field, current in (
             ("source_tree_sha256", current_source_sha256),
@@ -246,10 +252,18 @@ def main() -> int:
             ("dvm_manifest_sha256", dvm_manifest_sha256),
         ):
             if events[0][field] != current:
-                failures.append(f"trace {field} does not match current input")
+                stale_inputs.append(f"trace {field} does not match current input")
+    if stale_inputs and not args.classify_stale:
+        failures.extend(stale_inputs)
     summary = {
         "schema": "rustos-kvm-formal-trace-evidence-v4",
-        "status": "passed" if not failures else "failed",
+        "status": (
+            "failed"
+            if failures
+            else "stale"
+            if stale_inputs
+            else "passed"
+        ),
         "run_id": run_id,
         "topology": args.topology,
         "scenario": scenario_name,
@@ -264,6 +278,7 @@ def main() -> int:
         "rustos_boot_image_sha256": rustos_boot_image_sha256,
         "dvm_manifest_sha256": dvm_manifest_sha256,
         "failures": failures,
+        "stale_inputs": stale_inputs,
     }
     args.summary.parent.mkdir(parents=True, exist_ok=True)
     args.summary.write_text(
@@ -273,6 +288,10 @@ def main() -> int:
         for failure in failures:
             print(failure)
         return 1
+    if stale_inputs:
+        for stale in stale_inputs:
+            print(stale)
+        return 3
     print(
         f"kvm runtime trace conformance passed scenario={scenario_name} "
         f"events={len(events)} terminal_ms={events[-1]['elapsed_ms']}"

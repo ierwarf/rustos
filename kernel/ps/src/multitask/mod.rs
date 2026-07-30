@@ -2,6 +2,7 @@ mod context;
 mod current;
 mod irq;
 mod process_table;
+mod retirement;
 mod scheduler;
 mod spawn;
 
@@ -29,22 +30,22 @@ use crate::user::process_state::{
 
 pub use self::current::{
     activate_suspended_user_task, any_user_process_state, arm_block_current_task,
-    block_current_task, block_current_user_task, cancel_block_current_task,
-    commit_block_current_task, current_console_session, current_linux_thread_state,
-    current_task_id, current_user_abi, current_user_address_space, current_user_id,
-    current_user_log_ids, current_user_process_id, current_user_process_thread_count,
-    current_user_snapshot, current_user_stack_state, current_user_thread_id,
-    demote_current_user_task_to_user_class, exec_current_user_process, exec_user_process_by_pid,
-    exit_current_user_process, exit_current_user_task, halt_current_retired_task,
-    inherit_ipc_priority, inherit_ipc_priority_for_process, is_user_process_exiting,
-    is_user_task_alive, linux_thread_snapshot_by_ids, mark_user_process_exiting,
-    mark_user_process_exiting_once, note_process_exit_status, parent_process_id_of,
-    queue_linux_signal, release_ipc_priorities_for_process, release_ipc_priority,
-    retain_current_user_process_state, retire_current_user_task_due_to_fault,
+    cancel_block_current_task, complete_retired_task_cleanup, current_console_session,
+    current_linux_thread_state, current_task_id, current_user_abi, current_user_address_space,
+    current_user_id, current_user_log_ids, current_user_process_id,
+    current_user_process_thread_count, current_user_snapshot, current_user_stack_state,
+    current_user_thread_id, current_user_wait_binding, demote_current_user_task_to_user_class,
+    exec_current_user_process, exec_user_process_by_pid, exit_current_user_process,
+    exit_current_user_task, halt_current_retired_task, inherit_ipc_priority,
+    inherit_ipc_priority_for_process, is_user_process_exiting, is_user_task_alive,
+    linux_thread_snapshot_by_ids, mark_user_process_exiting, mark_user_process_exiting_once,
+    next_retired_task_cleanup, note_process_exit_status, parent_process_id_of,
+    queue_linux_process_sigchld, queue_linux_signal, release_ipc_priorities_for_process,
+    release_ipc_priority, retain_current_user_process_state, retire_current_user_task_due_to_fault,
     service_deferred_work, set_next_latency_pick_hint, set_next_pick_hint,
-    set_next_process_pick_hint, set_next_spawn_pick_hint, terminate_user_process,
-    terminate_user_task, user_log_ids_for_task, wait_for_child, wake_task, wake_user_task,
-    with_current_mm, with_current_process_credentials, with_current_process_state,
+    set_next_process_pick_hint, set_next_spawn_pick_hint, stop_current_linux_process,
+    terminate_user_process, terminate_user_task, user_log_ids_for_task, wait_for_child, wake_task,
+    wake_user_task, with_current_mm, with_current_process_credentials, with_current_process_state,
     with_current_process_state_mut, with_current_user_linux_state_mut,
     with_current_user_process_and_linux_thread_state_mut, with_current_user_process_state,
     with_current_user_process_state_mut, with_process_state_by_pid, with_process_state_by_pid_mut,
@@ -53,14 +54,14 @@ pub use self::current::{
 /// Upper bound for simultaneously schedulable task identities. Cross-crate
 /// bounded registries must derive capacity from this value rather than copy it.
 pub const MAX_SCHEDULER_TASKS: usize = scheduler::MAX_TASK;
+pub use self::irq::{
+    commit_block_current_task_and_yield, rtc_interrupt_handler_addr,
+    software_schedule_interrupt_handler_addr, timer_interrupt_handler_addr, yield_now,
+};
 #[allow(unused_imports)]
 pub(crate) use self::irq::{
     cond_resched, request_deferred_reschedule, request_user_return_reschedule,
     reschedule_deferred_from_interruptible_syscall, reschedule_if_requested,
-};
-pub use self::irq::{
-    rtc_interrupt_handler_addr, software_schedule_interrupt_handler_addr,
-    timer_interrupt_handler_addr, yield_now,
 };
 pub use self::spawn::{
     SyscallUserSimdSnapshot, spawn_kernel_process, spawn_user_process,
@@ -124,6 +125,8 @@ pub enum SpawnTaskError {
     NoFreeTaskSlot,
 }
 
+pub use retirement::RetiredTaskCleanup;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CurrentUserSnapshot {
     abi: UserAbi,
@@ -151,6 +154,7 @@ pub struct CurrentKernelStackScope {
 
 pub enum WaitChildResult {
     Exited { pid: u64, status: i32 },
+    StateChanged { pid: u64, status: i32 },
     Pending,
     NoMatchingChild,
 }
@@ -475,6 +479,8 @@ fn noop_task_entry(_id: u64) {
     }
 }
 
+// ASSEMBLY: Initial task stacks name this trampoline by address; there is no
+// ordinary Rust call edge for dead-code analysis to observe.
 #[allow(dead_code)]
 extern "C" fn task_entry_trampoline() -> ! {
     let task = interrupts::without_interrupts(|| unsafe { scheduler_ref().current_task_start() });

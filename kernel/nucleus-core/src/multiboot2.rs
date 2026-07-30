@@ -353,13 +353,13 @@ impl Tags {
             if tag.size < size_of::<RawTag>() as u32 || cursor + tag.size as usize > end {
                 return None;
             }
-            if tag.ty == TAG_MODULE {
-                if let Some(range) = self.module_range_from_tag(tag, expected_cmdline) {
-                    if found.is_some() {
-                        return None;
-                    }
-                    found = Some(range);
+            if tag.ty == TAG_MODULE
+                && let Some(range) = self.module_range_from_tag(tag, expected_cmdline)
+            {
+                if found.is_some() {
+                    return None;
                 }
+                found = Some(range);
             }
             cursor = align_up(cursor + tag.size as usize, 8)?;
         }
@@ -586,8 +586,8 @@ mod tests {
     #[test]
     fn prefers_new_acpi_rsdp_over_old() {
         let mut mbi = mbi_header();
-        push_acpi_tag(&mut mbi, TAG_ACPI_OLD, &[b'O', b'L', b'D']);
-        push_acpi_tag(&mut mbi, TAG_ACPI_NEW, &[b'N', b'E', b'W']);
+        push_acpi_tag(&mut mbi, TAG_ACPI_OLD, b"OLD");
+        push_acpi_tag(&mut mbi, TAG_ACPI_NEW, b"NEW");
         finish_mbi(&mut mbi);
 
         let tags = unsafe { Tags::new(mbi.as_ptr() as usize) };

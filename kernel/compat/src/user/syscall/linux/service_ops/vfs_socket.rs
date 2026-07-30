@@ -1,12 +1,35 @@
+//! Linux VFS/socket descriptor operations over service-owned open descriptions.
+//!
+//! - **Owner:** Compat owns fd and copyin/copyout semantics; `vfsd`/`netd` own
+//!   namespace, cursor, socket, and provider policy.
+//! - **Boundary:** User fds, buffers, flags, addresses, and service envelopes
+//!   are untrusted.
+//! - **Lifecycle:** Resolve an exact open description, prepare remote mutation,
+//!   copy/commit, and settle dup/fork/exec/final-close references.
+//! - **Concurrency:** Descriptor-table mutation and service calls are separated;
+//!   provider restart is bound by epoch and finite deadline.
+//! - **Failure:** Short I/O, copy failure, timeout, restart, capacity, and
+//!   close races preserve cursor/reference ownership and Linux errno.
+//! - **Forbidden:** No raw fd as provider token, partial handle installation,
+//!   synchronous call under table lock, or polling fallback.
+//! - **Evidence:** `vfs-open-description`.
 // RING3-MIGRATION-REFERENCE START: vfsd/netd fd-usercopy substrate exception.
 // vfsd/netd own file/socket policy. Ring0 keeps current-process user-copy,
 // fd-table mutation, and remote-handle/socket-token installation substrate.
 use super::*;
-use alloc::collections::{BTreeMap, VecDeque};
+use alloc::collections::BTreeMap;
+use nucleus_core::util::{
+    lockdep::{LockClass, TrackedSpinLock},
+    ring::RingBuffer,
+};
 use rustos_user_abi::syscall::VFS_DEVICE_ACCESS_DRM_COMPAT;
 
 const PENDING_NETD_REF_CAPACITY: usize = 4096;
+const PENDING_NETD_REF_STORAGE_CAPACITY: usize = PENDING_NETD_REF_CAPACITY + 1;
 const REMOTE_VFS_OPEN_DESCRIPTION_CAPACITY: usize = 32 * 1024;
+const NETD_REF_OPERATION_TIMEOUT_MS: u64 = 16;
+const NETD_REF_OPERATION_ATTEMPTS: usize = 3;
+const NETD_MAINTENANCE_ATTEMPTS_PER_CALL: usize = 1;
 
 #[derive(Clone, Copy)]
 struct PendingNetdRef {
@@ -17,49 +40,159 @@ struct PendingNetdRef {
     acknowledge_only: bool,
 }
 
-lazy_static::lazy_static! {
-    static ref PENDING_NETD_REFS: spin::Mutex<VecDeque<PendingNetdRef>> =
-        spin::Mutex::new(VecDeque::new());
-    /// Kernel fd tables are authoritative for descriptor references. vfsd
-    /// owns open-file state, but sees only initial open and final release.
-    static ref REMOTE_VFS_DESCRIPTOR_REFS: spin::Mutex<BTreeMap<u64, u64>> =
-        spin::Mutex::new(BTreeMap::new());
+#[derive(Clone, Copy)]
+struct RemoteVfsRefSlot {
+    remote_id: u64,
+    references: u64,
+    state: u8,
 }
+
+impl RemoteVfsRefSlot {
+    const EMPTY: Self = Self {
+        remote_id: 0,
+        references: 0,
+        state: 0,
+    };
+
+    const OCCUPIED: u8 = 1;
+    const TOMBSTONE: u8 = 2;
+}
+
+struct RemoteVfsRefRegistry {
+    slots: [RemoteVfsRefSlot; REMOTE_VFS_OPEN_DESCRIPTION_CAPACITY],
+    len: usize,
+}
+
+impl RemoteVfsRefRegistry {
+    const fn new() -> Self {
+        Self {
+            slots: [RemoteVfsRefSlot::EMPTY; REMOTE_VFS_OPEN_DESCRIPTION_CAPACITY],
+            len: 0,
+        }
+    }
+
+    fn probe_start(remote_id: u64) -> usize {
+        let mut value = remote_id;
+        value ^= value >> 33;
+        value = value.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        value ^= value >> 33;
+        value = value.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+        value ^= value >> 33;
+        value as usize & (REMOTE_VFS_OPEN_DESCRIPTION_CAPACITY - 1)
+    }
+
+    fn find_index(&self, remote_id: u64) -> Option<usize> {
+        let start = Self::probe_start(remote_id);
+        for offset in 0..REMOTE_VFS_OPEN_DESCRIPTION_CAPACITY {
+            let index = (start + offset) & (REMOTE_VFS_OPEN_DESCRIPTION_CAPACITY - 1);
+            let slot = self.slots[index];
+            if slot.state == 0 {
+                return None;
+            }
+            if slot.state == RemoteVfsRefSlot::OCCUPIED && slot.remote_id == remote_id {
+                return Some(index);
+            }
+        }
+        None
+    }
+
+    fn insert(&mut self, remote_id: u64) -> Result<(), i64> {
+        if self.find_index(remote_id).is_some() {
+            return Err(LINUX_EEXIST);
+        }
+        if self.len == REMOTE_VFS_OPEN_DESCRIPTION_CAPACITY {
+            return Err(LINUX_ENOSPC);
+        }
+        let start = Self::probe_start(remote_id);
+        let mut first_tombstone = None;
+        for offset in 0..REMOTE_VFS_OPEN_DESCRIPTION_CAPACITY {
+            let index = (start + offset) & (REMOTE_VFS_OPEN_DESCRIPTION_CAPACITY - 1);
+            let slot = self.slots[index];
+            if slot.state == RemoteVfsRefSlot::OCCUPIED {
+                if slot.remote_id == remote_id {
+                    return Err(LINUX_EEXIST);
+                }
+                continue;
+            }
+            if slot.state == RemoteVfsRefSlot::TOMBSTONE {
+                first_tombstone.get_or_insert(index);
+                continue;
+            }
+            let target = first_tombstone.unwrap_or(index);
+            self.slots[target] = RemoteVfsRefSlot {
+                remote_id,
+                references: 1,
+                state: RemoteVfsRefSlot::OCCUPIED,
+            };
+            self.len += 1;
+            return Ok(());
+        }
+
+        if let Some(target) = first_tombstone {
+            self.slots[target] = RemoteVfsRefSlot {
+                remote_id,
+                references: 1,
+                state: RemoteVfsRefSlot::OCCUPIED,
+            };
+            self.len += 1;
+            return Ok(());
+        }
+        Err(LINUX_ENOSPC)
+    }
+
+    fn acquire(&mut self, remote_id: u64) -> Result<(), i64> {
+        let index = self.find_index(remote_id).ok_or(LINUX_EBADF)?;
+        self.slots[index].references = self.slots[index]
+            .references
+            .checked_add(1)
+            .ok_or(LINUX_EOVERFLOW)?;
+        Ok(())
+    }
+
+    fn release(&mut self, remote_id: u64) -> Result<bool, i64> {
+        let index = self.find_index(remote_id).ok_or(LINUX_EBADF)?;
+        let slot = &mut self.slots[index];
+        if slot.references == 0 {
+            return Err(LINUX_ESTALE);
+        }
+        slot.references -= 1;
+        if slot.references != 0 {
+            return Ok(false);
+        }
+        *slot = RemoteVfsRefSlot {
+            state: RemoteVfsRefSlot::TOMBSTONE,
+            ..RemoteVfsRefSlot::EMPTY
+        };
+        self.len -= 1;
+        Ok(true)
+    }
+}
+
+static PENDING_NETD_REFS: TrackedSpinLock<
+    RingBuffer<PendingNetdRef, PENDING_NETD_REF_STORAGE_CAPACITY>,
+    { LockClass::NetdDeferredRef as u8 },
+> = TrackedSpinLock::new(RingBuffer::new());
+
+/// Kernel fd tables are authoritative for descriptor references. vfsd owns
+/// open-file state, but sees only initial open and final release.
+static REMOTE_VFS_DESCRIPTOR_REFS: TrackedSpinLock<
+    RemoteVfsRefRegistry,
+    { LockClass::RemoteVfsRegistry as u8 },
+> = TrackedSpinLock::new(RemoteVfsRefRegistry::new());
 
 fn register_remote_vfs_open_description(remote_id: u64) -> Result<(), i64> {
     if remote_id == 0 {
         return Err(LINUX_EINVAL);
     }
-    let mut refs = REMOTE_VFS_DESCRIPTOR_REFS.lock();
-    if refs.contains_key(&remote_id) {
-        return Err(LINUX_EEXIST);
-    }
-    if refs.len() == REMOTE_VFS_OPEN_DESCRIPTION_CAPACITY {
-        return Err(LINUX_ENOSPC);
-    }
-    refs.insert(remote_id, 1);
-    Ok(())
+    REMOTE_VFS_DESCRIPTOR_REFS.lock().insert(remote_id)
 }
 
 fn acquire_remote_vfs_descriptor_ref(remote_id: u64) -> Result<(), i64> {
-    let mut refs = REMOTE_VFS_DESCRIPTOR_REFS.lock();
-    let count = refs.get_mut(&remote_id).ok_or(LINUX_EBADF)?;
-    *count = count.checked_add(1).ok_or(LINUX_EOVERFLOW)?;
-    Ok(())
+    REMOTE_VFS_DESCRIPTOR_REFS.lock().acquire(remote_id)
 }
 
 fn release_remote_vfs_descriptor_ref(remote_id: u64) -> Result<bool, i64> {
-    let mut refs = REMOTE_VFS_DESCRIPTOR_REFS.lock();
-    let count = refs.get_mut(&remote_id).ok_or(LINUX_EBADF)?;
-    if *count == 0 {
-        return Err(LINUX_ESTALE);
-    }
-    *count -= 1;
-    if *count != 0 {
-        return Ok(false);
-    }
-    refs.remove(&remote_id);
-    Ok(true)
+    REMOTE_VFS_DESCRIPTOR_REFS.lock().release(remote_id)
 }
 
 pub fn syscall_linux_vfs_openat(dirfd: u64, path_ptr: u64, flags: u64, mode: u64) -> u64 {
@@ -242,34 +375,31 @@ pub fn syscall_linux_vfs_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
             }
         }
         linux_abi::F_GETFD | linux_abi::F_SETFD | linux_abi::F_GETFL | linux_abi::F_SETFL => {
-            if matches!(cmd, linux_abi::F_GETFL | linux_abi::F_SETFL) {
-                if let Some(remote) = current_remote_vfs_handle(fd) {
-                    let mut request = new_vfs_request(VFS_IPC_OP_FCNTL);
-                    request.fd = fd;
-                    request.remote_id = remote.remote_id();
-                    request.arg0 = cmd;
-                    request.arg1 = arg;
-                    let value =
-                        match call_pinned_remote_vfs_request(&request).and_then(|response| {
-                            ensure_vfs_status(&response)?;
-                            Ok(response.value)
-                        }) {
-                            Ok(value) => value,
-                            Err(errno) => return linux_errno(errno),
-                        };
-                    if cmd == linux_abi::F_SETFL {
-                        let _ = multitask::with_current_user_process_state_mut(
-                            |_, _, process_state| {
-                                process_state
-                                    .handles_mut()
-                                    .get_entry_mut(fd)
-                                    .map(|entry| entry.set_status_flags(value));
-                            },
-                        );
-                        return 0;
-                    }
-                    return value;
+            if matches!(cmd, linux_abi::F_GETFL | linux_abi::F_SETFL)
+                && let Some(remote) = current_remote_vfs_handle(fd)
+            {
+                let mut request = new_vfs_request(VFS_IPC_OP_FCNTL);
+                request.fd = fd;
+                request.remote_id = remote.remote_id();
+                request.arg0 = cmd;
+                request.arg1 = arg;
+                let value = match call_pinned_remote_vfs_request(&request).and_then(|response| {
+                    ensure_vfs_status(&response)?;
+                    Ok(response.value)
+                }) {
+                    Ok(value) => value,
+                    Err(errno) => return linux_errno(errno),
+                };
+                if cmd == linux_abi::F_SETFL {
+                    let _ =
+                        multitask::with_current_user_process_state_mut(|_, _, process_state| {
+                            if let Some(entry) = process_state.handles_mut().get_entry_mut(fd) {
+                                entry.set_status_flags(value);
+                            }
+                        });
+                    return 0;
                 }
+                return value;
             }
             match multitask::with_current_user_process_state_mut(|_, _, process_state| {
                 let entry = process_state.handles_mut().get_entry_mut(fd)?;
@@ -455,6 +585,22 @@ mod tests {
     }
 
     #[test]
+    fn netd_reference_retries_share_one_total_deadline() {
+        let slices = (0..NETD_REF_OPERATION_ATTEMPTS)
+            .map(|attempt| {
+                split_netd_ref_timeout_ms(
+                    NETD_REF_OPERATION_TIMEOUT_MS,
+                    NETD_REF_OPERATION_ATTEMPTS,
+                    attempt,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(slices.iter().all(|slice| *slice > 0));
+        assert_eq!(slices.iter().sum::<u64>(), NETD_REF_OPERATION_TIMEOUT_MS);
+        assert_eq!(slices, vec![6, 5, 5]);
+    }
+
+    #[test]
     fn transferred_input_description_keeps_the_waitset_service_reference() {
         let device = kernel_object::api::device::DeviceHandle::from_parts_with_token(
             kernel_object::api::device::DeviceId::Input,
@@ -520,6 +666,24 @@ mod tests {
         assert_eq!(release_remote_vfs_descriptor_ref(id), Ok(false));
         assert_eq!(release_remote_vfs_descriptor_ref(id), Ok(true));
         assert_eq!(release_remote_vfs_descriptor_ref(id), Err(LINUX_EBADF));
+    }
+
+    #[test]
+    fn remote_vfs_registry_preserves_collision_chains_across_tombstones() {
+        let first = 0xfedc_ba98_7654_0001;
+        let bucket = RemoteVfsRefRegistry::probe_start(first);
+        let second = (first + 1..first + REMOTE_VFS_OPEN_DESCRIPTION_CAPACITY as u64 + 2)
+            .find(|candidate| RemoteVfsRefRegistry::probe_start(*candidate) == bucket)
+            .expect("bounded hash range contains a collision");
+
+        assert_eq!(register_remote_vfs_open_description(first), Ok(()));
+        assert_eq!(register_remote_vfs_open_description(second), Ok(()));
+        assert_eq!(release_remote_vfs_descriptor_ref(first), Ok(true));
+        assert_eq!(acquire_remote_vfs_descriptor_ref(second), Ok(()));
+        assert_eq!(release_remote_vfs_descriptor_ref(second), Ok(false));
+        assert_eq!(release_remote_vfs_descriptor_ref(second), Ok(true));
+        assert_eq!(register_remote_vfs_open_description(first), Ok(()));
+        assert_eq!(release_remote_vfs_descriptor_ref(first), Ok(true));
     }
 }
 
@@ -875,14 +1039,14 @@ fn read_remote_vfs_pinned(
             };
         }
         if read == 0 {
-            if offset.is_none() {
-                if let Err(errno) = settle_vfs_cursor_mutation(&request, true) {
-                    return if copied > 0 {
-                        copied as u64
-                    } else {
-                        linux_errno(errno)
-                    };
-                }
+            if offset.is_none()
+                && let Err(errno) = settle_vfs_cursor_mutation(&request, true)
+            {
+                return if copied > 0 {
+                    copied as u64
+                } else {
+                    linux_errno(errno)
+                };
             }
             break;
         }
@@ -907,14 +1071,14 @@ fn read_remote_vfs_pinned(
             };
         }
         copied += read;
-        if offset.is_none() {
-            if let Err(errno) = settle_vfs_cursor_mutation(&request, true) {
-                return if copied > 0 {
-                    copied as u64
-                } else {
-                    linux_errno(errno)
-                };
-            }
+        if offset.is_none()
+            && let Err(errno) = settle_vfs_cursor_mutation(&request, true)
+        {
+            return if copied > 0 {
+                copied as u64
+            } else {
+                linux_errno(errno)
+            };
         }
         multitask::cond_resched();
         if read < chunk_len {
@@ -1073,21 +1237,27 @@ pub fn call_netd_socket_token_op(op: u16, socket_token: u64) -> Result<u64, i64>
 }
 
 fn call_netd_socket_token_op_bounded(op: u16, socket_token: u64) -> Result<u64, i64> {
-    drain_pending_netd_refs();
+    let _ = drain_pending_netd_refs();
     let request = new_netd_socket_request(op, socket_token);
     let mut last = LINUX_ETIMEDOUT;
-    for _ in 0..3 {
-        match call_netd_ipc_request_with_timeout(&request, 16) {
+    for attempt in 0..NETD_REF_OPERATION_ATTEMPTS {
+        let timeout_ms = split_netd_ref_timeout_ms(
+            NETD_REF_OPERATION_TIMEOUT_MS,
+            NETD_REF_OPERATION_ATTEMPTS,
+            attempt,
+        );
+        match call_netd_ipc_request_with_timeout(&request, timeout_ms) {
             Ok(response) => {
-                if send_netd_ref_ack(&request).is_err() {
-                    enqueue_pending_netd_ref(PendingNetdRef {
-                        op,
-                        socket_token,
-                        operation_hi: request.operation_hi,
-                        operation_lo: request.operation_lo,
-                        acknowledge_only: true,
-                    })?;
-                }
+                // The provider operation is already committed. Acknowledgement
+                // is maintenance and must not add another full IPC deadline to
+                // close/dup latency; preserve it as an exact replayable item.
+                enqueue_pending_netd_ref(PendingNetdRef {
+                    op,
+                    socket_token,
+                    operation_hi: request.operation_hi,
+                    operation_lo: request.operation_lo,
+                    acknowledge_only: true,
+                })?;
                 return Ok(response.value);
             }
             Err(errno) if errno == LINUX_ETIMEDOUT => last = errno,
@@ -1106,52 +1276,85 @@ fn call_netd_socket_token_op_bounded(op: u16, socket_token: u64) -> Result<u64, 
 
 fn enqueue_pending_netd_ref(pending: PendingNetdRef) -> Result<(), i64> {
     let mut queue = PENDING_NETD_REFS.lock();
-    if queue.iter().any(|entry| {
+    if queue.any(|entry| {
         entry.operation_hi == pending.operation_hi && entry.operation_lo == pending.operation_lo
     }) {
         return Ok(());
     }
-    if queue.len() == PENDING_NETD_REF_CAPACITY {
+    if queue.len() >= PENDING_NETD_REF_CAPACITY || !queue.push(pending) {
         return Err(LINUX_ENOSPC);
     }
-    queue.push_back(pending);
     Ok(())
 }
 
-fn drain_pending_netd_refs() {
-    for _ in 0..8 {
-        let Some(pending) = PENDING_NETD_REFS.lock().pop_front() else {
-            return;
+pub(super) fn service_deferred_netd_refs() -> usize {
+    drain_pending_netd_refs()
+}
+
+fn drain_pending_netd_refs() -> usize {
+    let mut attempted = 0usize;
+    for _ in 0..NETD_MAINTENANCE_ATTEMPTS_PER_CALL {
+        let Some(pending) = PENDING_NETD_REFS.lock().pop() else {
+            return attempted;
         };
+        attempted += 1;
         let mut request = new_netd_socket_request(pending.op, pending.socket_token);
         request.operation_hi = pending.operation_hi;
         request.operation_lo = pending.operation_lo;
         let completed = if pending.acknowledge_only {
-            send_netd_ref_ack(&request).is_ok()
+            send_netd_ref_ack_with_timeout(
+                &request,
+                rustos_user_abi::performance::IPC_FOREGROUND_MAINTENANCE_SLICE_MS,
+            )
+            .is_ok()
         } else {
-            match call_netd_ipc_request_with_timeout(&request, 16) {
-                Ok(_) => send_netd_ref_ack(&request).is_ok(),
+            match call_netd_ipc_request_with_timeout(
+                &request,
+                rustos_user_abi::performance::IPC_FOREGROUND_MAINTENANCE_SLICE_MS,
+            ) {
+                Ok(_) => {
+                    // Split operation replay and its acknowledgement across
+                    // turns. Each foreground caller pays at most one short
+                    // maintenance IPC instead of an operation+ack chain.
+                    let mut acknowledge = pending;
+                    acknowledge.acknowledge_only = true;
+                    assert!(
+                        PENDING_NETD_REFS.lock().push_front(acknowledge),
+                        "popped deferred netd reference must have retry capacity"
+                    );
+                    return attempted;
+                }
                 Err(errno) if errno == LINUX_EBADF => true,
                 Err(_) => false,
             }
         };
         if !completed {
-            PENDING_NETD_REFS.lock().push_front(pending);
-            return;
+            assert!(
+                PENDING_NETD_REFS.lock().push_front(pending),
+                "popped deferred netd reference must have retry capacity"
+            );
+            return attempted;
         }
     }
+    attempted
 }
 
-fn send_netd_ref_ack(request: &NetdIpcRequest) -> Result<(), i64> {
+fn send_netd_ref_ack_with_timeout(request: &NetdIpcRequest, timeout_ms: u64) -> Result<(), i64> {
     let mut ack = new_netd_socket_request(NETD_IPC_OP_REF_ACK, request.socket_token);
     ack.arg0 = request.op as u64;
     ack.operation_hi = request.operation_hi;
     ack.operation_lo = request.operation_lo;
-    let response = call_netd_ipc_request_with_timeout(&ack, 16)?;
+    let response = call_netd_ipc_request_with_timeout(&ack, timeout_ms)?;
     if response.value != 0 || response.payload_len != 0 {
         return Err(LINUX_EINVAL);
     }
     Ok(())
+}
+
+fn split_netd_ref_timeout_ms(total: u64, attempts: usize, attempt: usize) -> u64 {
+    debug_assert!(attempts > 0 && attempt < attempts);
+    let attempts = attempts as u64;
+    total / attempts + u64::from((attempt as u64) < total % attempts)
 }
 
 pub fn poll_netd_socket_token(

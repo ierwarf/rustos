@@ -1,8 +1,31 @@
+//! Generational kernel IPC objects, replies, queues, and shared regions.
+//!
+//! - **Owner:** `kernel-ipc-runtime` owns object identity and transport
+//!   mechanics; services own policy and request semantics.
+//! - **Boundary:** Endpoint handles, message bytes, transferred capabilities,
+//!   owner identities, and shared-region requests cross protection boundaries.
+//! - **Lifecycle:** Reserve quota, allocate an unpublished generational slot,
+//!   publish, settle reply/close/revoke, remove the exact generation, then
+//!   reclaim backing outside the slot lock.
+//! - **Concurrency:** Each production object slot has a tracked lock; guarded
+//!   closures are bounded, non-blocking, allocation-free, and callback-free.
+//! - **Failure:** Queue/capacity exhaustion, peer exit, timeout, duplicate
+//!   reply, stale handle, and partial transfer converge without leaked quota or
+//!   resurrected authority.
+//! - **Forbidden:** No production global object-table lock, allocation under a
+//!   raw slot lock, pointer-bearing wire record, or owner identity by PID alone.
+//! - **Evidence:** `ipc-call`, `endpoint-lifecycle`,
+//!   `ipc-handle-transfer`, `kernel-resource-lifecycle`, `root-authority`, and
+//!   `service-call-authority`.
+#[cfg(test)]
 use alloc::collections::BTreeMap;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 #[cfg(not(test))]
 use core::ptr;
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+mod slab;
 
 use crate::ipc_core::SharedRegionHandle;
 #[cfg(test)]
@@ -10,16 +33,18 @@ use crate::ipc_core::{
     ChannelHandle, EventHandle, IpcHeader, PORT_NAME_CAPACITY, PortHandle, PortName,
 };
 use kernel_object::api::handle::{HandleRights, HandleToken};
+use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
+#[cfg(test)]
 use spin::Mutex;
-#[cfg(not(test))]
-#[cfg(not(any(test, feature = "host-test")))]
-use x86_64::instructions::interrupts;
+
+use slab::GenerationalSlab;
 
 #[cfg(not(test))]
 use crate::memory::{kernel_vm, phys};
 
 #[cfg(not(test))]
 const PAGE_SIZE: usize = 4096;
+#[cfg(test)]
 const INITIAL_PENDING_CHANNEL_CAPACITY: usize = 4;
 #[cfg(test)]
 const INITIAL_CHANNEL_QUEUE_CAPACITY: usize = 8;
@@ -35,7 +60,18 @@ const MAX_ENDPOINT_INLINE_MESSAGE_BYTES: usize = rustos_user_abi::syscall::IPC_M
 const MAX_ENDPOINT_PENDING_MESSAGES: usize = 64;
 const MAX_ENDPOINT_TRANSFER_HANDLES: usize = 16;
 const MAX_ENDPOINT_WAITERS: usize = 64;
+const MAX_ENDPOINT_OBJECTS: usize = 512;
+const MAX_ENDPOINT_MESSAGE_OBJECTS: usize = 128;
+const MAX_REPLY_OBJECTS: usize = MAX_ENDPOINT_MESSAGE_OBJECTS;
+const MAX_SHARED_REGION_OBJECTS: usize = 1024;
+const MAX_OWNED_ENDPOINT_OBJECTS: usize = MAX_ENDPOINT_OBJECTS - 64;
+const MAX_ENDPOINTS_PER_PROCESS: usize = 32;
+const MAX_ENDPOINTS_PER_TASK: usize = 8;
+pub const MAX_ENDPOINT_WAKE_TASKS: usize = 128;
 const MAX_SHARED_REGION_BYTES: usize = 256 * 1024 * 1024;
+const MAX_SHARED_REGION_TOTAL_BYTES: usize = 512 * 1024 * 1024;
+const MAX_SHARED_REGIONS_PER_PROCESS: usize = 64;
+const MAX_SHARED_REGION_BYTES_PER_PROCESS: usize = 128 * 1024 * 1024;
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -228,23 +264,56 @@ pub enum IpcError {
     NoMemory,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EndpointWakeSet {
-    pub callers: Vec<u64>,
-    pub receivers: Vec<u64>,
+    callers: [u64; MAX_ENDPOINT_WAKE_TASKS],
+    caller_count: usize,
+    receivers: [u64; MAX_ENDPOINT_WAKE_TASKS],
+    receiver_count: usize,
+}
+
+impl Default for EndpointWakeSet {
+    fn default() -> Self {
+        Self {
+            callers: [0; MAX_ENDPOINT_WAKE_TASKS],
+            caller_count: 0,
+            receivers: [0; MAX_ENDPOINT_WAKE_TASKS],
+            receiver_count: 0,
+        }
+    }
 }
 
 impl EndpointWakeSet {
     fn push_caller(&mut self, task_id: u64) {
-        if !self.callers.contains(&task_id) {
-            self.callers.push(task_id);
+        if self.callers[..self.caller_count].contains(&task_id) {
+            return;
         }
+        assert!(
+            self.caller_count < self.callers.len(),
+            "endpoint caller wake set exceeds scheduler task capacity"
+        );
+        self.callers[self.caller_count] = task_id;
+        self.caller_count += 1;
     }
 
     fn push_receiver(&mut self, task_id: u64) {
-        if !self.receivers.contains(&task_id) {
-            self.receivers.push(task_id);
+        if self.receivers[..self.receiver_count].contains(&task_id) {
+            return;
         }
+        assert!(
+            self.receiver_count < self.receivers.len(),
+            "endpoint receiver wake set exceeds scheduler task capacity"
+        );
+        self.receivers[self.receiver_count] = task_id;
+        self.receiver_count += 1;
+    }
+
+    pub fn callers(&self) -> &[u64] {
+        &self.callers[..self.caller_count]
+    }
+
+    pub fn receivers(&self) -> &[u64] {
+        &self.receivers[..self.receiver_count]
     }
 }
 
@@ -267,20 +336,265 @@ struct ChannelObject {
 #[cfg(test)]
 struct SharedRegionObject {
     byte_len: usize,
+    owner_process_id: Option<u64>,
     bytes: Vec<u8>,
+    references: AtomicUsize,
 }
 
 #[cfg(not(test))]
 struct SharedRegionObject {
     byte_len: usize,
+    owner_process_id: Option<u64>,
     phys_start: u64,
     page_count: usize,
+    references: AtomicUsize,
+}
+
+impl SharedRegionObject {
+    fn try_retain(&self) -> bool {
+        self.references
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |references| {
+                (references != 0)
+                    .then(|| references.checked_add(1))
+                    .flatten()
+            })
+            .is_ok()
+    }
+
+    fn release(&self) -> bool {
+        let previous = self.references.fetch_sub(1, Ordering::Release);
+        assert!(previous != 0, "shared-region reference underflow");
+        previous == 1
+    }
+}
+
+struct SharedRegionReclaimQueue {
+    entries: [Option<SharedRegionObject>; MAX_SHARED_REGION_OBJECTS],
+    len: usize,
+}
+
+impl SharedRegionReclaimQueue {
+    const fn new() -> Self {
+        Self {
+            entries: [const { None }; MAX_SHARED_REGION_OBJECTS],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, object: SharedRegionObject) {
+        let slot = self
+            .entries
+            .get_mut(self.len)
+            .expect("shared-region reclaim admission invariant violated");
+        *slot = Some(object);
+        self.len += 1;
+    }
+
+    fn pop_front(&mut self) -> Option<SharedRegionObject> {
+        let object = self.entries.first_mut()?.take()?;
+        for index in 1..self.len {
+            self.entries[index - 1] = self.entries[index].take();
+        }
+        self.len -= 1;
+        Some(object)
+    }
+
+    #[cfg(test)]
+    fn clear(&mut self) {
+        for slot in &mut self.entries[..self.len] {
+            *slot = None;
+        }
+        self.len = 0;
+    }
+}
+
+#[derive(Debug)]
+pub struct KernelSharedRegionMappingHold {
+    region: KernelSharedRegionHandle,
+}
+
+impl Clone for KernelSharedRegionMappingHold {
+    fn clone(&self) -> Self {
+        assert!(
+            retain_shared_region(self.region),
+            "cloned a stale shared-region mapping hold"
+        );
+        Self {
+            region: self.region,
+        }
+    }
+}
+
+impl Drop for KernelSharedRegionMappingHold {
+    fn drop(&mut self) {
+        release_shared_region(self.region);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum EndpointOwner {
     Task(u64),
     Process(u64),
+}
+
+#[derive(Clone, Copy)]
+struct EndpointQuota {
+    owner: EndpointOwner,
+    count: usize,
+}
+
+struct EndpointQuotaTable {
+    entries: [Option<EndpointQuota>; MAX_ENDPOINT_OBJECTS],
+    owned_total: usize,
+}
+
+impl EndpointQuotaTable {
+    const fn new() -> Self {
+        Self {
+            entries: [None; MAX_ENDPOINT_OBJECTS],
+            owned_total: 0,
+        }
+    }
+
+    fn reserve(&mut self, owner: EndpointOwner) -> Result<(), IpcError> {
+        if self.owned_total >= MAX_OWNED_ENDPOINT_OBJECTS {
+            return Err(IpcError::NoMemory);
+        }
+        let per_owner_limit = match owner {
+            EndpointOwner::Task(_) => MAX_ENDPOINTS_PER_TASK,
+            EndpointOwner::Process(_) => MAX_ENDPOINTS_PER_PROCESS,
+        };
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .flatten()
+            .find(|entry| entry.owner == owner)
+        {
+            if entry.count >= per_owner_limit {
+                return Err(IpcError::NoMemory);
+            }
+            entry.count += 1;
+            self.owned_total += 1;
+            return Ok(());
+        }
+        let Some(slot) = self.entries.iter_mut().find(|entry| entry.is_none()) else {
+            return Err(IpcError::NoMemory);
+        };
+        *slot = Some(EndpointQuota { owner, count: 1 });
+        self.owned_total += 1;
+        Ok(())
+    }
+
+    fn release(&mut self, owner: EndpointOwner) {
+        let Some(slot) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.is_some_and(|entry| entry.owner == owner))
+        else {
+            panic!("endpoint quota release lost owner accounting");
+        };
+        let entry = slot
+            .as_mut()
+            .expect("matched endpoint quota slot must be populated");
+        if entry.count == 0 || self.owned_total == 0 {
+            panic!("endpoint quota accounting underflow");
+        }
+        entry.count -= 1;
+        self.owned_total -= 1;
+        if entry.count == 0 {
+            *slot = None;
+        }
+    }
+
+    #[cfg(test)]
+    fn clear(&mut self) {
+        self.entries = [None; MAX_ENDPOINT_OBJECTS];
+        self.owned_total = 0;
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SharedRegionQuota {
+    process_id: u64,
+    object_count: usize,
+    byte_count: usize,
+}
+
+struct SharedRegionQuotaTable {
+    entries: [Option<SharedRegionQuota>; MAX_PROCESS_RESOURCE_OWNERS],
+}
+
+const MAX_PROCESS_RESOURCE_OWNERS: usize = 32;
+
+impl SharedRegionQuotaTable {
+    const fn new() -> Self {
+        Self {
+            entries: [None; MAX_PROCESS_RESOURCE_OWNERS],
+        }
+    }
+
+    fn reserve(&mut self, process_id: u64, byte_len: usize) -> Result<(), IpcError> {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .flatten()
+            .find(|entry| entry.process_id == process_id)
+        {
+            if entry.object_count >= MAX_SHARED_REGIONS_PER_PROCESS
+                || entry
+                    .byte_count
+                    .checked_add(byte_len)
+                    .is_none_or(|bytes| bytes > MAX_SHARED_REGION_BYTES_PER_PROCESS)
+            {
+                return Err(IpcError::NoMemory);
+            }
+            entry.object_count += 1;
+            entry.byte_count += byte_len;
+            return Ok(());
+        }
+        if byte_len > MAX_SHARED_REGION_BYTES_PER_PROCESS {
+            return Err(IpcError::NoMemory);
+        }
+        let Some(slot) = self.entries.iter_mut().find(|entry| entry.is_none()) else {
+            return Err(IpcError::NoMemory);
+        };
+        *slot = Some(SharedRegionQuota {
+            process_id,
+            object_count: 1,
+            byte_count: byte_len,
+        });
+        Ok(())
+    }
+
+    fn release(&mut self, process_id: u64, byte_len: usize) {
+        let Some(slot) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.is_some_and(|entry| entry.process_id == process_id))
+        else {
+            panic!("shared-region quota release lost process accounting");
+        };
+        let entry = slot
+            .as_mut()
+            .expect("matched shared-region quota slot must be populated");
+        if entry.object_count == 0 || entry.byte_count < byte_len {
+            panic!("shared-region quota accounting underflow");
+        }
+        entry.object_count -= 1;
+        entry.byte_count -= byte_len;
+        if entry.object_count == 0 {
+            assert_eq!(
+                entry.byte_count, 0,
+                "shared-region object/byte accounting diverged"
+            );
+            *slot = None;
+        }
+    }
+
+    #[cfg(test)]
+    fn clear(&mut self) {
+        self.entries = [None; MAX_PROCESS_RESOURCE_OWNERS];
+    }
 }
 
 #[derive(Default)]
@@ -292,7 +606,9 @@ struct EndpointObject {
 
 struct EndpointMessageObject {
     endpoint_id: u64,
+    reply_id: u64,
     caller_task_id: u64,
+    published: bool,
     request: Vec<u8>,
     attached_handles: Vec<KernelTransferredHandle>,
     response: Option<EndpointResponse>,
@@ -302,6 +618,7 @@ struct ReplyObject {
     message_id: u64,
     receiver_owner: Option<EndpointOwner>,
     used: bool,
+    consumed: bool,
 }
 
 enum EndpointResponse {
@@ -318,38 +635,24 @@ struct EventObject {
     signal_count: u64,
 }
 
+#[cfg(test)]
 #[derive(Default)]
 struct IpcObjectTable {
     next_id: u64,
-    #[cfg(test)]
     named_ports: BTreeMap<PortName, u64>,
-    #[cfg(test)]
     ports: BTreeMap<u64, PortObject>,
-    #[cfg(test)]
     channels: BTreeMap<u64, ChannelObject>,
-    endpoints: BTreeMap<u64, EndpointObject>,
-    replies: BTreeMap<u64, ReplyObject>,
-    endpoint_messages: BTreeMap<u64, EndpointMessageObject>,
-    shared_regions: BTreeMap<u64, SharedRegionObject>,
-    #[cfg(test)]
     events: BTreeMap<u64, EventObject>,
 }
 
+#[cfg(test)]
 impl IpcObjectTable {
     const fn new() -> Self {
         Self {
             next_id: 1,
-            #[cfg(test)]
             named_ports: BTreeMap::new(),
-            #[cfg(test)]
             ports: BTreeMap::new(),
-            #[cfg(test)]
             channels: BTreeMap::new(),
-            endpoints: BTreeMap::new(),
-            replies: BTreeMap::new(),
-            endpoint_messages: BTreeMap::new(),
-            shared_regions: BTreeMap::new(),
-            #[cfg(test)]
             events: BTreeMap::new(),
         }
     }
@@ -363,7 +666,6 @@ impl IpcObjectTable {
         Ok(id)
     }
 
-    #[cfg(test)]
     fn allocate_channel_pair(&mut self) -> Result<(u64, u64), IpcError> {
         let left_id = self.allocate_id()?;
         let right_id = self.allocate_id()?;
@@ -389,38 +691,49 @@ impl IpcObjectTable {
     }
 }
 
+static ENDPOINTS: GenerationalSlab<
+    EndpointObject,
+    MAX_ENDPOINT_OBJECTS,
+    { LockClass::IpcEndpoint as u8 },
+> = GenerationalSlab::new();
+static ENDPOINT_QUOTAS: TrackedSpinLock<EndpointQuotaTable, { LockClass::IpcEndpointQuota as u8 }> =
+    TrackedSpinLock::new(EndpointQuotaTable::new());
+static ENDPOINT_MESSAGES: GenerationalSlab<
+    EndpointMessageObject,
+    MAX_ENDPOINT_MESSAGE_OBJECTS,
+    { LockClass::IpcMessage as u8 },
+> = GenerationalSlab::new();
+static REPLIES: GenerationalSlab<ReplyObject, MAX_REPLY_OBJECTS, { LockClass::IpcReply as u8 }> =
+    GenerationalSlab::new();
+static SHARED_REGIONS: GenerationalSlab<
+    SharedRegionObject,
+    MAX_SHARED_REGION_OBJECTS,
+    { LockClass::IpcRegion as u8 },
+> = GenerationalSlab::new();
+static SHARED_REGION_RECLAIMS: TrackedSpinLock<
+    SharedRegionReclaimQueue,
+    { LockClass::IpcRegionReclaim as u8 },
+> = TrackedSpinLock::new(SharedRegionReclaimQueue::new());
+static SHARED_REGION_ADMITTED: AtomicUsize = AtomicUsize::new(0);
+static SHARED_REGION_BYTES_ADMITTED: AtomicUsize = AtomicUsize::new(0);
+static SHARED_REGION_QUOTAS: TrackedSpinLock<
+    SharedRegionQuotaTable,
+    { LockClass::IpcRegionQuota as u8 },
+> = TrackedSpinLock::new(SharedRegionQuotaTable::new());
+
+#[cfg(test)]
 static IPC_OBJECTS: Mutex<IpcObjectTable> = Mutex::new(IpcObjectTable::new());
 
+#[cfg(test)]
 fn with_ipc_objects<R>(f: impl FnOnce(&mut IpcObjectTable) -> R) -> R {
-    #[cfg(not(any(test, feature = "host-test")))]
-    {
-        interrupts::without_interrupts(|| {
-            let mut objects = IPC_OBJECTS.lock();
-            f(&mut objects)
-        })
-    }
-
-    #[cfg(any(test, feature = "host-test"))]
-    {
-        let mut objects = IPC_OBJECTS.lock();
-        f(&mut objects)
-    }
+    let mut objects = IPC_OBJECTS.lock();
+    f(&mut objects)
 }
 
+#[cfg(test)]
 fn with_ipc_objects_ref<R>(f: impl FnOnce(&IpcObjectTable) -> R) -> R {
-    #[cfg(not(any(test, feature = "host-test")))]
-    {
-        interrupts::without_interrupts(|| {
-            let objects = IPC_OBJECTS.lock();
-            f(&objects)
-        })
-    }
-
-    #[cfg(any(test, feature = "host-test"))]
-    {
-        let objects = IPC_OBJECTS.lock();
-        f(&objects)
-    }
+    let objects = IPC_OBJECTS.lock();
+    f(&objects)
 }
 
 #[cfg(test)]
@@ -519,10 +832,10 @@ pub fn create_named_port(name: Option<PortName>) -> Result<KernelPortHandle, Ipc
     };
 
     with_ipc_objects(|objects| {
-        if let Some(name) = normalized_name {
-            if objects.named_ports.contains_key(&name) {
-                return Err(IpcError::InvalidArgument);
-            }
+        if let Some(name) = normalized_name
+            && objects.named_ports.contains_key(&name)
+        {
+            return Err(IpcError::InvalidArgument);
         }
 
         let id = objects.allocate_id()?;
@@ -612,19 +925,85 @@ pub fn connect_named_port(name: PortName) -> Result<KernelChannelHandle, IpcErro
     })
 }
 
+fn reserve_shared_region_admission(
+    owner_process_id: Option<u64>,
+    byte_len: usize,
+) -> Result<(), IpcError> {
+    if SHARED_REGION_ADMITTED
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |admitted| {
+            if admitted >= MAX_SHARED_REGION_OBJECTS {
+                return None;
+            }
+            Some(admitted + 1)
+        })
+        .is_err()
+    {
+        return Err(IpcError::NoMemory);
+    }
+    if SHARED_REGION_BYTES_ADMITTED
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |admitted| {
+            admitted
+                .checked_add(byte_len)
+                .filter(|bytes| *bytes <= MAX_SHARED_REGION_TOTAL_BYTES)
+        })
+        .is_err()
+    {
+        SHARED_REGION_ADMITTED.fetch_sub(1, Ordering::AcqRel);
+        return Err(IpcError::NoMemory);
+    }
+    if let Some(process_id) = owner_process_id
+        && let Err(error) = SHARED_REGION_QUOTAS.lock().reserve(process_id, byte_len)
+    {
+        SHARED_REGION_BYTES_ADMITTED.fetch_sub(byte_len, Ordering::AcqRel);
+        SHARED_REGION_ADMITTED.fetch_sub(1, Ordering::AcqRel);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn release_shared_region_admission(owner_process_id: Option<u64>, byte_len: usize) {
+    if let Some(process_id) = owner_process_id {
+        SHARED_REGION_QUOTAS.lock().release(process_id, byte_len);
+    }
+    let previous_bytes = SHARED_REGION_BYTES_ADMITTED.fetch_sub(byte_len, Ordering::AcqRel);
+    assert!(
+        previous_bytes >= byte_len,
+        "shared-region admission byte count underflow"
+    );
+    let previous = SHARED_REGION_ADMITTED.fetch_sub(1, Ordering::AcqRel);
+    assert!(previous != 0, "shared-region admission count underflow");
+}
+
 pub fn create_shared_region(byte_len: usize) -> Result<KernelSharedRegionHandle, IpcError> {
+    create_shared_region_with_owner(None, byte_len)
+}
+
+pub fn create_shared_region_for_process(
+    owner_process_id: u64,
+    byte_len: usize,
+) -> Result<KernelSharedRegionHandle, IpcError> {
+    create_shared_region_with_owner(Some(owner_process_id), byte_len)
+}
+
+fn create_shared_region_with_owner(
+    owner_process_id: Option<u64>,
+    byte_len: usize,
+) -> Result<KernelSharedRegionHandle, IpcError> {
     if byte_len == 0 || byte_len > MAX_SHARED_REGION_BYTES {
         return Err(IpcError::InvalidArgument);
     }
+    reserve_shared_region_admission(owner_process_id, byte_len)?;
 
     #[cfg(test)]
-    let object = SharedRegionObject {
+    let object_result = Ok::<SharedRegionObject, IpcError>(SharedRegionObject {
         byte_len,
+        owner_process_id,
         bytes: alloc::vec![0_u8; byte_len],
-    };
+        references: AtomicUsize::new(1),
+    });
 
     #[cfg(not(test))]
-    let object = {
+    let object_result = (|| {
         let page_count = byte_len
             .checked_add(PAGE_SIZE - 1)
             .map(|len| len / PAGE_SIZE)
@@ -642,18 +1021,95 @@ pub fn create_shared_region(byte_len: usize) -> Result<KernelSharedRegionHandle,
                 alloc_len,
             );
         }
-        SharedRegionObject {
+        Ok(SharedRegionObject {
             byte_len,
+            owner_process_id,
             phys_start: phys_start.as_u64(),
             page_count,
+            references: AtomicUsize::new(1),
+        })
+    })();
+
+    let object = match object_result {
+        Ok(object) => object,
+        Err(error) => {
+            release_shared_region_admission(owner_process_id, byte_len);
+            return Err(error);
         }
     };
+    match SHARED_REGIONS.insert(object) {
+        Ok(raw) => Ok(KernelSharedRegionHandle::from_raw(raw)),
+        Err(object) => {
+            enqueue_shared_region_reclaim(object);
+            Err(IpcError::NoMemory)
+        }
+    }
+}
 
-    with_ipc_objects(|objects| {
-        let id = objects.allocate_id()?;
-        objects.shared_regions.insert(id, object);
-        Ok(KernelSharedRegionHandle::from_raw(id))
-    })
+pub fn retain_shared_region(region: KernelSharedRegionHandle) -> bool {
+    SHARED_REGIONS
+        .with(region.raw(), SharedRegionObject::try_retain)
+        .unwrap_or(false)
+}
+
+pub fn release_shared_region(region: KernelSharedRegionHandle) {
+    let remove = SHARED_REGIONS
+        .with(region.raw(), SharedRegionObject::release)
+        .unwrap_or(false);
+    if remove {
+        let removed = SHARED_REGIONS.remove(region.raw());
+        let removed = removed.expect("last shared-region reference lost its object");
+        enqueue_shared_region_reclaim(removed);
+    }
+}
+
+pub fn acquire_shared_region_mapping(
+    region: KernelSharedRegionHandle,
+) -> Option<KernelSharedRegionMappingHold> {
+    retain_shared_region(region).then_some(KernelSharedRegionMappingHold { region })
+}
+
+fn enqueue_shared_region_reclaim(object: SharedRegionObject) {
+    SHARED_REGION_RECLAIMS.lock().push(object);
+}
+
+pub fn service_deferred_shared_region_reclaims(max_pages: usize) -> usize {
+    if max_pages == 0 {
+        return 0;
+    }
+    let Some(mut object) = SHARED_REGION_RECLAIMS.lock().pop_front() else {
+        return 0;
+    };
+
+    #[cfg(test)]
+    let reclaimed = {
+        object.bytes.clear();
+        1
+    };
+
+    #[cfg(not(test))]
+    let reclaimed = {
+        let count = max_pages.min(object.page_count);
+        for _ in 0..count {
+            object.page_count -= 1;
+            phys::free_frame(x86_64::PhysAddr::new(
+                object.phys_start + object.page_count as u64 * PAGE_SIZE as u64,
+            ));
+        }
+        count
+    };
+
+    #[cfg(test)]
+    let complete = object.bytes.is_empty();
+    #[cfg(not(test))]
+    let complete = object.page_count == 0;
+
+    if complete {
+        release_shared_region_admission(object.owner_process_id, object.byte_len);
+    } else {
+        enqueue_shared_region_reclaim(object);
+    }
+    reclaimed
 }
 
 pub fn create_endpoint() -> Result<KernelEndpointHandle, IpcError> {
@@ -678,18 +1134,45 @@ pub fn create_endpoint_for_process(
 fn create_endpoint_with_owner(
     owner: Option<EndpointOwner>,
 ) -> Result<KernelEndpointHandle, IpcError> {
-    with_ipc_objects(|objects| {
-        let id = objects.allocate_id()?;
-        objects.endpoints.insert(
-            id,
-            EndpointObject {
-                owner,
-                pending_messages: VecDeque::with_capacity(INITIAL_PENDING_CHANNEL_CAPACITY),
-                waiting_receivers: VecDeque::with_capacity(INITIAL_PENDING_CHANNEL_CAPACITY),
-            },
-        );
-        Ok(KernelEndpointHandle::from_raw(id))
-    })
+    if let Some(owner) = owner {
+        ENDPOINT_QUOTAS.lock().reserve(owner)?;
+    }
+    let endpoint = (|| {
+        let mut pending_messages = VecDeque::new();
+        pending_messages
+            .try_reserve_exact(MAX_ENDPOINT_PENDING_MESSAGES)
+            .map_err(|_| IpcError::NoMemory)?;
+        let mut waiting_receivers = VecDeque::new();
+        waiting_receivers
+            .try_reserve_exact(MAX_ENDPOINT_WAITERS)
+            .map_err(|_| IpcError::NoMemory)?;
+        Ok(EndpointObject {
+            owner,
+            // Reserve the complete admitted queue sizes before publication. No
+            // endpoint operation can therefore enter the allocator while
+            // holding the endpoint slot lock.
+            pending_messages,
+            waiting_receivers,
+        })
+    })();
+    let endpoint = match endpoint {
+        Ok(endpoint) => endpoint,
+        Err(error) => {
+            if let Some(owner) = owner {
+                ENDPOINT_QUOTAS.lock().release(owner);
+            }
+            return Err(error);
+        }
+    };
+    match ENDPOINTS.insert(endpoint) {
+        Ok(handle) => Ok(KernelEndpointHandle::from_raw(handle)),
+        Err(endpoint) => {
+            if let Some(owner) = endpoint.owner {
+                ENDPOINT_QUOTAS.lock().release(owner);
+            }
+            Err(IpcError::NoMemory)
+        }
+    }
 }
 
 fn validate_endpoint_transfer_handles(
@@ -745,42 +1228,57 @@ fn enqueue_endpoint_call_with_handles_faultable(
         return Err(IpcError::NoMemory);
     }
 
-    with_ipc_objects(|objects| {
-        let Some(endpoint_object) = objects.endpoints.get(&endpoint.raw()) else {
-            return Err(IpcError::InvalidHandle);
-        };
-        if endpoint_object.pending_messages.len() >= MAX_ENDPOINT_PENDING_MESSAGES {
+    let receiver_owner = ENDPOINTS
+        .with(endpoint.raw(), |endpoint| endpoint.owner)
+        .ok_or(IpcError::InvalidHandle)?;
+
+    let mut request_handles = Vec::new();
+    request_handles
+        .try_reserve_exact(MAX_ENDPOINT_TRANSFER_HANDLES.saturating_mul(2))
+        .map_err(|_| IpcError::NoMemory)?;
+    request_handles.extend_from_slice(attached_handles);
+    let request = copy_endpoint_bytes(request)?;
+    let message_id = ENDPOINT_MESSAGES
+        .insert(EndpointMessageObject {
+            endpoint_id: endpoint.raw(),
+            reply_id: 0,
+            caller_task_id,
+            published: false,
+            request,
+            attached_handles: request_handles,
+            response: None,
+        })
+        .map_err(|_| IpcError::NoMemory)?;
+    let reply_id = match REPLIES.insert(ReplyObject {
+        message_id,
+        receiver_owner,
+        used: false,
+        consumed: false,
+    }) {
+        Ok(reply_id) => reply_id,
+        Err(_) => {
+            drop(ENDPOINT_MESSAGES.remove(message_id));
             return Err(IpcError::NoMemory);
         }
-        let receiver_owner = endpoint_object.owner;
+    };
+    let _ = ENDPOINT_MESSAGES.with_mut(message_id, |message| message.reply_id = reply_id);
 
-        let message_id = objects.allocate_id()?;
-        let reply_id = objects.allocate_id()?;
-        objects.endpoint_messages.insert(
-            message_id,
-            EndpointMessageObject {
-                endpoint_id: endpoint.raw(),
-                caller_task_id,
-                request: request.to_vec(),
-                attached_handles: attached_handles.to_vec(),
-                response: None,
-            },
-        );
-        objects.replies.insert(
-            reply_id,
-            ReplyObject {
-                message_id,
-                receiver_owner,
-                used: false,
-            },
-        );
-
-        let receiver_to_wake = {
-            let endpoint_object = objects
-                .endpoints
-                .get_mut(&endpoint.raw())
-                .expect("ipc endpoint disappeared while enqueueing call");
-            endpoint_object.pending_messages.push_back(message_id);
+    let receiver_to_wake = ENDPOINTS.with_mut(endpoint.raw(), |endpoint_object| {
+        if endpoint_object.pending_messages.len() >= MAX_ENDPOINT_PENDING_MESSAGES {
+            return None;
+        }
+        let published = ENDPOINT_MESSAGES.with_mut(message_id, |message| {
+            if message.endpoint_id != endpoint.raw() || message.reply_id != reply_id {
+                return false;
+            }
+            message.published = true;
+            true
+        });
+        if published != Some(true) {
+            return None;
+        }
+        endpoint_object.pending_messages.push_back(message_id);
+        Some(
             endpoint_object
                 .waiting_receivers
                 .pop_front()
@@ -788,25 +1286,34 @@ fn enqueue_endpoint_call_with_handles_faultable(
                     Some(EndpointOwner::Task(task_id)) => Some(task_id),
                     Some(EndpointOwner::Process(_)) | None => None,
                 })
-                .filter(|task_id| *task_id != caller_task_id)
+                .filter(|task_id| *task_id != caller_task_id),
+        )
+    });
+    let Some(Some(receiver_to_wake)) = receiver_to_wake else {
+        let _ = REPLIES.remove(reply_id);
+        drop(ENDPOINT_MESSAGES.remove(message_id));
+        return if ENDPOINTS.with(endpoint.raw(), |_| ()).is_some() {
+            Err(IpcError::NoMemory)
+        } else {
+            Err(IpcError::InvalidHandle)
         };
+    };
 
-        Ok((KernelReplyHandle::from_raw(reply_id), receiver_to_wake))
-    })
+    Ok((KernelReplyHandle::from_raw(reply_id), receiver_to_wake))
 }
 
 /// Returns the process owner of the endpoint bound into a live reply
 /// capability.  The scheduler uses this only to establish bounded priority
 /// inheritance before a process-owned endpoint has selected a specific worker.
 pub fn endpoint_receiver_process_for_reply(reply: KernelReplyHandle) -> Option<u64> {
-    with_ipc_objects_ref(|objects| {
-        objects.replies.get(&reply.raw()).and_then(|reply_object| {
+    REPLIES
+        .with(reply.raw(), |reply_object| {
             match reply_object.receiver_owner {
                 Some(EndpointOwner::Process(process_id)) => Some(process_id),
                 Some(EndpointOwner::Task(_)) | None => None,
             }
         })
-    })
+        .flatten()
 }
 
 pub fn recv_endpoint(
@@ -845,52 +1352,36 @@ pub fn recv_endpoint_with_sender_and_limits(
     request_capacity: usize,
     handle_capacity: usize,
 ) -> Result<Option<EndpointReceivedWithSender>, IpcError> {
-    with_ipc_objects(|objects| {
-        let Some(endpoint_object) = objects.endpoints.get_mut(&endpoint.raw()) else {
-            return Err(IpcError::InvalidHandle);
-        };
-        let Some(message_id) = endpoint_object.pending_messages.front().copied() else {
-            return Ok(None);
-        };
+    ENDPOINTS
+        .with_mut(endpoint.raw(), |endpoint_object| {
+            let Some(message_id) = endpoint_object.pending_messages.front().copied() else {
+                return Ok(None);
+            };
 
-        let Some(message) = objects.endpoint_messages.get(&message_id) else {
-            return Err(IpcError::InvalidHandle);
-        };
-        if message.request.len() > request_capacity
-            || message.attached_handles.len() > handle_capacity
-        {
-            return Err(IpcError::BufferTooSmall);
-        }
-        let caller_task_id = message.caller_task_id;
-        let Some(reply_id) = objects
-            .replies
-            .iter()
-            .find_map(|(reply_id, reply)| (reply.message_id == message_id).then_some(*reply_id))
-        else {
-            return Err(IpcError::InvalidHandle);
-        };
-        objects
-            .endpoints
-            .get_mut(&endpoint.raw())
-            .expect("ipc endpoint disappeared while dequeuing call")
-            .pending_messages
-            .pop_front();
-        // Move the request bytes and handles out of the message rather than cloning;
-        // the server has consumed them and the message struct only needs to track
-        // the reply-write path from here on.
-        let message = objects
-            .endpoint_messages
-            .get_mut(&message_id)
-            .expect("ipc endpoint_message disappeared while dequeuing call");
-        let request = core::mem::take(&mut message.request);
-        let attached_handles = core::mem::take(&mut message.attached_handles);
-        Ok(Some((
-            KernelReplyHandle::from_raw(reply_id),
-            request,
-            attached_handles,
-            caller_task_id,
-        )))
-    })
+            let received = ENDPOINT_MESSAGES
+                .with_mut(message_id, |message| {
+                    if message.endpoint_id != endpoint.raw() {
+                        return Err(IpcError::InvalidHandle);
+                    }
+                    if message.request.len() > request_capacity
+                        || message.attached_handles.len() > handle_capacity
+                    {
+                        return Err(IpcError::BufferTooSmall);
+                    }
+                    let request = core::mem::take(&mut message.request);
+                    let attached_handles = core::mem::take(&mut message.attached_handles);
+                    Ok((
+                        KernelReplyHandle::from_raw(message.reply_id),
+                        request,
+                        attached_handles,
+                        message.caller_task_id,
+                    ))
+                })
+                .ok_or(IpcError::InvalidHandle)??;
+            endpoint_object.pending_messages.pop_front();
+            Ok(Some(received))
+        })
+        .ok_or(IpcError::InvalidHandle)?
 }
 
 /// Confirms that a task-owned internal endpoint is received only by that task.
@@ -900,33 +1391,27 @@ pub fn authorize_endpoint_receiver(
     endpoint: KernelEndpointHandle,
     receiver_task_id: u64,
 ) -> Result<(), IpcError> {
-    with_ipc_objects(|objects| {
-        let Some(endpoint_object) = objects.endpoints.get(&endpoint.raw()) else {
-            return Err(IpcError::InvalidHandle);
-        };
-        if !endpoint_owner_allows(endpoint_object.owner, EndpointOwner::Task(receiver_task_id)) {
-            return Err(IpcError::PermissionDenied);
-        }
-        Ok(())
-    })
+    ENDPOINTS
+        .with(endpoint.raw(), |endpoint_object| {
+            endpoint_owner_allows(endpoint_object.owner, EndpointOwner::Task(receiver_task_id))
+        })
+        .ok_or(IpcError::InvalidHandle)
+        .and_then(|allowed| allowed.then_some(()).ok_or(IpcError::PermissionDenied))
 }
 
 pub fn authorize_endpoint_receiver_for_process(
     endpoint: KernelEndpointHandle,
     receiver_process_id: u64,
 ) -> Result<(), IpcError> {
-    with_ipc_objects(|objects| {
-        let Some(endpoint_object) = objects.endpoints.get(&endpoint.raw()) else {
-            return Err(IpcError::InvalidHandle);
-        };
-        if !endpoint_owner_allows(
-            endpoint_object.owner,
-            EndpointOwner::Process(receiver_process_id),
-        ) {
-            return Err(IpcError::PermissionDenied);
-        }
-        Ok(())
-    })
+    ENDPOINTS
+        .with(endpoint.raw(), |endpoint_object| {
+            endpoint_owner_allows(
+                endpoint_object.owner,
+                EndpointOwner::Process(receiver_process_id),
+            )
+        })
+        .ok_or(IpcError::InvalidHandle)
+        .and_then(|allowed| allowed.then_some(()).ok_or(IpcError::PermissionDenied))
 }
 
 fn endpoint_owner_allows(owner: Option<EndpointOwner>, receiver: EndpointOwner) -> bool {
@@ -943,19 +1428,18 @@ pub fn add_endpoint_receiver_waiter(
     endpoint: KernelEndpointHandle,
     task_id: u64,
 ) -> Result<bool, IpcError> {
-    with_ipc_objects(|objects| {
-        let Some(endpoint_object) = objects.endpoints.get_mut(&endpoint.raw()) else {
-            return Err(IpcError::InvalidHandle);
-        };
-        let already_waiting = endpoint_object.waiting_receivers.contains(&task_id);
-        if !already_waiting {
-            if endpoint_object.waiting_receivers.len() >= MAX_ENDPOINT_WAITERS {
-                return Err(IpcError::NoMemory);
+    ENDPOINTS
+        .with_mut(endpoint.raw(), |endpoint_object| {
+            let already_waiting = endpoint_object.waiting_receivers.contains(&task_id);
+            if !already_waiting {
+                if endpoint_object.waiting_receivers.len() >= MAX_ENDPOINT_WAITERS {
+                    return Err(IpcError::NoMemory);
+                }
+                endpoint_object.waiting_receivers.push_back(task_id);
             }
-            endpoint_object.waiting_receivers.push_back(task_id);
-        }
-        Ok(!endpoint_object.pending_messages.is_empty())
-    })
+            Ok(!endpoint_object.pending_messages.is_empty())
+        })
+        .ok_or(IpcError::InvalidHandle)?
 }
 
 pub fn complete_endpoint_reply(reply: KernelReplyHandle, response: &[u8]) -> Result<u64, IpcError> {
@@ -989,27 +1473,11 @@ fn complete_endpoint_reply_with_handles_faultable(
         return Err(IpcError::NoMemory);
     }
 
-    with_ipc_objects(|objects| {
-        let Some(reply_object) = objects.replies.get_mut(&reply.raw()) else {
-            return Err(IpcError::InvalidHandle);
-        };
-        if reply_object.used {
-            return Err(IpcError::InvalidArgument);
-        }
-
-        let Some(message) = objects.endpoint_messages.get_mut(&reply_object.message_id) else {
-            return Err(IpcError::InvalidHandle);
-        };
-        if message.response.is_some() {
-            return Err(IpcError::InvalidHandle);
-        }
-        reply_object.used = true;
-        message.response = Some(EndpointResponse::Data {
-            bytes: response.to_vec(),
-            attached_handles: attached_handles.to_vec(),
-        });
-        Ok(message.caller_task_id)
-    })
+    complete_endpoint_reply_prepared(
+        reply,
+        None,
+        prepare_endpoint_response(response, attached_handles)?,
+    )
 }
 
 /// Completes a reply obtained through a task-owned internal endpoint.
@@ -1100,32 +1568,90 @@ fn complete_endpoint_reply_with_handles_for_owner_faultable(
         return Err(IpcError::NoMemory);
     }
 
-    with_ipc_objects(|objects| {
-        let Some(reply_object) = objects.replies.get_mut(&reply.raw()) else {
-            return Err(IpcError::InvalidHandle);
-        };
-        if !endpoint_owner_allows(reply_object.receiver_owner, receiver_owner) {
-            return Err(IpcError::PermissionDenied);
-        }
-        if reply_object.used {
-            return Err(IpcError::InvalidArgument);
-        }
+    complete_endpoint_reply_prepared(
+        reply,
+        Some(receiver_owner),
+        prepare_endpoint_response(response, attached_handles)?,
+    )
+}
 
-        let Some(message) = objects.endpoint_messages.get_mut(&reply_object.message_id) else {
-            return Err(IpcError::InvalidHandle);
-        };
-        if message.response.is_some() {
-            return Err(IpcError::InvalidHandle);
-        }
-        reply_object.used = true;
-        message.response = Some(EndpointResponse::Data {
-            bytes: response.to_vec(),
-            attached_handles: attached_handles.to_vec(),
-        });
-        Ok(message.caller_task_id)
+fn prepare_endpoint_response(
+    response: &[u8],
+    attached_handles: &[KernelTransferredHandle],
+) -> Result<EndpointResponse, IpcError> {
+    let mut handles = Vec::new();
+    handles
+        .try_reserve_exact(MAX_ENDPOINT_TRANSFER_HANDLES.saturating_mul(2))
+        .map_err(|_| IpcError::NoMemory)?;
+    handles.extend_from_slice(attached_handles);
+    Ok(EndpointResponse::Data {
+        bytes: copy_endpoint_bytes(response)?,
+        attached_handles: handles,
     })
 }
 
+fn copy_endpoint_bytes(bytes: &[u8]) -> Result<Vec<u8>, IpcError> {
+    let mut copy = Vec::new();
+    copy.try_reserve_exact(bytes.len())
+        .map_err(|_| IpcError::NoMemory)?;
+    copy.extend_from_slice(bytes);
+    Ok(copy)
+}
+
+fn complete_endpoint_reply_prepared(
+    reply: KernelReplyHandle,
+    required_owner: Option<EndpointOwner>,
+    response: EndpointResponse,
+) -> Result<u64, IpcError> {
+    let message_id = REPLIES
+        .with(reply.raw(), |reply_object| {
+            if required_owner
+                .is_some_and(|owner| !endpoint_owner_allows(reply_object.receiver_owner, owner))
+            {
+                return Err(IpcError::PermissionDenied);
+            }
+            if reply_object.consumed {
+                return Err(IpcError::InvalidArgument);
+            }
+            Ok(reply_object.message_id)
+        })
+        .ok_or(IpcError::InvalidHandle)??;
+
+    // Keep ownership outside both slot locks until the exact reply identity
+    // has been revalidated. If the transaction loses a race, the backing
+    // vectors are then dropped after the guards have been released.
+    let mut response = Some(response);
+    let result = ENDPOINT_MESSAGES
+        .with_mut(message_id, |message| {
+            REPLIES
+                .with_mut(reply.raw(), |reply_object| {
+                    if reply_object.message_id != message_id || reply_object.consumed {
+                        return Err(IpcError::InvalidHandle);
+                    }
+                    if required_owner.is_some_and(|owner| {
+                        !endpoint_owner_allows(reply_object.receiver_owner, owner)
+                    }) {
+                        return Err(IpcError::PermissionDenied);
+                    }
+                    if reply_object.used {
+                        return Err(IpcError::InvalidArgument);
+                    }
+                    if message.response.is_some() {
+                        return Err(IpcError::InvalidHandle);
+                    }
+                    let caller = message.caller_task_id;
+                    message.response = response.take();
+                    reply_object.used = true;
+                    Ok(caller)
+                })
+                .ok_or(IpcError::InvalidHandle)?
+        })
+        .ok_or(IpcError::InvalidHandle)?;
+    drop(response);
+    result
+}
+
+#[cfg(test)]
 pub fn take_endpoint_response(reply: KernelReplyHandle) -> Result<Option<Vec<u8>>, IpcError> {
     let Some((response, _handles)) = take_endpoint_response_with_handle_limit(reply, 0)? else {
         return Ok(None);
@@ -1133,6 +1659,7 @@ pub fn take_endpoint_response(reply: KernelReplyHandle) -> Result<Option<Vec<u8>
     Ok(Some(response))
 }
 
+#[cfg(test)]
 pub fn take_endpoint_response_with_handle_limit(
     reply: KernelReplyHandle,
     handle_capacity: usize,
@@ -1140,10 +1667,9 @@ pub fn take_endpoint_response_with_handle_limit(
     match take_endpoint_response_detailed(reply, handle_capacity)? {
         EndpointResponseTake::Pending => Ok(None),
         EndpointResponseTake::Response(response) => Ok(Some(response)),
-        // This compatibility wrapper predates transferred handles in terminal
-        // error results. Its callers use handle_capacity = 0 and cannot have
-        // created request descriptors; handle-aware callers use the detailed
-        // API and return the descriptors to their owning substrate.
+        // TEST-HARNESS: Test-only callers never create request descriptors.
+        // Production uses the detailed result and settles discarded transfer
+        // descriptors in the owning handle substrate.
         EndpointResponseTake::Error { error, .. } => Err(error),
     }
 }
@@ -1152,44 +1678,65 @@ pub fn take_endpoint_response_detailed(
     reply: KernelReplyHandle,
     handle_capacity: usize,
 ) -> Result<EndpointResponseTake, IpcError> {
-    with_ipc_objects(|objects| {
-        let Some(reply_object) = objects.replies.get(&reply.raw()) else {
-            return Err(IpcError::InvalidHandle);
-        };
-        let message_id = reply_object.message_id;
-        let Some(message) = objects.endpoint_messages.get_mut(&message_id) else {
-            return Err(IpcError::InvalidHandle);
-        };
-        match message.response.as_ref() {
-            None => Ok(EndpointResponseTake::Pending),
-            Some(EndpointResponse::Data {
-                attached_handles, ..
-            }) if attached_handles.len() > handle_capacity => Err(IpcError::BufferTooSmall),
-            Some(EndpointResponse::Data { .. }) => {
-                let Some(EndpointResponse::Data {
-                    bytes,
-                    attached_handles,
-                }) = message.response.take()
-                else {
-                    unreachable!("response was checked above");
-                };
-                objects.endpoint_messages.remove(&message_id);
-                objects.replies.remove(&reply.raw());
-                Ok(EndpointResponseTake::Response((bytes, attached_handles)))
-            }
-            Some(EndpointResponse::Error(err)) => {
-                let err = *err;
-                message.response.take();
-                let discarded_request_handles = core::mem::take(&mut message.attached_handles);
-                objects.endpoint_messages.remove(&message_id);
-                objects.replies.remove(&reply.raw());
-                Ok(EndpointResponseTake::Error {
-                    error: err,
-                    discarded_request_handles,
+    let message_id = REPLIES
+        .with(reply.raw(), |reply_object| {
+            (!reply_object.consumed).then_some(reply_object.message_id)
+        })
+        .flatten()
+        .ok_or(IpcError::InvalidHandle)?;
+
+    let (result, consumed) = ENDPOINT_MESSAGES
+        .with_mut(message_id, |message| {
+            REPLIES
+                .with_mut(reply.raw(), |reply_object| {
+                    if reply_object.message_id != message_id || reply_object.consumed {
+                        return Err(IpcError::InvalidHandle);
+                    }
+                    match message.response.as_ref() {
+                        None => Ok((EndpointResponseTake::Pending, false)),
+                        Some(EndpointResponse::Data {
+                            attached_handles, ..
+                        }) if attached_handles.len() > handle_capacity => {
+                            Err(IpcError::BufferTooSmall)
+                        }
+                        Some(EndpointResponse::Data { .. }) => {
+                            let Some(EndpointResponse::Data {
+                                bytes,
+                                attached_handles,
+                            }) = message.response.take()
+                            else {
+                                unreachable!("response was checked above");
+                            };
+                            reply_object.consumed = true;
+                            Ok((
+                                EndpointResponseTake::Response((bytes, attached_handles)),
+                                true,
+                            ))
+                        }
+                        Some(EndpointResponse::Error(err)) => {
+                            let err = *err;
+                            message.response.take();
+                            let discarded_request_handles =
+                                core::mem::take(&mut message.attached_handles);
+                            reply_object.consumed = true;
+                            Ok((
+                                EndpointResponseTake::Error {
+                                    error: err,
+                                    discarded_request_handles,
+                                },
+                                true,
+                            ))
+                        }
+                    }
                 })
-            }
-        }
-    })
+                .ok_or(IpcError::InvalidHandle)?
+        })
+        .ok_or(IpcError::InvalidHandle)??;
+    if consumed {
+        drop(ENDPOINT_MESSAGES.remove(message_id));
+        let _ = REPLIES.remove(reply.raw());
+    }
+    Ok(result)
 }
 
 pub fn cancel_endpoint_call(reply: KernelReplyHandle, caller_task_id: u64) -> Result<(), IpcError> {
@@ -1200,89 +1747,102 @@ pub fn cancel_endpoint_call_with_transfers(
     reply: KernelReplyHandle,
     caller_task_id: u64,
 ) -> Result<Vec<KernelTransferredHandle>, IpcError> {
-    with_ipc_objects(|objects| {
-        let Some(message_id) = objects
-            .replies
-            .get(&reply.raw())
-            .map(|reply| reply.message_id)
-        else {
-            return Err(IpcError::InvalidHandle);
-        };
-        let Some(message) = objects.endpoint_messages.get(&message_id) else {
-            return Err(IpcError::InvalidHandle);
-        };
-        if message.caller_task_id != caller_task_id {
-            return Err(IpcError::InvalidArgument);
-        }
+    let message_id = REPLIES
+        .with(reply.raw(), |reply| {
+            (!reply.consumed).then_some(reply.message_id)
+        })
+        .flatten()
+        .ok_or(IpcError::InvalidHandle)?;
+    let endpoint_id = ENDPOINT_MESSAGES
+        .with(message_id, |message| {
+            (message.caller_task_id == caller_task_id).then_some(message.endpoint_id)
+        })
+        .flatten()
+        .ok_or(IpcError::InvalidArgument)?;
 
-        if let Some(endpoint) = objects.endpoints.get_mut(&message.endpoint_id) {
+    let mut marked = false;
+    if ENDPOINTS
+        .with_mut(endpoint_id, |endpoint| {
             endpoint
                 .pending_messages
                 .retain(|pending_message_id| *pending_message_id != message_id);
-        }
-        let message = objects
-            .endpoint_messages
-            .remove(&message_id)
-            .expect("validated endpoint message disappeared while cancelling");
-        objects.replies.remove(&reply.raw());
-        Ok(transfers_from_message(message))
-    })
+            marked = mark_endpoint_call_consumed(message_id, reply.raw(), caller_task_id);
+        })
+        .is_none()
+    {
+        marked = mark_endpoint_call_consumed(message_id, reply.raw(), caller_task_id);
+    }
+    if !marked {
+        return Err(IpcError::InvalidHandle);
+    }
+
+    let message = ENDPOINT_MESSAGES
+        .remove(message_id)
+        .ok_or(IpcError::InvalidHandle)?;
+    let _ = REPLIES.remove(reply.raw());
+    Ok(transfers_from_message(message))
 }
 
 /// Cancels every endpoint call owned by a task being retired.  The caller may
 /// no longer reach the response path, so both request and already-queued reply
 /// descriptors are returned to the process-handle substrate for disposal.
-pub fn cancel_endpoint_calls_for_task(task_id: u64) -> Vec<KernelTransferredHandle> {
-    with_ipc_objects(|objects| {
-        let message_ids = objects
-            .endpoint_messages
-            .iter()
-            .filter_map(|(message_id, message)| {
-                (message.caller_task_id == task_id).then_some(*message_id)
-            })
-            .collect::<Vec<_>>();
-        let mut discarded = Vec::new();
-        for message_id in message_ids {
-            let Some(message) = objects.endpoint_messages.remove(&message_id) else {
-                continue;
-            };
-            if let Some(endpoint) = objects.endpoints.get_mut(&message.endpoint_id) {
-                endpoint
-                    .pending_messages
-                    .retain(|pending_message_id| *pending_message_id != message_id);
-            }
-            objects
-                .replies
-                .retain(|_, reply| reply.message_id != message_id);
-            discarded.extend(transfers_from_message(message));
-        }
-        discarded
-    })
+pub fn cancel_endpoint_calls_for_task(
+    task_id: u64,
+    mut release_transfers: impl FnMut(&[KernelTransferredHandle]),
+) -> usize {
+    let mut cancelled = 0usize;
+    for _ in 0..MAX_ENDPOINT_MESSAGE_OBJECTS {
+        let Some(message_id) = ENDPOINT_MESSAGES
+            .find_handle(|message| message.published && message.caller_task_id == task_id)
+        else {
+            return cancelled;
+        };
+        let Some(reply_id) = ENDPOINT_MESSAGES.with(message_id, |message| message.reply_id) else {
+            continue;
+        };
+        let transfers =
+            cancel_endpoint_call_with_transfers(KernelReplyHandle::from_raw(reply_id), task_id)
+                .expect("published task-owned endpoint call lost exact cancellation state");
+        release_transfers(&transfers);
+        cancelled += 1;
+    }
+    if ENDPOINT_MESSAGES
+        .find_handle(|message| message.published && message.caller_task_id == task_id)
+        .is_some()
+    {
+        panic!(
+            "task {} endpoint cancellation exceeded global message capacity {}",
+            task_id, MAX_ENDPOINT_MESSAGE_OBJECTS
+        );
+    }
+    cancelled
 }
 
 fn transfers_from_message(mut message: EndpointMessageObject) -> Vec<KernelTransferredHandle> {
     let mut transfers = core::mem::take(&mut message.attached_handles);
     if let Some(EndpointResponse::Data {
-        attached_handles, ..
+        attached_handles: mut response_handles,
+        ..
     }) = message.response.take()
     {
-        transfers.extend(attached_handles);
+        if transfers.capacity() < transfers.len().saturating_add(response_handles.len()) {
+            core::mem::swap(&mut transfers, &mut response_handles);
+        }
+        transfers.extend(response_handles);
     }
     transfers
 }
 
 pub fn remove_endpoint_waiters_for_task(task_id: u64) -> usize {
-    with_ipc_objects(|objects| {
-        let mut removed = 0;
-        for endpoint in objects.endpoints.values_mut() {
-            let before = endpoint.waiting_receivers.len();
-            endpoint
-                .waiting_receivers
-                .retain(|waiting_task_id| *waiting_task_id != task_id);
-            removed += before.saturating_sub(endpoint.waiting_receivers.len());
-        }
-        removed
-    })
+    let mut removed = 0;
+    ENDPOINTS.visit_mut(|_, endpoint| {
+        let before = endpoint.waiting_receivers.len();
+        endpoint
+            .waiting_receivers
+            .retain(|waiting_task_id| *waiting_task_id != task_id);
+        removed += before.saturating_sub(endpoint.waiting_receivers.len());
+    });
+    removed
 }
 
 pub fn fail_endpoints_owned_by_task(task_id: u64, err: IpcError) -> EndpointWakeSet {
@@ -1294,100 +1854,96 @@ pub fn fail_endpoints_owned_by_process(process_id: u64, err: IpcError) -> Endpoi
 }
 
 fn fail_endpoints_owned_by(owner: EndpointOwner, err: IpcError) -> EndpointWakeSet {
-    with_ipc_objects(|objects| {
-        let endpoints = objects
-            .endpoints
-            .iter()
-            .filter_map(|(endpoint_id, endpoint)| {
-                (endpoint.owner == Some(owner)).then_some(*endpoint_id)
-            })
-            .collect::<Vec<_>>();
-        if endpoints.is_empty() {
-            return EndpointWakeSet::default();
+    let mut wake_set = EndpointWakeSet::default();
+    while let Some((endpoint_id, endpoint)) =
+        ENDPOINTS.take_first_matching(|endpoint| endpoint.owner == Some(owner))
+    {
+        ENDPOINT_QUOTAS.lock().release(owner);
+        for receiver in endpoint.waiting_receivers {
+            wake_set.push_receiver(receiver);
         }
+        ENDPOINT_MESSAGES.visit_mut(|message_id, message| {
+            if !message.published
+                || message.endpoint_id != endpoint_id
+                || message.response.is_some()
+            {
+                return;
+            }
+            let failed = REPLIES.with_mut(message.reply_id, |reply| {
+                if reply.message_id != message_id || reply.consumed {
+                    return false;
+                }
+                reply.used = true;
+                message.response = Some(EndpointResponse::Error(err));
+                true
+            });
+            if failed == Some(true) {
+                wake_set.push_caller(message.caller_task_id);
+            }
+        });
+    }
+    wake_set
+}
 
-        let mut wake_set = EndpointWakeSet::default();
-        for endpoint_id in endpoints {
-            if let Some(endpoint) = objects.endpoints.remove(&endpoint_id) {
-                for receiver in endpoint.waiting_receivers {
-                    wake_set.push_receiver(receiver);
-                }
+fn mark_endpoint_call_consumed(message_id: u64, reply_id: u64, caller_task_id: u64) -> bool {
+    ENDPOINT_MESSAGES
+        .with_mut(message_id, |message| {
+            if message.caller_task_id != caller_task_id || message.reply_id != reply_id {
+                return false;
             }
-            let message_ids = objects
-                .endpoint_messages
-                .iter()
-                .filter_map(|(message_id, message)| {
-                    (message.endpoint_id == endpoint_id).then_some(*message_id)
-                })
-                .collect::<Vec<_>>();
-            for message_id in message_ids {
-                let Some(message) = objects.endpoint_messages.get_mut(&message_id) else {
-                    continue;
-                };
-                if message.response.is_none() {
-                    message.response = Some(EndpointResponse::Error(err));
-                    wake_set.push_caller(message.caller_task_id);
-                    if let Some(reply_id) = objects.replies.iter().find_map(|(reply_id, reply)| {
-                        (reply.message_id == message_id).then_some(*reply_id)
-                    }) && let Some(reply) = objects.replies.get_mut(&reply_id)
-                    {
-                        reply.used = true;
+            REPLIES
+                .with_mut(reply_id, |reply| {
+                    if reply.message_id != message_id || reply.consumed {
+                        return false;
                     }
-                }
-            }
-        }
-        wake_set
-    })
+                    reply.consumed = true;
+                    true
+                })
+                .unwrap_or(false)
+        })
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
 pub fn shared_region_len(region: KernelSharedRegionHandle) -> Option<usize> {
-    with_ipc_objects_ref(|objects| {
-        objects
-            .shared_regions
-            .get(&region.raw())
-            .map(|object| object.byte_len)
-    })
+    SHARED_REGIONS.with(region.raw(), |object| object.byte_len)
 }
 
 pub fn map_shared_region(region: KernelSharedRegionHandle) -> Option<(*mut u8, usize)> {
-    with_ipc_objects_ref(|objects| {
-        let object = objects.shared_regions.get(&region.raw())?;
-
+    SHARED_REGIONS.with(region.raw(), |object| {
         #[cfg(test)]
         {
-            Some((object.bytes.as_ptr() as *mut u8, object.byte_len))
+            (object.bytes.as_ptr() as *mut u8, object.byte_len)
         }
 
         #[cfg(not(test))]
         {
-            Some((
+            (
                 kernel_vm::higher_half_addr(object.phys_start) as *mut u8,
                 object.byte_len,
-            ))
+            )
         }
     })
 }
 
 pub fn shared_region_frames(region: KernelSharedRegionHandle) -> Option<Vec<u64>> {
-    with_ipc_objects_ref(|objects| {
-        let object = objects.shared_regions.get(&region.raw())?;
+    #[cfg(test)]
+    {
+        let _ = region;
+        None
+    }
 
-        #[cfg(test)]
-        {
-            let _ = object;
-            None
+    #[cfg(not(test))]
+    {
+        let (phys_start, page_count) = SHARED_REGIONS.with(region.raw(), |object| {
+            (object.phys_start, object.page_count)
+        })?;
+        let mut frames = Vec::with_capacity(page_count);
+        for page_index in 0..page_count {
+            frames.push(phys_start + page_index as u64 * PAGE_SIZE as u64);
         }
-
-        #[cfg(not(test))]
-        {
-            let mut frames = Vec::with_capacity(object.page_count);
-            for page_index in 0..object.page_count {
-                frames.push(object.phys_start + page_index as u64 * 4096);
-            }
-            Some(frames)
-        }
-    })
+        Some(frames)
+    }
 }
 
 #[cfg(test)]
@@ -1490,12 +2046,11 @@ pub(crate) fn dequeue_message_with_limits(
         let Some(channel_object) = objects.channels.get_mut(&channel.raw()) else {
             return Err(IpcError::InvalidHandle);
         };
-        if let Some(message) = channel_object.recv_queue.front() {
-            if message.payload.len() > payload_capacity
-                || message.attached_handles.len() > handle_capacity
-            {
-                return Err(IpcError::BufferTooSmall);
-            }
+        if let Some(message) = channel_object.recv_queue.front()
+            && (message.payload.len() > payload_capacity
+                || message.attached_handles.len() > handle_capacity)
+        {
+            return Err(IpcError::BufferTooSmall);
         }
         Ok(channel_object.recv_queue.pop_front())
     })
@@ -1519,13 +2074,17 @@ pub fn channel_queue_len(channel: KernelChannelHandle) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec::Vec;
+    use core::sync::atomic::Ordering;
+
     use super::{
-        ConsoleStreamKind, IpcError, IpcHeader, KernelHandle, accept_channel, connect_named_port,
-        connect_port, create_channel_pair, create_event, create_named_port, create_shared_region,
-        dequeue_message, dequeue_message_with_limits, enqueue_message, event_signal_count,
-        lookup_named_port, map_shared_region, port_name, queue_channel_for_accept, recv_endpoint,
-        recv_endpoint_with_limits, recv_endpoint_with_limits_and_handles, shared_region_len,
-        signal_event,
+        ConsoleStreamKind, IpcError, IpcHeader, KernelHandle, accept_channel,
+        acquire_shared_region_mapping, connect_named_port, connect_port, create_channel_pair,
+        create_event, create_named_port, create_shared_region, dequeue_message,
+        dequeue_message_with_limits, enqueue_message, event_signal_count, lookup_named_port,
+        map_shared_region, port_name, queue_channel_for_accept, recv_endpoint,
+        recv_endpoint_with_limits, recv_endpoint_with_limits_and_handles, release_shared_region,
+        service_deferred_shared_region_reclaims, shared_region_len, signal_event,
     };
     use kernel_object::api::handle::{FileHandleRights, HandleOwner, HandleRights, HandleToken};
     use spin::Mutex;
@@ -1535,8 +2094,26 @@ mod tests {
     fn with_isolated_ipc_test(f: impl FnOnce()) {
         let _guard = IPC_TEST_GUARD.lock();
         super::with_ipc_objects(|objects| *objects = super::IpcObjectTable::new());
+        super::ENDPOINTS.clear();
+        super::ENDPOINT_QUOTAS.lock().clear();
+        super::ENDPOINT_MESSAGES.clear();
+        super::REPLIES.clear();
+        super::SHARED_REGIONS.clear();
+        super::SHARED_REGION_RECLAIMS.lock().clear();
+        super::SHARED_REGION_ADMITTED.store(0, Ordering::Release);
+        super::SHARED_REGION_BYTES_ADMITTED.store(0, Ordering::Release);
+        super::SHARED_REGION_QUOTAS.lock().clear();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
         super::with_ipc_objects(|objects| *objects = super::IpcObjectTable::new());
+        super::ENDPOINTS.clear();
+        super::ENDPOINT_QUOTAS.lock().clear();
+        super::ENDPOINT_MESSAGES.clear();
+        super::REPLIES.clear();
+        super::SHARED_REGIONS.clear();
+        super::SHARED_REGION_RECLAIMS.lock().clear();
+        super::SHARED_REGION_ADMITTED.store(0, Ordering::Release);
+        super::SHARED_REGION_BYTES_ADMITTED.store(0, Ordering::Release);
+        super::SHARED_REGION_QUOTAS.lock().clear();
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
         }
@@ -1635,6 +2212,48 @@ mod tests {
             let (ptr, len) = map_shared_region(region).expect("map region");
             assert_eq!(len, 8192);
             assert!(!ptr.is_null());
+
+            let mapping = acquire_shared_region_mapping(region).expect("retain mapping");
+            let cloned_mapping = mapping.clone();
+            release_shared_region(region);
+            assert_eq!(shared_region_len(region), Some(8192));
+            drop(mapping);
+            assert_eq!(shared_region_len(region), Some(8192));
+            drop(cloned_mapping);
+            assert_eq!(shared_region_len(region), None);
+            assert_eq!(service_deferred_shared_region_reclaims(64), 1);
+        });
+    }
+
+    #[test]
+    fn process_shared_region_quota_is_bounded_until_reclaim_completes() {
+        with_isolated_ipc_test(|| {
+            let mut regions = [None; super::MAX_SHARED_REGIONS_PER_PROCESS];
+            for slot in &mut regions {
+                *slot = Some(
+                    super::create_shared_region_for_process(51, 1)
+                        .expect("within process shared-region quota"),
+                );
+            }
+            assert_eq!(
+                super::create_shared_region_for_process(51, 1),
+                Err(IpcError::NoMemory)
+            );
+            for region in regions.into_iter().flatten() {
+                release_shared_region(region);
+            }
+            assert_eq!(
+                super::create_shared_region_for_process(51, 1),
+                Err(IpcError::NoMemory),
+                "queued backing must remain charged until physical reclaim"
+            );
+            for _ in 0..super::MAX_SHARED_REGIONS_PER_PROCESS {
+                assert_eq!(service_deferred_shared_region_reclaims(1), 1);
+            }
+            assert!(
+                super::create_shared_region_for_process(51, 1).is_ok(),
+                "completed reclaim must return process quota"
+            );
         });
     }
 
@@ -1927,6 +2546,24 @@ mod tests {
     }
 
     #[test]
+    fn process_endpoint_quota_is_bounded_and_returned_on_exit() {
+        with_isolated_ipc_test(|| {
+            for _ in 0..super::MAX_ENDPOINTS_PER_PROCESS {
+                super::create_endpoint_for_process(41).expect("within process endpoint quota");
+            }
+            assert_eq!(
+                super::create_endpoint_for_process(41),
+                Err(IpcError::NoMemory)
+            );
+
+            let _ = super::fail_endpoints_owned_by_process(41, IpcError::PeerClosed);
+            for _ in 0..super::MAX_ENDPOINTS_PER_PROCESS {
+                super::create_endpoint_for_process(41).expect("quota returned after process exit");
+            }
+        });
+    }
+
+    #[test]
     fn endpoint_request_handles_require_explicit_receive_capacity() {
         with_isolated_ipc_test(|| {
             let endpoint = super::create_endpoint().expect("create endpoint");
@@ -2132,8 +2769,8 @@ mod tests {
                 super::enqueue_endpoint_call(endpoint, 22, b"request").expect("enqueue call");
 
             let wake_set = super::fail_endpoints_owned_by_task(10, IpcError::PeerClosed);
-            assert_eq!(wake_set.callers, alloc::vec![22]);
-            assert!(wake_set.receivers.is_empty());
+            assert_eq!(wake_set.callers(), &[22]);
+            assert!(wake_set.receivers().is_empty());
             assert_eq!(
                 super::take_endpoint_response(reply),
                 Err(IpcError::PeerClosed)
@@ -2153,7 +2790,7 @@ mod tests {
                 super::enqueue_endpoint_call(endpoint, 22, b"request").expect("enqueue call");
 
             let wake_set = super::fail_endpoints_owned_by_process(10, IpcError::PeerClosed);
-            assert_eq!(wake_set.callers, alloc::vec![22]);
+            assert_eq!(wake_set.callers(), &[22]);
             assert_eq!(
                 super::take_endpoint_response(reply),
                 Err(IpcError::PeerClosed)
@@ -2171,7 +2808,7 @@ mod tests {
                     .expect("enqueue call");
 
             let wake_set = super::fail_endpoints_owned_by_task(10, IpcError::PeerClosed);
-            assert_eq!(wake_set.callers, alloc::vec![22]);
+            assert_eq!(wake_set.callers(), &[22]);
             assert_eq!(
                 super::take_endpoint_response_detailed(reply, 0),
                 Ok(super::EndpointResponseTake::Error {
@@ -2215,7 +2852,13 @@ mod tests {
                 super::enqueue_endpoint_call_with_handles(endpoint, 22, b"second", &[second])
                     .expect("enqueue second");
 
-            let discarded = super::cancel_endpoint_calls_for_task(22);
+            let mut discarded = Vec::new();
+            assert_eq!(
+                super::cancel_endpoint_calls_for_task(22, |batch| {
+                    discarded.extend_from_slice(batch);
+                }),
+                2
+            );
             assert_eq!(discarded, alloc::vec![first, second]);
             assert_eq!(recv_endpoint(endpoint), Ok(None));
             assert_eq!(
@@ -2226,6 +2869,29 @@ mod tests {
                 super::take_endpoint_response(second_reply),
                 Err(IpcError::InvalidHandle)
             );
+        });
+    }
+
+    #[test]
+    fn retiring_caller_may_consume_the_exact_global_message_capacity() {
+        with_isolated_ipc_test(|| {
+            let first = super::create_endpoint().expect("create first endpoint");
+            let second = super::create_endpoint().expect("create second endpoint");
+            for endpoint in [first, second] {
+                for sequence in 0..super::MAX_ENDPOINT_PENDING_MESSAGES {
+                    super::enqueue_endpoint_call(endpoint, 22, &[(sequence + 1) as u8])
+                        .expect("enqueue within endpoint and global capacity");
+                }
+            }
+
+            assert_eq!(
+                super::cancel_endpoint_calls_for_task(22, |batch| {
+                    assert!(batch.is_empty());
+                }),
+                super::MAX_ENDPOINT_MESSAGE_OBJECTS
+            );
+            assert_eq!(recv_endpoint(first), Ok(None));
+            assert_eq!(recv_endpoint(second), Ok(None));
         });
     }
 
@@ -2285,8 +2951,8 @@ mod tests {
             super::add_endpoint_receiver_waiter(endpoint, 32).expect("add waiter");
 
             let wake_set = super::fail_endpoints_owned_by_task(10, IpcError::PeerClosed);
-            assert!(wake_set.callers.is_empty());
-            assert_eq!(wake_set.receivers, alloc::vec![31, 32]);
+            assert!(wake_set.callers().is_empty());
+            assert_eq!(wake_set.receivers(), &[31, 32]);
         });
     }
 
@@ -2302,8 +2968,8 @@ mod tests {
             assert_eq!(server_reply, reply);
 
             let wake_set = super::fail_endpoints_owned_by_task(10, IpcError::PeerClosed);
-            assert_eq!(wake_set.callers, alloc::vec![22]);
-            assert!(wake_set.receivers.is_empty());
+            assert_eq!(wake_set.callers(), &[22]);
+            assert!(wake_set.receivers().is_empty());
             assert_eq!(
                 super::complete_endpoint_reply(reply, b"late"),
                 Err(IpcError::InvalidArgument)

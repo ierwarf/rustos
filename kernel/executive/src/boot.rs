@@ -1,20 +1,19 @@
 use boot_protocol::{BootInfo, BootVolumeTransport};
-use core::arch::asm;
-use core::fmt::{self, Write};
 use core::panic::PanicInfo;
+use core::sync::atomic::{AtomicBool, Ordering};
 use kernel_compat::api as compat_api;
 use kernel_compat::api::console_host::{self, ConsoleProgramSpec};
 use kernel_hal::api as hal_api;
 use kernel_mm::api as mm_api;
 use kernel_ps::api as ps_api;
 use nucleus_core::util::{fault_injection, random};
-use x86_64::VirtAddr;
 
 use crate::{announce_ready, debug, fatal, flow_debug, flow_info, hal_hooks, io_services, tasks};
 
 const ROOTD_EXEC_PATH: &str = "services/rootd/rootd.elf";
 const ROOTD_BOOTSTRAP_WEIGHT_MICROS: u64 = 4_000;
-const MAX_BACKTRACE_FRAME_STEP: u64 = 1024 * 1024;
+const MAX_RETIRED_TASK_CLEANUPS_PER_TURN: usize = 4;
+static PANIC_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 macro_rules! boot_log {
     ($level:expr, $event_id:expr, $object_id:expr, $($arg:tt)+) => {{
@@ -35,7 +34,17 @@ macro_rules! boot_log {
 }
 
 pub fn handle_kernel_panic(info: &PanicInfo<'_>) -> ! {
-    let _ = io_services::gui_try_present_panic_blackout();
+    x86_64::instructions::interrupts::disable();
+    if PANIC_IN_PROGRESS.swap(true, Ordering::AcqRel) {
+        debug::println_emergency(format_args!("[NESTED PANIC]"));
+        loop {
+            x86_64::instructions::hlt();
+        }
+    }
+    // The first panic evidence must not acquire a display, allocator, or
+    // scheduler-dependent lock. A lock-contract panic can occur while any of
+    // those are inconsistent; trying to paint first recursively panics and
+    // turns a diagnosable failure into an x86 triple fault.
     debug::println_emergency(format_args!("[PANIC]"));
     debug::println_emergency(format_args!("message: {}", info.message()));
     if let Some(location) = info.location() {
@@ -48,40 +57,18 @@ pub fn handle_kernel_panic(info: &PanicInfo<'_>) -> ! {
     } else {
         debug::println_emergency(format_args!("location: <unknown>"));
     }
-    debug::report_panic(info);
-    debug::println!();
-    debug::println!("[PANIC]");
-    gui_panic_line(format_args!("[PANIC]"));
-    debug::println!("message: {}", info.message());
-    gui_panic_line(format_args!("message: {}", info.message()));
-
-    if let Some(location) = info.location() {
-        debug::println!(
-            "location: {}:{}:{}",
-            location.file(),
-            location.line(),
-            location.column()
-        );
-        gui_panic_line(format_args!(
-            "location: {}:{}:{}",
-            location.file(),
-            location.line(),
-            location.column()
-        ));
-    } else {
-        debug::println!("location: <unknown>");
-        gui_panic_line(format_args!("location: <unknown>"));
-    }
-
-    debug::dump_recent_trace_locations("panic");
-    print_backtrace();
-
     loop {
-        core::hint::spin_loop();
+        x86_64::instructions::hlt();
     }
 }
 
-pub fn initialize_kernel(boot_info_ptr: *const BootInfo) {
+/// Initializes the kernel from the immutable boot-protocol handoff.
+///
+/// # Safety
+///
+/// `boot_info_ptr` must name a readable, boot-protocol-validated [`BootInfo`]
+/// that remains valid through early kernel initialization.
+pub unsafe fn initialize_kernel(boot_info_ptr: *const BootInfo) {
     flow_info(1, "kernel initialize begin");
     let boot_info = match unsafe { BootInfo::from_ptr(boot_info_ptr) } {
         Ok(boot_info) => boot_info,
@@ -308,13 +295,11 @@ pub fn finalize_kernel_initialization() {
 
     let service_thread = ps_api::Thread::new(tasks::nucleus_housekeeping_task, 100);
     service_thread.start();
-    core::mem::forget(service_thread);
     flow_info(21, "kernel finalize: housekeeping task started");
     boot_log!(debug::LogLevel::Info, 135, 0, "housekeeping task started");
 
     let init_thread = ps_api::Thread::new(tasks::init_bootstrap_task, 90);
     init_thread.start();
-    core::mem::forget(init_thread);
     flow_info(22, "kernel finalize: init bootstrap task started");
     boot_log!(debug::LogLevel::Info, 136, 0, "init bootstrap task started");
 }
@@ -411,8 +396,37 @@ pub fn housekeeping_once() -> usize {
     let mut work = 0;
 
     trace_service_phase("reap");
+    // Retirement can include bounded service reconciliation. Bound the number
+    // of complete lifecycle transactions per scheduler turn so a process-exit
+    // storm cannot concatenate individually bounded waits into an unbounded UI
+    // or input stall. Unacknowledged records remain owned by the scheduler.
+    for _ in 0..MAX_RETIRED_TASK_CLEANUPS_PER_TURN {
+        let Some(cleanup) = ps_api::next_retired_task_cleanup() else {
+            break;
+        };
+        work += compat_api::syscall::cleanup_retired_task_runtime_state(
+            cleanup.task_id(),
+            cleanup.process_id(),
+            cleanup.process_terminal(),
+            cleanup.clear_child_tid(),
+            cleanup.robust_list_head(),
+            cleanup.robust_list_len(),
+        );
+        if !ps_api::complete_retired_task_cleanup(cleanup) {
+            panic!(
+                "retired task cleanup acknowledgement lost: task_id={} process_id={}",
+                cleanup.task_id(),
+                cleanup.process_id()
+            );
+        }
+        work += 1;
+    }
     work += ps_api::service_deferred_work();
     work += compat_api::syscall::service_deferred_transfer_releases();
+    // Shared display mappings may own large contiguous frame sets. Reclaim a
+    // bounded page quantum outside process/handle locks so close, exec, and
+    // exit cannot turn into a multi-megabyte allocator critical section.
+    work += ps_api::service_deferred_shared_region_reclaims(64);
 
     trace_service_phase("heartbeat");
     // Emit the once-per-second wall-clock heartbeat outside IRQ context. The
@@ -424,11 +438,18 @@ pub fn housekeeping_once() -> usize {
     work
 }
 
-pub fn kernel_main_bootstrap(boot_info_ptr: *const BootInfo) -> ! {
+/// Transfers the validated architecture handoff into scheduled kernel startup.
+///
+/// # Safety
+///
+/// `boot_info_ptr` must satisfy [`initialize_kernel`]'s boot handoff contract.
+pub unsafe fn kernel_main_bootstrap(boot_info_ptr: *const BootInfo) -> ! {
     x86_64::instructions::interrupts::disable();
     debug::boot_trace::println_fmt(format_args!("kernel: higher half entry"));
     flow_info(3, "kernel bootstrap higher-half entry");
-    initialize_kernel(boot_info_ptr);
+    // SAFETY: the architecture entry preserves the boot-protocol handoff
+    // pointer until scheduled bootstrap has copied all required metadata.
+    unsafe { initialize_kernel(boot_info_ptr) };
     ps_api::boot::start(scheduled_kernel_main)
 }
 
@@ -442,120 +463,5 @@ fn scheduled_kernel_main(_id: u64) {
 fn trace_service_phase(_phase: &'static str) {
     if debug::enabled!(heartbeat, debug) {
         debug::debug!(heartbeat, "service loop phase: {}", _phase);
-    }
-}
-
-fn print_backtrace() {
-    let mut frame = current_frame_pointer();
-    debug::println!("backtrace:");
-    gui_panic_line(format_args!("backtrace:"));
-
-    for index in 0..16 {
-        let Some(current) = frame else {
-            break;
-        };
-        let Some((next_rbp, return_rip)) = read_backtrace_frame(current) else {
-            break;
-        };
-        if return_rip == 0 {
-            break;
-        }
-        debug::println!("  {:02}: rip={:#x} rbp={:#x}", index, return_rip, current);
-        gui_panic_line(format_args!(
-            "  {:02}: rip={:#x} rbp={:#x}",
-            index, return_rip, current
-        ));
-
-        frame = if valid_next_frame_pointer(current, next_rbp) {
-            Some(next_rbp)
-        } else {
-            None
-        };
-    }
-}
-
-fn current_frame_pointer() -> Option<u64> {
-    let rbp: u64;
-    unsafe {
-        asm!("mov {}, rbp", out(reg) rbp, options(nomem, nostack, preserves_flags));
-    }
-    if rbp == 0 { None } else { Some(rbp) }
-}
-
-fn canonical_kernel_pointer(value: u64) -> Option<VirtAddr> {
-    let addr = VirtAddr::new(value);
-    if addr.as_u64() < 0xffff_8000_0000_0000 {
-        return None;
-    }
-    Some(addr)
-}
-
-fn read_backtrace_frame(rbp: u64) -> Option<(u64, u64)> {
-    if rbp % core::mem::align_of::<u64>() as u64 != 0 {
-        return None;
-    }
-    let frame_end = rbp.checked_add((core::mem::size_of::<u64>() * 2 - 1) as u64)?;
-    let rbp_addr = canonical_kernel_pointer(rbp)?;
-    canonical_kernel_pointer(frame_end)?;
-    let next_rbp = unsafe { core::ptr::read_volatile(rbp_addr.as_ptr::<u64>()) };
-    let return_rip = unsafe { core::ptr::read_volatile(rbp_addr.as_ptr::<u64>().add(1)) };
-    if return_rip != 0 {
-        canonical_kernel_pointer(return_rip)?;
-    }
-    Some((next_rbp, return_rip))
-}
-
-fn valid_next_frame_pointer(current: u64, next: u64) -> bool {
-    if next <= current || next - current > MAX_BACKTRACE_FRAME_STEP {
-        return false;
-    }
-    if next % core::mem::align_of::<u64>() as u64 != 0 {
-        return false;
-    }
-    canonical_kernel_pointer(next).is_some()
-}
-
-fn gui_panic_line(args: fmt::Arguments<'_>) {
-    let mut line = PanicLine::new();
-    let _ = line.write_fmt(args);
-    io_services::console_write(line.as_bytes());
-    io_services::console_write(b"\r\n");
-}
-
-struct PanicLine {
-    bytes: [u8; 256],
-    len: usize,
-}
-
-impl PanicLine {
-    const fn new() -> Self {
-        Self {
-            bytes: [0; 256],
-            len: 0,
-        }
-    }
-
-    fn push(&mut self, byte: u8) {
-        if self.len < self.bytes.len() {
-            self.bytes[self.len] = byte;
-            self.len += 1;
-        }
-    }
-
-    fn as_bytes(&self) -> &[u8] {
-        &self.bytes[..self.len]
-    }
-}
-
-impl Write for PanicLine {
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        for ch in s.chars() {
-            match ch {
-                '\n' | '\r' | '\t' => self.push(b' '),
-                ' '..='~' => self.push(ch as u8),
-                _ => self.push(b'?'),
-            }
-        }
-        Ok(())
     }
 }

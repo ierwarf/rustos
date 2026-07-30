@@ -1,15 +1,33 @@
+//! Transactional loader/procd broker operations for Linux and Windows tasks.
+//!
+//! - **Owner:** Compat owns privileged process substrate brokerage;
+//!   `loaderd`/`procd` own parsing and lifecycle policy.
+//! - **Boundary:** User requests, service replies, executable mappings,
+//!   initial registers, handles, and claimed process identities are untrusted.
+//! - **Lifecycle:** Prepare a suspended target, bind the exact requester and
+//!   loader epoch, stage mappings, commit once, activate, or retire/rollback.
+//! - **Concurrency:** Broker sessions are generation-bound and never expose a
+//!   partially initialized runnable task.
+//! - **Failure:** Requester/service exit, restart, mapping failure, timeout,
+//!   cancellation, and duplicate commit retire staged authority exactly once.
+//! - **Forbidden:** No runnable-before-commit child, raw image parsing in
+//!   ring0, pathname authority, or stale prepare-session reuse.
+//! - **Evidence:** `deferred-process-activation`,
+//!   `loader-request-authority`, `post-init-service-authority`, and
+//!   `remote-file-map`.
 use super::*;
 
-use alloc::collections::BTreeMap;
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
+use heapless::index_map::FnvIndexMap;
+use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
 use x86_64::VirtAddr;
 use x86_64::structures::paging::PageTableFlags;
 
 use crate::user::handles::KernelHandle;
 use crate::user::memfd::MemfdHandle;
-use lazy_static::lazy_static;
 use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_PROCD_OP_PROCESS_PREPARE, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
     COMMERCIAL_MAX_PROTOCOL_PROCD, CommercialMaxProtocolRequest, CommercialMaxProtocolResponse,
@@ -29,31 +47,17 @@ use rustos_user_abi::syscall::{
     RustosProcSignalQueueBrokerArgs, RustosProcValidateDeferredSpawnBrokerArgs,
     RustosUserRegisters, loader_service_role_allows_operation,
 };
-use spin::Mutex;
-
 const PAGE_SIZE: u64 = 4096;
 const SPAWN_FLAG_LOGICAL_ADMIN: u64 = 1;
 const MAX_PROC_PREPARES: usize = 128;
 const MAX_MAPPINGS_PER_PREPARE: usize = 4096;
 const MAX_EXEC_TICKETS: usize = 128;
+const MAX_EXEC_TRANSITIONS: usize = MAX_EXEC_TICKETS;
 const MAX_DEFERRED_ACTIVATIONS: usize = 128;
 const FILE_COPY_CHUNK: usize = 64 * 1024;
 
 static NEXT_PREPARE_HANDLE: AtomicU64 = AtomicU64::new(1);
 static NEXT_EXEC_TICKET: AtomicU64 = AtomicU64::new(1);
-
-lazy_static! {
-    static ref PROC_PREPARES: Mutex<BTreeMap<u64, ProcPrepareState>> = Mutex::new(BTreeMap::new());
-    static ref EXEC_TICKETS: Mutex<BTreeMap<u64, ExecTicketState>> = Mutex::new(BTreeMap::new());
-    static ref EXEC_TRANSITIONS: Mutex<BTreeMap<u64, ExecTransitionState>> =
-        Mutex::new(BTreeMap::new());
-    /// A deferred process is inert until the exact process that requested its
-    /// creation consumes this one-shot authority. Keeping this in ring0 makes
-    /// the authority survive loaderd restart without trusting a replayed
-    /// userspace PID claim.
-    static ref DEFERRED_ACTIVATIONS: Mutex<BTreeMap<u64, u64>> =
-        Mutex::new(BTreeMap::new());
-}
 
 type PinnedFileBacking = MemfdHandle;
 
@@ -84,7 +88,11 @@ enum MappingEntry {
 struct ProcPrepareState {
     owner_pid: u64,
     format: u16,
-    mappings: Vec<MappingEntry>,
+    #[allow(
+        clippy::vec_box,
+        reason = "mapping entries may carry a page payload; stable indirection avoids copying page-sized records when the bounded vector grows"
+    )]
+    mappings: Vec<Box<MappingEntry>>,
     windows_runtime: Option<crate::user::process::WindowsProcessLoaderRuntime>,
     linux_runtime: Option<(crate::user::linux::LinuxProcessImageInfo, u64)>,
 }
@@ -101,6 +109,30 @@ struct ExecTransitionState {
     target_tid: u64,
     registers: RustosUserRegisters,
 }
+
+type ProcPrepareRegistry = FnvIndexMap<u64, ProcPrepareState, MAX_PROC_PREPARES>;
+type ExecTicketRegistry = FnvIndexMap<u64, ExecTicketState, MAX_EXEC_TICKETS>;
+type ExecTransitionRegistry = FnvIndexMap<u64, ExecTransitionState, MAX_EXEC_TRANSITIONS>;
+type DeferredActivationRegistry = FnvIndexMap<u64, u64, MAX_DEFERRED_ACTIVATIONS>;
+
+static PROC_PREPARES: TrackedSpinLock<
+    ProcPrepareRegistry,
+    { LockClass::ProcBrokerRegistry as u8 },
+> = TrackedSpinLock::new(FnvIndexMap::new());
+static EXEC_TICKETS: TrackedSpinLock<ExecTicketRegistry, { LockClass::ProcBrokerRegistry as u8 }> =
+    TrackedSpinLock::new(FnvIndexMap::new());
+static EXEC_TRANSITIONS: TrackedSpinLock<
+    ExecTransitionRegistry,
+    { LockClass::ProcBrokerRegistry as u8 },
+> = TrackedSpinLock::new(FnvIndexMap::new());
+/// A deferred process is inert until the exact process that requested its
+/// creation consumes this one-shot authority. Keeping this in ring0 makes the
+/// authority survive loaderd restart without trusting a replayed userspace PID
+/// claim.
+static DEFERRED_ACTIVATIONS: TrackedSpinLock<
+    DeferredActivationRegistry,
+    { LockClass::ProcBrokerRegistry as u8 },
+> = TrackedSpinLock::new(FnvIndexMap::new());
 
 pub(super) fn syscall_linux_rustos_proc_prepare_broker(args_ptr: u64) -> u64 {
     if !current_process_can_load() {
@@ -120,6 +152,25 @@ pub(super) fn syscall_linux_rustos_proc_prepare_broker(args_ptr: u64) -> u64 {
     let Some(owner_pid) = multitask::current_user_process_id() else {
         return linux_errno(LINUX_EPERM);
     };
+    {
+        let prepares = PROC_PREPARES.lock();
+        if let Err(errno) = proc_prepare_publication_status(
+            multitask::is_user_process_exiting(owner_pid),
+            prepares.len(),
+        ) {
+            return linux_errno(errno);
+        }
+    }
+    // Allocate all pointer slots before publication. Mapping payloads are
+    // individually allocated before taking the registry lock, so subsequent
+    // append operations cannot enter the allocator while holding it.
+    let state = ProcPrepareState {
+        owner_pid,
+        format: args.format,
+        mappings: Vec::with_capacity(MAX_MAPPINGS_PER_PREPARE),
+        windows_runtime: None,
+        linux_runtime: None,
+    };
     let mut prepares = PROC_PREPARES.lock();
     if let Err(errno) = proc_prepare_publication_status(
         multitask::is_user_process_exiting(owner_pid),
@@ -130,16 +181,20 @@ pub(super) fn syscall_linux_rustos_proc_prepare_broker(args_ptr: u64) -> u64 {
     let Some(handle) = allocate_prepare_handle(&prepares) else {
         return linux_errno(LINUX_EAGAIN);
     };
-    prepares.insert(
-        handle,
-        ProcPrepareState {
-            owner_pid,
-            format: args.format,
-            mappings: Vec::new(),
-            windows_runtime: None,
-            linux_runtime: None,
-        },
-    );
+    match prepares.insert(handle, state) {
+        Ok(None) => {}
+        Ok(Some(replaced)) => {
+            drop(prepares);
+            drop(replaced);
+            return linux_errno(LINUX_EAGAIN);
+        }
+        Err((_handle, rejected)) => {
+            drop(prepares);
+            drop(rejected);
+            return linux_errno(LINUX_EAGAIN);
+        }
+    }
+    drop(prepares);
     nucleus_core::debug::record_milestone(
         nucleus_core::debug::LogCategory::Compat,
         "proc-prepare-published",
@@ -164,23 +219,13 @@ pub(super) fn syscall_linux_rustos_proc_map_file_broker(args_ptr: u64) -> u64 {
         Ok(b) => b,
         Err(e) => return linux_errno(e),
     };
-    let mut prepares = PROC_PREPARES.lock();
-    let Some(state) = prepares.get_mut(&args.prepare_handle) else {
-        return linux_errno(LINUX_EINVAL);
-    };
-    if !prepare_owned_by_current(state) {
-        return linux_errno(LINUX_EPERM);
-    }
     if let Err(errno) = validate_mapping_region(args.target_addr, args.mem_len, args.flags) {
         return linux_errno(errno);
     }
     if let Err(errno) = validate_file_mapping_len(args.mem_len, args.file_len) {
         return linux_errno(errno);
     }
-    if state.mappings.len() >= MAX_MAPPINGS_PER_PREPARE {
-        return linux_errno(LINUX_EINVAL);
-    }
-    state.mappings.push(MappingEntry::File {
+    let mapping = Box::new(MappingEntry::File {
         backing,
         file_offset: args.file_offset,
         file_len: args.file_len,
@@ -188,6 +233,17 @@ pub(super) fn syscall_linux_rustos_proc_map_file_broker(args_ptr: u64) -> u64 {
         mem_len: args.mem_len,
         flags: args.flags,
     });
+    let mut prepares = PROC_PREPARES.lock();
+    let Some(state) = prepares.get_mut(&args.prepare_handle) else {
+        return linux_errno(LINUX_EINVAL);
+    };
+    if !prepare_owned_by_current(state) {
+        return linux_errno(LINUX_EPERM);
+    }
+    if state.mappings.len() >= MAX_MAPPINGS_PER_PREPARE {
+        return linux_errno(LINUX_EINVAL);
+    }
+    state.mappings.push(mapping);
     0
 }
 
@@ -204,22 +260,10 @@ pub(super) fn syscall_linux_rustos_proc_map_file_batch_broker(args_ptr: u64) -> 
     if args.reserved0 != 0 || count == 0 || count > PROC_BROKER_BATCH_CAPACITY {
         return linux_errno(LINUX_EINVAL);
     }
-    // Resolve all fds before locking PROC_PREPARES
-    let mut backings: Vec<PinnedFileBacking> = Vec::with_capacity(count);
-    for entry in &args.entries[..count] {
-        match pinned_file_backing_from_current(entry.fd) {
-            Ok(b) => backings.push(b),
-            Err(e) => return linux_errno(e),
-        }
-    }
-    let mut prepares = PROC_PREPARES.lock();
-    let Some(state) = prepares.get_mut(&args.prepare_handle) else {
-        return linux_errno(LINUX_EINVAL);
-    };
-    if !prepare_owned_by_current(state) {
-        return linux_errno(LINUX_EPERM);
-    }
-    for entry in &args.entries[..count] {
+    // Resolve and allocate the entire batch before locking the registry.
+    let mut mappings: [Option<Box<MappingEntry>>; PROC_BROKER_BATCH_CAPACITY] =
+        [const { None }; PROC_BROKER_BATCH_CAPACITY];
+    for (index, entry) in args.entries[..count].iter().enumerate() {
         if entry.reserved0 != 0 {
             return linux_errno(LINUX_EINVAL);
         }
@@ -229,20 +273,35 @@ pub(super) fn syscall_linux_rustos_proc_map_file_batch_broker(args_ptr: u64) -> 
         if let Err(errno) = validate_file_mapping_len(entry.mem_len, entry.file_len) {
             return linux_errno(errno);
         }
-    }
-    if state.mappings.len() + count > MAX_MAPPINGS_PER_PREPARE {
-        return linux_errno(LINUX_EINVAL);
-    }
-    for (i, entry) in args.entries[..count].iter().enumerate() {
-        state.mappings.push(MappingEntry::File {
-            backing: backings[i].clone(),
+        let backing = match pinned_file_backing_from_current(entry.fd) {
+            Ok(backing) => backing,
+            Err(errno) => return linux_errno(errno),
+        };
+        mappings[index] = Some(Box::new(MappingEntry::File {
+            backing,
             file_offset: entry.file_offset,
             file_len: entry.file_len,
             target_addr: entry.target_addr,
             mem_len: entry.mem_len,
             flags: entry.flags,
-        });
+        }));
     }
+    let mut prepares = PROC_PREPARES.lock();
+    let Some(state) = prepares.get_mut(&args.prepare_handle) else {
+        return linux_errno(LINUX_EINVAL);
+    };
+    if !prepare_owned_by_current(state) {
+        return linux_errno(LINUX_EPERM);
+    }
+    if state.mappings.len() + count > MAX_MAPPINGS_PER_PREPARE {
+        return linux_errno(LINUX_EINVAL);
+    }
+    for mapping in &mut mappings[..count] {
+        state
+            .mappings
+            .push(mapping.take().expect("validated broker batch entry"));
+    }
+    drop(prepares);
     nucleus_core::debug::record_milestone(
         nucleus_core::debug::LogCategory::Compat,
         "proc-map-file-batch",
@@ -266,16 +325,6 @@ pub(super) fn syscall_linux_rustos_proc_set_linux_runtime_broker(args_ptr: u64) 
     }
     let interp_path_len = args.interp_path_len as usize;
     if interp_path_len > PROC_BROKER_LINUX_INTERP_PATH_CAPACITY {
-        return linux_errno(LINUX_EINVAL);
-    }
-    let mut prepares = PROC_PREPARES.lock();
-    let Some(state) = prepares.get_mut(&args.prepare_handle) else {
-        return linux_errno(LINUX_EINVAL);
-    };
-    if !prepare_owned_by_current(state) {
-        return linux_errno(LINUX_EPERM);
-    }
-    if state.format != PROC_BROKER_FORMAT_ELF64 || state.linux_runtime.is_some() {
         return linux_errno(LINUX_EINVAL);
     }
     let initial_tls = if args.has_tls != 0 {
@@ -316,7 +365,18 @@ pub(super) fn syscall_linux_rustos_proc_set_linux_runtime_broker(args_ptr: u64) 
         image_mappings: Vec::new(),
         runtime_search_paths: Vec::new(),
     };
+    let mut prepares = PROC_PREPARES.lock();
+    let Some(state) = prepares.get_mut(&args.prepare_handle) else {
+        return linux_errno(LINUX_EINVAL);
+    };
+    if !prepare_owned_by_current(state) {
+        return linux_errno(LINUX_EPERM);
+    }
+    if state.format != PROC_BROKER_FORMAT_ELF64 || state.linux_runtime.is_some() {
+        return linux_errno(LINUX_EINVAL);
+    }
     state.linux_runtime = Some((info, args.actual_entry));
+    drop(prepares);
     nucleus_core::debug::record_milestone(
         nucleus_core::debug::LogCategory::Compat,
         "proc-linux-runtime-published",
@@ -337,6 +397,14 @@ pub(super) fn syscall_linux_rustos_proc_map_zeroed_broker(args_ptr: u64) -> u64 
     if args.reserved0 != 0 {
         return linux_errno(LINUX_EINVAL);
     }
+    if let Err(errno) = validate_mapping_region(args.target_addr, args.mem_len, args.flags) {
+        return linux_errno(errno);
+    }
+    let mapping = Box::new(MappingEntry::Zeroed {
+        target_addr: args.target_addr,
+        mem_len: args.mem_len,
+        flags: args.flags,
+    });
     let mut prepares = PROC_PREPARES.lock();
     let Some(state) = prepares.get_mut(&args.prepare_handle) else {
         return linux_errno(LINUX_EINVAL);
@@ -344,17 +412,10 @@ pub(super) fn syscall_linux_rustos_proc_map_zeroed_broker(args_ptr: u64) -> u64 
     if !prepare_owned_by_current(state) {
         return linux_errno(LINUX_EPERM);
     }
-    if let Err(errno) = validate_mapping_region(args.target_addr, args.mem_len, args.flags) {
-        return linux_errno(errno);
-    }
     if state.mappings.len() >= MAX_MAPPINGS_PER_PREPARE {
         return linux_errno(LINUX_EINVAL);
     }
-    state.mappings.push(MappingEntry::Zeroed {
-        target_addr: args.target_addr,
-        mem_len: args.mem_len,
-        flags: args.flags,
-    });
+    state.mappings.push(mapping);
     0
 }
 
@@ -374,6 +435,16 @@ pub(super) fn syscall_linux_rustos_proc_map_data_broker(args_ptr: u64) -> u64 {
     {
         return linux_errno(LINUX_EINVAL);
     }
+    if let Err(errno) = validate_mapping_region(args.target_addr, args.mem_len, args.flags) {
+        return linux_errno(errno);
+    }
+    let mapping = Box::new(MappingEntry::Data {
+        target_addr: args.target_addr,
+        mem_len: args.mem_len,
+        flags: args.flags,
+        data_offset: args.data_offset,
+        data: args.data[..data_len].to_vec(),
+    });
     let mut prepares = PROC_PREPARES.lock();
     let Some(state) = prepares.get_mut(&args.prepare_handle) else {
         return linux_errno(LINUX_EINVAL);
@@ -381,19 +452,10 @@ pub(super) fn syscall_linux_rustos_proc_map_data_broker(args_ptr: u64) -> u64 {
     if !prepare_owned_by_current(state) {
         return linux_errno(LINUX_EPERM);
     }
-    if let Err(errno) = validate_mapping_region(args.target_addr, args.mem_len, args.flags) {
-        return linux_errno(errno);
-    }
     if state.mappings.len() >= MAX_MAPPINGS_PER_PREPARE {
         return linux_errno(LINUX_EINVAL);
     }
-    state.mappings.push(MappingEntry::Data {
-        target_addr: args.target_addr,
-        mem_len: args.mem_len,
-        flags: args.flags,
-        data_offset: args.data_offset,
-        data: args.data[..data_len].to_vec(),
-    });
+    state.mappings.push(mapping);
     0
 }
 
@@ -665,7 +727,11 @@ pub(super) fn syscall_linux_rustos_proc_commit_broker(args_ptr: u64) -> u64 {
                     let _ = multitask::terminate_user_process(spawned.pid);
                     return linux_errno(LINUX_EAGAIN);
                 }
-                activations.insert(spawned.pid, args.requester_pid);
+                if activations.insert(spawned.pid, args.requester_pid).is_err() {
+                    drop(activations);
+                    let _ = multitask::terminate_user_process(spawned.pid);
+                    return linux_errno(LINUX_EAGAIN);
+                }
                 drop(activations);
                 // Close the requester-exit race on both sides of publication:
                 // cleanup either observes the new entry, or this recheck
@@ -786,13 +852,18 @@ pub(super) fn syscall_linux_rustos_proc_authorize_exec_broker(args_ptr: u64) -> 
         let Some(ticket) = allocate_exec_ticket(&tickets) else {
             return linux_errno(LINUX_EAGAIN);
         };
-        tickets.insert(
-            ticket,
-            ExecTicketState {
-                target_pid: args.target_pid,
-                target_tid: args.target_tid,
-            },
-        );
+        if tickets
+            .insert(
+                ticket,
+                ExecTicketState {
+                    target_pid: args.target_pid,
+                    target_tid: args.target_tid,
+                },
+            )
+            .is_err()
+        {
+            return linux_errno(LINUX_EAGAIN);
+        }
         ticket
     };
     // Process teardown runs independently of procd authorization. Recheck
@@ -956,7 +1027,9 @@ pub(super) fn syscall_linux_rustos_proc_exec_target_broker(args_ptr: u64) -> u64
         if transitions.contains_key(&args.target_tid) {
             return linux_errno(LINUX_EBUSY);
         }
-        transitions.insert(args.target_tid, transition);
+        if transitions.insert(args.target_tid, transition).is_err() {
+            return linux_errno(LINUX_EAGAIN);
+        }
     }
     if let Some(closed_handles) = multitask::exec_user_process_by_pid(
         args.target_pid,
@@ -1061,6 +1134,7 @@ pub(super) fn syscall_linux_rustos_proc_fork_broker(args_ptr: u64) -> u64 {
     child_thread_state.rseq_len = 0;
     child_thread_state.rseq_signature = 0;
     child_thread_state.pending_signals = 0;
+    child_thread_state.pending_sigchld_events = 0;
 
     let mut bootstrap = multitask::UserTaskBootstrap::new(
         crate::user::abi::UserAbi::Linux,
@@ -1141,12 +1215,14 @@ pub(super) fn syscall_linux_rustos_proc_abort_broker(args_ptr: u64) -> u64 {
         return linux_errno(LINUX_EINVAL);
     }
     let mut prepares = PROC_PREPARES.lock();
-    if let Some(state) = prepares.get(&args.prepare_handle) {
-        if !prepare_owned_by_current(state) {
-            return linux_errno(LINUX_EPERM);
-        }
+    if let Some(state) = prepares.get(&args.prepare_handle)
+        && !prepare_owned_by_current(state)
+    {
+        return linux_errno(LINUX_EPERM);
     }
-    prepares.remove(&args.prepare_handle);
+    let removed = prepares.remove(&args.prepare_handle);
+    drop(prepares);
+    drop(removed);
     0
 }
 
@@ -1156,28 +1232,42 @@ pub(super) fn syscall_linux_rustos_proc_abort_broker(args_ptr: u64) -> u64 {
 /// therefore removes owner-bound prepares plus target-bound tickets and saved
 /// register transitions before the process table retires that process.
 pub(super) fn cleanup_proc_broker_state_for_process(process_id: u64) -> (usize, usize, usize) {
-    let deferred_targets = {
+    let mut deferred_targets = [0_u64; MAX_DEFERRED_ACTIVATIONS];
+    let deferred_target_count = {
         let mut activations = DEFERRED_ACTIVATIONS.lock();
-        let targets = activations
-            .iter()
-            .filter_map(|(target_pid, requester_pid)| {
-                (*requester_pid == process_id && *target_pid != process_id).then_some(*target_pid)
-            })
-            .collect::<Vec<_>>();
+        let mut count = 0usize;
+        for (target_pid, requester_pid) in activations.iter() {
+            if *requester_pid == process_id && *target_pid != process_id {
+                deferred_targets[count] = *target_pid;
+                count += 1;
+            }
+        }
         activations.retain(|target_pid, requester_pid| {
             *target_pid != process_id && *requester_pid != process_id
         });
-        targets
+        count
     };
-    for target_pid in deferred_targets {
+    for target_pid in deferred_targets[..deferred_target_count].iter().copied() {
         let _ = multitask::terminate_user_process(target_pid);
     }
 
-    let mut prepares = PROC_PREPARES.lock();
-    let prepares_before = prepares.len();
-    prepares.retain(|_, state| state.owner_pid != process_id);
-    let removed_prepares = prepares_before.saturating_sub(prepares.len());
-    drop(prepares);
+    // ProcPrepareState owns heap allocations and pinned file references. Remove
+    // one state at a time so its destructor never runs under the registry lock.
+    let mut removed_prepares = 0usize;
+    loop {
+        let removed = {
+            let mut prepares = PROC_PREPARES.lock();
+            let key = prepares
+                .iter()
+                .find_map(|(key, state)| (state.owner_pid == process_id).then_some(*key));
+            key.and_then(|key| prepares.remove(&key))
+        };
+        let Some(state) = removed else {
+            break;
+        };
+        removed_prepares += 1;
+        drop(state);
+    }
 
     let mut tickets = EXEC_TICKETS.lock();
     let tickets_before = tickets.len();
@@ -1308,12 +1398,12 @@ fn exec_transition_from_prepared(
 }
 
 fn address_space_from_mappings(
-    mappings: &[MappingEntry],
+    mappings: &[Box<MappingEntry>],
 ) -> Result<crate::memory::paging::ProcessAddressSpace, i64> {
     let mut address_space = crate::memory::paging::ProcessAddressSpace::new()
         .map_err(address_space_error_to_linux_errno)?;
     for (index, mapping) in mappings.iter().enumerate() {
-        match mapping {
+        match mapping.as_ref() {
             MappingEntry::Zeroed {
                 target_addr,
                 mem_len,
@@ -1492,7 +1582,7 @@ fn page_flags(flags: u64) -> Result<PageTableFlags, i64> {
     Ok(page_flags)
 }
 
-fn allocate_prepare_handle(prepares: &BTreeMap<u64, ProcPrepareState>) -> Option<u64> {
+fn allocate_prepare_handle(prepares: &ProcPrepareRegistry) -> Option<u64> {
     for _ in 0..MAX_PROC_PREPARES {
         let handle = allocate_nonwrapping_broker_identity(&NEXT_PREPARE_HANDLE)?;
         if !prepares.contains_key(&handle) {
@@ -1516,7 +1606,7 @@ fn proc_prepare_publication_status(owner_exiting: bool, pending: usize) -> Resul
     Ok(())
 }
 
-fn allocate_exec_ticket(tickets: &BTreeMap<u64, ExecTicketState>) -> Option<u64> {
+fn allocate_exec_ticket(tickets: &ExecTicketRegistry) -> Option<u64> {
     for _ in 0..MAX_EXEC_TICKETS {
         let ticket = allocate_nonwrapping_broker_identity(&NEXT_EXEC_TICKET)?;
         if !tickets.contains_key(&ticket) {
@@ -1527,7 +1617,7 @@ fn allocate_exec_ticket(tickets: &BTreeMap<u64, ExecTicketState>) -> Option<u64>
 }
 
 fn consume_deferred_activation_authority(
-    activations: &mut BTreeMap<u64, u64>,
+    activations: &mut DeferredActivationRegistry,
     target_pid: u64,
     requester_pid: u64,
 ) -> bool {
@@ -1542,7 +1632,7 @@ fn consume_deferred_activation_authority(
 }
 
 fn deferred_spawn_provenance_matches(
-    activations: &BTreeMap<u64, u64>,
+    activations: &DeferredActivationRegistry,
     target_pid: u64,
     requester_pid: u64,
 ) -> bool {
@@ -1574,14 +1664,11 @@ fn procd_process_prepare_policy(format: u16) -> Result<(), i64> {
     request.header.subject_pid = snapshot.process_id();
     request.header.subject_tid = snapshot.thread_id();
     request.arg0 = u64::from(format);
-    let response = match ipc_ops::call_service_endpoint_with_class(
+    let response = ipc_ops::call_service_endpoint_with_class(
         rustos_user_abi::syscall::IPC_SERVICE_PROCD,
         as_bytes(&request),
         ipc_ops::ServiceIpcClass::BootControl,
-    ) {
-        Ok(response) => response,
-        Err(errno) => return Err(errno),
-    };
+    )?;
     if response.len() != core::mem::size_of::<CommercialMaxProtocolResponse>() {
         return Err(LINUX_EINVAL);
     }
@@ -1604,8 +1691,8 @@ fn procd_process_prepare_policy(format: u16) -> Result<(), i64> {
 
 fn validate_mapping_region(target_addr: u64, mem_len: u64, flags: u64) -> Result<(), i64> {
     if mem_len == 0
-        || target_addr % PAGE_SIZE != 0
-        || mem_len % PAGE_SIZE != 0
+        || !target_addr.is_multiple_of(PAGE_SIZE)
+        || !mem_len.is_multiple_of(PAGE_SIZE)
         || target_addr < PROC_BROKER_USER_SPACE_BASE
         || target_addr
             .checked_add(mem_len)
@@ -1628,8 +1715,8 @@ fn validate_mapping_region(target_addr: u64, mem_len: u64, flags: u64) -> Result
 
 fn validate_user_range(start: u64, len: u64) -> Result<(), i64> {
     if len == 0
-        || start % PAGE_SIZE != 0
-        || len % PAGE_SIZE != 0
+        || !start.is_multiple_of(PAGE_SIZE)
+        || !len.is_multiple_of(PAGE_SIZE)
         || start < PROC_BROKER_USER_SPACE_BASE
         || start
             .checked_add(len)
@@ -1775,7 +1862,8 @@ mod tests {
 
     #[test]
     fn deferred_activation_authority_is_exact_one_shot_and_nontransferable() {
-        let mut activations = BTreeMap::from([(41, 7)]);
+        let mut activations = DeferredActivationRegistry::new();
+        assert_eq!(activations.insert(41, 7), Ok(None));
         assert!(deferred_spawn_provenance_matches(&activations, 41, 7));
         assert!(!deferred_spawn_provenance_matches(&activations, 41, 8));
         assert!(!consume_deferred_activation_authority(

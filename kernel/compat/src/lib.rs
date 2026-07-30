@@ -38,12 +38,14 @@ pub(crate) mod io {
 
         pub fn ioctl_from_user(
             handle: DeviceHandle,
+            process_id: u64,
             process_state: &mut kernel_ps::api::process_state::UserProcessState,
             request: u64,
             arg: u64,
         ) -> Result<u64, DeviceError> {
             kernel_io_manager::api::device::ioctl_from_user(
-                handle.into(),
+                handle,
+                process_id,
                 process_state,
                 request,
                 arg,
@@ -59,18 +61,18 @@ pub(crate) mod io {
         pub(crate) use kernel_object::api::session::ConsoleSessionHandle;
 
         pub fn write_to_session(session: ConsoleSessionHandle, bytes: &[u8]) -> usize {
-            kernel_io_manager::api::tty::write_to_session(session.into(), bytes)
+            kernel_io_manager::api::tty::write_to_session(session, bytes)
         }
 
         pub fn read_input_for_session(session: ConsoleSessionHandle, dest: &mut [u8]) -> usize {
-            kernel_io_manager::api::tty::read_input_for_session(session.into(), dest)
+            kernel_io_manager::api::tty::read_input_for_session(session, dest)
         }
 
         pub fn read_input_blocking_for_session(
             session: ConsoleSessionHandle,
             dest: &mut [u8],
         ) -> usize {
-            kernel_io_manager::api::tty::read_input_blocking_for_session(session.into(), dest)
+            kernel_io_manager::api::tty::read_input_blocking_for_session(session, dest)
         }
     }
 }

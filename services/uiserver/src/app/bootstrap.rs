@@ -13,14 +13,15 @@ use crate::sys::{
     boot_line, debug_line, diag_line, display_create_surface, display_get_info, display_present,
     display_present_rect, map_surface, open_console, open_display, open_input,
     publish_input_pointer_surface, require_background_thread_class, DisplayInfo,
-    DisplaySurfaceCreate, SurfaceMapping, ESTALE, PIXEL_FORMAT_BGRA8888,
+    DisplaySurfaceCreate, SurfaceMapping, EAGAIN, ENODEV, ESTALE, PIXEL_FORMAT_BGRA8888,
 };
 const SURFACE_CREATE_RETRIES: usize = 4;
 // Retry budget for waiting on a primary display provider (for example the DVM
 // display aperture). The earliest snapshot may still be the kernel firmware
-// framebuffer while the provider is being published. Polling for up to ~5s at
-// 50ms intervals covers boot-time ordering races without hanging forever.
-const PRIMARY_DISPLAY_WAIT_ATTEMPTS: usize = 100;
+// framebuffer, or GET_INFO may return EAGAIN/ENODEV before the provider is
+// published. Polling for at most 1s at 50ms intervals matches the product-boot
+// contract without hiding a missing provider behind an unbounded startup wait.
+const PRIMARY_DISPLAY_WAIT_ATTEMPTS: usize = 20;
 const PRIMARY_DISPLAY_WAIT_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Display validation outcome split between "wait and retry" failures (the
@@ -29,6 +30,10 @@ const PRIMARY_DISPLAY_WAIT_DELAY: std::time::Duration = std::time::Duration::fro
 enum DisplayValidationError {
     NotPrimaryYet,
     Fatal(i32),
+}
+
+fn display_info_unavailable_is_retryable(errno: i32) -> bool {
+    matches!(errno, EAGAIN | ENODEV)
 }
 
 fn validate_display_info_with_retry(
@@ -143,6 +148,53 @@ fn validate_surface_metadata(
     Ok(surface_mapping_len)
 }
 
+fn wait_for_primary_display(
+    display_fd: i32,
+    wait_attempts: &mut usize,
+) -> Result<(DisplayInfo, usize), i32> {
+    loop {
+        match display_get_info(display_fd) {
+            Ok(display) => match validate_display_info_with_retry(&display) {
+                Ok(stride) => return Ok((display, stride)),
+                Err(DisplayValidationError::Fatal(err)) => return Err(err),
+                Err(DisplayValidationError::NotPrimaryYet) => {
+                    if *wait_attempts == 0 {
+                        diag_line(
+                            format!(
+                                "uiserver: waiting for primary display provider (initial flags={:#x} gen={})",
+                                display.flags, display.generation,
+                            )
+                            .as_str(),
+                        );
+                    }
+                }
+            },
+            Err(errno) if display_info_unavailable_is_retryable(errno) => {
+                if *wait_attempts == 0 {
+                    diag_line(
+                        format!(
+                            "uiserver: waiting for primary display provider (get-info errno={errno})"
+                        )
+                        .as_str(),
+                    );
+                }
+            }
+            Err(errno) => {
+                debug_line(&format!("uiserver: display_get_info failed errno={errno}"));
+                diag_line("uiserver: display_get_info failed");
+                return Err(13);
+            }
+        }
+
+        *wait_attempts += 1;
+        if *wait_attempts >= PRIMARY_DISPLAY_WAIT_ATTEMPTS {
+            diag_line("uiserver: primary display provider never registered");
+            return Err(14);
+        }
+        thread::sleep(PRIMARY_DISPLAY_WAIT_DELAY);
+    }
+}
+
 fn fetch_surface_state(display_fd: i32) -> Result<DisplaySurfaceState, i32> {
     // Wait for the primary display provider to register before we attempt
     // surface creation. This guards against the boot-time race where
@@ -154,41 +206,8 @@ fn fetch_surface_state(display_fd: i32) -> Result<DisplaySurfaceState, i32> {
         // Re-fetch display info each surface attempt: after a generation
         // mismatch (or the primary-provider wait below) the geometry may have
         // changed and we need fresh dimensions for create_surface.
-        let mut display: DisplayInfo = display_get_info(display_fd).map_err(|errno| {
-            debug_line(&format!("uiserver: display_get_info failed errno={errno}"));
-            diag_line("uiserver: display_get_info failed");
-            13_i32
-        })?;
-        let display_stride_bytes = loop {
-            match validate_display_info_with_retry(&display) {
-                Ok(stride) => break stride,
-                Err(DisplayValidationError::Fatal(err)) => return Err(err),
-                Err(DisplayValidationError::NotPrimaryYet) => {
-                    if wait_attempts == 0 {
-                        diag_line(
-                            format!(
-                                "uiserver: waiting for primary display provider (initial flags={:#x} gen={})",
-                                display.flags, display.generation,
-                            )
-                            .as_str(),
-                        );
-                    }
-                    wait_attempts += 1;
-                    if wait_attempts >= PRIMARY_DISPLAY_WAIT_ATTEMPTS {
-                        diag_line("uiserver: primary display provider never registered");
-                        return Err(14);
-                    }
-                    thread::sleep(PRIMARY_DISPLAY_WAIT_DELAY);
-                    display = display_get_info(display_fd).map_err(|errno| {
-                        debug_line(&format!(
-                            "uiserver: display_get_info failed during primary wait errno={errno}"
-                        ));
-                        diag_line("uiserver: display_get_info failed during primary wait");
-                        13_i32
-                    })?;
-                }
-            }
-        };
+        let (display, display_stride_bytes) =
+            wait_for_primary_display(display_fd, &mut wait_attempts)?;
         if wait_attempts > 0 && attempt == 0 {
             diag_line(
                 format!(
@@ -280,58 +299,6 @@ fn fetch_surface_state(display_fd: i32) -> Result<DisplaySurfaceState, i32> {
 
     diag_line("uiserver: display surface generation kept changing");
     Err(16)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::validate_surface_metadata;
-    use crate::sys::{DisplayInfo, DisplaySurfaceCreate, PIXEL_FORMAT_BGRA8888};
-
-    fn padded_display() -> DisplayInfo {
-        DisplayInfo {
-            width: 1600,
-            height: 900,
-            stride_bytes: 7168,
-            bytes_per_pixel: 4,
-            pixel_format: PIXEL_FORMAT_BGRA8888,
-            flags: rustos_user_abi::device::DISPLAY_INFO_FLAG_PRIMARY_PROVIDER,
-            generation: 1,
-        }
-    }
-
-    fn padded_surface() -> DisplaySurfaceCreate {
-        DisplaySurfaceCreate {
-            width: 1600,
-            height: 900,
-            pixel_format: PIXEL_FORMAT_BGRA8888,
-            flags: 0,
-            handle: 6,
-            bytes_per_pixel: 4,
-            stride_bytes: 7168,
-            reserved: 0,
-            mapping_len: 6_451_200,
-            generation: 1,
-        }
-    }
-
-    #[test]
-    fn surface_metadata_accepts_provider_padding() {
-        assert_eq!(
-            validate_surface_metadata(&padded_display(), &padded_surface(), 7168),
-            Ok(6_451_200)
-        );
-    }
-
-    #[test]
-    fn surface_metadata_rejects_pitch_drift() {
-        let mut surface = padded_surface();
-        surface.stride_bytes = 6400;
-        surface.mapping_len = 5_763_072;
-        assert_eq!(
-            validate_surface_metadata(&padded_display(), &surface, 7168),
-            Err(16)
-        );
-    }
 }
 
 impl AppState {
@@ -569,4 +536,72 @@ fn load_launcher_programs() -> Vec<LauncherProgram> {
     }
 
     programs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        display_info_unavailable_is_retryable, validate_surface_metadata,
+        PRIMARY_DISPLAY_WAIT_ATTEMPTS, PRIMARY_DISPLAY_WAIT_DELAY,
+    };
+    use crate::sys::{
+        DisplayInfo, DisplaySurfaceCreate, EAGAIN, EINVAL, ENODEV, PIXEL_FORMAT_BGRA8888,
+    };
+
+    fn padded_display() -> DisplayInfo {
+        DisplayInfo {
+            width: 1600,
+            height: 900,
+            stride_bytes: 7168,
+            bytes_per_pixel: 4,
+            pixel_format: PIXEL_FORMAT_BGRA8888,
+            flags: rustos_user_abi::device::DISPLAY_INFO_FLAG_PRIMARY_PROVIDER,
+            generation: 1,
+        }
+    }
+
+    fn padded_surface() -> DisplaySurfaceCreate {
+        DisplaySurfaceCreate {
+            width: 1600,
+            height: 900,
+            pixel_format: PIXEL_FORMAT_BGRA8888,
+            flags: 0,
+            handle: 6,
+            bytes_per_pixel: 4,
+            stride_bytes: 7168,
+            reserved: 0,
+            mapping_len: 6_451_200,
+            generation: 1,
+        }
+    }
+
+    #[test]
+    fn surface_metadata_accepts_provider_padding() {
+        assert_eq!(
+            validate_surface_metadata(&padded_display(), &padded_surface(), 7168),
+            Ok(6_451_200)
+        );
+    }
+
+    #[test]
+    fn display_provider_wait_retries_only_transient_absence() {
+        assert!(display_info_unavailable_is_retryable(ENODEV));
+        assert!(display_info_unavailable_is_retryable(EAGAIN));
+        assert!(!display_info_unavailable_is_retryable(EINVAL));
+        assert!(
+            PRIMARY_DISPLAY_WAIT_DELAY.saturating_mul(PRIMARY_DISPLAY_WAIT_ATTEMPTS as u32)
+                <= std::time::Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn surface_metadata_rejects_pitch_drift() {
+        let mut surface = padded_surface();
+        surface.stride_bytes = 6400;
+        surface.mapping_len = 5_763_072;
+        assert_eq!(
+            validate_surface_metadata(&padded_display(), &surface, 7168),
+            Err(16)
+        );
+    }
 }

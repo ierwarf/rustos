@@ -1,3 +1,18 @@
+//! Per-process ABI, VMA backing, and descriptor-adjacent lifetime state.
+//!
+//! - **Owner:** `kernel-ps` owns kernel process substrate; service-owned policy
+//!   enters only through validated plans.
+//! - **Boundary:** Linux/Windows ABI state and remote backing tokens are valid
+//!   only under the exact process generation.
+//! - **Lifecycle:** Fork clones retained backing, unmap releases exact spans,
+//!   and exec replaces state transactionally before old-state retirement.
+//! - **Concurrency:** Mutation requires the process-state owner lock and never
+//!   performs synchronous service IPC while partially changed.
+//! - **Failure:** Partial map/exec/fork failure restores the prior state and
+//!   releases staged holds exactly once.
+//! - **Forbidden:** No descriptor close as backing release, stale process
+//!   snapshot, or policy implementation in this substrate.
+//! - **Evidence:** `memory-map` and `process-address-space-lifecycle`.
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::convert::TryFrom;
@@ -8,22 +23,16 @@ use x86_64::structures::paging::PageTableFlags;
 use crate::memory::paging::{self, AddressSpaceError, ProcessAddressSpace, UserRegion};
 use crate::user::handles::{HandleTable, KernelHandle};
 use crate::user::linux::{
-    CLOCK_MONOTONIC, CLOCK_REALTIME, LinuxMemoryMapState, LinuxProcessState, LinuxRuntimeProfile,
-    LinuxSigAction, MAX_SIGNAL_NUMBER, SIG_IGN,
+    LinuxMemoryMapState, LinuxProcessState, LinuxRuntimeProfile, LinuxSigAction, MAX_SIGNAL_NUMBER,
+    SIG_IGN,
 };
 use crate::user::memfd::MemfdMappingHold;
+use kernel_ipc_runtime::api::KernelSharedRegionMappingHold;
 
 const PAGE_SIZE: u64 = 4096;
 const DEFAULT_MAPPING_GAP: u64 = 16 * 1024 * 1024;
 const ADMIN_REQUEST_PATH_CAPACITY: usize = 96;
 const PROCESS_EXEC_PATH_CAPACITY: usize = 192;
-const LINUX_CLOCK_ADMISSION_REALTIME: u8 = 1 << 0;
-const LINUX_CLOCK_ADMISSION_MONOTONIC: u8 = 1 << 1;
-const LINUX_NANOSLEEP_ADMISSION: u8 = 1 << 2;
-const LINUX_CLOCK_NANOSLEEP_REALTIME_RELATIVE: u8 = 1 << 3;
-const LINUX_CLOCK_NANOSLEEP_REALTIME_ABSOLUTE: u8 = 1 << 4;
-const LINUX_CLOCK_NANOSLEEP_MONOTONIC_RELATIVE: u8 = 1 << 5;
-const LINUX_CLOCK_NANOSLEEP_MONOTONIC_ABSOLUTE: u8 = 1 << 6;
 pub const WINDOWS_TLS_SLOT_COUNT: usize = 64;
 pub const DEFAULT_DESKTOP_UID: u32 = 1000;
 pub const DEFAULT_DESKTOP_GID: u32 = 1000;
@@ -62,6 +71,8 @@ impl PendingAdminRequest {
         }
     }
 
+    // TEST-HARNESS: Host lifecycle tests inspect the staged request kind;
+    // production consumes the complete request atomically.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn kind(self) -> PendingAdminRequestKind {
         self.kind
@@ -137,6 +148,8 @@ impl ProcessSecurityContext {
         self.egid
     }
 
+    // TEST-HARNESS: Recovery tests observe pending authority without consuming
+    // it; production transitions through the mutation methods.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn pending_admin_request(self) -> Option<PendingAdminRequest> {
         self.pending_admin_request
@@ -166,11 +179,6 @@ pub struct UserProcessState {
     linux_process_state: Option<LinuxProcessState>,
     linux_memory_map: Option<LinuxMemoryMapState>,
     linux_runtime_profile: Option<LinuxRuntimeProfile>,
-    /// Positive syscalld admission for immutable Linux time-policy keys. The
-    /// cache is process-local, starts empty, and is reset by fork/exec.
-    /// Unknown clock IDs/flag combinations are never representable, so a
-    /// service or caller cannot turn malformed input into a cached grant.
-    linux_time_admission_mask: u8,
     linux_sigactions: [LinuxSigAction; MAX_SIGNAL_NUMBER + 1],
     windows_runtime: Option<WindowsProcessRuntimeState>,
     handles: HandleTable,
@@ -178,6 +186,7 @@ pub struct UserProcessState {
     mapping_cursor: u64,
     windows_allocations: Vec<WindowsAllocation>,
     shared_memfd_mappings: Vec<SharedMemfdMapping>,
+    shared_region_mappings: Vec<SharedRegionMapping>,
     cwd: String,
     exec_path: [u8; PROCESS_EXEC_PATH_CAPACITY],
     exec_path_len: usize,
@@ -306,10 +315,37 @@ pub struct SharedMemfdMapping {
     hold: MemfdMappingHold,
 }
 
+#[derive(Clone, Debug)]
+struct SharedRegionMapping {
+    start: u64,
+    len: u64,
+    hold: KernelSharedRegionMappingHold,
+}
+
 impl SharedMemfdMapping {
     fn end(&self) -> u64 {
         self.start.saturating_add(self.len)
     }
+}
+
+impl SharedRegionMapping {
+    fn end(&self) -> u64 {
+        self.start.saturating_add(self.len)
+    }
+}
+
+fn overlap_segment(
+    mapping_start: u64,
+    mapping_end: u64,
+    requested_start: u64,
+    requested_end: u64,
+) -> Option<(u64, u64)> {
+    let overlap_start = mapping_start.max(requested_start);
+    let overlap_end = mapping_end.min(requested_end);
+    if overlap_start >= overlap_end {
+        return None;
+    }
+    Some((overlap_start, overlap_end - overlap_start))
 }
 
 impl WindowsThreadRuntimeState {
@@ -351,7 +387,6 @@ impl UserProcessState {
             linux_process_state,
             linux_memory_map,
             linux_runtime_profile,
-            linux_time_admission_mask: 0,
             linux_sigactions: [LinuxSigAction::default(); MAX_SIGNAL_NUMBER + 1],
             windows_runtime,
             handles: HandleTable::new(),
@@ -359,6 +394,7 @@ impl UserProcessState {
             mapping_cursor: default_cursor,
             windows_allocations: Vec::new(),
             shared_memfd_mappings: Vec::new(),
+            shared_region_mappings: Vec::new(),
             cwd: String::from("/"),
             exec_path: [0; PROCESS_EXEC_PATH_CAPACITY],
             exec_path_len: 0,
@@ -394,44 +430,6 @@ impl UserProcessState {
 
     pub fn linux_runtime_profile(&self) -> Option<&LinuxRuntimeProfile> {
         self.linux_runtime_profile.as_ref()
-    }
-
-    pub fn linux_clock_admission_cached(&self, clock_id: u64) -> bool {
-        linux_clock_admission_bit(clock_id)
-            .is_some_and(|bit| self.linux_time_admission_mask & bit != 0)
-    }
-
-    /// Records only a successful admission for one of the two immutable Linux
-    /// clock IDs supported by syscalld. Returns false for every unknown ID.
-    pub fn cache_linux_clock_admission(&mut self, clock_id: u64) -> bool {
-        let Some(bit) = linux_clock_admission_bit(clock_id) else {
-            return false;
-        };
-        self.linux_time_admission_mask |= bit;
-        true
-    }
-
-    pub fn linux_nanosleep_admission_cached(&self) -> bool {
-        self.linux_time_admission_mask & LINUX_NANOSLEEP_ADMISSION != 0
-    }
-
-    pub fn cache_linux_nanosleep_admission(&mut self) {
-        self.linux_time_admission_mask |= LINUX_NANOSLEEP_ADMISSION;
-    }
-
-    pub fn linux_clock_nanosleep_admission_cached(&self, clock_id: u64, absolute: bool) -> bool {
-        linux_clock_nanosleep_admission_bit(clock_id, absolute)
-            .is_some_and(|bit| self.linux_time_admission_mask & bit != 0)
-    }
-
-    /// Records one exact successful `(clock_id, TIMER_ABSTIME)` policy key.
-    /// Returns false for unsupported IDs instead of caching a fallback.
-    pub fn cache_linux_clock_nanosleep_admission(&mut self, clock_id: u64, absolute: bool) -> bool {
-        let Some(bit) = linux_clock_nanosleep_admission_bit(clock_id, absolute) else {
-            return false;
-        };
-        self.linux_time_admission_mask |= bit;
-        true
     }
 
     pub fn address_space_and_linux_process_state_mut(
@@ -491,6 +489,50 @@ impl UserProcessState {
             }
         }
         self.shared_memfd_mappings = updated;
+    }
+
+    pub fn record_shared_region_mapping(
+        &mut self,
+        start: u64,
+        len: u64,
+        hold: KernelSharedRegionMappingHold,
+    ) {
+        self.shared_region_mappings
+            .push(SharedRegionMapping { start, len, hold });
+    }
+
+    pub fn shared_region_overlap_segments(&self, start: u64, end: u64) -> Vec<(u64, u64)> {
+        self.shared_region_mappings
+            .iter()
+            .filter_map(|mapping| overlap_segment(mapping.start, mapping.end(), start, end))
+            .collect()
+    }
+
+    pub fn release_shared_region_mappings_in_range(&mut self, start: u64, end: u64) {
+        let mut updated = Vec::with_capacity(self.shared_region_mappings.len() + 1);
+        for mapping in self.shared_region_mappings.drain(..) {
+            let mapping_end = mapping.end();
+            if end <= mapping.start || start >= mapping_end {
+                updated.push(mapping);
+                continue;
+            }
+
+            if start > mapping.start {
+                updated.push(SharedRegionMapping {
+                    start: mapping.start,
+                    len: start - mapping.start,
+                    hold: mapping.hold.clone(),
+                });
+            }
+            if end < mapping_end {
+                updated.push(SharedRegionMapping {
+                    start: end,
+                    len: mapping_end - end,
+                    hold: mapping.hold.clone(),
+                });
+            }
+        }
+        self.shared_region_mappings = updated;
     }
 
     pub fn linux_signal_action(&self, signal: u64) -> Option<LinuxSigAction> {
@@ -557,7 +599,6 @@ impl UserProcessState {
             linux_process_state: self.linux_process_state,
             linux_memory_map: self.linux_memory_map.clone(),
             linux_runtime_profile: self.linux_runtime_profile.clone(),
-            linux_time_admission_mask: 0,
             linux_sigactions: self.linux_sigactions,
             windows_runtime: self.windows_runtime,
             handles: self.handles.clone(),
@@ -565,6 +606,7 @@ impl UserProcessState {
             mapping_cursor: self.mapping_cursor,
             windows_allocations: self.windows_allocations.clone(),
             shared_memfd_mappings: self.shared_memfd_mappings.clone(),
+            shared_region_mappings: self.shared_region_mappings.clone(),
             cwd: self.cwd.clone(),
             exec_path: [0; PROCESS_EXEC_PATH_CAPACITY],
             exec_path_len: 0,
@@ -768,47 +810,21 @@ fn align_up(value: u64) -> u64 {
     value.saturating_add(PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
 }
 
-fn linux_clock_admission_bit(clock_id: u64) -> Option<u8> {
-    match clock_id {
-        id if id == CLOCK_REALTIME as u64 => Some(LINUX_CLOCK_ADMISSION_REALTIME),
-        id if id == CLOCK_MONOTONIC as u64 => Some(LINUX_CLOCK_ADMISSION_MONOTONIC),
-        _ => None,
-    }
-}
-
-fn linux_clock_nanosleep_admission_bit(clock_id: u64, absolute: bool) -> Option<u8> {
-    match (clock_id, absolute) {
-        (id, false) if id == CLOCK_REALTIME as u64 => Some(LINUX_CLOCK_NANOSLEEP_REALTIME_RELATIVE),
-        (id, true) if id == CLOCK_REALTIME as u64 => Some(LINUX_CLOCK_NANOSLEEP_REALTIME_ABSOLUTE),
-        (id, false) if id == CLOCK_MONOTONIC as u64 => {
-            Some(LINUX_CLOCK_NANOSLEEP_MONOTONIC_RELATIVE)
-        }
-        (id, true) if id == CLOCK_MONOTONIC as u64 => {
-            Some(LINUX_CLOCK_NANOSLEEP_MONOTONIC_ABSOLUTE)
-        }
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         DEFAULT_DESKTOP_GID, DEFAULT_DESKTOP_UID, PendingAdminRequestKind, ProcessSecurityContext,
-        UserProcessState,
+        overlap_segment,
     };
-    use crate::memory::paging::ProcessAddressSpace;
-    use crate::user::linux::{CLOCK_MONOTONIC, CLOCK_REALTIME, LinuxProcessState};
 
-    fn linux_process_state() -> UserProcessState {
-        UserProcessState::new(
-            ProcessAddressSpace::empty_for_tests(),
-            Some(LinuxProcessState::default()),
-            None,
-            None,
-            None,
-            false,
-            "/test.elf",
-        )
+    #[test]
+    fn overlap_segment_rejects_disjoint_ranges_without_unsigned_underflow() {
+        assert_eq!(overlap_segment(0x1000, 0x2000, 0x3000, 0x4000), None);
+        assert_eq!(overlap_segment(0x3000, 0x4000, 0x1000, 0x2000), None);
+        assert_eq!(
+            overlap_segment(0x1000, 0x3000, 0x2000, 0x4000),
+            Some((0x2000, 0x1000))
+        );
     }
 
     #[test]
@@ -838,31 +854,5 @@ mod tests {
         assert_eq!(admin.gid(), 0);
         assert_eq!(admin.euid(), 0);
         assert_eq!(admin.egid(), 0);
-    }
-
-    #[test]
-    fn linux_clock_admission_cache_is_exact_and_process_local() {
-        let mut state = linux_process_state();
-        assert!(!state.linux_clock_admission_cached(CLOCK_MONOTONIC as u64));
-        assert!(!state.linux_clock_admission_cached(CLOCK_REALTIME as u64));
-        assert!(!state.linux_nanosleep_admission_cached());
-        assert!(!state.linux_clock_nanosleep_admission_cached(CLOCK_MONOTONIC as u64, true));
-        assert!(!state.cache_linux_clock_admission(u64::MAX));
-        assert!(!state.cache_linux_clock_nanosleep_admission(u64::MAX, false));
-
-        assert!(state.cache_linux_clock_admission(CLOCK_MONOTONIC as u64));
-        state.cache_linux_nanosleep_admission();
-        assert!(state.cache_linux_clock_nanosleep_admission(CLOCK_MONOTONIC as u64, true));
-        assert!(state.linux_clock_admission_cached(CLOCK_MONOTONIC as u64));
-        assert!(!state.linux_clock_admission_cached(CLOCK_REALTIME as u64));
-        assert!(state.linux_nanosleep_admission_cached());
-        assert!(state.linux_clock_nanosleep_admission_cached(CLOCK_MONOTONIC as u64, true));
-        assert!(!state.linux_clock_nanosleep_admission_cached(CLOCK_MONOTONIC as u64, false));
-        assert!(!state.linux_clock_nanosleep_admission_cached(CLOCK_REALTIME as u64, true));
-
-        let child = state.fork_clone(ProcessAddressSpace::empty_for_tests(), None);
-        assert!(!child.linux_clock_admission_cached(CLOCK_MONOTONIC as u64));
-        assert!(!child.linux_nanosleep_admission_cached());
-        assert!(!child.linux_clock_nanosleep_admission_cached(CLOCK_MONOTONIC as u64, true));
     }
 }

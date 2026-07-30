@@ -26,6 +26,7 @@ Init ==
     /\ latencyHints = <<>>
 
 OverdueUsers == {task \in ready \cap UserTasks: readyAge[task] = MaxUserWait}
+OverdueSystems == {task \in ready \cap SystemTasks: readyAge[task] = MaxUserWait}
 
 AdvanceReadyAge(dispatched) ==
     [task \in Tasks |->
@@ -37,9 +38,10 @@ AdvanceReadyAge(dispatched) ==
 
 DispatchSystem(task) ==
     /\ task \in ready \cap SystemTasks
+    /\ (OverdueSystems = {} \/ task \in OverdueSystems)
     /\ (ready \cap UserTasks = {} \/ systemBurst < MaxSystemBurst)
-    /\ OverdueUsers = {}
-    /\ (latencyHints = <<>> \/ latencyBurst = MaxLatencyBurst)
+    /\ (OverdueSystems # {} \/ OverdueUsers = {})
+    /\ (OverdueSystems # {} \/ latencyHints = <<>> \/ latencyBurst = MaxLatencyBurst)
     /\ runtime' = [runtime EXCEPT ![task] = (@ + 1) % (MaxRuntime + 1)]
     /\ readyAge' = AdvanceReadyAge(task)
     /\ last' = task
@@ -49,8 +51,9 @@ DispatchSystem(task) ==
 
 DispatchUser(task) ==
     /\ task \in ready \cap UserTasks
+    /\ OverdueSystems = {}
     /\ (OverdueUsers = {} \/ task \in OverdueUsers)
-    /\ (latencyHints = <<>> \/ latencyBurst = MaxLatencyBurst)
+    /\ (OverdueUsers # {} \/ latencyHints = <<>> \/ latencyBurst = MaxLatencyBurst)
     /\ runtime' = [runtime EXCEPT ![task] = (@ + 1) % (MaxRuntime + 1)]
     /\ readyAge' = AdvanceReadyAge(task)
     /\ last' = task
@@ -61,6 +64,8 @@ DispatchUser(task) ==
 DispatchLatency ==
     /\ latencyHints # <<>>
     /\ latencyBurst < MaxLatencyBurst
+    /\ OverdueSystems = {}
+    /\ OverdueUsers = {}
     /\ Head(latencyHints) \in ready \cap UserTasks
     /\ LET task == Head(latencyHints) IN
        /\ runtime' = [runtime EXCEPT ![task] = (@ + 1) % (MaxRuntime + 1)]
@@ -141,7 +146,10 @@ CpuAccountingIsBounded == \A task \in Tasks: runtime[task] <= MaxRuntime
 UserReadyAgeIsBounded == \A task \in UserTasks: readyAge[task] <= MaxUserWait
 LatencyBurstIsBounded == latencyBurst <= MaxLatencyBurst
 LatencyHintQueueIsBounded == Len(latencyHints) <= MaxLatencyHints
-OverdueUserBlocksSystem == [] (OverdueUsers # {} => ~ENABLED DispatchAnySystem)
+OverdueUserBlocksSystem ==
+    [] (OverdueUsers # {} /\ OverdueSystems = {} => ~ENABLED DispatchAnySystem)
+OverdueReadyBlocksLatency ==
+    [] (OverdueSystems # {} \/ OverdueUsers # {} => ~ENABLED DispatchLatency)
 RunnableUserEventuallyRuns ==
     \A task \in UserTasks:
         [] (task \in ready => <> (task \notin ready \/ last = task))

@@ -1,3 +1,19 @@
+//! Shared memfd object, open-description, seal, and frame lifetime substrate.
+//!
+//! - **Owner:** `syscalld` owns creation/mapping policy; ring0 owns exact
+//!   descriptor state, seal enforcement, page frames, and shared mappings.
+//! - **Boundary:** Names, sizes, offsets, seal transitions, and mapping modes
+//!   are untrusted until overflow, bounds, and authority checks complete.
+//! - **Lifecycle:** Allocate frames into one shared object, duplicate only the
+//!   open description, account mappings, then release each frame exactly once.
+//! - **Concurrency:** The object-state lock serializes seal/size/mapping state;
+//!   user copies and page-table work do not hold unrelated process locks.
+//! - **Failure:** Allocation, mapping, copy, and seal conflicts leave the old
+//!   object state and frame ownership intact.
+//! - **Forbidden:** No policy fallback, W+X widening, seal rollback, cursor
+//!   sharing across distinct open descriptions, or frame reuse before release.
+//! - **Evidence:** `memory-map`, `physical-frame-lifecycle`,
+//!   `vfs-open-description`.
 // RING3-MIGRATION-REFERENCE START: memfd-kernel-substrate exception:
 // syscalld validates memfd_create policy and pagerd/mm broker owns mapping
 // admission. Ring0 keeps fd-local cursor, seal enforcement, physical frame
@@ -322,6 +338,9 @@ fn ensure_len_locked(state: &mut MemfdState, len: usize) -> Result<(), MemfdErro
             }
             return Err(MemfdError::NoMemory);
         };
+        // SAFETY: The freshly allocated frame is exclusively owned by this
+        // object, the higher-half direct map covers one complete page, and no
+        // handle publishes the frame until zeroing completes.
         unsafe {
             ptr::write_bytes(
                 kernel_vm::higher_half_addr(frame_phys.as_u64()) as *mut u8,
@@ -346,6 +365,51 @@ fn align_up_len(len: usize) -> Option<usize> {
         len.checked_add(PAGE_SIZE - rem)
     }
 }
+
+fn read_at_locked(frames: &[u64], len: usize, offset: usize, dest: &mut [u8]) -> usize {
+    if dest.is_empty() || offset >= len {
+        return 0;
+    }
+
+    let read_len = dest.len().min(len - offset);
+    let mut copied = 0usize;
+    while copied < read_len {
+        let absolute = offset + copied;
+        let page_index = absolute / PAGE_SIZE;
+        let page_offset = absolute % PAGE_SIZE;
+        let chunk_len = (read_len - copied).min(PAGE_SIZE - page_offset);
+        let src =
+            (kernel_vm::higher_half_addr(frames[page_index] + page_offset as u64)) as *const u8;
+        // SAFETY: `frames[page_index]` is retained by the locked object
+        // snapshot, bounds above keep the source within that page, and `dest`
+        // owns at least `read_len` writable bytes.
+        unsafe {
+            crate::arch::simd::copy_fast(src, dest.as_mut_ptr().add(copied), chunk_len);
+        }
+        copied += chunk_len;
+    }
+    read_len
+}
+
+fn write_at_locked(frames: &[u64], offset: usize, src: &[u8]) {
+    let mut copied = 0usize;
+    while copied < src.len() {
+        let absolute = offset + copied;
+        let page_index = absolute / PAGE_SIZE;
+        let page_offset = absolute % PAGE_SIZE;
+        let chunk_len = (src.len() - copied).min(PAGE_SIZE - page_offset);
+        let dest =
+            (kernel_vm::higher_half_addr(frames[page_index] + page_offset as u64)) as *mut u8;
+        // SAFETY: The retained frame belongs to this memfd object, the
+        // page/chunk bounds stay within its direct-map page, and `src` owns the
+        // complete immutable input slice.
+        unsafe {
+            crate::arch::simd::copy_fast(src.as_ptr().add(copied), dest, chunk_len);
+        }
+        copied += chunk_len;
+    }
+}
+// RING3-MIGRATION-REFERENCE END: memfd kernel backing substrate exception.
 
 #[cfg(test)]
 mod tests {
@@ -376,42 +440,3 @@ mod tests {
         );
     }
 }
-
-fn read_at_locked(frames: &[u64], len: usize, offset: usize, dest: &mut [u8]) -> usize {
-    if dest.is_empty() || offset >= len {
-        return 0;
-    }
-
-    let read_len = dest.len().min(len - offset);
-    let mut copied = 0usize;
-    while copied < read_len {
-        let absolute = offset + copied;
-        let page_index = absolute / PAGE_SIZE;
-        let page_offset = absolute % PAGE_SIZE;
-        let chunk_len = (read_len - copied).min(PAGE_SIZE - page_offset);
-        let src =
-            (kernel_vm::higher_half_addr(frames[page_index] + page_offset as u64)) as *const u8;
-        unsafe {
-            crate::arch::simd::copy_fast(src, dest.as_mut_ptr().add(copied), chunk_len);
-        }
-        copied += chunk_len;
-    }
-    read_len
-}
-
-fn write_at_locked(frames: &[u64], offset: usize, src: &[u8]) {
-    let mut copied = 0usize;
-    while copied < src.len() {
-        let absolute = offset + copied;
-        let page_index = absolute / PAGE_SIZE;
-        let page_offset = absolute % PAGE_SIZE;
-        let chunk_len = (src.len() - copied).min(PAGE_SIZE - page_offset);
-        let dest =
-            (kernel_vm::higher_half_addr(frames[page_index] + page_offset as u64)) as *mut u8;
-        unsafe {
-            crate::arch::simd::copy_fast(src.as_ptr().add(copied), dest, chunk_len);
-        }
-        copied += chunk_len;
-    }
-}
-// RING3-MIGRATION-REFERENCE END: memfd kernel backing substrate exception.

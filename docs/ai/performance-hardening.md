@@ -29,7 +29,13 @@ acceptance contracts, not tuning defaults:
 | UI CPU frame preparation | 8 ms | 16.667 ms completed frame | 0 |
 | First local DVM GPU activation after CPU boot frame | 750 ms | Included in 5 s boot ceiling | 0 |
 | Input arrival to visible cursor | One frame | 50 ms | 0 in frame/present |
+
+The first GPU completion is governed by the five-second activation deadline,
+not the 50 ms steady-state recovery bound. Once the epoch is active, every
+later completion again uses the 50 ms hard limit; the 16.667 ms target remains
+an independent performance failure rather than provider-revocation timing.
 | Deferred VFS maintenance per foreground turn | 1 ms | 1 ms | 1 replay |
+| Deferred netd reference maintenance per turn | 1 ms | 1 ms | 1 replay or ACK |
 | Readiness observation | 1 frame | 16 ms | 1 per deduplicated provider |
 | Interactive policy-only control | 16 ms | 100 ms | 1 |
 | Boot/control transaction | 100 ms | 5 s | 1 |
@@ -42,6 +48,47 @@ zero filesystem, catalog, or policy-service calls. `cargo xtask kvm-smoke`
 fails the five-second UI limit independently of its broader readiness timeout.
 `formal/run-source-conformance.sh` checks the class ordering and reply
 cancellation witnesses.
+
+Provider lifecycle limits apply to the complete turn, not to each retry.
+Netd dup/close divides one 16 ms budget across three attempts and moves the
+committed operation's ACK to the one-millisecond maintenance queue. VFS and
+netd maintenance each process at most one item per housekeeping turn, IPC
+transfer disposal releases at most one entry, and retirement acknowledges at
+most four exact task records. Backlog ownership remains explicit, but cleanup
+cannot monopolize the scheduler by multiplying individually bounded calls.
+The transfer-drop queue reserves its full admitted capacity up front and
+allocates drain output before taking the queue spin lock; exit-time descriptor
+disposal never invokes the allocator from that critical section.
+
+Scheduler-aware wait locks spin only for the short optimistic window, then use
+the scheduler's arm-publish-recheck-commit state transition. Raw spin locks are
+reserved for non-sleeping leaves. In particular, MMIO cache-mode transactions
+use one wait lock and perform allocation/page-table work with interrupts
+enabled; large BAR setup cannot become whole-transaction IRQ-off latency.
+
+The kernel IPC runtime has no global object-table critical section. Endpoint,
+message, reply, and shared-region registries use fixed-capacity generational
+slabs with one tracked spin lock per cache-line-aligned slot. Queue capacity
+and message storage are fallibly allocated before publication, failed
+transactions destroy that storage only after releasing their slot locks,
+owner retirement walks one slot at a time, and descriptor batches move
+directly into their cleanup owner. Endpoint
+traffic on unrelated objects therefore neither waits behind a BTreeMap
+allocator nor extends one whole-registry IRQ-off interval.
+Final shared-region release only transfers ownership to a fixed reclaim queue.
+Housekeeping frees at most 64 backing pages per turn, preventing a large
+surface close or exec from monopolizing a process-state lock or allocator.
+Process-broker prepare/ticket/transition/activation registries and remote-VFS
+descriptor references are fixed-capacity hash tables. Prepare mapping pointer
+capacity and each mapping payload are allocated before registry acquisition.
+Deferred VFS/netd retry queues use fixed rings with one private retry slot, so
+the advertised capacity remains exact even when a producer races a popped
+item's requeue. No first-use `BTreeMap` or `VecDeque` growth occurs in those
+tracked critical sections.
+
+Per-CPU lock-diagnostic storage is future-facing only. The enabled RustOS guest
+has one vCPU and no AP bring-up or SMP scheduler; measurements must not label a
+single-BSP run as multicore evidence.
 
 Slow-IPC diagnostics are an observation rail, not a second workload. Each of
 the generic and typed-service paths emits at most four records per second after
@@ -250,6 +297,10 @@ lock, and service restart invalidates it by advancing the epoch.
 ## Scheduler Dispatch
 
 - The KVM proof assigns RustOS one vCPU until SMP scheduling is implemented.
+  `tools/xtask/src/kvm/guest.rs::RUSTOS_SMP_READINESS` is the executable
+  enablement gate: more than one RustOS vCPU requires per-CPU scheduler and
+  syscall state, a CPU-online state machine, reschedule IPI, TLB shootdown, and
+  atomic robust-futex cleanup. The Linux DVM remains independently multi-vCPU.
   Advertising an idle second RustOS vCPU cannot improve guest throughput and
   steals host scheduling capacity from the Linux DVM on low-end machines.
 
@@ -263,8 +314,10 @@ lock, and service restart invalidates it by advancing the epoch.
   task has a 2 ms ready-age rail and every ready System task has a 2 ms rail.
   A selection micro-optimization must not bypass these limits or convert launch
   weights into strict-class authority. A blocked caller still hands directly
-  to its exact receiver, but otherwise an overdue System continuation runs
-  before a generic IPC hint; the hint is retained for the next dispatch.
+  to its exact receiver only while no task has crossed an absolute ready-age
+  rail. Once overdue, System then User recovery runs before fresh spawn,
+  latency, or generic IPC handoffs; queued hints are retained for the next
+  dispatch.
 - An authenticated netd local-socket completion may enqueue only a User task in
   the deduplicated 16-entry latency FIFO. At most eight such handoffs run
   consecutively, stale tasks are discarded, and a full queue drops the new

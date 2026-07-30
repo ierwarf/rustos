@@ -14,6 +14,7 @@ nucleus-core = { path = "../nucleus-core" }
 rustos-user-abi = { path = "../../libs/rustos-user-abi", features = ["linux-compat-state"] }
 storage-core = { path = "../../libs/storage-core" }
 trace-loc-macro = { path = "../../libs/trace-loc-macro" }
+heapless = { version = "0.9.3", default-features = false }
 lazy_static = { version = "1.4", features = ["spin_no_std"] }
 object = { version = "0.38.1", default-features = false, features = ["read_core", "elf"] }
 spin = "0.10.0"

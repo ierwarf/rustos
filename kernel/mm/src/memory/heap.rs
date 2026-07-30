@@ -1,3 +1,19 @@
+//! Bounded kernel heap and allocation-lifecycle diagnostics.
+//!
+//! - **Owner:** `kernel-mm` owns backing frames, buddy state, and allocation
+//!   provenance; callers own only returned live spans.
+//! - **Boundary:** Layout, pointer, capacity, and physical-frame ranges are
+//!   checked before tracker or allocator mutation.
+//! - **Lifecycle:** Allocate backing, publish one tracked live span, validate
+//!   exact layout on free, quarantine its address, then return it to the buddy.
+//! - **Concurrency:** Allocation runs with interrupts disabled under one fixed
+//!   tracker-to-buddy lock order; the normal path performs no quarantine scan.
+//! - **Failure:** Exhaustion, tracker saturation, invalid free, double free, and
+//!   layout mismatch fail without freeing an unowned span.
+//! - **Forbidden:** No unbounded scan on successful allocation, allocator
+//!   recursion, free-before-validation, fabricated span, or policy work.
+//! - **Evidence:** `kernel-resource-lifecycle` and `physical-frame-lifecycle`.
+
 #[cfg(not(test))]
 use buddy_system_allocator::LockedHeap;
 #[cfg(not(test))]
@@ -5,6 +21,7 @@ use core::alloc::GlobalAlloc;
 use core::alloc::Layout;
 #[cfg(not(test))]
 use core::ptr;
+#[cfg(not(test))]
 use spin::{Mutex, Once};
 #[cfg(not(test))]
 use x86_64::PhysAddr;
@@ -16,9 +33,13 @@ use x86_64::instructions::port::Port;
 #[cfg(not(test))]
 use crate::memory::{kernel_vm, phys};
 
+#[cfg(not(test))]
 const HEAP_ORDER: usize = 32;
+#[cfg(not(test))]
 const PAGE_SIZE: usize = 4096;
+#[cfg(not(test))]
 const MIN_HEAP_SIZE: usize = 64 * 1024 * 1024;
+#[cfg(not(test))]
 const MAX_HEAP_SIZE: usize = 512 * 1024 * 1024;
 #[cfg(test)]
 const ACTIVE_ALLOCATION_SLOTS: usize = 128;
@@ -31,10 +52,12 @@ const FREED_QUARANTINE_SLOTS: usize = 8_192;
 #[cfg(all(not(test), rustos_debug_print_enabled))]
 const DEBUGCON_PORT: u16 = 0x00e9;
 
+#[cfg(not(test))]
 static HEAP_INIT: Once<()> = Once::new();
 
 #[cfg(not(test))]
 static HEAP: LockedHeap<HEAP_ORDER> = LockedHeap::<HEAP_ORDER>::new();
+#[cfg(not(test))]
 static ALLOCATION_TRACKER: Mutex<AllocationTracker> = Mutex::new(AllocationTracker::new());
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -112,7 +135,6 @@ impl AllocationTracker {
     }
 
     fn record_alloc(&mut self, ptr: usize, layout: Layout) -> bool {
-        self.clear_freed(ptr);
         self.insert_active(ptr, layout.size(), layout.align())
     }
 
@@ -201,14 +223,6 @@ impl AllocationTracker {
         None
     }
 
-    fn clear_freed(&mut self, ptr: usize) {
-        for entry in &mut self.freed {
-            if entry.ptr == ptr {
-                *entry = FreedAllocEntry::EMPTY;
-            }
-        }
-    }
-
     fn is_recently_freed(&self, ptr: usize) -> bool {
         self.freed.iter().any(|entry| entry.ptr == ptr)
     }
@@ -258,6 +272,7 @@ impl AllocationTracker {
 }
 
 #[derive(Clone, Copy)]
+// DIAGNOSTIC: Occupancy fields feed debug-only allocator telemetry.
 #[cfg_attr(not(rustos_debug_print_enabled), allow(dead_code))]
 struct TrackerOccupancy {
     active_count: usize,
@@ -364,7 +379,7 @@ fn heap_violation_log(
     });
 }
 
-#[cfg(any(test, not(rustos_debug_print_enabled)))]
+#[cfg(all(not(test), not(rustos_debug_print_enabled)))]
 fn heap_violation_log(
     _kind: HeapViolationKind,
     _ptr: usize,
@@ -404,7 +419,7 @@ fn heap_tracker_overflow_log(ptr: usize, layout: Layout, occupancy: TrackerOccup
     });
 }
 
-#[cfg(any(test, not(rustos_debug_print_enabled)))]
+#[cfg(all(not(test), not(rustos_debug_print_enabled)))]
 fn heap_tracker_overflow_log(_ptr: usize, _layout: Layout, _occupancy: TrackerOccupancy) {}
 
 #[cfg(all(not(test), rustos_debug_print_enabled))]
@@ -539,14 +554,26 @@ mod tests {
     }
 
     #[test]
-    fn tracker_clears_recent_free_when_pointer_is_reused() {
+    fn tracker_reuse_keeps_quarantine_cold_and_live_state_authoritative() {
         let mut tracker = AllocationTracker::new();
         let layout = Layout::from_size_align(64, 8).unwrap();
         assert!(tracker.record_alloc(0x3000, layout));
+        let occupancy = tracker.occupancy();
+        assert_eq!(occupancy.active_count, 1);
+        assert_eq!(occupancy.peak_active_count, 1);
+        assert_eq!(occupancy.occupied_slots, 1);
+        assert_eq!(occupancy.tombstone_slots, 0);
+        assert_eq!(occupancy.empty_slots, ACTIVE_ALLOCATION_SLOTS - 1);
+        assert_eq!(occupancy.overflow_count, 0);
         assert_eq!(tracker.begin_dealloc(0x3000, layout), Ok(()));
         assert!(tracker.is_recently_freed(0x3000));
+        assert_eq!(tracker.recent_freed_layout(0x3000), Some((64, 8)));
+        assert_eq!(tracker.expected_layout(0x3000), Some((64, 8)));
         assert!(tracker.record_alloc(0x3000, layout));
-        assert!(!tracker.is_recently_freed(0x3000));
+        // The quarantine ring is checked only after active lookup fails. It
+        // need not be scanned and cleared on the successful allocation path.
+        assert!(tracker.is_recently_freed(0x3000));
+        assert!(tracker.find_active_slot(0x3000).is_some());
         assert_eq!(tracker.begin_dealloc(0x3000, layout), Ok(()));
     }
 

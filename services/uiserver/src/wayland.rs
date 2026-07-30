@@ -1,3 +1,19 @@
+//! Wayland client object, buffer, callback, and disconnect state machine.
+//!
+//! - **Owner:** `uiserver` owns compositor-side Wayland policy and object
+//!   lifetime; clients own only their admitted protocol objects and SHM bytes.
+//! - **Boundary:** Socket frames, object IDs, opcodes, SHM layouts, damage,
+//!   commits, callbacks, and disconnect timing are untrusted.
+//! - **Lifecycle:** Accept client, create typed objects, attach/damage/commit,
+//!   present, callback/release, destroy, and revoke every object on disconnect.
+//! - **Concurrency:** Client fd readiness composes with input/runtime deadlines;
+//!   callbacks and releases bind exact surface/buffer generations.
+//! - **Failure:** Malformed request, capacity, stale ID, short frame, client
+//!   death, provider revoke, and queue pressure isolate the exact client.
+//! - **Forbidden:** No client pointer, unbounded object table, callback without
+//!   matching release, periodic scan as readiness, or whole-compositor failure.
+//! - **Evidence:** `wayland-client-ingress`, `ui-main-loop-wakeup`, and
+//!   `gpu-frame-lifecycle`.
 use std::ffi::CString;
 use std::io::ErrorKind;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -27,6 +43,7 @@ use wayland_server::{
 };
 
 use crate::canvas::Rect;
+use crate::input_loop::UiWakeSender;
 use crate::layout::{
     self, clamp_wayland_frame, wayland_client_size_for_buffer, wayland_max_client_size,
     WINDOW_BORDER, WINDOW_TITLE_HEIGHT,
@@ -59,6 +76,8 @@ const MAX_WAYLAND_DISPATCH_LOGS: usize = 16;
 const MAX_WAYLAND_SLOW_TICK_LOGS: usize = 8;
 const SLOW_WAYLAND_TICK_MS: u128 = 16;
 const WAYLAND_POINTER_FRAME_INTERVAL: Duration = Duration::from_millis(15);
+const WAYLAND_READINESS_TRANSIENT_FAILURE_LIMIT: usize = 8;
+const WAYLAND_READINESS_RETRY_DELAY: Duration = Duration::from_millis(1);
 
 static WAYLAND_DISPATCH_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static WAYLAND_SLOW_TICK_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -66,6 +85,10 @@ static WAYLAND_READINESS_WAKE_LOGGED: AtomicBool = AtomicBool::new(false);
 
 fn claim_wayland_rearm(needs_rearm: &AtomicBool) -> bool {
     needs_rearm.swap(false, Ordering::AcqRel)
+}
+
+fn transient_wayland_readiness_error(kind: ErrorKind) -> bool {
+    matches!(kind, ErrorKind::BrokenPipe | ErrorKind::TimedOut)
 }
 
 fn post_protocol_error<I: Resource>(resource: &I, message: String) {
@@ -194,7 +217,7 @@ impl WaylandCompositor {
 
     pub(crate) fn attach_readiness_waker(
         &mut self,
-        ui_wake_sender: SyncSender<()>,
+        ui_wake_sender: UiWakeSender,
     ) -> std::io::Result<()> {
         if self.readiness.is_some() {
             return Err(std::io::Error::new(
@@ -216,6 +239,7 @@ impl WaylandCompositor {
             .spawn(move || {
                 require_background_thread_class();
                 let mut event = libc::epoll_event { events: 0, u64: 0 };
+                let mut consecutive_transient_failures = 0_usize;
                 loop {
                     let ready =
                         unsafe { libc::epoll_wait(owned_fd.as_raw_fd(), &mut event, 1, -1) };
@@ -224,9 +248,24 @@ impl WaylandCompositor {
                         if err.kind() == ErrorKind::Interrupted {
                             continue;
                         }
+                        if transient_wayland_readiness_error(err.kind())
+                            && consecutive_transient_failures
+                                < WAYLAND_READINESS_TRANSIENT_FAILURE_LIMIT
+                        {
+                            consecutive_transient_failures =
+                                consecutive_transient_failures.saturating_add(1);
+                            if consecutive_transient_failures == 1 {
+                                diag_line(format!(
+                                    "uiserver: Wayland readiness transient wait failure: {err}"
+                                ));
+                            }
+                            thread::sleep(WAYLAND_READINESS_RETRY_DELAY);
+                            continue;
+                        }
                         diag_line(format!("uiserver: Wayland readiness wait failed: {err}"));
                         std::process::exit(134);
                     }
+                    consecutive_transient_failures = 0;
                     if ready == 0 {
                         continue;
                     }
@@ -234,7 +273,7 @@ impl WaylandCompositor {
                         diag_line("uiserver: Wayland readiness wake observed");
                     }
                     worker_needs_rearm.store(true, Ordering::Release);
-                    let _ = ui_wake_sender.try_send(());
+                    ui_wake_sender.signal();
                     if rearm_receiver.recv().is_err() {
                         break;
                     }
@@ -676,9 +715,11 @@ fn surface_damage_rect(x: i32, y: i32, width: i32, height: i32) -> Option<Rect> 
 mod tests {
     use super::{
         can_retain_undamaged_buffer, checked_wayland_pixel_count, claim_wayland_rearm,
-        copy_wayland_bgra_row, validate_wayland_buffer_layout, wayland_nonnegative_i32,
-        WaylandWindowSnapshot, MAX_WAYLAND_BUFFER_DIMENSION, MAX_WAYLAND_SHM_POOL_BYTES,
+        copy_wayland_bgra_row, transient_wayland_readiness_error, validate_wayland_buffer_layout,
+        wayland_nonnegative_i32, WaylandWindowSnapshot, MAX_WAYLAND_BUFFER_DIMENSION,
+        MAX_WAYLAND_SHM_POOL_BYTES,
     };
+    use std::io::ErrorKind;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
@@ -688,6 +729,13 @@ mod tests {
         assert!(!claim_wayland_rearm(&needs_rearm));
         needs_rearm.store(true, Ordering::Release);
         assert!(claim_wayland_rearm(&needs_rearm));
+    }
+
+    #[test]
+    fn wayland_readiness_retries_only_transient_transport_failures() {
+        assert!(transient_wayland_readiness_error(ErrorKind::BrokenPipe));
+        assert!(transient_wayland_readiness_error(ErrorKind::TimedOut));
+        assert!(!transient_wayland_readiness_error(ErrorKind::InvalidInput));
     }
     use crate::canvas::Rect;
     use std::sync::Arc;

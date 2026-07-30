@@ -1,3 +1,18 @@
+//! Bounded DVM Ethernet shared-ring transport.
+//!
+//! - **Owner:** `kernel-io-manager` owns ring mechanics; `netd` owns socket and
+//!   packet policy and the Linux DVM owns the device driver.
+//! - **Boundary:** Shared headers, cursors, lengths, frames, and control epochs
+//!   are untrusted.
+//! - **Lifecycle:** Install an admitted aperture/epoch, publish bounded slots,
+//!   consume exact sequence, and revoke all stale records on owner loss.
+//! - **Concurrency:** Producer/consumer ordering is explicit; IRQ leaves signal
+//!   progress and perform no packet parsing.
+//! - **Failure:** Arithmetic overflow, malformed frame, cursor corruption,
+//!   capacity, and generation mismatch fail without out-of-bounds access.
+//! - **Forbidden:** No socket policy, native NIC fallback, guest pointer, or
+//!   stale slot replay in ring0.
+//! - **Evidence:** `dvm-network-ingress`.
 // RING3-MIGRATION-REFERENCE START: DVM Ethernet transport substrate.
 // Ring0 owns only fixed ivshmem mapping and bounded SPSC ring access. Linux
 // networking and RustOS socket/TCP policy remain in their respective user
@@ -23,13 +38,18 @@ const SLOT_LEN_BYTES: usize = 4;
 
 static INSTALLED: AtomicBool = AtomicBool::new(false);
 static UNAVAILABLE_LOGGED: AtomicBool = AtomicBool::new(false);
-static STATE: KernelWaitLock<Option<DvmNetworkState>> = KernelWaitLock::new(None);
+static STATE: KernelWaitLock<
+    Option<DvmNetworkState>,
+    { nucleus_core::util::lockdep::LockClass::DvmNetworkStateWait as u8 },
+> = KernelWaitLock::new(None);
 // The fixed ivshmem header and counters are DVM-writable after installation.
 // They can describe bounded frame state, but cannot attest that the L0-vetted
 // DVM control session is still alive. netd selects the generation through its
 // capability-gated broker after validating the service-owned lifecycle.
-static TRANSPORT_LEASE: KernelWaitLock<TransportLease> =
-    KernelWaitLock::new(TransportLease::inactive());
+static TRANSPORT_LEASE: KernelWaitLock<
+    TransportLease,
+    { nucleus_core::util::lockdep::LockClass::DvmNetworkLeaseWait as u8 },
+> = KernelWaitLock::new(TransportLease::inactive());
 
 struct DvmNetworkState {
     base: *mut u8,
@@ -358,7 +378,11 @@ fn slot_at(state: &DvmNetworkState, offset: u64, sequence: u32) -> Option<*mut u
     let index = u64::from(sequence % state.header.slot_count);
     let start = offset.checked_add(index.checked_mul(u64::from(DVM_NET_SLOT_BYTES))?)?;
     let end = start.checked_add(u64::from(DVM_NET_SLOT_BYTES))?;
-    (end <= state.header.region_bytes).then_some(unsafe { state.base.add(start as usize) })
+    if end > state.header.region_bytes {
+        return None;
+    }
+    let start = usize::try_from(start).ok()?;
+    Some(unsafe { state.base.add(start) })
 }
 
 fn read_header(mapped: *const u8) -> Option<DvmNetHeader> {

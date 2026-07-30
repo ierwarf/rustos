@@ -17,10 +17,12 @@ CONSTANTS MaxTask, MaxImage
 Phases == {"user", "syscall", "blocked", "resumed", "returned"}
 
 VARIABLES phase, currentTask, ownerTask, entryImage, snapshot, schedulerImage,
-          returnImage, active, nestedRejected, wrongTaskRejected
+          returnImage, active, nestedRejected, wrongTaskRejected,
+          syscallFrameLive, continuationPublished, returnValidated
 
 vars == <<phase, currentTask, ownerTask, entryImage, snapshot, schedulerImage,
-          returnImage, active, nestedRejected, wrongTaskRejected>>
+          returnImage, active, nestedRejected, wrongTaskRejected,
+          syscallFrameLive, continuationPublished, returnValidated>>
 
 Init ==
     /\ phase = "user"
@@ -33,6 +35,9 @@ Init ==
     /\ active = FALSE
     /\ nestedRejected = FALSE
     /\ wrongTaskRejected = FALSE
+    /\ syscallFrameLive = FALSE
+    /\ continuationPublished = FALSE
+    /\ returnValidated = FALSE
 
 Enter ==
     /\ phase = "user"
@@ -41,6 +46,9 @@ Enter ==
     /\ ownerTask' = currentTask
     /\ snapshot' = entryImage
     /\ active' = TRUE
+    /\ syscallFrameLive' = TRUE
+    /\ continuationPublished' = FALSE
+    /\ returnValidated' = FALSE
     /\ UNCHANGED <<currentTask, entryImage, schedulerImage, returnImage,
                    nestedRejected, wrongTaskRejected>>
 
@@ -49,15 +57,18 @@ Block ==
     /\ active
     /\ phase' = "blocked"
     /\ schedulerImage' \in 1..MaxImage
+    /\ continuationPublished' = TRUE
+    /\ returnValidated' = FALSE
     /\ UNCHANGED <<currentTask, ownerTask, entryImage, snapshot, returnImage,
-                   active, nestedRejected, wrongTaskRejected>>
+                   active, nestedRejected, wrongTaskRejected, syscallFrameLive>>
 
 KernelScratch ==
     /\ phase \in {"syscall", "blocked", "resumed"}
     /\ active
     /\ schedulerImage' \in 1..MaxImage
     /\ UNCHANGED <<phase, currentTask, ownerTask, entryImage, snapshot,
-                   returnImage, active, nestedRejected, wrongTaskRejected>>
+                   returnImage, active, nestedRejected, wrongTaskRejected,
+                   syscallFrameLive, continuationPublished, returnValidated>>
 
 ScheduleOther ==
     /\ phase = "blocked"
@@ -67,7 +78,8 @@ ScheduleOther ==
         /\ task # ownerTask
         /\ currentTask' = task
     /\ UNCHANGED <<phase, ownerTask, entryImage, snapshot, schedulerImage,
-                   returnImage, active, nestedRejected, wrongTaskRejected>>
+                   returnImage, active, nestedRejected, wrongTaskRejected,
+                   syscallFrameLive, continuationPublished, returnValidated>>
 
 RejectWrongTaskReturn ==
     /\ phase \in {"blocked", "resumed"}
@@ -75,7 +87,8 @@ RejectWrongTaskReturn ==
     /\ currentTask # ownerTask
     /\ wrongTaskRejected' = TRUE
     /\ UNCHANGED <<phase, currentTask, ownerTask, entryImage, snapshot,
-                   schedulerImage, returnImage, active, nestedRejected>>
+                   schedulerImage, returnImage, active, nestedRejected,
+                   syscallFrameLive, continuationPublished, returnValidated>>
 
 ScheduleOwner ==
     /\ phase = "blocked"
@@ -83,33 +96,60 @@ ScheduleOwner ==
     /\ currentTask # ownerTask
     /\ currentTask' = ownerTask
     /\ UNCHANGED <<phase, ownerTask, entryImage, snapshot, schedulerImage,
-                   returnImage, active, nestedRejected, wrongTaskRejected>>
+                   returnImage, active, nestedRejected, wrongTaskRejected,
+                   syscallFrameLive, continuationPublished, returnValidated>>
 
 Resume ==
     /\ phase = "blocked"
     /\ active
     /\ currentTask = ownerTask
     /\ phase' = "resumed"
+    /\ continuationPublished' = FALSE
+    /\ returnValidated' = FALSE
     /\ UNCHANGED <<currentTask, ownerTask, entryImage, snapshot,
                    schedulerImage, returnImage, active, nestedRejected,
-                   wrongTaskRejected>>
+                   wrongTaskRejected, syscallFrameLive>>
 
 RejectNestedCapture ==
     /\ phase \in {"syscall", "blocked", "resumed"}
     /\ active
     /\ nestedRejected' = TRUE
     /\ UNCHANGED <<phase, currentTask, ownerTask, entryImage, snapshot,
-                   schedulerImage, returnImage, active, wrongTaskRejected>>
+                   schedulerImage, returnImage, active, wrongTaskRejected,
+                   syscallFrameLive, continuationPublished, returnValidated>>
+
+(*******************************************************************************
+The return contract is checked after the last possible continuation resume.
+Checking before a deferred tail reschedule is insufficient: that schedule
+publishes and later consumes a kernel frame while the syscall frame remains
+live on the owner stack.  SYSRET may consume it only after post-resume
+canonical-address/RFLAGS validation.
+*******************************************************************************)
+ValidateReturn ==
+    /\ phase \in {"syscall", "resumed"}
+    /\ active
+    /\ currentTask = ownerTask
+    /\ syscallFrameLive
+    /\ ~continuationPublished
+    /\ returnValidated' = TRUE
+    /\ UNCHANGED <<phase, currentTask, ownerTask, entryImage, snapshot,
+                   schedulerImage, returnImage, active, nestedRejected,
+                   wrongTaskRejected, syscallFrameLive, continuationPublished>>
 
 Return ==
     /\ phase \in {"syscall", "resumed"}
     /\ active
     /\ currentTask = ownerTask
+    /\ syscallFrameLive
+    /\ ~continuationPublished
+    /\ returnValidated
     /\ phase' = "returned"
     /\ returnImage' = snapshot
     /\ active' = FALSE
+    /\ syscallFrameLive' = FALSE
     /\ UNCHANGED <<currentTask, ownerTask, entryImage, snapshot,
-                   schedulerImage, nestedRejected, wrongTaskRejected>>
+                   schedulerImage, nestedRejected, wrongTaskRejected,
+                   continuationPublished, returnValidated>>
 
 Next ==
     Enter
@@ -120,6 +160,7 @@ Next ==
     \/ ScheduleOwner
     \/ Resume
     \/ RejectNestedCapture
+    \/ ValidateReturn
     \/ Return
 
 TypeOK ==
@@ -133,6 +174,9 @@ TypeOK ==
     /\ active \in BOOLEAN
     /\ nestedRejected \in BOOLEAN
     /\ wrongTaskRejected \in BOOLEAN
+    /\ syscallFrameLive \in BOOLEAN
+    /\ continuationPublished \in BOOLEAN
+    /\ returnValidated \in BOOLEAN
 
 ActiveSnapshotIsEntryImage == active => snapshot = entryImage
 
@@ -149,6 +193,24 @@ ReturnedSnapshotIsInactive ==
 
 SchedulerScratchCannotAuthorizeReturn ==
     phase = "returned" => returnImage = snapshot
+
+ActiveSyscallRetainsItsEntryFrame ==
+    active => syscallFrameLive
+
+BlockedContinuationOwnsPublishedFrame ==
+    phase = "blocked" => continuationPublished
+
+ExecutingContinuationOwnsNoPublishedFrame ==
+    phase \in {"syscall", "resumed"} => ~continuationPublished
+
+PublishedContinuationIsNotExecuting ==
+    continuationPublished => phase = "blocked"
+
+ReturnConsumesOnlyPostResumeValidatedFrame ==
+    phase = "returned" =>
+        /\ returnValidated
+        /\ ~syscallFrameLive
+        /\ ~continuationPublished
 
 Spec == Init /\ [][Next]_vars
 ===============================================================================

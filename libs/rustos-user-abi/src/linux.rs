@@ -253,6 +253,7 @@ raw_u64! {
     FUTEX_CMD_MASK = linux::FUTEX_CMD_MASK;
     SIGKILL = linux::SIGKILL;
     SIGCHLD = linux::SIGCHLD;
+    SIGCONT = linux::SIGCONT;
     SIGSTOP = linux::SIGSTOP;
     SIG_BLOCK = linux::SIG_BLOCK;
     SIG_UNBLOCK = linux::SIG_UNBLOCK;
@@ -349,6 +350,8 @@ raw_u32! {
 raw_i32! {
     AT_FDCWD = linux::AT_FDCWD;
     WNOHANG = linux::WNOHANG;
+    WUNTRACED = linux::WUNTRACED;
+    WCONTINUED = linux::WCONTINUED;
 }
 
 raw_i16! {
@@ -361,6 +364,7 @@ raw_i16! {
 }
 
 pub const EPOLL_CLOEXEC: u64 = O_CLOEXEC;
+pub const SA_NOCLDSTOP: u64 = 0x0000_0001;
 pub const EPOLL_CTL_ADD: u64 = 1;
 pub const EPOLL_CTL_DEL: u64 = 2;
 pub const EPOLL_CTL_MOD: u64 = 3;
@@ -1076,6 +1080,7 @@ impl LinuxProcessImageInfo {
             rseq_signature: 0,
             signal_mask: 0,
             pending_signals: 0,
+            pending_sigchld_events: 0,
             signal_stack: LinuxSignalStack {
                 sp: 0,
                 flags: SS_DISABLE,
@@ -1326,6 +1331,10 @@ pub struct LinuxThreadState {
     pub rseq_signature: u32,
     pub signal_mask: u64,
     pub pending_signals: u64,
+    /// Coalesced process-directed SIGCHLD causes owned by this thread's
+    /// pending SIGCHLD bit. These bits let procd apply SA_NOCLDSTOP without
+    /// suppressing an exit notification that coalesced with stop/continue.
+    pub pending_sigchld_events: u32,
     pub signal_stack: LinuxSignalStack,
 }
 

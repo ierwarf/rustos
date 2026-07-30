@@ -1,9 +1,27 @@
+//! Input transport consumer, validation, session policy, and readiness owner.
+//!
+//! - **Owner:** `inputd` owns DVM record validation, translation, session
+//!   authority, policy queue, and readiness generation.
+//! - **Boundary:** Transport records, session changes, reader authorization,
+//!   and cross-service lifecycle replies are untrusted.
+//! - **Lifecycle:** Acquire exact consumer lease, ingest bounded batches,
+//!   validate/translate, publish generation, authorize/read, reset/revoke, and
+//!   withdraw on owner exit.
+//! - **Concurrency:** Ingestion uses atomic arm/recheck and bounded queue turns;
+//!   local locks are released before netd/session authority calls.
+//! - **Failure:** Malformed sequence/checksum/input, queue pressure, timeout,
+//!   consumer exit, session reset, and transport revoke preserve edge events
+//!   or fail explicitly.
+//! - **Forbidden:** No ring0 decode, polling, lossy key/button coalescing,
+//!   foreign reader, or native-device fallback.
+//! - **Evidence:** `input-delivery-lifecycle`, `dvm-input-ingress`, and
+//!   `waitset`.
 use std::collections::VecDeque;
 use std::io::Write;
 use std::mem::size_of;
 use std::slice;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 
 mod dvm_protocol;
@@ -93,7 +111,23 @@ impl Default for InputQueue {
 
 struct SharedInputQueueState {
     queue: Mutex<InputQueue>,
-    ingestion_waiting: AtomicBool,
+    handoff: Mutex<InputQueueHandoff>,
+    handoff_changed: Condvar,
+}
+
+#[derive(Default)]
+struct InputQueueHandoff {
+    ingestion_waiting: bool,
+}
+
+impl SharedInputQueueState {
+    fn new() -> Self {
+        Self {
+            queue: Mutex::new(InputQueue::default()),
+            handoff: Mutex::new(InputQueueHandoff::default()),
+            handoff_changed: Condvar::new(),
+        }
+    }
 }
 
 type SharedInputQueue = Arc<SharedInputQueueState>;
@@ -115,36 +149,58 @@ impl DvmIngressLogState {
 
 fn lock_input_queue(queue: &SharedInputQueue) -> MutexGuard<'_, InputQueue> {
     loop {
-        while queue.ingestion_waiting.load(Ordering::Acquire) {
-            thread::yield_now();
+        let mut handoff = queue.handoff.lock().unwrap_or_else(|_| {
+            debug_line("inputd: input queue handoff synchronization failed");
+            std::process::exit(134);
+        });
+        while handoff.ingestion_waiting {
+            handoff = queue.handoff_changed.wait(handoff).unwrap_or_else(|_| {
+                debug_line("inputd: input queue handoff wait failed");
+                std::process::exit(134);
+            });
         }
+        drop(handoff);
         let guard = queue.queue.lock().unwrap_or_else(|_| {
             debug_line("inputd: input queue synchronization failed");
             std::process::exit(134);
         });
-        if !queue.ingestion_waiting.load(Ordering::Acquire) {
+        let handoff = queue.handoff.lock().unwrap_or_else(|_| {
+            debug_line("inputd: input queue handoff synchronization failed");
+            std::process::exit(134);
+        });
+        if !handoff.ingestion_waiting {
             return guard;
         }
+        drop(handoff);
         drop(guard);
-        thread::yield_now();
     }
 }
 
 fn lock_input_queue_for_ingestion(queue: &SharedInputQueue) -> MutexGuard<'_, InputQueue> {
-    queue.ingestion_waiting.store(true, Ordering::Release);
-    loop {
-        match queue.queue.try_lock() {
-            Ok(guard) => {
-                queue.ingestion_waiting.store(false, Ordering::Release);
-                return guard;
-            }
-            Err(TryLockError::WouldBlock) => thread::yield_now(),
-            Err(TryLockError::Poisoned(_)) => {
-                debug_line("inputd: input queue synchronization failed");
-                std::process::exit(134);
-            }
-        }
+    {
+        let mut handoff = queue.handoff.lock().unwrap_or_else(|_| {
+            debug_line("inputd: input queue handoff synchronization failed");
+            std::process::exit(134);
+        });
+        handoff.ingestion_waiting = true;
     }
+    // Block behind the exact current owner. Readers that observe this handoff
+    // sleep on a condition variable rather than remaining runnable at the
+    // service scheduling class, so the designated ingestion worker always gets
+    // the turn needed to acquire the queue and return ring credit.
+    let guard = queue.queue.lock().unwrap_or_else(|_| {
+        debug_line("inputd: input queue synchronization failed");
+        std::process::exit(134);
+    });
+    {
+        let mut handoff = queue.handoff.lock().unwrap_or_else(|_| {
+            debug_line("inputd: input queue handoff synchronization failed");
+            std::process::exit(134);
+        });
+        handoff.ingestion_waiting = false;
+        queue.handoff_changed.notify_all();
+    }
+    guard
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -463,8 +519,7 @@ mod tests {
         COMMERCIAL_MAX_PROTOCOL_INPUTD, INPUTD_ACCESS_NATIVE, INPUTD_INGRESS_FLAG_DVM_SOURCE,
         INPUTD_INGRESS_FLAG_RESET_STATE, INPUTD_INGRESS_KIND_DVM_LINUX_KEY,
     };
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{mpsc, Arc, Mutex};
+    use std::sync::{mpsc, Arc};
     use std::time::{Duration, Instant};
 
     fn pointer_motion(dx: i32, dy: i32) -> input_evdev::InputEvent {
@@ -481,10 +536,7 @@ mod tests {
 
     #[test]
     fn ingestion_handoff_prevents_hot_reader_mutex_barging() {
-        let queue = Arc::new(SharedInputQueueState {
-            queue: Mutex::new(InputQueue::default()),
-            ingestion_waiting: AtomicBool::new(false),
-        });
+        let queue = Arc::new(SharedInputQueueState::new());
         let held = queue.queue.lock().unwrap();
         let (tx, rx) = mpsc::channel();
 
@@ -495,7 +547,7 @@ mod tests {
             ingestion_tx.send("ingestion").unwrap();
         });
         let deadline = Instant::now() + Duration::from_secs(1);
-        while !queue.ingestion_waiting.load(Ordering::Acquire) {
+        while !queue.handoff.lock().unwrap().ingestion_waiting {
             assert!(
                 Instant::now() < deadline,
                 "ingestion did not declare handoff"
@@ -521,10 +573,7 @@ mod tests {
 
     #[test]
     fn session_authority_sync_never_holds_the_policy_queue_lock() {
-        let queue = Arc::new(SharedInputQueueState {
-            queue: Mutex::new(InputQueue::default()),
-            ingestion_waiting: AtomicBool::new(false),
-        });
+        let queue = Arc::new(SharedInputQueueState::new());
         let mut pending_events = Vec::new();
         let outcomes = [DvmOutcome {
             grant_epoch: Some(7),
@@ -545,10 +594,7 @@ mod tests {
 
     #[test]
     fn failed_session_authority_sync_resets_without_killing_ring_progress() {
-        let queue = Arc::new(SharedInputQueueState {
-            queue: Mutex::new(InputQueue::default()),
-            ingestion_waiting: AtomicBool::new(false),
-        });
+        let queue = Arc::new(SharedInputQueueState::new());
         lock_input_queue_for_ingestion(&queue).push(pointer_motion(4, 2));
         let mut pending_events = Vec::new();
         let outcomes = [DvmOutcome {
@@ -994,10 +1040,7 @@ fn wait_for_dvm_ingress() -> Result<(), i32> {
 }
 
 fn serve(endpoint: u64) {
-    let queue = Arc::new(SharedInputQueueState {
-        queue: Mutex::new(InputQueue::default()),
-        ingestion_waiting: AtomicBool::new(false),
-    });
+    let queue = Arc::new(SharedInputQueueState::new());
     let dvm_ingress_log_state = Arc::new(DvmIngressLogState::default());
     start_dvm_ingestion_worker(Arc::clone(&queue), Arc::clone(&dvm_ingress_log_state));
     loop {

@@ -1,16 +1,29 @@
+//! Provider-generation registry for the general userspace wait set.
+//!
+//! - **Owner:** Compat owns waiter records; services own object readiness and
+//!   generation advancement.
+//! - **Boundary:** Provider observations and endpoint publications are accepted
+//!   only from the exact live service owner.
+//! - **Lifecycle:** Install exact observations, revalidate, match during arm,
+//!   wake on generation change/revoke, then remove on every resume/exit path.
+//! - **Concurrency:** The tracked registry lock contains bounded,
+//!   allocation-free mutations; scheduler wake occurs after releasing it.
+//! - **Failure:** Duplicate registration, capacity, task exit, provider restart,
+//!   and stale generation remove or reject only the exact waiter.
+//! - **Forbidden:** No provider scan loop, callback under lock, PID-only
+//!   identity, or generation decrease.
+//! - **Evidence:** `waitset`.
 // Ring0 owns only bounded wait tokens and scheduler wakeup. Provider services
 // own readiness state and generations; every wake is followed by a provider
 // recheck before Linux-visible readiness is returned.
 use super::*;
-use alloc::collections::BTreeMap;
 use lazy_static::lazy_static;
+use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
 use rustos_user_abi::syscall::{
     WAITSET_GLOBAL_OBJECT_ID, WAITSET_PROVIDER_INPUTD, WAITSET_PROVIDER_MAX, WAITSET_PROVIDER_NETD,
     WAITSET_PROVIDER_SESSIOND, WAITSET_PROVIDER_VFSD, WaitSetSignalBrokerArgs,
     waitset_signal_shape_valid,
 };
-use spin::Mutex;
-
 const WAITSET_WAITER_CAPACITY: usize =
     multitask::MAX_SCHEDULER_TASKS * WAITSET_PROVIDER_MAX as usize;
 const INPUT_OPEN_DESCRIPTION_CAPACITY: usize = 256;
@@ -31,15 +44,20 @@ struct WaitSetWaiter {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct InputOpenDescription {
+    token: u64,
     access: u16,
     refs: u64,
 }
 
 lazy_static! {
-    static ref WAITSET_WAITERS: Mutex<[Option<WaitSetWaiter>; WAITSET_WAITER_CAPACITY]> =
-        Mutex::new([None; WAITSET_WAITER_CAPACITY]);
-    static ref INPUT_OPEN_DESCRIPTIONS: Mutex<BTreeMap<u64, InputOpenDescription>> =
-        Mutex::new(BTreeMap::new());
+    static ref WAITSET_WAITERS: TrackedSpinLock<
+        [Option<WaitSetWaiter>; WAITSET_WAITER_CAPACITY],
+        { LockClass::CompatWaitset as u8 },
+    > = TrackedSpinLock::new([None; WAITSET_WAITER_CAPACITY]);
+    static ref INPUT_OPEN_DESCRIPTIONS: TrackedSpinLock<
+        [Option<InputOpenDescription>; INPUT_OPEN_DESCRIPTION_CAPACITY],
+        { LockClass::InputOpenDescription as u8 },
+    > = TrackedSpinLock::new([None; INPUT_OPEN_DESCRIPTION_CAPACITY]);
 }
 
 pub(crate) fn register_input_open_description(token: u64, access: u16) -> Result<(), i64> {
@@ -47,19 +65,28 @@ pub(crate) fn register_input_open_description(token: u64, access: u16) -> Result
         return Err(LINUX_EINVAL);
     }
     let mut objects = INPUT_OPEN_DESCRIPTIONS.lock();
-    if objects.contains_key(&token) {
+    if objects.iter().flatten().any(|object| object.token == token) {
         return Err(LINUX_EEXIST);
     }
-    if objects.len() >= INPUT_OPEN_DESCRIPTION_CAPACITY {
-        return Err(LINUX_EMFILE);
-    }
-    objects.insert(token, InputOpenDescription { access, refs: 1 });
+    let slot = objects
+        .iter_mut()
+        .find(|slot| slot.is_none())
+        .ok_or(LINUX_EMFILE)?;
+    *slot = Some(InputOpenDescription {
+        token,
+        access,
+        refs: 1,
+    });
     Ok(())
 }
 
 pub(crate) fn acquire_input_open_description(token: u64) -> Result<(), i64> {
     let mut objects = INPUT_OPEN_DESCRIPTIONS.lock();
-    let object = objects.get_mut(&token).ok_or(LINUX_EBADF)?;
+    let object = objects
+        .iter_mut()
+        .flatten()
+        .find(|object| object.token == token)
+        .ok_or(LINUX_EBADF)?;
     object.refs = object.refs.checked_add(1).ok_or(LINUX_EOVERFLOW)?;
     Ok(())
 }
@@ -67,19 +94,25 @@ pub(crate) fn acquire_input_open_description(token: u64) -> Result<(), i64> {
 /// Drops one descriptor reference and reports whether it was the final one.
 pub(crate) fn release_input_open_description(token: u64) -> Result<bool, i64> {
     let mut objects = INPUT_OPEN_DESCRIPTIONS.lock();
-    let object = objects.get_mut(&token).ok_or(LINUX_EBADF)?;
+    let slot = objects
+        .iter_mut()
+        .find(|slot| slot.as_ref().is_some_and(|object| object.token == token))
+        .ok_or(LINUX_EBADF)?;
+    let object = slot.as_mut().expect("matched input open description");
     if object.refs > 1 {
         object.refs -= 1;
         return Ok(false);
     }
-    objects.remove(&token);
+    *slot = None;
     Ok(true)
 }
 
 pub(crate) fn input_open_description_access(token: u64) -> Option<u16> {
     INPUT_OPEN_DESCRIPTIONS
         .lock()
-        .get(&token)
+        .iter()
+        .flatten()
+        .find(|object| object.token == token)
         .map(|object| object.access)
 }
 
@@ -144,13 +177,16 @@ fn register_waitset_waiters_faultable(
     Ok(())
 }
 
-pub(crate) fn remove_waitset_waiters(task_id: u64) {
+pub(crate) fn remove_waitset_waiters(task_id: u64) -> usize {
     let mut waiters = WAITSET_WAITERS.lock();
+    let mut removed = 0;
     for slot in waiters.iter_mut() {
         if slot.is_some_and(|waiter| waiter.task_id == task_id) {
             *slot = None;
+            removed += 1;
         }
     }
+    removed
 }
 
 /// Returns true only while the exact provider observations installed by the
@@ -281,6 +317,9 @@ mod tests {
         IPC_SERVICE_VFSD, WAITSET_GLOBAL_OBJECT_ID, WAITSET_PROVIDER_INPUTD, WAITSET_PROVIDER_NETD,
         WAITSET_PROVIDER_SESSIOND, WAITSET_PROVIDER_VFSD,
     };
+    use spin::Mutex;
+
+    static WAITSET_TEST_GUARD: Mutex<()> = Mutex::new(());
 
     #[test]
     fn readiness_generation_requires_a_strict_monotonic_advance() {
@@ -346,6 +385,7 @@ mod tests {
 
     #[test]
     fn waiter_removal_before_scheduler_arm_is_detected_by_presence() {
+        let _guard = WAITSET_TEST_GUARD.lock();
         let task_id = u64::MAX - 101;
         let process_id = u64::MAX - 102;
         let observations = [ProviderObservation {
@@ -355,12 +395,14 @@ mod tests {
         }];
         register_waitset_waiters(task_id, process_id, &observations).expect("register waiter");
         assert!(waitset_waiters_match(task_id, process_id, &observations));
-        remove_waitset_waiters(task_id);
+        assert_eq!(remove_waitset_waiters(task_id), 1);
+        assert_eq!(remove_waitset_waiters(task_id), 0);
         assert!(!waitset_waiters_match(task_id, process_id, &observations));
     }
 
     #[test]
     fn waitset_registration_fault_preserves_existing_observations() {
+        let _guard = WAITSET_TEST_GUARD.lock();
         let task_id = u64::MAX - 201;
         let process_id = u64::MAX - 202;
         let original = [ProviderObservation {

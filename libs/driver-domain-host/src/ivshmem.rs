@@ -129,6 +129,30 @@ impl IvshmemDoorbellServer {
             thread::sleep(Duration::from_millis(10));
         }
     }
+
+    /// Wait until disconnect processing and any replacement handshake reach
+    /// one exact fixed-peer population. Recovery callers use this before
+    /// assigning a vacant identity; an `>=` check could admit a stale count
+    /// while the broker is still reaping the predecessor socket.
+    pub fn wait_for_exact_peer_count(&self, expected: usize, timeout: Duration) -> Result<()> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| anyhow!("ivshmem exact peer wait deadline overflow"))?;
+        loop {
+            let observed = self.peer_count.load(Ordering::Acquire);
+            if observed == expected {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                bail!(
+                    "ivshmem exact peer population remained {observed}, expected {expected}, \
+                     after {:?}",
+                    timeout
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
 }
 
 impl Drop for IvshmemDoorbellServer {
@@ -143,7 +167,7 @@ impl Drop for IvshmemDoorbellServer {
 
 struct Peer {
     id: i64,
-    stream: UnixStream,
+    stream: Option<UnixStream>,
     receive_events: Vec<OwnedFd>,
 }
 
@@ -154,12 +178,19 @@ fn serve(
     peer_count: Arc<AtomicUsize>,
     vector_count: usize,
 ) -> Result<()> {
-    let mut peers = Vec::<Peer>::with_capacity(IVSHMEM_PEER_COUNT);
+    // LIFECYCLE: slots are fixed peer identities, not connection order.
+    // Eventfds remain leased to a logical slot across QEMU replacement; shared
+    // generation protocols perform revoke/rebind, while socket lifetime only
+    // changes liveness and never reallocates an identity.
+    let mut peers = (0..IVSHMEM_PEER_COUNT)
+        .map(|_| None)
+        .collect::<Vec<Option<Peer>>>();
     loop {
         match shutdown.try_recv() {
             Ok(()) | Err(TryRecvError::Disconnected) => return Ok(()),
             Err(TryRecvError::Empty) => {}
         }
+        reap_disconnected_peers(&mut peers, &peer_count)?;
         accept_ready_peers(
             &listener,
             &shared_memory,
@@ -167,7 +198,6 @@ fn serve(
             &peer_count,
             vector_count,
         )?;
-        reap_disconnected_peers(&mut peers)?;
         thread::sleep(Duration::from_millis(POLL_TIMEOUT_MS as u64));
     }
 }
@@ -175,24 +205,38 @@ fn serve(
 fn accept_ready_peers(
     listener: &UnixListener,
     shared_memory: &File,
-    peers: &mut Vec<Peer>,
+    peers: &mut [Option<Peer>],
     peer_count: &AtomicUsize,
     vector_count: usize,
 ) -> Result<()> {
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
-                if peers.len() >= IVSHMEM_PEER_COUNT || !peer_is_launch_owner(&stream)? {
+                let Some(id_index) = peers.iter().position(|peer| {
+                    peer.as_ref()
+                        .is_none_or(|peer| peer.stream.as_ref().is_none())
+                }) else {
+                    drop(stream);
+                    continue;
+                };
+                if !peer_is_launch_owner(&stream)? {
                     drop(stream);
                     continue;
                 }
                 stream
                     .set_nonblocking(true)
                     .context("make ivshmem client socket nonblocking")?;
-                let id = i64::try_from(peers.len()).expect("two peers fit ivshmem ID");
-                let receive_events = (0..vector_count)
-                    .map(|_| create_eventfd())
-                    .collect::<Result<Vec<_>>>()?;
+                let id = i64::try_from(id_index).expect("two peers fit ivshmem ID");
+                let replacing = peers[id_index].is_some();
+                if !replacing {
+                    peers[id_index] = Some(Peer {
+                        id,
+                        stream: None,
+                        receive_events: (0..vector_count)
+                            .map(|_| create_eventfd())
+                            .collect::<Result<Vec<_>>>()?,
+                    });
+                }
                 send_i64_with_fd(stream.as_raw_fd(), IVSHMEM_PROTOCOL_VERSION, None)?;
                 send_i64_with_fd(stream.as_raw_fd(), id, None)?;
                 send_i64_with_fd(
@@ -200,7 +244,12 @@ fn accept_ready_peers(
                     IVSHMEM_SHARED_MEMORY_MESSAGE,
                     Some(shared_memory.as_raw_fd()),
                 )?;
-                for existing in peers.iter() {
+                for existing in peers
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| *index != id_index)
+                    .filter_map(|(_, peer)| peer.as_ref())
+                {
                     for receive_event in &existing.receive_events {
                         send_i64_with_fd(
                             stream.as_raw_fd(),
@@ -209,25 +258,43 @@ fn accept_ready_peers(
                         )?;
                     }
                 }
-                for receive_event in &receive_events {
+                let receive_events = &peers[id_index]
+                    .as_ref()
+                    .expect("fixed ivshmem peer slot initialized")
+                    .receive_events;
+                for receive_event in receive_events {
                     send_i64_with_fd(stream.as_raw_fd(), id, Some(receive_event.as_raw_fd()))?;
                 }
 
-                for existing in peers.iter() {
-                    for receive_event in &receive_events {
-                        send_i64_with_fd(
-                            existing.stream.as_raw_fd(),
-                            id,
-                            Some(receive_event.as_raw_fd()),
-                        )?;
+                if !replacing {
+                    for existing in peers
+                        .iter()
+                        .enumerate()
+                        .filter(|(index, _)| *index != id_index)
+                        .filter_map(|(_, peer)| peer.as_ref())
+                        .filter_map(|peer| peer.stream.as_ref())
+                    {
+                        for receive_event in receive_events {
+                            send_i64_with_fd(
+                                existing.as_raw_fd(),
+                                id,
+                                Some(receive_event.as_raw_fd()),
+                            )?;
+                        }
                     }
                 }
-                peers.push(Peer {
-                    id,
-                    stream,
-                    receive_events,
-                });
-                peer_count.store(peers.len(), Ordering::Release);
+                peers[id_index]
+                    .as_mut()
+                    .expect("fixed ivshmem peer slot initialized")
+                    .stream = Some(stream);
+                peer_count.store(
+                    peers
+                        .iter()
+                        .flatten()
+                        .filter(|peer| peer.stream.is_some())
+                        .count(),
+                    Ordering::Release,
+                );
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
             Err(error) => return Err(error).context("accept ivshmem doorbell client"),
@@ -235,9 +302,16 @@ fn accept_ready_peers(
     }
 }
 
-fn reap_disconnected_peers(peers: &mut [Peer]) -> Result<()> {
-    for peer in peers.iter() {
-        let fd = peer.stream.as_raw_fd();
+fn reap_disconnected_peers(peers: &mut [Option<Peer>], peer_count: &AtomicUsize) -> Result<()> {
+    let mut disconnected = [false; IVSHMEM_PEER_COUNT];
+    for index in 0..peers.len() {
+        let Some(peer) = peers[index].as_ref() else {
+            continue;
+        };
+        let Some(stream) = peer.stream.as_ref() else {
+            continue;
+        };
+        let fd = stream.as_raw_fd();
         let mut byte = [0_u8; 1];
         let result = unsafe {
             libc::recv(
@@ -247,20 +321,52 @@ fn reap_disconnected_peers(peers: &mut [Peer]) -> Result<()> {
                 libc::MSG_PEEK | libc::MSG_DONTWAIT,
             )
         };
-        if result == 0 {
-            bail!(
-                "ivshmem peer {} disconnected; tear down the paired GUI topology",
-                peer.id
-            );
-        }
-        if result < 0 {
+        let is_disconnected = if result == 0 {
+            true
+        } else if result < 0 {
             let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::WouldBlock {
+            if error.kind() == io::ErrorKind::WouldBlock {
+                false
+            } else if matches!(
+                error.kind(),
+                io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::BrokenPipe
+            ) {
+                true
+            } else {
                 return Err(error)
                     .with_context(|| format!("ivshmem peer {} lifecycle socket failed", peer.id));
             }
+        } else {
+            false
+        };
+        if !is_disconnected {
+            continue;
+        }
+        disconnected[index] = true;
+    }
+
+    // The eventfd set is the fixed logical-peer lease, not the lifetime of one
+    // QEMU process. Retain it across a bounded reconnect so the surviving QEMU
+    // never processes a disconnect/connect churn for the same ID; the shared
+    // RustOS transport epoch remains the authoritative offline/rebind signal.
+    for (index, is_disconnected) in disconnected.into_iter().enumerate() {
+        if is_disconnected {
+            peers[index]
+                .as_mut()
+                .expect("observed ivshmem peer slot remains populated")
+                .stream = None;
         }
     }
+    peer_count.store(
+        peers
+            .iter()
+            .flatten()
+            .filter(|peer| peer.stream.is_some())
+            .count(),
+        Ordering::Release,
+    );
     Ok(())
 }
 
@@ -510,11 +616,24 @@ fn validate_shared_memory(file: &File) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use std::fs::{self, OpenOptions};
+    use std::io::Read;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     use std::os::unix::net::UnixStream;
-    use std::time::Duration;
+    use std::sync::atomic::Ordering;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     use super::{IvshmemDoorbellServer, validate_launch_socket_path};
+
+    fn peer_id(stream: &mut UnixStream) -> i64 {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut header = [0_u8; 16];
+        stream.read_exact(&mut header).unwrap();
+        assert_eq!(i64::from_le_bytes(header[..8].try_into().unwrap()), 0);
+        i64::from_le_bytes(header[8..].try_into().unwrap())
+    }
 
     #[test]
     fn rejects_a_nonprivate_socket_parent() {
@@ -567,5 +686,45 @@ mod tests {
         server
             .wait_for_peer_count(1, Duration::from_secs(1))
             .unwrap();
+    }
+
+    #[test]
+    fn reconnect_reclaims_the_vacant_fixed_peer_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let backing_path = directory.path().join("display.bin");
+        let backing = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&backing_path)
+            .unwrap();
+        backing.set_len(4096).unwrap();
+        let socket = directory.path().join("doorbell.sock");
+        let server = IvshmemDoorbellServer::start(&socket, &backing).unwrap();
+
+        let mut first = UnixStream::connect(&socket).unwrap();
+        assert_eq!(peer_id(&mut first), 0);
+        let mut second = UnixStream::connect(&socket).unwrap();
+        assert_eq!(peer_id(&mut second), 1);
+        server
+            .wait_for_peer_count(2, Duration::from_secs(1))
+            .unwrap();
+
+        drop(first);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while server.peer_count.load(Ordering::Acquire) != 1 {
+            assert!(Instant::now() < deadline, "peer disconnect was not reaped");
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let mut replacement = UnixStream::connect(&socket).unwrap();
+        assert_eq!(peer_id(&mut replacement), 0);
+        server
+            .wait_for_peer_count(2, Duration::from_secs(1))
+            .unwrap();
+        drop(second);
+        drop(replacement);
     }
 }

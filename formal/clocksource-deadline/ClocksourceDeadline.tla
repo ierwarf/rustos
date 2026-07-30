@@ -9,6 +9,10 @@ implementation bugs:
     thirteen seconds during a thirty-second host run;
   * resolving a sleeper through current_user_snapshot re-entered the
     process-table lock from syscall context and deadlocked before waiter arm.
+  * clock_gettime/nanosleep admission still took the shared process-state lock
+    (and could synchronously call syscalld) before any timer authority existed,
+    so one contended lookup turned a bounded userspace sleep into an infinite
+    pre-arm stall;
   * deadline wake used monotonic time while the outer sleep loop still tested
     the disabled periodic-RTC counter, so an expired finite sleep spun forever.
 
@@ -21,6 +25,8 @@ Elapsed time is read from a validated invariant-TSC/HPET clocksource. PIT is a
 clockevent only: one delayed event services every absolute deadline at or below
 the current source time. Sleeper identity is the scheduler task id and remains
 independent from a process-table lock already held by the syscall path.
+The fixed clock/timespec ABI envelope is admitted locally without process-state
+or policy-service participation.
 Deadline construction, expiry, and the caller's completion condition all use
 `sourceTime`; no second counter exists in the specification.
 *******************************************************************************)
@@ -47,13 +53,14 @@ VARIABLES sourceKind,
           taskState,
           deadline,
           deadlineOwner,
+          localAdmission,
           processLockHeld,
           armEpoch,
           lastWakeEpoch
 
 vars == <<sourceKind, sourceCalibrated, sourceTime, servicedTime,
           deliveredEvents, taskState, deadline, deadlineOwner,
-          processLockHeld, armEpoch, lastWakeEpoch>>
+          localAdmission, processLockHeld, armEpoch, lastWakeEpoch>>
 
 SourceValid ==
     /\ sourceKind \in {InvariantTsc, Hpet}
@@ -68,6 +75,7 @@ Init ==
     /\ taskState = [t \in Tasks |-> Ready]
     /\ deadline = [t \in Tasks |-> NoDeadline]
     /\ deadlineOwner = [t \in Tasks |-> NoTask]
+    /\ localAdmission = {}
     /\ processLockHeld = {}
     /\ armEpoch = [t \in Tasks |-> 0]
     /\ lastWakeEpoch = [t \in Tasks |-> 0]
@@ -77,7 +85,7 @@ SelectInvariantTsc ==
     /\ sourceKind' = InvariantTsc
     /\ sourceCalibrated' = TRUE
     /\ UNCHANGED <<sourceTime, servicedTime, deliveredEvents, taskState,
-                  deadline, deadlineOwner, processLockHeld, armEpoch,
+                  deadline, deadlineOwner, localAdmission, processLockHeld, armEpoch,
                   lastWakeEpoch>>
 
 SelectHpet ==
@@ -85,7 +93,7 @@ SelectHpet ==
     /\ sourceKind' = Hpet
     /\ sourceCalibrated' = TRUE
     /\ UNCHANGED <<sourceTime, servicedTime, deliveredEvents, taskState,
-                  deadline, deadlineOwner, processLockHeld, armEpoch,
+                  deadline, deadlineOwner, localAdmission, processLockHeld, armEpoch,
                   lastWakeEpoch>>
 
 EnterSyscall(task) ==
@@ -95,14 +103,24 @@ EnterSyscall(task) ==
     /\ processLockHeld' = processLockHeld \cup {task}
     /\ UNCHANGED <<sourceKind, sourceCalibrated, sourceTime, servicedTime,
                   deliveredEvents, taskState, deadline, deadlineOwner,
-                  armEpoch, lastWakeEpoch>>
+                  localAdmission, armEpoch, lastWakeEpoch>>
 
 ExitSyscall(task) ==
     /\ task \in processLockHeld
     /\ processLockHeld' = processLockHeld \ {task}
     /\ UNCHANGED <<sourceKind, sourceCalibrated, sourceTime, servicedTime,
                   deliveredEvents, taskState, deadline, deadlineOwner,
-                  armEpoch, lastWakeEpoch>>
+                  localAdmission, armEpoch, lastWakeEpoch>>
+
+AdmitDeadlineLocally(task) ==
+    /\ SourceValid
+    /\ task \in Tasks
+    /\ taskState[task] = Ready
+    /\ deadline[task] = NoDeadline
+    /\ localAdmission' = localAdmission \cup {task}
+    /\ UNCHANGED <<sourceKind, sourceCalibrated, sourceTime, servicedTime,
+                  deliveredEvents, taskState, deadline, deadlineOwner,
+                  processLockHeld, armEpoch, lastWakeEpoch>>
 
 (*******************************************************************************
 Arm resolves the exact scheduler task identity directly. It is intentionally
@@ -113,6 +131,7 @@ ArmSleep(task) ==
     /\ SourceValid
     /\ task \in Tasks
     /\ taskState[task] = Ready
+    /\ task \in localAdmission
     /\ deadline[task] = NoDeadline
     /\ sourceTime < MaxTime
     /\ armEpoch[task] < MaxArmEpoch
@@ -121,7 +140,7 @@ ArmSleep(task) ==
     /\ deadlineOwner' = [deadlineOwner EXCEPT ![task] = task]
     /\ armEpoch' = [armEpoch EXCEPT ![task] = armEpoch[task] + 1]
     /\ UNCHANGED <<sourceKind, sourceCalibrated, sourceTime, servicedTime,
-                  deliveredEvents, processLockHeld, lastWakeEpoch>>
+                  deliveredEvents, localAdmission, processLockHeld, lastWakeEpoch>>
 
 CommitSleep(task) ==
     /\ task \in Tasks
@@ -131,7 +150,7 @@ CommitSleep(task) ==
     /\ taskState' = [taskState EXCEPT ![task] = Blocked]
     /\ UNCHANGED <<sourceKind, sourceCalibrated, sourceTime, servicedTime,
                   deliveredEvents, deadline, deadlineOwner, processLockHeld,
-                  armEpoch, lastWakeEpoch>>
+                  localAdmission, armEpoch, lastWakeEpoch>>
 
 CancelExpiredArm(task) ==
     /\ task \in Tasks
@@ -140,6 +159,7 @@ CancelExpiredArm(task) ==
     /\ taskState' = [taskState EXCEPT ![task] = Ready]
     /\ deadline' = [deadline EXCEPT ![task] = NoDeadline]
     /\ deadlineOwner' = [deadlineOwner EXCEPT ![task] = NoTask]
+    /\ localAdmission' = localAdmission \ {task}
     /\ lastWakeEpoch' = [lastWakeEpoch EXCEPT ![task] = armEpoch[task]]
     /\ UNCHANGED <<sourceKind, sourceCalibrated, sourceTime, servicedTime,
                   deliveredEvents, processLockHeld, armEpoch>>
@@ -150,6 +170,7 @@ WakeTask(task) ==
     /\ taskState' = [taskState EXCEPT ![task] = Ready]
     /\ deadline' = [deadline EXCEPT ![task] = NoDeadline]
     /\ deadlineOwner' = [deadlineOwner EXCEPT ![task] = NoTask]
+    /\ localAdmission' = localAdmission \ {task}
     /\ lastWakeEpoch' = [lastWakeEpoch EXCEPT ![task] = armEpoch[task]]
     /\ UNCHANGED <<sourceKind, sourceCalibrated, sourceTime, servicedTime,
                   deliveredEvents, processLockHeld, armEpoch>>
@@ -165,7 +186,7 @@ AdvanceSource(step) ==
     /\ sourceTime' = sourceTime + step
     /\ UNCHANGED <<sourceKind, sourceCalibrated, servicedTime,
                   deliveredEvents, taskState, deadline, deadlineOwner,
-                  processLockHeld, armEpoch, lastWakeEpoch>>
+                  localAdmission, processLockHeld, armEpoch, lastWakeEpoch>>
 
 (*******************************************************************************
 One PIT clockevent catches up every due absolute deadline, including deadlines
@@ -189,6 +210,7 @@ DeliverClockEvent ==
         [t \in Tasks |-> IF t \in Due THEN NoTask ELSE deadlineOwner[t]]
     /\ lastWakeEpoch' =
         [t \in Tasks |-> IF t \in Due THEN armEpoch[t] ELSE lastWakeEpoch[t]]
+    /\ localAdmission' = localAdmission \ Due
     /\ UNCHANGED <<sourceKind, sourceCalibrated, sourceTime,
                   processLockHeld, armEpoch>>
 
@@ -198,6 +220,7 @@ RetireTask(task) ==
     /\ taskState' = [taskState EXCEPT ![task] = Retired]
     /\ deadline' = [deadline EXCEPT ![task] = NoDeadline]
     /\ deadlineOwner' = [deadlineOwner EXCEPT ![task] = NoTask]
+    /\ localAdmission' = localAdmission \ {task}
     /\ processLockHeld' = processLockHeld \ {task}
     /\ UNCHANGED <<sourceKind, sourceCalibrated, sourceTime, servicedTime,
                   deliveredEvents, armEpoch, lastWakeEpoch>>
@@ -207,6 +230,7 @@ Next ==
     \/ SelectHpet
     \/ \E task \in Tasks : EnterSyscall(task)
     \/ \E task \in Tasks : ExitSyscall(task)
+    \/ \E task \in Tasks : AdmitDeadlineLocally(task)
     \/ \E task \in Tasks : ArmSleep(task)
     \/ \E task \in Tasks : CommitSleep(task)
     \/ \E task \in Tasks : CancelExpiredArm(task)
@@ -230,6 +254,7 @@ TypeOK ==
     /\ taskState \in [Tasks -> {Ready, Armed, Blocked, Retired}]
     /\ deadline \in [Tasks -> 0..MaxTime]
     /\ deadlineOwner \in [Tasks -> Tasks \cup {NoTask}]
+    /\ localAdmission \subseteq Tasks
     /\ processLockHeld \subseteq Tasks
     /\ armEpoch \in [Tasks -> 0..MaxArmEpoch]
     /\ lastWakeEpoch \in [Tasks -> 0..MaxArmEpoch]
@@ -253,6 +278,7 @@ ArmedOrBlockedOwnsExactlyOneDeadline ==
         taskState[task] \in {Armed, Blocked} =>
             /\ deadline[task] # NoDeadline
             /\ deadlineOwner[task] = task
+            /\ task \in localAdmission
 
 NoServicedDeadlineRemainsAsleep ==
     \A task \in Tasks :
@@ -267,6 +293,7 @@ RetiredTaskHasNoTimerAuthority ==
         taskState[task] = Retired =>
             /\ deadline[task] = NoDeadline
             /\ deadlineOwner[task] = NoTask
+            /\ task \notin localAdmission
             /\ task \notin processLockHeld
 
 BlockedSleepEventuallyReleases ==

@@ -1,3 +1,19 @@
+//! Storage-policy broker over the bounded DVM block substrate.
+//!
+//! - **Owner:** `storaged` owns geometry, timeout, retry, durability, and cache
+//!   policy; Compat owns capability admission to ring0 transport.
+//! - **Boundary:** Service requests, sectors, buffers, operation IDs, and
+//!   provider epochs are untrusted.
+//! - **Lifecycle:** Admit signed generation/geometry, submit, poll/cancel,
+//!   finish exact ticket, and revoke/rebind only through a newer signed epoch.
+//! - **Concurrency:** Transport calls are finite and never expose raw shared
+//!   memory or physical addresses to the service.
+//! - **Failure:** Timeout, device fault, short completion, revoke, and stale
+//!   completion return exact errors without slot reuse or false durability.
+//! - **Forbidden:** No VFS direct access, ring0 retry policy, fabricated ready
+//!   marker, or generation-only restart authority.
+//! - **Evidence:** `dvm-block-startup`, `dvm-volume-io`, and
+//!   `durable-block-mutation`.
 // Ring0 exposes only the bounded storage-DVM transport to storaged. Physical
 // boot-volume discovery and reads are deliberately absent.
 use super::*;
@@ -299,8 +315,8 @@ fn broker_dvm_wait(args: &RustosBlockBrokerArgs) -> Result<u64, i64> {
             let _ = multitask::cancel_block_current_task();
             return Err(LINUX_EBUSY);
         }
-        match multitask::commit_block_current_task() {
-            Some(true) => multitask::yield_now(),
+        match multitask::commit_block_current_task_and_yield() {
+            Some(true) => {}
             Some(false) => {}
             None => {
                 block_api::disarm_dvm_waiter(task_id);

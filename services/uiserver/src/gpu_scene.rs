@@ -414,7 +414,6 @@ fn copy_xrgb_opaque_row(destination: &mut [u32], source: &[u32]) {
         for (destination, source) in destination[index..].iter_mut().zip(&source[index..]) {
             *destination = *source | 0xff00_0000;
         }
-        return;
     }
 
     #[cfg(not(target_arch = "x86_64"))]
@@ -941,34 +940,35 @@ mod tests {
         let mut pixels = vec![0xffff_ffff; 8 * 6];
         let first = [1_u32, 2, 3, 4];
         let second = [5_u32, 6, 7, 8];
-        let mut packer = GpuAtlasPacker::new(&mut pixels, 8, 6, 8).unwrap();
-        let first_rect = packer.place_bgra(&first, 2, 2, 2).unwrap();
-        let second_rect = packer.place_bgra(&second, 2, 2, 2).unwrap();
-        assert_eq!(
-            first_rect,
-            Rect {
-                x: 1,
-                y: 1,
-                width: 2,
-                height: 2
-            }
-        );
-        assert_eq!(
-            second_rect,
-            Rect {
-                x: 5,
-                y: 1,
-                width: 2,
-                height: 2
-            }
-        );
-        assert_eq!(
-            packer.place_bgra(&first, 2, 2, 2),
-            Err(GpuSceneError::AtlasFull)
-        );
-        drop(packer);
-        assert_eq!(pixels[1 * 8 + 1], 1);
-        assert_eq!(pixels[1 * 8 + 5], 5);
+        {
+            let mut packer = GpuAtlasPacker::new(&mut pixels, 8, 6, 8).unwrap();
+            let first_rect = packer.place_bgra(&first, 2, 2, 2).unwrap();
+            let second_rect = packer.place_bgra(&second, 2, 2, 2).unwrap();
+            assert_eq!(
+                first_rect,
+                Rect {
+                    x: 1,
+                    y: 1,
+                    width: 2,
+                    height: 2
+                }
+            );
+            assert_eq!(
+                second_rect,
+                Rect {
+                    x: 5,
+                    y: 1,
+                    width: 2,
+                    height: 2
+                }
+            );
+            assert_eq!(
+                packer.place_bgra(&first, 2, 2, 2),
+                Err(GpuSceneError::AtlasFull)
+            );
+        }
+        assert_eq!(pixels[9], 1);
+        assert_eq!(pixels[13], 5);
         assert_eq!(pixels[0], 0);
         assert_eq!(pixels[4], 0);
     }

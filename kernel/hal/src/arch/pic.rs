@@ -1,6 +1,6 @@
 use lazy_static::lazy_static;
+use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
 use pic8259::ChainedPics;
-use spin::Mutex;
 use x86_64::instructions::interrupts;
 
 pub const PIC_1_OFFSET: u8 = 0x20;
@@ -11,8 +11,8 @@ const CASCADE_IRQ: u8 = 2;
 const ALL_IRQS_MASKED: u8 = u8::MAX;
 
 lazy_static! {
-    pub static ref PICS: Mutex<ChainedPics> =
-        Mutex::new(unsafe { ChainedPics::new(PIC_1_OFFSET, PIC_2_OFFSET) });
+    pub static ref PICS: TrackedSpinLock<ChainedPics, { LockClass::LegacyPic as u8 }> =
+        TrackedSpinLock::new(unsafe { ChainedPics::new(PIC_1_OFFSET, PIC_2_OFFSET) });
 }
 
 pub fn init() {

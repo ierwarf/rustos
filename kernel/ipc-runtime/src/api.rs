@@ -1,7 +1,8 @@
 pub use crate::ipc::{
     EndpointReceived, EndpointReceivedWithSender, EndpointResponseTake,
     EndpointResponseWithHandles, EndpointWakeSet, IpcError, KernelEndpointHandle,
-    KernelReplyHandle, KernelSharedRegionHandle, KernelTransferredHandle,
+    KernelReplyHandle, KernelSharedRegionHandle, KernelSharedRegionMappingHold,
+    KernelTransferredHandle, MAX_ENDPOINT_WAKE_TASKS,
 };
 
 pub mod endpoint {
@@ -161,19 +162,6 @@ pub mod endpoint {
         )
     }
 
-    pub fn take_response(
-        reply: KernelReplyHandle,
-    ) -> Result<Option<alloc::vec::Vec<u8>>, IpcError> {
-        crate::ipc::take_endpoint_response(reply)
-    }
-
-    pub fn take_response_with_handle_limit(
-        reply: KernelReplyHandle,
-        handle_capacity: usize,
-    ) -> Result<Option<super::EndpointResponseWithHandles>, IpcError> {
-        crate::ipc::take_endpoint_response_with_handle_limit(reply, handle_capacity)
-    }
-
     pub fn take_response_detailed(
         reply: KernelReplyHandle,
         handle_capacity: usize,
@@ -192,8 +180,11 @@ pub mod endpoint {
         crate::ipc::cancel_endpoint_call_with_transfers(reply, caller_task_id)
     }
 
-    pub fn cancel_calls_for_task(task_id: u64) -> alloc::vec::Vec<KernelTransferredHandle> {
-        crate::ipc::cancel_endpoint_calls_for_task(task_id)
+    pub fn cancel_calls_for_task(
+        task_id: u64,
+        release_transfers: impl FnMut(&[KernelTransferredHandle]),
+    ) -> usize {
+        crate::ipc::cancel_endpoint_calls_for_task(task_id, release_transfers)
     }
 
     pub fn remove_waiters_for_task(task_id: u64) -> usize {
@@ -211,10 +202,17 @@ pub mod endpoint {
 
 pub mod region {
     pub use crate::ipc::IpcError;
-    pub use crate::ipc::KernelSharedRegionHandle;
+    pub use crate::ipc::{KernelSharedRegionHandle, KernelSharedRegionMappingHold};
 
     pub fn create(byte_len: usize) -> Result<KernelSharedRegionHandle, IpcError> {
         crate::ipc::create_shared_region(byte_len)
+    }
+
+    pub fn create_for_process(
+        owner_process_id: u64,
+        byte_len: usize,
+    ) -> Result<KernelSharedRegionHandle, IpcError> {
+        crate::ipc::create_shared_region_for_process(owner_process_id, byte_len)
     }
 
     pub fn map(region: KernelSharedRegionHandle) -> Option<(*mut u8, usize)> {
@@ -223,6 +221,24 @@ pub mod region {
 
     pub fn frames(region: KernelSharedRegionHandle) -> Option<alloc::vec::Vec<u64>> {
         crate::ipc::shared_region_frames(region)
+    }
+
+    pub fn retain_descriptor(region: KernelSharedRegionHandle) -> bool {
+        crate::ipc::retain_shared_region(region)
+    }
+
+    pub fn release_descriptor(region: KernelSharedRegionHandle) {
+        crate::ipc::release_shared_region(region);
+    }
+
+    pub fn acquire_mapping(
+        region: KernelSharedRegionHandle,
+    ) -> Option<KernelSharedRegionMappingHold> {
+        crate::ipc::acquire_shared_region_mapping(region)
+    }
+
+    pub fn service_deferred_reclaims(max_pages: usize) -> usize {
+        crate::ipc::service_deferred_shared_region_reclaims(max_pages)
     }
 }
 
@@ -247,10 +263,12 @@ pub use endpoint::{
     reply_with_handles as complete_endpoint_reply_with_handles,
     reply_with_handles_for_process as complete_endpoint_reply_with_handles_for_process,
     reply_with_handles_for_task as complete_endpoint_reply_with_handles_for_task,
-    take_response as take_endpoint_response,
     take_response_detailed as take_endpoint_response_detailed,
-    take_response_with_handle_limit as take_endpoint_response_with_handle_limit,
 };
 pub use region::{
-    create as create_shared_region, frames as shared_region_frames, map as map_shared_region,
+    acquire_mapping as acquire_shared_region_mapping, create as create_shared_region,
+    create_for_process as create_shared_region_for_process, frames as shared_region_frames,
+    map as map_shared_region, release_descriptor as release_shared_region_descriptor,
+    retain_descriptor as retain_shared_region_descriptor,
+    service_deferred_reclaims as service_deferred_shared_region_reclaims,
 };

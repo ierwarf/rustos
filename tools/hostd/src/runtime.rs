@@ -1025,18 +1025,18 @@ pub fn supervise_domain(
     reset_vfio_group(lease, &mut ops)?;
     install_signal_handlers()?;
     TERMINATE_REQUESTED.store(false, Ordering::Release);
-    let (mut child, mut launch_gate) = match spawn_qemu_gated(
-        &qemu,
+    let (mut child, mut launch_gate) = match spawn_qemu_gated(QemuLaunchInputs {
+        qemu: &qemu,
         lease,
-        &artifacts,
-        &display_bdf,
-        amd_vfct.as_ref(),
-        &secret_path,
-        config.display_doorbell,
-        config.display_pixels,
-        &runtime_dir,
-        &qmp_path,
-    ) {
+        artifacts: &artifacts,
+        display_bdf: &display_bdf,
+        amd_vfct: amd_vfct.as_ref(),
+        secret: &secret_path,
+        display_doorbell: config.display_doorbell,
+        display_pixels: config.display_pixels,
+        runtime_dir: &runtime_dir,
+        qmp_path: &qmp_path,
+    }) {
         Ok(child) => child,
         Err(start_error) => {
             let restore = restore_vfio_lease(lease, &mut ops);
@@ -1324,18 +1324,32 @@ pub fn recover_domain(
     store.remove(&lease.domain_id)
 }
 
-fn spawn_qemu_gated(
-    qemu: &Path,
-    lease: &VfioLeaseRecord,
-    artifacts: &VerifiedArtifacts,
-    display_bdf: &str,
-    amd_vfct: Option<&AmdVfctArtifact>,
-    secret: &Path,
-    display_doorbell: &Path,
-    display_pixels: &Path,
-    runtime_dir: &Path,
-    qmp_path: &Path,
-) -> Result<(Child, UnixStream)> {
+struct QemuLaunchInputs<'a> {
+    qemu: &'a Path,
+    lease: &'a VfioLeaseRecord,
+    artifacts: &'a VerifiedArtifacts,
+    display_bdf: &'a str,
+    amd_vfct: Option<&'a AmdVfctArtifact>,
+    secret: &'a Path,
+    display_doorbell: &'a Path,
+    display_pixels: &'a Path,
+    runtime_dir: &'a Path,
+    qmp_path: &'a Path,
+}
+
+fn spawn_qemu_gated(inputs: QemuLaunchInputs<'_>) -> Result<(Child, UnixStream)> {
+    let QemuLaunchInputs {
+        qemu,
+        lease,
+        artifacts,
+        display_bdf,
+        amd_vfct,
+        secret,
+        display_doorbell,
+        display_pixels,
+        runtime_dir,
+        qmp_path,
+    } = inputs;
     let serial = fs::OpenOptions::new()
         .write(true)
         .create_new(true)

@@ -83,11 +83,29 @@ contracts.
 9. **A scheduler block has one exact epoch.** Only a current, runnable,
    non-retired task may arm. Wake clears the arm before commit; commit refuses
    a raced wake; cancel requires a live arm; retirement removes all runnable,
-   donation, and wait authority.
+   donation, and scheduler-owned wait authority. A retired user slot remains
+   unreapable until executive housekeeping removes its exact task identity
+   from futex, wait-set, endpoint-discovery, input, block, and exec-transition
+   registries and acknowledges that cleanup back to the scheduler.
+   Scheduler-aware locks use this same arm-before-publication transition and
+   remove a waiter after any unrelated wake. Housekeeping completes no more
+   than four retirement records and one deferred transfer release per turn;
+   provider replay and acknowledgement are separate one-millisecond
+   maintenance turns rather than a synchronous backlog drain.
+   IPC object handles additionally bind a slot generation. Endpoint teardown
+   removes the exact generation before scanning its message slots; message and
+   reply transitions follow the runtime-enforced
+   `endpoint -> message -> reply` lock-class order.
 10. **All elapsed-time decisions share one validated monotonic domain.**
     Calendar RTC state never owns timeouts. A delayed clockevent catches every
     absolute deadline at or before the current source time, and cancel, wake,
     or owner exit removes the exact timer owner.
+11. **Finite kernel objects are charged to the initiating owner.** Endpoint,
+    shared-backing, and task admission reserve owner quota before publication.
+    Endpoint/task exit returns quota at terminal removal; a dropped shared
+    region remains charged while its physical backing is deferred and returns
+    quota only after reclaim. Kernel/bootstrap reserves are not consumable by
+    an ordinary process.
 11. **Usercopy retains one process generation through validation and copy.**
     Copyin/copyout rejects kernel, noncanonical, wrapping, unmapped, and
     wrong-permission spans before dereference. Exec and exit serialize against
@@ -141,12 +159,14 @@ contracts.
 | `process-address-space-lifecycle` | generation retain → serialized exec/exit mutation or thread attach → frozen exit epoch → final reclaim | `kernel-ps` | committed mutation/attach, exit-race rejection, final reclaim |
 | `ipc-handle-transfer` | rights-checked export → atomic message batch → invisible receive reservation → all-or-nothing install | IPC runtime, compat, fd/open-description substrate | installed batch, export/capacity denial, timeout/peer/exec revoke |
 | `process-signal-lifecycle` | pending selection → mask/action/target recheck → handler/stop/kill or fault disposition | compat signal policy, `kernel-ps`, exception bridge | delivery, stale selection denial, recoverable fault, terminal exit |
-| `futex-wait-lifecycle` | exact task/key registration → scheduler arm → wake/requeue, deadline, or task exit cleanup | compat futex owner, `kernel-ps` | wake, timeout, exit cleanup |
+| `futex-wait-lifecycle` | exact task/key registration → scheduler arm → wake/requeue, deadline, or task exit cleanup → bounded robust-list/pending owner-death transition | compat futex owner, `kernel-ps`, executive cleanup | wake, timeout, owner-died wake, exit cleanup |
+| `kernel-resource-lifecycle` | owner quota reservation → allocation/publication → close/exit or deferred backing reclaim → exact quota return | IPC runtime, process table, display/DRM callers | admitted object/task, capacity rejection, immediate revoke, completed deferred reclaim |
 | `netd-deferred-reply-lifecycle` | global pending-slot reserve → bounded detach batch → exactly one terminal reply | `netd` | reply, capacity/queue failure, timeout |
 | `input-delivery-lifecycle` | authenticated DVM record → atomic ingestion-worker arm → bounded drain → unlocked bounded session-authority sync → readiness generation → authorized UI read | input transport, `inputd`, `netd`, wait-set, `uiserver` | delivered event, malformed record, authority/session reset, consumer-owner exit/rearm, provider timeout, transport revoke |
+| `ui-main-loop-wakeup` | service-owned generation check → recheck → atomic block/reschedule or coalesced notification → bounded deadline return | `uiserver`, `kernel-hal`, `kernel-ps` | input/Wayland wake, deadline wake, stale generation retry, terminal provider revoke |
 | `gpu-frame-lifecycle` | live primed provider → bounded scene/capability → address-free submit → acquire/completion/page-flip fences | `uiserver`, display substrate, Linux DVM | displayed frame, provider/scene denial, stale completion revoke, hard timeout |
 | `acpi-firmware-admission` | checksummed root SDT → atomic MCFG admission → exact HPET GAS admission or explicit legacy/no-HPET topology | `kernel-hal` | ECAM/HPET topology or explicit bounded fallback topology |
-| `scheduler-lifecycle` | runnable current task → exact arm → raced wake/cancel or committed block → wake/deadline/retirement | `kernel-ps`, `kernel-hal` | wake success, raced-wake cancel, bounded timeout, terminal retirement |
+| `scheduler-lifecycle` | runnable current task → exact arm → raced wake/cancel or atomic committed block/reschedule → wake/deadline → exact dispatch and waiter cleanup before timer acknowledgement → retirement | `kernel-ps`, `kernel-hal`, `kernel-compat` | wake success, raced-wake cancel, bounded timeout, retained recovery authority through resume cleanup, terminal retirement |
 | `scheduler-dispatch` | source-pinned class admission → optional reply-scoped donation/demotion → bounded System burst or overdue/latency User dispatch | `runtimed`, `kernel-ps` | User dispatch, donation completion/cancel/revoke, base-class demotion |
 | `monotonic-deadline-lifecycle` | validated invariant-TSC/HPET source → exact task/deadline arm → recheck/commit → clockevent/nondeadline wake, cancel, timeout, or retirement | `kernel-hal`, `kernel-ps` | source rejection, wake success, cancel, bounded timeout, owner exit |
 | `user-memory-access` | retain exact process generation → canonical checked range → readable/writable live page spans → complete copy or rejection | `kernel-ps`, `kernel-mm` | complete copy, range/page-access rejection, exec/exit revoke |

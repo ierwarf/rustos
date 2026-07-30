@@ -1,3 +1,18 @@
+//! Runtime-control socket admission and bounded command dispatch.
+//!
+//! - **Owner:** `runtimed` owns desktop/session control policy.
+//! - **Boundary:** Local socket peers, frame lengths, command payloads, and
+//!   claimed process identities are untrusted.
+//! - **Lifecycle:** Accept, obtain kernel peer credentials, authorize live
+//!   role, parse exact frame, dispatch, reply, and close/revoke on process exit.
+//! - **Concurrency:** Connection work is bounded; no global runtime-state lock
+//!   is held across blocking I/O or process-control IPC.
+//! - **Failure:** Partial/malformed frame, unauthorized peer, timeout, queue
+//!   pressure, command failure, and owner exit close without state confusion.
+//! - **Forbidden:** No path/name authorization, unbounded allocation, implicit
+//!   admin, ambiguous framing, or stale uiserver role.
+//! - **Evidence:** `runtime-control-ingress`.
+use std::collections::VecDeque;
 use std::ffi::CString;
 use std::io::{ErrorKind, Read, Write};
 use std::mem::size_of;
@@ -9,17 +24,44 @@ use runtime_control::RuntimeRunningProgram;
 use rustos_user_abi::syscall::IPC_SERVICE_UISERVER;
 
 use super::{
-    boot_line, LAUNCH_TARGET_NEW_SESSION, MAX_LAUNCH_RETRY_BACKOFF,
+    boot_line, LAUNCH_TARGET_NEW_SESSION, MAX_LAUNCH_RETRY_BACKOFF, MAX_PENDING_RUNTIME_CLIENTS,
     MAX_POLICY_LAUNCH_ATTEMPTS_PER_TICK, MAX_RUNTIME_CLIENTS_PER_TICK, MAX_RUNTIME_PROGRAMS,
     OP_NOTIFY_READY, OP_REQUEST_LAUNCH_PATH, OP_REQUEST_TERMINATE, OP_SNAPSHOT_RUNNING_PROGRAMS,
-    PROTOCOL_VERSION, READY_COMPONENT_UI_SERVER, RETRY_BACKOFF, STORAGE_NOT_READY_RETRY_BACKOFF,
-    TERMINATE_TARGET_PID, TERMINATE_TARGET_SESSION, UI_SERVER_EXEC_PATH,
+    PROTOCOL_VERSION, READY_COMPONENT_UI_SERVER, RETRY_BACKOFF, SERVICE_REQUEST_TIMEOUT,
+    STORAGE_NOT_READY_RETRY_BACKOFF, TERMINATE_TARGET_PID, TERMINATE_TARGET_SESSION,
+    UI_SERVER_EXEC_PATH,
 };
 use super::{BrokerState, LaunchEntry, RuntimeRequest, RuntimeResponse};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RuntimePeerCredentials {
     pid: i32,
+}
+
+struct PendingRuntimeClient {
+    stream: UnixStream,
+    peer: RuntimePeerCredentials,
+    request: RuntimeRequest,
+    bytes_read: usize,
+    deadline: Instant,
+}
+
+pub(super) struct RuntimeConnections {
+    pending: VecDeque<PendingRuntimeClient>,
+}
+
+impl Default for RuntimeConnections {
+    fn default() -> Self {
+        Self {
+            pending: VecDeque::with_capacity(MAX_PENDING_RUNTIME_CLIENTS),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RequestReadProgress {
+    Pending,
+    Complete,
 }
 
 pub(super) fn bind_listener(path: &str) -> Result<UnixListener, i32> {
@@ -98,23 +140,26 @@ fn bind_timing(stage: &str, started_at: Instant) {
     );
 }
 
-pub(super) fn service_listener(listener: &UnixListener, state: &mut BrokerState) -> bool {
-    let mut did_work = false;
+pub(super) fn service_listener(
+    listener: &UnixListener,
+    connections: &mut RuntimeConnections,
+    state: &mut BrokerState,
+) -> bool {
+    let mut did_work = service_pending_clients(connections, state);
     for _ in 0..MAX_RUNTIME_CLIENTS_PER_TICK {
+        if connections.pending.len() >= MAX_PENDING_RUNTIME_CLIENTS {
+            break;
+        }
         match accept_runtime_client(listener) {
-            Ok((mut stream, peer)) => {
+            Ok((stream, peer)) => {
                 did_work = true;
-                if let Err(err) = service_stream(&mut stream, peer, state) {
-                    let _ = super::util::write_response(
-                        &mut stream,
-                        RuntimeResponse {
-                            version: PROTOCOL_VERSION,
-                            op: 0,
-                            status: -err,
-                            count: 0,
-                        },
-                    );
-                }
+                connections.pending.push_back(PendingRuntimeClient {
+                    stream,
+                    peer,
+                    request: RuntimeRequest::default(),
+                    bytes_read: 0,
+                    deadline: Instant::now() + SERVICE_REQUEST_TIMEOUT,
+                });
                 if state.ui_ready && !state.launch_catalog_loaded {
                     break;
                 }
@@ -132,6 +177,66 @@ pub(super) fn service_listener(listener: &UnixListener, state: &mut BrokerState)
         }
     }
     did_work
+}
+
+fn service_pending_clients(connections: &mut RuntimeConnections, state: &mut BrokerState) -> bool {
+    let mut did_work = false;
+    let service_count = connections.pending.len().min(MAX_RUNTIME_CLIENTS_PER_TICK);
+    for _ in 0..service_count {
+        let Some(mut client) = connections.pending.pop_front() else {
+            break;
+        };
+        if Instant::now() >= client.deadline {
+            write_runtime_error(&mut client.stream, libc::ETIMEDOUT);
+            did_work = true;
+            continue;
+        }
+        match read_request_progress(&mut client) {
+            Ok(RequestReadProgress::Pending) => {
+                connections.pending.push_back(client);
+            }
+            Ok(RequestReadProgress::Complete) => {
+                did_work = true;
+                if let Err(err) =
+                    service_request(&mut client.stream, client.peer, client.request, state)
+                {
+                    write_runtime_error(&mut client.stream, err);
+                }
+            }
+            Err(err) => {
+                did_work = true;
+                write_runtime_error(&mut client.stream, err);
+            }
+        }
+    }
+    did_work
+}
+
+fn read_request_progress(client: &mut PendingRuntimeClient) -> Result<RequestReadProgress, i32> {
+    let request_bytes = super::util::as_bytes_mut(&mut client.request);
+    while client.bytes_read < request_bytes.len() {
+        match client.stream.read(&mut request_bytes[client.bytes_read..]) {
+            Ok(0) => return Err(libc::EPIPE),
+            Ok(read) => client.bytes_read += read,
+            Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                return Ok(RequestReadProgress::Pending);
+            }
+            Err(err) => return Err(super::util::io_errno(err)),
+        }
+    }
+    Ok(RequestReadProgress::Complete)
+}
+
+fn write_runtime_error(stream: &mut UnixStream, err: i32) {
+    let _ = super::util::write_response(
+        stream,
+        RuntimeResponse {
+            version: PROTOCOL_VERSION,
+            op: 0,
+            status: -err,
+            count: 0,
+        },
+    );
 }
 
 fn accept_runtime_client(
@@ -208,13 +313,12 @@ fn authorize_runtime_request(
     }
 }
 
-fn service_stream(
+fn service_request(
     stream: &mut UnixStream,
     peer: RuntimePeerCredentials,
+    request: RuntimeRequest,
     state: &mut BrokerState,
 ) -> Result<(), i32> {
-    let mut request = RuntimeRequest::default();
-    read_exact_retry(stream, super::util::as_bytes_mut(&mut request))?;
     if request.version != PROTOCOL_VERSION {
         return Err(libc::EPROTO);
     }
@@ -228,28 +332,6 @@ fn service_stream(
         OP_NOTIFY_READY => handle_ready(stream, state, request),
         _ => Err(libc::EINVAL),
     }
-}
-
-fn read_exact_retry(stream: &mut UnixStream, mut bytes: &mut [u8]) -> Result<(), i32> {
-    use super::SERVICE_REQUEST_TIMEOUT;
-    let deadline = Instant::now() + SERVICE_REQUEST_TIMEOUT;
-    while !bytes.is_empty() {
-        match stream.read(bytes) {
-            Ok(0) => return Err(libc::EPIPE),
-            Ok(read) => {
-                let remaining = bytes;
-                bytes = &mut remaining[read..];
-            }
-            Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                if Instant::now() >= deadline {
-                    return Err(libc::ETIMEDOUT);
-                }
-                std::thread::yield_now();
-            }
-            Err(err) => return Err(super::util::io_errno(err)),
-        }
-    }
-    Ok(())
 }
 
 fn handle_snapshot(stream: &mut UnixStream, state: &BrokerState) -> Result<(), i32> {
@@ -592,11 +674,61 @@ fn last_errno() -> i32 {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+    use std::time::Instant;
+
     use super::{
-        launch_retry_backoff, runtime_request_role_authorized, OP_NOTIFY_READY,
+        launch_retry_backoff, read_request_progress, runtime_request_role_authorized,
+        PendingRuntimeClient, RequestReadProgress, RuntimePeerCredentials, OP_NOTIFY_READY,
         OP_REQUEST_LAUNCH_PATH, OP_REQUEST_TERMINATE, OP_SNAPSHOT_RUNNING_PROGRAMS,
     };
-    use crate::{MAX_LAUNCH_RETRY_BACKOFF, RETRY_BACKOFF, STORAGE_NOT_READY_RETRY_BACKOFF};
+    use crate::{
+        RuntimeRequest, MAX_LAUNCH_RETRY_BACKOFF, RETRY_BACKOFF, SERVICE_REQUEST_TIMEOUT,
+        STORAGE_NOT_READY_RETRY_BACKOFF,
+    };
+
+    #[test]
+    fn partial_background_client_never_busy_waits_the_policy_loop() {
+        let (mut sender, receiver) = UnixStream::pair().expect("socket pair");
+        sender.set_nonblocking(true).expect("sender nonblocking");
+        receiver
+            .set_nonblocking(true)
+            .expect("receiver nonblocking");
+        let request = RuntimeRequest {
+            op: OP_SNAPSHOT_RUNNING_PROGRAMS,
+            ..RuntimeRequest::default()
+        };
+        let bytes = crate::util::as_bytes(&request);
+        let split = bytes.len() / 2;
+        sender
+            .write_all(&bytes[..split])
+            .expect("first request half");
+        let mut client = PendingRuntimeClient {
+            stream: receiver,
+            peer: RuntimePeerCredentials {
+                pid: std::process::id() as i32,
+            },
+            request: RuntimeRequest::default(),
+            bytes_read: 0,
+            deadline: Instant::now() + SERVICE_REQUEST_TIMEOUT,
+        };
+
+        assert_eq!(
+            read_request_progress(&mut client).expect("partial request"),
+            RequestReadProgress::Pending
+        );
+        assert_eq!(client.bytes_read, split);
+
+        sender
+            .write_all(&bytes[split..])
+            .expect("second request half");
+        assert_eq!(
+            read_request_progress(&mut client).expect("complete request"),
+            RequestReadProgress::Complete
+        );
+        assert_eq!(client.request.op, OP_SNAPSHOT_RUNNING_PROGRAMS);
+    }
 
     #[test]
     fn runtime_control_mutations_require_live_uiserver_or_logical_admin() {

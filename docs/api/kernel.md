@@ -17,7 +17,7 @@ API modules over reaching into private subsystem modules.
 | `kernel-hal` | `kernel/hal/src/api.rs` | GDT/IDT/ACPI/PIC/RTC/SIMD setup, interrupt hooks, CPU helpers. |
 | `kernel-mm` | `kernel/mm/src/api.rs` | heap, paging, physical frames, higher-half address helpers. |
 | `kernel-object` | `kernel/object/src/api.rs` | typed object/handle/session rights shared by kernel subsystems. |
-| `kernel-ipc-runtime` | `kernel/ipc-runtime/src/api.rs` | kernel shared region creation, mapping, frame export. |
+| `kernel-ipc-runtime` | `kernel/ipc-runtime/src/api.rs` | kernel shared region creation, descriptor/mapping lifetime, mapping, frame export. |
 | `kernel-ps` | `kernel/ps/src/api.rs` | scheduler, process/thread state, user task lifecycle, waits, snapshots. |
 | `kernel-io-manager` | `kernel/io-manager/src/api.rs` | block, boot volume, console, device, tty, input, USB, VFS, drivers. |
 | `kernel-compat` | `kernel/compat/src/api.rs` | Linux/Windows compatibility syscall and console host API. |
@@ -142,7 +142,7 @@ kernel crate에서 private subsystem module을 직접 참조하기보다 이 API
 | `kernel-hal` | `kernel/hal/src/api.rs` | GDT/IDT/ACPI/PIC/RTC/SIMD setup, interrupt hook, CPU helper |
 | `kernel-mm` | `kernel/mm/src/api.rs` | heap, paging, physical frame, higher-half address helper |
 | `kernel-object` | `kernel/object/src/api.rs` | kernel subsystem이 공유하는 typed object/handle/session rights |
-| `kernel-ipc-runtime` | `kernel/ipc-runtime/src/api.rs` | kernel shared region 생성, mapping, frame export |
+| `kernel-ipc-runtime` | `kernel/ipc-runtime/src/api.rs` | kernel shared region 생성, descriptor/mapping 수명주기, mapping, frame export |
 | `kernel-ps` | `kernel/ps/src/api.rs` | scheduler, process/thread state, user task lifecycle, wait, snapshot |
 | `kernel-io-manager` | `kernel/io-manager/src/api.rs` | block, boot volume, console, device, tty, input, USB, VFS, driver |
 | `kernel-compat` | `kernel/compat/src/api.rs` | Linux/Windows compatibility syscall과 console host API |

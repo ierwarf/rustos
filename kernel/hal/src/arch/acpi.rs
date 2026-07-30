@@ -1,3 +1,17 @@
+//! Bounded ACPI topology admission for kernel hardware discovery.
+//!
+//! - **Owner:** `kernel-hal` owns checksummed firmware-table decoding.
+//! - **Boundary:** Firmware addresses, lengths, signatures, and resource
+//!   descriptors are untrusted until complete-table admission succeeds.
+//! - **Lifecycle:** Tables are staged, validated atomically, then published as
+//!   immutable topology; partial tables never mutate live state.
+//! - **Concurrency:** Admission is boot-serialized on the BSP.
+//! - **Failure:** Malformed optional topology is rejected with an explicit
+//!   bounded fallback only where the architecture contract permits it.
+//! - **Forbidden:** No unchecked firmware pointer, partial MCFG publication,
+//!   or fabricated timer topology.
+//! - **Evidence:** `acpi-firmware-admission` and
+//!   `monotonic-deadline-lifecycle`.
 use boot_protocol::BootInfo;
 use spin::Mutex;
 

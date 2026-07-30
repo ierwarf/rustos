@@ -652,7 +652,7 @@ fn map_elf_zeroed_segment(
         SYS_RUSTOS_PROC_MAP_ZEROED_BROKER,
         (&args as *const RustosProcMapZeroedBrokerArgs) as u64,
     );
-    (status >= 0).then_some(()).ok_or((-status) as i32)
+    syscall_unit_result(status)
 }
 
 fn proc_map_flags(elf_flags: u32) -> u64 {

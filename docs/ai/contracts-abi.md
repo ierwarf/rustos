@@ -32,6 +32,10 @@ Cross-owner composition is indexed by `system-flows.md` and
   interpreting its next request and owns credential/MM-policy cleanup. Neither
   service calls the other or rootd during the drain, so queued recovery evidence
   cannot close a `rootd -> loaderd -> procd -> rootd` authorization cycle.
+- Each fan-out queue is fixed-capacity and allocation-free under its tracked
+  spin lock. Drain output reserves caller capacity before locking, copies only
+  the claimed prefix, and removes that prefix only after successful copyout;
+  producer appends during copyout therefore survive the transaction.
 - Every lifecycle drain requires the exact current ABI version and zero reserved
   fields. Rootd overflow is sticky and terminal. Procd/syscalld overflow rebases
   only the affected private queue after its owner clears all cached per-process
@@ -62,6 +66,24 @@ application semantics can legitimately wait; endpoint lookup, authorization,
 ioctl routing, readiness, close/dup/exec maintenance, and frame submission are
 not bulk data. The class is explicit at every kernel call site, and
 `formal/run-source-conformance.sh` rejects a broken limit ordering.
+
+Linux futex WAIT/WAKE/REQUEUE operations are scheduler substrate, including
+their fixed opcode and flag envelope validation. They must validate locally,
+snapshot task/MM identity from scheduler-local state, and avoid allocation,
+the process-state lock, and synchronous policy-service calls before waiter and
+deadline registration. This keeps ordinary userspace mutexes independent of
+unrelated same-process state mutations, syscalld scheduling, restart, and IPC
+timeout and closes the pre-registration unpark race. Syscalld may own
+process-level ABI admission or versioned policy leases, but operation 66 is
+retired and no per-futex policy RPC exists.
+
+Linux `clock_gettime`, `nanosleep`, and `clock_nanosleep` use the same local
+timer-substrate rule. Their supported clock IDs, flags, and timespec envelope
+are fixed ABI validation, not mutable per-call policy. Operations 51 through
+53 are retired; the hot path must not acquire process state or call syscalld
+before arming a finite deadline. A future mutable time policy must be admitted
+once through an immutable scheduler-local lease, never through each clock read
+or sleep.
 
 Endpoints registered via `SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT`, looked up by stable `IPC_SERVICE_*` id. Registering endpoint `0` revokes; later lookups fail closed.
 Before final endpoint cleanup, a terminating process is marked exiting. Endpoint
@@ -575,6 +597,19 @@ policy remains with the owning service.
   removes that task's waiter/caller state. Do not weaken this to globally
   guessable endpoint or reply IDs, and do not regress service worker threads
   such as `uiserver-display-policy` to creator-task-only ownership.
+- Endpoint creation reserves its fixed owner ledger before queue allocation or
+  slab publication. A process owns at most 32 endpoints, a task-owned substrate
+  endpoint owner at most 8, and 64 of the 512 global endpoint slots remain
+  unavailable to process/task owners. Allocation or publication failure returns
+  the exact reservation; process exit returns it only after the owned endpoint
+  has been removed and its waiters have been settled.
+- Shared-region admission is charged to the creating process through display
+  and DRM surface creation. One object is at most 256 MiB, global admitted bytes
+  are at most 512 MiB, and one process owns at most 64 objects and 128 MiB.
+  Handle close transfers the object to deferred backing reclaim without
+  returning object or byte quota. Only completed physical reclaim returns that
+  charge. The process table separately caps one process at 32 attached tasks,
+  so a single subject cannot consume all 256 scheduler slots.
 - Public `SYS_RUSTOS_IPC_CALL` and handle-transfer call syscalls keep blocking
   Send/Receive/Reply semantics. Do not add a public timeout ABI for generic
   Linux ELF or Windows PE callers.
@@ -638,6 +673,13 @@ policy remains with the owning service.
   successful replay enqueues that idempotent ACK for a later bounded turn.
   Queue order and operation IDs retain recovery correctness while foreground
   I/O has a fixed maintenance tax.
+- Deferred netd reference reconciliation follows the same one-attempt,
+  one-millisecond maintenance quantum. A foreground dup/close divides one
+  16 ms total operation deadline across its retries and always defers the
+  acknowledgement; operation replay and acknowledgement are separate turns.
+  Eight-entry operation-plus-ack bursts and three independent 16 ms retries
+  are forbidden because their cumulative wait is not bounded by the caller's
+  advertised deadline.
 - Performance diagnostics are bounded evidence: early-call samples and
   threshold crossings only. They may not print per request, hold a policy
   lock, allocate an unbounded record, or become a prerequisite for forward
@@ -727,6 +769,26 @@ policy remains with the owning service.
   apply their temporary signal mask, reject a non-native sigset size, and
   return `EINTR` for a pending unmasked signal; SIGKILL/SIGSTOP can never be
   added to the temporary mask.
+- User-task retirement is a two-phase runtime boundary. The scheduler first
+  revokes runnable, deadline, and IPC authority, stamps the exact task/process
+  identity plus whether this was the process's last live thread, and keeps the
+  slot unreapable. Executive housekeeping then removes every task-scoped
+  futex, wait-set, service-discovery, input, block, bootstrap-TTY, and proc
+  broker record; terminal-process cleanup also closes provider references and
+  revokes service publications. Only an exact cleanup acknowledgement permits
+  slot reuse. A wait-lock unlock skips retired queue heads until it wakes one
+  live task, so a stale identity cannot consume the only wakeup.
+  A hardware-IRQ context validator may only quarantine the fixed task slot and
+  record one allocation-free deferred reason. It must not scan the live
+  current kernel frame as if it were a published runnable frame, nor enter
+  IPC/process teardown from the IRQ. Housekeeping finalizes that quarantine
+  through the same retirement boundary before reaping.
+  Service-publication wait admission is task-scoped and its capacity derives
+  from the scheduler task ceiling, not the smaller process-table ceiling. Its
+  registry is a fixed allocation-free table: one task rearm replaces its exact
+  slot, matching task IDs are extracted under the lock, and wake/hint calls run
+  only after unlock. The native input wait substrate uses the same ceiling; the separate inputd
+  ingestion waiter never competes with application slots.
 - A vfsd epoll membership key is `target_fd + provider + open-description
   object_id`. The provider endpoint epoch is record state, never part of that
   identity: after restart, duplicate `ADD` remains `EEXIST`, `MOD`
@@ -1224,9 +1286,14 @@ policy remains with the owning service.
   reference before publication; successful installation adopts it, while
   cancellation or rejection moves it to the process substrate's bounded
   deferred-drop queue. That queue shares the 1,024-entry admission ceiling
-  with live transfers, and housekeeping releases at most 32 entries per turn
-  through bounded provider cleanup, so task retirement neither waits without a
-  bound nor silently drops locally queued cleanup.
+  with live transfers, reserves that complete capacity before its spin lock is
+  published, and preallocates drain output before locking. Task exit therefore
+  cannot enter the allocator while holding the global deferred-drop lock.
+  Housekeeping releases at most one entry per turn through bounded provider
+  cleanup. Executive retirement likewise completes at most four exact cleanup
+  records per turn. Individually bounded provider calls therefore cannot
+  concatenate into an unbounded scheduler stall, while unacknowledged cleanup
+  remains scheduler-owned and unreapable.
   Every remaining provider-side reference mutation carries a kernel-minted
   128-bit operation ID. Netd reserves a bounded replay slot before applying a
   mutation, replays the exact result, rejects operation-ID aliases, and retains
@@ -1276,16 +1343,12 @@ policy remains with the owning service.
   recreate service state or turn a HUP token live again.
   Console liveness counts only descriptor-table ownership: temporary syscall
   snapshots do not postpone the final-close purge or suppress its waiter wake.
-- The latest bounded 30-second QEMU witness predates the current entropy,
-  checkpoint, and transactional-FD changes. It reached initd and repeatedly
-  delivered the expected no-input-device child exits without a
-  rootd/loaderd/procd authorization cycle, panic, or stalled lifecycle drain,
-  but it must not be cited as runtime evidence for this change set. A newly
-  signed image and current-source boot/crash-injection capture remain required.
-  The repository KVM launcher also passes its dry-run contract checks, while
-  the physical live-KVM gate remains separately unclaimed because host
-  admission correctly rejects the available NVIDIA render node. See
-  `physical-gpu-status.md` for that evidence boundary.
+- The current signed-image parallel KVM witness passed the five-second runtime
+  terminal plus three consecutive WayClick callback, uiserver
+  input/presentation, and DVM atomic-page-flip windows above 55 FPS. The
+  accepted windows had no input drop, slow, error, or backlog. This is
+  current-source virtio/DVM acceptance; physical-GPU admission remains a
+  separate hardware evidence boundary documented in `physical-gpu-status.md`.
 - KVM latency evidence records input arrival at uiserver queue consumption,
   before a GPU backpressure retry may leave the turn. The previous end-of-turn
   sample counted consumed input and cursor motion but skipped their timestamp
@@ -1318,6 +1381,10 @@ policy remains with the owning service.
   bytes; Enter/backspace/arrows use `KeyCode`.
 - Kernel TTY substrate remains a bootstrap/user-copy fallback only. Do not add
   new canonical editing or focus policy to ring0.
+- The bootstrap TTY substrate uses the ABI's fixed
+  `MAX_CONSOLE_SESSIONS` table. A non-system handle whose slot is outside that
+  table is rejected without allocation, waiter publication, or fallback to the
+  system console; raw handle bits may never resize ring0 state.
 
 ## Device Surface (`devmgrd`)
 
@@ -1341,6 +1408,10 @@ policy remains with the owning service.
 - `SYS_RUSTOS_SPAWN_EXEC` restricted to `rootd` spawning the fixed bootstrap allowlist (`syscalld`, `vfsd`, `loaderd`, `procd`, `initd`). Fails closed for `initd`, generic apps, broad service restarts. rootd may use direct spawn only during fixed bootstrap + `loaderd` recovery; post-bootstrap restarts of other leases must call loaderd.
 - Linux `execve` → `procd` (target auth) → `loaderd` (image materialization). If loader materialization fails, procd must cancel the exec ticket via `SYS_RUSTOS_PROC_CANCEL_EXEC_BROKER` before replying.
 - An exec ticket binds one live, non-exiting Linux `(target_pid, target_tid)` pair. Cancel and exec-target validate that exact stored pair before consuming the ticket; a mismatched request must leave it live. The successful exec-target path publishes its register handoff before replacing the target image. Normal/signal process exit, a non-final target-thread exit, and sibling retirement caused by Linux exec remove stale ticket or handoff state.
+  Exec detaches retired siblings from the process thread count immediately but
+  keeps each scheduler slot quarantined with its exact runtime-cleanup stamp;
+  it must never clear and reuse a sibling slot while futex, wait-set, or broker
+  records can still name that thread.
 - `loaderd` must attempt `ABORT_BROKER` after every rejected commit/exec-target call. Commit is normally terminal, but this closes early rejection paths (such as an already-pending target handoff) before they can retain a bounded prepare slot.
 - **Do not move** executable-format, import/export, or DLL namespace policy back into the kernel.
 
@@ -1514,9 +1585,9 @@ does not satisfy the 55 FPS gate.
 
 ## Process Policy Surface (`procd`)
 
-procd owns Linux `execve`, `fork`/`clone`, `wait4`, `rt_sigaction`, `rt_sigprocmask`, `sigaltstack`, `tgkill`, signal selection.
+procd owns Linux `execve`, `fork`/`clone`, `wait4`, `rt_sigaction`, `rt_sigprocmask`, `sigaltstack`, `tgkill`, signal selection. Procd IPC ABI v3 has a distinct default-stop disposition and an exact coalesced SIGCHLD cause snapshot; ring0 rejects a stop signal mapped to termination, a non-stop signal mapped to stop, and every stale or out-of-mask cause selection.
 
-`wait4` routes through procd for ownership validation; kernel still performs narrow process-table wait + status/rusage copyout.
+`wait4` routes through procd for ownership validation; kernel still performs narrow process-table wait + status/rusage copyout. `WUNTRACED` consumes one exact `(signal << 8) | 0x7f` child stop state and `WCONTINUED` consumes `0xffff`; without the matching option the state remains pending. A default stop gates every Linux task in the process while preserving its ready/block state. SIGCONT resumes all of them before its own disposition or mask is considered, and SIGKILL also removes the stop gate before termination delivery. Stop, continue, and exit queue process-directed SIGCHLD with exact coalesced cause bits. A receiving thread transfers those causes to a live sibling before retirement. Procd applies `SA_NOCLDSTOP` only when no exit cause coalesced, while ring0 revalidates and removes only the selected snapshot so a cause queued during the policy round trip remains pending.
 
 Kernel keeps only: user-copy, address-space replacement, scheduler mutation, pending-signal wakeup, Linux x86_64 `rt_sigframe`/`rt_sigreturn`.
 
@@ -1538,10 +1609,25 @@ Kernel keeps only: user-copy, address-space replacement, scheduler mutation, pen
   must not return `ENOSYS` or spin in libc retry loops. Any waiter table read by
   an IRQ handler must be mutated from process context with interrupts excluded
   while its spin lock is held.
+- Linux `set_robust_list` accepts only the native 24-byte robust-list head and
+  stores it in the exact thread state that retirement snapshots. Ordinary,
+  fault, forced, and exec-sibling retirement all run the same bounded cleanup:
+  signed futex offsets and user ranges are checked, at most 2048 entries plus
+  `list_op_pending` are examined, PI-tagged entries remain explicitly
+  unsupported, a word changes only while its TID bits still name the retiring
+  thread, `FUTEX_WAITERS` is preserved, `FUTEX_OWNER_DIED` is installed, and
+  one matching waiter is woken. This user-word transition is serialized by the
+  current BSP topology. AP enablement is forbidden until address-space-aware
+  atomic user-u32 compare-exchange replaces the BSP read/write sequence.
 - `exit_group` and default fatal-signal termination retire every thread in the
-  process and fail every thread-owned IPC wait/endpoint before the current
-  thread halts. Never revoke process service endpoints while sibling threads
-  remain runnable.
+  target process only after publishing the process-exiting state. New thread
+  attachment and process-scoped authority admission must reject that state;
+  teardown may then retire siblings and complete the exact deferred runtime
+  cleanup without a publication window. It must fail every thread-owned IPC
+  wait and endpoint before the current thread halts. Never revoke process
+  service endpoints while sibling threads remain runnable. A targeted
+  task termination marks the process exiting only when that task is its last
+  live thread; non-final thread termination must preserve process authority.
 - uiserver opens input nonblocking and waits through bounded `poll`; RustOS must
   not replace readiness with unconditional success followed by high-rate inputd
   reads.
@@ -1602,11 +1688,19 @@ do not admit a service, a module-loading path, or a future ABI reuse.
 - Built-in framebuffer registration accepts only the DVM primary-provider flag;
   do not infer ownership from geometry or `display_info()` presence.
 - Surface present = kernel fast path: copies validated shared-surface contents into active framebuffer + queues provider flush for bounded housekeeping. **Do not reintroduce synchronous virtio-gpu command waits into app syscall context** for normal uiserver presents.
+- Display ioctl is an explicit two-phase transaction: provider discovery,
+  aperture mapping, and any wait-capable setup run before acquiring process
+  descriptor state; the commit phase reacquires and revalidates the exact fd,
+  handle generation, request, and cache-only provider snapshot. No implicit
+  transport discovery or mapping is permitted below that process-state lock.
 - The KVM virtio-gpu path is Linux DVM DRM/KMS over the fixed display aperture.
   RustOS has no in-kernel virtio-gpu `.ko` path and must not regain a second
   display provider.
 - If the DVM provider is unavailable, normal presentation fails closed. It
-  must not synthesize a boot-framebuffer or direct-GPU fallback.
+  must not synthesize a boot-framebuffer or direct-GPU fallback. During boot,
+  `uiserver` treats only `EAGAIN`/`ENODEV` from display-info lookup as transient
+  provider-publication ordering and retries within the 1 s product-boot
+  deadline; every other error is terminal and deadline expiry remains fatal.
 - A DVM-backed physical scanout is usable for normal desktop rendering but is
   not a trusted-attention display. The trusted-UI status endpoint fails closed
   until an independently attested scanout and input path are deployed; drawing
@@ -1653,7 +1747,81 @@ do not admit a service, a module-loading path, or a future ABI reuse.
   still-unconsumed deferred-spawn `(target_pid, reporter_pid)` binding before
   publishing the lease. Capability registration then independently requires
   the reported PID to own its endpoint; reporter exit revokes descendants.
-- `KernelSpinLock` must not be held across disk/filesystem/IPC/framebuffer-copy loops. Use `KernelWaitLock` or split the section; add `cond_resched` in long loops.
+- A tracked spin lock must not be held across
+  disk/filesystem/IPC/framebuffer-copy loops. Use `KernelWaitLock` or split the
+  section; add `cond_resched` in long loops. Do not introduce subsystem-local
+  raw-spin diagnostics in place of the shared lock-class graph.
+- `KernelWaitLock` contention uses the scheduler's exact
+  arm-publish-recheck-commit protocol. Publishing a waiter before an ordinary
+  `block_current_task` is invalid on SMP: an unlock on another CPU can consume
+  the only wake before the waiter becomes blocked. A racing or unrelated wake
+  cancels the arm and removes the queue entry idempotently. The legacy direct
+  `block_current_task` / `block_current_user_task` entry points are removed;
+  bootstrap TTY and every other wait must use the same exact arm/commit
+  lifecycle.
+- The currently enabled RustOS topology is BSP-only: QEMU supplies one RustOS
+  vCPU, the scheduler and syscall-local state have one global instance, and
+  there is no AP bring-up, CPU-online state machine, per-CPU run queue, or
+  scheduling IPI protocol. APIC-ID-indexed lock diagnostics and SMP-safe wait
+  wording are forward contracts, not evidence that SMP is implemented.
+  `RUSTOS_SMP_READINESS` in the KVM launcher rejects a RustOS vCPU count above
+  one until those properties plus TLB shootdown and translated atomic robust
+  futex cleanup are all declared complete.
+- Process-broker registries are fixed-capacity and allocation-free while
+  locked. A prepare reserves its mapping-pointer capacity before publication;
+  file/data/zero mappings are constructed before acquisition. Removing a
+  prepare transfers it out of the registry before destroying pinned backing or
+  heap state. Deferred VFS/netd queues advertise only their public capacity and
+  retain one inaccessible slot for a concurrently popped item's exact retry,
+  preventing both capacity off-by-one failure and retry loss.
+- MMIO mapping publication, direct-map cache-mode override, reference update,
+  and final unmap are serialized by one scheduler-aware transaction lock.
+  Allocation and page-table range updates never run under the former raw
+  spinlock plus whole-transaction IRQ exclusion; direct-map override entries
+  remain physical-address ordered and reference increments cannot wrap.
+- Kernel IPC endpoint, message, reply, and shared-region registries are
+  independent fixed-capacity generational slabs. Handles encode a nonzero
+  generation and slot index; removal advances the generation and permanently
+  retires a slot rather than permitting ABA reuse after generation exhaustion.
+  Endpoint queues reserve their complete admitted capacity before publication,
+  and request/reply byte and handle storage is prepared with fallible reserve
+  before an object slot lock is taken. Failed publication keeps ownership of
+  that storage outside the slot guards so destruction cannot enter allocator
+  metadata from the critical section. Ring0 retirement cancels each task-owned
+  call separately and transfers its already-owned descriptor vector directly
+  to the deferred-drop owner; it never builds an aggregate vector under IRQ
+  exclusion. Slab slots are cache-line aligned so independent reply or region
+  locks do not share their lock word.
+- A display surface owns one shared-region descriptor reference. `dup`,
+  descriptor transfer, and `fork` acquire distinct references; close, exec, and
+  process teardown release them. Every successful VMA mapping owns a separate
+  mapping hold, so closing the last descriptor cannot invalidate mapped pages.
+  Partial unmap splits that hold with the surviving VMA pieces, and the last
+  descriptor-or-mapping release removes the generational object and transfers
+  its backing to a fixed-capacity reclaim queue. Housekeeping returns at most
+  64 pages per turn; admission counts live plus queued objects, so delayed
+  reclamation cannot overrun the queue or permit unbounded region creation.
+  Failed slab publication and failed descriptor installation enter the same
+  owned reclaim path.
+- IPC slot locks have explicit runtime classes ordered
+  `endpoint -> message -> reply`; region locks are independent leaves.
+  `nucleus-core` records observed per-CPU class dependencies without
+  allocation, rejects recursive acquisition and inverse dependency cycles,
+  requires strict LIFO release, and bounds both IRQ-off and IRQ-on spinning.
+  IDT interrupt entry additionally marks IRQ context before any tracked lock:
+  a class first observed from IRQ context becomes IRQ-safe, a class first
+  acquired in ordinary interrupt-enabled context becomes IRQ-unsafe, and the
+  same class or a dependency path may not cross from IRQ-safe to IRQ-unsafe.
+  `KernelWaitLock` classes share the same dependency graph through a
+  fixed-capacity task-identity stack that survives a scheduler handoff.
+  Inverse sleepable ordering is rejected. Blocking sleepable acquisition under
+  raw state remains forbidden; a bounded raw leaf under sleepable ownership is
+  learned as an ordinary dependency and rejected if it closes a cycle.
+  Successful fail-fast external try-locks are tracked as raw leaves and cannot
+  become a hidden blocking path.
+  Lock-class stack mutation plus physical unlock is interrupt-atomic and an
+  APIC ID outside the tracked CPU capacity is a direct diagnostic, never an
+  aliased CPU slot.
 - Boot service order separates UI-core liveness from mutable-volume readiness.
   `runtimed` waits on the foundation, `netd`, `devmgrd`, and `inputd`; it does
   not wait for `storaged`, because its signed early-system closure contains the

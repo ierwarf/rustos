@@ -62,6 +62,7 @@ impl DvmControlContract {
 #[derive(Debug)]
 struct KvmLayout {
     run_dir: PathBuf,
+    guest_cid: u32,
     runtime_disk: PathBuf,
     debugcon_log: PathBuf,
     rustos_serial_log: PathBuf,
@@ -98,9 +99,70 @@ struct SmokeOptions {
     physical_gpu_firmware: Option<PathBuf>,
     min_ui_fps: Option<u32>,
     ui_proof_windows: usize,
+    recovery_probe: RecoveryProbe,
     timeout: Duration,
     expected_markers: Vec<String>,
     expected_dvm_markers: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum RecoveryProbe {
+    #[default]
+    None,
+    DvmRestart,
+    RustosReboot,
+    All,
+}
+
+impl RecoveryProbe {
+    const fn includes_dvm_restart(self) -> bool {
+        matches!(self, Self::DvmRestart | Self::All)
+    }
+
+    const fn includes_rustos_reboot(self) -> bool {
+        matches!(self, Self::RustosReboot | Self::All)
+    }
+}
+
+#[derive(Debug)]
+struct KvmLaunchLock {
+    _file: std::fs::File,
+}
+
+fn acquire_kvm_launch_lock(run_dir: &Path) -> Result<KvmLaunchLock> {
+    fs::create_dir_all(run_dir)?;
+    fs::set_permissions(run_dir, std::fs::Permissions::from_mode(0o700))?;
+    let path = run_dir.join("launch.lock");
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("open KVM launch lock {}", path.display()))?;
+    fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result != 0 {
+        let error = std::io::Error::last_os_error();
+        if matches!(
+            error.raw_os_error(),
+            Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN
+        ) {
+            bail!(
+                "another RustOS KVM launch owns {}; close it before starting F5 or kvm-smoke",
+                path.display()
+            );
+        }
+        return Err(error).with_context(|| format!("lock KVM launch {}", path.display()));
+    }
+    file.set_len(0)?;
+    writeln!(file, "pid={}", std::process::id())?;
+    file.sync_data()?;
+    Ok(KvmLaunchLock { _file: file })
+}
+
+fn guest_cid_for_process(pid: u32) -> u32 {
+    MIN_DVM_GUEST_CID + pid % (u32::MAX - MIN_DVM_GUEST_CID)
 }
 
 pub(crate) fn build_dvm_command(config: &Config) -> Result<()> {
@@ -141,6 +203,7 @@ where
         return Ok(());
     }
     let options = parse_smoke_options(args.into_iter())?;
+    let _launch_lock = acquire_kvm_launch_lock(&config.build_dir.join("kvm"))?;
     validate_storage_fault_expectation(
         config.project.fault_injection.enabled,
         &config.project.fault_injection.rules,
@@ -171,6 +234,7 @@ where
     let control_relay = start_dvm_input_relay(
         config,
         options.timeout,
+        layout.guest_cid,
         layout.dvm_input_doorbell.clone(),
         layout.dvm_input_ring.clone(),
         layout.dvm_control_secret.clone(),
@@ -195,7 +259,7 @@ where
         display_doorbell.as_ref(),
         block_doorbell.as_ref(),
         &input_doorbell,
-        input_relay_gate,
+        Arc::clone(&input_relay_gate),
     )?;
     // `--timeout` is the readiness budget promised by the CLI, not a budget
     // for host-side doorbell setup, render-node admission, or process
@@ -215,7 +279,20 @@ where
         if options.dvm_block_shmem {
             verify_dvm_block_ready(&layout)?;
         }
-        Ok(probe)
+        RecoveryHarness {
+            qemu: &qemu,
+            config,
+            artifacts: &artifacts,
+            layout: &layout,
+            options: &options,
+            guest_display,
+            host_render_node: host_render_node.as_deref(),
+            input_doorbell: &input_doorbell,
+            display_doorbell: display_doorbell.as_ref(),
+            block_doorbell: block_doorbell.as_ref(),
+            input_relay_gate: Arc::clone(&input_relay_gate),
+        }
+        .run(&mut rustos, &mut dvm, probe)
     })();
     stop_guest(&mut rustos);
     stop_guest(&mut dvm);
@@ -306,6 +383,7 @@ fn select_smoke_guest_display(options: &SmokeOptions, host_has_gui: bool) -> Res
 /// when the session closes; a slow but progressing debug boot is not killed by
 /// an arbitrary startup deadline.
 pub(crate) fn kvm_run_command(config: &Config, build_image: bool) -> Result<()> {
+    let _launch_lock = acquire_kvm_launch_lock(&config.build_dir.join("kvm"))?;
     if build_image {
         crate::build::build(config, false)?;
     }
@@ -327,6 +405,7 @@ pub(crate) fn kvm_run_command(config: &Config, build_image: bool) -> Result<()> 
         physical_gpu_firmware: None,
         min_ui_fps: None,
         ui_proof_windows: DEFAULT_UI_FPS_ACTIVE_WINDOWS,
+        recovery_probe: RecoveryProbe::None,
         timeout: Duration::ZERO,
         expected_markers: vec![
             RUSTOS_GPU_ACTIVE_MARKER.to_owned(),
@@ -350,6 +429,7 @@ pub(crate) fn kvm_run_command(config: &Config, build_image: bool) -> Result<()> 
     let input_relay_gate = Arc::new(AtomicBool::new(false));
     start_dvm_input_relay_unbounded(
         config,
+        layout.guest_cid,
         layout.dvm_input_doorbell.clone(),
         layout.dvm_input_ring.clone(),
         layout.dvm_control_secret.clone(),
@@ -498,74 +578,6 @@ fn log_kvm_start_phase(phase: &str, started_at: Instant) {
     );
 }
 
-pub(crate) fn print_kvm_smoke_help() {
-    println!(
-        "\
-usage: cargo xtask kvm-smoke [options]
-
-Boots the Linux DVM and RustOS concurrently with QEMU/KVM. This verifies the
-host-authenticated Linux-DVM input relay endpoint and RustOS's dedicated
-framed virtual input transport. It does not synthesize QMP input.
-
-options:
-  --timeout <seconds>  wait for readiness markers (1..={MAX_SMOKE_TIMEOUT}, default 30)
-  --expect <marker>    require an additional RustOS debugcon marker (repeatable)
-  --expect-dvm <marker>
-                       require an additional Linux-DVM serial marker (repeatable)
-  --exercise-input     run the DVM's bounded evdev loopback self-test and require
-                       RustOS inputd keyboard and pointer ingress markers
-  --exercise-network   run netprobe through netd and the DVM Ethernet ring;
-                       requires --gui-dvm-surfaces and --dvm-network-shmem
-  --min-ui-fps <fps>   enable the private KVM-only UI profiler and bounded DVM
-                       uinput/evdev load, then require three high-volume input
-                       windows, WayClick commit/frame-callback windows, and three
-                       accepted DVM atomic-page-flip relay samples at or above
-                       this integer FPS; virtual display proof uses QEMU GTK,
-                       while --physical-gpu observes the physical KMS path
-  --ui-proof-windows <count>
-                       require 3..={MAX_UI_FPS_ACTIVE_WINDOWS} consecutive one-second UI/input
-                       and DVM relay samples (default {DEFAULT_UI_FPS_ACTIVE_WINDOWS}); requires
-                       --min-ui-fps and supports bounded active soak proofs
-  --gui-dvm-surfaces   enable the V3 GUI-DVM control/pixel backing and private
-                       three-slot GPU atlas transport; no standalone legacy
-                       surface renderer or native-GPU path is accepted
-  --dvm-network-shmem  attach the bounded RustOS↔DVM Ethernet ring; RustOS keeps
-                       no native virtio-net device in this topology
-  --dvm-block-shmem    attach a private virtual NVMe namespace only to Linux
-                       DVM and the fixed RustOS↔DVM block ring; RustOS receives
-                       no native storage controller
-  --storage-dvm-only   run the independent storage-DVM acceptance gate: enable
-                       --dvm-block-shmem and require boot, both block peers,
-                       first completion, and E2E flush without depending on UI,
-                       input, network, or GPU readiness markers
-  --storage-dvm-expect-flush-fault
-                       with --storage-dvm-only and exactly block.flush=fail,
-                       require a pre-publication DeviceFault and reject any E2E
-                       flush-success marker
-  --physical-gpu <BDF> non-commercial lab mode: attach one already-bound GPU
-                       from the sealed physical-GPU profile registry through
-                       IOMMUFD instead of virtio-GPU; never binds, unbinds, or
-                       resets the device
-  --gpu-firmware <path>
-                       profile-specific owner-private firmware table. The
-                       currently certified AMD profile requires a relocated
-                       VFCT produced by rustos-hostd prepare-amd-vfct
-  --physical-amdgpu <BDF>, --amd-vfct <path>
-                       compatibility aliases for the current AMD profile
-  --dry-run            validate inputs and prepare KVM log paths without launching QEMU
-  -h, --help           show this help
-
-The default proof requires RustOS to reach init handoff and the L0-style host
-broker to complete an authenticated Linux-DVM health/inventory/input-stream
-handshake. A real key requires a physical input source assigned to the DVM;
-the default smoke command does not fabricate one. `--exercise-input` is an
-explicit KVM-only self-test: its Linux agent writes a bounded uinput device,
-then consumes it through its ordinary evdev relay. It never opens QMP or a
-host-to-DVM input injection endpoint.
-"
-    );
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GuestDisplay {
     Headless,
@@ -685,6 +697,7 @@ where
         physical_gpu_firmware: None,
         min_ui_fps: None,
         ui_proof_windows: DEFAULT_UI_FPS_ACTIVE_WINDOWS,
+        recovery_probe: RecoveryProbe::None,
         timeout: Duration::from_secs(MAX_SMOKE_TIMEOUT),
         expected_markers: vec![
             RUSTOS_BOOT_MARKER.to_owned(),
@@ -740,6 +753,17 @@ where
                     );
                 }
                 options.ui_proof_windows = windows;
+            }
+            "--recovery-probe" => {
+                let value = next_value(&mut args, "--recovery-probe")?;
+                options.recovery_probe = match value.as_str() {
+                    "dvm-restart" => RecoveryProbe::DvmRestart,
+                    "rustos-reboot" => RecoveryProbe::RustosReboot,
+                    "all" => RecoveryProbe::All,
+                    _ => bail!(
+                        "--recovery-probe must be dvm-restart, rustos-reboot, or all, got {value}"
+                    ),
+                };
             }
             "--timeout" => {
                 let value = next_value(&mut args, "--timeout")?;
@@ -799,6 +823,14 @@ where
     }
     if options.expect_block_flush_fault && !options.storage_only {
         bail!("--storage-dvm-expect-flush-fault requires --storage-dvm-only");
+    }
+    if options.recovery_probe != RecoveryProbe::None
+        && (options.storage_only || options.expect_block_flush_fault)
+    {
+        bail!("--recovery-probe requires the normal positive product topology");
+    }
+    if options.recovery_probe != RecoveryProbe::None && options.min_ui_fps.is_some() {
+        bail!("--recovery-probe and --min-ui-fps are separate bounded acceptance runs");
     }
     if options.exercise_input {
         options

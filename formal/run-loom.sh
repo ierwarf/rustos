@@ -14,8 +14,14 @@ while IFS=$'\t' read -r proof_test production_source production_symbol invariant
     [[ -f "$source_path" ]] || { echo "missing Loom production source: $production_source" >&2; exit 1; }
     rg -q "fn ${proof_test}\\(" formal/loom-proof-kernel/src/lib.rs \
         || { echo "missing Loom proof test: $proof_test" >&2; exit 1; }
-    rg -q "fn ${production_symbol}\\b" "$source_path" \
+    symbol_leaf="${production_symbol##*::}"
+    rg -q "fn ${symbol_leaf}\\b" "$source_path" \
         || { echo "missing Loom production symbol: $production_source::$production_symbol" >&2; exit 1; }
+    if [[ "$production_symbol" == *::* ]]; then
+        symbol_owner="${production_symbol%%::*}"
+        rg -q "(struct|enum|trait|impl[^\\n]*) ${symbol_owner}\\b" "$source_path" \
+            || { echo "missing Loom production owner: $production_source::$symbol_owner" >&2; exit 1; }
+    fi
     [[ -n "$invariant" ]] || { echo "empty Loom invariant for $proof_test" >&2; exit 1; }
     production_inputs+=("$production_source")
 done <formal/concurrency-witnesses.tsv
@@ -25,6 +31,7 @@ if ! LOOM_MAX_BRANCHES="$branches" \
     tail -n 80 "$artifact_dir/loom.log" >&2
     exit 1
 fi
+proof_count="${#production_inputs[@]}"
 mapfile -t production_inputs < <(printf '%s\n' "${production_inputs[@]}" | sort -u)
 production_hashes="$(
     for source in "${production_inputs[@]}"; do
@@ -34,9 +41,10 @@ production_hashes="$(
 )"
 jq -n \
     --argjson branches "$branches" \
+    --argjson proof_count "$proof_count" \
     --arg registry_sha256 "$(sha256sum formal/concurrency-witnesses.tsv | awk '{print $1}')" \
     --arg proof_sha256 "$(sha256sum formal/loom-proof-kernel/src/lib.rs | awk '{print $1}')" \
     --argjson production_inputs "$production_hashes" \
-    '{schema:"rustos-loom-evidence-v2",status:"passed",proof_kernels:3,max_branches:$branches,inputs:{registry_sha256:$registry_sha256,proof_sha256:$proof_sha256,production:$production_inputs}}' \
+    '{schema:"rustos-loom-evidence-v2",status:"passed",proof_kernels:$proof_count,max_branches:$branches,inputs:{registry_sha256:$registry_sha256,proof_sha256:$proof_sha256,production:$production_inputs}}' \
     >"$artifact_dir/summary.json"
 printf 'Loom proof kernels passed\n'

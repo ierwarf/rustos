@@ -244,10 +244,12 @@ fn verify_payload_digest(
     Ok(())
 }
 
+type EarlySystemPayloadCandidate<'a> = (&'a [u8], [u8; 32], usize);
+
 fn early_system_payload_candidate<'a>(
     bytes: &'a [u8],
     path: &str,
-) -> Result<Option<(&'a [u8], [u8; 32], usize)>, BootstrapImageError> {
+) -> Result<Option<EarlySystemPayloadCandidate<'a>>, BootstrapImageError> {
     let Some(path) = normalized_bootstrap_path(path) else {
         return Ok(None);
     };

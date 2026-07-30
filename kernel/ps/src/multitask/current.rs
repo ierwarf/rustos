@@ -1,3 +1,19 @@
+//! Interrupt-excluded access to the current BSP task and process generation.
+//!
+//! - **Owner:** `kernel-ps` owns the current-task identity published by the
+//!   scheduler.
+//! - **Boundary:** Cross-crate callers receive bounded snapshots or execute a
+//!   closure while the exact current identity is stable.
+//! - **Lifecycle:** Dispatch publishes the new owner before it becomes
+//!   observable; retirement withdraws it before slot reuse.
+//! - **Concurrency:** Every mutable access uses the scheduler's interrupt
+//!   exclusion and lockdep owner token; no returned reference may escape.
+//! - **Failure:** Missing, retired, or generation-mismatched state returns no
+//!   authority.
+//! - **Forbidden:** No cached raw scheduler pointer, AP-local inference, or
+//!   service call while borrowing mutable scheduler state.
+//! - **Evidence:** `scheduler-lifecycle`, `scheduler-dispatch`,
+//!   `monotonic-deadline-lifecycle`, and `user-memory-access`.
 use x86_64::instructions::interrupts;
 
 use super::{
@@ -72,6 +88,14 @@ pub fn current_user_abi() -> Option<UserAbi> {
     })
 }
 
+/// Return the current task, ABI, and address-space identity without acquiring
+/// the process-state lock. Scheduler-owned wait paths use this snapshot before
+/// they have installed a waiter or deadline and must not inherit unrelated
+/// same-process lock latency.
+pub fn current_user_wait_binding() -> Option<(u64, UserAbi, u64)> {
+    interrupts::without_interrupts(|| unsafe { scheduler_ref().current_user_wait_binding() })
+}
+
 pub fn current_user_snapshot() -> Option<CurrentUserSnapshot> {
     let (thread_id, abi, process_handle, console_session) =
         interrupts::without_interrupts(|| unsafe {
@@ -112,16 +136,8 @@ pub fn terminate_user_process(process_id: u64) -> bool {
     })
 }
 
-pub fn block_current_user_task() -> bool {
-    interrupts::without_interrupts(|| unsafe { scheduler_mut().block_current_user_task() })
-}
-
 pub fn wake_user_task(task_id: u64) -> bool {
     interrupts::without_interrupts(|| unsafe { scheduler_mut().wake_user_task(task_id) })
-}
-
-pub fn block_current_task() -> bool {
-    interrupts::without_interrupts(|| unsafe { scheduler_mut().block_current_task() })
 }
 
 /// Arms a race-free block on the current task; must be paired with
@@ -134,14 +150,6 @@ pub fn arm_block_current_task() -> bool {
 /// Cancels a previously armed block without marking the current task blocked.
 pub fn cancel_block_current_task() -> bool {
     interrupts::without_interrupts(|| unsafe { scheduler_mut().cancel_block_current_task() })
-}
-
-/// Commits a previously armed block. Returns `Some(true)` if blocked,
-/// `Some(false)` if a wake raced us and we stayed runnable, `None` on invalid
-/// context. Callers must re-check their wakeup condition when `Some(false)` is
-/// returned instead of yielding.
-pub fn commit_block_current_task() -> Option<bool> {
-    interrupts::without_interrupts(|| unsafe { scheduler_mut().commit_block_current_task() })
 }
 
 pub fn wake_task(task_id: u64) -> bool {
@@ -317,10 +325,23 @@ pub fn parent_process_id_of(process_id: u64) -> Option<u64> {
     process_table::parent_process_id_of(process_id)
 }
 
-pub fn wait_for_child(parent_process_id: u64, target_pid: i64) -> WaitChildResult {
-    match process_table::wait_for_child(parent_process_id, target_pid) {
+pub fn wait_for_child(
+    parent_process_id: u64,
+    target_pid: i64,
+    include_stopped: bool,
+    include_continued: bool,
+) -> WaitChildResult {
+    match process_table::wait_for_child(
+        parent_process_id,
+        target_pid,
+        include_stopped,
+        include_continued,
+    ) {
         process_table::WaitResult::Exited { pid, status } => {
             WaitChildResult::Exited { pid, status }
+        }
+        process_table::WaitResult::StateChanged { pid, status } => {
+            WaitChildResult::StateChanged { pid, status }
         }
         process_table::WaitResult::Pending => WaitChildResult::Pending,
         process_table::WaitResult::NoMatchingChild => WaitChildResult::NoMatchingChild,
@@ -379,6 +400,16 @@ pub fn queue_linux_signal(process_id: u64, task_id: u64, signal: u64) -> bool {
     interrupts::without_interrupts(|| unsafe {
         scheduler_mut().queue_linux_signal(process_id, task_id, signal)
     })
+}
+
+pub fn queue_linux_process_sigchld(process_id: u64, events: u32) -> bool {
+    interrupts::without_interrupts(|| unsafe {
+        scheduler_mut().queue_linux_process_sigchld(process_id, events)
+    })
+}
+
+pub fn stop_current_linux_process(signal: u64) -> bool {
+    interrupts::without_interrupts(|| unsafe { scheduler_mut().stop_current_linux_process(signal) })
 }
 
 pub fn any_user_process_state(mut f: impl FnMut(u64, &UserProcessState) -> bool) -> bool {
@@ -470,4 +501,14 @@ pub fn exit_current_user_process() -> ! {
 
 pub fn service_deferred_work() -> usize {
     interrupts::without_interrupts(|| unsafe { scheduler_mut().reap_inactive_retired_slots() })
+}
+
+pub fn next_retired_task_cleanup() -> Option<super::RetiredTaskCleanup> {
+    interrupts::without_interrupts(|| unsafe { scheduler_ref().next_retired_task_cleanup() })
+}
+
+pub fn complete_retired_task_cleanup(cleanup: super::RetiredTaskCleanup) -> bool {
+    interrupts::without_interrupts(|| unsafe {
+        scheduler_mut().complete_retired_task_cleanup(cleanup)
+    })
 }

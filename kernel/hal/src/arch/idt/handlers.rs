@@ -1,3 +1,18 @@
+//! x86_64 exception and interrupt admission for the BSP.
+//!
+//! - **Owner:** `kernel-hal` owns CPU-entry decoding; policy and user-fault
+//!   disposition belong to registered executive/compat hooks.
+//! - **Boundary:** Hardware frames and user-controlled register state enter
+//!   ring0 here.
+//! - **Lifecycle:** Entry validates and classifies one frame, invokes a
+//!   snapshotted hook, then either resumes the same task or retires it.
+//! - **Concurrency:** IDT leaves enter tracked IRQ context before touching
+//!   shared state; callbacks run without the hook registry lock.
+//! - **Failure:** Kernel faults are fatal; user faults use exact-task
+//!   retirement and cannot unwind through Rust.
+//! - **Forbidden:** No service policy, allocation-heavy recovery, or
+//!   untracked lock acquisition in an IDT leaf.
+//! - **Evidence:** `exception-retirement` and `msi-vector-ingress`.
 use core::arch::global_asm;
 
 use x86_64::registers::control::Cr2;
@@ -42,8 +57,37 @@ unsafe extern "Rust" {
 // error-code wrapper's misaligned stack.
 #[inline(always)]
 pub fn default_handler(stack_frame: InterruptStackFrame, index: u8, error_code: Option<u64>) {
+    emergency_exception_marker(index);
     unsafe {
         rustos_default_handler_alignment_bridge(stack_frame, index, error_code);
+    }
+}
+
+/// Emit a lock-free, allocation-free exception marker before entering any
+/// formatted diagnostics. This remains usable when the exception was caused
+/// by corrupted scheduler or lock state and the normal panic path would fault
+/// recursively before producing evidence.
+#[inline(always)]
+fn emergency_exception_marker(index: u8) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in [
+        b'\n',
+        b'!',
+        b'E',
+        b'X',
+        b':',
+        HEX[usize::from(index >> 4)],
+        HEX[usize::from(index & 0x0f)],
+        b'\n',
+    ] {
+        unsafe {
+            core::arch::asm!(
+                "out dx, al",
+                in("dx") 0x00e9_u16,
+                in("al") byte,
+                options(nomem, nostack, preserves_flags)
+            );
+        }
     }
 }
 
@@ -187,6 +231,7 @@ pub extern "x86-interrupt" fn double_fault_handler(
     stack_frame: InterruptStackFrame,
     error_code: u64,
 ) -> ! {
+    emergency_exception_marker(8);
     let cr2 = Cr2::read().map(|addr| addr.as_u64()).unwrap_or(u64::MAX);
     crate::debug::dump_recent_trace_locations("double-fault");
     panic!(
@@ -205,23 +250,12 @@ fn is_user_mode(stack_frame: &InterruptStackFrame) -> bool {
     (stack_frame.code_segment.0 & 0x3) == 0x3
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn general_exception_bridge_aligns_every_rust_call_boundary() {
-        for raw_rsp in [0x1000_u64, 0x1008, 0x100f, 0x1010, u64::MAX - 0x1f] {
-            let aligned = (raw_rsp & !0xf).wrapping_sub(16);
-            assert_eq!(aligned & 0xf, 0);
-            assert!(aligned <= raw_rsp);
-        }
-    }
-}
-
 pub fn pic_interrupt_handler(
     _stack_frame: InterruptStackFrame,
     index: u8,
     _error_code: Option<u64>,
 ) {
+    let _irq_context = nucleus_core::util::lockdep::enter_irq_context();
     let irq = index.saturating_sub(crate::arch::pic::PIC_1_OFFSET);
     let _ = crate::hooks::dispatch_pic_irq(irq);
     crate::arch::pic::send_eoi(index);
@@ -235,16 +269,31 @@ pub fn msi_interrupt_handler(
     index: u8,
     _error_code: Option<u64>,
 ) {
+    let _irq_context = nucleus_core::util::lockdep::enter_irq_context();
     crate::arch::msi::dispatch(index);
 }
 
 /// DVM owns input delivery. Legacy keyboard IRQs have no RustOS input policy
 /// consumer; acknowledge them so a physical/spurious line cannot wedge PIC.
 pub extern "x86-interrupt" fn keyboard_interrupt_eoi_handler(_stack_frame: InterruptStackFrame) {
+    let _irq_context = nucleus_core::util::lockdep::enter_irq_context();
     crate::arch::pic::send_eoi(KEYBOARD_INTERRUPT_VECTOR);
 }
 
 /// See `keyboard_interrupt_eoi_handler`.
 pub extern "x86-interrupt" fn mouse_interrupt_eoi_handler(_stack_frame: InterruptStackFrame) {
+    let _irq_context = nucleus_core::util::lockdep::enter_irq_context();
     crate::arch::pic::send_eoi(MOUSE_INTERRUPT_VECTOR);
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn general_exception_bridge_aligns_every_rust_call_boundary() {
+        for raw_rsp in [0x1000_u64, 0x1008, 0x100f, 0x1010, u64::MAX - 0x1f] {
+            let aligned = (raw_rsp & !0xf).wrapping_sub(16);
+            assert_eq!(aligned & 0xf, 0);
+            assert!(aligned <= raw_rsp);
+        }
+    }
 }

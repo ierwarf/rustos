@@ -73,12 +73,22 @@ const RUSTOS_DVM_BLOCK_FIRST_COMPLETION_MARKER: &str = "dvm-block: first complet
 const RUSTOS_DVM_BLOCK_E2E_MARKER: &str = "storaged: dvm-block e2e flush completed generation=1";
 const RUSTOS_DVM_BLOCK_FLUSH_FAULT_MARKER: &str =
     "dvm-block: injected device fault operation=block.flush generation=1";
-const DVM_BLOCK_READY_MARKER: &str = "rustos-dvm-block: ready abi=2 generation=1";
+const GUI_DVM_OFFLINE_MARKER: &str = "gui-dvm: peer offline lease revoked";
+const GUI_DVM_REBOUND_MARKER: &str = "gui-dvm: peer ready lease rebound";
+// The higher-half trace is emitted before the structured debugcon sink becomes
+// durable on every OVMF path. `clocksource-ready` is the earliest milestone
+// guaranteed to survive in the per-process capture and therefore the first
+// admissible marker for a fresh-guest recovery epoch.
+const RUSTOS_REBOOT_ENTRY_MARKER: &str = "name=clocksource-ready";
+const DVM_BLOCK_READY_MARKER: &str = "rustos-dvm-block: ready abi=2 generation=";
 const DVM_GPU_PIPELINE_PRIME_TIMEOUT_US: u64 = 500_000;
 const DVM_GPU_HEALTH_SAMPLES: u64 = 3;
 const PHYSICAL_GPU_SMOKE_MIN_FRAMES: usize = 4;
 const DEFAULT_UI_FPS_ACTIVE_WINDOWS: usize = 3;
-const MAX_UI_FPS_ACTIVE_WINDOWS: usize = 20;
+// Long UI acceptance runs must be able to prove one full minute of
+// consecutive one-second samples. Keep the bound finite so malformed CLI
+// input cannot turn the smoke runner into an unbounded soak.
+const MAX_UI_FPS_ACTIVE_WINDOWS: usize = 60;
 // The end-to-end cursor contract is 60 accepted motion updates per second.
 // Require at least 55 in every measured one-second window (over 90%) so a
 // single timer boundary cannot fail an otherwise continuous 60 Hz stream.
@@ -113,9 +123,9 @@ const DVM_INPUT_FIRST_PEER_TIMEOUT: Duration = Duration::from_secs(5);
 /// consumer appears only after the policy services and uiserver are running.
 /// Keep that distinct boot dependency bounded without falsely admitting the
 /// transport-only MSI-X state.
-// Match the public kvm-smoke maximum. The former 20-second private deadline
-// could abort a valid boot before the caller's explicit --timeout 30 elapsed,
-// even though UI readiness and proof windows were still within that bound.
+// This is a guest policy-publication deadline, not the host acceptance-soak
+// duration. Keep it at the product's finite 30-second service ceiling even
+// when the host runner collects a longer sequence of performance samples.
 const DVM_INPUT_POLICY_READY_TIMEOUT: Duration = Duration::from_secs(30);
 // The RustOS MSI-X receive substrate deliberately rejects x2APIC until an
 // interrupt-remapping implementation can supply a non-truncated destination
@@ -134,9 +144,12 @@ const DVM_NET_REGION_BYTES: u64 = DVM_NET_APERTURE_BYTES;
 // to its private disk; runtimed accepts only these fixed boolean fields.
 const PRIVATE_ACCEPTANCE_CONTRACT_PATH: &str = "system/registry/system/kvm-acceptance-v1.env";
 const NETPROBE_QEMU_REACHABLE_MARKER: &str = "netprobe: qemu gateway reachable";
-const DVM_GUEST_CID: u32 = 4;
+const MIN_DVM_GUEST_CID: u32 = 3;
 const VHOST_VSOCK_DEVICE: &str = "/dev/vhost-vsock";
-const MAX_SMOKE_TIMEOUT: u64 = 30;
+// Readiness plus a 60-window performance proof needs headroom for boot. This
+// is only the host runner's hard process deadline; guest service waits retain
+// their narrower class-specific bounds.
+const MAX_SMOKE_TIMEOUT: u64 = 120;
 const PHYSICAL_GPU_REQUIRED_MEMLOCK: u64 = 4 * 1024 * 1024 * 1024;
 const ACPI_VFCT_HEADER_BYTES: usize = 0x4c;
 const ACPI_VFCT_VBIOS_OFFSET: usize = 0x34;
@@ -145,6 +158,7 @@ const ACPI_VFCT_IMAGE_LENGTH_OFFSET: usize = 24;
 const ACPI_VFCT_MAX_BYTES: usize = 4 * 1024 * 1024;
 
 include!("kvm/options.rs");
+include!("kvm/help.rs");
 include!("kvm/layout.rs");
 include!("kvm/guest.rs");
 include!("kvm/evidence.rs");

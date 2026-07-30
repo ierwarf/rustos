@@ -8,6 +8,8 @@ use serde::Deserialize;
 use crate::Result;
 use crate::util::{env_path, env_string, path_label, split_whitespace_owned};
 
+// GENERATED: The shared build-script module exposes helpers used by several
+// include sites; this consumer intentionally needs only the parser subset.
 #[allow(dead_code)]
 mod build_log_cfg {
     include!("../../../build_log_cfg.rs");
@@ -663,7 +665,23 @@ pub(crate) fn effective_config_toml(config: &ProjectConfig) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{FaultInjectionConfig, apply_fault_rule_overrides, validate_fault_injection};
+    use super::{
+        FaultInjectionConfig, KernelBuildConfig, apply_fault_rule_overrides,
+        validate_fault_injection,
+    };
+
+    #[test]
+    fn kernel_rustflags_select_the_boot_image_contract() {
+        let flags = KernelBuildConfig::default().rustflags("");
+        assert!(
+            flags
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .windows(2)
+                .any(|pair| pair == ["--cfg", "rustos_boot_image"]),
+            "kernel RUSTFLAGS must select cfg(rustos_boot_image): {flags}"
+        );
+    }
 
     #[test]
     fn fault_override_replaces_the_default_instead_of_being_shadowed() {

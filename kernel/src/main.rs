@@ -1,17 +1,33 @@
+//! BSP-only kernel entry and one-way higher-half bootstrap.
+//!
+//! - **Owner:** The kernel entry owns architectural admission ordering until
+//!   `kernel-executive` assumes the initialized substrate.
+//! - **Boundary:** Bootloader registers, `BootInfo`, bootstrap memory, and
+//!   firmware interrupt state are untrusted until their owning subsystem admits
+//!   them.
+//! - **Lifecycle:** Enter with interrupts disabled, establish descriptor and
+//!   memory state, cross once to the higher half, initialize owners in dependency
+//!   order, start scheduling, and never return.
+//! - **Concurrency:** Bootstrap is BSP-only and interrupts remain disabled until
+//!   the scheduler and handlers are ready; RustOS does not claim SMP support.
+//! - **Failure:** Invalid boot metadata, allocator failure, or subsystem
+//!   initialization failure terminates through the bounded panic path.
+//! - **Forbidden:** No policy decision, AP startup, inherited interrupt enable,
+//!   mutable success cache, or continuation after partial initialization.
+//! - **Evidence:** `kernel-memory-protection`, `physical-frame-lifecycle`,
+//!   `entropy-boundary`, and `service-bootstrap`.
+
 #![feature(abi_x86_interrupt)]
 #![feature(alloc_error_handler)]
 #![cfg_attr(all(not(test), rustos_boot_image), no_std)]
 #![cfg_attr(all(not(test), rustos_boot_image), no_main)]
 
 #[cfg(all(not(test), rustos_boot_image))]
+use boot_protocol::BootInfo;
+#[cfg(all(not(test), rustos_boot_image))]
 use core::alloc::Layout;
 #[cfg(all(not(test), rustos_boot_image))]
 use core::arch::global_asm;
-#[cfg(all(not(test), rustos_boot_image))]
-use core::cell::UnsafeCell;
-
-#[cfg(all(not(test), rustos_boot_image))]
-use boot_protocol::BootInfo;
 #[cfg(all(not(test), rustos_boot_image))]
 use kernel_executive::boot;
 #[cfg(all(not(test), rustos_boot_image))]
@@ -30,28 +46,6 @@ global_asm!(
     include_str!("../nucleus-core/src/multiboot2_entry.S"),
     options(att_syntax)
 );
-
-#[cfg(all(not(test), rustos_boot_image))]
-const BOOTSTRAP_STACK_SIZE: usize = 2 * 1024 * 1024;
-
-#[cfg(all(not(test), rustos_boot_image))]
-#[repr(align(16))]
-struct BootstrapStack {
-    #[allow(dead_code)]
-    bytes: [u8; BOOTSTRAP_STACK_SIZE],
-}
-
-#[cfg(all(not(test), rustos_boot_image))]
-struct BootstrapStackMemory(UnsafeCell<BootstrapStack>);
-
-#[cfg(all(not(test), rustos_boot_image))]
-unsafe impl Sync for BootstrapStackMemory {}
-
-#[cfg(all(not(test), rustos_boot_image))]
-static BOOTSTRAP_STACK: BootstrapStackMemory =
-    BootstrapStackMemory(UnsafeCell::new(BootstrapStack {
-        bytes: [0; BOOTSTRAP_STACK_SIZE],
-    }));
 
 #[cfg(any(test, not(rustos_boot_image)))]
 fn main() {}
@@ -100,10 +94,7 @@ fn kernel_start_from_boot_info(boot_info_ptr: *const BootInfo) -> ! {
 
 #[cfg(all(not(test), rustos_boot_image))]
 extern "C" fn kernel_main_high(boot_info_ptr: *const BootInfo) -> ! {
-    let bootstrap_stack_top = {
-        let base = BOOTSTRAP_STACK.0.get() as *const BootstrapStack as u64;
-        base + BOOTSTRAP_STACK_SIZE as u64
-    };
+    let bootstrap_stack_top = nucleus_core::bootstrap_stack::top();
     unsafe {
         hal_api::call_with_stack(
             mm_api::higher_half_addr(kernel_main_bootstrap as *const () as usize as u64),
@@ -115,5 +106,7 @@ extern "C" fn kernel_main_high(boot_info_ptr: *const BootInfo) -> ! {
 
 #[cfg(all(not(test), rustos_boot_image))]
 extern "C" fn kernel_main_bootstrap(boot_info_ptr: *const BootInfo) -> ! {
-    boot::kernel_main_bootstrap(boot_info_ptr)
+    // SAFETY: `rustos_entry` passes the unchanged boot-protocol pointer after
+    // switching to the aligned bootstrap stack.
+    unsafe { boot::kernel_main_bootstrap(boot_info_ptr) }
 }

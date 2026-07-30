@@ -9,6 +9,22 @@
 //! The allocator deliberately keeps mapped regions for the lifetime of the
 //! service.  This avoids pager re-entry and `munmap` lifetime races while still
 //! reclaiming every allocation inside those regions.
+//!
+//! - **Owner:** Each service process owns one allocator instance and its mapped
+//!   regions; no allocator state is shared across protection domains.
+//! - **Boundary:** Bootstrap spans, mmap results, layouts, headers, and free
+//!   spans are checked for overflow, alignment, containment, and provenance.
+//! - **Lifecycle:** Admit bootstrap memory, allocate/split, validate on free,
+//!   coalesce, retain mapped regions until process exit, and let process teardown
+//!   reclaim the mappings.
+//! - **Concurrency:** A bounded allocator lock protects metadata; growth occurs
+//!   only after releasing the metadata lock and is re-admitted before publish.
+//! - **Failure:** Invalid layout, exhausted address space, corrupt metadata, and
+//!   mmap failure return allocation failure rather than fabricating memory.
+//! - **Forbidden:** No kernel-policy re-entry while locked, foreign-pointer free,
+//!   silent integer wrap, or unmapping a region containing live allocations.
+//! - **Evidence:** `service-heap-lifecycle`, `allocator-reentrancy`, and
+//!   `kernel-resource-lifecycle`.
 
 #[cfg(feature = "global-allocator")]
 use core::alloc::{GlobalAlloc, Layout};

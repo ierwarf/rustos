@@ -2,6 +2,10 @@
 
 Optimized for AI agents, not human onboarding. English-only, dense, contract-shaped.
 
+`core-engineering-contract.md` is the mandatory source-writing contract for
+RustOS product intent, ownership, lifecycle, concurrency, ABI, comments,
+refactoring, recovery, and review.
+
 ## What lives here
 
 | File | Role |

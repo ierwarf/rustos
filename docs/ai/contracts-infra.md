@@ -165,7 +165,10 @@ or launch policy.
   Desktop metadata and runtime-launch policy have separate immutable caches;
   one registry must never satisfy a request for the other. Initial session
   autostart must not depend on a background thread completing before the first
-  policy drain.
+  policy drain. Accepted nonblocking clients are retained in a bounded partial
+  request set and serviced incrementally; a lower-class client preempted after
+  `connect()` cannot make the supervisor busy-yield or delay catalog-policy
+  convergence.
 - `runtimed` spawns uiserver suspended, admits its rootd lease, activates it,
   and waits for the exact PID's display-policy endpoint before committing the
   tracked process.
@@ -204,15 +207,44 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
 ## Kernel Build
 
 - Kernel-target Cargo invocations route through `tools/xtask/src/build/cargo.rs::kernel_rustflags_env`.
+- The boot nucleus deliberately compiles through Cargo's
+  `x86_64-unknown-linux-gnu` target to preserve the required object/link shape.
+  Bare-metal-only code must therefore use `cfg(rustos_boot_image)`, never
+  `cfg(target_os = "none")`; `formal/run-source-conformance.sh` rejects that
+  dead-branch pattern under `kernel/`.
 - Operational config: `config/rustos.toml`. Build-shape defaults:
   `[kernel.build]`. Set `RUSTOS_CONFIG` to test an alternate complete config.
 - Lock telemetry policy: `[lock_telemetry]`. `enabled=true` emits
   `rustos_lock_telemetry_enabled` for kernel crates and configures cycle
   thresholds through `RUSTOS_LOCK_TELEMETRY_WARN_WAIT_CYCLES` /
   `RUSTOS_LOCK_TELEMETRY_WARN_HOLD_CYCLES`.
-- Initial lock telemetry owner: `kernel/io-manager/src/sync.rs`
-  `KernelSpinLock` / `KernelWaitLock`. It warns on contended acquire latency and
-  long guard hold time with `lock-telemetry:` debugcon records.
+- Raw critical sections use the shared lock-class implementation in
+  `kernel/nucleus-core/src/util/lockdep.rs`; process state, MM page tables and
+  physical allocation, service registries, futex/input/RTC waiters, and IPC
+  slabs have distinct classes. Scheduler-aware blocking sections use
+  `kernel/io-manager/src/sync.rs::KernelWaitLock`. Both paths report bounded
+  wait/hold diagnostics without allocating from the diagnostic path. IDT
+  leaves explicitly enter IRQ context, and lockdep rejects a class used as both
+  IRQ-safe and ordinary interrupt-enabled plus every safe-to-unsafe dependency
+  path. A `KernelWaitLock` acquisition is rejected in IRQ context or while any
+  tracked raw-spin class is held. Every `KernelWaitLock` instance has a stable
+  class in the same allocation-free dependency graph. Its held-class stack is
+  keyed by scheduler task identity across a blocking handoff; inverse
+  sleepable ordering is rejected. Raw-to-blocking nesting is rejected;
+  sleepable-to-raw leaf acquisition is dependency-tracked and cycle-checked,
+  including successful nonblocking external try-locks.
+- While the product scheduler is BSP-only, every boot-image
+  `TrackedSpinLock` guard increments one task-preemption depth without masking
+  unrelated device interrupts. The software scheduler rejects every handoff
+  while that depth is non-zero. Code under such a guard must still be bounded,
+  non-blocking, and allocation-free; a lock shared with an IRQ leaf must also
+  wrap its process-context access in `without_interrupts`. SMP enablement is
+  gated on per-CPU preemption accounting, current-task publication, and
+  raw-spin stacks; task-owned sleepable stacks are already identity-scoped.
+- `boot-random` sits below `nucleus-core`, so its one master-seed lock cannot
+  use `TrackedSpinLock`. Its only critical section derives one 32-byte child
+  seed under local IRQ exclusion; no caller may hold the raw master lock across
+  a preemptible kernel frame.
 
 ### Default Kernel `RUSTFLAGS`
 
@@ -301,8 +333,8 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
   ingress markers. The composite device advertises pointer selection capability,
   emits one non-printable F12 keyboard proof, then emits pointer-only absolute positions;
   it never emits printable keys or clicks. It traces a 192-pixel axis-aligned
-  square for 2,667 cycles (a bounded 40-second source window that covers the
-  public 30-second gate plus guest admission), with source polling no faster
+  square for 6,000 cycles (a bounded 90-second source window that covers the
+  public 60-second gate plus guest admission), with source polling no faster
   than 15 ms. After L0 authenticates and requests the input stream, the agent
   admits only that live streaming interval to guest `SCHED_RR` priority 10 and
   first installs a 50 ms soft/100 ms hard `RLIMIT_RTTIME` continuous-CPU

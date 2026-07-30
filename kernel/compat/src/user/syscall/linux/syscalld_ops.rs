@@ -209,19 +209,18 @@ pub(super) fn syscall_linux_syscalld_getrandom(user_ptr: u64, user_len: u64, fla
 }
 
 pub(super) fn syscall_linux_wait4(pid: i64, status_ptr: u64, options: u64, rusage_ptr: u64) -> u64 {
-    if status_ptr != 0 {
-        if let Err(err) = usermem::validate_current_user_write_buffer(status_ptr, size_of::<i32>())
-        {
-            return linux_errno(address_space_error_to_linux_errno(err));
-        }
+    if status_ptr != 0
+        && let Err(err) = usermem::validate_current_user_write_buffer(status_ptr, size_of::<i32>())
+    {
+        return linux_errno(address_space_error_to_linux_errno(err));
     }
-    if rusage_ptr != 0 {
-        if let Err(err) = usermem::validate_current_user_write_buffer(
+    if rusage_ptr != 0
+        && let Err(err) = usermem::validate_current_user_write_buffer(
             rusage_ptr,
             size_of::<linux_abi::LinuxRusage>(),
-        ) {
-            return linux_errno(address_space_error_to_linux_errno(err));
-        }
+        )
+    {
+        return linux_errno(address_space_error_to_linux_errno(err));
     }
 
     let mut request = new_procd_request(PROCD_OP_WAIT4);
@@ -240,34 +239,40 @@ pub(super) fn syscall_linux_wait4(pid: i64, status_ptr: u64, options: u64, rusag
         None => return linux_errno(LINUX_ENOSYS),
     };
     let nohang = options & linux_abi::WNOHANG as u64 != 0;
+    let include_stopped = options & linux_abi::WUNTRACED as u64 != 0;
+    let include_continued = options & linux_abi::WCONTINUED as u64 != 0;
     loop {
-        match multitask::wait_for_child(parent_pid, pid) {
+        match multitask::wait_for_child(parent_pid, pid, include_stopped, include_continued) {
             multitask::WaitChildResult::Exited {
                 pid: child_pid,
                 status,
+            }
+            | multitask::WaitChildResult::StateChanged {
+                pid: child_pid,
+                status,
             } => {
-                if status_ptr != 0 {
-                    if let Err(err) = usermem::write_current_user_struct(status_ptr, &status) {
-                        return linux_errno(address_space_error_to_linux_errno(err));
-                    }
+                if status_ptr != 0
+                    && let Err(err) = usermem::write_current_user_struct(status_ptr, &status)
+                {
+                    return linux_errno(address_space_error_to_linux_errno(err));
                 }
-                if rusage_ptr != 0 {
-                    if let Err(err) = usermem::write_current_user_struct(
+                if rusage_ptr != 0
+                    && let Err(err) = usermem::write_current_user_struct(
                         rusage_ptr,
                         &linux_abi::LinuxRusage::default(),
-                    ) {
-                        return linux_errno(address_space_error_to_linux_errno(err));
-                    }
+                    )
+                {
+                    return linux_errno(address_space_error_to_linux_errno(err));
                 }
                 return child_pid;
             }
             multitask::WaitChildResult::Pending if nohang => return 0,
             multitask::WaitChildResult::Pending => {
                 multitask::yield_now();
-                if let Some(state) = multitask::current_linux_thread_state() {
-                    if state.pending_signals & !state.signal_mask != 0 {
-                        return linux_errno(LINUX_EINTR);
-                    }
+                if let Some(state) = multitask::current_linux_thread_state()
+                    && state.pending_signals & !state.signal_mask != 0
+                {
+                    return linux_errno(LINUX_EINTR);
                 }
             }
             multitask::WaitChildResult::NoMatchingChild if nohang => return 0,
@@ -334,88 +339,6 @@ pub(super) fn new_syscalld_request(op: u16) -> LinuxSyscallOffloadRequest {
         request.egid = security.egid();
     }
     request
-}
-
-pub(super) fn request_syscalld_clock_gettime_admission(clock_id: u64) -> Result<(), i64> {
-    let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_CLOCK_GETTIME);
-    request.arg0 = clock_id;
-    call_syscalld(request).and_then(|response| ensure_empty_syscalld_response(&response))
-}
-
-pub(super) fn request_syscalld_timespec_admission(
-    op: u16,
-    clock_id: u64,
-    flags: u64,
-    ts: LinuxTimespecWire,
-) -> Result<(), i64> {
-    if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
-        return Err(LINUX_EINVAL);
-    }
-    let absolute = flags == linux_abi::TIMER_ABSTIME as u64;
-    let cacheable = match op {
-        SYSCALL_OFFLOAD_OP_LINUX_NANOSLEEP if clock_id == 0 && flags == 0 => Some(false),
-        SYSCALL_OFFLOAD_OP_LINUX_CLOCK_NANOSLEEP
-            if flags == 0 || flags == linux_abi::TIMER_ABSTIME as u64 =>
-        {
-            Some(true)
-        }
-        _ => None,
-    };
-    let cached =
-        multitask::with_current_user_process_state(|_, _, process_state| match cacheable {
-            Some(false) => process_state.linux_nanosleep_admission_cached(),
-            Some(true) => process_state.linux_clock_nanosleep_admission_cached(clock_id, absolute),
-            None => false,
-        })
-        .unwrap_or(false);
-    if cached {
-        return Ok(());
-    }
-    if cacheable.is_some()
-        && ipc_ops::current_process_has_service_capability(IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY)
-    {
-        // syscalld is the owner of this immutable policy and must not issue a
-        // synchronous request to its own receive endpoint merely to back off
-        // that receive loop. Capability identity plus the exact local
-        // timespec/key validation above is the self-admission boundary.
-        let committed =
-            multitask::with_current_user_process_state_mut(|_, _, process_state| match cacheable {
-                Some(false) => {
-                    process_state.cache_linux_nanosleep_admission();
-                    true
-                }
-                Some(true) => {
-                    process_state.cache_linux_clock_nanosleep_admission(clock_id, absolute)
-                }
-                None => false,
-            })
-            .unwrap_or(false);
-        return if committed { Ok(()) } else { Err(LINUX_EINVAL) };
-    }
-
-    let mut request = new_syscalld_request(op);
-    request.arg0 = clock_id;
-    request.flags = flags;
-    request.path_len = LINUX_TIMESPEC_SIZE as u32;
-    request.path[..size_of::<i64>()].copy_from_slice(&ts.tv_sec.to_le_bytes());
-    request.path[size_of::<i64>()..LINUX_TIMESPEC_SIZE].copy_from_slice(&ts.tv_nsec.to_le_bytes());
-    call_syscalld(request).and_then(|response| ensure_empty_syscalld_response(&response))?;
-
-    let cache_committed =
-        multitask::with_current_user_process_state_mut(|_, _, process_state| match cacheable {
-            Some(false) => {
-                process_state.cache_linux_nanosleep_admission();
-                true
-            }
-            Some(true) => process_state.cache_linux_clock_nanosleep_admission(clock_id, absolute),
-            None => true,
-        })
-        .unwrap_or(false);
-    if cache_committed {
-        Ok(())
-    } else {
-        Err(LINUX_EINVAL)
-    }
 }
 
 pub(super) fn call_syscalld(

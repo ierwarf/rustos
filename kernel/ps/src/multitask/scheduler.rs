@@ -1,3 +1,23 @@
+//! BSP task scheduler, continuation ownership, blocking, and retirement.
+//!
+//! - **Owner:** `kernel-ps` owns task slots, scheduling state, and exact task
+//!   retirement; services own launch and workload policy.
+//! - **Boundary:** Saved CPU contexts, wake tokens, deadlines, donation hints,
+//!   and process generations converge here.
+//! - **Lifecycle:** A task moves through suspended/runnable/running,
+//!   arm/block/wake, and retired/reap-pending states with one exact epoch.
+//!   A running task has consumed its published continuation; only a trapped or
+//!   blocked task owns a frame that may be validated for dispatch.
+//! - **Concurrency:** BSP interrupt exclusion serializes scheduler mutation;
+//!   tracked lock/preemption ownership is updated before every handoff.
+//! - **Failure:** Invalid published contexts quarantine and retire a user task;
+//!   raced wake/cancel refuses sleep; cleanup must acknowledge every
+//!   task-scoped registry before slot reuse.
+//! - **Forbidden:** No SMP claim, split commit/yield, current-running-frame
+//!   validation, unbounded ready scan, or scheduler policy IPC.
+//! - **Evidence:** `scheduler-lifecycle`, `scheduler-dispatch`,
+//!   `process-address-space-lifecycle`, `exception-retirement`,
+//!   `endpoint-lifecycle`, and `syscall-simd-lifecycle`.
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -29,8 +49,10 @@ use super::{UserFaultDisposition, UserStackState, UserTaskBootstrap, initial_tas
 // panic. Keep the scheduler allocation-free and explicitly bounded, but size
 // the product contract for service growth and application headroom.
 pub(super) const MAX_TASK: usize = 128;
+const _: () = assert!(kernel_ipc_runtime::api::MAX_ENDPOINT_WAKE_TASKS >= MAX_TASK);
 const ROOT_TASK_SLOT: usize = 0;
 const FIRST_DYNAMIC_TASK_SLOT: usize = 1;
+
 // Kernel worker threads run fairly deep Rust call chains during process/module
 // bring-up, so smaller stacks can corrupt adjacent task stacks.
 // Kernel-side Rust paths during syscall, process load, and service orchestration are deep in
@@ -177,7 +199,7 @@ pub(super) struct CurrentLinuxThreadBinding {
     pub(super) linux_thread_state: NonNull<Option<LinuxThreadState>>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum TaskRetireReason {
     UserFault {
         vector: u8,
@@ -261,7 +283,14 @@ pub(super) struct TaskStart {
 pub(super) struct Scheduler {
     contexts: [Option<TaskContext>; MAX_TASK],
     retired: [bool; MAX_TASK],
+    retirement_cleanup: [Option<super::RetiredTaskCleanup>; MAX_TASK],
+    /// IRQ-time context validation may quarantine a task immediately, but
+    /// lifecycle teardown can touch IPC registries and process accounting.
+    /// Keep the reason in a fixed slot until housekeeping finalizes it in
+    /// process context; no allocation or cross-subsystem lock is taken in IRQ.
+    deferred_retire_reasons: [Option<TaskRetireReason>; MAX_TASK],
     start_suspended: [bool; MAX_TASK],
+    job_stopped: [bool; MAX_TASK],
     retire_reasons: [Option<TaskRetireReason>; MAX_TASK],
     simd_states: [SimdState; MAX_TASK],
     syscall_user_simd_states: [SimdState; MAX_TASK],
@@ -316,7 +345,10 @@ impl Scheduler {
         Self {
             contexts: [None; MAX_TASK],
             retired: [false; MAX_TASK],
+            retirement_cleanup: [None; MAX_TASK],
+            deferred_retire_reasons: [None; MAX_TASK],
             start_suspended: [false; MAX_TASK],
+            job_stopped: [false; MAX_TASK],
             retire_reasons: [None; MAX_TASK],
             simd_states: [SimdState::new(); MAX_TASK],
             syscall_user_simd_states: [SimdState::new(); MAX_TASK],
@@ -737,7 +769,10 @@ impl Scheduler {
         self.syscall_user_simd_states = [SimdState::new(); MAX_TASK];
         self.syscall_user_simd_active = [false; MAX_TASK];
         self.retired = [false; MAX_TASK];
+        self.retirement_cleanup = [None; MAX_TASK];
+        self.deferred_retire_reasons = [None; MAX_TASK];
         self.start_suspended = [false; MAX_TASK];
+        self.job_stopped = [false; MAX_TASK];
         self.retire_reasons = [None; MAX_TASK];
         self.current_task = ROOT_TASK_SLOT;
         self.pending_reap = false;
@@ -786,6 +821,10 @@ impl Scheduler {
             windows_thread_state: None,
         });
         self.starts[ROOT_TASK_SLOT] = Some(TaskStart { entry, id });
+        nucleus_core::util::lockdep::set_current_task_owner(
+            id.checked_add(1)
+                .expect("root task id exhausted lock owner token"),
+        );
 
         unsafe {
             save_state(&mut self.simd_states[ROOT_TASK_SLOT]);
@@ -816,7 +855,10 @@ impl Scheduler {
             self.next_spawn_pick_hint = None;
         }
         self.retired[slot] = false;
+        self.retirement_cleanup[slot] = None;
+        self.deferred_retire_reasons[slot] = None;
         self.start_suspended[slot] = false;
+        self.job_stopped[slot] = false;
         self.retire_reasons[slot] = None;
         self.simd_states[slot] = SimdState::new();
         self.syscall_user_simd_states[slot] = SimdState::new();
@@ -1207,6 +1249,21 @@ impl Scheduler {
         )
     }
 
+    /// Absolute ready-age gate. Once either class reaches its declared bound,
+    /// fresh spawn, latency, and IPC handoffs cannot postpone that task again.
+    /// System wins a simultaneous expiry; User is selected on the following
+    /// bounded turn because its ready age remains saturated.
+    fn mandatory_overdue_pick(&self, current: usize, now_ticks: u64) -> Option<usize> {
+        self.overdue_system_pick(current, now_ticks).or_else(|| {
+            self.overdue_class_pick(
+                current,
+                now_ticks,
+                SchedClass::User,
+                USER_READY_LATENCY_BOUND_MS,
+            )
+        })
+    }
+
     /// Selects an overdue strict-class continuation before an unrelated IPC
     /// hint. A blocked caller's exact causal handoff is handled earlier in
     /// `dispatch_schedule`; this helper covers only the ordinary runnable
@@ -1420,7 +1477,15 @@ impl Scheduler {
         (slot, task, pid)
     }
 
+    #[track_caller]
     fn retire_slot(&mut self, slot: usize, reason: TaskRetireReason) {
+        assert_eq!(
+            nucleus_core::util::lockdep::irq_context_depth(),
+            0,
+            "task retirement finalization must run outside hardware interrupt context slot={} reason={:?}",
+            slot,
+            reason,
+        );
         let rust_stack_pointer: usize;
         unsafe {
             core::arch::asm!(
@@ -1455,6 +1520,32 @@ impl Scheduler {
         let task_id = self.starts[slot].map(|start| start.id);
         let process =
             self.contexts[slot].and_then(|context| context.process_handle.zip(context.process_id));
+        let process_terminal = process.is_some_and(|(process_handle, _)| {
+            self.is_last_live_user_task_for_process(slot, process_handle)
+        });
+        let retirement_cleanup =
+            self.contexts[slot]
+                .filter(|context| context.user_mode)
+                .map(|context| super::RetiredTaskCleanup {
+                    task_id: task_id.expect("live user task retirement requires a task identity"),
+                    process_id: context
+                        .process_id
+                        .expect("live user task retirement requires a process identity"),
+                    process_terminal,
+                    clear_child_tid: context
+                        .linux_thread_state
+                        .map(|state| state.clear_child_tid)
+                        .unwrap_or(0),
+                    robust_list_head: context
+                        .linux_thread_state
+                        .map(|state| state.robust_list_head)
+                        .unwrap_or(0),
+                    robust_list_len: context
+                        .linux_thread_state
+                        .map(|state| state.robust_list_len)
+                        .unwrap_or(0),
+                });
+        self.transfer_pending_process_sigchld(slot);
         if let Some(task_id) = task_id {
             self.release_ipc_priorities_for_task(task_id);
             // Deadline ownership is task-scoped, not slot-scoped. Retire it
@@ -1464,6 +1555,7 @@ impl Scheduler {
         }
         self.retired[slot] = true;
         self.pending_reap = true;
+        self.retirement_cleanup[slot] = retirement_cleanup;
         if let Some(context) = self.contexts[slot].as_mut() {
             context.ready = false;
             context.ready_since_ticks = 0;
@@ -1475,36 +1567,60 @@ impl Scheduler {
         if let Some(task_id) = task_id {
             self.cleanup_ipc_authority_for_task(task_id);
         }
-        if let Some((process_handle, process_id)) = process
-            && !self
-                .contexts
-                .iter()
-                .enumerate()
-                .any(|(candidate, context)| {
-                    candidate != slot
-                        && !self.retired[candidate]
-                        && context.is_some_and(|context| {
-                            context.user_mode && context.process_handle == Some(process_handle)
-                        })
-                })
+        if let Some((_, process_id)) = process
+            && process_terminal
         {
             self.cleanup_ipc_authority_for_process(process_id);
         }
     }
 
+    fn is_last_live_user_task_for_process(
+        &self,
+        slot: usize,
+        process_handle: ProcessHandle,
+    ) -> bool {
+        !self
+            .contexts
+            .iter()
+            .enumerate()
+            .any(|(candidate, context)| {
+                candidate != slot
+                    && !self.retired[candidate]
+                    && context.is_some_and(|context| {
+                        context.user_mode && context.process_handle == Some(process_handle)
+                    })
+            })
+    }
+
+    fn retire_exec_sibling_slot(&mut self, slot: usize) {
+        let process_handle = self.contexts[slot].and_then(|context| context.process_handle);
+        self.retire_slot(slot, TaskRetireReason::Exited);
+        if let Some(process_handle) = process_handle {
+            crate::debug::trace_loc!();
+            let _ = process_table::detach_task(process_handle);
+            if let Some(context) = self.contexts[slot].as_mut() {
+                // Exec needs the process thread count to commit immediately,
+                // but the task slot remains quarantined until deferred runtime
+                // cleanup acknowledges its stamped identity.
+                context.process_handle = None;
+            }
+        }
+    }
+
     fn cleanup_ipc_authority_for_task(&mut self, task_id: u64) {
         kernel_ipc_runtime::api::remove_endpoint_waiters_for_task(task_id);
-        let discarded = kernel_ipc_runtime::api::cancel_endpoint_calls_for_task(task_id);
-        crate::user::handles::drop_ipc_transfer_descriptors(discarded.as_slice());
+        kernel_ipc_runtime::api::cancel_endpoint_calls_for_task(task_id, |discarded| {
+            crate::user::handles::drop_ipc_transfer_descriptors(discarded);
+        });
         let endpoint_wake_set = kernel_ipc_runtime::api::fail_endpoints_owned_by_task(
             task_id,
             kernel_ipc_runtime::api::IpcError::PeerClosed,
         );
-        for caller in endpoint_wake_set.callers {
-            let _ = self.wake_task(caller);
+        for caller in endpoint_wake_set.callers() {
+            let _ = self.wake_task(*caller);
         }
-        for receiver in endpoint_wake_set.receivers {
-            let _ = self.wake_task(receiver);
+        for receiver in endpoint_wake_set.receivers() {
+            let _ = self.wake_task(*receiver);
         }
     }
 
@@ -1514,11 +1630,11 @@ impl Scheduler {
             process_id,
             kernel_ipc_runtime::api::IpcError::PeerClosed,
         );
-        for caller in endpoint_wake_set.callers {
-            let _ = self.wake_task(caller);
+        for caller in endpoint_wake_set.callers() {
+            let _ = self.wake_task(*caller);
         }
-        for receiver in endpoint_wake_set.receivers {
-            let _ = self.wake_task(receiver);
+        for receiver in endpoint_wake_set.receivers() {
+            let _ = self.wake_task(*receiver);
         }
     }
 
@@ -1795,8 +1911,10 @@ impl Scheduler {
     }
 
     fn context_is_schedulable(&self, slot: usize, context: TaskContext) -> bool {
-        self.context_validation_error(slot, context, context.saved_rsp)
-            .is_none()
+        !self.job_stopped[slot]
+            && self
+                .context_validation_error(slot, context, context.saved_rsp)
+                .is_none()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2277,6 +2395,7 @@ impl Scheduler {
         context_ptr
     }
 
+    #[track_caller]
     fn retire_slot_due_to_invalid_context(
         &mut self,
         slot: usize,
@@ -2287,10 +2406,57 @@ impl Scheduler {
             return;
         }
         self.mark_slot_ready(slot, saved_rsp, false);
-        self.retire_slot(
-            slot,
-            TaskRetireReason::CorruptedContext { saved_rsp, reason },
+        let retire_reason = TaskRetireReason::CorruptedContext { saved_rsp, reason };
+        if nucleus_core::util::lockdep::irq_context_depth() != 0 {
+            self.quarantine_slot_for_deferred_retirement(slot, retire_reason);
+        } else {
+            self.retire_slot(slot, retire_reason);
+        }
+    }
+
+    /// Make an invalid task undispatchable without running lifecycle teardown
+    /// in hardware interrupt context. The fixed scheduler slot itself is the
+    /// queue entry, so an interrupt storm cannot allocate or enqueue duplicate
+    /// work. Housekeeping later calls `retire_slot` to revoke IPC/process
+    /// authority and publish the normal runtime-cleanup snapshot.
+    fn quarantine_slot_for_deferred_retirement(&mut self, slot: usize, reason: TaskRetireReason) {
+        assert!(
+            slot != ROOT_TASK_SLOT,
+            "scheduler root kernel task cannot be quarantined"
         );
+        if self.deferred_retire_reasons[slot].is_some() {
+            return;
+        }
+        self.retired[slot] = true;
+        self.pending_reap = true;
+        self.retire_reasons[slot] = Some(reason);
+        self.deferred_retire_reasons[slot] = Some(reason);
+        if let Some(context) = self.contexts[slot].as_mut() {
+            context.ready = false;
+            context.ready_since_ticks = 0;
+            context.blocked = false;
+            context.blocked_since_ticks = 0;
+            context.wake_armed = false;
+        }
+    }
+
+    fn finalize_deferred_retirements(&mut self) {
+        assert_eq!(
+            nucleus_core::util::lockdep::irq_context_depth(),
+            0,
+            "deferred task retirement drained from interrupt context"
+        );
+        for slot in FIRST_DYNAMIC_TASK_SLOT..MAX_TASK {
+            let Some(reason) = self.deferred_retire_reasons[slot].take() else {
+                continue;
+            };
+            if self.contexts[slot].is_none() {
+                self.retired[slot] = false;
+                self.retire_reasons[slot] = None;
+                continue;
+            }
+            self.retire_slot(slot, reason);
+        }
     }
 
     fn log_invalid_context(
@@ -2345,15 +2511,69 @@ impl Scheduler {
 
     fn retire_invalid_ready_tasks(&mut self) {
         for slot in 1..MAX_TASK {
+            // Only a published runnable frame is immutable scheduler state.
+            // The current task's saved frame is the live kernel stack and may
+            // be overwritten until interrupt/syscall entry finishes saving
+            // it. Scanning that slot under load used to mistake a transient
+            // frame for corruption and retire a healthy process from the
+            // timer IRQ. Blocked, suspended, and already-retired slots are not
+            // dispatch candidates and are validated at their own transition.
             let Some(context) = self.contexts[slot] else {
                 continue;
             };
+            if !should_validate_published_ready_frame(
+                slot,
+                self.current_task,
+                self.retired[slot],
+                self.start_suspended[slot],
+                context.ready,
+                context.blocked,
+            ) {
+                continue;
+            }
             if let Err(reason) =
                 self.validate_saved_context(slot, context.user_mode, context.saved_rsp)
             {
                 self.log_invalid_context(slot, context.saved_rsp, reason, "ready-scan");
                 self.retire_slot_due_to_invalid_context(slot, context.saved_rsp, reason);
             }
+        }
+    }
+
+    /// Enforce the scheduler's complete live-task state partition at the
+    /// dispatch linearization point. After the outgoing task has published
+    /// either Ready or Blocked, every other admitted task must be runnable,
+    /// blocked, explicitly suspended/stopped, or retired. A live slot in none
+    /// of those states has lost both CPU ownership and wake authority; letting
+    /// the scheduler continue would turn a bounded wait into an invisible
+    /// permanent hang.
+    fn assert_live_task_state_partition(&self) {
+        for slot in 1..MAX_TASK {
+            let Some(context) = self.contexts[slot] else {
+                continue;
+            };
+            if live_task_state_is_partitioned(
+                slot,
+                self.current_task,
+                self.retired[slot],
+                self.start_suspended[slot],
+                self.job_stopped[slot],
+                context.ready,
+                context.blocked,
+            ) {
+                continue;
+            }
+            let task_id = self.starts[slot].map(|start| start.id).unwrap_or(0);
+            panic!(
+                "scheduler live task lost state partition: slot={} task={} pid={:?} current_slot={} ready={} blocked={} wake_armed={}",
+                slot,
+                task_id,
+                context.process_id,
+                self.current_task,
+                context.ready,
+                context.blocked,
+                context.wake_armed
+            );
         }
     }
 
@@ -2403,6 +2623,7 @@ impl Scheduler {
         }
 
         self.retire_invalid_ready_tasks();
+        self.assert_live_task_state_partition();
 
         // Refresh cached min_vruntime: this is fed to newly-spawned tasks so
         // they do not preempt the rest of the system on creation alone.
@@ -2424,40 +2645,49 @@ impl Scheduler {
         // handoff before the unrelated User reservation; a committed child
         // activation is already an explicit, one-shot bootstrap transfer and
         // must run before either category of ordinary IPC wakeup.
-        let bootstrap_handoff = self.take_next_bootstrap_handoff_ready_slot();
+        let mandatory_overdue = self.mandatory_overdue_pick(current_slot, now_ticks);
+        let bootstrap_handoff = if mandatory_overdue.is_none() {
+            self.take_next_bootstrap_handoff_ready_slot()
+        } else {
+            None
+        };
         let (next_idx, ipc_handoff, reserved_user_pick, latency_handoff_pick) =
-            match bootstrap_handoff {
-                Some((woken_slot, is_latency_handoff)) => {
-                    (woken_slot, true, None, is_latency_handoff)
-                }
-                None => {
-                    let blocking_ipc_handoff = self.contexts[current_slot]
-                        .is_some_and(|context| context.blocked)
-                        .then(|| self.take_next_pick_hint_ready_slot())
-                        .flatten();
-                    let (next_idx, ipc_handoff, reserved_user_pick) = match blocking_ipc_handoff {
-                        Some(receiver_slot) => (receiver_slot, true, None),
-                        None => match self.reserved_user_pick(current_slot, now_ticks) {
-                            Some(user_slot) => (user_slot, false, Some(user_slot)),
-                            None => {
-                                let overdue_or_hint =
-                                    self.take_overdue_system_or_pick_hint(current_slot, now_ticks);
-                                let cfs_pick = if voluntary_yield {
-                                    self.pick_min_vruntime_excluding(current_slot)
-                                        .or_else(|| self.pick_min_vruntime(current_slot))
-                                } else {
-                                    self.pick_min_vruntime(current_slot)
-                                };
-                                match (overdue_or_hint, cfs_pick) {
-                                    (Some(handoff_slot), _) => (handoff_slot, true, None),
-                                    (None, Some(slot)) => (slot, false, None),
-                                    (None, None) => (ROOT_TASK_SLOT, false, None),
+            match mandatory_overdue {
+                Some(overdue_slot) => (overdue_slot, true, None, false),
+                None => match bootstrap_handoff {
+                    Some((woken_slot, is_latency_handoff)) => {
+                        (woken_slot, true, None, is_latency_handoff)
+                    }
+                    None => {
+                        let blocking_ipc_handoff = self.contexts[current_slot]
+                            .is_some_and(|context| context.blocked)
+                            .then(|| self.take_next_pick_hint_ready_slot())
+                            .flatten();
+                        let (next_idx, ipc_handoff, reserved_user_pick) = match blocking_ipc_handoff
+                        {
+                            Some(receiver_slot) => (receiver_slot, true, None),
+                            None => match self.reserved_user_pick(current_slot, now_ticks) {
+                                Some(user_slot) => (user_slot, false, Some(user_slot)),
+                                None => {
+                                    let overdue_or_hint = self
+                                        .take_overdue_system_or_pick_hint(current_slot, now_ticks);
+                                    let cfs_pick = if voluntary_yield {
+                                        self.pick_min_vruntime_excluding(current_slot)
+                                            .or_else(|| self.pick_min_vruntime(current_slot))
+                                    } else {
+                                        self.pick_min_vruntime(current_slot)
+                                    };
+                                    match (overdue_or_hint, cfs_pick) {
+                                        (Some(handoff_slot), _) => (handoff_slot, true, None),
+                                        (None, Some(slot)) => (slot, false, None),
+                                        (None, None) => (ROOT_TASK_SLOT, false, None),
+                                    }
                                 }
-                            }
-                        },
-                    };
-                    (next_idx, ipc_handoff, reserved_user_pick, false)
-                }
+                            },
+                        };
+                        (next_idx, ipc_handoff, reserved_user_pick, false)
+                    }
+                },
             };
 
         // Apply min-granularity guard: if the CFS pick differs from current
@@ -2493,6 +2723,14 @@ impl Scheduler {
                     self.record_dispatch_class(next_idx);
                     self.record_latency_handoff(latency_handoff_pick);
                     self.current_task = next_idx;
+                    let next_task_id = self.starts[next_idx]
+                        .map(|start| start.id)
+                        .expect("schedulable task missing lockdep owner identity");
+                    nucleus_core::util::lockdep::set_current_task_owner(
+                        next_task_id
+                            .checked_add(1)
+                            .expect("task id exhausted lock owner token"),
+                    );
                     return (next.saved_rsp, self.scheduler_tick_divisor);
                 }
                 Some(reason) if next_idx == ROOT_TASK_SLOT => {
@@ -2637,7 +2875,9 @@ impl Scheduler {
         }
     }
 
-    // Kernel-thread start metadata is kept for upcoming worker-thread instrumentation.
+    // The entry trampoline reads this metadata indirectly through its higher-half
+    // address, so ordinary Rust call-site analysis cannot see the live use.
+    // ASSEMBLY: `task_entry_trampoline` is installed in a synthesized context.
     #[allow(dead_code)]
     pub(super) fn current_task_start(&self) -> Option<TaskStart> {
         self.starts[self.current_task].filter(|_| {
@@ -2716,12 +2956,17 @@ impl Scheduler {
             return 0;
         }
 
+        self.finalize_deferred_retirements();
         let active_root = self.contexts[self.current_task].map(|ctx| ctx.address_space_root);
         let mut still_pending = false;
         let mut reaped = 0;
 
         for slot in FIRST_DYNAMIC_TASK_SLOT..MAX_TASK {
             if !self.retired[slot] {
+                continue;
+            }
+            if self.retirement_cleanup[slot].is_some() {
+                still_pending = true;
                 continue;
             }
 
@@ -2743,6 +2988,28 @@ impl Scheduler {
 
         self.pending_reap = still_pending;
         reaped + process_table::reap_exited_processes()
+    }
+
+    pub(super) fn next_retired_task_cleanup(&self) -> Option<super::RetiredTaskCleanup> {
+        (FIRST_DYNAMIC_TASK_SLOT..MAX_TASK).find_map(|slot| {
+            if !self.retired[slot] {
+                return None;
+            }
+            self.retirement_cleanup[slot]
+        })
+    }
+
+    pub(super) fn complete_retired_task_cleanup(
+        &mut self,
+        cleanup: super::RetiredTaskCleanup,
+    ) -> bool {
+        let Some(slot) = (FIRST_DYNAMIC_TASK_SLOT..MAX_TASK)
+            .find(|slot| self.retired[*slot] && self.retirement_cleanup[*slot] == Some(cleanup))
+        else {
+            return false;
+        };
+        self.retirement_cleanup[slot] = None;
+        true
     }
 
     pub(super) fn save_current_simd_state(&mut self) {
@@ -2797,6 +3064,21 @@ impl Scheduler {
         let abi = context.user_abi?;
         let process_handle = context.process_handle?;
         Some((thread_id, abi, process_handle, context.console_session))
+    }
+
+    /// Snapshot the immutable identity needed by scheduler-owned wait keys.
+    ///
+    /// This must remain scheduler-local: futex admission runs before a task
+    /// has installed any timeout recovery authority and therefore cannot spin
+    /// behind unrelated same-process state mutation.
+    pub(super) fn current_user_wait_binding(&self) -> Option<(u64, UserAbi, u64)> {
+        let slot = self.current_task;
+        let context = self.contexts[slot]?;
+        if !context.user_mode {
+            return None;
+        }
+        let thread_id = self.starts[slot].map(|start| start.id)?;
+        Some((thread_id, context.user_abi?, context.address_space_root))
     }
 
     pub(super) fn current_linux_thread_state(&self) -> Option<LinuxThreadState> {
@@ -2911,32 +3193,22 @@ impl Scheduler {
         mut bootstrap: UserTaskBootstrap,
     ) -> Option<Vec<crate::user::handles::KernelHandle>> {
         let slot = self.current_task;
-        let Some(current_context) = self.contexts[slot] else {
-            return None;
-        };
+        let current_context = self.contexts[slot]?;
         if !current_context.user_mode {
             return None;
         }
 
-        let Some(process_handle) = current_context.process_handle else {
-            return None;
-        };
-        let Some(linux_process_state) = bootstrap.linux_process_state.take() else {
-            return None;
-        };
-        let Some(linux_memory_map) = bootstrap.linux_memory_map.take() else {
-            return None;
-        };
-        let Some(linux_runtime_profile) = bootstrap.linux_runtime_profile.take() else {
-            return None;
-        };
-
-        let Some(process_id) = current_context.process_id else {
-            return None;
-        };
+        let process_handle = current_context.process_handle?;
+        let linux_process_state = bootstrap.linux_process_state.take()?;
+        let linux_memory_map = bootstrap.linux_memory_map.take()?;
+        let linux_runtime_profile = bootstrap.linux_runtime_profile.take()?;
+        let process_id = current_context.process_id?;
         let exec_path = String::from(bootstrap.exec_path());
         let (sibling_slots, sibling_count) =
             self.collect_process_sibling_slots(slot, process_handle);
+        for sibling_slot in sibling_slots.iter().take(sibling_count) {
+            self.retire_exec_sibling_slot(*sibling_slot);
+        }
         let new_root = address_space.root_phys().as_u64();
         let preserved_signal_mask = current_context
             .linux_thread_state
@@ -2945,6 +3217,7 @@ impl Scheduler {
         if let Some(thread_state) = bootstrap.linux_thread_state.as_mut() {
             thread_state.signal_mask = preserved_signal_mask;
             thread_state.pending_signals = 0;
+            thread_state.pending_sigchld_events = 0;
         }
         let new_fs_base = bootstrap
             .linux_thread_state
@@ -2952,9 +3225,7 @@ impl Scheduler {
             .unwrap_or(0);
 
         {
-            let Some(context) = self.contexts[slot].as_mut() else {
-                return None;
-            };
+            let context = self.contexts[slot].as_mut()?;
             context.address_space_root = new_root;
             context.user_abi = Some(bootstrap.abi);
             context.console_session = bootstrap.console_session;
@@ -2967,6 +3238,8 @@ impl Scheduler {
         }
 
         self.retired[slot] = false;
+        self.retirement_cleanup[slot] = None;
+        self.deferred_retire_reasons[slot] = None;
         self.retire_reasons[slot] = None;
         self.simd_states[slot] = SimdState::new();
         self.syscall_user_simd_active[slot] = false;
@@ -2986,10 +3259,6 @@ impl Scheduler {
         )
         .expect("current process handle disappeared during exec");
 
-        for sibling_slot in sibling_slots.iter().take(sibling_count) {
-            self.clear_slot(*sibling_slot);
-        }
-
         FsBase::write(VirtAddr::new(new_fs_base));
         Some(closed_handles)
     }
@@ -3001,27 +3270,18 @@ impl Scheduler {
         address_space: ProcessAddressSpace,
         mut bootstrap: UserTaskBootstrap,
     ) -> Option<Vec<crate::user::handles::KernelHandle>> {
-        let Some(slot) = self.find_linux_thread_slot(process_id, thread_id) else {
-            return None;
-        };
-        let Some(current_context) = self.contexts[slot] else {
-            return None;
-        };
-        let Some(process_handle) = current_context.process_handle else {
-            return None;
-        };
-        let Some(linux_process_state) = bootstrap.linux_process_state.take() else {
-            return None;
-        };
-        let Some(linux_memory_map) = bootstrap.linux_memory_map.take() else {
-            return None;
-        };
-        let Some(linux_runtime_profile) = bootstrap.linux_runtime_profile.take() else {
-            return None;
-        };
+        let slot = self.find_linux_thread_slot(process_id, thread_id)?;
+        let current_context = self.contexts[slot]?;
+        let process_handle = current_context.process_handle?;
+        let linux_process_state = bootstrap.linux_process_state.take()?;
+        let linux_memory_map = bootstrap.linux_memory_map.take()?;
+        let linux_runtime_profile = bootstrap.linux_runtime_profile.take()?;
         let exec_path = String::from(bootstrap.exec_path());
         let (sibling_slots, sibling_count) =
             self.collect_process_sibling_slots(slot, process_handle);
+        for sibling_slot in sibling_slots.iter().take(sibling_count) {
+            self.retire_exec_sibling_slot(*sibling_slot);
+        }
         let new_root = address_space.root_phys().as_u64();
         let preserved_signal_mask = current_context
             .linux_thread_state
@@ -3030,6 +3290,7 @@ impl Scheduler {
         if let Some(thread_state) = bootstrap.linux_thread_state.as_mut() {
             thread_state.signal_mask = preserved_signal_mask;
             thread_state.pending_signals = 0;
+            thread_state.pending_sigchld_events = 0;
         }
         let new_fs_base = bootstrap
             .linux_thread_state
@@ -3041,9 +3302,7 @@ impl Scheduler {
         let saved_rsp = self.init_user_task_context(slot, &bootstrap, user_cs, user_ss, rflags);
 
         {
-            let Some(context) = self.contexts[slot].as_mut() else {
-                return None;
-            };
+            let context = self.contexts[slot].as_mut()?;
             context.saved_rsp = saved_rsp;
             context.address_space_root = new_root;
             context.user_abi = Some(bootstrap.abi);
@@ -3056,6 +3315,8 @@ impl Scheduler {
             context.ready_since_ticks = crate::arch::rtc::ticks();
         }
         self.retired[slot] = false;
+        self.retirement_cleanup[slot] = None;
+        self.deferred_retire_reasons[slot] = None;
         self.retire_reasons[slot] = None;
         self.simd_states[slot] = SimdState::new();
         self.syscall_user_simd_active[slot] = false;
@@ -3078,9 +3339,6 @@ impl Scheduler {
         )
         .expect("target process handle disappeared during exec");
 
-        for sibling_slot in sibling_slots.iter().take(sibling_count) {
-            self.clear_slot(*sibling_slot);
-        }
         Some(closed_handles)
     }
 
@@ -3106,48 +3364,184 @@ impl Scheduler {
         task_id: u64,
         signal: u64,
     ) -> bool {
-        let signal_bit = crate::user::sysops::linux::linux_signal_bit(signal);
+        let Some(slot) = self.find_linux_thread_slot(process_id, task_id) else {
+            return false;
+        };
+        self.queue_linux_signal_to_slot(slot, process_id, signal, 0)
+    }
 
-        for slot in 0..MAX_TASK {
-            if self.retired[slot] {
-                continue;
-            }
-            let Some(context) = self.contexts[slot].as_mut() else {
-                continue;
-            };
-            if !context.user_mode || context.user_abi != Some(UserAbi::Linux) {
-                continue;
-            }
-            let Some(start) = self.starts[slot] else {
-                continue;
-            };
-            if start.id != task_id {
-                continue;
-            }
-            if context.process_id != Some(process_id) {
-                continue;
-            }
-            if signal == 0 {
-                return true;
-            }
-            let Some(thread_state) = context.linux_thread_state.as_mut() else {
-                continue;
-            };
+    pub(super) fn queue_linux_process_sigchld(&mut self, process_id: u64, events: u32) -> bool {
+        if events == 0 || events & !rustos_user_abi::syscall::PROCD_SIGCHLD_EVENT_MASK != 0 {
+            return false;
+        }
+        let slot = self
+            .find_linux_thread_slot(process_id, process_id)
+            .or_else(|| {
+                (0..MAX_TASK).find(|slot| {
+                    !self.retired[*slot]
+                        && self.contexts[*slot].is_some_and(|context| {
+                            context.user_mode
+                                && context.user_abi == Some(UserAbi::Linux)
+                                && context.process_id == Some(process_id)
+                        })
+                })
+            });
+        let Some(slot) = slot else {
+            return false;
+        };
+        self.queue_linux_signal_to_slot(slot, process_id, rustos_user_abi::linux::SIGCHLD, events)
+    }
 
-            let Some(signal_bit) = signal_bit else {
-                return false;
-            };
-            thread_state.pending_signals |= signal_bit;
-            if thread_state.signal_mask & signal_bit == 0 {
-                context.blocked = false;
-                context.blocked_since_ticks = 0;
-                context.ready = true;
-                context.ready_since_ticks = crate::arch::rtc::ticks();
-            }
+    fn transfer_pending_process_sigchld(&mut self, retiring_slot: usize) {
+        let Some((process_id, events)) = self.contexts[retiring_slot].and_then(|context| {
+            let state = context.linux_thread_state?;
+            (state.pending_sigchld_events != 0)
+                .then_some((context.process_id?, state.pending_sigchld_events))
+        }) else {
+            return;
+        };
+        let target = (0..MAX_TASK)
+            .filter(|slot| *slot != retiring_slot && !self.retired[*slot])
+            .filter(|slot| {
+                self.contexts[*slot].is_some_and(|context| {
+                    context.user_mode
+                        && context.user_abi == Some(UserAbi::Linux)
+                        && context.process_id == Some(process_id)
+                        && context.linux_thread_state.is_some()
+                })
+            })
+            .min_by_key(|slot| {
+                (
+                    self.starts[*slot].map(|start| start.id) != Some(process_id),
+                    *slot,
+                )
+            });
+        let Some(target) = target else {
+            return;
+        };
+        if !self.queue_linux_signal_to_slot(
+            target,
+            process_id,
+            rustos_user_abi::linux::SIGCHLD,
+            events,
+        ) {
+            return;
+        }
+        let sigchld_bit =
+            crate::user::sysops::linux::linux_signal_bit(rustos_user_abi::linux::SIGCHLD)
+                .expect("SIGCHLD must have a pending-signal bit");
+        if let Some(state) = self.contexts[retiring_slot]
+            .as_mut()
+            .and_then(|context| context.linux_thread_state.as_mut())
+        {
+            state.pending_sigchld_events = 0;
+            state.pending_signals &= !sigchld_bit;
+        }
+    }
+
+    fn queue_linux_signal_to_slot(
+        &mut self,
+        slot: usize,
+        process_id: u64,
+        signal: u64,
+        sigchld_events: u32,
+    ) -> bool {
+        if signal == 0 {
             return true;
         }
+        let Some(signal_bit) = crate::user::sysops::linux::linux_signal_bit(signal) else {
+            return false;
+        };
+        if signal == rustos_user_abi::linux::SIGCONT || signal == rustos_user_abi::linux::SIGKILL {
+            self.continue_linux_process(process_id);
+        }
+        let Some(context) = self.contexts[slot].as_mut() else {
+            return false;
+        };
+        let Some(thread_state) = context.linux_thread_state.as_mut() else {
+            return false;
+        };
+        if signal == rustos_user_abi::linux::SIGCHLD {
+            thread_state.pending_sigchld_events |= sigchld_events;
+        } else if sigchld_events != 0 {
+            return false;
+        }
+        thread_state.pending_signals |= signal_bit;
+        if thread_state.signal_mask & signal_bit == 0 {
+            context.blocked = false;
+            context.blocked_since_ticks = 0;
+            context.ready = true;
+            context.ready_since_ticks = crate::arch::rtc::ticks();
+        }
+        true
+    }
 
-        false
+    pub(super) fn stop_current_linux_process(&mut self, signal: u64) -> bool {
+        let current = self.current_task;
+        let Some(process_id) = self.contexts[current].and_then(|context| {
+            (context.user_mode && context.user_abi == Some(UserAbi::Linux))
+                .then_some(context.process_id)
+                .flatten()
+        }) else {
+            return false;
+        };
+        let mut changed = false;
+        for slot in 0..MAX_TASK {
+            if self.retired[slot]
+                || !self.contexts[slot].is_some_and(|context| {
+                    context.user_mode
+                        && context.user_abi == Some(UserAbi::Linux)
+                        && context.process_id == Some(process_id)
+                })
+            {
+                continue;
+            }
+            changed |= !self.job_stopped[slot];
+            self.job_stopped[slot] = true;
+        }
+        if changed {
+            let _ = process_table::note_process_stopped(process_id, signal);
+            if let Some(parent_process_id) = process_table::parent_process_id_of(process_id)
+                && parent_process_id != 0
+            {
+                let _ = self.queue_linux_process_sigchld(
+                    parent_process_id,
+                    rustos_user_abi::syscall::PROCD_SIGCHLD_EVENT_STOP,
+                );
+            }
+            super::request_deferred_reschedule();
+        }
+        changed
+    }
+
+    fn continue_linux_process(&mut self, process_id: u64) -> bool {
+        let mut changed = false;
+        for slot in 0..MAX_TASK {
+            if self.retired[slot]
+                || !self.contexts[slot].is_some_and(|context| {
+                    context.user_mode
+                        && context.user_abi == Some(UserAbi::Linux)
+                        && context.process_id == Some(process_id)
+                })
+            {
+                continue;
+            }
+            changed |= self.job_stopped[slot];
+            self.job_stopped[slot] = false;
+        }
+        if changed {
+            let _ = process_table::note_process_continued(process_id);
+            if let Some(parent_process_id) = process_table::parent_process_id_of(process_id)
+                && parent_process_id != 0
+            {
+                let _ = self.queue_linux_process_sigchld(
+                    parent_process_id,
+                    rustos_user_abi::syscall::PROCD_SIGCHLD_EVENT_CONTINUE,
+                );
+            }
+            super::request_deferred_reschedule();
+        }
+        changed
     }
 
     fn find_linux_thread_slot(&self, process_id: u64, thread_id: u64) -> Option<usize> {
@@ -3343,6 +3737,13 @@ impl Scheduler {
         if self.retired[slot] {
             return false;
         }
+        if let Some((process_handle, process_id)) =
+            self.contexts[slot].and_then(|context| context.process_handle.zip(context.process_id))
+            && self.is_last_live_user_task_for_process(slot, process_handle)
+            && process_table::mark_process_exiting(process_id).is_none()
+        {
+            return false;
+        }
 
         self.retire_slot(slot, TaskRetireReason::Terminated { requested_by_pid });
         true
@@ -3368,6 +3769,12 @@ impl Scheduler {
         if self.retired[leader_slot] {
             return false;
         }
+        // Exit publication precedes task retirement. This closes thread
+        // attachment and process-scoped authority admission before any
+        // sibling can disappear or terminal cleanup can begin.
+        if process_table::mark_process_exiting(process_id).is_none() {
+            return false;
+        }
         let (sibling_slots, sibling_count) =
             self.collect_process_sibling_slots(leader_slot, process_handle);
         for slot in sibling_slots.into_iter().take(sibling_count) {
@@ -3379,46 +3786,6 @@ impl Scheduler {
             leader_slot,
             TaskRetireReason::Terminated { requested_by_pid },
         );
-        true
-    }
-
-    pub(super) fn block_current_user_task(&mut self) -> bool {
-        let slot = self.current_task;
-        if self.retired[slot] || self.start_suspended[slot] {
-            return false;
-        }
-        let Some(context) = self.contexts[slot].as_mut() else {
-            return false;
-        };
-        if !context.user_mode || context.blocked {
-            return false;
-        }
-
-        context.blocked = true;
-        context.ready = false;
-        context.ready_since_ticks = 0;
-        context.blocked_since_ticks = crate::arch::rtc::ticks();
-        context.wake_armed = false;
-        true
-    }
-
-    pub(super) fn block_current_task(&mut self) -> bool {
-        let slot = self.current_task;
-        if slot == ROOT_TASK_SLOT || self.retired[slot] || self.start_suspended[slot] {
-            return false;
-        }
-        let Some(context) = self.contexts[slot].as_mut() else {
-            return false;
-        };
-        if context.blocked {
-            return false;
-        }
-
-        context.blocked = true;
-        context.ready = false;
-        context.ready_since_ticks = 0;
-        context.blocked_since_ticks = crate::arch::rtc::ticks();
-        context.wake_armed = false;
         true
     }
 
@@ -3535,6 +3902,24 @@ impl Scheduler {
                 ),
                 None => return false,
             };
+        if slot == self.current_task && !was_blocked {
+            // Dispatch consumed the current task's published interrupt frame.
+            // `saved_rsp` therefore names ordinary, reusable stack storage
+            // until the next schedule trap publishes a new frame.  A wake in
+            // the check-arm-commit window is only a token transition: clear
+            // the arm/block state and let commit report the race.  Validating
+            // the consumed frame here can quarantine a healthy running task
+            // after normal Rust stack writes have reused those bytes.
+            let context = self.contexts[slot]
+                .as_mut()
+                .expect("current scheduler slot lost its context during wake");
+            context.wake_armed = false;
+            context.blocked = false;
+            context.ready = false;
+            context.ready_since_ticks = 0;
+            context.blocked_since_ticks = 0;
+            return true;
+        }
         let already_runnable = was_ready && !was_blocked && !wake_was_armed;
         let invalid_reason = self
             .validate_saved_context(slot, user_mode, saved_rsp)
@@ -3585,7 +3970,7 @@ impl Scheduler {
             }
             (
                 context.vruntime_ns,
-                context.ready && invalid_reason.is_none(),
+                context.ready && invalid_reason.is_none() && !self.job_stopped[slot],
             )
         };
 
@@ -3665,6 +4050,25 @@ impl Scheduler {
         };
         let (sibling_slots, sibling_count) =
             self.collect_process_sibling_slots(current_slot, process_handle);
+        for slot in sibling_slots.iter().copied().take(sibling_count) {
+            if let Some(context) = self.contexts[slot] {
+                crate::debug::println!(
+                    "scheduler exit snapshot: slot={} task={} pid={:?} current_slot={} ready={} blocked={} armed={} suspended={} stopped={} retired={} ready_since={} blocked_since={}",
+                    slot,
+                    self.starts[slot].map(|start| start.id).unwrap_or(0),
+                    context.process_id,
+                    current_slot,
+                    context.ready,
+                    context.blocked,
+                    context.wake_armed,
+                    self.start_suspended[slot],
+                    self.job_stopped[slot],
+                    self.retired[slot],
+                    context.ready_since_ticks,
+                    context.blocked_since_ticks
+                );
+            }
+        }
         for slot in sibling_slots.into_iter().take(sibling_count) {
             self.retire_slot(slot, TaskRetireReason::Exited);
         }
@@ -3797,6 +4201,29 @@ fn stack_range_contains(base: u64, top: u64, start: usize, end: usize) -> bool {
     start >= base as usize && end <= top as usize
 }
 
+fn should_validate_published_ready_frame(
+    slot: usize,
+    current_slot: usize,
+    retired: bool,
+    start_suspended: bool,
+    ready: bool,
+    blocked: bool,
+) -> bool {
+    slot != current_slot && !retired && !start_suspended && ready && !blocked
+}
+
+fn live_task_state_is_partitioned(
+    slot: usize,
+    current_slot: usize,
+    retired: bool,
+    start_suspended: bool,
+    job_stopped: bool,
+    ready: bool,
+    blocked: bool,
+) -> bool {
+    slot == current_slot || retired || start_suspended || job_stopped || ready || blocked
+}
+
 /// Every hardware or `syscall` transition stack top is a SysV x86_64 call
 /// boundary. Heap-backed task stacks are byte buffers and therefore do not
 /// carry a stronger allocator alignment guarantee of their own.
@@ -3816,8 +4243,9 @@ mod tests {
     use crate::memory::paging::ProcessAddressSpace;
     use crate::multitask::{UserTaskBootstrap, noop_task_entry, process_table};
     use crate::user::abi::UserAbi;
+    use crate::user::linux::LinuxThreadState;
     use crate::user::process_state::UserProcessState;
-    use kernel_ipc_runtime::api::IpcError;
+    use kernel_ipc_runtime::api::{EndpointResponseTake, IpcError};
 
     static TEST_SCHEDULER_TEMPLATE: Scheduler = Scheduler::new();
 
@@ -3905,7 +4333,33 @@ mod tests {
     }
 
     #[test]
+    fn ready_validation_accepts_only_immutable_published_frames() {
+        use super::should_validate_published_ready_frame as should_validate;
+
+        assert!(should_validate(2, 1, false, false, true, false));
+        assert!(!should_validate(1, 1, false, false, true, false));
+        assert!(!should_validate(2, 1, true, false, true, false));
+        assert!(!should_validate(2, 1, false, true, true, false));
+        assert!(!should_validate(2, 1, false, false, false, false));
+        assert!(!should_validate(2, 1, false, false, true, true));
+    }
+
+    #[test]
+    fn live_noncurrent_task_must_retain_one_scheduler_state_owner() {
+        use super::live_task_state_is_partitioned as partitioned;
+
+        assert!(partitioned(1, 1, false, false, false, false, false));
+        assert!(partitioned(2, 1, false, false, false, true, false));
+        assert!(partitioned(2, 1, false, false, false, false, true));
+        assert!(partitioned(2, 1, true, false, false, false, false));
+        assert!(partitioned(2, 1, false, true, false, false, false));
+        assert!(partitioned(2, 1, false, false, true, false, false));
+        assert!(!partitioned(2, 1, false, false, false, false, false));
+    }
+
+    #[test]
     fn collect_process_sibling_slots_returns_matching_user_slots_only() {
+        let _process_table = process_table::tests::isolate_process_table();
         let mut scheduler = boxed_scheduler();
         let owner = test_process(1);
         let other = test_process(2);
@@ -3926,7 +4380,124 @@ mod tests {
     }
 
     #[test]
+    fn process_stop_is_scheduler_wide_and_sigcont_resumes_before_delivery() {
+        let _process_table = process_table::tests::isolate_process_table();
+        let mut scheduler = boxed_scheduler();
+        let process = test_process(48);
+        process_table::attach_task(process).expect("second thread");
+        let mut leader = test_user_context(process);
+        leader.linux_thread_state = Some(LinuxThreadState::default());
+        let mut worker = test_user_context(process);
+        worker.linux_thread_state = Some(LinuxThreadState::default());
+        scheduler.contexts[1] = Some(leader);
+        scheduler.contexts[2] = Some(worker);
+        scheduler.starts[1] = Some(TaskStart {
+            entry: noop_task_entry,
+            id: 48,
+        });
+        scheduler.starts[2] = Some(TaskStart {
+            entry: noop_task_entry,
+            id: 49,
+        });
+        scheduler.current_task = 1;
+
+        assert!(scheduler.stop_current_linux_process(19));
+        assert!(scheduler.job_stopped[1]);
+        assert!(scheduler.job_stopped[2]);
+        assert!(!scheduler.stop_current_linux_process(19));
+
+        assert!(scheduler.queue_linux_signal(48, 48, rustos_user_abi::linux::SIGCONT));
+        assert!(!scheduler.job_stopped[1]);
+        assert!(!scheduler.job_stopped[2]);
+        let pending = scheduler.contexts[1]
+            .and_then(|context| context.linux_thread_state)
+            .map(|state| state.pending_signals)
+            .unwrap_or(0);
+        assert_ne!(
+            pending
+                & crate::user::sysops::linux::linux_signal_bit(rustos_user_abi::linux::SIGCONT)
+                    .unwrap(),
+            0
+        );
+
+        process_table::note_process_exit_status(48, 0).expect("record exit");
+        process_table::detach_task(process).expect("detach leader");
+        process_table::detach_task(process).expect("detach worker");
+        assert_eq!(process_table::reap_exited_processes(), 1);
+    }
+
+    #[test]
+    fn process_sigchld_prefers_leader_and_retains_exact_coalesced_causes() {
+        let _process_table = process_table::tests::isolate_process_table();
+        let mut scheduler = boxed_scheduler();
+        let process = test_process(50);
+        process_table::attach_task(process).expect("second thread");
+        let mut leader = test_user_context(process);
+        leader.linux_thread_state = Some(LinuxThreadState::default());
+        let mut worker = test_user_context(process);
+        worker.linux_thread_state = Some(LinuxThreadState::default());
+        scheduler.contexts[1] = Some(leader);
+        scheduler.contexts[2] = Some(worker);
+        scheduler.starts[1] = Some(TaskStart {
+            entry: noop_task_entry,
+            id: 50,
+        });
+        scheduler.starts[2] = Some(TaskStart {
+            entry: noop_task_entry,
+            id: 51,
+        });
+
+        assert!(
+            scheduler.queue_linux_process_sigchld(
+                50,
+                rustos_user_abi::syscall::PROCD_SIGCHLD_EVENT_STOP
+            )
+        );
+        assert_eq!(
+            scheduler.contexts[1]
+                .and_then(|context| context.linux_thread_state)
+                .map(|state| state.pending_sigchld_events),
+            Some(rustos_user_abi::syscall::PROCD_SIGCHLD_EVENT_STOP)
+        );
+
+        scheduler.transfer_pending_process_sigchld(1);
+        assert_eq!(
+            scheduler.contexts[1]
+                .and_then(|context| context.linux_thread_state)
+                .map(|state| state.pending_sigchld_events),
+            Some(0)
+        );
+        assert_eq!(
+            scheduler.contexts[2]
+                .and_then(|context| context.linux_thread_state)
+                .map(|state| state.pending_sigchld_events),
+            Some(rustos_user_abi::syscall::PROCD_SIGCHLD_EVENT_STOP)
+        );
+
+        scheduler.retired[1] = true;
+        assert!(scheduler.queue_linux_process_sigchld(
+            50,
+            rustos_user_abi::syscall::PROCD_SIGCHLD_EVENT_CONTINUE
+        ));
+        assert_eq!(
+            scheduler.contexts[2]
+                .and_then(|context| context.linux_thread_state)
+                .map(|state| state.pending_sigchld_events),
+            Some(
+                rustos_user_abi::syscall::PROCD_SIGCHLD_EVENT_STOP
+                    | rustos_user_abi::syscall::PROCD_SIGCHLD_EVENT_CONTINUE
+            )
+        );
+
+        process_table::note_process_exit_status(50, 0).expect("record exit");
+        process_table::detach_task(process).expect("detach leader");
+        process_table::detach_task(process).expect("detach worker");
+        assert_eq!(process_table::reap_exited_processes(), 1);
+    }
+
+    #[test]
     fn terminate_user_process_retires_every_live_sibling() {
+        let _process_table = process_table::tests::isolate_process_table();
         let mut scheduler = boxed_scheduler();
         let owner = test_process(41);
         let other = test_process(42);
@@ -3948,13 +4519,31 @@ mod tests {
         });
 
         assert!(scheduler.terminate_user_process(41, Some(7)));
+        assert_eq!(process_table::is_process_exiting(41), Some(true));
         assert!(scheduler.retired[1]);
         assert!(scheduler.retired[2]);
         assert!(!scheduler.retired[3]);
     }
 
     #[test]
+    fn terminating_the_last_task_marks_its_process_exiting() {
+        let _process_table = process_table::tests::isolate_process_table();
+        let mut scheduler = boxed_scheduler();
+        let owner = test_process(45);
+        scheduler.contexts[1] = Some(test_user_context(owner));
+        scheduler.starts[1] = Some(TaskStart {
+            entry: noop_task_entry,
+            id: 451,
+        });
+
+        assert!(scheduler.terminate_user_task(451, Some(7)));
+        assert_eq!(process_table::is_process_exiting(45), Some(true));
+        assert!(scheduler.retired[1]);
+    }
+
+    #[test]
     fn retirement_revokes_task_and_process_ipc_authority() {
+        let _process_table = process_table::tests::isolate_process_table();
         let mut scheduler = boxed_scheduler();
         let owner = test_process(94);
         scheduler.contexts[1] = Some(test_user_context(owner));
@@ -3981,14 +4570,20 @@ mod tests {
             },
         );
 
-        assert_eq!(
-            kernel_ipc_runtime::api::take_endpoint_response(task_reply),
-            Err(IpcError::PeerClosed)
-        );
-        assert_eq!(
-            kernel_ipc_runtime::api::take_endpoint_response(process_reply),
-            Err(IpcError::PeerClosed)
-        );
+        assert!(matches!(
+            kernel_ipc_runtime::api::take_endpoint_response_detailed(task_reply, 0),
+            Ok(EndpointResponseTake::Error {
+                error: IpcError::PeerClosed,
+                discarded_request_handles,
+            }) if discarded_request_handles.is_empty()
+        ));
+        assert!(matches!(
+            kernel_ipc_runtime::api::take_endpoint_response_detailed(process_reply, 0),
+            Ok(EndpointResponseTake::Error {
+                error: IpcError::PeerClosed,
+                discarded_request_handles,
+            }) if discarded_request_handles.is_empty()
+        ));
         assert_eq!(
             kernel_ipc_runtime::api::enqueue_endpoint_call(task_endpoint, 953, b"late-task"),
             Err(IpcError::InvalidHandle)
@@ -4000,7 +4595,106 @@ mod tests {
     }
 
     #[test]
+    fn retired_user_slot_waits_for_exact_runtime_cleanup_ack() {
+        let _process_table = process_table::tests::isolate_process_table();
+        let mut scheduler = boxed_scheduler();
+        let owner = test_process(96);
+        scheduler.contexts[1] = Some(test_user_context(owner));
+        scheduler.starts[1] = Some(TaskStart {
+            entry: noop_task_entry,
+            id: 961,
+        });
+
+        scheduler.retire_slot(1, super::TaskRetireReason::Exited);
+        let cleanup = scheduler
+            .next_retired_task_cleanup()
+            .expect("retired user task cleanup");
+        assert_eq!(cleanup.task_id(), 961);
+        assert_eq!(cleanup.process_id(), 96);
+        assert!(cleanup.process_terminal());
+        assert_eq!(scheduler.reap_inactive_retired_slots(), 0);
+        assert!(scheduler.contexts[1].is_some());
+
+        assert!(
+            !scheduler.complete_retired_task_cleanup(crate::multitask::RetiredTaskCleanup {
+                task_id: 962,
+                process_id: 96,
+                process_terminal: true,
+                clear_child_tid: 0,
+                robust_list_head: 0,
+                robust_list_len: 0,
+            })
+        );
+        assert!(scheduler.complete_retired_task_cleanup(cleanup));
+        assert!(scheduler.reap_inactive_retired_slots() >= 1);
+        assert!(scheduler.contexts[1].is_none());
+    }
+
+    #[test]
+    fn retirement_cleanup_stamps_process_terminal_only_on_last_live_thread() {
+        let _process_table = process_table::tests::isolate_process_table();
+        let mut scheduler = boxed_scheduler();
+        let owner = test_process(97);
+        scheduler.contexts[1] = Some(test_user_context(owner));
+        scheduler.contexts[2] = Some(test_user_context(owner));
+        scheduler.starts[1] = Some(TaskStart {
+            entry: noop_task_entry,
+            id: 971,
+        });
+        scheduler.starts[2] = Some(TaskStart {
+            entry: noop_task_entry,
+            id: 972,
+        });
+
+        scheduler.retire_slot(1, super::TaskRetireReason::Exited);
+        let first = scheduler
+            .next_retired_task_cleanup()
+            .expect("first thread cleanup");
+        assert_eq!(first.task_id(), 971);
+        assert!(!first.process_terminal());
+        assert!(scheduler.complete_retired_task_cleanup(first));
+
+        scheduler.retire_slot(2, super::TaskRetireReason::Exited);
+        let last = scheduler
+            .next_retired_task_cleanup()
+            .expect("last thread cleanup");
+        assert_eq!(last.task_id(), 972);
+        assert!(last.process_terminal());
+    }
+
+    #[test]
+    fn exec_sibling_slot_stays_quarantined_until_runtime_cleanup() {
+        let _process_table = process_table::tests::isolate_process_table();
+        let mut scheduler = boxed_scheduler();
+        let owner = test_process(98);
+        scheduler.contexts[1] = Some(test_user_context(owner));
+        scheduler.contexts[2] = Some(test_user_context(owner));
+        scheduler.starts[1] = Some(TaskStart {
+            entry: noop_task_entry,
+            id: 981,
+        });
+        scheduler.starts[2] = Some(TaskStart {
+            entry: noop_task_entry,
+            id: 982,
+        });
+
+        scheduler.retire_exec_sibling_slot(2);
+        assert!(scheduler.retired[2]);
+        assert!(scheduler.contexts[2].is_some());
+        assert_eq!(scheduler.contexts[2].unwrap().process_handle, None);
+        assert_eq!(
+            scheduler
+                .next_retired_task_cleanup()
+                .map(|cleanup| cleanup.task_id()),
+            Some(982)
+        );
+        let _ = scheduler.reap_inactive_retired_slots();
+        assert!(scheduler.contexts[2].is_some());
+    }
+
+    #[test]
     fn rejected_thread_attachment_releases_unpublished_stack() {
+        let _process_table = process_table::tests::isolate_process_table();
         let mut scheduler = boxed_scheduler();
         let owner = test_process(95);
         scheduler.current_task = 1;
@@ -4024,6 +4718,7 @@ mod tests {
 
     #[test]
     fn synchronous_ipc_donation_promotes_and_revokes_a_transitive_user_chain() {
+        let _process_table = process_table::tests::isolate_process_table();
         let mut scheduler = boxed_scheduler();
         let interactive = test_process(61);
         let broker = test_process(62);
@@ -4136,7 +4831,53 @@ mod tests {
     }
 
     #[test]
+    fn raced_wake_never_validates_a_consumed_current_frame() {
+        let mut scheduler = boxed_scheduler();
+        let slot = 1;
+        scheduler.contexts[slot] = Some(TaskContext {
+            // Dispatch consumed this frame. Deliberately leave an address that
+            // could never be validated as a published continuation.
+            saved_rsp: 0,
+            ready: false,
+            ready_since_ticks: 0,
+            blocked: false,
+            blocked_since_ticks: 0,
+            wake_armed: true,
+            weight: NICE_0_LOAD,
+            vruntime_ns: 0,
+            exec_start_ticks: 0,
+            address_space_root: 0,
+            kernel_stack_base: 0,
+            kernel_stack_top: 0,
+            alternate_kernel_stack_base: 0,
+            alternate_kernel_stack_top: 0,
+            user_mode: true,
+            user_abi: Some(UserAbi::Linux),
+            console_session: ConsoleSessionHandle::SYSTEM,
+            process_handle: None,
+            process_id: None,
+            user_stack: None,
+            linux_thread_state: None,
+            windows_thread_state: None,
+        });
+        scheduler.starts[slot] = Some(TaskStart {
+            entry: noop_task_entry,
+            id: 691,
+        });
+        scheduler.current_task = slot;
+
+        assert!(scheduler.wake_task(691));
+        let context = scheduler.contexts[slot].expect("running task survived raced wake");
+        assert!(!scheduler.retired[slot]);
+        assert!(!context.ready);
+        assert!(!context.blocked);
+        assert!(!context.wake_armed);
+        assert_eq!(scheduler.commit_block_current_task(), Some(false));
+    }
+
+    #[test]
     fn strict_class_requires_explicit_admission_not_a_large_cfs_weight() {
+        let _process_table = process_table::tests::isolate_process_table();
         let mut scheduler = boxed_scheduler();
         let broker = test_process(69);
         let interactive = test_process(70);
@@ -4154,6 +4895,7 @@ mod tests {
 
     #[test]
     fn self_demotion_removes_only_the_base_system_class() {
+        let _process_table = process_table::tests::isolate_process_table();
         let mut scheduler = boxed_scheduler();
         let helper = test_process(73);
         let donor = test_process(74);
@@ -4194,6 +4936,7 @@ mod tests {
 
     #[test]
     fn bounded_system_burst_reserves_a_ready_user_turn() {
+        let _process_table = process_table::tests::isolate_process_table();
         let mut scheduler = boxed_scheduler();
         let system = test_process(71);
         let user = test_process(72);
@@ -4373,6 +5116,69 @@ mod tests {
             Some(hinted)
         );
         assert_eq!(scheduler.next_pick_hint, None);
+    }
+
+    #[test]
+    fn overdue_system_continuation_precedes_a_fresh_latency_handoff() {
+        let mut scheduler = boxed_scheduler();
+        let base = crate::memory::paging::USER_SPACE_BASE;
+        let user_cs = crate::arch::gdt::user_code_selector().0 as u64;
+        let user_ss = crate::arch::gdt::user_data_selector().0 as u64;
+        let mut allocate = |task_id, offset, system| {
+            scheduler
+                .allocate_user_slot(
+                    task_id,
+                    ProcessAddressSpace::empty_for_tests(),
+                    UserTaskBootstrap::new(
+                        UserAbi::Linux,
+                        x86_64::VirtAddr::new(base + offset),
+                        x86_64::VirtAddr::new(base + offset + 0x1_000),
+                    ),
+                    None,
+                    crate::arch::pit::divisor_from_micros(if system { 2_000 } else { 100 })
+                        | if system {
+                            super::INTERACTIVE_PIT_DIVISOR_FLAG
+                        } else {
+                            0
+                        },
+                    user_cs,
+                    user_ss,
+                    super::RFLAGS_RESERVED_BIT_1,
+                    false,
+                    noop_task_entry,
+                )
+                .expect("task slot")
+        };
+        let current = allocate(821, 0x2_000, true);
+        let overdue = allocate(822, 0x4_000, true);
+        let hinted = allocate(823, 0x6_000, false);
+        let now_ticks = crate::arch::rtc::ticks_per_second().saturating_mul(2);
+        scheduler.contexts[overdue]
+            .as_mut()
+            .expect("overdue context")
+            .ready_since_ticks = 1;
+        scheduler.contexts[hinted]
+            .as_mut()
+            .expect("hinted context")
+            .ready_since_ticks = now_ticks;
+        scheduler.current_task = current;
+        assert!(scheduler.set_next_latency_pick_hint(823));
+
+        assert_eq!(
+            scheduler.mandatory_overdue_pick(current, now_ticks),
+            Some(overdue)
+        );
+        assert_eq!(scheduler.latency_pick_hint_len, 1);
+
+        scheduler.contexts[overdue]
+            .as_mut()
+            .expect("overdue context")
+            .ready = false;
+        assert_eq!(scheduler.mandatory_overdue_pick(current, now_ticks), None);
+        assert_eq!(
+            scheduler.take_next_latency_pick_hint_ready_slot(),
+            Some(hinted)
+        );
     }
 
     #[test]

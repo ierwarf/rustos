@@ -1,5 +1,21 @@
+//! Privileged MM broker for service-admitted mapping plans.
+//!
+//! - **Owner:** `syscalld` owns mapping policy; Compat validates the broker
+//!   envelope and `kernel-mm` owns page-table mechanism.
+//! - **Boundary:** Requested ranges, flags, protections, backing identities,
+//!   and service replies are untrusted until complete-plan validation.
+//! - **Lifecycle:** Classify, retain backing, preflight the complete span,
+//!   commit atomically, or roll back all staged holds.
+//! - **Concurrency:** Exact process generation serializes map mutation; no
+//!   service IPC occurs while PTE state is partially changed.
+//! - **Failure:** Invalid/overflowing/W+X/overlapping plans, short remote reads,
+//!   allocation, exec, and exit races leave the prior address space intact.
+//! - **Forbidden:** No policy table in ring0, destructive prevalidation,
+//!   guest-selected frame, or partial `mprotect`.
+//! - **Evidence:** `memory-map`.
 use super::*;
 
+use alloc::vec;
 use alloc::vec::Vec;
 use x86_64::VirtAddr;
 use x86_64::structures::paging::PageTableFlags;
@@ -82,8 +98,10 @@ fn broker_describe_fd(args: &RustosMmBrokerArgs) -> Result<(), i64> {
         let Some(entry) = process_state.handles().get_entry(args.fd) else {
             return Err(LINUX_EBADF);
         };
-        let mut result = RustosMmFdBrokerResult::default();
-        result.rights = broker_rights(entry.rights());
+        let mut result = RustosMmFdBrokerResult {
+            rights: broker_rights(entry.rights()),
+            ..RustosMmFdBrokerResult::default()
+        };
 
         match entry.handle() {
             KernelHandle::RemoteVfs(remote) if remote.kind() == RemoteVfsHandleKind::File => {
@@ -264,6 +282,7 @@ fn broker_map_device_shared(args: &RustosMmBrokerArgs) -> Result<(), i64> {
             });
         }
         let external_mapping = surface.external_physical_mapping();
+        let mut shared_region_hold = None;
         let frames = if let Some((phys_start, external_len)) = external_mapping {
             if external_len != len || !phys_start.is_multiple_of(PAGE_SIZE) {
                 return Err(LINUX_EINVAL);
@@ -279,6 +298,8 @@ fn broker_map_device_shared(args: &RustosMmBrokerArgs) -> Result<(), i64> {
             frames
         } else {
             let shared_region = surface.shared_region().ok_or(LINUX_EINVAL)?;
+            shared_region_hold =
+                Some(crate::ipc::acquire_shared_region_mapping(shared_region).ok_or(LINUX_EINVAL)?);
             crate::ipc::shared_region_frames(shared_region).ok_or(LINUX_EINVAL)?
         };
         if frames.len() != page_count {
@@ -294,6 +315,9 @@ fn broker_map_device_shared(args: &RustosMmBrokerArgs) -> Result<(), i64> {
                 .map_existing_user_pages_at(VirtAddr::new(start), &frames, page_flags)
         }
         .map_err(address_space_error_to_linux_errno)?;
+        if let Some(hold) = shared_region_hold {
+            process_state.record_shared_region_mapping(region.start.as_u64(), args.len, hold);
+        }
         surface.set_mapped_region(region);
         let slot = process_state
             .handles_mut()
@@ -345,6 +369,14 @@ fn broker_unmap(args: &RustosMmBrokerArgs) -> Result<(), i64> {
         );
         external_segments.extend(
             process_state
+                .shared_region_overlap_segments(start, end)
+                .into_iter()
+                .map(|(segment_start, segment_len)| {
+                    (segment_start, segment_start.saturating_add(segment_len))
+                }),
+        );
+        external_segments.extend(
+            process_state
                 .handles()
                 .surface_overlap_segments(start, end)
                 .into_iter()
@@ -392,6 +424,7 @@ fn broker_unmap(args: &RustosMmBrokerArgs) -> Result<(), i64> {
             }
         }
         process_state.release_shared_memfd_mappings_in_range(start, end);
+        process_state.release_shared_region_mappings_in_range(start, end);
         process_state
             .handles_mut()
             .clear_surface_mappings_in_range(start, args.len);
@@ -444,8 +477,7 @@ fn copy_file_mapping(
     source: &FileMappingSource,
 ) -> Result<(), i64> {
     let mut copied = 0usize;
-    let mut chunk = Vec::new();
-    chunk.resize(FILE_COPY_CHUNK.min(len), 0);
+    let mut chunk = vec![0; FILE_COPY_CHUNK.min(len)];
 
     while copied < len {
         let count = (len - copied).min(chunk.len());
@@ -535,7 +567,7 @@ fn checked_len(len: u64) -> Result<usize, i64> {
 }
 
 fn checked_page_addr(addr: u64) -> Result<u64, i64> {
-    if addr == 0 || addr % PAGE_SIZE != 0 {
+    if addr == 0 || !addr.is_multiple_of(PAGE_SIZE) {
         return Err(LINUX_EINVAL);
     }
     VirtAddr::try_new(addr).map_err(|_| LINUX_EINVAL)?;
@@ -609,7 +641,7 @@ mod tests {
         assert_eq!(checked_page_addr(0), Err(LINUX_EINVAL));
         assert_eq!(checked_page_addr(0x0000_8000_0000_0000), Err(LINUX_EINVAL));
         assert_eq!(
-            checked_mapping_end(u64::MAX & !(PAGE_SIZE - 1), 2),
+            checked_mapping_end(!(PAGE_SIZE - 1), 2),
             Err(LINUX_EOVERFLOW)
         );
     }

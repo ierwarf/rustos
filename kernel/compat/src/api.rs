@@ -44,6 +44,24 @@ pub mod syscall {
     pub fn service_deferred_transfer_releases() -> usize {
         crate::user::syscall::linux::service_deferred_transfer_releases()
     }
+
+    pub fn cleanup_retired_task_runtime_state(
+        task_id: u64,
+        process_id: u64,
+        process_terminal: bool,
+        clear_child_tid: u64,
+        robust_list_head: u64,
+        robust_list_len: u64,
+    ) -> usize {
+        crate::user::syscall::cleanup_retired_task_runtime_state(
+            task_id,
+            process_id,
+            process_terminal,
+            clear_child_tid,
+            robust_list_head,
+            robust_list_len,
+        )
+    }
 }
 
 pub use syscall::init as init_syscalls;

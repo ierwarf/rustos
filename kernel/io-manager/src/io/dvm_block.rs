@@ -1,3 +1,20 @@
+//! Fixed-aperture DVM block ring, ticket, durability, and revoke substrate.
+//!
+//! - **Owner:** `kernel-io-manager` owns shared-ring mechanics; `storaged` owns
+//!   storage policy and the Linux DVM owns device drivers.
+//! - **Boundary:** Shared headers, cursors, completions, geometry, epoch
+//!   signatures, and device status are untrusted.
+//! - **Lifecycle:** Install signed zero-cursor epoch, reserve slot/ticket,
+//!   publish request, accept exact completion, finish/reclaim, revoke, and
+//!   rebind only a newer signed epoch.
+//! - **Concurrency:** Slot ownership and producer/consumer publication use
+//!   explicit ordering; IRQ work only records progress.
+//! - **Failure:** Timeout/cancel retains the slot until exact completion or
+//!   revoke; stale/malformed/short completion revokes instead of reusing data.
+//! - **Forbidden:** No raw AHCI/NVMe driver, ring0 retry/cache policy,
+//!   unsigned restart, premature slot reuse, or false flush success.
+//! - **Evidence:** `dvm-block-ingress`, `dvm-block-startup`,
+//!   `dvm-volume-io`, and `durable-block-mutation`.
 // RING3-MIGRATION-REFERENCE START: storage-DVM block transport substrate.
 // Ring0 owns only the fixed address-free queue, immutable transfer-slot
 // geometry, and launch-generation revocation. Controller policy, filesystem
@@ -30,7 +47,7 @@ const MSIX_ENTRY_ADDRESS_HIGH_OFFSET: usize = 4;
 const MSIX_ENTRY_DATA_OFFSET: usize = 8;
 const MSIX_ENTRY_VECTOR_CONTROL_OFFSET: usize = 12;
 const MSIX_ENTRY_VECTOR_MASKED: u32 = 1;
-const WAITERS_CAPACITY: usize = 64;
+const WAITERS_CAPACITY: usize = crate::multitask::MAX_SCHEDULER_TASKS;
 const REGION_BYTES_OFFSET: usize = 16;
 const QUEUE_DEPTH_OFFSET: usize = 24;
 const DATA_SLOT_BYTES_OFFSET: usize = 28;
@@ -59,7 +76,10 @@ static IRQ_PENDING: AtomicBool = AtomicBool::new(false);
 static IRQ_COUNT: AtomicU64 = AtomicU64::new(0);
 static IRQ_VECTOR: AtomicU8 = AtomicU8::new(0);
 static FIRST_COMPLETION_REPORTED: AtomicBool = AtomicBool::new(false);
-static STATE: KernelWaitLock<Option<DvmBlockState>> = KernelWaitLock::new(None);
+static STATE: KernelWaitLock<
+    Option<DvmBlockState>,
+    { nucleus_core::util::lockdep::LockClass::DvmBlockWait as u8 },
+> = KernelWaitLock::new(None);
 static WAITERS: [AtomicU64; WAITERS_CAPACITY] = [const { AtomicU64::new(0) }; WAITERS_CAPACITY];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -426,7 +446,7 @@ impl DvmBlockState {
         let Some(completion) = pending.completion else {
             return Ok(DvmBlockPoll::Pending);
         };
-        let result = match completion.status {
+        match completion.status {
             DvmBlockCompletionStatus::IoError => Err(DvmBlockError::DeviceFault),
             DvmBlockCompletionStatus::Unsupported => Err(DvmBlockError::Unsupported),
             DvmBlockCompletionStatus::Success => {
@@ -444,8 +464,7 @@ impl DvmBlockState {
                     Err(DvmBlockError::Invalid)
                 }
             }
-        };
-        result
+        }
     }
 
     fn finish(&mut self, ticket: DvmBlockTicket) -> Result<(), DvmBlockError> {
@@ -955,10 +974,14 @@ pub(crate) fn arm_waiter(task_id: u64) -> bool {
     })
 }
 
-pub(crate) fn disarm_waiter(task_id: u64) {
+pub(crate) fn disarm_waiter(task_id: u64) -> bool {
+    let mut removed = false;
     for slot in &WAITERS {
-        let _ = slot.compare_exchange(task_id, 0, Ordering::AcqRel, Ordering::Acquire);
+        removed |= slot
+            .compare_exchange(task_id, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
     }
+    removed
 }
 
 fn wake_waiters() {
@@ -1501,6 +1524,23 @@ mod tests {
         assert_eq!(state.request_producer, 0);
         assert!(state.pending.iter().all(Option::is_none));
         assert_eq!(registers[IVSHMEM_DOORBELL_OFFSET / 4], 0);
+    }
+
+    #[test]
+    fn retired_task_disarm_releases_block_waiter_exactly_once() {
+        let task_id = u64::MAX - 701;
+        assert!(arm_waiter(task_id));
+        assert!(disarm_waiter(task_id));
+        assert!(!disarm_waiter(task_id));
+    }
+
+    #[test]
+    #[allow(
+        clippy::assertions_on_constants,
+        reason = "the mutation witness must compile a reduced capacity and fail at runtime"
+    )]
+    fn block_waiter_capacity_covers_every_scheduler_task() {
+        assert!(WAITERS_CAPACITY >= crate::multitask::MAX_SCHEDULER_TASKS);
     }
 
     #[test]

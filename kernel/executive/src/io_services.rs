@@ -87,10 +87,6 @@ mod backend {
         kernel_io_manager::api::boot::init_dvm_block_provider()
     }
 
-    pub(crate) fn gui_try_present_panic_blackout() -> bool {
-        kernel_io_manager::api::io::gui::try_present_panic_blackout()
-    }
-
     pub(crate) fn userspace_display_active() -> bool {
         kernel_io_manager::api::io::gui::is_userspace_display_active()
     }
@@ -137,14 +133,14 @@ mod backend {
 
     pub(crate) fn system_console_session_raw() -> kernel_object::api::session::ConsoleSessionHandle
     {
-        kernel_io_manager::api::session::ConsoleSessionHandle::SYSTEM.into()
+        kernel_io_manager::api::session::ConsoleSessionHandle::SYSTEM
     }
 }
 
 pub(crate) use backend::{
     boot_volume_identity, boot_volume_transport_hint, bootstrap_phase, console_write,
-    enter_kernel_vfs_runtime, enter_userspace_runtime, gui_init, gui_try_present_panic_blackout,
-    init_boot_info, init_dvm_block_provider, init_dvm_display_provider, init_dvm_network_provider,
-    init_input, init_vfs, input_debug_snapshot, system_console_session_raw, tty_init,
-    userspace_display_active, userspace_ready,
+    enter_kernel_vfs_runtime, enter_userspace_runtime, gui_init, init_boot_info,
+    init_dvm_block_provider, init_dvm_display_provider, init_dvm_network_provider, init_input,
+    init_vfs, input_debug_snapshot, system_console_session_raw, tty_init, userspace_display_active,
+    userspace_ready,
 };

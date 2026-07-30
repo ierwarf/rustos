@@ -1,3 +1,18 @@
+//! Device-policy broker admission and capability installation boundary.
+//!
+//! - **Owner:** `devmgrd` and `sessiond` own device/open/ioctl policy; Compat
+//!   installs only their typed, capability-authorized decisions.
+//! - **Boundary:** Caller identity, ABI version, device/access identifiers,
+//!   rights, flags, ioctl routes, and reply envelopes are untrusted.
+//! - **Lifecycle:** Validate complete request, reserve any input description,
+//!   install one handle, or release the reservation on every failed branch.
+//! - **Concurrency:** No service call runs while a process handle-table
+//!   mutation is held; installation rechecks the current process generation.
+//! - **Failure:** Malformed, stale, over-authorized, or unrouteable requests
+//!   fail without leaking an input registration or partial descriptor.
+//! - **Forbidden:** Ring0 must not invent device policy, widen returned rights,
+//!   or route to a weaker provider when the named owner is unavailable.
+//! - **Evidence:** `commercial-envelope`, `service-call-authority`.
 use super::*;
 
 use core::mem::size_of;
@@ -122,7 +137,7 @@ pub(super) fn syscall_linux_rustos_device_ioctl_broker(args_ptr: u64) -> u64 {
 // substrate.
 fn session_policy_device_ioctl_allowed(args: &RustosDeviceIoctlBrokerArgs) -> bool {
     if args.process_id != 0
-        && !multitask::current_user_process_id().is_some_and(|pid| pid == args.process_id)
+        && multitask::current_user_process_id().is_none_or(|pid| pid != args.process_id)
     {
         return false;
     }

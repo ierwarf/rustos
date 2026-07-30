@@ -1,8 +1,7 @@
 use alloc::vec::Vec;
 use core::ffi::c_void;
 
-use crate::sync::KernelSpinLock as Mutex;
-use x86_64::instructions::interrupts;
+use crate::sync::KernelWaitLock;
 use x86_64::structures::paging::PageTableFlags;
 
 const PAGE_4KIB: u64 = 4096;
@@ -40,9 +39,30 @@ struct DirectMapPageOverride {
     refcount: usize,
 }
 
-static MMIO_MAPPINGS: Mutex<Vec<MmioMapping>> = Mutex::new(Vec::new());
-static DIRECT_MAP_PAGE_OVERRIDES: Mutex<Vec<DirectMapPageOverride>> = Mutex::new(Vec::new());
+struct MmioRegistry {
+    mappings: Vec<MmioMapping>,
+    direct_map_overrides: Vec<DirectMapPageOverride>,
+}
 
+impl MmioRegistry {
+    const fn new() -> Self {
+        Self {
+            mappings: Vec::new(),
+            direct_map_overrides: Vec::new(),
+        }
+    }
+}
+
+// Cache-mode changes, mapping publication, and final unmap are one transaction.
+// This is deliberately scheduler-aware: the transaction can allocate and
+// update many page-table entries, so making IRQ-off callers spin on a raw lock
+// turns a large BAR mapping into system-wide interrupt latency.
+static MMIO_REGISTRY: KernelWaitLock<
+    MmioRegistry,
+    { nucleus_core::util::lockdep::LockClass::MmioRegistryWait as u8 },
+> = KernelWaitLock::new(MmioRegistry::new());
+
+#[track_caller]
 pub(crate) fn map(phys_start: u64, size: usize, write_combine: bool) -> *mut c_void {
     if size == 0 {
         return core::ptr::null_mut();
@@ -54,54 +74,52 @@ pub(crate) fn map(phys_start: u64, size: usize, write_combine: bool) -> *mut c_v
         MmioCacheMode::Uncached
     };
 
-    irq_safe(|| {
-        let mut mappings = MMIO_MAPPINGS.lock();
-        if let Some(mapping) = mappings.iter_mut().find(|mapping| {
-            mapping.phys_start == phys_start
-                && mapping.size == size
-                && mapping.cache_mode == cache_mode
-        }) {
-            mapping.refcount += 1;
-            return mapping.virt_start as *mut c_void;
-        }
-
-        let (virt_start, backing, page_base, page_count) =
-            if let Some((virt_start, page_base, page_count)) = direct_map_mapping(phys_start, size)
-            {
-                if !apply_direct_map_cache_mode(page_base, page_count, cache_mode) {
-                    return core::ptr::null_mut();
-                }
-                (virt_start, MmioBacking::DirectMap, page_base, page_count)
-            } else {
-                let virt_start = match cache_mode {
-                    MmioCacheMode::Uncached => {
-                        crate::memory::paging::map_mmio_range(phys_start, size)
-                    }
-                    MmioCacheMode::WriteCombine => {
-                        crate::memory::paging::map_mmio_range_wc(phys_start, size)
-                    }
-                };
-                let Some(virt_start) = virt_start else {
-                    return core::ptr::null_mut();
-                };
-                (virt_start, MmioBacking::Window, 0, 0)
-            };
-        let Some(virt_start) = Some(virt_start) else {
+    let mut registry = MMIO_REGISTRY.lock();
+    if let Some(mapping) = registry.mappings.iter_mut().find(|mapping| {
+        mapping.phys_start == phys_start && mapping.size == size && mapping.cache_mode == cache_mode
+    }) {
+        let Some(next_refcount) = mapping.refcount.checked_add(1) else {
             return core::ptr::null_mut();
         };
+        mapping.refcount = next_refcount;
+        return mapping.virt_start as *mut c_void;
+    }
 
-        mappings.push(MmioMapping {
-            phys_start,
-            size,
-            virt_start: virt_start as usize,
-            cache_mode,
-            backing,
-            page_base,
-            page_count,
-            refcount: 1,
-        });
-        virt_start as *mut c_void
-    })
+    let (virt_start, backing, page_base, page_count) =
+        if let Some((virt_start, page_base, page_count)) = direct_map_mapping(phys_start, size) {
+            if !apply_direct_map_cache_mode(
+                &mut registry.direct_map_overrides,
+                page_base,
+                page_count,
+                cache_mode,
+            ) {
+                return core::ptr::null_mut();
+            }
+            (virt_start, MmioBacking::DirectMap, page_base, page_count)
+        } else {
+            let virt_start = match cache_mode {
+                MmioCacheMode::Uncached => crate::memory::paging::map_mmio_range(phys_start, size),
+                MmioCacheMode::WriteCombine => {
+                    crate::memory::paging::map_mmio_range_wc(phys_start, size)
+                }
+            };
+            let Some(virt_start) = virt_start else {
+                return core::ptr::null_mut();
+            };
+            (virt_start, MmioBacking::Window, 0, 0)
+        };
+
+    registry.mappings.push(MmioMapping {
+        phys_start,
+        size,
+        virt_start: virt_start as usize,
+        cache_mode,
+        backing,
+        page_base,
+        page_count,
+        refcount: 1,
+    });
+    virt_start as *mut c_void
 }
 
 pub(crate) fn unmap(addr: *mut c_void) {
@@ -109,29 +127,33 @@ pub(crate) fn unmap(addr: *mut c_void) {
         return;
     }
 
-    let removed = irq_safe(|| {
-        let mut mappings = MMIO_MAPPINGS.lock();
-        let index = mappings
+    let mut registry = MMIO_REGISTRY.lock();
+    let removed = {
+        let Some(index) = registry
+            .mappings
             .iter()
-            .position(|mapping| mapping.virt_start == addr as usize)?;
-        if mappings[index].refcount > 1 {
-            mappings[index].refcount -= 1;
-            return None;
+            .position(|mapping| mapping.virt_start == addr as usize)
+        else {
+            return;
+        };
+        if registry.mappings[index].refcount > 1 {
+            registry.mappings[index].refcount -= 1;
+            return;
         }
-        Some(mappings.remove(index))
-    });
+        registry.mappings.remove(index)
+    };
 
-    if let Some(mapping) = removed {
-        match mapping.backing {
-            MmioBacking::DirectMap => {
-                restore_direct_map_cache_mode(mapping.page_base, mapping.page_count);
-            }
-            MmioBacking::Window => {
-                let _ = crate::memory::paging::unmap_mmio_range(
-                    mapping.virt_start as u64,
-                    mapping.size,
-                );
-            }
+    match removed.backing {
+        MmioBacking::DirectMap => {
+            restore_direct_map_cache_mode(
+                &mut registry.direct_map_overrides,
+                removed.page_base,
+                removed.page_count,
+            );
+        }
+        MmioBacking::Window => {
+            let _ =
+                crate::memory::paging::unmap_mmio_range(removed.virt_start as u64, removed.size);
         }
     }
 }
@@ -153,23 +175,27 @@ fn direct_map_mapping(phys_start: u64, size: usize) -> Option<(u64, u64, usize)>
 }
 
 fn apply_direct_map_cache_mode(
+    overrides: &mut Vec<DirectMapPageOverride>,
     page_base: u64,
     page_count: usize,
     cache_mode: MmioCacheMode,
 ) -> bool {
     let desired_flags = cache_mode_flags(cache_mode);
-    let mut overrides = DIRECT_MAP_PAGE_OVERRIDES.lock();
     let mut new_pages = Vec::new();
+    let mut retained_indices = Vec::new();
 
     for page_index in 0..page_count {
         let phys_page = page_base + page_index as u64 * PAGE_4KIB;
-        if let Some(existing) = overrides
-            .iter()
-            .find(|override_entry| override_entry.phys_page_base == phys_page)
+        if let Ok(index) = overrides.binary_search_by_key(&phys_page, |entry| entry.phys_page_base)
         {
+            let existing = &overrides[index];
             if existing.cache_mode != cache_mode {
                 return false;
             }
+            if existing.refcount == usize::MAX {
+                return false;
+            }
+            retained_indices.push(index);
             continue;
         }
 
@@ -184,8 +210,7 @@ fn apply_direct_map_cache_mode(
         });
     }
 
-    let mut applied = 0usize;
-    for page in &new_pages {
+    for (applied, page) in new_pages.iter().enumerate() {
         if !crate::memory::paging::update_direct_map_range_flags(
             page.phys_page_base,
             PAGE_4KIB as usize,
@@ -202,45 +227,29 @@ fn apply_direct_map_cache_mode(
             }
             return false;
         }
-        applied += 1;
     }
 
-    for page in &new_pages {
-        overrides.push(DirectMapPageOverride {
-            phys_page_base: page.phys_page_base,
-            cache_mode: page.cache_mode,
-            original_cache_flags: page.original_cache_flags,
-            refcount: 1,
-        });
+    for index in retained_indices {
+        overrides[index].refcount += 1;
     }
-
-    for page_index in 0..page_count {
-        let phys_page = page_base + page_index as u64 * PAGE_4KIB;
-        if new_pages
-            .iter()
-            .any(|page| page.phys_page_base == phys_page)
-        {
-            continue;
-        }
-        if let Some(existing) = overrides
-            .iter_mut()
-            .find(|override_entry| override_entry.phys_page_base == phys_page)
-        {
-            existing.refcount += 1;
-        }
+    for page in new_pages {
+        let index = overrides
+            .binary_search_by_key(&page.phys_page_base, |entry| entry.phys_page_base)
+            .unwrap_or_else(|index| index);
+        overrides.insert(index, page);
     }
 
     true
 }
 
-fn restore_direct_map_cache_mode(page_base: u64, page_count: usize) {
-    let mut overrides = DIRECT_MAP_PAGE_OVERRIDES.lock();
-
+fn restore_direct_map_cache_mode(
+    overrides: &mut Vec<DirectMapPageOverride>,
+    page_base: u64,
+    page_count: usize,
+) {
     for page_index in 0..page_count {
         let phys_page = page_base + page_index as u64 * PAGE_4KIB;
-        let Some(index) = overrides
-            .iter()
-            .position(|override_entry| override_entry.phys_page_base == phys_page)
+        let Ok(index) = overrides.binary_search_by_key(&phys_page, |entry| entry.phys_page_base)
         else {
             continue;
         };
@@ -277,8 +286,4 @@ fn align_up(value: u64, align: u64) -> Option<u64> {
     value
         .checked_add(align - 1)
         .map(|aligned| aligned & !(align - 1))
-}
-
-fn irq_safe<T>(f: impl FnOnce() -> T) -> T {
-    interrupts::without_interrupts(f)
 }

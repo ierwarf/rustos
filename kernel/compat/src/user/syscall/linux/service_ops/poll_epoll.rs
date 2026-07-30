@@ -1,3 +1,18 @@
+//! Linux poll/epoll wait ABI over cross-service readiness generations.
+//!
+//! - **Owner:** Compat owns fd-set semantics; provider services own readiness
+//!   generations and `kernel-ps` owns task blocking.
+//! - **Boundary:** User arrays, epoll registrations, signal masks, service
+//!   replies, and provider generations are untrusted.
+//! - **Lifecycle:** Query, register, requery, arm, presence-check, commit,
+//!   resume, remove, disarm, and requery return one terminal outcome.
+//! - **Concurrency:** Waiter identity binds task/process/open-description and
+//!   provider epochs; provider calls are capped by the remaining app deadline.
+//! - **Failure:** Signal, timeout, close, dup/exec, provider revoke/restart,
+//!   peer exit, and late reply cannot lose a wake or revive a stale waiter.
+//! - **Forbidden:** No periodic polling, one-shot timeout ignoring, fd-only
+//!   registration, unbounded provider call, or app-specific readiness path.
+//! - **Evidence:** `waitset` and `input-delivery-lifecycle`.
 use super::*;
 
 const MAX_POLL_FDS: usize = 1024;
@@ -134,8 +149,8 @@ pub fn syscall_linux_poll(fds_ptr: u64, nfds: u64, timeout_ms: i64) -> u64 {
             let _ = multitask::cancel_block_current_task();
             return linux_errno(LINUX_EBUSY);
         }
-        match multitask::commit_block_current_task() {
-            Some(true) => multitask::yield_now(),
+        match multitask::commit_block_current_task_and_yield() {
+            Some(true) => {}
             Some(false) => {}
             None => {
                 super::super::broker_ops::waitset_broker_ops::remove_waitset_waiters(task_id);
@@ -358,6 +373,15 @@ fn provider_revoke_events(errno: i64) -> Option<u32> {
     .then_some(linux_abi::POLLERR as u32 | linux_abi::POLLHUP as u32)
 }
 
+fn transient_waitset_scan_error(errno: i64) -> bool {
+    // A VFS reply capability can be revoked after a bounded provider query
+    // times out even while vfsd and the epoll object remain live. EPIPE is an
+    // internal transport outcome, not a Linux epoll_wait(2) result. Re-scan
+    // under the original application deadline so a late reply cannot kill an
+    // otherwise valid wait set.
+    errno == LINUX_EPIPE
+}
+
 fn waitset_provider_query_timeout_ms(deadline_tick: Option<u64>) -> u64 {
     deadline_tick.map_or(WAITSET_PROVIDER_QUERY_TIMEOUT_MS, |deadline| {
         waitset_provider_query_timeout_ms_from_ticks(
@@ -479,9 +503,7 @@ pub fn syscall_linux_ppoll(
             Ok(ts) => ts,
             Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
         };
-        if let Err(errno) =
-            request_syscalld_timespec_admission(SYSCALL_OFFLOAD_OP_LINUX_NANOSLEEP, 0, 0, ts)
-        {
+        if let Err(errno) = process_time::validate_relative_sleep_timespec_locally(ts) {
             return linux_errno(errno);
         }
         ts.tv_sec
@@ -735,6 +757,10 @@ pub fn syscall_linux_epoll_wait(
                 multitask::cond_resched();
                 continue;
             }
+            Err(errno) if transient_waitset_scan_error(errno) => {
+                multitask::cond_resched();
+                continue;
+            }
             Err(errno) => return linux_errno(errno),
         };
         if !first.ready.is_empty() {
@@ -779,6 +805,11 @@ pub fn syscall_linux_epoll_wait(
                 multitask::cond_resched();
                 continue;
             }
+            Err(errno) if transient_waitset_scan_error(errno) => {
+                super::super::broker_ops::waitset_broker_ops::remove_waitset_waiters(task_id);
+                multitask::cond_resched();
+                continue;
+            }
             Err(errno) => {
                 super::super::broker_ops::waitset_broker_ops::remove_waitset_waiters(task_id);
                 return linux_errno(errno);
@@ -819,8 +850,8 @@ pub fn syscall_linux_epoll_wait(
             let _ = multitask::cancel_block_current_task();
             return linux_errno(LINUX_EBUSY);
         }
-        match multitask::commit_block_current_task() {
-            Some(true) => multitask::yield_now(),
+        match multitask::commit_block_current_task_and_yield() {
+            Some(true) => {}
             Some(false) => {}
             None => {
                 super::super::broker_ops::waitset_broker_ops::remove_waitset_waiters(task_id);
@@ -1279,6 +1310,13 @@ mod tests {
         }
         assert_eq!(provider_revoke_events(super::LINUX_EIO), None);
         assert_eq!(provider_revoke_events(super::LINUX_ETIMEDOUT), None);
+    }
+
+    #[test]
+    fn transient_vfs_reply_break_is_retried_inside_epoll_wait() {
+        assert!(super::transient_waitset_scan_error(super::LINUX_EPIPE));
+        assert!(!super::transient_waitset_scan_error(super::LINUX_EBADF));
+        assert!(!super::transient_waitset_scan_error(super::LINUX_ENODEV));
     }
 
     #[test]

@@ -761,21 +761,62 @@ static int acknowledge_host_invitation(const struct shared_display *shared) {
     return 0;
 }
 
-static void report_host_offline(const struct shared_display *shared) {
+static int host_confirmed_peer_ready(const struct shared_display *shared);
+
+static int notify_host_offline(const struct shared_display *shared) {
     char path[PATH_MAX];
     static const char offline[] = "offline\n";
+    ssize_t bytes;
     int fd;
     if (shared == NULL ||
         snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/%s", shared->pci_bdf,
                  RUSTOS_DVM_DISPLAY_OFFLINE_ATTRIBUTE) >= (int)sizeof(path)) {
-        return;
+        errno = EINVAL;
+        return -1;
     }
     fd = open(path, O_WRONLY | O_CLOEXEC);
     if (fd < 0) {
-        return;
+        return -1;
     }
-    (void)write(fd, offline, sizeof(offline) - 1U);
+    bytes = write(fd, offline, sizeof(offline) - 1U);
     close(fd);
+    if (bytes != (ssize_t)(sizeof(offline) - 1U)) {
+        if (bytes >= 0)
+            errno = EIO;
+        return -1;
+    }
+    return 0;
+}
+
+static void report_host_offline(const struct shared_display *shared) {
+    (void)notify_host_offline(shared);
+}
+
+/*
+ * LIFECYCLE: a replacement relay may inherit an aperture whose confirmation
+ * still names its dead predecessor. It must revoke that lease before creating
+ * a new GPU context; accepting the old confirmation would let stale
+ * completions cross process lifetimes. The host interrupt handler clears the
+ * confirmation and increments the context epoch. Bound the acknowledgement
+ * wait so a stopped RustOS peer cannot turn DVM recovery into an infinite
+ * wait.
+ */
+static int revoke_predecessor_lease(const struct shared_display *shared) {
+    const unsigned int attempts = 200U;
+    unsigned int attempt;
+    if (!host_confirmed_peer_ready(shared))
+        return 0;
+    if (notify_host_offline(shared) != 0)
+        return -1;
+    for (attempt = 0U; attempt < attempts; attempt++) {
+        if (read_le64(shared->base + GUI_POOL_READY_CONFIRMATION_OFFSET) == 0U) {
+            relay_log("rustos-dvm-display: predecessor lease revoked before rebind\n");
+            return 0;
+        }
+        usleep(10000U);
+    }
+    errno = ETIMEDOUT;
+    return -1;
 }
 
 static int host_confirmed_peer_ready(const struct shared_display *shared) {
@@ -2302,6 +2343,11 @@ static int serve_display(void) {
     (void)unlink(RUSTOS_DVM_DISPLAY_EVIDENCE_TEMP);
     if (open_shared_display(&shared) != 0) {
         relay_log("rustos-dvm-display: shared aperture unavailable errno=%d\n", errno);
+        return -1;
+    }
+    if (revoke_predecessor_lease(&shared) != 0) {
+        relay_log("rustos-dvm-display: predecessor lease revoke failed errno=%d\n", errno);
+        close_shared_display(&shared);
         return -1;
     }
     int gpu_result = serve_gpu_display(&shared);

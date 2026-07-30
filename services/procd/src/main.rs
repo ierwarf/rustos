@@ -13,7 +13,7 @@ use core::panic::PanicInfo;
 use rustos_svc_runtime::ipc;
 use rustos_svc_runtime::syscall::{syscall0, syscall1, syscall5};
 use rustos_user_abi::syscall::{
-    identity_is_exact_sender, CommercialMaxCapabilityLeaseWire,
+    identity_is_exact_sender, procd_sigchld_is_suppressed, CommercialMaxCapabilityLeaseWire,
     CommercialMaxProtocolDescriptorWire, CommercialMaxProtocolRequest,
     CommercialMaxProtocolResponse, LifecycleDrainBrokerArgs, LifecycleEventWire,
     LoaderSpawnRequest, LoaderSpawnResponse, ProcdIpcRequest, ProcdIpcResponse,
@@ -30,12 +30,12 @@ use rustos_user_abi::syscall::{
     PROCD_OP_FORK, PROCD_OP_RT_SIGACTION, PROCD_OP_RT_SIGPROCMASK, PROCD_OP_SELECT_SIGNAL,
     PROCD_OP_SIGALTSTACK, PROCD_OP_TGKILL, PROCD_OP_THREAD_PLAN, PROCD_OP_WAIT4,
     PROCD_PATH_CAPACITY, PROCD_PAYLOAD_CAPACITY, PROCD_SELECT_SIGNAL_HANDLER,
-    PROCD_SELECT_SIGNAL_IGNORE, PROCD_SELECT_SIGNAL_NONE, PROCD_SELECT_SIGNAL_TERMINATE,
-    PROC_BROKER_ABI_VERSION, PROC_BROKER_FORMAT_ELF64, PROC_BROKER_FORMAT_PE64,
-    PROC_BROKER_USER_SPACE_BASE, PROC_BROKER_USER_SPACE_END_EXCLUSIVE, SYS_RUSTOS_IPC_CALL,
-    SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER, SYS_RUSTOS_PROC_AUTHORIZE_EXEC_BROKER,
-    SYS_RUSTOS_PROC_CANCEL_EXEC_BROKER, SYS_RUSTOS_PROC_FORK_BROKER,
-    SYS_RUSTOS_PROC_SIGNAL_QUEUE_BROKER,
+    PROCD_SELECT_SIGNAL_IGNORE, PROCD_SELECT_SIGNAL_NONE, PROCD_SELECT_SIGNAL_STOP,
+    PROCD_SELECT_SIGNAL_TERMINATE, PROCD_SIGCHLD_EVENT_MASK, PROC_BROKER_ABI_VERSION,
+    PROC_BROKER_FORMAT_ELF64, PROC_BROKER_FORMAT_PE64, PROC_BROKER_USER_SPACE_BASE,
+    PROC_BROKER_USER_SPACE_END_EXCLUSIVE, SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER,
+    SYS_RUSTOS_PROC_AUTHORIZE_EXEC_BROKER, SYS_RUSTOS_PROC_CANCEL_EXEC_BROKER,
+    SYS_RUSTOS_PROC_FORK_BROKER, SYS_RUSTOS_PROC_SIGNAL_QUEUE_BROKER,
 };
 use spin::Mutex;
 
@@ -47,6 +47,8 @@ const ENOSYS: i32 = 38;
 const SYS_GETPID: u64 = 39;
 const AT_FDCWD: u64 = -100_i64 as u64;
 const WNOHANG: u64 = 1;
+const WUNTRACED: u64 = 2;
+const WCONTINUED: u64 = 8;
 const SS_DISABLE: u32 = 2;
 const MINSIGSTKSZ: u64 = 2048;
 const SIG_BLOCK: u64 = 0;
@@ -54,6 +56,7 @@ const SIG_UNBLOCK: u64 = 1;
 const SIG_SETMASK: u64 = 2;
 const SIG_IGN: u64 = 1;
 const SIGKILL: usize = 9;
+const SIGCHLD: usize = 17;
 const SIGSTOP: usize = 19;
 const LINUX_USER_SPACE_BASE: u64 = PROC_BROKER_USER_SPACE_BASE;
 const LINUX_USER_SPACE_END: u64 = PROC_BROKER_USER_SPACE_END_EXCLUSIVE;
@@ -682,7 +685,7 @@ fn process_clone_unsupported_mask() -> u64 {
 
 fn handle_wait4(request: &ProcdIpcRequest, response: &mut ProcdIpcResponse) {
     let pid = request.arg0 as i64;
-    if request.arg1 & !WNOHANG != 0 || pid < -1 || pid == 0 {
+    if request.arg1 & !(WNOHANG | WUNTRACED | WCONTINUED) != 0 || pid < -1 || pid == 0 {
         response.status = EINVAL;
     }
 }
@@ -840,12 +843,29 @@ fn handle_select_signal(request: &ProcdIpcRequest, response: &mut ProcdIpcRespon
         return;
     }
     response.signal = signal as u16;
+    let sigchld_events = if signal == SIGCHLD {
+        let events = request.arg1 as u32;
+        if request.arg1 > u64::from(u32::MAX) || events & !PROCD_SIGCHLD_EVENT_MASK != 0 {
+            response.status = -EINVAL;
+            return;
+        }
+        response.reserved0 = events;
+        events
+    } else {
+        if request.arg1 != 0 {
+            response.status = -EINVAL;
+            return;
+        }
+        0
+    };
     let action = PROCESS_SIGNAL_POLICY
         .lock()
         .get(&request.pid)
         .map(|state| state.sigactions[signal])
         .unwrap_or_default();
-    if action.handler == SIG_IGN {
+    if (signal == SIGCHLD && procd_sigchld_is_suppressed(sigchld_events, action.flags))
+        || action.handler == SIG_IGN
+    {
         response.action = PROCD_SELECT_SIGNAL_IGNORE;
     } else if action.handler != 0 && action.restorer != 0 {
         response.action = PROCD_SELECT_SIGNAL_HANDLER;
@@ -853,6 +873,8 @@ fn handle_select_signal(request: &ProcdIpcRequest, response: &mut ProcdIpcRespon
         response.payload_len = LINUX_SIGACTION_SIZE as u32;
     } else if default_ignore(signal) {
         response.action = PROCD_SELECT_SIGNAL_IGNORE;
+    } else if default_stop(signal) {
+        response.action = PROCD_SELECT_SIGNAL_STOP;
     } else {
         response.action = PROCD_SELECT_SIGNAL_TERMINATE;
     }
@@ -867,6 +889,10 @@ fn signal_bit(signal: usize) -> Option<u64> {
 
 fn default_ignore(signal: usize) -> bool {
     matches!(signal, 17 | 18 | 23 | 28)
+}
+
+fn default_stop(signal: usize) -> bool {
+    matches!(signal, 19..=22)
 }
 
 #[derive(Clone, Copy, Debug)]

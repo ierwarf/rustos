@@ -18,9 +18,11 @@ model makes the arm identity explicit: a wake invalidates that identity, so a
 later block must come from a newly armed epoch rather than a lost wakeup.
 
 Linearization points: arm records an epoch; wake/expiry invalidates that epoch;
-commit changes the current task to Blocked; retirement clears all scheduler and
-timer authority for the task.  It does not assert fairness or an eventual CPU
-slice, which require a different temporal/fairness model.
+commit changes the current task to Blocked and transfers CPU ownership in the
+same interrupt-excluded software-schedule transition; a deadline record remains
+owned until the resumed task acknowledges it; retirement clears all scheduler
+and timer authority for the task. It does not assert fairness or an eventual
+CPU slice, which require a different temporal/fairness model.
 *******************************************************************************)
 
 CONSTANTS Tasks, MaxTick, MaxArmEpoch
@@ -39,10 +41,12 @@ VARIABLES now,
           timerDeadline,
           armEpoch,
           lastWakeEpoch,
-          blockedEpoch
+          blockedEpoch,
+          resumePending,
+          framePublished
 
 vars == <<now, current, taskState, timerDeadline, armEpoch, lastWakeEpoch,
-          blockedEpoch>>
+          blockedEpoch, resumePending, framePublished>>
 
 Init ==
     /\ now = 0
@@ -52,22 +56,26 @@ Init ==
     /\ armEpoch = [t \in Tasks |-> 0]
     /\ lastWakeEpoch = [t \in Tasks |-> 0]
     /\ blockedEpoch = [t \in Tasks |-> 0]
+    /\ resumePending = [t \in Tasks |-> FALSE]
+    /\ framePublished = [t \in Tasks |-> TRUE]
 
 Dispatch(task) ==
     /\ task \in Tasks
     /\ current = NoTask
     /\ taskState[task] = Ready
     /\ current' = task
+    /\ framePublished' = [framePublished EXCEPT ![task] = FALSE]
     /\ UNCHANGED <<now, taskState, timerDeadline, armEpoch, lastWakeEpoch,
-                  blockedEpoch>>
+                  blockedEpoch, resumePending>>
 
 ReleaseCurrent(task) ==
     /\ task \in Tasks
     /\ current = task
     /\ taskState[task] = Ready
     /\ current' = NoTask
+    /\ framePublished' = [framePublished EXCEPT ![task] = TRUE]
     /\ UNCHANGED <<now, taskState, timerDeadline, armEpoch, lastWakeEpoch,
-                  blockedEpoch>>
+                  blockedEpoch, resumePending>>
 
 (*******************************************************************************
 The first half of wait_for_reply_with_deadline. Armed remains schedulable: it
@@ -78,10 +86,13 @@ ArmCurrentBlock(task) ==
     /\ task \in Tasks
     /\ current = task
     /\ taskState[task] = Ready
+    /\ timerDeadline[task] = NoTimer
+    /\ now < MaxTick
     /\ armEpoch[task] < MaxArmEpoch
     /\ taskState' = [taskState EXCEPT ![task] = Armed]
     /\ armEpoch' = [armEpoch EXCEPT ![task] = armEpoch[task] + 1]
     /\ UNCHANGED <<now, current, timerDeadline, lastWakeEpoch, blockedEpoch>>
+    /\ UNCHANGED <<resumePending, framePublished>>
 
 ArmDeadlineTimer(task) ==
     /\ task \in Tasks
@@ -91,7 +102,7 @@ ArmDeadlineTimer(task) ==
     /\ now < MaxTick
     /\ timerDeadline' = [timerDeadline EXCEPT ![task] = now + 1]
     /\ UNCHANGED <<now, current, taskState, armEpoch, lastWakeEpoch,
-                  blockedEpoch>>
+                  blockedEpoch, resumePending, framePublished>>
 
 (*******************************************************************************
 The recheck has observed no wake and no completed reply. A committed block is
@@ -106,25 +117,48 @@ CommitCurrentBlock(task) ==
     /\ taskState' = [taskState EXCEPT ![task] = Blocked]
     /\ current' = NoTask
     /\ blockedEpoch' = [blockedEpoch EXCEPT ![task] = armEpoch[task]]
-    /\ UNCHANGED <<now, timerDeadline, armEpoch, lastWakeEpoch>>
+    /\ framePublished' = [framePublished EXCEPT ![task] = TRUE]
+    /\ UNCHANGED <<now, timerDeadline, armEpoch, lastWakeEpoch, resumePending>>
 
 (*******************************************************************************
 An IPC reply, cancellation, or peer teardown invokes this path. In particular,
 when it races before commit it leaves the task Ready while it is still current;
 the subsequent commit guard is false and the caller rechecks instead of
-sleeping through the already-delivered wake.
+sleeping through the already-delivered wake.  A running or armed task has no
+published resumable frame: its previous frame was consumed by Dispatch and may
+already be ordinary stack storage.  Wake therefore validates/preserves a frame
+only for a Blocked task and treats an Armed wake as a token transition.
 *******************************************************************************)
 WakeTask(task) ==
     /\ task \in Tasks
     /\ taskState[task] \in {Armed, Blocked}
     /\ taskState' = [taskState EXCEPT ![task] = Ready]
-    /\ timerDeadline' = [timerDeadline EXCEPT ![task] = NoTimer]
     /\ lastWakeEpoch' =
         [lastWakeEpoch EXCEPT
             ![task] = IF taskState[task] = Armed
                      THEN armEpoch[task]
                      ELSE blockedEpoch[task]]
-    /\ UNCHANGED <<now, current, armEpoch, blockedEpoch>>
+    /\ resumePending' =
+        [resumePending EXCEPT
+            ![task] = resumePending[task] \/ taskState[task] = Blocked]
+    /\ UNCHANGED framePublished
+    /\ UNCHANGED <<now, current, timerDeadline, armEpoch, blockedEpoch>>
+
+(*******************************************************************************
+A clockevent wake is notification, not ownership transfer. The deadline stays
+published through scheduler wake and kernel cleanup. Only the resumed task can
+complete the wait and acknowledge the timer, so a scheduler-side lost
+transition or a stalled cleanup cannot delete the only recovery authority.
+*******************************************************************************)
+CompleteWait(task) ==
+    /\ task \in Tasks
+    /\ current = task
+    /\ taskState[task] = Ready
+    /\ timerDeadline[task] # NoTimer
+    /\ timerDeadline' = [timerDeadline EXCEPT ![task] = NoTimer]
+    /\ resumePending' = [resumePending EXCEPT ![task] = FALSE]
+    /\ UNCHANGED <<now, current, taskState, armEpoch, lastWakeEpoch,
+                  blockedEpoch, framePublished>>
 
 CancelCurrentArm(task) ==
     /\ task \in Tasks
@@ -133,7 +167,9 @@ CancelCurrentArm(task) ==
     /\ taskState' = [taskState EXCEPT ![task] = Ready]
     /\ timerDeadline' = [timerDeadline EXCEPT ![task] = NoTimer]
     /\ lastWakeEpoch' = [lastWakeEpoch EXCEPT ![task] = armEpoch[task]]
+    /\ resumePending' = [resumePending EXCEPT ![task] = FALSE]
     /\ UNCHANGED <<now, current, armEpoch, blockedEpoch>>
+    /\ UNCHANGED framePublished
 
 (*******************************************************************************
 irq.rs invokes the PIT clockevent's monotonic deadline service before scheduler
@@ -142,19 +178,25 @@ before Dispatch can be enabled from the resulting state.
 *******************************************************************************)
 Tick ==
     LET DueTasks ==
-        {t \in Tasks : taskState[t] \in {Armed, Blocked}
-                      /\ timerDeadline[t] = now + 1} IN
+        {t \in Tasks : taskState[t] \in {Ready, Armed, Blocked}
+                      /\ timerDeadline[t] # NoTimer
+                      /\ timerDeadline[t] <= now + 1} IN
     /\ now < MaxTick
+    /\ \A task \in Tasks :
+        taskState[task] = Armed => timerDeadline[task] # NoTimer
     /\ now' = now + 1
     /\ taskState' =
         [t \in Tasks |-> IF t \in DueTasks THEN Ready ELSE taskState[t]]
-    /\ timerDeadline' =
-        [t \in Tasks |-> IF t \in DueTasks THEN NoTimer ELSE timerDeadline[t]]
+    /\ UNCHANGED timerDeadline
     /\ lastWakeEpoch' =
         [t \in Tasks |->
-            IF t \in DueTasks
+            IF t \in DueTasks /\ taskState[t] \in {Armed, Blocked}
             THEN IF taskState[t] = Armed THEN armEpoch[t] ELSE blockedEpoch[t]
             ELSE lastWakeEpoch[t]]
+    /\ resumePending' =
+        [t \in Tasks |->
+            resumePending[t] \/ (t \in DueTasks /\ taskState[t] = Blocked)]
+    /\ UNCHANGED framePublished
     /\ UNCHANGED <<current, armEpoch, blockedEpoch>>
 
 RetireTask(task) ==
@@ -162,7 +204,9 @@ RetireTask(task) ==
     /\ taskState[task] # Retired
     /\ taskState' = [taskState EXCEPT ![task] = Retired]
     /\ timerDeadline' = [timerDeadline EXCEPT ![task] = NoTimer]
+    /\ resumePending' = [resumePending EXCEPT ![task] = FALSE]
     /\ current' = IF current = task THEN NoTask ELSE current
+    /\ framePublished' = [framePublished EXCEPT ![task] = FALSE]
     /\ UNCHANGED <<now, armEpoch, lastWakeEpoch, blockedEpoch>>
 
 Next ==
@@ -172,6 +216,7 @@ Next ==
     \/ \E task \in Tasks : ArmDeadlineTimer(task)
     \/ \E task \in Tasks : CommitCurrentBlock(task)
     \/ \E task \in Tasks : WakeTask(task)
+    \/ \E task \in Tasks : CompleteWait(task)
     \/ \E task \in Tasks : CancelCurrentArm(task)
     \/ Tick
     \/ \E task \in Tasks : RetireTask(task)
@@ -188,6 +233,8 @@ TypeOK ==
     /\ armEpoch \in [Tasks -> 0..MaxArmEpoch]
     /\ lastWakeEpoch \in [Tasks -> 0..MaxArmEpoch]
     /\ blockedEpoch \in [Tasks -> 0..MaxArmEpoch]
+    /\ resumePending \in [Tasks -> BOOLEAN]
+    /\ framePublished \in [Tasks -> BOOLEAN]
 
 CurrentTaskIsRunnable ==
     current # NoTask => taskState[current] \in {Ready, Armed}
@@ -198,11 +245,24 @@ AnArmedTaskStillOwnsTheCpu ==
 BlockedTaskOwnsNoCpu ==
     \A task \in Tasks : taskState[task] = Blocked => current # task
 
+CurrentTaskOwnsNoPublishedFrame ==
+    current # NoTask => ~framePublished[current]
+
+NonCurrentReadyTaskOwnsPublishedFrame ==
+    \A task \in Tasks :
+        taskState[task] = Ready /\ current # task => framePublished[task]
+
+BlockedTaskOwnsPublishedFrame ==
+    \A task \in Tasks : taskState[task] = Blocked => framePublished[task]
+
+ArmedTaskOwnsNoPublishedFrame ==
+    \A task \in Tasks : taskState[task] = Armed => ~framePublished[task]
+
 TimerHasOneLiveOwner ==
     \A task \in Tasks :
         timerDeadline[task] # NoTimer =>
-            /\ taskState[task] \in {Armed, Blocked}
-            /\ timerDeadline[task] > now
+            /\ taskState[task] \in {Ready, Armed, Blocked}
+            /\ (taskState[task] = Ready \/ timerDeadline[task] > now)
 
 BlockedTaskHasAnUnexpiredCommittedDeadline ==
     \A task \in Tasks :
@@ -229,14 +289,28 @@ RetiredTaskHasNoSchedulingOrTimerAuthority ==
             /\ current # task
             /\ timerDeadline[task] = NoTimer
 
+PendingResumeRetainsRecoveryAuthority ==
+    \A task \in Tasks :
+        resumePending[task] =>
+            /\ taskState[task] = Ready
+            /\ timerDeadline[task] # NoTimer
+
 TimerArmedWaitEventuallyReleases ==
     \A task \in Tasks:
         timerDeadline[task] # NoTimer ~>
             (timerDeadline[task] = NoTimer \/ taskState[task] = Retired)
 
-\* This is the explicit hardware-timer scheduling assumption.  The safety
-\* invariants above show what an interrupt must do; this fairness clause proves
-\* a successfully armed finite deadline cannot remain armed forever.
-Spec == Init /\ [][Next]_vars /\ WF_vars(Tick)
+\* These are the explicit clock, dispatch, and bounded kernel-resume progress
+\* assumptions. Safety shows which owner may mutate each stage; fairness proves
+\* a finite deadline cannot be acknowledged merely because wake was published:
+\* the task must be dispatched and complete its kernel wait cleanup.
+Spec ==
+    /\ Init
+    /\ [][Next]_vars
+    /\ WF_vars(Tick)
+    /\ \A task \in Tasks : WF_vars(ArmDeadlineTimer(task))
+    /\ \A task \in Tasks : WF_vars(ReleaseCurrent(task))
+    /\ \A task \in Tasks : SF_vars(Dispatch(task))
+    /\ \A task \in Tasks : SF_vars(CompleteWait(task))
 
 =============================================================================

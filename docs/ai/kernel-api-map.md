@@ -12,7 +12,7 @@ into another crate's private modules when `api.rs` exposes a wrapper.
 | GDT/IDT/ACPI/PIC/MSI-X receive substrate/RTC/SIMD/hooks | `kernel_hal::api as hal_api` | `kernel/hal/src/api.rs` |
 | Heap/paging/frames/higher-half | `kernel_mm::api as mm_api` | `kernel/mm/src/api.rs` |
 | Handles/rights/session ids | `kernel_object::api as object_api` | `kernel/object/src/api.rs` |
-| Shared memory regions | `kernel_ipc_runtime::api as ipc_api` | `kernel/ipc-runtime/src/api.rs` |
+| Endpoints, replies, transferred handles, shared regions | `kernel_ipc_runtime::api as ipc_api` | `kernel/ipc-runtime/src/api.rs` |
 | Scheduler/process/user state | `kernel_ps::api as ps_api` | `kernel/ps/src/api.rs` |
 | VFS/devices/console/drivers/input/USB | `kernel_io_manager::api as io_api` | `kernel/io-manager/src/api.rs` |
 | Linux/Windows compat/syscalls | `kernel_compat::api as compat_api` | `kernel/compat/src/api.rs` |
@@ -42,9 +42,49 @@ Do not reorder without reading `kernel/src/main.rs` and
   `ioctl_from_user`.
 - **Process state mutation:** `with_current_user_process_state_mut`,
   `with_process_state_by_pid_mut`.
-- **Scheduler wait primitives:** use `current_task_id`, `block_current_task`,
-  `wake_task` for kernel-capable wait queues; use `*_user_*` wrappers only
-  for userspace-task waits.
+- **Scheduler wait primitives:** use `current_task_id`,
+  `arm_block_current_task`, condition publication/recheck,
+  `commit_block_current_task_and_yield`, and `wake_task`. The commit and
+  software reschedule trap are one interrupt-excluded transition; callers
+  cannot split them with `commit_block_current_task(); yield_now()`. HAL
+  snapshots registered function pointers and releases its hook-registry guard
+  before invoking any callback. An expired RTC waiter remains published and is
+  re-notified on later ticks until the resumed task disarms its exact task
+  record; notification alone never destroys the last deadline authority. Direct
+  `block_current_task`/`block_current_user_task` entry points do not exist.
+  Retired user slots are intentionally unreapable until executive
+  housekeeping completes the exact
+  `RetiredTaskCleanup`/`cleanup_retired_task_runtime_state` handshake; new
+  task-scoped waiter registries must join that cleanup boundary. The retirement
+  value also freezes `clear_child_tid` and the Linux robust-list head/length so
+  forced and exec-sibling cleanup does not depend on current-task state.
+  RustOS currently boots and schedules only the BSP. APIC-ID-indexed
+  diagnostics do not imply AP bring-up or SMP scheduling; adding SMP requires
+  explicit per-CPU scheduler/syscall state, CPU-online transitions, and an IPI
+  wake/reschedule protocol.
+- **Raw spin critical sections:** use
+  `nucleus_core::util::lockdep::TrackedSpinLock` with one stable class per
+  logical lock type. On the BSP boot image its guard increments the task
+  preemption depth but leaves unrelated device interrupts enabled. Guarded work
+  must be bounded, non-blocking, and allocation-free; destroy removed objects
+  after releasing the guard. IDT leaves enter tracked IRQ context before taking
+  a class: the graph rejects a class used from both IRQ and ordinary
+  interrupt-enabled context and rejects IRQ-safe-to-IRQ-unsafe dependency
+  paths. `KernelWaitLock` uses stable task-owned classes in the same
+  allocation-free dependency graph. The scheduler publishes the current task
+  identity before every handoff and sleepable nesting survives blocking.
+  Blocking acquisition while a raw class is held is forbidden. A bounded raw
+  leaf may be taken after a sleepable lock; that ordering is recorded and
+  cycle-checked, and nonblocking external try-locks join the same raw graph.
+  A wait lock may not be acquired from IRQ context. Host behavior is selected
+  by absence of `rustos_boot_image`, not by `target_os`.
+- **IPC object admission:** process/task endpoint creation must use the
+  owner-aware API and process-backed display/DRM regions must use
+  `ipc_api::shared_region::create_for_process`. Owner quota is reserved before
+  allocation/publication. A shared-region drop does not return quota; deferred
+  physical reclaim does. Kernel/anonymous bootstrap objects use the explicit
+  ownerless entry points and remain within their separately reserved global
+  capacity.
 - **DVM block transport:** use `kernel_io_manager::api::block::{dvm_info,
   submit_dvm_read,submit_dvm_write,submit_dvm_flush,poll_dvm,cancel_dvm,
   finish_dvm}` only from the `STORAGE_POLICY`-gated compat broker. MSI-X code

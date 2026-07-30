@@ -5,17 +5,21 @@ description: Build the RustOS workspace correctly with required GPG signing envi
 
 # RustOS Build Skill
 
-## Required Environment
+## Signing Environment
 
-Builds will fail or stage unsigned artifacts without these:
+`cargo xtask build-kernel` always produces a signed nucleus. With no override,
+it creates or reuses the repository-local development identity
+`RustOS Dev GRUB <rustos-dev-grub@example.invalid>` in
+`build/dev-grub-gpg` and exports `build/dev-grub.pub`. These variables select
+explicit material instead:
 
 - `RUSTOS_GRUB_SIGNING_KEY` — GPG key ID used to sign the GRUB nucleus
 - `RUSTOS_GPG_HOME` — GPG home directory containing that key
 - `GPG` (optional) — path to gpg binary, defaults to `gpg` on PATH
 
-If either of the first two is unset, `cargo xtask build-kernel` will warn
-about a missing nucleus signature and `stage` will refuse. Confirm with
-the user before exporting these — never assume values.
+Never invent or export override values. When they are absent, use the
+source-defined repository-local development identity; staging still verifies
+that the detached signature exists.
 
 ## Commands
 

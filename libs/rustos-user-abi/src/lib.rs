@@ -42,25 +42,29 @@ mod tests {
 
     #[test]
     fn performance_limits_are_strictly_layered() {
-        assert!(performance::BOOT_TO_UI_TARGET_MS < performance::BOOT_TO_UI_HARD_LIMIT_MS);
-        assert!(
-            performance::UI_BOOT_GPU_ACTIVATION_BUDGET_MS < performance::BOOT_TO_UI_HARD_LIMIT_MS
-        );
-        assert!(
-            performance::IPC_FOREGROUND_MAINTENANCE_SLICE_MS
-                < performance::IPC_READINESS_QUERY_HARD_LIMIT_MS
-        );
-        assert!(
-            performance::IPC_READINESS_QUERY_HARD_LIMIT_MS
-                < performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS
-        );
-        assert!(
-            performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS
-                < performance::IPC_BOOT_CONTROL_HARD_LIMIT_MS
-        );
-        assert!(
-            performance::IPC_BOOT_CONTROL_HARD_LIMIT_MS < performance::IPC_BULK_DATA_HARD_LIMIT_MS
-        );
+        const {
+            assert!(performance::BOOT_TO_UI_TARGET_MS < performance::BOOT_TO_UI_HARD_LIMIT_MS);
+            assert!(
+                performance::UI_BOOT_GPU_ACTIVATION_BUDGET_MS
+                    < performance::BOOT_TO_UI_HARD_LIMIT_MS
+            );
+            assert!(
+                performance::IPC_FOREGROUND_MAINTENANCE_SLICE_MS
+                    < performance::IPC_READINESS_QUERY_HARD_LIMIT_MS
+            );
+            assert!(
+                performance::IPC_READINESS_QUERY_HARD_LIMIT_MS
+                    < performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS
+            );
+            assert!(
+                performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS
+                    < performance::IPC_BOOT_CONTROL_HARD_LIMIT_MS
+            );
+            assert!(
+                performance::IPC_BOOT_CONTROL_HARD_LIMIT_MS
+                    < performance::IPC_BULK_DATA_HARD_LIMIT_MS
+            );
+        }
         assert_eq!(performance::UI_FRAME_MAX_SYNCHRONOUS_POLICY_IPC, 0);
         assert_eq!(performance::SERVICE_LOOKUP_MAX_IPC_WITH_EXACT_GRANT, 0);
         assert_eq!(
