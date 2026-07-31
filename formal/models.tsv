@@ -61,6 +61,7 @@ dvm-release-bundle/DvmReleaseBundle	safety	intentional-terminal	bundle admission
 early-system-admission/EarlySystemAdmission	safety	intentional-terminal	bootstrap admission reaches DVM storage readiness or fails closed	120	900	exhaustive	no	no	no
 endpoint-publication/EndpointPublication	safety	intentional-terminal	publisher process may exit	120	900	exhaustive	no	yes	no
 endpoint-registry/EndpointRegistry	temporal	intentional-terminal	endpoint wait may settle terminally	120	900	exhaustive	no	no	no
+endpoint-receiver-wakeup/EndpointReceiverWakeup	safety	check	explicit terminal stutter preserves deadlock checking	30	120	exhaustive	no	no	no
 exception-retirement-lifecycle/ExceptionRetirementLifecycle	temporal	intentional-terminal	exception outcome is terminal	120	900	exhaustive	no	no	no
 exec-ticket/ExecTicket	safety	intentional-terminal	ticket outcome is terminal	120	900	exhaustive+simulate	yes	no	no
 filesystem-content-integrity/FilesystemContentIntegrity	temporal	intentional-terminal	verified read decision is terminal	120	900	exhaustive	no	no	no

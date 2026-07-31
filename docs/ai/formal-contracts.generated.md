@@ -2,18 +2,18 @@
 # Formal Contract Registry
 
 - Schema: `3`
-- Registry SHA-256: `de4f247cb6f8d8d7e4c6d3e16ebf6cd98a0944662c7c1f5ffcaf0a5805284101`
-- Models: `113`
+- Registry SHA-256: `a2374d65be686e333cefe24a901a7d762773f61edbd5cc8b8625f33d46eba4e5`
+- Models: `114`
 - Whole flows: `67`
-- Transitions: `576`
+- Transitions: `577`
 - Product runtime scenarios: `3`
-- Exact source witnesses: `413`
+- Exact source witnesses: `414`
 - Apalache pilots: `3`
 - TLAPS theorem models: `2`
 - Runtime-traced models: `7`
 - Intentional-terminal exceptions: `91` (ceiling `91`)
 - Cyclic strongly connected components: `31`
-- Supporting model bindings: `72`
+- Supporting model bindings: `73`
 - Explicit critical/high risk surfaces: `89`
 - Additional source mappings: `112`
 
@@ -41,7 +41,7 @@
 | `dvm-network-ingress` | `critical` | kernel-io-manager, netd | dvm-network-ring/DvmNetworkRing | 8 | 8 | delivered, rejected, revoked |
 | `dvm-read-cache` | `critical` | storaged | dvm-read-cache/DvmReadCache | 8 | 8 | cache-served, fill-failed, fresh-served, mutated, restarted, stale |
 | `dvm-volume-io` | `critical` | kernel-io-manager, vfsd | dvm-volume-io/DvmVolumeIo | 14 | 14 | complete, failed, geometry-rejected, image-rejected, rejected, reply-rejected, timed-out, unavailable |
-| `endpoint-lifecycle` | `critical` | kernel-compat, kernel-ipc-runtime, kernel-ps | endpoint-publication/EndpointPublication, ipc-endpoint-ownership/IpcEndpointOwnership | 7 | 7 | rejected |
+| `endpoint-lifecycle` | `critical` | kernel-compat, kernel-ipc-runtime, kernel-ps | endpoint-publication/EndpointPublication, endpoint-receiver-wakeup/EndpointReceiverWakeup, ipc-endpoint-ownership/IpcEndpointOwnership | 8 | 8 | rejected |
 | `entropy-boundary` | `critical` | kernel-compat, kernel-executive | entropy-broker-boundary/EntropyBrokerBoundary | 5 | 5 | boot-rejected, denied, served |
 | `exception-retirement` | `critical` | kernel-executive, kernel-hal, kernel-ps | exception-retirement-lifecycle/ExceptionRetirementLifecycle | 6 | 6 | kernel-panicked, process-retired, resumed, thread-retired |
 | `executable-image-admission` | `critical` | image-admission | dual-abi-image-admission/DualAbiImageAdmission | 4 | 4 | admitted, rejected |

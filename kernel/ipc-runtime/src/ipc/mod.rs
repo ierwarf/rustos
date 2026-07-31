@@ -1423,13 +1423,19 @@ fn endpoint_owner_allows(owner: Option<EndpointOwner>, receiver: EndpointOwner) 
 /// queued on the endpoint at the moment of registration. Callers must use the
 /// returned flag to skip blocking (and re-poll the queue) when `true`, closing
 /// the recv→add-waiter→block race window where the producer queued a message
-/// before our slot was visible and so issued no wake.
+/// before our slot was visible and so issued no wake. A task is published as a
+/// waiter only when the queue is still empty at this exact linearization point:
+/// leaving a waiter behind while returning `has_pending` lets a later producer
+/// consume stale wake/handoff authority for a receiver that never blocked.
 pub fn add_endpoint_receiver_waiter(
     endpoint: KernelEndpointHandle,
     task_id: u64,
 ) -> Result<bool, IpcError> {
     ENDPOINTS
         .with_mut(endpoint.raw(), |endpoint_object| {
+            if !endpoint_object.pending_messages.is_empty() {
+                return Ok(true);
+            }
             let already_waiting = endpoint_object.waiting_receivers.contains(&task_id);
             if !already_waiting {
                 if endpoint_object.waiting_receivers.len() >= MAX_ENDPOINT_WAITERS {
@@ -1437,7 +1443,7 @@ pub fn add_endpoint_receiver_waiter(
                 }
                 endpoint_object.waiting_receivers.push_back(task_id);
             }
-            Ok(!endpoint_object.pending_messages.is_empty())
+            Ok(false)
         })
         .ok_or(IpcError::InvalidHandle)?
 }
@@ -2074,6 +2080,8 @@ pub fn channel_queue_len(channel: KernelChannelHandle) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+    mod receiver_waiter_tests;
+
     use alloc::vec::Vec;
     use core::sync::atomic::Ordering;
 
@@ -2699,17 +2707,6 @@ mod tests {
                 super::complete_endpoint_reply(reply, b"second"),
                 Err(IpcError::InvalidArgument)
             );
-        });
-    }
-
-    #[test]
-    fn endpoint_receiver_waiter_is_woken_by_next_call() {
-        with_isolated_ipc_test(|| {
-            let endpoint = super::create_endpoint().expect("create endpoint");
-            super::add_endpoint_receiver_waiter(endpoint, 99).expect("add waiter");
-            let (_reply, receiver) =
-                super::enqueue_endpoint_call(endpoint, 1, b"request").expect("enqueue call");
-            assert_eq!(receiver, Some(99));
         });
     }
 

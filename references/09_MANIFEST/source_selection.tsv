@@ -1,0 +1,82 @@
+repository	topic	path	rationale
+torvalds/linux	process	Documentation/process/	patch submission, maintainership, regression and stable rules
+torvalds/linux	concurrency	Documentation/locking/	lock classes, lockdep, mutex/seqlock
+torvalds/linux	concurrency	Documentation/RCU/	RCU concepts and requirements
+torvalds/linux	concurrency	Documentation/memory-barriers.txt	compiler and CPU ordering
+torvalds/linux	verification	tools/memory-model/	LKMM, herd model, litmus tests
+torvalds/linux	verification	Documentation/dev-tools/	KUnit, KCSAN, KASAN, testing tools
+torvalds/linux	scheduler	kernel/sched/	scheduler implementation
+torvalds/linux	locking	kernel/locking/	core locking primitives
+torvalds/linux	rcu	kernel/rcu/	RCU implementation
+torvalds/linux	process	kernel/fork.c	task creation and teardown
+torvalds/linux	process	fs/exec.c	exec lifecycle
+torvalds/linux	elf	fs/binfmt_elf.c	ELF loading
+torvalds/linux	vfs	fs/namei.c	path lookup and rename races
+torvalds/linux	memory	mm/memory.c	page fault and COW
+torvalds/linux	memory	mm/mmap.c	VMA lifecycle
+torvalds/linux	ipc	ipc/	SysV and POSIX IPC
+torvalds/linux	abi	include/uapi/	public kernel UAPI
+torvalds/linux	compat	include/linux/compat.h	32/64 compat types
+torvalds/linux	compat	arch/x86/entry/	syscall entry and compat paths
+torvalds/linux	process	MAINTAINERS	ownership and routing
+QubesOS/qubes-doc	qubes	developer/system/architecture.rst	system trust boundaries
+QubesOS/qubes-doc	qubes	developer/services/qrexec.rst	RPC policy and protocol
+QubesOS/qubes-doc	qubes	developer/services/qrexec-internals.rst	implementation details
+QubesOS/qubes-doc	qubes	developer/services/admin-api.rst	management protocol
+QubesOS/qubes-doc	security	developer/system/security-critical-code.rst	TCB inventory
+QubesOS/qubes-core-admin	qubes	qubes/	VM/storage/device lifecycle
+QubesOS/qubes-core-admin	testing	qubes/tests/	system tests
+QubesOS/qubes-core-qrexec	qubes	daemon/	dom0 side qrexec
+QubesOS/qubes-core-qrexec	qubes	agent/	guest side qrexec
+xen-project/xen	abi	xen/include/public/	hypervisor public ABI
+xen-project/xen	ipc	xen/common/event_channel.c	event channel lifecycle
+xen-project/xen	memory	xen/common/grant_table.c	shared page grants
+xen-project/xen	lifecycle	xen/common/domain.c	domain lifecycle
+xen-project/xen	scheduler	xen/common/schedule.c	hypervisor scheduling
+seL4/seL4	kernel	src/	kernel implementation
+seL4/seL4	api	include/api/	kernel API structures
+seL4/seL4	userspace	libsel4/	user-facing syscall bindings
+seL4/seL4	spec	manual/	reference manual sources
+seL4/seL4	config	configs/	verified/supported configurations
+seL4/l4v	proof	proof/	Isabelle proofs
+seL4/l4v	spec	spec/	abstract and executable specs
+seL4/rfcs	process	.	architectural RFCs
+fuchsia	starnix	src/starnix/	Linux UAPI implementation
+fuchsia	zircon	zircon/kernel/	Zircon kernel
+fuchsia	abi	zircon/system/public/zircon/	public Zircon ABI
+fuchsia	docs	docs/concepts/kernel/	kernel concepts
+fuchsia	process	docs/contribute/	review and contribution process
+freebsd/freebsd-src	compat	sys/compat/linux/	common Linuxulator
+freebsd/freebsd-src	compat	sys/amd64/linux/	amd64 Linux ABI
+freebsd/freebsd-src	compat	sys/arm64/linux/	arm64 Linux ABI
+NetBSD/src	compat	sys/compat/linux/	NetBSD Linux emulation
+illumos/illumos-gate	compat	usr/src/uts/common/brand/lx/	lx brand kernel support
+illumos/illumos-gate	compat	usr/src/lib/brand/lx/	lx userspace brand
+google/gvisor	compat	pkg/sentry/	Sentry kernel
+google/gvisor	abi	pkg/abi/linux/	Linux ABI definitions
+wine-mirror/wine	compat	dlls/ntdll/unix/	NTDLL Unix backend
+wine-mirror/wine	compat	server/	Wine server object model
+wine-mirror/wine	compat	dlls/wow64/	WoW64 compatibility
+reactos/reactos	compat	ntoskrnl/	NT kernel implementation
+reactos/reactos	compat	dll/ntdll/	NTDLL
+reactos/reactos	compat	sdk/include/ndk/	NT native API definitions
+Stichting-MINIX-Research-Foundation/minix	microkernel	minix/kernel/	MINIX kernel
+Stichting-MINIX-Research-Foundation/minix	servers	minix/servers/	userspace servers
+HelenOS/helenos	microkernel	kernel/	HelenOS kernel
+HelenOS/helenos	servers	uspace/srv/	userspace services
+redox-os/kernel	microkernel	src/	Rust kernel
+genodelabs/genode	components	repos/base/	core component framework
+kernkonzept/fiasco	microkernel	src/	Fiasco.OC
+kernkonzept/l4re-core	runtime	.	L4Re runtime and servers
+tlaplus/Examples	verification	.	TLA+ example specifications
+apalache-mc/apalache	verification	docs/	Apalache docs
+model-checking/kani	verification	docs/	Kani model checking
+tokio-rs/loom	verification	src/	concurrency scheduler model
+diffblue/cbmc	verification	doc/	CBMC docs
+google/syzkaller	fuzzing	docs/	syzkaller operational docs
+google/syzkaller	fuzzing	sys/linux/	Linux syscall descriptions
+herd/herdtools7	memory-model	herd/	memory model tools
+riscv/riscv-isa-manual	spec	src/	RISC-V ISA sources
+oasis-tcs/virtio-spec	spec	.	VirtIO specification sources
+devicetree-org/devicetree-specification	spec	source/	Devicetree spec
+ARM-software/abi-aa	abi	.	Arm ABI specifications

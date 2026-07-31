@@ -26,6 +26,7 @@ dvm-input-selftest/DvmInputSelftest	evidence	dvm-input-ingress	Self-test evidenc
 dvm-network-control/DvmNetworkControl	refinement	dvm-network-ingress	Control lease lifetime refines network ingress generation ownership.
 dvm-release-bundle/DvmReleaseBundle	evidence	boot-storage-handoff	Signed release-bundle evidence binds the exact launched DVM artifacts.
 endpoint-registry/EndpointRegistry	refinement	endpoint-lifecycle	Registry publication and stale epoch rejection refine endpoint lifetime.
+endpoint-receiver-wakeup/EndpointReceiverWakeup	refinement	endpoint-lifecycle	Pending-message observation and receiver-waiter publication share one endpoint-slot linearization point; a pending fast path retains no stale wake authority.
 exec-ticket/ExecTicket	refinement	deferred-process-activation	Exact requester and target identity refine the activation transaction.
 gui-dvm-install/GuiDvmInstall	evidence	gpu-frame-lifecycle	GUI DVM installation evidence is bound to the real provider lifecycle.
 gui-dvm-pixel-authority/GuiDvmPixelAuthority	refinement	gpu-frame-lifecycle	Pixel authority and revoke refine GPU frame ownership.

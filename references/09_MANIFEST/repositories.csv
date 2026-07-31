@@ -1,0 +1,33 @@
+name,url,default_ref,license_hint,focus,mode
+Linux,https://github.com/torvalds/linux,master,GPL-2.0-only / Linux-syscall-note,"kernel, ABI, process docs, LKMM",offline+fetch
+Qubes docs,https://github.com/QubesOS/qubes-doc,main,verify upstream,"architecture, qrexec, TCB",offline+fetch
+Qubes core-admin,https://github.com/QubesOS/qubes-core-admin,main,GPL-family; verify,"qube lifecycle, admin API, storage",fetch
+Qubes qrexec,https://github.com/QubesOS/qubes-core-qrexec,main,GPL-family; verify,cross-domain RPC,fetch
+Xen,https://github.com/xen-project/xen,master,GPL-2.0; mixed tools,"hypervisor ABI, grant/event",fetch
+seL4,https://github.com/seL4/seL4,master,"per-file SPDX; kernel GPLv2, user headers BSD",capability microkernel,offline+fetch
+seL4 l4v,https://github.com/seL4/l4v,master,mixed proof licenses; verify,formal proofs,offline+fetch
+seL4 RFCs,https://github.com/seL4/rfcs,master,verify upstream,architecture change process,offline+fetch
+Fuchsia,https://fuchsia.googlesource.com/fuchsia,main,BSD-style and per-file,"Zircon, Starnix, components",fetch
+FreeBSD src,https://github.com/freebsd/freebsd-src,main,BSD and per-file,"Linuxulator, kernel",fetch
+NetBSD src,https://github.com/NetBSD/src,trunk,BSD and per-file,"compat_linux, kernel",fetch
+illumos,https://github.com/illumos/illumos-gate,master,CDDL and per-file,"lx brand, zones",fetch
+gVisor,https://github.com/google/gvisor,master,Apache-2.0,"userspace kernel, Linux ABI",fetch
+Wine,https://github.com/wine-mirror/wine,master,LGPL-2.1-or-later,"Windows ABI, WoW64",fetch
+ReactOS,https://github.com/reactos/reactos,master,GPL and per-file,NT-compatible OS,fetch
+MINIX 3,https://github.com/Stichting-MINIX-Research-Foundation/minix,master,BSD and imported code,microkernel servers,fetch
+HelenOS,https://github.com/HelenOS/helenos,master,BSD-3-Clause and per-file,IPC/VFS/drivers,fetch
+Redox kernel,https://github.com/redox-os/kernel,master,MIT,Rust kernel,fetch
+Genode,https://github.com/genodelabs/genode,master,AGPL/GPL/commercial mix; verify,component framework,fetch
+Fiasco.OC,https://github.com/kernkonzept/fiasco,master,GPL-2.0,L4 microkernel,fetch
+L4Re core,https://github.com/kernkonzept/l4re-core,master,mixed; verify,L4 runtime/services,fetch
+TLA+ Examples,https://github.com/tlaplus/Examples,master,MIT,distributed/concurrent specs,offline+fetch
+Apalache,https://github.com/apalache-mc/apalache,main,Apache-2.0,symbolic TLA+ checking,fetch
+Kani,https://github.com/model-checking/kani,main,Apache-2.0 / MIT,Rust model checking,fetch
+Loom,https://github.com/tokio-rs/loom,master,MIT,Rust concurrency exploration,offline+fetch
+CBMC,https://github.com/diffblue/cbmc,develop,BSD-4-Clause,C bounded model checking,fetch
+syzkaller,https://github.com/google/syzkaller,master,Apache-2.0,kernel syscall fuzzing,fetch
+herdtools7,https://github.com/herd/herdtools7,master,CeCILL-B,memory model/litmus,fetch
+RISC-V ISA,https://github.com/riscv/riscv-isa-manual,main,CC-BY-4.0,architecture spec,fetch
+VirtIO spec,https://github.com/oasis-tcs/virtio-spec,master,OASIS terms; verify,virtual devices,fetch
+Devicetree spec,https://github.com/devicetree-org/devicetree-specification,main,Apache-2.0,hardware description,fetch
+Arm ABI,https://github.com/ARM-software/abi-aa,main,CC-BY-SA-4.0,calling/ELF ABI,fetch

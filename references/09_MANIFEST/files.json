@@ -1,0 +1,524 @@
+[
+  {
+    "path": "00_START_HERE/LLM_SYSTEM_PROMPT_KO.md",
+    "bytes": 3664,
+    "lines": 61,
+    "sha256": "909f289aa4e09d9ec2110de76be58b11353043c152e83cf16d87733aa5aabb92"
+  },
+  {
+    "path": "00_START_HERE/README_KO.md",
+    "bytes": 3319,
+    "lines": 37,
+    "sha256": "0b107a52fc594446a5fbe1ae06bd20665f2f97a2d1aace1c0ccb5e2bd07a5e11"
+  },
+  {
+    "path": "00_START_HERE/TOPIC_MAP.md",
+    "bytes": 1621,
+    "lines": 16,
+    "sha256": "551aa2c54d10dedffb016cbebd6296d9d8b1f1058e186aba259f95efbecdfb28"
+  },
+  {
+    "path": "00_START_HERE/USAGE_FOR_150K_LOC_OS_KO.md",
+    "bytes": 2310,
+    "lines": 63,
+    "sha256": "4d77c04fcc0f0f75c4b9549a7d50226776c7249c6b99ef6fe9f93481463a27e3"
+  },
+  {
+    "path": "01_LINUX/COPYING",
+    "bytes": 496,
+    "lines": 20,
+    "sha256": "fb5a425bd3b3cd6071a3a9aff9909a859e7c1158d54d32e07658398cd67eb6a0"
+  },
+  {
+    "path": "01_LINUX/LLM_READ_ORDER_KO.md",
+    "bytes": 1003,
+    "lines": 30,
+    "sha256": "dee774972453cd82cd9c18f3637041a17300fd1aabc1c0451f23dee0f4f9235c"
+  },
+  {
+    "path": "01_LINUX/MAINTAINERS",
+    "bytes": 916472,
+    "lines": 29845,
+    "sha256": "0523342158cd694e7958b557c02ba2db4a4a14977f688b3578f5137f3d0cb3be"
+  },
+  {
+    "path": "01_LINUX/README",
+    "bytes": 6043,
+    "lines": 168,
+    "sha256": "2844b0b2cafe22741724c4fdda79b1259de48743f12ad40ce408adb1ef00ceda"
+  },
+  {
+    "path": "01_LINUX/docs_abi/adding-syscalls.rst",
+    "bytes": 29936,
+    "lines": 661,
+    "sha256": "310b49c416eee82a9c2ff14bcad57f025a1510b4e3eec574788cf7391a4893c6"
+  },
+  {
+    "path": "01_LINUX/docs_abi/ioctl-number.rst",
+    "bytes": 29061,
+    "lines": 412,
+    "sha256": "7bef8407942e3e9c118f31a64171db1357d3e417f73970e2b946330dc08e4904"
+  },
+  {
+    "path": "01_LINUX/docs_concurrency/atomic_t.txt",
+    "bytes": 10220,
+    "lines": 367,
+    "sha256": "717673f723f57ea07ca03d919e2a21e8fc2ce8c8808d3a1c6a9c36ae79885fe0"
+  },
+  {
+    "path": "01_LINUX/docs_concurrency/kcsan.rst",
+    "bytes": 17163,
+    "lines": 377,
+    "sha256": "6fdf591448f323bad4e62e109d3469f7d16fe4bb41f83f18beefc11d602ed913"
+  },
+  {
+    "path": "01_LINUX/docs_concurrency/locktypes.rst",
+    "bytes": 18128,
+    "lines": 555,
+    "sha256": "95348ee928c7b7399af86e3bf0c667e735454b5c7ac66142d431529cf12091f0"
+  },
+  {
+    "path": "01_LINUX/docs_concurrency/memory-barriers.rst",
+    "bytes": 382,
+    "lines": 18,
+    "sha256": "34a5d60fd01045d4e4f5ee1869c0f6c61e84c8c3b8549da1ab352f8292f64fac"
+  },
+  {
+    "path": "01_LINUX/docs_concurrency/memory-barriers.txt",
+    "bytes": 114239,
+    "lines": 3016,
+    "sha256": "090db2834c75aff44a528204c8072640e01efe51f1ac44e54a1d89efe1714a5c"
+  },
+  {
+    "path": "01_LINUX/docs_concurrency/seqlock.rst",
+    "bytes": 7796,
+    "lines": 242,
+    "sha256": "c9032991fbadfc712802e43715d159baf95fbb0ce18332bb19039b3a49fb4837"
+  },
+  {
+    "path": "01_LINUX/docs_concurrency/whatisRCU.rst",
+    "bytes": 53460,
+    "lines": 1415,
+    "sha256": "1a566001150d7b821772554795282c6e061115c980fae070c5e9b0da353d6e44"
+  },
+  {
+    "path": "01_LINUX/docs_process/2.Process.rst",
+    "bytes": 24258,
+    "lines": 494,
+    "sha256": "ce1b20d903d7db6aaad404e1476f1d8ec3b975760906f5499978dba2cc3eee57"
+  },
+  {
+    "path": "01_LINUX/docs_process/5.Posting.rst",
+    "bytes": 18396,
+    "lines": 368,
+    "sha256": "a2557b981f0d8d54a910abf56edce82bd833e6b5924be2f9b6ee5226f172b115"
+  },
+  {
+    "path": "01_LINUX/docs_process/development-process.rst",
+    "bytes": 821,
+    "lines": 27,
+    "sha256": "f24d59021efe8f62eca826b750c89b5d4907af4068657cbfa690e04cbadc6950"
+  },
+  {
+    "path": "01_LINUX/docs_process/security-bugs.rst",
+    "bytes": 18592,
+    "lines": 346,
+    "sha256": "0f7177ec0c9f95c061bb39de2947c0fdfe8670bd1419090066249f7925cdc772"
+  },
+  {
+    "path": "01_LINUX/docs_process/stable-api-nonsense.rst",
+    "bytes": 9471,
+    "lines": 204,
+    "sha256": "05210f08c197419fc06b1555d99dc19eaa5e034e1b301692b34413c7e3dfd86e"
+  },
+  {
+    "path": "01_LINUX/docs_process/stable-kernel-rules.rst",
+    "bytes": 9052,
+    "lines": 234,
+    "sha256": "5cc204d8a61ab1fa572d02a21fd9be2251f133b3c2efc79265bbf670226e51c4"
+  },
+  {
+    "path": "01_LINUX/docs_process/submit-checklist.rst",
+    "bytes": 5329,
+    "lines": 137,
+    "sha256": "9157fdbc9e2323d6175e0e526e70105348f68ee731ac9a2d9aa6ce6a125d2412"
+  },
+  {
+    "path": "01_LINUX/docs_process/submitting-patches.rst",
+    "bytes": 42024,
+    "lines": 949,
+    "sha256": "d9c5f7c9c849751d49208b537da9766dd6e1527a4eab0fec3baaf087ce7f2f23"
+  },
+  {
+    "path": "02_DUAL_ABI/DUAL_ABI_DESIGN_GUIDE_KO.md",
+    "bytes": 7240,
+    "lines": 133,
+    "sha256": "2c9560f27a18de263ed2a5ebadc713179350d2135d39f442c0715faa52454047"
+  },
+  {
+    "path": "02_DUAL_ABI/FREEBSD_LINUXULATOR_NOTES_KO.md",
+    "bytes": 1085,
+    "lines": 24,
+    "sha256": "b5131a051bc3c78c6aaca55757e14f63f161c176e9098ae8feffadf18d943945"
+  },
+  {
+    "path": "02_DUAL_ABI/FUCHSIA_STARNIX_NOTES_KO.md",
+    "bytes": 1728,
+    "lines": 26,
+    "sha256": "5a4e7ec6c9b40e3c0ff577057a4b353c7fb7492651daaceda70da62e87990222"
+  },
+  {
+    "path": "02_DUAL_ABI/OTHER_COMPATIBILITY_LAYERS.md",
+    "bytes": 1016,
+    "lines": 12,
+    "sha256": "6a02d8acc4b8b5ecdbbb5e71fa40b79ef3a9a90ab40ff9bc355a7923528f8568"
+  },
+  {
+    "path": "03_MICROKERNELS/DRIVER_ISOLATION_GUIDE_KO.md",
+    "bytes": 1364,
+    "lines": 36,
+    "sha256": "27dc18305fc2bfc95de3dc09555ed699f0a8e36f8a830e3e61e672788b7308f8"
+  },
+  {
+    "path": "03_MICROKERNELS/MICROKERNEL_COMPARISON_KO.md",
+    "bytes": 2675,
+    "lines": 33,
+    "sha256": "d8d2e94a2556da269fd643a3b990b97482d0c2204a0bacee880159ae2133c284"
+  },
+  {
+    "path": "03_MICROKERNELS/l4re_qnx_links/QNX_AND_L4_LINKS.md",
+    "bytes": 686,
+    "lines": 12,
+    "sha256": "646b29333fa46fe93a7a9bcc1e63ffc900fe88c8d911335d358f160a63667624"
+  },
+  {
+    "path": "03_MICROKERNELS/sel4/CAVEATS.md",
+    "bytes": 10786,
+    "lines": 261,
+    "sha256": "b494cb920245b8cd36771f56334f20a6cb7d28a9d7cf9fbeb0f6fc164ec30012"
+  },
+  {
+    "path": "03_MICROKERNELS/sel4/CONTRIBUTING.md",
+    "bytes": 2023,
+    "lines": 58,
+    "sha256": "b2a289673a48de8be5454393a831454800a02e4613492f16ba5a69f801a144b5"
+  },
+  {
+    "path": "03_MICROKERNELS/sel4/LICENSE.md",
+    "bytes": 1162,
+    "lines": 31,
+    "sha256": "8d178c609d943acf8098b3fdd420f25c222e08e06384c1cd93e3bc7cf5d93f64"
+  },
+  {
+    "path": "03_MICROKERNELS/sel4/README.md",
+    "bytes": 4710,
+    "lines": 111,
+    "sha256": "32c99ca428f53c8386135eb43b07945f512d8bea49f9343099097d8ab4f36244"
+  },
+  {
+    "path": "03_MICROKERNELS/sel4/RFCS_README.md",
+    "bytes": 11266,
+    "lines": 242,
+    "sha256": "39f7c81ead85a7ab50e1f9baf12e0d3091daa187e24bc8ff6bd86d62c3d073e8"
+  },
+  {
+    "path": "03_MICROKERNELS/sel4_l4v/README.md",
+    "bytes": 8872,
+    "lines": 189,
+    "sha256": "0c25141c8a78f325cc6a2f22cf326a991767781a19027359324712af29ab0539"
+  },
+  {
+    "path": "04_QUBES_XEN/QUBES_ARCHITECTURE_NOTES_KO.md",
+    "bytes": 2135,
+    "lines": 45,
+    "sha256": "a4d53bb18b1666c83658c08c7e94fa472dcd9c5342b30d81bde78852757f33d3"
+  },
+  {
+    "path": "04_QUBES_XEN/XEN_REFERENCE_MAP.md",
+    "bytes": 832,
+    "lines": 21,
+    "sha256": "ee3c1584af067fa2414f528867c3bab3515162ff7d751dce2cac262f2bda42da"
+  },
+  {
+    "path": "04_QUBES_XEN/qubes_docs/admin-api.rst",
+    "bytes": 27054,
+    "lines": 932,
+    "sha256": "046cd7207cb473d0cab3817cdc0e7a8598471e8e8f4c6cd8c55441303fa56d6a"
+  },
+  {
+    "path": "04_QUBES_XEN/qubes_docs/architecture.rst",
+    "bytes": 3948,
+    "lines": 71,
+    "sha256": "6fd2f99f81e588f8b58485e41060357dff4b541bd50432c489da0b8144545428"
+  },
+  {
+    "path": "04_QUBES_XEN/qubes_docs/qrexec-internals.rst",
+    "bytes": 14514,
+    "lines": 349,
+    "sha256": "9e2f7c2e07f7ef4a256691a6fd9cbecf0a644aff9595fe408a01f382790512a2"
+  },
+  {
+    "path": "04_QUBES_XEN/qubes_docs/qrexec.rst",
+    "bytes": 20250,
+    "lines": 329,
+    "sha256": "e7aa70c15eaa98afcd64eff20edb4dfa09f50e647cfc7d55e6f4e8581b5ef0f6"
+  },
+  {
+    "path": "04_QUBES_XEN/qubes_docs/security-critical-code.rst",
+    "bytes": 3985,
+    "lines": 70,
+    "sha256": "8fb941644c6e137be237273419bc7875d2ab0046d4d5502bbcbfd355763c0f8f"
+  },
+  {
+    "path": "05_VERIFICATION/FORMAL_SPEC_TEMPLATE.md",
+    "bytes": 1098,
+    "lines": 50,
+    "sha256": "387a6c5057e2063fd212966928500af565cfbaab98a096b055794edca7204b49"
+  },
+  {
+    "path": "05_VERIFICATION/LKMM_AND_BARRIERS_KO.md",
+    "bytes": 1365,
+    "lines": 36,
+    "sha256": "45b47dfe63ca790dc41423337417affc8b2b30fb28c1b911e795f20af6436a7a"
+  },
+  {
+    "path": "05_VERIFICATION/VERIFICATION_LADDER_KO.md",
+    "bytes": 3491,
+    "lines": 103,
+    "sha256": "6efaa12321bcb2cee8fa75973d0d1080fed3c947b829bd5e7908304238cd7e9f"
+  },
+  {
+    "path": "05_VERIFICATION/herdtools/README.md",
+    "bytes": 2023,
+    "lines": 70,
+    "sha256": "de8505b8d8d33730c4523ec0caac81d79bc740148ef0c47a0e81c2ae517fb46f"
+  },
+  {
+    "path": "05_VERIFICATION/kani_loom_cbmc/LOOM_README.md",
+    "bytes": 3018,
+    "lines": 90,
+    "sha256": "1c0d0db3f1332c7a9591928d618b5ab35a7196f641c6da966b78753377e64a74"
+  },
+  {
+    "path": "05_VERIFICATION/syzkaller/README.md",
+    "bytes": 2463,
+    "lines": 44,
+    "sha256": "9abeb11211a3cdd3d63af7369f0f7cb709cc3630ffcc7240cf0c5a337a3e2161"
+  },
+  {
+    "path": "05_VERIFICATION/tla_plus/README.md",
+    "bytes": 38499,
+    "lines": 170,
+    "sha256": "8130fbbc2b3a8b08ada74c886aaea78f37547745a7161372c055e6a54e52877c"
+  },
+  {
+    "path": "06_SPECS/SPECIFICATION_MATRIX.md",
+    "bytes": 1259,
+    "lines": 19,
+    "sha256": "c4161dd3dd197a9f7c4007b4e0ffc375f407ee1f08192e8cd40da3076bdfbe92"
+  },
+  {
+    "path": "06_SPECS/hardware_links/OFFICIAL_SPEC_LINKS.md",
+    "bytes": 1212,
+    "lines": 20,
+    "sha256": "f2e771f9dc9e05ade54f23ba9c01cf79f502b5fa8f18058292d22ddc7e87cb2d"
+  },
+  {
+    "path": "07_ENGINEERING_PRACTICE/AI_GENERATED_PATCH_REVIEW_KO.md",
+    "bytes": 1333,
+    "lines": 30,
+    "sha256": "6a4bce8dbc779577565858a9541349e738c9bbeb2ef4de7ef87a5beebc554b5e"
+  },
+  {
+    "path": "07_ENGINEERING_PRACTICE/COMMERCIAL_OS_DEFINITION_OF_DONE_KO.md",
+    "bytes": 1777,
+    "lines": 57,
+    "sha256": "7e440b6ce0c882e88ad2d8671b1934da26f4eeb39d6daa37435afd313c5a8105"
+  },
+  {
+    "path": "07_ENGINEERING_PRACTICE/OS_COMMON_SENSE_CHECKLIST_KO.md",
+    "bytes": 11026,
+    "lines": 192,
+    "sha256": "69c0927d59a72a4a024ab89256f8b1a394557bf10601d9875313d5aeef4afff1"
+  },
+  {
+    "path": "07_ENGINEERING_PRACTICE/PATCH_REVIEW_PLAYBOOK_KO.md",
+    "bytes": 2083,
+    "lines": 56,
+    "sha256": "3bf0ef335128077b795864ff6c69c9945491e99a04a99ff2a54859581bc324f4"
+  },
+  {
+    "path": "07_ENGINEERING_PRACTICE/RELEASE_AND_UPDATE_SAFETY_KO.md",
+    "bytes": 910,
+    "lines": 11,
+    "sha256": "cc85cd5676737f8fb6412d96673a28966fb8a9221d68aa167bdbb69706bb466d"
+  },
+  {
+    "path": "08_REVIEW_CASES/CASE_REVIEW_WORKSHEET.csv",
+    "bytes": 166,
+    "lines": 1,
+    "sha256": "de0460e81e01e3782e427619e2dbd950a88b5aa4e25d50183aa479eace4822e3"
+  },
+  {
+    "path": "08_REVIEW_CASES/README.md",
+    "bytes": 1455,
+    "lines": 21,
+    "sha256": "0913b7d556114102e26aae9b29f11bff9507e0fbbeecf7359f440963484d4120"
+  },
+  {
+    "path": "08_REVIEW_CASES/REPRESENTATIVE_CASE_CARDS_KO.md",
+    "bytes": 5738,
+    "lines": 92,
+    "sha256": "d53994166a72cc95b2ea1bc00df2e54898255f19c44349159fed95486429dad2"
+  },
+  {
+    "path": "08_REVIEW_CASES/REVIEW_PATTERNS_KO.md",
+    "bytes": 1187,
+    "lines": 31,
+    "sha256": "23aba94c14b8bd1ef85bd5b2995b977a16a50e0c1de0ddd8271949d50a84a14d"
+  },
+  {
+    "path": "08_REVIEW_CASES/all_pr_cases.csv",
+    "bytes": 32279,
+    "lines": 139,
+    "sha256": "83db991663a75a596ad8a487df103c77367db4a44efe8199d5ecc785e91a4ddd"
+  },
+  {
+    "path": "08_REVIEW_CASES/genode/cases.csv",
+    "bytes": 4030,
+    "lines": 18,
+    "sha256": "3928b7d9d5301c990e0f90ff7b127526963db412990ca4fdca305e4e6542f4f1"
+  },
+  {
+    "path": "08_REVIEW_CASES/helenos/cases.csv",
+    "bytes": 9190,
+    "lines": 41,
+    "sha256": "970b88bfd063548338734cb1f4da97f3c2bdce8323244a85d47d20d405fedf6b"
+  },
+  {
+    "path": "08_REVIEW_CASES/linux/LINUX_PUSH_CASES_KO.md",
+    "bytes": 2383,
+    "lines": 38,
+    "sha256": "36879aef386bb54ab070fca6420ee9e328c0bc267f0d62d721c782598ef1b747"
+  },
+  {
+    "path": "08_REVIEW_CASES/linux/accepted_commit_examples.csv",
+    "bytes": 3946,
+    "lines": 21,
+    "sha256": "f762590bb5854958c5d39179da061b94ec4989dd5711a05fe10ea6ae01da5d1e"
+  },
+  {
+    "path": "08_REVIEW_CASES/minix/cases.csv",
+    "bytes": 395,
+    "lines": 2,
+    "sha256": "4592106a2a39bb223aedec669be225410f16f1d92396ffe838999aa29f8d084f"
+  },
+  {
+    "path": "08_REVIEW_CASES/qubes/cases.csv",
+    "bytes": 10106,
+    "lines": 41,
+    "sha256": "645c74dc13aaeced3bc1620848f3d35653e2d1b08b81812d5a51f71abb94441c"
+  },
+  {
+    "path": "08_REVIEW_CASES/sel4/cases.csv",
+    "bytes": 8914,
+    "lines": 41,
+    "sha256": "d5f102fcf5ef3411a03549ce74b933e7d0e890508d48e61ef52aac98a6e0a45f"
+  },
+  {
+    "path": "09_MANIFEST/RETRIEVAL_GUIDE.md",
+    "bytes": 1198,
+    "lines": 27,
+    "sha256": "26c6b2b39b428fa4e19a7888612fb9c8ad6c67a9b3ecbe79d0e79efa07bbc555"
+  },
+  {
+    "path": "09_MANIFEST/SOURCE_CATALOG.md",
+    "bytes": 3296,
+    "lines": 38,
+    "sha256": "88870b62009fabdb78cd79df2151ee6be2179bf0be48d1d03f1e4ab4d268b542"
+  },
+  {
+    "path": "09_MANIFEST/official_urls.csv",
+    "bytes": 1337,
+    "lines": 30,
+    "sha256": "9ff411b2ca0f86ee06f38d6f89f5953643c632913975dbd3bc07354204bd221e"
+  },
+  {
+    "path": "09_MANIFEST/rag_corpus.jsonl",
+    "bytes": 1916353,
+    "lines": 1385,
+    "sha256": "7871a62bdc569f5e95e64af2ab920f1342f4a56d1c99f04bd5c37e5b31cc6776"
+  },
+  {
+    "path": "09_MANIFEST/repositories.csv",
+    "bytes": 3308,
+    "lines": 33,
+    "sha256": "34fa35141c0d29cec1d12e8dec8db7e0d862488a14652df99e8efd343ac0bbe4"
+  },
+  {
+    "path": "09_MANIFEST/source_selection.tsv",
+    "bytes": 5053,
+    "lines": 82,
+    "sha256": "cdb8242b00b64ff4dd77a76441b264745d27c799e3e5a6771acd8c20fd2717e4"
+  },
+  {
+    "path": "NOTICE_AND_LICENSE_POLICY.md",
+    "bytes": 1330,
+    "lines": 22,
+    "sha256": "2380d0858d34e845859ed80e694ce5c5d29220a3d758489fa85951ac08afa480"
+  },
+  {
+    "path": "tools/README.md",
+    "bytes": 783,
+    "lines": 12,
+    "sha256": "e385300335a1b726212f4dc13ba834e0e8f93d5e70ae90290da236a5356bc0a0"
+  },
+  {
+    "path": "tools/build_rag_jsonl.py",
+    "bytes": 3019,
+    "lines": 93,
+    "sha256": "e9d3f808247511edaf0c1a4c4eebb0eb0e767715c732b29464277472ccde46f6"
+  },
+  {
+    "path": "tools/fetch_full_reference_pack.sh",
+    "bytes": 4942,
+    "lines": 87,
+    "sha256": "803deaca3192caa7b5656147e1df82e9bc1fbad02c229daa10f32bc15a30362c"
+  },
+  {
+    "path": "tools/fetch_github_pr_threads.py",
+    "bytes": 2166,
+    "lines": 43,
+    "sha256": "ccece17bd9dafbe5b821a5605fca9aac3036294f266cd54c8fd87ad10ab37f5a"
+  },
+  {
+    "path": "tools/fetch_linux_commit_context.py",
+    "bytes": 1321,
+    "lines": 22,
+    "sha256": "bafc5314a17cadf916511da358017125e5ac4821fc3f9fc770f17f6354015557"
+  },
+  {
+    "path": "tools/fetch_linux_patchwork_cases.py",
+    "bytes": 2649,
+    "lines": 57,
+    "sha256": "27521cf3ba059569b456cd71f6f5356a1d8306a9cba6b8c91a1d210e63c14c04"
+  },
+  {
+    "path": "tools/snapshot_commits.py",
+    "bytes": 767,
+    "lines": 14,
+    "sha256": "14990a149450a997eab9323f613cee100f9f63aff856233b4020683b48832d15"
+  },
+  {
+    "path": "tools/update_manifest.py",
+    "bytes": 1765,
+    "lines": 53,
+    "sha256": "e8812fd810409f2d63bf83f25f02e2fc8e05f6add261c91b323f7bb4f418035f"
+  },
+  {
+    "path": "tools/verify_pack.py",
+    "bytes": 3663,
+    "lines": 97,
+    "sha256": "d40339d9ba7da03762239767a723791e778631816caa73413aeb7484ba9f1557"
+  }
+]

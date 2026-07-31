@@ -113,7 +113,7 @@ reason = "Per-CPU raw-guard stacks, CPU/APIC identity, and preemption depth proh
 path = "kernel/ipc-runtime/src/ipc/mod.rs"
 severity = "critical"
 flows = ["ipc-call", "endpoint-lifecycle", "ipc-handle-transfer", "kernel-resource-lifecycle", "root-authority", "service-call-authority"]
-reason = "IPC queues, replies, endpoint owners, owner quotas, shared backing, and transferred capabilities are the microkernel authority spine."
+reason = "IPC queues, exact receiver-waiter publication, replies, endpoint owners, owner quotas, shared backing, and transferred capabilities are the microkernel authority spine."
 
 [[risk_surfaces]]
 path = "kernel/mm/src/memory/address_space.rs"
@@ -837,6 +837,7 @@ models = [
 [[source_mappings]]
 path = "kernel/ipc-runtime/src/ipc/mod.rs"
 models = [
+    "endpoint-receiver-wakeup/EndpointReceiverWakeup",
     "ipc-endpoint-ownership/IpcEndpointOwnership",
     "ipc-handle-transfer/IpcHandleTransfer",
     "ipc-reply-deadline/IpcReplyDeadline",
@@ -1299,6 +1300,7 @@ required_models = [
     "scheduler-cpu-ownership/SchedulerCpuOwnership",
     "tlb-shootdown-lifecycle/TlbShootdownLifecycle",
     "cross-cpu-task-retirement/CrossCpuTaskRetirement",
+    "endpoint-receiver-wakeup/EndpointReceiverWakeup",
     "robust-futex-owner-death/RobustFutexOwnerDeath",
     "per-cpu-clockevent-lifecycle/PerCpuClockeventLifecycle",
     "syscall-simd-lifecycle/SyscallSimdLifecycle",

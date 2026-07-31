@@ -1,0 +1,21 @@
+sha,date,title,kind,url
+8ba098e6b6ff0db8edf28528d1552be261af30d4,2026-07-31,Merge tag v7.2-rc5-smb3-client-fixes,subsystem_pull,https://github.com/torvalds/linux/commit/8ba098e6b6ff0db8edf28528d1552be261af30d4
+a11f030c83e6a13f99645e3f4b24befa4bf9efea,2026-07-30,Merge tag for-v7.2-rc: power supply fixes,subsystem_pull,https://github.com/torvalds/linux/commit/a11f030c83e6a13f99645e3f4b24befa4bf9efea
+e05b559f9cda350d0ab33c44a8c1151ca62d2875,2026-07-30,Merge tag for-linus-iommufd: fuzzing and lifetime fixes,subsystem_pull,https://github.com/torvalds/linux/commit/e05b559f9cda350d0ab33c44a8c1151ca62d2875
+9e2e9da4de7518f65063607209744e5b77dc0450,2026-07-30,Merge tag audit-pr-20260730: overflow and UAF fixes,subsystem_pull,https://github.com/torvalds/linux/commit/9e2e9da4de7518f65063607209744e5b77dc0450
+3708dd9488440e35a165aee2bb2a1a7b1d0d5777,2026-07-30,Merge tag pm-7.2-rc6: cpufreq and initialization race fixes,subsystem_pull,https://github.com/torvalds/linux/commit/3708dd9488440e35a165aee2bb2a1a7b1d0d5777
+2812e64e1575e05500a35c405aaa6e99b7d7930b,2026-07-30,Merge tag net-7.2-rc6: networking regression and safety fixes,subsystem_pull,https://github.com/torvalds/linux/commit/2812e64e1575e05500a35c405aaa6e99b7d7930b
+110b5cdd5b72bcef01b8d4dfe45d922bdd16de0e,2026-07-30,Merge tag gpio-fixes-for-v7.2-rc6,subsystem_pull,https://github.com/torvalds/linux/commit/110b5cdd5b72bcef01b8d4dfe45d922bdd16de0e
+b96890b3e5e0995a4bcf731bb9d6af2bbdf8ec42,2026-07-30,Merge tag powerpc-7.2-3,subsystem_pull,https://github.com/torvalds/linux/commit/b96890b3e5e0995a4bcf731bb9d6af2bbdf8ec42
+451c9075d6c53f2438d110addbeeeea6fac18567,2026-07-30,qede: move tunnel sync outside internal lock to fix self-deadlock,direct_fix,https://github.com/torvalds/linux/commit/451c9075d6c53f2438d110addbeeeea6fac18567
+c92922c02caf2b9bb506a59f32f9187a21ab0be9,2026-07-30,Merge tag linux-can-fixes-for-7.2-20260729,subsystem_pull,https://github.com/torvalds/linux/commit/c92922c02caf2b9bb506a59f32f9187a21ab0be9
+a58a2b0ce354df531ebc71fc870058c2feb59f6b,2026-07-30,openvswitch: avoid publishing meter before failure points to fix UAF,direct_fix,https://github.com/torvalds/linux/commit/a58a2b0ce354df531ebc71fc870058c2feb59f6b
+16809472409d998afcda402e32b8229b389337c4,2026-07-30,octeontx2-pf: order carrier-off before queue stop,direct_fix,https://github.com/torvalds/linux/commit/16809472409d998afcda402e32b8229b389337c4
+732ed8f75ce583d115716f668dc80d730f3ad610,2026-07-30,libwx: fix queue mismatch for software VLAN packets,direct_fix,https://github.com/torvalds/linux/commit/732ed8f75ce583d115716f668dc80d730f3ad610
+dd16f1b5720f5dae33a79b5305e188e8290a3973,2026-07-30,Merge branch net-dsa-realtek-use-devm_mutex_init,series_merge,https://github.com/torvalds/linux/commit/dd16f1b5720f5dae33a79b5305e188e8290a3973
+442ecdc83d00d6c2312541c4e0ada47e02805fcb,2026-07-30,realtek: use devm_mutex_init for l2_lock,direct_fix,https://github.com/torvalds/linux/commit/442ecdc83d00d6c2312541c4e0ada47e02805fcb
+a95f3e9b8985fc0e21bfcf727e941c1f03476927,2026-07-30,realtek: use devm_mutex_init for vlan_lock,direct_fix,https://github.com/torvalds/linux/commit/a95f3e9b8985fc0e21bfcf727e941c1f03476927
+050e07f8765d84b4e74fae239ff7a9f29eb6869c,2026-07-30,realtek: use devm_mutex_init for regmap lock,direct_fix,https://github.com/torvalds/linux/commit/050e07f8765d84b4e74fae239ff7a9f29eb6869c
+70fd0cf29bc47882c1cb11ad4fb2881ac2c1e640,2026-07-30,realtek: use devm_mutex_init for mib_lock,direct_fix,https://github.com/torvalds/linux/commit/70fd0cf29bc47882c1cb11ad4fb2881ac2c1e640
+54ad7ea45d63146a8e3c57375f8a269d4cf7ecea,2026-07-30,ptp netc: fix interrupt storm and unbind ordering,direct_fix,https://github.com/torvalds/linux/commit/54ad7ea45d63146a8e3c57375f8a269d4cf7ecea
+e67cc80b50f587cd1d8ffc8989dcec3291720bc3,2026-07-30,mana: propagate real RX queue creation errors,direct_fix,https://github.com/torvalds/linux/commit/e67cc80b50f587cd1d8ffc8989dcec3291720bc3

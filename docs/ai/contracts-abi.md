@@ -627,6 +627,13 @@ policy remains with the owning service.
   with multiple independent event sources must drain with
   `SYS_RUSTOS_IPC_TRY_RECV` / `rustos_svc_runtime::ipc::try_recv` and use a
   bounded yield/sleep between drain passes.
+- Blocking receive has one endpoint-slot linearization point for the
+  poll/arm/register race. If a message is already pending when receiver
+  registration acquires that slot, the syscall re-polls without publishing a
+  waiter. A waiter may exist only while the queue is empty; retaining one on
+  the pending fast path creates stale wake and synchronous-handoff authority
+  for a task that never blocked. The executable refinement is
+  `formal/endpoint-receiver-wakeup/EndpointReceiverWakeup.tla`.
 - root-supervisor services that authorize subjects may use
   `SYS_RUSTOS_IPC_{TRY_RECV,RECV}_WITH_SENDER` to receive the caller PID/TID
   stamped by the kernel. Payload subject fields are not trusted unless they

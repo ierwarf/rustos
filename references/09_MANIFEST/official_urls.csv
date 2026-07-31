@@ -1,0 +1,30 @@
+name,url
+Linux docs,https://docs.kernel.org/
+Linux source,https://github.com/torvalds/linux
+Linux lore,https://lore.kernel.org/
+Linux Patchwork,https://patchwork.kernel.org/
+Qubes docs,https://doc.qubes-os.org/
+Qubes architecture,https://doc.qubes-os.org/en/latest/developer/system/architecture.html
+Qubes qrexec,https://doc.qubes-os.org/en/latest/developer/services/qrexec.html
+seL4 docs,https://docs.sel4.systems/
+seL4 source,https://github.com/seL4/seL4
+seL4 proofs,https://github.com/seL4/l4v
+seL4 RFCs,https://github.com/seL4/rfcs
+Fuchsia Starnix,https://fuchsia.dev/fuchsia-src/concepts/starnix
+Fuchsia source,https://fuchsia.googlesource.com/fuchsia/
+FreeBSD Linux compatibility,https://docs.freebsd.org/en/books/handbook/linuxemu/
+FreeBSD src,https://github.com/freebsd/freebsd-src
+gVisor,https://gvisor.dev/docs/
+Wine,https://www.winehq.org/
+ReactOS,https://reactos.org/
+illumos,https://illumos.org/
+MINIX 3,https://www.minix3.org/
+HelenOS,https://www.helenos.org/
+Genode,https://genode.org/
+QNX docs,https://www.qnx.com/developers/docs/
+TLA+,https://lamport.azurewebsites.net/tla/tla.html
+Apalache,https://apalache-mc.org/
+Kani,https://model-checking.github.io/kani/
+Loom,https://github.com/tokio-rs/loom
+syzkaller,https://github.com/google/syzkaller
+herdtools7,https://github.com/herd/herdtools7
