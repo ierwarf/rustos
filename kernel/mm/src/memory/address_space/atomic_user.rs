@@ -25,6 +25,24 @@ use super::{
 };
 
 impl ProcessAddressSpace {
+    /// Validate one shared futex word while the owning process generation is
+    /// retained. Key identity comes from the stable VMA backing object and
+    /// byte offset, never from a physical frame that can migrate or be reused.
+    pub fn validate_shared_futex_word(&self, address: u64) -> Result<(), AddressSpaceError> {
+        validate_atomic_u32_address(address)?;
+        let virt = VirtAddr::new(address);
+        let (phys, flags) = self
+            .translate_user_with_flags(virt)
+            .ok_or(AddressSpaceError::NotMapped)?;
+        validate_user_page_access(flags, UserBufferAccess::Write)?;
+        assert!(
+            phys.as_u64()
+                .is_multiple_of(core::mem::align_of::<AtomicU32>() as u64),
+            "shared futex invariant: aligned virtual word translated to misaligned physical word"
+        );
+        Ok(())
+    }
+
     pub fn atomic_load_user_u32(&self, address: u64) -> Result<u32, AddressSpaceError> {
         let word = self.atomic_user_u32(address)?;
         // ORDERING: Acquire observes release publication by another CPU before

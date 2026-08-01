@@ -5,13 +5,16 @@
 //! - **Boundary:** loaderd supplies an untrusted bounded target array and
 //!   requester claim after binding the kernel-stamped IPC sender.
 //! - **Lifecycle:** validate shape → lock registry → preflight every exact
-//!   capability → atomically publish every task → consume every capability.
+//!   capability and scheduler target → consume every capability while every
+//!   target remains suspended → atomically publish every task.
 //! - **Concurrency:** the process-broker registry lock precedes and spans the
 //!   allocation-free scheduler batch commit.
 //! - **Failure:** any bad shape, authority, or scheduler target changes none;
 //!   a post-commit capability mismatch is kernel corruption and panics.
 //! - **Forbidden:** no partial cohort, duplicate/zero target, nonzero tail,
-//!   capability consumption before publication, or best-effort member skip.
+//!   authority consumption outside the completed-preflight critical section,
+//!   runnable publication before every capability is consumed, or best-effort
+//!   member skip.
 //! - **Evidence:** `atomic-process-activation-batch` and the focused test below.
 
 use super::*;
@@ -87,7 +90,7 @@ pub(in crate::user::syscall::linux) fn syscall_linux_rustos_proc_activate_batch_
 #[cfg(test)]
 mod tests {
     #[test]
-    fn activation_batch_preflights_before_atomic_publish_and_consumption() {
+    fn activation_batch_keeps_preflight_and_commit_under_registry_lock() {
         let source = include_str!("activation_batch.rs");
         let lock = source
             .find("let mut activations = DEFERRED_ACTIVATIONS.lock()")
@@ -98,9 +101,6 @@ mod tests {
         let publish = source
             .find("multitask::activate_suspended_user_tasks_with_commit")
             .expect("atomic scheduler transaction");
-        let consume = source
-            .find("activations.remove(&target_pid)")
-            .expect("one-shot capability consumption");
         let unlock = source
             .find("drop(activations)")
             .expect("capability registry release");
@@ -109,9 +109,10 @@ mod tests {
             .expect("post-transaction evidence");
         assert!(lock < authority);
         assert!(authority < publish);
-        assert!(publish < consume);
-        assert!(consume < unlock);
+        assert!(publish < unlock);
         assert!(unlock < evidence);
+        assert!(source.contains("activations.remove(&target_pid)"));
+        assert!(source.contains("preflighted authority disappeared while locked"));
         assert!(source.contains("targets[..index].contains(&target_pid)"));
         assert!(source.contains("args.target_pids[target_count..]"));
     }

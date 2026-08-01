@@ -84,6 +84,24 @@ def main() -> int:
         if not matched_scope:
             errors.append(f"SMP source rule scope matched no files: {scope}")
 
+    for entry in manifest.get("required_sequences", []):
+        relative = entry["path"]
+        path = by_relative.get(relative)
+        checks += 1
+        if path is None:
+            errors.append(f"registered SMP sequence source is absent: {relative}")
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        cursor = 0
+        for token in entry["tokens"]:
+            position = text.find(token, cursor)
+            if position < 0:
+                errors.append(
+                    f"{relative}: required SMP sequence is missing/out of order: {token!r}"
+                )
+                break
+            cursor = position + len(token)
+
     unsafe_impls = 0
     for relative, path in by_relative.items():
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()

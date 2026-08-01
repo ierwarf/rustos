@@ -86,15 +86,95 @@ if grep -Eq 'call_syscalld|SYSCALL_OFFLOAD_OP_LINUX_FUTEX_POLICY' <<<"$futex_imp
     exit 1
 fi
 futex_context_body="$(
-    sed -n '/^fn current_futex_waiter_context(/,/^fn current_process_is_procd_policy_owner(/p' \
+    sed -n '/^fn current_futex_binding(/,/^fn register_futex_waiter_in(/p' \
         kernel/compat/src/user/syscall/linux/service_ops/futex_thread.rs
 )"
 if ! grep -Fq 'multitask::current_user_wait_binding()' <<<"$futex_context_body"; then
     echo 'futex key admission must use the scheduler-local current task/MM binding' >&2
     exit 1
 fi
+if ! grep -Fq 'usermem::current_user_address_space()' <<<"$futex_context_body" \
+    || ! grep -Fq 'shared_futex_backing_key(uaddr)' <<<"$futex_context_body"; then
+    echo 'shared futex key admission must pin the exact process/VMA backing generation' >&2
+    exit 1
+fi
 if grep -Eq 'with_current_user_process_state(_mut)?' <<<"$futex_context_body"; then
-    echo 'futex key admission must not contend on the process-state lock' >&2
+    echo 'futex admission must use its retained generation, not resnapshot current process state' >&2
+    exit 1
+fi
+if ! grep -Fq 'Err(paging::AddressSpaceError::NotMapped) => Ok(private)' <<<"$futex_context_body" \
+    || ! grep -Fq 'Some(shared) => [Some(shared), Some(private)]' <<<"$futex_context_body"; then
+    echo 'futex keys must fall back for anonymous words and preserve shared cleanup candidates' >&2
+    exit 1
+fi
+
+stack_fault_body="$(
+    sed -n '/^pub fn retire_current_user_task_due_to_fault(/,/^pub fn halt_current_retired_task()/p' \
+        kernel/ps/src/multitask/current.rs
+)"
+stack_plan_line="$(grep -n -m1 'prepare_current_user_stack_growth_on_fault' <<<"$stack_fault_body" | cut -d: -f1)"
+stack_apply_line="$(grep -n -m1 'try_with_process_state_mut' <<<"$stack_fault_body" | cut -d: -f1)"
+stack_commit_line="$(grep -n -m1 'commit_current_user_stack_growth' <<<"$stack_fault_body" | cut -d: -f1)"
+if [[ -z "$stack_plan_line" || -z "$stack_apply_line" || -z "$stack_commit_line" \
+    || "$stack_plan_line" -ge "$stack_apply_line" || "$stack_apply_line" -ge "$stack_commit_line" ]]; then
+    echo 'user stack growth must preserve scheduler-plan then nonblocking-process-apply then scheduler-commit order' >&2
+    exit 1
+fi
+stack_scheduler_body="$(
+    sed -n '/pub(super) fn prepare_current_user_stack_growth_on_fault(/,/pub(super) fn retire_current_user_task_due_to_fault(/p' \
+        kernel/ps/src/multitask/scheduler.rs
+)"
+if grep -Eq 'map_zeroed_user_pages_at|with_process_state|ProcessStateLock' <<<"$stack_scheduler_body"; then
+    echo 'scheduler-owned stack growth phases must not acquire or mutate process state' >&2
+    exit 1
+fi
+if ! grep -Fq 'self.deferred_retire_reasons[plan.slot].is_some()' <<<"$stack_scheduler_body" \
+    || ! grep -Fq 'context.user_stack != Some(plan.previous_stack)' <<<"$stack_scheduler_body"; then
+    echo 'stack growth commit must revalidate retirement and exact prior stack generation' >&2
+    exit 1
+fi
+
+exec_scheduler_body="$(
+    sed -n '/pub(super) fn exec_current_user_process(/,/pub(super) fn linux_thread_snapshot_by_ids(/p' \
+        kernel/ps/src/multitask/scheduler.rs
+)"
+if ! grep -Fq 'exec_slot_admission_valid' <<<"$exec_scheduler_body"; then
+    echo 'exec must reject retirement before installing a new address-space root' >&2
+    exit 1
+fi
+if grep -Eq 'retired\[[^]]+\][[:space:]]*=[[:space:]]*false|retirement_cleanup\[[^]]+\][[:space:]]*=[[:space:]]*None|deferred_retire_reasons\[[^]]+\][[:space:]]*=[[:space:]]*None' <<<"$exec_scheduler_body"; then
+    echo 'exec must never erase a previously published retirement marker' >&2
+    exit 1
+fi
+exec_transfer_body="$(
+    sed -n '/^pub fn replace_for_exec(/,/^fn exec_may_replace(/p' \
+        kernel/ps/src/multitask/process_table.rs
+)"
+if ! grep -Fq 'exec_commit_may_transfer(object, reservation)' <<<"$exec_transfer_body" \
+    || grep -Fq 'object.exiting' <<<"$exec_transfer_body"; then
+    echo 'an installed exec root must transfer ownership through its reservation despite a late exit marker' >&2
+    exit 1
+fi
+
+gpu_present_body="$(
+    sed -n '/pub(crate) fn present(/,/^    fn capability_for_slot(/p' \
+        services/uiserver/src/gpu_runtime.rs
+)"
+if ! grep -Fq 'let compiler_checkpoint = self.compiler.checkpoint();' <<<"$gpu_present_body" \
+    || ! grep -Fq 'self.compiler.restore_rejected_submit(compiler_checkpoint);' <<<"$gpu_present_body" \
+    || ! grep -Fq 'self.force_full_snapshot = true;' <<<"$gpu_present_body"; then
+    echo 'GPU submit preparation must retain exact rollback and full-replay state' >&2
+    exit 1
+fi
+
+acceptance_body="$(
+    sed -n '/^fn exact_contract_enables_profile(/,/^#\[cfg(test)\]/p' \
+        services/uiserver/src/acceptance_profile.rs
+)"
+if ! grep -Fq 'contract && ui_profile == Some(true) && network_exercise.is_some()' <<<"$acceptance_body" \
+    || ! grep -Fq 'WATCH_LIMIT' <<<"$acceptance_body" \
+    || ! grep -Fq 'require_background_thread_class();' <<<"$acceptance_body"; then
+    echo 'late acceptance profiling must use an exact bounded demoted watcher' >&2
     exit 1
 fi
 
@@ -269,6 +349,7 @@ per-cpu-clockevent-lifecycle/PerCpuClockeventLifecycle|kernel-ps|multitask::irq:
 scheduler-wakeup/SchedulerWakeup|kernel-ps|multitask::scheduler::tests::scheduler_block_arm_is_exact_race_safe_and_terminally_revoked
 scheduler-wakeup/SchedulerWakeup|kernel-ps|multitask::scheduler::tests::raced_wake_never_validates_a_consumed_current_frame
 scheduler-wakeup/SchedulerWakeup|kernel-ps|multitask::scheduler::tests::live_noncurrent_task_must_retain_one_scheduler_state_owner
+scheduler-wakeup/SchedulerWakeup|kernel-ps|multitask::cpu_local::tests::current_task_ownership_ignores_offline_slots_and_is_cpu_distinct
 scheduler-wakeup/SchedulerWakeup|kernel-hal|hooks::tests::scheduler_callback_runs_after_hook_registry_read_guard_is_released
 scheduler-wakeup/SchedulerWakeup|kernel-compat|user::syscall::linux::broker_ops::input_broker_ops::tests::ingestion_watchdog_is_bounded_below_ring_exhaustion_time
 scheduler-wakeup/SchedulerWakeup|kernel-compat|user::syscall::linux::service_ops::futex_thread::tests::task_identity_cleanup_removes_a_requeued_waiter
@@ -286,6 +367,7 @@ scheduler-thread-demotion/SchedulerThreadDemotion|vfsd|tests::ui_bootstrap_demot
 scheduler-thread-demotion/SchedulerThreadDemotion|loaderd|tests::ui_bootstrap_demotion_is_custodied_until_terminal_reply
 synchronous-ipc-handoff/SynchronousIpcHandoff|kernel-ps|multitask::scheduler::synchronous_handoff_tests::synchronous_ipc_handoff_is_fifo_deduplicated_and_fairness_bounded
 ipc-priority-inheritance/IpcPriorityInheritance|kernel-ps|multitask::scheduler::tests::synchronous_ipc_donation_promotes_and_revokes_a_transitive_user_chain
+ipc-priority-queue/IpcPriorityQueue|kernel-ipc-runtime|ipc::tests::receiver_waiter_tests::endpoint_system_calls_bypass_backlog_without_starving_ordinary_lane
 pci-bar-discovery/PciBarDiscovery|kernel-hal|arch::pci::tests::mem64_bar_size_uses_the_lowest_implemented_mask_bit
 dvm-volume-io/DvmVolumeIo|vfsd|tests::dvm_block_range_rejects_empty_overflow_and_end_overrun
 dvm-volume-io/DvmVolumeIo|vfsd|tests::storage_geometry_rejects_provider_overflow_unknown_flags_and_foreign_binding
@@ -353,8 +435,10 @@ kernel-resource-accounting/KernelResourceAccounting|kernel-ps|multitask::process
 input-ingestion-worker/InputIngestionWorker|inputd|tests::ingestion_handoff_prevents_hot_reader_mutex_barging
 input-ingestion-worker/InputIngestionWorker|inputd|tests::full_dvm_ingest_batch_retries_without_requiring_another_irq
 input-ingestion-worker/InputIngestionWorker|inputd|tests::readiness_generation_closes_empty_queue_lost_wake_window
-input-ingestion-worker/InputIngestionWorker|inputd|tests::session_authority_sync_never_holds_the_policy_queue_lock
-input-ingestion-worker/InputIngestionWorker|inputd|tests::failed_session_authority_sync_resets_without_killing_ring_progress
+input-ingestion-worker/InputIngestionWorker|inputd|dvm_session_sync::tests::session_authority_sync_never_holds_the_policy_queue_lock
+input-ingestion-worker/InputIngestionWorker|inputd|dvm_session_sync::tests::failed_session_authority_sync_resets_without_killing_ring_progress
+input-ingestion-worker/InputIngestionWorker|inputd|dvm_session_sync::tests::failed_session_grant_is_retryable_without_losing_following_input
+input-ingestion-worker/InputIngestionWorker|inputd|dvm_session_sync::tests::session_authority_retry_deadline_is_bounded
 input-ingestion-worker/InputIngestionWorker|kernel-compat|user::syscall::linux::ipc_ops::tests::inputd_owner_exit_withdraws_the_separate_ring_policy_lease
 input-ingestion-worker/InputIngestionWorker|kernel-io-manager|input::dvm_ring::tests::policy_consumer_withdrawal_preserves_transport_but_stops_production
 userspace-wait-set/UserspaceWaitSet|kernel-compat|user::syscall::linux::broker_ops::waitset_broker_ops::tests::readiness_generation_requires_a_strict_monotonic_advance
@@ -365,6 +449,7 @@ userspace-wait-set/UserspaceWaitSet|kernel-compat|user::syscall::linux::broker_o
 userspace-wait-set/UserspaceWaitSet|kernel-compat|user::syscall::linux::ipc_ops::tests::service_endpoint_epoch_changes_on_every_publication_boundary
 userspace-wait-set/UserspaceWaitSet|kernel-compat|user::syscall::linux::service_ops::poll_epoll::tests::provider_observations_are_deduplicated_and_keep_the_newest_generation
 userspace-wait-set/UserspaceWaitSet|kernel-compat|user::syscall::linux::service_ops::poll_epoll::tests::provider_query_timeout_never_exceeds_the_wait_deadline_or_service_cap
+userspace-wait-set/UserspaceWaitSet|kernel-compat|user::syscall::linux::service_ops::poll_epoll::control::tests::persistent_epoll_mutation_uses_the_interactive_deadline
 userspace-wait-set/UserspaceWaitSet|kernel-compat|user::syscall::linux::service_ops::poll_epoll::tests::provider_timeout_never_hides_readiness_found_earlier_in_the_scan
 userspace-wait-set/UserspaceWaitSet|kernel-compat|user::syscall::linux::service_ops::poll_epoll::tests::provider_revoke_is_reported_per_fd_as_error_and_hup
 userspace-wait-set/UserspaceWaitSet|kernel-compat|user::syscall::linux::service_ops::poll_epoll::tests::transient_vfs_reply_break_is_retried_inside_epoll_wait
@@ -388,7 +473,8 @@ userspace-wait-set/UserspaceWaitSet|kernel-compat|user::syscall::linux::service_
 service-mutation-recovery/ServiceMutationRecovery|kernel-compat|user::syscall::linux::service_ops::vfs_socket::tests::remote_vfs_refs_are_local_and_provider_close_is_final_only
 service-mutation-recovery/ServiceMutationRecovery|kernel-compat|user::syscall::linux::service_ops::vfs_socket::tests::netd_reference_retries_share_one_total_deadline
 service-mutation-recovery/ServiceMutationRecovery|kernel-ps|user::epoll::tests::descriptor_references_are_explicit_and_transient_clones_do_not_count
-service-mutation-recovery/ServiceMutationRecovery|kernel-compat|user::syscall::linux::service_ops::ipc_helpers::tests::foreground_vfs_maintenance_is_one_bounded_replay_turn
+service-mutation-recovery/ServiceMutationRecovery|kernel-compat|user::syscall::linux::service_ops::ipc_helpers::tests::housekeeping_vfs_maintenance_is_one_bounded_replay_turn
+service-mutation-recovery/ServiceMutationRecovery|kernel-compat|user::syscall::linux::service_ops::poll_epoll::control::tests::persistent_epoll_mutation_uses_the_interactive_deadline
 service-mutation-recovery/ServiceMutationRecovery|netd|ref_replay_tests::close_retry_replays_exact_result_and_rejects_operation_alias
 service-mutation-recovery/ServiceMutationRecovery|rootd|service_checkpoint::tests::exact_retry_is_idempotent_and_stale_retry_cannot_rollback|host-test
 service-mutation-recovery/ServiceMutationRecovery|rootd|service_checkpoint::tests::parent_tombstone_atomically_revokes_children|host-test
@@ -434,6 +520,7 @@ dvm-gpu-compositor/DvmGpuCompositor|uiserver|gpu_runtime::tests::completion_time
 dvm-gpu-admission/DvmGpuAdmission|uiserver|gpu_runtime::tests::completion_timeout_separates_activation_from_steady_state
 msi-vector-lifecycle/MsiVectorLifecycle|kernel-hal|arch::msi::tests::unallocated_vector_has_no_registration_authority
 msi-vector-lifecycle/MsiVectorLifecycle|kernel-hal|arch::msi::tests::failed_unpublished_vector_lease_revokes_exact_handler_and_slot
+msi-vector-lifecycle/MsiVectorLifecycle|kernel-hal|arch::msi::tests::committed_vector_remains_revocable_until_permanent_publication
 acpi-table-admission/AcpiTableAdmission|kernel-hal|arch::acpi::tests::root_sdt_requires_exact_signature_width_and_entry_alignment
 acpi-table-admission/AcpiTableAdmission|kernel-hal|arch::acpi::tests::mcfg_admission_is_atomic_bounded_aligned_and_nonoverlapping
 acpi-table-admission/AcpiTableAdmission|kernel-hal|arch::acpi::tests::ecam_region_range_and_config_address_are_checked_end_to_end
@@ -464,14 +551,16 @@ service-bootstrap-lifecycle/ServiceBootstrapLifecycle|initd|tests::service_readi
 post-init-bootstrap-barrier/PostInitBootstrapBarrier|initd|bootstrap_barrier::tests::independent_bootstrap_activation_overlaps_only_before_consumer_barriers
 post-init-bootstrap-barrier/PostInitBootstrapBarrier|initd|bootstrap_barrier::tests::dependency_packages_exclude_spawned_but_unadmitted_endpoints
 post-init-bootstrap-barrier/PostInitBootstrapBarrier|initd|bootstrap_barrier::tests::bootstrap_barrier_requires_every_exact_endpoint_admission
+post-init-bootstrap-barrier/PostInitBootstrapBarrier|initd|boot_order::tests::runtimed_bootstrap_does_not_wait_for_storage_dvm_publication
 post-init-bootstrap-barrier/PostInitBootstrapBarrier|initd|tests::endpoint_barrier_wait_is_exact_pid_bound_and_bounded
 bootstrap-activation-handoff/BootstrapActivationHandoff|kernel-ps|multitask::scheduler::activation_batch_tests::spawn_handoff_is_fifo_deduplicated_and_precedes_ipc_handoff
 bootstrap-activation-handoff/BootstrapActivationHandoff|kernel-ps|multitask::scheduler::tests::overdue_system_continuation_precedes_a_fresh_latency_handoff
 atomic-process-activation-batch/AtomicProcessActivationBatch|initd|activation::tests::activation_batch_is_exact_bounded_and_zero_tailed
 atomic-process-activation-batch/AtomicProcessActivationBatch|rustos-user-abi|syscall::activation_batch::tests::requester_identity_is_bound_to_the_kernel_sender
-atomic-process-activation-batch/AtomicProcessActivationBatch|kernel-compat|user::syscall::linux::proc_broker_ops::activation_batch::tests::activation_batch_preflights_before_atomic_publish_and_consumption
+atomic-process-activation-batch/AtomicProcessActivationBatch|kernel-compat|user::syscall::linux::proc_broker_ops::activation_batch::tests::activation_batch_keeps_preflight_and_commit_under_registry_lock
 atomic-process-activation-batch/AtomicProcessActivationBatch|kernel-compat|user::syscall::linux::proc_broker_ops::tests::deferred_activation_authority_is_exact_one_shot_and_nontransferable
 atomic-process-activation-batch/AtomicProcessActivationBatch|kernel-ps|multitask::scheduler::activation_batch_tests::spawn_handoff_is_fifo_deduplicated_and_precedes_ipc_handoff
+atomic-process-activation-batch/AtomicProcessActivationBatch|kernel-ps|multitask::scheduler::activation_batch_tests::authority_commit_is_checked_while_the_complete_cohort_is_still_suspended
 cpu-affinity-observation/CpuAffinityObservation|kernel-hal|arch::smp::tests::online_mask_contains_exact_dense_online_set
 cpu-affinity-observation/CpuAffinityObservation|kernel-compat|user::syscall::linux::syscalld_ops::tests::affinity_topology_stamp_is_versioned_exact_and_reserved_zero
 cpu-affinity-observation/CpuAffinityObservation|syscalld|affinity_policy::tests::sched_getaffinity_returns_exact_kernel_stamped_task_mask
@@ -560,6 +649,12 @@ product-boot/ProductBoot|uiserver|gpu_runtime::tests::frame_deadline_skips_misse
 ui-frame-budget/UiFrameBudget|wayclick|damage_tests::first_frame_marker_is_the_user_visible_boot_terminal
 input-ingestion-worker/InputIngestionWorker|kernel-io-manager|input::dvm_ring::tests::policy_consumer_readiness_requires_transport_and_is_idempotent
 product-boot/ProductBoot|kernel-compat|user::syscall::linux::debug_ops::product_milestone_tests::product_milestones_are_a_closed_fixed_name_vocabulary
+user-stack-growth/UserStackGrowth|kernel-ps|multitask::process_table::tests::exception_process_state_try_lock_never_waits_on_contention
+exec-address-space-transaction/ExecAddressSpaceTransaction|kernel-ps|multitask::process_table::tests::process_address_space_and_exec_exit_are_serialized
+exec-address-space-transaction/ExecAddressSpaceTransaction|kernel-ps|multitask::process_table::tests::exec_seal_rejects_thread_attachment_until_cancel
+robust-futex-owner-death/RobustFutexOwnerDeath|kernel-compat|user::syscall::linux::service_ops::futex_thread::tests::kernel_generated_wake_uses_shared_then_exact_private_fallback
+gpu-submit-transaction/GpuSubmitTransaction|uiserver|gpu_scene::tests::rejected_transport_submit_restores_exact_compiler_timeline
+acceptance-profile-publication/AcceptanceProfilePublication|uiserver|acceptance_profile::tests::late_acceptance_profile_requires_the_exact_complete_contract
 EOF
 
 jq -s --arg schema rustos-formal-source-conformance-v1 \

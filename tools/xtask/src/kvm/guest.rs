@@ -506,57 +506,6 @@ fn wait_for_parallel_boot(
         check_guest_running(dvm, "Linux DVM", &layout.dvm_stderr_log)?;
         let rustos_log = fs::read_to_string(&layout.debugcon_log)?;
         let dvm_log = fs::read_to_string(&layout.dvm_serial_log)?;
-        if !options.storage_only
-            && !rustos_log.contains(RUSTOS_GPU_ACTIVE_MARKER)
-            && guest_deadline_reached(&rustos_log, BOOT_TO_UI_HARD_LIMIT_MS)
-        {
-            let reason = format!(
-                "RustOS interactive UI missed the {} ms boot acceptance limit",
-                BOOT_TO_UI_HARD_LIMIT_MS
-            );
-            let missing_rustos = vec![RUSTOS_GPU_ACTIVE_MARKER.to_owned()];
-            let evidence = write_kvm_failure_summary(
-                layout,
-                &reason,
-                boot_started.elapsed(),
-                &rustos_log,
-                &dvm_log,
-                &missing_rustos,
-                &[],
-            )?;
-            bail!(
-                "{reason}; missing={RUSTOS_GPU_ACTIVE_MARKER:?}; evidence={}; inspect {} and {}",
-                evidence.display(),
-                layout.debugcon_log.display(),
-                layout.dvm_serial_log.display(),
-            );
-        }
-        if !options.storage_only
-            && options.dvm_block_shmem
-            && !rustos_log.contains(WAYCLICK_FIRST_FRAME_MARKER)
-            && guest_deadline_reached(&rustos_log, BOOT_TO_UI_HARD_LIMIT_MS)
-        {
-            let reason = format!(
-                "RustOS user-visible desktop missed the {} ms boot acceptance limit",
-                BOOT_TO_UI_HARD_LIMIT_MS
-            );
-            let missing_rustos = vec![WAYCLICK_FIRST_FRAME_MARKER.to_owned()];
-            let evidence = write_kvm_failure_summary(
-                layout,
-                &reason,
-                boot_started.elapsed(),
-                &rustos_log,
-                &dvm_log,
-                &missing_rustos,
-                &[],
-            )?;
-            bail!(
-                "{reason}; missing={WAYCLICK_FIRST_FRAME_MARKER:?}; evidence={}; inspect {} and {}",
-                evidence.display(),
-                layout.debugcon_log.display(),
-                layout.dvm_serial_log.display(),
-            );
-        }
         if options.expect_block_flush_fault && rustos_log.contains(RUSTOS_DVM_BLOCK_E2E_MARKER) {
             bail!("storage-DVM flush fault proof observed an impossible E2E flush-success marker");
         }

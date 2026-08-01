@@ -17,6 +17,7 @@ kernel/hal/src/arch/gdt.rs	4	0
 kernel/hal/src/interrupt_stubs.rs	0	0
 kernel/lowlevel/src/interrupts.rs	3	4
 kernel/ipc-runtime/src/ipc/mod.rs	1	12
+kernel/ipc-runtime/src/ipc/endpoint_priority.rs	0	0
 kernel/mm/src/memory/address_space.rs	24	0
 kernel/mm/src/memory/address_space/atomic_user.rs	0	0
 kernel/mm/src/memory/address_space/rollback.rs	0	0
@@ -57,6 +58,7 @@ kernel/compat/src/user/syscall/linux/service_ops/local_memfd_io.rs	0	0
 kernel/compat/src/user/syscall/linux/service_ops/vfs_socket.rs	0	0
 kernel/compat/src/user/syscall/linux/mm_broker_ops.rs	0	0
 kernel/compat/src/user/syscall/linux/service_ops/poll_epoll.rs	2	0
+kernel/compat/src/user/syscall/linux/service_ops/poll_epoll/control.rs	0	0
 kernel/compat/src/user/syscall/linux/waitset_broker_ops.rs	0	0
 kernel/compat/src/user/syscall/linux/service_ops/futex_thread.rs	0	0
 kernel/compat/src/user/syscall/linux/block_broker_ops.rs	0	0

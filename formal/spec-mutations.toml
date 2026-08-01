@@ -1,0 +1,368 @@
+# Mutation-adequacy corpus for the high-risk SMP and interactive-boot models.
+#
+# Each mutant is a single, exact alteration in a temporary TLA+ copy.  A
+# passing baseline followed by a TLC invariant counterexample is required.
+# Parser/type failures, timeout, and a surviving mutant are all gate failures.
+# `property-perturbation` intentionally changes an assertion to a nearby wrong
+# one; the other kinds model omitted guards, ordering, effect, or revoke steps.
+# The required_models set is deliberately risk-scoped, not a claim that finite
+# mutation testing can enumerate all faults in every TLA+ model.
+schema = "rustos-tla-mutation-corpus-v1"
+
+required_models = [
+    "acceptance-profile-publication/AcceptanceProfilePublication",
+    "atomic-process-activation-batch/AtomicProcessActivationBatch",
+    "cpu-online-lifecycle/CpuOnlineLifecycle",
+    "cross-cpu-task-retirement/CrossCpuTaskRetirement",
+    "exec-address-space-transaction/ExecAddressSpaceTransaction",
+    "gpu-submit-transaction/GpuSubmitTransaction",
+    "input-ingestion-worker/InputIngestionWorker",
+    "ipc-priority-queue/IpcPriorityQueue",
+    "msi-vector-lifecycle/MsiVectorLifecycle",
+    "per-cpu-clockevent-lifecycle/PerCpuClockeventLifecycle",
+    "product-boot/ProductBoot",
+    "robust-futex-owner-death/RobustFutexOwnerDeath",
+    "scheduler-cpu-ownership/SchedulerCpuOwnership",
+    "scheduler-wakeup/SchedulerWakeup",
+    "smp-reschedule-ipi/SmpRescheduleIpi",
+    "tlb-shootdown-lifecycle/TlbShootdownLifecycle",
+    "user-stack-growth/UserStackGrowth",
+    "userspace-wait-set/UserspaceWaitSet",
+]
+
+[[mutation]]
+id = "acceptance-initial-miss-negative-cached"
+kind = "transition-effect"
+severity = "high"
+model = "acceptance-profile-publication/AcceptanceProfilePublication"
+flow = "commercial-product-boot"
+find = "    /\\ phase' = Watching /\\ watching' = TRUE"
+replace = "    /\\ phase' = Watching /\\ watching' = FALSE"
+occurrence = 1
+invariant = "InitialMissRetainsBoundedObserver"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "activation-authority-revoke-removed"
+kind = "transition-revocation"
+severity = "critical"
+model = "atomic-process-activation-batch/AtomicProcessActivationBatch"
+flow = "atomic-process-activation-batch"
+find = "IF task \\in BatchSet THEN Revoked ELSE authority[task]"
+replace = "IF task \\in BatchSet THEN Live ELSE authority[task]"
+occurrence = 1
+invariant = "ExitedRequesterCannotLeaveActivatableOrphans"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "activation-consume-publish-order-collapsed"
+kind = "transition-order"
+severity = "critical"
+model = "atomic-process-activation-batch/AtomicProcessActivationBatch"
+flow = "atomic-process-activation-batch"
+find = "phase' = AuthorityConsumed"
+replace = "phase' = Committed"
+occurrence = 1
+invariant = "NoPartialPublication"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "activation-suspension-property-perturbed"
+kind = "property-perturbation"
+severity = "critical"
+model = "atomic-process-activation-batch/AtomicProcessActivationBatch"
+flow = "atomic-process-activation-batch"
+find = '''AuthorityConsumptionRetainsSuspension ==
+    phase = AuthorityConsumed =>
+'''
+replace = '''AuthorityConsumptionRetainsSuspension ==
+    phase = Committed =>
+'''
+occurrence = 1
+invariant = "AuthorityConsumptionRetainsSuspension"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "cpu-online-scheduler-stage-skipped"
+kind = "transition-order"
+severity = "critical"
+model = "cpu-online-lifecycle/CpuOnlineLifecycle"
+flow = "cpu-online-lifecycle"
+find = "state' = [state EXCEPT ![cpu] = OnlineParked]"
+replace = "state' = [state EXCEPT ![cpu] = Online]"
+occurrence = 1
+invariant = "OnlineRequiresCompleteCpu"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "cross-cpu-replace-before-sibling-detach"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "cross-cpu-task-retirement/CrossCpuTaskRetirement"
+flow = "cross-cpu-task-retirement"
+find = '''Replace ==
+    /\ phase = Quiescing
+    /\ targetQuiesced
+    /\ owner["target"] = NoneCpu
+    /\ ~siblingAttached
+'''
+replace = '''Replace ==
+    /\ phase = Quiescing
+    /\ targetQuiesced
+    /\ owner["target"] = NoneCpu
+    /\ TRUE
+'''
+occurrence = 1
+invariant = "ReplacementRequiresAllOldExecutionStopped"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "exec-installed-root-owner-transfer-dropped"
+kind = "transition-effect"
+severity = "critical"
+model = "exec-address-space-transaction/ExecAddressSpaceTransaction"
+flow = "process-address-space-lifecycle"
+find = "    /\\ phase' = Owned /\\ rootOwner' = ProcessOwner"
+replace = "    /\\ phase' = Owned /\\ rootOwner' = NoOwner"
+occurrence = 1
+invariant = "ActiveRootAlwaysOwned"
+min_counterexample_states = 6
+
+[[mutation]]
+id = "futex-kernel-wake-forced-private"
+kind = "transition-effect"
+severity = "critical"
+model = "robust-futex-owner-death/RobustFutexOwnerDeath"
+flow = "thread-exit-futex-cleanup"
+find = "    /\\ wakeKey' = waiterKey"
+replace = "    /\\ wakeKey' = PrivateKey"
+occurrence = 1
+invariant = "KernelGeneratedWakeUsesEquivalentKey"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "gpu-rejection-rollback-removed"
+kind = "transition-effect"
+severity = "critical"
+model = "gpu-submit-transaction/GpuSubmitTransaction"
+flow = "gpu-frame-lifecycle"
+find = "    /\\ nextSubmit' = checkpoint /\\ timelineAdmitted' = FALSE"
+replace = "    /\\ nextSubmit' = nextSubmit /\\ timelineAdmitted' = FALSE"
+occurrence = 1
+invariant = "RejectedSubmitRestoresExactCheckpoint"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "input-session-batch-retention-removed"
+kind = "transition-effect"
+severity = "critical"
+model = "input-ingestion-worker/InputIngestionWorker"
+flow = "input-delivery-lifecycle"
+find = '''BeginAuthoritySync ==
+    /\ workerState = Draining
+    /\ workerState' = Syncing
+    /\ authorityPending' = TRUE
+'''
+replace = '''BeginAuthoritySync ==
+    /\ workerState = Draining
+    /\ workerState' = Syncing
+    /\ authorityPending' = FALSE
+'''
+occurrence = 1
+invariant = "AuthorityBatchIsRetained"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "ipc-priority-ordinary-bypasses-system"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "ipc-priority-queue/IpcPriorityQueue"
+flow = "scheduler-dispatch"
+find = '''DeliverOrdinary ==
+    /\ Len(ordinaryQ) > 0
+    /\ ~SystemEligible
+'''
+replace = '''DeliverOrdinary ==
+    /\ Len(ordinaryQ) > 0
+    /\ TRUE
+'''
+occurrence = 1
+invariant = "SystemBacklogCannotBeBypassed"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "msi-committed-rollback-handler-retained"
+kind = "transition-revocation"
+severity = "critical"
+model = "msi-vector-lifecycle/MsiVectorLifecycle"
+flow = "msi-vector-ingress"
+find = '''    /\ leased' = leased \ Owned
+    /\ committed' = committed \ Owned
+    /\ routed' = routed \ Owned
+    /\ handlerOwner' = [v \in Vectors |-> IF v \in Owned THEN NoDevice ELSE handlerOwner[v]]
+'''
+replace = '''    /\ leased' = leased
+    /\ committed' = committed \ Owned
+    /\ routed' = routed \ Owned
+    /\ handlerOwner' = handlerOwner
+'''
+occurrence = 1
+invariant = "FailedPublicationHasNoAuthority"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "per-cpu-clockevent-deadline-before-lvt"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "per-cpu-clockevent-lifecycle/PerCpuClockeventLifecycle"
+flow = "per-cpu-clockevent-lifecycle"
+find = '''    /\ state[cpu] = LvtReady
+    /\ lvtUnmasked[cpu]
+'''
+replace = '''    /\ state[cpu] = Offline
+'''
+occurrence = 1
+invariant = "ArmedDeadlineRequiresUnmaskedLvt"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "per-cpu-clockevent-online-before-programming"
+kind = "transition-order"
+severity = "critical"
+model = "per-cpu-clockevent-lifecycle/PerCpuClockeventLifecycle"
+flow = "per-cpu-clockevent-lifecycle"
+find = '''ConfigureLvt(cpu) ==
+    /\ cpu \in ApCpus
+    /\ state[cpu] = Offline
+    /\ state' = [state EXCEPT ![cpu] = LvtReady]
+    /\ lvtUnmasked' = [lvtUnmasked EXCEPT ![cpu] = TRUE]
+    /\ UNCHANGED <<now, deadline, schedulerTurns>>
+'''
+replace = '''ConfigureLvt(cpu) ==
+    /\ cpu \in ApCpus
+    /\ state[cpu] = Offline
+    /\ state' = [state EXCEPT ![cpu] = Online]
+    /\ UNCHANGED <<now, deadline, lvtUnmasked, schedulerTurns>>
+'''
+occurrence = 1
+invariant = "ApOnlineRequiresProgrammedDeadline"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "product-boot-display-authority-guard-removed"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "product-boot/ProductBoot"
+flow = "commercial-product-boot"
+find = '''PresentFirstFrame ==
+    /\ mode = Interactive
+    /\ phase = WaylandReady
+    /\ displayProven
+'''
+replace = '''PresentFirstFrame ==
+    /\ mode = Interactive
+    /\ phase = WaylandReady
+    /\ TRUE
+'''
+occurrence = 1
+invariant = "PresentedHasCompleteAuthorityChain"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "scheduler-outgoing-stack-owner-retained"
+kind = "transition-effect"
+severity = "critical"
+model = "scheduler-cpu-ownership/SchedulerCpuOwnership"
+flow = "scheduler-cpu-ownership"
+find = '''CommitStackSwitch(cpu) ==
+    /\ ~panicked
+    /\ transitionFrom[cpu] # NoTask
+    /\ LET previous == transitionFrom[cpu] IN
+       /\ transitionFrom' = [transitionFrom EXCEPT ![cpu] = NoTask]
+       /\ taskCpu' = [taskCpu EXCEPT ![previous] = NoCpu]
+'''
+replace = '''CommitStackSwitch(cpu) ==
+    /\ ~panicked
+    /\ transitionFrom[cpu] # NoTask
+    /\ LET previous == transitionFrom[cpu] IN
+       /\ transitionFrom' = [transitionFrom EXCEPT ![cpu] = NoTask]
+       /\ taskCpu' = [taskCpu EXCEPT ![previous] = cpu]
+'''
+occurrence = 1
+invariant = "ReadyTasksAreNotRunning"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "scheduler-transition-wake-dropped"
+kind = "transition-effect"
+severity = "critical"
+model = "scheduler-wakeup/SchedulerWakeup"
+flow = "scheduler-lifecycle"
+find = '''WakeTask(task) ==
+    /\ task \in Tasks
+    /\ taskState[task] \in {Armed, Blocked}
+    /\ taskState' = [taskState EXCEPT ![task] = Ready]
+'''
+replace = '''WakeTask(task) ==
+    /\ task \in Tasks
+    /\ taskState[task] \in {Armed, Blocked}
+    /\ taskState' = [taskState EXCEPT ![task] =
+        IF transition = task THEN Blocked ELSE Ready]
+'''
+occurrence = 1
+invariant = "TransitionWakeSurvives"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "smp-ipi-request-bit-not-published"
+kind = "transition-effect"
+severity = "critical"
+model = "smp-reschedule-ipi/SmpRescheduleIpi"
+flow = "smp-reschedule-ipi-lifecycle"
+find = "request' = [request EXCEPT ![cpu] = TRUE]"
+replace = "request' = [request EXCEPT ![cpu] = FALSE]"
+occurrence = 1
+invariant = "IpiRequiresDurableRequest"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "tlb-reclaim-before-all-acks"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "tlb-shootdown-lifecycle/TlbShootdownLifecycle"
+flow = "tlb-shootdown-lifecycle"
+find = '''Reclaim ==
+    /\ phase = Published
+    /\ \A cpu \in targets: ackGeneration[cpu] = generation
+'''
+replace = '''Reclaim ==
+    /\ phase = Published
+    /\ TRUE
+'''
+occurrence = 1
+invariant = "ReclaimRequiresEveryAcknowledgement"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "user-stack-apply-under-scheduler-lock"
+kind = "transition-effect"
+severity = "critical"
+model = "user-stack-growth/UserStackGrowth"
+flow = "exception-retirement"
+find = "    /\\ processLock' = TRUE /\\ schedulerRaw' = FALSE"
+replace = "    /\\ processLock' = TRUE /\\ schedulerRaw' = TRUE"
+occurrence = 1
+invariant = "LockDomainsNeverOverlap"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "waitset-check-arm-recheck-removed"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "userspace-wait-set/UserspaceWaitSet"
+flow = "waitset"
+find = "ready \\/ generation # observedGeneration"
+replace = "FALSE"
+occurrence = 1
+invariant = "SleepingRequiresStableRecheck"
+min_counterexample_states = 3

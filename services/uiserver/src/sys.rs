@@ -570,11 +570,7 @@ pub(crate) fn boot_trace_enabled() -> bool {
 }
 
 pub(crate) fn ui_profile_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var("RUSTOS_UI_PROFILE") {
-        Ok(value) => matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"),
-        Err(_) => false,
-    })
+    crate::acceptance_profile::enabled()
 }
 
 pub(crate) fn boot_line(message: &str) {
@@ -586,7 +582,7 @@ pub(crate) fn boot_line(message: &str) {
 }
 
 pub(crate) fn profile_line(message: &str) {
-    if !ui_profile_enabled() {
+    if !crate::acceptance_profile::enabled() {
         return;
     }
     // The profile path is enabled only by the KVM acceptance harness and is
@@ -1283,7 +1279,7 @@ fn enumerate_host_device_paths(directory: &str, prefix: &str, preferred_path: &s
     paths
 }
 
-fn running_on_rustos() -> bool {
+pub(crate) fn running_on_rustos() -> bool {
     static IS_RUSTOS: OnceLock<bool> = OnceLock::new();
     *IS_RUSTOS.get_or_init(|| open_device(console_abi::CONSOLE_PATH, O_RDWR).is_ok())
 }

@@ -1,0 +1,140 @@
+# Each entry is a bounded, source-anchored concurrency claim.  Loom and
+# Shuttle are required for every entry; herd7 is required only when the
+# concrete source transition publishes data through a lock-free atomic edge.
+# A non-applicable herd7 verdict must name why an ISA litmus would model the
+# wrong abstraction instead of silently leaving a coverage gap.
+schema = "rustos-concurrency-triangle-v1"
+
+[budget]
+loom_max_branches = 200
+shuttle_iterations = 128
+shuttle_pct_depth = 3
+shuttle_max_seconds = 30
+herd_max_seconds = 10
+
+[[scenario]]
+id = "endpoint-publication"
+severity = "critical"
+flow = "endpoint-lifecycle"
+model = "endpoint-publication/EndpointPublication"
+source = "kernel/compat/src/user/syscall/linux/ipc_ops.rs"
+source_symbol = "cleanup_service_endpoints_for_process"
+source_anchors = ["cleanup_service_endpoints_for_process"]
+invariant = "exit revocation and endpoint publication have one lock-protected terminal owner"
+loom_test = "exit_and_publication_never_leave_authority_live"
+shuttle_test = "endpoint_exit_and_publication_have_one_terminal_owner"
+herd_not_applicable = "the decisive edge is a mutex-protected ownership transition, not an ISA-visible lock-free publication"
+
+[[scenario]]
+id = "futex-wait-linearization"
+severity = "critical"
+flow = "futex-wait-lifecycle"
+model = "futex-waiter-lifecycle/FutexWaiterLifecycle"
+source = "kernel/compat/src/user/syscall/linux/service_ops/futex_thread.rs"
+source_symbol = "futex_wait"
+source_anchors = [
+  "let mut waiters = FUTEX_WAITERS.lock();",
+  ".atomic_load_user_u32(uaddr)",
+  "register_futex_waiter_in(",
+]
+invariant = "FUTEX_WAIT comparison and waiter publication share one bucket transaction that a store plus WAKE cannot pass"
+loom_test = "futex_compare_and_waiter_publication_have_one_linearization_point"
+shuttle_test = "futex_store_wake_cannot_pass_compare_and_queue_publication"
+herd_not_applicable = "the decisive property spans a userspace store, a syscall boundary, and lock-protected waiter ownership; an ISA-only litmus would omit the queue transaction"
+
+[[scenario]]
+id = "ipc-priority-lane"
+severity = "critical"
+flow = "scheduler-dispatch"
+model = "ipc-priority-queue/IpcPriorityQueue"
+source = "kernel/ipc-runtime/src/ipc/endpoint_priority.rs"
+source_symbol = "next_pending"
+source_anchors = [
+  "!self.pending_system_messages.is_empty()",
+  "self.consecutive_system_deliveries",
+]
+invariant = "one endpoint slot guard preserves both lane FIFOs and reserves an ordinary head after two System deliveries"
+loom_test = "ipc_priority_lane_is_kernel_derived_and_starvation_bounded"
+shuttle_test = "ipc_priority_lane_remains_fifo_and_burst_bounded"
+herd_not_applicable = "lane selection and both queue mutations are protected by one tracked endpoint slot lock; an ISA litmus would omit the queue and trusted scheduler-class boundary"
+
+[[scenario]]
+id = "ipc-terminal-owner"
+severity = "critical"
+flow = "ipc-call"
+model = "ipc-reply-deadline/IpcReplyDeadline"
+source = "kernel/ipc-runtime/src/ipc/mod.rs"
+source_symbol = "cancel_endpoint_calls_for_task"
+source_anchors = ["cancel_endpoint_calls_for_task"]
+invariant = "reply, timeout, and revoke leave at most one terminal owner for each call"
+loom_test = "ipc_retirement_accepts_exact_global_capacity"
+shuttle_test = "ipc_reply_timeout_and_revoke_have_one_terminal_owner"
+herd_not_applicable = "the property is a lock-protected terminal-state race; a register-level litmus would omit call identity and cancellation ownership"
+
+[[scenario]]
+id = "reschedule-ipi"
+severity = "critical"
+flow = "smp-reschedule-ipi-lifecycle"
+model = "smp-reschedule-ipi/SmpRescheduleIpi"
+source = "kernel/ps/src/multitask/irq.rs"
+source_symbol = "arm_remote_reschedule"
+source_anchors = [
+  "flag.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)",
+  "deferred_reschedule_flag(logical_index).swap(0, Ordering::AcqRel)",
+]
+invariant = "a coalesced durable request is pending or exactly consumed at the target safe point"
+loom_test = "reschedule_request_is_never_lost_across_concurrent_consume"
+shuttle_test = "reschedule_request_is_never_lost_across_target_consume"
+herd_test = "formal/litmus/x86_64/reschedule_request_publication.litmus"
+herd_mutant = "formal/litmus/x86_64/reschedule_request_publication.mutant.litmus"
+herd_cat = "x86tso-mixed.cat"
+
+[[scenario]]
+id = "tlb-ack-reclaim"
+severity = "critical"
+flow = "tlb-shootdown-lifecycle"
+model = "tlb-shootdown-lifecycle/TlbShootdownLifecycle"
+source = "kernel/hal/src/arch/tlb_shootdown.rs"
+source_symbol = "on_interrupt"
+source_anchors = [
+  "ACK_GENERATION[logical_index].store(generation, Ordering::Release)",
+  "ACK_GENERATION[target].load(Ordering::Acquire) == generation",
+]
+invariant = "an exact acknowledgement publishes a completed flush before reclaim"
+loom_test = "tlb_mailbox_and_ack_publish_the_exact_generation"
+shuttle_test = "tlb_mailbox_flush_ack_and_reclaim_preserve_generation_order"
+herd_test = "formal/litmus/x86_64/tlb_ack_reclaim_publication.litmus"
+herd_mutant = "formal/litmus/x86_64/tlb_ack_reclaim_publication.mutant.litmus"
+herd_cat = "x86tso-mixed.cat"
+
+[[scenario]]
+id = "tlb-mailbox-request"
+severity = "critical"
+flow = "tlb-shootdown-lifecycle"
+model = "tlb-shootdown-lifecycle/TlbShootdownLifecycle"
+source = "kernel/hal/src/arch/tlb_shootdown.rs"
+source_symbol = "finish_shootdown"
+source_anchors = [
+  "REQUEST_ROOT[target].store(GLOBAL_SCOPE, Ordering::Relaxed)",
+  "REQUEST_GENERATION[target].store(generation, Ordering::Release)",
+  "let generation = REQUEST_GENERATION[logical_index].load(Ordering::Acquire)",
+]
+invariant = "a request generation publishes its complete target mailbox before handler validation"
+loom_test = "tlb_mailbox_and_ack_publish_the_exact_generation"
+shuttle_test = "tlb_mailbox_flush_ack_and_reclaim_preserve_generation_order"
+herd_test = "formal/litmus/x86_64/tlb_mailbox_request_publication.litmus"
+herd_mutant = "formal/litmus/x86_64/tlb_mailbox_request_publication.mutant.litmus"
+herd_cat = "x86tso-mixed.cat"
+
+[[scenario]]
+id = "waitset-arm"
+severity = "critical"
+flow = "waitset"
+model = "userspace-wait-set/UserspaceWaitSet"
+source = "kernel/compat/src/user/syscall/linux/service_ops/poll_epoll.rs"
+source_symbol = "syscall_linux_epoll_wait"
+source_anchors = ["syscall_linux_epoll_wait"]
+invariant = "a readiness generation crossing the check-register-recheck window cannot strand an armed waiter"
+loom_test = "readiness_change_cannot_be_lost_across_arm"
+shuttle_test = "waitset_generation_crossing_arm_is_not_lost"
+herd_not_applicable = "the property requires provider registration and generation identity; reducing it to raw loads/stores would create a misleading ISA-only claim"

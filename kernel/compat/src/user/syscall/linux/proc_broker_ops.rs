@@ -793,9 +793,9 @@ pub(super) fn syscall_linux_rustos_proc_activate_broker(args_ptr: u64) -> u64 {
         return linux_errno(LINUX_ESRCH);
     }
     drop(activations);
-    // Runnable publication and one-shot capability consumption are one
-    // ProcBrokerRegistry -> Scheduler critical section. Requester cleanup can
-    // win before it or observe the committed child after it, never between.
+    // One-shot capability consumption precedes runnable publication inside
+    // one ProcBrokerRegistry -> Scheduler critical section. Requester cleanup
+    // can win before it or observe the committed child after it, never between.
     nucleus_core::debug::record_milestone(
         nucleus_core::debug::LogCategory::Compat,
         "proc-activate-committed",

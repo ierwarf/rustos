@@ -1,0 +1,10 @@
+X86_64 TlbAckReclaimPublication
+"P0 publishes completed local flush before exact acknowledgement"
+{
+uint64_t flushed=0; uint64_t acknowledgement=0;
+uint64_t 1:rax; uint64_t 1:rbx;
+}
+P0                         | P1                         ;
+movq $1,(flushed)          | movq (acknowledgement),%rax ;
+movq $7,(acknowledgement)  | movq (flushed),%rbx         ;
+exists (1:rax=7 /\ 1:rbx=0)

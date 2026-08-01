@@ -252,7 +252,6 @@ impl Scheduler {
             process_handle: None,
             process_id: None,
             user_stack: None,
-            linux_thread_state: None,
             windows_thread_state: None,
         });
         self.starts[slot] = Some(TaskStart { entry, id });

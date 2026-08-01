@@ -1,0 +1,10 @@
+X86_64 TlbAckReclaimPublicationMutant
+"Mutant: acknowledge before publishing completed local flush"
+{
+uint64_t flushed=0; uint64_t acknowledgement=0;
+uint64_t 1:rax; uint64_t 1:rbx;
+}
+P0                         | P1                         ;
+movq $7,(acknowledgement)  | movq (acknowledgement),%rax ;
+movq $1,(flushed)          | movq (flushed),%rbx         ;
+exists (1:rax=7 /\ 1:rbx=0)

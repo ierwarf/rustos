@@ -152,7 +152,6 @@ impl<T: ?Sized> ProcessStateLock<T> {
         }
     }
 
-    #[cfg(test)]
     #[track_caller]
     pub(super) fn try_lock(&self) -> Option<ProcessStateGuard<'_, T>> {
         let acquire_site = Location::caller();

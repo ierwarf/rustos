@@ -1173,7 +1173,6 @@ pub fn call_netd_socket_token_op(op: u16, socket_token: u64) -> Result<u64, i64>
 }
 
 fn call_netd_socket_token_op_bounded(op: u16, socket_token: u64) -> Result<u64, i64> {
-    let _ = drain_pending_netd_refs();
     let request = new_netd_socket_request(op, socket_token);
     let mut last = LINUX_ETIMEDOUT;
     for attempt in 0..NETD_REF_OPERATION_ATTEMPTS {
@@ -1240,18 +1239,19 @@ fn drain_pending_netd_refs() -> usize {
         let completed = if pending.acknowledge_only {
             send_netd_ref_ack_with_timeout(
                 &request,
-                rustos_user_abi::performance::IPC_FOREGROUND_MAINTENANCE_SLICE_MS,
+                rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS,
             )
             .is_ok()
         } else {
             match call_netd_ipc_request_with_timeout(
                 &request,
-                rustos_user_abi::performance::IPC_FOREGROUND_MAINTENANCE_SLICE_MS,
+                rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS,
             ) {
                 Ok(_) => {
                     // Split operation replay and its acknowledgement across
-                    // turns. Each foreground caller pays at most one short
-                    // maintenance IPC instead of an operation+ack chain.
+                    // yielded housekeeping turns. This is not charged to a
+                    // foreground syscall and must outlive a normal SMP IPC
+                    // round trip rather than cancel/retry it every 1 ms.
                     let mut acknowledge = pending;
                     acknowledge.acknowledge_only = true;
                     assert!(

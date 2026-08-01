@@ -429,6 +429,12 @@ pub(crate) struct GpuSceneCompiler {
     timeline: DvmGpuTimeline,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct GpuSceneCheckpoint {
+    next_submit: u64,
+    timeline: DvmGpuTimeline,
+}
+
 impl GpuSceneCompiler {
     pub(crate) fn new(context_id: u32, context_epoch: u32) -> Result<Self, GpuSceneError> {
         let timeline =
@@ -519,6 +525,21 @@ impl GpuSceneCompiler {
             output_width,
             output_height,
         })
+    }
+
+    pub(crate) fn checkpoint(&self) -> GpuSceneCheckpoint {
+        GpuSceneCheckpoint {
+            next_submit: self.next_submit,
+            timeline: self.timeline,
+        }
+    }
+
+    /// Withdraws a locally admitted batch that the display transport rejected.
+    /// Completions can only refer to transport-accepted submits, so restoring
+    /// both counters is safe and prevents a phantom in-flight fence.
+    pub(crate) fn restore_rejected_submit(&mut self, checkpoint: GpuSceneCheckpoint) {
+        self.next_submit = checkpoint.next_submit;
+        self.timeline = checkpoint.timeline;
     }
 
     pub(crate) fn begin_prime(&mut self, fence_value: u64) -> Result<(), GpuSceneError> {
@@ -902,6 +923,23 @@ mod tests {
             batch.encode().unwrap().len(),
             batch.header.encoded_batch_len().unwrap()
         );
+    }
+
+    #[test]
+    fn rejected_transport_submit_restores_exact_compiler_timeline() {
+        let mut compiler = ready_compiler();
+        let checkpoint = compiler.checkpoint();
+        let source = texture(0x101, 2);
+        let rejected = compiler
+            .compile(1280, 720, 1, 0xff00_0000, &[layer(source, 10)])
+            .unwrap();
+        assert_eq!(rejected.header.submit_value, 1);
+
+        compiler.restore_rejected_submit(checkpoint);
+        let retry = compiler
+            .compile(1280, 720, 1, 0xff00_0000, &[layer(source, 10)])
+            .unwrap();
+        assert_eq!(retry.header.submit_value, rejected.header.submit_value);
     }
 
     #[test]

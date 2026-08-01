@@ -1,0 +1,10 @@
+X86_64 TlbMailboxRequestPublicationMutant
+"Mutant: publish the request generation before the mailbox payload"
+{
+uint64_t root=1; uint64_t generation=0;
+uint64_t 1:rax; uint64_t 1:rbx;
+}
+P0                     | P1                    ;
+movq $7,(generation)   | movq (generation),%rax ;
+movq $0,(root)         | movq (root),%rbx       ;
+exists (1:rax=7 /\ 1:rbx=1)

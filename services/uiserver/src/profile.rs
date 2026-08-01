@@ -1,7 +1,8 @@
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use crate::sys::{background_thread_demotion_count, profile_line, ui_profile_enabled};
+use crate::acceptance_profile;
+use crate::sys::{background_thread_demotion_count, profile_line};
 
 #[derive(Default)]
 struct ProfileWindow {
@@ -94,7 +95,7 @@ fn record_input_counter_sample(
 }
 
 pub(crate) fn enabled() -> bool {
-    ui_profile_enabled()
+    acceptance_profile::enabled()
 }
 
 pub(crate) fn record_input_loop(

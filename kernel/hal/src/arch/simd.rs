@@ -23,14 +23,19 @@ const XFEATURE_YMM: u64 = 1 << 2;
 const SIMD_MODE_FXSAVE: u8 = 1;
 const SIMD_MODE_XSAVE: u8 = 2;
 
+const SIMD_PROFILE_UNINITIALIZED: u8 = 0;
+const SIMD_PROFILE_READY: u8 = 2;
+
 const SIMD_STATE_BYTES: usize = 4096;
 const FXSAVE_STATE_BYTES: usize = 512;
 const XMM_COPY_THRESHOLD_BYTES: usize = 256;
 const YMM_COPY_THRESHOLD_BYTES: usize = 256;
 
 static SIMD_MODE: AtomicU8 = AtomicU8::new(SIMD_MODE_FXSAVE);
+static SIMD_PROFILE_STATE: AtomicU8 = AtomicU8::new(SIMD_PROFILE_UNINITIALIZED);
 static XSTATE_MASK: AtomicU64 = AtomicU64::new(XFEATURE_X87 | XFEATURE_SSE);
 static SIMD_STATE_REQUIRED_BYTES: AtomicUsize = AtomicUsize::new(FXSAVE_STATE_BYTES);
+static XSTATE_LAYOUT_FINGERPRINT: AtomicU64 = AtomicU64::new(0);
 static AVX_ENABLED: AtomicBool = AtomicBool::new(false);
 static AVX2_ENABLED: AtomicBool = AtomicBool::new(false);
 static XSAVEOPT_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -64,15 +69,28 @@ pub fn init() {
     unsafe {
         enable_sse_baseline();
 
-        let max_leaf = __cpuid(0).eax;
-        let leaf1 = __cpuid(1);
-        if (leaf1.ecx & CPUID_FEATURE_XSAVE) == 0 || max_leaf < 0xD {
-            SIMD_STATE_REQUIRED_BYTES.store(FXSAVE_STATE_BYTES, Ordering::Release);
+        // The BSP selects one migration-safe profile before AP startup. APs
+        // configure exactly that profile or fail closed; changing process-
+        // global mode atomics from an AP would let a task be saved with one
+        // instruction/layout and restored with another after migration.
+        if nucleus_core::util::lockdep::current_cpu_index() != 0
+            || SIMD_PROFILE_STATE.load(Ordering::Acquire) == SIMD_PROFILE_READY
+        {
+            configure_published_profile();
             return;
         }
 
-        let supported_xcr0 = __cpuid_count(0xD, 0).eax as u64;
+        let max_leaf = __cpuid(0).eax;
+        let leaf1 = __cpuid(1);
+        if (leaf1.ecx & CPUID_FEATURE_XSAVE) == 0 || max_leaf < 0xD {
+            publish_fxsave_profile();
+            return;
+        }
+
+        let xsave_leaf = __cpuid_count(0xD, 0);
+        let supported_xcr0 = u64::from(xsave_leaf.eax) | (u64::from(xsave_leaf.edx) << 32);
         if (supported_xcr0 & (XFEATURE_X87 | XFEATURE_SSE)) != (XFEATURE_X87 | XFEATURE_SSE) {
+            publish_fxsave_profile();
             return;
         }
 
@@ -91,25 +109,137 @@ pub fn init() {
         write_cr4(read_cr4() | CR4_OSXSAVE);
         xsetbv0(requested_mask);
 
-        XSTATE_MASK.store(requested_mask, Ordering::Release);
-        AVX_ENABLED.store(avx_enabled, Ordering::Release);
-        AVX2_ENABLED.store(avx2_enabled, Ordering::Release);
-        XSAVEOPT_ENABLED.store(
-            (__cpuid_count(0xD, 1).eax & CPUID_XSAVEOPT) != 0,
-            Ordering::Release,
-        );
-        SIMD_MODE.store(SIMD_MODE_XSAVE, Ordering::Release);
-
+        // CPUID.0Dh:0.EBX is the byte count for the features currently
+        // enabled in XCR0. EAX/EDX are a feature bitmap, never a size.
         let xsave_leaf = __cpuid_count(0xD, 0);
-        let required_bytes = (xsave_leaf.eax.max(xsave_leaf.ebx) as usize).max(FXSAVE_STATE_BYTES);
+        let required_bytes = (xsave_leaf.ebx as usize).max(FXSAVE_STATE_BYTES);
         if required_bytes > SIMD_STATE_BYTES {
             panic!(
                 "SIMD xsave state requires {} bytes but buffer is only {} bytes",
                 required_bytes, SIMD_STATE_BYTES,
             );
         }
-        SIMD_STATE_REQUIRED_BYTES.store(required_bytes, Ordering::Release);
+        let xsaveopt_enabled = (__cpuid_count(0xD, 1).eax & CPUID_XSAVEOPT) != 0;
+        let layout_fingerprint = xstate_layout_fingerprint(requested_mask);
+
+        XSTATE_MASK.store(requested_mask, Ordering::Relaxed);
+        SIMD_STATE_REQUIRED_BYTES.store(required_bytes, Ordering::Relaxed);
+        XSTATE_LAYOUT_FINGERPRINT.store(layout_fingerprint, Ordering::Relaxed);
+        AVX_ENABLED.store(avx_enabled, Ordering::Relaxed);
+        AVX2_ENABLED.store(avx2_enabled, Ordering::Relaxed);
+        XSAVEOPT_ENABLED.store(xsaveopt_enabled, Ordering::Relaxed);
+        SIMD_MODE.store(SIMD_MODE_XSAVE, Ordering::Relaxed);
+        // ORDERING: release publishes the complete immutable SIMD migration
+        // contract before any AP may enable scheduling.
+        SIMD_PROFILE_STATE.store(SIMD_PROFILE_READY, Ordering::Release);
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn publish_fxsave_profile() {
+    XSTATE_MASK.store(XFEATURE_X87 | XFEATURE_SSE, Ordering::Relaxed);
+    SIMD_STATE_REQUIRED_BYTES.store(FXSAVE_STATE_BYTES, Ordering::Relaxed);
+    XSTATE_LAYOUT_FINGERPRINT.store(0, Ordering::Relaxed);
+    AVX_ENABLED.store(false, Ordering::Relaxed);
+    AVX2_ENABLED.store(false, Ordering::Relaxed);
+    XSAVEOPT_ENABLED.store(false, Ordering::Relaxed);
+    SIMD_MODE.store(SIMD_MODE_FXSAVE, Ordering::Relaxed);
+    SIMD_PROFILE_STATE.store(SIMD_PROFILE_READY, Ordering::Release);
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn configure_published_profile() {
+    assert_eq!(
+        SIMD_PROFILE_STATE.load(Ordering::Acquire),
+        SIMD_PROFILE_READY,
+        "SIMD invariant: AP initialized before BSP profile publication"
+    );
+    let mode = SIMD_MODE.load(Ordering::Acquire);
+    if mode == SIMD_MODE_FXSAVE {
+        assert_eq!(
+            SIMD_STATE_REQUIRED_BYTES.load(Ordering::Acquire),
+            FXSAVE_STATE_BYTES,
+            "SIMD invariant: malformed FXSAVE profile"
+        );
+        return;
+    }
+    assert_eq!(
+        mode, SIMD_MODE_XSAVE,
+        "SIMD invariant: unknown published state mode"
+    );
+
+    let max_leaf = __cpuid(0).eax;
+    let leaf1 = __cpuid(1);
+    assert!(
+        max_leaf >= 0xD && (leaf1.ecx & CPUID_FEATURE_XSAVE) != 0,
+        "SIMD invariant: CPU lacks BSP-required XSAVE"
+    );
+    let xsave_leaf = __cpuid_count(0xD, 0);
+    let supported_xcr0 = u64::from(xsave_leaf.eax) | (u64::from(xsave_leaf.edx) << 32);
+    let required_mask = XSTATE_MASK.load(Ordering::Acquire);
+    assert_eq!(
+        supported_xcr0 & required_mask,
+        required_mask,
+        "SIMD invariant: CPU lacks BSP-required XCR0 components"
+    );
+    assert!(
+        !AVX_ENABLED.load(Ordering::Acquire) || (leaf1.ecx & CPUID_FEATURE_AVX) != 0,
+        "SIMD invariant: CPU lacks BSP-required AVX"
+    );
+    if AVX2_ENABLED.load(Ordering::Acquire) {
+        assert!(
+            max_leaf >= 7 && (__cpuid_count(7, 0).ebx & CPUID_EXT_FEATURE_AVX2) != 0,
+            "SIMD invariant: CPU lacks BSP-required AVX2"
+        );
+    }
+    if XSAVEOPT_ENABLED.load(Ordering::Acquire) {
+        assert_ne!(
+            __cpuid_count(0xD, 1).eax & CPUID_XSAVEOPT,
+            0,
+            "SIMD invariant: CPU lacks BSP-required XSAVEOPT"
+        );
+    }
+
+    unsafe {
+        write_cr4(read_cr4() | CR4_OSXSAVE);
+        xsetbv0(required_mask);
+    }
+    let enabled_leaf = __cpuid_count(0xD, 0);
+    let required_bytes = (enabled_leaf.ebx as usize).max(FXSAVE_STATE_BYTES);
+    assert!(
+        required_bytes <= SIMD_STATE_BYTES,
+        "SIMD invariant: CPU XSAVE state exceeds fixed task buffer"
+    );
+    assert_eq!(
+        required_bytes,
+        SIMD_STATE_REQUIRED_BYTES.load(Ordering::Acquire),
+        "SIMD invariant: CPU XSAVE byte layout differs from BSP"
+    );
+    assert_eq!(
+        unsafe { xstate_layout_fingerprint(required_mask) },
+        XSTATE_LAYOUT_FINGERPRINT.load(Ordering::Acquire),
+        "SIMD invariant: CPU XSTATE component layout differs from BSP"
+    );
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn xstate_layout_fingerprint(mask: u64) -> u64 {
+    // FNV-1a over every enabled extended component's architectural CPUID
+    // descriptor. Equal total byte counts alone do not make XRSTOR images
+    // migration-compatible when component offsets or format flags differ.
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    let mut component = 2u32;
+    while component < 64 {
+        if mask & (1u64 << component) != 0 {
+            let leaf = __cpuid_count(0xD, component);
+            for value in [component, leaf.eax, leaf.ebx, leaf.ecx, leaf.edx] {
+                hash ^= u64::from(value);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        component += 1;
+    }
+    hash
 }
 
 pub fn mode_name() -> &'static str {

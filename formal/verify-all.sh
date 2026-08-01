@@ -22,19 +22,20 @@ trap 'rm -f "$run_marker"' EXIT
 
 bash formal/selftest.sh
 bash formal/run-source-conformance.sh
-bash formal/run-all-tlc.sh --profile "$profile"
+FORMAL_SELFTEST_ALREADY_PASSED=1 bash formal/run-all-tlc.sh --profile "$profile"
 bash formal/run-spec-mutations.sh
 bash formal/run-fault-scenarios.sh
 bash formal/run-abi-differential.sh
 bash formal/run-recovery-scenarios.sh
 bash formal/run-implementation-mutations.sh
+bash formal/run-proof-index.sh
 bash formal/run-kani.sh
 bash formal/run-verus.sh
+bash formal/run-concurrency-triangle.sh
 bash formal/run-runtime-traces.sh
 if [[ "$profile" == nightly ]]; then
     bash formal/run-sanitizers.sh --profile=all
     bash formal/run-miri.sh
-    bash formal/run-loom.sh
     bash formal/run-apalache.sh
     bash formal/run-tlaps.sh
     bash formal/run-fuzz-smoke.sh

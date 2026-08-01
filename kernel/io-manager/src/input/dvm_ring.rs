@@ -727,7 +727,7 @@ fn arm_input_ring_interrupt(device: crate::arch::pci::PciDevice) -> Result<(), u
     capability.set_enabled(device, true);
     capability.set_function_masked(device, false);
     crate::driver::mmio::unmap(table.cast());
-    vector_lease.commit();
+    vector_lease.commit().retain_permanent();
     Ok(())
 }
 

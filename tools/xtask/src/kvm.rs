@@ -29,7 +29,6 @@ use rustos_driver_domain_host::{
     ControlContract as HostControlContract, ControlSecret, HostControlListener, InputRingSink,
     IvshmemDoorbellServer, ProbeResult,
 };
-use rustos_user_abi::performance::BOOT_TO_UI_HARD_LIMIT_MS;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;

@@ -7,9 +7,12 @@ Models the all-or-nothing publication of one bounded suspended-child cohort.
 Policy selects the cohort in initd. Loaderd binds the requester to the
 kernel-stamped IPC sender. Ring0 holds ProcBrokerRegistry before acquiring the
 Scheduler lock, validates every exact one-shot capability and suspended task,
-then publishes every runnable task and consumes every capability in one
-rollback-free critical section. A malformed or foreign cohort changes neither
-task nor capability state.
+then consumes every capability while every target remains suspended and
+publishes every runnable task in the same rollback-free critical section. The
+model exposes that lock-held interior as `AuthorityConsumed` only to prove the
+execution order; no external action, requester exit, dispatch, or reply can
+interleave it. A malformed or foreign cohort changes neither task nor
+capability state.
 
 Concrete owners:
   * services/initd/src/main.rs
@@ -31,6 +34,7 @@ Revoked == "revoked"
 ForeignAuthority == Foreign
 
 Idle == "idle"
+AuthorityConsumed == "authority-consumed"
 Committed == "committed"
 Rejected == "rejected"
 Exited == "exited"
@@ -83,20 +87,30 @@ BatchPreflightOK ==
         /\ taskState[task] = Suspended
         /\ authority[task] = Live
 
-CommitBatch ==
+ConsumeAuthority ==
     /\ phase = Idle
     /\ BatchPreflightOK
-    /\ taskState' =
-        [task \in Targets |->
-            IF task \in BatchSet THEN Runnable ELSE taskState[task]]
     /\ authority' =
         [task \in Targets |->
             IF task \in BatchSet THEN Consumed ELSE authority[task]]
+    /\ phase' = AuthorityConsumed
+    /\ UNCHANGED
+        <<taskState, shapeValid, queue, ordinaryQueue, dispatched,
+          replyResumed>>
+
+PublishBatch ==
+    /\ phase = AuthorityConsumed
+    /\ \A task \in BatchSet:
+        /\ taskState[task] = Suspended
+        /\ authority[task] = Consumed
+    /\ taskState' =
+        [task \in Targets |->
+            IF task \in BatchSet THEN Runnable ELSE taskState[task]]
     /\ phase' = Committed
     /\ queue' = Batch
     /\ dispatched' = <<>>
     /\ replyResumed' = FALSE
-    /\ UNCHANGED <<shapeValid, ordinaryQueue>>
+    /\ UNCHANGED <<authority, shapeValid, ordinaryQueue>>
 
 DispatchBatchHead ==
     /\ phase = Committed
@@ -144,7 +158,8 @@ TerminalStutter ==
 Next ==
     \/ \E task \in Targets: CorruptAuthority(task)
     \/ CorruptShape
-    \/ CommitBatch
+    \/ ConsumeAuthority
+    \/ PublishBatch
     \/ DispatchBatchHead
     \/ ResumeLoaderReply
     \/ RejectBatch
@@ -158,7 +173,7 @@ TypeOK ==
     /\ authority \in
         [Targets -> {Live, Consumed, Revoked, ForeignAuthority}]
     /\ shapeValid \in BOOLEAN
-    /\ phase \in {Idle, Committed, Rejected, Exited}
+    /\ phase \in {Idle, AuthorityConsumed, Committed, Rejected, Exited}
     /\ queue \in Seq(Targets)
     /\ ordinaryQueue \in Seq({Ordinary})
     /\ dispatched \in Seq(Targets)
@@ -175,13 +190,26 @@ NoPartialPublication ==
         /\ \A task \in BatchSet: authority[task] = Consumed
         /\ dispatched \o queue = Batch
 
-NoPublicationBeforeCommit ==
+NoRunnablePublicationBeforePublish ==
     phase # Committed =>
         /\ \A task \in BatchSet: taskState[task] # Runnable
-        /\ \A task \in BatchSet: authority[task] # Consumed
         /\ queue = <<>>
         /\ dispatched = <<>>
         /\ ~replyResumed
+
+AuthorityConsumptionRetainsSuspension ==
+    phase = AuthorityConsumed =>
+        /\ \A task \in BatchSet:
+            /\ taskState[task] = Suspended
+            /\ authority[task] = Consumed
+        /\ queue = <<>>
+        /\ dispatched = <<>>
+        /\ ~replyResumed
+
+CapabilityConsumptionRequiresCompletePreflight ==
+    \A task \in BatchSet:
+        authority[task] = Consumed =>
+            phase \in {AuthorityConsumed, Committed}
 
 RunnableRequiresConsumedAuthority ==
     \A task \in BatchSet:

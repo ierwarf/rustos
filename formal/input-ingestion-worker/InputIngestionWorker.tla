@@ -11,7 +11,9 @@ Concrete source anchors:
   * `services/inputd/src/main.rs`: `inputd-dvm-ingress` is the sole
     event-driven worker that invokes the existing bounded ingest broker. A
     full batch yields and immediately starts another bounded broker turn; it
-    does not wait for a later producer record to finish admitted backlog.
+    does not wait for a later producer record to finish admitted backlog. A
+    decoded SESSION_START batch remains private across bounded netd retries,
+    and its ordered transition suffix is cleared only after each exact ACK.
   * `kernel/io-manager/src/input/{dvm_ring,wait_queue}.rs`: inputd publishes a
     monotonic consumer wake generation after registering its dedicated slot;
     L0 samples it after commit and the MSI-X leaf only wakes that slot.
@@ -23,7 +25,8 @@ establish policy readiness, but after that point they cannot be required for
 consumer progress, and they can never advance the fixed-ring cursor.
 *******************************************************************************)
 
-CONSTANTS Slots, Batch, MaxProduced, MaxClientPolls, MaxWakeGeneration
+CONSTANTS Slots, Batch, MaxProduced, MaxClientPolls, MaxWakeGeneration,
+          MaxAuthorityRetries
 
 NoOwner == "none"
 WorkerOwner == "inputd-ingestion-worker"
@@ -34,11 +37,13 @@ Exited == "exited"
 
 VARIABLES policyConsumerReady, workerState, producer, consumer, irqPending,
           consumerWakeGeneration, notifiedWakeGeneration,
-          batchRemaining, clientPolls, inputdWakeSlot, lastConsumerOwner
+          batchRemaining, clientPolls, inputdWakeSlot, lastConsumerOwner,
+          authorityPending, authorityRetries
 
 vars == <<policyConsumerReady, workerState, producer, consumer, irqPending,
           consumerWakeGeneration, notifiedWakeGeneration,
-          batchRemaining, clientPolls, inputdWakeSlot, lastConsumerOwner>>
+          batchRemaining, clientPolls, inputdWakeSlot, lastConsumerOwner,
+          authorityPending, authorityRetries>>
 
 Outstanding == producer - consumer
 NormalCapacity == Slots - 1
@@ -55,6 +60,8 @@ Init ==
     /\ clientPolls = 0
     /\ inputdWakeSlot = NoOwner
     /\ lastConsumerOwner = NoOwner
+    /\ authorityPending = FALSE
+    /\ authorityRetries = 0
 
 \* A real client completes the policy-backed readiness check. The worker was
 \* already created by inputd; no client is permitted to become the consumer.
@@ -64,7 +71,8 @@ SetPolicyConsumerReady ==
     /\ policyConsumerReady' = TRUE
     /\ UNCHANGED <<workerState, producer, consumer, irqPending,
                   consumerWakeGeneration, notifiedWakeGeneration,
-                  batchRemaining, clientPolls, inputdWakeSlot, lastConsumerOwner>>
+                  batchRemaining, clientPolls, inputdWakeSlot, lastConsumerOwner,
+                  authorityPending, authorityRetries>>
 
 \* inputd registers its task first, publishes a new single-writer generation,
 \* then rechecks producer/consumer before committing the block.
@@ -78,7 +86,8 @@ ArmIngestionWorker ==
     /\ consumerWakeGeneration' = consumerWakeGeneration + 1
     /\ UNCHANGED <<policyConsumerReady, workerState, producer, consumer,
                   irqPending, notifiedWakeGeneration, batchRemaining,
-                  clientPolls, lastConsumerOwner>>
+                  clientPolls, lastConsumerOwner, authorityPending,
+                  authorityRetries>>
 
 \* L0 can produce only into a policy-ready ring with a live worker and keeps
 \* one slot reserved for authenticated cleanup.
@@ -98,7 +107,8 @@ Produce ==
     /\ notifiedWakeGeneration' = consumerWakeGeneration
     /\ UNCHANGED <<policyConsumerReady, workerState, consumer,
                   consumerWakeGeneration, batchRemaining, clientPolls,
-                  inputdWakeSlot, lastConsumerOwner>>
+                  inputdWakeSlot, lastConsumerOwner, authorityPending,
+                  authorityRetries>>
 
 \* The IRQ can be delayed or lost. The wait broker rechecks the raw cursors,
 \* so either an edge or outstanding work makes the worker runnable.
@@ -113,7 +123,8 @@ WakeIngestionWorker ==
     /\ inputdWakeSlot' = NoOwner
     /\ UNCHANGED <<policyConsumerReady, producer, consumer,
                   consumerWakeGeneration, notifiedWakeGeneration,
-                  clientPolls, lastConsumerOwner>>
+                  clientPolls, lastConsumerOwner, authorityPending,
+                  authorityRetries>>
 
 \* The finite kernel timer is independent of MSI-X delivery. It turns a lost
 \* or indefinitely coalesced interrupt into the same authoritative cursor
@@ -127,7 +138,8 @@ WatchdogWakeIngestionWorker ==
     /\ inputdWakeSlot' = NoOwner
     /\ UNCHANGED <<policyConsumerReady, producer, consumer, irqPending,
                   consumerWakeGeneration, notifiedWakeGeneration,
-                  clientPolls, lastConsumerOwner>>
+                  clientPolls, lastConsumerOwner, authorityPending,
+                  authorityRetries>>
 
 \* A commit that raced before arm publication is found by the authoritative
 \* post-registration cursor recheck; it needs no fabricated interrupt.
@@ -139,7 +151,8 @@ ObserveBacklogWithoutSleep ==
     /\ batchRemaining' = Batch
     /\ UNCHANGED <<policyConsumerReady, producer, consumer, irqPending,
                   consumerWakeGeneration, notifiedWakeGeneration,
-                  clientPolls, inputdWakeSlot, lastConsumerOwner>>
+                  clientPolls, inputdWakeSlot, lastConsumerOwner,
+                  authorityPending, authorityRetries>>
 
 \* Only the inputd worker advances RustOS's consumer cursor. Each broker
 \* invocation is bounded, even while catching up after a client stall.
@@ -152,29 +165,65 @@ DrainOne ==
     /\ lastConsumerOwner' = WorkerOwner
     /\ UNCHANGED <<policyConsumerReady, workerState, producer, irqPending,
                   consumerWakeGeneration, notifiedWakeGeneration,
-                  clientPolls, inputdWakeSlot>>
+                  clientPolls, inputdWakeSlot, authorityPending,
+                  authorityRetries>>
 
 \* Session start/end synchronizes the authenticated DVM epoch with netd.
 \* `Syncing` denotes that inputd has released its policy queue lock before the
-\* bounded cross-service IPC. A sync failure resets the uncommitted decoder
-\* session and resumes draining; it cannot kill the sole ring consumer.
+\* bounded cross-service IPC. The decoded batch and exact remaining transition
+\* suffix stay private until ACK; a failure cannot consume the only session
+\* marker and then resume draining unauthenticated records.
 BeginAuthoritySync ==
     /\ workerState = Draining
     /\ workerState' = Syncing
+    /\ authorityPending' = TRUE
+    /\ authorityRetries' = 0
     /\ UNCHANGED <<policyConsumerReady, producer, consumer, irqPending,
                   consumerWakeGeneration, notifiedWakeGeneration,
                   batchRemaining, clientPolls, inputdWakeSlot,
                   lastConsumerOwner>>
 
-\* Success and failure both settle the in-flight IPC before the worker resumes.
-\* The source witnesses distinguish decoder reset; the composition needs only
-\* the common lifecycle edge because neither outcome owns ring progress.
-SettleAuthoritySync ==
+AuthoritySyncSuccess ==
     /\ workerState = Syncing
+    /\ authorityPending
     /\ workerState' = Draining
+    /\ authorityPending' = FALSE
+    /\ authorityRetries' = 0
     /\ UNCHANGED <<policyConsumerReady, producer, consumer, irqPending,
                   consumerWakeGeneration, notifiedWakeGeneration,
                   batchRemaining, clientPolls, inputdWakeSlot,
+                  lastConsumerOwner>>
+
+\* A transient lookup or bounded IPC failure retains the batch and retry
+\* authority. No cursor or decoder ownership moves while the session is not
+\* admitted.
+AuthoritySyncFailure ==
+    /\ workerState = Syncing
+    /\ authorityPending
+    /\ authorityRetries < MaxAuthorityRetries
+    /\ authorityRetries' = authorityRetries + 1
+    /\ UNCHANGED <<policyConsumerReady, workerState, producer, consumer,
+                  irqPending, consumerWakeGeneration,
+                  notifiedWakeGeneration, batchRemaining, clientPolls,
+                  inputdWakeSlot, lastConsumerOwner, authorityPending>>
+
+\* The concrete worker uses an absolute five-second deadline. Exhaustion is a
+\* fail-closed process terminal; endpoint-owner cleanup withdraws producer
+\* admission rather than silently dropping the authenticated epoch.
+AuthoritySyncTimeout ==
+    /\ workerState = Syncing
+    /\ authorityPending
+    /\ authorityRetries = MaxAuthorityRetries
+    /\ policyConsumerReady' = FALSE
+    /\ workerState' = Exited
+    /\ consumer' = producer
+    /\ irqPending' = FALSE
+    /\ inputdWakeSlot' = NoOwner
+    /\ batchRemaining' = 0
+    /\ authorityPending' = FALSE
+    /\ authorityRetries' = 0
+    /\ UNCHANGED <<producer, consumerWakeGeneration,
+                  notifiedWakeGeneration, clientPolls,
                   lastConsumerOwner>>
 
 \* Process-exit cleanup revokes the service endpoint and the independent fixed
@@ -188,6 +237,8 @@ ConsumerOwnerExit ==
     /\ irqPending' = FALSE
     /\ inputdWakeSlot' = NoOwner
     /\ batchRemaining' = 0
+    /\ authorityPending' = FALSE
+    /\ authorityRetries' = 0
     /\ UNCHANGED <<producer, consumerWakeGeneration,
                   notifiedWakeGeneration, clientPolls,
                   lastConsumerOwner>>
@@ -196,6 +247,8 @@ RestartWorker ==
     /\ workerState = Exited
     /\ ~policyConsumerReady
     /\ workerState' = Waiting
+    /\ authorityPending' = FALSE
+    /\ authorityRetries' = 0
     /\ UNCHANGED <<policyConsumerReady, producer, consumer, irqPending,
                   consumerWakeGeneration, notifiedWakeGeneration,
                   batchRemaining, clientPolls, inputdWakeSlot,
@@ -209,7 +262,8 @@ FinishBoundedBatch ==
     /\ inputdWakeSlot' = NoOwner
     /\ UNCHANGED <<policyConsumerReady, producer, consumer, irqPending,
                   consumerWakeGeneration, notifiedWakeGeneration,
-                  clientPolls, lastConsumerOwner>>
+                  clientPolls, lastConsumerOwner, authorityPending,
+                  authorityRetries>>
 
 \* An application may poll arbitrarily often or stop polling altogether. It
 \* neither wakes the worker nor changes producer/consumer ownership.
@@ -218,7 +272,8 @@ ClientPoll ==
     /\ clientPolls' = clientPolls + 1
     /\ UNCHANGED <<policyConsumerReady, workerState, producer, consumer,
                   irqPending, consumerWakeGeneration, notifiedWakeGeneration,
-                  batchRemaining, inputdWakeSlot, lastConsumerOwner>>
+                  batchRemaining, inputdWakeSlot, lastConsumerOwner,
+                  authorityPending, authorityRetries>>
 
 Next ==
     \/ SetPolicyConsumerReady
@@ -229,7 +284,9 @@ Next ==
     \/ ObserveBacklogWithoutSleep
     \/ DrainOne
     \/ BeginAuthoritySync
-    \/ SettleAuthoritySync
+    \/ AuthoritySyncSuccess
+    \/ AuthoritySyncFailure
+    \/ AuthoritySyncTimeout
     \/ ConsumerOwnerExit
     \/ RestartWorker
     \/ FinishBoundedBatch
@@ -248,6 +305,8 @@ TypeOK ==
     /\ clientPolls \in 0..MaxClientPolls
     /\ inputdWakeSlot \in {NoOwner, WorkerOwner}
     /\ lastConsumerOwner \in {NoOwner, WorkerOwner}
+    /\ authorityPending \in BOOLEAN
+    /\ authorityRetries \in 0..MaxAuthorityRetries
 
 CursorBound ==
     /\ producer >= consumer
@@ -274,6 +333,9 @@ ClientPollCannotOwnProgress ==
     /\ clientPolls \in 0..MaxClientPolls
     /\ lastConsumerOwner # "client"
 
+AuthorityBatchIsRetained ==
+    workerState = Syncing => authorityPending
+
 Spec ==
     Init /\ [][Next]_vars
     /\ WF_vars(ArmIngestionWorker)
@@ -281,7 +343,9 @@ Spec ==
     /\ WF_vars(WatchdogWakeIngestionWorker)
     /\ WF_vars(ObserveBacklogWithoutSleep)
     /\ WF_vars(DrainOne)
-    /\ WF_vars(SettleAuthoritySync)
+    /\ WF_vars(AuthoritySyncSuccess)
+    /\ WF_vars(AuthoritySyncFailure)
+    /\ WF_vars(AuthoritySyncTimeout)
     /\ WF_vars(ConsumerOwnerExit)
     /\ WF_vars(RestartWorker)
     /\ WF_vars(FinishBoundedBatch)

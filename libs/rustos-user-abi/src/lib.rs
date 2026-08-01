@@ -58,10 +58,6 @@ mod tests {
                     < performance::BOOT_TO_UI_HARD_LIMIT_MS
             );
             assert!(
-                performance::IPC_FOREGROUND_MAINTENANCE_SLICE_MS
-                    < performance::IPC_READINESS_QUERY_HARD_LIMIT_MS
-            );
-            assert!(
                 performance::IPC_READINESS_QUERY_HARD_LIMIT_MS
                     < performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS
             );

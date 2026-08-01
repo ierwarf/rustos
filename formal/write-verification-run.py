@@ -10,6 +10,8 @@ import subprocess
 import tomllib
 from pathlib import Path
 
+from tlc_cache import validate_cached_summary
+
 
 def source_tree_sha256(root: Path) -> str:
     output = subprocess.run(
@@ -82,22 +84,25 @@ def main() -> int:
         ).splitlines():
             if line and not line.startswith("#"):
                 models.append(line.split("\t", 1)[0])
-    required.extend(
+    tlc_paths = {
         root
         / "build/formal/tlc"
         / args.profile
         / model.replace("/", "__")
-        / "summary.json"
+        / "summary.json": model
         for model in models
-    )
-    required = sorted(set(required))
+    }
+    required = sorted(set(required) | set(tlc_paths))
     not_before = args.not_before.resolve()
     if not_before.parent != (root / "build/formal/verification-run").resolve():
         raise ValueError("verification run marker is outside the evidence directory")
     marker_mtime_ns = not_before.stat().st_mtime_ns
     artifacts = []
     for path in required:
-        require_fresh(path, marker_mtime_ns)
+        if path in tlc_paths and profile.get("tlc_reuse_max_age_hours", 0) > 0:
+            validate_cached_summary(root, args.profile, tlc_paths[path])
+        else:
+            require_fresh(path, marker_mtime_ns)
         require_passed(path)
         artifacts.append(
             {

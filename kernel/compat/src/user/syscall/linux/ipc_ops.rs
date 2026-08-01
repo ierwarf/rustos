@@ -26,7 +26,9 @@ pub(super) use subject::{
     current_process_has_service_capability, current_process_with_service_capability,
 };
 
-use kernel_ipc_runtime::api::{KernelEndpointHandle, KernelReplyHandle, KernelTransferredHandle};
+use kernel_ipc_runtime::api::{
+    EndpointCallPriority, KernelEndpointHandle, KernelReplyHandle, KernelTransferredHandle,
+};
 use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
 
 macro_rules! ipc_trace {
@@ -2172,13 +2174,23 @@ fn enqueue_call_and_wake_with_handles(
     attached_handles: &[KernelTransferredHandle],
 ) -> Result<KernelReplyHandle, i64> {
     let task_id = multitask::current_task_id().ok_or(LINUX_EINVAL)?;
-    let (reply, receiver_to_wake) = kernel_ipc_runtime::api::enqueue_endpoint_call_with_handles(
-        endpoint,
-        task_id,
-        request,
-        attached_handles,
-    )
-    .map_err(ipc_error_to_linux_errno)?;
+    // Queue priority is scheduler authority: derive it from the live task
+    // slot, never from request bytes controlled by ring3. Sampling occurs
+    // before the IPC slot lock, preserving the scheduler -> IPC lock order.
+    let priority = if multitask::task_has_system_scheduling_class(task_id) {
+        EndpointCallPriority::System
+    } else {
+        EndpointCallPriority::Ordinary
+    };
+    let (reply, receiver_to_wake) =
+        kernel_ipc_runtime::api::enqueue_endpoint_call_with_handles_and_priority(
+            endpoint,
+            task_id,
+            request,
+            attached_handles,
+            priority,
+        )
+        .map_err(ipc_error_to_linux_errno)?;
     ipc_trace!(
         "ipc call queued: endpoint={} receiver_to_wake={:?}",
         endpoint.raw(),

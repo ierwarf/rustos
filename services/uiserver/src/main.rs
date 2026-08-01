@@ -1,3 +1,4 @@
+mod acceptance_profile;
 mod app;
 mod canvas;
 mod cursor_sprites;
@@ -1275,9 +1276,8 @@ fn main() {
     boot_line("uiserver: main enter");
     install_panic_hook();
     boot_line("uiserver: panic hook installed");
-    if profile::enabled() {
-        diag_line("uiserver: acceptance profile enabled");
-    }
+    acceptance_profile::start_late_watcher();
+    acceptance_profile::announce_if_enabled();
     if let Err(err) = sys::start_display_policy_endpoint() {
         sys::debug_line(&format!(
             "uiserver: display policy endpoint failed errno={err}"

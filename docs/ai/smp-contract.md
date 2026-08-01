@@ -120,6 +120,14 @@ hard-coded lockdep CPU zero are forbidden once `rustos_vcpus > 1`.
 An AP that reaches Rust without all private state panics before enabling
 interrupts or scheduling a task.
 
+The BSP publishes one immutable task-migration SIMD profile. Its XCR0 mask,
+XSAVE/FXSAVE mode, XSAVEOPT use, AVX/AVX2 admission, enabled-byte count, and
+per-component CPUID.0Dh layout fingerprint are release-published together.
+Every AP configures exactly that profile and panics before Online if any
+required feature, byte count, offset, or format differs. CPUID.0Dh:0.EAX/EDX
+is a component bitmap; only EBX after XCR0 installation is the enabled-state
+byte count. An AP may never downgrade or rewrite the global profile.
+
 Startup waits are bounded and use a generation-matched acknowledgement. The
 BSP must not hold a raw spin lock while waiting. Timeout leaves the topology
 unpublished and fails the boot; partial commercial SMP is forbidden.
@@ -222,6 +230,12 @@ violates execution ownership.
   are unavailable during that short transition rather than fabricating the
   incoming task as fully installed. The global scheduler scratch field is
   never remote ownership evidence.
+- Wake distinguishes `Current(cpu)` from `Transition(cpu)`. A current task has
+  consumed its frame, so wake only revokes arm/block and leaves it non-ready
+  until its trap publishes a new frame. A transition owner has already
+  published that frame, so wake must set it ready while dispatch continues to
+  reject the slot until assembly release-clears transition ownership. Treating
+  both phases as merely "running" is a lost-wake invariant violation.
 - Guard release validates the acquisition CPU, APIC identity, exact acquired
   nesting depth, and pending/held accounting before unlocking protected
   state. Unlock, held-class removal, and preemption-unit release form one
@@ -347,7 +361,36 @@ seL4 MCS reply objects, which explicitly track and return the caller's donated
 scheduling context. The executable refinement is
 `formal/synchronous-ipc-handoff/SynchronousIpcHandoff.tla`.
 
-### 7.6 Atomic startup-cohort activation
+### 7.6 Kernel-derived endpoint priority ordering
+
+Synchronous service endpoints deliver calls in two FIFO lanes so a live
+System dependency cannot remain behind an unrelated ordinary backlog:
+
+- the compat boundary samples the caller's effective scheduler class before
+  taking any IPC object lock; request bytes and ring3 protocol fields can
+  never select the lane;
+- the endpoint owns separate preallocated System and ordinary FIFO lanes, but
+  their combined occupancy is still bounded by
+  `MAX_ENDPOINT_PENDING_MESSAGES`;
+- FIFO is strict within each lane; a queued System call is selected before an
+  ordinary call until two consecutive System deliveries have occurred;
+- if both lanes remain nonempty after that two-call burst, exactly one
+  ordinary call is selected and resets the burst. A System-only queue may
+  continue without inventing an idle turn;
+- receive capacity failure does not pop a lane or advance the burst, and
+  cancellation removes the exact message from either lane before consuming
+  its reply authority;
+- queue selection, message validation, and committed pop occur under the same
+  endpoint slot guard. A selected head mismatch is an internal ownership
+  contradiction and panics rather than silently reordering calls.
+
+This follows the priority-ordered IPC used by seL4 MCS and QNX message
+channels, while RustOS adds the bounded ordinary reservation that matches its
+two-System/one-User scheduler contract. The executable refinement is
+`formal/ipc-priority-queue/IpcPriorityQueue.tla`; its semantic mutant removes
+the System-first guard and must be rejected by TLC.
+
+### 7.7 Atomic startup-cohort activation
 
 Post-init boot must not serialize independent suspended siblings by handing
 the CPU to the first child before the rest are runnable. Initd owns cohort
@@ -384,8 +427,11 @@ The executable refinement is
 `formal/atomic-process-activation-batch/AtomicProcessActivationBatch.tla`,
 including the rule that the loader reply cannot resume until the committed
 cohort FIFO is drained and that unrelated ordinary spawn backlog cannot consume
-or suppress it. The existing `bootstrap-activation-handoff` model continues to
-prove general FIFO first-turn custody after publication.
+or suppress it. Its `AuthorityConsumed` state is a verification-only view of
+the lock-held interior: it proves that every one-shot capability is consumed
+before runnable publication while forbidding requester exit, dispatch, or reply
+between those steps. The existing `bootstrap-activation-handoff` model
+continues to prove general FIFO first-turn custody after publication.
 
 ## 8. Address spaces and TLB shootdown
 
@@ -426,8 +472,47 @@ queues, timers, IPC donation, and current/ready ownership on every CPU.
   performs final shootdown, and only then reclaims the address space.
 - Exec uses the same sibling-retirement barrier before replacing mappings or
   ABI state.
+- Recoverable grow-down faults use scheduler-plan, nonblocking process-apply,
+  then scheduler-commit. The scheduler raw owner and `ProcessStateLock` never
+  overlap. Apply contention retires only the faulting task. If a remote
+  retire/exec invalidates the immutable plan after pages were installed, the
+  scheduler commit rejects it and retires that task; the installed anonymous
+  pages remain owned by the process address space, remain covered by the
+  process-wide `[stack]` VMA, block overlapping allocation through the mapped
+  region registry, and are reclaimed at process teardown. No sibling receives
+  the rejected task's expanded scheduler stack metadata.
+- Scheduler commit never enters the sleepable process-state lock. Exec first
+  seals and quiesces the process, commits scheduler-only identity/root/thread
+  metadata under the raw scheduler lock, releases it, then performs the
+  process-state replacement. Failure after scheduler commit is an invariant
+  panic; it is never exposed as a recoverable half-exec.
+- Linux per-thread state is protected by its own fixed-slot, generation/TID
+  checked raw lock. A raw mutable pointer into scheduler `TaskContext` may not
+  escape scheduler serialization. Process-state callers take
+  `ProcessState -> LinuxThreadState`; signal/lifecycle callers take
+  `Scheduler -> LinuxThreadState`; code holding LinuxThreadState may not enter
+  either owner.
 - Robust-futex owner death uses an address-space-aware atomic user-u32
   compare-exchange. A BSP read/modify/write sequence is not legal in SMP.
+- A non-private futex resolves to a stable shared-backing key when one exists;
+  anonymous memory without stable shared backing falls back to the exact
+  private mm-generation/root/VA key. Kernel-generated robust-list and
+  `clear_child_tid` wakeups try the stable shared key first and then the exact
+  private key because the userspace private flag is not retained at exit.
+- Private futex keys are `(never-reused mm generation, page-table root,
+  virtual word)`. Shared keys are `(backing kind, stable object generation,
+  byte offset)` and never use a physical frame number; memfd/shared-region
+  aliases therefore match across processes while unmap/remap and allocator
+  reuse cannot create ABA. WAIT and CMP_REQUEUE retain the exact process/VMA
+  generation, acquire the futex bucket, atomically compare the word, and
+  publish or mutate queues in that single critical section. Signal wake that
+  leaves a waiter in the table completes with EINTR/restart semantics, not
+  success.
+- MSI-X installation is a revocable transaction. Function mask/enable writes
+  require config-space readback. Device unmask, handler/vector ownership, and
+  transport/provider publication either all commit, or rollback disables and
+  masks the device before revoking the exact handlers and returning vectors.
+  A vector becomes boot-permanent only after the last fallible publication.
 - Linux `sched_getaffinity` reports the exact effective target-thread mask,
   bounded by the admitted Online set; `sched_setaffinity` commits the
   Linux-defined intersection with Online. Neither operation may substitute a
@@ -536,8 +621,11 @@ No single checker is sufficient. The release gate combines:
 4. runtime assertions and lockdep for high-risk internal invariants;
 5. TLA+ models for CPU online, reschedule IPI, task ownership, shootdown,
    process retirement, robust futex, and release admission;
-6. Loom/litmus tests for publication, queues, wake/block, and acknowledgement
-   races; pinned Kani harnesses for bounded unsafe/state-machine code;
+6. source-anchored Loom plus Shuttle PCT protocol kernels and mutation-sensitive
+   x86_64 herd7 litmuses for publication, queues, wake/block, and
+   acknowledgement races; a closed Kani/Verus proof index for bounded
+   unsafe/state-machine code and selective unbounded acknowledgement/state
+   partitions;
 7. source-conformance witnesses that bind each formal transition to an exact
    test;
 8. fault injection for missing/stale AP, IPI, timer, shootdown, retirement, and
@@ -581,7 +669,8 @@ For an SMP-affecting change set:
 
 1. `cargo xtask dev-plan`, then every selected immediate check;
 2. formal registry/source-contract/system-flow checks;
-3. targeted unit tests, TLA+ PR models, Loom, and pinned Kani harnesses;
+3. targeted unit tests, TLA+ PR models and mutants, the bounded Loom/Shuttle/
+   herd7 concurrency triangle, then the proof-indexed Kani and Verus kernels;
 4. `cargo xtask check`, `cargo xtask build`, and `cargo xtask verify-dvm`;
 5. bounded fault/recovery probes selected by the contract impact;
 6. fresh KVM/QEMU commercial runs at 1, 2, 4, and 8 RustOS vCPUs, each for
@@ -633,6 +722,11 @@ compatibility guarantees.
   <https://docs.kernel.org/scheduler/sched-ext.html>
 - Loom bounded concurrency exploration:
   <https://github.com/tokio-rs/loom>
+- Shuttle controlled schedule exploration and PCT scheduler:
+  <https://docs.rs/shuttle/0.9.1/shuttle/>
+- herdtools7 x86_64 memory-model simulation and source installation:
+  <https://diy.inria.fr/tuto/mem/index.html> and
+  <https://diy.inria.fr/sources/index.html>
 - Kani Rust model checking and current function-contract status:
   <https://model-checking.github.io/kani/> and
   <https://model-checking.github.io/kani/crates/doc/kani/contracts/index.html>

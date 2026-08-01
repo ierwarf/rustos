@@ -1,4 +1,5 @@
 mod evidence;
+mod profiles;
 mod registry;
 mod runtime_trace;
 

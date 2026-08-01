@@ -31,13 +31,17 @@ impl Scheduler {
             return false;
         }
 
-        // The caller owns the outer capability registry and the documented
-        // ProcBrokerRegistry -> Scheduler lock order. Consume that exact
-        // authority after every scheduler preflight succeeds but before any
-        // target becomes runnable. The callback must be bounded, infallible,
-        // allocation-free registry mutation; a panic leaves every target
-        // suspended and fails closed.
+        // LIFECYCLE: the caller owns the outer capability registry and the
+        // documented ProcBrokerRegistry -> Scheduler lock order. Consuming
+        // the exact one-shot authority is intentionally before publication:
+        // publishing first would leave a runnable child with live activation
+        // authority. The post-callback assertion is the executable boundary;
+        // moving publication ahead of authority consumption panics while both
+        // owners are still held rather than exposing a partial cohort.
+        // The callback must be bounded, infallible, allocation-free registry
+        // mutation; a panic leaves every target suspended and fails closed.
         commit_authority();
+        self.assert_authority_commit_preserved_suspension(task_ids);
         self.publish_suspended_user_tasks(task_ids);
         true
     }
@@ -88,6 +92,29 @@ impl Scheduler {
             "scheduler activation invariant: cohort exceeds bounded first-turn custody"
         );
         true
+    }
+
+    /// Checks the non-observable interior of a registry-to-scheduler commit.
+    ///
+    /// The callback may consume only its outer one-shot authority. It must
+    /// not make a preflighted task runnable, retire it, or otherwise change
+    /// scheduler custody before this method publishes the complete cohort.
+    /// A violation is kernel corruption: returning an error after authority
+    /// consumption would leave no userspace recovery path.
+    fn assert_authority_commit_preserved_suspension(&self, task_ids: &[u64]) {
+        for task_id in task_ids.iter().copied() {
+            let slot = self
+                .find_user_task_slot(task_id)
+                .expect("scheduler activation invariant: preflight target disappeared after authority commit");
+            assert!(
+                !self.retired[slot] && self.start_suspended[slot],
+                "scheduler activation invariant: authority commit changed suspension before cohort publication for task {task_id}"
+            );
+            assert!(
+                slot != self.current_task && !super::super::task_slot_is_running(slot),
+                "scheduler activation invariant: authority commit made task {task_id} runnable before cohort publication"
+            );
+        }
     }
 
     fn publish_suspended_user_tasks(&mut self, task_ids: &[u64]) {

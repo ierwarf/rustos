@@ -114,7 +114,8 @@ or launch policy.
   `formal/selftest.sh` runs it before model execution.
 - `formal/check-performance-contracts.sh` binds the shared source limits to
   typed compat IPC, single-attempt service publication, one-turn VFS recovery,
-  and the independent KVM five-second UI gate. It runs from `selftest.sh`;
+  and the temporary absence of an independent KVM boot deadline during SMP
+  qualification. It runs from `selftest.sh`;
   widening a deadline, restoring an unclassified 30-second helper, or wrapping
   endpoint publication in a retry loop is a contract failure before TLC.
 - Nightly evidence is `bash formal/verify-all.sh --profile nightly`: the PR

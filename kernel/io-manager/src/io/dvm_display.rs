@@ -261,11 +261,11 @@ fn try_install_serialized() -> bool {
         );
         return false;
     };
-    if !arm_gui_dvm_interrupts(pool.device) {
+    let Some(interrupt_install) = arm_gui_dvm_interrupts(pool.device) else {
         release_gui_pool(pool);
         reject_install("msix-control-interrupt-unavailable");
         return false;
-    }
+    };
     let Some(first_slot) = pool.header.slot_offset(0) else {
         release_gui_pool(pool);
         reject_install("slot-zero-out-of-range");
@@ -363,6 +363,7 @@ fn try_install_serialized() -> bool {
         &[0; DVM_GPU_PRIME_COMPLETION_BYTES],
     );
     INSTALLED.store(true, Ordering::Release);
+    interrupt_install.retain_permanent();
     crate::debug::info!(
         display,
         "gui-dvm: cacheable-pixel provider published width={} height={} stride={} slot_bytes={} gpu_atlas={}x{} gpu_stride={} pixel_phys={:#x}",
@@ -1405,51 +1406,82 @@ fn gui_dvm_offline_interrupt(_vector: u8) {
 
 /// Program exactly two host receive vectors: control/ready and offline. The
 /// device cannot turn them into a generic guest-selected interrupt allocator.
-fn arm_gui_dvm_interrupts(device: crate::arch::pci::PciDevice) -> bool {
+struct GuiInterruptInstall {
+    capability: crate::arch::pci::MsixCapability,
+    device: crate::arch::pci::PciDevice,
+    control: Option<crate::arch::msi::CommittedMsiVector>,
+    offline: Option<crate::arch::msi::CommittedMsiVector>,
+}
+
+impl GuiInterruptInstall {
+    fn retain_permanent(mut self) {
+        self.control
+            .take()
+            .expect("GUI DVM interrupt transaction lost control vector")
+            .retain_permanent();
+        self.offline
+            .take()
+            .expect("GUI DVM interrupt transaction lost offline vector")
+            .retain_permanent();
+    }
+}
+
+impl Drop for GuiInterruptInstall {
+    fn drop(&mut self) {
+        if self.control.is_some() || self.offline.is_some() {
+            self.capability.set_function_masked(self.device, true);
+            self.capability.set_enabled(self.device, false);
+            drop(self.offline.take());
+            drop(self.control.take());
+        }
+    }
+}
+
+fn arm_gui_dvm_interrupts(device: crate::arch::pci::PciDevice) -> Option<GuiInterruptInstall> {
     let Some(capability) = device.msix_capability() else {
-        return false;
+        return None;
     };
     if capability.table_entries() != GUI_DVM_MSIX_VECTOR_COUNT {
-        return false;
+        return None;
     }
     let Some(table_resource) = capability.table_resource(device) else {
-        return false;
+        return None;
     };
     let Ok(table_len) = usize::try_from(table_resource.size) else {
-        return false;
+        return None;
     };
     let Ok(table_offset) = usize::try_from(capability.table_offset()) else {
-        return false;
+        return None;
     };
     if table_offset
         .checked_add(MSIX_ENTRY_BYTES * GUI_DVM_MSIX_VECTOR_COUNT as usize)
         .is_none_or(|end| end > table_len)
     {
-        return false;
+        return None;
     }
     capability.set_function_masked(device, true);
     capability.set_enabled(device, false);
     let Some(mut control_lease) = crate::arch::msi::MsiVectorLease::allocate() else {
-        return false;
+        return None;
     };
     if !control_lease.register_handler(gui_dvm_control_interrupt) {
-        return false;
+        return None;
     }
     let Some(mut offline_lease) = crate::arch::msi::MsiVectorLease::allocate() else {
-        return false;
+        return None;
     };
     if !offline_lease.register_handler(gui_dvm_offline_interrupt) {
-        return false;
+        return None;
     }
     let Some(control_message) = control_lease.message() else {
-        return false;
+        return None;
     };
     let Some(offline_message) = offline_lease.message() else {
-        return false;
+        return None;
     };
     let table = crate::driver::mmio::map(table_resource.start, table_len, false).cast::<u8>();
     if table.is_null() {
-        return false;
+        return None;
     }
     unsafe {
         program_msix_entry(table.add(table_offset), control_message);
@@ -1469,9 +1501,12 @@ fn arm_gui_dvm_interrupts(device: crate::arch::pci::PciDevice) -> bool {
     capability.set_enabled(device, true);
     capability.set_function_masked(device, false);
     crate::driver::mmio::unmap(table.cast());
-    control_lease.commit();
-    offline_lease.commit();
-    true
+    Some(GuiInterruptInstall {
+        capability,
+        device,
+        control: Some(control_lease.commit()),
+        offline: Some(offline_lease.commit()),
+    })
 }
 
 unsafe fn program_msix_entry(entry: *mut u8, message: crate::arch::msi::MsiMessage) {

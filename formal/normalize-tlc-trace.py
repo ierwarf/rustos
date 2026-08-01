@@ -9,7 +9,10 @@ import re
 from pathlib import Path
 
 
-STATE = re.compile(r"^State ([0-9]+):(?: <(.+)>)?$")
+# Toolbox-style output prefixes snapshots with "State"; TLC's machine-format
+# stream uses the bare ordinal.  Both name the same counterexample state and
+# must normalize identically for the mutation-evidence hash.
+STATE = re.compile(r"^(?:State )?([0-9]+):(?: <(.+)>)?$")
 ASSIGNMENT = re.compile(r"^/\\ ([A-Za-z_][A-Za-z0-9_]*) = (.*)$")
 
 

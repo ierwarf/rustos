@@ -1,0 +1,10 @@
+X86_64 RescheduleRequestPublication
+"P0 publishes target work before its durable reschedule request"
+{
+uint64_t work=0; uint64_t request=0;
+uint64_t 1:rax; uint64_t 1:rbx;
+}
+P0                 | P1                 ;
+movq $1,(work)     | movq (request),%rax ;
+movq $1,(request)  | movq (work),%rbx    ;
+exists (1:rax=1 /\ 1:rbx=0)

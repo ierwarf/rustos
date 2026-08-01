@@ -90,6 +90,18 @@ pub struct MsiVectorLease {
     committed: bool,
 }
 
+/// Revocable ownership of one published vector and its exact handler.
+///
+/// Device drivers keep this guard until every later transport publication has
+/// succeeded. Dropping it revokes handler authority and returns the bounded
+/// vector; `retain_permanent` is the final one-way commit for boot-lifetime
+/// devices.
+pub struct CommittedMsiVector {
+    vector: u8,
+    handler: usize,
+    retained: bool,
+}
+
 pub fn physical_base() -> Option<u64> {
     let leaf1 = __cpuid(1);
     if leaf1.edx & CPUID_FEATURE_APIC == 0 {
@@ -448,10 +460,35 @@ impl MsiVectorLease {
         })
     }
 
-    /// Publish the reservation after the masked MSI-X entry is complete.
-    pub fn commit(mut self) -> u8 {
+    /// Transfer the reservation into revocable committed ownership.
+    pub fn commit(mut self) -> CommittedMsiVector {
         self.committed = true;
+        CommittedMsiVector {
+            vector: self.vector,
+            handler: self.handler,
+            retained: false,
+        }
+    }
+}
+
+impl CommittedMsiVector {
+    pub const fn vector(&self) -> u8 {
         self.vector
+    }
+
+    /// Permanently retain the vector only after the complete device and
+    /// transport transaction is externally visible and cannot fail.
+    pub fn retain_permanent(mut self) -> u8 {
+        self.retained = true;
+        self.vector
+    }
+}
+
+impl Drop for CommittedMsiVector {
+    fn drop(&mut self) {
+        if !self.retained {
+            release_vector_handler(self.vector, self.handler);
+        }
     }
 }
 
@@ -460,19 +497,27 @@ impl Drop for MsiVectorLease {
         if self.committed {
             return;
         }
-        let Some(index) = vector_index(self.vector) else {
-            return;
-        };
-        let handler_released = if self.handler == 0 {
-            HANDLERS[index].load(Ordering::Acquire) == 0
-        } else {
-            HANDLERS[index]
-                .compare_exchange(self.handler, 0, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-        };
-        if handler_released {
-            ALLOCATED[index].store(false, Ordering::Release);
-        }
+        release_vector_handler(self.vector, self.handler);
+    }
+}
+
+fn release_vector_handler(vector: u8, handler: usize) {
+    let Some(index) = vector_index(vector) else {
+        return;
+    };
+    // ORDERING: AcqRel removes the exact handler publication and observes any
+    // prior owner initialization before making its allocation reusable.
+    let handler_released = if handler == 0 {
+        HANDLERS[index].load(Ordering::Acquire) == 0
+    } else {
+        HANDLERS[index]
+            .compare_exchange(handler, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    };
+    if handler_released {
+        // ORDERING: release makes handler revocation visible before another
+        // allocator may successfully reserve this vector.
+        ALLOCATED[index].store(false, Ordering::Release);
     }
 }
 
@@ -567,6 +612,22 @@ mod tests {
         );
 
         drop(lease);
+        assert_eq!(HANDLERS[index].load(Ordering::Acquire), 0);
+        assert!(!ALLOCATED[index].load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn committed_vector_remains_revocable_until_permanent_publication() {
+        fn handler(_vector: u8) {}
+
+        let mut lease = MsiVectorLease::allocate().expect("bounded test vector");
+        let index = vector_index(lease.vector()).expect("allocated vector index");
+        assert!(lease.register_handler(handler));
+        let committed = lease.commit();
+        assert_eq!(committed.vector(), MSI_VECTOR_FIRST + index as u8);
+        assert!(ALLOCATED[index].load(Ordering::Acquire));
+
+        drop(committed);
         assert_eq!(HANDLERS[index].load(Ordering::Acquire), 0);
         assert!(!ALLOCATED[index].load(Ordering::Acquire));
     }

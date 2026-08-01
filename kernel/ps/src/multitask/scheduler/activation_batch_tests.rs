@@ -98,3 +98,50 @@ fn spawn_handoff_is_fifo_deduplicated_and_precedes_ipc_handoff() {
         Some(second)
     );
 }
+
+#[test]
+fn authority_commit_is_checked_while_the_complete_cohort_is_still_suspended() {
+    let mut scheduler = boxed_scheduler();
+    let base = crate::memory::paging::USER_SPACE_BASE;
+    let user_cs = crate::arch::gdt::user_code_selector().0 as u64;
+    let user_ss = crate::arch::gdt::user_data_selector().0 as u64;
+    let allocate = |scheduler: &mut Scheduler, task_id, offset| {
+        scheduler
+            .allocate_user_slot(
+                task_id,
+                ProcessAddressSpace::empty_for_tests(),
+                UserTaskBootstrap::new(
+                    UserAbi::Linux,
+                    x86_64::VirtAddr::new(base + offset),
+                    x86_64::VirtAddr::new(base + offset + 0x1_000),
+                ),
+                None,
+                crate::arch::pit::divisor_from_micros(2_000) | INTERACTIVE_PIT_DIVISOR_FLAG,
+                user_cs,
+                user_ss,
+                RFLAGS_RESERVED_BIT_1,
+                true,
+                noop_task_entry,
+            )
+            .expect("suspended task slot")
+    };
+    let first = allocate(&mut scheduler, 901, 0x2_000);
+    let second = allocate(&mut scheduler, 902, 0x4_000);
+    let authority_consumed = AtomicBool::new(false);
+
+    assert!(
+        scheduler.activate_suspended_user_tasks_with_commit(&[901, 902], || {
+            authority_consumed.store(true, Ordering::Release);
+        })
+    );
+
+    // The activation helper executes its post-callback suspension assertion
+    // before publication. A regression that publishes before consuming the
+    // authority therefore panics in this call rather than merely changing a
+    // syntactic source-order test.
+    assert!(authority_consumed.load(Ordering::Acquire));
+    assert!(!scheduler.start_suspended[first]);
+    assert!(!scheduler.start_suspended[second]);
+    assert_eq!(scheduler.atomic_activation_handoff_remaining, 2);
+    assert_eq!(scheduler.atomic_activation_pick_hints.len(), 2);
+}

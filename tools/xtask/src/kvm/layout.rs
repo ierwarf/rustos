@@ -1159,7 +1159,7 @@ fn start_dvm_input_relay_unbounded(
         // The input ivshmem broker deliberately tears down the whole fixed
         // topology when either peer disconnects. Keep peer 1 alive across
         // bounded vsock setup failures; otherwise a DVM that becomes ready
-        // just after the first five-second accept deadline can never reconnect.
+        // just after the first ten-second accept deadline can never reconnect.
         let mut sink = loop {
             match InputRingSink::connect(&input_doorbell, &input_ring, Duration::from_secs(1)) {
                 Ok(sink) => break sink,

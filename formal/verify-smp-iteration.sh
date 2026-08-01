@@ -18,24 +18,8 @@ bash formal/selftest.sh
 cargo xtask formal-contracts check
 bash formal/run-source-conformance.sh
 
-mapfile -t models < <(
-    python3 - "$repo_root/formal/contracts.toml" "$profile" <<'PY'
-import sys
-import tomllib
-from pathlib import Path
-
-manifest = tomllib.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-for model in manifest["profiles"][sys.argv[2]]["required_models"]:
-    print(model)
-PY
-)
-[[ "${#models[@]}" -gt 0 ]] || {
-    echo "SMP iteration profile contains no executable models" >&2
-    exit 2
-}
-for model in "${models[@]}"; do
-    bash formal/run-tlc.sh --profile "$profile" "$model"
-done
+FORMAL_SELFTEST_ALREADY_PASSED=1 \
+    bash formal/run-all-tlc.sh --profile "$profile"
 
 python3 formal/write-verification-run.py \
     --root "$repo_root" \

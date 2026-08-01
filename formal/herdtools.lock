@@ -1,0 +1,10 @@
+# Official release archive from https://github.com/herd/herdtools7/releases/tag/7.58
+version = "7.58"
+source_url = "https://github.com/herd/herdtools7/archive/refs/tags/7.58.tar.gz"
+source_sha256 = "1b72798457e678dec781ce914c4bd84dc6bae3c3c044cf4257d0974bf7f066ad"
+package_version = "7.58-1"
+package_url = "http://kr.archive.ubuntu.com/ubuntu/pool/universe/h/herdtools7/herdtools7_7.58-1_amd64.deb"
+package_sha256 = "d9fe029729b25681856399283be73ca41cb1df2a554d81f89ae284213fe502d2"
+binary = "herd7"
+architecture = "x86_64"
+cat = "x86tso-mixed.cat"

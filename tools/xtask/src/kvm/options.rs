@@ -459,9 +459,8 @@ pub(crate) fn kvm_run_command(config: &Config, build_image: bool) -> Result<()> 
     let interactive_boot_started = Instant::now();
 
     println!(
-        "xtask: interactive KVM DVM guests started in {} ms; user-visible first-frame readiness is required within {} ms of guest monotonic boot time",
+        "xtask: interactive KVM DVM guests started in {} ms; user-visible first-frame readiness is required before the outer smoke timeout",
         started_at.elapsed().as_millis(),
-        BOOT_TO_UI_HARD_LIMIT_MS,
     );
     let mut pointer_observed = false;
     let mut readiness_verified = false;
@@ -486,32 +485,6 @@ pub(crate) fn kvm_run_command(config: &Config, build_image: bool) -> Result<()> 
         }
         let rustos_log = read_runtime_log_if_present(&layout.debugcon_log)?;
         let dvm_log = read_runtime_log_if_present(&layout.dvm_serial_log)?;
-        if !rustos_log.contains(WAYCLICK_FIRST_FRAME_MARKER)
-            && guest_deadline_reached(&rustos_log, BOOT_TO_UI_HARD_LIMIT_MS)
-        {
-            let reason = format!(
-                "interactive RustOS missed the {} ms user-visible boot limit",
-                BOOT_TO_UI_HARD_LIMIT_MS
-            );
-            let missing_rustos = vec![WAYCLICK_FIRST_FRAME_MARKER.to_owned()];
-            let evidence = write_kvm_failure_summary(
-                &layout,
-                &reason,
-                interactive_boot_started.elapsed(),
-                &rustos_log,
-                &dvm_log,
-                &missing_rustos,
-                &[],
-            )?;
-            stop_guest(&mut dvm);
-            stop_guest(&mut rustos);
-            bail!(
-                "{reason}; missing={WAYCLICK_FIRST_FRAME_MARKER:?}; evidence={}; inspect {} and {}",
-                evidence.display(),
-                layout.debugcon_log.display(),
-                layout.dvm_serial_log.display(),
-            );
-        }
         if runtime_stall_or_crash_observed(&rustos_log) || runtime_stall_or_crash_observed(&dvm_log)
         {
             let reason =

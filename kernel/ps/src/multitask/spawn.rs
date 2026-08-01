@@ -6,7 +6,7 @@ use kernel_hal::api::cpu;
 use super::{
     MAIN_THREAD_SLICE_MICROS, NEXT_TASK_ID, SpawnTaskError, UserTaskBootstrap, allocate_task_id,
     checked_thread_pit_divisor, initial_task_rflags, kernel_task_entry_trampoline_addr,
-    noop_task_entry, publish_cpu_current_task, scheduler_mut,
+    noop_task_entry, publish_cpu_current_task, publish_scheduler_initialized, scheduler_mut,
 };
 use crate::memory::paging::ProcessAddressSpace;
 use crate::user::process_state::UserProcessState;
@@ -299,6 +299,10 @@ pub fn start(entry: fn(u64)) -> ! {
         scheduler.prepare_current_task_execution();
         let saved_rsp = scheduler.current_saved_rsp();
         drop(scheduler);
+        // ORDERING: publish the complete BSP/AP scheduler image before any
+        // CPU lifecycle becomes SchedulerReady and before timer/IPI leaves may
+        // enter without a redundant global-lock readiness probe.
+        publish_scheduler_initialized();
         for (logical_index, generation) in generations[..cpu_count].iter().copied().enumerate() {
             cpu::transition_lifecycle(
                 u8::try_from(logical_index).expect("scheduler CPU index exceeds u8 capacity"),

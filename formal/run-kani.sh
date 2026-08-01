@@ -15,6 +15,7 @@ installed="$(cargo kani --version | awk 'NR == 1 { print $2 }')"
 cd "$repo_root"
 artifact_dir="${KANI_ARTIFACT_DIR:-$repo_root/build/formal/kani}"
 mkdir -p "$artifact_dir"
+bash formal/run-proof-index.sh
 
 packages=(runtime-control rustos-image-admission driver-domain-protocol rustos-user-abi)
 overall=0
@@ -52,6 +53,10 @@ python3 formal/normalize-kani-results.py \
     --logs "$artifact_dir" \
     --sarif "$artifact_dir/kani.sarif" \
     --summary "$artifact_dir/summary.json"
+jq --arg proof_index_sha256 "$(sha256sum formal/proof-index.toml | awk '{print $1}')" \
+    '. + {proof_index_sha256:$proof_index_sha256}' \
+    "$artifact_dir/summary.json" >"$artifact_dir/summary.next.json"
+mv "$artifact_dir/summary.next.json" "$artifact_dir/summary.json"
 
 if [[ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["status"])' "$artifact_dir/summary.json")" != "passed" ]]; then
     overall=1

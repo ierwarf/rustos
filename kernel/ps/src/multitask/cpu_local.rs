@@ -31,6 +31,11 @@ use super::scheduler::Scheduler;
 
 static SCHEDULER: TrackedSpinLock<Scheduler, { LockClass::Scheduler as u8 }> =
     TrackedSpinLock::new(Scheduler::new());
+// ORDERING: This is a one-way scheduler publication. Interrupt leaves need
+// only know whether the fully initialized scheduler may be entered; taking the
+// global lock merely to read its root slot doubled every SMP timer/IPI
+// transaction.
+static SCHEDULER_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static CURRENT_TASK_SLOTS: [AtomicUsize; nucleus_core::util::lockdep::MAX_TRACKED_CPUS] =
     [const { AtomicUsize::new(0) }; nucleus_core::util::lockdep::MAX_TRACKED_CPUS];
 static CURRENT_TASK_ACTIVE: [AtomicBool; nucleus_core::util::lockdep::MAX_TRACKED_CPUS] =
@@ -48,6 +53,25 @@ static SCHEDULER_OWNER_CPU: AtomicUsize = AtomicUsize::new(NO_SCHEDULER_OWNER);
 static SCHEDULER_OWNER_SLOT: AtomicUsize = AtomicUsize::new(0);
 static SCHEDULER_OWNER_ACQUIRED_NS: AtomicU64 = AtomicU64::new(0);
 static SCHEDULER_OWNER_CALLER: AtomicPtr<Location<'static>> = AtomicPtr::new(ptr::null_mut());
+
+pub(super) fn scheduler_initialized() -> bool {
+    // ORDERING: Acquire observes reset, every AP idle context, and BSP current
+    // execution preparation published before the one-way Release below.
+    SCHEDULER_INITIALIZED.load(Ordering::Acquire)
+}
+
+pub(super) fn publish_scheduler_initialized() {
+    // ORDERING: Release publishes the fully initialized image exactly once.
+    // The scheduler has no supported teardown; duplicate initialization is a
+    // lifecycle violation rather than a state transition that can be retried.
+    // ORDERING: Acquire on failure distinguishes the duplicate publisher.
+    assert!(
+        SCHEDULER_INITIALIZED
+            .compare_exchange(false, true, Ordering::Release, Ordering::Acquire)
+            .is_ok(),
+        "scheduler invariant: initialized lifecycle published twice"
+    );
+}
 
 pub(super) struct SchedulerAccessGuard {
     guard: TrackedSpinGuard<'static, Scheduler, { LockClass::Scheduler as u8 }>,
@@ -292,7 +316,7 @@ pub(super) extern "C" fn commit_context_switch() {
 }
 
 pub(super) fn task_slot_is_running(slot: usize) -> bool {
-    task_running_cpu_in(
+    task_execution_owner_in(
         &CURRENT_TASK_SLOTS,
         &CURRENT_TASK_ACTIVE,
         &TRANSITION_FROM_SLOTS,
@@ -303,7 +327,32 @@ pub(super) fn task_slot_is_running(slot: usize) -> bool {
 }
 
 pub(super) fn task_running_cpu(slot: usize) -> Option<usize> {
-    task_running_cpu_in(
+    task_execution_owner(slot).map(TaskExecutionOwner::cpu)
+}
+
+/// Identifies why a task slot is still owned by a CPU.
+///
+/// `Transition` is deliberately distinct from `Current`: the outgoing task
+/// has already published a reusable saved frame, but its old kernel stack is
+/// still live until the assembly switch release-clears `TRANSITION_ACTIVE`.
+/// A concurrent wake must make that task runnable for the next dispatch; it
+/// must not apply the consumed-frame rule used for a currently executing task.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum TaskExecutionOwner {
+    Current(usize),
+    Transition(usize),
+}
+
+impl TaskExecutionOwner {
+    const fn cpu(self) -> usize {
+        match self {
+            Self::Current(cpu) | Self::Transition(cpu) => cpu,
+        }
+    }
+}
+
+pub(super) fn task_execution_owner(slot: usize) -> Option<TaskExecutionOwner> {
+    task_execution_owner_in(
         &CURRENT_TASK_SLOTS,
         &CURRENT_TASK_ACTIVE,
         &TRANSITION_FROM_SLOTS,
@@ -360,16 +409,16 @@ fn slot_is_running_in(
     transition_active: &[AtomicBool],
     slot: usize,
 ) -> bool {
-    task_running_cpu_in(slots, active, transition_slots, transition_active, slot).is_some()
+    task_execution_owner_in(slots, active, transition_slots, transition_active, slot).is_some()
 }
 
-fn task_running_cpu_in(
+fn task_execution_owner_in(
     slots: &[AtomicUsize],
     active: &[AtomicBool],
     transition_slots: &[AtomicUsize],
     transition_active: &[AtomicBool],
     slot: usize,
-) -> Option<usize> {
+) -> Option<TaskExecutionOwner> {
     assert_eq!(slots.len(), active.len());
     assert_eq!(slots.len(), transition_slots.len());
     assert_eq!(slots.len(), transition_active.len());
@@ -390,8 +439,18 @@ fn task_running_cpu_in(
             && transition_is_active.load(Ordering::Acquire)
             && transition.load(Ordering::Acquire) == slot;
         if owns_current || owns_transition {
+            // A slot may briefly be both the published current and the
+            // transition-from slot on the *same* CPU. Prefer Transition: its
+            // saved frame has been published and a wake must survive the
+            // imminent transition clear. Seeing the slot on two CPUs remains
+            // a fatal ownership violation.
+            let observed = if owns_transition {
+                TaskExecutionOwner::Transition(logical_index)
+            } else {
+                TaskExecutionOwner::Current(logical_index)
+            };
             assert!(
-                owner.replace(logical_index).is_none(),
+                owner.replace(observed).is_none(),
                 "scheduler invariant: one task has duplicate current/transition owners"
             );
         }
@@ -402,8 +461,8 @@ fn task_running_cpu_in(
 #[cfg(test)]
 mod tests {
     use super::{
-        AtomicBool, AtomicUsize, Ordering, slot_has_owner_in, slot_is_running_in,
-        task_running_cpu_in,
+        AtomicBool, AtomicUsize, Ordering, TaskExecutionOwner, slot_has_owner_in,
+        slot_is_running_in, task_execution_owner_in,
     };
 
     #[test]
@@ -443,8 +502,8 @@ mod tests {
             17
         ));
         assert_eq!(
-            task_running_cpu_in(&slots, &active, &transition_slots, &transition_active, 17),
-            Some(1)
+            task_execution_owner_in(&slots, &active, &transition_slots, &transition_active, 17),
+            Some(TaskExecutionOwner::Current(1))
         );
         assert!(!slot_is_running_in(
             &slots,
@@ -490,8 +549,8 @@ mod tests {
             23
         ));
         assert_eq!(
-            task_running_cpu_in(&slots, &active, &transition_slots, &transition_active, 17),
-            Some(1)
+            task_execution_owner_in(&slots, &active, &transition_slots, &transition_active, 17),
+            Some(TaskExecutionOwner::Transition(1))
         );
 
         // ORDERING: Assembly clears the transition only after changing `rsp`.

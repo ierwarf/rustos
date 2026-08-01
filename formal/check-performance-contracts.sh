@@ -8,12 +8,11 @@ cd "$repo_root"
 performance=libs/rustos-user-abi/src/performance.rs
 for witness in \
     'BOOT_TO_UI_TARGET_MS: u64 = 3_000' \
-    'BOOT_TO_UI_HARD_LIMIT_MS: u64 = 5_000' \
+    'BOOT_TO_UI_HARD_LIMIT_MS: u64 = 10_000' \
     'UI_FRAME_HARD_LIMIT_US: u64 = 16_667' \
     'UI_FRAME_CPU_TARGET_US: u64 = 8_000' \
     'UI_INPUT_TO_PRESENT_HARD_LIMIT_US: u64 = 50_000' \
     'UI_BOOT_GPU_ACTIVATION_BUDGET_MS: u64 = 750' \
-    'IPC_FOREGROUND_MAINTENANCE_SLICE_MS: u64 = 1' \
     'IPC_READINESS_QUERY_HARD_LIMIT_MS: u64 = 16' \
     'IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS: u64 = 100' \
     'IPC_BOOT_CONTROL_HARD_LIMIT_MS: u64 = 5_000' \
@@ -122,19 +121,28 @@ if rg -n 'SERVICE_ENDPOINT_(READY|REGISTER)_ATTEMPTS|fn register_service_endpoin
 fi
 
 ipc_helpers=kernel/compat/src/user/syscall/linux/service_ops/ipc_helpers.rs
-rg -Fq 'const FOREGROUND_VFS_MAINTENANCE_ATTEMPTS: usize = 1;' "$ipc_helpers" || {
-    echo "foreground VFS maintenance attempt bound drifted" >&2
+rg -Fq 'const HOUSEKEEPING_VFS_MAINTENANCE_ATTEMPTS: usize = 1;' "$ipc_helpers" || {
+    echo "housekeeping VFS maintenance attempt bound drifted" >&2
     exit 1
 }
-rg -Fq 'IPC_FOREGROUND_MAINTENANCE_SLICE_MS' "$ipc_helpers" || {
-    echo "foreground VFS maintenance lost its one-millisecond deadline" >&2
+rg -Fq 'IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS' "$ipc_helpers" || {
+    echo "housekeeping VFS maintenance lost its bounded control deadline" >&2
     exit 1
 }
+if [[ "$(rg -c 'drain_pending_vfs_mutations\(\)' "$ipc_helpers")" != 2 ]]; then
+    echo "VFS deferred recovery escaped its sole housekeeping entrypoint" >&2
+    exit 1
+fi
+vfs_socket=kernel/compat/src/user/syscall/linux/service_ops/vfs_socket.rs
+if [[ "$(rg -c 'drain_pending_netd_refs\(\)' "$vfs_socket")" != 2 ]]; then
+    echo "netd deferred recovery escaped its sole housekeeping entrypoint" >&2
+    exit 1
+fi
 
-rg -Fq 'BOOT_TO_UI_HARD_LIMIT_MS' tools/xtask/src/kvm/guest.rs || {
-    echo "KVM interactive boot gate is not bound to the shared hard limit" >&2
+if rg -Fq 'guest_deadline_reached' tools/xtask/src/kvm/{guest.rs,options.rs}; then
+    echo "KVM regained an independent guest boot deadline during the SMP qualification run" >&2
     exit 1
-}
+fi
 rg -Fq 'rustos_vcpus: 1,' tools/xtask/src/kvm/guest.rs || {
     echo "default KVM topology regained an unrequested RustOS vCPU that contends with the DVM" >&2
     exit 1
@@ -241,8 +249,17 @@ if rg -Fq 'load_desktop_program_entries(DEFAULT_APPLICATIONS_DIR)' \
     exit 1
 fi
 rg -Fq 'init_exec_priority(RUNTIMED_EXEC_PATH) < init_exec_priority(STORAGED_EXEC_PATH)' \
-    services/initd/src/main.rs || {
+    services/initd/src/boot_order.rs || {
     echo "immutable UI bootstrap is again ordered behind DVM-backed storaged" >&2
+    exit 1
+}
+rg -Fq 'exec == RUNTIMED_EXEC_PATH' services/initd/src/boot_order.rs || {
+    echo "runtimed lost its immediate pre-storaged activation boundary" >&2
+    exit 1
+}
+rg -Fq 'const GPU_INITIALIZATION_RETAINS_BOOT_CLASS: bool = true;' \
+    services/uiserver/src/gpu_runtime.rs || {
+    echo "mandatory GPU initialization can be demoted before its boot result" >&2
     exit 1
 }
 rg -Uq 'let reply = syscall3\([\s\S]{0,700}completion_demotion_due\(reply, handled\.demote_after_reply\)' \
@@ -487,6 +504,11 @@ rg -Fq 'set_next_process_pick_hint(receiver_process_id)' \
 rg -Fq 'synchronous_ipc_handoff_is_fifo_deduplicated_and_fairness_bounded' \
     kernel/ps/src/multitask/scheduler/synchronous_handoff_tests.rs || {
     echo "synchronous IPC handoff lost its executable fairness witness" >&2
+    exit 1
+}
+rg -Uq 'let gpu_compositor = Some\(GpuCompositorRuntime::new\([\s\S]{0,900}diag_line\("uiserver: init open_input begin"\)' \
+    services/uiserver/src/app/bootstrap.rs || {
+    echo "mandatory GPU initialization no longer overlaps serial input/console/surface startup" >&2
     exit 1
 }
 

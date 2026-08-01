@@ -1,6 +1,7 @@
 # model	role	whole_flow	rationale
 authority-identity-lifecycle/AuthorityIdentityLifecycle	refinement	root-authority	Non-reusable process and task identities refine root and delegated authority lifetime.
-atomic-process-activation-batch/AtomicProcessActivationBatch	refinement	atomic-process-activation-batch	Exact requester binding, complete capability/task preflight, atomic runnable publication, one-shot consumption, and requester-exit revoke refine startup cohort activation.
+atomic-process-activation-batch/AtomicProcessActivationBatch	refinement	atomic-process-activation-batch	Exact requester binding, complete capability/task preflight, lock-held one-shot consumption before atomic runnable publication, and requester-exit revoke refine startup cohort activation.
+cpu-online-lifecycle/CpuOnlineLifecycle	refinement	cpu-online-lifecycle	Generation-bound private architecture and scheduler readiness must precede Online dispatch authority.
 cpu-affinity-observation/CpuAffinityObservation	refinement	cpu-affinity-observation	Kernel-stamped dense Online topology and strict service-side validation refine Linux and Windows logical processor observations without exposing raw APIC identity.
 task-affinity-lifecycle/TaskAffinityLifecycle	refinement	task-affinity-lifecycle	Nonempty Online-subset task and process masks, exact target ownership, forced migration, previous-mask return, fork inheritance, exec preservation, and current-processor observation refine Linux and Windows affinity ABI.
 clocksource-deadline/ClocksourceDeadline	refinement	monotonic-deadline-lifecycle	The clocksource model proves the deadline flow's time-domain and catch-up invariants.
@@ -33,6 +34,7 @@ gui-dvm-pixel-authority/GuiDvmPixelAuthority	refinement	gpu-frame-lifecycle	Pixe
 gui-dvm-surface/GuiDvmSurface	refinement	gpu-frame-lifecycle	Surface bounds and generation ownership refine frame payload admission.
 input-readiness/InputReadiness	refinement	input-delivery-lifecycle	Check-arm-recheck readiness refines policy queue delivery.
 ipc-priority-inheritance/IpcPriorityInheritance	refinement	scheduler-dispatch	Reply-scoped donation refines scheduler dependency progress.
+ipc-priority-queue/IpcPriorityQueue	refinement	scheduler-dispatch	Kernel-derived priority ordering with FIFO lanes and a bounded System burst refines synchronous service progress without ordinary-call starvation.
 ivshmem-pairing/IvshmemPairing	refinement	dvm-control-ingress	Exact peer pairing and disconnect refine DVM control lifetime.
 kernel-resource-accounting/KernelResourceAccounting	refinement	kernel-resource-lifecycle	Owner-scoped endpoint, shared-backing, and task ceilings refine bounded kernel resource admission and reclaim.
 memfd-seal-lifecycle/MemfdSealLifecycle	refinement	memory-map	Seal, mapping, resize, and release serialize shared-memory mapping authority.
@@ -48,6 +50,7 @@ scheduler-admission/SchedulerAdmission	refinement	scheduler-dispatch	Strict-clas
 scheduler-cpu-distribution/SchedulerCpuDistribution	refinement	scheduler-dispatch	Bounded class bursts and per-task wait age refine dispatch fairness.
 scheduler-thread-demotion/SchedulerThreadDemotion	refinement	scheduler-dispatch	Base-class demotion, terminal bootstrap-reply custody, and donation preservation refine effective class.
 scheduler-wakeup/SchedulerWakeup	refinement	scheduler-lifecycle	Arm, token-only wake of a running task with no published frame, blocked-frame wake, atomic commit-reschedule, exact dispatch, waiter cleanup before timer acknowledgement, cancel, and retire refine task wait lifetime.
+msi-vector-lifecycle/MsiVectorLifecycle	refinement	msi-vector-ingress	Lease, exact handler bind, revocable commit, route, final provider publication, permanent retention, and atomic failed-publication rollback refine MSI-X authority lifetime.
 smp-release-admission/SmpReleaseAdmission	refinement	smp-release-admission	All-or-nothing multi-vCPU prerequisite admission prevents configuration from masquerading as SMP evidence.
 smp-reschedule-ipi/SmpRescheduleIpi	refinement	smp-reschedule-ipi-lifecycle	Per-CPU durable requests, coalesced fixed IPIs, locked deferral, and safe-point consumption refine cross-CPU rescheduling.
 scheduler-cpu-ownership/SchedulerCpuOwnership	refinement	scheduler-cpu-ownership	CPU-local current-task uniqueness, two-phase incoming reservation and outgoing-stack retention through the assembly RSP switch, IRQ-atomic pending-to-held acquisition, exact preemption-unit accounting, guard pinning, safe dispatch, and fail-closed invalid release refine scheduler execution ownership.
@@ -64,11 +67,19 @@ trusted-ui-boundary/TrustedUiBoundary	refinement	wayland-client-ingress	Trusted 
 ui-frame-budget/UiFrameBudget	refinement	gpu-frame-lifecycle	Main-loop budget and worker isolation refine frame progress.
 ui-main-loop-wakeup/UiMainLoopWakeup	refinement	gpu-frame-lifecycle	Atomic input-or-deadline wakeup refines idle main-loop progress.
 ui-input-motion/UiInputMotion	refinement	input-delivery-lifecycle	Motion coalescing and bounded delivery refine input lifecycle.
+input-ingestion-worker/InputIngestionWorker	refinement	input-delivery-lifecycle	Retained session-authority batches and bounded retry refine authenticated input delivery.
+userspace-wait-set/UserspaceWaitSet	refinement	waitset	Exact provider check-arm-recheck and generation/epoch observation refine generic wait-set readiness.
+service-mutation-recovery/ServiceMutationRecovery	refinement	waitset	Exact replay-safe epoll control mutations and retained checkpoint state refine persistent interest-list admission and cleanup.
 vfio-release-authorization/VfioReleaseAuthorization	refinement	boot-storage-handoff	Exact release authorization refines VFIO handback.
 wayland-frame-pacing/WaylandFramePacing	refinement	gpu-frame-lifecycle	Coalesced presentation and callback permits refine frame completion.
 rootd-bootstrap/RootdBootstrap	refinement	commercial-product-boot	Root bootstrap readiness refines the first absolute product boot deadline.
 input-ingestion-worker/InputIngestionWorker	refinement	commercial-product-boot	Authenticated policy-consumer readiness refines the interactive input milestone.
 dvm-display-readiness/DvmDisplayReadiness	refinement	commercial-product-boot	Generation-bound display admission refines the interactive provider milestone.
 dvm-block-startup/DvmBlockStartup	refinement	commercial-product-boot	Generation-bound block readiness refines both product boot topologies.
+product-boot/ProductBoot	refinement	commercial-product-boot	Sealed snapshot, active image, and first-frame authority chain refine the interactive product boot terminal.
 ui-frame-budget/UiFrameBudget	refinement	commercial-product-boot	The first presented frame refines the user-visible interactive terminal.
 ui-main-loop-wakeup/UiMainLoopWakeup	refinement	commercial-product-boot	Consecutive active UI windows require input and monotonic deadline wakes to remain live.
+acceptance-profile-publication/AcceptanceProfilePublication	refinement	commercial-product-boot	Bounded late registry observation refines acceptance-profiler activation without hot-path polling or permanent negative caching.
+exec-address-space-transaction/ExecAddressSpaceTransaction	refinement	process-address-space-lifecycle	Generation-bound reservation, retirement admission, root installation, and mandatory ownership transfer refine exec across scheduler and process-state lock domains.
+gpu-submit-transaction/GpuSubmitTransaction	refinement	gpu-frame-lifecycle	Compiler checkpoint, transport acceptance, exact rejection rollback, and full retry refine GPU producer publication.
+user-stack-growth/UserStackGrowth	refinement	exception-retirement	Scheduler planning, nonblocking process-state mapping, exact generation commit, and task-only failure refine recoverable grow-down faults.

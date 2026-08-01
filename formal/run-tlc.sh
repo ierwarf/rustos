@@ -81,6 +81,7 @@ log="$artifact_dir/tlc.log"
 summary="$artifact_dir/summary.json"
 state_dir="$(mktemp -d "${TMPDIR:-/tmp}/rustos-tlc.XXXXXX")"
 trap 'rm -rf "$state_dir"' EXIT
+tool_status="$state_dir/tlc-exit-status"
 
 deadlock_args=()
 if [[ "$deadlock_policy" == intentional-terminal ]]; then
@@ -90,20 +91,30 @@ fi
 set +e
 (
     cd "$artifact_dir"
+    export TLC_EXIT_STATUS_FILE="$tool_status"
     timeout --signal=TERM --kill-after=10 "$timeout_seconds" \
+        bash -c '
+            "$@"
+            tool_result=$?
+            printf "%s\n" "$tool_result" > "$TLC_EXIT_STATUS_FILE"
+            exit "$tool_result"
+        ' tlc-run \
         java -XX:+UseParallelGC -jar "$jar" \
-        -workers "$workers" \
-        -fp "$fingerprint" \
-        -seed "$seed" \
-        -coverage 1 \
-        "${deadlock_args[@]}" \
-        -generateSpecTE nomonolith \
-        -metadir "$state_dir" \
-        -config "$config" \
-        "$spec"
+            -workers "$workers" \
+            -fp "$fingerprint" \
+            -seed "$seed" \
+            -coverage 1 \
+            "${deadlock_args[@]}" \
+            -generateSpecTE nomonolith \
+            -metadir "$state_dir" \
+            -config "$config" \
+            "$spec"
 ) >"$log" 2>&1
 result=$?
 set -e
+if [[ -s "$tool_status" ]]; then
+    result="$(<"$tool_status")"
+fi
 
 if [[ "$result" -ne 0 ]]; then
     # TLC writes SpecTE beside the input module even when its process cwd and

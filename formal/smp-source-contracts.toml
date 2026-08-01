@@ -29,14 +29,44 @@ regex = '(?m)^//![ \t]+BSP task scheduler\b'
 reason = "runtime scheduler ownership is SMP-wide"
 
 [[forbidden_patterns]]
-scope = "kernel/hal/src/arch/rtc.rs"
-regex = '(?m)^//![ \t]+BSP deadline registry\b'
-reason = "deadline wake delivery is admitted for every online CPU"
+scope = "kernel/ps/src/multitask/irq.rs"
+regex = '(?m)^    crate::arch::rtc::service_clock_event\(\);$'
+reason = "the single global deadline base must not be expired independently by every AP clockevent"
 
 [[forbidden_patterns]]
 scope = "kernel/ps/src/multitask/scheduler.rs"
 regex = 'crate::debug::println!'
 reason = "the scheduler raw owner cannot enter synchronous logging"
+
+[[forbidden_patterns]]
+scope = "kernel/ps/src/multitask/scheduler.rs"
+regex = 'NonNull<Option<LinuxThreadState>>|addr_of_mut!\([^\n]*linux_thread_state'
+reason = "scheduler-owned Linux thread state must not escape as an untracked mutable data pointer"
+
+[[forbidden_patterns]]
+scope = "kernel/ps/src/multitask/scheduler/linux_thread_state.rs"
+regex = 'NonNull<Option<LinuxThreadState>>|addr_of_mut!\([^\n]*linux_thread_state'
+reason = "generation binding may point only to the stable tracked lock, never its mutable payload"
+
+[[forbidden_patterns]]
+scope = "kernel/ps/src/multitask/scheduler.rs"
+regex = 'process_table::replace_for_exec\s*\('
+reason = "exec process-state replacement must run only after the scheduler owner is released"
+
+[[forbidden_patterns]]
+scope = "kernel/ps/src/multitask/scheduler.rs"
+regex = 'map_zeroed_user_pages_at|try_with_process_state_mut'
+reason = "recoverable stack mapping belongs to process state after releasing the scheduler raw owner"
+
+[[forbidden_patterns]]
+scope = "kernel/hal/src/arch/simd.rs"
+regex = '(?i)(?:required_bytes|state_bytes|xsave_bytes)[^\n=]*=[^\n;]*xsave_leaf\.eax'
+reason = "CPUID.0Dh:0 EAX is an XCR0 feature bitmap; enabled XSAVE byte size comes from EBX"
+
+[[forbidden_patterns]]
+scope = "kernel/**/*.rs"
+regex = 'shared_futex_word_phys|FutexKey::Shared\s*\{\s*word_phys'
+reason = "shared futex identity must use stable generational backing plus offset, never a physical frame"
 
 [[forbidden_patterns]]
 scope = "kernel/ps/src/multitask/scheduler.rs"
@@ -72,6 +102,146 @@ reason = "batch activation evidence must run only after the capability registry 
 scope = "kernel/compat/src/user/syscall/linux/proc_broker_ops.rs"
 regex = '(?s)fn syscall_linux_rustos_proc_activate_broker.*?let mut activations = DEFERRED_ACTIVATIONS\.lock\(\);(?:(?!drop\(activations\)).)*record_milestone'
 reason = "single activation evidence must run only after the capability registry guard is released"
+
+# xAPIC MMIO and IA32_TSC_DEADLINE are not mutually serializing. The local LVT
+# must be unmasked and fenced before the first deadline is armed, or a vCPU
+# descheduled in the masked window can permanently lose its first clockevent.
+[[required_sequences]]
+path = "kernel/hal/src/arch/timer.rs"
+tokens = [
+    "lvt.write_volatile(",
+    "APIC_LVT_TSC_DEADLINE,",
+    "_mm_mfence();",
+    "NEXT_DEADLINE[logical_index].store(deadline, Ordering::Release);",
+    "write_deadline(deadline);",
+]
+
+[[required_sequences]]
+path = "kernel/ps/src/multitask/irq.rs"
+tokens = [
+    "fn timer_interrupt_dispatch(context_ptr: *mut SavedContext)",
+    "if logical_index == 0 {",
+    "crate::arch::rtc::service_clock_event();",
+    "if !scheduler_initialized()",
+]
+
+[[required_sequences]]
+path = "kernel/ps/src/multitask/spawn.rs"
+tokens = [
+    "scheduler.prepare_current_task_execution();",
+    "drop(scheduler);",
+    "publish_scheduler_initialized();",
+    "cpu::transition_lifecycle(",
+]
+
+[[required_sequences]]
+path = "kernel/ps/src/multitask/irq.rs"
+tokens = [
+    "fn complete_clockevent(logical_index: usize)",
+    "crate::arch::timer::arm_next_tick();",
+    "crate::arch::msi::local_apic_eoi();",
+    "record_first_cpu_event(",
+]
+
+# The legacy RTC line is also an interrupt entry. Its lockdep/ownership guard
+# must cover device service, scheduler work, EOI, and the returned stack—not
+# merely the small HAL acknowledgement leaf.
+[[required_sequences]]
+path = "kernel/ps/src/multitask/irq.rs"
+tokens = [
+    "fn rtc_interrupt_dispatch(context_ptr: *mut SavedContext)",
+    "let _irq_context = nucleus_core::util::lockdep::enter_irq_context();",
+    "crate::arch::rtc::on_interrupt();",
+    "scheduler.on_timer_interrupt(current_rsp)",
+    "crate::arch::pic::send_eoi(crate::arch::pic::PIC_2_OFFSET);",
+]
+
+# Shared futex comparison and queue movement are one kernel linearization
+# point. Waking the selected tasks is intentionally after the table guard so
+# scheduler acquisition never nests below the futex owner.
+[[required_sequences]]
+path = "kernel/compat/src/user/syscall/linux/service_ops/futex_thread.rs"
+tokens = [
+    "fn futex_wait(",
+    "let mut waiters = FUTEX_WAITERS.lock();",
+    ".atomic_load_user_u32(uaddr)",
+    "register_futex_waiter_in(",
+    "commit_block_current_task_and_yield()",
+]
+
+[[required_sequences]]
+path = "kernel/compat/src/user/syscall/linux/service_ops/futex_thread.rs"
+tokens = [
+    "fn futex_cmp_requeue(",
+    "let mut waiters = FUTEX_WAITERS.lock();",
+    ".atomic_load_user_u32(uaddr)",
+    "select_requeue_futex_waiters(",
+    "wake_selected_futex_tasks(&task_ids, wake_count)",
+]
+
+# The BSP publishes one immutable migration profile; APs consume that profile
+# before scheduling and must verify both its enabled size and component layout.
+[[required_sequences]]
+path = "kernel/hal/src/arch/simd.rs"
+tokens = [
+    "SIMD_PROFILE_STATE.store(SIMD_PROFILE_READY, Ordering::Release);",
+    "unsafe fn configure_published_profile()",
+    "SIMD_PROFILE_STATE.load(Ordering::Acquire)",
+    "let required_bytes = (enabled_leaf.ebx as usize)",
+    "XSTATE_LAYOUT_FINGERPRINT.load(Ordering::Acquire)",
+]
+
+# MSI-X ownership remains revocable through every fallible provider step. The
+# irreversible retain is ordered after the public installed flag.
+[[required_sequences]]
+path = "kernel/io-manager/src/io/dvm_block.rs"
+tokens = [
+    "let Some(interrupt_install) = arm_block_ring_interrupt(device)",
+    "*guard = Some(state);",
+    "INSTALLED.store(true, Ordering::Release);",
+    "interrupt_install.retain_permanent();",
+]
+
+[[required_sequences]]
+path = "kernel/io-manager/src/io/dvm_display.rs"
+tokens = [
+    "let Some(interrupt_install) = arm_gui_dvm_interrupts(pool.device)",
+    "INSTALLED.store(true, Ordering::Release);",
+    "interrupt_install.retain_permanent();",
+]
+
+# Recoverable stack faults are a three-domain transaction.  The scheduler
+# snapshots immutable identity, process state applies without waiting, and the
+# scheduler revalidates the same task/root/stack before metadata publication.
+[[required_sequences]]
+path = "kernel/ps/src/multitask/current.rs"
+tokens = [
+    "prepare_current_user_stack_growth_on_fault",
+    "try_with_process_state_mut",
+    "commit_current_user_stack_growth",
+    "retire_current_user_task_due_to_fault",
+]
+
+# Exec authorization linearizes against process exit before scheduler root
+# installation.  Once installed, the exact reservation must complete process
+# ownership transfer even when a later exit marker wins.
+[[required_sequences]]
+path = "kernel/ps/src/multitask/current.rs"
+tokens = [
+    "begin_exec(process_handle)",
+    "authorize_exec(exec_reservation)",
+    "scheduler_mut().exec_current_user_process",
+    "process_table::replace_for_exec(",
+]
+
+[[required_sequences]]
+path = "kernel/compat/src/user/syscall/linux/service_ops/futex_thread.rs"
+tokens = [
+    "shared_futex_backing_key(uaddr)",
+    "kernel_generated_futex_key_candidates(",
+    "Some(shared) => [Some(shared), Some(private)]",
+    "wake_futex_waiter_candidates(",
+]
 
 # Each named authority must remain a bounded dense logical-CPU array. This
 # rejects accidental regression to a scalar singleton even when the scalar is

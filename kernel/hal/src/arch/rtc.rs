@@ -1,4 +1,4 @@
-//! Global monotonic deadline registry and per-CPU clockevent wake delivery.
+//! Global monotonic deadline registry and single-owner wake delivery.
 //!
 //! - **Owner:** `kernel-hal` owns deadline records; the scheduler owns task
 //!   block epochs and callers own condition rechecks.
@@ -7,6 +7,7 @@
 //! - **Lifecycle:** Register, recheck, expire/notify, resume, and disarm retain
 //!   one exact waiter until its owner acknowledges cleanup.
 //! - **Concurrency:** The tracked deadline lock is bounded and allocation-free;
+//!   CPU0 owns expiry delivery while AP clockevents remain scheduler-local.
 //!   IRQ work records wakeups and leaves policy to schedulable context.
 //! - **Failure:** Cancel, nondeadline wake, timeout, and retirement are
 //!   idempotent and reject stale task identities.
@@ -380,15 +381,17 @@ pub fn on_interrupt() {
     RTC_TICKS_COMPLETED.fetch_add(1, Ordering::AcqRel);
 }
 
-/// Services absolute monotonic deadlines from any reliable clockevent. PIT
-/// calls this before each scheduler pick; therefore a delayed or coalesced
-/// interrupt catches up all expired waiters from the clocksource rather than
-/// extending every timeout by the number of lost RTC edges.
+/// Services the single global absolute-deadline base from its CPU0 owner. PIT
+/// calls this before each BSP scheduler pick; therefore a delayed or coalesced
+/// owner interrupt catches up all expired waiters from the clocksource rather
+/// than extending every timeout by the number of lost edges. AP LAPIC timers
+/// must not also expire this base: an expired waiter deliberately remains
+/// registered until its task acknowledges wakeup, so multi-CPU delivery would
+/// multiply the same notification and scheduler-lock acquisition by CPU count.
 pub fn service_clock_event() {
-    // Both callers are hardware clockevent leaves (PIT scheduling and RTC).
-    // Enter here rather than relying on one IDT wrapper so the shared absolute
-    // deadline table is always treated as IRQ-owned, including the low-level
-    // timer assembly path which bypasses the generic PIC handler.
+    // Both callers are CPU0 hardware clockevent leaves (PIT scheduling and
+    // legacy RTC). Enter here rather than relying on one IDT wrapper so the
+    // shared absolute deadline table is always treated as IRQ-owned.
     let _irq_context = nucleus_core::util::lockdep::enter_irq_context();
     let now_ticks = ticks();
     wake_ready_sleepers(now_ticks);

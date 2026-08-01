@@ -22,6 +22,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ptr;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use spin::Mutex;
 use x86_64::PhysAddr;
@@ -31,6 +32,7 @@ use crate::user::handles::{FileHandleSeekError, FileHandleSeekWhence};
 use crate::user::linux as linux_abi;
 
 const PAGE_SIZE: usize = 4096;
+static NEXT_MEMFD_OBJECT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum MemfdError {
@@ -52,6 +54,7 @@ struct MemfdState {
 
 #[derive(Debug)]
 struct MemfdObject {
+    object_id: u64,
     state: Mutex<MemfdState>,
 }
 
@@ -85,6 +88,7 @@ impl MemfdHandle {
             linux_abi::F_SEAL_SEAL as u32
         };
         let object = Arc::new(MemfdObject {
+            object_id: allocate_memfd_object_id(),
             state: Mutex::new(MemfdState {
                 name,
                 len: 0,
@@ -272,10 +276,26 @@ impl MemfdHandle {
 }
 
 impl MemfdMappingHold {
+    /// Stable object identity shared by every mapping of this memfd. IDs are
+    /// never recycled, so an unmap/remap cannot alias a sleeping futex key.
+    pub fn object_id(&self) -> u64 {
+        self.token.object.object_id
+    }
+
     pub fn path(&self) -> String {
         let state = self.token.object.state.lock();
         alloc::format!("anon_inode:[memfd:{}]", state.name)
     }
+}
+
+fn allocate_memfd_object_id() -> u64 {
+    // ORDERING: identity allocation does not publish object contents; atomic
+    // modification is required only to make IDs unique across CPUs.
+    NEXT_MEMFD_OBJECT_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1).filter(|next| *next != 0)
+        })
+        .unwrap_or_else(|_| panic!("memfd object identity exhausted"))
 }
 
 impl Drop for MemfdMappingToken {
@@ -438,5 +458,15 @@ mod tests {
             next_mapping_counts(1, usize::MAX, true),
             Err(MemfdError::Busy)
         );
+    }
+
+    #[test]
+    fn memfd_objects_receive_nonzero_never_reused_futex_identities() {
+        let first = MemfdHandle::new(String::from("first"), true);
+        let second = MemfdHandle::new(String::from("second"), true);
+        let first_id = first.object().object_id;
+        let second_id = second.object().object_id;
+        assert_ne!(first_id, 0);
+        assert_ne!(first_id, second_id);
     }
 }

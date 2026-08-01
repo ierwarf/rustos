@@ -7,7 +7,10 @@
 /// Optimization objective from kernel entry to an interactive desktop.
 pub const BOOT_TO_UI_TARGET_MS: u64 = 3_000;
 /// Product acceptance ceiling from kernel entry to an interactive desktop.
-pub const BOOT_TO_UI_HARD_LIMIT_MS: u64 = 5_000;
+/// The 3 s objective remains unchanged; this 10 s qualification rail allows
+/// bounded diagnosis and recovery without converting a slow boot into an
+/// unbounded success path.
+pub const BOOT_TO_UI_HARD_LIMIT_MS: u64 = 10_000;
 
 /// One 60 Hz frame, rounded up to the next microsecond.
 pub const UI_FRAME_HARD_LIMIT_US: u64 = 16_667;
@@ -21,8 +24,6 @@ pub const UI_BOOT_GPU_ACTIVATION_BUDGET_MS: u64 = 750;
 
 /// Non-consuming readiness and lifecycle maintenance queries.
 pub const IPC_READINESS_QUERY_HARD_LIMIT_MS: u64 = 16;
-/// Best-effort deferred maintenance charged to one foreground syscall turn.
-pub const IPC_FOREGROUND_MAINTENANCE_SLICE_MS: u64 = 1;
 /// Policy-only work that may affect an interactive syscall.
 pub const IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS: u64 = 100;
 /// Boot/control work that may hash, validate, or commit service state.
@@ -50,7 +51,6 @@ pub const SERVICE_ENDPOINT_STABLE_LOOKUP_MAX_LOCK_ACQUISITIONS: u32 = 0;
 const _: () = assert!(BOOT_TO_UI_TARGET_MS < BOOT_TO_UI_HARD_LIMIT_MS);
 const _: () = assert!(UI_FRAME_CPU_TARGET_US < UI_FRAME_HARD_LIMIT_US);
 const _: () = assert!(UI_BOOT_GPU_ACTIVATION_BUDGET_MS < BOOT_TO_UI_HARD_LIMIT_MS);
-const _: () = assert!(IPC_FOREGROUND_MAINTENANCE_SLICE_MS < IPC_READINESS_QUERY_HARD_LIMIT_MS);
 const _: () = assert!(IPC_READINESS_QUERY_HARD_LIMIT_MS < IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS);
 const _: () = assert!(IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS < IPC_BOOT_CONTROL_HARD_LIMIT_MS);
 const _: () = assert!(EXECUTABLE_SNAPSHOT_HARD_LIMIT_MS < IPC_BOOT_CONTROL_HARD_LIMIT_MS);

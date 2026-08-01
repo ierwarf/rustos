@@ -1,5 +1,5 @@
 pub use crate::ipc::{
-    EndpointReceived, EndpointReceivedWithSender, EndpointResponseTake,
+    EndpointCallPriority, EndpointReceived, EndpointReceivedWithSender, EndpointResponseTake,
     EndpointResponseWithHandles, EndpointWakeSet, IpcError, KernelEndpointHandle,
     KernelReplyHandle, KernelSharedRegionHandle, KernelSharedRegionMappingHold,
     KernelTransferredHandle, MAX_ENDPOINT_WAKE_TASKS,
@@ -7,7 +7,8 @@ pub use crate::ipc::{
 
 pub mod endpoint {
     pub use crate::ipc::{
-        EndpointWakeSet, IpcError, KernelEndpointHandle, KernelReplyHandle, KernelTransferredHandle,
+        EndpointCallPriority, EndpointWakeSet, IpcError, KernelEndpointHandle, KernelReplyHandle,
+        KernelTransferredHandle,
     };
 
     pub fn create() -> Result<KernelEndpointHandle, IpcError> {
@@ -41,6 +42,25 @@ pub mod endpoint {
             caller_task_id,
             request,
             attached_handles,
+        )
+    }
+
+    /// Enqueues using a scheduler-derived class. Callers must not translate a
+    /// user-supplied request field into this value: it is kernel scheduling
+    /// authority, not service protocol policy.
+    pub fn enqueue_call_with_handles_and_priority(
+        endpoint: KernelEndpointHandle,
+        caller_task_id: u64,
+        request: &[u8],
+        attached_handles: &[KernelTransferredHandle],
+        priority: EndpointCallPriority,
+    ) -> Result<(KernelReplyHandle, Option<u64>), IpcError> {
+        crate::ipc::enqueue_endpoint_call_with_handles_and_priority(
+            endpoint,
+            caller_task_id,
+            request,
+            attached_handles,
+            priority,
         )
     }
 
@@ -252,6 +272,7 @@ pub use endpoint::{
     create_for_process as create_endpoint_for_process, create_for_task as create_endpoint_for_task,
     enqueue_call as enqueue_endpoint_call,
     enqueue_call_with_handles as enqueue_endpoint_call_with_handles,
+    enqueue_call_with_handles_and_priority as enqueue_endpoint_call_with_handles_and_priority,
     fail_owned_by_process as fail_endpoints_owned_by_process,
     fail_owned_by_task as fail_endpoints_owned_by_task, recv as recv_endpoint,
     recv_with_limit as recv_endpoint_with_limit,

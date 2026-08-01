@@ -58,6 +58,19 @@ pub struct ProcessRef {
     state_ptr: NonNull<ProcessStateLock<UserProcessState>>,
 }
 
+/// Generation-bound authority for one exec ownership transfer.
+///
+/// `begin_exec` seals thread attachment. `authorize_exec` is the linearization
+/// point against process exit, and a scheduler commit carrying an authorized
+/// reservation must be followed by an infallible process-state ownership
+/// transfer even if exit is published immediately afterward.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExecReservation {
+    handle: ProcessHandle,
+    expected_mm_generation: u32,
+    next_mm_generation: u32,
+}
+
 impl ProcessRef {
     pub const fn process_id(&self) -> u64 {
         self.process_id
@@ -71,6 +84,16 @@ impl ProcessRef {
     pub fn with_state_mut<R>(&self, f: impl FnOnce(u64, &mut UserProcessState) -> R) -> R {
         let mut state = unsafe { self.state_ptr.as_ref() }.lock();
         f(self.process_id, &mut state)
+    }
+
+    pub fn try_with_state_mut<R>(
+        &self,
+        f: impl FnOnce(u64, &mut UserProcessState) -> R,
+    ) -> Option<R> {
+        // SAFETY: ProcessRef's retained table reference pins the allocation;
+        // ProcessStateLock supplies the exclusive mutable access.
+        let mut state = unsafe { self.state_ptr.as_ref() }.try_lock()?;
+        Some(f(self.process_id, &mut state))
     }
 }
 
@@ -87,6 +110,7 @@ struct ProcessObject {
     thread_count: usize,
     mm_generation: u32,
     exec_in_progress: bool,
+    exec_commit_authorized: bool,
     exiting: bool,
     queued_for_reap: bool,
     exit_status: Option<i32>,
@@ -104,6 +128,7 @@ impl ProcessObject {
             thread_count: 1,
             mm_generation: 1,
             exec_in_progress: false,
+            exec_commit_authorized: false,
             exiting: false,
             queued_for_reap: false,
             exit_status: None,
@@ -348,6 +373,22 @@ pub fn with_process_state_mut<R>(
     Some(process.with_state_mut(f))
 }
 
+/// Executes one nonblocking process-state mutation.
+///
+/// Exception recovery uses this instead of waiting on a task-owned lock: a
+/// page fault may be interrupted by remote exec/exit, and parking the faulting
+/// task before its exception frame has a committed continuation would lose the
+/// sole recovery owner. `None` means either a stale process generation or
+/// lock contention; both make the user fault fail closed without panicking the
+/// kernel.
+pub fn try_with_process_state_mut<R>(
+    handle: ProcessHandle,
+    f: impl FnOnce(u64, &mut UserProcessState) -> R,
+) -> Option<R> {
+    let process = retain_process(handle)?;
+    process.try_with_state_mut(f)
+}
+
 pub fn with_process_state_by_pid_mut<R>(
     process_id: u64,
     f: impl FnOnce(&mut UserProcessState) -> R,
@@ -365,24 +406,24 @@ pub fn with_process_state_by_pid<R>(
 }
 
 pub fn replace_for_exec(
-    handle: ProcessHandle,
+    reservation: ExecReservation,
     address_space: ProcessAddressSpace,
     linux_process_state: crate::user::linux::LinuxProcessState,
     linux_memory_map: crate::user::linux::LinuxMemoryMapState,
     linux_runtime_profile: crate::user::linux::LinuxRuntimeProfile,
     exec_path: &str,
 ) -> Option<alloc::vec::Vec<crate::user::handles::KernelHandle>> {
-    let process = retain_process(handle)?;
+    let process = retain_process(reservation.handle)?;
     process.with_state_mut(|_, state| {
-        // State replacement and the process-table exit marker are one
-        // transaction. If exit won the table lock, a stale exec preparation
-        // must not mutate the address space or clear the exit decision.
+        // Authorization already linearized exec against exit before the new
+        // root could become active. Once Scheduler installs that root this
+        // ownership transfer is deliberately independent of a later `exiting`
+        // marker: rejecting here would drop the CPU's active address space.
         let mut table = PROCESS_TABLE.lock();
-        let object = table.lookup_object_mut(handle)?;
-        if !exec_may_replace(object) {
+        let object = table.lookup_object_mut(reservation.handle)?;
+        if !exec_commit_may_transfer(object, reservation) {
             return None;
         }
-        let next_mm_generation = ProcessTable::next_generation(object.mm_generation)?;
         let closed = state.replace_for_exec(
             address_space,
             linux_process_state,
@@ -390,35 +431,70 @@ pub fn replace_for_exec(
             linux_runtime_profile,
             exec_path,
         );
-        object.mm_generation = next_mm_generation;
+        object.mm_generation = reservation.next_mm_generation;
         object.exec_in_progress = false;
-        object.queued_for_reap = false;
+        object.exec_commit_authorized = false;
         Some(closed)
     })
 }
 
 fn exec_may_replace(object: &ProcessObject) -> bool {
-    object.exec_in_progress && !object.exiting && object.thread_count == 1
+    object.exec_in_progress
+        && !object.exec_commit_authorized
+        && !object.exiting
+        && object.thread_count == 1
 }
 
-pub fn begin_exec(handle: ProcessHandle) -> Option<()> {
+fn exec_reservation_matches(object: &ProcessObject, reservation: ExecReservation) -> bool {
+    object.exec_in_progress
+        && object.mm_generation == reservation.expected_mm_generation
+        && ProcessTable::next_generation(object.mm_generation)
+            == Some(reservation.next_mm_generation)
+}
+
+fn exec_commit_may_transfer(object: &ProcessObject, reservation: ExecReservation) -> bool {
+    exec_reservation_matches(object, reservation) && object.exec_commit_authorized
+}
+
+pub fn begin_exec(handle: ProcessHandle) -> Option<ExecReservation> {
     let mut table = PROCESS_TABLE.lock();
     let object = table.lookup_object_mut(handle)?;
     if object.exiting || object.exec_in_progress {
         return None;
     }
+    let next_mm_generation = ProcessTable::next_generation(object.mm_generation)?;
     object.exec_in_progress = true;
-    Some(())
+    object.exec_commit_authorized = false;
+    Some(ExecReservation {
+        handle,
+        expected_mm_generation: object.mm_generation,
+        next_mm_generation,
+    })
 }
 
-pub fn cancel_exec(handle: ProcessHandle) -> bool {
+pub fn authorize_exec(reservation: ExecReservation) -> bool {
     let mut table = PROCESS_TABLE.lock();
-    let Some(object) = table.lookup_object_mut(handle) else {
+    let Some(object) = table.lookup_object_mut(reservation.handle) else {
         return false;
     };
-    let was_in_progress = object.exec_in_progress;
+    if !exec_reservation_matches(object, reservation) || !exec_may_replace(object) {
+        return false;
+    }
+    object.exec_commit_authorized = true;
+    true
+}
+
+pub fn cancel_exec(reservation: ExecReservation) -> bool {
+    let mut table = PROCESS_TABLE.lock();
+    let Some(object) = table.lookup_object_mut(reservation.handle) else {
+        return false;
+    };
+    if !exec_reservation_matches(object, reservation) {
+        return false;
+    }
     object.exec_in_progress = false;
-    was_in_progress
+    object.exec_commit_authorized = false;
+    true
 }
 
 pub fn note_process_exit_status(process_id: u64, status: i32) -> Option<()> {
@@ -625,11 +701,11 @@ fn reset_for_tests() {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::{
-        ProcessObject, ProcessTable, WaitResult, attach_task, begin_exec, cancel_exec,
-        create_process, create_process_with_parent, detach_task, is_process_exiting,
-        mark_process_exiting, note_process_continued, note_process_exit_status,
+        ExecReservation, ProcessHandle, ProcessObject, ProcessTable, WaitResult, attach_task,
+        begin_exec, cancel_exec, create_process, create_process_with_parent, detach_task,
+        is_process_exiting, mark_process_exiting, note_process_continued, note_process_exit_status,
         note_process_stopped, reap_exited_processes, retain_process, thread_count_by_pid,
-        wait_for_child,
+        try_with_process_state_mut, wait_for_child,
     };
     use crate::memory::paging::ProcessAddressSpace;
     use crate::user::process_state::UserProcessState;
@@ -699,6 +775,17 @@ pub(crate) mod tests {
         assert!(!super::exec_may_replace(&object));
         object.exec_in_progress = true;
         assert!(super::exec_may_replace(&object));
+        object.exec_commit_authorized = true;
+        assert!(!super::exec_may_replace(&object));
+        let reservation = ExecReservation {
+            handle: ProcessHandle::new(0, 1),
+            expected_mm_generation: object.mm_generation,
+            next_mm_generation: object.mm_generation + 1,
+        };
+        object.exiting = true;
+        assert!(super::exec_commit_may_transfer(&object, reservation));
+        object.exiting = false;
+        object.exec_commit_authorized = false;
         object.thread_count = 2;
         assert!(!super::exec_may_replace(&object));
         object.thread_count = 1;
@@ -707,14 +794,32 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn exception_process_state_try_lock_never_waits_on_contention() {
+        let _isolation = isolate_process_table();
+        let handle = create_process(49, new_state()).expect("process handle");
+        let retained = retain_process(handle).expect("retained process");
+
+        let contended = retained.with_state(|_, _| {
+            try_with_process_state_mut(handle, |_, _| {
+                panic!("contended exception mutation unexpectedly acquired process state")
+            })
+        });
+        assert!(contended.is_none());
+
+        detach_task(handle).expect("detach task");
+        drop(retained);
+        assert_eq!(reap_exited_processes(), 1);
+    }
+
+    #[test]
     fn exec_seal_rejects_thread_attachment_until_cancel() {
         let _isolation = isolate_process_table();
         let handle = create_process(48, new_state()).expect("process handle");
 
-        begin_exec(handle).expect("begin exec");
+        let reservation = begin_exec(handle).expect("begin exec");
         assert_eq!(attach_task(handle), None);
         assert_eq!(thread_count_by_pid(48), Some(1));
-        assert!(cancel_exec(handle));
+        assert!(cancel_exec(reservation));
         attach_task(handle).expect("attach after exec cancellation");
 
         detach_task(handle).expect("detach sibling");

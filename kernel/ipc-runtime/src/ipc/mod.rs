@@ -25,7 +25,13 @@ use alloc::vec::Vec;
 use core::ptr;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+mod shared_region_hold;
 mod slab;
+mod endpoint_priority;
+
+pub use endpoint_priority::EndpointCallPriority;
+use endpoint_priority::EndpointObject;
+pub use shared_region_hold::KernelSharedRegionMappingHold;
 
 use crate::ipc_core::SharedRegionHandle;
 #[cfg(test)]
@@ -408,29 +414,6 @@ impl SharedRegionReclaimQueue {
     }
 }
 
-#[derive(Debug)]
-pub struct KernelSharedRegionMappingHold {
-    region: KernelSharedRegionHandle,
-}
-
-impl Clone for KernelSharedRegionMappingHold {
-    fn clone(&self) -> Self {
-        assert!(
-            retain_shared_region(self.region),
-            "cloned a stale shared-region mapping hold"
-        );
-        Self {
-            region: self.region,
-        }
-    }
-}
-
-impl Drop for KernelSharedRegionMappingHold {
-    fn drop(&mut self) {
-        release_shared_region(self.region);
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum EndpointOwner {
     Task(u64),
@@ -595,13 +578,6 @@ impl SharedRegionQuotaTable {
     fn clear(&mut self) {
         self.entries = [None; MAX_PROCESS_RESOURCE_OWNERS];
     }
-}
-
-#[derive(Default)]
-struct EndpointObject {
-    owner: Option<EndpointOwner>,
-    pending_messages: VecDeque<u64>,
-    waiting_receivers: VecDeque<u64>,
 }
 
 struct EndpointMessageObject {
@@ -1066,7 +1042,7 @@ pub fn release_shared_region(region: KernelSharedRegionHandle) {
 pub fn acquire_shared_region_mapping(
     region: KernelSharedRegionHandle,
 ) -> Option<KernelSharedRegionMappingHold> {
-    retain_shared_region(region).then_some(KernelSharedRegionMappingHold { region })
+    retain_shared_region(region).then_some(KernelSharedRegionMappingHold::new(region))
 }
 
 fn enqueue_shared_region_reclaim(object: SharedRegionObject) {
@@ -1142,18 +1118,23 @@ fn create_endpoint_with_owner(
         pending_messages
             .try_reserve_exact(MAX_ENDPOINT_PENDING_MESSAGES)
             .map_err(|_| IpcError::NoMemory)?;
+        let mut pending_system_messages = VecDeque::new();
+        pending_system_messages
+            .try_reserve_exact(MAX_ENDPOINT_PENDING_MESSAGES)
+            .map_err(|_| IpcError::NoMemory)?;
         let mut waiting_receivers = VecDeque::new();
         waiting_receivers
             .try_reserve_exact(MAX_ENDPOINT_WAITERS)
             .map_err(|_| IpcError::NoMemory)?;
-        Ok(EndpointObject {
+        Ok(EndpointObject::new(
             owner,
             // Reserve the complete admitted queue sizes before publication. No
             // endpoint operation can therefore enter the allocator while
             // holding the endpoint slot lock.
             pending_messages,
+            pending_system_messages,
             waiting_receivers,
-        })
+        ))
     })();
     let endpoint = match endpoint {
         Ok(endpoint) => endpoint,
@@ -1204,11 +1185,28 @@ pub fn enqueue_endpoint_call_with_handles(
     request: &[u8],
     attached_handles: &[KernelTransferredHandle],
 ) -> Result<(KernelReplyHandle, Option<u64>), IpcError> {
+    enqueue_endpoint_call_with_handles_and_priority(
+        endpoint,
+        caller_task_id,
+        request,
+        attached_handles,
+        EndpointCallPriority::Ordinary,
+    )
+}
+
+pub fn enqueue_endpoint_call_with_handles_and_priority(
+    endpoint: KernelEndpointHandle,
+    caller_task_id: u64,
+    request: &[u8],
+    attached_handles: &[KernelTransferredHandle],
+    priority: EndpointCallPriority,
+) -> Result<(KernelReplyHandle, Option<u64>), IpcError> {
     enqueue_endpoint_call_with_handles_faultable(
         endpoint,
         caller_task_id,
         request,
         attached_handles,
+        priority,
         rustos_fault_injection::should_fail("ipc.endpoint.enqueue"),
     )
 }
@@ -1218,6 +1216,7 @@ fn enqueue_endpoint_call_with_handles_faultable(
     caller_task_id: u64,
     request: &[u8],
     attached_handles: &[KernelTransferredHandle],
+    priority: EndpointCallPriority,
     injected_failure: bool,
 ) -> Result<(KernelReplyHandle, Option<u64>), IpcError> {
     if request.is_empty() || request.len() > MAX_ENDPOINT_INLINE_MESSAGE_BYTES {
@@ -1264,7 +1263,7 @@ fn enqueue_endpoint_call_with_handles_faultable(
     let _ = ENDPOINT_MESSAGES.with_mut(message_id, |message| message.reply_id = reply_id);
 
     let receiver_to_wake = ENDPOINTS.with_mut(endpoint.raw(), |endpoint_object| {
-        if endpoint_object.pending_messages.len() >= MAX_ENDPOINT_PENDING_MESSAGES {
+        if endpoint_object.pending_len() >= MAX_ENDPOINT_PENDING_MESSAGES {
             return None;
         }
         let published = ENDPOINT_MESSAGES.with_mut(message_id, |message| {
@@ -1277,7 +1276,7 @@ fn enqueue_endpoint_call_with_handles_faultable(
         if published != Some(true) {
             return None;
         }
-        endpoint_object.pending_messages.push_back(message_id);
+        endpoint_object.push_pending(priority, message_id);
         Some(
             endpoint_object
                 .waiting_receivers
@@ -1354,7 +1353,7 @@ pub fn recv_endpoint_with_sender_and_limits(
 ) -> Result<Option<EndpointReceivedWithSender>, IpcError> {
     ENDPOINTS
         .with_mut(endpoint.raw(), |endpoint_object| {
-            let Some(message_id) = endpoint_object.pending_messages.front().copied() else {
+            let Some((lane, message_id)) = endpoint_object.next_pending() else {
                 return Ok(None);
             };
 
@@ -1378,7 +1377,7 @@ pub fn recv_endpoint_with_sender_and_limits(
                     ))
                 })
                 .ok_or(IpcError::InvalidHandle)??;
-            endpoint_object.pending_messages.pop_front();
+            endpoint_object.consume_pending(lane, message_id);
             Ok(Some(received))
         })
         .ok_or(IpcError::InvalidHandle)?
@@ -1433,7 +1432,7 @@ pub fn add_endpoint_receiver_waiter(
 ) -> Result<bool, IpcError> {
     ENDPOINTS
         .with_mut(endpoint.raw(), |endpoint_object| {
-            if !endpoint_object.pending_messages.is_empty() {
+            if endpoint_object.has_pending() {
                 return Ok(true);
             }
             let already_waiting = endpoint_object.waiting_receivers.contains(&task_id);
@@ -1771,6 +1770,9 @@ pub fn cancel_endpoint_call_with_transfers(
         .with_mut(endpoint_id, |endpoint| {
             endpoint
                 .pending_messages
+                .retain(|pending_message_id| *pending_message_id != message_id);
+            endpoint
+                .pending_system_messages
                 .retain(|pending_message_id| *pending_message_id != message_id);
             marked = mark_endpoint_call_consumed(message_id, reply.raw(), caller_task_id);
         })
@@ -2476,6 +2478,7 @@ mod tests {
                     41,
                     b"request",
                     &[],
+                    super::EndpointCallPriority::Ordinary,
                     true,
                 ),
                 Err(IpcError::NoMemory)

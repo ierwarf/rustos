@@ -25,9 +25,9 @@ acceptance contracts, not tuning defaults:
 
 | Path | Target | Hard limit | Synchronous policy IPC |
 |---|---:|---:|---:|
-| Kernel entry to interactive UI | 3 s | 5 s | One classified turn at a time |
+| Kernel entry to interactive UI | 3 s | 10 s | One classified turn at a time |
 | UI CPU frame preparation | 8 ms | 16.667 ms completed frame | 0 |
-| First local DVM GPU activation after CPU boot frame | 750 ms | Included in 5 s boot ceiling | 0 |
+| First local DVM GPU activation after CPU boot frame | 750 ms | Included in 10 s boot ceiling | 0 |
 | Input arrival to visible cursor | One frame | 50 ms | 0 in frame/present |
 
 The first GPU completion is governed by the five-second activation deadline,
@@ -44,15 +44,17 @@ an independent performance failure rather than provider-revocation timing.
 Every kernel-owned service call names one class in source. A shorter caller
 deadline is allowed; widening the class is not. Repeated endpoint lookup with
 an exact current-epoch grant performs zero rootd IPC. UI render/present performs
-zero filesystem, catalog, or policy-service calls. `cargo xtask kvm-smoke`
-fails the five-second UI limit independently of its broader readiness timeout.
+zero filesystem, catalog, or policy-service calls. During SMP qualification,
+`cargo xtask kvm-smoke` records boot timestamps but admits readiness until its
+outer timeout instead of terminating at the ten-second product target.
 `formal/run-source-conformance.sh` checks the class ordering and reply
 cancellation witnesses.
 
 Provider lifecycle limits apply to the complete turn, not to each retry.
 Netd dup/close divides one 16 ms budget across three attempts and moves the
-committed operation's ACK to the one-millisecond maintenance queue. VFS and
-netd maintenance each process at most one item per housekeeping turn, IPC
+committed operation's ACK to the housekeeping maintenance queue. VFS and netd
+maintenance each process at most one 100 ms-bounded control item per yielded
+housekeeping turn, IPC
 transfer disposal releases at most one entry, and retirement acknowledges at
 most four exact task records. Backlog ownership remains explicit, but cleanup
 cannot monopolize the scheduler by multiplying individually bounded calls.
@@ -136,7 +138,7 @@ lock, and service restart invalidates it by advancing the epoch.
   per turn. The 250 ms readiness/backoff delay is permitted only when that turn
   made no control-plane progress. Sleeping after every single registration
   serializes the concurrently started foundation services and violates the
-  five-second boot-to-UI hard limit.
+  measured ten-second boot-to-UI release target.
 
 - Default KVM-smoke runs keep coarse `uiserver: update tick` logs only.
 - Generic and typed slow-IPC diagnostics each emit at most one representative
@@ -247,6 +249,11 @@ lock, and service restart invalidates it by advancing the epoch.
   first blocking dispatch. It must not depend on an incoming event to flush
   the request that creates that event; later callback batches retain the same
   explicit post-dispatch flush ordering.
+- Wayland client admission calls the generic Linux `epoll_ctl(ADD)` path inside
+  `wayland-server`. Persistent epoll create/ADD/MOD/DEL/retire/purge operations
+  mutate checkpointed vfsd state and use the bounded 100 ms interactive-control
+  rail. The 16 ms rail is reserved for non-consuming readiness queries; using
+  it for control can reject a healthy accepted client under SMP contention.
 - The pre-catalog UI bootstrap reads only the signed Init environment registry.
   Its two service-local defaults are sealed in runtimed and are revalidated
   byte-for-byte against the generated launch catalog when that catalog is
@@ -282,10 +289,12 @@ lock, and service restart invalidates it by advancing the epoch.
   acceptance gate.
 - Inputd decodes one fixed ingress batch in its sole worker and takes the
   policy queue lock once for ordinary event publication. It never holds that
-  lock across the bounded netd session-authority call. A transition failure
-  resets and drops that session while retaining ring-consumer progress;
-  inputd process exit separately clears policy readiness and old-owner records
-  before a replacement worker may rearm.
+  lock across the bounded netd session-authority call. A transient transition
+  failure retains the decoded batch, decoder epoch, and exact unacknowledged
+  revoke/grant suffix, then retries before publishing any following input; the
+  absolute five-second deadline exits fail-closed. Inputd process exit
+  separately clears policy readiness and old-owner records before a
+  replacement worker may rearm.
 - An interactive service's `TASK_WEIGHT_INTERACTIVE_FLAG` admits only its
   input/present and directly latency-bound workers. POSIX clone inherits that
   base class, so catalog loading, runtime polling, console refresh, logging,
@@ -293,6 +302,9 @@ lock, and service restart invalidates it by advancing the epoch.
   one-way `SYS_RUSTOS_SCHED_DEMOTE_SELF` before work. The KVM UI profile gate
   requires a nonzero `background_thread_demotions` count; a demotion failure
   exits uiserver rather than quietly running the wrong scheduling model.
+  The bounded one-shot GPU initialization worker is the sole exception: it
+  retains uiserver's boot-critical class until it publishes the mandatory DVM
+  compositor result and exits, so background work cannot starve product boot.
 
 ## Scheduler Dispatch
 

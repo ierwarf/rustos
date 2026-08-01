@@ -421,23 +421,39 @@ fn noncanonical_input_bytes(termios: LinuxTermios, event: InputEvent) -> Result<
 pub(super) fn bootstrap_ui_server(state: &mut BrokerState) -> Result<(), i32> {
     boot_line("runtimed: waiting for devmgrd before ui bootstrap");
     wait_for_service_endpoint(IPC_SERVICE_DEVMGRD)?;
+    match spawn_ui_server_once(state) {
+        Err(errno) if ui_bootstrap_may_retry_immediately(errno) => {
+            // Every bounded IPC layer revokes its reply capability before it
+            // reports ETIMEDOUT, so the exact retry cannot overlap the first
+            // environment/VFS/loader transaction. A second failure returns
+            // to the ordinary bounded retry owner.
+            boot_line("runtimed: ui bootstrap timed out; one immediate retry");
+            spawn_ui_server_once(state)
+        }
+        result => result,
+    }
+}
+
+fn spawn_ui_server_once(state: &mut BrokerState) -> Result<(), i32> {
     let (args, env) = ui_server_bootstrap_args_env()?;
-    super::spawn::spawn_tracked_process(
-        state,
-        LaunchEntry {
-            desktop_file_id: String::from(UI_SERVER_DESKTOP_FILE_ID),
-            package_id: String::from("uiserver"),
-            display_name: String::from(UI_SERVER_DISPLAY_NAME),
-            exec: String::from(UI_SERVER_EXEC_PATH),
-            runtime_deps: Vec::new(),
-            restart: true,
-            weight_micros: UI_SERVER_TASK_WEIGHT_MICROS,
-            logical_admin: false,
-            console_hosted: false,
-            args,
-            env,
-        },
-    )
+    let entry = LaunchEntry {
+        desktop_file_id: String::from(UI_SERVER_DESKTOP_FILE_ID),
+        package_id: String::from("uiserver"),
+        display_name: String::from(UI_SERVER_DISPLAY_NAME),
+        exec: String::from(UI_SERVER_EXEC_PATH),
+        runtime_deps: Vec::new(),
+        restart: true,
+        weight_micros: UI_SERVER_TASK_WEIGHT_MICROS,
+        logical_admin: false,
+        console_hosted: false,
+        args,
+        env,
+    };
+    super::spawn::spawn_tracked_process(state, entry)
+}
+
+fn ui_bootstrap_may_retry_immediately(errno: i32) -> bool {
+    errno == libc::ETIMEDOUT
 }
 
 fn wait_for_service_endpoint(service_id: u64) -> Result<(), i32> {
@@ -1077,7 +1093,9 @@ fn merge_manifest_env_into(env: &mut Vec<String>, manifest_env: &[String]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{session_ingress_identity_authorized, SessionRuntime};
+    use super::{
+        session_ingress_identity_authorized, ui_bootstrap_may_retry_immediately, SessionRuntime,
+    };
     use keyboard_core::KeyCode;
     use rustos_user_abi::device::{InputEvent, INPUT_ACTION_PRESSED, INPUT_KIND_KEYBOARD};
     use rustos_user_abi::linux::LinuxTermios;
@@ -1097,6 +1115,13 @@ mod tests {
         assert!(session_ingress_identity_authorized(&request, 17, 19, true));
         request.header.op = COMMERCIAL_MAX_SESSIOND_OP_UI_BOOTSTRAP;
         assert!(!session_ingress_identity_authorized(&request, 17, 19, true));
+    }
+
+    #[test]
+    fn ui_bootstrap_retries_only_a_revoked_timeout_transaction_immediately() {
+        assert!(ui_bootstrap_may_retry_immediately(libc::ETIMEDOUT));
+        assert!(!ui_bootstrap_may_retry_immediately(libc::EAGAIN));
+        assert!(!ui_bootstrap_may_retry_immediately(libc::EINVAL));
     }
 
     fn key_event(code: u32, text: u8) -> InputEvent {

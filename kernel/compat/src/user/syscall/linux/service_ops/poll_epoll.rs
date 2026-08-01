@@ -13,6 +13,8 @@
 //! - **Forbidden:** No periodic polling, one-shot timeout ignoring, fd-only
 //!   registration, unbounded provider call, or app-specific readiness path.
 //! - **Evidence:** `waitset` and `input-delivery-lifecycle`.
+mod control;
+
 use super::*;
 
 const MAX_POLL_FDS: usize = 1024;
@@ -587,7 +589,7 @@ pub fn syscall_linux_epoll_create1(flags: u64) -> u64 {
     let mut request = new_vfs_request(VFS_IPC_OP_POLL_QUERY);
     request.arg0 = VFS_POLL_QUERY_EPOLL_CREATE;
     request.remote_id = epoll_token;
-    if let Err(errno) = call_vfs_ipc_request_with_timeout(&request, 16)
+    if let Err(errno) = call_vfs_ipc_request_with_timeout(&request, control::deadline_ms())
         .and_then(|response| ensure_vfs_status(&response))
     {
         // A timeout can race the service commit. The token is globally unique
@@ -703,7 +705,7 @@ pub fn syscall_linux_epoll_ctl(epfd: u64, op: u64, fd: u64, event_ptr: u64) -> u
     } else {
         None
     };
-    let result = call_vfs_ipc_request_with_timeout(&request, 16)
+    let result = call_vfs_ipc_request_with_timeout(&request, control::deadline_ms())
         .and_then(|response| ensure_vfs_status(&response));
     if let Some(guard) = guard {
         release_epoll_target_guard(guard);
@@ -1151,7 +1153,7 @@ pub fn retire_vfs_epoll(token: u64) -> Result<(), i64> {
 }
 
 pub fn retire_vfs_epoll_bounded(token: u64) -> Result<(), i64> {
-    retire_vfs_epoll_with_timeout(token, Some(16))
+    retire_vfs_epoll_with_timeout(token, Some(control::deadline_ms()))
 }
 
 fn retire_vfs_epoll_with_timeout(token: u64, timeout_ms: Option<u64>) -> Result<(), i64> {
@@ -1170,7 +1172,7 @@ pub fn purge_vfs_epoll_object(provider: u16, object_id: u64) -> Result<(), i64> 
 }
 
 pub fn purge_vfs_epoll_object_bounded(provider: u16, object_id: u64) -> Result<(), i64> {
-    purge_vfs_epoll_object_with_timeout(provider, object_id, Some(16))
+    purge_vfs_epoll_object_with_timeout(provider, object_id, Some(control::deadline_ms()))
 }
 
 fn purge_vfs_epoll_object_with_timeout(

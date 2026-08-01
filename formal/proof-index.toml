@@ -1,0 +1,106 @@
+# Curated retrieval graph for executable and ghost proofs. It is deliberately
+# closed-world: a proof cannot be credited unless its source counterpart,
+# formal-model anchor, harness/lemma, dependency edge, and stated scope all
+# validate mechanically. This is evidence routing, not an auto-prover.
+schema = "rustos-proof-index-v1"
+
+[policy]
+max_verus_files = 10
+max_dependency_depth = 8
+
+[[proof]]
+id = "driver-domain-input-frame"
+kind = "kani"
+package = "driver-domain-protocol"
+source = "libs/driver-domain-protocol/src/lib.rs"
+symbol = "RustosInputFrame::linux_evdev_key"
+formal_model = "dvm-input-ring/DvmInputRing"
+scope = "bounded wire-frame provenance, field encoding, and checksum admission"
+harnesses = [
+  "key_frame_has_exact_provenance_bounds_and_checksum",
+  "pointer_frame_rejects_unknown_button_bits_and_preserves_wire_fields",
+]
+depends_on = []
+
+[[proof]]
+id = "image-admission"
+kind = "kani"
+package = "rustos-image-admission"
+source = "libs/rustos-image-admission/src/lib.rs"
+symbol = "admit_image"
+formal_model = "dual-abi-image-admission/DualAbiImageAdmission"
+scope = "bounded parser, arithmetic, W^X, relocation, import, and region-admission paths"
+harnesses = [
+  "accepted_entry_is_bounded_and_executable",
+  "accepted_elf_segment_is_bounded_and_wx_exclusive",
+  "rebased_pe_without_relocations_is_rejected",
+  "accepted_pe_relocation_entry_has_a_bounded_exact_effect",
+  "accepted_pe_import_thunk_has_valid_identity_and_bound",
+  "little_endian_byte_fields_are_decoded_exactly",
+  "pe_section_u32_fields_are_decoded_exactly",
+  "accepted_pe_section_is_bounded_and_wx_exclusive",
+]
+depends_on = []
+
+[[proof]]
+id = "runtime-response"
+kind = "kani"
+package = "runtime-control"
+source = "libs/runtime-control/src/lib.rs"
+symbol = "response_payload_len"
+formal_model = "runtime-control-rpc/RuntimeControlRpc"
+scope = "bounded response shape, opcode identity, status, overflow, and payload partition"
+harnesses = [
+  "successful_response_never_crosses_rpc_identity",
+  "successful_snapshot_never_accepts_an_unbounded_payload_count",
+  "malformed_minimum_status_never_overflows_into_success",
+  "successful_command_never_accepts_a_payload",
+  "well_formed_server_error_preserves_the_errno",
+]
+depends_on = []
+
+[[proof]]
+id = "runtime-response-unbounded"
+kind = "verus"
+proof_file = "formal/verus-proof-kernel/runtime_response.rs"
+source = "libs/runtime-control/src/lib.rs"
+symbol = "response_payload_len"
+counterpart_test = "successful_response_never_crosses_rpc_identity"
+formal_model = "runtime-control-rpc/RuntimeControlRpc"
+scope = "unbounded mathematical status, identity, and payload partition behind the bounded Kani harnesses"
+lemmas = [
+  "exact_success_is_the_only_successful_cross_rpc_outcome",
+  "malformed_status_cannot_become_success",
+  "command_success_is_payload_free",
+  "snapshot_success_is_bounded",
+]
+depends_on = ["runtime-response"]
+
+[[proof]]
+id = "tlb-exact-ack"
+kind = "verus"
+proof_file = "formal/verus-proof-kernel/tlb_acknowledgement.rs"
+source = "kernel/hal/src/arch/tlb_shootdown.rs"
+symbol = "acknowledgements_complete"
+counterpart_test = "reclaim_requires_every_target_to_acknowledge_the_exact_generation"
+formal_model = "tlb-shootdown-lifecycle/TlbShootdownLifecycle"
+scope = "unbounded target-index partition for exact-generation acknowledgement admission"
+lemmas = [
+  "complete_requires_an_exact_acknowledgement_for_each_target",
+  "mismatched_acknowledgement_shape_cannot_admit_reclaim",
+]
+depends_on = []
+
+[[proof]]
+id = "waitset-signal-wire"
+kind = "kani"
+package = "rustos-user-abi"
+source = "libs/rustos-user-abi/src/syscall.rs"
+symbol = "waitset_signal_shape_valid"
+formal_model = "userspace-wait-set/UserspaceWaitSet"
+scope = "bounded public ABI shape before provider/object authority lookup"
+harnesses = [
+  "accepted_waitset_signal_has_exact_bounded_shape",
+  "malformed_waitset_signal_is_never_accepted",
+]
+depends_on = []

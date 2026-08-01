@@ -93,9 +93,18 @@ done < <(find formal -mindepth 2 -maxdepth 2 -name '*.cfg' | sort)
 for lock in formal/tla2tools.lock formal/kani.lock formal/verus.lock formal/apalache.lock formal/tlaps.lock; do
     [[ -s "$lock" ]] || { echo "missing tool lock: $lock" >&2; exit 1; }
 done
-for script in formal/run-{all-tlc,tlc,tlc-simulate,kani,verus,runtime-traces,source-conformance,miri,loom,fuzz-smoke,apalache,tlaps,abi-differential,recovery-scenarios,implementation-mutations,sanitizers}.sh; do
+for script in formal/run-{all-tlc,tlc,tlc-simulate,kani,verus,proof-index,runtime-traces,source-conformance,miri,loom,shuttle,herd,concurrency-triangle,fuzz-smoke,apalache,tlaps,abi-differential,recovery-scenarios,implementation-mutations,sanitizers}.sh; do
     [[ -x "$script" ]] || { echo "formal runner is not executable: $script" >&2; exit 1; }
 done
+[[ -s formal/spec-mutations.toml ]] || {
+    echo "formal/spec-mutations.toml is missing" >&2
+    exit 1
+}
+[[ -f formal/run-spec-mutations.py ]] || {
+    echo "formal/run-spec-mutations.py is missing" >&2
+    exit 1
+}
+python3 formal/run-spec-mutations.py --check
 for registry in \
     formal/abi-divergences.tsv \
     formal/fault-scenarios.tsv \
@@ -116,6 +125,11 @@ done
     exit 1
 }
 python3 formal/test-verification-run-freshness.py
+[[ -x formal/tlc_cache.py && -x formal/test-tlc-cache.py ]] || {
+    echo "formal TLC cache validator/selftest is not executable" >&2
+    exit 1
+}
+python3 formal/test-tlc-cache.py
 rg -q -- '--classify-stale' formal/run-runtime-traces.sh || {
     echo "runtime trace gate cannot distinguish stale optional KVM evidence" >&2
     exit 1
@@ -128,6 +142,26 @@ rg -q 'kvm_trace_status.*-eq 3' formal/run-runtime-traces.sh || {
     echo "formal concurrency witness registry is missing" >&2
     exit 1
 }
+for path in \
+    formal/concurrency-triangle.toml \
+    formal/herdtools.lock \
+    formal/check-concurrency-triangle.py \
+    formal/setup-herdtools.sh; do
+    [[ -s "$path" ]] || {
+        echo "formal concurrency triangle input is missing: $path" >&2
+        exit 1
+    }
+done
+[[ -x formal/setup-herdtools.sh ]] || {
+    echo "formal herdtools setup runner is not executable" >&2
+    exit 1
+}
+python3 formal/check-concurrency-triangle.py
+[[ -s formal/proof-index.toml && -x formal/check-proof-index.py ]] || {
+    echo "formal proof index input is missing or not executable" >&2
+    exit 1
+}
+python3 formal/check-proof-index.py
 [[ -x formal/check-system-flows.sh ]] || {
     echo "system-flow contract checker is not executable" >&2
     exit 1
@@ -171,6 +205,10 @@ python3 formal/check-proof-boundaries.py
 }
 rg -q 'run-source-conformance\.sh' formal/verify-all.sh || {
     echo "formal PR gate omits source conformance" >&2
+    exit 1
+}
+rg -q 'run-proof-index\.sh' formal/verify-all.sh || {
+    echo "formal PR gate omits proof-index validation" >&2
     exit 1
 }
 

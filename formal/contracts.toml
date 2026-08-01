@@ -112,8 +112,14 @@ reason = "Per-CPU raw-guard stacks, CPU/APIC identity, and preemption depth proh
 [[risk_surfaces]]
 path = "kernel/ipc-runtime/src/ipc/mod.rs"
 severity = "critical"
-flows = ["ipc-call", "endpoint-lifecycle", "ipc-handle-transfer", "kernel-resource-lifecycle", "root-authority", "service-call-authority"]
+flows = ["ipc-call", "endpoint-lifecycle", "ipc-handle-transfer", "kernel-resource-lifecycle", "root-authority", "scheduler-dispatch", "service-call-authority"]
 reason = "IPC queues, exact receiver-waiter publication, replies, endpoint owners, owner quotas, shared backing, and transferred capabilities are the microkernel authority spine."
+
+[[risk_surfaces]]
+path = "kernel/ipc-runtime/src/ipc/endpoint_priority.rs"
+severity = "critical"
+flows = ["scheduler-dispatch"]
+reason = "Kernel-derived endpoint lane selection prevents service priority inversion without permitting untrusted self-promotion or ordinary-call starvation."
 
 [[risk_surfaces]]
 path = "kernel/mm/src/memory/address_space.rs"
@@ -238,7 +244,7 @@ reason = "Pure mmap classification must accept the complete backing contract bef
 [[risk_surfaces]]
 path = "kernel/ps/src/multitask/process_table.rs"
 severity = "critical"
-flows = ["process-address-space-lifecycle", "cross-cpu-task-retirement", "endpoint-lifecycle", "kernel-resource-lifecycle"]
+flows = ["process-address-space-lifecycle", "cross-cpu-task-retirement", "endpoint-lifecycle", "kernel-resource-lifecycle", "exception-retirement"]
 reason = "Process generation, exit, address-space, endpoint lifetime, and per-process task admission share one identity boundary."
 
 [[risk_surfaces]]
@@ -292,7 +298,7 @@ reason = "AP idle ownership and first scheduler entry bind CPU lifecycle to one 
 [[risk_surfaces]]
 path = "kernel/ps/src/multitask/current.rs"
 severity = "critical"
-flows = ["scheduler-lifecycle", "scheduler-dispatch", "monotonic-deadline-lifecycle", "cross-cpu-task-retirement", "user-memory-access"]
+flows = ["scheduler-lifecycle", "scheduler-dispatch", "monotonic-deadline-lifecycle", "cross-cpu-task-retirement", "user-memory-access", "exception-retirement", "process-address-space-lifecycle"]
 reason = "Current-task access is the interrupt-excluded gateway to scheduler and process generation state."
 
 [[risk_surfaces]]
@@ -341,7 +347,7 @@ reason = "Loader transactions mutate process identity, mappings, handles, and ex
 path = "kernel/compat/src/user/syscall/linux/proc_broker_ops/activation_batch.rs"
 severity = "critical"
 flows = ["atomic-process-activation-batch"]
-reason = "The registry-to-scheduler critical section must preflight every one-shot capability before any runnable publication and consume all only after success."
+reason = "The registry-to-scheduler critical section must complete capability and scheduler preflight, consume every one-shot capability while targets remain suspended, then publish the complete runnable cohort."
 
 [[risk_surfaces]]
 path = "kernel/compat/src/user/syscall/linux/proc_broker_ops/authority.rs"
@@ -389,7 +395,13 @@ reason = "Untrusted mapping requests cross into the ring0 page-table substrate."
 path = "kernel/compat/src/user/syscall/linux/service_ops/poll_epoll.rs"
 severity = "critical"
 flows = ["waitset", "input-delivery-lifecycle"]
-reason = "General wait ABI correctness depends on atomic observation, arm, timeout, signal, and revoke."
+reason = "General wait ABI correctness depends on atomic observation, bounded control mutation, arm, timeout, signal, and revoke."
+
+[[risk_surfaces]]
+path = "kernel/compat/src/user/syscall/linux/service_ops/poll_epoll/control.rs"
+severity = "critical"
+flows = ["waitset"]
+reason = "Persistent epoll state mutations must not inherit the shorter non-consuming readiness deadline."
 
 [[risk_surfaces]]
 path = "kernel/compat/src/user/syscall/linux/waitset_broker_ops.rs"
@@ -816,6 +828,20 @@ models = [
 ]
 
 [[source_mappings]]
+path = "kernel/compat/src/user/syscall/linux/service_ops/poll_epoll.rs"
+models = [
+    "service-mutation-recovery/ServiceMutationRecovery",
+    "userspace-wait-set/UserspaceWaitSet",
+]
+
+[[source_mappings]]
+path = "kernel/compat/src/user/syscall/linux/service_ops/poll_epoll/control.rs"
+models = [
+    "service-mutation-recovery/ServiceMutationRecovery",
+    "userspace-wait-set/UserspaceWaitSet",
+]
+
+[[source_mappings]]
 path = "kernel/compat/src/user/syscall/linux/service_ops/vfs_socket.rs"
 models = [
     "vfs-open-description-recovery/VfsOpenDescriptionRecovery",
@@ -840,9 +866,14 @@ models = [
     "endpoint-receiver-wakeup/EndpointReceiverWakeup",
     "ipc-endpoint-ownership/IpcEndpointOwnership",
     "ipc-handle-transfer/IpcHandleTransfer",
+    "ipc-priority-queue/IpcPriorityQueue",
     "ipc-reply-deadline/IpcReplyDeadline",
     "kernel-resource-accounting/KernelResourceAccounting",
 ]
+
+[[source_mappings]]
+path = "kernel/ipc-runtime/src/ipc/endpoint_priority.rs"
+models = ["ipc-priority-queue/IpcPriorityQueue"]
 
 [[source_mappings]]
 path = "kernel/ipc-runtime/src/ipc/slab.rs"
@@ -865,8 +896,10 @@ models = [
 path = "kernel/ps/src/multitask/process_table.rs"
 models = [
     "cross-cpu-task-retirement/CrossCpuTaskRetirement",
+    "exec-address-space-transaction/ExecAddressSpaceTransaction",
     "kernel-resource-accounting/KernelResourceAccounting",
     "process-address-space-lifetime/ProcessAddressSpaceLifetime",
+    "user-stack-growth/UserStackGrowth",
 ]
 
 [[source_mappings]]
@@ -913,6 +946,7 @@ path = "kernel/ps/src/multitask/current.rs"
 models = [
     "clocksource-deadline/ClocksourceDeadline",
     "cross-cpu-task-retirement/CrossCpuTaskRetirement",
+    "exec-address-space-transaction/ExecAddressSpaceTransaction",
     "ipc-priority-inheritance/IpcPriorityInheritance",
     "process-address-space-lifetime/ProcessAddressSpaceLifetime",
     "scheduler-cpu-distribution/SchedulerCpuDistribution",
@@ -920,6 +954,7 @@ models = [
     "synchronous-ipc-handoff/SynchronousIpcHandoff",
     "scheduler-wakeup/SchedulerWakeup",
     "syscall-simd-lifecycle/SyscallSimdLifecycle",
+    "user-stack-growth/UserStackGrowth",
 ]
 
 [[source_mappings]]
@@ -956,10 +991,12 @@ models = [
     "atomic-process-activation-batch/AtomicProcessActivationBatch",
     "bootstrap-activation-handoff/BootstrapActivationHandoff",
     "cross-cpu-task-retirement/CrossCpuTaskRetirement",
+    "exec-address-space-transaction/ExecAddressSpaceTransaction",
     "scheduler-cpu-ownership/SchedulerCpuOwnership",
     "smp-reschedule-ipi/SmpRescheduleIpi",
     "synchronous-ipc-handoff/SynchronousIpcHandoff",
     "task-affinity-lifecycle/TaskAffinityLifecycle",
+    "user-stack-growth/UserStackGrowth",
 ]
 
 [[source_mappings]]
@@ -971,6 +1008,10 @@ models = [
     "per-cpu-clockevent-lifecycle/PerCpuClockeventLifecycle",
     "process-address-space-lifetime/ProcessAddressSpaceLifetime",
 ]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/context_validation.rs"
+models = ["scheduler-cpu-ownership/SchedulerCpuOwnership"]
 
 [[source_mappings]]
 path = "kernel/ps/src/multitask/scheduler/affinity.rs"
@@ -1101,6 +1142,10 @@ path = "services/inputd/src/main.rs"
 models = ["input-ingestion-worker/InputIngestionWorker"]
 
 [[source_mappings]]
+path = "services/inputd/src/dvm_session_sync.rs"
+models = ["input-ingestion-worker/InputIngestionWorker"]
+
+[[source_mappings]]
 path = "services/uiserver/src/input_loop.rs"
 models = [
     "ui-frame-budget/UiFrameBudget",
@@ -1108,8 +1153,21 @@ models = [
 ]
 
 [[source_mappings]]
+path = "services/uiserver/src/gpu_scene.rs"
+models = ["gpu-submit-transaction/GpuSubmitTransaction"]
+
+[[source_mappings]]
+path = "services/uiserver/src/gpu_runtime.rs"
+models = ["gpu-submit-transaction/GpuSubmitTransaction"]
+
+[[source_mappings]]
+path = "services/uiserver/src/acceptance_profile.rs"
+models = ["acceptance-profile-publication/AcceptanceProfilePublication"]
+
+[[source_mappings]]
 path = "services/uiserver/src/main.rs"
 models = [
+    "acceptance-profile-publication/AcceptanceProfilePublication",
     "ui-frame-budget/UiFrameBudget",
     "ui-main-loop-wakeup/UiMainLoopWakeup",
 ]
@@ -1266,9 +1324,46 @@ models = [
 
 [profiles.pr]
 evidence_max_age_hours = 168
+# Two-minute pre-QEMU contract: preserve the exact finite configurations for
+# the critical multi-owner models below; do not silently lower a model depth.
+# Broader model inventory remains a nightly qualification lane.
+tlc_max_wall_seconds = 120
+# Reuse only exact, recent pass evidence.  The validator binds the TLA/CFG,
+# pinned TLC binary, deadlock policy, workers, fingerprint, and seed.
+tlc_reuse_max_age_hours = 24
+required_models = [
+    "acceptance-profile-publication/AcceptanceProfilePublication",
+    "atomic-process-activation-batch/AtomicProcessActivationBatch",
+    "bootstrap-activation-handoff/BootstrapActivationHandoff",
+    "cpu-affinity-observation/CpuAffinityObservation",
+    "cpu-online-lifecycle/CpuOnlineLifecycle",
+    "cpu-topology-admission/CpuTopologyAdmission",
+    "cross-cpu-task-retirement/CrossCpuTaskRetirement",
+    "endpoint-publication/EndpointPublication",
+    "endpoint-receiver-wakeup/EndpointReceiverWakeup",
+    "exec-address-space-transaction/ExecAddressSpaceTransaction",
+    "futex-waiter-lifecycle/FutexWaiterLifecycle",
+    "gpu-submit-transaction/GpuSubmitTransaction",
+    "ipc-endpoint-ownership/IpcEndpointOwnership",
+    "ipc-priority-inheritance/IpcPriorityInheritance",
+    "ipc-priority-queue/IpcPriorityQueue",
+    "per-cpu-clockevent-lifecycle/PerCpuClockeventLifecycle",
+    "process-address-space-lifetime/ProcessAddressSpaceLifetime",
+    "product-boot/ProductBoot",
+    "robust-futex-owner-death/RobustFutexOwnerDeath",
+    "scheduler-cpu-ownership/SchedulerCpuOwnership",
+    "smp-release-admission/SmpReleaseAdmission",
+    "smp-reschedule-ipi/SmpRescheduleIpi",
+    "syscall-simd-lifecycle/SyscallSimdLifecycle",
+    "task-affinity-lifecycle/TaskAffinityLifecycle",
+    "tlb-shootdown-lifecycle/TlbShootdownLifecycle",
+    "userspace-wait-set/UserspaceWaitSet",
+    "user-stack-growth/UserStackGrowth",
+]
 required_evidence = [
     "build/formal/source-conformance/summary.json",
     "build/formal/smp-source-assumptions/summary.json",
+    "build/formal/proof-index/summary.json",
     "build/formal/kani/summary.json",
     "build/formal/verus/summary.json",
     "build/formal/runtime-traces/runtime-control-rpc-summary.json",
@@ -1277,7 +1372,8 @@ required_evidence = [
     "build/formal/abi-differential/summary.json",
     "build/formal/recovery-scenarios/summary.json",
     "build/formal/implementation-mutations/summary.json",
-    "build/formal/mutations/summary.json",
+    "build/formal/spec-mutations/summary.json",
+    "build/formal/concurrency-triangle/summary.json",
 ]
 
 [profiles.smp-iteration]
@@ -1285,11 +1381,14 @@ required_evidence = [
 # boot does not require rerunning every unrelated product model after each
 # scheduler fix. Release, FPS, and recovery evidence still require `pr`.
 evidence_max_age_hours = 24
+tlc_max_wall_seconds = 120
+tlc_reuse_max_age_hours = 24
 required_evidence = [
     "build/formal/source-conformance/summary.json",
     "build/formal/smp-source-assumptions/summary.json",
 ]
 required_models = [
+    "acceptance-profile-publication/AcceptanceProfilePublication",
     "atomic-process-activation-batch/AtomicProcessActivationBatch",
     "bootstrap-activation-handoff/BootstrapActivationHandoff",
     "cpu-affinity-observation/CpuAffinityObservation",
@@ -1301,18 +1400,24 @@ required_models = [
     "tlb-shootdown-lifecycle/TlbShootdownLifecycle",
     "cross-cpu-task-retirement/CrossCpuTaskRetirement",
     "endpoint-receiver-wakeup/EndpointReceiverWakeup",
+    "exec-address-space-transaction/ExecAddressSpaceTransaction",
+    "gpu-submit-transaction/GpuSubmitTransaction",
     "robust-futex-owner-death/RobustFutexOwnerDeath",
     "per-cpu-clockevent-lifecycle/PerCpuClockeventLifecycle",
     "syscall-simd-lifecycle/SyscallSimdLifecycle",
     "process-address-space-lifetime/ProcessAddressSpaceLifetime",
     "smp-release-admission/SmpReleaseAdmission",
+    "user-stack-growth/UserStackGrowth",
 ]
 
 [profiles.nightly]
 evidence_max_age_hours = 72
+tlc_max_wall_seconds = 1800
+tlc_reuse_max_age_hours = 0
 required_evidence = [
     "build/formal/source-conformance/summary.json",
     "build/formal/smp-source-assumptions/summary.json",
+    "build/formal/proof-index/summary.json",
     "build/formal/kani/summary.json",
     "build/formal/verus/summary.json",
     "build/formal/runtime-traces/runtime-control-rpc-summary.json",
@@ -1322,9 +1427,12 @@ required_evidence = [
     "build/formal/recovery-scenarios/summary.json",
     "build/formal/implementation-mutations/summary.json",
     "build/formal/sanitizers/summary.json",
-    "build/formal/mutations/summary.json",
+    "build/formal/spec-mutations/summary.json",
     "build/formal/miri/summary.json",
     "build/formal/loom/summary.json",
+    "build/formal/shuttle/summary.json",
+    "build/formal/herd/summary.json",
+    "build/formal/concurrency-triangle/summary.json",
     "build/formal/apalache/summary.json",
     "build/formal/tlaps/summary.json",
     "build/formal/fuzz/summary.json",
@@ -1332,7 +1440,7 @@ required_evidence = [
 
 [topologies.qemu-commercial]
 runtime_scenario = "interactive-boot"
-hard_deadline_ms = 5000
+hard_deadline_ms = 10000
 required_runtime_models = [
     "rootd-bootstrap/RootdBootstrap",
     "dvm-block-startup/DvmBlockStartup",

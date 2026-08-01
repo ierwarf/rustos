@@ -136,6 +136,14 @@ waits still use finite provider calls and remain interruptible/revocable.
   held. Lock order must be visible to lockdep; do not bypass it with an
   untracked lock or hand-written spinning.
 - Never split an atomic scheduler transition into “commit now, yield later.”
+- Never conflate a task that is still executing with an outgoing
+  stack-transition owner: their wake publication rules differ. Never expose a
+  mutable pointer into scheduler-owned task metadata after releasing the
+  scheduler lock; use a generation-checked independently synchronized cell.
+- Hardware interrupt setup uses a revocable guard through the last fallible
+  provider/transport publication. Device mask/disable is read back before
+  handler and vector authority are released; permanent reservation is the
+  final operation, not an intermediate convenience.
 - A supervisor may publish several already-prepared siblings only through one
   bounded activation transaction. Validate the complete unique target set,
   every exact requester capability, and every suspended scheduler context

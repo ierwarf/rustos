@@ -14,13 +14,14 @@
 //!   service call while borrowing mutable scheduler state.
 //! - **Evidence:** `scheduler-lifecycle`, `scheduler-dispatch`,
 //!   `monotonic-deadline-lifecycle`, and `user-memory-access`.
-use x86_64::instructions::interrupts;
+use x86_64::{VirtAddr, instructions::interrupts};
 
 use super::{
     CurrentUserSnapshot, RetainedCurrentUserAddressSpace, RetainedCurrentUserProcessState,
     UserFaultDisposition, WaitChildResult, current_cpu_task_slot_admitted, process_table,
     scheduler_mut, scheduler_ref,
 };
+use crate::debug;
 use crate::io::session::ConsoleSessionHandle;
 use crate::memory::paging::ProcessAddressSpace;
 use crate::user::abi::UserAbi;
@@ -228,6 +229,8 @@ pub fn activate_suspended_user_tasks(task_ids: &[u64]) -> bool {
 /// The callback executes under the caller's outer capability-registry guard
 /// and the scheduler raw lock. It must only perform infallible, allocation-free
 /// authority consumption and must never log, block, or acquire another lock.
+/// The scheduler asserts that every target remains suspended after the callback
+/// and before it publishes the complete runnable cohort.
 pub fn activate_suspended_user_tasks_with_commit<F>(task_ids: &[u64], commit_authority: F) -> bool
 where
     F: FnOnce(),
@@ -294,6 +297,16 @@ pub fn wake_task(task_id: u64) -> bool {
 pub fn demote_current_user_task_to_user_class() -> bool {
     interrupts::without_interrupts(|| unsafe {
         scheduler_mut().demote_current_user_task_to_user_class()
+    })
+}
+
+/// Reports whether `task_id` currently carries the kernel's effective System
+/// class, including a live reply-scoped donation. This value is sampled before
+/// endpoint enqueue; the reply capability remains the authoritative donation
+/// lifetime after publication.
+pub fn task_has_system_scheduling_class(task_id: u64) -> bool {
+    interrupts::without_interrupts(|| unsafe {
+        scheduler_ref().task_has_system_scheduling_class(task_id)
     })
 }
 
@@ -366,15 +379,20 @@ pub fn current_console_session() -> Option<ConsoleSessionHandle> {
 
 pub fn exec_current_user_process(
     address_space: ProcessAddressSpace,
-    bootstrap: super::UserTaskBootstrap,
+    mut bootstrap: super::UserTaskBootstrap,
 ) -> Option<alloc::vec::Vec<crate::user::handles::KernelHandle>> {
     const EXEC_REMOTE_QUIESCE_TIMEOUT_NS: u64 = 2_000_000_000;
+    let linux_process_state = bootstrap.linux_process_state.take()?;
+    let linux_memory_map = bootstrap.linux_memory_map.take()?;
+    let linux_runtime_profile = bootstrap.linux_runtime_profile.take()?;
+    let exec_path = alloc::string::String::from(bootstrap.exec_path());
+    let new_root = address_space.root_phys().as_u64();
 
     // SAFETY: interrupt exclusion prevents same-CPU scheduler reentry; the
     // scheduler access guard serializes every remote CPU.
     let process_handle =
         interrupts::without_interrupts(|| unsafe { scheduler_ref().current_process_handle() })?;
-    super::process_table::begin_exec(process_handle)?;
+    let exec_reservation = super::process_table::begin_exec(process_handle)?;
     let start = crate::arch::clock::monotonic_nanos();
     loop {
         // SAFETY: one bounded barrier step holds the same scheduler exclusion.
@@ -385,7 +403,7 @@ pub fn exec_current_user_process(
             Some(true) => break,
             Some(false) => {}
             None => {
-                let _ = super::process_table::cancel_exec(process_handle);
+                let _ = super::process_table::cancel_exec(exec_reservation);
                 return None;
             }
         }
@@ -400,31 +418,58 @@ pub fn exec_current_user_process(
         core::hint::spin_loop();
     }
 
-    // SAFETY: replacement is one scheduler-serialized state transition.
-    let result = interrupts::without_interrupts(|| unsafe {
-        scheduler_mut().exec_current_user_process(address_space, bootstrap)
+    complete_retirement_side_effects();
+    if !super::process_table::authorize_exec(exec_reservation) {
+        let _ = super::process_table::cancel_exec(exec_reservation);
+        return None;
+    }
+
+    // SAFETY: commit changes only scheduler-owned state and never enters the
+    // sleepable process-state lock while Scheduler is held.
+    let committed_handle = interrupts::without_interrupts(|| unsafe {
+        scheduler_mut().exec_current_user_process(new_root, &mut bootstrap)
     });
     complete_retirement_side_effects();
-    if result.is_none() {
-        let _ = super::process_table::cancel_exec(process_handle);
-    }
-    result
+    let Some(committed_handle) = committed_handle else {
+        let _ = super::process_table::cancel_exec(exec_reservation);
+        return None;
+    };
+    assert_eq!(
+        committed_handle, process_handle,
+        "exec transaction changed process generation during scheduler commit"
+    );
+    Some(
+        super::process_table::replace_for_exec(
+            exec_reservation,
+            address_space,
+            linux_process_state,
+            linux_memory_map,
+            linux_runtime_profile,
+            exec_path.as_str(),
+        )
+        .expect("exec process-state commit failed after scheduler commit"),
+    )
 }
 
 pub fn exec_user_process_by_pid(
     process_id: u64,
     thread_id: u64,
     address_space: ProcessAddressSpace,
-    bootstrap: super::UserTaskBootstrap,
+    mut bootstrap: super::UserTaskBootstrap,
 ) -> Option<alloc::vec::Vec<crate::user::handles::KernelHandle>> {
     const EXEC_REMOTE_QUIESCE_TIMEOUT_NS: u64 = 2_000_000_000;
+    let linux_process_state = bootstrap.linux_process_state.take()?;
+    let linux_memory_map = bootstrap.linux_memory_map.take()?;
+    let linux_runtime_profile = bootstrap.linux_runtime_profile.take()?;
+    let exec_path = alloc::string::String::from(bootstrap.exec_path());
+    let new_root = address_space.root_phys().as_u64();
 
     // SAFETY: interrupt exclusion prevents same-CPU scheduler reentry; the
     // scheduler access guard serializes every remote CPU.
     let process_handle = interrupts::without_interrupts(|| unsafe {
         scheduler_ref().process_handle_for_thread(process_id, thread_id)
     })?;
-    super::process_table::begin_exec(process_handle)?;
+    let exec_reservation = super::process_table::begin_exec(process_handle)?;
     let start = crate::arch::clock::monotonic_nanos();
     loop {
         // SAFETY: one bounded barrier step holds the same scheduler exclusion.
@@ -435,7 +480,7 @@ pub fn exec_user_process_by_pid(
             Some(true) => break,
             Some(false) => {}
             None => {
-                let _ = super::process_table::cancel_exec(process_handle);
+                let _ = super::process_table::cancel_exec(exec_reservation);
                 // SAFETY: exact target state is restored under scheduler
                 // serialization before returning failure.
                 interrupts::without_interrupts(|| unsafe {
@@ -459,19 +504,44 @@ pub fn exec_user_process_by_pid(
         core::hint::spin_loop();
     }
 
-    // SAFETY: replacement is one scheduler-serialized state transition.
-    let result = interrupts::without_interrupts(|| unsafe {
-        scheduler_mut().exec_user_process_by_pid(process_id, thread_id, address_space, bootstrap)
+    complete_retirement_side_effects();
+    if !super::process_table::authorize_exec(exec_reservation) {
+        let _ = super::process_table::cancel_exec(exec_reservation);
+        interrupts::without_interrupts(|| unsafe {
+            scheduler_mut().cancel_exec_target_quiesce(process_id, thread_id, process_handle);
+        });
+        return None;
+    }
+
+    // SAFETY: the target and siblings are quiesced; the scheduler transaction
+    // cannot acquire ProcessStateLock.
+    let committed_handle = interrupts::without_interrupts(|| unsafe {
+        scheduler_mut().exec_user_process_by_pid(process_id, thread_id, new_root, &mut bootstrap)
     });
     complete_retirement_side_effects();
-    if result.is_none() {
-        let _ = super::process_table::cancel_exec(process_handle);
+    let Some(committed_handle) = committed_handle else {
+        let _ = super::process_table::cancel_exec(exec_reservation);
         // SAFETY: exact target quiesce state is cleared under the same guard.
         interrupts::without_interrupts(|| unsafe {
             scheduler_mut().cancel_exec_target_quiesce(process_id, thread_id, process_handle);
         });
-    }
-    result
+        return None;
+    };
+    assert_eq!(
+        committed_handle, process_handle,
+        "target exec transaction changed process generation during scheduler commit"
+    );
+    Some(
+        super::process_table::replace_for_exec(
+            exec_reservation,
+            address_space,
+            linux_process_state,
+            linux_memory_map,
+            linux_runtime_profile,
+            exec_path.as_str(),
+        )
+        .expect("target exec process-state commit failed after scheduler commit"),
+    )
 }
 
 pub fn linux_thread_snapshot_by_ids(
@@ -493,21 +563,21 @@ pub fn with_current_user_linux_state_mut<R>(
         &mut Option<LinuxThreadState>,
     ) -> R,
 ) -> Option<R> {
-    let (process_id, tid, abi, process, mut linux_thread_state) =
-        retain_current_linux_thread_binding()?;
-    let linux_thread_state = unsafe { linux_thread_state.as_mut() };
-    Some(process.with_state_mut(|_, state| {
+    let (process_id, process, binding) = retain_current_linux_thread_binding()?;
+    process.with_state_mut(|_, state| {
         let (address_space, linux_process_state) =
             state.address_space_and_linux_process_state_mut();
-        f(
-            process_id,
-            tid,
-            abi,
-            address_space,
-            linux_process_state,
-            linux_thread_state,
-        )
-    }))
+        binding.with_thread_state_mut(|linux_thread_state| {
+            f(
+                process_id,
+                binding.tid,
+                binding.abi,
+                address_space,
+                linux_process_state,
+                linux_thread_state,
+            )
+        })
+    })
 }
 
 pub fn with_current_user_process_state_mut<R>(
@@ -620,10 +690,18 @@ pub fn with_process_state_by_pid<R>(
 pub fn with_current_user_process_and_linux_thread_state_mut<R>(
     f: impl FnOnce(u64, u64, UserAbi, &mut UserProcessState, &mut Option<LinuxThreadState>) -> R,
 ) -> Option<R> {
-    let (process_id, tid, abi, process, mut linux_thread_state) =
-        retain_current_linux_thread_binding()?;
-    let linux_thread_state = unsafe { linux_thread_state.as_mut() };
-    Some(process.with_state_mut(|_, state| f(process_id, tid, abi, state, linux_thread_state)))
+    let (process_id, process, binding) = retain_current_linux_thread_binding()?;
+    process.with_state_mut(|_, state| {
+        binding.with_thread_state_mut(|linux_thread_state| {
+            f(
+                process_id,
+                binding.tid,
+                binding.abi,
+                state,
+                linux_thread_state,
+            )
+        })
+    })
 }
 
 pub fn queue_linux_signal(process_id: u64, task_id: u64, signal: u64) -> bool {
@@ -667,10 +745,8 @@ fn retain_current_user_process_binding() -> Option<(u64, UserAbi, process_table:
 
 type RetainedLinuxThreadBinding = (
     u64,
-    u64,
-    UserAbi,
     process_table::ProcessRef,
-    core::ptr::NonNull<Option<LinuxThreadState>>,
+    super::scheduler::CurrentLinuxThreadBinding,
 );
 
 fn retain_current_linux_thread_binding() -> Option<RetainedLinuxThreadBinding> {
@@ -678,13 +754,7 @@ fn retain_current_linux_thread_binding() -> Option<RetainedLinuxThreadBinding> {
         scheduler_mut().current_linux_thread_binding()
     })?;
     let process = process_table::retain_process(binding.process_handle)?;
-    Some((
-        process.process_id(),
-        binding.tid,
-        binding.abi,
-        process,
-        binding.linux_thread_state,
-    ))
+    Some((process.process_id(), process, binding))
 }
 
 fn retain_current_process_ref() -> Option<process_table::ProcessRef> {
@@ -700,6 +770,69 @@ pub fn retire_current_user_task_due_to_fault(
     rip: u64,
     rsp: u64,
 ) -> UserFaultDisposition {
+    // SAFETY: interrupt exclusion and the scheduler access guard serialize
+    // only immutable plan creation; no process-state lock is acquired here.
+    let growth_plan = interrupts::without_interrupts(|| unsafe {
+        scheduler_ref().prepare_current_user_stack_growth_on_fault(vector, error_code, cr2, rsp)
+    });
+    if let Some(plan) = growth_plan {
+        let mapped =
+            process_table::try_with_process_state_mut(plan.process_handle, |_, process_state| {
+                if process_state.address_space_root() != plan.address_space_root {
+                    return false;
+                }
+                let (address_space, linux_process_state) =
+                    process_state.address_space_and_linux_process_state_mut();
+                let Some(linux_process_state) = linux_process_state.as_mut() else {
+                    return false;
+                };
+                if !linux_process_state.is_range_reserved(plan.growth_start, plan.growth_end) {
+                    return false;
+                }
+                if address_space
+                    .map_zeroed_user_pages_at(
+                        VirtAddr::new(plan.growth_start),
+                        plan.page_count,
+                        x86_64::structures::paging::PageTableFlags::WRITABLE
+                            | x86_64::structures::paging::PageTableFlags::NO_EXECUTE,
+                    )
+                    .is_err()
+                {
+                    return false;
+                }
+                if linux_process_state
+                    .release_reserved_range(plan.growth_start, plan.growth_end)
+                    .is_err()
+                {
+                    address_space
+                        .unmap_user_pages_at(VirtAddr::new(plan.growth_start), plan.page_count)
+                        .expect("user stack growth rollback failed");
+                    return false;
+                }
+                true
+            })
+            .unwrap_or(false);
+        if mapped {
+            // SAFETY: the process-state guard was released by the helper;
+            // this phase only revalidates and commits scheduler metadata.
+            let committed = interrupts::without_interrupts(|| unsafe {
+                scheduler_mut().commit_current_user_stack_growth(plan)
+            });
+            if committed {
+                debug::debug!(
+                    sched,
+                    "grew user stack task={} slot={} cr2={:#x} rsp={:#x} new_start={:#x} pages={}",
+                    plan.task_id,
+                    plan.slot,
+                    cr2,
+                    rsp,
+                    plan.growth_start,
+                    plan.page_count,
+                );
+                return UserFaultDisposition::Resumed;
+            }
+        }
+    }
     let disposition = interrupts::without_interrupts(|| unsafe {
         scheduler_mut().retire_current_user_task_due_to_fault(vector, error_code, cr2, rip, rsp)
     });

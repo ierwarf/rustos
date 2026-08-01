@@ -123,9 +123,6 @@ extern "C" fn timer_interrupt_dispatch(context_ptr: *mut SavedContext) -> *mut S
     // clockevent, scheduler, PIT, and EOI transaction.
     let _irq_context = nucleus_core::util::lockdep::enter_irq_context();
     let logical_index = current_cpu_index();
-    if logical_index != 0 {
-        crate::arch::timer::arm_next_tick();
-    }
     // Test the preemption gate before sleeper callbacks, debug decoration, or
     // even the lock-backed scheduler-initialized snapshot. An interrupt may
     // land in the small interval after a raw lock raised preemption depth but
@@ -136,11 +133,15 @@ extern "C" fn timer_interrupt_dispatch(context_ptr: *mut SavedContext) -> *mut S
         complete_clockevent(logical_index);
         return context_ptr;
     }
-    // Expire sleepers against invariant-TSC/HPET time before selecting the
-    // next task. This is deliberately independent of how many PIT/RTC edges
-    // the hypervisor delivered: one delayed edge catches up every absolute
-    // deadline that passed while the vCPU was descheduled.
-    crate::arch::rtc::service_clock_event();
+    // The deadline registry is one global clock base, not eight per-CPU timer
+    // bases. Only its BSP/PIT owner may expire it. Letting every LAPIC tick
+    // walk the same registry reissued each still-unacknowledged wake once per
+    // CPU and formed an SMP thundering herd on the global scheduler lock.
+    // Absolute deadlines make a delayed owner edge catch up without extending
+    // the wait; AP clockevents remain independent scheduler preemption edges.
+    if logical_index == 0 {
+        crate::arch::rtc::service_clock_event();
+    }
     if !scheduler_initialized() {
         complete_clockevent(logical_index);
         return context_ptr;
@@ -211,6 +212,13 @@ fn complete_clockevent(logical_index: usize) {
     if logical_index == 0 {
         crate::arch::pic::send_eoi(crate::arch::pic::PIC_1_OFFSET);
     } else {
+        // Rearm only after all scheduler/debug work is complete. At high CPU
+        // counts that work can exceed one 1 ms period; arming at entry then
+        // makes the deadline expire while IF=0 and causes an immediate
+        // interrupt on IRET, starving a newly selected user context before
+        // its first instruction. Absolute catch-up still preserves monotonic
+        // time while guaranteeing the next edge is strictly in the future.
+        crate::arch::timer::arm_next_tick();
         crate::arch::msi::local_apic_eoi();
     }
     record_first_cpu_event(
@@ -221,6 +229,11 @@ fn complete_clockevent(logical_index: usize) {
 }
 
 extern "C" fn rtc_interrupt_dispatch(context_ptr: *mut SavedContext) -> *mut SavedContext {
+    // Like the PIT/LAPIC dispatcher, the low-level RTC stub enters this
+    // function directly. Keep IRQ context published through wake processing,
+    // scheduler selection, acknowledgement, and the final stack decision;
+    // `rtc::on_interrupt`'s inner guard covers only device accounting.
+    let _irq_context = nucleus_core::util::lockdep::enter_irq_context();
     crate::arch::rtc::on_interrupt();
     if nucleus_core::util::lockdep::preemption_disabled() {
         set_local_deferred_reschedule();

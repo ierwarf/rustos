@@ -366,11 +366,6 @@ fn latest_guest_timestamp_us(log: &str) -> Option<u64> {
     log.lines().filter_map(structured_guest_timestamp_us).max()
 }
 
-fn guest_deadline_reached(log: &str, deadline_ms: u64) -> bool {
-    latest_guest_timestamp_us(log)
-        .is_some_and(|timestamp_us| timestamp_us >= deadline_ms.saturating_mul(1_000))
-}
-
 fn runtime_log_sha256(log: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(log.as_bytes());

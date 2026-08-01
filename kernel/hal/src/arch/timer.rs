@@ -5,7 +5,8 @@
 //! - **Boundary:** Logical APs admitted by the CPU lifecycle receive one fixed
 //!   private vector and a calibrated invariant-TSC deadline.
 //! - **Lifecycle:** Program the LVT while interrupts are disabled, arm before
-//!   Online publication, rearm at interrupt entry, and stop on CPU teardown.
+//!   Online publication, rearm after clockevent work and before EOI, and stop
+//!   on CPU teardown.
 //! - **Concurrency:** Each CPU writes only its local APIC view, deadline MSR,
 //!   and indexed next-deadline slot.
 //! - **Failure:** Missing TSC deadline, invariant-TSC calibration, local APIC,
@@ -14,7 +15,7 @@
 //!   wall clock, uncalibrated APIC count, or vector shared with MSI.
 //! - **Evidence:** `per-cpu-clockevent-lifecycle`.
 
-use core::arch::x86_64::{__cpuid, _rdtsc};
+use core::arch::x86_64::{__cpuid, _mm_mfence, _rdtsc};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use x86_64::registers::model_specific::Msr;
@@ -24,7 +25,6 @@ use super::acpi::MAX_SUPPORTED_CPUS;
 const IA32_TSC_DEADLINE: u32 = 0x6e0;
 const CPUID_TSC_DEADLINE: u32 = 1 << 24;
 const APIC_LVT_TIMER_OFFSET: usize = 0x320;
-const APIC_LVT_MASKED: u32 = 1 << 16;
 const APIC_LVT_TSC_DEADLINE: u32 = 2 << 17;
 const TICK_NANOS: u64 = 1_000_000;
 
@@ -52,14 +52,19 @@ pub fn init_current_cpu() -> bool {
         return false;
     };
 
+    // Intel SDM's TSC-deadline programming contract requires the xAPIC LVT
+    // write to become visible before the IA32_TSC_DEADLINE WRMSR.  Keeping the
+    // LVT masked while arming can lose the only first edge if a heavily
+    // oversubscribed vCPU is descheduled until after that deadline.
     // SAFETY: local APIC admission owns this executing CPU's MMIO view.
     unsafe {
         let lvt = (base + APIC_LVT_TIMER_OFFSET) as *mut u32;
         lvt.write_volatile(
-            (u32::from(super::idt::LOCAL_TIMER_VECTOR) & 0xff)
-                | APIC_LVT_TSC_DEADLINE
-                | APIC_LVT_MASKED,
+            (u32::from(super::idt::LOCAL_TIMER_VECTOR) & 0xff) | APIC_LVT_TSC_DEADLINE,
         );
+        // SAFETY: MFENCE is available in the x86_64 baseline. Intel specifies
+        // it to serialize the xAPIC MMIO LVT write with the following WRMSR.
+        _mm_mfence();
     }
     // SAFETY: `_rdtsc` is available after invariant-TSC and deadline admission.
     let now = unsafe { _rdtsc() };
@@ -67,17 +72,10 @@ pub fn init_current_cpu() -> bool {
         .checked_add(interval)
         .filter(|deadline| *deadline > now)
         .unwrap_or_else(|| panic!("local timer invariant: initial TSC deadline overflow"));
-    // ORDERING: Release publishes the first deadline before LVT unmask.
+    // ORDERING: Release publishes the first deadline after the fenced LVT
+    // configuration and before this CPU can publish Online.
     NEXT_DEADLINE[logical_index].store(deadline, Ordering::Release);
     write_deadline(deadline);
-    // SAFETY: vector, delivery mode, and first future deadline are complete;
-    // unmasking is the final local publication before CPU Online.
-    unsafe {
-        let lvt = (base + APIC_LVT_TIMER_OFFSET) as *mut u32;
-        lvt.write_volatile(
-            (u32::from(super::idt::LOCAL_TIMER_VECTOR) & 0xff) | APIC_LVT_TSC_DEADLINE,
-        );
-    }
     true
 }
 

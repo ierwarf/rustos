@@ -38,12 +38,47 @@ rejects phantom and duplicate rules and requires every critical/high point to
 resolve to exactly one executable source witness. The durability fault also
 requires the bounded storage-DVM negative KVM gate.
 `abi-divergences.tsv`, `recovery-scenarios.tsv`,
-`implementation-mutations.tsv`, and `sanitizer-targets.tsv` close four
+`spec-mutations.toml`, `implementation-mutations.tsv`,
+`sanitizer-targets.tsv`, and `concurrency-triangle.toml` close six
 independent source-evidence gaps: native dual-ABI drift, bounded
 restart/crash-consistency outcomes, test sensitivity to real implementation
-regressions, and instrumented host-testable critical/high boundaries. Their
-runners reject stale exceptions, missing transition classes, zero-test
-filters, compile-only mutant failures, and unbounded execution.
+regressions, TLA+ property/transition mutation survivors, and instrumented
+host-testable critical/high boundaries. Their runners reject stale exceptions,
+missing transition classes, zero-test filters, parser-only or compile-only
+mutant failures, and unbounded execution. See
+SPEC_MUTATION_CONTRACT.md for the one-mutant, named-invariant,
+counterexample-trace protocol.
+`CONCURRENCY_TRIANGLE_CONTRACT.md` defines the complementary bounded Loom,
+Shuttle PCT, and x86_64 herd7 lanes. It requires a source/model/flow binding
+and rejects both TLA+ and litmus survivors, so a green checker cannot be
+credited for an empty property or a non-sensitive order assertion.
+`proof-index.toml` is a closed proof-retrieval graph for the selected Kani and
+Verus kernels. It binds an executable source symbol to a registered TLA+ model,
+the exact harness or lemma, its companion test, and any dependency edge. The
+index checker rejects a Kani proof without its own `kani::cover!`, unregistered
+Verus proof files, stale source/model links, dependency cycles, and Verus
+`admit`/`assume`/axiom/external shortcuts. `run-proof-index.sh` records hashes
+of the index and all indexed inputs, which the PR seal consumes. It is not an
+LLM, proof generator, or claim that the source has been fully verified; see
+`PROOF_INDEX_CONTRACT.md` for the precise boundaries.
+The PR TLC profile is deliberately a 120-second, risk-weighted pre-QEMU set:
+it retains the exact finite configurations of 21 critical ownership, CPU,
+TLB, wake, ABI, and product-boot models rather than quietly reducing their
+state depth. The complete registered inventory is the nightly qualification
+lane. Any changed model is still run directly by `dev-plan` before either
+profile; a PR pass is not a claim that unrelated nightly models were explored.
+The `tlc_max_wall_seconds` profile budget fails closed rather than accepting a
+partially explored model.
+An exact PR pass may be reused for at most 24 hours. `tlc_cache.py` rejects it
+unless the TLA module, CFG, pinned TLC version and digest, deadlock policy,
+worker policy, fingerprint, seed, positive exploration metrics, and model name
+still match. A source or policy change therefore reruns only the affected
+model. The SMP iteration profile applies the same rule to its smaller model
+set; nightly qualification never reuses TLC evidence. This is proof-evidence
+reuse, not TLC state recovery, and no artifact is touched to fabricate
+freshness. TLC's `-depth` option controls random simulation rather than the
+depth of exhaustive model checking, so the PR lane does not use it to truncate
+the state graph; see the official [TLC tool options](https://github.com/tlaplus/tlaplus/blob/master/general/docs/current-tools.md).
 `verify-all.sh` emits a profile verification-run seal only after every selected
 gate succeeds. That seal hashes the complete source tree and every normalized
 gate/TLC artifact; commercial evidence rejects a stale, partial, or mixed-source
@@ -58,10 +93,12 @@ limits each evidence claim to one exact platform/topology. The proof-boundary
 checker rejects missing assumption classes, unknown references, unsealed
 profiles, and any attempt to inherit QEMU evidence into physical hardware.
 `check-performance-contracts.sh` is the source-drift gate for the shared boot,
-frame, and typed IPC limits. It also rejects unclassified compat service calls,
+frame, and typed IPC limits. During SMP qualification it also rejects restoring
+an independent guest boot deadline before the runtime failure path is stable.
+It rejects unclassified compat service calls,
 service-registration retry amplification, a stable endpoint lookup that takes
 the global writer lock, synchronous policy IPC in frame/present code, unbounded
-foreground VFS recovery, and a KVM UI gate detached from the five-second limit.
+foreground VFS recovery, and unbounded outer KVM execution.
 `check-rust-source-contracts.py` binds every critical/high Rust source in
 `contracts.toml` to a leading owner/boundary/lifecycle/concurrency/failure
 contract. It prevents undocumented unsafe/ordering debt and files over 1300
@@ -86,6 +123,7 @@ The full formal gate also runs the Rust implementation proofs:
 
     bash formal/setup-kani.sh   # once per pinned Kani version
     bash formal/setup-verus.sh  # once per pinned Verus release
+    bash formal/setup-herdtools.sh # once, with documented OCaml prerequisites
     bash formal/verify-all.sh --profile pr
 
 For an iterative multi-vCPU debugging boot, use the bounded exact-tree SMP
@@ -100,7 +138,7 @@ and is mechanically rejected by FPS, recovery, and physical-GPU gates.
 
 The scheduled/manual nightly tier changes TLC fingerprint and seed, retains
 single-worker reproducibility, adds fixed-seed long-trace simulation only for
-registry-selected models, and runs Miri, Loom, Apalache, TLAPS, and bounded
+registry-selected models, and runs Miri, Apalache, TLAPS, and bounded
 Rust/C libFuzzer campaigns:
 
     bash formal/verify-all.sh --profile nightly
@@ -136,7 +174,7 @@ and counterexamples are retained under `build/formal/`.
 | service-call-authority/ServiceCallAuthority | service lookup, raw IPC call syscalls, process-owned endpoints | numeric endpoint IDs are routing identifiers rather than ambient authority; lookup grants one exact process and publication epoch; revoke/republication invalidates stale grants; process exit clears grants; unpublished generic endpoints remain owner-only |
 | runtime-control-authority/RuntimeControlAuthority | runtimed Unix control socket, netd SO_PEERCRED, signed launch registry | request bytes never assert identity; the kernel-stamped peer PID must be the current uiserver endpoint owner or a live logical-admin launch; UI readiness is uiserver-only; service revoke and process exit withdraw authority before dispatch |
 | deferred-process-activation/DeferredProcessActivation | loaderd deferred spawn and kernel process broker | a suspended target is bound to the exact kernel-stamped requester; loader restart preserves the binding; activation consumes it once; foreign use, replay, and requester-exit orphans fail closed |
-| atomic-process-activation-batch/AtomicProcessActivationBatch | initd cohort policy, loaderd sender binding, kernel process broker, and kernel-ps scheduler | one 1..=8 unique cohort is completely shape/capability/context preflighted before publication; rejection changes no member; success publishes every runnable sibling and consumes every one-shot capability in one registry-to-scheduler critical section; FIFO first turns drain before the loader reply resumes; requester exit revokes the still-suspended cohort |
+| atomic-process-activation-batch/AtomicProcessActivationBatch | initd cohort policy, loaderd sender binding, kernel process broker, and kernel-ps scheduler | one 1..=8 unique cohort is completely shape/capability/context preflighted before publication; rejection changes no member; success consumes every one-shot capability while the complete cohort remains suspended, then publishes every runnable sibling in one registry-to-scheduler critical section; FIFO first turns drain before the loader reply resumes; requester exit revokes the still-suspended cohort |
 | cpu-affinity-observation/CpuAffinityObservation | HAL CPU lifecycle, kernel-compat Linux/Windows syscall boundaries, syscalld affinity policy, and shared ABI | only a versioned kernel-stamped nonempty bounded Online bitmap whose popcount matches and, for Linux, an exact same-process effective task mask may become topology ABI; stale, forged, empty, oversized, foreign-owner, or reserved-bearing observations publish nothing |
 | task-affinity-lifecycle/TaskAffinityLifecycle | kernel-ps scheduler affinity owner, Linux/Windows compat adapters, syscalld policy, and winsys exports | Linux thread and Windows process/thread masks remain nonempty Online subsets; process mutation is atomic across live threads; excluded running CPUs must migrate before user dispatch; previous-mask, fork inheritance, exec preservation, pseudo-handle admission, and current-processor observation remain exact |
 | loader-request-authority/LoaderRequestAuthority | initd identity publication, loaderd ingress, process commit and exec-target brokers | privileged spawn is rootd/initd/sessiond-only and exec replacement is procd-only; both ingress and terminal ring0 commit require the current kernel-owned service identity, so guessed PIDs and service restart/revoke cannot retain authority |
@@ -241,6 +279,7 @@ and counterexamples are retained under `build/formal/`.
 | clocksource-deadline/ClocksourceDeadline | invariant-TSC/HPET clocksource, PIT clockevent, scheduler sleep identity | elapsed time never derives from delivered RTC-edge count; a delayed event catches every absolute deadline crossed by a clocksource jump; only a calibrated source is admitted; sleep identity is the exact scheduler task id even while syscall code holds the process-table lock |
 | scheduler-admission/SchedulerAdmission | runtimed launch-catalog admission | a launch record is not a realtime capability: all non-UI requests are clamped below System admission even when registry input is hostile; only the exact trusted UI executable receives its pinned System weight; pending admission eventually settles |
 | ipc-priority-inheritance/IpcPriorityInheritance | scheduler effective classes and compat synchronous IPC | a live reply capability owns the only priority donation; System class propagates through nested calls; completion, cancellation, and task exit revoke it; System work wins until its bounded burst is exhausted, then one ready User turn is mandatory |
+| ipc-priority-queue/IpcPriorityQueue | scheduler-derived service endpoint delivery | System calls bypass an ordinary backlog in lane-local FIFO order, ring3 cannot choose the lane, combined admission remains bounded, and two consecutive System deliveries reserve the next queued ordinary head |
 | ipc-handle-transfer/IpcHandleTransfer | process handle substrate, IPC runtime, compat IPC syscalls | a transferred descriptor is either installed or dropped exactly once; every exported service-backed description owns a matching service reference which installation adopts or bounded deferred cleanup releases; queue cancellation, peer-close, invalid receiver output, caller exit, and owner exit after dequeue leave no registry entry; batch transfer is all-or-nothing |
 | ipc-endpoint-ownership/IpcEndpointOwnership | kernel IPC runtime, compat IPC syscalls, process handle table | a process-owned endpoint/reply may be served by its worker threads but cannot be received, replied to, or handle-drained by a foreign process; transferred handles install before a reply becomes terminal; process exit kills the endpoint, revokes queued/received and installed process-local transfer authority, and cannot be followed by enqueue revival through the dead numeric endpoint; every descriptor installation stays within the process ceiling and a full-table rejection is non-destructive |
 | proc-broker-session/ProcBrokerSession | process broker, loaderd, Linux process teardown | exact loader ownership and inherited console-session binding; mapping/runtime state only in a live prepare session; commit attempt is terminal; deferred children stay inert until activation; owner exit aborts every uncommitted or in-flight prepare before publication |
@@ -493,3 +532,14 @@ by source conformance. `DvmGpuCompositor` therefore explores one abstract
 fixed-command class while retaining three in-flight values and three outputs;
 it does not multiply the state graph by three command labels that no invariant
 can distinguish.
+
+The pre-QEMU transaction set additionally includes
+`user-stack-growth/UserStackGrowth` for recoverable page faults,
+`exec-address-space-transaction/ExecAddressSpaceTransaction` for active-root
+ownership, `gpu-submit-transaction/GpuSubmitTransaction` for rejected-submit
+rollback, and
+`acceptance-profile-publication/AcceptanceProfilePublication` for bounded late
+observer activation. `robust-futex-owner-death/RobustFutexOwnerDeath` includes
+canonical shared/private cleanup-key selection. These focused models stay
+small enough for the two-minute PR TLC budget and do not trigger the unchanged
+large compositor model.

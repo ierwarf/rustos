@@ -1,0 +1,10 @@
+X86_64 TlbMailboxRequestPublication
+"P0 publishes TLB mailbox payload before the request generation"
+{
+uint64_t root=1; uint64_t generation=0;
+uint64_t 1:rax; uint64_t 1:rbx;
+}
+P0                     | P1                    ;
+movq $0,(root)         | movq (generation),%rax ;
+movq $7,(generation)   | movq (root),%rbx       ;
+exists (1:rax=7 /\ 1:rbx=1)

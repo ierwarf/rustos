@@ -38,8 +38,8 @@ pub use crate::multitask::{
     set_next_spawn_pick_hint, set_next_synchronous_pick_hint, set_windows_current_thread_affinity,
     set_windows_process_affinity, spawn_user_process_state_with_parent,
     spawn_user_process_with_parent, spawn_user_thread_suspended, stop_current_linux_process,
-    terminate_user_process, terminate_user_task, wake_task, wake_user_task,
-    windows_process_affinity, with_current_mm, with_current_process_state,
+    task_has_system_scheduling_class, terminate_user_process, terminate_user_task, wake_task,
+    wake_user_task, windows_process_affinity, with_current_mm, with_current_process_state,
     with_current_process_state_mut, with_current_user_linux_state_mut,
     with_current_user_process_and_linux_thread_state_mut, with_current_user_process_state,
     with_process_state_by_pid, with_process_state_by_pid_mut,
@@ -64,7 +64,9 @@ pub use crate::user::linux::{
     LinuxVma, LinuxVmaFlags, LinuxVmaName,
 };
 pub use crate::user::memfd::{MemfdError, MemfdHandle, MemfdMappingHold};
-pub use crate::user::process_state::{ProcessSecurityContext, UserProcessState};
+pub use crate::user::process_state::{
+    ProcessSecurityContext, SharedFutexBackingKey, UserProcessState,
+};
 pub use crate::user::socket::{PassedHandle, SocketCredentials, SocketError, SocketHandle};
 pub use x86_64::VirtAddr;
 

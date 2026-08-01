@@ -2,6 +2,8 @@
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+
     use loom::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use loom::sync::{Arc, Mutex};
     use loom::thread;
@@ -83,6 +85,54 @@ mod tests {
             let observed = waitset.observed.load(Ordering::Acquire);
             let woke = waitset.woke.load(Ordering::Acquire);
             assert!(!(slept && generation > observed && !woke));
+        });
+    }
+
+    /// Mirrors FUTEX_WAIT versus user store plus FUTEX_WAKE. The waiter owns
+    /// the bucket across its atomic comparison and queue publication, so a
+    /// waker that publishes a changed word cannot pass an unqueued sleeper.
+    #[test]
+    fn futex_compare_and_waiter_publication_have_one_linearization_point() {
+        loom::model(|| {
+            struct Futex {
+                word: AtomicUsize,
+                waiter: Mutex<bool>,
+                slept: AtomicBool,
+                woke: AtomicBool,
+            }
+            let futex = Arc::new(Futex {
+                word: AtomicUsize::new(0),
+                waiter: Mutex::new(false),
+                slept: AtomicBool::new(false),
+                woke: AtomicBool::new(false),
+            });
+
+            let waiter_side = Arc::clone(&futex);
+            let waiter = thread::spawn(move || {
+                let mut registered = waiter_side.waiter.lock().unwrap();
+                if waiter_side.word.load(Ordering::Acquire) == 0 {
+                    *registered = true;
+                    waiter_side.slept.store(true, Ordering::Release);
+                }
+            });
+            let waker_side = Arc::clone(&futex);
+            let waker = thread::spawn(move || {
+                waker_side.word.store(1, Ordering::Release);
+                let mut registered = waker_side.waiter.lock().unwrap();
+                if *registered {
+                    *registered = false;
+                    waker_side.woke.store(true, Ordering::Release);
+                }
+            });
+            waiter.join().unwrap();
+            waker.join().unwrap();
+
+            let changed = futex.word.load(Ordering::Acquire) == 1;
+            let registered = *futex.waiter.lock().unwrap();
+            let slept = futex.slept.load(Ordering::Acquire);
+            let woke = futex.woke.load(Ordering::Acquire);
+            assert!(!(changed && registered));
+            assert!(!(changed && slept && !woke));
         });
     }
 
@@ -453,6 +503,156 @@ mod tests {
             });
             dispatch.join().unwrap();
             update.join().unwrap();
+        });
+    }
+
+    /// Models the endpoint slot as the single linearization owner of two FIFO
+    /// lanes and their shared burst counter. Producers may race a receiver,
+    /// but selection can never observe or update only half of that state.
+    #[test]
+    fn ipc_priority_lane_is_kernel_derived_and_starvation_bounded() {
+        loom::model(|| {
+            #[derive(Default)]
+            struct Queue {
+                system: VecDeque<u8>,
+                ordinary: VecDeque<u8>,
+                system_streak: u8,
+                delivered: Vec<u8>,
+            }
+
+            impl Queue {
+                fn pop(&mut self) {
+                    let choose_system = !self.system.is_empty()
+                        && (self.ordinary.is_empty() || self.system_streak < 2);
+                    if choose_system {
+                        assert!(self.ordinary.is_empty() || self.system_streak < 2);
+                        self.delivered.push(self.system.pop_front().unwrap());
+                        self.system_streak = (self.system_streak + 1).min(2);
+                    } else if let Some(message) = self.ordinary.pop_front() {
+                        assert!(self.system.is_empty() || self.system_streak == 2);
+                        self.delivered.push(message);
+                        self.system_streak = 0;
+                    }
+                }
+            }
+
+            let queue = Arc::new(Mutex::new(Queue::default()));
+            let system_queue = Arc::clone(&queue);
+            let system = thread::spawn(move || {
+                let mut queue = system_queue.lock().unwrap();
+                queue.system.push_back(1);
+                queue.system.push_back(2);
+            });
+            let ordinary_queue = Arc::clone(&queue);
+            let ordinary = thread::spawn(move || {
+                let mut queue = ordinary_queue.lock().unwrap();
+                queue.ordinary.push_back(3);
+                queue.ordinary.push_back(4);
+            });
+            let receiver_queue = Arc::clone(&queue);
+            let receiver = thread::spawn(move || receiver_queue.lock().unwrap().pop());
+
+            system.join().unwrap();
+            ordinary.join().unwrap();
+            receiver.join().unwrap();
+            let mut queue = queue.lock().unwrap();
+            while !queue.system.is_empty() || !queue.ordinary.is_empty() {
+                queue.pop();
+            }
+            let mut delivered = queue.delivered.clone();
+            delivered.sort_unstable();
+            assert_eq!(delivered, [1, 2, 3, 4]);
+        });
+    }
+
+    /// Models the 0->1 coalescing bit in `arm_remote_reschedule` racing the
+    /// target CPU's AcqRel consume.  A sender may collapse notifications, but
+    /// its request may never disappear: after both sides finish it is either
+    /// still durable or was observed by the target exactly once.
+    #[test]
+    fn reschedule_request_is_never_lost_across_concurrent_consume() {
+        loom::model(|| {
+            let request = Arc::new(AtomicUsize::new(0));
+            let consumed = Arc::new(AtomicBool::new(false));
+
+            let producer_request = Arc::clone(&request);
+            let producer = thread::spawn(move || {
+                let _ =
+                    producer_request.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire);
+            });
+            let consumer_request = Arc::clone(&request);
+            let consumer_consumed = Arc::clone(&consumed);
+            let consumer = thread::spawn(move || {
+                if consumer_request.swap(0, Ordering::AcqRel) != 0 {
+                    consumer_consumed.store(true, Ordering::Release);
+                }
+            });
+
+            producer.join().unwrap();
+            consumer.join().unwrap();
+            assert!(
+                request.load(Ordering::Acquire) != 0 || consumed.load(Ordering::Acquire),
+                "a coalesced reschedule request was neither pending nor consumed"
+            );
+        });
+    }
+
+    /// Models the shootdown mailbox's two release/acquire publications.  This
+    /// is deliberately a bounded protocol kernel: source anchoring and the
+    /// architecture litmus cover the concrete atomics, while Loom enumerates
+    /// all interleavings of this mailbox/flush/ack dependency graph.
+    #[test]
+    fn tlb_mailbox_and_ack_publish_the_exact_generation() {
+        loom::model(|| {
+            const GENERATION: usize = 7;
+            const GLOBAL_ROOT: usize = 0;
+
+            struct Mailbox {
+                root: AtomicUsize,
+                request: AtomicUsize,
+                flushed: AtomicBool,
+                acknowledgement: AtomicUsize,
+            }
+
+            let mailbox = Arc::new(Mailbox {
+                root: AtomicUsize::new(usize::MAX),
+                request: AtomicUsize::new(0),
+                flushed: AtomicBool::new(false),
+                acknowledgement: AtomicUsize::new(0),
+            });
+
+            let publisher_mailbox = Arc::clone(&mailbox);
+            let publisher = thread::spawn(move || {
+                publisher_mailbox.root.store(GLOBAL_ROOT, Ordering::Relaxed);
+                publisher_mailbox
+                    .request
+                    .store(GENERATION, Ordering::Release);
+            });
+            let target_mailbox = Arc::clone(&mailbox);
+            let target = thread::spawn(move || {
+                let generation = target_mailbox.request.load(Ordering::Acquire);
+                if generation != 0 {
+                    assert_eq!(generation, GENERATION);
+                    assert_eq!(target_mailbox.root.load(Ordering::Relaxed), GLOBAL_ROOT);
+                    target_mailbox.flushed.store(true, Ordering::Release);
+                    target_mailbox
+                        .acknowledgement
+                        .store(generation, Ordering::Release);
+                }
+            });
+            let reclaimer_mailbox = Arc::clone(&mailbox);
+            let reclaimer = thread::spawn(move || {
+                if reclaimer_mailbox.acknowledgement.load(Ordering::Acquire) == GENERATION {
+                    assert!(reclaimer_mailbox.flushed.load(Ordering::Acquire));
+                }
+            });
+
+            publisher.join().unwrap();
+            target.join().unwrap();
+            reclaimer.join().unwrap();
+            if mailbox.acknowledgement.load(Ordering::Acquire) == GENERATION {
+                assert!(mailbox.flushed.load(Ordering::Acquire));
+            }
         });
     }
 }

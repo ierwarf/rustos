@@ -21,8 +21,8 @@ use x86_64::registers::rflags::RFlags;
 use x86_64::registers::segmentation::{CS, SS, Segment};
 
 use self::cpu_local::{
-    current_cpu_task_slot_admitted, publish_cpu_current_task, scheduler_mut, scheduler_ref,
-    task_slot_is_running,
+    current_cpu_task_slot_admitted, publish_cpu_current_task, publish_scheduler_initialized,
+    scheduler_initialized, scheduler_mut, scheduler_ref, task_slot_is_running,
 };
 use crate::io::session::ConsoleSessionHandle;
 use crate::memory::paging::ProcessAddressSpace;
@@ -52,9 +52,9 @@ pub use self::current::{
     retire_current_user_task_due_to_fault, service_deferred_work, set_linux_task_affinity,
     set_next_latency_pick_hint, set_next_pick_hint, set_next_process_pick_hint,
     set_next_spawn_pick_hint, set_next_synchronous_pick_hint, set_windows_current_thread_affinity,
-    set_windows_process_affinity, stop_current_linux_process, terminate_user_process,
-    terminate_user_task, user_log_ids_for_task, wait_for_child, wake_task, wake_user_task,
-    windows_process_affinity, with_current_mm, with_current_process_credentials,
+    set_windows_process_affinity, stop_current_linux_process, task_has_system_scheduling_class,
+    terminate_user_process, terminate_user_task, user_log_ids_for_task, wait_for_child, wake_task,
+    wake_user_task, windows_process_affinity, with_current_mm, with_current_process_credentials,
     with_current_process_state, with_current_process_state_mut, with_current_user_linux_state_mut,
     with_current_user_process_and_linux_thread_state_mut, with_current_user_process_state,
     with_current_user_process_state_mut, with_process_state_by_pid, with_process_state_by_pid_mut,
@@ -105,10 +105,6 @@ fn allocate_task_id_from(counter: &AtomicU64) -> Option<u64> {
 
 fn allocate_task_id() -> Option<u64> {
     allocate_task_id_from(&NEXT_TASK_ID)
-}
-
-fn scheduler_initialized() -> bool {
-    interrupts::without_interrupts(|| unsafe { scheduler_ref().initialized() })
 }
 
 pub fn is_initialized() -> bool {
@@ -281,7 +277,7 @@ pub struct UserTaskRegisters {
     pub r15: u64,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub struct UserStackState {
     pub reserve_start: u64,
     pub reserve_end: u64,

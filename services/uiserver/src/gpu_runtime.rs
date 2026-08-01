@@ -52,6 +52,11 @@ use crate::sys::{
 const GPU_READY_RETRY: Duration = Duration::from_millis(50);
 const GPU_READY_TIMEOUT: Duration = Duration::from_secs(20);
 const GPU_FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
+// This one-shot worker is the mandatory boot compositor, not background
+// policy. It inherits uiserver's admitted boot-critical class only until it
+// publishes one result and exits; steady-state GPU work remains on the UI
+// owner, while every unrelated long-lived helper demotes normally.
+const GPU_INITIALIZATION_RETAINS_BOOT_CLASS: bool = true;
 // An idle desktop may have no completion syscall to drain the kernel's
 // wake-only DVM offline IRQ. Probe the descriptor at a bounded low rate so
 // process replacement is detected without adding one syscall to every frame.
@@ -141,6 +146,10 @@ pub(crate) struct GpuCompositor {
     next_content_epoch: u64,
     damage_history: VecDeque<AtlasDamageEpoch>,
     pending: Vec<PendingGpuFrame>,
+    /// A locally prepared scene may outlive a transport rejection, but the
+    /// next accepted submit must then replay the complete atlas rather than
+    /// treating the rejected damage as externally committed.
+    force_full_snapshot: bool,
     active: bool,
     activation_deadline: Instant,
     next_health_probe: Instant,
@@ -308,8 +317,9 @@ fn start_gpu_initialization(
         .name("uiserver-gpu-init".into())
         .spawn(move || {
             debug_line("uiserver: GPU initialization worker started");
-            require_background_thread_class();
-            debug_line("uiserver: GPU initialization worker entered background class");
+            if !GPU_INITIALIZATION_RETAINS_BOOT_CLASS {
+                require_background_thread_class();
+            }
             let deadline = Instant::now() + GPU_READY_TIMEOUT;
             let result = loop {
                 match GpuCompositor::try_initialize(display_fd, expected_display) {
@@ -484,6 +494,7 @@ impl GpuCompositor {
                 next_content_epoch: 1,
                 damage_history: VecDeque::with_capacity(info.slot_count as usize + 1),
                 pending: Vec::with_capacity(info.slot_count as usize),
+                force_full_snapshot: false,
                 active: false,
                 activation_deadline: Instant::now() + GPU_FIRST_FRAME_TIMEOUT,
                 next_health_probe: Instant::now() + GPU_PROVIDER_HEALTH_INTERVAL,
@@ -641,20 +652,34 @@ impl GpuCompositor {
         ) {
             layers.push(cursor);
         }
-        self.compiler
-            .signal_acquire(self.next_content_epoch)
-            .map_err(gpu_scene_errno)?;
-        let batch = self
-            .compiler
-            .compile(
-                state.surface.width,
-                state.surface.height,
-                self.next_content_epoch,
-                0xff00_0000,
-                layers.as_slice(),
-            )
-            .map_err(gpu_scene_errno)?;
-        let encoded = batch.encode().map_err(gpu_scene_errno)?;
+        let compiler_checkpoint = self.compiler.checkpoint();
+        if let Err(err) = self.compiler.signal_acquire(self.next_content_epoch) {
+            self.compiler.restore_rejected_submit(compiler_checkpoint);
+            self.force_full_snapshot = true;
+            return Err(gpu_scene_errno(err));
+        }
+        let batch = match self.compiler.compile(
+            state.surface.width,
+            state.surface.height,
+            self.next_content_epoch,
+            0xff00_0000,
+            layers.as_slice(),
+        ) {
+            Ok(batch) => batch,
+            Err(err) => {
+                self.compiler.restore_rejected_submit(compiler_checkpoint);
+                self.force_full_snapshot = true;
+                return Err(gpu_scene_errno(err));
+            }
+        };
+        let encoded = match batch.encode() {
+            Ok(encoded) => encoded,
+            Err(err) => {
+                self.compiler.restore_rejected_submit(compiler_checkpoint);
+                self.force_full_snapshot = true;
+                return Err(gpu_scene_errno(err));
+            }
+        };
         // Damage is relative to the immediately preceding complete contents of
         // this backing slot, not merely to the last globally submitted frame.
         // Triple-buffer rotation normally revisits an older slot; in that case
@@ -665,33 +690,57 @@ impl GpuCompositor {
         let source_damage_pixels = damage.iter().fold(0_u64, |total, rect| {
             total.saturating_add(u64::from(rect.width) * u64::from(rect.height))
         });
-        let submit_damage = snapshot_damage_for_slot(
-            retained_epoch,
-            self.next_content_epoch,
-            damage.as_slice(),
-            &self.damage_history,
-            self.info.atlas_width,
-            self.info.atlas_height,
-        )?;
+        let submit_damage = if self.force_full_snapshot {
+            full_atlas_damage(self.info.atlas_width, self.info.atlas_height)
+        } else {
+            match snapshot_damage_for_slot(
+                retained_epoch,
+                self.next_content_epoch,
+                damage.as_slice(),
+                &self.damage_history,
+                self.info.atlas_width,
+                self.info.atlas_height,
+            ) {
+                Ok(damage) => damage,
+                Err(err) => {
+                    self.compiler.restore_rejected_submit(compiler_checkpoint);
+                    self.force_full_snapshot = true;
+                    return Err(err);
+                }
+            }
+        };
         let prepare_elapsed = prepare_started.elapsed();
         let surface_handle = self.slots[slot_index].surface.handle;
         let copy_started = Instant::now();
-        copy_atlas_damage_to_slot(
+        if let Err(err) = copy_atlas_damage_to_slot(
             self.slots[slot_index].mapping.pixels_mut(),
             self.atlas.as_slice(),
             self.info.atlas_stride_bytes as usize / size_of::<u32>(),
             submit_damage.as_slice(),
             self.info.atlas_width,
             self.info.atlas_height,
-        )?;
+        ) {
+            self.compiler.restore_rejected_submit(compiler_checkpoint);
+            self.force_full_snapshot = true;
+            return Err(err);
+        }
         let copy_elapsed = copy_started.elapsed();
         let submit_started = Instant::now();
-        display_gpu_submit(
+        if let Err(err) = display_gpu_submit(
             self.display_fd,
             surface_handle,
             submit_damage.as_slice(),
             encoded.as_slice(),
-        )?;
+        ) {
+            // The atlas and retained scene describe the desired local state,
+            // but neither the timeline nor damage history may claim that the
+            // DVM accepted it. Restore admission and force the next retry to
+            // publish a complete snapshot into whichever slot becomes free.
+            self.compiler.restore_rejected_submit(compiler_checkpoint);
+            self.force_full_snapshot = true;
+            return Err(err);
+        }
+        self.force_full_snapshot = false;
         let submit_elapsed = submit_started.elapsed();
         let total_elapsed = total_started.elapsed();
         if total_elapsed >= GPU_SLOW_SUBMIT_THRESHOLD

@@ -16,6 +16,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::convert::TryFrom;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use x86_64::VirtAddr;
 use x86_64::structures::paging::PageTableFlags;
@@ -30,6 +31,7 @@ use crate::user::memfd::MemfdMappingHold;
 use kernel_ipc_runtime::api::KernelSharedRegionMappingHold;
 
 const PAGE_SIZE: u64 = 4096;
+static NEXT_FUTEX_NAMESPACE_ID: AtomicU64 = AtomicU64::new(1);
 const DEFAULT_MAPPING_GAP: u64 = 16 * 1024 * 1024;
 const ADMIN_REQUEST_PATH_CAPACITY: usize = 96;
 const PROCESS_EXEC_PATH_CAPACITY: usize = 192;
@@ -176,6 +178,7 @@ impl ProcessSecurityContext {
 
 pub struct UserProcessState {
     address_space: ProcessAddressSpace,
+    futex_namespace_id: u64,
     linux_process_state: Option<LinuxProcessState>,
     linux_memory_map: Option<LinuxMemoryMapState>,
     linux_runtime_profile: Option<LinuxRuntimeProfile>,
@@ -312,6 +315,7 @@ pub struct WindowsThreadRuntimeState {
 pub struct SharedMemfdMapping {
     start: u64,
     len: u64,
+    backing_offset: u64,
     hold: MemfdMappingHold,
 }
 
@@ -319,7 +323,17 @@ pub struct SharedMemfdMapping {
 struct SharedRegionMapping {
     start: u64,
     len: u64,
+    backing_offset: u64,
     hold: KernelSharedRegionMappingHold,
+}
+
+/// Stable, generational identity of one shared futex word. Physical frames
+/// are deliberately absent: remap, migration, and allocator reuse must not
+/// change or alias the rendezvous identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SharedFutexBackingKey {
+    Memfd { object_id: u64, byte_offset: u64 },
+    SharedRegion { region_id: u64, byte_offset: u64 },
 }
 
 impl SharedMemfdMapping {
@@ -384,6 +398,7 @@ impl UserProcessState {
 
         let mut state = Self {
             address_space,
+            futex_namespace_id: allocate_futex_namespace_id(),
             linux_process_state,
             linux_memory_map,
             linux_runtime_profile,
@@ -410,6 +425,11 @@ impl UserProcessState {
 
     pub fn address_space_root(&self) -> u64 {
         self.address_space.root_phys().as_u64()
+    }
+
+    /// Never-reused address-space generation used by private futex keys.
+    pub const fn futex_namespace_id(&self) -> u64 {
+        self.futex_namespace_id
     }
 
     pub fn address_space_mut(&mut self) -> &mut ProcessAddressSpace {
@@ -446,9 +466,19 @@ impl UserProcessState {
         &mut self.handles
     }
 
-    pub fn record_shared_memfd_mapping(&mut self, start: u64, len: u64, hold: MemfdMappingHold) {
-        self.shared_memfd_mappings
-            .push(SharedMemfdMapping { start, len, hold });
+    pub fn record_shared_memfd_mapping(
+        &mut self,
+        start: u64,
+        len: u64,
+        backing_offset: u64,
+        hold: MemfdMappingHold,
+    ) {
+        self.shared_memfd_mappings.push(SharedMemfdMapping {
+            start,
+            len,
+            backing_offset,
+            hold,
+        });
     }
 
     pub fn shared_memfd_overlap_segments(&self, start: u64, end: u64) -> Vec<(u64, usize)> {
@@ -477,6 +507,7 @@ impl UserProcessState {
                 updated.push(SharedMemfdMapping {
                     start: mapping.start,
                     len: start - mapping.start,
+                    backing_offset: mapping.backing_offset,
                     hold: mapping.hold.clone(),
                 });
             }
@@ -484,6 +515,10 @@ impl UserProcessState {
                 updated.push(SharedMemfdMapping {
                     start: end,
                     len: mapping_end - end,
+                    backing_offset: mapping
+                        .backing_offset
+                        .checked_add(end - mapping.start)
+                        .expect("shared memfd split offset overflow"),
                     hold: mapping.hold.clone(),
                 });
             }
@@ -497,8 +532,12 @@ impl UserProcessState {
         len: u64,
         hold: KernelSharedRegionMappingHold,
     ) {
-        self.shared_region_mappings
-            .push(SharedRegionMapping { start, len, hold });
+        self.shared_region_mappings.push(SharedRegionMapping {
+            start,
+            len,
+            backing_offset: 0,
+            hold,
+        });
     }
 
     pub fn shared_region_overlap_segments(&self, start: u64, end: u64) -> Vec<(u64, u64)> {
@@ -521,6 +560,7 @@ impl UserProcessState {
                 updated.push(SharedRegionMapping {
                     start: mapping.start,
                     len: start - mapping.start,
+                    backing_offset: mapping.backing_offset,
                     hold: mapping.hold.clone(),
                 });
             }
@@ -528,11 +568,61 @@ impl UserProcessState {
                 updated.push(SharedRegionMapping {
                     start: end,
                     len: mapping_end - end,
+                    backing_offset: mapping
+                        .backing_offset
+                        .checked_add(end - mapping.start)
+                        .expect("shared region split offset overflow"),
                     hold: mapping.hold.clone(),
                 });
             }
         }
         self.shared_region_mappings = updated;
+    }
+
+    /// Resolve a process-shared futex through retained VMA backing metadata.
+    /// The process-state lock pins these holds for the complete resolution;
+    /// object IDs/generations remain non-ABA after the returned value escapes.
+    pub fn shared_futex_backing_key(
+        &self,
+        address: u64,
+    ) -> Result<SharedFutexBackingKey, AddressSpaceError> {
+        self.address_space.validate_shared_futex_word(address)?;
+        let word_end = address
+            .checked_add(core::mem::size_of::<u32>() as u64)
+            .ok_or(AddressSpaceError::AddressOverflow)?;
+        let mut resolved = None;
+
+        for mapping in &self.shared_memfd_mappings {
+            if mapping.start <= address && word_end <= mapping.end() {
+                let key = SharedFutexBackingKey::Memfd {
+                    object_id: mapping.hold.object_id(),
+                    byte_offset: mapping
+                        .backing_offset
+                        .checked_add(address - mapping.start)
+                        .ok_or(AddressSpaceError::AddressOverflow)?,
+                };
+                assert!(
+                    resolved.replace(key).is_none(),
+                    "shared futex invariant: overlapping stable backing mappings"
+                );
+            }
+        }
+        for mapping in &self.shared_region_mappings {
+            if mapping.start <= address && word_end <= mapping.end() {
+                let key = SharedFutexBackingKey::SharedRegion {
+                    region_id: mapping.hold.identity(),
+                    byte_offset: mapping
+                        .backing_offset
+                        .checked_add(address - mapping.start)
+                        .ok_or(AddressSpaceError::AddressOverflow)?,
+                };
+                assert!(
+                    resolved.replace(key).is_none(),
+                    "shared futex invariant: overlapping stable backing mappings"
+                );
+            }
+        }
+        resolved.ok_or(AddressSpaceError::NotMapped)
     }
 
     pub fn linux_signal_action(&self, signal: u64) -> Option<LinuxSigAction> {
@@ -596,6 +686,7 @@ impl UserProcessState {
     ) -> Self {
         let mut state = Self {
             address_space,
+            futex_namespace_id: allocate_futex_namespace_id(),
             linux_process_state: self.linux_process_state,
             linux_memory_map: self.linux_memory_map.clone(),
             linux_runtime_profile: self.linux_runtime_profile.clone(),
@@ -808,6 +899,16 @@ impl UserProcessState {
 
 fn align_up(value: u64) -> u64 {
     value.saturating_add(PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
+}
+
+fn allocate_futex_namespace_id() -> u64 {
+    // ORDERING: the counter only allocates unique, never-reused identity; it
+    // does not publish process or page-table contents.
+    NEXT_FUTEX_NAMESPACE_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1).filter(|next| *next != 0)
+        })
+        .unwrap_or_else(|_| panic!("futex address-space identity exhausted"))
 }
 
 #[cfg(test)]

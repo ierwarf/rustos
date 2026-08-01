@@ -3,8 +3,8 @@
 #[cfg(test)]
 mod tests {
     use super::{
-        BOOT_TO_UI_HARD_LIMIT_MS, DEFAULT_UI_FPS_ACTIVE_WINDOWS, DVM_BLOCK_READY_MARKER,
-        DVM_BOOTSTRAP_FRAME_MARKER, DVM_CONTROL_AUTHENTICATION, DVM_CONTROL_CAPABILITIES,
+        DEFAULT_UI_FPS_ACTIVE_WINDOWS, DVM_BLOCK_READY_MARKER, DVM_BOOTSTRAP_FRAME_MARKER,
+        DVM_CONTROL_AUTHENTICATION, DVM_CONTROL_CAPABILITIES,
         DVM_CONTROL_PROTOCOL, DVM_CONTROL_STATE, DVM_CONTROL_TRANSPORT, DVM_DISPLAY_REGION_BYTES,
         DVM_GPU_COMPOSITOR_MARKER, DVM_KEYBOARD_INGRESS_MARKER, DVM_POINTER_INGRESS_MARKER,
         DvmNetworkCounters, GuestDisplay, MAX_SMOKE_TIMEOUT, PHYSICAL_GPU_PROFILES,
@@ -18,7 +18,7 @@ mod tests {
         claim_physical_gpu_launch_in, causal_tail, dvm_display_failure, dvm_display_provider_ready,
         dvm_display_relay_meets_fps, dvm_display_relay_ready, dvm_gpu_compositor_ready,
         dvm_gpu_device, dvm_machine, dvm_physical_frames_ready, dvm_pointer_device,
-        guest_cid_for_process, guest_deadline_reached, is_sha256, mesa_dri_prime_for_pci_bdf,
+        guest_cid_for_process, is_sha256, mesa_dri_prime_for_pci_bdf,
         parse_dvm_control_contract_text, parse_manifest_text, parse_smoke_options,
         physical_gpu_profile, prepare_runtime_log, qemu_display_backend, required_dvm_gpu_ready,
         rustos_marker_present, RustosSmpReadiness, RUSTOS_SMP_READINESS,
@@ -257,21 +257,14 @@ seq=119 msg=\"milestone name=product-init-identity-ready\"";
     }
 
     #[test]
-    fn interactive_ui_boot_has_an_independent_five_second_gate() {
-        assert_eq!(BOOT_TO_UI_HARD_LIMIT_MS, 5_000);
-        let source = include_str!("guest.rs");
-        assert!(source.contains("guest_deadline_reached"));
-        assert!(source.contains("BOOT_TO_UI_HARD_LIMIT_MS"));
-        assert!(source.contains("RUSTOS_GPU_ACTIVE_MARKER"));
-        assert!(source.contains("!options.storage_only"));
-        assert!(!guest_deadline_reached(
-            "seq=1 ts_us=4999999 milestone",
-            BOOT_TO_UI_HARD_LIMIT_MS,
-        ));
-        assert!(guest_deadline_reached(
-            "seq=2 ts_us=5000000 milestone",
-            BOOT_TO_UI_HARD_LIMIT_MS,
-        ));
+    fn interactive_ui_boot_uses_only_the_outer_smoke_timeout() {
+        let parallel_source = include_str!("guest.rs");
+        let interactive_source = include_str!("options.rs");
+        assert!(!parallel_source.contains("guest_deadline_reached"));
+        assert!(!parallel_source.contains("BOOT_TO_UI_HARD_LIMIT_MS"));
+        assert!(!interactive_source.contains("guest_deadline_reached"));
+        assert!(!interactive_source.contains("BOOT_TO_UI_HARD_LIMIT_MS"));
+        assert!(interactive_source.contains("before the outer smoke timeout"));
     }
 
     #[test]

@@ -8,6 +8,8 @@ use sha2::{Digest, Sha256};
 
 use crate::Result;
 
+use super::profiles::EvidenceProfile;
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum Severity {
     Critical,
@@ -154,12 +156,6 @@ pub(crate) struct RiskSurface {
     pub severity: String,
     pub flows: Vec<String>,
     pub reason: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct EvidenceProfile {
-    pub evidence_max_age_hours: u64,
-    pub required_evidence: Vec<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -627,16 +623,7 @@ impl ContractRegistry {
             }
         }
         for profile in self.manifest.profiles.values() {
-            if profile.evidence_max_age_hours == 0 {
-                bail!("evidence profile max age must be positive");
-            }
-            let mut evidence_paths = BTreeSet::new();
-            for evidence in &profile.required_evidence {
-                validate_relative_contract_path(evidence, "profile evidence")?;
-                if !evidence_paths.insert(evidence) {
-                    bail!("evidence profile repeats {}", evidence.display());
-                }
-            }
+            profile.validate(&self.models)?;
         }
         let intentional_terminal = self
             .models
@@ -1509,6 +1496,12 @@ fn registry_hash(registry: &ContractRegistry) -> String {
         hasher.update(profile.as_bytes());
         hasher.update([0]);
         hasher.update(contract.evidence_max_age_hours.to_le_bytes());
+        hasher.update(contract.tlc_max_wall_seconds.to_le_bytes());
+        hasher.update(contract.tlc_reuse_max_age_hours.to_le_bytes());
+        for model in &contract.required_models {
+            hasher.update(model.as_bytes());
+            hasher.update([0]);
+        }
         for path in &contract.required_evidence {
             hasher.update(path.as_os_str().as_encoded_bytes());
             hasher.update([0]);

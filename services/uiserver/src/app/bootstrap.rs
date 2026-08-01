@@ -313,6 +313,20 @@ impl AppState {
         })?;
         diag_line("uiserver: init open_display done");
         boot_line("uiserver: init open_display done");
+        // GPU admission depends only on the stable display contract, not on
+        // input, console, or the CPU scanout surface. Start its one-shot
+        // worker now so atlas creation and DVM priming overlap those serial
+        // device opens. The worker result is still revalidated against the
+        // final surface generation before it becomes active authority.
+        let mut gpu_display_wait_attempts = 0;
+        let (gpu_display, _) =
+            wait_for_primary_display(display_fd.as_raw_fd(), &mut gpu_display_wait_attempts)?;
+        boot_line("uiserver: gpu compositor init begin");
+        let gpu_compositor = Some(GpuCompositorRuntime::new(
+            display_fd.as_raw_fd(),
+            gpu_display,
+        )?);
+        boot_line("uiserver: gpu compositor init done");
         diag_line("uiserver: init open_input begin");
         boot_line("uiserver: init open_input begin");
         let input_fds = open_input().map_err(|errno| {
@@ -380,12 +394,6 @@ impl AppState {
         boot_line("uiserver: console command dispatcher spawn begin");
         let console_commands = start_console_command_dispatcher(console_fd);
         boot_line("uiserver: console command dispatcher spawn done");
-        boot_line("uiserver: gpu compositor init begin");
-        let gpu_compositor = Some(GpuCompositorRuntime::new(
-            display_fd.as_raw_fd(),
-            surface_state.display,
-        )?);
-        boot_line("uiserver: gpu compositor init done");
         Ok(Self {
             display: surface_state.display,
             surface: surface_state.surface,

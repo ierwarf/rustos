@@ -24,8 +24,18 @@ timeout, explicit deadlock policy, nightly simulation, and cross-tool pilot.
 Counts are emitted by the gates rather than duplicated here. The PR tier runs
 registry and whole-flow selftests, the script-registered exact source decision
 witnesses, exhaustive TLC, non-vacuous Kani, Verus, and a source-produced
-runtime trace. The nightly tier
-also runs selected TLC simulation, Miri, Loom, two typed Apalache refinements,
+runtime trace, and a closed Kani/Verus proof index whose source, formal-model,
+dependency, proof-file, and non-vacuity links are checked before either tool
+runs. Its 120-second TLC sub-lane admits the contract-selected 21 critical
+models at their unchanged finite configurations; it reuses only a recent pass
+whose exact model, configuration, pinned tool, and execution-policy hashes
+still match, then runs every cache miss. The full registry is nightly and does
+not reuse evidence.
+Any changed model is run directly before this profile, and expiration is a
+failure rather than an invitation to reduce the finite state space. It additionally requires every risk-scoped TLA+ property or
+transition mutant to be rejected by its named invariant with a normalized
+counterexample trace. The nightly tier
+also runs selected TLC simulation, Miri, two typed Apalache refinements,
 one TLAPS theorem, bounded Rust/C coverage-guided fuzzing, and pinned
 address/thread instrumentation. The PR tier also executes native
 Linux/Windows ABI reference comparison, checkpoint/service/storage recovery
@@ -35,8 +45,9 @@ critical/high kill ratio. Every tool emits or retains evidence below
 
 The product-boot composition gate closes the local-deadline gap:
 kernel-stamped runtime markers must refine one registered dependency DAG and
-reach the first WayClick frame or the storage-only terminal within the
-topology's five-second absolute deadline. Independent display and storage
+reach the first WayClick frame within the interactive topology's ten-second
+absolute deadline or the storage-only terminal within its independent
+five-second deadline. Independent display and storage
 branches may complete in either order, but every declared predecessor must
 precede its dependent event and every branch must join the terminal. A
 successful component marker cannot substitute for a missing later stage. The fault-scenario gate
@@ -54,9 +65,14 @@ failed infrastructure gates rather than implied successes:
   have exact source-decision witnesses; `runtime-control-rpc` is in both sets,
   none of those unit witnesses is full transition-system equivalence, and 51
   models still lack either mapping;
-- Loom covers one proof kernel, not the actual scheduler/IPC atomics under the
+- the PR concurrency triangle covers only its registered source-anchored
+  kernels and x86_64 litmuses, not actual scheduler/IPC atomics under the
   complete Rust memory model, and the C/Rust fuzz corpus has no long-term
   coverage floor, corpus minimization service, or regression SLA;
+- the Kani/Verus proof index is a bounded evidence-retrieval graph, not an
+  automatic proof synthesizer or a whole-kernel verification. Kani bounds,
+  Verus theorem assumptions, Rust/compiler correspondence, and all
+  unindexed code remain explicit coverage gaps;
 - high-risk whole-flow requirements and hazards now have stable IDs plus
   machine-checked model/source/witness links in `system-flows.tsv`; assumptions,
   proof obligations, runtime release evidence, review signatures, tool
@@ -74,7 +90,7 @@ failed infrastructure gates rather than implied successes:
 | A configured block read, mutation, or flush fault point is documented but does not intercept the live DVM request boundary, or consumes request/ring authority before reporting failure | dvm-volume-io; durable-block-mutation | kernel io-manager operation-bound fault admission before request ID, slot, cursor, and doorbell publication |
 | An installed block aperture accepts a missing/forged L0 signature, leaves a false RustOS-ready bit after a peer race, treats initial DVM-not-ready as a terminal fault, spins instead of sleeping, loses readiness between check and scheduler arm, falls back to bootstrap storage, or uses the volume before observing the exact generation | dvm-block-startup | signed early-system key, conditional readiness publication, kernel/io-manager readiness predicate, compat block-broker wait, and services/storaged bounded startup loop |
 | A foreign process activates another requester's suspended target, loaderd restart transfers or erases activation authority, an activation is replayed, or requester exit leaves an activatable orphan | deferred-process-activation | loaderd requester stamping plus kernel/compat deferred-activation registry, `proc_broker_ops/authority.rs`, and process-exit cleanup |
-| The first independently prepared child runs before later siblings become runnable, a malformed/duplicate/foreign batch partially activates, capability consumption precedes complete scheduler preflight, concurrent exit leaves half a cohort published, an impossible post-preflight failure is returned as recoverable state, or the synchronous loader reply delays a committed cohort's bounded first turns | atomic-process-activation-batch plus bootstrap-activation-handoff | initd fixed cohort construction, loaderd stamped-sender binding, kernel/compat ProcBrokerRegistry-to-Scheduler transaction, and kernel-ps allocation-free FIFO publication with a non-extendable cohort prefix |
+| The first independently prepared child runs before later siblings become runnable, a malformed/duplicate/foreign batch partially activates, capability consumption precedes complete scheduler preflight, runnable publication precedes one-shot capability consumption, concurrent exit interleaves the lock-held consumption-to-publication interior, an impossible post-preflight failure is returned as recoverable state, or the synchronous loader reply delays a committed cohort's bounded first turns | atomic-process-activation-batch plus bootstrap-activation-handoff | initd fixed cohort construction, loaderd stamped-sender binding, kernel/compat ProcBrokerRegistry-to-Scheduler transaction, an executable post-authority suspension assertion, and kernel-ps allocation-free FIFO publication with a non-extendable cohort prefix |
 | A generic process asks loaderd to mint an admin/System/session-bearing child, a non-procd caller commits another process image, or a service revoke during image loading still commits | loader-request-authority | initd identity-only publication, loaderd live role admission, shared ABI role matrix, `ipc_ops/subject.rs`, `proc_broker_ops/authority.rs`, and kernel/compat terminal role revalidation |
 | A supervisor reports an arbitrary live PID, omits or changes the declared executable path, rebinds a live lease, or retains child capability after its reporter exits | post-init-leases | rootd exact sender/path admission, rootd-only deferred-spawn provenance broker, reporter-chain validation, and lifecycle cascade |
 | A missing or duplicate boot module, malformed/overlapping table, path alias, undeclared file, corrupt payload, invalid storage-epoch verifying key, or early native-storage probe creates bootstrap authority | early-system-admission | boot/boot-protocol/src/lib.rs, kernel/nucleus-core/src/multiboot2.rs, kernel/io-manager/src/storage/boot_volume.rs, and tools/xtask/src/stage/mod.rs |
@@ -133,7 +149,7 @@ failed infrastructure gates rather than implied successes:
 | A DVM reconnect or disconnect retains old Ctrl/Alt/key/button state, a reset waits behind stale input, or a retired epoch injects into the next session | dvm-input-revocation | kernel/io-manager/src/input/{dvm_ring.rs,wait_queue.rs}, services/inputd/src/{dvm_protocol.rs,main.rs}, drivers/libs/keyboard-core/src/lib.rs |
 | A DVM gains a write path to the host-owned ring, L0 produces before a live policy consumer, cursors exceed the fixed aperture, IRQ decodes or moves cursors, revoke omits a service-visible barrier, a stale/malformed record reaches policy, recovery reallocates a permanent MSI-X vector or leaks a mapping, or finite committed work never drains | dvm-input-ring | libs/driver-domain-protocol/src/lib.rs, libs/driver-domain-host/src/{lib.rs,ivshmem.rs}, kernel/io-manager/src/input/{dvm_ring.rs,wait_queue.rs}, services/inputd/src/dvm_protocol.rs, kernel/compat/src/user/syscall/linux/input_broker_ops.rs |
 | A storage DVM chooses guest/host addresses, overruns a queue or transfer slot, completes a foreign/stale request, fabricates stable-write evidence, loses FLUSH/FUA ordering, preserves queue authority across restart, or forges a successor generation | dvm-block-transport | protocol ABI v2, kernel signed-epoch admission/rebind, Linux relay, storaged/vfsd, and KVM shared-ring evidence |
-| A generic client poll claims DVM transport-consumer authority, a wake/arm race strands committed input, an ingestion turn drains without a bound or starves recovery work, or finite committed records never reach inputd policy under the declared worker fairness | input-ingestion-worker | kernel/compat/src/user/syscall/linux/input_broker_ops.rs and services/inputd/src/main.rs |
+| A generic client poll claims DVM transport-consumer authority, a wake/arm race strands committed input, an ingestion turn drains without a bound or starves recovery work, a transient netd startup failure consumes the sole authenticated SESSION_START and silently drops every later event, a partially ACKed revoke/grant suffix is replayed out of order, or finite committed records never reach inputd policy under the declared worker fairness | input-ingestion-worker | kernel/compat/src/user/syscall/linux/input_broker_ops.rs and services/inputd/src/main.rs |
 | A DVM-backed scanout/input path, a compromised DVM relay, or a lost presentation/input channel is mistaken for a trusted-attention path and permits a privileged prompt | trusted-ui-boundary | kernel/io-manager/src/io/dvm_display.rs, kernel/io-manager/src/io/gui.rs, libs/rustos-user-abi/src/{device,syscall}.rs, services/uiserver/src/sys.rs |
 | A generic `poll`/`epoll` caller drains the DVM ring, the MSI-X worker transfer is absent from the ownership model, a finite `STATS` reply or readiness-gated read loses/replays an event, uiserver starts the stateful inputd READ merely to discover an empty queue, or accumulates burst credit after a missed reader cadence | input-readiness | kernel/io-manager/src/input/{wait_queue.rs,dvm_ring.rs}, kernel/compat/src/user/syscall/linux/{ipc_ops.rs,service_ops/poll_epoll.rs,service_ops/ipc_helpers.rs}, services/inputd/src/{dvm_protocol.rs,main.rs}, services/uiserver/src/{input_loop.rs,sys.rs} |
 | A provider changes readiness between an epoll check and waiter arm, an internal 16 ms provider timeout replaces the application's deadline or hides readiness already found on another fd, a timeout races a signal, a restarted service revives a stale token or aborts the aggregate wait instead of returning per-interest HUP, provider epoch is part of the registration key and creates duplicate/undeletable interests after restart, DEL incorrectly requires the unavailable provider's current epoch, numeric-fd reuse retargets an old interest, dup acquires one provider object then commits a concurrently reused source fd or releases a stale snapshot instead of the target actually replaced, fork clones one fd table but reacquires provider refs from a later live-parent snapshot, a closed console session is silently recreated by stale read/write/TTY/input traffic, a transient syscall snapshot is mistaken for an fd and suppresses final-close purge, a nonblocking console read re-enters the blocking retry loop after readiness is consumed, fd 0--2 bypass normal close/dup replacement semantics, a TTY ioctl route treats a closed/reused non-console fd as the caller's console, a wedged provider makes close/CLOEXEC/exit wait without a bound, or dup/fork/close/exec/exit prematurely destroys or retains the service object behind an open description | userspace-wait-set | libs/rustos-user-abi/src/syscall.rs, kernel/compat/src/user/syscall/linux/{waitset_broker_ops.rs,ipc_ops.rs,proc_broker_ops.rs,lifecycle_broker_ops.rs,service_ops/{ipc_helpers.rs,poll_epoll.rs,vfs_meta.rs,vfs_socket.rs}}, kernel/ps/src/user/handles/{table.rs,handles.rs}, and services/{vfsd,netd,inputd,runtimed}/src |
@@ -173,6 +189,7 @@ failed infrastructure gates rather than implied successes:
 | A mutable or malformed runtime launch record requests strict System weight for an ordinary app, or UI weight is granted to a path that merely resembles the trusted UI executable | scheduler-admission | services/runtimed/src/{main.rs,spawn.rs} |
 | A catalog child becomes runnable before runtimed records its PID, or an activated child never receives its one-shot first turn while UI/input IPC handoffs remain busy | deferred-start, scheduler-cpu-distribution | services/runtimed/src/spawn.rs and kernel/ps/src/multitask/scheduler.rs |
 | A System caller waits on a User broker or nested User policy server without reply-scoped donation; a critical DVM/UI flood exceeds its two-dispatch System bound while User work is ready; a completed/cancelled/exited reply leaks an inherited System class; or a foreign/malformed netd response creates latency authority | ipc-priority-inheritance, scheduler-cpu-distribution | kernel/ps/src/multitask/{scheduler.rs,current.rs}, kernel/compat/src/user/syscall/linux/ipc_ops.rs |
+| A kernel-derived System service call remains trapped behind an ordinary endpoint backlog, ring3 self-selects priority, lane-local FIFO is reordered, or strict priority starves the ordinary lane | ipc-priority-queue | kernel/ipc-runtime/src/ipc/mod.rs, kernel/compat/src/user/syscall/linux/ipc_ops.rs, kernel/ps/src/multitask/{scheduler.rs,current.rs} |
 | Opaque IPC descriptors remain in the pending registry after queue cancellation, peer-close, invalid receiver output, or any scheduler retirement; a transferred service-backed open description loses or leaks its service reference; retired task/process owners retain endpoint authority; one batch is partially installed | ipc-handle-transfer | kernel/ps/src/user/handles.rs, kernel/ipc-runtime/src/ipc/mod.rs, kernel/compat/src/user/syscall/linux/{ipc_ops.rs,service_ops/vfs_socket.rs}, kernel/ps/src/multitask/scheduler.rs, and kernel/executive/src/boot.rs |
 | A task ID, process-slot generation, local VFS/socket token, prepare handle, or exec ticket wraps and aliases a still-live or stale bearer; or generation exhaustion silently returns to one | authority-identity-lifecycle | kernel/ps/src/{multitask,user/handles.rs}, kernel/compat/src/user/syscall/linux/{proc_broker_ops.rs,net_broker_ops.rs,service_ops/vfs_socket.rs} |
 | Rootd exit/revoke reopens the root service namespace to a foreign process, a service publishes an endpoint owned by another process, or rootd changes generation between lease authorization and publication commit | root-authority-publication | kernel/compat/src/user/syscall/linux/ipc_ops.rs and kernel/ipc-runtime/src/ipc/mod.rs |
@@ -692,3 +709,15 @@ recorded. The separate RustOS
 native boot-device DMA backend remains identity-only. Therefore the DMA
 hardware gate stays explicitly failed even though both finite abstractions pass
 TLC.
+
+## Focused SMP race coverage added 2026-08
+
+The PR and SMP-iteration profiles now include the compact
+`user-stack-growth/UserStackGrowth`,
+`exec-address-space-transaction/ExecAddressSpaceTransaction`,
+`gpu-submit-transaction/GpuSubmitTransaction`, and
+`acceptance-profile-publication/AcceptanceProfilePublication` models. The
+existing `robust-futex-owner-death/RobustFutexOwnerDeath` model also carries
+shared/private key equivalence. Each changed model has a named source witness
+and a killed specification mutation. This closes the reported abstract gaps;
+runtime contention, DVM behavior, and sustained FPS remain separate KVM gates.

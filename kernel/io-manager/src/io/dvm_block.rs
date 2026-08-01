@@ -33,6 +33,10 @@ use ed25519_dalek::{Signature, VerifyingKey};
 
 use crate::sync::KernelWaitLock;
 
+#[path = "block_interrupt_install.rs"]
+mod interrupt_install;
+use interrupt_install::{BlockInterruptInstall, program_msix_entry};
+
 const IVSHMEM_VENDOR_ID: u16 = 0x1af4;
 const IVSHMEM_DEVICE_ID: u16 = 0x1110;
 const IVSHMEM_REGISTERS_BAR: usize = 0;
@@ -745,7 +749,7 @@ pub(crate) fn try_install() -> bool {
         );
         return false;
     }
-    if !arm_block_ring_interrupt(device) {
+    let Some(interrupt_install) = arm_block_ring_interrupt(device) else {
         release_state_mappings(&state);
         nucleus_core::debug::write_debugcon_only_line(
             alloc::format!(
@@ -755,7 +759,7 @@ pub(crate) fn try_install() -> bool {
             .as_bytes(),
         );
         return false;
-    }
+    };
     if !publish_rustos_ready(state.base, state.geometry.flags) {
         release_state_mappings(&state);
         return false;
@@ -780,6 +784,7 @@ pub(crate) fn try_install() -> bool {
     );
     *guard = Some(state);
     INSTALLED.store(true, Ordering::Release);
+    interrupt_install.retain_permanent();
     true
 }
 
@@ -1066,42 +1071,42 @@ fn write_record(base: *mut u8, bytes: &[u8; DVM_BLOCK_RECORD_BYTES]) {
     }
 }
 
-fn arm_block_ring_interrupt(device: crate::arch::pci::PciDevice) -> bool {
+fn arm_block_ring_interrupt(device: crate::arch::pci::PciDevice) -> Option<BlockInterruptInstall> {
     let Some(capability) = device.msix_capability() else {
-        return false;
+        return None;
     };
     if capability.table_entries() != BLOCK_RING_MSIX_VECTOR_COUNT {
-        return false;
+        return None;
     }
     let Some(table_resource) = capability.table_resource(device) else {
-        return false;
+        return None;
     };
     let Ok(table_len) = usize::try_from(table_resource.size) else {
-        return false;
+        return None;
     };
     let Ok(table_offset) = usize::try_from(capability.table_offset()) else {
-        return false;
+        return None;
     };
     if table_offset
         .checked_add(MSIX_ENTRY_BYTES)
         .is_none_or(|end| end > table_len)
     {
-        return false;
+        return None;
     }
     capability.set_function_masked(device, true);
     capability.set_enabled(device, false);
     let Some(mut vector_lease) = crate::arch::msi::MsiVectorLease::allocate() else {
-        return false;
+        return None;
     };
     if !vector_lease.register_handler(block_ring_interrupt) {
-        return false;
+        return None;
     }
     let Some(message) = vector_lease.message() else {
-        return false;
+        return None;
     };
     let table = crate::driver::mmio::map(table_resource.start, table_len, false).cast::<u8>();
     if table.is_null() {
-        return false;
+        return None;
     }
     unsafe {
         program_msix_entry(table.add(table_offset), message);
@@ -1115,29 +1120,11 @@ fn arm_block_ring_interrupt(device: crate::arch::pci::PciDevice) -> bool {
     capability.set_enabled(device, true);
     capability.set_function_masked(device, false);
     crate::driver::mmio::unmap(table.cast());
-    IRQ_VECTOR.store(vector_lease.commit(), Ordering::Release);
-    true
-}
-
-unsafe fn program_msix_entry(entry: *mut u8, message: crate::arch::msi::MsiMessage) {
-    unsafe {
-        entry
-            .add(MSIX_ENTRY_VECTOR_CONTROL_OFFSET)
-            .cast::<u32>()
-            .write_volatile(MSIX_ENTRY_VECTOR_MASKED.to_le());
-        entry
-            .add(MSIX_ENTRY_ADDRESS_LOW_OFFSET)
-            .cast::<u32>()
-            .write_volatile((message.address as u32).to_le());
-        entry
-            .add(MSIX_ENTRY_ADDRESS_HIGH_OFFSET)
-            .cast::<u32>()
-            .write_volatile(((message.address >> 32) as u32).to_le());
-        entry
-            .add(MSIX_ENTRY_DATA_OFFSET)
-            .cast::<u32>()
-            .write_volatile(message.data.to_le());
-    }
+    Some(BlockInterruptInstall {
+        capability,
+        device,
+        vector: Some(vector_lease.commit()),
+    })
 }
 
 fn load_u32(base: *mut u8, offset: usize, ordering: Ordering) -> u32 {

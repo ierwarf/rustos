@@ -74,6 +74,7 @@ input-readiness/InputReadiness	temporal	intentional-terminal	readiness wait may 
 ipc-endpoint-ownership/IpcEndpointOwnership	safety	intentional-terminal	message or owner may terminate	120	900	exhaustive	no	no	no
 ipc-handle-transfer/IpcHandleTransfer	safety	intentional-terminal	transfer outcome is terminal	120	900	exhaustive+simulate	yes	no	no
 ipc-priority-inheritance/IpcPriorityInheritance	safety	intentional-terminal	IPC call may resolve or cancel	120	900	exhaustive	no	no	no
+ipc-priority-queue/IpcPriorityQueue	safety	check	all-delivered terminal state stutters while priority selection remains explicit	30	120	exhaustive	no	no	no
 ipc-reply-deadline/IpcReplyDeadline	temporal	intentional-terminal	IPC wait outcome is terminal	120	900	exhaustive	no	no	no
 ivshmem-pairing/IvshmemPairing	temporal	intentional-terminal	peer pairing may disconnect	120	900	exhaustive	no	no	no
 kernel-resource-accounting/KernelResourceAccounting	temporal	intentional-terminal	deferred backing reclaim eventually returns exact owner quota	30	120	exhaustive	no	no	no
@@ -113,3 +114,7 @@ vfio-release-authorization/VfioReleaseAuthorization	safety	intentional-terminal	
 wayland-accept-isolation/WaylandAcceptIsolation	temporal	intentional-terminal	accept decision is terminal	120	900	exhaustive	no	no	no
 wayland-frame-pacing/WaylandFramePacing	temporal	intentional-terminal	bounded pacing epoch may stop	120	900	exhaustive	no	no	no
 product-boot/ProductBoot	temporal	intentional-terminal	product boot reaches a complete topology terminal or an explicit bounded failure	30	120	exhaustive	no	no	yes
+acceptance-profile-publication/AcceptanceProfilePublication	temporal	check	enabled and expired terminals stutter while bounded late publication remains explicit	30	120	exhaustive	no	no	no
+exec-address-space-transaction/ExecAddressSpaceTransaction	temporal	check	owned and cancelled terminals stutter while root ownership transfer remains explicit	30	120	exhaustive	no	no	no
+gpu-submit-transaction/GpuSubmitTransaction	safety	check	accepted submit stutters while rejected submits retain an explicit retry transition	30	120	exhaustive	no	no	no
+user-stack-growth/UserStackGrowth	temporal	check	committed and retired terminals stutter while the cross-lock transaction settles	30	120	exhaustive	no	no	no

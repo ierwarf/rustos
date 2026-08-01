@@ -145,12 +145,31 @@ impl RetiredSlotReclaim {
                 cr2,
                 rip,
             ),
-            Some(TaskRetireReason::CorruptedContext { saved_rsp, reason }) => {
+            Some(TaskRetireReason::CorruptedContext {
+                saved_rsp,
+                reason,
+                reason_code,
+            }) => {
                 debug::record_milestone(
                     debug::LogCategory::Sched,
                     "task-context-corrupted",
                     self.task_id,
-                    saved_rsp as u64,
+                    // FAILURE-TELEMETRY: reliable-output pressure may drop the
+                    // following companion record. Carry the reason in the top
+                    // byte of this record and the low 56 bits of the canonical
+                    // kernel stack pointer in the remainder. Bit 47 remains
+                    // sufficient to reconstruct the canonical high byte.
+                    (u64::from(reason_code) << 56) | ((saved_rsp as u64) & 0x00ff_ffff_ffff_ffff),
+                );
+                // FAILURE-TELEMETRY: ordinary debug text can interleave on
+                // concurrent CPUs. Keep the validation cause in a separate,
+                // fixed milestone so an SMP corruption is diagnosable without
+                // treating a torn serial line as evidence.
+                debug::record_milestone(
+                    debug::LogCategory::Sched,
+                    "task-context-corruption-reason",
+                    self.task_id,
+                    u64::from(reason_code),
                 );
                 debug::warn!(
                     sched,

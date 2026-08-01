@@ -100,6 +100,7 @@ pub enum LockClass {
     DisplayBackendWait = 36,
     Scheduler = 37,
     TlbShootdown = 38,
+    LinuxThreadState = 39,
 }
 
 #[cfg(rustos_boot_image)]

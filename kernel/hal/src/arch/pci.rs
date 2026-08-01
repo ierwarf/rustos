@@ -117,6 +117,12 @@ impl MsixCapability {
             control &= !PCI_MSIX_CONTROL_FUNCTION_MASK;
         }
         device.write_u16(self.config_offset + PCI_MSIX_CONTROL_OFFSET, control);
+        let observed = device.read_u16(self.config_offset + PCI_MSIX_CONTROL_OFFSET);
+        assert_eq!(
+            observed & PCI_MSIX_CONTROL_FUNCTION_MASK != 0,
+            masked,
+            "PCI MSI-X invariant: function-mask write did not complete"
+        );
     }
 
     /// Enable MSI-X only after a driver has populated and unmasked an owned
@@ -129,6 +135,12 @@ impl MsixCapability {
             control &= !PCI_MSIX_CONTROL_ENABLE;
         }
         device.write_u16(self.config_offset + PCI_MSIX_CONTROL_OFFSET, control);
+        let observed = device.read_u16(self.config_offset + PCI_MSIX_CONTROL_OFFSET);
+        assert_eq!(
+            observed & PCI_MSIX_CONTROL_ENABLE != 0,
+            enabled,
+            "PCI MSI-X invariant: enable write did not complete"
+        );
     }
 }
 

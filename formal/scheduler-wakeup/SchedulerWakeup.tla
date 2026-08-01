@@ -37,6 +37,7 @@ Retired == "retired"
 
 VARIABLES now,
           current,
+          transition,
           taskState,
           timerDeadline,
           armEpoch,
@@ -45,12 +46,13 @@ VARIABLES now,
           resumePending,
           framePublished
 
-vars == <<now, current, taskState, timerDeadline, armEpoch, lastWakeEpoch,
+vars == <<now, current, transition, taskState, timerDeadline, armEpoch, lastWakeEpoch,
           blockedEpoch, resumePending, framePublished>>
 
 Init ==
     /\ now = 0
     /\ current = NoTask
+    /\ transition = NoTask
     /\ taskState = [t \in Tasks |-> Ready]
     /\ timerDeadline = [t \in Tasks |-> NoTimer]
     /\ armEpoch = [t \in Tasks |-> 0]
@@ -62,20 +64,30 @@ Init ==
 Dispatch(task) ==
     /\ task \in Tasks
     /\ current = NoTask
+    /\ transition # task
     /\ taskState[task] = Ready
     /\ current' = task
     /\ framePublished' = [framePublished EXCEPT ![task] = FALSE]
-    /\ UNCHANGED <<now, taskState, timerDeadline, armEpoch, lastWakeEpoch,
+    /\ UNCHANGED <<now, transition, taskState, timerDeadline, armEpoch, lastWakeEpoch,
                   blockedEpoch, resumePending>>
 
 ReleaseCurrent(task) ==
     /\ task \in Tasks
     /\ current = task
+    /\ transition = NoTask
     /\ taskState[task] = Ready
     /\ current' = NoTask
+    /\ transition' = task
     /\ framePublished' = [framePublished EXCEPT ![task] = TRUE]
     /\ UNCHANGED <<now, taskState, timerDeadline, armEpoch, lastWakeEpoch,
                   blockedEpoch, resumePending>>
+
+CommitTransition(task) ==
+    /\ task \in Tasks
+    /\ transition = task
+    /\ transition' = NoTask
+    /\ UNCHANGED <<now, current, taskState, timerDeadline, armEpoch,
+                    lastWakeEpoch, blockedEpoch, resumePending, framePublished>>
 
 (*******************************************************************************
 The first half of wait_for_reply_with_deadline. Armed remains schedulable: it
@@ -91,7 +103,7 @@ ArmCurrentBlock(task) ==
     /\ armEpoch[task] < MaxArmEpoch
     /\ taskState' = [taskState EXCEPT ![task] = Armed]
     /\ armEpoch' = [armEpoch EXCEPT ![task] = armEpoch[task] + 1]
-    /\ UNCHANGED <<now, current, timerDeadline, lastWakeEpoch, blockedEpoch>>
+    /\ UNCHANGED <<now, current, transition, timerDeadline, lastWakeEpoch, blockedEpoch>>
     /\ UNCHANGED <<resumePending, framePublished>>
 
 ArmDeadlineTimer(task) ==
@@ -101,7 +113,7 @@ ArmDeadlineTimer(task) ==
     /\ timerDeadline[task] = NoTimer
     /\ now < MaxTick
     /\ timerDeadline' = [timerDeadline EXCEPT ![task] = now + 1]
-    /\ UNCHANGED <<now, current, taskState, armEpoch, lastWakeEpoch,
+    /\ UNCHANGED <<now, current, transition, taskState, armEpoch, lastWakeEpoch,
                   blockedEpoch, resumePending, framePublished>>
 
 (*******************************************************************************
@@ -111,11 +123,13 @@ legal only while the exact armed epoch and its timer are both still present.
 CommitCurrentBlock(task) ==
     /\ task \in Tasks
     /\ current = task
+    /\ transition = NoTask
     /\ taskState[task] = Armed
     /\ timerDeadline[task] > now
     /\ armEpoch[task] > lastWakeEpoch[task]
     /\ taskState' = [taskState EXCEPT ![task] = Blocked]
     /\ current' = NoTask
+    /\ transition' = task
     /\ blockedEpoch' = [blockedEpoch EXCEPT ![task] = armEpoch[task]]
     /\ framePublished' = [framePublished EXCEPT ![task] = TRUE]
     /\ UNCHANGED <<now, timerDeadline, armEpoch, lastWakeEpoch, resumePending>>
@@ -142,7 +156,7 @@ WakeTask(task) ==
         [resumePending EXCEPT
             ![task] = resumePending[task] \/ taskState[task] = Blocked]
     /\ UNCHANGED framePublished
-    /\ UNCHANGED <<now, current, timerDeadline, armEpoch, blockedEpoch>>
+    /\ UNCHANGED <<now, current, transition, timerDeadline, armEpoch, blockedEpoch>>
 
 (*******************************************************************************
 A clockevent wake is notification, not ownership transfer. The deadline stays
@@ -157,7 +171,7 @@ CompleteWait(task) ==
     /\ timerDeadline[task] # NoTimer
     /\ timerDeadline' = [timerDeadline EXCEPT ![task] = NoTimer]
     /\ resumePending' = [resumePending EXCEPT ![task] = FALSE]
-    /\ UNCHANGED <<now, current, taskState, armEpoch, lastWakeEpoch,
+    /\ UNCHANGED <<now, current, transition, taskState, armEpoch, lastWakeEpoch,
                   blockedEpoch, framePublished>>
 
 CancelCurrentArm(task) ==
@@ -168,7 +182,7 @@ CancelCurrentArm(task) ==
     /\ timerDeadline' = [timerDeadline EXCEPT ![task] = NoTimer]
     /\ lastWakeEpoch' = [lastWakeEpoch EXCEPT ![task] = armEpoch[task]]
     /\ resumePending' = [resumePending EXCEPT ![task] = FALSE]
-    /\ UNCHANGED <<now, current, armEpoch, blockedEpoch>>
+    /\ UNCHANGED <<now, current, transition, armEpoch, blockedEpoch>>
     /\ UNCHANGED framePublished
 
 (*******************************************************************************
@@ -197,7 +211,7 @@ Tick ==
         [t \in Tasks |->
             resumePending[t] \/ (t \in DueTasks /\ taskState[t] = Blocked)]
     /\ UNCHANGED framePublished
-    /\ UNCHANGED <<current, armEpoch, blockedEpoch>>
+    /\ UNCHANGED <<current, transition, armEpoch, blockedEpoch>>
 
 RetireTask(task) ==
     /\ task \in Tasks
@@ -206,12 +220,14 @@ RetireTask(task) ==
     /\ timerDeadline' = [timerDeadline EXCEPT ![task] = NoTimer]
     /\ resumePending' = [resumePending EXCEPT ![task] = FALSE]
     /\ current' = IF current = task THEN NoTask ELSE current
+    /\ transition' = IF transition = task THEN NoTask ELSE transition
     /\ framePublished' = [framePublished EXCEPT ![task] = FALSE]
     /\ UNCHANGED <<now, armEpoch, lastWakeEpoch, blockedEpoch>>
 
 Next ==
     \/ \E task \in Tasks : Dispatch(task)
     \/ \E task \in Tasks : ReleaseCurrent(task)
+    \/ \E task \in Tasks : CommitTransition(task)
     \/ \E task \in Tasks : ArmCurrentBlock(task)
     \/ \E task \in Tasks : ArmDeadlineTimer(task)
     \/ \E task \in Tasks : CommitCurrentBlock(task)
@@ -228,6 +244,7 @@ TypeOK ==
     /\ MaxArmEpoch \in Nat
     /\ now \in 0..MaxTick
     /\ current \in Tasks \cup {NoTask}
+    /\ transition \in Tasks \cup {NoTask}
     /\ taskState \in [Tasks -> {Ready, Armed, Blocked, Retired}]
     /\ timerDeadline \in [Tasks -> 0..MaxTick]
     /\ armEpoch \in [Tasks -> 0..MaxArmEpoch]
@@ -247,6 +264,16 @@ BlockedTaskOwnsNoCpu ==
 
 CurrentTaskOwnsNoPublishedFrame ==
     current # NoTask => ~framePublished[current]
+
+TransitionOwnsPublishedFrame ==
+    transition # NoTask => framePublished[transition]
+
+TransitionCannotDispatch == current = NoTask \/ current # transition
+
+TransitionWakeSurvives ==
+    \A task \in Tasks:
+        transition = task /\ lastWakeEpoch[task] = blockedEpoch[task] /\
+        blockedEpoch[task] # 0 => taskState[task] = Ready
 
 NonCurrentReadyTaskOwnsPublishedFrame ==
     \A task \in Tasks :
@@ -310,6 +337,7 @@ Spec ==
     /\ WF_vars(Tick)
     /\ \A task \in Tasks : WF_vars(ArmDeadlineTimer(task))
     /\ \A task \in Tasks : WF_vars(ReleaseCurrent(task))
+    /\ \A task \in Tasks : WF_vars(CommitTransition(task))
     /\ \A task \in Tasks : SF_vars(Dispatch(task))
     /\ \A task \in Tasks : SF_vars(CompleteWait(task))
 

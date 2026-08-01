@@ -35,7 +35,7 @@ const MAX_SLOW_SERVICE_CALL_LOGS_PER_SECOND: usize = 1;
 const PENDING_VFS_MUTATION_CAPACITY: usize = 32 * 1024;
 const PENDING_VFS_MUTATION_STORAGE_CAPACITY: usize = PENDING_VFS_MUTATION_CAPACITY + 1;
 const PENDING_VFS_PAYLOAD_CAPACITY: usize = 64;
-const FOREGROUND_VFS_MAINTENANCE_ATTEMPTS: usize = 1;
+const HOUSEKEEPING_VFS_MAINTENANCE_ATTEMPTS: usize = 1;
 
 #[derive(Clone, Copy)]
 struct PendingVfsMutation {
@@ -481,7 +481,6 @@ fn call_vfs_ipc_request_impl(
     request: &VfsIpcRequest,
     timeout_ms: Option<u64>,
 ) -> Result<VfsIpcResponse, i64> {
-    let _ = drain_pending_vfs_mutations();
     let start_ticks = crate::arch::rtc::ticks();
     let replay_safe_request = vfs_request_is_replay_safe(request);
     let deferred_reconcile = matches!(
@@ -693,11 +692,13 @@ pub(super) fn service_deferred_vfs_mutations() -> usize {
 }
 
 fn drain_pending_vfs_mutations() -> usize {
-    // Deferred recovery cannot multiply one foreground read/open into eight
-    // independent 16 ms waits. One one-millisecond replay turn preserves
-    // progress while bounding head-of-line maintenance charged to the caller.
+    // This path is owned by the dedicated nucleus housekeeping task, not a
+    // foreground syscall tail. Keep one transaction per yielded turn, but
+    // give that transaction the normal bounded control deadline. A 1 ms
+    // cancel/retry loop was shorter than an SMP service round-trip: vfsd then
+    // consumed an endless stream of already-revoked replies and starved boot.
     let mut attempted = 0usize;
-    for _ in 0..FOREGROUND_VFS_MAINTENANCE_ATTEMPTS {
+    for _ in 0..HOUSEKEEPING_VFS_MAINTENANCE_ATTEMPTS {
         let Some(pending) = PENDING_VFS_MUTATIONS.lock().pop() else {
             return attempted;
         };
@@ -716,8 +717,8 @@ fn drain_pending_vfs_mutations() -> usize {
         let response = ipc_ops::call_service_endpoint_with_class_deadline(
             IPC_SERVICE_VFSD,
             as_bytes(&request),
-            ipc_ops::ServiceIpcClass::ReadinessQuery,
-            rustos_user_abi::performance::IPC_FOREGROUND_MAINTENANCE_SLICE_MS,
+            ipc_ops::ServiceIpcClass::InteractiveControl,
+            rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS,
         )
         .ok()
         .and_then(|bytes| {
@@ -1815,11 +1816,11 @@ mod tests {
     }
 
     #[test]
-    fn foreground_vfs_maintenance_is_one_bounded_replay_turn() {
-        assert_eq!(FOREGROUND_VFS_MAINTENANCE_ATTEMPTS, 1);
+    fn housekeeping_vfs_maintenance_is_one_bounded_replay_turn() {
+        assert_eq!(HOUSEKEEPING_VFS_MAINTENANCE_ATTEMPTS, 1);
         assert_eq!(
-            rustos_user_abi::performance::IPC_FOREGROUND_MAINTENANCE_SLICE_MS,
-            1
+            rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS,
+            100
         );
     }
 

@@ -64,10 +64,40 @@ def read_registry(root: Path) -> list[dict[str, str | int]]:
         source_text = source.read_text(encoding="utf-8")
         if source_text.count(str(mutation["find"])) < int(mutation["occurrence"]):
             raise SystemExit(f"{identity}: mutation anchor occurrence is missing")
-        if not re.search(
-            rf"\bfn\s+{re.escape(str(mutation['test']))}\s*\(", source_text
+        witness_pattern = rf"\bfn\s+{re.escape(str(mutation['test']))}\s*\("
+        witness_sources = [source_text]
+        # Large kernel owners keep their exact unit witnesses in an explicit
+        # path module. Resolve only modules that the mutated source itself
+        # declares, so an unrelated same-named test cannot satisfy this gate.
+        for relative in re.findall(
+            r'#\[path\s*=\s*"([^"]+)"\]\s*\n\s*mod\s+[A-Za-z_][A-Za-z0-9_]*\s*;',
+            source_text,
         ):
-            raise SystemExit(f"{identity}: exact witness test is missing from source")
+            witness_path = source.parent / relative
+            if not witness_path.is_file():
+                raise SystemExit(
+                    f"{identity}: declared witness module is missing: {witness_path}"
+                )
+            witness_sources.append(witness_path.read_text(encoding="utf-8"))
+        if not any(re.search(witness_pattern, text) for text in witness_sources):
+            # The production owner may be a child module while its white-box
+            # witness remains in the parent test module. Accept that layout
+            # only when the exact function name is globally unique. The cargo
+            # baseline below still requires this exact filter to execute one
+            # or more tests in the declared package, preventing an unrelated
+            # same-named function from satisfying mutation evidence.
+            matches = [
+                candidate
+                for candidate in root.rglob("*.rs")
+                if not any(part in {"target", "build", "vendor"} for part in candidate.parts)
+                and re.search(
+                    witness_pattern, candidate.read_text(encoding="utf-8", errors="strict")
+                )
+            ]
+            if len(matches) != 1:
+                raise SystemExit(
+                    f"{identity}: exact witness test must resolve uniquely; matches={len(matches)}"
+                )
         mutations.append(mutation)
     if not mutations:
         raise SystemExit("implementation mutation registry is empty")
@@ -192,8 +222,15 @@ def main() -> int:
             (artifact_dir / f"{identity}-mutant.log").write_text(
                 mutant.stdout, encoding="utf-8"
             )
-            killed = mutant.returncode != 0 and bool(
-                re.search(r"test result: FAILED", mutant.stdout)
+            # Some freestanding service profiles use panic=abort even in host
+            # tests, so Cargo can terminate after `running N tests` without a
+            # libtest `FAILED` footer. The exact filter already passed in the
+            # baseline; observing it start here proves compilation succeeded
+            # and makes a nonzero exit an execution-time mutant kill rather
+            # than an invalid mutant.
+            exact_test_started = bool(re.search(r"running [1-9][0-9]* tests?", mutant.stdout))
+            killed = mutant.returncode != 0 and (
+                bool(re.search(r"test result: FAILED", mutant.stdout)) or exact_test_started
             )
             if not killed:
                 print("\n".join(mutant.stdout.splitlines()[-100:]), file=sys.stderr)

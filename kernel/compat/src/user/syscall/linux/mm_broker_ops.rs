@@ -214,7 +214,7 @@ fn broker_map_memfd_shared(args: &RustosMmBrokerArgs) -> Result<(), i64> {
             .address_space_mut()
             .map_existing_user_pages_at(VirtAddr::new(start), &frames, page_flags)
             .map_err(address_space_error_to_linux_errno)?;
-        process_state.record_shared_memfd_mapping(start, args.len, hold);
+        process_state.record_shared_memfd_mapping(start, args.len, args.offset, hold);
         process_state.set_mapping_cursor(mapping_end);
         Ok::<RustosMmMapBrokerResult, i64>(RustosMmMapBrokerResult {
             addr: start,

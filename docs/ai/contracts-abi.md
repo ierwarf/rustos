@@ -674,16 +674,18 @@ policy remains with the owning service.
   and every query uses the shorter of the remaining application deadline and
   16 ms. A timeout cannot restart the whole scan or hide readiness already
   found elsewhere.
-- Deferred VFS checkpoint/replay maintenance may consume at most one 1 ms
-  attempt at the start of a foreground VFS turn. It cannot drain a backlog in
-  an eight-request burst or synchronously chain a second checkpoint ACK;
-  successful replay enqueues that idempotent ACK for a later bounded turn.
-  Queue order and operation IDs retain recovery correctness while foreground
-  I/O has a fixed maintenance tax.
+- Deferred VFS checkpoint/replay maintenance runs only in the nucleus
+  housekeeping task and consumes at most one bounded 100 ms control
+  transaction per yielded turn. It cannot drain a backlog in an eight-request
+  burst or synchronously chain a second checkpoint ACK; successful replay
+  enqueues that idempotent ACK for a later turn. No recovery wait is charged
+  to foreground I/O, and the deadline must exceed a normal SMP IPC round trip
+  so cancellation cannot amplify retries into revoked-reply queue pressure.
 - Deferred netd reference reconciliation follows the same one-attempt,
-  one-millisecond maintenance quantum. A foreground dup/close divides one
+  housekeeping-owned 100 ms control bound. A foreground dup/close divides one
   16 ms total operation deadline across its retries and always defers the
-  acknowledgement; operation replay and acknowledgement are separate turns.
+  acknowledgement; operation replay and acknowledgement are separate
+  housekeeping turns.
   Eight-entry operation-plus-ack bursts and three independent 16 ms retries
   are forbidden because their cumulative wait is not bounded by the caller's
   advertised deadline.
@@ -717,8 +719,11 @@ policy remains with the owning service.
   mutations to vfsd, so a routine `fcntl(F_DUPFD*)` cannot inherit vfsd
   scheduling latency. `close` removes the local descriptor first, then performs
   any token-addressed final provider release; a wedged vfsd/netd cannot retain
-  a reusable numeric fd or block process retirement. Cross-service cleanup and
-  matching epoll purges use the 16 ms cancellable internal IPC path. vfsd is
+  a reusable numeric fd or block process retirement. Ordinary cross-service
+  close uses the 16 ms cancellable internal IPC path. Checkpointed epoll
+  create/ADD/MOD/DEL/retire and matching purges are state-changing control
+  transactions and use the separate bounded 100 ms interactive-control rail;
+  they must never inherit the non-consuming readiness-query deadline. vfsd is
   the only intended caller of `SYS_RUSTOS_FD_*_BROKER`; gated by `VFS_POLICY`.
   Generic apps must not call those brokers directly.
   Fork clones the address space and fd table in one process-state snapshot;
@@ -756,6 +761,10 @@ policy remains with the owning service.
   the vfsd mutation. Releasing that transaction guard performs normal
   last-close purge, so a concurrent final close cannot purge first and then
   leave a newly inserted interest for a retired object.
+  Linux defines `epoll_ctl` as the synchronous interest-list control interface,
+  distinct from the timeout-bearing `epoll_wait`; the compatibility boundary
+  therefore keeps mutation completion separate from the 16 ms provider-query
+  cap (<https://www.man7.org/linux/man-pages/man2/epoll_ctl.2.html>).
   `O_NONBLOCK` is read from the same fd-table snapshot as the console
   handle; an empty sessiond read returns `EAGAIN` instead of re-entering
   the blocking retry loop after a readiness race.
@@ -1369,6 +1378,15 @@ policy remains with the owning service.
   preserving keyboard and pointer-button edges. Linux key translation and
   modifier/text state remain inputd policy; RustOS receives only bounded,
   authenticated relay records.
+- The authenticated DVM `SESSION_START` is a one-shot epoch authority record.
+  If netd is not yet published or its bounded grant/revoke call fails, inputd
+  retains the already-decoded fixed-size batch, decoder epoch, events, and
+  exact unacknowledged transition suffix. It retries outside the policy-queue
+  lock for at most five seconds and publishes no event first. A successful ACK
+  clears only that transition; timeout exits fail-closed so endpoint-owner
+  cleanup withdraws producer admission. Resetting the decoder and draining
+  later records after a transient failure is forbidden because the host does
+  not repeat the session authority marker.
 - Input IPC ABI version 2 extends `InputIngressWire` with a distinct,
   report-atomic DVM absolute-pointer position. It is never reinterpreted as a
   relative delta: complete `SYN_REPORT` positions are bounded to the declared
