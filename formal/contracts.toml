@@ -631,6 +631,7 @@ path = "kernel/mm/src/memory/address_space.rs"
 models = [
     "cross-cpu-task-retirement/CrossCpuTaskRetirement",
     "page-table-lifecycle/PageTableLifecycle",
+    "page-table-map-transaction/PageTableMapTransaction",
     "process-address-space-lifetime/ProcessAddressSpaceLifetime",
     "robust-futex-owner-death/RobustFutexOwnerDeath",
     "tlb-shootdown-lifecycle/TlbShootdownLifecycle",
@@ -643,6 +644,7 @@ models = ["robust-futex-owner-death/RobustFutexOwnerDeath"]
 [[source_mappings]]
 path = "kernel/mm/src/memory/address_space/rollback.rs"
 models = [
+    "page-table-map-transaction/PageTableMapTransaction",
     "physical-frame-lifecycle/PhysicalFrameLifecycle",
     "tlb-shootdown-lifecycle/TlbShootdownLifecycle",
 ]
@@ -913,11 +915,35 @@ models = [
 
 [[source_mappings]]
 path = "kernel/ps/src/user/handles.rs"
-models = ["ipc-handle-transfer/IpcHandleTransfer"]
+models = [
+    "ipc-handle-transfer/IpcHandleTransfer",
+    "ipc-transfer-authority/IpcTransferAuthority",
+]
 
 [[source_mappings]]
 path = "kernel/compat/src/user/syscall/linux/service_ops/vfs_meta.rs"
-models = ["ipc-handle-transfer/IpcHandleTransfer"]
+models = [
+    "ipc-handle-transfer/IpcHandleTransfer",
+    "ipc-transfer-authority/IpcTransferAuthority",
+]
+
+[[source_mappings]]
+path = "kernel/compat/src/user/syscall/linux/net_broker_ops.rs"
+models = [
+    "ipc-handle-transfer/IpcHandleTransfer",
+    "ipc-transfer-authority/IpcTransferAuthority",
+]
+
+[[source_mappings]]
+path = "services/netd/src/main.rs"
+models = [
+    "ipc-transfer-authority/IpcTransferAuthority",
+    "netd-deferred-reply/NetdDeferredReply",
+]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/reschedule_observation.rs"
+models = ["smp-reschedule-ipi/SmpRescheduleIpi"]
 
 [[source_mappings]]
 path = "kernel/ipc-runtime/src/ipc/endpoint_priority.rs"
@@ -1184,8 +1210,20 @@ models = ["scheduler-wakeup/SchedulerWakeup"]
 path = "kernel/io-manager/src/input/dvm_ring.rs"
 models = [
     "dvm-input-ring/DvmInputRing",
+    "dvm-transport-lifecycle/DvmTransportLifecycle",
     "input-ingestion-worker/InputIngestionWorker",
 ]
+
+[[source_mappings]]
+path = "kernel/io-manager/src/io/dvm_display.rs"
+models = [
+    "dvm-display-readiness/DvmDisplayReadiness",
+    "dvm-transport-lifecycle/DvmTransportLifecycle",
+]
+
+[[source_mappings]]
+path = "kernel/io-manager/src/transport_lifecycle.rs"
+models = ["dvm-transport-lifecycle/DvmTransportLifecycle"]
 
 [[source_mappings]]
 path = "kernel/io-manager/src/io/dvm_network.rs"

@@ -5,6 +5,7 @@ mod deferred_wake;
 mod irq;
 mod process_state_lock;
 mod process_table;
+mod reschedule_observation;
 mod retirement;
 mod scheduler;
 mod spawn;
@@ -63,8 +64,7 @@ pub use self::retirement::UserFaultDisposition;
 pub use self::scheduler::drain_scheduler_runtime_profile;
 pub use self::scheduler::{AffinityCommit, AffinityError, ProcessAffinitySnapshot};
 
-/// Upper bound for simultaneously schedulable task identities. Cross-crate
-/// bounded registries must derive capacity from this value rather than copy it.
+/// Upper bound for schedulable task identities and cross-crate bounded registries.
 pub const MAX_SCHEDULER_TASKS: usize = scheduler::MAX_TASK;
 pub use self::irq::{
     commit_block_current_task_and_yield, rtc_interrupt_handler_addr,
@@ -82,7 +82,13 @@ pub use self::spawn::{
     spawn_user_thread_suspended, start, start_secondary_cpu,
 };
 
-const MAIN_THREAD_SLICE_MICROS: u64 = 1_000;
+// A one-millisecond periodic preemption edge spent a material fraction of a
+// vCPU re-entering the scheduler even when the local runqueue had no competing
+// task.  Four milliseconds keeps the worst-case fair-class dispatch latency
+// well inside a 60 Hz frame while cutting periodic scheduler entries by 75%.
+// Explicit wakeups, IPC handoffs, and remote mailbox notifications still use
+// immediate software/IPI safe points and are not delayed by this quantum.
+const MAIN_THREAD_SLICE_MICROS: u64 = 4_000;
 const MIN_THREAD_WEIGHT_MICROS: u64 = 1;
 const MAX_THREAD_WEIGHT_MICROS: u64 = 10_000;
 const INTERACTIVE_PIT_DIVISOR_FLAG: u16 = 1 << 15;
@@ -132,6 +138,7 @@ pub struct CurrentUserSnapshot {
     abi: UserAbi,
     thread_id: u64,
     process_id: u64,
+    process_generation: u64,
     console_session: ConsoleSessionHandle,
     security: ProcessSecurityContext,
 }
@@ -169,11 +176,15 @@ impl RetainedCurrentUserProcessState {
     }
 
     pub fn with_process_state<R>(&self, f: impl FnOnce(&UserProcessState) -> R) -> R {
-        self.process.with_state(|_, state| f(state))
+        self.process
+            .with_visible_state(|_, state| f(state))
+            .expect("retained current process crossed an exec staging boundary")
     }
 
     pub fn with_address_space<R>(&self, f: impl FnOnce(&ProcessAddressSpace) -> R) -> R {
-        self.process.with_state(|_, state| f(state.address_space()))
+        self.process
+            .with_visible_state(|_, state| f(state.address_space()))
+            .expect("retained current address space crossed an exec staging boundary")
     }
 }
 
@@ -204,49 +215,15 @@ impl RetainedCurrentUserAddressSpace {
     }
 
     pub fn with_process_state<R>(&self, f: impl FnOnce(&UserProcessState) -> R) -> R {
-        self.process.with_state(|_, state| f(state))
+        self.process
+            .with_visible_state(|_, state| f(state))
+            .expect("retained current process crossed an exec staging boundary")
     }
 
     pub fn with_address_space<R>(&self, f: impl FnOnce(&ProcessAddressSpace) -> R) -> R {
-        self.process.with_state(|_, state| f(state.address_space()))
-    }
-}
-
-impl CurrentUserSnapshot {
-    pub(crate) const fn new(
-        abi: UserAbi,
-        thread_id: u64,
-        process_id: u64,
-        console_session: ConsoleSessionHandle,
-        security: ProcessSecurityContext,
-    ) -> Self {
-        Self {
-            abi,
-            thread_id,
-            process_id,
-            console_session,
-            security,
-        }
-    }
-
-    pub const fn abi(self) -> UserAbi {
-        self.abi
-    }
-
-    pub const fn thread_id(self) -> u64 {
-        self.thread_id
-    }
-
-    pub const fn process_id(self) -> u64 {
-        self.process_id
-    }
-
-    pub const fn console_session(self) -> ConsoleSessionHandle {
-        self.console_session
-    }
-
-    pub const fn security(self) -> ProcessSecurityContext {
-        self.security
+        self.process
+            .with_visible_state(|_, state| f(state.address_space()))
+            .expect("retained current address space crossed an exec staging boundary")
     }
 }
 

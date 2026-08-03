@@ -32,14 +32,16 @@ impl Scheduler {
         slot: usize,
         reason: TaskRetireReason,
     ) -> bool {
-        if !remote_task_requires_quiescence(
-            slot,
-            self.current_task,
-            super::super::task_slot_is_running(slot),
-        ) {
+        let running_cpu = super::super::cpu_local::task_running_cpu(slot);
+        if !remote_task_requires_quiescence(slot, self.current_task, running_cpu.is_some()) {
             return false;
         }
         self.quarantine_slot_for_deferred_retirement(slot, reason);
+        #[cfg(not(test))]
+        super::super::irq::request_target_reschedule(
+            running_cpu.expect("remote retirement lost running CPU"),
+        );
+        #[cfg(test)]
         super::super::request_deferred_reschedule();
         true
     }
@@ -51,20 +53,18 @@ impl Scheduler {
             self.collect_live_process_sibling_slots(current_slot, process_handle);
         let mut waiting_for_remote = false;
         for slot in siblings.into_iter().take(count) {
-            if remote_task_requires_quiescence(
-                slot,
-                current_slot,
-                super::super::task_slot_is_running(slot),
-            ) {
+            let running_cpu = super::super::cpu_local::task_running_cpu(slot);
+            if remote_task_requires_quiescence(slot, current_slot, running_cpu.is_some()) {
                 self.quarantine_slot_for_deferred_retirement(slot, TaskRetireReason::Exited);
+                #[cfg(not(test))]
+                super::super::irq::request_target_reschedule(
+                    running_cpu.expect("exec sibling lost running CPU"),
+                );
                 waiting_for_remote = true;
                 continue;
             }
             self.deferred_retire_reasons[slot] = None;
             self.retire_exec_sibling_slot(slot);
-        }
-        if waiting_for_remote {
-            super::super::request_deferred_reschedule();
         }
         Some(!waiting_for_remote)
     }
@@ -96,28 +96,33 @@ impl Scheduler {
         }
         self.exec_target_quiesced[target_slot] = true;
 
+        let target_running_cpu = super::super::cpu_local::task_running_cpu(target_slot);
         let mut waiting_for_remote = remote_task_requires_quiescence(
             target_slot,
             self.current_task,
-            super::super::task_slot_is_running(target_slot),
+            target_running_cpu.is_some(),
         );
+        #[cfg(not(test))]
+        if waiting_for_remote {
+            super::super::irq::request_target_reschedule(
+                target_running_cpu.expect("exec target lost running CPU"),
+            );
+        }
         let (siblings, count) =
             self.collect_live_process_sibling_slots(target_slot, process_handle);
         for slot in siblings.into_iter().take(count) {
-            if remote_task_requires_quiescence(
-                slot,
-                self.current_task,
-                super::super::task_slot_is_running(slot),
-            ) {
+            let running_cpu = super::super::cpu_local::task_running_cpu(slot);
+            if remote_task_requires_quiescence(slot, self.current_task, running_cpu.is_some()) {
                 self.quarantine_slot_for_deferred_retirement(slot, TaskRetireReason::Exited);
+                #[cfg(not(test))]
+                super::super::irq::request_target_reschedule(
+                    running_cpu.expect("exec sibling lost running CPU"),
+                );
                 waiting_for_remote = true;
                 continue;
             }
             self.deferred_retire_reasons[slot] = None;
             self.retire_exec_sibling_slot(slot);
-        }
-        if waiting_for_remote {
-            super::super::request_deferred_reschedule();
         }
         Some(!waiting_for_remote)
     }
@@ -151,6 +156,10 @@ impl Scheduler {
 
     pub(super) fn context_is_schedulable(&self, slot: usize, context: TaskContext) -> bool {
         let current_cpu = nucleus_core::util::lockdep::current_cpu_index();
+        #[cfg(not(test))]
+        if !runqueue::is_local_runnable(slot, current_cpu) {
+            return false;
+        }
         if candidate_has_foreign_execution_owner(
             slot,
             self.current_task,
@@ -260,6 +269,8 @@ impl Scheduler {
         self.idle_cpu[slot] = logical_index;
         let idle_mask = 1_u64 << logical_index;
         self.initialize_slot_affinity(slot, idle_mask, idle_mask);
+        #[cfg(not(test))]
+        runqueue::admit_running(slot, usize::from(logical_index));
         slot
     }
 

@@ -33,8 +33,9 @@ pub(super) use subject::{
 };
 
 use kernel_ipc_runtime::api::{
-    EndpointCallPriority, KernelEndpointHandle, KernelReplyHandle, KernelTransferTicket,
-    KernelTransferredHandle,
+    ChannelIdentity, EndpointCallPriority, KernelEndpointHandle, KernelReplyHandle,
+    KernelTransferTicket, KernelTransferredHandle, ProcessIdentity, ServiceIdentity,
+    TransferContext,
 };
 use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
 
@@ -751,6 +752,9 @@ fn advance_service_endpoint_epoch(index: usize) -> Result<u64, i64> {
     let current = SERVICE_ENDPOINT_EPOCHS[index].load(Ordering::Relaxed);
     let next = next_service_endpoint_epoch(current).ok_or(LINUX_EOVERFLOW)?;
     SERVICE_ENDPOINT_EPOCHS[index].store(next, Ordering::Release);
+    if current != 0 {
+        multitask::drop_ipc_transfers_for_service_epoch(index as u64, current);
+    }
     Ok(next)
 }
 
@@ -2653,16 +2657,94 @@ pub(super) fn install_transfer_descriptors_for_current_process(
 
 pub(super) fn transfer_tickets_for_descriptors(
     descriptors: &[KernelTransferredHandle],
+    context: TransferContext,
 ) -> Result<Vec<KernelTransferTicket>, i64> {
-    multitask::ipc_transfer_tickets(descriptors).map_err(ipc_transfer_error_to_linux_errno)
+    multitask::bind_ipc_transfer_tickets(descriptors, context)
+        .map_err(ipc_transfer_error_to_linux_errno)
 }
 
-pub(super) fn install_transfer_tickets_for_current_process(
+pub(super) fn commit_transfer_tickets_enqueue(tickets: &[KernelTransferTicket]) -> Result<(), i64> {
+    multitask::commit_ipc_transfer_enqueue(tickets).map_err(ipc_transfer_error_to_linux_errno)
+}
+
+pub(super) struct PreparedTransferInstall {
+    reservation_id: u64,
+    slots: Vec<u64>,
+    entries: Option<Vec<multitask::TransferredHandleEntry>>,
+    service_refs: Vec<super::service_ops::ServiceHandleRef>,
+    committed: bool,
+}
+
+impl PreparedTransferInstall {
+    pub(super) fn fds(&self) -> Result<Vec<i32>, i64> {
+        self.slots
+            .iter()
+            .copied()
+            .map(|fd| i32::try_from(fd).map_err(|_| LINUX_EOVERFLOW))
+            .collect()
+    }
+
+    pub(super) fn commit(mut self) -> Result<(), i64> {
+        let entries = self.entries.take().ok_or(LINUX_ESTALE)?;
+        let committed = multitask::with_current_user_process_state_mut(|_, _, process_state| {
+            process_state.handles_mut().commit_reserved_transfers(
+                self.reservation_id,
+                self.slots.as_slice(),
+                entries,
+            )
+        });
+        match committed {
+            Some(Ok(())) => {
+                self.committed = true;
+                self.service_refs.clear();
+                Ok(())
+            }
+            Some(Err(entries)) => {
+                self.entries = Some(entries);
+                Err(LINUX_ESTALE)
+            }
+            None => Err(LINUX_EINVAL),
+        }
+    }
+}
+
+impl Drop for PreparedTransferInstall {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        cancel_received_handle_reservations(self.reservation_id, self.slots.as_slice());
+        super::service_ops::release_service_handle_refs_bounded(self.service_refs.as_slice());
+    }
+}
+
+pub(super) fn prepare_transfer_tickets_for_current_process(
     tickets: &[KernelTransferTicket],
-) -> Result<Vec<i32>, i64> {
-    let entries = multitask::take_ipc_transfer_entries_by_tickets(tickets)
-        .map_err(ipc_transfer_error_to_linux_errno)?;
-    install_transfer_entries_for_current_process(entries)
+    receiver: ProcessIdentity,
+    service: ServiceIdentity,
+    channel: ChannelIdentity,
+    stream_pos: u64,
+) -> Result<PreparedTransferInstall, i64> {
+    let entries = multitask::claim_ipc_transfer_entries_by_tickets(
+        tickets, receiver, service, channel, stream_pos,
+    )
+    .map_err(ipc_transfer_error_to_linux_errno)?;
+    let service_refs = service_transfer_refs(&entries);
+    let reservation = multitask::with_current_user_process_state_mut(|_, _, process_state| {
+        process_state.handles_mut().reserve_slots(entries.len())
+    })
+    .flatten();
+    let Some((reservation_id, slots)) = reservation else {
+        super::service_ops::release_service_handle_refs_bounded(&service_refs);
+        return Err(LINUX_EMFILE);
+    };
+    Ok(PreparedTransferInstall {
+        reservation_id,
+        slots,
+        entries: Some(entries),
+        service_refs,
+        committed: false,
+    })
 }
 
 fn install_transfer_entries_for_current_process(
@@ -2769,7 +2851,9 @@ pub(super) fn release_input_transfer_token(token: u64) {
 fn ipc_transfer_error_to_linux_errno(err: multitask::IpcTransferRegistryError) -> i64 {
     match err {
         multitask::IpcTransferRegistryError::Exhausted => LINUX_ENOMEM,
+        multitask::IpcTransferRegistryError::BindingMismatch => LINUX_EPERM,
         multitask::IpcTransferRegistryError::InvalidDescriptor => LINUX_EINVAL,
+        multitask::IpcTransferRegistryError::InvalidState => LINUX_ESTALE,
         multitask::IpcTransferRegistryError::StaleDescriptor => LINUX_ESTALE,
     }
 }

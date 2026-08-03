@@ -137,33 +137,37 @@ if grep -Eq 'retired\[[^]]+\][[:space:]]*=[[:space:]]*false|retirement_cleanup\[
     echo 'exec must never erase a previously published retirement marker' >&2
     exit 1
 fi
-exec_transfer_body="$(
-    sed -n '/^pub fn replace_for_exec_and_publish(/,/^fn exec_may_replace(/p' \
+exec_stage_body="$(
+    sed -n '/^pub fn stage_exec_state(/,/^pub fn finalize_exec_state(/p' \
         kernel/ps/src/multitask/process_table.rs
 )"
-if ! grep -Fq 'exec_commit_may_transfer(object, reservation)' <<<"$exec_transfer_body" \
-    || grep -Fq 'object.exiting' <<<"$exec_transfer_body"; then
-    echo 'an installed exec root must transfer ownership through its reservation despite a late exit marker' >&2
+if ! grep -Fq 'exec_commit_may_transfer(object, reservation)' <<<"$exec_stage_body" \
+    || ! grep -Fq 'object.exec_state_staged = true;' <<<"$exec_stage_body"; then
+    echo 'exec staging must retain exact reservation and hide the new process state' >&2
     exit 1
 fi
-exec_state_line="$(grep -n -m1 'state.replace_for_exec(' <<<"$exec_transfer_body" | cut -d: -f1)"
-exec_publish_line="$(grep -n -m1 'let published_handle = publish_scheduler()' <<<"$exec_transfer_body" | cut -d: -f1)"
-exec_retain_line="$(grep -n -m1 'Some((closed, old_state))' <<<"$exec_transfer_body" | cut -d: -f1)"
+exec_transfer_body="$(
+    sed -n '/^pub fn exec_current_user_process(/,/^pub fn exec_user_process_by_pid(/p' \
+        kernel/ps/src/multitask/current.rs
+)"
+exec_state_line="$(grep -n -m1 'process_table::stage_exec_state(' <<<"$exec_transfer_body" | cut -d: -f1)"
+exec_publish_line="$(grep -n -m1 'scheduler_mut().exec_current_user_process' <<<"$exec_transfer_body" | cut -d: -f1)"
+exec_retain_line="$(grep -n -m1 'process_table::finalize_exec_state(staged, published)' <<<"$exec_transfer_body" | cut -d: -f1)"
 exec_drop_line="$(grep -n -m1 'drop(old_state);' <<<"$exec_transfer_body" | cut -d: -f1)"
 if [[ -z "$exec_state_line" || -z "$exec_publish_line" || -z "$exec_retain_line" || -z "$exec_drop_line" \
     || "$exec_state_line" -ge "$exec_publish_line" || "$exec_publish_line" -ge "$exec_retain_line" \
     || "$exec_retain_line" -ge "$exec_drop_line" ]]; then
-    echo 'exec must commit process generation, publish scheduler generation, then retire the retained old bundle' >&2
+    echo 'exec must stage process state, publish scheduler root, finalize generation, then retire the old bundle' >&2
     exit 1
 fi
 
 reschedule_publish_body="$(
-    sed -n '/^fn publish_deferred_reschedule(/,/^}/p' kernel/ps/src/multitask/irq.rs
+    sed -n '/^fn publish_local_reschedule(/,/^}/p' kernel/ps/src/multitask/irq.rs
 )"
 if ! grep -Fq 'local_request.store(1, Ordering::Release);' <<<"$reschedule_publish_body" \
-    || ! grep -Fq 'fanout_pending.store(true, Ordering::Release);' <<<"$reschedule_publish_body" \
-    || ! grep -Fq 'super::irq::flush_deferred_reschedule_fanout();' kernel/ps/src/multitask/cpu_local.rs; then
-    echo 'lock-held reschedule publication must retain local work and flush remote fanout after raw unlock' >&2
+    || grep -Fq 'fanout' <<<"$reschedule_publish_body" \
+    || ! grep -Fq 'super::irq::flush_deferred_target_reschedules();' kernel/ps/src/multitask/cpu_local.rs; then
+    echo 'local reschedule publication must stay local and exact target custody must flush after raw unlock' >&2
     exit 1
 fi
 
@@ -331,6 +335,7 @@ dual-abi-image-admission/DualAbiImageAdmission|rustos-image-admission|tests::rej
 dvm-input-ring/DvmInputRing|driver-domain-protocol|tests::input_ring_has_separate_cursor_cache_lines_and_rejects_tampering
 dvm-input-ring/DvmInputRing|driver-domain-protocol|tests::input_frame_requires_nonzero_provenance_bounds_and_stable_checksum
 dvm-input-ring/DvmInputRing|kernel-io-manager|input::dvm_ring::tests::policy_consumer_readiness_requires_transport_and_is_idempotent
+dvm-transport-lifecycle/DvmTransportLifecycle|kernel-io-manager|transport_lifecycle::tests::drain_closes_admission_and_waits_for_exact_claim
 dvm-input-ring/DvmInputRing|inputd|dvm_protocol::tests::session_sequence_and_transport_reset_are_service_owned
 dvm-input-ring/DvmInputRing|inputd|dvm_protocol::tests::invalid_checksum_and_cross_generation_record_fail_closed
 dvm-network-ring/DvmNetworkRing|driver-domain-protocol|tests::dvm_ethernet_payload_rejects_bad_checksum_and_fragments
@@ -434,6 +439,7 @@ robust-futex-owner-death/RobustFutexOwnerDeath|kernel-compat|user::syscall::linu
 per-cpu-clockevent-lifecycle/PerCpuClockeventLifecycle|kernel-hal|arch::timer::tests::tsc_deadline_interval_and_catchup_are_strictly_future_bounded
 per-cpu-clockevent-lifecycle/PerCpuClockeventLifecycle|kernel-hal|arch::smp::tests::cpu_lifecycle_publication_is_dense_generation_bound_and_ordered
 per-cpu-clockevent-lifecycle/PerCpuClockeventLifecycle|kernel-ps|multitask::irq::tests::syscall_tail_consumes_every_deferred_or_handoff_request_exactly_once
+per-cpu-clockevent-lifecycle/PerCpuClockeventLifecycle|kernel-ps|multitask::irq::tests::periodic_idle_tick_stays_local_only_without_any_queue_or_request
 scheduler-wakeup/SchedulerWakeup|kernel-ps|multitask::scheduler::tests::scheduler_block_arm_is_exact_race_safe_and_terminally_revoked
 scheduler-wakeup/SchedulerWakeup|kernel-ps|multitask::scheduler::tests::raced_wake_never_validates_a_consumed_current_frame
 scheduler-wakeup/SchedulerWakeup|kernel-ps|multitask::scheduler::tests::live_noncurrent_task_must_retain_one_scheduler_state_owner
@@ -449,6 +455,10 @@ scheduler-cpu-distribution/SchedulerCpuDistribution|kernel-ps|multitask::schedul
 scheduler-cpu-distribution/SchedulerCpuDistribution|kernel-ps|multitask::scheduler::tests::user_reservation_obeys_vruntime_without_a_wall_clock_bypass
 scheduler-cpu-distribution/SchedulerCpuDistribution|kernel-ps|multitask::scheduler::tests::fair_locality_is_bounded_by_class_and_vruntime_lag
 scheduler-cpu-distribution/SchedulerCpuDistribution|kernel-ps|multitask::scheduler::tests::event_wait_handoff_is_fifo_deduplicated_and_burst_bounded
+scheduler-cpu-distribution/SchedulerCpuDistribution|kernel-ps|multitask::scheduler::tests::dispatch_fairness_and_handoff_state_is_cpu_isolated
+scheduler-cpu-distribution/SchedulerCpuDistribution|kernel-ps|multitask::scheduler::runqueue::tests::idle_steal_uses_single_owner_mailbox_transfer
+scheduler-cpu-distribution/SchedulerCpuDistribution|kernel-ps|multitask::scheduler::runqueue::tests::affinity_rehome_invalidates_and_coalesces_old_mailbox_generations
+scheduler-cpu-distribution/SchedulerCpuDistribution|kernel-ps|multitask::scheduler::runqueue_policy::tests::active_balance_requires_more_than_one_excess_runnable
 scheduler-cpu-distribution/SchedulerCpuDistribution|kernel-ps|multitask::scheduler::tests::overdue_system_continuation_precedes_a_fresh_latency_handoff
 scheduler-cpu-distribution/SchedulerCpuDistribution|kernel-ps|multitask::irq::tests::syscall_tail_consumes_every_deferred_or_handoff_request_exactly_once
 scheduler-cpu-distribution/SchedulerCpuDistribution|kernel-ps|multitask::scheduler::runtime_profile::tests::runtime_profile_distinguishes_switches_roots_and_migrations
@@ -485,6 +495,7 @@ page-table-lifecycle/PageTableLifecycle|kernel-mm|memory::address_space::tests::
 page-table-lifecycle/PageTableLifecycle|kernel-mm|memory::address_space::tests::user_page_flags_enforce_wx_and_reject_huge_pages
 page-table-lifecycle/PageTableLifecycle|kernel-mm|memory::address_space::tests::protection_span_preflight_rejects_a_hole_before_commit
 page-table-lifecycle/PageTableLifecycle|kernel-mm|memory::address_space::tests::unmap_region_plan_is_complete_before_metadata_commit
+page-table-map-transaction/PageTableMapTransaction|kernel-mm|memory::address_space::rollback::tests::intermediate_tables_rollback_in_reverse_publication_order
 page-table-lifecycle/PageTableLifecycle|kernel-mm|memory::kernel_vm::tests::direct_map_update_bounds_are_aligned_nonempty_and_nonwrapping
 page-table-lifecycle/PageTableLifecycle|kernel-mm|memory::kernel_vm::tests::kernel_segment_protection_rejects_writable_executable_authority
 page-table-lifecycle/PageTableLifecycle|syscalld|mmap_policy::tests::invalid_backing_is_rejected_before_a_fixed_replace_plan_exists
@@ -595,6 +606,7 @@ netd-deferred-reply/NetdDeferredReply|netd|local_socket_poll_tests::poisoned_def
 netd-deferred-reply/NetdDeferredReply|netd|local_socket_poll_tests::local_poll_wait_budget_matches_readiness_service_cap
 ipc-handle-transfer/IpcHandleTransfer|kernel-ps|user::handles::transfer_registry_tests::cancelled_transfer_moves_its_open_description_to_deferred_cleanup
 ipc-handle-transfer/IpcHandleTransfer|kernel-ps|user::handles::transfer_registry_tests::opaque_transfer_ticket_is_exact_one_shot_and_nonce_bound
+ipc-transfer-authority/IpcTransferAuthority|kernel-ps|user::handles::transfer_registry_tests::opaque_transfer_ticket_is_exact_one_shot_and_nonce_bound
 ipc-handle-transfer/IpcHandleTransfer|kernel-ps|user::handles::table::tests::receive_reservations_are_invisible_and_publish_atomically
 ipc-handle-transfer/IpcHandleTransfer|kernel-ps|user::handles::table::tests::cancelled_receive_reservation_is_reusable
 ipc-handle-transfer/IpcHandleTransfer|kernel-ps|user::handles::table::tests::stale_reservation_cannot_cancel_or_commit_after_exec_boundary
@@ -753,6 +765,9 @@ product-boot/ProductBoot|kernel-io-manager|input::dvm_ring::tests::policy_consum
 product-boot/ProductBoot|uiserver|gpu_runtime::tests::dvm_gpu_admission_waits_without_hiding_behind_software
 product-boot/ProductBoot|storaged|tests::dvm_block_e2e_marker_names_the_complete_authority_path
 product-boot/ProductBoot|uiserver|gpu_runtime::tests::frame_deadline_skips_missed_slots_without_drift_or_burst
+product-boot/ProductBoot|uiserver|input_loop::tests::input_waitset_startup_retries_only_transient_control_failures
+product-boot/ProductBoot|xtask|kvm::tests::dvm_display_mode_requires_the_observed_display_contract
+dvm-gpu-compositor/DvmGpuCompositor|uiserver|gpu_runtime::tests::mandatory_gpu_wait_never_admits_cpu_present_as_retry
 ui-frame-budget/UiFrameBudget|wayclick|damage_tests::first_frame_marker_is_the_user_visible_boot_terminal
 input-ingestion-worker/InputIngestionWorker|kernel-io-manager|input::dvm_ring::tests::policy_consumer_readiness_requires_transport_and_is_idempotent
 dvm-input-ring/DvmInputRing|kernel-io-manager|input::dvm_ring::tests::concurrent_broker_callers_have_exactly_one_drain_owner
@@ -761,7 +776,7 @@ user-stack-growth/UserStackGrowth|kernel-compat|user::process::tests::release_st
 user-stack-growth/UserStackGrowth|kernel-ps|multitask::process_table::tests::exception_process_state_try_lock_never_waits_on_contention
 exec-address-space-transaction/ExecAddressSpaceTransaction|kernel-ps|multitask::process_table::tests::process_address_space_and_exec_exit_are_serialized
 exec-address-space-transaction/ExecAddressSpaceTransaction|kernel-ps|multitask::process_table::tests::exec_seal_rejects_thread_attachment_until_cancel
-smp-reschedule-ipi/SmpRescheduleIpi|kernel-ps|multitask::irq::tests::lock_held_reschedule_publication_retains_local_and_fanout_work
+smp-reschedule-ipi/SmpRescheduleIpi|kernel-ps|multitask::irq::tests::local_reschedule_publication_never_creates_remote_authority
 scheduler-cpu-ownership/SchedulerCpuOwnership|kernel-ps|multitask::scheduler::tests::ready_scanner_never_reads_a_frame_owned_by_any_cpu
 clocksource-deadline/ClocksourceDeadline|kernel-hal|arch::clock::tests::raw_tsc_global_clock_is_rejected_until_smp_offsets_are_admitted
 exception-retirement-lifecycle/ExceptionRetirementLifecycle|kernel-hal|arch::gdt::tests::per_cpu_privilege_and_ist_stacks_are_aligned_and_disjoint

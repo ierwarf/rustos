@@ -175,6 +175,14 @@ pub(crate) enum GpuCompositorRuntime {
 }
 
 impl GpuCompositorRuntime {
+    /// CPU presentation is a provider, not a retry path. Once the display
+    /// contract requires the DVM compositor, Waiting and paced Active turns
+    /// must retain the last valid front buffer instead of silently performing
+    /// the same full scene on the UI thread.
+    pub(crate) fn admits_cpu_present(&self) -> bool {
+        matches!(self, Self::SoftwareFallback)
+    }
+
     pub(crate) fn new(display_fd: RawFd, display: DisplayInfo) -> Result<Self, i32> {
         let now = Instant::now();
         match gpu_provider_admission(display) {

@@ -1029,10 +1029,10 @@ fn as_bytes_mut<T>(value: &mut T) -> &mut [u8] {
 #[cfg(test)]
 mod tests {
     use super::{
-        DesktopLoadMode, MAX_RUNTIME_PROGRAMS, OP_REQUEST_LAUNCH_PATH,
-        OP_SNAPSHOT_RUNNING_PROGRAMS, PROTOCOL_VERSION, RuntimeRequest, RuntimeResponse,
-        StartupMode, parse_desktop_program_entry, parse_desktop_registry_entry, parse_exec_tokens,
-        parse_startup_registry_entry, response_payload_len,
+        parse_desktop_program_entry, parse_desktop_registry_entry, parse_exec_tokens,
+        parse_startup_registry_entry, response_payload_len, DesktopLoadMode, RuntimeRequest,
+        RuntimeResponse, StartupMode, MAX_RUNTIME_PROGRAMS, OP_REQUEST_LAUNCH_PATH,
+        OP_SNAPSHOT_RUNNING_PROGRAMS, PROTOCOL_VERSION,
     };
     use std::path::Path;
 
@@ -1244,8 +1244,8 @@ mod tests {
 #[cfg(kani)]
 mod verification {
     use super::{
-        MAX_RUNTIME_PROGRAMS, OP_SNAPSHOT_RUNNING_PROGRAMS, PROTOCOL_VERSION, RuntimeRequest,
-        RuntimeResponse, response_payload_len,
+        response_payload_len, RuntimeRequest, RuntimeResponse, MAX_RUNTIME_PROGRAMS,
+        OP_SNAPSHOT_RUNNING_PROGRAMS, PROTOCOL_VERSION,
     };
 
     #[kani::proof]

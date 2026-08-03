@@ -71,6 +71,38 @@ pub struct ExecReservation {
     next_mm_generation: u32,
 }
 
+pub struct StagedExec {
+    reservation: ExecReservation,
+    process_id: u64,
+    closed: alloc::vec::Vec<crate::user::handles::KernelHandle>,
+    old_state: UserProcessState,
+}
+
+pub struct ExecFinalize {
+    process_id: u64,
+    exit_pending: bool,
+    closed: alloc::vec::Vec<crate::user::handles::KernelHandle>,
+    old_state: UserProcessState,
+}
+
+impl ExecFinalize {
+    pub fn into_parts(
+        self,
+    ) -> (
+        u64,
+        bool,
+        alloc::vec::Vec<crate::user::handles::KernelHandle>,
+        UserProcessState,
+    ) {
+        (
+            self.process_id,
+            self.exit_pending,
+            self.closed,
+            self.old_state,
+        )
+    }
+}
+
 impl ProcessRef {
     pub const fn process_id(&self) -> u64 {
         self.process_id
@@ -86,6 +118,23 @@ impl ProcessRef {
         f(self.process_id, &mut state)
     }
 
+    pub fn with_visible_state<R>(&self, f: impl FnOnce(u64, &UserProcessState) -> R) -> Option<R> {
+        // SAFETY: ProcessRef retains the owning Arc, so the NonNull state
+        // pointer remains live for this complete guarded access.
+        let state = unsafe { self.state_ptr.as_ref() }.lock();
+        process_state_is_visible(self.handle).then(|| f(self.process_id, &state))
+    }
+
+    pub fn with_visible_state_mut<R>(
+        &self,
+        f: impl FnOnce(u64, &mut UserProcessState) -> R,
+    ) -> Option<R> {
+        // SAFETY: ProcessRef retains the owning Arc, and the per-process lock
+        // is the unique mutable access authority for the pointed-to state.
+        let mut state = unsafe { self.state_ptr.as_ref() }.lock();
+        process_state_is_visible(self.handle).then(|| f(self.process_id, &mut state))
+    }
+
     pub fn try_with_state_mut<R>(
         &self,
         f: impl FnOnce(u64, &mut UserProcessState) -> R,
@@ -93,7 +142,7 @@ impl ProcessRef {
         // SAFETY: ProcessRef's retained table reference pins the allocation;
         // ProcessStateLock supplies the exclusive mutable access.
         let mut state = unsafe { self.state_ptr.as_ref() }.try_lock()?;
-        Some(f(self.process_id, &mut state))
+        process_state_is_visible(self.handle).then(|| f(self.process_id, &mut state))
     }
 }
 
@@ -111,6 +160,8 @@ struct ProcessObject {
     mm_generation: u32,
     exec_in_progress: bool,
     exec_commit_authorized: bool,
+    exec_state_staged: bool,
+    exit_pending: bool,
     exiting: bool,
     queued_for_reap: bool,
     exit_status: Option<i32>,
@@ -129,6 +180,8 @@ impl ProcessObject {
             mm_generation: 1,
             exec_in_progress: false,
             exec_commit_authorized: false,
+            exec_state_staged: false,
+            exit_pending: false,
             exiting: false,
             queued_for_reap: false,
             exit_status: None,
@@ -362,7 +415,7 @@ pub fn with_process_state<R>(
     f: impl FnOnce(u64, &UserProcessState) -> R,
 ) -> Option<R> {
     let process = retain_process(handle)?;
-    Some(process.with_state(f))
+    process.with_visible_state(f)
 }
 
 pub fn with_process_state_mut<R>(
@@ -370,7 +423,7 @@ pub fn with_process_state_mut<R>(
     f: impl FnOnce(u64, &mut UserProcessState) -> R,
 ) -> Option<R> {
     let process = retain_process(handle)?;
-    Some(process.with_state_mut(f))
+    process.with_visible_state_mut(f)
 }
 
 /// Executes one nonblocking process-state mutation.
@@ -394,7 +447,7 @@ pub fn with_process_state_by_pid_mut<R>(
     f: impl FnOnce(&mut UserProcessState) -> R,
 ) -> Option<R> {
     let process = retain_process_by_pid(process_id)?;
-    Some(process.with_state_mut(|_, state| f(state)))
+    process.with_visible_state_mut(|_, state| f(state))
 }
 
 pub fn with_process_state_by_pid<R>(
@@ -402,20 +455,19 @@ pub fn with_process_state_by_pid<R>(
     f: impl FnOnce(&UserProcessState) -> R,
 ) -> Option<R> {
     let process = retain_process_by_pid(process_id)?;
-    Some(process.with_state(|_, state| f(state)))
+    process.with_visible_state(|_, state| f(state))
 }
 
-pub fn replace_for_exec_and_publish(
+pub fn stage_exec_state(
     reservation: ExecReservation,
     address_space: ProcessAddressSpace,
     linux_process_state: crate::user::linux::LinuxProcessState,
     linux_memory_map: crate::user::linux::LinuxMemoryMapState,
     linux_runtime_profile: crate::user::linux::LinuxRuntimeProfile,
     exec_path: &str,
-    publish_scheduler: impl FnOnce() -> Option<ProcessHandle>,
-) -> Option<alloc::vec::Vec<crate::user::handles::KernelHandle>> {
+) -> Option<StagedExec> {
     let process = retain_process(reservation.handle)?;
-    let (closed, old_state) = process.with_state_mut(|_, state| {
+    process.with_state_mut(|process_id, state| {
         {
             let mut table = PROCESS_TABLE.lock();
             let object = table.lookup_object_mut(reservation.handle)?;
@@ -424,11 +476,6 @@ pub fn replace_for_exec_and_publish(
             }
         }
 
-        // Keep ProcessStateLock held from the state-generation replacement
-        // through scheduler root/context publication. A remote target may be
-        // made runnable only at the final scheduler edge; a self target keeps
-        // IRQs excluded for that edge. Thus no syscall can observe mixed old
-        // and new generations.
         let (closed, old_state) = state.replace_for_exec(
             address_space,
             linux_process_state,
@@ -447,37 +494,49 @@ pub fn replace_for_exec_and_publish(
                 "authorized exec reservation changed before generation publication"
             );
             object.mm_generation = reservation.next_mm_generation;
+            object.exec_state_staged = true;
         }
+        Some(StagedExec {
+            reservation,
+            process_id,
+            closed,
+            old_state,
+        })
+    })
+}
 
-        let published_handle = publish_scheduler()
-            .expect("authorized exec scheduler publication failed after process-state commit");
-        assert_eq!(
-            published_handle, reservation.handle,
-            "exec scheduler publication changed process generation"
+pub fn finalize_exec_state(staged: StagedExec, published_handle: ProcessHandle) -> ExecFinalize {
+    assert_eq!(
+        published_handle, staged.reservation.handle,
+        "exec scheduler publication changed process generation"
+    );
+    let exit_pending = {
+        let mut table = PROCESS_TABLE.lock();
+        let object = table
+            .lookup_object_mut(staged.reservation.handle)
+            .expect("published exec process disappeared before finalization");
+        assert!(
+            object.exec_in_progress
+                && object.exec_commit_authorized
+                && object.exec_state_staged
+                && object.mm_generation == staged.reservation.next_mm_generation,
+            "published exec transaction lost exact generation ownership"
         );
-
-        {
-            let mut table = PROCESS_TABLE.lock();
-            let object = table
-                .lookup_object_mut(reservation.handle)
-                .expect("published exec process disappeared before finalization");
-            assert!(
-                object.exec_in_progress
-                    && object.exec_commit_authorized
-                    && object.mm_generation == reservation.next_mm_generation,
-                "published exec transaction lost exact generation ownership"
-            );
-            object.exec_in_progress = false;
-            object.exec_commit_authorized = false;
+        object.exec_in_progress = false;
+        object.exec_commit_authorized = false;
+        object.exec_state_staged = false;
+        let exit_pending = core::mem::take(&mut object.exit_pending);
+        if exit_pending {
+            object.exiting = true;
         }
-
-        Some((closed, old_state))
-    })?;
-    // Scheduler publication has removed the final old-root execution owner,
-    // and ProcessStateLock is now released. Only here may address-space Drop
-    // begin retirement/shootdown and wait for its exact TLB generation.
-    drop(old_state);
-    Some(closed)
+        exit_pending
+    };
+    ExecFinalize {
+        process_id: staged.process_id,
+        exit_pending,
+        closed: staged.closed,
+        old_state: staged.old_state,
+    }
 }
 
 fn exec_may_replace(object: &ProcessObject) -> bool {
@@ -495,7 +554,20 @@ fn exec_reservation_matches(object: &ProcessObject, reservation: ExecReservation
 }
 
 fn exec_commit_may_transfer(object: &ProcessObject, reservation: ExecReservation) -> bool {
-    exec_reservation_matches(object, reservation) && object.exec_commit_authorized
+    exec_reservation_matches(object, reservation)
+        && object.exec_commit_authorized
+        && !object.exec_state_staged
+        && !object.exiting
+}
+
+fn process_state_is_visible(handle: ProcessHandle) -> bool {
+    let table = PROCESS_TABLE.lock();
+    table
+        .slots
+        .get(handle.index())
+        .filter(|slot| slot.generation == handle.generation())
+        .and_then(|slot| slot.object.as_deref())
+        .is_some_and(|object| !object.exec_state_staged)
 }
 
 pub fn begin_exec(handle: ProcessHandle) -> Option<ExecReservation> {
@@ -534,8 +606,12 @@ pub fn cancel_exec(reservation: ExecReservation) -> bool {
     if !exec_reservation_matches(object, reservation) {
         return false;
     }
+    if object.exec_state_staged {
+        panic!("exec invariant: staged process state cannot be cancelled after commit began");
+    }
     object.exec_in_progress = false;
     object.exec_commit_authorized = false;
+    object.exec_state_staged = false;
     true
 }
 
@@ -586,6 +662,10 @@ pub fn mark_process_exiting(process_id: u64) -> Option<()> {
         .iter_mut()
         .filter_map(|slot| slot.object.as_deref_mut())
         .find(|object| object.process_id == process_id)?;
+    if object.exec_in_progress {
+        object.exit_pending = true;
+        return None;
+    }
     object.exiting = true;
     Some(())
 }
@@ -600,6 +680,10 @@ pub fn mark_process_exiting_once(process_id: u64) -> Option<bool> {
         .iter_mut()
         .filter_map(|slot| slot.object.as_deref_mut())
         .find(|object| object.process_id == process_id)?;
+    if object.exec_in_progress {
+        object.exit_pending = true;
+        return Some(false);
+    }
     let first = !object.exiting;
     object.exiting = true;
     Some(first)
@@ -824,9 +908,9 @@ pub(crate) mod tests {
             expected_mm_generation: object.mm_generation,
             next_mm_generation: object.mm_generation + 1,
         };
-        object.exiting = true;
+        object.exit_pending = true;
         assert!(super::exec_commit_may_transfer(&object, reservation));
-        object.exiting = false;
+        object.exit_pending = false;
         object.exec_commit_authorized = false;
         object.thread_count = 2;
         assert!(!super::exec_may_replace(&object));

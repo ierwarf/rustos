@@ -44,8 +44,8 @@ pub mod arch {
 
     pub mod tlb {
         pub use crate::arch::tlb_shootdown::{
-            AddressSpaceMutationGuard, activate_address_space, admit_current_cpu_online,
-            assert_address_space_inactive, begin_address_space_mutation,
+            AddressSpaceMutationGuard, FlushedAddressSpaceMutationGuard, activate_address_space,
+            admit_current_cpu_online, assert_address_space_inactive, begin_address_space_mutation,
             begin_address_space_retirement, begin_global_mapping_mutation,
         };
     }

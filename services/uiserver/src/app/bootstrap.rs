@@ -451,6 +451,12 @@ impl AppState {
         result
     }
 
+    pub(crate) fn gpu_admits_cpu_present(&self) -> bool {
+        self.gpu_compositor
+            .as_ref()
+            .is_some_and(GpuCompositorRuntime::admits_cpu_present)
+    }
+
     pub(crate) fn poll_gpu_completions(&mut self) -> Result<bool, i32> {
         let mut runtime = self.gpu_compositor.take().ok_or(22)?;
         let result = runtime.poll(self.display_fd.as_raw_fd(), &mut self.display);

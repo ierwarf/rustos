@@ -258,8 +258,12 @@ impl Scheduler {
             {
                 continue;
             }
-            changed |= !self.job_stopped[slot];
+            let slot_changed = !self.job_stopped[slot];
+            changed |= slot_changed;
             self.job_stopped[slot] = true;
+            if slot_changed {
+                self.request_runqueue_owner_reschedule(slot);
+            }
         }
         if changed {
             let _ = process_table::note_process_stopped(process_id, signal);
@@ -271,7 +275,6 @@ impl Scheduler {
                     rustos_user_abi::syscall::PROCD_SIGCHLD_EVENT_STOP,
                 );
             }
-            super::super::request_deferred_reschedule();
         }
         changed
     }
@@ -288,8 +291,12 @@ impl Scheduler {
             {
                 continue;
             }
-            changed |= self.job_stopped[slot];
+            let slot_changed = self.job_stopped[slot];
+            changed |= slot_changed;
             self.job_stopped[slot] = false;
+            if slot_changed {
+                self.request_runqueue_owner_reschedule(slot);
+            }
         }
         if changed {
             let _ = process_table::note_process_continued(process_id);
@@ -301,7 +308,6 @@ impl Scheduler {
                     rustos_user_abi::syscall::PROCD_SIGCHLD_EVENT_CONTINUE,
                 );
             }
-            super::super::request_deferred_reschedule();
         }
         changed
     }

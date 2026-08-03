@@ -525,8 +525,8 @@ mod tests {
 
         let reserve_start = USER_STACK_TOP_EXCLUSIVE
             - u64::try_from(USER_STACK_RESERVE_PAGES).expect("stack pages") * PAGE_SIZE;
-        let usable_start = reserve_start
-            + u64::try_from(USER_STACK_GUARD_PAGES).expect("guard pages") * PAGE_SIZE;
+        let usable_start =
+            reserve_start + u64::try_from(USER_STACK_GUARD_PAGES).expect("guard pages") * PAGE_SIZE;
         let state = release_user_stack_state(VirtAddr::new(reserve_start));
         assert_eq!(state.reserve_start, usable_start);
         assert_eq!(state.reserve_start, state.committed_start);

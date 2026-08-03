@@ -25,18 +25,30 @@ pub use affinity::{AffinityCommit, AffinityError, ProcessAffinitySnapshot};
 #[cfg(test)]
 mod activation_batch_tests;
 mod context_validation;
+mod dispatch_policy;
 mod handoff_queue;
 mod handoffs;
 mod linux_thread_state;
 mod locality;
 mod reclaim;
+mod runqueue;
+mod runqueue_policy;
 mod runtime_profile;
 pub(in crate::multitask) use runtime_profile::SchedulerEntryCause;
 pub use runtime_profile::drain_scheduler_runtime_profile;
 pub(in crate::multitask) use runtime_profile::publish_scheduler_runtime_profile;
+
+pub(in crate::multitask) fn local_dispatch_work_pending(cpu: usize) -> bool {
+    runqueue::local_dispatch_work_pending(cpu)
+}
+
+pub(in crate::multitask) fn foreign_runnable_work_pending(cpu: usize) -> bool {
+    runqueue::foreign_runnable_work_pending(cpu)
+}
 mod smp;
 #[cfg(test)]
 mod synchronous_handoff_tests;
+mod thread_slots;
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -61,6 +73,7 @@ use super::context::{SAVED_CONTEXT_BYTES, SavedContext};
 use super::process_table::{self, ProcessHandle};
 use super::{UserFaultDisposition, UserStackState, UserTaskBootstrap, initial_task_rflags};
 use context_validation::context_validation_reason_code;
+use dispatch_policy::CpuDispatchPolicy;
 use handoff_queue::SlotHandoffQueue;
 pub(super) use linux_thread_state::CurrentLinuxThreadBinding;
 use linux_thread_state::{LinuxThreadStateLock, empty_linux_thread_state_lock};
@@ -367,6 +380,7 @@ pub(super) struct Scheduler {
     /// process context; no allocation or cross-subsystem lock is taken in IRQ.
     deferred_retire_reasons: [Option<TaskRetireReason>; MAX_TASK],
     exec_target_quiesced: [bool; MAX_TASK], // blocks external exec target dispatch
+    thread_slot_reserved: [bool; MAX_TASK],
     start_suspended: [bool; MAX_TASK],
     job_stopped: [bool; MAX_TASK],
     retire_reasons: [Option<TaskRetireReason>; MAX_TASK],
@@ -386,42 +400,14 @@ pub(super) struct Scheduler {
     task_last_cpu: [u8; MAX_TASK],
     pub(super) current_task: usize,
     pending_reap: bool,
-    /// L4/seL4-style "donate" hint: on the next scheduler tick, prefer this
-    /// slot if it is ready. Set by IPC paths immediately before
-    /// `yield_now()` so the caller hands its remaining timeslice to the
-    /// receiver/replier instead of letting round-robin pick an unrelated task
-    /// and stalling for an entire PIT slice. The hint is kept while its target
-    /// is ready but temporarily blocked by a higher scheduling class, and is
-    /// cleared once consumed or once the target is no longer schedulable.
-    next_pick_hint: Option<usize>,
-    /// Bounded FIFO of authority-checked event/data wakeups. Unlike a normal
-    /// donation hint, these may cross the System/User class boundary. A FIFO
-    /// prevents concurrent service replies from overwriting older wakeups.
-    latency_pick_hints: [Option<usize>; MAX_LATENCY_HANDOFF_HINTS],
-    latency_pick_hint_head: usize,
-    latency_pick_hint_len: usize,
-    /// Exact child first-turn authority; separate from replaceable IPC hints.
-    spawn_pick_hints: SlotHandoffQueue<MAX_TASK>,
-    /// Exact members of one atomic activation cohort. This must not alias the
-    /// ordinary spawn queue: concurrent thread creation may leave unrelated
-    /// first-turn hints there while initd commits a later service cohort.
-    atomic_activation_pick_hints: SlotHandoffQueue<MAX_ATOMIC_ACTIVATION_HANDOFFS>,
-    /// Remaining members of one atomically committed startup cohort that must
-    /// receive a first turn before the loader reply chain resumes.
-    atomic_activation_handoff_remaining: usize,
-    /// Exact peers required by committed synchronous IPC. Call enqueue and
-    /// reply completion may race on different CPUs, so custody is a bounded
-    /// FIFO, not a replaceable side hint.
-    sync_pick_hints: SlotHandoffQueue<MAX_TASK>,
+    /// Every hot-path policy value is owned by one logical CPU. The global
+    /// scheduler object is currently only the lifecycle/catalog serializer;
+    /// it must not create a second system-wide dispatch policy.
+    cpu_dispatch: [CpuDispatchPolicy; nucleus_core::util::lockdep::MAX_TRACKED_CPUS],
     /// At most one synchronous IPC wait can be active per runnable task, so
     /// `MAX_TASK` fixed entries cover every live donation without allocating
     /// from scheduler or IPC paths.
     ipc_priority_donations: [Option<IpcPriorityDonation>; MAX_TASK],
-    /// Cached minimum vruntime across the ready set, refreshed each pick.
-    /// New tasks initialise their vruntime from this value (plus a small
-    /// penalty) so they cannot preempt long-lived ready tasks just by virtue
-    /// of being freshly created.
-    last_min_vruntime_ns: u64,
     /// Attribution remains fixed-size and is rendered only after the global
     /// scheduler owner is released; normal logging policy may discard it.
     runtime_profile_started_ticks: u64,
@@ -444,13 +430,6 @@ pub(super) struct Scheduler {
     /// True after the bootstrap root task has entered the permanent hlt loop.
     /// Before that, slot 0 still runs finalize work and remains schedulable.
     root_idle: bool,
-    /// Number of immediately preceding System-class dispatches. Once the
-    /// bounded maximum is reached a ready User task receives one mandatory
-    /// dispatch, preventing a critical-lane flood from starving recovery or
-    /// ordinary applications forever.
-    system_dispatch_streak: u8,
-    latency_handoff_streak: u8,
-    sync_handoff_streak: u8,
     /// Fixed scheduler tick divisor. CFS-style scheduling accounts CPU share
     /// through vruntime weights; it must not also shorten/lengthen the hardware
     /// tick per task or low-weight services pay excessive interrupt overhead.
@@ -467,6 +446,7 @@ impl Scheduler {
             retirement_side_effects: [None; MAX_TASK],
             deferred_retire_reasons: [None; MAX_TASK],
             exec_target_quiesced: [false; MAX_TASK],
+            thread_slot_reserved: [false; MAX_TASK],
             start_suspended: [false; MAX_TASK],
             job_stopped: [false; MAX_TASK],
             retire_reasons: [None; MAX_TASK],
@@ -482,14 +462,8 @@ impl Scheduler {
             task_last_cpu: [NO_IDLE_CPU; MAX_TASK],
             current_task: 0,
             pending_reap: false,
-            next_pick_hint: None,
-            latency_pick_hints: [None; MAX_LATENCY_HANDOFF_HINTS],
-            latency_pick_hint_head: 0,
-            latency_pick_hint_len: 0,
-            spawn_pick_hints: SlotHandoffQueue::new(),
-            atomic_activation_pick_hints: SlotHandoffQueue::new(),
-            atomic_activation_handoff_remaining: 0,
-            sync_pick_hints: SlotHandoffQueue::new(),
+            cpu_dispatch: [const { CpuDispatchPolicy::new() };
+                nucleus_core::util::lockdep::MAX_TRACKED_CPUS],
             ipc_priority_donations: [None; MAX_TASK],
             runtime_profile_started_ticks: 0,
             runtime_profile_ns: [0; MAX_TASK],
@@ -505,12 +479,79 @@ impl Scheduler {
             runtime_profile_lock_hold_ns: 0,
             runtime_profile_lock_wait_max_ns: 0,
             runtime_profile_lock_hold_max_ns: 0,
-            last_min_vruntime_ns: 0,
             root_idle: false,
-            system_dispatch_streak: 0,
-            latency_handoff_streak: 0,
-            sync_handoff_streak: 0,
             scheduler_tick_divisor: 0,
+        }
+    }
+
+    #[inline]
+    fn current_dispatch_cpu() -> usize {
+        let cpu = nucleus_core::util::lockdep::current_cpu_index();
+        assert!(
+            cpu < nucleus_core::util::lockdep::MAX_TRACKED_CPUS,
+            "scheduler dispatch CPU exceeds capacity"
+        );
+        cpu
+    }
+
+    #[inline]
+    fn current_dispatch_policy(&self) -> &CpuDispatchPolicy {
+        &self.cpu_dispatch[Self::current_dispatch_cpu()]
+    }
+
+    #[inline]
+    fn current_dispatch_policy_mut(&mut self) -> &mut CpuDispatchPolicy {
+        &mut self.cpu_dispatch[Self::current_dispatch_cpu()]
+    }
+
+    fn slot_dispatch_cpu(&self, slot: usize) -> usize {
+        #[cfg(not(test))]
+        if let Some(cpu) = runqueue::owner(slot).cpu {
+            return cpu;
+        }
+        #[cfg(test)]
+        let _ = slot;
+        Self::current_dispatch_cpu()
+    }
+
+    fn handoff_slot_ready(&self, slot: usize) -> bool {
+        slot < MAX_TASK
+            && !self.retired[slot]
+            && !self.start_suspended[slot]
+            && !self.job_stopped[slot]
+            && !self.exec_target_quiesced[slot]
+            && self.deferred_retire_reasons[slot].is_none()
+            && self.contexts[slot].is_some_and(|context| context.ready && !context.blocked)
+    }
+
+    fn new_task_vruntime(&self) -> u64 {
+        self.current_dispatch_policy()
+            .last_min_vruntime_ns
+            .saturating_add(SCHED_NEW_TASK_VRUNTIME_PENALTY_NS)
+    }
+
+    fn remove_slot_from_dispatch_policies(&mut self, slot: usize) {
+        for policy in &mut self.cpu_dispatch {
+            if policy.next_pick_hint == Some(slot) {
+                policy.next_pick_hint = None;
+            }
+            let mut compact = [None; MAX_LATENCY_HANDOFF_HINTS];
+            let mut retained = 0_usize;
+            for offset in 0..policy.latency_pick_hint_len {
+                let index = (policy.latency_pick_hint_head + offset) % MAX_LATENCY_HANDOFF_HINTS;
+                if let Some(candidate) = policy.latency_pick_hints[index]
+                    && candidate != slot
+                {
+                    compact[retained] = Some(candidate);
+                    retained += 1;
+                }
+            }
+            policy.latency_pick_hints = compact;
+            policy.latency_pick_hint_head = 0;
+            policy.latency_pick_hint_len = retained;
+            policy.spawn_pick_hints.remove(slot);
+            policy.atomic_activation_pick_hints.remove(slot);
+            policy.sync_pick_hints.remove(slot);
         }
     }
 
@@ -524,14 +565,17 @@ impl Scheduler {
     /// handoff has its own hint slot and remains protected from IPC replies.
     pub(super) fn set_next_pick_hint(&mut self, task_id: u64) {
         let Some(slot) = self.find_task_slot(task_id) else {
-            self.next_pick_hint = None;
+            self.current_dispatch_policy_mut().next_pick_hint = None;
             return;
         };
-        if !self.handoff_hint_eligible(slot) {
+        if !self.handoff_slot_ready(slot) {
             return;
         }
-        self.apply_ipc_donation(slot);
-        self.next_pick_hint = Some(slot);
+        let target_cpu = self.slot_dispatch_cpu(slot);
+        if target_cpu == Self::current_dispatch_cpu() {
+            self.apply_ipc_donation(slot);
+        }
+        self.cpu_dispatch[target_cpu].next_pick_hint = Some(slot);
     }
 
     pub(super) fn set_next_latency_pick_hint(&mut self, task_id: u64) -> bool {
@@ -541,54 +585,43 @@ impl Scheduler {
         // This queue exists only for the explicit cross-class exception.
         // System tasks already win normal class selection and must not consume
         // the bounded User wakeup budget.
-        if self.slot_class(slot) != Some(SchedClass::User) || !self.handoff_hint_eligible(slot) {
+        if self.slot_class(slot) != Some(SchedClass::User) || !self.handoff_slot_ready(slot) {
             return false;
         }
-        if (0..self.latency_pick_hint_len).any(|offset| {
-            let index = (self.latency_pick_hint_head + offset) % MAX_LATENCY_HANDOFF_HINTS;
-            self.latency_pick_hints[index] == Some(slot)
+        let target_cpu = self.slot_dispatch_cpu(slot);
+        let policy = &self.cpu_dispatch[target_cpu];
+        if (0..policy.latency_pick_hint_len).any(|offset| {
+            let index = (policy.latency_pick_hint_head + offset) % MAX_LATENCY_HANDOFF_HINTS;
+            policy.latency_pick_hints[index] == Some(slot)
         }) {
             return true;
         }
-        if self.latency_pick_hint_len >= MAX_LATENCY_HANDOFF_HINTS {
+        if policy.latency_pick_hint_len >= MAX_LATENCY_HANDOFF_HINTS {
             return false;
         }
-        let tail =
-            (self.latency_pick_hint_head + self.latency_pick_hint_len) % MAX_LATENCY_HANDOFF_HINTS;
-        self.latency_pick_hints[tail] = Some(slot);
-        self.latency_pick_hint_len += 1;
+        let policy = &mut self.cpu_dispatch[target_cpu];
+        let tail = (policy.latency_pick_hint_head + policy.latency_pick_hint_len)
+            % MAX_LATENCY_HANDOFF_HINTS;
+        policy.latency_pick_hints[tail] = Some(slot);
+        policy.latency_pick_hint_len += 1;
         true
-    }
-
-    fn remove_latency_pick_hint(&mut self, slot: usize) {
-        let mut compact = [None; MAX_LATENCY_HANDOFF_HINTS];
-        let mut retained = 0_usize;
-        for offset in 0..self.latency_pick_hint_len {
-            let index = (self.latency_pick_hint_head + offset) % MAX_LATENCY_HANDOFF_HINTS;
-            if let Some(candidate) = self.latency_pick_hints[index]
-                && candidate != slot
-            {
-                compact[retained] = Some(candidate);
-                retained += 1;
-            }
-        }
-        self.latency_pick_hints = compact;
-        self.latency_pick_hint_head = 0;
-        self.latency_pick_hint_len = retained;
     }
 
     /// Selects a runnable worker for a process-owned endpoint when the sender
     /// enqueues between the server's reply and its next `IPC_RECV`. In that
-    /// window the endpoint has no waiter task to return, but the process worker
-    /// is ready and must receive the same direct-handoff treatment.
+    /// window the endpoint has no waiter task to return, but an associated
+    /// process worker is ready or already running and must receive the same
+    /// direct-handoff treatment. The server may belong to another runqueue;
+    /// limiting this search to the caller CPU silently disables QNX-style
+    /// server boost on SMP and leaves a System caller behind unrelated User
+    /// work until the server's next receive.
     pub(super) fn set_next_process_pick_hint(&mut self, process_id: u64) -> Option<u64> {
         let slot = (0..MAX_TASK)
-            .filter(|slot| *slot != self.current_task)
             .filter(|slot| {
                 self.contexts[*slot].is_some_and(|context| {
                     context.process_id == Some(process_id)
                         && context.ready
-                        && self.context_is_schedulable(*slot, context)
+                        && self.handoff_slot_ready(*slot)
                 })
             })
             .min_by_key(|slot| {
@@ -597,9 +630,13 @@ impl Scheduler {
                     .unwrap_or((u64::MAX, *slot))
             })?;
         self.apply_ipc_donation(slot);
-        self.sync_pick_hints
+        let target_cpu = self.slot_dispatch_cpu(slot);
+        self.cpu_dispatch[target_cpu]
+            .sync_pick_hints
             .enqueue(slot)
             .expect("scheduler synchronous process handoff queue overflow");
+        #[cfg(not(test))]
+        super::irq::request_target_reschedule(target_cpu);
         self.starts[slot].map(|start| start.id)
     }
 
@@ -746,13 +783,6 @@ impl Scheduler {
         })
     }
 
-    fn handoff_hint_eligible(&self, slot: usize) -> bool {
-        let Some(context) = self.contexts.get(slot).and_then(|context| *context) else {
-            return false;
-        };
-        context.ready && self.context_is_schedulable(slot, context)
-    }
-
     fn apply_ipc_donation(&mut self, target_slot: usize) {
         if target_slot == self.current_task || target_slot >= MAX_TASK {
             return;
@@ -815,22 +845,27 @@ impl Scheduler {
     }
 
     fn next_pick_hint_candidate_slot(&self) -> Option<usize> {
-        self.pick_hint_candidate_slot(self.next_pick_hint)
+        self.pick_hint_candidate_slot(self.current_dispatch_policy().next_pick_hint)
     }
 
     fn next_pick_hint_ready_slot(&self) -> Option<usize> {
-        self.pick_hint_ready_slot(self.next_pick_hint)
+        self.pick_hint_ready_slot(self.current_dispatch_policy().next_pick_hint)
     }
 
     fn take_next_latency_pick_hint_ready_slot(&mut self) -> Option<usize> {
-        if self.latency_handoff_streak >= MAX_CONSECUTIVE_LATENCY_HANDOFFS {
+        if self.current_dispatch_policy().latency_handoff_streak >= MAX_CONSECUTIVE_LATENCY_HANDOFFS
+        {
             return None;
         }
-        while self.latency_pick_hint_len != 0 {
-            let index = self.latency_pick_hint_head;
-            let hint = self.latency_pick_hints[index].take();
-            self.latency_pick_hint_head = (index + 1) % MAX_LATENCY_HANDOFF_HINTS;
-            self.latency_pick_hint_len -= 1;
+        while self.current_dispatch_policy().latency_pick_hint_len != 0 {
+            let hint = {
+                let policy = self.current_dispatch_policy_mut();
+                let index = policy.latency_pick_hint_head;
+                let hint = policy.latency_pick_hints[index].take();
+                policy.latency_pick_hint_head = (index + 1) % MAX_LATENCY_HANDOFF_HINTS;
+                policy.latency_pick_hint_len -= 1;
+                hint
+            };
             if let Some(slot) = self.pick_hint_candidate_slot(hint) {
                 return Some(slot);
             }
@@ -839,12 +874,14 @@ impl Scheduler {
     }
 
     fn take_next_pick_hint_ready_slot(&mut self) -> Option<usize> {
-        if self.next_pick_hint.is_some() && self.next_pick_hint_candidate_slot().is_none() {
-            self.next_pick_hint = None;
+        if self.current_dispatch_policy().next_pick_hint.is_some()
+            && self.next_pick_hint_candidate_slot().is_none()
+        {
+            self.current_dispatch_policy_mut().next_pick_hint = None;
             return None;
         }
         let slot = self.next_pick_hint_ready_slot()?;
-        self.next_pick_hint = None;
+        self.current_dispatch_policy_mut().next_pick_hint = None;
         Some(slot)
     }
 
@@ -861,6 +898,8 @@ impl Scheduler {
         rflags: u64,
         kernel_task_entry_rip: u64,
     ) {
+        #[cfg(not(test))]
+        runqueue::reset_before_publication();
         for slot in 0..MAX_TASK {
             self.clear_slot(slot);
         }
@@ -872,6 +911,7 @@ impl Scheduler {
         self.retirement_cleanup = [None; MAX_TASK];
         self.retirement_side_effects = [None; MAX_TASK];
         self.deferred_retire_reasons = [None; MAX_TASK];
+        self.thread_slot_reserved = [false; MAX_TASK];
         self.start_suspended = [false; MAX_TASK];
         self.job_stopped = [false; MAX_TASK];
         self.retire_reasons = [None; MAX_TASK];
@@ -896,19 +936,10 @@ impl Scheduler {
         self.runtime_profile_lock_hold_max_ns = 0;
         self.current_task = ROOT_TASK_SLOT;
         self.pending_reap = false;
-        self.next_pick_hint = None;
-        self.latency_pick_hints = [None; MAX_LATENCY_HANDOFF_HINTS];
-        self.latency_pick_hint_head = 0;
-        self.latency_pick_hint_len = 0;
-        self.spawn_pick_hints = SlotHandoffQueue::new();
-        self.atomic_activation_pick_hints = SlotHandoffQueue::new();
-        self.atomic_activation_handoff_remaining = 0;
-        self.sync_pick_hints = SlotHandoffQueue::new();
+        self.cpu_dispatch =
+            [const { CpuDispatchPolicy::new() }; nucleus_core::util::lockdep::MAX_TRACKED_CPUS];
         self.ipc_priority_donations = [None; MAX_TASK];
         self.root_idle = false;
-        self.system_dispatch_streak = 0;
-        self.latency_handoff_streak = 0;
-        self.sync_handoff_streak = 0;
         self.scheduler_tick_divisor = main_thread_pit_divisor;
         self.reset_stack_storage(ROOT_TASK_SLOT)
             .expect("scheduler root stack allocation failed");
@@ -944,6 +975,8 @@ impl Scheduler {
             windows_thread_state: None,
         });
         self.starts[ROOT_TASK_SLOT] = Some(TaskStart { entry, id });
+        #[cfg(not(test))]
+        runqueue::admit_running(ROOT_TASK_SLOT, 0);
         nucleus_core::util::lockdep::set_current_task_owner(
             id.checked_add(1)
                 .expect("root task id exhausted lock owner token"),
@@ -982,15 +1015,13 @@ impl Scheduler {
         let stack_top = context.map(|context| context.kernel_stack_top).unwrap_or(0);
         let reason = self.retire_reasons[slot];
 
+        #[cfg(not(test))]
+        if self.starts[slot].is_some() {
+            runqueue::release_retired(slot);
+        }
         self.contexts[slot] = None;
         self.install_linux_thread_state(slot, None, None);
-        if self.next_pick_hint == Some(slot) {
-            self.next_pick_hint = None;
-        }
-        self.remove_latency_pick_hint(slot);
-        self.spawn_pick_hints.remove(slot);
-        self.atomic_activation_pick_hints.remove(slot);
-        self.sync_pick_hints.remove(slot);
+        self.remove_slot_from_dispatch_policies(slot);
         self.retired[slot] = false;
         self.retirement_cleanup[slot] = None;
         self.deferred_retire_reasons[slot] = None;
@@ -1093,7 +1124,8 @@ impl Scheduler {
     /// `min_ready_vruntime_in_class`.
     fn min_ready_vruntime(&self) -> u64 {
         let mut min: Option<u64> = None;
-        for slot in 0..MAX_TASK {
+        let current_cpu = nucleus_core::util::lockdep::current_cpu_index();
+        for slot in runqueue::local_runnable_slots(current_cpu) {
             if !self.is_fair_candidate_slot(slot) {
                 continue;
             }
@@ -1119,7 +1151,8 @@ impl Scheduler {
     /// different real-time pace because of weight differences.
     fn min_ready_vruntime_in_class(&self, class: SchedClass) -> u64 {
         let mut min: Option<u64> = None;
-        for slot in 0..MAX_TASK {
+        let current_cpu = nucleus_core::util::lockdep::current_cpu_index();
+        for slot in runqueue::local_runnable_slots(current_cpu) {
             if !self.is_fair_candidate_slot(slot) {
                 continue;
             }
@@ -1299,7 +1332,8 @@ impl Scheduler {
         latency_bound_ms: u64,
     ) -> Option<usize> {
         let mut oldest: Option<(usize, u64, u64)> = None;
-        for slot in 0..MAX_TASK {
+        let current_cpu = nucleus_core::util::lockdep::current_cpu_index();
+        for slot in runqueue::local_runnable_slots(current_cpu) {
             if slot == current || !self.is_fair_candidate_slot(slot) {
                 continue;
             }
@@ -1366,27 +1400,31 @@ impl Scheduler {
     }
 
     fn user_reservation_due(&self) -> bool {
-        self.system_dispatch_streak >= MAX_CONSECUTIVE_SYSTEM_DISPATCHES
+        self.current_dispatch_policy().system_dispatch_streak >= MAX_CONSECUTIVE_SYSTEM_DISPATCHES
     }
 
     fn record_dispatch_class(&mut self, slot: usize) {
-        self.system_dispatch_streak = match self.slot_class(slot) {
+        let next = match self.slot_class(slot) {
             Some(SchedClass::System) => self
+                .current_dispatch_policy()
                 .system_dispatch_streak
                 .saturating_add(1)
                 .min(MAX_CONSECUTIVE_SYSTEM_DISPATCHES),
             Some(SchedClass::User | SchedClass::Idle) | None => 0,
         };
+        self.current_dispatch_policy_mut().system_dispatch_streak = next;
     }
 
     fn record_latency_handoff(&mut self, latency_handoff: bool) {
-        self.latency_handoff_streak = if latency_handoff {
-            self.latency_handoff_streak
+        let next = if latency_handoff {
+            self.current_dispatch_policy()
+                .latency_handoff_streak
                 .saturating_add(1)
                 .min(MAX_CONSECUTIVE_LATENCY_HANDOFFS)
         } else {
             0
         };
+        self.current_dispatch_policy_mut().latency_handoff_streak = next;
     }
 
     /// Removes the current user task's *base* System-class admission and caps
@@ -1548,6 +1586,14 @@ impl Scheduler {
         if slot == ROOT_TASK_SLOT {
             panic!("scheduler root kernel task cannot be retired");
         }
+
+        #[cfg(not(test))]
+        runqueue::retire(
+            slot,
+            self.contexts[slot]
+                .map(|context| context.weight)
+                .unwrap_or(NICE_0_LOAD),
+        );
 
         let task_id = self.starts[slot].map(|start| start.id);
         let process =
@@ -1960,9 +2006,7 @@ impl Scheduler {
                     blocked_since_ticks: 0,
                     wake_armed: false,
                     weight: Self::weight_from_pit_divisor(pit_divisor),
-                    vruntime_ns: self
-                        .last_min_vruntime_ns
-                        .saturating_add(SCHED_NEW_TASK_VRUNTIME_PENALTY_NS),
+                    vruntime_ns: self.new_task_vruntime(),
                     exec_start_ticks: 0,
                     address_space_root: crate::memory::paging::kernel_root_phys().as_u64(),
                     kernel_stack_base: kernel_stack_base as u64,
@@ -1980,6 +2024,8 @@ impl Scheduler {
                 self.simd_states[slot] = SimdState::new();
                 self.syscall_user_simd_active[slot] = false;
                 self.starts[slot] = Some(TaskStart { entry, id });
+                #[cfg(not(test))]
+                self.admit_runqueue_slot(slot, true);
                 return Some(slot);
             }
         }
@@ -2057,9 +2103,7 @@ impl Scheduler {
                     },
                     wake_armed: false,
                     weight: Self::weight_from_pit_divisor(pit_divisor),
-                    vruntime_ns: self
-                        .last_min_vruntime_ns
-                        .saturating_add(SCHED_NEW_TASK_VRUNTIME_PENALTY_NS),
+                    vruntime_ns: self.new_task_vruntime(),
                     exec_start_ticks: 0,
                     address_space_root: root_phys,
                     kernel_stack_base: kernel_stack_base as u64,
@@ -2090,6 +2134,8 @@ impl Scheduler {
                 );
                 self.initialize_slot_affinity(slot, inherited_process_mask, inherited_process_mask);
                 self.start_suspended[slot] = start_suspended;
+                #[cfg(not(test))]
+                self.admit_runqueue_slot(slot, !start_suspended);
                 return Some(slot);
             }
         }
@@ -2130,9 +2176,7 @@ impl Scheduler {
                     blocked_since_ticks: 0,
                     wake_armed: false,
                     weight: Self::weight_from_pit_divisor(pit_divisor),
-                    vruntime_ns: self
-                        .last_min_vruntime_ns
-                        .saturating_add(SCHED_NEW_TASK_VRUNTIME_PENALTY_NS),
+                    vruntime_ns: self.new_task_vruntime(),
                     exec_start_ticks: 0,
                     address_space_root: root_phys,
                     kernel_stack_base: kernel_stack_base as u64,
@@ -2161,6 +2205,8 @@ impl Scheduler {
                     bootstrap.linux_thread_state.map(|_| id),
                     bootstrap.linux_thread_state,
                 );
+                #[cfg(not(test))]
+                self.admit_runqueue_slot(slot, true);
                 return Some(slot);
             }
         }
@@ -2202,9 +2248,7 @@ impl Scheduler {
                     blocked_since_ticks: 0,
                     wake_armed: false,
                     weight: Self::weight_from_pit_divisor(pit_divisor),
-                    vruntime_ns: self
-                        .last_min_vruntime_ns
-                        .saturating_add(SCHED_NEW_TASK_VRUNTIME_PENALTY_NS),
+                    vruntime_ns: self.new_task_vruntime(),
                     exec_start_ticks: 0,
                     address_space_root: root_phys,
                     kernel_stack_base: kernel_stack_base as u64,
@@ -2235,114 +2279,9 @@ impl Scheduler {
                     entry.as_u64(),
                     _exec_path
                 );
+                #[cfg(not(test))]
+                self.admit_runqueue_slot(slot, true);
                 return Some(slot);
-            }
-        }
-
-        None
-    }
-
-    #[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
-    pub(super) fn allocate_user_thread_slot(
-        &mut self,
-        id: u64,
-        bootstrap: UserTaskBootstrap,
-        user_cs: u64,
-        user_ss: u64,
-        rflags: u64,
-    ) -> Option<(usize, u32)> {
-        let current = self.contexts[self.current_task]?;
-        let (inherited_task_mask, inherited_process_mask) =
-            self.current_affinity_for_child_thread();
-        if !current.user_mode {
-            return None;
-        }
-
-        let root_phys = current.address_space_root;
-        let process_handle = current.process_handle?;
-        let process_id = current.process_id?;
-        for slot in FIRST_DYNAMIC_TASK_SLOT..MAX_TASK {
-            if self.contexts[slot].is_none() {
-                self.reset_stack_storage(slot)?;
-                if process_table::attach_task(process_handle).is_none() {
-                    self.release_stack_storage(slot);
-                    return None;
-                }
-                if let Some(thread_state) = bootstrap.windows_thread_state {
-                    let Some(init_result) = process_table::with_process_state_mut(
-                        process_handle,
-                        |_, process_state| {
-                            process::initialize_windows_thread_identifiers(
-                                process_state.address_space_mut(),
-                                thread_state.teb_address,
-                                process_id,
-                                id,
-                            )
-                        },
-                    ) else {
-                        let _ = process_table::detach_task(process_handle);
-                        self.release_stack_storage(slot);
-                        return None;
-                    };
-                    if let Err(error) = init_result {
-                        let _ = process_table::detach_task(process_handle);
-                        self.release_stack_storage(slot);
-                        panic!("failed to initialize windows thread ids: {:?}", error);
-                    }
-                }
-                let (kernel_stack_base, kernel_stack_top) = self.stack_bounds(slot);
-                self.contexts[slot] = Some(TaskContext {
-                    saved_rsp: self
-                        .init_user_task_context(slot, &bootstrap, user_cs, user_ss, rflags),
-                    // Clone publication is transactional. The child must not
-                    // execute until the caller has committed parent_tid and
-                    // child_tid in the shared address space.
-                    ready: false,
-                    ready_since_ticks: 0,
-                    blocked: true,
-                    blocked_since_ticks: crate::arch::rtc::ticks(),
-                    wake_armed: false,
-                    // POSIX threads share one process scheduling policy.  A
-                    // hard-coded default here creates a cross-class priority
-                    // inversion when a System UI thread waits on a helper it
-                    // just cloned.  Inherit the parent's base load weight and
-                    // fair position; transient IPC donations remain scoped to
-                    // their reply capability and are intentionally not copied.
-                    weight: current.weight,
-                    vruntime_ns: current
-                        .vruntime_ns
-                        .saturating_add(SCHED_NEW_TASK_VRUNTIME_PENALTY_NS),
-                    exec_start_ticks: 0,
-                    address_space_root: root_phys,
-                    kernel_stack_base: kernel_stack_base as u64,
-                    kernel_stack_top: kernel_stack_top as u64,
-                    alternate_kernel_stack_base: 0,
-                    alternate_kernel_stack_top: 0,
-                    user_mode: true,
-                    user_abi: Some(bootstrap.abi),
-                    console_session: bootstrap.console_session,
-                    process_handle: Some(process_handle),
-                    process_id: Some(process_id),
-                    user_stack: bootstrap.user_stack,
-                    windows_thread_state: bootstrap.windows_thread_state.map(|mut state| {
-                        state.thread_id = id;
-                        state
-                    }),
-                });
-                self.simd_states[slot] = SimdState::new();
-                self.syscall_user_simd_active[slot] = false;
-                self.start_suspended[slot] = true;
-                self.starts[slot] = Some(TaskStart {
-                    entry: super::noop_task_entry,
-                    id,
-                });
-                self.install_linux_thread_state(
-                    slot,
-                    bootstrap.linux_thread_state.map(|_| id),
-                    bootstrap.linux_thread_state,
-                );
-                self.initialize_slot_affinity(slot, inherited_task_mask, inherited_process_mask);
-                return Some((slot, current.weight));
             }
         }
 
@@ -2459,6 +2398,13 @@ impl Scheduler {
         if self.deferred_retire_reasons[slot].is_some() {
             return;
         }
+        #[cfg(not(test))]
+        runqueue::retire(
+            slot,
+            self.contexts[slot]
+                .map(|context| context.weight)
+                .unwrap_or(NICE_0_LOAD),
+        );
         self.retired[slot] = true;
         self.pending_reap = true;
         self.retire_reasons[slot] = Some(reason);
@@ -2542,7 +2488,11 @@ impl Scheduler {
     }
 
     fn retire_invalid_ready_tasks(&mut self) {
-        for slot in 1..MAX_TASK {
+        let current_cpu = nucleus_core::util::lockdep::current_cpu_index();
+        for slot in runqueue::local_runnable_slots(current_cpu) {
+            if slot == ROOT_TASK_SLOT {
+                continue;
+            }
             // Only a published runnable frame is immutable scheduler state.
             // The current task's saved frame is the live kernel stack and may
             // be overwritten until interrupt/syscall entry finishes saving
@@ -2589,6 +2539,7 @@ impl Scheduler {
     /// of those states has lost both CPU ownership and wake authority; letting
     /// the scheduler continue would turn a bounded wait into an invisible
     /// permanent hang.
+    #[cfg(test)]
     fn assert_live_task_state_partition(&self) {
         for slot in 1..MAX_TASK {
             let Some(context) = self.contexts[slot] else {
@@ -2635,6 +2586,9 @@ impl Scheduler {
         current_rsp: usize,
         voluntary_yield: bool,
     ) -> SchedulerDispatch {
+        let dispatch_cpu = nucleus_core::util::lockdep::current_cpu_index();
+        #[cfg(not(test))]
+        let current_cpu = dispatch_cpu;
         let current_slot = self.current_task;
         let current_task_id = self.starts[current_slot]
             .map(|start| start.id)
@@ -2674,12 +2628,53 @@ impl Scheduler {
             self.retire_slot_due_to_invalid_context(current_slot, current_rsp, reason);
         }
 
+        #[cfg(not(test))]
+        {
+            let owner = runqueue::owner(current_slot);
+            if owner.state == runqueue::RunOwnerState::Running {
+                let weight = self.contexts[current_slot]
+                    .map(|context| context.weight)
+                    .unwrap_or(NICE_0_LOAD);
+                let current_affinity = self.task_affinity_masks[current_slot]
+                    & self.process_affinity_masks[current_slot];
+                let current_cpu_is_eligible = current_affinity & (1_u64 << current_cpu) != 0;
+                if self.retired[current_slot]
+                    || self.contexts[current_slot]
+                        .is_none_or(|context| !context.ready || context.blocked)
+                {
+                    runqueue::publish_blocked(current_slot, current_cpu, weight);
+                } else if !current_cpu_is_eligible {
+                    runqueue::publish_blocked(current_slot, current_cpu, weight);
+                    assert!(
+                        self.publish_runqueue_wake(current_slot),
+                        "scheduler could not rehome affinity-excluded current slot={current_slot}"
+                    );
+                } else {
+                    runqueue::publish_local(current_slot, current_cpu, weight);
+                }
+            } else {
+                assert!(
+                    owner.state.is_terminal(),
+                    "scheduler current task entered dispatch without Running or terminal custody slot={} owner={owner:?}",
+                    current_slot
+                );
+            }
+            let _ = runqueue::drain_remote_wakes(current_cpu);
+            if self.slot_class(current_slot) == Some(SchedClass::Idle) {
+                let _ = self.steal_one_for_idle_cpu(current_cpu);
+            } else if !voluntary_yield {
+                let _ = self.rebalance_one_from_busy_cpu(current_cpu, now_ticks);
+            }
+        }
+
         self.retire_invalid_ready_tasks();
+        #[cfg(test)]
         self.assert_live_task_state_partition();
 
         // Refresh cached min_vruntime: this is fed to newly-spawned tasks so
         // they do not preempt the rest of the system on creation alone.
-        self.last_min_vruntime_ns = self.min_ready_vruntime();
+        let local_min_vruntime = self.min_ready_vruntime();
+        self.current_dispatch_policy_mut().last_min_vruntime_ns = local_min_vruntime;
 
         // Pick order:
         //  1. The bounded first-turn prefix of one atomically activated
@@ -2807,6 +2802,13 @@ impl Scheduler {
         if let Some(next) = self.contexts[next_idx] {
             match self.context_validation_error(next_idx, next, next.saved_rsp) {
                 None => {
+                    #[cfg(not(test))]
+                    assert!(
+                        runqueue::claim_dispatch(next_idx, dispatch_cpu, next.weight),
+                        "scheduler selected a task without local rq custody slot={} cpu={}",
+                        next_idx,
+                        dispatch_cpu
+                    );
                     self.trace_switch(current_slot, next_idx);
                     if next_idx != current_slot && next.ready_since_ticks != 0 {
                         let task_id = self.starts[next_idx].map(|start| start.id);
@@ -2826,7 +2828,6 @@ impl Scheduler {
                     }
                     self.record_dispatch_class(next_idx);
                     self.record_runtime_profile_dispatch(next_idx);
-                    let dispatch_cpu = nucleus_core::util::lockdep::current_cpu_index();
                     self.record_runtime_profile_transition(current_slot, next_idx, dispatch_cpu);
                     self.record_task_dispatch_cpu(next_idx, dispatch_cpu);
                     self.record_latency_handoff(latency_handoff_pick);
@@ -2869,6 +2870,13 @@ impl Scheduler {
         }
 
         let current = self.contexts[current_slot].expect("scheduler lost the current task context");
+        #[cfg(not(test))]
+        assert!(
+            runqueue::claim_dispatch(current_slot, dispatch_cpu, current.weight),
+            "scheduler fallback task lost local rq custody slot={} cpu={}",
+            current_slot,
+            dispatch_cpu
+        );
         // Keep running current: refresh its exec_start_ticks so subsequent
         // vruntime accounting sees a non-zero baseline.
         if let Some(ctx) = self.contexts[current_slot].as_mut() {
@@ -2886,7 +2894,6 @@ impl Scheduler {
             false,
         );
         self.record_runtime_profile_dispatch(current_slot);
-        let dispatch_cpu = nucleus_core::util::lockdep::current_cpu_index();
         self.record_runtime_profile_transition(current_slot, current_slot, dispatch_cpu);
         self.record_task_dispatch_cpu(current_slot, dispatch_cpu);
         SchedulerDispatch::new(
@@ -3034,6 +3041,10 @@ impl Scheduler {
         self.contexts[self.current_task]
             .map(|context| context.user_mode)
             .unwrap_or(false)
+    }
+
+    pub(super) fn current_task_is_idle_task(&self) -> bool {
+        self.slot_class(self.current_task) == Some(SchedClass::Idle)
     }
 
     pub(super) fn current_task_is_retired(&self) -> bool {
@@ -3870,6 +3881,11 @@ impl Scheduler {
             context.ready = true;
             context.ready_since_ticks = crate::arch::rtc::ticks();
             context.blocked_since_ticks = 0;
+            #[cfg(not(test))]
+            if let Some(cpu) = runqueue::owner(slot).cpu {
+                super::irq::request_target_reschedule(cpu);
+            }
+            #[cfg(test)]
             super::request_deferred_reschedule();
             return true;
         }
@@ -3939,6 +3955,13 @@ impl Scheduler {
             return true;
         }
 
+        #[cfg(not(test))]
+        let wake_owner_cpu = if waker_ready && self.publish_runqueue_wake(slot) {
+            runqueue::owner(slot).cpu
+        } else {
+            None
+        };
+
         // Wake-preempt. Without this signal the wake just makes the task
         // ready; the next scheduling decision then waits for either the next
         // timer tick (~1ms — recoverable) or the current task to voluntarily
@@ -3966,6 +3989,11 @@ impl Scheduler {
                 _ => false,
             };
             if should_preempt {
+                #[cfg(not(test))]
+                if let Some(cpu) = wake_owner_cpu {
+                    super::irq::request_target_reschedule(cpu);
+                }
+                #[cfg(test)]
                 super::request_deferred_reschedule();
             }
         }
@@ -4115,6 +4143,7 @@ fn published_frame_is_stable(slot: usize, current_slot: usize, running: bool) ->
     slot != current_slot && !running
 }
 
+#[cfg(test)]
 fn live_task_state_is_partitioned(
     slot: usize,
     current_slot: usize,
@@ -4676,18 +4705,7 @@ mod tests {
         scheduler.current_task = 1;
         scheduler.contexts[1] = Some(test_user_context(owner));
         process_table::mark_process_exiting(95).expect("mark exiting");
-        let base = crate::memory::paging::USER_SPACE_BASE;
-        let bootstrap = UserTaskBootstrap::new(
-            UserAbi::Linux,
-            x86_64::VirtAddr::new(base + 0x2_000),
-            x86_64::VirtAddr::new(base + 0x4_000),
-        );
-
-        assert_eq!(
-            scheduler
-                .allocate_user_thread_slot(951, bootstrap, 0, 0, super::RFLAGS_RESERVED_BIT_1,),
-            None
-        );
+        assert!(scheduler.reserve_user_thread_slot(951).is_none());
         assert!(scheduler.contexts[2].is_none());
         assert!(scheduler.stacks[2].is_none());
     }
@@ -4742,6 +4760,8 @@ mod tests {
         // owner process until the reply terminally releases the donation.
         assert!(scheduler.inherit_ipc_priority_for_process(12, 601, 62));
         assert_eq!(scheduler.slot_class(2), Some(SchedClass::System));
+        assert_eq!(scheduler.set_next_process_pick_hint(62), Some(602));
+        assert_eq!(scheduler.current_dispatch_policy().sync_pick_hints.len(), 1);
         assert!(scheduler.release_ipc_priority(12));
         assert_eq!(scheduler.slot_class(2), Some(SchedClass::User));
     }
@@ -4947,15 +4967,23 @@ mod tests {
         system_context.weight = SYSTEM_CLASS_WEIGHT_FLAG | NICE_0_LOAD;
         scheduler.contexts[1] = Some(system_context);
         scheduler.contexts[2] = Some(test_user_context(user));
-        scheduler.system_dispatch_streak = MAX_CONSECUTIVE_SYSTEM_DISPATCHES;
+        scheduler
+            .current_dispatch_policy_mut()
+            .system_dispatch_streak = MAX_CONSECUTIVE_SYSTEM_DISPATCHES;
 
         assert!(scheduler.user_reservation_due());
         scheduler.record_dispatch_class(2);
-        assert_eq!(scheduler.system_dispatch_streak, 0);
+        assert_eq!(
+            scheduler.current_dispatch_policy().system_dispatch_streak,
+            0
+        );
         assert!(!scheduler.user_reservation_due());
 
         scheduler.record_dispatch_class(1);
-        assert_eq!(scheduler.system_dispatch_streak, 1);
+        assert_eq!(
+            scheduler.current_dispatch_policy().system_dispatch_streak,
+            1
+        );
     }
 
     #[test]
@@ -5011,7 +5039,9 @@ mod tests {
         assert!(!scheduler.user_reservation_due());
         assert_eq!(scheduler.reserved_user_pick(current), None);
 
-        scheduler.system_dispatch_streak = MAX_CONSECUTIVE_SYSTEM_DISPATCHES;
+        scheduler
+            .current_dispatch_policy_mut()
+            .system_dispatch_streak = MAX_CONSECUTIVE_SYSTEM_DISPATCHES;
         assert_eq!(scheduler.reserved_user_pick(current), Some(newer_user));
     }
 
@@ -5179,7 +5209,10 @@ mod tests {
             scheduler.take_overdue_system_or_pick_hint(current, now_ticks),
             Some(overdue)
         );
-        assert_eq!(scheduler.next_pick_hint, Some(hinted));
+        assert_eq!(
+            scheduler.current_dispatch_policy().next_pick_hint,
+            Some(hinted)
+        );
 
         scheduler.contexts[overdue]
             .as_mut()
@@ -5189,7 +5222,7 @@ mod tests {
             scheduler.take_overdue_system_or_pick_hint(current, now_ticks),
             Some(hinted)
         );
-        assert_eq!(scheduler.next_pick_hint, None);
+        assert_eq!(scheduler.current_dispatch_policy().next_pick_hint, None);
     }
 
     #[test]
@@ -5242,7 +5275,7 @@ mod tests {
             scheduler.mandatory_overdue_system_pick(current, now_ticks),
             Some(overdue)
         );
-        assert_eq!(scheduler.latency_pick_hint_len, 1);
+        assert_eq!(scheduler.current_dispatch_policy().latency_pick_hint_len, 1);
 
         scheduler.contexts[overdue]
             .as_mut()
@@ -5335,12 +5368,34 @@ mod tests {
         assert_eq!(scheduler.take_next_latency_pick_hint_ready_slot(), None);
 
         assert!(scheduler.set_next_latency_pick_hint(901));
-        scheduler.latency_handoff_streak = super::MAX_CONSECUTIVE_LATENCY_HANDOFFS;
+        scheduler
+            .current_dispatch_policy_mut()
+            .latency_handoff_streak = super::MAX_CONSECUTIVE_LATENCY_HANDOFFS;
         assert_eq!(scheduler.take_next_latency_pick_hint_ready_slot(), None);
         scheduler.record_latency_handoff(false);
         assert_eq!(
             scheduler.take_next_latency_pick_hint_ready_slot(),
             Some(user_slot)
         );
+    }
+
+    #[test]
+    fn dispatch_fairness_and_handoff_state_is_cpu_isolated() {
+        let _process_table = process_table::tests::isolate_process_table();
+        let mut scheduler = boxed_scheduler();
+        let user = test_process(904);
+        scheduler.contexts[1] = Some(test_user_context(user));
+        scheduler.cpu_dispatch[1].system_dispatch_streak = MAX_CONSECUTIVE_SYSTEM_DISPATCHES;
+        scheduler.cpu_dispatch[1].next_pick_hint = Some(7);
+
+        scheduler.record_dispatch_class(1);
+        scheduler.current_dispatch_policy_mut().next_pick_hint = None;
+
+        assert_eq!(scheduler.cpu_dispatch[0].system_dispatch_streak, 0);
+        assert_eq!(
+            scheduler.cpu_dispatch[1].system_dispatch_streak,
+            MAX_CONSECUTIVE_SYSTEM_DISPATCHES
+        );
+        assert_eq!(scheduler.cpu_dispatch[1].next_pick_hint, Some(7));
     }
 }

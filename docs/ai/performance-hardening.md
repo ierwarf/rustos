@@ -384,9 +384,17 @@ lock, and service restart invalidates it by advancing the epoch.
   lock across the bounded netd session-authority call. A transient transition
   failure retains the decoded batch, decoder epoch, and exact unacknowledged
   revoke/grant suffix, then retries before publishing any following input; the
-  absolute five-second deadline exits fail-closed. Inputd process exit
+  state-changing netd/broker turn owns the 100 ms interactive-control budget,
+  not the 16 ms non-consuming readiness-query budget, while the absolute
+  five-second deadline still exits fail-closed. Inputd process exit
   separately clears policy readiness and old-owner records before a
   replacement worker may rearm.
+- Persistent uiserver input wait-set mutations retain their individual 100 ms
+  interactive-control reconciliation limit. Startup retries only transient
+  timeout, interrupted, or backpressure results within the existing five-second
+  boot-control deadline; permanent shape/provider errors still fail immediately.
+  This bounds recovery from a busy single-threaded policy server without
+  converting retry into an unbounded success path.
 - An interactive service's `TASK_WEIGHT_INTERACTIVE_FLAG` admits only its
   input/present and directly latency-bound workers. POSIX clone inherits that
   base class, so catalog loading, runtime polling, console refresh, logging,
@@ -403,6 +411,18 @@ lock, and service restart invalidates it by advancing the epoch.
   The bounded one-shot GPU initialization worker is the sole exception: it
   retains uiserver's boot-critical class until it publishes the mandatory DVM
   compositor result and exits, so background work cannot starve product boot.
+- `kvm-smoke --gui-dvm-surfaces` admits one complete visible-desktop topology:
+  it always attaches the production DVM block provider as well as the display
+  control/pixel transports. Desktop executables are deliberately absent from
+  the immutable early-system closure, so a display-only launch would otherwise
+  produce permanent `ENODEV` retries and could never prove a user-visible UI.
+  `--storage-dvm-only` remains the independent storage contract gate.
+- CPU presentation is admitted only when it is the selected display provider.
+  A mandatory DVM compositor in `Waiting`, or an active compositor holding its
+  15 ms pacing deadline, retains the last valid front buffer and returns
+  bounded backpressure. It must not reinterpret a deferred GPU turn as
+  permission to perform a full 1600x900 CPU scene on the UI thread; that route
+  both violated provider ownership and could trip the three-second UI watchdog.
 
 ## Scheduler Dispatch
 

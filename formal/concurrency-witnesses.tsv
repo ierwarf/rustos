@@ -17,7 +17,7 @@ scheduler_callback_runs_after_hook_registry_read_guard_is_released	kernel/hal/sr
 reschedule_request_is_never_lost_across_concurrent_consume	kernel/ps/src/multitask/irq.rs	arm_remote_reschedule	coalesced-0-to-1-request-is-either-pending-or-exactly-consumed
 tlb_mailbox_and_ack_publish_the_exact_generation	kernel/hal/src/arch/tlb_shootdown.rs	finish_shootdown	release-request-publishes-mailbox-and-release-ack-publishes-flush-before-reclaim
 recoverable_stack_growth_never_nests_scheduler_and_process_locks	kernel/ps/src/multitask/current.rs	retire_current_user_task_due_to_fault	plan-apply-commit-separates-raw-scheduler-and-process-state-lock-domains
-exec_installed_root_retains_generation_bound_owner	kernel/ps/src/multitask/process_table.rs	replace_for_exec	authorized-reservation-survives-late-exit-through-mandatory-owner-transfer
+exec_installed_root_retains_generation_bound_owner	kernel/ps/src/multitask/process_table.rs	finalize_exec_state	authorized-reservation-survives-late-exit-through-mandatory-owner-transfer
 kernel_generated_futex_wake_matches_waiter_identity	kernel/compat/src/user/syscall/linux/service_ops/futex_thread.rs	kernel_generated_futex_wake_keys	shared-backing-first-and-exact-private-fallback-use-canonical-waiter-keys
 rejected_gpu_submit_restores_producer_state	services/uiserver/src/gpu_runtime.rs	GpuCompositor::present	transport-rejection-restores-timeline-and-forces-complete-atlas-replay
 late_acceptance_contract_enables_profiler_once	services/uiserver/src/acceptance_profile.rs	start_late_watcher	bounded-demoted-watcher-publishes-one-atomic-profile-transition

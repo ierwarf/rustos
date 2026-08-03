@@ -6,7 +6,7 @@ task-affinity-lifecycle/TaskAffinityLifecycle	safety	check	rejected affinity req
 acpi-table-admission/AcpiTableAdmission	safety	intentional-terminal	malformed firmware selects no partial ECAM or HPET authority	30	120	exhaustive	no	no	no
 cpu-topology-admission/CpuTopologyAdmission	safety	check	terminal admission states stutter so deadlock checking remains enabled	30	120	exhaustive	no	no	no
 cpu-online-lifecycle/CpuOnlineLifecycle	safety	check	all-failed terminal state stutters so deadlock checking remains enabled	30	120	exhaustive	no	no	no
-smp-reschedule-ipi/SmpRescheduleIpi	temporal	check	critical-section exit must flush durable fan-out and every published request must reach a safe dispatch	30	120	exhaustive	no	no	no
+smp-reschedule-ipi/SmpRescheduleIpi	temporal	check	critical-section exit must flush every exact target custody bit and every published request must reach a safe dispatch	30	120	exhaustive	no	no	no
 scheduler-cpu-ownership/SchedulerCpuOwnership	safety	check	fail-closed invalid attempts and ordinary acquire release dispatch transitions all retain enabled stutter or progress	30	120	exhaustive	no	no	no
 bootstrap-activation-handoff/BootstrapActivationHandoff	safety	check	terminal and duplicate-activation stutter preserves deadlock checking while bounded FIFO ownership remains explicit	30	120	exhaustive	no	no	no
 synchronous-ipc-handoff/SynchronousIpcHandoff	safety	check	explicit terminal stutter preserves deadlock checking while bounded FIFO call-reply custody remains explicit	30	120	exhaustive	no	no	no
@@ -57,6 +57,7 @@ dvm-input-ring/DvmInputRing	temporal	intentional-terminal	ring epoch may revoke	
 dvm-input-selftest/DvmInputSelftest	temporal	intentional-terminal	selftest process terminates	120	900	exhaustive	no	no	no
 dvm-network-control/DvmNetworkControl	safety	intentional-terminal	network session may end	120	900	exhaustive	no	no	no
 dvm-network-ring/DvmNetworkRing	safety	intentional-terminal	ring epoch may revoke	120	900	exhaustive	no	no	no
+dvm-transport-lifecycle/DvmTransportLifecycle	temporal	check	revoked transport remains terminal while drain settles exact claims	30	120	exhaustive	no	no	no
 dvm-release-bundle/DvmReleaseBundle	safety	intentional-terminal	bundle admission decision is terminal	120	900	exhaustive	no	no	no
 early-system-admission/EarlySystemAdmission	safety	intentional-terminal	bootstrap admission reaches DVM storage readiness or fails closed	120	900	exhaustive	no	no	no
 endpoint-publication/EndpointPublication	safety	intentional-terminal	publisher process may exit	120	900	exhaustive	no	yes	no
@@ -77,6 +78,7 @@ ipc-priority-inheritance/IpcPriorityInheritance	safety	intentional-terminal	IPC 
 ipc-priority-queue/IpcPriorityQueue	safety	check	all-delivered terminal state stutters while priority selection remains explicit	30	120	exhaustive	no	no	no
 ipc-reply-recv-transaction/IpcReplyRecvTransaction	safety	check	explicit success and phase-aware error terminals stutter while reply consumption and receive wake custody remain explicit	30	120	exhaustive	no	no	no
 ipc-reply-deadline/IpcReplyDeadline	temporal	intentional-terminal	IPC wait outcome is terminal	120	900	exhaustive	no	no	no
+ipc-transfer-authority/IpcTransferAuthority	temporal	check	installed and released terminals stutter while exact ownership remains checked	120	900	exhaustive	no	no	no
 ivshmem-pairing/IvshmemPairing	temporal	intentional-terminal	peer pairing may disconnect	120	900	exhaustive	no	no	no
 kernel-resource-accounting/KernelResourceAccounting	temporal	intentional-terminal	deferred backing reclaim eventually returns exact owner quota	30	120	exhaustive	no	no	no
 memfd-seal-lifecycle/MemfdSealLifecycle	safety	intentional-terminal	sealed object may retain stable mappings	30	120	exhaustive	no	no	no
@@ -84,6 +86,7 @@ msi-vector-lifecycle/MsiVectorLifecycle	safety	intentional-terminal	failed vecto
 netd-deferred-reply/NetdDeferredReply	temporal	intentional-terminal	deferred request resolves or is rejected	30	120	exhaustive	no	no	no
 network-payload-session/NetworkPayloadSession	safety	intentional-terminal	payload decision is terminal	120	900	exhaustive	no	no	no
 page-table-lifecycle/PageTableLifecycle	safety	intentional-terminal	mapping lifecycle may complete	120	900	exhaustive	no	no	no
+page-table-map-transaction/PageTableMapTransaction	temporal	check	committed and failed terminals stutter after exact topology settlement	30	120	exhaustive	no	no	no
 persistent-mutation-admission/PersistentMutationAdmission	safety	intentional-terminal	mutation admission decision is terminal	30	120	exhaustive	no	no	no
 post-init-leases/PostInitLeases	safety	intentional-terminal	service lease may terminate	120	900	exhaustive	no	no	no
 post-init-bootstrap-barrier/PostInitBootstrapBarrier	safety	check	consumer success failure and fail-closed early admission stutter while exact endpoint ownership remains checked	30	120	exhaustive	no	no	no

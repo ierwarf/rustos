@@ -5,7 +5,8 @@
 //!   enqueue with a live reply capability, or successful reply consumption.
 //! - **Lifecycle:** Admit a deduplicated slot, retain it across fairness,
 //!   dispatch FIFO, or remove it during exact slot retirement.
-//! - **Concurrency:** The enclosing global scheduler guard serializes access.
+//! - **Concurrency:** lifecycle publication uses the catalog guard, while each
+//!   handoff queue and fairness streak belongs to the target logical CPU.
 //! - **Failure:** Impossible queue capacity panics instead of losing authority.
 //! - **Forbidden:** No allocation, overwrite, class fabrication, or stale-slot
 //!   transfer.
@@ -121,8 +122,10 @@ impl Scheduler {
         let prioritize_atomic_cohort = task_ids.len() > 1;
         if prioritize_atomic_cohort {
             assert!(
-                self.atomic_activation_pick_hints.is_empty()
-                    && self.atomic_activation_handoff_remaining == 0,
+                self.cpu_dispatch.iter().all(|policy| {
+                    policy.atomic_activation_pick_hints.is_empty()
+                        && policy.atomic_activation_handoff_remaining == 0
+                }),
                 "scheduler activation invariant: overlapping atomic cohorts"
             );
         }
@@ -139,7 +142,9 @@ impl Scheduler {
             // disjoint from ordinary thread-spawn custody, so an unrelated
             // startup burst cannot consume or disable these exact first turns.
             if prioritize_atomic_cohort {
-                let inserted = self
+                let target_cpu = self.slot_dispatch_cpu(slot);
+                let policy = &mut self.cpu_dispatch[target_cpu];
+                let inserted = policy
                     .atomic_activation_pick_hints
                     .enqueue(slot)
                     .expect("scheduler atomic activation queue overflow");
@@ -147,12 +152,13 @@ impl Scheduler {
                     inserted,
                     "scheduler activation invariant: duplicate cohort slot"
                 );
+                policy.atomic_activation_handoff_remaining = policy
+                    .atomic_activation_handoff_remaining
+                    .checked_add(1)
+                    .expect("scheduler atomic activation handoff count overflow");
             } else {
                 self.set_next_spawn_pick_hint(task_id);
             }
-        }
-        if prioritize_atomic_cohort {
-            self.atomic_activation_handoff_remaining = task_ids.len();
         }
     }
 
@@ -163,10 +169,12 @@ impl Scheduler {
         let Some(slot) = self.find_task_slot(task_id) else {
             return false;
         };
-        if !self.handoff_hint_eligible(slot) {
+        if !self.handoff_slot_ready(slot) {
             return false;
         }
-        self.sync_pick_hints
+        let target_cpu = self.slot_dispatch_cpu(slot);
+        self.cpu_dispatch[target_cpu]
+            .sync_pick_hints
             .enqueue(slot)
             .expect("scheduler synchronous IPC handoff queue overflow");
         true
@@ -179,17 +187,20 @@ impl Scheduler {
         let Some(context) = self.contexts[slot] else {
             return;
         };
-        if !context.ready || !self.context_is_schedulable(slot, context) {
+        if !context.ready || !self.handoff_slot_ready(slot) {
             return;
         }
-        let inserted = self
+        let target_cpu = self.slot_dispatch_cpu(slot);
+        let inserted = self.cpu_dispatch[target_cpu]
             .spawn_pick_hints
             .enqueue(slot)
             .expect("scheduler spawn handoff queue overflow");
         if !inserted {
             return;
         }
-        self.apply_ipc_donation(slot);
+        if target_cpu == Self::current_dispatch_cpu() {
+            self.apply_ipc_donation(slot);
+        }
     }
 
     /// Select the one-shot child-start transfer before an ordinary wakeup. A child
@@ -207,7 +218,7 @@ impl Scheduler {
     }
 
     pub(super) fn take_next_spawn_pick_hint_ready_slot(&mut self) -> Option<usize> {
-        while let Some(hint) = self.spawn_pick_hints.pop() {
+        while let Some(hint) = self.current_dispatch_policy_mut().spawn_pick_hints.pop() {
             if let Some(slot) = self.pick_hint_candidate_slot(Some(hint)) {
                 return Some(slot);
             }
@@ -220,13 +231,24 @@ impl Scheduler {
     /// cannot consume this custody or disable the bounded first-turn prefix.
     pub(super) fn take_next_atomic_activation_handoff_ready_slot(&mut self) -> Option<usize> {
         assert!(
-            self.atomic_activation_handoff_remaining <= MAX_ATOMIC_ACTIVATION_HANDOFFS,
+            self.current_dispatch_policy()
+                .atomic_activation_handoff_remaining
+                <= MAX_ATOMIC_ACTIVATION_HANDOFFS,
             "scheduler atomic activation handoff bound corrupted"
         );
-        while self.atomic_activation_handoff_remaining > 0 {
-            self.atomic_activation_handoff_remaining -= 1;
-            let Some(hint) = self.atomic_activation_pick_hints.pop() else {
-                self.atomic_activation_handoff_remaining = 0;
+        while self
+            .current_dispatch_policy()
+            .atomic_activation_handoff_remaining
+            > 0
+        {
+            let hint = {
+                let policy = self.current_dispatch_policy_mut();
+                policy.atomic_activation_handoff_remaining -= 1;
+                policy.atomic_activation_pick_hints.pop()
+            };
+            let Some(hint) = hint else {
+                self.current_dispatch_policy_mut()
+                    .atomic_activation_handoff_remaining = 0;
                 return None;
             };
             if let Some(slot) = self.pick_hint_candidate_slot(Some(hint)) {
@@ -237,10 +259,10 @@ impl Scheduler {
     }
 
     pub(super) fn take_next_synchronous_pick_hint_ready_slot(&mut self) -> Option<usize> {
-        if self.sync_handoff_streak >= MAX_CONSECUTIVE_SYNC_HANDOFFS {
+        if self.current_dispatch_policy().sync_handoff_streak >= MAX_CONSECUTIVE_SYNC_HANDOFFS {
             return None;
         }
-        while let Some(hint) = self.sync_pick_hints.pop() {
+        while let Some(hint) = self.current_dispatch_policy_mut().sync_pick_hints.pop() {
             if let Some(slot) = self.pick_hint_candidate_slot(Some(hint)) {
                 return Some(slot);
             }
@@ -249,12 +271,14 @@ impl Scheduler {
     }
 
     pub(super) fn record_synchronous_handoff(&mut self, synchronous_handoff: bool) {
-        self.sync_handoff_streak = if synchronous_handoff {
-            self.sync_handoff_streak
+        let next = if synchronous_handoff {
+            self.current_dispatch_policy()
+                .sync_handoff_streak
                 .saturating_add(1)
                 .min(MAX_CONSECUTIVE_SYNC_HANDOFFS)
         } else {
             0
         };
+        self.current_dispatch_policy_mut().sync_handoff_streak = next;
     }
 }

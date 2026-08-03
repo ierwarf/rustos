@@ -56,14 +56,17 @@ impl Scheduler {
     }
 
     fn migration_required(&self, slot: usize, requested_mask: u64) -> bool {
-        super::super::cpu_local::task_running_cpu(slot)
+        #[cfg(not(test))]
+        let owner_cpu = runqueue::owner(slot).cpu;
+        #[cfg(test)]
+        let owner_cpu = super::super::cpu_local::task_running_cpu(slot)
             // Boxed scheduler tests have no global CPU-slot publication. In
             // production, a scheduler guard's scratch `current_task` is the
             // exact calling CPU slot loaded by `cpu_local::scheduler_mut`.
             .or_else(|| {
                 (slot == self.current_task).then(nucleus_core::util::lockdep::current_cpu_index)
-            })
-            .is_some_and(|cpu| requested_mask & (1_u64 << cpu) == 0)
+            });
+        owner_cpu.is_some_and(|cpu| requested_mask & (1_u64 << cpu) == 0)
     }
 
     fn resolve_current_process_task(
@@ -114,6 +117,10 @@ impl Scheduler {
         let reschedule_required = self.migration_required(slot, requested);
         self.task_affinity_masks[slot] = requested;
         self.affinity_migration_pending[slot] = reschedule_required;
+        #[cfg(not(test))]
+        if reschedule_required {
+            self.rehome_runqueue_slot(slot);
+        }
         Ok(AffinityCommit {
             previous_mask,
             reschedule_required,
@@ -166,6 +173,10 @@ impl Scheduler {
             self.process_affinity_masks[slot] = requested;
             self.task_affinity_masks[slot] = requested;
             self.affinity_migration_pending[slot] = migrate;
+            #[cfg(not(test))]
+            if migrate {
+                self.rehome_runqueue_slot(slot);
+            }
             reschedule_required |= migrate;
         }
         assert_ne!(
@@ -192,6 +203,10 @@ impl Scheduler {
         let reschedule_required = self.migration_required(slot, requested);
         self.task_affinity_masks[slot] = requested;
         self.affinity_migration_pending[slot] = reschedule_required;
+        #[cfg(not(test))]
+        if reschedule_required {
+            self.rehome_runqueue_slot(slot);
+        }
         Ok(AffinityCommit {
             previous_mask,
             reschedule_required,

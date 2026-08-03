@@ -13,6 +13,7 @@ mod tests {
         RUSTOS_DVM_BLOCK_FLUSH_FAULT_MARKER, RUSTOS_DVM_BLOCK_MARKER,
         RUSTOS_GPU_SCENE_COMPILER_MARKER, RUSTOS_INIT_IDENTITY_MARKER,
         RUSTOS_POST_INIT_PROVENANCE_MARKER, VIRTUAL_GPU_EVIDENCE, WayclickProfileObservation,
+        WAYCLICK_FIRST_FRAME_MARKER,
         acquire_kvm_launch_lock, append_dvm_display_pixels, append_dvm_input_devices,
         append_dvm_network_device, append_dvm_virtual_gpu, append_physical_gpu,
         claim_physical_gpu_launch_in, causal_tail, dvm_display_failure, dvm_display_provider_ready,
@@ -55,10 +56,13 @@ mod tests {
                 "smp-cpu-idle-enter",
                 "smp-cpu-first-clockevent",
                 "smp-cpu-first-user-dispatch",
-                "smp-cpu-first-reschedule-ipi",
             ] {
                 log.push_str(format!("name={name} arg0=0x{cpu:x} arg1=0x1\n").as_str());
             }
+            log.push_str(
+                format!("name=smp-resched-route arg0=0x{cpu:x} arg1=0x100000000000001\n")
+                    .as_str(),
+            );
         }
         assert!(smp_runtime_missing_markers(&log, 2).is_empty());
         let incomplete = log.replace(
@@ -271,6 +275,9 @@ seq=119 msg=\"milestone name=product-init-identity-ready\"";
     fn dvm_display_mode_requires_the_observed_display_contract() {
         let options = parse_smoke_options(vec!["--gui-dvm-surfaces".into()].into_iter()).unwrap();
         assert!(options.gui_dvm_surfaces);
+        assert!(options.dvm_block_shmem);
+        assert!(options.expected_markers.contains(&RUSTOS_DVM_BLOCK_E2E_MARKER.to_owned()));
+        assert!(options.expected_markers.contains(&WAYCLICK_FIRST_FRAME_MARKER.to_owned()));
         assert!(
             options
                 .expected_dvm_markers

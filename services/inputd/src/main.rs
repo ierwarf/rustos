@@ -31,30 +31,30 @@ mod service_loop;
 
 use keyboard_core::{KeyAction, KeyboardDriver, KeyboardEvent};
 use rustos_user_abi::syscall::{
-    COMMERCIAL_MAX_INPUTD_OP_DROP_POLICY, COMMERCIAL_MAX_INPUTD_OP_EVDEV_TRANSLATE,
-    COMMERCIAL_MAX_INPUTD_OP_INPUT_READER, COMMERCIAL_MAX_INPUTD_OP_INPUT_STATS,
-    COMMERCIAL_MAX_INPUTD_OP_LAYOUT_POLICY, COMMERCIAL_MAX_INPUTD_OP_POINTER_SURFACE_POLICY,
-    COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_INPUTD,
-    CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
-    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, INPUTD_ACCESS_EVDEV,
-    INPUTD_ACCESS_NATIVE, INPUTD_INGEST_MAX_EVENTS, INPUTD_INGRESS_FLAG_DVM_SOURCE,
-    INPUTD_INGRESS_FLAG_RESET_STATE, INPUTD_INGRESS_KIND_DVM_LINUX_KEY,
-    INPUTD_INGRESS_KIND_POINTER_PACKET, INPUTD_INGRESS_KIND_POINTER_POSITION,
-    INPUTD_IPC_ABI_VERSION, INPUTD_IPC_OP_AUTHORIZE_READ, INPUTD_IPC_OP_PING, INPUTD_IPC_OP_READ,
-    INPUTD_IPC_OP_SET_POINTER_SURFACE, INPUTD_IPC_OP_STATS, INPUTD_READ_FLAG_NONBLOCK,
-    INPUTD_READ_PAYLOAD_CAPACITY, IPC_MAX_INLINE_BYTES, IPC_SERVICE_INPUTD, IPC_SERVICE_NETD,
-    IPC_SERVICE_UISERVER, InputDvmRecordWire, InputIngestBrokerArgs, InputIngressWire,
+    identity_is_exact_sender, CommercialMaxCapabilityLeaseWire,
+    CommercialMaxProtocolDescriptorWire, CommercialMaxProtocolRequest,
+    CommercialMaxProtocolResponse, InputDvmRecordWire, InputIngestBrokerArgs, InputIngressWire,
     InputPointerPacketWire, InputPointerPositionWire, InputStatsBrokerArgs, InputStatsWire,
     InputdIpcRequest, InputdIpcResponse, InputdPointerSurfaceRequest, InputdReadResponse,
-    NETD_DVM_SESSION_GRANT, NETD_DVM_SESSION_REVOKE, NETD_IPC_ABI_VERSION, NETD_IPC_OP_DVM_SESSION,
-    NETD_IPC_REQUEST_HEADER_SIZE, NetdIpcRequest, NetdIpcResponse, SYS_RUSTOS_DEBUG_PRINT,
-    SYS_RUSTOS_INPUT_INGEST_BROKER, SYS_RUSTOS_INPUT_STATS_BROKER, SYS_RUSTOS_INPUT_WAIT_BROKER,
-    SYS_RUSTOS_IPC_ENDPOINT_CREATE, identity_is_exact_sender,
+    NetdIpcRequest, NetdIpcResponse, COMMERCIAL_MAX_INPUTD_OP_DROP_POLICY,
+    COMMERCIAL_MAX_INPUTD_OP_EVDEV_TRANSLATE, COMMERCIAL_MAX_INPUTD_OP_INPUT_READER,
+    COMMERCIAL_MAX_INPUTD_OP_INPUT_STATS, COMMERCIAL_MAX_INPUTD_OP_LAYOUT_POLICY,
+    COMMERCIAL_MAX_INPUTD_OP_POINTER_SURFACE_POLICY, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
+    COMMERCIAL_MAX_PROTOCOL_INPUTD, INPUTD_ACCESS_EVDEV, INPUTD_ACCESS_NATIVE,
+    INPUTD_INGEST_MAX_EVENTS, INPUTD_INGRESS_FLAG_DVM_SOURCE, INPUTD_INGRESS_FLAG_RESET_STATE,
+    INPUTD_INGRESS_KIND_DVM_LINUX_KEY, INPUTD_INGRESS_KIND_POINTER_PACKET,
+    INPUTD_INGRESS_KIND_POINTER_POSITION, INPUTD_IPC_ABI_VERSION, INPUTD_IPC_OP_AUTHORIZE_READ,
+    INPUTD_IPC_OP_PING, INPUTD_IPC_OP_READ, INPUTD_IPC_OP_SET_POINTER_SURFACE, INPUTD_IPC_OP_STATS,
+    INPUTD_READ_FLAG_NONBLOCK, INPUTD_READ_PAYLOAD_CAPACITY, IPC_MAX_INLINE_BYTES,
+    IPC_SERVICE_INPUTD, IPC_SERVICE_NETD, IPC_SERVICE_UISERVER, NETD_DVM_SESSION_GRANT,
+    NETD_DVM_SESSION_REVOKE, NETD_IPC_ABI_VERSION, NETD_IPC_OP_DVM_SESSION,
+    NETD_IPC_REQUEST_HEADER_SIZE, SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_INPUT_INGEST_BROKER,
+    SYS_RUSTOS_INPUT_STATS_BROKER, SYS_RUSTOS_INPUT_WAIT_BROKER, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
 };
 #[cfg(not(test))]
 use rustos_user_abi::syscall::{
-    SYS_RUSTOS_WAITSET_SIGNAL_BROKER, WAITSET_ABI_VERSION, WAITSET_GLOBAL_OBJECT_ID,
-    WAITSET_PROVIDER_INPUTD, WaitSetSignalBrokerArgs,
+    WaitSetSignalBrokerArgs, SYS_RUSTOS_WAITSET_SIGNAL_BROKER, WAITSET_ABI_VERSION,
+    WAITSET_GLOBAL_OBJECT_ID, WAITSET_PROVIDER_INPUTD,
 };
 
 // The DVM ingestion worker waits on the MSI-X-published ring and transfers
@@ -512,17 +512,17 @@ fn keyboard_action_to_inputd(action: KeyAction) -> u16 {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{
-        DvmIngressLogState, INPUTD_INGEST_MAX_EVENTS, InputQueue, SharedInputQueueState,
         apply_dvm_ingress_wire, ingest_batch_needs_immediate_retry, lock_input_queue,
-        lock_input_queue_for_ingestion, validate_commercial_request,
+        lock_input_queue_for_ingestion, validate_commercial_request, DvmIngressLogState,
+        InputQueue, SharedInputQueueState, INPUTD_INGEST_MAX_EVENTS,
     };
     use rustos_user_abi::syscall::{
-        COMMERCIAL_MAX_INPUTD_OP_INPUT_READER, COMMERCIAL_MAX_PROTOCOL_INPUTD,
-        CommercialMaxProtocolRequest, INPUTD_ACCESS_NATIVE, INPUTD_INGRESS_FLAG_DVM_SOURCE,
-        INPUTD_INGRESS_FLAG_RESET_STATE, INPUTD_INGRESS_KIND_DVM_LINUX_KEY, InputIngressWire,
-        InputPointerPacketWire, InputPointerPositionWire, InputdIpcRequest,
+        CommercialMaxProtocolRequest, InputIngressWire, InputPointerPacketWire,
+        InputPointerPositionWire, InputdIpcRequest, COMMERCIAL_MAX_INPUTD_OP_INPUT_READER,
+        COMMERCIAL_MAX_PROTOCOL_INPUTD, INPUTD_ACCESS_NATIVE, INPUTD_INGRESS_FLAG_DVM_SOURCE,
+        INPUTD_INGRESS_FLAG_RESET_STATE, INPUTD_INGRESS_KIND_DVM_LINUX_KEY,
     };
-    use std::sync::{Arc, mpsc};
+    use std::sync::{mpsc, Arc};
     use std::time::{Duration, Instant};
 
     fn pointer_motion(dx: i32, dy: i32) -> input_evdev::InputEvent {
@@ -1148,7 +1148,7 @@ fn notify_netd_dvm_session(epoch: u32, action: u64) -> Result<(), i32> {
             NETD_IPC_REQUEST_HEADER_SIZE,
             (&mut response as *mut NetdIpcResponse).cast(),
             size_of::<NetdIpcResponse>(),
-            rustos_user_abi::performance::IPC_READINESS_QUERY_HARD_LIMIT_MS,
+            dvm_session_sync::CALL_DEADLINE_MS,
         )
     };
     if received < 0 {

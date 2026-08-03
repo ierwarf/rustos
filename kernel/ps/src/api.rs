@@ -52,9 +52,9 @@ pub use crate::user::handles::{
     FileHandleSeekError, FileHandleSeekWhence, HandleEntry, HandleTable, InetSocketHandle,
     IpcTransferRegistryError, KernelHandle, MAX_DYNAMIC_FD, RemoteVfsHandle, RemoteVfsHandleKind,
     TransferredHandleEntry, VfsDirectoryEntry, VfsDirectoryEntryKind, VfsDirectoryHandle,
-    drop_ipc_transfer_descriptors, drop_ipc_transfer_tickets, ipc_transfer_tickets,
+    bind_ipc_transfer_tickets, claim_ipc_transfer_entries_by_tickets, commit_ipc_transfer_enqueue,
+    drop_ipc_transfer_descriptors, drop_ipc_transfer_tickets, drop_ipc_transfers_for_service_epoch,
     register_ipc_transfer_entries, take_deferred_ipc_transfer_drops, take_ipc_transfer_entries,
-    take_ipc_transfer_entries_by_tickets,
 };
 
 pub fn service_deferred_shared_region_reclaims(max_pages: usize) -> usize {
@@ -69,7 +69,9 @@ pub use crate::user::memfd::{MemfdError, MemfdHandle, MemfdMappingHold};
 pub use crate::user::process_state::{
     ProcessSecurityContext, SharedFutexBackingKey, UserProcessState,
 };
-pub use crate::user::socket::{PassedHandle, SocketCredentials, SocketError, SocketHandle};
+pub use crate::user::socket::{
+    PassedHandle, SocketCredentials, SocketError, SocketHandle, SocketStreamGuard,
+};
 pub use x86_64::VirtAddr;
 
 pub fn current_console_session() -> Option<kernel_object::api::session::ConsoleSessionHandle> {

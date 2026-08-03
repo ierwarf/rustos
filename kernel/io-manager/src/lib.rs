@@ -57,4 +57,5 @@ pub mod io;
 #[path = "storage/mod.rs"]
 pub mod storage;
 pub(crate) mod sync;
+pub(crate) mod transport_lifecycle;
 pub(crate) mod transport_types;

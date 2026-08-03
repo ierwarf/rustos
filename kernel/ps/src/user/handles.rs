@@ -8,7 +8,10 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use kernel_ipc_runtime::api::{KernelTransferTicket, KernelTransferredHandle};
+use kernel_ipc_runtime::api::{
+    ChannelIdentity, KernelTransferTicket, KernelTransferredHandle, ProcessIdentity,
+    ServiceIdentity, TransferContext,
+};
 use kernel_object::api::handle::{
     DeviceHandleRights, FileHandleRights, HandleOwner, HandleRights, HandleToken,
     SharedRegionRights, SocketHandleRights,
@@ -193,13 +196,26 @@ impl ConsoleHandle {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IpcTransferRegistryError {
     Exhausted,
+    BindingMismatch,
     InvalidDescriptor,
+    InvalidState,
     StaleDescriptor,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IpcTransferState {
+    Vacant,
+    Registered,
+    Exported,
+    Enqueued,
 }
 
 struct IpcTransferSlot {
     transfer_id: u64,
     nonce: u64,
+    batch_generation: u64,
+    context: Option<TransferContext>,
+    state: IpcTransferState,
     entry: Option<TransferredHandleEntry>,
 }
 
@@ -208,6 +224,9 @@ impl IpcTransferSlot {
         Self {
             transfer_id: 0,
             nonce: 0,
+            batch_generation: 0,
+            context: None,
+            state: IpcTransferState::Vacant,
             entry: None,
         }
     }
@@ -247,11 +266,16 @@ impl IpcTransferRegistry {
         if transfer_id == 0 || nonce == 0 || self.contains(transfer_id) {
             return false;
         }
-        let Some(slot) = self.slots.iter_mut().find(|slot| slot.entry.is_none()) else {
+        let Some(slot) = self
+            .slots
+            .iter_mut()
+            .find(|slot| slot.state == IpcTransferState::Vacant)
+        else {
             return false;
         };
         slot.transfer_id = transfer_id;
         slot.nonce = nonce;
+        slot.state = IpcTransferState::Registered;
         slot.entry = Some(entry);
         self.len += 1;
         true
@@ -263,18 +287,9 @@ impl IpcTransferRegistry {
             .iter_mut()
             .find(|slot| slot.transfer_id == transfer_id)?;
         let entry = slot.entry.take()?;
-        slot.transfer_id = 0;
-        slot.nonce = 0;
+        *slot = IpcTransferSlot::empty();
         self.len -= 1;
         Some(entry)
-    }
-
-    fn ticket(&self, transfer_id: u64) -> Option<KernelTransferTicket> {
-        let slot = self
-            .slots
-            .iter()
-            .find(|slot| slot.transfer_id == transfer_id && slot.entry.is_some())?;
-        KernelTransferTicket::new(slot.transfer_id, slot.nonce)
     }
 
     fn ticket_matches(&self, ticket: KernelTransferTicket) -> bool {
@@ -282,6 +297,7 @@ impl IpcTransferRegistry {
             slot.entry.is_some()
                 && slot.transfer_id == ticket.transfer_id()
                 && slot.nonce == ticket.nonce()
+                && slot.batch_generation == ticket.batch_generation()
         })
     }
 }
@@ -343,6 +359,7 @@ static IPC_DEFERRED_TRANSFER_DROPS: TrackedSpinLock<
     TrackedSpinLock::new(DeferredTransferDropQueue::new());
 
 static NEXT_IPC_TRANSFER_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_IPC_TRANSFER_BATCH_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 pub fn register_ipc_transfer_entries(
     entries: Vec<TransferredHandleEntry>,
@@ -402,11 +419,29 @@ pub fn register_ipc_transfer_entries(
 
 /// Convert kernel-only typed descriptors into opaque integer tickets for one
 /// service byte protocol. No enum layout or padding crosses the boundary.
-pub fn ipc_transfer_tickets(
+pub fn bind_ipc_transfer_tickets(
     descriptors: &[KernelTransferredHandle],
+    context: TransferContext,
 ) -> Result<Vec<KernelTransferTicket>, IpcTransferRegistryError> {
+    if descriptors.is_empty()
+        || context.source.pid == 0
+        || context.source.generation == 0
+        || context.service.service_id == 0
+        || context.service.epoch == 0
+        || context.channel.channel_id == 0
+        || context.channel.generation == 0
+        || context.channel.receiver_side == 0
+        || context.stream_start >= context.stream_end
+    {
+        return Err(IpcTransferRegistryError::BindingMismatch);
+    }
     let mut tickets = Vec::with_capacity(descriptors.len());
-    let objects = IPC_TRANSFER_OBJECTS.lock();
+    let batch_generation = NEXT_IPC_TRANSFER_BATCH_GENERATION
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            (current != 0).then(|| current.checked_add(1)).flatten()
+        })
+        .map_err(|_| IpcTransferRegistryError::Exhausted)?;
+    let mut objects = IPC_TRANSFER_OBJECTS.lock();
     for (index, descriptor) in descriptors.iter().enumerate() {
         if descriptors[..index]
             .iter()
@@ -414,45 +449,120 @@ pub fn ipc_transfer_tickets(
         {
             return Err(IpcTransferRegistryError::InvalidDescriptor);
         }
-        let Some(entry) = objects.get(descriptor.transfer_id()) else {
+        let Some(slot) = objects
+            .slots
+            .iter()
+            .find(|slot| slot.transfer_id == descriptor.transfer_id())
+        else {
+            return Err(IpcTransferRegistryError::StaleDescriptor);
+        };
+        let Some(entry) = slot.entry.as_ref() else {
             return Err(IpcTransferRegistryError::StaleDescriptor);
         };
         if entry.ipc_descriptor(descriptor.transfer_id()) != Some(*descriptor) {
             return Err(IpcTransferRegistryError::InvalidDescriptor);
         }
+        if slot.state != IpcTransferState::Registered {
+            return Err(IpcTransferRegistryError::InvalidState);
+        }
+    }
+    for descriptor in descriptors {
+        let slot = objects
+            .slots
+            .iter_mut()
+            .find(|slot| slot.transfer_id == descriptor.transfer_id())
+            .expect("validated transfer registry entry disappeared before binding");
+        slot.batch_generation = batch_generation;
+        slot.context = Some(context);
+        slot.state = IpcTransferState::Exported;
         tickets.push(
-            objects
-                .ticket(descriptor.transfer_id())
-                .expect("validated transfer registry entry lost its ticket"),
+            KernelTransferTicket::new(slot.transfer_id, slot.nonce, batch_generation)
+                .expect("validated transfer batch produced an invalid ticket"),
         );
     }
     Ok(tickets)
 }
 
-pub fn take_ipc_transfer_entries_by_tickets(
+pub fn commit_ipc_transfer_enqueue(
     tickets: &[KernelTransferTicket],
+) -> Result<(), IpcTransferRegistryError> {
+    let mut objects = IPC_TRANSFER_OBJECTS.lock();
+    validate_ticket_batch(&objects, tickets, IpcTransferState::Exported)?;
+    for ticket in tickets {
+        let slot = objects
+            .slots
+            .iter_mut()
+            .find(|slot| slot.transfer_id == ticket.transfer_id())
+            .expect("validated transfer ticket disappeared before enqueue commit");
+        slot.state = IpcTransferState::Enqueued;
+    }
+    Ok(())
+}
+
+pub fn claim_ipc_transfer_entries_by_tickets(
+    tickets: &[KernelTransferTicket],
+    receiver: ProcessIdentity,
+    service: ServiceIdentity,
+    channel: ChannelIdentity,
+    stream_pos: u64,
 ) -> Result<Vec<TransferredHandleEntry>, IpcTransferRegistryError> {
     let mut entries = Vec::with_capacity(tickets.len());
     let mut objects = IPC_TRANSFER_OBJECTS.lock();
-    for (index, ticket) in tickets.iter().enumerate() {
-        if tickets[..index]
-            .iter()
-            .any(|prior| prior.transfer_id() == ticket.transfer_id())
-        {
-            return Err(IpcTransferRegistryError::InvalidDescriptor);
-        }
-        if !objects.ticket_matches(*ticket) {
-            return Err(IpcTransferRegistryError::StaleDescriptor);
-        }
+    validate_ticket_batch(&objects, tickets, IpcTransferState::Enqueued)?;
+    let context = objects
+        .slots
+        .iter()
+        .find(|slot| slot.transfer_id == tickets[0].transfer_id())
+        .and_then(|slot| slot.context)
+        .ok_or(IpcTransferRegistryError::InvalidState)?;
+    if context.service != service
+        || context.channel != channel
+        || context.stream_start != stream_pos
+        || context.stream_end <= context.stream_start
+        || context
+            .intended_receiver
+            .is_some_and(|intended| intended != receiver)
+    {
+        return Err(IpcTransferRegistryError::BindingMismatch);
     }
     for ticket in tickets {
         entries.push(
             objects
                 .remove(ticket.transfer_id())
-                .expect("validated IPC transfer ticket disappeared while taking"),
+                .expect("validated transfer ticket disappeared while claiming"),
         );
     }
     Ok(entries)
+}
+
+fn validate_ticket_batch(
+    objects: &IpcTransferRegistry,
+    tickets: &[KernelTransferTicket],
+    expected_state: IpcTransferState,
+) -> Result<(), IpcTransferRegistryError> {
+    let Some(first) = tickets.first() else {
+        return Err(IpcTransferRegistryError::InvalidDescriptor);
+    };
+    for (index, ticket) in tickets.iter().enumerate() {
+        if ticket.batch_generation() != first.batch_generation()
+            || tickets[..index]
+                .iter()
+                .any(|prior| prior.transfer_id() == ticket.transfer_id())
+        {
+            return Err(IpcTransferRegistryError::InvalidDescriptor);
+        }
+        let Some(slot) = objects.slots.iter().find(|slot| {
+            slot.transfer_id == ticket.transfer_id()
+                && slot.nonce == ticket.nonce()
+                && slot.batch_generation == ticket.batch_generation()
+        }) else {
+            return Err(IpcTransferRegistryError::StaleDescriptor);
+        };
+        if slot.state != expected_state || slot.context.is_none() || slot.entry.is_none() {
+            return Err(IpcTransferRegistryError::InvalidState);
+        }
+    }
+    Ok(())
 }
 
 pub fn drop_ipc_transfer_tickets(tickets: &[KernelTransferTicket]) {
@@ -466,6 +576,25 @@ pub fn drop_ipc_transfer_tickets(tickets: &[KernelTransferTicket]) {
             && let Some(entry) = objects.remove(ticket.transfer_id())
         {
             deferred.push(entry);
+        }
+    }
+}
+
+pub fn drop_ipc_transfers_for_service_epoch(service_id: u64, epoch: u64) {
+    if service_id == 0 || epoch == 0 {
+        return;
+    }
+    let mut objects = IPC_TRANSFER_OBJECTS.lock();
+    let mut deferred = IPC_DEFERRED_TRANSFER_DROPS.lock();
+    for index in 0..objects.slots.len() {
+        let matches = objects.slots[index].context.is_some_and(|context| {
+            context.service.service_id == service_id && context.service.epoch == epoch
+        });
+        if matches {
+            let transfer_id = objects.slots[index].transfer_id;
+            if let Some(entry) = objects.remove(transfer_id) {
+                deferred.push(entry);
+            }
         }
     }
 }
@@ -882,22 +1011,117 @@ mod transfer_registry_tests {
         let transferred = TransferredHandleEntry::from_entry(entry).expect("transferable input");
         let descriptors =
             register_ipc_transfer_entries(alloc::vec![transferred]).expect("register transfer");
-        let tickets = ipc_transfer_tickets(&descriptors).expect("mint transfer ticket");
+        let source = ProcessIdentity {
+            pid: 7,
+            generation: 3,
+        };
+        let receiver = ProcessIdentity {
+            pid: 11,
+            generation: 5,
+        };
+        let service = ServiceIdentity {
+            service_id: 4,
+            epoch: 9,
+        };
+        let channel = ChannelIdentity {
+            channel_id: 13,
+            generation: 13,
+            receiver_side: 2,
+        };
+        let context = TransferContext {
+            source,
+            service,
+            channel,
+            stream_start: 0,
+            stream_end: 1,
+            intended_receiver: Some(receiver),
+        };
+        let tickets =
+            bind_ipc_transfer_tickets(&descriptors, context).expect("mint transfer ticket");
         assert_eq!(tickets.len(), 1);
+        commit_ipc_transfer_enqueue(&tickets).expect("publish queue ownership");
+
+        for rejected in [
+            claim_ipc_transfer_entries_by_tickets(
+                &tickets,
+                ProcessIdentity {
+                    pid: receiver.pid,
+                    generation: receiver.generation + 1,
+                },
+                service,
+                channel,
+                context.stream_start,
+            ),
+            claim_ipc_transfer_entries_by_tickets(
+                &tickets,
+                receiver,
+                ServiceIdentity {
+                    service_id: service.service_id,
+                    epoch: service.epoch + 1,
+                },
+                channel,
+                context.stream_start,
+            ),
+            claim_ipc_transfer_entries_by_tickets(
+                &tickets,
+                receiver,
+                service,
+                ChannelIdentity {
+                    receiver_side: channel.receiver_side + 1,
+                    ..channel
+                },
+                context.stream_start,
+            ),
+            claim_ipc_transfer_entries_by_tickets(
+                &tickets,
+                receiver,
+                service,
+                channel,
+                context.stream_start + 1,
+            ),
+        ] {
+            assert!(matches!(
+                rejected,
+                Err(IpcTransferRegistryError::BindingMismatch)
+            ));
+        }
 
         let forged_nonce = tickets[0].nonce().wrapping_add(1).max(1);
-        let forged = KernelTransferTicket::new(tickets[0].transfer_id(), forged_nonce)
-            .expect("nonzero forged ticket shape");
+        let forged = KernelTransferTicket::new(
+            tickets[0].transfer_id(),
+            forged_nonce,
+            tickets[0].batch_generation(),
+        )
+        .expect("nonzero forged ticket shape");
         assert!(matches!(
-            take_ipc_transfer_entries_by_tickets(&[forged]),
+            claim_ipc_transfer_entries_by_tickets(
+                &[forged],
+                receiver,
+                service,
+                channel,
+                context.stream_start
+            ),
             Err(IpcTransferRegistryError::StaleDescriptor)
         ));
 
-        let entries = take_ipc_transfer_entries_by_tickets(&tickets).expect("take exact ticket");
+        let entries = claim_ipc_transfer_entries_by_tickets(
+            &tickets,
+            receiver,
+            service,
+            channel,
+            context.stream_start,
+        )
+        .expect("take exact ticket");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].entry().handle().device_handle(), Some(device));
         assert!(matches!(
-            take_ipc_transfer_entries_by_tickets(&tickets),
+            claim_ipc_transfer_entries_by_tickets(
+                &tickets,
+                receiver,
+                service,
+                channel,
+                context.stream_start
+            ),
             Err(IpcTransferRegistryError::StaleDescriptor)
         ));
     }

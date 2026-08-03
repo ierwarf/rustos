@@ -43,6 +43,8 @@ enum XtaskCommand {
     KvmRun {
         #[arg(long = "build")]
         build_image: bool,
+        #[arg(long = "rustos-vcpus", default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=8))]
+        rustos_vcpus: u8,
     },
     Selftest,
     #[command(name = "fuzz-host")]
@@ -140,7 +142,10 @@ pub(crate) fn run() -> Result<()> {
             unreachable!("formal-contracts returned before loading config")
         }
         Some(XtaskCommand::KvmSmoke { args }) => kvm::kvm_smoke_command(&config, args.into_iter()),
-        Some(XtaskCommand::KvmRun { build_image }) => kvm::kvm_run_command(&config, build_image),
+        Some(XtaskCommand::KvmRun {
+            build_image,
+            rustos_vcpus,
+        }) => kvm::kvm_run_command(&config, build_image, rustos_vcpus),
         Some(XtaskCommand::Selftest) => testinfra::selftest(&config),
         Some(XtaskCommand::FuzzHost {
             target,

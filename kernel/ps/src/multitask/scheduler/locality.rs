@@ -49,7 +49,8 @@ impl Scheduler {
     pub(super) fn pick_min_vruntime(&self, current: usize) -> Option<usize> {
         let mut best_by_class = [None::<(usize, u64)>; SchedClass::COUNT];
         let mut local_by_class = [None::<(usize, u64)>; SchedClass::COUNT];
-        for slot in 0..MAX_TASK {
+        let current_cpu = nucleus_core::util::lockdep::current_cpu_index();
+        for slot in runqueue::local_runnable_slots(current_cpu) {
             if !self.is_fair_candidate_slot(slot) {
                 continue;
             }
@@ -92,7 +93,8 @@ impl Scheduler {
     pub(super) fn pick_min_vruntime_excluding(&self, excluded: usize) -> Option<usize> {
         let mut best_by_class = [None::<(usize, u64, usize)>; SchedClass::COUNT];
         let mut local_by_class = [None::<(usize, u64, usize)>; SchedClass::COUNT];
-        for slot in 0..MAX_TASK {
+        let current_cpu = nucleus_core::util::lockdep::current_cpu_index();
+        for slot in runqueue::local_runnable_slots(current_cpu) {
             if slot == excluded || !self.is_fair_candidate_slot(slot) {
                 continue;
             }
@@ -149,7 +151,8 @@ impl Scheduler {
     ) -> Option<usize> {
         let mut best: Option<(usize, u64)> = None;
         let mut local: Option<(usize, u64)> = None;
-        for slot in 0..MAX_TASK {
+        let current_cpu = nucleus_core::util::lockdep::current_cpu_index();
+        for slot in runqueue::local_runnable_slots(current_cpu) {
             if !self.is_fair_candidate_slot(slot) {
                 continue;
             }
@@ -187,7 +190,8 @@ impl Scheduler {
         let class = self.slot_class(current)?;
         let mut best: Option<(usize, u64)> = None;
         let mut local: Option<(usize, u64)> = None;
-        for slot in 0..MAX_TASK {
+        let current_cpu = nucleus_core::util::lockdep::current_cpu_index();
+        for slot in runqueue::local_runnable_slots(current_cpu) {
             if slot == current || !self.is_fair_candidate_slot(slot) {
                 continue;
             }

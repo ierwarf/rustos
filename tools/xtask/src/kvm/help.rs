@@ -34,8 +34,9 @@ options:
                        and/or restart RustOS in a fresh QEMU process;
                        require a new authenticated epoch and full readiness
   --gui-dvm-surfaces   enable the V3 GUI-DVM control/pixel backing and private
-                       three-slot GPU atlas transport; no standalone legacy
-                       surface renderer or native-GPU path is accepted
+                       three-slot GPU atlas transport, plus the production DVM
+                       block provider needed by the visible desktop; no
+                       standalone legacy surface or native-GPU path is accepted
   --dvm-network-shmem  attach the bounded RustOS↔DVM Ethernet ring; RustOS keeps
                        no native virtio-net device in this topology
   --dvm-block-shmem    attach a private virtual NVMe namespace only to Linux

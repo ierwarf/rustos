@@ -90,7 +90,7 @@ fn dvm_session_epoch() -> &'static Mutex<u32> {
     EPOCH.get_or_init(|| Mutex::new(0))
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct RefReplayEntry {
     operation_hi: u64,
     operation_lo: u64,
@@ -98,6 +98,7 @@ struct RefReplayEntry {
     socket_token: u64,
     status: i32,
     value: u64,
+    release: Vec<u8>,
     complete: bool,
 }
 
@@ -107,7 +108,9 @@ fn ref_replay_log() -> &'static Mutex<VecDeque<RefReplayEntry>> {
 }
 const MAX_LISTEN_BACKLOG: usize = 128;
 const SOCKET_BUFFER_CAPACITY: usize = 1024 * 1024;
-const SOCKET_CONTROL_BUFFER_CAPACITY: usize = 64 * 1024;
+// Every queued ancillary byte must fit in one kernel-consumed release trailer
+// when read/close discards it. This is a lifecycle bound, not a tuning knob.
+const SOCKET_CONTROL_BUFFER_CAPACITY: usize = 16 * 1024;
 const INET_TCP_BUFFER_CAPACITY: usize = 16 * 1024;
 const INET_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const INET_IO_POLL_BUDGET: usize = 256;
@@ -815,6 +818,9 @@ fn begin_ref_result(
             return Err(libc::EBUSY);
         }
         response.value = entry.value;
+        response.payload[..entry.release.len()].copy_from_slice(entry.release.as_slice());
+        response.payload_len = entry.release.len() as u32;
+        response.reserved0 = entry.release.len() as u32;
         return Ok(RefReplayAction::Replay(entry.status));
     }
     if log.len() == REF_REPLAY_CAPACITY {
@@ -827,6 +833,7 @@ fn begin_ref_result(
         socket_token: request.socket_token,
         status: libc::EINPROGRESS,
         value: 0,
+        release: Vec::new(),
         complete: false,
     });
     Ok(RefReplayAction::Execute)
@@ -845,6 +852,11 @@ fn complete_ref_result(request: &NetdIpcRequest, response: &NetdIpcResponse, sta
     };
     entry.status = status;
     entry.value = response.value;
+    let release_len = response.reserved0 as usize;
+    entry.release.clear();
+    entry
+        .release
+        .extend_from_slice(&response.payload[..release_len]);
     entry.complete = true;
 }
 
@@ -865,7 +877,7 @@ fn acknowledge_ref_result(request: &NetdIpcRequest) -> i32 {
     }) else {
         return 0;
     };
-    let entry = log[index];
+    let entry = &log[index];
     if entry.op != request.arg0 as u16 || entry.socket_token != request.socket_token {
         return libc::EPROTO;
     }
@@ -1036,9 +1048,10 @@ enum UnixSocketState {
 
 #[derive(Debug)]
 struct ConnectedState {
-    incoming_bytes: VecDeque<u8>,
-    incoming_controls: VecDeque<Vec<u8>>,
+    incoming: VecDeque<UnixStreamSegment>,
+    incoming_bytes: usize,
     incoming_control_bytes: usize,
+    channel_id: u64,
     peer: u64,
     peer_closed: bool,
     peer_read_closed: bool,
@@ -1050,6 +1063,12 @@ struct ConnectedState {
     recv_drain_handoff_armed: bool,
     recv_closed: bool,
     send_closed: bool,
+}
+
+#[derive(Debug)]
+struct UnixStreamSegment {
+    bytes: VecDeque<u8>,
+    control: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -1337,7 +1356,7 @@ fn handle_socket(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i3
             },
         );
         drop(state);
-        return call_net_broker(request, response, token, 0, 0);
+        return call_net_broker(request, response, token, 0, 0, true);
     }
     if domain != linux_abi::AF_UNIX || base_type != linux_abi::SOCK_STREAM {
         return libc::EAFNOSUPPORT;
@@ -1364,7 +1383,7 @@ fn handle_socket(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i3
         },
     );
     drop(state);
-    call_net_broker(request, response, token, 0, 0)
+    call_net_broker(request, response, token, 0, 0, true)
 }
 
 fn handle_socketpair(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
@@ -1396,9 +1415,10 @@ fn handle_socketpair(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -
             local_path: None,
             peer_path: None,
             state: UnixSocketState::Connected(ConnectedState {
-                incoming_bytes: VecDeque::new(),
-                incoming_controls: VecDeque::new(),
+                incoming: VecDeque::new(),
+                incoming_bytes: 0,
                 incoming_control_bytes: 0,
+                channel_id: 0,
                 peer: right,
                 peer_closed: false,
                 peer_read_closed: false,
@@ -1420,9 +1440,10 @@ fn handle_socketpair(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -
             local_path: None,
             peer_path: None,
             state: UnixSocketState::Connected(ConnectedState {
-                incoming_bytes: VecDeque::new(),
-                incoming_controls: VecDeque::new(),
+                incoming: VecDeque::new(),
+                incoming_bytes: 0,
                 incoming_control_bytes: 0,
+                channel_id: 0,
                 peer: left,
                 peer_closed: false,
                 peer_read_closed: false,
@@ -1435,7 +1456,7 @@ fn handle_socketpair(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -
         },
     );
     drop(state);
-    call_net_broker(request, response, 0, left, right)
+    call_net_broker(request, response, 0, left, right, true)
 }
 
 fn handle_dup(request: &NetdIpcRequest) -> i32 {
@@ -1484,7 +1505,23 @@ fn handle_close(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32
             state.bindings.remove(&path);
         }
     }
-    if let UnixSocketState::Connected(connected) = socket.state {
+    if let UnixSocketState::Connected(mut connected) = socket.state {
+        let mut released = Vec::new();
+        while let Some(segment) = connected.incoming.pop_front() {
+            if segment.control.is_empty() {
+                continue;
+            }
+            let start = cmsg_align(released.len());
+            released.resize(start, 0);
+            released.extend_from_slice(segment.control.as_slice());
+        }
+        if released.len() > response.payload.len() {
+            debug_line("netd: ancillary release bound violated");
+            std::process::exit(134);
+        }
+        response.payload[..released.len()].copy_from_slice(released.as_slice());
+        response.payload_len = released.len() as u32;
+        response.reserved0 = released.len() as u32;
         if let Some(peer) = state.sockets.get_mut(&connected.peer) {
             if let UnixSocketState::Connected(peer_connected) = &mut peer.state {
                 peer_connected.peer_closed = true;
@@ -1563,19 +1600,37 @@ fn handle_connect(request: &NetdIpcRequest) -> i32 {
     if !state.token_available(accepted) {
         return libc::EAGAIN;
     }
-    let is_wayland = is_wayland_path(path.as_str());
-    let Some(client) = state.sockets.get_mut(&request.socket_token) else {
+    let Some(client) = state.sockets.get(&request.socket_token) else {
         return libc::EBADF;
     };
     if client.bound_path.is_some() || !matches!(client.state, UnixSocketState::Idle) {
         return libc::EINVAL;
     }
+    let Some(listener) = state.sockets.get(&listener_token) else {
+        return libc::ECONNREFUSED;
+    };
+    let UnixSocketState::Listening { backlog, pending } = &listener.state else {
+        return libc::ECONNREFUSED;
+    };
+    if pending.len() >= *backlog {
+        return libc::EAGAIN;
+    }
+    let channel_id = match bind_unix_connection(request, accepted) {
+        Ok(channel_id) => channel_id,
+        Err(errno) => return errno,
+    };
+    let is_wayland = is_wayland_path(path.as_str());
+    let client = state
+        .sockets
+        .get_mut(&request.socket_token)
+        .expect("validated client socket disappeared under net state lock");
     let client_local_path = client.local_path.clone();
     client.peer_path = Some(path.clone());
     client.state = UnixSocketState::Connected(ConnectedState {
-        incoming_bytes: VecDeque::new(),
-        incoming_controls: VecDeque::new(),
+        incoming: VecDeque::new(),
+        incoming_bytes: 0,
         incoming_control_bytes: 0,
+        channel_id,
         peer: accepted,
         peer_closed: false,
         peer_read_closed: false,
@@ -1589,12 +1644,9 @@ fn handle_connect(request: &NetdIpcRequest) -> i32 {
         let Some(listener) = state.sockets.get_mut(&listener_token) else {
             return libc::ECONNREFUSED;
         };
-        let UnixSocketState::Listening { backlog, pending } = &mut listener.state else {
+        let UnixSocketState::Listening { pending, .. } = &mut listener.state else {
             return libc::ECONNREFUSED;
         };
-        if pending.len() >= *backlog {
-            return libc::EAGAIN;
-        }
         pending.push_back(accepted);
         if is_wayland {
             debug_line("netd: wayland connect queued");
@@ -1611,9 +1663,10 @@ fn handle_connect(request: &NetdIpcRequest) -> i32 {
             local_path: listener_path,
             peer_path: client_local_path,
             state: UnixSocketState::Connected(ConnectedState {
-                incoming_bytes: VecDeque::new(),
-                incoming_controls: VecDeque::new(),
+                incoming: VecDeque::new(),
+                incoming_bytes: 0,
                 incoming_control_bytes: 0,
+                channel_id,
                 peer: request.socket_token,
                 peer_closed: false,
                 peer_read_closed: false,
@@ -1627,6 +1680,32 @@ fn handle_connect(request: &NetdIpcRequest) -> i32 {
     );
     drop(state);
     0
+}
+
+fn bind_unix_connection(request: &NetdIpcRequest, accepted: u64) -> Result<u64, i32> {
+    let args = RustosNetBrokerArgs {
+        process_id: request.pid,
+        op: rustos_user_abi::syscall::NET_BROKER_OP_UNIX_CONNECT_BIND,
+        reserved0: 0,
+        reserved1: 0,
+        arg0: request.arg0,
+        arg1: request.socket_token,
+        arg2: accepted,
+        arg3: 0,
+        arg4: 0,
+        arg5: 0,
+    };
+    let result = syscall1(
+        SYS_RUSTOS_NET_BROKER,
+        (&args as *const RustosNetBrokerArgs) as u64,
+    );
+    if result < 0 {
+        Err(last_errno())
+    } else if result == 0 {
+        Err(libc::EPROTO)
+    } else {
+        Ok(result as u64)
+    }
 }
 
 fn handle_inet_connect(request: &NetdIpcRequest) -> i32 {
@@ -1727,6 +1806,19 @@ fn handle_accept(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i3
             _ => return libc::EINVAL,
         }
     };
+    let channel_id = {
+        let state = net_state().lock().unwrap();
+        let Some(socket) = state.sockets.get(&accepted) else {
+            return libc::ECONNABORTED;
+        };
+        let UnixSocketState::Connected(connected) = &socket.state else {
+            return libc::ECONNABORTED;
+        };
+        connected.channel_id
+    };
+    if channel_id == 0 {
+        return libc::EPROTO;
+    }
     if request.arg1 != 0 && request.arg2 != 0 {
         let state = net_state().lock().unwrap();
         if let Some(socket) = state.sockets.get(&accepted) {
@@ -1737,7 +1829,23 @@ fn handle_accept(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i3
             }
         }
     }
-    call_net_broker(request, response, 0, accepted, 0)
+    let result = call_net_broker(request, response, 0, accepted, channel_id, false);
+    if result != 0 {
+        // The kernel did not publish the accepted open description. Restore
+        // the listener's ownership so a transient broker failure cannot lose
+        // a connection that is still live in netd.
+        let mut state = net_state().lock().unwrap();
+        if state.sockets.contains_key(&accepted) {
+            if let Some(listener) = state.sockets.get_mut(&request.socket_token) {
+                if let UnixSocketState::Listening { pending, .. } = &mut listener.state {
+                    if !pending.contains(&accepted) {
+                        pending.push_front(accepted);
+                    }
+                }
+            }
+        }
+    }
+    result
 }
 
 fn is_wayland_path(path: &str) -> bool {
@@ -1810,11 +1918,16 @@ fn handle_recv(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 
     } else {
         usize::try_from(request.arg2).unwrap_or(usize::MAX)
     };
-    let limit = requested.min(response.payload.len());
-    match recv_socket_bytes(request, &mut response.payload[..limit]) {
-        Ok(read) => {
-            response.value = read as u64;
-            response.payload_len = read as u32;
+    let limit = requested.min(response.payload.len() - SOCKET_CONTROL_BUFFER_CAPACITY);
+    match recv_socket_bytes(request, &mut response.payload[..limit], false) {
+        Ok(received) => {
+            let release_start = received.read;
+            let release_end = release_start + received.discarded.len();
+            response.payload[release_start..release_end]
+                .copy_from_slice(received.discarded.as_slice());
+            response.reserved0 = received.discarded.len() as u32;
+            response.value = received.read as u64;
+            response.payload_len = release_end as u32;
             0
         }
         Err(errno) => errno,
@@ -1822,7 +1935,8 @@ fn handle_recv(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 
 }
 
 fn handle_recvmsg(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
-    let control_len = match pending_recvmsg_control_len(request) {
+    let requested = request.payload_len as usize;
+    let control_len = match pending_recvmsg_control_len(request, requested) {
         Ok(control_len) => control_len,
         Err(errno) => return errno,
     };
@@ -1831,25 +1945,24 @@ fn handle_recvmsg(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i
         .len()
         .saturating_sub(NETD_RECVMSG_PAYLOAD_HEADER_SIZE)
         .saturating_sub(control_len);
-    let requested = request.payload_len as usize;
     let data_len = requested.min(available);
     let data_start = NETD_RECVMSG_PAYLOAD_HEADER_SIZE;
     let data_end = data_start + data_len;
-    match recv_socket_bytes(request, &mut response.payload[data_start..data_end]) {
-        Ok(read) => {
-            let control = match recvmsg_control_payload(request) {
+    match recv_socket_bytes(request, &mut response.payload[data_start..data_end], true) {
+        Ok(received) => {
+            let control = match append_recvmsg_credentials(request, received.control) {
                 Ok(control) => control,
                 Err(errno) => return errno,
             };
-            let control_start = data_start + read;
+            let control_start = data_start + received.read;
             let control_end = control_start + control.len();
             response.payload[control_start..control_end].copy_from_slice(&control);
-            response.payload[0..4].copy_from_slice(&(read as u32).to_ne_bytes());
+            response.payload[0..4].copy_from_slice(&(received.read as u32).to_ne_bytes());
             response.payload[4..8].copy_from_slice(&(control.len() as u32).to_ne_bytes());
             response.payload[8..12].copy_from_slice(&0_u32.to_ne_bytes());
             response.payload[12..16].copy_from_slice(&0_u32.to_ne_bytes());
             response.payload_len = control_end as u32;
-            response.value = read as u64;
+            response.value = received.read as u64;
             0
         }
         Err(errno) => errno,
@@ -1996,7 +2109,7 @@ fn unix_socket_revents(state: &NetState, token: u64, requested: u32) -> Result<u
                         _ => None,
                     });
             if requested & linux_abi::POLLIN as u32 != 0
-                && (!connected.incoming_bytes.is_empty()
+                && (connected.incoming_bytes != 0
                     || connected.peer_write_closed
                     || connected.peer_closed)
             {
@@ -2008,7 +2121,7 @@ fn unix_socket_revents(state: &NetState, token: u64, requested: u32) -> Result<u
                     && !connected.peer_closed
                     && peer_connected.is_some_and(|peer| {
                         !peer.recv_closed
-                            && peer.incoming_bytes.len() < SOCKET_BUFFER_CAPACITY
+                            && peer.incoming_bytes < SOCKET_BUFFER_CAPACITY
                             && peer.incoming_control_bytes < SOCKET_CONTROL_BUFFER_CAPACITY
                     });
                 if writable {
@@ -2228,7 +2341,7 @@ fn send_socket_message(
     if peer_connected.recv_closed {
         return Err(libc::EPIPE);
     }
-    let room = SOCKET_BUFFER_CAPACITY.saturating_sub(peer_connected.incoming_bytes.len());
+    let room = SOCKET_BUFFER_CAPACITY.saturating_sub(peer_connected.incoming_bytes);
     if room == 0 {
         return Err(libc::EAGAIN);
     }
@@ -2244,22 +2357,37 @@ fn send_socket_message(
         return Err(libc::EAGAIN);
     }
     let write_len = room.min(bytes.len());
-    peer_connected
-        .incoming_bytes
-        .extend(bytes[..write_len].iter().copied());
+    peer_connected.incoming_bytes += write_len;
     if !control.is_empty() {
         peer_connected.incoming_control_bytes = peer_connected
             .incoming_control_bytes
             .saturating_add(control.len());
-        peer_connected.incoming_controls.push_back(control.to_vec());
     }
+    peer_connected.incoming.push_back(UnixStreamSegment {
+        bytes: bytes[..write_len].iter().copied().collect(),
+        control: control.to_vec(),
+    });
     drop(state);
     Ok(write_len)
 }
 
-fn recv_socket_bytes(request: &NetdIpcRequest, dest: &mut [u8]) -> Result<usize, i32> {
+struct SocketReceive {
+    read: usize,
+    control: Vec<u8>,
+    discarded: Vec<u8>,
+}
+
+fn recv_socket_bytes(
+    request: &NetdIpcRequest,
+    dest: &mut [u8],
+    collect_control: bool,
+) -> Result<SocketReceive, i32> {
     if dest.is_empty() {
-        return Ok(0);
+        return Ok(SocketReceive {
+            read: 0,
+            control: Vec::new(),
+            discarded: Vec::new(),
+        });
     }
     let mut state = net_state().lock().unwrap();
     let socket = state
@@ -2269,22 +2397,62 @@ fn recv_socket_bytes(request: &NetdIpcRequest, dest: &mut [u8]) -> Result<usize,
     let UnixSocketState::Connected(connected) = &mut socket.state else {
         return Err(libc::ENOTCONN);
     };
-    if connected.incoming_bytes.is_empty() {
+    if connected.incoming_bytes == 0 {
         if connected.peer_closed || connected.peer_write_closed {
-            return Ok(0);
+            return Ok(SocketReceive {
+                read: 0,
+                control: Vec::new(),
+                discarded: Vec::new(),
+            });
         }
         return Err(libc::EAGAIN);
     }
-    let count = dest.len().min(connected.incoming_bytes.len());
-    for slot in &mut dest[..count] {
-        *slot = connected.incoming_bytes.pop_front().unwrap_or_default();
+    let mut read = 0usize;
+    let mut control = Vec::new();
+    let mut discarded = Vec::new();
+    while read < dest.len() {
+        let Some(segment) = connected.incoming.front_mut() else {
+            break;
+        };
+        if collect_control && !control.is_empty() && !segment.control.is_empty() {
+            break;
+        }
+        if !segment.control.is_empty() {
+            let ancillary = core::mem::take(&mut segment.control);
+            connected.incoming_control_bytes = connected
+                .incoming_control_bytes
+                .saturating_sub(ancillary.len());
+            if collect_control {
+                control = ancillary;
+            } else {
+                let start = cmsg_align(discarded.len());
+                discarded.resize(start, 0);
+                discarded.extend_from_slice(ancillary.as_slice());
+            }
+        }
+        let count = (dest.len() - read).min(segment.bytes.len());
+        for slot in &mut dest[read..read + count] {
+            *slot = segment.bytes.pop_front().unwrap_or_default();
+        }
+        read += count;
+        connected.incoming_bytes = connected.incoming_bytes.saturating_sub(count);
+        if segment.bytes.is_empty() {
+            connected.incoming.pop_front();
+        }
+        if count == 0 {
+            break;
+        }
     }
     connected.recv_drain_handoff_armed = true;
     drop(state);
-    Ok(count)
+    Ok(SocketReceive {
+        read,
+        control,
+        discarded,
+    })
 }
 
-fn pending_recvmsg_control_len(request: &NetdIpcRequest) -> Result<usize, i32> {
+fn pending_recvmsg_control_len(request: &NetdIpcRequest, requested: usize) -> Result<usize, i32> {
     let state = net_state().lock().unwrap();
     let socket = state
         .sockets
@@ -2293,11 +2461,18 @@ fn pending_recvmsg_control_len(request: &NetdIpcRequest) -> Result<usize, i32> {
     let UnixSocketState::Connected(connected) = &socket.state else {
         return Err(libc::ENOTCONN);
     };
-    let queued_len = connected
-        .incoming_controls
-        .front()
-        .map(Vec::len)
-        .unwrap_or(0);
+    let mut remaining = requested;
+    let mut queued_len = 0usize;
+    for segment in &connected.incoming {
+        if remaining == 0 {
+            break;
+        }
+        if !segment.control.is_empty() {
+            queued_len = segment.control.len();
+            break;
+        }
+        remaining = remaining.saturating_sub(segment.bytes.len());
+    }
     let credentials_len = if socket.options.passcred {
         size_of::<linux_abi::LinuxCmsghdr>() + size_of::<linux_abi::LinuxUCred>()
     } else {
@@ -2306,21 +2481,20 @@ fn pending_recvmsg_control_len(request: &NetdIpcRequest) -> Result<usize, i32> {
     Ok(cmsg_align(queued_len) + credentials_len)
 }
 
-fn recvmsg_control_payload(request: &NetdIpcRequest) -> Result<Vec<u8>, i32> {
-    let mut state = net_state().lock().unwrap();
+fn append_recvmsg_credentials(
+    request: &NetdIpcRequest,
+    mut control: Vec<u8>,
+) -> Result<Vec<u8>, i32> {
+    let state = net_state().lock().unwrap();
     let socket = state
         .sockets
-        .get_mut(&request.socket_token)
+        .get(&request.socket_token)
         .ok_or(libc::EBADF)?;
     let passcred = socket.options.passcred;
-    let UnixSocketState::Connected(connected) = &mut socket.state else {
+    let UnixSocketState::Connected(connected) = &socket.state else {
         return Err(libc::ENOTCONN);
     };
-    let mut control = connected.incoming_controls.pop_front().unwrap_or_default();
     let peer_credentials = connected.peer_credentials;
-    connected.incoming_control_bytes = connected
-        .incoming_control_bytes
-        .saturating_sub(control.len());
     drop(state);
     if !passcred {
         return Ok(control);
@@ -2416,6 +2590,7 @@ fn call_net_broker(
     socket_token: u64,
     token_a: u64,
     token_b: u64,
+    discard_tokens_on_failure: bool,
 ) -> i32 {
     let args = RustosNetBrokerArgs {
         process_id: request.pid,
@@ -2439,7 +2614,9 @@ fn call_net_broker(
     );
     if result < 0 {
         let errno = last_errno();
-        discard_unpublished_socket_tokens(socket_token, token_a, token_b);
+        if discard_tokens_on_failure {
+            discard_unpublished_socket_tokens(socket_token, token_a, token_b);
+        }
         return errno;
     }
     response.value = result as u64;
@@ -2655,9 +2832,10 @@ mod local_socket_poll_tests {
             local_path: None,
             peer_path: None,
             state: UnixSocketState::Connected(ConnectedState {
-                incoming_bytes: VecDeque::new(),
-                incoming_controls: VecDeque::new(),
+                incoming: VecDeque::new(),
+                incoming_bytes: 0,
                 incoming_control_bytes: 0,
+                channel_id: 1,
                 peer,
                 peer_closed: false,
                 peer_read_closed: false,
@@ -2689,7 +2867,11 @@ mod local_socket_poll_tests {
         else {
             unreachable!();
         };
-        connected.incoming_bytes.push_back(1);
+        connected.incoming_bytes = 1;
+        connected.incoming.push_back(UnixStreamSegment {
+            bytes: [1].into_iter().collect(),
+            control: Vec::new(),
+        });
         assert_eq!(
             unix_socket_revents(&state, 1, linux_abi::POLLIN as u32).unwrap(),
             linux_abi::POLLIN as u32
@@ -2752,6 +2934,79 @@ mod local_socket_poll_tests {
             validate_request(size_of::<NetdIpcRequest>(), &request),
             Err(libc::EINVAL)
         );
+    }
+
+    fn install_segmented_test_socket(token: u64, segments: Vec<UnixStreamSegment>) {
+        let mut socket = connected_socket(token.wrapping_add(1));
+        let UnixSocketState::Connected(connected) = &mut socket.state else {
+            unreachable!();
+        };
+        connected.incoming_bytes = segments.iter().map(|segment| segment.bytes.len()).sum();
+        connected.incoming_control_bytes =
+            segments.iter().map(|segment| segment.control.len()).sum();
+        connected.incoming = segments.into_iter().collect();
+        net_state().lock().unwrap().sockets.insert(token, socket);
+    }
+
+    #[test]
+    fn recvmsg_ancillary_stays_with_its_stream_segment() {
+        let token = u64::MAX - 910;
+        install_segmented_test_socket(
+            token,
+            vec![
+                UnixStreamSegment {
+                    bytes: [1, 2].into_iter().collect(),
+                    control: Vec::new(),
+                },
+                UnixStreamSegment {
+                    bytes: [3, 4].into_iter().collect(),
+                    control: vec![9, 8, 7, 6],
+                },
+            ],
+        );
+        let request = NetdIpcRequest {
+            socket_token: token,
+            ..NetdIpcRequest::default()
+        };
+        let mut first = [0_u8; 2];
+        let received = recv_socket_bytes(&request, &mut first, true).unwrap();
+        assert_eq!(first, [1, 2]);
+        assert!(received.control.is_empty());
+
+        let mut second = [0_u8; 2];
+        let received = recv_socket_bytes(&request, &mut second, true).unwrap();
+        assert_eq!(second, [3, 4]);
+        assert_eq!(received.control, vec![9, 8, 7, 6]);
+        net_state().lock().unwrap().sockets.remove(&token);
+    }
+
+    #[test]
+    fn ordinary_read_discards_ancillary_exactly_once() {
+        let token = u64::MAX - 911;
+        install_segmented_test_socket(
+            token,
+            vec![UnixStreamSegment {
+                bytes: [5, 6].into_iter().collect(),
+                control: vec![4, 3, 2, 1],
+            }],
+        );
+        let request = NetdIpcRequest {
+            socket_token: token,
+            ..NetdIpcRequest::default()
+        };
+        let mut bytes = [0_u8; 2];
+        let received = recv_socket_bytes(&request, &mut bytes, false).unwrap();
+        assert_eq!(bytes, [5, 6]);
+        assert!(received.control.is_empty());
+        assert_eq!(received.discarded, vec![4, 3, 2, 1]);
+
+        let connected = net_state().lock().unwrap().sockets.remove(&token).unwrap();
+        let UnixSocketState::Connected(connected) = connected.state else {
+            unreachable!();
+        };
+        assert_eq!(connected.incoming_bytes, 0);
+        assert_eq!(connected.incoming_control_bytes, 0);
+        assert!(connected.incoming.is_empty());
     }
 }
 

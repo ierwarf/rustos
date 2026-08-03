@@ -137,20 +137,25 @@ pub const RUSTOS_BOOTSTRAP_HEAP_DEFAULT_LEN: u64 = 16 * 1024 * 1024;
 /// Exact integer-only service wire for one kernel-owned handle-transfer
 /// ticket. Typed kernel descriptors, enum discriminants, pointers, and Rust
 /// padding must never cross the ring3 boundary.
-pub const IPC_TRANSFER_TICKET_WIRE_BYTES: usize = 16;
+pub const IPC_TRANSFER_TICKET_WIRE_BYTES: usize = 24;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IpcTransferTicketWire {
     transfer_id: u64,
     nonce: u64,
+    batch_generation: u64,
 }
 
 impl IpcTransferTicketWire {
-    pub const fn new(transfer_id: u64, nonce: u64) -> Option<Self> {
-        if transfer_id == 0 || nonce == 0 {
+    pub const fn new(transfer_id: u64, nonce: u64, batch_generation: u64) -> Option<Self> {
+        if transfer_id == 0 || nonce == 0 || batch_generation == 0 {
             return None;
         }
-        Some(Self { transfer_id, nonce })
+        Some(Self {
+            transfer_id,
+            nonce,
+            batch_generation,
+        })
     }
 
     pub const fn transfer_id(self) -> u64 {
@@ -161,10 +166,15 @@ impl IpcTransferTicketWire {
         self.nonce
     }
 
+    pub const fn batch_generation(self) -> u64 {
+        self.batch_generation
+    }
+
     pub fn encode(self) -> [u8; IPC_TRANSFER_TICKET_WIRE_BYTES] {
         let mut bytes = [0_u8; IPC_TRANSFER_TICKET_WIRE_BYTES];
         bytes[..8].copy_from_slice(&self.transfer_id.to_le_bytes());
-        bytes[8..].copy_from_slice(&self.nonce.to_le_bytes());
+        bytes[8..16].copy_from_slice(&self.nonce.to_le_bytes());
+        bytes[16..24].copy_from_slice(&self.batch_generation.to_le_bytes());
         bytes
     }
 
@@ -173,8 +183,9 @@ impl IpcTransferTicketWire {
             return None;
         }
         let transfer_id = u64::from_le_bytes(bytes[..8].try_into().ok()?);
-        let nonce = u64::from_le_bytes(bytes[8..].try_into().ok()?);
-        Self::new(transfer_id, nonce)
+        let nonce = u64::from_le_bytes(bytes[8..16].try_into().ok()?);
+        let batch_generation = u64::from_le_bytes(bytes[16..24].try_into().ok()?);
+        Self::new(transfer_id, nonce, batch_generation)
     }
 }
 
@@ -199,22 +210,30 @@ mod ipc_transfer_ticket_verification {
     fn every_nonzero_ticket_round_trips() {
         let transfer_id: u64 = kani::any();
         let nonce: u64 = kani::any();
-        kani::assume(transfer_id != 0 && nonce != 0);
+        let batch_generation: u64 = kani::any();
+        kani::assume(transfer_id != 0 && nonce != 0 && batch_generation != 0);
         kani::cover!(transfer_id == 1 && nonce == 1);
-        let ticket = IpcTransferTicketWire::new(transfer_id, nonce).expect("nonzero ticket");
-        assert_eq!(IpcTransferTicketWire::decode(&ticket.encode()), Some(ticket));
+        let ticket = IpcTransferTicketWire::new(transfer_id, nonce, batch_generation)
+            .expect("nonzero ticket");
+        assert_eq!(
+            IpcTransferTicketWire::decode(&ticket.encode()),
+            Some(ticket)
+        );
     }
 
     #[kani::proof]
     fn either_zero_field_is_rejected() {
         let transfer_id: u64 = kani::any();
         let nonce: u64 = kani::any();
-        kani::assume(transfer_id == 0 || nonce == 0);
-        kani::cover!(transfer_id == 0 && nonce != 0);
-        kani::cover!(transfer_id != 0 && nonce == 0);
+        let batch_generation: u64 = kani::any();
+        kani::assume(transfer_id == 0 || nonce == 0 || batch_generation == 0);
+        kani::cover!(transfer_id == 0 && nonce != 0 && batch_generation != 0);
+        kani::cover!(transfer_id != 0 && nonce == 0 && batch_generation != 0);
+        kani::cover!(transfer_id != 0 && nonce != 0 && batch_generation == 0);
         let mut bytes = [0_u8; IPC_TRANSFER_TICKET_WIRE_BYTES];
         bytes[..8].copy_from_slice(&transfer_id.to_le_bytes());
-        bytes[8..].copy_from_slice(&nonce.to_le_bytes());
+        bytes[8..16].copy_from_slice(&nonce.to_le_bytes());
+        bytes[16..24].copy_from_slice(&batch_generation.to_le_bytes());
         assert!(IpcTransferTicketWire::decode(&bytes).is_none());
     }
 }
@@ -579,7 +598,7 @@ pub const ROOTD_LEASE_STATE_RUNNING: u16 = 1;
 pub const ROOTD_LEASE_STATE_EXITED: u16 = 2;
 pub const ROOTD_LEASE_STATE_RESTART_PENDING: u16 = 3;
 pub const ROOTD_LEASE_STATE_FAILED: u16 = 4;
-pub const NETD_IPC_ABI_VERSION: u16 = 5;
+pub const NETD_IPC_ABI_VERSION: u16 = 6;
 pub const NETD_IPC_PAYLOAD_CAPACITY: usize = 32 * 1024;
 /// Netd v2 sends only the fixed header plus `payload_len`; the unused tail of
 /// the in-memory transport buffer is not copied through the kernel IPC path.
@@ -608,6 +627,9 @@ pub const NET_BROKER_OP_PACKET_RX: u16 = 0x8003;
 pub const NET_BROKER_OP_PACKET_LEASE_GRANT: u16 = 0x8004;
 pub const NET_BROKER_OP_PACKET_LEASE_REVOKE: u16 = 0x8005;
 pub const NET_BROKER_OP_PACKET_LEASE_RESET: u16 = 0x8006;
+/// Atomically binds a connecting AF_UNIX open description to a kernel-minted
+/// channel generation before netd publishes the accepted peer.
+pub const NET_BROKER_OP_UNIX_CONNECT_BIND: u16 = 0x8010;
 /// Kernel-only acknowledgement that retires one completed replay-safe
 /// dup/close operation from netd's bounded reconciliation table.
 pub const NETD_IPC_OP_REF_ACK: u16 = 0x8004;

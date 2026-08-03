@@ -1,9 +1,10 @@
 use super::*;
 
+use core::sync::atomic::{AtomicU64, Ordering};
 use rustos_user_abi::syscall::{
     IPC_SERVICE_CAP_NET_POLICY, NET_BROKER_OP_PACKET_LEASE_GRANT, NET_BROKER_OP_PACKET_LEASE_RESET,
     NET_BROKER_OP_PACKET_LEASE_REVOKE, NET_BROKER_OP_PACKET_RX, NET_BROKER_OP_PACKET_STATUS,
-    NET_BROKER_OP_PACKET_TX, RustosNetBrokerArgs,
+    NET_BROKER_OP_PACKET_TX, NET_BROKER_OP_UNIX_CONNECT_BIND, RustosNetBrokerArgs,
 };
 use x86_64::VirtAddr;
 
@@ -31,6 +32,7 @@ fn dispatch_net_broker(args: &RustosNetBrokerArgs) -> Result<u64, i64> {
         SYSCALL_OFFLOAD_OP_LINUX_SOCKET => broker_socket(args),
         SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR => broker_socketpair(args),
         SYSCALL_OFFLOAD_OP_LINUX_ACCEPT => broker_accept(args),
+        NET_BROKER_OP_UNIX_CONNECT_BIND => broker_unix_connect_bind(args),
         NET_BROKER_OP_PACKET_STATUS => broker_packet_status(),
         NET_BROKER_OP_PACKET_TX => broker_packet_tx(args),
         NET_BROKER_OP_PACKET_RX => broker_packet_rx(args),
@@ -158,37 +160,74 @@ fn broker_socketpair(args: &RustosNetBrokerArgs) -> Result<u64, i64> {
         return Err(LINUX_EAFNOSUPPORT);
     }
     let open_flags = args.arg1 & (linux_abi::SOCK_NONBLOCK | linux_abi::SOCK_CLOEXEC);
+    let channel_id = allocate_unix_channel_id()?;
+    let left = multitask::SocketHandle::from_token(
+        args.arg4,
+        linux_abi::AF_UNIX,
+        linux_abi::SOCK_STREAM,
+        args.arg2,
+    );
+    let right = multitask::SocketHandle::from_token(
+        args.arg5,
+        linux_abi::AF_UNIX,
+        linux_abi::SOCK_STREAM,
+        args.arg2,
+    );
+    assert!(left.bind_channel(channel_id, 1));
+    assert!(right.bind_channel(channel_id, 2));
     install_process_socket_pair(
         args,
-        multitask::KernelHandle::Socket(multitask::SocketHandle::from_token(
-            args.arg4,
-            linux_abi::AF_UNIX,
-            linux_abi::SOCK_STREAM,
-            args.arg2,
-        )),
-        multitask::KernelHandle::Socket(multitask::SocketHandle::from_token(
-            args.arg5,
-            linux_abi::AF_UNIX,
-            linux_abi::SOCK_STREAM,
-            args.arg2,
-        )),
+        multitask::KernelHandle::Socket(left),
+        multitask::KernelHandle::Socket(right),
         open_flags,
     )
 }
 
+fn broker_unix_connect_bind(args: &RustosNetBrokerArgs) -> Result<u64, i64> {
+    if args.arg1 == 0 || args.arg2 == 0 || args.arg3 != 0 || args.arg4 != 0 || args.arg5 != 0 {
+        return Err(LINUX_EINVAL);
+    }
+    let channel_id = allocate_unix_channel_id()?;
+    let Some(bound) = multitask::with_process_state_by_pid_mut(args.process_id, |process_state| {
+        let Some(entry) = process_state.handles_mut().get_entry_mut(args.arg0) else {
+            return false;
+        };
+        let multitask::KernelHandle::Socket(socket) = entry.handle_mut() else {
+            return false;
+        };
+        socket.token_id() == args.arg1 && socket.bind_channel(channel_id, 1)
+    }) else {
+        return Err(LINUX_ESRCH);
+    };
+    bound.then_some(channel_id).ok_or(LINUX_EINVAL)
+}
+
+fn allocate_unix_channel_id() -> Result<u64, i64> {
+    static NEXT_UNIX_CHANNEL_ID: AtomicU64 = AtomicU64::new(1);
+    NEXT_UNIX_CHANNEL_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            (current != 0).then(|| current.checked_add(1)).flatten()
+        })
+        .map_err(|_| LINUX_EOVERFLOW)
+}
+
 fn broker_accept(args: &RustosNetBrokerArgs) -> Result<u64, i64> {
     let status_flags = process_socket_status_flags(args.process_id, args.arg0)?;
-    if args.arg4 == 0 {
+    if args.arg4 == 0 || args.arg5 == 0 {
+        return Err(LINUX_EINVAL);
+    }
+    let socket = multitask::SocketHandle::from_token(
+        args.arg4,
+        linux_abi::AF_UNIX,
+        linux_abi::SOCK_STREAM,
+        0,
+    );
+    if !socket.bind_channel(args.arg5, 2) {
         return Err(LINUX_EINVAL);
     }
     install_process_handle(
         args.process_id,
-        multitask::KernelHandle::Socket(multitask::SocketHandle::from_token(
-            args.arg4,
-            linux_abi::AF_UNIX,
-            linux_abi::SOCK_STREAM,
-            0,
-        )),
+        multitask::KernelHandle::Socket(socket),
         (status_flags & linux_abi::O_NONBLOCK)
             | (args.arg3 & (linux_abi::SOCK_NONBLOCK | linux_abi::SOCK_CLOEXEC)),
     )

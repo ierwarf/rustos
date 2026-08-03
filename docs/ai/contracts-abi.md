@@ -583,13 +583,19 @@ policy remains with the owning service.
 - Bounded cap-transfer via `kernel_ipc_runtime::api::KernelTransferredHandle` + `*_with_handles` endpoint APIs.
 - Byte-only recv/take wrappers must fail with `BufferTooSmall` when a queued message contains transferred handles. Older paths must never silently drop capabilities.
 - Transferred handles require nonzero transfer ticket + `HandleRights::allows_transfer()` true.
-- The only Ring3 handle-transfer authority wire is exactly 16 little-endian
-  bytes: nonzero `transfer_id: u64` followed by nonzero random `nonce: u64`.
+- The only Ring3 handle-transfer authority wire is exactly 24 little-endian
+  bytes: nonzero `transfer_id: u64`, nonzero random `nonce: u64`, and nonzero
+  kernel-minted `batch_generation: u64`.
   Ring3 bytes are never copied into `KernelTransferredHandle`, a Rust enum,
   padding, discriminants, references, or pointers. Decode produces the typed
   ticket only after exact-length and nonzero checks; malformed bytes return a
   bounded ABI error without constructing or consuming authority.
-- The registry matches both ID and nonce and consumes the entry exactly once.
+- The registry matches ID, nonce, and batch generation and consumes the whole
+  batch exactly once. Before netd sees it, the kernel binds the batch to the
+  source process generation, intended receiver generation, netd service epoch,
+  socket channel generation/direction, and exact byte-stream interval. Netd
+  IPC ABI v6 carries only these opaque tickets; it cannot redirect authority by
+  editing a PID, epoch, channel, or stream position.
   A forged, stale, zero, or replayed ticket cannot remove the live entry. The
   Kani parser proofs exhaust the 128-bit input partition and canonical
   round-trip; `ipc-handle-transfer` separately checks typed registry lifetime.
@@ -599,6 +605,13 @@ policy remains with the owning service.
   abandoned by caller task exit must return every opaque descriptor for exactly
   one substrate drop. Successful receive installs the whole validated batch;
   duplicate/stale descriptors and partial installation must fail closed.
+  AF_UNIX queues retain byte and ancillary control as one ordered stream
+  segment. `recvmsg` may collect rights only from a segment whose bytes it
+  consumes; ordinary `read` consumes and returns that segment's rights to the
+  kernel release trailer instead of reattaching them to later bytes. Close,
+  queue discard, peer exit, and service-epoch replacement release every queued
+  batch. Destination FD numbers remain invisible reservations until data,
+  control, and message-header copyout all succeed, then publish atomically.
 - Supervisor services polling independent brokers must use `SYS_RUSTOS_IPC_TRY_RECV`, not blocking `SYS_RUSTOS_IPC_RECV`.
 - FD-table transfer goes through `kernel_ps::api::TransferredHandleEntry` + `HandleTable::{duplicate_for_transfer, install_transferred}`. Source class + rights must permit descriptor transfer; directory FDs are file capabilities and transferable for VFS migration.
 - Userspace handle-aware IPC: `SYS_RUSTOS_IPC_{CALL,RECV,REPLY}_WITH_HANDLES` with `Ipc*WithHandlesArgs`. Send handles = Linux fd arrays; received handles install into receiver fd table and return as `i32` fd arrays + `u16` count. `recv_fd_count_ptr` mandatory even when no handles returned. Counts bounded by `IPC_MAX_TRANSFER_HANDLES`.
@@ -1905,7 +1918,7 @@ do not admit a service, a module-loading path, or a future ABI reuse.
   state machine, CPU-local architectural/lockdep/current-task state,
   reschedule IPI, TLB shootdown, cross-CPU lifetime barriers, and translated
   atomic robust-futex cleanup. It still uses one serialized scheduler state
-  and broadcast reschedule fan-out rather than the required per-CPU run queues
+  and the retired broadcast reschedule fan-out rather than the required per-CPU run queues
   and targeted load balancing. `RUSTOS_SMP_READINESS` is therefore a
   source-bound admission gate, not a release claim: multi-vCPU commercial
   acceptance remains closed until the full contract and 1/2/4/8-vCPU

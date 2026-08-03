@@ -37,9 +37,15 @@ use super::acpi::MAX_SUPPORTED_CPUS;
 const PAGE_SIZE: u64 = 4096;
 const GLOBAL_SCOPE: u64 = 0;
 #[cfg(rustos_boot_image)]
-const ACK_TIMEOUT_NS: u64 = 100_000_000;
+/// A delayed virtual CPU may legitimately miss one host scheduling quantum.
+/// Retry notification at this bound; it is not a CPU-failure verdict.
+const ACK_RETRY_NS: u64 = 100_000_000;
+/// The boot-static SMP envelope is fail-stop. Only this longer liveness
+/// watchdog may classify a target as unable to participate in safe reclaim.
 #[cfg(rustos_boot_image)]
-const PROTOCOL_ACQUIRE_TIMEOUT_NS: u64 = 100_000_000;
+const ACK_LIVENESS_TIMEOUT_NS: u64 = 2_000_000_000;
+#[cfg(rustos_boot_image)]
+const PROTOCOL_ACQUIRE_TIMEOUT_NS: u64 = ACK_LIVENESS_TIMEOUT_NS;
 
 static PROTOCOL_LOCK: TrackedSpinLock<(), { LockClass::TlbShootdown as u8 }> =
     TrackedSpinLock::new(());
@@ -70,18 +76,50 @@ pub struct AddressSpaceMutationGuard {
     restore_interrupts: bool,
 }
 
+/// A mutation whose exact shootdown quorum has completed.  Holding this value
+/// retains serialization while the caller removes ownership metadata and
+/// releases frames, but dropping it only unlocks the protocol; it cannot issue
+/// a second shootdown for the same mutation generation.
+pub struct FlushedAddressSpaceMutationGuard {
+    guard: Option<TrackedSpinGuard<'static, (), { LockClass::TlbShootdown as u8 }>>,
+    restore_interrupts: bool,
+}
+
 impl AddressSpaceMutationGuard {
     /// Complete a shootdown while retaining mutation serialization.
     ///
     /// Call this after removing a mapping and before releasing or reassigning
     /// any frame that a stale translation could still reach.
-    pub fn flush_before_reclaim(&mut self) {
+    pub fn flush_for_reclaim(mut self) -> FlushedAddressSpaceMutationGuard {
         assert!(
             self.guard.is_some(),
             "TLB invariant: inactive mutation guard attempted a flush"
         );
         #[cfg(rustos_boot_image)]
         finish_shootdown(self.scope);
+        let guard = self
+            .guard
+            .take()
+            .expect("TLB invariant: flushed mutation guard lost its protocol lock");
+        let flushed = FlushedAddressSpaceMutationGuard {
+            guard: Some(guard),
+            restore_interrupts: self.restore_interrupts,
+        };
+        // `AddressSpaceMutationGuard` has a Drop implementation for the dirty
+        // state. Ownership of its protocol guard has moved into the flushed
+        // typestate, so suppress that dirty-state destructor exactly once.
+        core::mem::forget(self);
+        flushed
+    }
+}
+
+impl Drop for FlushedAddressSpaceMutationGuard {
+    fn drop(&mut self) {
+        let guard = self
+            .guard
+            .take()
+            .expect("TLB invariant: flushed mutation guard completed twice");
+        unlock_protocol(guard, self.restore_interrupts);
     }
 }
 
@@ -370,17 +408,31 @@ fn finish_shootdown(scope: MutationScope) {
         if !targets[target] {
             continue;
         }
+        let mut retry_after = ACK_RETRY_NS;
         loop {
             // ORDERING: Acquire observes the target flush preceding its exact
             // acknowledgement publication.
             if ACK_GENERATION[target].load(Ordering::Acquire) == generation {
                 break;
             }
-            if super::clock::monotonic_nanos().saturating_sub(start) >= ACK_TIMEOUT_NS {
+            let elapsed = super::clock::monotonic_nanos().saturating_sub(start);
+            if elapsed >= ACK_LIVENESS_TIMEOUT_NS {
                 panic!(
-                    "TLB invariant: generation {generation} timed out waiting for logical CPU {} APIC {}",
-                    descriptor.logical_index, descriptor.apic_id
+                    "TLB liveness watchdog: generation {generation} retained reclaim quarantine while logical CPU {} APIC {} failed to acknowledge after {}ns",
+                    descriptor.logical_index, descriptor.apic_id, elapsed
                 );
+            }
+            if elapsed >= retry_after {
+                // The mailbox remains generation-owned and the frame remains
+                // quarantined behind this guard. A duplicate IPI is only a
+                // notification retry; the exact generation ACK is idempotent.
+                super::msi::send_tlb_shootdown_ipi(descriptor.apic_id).unwrap_or_else(|error| {
+                    panic!(
+                        "TLB invariant: generation {generation} retry IPI to logical CPU {} APIC {} failed: {error:?}",
+                        descriptor.logical_index, descriptor.apic_id
+                    )
+                });
+                retry_after = elapsed.saturating_add(ACK_RETRY_NS);
             }
             spin_loop();
         }

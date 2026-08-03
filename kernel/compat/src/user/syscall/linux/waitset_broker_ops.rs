@@ -153,9 +153,12 @@ fn register_waitset_waiters_faultable(
     }
     let mut waiters = WAITSET_WAITERS.lock();
     for slot in waiters.iter_mut() {
-        if slot.is_some_and(|waiter| {
-            waiter.task_id == task_id || !multitask::is_user_task_alive(waiter.task_id)
-        }) {
+        // Task retirement and process teardown are the authoritative cleanup
+        // owners (`remove_waitset_waiters*`).  Do not query the global
+        // scheduler once per registry slot while holding the wait-set lock:
+        // that inverted dependency serializes registration with every
+        // dispatch and would defeat per-CPU run-queue locality.
+        if slot.is_some_and(|waiter| waiter.task_id == task_id) {
             *slot = None;
         }
     }

@@ -22,7 +22,7 @@ mod tests {
 
     #[test]
     fn ipc_transfer_ticket_wire_is_canonical_and_rejects_zero_authority() {
-        let ticket = syscall::IpcTransferTicketWire::new(7, 11).expect("nonzero ticket");
+        let ticket = syscall::IpcTransferTicketWire::new(7, 11, 13).expect("nonzero ticket");
         let bytes = ticket.encode();
         assert_eq!(syscall::IpcTransferTicketWire::decode(&bytes), Some(ticket));
 
@@ -195,7 +195,7 @@ mod tests {
             12
         );
         assert_eq!(syscall::COMMERCIAL_MAX_ROOTD_OP_LOADER_WORKER_COMPLETE, 13);
-        assert_eq!(syscall::NETD_IPC_ABI_VERSION, 5);
+        assert_eq!(syscall::NETD_IPC_ABI_VERSION, 6);
         assert_eq!(syscall::SYS_RUSTOS_WAITSET_SIGNAL_BROKER, 0x5255_003f);
         assert_eq!(syscall::SYS_RUSTOS_ENTROPY_BROKER, 0x5255_0040);
         assert_eq!(syscall::SYS_RUSTOS_EARLY_SYSTEM_BROKER, 0x5255_0041);

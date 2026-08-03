@@ -3,9 +3,9 @@
 use super::{
     copy_atlas_damage_to_slot, difference_bounds, gpu_completion_timed_out, gpu_provider_admission,
     next_frame_deadline, reconstruction_damage_within_budget, snapshot_damage_for_slot,
-    AtlasDamageEpoch, DvmGpuAtlasDamage, GpuProviderAdmission, Rect, GPU_COMPLETION_TIMEOUT,
-    GPU_FIRST_FRAME_TIMEOUT, GPU_FRAME_INTERVAL, GPU_INITIALIZATION_RETAINS_BOOT_CLASS,
-    GPU_PROVIDER_HEALTH_INTERVAL,
+    AtlasDamageEpoch, DvmGpuAtlasDamage, GpuCompositorRuntime, GpuProviderAdmission, Rect,
+    GPU_COMPLETION_TIMEOUT, GPU_FIRST_FRAME_TIMEOUT, GPU_FRAME_INTERVAL,
+    GPU_INITIALIZATION_RETAINS_BOOT_CLASS, GPU_PROVIDER_HEALTH_INTERVAL,
 };
 use crate::sys::DisplayInfo;
 use rustos_user_abi::device::{DISPLAY_INFO_FLAG_DVM_SCANOUT, DISPLAY_INFO_FLAG_GPU_COMPOSITOR};
@@ -44,6 +44,17 @@ fn dvm_gpu_admission_waits_without_hiding_behind_software() {
         gpu_provider_admission(display_with_flags(DISPLAY_INFO_FLAG_GPU_COMPOSITOR)),
         GpuProviderAdmission::Invalid
     );
+}
+
+#[test]
+fn mandatory_gpu_wait_never_admits_cpu_present_as_retry() {
+    assert!(GpuCompositorRuntime::SoftwareFallback.admits_cpu_present());
+    let waiting = GpuCompositorRuntime::Waiting {
+        deadline: Instant::now() + Duration::from_secs(1),
+        next_probe: Instant::now(),
+        initialization: None,
+    };
+    assert!(!waiting.admits_cpu_present());
 }
 
 #[test]

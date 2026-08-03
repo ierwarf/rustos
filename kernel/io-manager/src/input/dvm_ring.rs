@@ -79,6 +79,10 @@ static RESET_PENDING_GENERATION: AtomicU64 = AtomicU64::new(0);
 /// threads can enter the broker concurrently. The shared consumer cursor has
 /// exactly one linearization owner per drain turn.
 static DRAIN_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+static INPUT_LIFECYCLE: crate::transport_lifecycle::TransportLifecycle =
+    crate::transport_lifecycle::TransportLifecycle::detached();
+static WITHDRAW_PENDING: AtomicBool = AtomicBool::new(false);
+static REVOKE_PENDING: AtomicBool = AtomicBool::new(false);
 static BROKER_CALLS: AtomicU64 = AtomicU64::new(0);
 static RECORDS_COPIED: AtomicU64 = AtomicU64::new(0);
 static REVOKE_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -115,6 +119,7 @@ impl Drop for DrainGuard {
         // ORDERING: Release publishes every cursor/reset mutation before a
         // later broker caller may become the sole drain owner.
         DRAIN_IN_PROGRESS.store(false, Ordering::Release);
+        finish_pending_lifecycle();
     }
 }
 
@@ -198,6 +203,10 @@ fn try_install_serialized() -> bool {
     GENERATION.store(ring.header.generation, Ordering::Release);
     CONSUMER.store(ring.header.consumer, Ordering::Release);
     CONSUMER_WAKE_GENERATION.store(ring.header.consumer_wake_generation, Ordering::Release);
+    assert!(
+        INPUT_LIFECYCLE.activate(ring.header.generation),
+        "DVM input lifecycle activation failed during install"
+    );
     INSTALLED.store(true, Ordering::Release);
     crate::debug::info!(
         input,
@@ -212,6 +221,7 @@ fn try_install_serialized() -> bool {
 /// that MSI-X is armed; it does not prove that the sole ring consumer can
 /// advance the cursor.
 pub(crate) fn mark_policy_consumer_ready() -> bool {
+    finish_pending_lifecycle();
     if !INSTALLED.load(Ordering::Acquire) && !try_install() {
         return false;
     }
@@ -233,6 +243,9 @@ pub(crate) fn mark_policy_consumer_ready() -> bool {
         revoke("policy-ready-transport-not-ready");
         return false;
     };
+    if !INPUT_LIFECYCLE.activate(header.generation) {
+        return false;
+    }
     if flags == header.flags {
         return true;
     }
@@ -286,27 +299,14 @@ pub(crate) fn withdraw_policy_consumer() {
         flags & !DVM_INPUT_RING_FLAG_POLICY_CONSUMER_READY,
     );
     fence(Ordering::SeqCst);
-
-    let Some(header) = read_header(mapped) else {
-        revoke("policy-consumer-exit-header-invalid");
-        return;
-    };
     let generation = GENERATION.load(Ordering::Acquire);
-    let consumer = CONSUMER.load(Ordering::Acquire);
-    if header.generation != generation
-        || header.consumer != consumer
-        || header.producer < consumer
-        || header.producer.saturating_sub(consumer) > u64::from(DVM_INPUT_RING_SLOT_COUNT)
-    {
-        revoke("policy-consumer-exit-lifecycle-invalid");
-        return;
-    }
-    fence(Ordering::Release);
-    write_u64(mapped, DVM_INPUT_RING_CONSUMER_OFFSET, header.producer);
-    CONSUMER.store(header.producer, Ordering::Release);
-    IRQ_PENDING.store(false, Ordering::Release);
+    INPUT_LIFECYCLE.request_drain();
+    // ORDERING: the Release pending bit publishes the retired generation and
+    // shared-ready withdrawal before any quiescent finisher resets cursors.
+    WITHDRAW_PENDING.store(true, Ordering::Release);
     RESET_PENDING_GENERATION.store(generation.max(1), Ordering::Release);
     super::wait_queue::wake_input_waiters();
+    wait_for_lifecycle_quiescence("policy-consumer-withdraw");
     crate::debug::warn!(
         input,
         "dvm-input-ring: policy consumer withdrawn generation={}",
@@ -359,13 +359,20 @@ pub(crate) fn service_pending(dest: &mut [InputDvmRecordWire]) -> usize {
         RECORDS_COPIED.fetch_add(written as u64, Ordering::Relaxed);
         return written;
     }
-    let _ = IRQ_PENDING.swap(false, Ordering::AcqRel);
-    let Some(header) = read_header(mapped) else {
-        revoke("header-invalid");
+    // ORDERING: Acquire binds the shared-memory claim to the installed
+    // generation published before INSTALLED became visible.
+    let generation = GENERATION.load(Ordering::Acquire);
+    let Some(lifecycle_claim) = INPUT_LIFECYCLE.try_claim(generation) else {
         RECORDS_COPIED.fetch_add(written as u64, Ordering::Relaxed);
         return written;
     };
-    let generation = GENERATION.load(Ordering::Acquire);
+    let reset_written = written;
+    let _ = IRQ_PENDING.swap(false, Ordering::AcqRel);
+    let Some(header) = read_header(mapped) else {
+        revoke("header-invalid");
+        RECORDS_COPIED.fetch_add(reset_written as u64, Ordering::Relaxed);
+        return reset_written;
+    };
     let mut consumer = CONSUMER.load(Ordering::Acquire);
     if header.generation != generation
         || header.consumer != consumer
@@ -373,8 +380,8 @@ pub(crate) fn service_pending(dest: &mut [InputDvmRecordWire]) -> usize {
         || header.producer.saturating_sub(consumer) > u64::from(DVM_INPUT_RING_SLOT_COUNT)
     {
         revoke("cursor-or-generation-invalid");
-        RECORDS_COPIED.fetch_add(written as u64, Ordering::Relaxed);
-        return written;
+        RECORDS_COPIED.fetch_add(reset_written as u64, Ordering::Relaxed);
+        return reset_written;
     }
     // Pairs with L0's release fence before it advances `producer`. No record
     // bytes may be observed before the validated cursor becomes visible.
@@ -393,8 +400,8 @@ pub(crate) fn service_pending(dest: &mut [InputDvmRecordWire]) -> usize {
             })
         else {
             revoke("record-offset-invalid");
-            RECORDS_COPIED.fetch_add(written as u64, Ordering::Relaxed);
-            return written;
+            RECORDS_COPIED.fetch_add(reset_written as u64, Ordering::Relaxed);
+            return reset_written;
         };
         let mut record = [0_u8; DVM_INPUT_RING_RECORD_BYTES];
         for (index, byte) in record.iter_mut().enumerate() {
@@ -409,6 +416,13 @@ pub(crate) fn service_pending(dest: &mut [InputDvmRecordWire]) -> usize {
         };
         written += 1;
         consumer = consumer.saturating_add(1);
+    }
+    if !lifecycle_claim.validate_current() || lifecycle_claim.epoch() != generation {
+        // ORDERING: publish the rejected generation for inputd's reset barrier
+        // before this claim is dropped and another epoch may activate.
+        RESET_PENDING_GENERATION.store(generation.max(1), Ordering::Release);
+        RECORDS_COPIED.fetch_add(reset_written as u64, Ordering::Relaxed);
+        return reset_written;
     }
     fence(Ordering::Release);
     unsafe {
@@ -436,11 +450,20 @@ pub(crate) fn arm_consumer_wake() -> bool {
     if mapped.is_null() {
         return false;
     }
+    // ORDERING: Acquire selects the exact epoch before arming a shared wake;
+    // the claim recheck closes revoke between selection and publication.
+    let generation = GENERATION.load(Ordering::Acquire);
+    let Some(claim) = INPUT_LIFECYCLE.try_claim(generation) else {
+        return false;
+    };
     let current = CONSUMER_WAKE_GENERATION.load(Ordering::Acquire);
     let Some(next) = current.checked_add(1) else {
         revoke("consumer-wake-generation-wrapped");
         return false;
     };
+    if !claim.validate_current() || claim.epoch() != generation {
+        return false;
+    }
     fence(Ordering::Release);
     unsafe {
         mapped
@@ -493,6 +516,67 @@ fn input_ring_interrupt(_vector: u8) {
 }
 
 fn revoke(reason: &str) {
+    INPUT_LIFECYCLE.request_drain();
+    // ORDERING: drain closes admission before Release publishes revoke work;
+    // the generation and waiter wake follow that publication.
+    REVOKE_PENDING.store(true, Ordering::Release);
+    let generation = GENERATION.load(Ordering::Acquire).max(1);
+    RESET_PENDING_GENERATION.store(generation, Ordering::Release);
+    super::wait_queue::wake_input_waiters();
+    crate::debug::warn!(
+        input,
+        "dvm-input-ring: transport drain requested reason={}",
+        reason
+    );
+    finish_pending_lifecycle();
+}
+
+fn finish_pending_lifecycle() {
+    // ORDERING: Acquire observes the drain request and its generation before
+    // attempting the zero-claim transition to Revoked.
+    if !WITHDRAW_PENDING.load(Ordering::Acquire) && !REVOKE_PENDING.load(Ordering::Acquire) {
+        return;
+    }
+    let Some(retired_generation) = INPUT_LIFECYCLE.finish_drain() else {
+        return;
+    };
+    if WITHDRAW_PENDING.swap(false, Ordering::AcqRel) {
+        // ORDERING: AcqRel owns the one withdrawal reset; Acquire then observes
+        // the mapping and cursor state published by the final claim.
+        let mapped = SHARED_ADDR.load(Ordering::Acquire) as *mut u8;
+        let valid = if mapped.is_null() {
+            false
+        } else if let Some(header) = read_header(mapped) {
+            let consumer = CONSUMER.load(Ordering::Acquire);
+            if header.generation == retired_generation
+                && header.consumer == consumer
+                && header.producer >= consumer
+                && header.producer.saturating_sub(consumer) <= u64::from(DVM_INPUT_RING_SLOT_COUNT)
+            {
+                // ORDERING: publish cursor bytes before the Release cursor and
+                // pending-bit stores expose withdrawal completion.
+                fence(Ordering::Release);
+                write_u64(mapped, DVM_INPUT_RING_CONSUMER_OFFSET, header.producer);
+                CONSUMER.store(header.producer, Ordering::Release);
+                IRQ_PENDING.store(false, Ordering::Release);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if !valid {
+            // ORDERING: Release hands malformed withdrawal to the stronger
+            // revoke branch before this finisher relinquishes ownership.
+            REVOKE_PENDING.store(true, Ordering::Release);
+        }
+    }
+    // ORDERING: AcqRel selects the sole revoke/reset owner after every claim
+    // and optional withdrawal cursor publication is complete.
+    if !REVOKE_PENDING.swap(false, Ordering::AcqRel) {
+        return;
+    }
     INSTALLED.store(false, Ordering::Release);
     let mapped = SHARED_ADDR.swap(0, Ordering::AcqRel) as *mut u8;
     if !mapped.is_null() {
@@ -510,11 +594,37 @@ fn revoke(reason: &str) {
     // The kernel does not decode or own input/network policy. Publish a
     // generation-stamped barrier so inputd can revoke its state and notify
     // netd before accepting records from any replacement generation.
-    let generation = GENERATION.load(Ordering::Acquire).max(1);
-    RESET_PENDING_GENERATION.store(generation, Ordering::Release);
+    // ORDERING: Release publishes the exact retired epoch to policy consumers
+    // before their waiter wake can observe transport absence.
+    RESET_PENDING_GENERATION.store(retired_generation.max(1), Ordering::Release);
     REVOKE_COUNT.fetch_add(1, Ordering::Relaxed);
     super::wait_queue::wake_input_waiters();
-    crate::debug::warn!(input, "dvm-input-ring: transport revoked reason={}", reason);
+    crate::debug::warn!(input, "dvm-input-ring: transport revoked after quiescence");
+}
+
+fn wait_for_lifecycle_quiescence(reason: &str) {
+    const QUIESCE_TIMEOUT_NS: u64 = 2_000_000_000;
+    let started = crate::arch::clock::monotonic_nanos();
+    loop {
+        finish_pending_lifecycle();
+        // ORDERING: Acquire observes both pending-bit clear operations after
+        // the lifecycle's zero-claim finish transition.
+        if INPUT_LIFECYCLE.in_flight() == 0
+            && !WITHDRAW_PENDING.load(Ordering::Acquire)
+            && !REVOKE_PENDING.load(Ordering::Acquire)
+        {
+            return;
+        }
+        if crate::arch::clock::monotonic_nanos().saturating_sub(started) >= QUIESCE_TIMEOUT_NS {
+            panic!(
+                "DVM input lifecycle failed to quiesce reason={} generation={} in_flight={}",
+                reason,
+                INPUT_LIFECYCLE.epoch(),
+                INPUT_LIFECYCLE.in_flight()
+            );
+        }
+        core::hint::spin_loop();
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]

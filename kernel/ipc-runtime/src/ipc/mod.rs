@@ -194,14 +194,19 @@ pub struct KernelTransferredHandle {
 pub struct KernelTransferTicket {
     transfer_id: u64,
     nonce: u64,
+    batch_generation: u64,
 }
 
 impl KernelTransferTicket {
-    pub const fn new(transfer_id: u64, nonce: u64) -> Option<Self> {
-        if transfer_id == 0 || nonce == 0 {
+    pub const fn new(transfer_id: u64, nonce: u64, batch_generation: u64) -> Option<Self> {
+        if transfer_id == 0 || nonce == 0 || batch_generation == 0 {
             return None;
         }
-        Some(Self { transfer_id, nonce })
+        Some(Self {
+            transfer_id,
+            nonce,
+            batch_generation,
+        })
     }
 
     pub const fn transfer_id(self) -> u64 {
@@ -211,6 +216,39 @@ impl KernelTransferTicket {
     pub const fn nonce(self) -> u64 {
         self.nonce
     }
+
+    pub const fn batch_generation(self) -> u64 {
+        self.batch_generation
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProcessIdentity {
+    pub pid: u64,
+    pub generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ServiceIdentity {
+    pub service_id: u64,
+    pub epoch: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChannelIdentity {
+    pub channel_id: u64,
+    pub generation: u64,
+    pub receiver_side: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TransferContext {
+    pub source: ProcessIdentity,
+    pub service: ServiceIdentity,
+    pub channel: ChannelIdentity,
+    pub stream_start: u64,
+    pub stream_end: u64,
+    pub intended_receiver: Option<ProcessIdentity>,
 }
 
 pub type EndpointReceived = (KernelReplyHandle, Vec<u8>, Vec<KernelTransferredHandle>);

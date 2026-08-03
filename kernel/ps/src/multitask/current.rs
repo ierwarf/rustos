@@ -28,6 +28,50 @@ use crate::user::abi::UserAbi;
 use crate::user::linux::{LinuxProcessState, LinuxThreadState};
 use crate::user::process_state::{ProcessSecurityContext, UserProcessState};
 
+impl CurrentUserSnapshot {
+    pub(crate) const fn new(
+        abi: UserAbi,
+        thread_id: u64,
+        process_id: u64,
+        process_generation: u64,
+        console_session: ConsoleSessionHandle,
+        security: ProcessSecurityContext,
+    ) -> Self {
+        Self {
+            abi,
+            thread_id,
+            process_id,
+            process_generation,
+            console_session,
+            security,
+        }
+    }
+
+    pub const fn abi(self) -> UserAbi {
+        self.abi
+    }
+
+    pub const fn thread_id(self) -> u64 {
+        self.thread_id
+    }
+
+    pub const fn process_id(self) -> u64 {
+        self.process_id
+    }
+
+    pub const fn process_generation(self) -> u64 {
+        self.process_generation
+    }
+
+    pub const fn console_session(self) -> ConsoleSessionHandle {
+        self.console_session
+    }
+
+    pub const fn security(self) -> ProcessSecurityContext {
+        self.security
+    }
+}
+
 pub fn current_user_address_space() -> Option<RetainedCurrentUserAddressSpace> {
     let (_, abi, process) = retain_current_user_process_binding()?;
     Some(RetainedCurrentUserAddressSpace {
@@ -201,6 +245,7 @@ pub fn current_user_snapshot() -> Option<CurrentUserSnapshot> {
             abi,
             thread_id,
             process_id,
+            u64::from(process_handle.generation()),
             console_session,
             process_state.security(),
         )
@@ -425,26 +470,36 @@ pub fn exec_current_user_process(
         return None;
     }
 
-    let committed = super::process_table::replace_for_exec_and_publish(
+    let staged = super::process_table::stage_exec_state(
         exec_reservation,
         address_space,
         linux_process_state,
         linux_memory_map,
         linux_runtime_profile,
         exec_path.as_str(),
-        || {
-            // SAFETY: ProcessStateLock remains held while IRQ exclusion and the raw
-            // scheduler lock publish the matching root/context generation.
-            interrupts::without_interrupts(|| unsafe {
-                scheduler_mut().exec_current_user_process(new_root, &mut bootstrap)
-            })
-        },
     );
-    complete_retirement_side_effects();
-    let Some(closed) = committed else {
+    let Some(staged) = staged else {
         let _ = super::process_table::cancel_exec(exec_reservation);
         return None;
     };
+    // SAFETY: ProcessStateLock is released before IRQ exclusion and the raw
+    // scheduler owner; ordinary state readers retry until finalization.
+    let published = interrupts::without_interrupts(|| unsafe {
+        scheduler_mut().exec_current_user_process(new_root, &mut bootstrap)
+    })
+    .expect("authorized self exec lost its reserved scheduler target");
+    let finalized = super::process_table::finalize_exec_state(staged, published);
+    let (process_id, exit_pending, closed, old_state) = finalized.into_parts();
+    // Scheduler publication removed the last old-root execution owner.
+    drop(old_state);
+    if exit_pending {
+        assert!(
+            terminate_user_process(process_id),
+            "exec-finalized pending exit lost scheduler ownership"
+        );
+        super::request_user_return_reschedule();
+    }
+    complete_retirement_side_effects();
     Some(closed)
 }
 
@@ -512,36 +567,40 @@ pub fn exec_user_process_by_pid(
         return None;
     }
 
-    let committed = super::process_table::replace_for_exec_and_publish(
+    let staged = super::process_table::stage_exec_state(
         exec_reservation,
         address_space,
         linux_process_state,
         linux_memory_map,
         linux_runtime_profile,
         exec_path.as_str(),
-        || {
-            // The remote target remains quiesced until this final scheduler
-            // publication; ProcessStateLock prevents an early dispatcher from
-            // observing a partially finalized process generation.
-            interrupts::without_interrupts(|| unsafe {
-                scheduler_mut().exec_user_process_by_pid(
-                    process_id,
-                    thread_id,
-                    new_root,
-                    &mut bootstrap,
-                )
-            })
-        },
     );
-    complete_retirement_side_effects();
-    let Some(closed) = committed else {
+    let Some(staged) = staged else {
         let _ = super::process_table::cancel_exec(exec_reservation);
-        // SAFETY: exact target quiesce state is cleared under the same guard.
+        // SAFETY: no ProcessState lock is held; IRQ exclusion and the global
+        // scheduler owner serialize exact target-quiesce rollback.
         interrupts::without_interrupts(|| unsafe {
             scheduler_mut().cancel_exec_target_quiesce(process_id, thread_id, process_handle);
         });
         return None;
     };
+    // SAFETY: staging released ProcessStateLock; IRQ exclusion and the raw
+    // scheduler owner serialize exact reserved-target publication.
+    let published = interrupts::without_interrupts(|| unsafe {
+        scheduler_mut().exec_user_process_by_pid(process_id, thread_id, new_root, &mut bootstrap)
+    })
+    .expect("authorized target exec lost its reserved scheduler slot");
+    let finalized = super::process_table::finalize_exec_state(staged, published);
+    let (finalized_pid, exit_pending, closed, old_state) = finalized.into_parts();
+    drop(old_state);
+    if exit_pending {
+        assert_eq!(finalized_pid, process_id);
+        assert!(
+            terminate_user_process(process_id),
+            "target exec-finalized pending exit lost scheduler ownership"
+        );
+    }
+    complete_retirement_side_effects();
     Some(closed)
 }
 
@@ -565,7 +624,7 @@ pub fn with_current_user_linux_state_mut<R>(
     ) -> R,
 ) -> Option<R> {
     let (process_id, process, binding) = retain_current_linux_thread_binding()?;
-    process.with_state_mut(|_, state| {
+    process.with_visible_state_mut(|_, state| {
         let (address_space, linux_process_state) =
             state.address_space_and_linux_process_state_mut();
         binding.with_thread_state_mut(|linux_thread_state| {
@@ -578,21 +637,21 @@ pub fn with_current_user_linux_state_mut<R>(
                 linux_thread_state,
             )
         })
-    })
+    })?
 }
 
 pub fn with_current_user_process_state_mut<R>(
     f: impl FnOnce(u64, UserAbi, &mut UserProcessState) -> R,
 ) -> Option<R> {
     let (thread_id, abi, process) = retain_current_user_process_binding()?;
-    Some(process.with_state_mut(|_, process_state| f(thread_id, abi, process_state)))
+    process.with_visible_state_mut(|_, process_state| f(thread_id, abi, process_state))
 }
 
 pub fn with_current_user_process_state<R>(
     f: impl FnOnce(u64, UserAbi, &UserProcessState) -> R,
 ) -> Option<R> {
     let (thread_id, abi, process) = retain_current_user_process_binding()?;
-    Some(process.with_state(|_, process_state| f(thread_id, abi, process_state)))
+    process.with_visible_state(|_, process_state| f(thread_id, abi, process_state))
 }
 
 pub fn with_process_state_by_pid_mut<R>(
@@ -651,7 +710,7 @@ pub fn wait_for_child(
 
 pub fn with_current_mm<R>(f: impl FnOnce(&ProcessAddressSpace) -> R) -> Option<R> {
     let (_, _, process) = retain_current_user_process_binding()?;
-    Some(process.with_state(|_, state| f(state.address_space())))
+    process.with_visible_state(|_, state| f(state.address_space()))
 }
 
 pub fn with_current_process_credentials<R>(
@@ -673,12 +732,12 @@ pub fn with_current_process_state_mut<R>(
     f: impl FnOnce(u64, &mut UserProcessState) -> R,
 ) -> Option<R> {
     let process = retain_current_process_ref()?;
-    Some(process.with_state_mut(f))
+    process.with_visible_state_mut(f)
 }
 
 pub fn with_current_process_state<R>(f: impl FnOnce(u64, &UserProcessState) -> R) -> Option<R> {
     let process = retain_current_process_ref()?;
-    Some(process.with_state(f))
+    process.with_visible_state(f)
 }
 
 pub fn with_process_state_by_pid<R>(
@@ -692,7 +751,7 @@ pub fn with_current_user_process_and_linux_thread_state_mut<R>(
     f: impl FnOnce(u64, u64, UserAbi, &mut UserProcessState, &mut Option<LinuxThreadState>) -> R,
 ) -> Option<R> {
     let (process_id, process, binding) = retain_current_linux_thread_binding()?;
-    process.with_state_mut(|_, state| {
+    process.with_visible_state_mut(|_, state| {
         binding.with_thread_state_mut(|linux_thread_state| {
             f(
                 process_id,
@@ -702,7 +761,7 @@ pub fn with_current_user_process_and_linux_thread_state_mut<R>(
                 linux_thread_state,
             )
         })
-    })
+    })?
 }
 
 pub fn queue_linux_signal(process_id: u64, task_id: u64, signal: u64) -> bool {
@@ -729,7 +788,10 @@ pub fn any_user_process_state(mut f: impl FnMut(u64, &UserProcessState) -> bool)
         let Some(process) = process_table::retain_process(handle) else {
             continue;
         };
-        if process.with_state(|process_id, process_state| f(process_id, process_state)) {
+        if process
+            .with_visible_state(|process_id, process_state| f(process_id, process_state))
+            .unwrap_or(false)
+        {
             return true;
         }
     }

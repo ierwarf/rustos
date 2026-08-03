@@ -240,9 +240,42 @@ pub fn spawn_user_thread_suspended(bootstrap: UserTaskBootstrap) -> Result<u64, 
     let user_ss = crate::arch::gdt::user_data_selector().0 as u64;
     let rflags = initial_task_rflags().bits();
 
+    let reservation =
+        interrupts::without_interrupts(|| unsafe { scheduler_mut().reserve_user_thread_slot(id) })
+            .ok_or(SpawnTaskError::NoFreeTaskSlot)?;
+
+    // The scheduler reservation keeps the slot non-runnable while the
+    // sleepable ProcessState owner initializes Windows TEB identifiers. No raw
+    // scheduler guard is nested with ProcessStateLock in either direction.
+    if let Some(thread_state) = bootstrap.windows_thread_state {
+        let initialized = super::process_table::with_process_state_mut(
+            reservation.process_handle,
+            |_, process_state| {
+                crate::user::process::initialize_windows_thread_identifiers(
+                    process_state.address_space_mut(),
+                    thread_state.teb_address,
+                    reservation.process_id,
+                    id,
+                )
+            },
+        );
+        let Some(initialized) = initialized else {
+            interrupts::without_interrupts(|| unsafe {
+                scheduler_mut().cancel_user_thread_slot(reservation);
+            });
+            return Err(SpawnTaskError::NoFreeTaskSlot);
+        };
+        if let Err(error) = initialized {
+            interrupts::without_interrupts(|| unsafe {
+                scheduler_mut().cancel_user_thread_slot(reservation);
+            });
+            panic!("failed to initialize windows thread ids: {:?}", error);
+        }
+    }
+
     interrupts::without_interrupts(|| unsafe {
         scheduler_mut()
-            .allocate_user_thread_slot(id, bootstrap, user_cs, user_ss, rflags)
+            .commit_user_thread_slot(reservation, bootstrap, user_cs, user_ss, rflags)
             .ok_or(SpawnTaskError::NoFreeTaskSlot)
     })?;
 

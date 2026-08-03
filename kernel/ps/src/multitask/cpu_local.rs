@@ -40,6 +40,8 @@ static CURRENT_TASK_SLOTS: [AtomicUsize; nucleus_core::util::lockdep::MAX_TRACKE
     [const { AtomicUsize::new(0) }; nucleus_core::util::lockdep::MAX_TRACKED_CPUS];
 static CURRENT_TASK_ACTIVE: [AtomicBool; nucleus_core::util::lockdep::MAX_TRACKED_CPUS] =
     [const { AtomicBool::new(false) }; nucleus_core::util::lockdep::MAX_TRACKED_CPUS];
+static CURRENT_TASK_IDLE: [AtomicBool; nucleus_core::util::lockdep::MAX_TRACKED_CPUS] =
+    [const { AtomicBool::new(false) }; nucleus_core::util::lockdep::MAX_TRACKED_CPUS];
 static TRANSITION_FROM_SLOTS: [AtomicUsize; nucleus_core::util::lockdep::MAX_TRACKED_CPUS] =
     [const { AtomicUsize::new(0) }; nucleus_core::util::lockdep::MAX_TRACKED_CPUS];
 static TRANSITION_ACTIVE: [AtomicBool; nucleus_core::util::lockdep::MAX_TRACKED_CPUS] =
@@ -133,6 +135,13 @@ impl Drop for SchedulerAccessGuard {
         // CPU. A changed handoff already published the outgoing transition,
         // so both stacks remain owned until the assembly commit callback.
         CURRENT_TASK_SLOTS[self.logical_index].store(guard.current_task, Ordering::Release);
+        // ORDERING: Release publishes the selected slot's scheduler-derived
+        // Idle class after the slot itself. Periodic interrupt leaves may use
+        // this one bit only to retain an idle continuation when every local
+        // and foreign runqueue publication is empty.
+        // ORDERING: the following Release is the derived-class publication.
+        CURRENT_TASK_IDLE[self.logical_index]
+            .store(guard.current_task_is_idle_task(), Ordering::Release);
         // ORDERING: diagnostic metadata is not lock authority. Release-clear
         // its publication immediately before the tracked guard releases the
         // real lock.
@@ -144,7 +153,7 @@ impl Drop for SchedulerAccessGuard {
                 .take()
                 .expect("scheduler guard disappeared before unlock"),
         );
-        super::irq::flush_deferred_reschedule_fanout();
+        super::irq::flush_deferred_target_reschedules();
     }
 }
 
@@ -306,8 +315,21 @@ pub(super) fn publish_cpu_current_task(logical_index: usize, slot: usize) {
     // ORDERING: Release makes the initialized idle context visible before the
     // AP is allowed to enter scheduler code.
     CURRENT_TASK_SLOTS[logical_index].store(slot, Ordering::Release);
+    // ORDERING: this Release follows the exact slot publication above. AP
+    // initial publications are private idle tasks; BSP slot zero is still
+    // bootstrap work here and becomes Idle only after `mark_root_idle`.
+    CURRENT_TASK_IDLE[logical_index].store(logical_index != 0, Ordering::Release);
     // ORDERING: Release publishes ownership only after the exact task slot.
     CURRENT_TASK_ACTIVE[logical_index].store(true, Ordering::Release);
+}
+
+pub(super) fn current_cpu_task_is_idle(logical_index: usize) -> bool {
+    if logical_index >= CURRENT_TASK_IDLE.len() {
+        return false;
+    }
+    // ORDERING: Acquire observes the exact current-slot publication that
+    // precedes this derived class bit.
+    CURRENT_TASK_IDLE[logical_index].load(Ordering::Acquire)
 }
 
 /// Reports whether the calling CPU may safely enter current-task snapshot

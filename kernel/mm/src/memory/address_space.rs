@@ -77,6 +77,13 @@ pub struct ProcessAddressSpace {
     regions: Vec<UserRegion>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PublishedUserTable {
+    parent_phys: u64,
+    parent_index: usize,
+    table_phys: u64,
+}
+
 impl ProcessAddressSpace {
     #[inline(never)]
     pub fn new() -> Result<Self, AddressSpaceError> {
@@ -198,27 +205,38 @@ impl ProcessAddressSpace {
         validate_user_page_range(start, page_count)?;
 
         let page_flags = normalize_user_page_flags(flags)?;
+        let table_capacity = page_count
+            .checked_mul(3)
+            .ok_or(AddressSpaceError::AddressOverflow)?;
         let mut mapped_pages = Vec::new();
+        let mut published_tables = Vec::new();
         mapped_pages
             .try_reserve_exact(page_count)
             .map_err(|_| AddressSpaceError::OutOfFrames)?;
+        published_tables
+            .try_reserve_exact(table_capacity)
+            .map_err(|_| AddressSpaceError::OutOfFrames)?;
         self.owned_frames
-            .try_reserve_exact(page_count)
+            .try_reserve_exact(
+                page_count
+                    .checked_add(table_capacity)
+                    .ok_or(AddressSpaceError::AddressOverflow)?,
+            )
             .map_err(|_| AddressSpaceError::OutOfFrames)?;
         self.regions
             .try_reserve(1)
             .map_err(|_| AddressSpaceError::OutOfFrames)?;
-        let mut mutation = begin_address_space_mutation(self.root_phys());
+        let mutation = begin_address_space_mutation(self.root_phys());
 
         for page_index in 0..page_count {
             let virt = page_addr(start, page_index)?;
             if self.translate_user(virt).is_some() {
-                rollback_user_pages(self, &mapped_pages, &mut mutation);
+                rollback_user_pages(self, &mapped_pages, &published_tables, mutation);
                 return Err(AddressSpaceError::AlreadyMapped);
             }
 
             let Some(frame_phys) = phys::alloc_frame() else {
-                rollback_user_pages(self, &mapped_pages, &mut mutation);
+                rollback_user_pages(self, &mapped_pages, &published_tables, mutation);
                 return Err(AddressSpaceError::OutOfFrames);
             };
 
@@ -226,9 +244,11 @@ impl ProcessAddressSpace {
                 ptr::write_bytes(higher_half_ptr(frame_phys), 0, PAGE_4KIB);
             }
 
-            if let Err(err) = self.map_user_page(virt, frame_phys, page_flags) {
+            if let Err(err) =
+                self.map_user_page(virt, frame_phys, page_flags, &mut published_tables)
+            {
                 phys::free_frame(frame_phys);
-                rollback_user_pages(self, &mapped_pages, &mut mutation);
+                rollback_user_pages(self, &mapped_pages, &published_tables, mutation);
                 return Err(err);
             }
 
@@ -237,7 +257,7 @@ impl ProcessAddressSpace {
 
         for &(_, frame_phys) in &mapped_pages {
             if let Err(err) = track_owned_frame(&mut self.owned_frames, frame_phys) {
-                rollback_user_pages(self, &mapped_pages, &mut mutation);
+                rollback_user_pages(self, &mapped_pages, &published_tables, mutation);
                 return Err(err);
             }
         }
@@ -291,23 +311,39 @@ impl ProcessAddressSpace {
 
         validate_user_page_range(start, frames.len())?;
         let page_flags = normalize_user_page_flags(flags)? | leaf_flags;
+        let table_capacity = frames
+            .len()
+            .checked_mul(3)
+            .ok_or(AddressSpaceError::AddressOverflow)?;
         let mut mapped_pages = Vec::new();
+        let mut published_tables = Vec::new();
         mapped_pages
             .try_reserve_exact(frames.len())
+            .map_err(|_| AddressSpaceError::OutOfFrames)?;
+        published_tables
+            .try_reserve_exact(table_capacity)
+            .map_err(|_| AddressSpaceError::OutOfFrames)?;
+        self.owned_frames
+            .try_reserve_exact(table_capacity)
             .map_err(|_| AddressSpaceError::OutOfFrames)?;
         self.regions
             .try_reserve(1)
             .map_err(|_| AddressSpaceError::OutOfFrames)?;
-        let mut mutation = begin_address_space_mutation(self.root_phys());
+        let mutation = begin_address_space_mutation(self.root_phys());
 
         for (page_index, frame_phys) in frames.iter().copied().enumerate() {
             let virt = page_addr(start, page_index)?;
             if self.translate_user(virt).is_some() {
-                rollback_external_user_pages(self, &mapped_pages, &mut mutation);
+                rollback_external_user_pages(self, &mapped_pages, &published_tables, mutation);
                 return Err(AddressSpaceError::AlreadyMapped);
             }
-            if let Err(err) = self.map_user_page(virt, PhysAddr::new(frame_phys), page_flags) {
-                rollback_external_user_pages(self, &mapped_pages, &mut mutation);
+            if let Err(err) = self.map_user_page(
+                virt,
+                PhysAddr::new(frame_phys),
+                page_flags,
+                &mut published_tables,
+            ) {
+                rollback_external_user_pages(self, &mapped_pages, &published_tables, mutation);
                 return Err(err);
             }
             mapped_pages.push(virt);
@@ -356,7 +392,7 @@ impl ProcessAddressSpace {
             frames.push(phys.as_u64());
         }
 
-        let mut mutation = begin_address_space_mutation(self.root_phys());
+        let mutation = begin_address_space_mutation(self.root_phys());
         for page_index in 0..page_count {
             let virt = page_addr(start, page_index)?;
             let unmapped = self
@@ -364,7 +400,7 @@ impl ProcessAddressSpace {
                 .ok_or(AddressSpaceError::NotMapped)?;
             debug_assert_eq!(Some(unmapped.as_u64()), frames.get(page_index).copied());
         }
-        mutation.flush_before_reclaim();
+        let _flushed_mutation = mutation.flush_for_reclaim();
 
         for frame_phys in frames {
             remove_owned_frame(&mut self.owned_frames, frame_phys)?;
@@ -770,15 +806,30 @@ impl ProcessAddressSpace {
         virt: VirtAddr,
         phys: PhysAddr,
         flags: PageTableFlags,
+        published_tables: &mut Vec<PublishedUserTable>,
     ) -> Result<(), AddressSpaceError> {
         validate_user_page_range(virt, 1)?;
 
         let pml4_phys = self.root_phys();
-        let owned_frames = &mut self.owned_frames;
-        let root = unsafe { kernel_vm::phys_to_table_mut(pml4_phys) };
-        let pdpt = ensure_next_table(owned_frames, root, p4_index(virt))?;
-        let pd = ensure_next_table(owned_frames, pdpt, p3_index(virt))?;
-        let pt = ensure_next_table(owned_frames, pd, p2_index(virt))?;
+        let pdpt_phys = ensure_next_table(
+            &mut self.owned_frames,
+            published_tables,
+            pml4_phys,
+            p4_index(virt),
+        )?;
+        let pd_phys = ensure_next_table(
+            &mut self.owned_frames,
+            published_tables,
+            pdpt_phys,
+            p3_index(virt),
+        )?;
+        let pt_phys = ensure_next_table(
+            &mut self.owned_frames,
+            published_tables,
+            pd_phys,
+            p2_index(virt),
+        )?;
+        let pt = unsafe { kernel_vm::phys_to_table_mut(pt_phys) };
 
         let entry = &mut pt[p1_index(virt)];
         if !entry.is_unused() {
@@ -1025,11 +1076,13 @@ fn track_owned_frame(
     Ok(())
 }
 
-fn ensure_next_table<'a>(
+fn ensure_next_table(
     owned_frames: &mut Vec<u64>,
-    parent: &'a mut PageTable,
+    published_tables: &mut Vec<PublishedUserTable>,
+    parent_phys: PhysAddr,
     index: usize,
-) -> Result<&'a mut PageTable, AddressSpaceError> {
+) -> Result<PhysAddr, AddressSpaceError> {
+    let parent = unsafe { kernel_vm::phys_to_table_mut(parent_phys) };
     let entry = &mut parent[index];
 
     if entry.is_unused() {
@@ -1044,16 +1097,21 @@ fn ensure_next_table<'a>(
             return Err(err);
         }
         entry.set_addr(table_phys, user_table_flags());
+        published_tables.push(PublishedUserTable {
+            parent_phys: parent_phys.as_u64(),
+            parent_index: index,
+            table_phys: table_phys.as_u64(),
+        });
     } else {
         if entry.flags().contains(PageTableFlags::HUGE_PAGE) {
             return Err(AddressSpaceError::HugePageConflict);
         }
-
-        let merged_flags = entry.flags() | user_table_flags();
-        entry.set_addr(entry.addr(), merged_flags);
+        if !entry.flags().contains(user_table_flags()) {
+            return Err(AddressSpaceError::ProtectionViolation);
+        }
     }
 
-    Ok(unsafe { kernel_vm::phys_to_table_mut(entry.addr()) })
+    Ok(entry.addr())
 }
 
 fn validate_user_page_range(start: VirtAddr, page_count: usize) -> Result<(), AddressSpaceError> {

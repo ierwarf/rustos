@@ -72,8 +72,9 @@ continue to require:
 - per-CPU run queues with bounded targeted wake and load balancing;
 - multicore memory-order litmus, stress, and recovery evidence.
 
-The current serialized global scheduler and broadcast reschedule fan-out are
-correctness scaffolding, not completion of the per-CPU run-queue contract.
+The current serialized global scheduler remains correctness scaffolding, not
+completion of the per-CPU run-queue contract. The former broadcast reschedule
+fan-out is retired; ordinary local work cannot create remote IPI authority.
 No document, launcher flag, or readiness marker may advertise commercial SMP
 until the 1/2/4/8-vCPU qualification matrix passes.
 

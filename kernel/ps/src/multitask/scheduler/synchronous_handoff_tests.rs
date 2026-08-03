@@ -75,7 +75,7 @@ fn synchronous_ipc_handoff_is_fifo_deduplicated_and_fairness_bounded() {
     assert!(scheduler.set_next_synchronous_pick_hint(912));
     assert!(scheduler.set_next_synchronous_pick_hint(912));
     assert!(scheduler.set_next_synchronous_pick_hint(913));
-    assert_eq!(scheduler.sync_pick_hints.len(), 2);
+    assert_eq!(scheduler.current_dispatch_policy().sync_pick_hints.len(), 2);
     assert_eq!(
         scheduler.mandatory_overdue_system_pick(current, now_ticks),
         Some(overdue)
@@ -92,9 +92,9 @@ fn synchronous_ipc_handoff_is_fifo_deduplicated_and_fairness_bounded() {
 
     assert!(scheduler.set_next_synchronous_pick_hint(912));
     assert!(scheduler.set_next_synchronous_pick_hint(913));
-    scheduler.sync_handoff_streak = MAX_CONSECUTIVE_SYNC_HANDOFFS;
+    scheduler.current_dispatch_policy_mut().sync_handoff_streak = MAX_CONSECUTIVE_SYNC_HANDOFFS;
     assert_eq!(scheduler.take_next_synchronous_pick_hint_ready_slot(), None);
-    assert_eq!(scheduler.sync_pick_hints.len(), 2);
+    assert_eq!(scheduler.current_dispatch_policy().sync_pick_hints.len(), 2);
     scheduler.record_synchronous_handoff(false);
     assert_eq!(
         scheduler.take_next_synchronous_pick_hint_ready_slot(),

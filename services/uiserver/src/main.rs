@@ -52,12 +52,8 @@ const UI_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 const UI_WATCHDOG_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 const UI_PHASE_PANIC_THRESHOLD_MS: u64 = 3_000;
 const WAYLAND_BACKLOG_SERVICE_INTERVAL: Duration = Duration::from_millis(4);
-// Keep callback-only pacing phase-locked with the DVM GPU presentation
-// cadence. A 16 ms client pulse against a 15 ms presentation clock creates a
-// beat: an otherwise healthy callback can repeatedly miss two adjacent
-// permits and exceed the 50 ms interactive-latency contract. Both clocks are
-// deliberately 15 ms, while the one-shot callback and presentation permits
-// below still prevent an unbounded client-driven loop.
+// Phase-lock callbacks to the 15 ms DVM presentation clock; a 16/15 ms beat
+// can miss adjacent permits and violate the 50 ms latency contract.
 const WAYLAND_FRAME_CALLBACK_INTERVAL: Duration = Duration::from_millis(15);
 const PARTIAL_RENDER_BUDGET: Duration = Duration::from_millis(8);
 const DISPLAY_BACKPRESSURE_RETRY_DELAY: Duration = Duration::from_millis(1);
@@ -273,6 +269,9 @@ fn present_drawable_update(
             return Ok(PresentUpdateResult::Rendered {
                 deferred_update: VisualUpdate::default(),
             });
+        }
+        Ok(false) if !state.gpu_admits_cpu_present() => {
+            return Ok(PresentUpdateResult::Backpressured)
         }
         Ok(false) => {}
         Err(crate::sys::EAGAIN) => return Ok(PresentUpdateResult::Backpressured),
@@ -786,6 +785,36 @@ fn run() -> Result<(), i32> {
     let mut pending_update = VisualUpdate::default();
     let mut presented_cursor_x = state.cursor_x;
     let mut presented_cursor_y = state.cursor_y;
+    // Establish the compositor's persistent epoll interests before opening
+    // the runtime catalog.  Application autostart can legitimately drive a
+    // large executable snapshot through vfsd as soon as the runtime client is
+    // visible; placing the control mutation behind that bulk request creates
+    // head-of-line blocking on vfsd's single mutation owner and can expire the
+    // bounded interactive-control deadline.  Wayland readiness is a required
+    // product capability, so publish it first and fail closed if its listener
+    // or either readiness worker cannot be admitted.
+    diag_line("uiserver: wayland initialize begin");
+    let wayland_init_started = Instant::now();
+    let mut wayland = WaylandCompositor::initialize(
+        state.display.width,
+        state.display.height,
+        input_events.wake_sender(),
+    )
+    .ok_or_else(|| {
+        diag_line("uiserver: mandatory Wayland compositor initialization failed");
+        libc::EIO
+    })?;
+    wayland
+        .attach_readiness_waker(input_events.wake_sender())
+        .map_err(|err| {
+            diag_line(format!(
+                "uiserver: Wayland readiness waiter initialization failed: {err}"
+            ));
+            libc::EIO
+        })?;
+    diag_line("uiserver: wayland initialize done");
+    log_boot_stage(wayland_init_started, "wayland_initialize");
+
     diag_line("uiserver: runtime client open begin");
     let runtime_open_started = Instant::now();
     let mut runtime_state = RuntimeState::default();
@@ -801,25 +830,6 @@ fn run() -> Result<(), i32> {
             diag_line("uiserver: open runtimed sync socket failed");
             19
         })?;
-    diag_line("uiserver: wayland initialize begin");
-    let wayland_init_started = Instant::now();
-    let mut wayland = WaylandCompositor::initialize(
-        state.display.width,
-        state.display.height,
-        input_events.wake_sender(),
-    );
-    if let Some(compositor) = wayland.as_mut() {
-        compositor
-            .attach_readiness_waker(input_events.wake_sender())
-            .map_err(|err| {
-                diag_line(format!(
-                    "uiserver: Wayland readiness waiter initialization failed: {err}"
-                ));
-                libc::EIO
-            })?;
-    }
-    diag_line("uiserver: wayland initialize done");
-    log_boot_stage(wayland_init_started, "wayland_initialize");
     sys::mark_display_policy_ready();
     match runtime.notify_ui_ready() {
         Ok(()) => diag_line("uiserver: ui ready notified"),
@@ -896,7 +906,7 @@ fn run() -> Result<(), i32> {
             "input",
             input_loop::process_pending_input(
                 &mut state,
-                wayland.as_mut(),
+                Some(&mut wayland),
                 &runtime,
                 &input_events,
             ),
@@ -929,47 +939,45 @@ fn run() -> Result<(), i32> {
         let now = wayland_started;
         let service_wayland = !input.backlog_remaining || now >= next_wayland_backlog_service;
         watchdog.enter(UI_PHASE_WAYLAND);
-        if let Some(compositor) = wayland.as_mut() {
-            let callback_due = wayland_callback_pending
-                && (wayland_frame_permit || now >= next_wayland_callback_pulse);
-            let protocol_input = compositor.has_pending_protocol_input();
-            if service_wayland
-                && wayland_service_required(protocol_input, input.input_events, callback_due)
-            {
-                let wayland_changed = compositor.tick();
-                compositor.rearm_readiness();
-                if wayland_changed {
-                    let wayland_dirty = state.sync_wayland_windows(compositor.window_snapshots());
-                    compositor.clear_window_damage();
-                    let focus_dirty = phase_result(
-                        "wayland-focus",
-                        state.recover_focus_after_wayland_change(Some(compositor)),
-                    )?;
-                    let mut update = VisualUpdate::partial(wayland_dirty);
-                    update.add_partial_rect(focus_dirty);
-                    pending_update.absorb(update);
-                }
-                let frame_callback_rect = compositor.pending_frame_callback_rect();
-                wayland_callback_pending = !frame_callback_rect.is_empty();
-                let callback_only = pending_update.is_empty() && !frame_callback_rect.is_empty();
-                if callback_only {
-                    log_wayland_callback_only(&state, frame_callback_rect);
-                }
-                let callback_now = Instant::now();
-                let callback_only_cadence_permit =
-                    callback_only && callback_now >= next_wayland_callback_pulse;
-                if !frame_callback_rect.is_empty()
-                    && (wayland_frame_permit || callback_only_cadence_permit)
-                {
-                    compositor.consume_frame_callback_permit();
-                    wayland_callback_pending = false;
-                    wayland_frame_permit = false;
-                    next_wayland_callback_pulse = callback_now + WAYLAND_FRAME_CALLBACK_INTERVAL;
-                }
-                next_wayland_backlog_service = now + WAYLAND_BACKLOG_SERVICE_INTERVAL;
-            } else if input.backlog_remaining {
-                compositor.flush_clients();
+        let callback_due = wayland_callback_pending
+            && (wayland_frame_permit || now >= next_wayland_callback_pulse);
+        let protocol_input = wayland.has_pending_protocol_input();
+        if service_wayland
+            && wayland_service_required(protocol_input, input.input_events, callback_due)
+        {
+            let wayland_changed = wayland.tick();
+            wayland.rearm_readiness();
+            if wayland_changed {
+                let wayland_dirty = state.sync_wayland_windows(wayland.window_snapshots());
+                wayland.clear_window_damage();
+                let focus_dirty = phase_result(
+                    "wayland-focus",
+                    state.recover_focus_after_wayland_change(Some(&mut wayland)),
+                )?;
+                let mut update = VisualUpdate::partial(wayland_dirty);
+                update.add_partial_rect(focus_dirty);
+                pending_update.absorb(update);
             }
+            let frame_callback_rect = wayland.pending_frame_callback_rect();
+            wayland_callback_pending = !frame_callback_rect.is_empty();
+            let callback_only = pending_update.is_empty() && !frame_callback_rect.is_empty();
+            if callback_only {
+                log_wayland_callback_only(&state, frame_callback_rect);
+            }
+            let callback_now = Instant::now();
+            let callback_only_cadence_permit =
+                callback_only && callback_now >= next_wayland_callback_pulse;
+            if !frame_callback_rect.is_empty()
+                && (wayland_frame_permit || callback_only_cadence_permit)
+            {
+                wayland.consume_frame_callback_permit();
+                wayland_callback_pending = false;
+                wayland_frame_permit = false;
+                next_wayland_callback_pulse = callback_now + WAYLAND_FRAME_CALLBACK_INTERVAL;
+            }
+            next_wayland_backlog_service = now + WAYLAND_BACKLOG_SERVICE_INTERVAL;
+        } else if input.backlog_remaining {
+            wayland.flush_clients();
         }
         watchdog.leave();
         phase_timings.wayland = wayland_started.elapsed();

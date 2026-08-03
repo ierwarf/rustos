@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use runtime_control::RuntimeClient;
 
@@ -24,6 +24,9 @@ const INPUT_READER_WATCHDOG_INTERVAL: std::time::Duration = std::time::Duration:
 const INPUT_READER_PANIC_THRESHOLD_MS: u64 = 3_000;
 const MAX_INITIAL_INPUT_DROP_LOGS: u64 = 8;
 const MAX_WAYLAND_POINTER_FLUSH_EVENTS: u64 = 16;
+const INPUT_WAITSET_RETRY_BACKOFF: Duration = Duration::from_millis(10);
+const INPUT_WAITSET_STARTUP_BUDGET: Duration =
+    Duration::from_millis(rustos_user_abi::performance::IPC_BOOT_CONTROL_HARD_LIMIT_MS);
 
 pub(crate) struct InputReader {
     receiver: Receiver<InputEvent>,
@@ -204,7 +207,7 @@ impl InputReaderStats {
     }
 }
 
-fn create_input_wait_epoll(input_fds: &[OwnedFd]) -> Result<OwnedFd, i32> {
+fn create_input_wait_epoll_once(input_fds: &[OwnedFd]) -> Result<OwnedFd, i32> {
     if input_fds.is_empty() {
         return Err(libc::ENODEV);
     }
@@ -235,6 +238,28 @@ fn create_input_wait_epoll(input_fds: &[OwnedFd]) -> Result<OwnedFd, i32> {
         }
     }
     Ok(epoll)
+}
+
+fn retryable_input_waitset_error(errno: i32) -> bool {
+    matches!(errno, libc::ETIMEDOUT | libc::EAGAIN | libc::EINTR)
+}
+
+fn create_input_wait_epoll(input_fds: &[OwnedFd]) -> Result<OwnedFd, i32> {
+    let deadline = Instant::now() + INPUT_WAITSET_STARTUP_BUDGET;
+    loop {
+        match create_input_wait_epoll_once(input_fds) {
+            Ok(epoll) => return Ok(epoll),
+            Err(errno) if retryable_input_waitset_error(errno) && Instant::now() < deadline => {
+                // Each persistent mutation retains its independent 100 ms
+                // reconciliation rail in compat. Boot owns a larger bounded
+                // recovery window so a single-threaded userspace server that
+                // is completing an earlier request cannot turn transient head-
+                // of-line delay into permanent loss of the display service.
+                thread::sleep(INPUT_WAITSET_RETRY_BACKOFF);
+            }
+            Err(errno) => return Err(errno),
+        }
+    }
 }
 
 pub(crate) fn start_input_reader(input_fds: Vec<OwnedFd>) -> Result<InputReader, i32> {
@@ -713,6 +738,20 @@ mod tests {
     use std::sync::{mpsc, Arc};
     use std::thread;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn input_waitset_startup_retries_only_transient_control_failures() {
+        assert!(super::retryable_input_waitset_error(libc::ETIMEDOUT));
+        assert!(super::retryable_input_waitset_error(libc::EAGAIN));
+        assert!(super::retryable_input_waitset_error(libc::EINTR));
+        assert!(!super::retryable_input_waitset_error(libc::EINVAL));
+        assert!(!super::retryable_input_waitset_error(libc::ENODEV));
+        assert_eq!(
+            super::INPUT_WAITSET_STARTUP_BUDGET,
+            Duration::from_millis(rustos_user_abi::performance::IPC_BOOT_CONTROL_HARD_LIMIT_MS)
+        );
+        assert!(super::INPUT_WAITSET_RETRY_BACKOFF < super::INPUT_WAITSET_STARTUP_BUDGET);
+    }
 
     fn event(kind: u16, value0: i32, value1: i32) -> InputEvent {
         InputEvent {

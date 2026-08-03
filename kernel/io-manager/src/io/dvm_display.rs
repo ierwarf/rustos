@@ -118,6 +118,9 @@ static GPU_PRIME_DURATION_NS: AtomicU64 = AtomicU64::new(0);
 static GPU_SUBMIT_FLAGS: AtomicU32 = AtomicU32::new(0);
 static GPU_SESSION_SUBMISSIONS: AtomicU64 = AtomicU64::new(0);
 static GPU_SUBMIT_LOCK: AtomicBool = AtomicBool::new(false);
+static GPU_LIFECYCLE: crate::transport_lifecycle::TransportLifecycle =
+    crate::transport_lifecycle::TransportLifecycle::detached();
+static GPU_EPOCH_RESET_PENDING: AtomicBool = AtomicBool::new(false);
 static GPU_SLOT_STATE: [AtomicU8; DVM_GPU_RENDER_MAX_IN_FLIGHT as usize] = [
     AtomicU8::new(GPU_SLOT_FREE),
     AtomicU8::new(GPU_SLOT_FREE),
@@ -362,6 +365,10 @@ fn try_install_serialized() -> bool {
         DVM_GPU_ATLAS_PRIME_COMPLETION_OFFSET,
         &[0; DVM_GPU_PRIME_COMPLETION_BYTES],
     );
+    assert!(
+        GPU_LIFECYCLE.activate(u64::from(GPU_INITIAL_CONTEXT_EPOCH)),
+        "gui-dvm lifecycle activation failed during install"
+    );
     INSTALLED.store(true, Ordering::Release);
     interrupt_install.retain_permanent();
     crate::debug::info!(
@@ -489,6 +496,7 @@ pub(crate) fn try_submit_gpu_atlas(
     damage: &[DvmGpuAtlasDamage],
     batch: &[u8],
 ) -> DvmGpuSubmitOutcome {
+    service_gpu_epoch_reset();
     if !INSTALLED.load(Ordering::Acquire) || TRANSPORT_REVOKED.load(Ordering::Acquire) {
         return DvmGpuSubmitOutcome::Unavailable;
     }
@@ -499,6 +507,12 @@ pub(crate) fn try_submit_gpu_atlas(
     if !GUI_DVM_PEER_READY.load(Ordering::Acquire) {
         return DvmGpuSubmitOutcome::Backpressured;
     }
+    // ORDERING: Acquire selects the installed context epoch before claiming
+    // any shared slot; the claim recheck closes concurrent drain/reset.
+    let expected_epoch = u64::from(GPU_CONTEXT_EPOCH.load(Ordering::Acquire));
+    let Some(lifecycle_claim) = GPU_LIFECYCLE.try_claim(expected_epoch) else {
+        return DvmGpuSubmitOutcome::Unavailable;
+    };
     let Some(_submit_guard) = GpuSubmitGuard::try_acquire() else {
         return DvmGpuSubmitOutcome::Backpressured;
     };
@@ -588,7 +602,22 @@ pub(crate) fn try_submit_gpu_atlas(
     GPU_SLOT_CONTEXT_ID[slot].store(header.context_id, Ordering::Release);
     GPU_SLOT_CONTEXT_EPOCH[slot].store(header.context_epoch, Ordering::Release);
     GPU_SLOT_SUBMIT_VALUE[slot].store(header.submit_value, Ordering::Release);
-    GPU_SLOT_STATE[slot].store(GPU_SLOT_SUBMITTED, Ordering::Release);
+    // ORDERING: the AcqRel CAS is the final slot publication and follows all
+    // payload/context Release stores under the still-live epoch claim.
+    if !lifecycle_claim.validate_current()
+        || lifecycle_claim.epoch() != u64::from(header.context_epoch)
+        || GPU_SLOT_STATE[slot]
+            .compare_exchange(
+                GPU_SLOT_WRITING,
+                GPU_SLOT_SUBMITTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+    {
+        GPU_SLOT_STATE[slot].store(GPU_SLOT_FREE, Ordering::Release);
+        return DvmGpuSubmitOutcome::Unavailable;
+    }
     let Some(invitation_offset) = dvm_gpu_atlas_invitation_offset(binding_slot) else {
         GPU_SLOT_STATE[slot].store(GPU_SLOT_FREE, Ordering::Release);
         return DvmGpuSubmitOutcome::Invalid;
@@ -604,6 +633,7 @@ pub(crate) fn query_gpu_atlas_completion(
     binding_slot: u32,
     result: &mut [u8; driver_domain_protocol::DVM_GPU_ATLAS_COMPLETION_SLOT_BYTES],
 ) -> DvmGpuCompletionOutcome {
+    service_gpu_epoch_reset();
     if !INSTALLED.load(Ordering::Acquire) || TRANSPORT_REVOKED.load(Ordering::Acquire) {
         return DvmGpuCompletionOutcome::Unavailable;
     }
@@ -611,6 +641,12 @@ pub(crate) fn query_gpu_atlas_completion(
     if TRANSPORT_REVOKED.load(Ordering::Acquire) {
         return DvmGpuCompletionOutcome::Unavailable;
     }
+    // ORDERING: Acquire binds completion inspection to the active epoch before
+    // any shared completion bytes are accepted.
+    let expected_epoch = u64::from(GPU_CONTEXT_EPOCH.load(Ordering::Acquire));
+    let Some(lifecycle_claim) = GPU_LIFECYCLE.try_claim(expected_epoch) else {
+        return DvmGpuCompletionOutcome::Unavailable;
+    };
     let slot = binding_slot as usize;
     if slot >= GPU_SLOT_STATE.len() {
         return DvmGpuCompletionOutcome::Invalid;
@@ -653,6 +689,14 @@ pub(crate) fn query_gpu_atlas_completion(
     {
         let control_sequence = GUI_DVM_ACKED_CONTROL_SEQUENCE.load(Ordering::Acquire);
         revoke_transport("gpu-completion-capability-mismatch", control_sequence);
+        return DvmGpuCompletionOutcome::Unavailable;
+    }
+    // ORDERING: Acquire rechecks the slot's context epoch after shared record
+    // validation and before completion acknowledgement.
+    if !lifecycle_claim.validate_current()
+        || lifecycle_claim.epoch()
+            != u64::from(GPU_SLOT_CONTEXT_EPOCH[slot].load(Ordering::Acquire))
+    {
         return DvmGpuCompletionOutcome::Unavailable;
     }
     let Some(ack_offset) = dvm_gpu_atlas_completion_ack_offset(binding_slot) else {
@@ -1132,12 +1176,15 @@ fn damage_bounds(
 /// current single-domain input broker has no multi-domain focus authority.
 fn drain_dvm_control() {
     if GUI_DVM_OFFLINE_IRQ_PENDING.swap(false, Ordering::AcqRel) {
+        GPU_LIFECYCLE.request_drain();
+        // ORDERING: drain closes new claims before Release publishes pending
+        // reset and peer-unready state.
+        GPU_EPOCH_RESET_PENDING.store(true, Ordering::Release);
         GUI_DVM_PEER_READY.store(false, Ordering::Release);
         GUI_DVM_EXPECTED_INVITATION.store(0, Ordering::Release);
         GPU_PRIME_DURATION_NS.store(0, Ordering::Release);
         GPU_SUBMIT_FLAGS.store(0, Ordering::Release);
         GPU_SESSION_SUBMISSIONS.store(0, Ordering::Release);
-        reset_gpu_slots();
         // A future relay must not mistake an old confirmation for approval of
         // a reused generation after DVM restart.
         write_u64(DVM_GUI_SURFACE_POOL_READY_CONFIRMATION_OFFSET, 0);
@@ -1145,25 +1192,9 @@ fn drain_dvm_control() {
             DVM_GPU_ATLAS_PRIME_COMPLETION_OFFSET,
             &[0; DVM_GPU_PRIME_COMPLETION_BYTES],
         );
-        let next_epoch = GPU_CONTEXT_EPOCH.load(Ordering::Acquire).checked_add(1);
-        let Some(next_epoch) = next_epoch else {
-            revoke_transport("gpu-context-epoch-exhausted", 0);
+        if !service_gpu_epoch_reset() {
             return;
-        };
-        GPU_CONTEXT_EPOCH.store(next_epoch, Ordering::Release);
-        write_u32(DVM_GPU_ATLAS_CONTEXT_EPOCH_OFFSET, next_epoch);
-        nucleus_core::debug::write_debugcon_only_line(
-            alloc::format!(
-                "gui-dvm: peer offline lease revoked context_epoch={}",
-                next_epoch
-            )
-            .as_bytes(),
-        );
-        // Recovery must not depend on unrelated cursor or client damage.
-        // Re-advertise the newest complete front immediately after revocation
-        // so a replacement DVM can prime the new context while the desktop is
-        // otherwise idle.
-        reinvite_newest_ready_slot();
+        }
     }
     if !GUI_DVM_CONTROL_IRQ_PENDING.swap(false, Ordering::AcqRel) {
         return;
@@ -1227,17 +1258,73 @@ fn drain_dvm_control() {
 }
 
 fn revoke_transport(reason: &str, sequence: u64) {
+    // ORDERING: Release revocation becomes visible before drain/reset work and
+    // every peer-ready or acknowledgement field is cleared.
     TRANSPORT_REVOKED.store(true, Ordering::Release);
+    GPU_LIFECYCLE.request_drain();
+    GPU_EPOCH_RESET_PENDING.store(true, Ordering::Release);
     GPU_SUBMIT_FLAGS.store(0, Ordering::Release);
     GUI_DVM_PEER_READY.store(false, Ordering::Release);
     GUI_DVM_EXPECTED_INVITATION.store(0, Ordering::Release);
     GUI_DVM_ACKED_CONTROL_SEQUENCE.store(sequence, Ordering::Release);
     write_u64(DVM_GUI_SURFACE_POOL_HOST_ACK_OFFSET, sequence);
-    reset_gpu_slots();
+    let _ = service_gpu_epoch_reset();
     crate::debug::warn!(display, "gui-dvm: transport revoked reason={}", reason);
 }
 
+fn service_gpu_epoch_reset() -> bool {
+    // ORDERING: Acquire observes the complete drain request before trying the
+    // zero-claim transition and resetting slot storage.
+    if !GPU_EPOCH_RESET_PENDING.load(Ordering::Acquire) {
+        return true;
+    }
+    let Some(retired_epoch) = GPU_LIFECYCLE.finish_drain() else {
+        return false;
+    };
+    reset_gpu_slots();
+    let Some(next_epoch) = retired_epoch
+        .checked_add(1)
+        .and_then(|epoch| u32::try_from(epoch).ok())
+        .filter(|epoch| *epoch != 0)
+    else {
+        // ORDERING: epoch exhaustion publishes permanent revoke before clearing
+        // the one-shot reset work item.
+        TRANSPORT_REVOKED.store(true, Ordering::Release);
+        GPU_EPOCH_RESET_PENDING.store(false, Ordering::Release);
+        return false;
+    };
+    // ORDERING: Release publishes the new epoch before shared invitation and
+    // reset-complete publication can make the replacement usable.
+    GPU_CONTEXT_EPOCH.store(next_epoch, Ordering::Release);
+    write_u32(DVM_GPU_ATLAS_CONTEXT_EPOCH_OFFSET, next_epoch);
+    GPU_EPOCH_RESET_PENDING.store(false, Ordering::Release);
+    // ORDERING: Acquire prevents reactivation after a concurrent permanent
+    // revoke publication.
+    if TRANSPORT_REVOKED.load(Ordering::Acquire) {
+        return true;
+    }
+    assert!(
+        GPU_LIFECYCLE.activate(u64::from(next_epoch)),
+        "gui-dvm lifecycle failed to activate replacement epoch"
+    );
+    nucleus_core::debug::write_debugcon_only_line(
+        alloc::format!(
+            "gui-dvm: peer offline lease revoked context_epoch={}",
+            next_epoch
+        )
+        .as_bytes(),
+    );
+    // Recovery must not depend on unrelated cursor or client damage.
+    reinvite_newest_ready_slot();
+    true
+}
+
 fn reset_gpu_slots() {
+    assert_eq!(
+        GPU_LIFECYCLE.in_flight(),
+        0,
+        "gui-dvm reset attempted with in-flight transport claims"
+    );
     for slot in 0..GPU_SLOT_STATE.len() {
         GPU_SLOT_GENERATION[slot].store(0, Ordering::Release);
         GPU_SLOT_SEQUENCE[slot].store(0, Ordering::Release);

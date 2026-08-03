@@ -17,10 +17,16 @@ use std::time::Duration;
 use rustos_user_abi::syscall::{InputIngressWire, NETD_DVM_SESSION_GRANT, NETD_DVM_SESSION_REVOKE};
 
 use super::dvm_protocol::DvmOutcome;
-use super::{SharedInputQueue, apply_dvm_ingress_wire, lock_input_queue_for_ingestion};
+use super::{apply_dvm_ingress_wire, lock_input_queue_for_ingestion, SharedInputQueue};
 
 pub(super) const RETRY_BACKOFF: Duration = Duration::from_millis(10);
 pub(super) const TIMEOUT: Duration = Duration::from_secs(5);
+/// A grant/revoke changes authenticated cross-service policy and can enter the
+/// net packet broker. It is not a non-consuming readiness query, so each
+/// attempt owns the interactive control budget while the retained batch keeps
+/// the aggregate fail-closed deadline bounded by [`TIMEOUT`].
+pub(super) const CALL_DEADLINE_MS: u64 =
+    rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS;
 
 pub(super) fn apply(
     queue: &SharedInputQueue,
@@ -73,13 +79,13 @@ mod tests {
     use std::time::Duration;
 
     use rustos_user_abi::syscall::{
-        INPUTD_ACCESS_NATIVE, INPUTD_INGRESS_FLAG_DVM_SOURCE, INPUTD_INGRESS_KIND_POINTER_PACKET,
-        InputIngressWire, InputPointerPacketWire, NETD_DVM_SESSION_GRANT,
+        InputIngressWire, InputPointerPacketWire, INPUTD_ACCESS_NATIVE,
+        INPUTD_INGRESS_FLAG_DVM_SOURCE, INPUTD_INGRESS_KIND_POINTER_PACKET, NETD_DVM_SESSION_GRANT,
     };
 
-    use super::{RETRY_BACKOFF, TIMEOUT, apply};
+    use super::{apply, CALL_DEADLINE_MS, RETRY_BACKOFF, TIMEOUT};
     use crate::dvm_protocol::DvmOutcome;
-    use crate::{SharedInputQueueState, lock_input_queue, lock_input_queue_for_ingestion};
+    use crate::{lock_input_queue, lock_input_queue_for_ingestion, SharedInputQueueState};
 
     fn pointer_motion(dx: i32, dy: i32) -> input_evdev::InputEvent {
         input_evdev::InputEvent {
@@ -191,6 +197,12 @@ mod tests {
     fn session_authority_retry_deadline_is_bounded() {
         assert_eq!(RETRY_BACKOFF, Duration::from_millis(10));
         assert_eq!(TIMEOUT, Duration::from_secs(5));
+        assert_eq!(
+            CALL_DEADLINE_MS,
+            rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS
+        );
+        assert!(CALL_DEADLINE_MS > rustos_user_abi::performance::IPC_READINESS_QUERY_HARD_LIMIT_MS);
+        assert!(Duration::from_millis(CALL_DEADLINE_MS) < TIMEOUT);
         assert!(RETRY_BACKOFF < TIMEOUT);
     }
 }

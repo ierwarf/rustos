@@ -36,9 +36,8 @@ static CPU_FIRST_USER_DISPATCH_RECORDED: [AtomicBool;
 static CPU_FIRST_RESCHEDULE_IPI_RECORDED: [AtomicBool;
     nucleus_core::util::lockdep::MAX_TRACKED_CPUS] =
     [const { AtomicBool::new(false) }; nucleus_core::util::lockdep::MAX_TRACKED_CPUS];
-/// A request published while a raw scheduler owner disables preemption still
-/// needs a durable remote notification after that owner releases the lock.
-static RESCHEDULE_FANOUT_PENDING: AtomicBool = AtomicBool::new(false);
+#[cfg(not(test))]
+static TARGET_RESCHEDULE_IPI_PENDING: AtomicU64 = AtomicU64::new(0);
 
 pub fn timer_interrupt_handler_addr() -> u64 {
     crate::lowlevel::interrupts::timer_interrupt_handler_addr()
@@ -73,9 +72,31 @@ fn user_return_reschedule_flag(logical_index: usize) -> &'static AtomicU64 {
         .expect("scheduler invariant: user-return CPU index out of range")
 }
 
+fn cpu_lifecycle_generation(logical_index: usize) -> u64 {
+    #[cfg(test)]
+    {
+        assert!(logical_index < nucleus_core::util::lockdep::MAX_TRACKED_CPUS);
+        return 1;
+    }
+    #[cfg(not(test))]
+    {
+        let logical_index = u8::try_from(logical_index)
+            .expect("scheduler invariant: logical CPU index exceeds lifecycle identity");
+        cpu::lifecycle_snapshot(logical_index)
+            .filter(|snapshot| snapshot.state == cpu::CpuLifecycleState::Online)
+            .map(|snapshot| snapshot.generation)
+            .expect("scheduler invariant: reschedule target is not Online")
+    }
+}
+
 fn set_local_deferred_reschedule() {
+    let logical_index = current_cpu_index();
+    super::reschedule_observation::publish_request(
+        logical_index,
+        cpu_lifecycle_generation(logical_index),
+    );
     // ORDERING: Release publishes the request to this CPU's next safe point.
-    deferred_reschedule_flag(current_cpu_index()).store(1, Ordering::Release);
+    deferred_reschedule_flag(logical_index).store(1, Ordering::Release);
 }
 
 fn arm_remote_reschedule(flag: &AtomicU64) -> bool {
@@ -85,15 +106,70 @@ fn arm_remote_reschedule(flag: &AtomicU64) -> bool {
         .is_ok()
 }
 
-fn publish_deferred_reschedule(local_request: &AtomicU64, fanout_pending: &AtomicBool) {
-    // ORDERING: the local Release makes the scheduling work durable before
-    // the fan-out Release transfers notification custody to the unlock path.
+fn publish_local_reschedule(local_request: &AtomicU64) {
+    // ORDERING: Release makes the scheduling work durable for this CPU's next
+    // safe point. Ordinary local work never creates remote notification
+    // authority; only an exact target owner may do that.
     local_request.store(1, Ordering::Release);
-    fanout_pending.store(true, Ordering::Release);
 }
 
-const fn reschedule_notification_required(target: usize, current: usize) -> bool {
+const fn remote_notification_required(target: usize, current: usize) -> bool {
     target != current
+}
+
+const fn periodic_user_continuation_is_local(
+    interrupted_user_frame: bool,
+    runqueue_work_pending: bool,
+    deferred_reschedule_pending: bool,
+    user_return_reschedule_pending: bool,
+) -> bool {
+    interrupted_user_frame
+        && !runqueue_work_pending
+        && !deferred_reschedule_pending
+        && !user_return_reschedule_pending
+}
+
+const fn periodic_idle_continuation_is_local(
+    interrupted_kernel_frame: bool,
+    current_task_is_idle: bool,
+    local_work_pending: bool,
+    foreign_work_pending: bool,
+    deferred_reschedule_pending: bool,
+    user_return_reschedule_pending: bool,
+) -> bool {
+    interrupted_kernel_frame
+        && current_task_is_idle
+        && !local_work_pending
+        && !foreign_work_pending
+        && !deferred_reschedule_pending
+        && !user_return_reschedule_pending
+}
+
+fn retain_periodic_continuation(logical_index: usize, context_ptr: *const SavedContext) -> bool {
+    // SAFETY: the interrupt stub supplies one complete frame for the duration
+    // of this IRQ dispatch. Reading CS does not consume or mutate continuation
+    // ownership.
+    let interrupted_user_frame =
+        unsafe { &*context_ptr }.cs == crate::arch::gdt::user_code_selector().0 as u64;
+    let interrupted_kernel_frame = !interrupted_user_frame;
+    let local_work_pending = super::scheduler::local_dispatch_work_pending(logical_index);
+    let deferred_reschedule_pending =
+        deferred_reschedule_flag(logical_index).load(Ordering::Acquire) != 0;
+    let user_return_reschedule_pending =
+        user_return_reschedule_flag(logical_index).load(Ordering::Acquire) != 0;
+    periodic_user_continuation_is_local(
+        interrupted_user_frame,
+        local_work_pending,
+        deferred_reschedule_pending,
+        user_return_reschedule_pending,
+    ) || periodic_idle_continuation_is_local(
+        interrupted_kernel_frame,
+        super::cpu_local::current_cpu_task_is_idle(logical_index),
+        local_work_pending,
+        super::scheduler::foreign_runnable_work_pending(logical_index),
+        deferred_reschedule_pending,
+        user_return_reschedule_pending,
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -160,6 +236,16 @@ extern "C" fn timer_interrupt_dispatch(context_ptr: *mut SavedContext) -> *mut S
         complete_clockevent(logical_index);
         return context_ptr;
     }
+    // The common steady-state case on an otherwise idle CPU has exactly one
+    // running user task and no queued or remotely published work. A periodic
+    // clockevent cannot change that decision. Keep the CPU-local continuation
+    // without bouncing the lifecycle-global scheduler cache line; a local
+    // enqueue, remote mailbox edge, affinity/retirement request, or syscall-tail
+    // request disables this fast path before the next selection point.
+    if retain_periodic_continuation(logical_index, context_ptr) {
+        complete_clockevent(logical_index);
+        return context_ptr;
+    }
     // A task may have published its blocked/retired state immediately before
     // completing a bounded raw-lock transaction. That state alone must not
     // authorize the timer path to switch stacks while the preemption guard is
@@ -169,15 +255,21 @@ extern "C" fn timer_interrupt_dispatch(context_ptr: *mut SavedContext) -> *mut S
     // SAFETY: the interrupt stub supplied a complete CPU-local frame, IRQ
     // exclusion prevents same-CPU nested scheduling, and the scheduler lock
     // serializes all cross-CPU task-state mutation.
-    let (next_rsp, user_dispatch, runtime_profile) = unsafe {
+    let (next_rsp, user_dispatch, runtime_profile, reschedule_goal) = unsafe {
         let mut scheduler = scheduler_mut();
         if timer_interrupted_kernel_frame(context_ptr, &scheduler) {
             complete_clockevent(logical_index);
             return context_ptr;
         }
-        // A real user-frame clockevent consumes any request not already
-        // serviced by the IF-enabled common syscall tail.
+        // A user-frame clockevent is itself a generation-bound scheduling
+        // request. Publish it before clearing coalesced deferred work so every
+        // Online CPU can prove that an actual request, rather than merely an
+        // interrupt arrival, reached a scheduler safe point.
         let logical_index = current_cpu_index();
+        let reschedule_goal = super::reschedule_observation::publish_request(
+            logical_index,
+            cpu_lifecycle_generation(logical_index),
+        );
         // ORDERING: Release completes same-CPU request consumption before the
         // selected continuation is restored.
         user_return_reschedule_flag(logical_index).store(0, Ordering::Release);
@@ -199,10 +291,16 @@ extern "C" fn timer_interrupt_dispatch(context_ptr: *mut SavedContext) -> *mut S
             dispatch.next_rsp,
             scheduler.current_task_is_user_task(),
             runtime_profile,
+            reschedule_goal,
         )
     };
 
     super::scheduler::publish_scheduler_runtime_profile(runtime_profile);
+    super::reschedule_observation::record_consumption(
+        logical_index,
+        reschedule_goal,
+        super::reschedule_observation::RescheduleRoute::Timer,
+    );
     record_first_user_dispatch(logical_index, user_dispatch);
     record_atomic_activation_dispatch(logical_index);
     record_first_ap_work_dispatch(logical_index);
@@ -270,6 +368,11 @@ extern "C" fn rtc_interrupt_dispatch(context_ptr: *mut SavedContext) -> *mut Sav
         return context_ptr;
     }
 
+    if retain_periodic_continuation(current_cpu_index(), context_ptr) {
+        crate::arch::pic::send_eoi(crate::arch::pic::PIC_2_OFFSET);
+        return context_ptr;
+    }
+
     // Drain sleeper wakeups BEFORE the scheduler pick so newly-ready tasks
     // are visible to `dispatch_schedule`. The previous ordering ran the pick
     // first, then woke sleepers — so a sleeper whose target tick had just
@@ -287,11 +390,13 @@ extern "C" fn rtc_interrupt_dispatch(context_ptr: *mut SavedContext) -> *mut Sav
         return context_ptr;
     }
 
+    let logical_index = current_cpu_index();
+    let reschedule_goal = super::reschedule_observation::request_goal(logical_index);
     let (next_rsp, user_dispatch, runtime_profile) = unsafe {
         let mut scheduler = scheduler_mut();
         // ORDERING: Release completes same-CPU request consumption before the
         // selected continuation is restored.
-        deferred_reschedule_flag(current_cpu_index()).store(0, Ordering::Release);
+        deferred_reschedule_flag(logical_index).store(0, Ordering::Release);
         scheduler.record_runtime_profile_entry(super::scheduler::SchedulerEntryCause::Rtc);
         scheduler.save_current_simd_state();
         let dispatch = scheduler.on_timer_interrupt(current_rsp);
@@ -306,8 +411,13 @@ extern "C" fn rtc_interrupt_dispatch(context_ptr: *mut SavedContext) -> *mut Sav
     };
 
     super::scheduler::publish_scheduler_runtime_profile(runtime_profile);
-    record_first_user_dispatch(current_cpu_index(), user_dispatch);
-    record_atomic_activation_dispatch(current_cpu_index());
+    super::reschedule_observation::record_consumption(
+        logical_index,
+        reschedule_goal,
+        super::reschedule_observation::RescheduleRoute::Rtc,
+    );
+    record_first_user_dispatch(logical_index, user_dispatch);
+    record_atomic_activation_dispatch(logical_index);
     crate::arch::pic::send_eoi(crate::arch::pic::PIC_2_OFFSET);
     next_rsp as *mut SavedContext
 }
@@ -332,8 +442,15 @@ pub fn reschedule_if_requested() {
         return;
     }
     // ORDERING: AcqRel consumes this CPU's published request exactly once.
-    if deferred_reschedule_flag(current_cpu_index()).swap(0, Ordering::AcqRel) != 0 {
+    let logical_index = current_cpu_index();
+    let goal = super::reschedule_observation::request_goal(logical_index);
+    if deferred_reschedule_flag(logical_index).swap(0, Ordering::AcqRel) != 0 {
         yield_now();
+        super::reschedule_observation::record_consumption(
+            logical_index,
+            goal,
+            super::reschedule_observation::RescheduleRoute::LocalSafePoint,
+        );
     }
 }
 
@@ -353,11 +470,17 @@ pub fn reschedule_deferred_from_interruptible_syscall() {
         return;
     }
     let logical_index = current_cpu_index();
+    let reschedule_goal = super::reschedule_observation::request_goal(logical_index);
     if consume_syscall_tail_reschedule(
         deferred_reschedule_flag(logical_index),
         user_return_reschedule_flag(logical_index),
     ) {
         crate::lowlevel::interrupts::trigger_software_schedule_interruptible();
+        super::reschedule_observation::record_consumption(
+            logical_index,
+            reschedule_goal,
+            super::reschedule_observation::RescheduleRoute::SyscallTail,
+        );
     }
 }
 
@@ -372,79 +495,104 @@ fn consume_syscall_tail_reschedule(
 
 pub(crate) fn request_deferred_reschedule() {
     let source_cpu = current_cpu_index();
-    // ORDERING: The paired Release publications preserve both local work and
-    // remote fan-out authority across an early lock-held return.
-    publish_deferred_reschedule(
-        deferred_reschedule_flag(source_cpu),
-        &RESCHEDULE_FANOUT_PENDING,
+    super::reschedule_observation::publish_request(
+        source_cpu,
+        cpu_lifecycle_generation(source_cpu),
     );
-    #[cfg(not(test))]
-    {
-        // Callers may publish a request while holding the scheduler or another
-        // raw lock. The durable local bit is sufficient; the current/next safe
-        // point will fan it out after the preemption gate opens.
-        if nucleus_core::util::lockdep::preemption_disabled() {
-            return;
-        }
-        if !scheduler_initialized() {
-            return;
-        }
-        flush_deferred_reschedule_fanout();
-    }
+    publish_local_reschedule(deferred_reschedule_flag(source_cpu));
 }
 
-/// Publish target request bits and notification edges after the scheduler raw
-/// lock has actually been released. Multiple flushers are safe: the global
-/// pending bit closes publish-vs-clear, and each target bit coalesces IPIs on
-/// its own 0->1 edge.
-pub(super) fn flush_deferred_reschedule_fanout() {
+/// Publish one scheduling request to the CPU that owns the runnable task.
+///
+/// Remote wake placement has already transferred exact task custody to the
+/// target mailbox before this function is called.  Notification is therefore
+/// a coalesced hint, not ownership: a same-CPU target consumes the durable bit
+/// at its next safe point and a remote target receives exactly one private IPI
+/// on the 0->1 edge.  Ordinary wakeups never broadcast to unrelated CPUs.
+#[cfg(not(test))]
+pub(super) fn request_target_reschedule(target: usize) {
+    assert!(
+        target < nucleus_core::util::lockdep::MAX_TRACKED_CPUS,
+        "scheduler targeted reschedule CPU exceeds capacity"
+    );
+    let snapshot = {
+        let logical_index = u8::try_from(target)
+            .expect("scheduler targeted reschedule CPU exceeds lifecycle identity");
+        cpu::lifecycle_snapshot(logical_index)
+            .filter(|snapshot| snapshot.state == cpu::CpuLifecycleState::Online)
+            .expect("scheduler targeted reschedule CPU is not Online")
+    };
+    let sequence = super::reschedule_observation::publish_request(target, snapshot.generation);
+    if !arm_remote_reschedule(deferred_reschedule_flag(target)) {
+        return;
+    }
+    let source = current_cpu_index();
+    if !remote_notification_required(target, source) {
+        return;
+    }
+    if nucleus_core::util::lockdep::preemption_disabled() {
+        // ORDERING: Release transfers notification custody to the scheduler
+        // unlock safe point. The target request bit and mailbox payload were
+        // both published before this bit becomes visible.
+        TARGET_RESCHEDULE_IPI_PENDING.fetch_or(1_u64 << target, Ordering::Release);
+        return;
+    }
+    send_target_reschedule_ipi(target, snapshot.generation, sequence);
+}
+
+#[cfg(not(test))]
+fn send_target_reschedule_ipi(target: usize, generation: u64, sequence: u64) {
+    let descriptor = cpu::topology()
+        .and_then(|topology| {
+            topology
+                .cpus()
+                .iter()
+                .find(|descriptor| usize::from(descriptor.logical_index) == target)
+                .copied()
+        })
+        .expect("scheduler targeted reschedule CPU has no topology descriptor");
+    super::reschedule_observation::record_notification(target, generation, sequence);
+    crate::arch::msi::send_reschedule_ipi(descriptor.apic_id).unwrap_or_else(|error| {
+        panic!(
+            "scheduler invariant: targeted reschedule IPI to logical CPU {} APIC {} failed: {error:?}",
+            descriptor.logical_index, descriptor.apic_id
+        )
+    });
+}
+
+/// Emit exact target notification edges after the scheduler raw lock has
+/// actually been released. Multiple flushers are safe: each target bit
+/// coalesces IPIs and a racing publication remains for the next safe point.
+pub(super) fn flush_deferred_target_reschedules() {
     #[cfg(not(test))]
     {
         if !scheduler_initialized() {
             return;
         }
-        let Some(topology) = cpu::topology() else {
-            return;
-        };
-        let flusher = current_cpu_index();
-        // ORDERING: AcqRel claims every fan-out epoch published before the
-        // swap while preserving a concurrent publication for the next loop.
-        while RESCHEDULE_FANOUT_PENDING.swap(false, Ordering::AcqRel) {
-            for descriptor in topology.cpus() {
-                let target = usize::from(descriptor.logical_index);
-                let Some(snapshot) = cpu::lifecycle_snapshot(descriptor.logical_index) else {
-                    panic!(
-                        "scheduler invariant: admitted CPU {} has no lifecycle slot",
-                        descriptor.logical_index
-                    );
-                };
-                if snapshot.state != cpu::CpuLifecycleState::Online {
-                    continue;
-                }
-                if !arm_remote_reschedule(deferred_reschedule_flag(target)) {
-                    continue;
-                }
-                // The current CPU now owns a durable local bit and reaches a
-                // safe point on return; xAPIC rejects a fixed self-IPI. Do not
-                // skip publishing that bit when the flusher differs from the
-                // original publisher—skip only the notification write.
-                if !reschedule_notification_required(target, flusher) {
-                    continue;
-                }
-                crate::arch::msi::send_reschedule_ipi(descriptor.apic_id).unwrap_or_else(|error| {
-                    panic!(
-                        "scheduler invariant: reschedule IPI to logical CPU {} APIC {} failed: {error:?}",
-                        descriptor.logical_index, descriptor.apic_id
-                    )
-                });
+        // ORDERING: AcqRel claims every target whose mailbox/request became
+        // durable while a raw scheduler owner disabled preemption. New target
+        // bits racing this swap remain for the next safe point.
+        let targeted = TARGET_RESCHEDULE_IPI_PENDING.swap(0, Ordering::AcqRel);
+        for target in 0..nucleus_core::util::lockdep::MAX_TRACKED_CPUS {
+            if targeted & (1_u64 << target) == 0 {
+                continue;
             }
+            if !remote_notification_required(target, current_cpu_index()) {
+                // The durable local request is enough. xAPIC fixed self-IPIs
+                // are forbidden and the return path is already a safe point.
+                continue;
+            }
+            let logical_index =
+                u8::try_from(target).expect("scheduler deferred target exceeds lifecycle identity");
+            let snapshot = cpu::lifecycle_snapshot(logical_index)
+                .filter(|snapshot| snapshot.state == cpu::CpuLifecycleState::Online)
+                .expect("scheduler deferred target is not Online");
+            send_target_reschedule_ipi(
+                target,
+                snapshot.generation,
+                super::reschedule_observation::request_goal(target),
+            );
         }
-    }
-    #[cfg(test)]
-    {
-        // ORDERING: tests have no APIC delivery; Release still models handing
-        // the claimed epoch back to an empty fan-out state.
-        RESCHEDULE_FANOUT_PENDING.store(false, Ordering::Release);
     }
 }
 
@@ -483,6 +631,7 @@ extern "C" fn reschedule_ipi_interrupt_dispatch(
         0,
         "scheduler invariant: reschedule request disappeared on its target CPU"
     );
+    let reschedule_goal = super::reschedule_observation::request_goal(logical_index);
 
     let current_rsp = context_ptr as usize;
     // SAFETY: the IPI stub supplied a complete CPU-local frame, IRQ exclusion
@@ -508,6 +657,11 @@ extern "C" fn reschedule_ipi_interrupt_dispatch(
         )
     };
     super::scheduler::publish_scheduler_runtime_profile(runtime_profile);
+    super::reschedule_observation::record_consumption(
+        logical_index,
+        reschedule_goal,
+        super::reschedule_observation::RescheduleRoute::RemoteIpi,
+    );
     record_first_user_dispatch(logical_index, user_dispatch);
     record_atomic_activation_dispatch(logical_index);
     record_first_ap_work_dispatch(logical_index);
@@ -532,6 +686,14 @@ extern "C" fn software_schedule_interrupt_dispatch(
     if !scheduler_initialized() {
         return context_ptr;
     }
+    let logical_index = current_cpu_index();
+    // The software interrupt is an explicit local scheduling request. Bind it
+    // to the current CPU lifecycle before entering the serialized scheduler
+    // transaction, then attest consumption after the selected frame is ready.
+    let reschedule_goal = super::reschedule_observation::publish_request(
+        logical_index,
+        cpu_lifecycle_generation(logical_index),
+    );
     let current_rsp = context_ptr as usize;
     let (next_rsp, user_dispatch, runtime_profile) = unsafe {
         let mut scheduler = scheduler_mut();
@@ -552,8 +714,13 @@ extern "C" fn software_schedule_interrupt_dispatch(
     };
 
     super::scheduler::publish_scheduler_runtime_profile(runtime_profile);
-    record_first_user_dispatch(current_cpu_index(), user_dispatch);
-    record_atomic_activation_dispatch(current_cpu_index());
+    super::reschedule_observation::record_consumption(
+        logical_index,
+        reschedule_goal,
+        super::reschedule_observation::RescheduleRoute::LocalSafePoint,
+    );
+    record_first_user_dispatch(logical_index, user_dispatch);
+    record_atomic_activation_dispatch(logical_index);
     next_rsp as *mut SavedContext
 }
 
@@ -653,29 +820,65 @@ pub fn commit_block_current_task_and_yield() -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
-    use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use core::sync::atomic::{AtomicU64, Ordering};
 
     use super::{
         RescheduleIpiGate, arm_remote_reschedule, consume_syscall_tail_reschedule,
-        publish_deferred_reschedule, reschedule_ipi_gate, reschedule_notification_required,
+        periodic_idle_continuation_is_local, periodic_user_continuation_is_local,
+        publish_local_reschedule, remote_notification_required, reschedule_ipi_gate,
     };
 
     #[test]
-    fn lock_held_reschedule_publication_retains_local_and_fanout_work() {
-        let local = AtomicU64::new(0);
-        let fanout = AtomicBool::new(false);
-        publish_deferred_reschedule(&local, &fanout);
-        // ORDERING: Acquire observes both publications exactly as the unlock
-        // flusher does before issuing target notifications.
-        assert_eq!(local.load(Ordering::Acquire), 1);
-        assert!(fanout.load(Ordering::Acquire));
+    fn periodic_tick_stays_local_only_without_any_dispatch_authority() {
+        assert!(periodic_user_continuation_is_local(
+            true, false, false, false
+        ));
+        assert!(!periodic_user_continuation_is_local(
+            false, false, false, false
+        ));
+        assert!(!periodic_user_continuation_is_local(
+            true, true, false, false
+        ));
+        assert!(!periodic_user_continuation_is_local(
+            true, false, true, false
+        ));
+        assert!(!periodic_user_continuation_is_local(
+            true, false, false, true
+        ));
     }
 
     #[test]
-    fn post_unlock_fanout_publishes_self_work_without_sending_self_ipi() {
-        assert!(!reschedule_notification_required(2, 2));
-        assert!(reschedule_notification_required(1, 2));
-        assert!(reschedule_notification_required(3, 2));
+    fn periodic_idle_tick_stays_local_only_without_any_queue_or_request() {
+        assert!(periodic_idle_continuation_is_local(
+            true, true, false, false, false, false
+        ));
+        assert!(!periodic_idle_continuation_is_local(
+            true, true, true, false, false, false
+        ));
+        assert!(!periodic_idle_continuation_is_local(
+            true, true, false, true, false, false
+        ));
+        assert!(!periodic_idle_continuation_is_local(
+            true, false, false, false, false, false
+        ));
+        assert!(!periodic_idle_continuation_is_local(
+            false, true, false, false, false, false
+        ));
+    }
+
+    #[test]
+    fn local_reschedule_publication_never_creates_remote_authority() {
+        let local = AtomicU64::new(0);
+        publish_local_reschedule(&local);
+        // ORDERING: Acquire observes the exact local safe-point request.
+        assert_eq!(local.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn exact_target_notification_rejects_self_ipi() {
+        assert!(!remote_notification_required(2, 2));
+        assert!(remote_notification_required(1, 2));
+        assert!(remote_notification_required(3, 2));
     }
 
     #[test]

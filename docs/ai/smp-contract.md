@@ -163,16 +163,23 @@ acknowledges the APIC but retains the request for a same-CPU syscall, timer, or
 `cond_resched` safe point. CPU hot-remove is prohibited until this exception is
 replaced by an explicit generation token.
 
-A request made while any raw scheduler/preemption owner is held publishes both
-the local request bit and a global fan-out-pending bit before returning. The
-raw scheduler guard releases the physical lock and its preemption unit first,
-then a post-unlock flusher exchanges the global bit and publishes request bits
-to every `Online` CPU. Only each remote target's 0->1 edge sends an IPI; the
-flusher's own bit is consumed at its return safe point because xAPIC fixed
-self-destination is unsupported. The flusher loops until a concurrent
-publisher leaves no pending epoch, and need not be the original publisher.
-Dropping either the local bit, global custody bit, post-unlock fan-out, or the
-self-notification guard is an invariant failure.
+Each CPU also publishes one cache-line-separated lifecycle generation and
+monotonic request/notify/consume sequences. Request publication precedes the
+durable bit; only a remote 0->1 pending edge records notification; a local
+safe point, timer, RTC, syscall tail, or remote IPI records consumption after
+scheduling work. One notification may cover several requests. Acceptance
+requires same-generation `consume_seq >= request_seq_at_stop` and never
+requires a self IPI.
+
+An ordinary reschedule request belongs only to the calling CPU and publishes no
+remote authority. A runnable-task or lifecycle mutation that needs another CPU
+must name the exact runqueue owner and publish that target's durable request
+bit. If the raw scheduler owner currently disables preemption, the exact target
+bit transfers notification custody to the unlock path. The raw scheduler guard
+releases the physical lock and its preemption unit first, then claims only those
+target bits and emits their coalesced remote notifications. A concurrent target
+publication remains pending for the next unlock. Fixed self IPIs and topology-
+wide ordinary reschedule broadcasts are invariant failures.
 
 Handlers are allocation-free, non-blocking, and never acquire a sleepable
 lock. They acknowledge the local APIC exactly once. A sender may wait only
@@ -254,10 +261,31 @@ does not replace shootdown: every page-table mutation still flushes all exact
 generation targets, and AP Online admission still performs its mandatory CR3
 reload to close the parked translation window.
 
-Stealing a task acquires queues in ascending `CpuIndex` order or uses a
-single-owner transfer protocol. Waiting for an IPI while holding either queue
-lock is forbidden. Internal duplicate ownership, invalid queue order, or
-dispatch on an unready CPU panics.
+Idle balancing uses the single-owner transfer protocol. Only an Idle-class CPU
+with no eligible local continuation scans the fixed admitted CPU set; it picks
+one affinity-valid foreign continuation, removes it under the source queue
+owner, publishes it to the target mailbox, and drains that mailbox locally.
+It never holds two runqueue locks and never sends itself an IPI. Ordinary busy
+ticks perform no unbounded foreign scan. Once per staggered eight-tick window,
+a busy source CPU may move at most one affinity-valid queued continuation when
+its published runnable count exceeds a permitted target by more than one. The
+same source-owner CAS and target mailbox perform the transfer without dual-rq
+locking; a directed IPI is sent only for a newly pending remote mailbox. This
+closes the permanently-runnable imbalance that wake placement and idle stealing
+cannot repair. Repeated affinity rehome replaces an older
+mailbox record for the same slot, so stale generations cannot amplify one task
+into finite-capacity exhaustion. Waiting for an IPI while holding either queue
+or mailbox lock is forbidden. Internal duplicate ownership, lost generation,
+invalid queue order, or dispatch on an unready CPU panics.
+
+An empty periodic edge is not itself dispatch authority. After CPU0 has
+serviced the shared deadline registry, both BSP RTC and PIT/LAPIC leaves retain
+the exact current continuation when it is either the sole User task or the
+CPU's published Idle task and there is no local queue/mailbox work, foreign
+runnable load, deferred reschedule, or user-return request. Each checked source
+is independently release/acquire published; a concurrent enqueue still owns a
+directed IPI. This keeps quiescent CPUs off the lifecycle-global catalog lock
+without polling away a real wake or idle-steal opportunity.
 
 ### 7.1 Dispatch, raw-guard, and CPU-affinity linearization
 
@@ -560,9 +588,12 @@ The required mutation/retirement sequence is:
    acknowledge.
 
 Range invalidation may be selected only by a measured threshold. Correctness
-never depends on that threshold. Timeout, stale acknowledgement, generation
-wrap, target disappearance, token reuse, or reclaim-before-ack is an internal
-memory-isolation failure and panics. An address space cannot be destroyed while
+never depends on that threshold. A missing acknowledgement triggers a 100 ms
+diagnostic/resend cadence while the durable transaction and reclaim quarantine
+remain owned. Only a 2-second CPU-liveness failure may invoke the boot-only
+fail-stop policy; the elapsed 100 ms interval alone is never a panic reason.
+Stale acknowledgement, generation wrap, token reuse, or reclaim-before-ack is
+an internal memory-isolation failure and panics. An address space cannot be destroyed while
 any live reference, active-root owner, or shootdown obligation remains. A root
 in `Retiring` or `Reclaimed` cannot acquire a new reference or be activated;
 future activation after reclaim is an invariant panic, not a stale scheduler
@@ -586,16 +617,16 @@ queues, timers, IPC donation, and current/ready ownership on every CPU.
   `FaultDeferred` worker retry; transient lock contention may never be
   reclassified as retirement. Only an already-published retirement or stale
   generation may terminate that retry.
-- Exec seals siblings and keeps the target non-runnable. Under
-  `ProcessStateLock` it swaps process/FD/mm-generation ownership, then acquires
-  the raw scheduler owner to publish the matching root/context generation and
-  runnable edge. The old process-state bundle remains retained through both
-  publications. Only after the scheduler publication and release of
-  `ProcessStateLock` may its address space enter shootdown and reclamation.
-  `ProcessStateLock -> Scheduler` is the one named exec exception to the normal
-  disjoint-lock rule; `Scheduler -> ProcessStateLock` remains forbidden.
-  Failure after either publication is an invariant panic, never a recoverable
-  half-exec.
+- Exec reserves an exact frozen scheduler target token, releases the raw owner,
+  stages the process/FD/MM bundle under `ProcessStateLock`, releases that lock,
+  publishes the matching root/context under the scheduler owner, and finally
+  makes the staged generation visible under `ProcessStateLock`. Readers retry
+  while the lifecycle is staged/publishing. Exit in that interval latches
+  `exit_pending` on the token instead of retiring the target and wins after
+  finalization. The old bundle remains retained until visibility commit.
+  `ProcessStateLock` and any scheduler/run-queue raw owner must never nest in
+  either direction; Windows thread creation follows the same reserve,
+  initialize, publish rule.
 - Linux per-thread state is protected by its own fixed-slot, generation/TID
   checked raw lock. A raw mutable pointer into scheduler `TaskContext` may not
   escape scheduler serialization. Process-state callers take
@@ -799,7 +830,57 @@ Stop only when profiles show no single avoidable SMP/boot/runtime/ring0 hotspot
 with meaningful user-visible or system-wide impact, regressions are absent
 across 1/2/4/8 CPUs, and every accepted optimization has before/after evidence.
 
-## 14. Primary design references
+## 14. Commercial and high-assurance scheduler comparison
+
+The reference systems do not prescribe one universal lock topology. Linux,
+FreeBSD ULE, and Zircon use CPU-local runqueues with bounded balancing. XNU
+serializes a selected processor-set domain rather than the whole machine, and
+Xen Credit2 permits CPU/core/socket/NUMA/shared domains while capping the CPUs
+per runqueue. seL4 SMP deliberately uses a big kernel lock, and Zephyr retains
+a correct global-lock compatibility mode, showing that a global owner is not
+by itself a correctness defect. It is nevertheless incompatible with the
+RustOS scalability gate once measured contention makes independent CPUs wait
+on ordinary dispatch.
+
+The userspace-server comparison adds a separate obligation. QNX requires a
+multithreaded server to keep a receive-blocked worker and applies server boost
+when a high-priority sender arrives while no receiver is blocked. seL4 MCS
+instead makes a passive server run on the caller's donated scheduling context.
+RustOS retains reply-scoped donation; enqueue on a process-owned endpoint now
+selects an eligible worker across all CPU runqueues, publishes the handoff in
+that worker's CPU policy, and sends the exact directed reschedule request. A
+caller-CPU-only worker scan is forbidden. Userspace startup still owns a larger
+bounded reconciliation window around individual 100 ms control mutations, so
+one transient single-threaded-server head-of-line delay cannot permanently
+remove uiserver. Long-running servers that advertise concurrent low-latency
+control remain obligated to provide a bounded worker pool; retries are recovery,
+not a substitute for server capacity.
+
+RustOS therefore keeps these distinct acceptance statements:
+
+- exact current-task, runqueue, mailbox, affinity, timer, IPI, and retirement
+  ownership is a correctness gate;
+- CPU-owned fairness/handoff state, idle stealing, staggered one-task active
+  balancing, cross-CPU server boost, and directed reschedule IPIs are the
+  current scalable dispatch boundary;
+- the remaining global `Scheduler` guard is still a lifecycle/catalog and task
+  payload serializer, so `R3-PERF-SCHED-011` is not closed until normal local
+  selection and accounting stop acquiring it;
+- hard realtime or temporal-isolation claims remain forbidden without explicit
+  capacity admission, replenishment, and request-budget custody comparable to
+  seL4 MCS or QNX adaptive partitions;
+- CPU hotplug, NUMA placement, heterogeneous-core policy, and SMT security
+  scheduling are outside the current boot-static eight-CPU product envelope
+  and must remain rejected rather than partially advertised.
+
+The next lock split must move mutable task scheduling payload beside its exact
+runqueue/task owner. Adding multiple locks around the existing monolithic
+`Scheduler` would create unsynchronised aliases and is forbidden. The global
+catalog may remain for rare create/exec/exit operations, matching XNU/Xen-style
+domain serialization, but a timer, local wake, selection, accounting turn, or
+idle steal must not require it in the completed backend.
+
+## 15. Primary design references
 
 These sources inform the contract; RustOS does not claim their verification or
 compatibility guarantees.
@@ -813,26 +894,45 @@ compatibility guarantees.
 - AMD64 Architecture Programmer's Manual:
   <https://docs.amd.com/v/u/en-US/40332_4.09_APM_PUB>
 - seL4 SMP and MCS scheduler material:
-  <https://sel4.systems/About/FAQ.html> and
+  <https://docs.sel4.systems/releases/sel4/6.0.0.html> and
   <https://docs.sel4.systems/Tutorials/mcs.html>; seL4 runnable-queue FIFO
   semantics within priority:
   <https://docs.sel4.systems/Tutorials/threads.html>
 - QNX Neutrino SMP scheduling and cross-CPU rescheduling:
-  <https://www.qnx.com/developers/docs/7.1/com.qnx.doc.neutrino.sys_arch/topic/smp_HOWTHESMP.html>
+  <https://www.qnx.com/developers/docs/8.0/com.qnx.doc.neutrino.sys_arch/topic/kernel_Scheduling_priority.html>
 - QNX synchronous send-receive-reply custody and message-driven priority
   inheritance:
   <https://www.qnx.com/developers/docs/8.0/com.qnx.doc.neutrino.sys_arch/topic/ipc_Sync_messaging.html> and
-  <https://qnx.com/developers/docs/7.1/com.qnx.doc.neutrino.sys_arch/topic/ipc_Priority_inheritance_messages.html>
+  <https://qnx.com/developers/docs/7.1/com.qnx.doc.neutrino.sys_arch/topic/ipc_Priority_inheritance_messages.html>;
+  QNX no-waiter server boost and receive-blocked thread-pool requirement:
+  <https://www.qnx.com/developers/docs/8.0/com.qnx.doc.neutrino.sys_arch/topic/ipc_Server_boost.html> and
+  <https://www.qnx.com/developers/docs/8.0/com.qnx.doc.neutrino.resmgr/topic/multithread.html>
 - L4Re IPC atomicity and timeout/capability rules:
   <https://l4re.org/doc/l4re_concepts_ipc.html>
 - Linux CPU hotplug state machine, x86 TLB guidance, lock types, lockdep, and
-  LKMM, plus explicit FIFO/priority dispatch-queue custody:
+  LKMM, scheduler domains, and explicit FIFO/priority dispatch-queue custody:
   <https://docs.kernel.org/6.3/core-api/cpu_hotplug.html>,
   <https://docs.kernel.org/arch/x86/tlb.html>,
   <https://www.kernel.org/doc/html/latest/locking/locktypes.html>,
   <https://docs.kernel.org/5.17/locking/lockdep-design.html>, and
-  <https://docs.kernel.org/dev-tools/lkmm/docs/litmus-tests.html>, and
+  <https://docs.kernel.org/dev-tools/lkmm/docs/litmus-tests.html>,
+  <https://cdn.kernel.org/doc/html/latest/scheduler/sched-domains.html>, and
   <https://docs.kernel.org/scheduler/sched-ext.html>
+- FreeBSD ULE current source and per-CPU runqueue/stealing history:
+  <https://cgit.freebsd.org/src/log/sys/kern/sched_ule.c>
+- Zircon CPU-local fair/deadline runqueues, preemption timers, placement, and
+  work stealing:
+  <https://fuchsia.dev/fuchsia-src/concepts/kernel/kernel_scheduling>
+- Apple XNU processor-set locking, chosen-processor dispatch, and directed AST
+  policy:
+  <https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/kern/sched_prim.c>
+- Xen Credit2 topology-selected runqueue domains and maximum CPUs per runqueue:
+  <https://xenbits.xen.org/docs/unstable/misc/xen-command-line.html>
+- Zephyr SMP spinlock, CPU-mask, directed-IPI, and cascade contracts:
+  <https://docs.zephyrproject.org/latest/kernel/services/smp/smp.html>
+- RTEMS scheduler instances, processor assignment, affinity, EDF, and explicit
+  scheduled/ready/blocked node states:
+  <https://docs.rtems.org/docs/main/c-user/scheduling-concepts/smp-schedulers.html>
 - Loom bounded concurrency exploration:
   <https://github.com/tokio-rs/loom>
 - Shuttle controlled schedule exploration and PCT scheduler:

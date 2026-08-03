@@ -6,8 +6,10 @@ cpu-affinity-observation/CpuAffinityObservation	refinement	cpu-affinity-observat
 task-affinity-lifecycle/TaskAffinityLifecycle	refinement	task-affinity-lifecycle	Nonempty Online-subset task and process masks, exact target ownership, forced migration, previous-mask return, fork inheritance, exec preservation, and current-processor observation refine Linux and Windows affinity ABI.
 clocksource-deadline/ClocksourceDeadline	refinement	monotonic-deadline-lifecycle	The clocksource model proves the deadline flow's time-domain and catch-up invariants.
 dvm-input-ring/DvmInputRing	refinement	dvm-input-ingress	Two authorized broker callers contend for one exact drain owner while cursor, reset, and epoch transitions remain single-consumer.
+dvm-transport-lifecycle/DvmTransportLifecycle	refinement	dvm-input-ingress	Generation-bound claims close at drain start and shared transport reset is admitted only after exact claim quiescence.
 exception-retirement-lifecycle/ExceptionRetirementLifecycle	refinement	exception-retirement	Dedicated IST and lock-free NMI entry plus scalar-only user-fault diagnostics refine exception containment without untrusted memory probes.
 ipc-handle-transfer/IpcHandleTransfer	refinement	ipc-handle-transfer	The typed handle lifecycle is preceded by a canonical nonzero integer-ticket parser and exact one-shot registry lookup.
+ipc-transfer-authority/IpcTransferAuthority	refinement	ipc-handle-transfer	Kernel-bound receiver generation, service epoch, channel direction, stream position, and invisible copyout reservations refine one-shot descriptor transfer authority.
 deferred-start/DeferredStart	refinement	deferred-process-activation	Suspended creation and one-shot activation refine the process activation transaction.
 devmgrd-sessiond-isolation/DevmgrdSessiondIsolation	refinement	service-call-authority	Bounded policy-worker isolation refines nested service-call progress and cancellation.
 dma-iommu-isolation/DmaIommuIsolation	refinement	boot-storage-handoff	IOMMU ownership and DMA revocation refine physical device handoff.
@@ -85,6 +87,7 @@ product-boot/ProductBoot	refinement	commercial-product-boot	Sealed snapshot, act
 ui-frame-budget/UiFrameBudget	refinement	commercial-product-boot	The first presented frame refines the user-visible interactive terminal.
 ui-main-loop-wakeup/UiMainLoopWakeup	refinement	commercial-product-boot	Consecutive active UI windows require input and monotonic deadline wakes to remain live.
 acceptance-profile-publication/AcceptanceProfilePublication	refinement	commercial-product-boot	Bounded late registry observation refines acceptance-profiler activation without hot-path polling or permanent negative caching.
-exec-address-space-transaction/ExecAddressSpaceTransaction	refinement	process-address-space-lifecycle	Process-state generation commit, quiesced scheduler root publication, and retained old-bundle retirement form one staged exec transaction.
+exec-address-space-transaction/ExecAddressSpaceTransaction	refinement	process-address-space-lifecycle	Scheduler reservation, ProcessState staging, raw-lock publication, exit-pending latch, and final visibility form one non-nested exec transaction.
+page-table-map-transaction/PageTableMapTransaction	refinement	memory-map	Intermediate page-table publication is commit-logged and a failed mapping restores exact topology before one shootdown and frame reclaim.
 gpu-submit-transaction/GpuSubmitTransaction	refinement	gpu-frame-lifecycle	Compiler checkpoint, transport acceptance, exact rejection rollback, and full retry refine GPU producer publication.
 user-stack-growth/UserStackGrowth	refinement	exception-retirement	Release stacks eagerly map every usable page above a permanent guard; the modeled deferred path forbids transient lock contention from retiring a live valid fault.

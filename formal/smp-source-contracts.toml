@@ -252,8 +252,10 @@ path = "kernel/ps/src/multitask/current.rs"
 tokens = [
     "begin_exec(process_handle)",
     "authorize_exec(exec_reservation)",
-    "process_table::replace_for_exec_and_publish(",
+    "process_table::stage_exec_state(",
     "scheduler_mut().exec_current_user_process",
+    "process_table::finalize_exec_state(staged, published)",
+    "drop(old_state);",
 ]
 
 [[required_sequences]]
@@ -261,29 +263,67 @@ path = "kernel/ps/src/multitask/process_table.rs"
 tokens = [
     "state.replace_for_exec(",
     "object.mm_generation = reservation.next_mm_generation;",
-    "let published_handle = publish_scheduler()",
+    "object.exec_state_staged = true;",
+    "pub fn finalize_exec_state(",
     "object.exec_in_progress = false;",
-    "Some((closed, old_state))",
-    "drop(old_state);",
+    "object.exec_state_staged = false;",
 ]
 
 [[required_sequences]]
 path = "kernel/ps/src/multitask/irq.rs"
 tokens = [
-    "fn publish_deferred_reschedule(",
+    "fn publish_local_reschedule(",
     "local_request.store(1, Ordering::Release);",
-    "fanout_pending.store(true, Ordering::Release);",
-    "if nucleus_core::util::lockdep::preemption_disabled()",
-    "flush_deferred_reschedule_fanout();",
+    "pub(super) fn request_target_reschedule(target: usize)",
+    "TARGET_RESCHEDULE_IPI_PENDING.fetch_or(1_u64 << target, Ordering::Release);",
 ]
 
 [[required_sequences]]
 path = "kernel/ps/src/multitask/irq.rs"
 tokens = [
-    "let flusher = current_cpu_index();",
-    "arm_remote_reschedule(deferred_reschedule_flag(target))",
-    "if !reschedule_notification_required(target, flusher)",
-    "crate::arch::msi::send_reschedule_ipi(descriptor.apic_id)",
+    "let targeted = TARGET_RESCHEDULE_IPI_PENDING.swap(0, Ordering::AcqRel);",
+    "if !remote_notification_required(target, current_cpu_index())",
+    "send_target_reschedule_ipi(",
+    "reschedule_observation::request_goal(target)",
+]
+
+[[required_sequences]]
+path = "kernel/ps/src/multitask/reschedule_observation.rs"
+tokens = [
+    ".fetch_update(Ordering::AcqRel, Ordering::Acquire, |current|",
+    "notify_seq.store(sequence, Ordering::Release);",
+    "consume_seq.fetch_max(goal, Ordering::AcqRel)",
+]
+
+[[required_sequences]]
+path = "kernel/ps/src/user/handles.rs"
+tokens = [
+    "pub fn bind_ipc_transfer_tickets(",
+    "slot.context = Some(context);",
+    "slot.state = IpcTransferState::Exported;",
+    "pub fn commit_ipc_transfer_enqueue(",
+    "slot.state = IpcTransferState::Enqueued;",
+    "pub fn claim_ipc_transfer_entries_by_tickets(",
+    "context.service != service",
+    "context.channel != channel",
+    "context.stream_start != stream_pos",
+]
+
+[[required_sequences]]
+path = "kernel/compat/src/user/syscall/linux/service_ops/vfs_meta.rs"
+tokens = [
+    "write_current_iovec_payload(&iovecs,",
+    "write_current_control_payload(",
+    "write_current_user_struct(request.arg1, &header)",
+    "prepared.commit()?;",
+]
+
+[[required_sequences]]
+path = "kernel/compat/src/user/syscall/linux/net_broker_ops.rs"
+tokens = [
+    "NET_BROKER_OP_UNIX_CONNECT_BIND => broker_unix_connect_bind(args)",
+    "let channel_id = allocate_unix_channel_id()?;",
+    "socket.token_id() == args.arg1 && socket.bind_channel(channel_id, 1)",
 ]
 
 [[required_sequences]]
@@ -291,7 +331,7 @@ path = "kernel/ps/src/multitask/cpu_local.rs"
 tokens = [
     "drop(",
     "self.guard",
-    "super::irq::flush_deferred_reschedule_fanout();",
+    "super::irq::flush_deferred_target_reschedules();",
 ]
 
 [[required_sequences]]

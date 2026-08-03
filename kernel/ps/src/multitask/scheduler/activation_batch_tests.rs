@@ -42,11 +42,17 @@ fn spawn_handoff_is_fifo_deduplicated_and_precedes_ipc_handoff() {
     assert!(!scheduler.activate_suspended_user_tasks(&[802, 999]));
     assert!(scheduler.start_suspended[first]);
     assert!(scheduler.start_suspended[second]);
-    assert_eq!(scheduler.spawn_pick_hints.len(), 0);
+    assert_eq!(
+        scheduler.current_dispatch_policy().spawn_pick_hints.len(),
+        0
+    );
     assert!(!scheduler.activate_suspended_user_tasks(&[802, 802]));
     assert!(scheduler.start_suspended[first]);
     assert!(scheduler.start_suspended[second]);
-    assert_eq!(scheduler.spawn_pick_hints.len(), 0);
+    assert_eq!(
+        scheduler.current_dispatch_policy().spawn_pick_hints.len(),
+        0
+    );
     let authority_commit_started = AtomicBool::new(false);
     let failed_commit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         scheduler.activate_suspended_user_tasks_with_commit(&[802, 803], || {
@@ -58,17 +64,44 @@ fn spawn_handoff_is_fifo_deduplicated_and_precedes_ipc_handoff() {
     assert!(authority_commit_started.load(Ordering::Acquire));
     assert!(scheduler.start_suspended[first]);
     assert!(scheduler.start_suspended[second]);
-    assert_eq!(scheduler.atomic_activation_handoff_remaining, 0);
-    assert!(scheduler.atomic_activation_pick_hints.is_empty());
+    assert_eq!(
+        scheduler
+            .current_dispatch_policy()
+            .atomic_activation_handoff_remaining,
+        0
+    );
+    assert!(
+        scheduler
+            .current_dispatch_policy()
+            .atomic_activation_pick_hints
+            .is_empty()
+    );
     scheduler.set_next_spawn_pick_hint(804);
     assert!(scheduler.activate_suspended_user_tasks(&[802, 803]));
-    assert_eq!(scheduler.atomic_activation_handoff_remaining, 2);
-    assert_eq!(scheduler.atomic_activation_pick_hints.len(), 2);
-    assert_eq!(scheduler.spawn_pick_hints.len(), 1);
+    assert_eq!(
+        scheduler
+            .current_dispatch_policy()
+            .atomic_activation_handoff_remaining,
+        2
+    );
+    assert_eq!(
+        scheduler
+            .current_dispatch_policy()
+            .atomic_activation_pick_hints
+            .len(),
+        2
+    );
+    assert_eq!(
+        scheduler.current_dispatch_policy().spawn_pick_hints.len(),
+        1
+    );
     assert!(scheduler.set_next_synchronous_pick_hint(801));
     scheduler.set_next_spawn_pick_hint(802);
     scheduler.set_next_pick_hint(802);
-    assert_eq!(scheduler.spawn_pick_hints.len(), 2);
+    assert_eq!(
+        scheduler.current_dispatch_policy().spawn_pick_hints.len(),
+        2
+    );
     assert_eq!(
         scheduler.take_next_atomic_activation_handoff_ready_slot(),
         Some(first)
@@ -142,6 +175,17 @@ fn authority_commit_is_checked_while_the_complete_cohort_is_still_suspended() {
     assert!(authority_consumed.load(Ordering::Acquire));
     assert!(!scheduler.start_suspended[first]);
     assert!(!scheduler.start_suspended[second]);
-    assert_eq!(scheduler.atomic_activation_handoff_remaining, 2);
-    assert_eq!(scheduler.atomic_activation_pick_hints.len(), 2);
+    assert_eq!(
+        scheduler
+            .current_dispatch_policy()
+            .atomic_activation_handoff_remaining,
+        2
+    );
+    assert_eq!(
+        scheduler
+            .current_dispatch_policy()
+            .atomic_activation_pick_hints
+            .len(),
+        2
+    );
 }

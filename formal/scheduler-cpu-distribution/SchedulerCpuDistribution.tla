@@ -28,9 +28,9 @@ Init ==
     /\ readyAge = [task \in Tasks |-> 0]
     /\ last = NoTask
     /\ lastCpu = [task \in Tasks |-> NoCpu]
-    /\ systemBurst = 0
-    /\ latencyBurst = 0
-    /\ latencyHints = <<>>
+    /\ systemBurst = [cpu \in Cpus |-> 0]
+    /\ latencyBurst = [cpu \in Cpus |-> 0]
+    /\ latencyHints = [cpu \in Cpus |-> <<>>]
     /\ fairUserPick = TRUE
 
 OverdueSystems == {task \in ready \cap SystemTasks: readyAge[task] = MaxSystemWait}
@@ -69,15 +69,17 @@ DispatchSystem(task, cpu) ==
     /\ task \in ready \cap SystemTasks
     /\ cpu \in Cpus
     /\ (OverdueSystems = {} \/ task \in OverdueSystems)
-    /\ (ready \cap UserTasks = {} \/ systemBurst < MaxSystemBurst)
-    /\ (OverdueSystems # {} \/ latencyHints = <<>> \/ latencyBurst = MaxLatencyBurst)
+    /\ (ready \cap UserTasks = {} \/ systemBurst[cpu] < MaxSystemBurst)
+    /\ (OverdueSystems # {} \/ latencyHints[cpu] = <<>> \/ latencyBurst[cpu] = MaxLatencyBurst)
     /\ (OverdueSystems # {} \/ AdmittedFairPick(task, cpu, SystemTasks))
     /\ runtime' = [runtime EXCEPT ![task] = ChargeRuntime(task)]
     /\ readyAge' = AdvanceReadyAge(task)
     /\ last' = task
     /\ lastCpu' = [lastCpu EXCEPT ![task] = cpu]
-    /\ systemBurst' = IF ready \cap UserTasks = {} THEN 0 ELSE systemBurst + 1
-    /\ latencyBurst' = 0
+    /\ systemBurst' =
+        [systemBurst EXCEPT
+            ![cpu] = IF ready \cap UserTasks = {} THEN 0 ELSE @ + 1]
+    /\ latencyBurst' = [latencyBurst EXCEPT ![cpu] = 0]
     /\ fairUserPick' = TRUE
     /\ UNCHANGED <<ready, latencyHints>>
 
@@ -90,40 +92,42 @@ DispatchUser(task, cpu) ==
     /\ readyAge' = AdvanceReadyAge(task)
     /\ last' = task
     /\ lastCpu' = [lastCpu EXCEPT ![task] = cpu]
-    /\ systemBurst' = 0
-    /\ latencyBurst' = 0
+    /\ systemBurst' = [systemBurst EXCEPT ![cpu] = 0]
+    /\ latencyBurst' = [latencyBurst EXCEPT ![cpu] = 0]
     /\ fairUserPick' = ObservedFairPick(task, cpu, UserTasks)
     /\ UNCHANGED <<ready, latencyHints>>
 
 DispatchLatency(cpu) ==
-    /\ latencyHints # <<>>
+    /\ latencyHints[cpu] # <<>>
     /\ cpu \in Cpus
-    /\ latencyBurst < MaxLatencyBurst
+    /\ latencyBurst[cpu] < MaxLatencyBurst
     /\ OverdueSystems = {}
-    /\ Head(latencyHints) \in ready \cap UserTasks
-    /\ LET task == Head(latencyHints) IN
+    /\ Head(latencyHints[cpu]) \in ready \cap UserTasks
+    /\ LET task == Head(latencyHints[cpu]) IN
        /\ runtime' = [runtime EXCEPT ![task] = ChargeRuntime(task)]
        /\ readyAge' = AdvanceReadyAge(task)
        /\ last' = task
        /\ lastCpu' = [lastCpu EXCEPT ![task] = cpu]
-    /\ systemBurst' = 0
-    /\ latencyBurst' = latencyBurst + 1
-    /\ latencyHints' = Tail(latencyHints)
+    /\ systemBurst' = [systemBurst EXCEPT ![cpu] = 0]
+    /\ latencyBurst' = [latencyBurst EXCEPT ![cpu] = @ + 1]
+    /\ latencyHints' = [latencyHints EXCEPT ![cpu] = Tail(@)]
     /\ fairUserPick' = TRUE
     /\ UNCHANGED ready
 
-QueueLatencyHint(task) ==
+QueueLatencyHint(task, cpu) ==
     /\ task \in ready \cap UserTasks
-    /\ task \notin {latencyHints[index]: index \in DOMAIN latencyHints}
-    /\ Len(latencyHints) < MaxLatencyHints
-    /\ latencyHints' = Append(latencyHints, task)
+    /\ cpu \in Cpus
+    /\ task \notin {latencyHints[cpu][index]: index \in DOMAIN latencyHints[cpu]}
+    /\ Len(latencyHints[cpu]) < MaxLatencyHints
+    /\ latencyHints' = [latencyHints EXCEPT ![cpu] = Append(@, task)]
     /\ UNCHANGED <<ready, runtime, readyAge, last, lastCpu, systemBurst,
                     latencyBurst, fairUserPick>>
 
-DropStaleLatencyHint ==
-    /\ latencyHints # <<>>
-    /\ Head(latencyHints) \notin ready
-    /\ latencyHints' = Tail(latencyHints)
+DropStaleLatencyHint(cpu) ==
+    /\ cpu \in Cpus
+    /\ latencyHints[cpu] # <<>>
+    /\ Head(latencyHints[cpu]) \notin ready
+    /\ latencyHints' = [latencyHints EXCEPT ![cpu] = Tail(@)]
     /\ UNCHANGED <<ready, runtime, readyAge, last, lastCpu, systemBurst,
                     latencyBurst, fairUserPick>>
 
@@ -153,8 +157,8 @@ Next ==
     \/ DispatchAnySystem
     \/ DispatchAnyUser
     \/ DispatchAnyLatency
-    \/ \E task \in UserTasks: QueueLatencyHint(task)
-    \/ DropStaleLatencyHint
+    \/ \E task \in UserTasks, cpu \in Cpus: QueueLatencyHint(task, cpu)
+    \/ \E cpu \in Cpus: DropStaleLatencyHint(cpu)
     \/ \E task \in Tasks: Block(task)
     \/ \E task \in Tasks: Wake(task)
 
@@ -168,7 +172,7 @@ Spec ==
     \* the consumer polling contract therefore requires strong fairness for
     \* both consuming a runnable head and dropping an observed stale head.
     /\ SF_vars(DispatchAnyLatency)
-    /\ SF_vars(DropStaleLatencyHint)
+    /\ (\A cpu \in Cpus: SF_vars(DropStaleLatencyHint(cpu)))
 
 TypeOK ==
     /\ ready \in SUBSET Tasks
@@ -176,21 +180,24 @@ TypeOK ==
     /\ readyAge \in [Tasks -> 0..MaxSystemWait]
     /\ last \in Tasks \cup {NoTask}
     /\ lastCpu \in [Tasks -> Cpus \cup {NoCpu}]
-    /\ systemBurst \in Nat
-    /\ latencyBurst \in 0..MaxLatencyBurst
-    /\ latencyHints \in Seq(UserTasks)
+    /\ systemBurst \in [Cpus -> Nat]
+    /\ latencyBurst \in [Cpus -> 0..MaxLatencyBurst]
+    /\ latencyHints \in [Cpus -> Seq(UserTasks)]
     /\ fairUserPick \in BOOLEAN
-    /\ Len(latencyHints) <= MaxLatencyHints
-    /\ \A i, j \in DOMAIN latencyHints:
-           i # j => latencyHints[i] # latencyHints[j]
+    /\ \A cpu \in Cpus:
+        /\ Len(latencyHints[cpu]) <= MaxLatencyHints
+        /\ \A i, j \in DOMAIN latencyHints[cpu]:
+               i # j => latencyHints[cpu][i] # latencyHints[cpu][j]
 
-SystemBurstIsBounded == systemBurst <= MaxSystemBurst
-UserReservationIsBounded == ready \cap UserTasks # {} => systemBurst <= MaxSystemBurst
+SystemBurstIsBounded == \A cpu \in Cpus: systemBurst[cpu] <= MaxSystemBurst
+UserReservationIsBounded ==
+    ready \cap UserTasks # {} => \A cpu \in Cpus: systemBurst[cpu] <= MaxSystemBurst
 CpuAccountingIsBounded == \A task \in Tasks: runtime[task] <= MaxRuntime
 OnlySystemAccumulatesReadyAge == \A task \in UserTasks: readyAge[task] = 0
 FairUserSelectionUsesRuntime == fairUserPick
-LatencyBurstIsBounded == latencyBurst <= MaxLatencyBurst
-LatencyHintQueueIsBounded == Len(latencyHints) <= MaxLatencyHints
+LatencyBurstIsBounded == \A cpu \in Cpus: latencyBurst[cpu] <= MaxLatencyBurst
+LatencyHintQueueIsBounded ==
+    \A cpu \in Cpus: Len(latencyHints[cpu]) <= MaxLatencyHints
 OverdueSystemBlocksLatency ==
     [] (OverdueSystems # {} => ~ENABLED DispatchAnyLatency)
 RunnableUserEventuallyRuns ==

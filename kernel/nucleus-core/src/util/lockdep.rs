@@ -101,6 +101,8 @@ pub enum LockClass {
     Scheduler = 37,
     TlbShootdown = 38,
     LinuxThreadState = 39,
+    SchedulerRunQueue = 40,
+    SchedulerMailbox = 41,
 }
 
 #[cfg(rustos_boot_image)]

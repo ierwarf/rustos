@@ -382,7 +382,11 @@ fn select_smoke_guest_display(options: &SmokeOptions, host_has_gui: bool) -> Res
 /// closes the DVM QEMU window or interrupts it. Acceptance is still enforced
 /// when the session closes; a slow but progressing debug boot is not killed by
 /// an arbitrary startup deadline.
-pub(crate) fn kvm_run_command(config: &Config, build_image: bool) -> Result<()> {
+pub(crate) fn kvm_run_command(
+    config: &Config,
+    build_image: bool,
+    rustos_vcpus: u8,
+) -> Result<()> {
     let _launch_lock = acquire_kvm_launch_lock(&config.build_dir.join("kvm"))?;
     if build_image {
         crate::build::build(config, false)?;
@@ -401,8 +405,10 @@ pub(crate) fn kvm_run_command(config: &Config, build_image: bool) -> Result<()> 
         gui_dvm_surfaces: true,
         dvm_network_shmem: true,
         dvm_block_shmem: true,
-        rustos_vcpus: 1,
-        smp_iteration: false,
+        rustos_vcpus,
+        // Interactive SMP uses the same exact-tree bounded evidence profile as
+        // the topology smoke run. It is observation, not a release/FPS claim.
+        smp_iteration: rustos_vcpus > 1,
         physical_gpu_bdf: None,
         physical_gpu_firmware: None,
         min_ui_fps: None,
@@ -773,12 +779,19 @@ where
         }
     }
 
-    // A frame-rate proof without input and the production storage provider can
-    // only time out with idle windows or ENODEV launch retries. Reuse the normal
-    // DVM uinput and block paths; no QMP or embedded-volume shortcut is added.
+    // The graphical product topology launches its shell and WayClick from the
+    // production DVM volume. Attaching the display transport without its
+    // storage provider produces a compositor-only boot that can never satisfy
+    // the visible desktop contract. Keep the two providers atomic at the
+    // runner boundary; storage-only remains independently selectable below.
+    if options.gui_dvm_surfaces {
+        options.dvm_block_shmem = true;
+    }
+
+    // A frame-rate proof additionally requires real input. Reuse the normal
+    // DVM uinput path; no QMP or embedded-volume shortcut is added.
     if options.min_ui_fps.is_some() {
         options.exercise_input = true;
-        options.dvm_block_shmem = true;
     }
     if options.smp_iteration {
         if options.rustos_vcpus <= 1 {

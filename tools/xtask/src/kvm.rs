@@ -204,7 +204,7 @@ fn smp_runtime_missing_markers(log: &str, rustos_vcpus: u8) -> Vec<String> {
             }
         }
         if rustos_vcpus > 1 {
-            let marker = format!("name=smp-cpu-first-reschedule-ipi arg0=0x{logical_cpu:x}");
+            let marker = format!("name=smp-resched-route arg0=0x{logical_cpu:x}");
             if !log.contains(marker.as_str()) {
                 missing.push(marker);
             }

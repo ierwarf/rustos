@@ -56,8 +56,13 @@ rg -Fq 'call_bounded(' services/inputd/src/main.rs || {
     echo "inputd-to-netd lifecycle call is not deadline-bounded" >&2
     exit 1
 }
-rg -Fq 'IPC_READINESS_QUERY_HARD_LIMIT_MS' services/inputd/src/main.rs || {
-    echo "inputd-to-netd lifecycle call exceeds the readiness rail" >&2
+rg -Fq 'dvm_session_sync::CALL_DEADLINE_MS' services/inputd/src/main.rs || {
+    echo "inputd-to-netd lifecycle call bypasses its owned deadline" >&2
+    exit 1
+}
+rg -Fq 'rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS' \
+    services/inputd/src/dvm_session_sync.rs || {
+    echo "inputd-to-netd lifecycle mutation lacks the interactive-control rail" >&2
     exit 1
 }
 rg -Fq 'const SERVICE_ENDPOINT_STABLE_READ_ATTEMPTS: usize = 3;' "$ipc_ops" || {
@@ -572,7 +577,7 @@ if rg -Fq 'let mut chunk = [0_u8; 256];' \
     exit 1
 fi
 rg -Fq 'sync_pick_hints: SlotHandoffQueue<MAX_TASK>' \
-    kernel/ps/src/multitask/scheduler.rs || {
+    kernel/ps/src/multitask/scheduler/dispatch_policy.rs || {
     echo "synchronous IPC peers no longer have complete bounded FIFO custody" >&2
     exit 1
 }

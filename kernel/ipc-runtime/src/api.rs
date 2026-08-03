@@ -1,8 +1,9 @@
 pub use crate::ipc::{
-    EndpointCallPriority, EndpointReceived, EndpointReceivedWithSender, EndpointResponseTake,
-    EndpointResponseWithHandles, EndpointWakeSet, IpcError, KernelEndpointHandle,
-    KernelReplyHandle, KernelSharedRegionHandle, KernelSharedRegionMappingHold,
-    KernelTransferTicket, KernelTransferredHandle, MAX_ENDPOINT_WAKE_TASKS,
+    ChannelIdentity, EndpointCallPriority, EndpointReceived, EndpointReceivedWithSender,
+    EndpointResponseTake, EndpointResponseWithHandles, EndpointWakeSet, IpcError,
+    KernelEndpointHandle, KernelReplyHandle, KernelSharedRegionHandle,
+    KernelSharedRegionMappingHold, KernelTransferTicket, KernelTransferredHandle,
+    MAX_ENDPOINT_WAKE_TASKS, ProcessIdentity, ServiceIdentity, TransferContext,
 };
 
 pub mod endpoint {

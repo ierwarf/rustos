@@ -72,7 +72,7 @@ fn read_config_snapshot_file(file: &File, max_bytes: usize) -> Result<String, Er
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_CONFIG_SNAPSHOT_BYTES, read_bounded_config_snapshot, read_config_snapshot_file,
+        read_bounded_config_snapshot, read_config_snapshot_file, MAX_CONFIG_SNAPSHOT_BYTES,
     };
     use std::fs::File;
     use std::io::{Seek, SeekFrom};

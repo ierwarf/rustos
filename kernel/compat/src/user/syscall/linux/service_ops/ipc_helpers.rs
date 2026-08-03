@@ -1659,7 +1659,12 @@ fn call_netd_ipc_request_impl(
         || decoded.payload_len as usize > NETD_IPC_PAYLOAD_CAPACITY
         || decoded.version != NETD_IPC_ABI_VERSION
         || decoded.op != request.op
-        || decoded.reserved0 != 0
+        || decoded.reserved0 > decoded.payload_len
+        || (decoded.reserved0 != 0
+            && !matches!(
+                request.op,
+                SYSCALL_OFFLOAD_OP_LINUX_CLOSE | SYSCALL_OFFLOAD_OP_LINUX_RECVFROM
+            ))
         || decoded.reserved1 & !NETD_IPC_RESPONSE_FLAG_LATENCY_HANDOFF != 0
     {
         return Err(LINUX_EINVAL);
@@ -1667,6 +1672,7 @@ fn call_netd_ipc_request_impl(
     if decoded.status != 0 {
         return Err(decoded.status.unsigned_abs() as i64);
     }
+    super::vfs_meta::consume_netd_release_payload(&mut decoded)?;
     // The scheduling hint is consumed at the kernel IPC boundary and is not
     // part of the Linux socket result exposed to compatibility callers.
     decoded.reserved1 = 0;

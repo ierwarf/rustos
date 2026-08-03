@@ -16,13 +16,16 @@ required_models = [
     "cpu-online-lifecycle/CpuOnlineLifecycle",
     "cross-cpu-task-retirement/CrossCpuTaskRetirement",
     "dvm-input-ring/DvmInputRing",
+    "dvm-transport-lifecycle/DvmTransportLifecycle",
     "exception-retirement-lifecycle/ExceptionRetirementLifecycle",
     "exec-address-space-transaction/ExecAddressSpaceTransaction",
     "gpu-submit-transaction/GpuSubmitTransaction",
     "input-ingestion-worker/InputIngestionWorker",
     "ipc-priority-queue/IpcPriorityQueue",
     "ipc-reply-recv-transaction/IpcReplyRecvTransaction",
+    "ipc-transfer-authority/IpcTransferAuthority",
     "msi-vector-lifecycle/MsiVectorLifecycle",
+    "page-table-map-transaction/PageTableMapTransaction",
     "per-cpu-clockevent-lifecycle/PerCpuClockeventLifecycle",
     "product-boot/ProductBoot",
     "robust-futex-owner-death/RobustFutexOwnerDeath",
@@ -195,6 +198,30 @@ invariant = "SingleFlightDrainOwnership"
 min_counterexample_states = 3
 
 [[mutation]]
+id = "dvm-transport-reset-before-quiescence"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "dvm-transport-lifecycle/DvmTransportLifecycle"
+flow = "dvm-input-ingress"
+find = '''CompleteDrain ==
+    /\ state = "Draining"
+    /\ claims = 0
+    /\ state' = "Revoked"
+    /\ resetCount' = resetCount + 1
+    /\ resetWithClaim' = (claims # 0)
+'''
+replace = '''CompleteDrain ==
+    /\ state = "Draining"
+    /\ claims \in 0..MaxClaims
+    /\ state' = "Revoked"
+    /\ resetCount' = resetCount + 1
+    /\ resetWithClaim' = (claims # 0)
+'''
+occurrence = 1
+invariant = "ResetOnlyAfterQuiescence"
+min_counterexample_states = 4
+
+[[mutation]]
 id = "exception-user-diagnostic-memory-probe-restored"
 kind = "transition-effect"
 severity = "critical"
@@ -225,30 +252,41 @@ severity = "critical"
 model = "exec-address-space-transaction/ExecAddressSpaceTransaction"
 flow = "process-address-space-lifecycle"
 find = '''    /\ processStateLockHeld' = TRUE
-    /\ UNCHANGED <<exiting, retiredMarker, reservationValid,
-                    schedulerGeneration, activeRootGeneration, targetRunnable,
-                    oldBundleRetained, ownershipCommitted,
-                    publishedOverRetirement>>'''
+    /\ locksNested' = schedulerLockHeld
+    /\ UNCHANGED <<tokenLive, tokenUses, stagedBundle,
+                    schedulerPublished, visibleGeneration, exitPending,
+                    targetRetired, oldBundleRetained, schedulerLockHeld,
+                    publicationFailed>>'''
 replace = '''    /\ processStateLockHeld' = TRUE
     /\ oldBundleRetained' = FALSE
-    /\ UNCHANGED <<exiting, retiredMarker, reservationValid,
-                    schedulerGeneration, activeRootGeneration, targetRunnable,
-                    ownershipCommitted, publishedOverRetirement>>'''
+    /\ locksNested' = schedulerLockHeld
+    /\ UNCHANGED <<tokenLive, tokenUses, stagedBundle,
+                    schedulerPublished, visibleGeneration, exitPending,
+                    targetRetired, schedulerLockHeld, publicationFailed>>'''
 occurrence = 1
-invariant = "OldBundleRetainedUntilSchedulerPublication"
+invariant = "OldBundleRetainedUntilVisibleCommit"
 min_counterexample_states = 5
 
 [[mutation]]
-id = "exec-target-quiesce-removed"
+id = "exec-target-immediate-retire-during-transaction"
 kind = "transition-effect"
 severity = "critical"
 model = "exec-address-space-transaction/ExecAddressSpaceTransaction"
 flow = "process-address-space-lifecycle"
-find = "    /\\ targetRunnable' = FALSE"
-replace = "    /\\ targetRunnable' = TRUE"
+find = '''    /\ exitPending' = TRUE
+    /\ UNCHANGED <<phase, tokenLive, tokenUses, stagedBundle,
+                    schedulerPublished, visibleGeneration, targetRetired,
+                    oldBundleRetained, processStateLockHeld,
+                    schedulerLockHeld, locksNested, publicationFailed>>'''
+replace = '''    /\ exitPending' = TRUE
+    /\ targetRetired' = TRUE
+    /\ UNCHANGED <<phase, tokenLive, tokenUses, stagedBundle,
+                    schedulerPublished, visibleGeneration,
+                    oldBundleRetained, processStateLockHeld,
+                    schedulerLockHeld, locksNested, publicationFailed>>'''
 occurrence = 1
-invariant = "MixedGenerationIsNeverExternallyRunnable"
-min_counterexample_states = 5
+invariant = "NoCommitAfterRetire"
+min_counterexample_states = 3
 
 [[mutation]]
 id = "futex-kernel-wake-forced-private"
@@ -318,8 +356,25 @@ kind = "transition-effect"
 severity = "critical"
 model = "ipc-reply-recv-transaction/IpcReplyRecvTransaction"
 flow = "scheduler-dispatch"
-find = "    /\\ replyLive' = FALSE"
-replace = "    /\\ replyLive' = TRUE"
+find = '''ReceiveQueued ==
+    /\ phase = ReplyCommitted
+    /\ requestPending
+    /\ phase' = Delivered
+    /\ requestPending' = FALSE
+    /\ nextReplyOwned' = TRUE
+    /\ resultKind' = Success
+    /\ UNCHANGED <<replyLive, callerRunnable, waiterArmed, serverBlocked>>
+'''
+replace = '''ReceiveQueued ==
+    /\ phase = ReplyCommitted
+    /\ requestPending
+    /\ phase' = Delivered
+    /\ requestPending' = FALSE
+    /\ nextReplyOwned' = TRUE
+    /\ resultKind' = Success
+    /\ replyLive' = TRUE
+    /\ UNCHANGED <<callerRunnable, waiterArmed, serverBlocked>>
+'''
 occurrence = 1
 invariant = "ReplyCommitPrecedesReceive"
 min_counterexample_states = 3
@@ -347,6 +402,18 @@ replace = "    /\\ resultKind' = TaggedPostError"
 occurrence = 1
 invariant = "PreCommitFailurePreservesReply"
 min_counterexample_states = 2
+
+[[mutation]]
+id = "ipc-transfer-recipient-guard-removed"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "ipc-transfer-authority/IpcTransferAuthority"
+flow = "ipc-handle-transfer"
+find = "    /\\ receiver = intendedReceiver"
+replace = "    /\\ receiver \\in Receivers"
+occurrence = 1
+invariant = "OnlyIntendedRecipientInstalls"
+min_counterexample_states = 5
 
 [[mutation]]
 id = "msi-committed-rollback-handler-retained"
@@ -383,6 +450,18 @@ replace = '''    /\ interruptedLockHeld' = lockHeld
 occurrence = 1
 invariant = "NmiTakesNoTrackedLock"
 min_counterexample_states = 2
+
+[[mutation]]
+id = "page-table-publication-log-omitted"
+kind = "transition-effect"
+severity = "critical"
+model = "page-table-map-transaction/PageTableMapTransaction"
+flow = "memory-map"
+find = "    /\\ commitLog' = Append(commitLog, table)"
+replace = "    /\\ commitLog' = commitLog"
+occurrence = 1
+invariant = "PublishedTopologyHasRollbackCustody"
+min_counterexample_states = 3
 
 [[mutation]]
 id = "per-cpu-clockevent-deadline-before-lvt"
@@ -448,7 +527,7 @@ kind = "transition-guard-removal"
 severity = "critical"
 model = "scheduler-cpu-distribution/SchedulerCpuDistribution"
 flow = "scheduler-dispatch"
-find = '''    /\ (ready \cap UserTasks = {} \/ systemBurst < MaxSystemBurst)'''
+find = '''    /\ (ready \cap UserTasks = {} \/ systemBurst[cpu] < MaxSystemBurst)'''
 replace = '''    /\ TRUE'''
 occurrence = 1
 invariant = "SystemBurstIsBounded"
@@ -557,28 +636,28 @@ invariant = "TransitionWakeSurvives"
 min_counterexample_states = 4
 
 [[mutation]]
-id = "smp-ipi-fanout-bit-not-published"
+id = "smp-ipi-exact-target-publication-removed"
 kind = "transition-effect"
 severity = "critical"
 model = "smp-reschedule-ipi/SmpRescheduleIpi"
 flow = "smp-reschedule-ipi-lifecycle"
-find = "fanoutPending' = TRUE"
-replace = "fanoutPending' = FALSE"
-occurrence = 1
-invariant = "PendingFanoutHasDurableOwner"
-min_counterexample_states = 2
+find = "    /\\ request' = [request EXCEPT ![target] = TRUE]"
+replace = "    /\\ request' = request"
+occurrence = 2
+invariant = "PendingTargetHasDurableRequest"
+min_counterexample_states = 3
 
 [[mutation]]
-id = "smp-ipi-fanout-target-publication-removed"
+id = "smp-ipi-locked-target-custody-not-published"
 kind = "transition-effect"
 severity = "critical"
 model = "smp-reschedule-ipi/SmpRescheduleIpi"
 flow = "smp-reschedule-ipi-lifecycle"
-find = "    /\\ request' = [cpu \\in Cpus |-> IF online[cpu] THEN TRUE ELSE request[cpu]]"
-replace = "    /\\ request' = request"
+find = "[targetPending EXCEPT ![target] = IF ~request[target] THEN TRUE ELSE @]"
+replace = "[targetPending EXCEPT ![target] = FALSE]"
 occurrence = 1
-invariant = "IpiRequiresDurableRequest"
-min_counterexample_states = 3
+invariant = "LockedTargetCustodyIsNeverLost"
+min_counterexample_states = 2
 
 [[mutation]]
 id = "smp-ipi-self-notification-restored"
@@ -588,7 +667,7 @@ model = "smp-reschedule-ipi/SmpRescheduleIpi"
 flow = "smp-reschedule-ipi-lifecycle"
 find = "    /\\ selfIpiSent' = FALSE"
 replace = "    /\\ selfIpiSent' = TRUE"
-occurrence = 1
+occurrence = 2
 invariant = "NoSelfIpi"
 min_counterexample_states = 2
 

@@ -42,6 +42,10 @@ Do not reorder without reading `kernel/src/main.rs` and
   `ioctl_from_user`.
 - **Process state mutation:** `with_current_user_process_state_mut`,
   `with_process_state_by_pid_mut`.
+  Exec uses the staged lifecycle APIs: reserve the exact scheduler target,
+  stage under ProcessState alone, publish under Scheduler alone, then finalize
+  visibility. No caller may nest either lock or retire an exec-reserved target;
+  exit is latched as `exit_pending`.
 - **Scheduler wait primitives:** use `current_task_id`,
   `arm_block_current_task`, condition publication/recheck,
   `commit_block_current_task_and_yield`, and `wake_task`. The commit and
@@ -107,6 +111,11 @@ Do not reorder without reading `kernel/src/main.rs` and
   `input::transport::withdraw_policy_consumer` only when the live inputd
   endpoint owner exits; this clears producer admission and old-owner records
   without moving decode or input policy into ring0.
+- **DVM transport lifecycle:** display submit/query and input drain acquire an
+  exact `TransportClaim` for the current epoch before touching shared memory.
+  Revoke first closes admission (`Active -> Draining`), waits boundedly for
+  `in_flight == 0`, and only then resets slots, mappings, or cursors and
+  publishes the next epoch. IRQ leaves request revoke but never wait.
 - **Scheduler preemption:** `cond_resched`/`reschedule_if_requested` only at
   Linux-style safe points outside spinlocked or IRQ-off regions. Timer IRQs
   should request reschedule for user-task kernel frames, not blindly switch

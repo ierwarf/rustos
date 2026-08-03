@@ -26,7 +26,12 @@ const IA32_TSC_DEADLINE: u32 = 0x6e0;
 const CPUID_TSC_DEADLINE: u32 = 1 << 24;
 const APIC_LVT_TIMER_OFFSET: usize = 0x320;
 const APIC_LVT_TSC_DEADLINE: u32 = 2 << 17;
-const TICK_NANOS: u64 = 1_000_000;
+// Match the BSP fair-class quantum. A private one-millisecond deadline on
+// every AP multiplied periodic scheduler entries by the CPU count and made an
+// otherwise idle 8-vCPU guest contend on scheduler bookkeeping thousands of
+// times per second. Immediate IPC/wake/IPI safe points remain independent of
+// this bounded periodic fallback.
+const TICK_NANOS: u64 = 4_000_000;
 
 static NEXT_DEADLINE: [AtomicU64; MAX_SUPPORTED_CPUS] =
     [const { AtomicU64::new(0) }; MAX_SUPPORTED_CPUS];
@@ -133,7 +138,7 @@ mod tests {
 
     #[test]
     fn tsc_deadline_interval_and_catchup_are_strictly_future_bounded() {
-        assert_eq!(tick_interval(3_000_000_000), Some(3_000_000));
+        assert_eq!(tick_interval(3_000_000_000), Some(12_000_000));
         assert_eq!(next_future_deadline(100, 99, 10), Some(110));
         assert_eq!(next_future_deadline(100, 100, 10), Some(110));
         assert_eq!(next_future_deadline(100, 125, 10), Some(130));

@@ -2,209 +2,210 @@
 EXTENDS Naturals
 
 (***************************************************************************
-Exec spans process-table reservation, target quiescence, ProcessState/FD/MM
-generation replacement, scheduler root/context publication, and old-bundle
-retirement.
-
-The ProcessState lock remains held across the process-generation and scheduler
-publication edges. A remote target is not runnable until the last scheduler
-edge; self publication excludes IRQs. The old bundle remains retained until
-the new root/context is active.
-
-Concrete owners:
-  * kernel/ps/src/multitask/{current,process_table,scheduler}.rs
-  * kernel/ps/src/user/process_state.rs
+Exec owns one scheduler reservation token. ProcessState staging and final
+visibility occur under the sleepable ProcessState lock, while scheduler
+publication occurs under the raw scheduler owner; the two locks never nest.
+Exit during the transaction latches exitPending instead of retiring the
+reserved target. Readers reject the staged interval, and the new generation
+becomes visible only after scheduler publication.
 ***************************************************************************)
 
 Idle == "idle"
 Reserved == "reserved"
-Quiesced == "quiesced"
-Authorized == "authorized"
-StateCommitted == "state-committed"
-SchedulerPublished == "scheduler-published"
-Owned == "owned"
+Staging == "staging"
+Staged == "staged"
+Publishing == "publishing"
+Published == "published"
+Finalizing == "finalizing"
+Finalized == "finalized"
+Exiting == "exiting"
 Cancelled == "cancelled"
 
 OldGeneration == 0
 NewGeneration == 1
 
-VARIABLES phase, exiting, retiredMarker, reservationValid,
-          processGeneration, schedulerGeneration, activeRootGeneration,
-          targetRunnable, processStateLockHeld, oldBundleRetained,
-          ownershipCommitted, publishedOverRetirement
+VARIABLES phase, tokenLive, tokenUses, stagedBundle, schedulerPublished,
+          visibleGeneration, exitPending, targetRetired, oldBundleRetained,
+          processStateLockHeld, schedulerLockHeld, locksNested,
+          publicationFailed
 
-vars == <<phase, exiting, retiredMarker, reservationValid,
-          processGeneration, schedulerGeneration, activeRootGeneration,
-          targetRunnable, processStateLockHeld, oldBundleRetained,
-          ownershipCommitted, publishedOverRetirement>>
+vars == <<phase, tokenLive, tokenUses, stagedBundle, schedulerPublished,
+          visibleGeneration, exitPending, targetRetired, oldBundleRetained,
+          processStateLockHeld, schedulerLockHeld, locksNested,
+          publicationFailed>>
 
 Init ==
     /\ phase = Idle
-    /\ exiting = FALSE
-    /\ retiredMarker = FALSE
-    /\ reservationValid = FALSE
-    /\ processGeneration = OldGeneration
-    /\ schedulerGeneration = OldGeneration
-    /\ activeRootGeneration = OldGeneration
-    /\ targetRunnable = TRUE
-    /\ processStateLockHeld = FALSE
+    /\ tokenLive = FALSE
+    /\ tokenUses = 0
+    /\ stagedBundle = FALSE
+    /\ schedulerPublished = FALSE
+    /\ visibleGeneration = OldGeneration
+    /\ exitPending = FALSE
+    /\ targetRetired = FALSE
     /\ oldBundleRetained = TRUE
-    /\ ownershipCommitted = FALSE
-    /\ publishedOverRetirement = FALSE
+    /\ processStateLockHeld = FALSE
+    /\ schedulerLockHeld = FALSE
+    /\ locksNested = FALSE
+    /\ publicationFailed = FALSE
 
-BeginExec ==
-    /\ phase = Idle /\ ~exiting /\ ~retiredMarker
+ReserveExec ==
+    /\ phase = Idle
     /\ phase' = Reserved
-    /\ reservationValid' = TRUE
-    /\ UNCHANGED <<exiting, retiredMarker, processGeneration,
-                    schedulerGeneration, activeRootGeneration, targetRunnable,
-                    processStateLockHeld, oldBundleRetained,
-                    ownershipCommitted, publishedOverRetirement>>
+    /\ tokenLive' = TRUE
+    /\ UNCHANGED <<tokenUses, stagedBundle, schedulerPublished,
+                    visibleGeneration, exitPending, targetRetired,
+                    oldBundleRetained, processStateLockHeld,
+                    schedulerLockHeld, locksNested, publicationFailed>>
 
-Quiesce ==
+BeginStage ==
     /\ phase = Reserved
-    /\ phase' = Quiesced
-    /\ targetRunnable' = FALSE
-    /\ UNCHANGED <<exiting, retiredMarker, reservationValid,
-                    processGeneration, schedulerGeneration,
-                    activeRootGeneration, processStateLockHeld,
-                    oldBundleRetained, ownershipCommitted,
-                    publishedOverRetirement>>
-
-PublishExit ==
-    /\ phase \in {Reserved, Quiesced, Authorized}
-    /\ exiting' = TRUE
-    /\ retiredMarker' = TRUE
-    /\ UNCHANGED <<phase, reservationValid, processGeneration,
-                    schedulerGeneration, activeRootGeneration, targetRunnable,
-                    processStateLockHeld, oldBundleRetained,
-                    ownershipCommitted, publishedOverRetirement>>
-
-Authorize ==
-    /\ phase = Quiesced /\ reservationValid
-    /\ ~exiting /\ ~retiredMarker
-    /\ phase' = Authorized
-    /\ UNCHANGED <<exiting, retiredMarker, reservationValid,
-                    processGeneration, schedulerGeneration,
-                    activeRootGeneration, targetRunnable,
-                    processStateLockHeld, oldBundleRetained,
-                    ownershipCommitted, publishedOverRetirement>>
-
-CommitProcessState ==
-    /\ phase = Authorized /\ reservationValid
-    /\ phase' = StateCommitted
-    /\ processGeneration' = NewGeneration
+    /\ tokenLive
+    /\ ~schedulerLockHeld
+    /\ phase' = Staging
     /\ processStateLockHeld' = TRUE
-    /\ UNCHANGED <<exiting, retiredMarker, reservationValid,
-                    schedulerGeneration, activeRootGeneration, targetRunnable,
-                    oldBundleRetained, ownershipCommitted,
-                    publishedOverRetirement>>
+    /\ locksNested' = schedulerLockHeld
+    /\ UNCHANGED <<tokenLive, tokenUses, stagedBundle, schedulerPublished,
+                    visibleGeneration, exitPending, targetRetired,
+                    oldBundleRetained, schedulerLockHeld, publicationFailed>>
 
-PublishScheduler ==
-    /\ phase = StateCommitted
-    /\ reservationValid /\ processStateLockHeld
-    /\ processGeneration = NewGeneration
-    /\ phase' = SchedulerPublished
-    /\ schedulerGeneration' = NewGeneration
-    /\ activeRootGeneration' = NewGeneration
-    /\ targetRunnable' = TRUE
-    /\ publishedOverRetirement' = retiredMarker
-    /\ UNCHANGED <<exiting, retiredMarker, reservationValid,
-                    processGeneration, processStateLockHeld,
-                    oldBundleRetained, ownershipCommitted>>
-
-FinalizeOwnership ==
-    /\ phase = SchedulerPublished
+CompleteStage ==
+    /\ phase = Staging
     /\ processStateLockHeld
-    /\ processGeneration = NewGeneration
-    /\ schedulerGeneration = NewGeneration
-    /\ activeRootGeneration = NewGeneration
-    /\ phase' = Owned
-    /\ reservationValid' = FALSE
+    /\ phase' = Staged
+    /\ stagedBundle' = TRUE
     /\ processStateLockHeld' = FALSE
-    /\ oldBundleRetained' = FALSE
-    /\ ownershipCommitted' = TRUE
-    /\ UNCHANGED <<exiting, retiredMarker, processGeneration,
-                    schedulerGeneration, activeRootGeneration,
-                    targetRunnable, publishedOverRetirement>>
+    /\ UNCHANGED <<tokenLive, tokenUses, schedulerPublished,
+                    visibleGeneration, exitPending, targetRetired,
+                    oldBundleRetained, schedulerLockHeld, locksNested,
+                    publicationFailed>>
 
-CancelBeforeCommit ==
-    /\ phase \in {Reserved, Quiesced}
-    /\ exiting \/ retiredMarker
+BeginPublish ==
+    /\ phase = Staged
+    /\ tokenLive
+    /\ stagedBundle
+    /\ ~processStateLockHeld
+    /\ ~targetRetired
+    /\ phase' = Publishing
+    /\ schedulerLockHeld' = TRUE
+    /\ locksNested' = processStateLockHeld
+    /\ UNCHANGED <<tokenLive, tokenUses, stagedBundle, schedulerPublished,
+                    visibleGeneration, exitPending, targetRetired,
+                    oldBundleRetained, processStateLockHeld,
+                    publicationFailed>>
+
+CompletePublish ==
+    /\ phase = Publishing
+    /\ schedulerLockHeld
+    /\ tokenLive
+    /\ tokenUses = 0
+    /\ phase' = Published
+    /\ schedulerPublished' = TRUE
+    /\ tokenUses' = 1
+    /\ schedulerLockHeld' = FALSE
+    /\ UNCHANGED <<tokenLive, stagedBundle, visibleGeneration, exitPending,
+                    targetRetired, oldBundleRetained, processStateLockHeld,
+                    locksNested, publicationFailed>>
+
+BeginFinalize ==
+    /\ phase = Published
+    /\ schedulerPublished
+    /\ ~schedulerLockHeld
+    /\ phase' = Finalizing
+    /\ processStateLockHeld' = TRUE
+    /\ locksNested' = schedulerLockHeld
+    /\ UNCHANGED <<tokenLive, tokenUses, stagedBundle,
+                    schedulerPublished, visibleGeneration, exitPending,
+                    targetRetired, oldBundleRetained, schedulerLockHeld,
+                    publicationFailed>>
+
+CompleteFinalize ==
+    /\ phase = Finalizing
+    /\ processStateLockHeld
+    /\ schedulerPublished
+    /\ phase' = IF exitPending THEN Exiting ELSE Finalized
+    /\ visibleGeneration' = NewGeneration
+    /\ tokenLive' = FALSE
+    /\ stagedBundle' = FALSE
+    /\ oldBundleRetained' = FALSE
+    /\ targetRetired' = exitPending
+    /\ processStateLockHeld' = FALSE
+    /\ UNCHANGED <<tokenUses, schedulerPublished, exitPending,
+                    schedulerLockHeld, locksNested, publicationFailed>>
+
+RequestExit ==
+    /\ phase \in {Reserved, Staging, Staged, Publishing, Published, Finalizing}
+    /\ ~exitPending
+    /\ exitPending' = TRUE
+    /\ UNCHANGED <<phase, tokenLive, tokenUses, stagedBundle,
+                    schedulerPublished, visibleGeneration, targetRetired,
+                    oldBundleRetained, processStateLockHeld,
+                    schedulerLockHeld, locksNested, publicationFailed>>
+
+CancelBeforeStage ==
+    /\ phase = Reserved
+    /\ exitPending
     /\ phase' = Cancelled
-    /\ reservationValid' = FALSE
-    /\ targetRunnable' = TRUE
-    /\ UNCHANGED <<exiting, retiredMarker, processGeneration,
-                    schedulerGeneration, activeRootGeneration,
-                    processStateLockHeld, oldBundleRetained,
-                    ownershipCommitted, publishedOverRetirement>>
+    /\ tokenLive' = FALSE
+    /\ targetRetired' = TRUE
+    /\ UNCHANGED <<tokenUses, stagedBundle, schedulerPublished,
+                    visibleGeneration, exitPending, oldBundleRetained,
+                    processStateLockHeld, schedulerLockHeld, locksNested,
+                    publicationFailed>>
 
 Terminal ==
-    /\ phase \in {Owned, Cancelled}
+    /\ phase \in {Finalized, Exiting, Cancelled}
     /\ UNCHANGED vars
 
-Next ==
-    BeginExec \/ Quiesce \/ PublishExit \/ Authorize \/ CommitProcessState
-    \/ PublishScheduler \/ FinalizeOwnership \/ CancelBeforeCommit \/ Terminal
+Next == ReserveExec \/ BeginStage \/ CompleteStage \/ BeginPublish
+        \/ CompletePublish \/ BeginFinalize \/ CompleteFinalize
+        \/ RequestExit \/ CancelBeforeStage \/ Terminal
 
 Spec ==
     Init /\ [][Next]_vars
-    /\ WF_vars(CommitProcessState)
-    /\ WF_vars(PublishScheduler)
-    /\ WF_vars(FinalizeOwnership)
+    /\ WF_vars(BeginStage)
+    /\ WF_vars(CompleteStage)
+    /\ WF_vars(BeginPublish)
+    /\ WF_vars(CompletePublish)
+    /\ WF_vars(BeginFinalize)
+    /\ WF_vars(CompleteFinalize)
+    /\ WF_vars(CancelBeforeStage)
 
 TypeOK ==
-    /\ phase \in {Idle, Reserved, Quiesced, Authorized, StateCommitted,
-                   SchedulerPublished, Owned, Cancelled}
-    /\ exiting \in BOOLEAN
-    /\ retiredMarker \in BOOLEAN
-    /\ reservationValid \in BOOLEAN
-    /\ processGeneration \in {OldGeneration, NewGeneration}
-    /\ schedulerGeneration \in {OldGeneration, NewGeneration}
-    /\ activeRootGeneration \in {OldGeneration, NewGeneration}
-    /\ targetRunnable \in BOOLEAN
-    /\ processStateLockHeld \in BOOLEAN
+    /\ phase \in {Idle, Reserved, Staging, Staged, Publishing, Published,
+                   Finalizing, Finalized, Exiting, Cancelled}
+    /\ tokenLive \in BOOLEAN
+    /\ tokenUses \in 0..1
+    /\ stagedBundle \in BOOLEAN
+    /\ schedulerPublished \in BOOLEAN
+    /\ visibleGeneration \in {OldGeneration, NewGeneration}
+    /\ exitPending \in BOOLEAN
+    /\ targetRetired \in BOOLEAN
     /\ oldBundleRetained \in BOOLEAN
-    /\ ownershipCommitted \in BOOLEAN
-    /\ publishedOverRetirement \in BOOLEAN
+    /\ processStateLockHeld \in BOOLEAN
+    /\ schedulerLockHeld \in BOOLEAN
+    /\ locksNested \in BOOLEAN
+    /\ publicationFailed \in BOOLEAN
 
-RunnableNewRootImpliesCompleteNewGeneration ==
-    targetRunnable /\ schedulerGeneration = NewGeneration =>
-        /\ processGeneration = NewGeneration
-        /\ activeRootGeneration = NewGeneration
+NoVisibleHalfExec ==
+    visibleGeneration = NewGeneration =>
+        /\ schedulerPublished
+        /\ phase \in {Finalized, Exiting}
 
-MixedGenerationIsNeverExternallyRunnable ==
-    processGeneration # schedulerGeneration =>
-        processStateLockHeld /\ ~targetRunnable
+NoCommitAfterRetire ==
+    targetRetired => ~tokenLive /\ phase \in {Exiting, Cancelled}
 
-OldBundleRetainedUntilSchedulerPublication ==
-    schedulerGeneration = OldGeneration => oldBundleRetained
-
-OldBundleReleaseRequiresCompletePublication ==
-    ~oldBundleRetained =>
-        /\ processGeneration = NewGeneration
-        /\ schedulerGeneration = NewGeneration
-        /\ activeRootGeneration = NewGeneration
-        /\ ownershipCommitted
-
-AuthorizedPublishOverRetirementIsGenerationComplete ==
-    publishedOverRetirement =>
-        /\ phase \in {SchedulerPublished, Owned}
-        /\ processGeneration = NewGeneration
-        /\ schedulerGeneration = NewGeneration
-        /\ activeRootGeneration = NewGeneration
-
-OwnedPhaseIsGenerationComplete ==
-    phase = Owned =>
-        /\ ownershipCommitted
-        /\ ~reservationValid
-        /\ ~processStateLockHeld
-        /\ targetRunnable
-        /\ processGeneration = NewGeneration
-        /\ schedulerGeneration = NewGeneration
-
-AuthorizedExecEventuallySettles ==
-    phase \in {Authorized, StateCommitted, SchedulerPublished} ~>
-        phase = Owned
+TokenSingleUse == tokenUses <= 1
+ProcessAndSchedulerLocksNeverNest ==
+    /\ ~locksNested
+    /\ ~(processStateLockHeld /\ schedulerLockHeld)
+NoNormalPublicationFailure == ~publicationFailed
+OldBundleRetainedUntilVisibleCommit ==
+    visibleGeneration = OldGeneration => oldBundleRetained
+ExitEventuallyWins ==
+    exitPending ~> phase \in {Exiting, Cancelled}
+ReservedExecEventuallySettles ==
+    phase \in {Reserved, Staging, Staged, Publishing, Published, Finalizing}
+        ~> phase \in {Finalized, Exiting, Cancelled}
 
 =============================================================================
