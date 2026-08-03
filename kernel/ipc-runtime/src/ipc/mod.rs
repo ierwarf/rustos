@@ -25,9 +25,9 @@ use alloc::vec::Vec;
 use core::ptr;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+mod endpoint_priority;
 mod shared_region_hold;
 mod slab;
-mod endpoint_priority;
 
 pub use endpoint_priority::EndpointCallPriority;
 use endpoint_priority::EndpointObject;
@@ -183,6 +183,34 @@ pub struct KernelTransferredHandle {
     transfer_id: u64,
     token: HandleToken,
     rights: HandleRights,
+}
+
+/// Integer-only capability ticket that may cross a Ring0/Ring3 byte boundary.
+///
+/// `KernelTransferredHandle` contains Rust enums and is therefore never a wire
+/// type.  The random nonce also prevents a service from guessing a sequential
+/// registry id or replaying a stale id after a future registry reuse.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KernelTransferTicket {
+    transfer_id: u64,
+    nonce: u64,
+}
+
+impl KernelTransferTicket {
+    pub const fn new(transfer_id: u64, nonce: u64) -> Option<Self> {
+        if transfer_id == 0 || nonce == 0 {
+            return None;
+        }
+        Some(Self { transfer_id, nonce })
+    }
+
+    pub const fn transfer_id(self) -> u64 {
+        self.transfer_id
+    }
+
+    pub const fn nonce(self) -> u64 {
+        self.nonce
+    }
 }
 
 pub type EndpointReceived = (KernelReplyHandle, Vec<u8>, Vec<KernelTransferredHandle>);

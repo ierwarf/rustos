@@ -103,6 +103,26 @@ scope = "kernel/compat/src/user/syscall/linux/proc_broker_ops.rs"
 regex = '(?s)fn syscall_linux_rustos_proc_activate_broker.*?let mut activations = DEFERRED_ACTIVATIONS\.lock\(\);(?:(?!drop\(activations\)).)*record_milestone'
 reason = "single activation evidence must run only after the capability registry guard is released"
 
+[[forbidden_patterns]]
+scope = "kernel/hal/src/arch/idt/handlers.rs"
+regex = 'stack_frame\.stack_pointer\.as_u64\(\)\s+as\s+\*const|slice::from_raw_parts'
+reason = "user-controlled exception RSP is diagnostic data, never a kernel-readable pointer"
+
+[[forbidden_patterns]]
+scope = "kernel/compat/src/user/syscall/linux/service_ops/vfs_meta.rs"
+regex = 'MaybeUninit|assume_init|from_raw_parts\([^\n]*KernelTransferredHandle'
+reason = "ring3 transfer bytes must decode through the integer-only ticket wire"
+
+[[forbidden_patterns]]
+scope = "kernel/hal/src/arch/clock.rs"
+regex = 'const fn tsc_clocksource_admitted\([^)]*\)[^{]*\{\s*true\s*\}'
+reason = "raw invariant TSC is not an SMP global clocksource without skew admission"
+
+[[forbidden_patterns]]
+scope = "kernel/hal/src/arch/smp.rs"
+regex = '\(Self::Failed,\s*Self::Starting\)'
+reason = "the boot-static CPU lifecycle cannot reuse generation one after failure"
+
 # xAPIC MMIO and IA32_TSC_DEADLINE are not mutually serializing. The local LVT
 # must be unmasked and fenced before the first deadline is armed, or a vCPU
 # descheduled in the masked window can permanently lose its first clockevent.
@@ -210,16 +230,18 @@ tokens = [
     "interrupt_install.retain_permanent();",
 ]
 
-# Recoverable stack faults are a three-domain transaction.  The scheduler
-# snapshots immutable identity, process state applies without waiting, and the
-# scheduler revalidates the same task/root/stack before metadata publication.
+# Release containment eagerly maps every usable stack page because exception
+# context cannot wait for ProcessStateLock. The retained lazy-growth code is a
+# future deferred-worker refinement and is not the normal release path.
 [[required_sequences]]
-path = "kernel/ps/src/multitask/current.rs"
+path = "kernel/compat/src/user/process/mod.rs"
 tokens = [
-    "prepare_current_user_stack_growth_on_fault",
-    "try_with_process_state_mut",
-    "commit_current_user_stack_growth",
-    "retire_current_user_task_due_to_fault",
+    "USER_STACK_INITIAL_COMMIT_PAGES: usize = USER_STACK_RESERVE_PAGES - USER_STACK_GUARD_PAGES",
+    "let usable_start = reserve_start",
+    "UserStackState::new(",
+    "usable_start.as_u64(),",
+    "map_zeroed_user_pages_at(",
+    "USER_STACK_INITIAL_COMMIT_PAGES,",
 ]
 
 # Exec authorization linearizes against process exit before scheduler root
@@ -230,8 +252,78 @@ path = "kernel/ps/src/multitask/current.rs"
 tokens = [
     "begin_exec(process_handle)",
     "authorize_exec(exec_reservation)",
+    "process_table::replace_for_exec_and_publish(",
     "scheduler_mut().exec_current_user_process",
-    "process_table::replace_for_exec(",
+]
+
+[[required_sequences]]
+path = "kernel/ps/src/multitask/process_table.rs"
+tokens = [
+    "state.replace_for_exec(",
+    "object.mm_generation = reservation.next_mm_generation;",
+    "let published_handle = publish_scheduler()",
+    "object.exec_in_progress = false;",
+    "Some((closed, old_state))",
+    "drop(old_state);",
+]
+
+[[required_sequences]]
+path = "kernel/ps/src/multitask/irq.rs"
+tokens = [
+    "fn publish_deferred_reschedule(",
+    "local_request.store(1, Ordering::Release);",
+    "fanout_pending.store(true, Ordering::Release);",
+    "if nucleus_core::util::lockdep::preemption_disabled()",
+    "flush_deferred_reschedule_fanout();",
+]
+
+[[required_sequences]]
+path = "kernel/ps/src/multitask/irq.rs"
+tokens = [
+    "let flusher = current_cpu_index();",
+    "arm_remote_reschedule(deferred_reschedule_flag(target))",
+    "if !reschedule_notification_required(target, flusher)",
+    "crate::arch::msi::send_reschedule_ipi(descriptor.apic_id)",
+]
+
+[[required_sequences]]
+path = "kernel/ps/src/multitask/cpu_local.rs"
+tokens = [
+    "drop(",
+    "self.guard",
+    "super::irq::flush_deferred_reschedule_fanout();",
+]
+
+[[required_sequences]]
+path = "kernel/io-manager/src/input/dvm_ring.rs"
+tokens = [
+    "fn try_claim_drain(owner: &AtomicBool) -> bool",
+    ".compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)",
+    "if !try_claim_drain(&DRAIN_IN_PROGRESS)",
+    "let reset_generation = RESET_PENDING_GENERATION.swap(0, Ordering::AcqRel);",
+]
+
+[[required_sequences]]
+path = "kernel/hal/src/arch/idt/handlers.rs"
+tokens = [
+    "fn non_maskable_interrupt_handler(_stack_frame: InterruptStackFrame)",
+    "emergency_exception_marker(2);",
+]
+
+[[required_sequences]]
+path = "kernel/hal/src/arch/idt/mod.rs"
+tokens = [
+    ".set_handler_fn(non_maskable_interrupt_handler)",
+    ".set_stack_index(crate::arch::gdt::NMI_IST_INDEX);",
+]
+
+[[required_sequences]]
+path = "kernel/hal/src/arch/clock.rs"
+tokens = [
+    "let tsc_hz = invariant_tsc_supported()",
+    "TSC_HZ.store(tsc_hz, Ordering::Relaxed);",
+    "if tsc_clocksource_admitted(super::smp::cpu_count())",
+    "if let Some((base, period_fs, counter)) = hpet",
 ]
 
 [[required_sequences]]
@@ -248,7 +340,7 @@ tokens = [
 # atomic and therefore invisible to a data-race detector.
 [[per_cpu_statics]]
 path = "kernel/hal/src/arch/gdt.rs"
-names = ["RING0_STACKS", "DOUBLE_FAULT_STACKS", "TSS_SLOTS", "GDT_SLOTS"]
+names = ["RING0_STACKS", "DOUBLE_FAULT_STACKS", "NMI_STACKS", "TSS_SLOTS", "GDT_SLOTS"]
 capacity = "MAX_SUPPORTED_CPUS"
 
 [[per_cpu_statics]]

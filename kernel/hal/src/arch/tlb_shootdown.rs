@@ -218,8 +218,18 @@ pub fn activate_address_space(root: PhysAddr) {
     );
     #[cfg(rustos_boot_image)]
     interrupts::without_interrupts(|| {
-        write_cr3(root);
         let logical_index = current_cpu_index();
+        // ORDERING: Acquire observes this CPU's previous Release publication.
+        // The shootdown protocol targets every eligible CPU and flushes by an
+        // exact generation, so rewriting an already-active root adds no
+        // visibility. Avoiding that write preserves the CPU's TLB across
+        // same-process threads and same-task scheduler turns.
+        // ORDERING: This Acquire is the exact same-CPU publication check.
+        let active_root = ACTIVE_ROOT[logical_index].load(Ordering::Acquire);
+        if !activation_requires_cr3_write(active_root, root_raw) {
+            return;
+        }
+        write_cr3(root);
         // ORDERING: Release publishes the active root only after CR3 accepted
         // the same frame. Shootdowns target every eligible CPU rather than
         // racing this value as a target-selection filter.
@@ -309,18 +319,22 @@ fn finish_shootdown(scope: MutationScope) {
         return;
     };
 
+    let mutation_root = scope_root(scope);
     for descriptor in topology.cpus() {
         let target = usize::from(descriptor.logical_index);
         // ORDERING: Acquire observes online admission before target selection.
-        if target == current || !SHOOTDOWN_ELIGIBLE[target].load(Ordering::Acquire) {
+        let eligible = SHOOTDOWN_ELIGIBLE[target].load(Ordering::Acquire);
+        // ORDERING: Acquire observes the root published at target activation.
+        // It is diagnostic input only: filtering by it would race a later
+        // IRQ-time activation onto the mutation root.
+        let active_root = ACTIVE_ROOT[target].load(Ordering::Acquire);
+        if target == current || !shootdown_target_is_required(eligible, active_root, mutation_root)
+        {
             continue;
         }
         // Every eligible CPU is targeted. Filtering by the observed root would
         // race an IRQ-time address-space activation that intentionally cannot
         // take the mutation lock.
-        // ORDERING: Acquire observes the root published at target activation
-        // before this initiator decides whether the CPU belongs in the batch.
-        let active_root = ACTIVE_ROOT[target].load(Ordering::Acquire);
         assert_ne!(
             active_root, 0,
             "TLB invariant: eligible target has no active root"
@@ -336,7 +350,6 @@ fn finish_shootdown(scope: MutationScope) {
 
     // The sender also flushes unconditionally. This is deliberately broader
     // than the mutation scope so a concurrent local activation cannot escape.
-    let _ = scope;
     tlb::flush_all();
 
     for descriptor in topology.cpus() {
@@ -406,12 +419,20 @@ const fn scope_root(scope: MutationScope) -> u64 {
 }
 
 #[cfg(any(rustos_boot_image, test))]
-const fn scope_targets_root(scope: MutationScope, active_root: u64) -> bool {
-    active_root != 0
-        && match scope {
-            MutationScope::AddressSpace(root) => active_root == root,
-            MutationScope::Global => true,
-        }
+const CONSERVATIVE_SHOOTDOWN_TARGETS: bool = true;
+
+#[cfg(any(rustos_boot_image, test))]
+const fn shootdown_target_is_required(
+    eligible: bool,
+    _active_root: u64,
+    _mutation_root: u64,
+) -> bool {
+    eligible && CONSERVATIVE_SHOOTDOWN_TARGETS
+}
+
+#[cfg(any(rustos_boot_image, test))]
+const fn activation_requires_cr3_write(active_root: u64, requested_root: u64) -> bool {
+    active_root != requested_root
 }
 
 #[cfg(any(rustos_boot_image, test))]
@@ -444,8 +465,9 @@ fn current_cpu_index() -> usize {
 #[cfg(rustos_boot_image)]
 fn write_cr3(root: PhysAddr) {
     let frame = PhysFrame::containing_address(root);
-    // SAFETY: callers hold the protocol lock, the root is page-aligned and
-    // owned by kernel-mm, and interrupts are excluded across the CR3 write.
+    // SAFETY: the root is page-aligned and owned by kernel-mm. Activation
+    // excludes local interrupts; online admission additionally owns the
+    // protocol lock before its mandatory parked-to-online flush.
     unsafe {
         Cr3::write(frame, Cr3Flags::empty());
     }
@@ -455,18 +477,27 @@ fn write_cr3(root: PhysAddr) {
 mod tests {
     use core::sync::atomic::{AtomicU64, Ordering};
 
-    use super::{MutationScope, acknowledgements_complete, scope_root, scope_targets_root};
+    use super::{
+        MutationScope, acknowledgements_complete, activation_requires_cr3_write, scope_root,
+        shootdown_target_is_required,
+    };
 
     #[test]
-    fn root_specific_and_global_target_selection_are_exact() {
+    fn same_root_activation_preserves_tlb_but_root_change_reloads_cr3() {
+        assert!(!activation_requires_cr3_write(0x4000, 0x4000));
+        assert!(activation_requires_cr3_write(0, 0x4000));
+        assert!(activation_requires_cr3_write(0x4000, 0x5000));
+    }
+
+    #[test]
+    fn shootdown_targets_every_eligible_cpu_regardless_of_root() {
         let root = MutationScope::AddressSpace(0x4000);
         assert_eq!(scope_root(root), 0x4000);
-        assert!(scope_targets_root(root, 0x4000));
-        assert!(!scope_targets_root(root, 0x5000));
-        assert!(!scope_targets_root(root, 0));
         assert_eq!(scope_root(MutationScope::Global), 0);
-        assert!(scope_targets_root(MutationScope::Global, 0x5000));
-        assert!(!scope_targets_root(MutationScope::Global, 0));
+        assert!(shootdown_target_is_required(true, 0x4000, 0x4000));
+        assert!(shootdown_target_is_required(true, 0x5000, 0x4000));
+        assert!(shootdown_target_is_required(true, 0x5000, 0));
+        assert!(!shootdown_target_is_required(false, 0x4000, 0x4000));
     }
 
     #[test]

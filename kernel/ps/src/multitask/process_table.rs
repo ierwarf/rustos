@@ -405,37 +405,79 @@ pub fn with_process_state_by_pid<R>(
     Some(process.with_state(|_, state| f(state)))
 }
 
-pub fn replace_for_exec(
+pub fn replace_for_exec_and_publish(
     reservation: ExecReservation,
     address_space: ProcessAddressSpace,
     linux_process_state: crate::user::linux::LinuxProcessState,
     linux_memory_map: crate::user::linux::LinuxMemoryMapState,
     linux_runtime_profile: crate::user::linux::LinuxRuntimeProfile,
     exec_path: &str,
+    publish_scheduler: impl FnOnce() -> Option<ProcessHandle>,
 ) -> Option<alloc::vec::Vec<crate::user::handles::KernelHandle>> {
     let process = retain_process(reservation.handle)?;
-    process.with_state_mut(|_, state| {
-        // Authorization already linearized exec against exit before the new
-        // root could become active. Once Scheduler installs that root this
-        // ownership transfer is deliberately independent of a later `exiting`
-        // marker: rejecting here would drop the CPU's active address space.
-        let mut table = PROCESS_TABLE.lock();
-        let object = table.lookup_object_mut(reservation.handle)?;
-        if !exec_commit_may_transfer(object, reservation) {
-            return None;
+    let (closed, old_state) = process.with_state_mut(|_, state| {
+        {
+            let mut table = PROCESS_TABLE.lock();
+            let object = table.lookup_object_mut(reservation.handle)?;
+            if !exec_commit_may_transfer(object, reservation) {
+                return None;
+            }
         }
-        let closed = state.replace_for_exec(
+
+        // Keep ProcessStateLock held from the state-generation replacement
+        // through scheduler root/context publication. A remote target may be
+        // made runnable only at the final scheduler edge; a self target keeps
+        // IRQs excluded for that edge. Thus no syscall can observe mixed old
+        // and new generations.
+        let (closed, old_state) = state.replace_for_exec(
             address_space,
             linux_process_state,
             linux_memory_map,
             linux_runtime_profile,
             exec_path,
         );
-        object.mm_generation = reservation.next_mm_generation;
-        object.exec_in_progress = false;
-        object.exec_commit_authorized = false;
-        Some(closed)
-    })
+
+        {
+            let mut table = PROCESS_TABLE.lock();
+            let object = table
+                .lookup_object_mut(reservation.handle)
+                .expect("authorized exec process disappeared before generation publication");
+            assert!(
+                exec_commit_may_transfer(object, reservation),
+                "authorized exec reservation changed before generation publication"
+            );
+            object.mm_generation = reservation.next_mm_generation;
+        }
+
+        let published_handle = publish_scheduler()
+            .expect("authorized exec scheduler publication failed after process-state commit");
+        assert_eq!(
+            published_handle, reservation.handle,
+            "exec scheduler publication changed process generation"
+        );
+
+        {
+            let mut table = PROCESS_TABLE.lock();
+            let object = table
+                .lookup_object_mut(reservation.handle)
+                .expect("published exec process disappeared before finalization");
+            assert!(
+                object.exec_in_progress
+                    && object.exec_commit_authorized
+                    && object.mm_generation == reservation.next_mm_generation,
+                "published exec transaction lost exact generation ownership"
+            );
+            object.exec_in_progress = false;
+            object.exec_commit_authorized = false;
+        }
+
+        Some((closed, old_state))
+    })?;
+    // Scheduler publication has removed the final old-root execution owner,
+    // and ProcessStateLock is now released. Only here may address-space Drop
+    // begin retirement/shootdown and wait for its exact TLB generation.
+    drop(old_state);
+    Some(closed)
 }
 
 fn exec_may_replace(object: &ProcessObject) -> bool {

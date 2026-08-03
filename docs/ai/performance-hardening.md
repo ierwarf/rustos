@@ -37,7 +37,7 @@ an independent performance failure rather than provider-revocation timing.
 | Deferred VFS maintenance per foreground turn | 1 ms | 1 ms | 1 replay |
 | Deferred netd reference maintenance per turn | 1 ms | 1 ms | 1 replay or ACK |
 | Readiness observation | 1 frame | 16 ms | 1 per deduplicated provider |
-| Interactive policy-only control | 16 ms | 100 ms | 1 |
+| Interactive policy-only control | 16 ms | 100 ms | 1; service drains at most 32 already-queued controls per turn |
 | Boot/control transaction | 100 ms | 5 s | 1 |
 | Bulk external-device data | 5 s | 30 s | 1 |
 
@@ -51,8 +51,9 @@ outer timeout instead of terminating at the ten-second product target.
 cancellation witnesses.
 
 Provider lifecycle limits apply to the complete turn, not to each retry.
-Netd dup/close divides one 16 ms budget across three attempts and moves the
-committed operation's ACK to the housekeeping maintenance queue. VFS and netd
+Netd dup/close may retry only an early transport break inside one remaining
+100 ms interactive-control budget and moves the committed operation's ACK to
+the housekeeping maintenance queue. VFS and netd
 maintenance each process at most one 100 ms-bounded control item per yielded
 housekeeping turn, IPC
 transfer disposal releases at most one entry, and retirement acknowledges at
@@ -88,15 +89,73 @@ the advertised capacity remains exact even when a producer races a popped
 item's requeue. No first-use `BTreeMap` or `VecDeque` growth occurs in those
 tracked critical sections.
 
-Per-CPU lock-diagnostic storage is future-facing only. The enabled RustOS guest
-has one vCPU and no AP bring-up or SMP scheduler; measurements must not label a
-single-BSP run as multicore evidence.
+Per-CPU lock diagnostics are indexed only by the dense admitted logical CPU
+identity; raw APIC IDs never index their storage. A configured vCPU count is
+not multicore evidence by itself: every admitted CPU must publish its online,
+clockevent, idle, user-dispatch, and reschedule-IPI witnesses, and the 1/2/4/8
+runtime matrix remains the release authority.
 
 Slow-IPC diagnostics are an observation rail, not a second workload. Each of
 the generic and typed-service paths emits at most four records per second after
 its early sample set. A sustained input or storage load therefore remains
 diagnosable across the run without paying for hundreds of emergency debugcon
 writes during the same boot second.
+Rejected one-shot IPC replies follow the same rule at both sides of the
+boundary. Ring0 preserves four exact reply-capability samples, then emits at
+most one cumulative rejection summary per second. Each ring3 service reply
+lane preserves its first four failures and only power-of-two cumulative totals
+afterward. A cancelled caller therefore remains diagnosable without allowing
+the synchronous debug port and its VM exits to amplify the timeout storm.
+The private UI profile attributes GPU completion separately and reports wall
+time not covered by named phases. A slow total with many independently inflated
+small phases points to preemption or diagnostic contention; it must not be
+misreported as GPU execution time merely because the completion query begins
+the owner turn.
+The scheduler profile accumulates measured task runtime, dispatch counts,
+same-task decisions, real task switches, address-space switches, cross-CPU
+migrations, timer/RTC/reschedule-IPI/software entry causes, and aggregate/max
+global-lock wait and hold time in fixed arrays and counters. The first eligible
+CPU destructively snapshots only the top four tasks once per second. IRQ code
+publishes it into one release/acquire pending slot after the global scheduler
+owner is released; housekeeping owns the fixed header, transition, lock,
+packed entry-cause, and four task milestone records. The BSP is not assumed to
+retain steady-state user work. Locality history is keyed by the exact task id
+across windows and is observation only; slot reuse is reset and no scheduler
+policy may consume profiler state.
+This distinguishes a permanently runnable Ring3 worker from Ring0 dispatch
+churn without adding logging or allocation to the scheduling critical section.
+Ordinary same-class fair selection may retain the exact task's last CPU only
+within one scheduler minimum-granularity unit of the global least vruntime.
+This cache-locality bound is source-tested, model-checked, and mutation-tested;
+it cannot override exact IPC/activation handoffs, strict-class recovery,
+affinity, or remote running ownership. Runtime evidence must still show that
+migrations fall without unfair ready-age growth before this becomes accepted
+as a useful optimization.
+The serialized SMP scheduler returns an exact source/destination-slot token.
+When both slots are equal, the IRQ leaf retains the already-active
+CR3/TSS/syscall-stack/segment/FS/GS state; a real slot change restores all of
+it. Address-space activation also preserves the TLB for an identical
+release-published root, while AP Online admission and generation-bound
+shootdowns keep their mandatory flushes. Do not skip SIMD restore merely
+because the task slot stayed equal: ring0 compiler code executes after the
+save boundary and may use vector registers.
+When software scheduler entries dominate timer, RTC, and reschedule-IPI
+entries, inspect synchronous service loops before changing timer or IPI policy.
+A separate byte-only `reply` followed by `recv_with_sender` costs an avoidable
+ring3 boundary and scheduler transition per request. The admitted fused
+`reply_recv_with_sender` path preflights both phases before commit, preserves
+the exact caller handoff, and then blocks or dequeues under the existing
+endpoint check-arm-recheck protocol. Measure its effect first on one service;
+do not mass-migrate multi-source supervisors or handle-bearing endpoints.
+Inputd uses the fully fused single-endpoint loop. Loaderd uses the same path
+only for byte-only requests with no reply-dependent descriptor cleanup or
+bootstrap demotion; spawn replies retain the split boundary so those actions
+complete before loaderd can block again. A zero-byte dequeued loader call is a
+malformed live request and receives terminal `EINVAL`, never an idle hint.
+Each uiserver helper emits one post-demotion `(thread name, kernel-stamped
+TID)` record. Scheduler top-task samples can therefore identify a hot helper
+without adding periodic tracing to the presentation loop or trusting the name
+as authority.
 
 The kernel service registry publishes an endpoint last and clears it first.
 The steady-state lookup path takes an epoch/endpoint snapshot, rechecks both
@@ -134,16 +193,33 @@ lock, and service restart invalidates it by advancing the epoch.
 
 ## UI Runtime
 
-- Rootd's early readiness loop drains up to 32 already-queued control requests
-  per turn. The 250 ms readiness/backoff delay is permitted only when that turn
-  made no control-plane progress. Sleeping after every single registration
-  serializes the concurrently started foundation services and violates the
-  measured ten-second boot-to-UI release target.
+- Rootd's early and steady-state supervisor loops and runtimed's session-owner
+  loop drain up to the shared 32-request already-queued control budget per
+  turn. Rootd's 250 ms readiness/backoff delay is permitted only when its
+  early turn made no control-plane progress. Lifecycle/restart and runtimed's
+  catalog/launch/socket owners run after each bounded burst. Sleeping or
+  re-entering those slower owners after every single registration, checkpoint,
+  or session request serializes a synchronous dependency chain; draining
+  without a bound can starve those owners instead.
+  After bootstrap, an empty rootd turn sleeps for the ABI-owned 10 ms
+  supervisor interval through the root-supervisor timer broker. A yield-only
+  idle loop is forbidden: it leaves a System-class task permanently runnable
+  and steals CPU from the display/input causal chain on every vCPU.
+  Initd, runtimed, and netd's eventless INET readiness lane likewise use a
+  10 ms minimum steady-state observation cadence. Their former 1–2 ms timers
+  generated more than a thousand unrelated wakeups per second on a two-vCPU
+  guest. This is a bounded bridge until those heterogeneous sources share an
+  event wait object, not permission to widen synchronous IPC deadlines.
 
 - Default KVM-smoke runs keep coarse `uiserver: update tick` logs only.
 - Generic and typed slow-IPC diagnostics each emit at most one representative
-  sample per second. The synchronous debug sink cannot become an overload
-  amplifier; aggregate counters and milestones retain the dropped volume.
+  sample per second. Typed terminal failures have a separate one-per-second
+  lane, so an earlier slow success cannot hide the failing call. A rate-limited
+  failed VFS poll control record includes its exact query subtype and epoll
+  token, so CREATE/SNAPSHOT/CTL/retire can be distinguished without enabling
+  an unbounded trace. The synchronous debug sink cannot
+  become an overload amplifier; aggregate counters and milestones retain the
+  dropped volume.
 - Immutable successful syscalld time admissions are process-local cached
   exact keys. In particular, syscalld never routes its own receive-loop
   backoff through its own IPC endpoint.
@@ -249,11 +325,22 @@ lock, and service restart invalidates it by advancing the epoch.
   first blocking dispatch. It must not depend on an incoming event to flush
   the request that creates that event; later callback batches retain the same
   explicit post-dispatch flush ordering.
+- Uiserver's Wayland listener blocks on its registered epoll readiness edge;
+  it does not probe `accept4` on a fixed cadence. The accept worker publishes
+  bounded-queue ownership before signaling the coalesced UI wake, and the UI
+  thread fails closed if a received stream has no matching ownership token.
+  Client protocol dispatch likewise runs only for backend-fd readiness, a
+  completed accept, server-generated input, or a due frame callback. An idle
+  compositor turn must not issue empty VFS/NETD reads merely because a runtime
+  or console deadline woke the UI loop.
 - Wayland client admission calls the generic Linux `epoll_ctl(ADD)` path inside
   `wayland-server`. Persistent epoll create/ADD/MOD/DEL/retire/purge operations
   mutate checkpointed vfsd state and use the bounded 100 ms interactive-control
   rail. The 16 ms rail is reserved for non-consuming readiness queries; using
   it for control can reject a healthy accepted client under SMP contention.
+  The exact target socket reference acquired for ADD is itself a netd DUP
+  mutation and follows the same rule: one complete 100 ms attempt, no retry of
+  a real timeout, and background replay ownership for uncertain completion.
 - The pre-catalog UI bootstrap reads only the signed Init environment registry.
   Its two service-local defaults are sealed in runtimed and are revalidated
   byte-for-byte against the generated launch catalog when that catalog is
@@ -273,6 +360,11 @@ lock, and service restart invalidates it by advancing the epoch.
   relay, an active RustOS provider, and a non-zero immutable source frame.
   On clean close it requires healthy idle ticks and an actual DVM pointer
   ingress marker emitted only after the host pointer enters the GTK window.
+- The per-run KVM acceptance file is an immutable 256-byte private contract.
+  Runtimed and uiserver read it with explicit offsets, so profiler injection
+  cannot serialize on or mutate vfsd's durable open-description cursor path.
+  Missing, oversized, malformed, or partially published contracts remain
+  disabled; release images do not gain profiler authority.
 - Under pointer stress, expected healthy markers are `input_errors=0`,
   `input_slow=0`, recurring `update tick`, and no watchdog/stall lines.
 - A DVM input ring must be drained by inputd's MSI-X-woken, capability-gated
@@ -302,6 +394,12 @@ lock, and service restart invalidates it by advancing the epoch.
   one-way `SYS_RUSTOS_SCHED_DEMOTE_SELF` before work. The KVM UI profile gate
   requires a nonzero `background_thread_demotions` count; a demotion failure
   exits uiserver rather than quietly running the wrong scheduling model.
+  Demotion clears the base class and monotonically caps inherited permanent
+  weight at `NICE_0_LOAD`; it never raises an already lower weight. Exact
+  synchronous service work instead receives only reply-scoped priority
+  donation and direct handoff. This separates Linux CFS-style weighted fair
+  share from the bounded message inheritance described by QNX Neutrino and
+  seL4 MCS, so clone inheritance cannot become permanent service authority.
   The bounded one-shot GPU initialization worker is the sole exception: it
   retains uiserver's boot-critical class until it publishes the mandatory DVM
   compositor result and exits, so background work cannot starve product boot.
@@ -322,14 +420,17 @@ lock, and service restart invalidates it by advancing the epoch.
   ordering and vruntime tie behavior while avoiding two extra full-table plus
   IPC-donation classification passes when no System task is ready.
 - At most two consecutive System dispatches may run while User work is ready;
-  the next dispatch is reserved for User work. Independently, every ready User
-  task has a 2 ms ready-age rail and every ready System task has a 2 ms rail.
-  A selection micro-optimization must not bypass these limits or convert launch
-  weights into strict-class authority. A blocked caller still hands directly
-  to its exact receiver only while no task has crossed an absolute ready-age
-  rail. Once overdue, System then User recovery runs before fresh spawn,
-  latency, or generic IPC handoffs; queued hints are retained for the next
-  dispatch.
+  the next ordinary dispatch is reserved for the lowest-vruntime User task.
+  Every ready System task has a 2 ms recovery rail, while User work has no
+  unadmitted wall-clock deadline: under overload such a promise is impossible
+  and made ready age override weight on nearly every turn. User progress comes
+  from the bounded System and handoff bursts plus weight-normalized vruntime.
+  Exact synchronous IPC may hand directly to its receiver/caller for at most
+  eight turns; an overdue System continuation then runs before fresh spawn,
+  latency, or generic IPC handoffs. Queued hints remain owned for a later turn.
+  This follows Linux CFS/EEVDF's virtual-runtime/lag accounting rather than
+  presenting a hard deadline without the bandwidth admission required by
+  `SCHED_DEADLINE`.
 - An authenticated netd local-socket completion may enqueue only a User task in
   the deduplicated 16-entry latency FIFO. At most eight such handoffs run
   consecutively, stale tasks are discarded, and a full queue drops the new

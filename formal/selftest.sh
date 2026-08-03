@@ -162,6 +162,11 @@ python3 formal/check-concurrency-triangle.py
     exit 1
 }
 python3 formal/check-proof-index.py
+[[ -x formal/check-native-syscall-numbers.py ]] || {
+    echo "native syscall number checker is missing or not executable" >&2
+    exit 1
+}
+python3 formal/check-native-syscall-numbers.py
 [[ -x formal/check-system-flows.sh ]] || {
     echo "system-flow contract checker is not executable" >&2
     exit 1
@@ -211,5 +216,14 @@ rg -q 'run-proof-index\.sh' formal/verify-all.sh || {
     echo "formal PR gate omits proof-index validation" >&2
     exit 1
 }
+rg -q 'FORMAL_PROOF_INDEX_ALREADY_PASSED=1' formal/verify-all.sh || {
+    echo "Kani and Verus can race while rewriting the shared proof index" >&2
+    exit 1
+}
+rg -q 'run_parallel_lane source-conformance' formal/verify-all.sh \
+    && rg -q 'run_parallel_lane tlc' formal/verify-all.sh || {
+        echo "two-minute formal gate stopped parallelizing independent lanes" >&2
+        exit 1
+    }
 
 printf 'formal selftest passed: %s registered models\n' "$(printf '%s\n' "$registered" | wc -l)"

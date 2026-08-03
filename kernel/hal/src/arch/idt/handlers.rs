@@ -158,50 +158,22 @@ fn rustos_default_handler_aligned(
     );
 }
 
-#[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
-pub extern "x86-interrupt" fn non_maskable_interrupt_handler(stack_frame: InterruptStackFrame) {
-    let cr2 = Cr2::read().map(|addr| addr.as_u64()).unwrap_or(u64::MAX);
-    crate::debug::println!(
-        "NMI: cr2={:#x} rip={:#x} cs={:#x} rflags={:#x} rsp={:#x} ss={:#x}",
-        cr2,
-        stack_frame.instruction_pointer.as_u64(),
-        stack_frame.code_segment.0,
-        stack_frame.cpu_flags.bits(),
-        stack_frame.stack_pointer.as_u64(),
-        stack_frame.stack_segment.0,
-    );
-    if let Some(snapshot) = crate::hooks::current_user_snapshot() {
-        crate::debug::println!(
-            "NMI: current user abi={:?} pid={} tid={} session={:?}",
-            snapshot.abi,
-            snapshot.process_id,
-            snapshot.thread_id,
-            snapshot.console_session_raw,
-        );
-    } else {
-        crate::debug::println!("NMI: no current user task");
-    }
-    crate::debug::dump_recent_trace_locations("nmi");
+pub extern "x86-interrupt" fn non_maskable_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    // NMI can interrupt the owner of every kernel lock. Keep this leaf free of
+    // formatted logging, hook-registry access, process-state access,
+    // allocation, and tracked locks. Rich diagnostics must be collected from
+    // ordinary task/IRQ context after a future lock-free snapshot handoff.
+    emergency_exception_marker(2);
 }
 
 #[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
 fn log_general_protection_details(error_code: u64, rip: u64, rsp: u64) {
     crate::debug::println!(
-        "general protection detail: ec={:#x} rip={:#x}",
+        "general protection detail: ec={:#x} rip={:#x} rsp={:#x}",
         error_code,
         rip,
+        rsp,
     );
-
-    for index in 0..8usize {
-        let addr = rsp.saturating_add((index * core::mem::size_of::<u64>()) as u64);
-        let value = unsafe { (addr as *const u64).read_volatile() };
-        crate::debug::println!(
-            "general protection stack[{}]: {:#x} = {:#x}",
-            index,
-            addr,
-            value
-        );
-    }
 }
 
 #[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
@@ -215,7 +187,7 @@ fn log_page_fault_details(error_code: u64, cr2: u64, rip: u64, rsp: u64) {
     let shadow_stack = (error_code & 0x40) != 0;
     let sgx = (error_code & 0x80) != 0;
     crate::debug::println!(
-        "page fault detail: ec={:#x} present={} write={} user={} rsvd={} ifetch={} pkey={} sstk={} sgx={} rip={:#x} cr2={:#x}",
+        "page fault detail: ec={:#x} present={} write={} user={} rsvd={} ifetch={} pkey={} sstk={} sgx={} rip={:#x} cr2={:#x} rsp={:#x}",
         error_code,
         present,
         write,
@@ -227,13 +199,8 @@ fn log_page_fault_details(error_code: u64, cr2: u64, rip: u64, rsp: u64) {
         sgx,
         rip,
         cr2,
+        rsp,
     );
-
-    for index in 0..8usize {
-        let addr = rsp.saturating_add((index * core::mem::size_of::<u64>()) as u64);
-        let value = unsafe { (addr as *const u64).read_volatile() };
-        crate::debug::println!("page fault stack[{}]: {:#x} = {:#x}", index, addr, value);
-    }
 }
 
 pub extern "x86-interrupt" fn double_fault_handler(

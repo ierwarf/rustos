@@ -15,6 +15,7 @@ for witness in \
     'UI_BOOT_GPU_ACTIVATION_BUDGET_MS: u64 = 750' \
     'IPC_READINESS_QUERY_HARD_LIMIT_MS: u64 = 16' \
     'IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS: u64 = 100' \
+    'IPC_CONTROL_DRAIN_BUDGET: usize = 32' \
     'IPC_BOOT_CONTROL_HARD_LIMIT_MS: u64 = 5_000' \
     'DVM_STORAGE_BOOT_READY_HARD_LIMIT_MS: u64 = 4_000' \
     'IPC_BULK_DATA_HARD_LIMIT_MS: u64 = 30_000' \
@@ -46,6 +47,7 @@ if [[ "${#raw_timeout_owners[@]}" -ne 1 \
 fi
 
 ipc_ops=kernel/compat/src/user/syscall/linux/ipc_ops.rs
+ipc_reply_diagnostics=kernel/compat/src/user/syscall/linux/ipc_reply_diagnostics.rs
 rg -Fq 'SYS_RUSTOS_IPC_CALL_BOUNDED' "$ipc_ops" || {
     echo "explicit bounded userspace IPC syscall is missing" >&2
     exit 1
@@ -75,14 +77,64 @@ grep -Fq 'epoch_before == epoch_after' <<<"$service_lookup_body" || {
 }
 
 rootd=services/rootd/src/main.rs
-rg -Fq 'const ROOTD_REQUEST_DRAIN_BUDGET: usize = 32;' "$rootd" || {
+rootd_drain=services/rootd/src/control_drain.rs
+rg -Fq 'const ROOTD_REQUEST_DRAIN_BUDGET: usize = IPC_CONTROL_DRAIN_BUDGET;' "$rootd_drain" || {
     echo "rootd boot control burst drain bound drifted" >&2
     exit 1
 }
+if [[ "$(rg -Fc 'control_drain::drain_rootd_control_requests' "$rootd")" -ne 2 ]]; then
+    echo "rootd early and steady-state loops must share the bounded control drain" >&2
+    exit 1
+fi
 rg -Fq '&& served == 0' "$rootd" || {
     echo "rootd can sleep through an already-progressing boot control burst" >&2
     exit 1
 }
+rg -Fq 'ROOTD_SUPERVISOR_IDLE_POLL_MS: u64 = 10' "$performance" || {
+    echo "rootd steady-state supervisor poll bound drifted" >&2
+    exit 1
+}
+supervisor_idle_body="$(sed -n '/fn supervisor_idle()/,/^}/p' "$rootd")"
+grep -Fq 'wait_for_restart_backoff(delay_ms)' <<<"$supervisor_idle_body" || {
+    echo "rootd steady-state supervisor stopped using the bounded wait broker" >&2
+    exit 1
+}
+if grep -Fq 'yield_now()' <<<"$supervisor_idle_body"; then
+    echo "rootd steady-state supervisor regressed to a runnable yield loop" >&2
+    exit 1
+fi
+
+runtimed_main=services/runtimed/src/main.rs
+rg -Fq 'const SESSION_REQUEST_DRAIN_BUDGET: usize = IPC_CONTROL_DRAIN_BUDGET;' "$runtimed_main" || {
+    echo "runtimed session control burst drain bound drifted" >&2
+    exit 1
+}
+rg -Fq 'drain_session_request_burst(session_endpoint, &mut state)' "$runtimed_main" || {
+    echo "runtimed main loop stopped draining its ready session dependency burst" >&2
+    exit 1
+}
+rg -Fq 'const POLL_INTERVAL: Duration = Duration::from_millis(10);' services/initd/src/main.rs \
+    && rg -Fq 'pub(crate) const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(10);' "$runtimed_main" \
+    && rg -Fq 'const INET_READINESS_POLL_INTERVAL: Duration = Duration::from_millis(10);' services/netd/src/main.rs || {
+        echo "steady-state Ring3 pollers regained sub-10ms scheduler churn" >&2
+        exit 1
+    }
+
+endpoint_priority=kernel/ipc-runtime/src/ipc/endpoint_priority.rs
+rg -Fq 'super::MAX_ENDPOINT_PENDING_MESSAGES' "$endpoint_priority" \
+    && rg -Fq 'IPC_CONTROL_DRAIN_BUDGET.saturating_mul(2)' "$endpoint_priority" || {
+        echo "kernel endpoint admission no longer retains two control drain bursts" >&2
+        exit 1
+    }
+
+typed_ipc=kernel/compat/src/user/syscall/linux/service_ops/ipc_helpers.rs
+typed_ipc_diagnostics=kernel/compat/src/user/syscall/linux/service_ops/ipc_helpers_diagnostics.rs
+rg -Fq 'static FAILED_SERVICE_CALL_LOG_RATE_STATE' "$typed_ipc_diagnostics" \
+    && rg -Fq 'static SLOW_SERVICE_CALL_LOG_RATE_STATE' "$typed_ipc_diagnostics" \
+    && rg -Fq 'diagnostics::log_failed_service_call(' "$typed_ipc" || {
+        echo "terminal typed-service failures lost their independent bounded diagnostic lane" >&2
+        exit 1
+    }
 
 ui_hot_paths=(
     services/uiserver/src/render.rs
@@ -99,6 +151,9 @@ fi
 
 for service in inputd storaged devmgrd netd; do
     source="services/$service/src/main.rs"
+    if [[ "$service" == inputd ]]; then
+        source="services/inputd/src/service_loop.rs"
+    fi
     rg -Fq 'rustos_svc_runtime::ipc::register_service_endpoint' "$source" || {
         echo "$service does not use the single-attempt shared registration path" >&2
         exit 1
@@ -156,9 +211,13 @@ rg -Fq 'const SYSTEM_READY_LATENCY_BOUND_MS: u64 = 2;' \
     echo "System dispatch latency rail exceeds the interactive frame budget" >&2
     exit 1
 }
-rg -Fq 'const USER_READY_LATENCY_BOUND_MS: u64 = 2;' \
+if rg -Fq 'USER_READY_LATENCY_BOUND_MS' kernel/ps/src/multitask/scheduler.rs; then
+    echo "unadmitted User wall-clock deadline bypasses fair-share accounting" >&2
+    exit 1
+fi
+rg -Fq 'fn reserved_user_pick(&self, current: usize) -> Option<usize>' \
     kernel/ps/src/multitask/scheduler.rs || {
-    echo "User dispatch latency rail exceeds the interactive frame budget" >&2
+    echo "User reservation is no longer isolated from wall-clock ready age" >&2
     exit 1
 }
 rg -Fq 'background_probe_rank' services/runtimed/src/catalog.rs || {
@@ -262,7 +321,12 @@ rg -Fq 'const GPU_INITIALIZATION_RETAINS_BOOT_CLASS: bool = true;' \
     echo "mandatory GPU initialization can be demoted before its boot result" >&2
     exit 1
 }
-rg -Uq 'let reply = syscall3\([\s\S]{0,700}completion_demotion_due\(reply, handled\.demote_after_reply\)' \
+rg -Fq 'context.weight = (context.weight & LOAD_WEIGHT_MASK).min(NICE_0_LOAD);' \
+    kernel/ps/src/multitask/scheduler.rs || {
+    echo "scheduler self-demotion no longer caps inherited permanent fair weight" >&2
+    exit 1
+}
+rg -Uq 'let reply = unsafe \{[\s\S]{0,700}rustos_svc_runtime::ipc::reply\([\s\S]{0,700}completion_demotion_due\(reply, handled\.demote_after_reply\)' \
     services/loaderd/src/main.rs || {
     echo "loaderd can demote before its terminal UI spawn reply completes" >&2
     exit 1
@@ -342,8 +406,39 @@ rg -Fq 'const MAX_SLOW_IPC_LOGS_PER_SECOND: usize = 1;' "$ipc_ops" || {
     echo "generic IPC slow logging is no longer rate-bounded" >&2
     exit 1
 }
-rg -Fq 'const MAX_SLOW_SERVICE_CALL_LOGS_PER_SECOND: usize = 1;' \
-    kernel/compat/src/user/syscall/linux/service_ops/ipc_helpers.rs || {
+rg -Fq 'const MAX_REPLY_REJECTION_SUMMARIES_PER_SECOND: u8 = 1;' "$ipc_reply_diagnostics" || {
+    echo "late IPC reply rejection summaries are no longer rate-bounded" >&2
+    exit 1
+}
+rg -Fq '"ipc-reply-rejected-summary"' "$ipc_reply_diagnostics" || {
+    echo "late IPC reply rejection volume lost its cumulative summary" >&2
+    exit 1
+}
+rg -Fq 'pub struct ReplyFailureDiagnostics' libs/rustos-svc-runtime/src/ipc.rs || {
+    echo "service reply failure diagnostics lost their shared bounded owner" >&2
+    exit 1
+}
+for service_group in \
+    'services/netd/src/main.rs' \
+    'services/inputd/src/main.rs services/inputd/src/service_loop.rs' \
+    'services/devmgrd/src/main.rs'; do
+    read -r -a service_sources <<<"$service_group"
+    service="${service_sources[0]}"
+    rg -Fq 'ReplyFailureDiagnostics::new()' "${service_sources[@]}" || {
+        echo "$service no longer owns a bounded reply failure lane" >&2
+        exit 1
+    }
+    rg -Fq 'REPLY_FAILURE_DIAGNOSTICS.record(' "${service_sources[@]}" || {
+        echo "$service bypasses bounded reply failure reporting" >&2
+        exit 1
+    }
+    if rg -Uq 'writeln!\([^;]{0,200}reply failed' "${service_sources[@]}"; then
+        echo "$service regained synchronous per-failure reply logging" >&2
+        exit 1
+    fi
+done
+rg -Fq 'const MAX_SERVICE_CALL_LOGS_PER_SECOND: u8 = 1;' \
+    "$typed_ipc_diagnostics" || {
     echo "typed service IPC slow logging is no longer rate-bounded" >&2
     exit 1
 }
@@ -481,7 +576,7 @@ rg -Fq 'sync_pick_hints: SlotHandoffQueue<MAX_TASK>' \
     echo "synchronous IPC peers no longer have complete bounded FIFO custody" >&2
     exit 1
 }
-rg -Uq 'let atomic_activation_handoff = self\.take_next_atomic_activation_handoff_ready_slot\(\);[\s\S]{0,500}let sync_handoff = if atomic_activation_handoff\.is_none\(\)[\s\S]{0,500}take_next_synchronous_pick_hint_ready_slot\(\)[\s\S]{0,800}match atomic_activation_handoff[\s\S]{0,800}match sync_handoff[\s\S]{0,500}mandatory_overdue_pick' \
+rg -Uq 'let atomic_activation_handoff = self\.take_next_atomic_activation_handoff_ready_slot\(\);[\s\S]{0,500}let sync_handoff = if atomic_activation_handoff\.is_none\(\)[\s\S]{0,500}take_next_synchronous_pick_hint_ready_slot\(\)[\s\S]{0,800}match atomic_activation_handoff[\s\S]{0,800}match sync_handoff[\s\S]{0,500}mandatory_overdue_system_pick' \
     kernel/ps/src/multitask/scheduler.rs || {
     echo "atomic activation or synchronous IPC handoff no longer precedes unrelated overdue work" >&2
     exit 1
@@ -506,9 +601,59 @@ rg -Fq 'synchronous_ipc_handoff_is_fifo_deduplicated_and_fairness_bounded' \
     echo "synchronous IPC handoff lost its executable fairness witness" >&2
     exit 1
 }
+scheduler_profile=kernel/ps/src/multitask/scheduler/runtime_profile.rs
+rg -Fq 'const PROFILE_TOP_TASKS: usize = 4;' "$scheduler_profile" \
+    && rg -Fq 'self.runtime_profile_ns.fill(0);' "$scheduler_profile" \
+    && rg -Fq 'self.runtime_profile_entry_counts.fill(0);' "$scheduler_profile" \
+    && rg -Fq 'kernel-scheduler-entry' "$scheduler_profile" \
+    && rg -Fq 'runtime_profile_is_windowed_ranked_and_destructive' "$scheduler_profile" || {
+        echo "scheduler runtime attribution lost its bounded destructive snapshot" >&2
+        exit 1
+    }
+if [[ "$(rg -Fc 'publish_scheduler_runtime_profile(runtime_profile);' kernel/ps/src/multitask/irq.rs)" -ne 4 ]] \
+    || ! rg -Fq 'ps_api::drain_scheduler_runtime_profile();' kernel/executive/src/boot.rs \
+    || ! rg -Fq 'pending_runtime_profile_is_single_slot_release_acquire_custody' "$scheduler_profile"; then
+    echo "scheduler runtime attribution left its IRQ-to-housekeeping custody path" >&2
+    exit 1
+fi
 rg -Uq 'let gpu_compositor = Some\(GpuCompositorRuntime::new\([\s\S]{0,900}diag_line\("uiserver: init open_input begin"\)' \
     services/uiserver/src/app/bootstrap.rs || {
     echo "mandatory GPU initialization no longer overlaps serial input/console/surface startup" >&2
+    exit 1
+}
+if [ "$(rg -c 'record_runtime_profile_entry' kernel/ps/src/multitask/irq.rs)" -ne 4 ] \
+    || ! rg -Fq 'runtime_profile_entry_causes_are_exact_and_destructive' "$scheduler_profile"; then
+    echo "scheduler entry-cause attribution is incomplete or lacks a destructive witness" >&2
+    exit 1
+fi
+reply_recv_kernel=kernel/compat/src/user/syscall/linux/ipc_reply_recv.rs
+rg -Fq 'SYS_RUSTOS_IPC_REPLY_RECV_WITH_SENDER' \
+    kernel/compat/src/user/syscall/linux/ipc_ops.rs || {
+    echo "fused reply-receive syscall left compat dispatch" >&2
+    exit 1
+}
+for witness in \
+    'ipc_reply_recv_shape_valid(&args)' \
+    'prepare_recv_with_sender(' \
+    'complete_endpoint_reply_for_process(' \
+    'recv_with_sender_blocking_prepared(' \
+    'IPC_REPLY_RECV_COMMITTED_ERROR_BASE + errno'; do
+    rg -Fq "$witness" "$reply_recv_kernel" || {
+        echo "fused reply-receive lost phase or custody witness: $witness" >&2
+        exit 1
+    }
+done
+rg -Uq 'prepare_recv_with_sender\([\s\S]{0,1800}copy_request_from_user\([\s\S]{0,1800}complete_endpoint_reply_for_process\([\s\S]{0,2600}recv_with_sender_blocking_prepared\(' \
+    "$reply_recv_kernel" || {
+    echo "fused reply-receive no longer preflights before reply commit and receive" >&2
+    exit 1
+}
+rg -Fq 'pub unsafe fn reply_recv_with_sender(' libs/rustos-svc-runtime/src/ipc.rs \
+    && rg -Fq 'pub fn reply_recv_committed_errno(result: i64)' \
+        libs/rustos-svc-runtime/src/ipc.rs \
+    && rg -Fq 'reply_recv_input_request(' services/inputd/src/service_loop.rs \
+    && rg -Fq 'let response = malformed_input_response();' services/inputd/src/service_loop.rs || {
+    echo "inputd or service runtime bypasses fused reply-receive phase handling" >&2
     exit 1
 }
 

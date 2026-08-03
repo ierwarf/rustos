@@ -5,16 +5,18 @@
 //! - **Boundary:** Executable bytes, paths, imports, relocations, caller
 //!   identity, broker replies, and filesystem snapshots are untrusted.
 //! - **Lifecycle:** Obtain immutable bytes, admit complete image, prepare a
-//!   suspended target, stage mappings/handles, commit once, activate, or retire.
+//!   suspended target, stage mappings/handles, commit once, activate, reply
+//!   exactly once, then receive the next request or retire.
 //! - **Concurrency:** Requests bind exact kernel-stamped sender and loader
 //!   publication epoch; no mutable image is reread after admission.
 //! - **Failure:** Malformed/overlapping/W+X image, short read, service restart,
 //!   timeout, requester exit, and partial mapping roll back all staged state.
 //! - **Forbidden:** No raw parser in ring0, pathname authority, runnable partial
-//!   child, Linux-kernel extension compatibility, or format-specific bypass.
+//!   child, abandoned malformed caller, delayed post-reply cleanup/demotion,
+//!   Linux-kernel extension compatibility, or format-specific bypass.
 //! - **Evidence:** `executable-image-admission`,
 //!   `loader-request-authority`, `deferred-process-activation`, and
-//!   `remote-file-map`.
+//!   `remote-file-map`, plus `ipc-reply-recv-transaction`.
 #![no_std]
 #![no_main]
 
@@ -59,21 +61,23 @@ use rustos_user_abi::syscall::{
     PROC_BROKER_FORMAT_PE64, PROC_BROKER_LINUX_INTERP_PATH_CAPACITY, PROC_BROKER_MAP_EXEC,
     PROC_BROKER_MAP_PRIVATE, PROC_BROKER_MAP_READ, PROC_BROKER_MAP_WRITE,
     PROC_BROKER_USER_SPACE_BASE, PROC_BROKER_USER_SPACE_END_EXCLUSIVE, SYS_RUSTOS_DEBUG_PRINT,
-    SYS_RUSTOS_IPC_CALL_WITH_HANDLES_BOUNDED, SYS_RUSTOS_IPC_RECV_WITH_SENDER,
-    SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_PROC_ABORT_BROKER, SYS_RUSTOS_PROC_ACTIVATE_BATCH_BROKER,
-    SYS_RUSTOS_PROC_ACTIVATE_BROKER, SYS_RUSTOS_PROC_MAP_DATA_BROKER,
-    SYS_RUSTOS_PROC_MAP_FILE_BATCH_BROKER, SYS_RUSTOS_PROC_MAP_ZEROED_BROKER,
-    SYS_RUSTOS_PROC_PREPARE_BROKER, SYS_RUSTOS_PROC_SET_LINUX_RUNTIME_BROKER,
-    SYS_RUSTOS_PROC_SET_WINDOWS_RUNTIME_BROKER, SYS_RUSTOS_SCHED_DEMOTE_SELF,
-    VFS_EXECUTABLE_SNAPSHOT_ABI_VERSION, VFS_EXECUTABLE_SNAPSHOT_OP_OPEN, VFS_IPC_PATH_CAPACITY,
+    SYS_RUSTOS_IPC_CALL_WITH_HANDLES_BOUNDED, SYS_RUSTOS_PROC_ABORT_BROKER,
+    SYS_RUSTOS_PROC_ACTIVATE_BATCH_BROKER, SYS_RUSTOS_PROC_ACTIVATE_BROKER,
+    SYS_RUSTOS_PROC_MAP_DATA_BROKER, SYS_RUSTOS_PROC_MAP_FILE_BATCH_BROKER,
+    SYS_RUSTOS_PROC_MAP_ZEROED_BROKER, SYS_RUSTOS_PROC_PREPARE_BROKER,
+    SYS_RUSTOS_PROC_SET_LINUX_RUNTIME_BROKER, SYS_RUSTOS_PROC_SET_WINDOWS_RUNTIME_BROKER,
+    SYS_RUSTOS_SCHED_DEMOTE_SELF, VFS_EXECUTABLE_SNAPSHOT_ABI_VERSION,
+    VFS_EXECUTABLE_SNAPSHOT_OP_OPEN, VFS_IPC_PATH_CAPACITY,
 };
 
 mod commit;
 
 use commit::{commit_prepared_executable, LoaderOperation};
-use loaderd::completion_demotion_due;
+use loaderd::{
+    classify_loader_wire_size, classify_reply_recv_recovery, completion_demotion_due,
+    fused_loader_reply_eligible, LoaderWireKind, ReplyRecvRecoveryAction,
+};
 
-const SYS_SCHED_YIELD: u64 = 24;
 const SYS_EXIT: u64 = 60;
 const UI_SERVER_EXEC_PATH: &str = "services/uiserver/uiserver.elf";
 static POST_UI_DEMOTED: AtomicBool = AtomicBool::new(false);
@@ -191,44 +195,63 @@ fn service_main() {
 
 fn serve(endpoint: u64) {
     let mut recv_error_reported = false;
+    let mut request = MaybeUninit::<LoaderdRecvBuffer>::uninit();
+    let mut reply_cap = 0_u64;
+    let mut sender_pid = 0_u64;
+    let mut sender_tid = 0_u64;
+    let mut received = recv_loader_request(
+        endpoint,
+        &mut request,
+        &mut reply_cap,
+        &mut sender_pid,
+        &mut sender_tid,
+    );
     loop {
-        let mut request = MaybeUninit::<LoaderdRecvBuffer>::uninit();
-        let mut reply_cap = 0_u64;
-        let mut sender_pid = 0_u64;
-        let mut sender_tid = 0_u64;
-        let received = syscall6(
-            SYS_RUSTOS_IPC_RECV_WITH_SENDER,
-            endpoint,
-            request.as_mut_ptr() as *mut u8 as u64,
-            LOADERD_RECV_BYTES as u64,
-            (&mut reply_cap as *mut u64) as u64,
-            (&mut sender_pid as *mut u64) as u64,
-            (&mut sender_tid as *mut u64) as u64,
-        );
         if received < 0 {
             if !recv_error_reported {
                 debug_line("loaderd: recv failed");
                 recv_error_reported = true;
             }
-            yield_after_idle_receive();
+            received = recv_loader_request(
+                endpoint,
+                &mut request,
+                &mut reply_cap,
+                &mut sender_pid,
+                &mut sender_tid,
+            );
             continue;
         }
-        if received == 0 {
-            yield_after_idle_receive();
-            continue;
-        }
+        recv_error_reported = false;
         // SAFETY: `received` is a successful bounded receive length no larger
         // than the initialized request buffer; the slice cannot outlive it.
-        let request = unsafe {
+        let request_bytes = unsafe {
             core::slice::from_raw_parts(request.as_ptr() as *const u8, received as usize)
         };
-        let handled = handle_wire_request(received as usize, request, sender_pid, sender_tid);
-        let reply = syscall3(
-            SYS_RUSTOS_IPC_REPLY,
-            reply_cap,
-            handled.reply.as_ptr() as u64,
-            handled.reply.len() as u64,
-        );
+        let handled = handle_wire_request(received as usize, request_bytes, sender_pid, sender_tid);
+        if fused_loader_reply_eligible(handled.cleanup_fds.len(), handled.demote_after_reply) {
+            // CONTRACT: this path owns no post-reply cleanup or class
+            // transition. The response and receive buffer are disjoint and
+            // remain live for the complete fused transaction.
+            received = reply_recv_loader_request(
+                endpoint,
+                reply_cap,
+                handled.reply.as_ptr(),
+                handled.reply.len(),
+                &mut request,
+                &mut reply_cap,
+                &mut sender_pid,
+                &mut sender_tid,
+            );
+            continue;
+        }
+
+        // Spawn transactions may retain snapshot descriptors until the exact
+        // reply commits, while the UI bootstrap reply also owns the immediate
+        // demotion boundary. Neither may block inside a fused receive before
+        // its post-reply action completes.
+        let reply = unsafe {
+            rustos_svc_runtime::ipc::reply(reply_cap, handled.reply.as_ptr(), handled.reply.len())
+        };
         if reply < 0 {
             rustos_svc_runtime::ipc::debug_line("loaderd: reply failed");
         } else if completion_demotion_due(reply, handled.demote_after_reply) {
@@ -239,7 +262,83 @@ fn serve(endpoint: u64) {
             demote_after_ui_bootstrap_reply();
         }
         close_fds(&handled.cleanup_fds);
+        received = recv_loader_request(
+            endpoint,
+            &mut request,
+            &mut reply_cap,
+            &mut sender_pid,
+            &mut sender_tid,
+        );
     }
+}
+
+fn recv_loader_request(
+    endpoint: u64,
+    request: &mut MaybeUninit<LoaderdRecvBuffer>,
+    reply_cap: &mut u64,
+    sender_pid: &mut u64,
+    sender_tid: &mut u64,
+) -> i64 {
+    // SAFETY: every output points into the single-threaded service loop's live
+    // stack frame and remains exclusively borrowed for the blocking call.
+    unsafe {
+        rustos_svc_runtime::ipc::recv_with_sender(
+            endpoint,
+            request.as_mut_ptr().cast::<u8>(),
+            LOADERD_RECV_BYTES,
+            reply_cap,
+            sender_pid,
+            sender_tid,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reply_recv_loader_request(
+    endpoint: u64,
+    reply_cap: u64,
+    response: *const u8,
+    response_len: usize,
+    request: &mut MaybeUninit<LoaderdRecvBuffer>,
+    next_reply_cap: &mut u64,
+    sender_pid: &mut u64,
+    sender_tid: &mut u64,
+) -> i64 {
+    // SAFETY: response storage and the disjoint receive buffer remain live and
+    // immovable until the fused syscall returns; every output is exclusive.
+    let result = unsafe {
+        rustos_svc_runtime::ipc::reply_recv_with_sender(
+            endpoint,
+            reply_cap,
+            response,
+            response_len,
+            request.as_mut_ptr().cast::<u8>(),
+            LOADERD_RECV_BYTES,
+            next_reply_cap,
+            sender_pid,
+            sender_tid,
+        )
+    };
+    match classify_reply_recv_recovery(result) {
+        ReplyRecvRecoveryAction::None => {}
+        ReplyRecvRecoveryAction::PostCommit(_) => {
+            rustos_svc_runtime::ipc::debug_line("loaderd: reply-recv receive failed");
+        }
+        ReplyRecvRecoveryAction::RetryReply(_) => {
+            rustos_svc_runtime::ipc::debug_line("loaderd: reply-recv reply failed");
+            // SAFETY: the result partition proves the fused syscall did not
+            // consume `reply_cap`; make exactly one terminal recovery attempt.
+            let recovery =
+                unsafe { rustos_svc_runtime::ipc::reply(reply_cap, response, response_len) };
+            if recovery < 0 {
+                rustos_svc_runtime::ipc::debug_line("loaderd: reply-recv recovery failed");
+            }
+        }
+        ReplyRecvRecoveryAction::ProtocolViolation => {
+            panic!("loaderd: invalid reply-recv result outside native ABI partition")
+        }
+    }
+    result
 }
 
 // IPC replies are written immediately; keep the hot response path allocation
@@ -298,28 +397,30 @@ fn handle_wire_request(
     sender_pid: u64,
     sender_tid: u64,
 ) -> HandledLoaderRequest {
-    if received == size_of::<CommercialMaxProtocolRequest>() {
-        let request = unsafe { &*bytes.as_ptr().cast::<CommercialMaxProtocolRequest>() };
-        return HandledLoaderRequest {
-            reply: LoaderReply::Commercial(handle_commercial_request(
-                request, sender_pid, sender_tid,
-            )),
-            cleanup_fds: Vec::new(),
-            demote_after_reply: false,
-        };
+    match classify_loader_wire_size(received) {
+        LoaderWireKind::Commercial => {
+            let request = unsafe { &*bytes.as_ptr().cast::<CommercialMaxProtocolRequest>() };
+            HandledLoaderRequest {
+                reply: LoaderReply::Commercial(handle_commercial_request(
+                    request, sender_pid, sender_tid,
+                )),
+                cleanup_fds: Vec::new(),
+                demote_after_reply: false,
+            }
+        }
+        LoaderWireKind::ActivateBatch => {
+            let request = unsafe { &*bytes.as_ptr().cast::<LoaderActivateBatchRequest>() };
+            handle_activate_batch_request(request, sender_pid)
+        }
+        LoaderWireKind::Spawn => {
+            let request = unsafe { &*bytes.as_ptr().cast::<LoaderSpawnRequest>() };
+            handle_request(received, request, sender_pid)
+        }
+        LoaderWireKind::Malformed => spawn_response(LoaderSpawnResponse {
+            status: EINVAL,
+            ..LoaderSpawnResponse::default()
+        }),
     }
-    if received == size_of::<LoaderActivateBatchRequest>() {
-        let request = unsafe { &*bytes.as_ptr().cast::<LoaderActivateBatchRequest>() };
-        return handle_activate_batch_request(request, sender_pid);
-    }
-    if received == size_of::<LoaderSpawnRequest>() {
-        let request = unsafe { &*bytes.as_ptr().cast::<LoaderSpawnRequest>() };
-        return handle_request(received, request, sender_pid);
-    }
-    spawn_response(LoaderSpawnResponse {
-        status: EINVAL,
-        ..LoaderSpawnResponse::default()
-    })
 }
 
 fn handle_activate_batch_request(
@@ -642,10 +743,6 @@ fn authorize_loader_operation(op: u16, sender_pid: u64) -> Result<(), i32> {
         }
     }
     Err(EACCES)
-}
-
-fn yield_after_idle_receive() {
-    let _ = syscall0(SYS_SCHED_YIELD);
 }
 
 fn handle_commercial_request(
@@ -1009,16 +1106,8 @@ fn syscall2(number: u64, arg0: u64, arg1: u64) -> i64 {
     unsafe { rustos_svc_runtime::syscall::syscall2(number, arg0, arg1) }
 }
 
-fn syscall3(number: u64, arg0: u64, arg1: u64, arg2: u64) -> i64 {
-    unsafe { rustos_svc_runtime::syscall::syscall3(number, arg0, arg1, arg2) }
-}
-
 fn syscall4(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> i64 {
     unsafe { rustos_svc_runtime::syscall::syscall4(number, arg0, arg1, arg2, arg3) }
-}
-
-fn syscall6(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i64 {
-    unsafe { rustos_svc_runtime::syscall::syscall6(number, arg0, arg1, arg2, arg3, arg4, arg5) }
 }
 
 fn debug_line(message: &str) {

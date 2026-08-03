@@ -15,18 +15,16 @@
 //! - **Evidence:** `vfs-open-description`.
 use super::*;
 use alloc::string::String;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use nucleus_core::util::{
     lockdep::{LockClass, TrackedSpinLock},
     ring::RingBuffer,
 };
 
-const EARLY_SERVICE_CALL_SAMPLES: usize = 6;
-const SLOW_SERVICE_CALL_THRESHOLD_MS: u64 = 10;
-// Typed service calls share the synchronous debug sink with the generic IPC
-// path. Bound diagnostic work independently to one representative sample per
-// second so the act of reporting overload cannot sustain that overload.
-const MAX_SLOW_SERVICE_CALL_LOGS_PER_SECOND: usize = 1;
+#[path = "ipc_helpers_deadline.rs"]
+pub(super) mod deadline;
+#[path = "ipc_helpers_diagnostics.rs"]
+mod diagnostics;
+
 // A readiness probe cannot consume an event: it only transfers authenticated
 // ingress into inputd's policy queue. Bound that safe, idempotent operation so
 // a wedged inputd cannot freeze uiserver's input loop for the generic service
@@ -55,9 +53,6 @@ static PENDING_VFS_MUTATIONS: TrackedSpinLock<
     RingBuffer<PendingVfsMutation, PENDING_VFS_MUTATION_STORAGE_CAPACITY>,
     { LockClass::VfsDeferredMutation as u8 },
 > = TrackedSpinLock::new(RingBuffer::new());
-
-static SERVICE_CALL_SAMPLE_COUNT: AtomicUsize = AtomicUsize::new(0);
-static SLOW_SERVICE_CALL_LOG_RATE_STATE: AtomicU64 = AtomicU64::new(u64::MAX);
 
 // RING3-MIGRATION-REFERENCE START: bootstrap-device-route exception: rootd owns
 // the bootstrap manifest/restart policy and loaderd owns normal spawn policy.
@@ -335,7 +330,7 @@ pub fn call_procd(request: &ProcdIpcRequest) -> Result<ProcdIpcResponse, i64> {
     }
     let response = read_unaligned::<ProcdIpcResponse>(response.as_slice());
     validate_procd_response_envelope(request.op, &response)?;
-    log_slow_service_call(
+    diagnostics::log_slow_service_call(
         "procd",
         request.op,
         ticks_elapsed_ms(start_ticks, crate::arch::rtc::ticks()),
@@ -495,19 +490,25 @@ fn call_vfs_ipc_request_impl(
                 | VFS_POLL_QUERY_EPOLL_PURGE_OBJECT
         );
     let total_timeout_ms = timeout_ms.or(replay_safe_request.then_some(30_000));
-    let attempts = if replay_safe_request {
-        total_timeout_ms
-            .map(|total| usize::try_from(total).unwrap_or(usize::MAX).min(3))
-            .unwrap_or(3)
-            .max(1)
-    } else {
-        1
-    };
+    let attempts = if replay_safe_request { 3 } else { 1 };
     let mut response = None;
     let mut last_errno = LINUX_ETIMEDOUT;
     for attempt in 0..attempts {
-        let attempt_timeout_ms =
-            total_timeout_ms.map(|total| split_retry_timeout_ms(total, attempts, attempt));
+        // A dequeued request keeps executing after its caller's reply
+        // capability expires. Give it the complete remaining rail: dividing a
+        // 16/100 ms contract into short attempts only manufactures late
+        // replies and backlog. Retry solely when the transport breaks early;
+        // a real timeout transfers mutation ownership to housekeeping below.
+        let attempt_timeout_ms = match total_timeout_ms {
+            Some(total) => {
+                let elapsed = ticks_elapsed_ms(start_ticks, crate::arch::rtc::ticks());
+                let Some(remaining) = deadline::remaining_service_timeout_ms(total, elapsed) else {
+                    break;
+                };
+                Some(remaining)
+            }
+            None => None,
+        };
         let result = match attempt_timeout_ms {
             Some(timeout_ms) => ipc_ops::call_service_endpoint_with_class_deadline(
                 IPC_SERVICE_VFSD,
@@ -527,26 +528,38 @@ fn call_vfs_ipc_request_impl(
                 break;
             }
             Err(errno)
-                if attempts > 1
-                    && matches!(errno, LINUX_ETIMEDOUT | LINUX_EPIPE | LINUX_ENOSYS) =>
+                if attempt + 1 < attempts
+                    && deadline::retryable_early_service_transport_error(errno) =>
             {
                 last_errno = errno;
                 multitask::cond_resched();
             }
-            Err(errno) => return Err(errno),
+            Err(errno) => {
+                last_errno = errno;
+                break;
+            }
         }
     }
+    let detail = deadline::vfs_request_log_detail(request);
     let response = match response {
         Some(response) => response,
         None => {
+            diagnostics::log_failed_service_call(
+                "vfsd",
+                request.op,
+                ticks_elapsed_ms(start_ticks, crate::arch::rtc::ticks()),
+                request.pid,
+                request.tid,
+                last_errno,
+                detail.as_deref(),
+            );
             if deferred_reconcile {
                 enqueue_pending_vfs_mutation(request)?;
             }
             return Err(last_errno);
         }
     };
-    let detail = vfs_request_log_detail(request);
-    log_slow_service_call(
+    diagnostics::log_slow_service_call(
         "vfsd",
         request.op,
         ticks_elapsed_ms(start_ticks, crate::arch::rtc::ticks()),
@@ -574,12 +587,6 @@ fn call_vfs_ipc_request_impl(
     Ok(response)
 }
 
-fn split_retry_timeout_ms(total: u64, attempts: usize, attempt: usize) -> u64 {
-    debug_assert!(attempts > 0 && attempt < attempts);
-    let attempts = attempts as u64;
-    total / attempts + u64::from((attempt as u64) < total % attempts)
-}
-
 fn vfs_checkpoint_ack_required(request: &VfsIpcRequest) -> bool {
     request.op == VFS_IPC_OP_CLOSE
         || request.op == VFS_IPC_OP_POLL_QUERY
@@ -591,31 +598,29 @@ fn vfs_checkpoint_ack_required(request: &VfsIpcRequest) -> bool {
 
 fn acknowledge_vfs_checkpoint_mutation(original: &VfsIpcRequest) -> Result<(), i64> {
     let ack = vfs_checkpoint_ack_request(original);
-    let mut last_errno = LINUX_ETIMEDOUT;
-    for attempt in 0..3 {
-        match ipc_ops::call_service_endpoint_with_class_deadline(
-            IPC_SERVICE_VFSD,
-            as_bytes(&ack),
-            ipc_ops::ServiceIpcClass::ReadinessQuery,
-            split_retry_timeout_ms(16, 3, attempt),
-        ) {
-            Ok(bytes) if bytes.len() == size_of::<VfsIpcResponse>() => {
-                let response = read_unaligned::<VfsIpcResponse>(&bytes);
-                if validate_vfs_response_envelope(ack.op, &response).is_ok() && response.status == 0
-                {
-                    return Ok(());
-                }
-                last_errno = if response.status == 0 {
-                    LINUX_EINVAL
-                } else {
-                    i64::from(response.status.unsigned_abs())
-                };
+    // A visibility ACK is already idempotent and has a background replay
+    // owner. Splitting its 16 ms rail into three calls creates requests whose
+    // reply capabilities expire before an SMP service round-trip completes.
+    let last_errno = match ipc_ops::call_service_endpoint_with_class_deadline(
+        IPC_SERVICE_VFSD,
+        as_bytes(&ack),
+        ipc_ops::ServiceIpcClass::ReadinessQuery,
+        rustos_user_abi::performance::IPC_READINESS_QUERY_HARD_LIMIT_MS,
+    ) {
+        Ok(bytes) if bytes.len() == size_of::<VfsIpcResponse>() => {
+            let response = read_unaligned::<VfsIpcResponse>(&bytes);
+            if validate_vfs_response_envelope(ack.op, &response).is_ok() && response.status == 0 {
+                return Ok(());
             }
-            Ok(_) => last_errno = LINUX_EINVAL,
-            Err(errno) => last_errno = errno,
+            if response.status == 0 {
+                LINUX_EINVAL
+            } else {
+                i64::from(response.status.unsigned_abs())
+            }
         }
-        multitask::cond_resched();
-    }
+        Ok(_) => LINUX_EINVAL,
+        Err(errno) => errno,
+    };
     enqueue_pending_vfs_mutation(&ack)?;
     Err(last_errno)
 }
@@ -1108,7 +1113,7 @@ fn call_sessiond_console_route(
         as_bytes(&request),
         ipc_ops::ServiceIpcClass::BulkData,
     )?;
-    log_slow_service_call(
+    diagnostics::log_slow_service_call(
         "sessiond",
         request.header.op,
         ticks_elapsed_ms(start_ticks, crate::arch::rtc::ticks()),
@@ -1255,7 +1260,7 @@ pub fn ioctl_tty_via_sessiond(fd: u64, request_number: u64, arg: u64) -> Result<
         as_bytes(&request),
         ipc_ops::ServiceIpcClass::InteractiveControl,
     )?;
-    log_slow_service_call(
+    diagnostics::log_slow_service_call(
         "sessiond",
         request.header.op,
         ticks_elapsed_ms(start_ticks, crate::arch::rtc::ticks()),
@@ -1334,7 +1339,7 @@ pub fn ioctl_device_via_devmgrd(fd: u64, request_number: u64, arg: u64) -> Resul
         as_bytes(&request),
         ipc_ops::ServiceIpcClass::InteractiveControl,
     )?;
-    log_slow_service_call(
+    diagnostics::log_slow_service_call(
         "devmgrd",
         request.op,
         ticks_elapsed_ms(start_ticks, crate::arch::rtc::ticks()),
@@ -1388,7 +1393,7 @@ pub fn ioctl_route_via_devmgrd(fd: u64, request_number: u64) -> Result<u64, i64>
         as_bytes(&request),
         ipc_ops::ServiceIpcClass::InteractiveControl,
     )?;
-    log_slow_service_call(
+    diagnostics::log_slow_service_call(
         "devmgrd",
         request.op,
         ticks_elapsed_ms(start_ticks, crate::arch::rtc::ticks()),
@@ -1563,7 +1568,7 @@ pub fn call_inputd_read_request(request: &InputdIpcRequest) -> Result<InputdRead
     } else {
         Some("blocking")
     };
-    log_slow_service_call(
+    diagnostics::log_slow_service_call(
         "inputd",
         request.op,
         ticks_elapsed_ms(start_ticks, crate::arch::rtc::ticks()),
@@ -1615,7 +1620,7 @@ fn call_netd_ipc_request_impl(
         Some(timeout_ms) => ipc_ops::call_service_endpoint_with_class_deadline(
             IPC_SERVICE_NETD,
             request_bytes,
-            ipc_ops::ServiceIpcClass::ReadinessQuery,
+            deadline::netd_timeout_class(request.op),
             timeout_ms,
         )?,
         None => ipc_ops::call_service_endpoint_with_class(
@@ -1625,7 +1630,7 @@ fn call_netd_ipc_request_impl(
         )?,
     };
     let elapsed_ms = ticks_elapsed_ms(start_ticks, crate::arch::rtc::ticks());
-    log_slow_service_call(
+    diagnostics::log_slow_service_call(
         "netd",
         request.op,
         elapsed_ms,
@@ -1681,52 +1686,6 @@ fn ticks_elapsed_ms(start_ticks: u64, end_ticks: u64) -> u64 {
         .saturating_sub(start_ticks)
         .saturating_mul(1000)
         .saturating_div(ticks_per_second)
-}
-
-fn log_slow_service_call(
-    service: &str,
-    op: u16,
-    elapsed_ms: u64,
-    pid: u64,
-    tid: u64,
-    status_or_len: i64,
-    detail: Option<&str>,
-) {
-    let sample_index = SERVICE_CALL_SAMPLE_COUNT.fetch_add(1, Ordering::Relaxed);
-    if sample_index >= EARLY_SERVICE_CALL_SAMPLES && elapsed_ms < SLOW_SERVICE_CALL_THRESHOLD_MS {
-        return;
-    }
-    let ticks_per_second = crate::arch::rtc::ticks_per_second().max(1);
-    let window = crate::arch::rtc::ticks() / ticks_per_second;
-    if !super::super::ipc_ops::diagnostic_rate_limit_permit(
-        &SLOW_SERVICE_CALL_LOG_RATE_STATE,
-        window,
-        MAX_SLOW_SERVICE_CALL_LOGS_PER_SECOND as u8,
-    ) {
-        return;
-    }
-    if let Some(detail) = detail {
-        debug::println!(
-            "service ipc slow: service={} op={} elapsed_ms={} pid={} tid={} status_or_len={} detail={}",
-            service,
-            op,
-            elapsed_ms,
-            pid,
-            tid,
-            status_or_len,
-            detail,
-        );
-    } else {
-        debug::println!(
-            "service ipc slow: service={} op={} elapsed_ms={} pid={} tid={} status_or_len={}",
-            service,
-            op,
-            elapsed_ms,
-            pid,
-            tid,
-            status_or_len,
-        );
-    }
 }
 
 #[allow(
@@ -1793,16 +1752,6 @@ mod tests {
     }
 
     #[test]
-    fn replay_retries_share_one_total_timeout_budget() {
-        let slices = (0..3)
-            .map(|attempt| split_retry_timeout_ms(16, 3, attempt))
-            .collect::<Vec<_>>();
-        assert_eq!(slices.as_slice(), &[6, 5, 5]);
-        assert_eq!(slices.iter().sum::<u64>(), 16);
-        assert_eq!(split_retry_timeout_ms(1, 1, 0), 1);
-    }
-
-    #[test]
     fn epoll_snapshot_reads_are_retry_safe() {
         let mut request = VfsIpcRequest {
             op: VFS_IPC_OP_POLL_QUERY,
@@ -1845,21 +1794,6 @@ mod tests {
             Err(LINUX_EINVAL)
         );
     }
-}
-
-fn vfs_request_log_detail(request: &VfsIpcRequest) -> Option<String> {
-    if request.path_len != 0 {
-        let path_len = usize::try_from(request.path_len).ok()?;
-        if path_len > request.path.len() {
-            return None;
-        }
-        let path = core::str::from_utf8(&request.path[..path_len]).ok()?;
-        return Some(alloc::format!("path={}", path));
-    }
-    if let Some(remote) = current_remote_vfs_handle(request.fd) {
-        return Some(alloc::format!("fd={} path={}", request.fd, remote.path()));
-    }
-    None
 }
 
 pub fn current_remote_vfs_handle(fd: u64) -> Option<multitask::RemoteVfsHandle> {

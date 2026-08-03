@@ -43,6 +43,36 @@ harnesses = [
 depends_on = []
 
 [[proof]]
+id = "ipc-reply-recv-wire"
+kind = "kani"
+package = "rustos-user-abi"
+source = "libs/rustos-user-abi/src/syscall/ipc_reply_recv.rs"
+symbol = "ipc_reply_recv_shape_valid"
+formal_model = "ipc-reply-recv-transaction/IpcReplyRecvTransaction"
+scope = "bounded pre-commit native IPC envelope shape before live endpoint and user-range validation"
+harnesses = [
+  "accepted_reply_recv_shape_is_exact",
+  "malformed_reply_recv_shape_is_never_accepted",
+  "reply_recv_result_partition_is_exact",
+]
+depends_on = []
+
+[[proof]]
+id = "ipc-transfer-ticket-wire"
+kind = "kani"
+package = "rustos-user-abi"
+source = "libs/rustos-user-abi/src/syscall.rs"
+symbol = "IpcTransferTicketWire::decode"
+formal_model = "ipc-handle-transfer/IpcHandleTransfer"
+scope = "exhaustive 128-bit integer-only ticket decoding, canonical round-trip, and rejection of zero authority before one-shot registry lookup"
+harnesses = [
+  "accepted_ticket_is_nonzero_and_canonical",
+  "every_nonzero_ticket_round_trips",
+  "either_zero_field_is_rejected",
+]
+depends_on = []
+
+[[proof]]
 id = "runtime-response"
 kind = "kani"
 package = "runtime-control"

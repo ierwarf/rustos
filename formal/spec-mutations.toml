@@ -12,22 +12,29 @@ schema = "rustos-tla-mutation-corpus-v1"
 required_models = [
     "acceptance-profile-publication/AcceptanceProfilePublication",
     "atomic-process-activation-batch/AtomicProcessActivationBatch",
+    "clocksource-deadline/ClocksourceDeadline",
     "cpu-online-lifecycle/CpuOnlineLifecycle",
     "cross-cpu-task-retirement/CrossCpuTaskRetirement",
+    "dvm-input-ring/DvmInputRing",
+    "exception-retirement-lifecycle/ExceptionRetirementLifecycle",
     "exec-address-space-transaction/ExecAddressSpaceTransaction",
     "gpu-submit-transaction/GpuSubmitTransaction",
     "input-ingestion-worker/InputIngestionWorker",
     "ipc-priority-queue/IpcPriorityQueue",
+    "ipc-reply-recv-transaction/IpcReplyRecvTransaction",
     "msi-vector-lifecycle/MsiVectorLifecycle",
     "per-cpu-clockevent-lifecycle/PerCpuClockeventLifecycle",
     "product-boot/ProductBoot",
     "robust-futex-owner-death/RobustFutexOwnerDeath",
+    "scheduler-cpu-distribution/SchedulerCpuDistribution",
     "scheduler-cpu-ownership/SchedulerCpuOwnership",
+    "scheduler-thread-demotion/SchedulerThreadDemotion",
     "scheduler-wakeup/SchedulerWakeup",
     "smp-reschedule-ipi/SmpRescheduleIpi",
     "tlb-shootdown-lifecycle/TlbShootdownLifecycle",
     "user-stack-growth/UserStackGrowth",
     "userspace-wait-set/UserspaceWaitSet",
+    "wayland-accept-isolation/WaylandAcceptIsolation",
 ]
 
 [[mutation]]
@@ -83,6 +90,41 @@ invariant = "AuthorityConsumptionRetainsSuspension"
 min_counterexample_states = 3
 
 [[mutation]]
+id = "clock-raw-tsc-smp-admission-guard-removed"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "clocksource-deadline/ClocksourceDeadline"
+flow = "monotonic-deadline-lifecycle"
+find = "    /\\ clockCpuCount = 1"
+replace = "    /\\ TRUE"
+occurrence = 1
+invariant = "RawTscRequiresUniprocessorTopology"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "cpu-online-restart-fails-open"
+kind = "transition-effect"
+severity = "critical"
+model = "cpu-online-lifecycle/CpuOnlineLifecycle"
+flow = "cpu-online-lifecycle"
+find = '''RejectRestart(cpu) ==
+    /\ state[cpu] = Failed
+    /\ restartAttempted' = TRUE
+    /\ panicRaised' = TRUE
+    /\ UNCHANGED <<state, generation, privateReady, schedulerReady,
+                   dispatchAuthority, failedSeen, staleGenerationAttempted>>'''
+replace = '''RejectRestart(cpu) ==
+    /\ state[cpu] = Failed
+    /\ state' = [state EXCEPT ![cpu] = Starting]
+    /\ restartAttempted' = TRUE
+    /\ panicRaised' = FALSE
+    /\ UNCHANGED <<generation, privateReady, schedulerReady,
+                   dispatchAuthority, failedSeen, staleGenerationAttempted>>'''
+occurrence = 1
+invariant = "FailedStateIsTerminalForBoot"
+min_counterexample_states = 3
+
+[[mutation]]
 id = "cpu-online-scheduler-stage-skipped"
 kind = "transition-order"
 severity = "critical"
@@ -92,6 +134,22 @@ find = "state' = [state EXCEPT ![cpu] = OnlineParked]"
 replace = "state' = [state EXCEPT ![cpu] = Online]"
 occurrence = 1
 invariant = "OnlineRequiresCompleteCpu"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "cpu-online-stale-generation-fails-open"
+kind = "transition-effect"
+severity = "critical"
+model = "cpu-online-lifecycle/CpuOnlineLifecycle"
+flow = "cpu-online-lifecycle"
+find = '''RejectStaleGeneration ==
+    /\ staleGenerationAttempted' = TRUE
+    /\ panicRaised' = TRUE'''
+replace = '''RejectStaleGeneration ==
+    /\ staleGenerationAttempted' = TRUE
+    /\ panicRaised' = FALSE'''
+occurrence = 1
+invariant = "InvalidGenerationFailsClosed"
 min_counterexample_states = 2
 
 [[mutation]]
@@ -117,16 +175,80 @@ invariant = "ReplacementRequiresAllOldExecutionStopped"
 min_counterexample_states = 3
 
 [[mutation]]
-id = "exec-installed-root-owner-transfer-dropped"
+id = "dvm-input-drain-owner-guard-removed"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "dvm-input-ring/DvmInputRing"
+flow = "dvm-input-ingress"
+find = '''BeginBrokerTurn(caller) ==
+    /\ caller \in Callers
+    /\ rustosReady
+    /\ brokerOwner = NoOwner
+'''
+replace = '''BeginBrokerTurn(caller) ==
+    /\ caller \in Callers
+    /\ rustosReady
+    /\ TRUE
+'''
+occurrence = 1
+invariant = "SingleFlightDrainOwnership"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "exception-user-diagnostic-memory-probe-restored"
+kind = "transition-effect"
+severity = "critical"
+model = "exception-retirement-lifecycle/ExceptionRetirementLifecycle"
+flow = "exception-retirement"
+find = '''RecordScalarDiagnostics ==
+    /\ phase = Aligned
+    /\ stackAligned
+    /\ phase' = Diagnosed
+    /\ diagnosticProbeAttempted' = FALSE
+    /\ nestedFault' = FALSE
+'''
+replace = '''RecordScalarDiagnostics ==
+    /\ phase = Aligned
+    /\ stackAligned
+    /\ phase' = Diagnosed
+    /\ diagnosticProbeAttempted' = TRUE
+    /\ nestedFault' = ~diagnosticMemoryValid
+'''
+occurrence = 1
+invariant = "UserDiagnosticNeverProbesMemory"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "exec-old-bundle-released-before-scheduler-publication"
+kind = "transition-order"
+severity = "critical"
+model = "exec-address-space-transaction/ExecAddressSpaceTransaction"
+flow = "process-address-space-lifecycle"
+find = '''    /\ processStateLockHeld' = TRUE
+    /\ UNCHANGED <<exiting, retiredMarker, reservationValid,
+                    schedulerGeneration, activeRootGeneration, targetRunnable,
+                    oldBundleRetained, ownershipCommitted,
+                    publishedOverRetirement>>'''
+replace = '''    /\ processStateLockHeld' = TRUE
+    /\ oldBundleRetained' = FALSE
+    /\ UNCHANGED <<exiting, retiredMarker, reservationValid,
+                    schedulerGeneration, activeRootGeneration, targetRunnable,
+                    ownershipCommitted, publishedOverRetirement>>'''
+occurrence = 1
+invariant = "OldBundleRetainedUntilSchedulerPublication"
+min_counterexample_states = 5
+
+[[mutation]]
+id = "exec-target-quiesce-removed"
 kind = "transition-effect"
 severity = "critical"
 model = "exec-address-space-transaction/ExecAddressSpaceTransaction"
 flow = "process-address-space-lifecycle"
-find = "    /\\ phase' = Owned /\\ rootOwner' = ProcessOwner"
-replace = "    /\\ phase' = Owned /\\ rootOwner' = NoOwner"
+find = "    /\\ targetRunnable' = FALSE"
+replace = "    /\\ targetRunnable' = TRUE"
 occurrence = 1
-invariant = "ActiveRootAlwaysOwned"
-min_counterexample_states = 6
+invariant = "MixedGenerationIsNeverExternallyRunnable"
+min_counterexample_states = 5
 
 [[mutation]]
 id = "futex-kernel-wake-forced-private"
@@ -191,6 +313,42 @@ invariant = "SystemBacklogCannotBeBypassed"
 min_counterexample_states = 4
 
 [[mutation]]
+id = "ipc-reply-recv-commit-effect-removed"
+kind = "transition-effect"
+severity = "critical"
+model = "ipc-reply-recv-transaction/IpcReplyRecvTransaction"
+flow = "scheduler-dispatch"
+find = "    /\\ replyLive' = FALSE"
+replace = "    /\\ replyLive' = TRUE"
+occurrence = 1
+invariant = "ReplyCommitPrecedesReceive"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "ipc-reply-recv-postcommit-error-untagged"
+kind = "transition-effect"
+severity = "critical"
+model = "ipc-reply-recv-transaction/IpcReplyRecvTransaction"
+flow = "scheduler-dispatch"
+find = "    /\\ resultKind' = TaggedPostError"
+replace = "    /\\ resultKind' = PreError"
+occurrence = 1
+invariant = "PostCommitFailureIsTagged"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "ipc-reply-recv-preflight-error-mistagged"
+kind = "transition-effect"
+severity = "critical"
+model = "ipc-reply-recv-transaction/IpcReplyRecvTransaction"
+flow = "scheduler-dispatch"
+find = "    /\\ resultKind' = PreError"
+replace = "    /\\ resultKind' = TaggedPostError"
+occurrence = 1
+invariant = "PreCommitFailurePreservesReply"
+min_counterexample_states = 2
+
+[[mutation]]
 id = "msi-committed-rollback-handler-retained"
 kind = "transition-revocation"
 severity = "critical"
@@ -209,6 +367,22 @@ replace = '''    /\ leased' = leased
 occurrence = 1
 invariant = "FailedPublicationHasNoAuthority"
 min_counterexample_states = 3
+
+[[mutation]]
+id = "nmi-acquires-interrupted-lock"
+kind = "transition-effect"
+severity = "critical"
+model = "exception-retirement-lifecycle/ExceptionRetirementLifecycle"
+flow = "exception-retirement"
+find = '''    /\ interruptedLockHeld' = lockHeld
+    /\ nmiTookLock' = FALSE
+'''
+replace = '''    /\ interruptedLockHeld' = lockHeld
+    /\ nmiTookLock' = lockHeld
+'''
+occurrence = 1
+invariant = "NmiTakesNoTrackedLock"
+min_counterexample_states = 2
 
 [[mutation]]
 id = "per-cpu-clockevent-deadline-before-lvt"
@@ -269,6 +443,75 @@ invariant = "PresentedHasCompleteAuthorityChain"
 min_counterexample_states = 2
 
 [[mutation]]
+id = "scheduler-class-burst-cap-removed"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "scheduler-cpu-distribution/SchedulerCpuDistribution"
+flow = "scheduler-dispatch"
+find = '''    /\ (ready \cap UserTasks = {} \/ systemBurst < MaxSystemBurst)'''
+replace = '''    /\ TRUE'''
+occurrence = 1
+invariant = "SystemBurstIsBounded"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "scheduler-demotion-low-weight-promotion"
+kind = "transition-effect"
+severity = "critical"
+model = "scheduler-thread-demotion/SchedulerThreadDemotion"
+flow = "scheduler-dispatch"
+find = '''    /\ baseWeight' =
+        [baseWeight EXCEPT ![thread] =
+            IF @ = Elevated THEN Normal ELSE @]'''
+replace = '''    /\ baseWeight' = [baseWeight EXCEPT ![thread] = Normal]'''
+occurrence = 1
+invariant = "LowWeightNeverPromoted"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "scheduler-demotion-permanent-weight-cap-removed"
+kind = "transition-effect"
+severity = "critical"
+model = "scheduler-thread-demotion/SchedulerThreadDemotion"
+flow = "scheduler-dispatch"
+find = '''    /\ baseWeight' =
+        [baseWeight EXCEPT ![thread] =
+            IF @ = Elevated THEN Normal ELSE @]'''
+replace = '''    /\ baseWeight' = baseWeight'''
+occurrence = 1
+invariant = "DemotionCapsPermanentWeight"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "scheduler-fair-user-vruntime-guard-removed"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "scheduler-cpu-distribution/SchedulerCpuDistribution"
+flow = "scheduler-dispatch"
+find = '''    /\ AdmittedFairPick(task, cpu, UserTasks)'''
+replace = '''    /\ TRUE'''
+occurrence = 1
+invariant = "FairUserSelectionUsesRuntime"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "scheduler-locality-lag-bound-removed"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "scheduler-cpu-distribution/SchedulerCpuDistribution"
+flow = "scheduler-dispatch"
+find = '''LocalityAdmissible(task, cpu, classTasks) ==
+    /\ lastCpu[task] = cpu
+    /\ \A peer \in ready \cap classTasks:
+           runtime[task] <= runtime[peer] + MaxLocalityLag'''
+replace = '''LocalityAdmissible(task, cpu, classTasks) ==
+    /\ lastCpu[task] = cpu
+    /\ \A peer \in ready \cap classTasks: TRUE'''
+occurrence = 1
+invariant = "FairUserSelectionUsesRuntime"
+min_counterexample_states = 3
+
+[[mutation]]
 id = "scheduler-outgoing-stack-owner-retained"
 kind = "transition-effect"
 severity = "critical"
@@ -314,16 +557,52 @@ invariant = "TransitionWakeSurvives"
 min_counterexample_states = 4
 
 [[mutation]]
-id = "smp-ipi-request-bit-not-published"
+id = "smp-ipi-fanout-bit-not-published"
 kind = "transition-effect"
 severity = "critical"
 model = "smp-reschedule-ipi/SmpRescheduleIpi"
 flow = "smp-reschedule-ipi-lifecycle"
-find = "request' = [request EXCEPT ![cpu] = TRUE]"
-replace = "request' = [request EXCEPT ![cpu] = FALSE]"
+find = "fanoutPending' = TRUE"
+replace = "fanoutPending' = FALSE"
+occurrence = 1
+invariant = "PendingFanoutHasDurableOwner"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "smp-ipi-fanout-target-publication-removed"
+kind = "transition-effect"
+severity = "critical"
+model = "smp-reschedule-ipi/SmpRescheduleIpi"
+flow = "smp-reschedule-ipi-lifecycle"
+find = "    /\\ request' = [cpu \\in Cpus |-> IF online[cpu] THEN TRUE ELSE request[cpu]]"
+replace = "    /\\ request' = request"
 occurrence = 1
 invariant = "IpiRequiresDurableRequest"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "smp-ipi-self-notification-restored"
+kind = "transition-effect"
+severity = "critical"
+model = "smp-reschedule-ipi/SmpRescheduleIpi"
+flow = "smp-reschedule-ipi-lifecycle"
+find = "    /\\ selfIpiSent' = FALSE"
+replace = "    /\\ selfIpiSent' = TRUE"
+occurrence = 1
+invariant = "NoSelfIpi"
 min_counterexample_states = 2
+
+[[mutation]]
+id = "tlb-active-root-target-filtered"
+kind = "transition-effect"
+severity = "critical"
+model = "tlb-shootdown-lifecycle/TlbShootdownLifecycle"
+flow = "tlb-shootdown-lifecycle"
+find = "TargetSnapshot(root) == {cpu \\in Cpus: eligible[cpu]}"
+replace = "TargetSnapshot(root) == {cpu \\in Cpus: eligible[cpu] /\\ (root = GlobalRoot \\/ activeRoot[cpu] = root)}"
+occurrence = 1
+invariant = "TargetsCoverEveryEligibleCpu"
+min_counterexample_states = 3
 
 [[mutation]]
 id = "tlb-reclaim-before-all-acks"
@@ -331,17 +610,66 @@ kind = "transition-guard-removal"
 severity = "critical"
 model = "tlb-shootdown-lifecycle/TlbShootdownLifecycle"
 flow = "tlb-shootdown-lifecycle"
-find = '''Reclaim ==
+find = '''Finish ==
     /\ phase = Published
     /\ \A cpu \in targets: ackGeneration[cpu] = generation
 '''
-replace = '''Reclaim ==
+replace = '''Finish ==
     /\ phase = Published
     /\ TRUE
 '''
 occurrence = 1
-invariant = "ReclaimRequiresEveryAcknowledgement"
+invariant = "FinishRequiresEveryAcknowledgement"
 min_counterexample_states = 3
+
+[[mutation]]
+id = "tlb-reclaimed-root-reactivation"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "tlb-shootdown-lifecycle/TlbShootdownLifecycle"
+flow = "tlb-shootdown-lifecycle"
+find = '''Activate(cpu, root) ==
+    /\ rootState[root] = RootLive
+    /\ references[root] > 0
+'''
+replace = '''Activate(cpu, root) ==
+    /\ TRUE
+'''
+occurrence = 1
+invariant = "ActiveRootsAreLiveAndReferenced"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "tlb-retirement-with-live-reference"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "tlb-shootdown-lifecycle/TlbShootdownLifecycle"
+flow = "tlb-shootdown-lifecycle"
+find = '''BeginRetirement(root) ==
+    /\ phase = Idle
+    /\ rootState[root] = RootLive
+    /\ references[root] = 0
+'''
+replace = '''BeginRetirement(root) ==
+    /\ phase = Idle
+    /\ rootState[root] = RootLive
+    /\ TRUE
+'''
+occurrence = 1
+invariant = "RetiredRootsOwnNoReference"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "tlb-same-root-activation-reloads"
+kind = "transition-effect"
+severity = "high"
+model = "tlb-shootdown-lifecycle/TlbShootdownLifecycle"
+flow = "tlb-shootdown-lifecycle"
+find = "    /\\ lastActivationReloaded' = (activeRoot[cpu] # root)"
+replace = "    /\\ lastActivationReloaded' = TRUE"
+occurrence = 1
+invariant = "SameRootActivationDoesNotReload"
+min_counterexample_states = 2
 
 [[mutation]]
 id = "user-stack-apply-under-scheduler-lock"
@@ -351,8 +679,26 @@ model = "user-stack-growth/UserStackGrowth"
 flow = "exception-retirement"
 find = "    /\\ processLock' = TRUE /\\ schedulerRaw' = FALSE"
 replace = "    /\\ processLock' = TRUE /\\ schedulerRaw' = TRUE"
-occurrence = 1
+occurrence = 2
 invariant = "LockDomainsNeverOverlap"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "user-stack-contention-retired-instead-of-deferred"
+kind = "transition-effect"
+severity = "critical"
+model = "user-stack-growth/UserStackGrowth"
+flow = "exception-retirement"
+find = '''ApplyContentionDefers ==
+    /\ phase = Planned /\ ~taskRetired
+    /\ phase' = Deferred
+'''
+replace = '''ApplyContentionDefers ==
+    /\ phase = Planned /\ ~taskRetired
+    /\ phase' = Retired
+'''
+occurrence = 1
+invariant = "RetiredPhaseRequiresPublishedRetirement"
 min_counterexample_states = 3
 
 [[mutation]]
@@ -366,3 +712,21 @@ replace = "FALSE"
 occurrence = 1
 invariant = "SleepingRequiresStableRecheck"
 min_counterexample_states = 3
+
+[[mutation]]
+id = "wayland-accept-readiness-guard-removed"
+kind = "transition-guard-removal"
+severity = "high"
+model = "wayland-accept-isolation/WaylandAcceptIsolation"
+flow = "wayland-client-ingress"
+find = '''BeginAcceptCall ==
+    /\ acceptCall = Idle
+    /\ listenerReady
+'''
+replace = '''BeginAcceptCall ==
+    /\ acceptCall = Idle
+    /\ TRUE
+'''
+occurrence = 1
+invariant = "AcceptRequiresPublishedReadiness"
+min_counterexample_states = 2

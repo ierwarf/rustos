@@ -238,7 +238,15 @@ fn create_input_wait_epoll(input_fds: &[OwnedFd]) -> Result<OwnedFd, i32> {
 }
 
 pub(crate) fn start_input_reader(input_fds: Vec<OwnedFd>) -> Result<InputReader, i32> {
-    let input_wait_epoll = create_input_wait_epoll(&input_fds)?;
+    let input_wait_epoll = create_input_wait_epoll(&input_fds).map_err(|errno| {
+        // This is a synchronous boot-terminal diagnostic. The normal
+        // observability worker may not run again when persistent epoll
+        // creation or registration exhausts its bounded service deadline.
+        crate::sys::debug_line(&format!(
+            "uiserver: startup failed stage=input-waitset-create errno={errno}"
+        ));
+        errno
+    })?;
     let (sender, receiver) = mpsc::sync_channel::<InputEvent>(INPUT_READER_QUEUE_CAPACITY);
     let wake_generation = Arc::new(AtomicU64::new(0));
     let shared_wake_sender = UiWakeSender {

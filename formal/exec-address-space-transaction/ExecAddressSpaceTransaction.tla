@@ -2,111 +2,209 @@
 EXTENDS Naturals
 
 (***************************************************************************
-Exec spans process-table reservation, scheduler admission/CR3 installation,
-and process-state ownership transfer.  Exit may win before installation or
-arrive after authorization, but an installed root always retains an exact
-owner and an authorized installation must complete its transfer.
+Exec spans process-table reservation, target quiescence, ProcessState/FD/MM
+generation replacement, scheduler root/context publication, and old-bundle
+retirement.
+
+The ProcessState lock remains held across the process-generation and scheduler
+publication edges. A remote target is not runnable until the last scheduler
+edge; self publication excludes IRQs. The old bundle remains retained until
+the new root/context is active.
+
+Concrete owners:
+  * kernel/ps/src/multitask/{current,process_table,scheduler}.rs
+  * kernel/ps/src/user/process_state.rs
 ***************************************************************************)
 
 Idle == "idle"
 Reserved == "reserved"
 Quiesced == "quiesced"
 Authorized == "authorized"
-RootInstalled == "root-installed"
+StateCommitted == "state-committed"
+SchedulerPublished == "scheduler-published"
 Owned == "owned"
 Cancelled == "cancelled"
 
-NoOwner == "none"
-PreparedOwner == "prepared-owner"
-ProcessOwner == "process-owner"
+OldGeneration == 0
+NewGeneration == 1
 
-VARIABLES phase, exiting, retiredMarker, reservationValid, activeRoot,
-          rootOwner, ownershipCommitted, installedOverRetirement
+VARIABLES phase, exiting, retiredMarker, reservationValid,
+          processGeneration, schedulerGeneration, activeRootGeneration,
+          targetRunnable, processStateLockHeld, oldBundleRetained,
+          ownershipCommitted, publishedOverRetirement
 
-vars == <<phase, exiting, retiredMarker, reservationValid, activeRoot,
-          rootOwner, ownershipCommitted, installedOverRetirement>>
+vars == <<phase, exiting, retiredMarker, reservationValid,
+          processGeneration, schedulerGeneration, activeRootGeneration,
+          targetRunnable, processStateLockHeld, oldBundleRetained,
+          ownershipCommitted, publishedOverRetirement>>
 
 Init ==
-    /\ phase = Idle /\ exiting = FALSE /\ retiredMarker = FALSE
-    /\ reservationValid = FALSE /\ activeRoot = FALSE
-    /\ rootOwner = NoOwner /\ ownershipCommitted = FALSE
-    /\ installedOverRetirement = FALSE
+    /\ phase = Idle
+    /\ exiting = FALSE
+    /\ retiredMarker = FALSE
+    /\ reservationValid = FALSE
+    /\ processGeneration = OldGeneration
+    /\ schedulerGeneration = OldGeneration
+    /\ activeRootGeneration = OldGeneration
+    /\ targetRunnable = TRUE
+    /\ processStateLockHeld = FALSE
+    /\ oldBundleRetained = TRUE
+    /\ ownershipCommitted = FALSE
+    /\ publishedOverRetirement = FALSE
 
 BeginExec ==
     /\ phase = Idle /\ ~exiting /\ ~retiredMarker
-    /\ phase' = Reserved /\ reservationValid' = TRUE
-    /\ rootOwner' = PreparedOwner
-    /\ UNCHANGED <<exiting, retiredMarker, activeRoot, ownershipCommitted,
-                    installedOverRetirement>>
+    /\ phase' = Reserved
+    /\ reservationValid' = TRUE
+    /\ UNCHANGED <<exiting, retiredMarker, processGeneration,
+                    schedulerGeneration, activeRootGeneration, targetRunnable,
+                    processStateLockHeld, oldBundleRetained,
+                    ownershipCommitted, publishedOverRetirement>>
 
 Quiesce ==
     /\ phase = Reserved
     /\ phase' = Quiesced
-    /\ UNCHANGED <<exiting, retiredMarker, reservationValid, activeRoot,
-                    rootOwner, ownershipCommitted, installedOverRetirement>>
+    /\ targetRunnable' = FALSE
+    /\ UNCHANGED <<exiting, retiredMarker, reservationValid,
+                    processGeneration, schedulerGeneration,
+                    activeRootGeneration, processStateLockHeld,
+                    oldBundleRetained, ownershipCommitted,
+                    publishedOverRetirement>>
 
 PublishExit ==
-    /\ phase \in {Reserved, Quiesced, Authorized, RootInstalled}
-    /\ exiting' = TRUE /\ retiredMarker' = TRUE
-    /\ UNCHANGED <<phase, reservationValid, activeRoot, rootOwner,
-                    ownershipCommitted, installedOverRetirement>>
+    /\ phase \in {Reserved, Quiesced, Authorized}
+    /\ exiting' = TRUE
+    /\ retiredMarker' = TRUE
+    /\ UNCHANGED <<phase, reservationValid, processGeneration,
+                    schedulerGeneration, activeRootGeneration, targetRunnable,
+                    processStateLockHeld, oldBundleRetained,
+                    ownershipCommitted, publishedOverRetirement>>
 
 Authorize ==
     /\ phase = Quiesced /\ reservationValid
     /\ ~exiting /\ ~retiredMarker
     /\ phase' = Authorized
-    /\ UNCHANGED <<exiting, retiredMarker, reservationValid, activeRoot,
-                    rootOwner, ownershipCommitted, installedOverRetirement>>
+    /\ UNCHANGED <<exiting, retiredMarker, reservationValid,
+                    processGeneration, schedulerGeneration,
+                    activeRootGeneration, targetRunnable,
+                    processStateLockHeld, oldBundleRetained,
+                    ownershipCommitted, publishedOverRetirement>>
 
-InstallRoot ==
+CommitProcessState ==
     /\ phase = Authorized /\ reservationValid
-    /\ ~retiredMarker
-    /\ phase' = RootInstalled /\ activeRoot' = TRUE
-    /\ installedOverRetirement' = retiredMarker
-    /\ UNCHANGED <<exiting, retiredMarker, reservationValid, rootOwner,
-                    ownershipCommitted>>
+    /\ phase' = StateCommitted
+    /\ processGeneration' = NewGeneration
+    /\ processStateLockHeld' = TRUE
+    /\ UNCHANGED <<exiting, retiredMarker, reservationValid,
+                    schedulerGeneration, activeRootGeneration, targetRunnable,
+                    oldBundleRetained, ownershipCommitted,
+                    publishedOverRetirement>>
 
-TransferOwnership ==
-    /\ phase = RootInstalled /\ reservationValid /\ activeRoot
-    /\ phase' = Owned /\ rootOwner' = ProcessOwner
-    /\ ownershipCommitted' = TRUE /\ reservationValid' = FALSE
-    /\ UNCHANGED <<exiting, retiredMarker, activeRoot,
-                    installedOverRetirement>>
+PublishScheduler ==
+    /\ phase = StateCommitted
+    /\ reservationValid /\ processStateLockHeld
+    /\ processGeneration = NewGeneration
+    /\ phase' = SchedulerPublished
+    /\ schedulerGeneration' = NewGeneration
+    /\ activeRootGeneration' = NewGeneration
+    /\ targetRunnable' = TRUE
+    /\ publishedOverRetirement' = retiredMarker
+    /\ UNCHANGED <<exiting, retiredMarker, reservationValid,
+                    processGeneration, processStateLockHeld,
+                    oldBundleRetained, ownershipCommitted>>
 
-CancelBeforeInstall ==
-    /\ phase \in {Reserved, Quiesced, Authorized}
+FinalizeOwnership ==
+    /\ phase = SchedulerPublished
+    /\ processStateLockHeld
+    /\ processGeneration = NewGeneration
+    /\ schedulerGeneration = NewGeneration
+    /\ activeRootGeneration = NewGeneration
+    /\ phase' = Owned
+    /\ reservationValid' = FALSE
+    /\ processStateLockHeld' = FALSE
+    /\ oldBundleRetained' = FALSE
+    /\ ownershipCommitted' = TRUE
+    /\ UNCHANGED <<exiting, retiredMarker, processGeneration,
+                    schedulerGeneration, activeRootGeneration,
+                    targetRunnable, publishedOverRetirement>>
+
+CancelBeforeCommit ==
+    /\ phase \in {Reserved, Quiesced}
     /\ exiting \/ retiredMarker
-    /\ phase' = Cancelled /\ reservationValid' = FALSE
-    /\ rootOwner' = NoOwner
-    /\ UNCHANGED <<exiting, retiredMarker, activeRoot, ownershipCommitted,
-                    installedOverRetirement>>
+    /\ phase' = Cancelled
+    /\ reservationValid' = FALSE
+    /\ targetRunnable' = TRUE
+    /\ UNCHANGED <<exiting, retiredMarker, processGeneration,
+                    schedulerGeneration, activeRootGeneration,
+                    processStateLockHeld, oldBundleRetained,
+                    ownershipCommitted, publishedOverRetirement>>
 
 Terminal ==
     /\ phase \in {Owned, Cancelled}
     /\ UNCHANGED vars
 
-Next == BeginExec \/ Quiesce \/ PublishExit \/ Authorize \/ InstallRoot
-        \/ TransferOwnership \/ CancelBeforeInstall \/ Terminal
+Next ==
+    BeginExec \/ Quiesce \/ PublishExit \/ Authorize \/ CommitProcessState
+    \/ PublishScheduler \/ FinalizeOwnership \/ CancelBeforeCommit \/ Terminal
 
-Spec == Init /\ [][Next]_vars /\ WF_vars(TransferOwnership)
+Spec ==
+    Init /\ [][Next]_vars
+    /\ WF_vars(CommitProcessState)
+    /\ WF_vars(PublishScheduler)
+    /\ WF_vars(FinalizeOwnership)
 
 TypeOK ==
-    /\ phase \in {Idle, Reserved, Quiesced, Authorized, RootInstalled,
-                   Owned, Cancelled}
-    /\ exiting \in BOOLEAN /\ retiredMarker \in BOOLEAN
-    /\ reservationValid \in BOOLEAN /\ activeRoot \in BOOLEAN
-    /\ rootOwner \in {NoOwner, PreparedOwner, ProcessOwner}
+    /\ phase \in {Idle, Reserved, Quiesced, Authorized, StateCommitted,
+                   SchedulerPublished, Owned, Cancelled}
+    /\ exiting \in BOOLEAN
+    /\ retiredMarker \in BOOLEAN
+    /\ reservationValid \in BOOLEAN
+    /\ processGeneration \in {OldGeneration, NewGeneration}
+    /\ schedulerGeneration \in {OldGeneration, NewGeneration}
+    /\ activeRootGeneration \in {OldGeneration, NewGeneration}
+    /\ targetRunnable \in BOOLEAN
+    /\ processStateLockHeld \in BOOLEAN
+    /\ oldBundleRetained \in BOOLEAN
     /\ ownershipCommitted \in BOOLEAN
-    /\ installedOverRetirement \in BOOLEAN
+    /\ publishedOverRetirement \in BOOLEAN
 
-ActiveRootAlwaysOwned == activeRoot => rootOwner # NoOwner
-RootInstallNeverOverwritesRetirement == ~installedOverRetirement
-OwnedPhaseHasProcessOwner ==
-    phase = Owned => ownershipCommitted /\ rootOwner = ProcessOwner
-InstalledRootKeepsReservationUntilTransfer ==
-    phase = RootInstalled => reservationValid /\ rootOwner = PreparedOwner
+RunnableNewRootImpliesCompleteNewGeneration ==
+    targetRunnable /\ schedulerGeneration = NewGeneration =>
+        /\ processGeneration = NewGeneration
+        /\ activeRootGeneration = NewGeneration
 
-InstalledRootEventuallyTransfers ==
-    phase = RootInstalled ~> phase = Owned
+MixedGenerationIsNeverExternallyRunnable ==
+    processGeneration # schedulerGeneration =>
+        processStateLockHeld /\ ~targetRunnable
+
+OldBundleRetainedUntilSchedulerPublication ==
+    schedulerGeneration = OldGeneration => oldBundleRetained
+
+OldBundleReleaseRequiresCompletePublication ==
+    ~oldBundleRetained =>
+        /\ processGeneration = NewGeneration
+        /\ schedulerGeneration = NewGeneration
+        /\ activeRootGeneration = NewGeneration
+        /\ ownershipCommitted
+
+AuthorizedPublishOverRetirementIsGenerationComplete ==
+    publishedOverRetirement =>
+        /\ phase \in {SchedulerPublished, Owned}
+        /\ processGeneration = NewGeneration
+        /\ schedulerGeneration = NewGeneration
+        /\ activeRootGeneration = NewGeneration
+
+OwnedPhaseIsGenerationComplete ==
+    phase = Owned =>
+        /\ ownershipCommitted
+        /\ ~reservationValid
+        /\ ~processStateLockHeld
+        /\ targetRunnable
+        /\ processGeneration = NewGeneration
+        /\ schedulerGeneration = NewGeneration
+
+AuthorizedExecEventuallySettles ==
+    phase \in {Authorized, StateCommitted, SchedulerPublished} ~>
+        phase = Owned
 
 =============================================================================

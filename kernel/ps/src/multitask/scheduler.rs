@@ -28,7 +28,12 @@ mod context_validation;
 mod handoff_queue;
 mod handoffs;
 mod linux_thread_state;
+mod locality;
 mod reclaim;
+mod runtime_profile;
+pub(in crate::multitask) use runtime_profile::SchedulerEntryCause;
+pub use runtime_profile::drain_scheduler_runtime_profile;
+pub(in crate::multitask) use runtime_profile::publish_scheduler_runtime_profile;
 mod smp;
 #[cfg(test)]
 mod synchronous_handoff_tests;
@@ -117,6 +122,12 @@ const IPC_DONATION_BONUS_NS: u64 = 2_000_000;
 // (200us) so wake-up latency stays low; advantage_ns check still uses this as
 // the "must be at least this much ahead" threshold for peer-driven preemption.
 const SCHED_MIN_GRANULARITY_NS: u64 = 200_000;
+// Fair picks may retain cache locality only while a candidate that last ran
+// on this CPU remains within one minimum-granularity unit of the global
+// least-vruntime peer in the same class. This is a bounded tie-break, not CPU
+// affinity: exact handoffs, strict-class recovery, affinity, and remote-owner
+// exclusion all run before it, and a larger lag forces the global minimum.
+const SCHED_CPU_LOCALITY_LAG_NS: u64 = SCHED_MIN_GRANULARITY_NS;
 // Maximum runtime budget before we *forcibly* prefer any other ready task,
 // even ones that would normally lose the vruntime comparison. Acts as a
 // last-resort anti-starvation rail for long-running kernel paths that finally
@@ -127,13 +138,6 @@ const SCHED_MAX_BURST_NS: u64 = 20_000_000;
 /// CPU-share boost: once the bound expires the oldest ready System task gets
 /// one turn, after which normal weighted vruntime resumes.
 const SYSTEM_READY_LATENCY_BOUND_MS: u64 = 2;
-/// A ready fair-class task must run soon enough to consume a compositor frame
-/// callback before the following 60 Hz refresh. The bound is per task, not a
-/// class-wide dispatch ratio: one User turn after a System burst can still
-/// become multi-second latency when several services and applications share
-/// that turn. Two milliseconds bounds rotation across several clients while
-/// leaving drawing and commit headroom inside a 16.67 ms frame.
-const USER_READY_LATENCY_BOUND_MS: u64 = 2;
 // Initial vruntime offset for newly-spawned tasks relative to current
 // min_vruntime. Keep this near min-granularity: a larger multi-ms penalty
 // leaves freshly spawned services behind polling System peers during boot.
@@ -313,6 +317,40 @@ pub(super) struct TaskStart {
     pub(super) id: u64,
 }
 
+/// Exact result of one serialized scheduling decision.
+///
+/// Callers must carry this token through the architecture-return preparation
+/// step.  Deriving the switch predicate from the selected slots prevents an
+/// IRQ leaf from accidentally replaying CR3/TSS/FS/GS state on a same-task
+/// timer turn, while a real task switch can never skip that restoration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SchedulerDispatch {
+    pub(super) next_rsp: usize,
+    pub(super) tick_divisor: u16,
+    previous_slot: usize,
+    next_slot: usize,
+}
+
+impl SchedulerDispatch {
+    const fn new(
+        next_rsp: usize,
+        tick_divisor: u16,
+        previous_slot: usize,
+        next_slot: usize,
+    ) -> Self {
+        Self {
+            next_rsp,
+            tick_divisor,
+            previous_slot,
+            next_slot,
+        }
+    }
+
+    const fn requires_architectural_restore(self) -> bool {
+        self.previous_slot != self.next_slot
+    }
+}
+
 pub(super) struct Scheduler {
     contexts: [Option<TaskContext>; MAX_TASK],
     /// Thread metadata is independently synchronized from scheduler state.
@@ -341,6 +379,11 @@ pub(super) struct Scheduler {
     task_affinity_masks: [u64; MAX_TASK],
     process_affinity_masks: [u64; MAX_TASK],
     affinity_migration_pending: [bool; MAX_TASK],
+    /// Last CPU that actually dispatched each exact live task. This is
+    /// scheduler policy metadata, unlike the independently reset diagnostic
+    /// profile. It is only a bounded fair-pick tie-break and grants no CPU
+    /// ownership or affinity authority.
+    task_last_cpu: [u8; MAX_TASK],
     pub(super) current_task: usize,
     pending_reap: bool,
     /// L4/seL4-style "donate" hint: on the next scheduler tick, prefer this
@@ -379,6 +422,25 @@ pub(super) struct Scheduler {
     /// penalty) so they cannot preempt long-lived ready tasks just by virtue
     /// of being freshly created.
     last_min_vruntime_ns: u64,
+    /// Attribution remains fixed-size and is rendered only after the global
+    /// scheduler owner is released; normal logging policy may discard it.
+    runtime_profile_started_ticks: u64,
+    runtime_profile_ns: [u64; MAX_TASK],
+    runtime_profile_dispatches: [u64; MAX_TASK],
+    runtime_profile_entry_counts: [u64; runtime_profile::SCHEDULER_ENTRY_CAUSE_COUNT],
+    runtime_profile_same_task_dispatches: u64,
+    runtime_profile_task_switches: u64,
+    runtime_profile_address_space_switches: u64,
+    runtime_profile_cross_cpu_migrations: u64,
+    /// Diagnostic locality history is keyed by the exact monotonic task id so
+    /// slot reuse cannot be misreported as a cross-CPU migration. It is not
+    /// scheduling authority and must never influence affinity or selection.
+    runtime_profile_last_cpu: [u8; MAX_TASK],
+    runtime_profile_last_task_id: [u64; MAX_TASK],
+    runtime_profile_lock_wait_ns: u64,
+    runtime_profile_lock_hold_ns: u64,
+    runtime_profile_lock_wait_max_ns: u64,
+    runtime_profile_lock_hold_max_ns: u64,
     /// True after the bootstrap root task has entered the permanent hlt loop.
     /// Before that, slot 0 still runs finalize work and remains schedulable.
     root_idle: bool,
@@ -417,6 +479,7 @@ impl Scheduler {
             task_affinity_masks: [UNRESTRICTED_CPU_MASK; MAX_TASK],
             process_affinity_masks: [UNRESTRICTED_CPU_MASK; MAX_TASK],
             affinity_migration_pending: [false; MAX_TASK],
+            task_last_cpu: [NO_IDLE_CPU; MAX_TASK],
             current_task: 0,
             pending_reap: false,
             next_pick_hint: None,
@@ -428,6 +491,20 @@ impl Scheduler {
             atomic_activation_handoff_remaining: 0,
             sync_pick_hints: SlotHandoffQueue::new(),
             ipc_priority_donations: [None; MAX_TASK],
+            runtime_profile_started_ticks: 0,
+            runtime_profile_ns: [0; MAX_TASK],
+            runtime_profile_dispatches: [0; MAX_TASK],
+            runtime_profile_entry_counts: [0; runtime_profile::SCHEDULER_ENTRY_CAUSE_COUNT],
+            runtime_profile_same_task_dispatches: 0,
+            runtime_profile_task_switches: 0,
+            runtime_profile_address_space_switches: 0,
+            runtime_profile_cross_cpu_migrations: 0,
+            runtime_profile_last_cpu: [NO_IDLE_CPU; MAX_TASK],
+            runtime_profile_last_task_id: [0; MAX_TASK],
+            runtime_profile_lock_wait_ns: 0,
+            runtime_profile_lock_hold_ns: 0,
+            runtime_profile_lock_wait_max_ns: 0,
+            runtime_profile_lock_hold_max_ns: 0,
             last_min_vruntime_ns: 0,
             root_idle: false,
             system_dispatch_streak: 0,
@@ -802,6 +879,21 @@ impl Scheduler {
         self.task_affinity_masks = [UNRESTRICTED_CPU_MASK; MAX_TASK];
         self.process_affinity_masks = [UNRESTRICTED_CPU_MASK; MAX_TASK];
         self.affinity_migration_pending = [false; MAX_TASK];
+        self.task_last_cpu = [NO_IDLE_CPU; MAX_TASK];
+        self.runtime_profile_started_ticks = 0;
+        self.runtime_profile_ns = [0; MAX_TASK];
+        self.runtime_profile_dispatches = [0; MAX_TASK];
+        self.runtime_profile_entry_counts = [0; runtime_profile::SCHEDULER_ENTRY_CAUSE_COUNT];
+        self.runtime_profile_same_task_dispatches = 0;
+        self.runtime_profile_task_switches = 0;
+        self.runtime_profile_address_space_switches = 0;
+        self.runtime_profile_cross_cpu_migrations = 0;
+        self.runtime_profile_last_cpu = [NO_IDLE_CPU; MAX_TASK];
+        self.runtime_profile_last_task_id = [0; MAX_TASK];
+        self.runtime_profile_lock_wait_ns = 0;
+        self.runtime_profile_lock_hold_ns = 0;
+        self.runtime_profile_lock_wait_max_ns = 0;
+        self.runtime_profile_lock_hold_max_ns = 0;
         self.current_task = ROOT_TASK_SLOT;
         self.pending_reap = false;
         self.next_pick_hint = None;
@@ -914,6 +1006,9 @@ impl Scheduler {
         self.task_affinity_masks[slot] = UNRESTRICTED_CPU_MASK;
         self.process_affinity_masks[slot] = UNRESTRICTED_CPU_MASK;
         self.affinity_migration_pending[slot] = false;
+        self.task_last_cpu[slot] = NO_IDLE_CPU;
+        self.runtime_profile_last_cpu[slot] = NO_IDLE_CPU;
+        self.runtime_profile_last_task_id[slot] = 0;
         RetiredSlotReclaim::new(
             process_handle,
             self.stacks[slot].take(),
@@ -1152,10 +1247,9 @@ impl Scheduler {
     /// historical zero-charge behavior, since storage and other kernel paths
     /// rely on it to make timely forward progress under TCG.
     fn account_current_runtime(&mut self, slot: usize, now_ticks: u64, force_min_charge: bool) {
-        let Some(context) = self.contexts[slot].as_mut() else {
+        let Some(start) = self.contexts[slot].map(|context| context.exec_start_ticks) else {
             return;
         };
-        let start = context.exec_start_ticks;
         if start == 0 {
             return;
         }
@@ -1164,11 +1258,15 @@ impl Scheduler {
         } else {
             0
         };
+        self.account_runtime_profile(slot, elapsed_ns);
         let elapsed_ns = if force_min_charge {
             elapsed_ns.max(SCHED_MIN_GRANULARITY_NS)
         } else {
             elapsed_ns
         };
+        let context = self.contexts[slot]
+            .as_mut()
+            .expect("profiled scheduler task disappeared under scheduler owner");
         if elapsed_ns == 0 {
             context.exec_start_ticks = 0;
             return;
@@ -1178,98 +1276,19 @@ impl Scheduler {
         context.exec_start_ticks = 0;
     }
 
-    /// Walks scheduling classes in priority order (System > User > Idle) and
-    /// within each picks the smallest-vruntime ready task. The dispatcher
-    /// applies the bounded User reservation before calling this normal path.
+    /// Returns the lowest-vruntime User task only after the class-wide System
+    /// burst is exhausted.
     ///
-    /// Returns `None` only if literally nothing is ready and schedulable in
-    /// any class (including the current task and root) — in which case
-    /// `dispatch_schedule` falls back to ROOT_TASK_SLOT.
-    fn pick_min_vruntime(&self, current: usize) -> Option<usize> {
-        let mut best_by_class = [None::<(usize, u64)>; SchedClass::COUNT];
-        for slot in 0..MAX_TASK {
-            if !self.is_fair_candidate_slot(slot) {
-                continue;
-            }
-            let Some(context) = self.contexts[slot] else {
-                continue;
-            };
-            if !context.ready || !self.context_is_schedulable(slot, context) {
-                continue;
-            }
-            let Some(class) = self.slot_class(slot) else {
-                continue;
-            };
-            let key = if slot == current {
-                context.vruntime_ns.saturating_add(1)
-            } else {
-                context.vruntime_ns
-            };
-            let candidate = &mut best_by_class[class.index()];
-            if candidate
-                .map(|(_, best_key)| key < best_key)
-                .unwrap_or(true)
-            {
-                *candidate = Some((slot, key));
-            }
-        }
-        best_by_class
-            .into_iter()
+    /// A previous 2 ms wall-clock deadline made every runnable User task
+    /// bypass weight and vruntime under overload. With more runnable tasks
+    /// than admitted CPU capacity that promise is unschedulable and turns the
+    /// scheduler into a high-rate round-robin loop. Ordinary fair work stays
+    /// governed by charged vruntime; exact event and synchronous IPC wakeups
+    /// retain their separately bounded handoff queues.
+    fn reserved_user_pick(&self, current: usize) -> Option<usize> {
+        self.user_reservation_due()
+            .then(|| self.pick_min_vruntime_in_class(current, SchedClass::User))
             .flatten()
-            .next()
-            .map(|(slot, _)| slot)
-    }
-
-    fn pick_min_vruntime_excluding(&self, excluded: usize) -> Option<usize> {
-        let mut best_by_class = [None::<(usize, u64, usize)>; SchedClass::COUNT];
-        for slot in 0..MAX_TASK {
-            if slot == excluded || !self.is_fair_candidate_slot(slot) {
-                continue;
-            }
-            let Some(context) = self.contexts[slot] else {
-                continue;
-            };
-            if !context.ready || !self.context_is_schedulable(slot, context) {
-                continue;
-            }
-            let Some(class) = self.slot_class(slot) else {
-                continue;
-            };
-            let distance = (slot + MAX_TASK - excluded) % MAX_TASK;
-            let candidate = &mut best_by_class[class.index()];
-            if candidate
-                .map(|(_, best_vruntime, best_distance)| {
-                    context.vruntime_ns < best_vruntime
-                        || (context.vruntime_ns == best_vruntime && distance < best_distance)
-                })
-                .unwrap_or(true)
-            {
-                *candidate = Some((slot, context.vruntime_ns, distance));
-            }
-        }
-        best_by_class
-            .into_iter()
-            .flatten()
-            .next()
-            .map(|(slot, _, _)| slot)
-    }
-
-    /// Returns one User task when either its per-task dispatch deadline has
-    /// expired or the class-wide System burst is exhausted. Deadline selection
-    /// uses the oldest ready task so multiple fair-class clients cannot hide
-    /// behind a single class reservation.
-    fn reserved_user_pick(&self, current: usize, now_ticks: u64) -> Option<usize> {
-        self.overdue_class_pick(
-            current,
-            now_ticks,
-            SchedClass::User,
-            USER_READY_LATENCY_BOUND_MS,
-        )
-        .or_else(|| {
-            self.user_reservation_due()
-                .then(|| self.pick_min_vruntime_in_class(current, SchedClass::User))
-                .flatten()
-        })
     }
 
     fn overdue_class_pick(
@@ -1320,19 +1339,13 @@ impl Scheduler {
         )
     }
 
-    /// Absolute ready-age gate. Once either class reaches its declared bound,
-    /// fresh spawn, latency, and IPC handoffs cannot postpone that task again.
-    /// System wins a simultaneous expiry; User is selected on the following
-    /// bounded turn because its ready age remains saturated.
-    fn mandatory_overdue_pick(&self, current: usize, now_ticks: u64) -> Option<usize> {
-        self.overdue_system_pick(current, now_ticks).or_else(|| {
-            self.overdue_class_pick(
-                current,
-                now_ticks,
-                SchedClass::User,
-                USER_READY_LATENCY_BOUND_MS,
-            )
-        })
+    /// Strict-class ready-age gate. Fresh handoffs cannot postpone an already
+    /// admitted System continuation past its bound. User-class progress is
+    /// instead guaranteed by the System-burst reservation, bounded handoff
+    /// bursts, and charged vruntime; no unadmitted wall-clock deadline may
+    /// override fair-share accounting.
+    fn mandatory_overdue_system_pick(&self, current: usize, now_ticks: u64) -> Option<usize> {
+        self.overdue_system_pick(current, now_ticks)
     }
 
     /// Selects an overdue strict-class continuation before an unrelated IPC
@@ -1376,14 +1389,17 @@ impl Scheduler {
         };
     }
 
-    /// Removes the current user task's *base* System-class admission.
+    /// Removes the current user task's *base* System-class admission and caps
+    /// its permanent fair-scheduler share at the nominal user weight.
     ///
     /// This is an irreversible self-demotion for a process helper such as a
-    /// telemetry, catalog, or untrusted client-accept worker.  It preserves
-    /// the load weight and intentionally does not touch a live reply-scoped
-    /// IPC donation: a caller's bounded priority inheritance must outlive a
-    /// helper's local base-class choice and is released only by that reply's
-    /// terminal path.
+    /// telemetry, catalog, or untrusted client-accept worker. Clone inherits
+    /// both the class bit and the parent's load weight; clearing only the bit
+    /// left every uiserver helper with the compositor's elevated CPU share.
+    /// The cap is monotonic (a low-weight task cannot use this syscall to gain
+    /// share) and intentionally does not touch a live reply-scoped IPC
+    /// donation. Synchronous service work regains only its caller-derived
+    /// effective class and direct handoff until the exact reply terminates.
     pub(super) fn demote_current_user_task_to_user_class(&mut self) -> bool {
         let Some(context) = self.contexts[self.current_task].as_mut() else {
             return false;
@@ -1391,73 +1407,8 @@ impl Scheduler {
         if !context.user_mode {
             return false;
         }
-        context.weight &= LOAD_WEIGHT_MASK;
+        context.weight = (context.weight & LOAD_WEIGHT_MASK).min(NICE_0_LOAD);
         true
-    }
-
-    /// Picks the schedulable task with the smallest vruntime within a single
-    /// class. Ties prefer rotation away from the current task to keep
-    /// RR-equivalent behaviour when all weights are equal.
-    fn pick_min_vruntime_in_class(&self, current: usize, class: SchedClass) -> Option<usize> {
-        let mut best: Option<(usize, u64)> = None;
-        for slot in 0..MAX_TASK {
-            if !self.is_fair_candidate_slot(slot) {
-                continue;
-            }
-            let Some(ctx) = self.contexts[slot] else {
-                continue;
-            };
-            if !ctx.ready {
-                continue;
-            }
-            if !self.context_is_schedulable(slot, ctx) {
-                continue;
-            }
-            if self.slot_class(slot) != Some(class) {
-                continue;
-            }
-            // Tiny additive bias for the current slot encourages rotation on
-            // exact vruntime ties (the common case under equal weights), so
-            // we avoid sticking on one task when several are equally idle.
-            let key = if slot == current {
-                ctx.vruntime_ns.saturating_add(1)
-            } else {
-                ctx.vruntime_ns
-            };
-            match best {
-                None => best = Some((slot, key)),
-                Some((_, bk)) if key < bk => best = Some((slot, key)),
-                _ => {}
-            }
-        }
-        best.map(|(slot, _)| slot)
-    }
-
-    fn pick_burst_alternate_in_current_class(&self, current: usize) -> Option<usize> {
-        let class = self.slot_class(current)?;
-        let mut best: Option<(usize, u64)> = None;
-        for slot in 0..MAX_TASK {
-            if slot == current || !self.is_fair_candidate_slot(slot) {
-                continue;
-            }
-            let Some(ctx) = self.contexts[slot] else {
-                continue;
-            };
-            if !ctx.ready || !self.context_is_schedulable(slot, ctx) {
-                continue;
-            }
-            if self.slot_class(slot) != Some(class) {
-                continue;
-            }
-            let key = ctx.vruntime_ns;
-            if best
-                .map(|(_, current_key)| key < current_key)
-                .unwrap_or(true)
-            {
-                best = Some((slot, key));
-            }
-        }
-        best.map(|(slot, _)| slot)
     }
 
     fn maybe_log_ready_wait(
@@ -2599,6 +2550,16 @@ impl Scheduler {
             // frame for corruption and retire a healthy process from the
             // timer IRQ. Blocked, suspended, and already-retired slots are not
             // dispatch candidates and are validated at their own transition.
+            // `self.current_task` is scratch for this guard's CPU only. A
+            // different CPU may still own this slot and mutate its live stack
+            // without holding the global scheduler lock.
+            if !published_frame_is_stable(
+                slot,
+                self.current_task,
+                super::task_slot_is_running(slot),
+            ) {
+                continue;
+            }
             let Some(context) = self.contexts[slot] else {
                 continue;
             };
@@ -2661,15 +2622,19 @@ impl Scheduler {
         }
     }
 
-    pub(super) fn on_timer_interrupt(&mut self, current_rsp: usize) -> (usize, u16) {
+    pub(super) fn on_timer_interrupt(&mut self, current_rsp: usize) -> SchedulerDispatch {
         self.dispatch_schedule(current_rsp, false)
     }
 
-    pub(super) fn on_voluntary_yield(&mut self, current_rsp: usize) -> (usize, u16) {
+    pub(super) fn on_voluntary_yield(&mut self, current_rsp: usize) -> SchedulerDispatch {
         self.dispatch_schedule(current_rsp, true)
     }
 
-    fn dispatch_schedule(&mut self, current_rsp: usize, voluntary_yield: bool) -> (usize, u16) {
+    fn dispatch_schedule(
+        &mut self,
+        current_rsp: usize,
+        voluntary_yield: bool,
+    ) -> SchedulerDispatch {
         let current_slot = self.current_task;
         let current_task_id = self.starts[current_slot]
             .map(|start| start.id)
@@ -2753,7 +2718,7 @@ impl Scheduler {
                     Some(peer_slot) => (peer_slot, true, None, false, true),
                     None => {
                         let mandatory_overdue =
-                            self.mandatory_overdue_pick(current_slot, now_ticks);
+                            self.mandatory_overdue_system_pick(current_slot, now_ticks);
                         let bootstrap_handoff = if mandatory_overdue.is_none() {
                             self.take_next_bootstrap_handoff_ready_slot()
                         } else {
@@ -2775,9 +2740,7 @@ impl Scheduler {
                                             match blocking_ipc_handoff {
                                                 Some(receiver_slot) => (receiver_slot, true, None),
                                                 None => {
-                                                    match self
-                                                        .reserved_user_pick(current_slot, now_ticks)
-                                                    {
+                                                    match self.reserved_user_pick(current_slot) {
                                                         Some(user_slot) => {
                                                             (user_slot, false, Some(user_slot))
                                                         }
@@ -2862,6 +2825,10 @@ impl Scheduler {
                         context.exec_start_ticks = now_ticks;
                     }
                     self.record_dispatch_class(next_idx);
+                    self.record_runtime_profile_dispatch(next_idx);
+                    let dispatch_cpu = nucleus_core::util::lockdep::current_cpu_index();
+                    self.record_runtime_profile_transition(current_slot, next_idx, dispatch_cpu);
+                    self.record_task_dispatch_cpu(next_idx, dispatch_cpu);
                     self.record_latency_handoff(latency_handoff_pick);
                     self.record_synchronous_handoff(sync_handoff_pick);
                     self.current_task = next_idx;
@@ -2869,7 +2836,7 @@ impl Scheduler {
                         .map(|start| start.id)
                         .expect("schedulable task missing lockdep owner identity");
                     nucleus_core::util::lockdep::record_scheduler_dispatch(
-                        nucleus_core::util::lockdep::current_cpu_index(),
+                        dispatch_cpu,
                         current_task_id,
                         next_task_id,
                         current_slot,
@@ -2883,7 +2850,12 @@ impl Scheduler {
                             .checked_add(1)
                             .expect("task id exhausted lock owner token"),
                     );
-                    return (next.saved_rsp, self.scheduler_tick_divisor);
+                    return SchedulerDispatch::new(
+                        next.saved_rsp,
+                        self.scheduler_tick_divisor,
+                        current_slot,
+                        next_idx,
+                    );
                 }
                 Some(reason) if next_idx == ROOT_TASK_SLOT => {
                     self.log_invalid_context(next_idx, next.saved_rsp, reason, "next");
@@ -2913,7 +2885,16 @@ impl Scheduler {
             self.slot_class(current_slot) == Some(SchedClass::Idle),
             false,
         );
-        (current.saved_rsp, self.scheduler_tick_divisor)
+        self.record_runtime_profile_dispatch(current_slot);
+        let dispatch_cpu = nucleus_core::util::lockdep::current_cpu_index();
+        self.record_runtime_profile_transition(current_slot, current_slot, dispatch_cpu);
+        self.record_task_dispatch_cpu(current_slot, dispatch_cpu);
+        SchedulerDispatch::new(
+            current.saved_rsp,
+            self.scheduler_tick_divisor,
+            current_slot,
+            current_slot,
+        )
     }
 
     /// Min-granularity guard. Returns either `cfs_pick` (preempt) or
@@ -3113,6 +3094,26 @@ impl Scheduler {
         }
         FsBase::write(VirtAddr::new(fs_base));
         crate::user::syscall::prepare_for_context_return(return_to_user, user_gs_base);
+    }
+
+    /// Restore task-specific architectural state only across a real task
+    /// switch. Same-task scheduler turns retain the already-active CR3, TSS,
+    /// syscall stack, segment state, and FS/GS bases. The SIMD image remains
+    /// restored by every IRQ leaf because compiler-generated kernel code may
+    /// use vector registers after the save boundary.
+    pub(super) fn prepare_dispatched_task_execution(&mut self, dispatch: SchedulerDispatch) {
+        assert_eq!(
+            self.current_task, dispatch.next_slot,
+            "scheduler invariant: architecture restore token does not name current task"
+        );
+        if !dispatch.requires_architectural_restore() {
+            assert_eq!(
+                dispatch.previous_slot, dispatch.next_slot,
+                "scheduler invariant: same-task restore token changed slot identity"
+            );
+            return;
+        }
+        self.prepare_current_task_execution();
     }
 
     pub(super) fn reap_inactive_retired_slots(&mut self) -> Option<RetiredSlotReclaim> {
@@ -3362,7 +3363,7 @@ impl Scheduler {
         let preserved_affinity = self.exec_affinity_snapshot(slot);
         let process_id = current_context.process_id?;
         let (sibling_slots, sibling_count) =
-            self.collect_process_sibling_slots(slot, process_handle);
+            self.collect_live_process_sibling_slots(slot, process_handle);
         for sibling_slot in sibling_slots.iter().take(sibling_count) {
             self.retire_exec_sibling_slot(*sibling_slot);
         }
@@ -3388,8 +3389,10 @@ impl Scheduler {
             context.user_stack = bootstrap.user_stack;
             context.blocked = false;
             context.blocked_since_ticks = 0;
-            context.ready = true;
-            context.ready_since_ticks = crate::arch::rtc::ticks();
+            // Self-exec keeps the only Running owner. Publishing Ready here
+            // would let another CPU validate or dispatch this live stack.
+            context.ready = false;
+            context.ready_since_ticks = 0;
         }
 
         self.exec_target_quiesced[slot] = false;
@@ -3426,7 +3429,7 @@ impl Scheduler {
         let preserved_affinity = self.exec_affinity_snapshot(slot);
         self.assert_exec_target_replacement_safe(slot);
         let (sibling_slots, sibling_count) =
-            self.collect_process_sibling_slots(slot, process_handle);
+            self.collect_live_process_sibling_slots(slot, process_handle);
         for sibling_slot in sibling_slots.iter().take(sibling_count) {
             self.retire_exec_sibling_slot(*sibling_slot);
         }
@@ -3507,7 +3510,14 @@ impl Scheduler {
         })
     }
 
-    fn collect_process_sibling_slots(
+    /// Collect only siblings that still have live scheduler ownership.
+    ///
+    /// Retired slots intentionally retain their context and process identity
+    /// until out-of-lock side effects and runtime cleanup acknowledge the
+    /// exact task generation. Re-collecting such a slot for process exit or
+    /// exec would publish a second retirement owner and is a fatal lifecycle
+    /// violation, not an idempotent operation.
+    fn collect_live_process_sibling_slots(
         &self,
         current_slot: usize,
         process_handle: ProcessHandle,
@@ -3515,7 +3525,7 @@ impl Scheduler {
         let mut slots = [0usize; MAX_TASK];
         let mut count = 0usize;
         for slot in 1..MAX_TASK {
-            if slot == current_slot {
+            if slot == current_slot || self.retired[slot] {
                 continue;
             }
 
@@ -3685,7 +3695,7 @@ impl Scheduler {
             return false;
         }
         let (sibling_slots, sibling_count) =
-            self.collect_process_sibling_slots(leader_slot, process_handle);
+            self.collect_live_process_sibling_slots(leader_slot, process_handle);
         for slot in sibling_slots.into_iter().take(sibling_count) {
             if !self.retired[slot] {
                 self.retire_slot(slot, TaskRetireReason::Terminated { requested_by_pid });
@@ -3992,7 +4002,7 @@ impl Scheduler {
             return;
         };
         let (sibling_slots, sibling_count) =
-            self.collect_process_sibling_slots(current_slot, process_handle);
+            self.collect_live_process_sibling_slots(current_slot, process_handle);
         let (_, current_task, current_pid) = self.describe_current_task();
         let logical_cpu = nucleus_core::util::lockdep::current_cpu_index();
         for slot in sibling_slots.iter().copied().take(sibling_count) {
@@ -4101,6 +4111,10 @@ fn should_validate_published_ready_frame(
     slot != current_slot && !retired && !start_suspended && ready && !blocked
 }
 
+fn published_frame_is_stable(slot: usize, current_slot: usize, running: bool) -> bool {
+    slot != current_slot && !running
+}
+
 fn live_task_state_is_partitioned(
     slot: usize,
     current_slot: usize,
@@ -4125,9 +4139,9 @@ mod tests {
     use alloc::boxed::Box;
 
     use super::{
-        ConsoleSessionHandle, MAX_CONSECUTIVE_SYSTEM_DISPATCHES, MAX_TASK, NICE_0_LOAD,
-        SYSTEM_CLASS_WEIGHT_FLAG, SchedClass, Scheduler, TaskContext, TaskStart,
-        align_kernel_stack_top,
+        ConsoleSessionHandle, MAX_CONSECUTIVE_SYSTEM_DISPATCHES, MAX_TASK, MIN_LOAD_WEIGHT,
+        NICE_0_LOAD, SCHED_CPU_LOCALITY_LAG_NS, SYSTEM_CLASS_WEIGHT_FLAG, SchedClass, Scheduler,
+        SchedulerDispatch, TaskContext, TaskStart, align_kernel_stack_top,
     };
     use crate::memory::paging::ProcessAddressSpace;
     use crate::multitask::{UserTaskBootstrap, noop_task_entry, process_table};
@@ -4146,6 +4160,15 @@ mod tests {
             assert!(top <= 0x10_000 + low_bits);
             assert!((0x10_000 + low_bits) - top < 16);
         }
+    }
+
+    #[test]
+    fn architectural_restore_is_required_exactly_for_a_task_switch() {
+        let same = SchedulerDispatch::new(0x1000, 119, 7, 7);
+        assert!(!same.requires_architectural_restore());
+
+        let switched = SchedulerDispatch::new(0x2000, 119, 7, 9);
+        assert!(switched.requires_architectural_restore());
     }
 
     #[test]
@@ -4233,6 +4256,15 @@ mod tests {
     }
 
     #[test]
+    fn ready_scanner_never_reads_a_frame_owned_by_any_cpu() {
+        use super::published_frame_is_stable as stable;
+
+        assert!(stable(2, 1, false));
+        assert!(!stable(1, 1, false));
+        assert!(!stable(2, 1, true));
+    }
+
+    #[test]
     fn live_noncurrent_task_must_retain_one_scheduler_state_owner() {
         use super::live_task_state_is_partitioned as partitioned;
 
@@ -4261,9 +4293,12 @@ mod tests {
             ..test_user_context(owner)
         });
 
-        let (slots, count) = scheduler.collect_process_sibling_slots(1, owner);
+        scheduler.retired[2] = true;
+        scheduler.contexts[5] = Some(test_user_context(owner));
+
+        let (slots, count) = scheduler.collect_live_process_sibling_slots(1, owner);
         assert_eq!(count, 1);
-        assert_eq!(slots[0], 2);
+        assert_eq!(slots[0], 5);
         assert!(slots[1..MAX_TASK].iter().all(|slot| *slot == 0));
     }
 
@@ -4849,14 +4884,14 @@ mod tests {
     }
 
     #[test]
-    fn self_demotion_removes_only_the_base_system_class() {
+    fn self_demotion_removes_base_system_class_and_caps_fair_weight() {
         let _process_table = process_table::tests::isolate_process_table();
         let mut scheduler = boxed_scheduler();
         let helper = test_process(73);
         let donor = test_process(74);
 
         let mut helper_context = test_user_context(helper);
-        helper_context.weight = SYSTEM_CLASS_WEIGHT_FLAG | NICE_0_LOAD;
+        helper_context.weight = SYSTEM_CLASS_WEIGHT_FLAG | (4 * NICE_0_LOAD);
         let mut donor_context = test_user_context(donor);
         donor_context.weight = SYSTEM_CLASS_WEIGHT_FLAG | NICE_0_LOAD;
         scheduler.contexts[1] = Some(helper_context);
@@ -4887,6 +4922,18 @@ mod tests {
         assert_eq!(scheduler.slot_class(1), Some(SchedClass::System));
         assert!(scheduler.release_ipc_priority(13));
         assert_eq!(scheduler.slot_class(1), Some(SchedClass::User));
+
+        // The syscall is surrender-only. A task already below the nominal
+        // share must not be able to raise its weight by invoking it.
+        scheduler.contexts[1]
+            .as_mut()
+            .expect("current context")
+            .weight = SYSTEM_CLASS_WEIGHT_FLAG | MIN_LOAD_WEIGHT;
+        assert!(scheduler.demote_current_user_task_to_user_class());
+        assert_eq!(
+            scheduler.contexts[1].expect("current context").weight,
+            MIN_LOAD_WEIGHT
+        );
     }
 
     #[test]
@@ -4912,7 +4959,7 @@ mod tests {
     }
 
     #[test]
-    fn oldest_overdue_user_is_reserved_before_system_burst_exhaustion() {
+    fn user_reservation_obeys_vruntime_without_a_wall_clock_bypass() {
         let mut scheduler = boxed_scheduler();
         let base = crate::memory::paging::USER_SPACE_BASE;
         let user_cs = crate::arch::gdt::user_code_selector().0 as u64;
@@ -4948,17 +4995,89 @@ mod tests {
             .as_mut()
             .expect("newer user context")
             .ready_since_ticks = 2;
+        scheduler.contexts[newer_user]
+            .as_mut()
+            .expect("newer user context")
+            .vruntime_ns = 10;
         scheduler.contexts[older_user]
             .as_mut()
             .expect("older user context")
             .ready_since_ticks = 1;
+        scheduler.contexts[older_user]
+            .as_mut()
+            .expect("older user context")
+            .vruntime_ns = 20;
 
         assert!(!scheduler.user_reservation_due());
-        let now_ticks = crate::arch::rtc::ticks_per_second().saturating_mul(2);
-        assert_eq!(
-            scheduler.reserved_user_pick(current, now_ticks),
-            Some(older_user)
-        );
+        assert_eq!(scheduler.reserved_user_pick(current), None);
+
+        scheduler.system_dispatch_streak = MAX_CONSECUTIVE_SYSTEM_DISPATCHES;
+        assert_eq!(scheduler.reserved_user_pick(current), Some(newer_user));
+    }
+
+    #[test]
+    fn fair_locality_is_bounded_by_class_and_vruntime_lag() {
+        let mut scheduler = boxed_scheduler();
+        let base = crate::memory::paging::USER_SPACE_BASE;
+        let user_cs = crate::arch::gdt::user_code_selector().0 as u64;
+        let user_ss = crate::arch::gdt::user_data_selector().0 as u64;
+        let mut allocate = |task_id, offset| {
+            scheduler
+                .allocate_user_slot(
+                    task_id,
+                    ProcessAddressSpace::empty_for_tests(),
+                    UserTaskBootstrap::new(
+                        UserAbi::Linux,
+                        x86_64::VirtAddr::new(base + offset),
+                        x86_64::VirtAddr::new(base + offset + 0x1_000),
+                    ),
+                    None,
+                    crate::arch::pit::divisor_from_micros(100),
+                    user_cs,
+                    user_ss,
+                    super::RFLAGS_RESERVED_BIT_1,
+                    false,
+                    noop_task_entry,
+                )
+                .expect("user slot")
+        };
+        let current = allocate(781, 0x2_000);
+        let global_min = allocate(782, 0x4_000);
+        let local = allocate(783, 0x6_000);
+        scheduler.current_task = current;
+        scheduler.task_last_cpu[current] = 0;
+        scheduler.task_last_cpu[global_min] = 1;
+        scheduler.task_last_cpu[local] = 0;
+        scheduler.contexts[current]
+            .as_mut()
+            .expect("current context")
+            .vruntime_ns = 10_000_000;
+        scheduler.contexts[global_min]
+            .as_mut()
+            .expect("global context")
+            .vruntime_ns = 1_000_000;
+        scheduler.contexts[local]
+            .as_mut()
+            .expect("local context")
+            .vruntime_ns = 1_000_000 + SCHED_CPU_LOCALITY_LAG_NS;
+
+        assert_eq!(scheduler.pick_min_vruntime(current), Some(local));
+
+        scheduler.contexts[local]
+            .as_mut()
+            .expect("local context")
+            .vruntime_ns = 1_000_001 + SCHED_CPU_LOCALITY_LAG_NS;
+        assert_eq!(scheduler.pick_min_vruntime(current), Some(global_min));
+
+        scheduler.contexts[global_min]
+            .as_mut()
+            .expect("global context")
+            .weight |= SYSTEM_CLASS_WEIGHT_FLAG;
+        scheduler.contexts[global_min]
+            .as_mut()
+            .expect("global context")
+            .vruntime_ns = u64::MAX / 2;
+        assert_eq!(scheduler.pick_min_vruntime(current), Some(global_min));
     }
 
     #[test]
@@ -5120,7 +5239,7 @@ mod tests {
         assert!(scheduler.set_next_latency_pick_hint(823));
 
         assert_eq!(
-            scheduler.mandatory_overdue_pick(current, now_ticks),
+            scheduler.mandatory_overdue_system_pick(current, now_ticks),
             Some(overdue)
         );
         assert_eq!(scheduler.latency_pick_hint_len, 1);
@@ -5129,7 +5248,10 @@ mod tests {
             .as_mut()
             .expect("overdue context")
             .ready = false;
-        assert_eq!(scheduler.mandatory_overdue_pick(current, now_ticks), None);
+        assert_eq!(
+            scheduler.mandatory_overdue_system_pick(current, now_ticks),
+            None
+        );
         assert_eq!(
             scheduler.take_next_latency_pick_hint_ready_slot(),
             Some(hinted)

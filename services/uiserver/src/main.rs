@@ -7,6 +7,7 @@ mod gpu_runtime;
 mod gpu_scene;
 mod input_loop;
 mod layout;
+mod loop_timing;
 mod profile;
 mod render;
 mod runtime_sync;
@@ -14,6 +15,7 @@ mod simd;
 mod sys;
 mod terminal;
 mod wayland;
+mod wayland_accept;
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -24,6 +26,7 @@ use app::{
     start_console_refresh_worker, start_launcher_program_loader, AppState, VisualUpdate,
     CONSOLE_POLL_SLEEP, CURSOR_BLINK_INTERVAL, CURSOR_MOTION_SETTLE_INTERVAL, RUNTIME_POLL_SLEEP,
 };
+use loop_timing::{log_slow_loop_iteration, LoopPhaseTimings};
 use render::start_desktop_background_loader;
 use render::{render_boot_frame, render_debug_white_box, render_frame, render_rect};
 use runtime_control::RuntimeClient;
@@ -59,7 +62,6 @@ const WAYLAND_FRAME_CALLBACK_INTERVAL: Duration = Duration::from_millis(15);
 const PARTIAL_RENDER_BUDGET: Duration = Duration::from_millis(8);
 const DISPLAY_BACKPRESSURE_RETRY_DELAY: Duration = Duration::from_millis(1);
 const SLOW_LOOP_THRESHOLD: Duration = Duration::from_millis(50);
-const MAX_SLOW_LOOP_LOGS: usize = 16;
 
 const UI_PHASE_IDLE: usize = 0;
 const UI_PHASE_INPUT: usize = 1;
@@ -80,24 +82,6 @@ static SLOW_RUNTIME_REFRESH_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static WAYLAND_CALLBACK_ONLY_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static POINTER_MOVED_LOGGED: AtomicUsize = AtomicUsize::new(0);
 static CURSOR_PIPELINE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
-static SLOW_LOOP_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
-
-#[derive(Default)]
-struct LoopPhaseTimings {
-    input: Duration,
-    wayland: Duration,
-    runtime: Duration,
-    console: Duration,
-    cursor: Duration,
-    main_present: Duration,
-    sleep: Duration,
-}
-
-impl LoopPhaseTimings {
-    fn total_excluding_sleep(&self) -> Duration {
-        self.input + self.wayland + self.runtime + self.console + self.cursor + self.main_present
-    }
-}
 
 enum PresentUpdateResult {
     Idle,
@@ -696,32 +680,6 @@ fn log_cursor_pipeline_sample(
     ));
 }
 
-fn log_slow_loop_iteration(
-    state: &AppState,
-    iteration_elapsed: Duration,
-    timings: &LoopPhaseTimings,
-    backlog_remaining: bool,
-) {
-    let index = SLOW_LOOP_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    if index >= MAX_SLOW_LOOP_LOGS {
-        return;
-    }
-    diag_line(format!(
-        "uiserver: slow loop iter_ms={} input_ms={} wayland_ms={} runtime_ms={} console_ms={} cursor_ms={} present_ms={} sleep_ms={} backlog={} console_windows={} wayland_windows={}",
-        iteration_elapsed.as_millis(),
-        timings.input.as_millis(),
-        timings.wayland.as_millis(),
-        timings.runtime.as_millis(),
-        timings.console.as_millis(),
-        timings.cursor.as_millis(),
-        timings.main_present.as_millis(),
-        timings.sleep.as_millis(),
-        backlog_remaining,
-        state.console_windows.len(),
-        state.wayland_windows.len(),
-    ));
-}
-
 fn log_wayland_callback_only(state: &AppState, rect: canvas::Rect) {
     if !profile::enabled() {
         return;
@@ -845,7 +803,11 @@ fn run() -> Result<(), i32> {
         })?;
     diag_line("uiserver: wayland initialize begin");
     let wayland_init_started = Instant::now();
-    let mut wayland = WaylandCompositor::initialize(state.display.width, state.display.height);
+    let mut wayland = WaylandCompositor::initialize(
+        state.display.width,
+        state.display.height,
+        input_events.wake_sender(),
+    );
     if let Some(compositor) = wayland.as_mut() {
         compositor
             .attach_readiness_waker(input_events.wake_sender())
@@ -907,9 +869,11 @@ fn run() -> Result<(), i32> {
         let iteration_started = Instant::now();
         let mut phase_timings = LoopPhaseTimings::default();
 
+        let gpu_completion_started = Instant::now();
         if phase_result("gpu-completion", state.poll_gpu_completions())? {
             pending_update.request_full();
         }
+        phase_timings.gpu_completion = gpu_completion_started.elapsed();
 
         let background_ready = apply_ready_desktop_backgrounds(&mut state, &desktop_background);
         if background_ready {
@@ -966,7 +930,12 @@ fn run() -> Result<(), i32> {
         let service_wayland = !input.backlog_remaining || now >= next_wayland_backlog_service;
         watchdog.enter(UI_PHASE_WAYLAND);
         if let Some(compositor) = wayland.as_mut() {
-            if service_wayland {
+            let callback_due = wayland_callback_pending
+                && (wayland_frame_permit || now >= next_wayland_callback_pulse);
+            let protocol_input = compositor.has_pending_protocol_input();
+            if service_wayland
+                && wayland_service_required(protocol_input, input.input_events, callback_due)
+            {
                 let wayland_changed = compositor.tick();
                 compositor.rearm_readiness();
                 if wayland_changed {
@@ -1269,6 +1238,23 @@ fn run() -> Result<(), i32> {
             );
         }
         profile::maybe_emit();
+    }
+}
+
+fn wayland_service_required(protocol_input: bool, input_events: u64, callback_due: bool) -> bool {
+    protocol_input || input_events != 0 || callback_due
+}
+
+#[cfg(test)]
+mod main_loop_tests {
+    use super::wayland_service_required;
+
+    #[test]
+    fn wayland_dispatch_requires_protocol_input_server_events_or_due_callback() {
+        assert!(!wayland_service_required(false, 0, false));
+        assert!(wayland_service_required(true, 0, false));
+        assert!(wayland_service_required(false, 1, false));
+        assert!(wayland_service_required(false, 0, true));
     }
 }
 

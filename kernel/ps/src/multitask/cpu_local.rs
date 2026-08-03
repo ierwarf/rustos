@@ -74,34 +74,46 @@ pub(super) fn publish_scheduler_initialized() {
 }
 
 pub(super) struct SchedulerAccessGuard {
-    guard: TrackedSpinGuard<'static, Scheduler, { LockClass::Scheduler as u8 }>,
+    guard: Option<TrackedSpinGuard<'static, Scheduler, { LockClass::Scheduler as u8 }>>,
     logical_index: usize,
     original_task: usize,
+    acquired_at_ns: u64,
 }
 
 impl Deref for SchedulerAccessGuard {
     type Target = Scheduler;
 
     fn deref(&self) -> &Self::Target {
-        &self.guard
+        self.guard
+            .as_deref()
+            .expect("scheduler guard missing before release")
     }
 }
 
 impl DerefMut for SchedulerAccessGuard {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.guard
+        self.guard
+            .as_deref_mut()
+            .expect("scheduler guard missing before release")
     }
 }
 
 impl Drop for SchedulerAccessGuard {
     fn drop(&mut self) {
+        let guard = self
+            .guard
+            .as_mut()
+            .expect("scheduler guard missing during release");
+        guard.record_runtime_profile_lock_hold(
+            crate::arch::clock::monotonic_nanos().saturating_sub(self.acquired_at_ns),
+        );
         // ORDERING: Acquire proves this CPU completed initial slot admission.
         assert!(
             CURRENT_TASK_ACTIVE[self.logical_index].load(Ordering::Acquire),
             "scheduler invariant: CPU returned a task before current-slot admission"
         );
         assert!(
-            !slot_has_remote_owner(self.logical_index, self.guard.current_task),
+            !slot_has_remote_owner(self.logical_index, guard.current_task),
             "scheduler invariant: one task selected concurrently on two CPUs"
         );
         // ORDERING: Acquire rejects a second scheduler return before assembly
@@ -110,7 +122,7 @@ impl Drop for SchedulerAccessGuard {
             !TRANSITION_ACTIVE[self.logical_index].load(Ordering::Acquire),
             "scheduler invariant: CPU entered scheduler before prior stack handoff committed"
         );
-        if self.guard.current_task != self.original_task {
+        if guard.current_task != self.original_task {
             // ORDERING: Publish the outgoing slot before activating the
             // transition. Remote lifetime and selection paths must retain its
             // stack until assembly has installed the incoming `rsp`.
@@ -120,11 +132,19 @@ impl Drop for SchedulerAccessGuard {
         // ORDERING: Release publishes the exact task slot selected for this
         // CPU. A changed handoff already published the outgoing transition,
         // so both stacks remain owned until the assembly commit callback.
-        CURRENT_TASK_SLOTS[self.logical_index].store(self.guard.current_task, Ordering::Release);
+        CURRENT_TASK_SLOTS[self.logical_index].store(guard.current_task, Ordering::Release);
         // ORDERING: diagnostic metadata is not lock authority. Release-clear
         // its publication immediately before the tracked guard releases the
         // real lock.
         SCHEDULER_OWNER_CPU.store(NO_SCHEDULER_OWNER, Ordering::Release);
+        // Drop the tracked guard explicitly so the raw lock and its
+        // preemption unit are gone before any remote IPI is emitted.
+        drop(
+            self.guard
+                .take()
+                .expect("scheduler guard disappeared before unlock"),
+        );
+        super::irq::flush_deferred_reschedule_fanout();
     }
 }
 
@@ -220,6 +240,8 @@ pub(super) unsafe fn scheduler_mut() -> SchedulerAccessGuard {
         }
         spin_loop();
     };
+    let acquired_at_ns = crate::arch::clock::monotonic_nanos();
+    guard.record_runtime_profile_lock_wait(acquired_at_ns.saturating_sub(started_at));
     // ORDERING: Acquire restores this CPU's last published current-task slot
     // into the lock-protected scheduler scratch field.
     let original_task = CURRENT_TASK_SLOTS[logical_index].load(Ordering::Acquire);
@@ -233,7 +255,7 @@ pub(super) unsafe fn scheduler_mut() -> SchedulerAccessGuard {
     // ORDERING: prepare every relaxed diagnostic field before release
     // publishing the owner CPU below.
     SCHEDULER_OWNER_SLOT.store(original_task, Ordering::Relaxed);
-    SCHEDULER_OWNER_ACQUIRED_NS.store(crate::arch::clock::monotonic_nanos(), Ordering::Relaxed);
+    SCHEDULER_OWNER_ACQUIRED_NS.store(acquired_at_ns, Ordering::Relaxed);
     // ORDERING: this final relaxed field is also covered by the owner CPU's
     // following release publication.
     SCHEDULER_OWNER_CALLER.store(
@@ -251,9 +273,10 @@ pub(super) unsafe fn scheduler_mut() -> SchedulerAccessGuard {
         let _ = guard.wake_task(task_id);
     }
     SchedulerAccessGuard {
-        guard,
+        guard: Some(guard),
         logical_index,
         original_task,
+        acquired_at_ns,
     }
 }
 

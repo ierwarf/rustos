@@ -27,7 +27,12 @@ use rustos_user_abi::syscall::VFS_DEVICE_ACCESS_DRM_COMPAT;
 const PENDING_NETD_REF_CAPACITY: usize = 4096;
 const PENDING_NETD_REF_STORAGE_CAPACITY: usize = PENDING_NETD_REF_CAPACITY + 1;
 const REMOTE_VFS_OPEN_DESCRIPTION_CAPACITY: usize = 32 * 1024;
-const NETD_REF_OPERATION_TIMEOUT_MS: u64 = 16;
+// DUP/CLOSE/ACK change a service-owned open-description reference. They are
+// persistent control mutations, not non-consuming readiness observations.
+// One attempt therefore owns the complete interactive rail; fragmenting this
+// into 5-6 ms calls lets netd commit after each reply capability is revoked.
+const NETD_REF_OPERATION_TIMEOUT_MS: u64 =
+    rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS;
 const NETD_REF_OPERATION_ATTEMPTS: usize = 3;
 const NETD_MAINTENANCE_ATTEMPTS_PER_CALL: usize = 1;
 
@@ -575,7 +580,6 @@ fn duplicate_fd_transaction(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::vec;
 
     #[test]
     fn descriptor_exhaustion_is_not_reported_as_a_bad_source_fd() {
@@ -585,19 +589,21 @@ mod tests {
     }
 
     #[test]
-    fn netd_reference_retries_share_one_total_deadline() {
-        let slices = (0..NETD_REF_OPERATION_ATTEMPTS)
-            .map(|attempt| {
-                split_netd_ref_timeout_ms(
-                    NETD_REF_OPERATION_TIMEOUT_MS,
-                    NETD_REF_OPERATION_ATTEMPTS,
-                    attempt,
-                )
-            })
-            .collect::<Vec<_>>();
-        assert!(slices.iter().all(|slice| *slice > 0));
-        assert_eq!(slices.iter().sum::<u64>(), NETD_REF_OPERATION_TIMEOUT_MS);
-        assert_eq!(slices, vec![6, 5, 5]);
+    fn netd_reference_mutation_owns_the_complete_interactive_deadline() {
+        assert_eq!(
+            NETD_REF_OPERATION_TIMEOUT_MS,
+            rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS
+        );
+        assert_eq!(
+            super::ipc_helpers::deadline::remaining_service_timeout_ms(
+                NETD_REF_OPERATION_TIMEOUT_MS,
+                0,
+            ),
+            Some(100)
+        );
+        assert!(
+            !super::ipc_helpers::deadline::retryable_early_service_transport_error(LINUX_ETIMEDOUT)
+        );
     }
 
     #[test]
@@ -1174,13 +1180,16 @@ pub fn call_netd_socket_token_op(op: u16, socket_token: u64) -> Result<u64, i64>
 
 fn call_netd_socket_token_op_bounded(op: u16, socket_token: u64) -> Result<u64, i64> {
     let request = new_netd_socket_request(op, socket_token);
+    let start_ticks = crate::arch::rtc::ticks();
     let mut last = LINUX_ETIMEDOUT;
     for attempt in 0..NETD_REF_OPERATION_ATTEMPTS {
-        let timeout_ms = split_netd_ref_timeout_ms(
+        let elapsed_ms = netd_ref_elapsed_ms(start_ticks, crate::arch::rtc::ticks());
+        let Some(timeout_ms) = super::ipc_helpers::deadline::remaining_service_timeout_ms(
             NETD_REF_OPERATION_TIMEOUT_MS,
-            NETD_REF_OPERATION_ATTEMPTS,
-            attempt,
-        );
+            elapsed_ms,
+        ) else {
+            break;
+        };
         match call_netd_ipc_request_with_timeout(&request, timeout_ms) {
             Ok(response) => {
                 // The provider operation is already committed. Acknowledgement
@@ -1195,7 +1204,15 @@ fn call_netd_socket_token_op_bounded(op: u16, socket_token: u64) -> Result<u64, 
                 })?;
                 return Ok(response.value);
             }
-            Err(errno) if errno == LINUX_ETIMEDOUT => last = errno,
+            Err(errno)
+                if attempt + 1 < NETD_REF_OPERATION_ATTEMPTS
+                    && super::ipc_helpers::deadline::retryable_early_service_transport_error(
+                        errno,
+                    ) =>
+            {
+                last = errno;
+                multitask::cond_resched();
+            }
             Err(errno) => return Err(errno),
         }
     }
@@ -1287,10 +1304,12 @@ fn send_netd_ref_ack_with_timeout(request: &NetdIpcRequest, timeout_ms: u64) -> 
     Ok(())
 }
 
-fn split_netd_ref_timeout_ms(total: u64, attempts: usize, attempt: usize) -> u64 {
-    debug_assert!(attempts > 0 && attempt < attempts);
-    let attempts = attempts as u64;
-    total / attempts + u64::from((attempt as u64) < total % attempts)
+fn netd_ref_elapsed_ms(start_ticks: u64, end_ticks: u64) -> u64 {
+    let ticks_per_second = crate::arch::rtc::ticks_per_second().max(1);
+    end_ticks
+        .saturating_sub(start_ticks)
+        .saturating_mul(1000)
+        .saturating_div(ticks_per_second)
 }
 
 pub fn poll_netd_socket_token(

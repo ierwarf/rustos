@@ -70,6 +70,8 @@ use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
 
 const RECV_BACKOFF: Duration = Duration::from_millis(1);
+static REPLY_FAILURE_DIAGNOSTICS: rustos_svc_runtime::ipc::ReplyFailureDiagnostics =
+    rustos_svc_runtime::ipc::ReplyFailureDiagnostics::new();
 /// Fixed endpoint front-end pool. Short local-socket requests from independent
 /// clients must not queue behind one receiver, while shared protocol state
 /// remains serialized by `NetState` and blocking INET work stays in its
@@ -126,7 +128,8 @@ const AUTHENTICATED_CONTROL_RETRY: Duration = Duration::from_millis(4);
 /// deadline; only an actual smoltcp socket-state transition advances the
 /// public wait-set generation. Each turn processes at most the fixed ingress
 /// budget before yielding, even if a hostile producer keeps refilling the ring.
-const INET_READINESS_POLL_INTERVAL: Duration = Duration::from_millis(1);
+// The DVM ring has no userspace eventfd; 10 ms avoids unchanged-readiness wakeup churn.
+const INET_READINESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const INET_READINESS_POLL_BUDGET: usize = 32;
 const QEMU_USERNET_ADDR: Ipv4Address = Ipv4Address::new(10, 0, 2, 15);
 const QEMU_USERNET_GATEWAY: Ipv4Address = Ipv4Address::new(10, 0, 2, 2);
@@ -248,7 +251,7 @@ fn serve_request_loop(endpoint: u64) {
                     reply_commercial_error(reply_cap, commercial_request, libc::EACCES)
                 };
                 if reply < 0 {
-                    let _ = writeln!(std::io::stderr(), "netd: reply failed errno={}", -reply);
+                    REPLY_FAILURE_DIAGNOSTICS.record("netd", "ipc", -reply);
                 }
                 continue;
             }
@@ -304,7 +307,7 @@ fn serve_request_loop(endpoint: u64) {
         };
         let reply = reply_netd_response(reply_cap, &response);
         if reply < 0 {
-            let _ = writeln!(std::io::stderr(), "netd: reply failed errno={}", -reply);
+            REPLY_FAILURE_DIAGNOSTICS.record("netd", "ipc", -reply);
         }
         service_local_poll_waiters();
     }
@@ -429,8 +432,7 @@ fn start_blocking_workers() {
         if let Some(error) = last_error {
             debug_line(&format!(
                 "netd: blocking worker pool partially admitted active={} requested={} error={error}",
-                active,
-                BLOCKING_WORKER_COUNT,
+                active, BLOCKING_WORKER_COUNT,
             ));
         }
         queue.available.notify_all();
@@ -2573,10 +2575,15 @@ fn await_authenticated_packet_provider() -> Result<(), i32> {
 mod packet_provider_state_tests {
     use super::{
         packet_provider_state_from_wire, poll_turn_changes_readiness, PacketProviderState,
-        PollIngressSingleResult, PollResult, NET_BROKER_PACKET_STATUS_ACTIVE,
-        NET_BROKER_PACKET_STATUS_AWAITING_AUTHENTICATED_CONTROL,
+        PollIngressSingleResult, PollResult, INET_READINESS_POLL_INTERVAL,
+        NET_BROKER_PACKET_STATUS_ACTIVE, NET_BROKER_PACKET_STATUS_AWAITING_AUTHENTICATED_CONTROL,
         NET_BROKER_PACKET_STATUS_UNAVAILABLE,
     };
+
+    #[test]
+    fn inet_readiness_poll_is_bounded_without_one_millisecond_churn() {
+        assert_eq!(INET_READINESS_POLL_INTERVAL.as_millis(), 10);
+    }
 
     #[test]
     fn inet_ingress_publishes_only_socket_state_transitions() {

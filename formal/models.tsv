@@ -6,7 +6,7 @@ task-affinity-lifecycle/TaskAffinityLifecycle	safety	check	rejected affinity req
 acpi-table-admission/AcpiTableAdmission	safety	intentional-terminal	malformed firmware selects no partial ECAM or HPET authority	30	120	exhaustive	no	no	no
 cpu-topology-admission/CpuTopologyAdmission	safety	check	terminal admission states stutter so deadlock checking remains enabled	30	120	exhaustive	no	no	no
 cpu-online-lifecycle/CpuOnlineLifecycle	safety	check	all-failed terminal state stutters so deadlock checking remains enabled	30	120	exhaustive	no	no	no
-smp-reschedule-ipi/SmpRescheduleIpi	safety	check	critical-section enter and exit keep the finite protocol enabled while safety invariants are checked	30	120	exhaustive	no	no	no
+smp-reschedule-ipi/SmpRescheduleIpi	temporal	check	critical-section exit must flush durable fan-out and every published request must reach a safe dispatch	30	120	exhaustive	no	no	no
 scheduler-cpu-ownership/SchedulerCpuOwnership	safety	check	fail-closed invalid attempts and ordinary acquire release dispatch transitions all retain enabled stutter or progress	30	120	exhaustive	no	no	no
 bootstrap-activation-handoff/BootstrapActivationHandoff	safety	check	terminal and duplicate-activation stutter preserves deadlock checking while bounded FIFO ownership remains explicit	30	120	exhaustive	no	no	no
 synchronous-ipc-handoff/SynchronousIpcHandoff	safety	check	explicit terminal stutter preserves deadlock checking while bounded FIFO call-reply custody remains explicit	30	120	exhaustive	no	no	no
@@ -75,6 +75,7 @@ ipc-endpoint-ownership/IpcEndpointOwnership	safety	intentional-terminal	message 
 ipc-handle-transfer/IpcHandleTransfer	safety	intentional-terminal	transfer outcome is terminal	120	900	exhaustive+simulate	yes	no	no
 ipc-priority-inheritance/IpcPriorityInheritance	safety	intentional-terminal	IPC call may resolve or cancel	120	900	exhaustive	no	no	no
 ipc-priority-queue/IpcPriorityQueue	safety	check	all-delivered terminal state stutters while priority selection remains explicit	30	120	exhaustive	no	no	no
+ipc-reply-recv-transaction/IpcReplyRecvTransaction	safety	check	explicit success and phase-aware error terminals stutter while reply consumption and receive wake custody remain explicit	30	120	exhaustive	no	no	no
 ipc-reply-deadline/IpcReplyDeadline	temporal	intentional-terminal	IPC wait outcome is terminal	120	900	exhaustive	no	no	no
 ivshmem-pairing/IvshmemPairing	temporal	intentional-terminal	peer pairing may disconnect	120	900	exhaustive	no	no	no
 kernel-resource-accounting/KernelResourceAccounting	temporal	intentional-terminal	deferred backing reclaim eventually returns exact owner quota	30	120	exhaustive	no	no	no

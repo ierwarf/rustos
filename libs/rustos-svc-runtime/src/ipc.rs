@@ -1,16 +1,68 @@
 //! Thin convenience wrappers around the RustOS native IPC syscalls. Services
 //! can call these directly without going through libc.
 
-use alloc::vec::Vec;
+use alloc::{format, vec::Vec};
+use core::sync::atomic::{AtomicU64, Ordering};
 use rustos_user_abi::syscall::{
-    RustosIpcValidateServiceOwnerArgs, IPC_ABI_VERSION, SYS_RUSTOS_DEBUG_PRINT,
-    SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_IPC_CALL_BOUNDED, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
+    IPC_ABI_VERSION, IpcReplyRecvResultKind, IpcReplyRecvWithSenderArgs,
+    RustosIpcValidateServiceOwnerArgs, SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_IPC_CALL,
+    SYS_RUSTOS_IPC_CALL_BOUNDED, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
     SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_RECV_WITH_SENDER,
     SYS_RUSTOS_IPC_REGISTER_LINUX_SYSCALL_ENDPOINT, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT,
-    SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_IPC_VALIDATE_SERVICE_OWNER, SYS_RUSTOS_PRODUCT_MILESTONE,
+    SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_IPC_REPLY_RECV_WITH_SENDER,
+    SYS_RUSTOS_IPC_VALIDATE_SERVICE_OWNER, SYS_RUSTOS_PRODUCT_MILESTONE,
 };
 
 use crate::syscall::{syscall0, syscall1, syscall2, syscall3, syscall5, syscall6};
+
+const EARLY_REPLY_FAILURE_SAMPLES: u64 = 4;
+
+/// Lifetime-bounded reporting for replies whose caller has already cancelled
+/// or retired its one-shot capability.
+///
+/// A failure remains observable immediately, but a cancellation storm cannot
+/// turn the synchronous debug port into a second workload.  Each independent
+/// service lane emits the first four failures and then only power-of-two
+/// cumulative totals: at most 68 records even if its counter reaches `u64::MAX`.
+pub struct ReplyFailureDiagnostics {
+    total: AtomicU64,
+}
+
+impl ReplyFailureDiagnostics {
+    pub const fn new() -> Self {
+        Self {
+            total: AtomicU64::new(0),
+        }
+    }
+
+    pub fn record(&self, service: &str, operation: &str, errno: i64) {
+        let total = self
+            .total
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                value.checked_add(1)
+            })
+            .map_or(u64::MAX, |previous| previous + 1);
+        if reply_failure_diagnostic_due(total) {
+            debug_line(&format!(
+                "{service}: {operation} reply failed errno={errno} total={total}"
+            ));
+        }
+    }
+
+    pub fn total(&self) -> u64 {
+        self.total.load(Ordering::Acquire)
+    }
+}
+
+impl Default for ReplyFailureDiagnostics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn reply_failure_diagnostic_due(total: u64) -> bool {
+    total <= EARLY_REPLY_FAILURE_SAMPLES || total.is_power_of_two()
+}
 
 #[inline]
 pub fn endpoint_create() -> i64 {
@@ -132,6 +184,62 @@ pub unsafe fn reply(reply_cap: u64, response: *const u8, response_len: usize) ->
     )
 }
 
+/// Complete `reply_cap` and enter the next authenticated receive without an
+/// intermediate return to ring3.
+///
+/// A non-negative result is the next request length.  An ordinary negative
+/// errno means the reply was not consumed.  Use
+/// [`reply_recv_committed_errno`] to identify a receive failure after the
+/// reply commit; the old reply capability must never be retried in that case.
+#[inline]
+pub unsafe fn reply_recv_with_sender(
+    endpoint: u64,
+    reply_cap: u64,
+    response: *const u8,
+    response_len: usize,
+    request_buf: *mut u8,
+    request_capacity: usize,
+    next_reply_cap_out: *mut u64,
+    sender_pid_out: *mut u64,
+    sender_tid_out: *mut u64,
+) -> i64 {
+    let args = IpcReplyRecvWithSenderArgs {
+        abi_version: IPC_ABI_VERSION,
+        endpoint,
+        reply_cap,
+        response_ptr: response as u64,
+        response_len: response_len as u64,
+        request_ptr: request_buf as u64,
+        request_capacity: request_capacity as u64,
+        next_reply_cap_ptr: next_reply_cap_out as u64,
+        sender_pid_ptr: sender_pid_out as u64,
+        sender_tid_ptr: sender_tid_out as u64,
+        ..IpcReplyRecvWithSenderArgs::default()
+    };
+    syscall1(
+        SYS_RUSTOS_IPC_REPLY_RECV_WITH_SENDER,
+        (&args as *const IpcReplyRecvWithSenderArgs) as u64,
+    )
+}
+
+/// Returns the underlying receive errno only when `result` proves that the
+/// reply phase committed.  `None` means either success or a pre-commit errno.
+#[inline]
+pub fn reply_recv_committed_errno(result: i64) -> Option<i64> {
+    match reply_recv_result_kind(result) {
+        IpcReplyRecvResultKind::PostCommitError(errno) => Some(errno),
+        _ => None,
+    }
+}
+
+/// Classify success, retry-safe pre-commit failure, completed-reply failure,
+/// and impossible wire values without collapsing a protocol violation into a
+/// retryable result.
+#[inline]
+pub const fn reply_recv_result_kind(result: i64) -> IpcReplyRecvResultKind {
+    rustos_user_abi::syscall::ipc_reply_recv_result_kind(result)
+}
+
 /// Emit a debug line via `SYS_RUSTOS_DEBUG_PRINT`. Always-on; equivalent to
 /// the per-service `debug_line()` helpers that previously called
 /// `libc::syscall`.
@@ -154,4 +262,43 @@ pub fn debug_line(message: &str) {
 #[inline]
 pub fn product_milestone(milestone: u64, arg0: u64, arg1: u64) -> i64 {
     unsafe { syscall3(SYS_RUSTOS_PRODUCT_MILESTONE, milestone, arg0, arg1) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{reply_failure_diagnostic_due, reply_recv_committed_errno, reply_recv_result_kind};
+    use rustos_user_abi::syscall::IpcReplyRecvResultKind;
+
+    #[test]
+    fn reply_failure_diagnostics_are_lifetime_bounded() {
+        for total in 1..=4 {
+            assert!(reply_failure_diagnostic_due(total));
+        }
+        assert!(!reply_failure_diagnostic_due(5));
+        assert!(reply_failure_diagnostic_due(8));
+        assert!(!reply_failure_diagnostic_due(9));
+        assert!(reply_failure_diagnostic_due(1_u64 << 63));
+        assert!(!reply_failure_diagnostic_due(u64::MAX));
+    }
+
+    #[test]
+    fn reply_recv_phase_tag_cannot_alias_linux_errno() {
+        assert_eq!(reply_recv_committed_errno(0), None);
+        assert_eq!(reply_recv_committed_errno(-1), None);
+        assert_eq!(reply_recv_committed_errno(-4095), None);
+        assert_eq!(reply_recv_committed_errno(-4096), None);
+        assert_eq!(reply_recv_committed_errno(-4097), Some(1));
+        assert_eq!(reply_recv_committed_errno(-4221), Some(125));
+        assert_eq!(reply_recv_committed_errno(-8191), Some(4095));
+        assert_eq!(reply_recv_committed_errno(-8192), None);
+        assert_eq!(reply_recv_committed_errno(i64::MIN), None);
+        assert_eq!(
+            reply_recv_result_kind(-1),
+            IpcReplyRecvResultKind::PreCommitError(1)
+        );
+        assert_eq!(
+            reply_recv_result_kind(-4096),
+            IpcReplyRecvResultKind::Invalid
+        );
+    }
 }

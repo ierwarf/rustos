@@ -19,9 +19,10 @@ const PAGE_SIZE: u64 = 4096;
 const MAX_LOAD_SEGMENTS: usize = 32;
 const USER_STACK_GUARD_PAGES: usize = 1;
 const USER_STACK_RESERVE_PAGES: usize = 256;
-// Rust std userspace binaries can reserve tens of KiB in a single frame,
-// especially around Vec/array-heavy state synchronization paths.
-const USER_STACK_INITIAL_COMMIT_PAGES: usize = 64;
+// Exception context cannot wait for ProcessStateLock: another thread may hold
+// it when a valid stack-growth fault arrives. Until a deferred fault worker
+// exists, map every usable page eagerly and retain one permanent guard page.
+const USER_STACK_INITIAL_COMMIT_PAGES: usize = USER_STACK_RESERVE_PAGES - USER_STACK_GUARD_PAGES;
 const USER_STACK_TOP_EXCLUSIVE: u64 = paging::USER_SPACE_END_EXCLUSIVE;
 
 #[derive(Debug)]
@@ -315,14 +316,25 @@ pub fn spawn_prepared_process_suspended(
     Ok(SpawnedProcess { pid })
 }
 
+fn release_user_stack_state(reserve_start: VirtAddr) -> multitask::UserStackState {
+    let usable_start = reserve_start
+        + u64::try_from(USER_STACK_GUARD_PAGES).expect("stack guard-page count overflow")
+            * PAGE_SIZE;
+    multitask::UserStackState::new(
+        usable_start.as_u64(),
+        USER_STACK_TOP_EXCLUSIVE,
+        usable_start.as_u64(),
+    )
+}
+
 fn prepare_loaded_process_with_launch(
     mut loaded: LoadedProcessImage,
     launch: ProcessLaunchOptions<'_>,
 ) -> Result<PreparedProcessImage, ProcessLoadError> {
     const {
-        assert!(USER_STACK_RESERVE_PAGES > USER_STACK_INITIAL_COMMIT_PAGES);
+        assert!(USER_STACK_RESERVE_PAGES > USER_STACK_GUARD_PAGES);
         assert!(
-            USER_STACK_RESERVE_PAGES - USER_STACK_INITIAL_COMMIT_PAGES >= USER_STACK_GUARD_PAGES
+            USER_STACK_INITIAL_COMMIT_PAGES + USER_STACK_GUARD_PAGES == USER_STACK_RESERVE_PAGES
         );
     }
 
@@ -336,11 +348,7 @@ fn prepare_loaded_process_with_launch(
         "user stack reserve overlaps an existing mapping",
     )?;
 
-    let stack_state = multitask::UserStackState::new(
-        reserve_start.as_u64(),
-        USER_STACK_TOP_EXCLUSIVE,
-        USER_STACK_TOP_EXCLUSIVE - USER_STACK_INITIAL_COMMIT_PAGES as u64 * PAGE_SIZE,
-    );
+    let stack_state = release_user_stack_state(reserve_start);
     let stack_start = VirtAddr::new(stack_state.committed_start);
     let stack_region = loaded.address_space.map_zeroed_user_pages_at(
         stack_start,
@@ -422,7 +430,9 @@ fn build_process_bootstrap(
     let mut bootstrap = multitask::UserTaskBootstrap::new(abi, entry, stack_pointer);
     bootstrap.registers = launch.registers.into_task_registers();
     bootstrap.user_stack = user_stack;
-    if let (Some(stack), Some(state)) = (user_stack, linux_process_state.as_mut()) {
+    if let (Some(stack), Some(state)) = (user_stack, linux_process_state.as_mut())
+        && stack.reserve_start < stack.committed_start
+    {
         state
             .reserve_range(stack.reserve_start, stack.committed_start)
             .map_err(|_| {
@@ -501,4 +511,25 @@ fn align_up(value: u64, align: u64) -> Option<u64> {
     value
         .checked_add(align - 1)
         .map(|aligned| align_down(aligned, align))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn release_stack_maps_every_usable_page_above_one_guard() {
+        assert_eq!(USER_STACK_GUARD_PAGES, 1);
+        assert_eq!(USER_STACK_RESERVE_PAGES, 256);
+        assert_eq!(USER_STACK_INITIAL_COMMIT_PAGES, 255);
+
+        let reserve_start = USER_STACK_TOP_EXCLUSIVE
+            - u64::try_from(USER_STACK_RESERVE_PAGES).expect("stack pages") * PAGE_SIZE;
+        let usable_start = reserve_start
+            + u64::try_from(USER_STACK_GUARD_PAGES).expect("guard pages") * PAGE_SIZE;
+        let state = release_user_stack_state(VirtAddr::new(reserve_start));
+        assert_eq!(state.reserve_start, usable_start);
+        assert_eq!(state.reserve_start, state.committed_start);
+        assert_eq!(state.reserve_end, USER_STACK_TOP_EXCLUSIVE);
+    }
 }

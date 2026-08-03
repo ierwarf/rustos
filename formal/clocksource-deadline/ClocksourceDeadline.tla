@@ -31,7 +31,7 @@ Deadline construction, expiry, and the caller's completion condition all use
 `sourceTime`; no second counter exists in the specification.
 *******************************************************************************)
 
-CONSTANTS Tasks, MaxTime, MaxJump, MaxArmEpoch
+CONSTANTS Tasks, Cpus, MaxTime, MaxJump, MaxArmEpoch
 
 NoTask == 0
 NoDeadline == 0
@@ -47,6 +47,7 @@ Retired == "retired"
 
 VARIABLES sourceKind,
           sourceCalibrated,
+          clockCpuCount,
           sourceTime,
           servicedTime,
           deliveredEvents,
@@ -58,7 +59,7 @@ VARIABLES sourceKind,
           armEpoch,
           lastWakeEpoch
 
-vars == <<sourceKind, sourceCalibrated, sourceTime, servicedTime,
+vars == <<sourceKind, sourceCalibrated, clockCpuCount, sourceTime, servicedTime,
           deliveredEvents, taskState, deadline, deadlineOwner,
           localAdmission, processLockHeld, armEpoch, lastWakeEpoch>>
 
@@ -69,6 +70,7 @@ SourceValid ==
 Init ==
     /\ sourceKind = Uninitialized
     /\ sourceCalibrated = FALSE
+    /\ clockCpuCount \in 1..Cardinality(Cpus)
     /\ sourceTime = 0
     /\ servicedTime = 0
     /\ deliveredEvents = 0
@@ -82,6 +84,9 @@ Init ==
 
 SelectInvariantTsc ==
     /\ sourceKind = Uninitialized
+    \* Raw TSC becomes a system-wide source only in the uniprocessor topology.
+    \* SMP remains on HPET until an explicit cross-CPU skew admission exists.
+    /\ clockCpuCount = 1
     /\ sourceKind' = InvariantTsc
     /\ sourceCalibrated' = TRUE
     /\ UNCHANGED <<sourceTime, servicedTime, deliveredEvents, taskState,
@@ -184,7 +189,7 @@ AdvanceSource(step) ==
     /\ step \in 1..MaxJump
     /\ sourceTime + step <= MaxTime
     /\ sourceTime' = sourceTime + step
-    /\ UNCHANGED <<sourceKind, sourceCalibrated, servicedTime,
+    /\ UNCHANGED <<sourceKind, sourceCalibrated, clockCpuCount, servicedTime,
                   deliveredEvents, taskState, deadline, deadlineOwner,
                   localAdmission, processLockHeld, armEpoch, lastWakeEpoch>>
 
@@ -211,7 +216,7 @@ DeliverClockEvent ==
     /\ lastWakeEpoch' =
         [t \in Tasks |-> IF t \in Due THEN armEpoch[t] ELSE lastWakeEpoch[t]]
     /\ localAdmission' = localAdmission \ Due
-    /\ UNCHANGED <<sourceKind, sourceCalibrated, sourceTime,
+    /\ UNCHANGED <<sourceKind, sourceCalibrated, clockCpuCount, sourceTime,
                   processLockHeld, armEpoch>>
 
 RetireTask(task) ==
@@ -226,22 +231,26 @@ RetireTask(task) ==
                   deliveredEvents, armEpoch, lastWakeEpoch>>
 
 Next ==
-    \/ SelectInvariantTsc
-    \/ SelectHpet
-    \/ \E task \in Tasks : EnterSyscall(task)
-    \/ \E task \in Tasks : ExitSyscall(task)
-    \/ \E task \in Tasks : AdmitDeadlineLocally(task)
-    \/ \E task \in Tasks : ArmSleep(task)
-    \/ \E task \in Tasks : CommitSleep(task)
-    \/ \E task \in Tasks : CancelExpiredArm(task)
-    \/ \E task \in Tasks : WakeTask(task)
-    \/ \E step \in 1..MaxJump : AdvanceSource(step)
-    \/ DeliverClockEvent
-    \/ \E task \in Tasks : RetireTask(task)
+    /\ clockCpuCount' = clockCpuCount
+    /\ \/ SelectInvariantTsc
+       \/ SelectHpet
+       \/ \E task \in Tasks : EnterSyscall(task)
+       \/ \E task \in Tasks : ExitSyscall(task)
+       \/ \E task \in Tasks : AdmitDeadlineLocally(task)
+       \/ \E task \in Tasks : ArmSleep(task)
+       \/ \E task \in Tasks : CommitSleep(task)
+       \/ \E task \in Tasks : CancelExpiredArm(task)
+       \/ \E task \in Tasks : WakeTask(task)
+       \/ \E step \in 1..MaxJump : AdvanceSource(step)
+       \/ DeliverClockEvent
+       \/ \E task \in Tasks : RetireTask(task)
 
 TypeOK ==
     /\ Tasks \subseteq Nat
     /\ NoTask \notin Tasks
+    /\ Cpus \subseteq Nat
+    /\ Cpus # {}
+    /\ clockCpuCount \in 1..Cardinality(Cpus)
     /\ MaxTime \in Nat
     /\ MaxJump \in Nat
     /\ MaxArmEpoch \in Nat
@@ -261,6 +270,9 @@ TypeOK ==
 
 SelectedSourceIsValidated ==
     sourceKind # Uninitialized => SourceValid
+
+RawTscRequiresUniprocessorTopology ==
+    sourceKind = InvariantTsc => clockCpuCount = 1
 
 UnvalidatedClockOwnsNoDeadline ==
     ~SourceValid => \A task \in Tasks : deadline[task] = NoDeadline

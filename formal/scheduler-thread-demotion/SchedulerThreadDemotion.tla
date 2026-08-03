@@ -14,13 +14,15 @@ Concrete owners:
   * services/loaderd/src/main.rs
   * services/vfsd/src/main.rs
 
-The ABI deliberately has one direction.  A helper may surrender its base
-System class, but can never raise itself again.  The only remaining temporary
-System class is a reply-scoped IPC donation; that donation does not rewrite
-the base class and must disappear when its reply is released or the thread is
-retired.  This keeps background/untrusted helper work from competing with the
-input/present owner while preserving bounded priority inheritance for an
-already-authorized synchronous request.
+The ABI deliberately has one direction. A helper surrenders both its base
+System class and any permanent fair weight above the nominal user share, but
+can never raise either again. A task already below the nominal share is not
+promoted. The only remaining temporary System class is a reply-scoped IPC
+donation; that donation does not rewrite the base class or permanent weight
+and must disappear when its reply is released or the thread is retired. This
+keeps background/untrusted helper work from retaining the compositor's CPU
+share while preserving bounded priority inheritance for an already-authorized
+synchronous request.
 
 Loaderd and vfsd additionally carry the terminal UI bootstrap replies.  They
 may publish a demotion intent while processing that request, but must not
@@ -28,22 +30,29 @@ consume it until the exact reply succeeds.  Otherwise a still-blocked System
 caller can be stranded after the server has already dropped to User class.
 *******************************************************************************)
 
-CONSTANTS Threads, CompletionBoundThreads
+CONSTANTS Threads, CompletionBoundThreads, LowWeightThreads
 
 System == "system"
 User == "user"
+Elevated == "elevated"
+Normal == "normal"
+Low == "low"
 NoReply == "none"
 ReplyPending == "pending"
 ReplyComplete == "complete"
 
-VARIABLES live, baseClass, demoted, replyDonation, bootstrapReply
+VARIABLES live, baseClass, baseWeight, demoted, replyDonation, bootstrapReply
 
-vars == <<live, baseClass, demoted, replyDonation, bootstrapReply>>
+vars == <<live, baseClass, baseWeight, demoted, replyDonation, bootstrapReply>>
 
 Init ==
     /\ CompletionBoundThreads \subseteq Threads
+    /\ LowWeightThreads \subseteq Threads
     /\ live = [thread \in Threads |-> TRUE]
     /\ baseClass = [thread \in Threads |-> System]
+    /\ baseWeight =
+        [thread \in Threads |->
+            IF thread \in LowWeightThreads THEN Low ELSE Elevated]
     /\ demoted = [thread \in Threads |-> FALSE]
     /\ replyDonation = [thread \in Threads |-> FALSE]
     /\ bootstrapReply =
@@ -55,7 +64,7 @@ CompleteBootstrapReply(thread) ==
     /\ live[thread]
     /\ bootstrapReply[thread] = ReplyPending
     /\ bootstrapReply' = [bootstrapReply EXCEPT ![thread] = ReplyComplete]
-    /\ UNCHANGED <<live, baseClass, demoted, replyDonation>>
+    /\ UNCHANGED <<live, baseClass, baseWeight, demoted, replyDonation>>
 
 DemoteSelf(thread) ==
     /\ thread \in Threads
@@ -63,6 +72,9 @@ DemoteSelf(thread) ==
     /\ baseClass[thread] = System
     /\ (thread \in CompletionBoundThreads => bootstrapReply[thread] = ReplyComplete)
     /\ baseClass' = [baseClass EXCEPT ![thread] = User]
+    /\ baseWeight' =
+        [baseWeight EXCEPT ![thread] =
+            IF @ = Elevated THEN Normal ELSE @]
     /\ demoted' = [demoted EXCEPT ![thread] = TRUE]
     /\ UNCHANGED <<live, replyDonation, bootstrapReply>>
 
@@ -70,20 +82,20 @@ GrantReplyDonation(thread) ==
     /\ thread \in Threads
     /\ live[thread]
     /\ replyDonation' = [replyDonation EXCEPT ![thread] = TRUE]
-    /\ UNCHANGED <<live, baseClass, demoted, bootstrapReply>>
+    /\ UNCHANGED <<live, baseClass, baseWeight, demoted, bootstrapReply>>
 
 ReleaseReplyDonation(thread) ==
     /\ thread \in Threads
     /\ replyDonation[thread]
     /\ replyDonation' = [replyDonation EXCEPT ![thread] = FALSE]
-    /\ UNCHANGED <<live, baseClass, demoted, bootstrapReply>>
+    /\ UNCHANGED <<live, baseClass, baseWeight, demoted, bootstrapReply>>
 
 Retire(thread) ==
     /\ thread \in Threads
     /\ live[thread]
     /\ live' = [live EXCEPT ![thread] = FALSE]
     /\ replyDonation' = [replyDonation EXCEPT ![thread] = FALSE]
-    /\ UNCHANGED <<baseClass, demoted, bootstrapReply>>
+    /\ UNCHANGED <<baseClass, baseWeight, demoted, bootstrapReply>>
 
 Next ==
     \/ \E thread \in Threads : CompleteBootstrapReply(thread)
@@ -101,12 +113,20 @@ Spec == Init /\ [][Next]_vars
 TypeOK ==
     /\ live \in [Threads -> BOOLEAN]
     /\ baseClass \in [Threads -> {System, User}]
+    /\ baseWeight \in [Threads -> {Elevated, Normal, Low}]
     /\ demoted \in [Threads -> BOOLEAN]
     /\ replyDonation \in [Threads -> BOOLEAN]
     /\ bootstrapReply \in [Threads -> {NoReply, ReplyPending, ReplyComplete}]
 
 NoSelfPromotion ==
     \A thread \in Threads : demoted[thread] => baseClass[thread] = User
+
+DemotionCapsPermanentWeight ==
+    \A thread \in Threads :
+        demoted[thread] => baseWeight[thread] \in {Normal, Low}
+
+LowWeightNeverPromoted ==
+    \A thread \in LowWeightThreads : baseWeight[thread] = Low
 
 DemotionIsBaseOnly ==
     \A thread \in Threads :

@@ -291,8 +291,9 @@ pub fn wake_task(task_id: u64) -> bool {
     interrupts::without_interrupts(|| unsafe { scheduler_mut().wake_task(task_id) })
 }
 
-/// Permanently removes the current user task's base System-class admission.
-/// A reply-scoped IPC priority donation, if any, remains owned by that reply
+/// Permanently removes the current user task's base System-class admission and
+/// caps its permanent fair weight without ever increasing a lower weight. A
+/// reply-scoped IPC priority donation, if any, remains owned by that reply
 /// capability and therefore remains effective until the normal release path.
 pub fn demote_current_user_task_to_user_class() -> bool {
     interrupts::without_interrupts(|| unsafe {
@@ -424,31 +425,27 @@ pub fn exec_current_user_process(
         return None;
     }
 
-    // SAFETY: commit changes only scheduler-owned state and never enters the
-    // sleepable process-state lock while Scheduler is held.
-    let committed_handle = interrupts::without_interrupts(|| unsafe {
-        scheduler_mut().exec_current_user_process(new_root, &mut bootstrap)
-    });
+    let committed = super::process_table::replace_for_exec_and_publish(
+        exec_reservation,
+        address_space,
+        linux_process_state,
+        linux_memory_map,
+        linux_runtime_profile,
+        exec_path.as_str(),
+        || {
+            // SAFETY: ProcessStateLock remains held while IRQ exclusion and the raw
+            // scheduler lock publish the matching root/context generation.
+            interrupts::without_interrupts(|| unsafe {
+                scheduler_mut().exec_current_user_process(new_root, &mut bootstrap)
+            })
+        },
+    );
     complete_retirement_side_effects();
-    let Some(committed_handle) = committed_handle else {
+    let Some(closed) = committed else {
         let _ = super::process_table::cancel_exec(exec_reservation);
         return None;
     };
-    assert_eq!(
-        committed_handle, process_handle,
-        "exec transaction changed process generation during scheduler commit"
-    );
-    Some(
-        super::process_table::replace_for_exec(
-            exec_reservation,
-            address_space,
-            linux_process_state,
-            linux_memory_map,
-            linux_runtime_profile,
-            exec_path.as_str(),
-        )
-        .expect("exec process-state commit failed after scheduler commit"),
-    )
+    Some(closed)
 }
 
 pub fn exec_user_process_by_pid(
@@ -507,19 +504,37 @@ pub fn exec_user_process_by_pid(
     complete_retirement_side_effects();
     if !super::process_table::authorize_exec(exec_reservation) {
         let _ = super::process_table::cancel_exec(exec_reservation);
+        // SAFETY: IRQ exclusion and the global scheduler guard serialize the
+        // exact target-quiesce rollback; no process-state lock is acquired.
         interrupts::without_interrupts(|| unsafe {
             scheduler_mut().cancel_exec_target_quiesce(process_id, thread_id, process_handle);
         });
         return None;
     }
 
-    // SAFETY: the target and siblings are quiesced; the scheduler transaction
-    // cannot acquire ProcessStateLock.
-    let committed_handle = interrupts::without_interrupts(|| unsafe {
-        scheduler_mut().exec_user_process_by_pid(process_id, thread_id, new_root, &mut bootstrap)
-    });
+    let committed = super::process_table::replace_for_exec_and_publish(
+        exec_reservation,
+        address_space,
+        linux_process_state,
+        linux_memory_map,
+        linux_runtime_profile,
+        exec_path.as_str(),
+        || {
+            // The remote target remains quiesced until this final scheduler
+            // publication; ProcessStateLock prevents an early dispatcher from
+            // observing a partially finalized process generation.
+            interrupts::without_interrupts(|| unsafe {
+                scheduler_mut().exec_user_process_by_pid(
+                    process_id,
+                    thread_id,
+                    new_root,
+                    &mut bootstrap,
+                )
+            })
+        },
+    );
     complete_retirement_side_effects();
-    let Some(committed_handle) = committed_handle else {
+    let Some(closed) = committed else {
         let _ = super::process_table::cancel_exec(exec_reservation);
         // SAFETY: exact target quiesce state is cleared under the same guard.
         interrupts::without_interrupts(|| unsafe {
@@ -527,21 +542,7 @@ pub fn exec_user_process_by_pid(
         });
         return None;
     };
-    assert_eq!(
-        committed_handle, process_handle,
-        "target exec transaction changed process generation during scheduler commit"
-    );
-    Some(
-        super::process_table::replace_for_exec(
-            exec_reservation,
-            address_space,
-            linux_process_state,
-            linux_memory_map,
-            linux_runtime_profile,
-            exec_path.as_str(),
-        )
-        .expect("target exec process-state commit failed after scheduler commit"),
-    )
+    Some(closed)
 }
 
 pub fn linux_thread_snapshot_by_ids(

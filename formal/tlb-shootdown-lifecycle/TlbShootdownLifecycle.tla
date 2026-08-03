@@ -2,66 +2,146 @@
 EXTENDS Naturals, FiniteSets
 
 (***************************************************************************
-Models serialized address-space activation, page-table mutation, exact target
-snapshot, generation mailbox acknowledgement, and reclaim admission.
+Models address-space reference ownership, activation, serialized page-table
+mutation, conservative all-eligible target publication, exact-generation
+acknowledgement, and terminal root reclamation.
+
+The scheduler/process layer must release every task/slot/process reference and
+deactivate the root before retirement starts. Once a root is Retiring, neither
+a new reference nor a future Activate action is admitted. This makes the
+otherwise implicit Rust ownership premise part of the checked refinement.
 
 Concrete owners:
   * kernel/hal/src/arch/tlb_shootdown.rs
   * kernel/mm/src/memory/{address_space,kernel_vm}.rs
+  * kernel/ps/src/multitask/{scheduler,process_table}.rs
 ***************************************************************************)
 
-CONSTANT Cpus, Roots
+CONSTANTS Cpus, Roots, MaxRefs
 
 NoneRoot == "none"
 GlobalRoot == "global"
 Idle == "idle"
 Editing == "editing"
 Published == "published"
-Reclaimed == "reclaimed"
+Complete == "complete"
 
-VARIABLES activeRoot, eligible, phase, mutationRoot, generation,
-          targets, requestGeneration, ackGeneration
+RootLive == "root-live"
+RootRetiring == "root-retiring"
+RootReclaimed == "root-reclaimed"
 
-vars == <<activeRoot, eligible, phase, mutationRoot, generation,
-          targets, requestGeneration, ackGeneration>>
+NoMutation == "no-mutation"
+EditMutation == "edit-mutation"
+GlobalMutation == "global-mutation"
+RetireMutation == "retire-mutation"
+
+VARIABLES activeRoot, eligible, rootState, references, phase, mutationKind,
+          mutationRoot, generation, targets, requestGeneration, ackGeneration,
+          lastActivationSameRoot, lastActivationReloaded
+
+vars == <<activeRoot, eligible, rootState, references, phase, mutationKind,
+          mutationRoot, generation, targets, requestGeneration, ackGeneration,
+          lastActivationSameRoot, lastActivationReloaded>>
 
 Init ==
     /\ activeRoot = [cpu \in Cpus |-> NoneRoot]
     /\ eligible = [cpu \in Cpus |-> FALSE]
+    /\ rootState = [root \in Roots |-> RootLive]
+    /\ references = [root \in Roots |-> 1]
     /\ phase = Idle
+    /\ mutationKind = NoMutation
     /\ mutationRoot = NoneRoot
     /\ generation = 0
     /\ targets = {}
     /\ requestGeneration = [cpu \in Cpus |-> 0]
     /\ ackGeneration = [cpu \in Cpus |-> 0]
+    /\ lastActivationSameRoot = FALSE
+    /\ lastActivationReloaded = FALSE
+
+TargetSnapshot(root) == {cpu \in Cpus: eligible[cpu]}
+
+AcquireReference(root) ==
+    /\ rootState[root] = RootLive
+    /\ references[root] < MaxRefs
+    /\ references' = [references EXCEPT ![root] = @ + 1]
+    /\ UNCHANGED <<activeRoot, eligible, rootState, phase, mutationKind,
+                   mutationRoot, generation, targets, requestGeneration,
+                   ackGeneration, lastActivationSameRoot,
+                   lastActivationReloaded>>
+
+ReleaseReference(root) ==
+    /\ references[root] > 0
+    /\ \A cpu \in Cpus: activeRoot[cpu] # root
+    /\ references' = [references EXCEPT ![root] = @ - 1]
+    /\ UNCHANGED <<activeRoot, eligible, rootState, phase, mutationKind,
+                   mutationRoot, generation, targets, requestGeneration,
+                   ackGeneration, lastActivationSameRoot,
+                   lastActivationReloaded>>
 
 Activate(cpu, root) ==
-    /\ phase = Idle
-    /\ root \in Roots
+    /\ rootState[root] = RootLive
+    /\ references[root] > 0
+    /\ lastActivationSameRoot' = (activeRoot[cpu] = root)
+    /\ lastActivationReloaded' = (activeRoot[cpu] # root)
     /\ activeRoot' = [activeRoot EXCEPT ![cpu] = root]
-    /\ UNCHANGED <<eligible, phase, mutationRoot, generation, targets,
-                   requestGeneration, ackGeneration>>
+    /\ UNCHANGED <<eligible, rootState, references, phase, mutationKind,
+                   mutationRoot, generation, targets, requestGeneration,
+                   ackGeneration>>
+
+Deactivate(cpu) ==
+    /\ activeRoot[cpu] # NoneRoot
+    /\ activeRoot' = [activeRoot EXCEPT ![cpu] = NoneRoot]
+    /\ lastActivationSameRoot' = FALSE
+    /\ lastActivationReloaded' = FALSE
+    /\ UNCHANGED <<eligible, rootState, references, phase, mutationKind,
+                   mutationRoot, generation, targets, requestGeneration,
+                   ackGeneration>>
 
 Admit(cpu) ==
     /\ phase = Idle
     /\ activeRoot[cpu] \in Roots
     /\ ~eligible[cpu]
     /\ eligible' = [eligible EXCEPT ![cpu] = TRUE]
-    /\ UNCHANGED <<activeRoot, phase, mutationRoot, generation, targets,
-                   requestGeneration, ackGeneration>>
+    /\ UNCHANGED <<activeRoot, rootState, references, phase, mutationKind,
+                   mutationRoot, generation, targets, requestGeneration,
+                   ackGeneration, lastActivationSameRoot,
+                   lastActivationReloaded>>
 
-Begin(root) ==
+BeginMutation(root) ==
     /\ phase = Idle
-    /\ root \in Roots \cup {GlobalRoot}
+    /\ rootState[root] = RootLive
     /\ phase' = Editing
+    /\ mutationKind' = EditMutation
     /\ mutationRoot' = root
-    /\ targets' = {
-        cpu \in Cpus:
-            eligible[cpu]
-            /\ (root = GlobalRoot \/ activeRoot[cpu] = root)
-       }
-    /\ UNCHANGED <<activeRoot, eligible, generation,
-                   requestGeneration, ackGeneration>>
+    \* IRQ-time activation deliberately does not wait for this sender lock.
+    /\ targets' = TargetSnapshot(root)
+    /\ UNCHANGED <<activeRoot, eligible, rootState, references, generation,
+                   requestGeneration, ackGeneration, lastActivationSameRoot,
+                   lastActivationReloaded>>
+
+BeginGlobalMutation ==
+    /\ phase = Idle
+    /\ phase' = Editing
+    /\ mutationKind' = GlobalMutation
+    /\ mutationRoot' = GlobalRoot
+    /\ targets' = TargetSnapshot(GlobalRoot)
+    /\ UNCHANGED <<activeRoot, eligible, rootState, references, generation,
+                   requestGeneration, ackGeneration, lastActivationSameRoot,
+                   lastActivationReloaded>>
+
+BeginRetirement(root) ==
+    /\ phase = Idle
+    /\ rootState[root] = RootLive
+    /\ references[root] = 0
+    /\ \A cpu \in Cpus: activeRoot[cpu] # root
+    /\ rootState' = [rootState EXCEPT ![root] = RootRetiring]
+    /\ phase' = Editing
+    /\ mutationKind' = RetireMutation
+    /\ mutationRoot' = root
+    /\ targets' = TargetSnapshot(root)
+    /\ UNCHANGED <<activeRoot, eligible, references, generation,
+                   requestGeneration, ackGeneration, lastActivationSameRoot,
+                   lastActivationReloaded>>
 
 Publish ==
     /\ phase = Editing
@@ -73,34 +153,49 @@ Publish ==
         [cpu \in Cpus |->
             IF cpu \in targets THEN 0 ELSE ackGeneration[cpu]]
     /\ phase' = Published
-    /\ UNCHANGED <<activeRoot, eligible, mutationRoot, targets>>
+    /\ UNCHANGED <<activeRoot, eligible, rootState, references, mutationKind,
+                   mutationRoot, targets, lastActivationSameRoot,
+                   lastActivationReloaded>>
 
 Acknowledge(cpu) ==
     /\ phase = Published
     /\ cpu \in targets
     /\ requestGeneration[cpu] = generation
     /\ ackGeneration' = [ackGeneration EXCEPT ![cpu] = generation]
-    /\ UNCHANGED <<activeRoot, eligible, phase, mutationRoot, generation,
-                   targets, requestGeneration>>
+    /\ UNCHANGED <<activeRoot, eligible, rootState, references, phase,
+                   mutationKind, mutationRoot, generation, targets,
+                   requestGeneration, lastActivationSameRoot,
+                   lastActivationReloaded>>
 
-Reclaim ==
+Finish ==
     /\ phase = Published
     /\ \A cpu \in targets: ackGeneration[cpu] = generation
-    /\ phase' = Reclaimed
-    /\ UNCHANGED <<activeRoot, eligible, mutationRoot, generation, targets,
-                   requestGeneration, ackGeneration>>
+    /\ rootState' =
+        IF mutationKind = RetireMutation
+        THEN [rootState EXCEPT ![mutationRoot] = RootReclaimed]
+        ELSE rootState
+    /\ phase' = Complete
+    /\ UNCHANGED <<activeRoot, eligible, references, mutationKind,
+                   mutationRoot, generation, targets, requestGeneration,
+                   ackGeneration, lastActivationSameRoot,
+                   lastActivationReloaded>>
 
 Terminal ==
-    /\ phase = Reclaimed
+    /\ phase = Complete
     /\ UNCHANGED vars
 
 Next ==
+    \/ \E root \in Roots: AcquireReference(root)
+    \/ \E root \in Roots: ReleaseReference(root)
     \/ \E cpu \in Cpus, root \in Roots: Activate(cpu, root)
+    \/ \E cpu \in Cpus: Deactivate(cpu)
     \/ \E cpu \in Cpus: Admit(cpu)
-    \/ \E root \in Roots \cup {GlobalRoot}: Begin(root)
+    \/ \E root \in Roots: BeginMutation(root)
+    \/ BeginGlobalMutation
+    \/ \E root \in Roots: BeginRetirement(root)
     \/ Publish
     \/ \E cpu \in Cpus: Acknowledge(cpu)
-    \/ Reclaim
+    \/ Finish
     \/ Terminal
 
 Spec == Init /\ [][Next]_vars
@@ -108,26 +203,48 @@ Spec == Init /\ [][Next]_vars
 TypeOK ==
     /\ activeRoot \in [Cpus -> Roots \cup {NoneRoot}]
     /\ eligible \in [Cpus -> BOOLEAN]
-    /\ phase \in {Idle, Editing, Published, Reclaimed}
+    /\ rootState \in [Roots -> {RootLive, RootRetiring, RootReclaimed}]
+    /\ references \in [Roots -> 0..MaxRefs]
+    /\ phase \in {Idle, Editing, Published, Complete}
+    /\ mutationKind \in
+        {NoMutation, EditMutation, GlobalMutation, RetireMutation}
     /\ mutationRoot \in Roots \cup {NoneRoot, GlobalRoot}
     /\ generation \in Nat
     /\ targets \subseteq Cpus
     /\ requestGeneration \in [Cpus -> Nat]
     /\ ackGeneration \in [Cpus -> Nat]
+    /\ lastActivationSameRoot \in BOOLEAN
+    /\ lastActivationReloaded \in BOOLEAN
 
-TargetsMatchSnapshot ==
+SameRootActivationDoesNotReload ==
+    lastActivationSameRoot => ~lastActivationReloaded
+
+TargetsCoverEveryEligibleCpu ==
     phase \in {Editing, Published} =>
-        \A cpu \in targets:
-            /\ eligible[cpu]
-            /\ (mutationRoot = GlobalRoot
-                \/ activeRoot[cpu] = mutationRoot)
+        targets = {cpu \in Cpus: eligible[cpu]}
 
 PublishedTargetsOwnExactGeneration ==
     phase = Published =>
         \A cpu \in targets: requestGeneration[cpu] = generation
 
-ReclaimRequiresEveryAcknowledgement ==
-    phase = Reclaimed =>
+FinishRequiresEveryAcknowledgement ==
+    phase = Complete =>
         \A cpu \in targets: ackGeneration[cpu] = generation
+
+RetiredRootsOwnNoReference ==
+    \A root \in Roots:
+        rootState[root] \in {RootRetiring, RootReclaimed} => references[root] = 0
+
+ActiveRootsAreLiveAndReferenced ==
+    \A cpu \in Cpus:
+        activeRoot[cpu] # NoneRoot =>
+            /\ rootState[activeRoot[cpu]] = RootLive
+            /\ references[activeRoot[cpu]] > 0
+
+ReclaimedRootsCannotReactivate ==
+    \A root \in Roots:
+        rootState[root] = RootReclaimed =>
+            /\ references[root] = 0
+            /\ \A cpu \in Cpus: activeRoot[cpu] # root
 
 =============================================================================

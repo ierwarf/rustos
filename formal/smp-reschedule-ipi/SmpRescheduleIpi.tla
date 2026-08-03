@@ -2,7 +2,8 @@
 EXTENDS Naturals
 
 (***************************************************************************
-Models the per-CPU 0->1 reschedule request and fixed-IPI protocol.
+Models the per-CPU 0->1 reschedule request, lock-held publication, post-unlock
+fan-out, and fixed-IPI protocol.
 
 The request bit is the durable work owner. The APIC pending bit is only a
 notification. Receiving an IPI while a raw lock disables preemption may
@@ -15,47 +16,66 @@ Concrete owners:
   * kernel/lowlevel/src/interrupts.rs
 ***************************************************************************)
 
-CONSTANTS Cpus, MaxDispatchCount
+CONSTANTS Cpus, NoCpu, MaxDispatchCount
 
-VARIABLES online, request, ipiPending, preemptDisabled,
-          deferredOutstanding, dispatchCount, unsafeDispatch
+VARIABLES online, request, ipiPending, preemptDisabled, fanoutPending, fanoutOwner,
+          deferredOutstanding, dispatchCount, unsafeDispatch, selfIpiSent
 
-vars == <<online, request, ipiPending, preemptDisabled,
-          deferredOutstanding, dispatchCount, unsafeDispatch>>
+vars == <<online, request, ipiPending, preemptDisabled, fanoutPending, fanoutOwner,
+          deferredOutstanding, dispatchCount, unsafeDispatch, selfIpiSent>>
 
 Init ==
     /\ online = [cpu \in Cpus |-> TRUE]
     /\ request = [cpu \in Cpus |-> FALSE]
     /\ ipiPending = [cpu \in Cpus |-> FALSE]
     /\ preemptDisabled = [cpu \in Cpus |-> FALSE]
+    /\ fanoutPending = FALSE
+    /\ fanoutOwner = NoCpu
     /\ deferredOutstanding = [cpu \in Cpus |-> FALSE]
     /\ dispatchCount = [cpu \in Cpus |-> 0]
     /\ unsafeDispatch = FALSE
+    /\ selfIpiSent = FALSE
 
-PublishAndNotify(cpu) ==
+Publish(cpu) ==
     /\ online[cpu]
-    /\ ~request[cpu]
+    /\ ~request[cpu] \/ ~fanoutPending
     /\ request' = [request EXCEPT ![cpu] = TRUE]
-    /\ ipiPending' = [ipiPending EXCEPT ![cpu] = TRUE]
+    /\ fanoutPending' = TRUE
+    /\ fanoutOwner' = cpu
+    /\ UNCHANGED <<online, ipiPending, preemptDisabled, deferredOutstanding,
+                   dispatchCount, unsafeDispatch, selfIpiSent>>
+
+\* A flusher may differ from the original publisher. Conservative fan-out
+\* therefore covers every Online CPU; an already armed target retains its
+\* request and needs no second IPI edge.
+Fanout(flusher) ==
+    /\ fanoutPending
+    /\ online[flusher]
+    /\ request' = [cpu \in Cpus |-> IF online[cpu] THEN TRUE ELSE request[cpu]]
+    /\ ipiPending' =
+        [cpu \in Cpus |->
+            IF online[cpu] /\ cpu # flusher /\ ~request[cpu]
+            THEN TRUE
+            ELSE ipiPending[cpu]]
+    /\ selfIpiSent' = FALSE
+    /\ fanoutPending' = FALSE
+    /\ fanoutOwner' = NoCpu
     /\ UNCHANGED <<online, preemptDisabled, deferredOutstanding,
                    dispatchCount, unsafeDispatch>>
 
-Coalesce(cpu) ==
-    /\ online[cpu]
-    /\ request[cpu]
-    /\ UNCHANGED vars
+FanoutAny == \E flusher \in Cpus: Fanout(flusher)
 
 EnterCritical(cpu) ==
     /\ ~preemptDisabled[cpu]
     /\ preemptDisabled' = [preemptDisabled EXCEPT ![cpu] = TRUE]
-    /\ UNCHANGED <<online, request, ipiPending, deferredOutstanding,
-                   dispatchCount, unsafeDispatch>>
+    /\ UNCHANGED <<online, request, ipiPending, fanoutPending, fanoutOwner, deferredOutstanding,
+                   dispatchCount, unsafeDispatch, selfIpiSent>>
 
 ExitCritical(cpu) ==
     /\ preemptDisabled[cpu]
     /\ preemptDisabled' = [preemptDisabled EXCEPT ![cpu] = FALSE]
-    /\ UNCHANGED <<online, request, ipiPending, deferredOutstanding,
-                   dispatchCount, unsafeDispatch>>
+    /\ UNCHANGED <<online, request, ipiPending, fanoutPending, fanoutOwner, deferredOutstanding,
+                   dispatchCount, unsafeDispatch, selfIpiSent>>
 
 ReceiveWhileLocked(cpu) ==
     /\ ipiPending[cpu]
@@ -63,8 +83,8 @@ ReceiveWhileLocked(cpu) ==
     /\ ipiPending' = [ipiPending EXCEPT ![cpu] = FALSE]
     /\ deferredOutstanding' =
         [deferredOutstanding EXCEPT ![cpu] = TRUE]
-    /\ UNCHANGED <<online, request, preemptDisabled,
-                   dispatchCount, unsafeDispatch>>
+    /\ UNCHANGED <<online, request, preemptDisabled, fanoutPending, fanoutOwner,
+                   dispatchCount, unsafeDispatch, selfIpiSent>>
 
 ReceiveAndDispatch(cpu) ==
     /\ ipiPending[cpu]
@@ -77,7 +97,8 @@ ReceiveAndDispatch(cpu) ==
         [dispatchCount EXCEPT
             ![cpu] = IF @ < MaxDispatchCount THEN @ + 1 ELSE @]
     /\ unsafeDispatch' = unsafeDispatch \/ preemptDisabled[cpu]
-    /\ UNCHANGED <<online, preemptDisabled>>
+    /\ UNCHANGED <<online, preemptDisabled, fanoutPending, fanoutOwner,
+                   selfIpiSent>>
 
 ConsumeAtSafePoint(cpu) ==
     /\ request[cpu]
@@ -90,19 +111,26 @@ ConsumeAtSafePoint(cpu) ==
         [dispatchCount EXCEPT
             ![cpu] = IF @ < MaxDispatchCount THEN @ + 1 ELSE @]
     /\ unsafeDispatch' = unsafeDispatch \/ preemptDisabled[cpu]
-    /\ UNCHANGED <<online, preemptDisabled>>
+    /\ UNCHANGED <<online, preemptDisabled, fanoutPending, fanoutOwner,
+                   selfIpiSent>>
+
+Dispatch(cpu) == ReceiveAndDispatch(cpu) \/ ConsumeAtSafePoint(cpu)
 
 Next ==
     \E cpu \in Cpus:
-        \/ PublishAndNotify(cpu)
-        \/ Coalesce(cpu)
+        \/ Publish(cpu)
         \/ EnterCritical(cpu)
         \/ ExitCritical(cpu)
         \/ ReceiveWhileLocked(cpu)
         \/ ReceiveAndDispatch(cpu)
         \/ ConsumeAtSafePoint(cpu)
+    \/ FanoutAny
 
-Spec == Init /\ [][Next]_vars
+Spec ==
+    Init /\ [][Next]_vars
+    /\ WF_vars(FanoutAny)
+    /\ (\A cpu \in Cpus: WF_vars(ExitCritical(cpu)))
+    /\ (\A target \in Cpus: SF_vars(Dispatch(target)))
 
 TypeOK ==
     /\ MaxDispatchCount \in Nat \ {0}
@@ -110,12 +138,16 @@ TypeOK ==
     /\ request \in [Cpus -> BOOLEAN]
     /\ ipiPending \in [Cpus -> BOOLEAN]
     /\ preemptDisabled \in [Cpus -> BOOLEAN]
+    /\ fanoutPending \in BOOLEAN
+    /\ fanoutOwner \in Cpus \union {NoCpu}
+    /\ NoCpu \notin Cpus
     /\ deferredOutstanding \in [Cpus -> BOOLEAN]
     \* Safety depends on whether and how often a consume edge was observed,
     \* not an unbounded lifetime total. Saturation keeps the exhaustive state
     \* space finite while distinguishing zero, one, and repeated dispatch.
     /\ dispatchCount \in [Cpus -> 0..MaxDispatchCount]
     /\ unsafeDispatch \in BOOLEAN
+    /\ selfIpiSent \in BOOLEAN
 
 IpiRequiresDurableRequest ==
     \A cpu \in Cpus : ipiPending[cpu] => request[cpu]
@@ -126,7 +158,19 @@ DeferredReceiveNeverLosesRequest ==
 NoDispatchWhilePreemptionDisabled ==
     ~unsafeDispatch
 
+NoSelfIpi == ~selfIpiSent
+
 OfflineCpuOwnsNoNotification ==
     \A cpu \in Cpus : ~online[cpu] => ~ipiPending[cpu]
+
+PendingFanoutHasDurableOwner ==
+    /\ fanoutPending => fanoutOwner \in Cpus
+    /\ ~fanoutPending => fanoutOwner = NoCpu
+
+PendingFanoutEventuallyFlushes ==
+    fanoutPending ~> ~fanoutPending
+
+PublishedRequestEventuallyDispatches ==
+    \A cpu \in Cpus: request[cpu] ~> ~request[cpu]
 
 =============================================================================

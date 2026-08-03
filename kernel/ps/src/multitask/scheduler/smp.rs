@@ -47,7 +47,8 @@ impl Scheduler {
     pub(in crate::multitask) fn quiesce_current_exec_siblings(&mut self) -> Option<bool> {
         let current_slot = self.current_task;
         let process_handle = self.contexts[current_slot]?.process_handle?;
-        let (siblings, count) = self.collect_process_sibling_slots(current_slot, process_handle);
+        let (siblings, count) =
+            self.collect_live_process_sibling_slots(current_slot, process_handle);
         let mut waiting_for_remote = false;
         for slot in siblings.into_iter().take(count) {
             if remote_task_requires_quiescence(
@@ -100,7 +101,8 @@ impl Scheduler {
             self.current_task,
             super::super::task_slot_is_running(target_slot),
         );
-        let (siblings, count) = self.collect_process_sibling_slots(target_slot, process_handle);
+        let (siblings, count) =
+            self.collect_live_process_sibling_slots(target_slot, process_handle);
         for slot in siblings.into_iter().take(count) {
             if remote_task_requires_quiescence(
                 slot,

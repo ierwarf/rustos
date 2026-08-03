@@ -8,7 +8,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use kernel_ipc_runtime::api::KernelTransferredHandle;
+use kernel_ipc_runtime::api::{KernelTransferTicket, KernelTransferredHandle};
 use kernel_object::api::handle::{
     DeviceHandleRights, FileHandleRights, HandleOwner, HandleRights, HandleToken,
     SharedRegionRights, SocketHandleRights,
@@ -199,6 +199,7 @@ pub enum IpcTransferRegistryError {
 
 struct IpcTransferSlot {
     transfer_id: u64,
+    nonce: u64,
     entry: Option<TransferredHandleEntry>,
 }
 
@@ -206,6 +207,7 @@ impl IpcTransferSlot {
     const fn empty() -> Self {
         Self {
             transfer_id: 0,
+            nonce: 0,
             entry: None,
         }
     }
@@ -241,14 +243,15 @@ impl IpcTransferRegistry {
             .and_then(|slot| slot.entry.as_ref())
     }
 
-    fn insert(&mut self, transfer_id: u64, entry: TransferredHandleEntry) -> bool {
-        if transfer_id == 0 || self.contains(transfer_id) {
+    fn insert(&mut self, transfer_id: u64, nonce: u64, entry: TransferredHandleEntry) -> bool {
+        if transfer_id == 0 || nonce == 0 || self.contains(transfer_id) {
             return false;
         }
         let Some(slot) = self.slots.iter_mut().find(|slot| slot.entry.is_none()) else {
             return false;
         };
         slot.transfer_id = transfer_id;
+        slot.nonce = nonce;
         slot.entry = Some(entry);
         self.len += 1;
         true
@@ -261,8 +264,25 @@ impl IpcTransferRegistry {
             .find(|slot| slot.transfer_id == transfer_id)?;
         let entry = slot.entry.take()?;
         slot.transfer_id = 0;
+        slot.nonce = 0;
         self.len -= 1;
         Some(entry)
+    }
+
+    fn ticket(&self, transfer_id: u64) -> Option<KernelTransferTicket> {
+        let slot = self
+            .slots
+            .iter()
+            .find(|slot| slot.transfer_id == transfer_id && slot.entry.is_some())?;
+        KernelTransferTicket::new(slot.transfer_id, slot.nonce)
+    }
+
+    fn ticket_matches(&self, ticket: KernelTransferTicket) -> bool {
+        self.slots.iter().any(|slot| {
+            slot.entry.is_some()
+                && slot.transfer_id == ticket.transfer_id()
+                && slot.nonce == ticket.nonce()
+        })
     }
 }
 
@@ -333,6 +353,10 @@ pub fn register_ipc_transfer_entries(
     let mut inserted_ids = Vec::with_capacity(entries.len());
     let mut descriptors = Vec::with_capacity(entries.len());
     let mut rollback = Vec::with_capacity(entries.len());
+    let mut nonces = Vec::with_capacity(entries.len());
+    for _ in 0..entries.len() {
+        nonces.push(fresh_ipc_transfer_nonce());
+    }
     let mut objects = IPC_TRANSFER_OBJECTS.lock();
     let deferred = IPC_DEFERRED_TRANSFER_DROPS.lock();
     if objects
@@ -345,7 +369,7 @@ pub fn register_ipc_transfer_entries(
     }
     drop(deferred);
 
-    for entry in entries {
+    for (entry, nonce) in entries.into_iter().zip(nonces) {
         let Some(transfer_id) = allocate_ipc_transfer_id(&objects) else {
             for transfer_id in inserted_ids {
                 if let Some(entry) = objects.remove(transfer_id) {
@@ -367,13 +391,83 @@ pub fn register_ipc_transfer_entries(
             return Err(IpcTransferRegistryError::InvalidDescriptor);
         };
         assert!(
-            objects.insert(transfer_id, entry),
+            objects.insert(transfer_id, nonce, entry),
             "validated IPC transfer slot disappeared before publication"
         );
         inserted_ids.push(transfer_id);
         descriptors.push(descriptor);
     }
     Ok(descriptors)
+}
+
+/// Convert kernel-only typed descriptors into opaque integer tickets for one
+/// service byte protocol. No enum layout or padding crosses the boundary.
+pub fn ipc_transfer_tickets(
+    descriptors: &[KernelTransferredHandle],
+) -> Result<Vec<KernelTransferTicket>, IpcTransferRegistryError> {
+    let mut tickets = Vec::with_capacity(descriptors.len());
+    let objects = IPC_TRANSFER_OBJECTS.lock();
+    for (index, descriptor) in descriptors.iter().enumerate() {
+        if descriptors[..index]
+            .iter()
+            .any(|prior| prior.transfer_id() == descriptor.transfer_id())
+        {
+            return Err(IpcTransferRegistryError::InvalidDescriptor);
+        }
+        let Some(entry) = objects.get(descriptor.transfer_id()) else {
+            return Err(IpcTransferRegistryError::StaleDescriptor);
+        };
+        if entry.ipc_descriptor(descriptor.transfer_id()) != Some(*descriptor) {
+            return Err(IpcTransferRegistryError::InvalidDescriptor);
+        }
+        tickets.push(
+            objects
+                .ticket(descriptor.transfer_id())
+                .expect("validated transfer registry entry lost its ticket"),
+        );
+    }
+    Ok(tickets)
+}
+
+pub fn take_ipc_transfer_entries_by_tickets(
+    tickets: &[KernelTransferTicket],
+) -> Result<Vec<TransferredHandleEntry>, IpcTransferRegistryError> {
+    let mut entries = Vec::with_capacity(tickets.len());
+    let mut objects = IPC_TRANSFER_OBJECTS.lock();
+    for (index, ticket) in tickets.iter().enumerate() {
+        if tickets[..index]
+            .iter()
+            .any(|prior| prior.transfer_id() == ticket.transfer_id())
+        {
+            return Err(IpcTransferRegistryError::InvalidDescriptor);
+        }
+        if !objects.ticket_matches(*ticket) {
+            return Err(IpcTransferRegistryError::StaleDescriptor);
+        }
+    }
+    for ticket in tickets {
+        entries.push(
+            objects
+                .remove(ticket.transfer_id())
+                .expect("validated IPC transfer ticket disappeared while taking"),
+        );
+    }
+    Ok(entries)
+}
+
+pub fn drop_ipc_transfer_tickets(tickets: &[KernelTransferTicket]) {
+    if tickets.is_empty() {
+        return;
+    }
+    let mut objects = IPC_TRANSFER_OBJECTS.lock();
+    let mut deferred = IPC_DEFERRED_TRANSFER_DROPS.lock();
+    for ticket in tickets {
+        if objects.ticket_matches(*ticket)
+            && let Some(entry) = objects.remove(ticket.transfer_id())
+        {
+            deferred.push(entry);
+        }
+    }
 }
 
 pub fn take_ipc_transfer_entries(
@@ -438,6 +532,17 @@ fn allocate_ipc_transfer_id(objects: &IpcTransferRegistry) -> Option<u64> {
         }
     }
     None
+}
+
+fn fresh_ipc_transfer_nonce() -> u64 {
+    loop {
+        let mut bytes = [0_u8; core::mem::size_of::<u64>()];
+        nucleus_core::util::random::Random::new().fill_bytes(&mut bytes);
+        let nonce = u64::from_le_bytes(bytes);
+        if nonce != 0 {
+            return nonce;
+        }
+    }
 }
 
 fn allocate_nonwrapping_identity(counter: &AtomicU64) -> Option<u64> {
@@ -766,6 +871,35 @@ mod transfer_registry_tests {
         let dropped = take_deferred_ipc_transfer_drops(1);
         assert_eq!(dropped.len(), 1);
         assert_eq!(dropped[0].entry().handle().device_handle(), Some(device));
+    }
+
+    #[test]
+    fn opaque_transfer_ticket_is_exact_one_shot_and_nonce_bound() {
+        let token = u64::MAX - 702;
+        let device =
+            DeviceHandle::from_parts_with_token(DeviceId::Input, DeviceAccessKind::Evdev, token);
+        let entry = HandleEntry::new(KernelHandle::Device(device), 0, linux_abi::O_RDONLY);
+        let transferred = TransferredHandleEntry::from_entry(entry).expect("transferable input");
+        let descriptors =
+            register_ipc_transfer_entries(alloc::vec![transferred]).expect("register transfer");
+        let tickets = ipc_transfer_tickets(&descriptors).expect("mint transfer ticket");
+        assert_eq!(tickets.len(), 1);
+
+        let forged_nonce = tickets[0].nonce().wrapping_add(1).max(1);
+        let forged = KernelTransferTicket::new(tickets[0].transfer_id(), forged_nonce)
+            .expect("nonzero forged ticket shape");
+        assert!(matches!(
+            take_ipc_transfer_entries_by_tickets(&[forged]),
+            Err(IpcTransferRegistryError::StaleDescriptor)
+        ));
+
+        let entries = take_ipc_transfer_entries_by_tickets(&tickets).expect("take exact ticket");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].entry().handle().device_handle(), Some(device));
+        assert!(matches!(
+            take_ipc_transfer_entries_by_tickets(&tickets),
+            Err(IpcTransferRegistryError::StaleDescriptor)
+        ));
     }
 
     #[test]

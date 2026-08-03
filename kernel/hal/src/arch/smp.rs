@@ -4,9 +4,10 @@
 //!   online-state transitions; scheduling policy remains in `kernel-ps`.
 //! - **Boundary:** Only a completely admitted ACPI topology may create slots.
 //!   Raw APIC IDs are data and never array indexes.
-//! - **Lifecycle:** One release-published registry moves each exact generation
-//!   through Discovered -> Starting -> OnlineParked -> SchedulerReady -> Online
-//!   or the documented quarantine/failure paths.
+//! - **Lifecycle:** One release-published boot-static registry moves generation
+//!   one through Discovered -> Starting -> OnlineParked -> SchedulerReady ->
+//!   Online or the documented quarantine/failure paths. Failed is terminal
+//!   until reboot; in-boot restart/hotplug is unsupported.
 //! - **Concurrency:** Boot publication is single-writer; readers acquire the
 //!   publication epoch and state transitions use atomic compare-exchange.
 //! - **Failure:** Missing untrusted topology leaves the registry unpublished.
@@ -446,6 +447,16 @@ mod tests {
         let registry = CpuLifecycleRegistry::new();
         registry.publish_discovered(test_topology(&[(0, 0, false)]));
         registry.transition(0, FIRST_CPU_GENERATION + 1, CpuLifecycleState::Starting);
+    }
+
+    #[test]
+    #[should_panic(expected = "illegal CPU transition")]
+    fn cpu_lifecycle_failed_state_is_boot_terminal() {
+        let registry = CpuLifecycleRegistry::new();
+        registry.publish_discovered(test_topology(&[(0, 0, false)]));
+        registry.transition(0, FIRST_CPU_GENERATION, CpuLifecycleState::Starting);
+        registry.transition(0, FIRST_CPU_GENERATION, CpuLifecycleState::Failed);
+        registry.transition(0, FIRST_CPU_GENERATION, CpuLifecycleState::Starting);
     }
 
     #[test]

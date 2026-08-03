@@ -36,6 +36,9 @@ static CPU_FIRST_USER_DISPATCH_RECORDED: [AtomicBool;
 static CPU_FIRST_RESCHEDULE_IPI_RECORDED: [AtomicBool;
     nucleus_core::util::lockdep::MAX_TRACKED_CPUS] =
     [const { AtomicBool::new(false) }; nucleus_core::util::lockdep::MAX_TRACKED_CPUS];
+/// A request published while a raw scheduler owner disables preemption still
+/// needs a durable remote notification after that owner releases the lock.
+static RESCHEDULE_FANOUT_PENDING: AtomicBool = AtomicBool::new(false);
 
 pub fn timer_interrupt_handler_addr() -> u64 {
     crate::lowlevel::interrupts::timer_interrupt_handler_addr()
@@ -80,6 +83,17 @@ fn arm_remote_reschedule(flag: &AtomicU64) -> bool {
     // the ICR write and observes a request already owned by the target CPU.
     flag.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
+}
+
+fn publish_deferred_reschedule(local_request: &AtomicU64, fanout_pending: &AtomicBool) {
+    // ORDERING: the local Release makes the scheduling work durable before
+    // the fan-out Release transfers notification custody to the unlock path.
+    local_request.store(1, Ordering::Release);
+    fanout_pending.store(true, Ordering::Release);
+}
+
+const fn reschedule_notification_required(target: usize, current: usize) -> bool {
+    target != current
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -155,7 +169,7 @@ extern "C" fn timer_interrupt_dispatch(context_ptr: *mut SavedContext) -> *mut S
     // SAFETY: the interrupt stub supplied a complete CPU-local frame, IRQ
     // exclusion prevents same-CPU nested scheduling, and the scheduler lock
     // serializes all cross-CPU task-state mutation.
-    let (next_rsp, user_dispatch) = unsafe {
+    let (next_rsp, user_dispatch, runtime_profile) = unsafe {
         let mut scheduler = scheduler_mut();
         if timer_interrupted_kernel_frame(context_ptr, &scheduler) {
             complete_clockevent(logical_index);
@@ -168,16 +182,27 @@ extern "C" fn timer_interrupt_dispatch(context_ptr: *mut SavedContext) -> *mut S
         // selected continuation is restored.
         user_return_reschedule_flag(logical_index).store(0, Ordering::Release);
         deferred_reschedule_flag(logical_index).store(0, Ordering::Release);
+        scheduler.record_runtime_profile_entry(super::scheduler::SchedulerEntryCause::Timer);
         scheduler.save_current_simd_state();
-        let (next_rsp, next_pit_divisor) = scheduler.on_timer_interrupt(current_rsp);
+        let dispatch = scheduler.on_timer_interrupt(current_rsp);
         if logical_index == 0 {
-            crate::arch::pit::set_divisor(0, next_pit_divisor);
+            crate::arch::pit::set_divisor(0, dispatch.tick_divisor);
         }
-        scheduler.prepare_current_task_execution();
+        scheduler.prepare_dispatched_task_execution(dispatch);
         scheduler.restore_current_simd_state();
-        (next_rsp, scheduler.current_task_is_user_task())
+        // The BSP may stay in its kernel idle continuation while an AP owns
+        // all user work. The global scheduler owner already serializes and
+        // destructively gates the one-second snapshot, so any CPU that traps
+        // a user frame may claim the due profile without duplicate output.
+        let runtime_profile = scheduler.take_runtime_profile(crate::arch::rtc::ticks());
+        (
+            dispatch.next_rsp,
+            scheduler.current_task_is_user_task(),
+            runtime_profile,
+        )
     };
 
+    super::scheduler::publish_scheduler_runtime_profile(runtime_profile);
     record_first_user_dispatch(logical_index, user_dispatch);
     record_atomic_activation_dispatch(logical_index);
     record_first_ap_work_dispatch(logical_index);
@@ -262,18 +287,25 @@ extern "C" fn rtc_interrupt_dispatch(context_ptr: *mut SavedContext) -> *mut Sav
         return context_ptr;
     }
 
-    let (next_rsp, user_dispatch) = unsafe {
+    let (next_rsp, user_dispatch, runtime_profile) = unsafe {
         let mut scheduler = scheduler_mut();
         // ORDERING: Release completes same-CPU request consumption before the
         // selected continuation is restored.
         deferred_reschedule_flag(current_cpu_index()).store(0, Ordering::Release);
+        scheduler.record_runtime_profile_entry(super::scheduler::SchedulerEntryCause::Rtc);
         scheduler.save_current_simd_state();
-        let (next_rsp, _next_pit_divisor) = scheduler.on_timer_interrupt(current_rsp);
-        scheduler.prepare_current_task_execution();
+        let dispatch = scheduler.on_timer_interrupt(current_rsp);
+        scheduler.prepare_dispatched_task_execution(dispatch);
         scheduler.restore_current_simd_state();
-        (next_rsp, scheduler.current_task_is_user_task())
+        let runtime_profile = scheduler.take_runtime_profile(crate::arch::rtc::ticks());
+        (
+            dispatch.next_rsp,
+            scheduler.current_task_is_user_task(),
+            runtime_profile,
+        )
     };
 
+    super::scheduler::publish_scheduler_runtime_profile(runtime_profile);
     record_first_user_dispatch(current_cpu_index(), user_dispatch);
     record_atomic_activation_dispatch(current_cpu_index());
     crate::arch::pic::send_eoi(crate::arch::pic::PIC_2_OFFSET);
@@ -340,9 +372,12 @@ fn consume_syscall_tail_reschedule(
 
 pub(crate) fn request_deferred_reschedule() {
     let source_cpu = current_cpu_index();
-    // ORDERING: Release publishes the local request before any return to a
-    // scheduler safe point.
-    deferred_reschedule_flag(source_cpu).store(1, Ordering::Release);
+    // ORDERING: The paired Release publications preserve both local work and
+    // remote fan-out authority across an early lock-held return.
+    publish_deferred_reschedule(
+        deferred_reschedule_flag(source_cpu),
+        &RESCHEDULE_FANOUT_PENDING,
+    );
     #[cfg(not(test))]
     {
         // Callers may publish a request while holding the scheduler or another
@@ -354,33 +389,62 @@ pub(crate) fn request_deferred_reschedule() {
         if !scheduler_initialized() {
             return;
         }
+        flush_deferred_reschedule_fanout();
+    }
+}
+
+/// Publish target request bits and notification edges after the scheduler raw
+/// lock has actually been released. Multiple flushers are safe: the global
+/// pending bit closes publish-vs-clear, and each target bit coalesces IPIs on
+/// its own 0->1 edge.
+pub(super) fn flush_deferred_reschedule_fanout() {
+    #[cfg(not(test))]
+    {
+        if !scheduler_initialized() {
+            return;
+        }
         let Some(topology) = cpu::topology() else {
             return;
         };
-        for descriptor in topology.cpus() {
-            let target = usize::from(descriptor.logical_index);
-            if target == source_cpu {
-                continue;
+        let flusher = current_cpu_index();
+        // ORDERING: AcqRel claims every fan-out epoch published before the
+        // swap while preserving a concurrent publication for the next loop.
+        while RESCHEDULE_FANOUT_PENDING.swap(false, Ordering::AcqRel) {
+            for descriptor in topology.cpus() {
+                let target = usize::from(descriptor.logical_index);
+                let Some(snapshot) = cpu::lifecycle_snapshot(descriptor.logical_index) else {
+                    panic!(
+                        "scheduler invariant: admitted CPU {} has no lifecycle slot",
+                        descriptor.logical_index
+                    );
+                };
+                if snapshot.state != cpu::CpuLifecycleState::Online {
+                    continue;
+                }
+                if !arm_remote_reschedule(deferred_reschedule_flag(target)) {
+                    continue;
+                }
+                // The current CPU now owns a durable local bit and reaches a
+                // safe point on return; xAPIC rejects a fixed self-IPI. Do not
+                // skip publishing that bit when the flusher differs from the
+                // original publisher—skip only the notification write.
+                if !reschedule_notification_required(target, flusher) {
+                    continue;
+                }
+                crate::arch::msi::send_reschedule_ipi(descriptor.apic_id).unwrap_or_else(|error| {
+                    panic!(
+                        "scheduler invariant: reschedule IPI to logical CPU {} APIC {} failed: {error:?}",
+                        descriptor.logical_index, descriptor.apic_id
+                    )
+                });
             }
-            let Some(snapshot) = cpu::lifecycle_snapshot(descriptor.logical_index) else {
-                panic!(
-                    "scheduler invariant: admitted CPU {} has no lifecycle slot",
-                    descriptor.logical_index
-                );
-            };
-            if snapshot.state != cpu::CpuLifecycleState::Online {
-                continue;
-            }
-            if !arm_remote_reschedule(deferred_reschedule_flag(target)) {
-                continue;
-            }
-            crate::arch::msi::send_reschedule_ipi(descriptor.apic_id).unwrap_or_else(|error| {
-                panic!(
-                    "scheduler invariant: reschedule IPI to logical CPU {} APIC {} failed: {error:?}",
-                    descriptor.logical_index, descriptor.apic_id
-                )
-            });
         }
+    }
+    #[cfg(test)]
+    {
+        // ORDERING: tests have no APIC delivery; Release still models handing
+        // the claimed epoch back to an empty fan-out state.
+        RESCHEDULE_FANOUT_PENDING.store(false, Ordering::Release);
     }
 }
 
@@ -424,18 +488,26 @@ extern "C" fn reschedule_ipi_interrupt_dispatch(
     // SAFETY: the IPI stub supplied a complete CPU-local frame, IRQ exclusion
     // prevents same-CPU nested scheduling, and the global scheduler lock
     // serializes cross-CPU task-state mutation.
-    let (next_rsp, user_dispatch) = unsafe {
+    let (next_rsp, user_dispatch, runtime_profile) = unsafe {
         let mut scheduler = scheduler_mut();
         if timer_interrupted_kernel_frame(context_ptr, &scheduler) {
             crate::arch::msi::local_apic_eoi();
             return context_ptr;
         }
+        scheduler
+            .record_runtime_profile_entry(super::scheduler::SchedulerEntryCause::RescheduleIpi);
         scheduler.save_current_simd_state();
-        let (next_rsp, _next_pit_divisor) = scheduler.on_voluntary_yield(current_rsp);
-        scheduler.prepare_current_task_execution();
+        let dispatch = scheduler.on_voluntary_yield(current_rsp);
+        scheduler.prepare_dispatched_task_execution(dispatch);
         scheduler.restore_current_simd_state();
-        (next_rsp, scheduler.current_task_is_user_task())
+        let runtime_profile = scheduler.take_runtime_profile(crate::arch::rtc::ticks());
+        (
+            dispatch.next_rsp,
+            scheduler.current_task_is_user_task(),
+            runtime_profile,
+        )
     };
+    super::scheduler::publish_scheduler_runtime_profile(runtime_profile);
     record_first_user_dispatch(logical_index, user_dispatch);
     record_atomic_activation_dispatch(logical_index);
     record_first_ap_work_dispatch(logical_index);
@@ -461,18 +533,25 @@ extern "C" fn software_schedule_interrupt_dispatch(
         return context_ptr;
     }
     let current_rsp = context_ptr as usize;
-    let (next_rsp, user_dispatch) = unsafe {
+    let (next_rsp, user_dispatch, runtime_profile) = unsafe {
         let mut scheduler = scheduler_mut();
+        scheduler.record_runtime_profile_entry(super::scheduler::SchedulerEntryCause::Software);
         scheduler.save_current_simd_state();
         // Voluntary yield: floor the vruntime charge so a sub-tick yield can't
         // accumulate 0 vruntime and re-win CFS. Timer-driven preemption still
         // uses the unfloored path.
-        let (next_rsp, _next_pit_divisor) = scheduler.on_voluntary_yield(current_rsp);
-        scheduler.prepare_current_task_execution();
+        let dispatch = scheduler.on_voluntary_yield(current_rsp);
+        scheduler.prepare_dispatched_task_execution(dispatch);
         scheduler.restore_current_simd_state();
-        (next_rsp, scheduler.current_task_is_user_task())
+        let runtime_profile = scheduler.take_runtime_profile(crate::arch::rtc::ticks());
+        (
+            dispatch.next_rsp,
+            scheduler.current_task_is_user_task(),
+            runtime_profile,
+        )
     };
 
+    super::scheduler::publish_scheduler_runtime_profile(runtime_profile);
     record_first_user_dispatch(current_cpu_index(), user_dispatch);
     record_atomic_activation_dispatch(current_cpu_index());
     next_rsp as *mut SavedContext
@@ -574,12 +653,30 @@ pub fn commit_block_current_task_and_yield() -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
-    use core::sync::atomic::{AtomicU64, Ordering};
+    use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     use super::{
         RescheduleIpiGate, arm_remote_reschedule, consume_syscall_tail_reschedule,
-        reschedule_ipi_gate,
+        publish_deferred_reschedule, reschedule_ipi_gate, reschedule_notification_required,
     };
+
+    #[test]
+    fn lock_held_reschedule_publication_retains_local_and_fanout_work() {
+        let local = AtomicU64::new(0);
+        let fanout = AtomicBool::new(false);
+        publish_deferred_reschedule(&local, &fanout);
+        // ORDERING: Acquire observes both publications exactly as the unlock
+        // flusher does before issuing target notifications.
+        assert_eq!(local.load(Ordering::Acquire), 1);
+        assert!(fanout.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn post_unlock_fanout_publishes_self_work_without_sending_self_ipi() {
+        assert!(!reschedule_notification_required(2, 2));
+        assert!(reschedule_notification_required(1, 2));
+        assert!(reschedule_notification_required(3, 2));
+    }
 
     #[test]
     fn syscall_tail_consumes_every_deferred_or_handoff_request_exactly_once() {

@@ -30,7 +30,8 @@ lazy_static! {
         );
         unsafe {
             idt.non_maskable_interrupt
-                .set_handler_fn(non_maskable_interrupt_handler);
+                .set_handler_fn(non_maskable_interrupt_handler)
+                .set_stack_index(crate::arch::gdt::NMI_IST_INDEX);
             idt.double_fault
                 .set_handler_fn(double_fault_handler)
                 .set_stack_index(crate::arch::gdt::DOUBLE_FAULT_IST_INDEX);

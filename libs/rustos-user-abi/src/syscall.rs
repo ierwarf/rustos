@@ -1,8 +1,10 @@
 mod activation_batch;
 mod affinity;
+mod ipc_reply_recv;
 
 pub use activation_batch::*;
 pub use affinity::*;
+pub use ipc_reply_recv::*;
 
 pub const SYS_RUSTOS_DEBUG_PRINT: u64 = 0x5255_0001;
 pub const SYS_RUSTOS_SPAWN_EXEC: u64 = 0x5255_0002;
@@ -131,6 +133,91 @@ pub const AT_RUSTOS_BOOTSTRAP_HEAP_LEN: u64 = 0x5255_1001;
 /// services. 16 MiB is enough for syscalld's BTreeMap<pid, state> and
 /// vfsd's FAT volume metadata without falling back to mmap.
 pub const RUSTOS_BOOTSTRAP_HEAP_DEFAULT_LEN: u64 = 16 * 1024 * 1024;
+
+/// Exact integer-only service wire for one kernel-owned handle-transfer
+/// ticket. Typed kernel descriptors, enum discriminants, pointers, and Rust
+/// padding must never cross the ring3 boundary.
+pub const IPC_TRANSFER_TICKET_WIRE_BYTES: usize = 16;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IpcTransferTicketWire {
+    transfer_id: u64,
+    nonce: u64,
+}
+
+impl IpcTransferTicketWire {
+    pub const fn new(transfer_id: u64, nonce: u64) -> Option<Self> {
+        if transfer_id == 0 || nonce == 0 {
+            return None;
+        }
+        Some(Self { transfer_id, nonce })
+    }
+
+    pub const fn transfer_id(self) -> u64 {
+        self.transfer_id
+    }
+
+    pub const fn nonce(self) -> u64 {
+        self.nonce
+    }
+
+    pub fn encode(self) -> [u8; IPC_TRANSFER_TICKET_WIRE_BYTES] {
+        let mut bytes = [0_u8; IPC_TRANSFER_TICKET_WIRE_BYTES];
+        bytes[..8].copy_from_slice(&self.transfer_id.to_le_bytes());
+        bytes[8..].copy_from_slice(&self.nonce.to_le_bytes());
+        bytes
+    }
+
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != IPC_TRANSFER_TICKET_WIRE_BYTES {
+            return None;
+        }
+        let transfer_id = u64::from_le_bytes(bytes[..8].try_into().ok()?);
+        let nonce = u64::from_le_bytes(bytes[8..].try_into().ok()?);
+        Self::new(transfer_id, nonce)
+    }
+}
+
+#[cfg(kani)]
+mod ipc_transfer_ticket_verification {
+    use super::*;
+
+    #[kani::proof]
+    fn accepted_ticket_is_nonzero_and_canonical() {
+        let bytes: [u8; IPC_TRANSFER_TICKET_WIRE_BYTES] = kani::any();
+        let parsed = IpcTransferTicketWire::decode(&bytes);
+        kani::cover!(parsed.is_some());
+        kani::cover!(parsed.is_none());
+        if let Some(ticket) = parsed {
+            assert_ne!(ticket.transfer_id(), 0);
+            assert_ne!(ticket.nonce(), 0);
+            assert_eq!(ticket.encode(), bytes);
+        }
+    }
+
+    #[kani::proof]
+    fn every_nonzero_ticket_round_trips() {
+        let transfer_id: u64 = kani::any();
+        let nonce: u64 = kani::any();
+        kani::assume(transfer_id != 0 && nonce != 0);
+        kani::cover!(transfer_id == 1 && nonce == 1);
+        let ticket = IpcTransferTicketWire::new(transfer_id, nonce).expect("nonzero ticket");
+        assert_eq!(IpcTransferTicketWire::decode(&ticket.encode()), Some(ticket));
+    }
+
+    #[kani::proof]
+    fn either_zero_field_is_rejected() {
+        let transfer_id: u64 = kani::any();
+        let nonce: u64 = kani::any();
+        kani::assume(transfer_id == 0 || nonce == 0);
+        kani::cover!(transfer_id == 0 && nonce != 0);
+        kani::cover!(transfer_id != 0 && nonce == 0);
+        let mut bytes = [0_u8; IPC_TRANSFER_TICKET_WIRE_BYTES];
+        bytes[..8].copy_from_slice(&transfer_id.to_le_bytes());
+        bytes[8..].copy_from_slice(&nonce.to_le_bytes());
+        assert!(IpcTransferTicketWire::decode(&bytes).is_none());
+    }
+}
 
 /// Explicit admission bit for latency-critical display/input tasks.  The low
 /// bits remain the ordinary CFS load weight in microseconds; callers must not

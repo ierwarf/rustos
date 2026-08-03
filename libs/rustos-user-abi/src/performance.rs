@@ -26,6 +26,17 @@ pub const UI_BOOT_GPU_ACTIVATION_BUDGET_MS: u64 = 750;
 pub const IPC_READINESS_QUERY_HARD_LIMIT_MS: u64 = 16;
 /// Policy-only work that may affect an interactive syscall.
 pub const IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS: u64 = 100;
+/// Maximum already-queued control requests one service processes before it
+/// returns to lifecycle, launch, socket, or other policy work.  The kernel
+/// endpoint admission ceiling must retain at least two such bursts so a busy
+/// control owner cannot turn bounded draining into starvation.
+pub const IPC_CONTROL_DRAIN_BUDGET: usize = 32;
+/// Maximum steady-state delay before rootd rechecks lifecycle and control
+/// work. Rootd has no multi-source wait object yet, so its supervisor uses the
+/// capability-gated timer broker between bounded nonblocking drains. Keeping
+/// this at or below the readiness rail prevents an idle root supervisor from
+/// remaining runnable while still bounding admission latency.
+pub const ROOTD_SUPERVISOR_IDLE_POLL_MS: u64 = 10;
 /// Boot/control work that may hash, validate, or commit service state.
 pub const IPC_BOOT_CONTROL_HARD_LIMIT_MS: u64 = 5_000;
 /// One immutable executable snapshot on an interactive launch path. The
@@ -52,6 +63,11 @@ const _: () = assert!(BOOT_TO_UI_TARGET_MS < BOOT_TO_UI_HARD_LIMIT_MS);
 const _: () = assert!(UI_FRAME_CPU_TARGET_US < UI_FRAME_HARD_LIMIT_US);
 const _: () = assert!(UI_BOOT_GPU_ACTIVATION_BUDGET_MS < BOOT_TO_UI_HARD_LIMIT_MS);
 const _: () = assert!(IPC_READINESS_QUERY_HARD_LIMIT_MS < IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS);
+const _: () = assert!(IPC_CONTROL_DRAIN_BUDGET > 0);
+const _: () = assert!(
+    ROOTD_SUPERVISOR_IDLE_POLL_MS > 0
+        && ROOTD_SUPERVISOR_IDLE_POLL_MS <= IPC_READINESS_QUERY_HARD_LIMIT_MS
+);
 const _: () = assert!(IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS < IPC_BOOT_CONTROL_HARD_LIMIT_MS);
 const _: () = assert!(EXECUTABLE_SNAPSHOT_HARD_LIMIT_MS < IPC_BOOT_CONTROL_HARD_LIMIT_MS);
 const _: () = assert!(DVM_STORAGE_BOOT_READY_HARD_LIMIT_MS < BOOT_TO_UI_HARD_LIMIT_MS);

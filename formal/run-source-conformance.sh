@@ -108,29 +108,20 @@ if ! grep -Fq 'Err(paging::AddressSpaceError::NotMapped) => Ok(private)' <<<"$fu
     exit 1
 fi
 
-stack_fault_body="$(
-    sed -n '/^pub fn retire_current_user_task_due_to_fault(/,/^pub fn halt_current_retired_task()/p' \
-        kernel/ps/src/multitask/current.rs
+stack_layout_body="$(
+    sed -n '/^fn release_user_stack_state(/,/^fn prepare_loaded_process_with_launch(/p' \
+        kernel/compat/src/user/process/mod.rs
 )"
-stack_plan_line="$(grep -n -m1 'prepare_current_user_stack_growth_on_fault' <<<"$stack_fault_body" | cut -d: -f1)"
-stack_apply_line="$(grep -n -m1 'try_with_process_state_mut' <<<"$stack_fault_body" | cut -d: -f1)"
-stack_commit_line="$(grep -n -m1 'commit_current_user_stack_growth' <<<"$stack_fault_body" | cut -d: -f1)"
-if [[ -z "$stack_plan_line" || -z "$stack_apply_line" || -z "$stack_commit_line" \
-    || "$stack_plan_line" -ge "$stack_apply_line" || "$stack_apply_line" -ge "$stack_commit_line" ]]; then
-    echo 'user stack growth must preserve scheduler-plan then nonblocking-process-apply then scheduler-commit order' >&2
-    exit 1
-fi
-stack_scheduler_body="$(
-    sed -n '/pub(super) fn prepare_current_user_stack_growth_on_fault(/,/pub(super) fn retire_current_user_task_due_to_fault(/p' \
-        kernel/ps/src/multitask/scheduler.rs
+stack_setup_body="$(
+    sed -n '/^fn prepare_loaded_process_with_launch(/,/^fn build_process_bootstrap(/p' \
+        kernel/compat/src/user/process/mod.rs
 )"
-if grep -Eq 'map_zeroed_user_pages_at|with_process_state|ProcessStateLock' <<<"$stack_scheduler_body"; then
-    echo 'scheduler-owned stack growth phases must not acquire or mutate process state' >&2
-    exit 1
-fi
-if ! grep -Fq 'self.deferred_retire_reasons[plan.slot].is_some()' <<<"$stack_scheduler_body" \
-    || ! grep -Fq 'context.user_stack != Some(plan.previous_stack)' <<<"$stack_scheduler_body"; then
-    echo 'stack growth commit must revalidate retirement and exact prior stack generation' >&2
+if ! grep -Fq 'USER_STACK_INITIAL_COMMIT_PAGES: usize = USER_STACK_RESERVE_PAGES - USER_STACK_GUARD_PAGES' \
+        kernel/compat/src/user/process/mod.rs \
+    || ! grep -Fq 'let usable_start = reserve_start' <<<"$stack_layout_body" \
+    || ! grep -Fq 'release_user_stack_state(reserve_start)' <<<"$stack_setup_body" \
+    || ! grep -Fq 'USER_STACK_INITIAL_COMMIT_PAGES,' <<<"$stack_setup_body"; then
+    echo 'release user stacks must eagerly map every usable page above one permanent guard' >&2
     exit 1
 fi
 
@@ -147,12 +138,71 @@ if grep -Eq 'retired\[[^]]+\][[:space:]]*=[[:space:]]*false|retirement_cleanup\[
     exit 1
 fi
 exec_transfer_body="$(
-    sed -n '/^pub fn replace_for_exec(/,/^fn exec_may_replace(/p' \
+    sed -n '/^pub fn replace_for_exec_and_publish(/,/^fn exec_may_replace(/p' \
         kernel/ps/src/multitask/process_table.rs
 )"
 if ! grep -Fq 'exec_commit_may_transfer(object, reservation)' <<<"$exec_transfer_body" \
     || grep -Fq 'object.exiting' <<<"$exec_transfer_body"; then
     echo 'an installed exec root must transfer ownership through its reservation despite a late exit marker' >&2
+    exit 1
+fi
+exec_state_line="$(grep -n -m1 'state.replace_for_exec(' <<<"$exec_transfer_body" | cut -d: -f1)"
+exec_publish_line="$(grep -n -m1 'let published_handle = publish_scheduler()' <<<"$exec_transfer_body" | cut -d: -f1)"
+exec_retain_line="$(grep -n -m1 'Some((closed, old_state))' <<<"$exec_transfer_body" | cut -d: -f1)"
+exec_drop_line="$(grep -n -m1 'drop(old_state);' <<<"$exec_transfer_body" | cut -d: -f1)"
+if [[ -z "$exec_state_line" || -z "$exec_publish_line" || -z "$exec_retain_line" || -z "$exec_drop_line" \
+    || "$exec_state_line" -ge "$exec_publish_line" || "$exec_publish_line" -ge "$exec_retain_line" \
+    || "$exec_retain_line" -ge "$exec_drop_line" ]]; then
+    echo 'exec must commit process generation, publish scheduler generation, then retire the retained old bundle' >&2
+    exit 1
+fi
+
+reschedule_publish_body="$(
+    sed -n '/^fn publish_deferred_reschedule(/,/^}/p' kernel/ps/src/multitask/irq.rs
+)"
+if ! grep -Fq 'local_request.store(1, Ordering::Release);' <<<"$reschedule_publish_body" \
+    || ! grep -Fq 'fanout_pending.store(true, Ordering::Release);' <<<"$reschedule_publish_body" \
+    || ! grep -Fq 'super::irq::flush_deferred_reschedule_fanout();' kernel/ps/src/multitask/cpu_local.rs; then
+    echo 'lock-held reschedule publication must retain local work and flush remote fanout after raw unlock' >&2
+    exit 1
+fi
+
+input_drain_body="$(
+    sed -n '/^pub(crate) fn service_pending(/,/^pub(crate) fn has_pending_records()/p' \
+        kernel/io-manager/src/input/dvm_ring.rs
+)"
+if ! grep -Fq 'if !try_claim_drain(&DRAIN_IN_PROGRESS)' <<<"$input_drain_body" \
+    || ! grep -Fq 'let _drain_guard = DrainGuard;' <<<"$input_drain_body"; then
+    echo 'DVM input cursor and reset authority require one exact drain owner' >&2
+    exit 1
+fi
+
+nmi_body="$(
+    sed -n '/fn non_maskable_interrupt_handler(/,/^#\[cfg_attr/p' \
+        kernel/hal/src/arch/idt/handlers.rs
+)"
+if ! grep -Fq 'emergency_exception_marker(2);' <<<"$nmi_body" \
+    || grep -Eq 'crate::debug::|hooks::|process_table::|\.lock\(|panic!|println!' <<<"$nmi_body"; then
+    echo 'NMI must remain a dedicated-IST lock-free emergency leaf' >&2
+    exit 1
+fi
+if grep -Eq 'stack_frame\.stack_pointer\.as_u64\(\)[[:space:]]+as[[:space:]]+\*const|slice::from_raw_parts' \
+        kernel/hal/src/arch/idt/handlers.rs; then
+    echo 'user exception diagnostics must never dereference the untrusted saved RSP' >&2
+    exit 1
+fi
+
+if ! grep -Fq 'IpcTransferTicketWire::decode(bytes)' \
+        kernel/compat/src/user/syscall/linux/service_ops/vfs_meta.rs \
+    || grep -Eq 'MaybeUninit|assume_init' \
+        kernel/compat/src/user/syscall/linux/service_ops/vfs_meta.rs; then
+    echo 'SCM_RIGHTS service bytes must use the canonical integer-only ticket parser' >&2
+    exit 1
+fi
+
+if ! grep -Fq 'cpu_count == 1' kernel/hal/src/arch/clock.rs \
+    || ! grep -Fq 'if let Some((base, period_fs, counter)) = hpet' kernel/hal/src/arch/clock.rs; then
+    echo 'raw TSC must remain uniprocessor-only and SMP must fail over to validated HPET' >&2
     exit 1
 fi
 
@@ -167,14 +217,48 @@ if ! grep -Fq 'let compiler_checkpoint = self.compiler.checkpoint();' <<<"$gpu_p
     exit 1
 fi
 
+# Wayland listener and client dispatch are readiness-driven. A nonblocking
+# accept/read returning WouldBlock is still a cross-service operation; a fixed
+# probe cadence would consume scheduler and VFS/NETD turns while idle.
+wayland_accept_body="$(
+    sed -n '/^pub(crate) fn start_wayland_acceptor(/,/^#\[cfg(test)\]/p' \
+        services/uiserver/src/wayland_accept.rs
+)"
+if ! grep -Fq 'libc::epoll_wait(' <<<"$wayland_accept_body" \
+    || ! grep -Fq 'WAYLAND_ACCEPT_WAIT_TIMEOUT_MS' <<<"$wayland_accept_body" \
+    || ! grep -Fq 'worker_pending.fetch_add(1, Ordering::Release);' <<<"$wayland_accept_body" \
+    || ! grep -Fq 'ui_wake_sender.signal()' <<<"$wayland_accept_body" \
+    || grep -Fq 'thread::sleep' <<<"$wayland_accept_body"; then
+    echo 'Wayland accept must block on listener readiness and publish queue ownership before waking UI' >&2
+    exit 1
+fi
+if ! grep -Fq 'wayland_service_required(protocol_input, input.input_events, callback_due)' \
+        services/uiserver/src/main.rs; then
+    echo 'Wayland client dispatch must require protocol input, server events, or a due callback' >&2
+    exit 1
+fi
+
 acceptance_body="$(
     sed -n '/^fn exact_contract_enables_profile(/,/^#\[cfg(test)\]/p' \
         services/uiserver/src/acceptance_profile.rs
 )"
 if ! grep -Fq 'contract && ui_profile == Some(true) && network_exercise.is_some()' <<<"$acceptance_body" \
     || ! grep -Fq 'WATCH_LIMIT' <<<"$acceptance_body" \
-    || ! grep -Fq 'require_background_thread_class();' <<<"$acceptance_body"; then
-    echo 'late acceptance profiling must use an exact bounded demoted watcher' >&2
+    || ! grep -Fq 'require_background_thread_class();' <<<"$acceptance_body" \
+    || ! grep -Fq 'read_bounded_config_snapshot(CONTRACT_PATH, CONTRACT_MAX_BYTES)' <<<"$acceptance_body" \
+    || grep -Fq 'read_to_string' <<<"$acceptance_body"; then
+    echo 'late acceptance profiling must use an exact bounded positioned-read demoted watcher' >&2
+    exit 1
+fi
+
+runtimed_acceptance_body="$(
+    sed -n '/^fn apply_kvm_acceptance_contract(/,/^fn upsert_env(/p' \
+        services/runtimed/src/spawn.rs
+)"
+if ! grep -Fq 'read_bounded_config_snapshot(' <<<"$runtimed_acceptance_body" \
+    || ! grep -Fq 'KVM_ACCEPTANCE_CONTRACT_MAX_BYTES' <<<"$runtimed_acceptance_body" \
+    || grep -Fq 'read_to_string' <<<"$runtimed_acceptance_body"; then
+    echo 'runtimed acceptance injection must use the bounded positioned-read snapshot path' >&2
     exit 1
 fi
 
@@ -266,6 +350,8 @@ wayland-accept-isolation/WaylandAcceptIsolation|uiserver|wayland::tests::wayland
 wayland-accept-isolation/WaylandAcceptIsolation|uiserver|wayland::tests::wayland_buffer_limits_reject_oversized_dimensions
 wayland-accept-isolation/WaylandAcceptIsolation|uiserver|wayland::tests::wayland_integer_args_reject_negative_values
 wayland-accept-isolation/WaylandAcceptIsolation|uiserver|wayland::tests::wayland_readiness_requires_one_dispatch_before_rearm
+wayland-accept-isolation/WaylandAcceptIsolation|uiserver|wayland_accept::tests::wayland_accept_uses_blocking_readiness_not_probe_cadence
+wayland-accept-isolation/WaylandAcceptIsolation|uiserver|main_loop_tests::wayland_dispatch_requires_protocol_input_server_events_or_due_callback
 wayland-frame-pacing/WaylandFramePacing|wayclick|damage_tests::cursor_damage_unions_old_and_new_positions_without_full_surface_copy
 wayland-frame-pacing/WaylandFramePacing|wayclick|damage_tests::cursor_damage_is_clipped_and_state_changes_force_full_damage
 boot-storage-handoff/BootStorageHandoff|rustos-hostd|storage::tests::aperture_epochs_are_clean_monotonic_and_revocable
@@ -330,10 +416,12 @@ smp-reschedule-ipi/SmpRescheduleIpi|kernel-ps|multitask::irq::tests::reschedule_
 scheduler-cpu-ownership/SchedulerCpuOwnership|kernel-hal|interrupt_stubs::tests::scheduler_commit_call_aligns_and_restores_incoming_rsp
 scheduler-cpu-ownership/SchedulerCpuOwnership|kernel-ps|multitask::cpu_local::tests::current_task_ownership_ignores_offline_slots_and_is_cpu_distinct
 scheduler-cpu-ownership/SchedulerCpuOwnership|kernel-ps|multitask::irq::tests::reschedule_ipi_gate_retains_locked_work_and_dispatches_only_at_safe_point
+scheduler-cpu-ownership/SchedulerCpuOwnership|kernel-ps|multitask::scheduler::tests::architectural_restore_is_required_exactly_for_a_task_switch
 scheduler-cpu-ownership/SchedulerCpuOwnership|kernel-ps|multitask::scheduler::smp::tests::remote_or_transition_owned_task_is_not_schedulable
 scheduler-cpu-ownership/SchedulerCpuOwnership|nucleus-core|util::lockdep::tests::tracked_guard_release_requires_same_cpu_apic_and_positive_depth
 scheduler-cpu-ownership/SchedulerCpuOwnership|nucleus-core|util::lockdep::tests::pending_acquire_units_cannot_consume_a_held_guard_pin
-tlb-shootdown-lifecycle/TlbShootdownLifecycle|kernel-hal|arch::tlb_shootdown::tests::root_specific_and_global_target_selection_are_exact
+tlb-shootdown-lifecycle/TlbShootdownLifecycle|kernel-hal|arch::tlb_shootdown::tests::shootdown_targets_every_eligible_cpu_regardless_of_root
+tlb-shootdown-lifecycle/TlbShootdownLifecycle|kernel-hal|arch::tlb_shootdown::tests::same_root_activation_preserves_tlb_but_root_change_reloads_cr3
 tlb-shootdown-lifecycle/TlbShootdownLifecycle|kernel-hal|arch::tlb_shootdown::tests::reclaim_requires_every_target_to_acknowledge_the_exact_generation
 tlb-shootdown-lifecycle/TlbShootdownLifecycle|kernel-mm|memory::address_space::tests::unmap_region_plan_is_complete_before_metadata_commit
 cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::process_table::tests::exec_seal_rejects_thread_attachment_until_cancel
@@ -358,11 +446,14 @@ smp-release-admission/SmpReleaseAdmission|xtask|kvm::tests::rustos_smp_runtime_r
 scheduler-admission/SchedulerAdmission|runtimed|spawn::tests::catalog_weight_cannot_promote_an_untrusted_program
 scheduler-admission/SchedulerAdmission|runtimed|spawn::tests::only_the_exact_ui_server_path_receives_system_weight
 scheduler-cpu-distribution/SchedulerCpuDistribution|kernel-ps|multitask::scheduler::tests::bounded_system_burst_reserves_a_ready_user_turn
-scheduler-cpu-distribution/SchedulerCpuDistribution|kernel-ps|multitask::scheduler::tests::oldest_overdue_user_is_reserved_before_system_burst_exhaustion
+scheduler-cpu-distribution/SchedulerCpuDistribution|kernel-ps|multitask::scheduler::tests::user_reservation_obeys_vruntime_without_a_wall_clock_bypass
+scheduler-cpu-distribution/SchedulerCpuDistribution|kernel-ps|multitask::scheduler::tests::fair_locality_is_bounded_by_class_and_vruntime_lag
 scheduler-cpu-distribution/SchedulerCpuDistribution|kernel-ps|multitask::scheduler::tests::event_wait_handoff_is_fifo_deduplicated_and_burst_bounded
 scheduler-cpu-distribution/SchedulerCpuDistribution|kernel-ps|multitask::scheduler::tests::overdue_system_continuation_precedes_a_fresh_latency_handoff
 scheduler-cpu-distribution/SchedulerCpuDistribution|kernel-ps|multitask::irq::tests::syscall_tail_consumes_every_deferred_or_handoff_request_exactly_once
-scheduler-thread-demotion/SchedulerThreadDemotion|kernel-ps|multitask::scheduler::tests::self_demotion_removes_only_the_base_system_class
+scheduler-cpu-distribution/SchedulerCpuDistribution|kernel-ps|multitask::scheduler::runtime_profile::tests::runtime_profile_distinguishes_switches_roots_and_migrations
+scheduler-cpu-distribution/SchedulerCpuDistribution|kernel-ps|multitask::scheduler::runtime_profile::tests::runtime_profile_lock_totals_and_maxima_are_destructive
+scheduler-thread-demotion/SchedulerThreadDemotion|kernel-ps|multitask::scheduler::tests::self_demotion_removes_base_system_class_and_caps_fair_weight
 scheduler-thread-demotion/SchedulerThreadDemotion|vfsd|tests::ui_bootstrap_demotion_requires_successful_terminal_snapshot_reply
 scheduler-thread-demotion/SchedulerThreadDemotion|loaderd|tests::ui_bootstrap_demotion_is_custodied_until_terminal_reply
 synchronous-ipc-handoff/SynchronousIpcHandoff|kernel-ps|multitask::scheduler::synchronous_handoff_tests::synchronous_ipc_handoff_is_fifo_deduplicated_and_fairness_bounded
@@ -471,7 +562,10 @@ userspace-wait-set/UserspaceWaitSet|kernel-compat|user::syscall::linux::service_
 userspace-wait-set/UserspaceWaitSet|kernel-compat|user::syscall::linux::service_ops::vfs_socket::tests::transferred_input_description_keeps_the_waitset_service_reference
 userspace-wait-set/UserspaceWaitSet|kernel-compat|user::syscall::linux::service_ops::vfs_socket::tests::fork_service_refs_come_from_the_frozen_child_handle_snapshot
 service-mutation-recovery/ServiceMutationRecovery|kernel-compat|user::syscall::linux::service_ops::vfs_socket::tests::remote_vfs_refs_are_local_and_provider_close_is_final_only
-service-mutation-recovery/ServiceMutationRecovery|kernel-compat|user::syscall::linux::service_ops::vfs_socket::tests::netd_reference_retries_share_one_total_deadline
+service-mutation-recovery/ServiceMutationRecovery|kernel-compat|user::syscall::linux::service_ops::vfs_socket::tests::netd_reference_mutation_owns_the_complete_interactive_deadline
+service-mutation-recovery/ServiceMutationRecovery|kernel-compat|user::syscall::linux::service_ops::ipc_helpers::deadline::tests::netd_reference_mutations_use_interactive_control_deadline
+ipc-reply-deadline/IpcReplyDeadline|kernel-compat|user::syscall::linux::service_ops::ipc_helpers::diagnostics::tests::terminal_failure_diagnostic_has_an_independent_bounded_lane
+ipc-reply-deadline/IpcReplyDeadline|kernel-compat|user::syscall::linux::service_ops::ipc_helpers::deadline::tests::vfs_timeout_diagnostic_identifies_the_exact_epoll_control_operation
 service-mutation-recovery/ServiceMutationRecovery|kernel-ps|user::epoll::tests::descriptor_references_are_explicit_and_transient_clones_do_not_count
 service-mutation-recovery/ServiceMutationRecovery|kernel-compat|user::syscall::linux::service_ops::ipc_helpers::tests::housekeeping_vfs_maintenance_is_one_bounded_replay_turn
 service-mutation-recovery/ServiceMutationRecovery|kernel-compat|user::syscall::linux::service_ops::poll_epoll::control::tests::persistent_epoll_mutation_uses_the_interactive_deadline
@@ -491,6 +585,7 @@ userspace-wait-set/UserspaceWaitSet|vfsd|tests::epoll_snapshot_rotates_a_persist
 userspace-wait-set/UserspaceWaitSet|vfsd|tests::provider_restart_updates_epoch_without_duplicating_registration_identity
 userspace-wait-set/UserspaceWaitSet|uiserver|wayland::tests::wayland_readiness_requires_one_dispatch_before_rearm
 userspace-wait-set/UserspaceWaitSet|uiserver|wayland::tests::wayland_readiness_retries_only_transient_transport_failures
+userspace-wait-set/UserspaceWaitSet|uiserver|wayland_accept::tests::wayland_accept_uses_blocking_readiness_not_probe_cadence
 userspace-wait-set/UserspaceWaitSet|uiserver|input_loop::tests::input_reader_uses_blocking_epoll_readiness_not_probe_cadence
 userspace-wait-set/UserspaceWaitSet|netd|packet_provider_state_tests::inet_ingress_publishes_only_socket_state_transitions
 userspace-wait-set/UserspaceWaitSet|runtimed|session::tests::console_readiness_generation_advances_only_when_input_becomes_ready
@@ -499,6 +594,7 @@ netd-deferred-reply/NetdDeferredReply|netd|local_socket_poll_tests::pending_slot
 netd-deferred-reply/NetdDeferredReply|netd|local_socket_poll_tests::poisoned_deferred_queue_is_drained_for_fail_closed_replies
 netd-deferred-reply/NetdDeferredReply|netd|local_socket_poll_tests::local_poll_wait_budget_matches_readiness_service_cap
 ipc-handle-transfer/IpcHandleTransfer|kernel-ps|user::handles::transfer_registry_tests::cancelled_transfer_moves_its_open_description_to_deferred_cleanup
+ipc-handle-transfer/IpcHandleTransfer|kernel-ps|user::handles::transfer_registry_tests::opaque_transfer_ticket_is_exact_one_shot_and_nonce_bound
 ipc-handle-transfer/IpcHandleTransfer|kernel-ps|user::handles::table::tests::receive_reservations_are_invisible_and_publish_atomically
 ipc-handle-transfer/IpcHandleTransfer|kernel-ps|user::handles::table::tests::cancelled_receive_reservation_is_reusable
 ipc-handle-transfer/IpcHandleTransfer|kernel-ps|user::handles::table::tests::stale_reservation_cannot_cancel_or_commit_after_exec_boundary
@@ -595,8 +691,19 @@ ipc-reply-deadline/IpcReplyDeadline|kernel-ipc-runtime|ipc::tests::endpoint_canc
 ipc-reply-deadline/IpcReplyDeadline|kernel-ipc-runtime|ipc::tests::endpoint_cancel_rejects_wrong_caller_without_consuming_reply
 ipc-reply-deadline/IpcReplyDeadline|kernel-ipc-runtime|ipc::tests::retiring_caller_may_consume_the_exact_global_message_capacity
 ipc-reply-deadline/IpcReplyDeadline|rustos-user-abi|tests::performance_limits_are_strictly_layered
+ipc-reply-deadline/IpcReplyDeadline|rootd|control_drain::tests::root_control_drain_services_a_bounded_ready_burst|host-test
+ipc-reply-deadline/IpcReplyDeadline|runtimed|tests::session_control_drain_services_a_bounded_ready_burst
 ipc-reply-deadline/IpcReplyDeadline|kernel-compat|user::syscall::linux::ipc_ops::tests::public_ipc_calls_share_the_finite_service_deadline
 ipc-reply-deadline/IpcReplyDeadline|kernel-compat|user::syscall::linux::ipc_ops::tests::stable_service_endpoint_snapshot_rejects_revoked_owners
+ipc-reply-recv-transaction/IpcReplyRecvTransaction|rustos-user-abi|syscall::ipc_reply_recv::tests::reply_recv_wire_shape_and_error_partition_are_stable
+ipc-reply-recv-transaction/IpcReplyRecvTransaction|rustos-svc-runtime|ipc::tests::reply_recv_phase_tag_cannot_alias_linux_errno
+ipc-reply-recv-transaction/IpcReplyRecvTransaction|kernel-compat|user::syscall::linux::ipc_ops::ipc_reply_recv::tests::reply_recv_precommit_shape_is_exact_and_versioned
+ipc-reply-recv-transaction/IpcReplyRecvTransaction|kernel-compat|user::syscall::linux::ipc_ops::ipc_reply_recv::tests::reply_recv_post_commit_error_is_outside_linux_errno_space
+ipc-reply-recv-transaction/IpcReplyRecvTransaction|inputd|service_loop::tests::malformed_dequeued_request_has_terminal_error_reply
+ipc-reply-recv-transaction/IpcReplyRecvTransaction|inputd|service_loop::tests::reply_recv_recovery_retries_only_a_proven_live_reply
+ipc-reply-recv-transaction/IpcReplyRecvTransaction|loaderd|tests::zero_length_request_is_malformed_not_idle
+ipc-reply-recv-transaction/IpcReplyRecvTransaction|loaderd|tests::fused_reply_never_delays_cleanup_or_bootstrap_demotion
+ipc-reply-recv-transaction/IpcReplyRecvTransaction|loaderd|tests::reply_recv_recovery_retries_only_a_proven_live_reply
 commercial-service-envelope/CommercialServiceEnvelope|rustos-user-abi|syscall::syscall_tests::commercial_request_envelope_rejects_reserved_flags_and_oversized_lengths
 commercial-service-envelope/CommercialServiceEnvelope|rustos-user-abi|syscall::syscall_tests::commercial_response_envelope_matches_exact_request_and_bounds_nested_fields
 commercial-service-envelope/CommercialServiceEnvelope|kernel-compat|user::syscall::linux::ipc_ops::tests::commercial_response_envelope_is_bound_to_request_and_bounded
@@ -648,10 +755,17 @@ product-boot/ProductBoot|storaged|tests::dvm_block_e2e_marker_names_the_complete
 product-boot/ProductBoot|uiserver|gpu_runtime::tests::frame_deadline_skips_missed_slots_without_drift_or_burst
 ui-frame-budget/UiFrameBudget|wayclick|damage_tests::first_frame_marker_is_the_user_visible_boot_terminal
 input-ingestion-worker/InputIngestionWorker|kernel-io-manager|input::dvm_ring::tests::policy_consumer_readiness_requires_transport_and_is_idempotent
+dvm-input-ring/DvmInputRing|kernel-io-manager|input::dvm_ring::tests::concurrent_broker_callers_have_exactly_one_drain_owner
 product-boot/ProductBoot|kernel-compat|user::syscall::linux::debug_ops::product_milestone_tests::product_milestones_are_a_closed_fixed_name_vocabulary
+user-stack-growth/UserStackGrowth|kernel-compat|user::process::tests::release_stack_maps_every_usable_page_above_one_guard
 user-stack-growth/UserStackGrowth|kernel-ps|multitask::process_table::tests::exception_process_state_try_lock_never_waits_on_contention
 exec-address-space-transaction/ExecAddressSpaceTransaction|kernel-ps|multitask::process_table::tests::process_address_space_and_exec_exit_are_serialized
 exec-address-space-transaction/ExecAddressSpaceTransaction|kernel-ps|multitask::process_table::tests::exec_seal_rejects_thread_attachment_until_cancel
+smp-reschedule-ipi/SmpRescheduleIpi|kernel-ps|multitask::irq::tests::lock_held_reschedule_publication_retains_local_and_fanout_work
+scheduler-cpu-ownership/SchedulerCpuOwnership|kernel-ps|multitask::scheduler::tests::ready_scanner_never_reads_a_frame_owned_by_any_cpu
+clocksource-deadline/ClocksourceDeadline|kernel-hal|arch::clock::tests::raw_tsc_global_clock_is_rejected_until_smp_offsets_are_admitted
+exception-retirement-lifecycle/ExceptionRetirementLifecycle|kernel-hal|arch::gdt::tests::per_cpu_privilege_and_ist_stacks_are_aligned_and_disjoint
+ipc-handle-transfer/IpcHandleTransfer|rustos-user-abi|tests::ipc_transfer_ticket_wire_is_canonical_and_rejects_zero_authority
 robust-futex-owner-death/RobustFutexOwnerDeath|kernel-compat|user::syscall::linux::service_ops::futex_thread::tests::kernel_generated_wake_uses_shared_then_exact_private_fallback
 gpu-submit-transaction/GpuSubmitTransaction|uiserver|gpu_scene::tests::rejected_transport_submit_restores_exact_compiler_timeline
 acceptance-profile-publication/AcceptanceProfilePublication|uiserver|acceptance_profile::tests::late_acceptance_profile_requires_the_exact_complete_contract

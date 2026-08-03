@@ -38,6 +38,7 @@ const SYS_POLL: usize = 7;
 const SYS_MMAP: usize = 9;
 const SYS_MUNMAP: usize = 11;
 const SYS_IOCTL: usize = 16;
+const SYS_GETTID: usize = 186;
 const SYS_OPENAT: usize = 257;
 const SYS_RUSTOS_IPC_ENDPOINT_CREATE: usize = syscall_abi::SYS_RUSTOS_IPC_ENDPOINT_CREATE as usize;
 const SYS_RUSTOS_IPC_CALL: usize = syscall_abi::SYS_RUSTOS_IPC_CALL as usize;
@@ -616,8 +617,9 @@ pub(crate) fn debug_line(message: &str) {
     }
 }
 
-/// Makes an auxiliary uiserver thread surrender the System-class admission it
-/// inherited from the interactive process.  This has no host-test effect.
+/// Makes an auxiliary uiserver thread surrender the System-class admission and
+/// elevated fair share it inherited from the interactive process. This has no
+/// host-test effect.
 ///
 /// The ABI is self-demotion only, so failure must not leave a background or
 /// untrusted worker competing with input/present at elevated priority.  Exit
@@ -629,6 +631,16 @@ pub(crate) fn require_background_thread_class() {
     let result = unsafe { syscall0(SYS_RUSTOS_SCHED_DEMOTE_SELF) };
     if result == 0 {
         BACKGROUND_THREAD_DEMOTIONS.fetch_add(1, Ordering::Relaxed);
+        // One boot-time identity record makes scheduler top-task attribution
+        // actionable without adding any sample or syscall to the frame loop.
+        // The kernel stamps gettid; a Rust thread name is diagnostic only and
+        // never grants scheduling authority.
+        let current = thread::current();
+        let name = current.name().unwrap_or("<unnamed>");
+        let tid = unsafe { syscall0(SYS_GETTID) };
+        debug_line(&format!(
+            "uiserver: background scheduling class=user name={name} tid={tid}"
+        ));
         return;
     }
     debug_line("uiserver: background scheduling demotion failed");

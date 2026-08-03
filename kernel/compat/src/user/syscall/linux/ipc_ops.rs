@@ -17,17 +17,24 @@
 //!   `input-delivery-lifecycle`.
 use super::*;
 
+#[path = "ipc_reply_diagnostics.rs"]
+mod diagnostics;
+#[path = "ipc_reply_recv.rs"]
+mod ipc_reply_recv;
 mod subject;
 
 use alloc::vec::Vec;
 use core::mem::size_of;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+pub(super) use diagnostics::diagnostic_rate_limit_permit;
+use diagnostics::record_ipc_reply_rejection;
 pub(super) use subject::{
     current_process_has_service_capability, current_process_with_service_capability,
 };
 
 use kernel_ipc_runtime::api::{
-    EndpointCallPriority, KernelEndpointHandle, KernelReplyHandle, KernelTransferredHandle,
+    EndpointCallPriority, KernelEndpointHandle, KernelReplyHandle, KernelTransferTicket,
+    KernelTransferredHandle,
 };
 use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
 
@@ -208,6 +215,7 @@ pub(super) fn is_linux_rustos_ipc_syscall(syscall_number: u64) -> bool {
             | linux_abi::SYS_RUSTOS_IPC_TRY_RECV
             | linux_abi::SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER
             | linux_abi::SYS_RUSTOS_IPC_RECV_WITH_SENDER
+            | linux_abi::SYS_RUSTOS_IPC_REPLY_RECV_WITH_SENDER
             | linux_abi::SYS_RUSTOS_IPC_REPLY
             | linux_abi::SYS_RUSTOS_IPC_CALL_WITH_HANDLES
             | linux_abi::SYS_RUSTOS_IPC_CALL_WITH_HANDLES_BOUNDED
@@ -252,6 +260,9 @@ pub(super) fn dispatch_linux_rustos_ipc_syscall(frame: &SyscallFrame) -> u64 {
         linux_abi::SYS_RUSTOS_IPC_RECV_WITH_SENDER => syscall_linux_rustos_ipc_recv_with_sender(
             frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
         ),
+        linux_abi::SYS_RUSTOS_IPC_REPLY_RECV_WITH_SENDER => {
+            ipc_reply_recv::syscall_linux_rustos_ipc_reply_recv_with_sender(frame.rdi)
+        }
         linux_abi::SYS_RUSTOS_IPC_VALIDATE_SERVICE_OWNER => {
             syscall_linux_rustos_ipc_validate_service_owner(frame.rdi)
         }
@@ -1524,41 +1535,76 @@ pub(super) fn syscall_linux_rustos_ipc_recv_with_sender(
     sender_pid_ptr: u64,
     sender_tid_ptr: u64,
 ) -> u64 {
-    let endpoint = KernelEndpointHandle::from_raw(endpoint);
-    let Some(task_id) = multitask::current_task_id() else {
-        return linux_errno(LINUX_EINVAL);
+    let (endpoint, task_id, _process_id, request_capacity) = match prepare_recv_with_sender(
+        endpoint,
+        request_ptr,
+        request_capacity,
+        reply_cap_ptr,
+        sender_pid_ptr,
+        sender_tid_ptr,
+    ) {
+        Ok(prepared) => prepared,
+        Err(errno) => return linux_errno(errno),
     };
-    let Some(process_id) = multitask::current_user_process_id() else {
-        return linux_errno(LINUX_EINVAL);
-    };
-    if let Err(err) =
-        kernel_ipc_runtime::api::authorize_endpoint_receiver_for_process(endpoint, process_id)
-    {
-        return linux_errno(ipc_error_to_linux_errno(err));
+    match recv_with_sender_blocking_prepared(
+        endpoint,
+        task_id,
+        request_ptr,
+        request_capacity,
+        reply_cap_ptr,
+        sender_pid_ptr,
+        sender_tid_ptr,
+    ) {
+        Ok((received, _yielded)) => received as u64,
+        Err((errno, _yielded)) => linux_errno(errno),
     }
-    let Ok(request_capacity) = usize::try_from(request_capacity) else {
-        return linux_errno(LINUX_EINVAL);
-    };
-    if request_capacity > rustos_user_abi::syscall::IPC_MAX_INLINE_BYTES {
-        return linux_errno(LINUX_EINVAL);
-    }
-    if request_capacity > 0
-        && let Err(err) = usermem::validate_current_user_write_buffer(request_ptr, request_capacity)
-    {
-        return linux_errno(address_space_error_to_linux_errno(err));
-    }
-    if let Err(err) = usermem::validate_current_user_write_buffer(reply_cap_ptr, size_of::<u64>()) {
-        return linux_errno(address_space_error_to_linux_errno(err));
-    }
-    if let Err(err) = usermem::validate_current_user_write_buffer(sender_pid_ptr, size_of::<u64>())
-    {
-        return linux_errno(address_space_error_to_linux_errno(err));
-    }
-    if let Err(err) = usermem::validate_current_user_write_buffer(sender_tid_ptr, size_of::<u64>())
-    {
-        return linux_errno(address_space_error_to_linux_errno(err));
-    }
+}
 
+fn prepare_recv_with_sender(
+    endpoint: u64,
+    request_ptr: u64,
+    request_capacity: u64,
+    reply_cap_ptr: u64,
+    sender_pid_ptr: u64,
+    sender_tid_ptr: u64,
+) -> Result<(KernelEndpointHandle, u64, u64, usize), i64> {
+    let endpoint = KernelEndpointHandle::from_raw(endpoint);
+    let task_id = multitask::current_task_id().ok_or(LINUX_EINVAL)?;
+    let process_id = multitask::current_user_process_id().ok_or(LINUX_EINVAL)?;
+    kernel_ipc_runtime::api::authorize_endpoint_receiver_for_process(endpoint, process_id)
+        .map_err(ipc_error_to_linux_errno)?;
+    let request_capacity = usize::try_from(request_capacity).map_err(|_| LINUX_EINVAL)?;
+    if request_capacity > rustos_user_abi::syscall::IPC_MAX_INLINE_BYTES {
+        return Err(LINUX_EINVAL);
+    }
+    if request_capacity > 0 {
+        usermem::validate_current_user_write_buffer(request_ptr, request_capacity)
+            .map_err(address_space_error_to_linux_errno)?;
+    }
+    usermem::validate_current_user_write_buffer(reply_cap_ptr, size_of::<u64>())
+        .map_err(address_space_error_to_linux_errno)?;
+    usermem::validate_current_user_write_buffer(sender_pid_ptr, size_of::<u64>())
+        .map_err(address_space_error_to_linux_errno)?;
+    usermem::validate_current_user_write_buffer(sender_tid_ptr, size_of::<u64>())
+        .map_err(address_space_error_to_linux_errno)?;
+    Ok((endpoint, task_id, process_id, request_capacity))
+}
+
+/// Receives on an already-authorized endpoint after every user output range
+/// has been validated.  The boolean records whether this invocation actually
+/// committed a block and crossed the scheduler; reply-receive uses it to avoid
+/// issuing a redundant syscall-tail reschedule after the exact caller already
+/// received its direct handoff.
+fn recv_with_sender_blocking_prepared(
+    endpoint: KernelEndpointHandle,
+    task_id: u64,
+    request_ptr: u64,
+    request_capacity: usize,
+    reply_cap_ptr: u64,
+    sender_pid_ptr: u64,
+    sender_tid_ptr: u64,
+) -> Result<(usize, bool), (i64, bool)> {
+    let mut yielded = false;
     loop {
         match kernel_ipc_runtime::api::recv_endpoint_with_sender_and_limits(
             endpoint,
@@ -1568,32 +1614,22 @@ pub(super) fn syscall_linux_rustos_ipc_recv_with_sender(
             Ok(Some((reply, request, _handles, caller_task_id))) => {
                 let (sender_pid, sender_tid) =
                     multitask::user_log_ids_for_task(caller_task_id).unwrap_or((0, 0));
-                if !request.is_empty()
-                    && let Err(err) = usermem::write_current_user_bytes(request_ptr, &request)
-                {
-                    return linux_errno(address_space_error_to_linux_errno(err));
+                if !request.is_empty() {
+                    usermem::write_current_user_bytes(request_ptr, &request)
+                        .map_err(|err| (address_space_error_to_linux_errno(err), yielded))?;
                 }
-                if let Err(err) =
-                    usermem::write_current_user_bytes(reply_cap_ptr, &reply.raw().to_ne_bytes())
-                {
-                    return linux_errno(address_space_error_to_linux_errno(err));
-                }
-                if let Err(err) =
-                    usermem::write_current_user_bytes(sender_pid_ptr, &sender_pid.to_ne_bytes())
-                {
-                    return linux_errno(address_space_error_to_linux_errno(err));
-                }
-                if let Err(err) =
-                    usermem::write_current_user_bytes(sender_tid_ptr, &sender_tid.to_ne_bytes())
-                {
-                    return linux_errno(address_space_error_to_linux_errno(err));
-                }
+                usermem::write_current_user_bytes(reply_cap_ptr, &reply.raw().to_ne_bytes())
+                    .map_err(|err| (address_space_error_to_linux_errno(err), yielded))?;
+                usermem::write_current_user_bytes(sender_pid_ptr, &sender_pid.to_ne_bytes())
+                    .map_err(|err| (address_space_error_to_linux_errno(err), yielded))?;
+                usermem::write_current_user_bytes(sender_tid_ptr, &sender_tid.to_ne_bytes())
+                    .map_err(|err| (address_space_error_to_linux_errno(err), yielded))?;
                 let _ = multitask::inherit_ipc_priority(reply.raw(), caller_task_id, task_id);
-                return request.len() as u64;
+                return Ok((request.len(), yielded));
             }
             Ok(None) => {
                 if !multitask::arm_block_current_task() {
-                    return linux_errno(LINUX_EINVAL);
+                    return Err((LINUX_EINVAL, yielded));
                 }
                 let pending = match kernel_ipc_runtime::api::add_endpoint_receiver_waiter(
                     endpoint, task_id,
@@ -1601,7 +1637,7 @@ pub(super) fn syscall_linux_rustos_ipc_recv_with_sender(
                     Ok(pending) => pending,
                     Err(err) => {
                         let _ = multitask::cancel_block_current_task();
-                        return linux_errno(ipc_error_to_linux_errno(err));
+                        return Err((ipc_error_to_linux_errno(err), yielded));
                     }
                 };
                 if pending {
@@ -1609,12 +1645,12 @@ pub(super) fn syscall_linux_rustos_ipc_recv_with_sender(
                     continue;
                 }
                 match multitask::commit_block_current_task_and_yield() {
-                    Some(true) => {}
+                    Some(true) => yielded = true,
                     Some(false) => continue,
-                    None => return linux_errno(LINUX_EINVAL),
+                    None => return Err((LINUX_EINVAL, yielded)),
                 }
             }
-            Err(err) => return linux_errno(ipc_error_to_linux_errno(err)),
+            Err(err) => return Err((ipc_error_to_linux_errno(err), yielded)),
         }
     }
 }
@@ -2612,6 +2648,26 @@ pub(super) fn install_transfer_descriptors_for_current_process(
     descriptors: &[KernelTransferredHandle],
 ) -> Result<Vec<i32>, i64> {
     let entries = take_transfer_entries(descriptors)?;
+    install_transfer_entries_for_current_process(entries)
+}
+
+pub(super) fn transfer_tickets_for_descriptors(
+    descriptors: &[KernelTransferredHandle],
+) -> Result<Vec<KernelTransferTicket>, i64> {
+    multitask::ipc_transfer_tickets(descriptors).map_err(ipc_transfer_error_to_linux_errno)
+}
+
+pub(super) fn install_transfer_tickets_for_current_process(
+    tickets: &[KernelTransferTicket],
+) -> Result<Vec<i32>, i64> {
+    let entries = multitask::take_ipc_transfer_entries_by_tickets(tickets)
+        .map_err(ipc_transfer_error_to_linux_errno)?;
+    install_transfer_entries_for_current_process(entries)
+}
+
+fn install_transfer_entries_for_current_process(
+    entries: Vec<multitask::TransferredHandleEntry>,
+) -> Result<Vec<i32>, i64> {
     let service_refs = service_transfer_refs(&entries);
     let Some(fds) = multitask::with_current_user_process_state_mut(|_, _, process_state| {
         if !process_state
@@ -2649,6 +2705,14 @@ pub(super) fn install_transfer_descriptors_for_current_process(
             Err(errno)
         }
     }
+}
+
+pub(super) fn drop_transfer_tickets(tickets: &[KernelTransferTicket]) {
+    if tickets.is_empty() {
+        return;
+    }
+    multitask::drop_ipc_transfer_tickets(tickets);
+    let _ = service_deferred_transfer_releases();
 }
 
 fn take_transfer_entries(
@@ -2732,30 +2796,6 @@ fn ipc_error_to_linux_errno(err: kernel_ipc_runtime::api::IpcError) -> i64 {
     }
 }
 
-fn record_ipc_reply_rejection(
-    reply: u64,
-    receiver_process_id: u64,
-    err: kernel_ipc_runtime::api::IpcError,
-) {
-    let reason = match err {
-        kernel_ipc_runtime::api::IpcError::InvalidHandle => 1_u64,
-        kernel_ipc_runtime::api::IpcError::PermissionDenied => 2,
-        kernel_ipc_runtime::api::IpcError::PeerClosed => 3,
-        kernel_ipc_runtime::api::IpcError::BufferTooSmall => 4,
-        kernel_ipc_runtime::api::IpcError::InvalidArgument => 5,
-        kernel_ipc_runtime::api::IpcError::NoMemory => 6,
-    };
-    // FAILURE-TELEMETRY: reply rejection is rare and is otherwise collapsed
-    // into Linux errno. Preserve the exact capability and kernel reason so an
-    // SMP ownership race cannot masquerade as an ordinary EINVAL.
-    nucleus_core::debug::record_milestone(
-        nucleus_core::debug::LogCategory::Compat,
-        "ipc-reply-rejected",
-        reply,
-        ((receiver_process_id & 0xffff_ffff) << 32) | reason,
-    );
-}
-
 fn ticks_elapsed_ms(start_ticks: u64, end_ticks: u64) -> u64 {
     let ticks_per_second = crate::arch::rtc::ticks_per_second().max(1);
     end_ticks
@@ -2782,34 +2822,6 @@ where
         return;
     }
     log();
-}
-
-pub(super) fn diagnostic_rate_limit_permit(state: &AtomicU64, window: u64, limit: u8) -> bool {
-    if limit == 0 {
-        return false;
-    }
-    const COUNT_BITS: u32 = 8;
-    const COUNT_MASK: u64 = (1_u64 << COUNT_BITS) - 1;
-    let window = window.min(u64::MAX >> COUNT_BITS);
-    loop {
-        let previous = state.load(Ordering::Relaxed);
-        let previous_window = previous >> COUNT_BITS;
-        let previous_count = (previous & COUNT_MASK) as u8;
-        let next = if previous_window != window {
-            (window << COUNT_BITS) | 1
-        } else {
-            if previous_count >= limit {
-                return false;
-            }
-            previous + 1
-        };
-        if state
-            .compare_exchange_weak(previous, next, Ordering::AcqRel, Ordering::Relaxed)
-            .is_ok()
-        {
-            return true;
-        }
-    }
 }
 
 #[allow(
@@ -2954,17 +2966,6 @@ mod tests {
     )]
     fn service_endpoint_waiter_capacity_covers_every_scheduler_task() {
         assert!(MAX_SERVICE_ENDPOINT_WAITERS >= multitask::MAX_SCHEDULER_TASKS);
-    }
-
-    #[test]
-    fn diagnostic_rate_limit_is_exact_per_time_window() {
-        let state = AtomicU64::new(u64::MAX);
-        for _ in 0..4 {
-            assert!(diagnostic_rate_limit_permit(&state, 7, 4));
-        }
-        assert!(!diagnostic_rate_limit_permit(&state, 7, 4));
-        assert!(diagnostic_rate_limit_permit(&state, 8, 4));
-        assert!(!diagnostic_rate_limit_permit(&state, 8, 0));
     }
 
     #[test]

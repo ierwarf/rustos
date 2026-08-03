@@ -9,6 +9,12 @@ Cross-owner composition is indexed by `system-flows.md` and
 - Shared ABI crate: `libs/rustos-user-abi`.
 - Kernel re-export: `kernel/ps/src/user/{abi,handles,sysops}.rs`. `kernel/compat` re-exports through `kernel_ps::api`; no shadow ABI/handle/user-memory sysop files.
 - Device/console/UI `repr(C)` structs and ioctl numbers must live in `rustos-user-abi`. Services (`uiserver`, `runtimed`) consume that crate — never duplicate request structs or ioctl encoding.
+- Every native `SYS_RUSTOS_*` number is one literal in
+  `libs/rustos-user-abi/src/syscall.rs` or its direct syscall modules, remains
+  inside the `0x5255_XXXX` namespace, and is globally unique. Adding a syscall
+  requires `formal/check-native-syscall-numbers.py` to pass; a duplicate would
+  make top-level dispatch select an unrelated authority path and is therefore
+  a critical ABI failure, not a compatibility alias.
 - Evacuation policy, ring0/ring3 boundary, service ownership: live source
   `RING3-MIGRATION-REFERENCE` / `RING3-MIGRATION-COMMENTED-OUT` markers, exact
   broker call paths, and owning service contracts.
@@ -577,6 +583,16 @@ policy remains with the owning service.
 - Bounded cap-transfer via `kernel_ipc_runtime::api::KernelTransferredHandle` + `*_with_handles` endpoint APIs.
 - Byte-only recv/take wrappers must fail with `BufferTooSmall` when a queued message contains transferred handles. Older paths must never silently drop capabilities.
 - Transferred handles require nonzero transfer ticket + `HandleRights::allows_transfer()` true.
+- The only Ring3 handle-transfer authority wire is exactly 16 little-endian
+  bytes: nonzero `transfer_id: u64` followed by nonzero random `nonce: u64`.
+  Ring3 bytes are never copied into `KernelTransferredHandle`, a Rust enum,
+  padding, discriminants, references, or pointers. Decode produces the typed
+  ticket only after exact-length and nonzero checks; malformed bytes return a
+  bounded ABI error without constructing or consuming authority.
+- The registry matches both ID and nonce and consumes the entry exactly once.
+  A forged, stale, zero, or replayed ticket cannot remove the live entry. The
+  Kani parser proofs exhaust the 128-bit input partition and canonical
+  round-trip; `ipc-handle-transfer` separately checks typed registry lifetime.
 - Pending transferred-handle entries are owned by the process-handle substrate,
   not an isolated compat cache. An endpoint message that is cancelled,
   peer-closed before receive, rejected after receive-output validation, or
@@ -627,6 +643,13 @@ policy remains with the owning service.
   with multiple independent event sources must drain with
   `SYS_RUSTOS_IPC_TRY_RECV` / `rustos_svc_runtime::ipc::try_recv` and use a
   bounded yield/sleep between drain passes.
+- Rootd and runtimed use the shared `IPC_CONTROL_DRAIN_BUDGET` to process at
+  most 32 already-queued control requests before returning to lifecycle,
+  launch, catalog, and socket work. The kernel's 64-call endpoint admission
+  ceiling is compile-time required to retain two such bursts. Do not sleep or
+  run unrelated policy after every single ready request, and do not replace
+  this bound with an unbounded drain; both changes can violate a synchronous
+  caller's 100 ms interactive-control rail under SMP contention.
 - Blocking receive has one endpoint-slot linearization point for the
   poll/arm/register race. If a message is already pending when receiver
   registration acquires that slot, the syscall re-polls without publishing a
@@ -634,6 +657,26 @@ policy remains with the owning service.
   the pending fast path creates stale wake and synchronous-handoff authority
   for a task that never blocked. The executable refinement is
   `formal/endpoint-receiver-wakeup/EndpointReceiverWakeup.tla`.
+- A single-endpoint byte-only policy service may complete its current reply and
+  enter the next sender-authenticated receive through
+  `SYS_RUSTOS_IPC_REPLY_RECV_WITH_SENDER`. The syscall accepts only the exact
+  versioned `IpcReplyRecvWithSenderArgs` shape. Endpoint ownership, response
+  input, request capacity, and every next-request output range are validated
+  before the old one-shot reply is consumed. A normal negative errno is
+  therefore pre-commit. A receive error after reply completion is encoded
+  below Linux's `-4095` errno range with
+  `IPC_REPLY_RECV_COMMITTED_ERROR_BASE`. The admitted raw partitions are
+  non-negative success, `-1..=-4095` pre-commit errno, and
+  `-4097..=-8191` post-commit errno; `-4096`, `<= -8192`, and `i64::MIN` are
+  fail-closed ABI violations rather than retry states. Ring3 may retry the old
+  cap only after a decoded pre-commit errno and must never retry it after a
+  tagged post-commit result. A non-negative result both proves reply completion and
+  reports the next request length. The receive half reuses the endpoint
+  check-arm-recheck waiter protocol and retains the exact awakened caller's
+  bounded synchronous scheduler custody. Handle-bearing reply/receive remains
+  on the explicit separate syscalls; the fused byte path may not drop, infer,
+  or partially install handles. The executable transaction is
+  `formal/ipc-reply-recv-transaction/IpcReplyRecvTransaction.tla`.
 - root-supervisor services that authorize subjects may use
   `SYS_RUSTOS_IPC_{TRY_RECV,RECV}_WITH_SENDER` to receive the caller PID/TID
   stamped by the kernel. Payload subject fields are not trusted unless they
@@ -693,6 +736,16 @@ policy remains with the owning service.
   threshold crossings only. They may not print per request, hold a policy
   lock, allocate an unbounded record, or become a prerequisite for forward
   progress.
+- A hot single-endpoint service loop must use the fused reply-receive primitive
+  only when it has no independent event source that must run between phases.
+  This removes the reply return-to-ring3 plus the following receive trap while
+  preserving one exact scheduler handoff. `inputd` is the first admitted user:
+  its DVM ingestion remains an independent worker, every dequeued malformed
+  request receives terminal `EINVAL`, a pre-commit failure makes one immediate
+  standalone attempt with the proven-live reply cap, and a tagged post-commit
+  receive failure falls back to a fresh receive without replaying the completed
+  reply. Any value outside the three exact result partitions terminates the
+  service as an ABI contract violation instead of guessing whether to retry.
 
 ## VFS Surface (`vfsd`)
 
@@ -719,11 +772,13 @@ policy remains with the owning service.
   mutations to vfsd, so a routine `fcntl(F_DUPFD*)` cannot inherit vfsd
   scheduling latency. `close` removes the local descriptor first, then performs
   any token-addressed final provider release; a wedged vfsd/netd cannot retain
-  a reusable numeric fd or block process retirement. Ordinary cross-service
-  close uses the 16 ms cancellable internal IPC path. Checkpointed epoll
-  create/ADD/MOD/DEL/retire and matching purges are state-changing control
-  transactions and use the separate bounded 100 ms interactive-control rail;
-  they must never inherit the non-consuming readiness-query deadline. vfsd is
+  a reusable numeric fd or block process retirement. Netd socket DUP, final
+  CLOSE, and their exact replay ACK mutate the provider's open-description
+  reference and therefore own one complete bounded 100 ms interactive-control
+  attempt. They do not split the deadline or retry a real timeout; exact
+  mutation identity transfers to housekeeping. Checkpointed epoll
+  create/ADD/MOD/DEL/retire and matching purges follow the same control rail.
+  Only non-consuming provider readiness queries use the 16 ms deadline. vfsd is
   the only intended caller of `SYS_RUSTOS_FD_*_BROKER`; gated by `VFS_POLICY`.
   Generic apps must not call those brokers directly.
   Fork clones the address space and fd table in one process-state snapshot;
@@ -764,7 +819,10 @@ policy remains with the owning service.
   Linux defines `epoll_ctl` as the synchronous interest-list control interface,
   distinct from the timeout-bearing `epoll_wait`; the compatibility boundary
   therefore keeps mutation completion separate from the 16 ms provider-query
-  cap (<https://www.man7.org/linux/man-pages/man2/epoll_ctl.2.html>).
+  cap (<https://man7.org/linux/man-pages/man2/epoll_ctl.2.html>). Its ADD record
+  pins the target open file description, matching Linux's documented reference
+  semantics; acquiring that netd reference is part of the same interactive
+  mutation, not a readiness probe (<https://docs.kernel.org/filesystems/files.html>).
   `O_NONBLOCK` is read from the same fd-table snapshot as the console
   handle; an empty sessiond read returns `EAGAIN` instead of re-entering
   the blocking retry loop after a readiness race.
@@ -1699,11 +1757,12 @@ Kernel keeps only: user-copy, address-space replacement, scheduler mutation, pen
   reads.
 - `SYS_RUSTOS_SCHED_DEMOTE_SELF` is a narrow scheduler substrate for an
   already-running user thread to irreversibly surrender its inherited base
-  System class. It takes no priority argument, cannot promote any thread, and
-  preserves only live reply-scoped IPC inheritance until that reply's normal
-  release. uiserver uses it for background and untrusted client-accept workers;
-  failure terminates the UI process instead of letting those workers contend
-  with input/present at System priority.
+  System class and cap its permanent fair weight at `NICE_0_LOAD`. It takes no
+  priority argument and cannot raise a lower weight. Live reply-scoped IPC
+  inheritance remains independent until that exact reply's normal release.
+  uiserver uses it for background and untrusted client-accept workers; failure
+  terminates the UI process instead of letting those workers retain either
+  System priority or the compositor's elevated CPU share.
 - Linux `memfd_create`: policy validation in syscalld; kernel performs handle install + read/write/truncate/seal (current handles, user memory).
 - Static-PIE policy services receive one kernel-mapped bootstrap heap, but its
   runtime allocator is reclaiming rather than bump-only. Every allocation owns

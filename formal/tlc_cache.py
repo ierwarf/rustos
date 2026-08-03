@@ -80,6 +80,7 @@ def validate_cached_summary(
     model: str,
     *,
     now: float | None = None,
+    min_remaining_seconds: int = 0,
 ) -> CacheValidation:
     """Return validated cache metadata or raise ValueError on any uncertainty."""
 
@@ -93,6 +94,11 @@ def validate_cached_summary(
     max_age_hours = profiles[profile].get("tlc_reuse_max_age_hours", 0)
     if not isinstance(max_age_hours, int) or max_age_hours <= 0:
         raise ValueError(f"TLC evidence reuse is disabled for profile {profile}")
+    if not isinstance(min_remaining_seconds, int) or min_remaining_seconds < 0:
+        raise ValueError("TLC minimum remaining lifetime is invalid")
+    max_age_seconds = max_age_hours * 3600
+    if min_remaining_seconds >= max_age_seconds:
+        raise ValueError("TLC minimum remaining lifetime exhausts the reuse window")
     required_models = profiles[profile].get("required_models", [])
     if model not in required_models:
         raise ValueError(f"model is not selected by profile {profile}: {model}")
@@ -147,9 +153,13 @@ def validate_cached_summary(
     age_seconds = observed_now - summary.stat().st_mtime
     if age_seconds < -300:
         raise ValueError("cached TLC summary timestamp is implausibly in the future")
-    if age_seconds > max_age_hours * 3600:
+    if age_seconds > max_age_seconds:
         raise ValueError(
             f"cached TLC summary exceeds {max_age_hours} hour reuse limit"
+        )
+    if age_seconds > max_age_seconds - min_remaining_seconds:
+        raise ValueError(
+            "cached TLC summary cannot remain valid through the seal reserve"
         )
     return CacheValidation(summary=summary, age_seconds=max(age_seconds, 0.0))
 
@@ -159,9 +169,15 @@ def main() -> int:
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--profile", required=True)
     parser.add_argument("--model", required=True)
+    parser.add_argument("--min-remaining-seconds", type=int, default=0)
     args = parser.parse_args()
     try:
-        result = validate_cached_summary(args.root, args.profile, args.model)
+        result = validate_cached_summary(
+            args.root,
+            args.profile,
+            args.model,
+            min_remaining_seconds=args.min_remaining_seconds,
+        )
     except (OSError, ValueError, KeyError, TypeError) as error:
         print(f"TLC cache miss model={args.model}: {error}")
         return 1

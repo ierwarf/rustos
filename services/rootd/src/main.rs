@@ -26,6 +26,7 @@
 
 extern crate alloc;
 
+mod control_drain;
 mod service_checkpoint;
 
 use core::arch::asm;
@@ -94,12 +95,6 @@ const BOOTSTRAP_SPAWN_MAX_ATTEMPTS: u32 = 64;
 const INITD_SPAWN_MAX_ATTEMPTS: u32 = 64;
 const CORE_READINESS_POLL_INTERVAL_MS: u32 = 250;
 const CORE_READINESS_POLL_MAX: u32 = 20;
-/// A readiness poll turn must drain the already-queued control burst before
-/// entering the 250 ms hardware/service readiness backoff. Core services start
-/// concurrently and publish through this one endpoint; sleeping after one
-/// request serializes their registrations into a multi-second boot delay.
-const ROOTD_REQUEST_DRAIN_BUDGET: usize = 32;
-
 const SYSCALLD_EXEC: &[u8] = b"services/syscalld/syscalld.elf\0";
 const VFSD_EXEC: &[u8] = b"services/vfsd/vfsd.elf\0";
 const LOADERD_EXEC: &[u8] = b"services/loaderd/loaderd.elf\0";
@@ -336,18 +331,15 @@ pub extern "C" fn __rustos_rootd_start() -> ! {
     debug_line(b"rootd: core services spawned, waiting for readiness\n");
     while !service_dependencies_ready(INITD_LEASE_INDEX) {
         drain_lifecycle_events(&mut leases, &mut post_init_leases);
-        let mut served = 0;
-        while served < ROOTD_REQUEST_DRAIN_BUDGET
-            && serve_rootd_once(
+        let served = control_drain::drain_rootd_control_requests(|| {
+            serve_rootd_once(
                 endpoint,
                 &leases,
                 &mut post_init_leases,
                 &mut service_checkpoints,
                 false,
             )
-        {
-            served += 1;
-        }
+        });
         restart_failed_leases(
             endpoint,
             &mut leases,
@@ -380,13 +372,16 @@ pub extern "C" fn __rustos_rootd_start() -> ! {
     yield_now();
     loop {
         drain_lifecycle_events(&mut leases, &mut post_init_leases);
-        let _ = serve_rootd_once(
-            endpoint,
-            &leases,
-            &mut post_init_leases,
-            &mut service_checkpoints,
-            false,
-        );
+        // Keep post-init control draining bounded by `control_drain` too.
+        let _ = control_drain::drain_rootd_control_requests(|| {
+            serve_rootd_once(
+                endpoint,
+                &leases,
+                &mut post_init_leases,
+                &mut service_checkpoints,
+                false,
+            )
+        });
         restart_failed_leases(
             endpoint,
             &mut leases,
@@ -2317,7 +2312,12 @@ fn yield_now() {
 }
 
 fn supervisor_idle() {
-    yield_now();
+    // No multi-source lifecycle/control wait object exists at this boundary.
+    // The capability-gated timer broker bounds polling without leaving this
+    // System-class supervisor runnable and starving the display causal chain.
+    let delay_ms = rustos_user_abi::performance::ROOTD_SUPERVISOR_IDLE_POLL_MS;
+    let delay_ms = u32::try_from(delay_ms).expect("rootd idle poll interval exceeds broker ABI");
+    wait_for_restart_backoff(delay_ms);
 }
 
 fn fail_closed(message: &[u8]) -> ! {

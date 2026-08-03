@@ -27,7 +27,9 @@ use super::acpi::MAX_SUPPORTED_CPUS;
 
 const KERNEL_PRIVILEGE_STACK_SIZE: usize = 256 * 1024;
 const DOUBLE_FAULT_STACK_SIZE: usize = 128 * 1024;
+const NMI_STACK_SIZE: usize = 64 * 1024;
 pub(crate) const DOUBLE_FAULT_IST_INDEX: u16 = 0;
+pub(crate) const NMI_IST_INDEX: u16 = 1;
 const GDT_EMPTY: u8 = 0;
 const GDT_BUILDING: u8 = 1;
 const GDT_LIVE: u8 = 2;
@@ -68,6 +70,12 @@ static RING0_STACKS: [PrivilegeStackMemory; MAX_SUPPORTED_CPUS] = [const {
 static DOUBLE_FAULT_STACKS: [InterruptStackMemory<DOUBLE_FAULT_STACK_SIZE>; MAX_SUPPORTED_CPUS] = [const {
     InterruptStackMemory(UnsafeCell::new(InterruptStack {
         _bytes: [0; DOUBLE_FAULT_STACK_SIZE],
+    }))
+};
+    MAX_SUPPORTED_CPUS];
+static NMI_STACKS: [InterruptStackMemory<NMI_STACK_SIZE>; MAX_SUPPORTED_CPUS] = [const {
+    InterruptStackMemory(UnsafeCell::new(InterruptStack {
+        _bytes: [0; NMI_STACK_SIZE],
     }))
 };
     MAX_SUPPORTED_CPUS];
@@ -143,6 +151,7 @@ pub fn init_for_cpu(logical_index: usize) {
         DOUBLE_FAULT_IST_INDEX,
         double_fault_stack_top(logical_index),
     );
+    set_interrupt_stack_for_cpu(logical_index, NMI_IST_INDEX, nmi_stack_top(logical_index));
 
     let mut gdt = GlobalDescriptorTable::new();
     let kernel_code = gdt.append(Descriptor::kernel_code_segment());
@@ -287,22 +296,37 @@ fn double_fault_stack_top(logical_index: usize) -> u64 {
     base + DOUBLE_FAULT_STACK_SIZE as u64
 }
 
+fn nmi_stack_top(logical_index: usize) -> u64 {
+    let base = NMI_STACKS[logical_index].0.get() as *const InterruptStack<NMI_STACK_SIZE> as u64;
+    base + NMI_STACK_SIZE as u64
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{MAX_SUPPORTED_CPUS, default_ring0_stack_top, double_fault_stack_top};
+    use super::{
+        DOUBLE_FAULT_IST_INDEX, MAX_SUPPORTED_CPUS, NMI_IST_INDEX, default_ring0_stack_top,
+        double_fault_stack_top, nmi_stack_top,
+    };
 
     #[test]
     fn per_cpu_privilege_and_ist_stacks_are_aligned_and_disjoint() {
+        assert_ne!(NMI_IST_INDEX, DOUBLE_FAULT_IST_INDEX);
         let mut privilege = [0_u64; MAX_SUPPORTED_CPUS];
         let mut interrupt = [0_u64; MAX_SUPPORTED_CPUS];
+        let mut nmi = [0_u64; MAX_SUPPORTED_CPUS];
         for cpu in 0..MAX_SUPPORTED_CPUS {
             privilege[cpu] = default_ring0_stack_top(cpu);
             interrupt[cpu] = double_fault_stack_top(cpu);
+            nmi[cpu] = nmi_stack_top(cpu);
             assert_eq!(privilege[cpu] & 0xf, 0);
             assert_eq!(interrupt[cpu] & 0xf, 0);
+            assert_eq!(nmi[cpu] & 0xf, 0);
             assert_ne!(privilege[cpu], interrupt[cpu]);
+            assert_ne!(privilege[cpu], nmi[cpu]);
+            assert_ne!(interrupt[cpu], nmi[cpu]);
             assert!(!privilege[..cpu].contains(&privilege[cpu]));
             assert!(!interrupt[..cpu].contains(&interrupt[cpu]));
+            assert!(!nmi[..cpu].contains(&nmi[cpu]));
         }
     }
 }

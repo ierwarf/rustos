@@ -27,34 +27,34 @@ use std::time::Instant;
 
 mod dvm_protocol;
 mod dvm_session_sync;
+mod service_loop;
 
 use keyboard_core::{KeyAction, KeyboardDriver, KeyboardEvent};
 use rustos_user_abi::syscall::{
-    identity_is_exact_sender, CommercialMaxCapabilityLeaseWire,
-    CommercialMaxProtocolDescriptorWire, CommercialMaxProtocolRequest,
-    CommercialMaxProtocolResponse, InputDvmRecordWire, InputIngestBrokerArgs, InputIngressWire,
+    COMMERCIAL_MAX_INPUTD_OP_DROP_POLICY, COMMERCIAL_MAX_INPUTD_OP_EVDEV_TRANSLATE,
+    COMMERCIAL_MAX_INPUTD_OP_INPUT_READER, COMMERCIAL_MAX_INPUTD_OP_INPUT_STATS,
+    COMMERCIAL_MAX_INPUTD_OP_LAYOUT_POLICY, COMMERCIAL_MAX_INPUTD_OP_POINTER_SURFACE_POLICY,
+    COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_INPUTD,
+    CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
+    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, INPUTD_ACCESS_EVDEV,
+    INPUTD_ACCESS_NATIVE, INPUTD_INGEST_MAX_EVENTS, INPUTD_INGRESS_FLAG_DVM_SOURCE,
+    INPUTD_INGRESS_FLAG_RESET_STATE, INPUTD_INGRESS_KIND_DVM_LINUX_KEY,
+    INPUTD_INGRESS_KIND_POINTER_PACKET, INPUTD_INGRESS_KIND_POINTER_POSITION,
+    INPUTD_IPC_ABI_VERSION, INPUTD_IPC_OP_AUTHORIZE_READ, INPUTD_IPC_OP_PING, INPUTD_IPC_OP_READ,
+    INPUTD_IPC_OP_SET_POINTER_SURFACE, INPUTD_IPC_OP_STATS, INPUTD_READ_FLAG_NONBLOCK,
+    INPUTD_READ_PAYLOAD_CAPACITY, IPC_MAX_INLINE_BYTES, IPC_SERVICE_INPUTD, IPC_SERVICE_NETD,
+    IPC_SERVICE_UISERVER, InputDvmRecordWire, InputIngestBrokerArgs, InputIngressWire,
     InputPointerPacketWire, InputPointerPositionWire, InputStatsBrokerArgs, InputStatsWire,
     InputdIpcRequest, InputdIpcResponse, InputdPointerSurfaceRequest, InputdReadResponse,
-    NetdIpcRequest, NetdIpcResponse, COMMERCIAL_MAX_INPUTD_OP_DROP_POLICY,
-    COMMERCIAL_MAX_INPUTD_OP_EVDEV_TRANSLATE, COMMERCIAL_MAX_INPUTD_OP_INPUT_READER,
-    COMMERCIAL_MAX_INPUTD_OP_INPUT_STATS, COMMERCIAL_MAX_INPUTD_OP_LAYOUT_POLICY,
-    COMMERCIAL_MAX_INPUTD_OP_POINTER_SURFACE_POLICY, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
-    COMMERCIAL_MAX_PROTOCOL_INPUTD, INPUTD_ACCESS_EVDEV, INPUTD_ACCESS_NATIVE,
-    INPUTD_INGEST_MAX_EVENTS, INPUTD_INGRESS_FLAG_DVM_SOURCE, INPUTD_INGRESS_FLAG_RESET_STATE,
-    INPUTD_INGRESS_KIND_DVM_LINUX_KEY, INPUTD_INGRESS_KIND_POINTER_PACKET,
-    INPUTD_INGRESS_KIND_POINTER_POSITION, INPUTD_IPC_ABI_VERSION, INPUTD_IPC_OP_AUTHORIZE_READ,
-    INPUTD_IPC_OP_PING, INPUTD_IPC_OP_READ, INPUTD_IPC_OP_SET_POINTER_SURFACE, INPUTD_IPC_OP_STATS,
-    INPUTD_READ_FLAG_NONBLOCK, INPUTD_READ_PAYLOAD_CAPACITY, IPC_MAX_INLINE_BYTES,
-    IPC_SERVICE_INPUTD, IPC_SERVICE_NETD, IPC_SERVICE_UISERVER, NETD_DVM_SESSION_GRANT,
-    NETD_DVM_SESSION_REVOKE, NETD_IPC_ABI_VERSION, NETD_IPC_OP_DVM_SESSION,
-    NETD_IPC_REQUEST_HEADER_SIZE, SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_INPUT_INGEST_BROKER,
-    SYS_RUSTOS_INPUT_STATS_BROKER, SYS_RUSTOS_INPUT_WAIT_BROKER, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
-    SYS_RUSTOS_IPC_RECV_WITH_SENDER, SYS_RUSTOS_IPC_REPLY,
+    NETD_DVM_SESSION_GRANT, NETD_DVM_SESSION_REVOKE, NETD_IPC_ABI_VERSION, NETD_IPC_OP_DVM_SESSION,
+    NETD_IPC_REQUEST_HEADER_SIZE, NetdIpcRequest, NetdIpcResponse, SYS_RUSTOS_DEBUG_PRINT,
+    SYS_RUSTOS_INPUT_INGEST_BROKER, SYS_RUSTOS_INPUT_STATS_BROKER, SYS_RUSTOS_INPUT_WAIT_BROKER,
+    SYS_RUSTOS_IPC_ENDPOINT_CREATE, identity_is_exact_sender,
 };
 #[cfg(not(test))]
 use rustos_user_abi::syscall::{
-    WaitSetSignalBrokerArgs, SYS_RUSTOS_WAITSET_SIGNAL_BROKER, WAITSET_ABI_VERSION,
-    WAITSET_GLOBAL_OBJECT_ID, WAITSET_PROVIDER_INPUTD,
+    SYS_RUSTOS_WAITSET_SIGNAL_BROKER, WAITSET_ABI_VERSION, WAITSET_GLOBAL_OBJECT_ID,
+    WAITSET_PROVIDER_INPUTD, WaitSetSignalBrokerArgs,
 };
 
 // The DVM ingestion worker waits on the MSI-X-published ring and transfers
@@ -62,6 +62,8 @@ use rustos_user_abi::syscall::{
 // requests still own reader authorization and event serialization; no polling
 // client is allowed to become the liveness dependency for transport progress.
 const INPUTD_QUEUE_MAX_EVENTS: usize = 4096;
+static REPLY_FAILURE_DIAGNOSTICS: rustos_svc_runtime::ipc::ReplyFailureDiagnostics =
+    rustos_svc_runtime::ipc::ReplyFailureDiagnostics::new();
 const INPUTD_MAX_NATIVE_READ_BYTES: u64 = input_evdev::MAX_NATIVE_READ_BYTES as u64;
 const INPUTD_MAX_EVDEV_READ_BYTES: u64 = input_evdev::MAX_EVDEV_READ_BYTES as u64;
 #[derive(Clone, Copy, Debug, Default)]
@@ -510,17 +512,17 @@ fn keyboard_action_to_inputd(action: KeyAction) -> u16 {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{
+        DvmIngressLogState, INPUTD_INGEST_MAX_EVENTS, InputQueue, SharedInputQueueState,
         apply_dvm_ingress_wire, ingest_batch_needs_immediate_retry, lock_input_queue,
-        lock_input_queue_for_ingestion, validate_commercial_request, DvmIngressLogState,
-        InputQueue, SharedInputQueueState, INPUTD_INGEST_MAX_EVENTS,
+        lock_input_queue_for_ingestion, validate_commercial_request,
     };
     use rustos_user_abi::syscall::{
-        CommercialMaxProtocolRequest, InputIngressWire, InputPointerPacketWire,
-        InputPointerPositionWire, InputdIpcRequest, COMMERCIAL_MAX_INPUTD_OP_INPUT_READER,
-        COMMERCIAL_MAX_PROTOCOL_INPUTD, INPUTD_ACCESS_NATIVE, INPUTD_INGRESS_FLAG_DVM_SOURCE,
-        INPUTD_INGRESS_FLAG_RESET_STATE, INPUTD_INGRESS_KIND_DVM_LINUX_KEY,
+        COMMERCIAL_MAX_INPUTD_OP_INPUT_READER, COMMERCIAL_MAX_PROTOCOL_INPUTD,
+        CommercialMaxProtocolRequest, INPUTD_ACCESS_NATIVE, INPUTD_INGRESS_FLAG_DVM_SOURCE,
+        INPUTD_INGRESS_FLAG_RESET_STATE, INPUTD_INGRESS_KIND_DVM_LINUX_KEY, InputIngressWire,
+        InputPointerPacketWire, InputPointerPositionWire, InputdIpcRequest,
     };
-    use std::sync::{mpsc, Arc};
+    use std::sync::{Arc, mpsc};
     use std::time::{Duration, Instant};
 
     fn pointer_motion(dx: i32, dy: i32) -> input_evdev::InputEvent {
@@ -866,27 +868,7 @@ mod tests {
 
 fn main() {
     observability_client::info!("inputd", service, "service started");
-    let endpoint = syscall0(SYS_RUSTOS_IPC_ENDPOINT_CREATE);
-    if endpoint < 0 {
-        let _ = writeln!(
-            std::io::stderr(),
-            "inputd: endpoint create failed errno={}",
-            -endpoint
-        );
-        return;
-    }
-    let register =
-        rustos_svc_runtime::ipc::register_service_endpoint(IPC_SERVICE_INPUTD, endpoint as u64);
-    if register < 0 {
-        let _ = writeln!(
-            std::io::stderr(),
-            "inputd: endpoint register failed errno={}",
-            -register
-        );
-        return;
-    }
-    debug_line("inputd: input policy endpoint registered");
-    serve(endpoint as u64);
+    service_loop::run();
 }
 
 /// Runs at the input-service priority but has no policy authority beyond the
@@ -1008,143 +990,6 @@ fn wait_for_dvm_ingress() -> Result<(), i32> {
     }
 }
 
-fn serve(endpoint: u64) {
-    let queue = Arc::new(SharedInputQueueState::new());
-    let dvm_ingress_log_state = Arc::new(DvmIngressLogState::default());
-    start_dvm_ingestion_worker(Arc::clone(&queue), Arc::clone(&dvm_ingress_log_state));
-    loop {
-        let mut request = [0_u8; IPC_MAX_INLINE_BYTES];
-        let mut reply_cap = 0_u64;
-        let mut sender_pid = 0_u64;
-        let mut sender_tid = 0_u64;
-        let received = syscall6(
-            SYS_RUSTOS_IPC_RECV_WITH_SENDER,
-            endpoint,
-            request.as_mut_ptr() as u64,
-            request.len() as u64,
-            (&mut reply_cap as *mut u64) as u64,
-            (&mut sender_pid as *mut u64) as u64,
-            (&mut sender_tid as *mut u64) as u64,
-        );
-        if received <= 0 {
-            continue;
-        }
-        let request_size = received as usize;
-        if request_size == size_of::<CommercialMaxProtocolRequest>() {
-            let request = read_unaligned::<CommercialMaxProtocolRequest>(&request);
-            let reply = {
-                let mut queue = lock_input_queue(&queue);
-                reply_commercial_request(reply_cap, &request, sender_pid, sender_tid, &mut queue)
-            };
-            if reply < 0 {
-                let _ = writeln!(std::io::stderr(), "inputd: reply failed errno={}", -reply);
-            }
-            log_dvm_ingress_observations(&queue, &dvm_ingress_log_state);
-            continue;
-        }
-        if request_size == size_of::<InputdPointerSurfaceRequest>() {
-            debug_line("inputd: pointer surface request received");
-            let request = read_unaligned::<InputdPointerSurfaceRequest>(&request);
-            let mut response = InputdIpcResponse {
-                version: INPUTD_IPC_ABI_VERSION,
-                op: request.op,
-                ..InputdIpcResponse::default()
-            };
-            response.status = {
-                let mut queue = lock_input_queue(&queue);
-                if rustos_svc_runtime::ipc::validate_service_owner(IPC_SERVICE_UISERVER, sender_pid)
-                    < 0
-                {
-                    libc::EACCES
-                } else {
-                    dispatch_pointer_surface_request(&request, &mut queue)
-                }
-            };
-            response.approved_len = (response.status == 0) as u64;
-            debug_line("inputd: pointer surface state applied");
-            let reply = syscall3(
-                SYS_RUSTOS_IPC_REPLY,
-                reply_cap,
-                (&response as *const InputdIpcResponse) as u64,
-                size_of::<InputdIpcResponse>() as u64,
-            );
-            debug_line("inputd: pointer surface reply returned");
-            if reply < 0 {
-                let _ = writeln!(std::io::stderr(), "inputd: reply failed errno={}", -reply);
-            }
-            log_dvm_ingress_observations(&queue, &dvm_ingress_log_state);
-            continue;
-        }
-        if request_size != size_of::<InputdIpcRequest>() {
-            continue;
-        }
-        let request = read_unaligned::<InputdIpcRequest>(&request);
-        let reply = if request.op == INPUTD_IPC_OP_READ {
-            let mut response = InputdReadResponse {
-                version: INPUTD_IPC_ABI_VERSION,
-                op: request.op,
-                ..InputdReadResponse::default()
-            };
-            response.status = match validate(received as usize, &request) {
-                Ok(())
-                    if !identity_is_exact_sender(
-                        request.pid,
-                        request.tid,
-                        sender_pid,
-                        sender_tid,
-                    ) =>
-                {
-                    libc::EACCES
-                }
-                Ok(()) => {
-                    let mut queue = lock_input_queue(&queue);
-                    dispatch_read(&request, &mut response, &mut queue)
-                }
-                Err(errno) => errno,
-            };
-            syscall3(
-                SYS_RUSTOS_IPC_REPLY,
-                reply_cap,
-                (&response as *const InputdReadResponse) as u64,
-                size_of::<InputdReadResponse>() as u64,
-            )
-        } else {
-            let mut response = InputdIpcResponse {
-                version: INPUTD_IPC_ABI_VERSION,
-                op: request.op,
-                ..InputdIpcResponse::default()
-            };
-            response.status = match validate(received as usize, &request) {
-                Ok(())
-                    if !identity_is_exact_sender(
-                        request.pid,
-                        request.tid,
-                        sender_pid,
-                        sender_tid,
-                    ) =>
-                {
-                    libc::EACCES
-                }
-                Ok(()) => {
-                    let mut queue = lock_input_queue(&queue);
-                    dispatch(&request, &mut response, &mut queue)
-                }
-                Err(errno) => errno,
-            };
-            syscall3(
-                SYS_RUSTOS_IPC_REPLY,
-                reply_cap,
-                (&response as *const InputdIpcResponse) as u64,
-                size_of::<InputdIpcResponse>() as u64,
-            )
-        };
-        if reply < 0 {
-            let _ = writeln!(std::io::stderr(), "inputd: reply failed errno={}", -reply);
-        }
-        log_dvm_ingress_observations(&queue, &dvm_ingress_log_state);
-    }
-}
-
 fn log_dvm_ingress_observations(queue: &SharedInputQueue, state: &DvmIngressLogState) {
     let observations = lock_input_queue(queue).take_dvm_ingress_observations();
     log_dvm_ingress_observation_flags(state, observations);
@@ -1161,34 +1006,6 @@ fn log_dvm_ingress_observation_flags(
     if log_pointer {
         debug_line("inputd: DVM pointer ingress observed");
     }
-}
-
-fn reply_commercial_request(
-    reply_cap: u64,
-    request: &CommercialMaxProtocolRequest,
-    sender_pid: u64,
-    sender_tid: u64,
-    queue: &mut InputQueue,
-) -> i64 {
-    let mut response = CommercialMaxProtocolResponse {
-        header: request.header,
-        ..CommercialMaxProtocolResponse::default()
-    };
-    response.header.version = COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
-    response.status = if !request.subject_is_exact_sender(sender_pid, sender_tid) {
-        libc::EACCES
-    } else {
-        validate_commercial_request(request)
-            .and_then(|_| dispatch_commercial_request(request, &mut response, queue))
-            .err()
-            .unwrap_or(0)
-    };
-    syscall3(
-        SYS_RUSTOS_IPC_REPLY,
-        reply_cap,
-        (&response as *const CommercialMaxProtocolResponse) as u64,
-        size_of::<CommercialMaxProtocolResponse>() as u64,
-    )
 }
 
 fn dispatch(
@@ -1714,14 +1531,6 @@ fn syscall1(number: u64, arg0: u64) -> i64 {
 
 fn syscall2(number: u64, arg0: u64, arg1: u64) -> i64 {
     unsafe { libc::syscall(number as libc::c_long, arg0, arg1) as i64 }
-}
-
-fn syscall3(number: u64, arg0: u64, arg1: u64, arg2: u64) -> i64 {
-    unsafe { libc::syscall(number as libc::c_long, arg0, arg1, arg2) as i64 }
-}
-
-fn syscall6(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i64 {
-    unsafe { libc::syscall(number as libc::c_long, arg0, arg1, arg2, arg3, arg4, arg5) as i64 }
 }
 
 fn last_errno() -> i32 {

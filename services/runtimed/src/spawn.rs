@@ -15,13 +15,13 @@
 //! - **Evidence:** `scheduler-dispatch`, `deferred-process-activation`, and
 //!   `runtime-control-ingress`.
 use std::ffi::CString;
-use std::fs;
 use std::mem::size_of;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::Ordering;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use runtime_control::read_bounded_config_snapshot;
 use rustos_user_abi::performance::IPC_BOOT_CONTROL_HARD_LIMIT_MS;
 use rustos_user_abi::syscall::{
     CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, LoaderSpawnRequest,
@@ -44,6 +44,7 @@ use super::{
 use super::{BrokerState, LaunchEntry, RunningProcess};
 
 const KVM_ACCEPTANCE_CONTRACT_PATH: &str = "/system/registry/system/kvm-acceptance-v1.env";
+const KVM_ACCEPTANCE_CONTRACT_MAX_BYTES: usize = 256;
 
 #[derive(Clone, Copy)]
 struct KvmAcceptanceContract {
@@ -209,7 +210,15 @@ fn apply_kvm_acceptance_contract(entry: &mut LaunchEntry) {
 }
 
 fn load_kvm_acceptance_contract() -> Option<KvmAcceptanceContract> {
-    let contents = fs::read_to_string(KVM_ACCEPTANCE_CONTRACT_PATH).ok()?;
+    // This is an immutable policy snapshot. A sequential read would publish a
+    // VFS cursor checkpoint and can lose the small KVM contract behind an
+    // unrelated checkpoint burst; positioned bounded I/O is the same path
+    // used by the admitted runtime registries.
+    let contents = read_bounded_config_snapshot(
+        KVM_ACCEPTANCE_CONTRACT_PATH,
+        KVM_ACCEPTANCE_CONTRACT_MAX_BYTES,
+    )
+    .ok()?;
     parse_kvm_acceptance_contract(contents.as_str())
 }
 

@@ -15,7 +15,9 @@ installed="$(cargo kani --version | awk 'NR == 1 { print $2 }')"
 cd "$repo_root"
 artifact_dir="${KANI_ARTIFACT_DIR:-$repo_root/build/formal/kani}"
 mkdir -p "$artifact_dir"
-bash formal/run-proof-index.sh
+if [[ "${FORMAL_PROOF_INDEX_ALREADY_PASSED:-0}" != 1 ]]; then
+    bash formal/run-proof-index.sh
+fi
 
 packages=(runtime-control rustos-image-admission driver-domain-protocol rustos-user-abi)
 overall=0

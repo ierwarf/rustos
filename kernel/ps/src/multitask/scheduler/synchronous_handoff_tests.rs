@@ -77,7 +77,7 @@ fn synchronous_ipc_handoff_is_fifo_deduplicated_and_fairness_bounded() {
     assert!(scheduler.set_next_synchronous_pick_hint(913));
     assert_eq!(scheduler.sync_pick_hints.len(), 2);
     assert_eq!(
-        scheduler.mandatory_overdue_pick(current, now_ticks),
+        scheduler.mandatory_overdue_system_pick(current, now_ticks),
         Some(overdue)
     );
     assert_eq!(

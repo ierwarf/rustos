@@ -2,10 +2,11 @@
 EXTENDS Naturals
 
 (***************************************************************************
-Recoverable grow-down faults cross the scheduler and process-state lock
-domains.  Planning and metadata commit are scheduler-owned; mapping is
-process-state-owned.  A stale plan, contention, exec generation change, or
-retirement must terminate only the faulting task, never nest the two locks.
+The release containment eagerly maps every usable stack page and retains one
+permanent guard, so a valid stack access never enters exception-time locking.
+The deferred path remains the required future refinement for restoring lazy
+growth: transient ProcessStateLock contention must defer, never retire, a live
+valid fault.
 ***************************************************************************)
 
 CONSTANT MaxGeneration
@@ -14,6 +15,7 @@ NoGeneration == MaxGeneration + 1
 Idle == "idle"
 Planned == "planned"
 Applying == "applying"
+Deferred == "deferred"
 Mapped == "mapped"
 Committed == "committed"
 Retired == "retired"
@@ -41,6 +43,15 @@ Prepare ==
     /\ UNCHANGED <<generation, schedulerRaw, processLock, mappingInstalled,
                     metadataCommitted, taskRetired>>
 
+EagerMapAllUsablePages ==
+    /\ phase = Idle /\ ~taskRetired
+    /\ phase' = Committed
+    /\ planGeneration' = generation
+    /\ mappingInstalled' = TRUE
+    /\ metadataCommitted' = TRUE
+    /\ UNCHANGED <<generation, schedulerRaw, processLock,
+                    taskRetired>>
+
 BeginApply ==
     /\ phase = Planned /\ ~taskRetired
     /\ phase' = Applying
@@ -56,20 +67,28 @@ FinishApply ==
     /\ UNCHANGED <<generation, planGeneration, schedulerRaw,
                     metadataCommitted, taskRetired>>
 
-ApplyContentionFailsClosed ==
-    /\ phase = Planned
-    /\ phase' = Retired /\ taskRetired' = TRUE
+ApplyContentionDefers ==
+    /\ phase = Planned /\ ~taskRetired
+    /\ phase' = Deferred
     /\ UNCHANGED <<generation, planGeneration, schedulerRaw, processLock,
-                    mappingInstalled, metadataCommitted>>
+                    mappingInstalled, metadataCommitted, taskRetired>>
+
+RetryDeferred ==
+    /\ phase = Deferred /\ ~taskRetired
+    /\ phase' = Applying
+    /\ processLock' = TRUE /\ schedulerRaw' = FALSE
+    /\ UNCHANGED <<generation, planGeneration, mappingInstalled,
+                    metadataCommitted, taskRetired>>
 
 ConcurrentRetirement ==
     /\ phase \in {Planned, Mapped} /\ ~taskRetired
+    /\ phase' = IF phase = Planned THEN Retired ELSE Mapped
     /\ taskRetired' = TRUE
-    /\ UNCHANGED <<phase, generation, planGeneration, schedulerRaw,
+    /\ UNCHANGED <<generation, planGeneration, schedulerRaw,
                     processLock, mappingInstalled, metadataCommitted>>
 
 ConcurrentExec ==
-    /\ phase \in {Planned, Mapped} /\ ~processLock
+    /\ phase \in {Planned, Deferred, Mapped} /\ ~processLock
     /\ generation < MaxGeneration
     /\ generation' = generation + 1
     /\ UNCHANGED <<phase, planGeneration, schedulerRaw, processLock,
@@ -99,17 +118,19 @@ Terminal ==
     /\ UNCHANGED vars
 
 Next ==
-    \/ Prepare \/ BeginApply \/ FinishApply \/ ApplyContentionFailsClosed
+    \/ EagerMapAllUsablePages
+    \/ Prepare \/ BeginApply \/ FinishApply \/ ApplyContentionDefers
+    \/ RetryDeferred
     \/ ConcurrentRetirement \/ ConcurrentExec
     \/ CommitMetadata \/ RejectStaleCommit \/ Terminal
 
-Settle == BeginApply \/ FinishApply \/ ApplyContentionFailsClosed
+Settle == BeginApply \/ FinishApply \/ ApplyContentionDefers \/ RetryDeferred
           \/ CommitMetadata \/ RejectStaleCommit
 
 Spec == Init /\ [][Next]_vars /\ WF_vars(Settle)
 
 TypeOK ==
-    /\ phase \in {Idle, Planned, Applying, Mapped, Committed, Retired}
+    /\ phase \in {Idle, Planned, Applying, Deferred, Mapped, Committed, Retired}
     /\ generation \in 0..MaxGeneration
     /\ planGeneration \in 0..NoGeneration
     /\ schedulerRaw \in BOOLEAN /\ processLock \in BOOLEAN
@@ -125,7 +146,13 @@ CommittedOrRetiredIsTerminal ==
 RetainedRejectedMappingHasNoSchedulerCommit ==
     phase = Retired /\ mappingInstalled => ~metadataCommitted /\ taskRetired
 
+TransientContentionCannotRetireValidFault ==
+    phase = Deferred => ~taskRetired /\ ~metadataCommitted
+
+RetiredPhaseRequiresPublishedRetirement ==
+    phase = Retired => taskRetired
+
 GrowthEventuallySettles ==
-    phase \in {Planned, Applying, Mapped} ~> phase \in {Committed, Retired}
+    phase \in {Planned, Applying, Deferred, Mapped} ~> phase \in {Committed, Retired}
 
 =============================================================================

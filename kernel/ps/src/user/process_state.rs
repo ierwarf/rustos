@@ -729,7 +729,7 @@ impl UserProcessState {
         linux_memory_map: LinuxMemoryMapState,
         linux_runtime_profile: LinuxRuntimeProfile,
         exec_path: &str,
-    ) -> Vec<KernelHandle> {
+    ) -> (Vec<KernelHandle>, Self) {
         let preserved_ignored = self
             .linux_sigactions
             .map(|action| action.handler == SIG_IGN);
@@ -767,8 +767,12 @@ impl UserProcessState {
             }
         }
 
-        *self = fresh;
-        closed
+        // Return the old bundle so the exec coordinator can retain its MM and
+        // other generation-owned state until the scheduler has activated the
+        // new root/context. Dropping it before that publication can reclaim an
+        // address space that is still current on the executing CPU.
+        let old = core::mem::replace(self, fresh);
+        (closed, old)
     }
 
     pub fn map_zeroed_pages_from_mapping_cursor(

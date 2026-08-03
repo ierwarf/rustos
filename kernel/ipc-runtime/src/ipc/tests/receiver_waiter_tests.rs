@@ -47,21 +47,9 @@ fn endpoint_system_calls_bypass_backlog_without_starving_ordinary_lane() {
             b"ordinary-a",
             super::super::EndpointCallPriority::Ordinary,
         );
-        enqueue(
-            2,
-            b"system-a",
-            super::super::EndpointCallPriority::System,
-        );
-        enqueue(
-            3,
-            b"system-b",
-            super::super::EndpointCallPriority::System,
-        );
-        enqueue(
-            4,
-            b"system-c",
-            super::super::EndpointCallPriority::System,
-        );
+        enqueue(2, b"system-a", super::super::EndpointCallPriority::System);
+        enqueue(3, b"system-b", super::super::EndpointCallPriority::System);
+        enqueue(4, b"system-c", super::super::EndpointCallPriority::System);
         enqueue(
             5,
             b"ordinary-b",

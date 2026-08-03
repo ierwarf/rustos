@@ -17,7 +17,7 @@ use std::time::Duration;
 use rustos_user_abi::syscall::{InputIngressWire, NETD_DVM_SESSION_GRANT, NETD_DVM_SESSION_REVOKE};
 
 use super::dvm_protocol::DvmOutcome;
-use super::{apply_dvm_ingress_wire, lock_input_queue_for_ingestion, SharedInputQueue};
+use super::{SharedInputQueue, apply_dvm_ingress_wire, lock_input_queue_for_ingestion};
 
 pub(super) const RETRY_BACKOFF: Duration = Duration::from_millis(10);
 pub(super) const TIMEOUT: Duration = Duration::from_secs(5);
@@ -73,13 +73,13 @@ mod tests {
     use std::time::Duration;
 
     use rustos_user_abi::syscall::{
-        InputIngressWire, InputPointerPacketWire, INPUTD_ACCESS_NATIVE,
-        INPUTD_INGRESS_FLAG_DVM_SOURCE, INPUTD_INGRESS_KIND_POINTER_PACKET, NETD_DVM_SESSION_GRANT,
+        INPUTD_ACCESS_NATIVE, INPUTD_INGRESS_FLAG_DVM_SOURCE, INPUTD_INGRESS_KIND_POINTER_PACKET,
+        InputIngressWire, InputPointerPacketWire, NETD_DVM_SESSION_GRANT,
     };
 
-    use super::{apply, RETRY_BACKOFF, TIMEOUT};
+    use super::{RETRY_BACKOFF, TIMEOUT, apply};
     use crate::dvm_protocol::DvmOutcome;
-    use crate::{lock_input_queue, lock_input_queue_for_ingestion, SharedInputQueueState};
+    use crate::{SharedInputQueueState, lock_input_queue, lock_input_queue_for_ingestion};
 
     fn pointer_motion(dx: i32, dy: i32) -> input_evdev::InputEvent {
         input_evdev::InputEvent {

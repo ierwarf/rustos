@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
@@ -171,12 +172,36 @@ def prepare_checkout(root: Path, destination: Path) -> None:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Kill registered implementation mutants with their exact witnesses."
+    )
+    parser.add_argument(
+        "--only",
+        action="append",
+        default=[],
+        metavar="ID",
+        help="run one registered mutation; repeat for a focused change set",
+    )
+    args = parser.parse_args()
     root = Path(
         subprocess.check_output(
             ["git", "rev-parse", "--show-toplevel"], text=True
         ).strip()
     )
     mutations = read_registry(root)
+    focused_ids = set(args.only)
+    if focused_ids:
+        known_ids = {str(mutation["id"]) for mutation in mutations}
+        unknown_ids = focused_ids - known_ids
+        if unknown_ids:
+            raise SystemExit(
+                "unknown implementation mutation ids: " + ", ".join(sorted(unknown_ids))
+            )
+        mutations = [
+            mutation
+            for mutation in mutations
+            if str(mutation["id"]) in focused_ids
+        ]
     artifact_dir = root / "build/formal/implementation-mutations"
     artifact_dir.mkdir(parents=True, exist_ok=True)
     target_dir = artifact_dir / "target"
@@ -261,11 +286,17 @@ def main() -> int:
         "kill_count": len(results),
         "kill_ratio": 1.0,
         "mutations": results,
+        "scope": "focused" if focused_ids else "complete",
     }
-    (artifact_dir / "summary.json").write_text(
+    summary_name = "focused-summary.json" if focused_ids else "summary.json"
+    (artifact_dir / summary_name).write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
-    print(f"implementation mutations passed killed={len(results)}/{len(results)}")
+    scope = "focused" if focused_ids else "complete"
+    print(
+        f"implementation mutations passed scope={scope} "
+        f"killed={len(results)}/{len(results)}"
+    )
     return 0
 
 

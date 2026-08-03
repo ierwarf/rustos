@@ -5,15 +5,18 @@ EXTENDS Naturals, Sequences, FiniteSets
 Models the Wayland listener boundary in uiserver.
 
 Concrete owner:
-  * services/uiserver/src/wayland.rs `start_wayland_acceptor` and
-    `WaylandCompositor::tick`
+  * services/uiserver/src/wayland_accept.rs `start_wayland_acceptor`
+  * services/uiserver/src/wayland.rs `WaylandCompositor::tick`
 
 The netd-backed accept4 call can be delayed even when the listener is
 nonblocking, because nonblocking describes socket state, not the latency of
 the cross-service RPC that observes that state.  The accept worker is therefore
-the only owner of that RPC.  It passes completed streams through a bounded
-channel; the UI thread performs only bounded `try_recv` operations.  Queue
-overload rejects and logs the newly accepted client instead of blocking the UI.
+the only owner of that RPC, and it may enter accept4 only after the listener
+wait-set publishes a readiness edge.  It passes completed streams through a
+bounded channel and publishes one coalescing UI wake; the UI thread performs
+only bounded `try_recv` operations.  Queue overload rejects and logs the newly
+accepted client instead of blocking the UI.  Periodic accept probing is not an
+admitted transition.
 
 `AcceptCallStalls` deliberately leaves the UI actions enabled.  Weak fairness
 then checks that a stalled/recovering netd call cannot suppress UI frame
@@ -28,7 +31,9 @@ NoStream == 0
 Idle == "idle"
 Waiting == "waiting"
 
-VARIABLES acceptCall,
+VARIABLES listenerReady,
+          acceptStartedWithoutReady,
+          acceptCall,
           acceptWait,
           nextStream,
           acceptQueue,
@@ -40,9 +45,9 @@ VARIABLES acceptCall,
           uiAdvancedAfterStall,
           overloadLogged
 
-vars == <<acceptCall, acceptWait, nextStream, acceptQueue, inserted, rejected,
-          uiEpoch, frameEpoch, stallObserved, uiAdvancedAfterStall,
-          overloadLogged>>
+vars == <<listenerReady, acceptStartedWithoutReady, acceptCall, acceptWait,
+          nextStream, acceptQueue, inserted, rejected, uiEpoch, frameEpoch,
+          stallObserved, uiAdvancedAfterStall, overloadLogged>>
 
 SeqSet(sequence) == {sequence[index] : index \in 1..Len(sequence)}
 
@@ -51,6 +56,8 @@ Distinct(sequence) ==
         left # right => sequence[left] # sequence[right]
 
 Init ==
+    /\ listenerReady = FALSE
+    /\ acceptStartedWithoutReady = FALSE
     /\ acceptCall = Idle
     /\ acceptWait = 0
     /\ nextStream = 1
@@ -63,8 +70,20 @@ Init ==
     /\ uiAdvancedAfterStall = FALSE
     /\ overloadLogged = [stream \in Streams |-> FALSE]
 
+PublishListenerReady ==
+    /\ acceptCall = Idle
+    /\ ~listenerReady
+    /\ listenerReady' = TRUE
+    /\ UNCHANGED <<acceptStartedWithoutReady, acceptCall, acceptWait,
+                  nextStream, acceptQueue, inserted, rejected, uiEpoch,
+                  frameEpoch, stallObserved, uiAdvancedAfterStall,
+                  overloadLogged>>
+
 BeginAcceptCall ==
     /\ acceptCall = Idle
+    /\ listenerReady
+    /\ listenerReady' = FALSE
+    /\ acceptStartedWithoutReady' = ~listenerReady
     /\ acceptCall' = Waiting
     /\ acceptWait' = 0
     /\ UNCHANGED <<nextStream, acceptQueue, inserted, rejected, uiEpoch,
@@ -76,16 +95,17 @@ AcceptCallStalls ==
     /\ acceptWait < MaxAcceptWait
     /\ acceptWait' = acceptWait + 1
     /\ stallObserved' = TRUE
-    /\ UNCHANGED <<acceptCall, nextStream, acceptQueue, inserted, rejected,
-                  uiEpoch, frameEpoch, uiAdvancedAfterStall, overloadLogged>>
+    /\ UNCHANGED <<listenerReady, acceptStartedWithoutReady, acceptCall,
+                  nextStream, acceptQueue, inserted, rejected, uiEpoch,
+                  frameEpoch, uiAdvancedAfterStall, overloadLogged>>
 
 AcceptWouldBlock ==
     /\ acceptCall = Waiting
     /\ acceptCall' = Idle
     /\ acceptWait' = 0
-    /\ UNCHANGED <<nextStream, acceptQueue, inserted, rejected, uiEpoch,
-                  frameEpoch, stallObserved, uiAdvancedAfterStall,
-                  overloadLogged>>
+    /\ UNCHANGED <<listenerReady, acceptStartedWithoutReady, nextStream,
+                  acceptQueue, inserted, rejected, uiEpoch, frameEpoch,
+                  stallObserved, uiAdvancedAfterStall, overloadLogged>>
 
 AcceptReturnsStream ==
     /\ acceptCall = Waiting
@@ -100,8 +120,8 @@ AcceptReturnsStream ==
           ELSE /\ acceptQueue' = acceptQueue
                /\ rejected' = Append(rejected, nextStream)
                /\ overloadLogged' = [overloadLogged EXCEPT ![nextStream] = TRUE]
-    /\ UNCHANGED <<inserted, uiEpoch, frameEpoch, stallObserved,
-                  uiAdvancedAfterStall>>
+    /\ UNCHANGED <<listenerReady, acceptStartedWithoutReady, inserted, uiEpoch,
+                  frameEpoch, stallObserved, uiAdvancedAfterStall>>
 
 UiTick ==
     /\ uiEpoch' = (uiEpoch + 1) % 3
@@ -112,12 +132,14 @@ UiTick ==
                /\ inserted' = inserted
           ELSE /\ acceptQueue' = Tail(acceptQueue)
                /\ inserted' = Append(inserted, Head(acceptQueue))
-    /\ UNCHANGED <<acceptCall, acceptWait, nextStream, rejected,
-                  stallObserved, overloadLogged>>
+    /\ UNCHANGED <<listenerReady, acceptStartedWithoutReady, acceptCall,
+                  acceptWait, nextStream, rejected, stallObserved,
+                  overloadLogged>>
 
 ResolveAcceptCall == AcceptWouldBlock \/ AcceptReturnsStream
 
 Next ==
+    \/ PublishListenerReady
     \/ BeginAcceptCall
     \/ AcceptCallStalls
     \/ AcceptWouldBlock
@@ -127,9 +149,12 @@ Next ==
 Spec ==
     Init /\ [][Next]_vars
          /\ WF_vars(UiTick)
+         /\ WF_vars(BeginAcceptCall)
          /\ WF_vars(ResolveAcceptCall)
 
 TypeOK ==
+    /\ listenerReady \in BOOLEAN
+    /\ acceptStartedWithoutReady \in BOOLEAN
     /\ acceptCall \in {Idle, Waiting}
     /\ acceptWait \in 0..MaxAcceptWait
     /\ nextStream \in 1..(StreamCount + 1)
@@ -159,6 +184,9 @@ UiNeverOwnsAcceptWait ==
 
 AcceptWaitIsBounded ==
     acceptCall = Waiting => acceptWait <= MaxAcceptWait
+
+AcceptRequiresPublishedReadiness ==
+    ~acceptStartedWithoutReady
 
 StalledAcceptCannotStopFrames ==
     stallObserved ~> uiAdvancedAfterStall

@@ -27,6 +27,11 @@ const MAX_RUNTIME_PROGRAMS: usize = 64;
 const DEFAULT_WEIGHT_MICROS: u64 = 100;
 const RPC_IO_TIMEOUT: Duration = Duration::from_secs(5);
 
+mod config_snapshot;
+
+pub use config_snapshot::read_bounded_config_snapshot;
+use config_snapshot::read_config_snapshot;
+
 pub const DEFAULT_RUNTIME_SOCKET_PATH: &str = "/run/runtimed.sock";
 pub const DEFAULT_APPLICATIONS_DIR: &str = "/usr/share/applications";
 pub const DEFAULT_AUTOSTART_DIR: &str = "/etc/xdg/autostart";
@@ -497,7 +502,7 @@ fn load_desktop_entries(
 
     let mut entries = Vec::new();
     for path in paths {
-        let contents = fs::read_to_string(&path)?;
+        let contents = read_config_snapshot(&path)?;
         if let Some(entry) = parse_desktop_program_entry(&contents, &path, mode) {
             entries.push(entry);
         }
@@ -512,7 +517,7 @@ fn load_desktop_entries(
 }
 
 fn load_desktop_registry_entries(path: &str) -> Result<Vec<DesktopProgramEntry>, std::io::Error> {
-    let contents = fs::read_to_string(path)?;
+    let contents = read_config_snapshot(path)?;
     let mut entries = Vec::new();
 
     for (line_number, line) in contents.lines().enumerate() {
@@ -538,7 +543,7 @@ fn load_desktop_registry_entries(path: &str) -> Result<Vec<DesktopProgramEntry>,
 }
 
 fn load_startup_registry_entries(path: &str) -> Result<Vec<StartupEntry>, std::io::Error> {
-    let contents = fs::read_to_string(path)?;
+    let contents = read_config_snapshot(path)?;
     let mut entries = Vec::new();
 
     for (line_number, line) in contents.lines().enumerate() {
@@ -612,7 +617,7 @@ fn cached_runtime_env_registry_entries() -> Result<Vec<RuntimeEnvEntry>, std::io
 }
 
 fn load_runtime_env_registry_entries(path: &str) -> Result<Vec<RuntimeEnvEntry>, std::io::Error> {
-    let contents = fs::read_to_string(path)?;
+    let contents = read_config_snapshot(path)?;
     let mut entries = Vec::new();
 
     for (line_number, line) in contents.lines().enumerate() {
@@ -640,7 +645,7 @@ fn parse_runtime_env_registry_entry(line: &str) -> Option<RuntimeEnvEntry> {
     let scope = registry_field(line, "scope")?;
     let key = registry_field(line, "key")?;
     let value = registry_field(line, "value")?;
-    if !valid_env_key(key) || value.as_bytes().contains(&0) {
+    if !config_snapshot::valid_env_key(key) || value.as_bytes().contains(&0) {
         return None;
     }
     Some(RuntimeEnvEntry {
@@ -942,13 +947,6 @@ fn registry_field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
     })
 }
 
-fn valid_env_key(key: &str) -> bool {
-    !key.is_empty()
-        && key
-            .bytes()
-            .all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
-}
-
 fn fallback_package_id(desktop_file_id: &str, exec: &str) -> String {
     Path::new(desktop_file_id)
         .file_stem()
@@ -1031,10 +1029,10 @@ fn as_bytes_mut<T>(value: &mut T) -> &mut [u8] {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_desktop_program_entry, parse_desktop_registry_entry, parse_exec_tokens,
-        parse_startup_registry_entry, response_payload_len, DesktopLoadMode, RuntimeRequest,
-        RuntimeResponse, StartupMode, MAX_RUNTIME_PROGRAMS, OP_REQUEST_LAUNCH_PATH,
-        OP_SNAPSHOT_RUNNING_PROGRAMS, PROTOCOL_VERSION,
+        DesktopLoadMode, MAX_RUNTIME_PROGRAMS, OP_REQUEST_LAUNCH_PATH,
+        OP_SNAPSHOT_RUNNING_PROGRAMS, PROTOCOL_VERSION, RuntimeRequest, RuntimeResponse,
+        StartupMode, parse_desktop_program_entry, parse_desktop_registry_entry, parse_exec_tokens,
+        parse_startup_registry_entry, response_payload_len,
     };
     use std::path::Path;
 
@@ -1246,8 +1244,8 @@ mod tests {
 #[cfg(kani)]
 mod verification {
     use super::{
-        response_payload_len, RuntimeRequest, RuntimeResponse, MAX_RUNTIME_PROGRAMS,
-        OP_SNAPSHOT_RUNNING_PROGRAMS, PROTOCOL_VERSION,
+        MAX_RUNTIME_PROGRAMS, OP_SNAPSHOT_RUNNING_PROGRAMS, PROTOCOL_VERSION, RuntimeRequest,
+        RuntimeResponse, response_payload_len,
     };
 
     #[kani::proof]

@@ -2,7 +2,7 @@ pub use crate::ipc::{
     EndpointCallPriority, EndpointReceived, EndpointReceivedWithSender, EndpointResponseTake,
     EndpointResponseWithHandles, EndpointWakeSet, IpcError, KernelEndpointHandle,
     KernelReplyHandle, KernelSharedRegionHandle, KernelSharedRegionMappingHold,
-    KernelTransferredHandle, MAX_ENDPOINT_WAKE_TASKS,
+    KernelTransferTicket, KernelTransferredHandle, MAX_ENDPOINT_WAKE_TASKS,
 };
 
 pub mod endpoint {

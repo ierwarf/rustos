@@ -334,8 +334,14 @@ reason = "Descriptor duplication, exec, close, and transfer determine capability
 [[risk_surfaces]]
 path = "kernel/compat/src/user/syscall/linux/ipc_ops.rs"
 severity = "critical"
-flows = ["ipc-call", "endpoint-lifecycle", "root-authority", "service-call-authority", "commercial-envelope", "input-delivery-lifecycle"]
-reason = "User ABI IPC admission binds callers to service generations and finite reply deadlines."
+flows = ["ipc-call", "endpoint-lifecycle", "root-authority", "service-call-authority", "commercial-envelope", "input-delivery-lifecycle", "scheduler-dispatch"]
+reason = "User ABI IPC admission binds callers to service generations and finite reply deadlines; fused reply-receive preflights every user range before consuming one-shot authority."
+
+[[risk_surfaces]]
+path = "kernel/compat/src/user/syscall/linux/ipc_reply_recv.rs"
+severity = "critical"
+flows = ["scheduler-dispatch"]
+reason = "Fused reply-receive has a phase-sensitive one-shot commit and must retain exact caller and endpoint waiter custody without retry ambiguity."
 
 [[risk_surfaces]]
 path = "kernel/compat/src/user/syscall/linux/proc_broker_ops.rs"
@@ -485,7 +491,13 @@ reason = "Pure barrier predicates separate spawned children from exact endpoint 
 path = "services/loaderd/src/main.rs"
 severity = "critical"
 flows = ["loader-request-authority", "scheduler-dispatch", "atomic-process-activation-batch"]
-reason = "Loaderd admits executable images and coordinates the transactional process loader."
+reason = "Loaderd admits executable images, coordinates the transactional process loader, and owns exact terminal reply plus selective fused-receive custody."
+
+[[risk_surfaces]]
+path = "services/loaderd/src/lib.rs"
+severity = "critical"
+flows = ["scheduler-dispatch"]
+reason = "Loaderd classifies malformed wire sizes, post-reply cleanup/demotion eligibility, and phase-tagged fused-receive recovery."
 
 [[risk_surfaces]]
 path = "services/vfsd/src/main.rs"
@@ -502,8 +514,14 @@ reason = "Storaged binds provider generation, geometry, read-ahead, cancellation
 [[risk_surfaces]]
 path = "services/inputd/src/main.rs"
 severity = "critical"
-flows = ["input-delivery-lifecycle"]
-reason = "Inputd owns readiness publication, policy queue progress, and transport consumer lifetime."
+flows = ["input-delivery-lifecycle", "scheduler-dispatch"]
+reason = "Inputd owns readiness publication, policy queue progress, transport consumer lifetime, and the first fused reply-receive service loop."
+
+[[risk_surfaces]]
+path = "services/inputd/src/service_loop.rs"
+severity = "critical"
+flows = ["scheduler-dispatch"]
+reason = "The service loop owns byte-only reply-receive phase handling and must terminate every dequeued caller exactly once."
 
 [[risk_surfaces]]
 path = "services/netd/src/main.rs"
@@ -528,6 +546,12 @@ path = "services/uiserver/src/wayland.rs"
 severity = "critical"
 flows = ["wayland-client-ingress"]
 reason = "Untrusted Wayland objects, buffers, callbacks, and disconnects share compositor state."
+
+[[risk_surfaces]]
+path = "services/uiserver/src/wayland_accept.rs"
+severity = "critical"
+flows = ["wayland-client-ingress"]
+reason = "Listener readiness, accepted-stream ownership, and UI wake ordering admit untrusted Wayland peers."
 
 [[risk_surfaces]]
 path = "services/uiserver/src/gpu_runtime.rs"
@@ -789,7 +813,19 @@ models = [
 
 [[source_mappings]]
 path = "libs/rustos-user-abi/src/syscall.rs"
-models = ["sigchld-notification/SigchldNotification"]
+models = [
+    "ipc-handle-transfer/IpcHandleTransfer",
+    "ipc-reply-recv-transaction/IpcReplyRecvTransaction",
+    "sigchld-notification/SigchldNotification",
+]
+
+[[source_mappings]]
+path = "libs/rustos-user-abi/src/syscall/ipc_reply_recv.rs"
+models = ["ipc-reply-recv-transaction/IpcReplyRecvTransaction"]
+
+[[source_mappings]]
+path = "libs/rustos-svc-runtime/src/ipc.rs"
+models = ["ipc-reply-recv-transaction/IpcReplyRecvTransaction"]
 
 [[source_mappings]]
 path = "libs/rustos-user-abi/src/syscall/activation_batch.rs"
@@ -819,6 +855,10 @@ models = [
     "process-signal-delivery/ProcessSignalDelivery",
     "sigchld-notification/SigchldNotification",
 ]
+
+[[source_mappings]]
+path = "kernel/compat/src/user/syscall/linux/scheduler_ops.rs"
+models = ["scheduler-thread-demotion/SchedulerThreadDemotion"]
 
 [[source_mappings]]
 path = "kernel/compat/src/user/syscall/linux/service_ops/ipc_helpers.rs"
@@ -870,6 +910,14 @@ models = [
     "ipc-reply-deadline/IpcReplyDeadline",
     "kernel-resource-accounting/KernelResourceAccounting",
 ]
+
+[[source_mappings]]
+path = "kernel/ps/src/user/handles.rs"
+models = ["ipc-handle-transfer/IpcHandleTransfer"]
+
+[[source_mappings]]
+path = "kernel/compat/src/user/syscall/linux/service_ops/vfs_meta.rs"
+models = ["ipc-handle-transfer/IpcHandleTransfer"]
 
 [[source_mappings]]
 path = "kernel/ipc-runtime/src/ipc/endpoint_priority.rs"
@@ -993,6 +1041,7 @@ models = [
     "cross-cpu-task-retirement/CrossCpuTaskRetirement",
     "exec-address-space-transaction/ExecAddressSpaceTransaction",
     "scheduler-cpu-ownership/SchedulerCpuOwnership",
+    "scheduler-thread-demotion/SchedulerThreadDemotion",
     "smp-reschedule-ipi/SmpRescheduleIpi",
     "synchronous-ipc-handoff/SynchronousIpcHandoff",
     "task-affinity-lifecycle/TaskAffinityLifecycle",
@@ -1103,9 +1152,14 @@ models = [
 path = "kernel/compat/src/user/syscall/linux/ipc_ops.rs"
 models = [
     "input-ingestion-worker/InputIngestionWorker",
+    "ipc-reply-recv-transaction/IpcReplyRecvTransaction",
     "service-call-authority/ServiceCallAuthority",
     "synchronous-ipc-handoff/SynchronousIpcHandoff",
 ]
+
+[[source_mappings]]
+path = "kernel/compat/src/user/syscall/linux/ipc_reply_recv.rs"
+models = ["ipc-reply-recv-transaction/IpcReplyRecvTransaction"]
 
 [[source_mappings]]
 path = "kernel/io-manager/src/api.rs"
@@ -1139,7 +1193,14 @@ models = ["dvm-network-ring/DvmNetworkRing"]
 
 [[source_mappings]]
 path = "services/inputd/src/main.rs"
-models = ["input-ingestion-worker/InputIngestionWorker"]
+models = [
+    "input-ingestion-worker/InputIngestionWorker",
+    "ipc-reply-recv-transaction/IpcReplyRecvTransaction",
+]
+
+[[source_mappings]]
+path = "services/inputd/src/service_loop.rs"
+models = ["ipc-reply-recv-transaction/IpcReplyRecvTransaction"]
 
 [[source_mappings]]
 path = "services/inputd/src/dvm_session_sync.rs"
@@ -1183,6 +1244,7 @@ models = [
 path = "services/loaderd/src/main.rs"
 models = [
     "atomic-process-activation-batch/AtomicProcessActivationBatch",
+    "ipc-reply-recv-transaction/IpcReplyRecvTransaction",
     "loader-request-authority/LoaderRequestAuthority",
     "scheduler-thread-demotion/SchedulerThreadDemotion",
     "ui-frame-budget/UiFrameBudget",
@@ -1190,7 +1252,10 @@ models = [
 
 [[source_mappings]]
 path = "services/loaderd/src/lib.rs"
-models = ["scheduler-thread-demotion/SchedulerThreadDemotion"]
+models = [
+    "ipc-reply-recv-transaction/IpcReplyRecvTransaction",
+    "scheduler-thread-demotion/SchedulerThreadDemotion",
+]
 
 [[source_mappings]]
 path = "services/vfsd/src/main.rs"
@@ -1331,6 +1396,9 @@ tlc_max_wall_seconds = 120
 # Reuse only exact, recent pass evidence.  The validator binds the TLA/CFG,
 # pinned TLC binary, deadlock policy, workers, fingerprint, and seed.
 tlc_reuse_max_age_hours = 24
+# Refresh an exact cache entry before it can expire while the remaining proof
+# lanes run and the current-tree evidence manifest is sealed.
+tlc_seal_reserve_seconds = 300
 required_models = [
     "acceptance-profile-publication/AcceptanceProfilePublication",
     "atomic-process-activation-batch/AtomicProcessActivationBatch",
@@ -1347,6 +1415,7 @@ required_models = [
     "ipc-endpoint-ownership/IpcEndpointOwnership",
     "ipc-priority-inheritance/IpcPriorityInheritance",
     "ipc-priority-queue/IpcPriorityQueue",
+    "ipc-reply-recv-transaction/IpcReplyRecvTransaction",
     "per-cpu-clockevent-lifecycle/PerCpuClockeventLifecycle",
     "process-address-space-lifetime/ProcessAddressSpaceLifetime",
     "product-boot/ProductBoot",
@@ -1383,6 +1452,7 @@ required_evidence = [
 evidence_max_age_hours = 24
 tlc_max_wall_seconds = 120
 tlc_reuse_max_age_hours = 24
+tlc_seal_reserve_seconds = 300
 required_evidence = [
     "build/formal/source-conformance/summary.json",
     "build/formal/smp-source-assumptions/summary.json",
@@ -1400,6 +1470,7 @@ required_models = [
     "tlb-shootdown-lifecycle/TlbShootdownLifecycle",
     "cross-cpu-task-retirement/CrossCpuTaskRetirement",
     "endpoint-receiver-wakeup/EndpointReceiverWakeup",
+    "ipc-reply-recv-transaction/IpcReplyRecvTransaction",
     "exec-address-space-transaction/ExecAddressSpaceTransaction",
     "gpu-submit-transaction/GpuSubmitTransaction",
     "robust-futex-owner-death/RobustFutexOwnerDeath",

@@ -48,6 +48,7 @@ kernel/ps/src/api.rs	0	0
 kernel/ps/src/user/epoll.rs	0	0
 kernel/ps/src/user/handles/table.rs	0	0
 kernel/compat/src/user/syscall/linux/ipc_ops.rs	1	56
+kernel/compat/src/user/syscall/linux/ipc_reply_recv.rs	0	0
 kernel/compat/src/user/syscall/linux/ipc_ops/subject.rs	0	0
 kernel/compat/src/user/syscall/linux/proc_broker_ops.rs	0	0
 kernel/compat/src/user/syscall/linux/proc_broker_ops/authority.rs	0	0
@@ -74,14 +75,17 @@ services/rootd/src/main.rs	20	27
 services/initd/src/main.rs	0	0
 services/initd/src/activation.rs	0	0
 services/initd/src/bootstrap_barrier.rs	0	0
+services/loaderd/src/lib.rs	0	0
 services/loaderd/src/main.rs	10	2
 services/vfsd/src/main.rs	33	2
 services/storaged/src/block.rs	1	0
 services/inputd/src/main.rs	10	2
+services/inputd/src/service_loop.rs	0	0
 services/netd/src/main.rs	9	11
 services/runtimed/src/spawn.rs	10	0
 services/runtimed/src/socket.rs	15	0
 services/uiserver/src/wayland.rs	13	6
+services/uiserver/src/wayland_accept.rs	0	0
 services/uiserver/src/gpu_runtime.rs	1	0
 kernel/compat/src/user/syscall/linux/device_broker_ops.rs	0	0
 kernel/ps/src/user/memfd.rs	0	0

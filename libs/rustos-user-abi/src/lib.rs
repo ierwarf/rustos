@@ -21,6 +21,21 @@ mod tests {
     use super::{console, device, performance, syscall, ui, windows};
 
     #[test]
+    fn ipc_transfer_ticket_wire_is_canonical_and_rejects_zero_authority() {
+        let ticket = syscall::IpcTransferTicketWire::new(7, 11).expect("nonzero ticket");
+        let bytes = ticket.encode();
+        assert_eq!(syscall::IpcTransferTicketWire::decode(&bytes), Some(ticket));
+
+        let mut zero_id = bytes;
+        zero_id[..8].fill(0);
+        assert!(syscall::IpcTransferTicketWire::decode(&zero_id).is_none());
+        let mut zero_nonce = bytes;
+        zero_nonce[8..].fill(0);
+        assert!(syscall::IpcTransferTicketWire::decode(&zero_nonce).is_none());
+        assert!(syscall::IpcTransferTicketWire::decode(&bytes[..15]).is_none());
+    }
+
+    #[test]
     fn windows_topology_observation_keeps_reserved_fields_zero() {
         let basic = windows::WindowsSystemBasicInformation::from_online_count(8);
         assert_eq!(basic.reserved1, [0; 24]);
@@ -71,6 +86,8 @@ mod tests {
             );
         }
         assert_eq!(performance::UI_FRAME_MAX_SYNCHRONOUS_POLICY_IPC, 0);
+        assert_eq!(performance::IPC_CONTROL_DRAIN_BUDGET, 32);
+        assert_eq!(performance::ROOTD_SUPERVISOR_IDLE_POLL_MS, 10);
         assert_eq!(performance::SERVICE_LOOKUP_MAX_IPC_WITH_EXACT_GRANT, 0);
         assert_eq!(
             performance::SERVICE_ENDPOINT_STABLE_LOOKUP_MAX_LOCK_ACQUISITIONS,
@@ -120,6 +137,11 @@ mod tests {
         assert_eq!(syscall::SYS_RUSTOS_IPC_WAIT_SERVICE_ENDPOINT, 0x5255_0039);
         assert_eq!(syscall::SYS_RUSTOS_PROC_ACTIVATE_BROKER, 0x5255_003a);
         assert_eq!(syscall::SYS_RUSTOS_PROC_ACTIVATE_BATCH_BROKER, 0x5255_0047);
+        assert_eq!(syscall::SYS_RUSTOS_IPC_REPLY_RECV_WITH_SENDER, 0x5255_0048);
+        assert_ne!(
+            syscall::SYS_RUSTOS_IPC_REPLY_RECV_WITH_SENDER,
+            syscall::SYS_RUSTOS_PROC_ACTIVATE_BATCH_BROKER
+        );
         assert_eq!(syscall::SYS_RUSTOS_ROOTD_WAIT_BROKER, 0x5255_003b);
         assert_eq!(syscall::SYS_RUSTOS_ROOTD_TERMINATE_BROKER, 0x5255_003c);
         assert!(

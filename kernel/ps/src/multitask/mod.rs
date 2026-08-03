@@ -60,6 +60,7 @@ pub use self::current::{
     with_current_user_process_state_mut, with_process_state_by_pid, with_process_state_by_pid_mut,
 };
 pub use self::retirement::UserFaultDisposition;
+pub use self::scheduler::drain_scheduler_runtime_profile;
 pub use self::scheduler::{AffinityCommit, AffinityError, ProcessAffinitySnapshot};
 
 /// Upper bound for simultaneously schedulable task identities. Cross-crate

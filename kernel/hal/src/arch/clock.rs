@@ -57,10 +57,18 @@ pub fn init() -> Option<ClockSourceInfo> {
     }
 
     let hpet = init_hpet();
-    if invariant_tsc_supported() {
-        let tsc_hz = cpuid_tsc_frequency_hz().or_else(|| hpet.and_then(calibrate_tsc_with_hpet));
-        if let Some(tsc_hz) = tsc_hz.filter(|hz| (MIN_TSC_HZ..=MAX_TSC_HZ).contains(hz)) {
-            TSC_HZ.store(tsc_hz, Ordering::Relaxed);
+    let tsc_hz = invariant_tsc_supported()
+        .then(|| cpuid_tsc_frequency_hz().or_else(|| hpet.and_then(calibrate_tsc_with_hpet)))
+        .flatten()
+        .filter(|hz| (MIN_TSC_HZ..=MAX_TSC_HZ).contains(hz));
+    if let Some(tsc_hz) = tsc_hz {
+        // The calibrated rate remains useful for each CPU's local
+        // TSC-deadline clockevent even when HPET owns global monotonic time.
+        TSC_HZ.store(tsc_hz, Ordering::Relaxed);
+        // Invariant TSC proves rate stability, not cross-CPU offset/skew. Until
+        // AP rendezvous admission publishes per-CPU offsets, only a uniprocessor
+        // topology may expose raw TSC as the global monotonic source.
+        if tsc_clocksource_admitted(super::smp::cpu_count()) {
             TSC_BASE.store(read_tsc_ordered(), Ordering::Relaxed);
             SOURCE.store(SOURCE_INVARIANT_TSC, Ordering::Release);
             return Some(ClockSourceInfo {
@@ -102,11 +110,11 @@ pub fn current_source() -> Option<ClockSourceInfo> {
 }
 
 pub fn invariant_tsc_frequency_hz() -> Option<u64> {
-    // ORDERING: Acquire observes the frequency fields published before the
-    // invariant-TSC source selector's Release store.
-    (SOURCE.load(Ordering::Acquire) == SOURCE_INVARIANT_TSC)
-        .then(|| TSC_HZ.load(Ordering::Acquire))
-        .filter(|frequency| *frequency != 0)
+    // The rate is separately admitted for CPU-local TSC-deadline clockevents;
+    // global monotonic time may deliberately remain on HPET under SMP.
+    // ORDERING: Acquire observes the rate stored before clocksource admission;
+    // zero remains the explicit not-calibrated sentinel.
+    Some(TSC_HZ.load(Ordering::Acquire)).filter(|frequency| *frequency != 0)
 }
 
 pub fn monotonic_nanos() -> u64 {
@@ -193,6 +201,10 @@ fn invariant_tsc_supported() -> bool {
     maximum_extended_leaf >= 0x8000_0007 && __cpuid(0x8000_0007).edx & (1 << 8) != 0
 }
 
+const fn tsc_clocksource_admitted(cpu_count: usize) -> bool {
+    cpu_count == 1
+}
+
 fn cpuid_tsc_frequency_hz() -> Option<u64> {
     let maximum_basic_leaf = __cpuid(0).eax;
     if maximum_basic_leaf < 0x15 {
@@ -274,5 +286,13 @@ mod tests {
             1_000_000_000
         );
         assert_eq!(hpet_frequency_hz(100_000_000), 10_000_000);
+    }
+
+    #[test]
+    fn raw_tsc_global_clock_is_rejected_until_smp_offsets_are_admitted() {
+        assert!(tsc_clocksource_admitted(1));
+        assert!(!tsc_clocksource_admitted(2));
+        assert!(!tsc_clocksource_admitted(4));
+        assert!(!tsc_clocksource_admitted(8));
     }
 }

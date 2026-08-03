@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use runtime_control::{StartupMode, DEFAULT_RUNTIME_SOCKET_PATH};
 use rustos_user_abi::console as console_abi;
+use rustos_user_abi::performance::IPC_CONTROL_DRAIN_BUDGET;
 use rustos_user_abi::syscall::{
     SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_SCHED_DEMOTE_SELF, TASK_WEIGHT_INTERACTIVE_FLAG,
 };
@@ -25,9 +26,17 @@ pub(crate) const MAX_UNTRUSTED_TASK_WEIGHT_MICROS: u64 = 1_000;
 pub(crate) const UI_SERVER_CATALOG_WEIGHT_MICROS: u64 = 2_000;
 pub(crate) const UI_SERVER_TASK_WEIGHT_MICROS: u64 =
     TASK_WEIGHT_INTERACTIVE_FLAG | UI_SERVER_CATALOG_WEIGHT_MICROS;
-pub(crate) const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(2);
+// Session IPC, child lifecycle, and the AF_UNIX listener do not yet share one
+// wait object. Bound their idle observation latency without waking this
+// User-class supervisor five hundred times per second at steady state.
+pub(crate) const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 pub(crate) const RETRY_BACKOFF: Duration = Duration::from_millis(100);
 pub(crate) const MAX_LAUNCH_RETRY_BACKOFF: Duration = Duration::from_secs(5);
+// Runtimed also owns the sessiond endpoint. A single session request must not
+// be separated from the next already-queued request by catalog, launch, reap,
+// and AF_UNIX control work. The bound preserves those owners' progress while
+// draining the synchronous session dependency burst that feeds the UI loop.
+const SESSION_REQUEST_DRAIN_BUDGET: usize = IPC_CONTROL_DRAIN_BUDGET;
 // A DVM-volume `EAGAIN` is an explicit readiness transition, not a failed
 // launch. Keep retry traffic below the UI-core and storage-ready paths.
 pub(crate) const STORAGE_NOT_READY_RETRY_BACKOFF: Duration = Duration::from_millis(250);
@@ -236,7 +245,7 @@ fn main() {
     let _ = ensure_ui_bootstrap(&mut state);
     loop {
         let mut did_work = false;
-        did_work |= session::service_session_endpoint(session_endpoint, &mut state);
+        did_work |= drain_session_request_burst(session_endpoint, &mut state) != 0;
         did_work |= spawn::reap_children(&mut state);
         did_work |= ensure_ui_bootstrap(&mut state);
         if state.ui_ready && !state.launch_catalog_loaded {
@@ -252,6 +261,21 @@ fn main() {
         }
         thread::sleep(spawn::next_idle_delay(&state));
     }
+}
+
+fn drain_session_request_burst(endpoint: Option<u64>, state: &mut BrokerState) -> usize {
+    drain_bounded_requests(SESSION_REQUEST_DRAIN_BUDGET, || {
+        session::service_session_endpoint(endpoint, state)
+    })
+}
+
+fn drain_bounded_requests(mut remaining: usize, mut serve_one: impl FnMut() -> bool) -> usize {
+    let mut served = 0;
+    while remaining != 0 && serve_one() {
+        served += 1;
+        remaining -= 1;
+    }
+    served
 }
 
 fn ensure_ui_bootstrap(state: &mut BrokerState) -> bool {
@@ -310,4 +334,43 @@ fn require_post_ui_user_class() {
     }
     spawn::debug_line("runtimed: fatal post-ui scheduling demotion failed");
     std::process::exit(134);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        drain_bounded_requests, IDLE_POLL_INTERVAL, IPC_CONTROL_DRAIN_BUDGET,
+        SESSION_REQUEST_DRAIN_BUDGET,
+    };
+
+    #[test]
+    fn steady_supervisor_poll_is_bounded_without_two_millisecond_churn() {
+        assert_eq!(IDLE_POLL_INTERVAL, std::time::Duration::from_millis(10));
+    }
+
+    #[test]
+    fn session_control_drain_services_a_bounded_ready_burst() {
+        assert_eq!(SESSION_REQUEST_DRAIN_BUDGET, IPC_CONTROL_DRAIN_BUDGET);
+        assert_eq!(SESSION_REQUEST_DRAIN_BUDGET, 32);
+        let mut ready = SESSION_REQUEST_DRAIN_BUDGET + 8;
+        let served = drain_bounded_requests(SESSION_REQUEST_DRAIN_BUDGET, || {
+            if ready == 0 {
+                return false;
+            }
+            ready -= 1;
+            true
+        });
+        assert_eq!(served, SESSION_REQUEST_DRAIN_BUDGET);
+        assert_eq!(ready, 8);
+
+        let served = drain_bounded_requests(SESSION_REQUEST_DRAIN_BUDGET, || {
+            if ready == 0 {
+                return false;
+            }
+            ready -= 1;
+            true
+        });
+        assert_eq!(served, 8);
+        assert_eq!(ready, 0);
+    }
 }

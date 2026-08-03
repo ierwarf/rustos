@@ -23,6 +23,10 @@ use super::EndpointOwner;
 /// before one ordinary call must be delivered. This mirrors the scheduler's
 /// two-System/one-User dispatch contract.
 const MAX_CONSECUTIVE_PRIORITY_ENDPOINT_CALLS: u8 = 2;
+const _: () = assert!(
+    super::MAX_ENDPOINT_PENDING_MESSAGES
+        >= rustos_user_abi::performance::IPC_CONTROL_DRAIN_BUDGET.saturating_mul(2)
+);
 
 /// Trusted queue class sampled from the kernel scheduler.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -82,8 +86,7 @@ impl EndpointObject {
     pub(super) fn next_pending(&self) -> Option<(EndpointQueueLane, u64)> {
         let deliver_system = !self.pending_system_messages.is_empty()
             && (self.pending_messages.is_empty()
-                || self.consecutive_system_deliveries
-                    < MAX_CONSECUTIVE_PRIORITY_ENDPOINT_CALLS);
+                || self.consecutive_system_deliveries < MAX_CONSECUTIVE_PRIORITY_ENDPOINT_CALLS);
         if deliver_system {
             self.pending_system_messages
                 .front()

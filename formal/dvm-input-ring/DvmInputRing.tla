@@ -29,14 +29,13 @@ protocol/ownership model, not a claim about DMA or cache-coherence hardware;
 source fence and mapping checks are required conformance evidence.
 *******************************************************************************)
 
-CONSTANTS Epochs, Slots, MaxSequence, MaxBrokerBatch, MaxTamperAttempts,
-          MaxAttachAttempts
+CONSTANTS Epochs, Slots, Callers, MaxSequence, MaxBrokerBatch,
+          MaxTamperAttempts, MaxAttachAttempts
 
 NoEpoch == 0
 NoRecord == [kind |-> "empty", epoch |-> NoEpoch, seq |-> 0]
 NoOwner == "none"
 L0Owner == "l0"
-BrokerOwner == "inputd-broker"
 
 Start(epoch) == [kind |-> "start", epoch |-> epoch, seq |-> 0]
 Key(epoch, seq) == [kind |-> "key", epoch |-> epoch, seq |-> seq]
@@ -55,7 +54,7 @@ VARIABLES rustosReady, policyConsumerReady, installRejected, msixArmed, msixVect
           attachAttempts,
           authenticated, streamEpoch, l0NextSequence,
           issuedEpochs, producer, consumer, ring, irqPending,
-          brokerOwner, brokerRemaining, activeEpoch, expectedSequence,
+          brokerOwner, activeDrainCallers, brokerRemaining, activeEpoch, expectedSequence,
           committed, delivered, rejected, lastProducerOwner,
           lastConsumerOwner, dvmTamperAttempts
 
@@ -63,7 +62,7 @@ vars == <<rustosReady, policyConsumerReady, installRejected, msixArmed, msixVect
           attachAttempts,
           authenticated, streamEpoch, l0NextSequence,
           issuedEpochs, producer, consumer, ring, irqPending,
-          brokerOwner, brokerRemaining, activeEpoch, expectedSequence,
+          brokerOwner, activeDrainCallers, brokerRemaining, activeEpoch, expectedSequence,
           committed, delivered, rejected, lastProducerOwner,
           lastConsumerOwner, dvmTamperAttempts>>
 
@@ -89,6 +88,7 @@ Init ==
     /\ ring = [slot \in RingSlots |-> NoRecord]
     /\ irqPending = FALSE
     /\ brokerOwner = NoOwner
+    /\ activeDrainCallers = {}
     /\ brokerRemaining = 0
     /\ activeEpoch = NoEpoch
     /\ expectedSequence = 0
@@ -112,7 +112,7 @@ InstallRustosReceiver ==
         IF msixArmed THEN msixVectorAllocations ELSE msixVectorAllocations + 1
     /\ attachAttempts' = attachAttempts + 1
     /\ UNCHANGED <<installRejected, authenticated, streamEpoch, l0NextSequence, issuedEpochs,
-                  producer, consumer, ring, irqPending, brokerOwner,
+                  producer, consumer, ring, irqPending, brokerOwner, activeDrainCallers,
                   brokerRemaining, activeEpoch, expectedSequence, committed,
                   delivered, rejected, lastProducerOwner, lastConsumerOwner,
                   dvmTamperAttempts>>
@@ -133,7 +133,7 @@ RejectRustosReceiver ==
     /\ attachAttempts' = attachAttempts + 1
     /\ UNCHANGED <<rustosReady, policyConsumerReady, msixArmed, authenticated, streamEpoch, l0NextSequence,
                   issuedEpochs, producer, consumer, ring, irqPending,
-                  brokerOwner, brokerRemaining, activeEpoch, expectedSequence,
+                  brokerOwner, activeDrainCallers, brokerRemaining, activeEpoch, expectedSequence,
                   committed, delivered, rejected, lastProducerOwner,
                   lastConsumerOwner, dvmTamperAttempts>>
 
@@ -152,7 +152,7 @@ RuntimeTransportRevoke ==
     /\ expectedSequence' = 0
     /\ UNCHANGED <<installRejected, msixArmed, msixVectorAllocations, attachAttempts,
                   issuedEpochs,
-                  producer, consumer, ring, irqPending, brokerOwner,
+                  producer, consumer, ring, irqPending, brokerOwner, activeDrainCallers,
                   brokerRemaining, committed,
                   delivered, rejected, lastProducerOwner, lastConsumerOwner,
                   dvmTamperAttempts>>
@@ -168,7 +168,7 @@ AttachRetryBudgetExhausted ==
     /\ installRejected' = TRUE
     /\ UNCHANGED <<rustosReady, policyConsumerReady, msixArmed, msixVectorAllocations, attachAttempts,
                   authenticated, streamEpoch, l0NextSequence, issuedEpochs,
-                  producer, consumer, ring, irqPending, brokerOwner,
+                  producer, consumer, ring, irqPending, brokerOwner, activeDrainCallers,
                   brokerRemaining, activeEpoch, expectedSequence, committed,
                   delivered, rejected, lastProducerOwner, lastConsumerOwner,
                   dvmTamperAttempts>>
@@ -180,7 +180,7 @@ AuthenticateL0 ==
     /\ UNCHANGED <<rustosReady, policyConsumerReady, installRejected, msixArmed, msixVectorAllocations,
                   attachAttempts,
                   streamEpoch, l0NextSequence, issuedEpochs,
-                  producer, consumer, ring, irqPending, brokerOwner,
+                  producer, consumer, ring, irqPending, brokerOwner, activeDrainCallers,
                   brokerRemaining, activeEpoch, expectedSequence, committed,
                   delivered, rejected, lastProducerOwner, lastConsumerOwner,
                   dvmTamperAttempts>>
@@ -194,7 +194,7 @@ PolicyConsumerPoll ==
     /\ UNCHANGED <<rustosReady, installRejected, msixArmed, msixVectorAllocations,
                   attachAttempts, authenticated, streamEpoch, l0NextSequence,
                   issuedEpochs, producer, consumer, ring, irqPending,
-                  brokerOwner, brokerRemaining, activeEpoch, expectedSequence,
+                  brokerOwner, activeDrainCallers, brokerRemaining, activeEpoch, expectedSequence,
                   committed, delivered, rejected, lastProducerOwner,
                   lastConsumerOwner, dvmTamperAttempts>>
 
@@ -216,7 +216,7 @@ L0Start(epoch) ==
     /\ UNCHANGED <<rustosReady, policyConsumerReady, installRejected, msixArmed, msixVectorAllocations,
                   attachAttempts,
                   authenticated, consumer, irqPending,
-                  brokerOwner, brokerRemaining, activeEpoch, expectedSequence,
+                  brokerOwner, activeDrainCallers, brokerRemaining, activeEpoch, expectedSequence,
                   delivered, rejected, lastConsumerOwner, dvmTamperAttempts>>
 
 L0Key ==
@@ -233,7 +233,7 @@ L0Key ==
     /\ UNCHANGED <<rustosReady, policyConsumerReady, installRejected, msixArmed, msixVectorAllocations,
                   attachAttempts,
                   authenticated, streamEpoch, issuedEpochs,
-                  consumer, irqPending, brokerOwner, brokerRemaining,
+                  consumer, irqPending, brokerOwner, activeDrainCallers, brokerRemaining,
                   activeEpoch, expectedSequence, delivered, rejected,
                   lastConsumerOwner, dvmTamperAttempts>>
 
@@ -254,7 +254,7 @@ L0End ==
     /\ UNCHANGED <<rustosReady, policyConsumerReady, installRejected, msixArmed, msixVectorAllocations,
                   attachAttempts,
                   authenticated, issuedEpochs, consumer,
-                  irqPending, brokerOwner, brokerRemaining, activeEpoch,
+                  irqPending, brokerOwner, activeDrainCallers, brokerRemaining, activeEpoch,
                   expectedSequence, delivered, rejected, lastConsumerOwner,
                   dvmTamperAttempts>>
 
@@ -268,7 +268,7 @@ DvmTamperAttempt ==
                   attachAttempts,
                   authenticated, streamEpoch, l0NextSequence,
                   issuedEpochs, producer, consumer, ring, irqPending,
-                  brokerOwner, brokerRemaining, activeEpoch, expectedSequence,
+                  brokerOwner, activeDrainCallers, brokerRemaining, activeEpoch, expectedSequence,
                   committed, delivered, rejected, lastProducerOwner,
                   lastConsumerOwner>>
 
@@ -279,16 +279,18 @@ SignalInputIrq ==
     /\ UNCHANGED <<rustosReady, policyConsumerReady, installRejected, msixArmed, msixVectorAllocations,
                   attachAttempts,
                   authenticated, streamEpoch, l0NextSequence,
-                  issuedEpochs, producer, consumer, ring, brokerOwner,
+                  issuedEpochs, producer, consumer, ring, brokerOwner, activeDrainCallers,
                   brokerRemaining, activeEpoch, expectedSequence, committed,
                   delivered, rejected, lastProducerOwner, lastConsumerOwner,
                   dvmTamperAttempts>>
 
-BeginBrokerTurn ==
+BeginBrokerTurn(caller) ==
+    /\ caller \in Callers
     /\ rustosReady
     /\ brokerOwner = NoOwner
     /\ consumer < producer
-    /\ brokerOwner' = BrokerOwner
+    /\ brokerOwner' = caller
+    /\ activeDrainCallers' = activeDrainCallers \cup {caller}
     /\ brokerRemaining' = MaxBrokerBatch
     /\ irqPending' = FALSE
     /\ UNCHANGED <<rustosReady, policyConsumerReady, installRejected, msixArmed, msixVectorAllocations,
@@ -313,14 +315,16 @@ ValidEnd(record) ==
 \* every observed slot, including malformed/stale records, so one hostile slot
 \* cannot pin the finite ring. Only exact current-epoch/sequence keys reach
 \* inputd; start/end atomically replace/revoke that epoch's policy state.
-ConsumeSlot ==
-    /\ brokerOwner = BrokerOwner
+ConsumeSlot(caller) ==
+    /\ caller \in Callers
+    /\ brokerOwner = caller
+    /\ activeDrainCallers = {caller}
     /\ brokerRemaining > 0
     /\ consumer < producer
     /\ LET record == ring[Slot(consumer)] IN
        /\ consumer' = consumer + 1
        /\ brokerRemaining' = brokerRemaining - 1
-       /\ lastConsumerOwner' = BrokerOwner
+       /\ lastConsumerOwner' = caller
        /\ IF ValidStart(record)
              THEN /\ activeEpoch' = record.epoch
                   /\ expectedSequence' = 0
@@ -343,13 +347,16 @@ ConsumeSlot ==
     /\ UNCHANGED <<rustosReady, policyConsumerReady, installRejected, msixArmed, msixVectorAllocations,
                   attachAttempts,
                   authenticated, streamEpoch, l0NextSequence,
-                  issuedEpochs, producer, ring, irqPending, brokerOwner,
+                  issuedEpochs, producer, ring, irqPending, brokerOwner, activeDrainCallers,
                   committed, lastProducerOwner, dvmTamperAttempts>>
 
-FinishBrokerTurn ==
-    /\ brokerOwner = BrokerOwner
+FinishBrokerTurn(caller) ==
+    /\ caller \in Callers
+    /\ brokerOwner = caller
+    /\ activeDrainCallers = {caller}
     /\ brokerRemaining = 0 \/ consumer = producer
     /\ brokerOwner' = NoOwner
+    /\ activeDrainCallers' = {}
     /\ brokerRemaining' = 0
     /\ UNCHANGED <<rustosReady, policyConsumerReady, installRejected, msixArmed, msixVectorAllocations,
                   attachAttempts,
@@ -358,6 +365,10 @@ FinishBrokerTurn ==
                   activeEpoch, expectedSequence, committed, delivered,
                   rejected, lastProducerOwner, lastConsumerOwner,
                   dvmTamperAttempts>>
+
+BrokerBegin == \E caller \in Callers: BeginBrokerTurn(caller)
+BrokerConsume == \E caller \in Callers: ConsumeSlot(caller)
+BrokerFinish == \E caller \in Callers: FinishBrokerTurn(caller)
 
 Next ==
     \/ InstallRustosReceiver
@@ -371,9 +382,9 @@ Next ==
     \/ L0End
     \/ DvmTamperAttempt
     \/ SignalInputIrq
-    \/ BeginBrokerTurn
-    \/ ConsumeSlot
-    \/ FinishBrokerTurn
+    \/ BrokerBegin
+    \/ BrokerConsume
+    \/ BrokerFinish
 
 TypeOK ==
     /\ rustosReady \in BOOLEAN
@@ -389,7 +400,8 @@ TypeOK ==
     /\ producer \in Nat /\ consumer \in Nat
     /\ ring \in [RingSlots -> AllRecords \cup {NoRecord}]
     /\ irqPending \in BOOLEAN
-    /\ brokerOwner \in {NoOwner, BrokerOwner}
+    /\ brokerOwner \in {NoOwner} \union Callers
+    /\ activeDrainCallers \subseteq Callers
     /\ brokerRemaining \in 0..MaxBrokerBatch
     /\ activeEpoch \in Epochs \cup {NoEpoch}
     /\ expectedSequence \in 0..MaxSequence
@@ -397,7 +409,7 @@ TypeOK ==
     /\ delivered \in Seq({Key(epoch, seq) : epoch \in Epochs, seq \in 1..MaxSequence})
     /\ rejected \in Seq(AllRecords)
     /\ lastProducerOwner \in {NoOwner, L0Owner}
-    /\ lastConsumerOwner \in {NoOwner, BrokerOwner}
+    /\ lastConsumerOwner \in {NoOwner} \union Callers
     /\ dvmTamperAttempts \in 0..MaxTamperAttempts
 
 CursorBound ==
@@ -421,7 +433,12 @@ AttachRecoveryIsBounded == attachAttempts <= MaxAttachAttempts
 
 SingleWriterOwnership ==
     /\ lastProducerOwner \in {NoOwner, L0Owner}
-    /\ lastConsumerOwner \in {NoOwner, BrokerOwner}
+    /\ lastConsumerOwner \in {NoOwner} \union Callers
+
+SingleFlightDrainOwnership ==
+    /\ Cardinality(activeDrainCallers) <= 1
+    /\ brokerOwner = NoOwner => activeDrainCallers = {}
+    /\ brokerOwner \in Callers => activeDrainCallers = {brokerOwner}
 
 InterruptCannotConsumeOrDecidePolicy ==
     brokerOwner = NoOwner => brokerRemaining = 0
@@ -445,9 +462,9 @@ MalformedDoesNotCreateAuthority ==
 Spec ==
     Init /\ [][Next]_vars
     /\ WF_vars(L0End)
-    /\ WF_vars(BeginBrokerTurn)
-    /\ WF_vars(ConsumeSlot)
-    /\ WF_vars(FinishBrokerTurn)
+    /\ WF_vars(BrokerBegin)
+    /\ WF_vars(BrokerConsume)
+    /\ WF_vars(BrokerFinish)
 
 RingEventuallyDrainsOrRevokes ==
     []((rustosReady /\ consumer < producer) => <>(consumer = producer \/ ~rustosReady))

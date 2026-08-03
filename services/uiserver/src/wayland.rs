@@ -20,7 +20,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError};
+use std::sync::mpsc::{sync_channel, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -53,6 +53,7 @@ use crate::sys::{
     InputEvent, SharedFdMapping, INPUT_ACTION_PRESSED, INPUT_ACTION_RELEASED,
     INPUT_ACTION_REPEATED, INPUT_KIND_KEYBOARD,
 };
+use crate::wayland_accept::{start_wayland_acceptor, WaylandAcceptor};
 
 const WAYLAND_SOCKET_NAME: &str = "wayland-0";
 const WINDOW_CASCADE_X: usize = 42;
@@ -63,9 +64,6 @@ const MAX_WAYLAND_SHM_POOL_BYTES: usize = 64 * 1024 * 1024;
 const MAX_WAYLAND_BUFFER_DIMENSION: usize = 8192;
 const MAX_WAYLAND_BUFFER_PIXELS: usize = MAX_WAYLAND_SHM_POOL_BYTES / 4;
 const MAX_WAYLAND_CLIENT_ACCEPTS_PER_TICK: usize = 8;
-const WAYLAND_ACCEPT_QUEUE_CAPACITY: usize = 16;
-const WAYLAND_ACCEPT_IDLE_RETRY_MS: u64 = 4;
-const WAYLAND_ACCEPT_ERROR_RETRY_MS: u64 = 16;
 const MAX_WAYLAND_CLIENT_DISPATCHES_PER_TICK: usize = 1;
 const MAX_WAYLAND_SURFACES: usize = 64;
 const MAX_WAYLAND_OUTPUT_RESOURCES: usize = 64;
@@ -138,19 +136,12 @@ struct WaylandReadiness {
     needs_rearm: Arc<AtomicBool>,
 }
 
-struct WaylandAcceptor {
-    receiver: Receiver<UnixStream>,
-    running: Arc<AtomicBool>,
-}
-
-impl Drop for WaylandAcceptor {
-    fn drop(&mut self) {
-        self.running.store(false, Ordering::Release);
-    }
-}
-
 impl WaylandCompositor {
-    pub(crate) fn initialize(display_width: u32, display_height: u32) -> Option<Self> {
+    pub(crate) fn initialize(
+        display_width: u32,
+        display_height: u32,
+        ui_wake_sender: UiWakeSender,
+    ) -> Option<Self> {
         let runtime_dir = current_runtime_dir();
         let socket_path = format!("{runtime_dir}/{WAYLAND_SOCKET_NAME}");
         let display = match Display::new() {
@@ -177,7 +168,7 @@ impl WaylandCompositor {
             ));
             return None;
         }
-        let acceptor = match start_wayland_acceptor(listener) {
+        let acceptor = match start_wayland_acceptor(listener, ui_wake_sender) {
             Ok(acceptor) => acceptor,
             Err(err) => {
                 diag_line(format!(
@@ -299,12 +290,24 @@ impl WaylandCompositor {
         }
     }
 
+    /// Whether an external edge authorizes a potentially consuming protocol
+    /// turn. `wayland-server` documents `poll_fd()` as the dispatch authority;
+    /// probing every UI turn would turn an empty nonblocking socket read into
+    /// cross-service VFS/NETD traffic and scheduler churn.
+    pub(crate) fn has_pending_protocol_input(&self) -> bool {
+        self.acceptor.has_pending()
+            || self
+                .readiness
+                .as_ref()
+                .is_some_and(|readiness| readiness.needs_rearm.load(Ordering::Acquire))
+    }
+
     pub(crate) fn tick(&mut self) -> bool {
         let tick_started = Instant::now();
         let accept_started = tick_started;
         let mut accepted = 0_usize;
         while accepted < MAX_WAYLAND_CLIENT_ACCEPTS_PER_TICK {
-            match self.acceptor.receiver.try_recv() {
+            match self.acceptor.try_recv() {
                 Ok(stream) => {
                     accepted = accepted.saturating_add(1);
                     match self
@@ -471,60 +474,6 @@ fn set_fd_nonblocking(fd: i32) -> std::io::Result<()> {
         return Err(std::io::Error::last_os_error());
     }
     Ok(())
-}
-
-fn accept_wayland_client(listener: &UnixListener) -> std::io::Result<UnixStream> {
-    let fd = unsafe {
-        libc::accept4(
-            listener.as_raw_fd(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(unsafe { UnixStream::from_raw_fd(fd) })
-}
-
-fn start_wayland_acceptor(listener: UnixListener) -> std::io::Result<WaylandAcceptor> {
-    let (sender, receiver) = sync_channel(WAYLAND_ACCEPT_QUEUE_CAPACITY);
-    let running = Arc::new(AtomicBool::new(true));
-    let worker_running = Arc::clone(&running);
-    thread::Builder::new()
-        .name(String::from("wayland-accept"))
-        .spawn(move || {
-            require_background_thread_class();
-            while worker_running.load(Ordering::Acquire) {
-                match accept_wayland_client(&listener) {
-                    Ok(stream) => {
-                        if let Err(err) = set_fd_nonblocking(stream.as_raw_fd()) {
-                            diag_line(format!(
-                                "uiserver: accepted wayland client nonblocking failed: {err}"
-                            ));
-                            continue;
-                        }
-                        match sender.try_send(stream) {
-                            Ok(()) => {}
-                            Err(TrySendError::Full(_)) => {
-                                diag_line("uiserver: wayland accept queue full; client rejected");
-                                thread::sleep(Duration::from_millis(WAYLAND_ACCEPT_IDLE_RETRY_MS));
-                            }
-                            Err(TrySendError::Disconnected(_)) => break,
-                        }
-                    }
-                    Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(WAYLAND_ACCEPT_IDLE_RETRY_MS));
-                    }
-                    Err(err) => {
-                        diag_line(format!("uiserver: wayland accept failed: {err}"));
-                        thread::sleep(Duration::from_millis(WAYLAND_ACCEPT_ERROR_RETRY_MS));
-                    }
-                }
-            }
-        })?;
-    Ok(WaylandAcceptor { receiver, running })
 }
 
 fn current_runtime_dir() -> String {
@@ -737,6 +686,7 @@ mod tests {
         assert!(transient_wayland_readiness_error(ErrorKind::TimedOut));
         assert!(!transient_wayland_readiness_error(ErrorKind::InvalidInput));
     }
+
     use crate::canvas::Rect;
     use std::sync::Arc;
 

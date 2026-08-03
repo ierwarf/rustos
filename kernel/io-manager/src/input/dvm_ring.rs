@@ -75,6 +75,10 @@ static CONSUMER_WAKE_GENERATION: AtomicU64 = AtomicU64::new(0);
 /// Non-zero when inputd must observe a revocation barrier before any record
 /// from a later transport generation. The broker consumes this atomically.
 static RESET_PENDING_GENERATION: AtomicU64 = AtomicU64::new(0);
+/// Process capabilities are intentionally process-wide, so two authorized
+/// threads can enter the broker concurrently. The shared consumer cursor has
+/// exactly one linearization owner per drain turn.
+static DRAIN_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static BROKER_CALLS: AtomicU64 = AtomicU64::new(0);
 static RECORDS_COPIED: AtomicU64 = AtomicU64::new(0);
 static REVOKE_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -103,6 +107,24 @@ const DISCOVERY_REJECTION_LENGTH: u8 = 6;
 const DISCOVERY_REJECTION_MAPPING: u8 = 7;
 const DISCOVERY_REJECTION_HEADER: u8 = 8;
 const DISCOVERY_REJECTION_REGION: u8 = 9;
+
+struct DrainGuard;
+
+impl Drop for DrainGuard {
+    fn drop(&mut self) {
+        // ORDERING: Release publishes every cursor/reset mutation before a
+        // later broker caller may become the sole drain owner.
+        DRAIN_IN_PROGRESS.store(false, Ordering::Release);
+    }
+}
+
+fn try_claim_drain(owner: &AtomicBool) -> bool {
+    // ORDERING: AcqRel is the single-consumer admission edge; Acquire on
+    // failure observes that another caller retains cursor/reset custody.
+    owner
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
 
 struct MappedInputRing {
     device: crate::arch::pci::PciDevice,
@@ -305,6 +327,13 @@ pub(crate) fn service_pending(dest: &mut [InputDvmRecordWire]) -> usize {
     if dest.is_empty() {
         return 0;
     }
+    // ORDERING: AcqRel is the one-drain linearization point and observes the
+    // prior owner's cursor publication. A losing caller leaves all records and
+    // reset authority untouched for the admitted owner or a later turn.
+    if !try_claim_drain(&DRAIN_IN_PROGRESS) {
+        return 0;
+    }
+    let _drain_guard = DrainGuard;
     let reset_generation = RESET_PENDING_GENERATION.swap(0, Ordering::AcqRel);
     let mut written = 0;
     if reset_generation != 0 {
@@ -771,6 +800,16 @@ fn write_u64(base: *mut u8, offset: usize, value: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_broker_callers_have_exactly_one_drain_owner() {
+        let owner = AtomicBool::new(false);
+        assert!(try_claim_drain(&owner));
+        assert!(!try_claim_drain(&owner));
+        // ORDERING: Release models the DrainGuard publication between turns.
+        owner.store(false, Ordering::Release);
+        assert!(try_claim_drain(&owner));
+    }
 
     #[test]
     fn policy_consumer_readiness_requires_transport_and_is_idempotent() {

@@ -20,10 +20,24 @@ into an implementation-wide or certification claim.
 | Parser exploration | Rust libFuzzer plus Clang libFuzzer/ASan/UBSan | Bounded coverage-guided executions do not crash the selected Rust and exact Linux-DVM C parsers | Exhaustiveness, sustained corpus quality, or target-device behavior |
 | Instrumented host boundaries | `run-sanitizers.sh` | Every registered critical/high host-testable Rust target passes the pinned address/thread instrumentation profile with a rebuilt matching standard library | Untested target-only assembly, device DMA, or paths outside the registered tests |
 | Dual-ABI reference comparison | `run-abi-differential.sh` | Compiled RustOS Linux/Windows constants and layouts equal native Linux and MinGW/Wine probes, except exact unexpired declared divergences | Complete syscall behavior, undocumented platform behavior, or application compatibility |
+| Native syscall registry | `check-native-syscall-numbers.py` | Every literal `SYS_RUSTOS_*` declaration in the authoritative ABI modules has the native prefix and a globally unique number | Correct dispatch behavior after a unique number is selected or non-native Linux/Windows syscall tables |
 | Recovery scenario matrix | `run-recovery-scenarios.sh` | Every registered checkpoint, service-restart, and storage disruption executes an exact bounded source witness and reaches its declared terminal state | Physical power-cut behavior or unregistered recovery transitions |
 | Source trace replay | `run-runtime-traces.sh` | Concrete runtime-control and successful bounded KVM P0 outcomes conform to registered model actions and topology requirements | Production fleet telemetry or every model transition |
 | Source decision witnesses | `run-source-conformance.sh` | The exact typed count in `docs/ai/formal-contracts.generated.md` executes mapped high-risk lifecycle, RPC, and IPC decisions; a duplicate, missing, renamed, or filtered witness fails the gate | Full transition-system equivalence, concurrency beyond the tested decision, target hardware, or the other registered models |
 | Mutation sensitivity | run-spec-mutations.sh; run-herd.sh; run-implementation-mutations.sh | Each registered TLA+ property/transition mutant is killed by its named invariant and normalized counterexample trace; each herd7 order mutant reaches its exact forbidden outcome; critical/high implementation mutants are killed by an executing witness rather than compile failure | Completeness against every possible mutation, source equivalence, or a production execution of a temporary model mutant |
+
+Exact TLC reuse also reserves five minutes of remaining cache lifetime before a
+PR or SMP iteration begins. This prevents a pass admitted at run start from
+crossing the 24-hour boundary while Kani, mutation, and concurrency lanes finish
+and then failing only at final evidence sealing. The final writer independently
+revalidates the exact inputs and actual age; the reserve never widens the reuse
+window.
+
+After the registry selftest and one proof-index validation, source conformance,
+exact-input TLC, Kani, Verus, mutation, recovery, trace, ABI, and concurrency
+lanes execute as independent fail-closed children. Their outputs are replayed
+only after every child status is collected. Kani and Verus receive the sealed
+proof-index precondition and do not concurrently rewrite its shared summary.
 | Signed evidence | `cargo xtask formal-contracts evidence` | A GPG signature binds the current source tree, registry, exact passed/fresh proof summaries, topology runtime trace, and required boot/DVM binaries | Correctness beyond the recorded evidence or evidence after expiry |
 | Integration | focused Rust tests and bounded DVM/KVM smoke | Concrete owner wiring and observable regression behavior | Exhaustive state exploration |
 
@@ -71,7 +85,12 @@ not a bug. Keep it in `CONFORMANCE.md` until it is resolved.
   its human output into stable summary JSON and SARIF, and fails any harness
   with no satisfied cover witness. Failed runs request Kani concrete playback.
 - The full merge gate is `bash formal/verify-all.sh --profile pr`. It uses no Kani flags that
-  weaken the analysis such as `--ignore-global-asm`.
+  weaken the analysis such as `--ignore-global-asm`. After the source and TLC
+  prerequisites pass, independent mutation, differential, recovery, proof,
+  concurrency, and trace lanes run concurrently in disjoint evidence
+  directories. The parent collects every exact exit status before sealing;
+  concurrency changes wall time only and never skips, weakens, or converts a
+  failed lane into evidence.
 
 Kani stays with bounded parsers, ABI shapes, arithmetic partitions, and narrow
 unsafe-adjacent admission code. Function contracts are not credited merely

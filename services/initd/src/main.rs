@@ -68,7 +68,10 @@ const LOADERD_EXEC_PATH: &str = "services/loaderd/loaderd.elf";
 const RUNTIMED_EXEC_PATH: &str = "services/runtimed/runtimed.elf";
 const STORAGED_EXEC_PATH: &str = "services/storaged/storaged.elf";
 const INPUTD_EXEC_PATH: &str = "services/inputd/inputd.elf";
-const POLL_INTERVAL: Duration = Duration::from_millis(2);
+// Until lifecycle and loader control share one event wait object, keep the
+// supervisor's nonblocking sources on one bounded timer. A 2 ms cadence left
+// an otherwise idle User-class task runnable often enough to crowd the UI.
+const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const RETRY_BACKOFF: Duration = Duration::from_millis(50);
 const ROOTD_LEASE_RECONCILIATION_INTERVAL: Duration = Duration::from_millis(100);
 const ROOTD_LEASE_RECOVERY_TIMEOUT: Duration =
@@ -290,9 +293,9 @@ fn main() {
                         fail_closed_after_children_cleanup(
                             &pending_activations,
                             &format!(
-                            "initd: fatal rootd lease report failed exec={} pid={pid} errno={err}",
-                            entry.exec
-                        ),
+                                "initd: fatal rootd lease report failed exec={} pid={pid} errno={err}",
+                                entry.exec
+                            ),
                         );
                     }
                     boot_line(&format!(
@@ -1231,8 +1234,13 @@ fn boot_line(message: &str) {
 mod tests {
     use super::{
         classify_service_ready_status, cleanup_spawned_service, endpoint_wait_args,
-        exec_weight_micros, RUNTIMED_EXEC_PATH, TASK_WEIGHT_INTERACTIVE_FLAG,
+        exec_weight_micros, POLL_INTERVAL, RUNTIMED_EXEC_PATH, TASK_WEIGHT_INTERACTIVE_FLAG,
     };
+
+    #[test]
+    fn steady_supervisor_poll_is_bounded_without_two_millisecond_churn() {
+        assert_eq!(POLL_INTERVAL, std::time::Duration::from_millis(10));
+    }
 
     #[test]
     fn failed_service_cleanup_accepts_only_exact_retirement_or_esrch() {

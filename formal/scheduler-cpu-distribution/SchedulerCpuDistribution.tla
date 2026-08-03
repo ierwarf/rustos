@@ -4,76 +4,112 @@ EXTENDS Naturals, FiniteSets, Sequences
 (*******************************************************************************
 Owner: kernel-ps scheduler.
 Linearization point: Dispatch charges exactly one CPU turn. A bounded System
-burst reserves a User turn when both classes remain runnable, while a per-task
-ready-age deadline prevents several User tasks from sharing one reservation so
-coarsely that an individual application misses every compositor frame.
+burst reserves a User turn when both classes remain runnable. User selection
+uses charged virtual runtime; a wall-clock deadline without bandwidth admission
+would be unsatisfiable under overload and must not bypass fair-share weights.
+Exact wake and synchronous IPC urgency live in separately bounded handoffs.
+Ordinary picks may retain the last CPU only within a finite virtual-runtime
+lag; locality cannot cross class, affinity, or fairness admission.
 *******************************************************************************)
 
-CONSTANTS Tasks, SystemTasks, UserTasks, MaxSystemBurst, MaxRuntime, MaxUserWait,
-          MaxLatencyBurst, MaxLatencyHints
+CONSTANTS Tasks, SystemTasks, UserTasks, MaxSystemBurst, MaxRuntime, MaxSystemWait,
+          MaxLatencyBurst, MaxLatencyHints, Cpus, MaxLocalityLag
 
 NoTask == "none"
-VARIABLES ready, runtime, readyAge, last, systemBurst, latencyBurst, latencyHints
-vars == <<ready, runtime, readyAge, last, systemBurst, latencyBurst, latencyHints>>
+NoCpu == "no-cpu"
+VARIABLES ready, runtime, readyAge, last, lastCpu, systemBurst, latencyBurst,
+          latencyHints, fairUserPick
+vars == <<ready, runtime, readyAge, last, lastCpu, systemBurst, latencyBurst,
+          latencyHints, fairUserPick>>
 
 Init ==
     /\ ready = Tasks
     /\ runtime = [task \in Tasks |-> 0]
     /\ readyAge = [task \in Tasks |-> 0]
     /\ last = NoTask
+    /\ lastCpu = [task \in Tasks |-> NoCpu]
     /\ systemBurst = 0
     /\ latencyBurst = 0
     /\ latencyHints = <<>>
+    /\ fairUserPick = TRUE
 
-OverdueUsers == {task \in ready \cap UserTasks: readyAge[task] = MaxUserWait}
-OverdueSystems == {task \in ready \cap SystemTasks: readyAge[task] = MaxUserWait}
+OverdueSystems == {task \in ready \cap SystemTasks: readyAge[task] = MaxSystemWait}
+
+LeastRuntimeIn(task, classTasks) ==
+    \A peer \in ready \cap classTasks : runtime[task] <= runtime[peer]
+
+LocalityAdmissible(task, cpu, classTasks) ==
+    /\ lastCpu[task] = cpu
+    /\ \A peer \in ready \cap classTasks:
+           runtime[task] <= runtime[peer] + MaxLocalityLag
+
+LocalityWithinBound(task, cpu, classTasks) ==
+    /\ lastCpu[task] = cpu
+    /\ \A peer \in ready \cap classTasks:
+           runtime[task] <= runtime[peer] + MaxLocalityLag
+
+AdmittedFairPick(task, cpu, classTasks) ==
+    LeastRuntimeIn(task, classTasks) \/ LocalityAdmissible(task, cpu, classTasks)
+
+ObservedFairPick(task, cpu, classTasks) ==
+    LeastRuntimeIn(task, classTasks) \/ LocalityWithinBound(task, cpu, classTasks)
 
 AdvanceReadyAge(dispatched) ==
     [task \in Tasks |->
-        IF task = dispatched \/ task \notin ready
+        IF task = dispatched \/ task \notin ready \/ task \notin SystemTasks
         THEN 0
-        ELSE IF readyAge[task] < MaxUserWait
+        ELSE IF readyAge[task] < MaxSystemWait
              THEN readyAge[task] + 1
-             ELSE MaxUserWait]
+             ELSE MaxSystemWait]
 
-DispatchSystem(task) ==
+ChargeRuntime(task) ==
+    IF runtime[task] < MaxRuntime THEN runtime[task] + 1 ELSE MaxRuntime
+
+DispatchSystem(task, cpu) ==
     /\ task \in ready \cap SystemTasks
+    /\ cpu \in Cpus
     /\ (OverdueSystems = {} \/ task \in OverdueSystems)
     /\ (ready \cap UserTasks = {} \/ systemBurst < MaxSystemBurst)
-    /\ (OverdueSystems # {} \/ OverdueUsers = {})
     /\ (OverdueSystems # {} \/ latencyHints = <<>> \/ latencyBurst = MaxLatencyBurst)
-    /\ runtime' = [runtime EXCEPT ![task] = (@ + 1) % (MaxRuntime + 1)]
+    /\ (OverdueSystems # {} \/ AdmittedFairPick(task, cpu, SystemTasks))
+    /\ runtime' = [runtime EXCEPT ![task] = ChargeRuntime(task)]
     /\ readyAge' = AdvanceReadyAge(task)
     /\ last' = task
+    /\ lastCpu' = [lastCpu EXCEPT ![task] = cpu]
     /\ systemBurst' = IF ready \cap UserTasks = {} THEN 0 ELSE systemBurst + 1
     /\ latencyBurst' = 0
+    /\ fairUserPick' = TRUE
     /\ UNCHANGED <<ready, latencyHints>>
 
-DispatchUser(task) ==
+DispatchUser(task, cpu) ==
     /\ task \in ready \cap UserTasks
+    /\ cpu \in Cpus
     /\ OverdueSystems = {}
-    /\ (OverdueUsers = {} \/ task \in OverdueUsers)
-    /\ (OverdueUsers # {} \/ latencyHints = <<>> \/ latencyBurst = MaxLatencyBurst)
-    /\ runtime' = [runtime EXCEPT ![task] = (@ + 1) % (MaxRuntime + 1)]
+    /\ AdmittedFairPick(task, cpu, UserTasks)
+    /\ runtime' = [runtime EXCEPT ![task] = ChargeRuntime(task)]
     /\ readyAge' = AdvanceReadyAge(task)
     /\ last' = task
+    /\ lastCpu' = [lastCpu EXCEPT ![task] = cpu]
     /\ systemBurst' = 0
     /\ latencyBurst' = 0
+    /\ fairUserPick' = ObservedFairPick(task, cpu, UserTasks)
     /\ UNCHANGED <<ready, latencyHints>>
 
-DispatchLatency ==
+DispatchLatency(cpu) ==
     /\ latencyHints # <<>>
+    /\ cpu \in Cpus
     /\ latencyBurst < MaxLatencyBurst
     /\ OverdueSystems = {}
-    /\ OverdueUsers = {}
     /\ Head(latencyHints) \in ready \cap UserTasks
     /\ LET task == Head(latencyHints) IN
-       /\ runtime' = [runtime EXCEPT ![task] = (@ + 1) % (MaxRuntime + 1)]
+       /\ runtime' = [runtime EXCEPT ![task] = ChargeRuntime(task)]
        /\ readyAge' = AdvanceReadyAge(task)
        /\ last' = task
+       /\ lastCpu' = [lastCpu EXCEPT ![task] = cpu]
     /\ systemBurst' = 0
     /\ latencyBurst' = latencyBurst + 1
     /\ latencyHints' = Tail(latencyHints)
+    /\ fairUserPick' = TRUE
     /\ UNCHANGED ready
 
 QueueLatencyHint(task) ==
@@ -81,13 +117,15 @@ QueueLatencyHint(task) ==
     /\ task \notin {latencyHints[index]: index \in DOMAIN latencyHints}
     /\ Len(latencyHints) < MaxLatencyHints
     /\ latencyHints' = Append(latencyHints, task)
-    /\ UNCHANGED <<ready, runtime, readyAge, last, systemBurst, latencyBurst>>
+    /\ UNCHANGED <<ready, runtime, readyAge, last, lastCpu, systemBurst,
+                    latencyBurst, fairUserPick>>
 
 DropStaleLatencyHint ==
     /\ latencyHints # <<>>
     /\ Head(latencyHints) \notin ready
     /\ latencyHints' = Tail(latencyHints)
-    /\ UNCHANGED <<ready, runtime, readyAge, last, systemBurst, latencyBurst>>
+    /\ UNCHANGED <<ready, runtime, readyAge, last, lastCpu, systemBurst,
+                    latencyBurst, fairUserPick>>
 
 Block(task) ==
     /\ task \in ready
@@ -96,21 +134,25 @@ Block(task) ==
     \* Keep queued hints until the consumer observes that their owner is no
     \* longer runnable.  Eagerly filtering here made DropStaleLatencyHint
     \* unreachable and failed to model the producer/consumer race.
-    /\ UNCHANGED <<runtime, last, systemBurst, latencyBurst, latencyHints>>
+    /\ UNCHANGED <<runtime, last, lastCpu, systemBurst, latencyBurst,
+                    latencyHints, fairUserPick>>
 
 Wake(task) ==
     /\ task \notin ready
     /\ ready' = ready \cup {task}
     /\ readyAge' = [readyAge EXCEPT ![task] = 0]
-    /\ UNCHANGED <<runtime, last, systemBurst, latencyBurst, latencyHints>>
+    /\ UNCHANGED <<runtime, last, lastCpu, systemBurst, latencyBurst,
+                    latencyHints, fairUserPick>>
 
-DispatchAnySystem == \E task \in SystemTasks: DispatchSystem(task)
-DispatchAnyUser == \E task \in UserTasks: DispatchUser(task)
+DispatchAnySystem == \E task \in SystemTasks, cpu \in Cpus: DispatchSystem(task, cpu)
+DispatchAnyUser == \E task \in UserTasks, cpu \in Cpus: DispatchUser(task, cpu)
+DispatchUserTask(task) == \E cpu \in Cpus: DispatchUser(task, cpu)
+DispatchAnyLatency == \E cpu \in Cpus: DispatchLatency(cpu)
 
 Next ==
     \/ DispatchAnySystem
     \/ DispatchAnyUser
-    \/ DispatchLatency
+    \/ DispatchAnyLatency
     \/ \E task \in UserTasks: QueueLatencyHint(task)
     \/ DropStaleLatencyHint
     \/ \E task \in Tasks: Block(task)
@@ -120,22 +162,24 @@ Spec ==
     /\ Init
     /\ [][Next]_vars
     /\ WF_vars(DispatchAnySystem)
-    /\ \A task \in UserTasks: SF_vars(DispatchUser(task))
+    /\ \A task \in UserTasks: SF_vars(DispatchUserTask(task))
     \* A producer can repeatedly make the queue head runnable/unrunnable.
     \* Weak fairness permits that flicker to starve every later hint forever;
     \* the consumer polling contract therefore requires strong fairness for
     \* both consuming a runnable head and dropping an observed stale head.
-    /\ SF_vars(DispatchLatency)
+    /\ SF_vars(DispatchAnyLatency)
     /\ SF_vars(DropStaleLatencyHint)
 
 TypeOK ==
     /\ ready \in SUBSET Tasks
     /\ runtime \in [Tasks -> 0..MaxRuntime]
-    /\ readyAge \in [Tasks -> 0..MaxUserWait]
+    /\ readyAge \in [Tasks -> 0..MaxSystemWait]
     /\ last \in Tasks \cup {NoTask}
-    /\ systemBurst \in 0..MaxSystemBurst
+    /\ lastCpu \in [Tasks -> Cpus \cup {NoCpu}]
+    /\ systemBurst \in Nat
     /\ latencyBurst \in 0..MaxLatencyBurst
     /\ latencyHints \in Seq(UserTasks)
+    /\ fairUserPick \in BOOLEAN
     /\ Len(latencyHints) <= MaxLatencyHints
     /\ \A i, j \in DOMAIN latencyHints:
            i # j => latencyHints[i] # latencyHints[j]
@@ -143,13 +187,12 @@ TypeOK ==
 SystemBurstIsBounded == systemBurst <= MaxSystemBurst
 UserReservationIsBounded == ready \cap UserTasks # {} => systemBurst <= MaxSystemBurst
 CpuAccountingIsBounded == \A task \in Tasks: runtime[task] <= MaxRuntime
-UserReadyAgeIsBounded == \A task \in UserTasks: readyAge[task] <= MaxUserWait
+OnlySystemAccumulatesReadyAge == \A task \in UserTasks: readyAge[task] = 0
+FairUserSelectionUsesRuntime == fairUserPick
 LatencyBurstIsBounded == latencyBurst <= MaxLatencyBurst
 LatencyHintQueueIsBounded == Len(latencyHints) <= MaxLatencyHints
-OverdueUserBlocksSystem ==
-    [] (OverdueUsers # {} /\ OverdueSystems = {} => ~ENABLED DispatchAnySystem)
-OverdueReadyBlocksLatency ==
-    [] (OverdueSystems # {} \/ OverdueUsers # {} => ~ENABLED DispatchLatency)
+OverdueSystemBlocksLatency ==
+    [] (OverdueSystems # {} => ~ENABLED DispatchAnyLatency)
 RunnableUserEventuallyRuns ==
     \A task \in UserTasks:
         [] (task \in ready => <> (task \notin ready \/ last = task))

@@ -50,6 +50,17 @@ print(tomllib.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))["profiles"][s
 PY
 )"
 [[ "$budget_seconds" =~ ^[1-9][0-9]*$ ]] || { echo "invalid TLC wall budget for $profile" >&2; exit 2; }
+seal_reserve_seconds="$(python3 - "$repo_root/formal/contracts.toml" "$profile" <<'PY'
+import sys
+import tomllib
+from pathlib import Path
+print(tomllib.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))["profiles"][sys.argv[2]].get("tlc_seal_reserve_seconds", 0))
+PY
+)"
+[[ "$seal_reserve_seconds" =~ ^[0-9]+$ ]] || {
+    echo "invalid TLC seal reserve for $profile" >&2
+    exit 2
+}
 for model in "${models[@]}"; do
     elapsed=$((SECONDS - started))
     remaining=$((budget_seconds - elapsed))
@@ -58,7 +69,8 @@ for model in "${models[@]}"; do
         exit 124
     }
     if python3 formal/tlc_cache.py \
-        --root "$repo_root" --profile "$profile" --model "$model"; then
+        --root "$repo_root" --profile "$profile" --model "$model" \
+        --min-remaining-seconds "$seal_reserve_seconds"; then
         continue
     fi
     timeout --preserve-status --signal=TERM --kill-after=5 "$remaining" \

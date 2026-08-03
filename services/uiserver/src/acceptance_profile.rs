@@ -6,11 +6,12 @@
 //! Forbidden: unbounded polling, partial token acceptance, duplicate announcements.
 //! Evidence: focused parser test plus the AcceptanceProfilePublication model.
 
-use std::fs;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
+
+use runtime_control::read_bounded_config_snapshot;
 
 use crate::sys::{diag_line, require_background_thread_class, running_on_rustos};
 
@@ -19,6 +20,7 @@ static ANNOUNCED: AtomicBool = AtomicBool::new(false);
 static INITIALIZED: OnceLock<()> = OnceLock::new();
 
 const CONTRACT_PATH: &str = "/system/registry/system/kvm-acceptance-v1.env";
+const CONTRACT_MAX_BYTES: usize = 256;
 const WATCH_INTERVAL: Duration = Duration::from_millis(250);
 const WATCH_LIMIT: Duration = Duration::from_secs(30);
 
@@ -73,7 +75,7 @@ pub(crate) fn start_late_watcher() {
             require_background_thread_class();
             let deadline = Instant::now() + WATCH_LIMIT;
             while Instant::now() < deadline {
-                let enabled = fs::read_to_string(CONTRACT_PATH)
+                let enabled = read_bounded_config_snapshot(CONTRACT_PATH, CONTRACT_MAX_BYTES)
                     .ok()
                     .is_some_and(|contents| exact_contract_enables_profile(&contents));
                 if enabled {

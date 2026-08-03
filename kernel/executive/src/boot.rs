@@ -698,6 +698,7 @@ pub fn housekeeping_once() -> usize {
     // bounded page quantum outside process/handle locks so close, exec, and
     // exit cannot turn into a multi-megabyte allocator critical section.
     work += ps_api::service_deferred_shared_region_reclaims(64);
+    work += ps_api::drain_scheduler_runtime_profile();
 
     trace_service_phase("heartbeat");
     // Emit the once-per-second wall-clock heartbeat outside IRQ context. The

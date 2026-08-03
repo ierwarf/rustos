@@ -655,4 +655,315 @@ mod tests {
             }
         });
     }
+
+    /// Mirrors recoverable grow-down fault handling. Planning and commit take
+    /// only the scheduler owner; page installation takes only process state.
+    /// A concurrent retirement may invalidate the plan, but the transaction
+    /// must still terminate as either an exact metadata commit or task-only
+    /// retirement, never as a half-committed live task.
+    #[test]
+    fn recoverable_stack_growth_never_nests_scheduler_and_process_locks() {
+        loom::model(|| {
+            #[derive(Clone, Copy)]
+            struct SchedulerState {
+                generation: usize,
+                stack_start: usize,
+                retired: bool,
+                committed: bool,
+            }
+            #[derive(Default)]
+            struct ProcessState {
+                reserved: bool,
+                mapped: bool,
+            }
+
+            let scheduler = Arc::new(Mutex::new(SchedulerState {
+                generation: 1,
+                stack_start: 8,
+                retired: false,
+                committed: false,
+            }));
+            let process = Arc::new(Mutex::new(ProcessState {
+                reserved: true,
+                mapped: false,
+            }));
+
+            let fault_scheduler = Arc::clone(&scheduler);
+            let fault_process = Arc::clone(&process);
+            let fault = thread::spawn(move || {
+                // The immutable plan escapes only after the scheduler guard is
+                // dropped. No process-state access occurs in this scope.
+                let plan = {
+                    let scheduler = fault_scheduler.lock().unwrap();
+                    (!scheduler.retired).then_some((scheduler.generation, scheduler.stack_start))
+                };
+                let Some((generation, previous_start)) = plan else {
+                    return;
+                };
+
+                // The mapping phase owns only process state. This scope ends
+                // before scheduler revalidation begins.
+                let mapped = {
+                    let mut process = fault_process.lock().unwrap();
+                    if process.reserved {
+                        process.reserved = false;
+                        process.mapped = true;
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if !mapped {
+                    fault_scheduler.lock().unwrap().retired = true;
+                    return;
+                }
+
+                let mut scheduler = fault_scheduler.lock().unwrap();
+                if !scheduler.retired
+                    && scheduler.generation == generation
+                    && scheduler.stack_start == previous_start
+                {
+                    scheduler.stack_start = previous_start - 1;
+                    scheduler.committed = true;
+                } else {
+                    scheduler.retired = true;
+                }
+            });
+
+            let retire_scheduler = Arc::clone(&scheduler);
+            let retire = thread::spawn(move || {
+                let mut scheduler = retire_scheduler.lock().unwrap();
+                scheduler.retired = true;
+                scheduler.generation += 1;
+            });
+
+            fault.join().unwrap();
+            retire.join().unwrap();
+            let scheduler = scheduler.lock().unwrap();
+            let process = process.lock().unwrap();
+            // A later ordinary retirement may follow a successful commit; it
+            // does not erase the fact that the commit owned a real mapping.
+            assert!(!scheduler.committed || process.mapped);
+            assert!(scheduler.committed || scheduler.retired);
+        });
+    }
+
+    /// Mirrors the exec reservation protocol around a concurrent exit. Exit
+    /// may win before root installation, but once the scheduler installs the
+    /// reserved root the process-state owner transfer is mandatory even when
+    /// `exiting` becomes visible in the transaction gap.
+    #[test]
+    fn exec_installed_root_retains_generation_bound_owner() {
+        loom::model(|| {
+            #[derive(Default)]
+            struct ProcessState {
+                reservation: usize,
+                authorized: bool,
+                exiting: bool,
+                owner_generation: usize,
+            }
+            #[derive(Default)]
+            struct SchedulerState {
+                retired: bool,
+                root_generation: usize,
+            }
+            let process = Arc::new(Mutex::new(ProcessState {
+                owner_generation: 1,
+                ..ProcessState::default()
+            }));
+            let scheduler = Arc::new(Mutex::new(SchedulerState::default()));
+
+            let exec_process = Arc::clone(&process);
+            let exec_scheduler = Arc::clone(&scheduler);
+            let exec = thread::spawn(move || {
+                {
+                    let mut process = exec_process.lock().unwrap();
+                    if process.exiting {
+                        return;
+                    }
+                    process.reservation = 2;
+                    process.authorized = true;
+                }
+                let installed = {
+                    let mut scheduler = exec_scheduler.lock().unwrap();
+                    if scheduler.retired {
+                        false
+                    } else {
+                        scheduler.root_generation = 2;
+                        true
+                    }
+                };
+                if installed {
+                    let mut process = exec_process.lock().unwrap();
+                    assert_eq!(process.reservation, 2);
+                    assert!(process.authorized);
+                    // Deliberately do not reject `exiting`: the installed CR3
+                    // already needs this exact generation-bound owner.
+                    process.owner_generation = 2;
+                    process.reservation = 0;
+                    process.authorized = false;
+                }
+            });
+
+            let exit_process = Arc::clone(&process);
+            let exit_scheduler = Arc::clone(&scheduler);
+            let exit = thread::spawn(move || {
+                exit_process.lock().unwrap().exiting = true;
+                exit_scheduler.lock().unwrap().retired = true;
+            });
+
+            exec.join().unwrap();
+            exit.join().unwrap();
+            let installed = scheduler.lock().unwrap().root_generation == 2;
+            let owner_generation = process.lock().unwrap().owner_generation;
+            assert!(!installed || owner_generation == 2);
+        });
+    }
+
+    /// Mirrors kernel-generated robust-list and clear-child wakes. Userspace
+    /// flags are unavailable at exit, so a stable shared identity is tried
+    /// first and the exact private identity remains the anonymous fallback.
+    #[test]
+    fn kernel_generated_futex_wake_matches_waiter_identity() {
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum Key {
+            Shared,
+            Private,
+        }
+
+        for stable_shared in [false, true] {
+            loom::model(move || {
+                let waiter = Arc::new(Mutex::new(None::<Key>));
+                let registered = Arc::new(AtomicBool::new(false));
+                let cleanup_claimed = Arc::new(AtomicBool::new(false));
+                let woke = Arc::new(AtomicBool::new(false));
+
+                let waiter_slot = Arc::clone(&waiter);
+                let waiter_registered = Arc::clone(&registered);
+                let register = thread::spawn(move || {
+                    *waiter_slot.lock().unwrap() = Some(if stable_shared {
+                        Key::Shared
+                    } else {
+                        Key::Private
+                    });
+                    waiter_registered.store(true, Ordering::Release);
+                });
+
+                let cleanup_slot = Arc::clone(&waiter);
+                let cleanup_registered = Arc::clone(&registered);
+                let cleanup_observed = Arc::clone(&cleanup_claimed);
+                let cleanup_woke = Arc::clone(&woke);
+                let cleanup = thread::spawn(move || {
+                    if !cleanup_registered.load(Ordering::Acquire) {
+                        return;
+                    }
+                    cleanup_observed.store(true, Ordering::Release);
+                    let candidates = if stable_shared {
+                        [Some(Key::Shared), Some(Key::Private)]
+                    } else {
+                        [Some(Key::Private), None]
+                    };
+                    let mut waiter = cleanup_slot.lock().unwrap();
+                    for candidate in candidates.into_iter().flatten() {
+                        if *waiter == Some(candidate) {
+                            *waiter = None;
+                            cleanup_woke.store(true, Ordering::Release);
+                            break;
+                        }
+                    }
+                });
+
+                register.join().unwrap();
+                cleanup.join().unwrap();
+                if cleanup_claimed.load(Ordering::Acquire) {
+                    assert!(woke.load(Ordering::Acquire));
+                    assert!(waiter.lock().unwrap().is_none());
+                }
+            });
+        }
+    }
+
+    /// Mirrors a GPU transport rejection racing the producer's candidate
+    /// compilation. Only an observed rejection owns rollback; when it does,
+    /// both compiler counters return to the exact checkpoint and the next
+    /// successful submit is forced to replay the complete atlas.
+    #[test]
+    fn rejected_gpu_submit_restores_producer_state() {
+        loom::model(|| {
+            #[derive(Clone, Copy)]
+            struct Compiler {
+                next_submit: usize,
+                timeline: usize,
+                force_full: bool,
+            }
+            let compiler = Arc::new(Mutex::new(Compiler {
+                next_submit: 7,
+                timeline: 11,
+                force_full: false,
+            }));
+            let reject = Arc::new(AtomicBool::new(false));
+            let rolled_back = Arc::new(AtomicBool::new(false));
+
+            let transport_reject = Arc::clone(&reject);
+            let transport = thread::spawn(move || {
+                transport_reject.store(true, Ordering::Release);
+            });
+            let submit_compiler = Arc::clone(&compiler);
+            let submit_reject = Arc::clone(&reject);
+            let submit_rollback = Arc::clone(&rolled_back);
+            let submit = thread::spawn(move || {
+                let mut compiler = submit_compiler.lock().unwrap();
+                let checkpoint = (compiler.next_submit, compiler.timeline);
+                compiler.next_submit += 1;
+                compiler.timeline += 1;
+                if submit_reject.load(Ordering::Acquire) {
+                    compiler.next_submit = checkpoint.0;
+                    compiler.timeline = checkpoint.1;
+                    compiler.force_full = true;
+                    submit_rollback.store(true, Ordering::Release);
+                }
+            });
+
+            transport.join().unwrap();
+            submit.join().unwrap();
+            let compiler = compiler.lock().unwrap();
+            if rolled_back.load(Ordering::Acquire) {
+                assert_eq!(compiler.next_submit, 7);
+                assert_eq!(compiler.timeline, 11);
+                assert!(compiler.force_full);
+            }
+        });
+    }
+
+    /// Mirrors the late acceptance watcher after its initial registry miss.
+    /// Multiple observations of the now-complete private contract race through
+    /// one atomic publication and may emit exactly one profiler announcement.
+    #[test]
+    fn late_acceptance_contract_enables_profiler_once() {
+        loom::model(|| {
+            let contract_complete = Arc::new(AtomicBool::new(false));
+            let enabled = Arc::new(AtomicBool::new(false));
+            let announcements = Arc::new(AtomicUsize::new(0));
+
+            // The synchronous initial read missed. Publication then precedes
+            // both bounded watcher observations.
+            contract_complete.store(true, Ordering::Release);
+            let mut watchers = Vec::new();
+            for _ in 0..2 {
+                let contract = Arc::clone(&contract_complete);
+                let enabled = Arc::clone(&enabled);
+                let announcements = Arc::clone(&announcements);
+                watchers.push(thread::spawn(move || {
+                    if contract.load(Ordering::Acquire) && !enabled.swap(true, Ordering::AcqRel) {
+                        announcements.fetch_add(1, Ordering::AcqRel);
+                    }
+                }));
+            }
+            for watcher in watchers {
+                watcher.join().unwrap();
+            }
+            assert!(enabled.load(Ordering::Acquire));
+            assert_eq!(announcements.load(Ordering::Acquire), 1);
+        });
+    }
 }

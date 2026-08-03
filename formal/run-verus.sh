@@ -26,7 +26,9 @@ fi
 cd "$repo_root"
 artifact_dir="${VERUS_ARTIFACT_DIR:-$repo_root/build/formal/verus}"
 mkdir -p "$artifact_dir"
-bash formal/run-proof-index.sh
+if [[ "${FORMAL_PROOF_INDEX_ALREADY_PASSED:-0}" != 1 ]]; then
+    bash formal/run-proof-index.sh
+fi
 mapfile -t cases < <(
     python3 - <<'PY'
 import tomllib

@@ -56,6 +56,10 @@ const SYS_GETPID: u64 = 39;
 const SYS_GETTID: u64 = 186;
 const SESSIOND_IOCTL_WORKERS: usize = 4;
 const SESSIOND_IOCTL_WORKER_QUEUE_CAPACITY: usize = 8;
+static REPLY_FAILURE_DIAGNOSTICS: rustos_svc_runtime::ipc::ReplyFailureDiagnostics =
+    rustos_svc_runtime::ipc::ReplyFailureDiagnostics::new();
+static SESSIOND_REPLY_FAILURE_DIAGNOSTICS: rustos_svc_runtime::ipc::ReplyFailureDiagnostics =
+    rustos_svc_runtime::ipc::ReplyFailureDiagnostics::new();
 
 struct SessiondIoctlWork {
     reply_cap: u64,
@@ -127,11 +131,7 @@ fn sessiond_ioctl_worker(receiver: Receiver<SessiondIoctlWork>) {
     while let Ok(work) = receiver.recv() {
         let reply = reply_device_ioctl(work.reply_cap, &work.request);
         if reply < 0 {
-            let _ = writeln!(
-                std::io::stderr(),
-                "devmgrd: sessiond ioctl reply failed errno={}",
-                -reply
-            );
+            SESSIOND_REPLY_FAILURE_DIAGNOSTICS.record("devmgrd", "sessiond-ioctl", -reply);
         }
     }
 }
@@ -213,7 +213,7 @@ fn serve(endpoint: u64, sessiond_workers: &SessiondIoctlWorkers) {
             }
         };
         if reply < 0 {
-            let _ = writeln!(std::io::stderr(), "devmgrd: reply failed errno={}", -reply);
+            REPLY_FAILURE_DIAGNOSTICS.record("devmgrd", "ipc", -reply);
         }
     }
 }

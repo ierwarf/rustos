@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import tempfile
+import time
 from pathlib import Path
 
 from tlc_cache import validate_cached_summary
@@ -88,6 +89,21 @@ def main() -> int:
 
         write_summary()
         validate_cached_summary(root, "pr", "sample/Sample")
+
+        near_expiry = time.time() - 24 * 3600 + 60
+        os.utime(summary, (near_expiry, near_expiry))
+        validate_cached_summary(root, "pr", "sample/Sample")
+        try:
+            validate_cached_summary(
+                root,
+                "pr",
+                "sample/Sample",
+                min_remaining_seconds=120,
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("TLC cache accepted evidence that expires before sealing")
 
         spec.write_text("---- MODULE Sample ----\nVARIABLE changed\n====\n", encoding="utf-8")
         expect_rejected(root, "a changed specification")

@@ -941,15 +941,11 @@ fn encode_transfer_control_payload(control: &[u8]) -> Result<EncodedControlPaylo
             ));
         }
         let descriptors = super::super::ipc_ops::export_current_fds_for_transfer(fds.as_slice())?;
-        let bytes = unsafe {
-            core::slice::from_raw_parts(
-                descriptors.as_ptr().cast::<u8>(),
-                descriptors.len()
-                    * core::mem::size_of::<kernel_ipc_runtime::api::KernelTransferredHandle>(),
-            )
-        };
+        let tickets =
+            super::super::ipc_ops::transfer_tickets_for_descriptors(descriptors.as_slice())?;
+        let bytes = encode_transfer_tickets(tickets.as_slice())?;
         all_descriptors.extend_from_slice(descriptors.as_slice());
-        Ok(bytes.to_vec())
+        Ok(bytes)
     });
     let bytes = match result {
         Ok(bytes) => bytes,
@@ -965,18 +961,19 @@ fn encode_transfer_control_payload(control: &[u8]) -> Result<EncodedControlPaylo
 }
 
 fn decode_transfer_control_payload(control: &[u8]) -> Result<Vec<u8>, i64> {
-    rewrite_scm_rights_control(control, |descriptor_bytes| {
-        let descriptor_size =
-            core::mem::size_of::<kernel_ipc_runtime::api::KernelTransferredHandle>();
-        if descriptor_size == 0 || descriptor_bytes.len() % descriptor_size != 0 {
+    rewrite_scm_rights_control(control, |ticket_bytes| {
+        if !ticket_bytes
+            .len()
+            .is_multiple_of(TRANSFER_TICKET_WIRE_BYTES)
+        {
             return Err(LINUX_EINVAL);
         }
-        let mut descriptors = Vec::with_capacity(descriptor_bytes.len() / descriptor_size);
-        for chunk in descriptor_bytes.chunks_exact(descriptor_size) {
-            descriptors.push(read_transfer_descriptor(chunk)?);
+        let mut tickets = Vec::with_capacity(ticket_bytes.len() / TRANSFER_TICKET_WIRE_BYTES);
+        for chunk in ticket_bytes.chunks_exact(TRANSFER_TICKET_WIRE_BYTES) {
+            tickets.push(read_transfer_ticket(chunk)?);
         }
-        let fds = super::super::ipc_ops::install_transfer_descriptors_for_current_process(
-            descriptors.as_slice(),
+        let fds = super::super::ipc_ops::install_transfer_tickets_for_current_process(
+            tickets.as_slice(),
         )?;
         let bytes = unsafe {
             core::slice::from_raw_parts(
@@ -989,7 +986,6 @@ fn decode_transfer_control_payload(control: &[u8]) -> Result<Vec<u8>, i64> {
 }
 
 fn decoded_transfer_control_len(control: &[u8]) -> Result<usize, i64> {
-    let descriptor_size = core::mem::size_of::<kernel_ipc_runtime::api::KernelTransferredHandle>();
     let mut total = 0usize;
     let mut offset = 0usize;
     while offset + core::mem::size_of::<linux_abi::LinuxCmsghdr>() <= control.len() {
@@ -1005,10 +1001,10 @@ fn decoded_transfer_control_len(control: &[u8]) -> Result<usize, i64> {
         let visible_len = if header.cmsg_level == linux_abi::SOL_SOCKET as u32
             && header.cmsg_type == linux_abi::SCM_RIGHTS as u32
         {
-            if descriptor_size == 0 || !data_len.is_multiple_of(descriptor_size) {
+            if !data_len.is_multiple_of(TRANSFER_TICKET_WIRE_BYTES) {
                 return Err(LINUX_EINVAL);
             }
-            let fd_bytes = (data_len / descriptor_size)
+            let fd_bytes = (data_len / TRANSFER_TICKET_WIRE_BYTES)
                 .checked_mul(core::mem::size_of::<i32>())
                 .ok_or(LINUX_EINVAL)?;
             core::mem::size_of::<linux_abi::LinuxCmsghdr>()
@@ -1029,8 +1025,7 @@ fn decoded_transfer_control_len(control: &[u8]) -> Result<usize, i64> {
 }
 
 fn drop_encoded_transfer_descriptors(control: &[u8]) -> Result<(), i64> {
-    let descriptor_size = core::mem::size_of::<kernel_ipc_runtime::api::KernelTransferredHandle>();
-    let mut descriptors = Vec::new();
+    let mut tickets = Vec::new();
     let mut offset = 0usize;
     while offset + core::mem::size_of::<linux_abi::LinuxCmsghdr>() <= control.len() {
         let header = read_control_header(&control[offset..])?;
@@ -1046,11 +1041,11 @@ fn drop_encoded_transfer_descriptors(control: &[u8]) -> Result<(), i64> {
         {
             let data_start = offset + core::mem::size_of::<linux_abi::LinuxCmsghdr>();
             let data = &control[data_start..offset + cmsg_len];
-            if descriptor_size == 0 || !data.len().is_multiple_of(descriptor_size) {
+            if !data.len().is_multiple_of(TRANSFER_TICKET_WIRE_BYTES) {
                 return Err(LINUX_EINVAL);
             }
-            for chunk in data.chunks_exact(descriptor_size) {
-                descriptors.push(read_transfer_descriptor(chunk)?);
+            for chunk in data.chunks_exact(TRANSFER_TICKET_WIRE_BYTES) {
+                tickets.push(read_transfer_ticket(chunk)?);
             }
         }
         offset = next;
@@ -1058,7 +1053,7 @@ fn drop_encoded_transfer_descriptors(control: &[u8]) -> Result<(), i64> {
     if offset != control.len() {
         return Err(LINUX_EINVAL);
     }
-    super::super::ipc_ops::drop_transfer_descriptors(descriptors.as_slice());
+    super::super::ipc_ops::drop_transfer_tickets(tickets.as_slice());
     Ok(())
 }
 
@@ -1123,22 +1118,35 @@ fn write_control_header(dest: &mut [u8], header: linux_abi::LinuxCmsghdr) {
     dest[12..16].copy_from_slice(&header.cmsg_type.to_ne_bytes());
 }
 
-fn read_transfer_descriptor(
+const TRANSFER_TICKET_WIRE_BYTES: usize =
+    rustos_user_abi::syscall::IPC_TRANSFER_TICKET_WIRE_BYTES;
+
+fn encode_transfer_tickets(
+    tickets: &[kernel_ipc_runtime::api::KernelTransferTicket],
+) -> Result<Vec<u8>, i64> {
+    let byte_len = tickets
+        .len()
+        .checked_mul(TRANSFER_TICKET_WIRE_BYTES)
+        .ok_or(LINUX_EINVAL)?;
+    let mut bytes = Vec::with_capacity(byte_len);
+    for ticket in tickets {
+        let wire = rustos_user_abi::syscall::IpcTransferTicketWire::new(
+            ticket.transfer_id(),
+            ticket.nonce(),
+        )
+        .ok_or(LINUX_EINVAL)?;
+        bytes.extend_from_slice(&wire.encode());
+    }
+    Ok(bytes)
+}
+
+fn read_transfer_ticket(
     bytes: &[u8],
-) -> Result<kernel_ipc_runtime::api::KernelTransferredHandle, i64> {
-    if bytes.len() != core::mem::size_of::<kernel_ipc_runtime::api::KernelTransferredHandle>() {
-        return Err(LINUX_EINVAL);
-    }
-    let mut descriptor =
-        core::mem::MaybeUninit::<kernel_ipc_runtime::api::KernelTransferredHandle>::uninit();
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            bytes.as_ptr(),
-            descriptor.as_mut_ptr().cast::<u8>(),
-            bytes.len(),
-        );
-        Ok(descriptor.assume_init())
-    }
+) -> Result<kernel_ipc_runtime::api::KernelTransferTicket, i64> {
+    let wire =
+        rustos_user_abi::syscall::IpcTransferTicketWire::decode(bytes).ok_or(LINUX_EINVAL)?;
+    kernel_ipc_runtime::api::KernelTransferTicket::new(wire.transfer_id(), wire.nonce())
+        .ok_or(LINUX_EINVAL)
 }
 
 fn next_control_offset(total_len: usize, offset: usize, cmsg_len: usize) -> Result<usize, i64> {
@@ -1206,7 +1214,10 @@ fn write_current_sockopt_payload(
 
 #[cfg(test)]
 mod tests {
-    use super::{ioctl_is_display_policy_request, is_console_handle};
+    use super::{
+        encode_transfer_tickets, ioctl_is_display_policy_request, is_console_handle,
+        read_transfer_ticket,
+    };
     use crate::multitask;
 
     #[test]
@@ -1239,5 +1250,21 @@ mod tests {
         assert!(!ioctl_is_display_policy_request(
             rustos_user_abi::console::CONSOLE_IOCTL_GET_STATE
         ));
+    }
+
+    #[test]
+    fn transfer_ticket_wire_is_integer_only_exact_and_nonzero() {
+        let ticket = kernel_ipc_runtime::api::KernelTransferTicket::new(7, 11)
+            .expect("valid transfer ticket");
+        let bytes = encode_transfer_tickets(&[ticket]).expect("encode ticket");
+        assert_eq!(read_transfer_ticket(&bytes), Ok(ticket));
+
+        let mut zero_id = bytes.clone();
+        zero_id[..8].fill(0);
+        assert!(read_transfer_ticket(&zero_id).is_err());
+        let mut zero_nonce = bytes.clone();
+        zero_nonce[8..].fill(0);
+        assert!(read_transfer_ticket(&zero_nonce).is_err());
+        assert!(read_transfer_ticket(&bytes[..15]).is_err());
     }
 }

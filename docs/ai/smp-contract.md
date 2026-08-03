@@ -52,8 +52,8 @@ it is never interchangeable with firmware processor UID or APIC ID.
 
 ## 3. CPU lifecycle
 
-Each discovered CPU has a monotonically increasing generation and exactly one
-state:
+The current product envelope admits one boot-static generation per discovered
+CPU and exactly one state:
 
 ```text
 Absent -> Discovered -> Starting -> OnlineParked -> SchedulerReady -> Online
@@ -80,6 +80,13 @@ Online -> Quarantined -> Failed
 No state may be skipped. Publication is release-ordered; observers use acquire
 loads. A stale generation can never acknowledge startup, IPI, TLB, task, or
 retirement work.
+
+CPU hot-unplug and in-boot restart are not implemented. `Quarantined -> Failed`
+is terminal for that boot, and an attempted transition out of `Failed`, reuse
+of generation 1, or a stale-generation transition panics. A future restart
+feature must add `Draining -> Parked -> Offline -> Starting` with a strictly
+new generation and prove mailbox, APIC, timer, run ownership, and TLB cleanup
+before it may weaken this fail-stop contract.
 
 ## 4. Firmware and topology admission
 
@@ -156,18 +163,45 @@ acknowledges the APIC but retains the request for a same-CPU syscall, timer, or
 `cond_resched` safe point. CPU hot-remove is prohibited until this exception is
 replaced by an explicit generation token.
 
+A request made while any raw scheduler/preemption owner is held publishes both
+the local request bit and a global fan-out-pending bit before returning. The
+raw scheduler guard releases the physical lock and its preemption unit first,
+then a post-unlock flusher exchanges the global bit and publishes request bits
+to every `Online` CPU. Only each remote target's 0->1 edge sends an IPI; the
+flusher's own bit is consumed at its return safe point because xAPIC fixed
+self-destination is unsupported. The flusher loops until a concurrent
+publisher leaves no pending epoch, and need not be the original publisher.
+Dropping either the local bit, global custody bit, post-unlock fan-out, or the
+self-notification guard is an invariant failure.
+
 Handlers are allocation-free, non-blocking, and never acquire a sleepable
 lock. They acknowledge the local APIC exactly once. A sender may wait only
 outside raw locks, with a monotonic deadline and direct diagnostic on expiry.
 
+NMI uses a dedicated per-CPU IST stack distinct from double fault and machine
+check. Its handler is a fixed emergency marker/return leaf: it does not acquire
+the debug lock, scheduler, process state, allocator, or any lock that the
+interrupted context may hold. General-protection and page-fault diagnostics
+record only scalar vector/error/RIP/RSP values; they never dereference the
+untrusted saved user RSP or probe diagnostic memory from exception context.
+
 Each online CPU owns its local clockevent. Global time remains a validated
 monotonic clocksource; clockevent delivery and timekeeping are separate.
 Scheduling quantum is time-based and does not shrink as CPU count increases.
+Invariant-TSC capability establishes rate stability, not cross-CPU offset.
+Therefore raw TSC is a global monotonic source only for a one-CPU topology;
+SMP uses a validated 64-bit HPET. TSC frequency remains available for local
+TSC-deadline clockevents. SMP TSC timekeeping may be admitted only after an AP
+rendezvous measures and publishes bounded per-CPU offsets/skew and migration
+tests prove normalized monotonicity.
 
 ## 7. Scheduler and task ownership
 
-Each online CPU owns one run queue and at most one current task. Each live task
-is in exactly one state:
+The target per-CPU design gives each online CPU one run queue and at most one
+current task. The present release candidate still has a serialized global
+ready table plus per-CPU current ownership; it must satisfy the same exact-one
+state partition, but does not satisfy the scalability acceptance gate. Each
+live task is in exactly one state:
 
 ```text
 Running(cpu, generation)
@@ -184,7 +218,7 @@ Wake-before-block retains the existing arm/recheck/commit guarantee across
 CPUs. Migration uses an exact epoch; a stale dequeue, wake, timer, IPI, or
 retirement event cannot revive or duplicate a task.
 
-Initial load balancing is conservative:
+Per-CPU load balancing is introduced conservatively:
 
 - enqueue locally when affinity and capacity allow;
 - wake on the last CPU when it is online and permitted;
@@ -192,6 +226,33 @@ Initial load balancing is conservative:
 - rebalance only at bounded points, never by a global scan in every tick;
 - preserve existing System/User fairness and donation semantics globally;
 - affinity masks are validated against the admitted online set.
+
+During the serialized-dispatch transition, the exact last CPU is already
+retained as scheduler policy metadata. Ordinary fair picks may prefer a
+same-class candidate local to the invoking CPU only while its virtual runtime
+is within one minimum-granularity unit of the class-global minimum. A larger
+lag forces the global minimum. Strict ready-age recovery, exact activation and
+IPC handoffs, affinity, idle ownership, and foreign-running-owner exclusion
+precede this tie-break. Slot retirement clears the history; profiler locality
+state is separate and can never become scheduling authority.
+
+The serialized ready scanner excludes a slot owned by `Current(cpu)` or
+`Transition(cpu)` on any CPU before reading or restoring its saved frame. A
+same-CPU current-slot exception is not sufficient: a foreign CPU owns that
+stack and register image just as exclusively. Exec keeps its current target
+non-ready until the matching process and scheduler generations are published.
+
+Until the per-CPU run-queue transition is complete, the serialized dispatcher
+must still avoid replaying task-specific architecture state on a same-task
+turn. A scheduling result carries its exact source and destination slots:
+different slots require CR3/TSS/syscall-stack/segment/FS/GS restoration, while
+equal slots retain the already-active state. SIMD restore remains mandatory on
+both paths because compiler-generated ring0 code may use vector registers
+after the save boundary. Address-space activation separately skips a CR3 write
+when the requested root equals the CPU's release-published active root. This
+does not replace shootdown: every page-table mutation still flushes all exact
+generation targets, and AP Online admission still performs its mandatory CR3
+reload to close the parked translation window.
 
 Stealing a task acquires queues in ascending `CpuIndex` order or uses a
 single-owner transfer protocol. Waiting for an IPI while holding either queue
@@ -301,10 +362,11 @@ Activation is a scheduler transaction, not a replaceable optimization hint:
 - later child activations, loader replies, and ordinary IPC donation cannot
   overwrite an older activation;
 - retirement removes only the exact stale slot and preserves survivor order;
-- the absolute 2 ms per-task ready-age gate runs before the activation FIFO
-  and does not consume it, so boot handoff cannot suspend global fairness;
-- absent an overdue task, the oldest live activation receives its first turn
-  before unrelated latency or IPC hints.
+- the strict-System 2 ms ready-age gate may run before the activation FIFO but
+  does not consume it, so boot handoff cannot suspend admitted recovery;
+- absent an overdue System continuation, the oldest live activation receives
+  its first turn before unrelated latency or IPC hints. User progress remains
+  a bounded-burst plus charged-vruntime property, not an unadmitted deadline.
 
 This uses the same explicit queue ownership found in the seL4 scheduler
 (runnable peers are FIFO within priority) and Linux dispatch queues (a task is
@@ -323,6 +385,10 @@ completed the exact terminal reply for the work that justified that class:
 - vfsd demotes only after the handle-bearing uiserver snapshot reply succeeds;
 - a failed, cancelled, or rejected reply retains the server's base class so
   recovery and diagnostics cannot be stranded behind ordinary User work;
+- successful self-demotion also caps clone-inherited permanent fair weight at
+  the nominal user share without raising a lower weight; temporary synchronous
+  service urgency remains reply-scoped rather than becoming a base-weight
+  privilege;
 - the scheduler's reply-scoped donation remains independent and is still
   revoked by the exact reply/cancellation lifecycle.
 
@@ -361,7 +427,39 @@ seL4 MCS reply objects, which explicitly track and return the caller's donated
 scheduling context. The executable refinement is
 `formal/synchronous-ipc-handoff/SynchronousIpcHandoff.tla`.
 
-### 7.6 Kernel-derived endpoint priority ordering
+### 7.6 Fused reply-receive phase and scheduler custody
+
+A byte-only single-endpoint service may use one kernel entry to finish its
+current call and wait for the next one, matching the `ReplyRecv` shape exposed
+by seL4 while preserving RustOS sender identity and deadline semantics:
+
+- wire version, reserved fields, endpoint process ownership, response bytes,
+  next-request capacity, and all copyout ranges are checked while the current
+  reply capability remains live;
+- reply completion is the commit point: only a successful one-shot consume may
+  release donation, wake the exact caller, and publish its synchronous FIFO
+  handoff;
+- the receive half uses the existing endpoint check-arm-recheck transition. A
+  committed block performs the handoff immediately; a message already queued
+  requests one syscall-tail handoff without an intermediate ring3 receive trap;
+- normal errno means pre-commit and a disjoint native error tag means the reply
+  committed before receive failed. Ring3 may make one standalone recovery
+  attempt only for the proven pre-commit live cap; it never retries a tagged
+  completed cap. Reserved or out-of-range result values are fatal ABI
+  violations rather than guessed retry states;
+- handle transfer is not implicit. A service requiring attached handles stays
+  on the separate handle-aware reply and receive operations;
+- a dequeued malformed request is still a live caller obligation and must get a
+  terminal error reply rather than being abandoned until timeout.
+- a service may fuse the next receive only when the completed reply has no
+  immediate cleanup or authority transition behind it. Loaderd therefore
+  keeps spawn cleanup and bootstrap demotion on the split path, but fuses its
+  byte-only no-post-action requests; zero-byte calls are malformed obligations.
+
+The executable phase refinement is
+`formal/ipc-reply-recv-transaction/IpcReplyRecvTransaction.tla`.
+
+### 7.7 Kernel-derived endpoint priority ordering
 
 Synchronous service endpoints deliver calls in two FIFO lanes so a live
 System dependency cannot remain behind an unrelated ordinary backlog:
@@ -390,7 +488,7 @@ two-System/one-User scheduler contract. The executable refinement is
 `formal/ipc-priority-queue/IpcPriorityQueue.tla`; its semantic mutant removes
 the System-first guard and must be rejected by TLC.
 
-### 7.7 Atomic startup-cohort activation
+### 7.8 Atomic startup-cohort activation
 
 Post-init boot must not serialize independent suspended siblings by handing
 the CPU to the first child before the rest are runnable. Initd owns cohort
@@ -438,28 +536,37 @@ continues to prove general FIFO first-turn custody after publication.
 Every address space owns:
 
 - a monotonically increasing TLB generation;
-- an acquire/release active-CPU mask;
+- scheduler/process-generation references that keep the unique
+  `ProcessAddressSpace` alive;
+- an acquire/release per-CPU active-root publication;
 - a bounded shootdown token containing address-space identity, generation,
   range/full mode, target mask, and acknowledgement mask;
 - deferred physical-frame reclamation tied to the acknowledged generation.
 
-The required mutation sequence is:
+The required mutation/retirement sequence is:
 
 1. validate the entire mapping operation and reserve fallible bookkeeping;
 2. mutate PTEs and advance the address-space generation under its mutation
    lock;
-3. snapshot the active CPU mask;
-4. publish the token, release the mutation/raw lock, and send typed IPIs;
-5. invalidate locally and on every target;
-6. wait outside raw locks for generation-matched acknowledgements;
-7. reclaim page-table or mapped frames only after all required CPUs
+3. for retirement, first prove every task/slot/process reference has been
+   detached and no CPU can publish that root again;
+4. conservatively snapshot every shootdown-eligible CPU, not only CPUs whose
+   active-root observation currently matches—the IRQ activation path cannot
+   take the sender's mutation lock;
+5. publish the token, release the mutation/raw lock, and send typed IPIs;
+6. invalidate locally and on every target;
+7. wait outside raw locks for generation-matched acknowledgements;
+8. reclaim page-table or mapped frames only after all required CPUs
    acknowledge.
 
 Range invalidation may be selected only by a measured threshold. Correctness
 never depends on that threshold. Timeout, stale acknowledgement, generation
 wrap, target disappearance, token reuse, or reclaim-before-ack is an internal
 memory-isolation failure and panics. An address space cannot be destroyed while
-its active mask or shootdown obligations are non-empty.
+any live reference, active-root owner, or shootdown obligation remains. A root
+in `Retiring` or `Reclaimed` cannot acquire a new reference or be activated;
+future activation after reclaim is an invariant panic, not a stale scheduler
+event to tolerate.
 
 ## 9. Process, exec, exit, futex, and ABI
 
@@ -472,20 +579,23 @@ queues, timers, IPC donation, and current/ready ownership on every CPU.
   performs final shootdown, and only then reclaims the address space.
 - Exec uses the same sibling-retirement barrier before replacing mappings or
   ABI state.
-- Recoverable grow-down faults use scheduler-plan, nonblocking process-apply,
-  then scheduler-commit. The scheduler raw owner and `ProcessStateLock` never
-  overlap. Apply contention retires only the faulting task. If a remote
-  retire/exec invalidates the immutable plan after pages were installed, the
-  scheduler commit rejects it and retires that task; the installed anonymous
-  pages remain owned by the process address space, remain covered by the
-  process-wide `[stack]` VMA, block overlapping allocation through the mapped
-  region registry, and are reclaimed at process teardown. No sibling receives
-  the rejected task's expanded scheduler stack metadata.
-- Scheduler commit never enters the sleepable process-state lock. Exec first
-  seals and quiesces the process, commits scheduler-only identity/root/thread
-  metadata under the raw scheduler lock, releases it, then performs the
-  process-state replacement. Failure after scheduler commit is an invariant
-  panic; it is never exposed as a recoverable half-exec.
+- The release stack profile eagerly maps every usable stack page above one
+  permanent guard page before the task becomes runnable. Consequently a valid
+  stack access does not enter `ProcessStateLock` from page-fault context. A
+  future lazy-growth profile must use immutable task/generation plans and a
+  `FaultDeferred` worker retry; transient lock contention may never be
+  reclassified as retirement. Only an already-published retirement or stale
+  generation may terminate that retry.
+- Exec seals siblings and keeps the target non-runnable. Under
+  `ProcessStateLock` it swaps process/FD/mm-generation ownership, then acquires
+  the raw scheduler owner to publish the matching root/context generation and
+  runnable edge. The old process-state bundle remains retained through both
+  publications. Only after the scheduler publication and release of
+  `ProcessStateLock` may its address space enter shootdown and reclamation.
+  `ProcessStateLock -> Scheduler` is the one named exec exception to the normal
+  disjoint-lock rule; `Scheduler -> ProcessStateLock` remains forbidden.
+  Failure after either publication is an invariant panic, never a recoverable
+  half-exec.
 - Linux per-thread state is protected by its own fixed-slot, generation/TID
   checked raw lock. A raw mutable pointer into scheduler `TaskContext` may not
   escape scheduler serialization. Process-state callers take
@@ -565,6 +675,9 @@ vector unmasked and the CPU allowed Online. Interrupt entry rearms a strictly
 future deadline before scheduler work, never changes the BSP PIT divisor, and
 uses local APIC EOI. Missing prerequisites fail AP admission rather than
 silently creating a non-preemptible CPU.
+The same calibrated TSC rate does not authorize global SMP timekeeping; until
+offset/skew admission exists, `clocksource-deadline` requires HPET for every
+multi-CPU topology.
 
 ## 10. Locking and memory ordering
 
