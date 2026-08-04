@@ -345,6 +345,21 @@ its own refinement model for `V5-FORMAL-SCHED-019`, and landing a partial
 version without that validation would repeat the per-slot owner-word mistake
 recorded above, which passed every unit test and only failed in KVM.
 
+**Size it against acquisitions, not dispatches.** Dispatch counts undercount
+the contention badly. A guard-acquisition counter now reports **76,738
+acquisitions per second against 4,198 dispatches** in the same window, so the
+lock is taken roughly eighteen times more often than it makes a scheduling
+decision. The remainder is non-dispatch traffic on the same lock: `wake_task`,
+pick-hint publication, IPC donation, affinity, and lifecycle.
+
+This changes the plan. The audit's patch E is written around dispatch
+selection, and sharding only the dispatch path would leave the large majority
+of acquisitions on the global lock and would not deliver the expected relief.
+Whatever is built has to move the wake and hint paths off the global lock too,
+or measure first which of those callers dominate. The acquisition counter is
+emitted in `kernel-scheduler-phase-select` arg1 low half specifically so that
+breakdown can be taken before any code is moved.
+
 ### The uiserver owner findings do not reproduce as described
 
 `V5-GPU-UI-OWNER-014` states that `GpuCompositor::present` performs a full

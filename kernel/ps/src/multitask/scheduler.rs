@@ -407,6 +407,7 @@ pub(super) struct Scheduler {
     /// scheduling authority and must never influence affinity or selection.
     runtime_profile_last_cpu: [u8; MAX_TASK],
     runtime_profile_last_task_id: [u64; MAX_TASK],
+    runtime_profile_lock_acquisitions: u64,
     runtime_profile_lock_wait_ns: u64,
     runtime_profile_lock_hold_ns: u64,
     runtime_profile_lock_wait_max_ns: u64,
@@ -469,6 +470,7 @@ impl Scheduler {
             runtime_profile_cross_cpu_migrations: 0,
             runtime_profile_last_cpu: [NO_IDLE_CPU; MAX_TASK],
             runtime_profile_last_task_id: [0; MAX_TASK],
+            runtime_profile_lock_acquisitions: 0,
             runtime_profile_lock_wait_ns: 0,
             runtime_profile_lock_hold_ns: 0,
             runtime_profile_lock_wait_max_ns: 0,

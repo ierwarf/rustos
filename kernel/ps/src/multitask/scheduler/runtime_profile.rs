@@ -67,6 +67,10 @@ pub(in crate::multitask) struct SchedulerRuntimeProfile {
     pub(in crate::multitask) task_switches: u64,
     pub(in crate::multitask) address_space_switches: u64,
     pub(in crate::multitask) cross_cpu_migrations: u64,
+    /// Guard acquisitions, which is the figure the global dispatch lock is
+    /// actually contended on. Dispatch decisions undercount it: lifecycle,
+    /// wake, and affinity paths take the same lock without dispatching.
+    pub(in crate::multitask) lock_acquisitions: u64,
     pub(in crate::multitask) lock_wait_ns: u64,
     pub(in crate::multitask) lock_hold_ns: u64,
     pub(in crate::multitask) lock_wait_max_ns: u64,
@@ -200,8 +204,8 @@ pub fn drain_scheduler_runtime_profile() -> usize {
                 / 1_000,
         ),
     );
-    // arg0=(select vruntime, select handoff), arg1=(select pick, summed
-    // local runnable candidates across the window).
+    // arg0=(select vruntime, select handoff), arg1=(select pick, guard
+    // acquisitions across the window).
     crate::debug::record_milestone(
         crate::debug::LogCategory::Sched,
         "kernel-scheduler-phase-select",
@@ -211,7 +215,7 @@ pub fn drain_scheduler_runtime_profile() -> usize {
         ),
         pack_u32_pair(
             profile.phase_ns[SchedulerPhase::SelectPick as usize] / 1_000,
-            profile.runnable_samples,
+            profile.lock_acquisitions,
         ),
     );
     // arg0=(commit, architectural restore), arg1=(attributed total, hold total).
@@ -314,6 +318,8 @@ impl Scheduler {
     }
 
     pub(in crate::multitask) fn record_runtime_profile_lock_wait(&mut self, elapsed_ns: u64) {
+        self.runtime_profile_lock_acquisitions =
+            self.runtime_profile_lock_acquisitions.saturating_add(1);
         self.runtime_profile_lock_wait_ns =
             self.runtime_profile_lock_wait_ns.saturating_add(elapsed_ns);
         self.runtime_profile_lock_wait_max_ns =
@@ -369,6 +375,7 @@ impl Scheduler {
             task_switches: self.runtime_profile_task_switches,
             address_space_switches: self.runtime_profile_address_space_switches,
             cross_cpu_migrations: self.runtime_profile_cross_cpu_migrations,
+            lock_acquisitions: self.runtime_profile_lock_acquisitions,
             lock_wait_ns: self.runtime_profile_lock_wait_ns,
             lock_hold_ns: self.runtime_profile_lock_hold_ns,
             lock_wait_max_ns: self.runtime_profile_lock_wait_max_ns,
@@ -404,6 +411,7 @@ impl Scheduler {
         self.runtime_profile_task_switches = 0;
         self.runtime_profile_address_space_switches = 0;
         self.runtime_profile_cross_cpu_migrations = 0;
+        self.runtime_profile_lock_acquisitions = 0;
         self.runtime_profile_lock_wait_ns = 0;
         self.runtime_profile_lock_hold_ns = 0;
         self.runtime_profile_lock_wait_max_ns = 0;
@@ -499,6 +507,7 @@ mod tests {
             task_switches: 0,
             address_space_switches: 0,
             cross_cpu_migrations: 0,
+            lock_acquisitions: 0,
             lock_wait_ns: 0,
             lock_hold_ns: 0,
             lock_wait_max_ns: 0,
