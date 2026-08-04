@@ -40,10 +40,9 @@ mod dependency_graph;
 #[cfg(rustos_boot_image)]
 use dependency_graph::{
     DEPENDENCIES, VALIDATED_RAW_EDGES, VALIDATED_TASK_EDGES, dependency_reaches,
-    edge_already_validated, irq_dependency_conflicts, mark_class_irq_unsafe,
-    publish_validated_edge, record_irq_usage,
+    edge_already_validated, irq_dependency_conflicts, publish_validated_edge, record_irq_usage,
 };
-#[cfg(any(rustos_boot_image, test))]
+#[cfg(test)]
 use dependency_graph::graph_reaches;
 #[cfg(rustos_boot_image)]
 mod raw_diag;

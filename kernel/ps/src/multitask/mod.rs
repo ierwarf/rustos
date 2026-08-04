@@ -1,6 +1,7 @@
 mod context;
 mod cpu_local;
 mod current;
+mod current_identity;
 mod deferred_wake;
 mod irq;
 mod process_state_lock;
@@ -40,7 +41,8 @@ pub use self::current::{
     activate_suspended_user_tasks_with_commit, any_user_process_state, arm_block_current_task,
     attach_reserved_ipc_priority, bind_ipc_priority_to_process_worker, bind_reserved_ipc_priority,
     cancel_block_current_task, cancel_ipc_priority_reservation, complete_retired_task_cleanup,
-    current_console_session, current_linux_thread_state, current_task_id, current_user_abi,
+    current_console_session, current_linux_thread_state, current_task_id,
+    current_thread_may_have_pending_signals, current_user_abi,
     current_user_address_space, current_user_id, current_user_log_ids, current_user_process_id,
     current_user_process_thread_count, current_user_snapshot, current_user_stack_state,
     current_user_thread_id, current_user_wait_binding, demote_current_user_task_to_user_class,

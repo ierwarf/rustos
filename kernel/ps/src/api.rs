@@ -28,7 +28,7 @@ pub use crate::multitask::{
     attach_reserved_ipc_priority, bind_ipc_priority_to_process_worker, bind_reserved_ipc_priority,
     cancel_block_current_task, cancel_ipc_priority_reservation,
     commit_block_current_task_and_yield, complete_retired_task_cleanup, current_linux_thread_state,
-    current_user_address_space, current_user_process_thread_count, current_user_stack_state,
+    current_thread_may_have_pending_signals, current_user_address_space, current_user_process_thread_count, current_user_stack_state,
     current_user_thread_id, current_user_wait_binding, demote_current_user_task_to_user_class,
     drain_scheduler_runtime_profile, exec_current_user_process, exec_user_process_by_pid,
     exit_current_user_process, exit_current_user_task, inherit_ipc_priority,

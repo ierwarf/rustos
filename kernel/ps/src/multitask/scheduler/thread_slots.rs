@@ -114,6 +114,7 @@ impl Scheduler {
             entry: super::super::noop_task_entry,
             id: reservation.id,
         });
+        self.publish_slot_identity(slot);
         self.install_linux_thread_state(
             slot,
             bootstrap.linux_thread_state.map(|_| reservation.id),

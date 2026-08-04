@@ -79,6 +79,70 @@ static SCHEDULER_OWNER_SLOT: AtomicUsize = AtomicUsize::new(0);
 static SCHEDULER_OWNER_ACQUIRED_NS: AtomicU64 = AtomicU64::new(0);
 static SCHEDULER_OWNER_CALLER: AtomicPtr<Location<'static>> = AtomicPtr::new(ptr::null_mut());
 
+// Per-site acquisition census.
+//
+// The lock is acquired far more often than it dispatches, and the excess is
+// non-dispatch traffic: wake, pick hints, donation, affinity, and lifecycle.
+// Sharding only the dispatch path would therefore leave most acquisitions
+// behind, so the per-CPU migration has to be aimed with a per-caller count
+// rather than with the dispatch total.
+//
+// This is an atomic side table, not lock state: it is updated before the guard
+// exists and adds a bounded linear probe, never an allocation or a second lock.
+const ACQUIRE_SITE_SLOTS: usize = 64;
+static ACQUIRE_SITE_CALLERS: [AtomicPtr<Location<'static>>; ACQUIRE_SITE_SLOTS] =
+    [const { AtomicPtr::new(ptr::null_mut()) }; ACQUIRE_SITE_SLOTS];
+static ACQUIRE_SITE_COUNTS: [AtomicU64; ACQUIRE_SITE_SLOTS] =
+    [const { AtomicU64::new(0) }; ACQUIRE_SITE_SLOTS];
+static ACQUIRE_SITE_OVERFLOW: AtomicU64 = AtomicU64::new(0);
+
+/// Charges one acquisition to its caller.
+fn record_acquire_site(caller: &'static Location<'static>) {
+    let key = caller as *const Location<'static> as *mut Location<'static>;
+    for slot in 0..ACQUIRE_SITE_SLOTS {
+        // ORDERING: Acquire observes a claim published by whichever CPU first
+        // registered this site.
+        let current = ACQUIRE_SITE_CALLERS[slot].load(Ordering::Acquire);
+        if current == key {
+            ACQUIRE_SITE_COUNTS[slot].fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        if current.is_null()
+            // ORDERING: Release publishes the claim before its count is used.
+            && ACQUIRE_SITE_CALLERS[slot]
+                .compare_exchange(ptr::null_mut(), key, Ordering::Release, Ordering::Acquire)
+                .is_ok()
+        {
+            ACQUIRE_SITE_COUNTS[slot].fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    }
+    ACQUIRE_SITE_OVERFLOW.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Takes the census so far, clearing counts for the next window.
+///
+/// Called outside the scheduler owner; it never blocks a dispatch.
+pub(super) fn take_acquire_site_census() -> ([(&'static str, u32, u64); ACQUIRE_SITE_SLOTS], u64) {
+    let mut census = [("", 0_u32, 0_u64); ACQUIRE_SITE_SLOTS];
+    for slot in 0..ACQUIRE_SITE_SLOTS {
+        let count = ACQUIRE_SITE_COUNTS[slot].swap(0, Ordering::Relaxed);
+        if count == 0 {
+            continue;
+        }
+        // ORDERING: Acquire pairs with the claim publication above.
+        let caller = ACQUIRE_SITE_CALLERS[slot].load(Ordering::Acquire);
+        if caller.is_null() {
+            continue;
+        }
+        // SAFETY: `Location::caller` returns a static allocation that outlives
+        // every observer of this table.
+        let caller = unsafe { &*caller };
+        census[slot] = (caller.file(), caller.line(), count);
+    }
+    (census, ACQUIRE_SITE_OVERFLOW.swap(0, Ordering::Relaxed))
+}
+
 pub(super) fn scheduler_initialized() -> bool {
     // ORDERING: Acquire observes reset, every AP idle context, and BSP current
     // execution preparation published before the one-way Release below.
@@ -222,6 +286,7 @@ pub(super) unsafe fn scheduler_mut() -> SchedulerAccessGuard {
         logical_index == 0 || CURRENT_TASK_ACTIVE[logical_index].load(Ordering::Acquire),
         "scheduler invariant: AP entered before current-task admission"
     );
+    record_acquire_site(caller);
     let started_at = crate::arch::clock::monotonic_nanos();
     let mut deadline_poll_spins: u32 = 0;
     let mut guard = SCHEDULER
@@ -396,6 +461,19 @@ pub(super) fn current_cpu_task_is_idle(logical_index: usize) -> bool {
 /// Reports whether the calling CPU may safely enter current-task snapshot
 /// paths. Early AP boot and panic/log formatting use this as a non-blocking
 /// authority check before touching the scheduler lock.
+/// The slot the asking CPU is currently running, or `None` when the slot has
+/// not been admitted yet. Callers must already have interrupts masked, which
+/// is what keeps the answer from changing underneath them.
+pub(super) fn current_cpu_task_slot() -> Option<usize> {
+    if !current_cpu_task_slot_admitted() {
+        return None;
+    }
+    let logical_index = nucleus_core::util::lockdep::current_cpu_index();
+    // ORDERING: Acquire pairs with the current-slot publication in dispatch
+    // and in `publish_cpu_current_task`.
+    Some(CURRENT_TASK_SLOTS.get(logical_index)?.load(Ordering::Acquire))
+}
+
 pub(super) fn current_cpu_task_slot_admitted() -> bool {
     let logical_index = nucleus_core::util::lockdep::current_cpu_index();
     logical_index < CURRENT_TASK_ACTIVE.len()

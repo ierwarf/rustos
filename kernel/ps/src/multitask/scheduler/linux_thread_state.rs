@@ -228,6 +228,9 @@ impl Scheduler {
                 return false;
             }
             thread_state.pending_signals |= signal_bit;
+            // The hint must be raised after the state it advertises and while
+            // the scheduler lock still excludes the syncing reader.
+            super::super::current_identity::raise_signal_pending(slot);
             thread_state.signal_mask & signal_bit == 0
         };
 

@@ -439,12 +439,90 @@ design rather than reading the implementation:
 
 Read the code before trusting a name-based search against this audit.
 
+### SCHED-GLOBAL-001: what the acquisition census actually proved
+
+The audit called for a per-CPU runqueue to replace global dispatch
+serialization. Measuring the callers first changed the shape of the fix, and
+the measurement is reproducible from the milestones described below.
+
+`Scheduler::scheduler_mut` records its `#[track_caller]` caller into a 64-slot
+census (`kernel/ps/src/multitask/cpu_local.rs`), and the once-per-second
+runtime profile emits the top four as `kernel-scheduler-acquire-0..3`
+milestones, packing an FNV-1a32 hash of the caller file in the high half of
+`arg1` and the line in the low half. Milestones are required here: the ordinary
+`debug::info!` channel does not reach the debug transport in the product
+configuration, so a census emitted through it produced no output at all and
+briefly read as a broken counter.
+
+The result at 8 vCPU: the dominant callers were not dispatch. They were
+read-only identity queries about the task already running on the asking CPU,
+issued by syscall entry and return, and `scheduler_ref()` is literally
+`scheduler_mut()`, so each one took the exclusive global lock:
+
+| caller | acquisitions/s |
+| --- | --- |
+| `current.rs` `current_task_id` | 68302 |
+| `current.rs` `retain_current_user_process_binding` | 58504 |
+| `current.rs` `current_user_abi` | 40245 |
+| `current.rs` `current_linux_thread_state` | 26991 |
+
+Sharding dispatch would not have moved any of these. Linux answers the same
+questions from `current`, FreeBSD from `curthread`, and Zircon from
+`Thread::Current::Get()` — a published per-thread cell, never the run-queue
+lock — so the fix follows that design instead.
+
+`kernel/ps/src/multitask/current_identity.rs` publishes a seqlock-protected
+identity record per task slot, written only under the scheduler lock and read
+with interrupts masked. A reader that catches a writer mid-update, or an
+unpublished slot, returns `None` and falls back to the locked query.
+
+A missed publication site would serve a *stale* record rather than an absent
+one, which is a correctness fault, so completeness is not left to inspection:
+`Scheduler::divergent_published_identity` re-derives every slot from the
+authoritative tables under the lock each drain and reports the first
+disagreement as `kernel-scheduler-identity-divergence`. It immediately found
+one — `ROOT_TASK_SLOT` (slot 0, the BSP boot task, below
+`FIRST_DYNAMIC_TASK_SLOT`) is installed outside the dynamic allocation paths
+and had no publication call. Do not remove this audit; it is the standing proof
+that the eleven publication sites are complete.
+
+Syscall *return* was the remaining hot path: `deliver_pending_signals_if_needed`
+took the lock on every exit only to read `pending_signals == 0`, which is
+nearly always true. There is exactly one site that raises a pending signal
+(`scheduler/linux_thread_state.rs`, the `|=` pair) and it runs under the
+scheduler lock, as does the site that lowers the hint, so a conservative
+per-slot flag is safe in the same way `TIF_SIGPENDING` is in Linux: it may read
+`true` when nothing is pending, costing one locked recheck, and can never read
+`false` while something is pending.
+
+Measured at 8 vCPU, per one-second drain:
+
+| | baseline | identity published | + signal hint |
+| --- | --- | --- | --- |
+| lock wait total | 3 650 000 us | 1 394 404 us | 585 880 us |
+| lock hold max | 169 us | 89 us | 298 us |
+| top caller | 94 065/s | 59 932/s | 14 736/s |
+| identity divergences | n/a | 0 | 0 |
+
+Lock wait fell 6.2x against the session baseline. The remaining top callers are
+`multitask/irq.rs` (~14.7k/s), the syscall SIMD capture/restore pair in
+`multitask/spawn.rs` (~13.1k/s each, both touching only the current task's own
+slot and therefore the next candidates for the same treatment), and the
+`current_linux_thread_state` fallback now that the hint gates it.
+
+Note `lock hold max` rose to 298 us. That is a maximum, not a total, and the
+total hold fell; it has not been attributed yet and should be before this is
+called finished.
+
 ### Gate status
 
 - 1 vCPU: passes, boot terminal 2824 ms.
-- 2, 4, 8 vCPU: reach readiness, fail on the input-ring drain stall.
-- 55 FPS WayClick gate: not met, not yet measurable past the stall.
-- Nothing is committed. No hook or signing bypass has been used.
+- 2, 4, 8 vCPU: reach readiness, fail on the input-ring drain stall. The 8 vCPU
+  run now reports `RustOS missing=[]` and `Linux-DVM missing=[]` and stops on
+  the DVM GPU/input leg, so the scheduler work moved the failure downstream.
+- 55 FPS WayClick gate: not met, still not measurable past the stall.
+- The scheduler identity work is committed. No hook or signing bypass has been
+  used at any point.
 
 ## Resume sequence
 

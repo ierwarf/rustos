@@ -71,6 +71,7 @@ use crate::user::process;
 use crate::user::process_state::{UserProcessState, WindowsThreadRuntimeState};
 
 use super::context::{SAVED_CONTEXT_BYTES, SavedContext};
+use super::current_identity::{self, TaskIdentity};
 use super::process_table::{self, ProcessHandle};
 use super::{UserFaultDisposition, UserStackState, UserTaskBootstrap, initial_task_rflags};
 use context_validation::context_validation_reason_code;
@@ -829,6 +830,7 @@ impl Scheduler {
             windows_thread_state: None,
         });
         self.starts[ROOT_TASK_SLOT] = Some(TaskStart { entry, id });
+        self.publish_slot_identity(ROOT_TASK_SLOT);
         #[cfg(not(test))]
         runqueue::admit_running(ROOT_TASK_SLOT, 0);
         nucleus_core::util::lockdep::set_current_task_owner(
@@ -887,6 +889,7 @@ impl Scheduler {
         self.syscall_user_simd_states[slot] = SimdState::new();
         self.syscall_user_simd_active[slot] = false;
         self.starts[slot] = None;
+        self.publish_slot_identity(slot);
         self.idle_cpu[slot] = NO_IDLE_CPU;
         self.task_affinity_masks[slot] = UNRESTRICTED_CPU_MASK;
         self.process_affinity_masks[slot] = UNRESTRICTED_CPU_MASK;
@@ -1543,6 +1546,7 @@ impl Scheduler {
                 context.process_handle = None;
             }
         }
+        self.publish_slot_identity(slot);
     }
 
     fn allocate_stack_storage(&mut self, slot: usize) -> Option<()> {
@@ -1880,6 +1884,7 @@ impl Scheduler {
                 self.simd_states[slot] = SimdState::new();
                 self.syscall_user_simd_active[slot] = false;
                 self.starts[slot] = Some(TaskStart { entry, id });
+                self.publish_slot_identity(slot);
                 #[cfg(not(test))]
                 self.admit_runqueue_slot(slot, true);
                 return Some(slot);
@@ -1983,6 +1988,7 @@ impl Scheduler {
                     entry: idle_entry,
                     id,
                 });
+                self.publish_slot_identity(slot);
                 self.install_linux_thread_state(
                     slot,
                     bootstrap.linux_thread_state.map(|_| id),
@@ -2056,6 +2062,7 @@ impl Scheduler {
                     entry: idle_entry,
                     id,
                 });
+                self.publish_slot_identity(slot);
                 self.install_linux_thread_state(
                     slot,
                     bootstrap.linux_thread_state.map(|_| id),
@@ -2125,6 +2132,7 @@ impl Scheduler {
                     entry: super::noop_task_entry,
                     id,
                 });
+                self.publish_slot_identity(slot);
                 debug::debug!(
                     sched,
                     "allocate kernel process slot={} pid={} process={:?} root={:#x} entry={:#x} exec={}",
@@ -3085,6 +3093,43 @@ impl Scheduler {
         true
     }
 
+    /// Re-derives and republishes the lock-free identity record for `slot`.
+    ///
+    /// Every site that binds, rebinds, or retires a slot must call this. A
+    /// missed call would leave a stale record rather than an absent one, so
+    /// `divergent_published_identity` re-derives the whole table under the
+    /// lock and names the first slot that disagrees instead of leaving the
+    /// completeness of these call sites to inspection.
+    pub(super) fn publish_slot_identity(&self, slot: usize) {
+        match self.slot_identity(slot) {
+            Some(identity) => current_identity::publish(slot, identity),
+            None => current_identity::clear(slot),
+        }
+    }
+
+    fn slot_identity(&self, slot: usize) -> Option<TaskIdentity> {
+        let context = self.contexts.get(slot).copied().flatten()?;
+        Some(TaskIdentity {
+            task_id: self
+                .starts
+                .get(slot)
+                .copied()
+                .flatten()
+                .map(|start| start.id),
+            user_mode: context.user_mode,
+            abi: context.user_abi,
+            process_handle: context.process_handle,
+            console_session: context.console_session,
+        })
+    }
+
+    /// Returns the first slot whose published identity disagrees with the
+    /// scheduler's own tables, or `None` when the publication is complete.
+    pub(super) fn divergent_published_identity(&self) -> Option<usize> {
+        (0..MAX_TASK)
+            .find(|&slot| !current_identity::matches_authority(slot, self.slot_identity(slot)))
+    }
+
     pub(super) fn current_user_process_binding(
         &self,
     ) -> Option<(u64, UserAbi, ProcessHandle, ConsoleSessionHandle)> {
@@ -3121,7 +3166,16 @@ impl Scheduler {
         if !context.user_mode || context.user_abi != Some(UserAbi::Linux) {
             return None;
         }
-        self.linux_thread_state(slot)
+        let state = self.linux_thread_state(slot);
+        // Lower the hint whenever the authority says nothing is pending. This
+        // runs under the scheduler lock, so it cannot race the raise site.
+        current_identity::sync_signal_pending(
+            slot,
+            state.is_some_and(|state| {
+                state.pending_signals != 0 || state.pending_sigchld_events != 0
+            }),
+        );
+        state
     }
 
     pub(super) fn current_user_stack_state(&self) -> Option<UserStackState> {
@@ -3260,6 +3314,7 @@ impl Scheduler {
             entry: super::noop_task_entry,
             id: process_id,
         });
+        self.publish_slot_identity(slot);
         self.install_linux_thread_state(
             slot,
             bootstrap.linux_thread_state.map(|_| process_id),
@@ -3328,6 +3383,7 @@ impl Scheduler {
             entry: super::noop_task_entry,
             id: process_id,
         });
+        self.publish_slot_identity(slot);
         self.install_linux_thread_state(
             slot,
             bootstrap.linux_thread_state.map(|_| process_id),

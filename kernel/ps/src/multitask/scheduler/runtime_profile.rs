@@ -77,6 +77,10 @@ pub(in crate::multitask) struct SchedulerRuntimeProfile {
     pub(in crate::multitask) lock_hold_max_ns: u64,
     pub(in crate::multitask) phase_ns: [u64; SCHEDULER_PHASE_COUNT],
     pub(in crate::multitask) runnable_samples: u64,
+    /// First slot whose lock-free identity record disagrees with the
+    /// scheduler's own tables, or `usize::MAX` when publication is complete.
+    /// This is the standing proof that no identity write site was missed.
+    pub(in crate::multitask) divergent_identity_slot: usize,
     pub(in crate::multitask) top: [SchedulerRuntimeProfileEntry; PROFILE_TOP_TASKS],
 }
 
@@ -151,6 +155,16 @@ fn pack_u32_pair(high: u64, low: u64) -> u64 {
     let high = high.min(u64::from(u32::MAX));
     let low = low.min(u64::from(u32::MAX));
     (high << 32) | low
+}
+
+/// Stable 32-bit file identity for the acquisition census.
+fn fnv1a32(value: &str) -> u32 {
+    let mut hash = 0x811c_9dc5_u32;
+    for byte in value.as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
 }
 
 pub fn drain_scheduler_runtime_profile() -> usize {
@@ -245,6 +259,54 @@ pub fn drain_scheduler_runtime_profile() -> usize {
             profile.entry_causes[SchedulerEntryCause::Rtc as usize],
         ),
     );
+    // Per-caller acquisition census. Emitted here because this path already
+    // runs after the scheduler owner is released, so naming the callers costs
+    // no lock hold. Sorted so the sites worth moving off the global lock come
+    // first; the dispatch total alone never showed them.
+    let (mut census, overflow) = super::super::cpu_local::take_acquire_site_census();
+    census.sort_unstable_by(|left, right| right.2.cmp(&left.2));
+    // A divergence here means a slot mutated its identity without
+    // republishing, which serves stale answers to syscall entry. It is
+    // reported rather than left to inspection of the write sites.
+    if profile.divergent_identity_slot != usize::MAX {
+        crate::debug::record_milestone(
+            crate::debug::LogCategory::Sched,
+            "kernel-scheduler-identity-divergence",
+            u64::try_from(profile.divergent_identity_slot).unwrap_or(u64::MAX),
+            0,
+        );
+    }
+    // Milestones, not level-filtered logs: the ordinary info channel does not
+    // reach the debug transport in the product configuration, and a diagnostic
+    // that cannot be read is not evidence.
+    for (index, (file, line, count)) in census.iter().take(4).enumerate() {
+        if *count == 0 {
+            break;
+        }
+        crate::debug::record_milestone(
+            crate::debug::LogCategory::Sched,
+            match index {
+                0 => "kernel-scheduler-acquire-0",
+                1 => "kernel-scheduler-acquire-1",
+                2 => "kernel-scheduler-acquire-2",
+                _ => "kernel-scheduler-acquire-3",
+            },
+            *count,
+            // The line alone is ambiguous across files, so pack a stable file
+            // hash beside it. Offline, hashing a candidate path identifies the
+            // caller exactly.
+            (u64::from(fnv1a32(file)) << 32) | u64::from(*line),
+        );
+    }
+    if overflow != 0 {
+        crate::debug::record_milestone(
+            crate::debug::LogCategory::Sched,
+            "kernel-scheduler-acquire-overflow",
+            overflow,
+            0,
+        );
+    }
+
     let names = [
         "kernel-scheduler-top-0",
         "kernel-scheduler-top-1",
@@ -382,6 +444,7 @@ impl Scheduler {
             lock_hold_max_ns: self.runtime_profile_lock_hold_max_ns,
             phase_ns: self.runtime_profile_phase_ns,
             runnable_samples: self.runtime_profile_runnable_samples,
+            divergent_identity_slot: self.divergent_published_identity().unwrap_or(usize::MAX),
             top: [SchedulerRuntimeProfileEntry::default(); PROFILE_TOP_TASKS],
         };
         for slot in 0..MAX_TASK {
@@ -514,6 +577,7 @@ mod tests {
             lock_hold_max_ns: 0,
             phase_ns: [0; SCHEDULER_PHASE_COUNT],
             runnable_samples: 0,
+            divergent_identity_slot: usize::MAX,
             top: [SchedulerRuntimeProfileEntry::default(); PROFILE_TOP_TASKS],
         };
         assert!(pending.publish(profile));

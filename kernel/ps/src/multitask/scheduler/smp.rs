@@ -266,6 +266,7 @@ impl Scheduler {
             windows_thread_state: None,
         });
         self.starts[slot] = Some(TaskStart { entry, id });
+        self.publish_slot_identity(slot);
         self.idle_cpu[slot] = logical_index;
         let idle_mask = 1_u64 << logical_index;
         self.initialize_slot_affinity(slot, idle_mask, idle_mask);

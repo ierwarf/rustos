@@ -16,6 +16,7 @@
 //!   `monotonic-deadline-lifecycle`, and `user-memory-access`.
 use x86_64::{VirtAddr, instructions::interrupts};
 
+use super::cpu_local;
 use super::{
     CurrentUserSnapshot, RetainedCurrentUserAddressSpace, RetainedCurrentUserProcessState,
     UserFaultDisposition, WaitChildResult, current_cpu_task_slot_admitted, process_table,
@@ -89,7 +90,22 @@ pub fn current_task_id() -> Option<u64> {
     if nucleus_core::util::lockdep::preemption_disabled() || !current_cpu_task_slot_admitted() {
         return None;
     }
-    interrupts::without_interrupts(|| unsafe { scheduler_ref().current_task_id() })
+    interrupts::without_interrupts(|| {
+        if let Some(identity) = published_current_identity() {
+            return identity.task_id;
+        }
+        // SAFETY: interrupts are masked, so the current slot is stable.
+        unsafe { scheduler_ref().current_task_id() }
+    })
+}
+
+/// The identity published for the task this CPU is running, if any.
+///
+/// Callers must already have interrupts masked. A `None` result means the
+/// record was never published or a writer was mid-update, and the caller must
+/// fall back to the locked scheduler query.
+fn published_current_identity() -> Option<super::current_identity::TaskIdentity> {
+    super::current_identity::read(cpu_local::current_cpu_task_slot()?)
 }
 
 pub fn linux_task_affinity(
@@ -199,6 +215,18 @@ pub fn current_user_process_thread_count() -> Option<usize> {
     process_table::thread_count_by_pid(process_id)
 }
 
+/// Whether the running thread may have a pending Linux signal.
+///
+/// Syscall return calls this on every exit. A `true` answer only means the
+/// authoritative state has to be consulted; a `false` answer is conclusive and
+/// costs no scheduler lock.
+pub fn current_thread_may_have_pending_signals() -> bool {
+    interrupts::without_interrupts(|| {
+        cpu_local::current_cpu_task_slot()
+            .is_none_or(super::current_identity::signal_pending)
+    })
+}
+
 pub fn current_linux_thread_state() -> Option<LinuxThreadState> {
     interrupts::without_interrupts(|| unsafe { scheduler_ref().current_linux_thread_state() })
 }
@@ -220,10 +248,16 @@ pub fn current_user_thread_id() -> Option<u64> {
 /// binding is read with interrupts masked so the current slot and its ABI are
 /// one coherent observation.
 pub fn current_user_abi() -> Option<UserAbi> {
-    interrupts::without_interrupts(|| unsafe {
-        scheduler_ref()
-            .current_user_process_binding()
-            .map(|(_, abi, _, _)| abi)
+    interrupts::without_interrupts(|| {
+        if let Some(identity) = published_current_identity() {
+            return identity.user_binding().map(|(_, abi, _, _)| abi);
+        }
+        // SAFETY: interrupts are masked, so the current slot is stable.
+        unsafe {
+            scheduler_ref()
+                .current_user_process_binding()
+                .map(|(_, abi, _, _)| abi)
+        }
     })
 }
 
@@ -835,8 +869,12 @@ pub fn any_user_process_state(mut f: impl FnMut(u64, &UserProcessState) -> bool)
 }
 
 fn retain_current_user_process_binding() -> Option<(u64, UserAbi, process_table::ProcessRef)> {
-    let (thread_id, abi, process_handle, _) = interrupts::without_interrupts(|| unsafe {
-        scheduler_ref().current_user_process_binding()
+    let (thread_id, abi, process_handle, _) = interrupts::without_interrupts(|| {
+        if let Some(identity) = published_current_identity() {
+            return identity.user_binding();
+        }
+        // SAFETY: interrupts are masked, so the current slot is stable.
+        unsafe { scheduler_ref().current_user_process_binding() }
     })?;
     let process = process_table::retain_process(process_handle)?;
     Some((thread_id, abi, process))

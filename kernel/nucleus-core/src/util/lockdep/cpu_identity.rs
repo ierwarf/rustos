@@ -261,30 +261,30 @@ pub fn bind_current_cpu_identity(logical_index: u8, expected_apic_id: u32) {
 fn rdtscp_supported() -> bool {
     use core::arch::x86_64::__cpuid;
 
-    // SAFETY: CPUID is unprivileged and the extended maximum leaf gates the
-    // feature word query.
-    let maximum = unsafe { __cpuid(0x8000_0000) }.eax;
-    maximum >= 0x8000_0001 && unsafe { __cpuid(0x8000_0001) }.edx & (1 << 27) != 0
+    // CPUID is unprivileged and the extended maximum leaf gates the feature
+    // word query.
+    let maximum = __cpuid(0x8000_0000).eax;
+    maximum >= 0x8000_0001 && __cpuid(0x8000_0001).edx & (1 << 27) != 0
 }
 
 #[cfg(rustos_boot_image)]
 pub fn hardware_apic_id() -> u32 {
     use core::arch::x86_64::{__cpuid, __cpuid_count};
 
-    // SAFETY: CPUID is unprivileged on x86_64 and these leaves are queried only
-    // after checking the maximum supported basic leaf.
-    let maximum = unsafe { __cpuid(0) }.eax;
+    // CPUID is unprivileged on x86_64 and these leaves are queried only after
+    // checking the maximum supported basic leaf.
+    let maximum = __cpuid(0).eax;
     for leaf in [0x1f, 0x0b] {
         if maximum >= leaf {
-            // SAFETY: the maximum basic leaf admits this topology query.
-            let topology = unsafe { __cpuid_count(leaf, 0) };
+            // The maximum basic leaf above admits this topology query.
+            let topology = __cpuid_count(leaf, 0);
             if topology.ebx != 0 {
                 return topology.edx;
             }
         }
     }
     // SAFETY: CPUID leaf one is mandatory on x86_64.
-    unsafe { __cpuid(1) }.ebx >> 24
+    __cpuid(1).ebx >> 24
 }
 
 #[cfg(not(rustos_boot_image))]

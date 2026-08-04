@@ -93,6 +93,12 @@ struct LinuxRtSigFrame {
 // construction, current-thread pending-bit clearing, and final register
 // mutation substrate.
 pub(super) fn deliver_pending_signals_if_needed(frame: &mut SyscallFrame) -> bool {
+    // Every syscall return reaches here and almost none of them have a signal
+    // to deliver. The hint answers the common case without the scheduler lock;
+    // only a raised hint pays for the authoritative snapshot.
+    if !multitask::current_thread_may_have_pending_signals() {
+        return false;
+    }
     let Some(thread_state) = multitask::current_linux_thread_state() else {
         return false;
     };
