@@ -304,6 +304,46 @@ and provide none. Either move the testable logic into the crate's `lib.rs`,
 which is where vfsd's 21 executing tests live, or make the binary host-testable.
 Do not add new tests to those files until this is resolved.
 
+### The uiserver owner findings do not reproduce as described
+
+`V5-GPU-UI-OWNER-014` states that `GpuCompositor::present` performs a full
+scene rebuild, atlas copy, and submit, then waits synchronously through
+`retire_oldest(true)`, stalling the UI loop for tens to hundreds of
+milliseconds. On current source that blocking retire is reached only in the
+`!self.active` branch, which runs once on the activation frame to publish the
+compositor-active contract. Steady state runs the non-blocking
+`while self.retire_oldest(false)? {}` and returns `EAGAIN` rather than owning
+the UI thread, which the code states directly.
+
+The frame instrumentation added for `V5-UI-PIPELINE-011` measures the same
+thing. Across **3120 frames** in one 8 vCPU run there was exactly **one** slow
+full present, **one** slow partial present, and **one** slow loop, about
+0.03 percent. The single slow present is the activation frame. Steady frames
+run 4.8 to 6.8 ms with Wayland around 2 to 3 ms and present around 2 ms, so the
+loop sustains roughly 125 iterations per second, comfortably inside a 55 FPS
+budget.
+
+`V5-WAYLAND-HOL-013` describes protocol dispatch, render, and present sharing
+one owner. That is still structurally true: the main loop runs input, then
+Wayland, then render and present in sequence. What does not hold is the
+consequence. Because present never blocks in steady state, protocol progress
+is not delayed behind it, and no head-of-line stall appears in the frame
+records.
+
+Read these two as **risk mitigated, not architecture changed**. The single
+owner remains, so a future blocking call added to the present path would
+reintroduce the stall with nothing structural to prevent it. Splitting the
+protocol, scene, and submission owners is still the more defensible end state.
+But it is a large refactor of an 18k line service, and on this evidence it
+would not move the frame rate, so it should not be done as a performance fix.
+If it is done, justify it as ownership hardening and keep the frame records as
+the before-and-after check.
+
+This is the same pattern as the other corrections in this document: the audit
+was written against a snapshot where every path was roughly two orders of
+magnitude slower, which made a once-per-activation blocking wait look like a
+per-frame stall.
+
 ### Audit v5 closure, verified against source
 
 **Fourteen closed:** `SCHED-DONATION-002`, `SCHED-RESCHED-003`,
