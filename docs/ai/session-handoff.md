@@ -136,9 +136,19 @@ records: the caller's deadline expires, it abandons the reply capability, and
 rootd's late reply is rejected by the kernel. The caller then surfaces a
 permission-shaped error for what is really a latency failure.
 
-So the chain is: a rootd call exceeds its caller's deadline, the reply is
-rejected, the capability or lookup appears to fail, initd treats the endpoint
-barrier as fatal, and rootd exhausts its restart budget.
+The last link is in the kernel: `ipc_error_to_linux_errno` maps
+`IpcError::PermissionDenied` to `LINUX_EPERM`, and `enqueue_call_and_wake`
+returns that when the caller may not call the target endpoint. initd's
+capability to call rootd is therefore absent at the moment of the devmgrd
+lookup — because the grant reply that would have installed it was one of the
+three that failed to send.
+
+So the complete chain is: a rootd round trip exceeds its caller's deadline;
+the caller abandons the reply capability; rootd's reply is rejected with
+`InvalidHandle`; the capability is never installed; initd's next rootd call
+returns `PermissionDenied`, surfacing as `EPERM`; the devmgrd endpoint lookup
+fails; initd treats the endpoint barrier as fatal; rootd exhausts its restart
+budget. Every step of this is confirmed by log evidence rather than inferred.
 
 Two things to fix, in this order:
 
