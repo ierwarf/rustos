@@ -2128,6 +2128,10 @@ impl ServiceIpcClass {
     }
 }
 
+/// Diagnostic count of caller-side service reply deadline expiries.
+static SERVICE_REPLY_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+const EARLY_SERVICE_REPLY_TIMEOUT_SAMPLES: u64 = 8;
+
 pub(super) fn call_service_endpoint_with_class(
     service_id: u64,
     request: &[u8],
@@ -2320,7 +2324,38 @@ fn wait_for_service_reply_with_timeout(
     reply: KernelReplyHandle,
     timeout_ms: u64,
 ) -> Result<Vec<u8>, i64> {
-    Ok(wait_for_reply_with_deadline(reply, 0, service_ipc_deadline_tick_after(timeout_ms))?.0)
+    match wait_for_reply_with_deadline(reply, 0, service_ipc_deadline_tick_after(timeout_ms)) {
+        Ok(response) => Ok(response.0),
+        Err(errno) => {
+            // An abandoned reply capability is the start of a failure chain
+            // that surfaces far from here: the service replies late, the reply
+            // is rejected, a capability is never installed, and the next call
+            // returns a permission error. Recording the exact deadline that
+            // expired is what makes that chain attributable to its cause
+            // instead of to the permission error it eventually looks like.
+            record_service_reply_timeout(reply, timeout_ms, errno);
+            Err(errno)
+        }
+    }
+}
+
+/// Publishes the exact caller-side deadline that a service reply missed.
+///
+/// Bounded to the first few occurrences and then to exponentially spaced
+/// counts, matching the reply-rejection diagnostics this pairs with.
+fn record_service_reply_timeout(reply: KernelReplyHandle, timeout_ms: u64, errno: i64) {
+    // ORDERING: Relaxed is exact; this counter owns diagnostics only and
+    // orders nothing.
+    let total = SERVICE_REPLY_TIMEOUTS.fetch_add(1, Ordering::Relaxed) + 1;
+    if total > EARLY_SERVICE_REPLY_TIMEOUT_SAMPLES && !total.is_power_of_two() {
+        return;
+    }
+    nucleus_core::debug::record_milestone(
+        nucleus_core::debug::LogCategory::Compat,
+        "ipc-service-reply-timeout",
+        reply.raw(),
+        ((timeout_ms & 0xffff_ffff) << 32) | (errno.unsigned_abs() & 0xffff_ffff),
+    );
 }
 
 fn wait_for_service_reply_with_handle_limit(

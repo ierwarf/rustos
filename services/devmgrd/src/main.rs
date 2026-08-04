@@ -84,6 +84,14 @@ fn main() {
         );
         return;
     }
+    // Registration publishes this service as callable, so everything a call
+    // needs must already exist. Spawning the ioctl workers afterwards left a
+    // window in which the endpoint was advertised but nothing could serve it,
+    // and a caller bound by the 100 ms interactive deadline expired inside
+    // that window. The caller then abandoned its reply capability, this
+    // service's late reply was rejected, and the capability it carried was
+    // never installed, which surfaced much later as a permission error.
+    let sessiond_workers = start_sessiond_ioctl_workers();
     let register =
         rustos_svc_runtime::ipc::register_service_endpoint(IPC_SERVICE_DEVMGRD, endpoint as u64);
     if register < 0 {
@@ -96,7 +104,6 @@ fn main() {
     }
 
     debug_line("devmgrd: device policy endpoint registered");
-    let sessiond_workers = start_sessiond_ioctl_workers();
     serve(endpoint as u64, &sessiond_workers);
 }
 
