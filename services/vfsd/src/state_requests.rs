@@ -49,8 +49,11 @@ impl VfsState {
         }
         match request.header.op {
             COMMERCIAL_MAX_VFSD_OP_MOUNT_GRAPH => {
-                response.value0 = lock_vfs_storage().mount_generation;
-                response.value1 = u64::from(lock_vfs_storage().volume.is_some());
+                {
+                    let storage = lock_vfs_storage();
+                    response.value0 = storage.mount_generation;
+                    response.value1 = u64::from(storage.volume.is_some());
+                }
                 response.descriptor_count = 1;
                 response.descriptors[0] =
                     vfs_descriptor("mount-graph", request.header.op, lock_vfs_storage().mount_generation, 0);
@@ -91,15 +94,27 @@ impl VfsState {
                 fill_handle_descriptors(self, &mut response, RemoteKind::File);
             }
             COMMERCIAL_MAX_VFSD_OP_METADATA_POLICY => {
-                response.value0 = lock_vfs_storage().metadata_cache.len() as u64;
-                response.value1 = lock_vfs_storage().dir_entries_cache.len() as u64;
+                {
+                    let storage = lock_vfs_storage();
+                    response.value0 = storage.metadata_cache.len() as u64;
+                    response.value1 = storage.dir_entries_cache.len() as u64;
+                }
                 response.capability = vfs_capability("metadata-policy", request.header.op);
                 response.descriptor_count = 1;
+                // One acquisition: two live guards in one argument list would
+                // deadlock, because the storage owner is not re-entrant.
+                let (metadata_entries, dir_entries) = {
+                    let storage = lock_vfs_storage();
+                    (
+                        storage.metadata_cache.len() as u64,
+                        storage.dir_entries_cache.len() as u64,
+                    )
+                };
                 response.descriptors[0] = vfs_descriptor(
                     "metadata-policy",
                     request.header.op,
-                    lock_vfs_storage().metadata_cache.len() as u64,
-                    lock_vfs_storage().dir_entries_cache.len() as u64,
+                    metadata_entries,
+                    dir_entries,
                 );
             }
             _ => response.status = EINVAL,

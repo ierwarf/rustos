@@ -88,6 +88,17 @@ static VFS_STORAGE: SharedVfsStorage = SharedVfsStorage {
     storage: UnsafeCell::new(VfsStorage::new()),
 };
 
+/// Spin bound for one storage acquisition.
+///
+/// No holder retains storage across a bulk read, so a legitimate wait is one
+/// short phase or one chunk. Exceeding this bound means the owner will never be
+/// released, which is a lock-discipline bug rather than contention. Failing
+/// loudly is mandatory: a silent spin here strands every filesystem request in
+/// the system with no diagnostic.
+const STORAGE_ACQUIRE_SPIN_LIMIT: u64 = 1 << 24;
+/// Spins before falling back to sleeping. Short holds resolve inside this.
+const STORAGE_ACQUIRE_SPIN_BEFORE_SLEEP: u64 = 4_096;
+
 pub(crate) struct VfsStorageGuard;
 
 /// Acquires the single storage owner.
@@ -98,6 +109,7 @@ pub(crate) struct VfsStorageGuard;
 /// chunk. This service must not use yield as a progress mechanism, so the
 /// bound has to come from the hold discipline rather than from the waiter.
 pub(crate) fn lock_vfs_storage() -> VfsStorageGuard {
+    let mut spins: u64 = 0;
     loop {
         // ORDERING: Acquire observes the previous holder's complete storage
         // mutation before this caller may reach it.
@@ -108,7 +120,20 @@ pub(crate) fn lock_vfs_storage() -> VfsStorageGuard {
         {
             return VfsStorageGuard;
         }
-        core::hint::spin_loop();
+        spins = spins.saturating_add(1);
+        assert!(
+            spins < STORAGE_ACQUIRE_SPIN_LIMIT,
+            "vfsd storage owner was not released within its bounded hold; the \
+             usual cause is two live guards in one expression or a re-entrant \
+             acquisition, which this owner does not support"
+        );
+        if spins < STORAGE_ACQUIRE_SPIN_BEFORE_SLEEP {
+            core::hint::spin_loop();
+        } else {
+            // The holder may own storage for one device read. Spinning through
+            // that would burn a scheduling turn that the holder needs.
+            rustos_svc_runtime::syscall::sleep_millis(1);
+        }
     }
 }
 
@@ -153,30 +178,23 @@ pub(crate) enum ExecutableSnapshotAdmission {
     Read(ExecutableSnapshotPlan),
 }
 
-/// Bytes read per storage acquisition during a snapshot.
+/// Reads a planned snapshot in one acquisition.
 ///
-/// A namespace request therefore waits at most one chunk, never a whole image.
-const EXECUTABLE_SNAPSHOT_CHUNK_BYTES: usize = 64 * 1024;
-
-/// Drives one planned snapshot to completion outside the storage owner.
-pub(crate) fn read_planned_executable_snapshot(plan: &ExecutableSnapshotPlan) -> Result<Vec<u8>, i32> {
+/// This is deliberately a single read rather than a chunked one. FAT resolves a
+/// ranged read by walking the cluster chain from the start of the file, so
+/// splitting the read into chunks turns one linear read into a quadratic one,
+/// and the cache-materialization rule only fires when the request covers the
+/// whole file. One acquisition for one device read is therefore the minimum a
+/// single-volume design can hold, and it is the same hold the pre-split code
+/// took. What the split actually removes is the second `FatVolume`, not this
+/// hold.
+fn read_planned_executable_snapshot(plan: &ExecutableSnapshotPlan) -> Result<Vec<u8>, i32> {
     let mut bytes = Vec::new();
     bytes.try_reserve_exact(plan.file_len).map_err(|_| ENOMEM)?;
     bytes.resize(plan.file_len, 0);
-    let mut offset = 0usize;
-    while offset < plan.file_len {
-        let end = plan
-            .file_len
-            .min(offset.saturating_add(EXECUTABLE_SNAPSHOT_CHUNK_BYTES));
-        let read = lock_vfs_storage().read_executable_snapshot_chunk(
-            plan,
-            offset as u64,
-            &mut bytes[offset..end],
-        )?;
-        if read == 0 || read > end - offset {
-            return Err(EIO);
-        }
-        offset += read;
+    let read = lock_vfs_storage().read_executable_snapshot_chunk(plan, 0, bytes.as_mut_slice())?;
+    if read != plan.file_len {
+        return Err(EIO);
     }
     Ok(bytes)
 }
