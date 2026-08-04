@@ -110,6 +110,47 @@ Still worth closing regardless of the outcome: `arm_consumer_wake` documents
 "L0 rings at most once per generation" while `start_dvm_ingestion_worker`
 documents "L0 rings every committed record". Those cannot both be the contract.
 
+### Current blocker: rootd reply latency exceeds caller deadlines
+
+After the two commits above, boot on 8 vCPU stops with
+
+```
+initd: fatal service endpoint not ready exec=services/devmgrd/devmgrd.elf pid=37 errno=1
+rootd: restart budget exhausted
+```
+
+`errno=1` is `EPERM`, not a timeout, which initially looks like an authorization
+denial. It is not. The evidence bisects cleanly:
+
+- `initd -> devmgrd` is explicitly permitted by `service_dependency_allowed`.
+- The rootd authorization paths return `EINVAL` (22) or `EACCES` (13); none
+  returns `EPERM`.
+- The log contains **zero** `rootd: service capability denied` lines.
+- rootd logs `service capability request received` six times and
+  `service capability replied ok` three times. That second line additionally
+  requires `replied >= 0`, so all six requests were *authorized* and three
+  replies **failed to send**.
+
+That is the same phenomenon as the `ipc-reply-rejected ... InvalidHandle`
+records: the caller's deadline expires, it abandons the reply capability, and
+rootd's late reply is rejected by the kernel. The caller then surfaces a
+permission-shaped error for what is really a latency failure.
+
+So the chain is: a rootd call exceeds its caller's deadline, the reply is
+rejected, the capability or lookup appears to fail, initd treats the endpoint
+barrier as fatal, and rootd exhausts its restart budget.
+
+Two things to fix, in this order:
+
+1. Find why the rootd round trip exceeds the caller deadline. Use the phase
+   attribution method that resolved the scheduler question rather than
+   guessing; the scheduler is no longer the constraint, so this is either
+   rootd-side work or a deadline that was always too tight and only now gets
+   reached.
+2. Stop reporting a late reply as `EPERM`. A rejected reply caused by an
+   expired deadline must surface as a timeout, or every future occurrence will
+   be misdiagnosed as an authorization bug exactly as it was here.
+
 ### Attributed: the `input-policy` boot overrun is IPC reply rejection
 
 The `input-policy` step in `formal/product-scenarios.tsv` is measured from the
