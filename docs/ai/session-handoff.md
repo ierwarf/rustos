@@ -304,6 +304,47 @@ and provide none. Either move the testable logic into the crate's `lib.rs`,
 which is where vfsd's 21 executing tests live, or make the binary host-testable.
 Do not add new tests to those files until this is resolved.
 
+### SCHED-GLOBAL-001 is now validated by measurement, and only now
+
+Early in this session the global scheduler lock looked saturated, but the cause
+was `CPUID` exits inside every tracked lock: each hold was 329 us of VM exits at
+2,100 dispatches per second. Removing them cut lock wait from 5.9 s/s to
+0.029 s/s, which is why the lock stopped being the constraint at that moment.
+
+With the rest of the boot path fixed the system now does far more scheduling
+work, and the lock is saturated again for the real reason:
+
+| metric, per second at 8 vCPU | value |
+| --- | ---: |
+| dispatches | 29,481 |
+| lock hold total | 682,222 us |
+| hold per dispatch | 23 us |
+| lock hold duty on one lock | 68 percent |
+| lock wait total | 3,647,336 us |
+| share of all CPU time spent waiting | 46 percent |
+
+The volume is genuine work, not redundant entries: 23,261 of 29,481 dispatches
+are real task switches and only 6,220 are same-task, while entry causes are
+18,648 software yields, 10,628 reschedule IPIs, and 205 timer leaves. A
+same-task fast path would therefore recover at most 21 percent and would not
+change the outcome.
+
+In-owner attribution per dispatch is roughly 8.8 us selection, 2.2 us balance,
+1.4 us validation, and 0.2 us accounting, so about 12.6 us of the 23 us hold is
+attributed and the critical section is not dominated by any single scan.
+
+The conclusion is that one lock held 68 percent of the time and acquired 29,481
+times per second across eight CPUs cannot be repaired by shortening the
+critical section. Per-CPU dispatch authority, the audit's patch E and its
+P1.4 to P1.6 staging, is the correct fix and is now justified by measurement
+rather than by the earlier misattribution.
+
+It is deliberately not attempted here. It is a staged migration that needs
+shadow-read validation against the legacy backend, a boot-selected backend, and
+its own refinement model for `V5-FORMAL-SCHED-019`, and landing a partial
+version without that validation would repeat the per-slot owner-word mistake
+recorded above, which passed every unit test and only failed in KVM.
+
 ### The uiserver owner findings do not reproduce as described
 
 `V5-GPU-UI-OWNER-014` states that `GpuCompositor::present` performs a full
