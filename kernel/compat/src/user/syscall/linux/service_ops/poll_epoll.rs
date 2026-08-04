@@ -17,7 +17,10 @@ mod control;
 
 use super::*;
 
-const MAX_POLL_FDS: usize = 1024;
+// Every provider-backed descriptor in one poll arm must fit in the exact
+// object observation set installed in ring0.  Reject larger scans instead of
+// silently collapsing them to a provider-wide wake bucket.
+const MAX_POLL_FDS: usize = WAITSET_MAX_INTERESTS;
 const POLLFD_SIZE: usize = size_of::<linux_abi::LinuxPollFd>();
 const EPOLL_EVENT_SIZE: usize = size_of::<linux_abi::LinuxEpollEvent>();
 const WAITSET_INTEREST_SIZE: usize = size_of::<WaitSetInterestWire>();
@@ -187,7 +190,7 @@ fn collect_poll_readiness(
     let mut state = PollReadinessState {
         ready: 0,
         provider_timed_out: false,
-        observations: Vec::with_capacity(WAITSET_PROVIDER_MAX as usize),
+        observations: Vec::with_capacity(nfds.min(WAITSET_MAX_INTERESTS)),
     };
     for index in 0..nfds {
         let entry_ptr = fds_ptr
@@ -215,6 +218,11 @@ fn collect_poll_readiness(
         entry[6..8].copy_from_slice(&(revents as i16).to_le_bytes());
         usermem::write_current_user_bytes(entry_ptr, &entry)
             .map_err(address_space_error_to_linux_errno)?;
+    }
+    if state.observations.len()
+        > super::super::broker_ops::waitset_broker_ops::WAITSET_MAX_OBSERVATIONS
+    {
+        return Err(LINUX_EINVAL);
     }
     require_completed_provider_scan(state.provider_timed_out, state.ready != 0)?;
     Ok(state)
@@ -252,7 +260,7 @@ fn collect_one_poll_fd(
                 }
                 Err(errno) => return Err(errno),
             };
-            note_poll_observation(state, WAITSET_PROVIDER_NETD, generation);
+            note_poll_observation(state, WAITSET_PROVIDER_NETD, socket.token_id(), generation);
             Ok(revents & ready_mask)
         }
         multitask::KernelHandle::InetSocket(socket) => {
@@ -267,7 +275,7 @@ fn collect_one_poll_fd(
                 }
                 Err(errno) => return Err(errno),
             };
-            note_poll_observation(state, WAITSET_PROVIDER_NETD, generation);
+            note_poll_observation(state, WAITSET_PROVIDER_NETD, socket.token_id(), generation);
             Ok(revents & ready_mask)
         }
         multitask::KernelHandle::Epoll(epoll) => {
@@ -300,7 +308,12 @@ fn collect_one_poll_fd(
                 }
                 Err(errno) => return Err(errno),
             };
-            note_poll_observation(state, WAITSET_PROVIDER_INPUTD, generation);
+            note_poll_observation(
+                state,
+                WAITSET_PROVIDER_INPUTD,
+                waitset_input_object_id(access),
+                generation,
+            );
             Ok(if ready {
                 events & (linux_abi::POLLIN as u32 | linux_abi::POLLPRI as u32)
             } else {
@@ -324,7 +337,7 @@ fn collect_one_poll_fd(
                 }
                 Err(errno) => return Err(errno),
             };
-            note_poll_observation(state, WAITSET_PROVIDER_SESSIOND, generation);
+            note_poll_observation(state, WAITSET_PROVIDER_SESSIOND, session, generation);
             Ok(console_ready_events(console.stream(), live, ready, events))
         }
         multitask::KernelHandle::Console(console)
@@ -346,7 +359,7 @@ fn collect_one_poll_fd(
                 }
                 Err(errno) => return Err(errno),
             };
-            note_poll_observation(state, WAITSET_PROVIDER_SESSIOND, generation);
+            note_poll_observation(state, WAITSET_PROVIDER_SESSIOND, session, generation);
             Ok(console_ready_events(console.stream(), live, false, events))
         }
         multitask::KernelHandle::Console(console)
@@ -407,12 +420,17 @@ fn waitset_provider_query_timeout_ms_from_ticks(
     milliseconds.clamp(1, WAITSET_PROVIDER_QUERY_TIMEOUT_MS)
 }
 
-fn note_poll_observation(state: &mut PollReadinessState, provider: u16, generation: u64) {
+fn note_poll_observation(
+    state: &mut PollReadinessState,
+    provider: u16,
+    object_id: u64,
+    generation: u64,
+) {
     note_poll_observation_for_provider(
         state,
         super::super::broker_ops::waitset_broker_ops::ProviderObservation {
             provider,
-            object_id: WAITSET_GLOBAL_OBJECT_ID,
+            object_id,
             generation,
         },
     );
@@ -422,17 +440,30 @@ fn note_poll_observation_for_provider(
     state: &mut PollReadinessState,
     observation: super::super::broker_ops::waitset_broker_ops::ProviderObservation,
 ) {
-    if let Some(previous) = state
-        .observations
-        .iter_mut()
-        .find(|previous| previous.provider == observation.provider)
-    {
+    merge_provider_observation(&mut state.observations, observation);
+}
+
+fn merge_provider_observation(
+    observations: &mut Vec<super::super::broker_ops::waitset_broker_ops::ProviderObservation>,
+    observation: super::super::broker_ops::waitset_broker_ops::ProviderObservation,
+) {
+    if let Some(previous) = observations.iter_mut().find(|previous| {
+        previous.provider == observation.provider && previous.object_id == observation.object_id
+    }) {
         if observation.generation > previous.generation {
             *previous = observation;
         }
     } else {
-        state.observations.push(observation);
-        state.observations.sort_by_key(|entry| entry.provider);
+        observations.push(observation);
+        observations.sort_by_key(|entry| (entry.provider, entry.object_id));
+    }
+}
+
+fn waitset_input_object_id(access: u16) -> u64 {
+    match access {
+        INPUTD_ACCESS_NATIVE => WAITSET_INPUT_NATIVE_OBJECT_ID,
+        INPUTD_ACCESS_EVDEV => WAITSET_INPUT_EVDEV_OBJECT_ID,
+        _ => 0,
     }
 }
 
@@ -1022,9 +1053,14 @@ fn collect_epoll_readiness(
     }
 
     let mut ready = Vec::new();
-    let mut netd_generation = None;
-    let mut input_generation = None;
-    let mut sessiond_generation = None;
+    let mut observations = Vec::with_capacity(interests.len().saturating_add(1));
+    observations.push(
+        super::super::broker_ops::waitset_broker_ops::ProviderObservation {
+            provider: WAITSET_PROVIDER_VFSD,
+            object_id: epoll_token,
+            generation: response.aux,
+        },
+    );
     let mut provider_timed_out = false;
     for (interest, revoked) in interests {
         if revoked {
@@ -1041,7 +1077,14 @@ fn collect_epoll_readiness(
                         interest.events,
                         waitset_provider_query_timeout_ms(deadline_tick),
                     )?;
-                    netd_generation = Some(generation);
+                    merge_provider_observation(
+                        &mut observations,
+                        super::super::broker_ops::waitset_broker_ops::ProviderObservation {
+                            provider: WAITSET_PROVIDER_NETD,
+                            object_id: interest.object_id,
+                            generation,
+                        },
+                    );
                     revents
                 }
                 WAITSET_PROVIDER_INPUTD => {
@@ -1054,7 +1097,14 @@ fn collect_epoll_readiness(
                         access,
                         waitset_provider_query_timeout_ms(deadline_tick),
                     )?;
-                    input_generation = Some(generation);
+                    merge_provider_observation(
+                        &mut observations,
+                        super::super::broker_ops::waitset_broker_ops::ProviderObservation {
+                            provider: WAITSET_PROVIDER_INPUTD,
+                            object_id: waitset_input_object_id(access),
+                            generation,
+                        },
+                    );
                     if is_ready {
                         interest.events & (linux_abi::EPOLLIN | linux_abi::EPOLLPRI)
                     } else {
@@ -1071,7 +1121,14 @@ fn collect_epoll_readiness(
                         session,
                         waitset_provider_query_timeout_ms(deadline_tick),
                     )?;
-                    sessiond_generation = Some(generation);
+                    merge_provider_observation(
+                        &mut observations,
+                        super::super::broker_ops::waitset_broker_ops::ProviderObservation {
+                            provider: WAITSET_PROVIDER_SESSIOND,
+                            object_id: session,
+                            generation,
+                        },
+                    );
                     console_ready_events(stream, live, is_ready, interest.events)
                 }
                 _ => return Err(LINUX_EIO),
@@ -1095,41 +1152,6 @@ fn collect_epoll_readiness(
     }
     require_completed_provider_scan(provider_timed_out, !ready.is_empty())?;
 
-    let mut observations = Vec::with_capacity(3);
-    observations.push(
-        super::super::broker_ops::waitset_broker_ops::ProviderObservation {
-            provider: WAITSET_PROVIDER_VFSD,
-            object_id: WAITSET_GLOBAL_OBJECT_ID,
-            generation: response.aux,
-        },
-    );
-    if let Some(generation) = netd_generation {
-        observations.push(
-            super::super::broker_ops::waitset_broker_ops::ProviderObservation {
-                provider: WAITSET_PROVIDER_NETD,
-                object_id: WAITSET_GLOBAL_OBJECT_ID,
-                generation,
-            },
-        );
-    }
-    if let Some(generation) = input_generation {
-        observations.push(
-            super::super::broker_ops::waitset_broker_ops::ProviderObservation {
-                provider: WAITSET_PROVIDER_INPUTD,
-                object_id: WAITSET_GLOBAL_OBJECT_ID,
-                generation,
-            },
-        );
-    }
-    if let Some(generation) = sessiond_generation {
-        observations.push(
-            super::super::broker_ops::waitset_broker_ops::ProviderObservation {
-                provider: WAITSET_PROVIDER_SESSIOND,
-                object_id: WAITSET_GLOBAL_OBJECT_ID,
-                generation,
-            },
-        );
-    }
     Ok(EpollReadinessState {
         ready,
         observations,
@@ -1238,19 +1260,22 @@ mod tests {
     }
 
     #[test]
-    fn provider_observations_are_deduplicated_and_keep_the_newest_generation() {
+    fn object_observations_are_deduplicated_and_keep_the_newest_generation() {
         let mut state = PollReadinessState {
             ready: 0,
             provider_timed_out: false,
             observations: Vec::new(),
         };
-        note_poll_observation(&mut state, WAITSET_PROVIDER_NETD, 7);
-        note_poll_observation(&mut state, WAITSET_PROVIDER_INPUTD, 11);
-        note_poll_observation(&mut state, WAITSET_PROVIDER_NETD, 7);
-        assert_eq!(state.observations.len(), 2);
+        note_poll_observation(&mut state, WAITSET_PROVIDER_NETD, 41, 7);
+        note_poll_observation(&mut state, WAITSET_PROVIDER_INPUTD, 1, 11);
+        note_poll_observation(&mut state, WAITSET_PROVIDER_NETD, 41, 7);
+        note_poll_observation(&mut state, WAITSET_PROVIDER_NETD, 42, 7);
+        assert_eq!(state.observations.len(), 3);
         assert_eq!(state.observations[0].provider, WAITSET_PROVIDER_NETD);
-        assert_eq!(state.observations[1].provider, WAITSET_PROVIDER_INPUTD);
-        note_poll_observation(&mut state, WAITSET_PROVIDER_NETD, 8);
+        assert_eq!(state.observations[0].object_id, 41);
+        assert_eq!(state.observations[1].object_id, 42);
+        assert_eq!(state.observations[2].provider, WAITSET_PROVIDER_INPUTD);
+        note_poll_observation(&mut state, WAITSET_PROVIDER_NETD, 41, 8);
         assert_eq!(state.observations[0].generation, 8);
     }
 

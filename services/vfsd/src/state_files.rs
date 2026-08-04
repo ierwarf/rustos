@@ -395,7 +395,7 @@ impl VfsState {
                 return;
             }
         };
-        match self.metadata(path.as_str()) {
+        match lock_vfs_storage().metadata(path.as_str()) {
             Ok(metadata) => {
                 let statx = build_linux_statx(metadata);
                 response.payload_len = LINUX_STATX_SIZE as u32;
@@ -417,7 +417,7 @@ impl VfsState {
                 return;
             }
         };
-        match self.metadata(path.as_str()) {
+        match lock_vfs_storage().metadata(path.as_str()) {
             Ok(metadata) => {
                 let stat = build_linux_stat(metadata);
                 response.payload_len = LINUX_STAT_SIZE as u32;
@@ -433,7 +433,7 @@ impl VfsState {
             return;
         };
         response.status = match self.resolve_path(request, request.pid, request.dirfd, path) {
-            Ok(path) => self.metadata(path.as_str()).err().unwrap_or(0),
+            Ok(path) => lock_vfs_storage().metadata(path.as_str()).err().unwrap_or(0),
             Err(errno) => errno,
         };
     }
@@ -474,14 +474,14 @@ impl VfsState {
     }
 
     fn linux_mount_vfs(&mut self, response: &mut VfsIpcResponse) {
-        response.status = match self.advance_mount_generation() {
+        response.status = match lock_vfs_storage().advance_mount_generation() {
             Ok(()) => 0,
             Err(errno) => errno,
         };
     }
 
     fn linux_umount_vfs(&mut self, response: &mut VfsIpcResponse) {
-        response.status = match self.advance_mount_generation() {
+        response.status = match lock_vfs_storage().advance_mount_generation() {
             Ok(()) => 0,
             Err(errno) => errno,
         };

@@ -28,7 +28,7 @@ use super::{DeviceError, read_user_struct, write_user_struct};
 
 const MAX_DISPLAY_SURFACES_PER_PROCESS: usize = 4;
 
-pub(crate) fn prepare_ioctl(request: u64) {
+pub(crate) fn prepare_ioctl(request: u64, gpu_atlas_create_slot: Option<u32>) {
     if matches!(
         request,
         device::DISPLAY_IOCTL_GET_INFO
@@ -44,16 +44,34 @@ pub(crate) fn prepare_ioctl(request: u64) {
         // the ioctl itself revalidates the fd and all generation-stamped
         // objects after this phase.
         let _ = gui::display_info();
-        if let Some(gpu) = crate::io::dvm_display::gpu_atlas_info() {
-            // Atlas slots are a fixed, ABI-bounded set. Publish every mapping
-            // here so surface selection under the process lock is cache-only.
-            for slot in 0..gpu.slot_count {
-                if crate::io::dvm_display::gpu_atlas_slot_mapping(slot).is_none() {
-                    break;
-                }
-            }
+        let _ = crate::io::dvm_display::gpu_atlas_info();
+        if request == device::DISPLAY_IOCTL_CREATE_SURFACE
+            && let Some(slot) = gpu_atlas_create_slot
+        {
+            // The argument and exact next-free slot were captured under the
+            // process owner before this sleepable preflight. Map only that
+            // slot; mapping all three 16 MiB apertures on the first CREATE
+            // serialized UI bootstrap for many seconds under KVM.
+            let _ = crate::io::dvm_display::gpu_atlas_slot_mapping(slot);
         }
     }
+}
+
+pub(crate) fn gpu_atlas_create_slot_from_user(
+    process_state: &UserProcessState,
+    request: u64,
+    arg: u64,
+) -> Option<u32> {
+    if request != device::DISPLAY_IOCTL_CREATE_SURFACE {
+        return None;
+    }
+    let create =
+        read_user_struct::<DisplaySurfaceCreate>(process_state.address_space(), arg).ok()?;
+    if create.flags != DISPLAY_SURFACE_FLAG_GPU_ATLAS {
+        return None;
+    }
+    let gpu = crate::io::dvm_display::gpu_atlas_info_snapshot()?;
+    (0..gpu.slot_count).find(|slot| !process_state.handles().gpu_atlas_slot_in_use(*slot))
 }
 
 fn display_info() -> Result<DisplayInfo, DeviceError> {
@@ -538,5 +556,15 @@ fn validate_surface_mapping(
         .checked_add(surface.mapping_len().saturating_sub(1))
         .ok_or(DeviceError::InvalidArgument)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MAX_DISPLAY_SURFACES_PER_PROCESS;
+
+    #[test]
+    fn display_surface_capacity_covers_primary_and_exact_gpu_slots() {
+        assert_eq!(MAX_DISPLAY_SURFACES_PER_PROCESS, 4);
+    }
 }
 // RING3-MIGRATION-REFERENCE END: devmgrd/uiserver-owned display ioctl substrate exception.

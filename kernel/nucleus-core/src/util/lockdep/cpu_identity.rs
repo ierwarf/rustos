@@ -67,6 +67,50 @@ pub fn current_cpu_index() -> usize {
     0
 }
 
+/// Returns the calling CPU's admitted architectural APIC identity.
+///
+/// `hardware_apic_id` derives the identity with `CPUID`, which is an
+/// unconditional VM exit on every virtualized product topology. The raw-guard
+/// ownership check captured it on acquisition, on failed acquisition, and again
+/// on release, so each tracked lock put several exits inside the critical
+/// section it protects. That made nested-lock cost scale with CPU count rather
+/// than with the protected work, and on the serialized dispatch path it
+/// dominated every scheduling decision.
+///
+/// The dense identity map is immutable after topology publication, so this
+/// reads the admitted identity for the logical index instead. The check stays
+/// exactly as strong: the logical index comes from CPU-local architectural
+/// state and is rejected outright when it falls outside the admitted topology.
+/// Before publication there is no map to read and the `CPUID` derivation
+/// remains the only source.
+#[cfg(rustos_boot_image)]
+pub fn current_apic_id() -> u32 {
+    // ORDERING: Acquire observes the complete dense map published by topology
+    // admission before any entry is read.
+    if !CPU_IDENTITIES_PUBLISHED.load(Ordering::Acquire) {
+        return hardware_apic_id();
+    }
+    let index = current_cpu_index();
+    let count = CPU_IDENTITY_COUNT.load(Ordering::Relaxed);
+    if index >= count {
+        return hardware_apic_id();
+    }
+    // ORDERING: the publication flag acquired above covers this payload; the
+    // map is immutable afterwards. Zero is the never-published sentinel, so the
+    // stored value is the identity biased by one.
+    let encoded = CPU_APIC_IDENTITIES[index].load(Ordering::Relaxed);
+    match encoded {
+        0 => hardware_apic_id(),
+        encoded => u32::try_from(encoded - 1)
+            .expect("lockdep invariant: admitted APIC identity exceeds u32 capacity"),
+    }
+}
+
+#[cfg(not(rustos_boot_image))]
+pub fn current_apic_id() -> u32 {
+    0
+}
+
 #[cfg(any(rustos_boot_image, test))]
 pub(super) fn select_cpu_index(
     identities: impl IntoIterator<Item = u64>,

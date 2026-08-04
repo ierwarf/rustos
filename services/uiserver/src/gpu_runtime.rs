@@ -45,11 +45,12 @@ use crate::render::{
 use crate::sys::{
     debug_line, diag_line, display_create_gpu_atlas_surface, display_get_info,
     display_gpu_get_info, display_gpu_query_completion, display_gpu_submit, map_surface,
-    require_background_thread_class, DisplayGpuInfo, DisplayInfo, DisplaySurfaceCreate,
-    SurfaceMapping, EAGAIN, EINVAL, ENODEV, ESTALE,
+    spawn_ui_thread, DisplayGpuInfo, DisplayInfo, DisplaySurfaceCreate, SurfaceMapping,
+    UiThreadRole, EAGAIN, EINVAL, ENODEV, ESTALE,
 };
 
 const GPU_READY_RETRY: Duration = Duration::from_millis(50);
+const GPU_READY_RETRY_MAX: Duration = Duration::from_millis(400);
 const GPU_READY_TIMEOUT: Duration = Duration::from_secs(20);
 const GPU_FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 // This one-shot worker is the mandatory boot compositor, not background
@@ -321,24 +322,33 @@ fn start_gpu_initialization(
     expected_display: DisplayInfo,
 ) -> Result<Receiver<GpuInitializationResult>, i32> {
     let (sender, receiver) = mpsc::sync_channel(1);
-    thread::Builder::new()
-        .name("uiserver-gpu-init".into())
-        .spawn(move || {
-            debug_line("uiserver: GPU initialization worker started");
-            if !GPU_INITIALIZATION_RETAINS_BOOT_CLASS {
-                require_background_thread_class();
-            }
-            let deadline = Instant::now() + GPU_READY_TIMEOUT;
-            let result = loop {
-                match GpuCompositor::try_initialize(display_fd, expected_display) {
-                    Ok(None) if Instant::now() < deadline => thread::sleep(GPU_READY_RETRY),
-                    Ok(None) => break Err(ETIMEDOUT),
-                    terminal => break terminal,
+    let role = if GPU_INITIALIZATION_RETAINS_BOOT_CLASS {
+        UiThreadRole::BootstrapGpu
+    } else {
+        UiThreadRole::Background
+    };
+    spawn_ui_thread(role, "uiserver-gpu-init", move || {
+        debug_line("uiserver: GPU initialization worker started");
+        let deadline = Instant::now() + GPU_READY_TIMEOUT;
+        let mut attempts = 0_u32;
+        let result = loop {
+            match GpuCompositor::try_initialize(display_fd, expected_display) {
+                Ok(None) if Instant::now() < deadline => {
+                    attempts = attempts.saturating_add(1);
+                    if attempts == 1 || attempts.is_power_of_two() {
+                        debug_line(&format!(
+                            "uiserver: GPU provider pending attempt={attempts}"
+                        ));
+                    }
+                    thread::sleep(gpu_ready_retry_backoff(attempts));
                 }
-            };
-            let _ = sender.send(result);
-        })
-        .map_err(|_| EAGAIN)?;
+                Ok(None) => break Err(ETIMEDOUT),
+                terminal => break terminal,
+            }
+        };
+        let _ = sender.send(result);
+    })
+    .map_err(|_| EAGAIN)?;
     Ok(receiver)
 }
 
@@ -359,6 +369,10 @@ impl GpuCompositor {
                 return Err(ESTALE);
             }
         };
+        debug_line(&format!(
+            "uiserver: GPU initialization stage=gpu-info done slots={} atlas={}x{} stride={}",
+            info.slot_count, info.atlas_width, info.atlas_height, info.atlas_stride_bytes,
+        ));
         if info.generation != current_display.generation {
             return Err(ESTALE);
         }
@@ -387,12 +401,19 @@ impl GpuCompositor {
         }
         let mut slots = Vec::with_capacity(info.slot_count as usize);
         for slot_index in 0..info.slot_count {
+            debug_line(&format!(
+                "uiserver: GPU initialization stage=atlas-create begin slot={slot_index}"
+            ));
             let surface = display_create_gpu_atlas_surface(display_fd, info).map_err(|errno| {
                 debug_line(&format!(
                     "uiserver: GPU initialization rejected stage=create-atlas slot={slot_index} errno={errno}"
                 ));
                 errno
             })?;
+            debug_line(&format!(
+                "uiserver: GPU initialization stage=atlas-create done slot={slot_index} bytes={}",
+                surface.mapping_len,
+            ));
             let raw_fd = i32::try_from(surface.handle).map_err(|_| {
                 debug_line(&format!(
                     "uiserver: GPU initialization rejected stage=atlas-fd slot={slot_index} handle={}",
@@ -408,12 +429,18 @@ impl GpuCompositor {
                 ));
                 EINVAL
             })?;
+            debug_line(&format!(
+                "uiserver: GPU initialization stage=atlas-map begin slot={slot_index} bytes={mapping_len}"
+            ));
             let mapping = map_surface(surface_fd.as_raw_fd(), mapping_len).map_err(|errno| {
                 debug_line(&format!(
                     "uiserver: GPU initialization rejected stage=atlas-map slot={slot_index} errno={errno}"
                 ));
                 errno
             })?;
+            debug_line(&format!(
+                "uiserver: GPU initialization stage=atlas-map done slot={slot_index}"
+            ));
             slots.push(GpuAtlasSlot {
                 surface,
                 _surface_fd: surface_fd,
@@ -943,6 +970,14 @@ impl GpuCompositor {
             }
         }
     }
+}
+
+fn gpu_ready_retry_backoff(attempt: u32) -> Duration {
+    let shift = attempt.saturating_sub(1).min(3);
+    GPU_READY_RETRY
+        .checked_mul(1_u32 << shift)
+        .unwrap_or(GPU_READY_RETRY_MAX)
+        .min(GPU_READY_RETRY_MAX)
 }
 
 fn gpu_completion_timed_out(

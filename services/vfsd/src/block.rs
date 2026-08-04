@@ -24,8 +24,13 @@ const IPC_BLOCK_PAYLOAD_BYTES: usize =
     rustos_user_abi::syscall::COMMERCIAL_MAX_PROTOCOL_PAYLOAD_CAPACITY;
 // FAT may satisfy a large executable snapshot as hundreds of cache-hot block
 // requests after one DVM read-ahead completion. Bound the uninterrupted
-// System-class service burst independently of individual IPC chunk size.
-const BULK_COOPERATIVE_YIELD_BYTES: usize = 64 * 1024;
+// System-class service burst independently of individual IPC chunk size. One
+// inline storaged reply carries just under 64 KiB; yielding after every reply
+// turned a 900 KiB executable into fifteen scheduler handoffs and routinely
+// exhausted the public two-second snapshot deadline on SMP. Four replies keep
+// the burst bounded while matching the snapshot writer's 256 KiB progress
+// quantum.
+const BULK_COOPERATIVE_YIELD_BYTES: usize = 256 * 1024;
 static mut STORAGED_BULK_RESPONSE_SLOT: StoragedBulkReadResponse =
     StoragedBulkReadResponse::zeroed();
 // Not-ready is an expected, bounded state while the DVM proves its initial
@@ -392,6 +397,25 @@ mod tests {
         assert_eq!(max_blocks * block_size, 60 * 1024);
         assert!(max_blocks * block_size <= STORAGED_BULK_READ_PAYLOAD_CAPACITY);
         assert!((max_blocks + 1) * block_size > STORAGED_BULK_READ_PAYLOAD_CAPACITY);
+    }
+
+    #[test]
+    fn bulk_cooperative_yield_batches_four_inline_replies() {
+        let inline = 60 * 1024;
+        let (after_one, yielded) =
+            cooperative_bulk_yield_state(inline, BULK_COOPERATIVE_YIELD_BYTES);
+        assert_eq!(after_one, inline);
+        assert!(!yielded);
+
+        let (after_four, yielded) =
+            cooperative_bulk_yield_state(inline * 4, BULK_COOPERATIVE_YIELD_BYTES);
+        assert_eq!(after_four, inline * 4);
+        assert!(!yielded);
+
+        let (remainder, yielded) =
+            cooperative_bulk_yield_state(inline * 5, BULK_COOPERATIVE_YIELD_BYTES);
+        assert_eq!(remainder, inline * 5 - BULK_COOPERATIVE_YIELD_BYTES);
+        assert!(yielded);
     }
 
     #[test]

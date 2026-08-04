@@ -33,7 +33,7 @@ use runtime_control::RuntimeClient;
 use runtime_sync::{refresh_runtime_state, start_runtime_sync, RuntimeState};
 use sys::{
     background_thread_demotion_count, boot_line, boot_trace_enabled, diag_line, heartbeat_line,
-    require_background_thread_class,
+    spawn_ui_thread, UiThreadRole,
 };
 use wayland::WaylandCompositor;
 
@@ -109,31 +109,26 @@ impl UiLoopWatchdog {
         let last_progress_ms = Arc::clone(&watchdog.last_progress_ms);
         let loop_seq = Arc::clone(&watchdog.loop_seq);
         let thread_started = boot_started;
-        let _ = thread::Builder::new()
-            .name(String::from("uiserver-watchdog"))
-            .spawn(move || {
-                require_background_thread_class();
-                loop {
-                    thread::sleep(UI_WATCHDOG_CHECK_INTERVAL);
-                    let phase_id = phase.load(Ordering::Acquire);
-                    let now_ms = elapsed_ms_since(thread_started);
-                    let elapsed_ms = if phase_id == UI_PHASE_IDLE {
-                        now_ms.saturating_sub(last_progress_ms.load(Ordering::Acquire))
-                    } else {
-                        now_ms.saturating_sub(phase_started_ms.load(Ordering::Acquire))
-                    };
-                    if elapsed_ms < UI_PHASE_PANIC_THRESHOLD_MS {
-                        continue;
-                    }
-                    diag_line(format!(
-                        "uiserver watchdog panic: phase={} elapsed_ms={} loop_seq={}",
-                        ui_phase_name(phase_id),
-                        elapsed_ms,
-                        loop_seq.load(Ordering::Acquire),
-                    ));
-                    std::process::exit(134);
-                }
-            });
+        let _ = spawn_ui_thread(UiThreadRole::Watchdog, "uiserver-watchdog", move || loop {
+            thread::sleep(UI_WATCHDOG_CHECK_INTERVAL);
+            let phase_id = phase.load(Ordering::Acquire);
+            let now_ms = elapsed_ms_since(thread_started);
+            let elapsed_ms = if phase_id == UI_PHASE_IDLE {
+                now_ms.saturating_sub(last_progress_ms.load(Ordering::Acquire))
+            } else {
+                now_ms.saturating_sub(phase_started_ms.load(Ordering::Acquire))
+            };
+            if elapsed_ms < UI_PHASE_PANIC_THRESHOLD_MS {
+                continue;
+            }
+            diag_line(format!(
+                "uiserver watchdog panic: phase={} elapsed_ms={} loop_seq={}",
+                ui_phase_name(phase_id),
+                elapsed_ms,
+                loop_seq.load(Ordering::Acquire),
+            ));
+            std::process::exit(134);
+        });
         watchdog
     }
 
@@ -728,6 +723,31 @@ fn run() -> Result<(), i32> {
     boot_line("uiserver: input reader spawn begin");
     let input_events = input_loop::start_input_reader(std::mem::take(&mut state.input_fds))?;
     boot_line("uiserver: input reader spawn done");
+    // Admit the protocol owner before optional background loaders and GPU
+    // activation. Thread creation crosses procd and may require a scheduler
+    // turn; placing Wayland behind those jobs made a valid desktop miss the
+    // finite product-readiness deadline without any protocol failure.
+    diag_line("uiserver: wayland initialize begin");
+    let wayland_init_started = Instant::now();
+    let mut wayland = WaylandCompositor::initialize(
+        state.display.width,
+        state.display.height,
+        input_events.wake_sender(),
+    )
+    .ok_or_else(|| {
+        diag_line("uiserver: mandatory Wayland compositor initialization failed");
+        libc::EIO
+    })?;
+    wayland
+        .attach_readiness_waker(input_events.wake_sender())
+        .map_err(|err| {
+            diag_line(format!(
+                "uiserver: Wayland readiness waiter initialization failed: {err}"
+            ));
+            libc::EIO
+        })?;
+    diag_line("uiserver: wayland initialize done");
+    log_boot_stage(wayland_init_started, "wayland_initialize");
     boot_line("uiserver: run initialize done");
     sys::publish_display_policy_metadata(state.display);
     diag_line("uiserver: run initialize done");
@@ -766,55 +786,23 @@ fn run() -> Result<(), i32> {
     boot_line("uiserver: first present done");
     log_boot_stage(first_present_started, "first_present");
 
-    // Complete the already-dispatched mandatory GPU path before unrelated
-    // Wayland, runtime-catalog, and application policy startup can compete for
-    // CPU or IPC service turns. This bounded local-only turn is not a
-    // fallback; the main loop retains the same fail-closed recovery contract.
-    let gpu_activation_deadline = Instant::now()
-        + Duration::from_millis(rustos_user_abi::performance::UI_BOOT_GPU_ACTIVATION_BUDGET_MS);
-    while Instant::now() < gpu_activation_deadline {
-        let gpu_initialized = state.poll_gpu_completions()?;
-        let background_ready = apply_ready_desktop_backgrounds(&mut state, &desktop_background);
-        if (gpu_initialized || background_ready) && state.present_gpu_update(true)? {
-            break;
-        }
-        thread::sleep(Duration::from_millis(1));
+    // GPU admission and atlas construction already belong to the bootstrap
+    // worker. Do one nonblocking handoff check, then publish UI readiness and
+    // let the normal event loop consume the eventual completion. Polling here
+    // used to yield every millisecond for the full activation budget; on SMP
+    // that manufactured thousands of software-scheduler entries before the
+    // runtime could launch the first desktop client. Waiting/Active still
+    // forbid a CPU full-scene fallback and retain the last valid front.
+    let gpu_initialized = state.poll_gpu_completions()?;
+    let background_ready = apply_ready_desktop_backgrounds(&mut state, &desktop_background);
+    if gpu_initialized || background_ready {
+        let _ = state.present_gpu_update(true)?;
     }
 
     diag_line("uiserver: post-present init begin");
     let mut pending_update = VisualUpdate::default();
     let mut presented_cursor_x = state.cursor_x;
     let mut presented_cursor_y = state.cursor_y;
-    // Establish the compositor's persistent epoll interests before opening
-    // the runtime catalog.  Application autostart can legitimately drive a
-    // large executable snapshot through vfsd as soon as the runtime client is
-    // visible; placing the control mutation behind that bulk request creates
-    // head-of-line blocking on vfsd's single mutation owner and can expire the
-    // bounded interactive-control deadline.  Wayland readiness is a required
-    // product capability, so publish it first and fail closed if its listener
-    // or either readiness worker cannot be admitted.
-    diag_line("uiserver: wayland initialize begin");
-    let wayland_init_started = Instant::now();
-    let mut wayland = WaylandCompositor::initialize(
-        state.display.width,
-        state.display.height,
-        input_events.wake_sender(),
-    )
-    .ok_or_else(|| {
-        diag_line("uiserver: mandatory Wayland compositor initialization failed");
-        libc::EIO
-    })?;
-    wayland
-        .attach_readiness_waker(input_events.wake_sender())
-        .map_err(|err| {
-            diag_line(format!(
-                "uiserver: Wayland readiness waiter initialization failed: {err}"
-            ));
-            libc::EIO
-        })?;
-    diag_line("uiserver: wayland initialize done");
-    log_boot_stage(wayland_init_started, "wayland_initialize");
-
     diag_line("uiserver: runtime client open begin");
     let runtime_open_started = Instant::now();
     let mut runtime_state = RuntimeState::default();

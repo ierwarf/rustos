@@ -12,7 +12,7 @@ use super::*;
 
 impl Scheduler {
     fn candidate_is_local_to_current_cpu(&self, slot: usize) -> bool {
-        if slot == self.current_task {
+        if slot == self.current_task_slot() {
             return true;
         }
         let logical_cpu = u8::try_from(nucleus_core::util::lockdep::current_cpu_index())

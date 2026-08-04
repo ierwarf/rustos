@@ -330,6 +330,13 @@ where
             &layout.dvm_serial_log,
         )?;
     }
+    let success_evidence = write_kvm_success_summary(
+        config,
+        &artifacts,
+        &layout,
+        &options,
+        boot_started.elapsed(),
+    )?;
     println!(
         "xtask: parallel KVM boot passed (RustOS + Linux DVM); control={} established authenticated L0 input relay (DVM cid={}, inventory={}, virtio-net={}, virtio-gpu={}) without QMP",
         artifacts.control.control_plane(),
@@ -346,6 +353,12 @@ where
             "missing"
         },
     );
+    if let Some(path) = success_evidence {
+        println!(
+            "xtask: SMP correctness evidence published at {}",
+            path.display()
+        );
+    }
     Ok(())
 }
 
@@ -792,11 +805,9 @@ where
     // DVM uinput path; no QMP or embedded-volume shortcut is added.
     if options.min_ui_fps.is_some() {
         options.exercise_input = true;
+        options.dvm_block_shmem = true;
     }
     if options.smp_iteration {
-        if options.rustos_vcpus <= 1 {
-            bail!("--smp-iteration requires --rustos-vcpus greater than 1");
-        }
         if options.timeout > Duration::from_secs(30) {
             bail!("--smp-iteration is restricted to a bounded --timeout of at most 30 seconds");
         }

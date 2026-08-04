@@ -5,6 +5,7 @@ extern crate alloc;
 use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU8, Ordering};
 use rustos_user_abi::syscall::{
     DvmBlockInfoWire, ServiceCheckpointRecordWire, EARLY_SYSTEM_BROKER_MAX_IO_BYTES,
     SERVICE_CHECKPOINT_ABI_VERSION, SERVICE_CHECKPOINT_FLAG_TOMBSTONE, VFS_IPC_OP_FTRUNCATE,
@@ -15,6 +16,74 @@ use storage_core::{IoResult, StorageError};
 pub const ENOENT: i32 = 2;
 pub const ENOTDIR: i32 = 20;
 pub const EROFS: i32 = 30;
+
+const SNAPSHOT_ADMISSION_IDLE: u8 = 0;
+const SNAPSHOT_ADMISSION_WRITING: u8 = 1;
+const SNAPSHOT_ADMISSION_READY: u8 = 2;
+const SNAPSHOT_ADMISSION_BUSY: u8 = 3;
+
+/// One bounded executable-snapshot handoff from the endpoint receiver to the
+/// bulk worker. The atomic state is the slot's publication authority: the
+/// receiver reserves before writing and publishes with Release; the sole
+/// worker claims with Acquire before reading and returns the slot only after
+/// its terminal reply attempt.
+pub struct SnapshotWorkerAdmission(AtomicU8);
+
+impl SnapshotWorkerAdmission {
+    pub const fn new() -> Self {
+        Self(AtomicU8::new(SNAPSHOT_ADMISSION_IDLE))
+    }
+
+    pub fn try_reserve(&self) -> bool {
+        self.0
+            .compare_exchange(
+                SNAPSHOT_ADMISSION_IDLE,
+                SNAPSHOT_ADMISSION_WRITING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    pub fn publish_ready(&self) {
+        self.0
+            .compare_exchange(
+                SNAPSHOT_ADMISSION_WRITING,
+                SNAPSHOT_ADMISSION_READY,
+                Ordering::Release,
+                Ordering::Acquire,
+            )
+            .expect("snapshot admission published without reservation");
+    }
+
+    pub fn try_claim(&self) -> bool {
+        self.0
+            .compare_exchange(
+                SNAPSHOT_ADMISSION_READY,
+                SNAPSHOT_ADMISSION_BUSY,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    pub fn release(&self) {
+        self.0
+            .compare_exchange(
+                SNAPSHOT_ADMISSION_BUSY,
+                SNAPSHOT_ADMISSION_IDLE,
+                Ordering::Release,
+                Ordering::Acquire,
+            )
+            .expect("snapshot admission released without worker ownership");
+    }
+}
+
+impl Default for SnapshotWorkerAdmission {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 const EINTR: i32 = 4;
 const EIO: i32 = 5;
@@ -473,6 +542,19 @@ pub fn unlink_policy(path: &str) -> i32 {
 mod tests {
     use super::*;
     use alloc::vec;
+
+    #[test]
+    fn snapshot_worker_admission_is_single_slot_and_exact_owner() {
+        let admission = SnapshotWorkerAdmission::new();
+        assert!(admission.try_reserve());
+        assert!(!admission.try_reserve());
+        assert!(!admission.try_claim());
+        admission.publish_ready();
+        assert!(admission.try_claim());
+        assert!(!admission.try_claim());
+        admission.release();
+        assert!(admission.try_reserve());
+    }
 
     #[test]
     fn reply_failure_diagnostics_are_first_then_exponentially_rate_limited() {

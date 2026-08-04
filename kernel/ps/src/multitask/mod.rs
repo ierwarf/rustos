@@ -38,25 +38,26 @@ use crate::user::process_state::{
 pub use self::current::{
     activate_suspended_user_task, activate_suspended_user_tasks,
     activate_suspended_user_tasks_with_commit, any_user_process_state, arm_block_current_task,
-    cancel_block_current_task, complete_retired_task_cleanup, current_console_session,
-    current_linux_thread_state, current_task_id, current_user_abi, current_user_address_space,
-    current_user_id, current_user_log_ids, current_user_process_id,
+    attach_reserved_ipc_priority, bind_ipc_priority_to_process_worker, bind_reserved_ipc_priority,
+    cancel_block_current_task, cancel_ipc_priority_reservation, complete_retired_task_cleanup,
+    current_console_session, current_linux_thread_state, current_task_id, current_user_abi,
+    current_user_address_space, current_user_id, current_user_log_ids, current_user_process_id,
     current_user_process_thread_count, current_user_snapshot, current_user_stack_state,
     current_user_thread_id, current_user_wait_binding, demote_current_user_task_to_user_class,
     exec_current_user_process, exec_user_process_by_pid, exit_current_user_process,
     exit_current_user_task, halt_current_retired_task, inherit_ipc_priority,
-    inherit_ipc_priority_for_process, is_user_process_exiting, is_user_task_alive,
-    linux_task_affinity, linux_thread_snapshot_by_ids, mark_user_process_exiting,
-    mark_user_process_exiting_once, next_retired_task_cleanup, note_process_exit_status,
-    parent_process_id_of, queue_linux_process_sigchld, queue_linux_signal,
-    release_ipc_priorities_for_process, release_ipc_priority, retain_current_user_process_state,
-    retire_current_user_task_due_to_fault, service_deferred_work, set_linux_task_affinity,
-    set_next_latency_pick_hint, set_next_pick_hint, set_next_process_pick_hint,
-    set_next_spawn_pick_hint, set_next_synchronous_pick_hint, set_windows_current_thread_affinity,
-    set_windows_process_affinity, stop_current_linux_process, task_has_system_scheduling_class,
-    terminate_user_process, terminate_user_task, user_log_ids_for_task, wait_for_child, wake_task,
-    wake_user_task, windows_process_affinity, with_current_mm, with_current_process_credentials,
-    with_current_process_state, with_current_process_state_mut, with_current_user_linux_state_mut,
+    is_user_process_exiting, is_user_task_alive, linux_task_affinity, linux_thread_snapshot_by_ids,
+    mark_user_process_exiting, mark_user_process_exiting_once, next_retired_task_cleanup,
+    note_process_exit_status, parent_process_id_of, queue_linux_process_sigchld,
+    queue_linux_signal, release_ipc_priorities_for_process, release_ipc_priority,
+    reserve_ipc_priority, retain_current_user_process_state, retire_current_user_task_due_to_fault,
+    service_deferred_work, set_linux_task_affinity, set_next_latency_pick_hint, set_next_pick_hint,
+    set_next_process_pick_hint, set_next_spawn_pick_hint, set_next_synchronous_pick_hint,
+    set_windows_current_thread_affinity, set_windows_process_affinity, stop_current_linux_process,
+    task_has_system_scheduling_class, terminate_user_process, terminate_user_task,
+    user_log_ids_for_task, wait_for_child, wake_task, wake_user_task, windows_process_affinity,
+    with_current_mm, with_current_process_credentials, with_current_process_state,
+    with_current_process_state_mut, with_current_user_linux_state_mut,
     with_current_user_process_and_linux_thread_state_mut, with_current_user_process_state,
     with_current_user_process_state_mut, with_process_state_by_pid, with_process_state_by_pid_mut,
 };
@@ -97,8 +98,6 @@ const USER_TASK_EXEC_PATH_CAPACITY: usize = 192;
 const USER_STACK_PAGE_SIZE: u64 = 4096;
 
 static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(0);
-static DEFERRED_RESCHEDULE_REQUESTED: [AtomicU64; nucleus_core::util::lockdep::MAX_TRACKED_CPUS] =
-    [const { AtomicU64::new(0) }; nucleus_core::util::lockdep::MAX_TRACKED_CPUS];
 static USER_RETURN_RESCHEDULE_ARMED: [AtomicU64; nucleus_core::util::lockdep::MAX_TRACKED_CPUS] =
     [const { AtomicU64::new(0) }; nucleus_core::util::lockdep::MAX_TRACKED_CPUS];
 
@@ -280,29 +279,6 @@ impl UserStackState {
         }
     }
 
-    pub fn contains_reserved_address(self, addr: u64) -> bool {
-        addr >= self.reserve_start && addr < self.committed_start
-    }
-
-    pub fn contains_stack_pointer(self, rsp: u64) -> bool {
-        rsp >= self.reserve_start && rsp < self.reserve_end
-    }
-
-    pub fn grow_to_include_fault(&mut self, fault_addr: u64) -> Option<(u64, u64, usize)> {
-        let fault_page = fault_addr & !(USER_STACK_PAGE_SIZE - 1);
-        if fault_page < self.reserve_start || fault_page >= self.committed_start {
-            return None;
-        }
-
-        let previous_committed_start = self.committed_start;
-        let page_count = ((previous_committed_start - fault_page) / USER_STACK_PAGE_SIZE) as usize;
-        if page_count == 0 {
-            return None;
-        }
-
-        self.committed_start = fault_page;
-        Some((fault_page, previous_committed_start, page_count))
-    }
 }
 
 #[derive(Debug, Clone)]

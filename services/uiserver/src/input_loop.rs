@@ -13,8 +13,8 @@ use crate::app::{
 };
 use crate::profile;
 use crate::sys::{
-    boot_line, diag_line, read_input, require_background_thread_class, InputEvent,
-    INPUT_ACTION_NONE, INPUT_KIND_POINTER_MOTION, INPUT_KIND_POINTER_POSITION,
+    boot_line, diag_line, read_input, spawn_ui_thread, InputEvent, UiThreadRole, INPUT_ACTION_NONE,
+    INPUT_KIND_POINTER_MOTION, INPUT_KIND_POINTER_POSITION,
 };
 use crate::wayland::WaylandCompositor;
 
@@ -281,135 +281,127 @@ pub(crate) fn start_input_reader(input_fds: Vec<OwnedFd>) -> Result<InputReader,
     let reader_wake_sender = shared_wake_sender.clone();
     let stats = Arc::new(InputReaderStats::new());
     let reader_stats = Arc::clone(&stats);
-    thread::Builder::new()
-        .name(String::from("uiserver-input-reader"))
-        .spawn(move || {
-            boot_line("uiserver: input reader worker enter");
-            require_background_thread_class();
-            let mut events = [InputEvent::default(); INPUT_EVENT_BATCH];
-            let mut readiness = [libc::epoll_event { events: 0, u64: 0 }; 8];
-            let mut first_read = true;
-            loop {
-                reader_stats
-                    .wait_started_ms
-                    .store(reader_stats.elapsed_ms(), Ordering::Release);
-                reader_stats.wait_active.store(true, Ordering::Release);
-                reader_stats.wait_attempts.fetch_add(1, Ordering::Relaxed);
-                let ready = loop {
-                    let ready = unsafe {
-                        libc::epoll_wait(
-                            input_wait_epoll.as_raw_fd(),
-                            readiness.as_mut_ptr(),
-                            readiness.len() as i32,
-                            -1,
-                        )
-                    };
-                    if ready >= 0 {
-                        break ready as usize;
-                    }
-                    let errno = std::io::Error::last_os_error()
-                        .raw_os_error()
-                        .unwrap_or(libc::EIO);
-                    if errno != libc::EINTR {
-                        diag_line(format!(
-                            "uiserver input watchdog panic: readiness wait failed errno={errno}"
-                        ));
-                        std::process::exit(134);
-                    }
+    spawn_ui_thread(UiThreadRole::Protocol, "uiserver-input-reader", move || {
+        boot_line("uiserver: input reader worker enter");
+        let mut events = [InputEvent::default(); INPUT_EVENT_BATCH];
+        let mut readiness = [libc::epoll_event { events: 0, u64: 0 }; 8];
+        let mut first_read = true;
+        loop {
+            reader_stats
+                .wait_started_ms
+                .store(reader_stats.elapsed_ms(), Ordering::Release);
+            reader_stats.wait_active.store(true, Ordering::Release);
+            reader_stats.wait_attempts.fetch_add(1, Ordering::Relaxed);
+            let ready = loop {
+                let ready = unsafe {
+                    libc::epoll_wait(
+                        input_wait_epoll.as_raw_fd(),
+                        readiness.as_mut_ptr(),
+                        readiness.len() as i32,
+                        -1,
+                    )
                 };
-                reader_stats.wait_active.store(false, Ordering::Release);
-                reader_stats.completed_waits.fetch_add(1, Ordering::Relaxed);
-                if readiness[..ready]
-                    .iter()
-                    .any(|event| event.events & (libc::EPOLLERR | libc::EPOLLHUP) as u32 != 0)
-                {
-                    diag_line("uiserver input watchdog panic: input provider revoked");
+                if ready >= 0 {
+                    break ready as usize;
+                }
+                let errno = std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO);
+                if errno != libc::EINTR {
+                    diag_line(format!(
+                        "uiserver input watchdog panic: readiness wait failed errno={errno}"
+                    ));
                     std::process::exit(134);
                 }
-                if first_read {
-                    boot_line("uiserver: input reader first nonblocking read begin");
-                }
-                reader_stats
-                    .read_started_ms
-                    .store(reader_stats.elapsed_ms(), Ordering::Release);
-                reader_stats.read_active.store(true, Ordering::Release);
-                reader_stats.read_attempts.fetch_add(1, Ordering::Relaxed);
-                let read_started = Instant::now();
-                let result = read_input(&input_fds, &mut events);
-                if first_read {
-                    boot_line("uiserver: input reader first nonblocking read returned");
-                    first_read = false;
-                }
-                reader_stats.read_active.store(false, Ordering::Release);
-                reader_stats.completed_reads.fetch_add(1, Ordering::Relaxed);
-                let read_count = match result {
-                    Ok(count) => count,
-                    Err(errno) => {
-                        reader_stats.errors.fetch_add(1, Ordering::Relaxed);
-                        diag_line(format!("uiserver: input reader failed errno={errno}"));
-                        continue;
-                    }
-                };
-                let read_elapsed = read_started.elapsed();
-                if read_elapsed.as_millis() >= SLOW_INPUT_READ_THRESHOLD_MS {
-                    reader_stats.slow_reads.fetch_add(1, Ordering::Relaxed);
-                    diag_line(format!(
-                        "uiserver: input read slow elapsed_ms={} events={}",
-                        read_elapsed.as_millis(),
-                        read_count,
-                    ));
-                }
-                if read_count == 0 {
+            };
+            reader_stats.wait_active.store(false, Ordering::Release);
+            reader_stats.completed_waits.fetch_add(1, Ordering::Relaxed);
+            if readiness[..ready]
+                .iter()
+                .any(|event| event.events & (libc::EPOLLERR | libc::EPOLLHUP) as u32 != 0)
+            {
+                diag_line("uiserver input watchdog panic: input provider revoked");
+                std::process::exit(134);
+            }
+            if first_read {
+                boot_line("uiserver: input reader first nonblocking read begin");
+            }
+            reader_stats
+                .read_started_ms
+                .store(reader_stats.elapsed_ms(), Ordering::Release);
+            reader_stats.read_active.store(true, Ordering::Release);
+            reader_stats.read_attempts.fetch_add(1, Ordering::Relaxed);
+            let read_started = Instant::now();
+            let result = read_input(&input_fds, &mut events);
+            if first_read {
+                boot_line("uiserver: input reader first nonblocking read returned");
+                first_read = false;
+            }
+            reader_stats.read_active.store(false, Ordering::Release);
+            reader_stats.completed_reads.fetch_add(1, Ordering::Relaxed);
+            let read_count = match result {
+                Ok(count) => count,
+                Err(errno) => {
+                    reader_stats.errors.fetch_add(1, Ordering::Relaxed);
+                    diag_line(format!("uiserver: input reader failed errno={errno}"));
                     continue;
                 }
-                reader_stats
-                    .raw_events
-                    .fetch_add(read_count as u64, Ordering::Relaxed);
-                let mut batch = InputReaderBatchCoalescer::default();
-                for event in events[..read_count].iter().copied() {
-                    batch.push(event);
-                }
-
-                let mut sent = 0_u64;
-                let mut coalesced = [InputEvent::default(); INPUT_EVENT_BATCH];
-                for event in batch.drain_into(&mut coalesced).iter().copied() {
-                    if sender.try_send(event).is_err() {
-                        let drop_count = reader_stats
-                            .queue_drops
-                            .fetch_add(1, Ordering::Relaxed)
-                            .saturating_add(1);
-                        if drop_count <= MAX_INITIAL_INPUT_DROP_LOGS
-                            || drop_count.is_power_of_two()
-                        {
-                            diag_line(format!(
-                                "uiserver: input reader queue full; dropping event drops={drop_count}"
-                            ));
-                        }
-                        break;
-                    }
-                    sent = sent.saturating_add(1);
-                }
-                reader_stats
-                    .delivered_events
-                    .fetch_add(sent, Ordering::Relaxed);
-                if sent > 0 {
-                    reader_stats
-                        .last_delivery_ms
-                        .store(reader_stats.elapsed_ms(), Ordering::Release);
-                    reader_wake_sender.signal();
-                }
+            };
+            let read_elapsed = read_started.elapsed();
+            if read_elapsed.as_millis() >= SLOW_INPUT_READ_THRESHOLD_MS {
+                reader_stats.slow_reads.fetch_add(1, Ordering::Relaxed);
+                diag_line(format!(
+                    "uiserver: input read slow elapsed_ms={} events={}",
+                    read_elapsed.as_millis(),
+                    read_count,
+                ));
             }
-        })
-        .unwrap_or_else(|_| {
-            diag_line("uiserver input watchdog panic: failed to spawn input reader");
-            std::process::exit(134);
-        });
+            if read_count == 0 {
+                continue;
+            }
+            reader_stats
+                .raw_events
+                .fetch_add(read_count as u64, Ordering::Relaxed);
+            let mut batch = InputReaderBatchCoalescer::default();
+            for event in events[..read_count].iter().copied() {
+                batch.push(event);
+            }
+
+            let mut sent = 0_u64;
+            let mut coalesced = [InputEvent::default(); INPUT_EVENT_BATCH];
+            for event in batch.drain_into(&mut coalesced).iter().copied() {
+                if sender.try_send(event).is_err() {
+                    let drop_count = reader_stats
+                        .queue_drops
+                        .fetch_add(1, Ordering::Relaxed)
+                        .saturating_add(1);
+                    if drop_count <= MAX_INITIAL_INPUT_DROP_LOGS || drop_count.is_power_of_two() {
+                        diag_line(format!(
+                            "uiserver: input reader queue full; dropping event drops={drop_count}"
+                        ));
+                    }
+                    break;
+                }
+                sent = sent.saturating_add(1);
+            }
+            reader_stats
+                .delivered_events
+                .fetch_add(sent, Ordering::Relaxed);
+            if sent > 0 {
+                reader_stats
+                    .last_delivery_ms
+                    .store(reader_stats.elapsed_ms(), Ordering::Release);
+                reader_wake_sender.signal();
+            }
+        }
+    })
+    .unwrap_or_else(|_| {
+        diag_line("uiserver input watchdog panic: failed to spawn input reader");
+        std::process::exit(134);
+    });
 
     let watchdog_stats = Arc::clone(&stats);
-    thread::Builder::new()
-        .name(String::from("uiserver-input-watchdog"))
-        .spawn(move || {
-            require_background_thread_class();
+    spawn_ui_thread(UiThreadRole::Watchdog, "uiserver-input-watchdog", move || {
             loop {
                 thread::sleep(INPUT_READER_WATCHDOG_INTERVAL);
                 let snapshot = watchdog_stats.snapshot();

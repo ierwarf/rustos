@@ -15,9 +15,9 @@ use crate::render::{self, default_console_window_rect, taskbar_slot_rect};
 use crate::runtime_sync::{runtime_program_is_hidden, runtime_program_title, RuntimeState};
 use crate::sys::{
     console_get_state, console_send_input_event, console_set_focus,
-    console_snapshot_session_output, console_snapshot_sessions, open_console,
-    require_background_thread_class, ConsoleSessionHandle, ConsoleSessionInfo, ConsoleStateInfo,
-    InputEvent, MAX_CONSOLE_SNAPSHOT_BYTES,
+    console_snapshot_session_output, console_snapshot_sessions, open_console, spawn_ui_thread,
+    ConsoleSessionHandle, ConsoleSessionInfo, ConsoleStateInfo, InputEvent, UiThreadRole,
+    MAX_CONSOLE_SNAPSHOT_BYTES,
 };
 use crate::wayland::WaylandCompositor;
 use runtime_control::RuntimeRunningProgram;
@@ -151,33 +151,38 @@ pub(crate) fn start_console_command_dispatcher(console_fd: OwnedFd) -> ConsoleCo
     let (sender, receiver) = mpsc::sync_channel::<ConsoleCommand>(CONSOLE_COMMAND_QUEUE_CAPACITY);
     let stats = Arc::new(ConsoleCommandStats::new());
     let worker_stats = Arc::clone(&stats);
-    thread::spawn(move || {
-        while let Ok(command) = receiver.recv() {
-            worker_stats
-                .active_started_ms
-                .store(worker_stats.elapsed_ms(), Ordering::Release);
-            worker_stats.active.store(true, Ordering::Release);
-            let started = Instant::now();
-            let result = match command {
-                ConsoleCommand::Input {
-                    session_handle,
-                    event,
-                } => console_send_input_event(console_fd.as_raw_fd(), session_handle, event),
-                ConsoleCommand::SetFocus { session_handle } => {
-                    console_set_focus(console_fd.as_raw_fd(), session_handle)
+    spawn_ui_thread(
+        UiThreadRole::Background,
+        "uiserver-console-command",
+        move || {
+            while let Ok(command) = receiver.recv() {
+                worker_stats
+                    .active_started_ms
+                    .store(worker_stats.elapsed_ms(), Ordering::Release);
+                worker_stats.active.store(true, Ordering::Release);
+                let started = Instant::now();
+                let result = match command {
+                    ConsoleCommand::Input {
+                        session_handle,
+                        event,
+                    } => console_send_input_event(console_fd.as_raw_fd(), session_handle, event),
+                    ConsoleCommand::SetFocus { session_handle } => {
+                        console_set_focus(console_fd.as_raw_fd(), session_handle)
+                    }
+                };
+                let elapsed = started.elapsed();
+                if elapsed >= SLOW_CONSOLE_INPUT_COMMAND_THRESHOLD {
+                    worker_stats.slow_commands.fetch_add(1, Ordering::Relaxed);
                 }
-            };
-            let elapsed = started.elapsed();
-            if elapsed >= SLOW_CONSOLE_INPUT_COMMAND_THRESHOLD {
-                worker_stats.slow_commands.fetch_add(1, Ordering::Relaxed);
+                if result.is_err() {
+                    worker_stats.errors.fetch_add(1, Ordering::Relaxed);
+                }
+                worker_stats.completed.fetch_add(1, Ordering::Relaxed);
+                worker_stats.active.store(false, Ordering::Release);
             }
-            if result.is_err() {
-                worker_stats.errors.fetch_add(1, Ordering::Relaxed);
-            }
-            worker_stats.completed.fetch_add(1, Ordering::Relaxed);
-            worker_stats.active.store(false, Ordering::Release);
-        }
-    });
+        },
+    )
+    .unwrap_or_else(|_| std::process::exit(134));
     ConsoleCommandDispatcher { sender, stats }
 }
 
@@ -189,26 +194,30 @@ struct ConsoleSessionOutput {
 
 pub(crate) fn start_console_refresh_worker() -> Receiver<ConsoleRefresh> {
     let (sender, receiver) = mpsc::sync_channel(2);
-    thread::spawn(move || {
-        require_background_thread_class();
-        let Ok(console_fd) = open_console() else {
-            return;
-        };
-        let mut snapshot = [0_u8; MAX_CONSOLE_SNAPSHOT_BYTES];
-        let mut output_generations = BTreeMap::<ConsoleSessionHandle, u64>::new();
-        loop {
-            if let Ok(refresh) = collect_console_refresh(
-                console_fd.as_raw_fd(),
-                &mut snapshot,
-                &mut output_generations,
-            ) {
-                if sender.try_send(refresh).is_err() {
-                    output_generations.clear();
+    spawn_ui_thread(
+        UiThreadRole::Background,
+        "uiserver-console-refresh",
+        move || {
+            let Ok(console_fd) = open_console() else {
+                return;
+            };
+            let mut snapshot = [0_u8; MAX_CONSOLE_SNAPSHOT_BYTES];
+            let mut output_generations = BTreeMap::<ConsoleSessionHandle, u64>::new();
+            loop {
+                if let Ok(refresh) = collect_console_refresh(
+                    console_fd.as_raw_fd(),
+                    &mut snapshot,
+                    &mut output_generations,
+                ) {
+                    if sender.try_send(refresh).is_err() {
+                        output_generations.clear();
+                    }
                 }
+                thread::sleep(CONSOLE_POLL_SLEEP);
             }
-            thread::sleep(CONSOLE_POLL_SLEEP);
-        }
-    });
+        },
+    )
+    .unwrap_or_else(|_| std::process::exit(134));
     receiver
 }
 

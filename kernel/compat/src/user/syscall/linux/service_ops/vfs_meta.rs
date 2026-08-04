@@ -624,9 +624,15 @@ pub fn syscall_linux_net6(
                     pending_transfers.drop_pending();
                     return linux_errno(LINUX_EIO);
                 }
-            } else if result.is_ok() && pending_transfers.commit_send().is_err() {
-                pending_transfers.drop_pending();
-                return linux_errno(LINUX_ESTALE);
+            } else if result.is_ok() {
+                let Some(accepted) = consumed else {
+                    pending_transfers.drop_pending();
+                    return linux_errno(LINUX_EIO);
+                };
+                if pending_transfers.commit_send(accepted).is_err() {
+                    pending_transfers.drop_pending();
+                    return linux_errno(LINUX_ESTALE);
+                }
             }
             match result {
                 Ok(()) => response.value,
@@ -691,12 +697,19 @@ impl PendingNetdTransfers {
         Ok(())
     }
 
-    fn commit_send(&mut self) -> Result<(), i64> {
+    fn commit_send(&mut self, accepted: usize) -> Result<(), i64> {
+        if let Some(stream) = self.stream.take() {
+            let reserved = stream
+                .end()
+                .checked_sub(stream.start())
+                .and_then(|len| usize::try_from(len).ok())
+                .ok_or(LINUX_ESTALE)?;
+            if (!self.tickets.is_empty() && accepted != reserved) || !stream.commit_send(accepted) {
+                return Err(LINUX_ESTALE);
+            }
+        }
         self.descriptors.clear();
         self.tickets.clear();
-        if let Some(stream) = self.stream.take() {
-            stream.commit_send();
-        }
         Ok(())
     }
 
@@ -729,10 +742,9 @@ impl PendingNetdTransfers {
     }
 
     fn drop_pending(&mut self) {
-        if self.descriptors.is_empty() {
-            return;
+        if !self.descriptors.is_empty() {
+            super::super::ipc_ops::drop_transfer_descriptors(self.descriptors.as_slice());
         }
-        super::super::ipc_ops::drop_transfer_descriptors(self.descriptors.as_slice());
         self.descriptors.clear();
         self.tickets.clear();
         self.stream.take();

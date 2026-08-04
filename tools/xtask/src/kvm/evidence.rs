@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: MIT
-
 fn required_dvm_gpu_ready(
     options: &SmokeOptions,
     log: &str,
@@ -18,29 +17,35 @@ fn dvm_gpu_compositor_ready(log: &str, expected: GpuEvidenceExpectation) -> bool
         "rustos-dvm-gpu: contract negative selftest failed",
     ];
     let mut ready = false;
-    let mut health_sequence = 0_u64;
+    let mut healthy_run = 0_u64;
+    let mut last_health_sequence = None;
     for line in log.lines() {
         if failure_after_ready
             .iter()
             .any(|marker| line.contains(marker))
         {
             ready = false;
-            health_sequence = 0;
+            healthy_run = 0;
+            last_health_sequence = None;
             continue;
         }
         if let Some((_, fields)) = line.split_once("rustos-dvm-gpu: health ") {
             let sequence = log_u64(fields, "sequence");
             let completion = log_u64(fields, "completion_us");
-            if sequence.is_some_and(|value| value == health_sequence + 1)
+            let ordered = sequence.is_some_and(|value| {
+                value != 0
+                    && last_health_sequence.is_none_or(|previous| value == previous + 1)
+            });
+            last_health_sequence = sequence;
+            if ordered
                 && completion.is_some_and(|value| value > 0 && value <= 16_667)
                 && fields
                     .split_whitespace()
                     .any(|field| field == "acquire-fence=1")
             {
-                health_sequence += 1;
+                healthy_run += 1;
             } else {
-                ready = false;
-                health_sequence = 0;
+                healthy_run = 0;
             }
             continue;
         }
@@ -128,9 +133,10 @@ fn dvm_gpu_compositor_ready(log: &str, expected: GpuEvidenceExpectation) -> bool
             && fields
                 .split_whitespace()
                 .any(|field| field == "hash-dynamic=1");
-        health_sequence = 0;
+        healthy_run = 0;
+        last_health_sequence = None;
     }
-    ready && health_sequence >= DVM_GPU_HEALTH_SAMPLES
+    ready && healthy_run >= DVM_GPU_HEALTH_SAMPLES
 }
 
 fn dvm_display_failure(log: &str, physical_gpu: bool) -> Option<String> {
@@ -354,6 +360,34 @@ struct KvmFailureSummary<'a> {
     causal_tail: Vec<KvmCausalEvent>,
 }
 
+#[derive(Debug, Serialize)]
+struct KvmSuccessArtifact {
+    path: String,
+    bytes: u64,
+    sha256: String,
+}
+
+#[derive(Debug, Serialize)]
+struct KvmSuccessSummary {
+    schema: &'static str,
+    status: &'static str,
+    rustos_vcpus: u8,
+    boot_elapsed_ms: u64,
+    formal_profile: &'static str,
+    source_tree_sha256: String,
+    formal_verification: KvmSuccessArtifact,
+    rustos_boot_image: KvmSuccessArtifact,
+    dvm_kernel: KvmSuccessArtifact,
+    dvm_rootfs: KvmSuccessArtifact,
+    rustos_log: KvmFailureLog,
+    dvm_log: KvmFailureLog,
+    required_rustos_markers: usize,
+    required_dvm_markers: usize,
+    smp_runtime_markers: usize,
+    ui_minimum_fps: Option<u32>,
+    ui_proof_windows: usize,
+}
+
 fn structured_guest_timestamp_us(line: &str) -> Option<u64> {
     line.split_ascii_whitespace().find_map(|field| {
         field
@@ -370,6 +404,21 @@ fn runtime_log_sha256(log: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(log.as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+fn binary_artifact(root: &Path, path: &Path) -> Result<KvmSuccessArtifact> {
+    let bytes = fs::read(path).with_context(|| format!("read evidence artifact {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    Ok(KvmSuccessArtifact {
+        path: path
+            .strip_prefix(root)
+            .unwrap_or(path)
+            .display()
+            .to_string(),
+        bytes: bytes.len().try_into().unwrap_or(u64::MAX),
+        sha256: format!("{:x}", hasher.finalize()),
+    })
 }
 
 fn causal_record(line: &str) -> bool {
@@ -469,6 +518,114 @@ fn write_kvm_failure_summary(
     fs::rename(&temporary, &path)
         .with_context(|| format!("publish KVM failure evidence {}", path.display()))?;
     Ok(path)
+}
+
+fn write_kvm_success_summary(
+    config: &Config,
+    artifacts: &DvmArtifacts,
+    layout: &KvmLayout,
+    options: &SmokeOptions,
+    boot_elapsed: Duration,
+) -> Result<Option<PathBuf>> {
+    if !options.smp_iteration {
+        return Ok(None);
+    }
+    crate::formal_contracts::validate_smp_launch_evidence(
+        &config.root_dir,
+        "smp-iteration",
+    )?;
+    let formal_path = config
+        .root_dir
+        .join("build/formal/verification-run/smp-iteration.json");
+    let formal_bytes = fs::read(&formal_path)
+        .with_context(|| format!("read SMP formal evidence {}", formal_path.display()))?;
+    let formal: serde_json::Value = serde_json::from_slice(&formal_bytes)?;
+    let source_tree_sha256 = formal
+        .get("source_tree_sha256")
+        .and_then(serde_json::Value::as_str)
+        .context("SMP formal evidence lacks source_tree_sha256")?
+        .to_owned();
+    let rustos_log = read_runtime_log_if_present(&layout.debugcon_log)?;
+    let dvm_log = read_runtime_log_if_present(&layout.dvm_serial_log)?;
+    let missing_smp = smp_runtime_missing_markers(&rustos_log, options.rustos_vcpus);
+    let missing_rustos = options
+        .expected_markers
+        .iter()
+        .filter(|marker| !rustos_marker_present(&rustos_log, marker))
+        .collect::<Vec<_>>();
+    let missing_dvm = options
+        .expected_dvm_markers
+        .iter()
+        .filter(|marker| !dvm_log.contains(marker.as_str()))
+        .collect::<Vec<_>>();
+    if !missing_smp.is_empty() || !missing_rustos.is_empty() || !missing_dvm.is_empty() {
+        bail!(
+            "refusing to publish incomplete SMP success evidence: smp={missing_smp:?} rustos={missing_rustos:?} dvm={missing_dvm:?}"
+        );
+    }
+    let smp_runtime_markers = usize::from(options.rustos_vcpus)
+        * if options.rustos_vcpus > 1 { 5 } else { 4 };
+    let summary = KvmSuccessSummary {
+        schema: "rustos-kvm-smp-correctness-evidence-v1",
+        status: "passed",
+        rustos_vcpus: options.rustos_vcpus,
+        boot_elapsed_ms: boot_elapsed.as_millis().try_into().unwrap_or(u64::MAX),
+        formal_profile: "smp-iteration",
+        source_tree_sha256: source_tree_sha256.clone(),
+        formal_verification: binary_artifact(&config.root_dir, &formal_path)?,
+        rustos_boot_image: binary_artifact(&config.root_dir, &config.boot_disk_image)?,
+        dvm_kernel: binary_artifact(&config.root_dir, &artifacts.kernel)?,
+        dvm_rootfs: binary_artifact(&config.root_dir, &artifacts.rootfs)?,
+        rustos_log: KvmFailureLog {
+            path: layout.debugcon_log.display().to_string(),
+            bytes: rustos_log.len(),
+            sha256: runtime_log_sha256(&rustos_log),
+            latest_guest_ts_us: latest_guest_timestamp_us(&rustos_log),
+        },
+        dvm_log: KvmFailureLog {
+            path: layout.dvm_serial_log.display().to_string(),
+            bytes: dvm_log.len(),
+            sha256: runtime_log_sha256(&dvm_log),
+            latest_guest_ts_us: latest_guest_timestamp_us(&dvm_log),
+        },
+        required_rustos_markers: options.expected_markers.len(),
+        required_dvm_markers: options.expected_dvm_markers.len(),
+        smp_runtime_markers,
+        ui_minimum_fps: options.min_ui_fps,
+        ui_proof_windows: options.ui_proof_windows,
+    };
+    let evidence_dir = layout.run_dir.join("smp-evidence");
+    fs::create_dir_all(&evidence_dir)?;
+    let hash_prefix = source_tree_sha256
+        .get(..16)
+        .context("SMP source-tree hash is not canonical SHA-256")?;
+    let name = format!("vcpu-{}-{hash_prefix}.json", options.rustos_vcpus);
+    let path = evidence_dir.join(&name);
+    let temporary = evidence_dir.join(format!("{name}.tmp"));
+    let mut encoded = serde_json::to_vec_pretty(&summary)?;
+    encoded.push(b'\n');
+    fs::write(&temporary, &encoded)
+        .with_context(|| format!("write temporary KVM success evidence {}", temporary.display()))?;
+    fs::rename(&temporary, &path)
+        .with_context(|| format!("publish KVM success evidence {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    hasher.update(&encoded);
+    let digest = format!("{:x}", hasher.finalize());
+    let checksum_path = evidence_dir.join(format!("{name}.sha256"));
+    let checksum_temporary = evidence_dir.join(format!("{name}.sha256.tmp"));
+    fs::write(&checksum_temporary, format!("{digest}  {name}\n")).with_context(|| {
+        format!(
+            "write temporary KVM success checksum {}",
+            checksum_temporary.display()
+        )
+    })?;
+    fs::rename(&checksum_temporary, &checksum_path).with_context(|| {
+        format!(
+            "publish KVM success checksum {}",
+            checksum_path.display()
+        )
+    })?;
+    Ok(Some(path))
 }
 
 fn uiserver_idle_ticks_healthy(log: &str, required_ticks: usize) -> bool {

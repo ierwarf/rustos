@@ -96,7 +96,7 @@ struct SocketTransferState {
 pub struct SocketStreamGuard {
     transfer: Arc<SocketTransferState>,
     start: u64,
-    end: u64,
+    max_end: u64,
     send: bool,
     settled: bool,
 }
@@ -178,19 +178,12 @@ impl SocketHandle {
             &self.transfer.recv_position
         };
         let start = position.load(Ordering::Acquire);
-        let end = if send {
+        let max_end = if send {
             let len = len as u64;
             let Some(end) = start.checked_add(len) else {
                 busy.store(false, Ordering::Release);
                 return None;
             };
-            if position
-                .compare_exchange(start, end, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
-                busy.store(false, Ordering::Release);
-                return None;
-            }
             end
         } else {
             start
@@ -198,7 +191,7 @@ impl SocketHandle {
         Some(SocketStreamGuard {
             transfer: self.transfer.clone(),
             start,
-            end,
+            max_end,
             send,
             settled: false,
         })
@@ -227,12 +220,32 @@ impl SocketStreamGuard {
     }
 
     pub const fn end(&self) -> u64 {
-        self.end
+        self.max_end
     }
 
-    pub fn commit_send(mut self) {
-        debug_assert!(self.send);
+    pub fn commit_send(mut self, accepted: usize) -> bool {
+        if !self.send {
+            return false;
+        }
+        let Ok(accepted) = u64::try_from(accepted) else {
+            return false;
+        };
+        let Some(end) = self.start.checked_add(accepted) else {
+            return false;
+        };
+        if end > self.max_end
+            || self
+                .transfer
+                .send_position
+                .compare_exchange(self.start, end, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            self.transfer.poisoned.store(true, Ordering::Release);
+            return false;
+        }
+        self.max_end = end;
         self.settled = true;
+        true
     }
 
     pub fn commit_receive(mut self, len: usize) -> bool {
@@ -253,7 +266,7 @@ impl SocketStreamGuard {
         {
             return false;
         }
-        self.end = end;
+        self.max_end = end;
         self.settled = true;
         true
     }
@@ -261,22 +274,44 @@ impl SocketStreamGuard {
 
 impl Drop for SocketStreamGuard {
     fn drop(&mut self) {
-        if self.send && !self.settled {
-            if self
-                .transfer
-                .send_position
-                .compare_exchange(self.end, self.start, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
-                self.transfer.poisoned.store(true, Ordering::Release);
-            }
-        }
         let busy = if self.send {
             &self.transfer.send_in_flight
         } else {
             &self.transfer.recv_in_flight
         };
         busy.store(false, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SocketHandle;
+
+    #[test]
+    fn partial_send_advances_only_the_provider_accepted_range() {
+        let socket = SocketHandle::from_token(7, 1, 1, 0);
+        assert!(socket.bind_channel(9, 1));
+
+        let first = socket.begin_stream_send(64).expect("first reservation");
+        assert_eq!((first.start(), first.end()), (0, 64));
+        assert!(first.commit_send(4));
+
+        let second = socket.begin_stream_send(8).expect("second reservation");
+        assert_eq!((second.start(), second.end()), (4, 12));
+        drop(second);
+
+        let retry = socket.begin_stream_send(8).expect("aborted range retry");
+        assert_eq!((retry.start(), retry.end()), (4, 12));
+        assert!(retry.commit_send(8));
+    }
+
+    #[test]
+    fn provider_cannot_accept_beyond_the_reserved_range() {
+        let socket = SocketHandle::from_token(8, 1, 1, 0);
+        assert!(socket.bind_channel(10, 2));
+        let reservation = socket.begin_stream_send(3).expect("reservation");
+        assert!(!reservation.commit_send(4));
+        assert!(socket.begin_stream_send(1).is_none());
     }
 }
 // RING3-MIGRATION-REFERENCE END: netd-owned socket policy token substrate.

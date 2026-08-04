@@ -364,15 +364,51 @@ pub fn inherit_ipc_priority(reply: u64, donor_task_id: u64, receiver_task_id: u6
     })
 }
 
-/// Starts the same reply-scoped donation for a process-owned endpoint before a
-/// concrete receiver worker has entered `IPC_RECV`.
-pub fn inherit_ipc_priority_for_process(
+pub fn reserve_ipc_priority(donor_task_id: u64) -> bool {
+    // SAFETY: interrupt exclusion and the scheduler access guard serialize the
+    // exact donor reservation; no scheduler-owned reference escapes.
+    interrupts::without_interrupts(|| unsafe {
+        scheduler_mut().reserve_ipc_priority(donor_task_id)
+    })
+}
+
+pub fn cancel_ipc_priority_reservation(donor_task_id: u64) -> bool {
+    // SAFETY: interrupt exclusion and the scheduler access guard serialize the
+    // exact donor reservation cancellation; no borrow escapes.
+    interrupts::without_interrupts(|| unsafe {
+        scheduler_mut().cancel_ipc_priority_reservation(donor_task_id)
+    })
+}
+
+pub fn attach_reserved_ipc_priority(reply: u64, donor_task_id: u64) -> bool {
+    // SAFETY: interrupt exclusion and the scheduler access guard transfer one
+    // temporary donor reservation to one immutable reply identity.
+    interrupts::without_interrupts(|| unsafe {
+        scheduler_mut().attach_reserved_ipc_priority(reply, donor_task_id)
+    })
+}
+
+pub fn bind_reserved_ipc_priority(reply: u64, donor_task_id: u64, receiver_task_id: u64) -> bool {
+    // SAFETY: interrupt exclusion and the scheduler access guard make binding
+    // the reserved donor to one reply/receiver an atomic scheduler mutation.
+    interrupts::without_interrupts(|| unsafe {
+        scheduler_mut().bind_reserved_ipc_priority(reply, donor_task_id, receiver_task_id)
+    })
+}
+
+/// Selects and binds one exact worker for a process-owned endpoint in the same
+/// scheduler transaction that reserves its reply-scoped donation.
+pub fn bind_ipc_priority_to_process_worker(
     reply: u64,
     donor_task_id: u64,
     receiver_process_id: u64,
-) -> bool {
+) -> Option<u64> {
     interrupts::without_interrupts(|| unsafe {
-        scheduler_mut().inherit_ipc_priority_for_process(reply, donor_task_id, receiver_process_id)
+        scheduler_mut().bind_ipc_priority_to_process_worker(
+            reply,
+            donor_task_id,
+            receiver_process_id,
+        )
     })
 }
 
@@ -833,69 +869,13 @@ pub fn retire_current_user_task_due_to_fault(
     rip: u64,
     rsp: u64,
 ) -> UserFaultDisposition {
-    // SAFETY: interrupt exclusion and the scheduler access guard serialize
-    // only immutable plan creation; no process-state lock is acquired here.
-    let growth_plan = interrupts::without_interrupts(|| unsafe {
-        scheduler_ref().prepare_current_user_stack_growth_on_fault(vector, error_code, cr2, rsp)
-    });
-    if let Some(plan) = growth_plan {
-        let mapped =
-            process_table::try_with_process_state_mut(plan.process_handle, |_, process_state| {
-                if process_state.address_space_root() != plan.address_space_root {
-                    return false;
-                }
-                let (address_space, linux_process_state) =
-                    process_state.address_space_and_linux_process_state_mut();
-                let Some(linux_process_state) = linux_process_state.as_mut() else {
-                    return false;
-                };
-                if !linux_process_state.is_range_reserved(plan.growth_start, plan.growth_end) {
-                    return false;
-                }
-                if address_space
-                    .map_zeroed_user_pages_at(
-                        VirtAddr::new(plan.growth_start),
-                        plan.page_count,
-                        x86_64::structures::paging::PageTableFlags::WRITABLE
-                            | x86_64::structures::paging::PageTableFlags::NO_EXECUTE,
-                    )
-                    .is_err()
-                {
-                    return false;
-                }
-                if linux_process_state
-                    .release_reserved_range(plan.growth_start, plan.growth_end)
-                    .is_err()
-                {
-                    address_space
-                        .unmap_user_pages_at(VirtAddr::new(plan.growth_start), plan.page_count)
-                        .expect("user stack growth rollback failed");
-                    return false;
-                }
-                true
-            })
-            .unwrap_or(false);
-        if mapped {
-            // SAFETY: the process-state guard was released by the helper;
-            // this phase only revalidates and commits scheduler metadata.
-            let committed = interrupts::without_interrupts(|| unsafe {
-                scheduler_mut().commit_current_user_stack_growth(plan)
-            });
-            if committed {
-                debug::debug!(
-                    sched,
-                    "grew user stack task={} slot={} cr2={:#x} rsp={:#x} new_start={:#x} pages={}",
-                    plan.task_id,
-                    plan.slot,
-                    cr2,
-                    rsp,
-                    plan.growth_start,
-                    plan.page_count,
-                );
-                return UserFaultDisposition::Resumed;
-            }
-        }
-    }
+    // Release stacks eagerly map every usable page above the permanent guard.
+    // There is therefore no supported lazy-growth fault in the enabled
+    // topology. The former dormant path used a nonblocking ProcessState lock
+    // and collapsed transient contention into task retirement; retaining it
+    // would silently reactivate that bug if stack reservation policy changed.
+    // A future lazy profile must introduce an explicit deferred-fault owner
+    // and generation-bound retry before this exception path may resume faults.
     let disposition = interrupts::without_interrupts(|| unsafe {
         scheduler_mut().retire_current_user_task_due_to_fault(vector, error_code, cr2, rip, rsp)
     });

@@ -20,15 +20,22 @@ use super::*;
 use lazy_static::lazy_static;
 use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
 use rustos_user_abi::syscall::{
-    WAITSET_GLOBAL_OBJECT_ID, WAITSET_PROVIDER_INPUTD, WAITSET_PROVIDER_MAX, WAITSET_PROVIDER_NETD,
+    WAITSET_MAX_INTERESTS, WAITSET_PROVIDER_INPUTD, WAITSET_PROVIDER_MAX, WAITSET_PROVIDER_NETD,
     WAITSET_PROVIDER_SESSIOND, WAITSET_PROVIDER_VFSD, WaitSetSignalBrokerArgs,
     waitset_signal_shape_valid,
 };
+// Preallocated system-wide observation slab. One task may arm the ABI maximum;
+// the remaining capacity admits ordinary multi-provider waits concurrently.
+// Exhaustion is explicit EBUSY and never collapses identities or allocates in
+// the raw registry critical section.
+const WAITSET_OBSERVATIONS_PER_TASK_BUDGET: usize = 16;
 const WAITSET_WAITER_CAPACITY: usize =
-    multitask::MAX_SCHEDULER_TASKS * WAITSET_PROVIDER_MAX as usize;
+    multitask::MAX_SCHEDULER_TASKS * WAITSET_OBSERVATIONS_PER_TASK_BUDGET;
+pub(crate) const WAITSET_MAX_OBSERVATIONS: usize = WAITSET_MAX_INTERESTS + 1;
+const _: () = assert!(WAITSET_WAITER_CAPACITY >= WAITSET_MAX_OBSERVATIONS);
 const INPUT_OPEN_DESCRIPTION_CAPACITY: usize = 256;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ProviderObservation {
     pub provider: u16,
     pub object_id: u64,
@@ -138,11 +145,10 @@ fn register_waitset_waiters_faultable(
     if task_id == 0
         || process_id == 0
         || observations.is_empty()
-        || observations.len() > WAITSET_PROVIDER_MAX as usize
+        || observations.len() > WAITSET_MAX_OBSERVATIONS
         || observations.iter().any(|observation| {
             observation.provider == 0
                 || observation.provider > WAITSET_PROVIDER_MAX
-                || observation.object_id != WAITSET_GLOBAL_OBJECT_ID
                 || observation.generation == 0
         })
     {
@@ -152,29 +158,35 @@ fn register_waitset_waiters_faultable(
         return Err(LINUX_EBUSY);
     }
     let mut waiters = WAITSET_WAITERS.lock();
+    let existing = waiters
+        .iter()
+        .flatten()
+        .filter(|waiter| waiter.task_id == task_id)
+        .count();
+    let free = waiters.iter().filter(|slot| slot.is_none()).count();
+    if free.saturating_add(existing) < observations.len() {
+        return Err(LINUX_EBUSY);
+    }
+    // Replacement is one bounded transaction: capacity is proved first, the
+    // prior set is removed, then the complete new set is installed without an
+    // allocator or fallible operation under the registry lock.
     for slot in waiters.iter_mut() {
-        // Task retirement and process teardown are the authoritative cleanup
-        // owners (`remove_waitset_waiters*`).  Do not query the global
-        // scheduler once per registry slot while holding the wait-set lock:
-        // that inverted dependency serializes registration with every
-        // dispatch and would defeat per-CPU run-queue locality.
-        if slot.is_some_and(|waiter| waiter.task_id == task_id) {
+        if slot
+            .as_ref()
+            .is_some_and(|waiter| waiter.task_id == task_id)
+        {
             *slot = None;
         }
     }
-    let free = waiters.iter().filter(|slot| slot.is_none()).count();
-    if free < observations.len() {
-        return Err(LINUX_EBUSY);
-    }
-    for observation in observations {
+    for observation in observations.iter().copied() {
         let slot = waiters
             .iter_mut()
             .find(|slot| slot.is_none())
-            .expect("wait-set capacity changed while locked");
+            .expect("waitset capacity preflight diverged");
         *slot = Some(WaitSetWaiter {
             task_id,
             process_id,
-            observation: *observation,
+            observation,
         });
     }
     Ok(())
@@ -184,7 +196,10 @@ pub(crate) fn remove_waitset_waiters(task_id: u64) -> usize {
     let mut waiters = WAITSET_WAITERS.lock();
     let mut removed = 0;
     for slot in waiters.iter_mut() {
-        if slot.is_some_and(|waiter| waiter.task_id == task_id) {
+        if slot
+            .as_ref()
+            .is_some_and(|waiter| waiter.task_id == task_id)
+        {
             *slot = None;
             removed += 1;
         }
@@ -205,24 +220,21 @@ pub(crate) fn waitset_waiters_match(
         return true;
     }
     let waiters = WAITSET_WAITERS.lock();
-    let mut matched = 0usize;
-    for waiter in waiters
+    let mut installed = waiters
         .iter()
         .flatten()
-        .filter(|waiter| waiter.task_id == task_id && waiter.process_id == process_id)
-    {
-        if !observations.contains(&waiter.observation) {
-            return false;
-        }
-        matched += 1;
-    }
-    matched == observations.len()
+        .filter(|waiter| waiter.task_id == task_id && waiter.process_id == process_id);
+    installed.clone().count() == observations.len()
+        && installed.all(|waiter| observations.contains(&waiter.observation))
 }
 
 pub(crate) fn remove_waitset_waiters_for_process(process_id: u64) {
     let mut waiters = WAITSET_WAITERS.lock();
     for slot in waiters.iter_mut() {
-        if slot.is_some_and(|waiter| waiter.process_id == process_id) {
+        if slot
+            .as_ref()
+            .is_some_and(|waiter| waiter.process_id == process_id)
+        {
             *slot = None;
         }
     }
@@ -232,7 +244,7 @@ pub(crate) fn revoke_waitset_provider(service_id: u64) {
     let Some(provider) = provider_for_service(service_id) else {
         return;
     };
-    wake_matching(provider, WAITSET_GLOBAL_OBJECT_ID, None);
+    wake_matching(provider, None, None);
 }
 
 pub(super) fn syscall_linux_rustos_waitset_signal_broker(args_ptr: u64) -> u64 {
@@ -252,34 +264,53 @@ pub(super) fn syscall_linux_rustos_waitset_signal_broker(args_ptr: u64) -> u64 {
     if !ipc_ops::process_owns_live_service_endpoint(process_id, service_id) {
         return linux_errno(LINUX_EPERM);
     }
-    wake_matching(args.provider, args.object_id, Some(args.generation));
+    wake_matching(args.provider, Some(args.object_id), Some(args.generation));
     0
 }
 
-fn wake_matching(provider: u16, object_id: u64, generation: Option<u64>) {
+fn wake_matching(provider: u16, object_id: Option<u64>, generation: Option<u64>) {
     let mut task_ids = [0_u64; WAITSET_WAITER_CAPACITY];
-    let mut count = 0usize;
-    {
-        let mut waiters = WAITSET_WAITERS.lock();
-        for slot in waiters.iter_mut() {
-            let Some(waiter) = *slot else {
-                continue;
-            };
-            if waiter.observation.provider != provider
-                || waiter.observation.object_id != object_id
-                || generation
-                    .is_some_and(|value| !generation_advances(waiter.observation.generation, value))
-            {
-                continue;
-            }
-            task_ids[count] = waiter.task_id;
-            count += 1;
-            *slot = None;
-        }
-    }
+    let count = take_matching_waiters(provider, object_id, generation, &mut task_ids);
     for task_id in task_ids.into_iter().take(count) {
         let _ = multitask::wake_task(task_id);
     }
+}
+
+fn take_matching_waiters(
+    provider: u16,
+    object_id: Option<u64>,
+    generation: Option<u64>,
+    task_ids: &mut [u64; WAITSET_WAITER_CAPACITY],
+) -> usize {
+    let mut count = 0usize;
+    {
+        let mut waiters = WAITSET_WAITERS.lock();
+        for waiter in waiters.iter().flatten() {
+            let matches = {
+                let observation = waiter.observation;
+                observation.provider == provider
+                    && object_id.is_none_or(|object| observation.object_id == object)
+                    && generation
+                        .is_none_or(|value| generation_advances(observation.generation, value))
+            };
+            if !matches {
+                continue;
+            }
+            if !task_ids[..count].contains(&waiter.task_id) {
+                task_ids[count] = waiter.task_id;
+                count += 1;
+            }
+        }
+        for slot in waiters.iter_mut() {
+            if slot
+                .as_ref()
+                .is_some_and(|waiter| task_ids[..count].contains(&waiter.task_id))
+            {
+                *slot = None;
+            }
+        }
+    }
+    count
 }
 
 fn generation_advances(observed: u64, published: u64) -> bool {
@@ -313,11 +344,11 @@ mod tests {
         generation_advances, input_open_description_access, provider_for_service,
         register_input_open_description, register_waitset_waiters,
         register_waitset_waiters_faultable, release_input_open_description, remove_waitset_waiters,
-        service_for_provider, waitset_waiters_match,
+        service_for_provider, take_matching_waiters, waitset_waiters_match,
     };
     use rustos_user_abi::syscall::{
         INPUTD_ACCESS_EVDEV, IPC_SERVICE_INPUTD, IPC_SERVICE_NETD, IPC_SERVICE_SESSIOND,
-        IPC_SERVICE_VFSD, WAITSET_GLOBAL_OBJECT_ID, WAITSET_PROVIDER_INPUTD, WAITSET_PROVIDER_NETD,
+        IPC_SERVICE_VFSD, WAITSET_PROVIDER_INPUTD, WAITSET_PROVIDER_NETD,
         WAITSET_PROVIDER_SESSIOND, WAITSET_PROVIDER_VFSD,
     };
     use spin::Mutex;
@@ -333,12 +364,12 @@ mod tests {
     }
 
     #[test]
-    fn waiter_capacity_covers_every_scheduler_task_provider_pair() {
+    fn waiter_capacity_admits_one_maximal_arm_and_bounded_concurrency() {
         assert_eq!(
             WAITSET_WAITER_CAPACITY,
-            super::multitask::MAX_SCHEDULER_TASKS
-                * rustos_user_abi::syscall::WAITSET_PROVIDER_MAX as usize
+            super::multitask::MAX_SCHEDULER_TASKS * super::WAITSET_OBSERVATIONS_PER_TASK_BUDGET
         );
+        assert!(WAITSET_WAITER_CAPACITY >= super::WAITSET_MAX_OBSERVATIONS);
     }
 
     #[test]
@@ -393,7 +424,7 @@ mod tests {
         let process_id = u64::MAX - 102;
         let observations = [ProviderObservation {
             provider: WAITSET_PROVIDER_NETD,
-            object_id: WAITSET_GLOBAL_OBJECT_ID,
+            object_id: 41,
             generation: 7,
         }];
         register_waitset_waiters(task_id, process_id, &observations).expect("register waiter");
@@ -410,12 +441,12 @@ mod tests {
         let process_id = u64::MAX - 202;
         let original = [ProviderObservation {
             provider: WAITSET_PROVIDER_NETD,
-            object_id: WAITSET_GLOBAL_OBJECT_ID,
+            object_id: 41,
             generation: 11,
         }];
         let replacement = [ProviderObservation {
             provider: WAITSET_PROVIDER_VFSD,
-            object_id: WAITSET_GLOBAL_OBJECT_ID,
+            object_id: 42,
             generation: 12,
         }];
         register_waitset_waiters(task_id, process_id, &original).expect("register waiter");
@@ -426,5 +457,33 @@ mod tests {
         assert!(waitset_waiters_match(task_id, process_id, &original));
         assert!(!waitset_waiters_match(task_id, process_id, &replacement));
         remove_waitset_waiters(task_id);
+    }
+
+    #[test]
+    fn exact_object_publication_never_removes_a_foreign_wait_set() {
+        let _guard = WAITSET_TEST_GUARD.lock();
+        let first_task = u64::MAX - 301;
+        let second_task = u64::MAX - 302;
+        let process_id = u64::MAX - 303;
+        let first = [ProviderObservation {
+            provider: WAITSET_PROVIDER_NETD,
+            object_id: 41,
+            generation: 7,
+        }];
+        let second = [ProviderObservation {
+            provider: WAITSET_PROVIDER_NETD,
+            object_id: 42,
+            generation: 7,
+        }];
+        register_waitset_waiters(first_task, process_id, &first).expect("first exact waiter");
+        register_waitset_waiters(second_task, process_id, &second).expect("second exact waiter");
+
+        let mut task_ids = [0_u64; super::WAITSET_WAITER_CAPACITY];
+        let count = take_matching_waiters(WAITSET_PROVIDER_NETD, Some(41), Some(8), &mut task_ids);
+
+        assert_eq!(&task_ids[..count], &[first_task]);
+        assert!(!waitset_waiters_match(first_task, process_id, &first));
+        assert!(waitset_waiters_match(second_task, process_id, &second));
+        remove_waitset_waiters(second_task);
     }
 }

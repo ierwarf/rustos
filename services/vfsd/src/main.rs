@@ -27,6 +27,7 @@ use alloc::ffi::CString;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use core::cell::UnsafeCell;
 use core::mem::{size_of, MaybeUninit};
 #[cfg(all(not(test), not(clippy)))]
 use core::panic::PanicInfo;
@@ -70,8 +71,7 @@ use rustos_user_abi::syscall::{
 };
 #[cfg(not(test))]
 use rustos_user_abi::syscall::{
-    WaitSetSignalBrokerArgs, SYS_RUSTOS_WAITSET_SIGNAL_BROKER, WAITSET_GLOBAL_OBJECT_ID,
-    WAITSET_PROVIDER_VFSD,
+    WaitSetSignalBrokerArgs, SYS_RUSTOS_WAITSET_SIGNAL_BROKER, WAITSET_PROVIDER_VFSD,
 };
 use storage_fat::{FatDirEntry, FatNodeKind, FatVolume};
 use vfsd::{
@@ -90,6 +90,8 @@ mod block;
 mod devmgrd;
 mod early_system;
 mod linux_types;
+mod snapshot_worker;
+mod storage_owner;
 mod util;
 
 use block::BootBlockDevice;
@@ -97,6 +99,9 @@ use devmgrd::{devmgrd_dir_entries, devmgrd_lookup};
 use linux_types::{
     validate_linux_request, validate_vfs_request, LinuxSyscallOffloadRequest,
     LinuxSyscallOffloadResponse,
+};
+use snapshot_worker::{
+    demote_current_thread_or_exit, enqueue_executable_snapshot, ensure_snapshot_worker,
 };
 use util::{
     build_linux_stat, build_linux_statx, encode_dirent, handle_kind_u16, is_at_fdcwd,
@@ -167,7 +172,7 @@ const EXECUTABLE_SNAPSHOT_MAX_BYTES: u64 = 128 * 1024 * 1024;
 const EXECUTABLE_SNAPSHOT_CACHE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 const EXECUTABLE_SNAPSHOT_WRITE_CHUNK_BYTES: usize = 256 * 1024;
 const UI_SERVER_EXEC_PATH: &[u8] = b"services/uiserver/uiserver.elf";
-static POST_UI_DEMOTED: AtomicBool = AtomicBool::new(false);
+static SNAPSHOT_WORKER_DEMOTED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy)]
 struct ExecutableSnapshot {
@@ -257,6 +262,16 @@ fn service_main() {
         return;
     }
     ipc::debug_line("vfsd: vfs policy endpoint registered");
+    if ensure_snapshot_worker().is_err() {
+        // procd is an independently starting core service. Keep the endpoint
+        // receive owner live and retry the exact worker admission when the
+        // first snapshot arrives instead of burning rootd's restart budget.
+        ipc::debug_line("vfsd: executable snapshot worker admission deferred");
+    }
+    // The receive owner performs no bulk I/O. A System caller donates only
+    // while its exact request is live; the snapshot worker retains bootstrap
+    // class until it completes the terminal uiserver image reply.
+    demote_current_thread_or_exit("receive-owner");
     serve(endpoint as u64, state);
 }
 
@@ -287,7 +302,7 @@ fn serve(endpoint: u64, mut state: VfsState) {
         };
         let reply = if received as usize == size_of::<VfsExecutableSnapshotRequest>() {
             let request = unsafe { &*request.as_ptr().cast::<VfsExecutableSnapshotRequest>() };
-            reply_executable_snapshot(&mut state, reply_cap, sender_pid, sender_tid, request)
+            enqueue_executable_snapshot(reply_cap, sender_pid, sender_tid, *request)
         } else if received as usize == size_of::<VfsIpcRequest>() {
             let request = unsafe { &*request.as_ptr().cast::<VfsIpcRequest>() };
             let response = reset_vfs_response_slot(request.op);
@@ -366,8 +381,8 @@ fn serve(endpoint: u64, mut state: VfsState) {
     }
 }
 
+
 fn reply_executable_snapshot(
-    state: &mut VfsState,
     reply_cap: u64,
     sender_pid: u64,
     sender_tid: u64,
@@ -393,7 +408,7 @@ fn reply_executable_snapshot(
         };
     }
 
-    let snapshot = match state.open_executable_snapshot(request) {
+    let snapshot = match open_executable_snapshot(request) {
         Ok(snapshot) => snapshot,
         Err(errno) => {
             ipc::debug_line(
@@ -410,7 +425,7 @@ fn reply_executable_snapshot(
         }
     };
     response.file_bytes = snapshot.file_bytes;
-    response.mount_generation = state.mount_generation;
+    response.mount_generation = lock_vfs_storage().mount_generation;
     let send_fd = snapshot.fd as u64;
     let args = IpcReplyWithHandlesArgs {
         reply_cap,
@@ -445,12 +460,12 @@ fn reply_executable_snapshot(
 }
 
 fn demote_after_ui_bootstrap_snapshot_reply() {
-    if POST_UI_DEMOTED.load(Ordering::Acquire) {
+    if SNAPSHOT_WORKER_DEMOTED.load(Ordering::Acquire) {
         return;
     }
     let status = unsafe { rustos_svc_runtime::syscall::syscall0(SYS_RUSTOS_SCHED_DEMOTE_SELF) };
     if status == 0 {
-        POST_UI_DEMOTED.store(true, Ordering::Release);
+        SNAPSHOT_WORKER_DEMOTED.store(true, Ordering::Release);
         debug_line("vfsd: post-ui scheduling class=user");
         return;
     }
@@ -464,37 +479,14 @@ fn demote_after_ui_bootstrap_snapshot_reply() {
 }
 
 struct VfsState {
-    volume: Option<FatVolume<BootBlockDevice>>,
     cwd: BTreeMap<u64, String>,
     handles: BTreeMap<u64, RemoteHandle>,
-    /// Positive + negative metadata cache. `Ok(_)` is a resolved entry;
-    /// `Err(errno)` is a negative cache (e.g. ENOENT) so back-to-back stat()s
-    /// of common missing libc paths return without touching FAT. The whole map
-    /// is dropped whenever `mount_generation` changes.
-    metadata_cache: BTreeMap<String, Result<Metadata, i32>>,
-    /// Cached directory listings, keyed by absolute path. Linux startup
-    /// re-reads `/`, `/dev`, library directories, etc.; FAT traversal per call
-    /// is expensive enough to dominate boot time when libc walks PATH.
-    dir_entries_cache: BTreeMap<String, Vec<DirEntry>>,
-    /// Complete bytes for bounded read-only files on the current mount
-    /// generation. Persistent mutation is not implemented by vfsd, and every
-    /// remount invalidates this cache before the replacement volume is used.
-    file_bytes_cache: BTreeMap<String, Vec<u8>>,
-    file_bytes_cache_bytes: usize,
-    /// Terminally sealed executable images owned by the current mount
-    /// generation. Handle transfer duplicates the descriptor into loaderd;
-    /// keeping one vfsd reference lets common interpreters/DLLs be reused
-    /// without re-reading the storage DVM on every process launch.
-    executable_snapshot_cache: BTreeMap<String, ExecutableSnapshot>,
-    executable_snapshot_cache_bytes: usize,
     epolls: WaitSetRegistry,
     checkpoint_revisions: BTreeMap<CheckpointRevisionKey, u64>,
     checkpoint_operations: BTreeMap<CheckpointRevisionKey, (u64, u64)>,
     checkpoint_records: BTreeMap<CheckpointRevisionKey, ServiceCheckpointRecordWire>,
     readiness_generation: u64,
     next_handle: u64,
-    mount_generation: u64,
-    cache_generation: u64,
 }
 
 #[derive(Clone)]
@@ -523,6 +515,11 @@ pub(crate) struct Metadata {
     pub(crate) len: u64,
     pub(crate) inode: u64,
 }
+
+use storage_owner::{
+    lock_vfs_storage, open_executable_snapshot, ExecutableSnapshotAdmission,
+    ExecutableSnapshotPlan, VfsStorage,
+};
 
 include!("state_checkpoint.rs");
 include!("state_requests.rs");

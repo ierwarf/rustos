@@ -231,8 +231,8 @@ tokens = [
 ]
 
 # Release containment eagerly maps every usable stack page because exception
-# context cannot wait for ProcessStateLock. The retained lazy-growth code is a
-# future deferred-worker refinement and is not the normal release path.
+# context cannot wait for ProcessStateLock. No lazy-growth exception path is
+# retained; restoring one requires a new deferred-worker refinement.
 [[required_sequences]]
 path = "kernel/compat/src/user/process/mod.rs"
 tokens = [
@@ -272,9 +272,10 @@ tokens = [
 [[required_sequences]]
 path = "kernel/ps/src/multitask/irq.rs"
 tokens = [
-    "fn publish_local_reschedule(",
-    "local_request.store(1, Ordering::Release);",
+    "pub(crate) fn request_deferred_reschedule()",
+    "reschedule_observation::publish_request(",
     "pub(super) fn request_target_reschedule(target: usize)",
+    "if !publication.newly_pending",
     "TARGET_RESCHEDULE_IPI_PENDING.fetch_or(1_u64 << target, Ordering::Release);",
 ]
 
@@ -283,16 +284,62 @@ path = "kernel/ps/src/multitask/irq.rs"
 tokens = [
     "let targeted = TARGET_RESCHEDULE_IPI_PENDING.swap(0, Ordering::AcqRel);",
     "if !remote_notification_required(target, current_cpu_index())",
+    "reschedule_observation::request_pending(target)",
     "send_target_reschedule_ipi(",
-    "reschedule_observation::request_goal(target)",
+    "reschedule_observation::request_sequence_snapshot(target)",
 ]
 
 [[required_sequences]]
 path = "kernel/ps/src/multitask/reschedule_observation.rs"
 tokens = [
-    ".fetch_update(Ordering::AcqRel, Ordering::Acquire, |current|",
-    "notify_seq.store(sequence, Ordering::Release);",
+    "let next = (sequence << 1) | PENDING_BIT;",
+    "observation.request_word.compare_exchange_weak(",
+    "pub(super) fn claim_pending(cpu: usize) -> Option<u64>",
     "consume_seq.fetch_max(goal, Ordering::AcqRel)",
+]
+
+[[required_sequences]]
+path = "kernel/io-manager/src/transport_lifecycle.rs"
+tokens = [
+    "state_epoch: AtomicU64",
+    "pub(crate) fn activate_begin(&self, epoch: u64)",
+    "TransportState::Active | TransportState::Activating",
+    ".compare_exchange(\n                self.activating_word,",
+    "pack(epoch, TransportState::Active)",
+]
+
+[[required_sequences]]
+path = "kernel/io-manager/src/input/dvm_ring.rs"
+tokens = [
+    "fn claim_installed_mapping()",
+    "INPUT_LIFECYCLE.try_claim(generation)?",
+    "let mapped = SHARED_ADDR.load(Ordering::Acquire)",
+    "!lifecycle.validate_current()",
+]
+
+[[required_sequences]]
+path = "kernel/io-manager/src/input/dvm_ring.rs"
+tokens = [
+    "impl Drop for TransportMappingClaim<'_>",
+    "drop(self.lifecycle.take());",
+    "finish_pending_lifecycle();",
+]
+
+[[required_sequences]]
+path = "kernel/ps/src/user/socket.rs"
+tokens = [
+    "pub fn commit_send(mut self, accepted: usize) -> bool",
+    "self.start.checked_add(accepted)",
+    ".compare_exchange(self.start, end, Ordering::AcqRel, Ordering::Acquire)",
+]
+
+[[required_sequences]]
+path = "kernel/compat/src/user/syscall/linux/ipc_ops.rs"
+tokens = [
+    "if donation_required && !multitask::reserve_ipc_priority(task_id)",
+    "enqueue_endpoint_call_with_handles_and_priority(",
+    "multitask::bind_reserved_ipc_priority(reply.raw(), task_id, receiver_task_id)",
+    "cancel_reply_wait(reply, task_id, ReplyCancelReason::InvalidCommit)",
 ]
 
 [[required_sequences]]
@@ -425,8 +472,13 @@ capacity = "MAX_TRACKED_CPUS"
 
 [[per_cpu_statics]]
 path = "kernel/ps/src/multitask/mod.rs"
-names = ["DEFERRED_RESCHEDULE_REQUESTED", "USER_RETURN_RESCHEDULE_ARMED"]
+names = ["USER_RETURN_RESCHEDULE_ARMED"]
 capacity = "MAX_TRACKED_CPUS"
+
+[[per_cpu_statics]]
+path = "kernel/ps/src/multitask/reschedule_observation.rs"
+names = ["RESCHEDULE_OBSERVATIONS"]
+capacity = "CPU_CAPACITY"
 
 [[per_cpu_statics]]
 path = "kernel/ps/src/multitask/irq.rs"

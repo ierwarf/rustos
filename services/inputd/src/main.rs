@@ -54,7 +54,7 @@ use rustos_user_abi::syscall::{
 #[cfg(not(test))]
 use rustos_user_abi::syscall::{
     WaitSetSignalBrokerArgs, SYS_RUSTOS_WAITSET_SIGNAL_BROKER, WAITSET_ABI_VERSION,
-    WAITSET_GLOBAL_OBJECT_ID, WAITSET_PROVIDER_INPUTD,
+    WAITSET_INPUT_EVDEV_OBJECT_ID, WAITSET_INPUT_NATIVE_OBJECT_ID, WAITSET_PROVIDER_INPUTD,
 };
 
 // The DVM ingestion worker waits on the MSI-X-published ring and transfers
@@ -916,13 +916,17 @@ fn start_dvm_ingestion_worker(queue: SharedInputQueue, log_state: Arc<DvmIngress
                         "inputd: DVM transport progress records={total_drained} batch={drained} batch_seq={nonempty_batches} stage=decoded"
                     ));
                 }
-                let session_sync_deadline = Instant::now() + dvm_session_sync::TIMEOUT;
+                let session_sync_deadline = dvm_session_sync::AbsoluteDeadline::after(
+                    Instant::now(),
+                    dvm_session_sync::TIMEOUT,
+                );
                 let mut session_sync_attempts = 0_u32;
                 let observations = loop {
                     match dvm_session_sync::apply(
                         &queue,
                         outcomes.as_mut_slice(),
                         &mut pending_events,
+                        session_sync_deadline,
                         notify_netd_dvm_session,
                     ) {
                         Ok(observations) => break observations,
@@ -933,19 +937,26 @@ fn start_dvm_ingestion_worker(queue: SharedInputQueue, log_state: Arc<DvmIngress
                                     "inputd: DVM session authority sync retry errno={errno} attempt={session_sync_attempts}"
                                 ));
                             }
-                            if Instant::now() >= session_sync_deadline {
+                            let Some(backoff) = session_sync_deadline
+                                .retry_backoff(
+                                    Instant::now(),
+                                    dvm_session_sync::retry_backoff_for_attempt(
+                                        session_sync_attempts,
+                                    ),
+                                )
+                            else {
                                 debug_line(&format!(
                                     "inputd: DVM session authority sync timed out errno={errno} attempts={session_sync_attempts}"
                                 ));
                                 std::process::exit(134);
-                            }
+                            };
                             // SESSION-CUSTODY: keep this decoded, bounded batch
                             // and its decoder epoch private until netd admits
                             // every ordered revoke/grant. Draining later ring
                             // records or resetting the decoder here would lose
                             // the sole authenticated SESSION_START and silently
                             // discard all subsequent input from the live epoch.
-                            thread::sleep(dvm_session_sync::RETRY_BACKOFF);
+                            thread::sleep(backoff);
                         }
                     }
                 };
@@ -1111,7 +1122,7 @@ fn drain_transport(records: &mut [InputDvmRecordWire]) -> Result<usize, i32> {
     Ok((count as usize).min(records.len()))
 }
 
-fn notify_netd_dvm_session(epoch: u32, action: u64) -> Result<(), i32> {
+fn notify_netd_dvm_session(epoch: u32, action: u64, timeout_ms: u64) -> Result<(), i32> {
     if epoch == 0 || !matches!(action, NETD_DVM_SESSION_GRANT | NETD_DVM_SESSION_REVOKE) {
         return Err(libc::EINVAL);
     }
@@ -1148,7 +1159,7 @@ fn notify_netd_dvm_session(epoch: u32, action: u64) -> Result<(), i32> {
             NETD_IPC_REQUEST_HEADER_SIZE,
             (&mut response as *mut NetdIpcResponse).cast(),
             size_of::<NetdIpcResponse>(),
-            dvm_session_sync::CALL_DEADLINE_MS,
+            timeout_ms,
         )
     };
     if received < 0 {
@@ -1333,21 +1344,26 @@ fn publish_readiness_generation(generation: u64) {
     let _ = generation;
     #[cfg(not(test))]
     {
-        let args = WaitSetSignalBrokerArgs {
-            abi_version: WAITSET_ABI_VERSION,
-            provider: WAITSET_PROVIDER_INPUTD,
-            flags: 0,
-            object_id: WAITSET_GLOBAL_OBJECT_ID,
-            generation,
-            reserved0: 0,
-        };
-        let result = syscall1(
-            SYS_RUSTOS_WAITSET_SIGNAL_BROKER,
-            (&args as *const WaitSetSignalBrokerArgs) as u64,
-        );
-        if result < 0 {
-            debug_line("inputd: readiness generation publication failed");
-            std::process::exit(134);
+        for object_id in [
+            WAITSET_INPUT_NATIVE_OBJECT_ID,
+            WAITSET_INPUT_EVDEV_OBJECT_ID,
+        ] {
+            let args = WaitSetSignalBrokerArgs {
+                abi_version: WAITSET_ABI_VERSION,
+                provider: WAITSET_PROVIDER_INPUTD,
+                flags: 0,
+                object_id,
+                generation,
+                reserved0: 0,
+            };
+            let result = syscall1(
+                SYS_RUSTOS_WAITSET_SIGNAL_BROKER,
+                (&args as *const WaitSetSignalBrokerArgs) as u64,
+            );
+            if result < 0 {
+                debug_line("inputd: readiness generation publication failed");
+                std::process::exit(134);
+            }
         }
     }
 }

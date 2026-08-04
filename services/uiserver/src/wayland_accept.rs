@@ -17,10 +17,9 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, TryRecvError, TrySendError};
 use std::sync::Arc;
-use std::thread;
 
 use crate::input_loop::UiWakeSender;
-use crate::sys::{diag_line, require_background_thread_class};
+use crate::sys::{diag_line, spawn_ui_thread, UiThreadRole};
 
 const WAYLAND_ACCEPT_QUEUE_CAPACITY: usize = 16;
 const WAYLAND_ACCEPT_WAIT_TIMEOUT_MS: i32 = -1;
@@ -122,84 +121,79 @@ pub(crate) fn start_wayland_acceptor(
     let (sender, receiver) = sync_channel(WAYLAND_ACCEPT_QUEUE_CAPACITY);
     let pending = Arc::new(AtomicUsize::new(0));
     let worker_pending = Arc::clone(&pending);
-    thread::Builder::new()
-        .name(String::from("wayland-accept"))
-        .spawn(move || {
-            require_background_thread_class();
-            // Uiserver owns this listener for its process lifetime. Service
-            // retirement terminates all threads together; there is no
-            // in-process compositor detach that could orphan this wait.
-            loop {
-                let mut event = libc::epoll_event { events: 0, u64: 0 };
-                // SAFETY: The epoll fd is live in this worker and `event` is a
-                // valid one-element output buffer for this blocking call.
-                let ready = unsafe {
-                    libc::epoll_wait(
-                        accept_epoll.as_raw_fd(),
-                        &mut event,
-                        1,
-                        WAYLAND_ACCEPT_WAIT_TIMEOUT_MS,
-                    )
-                };
-                if ready < 0 {
-                    let err = std::io::Error::last_os_error();
-                    if err.kind() == ErrorKind::Interrupted {
-                        continue;
-                    }
-                    diag_line(format!(
-                        "uiserver: Wayland accept readiness wait failed: {err}"
-                    ));
-                    std::process::exit(134);
-                }
-                if ready == 0 {
+    spawn_ui_thread(UiThreadRole::Protocol, "wayland-accept", move || {
+        // Uiserver owns this listener for its process lifetime. Service
+        // retirement terminates all threads together; there is no
+        // in-process compositor detach that could orphan this wait.
+        loop {
+            let mut event = libc::epoll_event { events: 0, u64: 0 };
+            // SAFETY: The epoll fd is live in this worker and `event` is a
+            // valid one-element output buffer for this blocking call.
+            let ready = unsafe {
+                libc::epoll_wait(
+                    accept_epoll.as_raw_fd(),
+                    &mut event,
+                    1,
+                    WAYLAND_ACCEPT_WAIT_TIMEOUT_MS,
+                )
+            };
+            if ready < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == ErrorKind::Interrupted {
                     continue;
                 }
-                if event.events & (libc::EPOLLERR | libc::EPOLLHUP) as u32 != 0 {
-                    diag_line("uiserver: Wayland listener readiness revoked");
-                    std::process::exit(134);
-                }
+                diag_line(format!(
+                    "uiserver: Wayland accept readiness wait failed: {err}"
+                ));
+                std::process::exit(134);
+            }
+            if ready == 0 {
+                continue;
+            }
+            if event.events & (libc::EPOLLERR | libc::EPOLLHUP) as u32 != 0 {
+                diag_line("uiserver: Wayland listener readiness revoked");
+                std::process::exit(134);
+            }
 
-                loop {
-                    match accept_wayland_client(&listener) {
-                        Ok(stream) => {
-                            if let Err(err) = set_fd_nonblocking(stream.as_raw_fd()) {
-                                diag_line(format!(
-                                    "uiserver: accepted Wayland client nonblocking failed: {err}"
-                                ));
-                                continue;
+            loop {
+                match accept_wayland_client(&listener) {
+                    Ok(stream) => {
+                        if let Err(err) = set_fd_nonblocking(stream.as_raw_fd()) {
+                            diag_line(format!(
+                                "uiserver: accepted Wayland client nonblocking failed: {err}"
+                            ));
+                            continue;
+                        }
+                        // ORDERING: Release publishes the ownership token
+                        // before the channel send and coalesced UI wake.
+                        worker_pending.fetch_add(1, Ordering::Release);
+                        match sender.try_send(stream) {
+                            Ok(()) => ui_wake_sender.signal(),
+                            Err(TrySendError::Full(_)) => {
+                                // ORDERING: AcqRel retracts only this
+                                // unpublished stream's Release token.
+                                worker_pending.fetch_sub(1, Ordering::AcqRel);
+                                diag_line("uiserver: Wayland accept queue full; client rejected");
+                                break;
                             }
-                            // ORDERING: Release publishes the ownership token
-                            // before the channel send and coalesced UI wake.
-                            worker_pending.fetch_add(1, Ordering::Release);
-                            match sender.try_send(stream) {
-                                Ok(()) => ui_wake_sender.signal(),
-                                Err(TrySendError::Full(_)) => {
-                                    // ORDERING: AcqRel retracts only this
-                                    // unpublished stream's Release token.
-                                    worker_pending.fetch_sub(1, Ordering::AcqRel);
-                                    diag_line(
-                                        "uiserver: Wayland accept queue full; client rejected",
-                                    );
-                                    break;
-                                }
-                                Err(TrySendError::Disconnected(_)) => {
-                                    // ORDERING: No consumer can observe the
-                                    // failed send, so retract its exact token.
-                                    worker_pending.fetch_sub(1, Ordering::AcqRel);
-                                    return;
-                                }
+                            Err(TrySendError::Disconnected(_)) => {
+                                // ORDERING: No consumer can observe the
+                                // failed send, so retract its exact token.
+                                worker_pending.fetch_sub(1, Ordering::AcqRel);
+                                return;
                             }
                         }
-                        Err(err) if err.kind() == ErrorKind::WouldBlock => break,
-                        Err(err) if err.kind() == ErrorKind::Interrupted => continue,
-                        Err(err) => {
-                            diag_line(format!("uiserver: Wayland accept failed: {err}"));
-                            std::process::exit(134);
-                        }
+                    }
+                    Err(err) if err.kind() == ErrorKind::WouldBlock => break,
+                    Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+                    Err(err) => {
+                        diag_line(format!("uiserver: Wayland accept failed: {err}"));
+                        std::process::exit(134);
                     }
                 }
             }
-        })?;
+        }
+    })?;
     Ok(WaylandAcceptor { receiver, pending })
 }
 

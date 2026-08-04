@@ -64,7 +64,7 @@ impl Scheduler {
             // production, a scheduler guard's scratch `current_task` is the
             // exact calling CPU slot loaded by `cpu_local::scheduler_mut`.
             .or_else(|| {
-                (slot == self.current_task).then(nucleus_core::util::lockdep::current_cpu_index)
+                (slot == self.current_task_slot()).then(nucleus_core::util::lockdep::current_cpu_index)
             });
         owner_cpu.is_some_and(|cpu| requested_mask & (1_u64 << cpu) == 0)
     }
@@ -74,12 +74,12 @@ impl Scheduler {
         target_task_id: u64,
         required_abi: UserAbi,
     ) -> Result<usize, AffinityError> {
-        let current = self.contexts[self.current_task].ok_or(AffinityError::MissingTask)?;
+        let current = self.contexts[self.current_task_slot()].ok_or(AffinityError::MissingTask)?;
         if !current.user_mode || current.user_abi != Some(required_abi) {
             return Err(AffinityError::WrongAbi);
         }
         let target_slot = if target_task_id == 0 {
-            self.current_task
+            self.current_task_slot()
         } else {
             self.find_user_task_slot(target_task_id)
                 .ok_or(AffinityError::MissingTask)?
@@ -249,8 +249,8 @@ impl Scheduler {
 
     pub(super) fn current_affinity_for_child_thread(&self) -> (u64, u64) {
         (
-            self.task_affinity_masks[self.current_task],
-            self.process_affinity_masks[self.current_task],
+            self.task_affinity_masks[self.current_task_slot()],
+            self.process_affinity_masks[self.current_task_slot()],
         )
     }
 
@@ -282,14 +282,14 @@ impl Scheduler {
             .checked_shl(u32::try_from(logical_cpu).expect("logical CPU index overflow"))
             .expect("logical CPU index exceeds affinity mask");
         assert!(
-            self.task_affinity_masks[self.current_task] & bit != 0,
+            self.task_affinity_masks[self.current_task_slot()] & bit != 0,
             "scheduler invariant: task {} dispatched on excluded logical CPU {} mask={:#x} migration_pending={}",
-            self.starts[self.current_task]
+            self.starts[self.current_task_slot()]
                 .map(|start| start.id)
                 .unwrap_or(0),
             logical_cpu,
-            self.task_affinity_masks[self.current_task],
-            self.affinity_migration_pending[self.current_task],
+            self.task_affinity_masks[self.current_task_slot()],
+            self.affinity_migration_pending[self.current_task_slot()],
         );
     }
 }
@@ -327,6 +327,10 @@ mod tests {
 
     #[test]
     fn linux_thread_affinity_commits_exact_mask_and_previous_value() {
+        // Affinity tests attach real processes to the one global process
+        // table, so they must hold the same exclusive test isolation as every
+        // other scheduler test or a concurrent test observes a foreign process.
+        let _process_table = process_table::tests::isolate_process_table();
         let mut scheduler = boxed_scheduler();
         let process = test_process(0xaff1_0001);
         let slot = FIRST_DYNAMIC_TASK_SLOT;
@@ -351,6 +355,10 @@ mod tests {
 
     #[test]
     fn invalid_affinity_changes_leave_all_authority_unchanged() {
+        // Affinity tests attach real processes to the one global process
+        // table, so they must hold the same exclusive test isolation as every
+        // other scheduler test or a concurrent test observes a foreign process.
+        let _process_table = process_table::tests::isolate_process_table();
         let mut scheduler = boxed_scheduler();
         let process = test_process(0xaff1_0002);
         let slot = FIRST_DYNAMIC_TASK_SLOT;
@@ -376,6 +384,10 @@ mod tests {
 
     #[test]
     fn excluded_running_cpu_requires_remote_reschedule() {
+        // Affinity tests attach real processes to the one global process
+        // table, so they must hold the same exclusive test isolation as every
+        // other scheduler test or a concurrent test observes a foreign process.
+        let _process_table = process_table::tests::isolate_process_table();
         let mut scheduler = boxed_scheduler();
         let process = test_process(0xaff1_0006);
         let slot = FIRST_DYNAMIC_TASK_SLOT;
@@ -404,6 +416,10 @@ mod tests {
 
     #[test]
     fn child_task_inherits_effective_parent_affinity() {
+        // Affinity tests attach real processes to the one global process
+        // table, so they must hold the same exclusive test isolation as every
+        // other scheduler test or a concurrent test observes a foreign process.
+        let _process_table = process_table::tests::isolate_process_table();
         let mut scheduler = boxed_scheduler();
         let process_id = 0xaff1_0003;
         let process = test_process(process_id);
@@ -430,6 +446,10 @@ mod tests {
 
     #[test]
     fn exec_preserves_task_and_process_affinity() {
+        // Affinity tests attach real processes to the one global process
+        // table, so they must hold the same exclusive test isolation as every
+        // other scheduler test or a concurrent test observes a foreign process.
+        let _process_table = process_table::tests::isolate_process_table();
         let mut scheduler = boxed_scheduler();
         let process = test_process(0xaff1_0007);
         let slot = FIRST_DYNAMIC_TASK_SLOT;
@@ -457,6 +477,10 @@ mod tests {
 
     #[test]
     fn windows_process_affinity_updates_every_live_thread_atomically() {
+        // Affinity tests attach real processes to the one global process
+        // table, so they must hold the same exclusive test isolation as every
+        // other scheduler test or a concurrent test observes a foreign process.
+        let _process_table = process_table::tests::isolate_process_table();
         let mut scheduler = boxed_scheduler();
         let process = test_process(0xaff1_0004);
         let first = FIRST_DYNAMIC_TASK_SLOT;
@@ -492,6 +516,10 @@ mod tests {
 
     #[test]
     fn windows_thread_affinity_returns_previous_and_rejects_process_escape() {
+        // Affinity tests attach real processes to the one global process
+        // table, so they must hold the same exclusive test isolation as every
+        // other scheduler test or a concurrent test observes a foreign process.
+        let _process_table = process_table::tests::isolate_process_table();
         let mut scheduler = boxed_scheduler();
         let process = test_process(0xaff1_0005);
         let slot = FIRST_DYNAMIC_TASK_SLOT;

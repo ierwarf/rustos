@@ -56,7 +56,8 @@ rg -Fq 'call_bounded(' services/inputd/src/main.rs || {
     echo "inputd-to-netd lifecycle call is not deadline-bounded" >&2
     exit 1
 }
-rg -Fq 'dvm_session_sync::CALL_DEADLINE_MS' services/inputd/src/main.rs || {
+rg -Fq 'CALL_DEADLINE_MS' services/inputd/src/dvm_session_sync.rs \
+    && rg -Fq 'timeout_ms,' services/inputd/src/main.rs || {
     echo "inputd-to-netd lifecycle call bypasses its owned deadline" >&2
     exit 1
 }

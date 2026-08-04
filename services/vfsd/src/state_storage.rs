@@ -9,7 +9,7 @@ impl VfsState {
     }
 
     fn chdir(&mut self, pid: u64, path: &str) -> i32 {
-        match self.metadata(path) {
+        match lock_vfs_storage().metadata(path) {
             Ok(metadata) if metadata.kind == RemoteKind::Directory => {
                 self.cwd.insert(pid, path.to_string());
                 0
@@ -103,7 +103,7 @@ impl VfsState {
             };
         }
 
-        let metadata = self.metadata(path).inspect_err(|&errno| {
+        let metadata = lock_vfs_storage().metadata(path).inspect_err(|&errno| {
             if !block::is_transient_storage_not_ready(errno) {
                 debug_line(&format!(
                     "vfsd: open failed stage=metadata errno={errno} path={path}"
@@ -182,7 +182,7 @@ impl VfsState {
                 return Ok(0);
             }
             let replay_len = replay_len as usize;
-            let read = self.read_file_slice_into(
+            let read = lock_vfs_storage().read_file_slice_into(
                 path.as_str(),
                 file_len,
                 handle.last_start,
@@ -198,7 +198,7 @@ impl VfsState {
         let read = if len == 0 {
             0
         } else {
-            self.read_file_slice_into(path.as_str(), file_len, start, &mut dest[..len])?
+            lock_vfs_storage().read_file_slice_into(path.as_str(), file_len, start, &mut dest[..len])?
         };
         if offset.is_none() {
             let mut candidate = self.handles.get(&id).cloned().ok_or(EBADF)?;
@@ -219,6 +219,9 @@ impl VfsState {
         Ok(read)
     }
 
+}
+
+impl VfsStorage {
     fn read_file_slice_into(
         &mut self,
         path: &str,
@@ -264,10 +267,17 @@ impl VfsState {
         }
     }
 
-    fn open_executable_snapshot(
+    /// Resolves a snapshot request into either a warm cache hit or an
+    /// immutable read plan, holding storage only for that resolution.
+    ///
+    /// The bulk read deliberately happens outside this call. Holding the single
+    /// storage owner across a multi-megabyte volume read would block every
+    /// namespace request behind it, which is the head-of-line stall this
+    /// service is required not to have.
+    fn plan_executable_snapshot(
         &mut self,
         request: &VfsExecutableSnapshotRequest,
-    ) -> Result<ExecutableSnapshotOpen, i32> {
+    ) -> Result<ExecutableSnapshotAdmission, i32> {
         if request.version != VFS_EXECUTABLE_SNAPSHOT_ABI_VERSION
             || request.op != VFS_EXECUTABLE_SNAPSHOT_OP_OPEN
             || request.flags != 0
@@ -291,11 +301,11 @@ impl VfsState {
 
         self.invalidate_caches_if_remounted();
         if let Some(snapshot) = self.executable_snapshot_cache.get(path.as_str()).copied() {
-            return Ok(ExecutableSnapshotOpen {
+            return Ok(ExecutableSnapshotAdmission::Cached(ExecutableSnapshotOpen {
                 fd: snapshot.fd,
                 file_bytes: snapshot.file_bytes,
                 close_after_reply: false,
-            });
+            }));
         }
 
         let metadata = self.metadata(path.as_str())?;
@@ -306,33 +316,38 @@ impl VfsState {
             return Err(if metadata.len == 0 { ENOEXEC } else { EOVERFLOW });
         }
         let file_len = usize::try_from(metadata.len).map_err(|_| EOVERFLOW)?;
-        if !early_system_owned {
-            ipc::debug_line(
-                format!(
-                    "vfsd: executable snapshot volume-read begin path={} bytes={file_len}",
-                    path.as_str()
-                )
-                .as_str(),
-            );
-        }
-        let mut bytes = Vec::new();
-        bytes.try_reserve_exact(file_len).map_err(|_| ENOMEM)?;
-        bytes.resize(file_len, 0);
-        let read = self.read_file_slice_into(path.as_str(), metadata.len, 0, &mut bytes)?;
-        if read != file_len {
-            return Err(EIO);
-        }
-        if !early_system_owned {
-            ipc::debug_line(
-                format!(
-                    "vfsd: executable snapshot volume-read done path={} bytes={read}",
-                    path.as_str()
-                )
-                .as_str(),
-            );
-        }
-        let fd = create_terminally_sealed_snapshot(path.as_str(), bytes.as_slice())?;
-        if !early_system_owned {
+        let product_interactive_snapshot = path == "/apps/wayclick/wayclick.elf";
+        Ok(ExecutableSnapshotAdmission::Read(ExecutableSnapshotPlan {
+            path,
+            file_len,
+            metadata_len: metadata.len,
+            verbose: !early_system_owned || product_interactive_snapshot,
+        }))
+    }
+
+    /// Reads one bounded chunk of a planned snapshot.
+    ///
+    /// The caller re-acquires storage per chunk so a namespace request waits at
+    /// most one chunk, never a whole file.
+    fn read_executable_snapshot_chunk(
+        &mut self,
+        plan: &ExecutableSnapshotPlan,
+        offset: u64,
+        dest: &mut [u8],
+    ) -> Result<usize, i32> {
+        self.read_file_slice_into(plan.path.as_str(), plan.metadata_len, offset, dest)
+    }
+
+    /// Seals the completed image and admits it to the mount-generation cache.
+    fn commit_executable_snapshot(
+        &mut self,
+        plan: &ExecutableSnapshotPlan,
+        bytes: &[u8],
+    ) -> Result<ExecutableSnapshotOpen, i32> {
+        let path = plan.path.clone();
+        let file_len = plan.file_len;
+        let fd = create_terminally_sealed_snapshot(path.as_str(), bytes)?;
+        if plan.verbose {
             ipc::debug_line(executable_snapshot_marker(path.as_str(), file_len).as_str());
             let _ = ipc::product_milestone(
                 PRODUCT_MILESTONE_EXECUTABLE_SNAPSHOT_SEALED,
@@ -344,7 +359,7 @@ impl VfsState {
         if file_len > EXECUTABLE_SNAPSHOT_CACHE_BUDGET_BYTES {
             return Ok(ExecutableSnapshotOpen {
                 fd,
-                file_bytes: metadata.len,
+                file_bytes: plan.metadata_len,
                 close_after_reply: true,
             });
         }
@@ -363,17 +378,20 @@ impl VfsState {
             path,
             ExecutableSnapshot {
                 fd,
-                file_bytes: metadata.len,
+                file_bytes: plan.metadata_len,
             },
         );
         self.executable_snapshot_cache_bytes += file_len;
         Ok(ExecutableSnapshotOpen {
             fd,
-            file_bytes: metadata.len,
+            file_bytes: plan.metadata_len,
             close_after_reply: false,
         })
     }
 
+}
+
+impl VfsState {
     fn render_getdents_payload(
         &mut self,
         id: u64,
@@ -393,7 +411,7 @@ impl VfsState {
             }
             handle.path.clone()
         };
-        let entries = self.dir_entries(path.as_str())?;
+        let entries = lock_vfs_storage().dir_entries(path.as_str())?;
         let mut written = 0usize;
         let mut consumed = 0usize;
         for (index, entry) in entries.iter().enumerate().skip(cursor) {
@@ -411,6 +429,9 @@ impl VfsState {
         Ok((written, consumed))
     }
 
+}
+
+impl VfsStorage {
     fn metadata(&mut self, path: &str) -> Result<Metadata, i32> {
         if path == "/" || path == "/proc" || path == "/run" {
             return Ok(Metadata {

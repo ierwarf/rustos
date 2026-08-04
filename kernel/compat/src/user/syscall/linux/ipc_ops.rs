@@ -2222,27 +2222,53 @@ fn enqueue_call_and_wake_with_handles(
     } else {
         EndpointCallPriority::Ordinary
     };
+    let donation_required = priority == EndpointCallPriority::System;
+    if donation_required && !multitask::reserve_ipc_priority(task_id) {
+        return Err(LINUX_ENOSPC);
+    }
     let (reply, receiver_to_wake) =
-        kernel_ipc_runtime::api::enqueue_endpoint_call_with_handles_and_priority(
+        match kernel_ipc_runtime::api::enqueue_endpoint_call_with_handles_and_priority(
             endpoint,
             task_id,
             request,
             attached_handles,
             priority,
-        )
-        .map_err(ipc_error_to_linux_errno)?;
+        ) {
+            Ok(enqueued) => enqueued,
+            Err(error) => {
+                if donation_required {
+                    let _ = multitask::cancel_ipc_priority_reservation(task_id);
+                }
+                return Err(ipc_error_to_linux_errno(error));
+            }
+        };
     ipc_trace!(
         "ipc call queued: endpoint={} receiver_to_wake={:?}",
         endpoint.raw(),
         receiver_to_wake
     );
     let receiver_process_id = kernel_ipc_runtime::api::endpoint::receiver_process_for_reply(reply);
-    if let Some(receiver_process_id) = receiver_process_id {
-        let _ =
-            multitask::inherit_ipc_priority_for_process(reply.raw(), task_id, receiver_process_id);
-        if receiver_to_wake.is_none() {
+    let mut donation_admitted = !donation_required;
+    if receiver_to_wake.is_none()
+        && let Some(receiver_process_id) = receiver_process_id
+    {
+        if donation_required {
+            donation_admitted = multitask::bind_ipc_priority_to_process_worker(
+                reply.raw(),
+                task_id,
+                receiver_process_id,
+            )
+            .is_some();
+        } else {
             let _ = multitask::set_next_process_pick_hint(receiver_process_id);
         }
+    }
+    if receiver_to_wake.is_none() && donation_required && !donation_admitted {
+        // No receiver was parked at publication time. Transfer the bounded
+        // reservation to the reply itself; the concrete `IPC_RECV` worker
+        // binds it before observing the request, while timeout/revoke can
+        // release the same exact reply without process-wide boosting.
+        donation_admitted = multitask::attach_reserved_ipc_priority(reply.raw(), task_id);
     }
     if let Some(receiver_task_id) = receiver_to_wake {
         // The reply capability is the lifetime authority for this donation.
@@ -2250,7 +2276,17 @@ fn enqueue_call_and_wake_with_handles(
         // directly needed by a System caller is eligible for the very next
         // pick, rather than being indefinitely deferred by unrelated System
         // pollers.
-        let inherited = multitask::inherit_ipc_priority(reply.raw(), task_id, receiver_task_id);
+        let inherited = if donation_required {
+            multitask::bind_reserved_ipc_priority(reply.raw(), task_id, receiver_task_id)
+        } else {
+            true
+        };
+        donation_admitted |= inherited;
+        if !donation_admitted {
+            cancel_reply_wait(reply, task_id, ReplyCancelReason::InvalidCommit);
+            let _ = multitask::cancel_ipc_priority_reservation(task_id);
+            return Err(LINUX_ENOSPC);
+        }
         let woke = multitask::wake_task(receiver_task_id);
         ipc_trace!(
             "ipc call wake: endpoint={} receiver_task={} woke={} inherited={}",
@@ -2264,6 +2300,14 @@ fn enqueue_call_and_wake_with_handles(
         // not-yet-armed waiter. `wait_for_reply` performs the actual yield
         // after the wait state is committed.
         let _ = multitask::set_next_synchronous_pick_hint(receiver_task_id);
+    }
+    if !donation_admitted {
+        // Reply and donation capacity are one admission transaction for a
+        // System-class caller. Do not let it block after silently dropping the
+        // scheduling edge; terminal cancellation returns attached authority.
+        cancel_reply_wait(reply, task_id, ReplyCancelReason::InvalidCommit);
+        let _ = multitask::cancel_ipc_priority_reservation(task_id);
+        return Err(LINUX_ENOSPC);
     }
     Ok(reply)
 }
@@ -2725,6 +2769,10 @@ pub(super) fn prepare_transfer_tickets_for_current_process(
     channel: ChannelIdentity,
     stream_pos: u64,
 ) -> Result<PreparedTransferInstall, i64> {
+    multitask::bind_ipc_transfer_receiver_by_tickets(
+        tickets, receiver, service, channel, stream_pos,
+    )
+    .map_err(ipc_transfer_error_to_linux_errno)?;
     let entries = multitask::claim_ipc_transfer_entries_by_tickets(
         tickets, receiver, service, channel, stream_pos,
     )

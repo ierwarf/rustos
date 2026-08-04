@@ -44,17 +44,21 @@ WaitStates == {"idle", "recheck-pending", "sleeping", "woken",
 TerminalStates == {"returned-ready", "returned-timeout", "returned-revoked",
                    "returned-interrupted"}
 
-VARIABLES generation, epoch, providerLive, ready, waitState, observedGeneration,
-          observedEpoch, deadline, now, objectRefs, epollRefs, ingressBacklog
+VARIABLES generation, otherGeneration, epoch, providerLive, ready, otherReady,
+          waitState, observedGeneration, observedEpoch, deadline, now,
+          objectRefs, epollRefs, ingressBacklog, wakeObject
 
-vars == <<generation, epoch, providerLive, ready, waitState, observedGeneration,
-          observedEpoch, deadline, now, objectRefs, epollRefs, ingressBacklog>>
+vars == <<generation, otherGeneration, epoch, providerLive, ready, otherReady,
+          waitState, observedGeneration, observedEpoch, deadline, now,
+          objectRefs, epollRefs, ingressBacklog, wakeObject>>
 
 Init ==
     /\ generation = 1
+    /\ otherGeneration = 1
     /\ epoch = 1
     /\ providerLive = TRUE
     /\ ready = FALSE
+    /\ otherReady = FALSE
     /\ waitState = "idle"
     /\ observedGeneration = 1
     /\ observedEpoch = 1
@@ -63,6 +67,7 @@ Init ==
     /\ objectRefs = 1
     /\ epollRefs = 1
     /\ ingressBacklog = 0
+    /\ wakeObject = 0
 
 BeginWait ==
     /\ waitState = "idle"
@@ -73,17 +78,20 @@ BeginWait ==
     /\ waitState' = IF ~providerLive \/ epoch # observedEpoch
                      THEN "returned-revoked"
                      ELSE IF ready THEN "returned-ready" ELSE "recheck-pending"
-    /\ UNCHANGED <<generation, epoch, providerLive, ready, observedEpoch, now,
-                   objectRefs, epollRefs, ingressBacklog>>
+    /\ wakeObject' = 0
+    /\ UNCHANGED <<generation, otherGeneration, epoch, providerLive, ready,
+                   otherReady, observedEpoch, now, objectRefs, epollRefs,
+                   ingressBacklog>>
 
 ExternalIngress ==
     /\ providerLive
     /\ ingressBacklog < MaxIngress
     /\ waitState \notin TerminalStates
     /\ ingressBacklog' = ingressBacklog + 1
-    /\ UNCHANGED <<generation, epoch, providerLive, ready, waitState,
+    /\ UNCHANGED <<generation, otherGeneration, epoch, providerLive, ready,
+                   otherReady, waitState,
                    observedGeneration, observedEpoch, deadline, now, objectRefs,
-                   epollRefs>>
+                   epollRefs, wakeObject>>
 
 IngressStep ==
     /\ providerLive
@@ -96,8 +104,10 @@ IngressStep ==
     /\ ready' = TRUE
     /\ waitState' = IF waitState = "sleeping"
                      THEN "woken" ELSE waitState
-    /\ UNCHANGED <<epoch, providerLive, observedGeneration, observedEpoch,
-                   deadline, now, objectRefs, epollRefs>>
+    /\ wakeObject' = IF waitState = "sleeping" THEN 1 ELSE wakeObject
+    /\ UNCHANGED <<otherGeneration, epoch, providerLive, otherReady,
+                   observedGeneration, observedEpoch, deadline, now,
+                   objectRefs, epollRefs>>
 
 ProviderReady ==
     /\ providerLive
@@ -108,8 +118,21 @@ ProviderReady ==
     /\ ready' = TRUE
     /\ waitState' = IF waitState = "sleeping"
                      THEN "woken" ELSE waitState
-    /\ UNCHANGED <<epoch, providerLive, observedGeneration, observedEpoch,
-                   deadline, now, objectRefs, epollRefs, ingressBacklog>>
+    /\ wakeObject' = IF waitState = "sleeping" THEN 1 ELSE wakeObject
+    /\ UNCHANGED <<otherGeneration, epoch, providerLive, otherReady,
+                   observedGeneration, observedEpoch, deadline, now,
+                   objectRefs, epollRefs, ingressBacklog>>
+
+OtherProviderReady ==
+    /\ providerLive
+    /\ objectRefs > 0
+    /\ otherGeneration < 2
+    /\ waitState \notin TerminalStates
+    /\ otherGeneration' = otherGeneration + 1
+    /\ otherReady' = TRUE
+    /\ UNCHANGED <<generation, epoch, providerLive, ready, waitState,
+                   observedGeneration, observedEpoch, deadline, now, objectRefs,
+                   epollRefs, ingressBacklog, wakeObject>>
 
 ConsumeReady ==
     /\ providerLive
@@ -120,32 +143,39 @@ ConsumeReady ==
     /\ ready' = FALSE
     /\ waitState' = IF waitState = "sleeping"
                      THEN "woken" ELSE waitState
-    /\ UNCHANGED <<epoch, providerLive, observedGeneration, observedEpoch,
-                   deadline, now, objectRefs, epollRefs, ingressBacklog>>
+    /\ wakeObject' = IF waitState = "sleeping" THEN 1 ELSE wakeObject
+    /\ UNCHANGED <<otherGeneration, epoch, providerLive, otherReady,
+                   observedGeneration, observedEpoch, deadline, now,
+                   objectRefs, epollRefs, ingressBacklog>>
 
 ArmRecheck ==
     /\ waitState = "recheck-pending"
     /\ waitState' = IF ~providerLive \/ epoch # observedEpoch \/
                          ready \/ generation # observedGeneration
                      THEN "woken" ELSE "sleeping"
-    /\ UNCHANGED <<generation, epoch, providerLive, ready, observedGeneration,
-                   observedEpoch, deadline, now, objectRefs, epollRefs,
-                   ingressBacklog>>
+    /\ wakeObject' = IF providerLive /\ epoch = observedEpoch /\
+                          (generation # observedGeneration \/ ready)
+                     THEN 1 ELSE 0
+    /\ UNCHANGED <<generation, otherGeneration, epoch, providerLive, ready,
+                   otherReady, observedGeneration, observedEpoch, deadline,
+                   now, objectRefs, epollRefs, ingressBacklog>>
 
 TimeoutWake ==
     /\ waitState \in {"recheck-pending", "sleeping"}
     /\ now >= deadline
     /\ waitState' = "woken"
-    /\ UNCHANGED <<generation, epoch, providerLive, ready, observedGeneration,
-                   observedEpoch, deadline, now, objectRefs, epollRefs,
-                   ingressBacklog>>
+    /\ wakeObject' = 0
+    /\ UNCHANGED <<generation, otherGeneration, epoch, providerLive, ready,
+                   otherReady, observedGeneration, observedEpoch, deadline,
+                   now, objectRefs, epollRefs, ingressBacklog>>
 
 SignalCancel ==
     /\ waitState \in {"recheck-pending", "sleeping", "woken"}
     /\ waitState' = "returned-interrupted"
-    /\ UNCHANGED <<generation, epoch, providerLive, ready, observedGeneration,
-                   observedEpoch, deadline, now, objectRefs, epollRefs,
-                   ingressBacklog>>
+    /\ wakeObject' = 0
+    /\ UNCHANGED <<generation, otherGeneration, epoch, providerLive, ready,
+                   otherReady, observedGeneration, observedEpoch, deadline,
+                   now, objectRefs, epollRefs, ingressBacklog>>
 
 ResolveWake ==
     /\ waitState = "woken"
@@ -155,8 +185,10 @@ ResolveWake ==
                      ELSE IF ready THEN "returned-ready"
                      ELSE IF now >= deadline THEN "returned-timeout"
                      ELSE "recheck-pending"
-    /\ UNCHANGED <<generation, epoch, providerLive, ready, observedEpoch,
-                   deadline, now, objectRefs, epollRefs, ingressBacklog>>
+    /\ wakeObject' = 0
+    /\ UNCHANGED <<generation, otherGeneration, epoch, providerLive, ready,
+                   otherReady, observedEpoch, deadline, now, objectRefs,
+                   epollRefs, ingressBacklog>>
 
 ProviderRestart ==
     /\ providerLive
@@ -165,9 +197,12 @@ ProviderRestart ==
     /\ providerLive' = FALSE
     /\ epoch' = epoch + 1
     /\ generation' = 1
+    /\ otherGeneration' = 1
     /\ ready' = FALSE
+    /\ otherReady' = FALSE
     /\ waitState' = IF waitState \in {"recheck-pending", "sleeping", "woken"}
                      THEN "woken" ELSE waitState
+    /\ wakeObject' = 0
     /\ UNCHANGED <<observedGeneration, observedEpoch, deadline, now, objectRefs,
                    epollRefs, ingressBacklog>>
 
@@ -175,18 +210,18 @@ ProviderRecover ==
     /\ ~providerLive
     /\ waitState \notin TerminalStates
     /\ providerLive' = TRUE
-    /\ UNCHANGED <<generation, epoch, ready, waitState, observedGeneration,
-                   observedEpoch, deadline, now, objectRefs, epollRefs,
-                   ingressBacklog>>
+    /\ UNCHANGED <<generation, otherGeneration, epoch, ready, otherReady,
+                   waitState, observedGeneration, observedEpoch, deadline, now,
+                   objectRefs, epollRefs, ingressBacklog, wakeObject>>
 
 DuplicateObject ==
     /\ objectRefs > 0
     /\ objectRefs < MaxRefs
     /\ waitState \notin TerminalStates
     /\ objectRefs' = objectRefs + 1
-    /\ UNCHANGED <<generation, epoch, providerLive, ready, waitState,
-                   observedGeneration, observedEpoch, deadline, now, epollRefs,
-                   ingressBacklog>>
+    /\ UNCHANGED <<generation, otherGeneration, epoch, providerLive, ready,
+                   otherReady, waitState, observedGeneration, observedEpoch,
+                   deadline, now, epollRefs, ingressBacklog, wakeObject>>
 
 \* Concrete fork acquires provider refs from the same frozen HandleTable clone
 \* that is published in the child, never from a later live-parent resnapshot.
@@ -201,8 +236,10 @@ CloseObject ==
     /\ ready' = IF objectRefs = 1 THEN FALSE ELSE ready
     /\ waitState' = IF waitState = "sleeping"
                      THEN "woken" ELSE waitState
-    /\ UNCHANGED <<epoch, providerLive, observedGeneration, observedEpoch,
-                   deadline, now, epollRefs, ingressBacklog>>
+    /\ wakeObject' = IF waitState = "sleeping" THEN 1 ELSE wakeObject
+    /\ UNCHANGED <<otherGeneration, epoch, providerLive, otherReady,
+                   observedGeneration, observedEpoch, deadline, now, epollRefs,
+                   ingressBacklog>>
 
 \* Concrete exec returns the exact CLOEXEC handles retired by the atomic
 \* process-table replacement; provider cleanup is derived from that list.
@@ -213,9 +250,9 @@ DuplicateEpoll ==
     /\ epollRefs < MaxRefs
     /\ waitState \notin TerminalStates
     /\ epollRefs' = epollRefs + 1
-    /\ UNCHANGED <<generation, epoch, providerLive, ready, waitState,
-                   observedGeneration, observedEpoch, deadline, now, objectRefs,
-                   ingressBacklog>>
+    /\ UNCHANGED <<generation, otherGeneration, epoch, providerLive, ready,
+                   otherReady, waitState, observedGeneration, observedEpoch,
+                   deadline, now, objectRefs, ingressBacklog, wakeObject>>
 
 CloseEpoll ==
     /\ epollRefs > 0
@@ -224,16 +261,18 @@ CloseEpoll ==
     /\ waitState' = IF epollRefs = 1 /\
                          waitState \in {"recheck-pending", "sleeping", "woken"}
                      THEN "woken" ELSE waitState
-    /\ UNCHANGED <<generation, epoch, providerLive, ready, observedGeneration,
-                   observedEpoch, deadline, now, objectRefs, ingressBacklog>>
+    /\ wakeObject' = 0
+    /\ UNCHANGED <<generation, otherGeneration, epoch, providerLive, ready,
+                   otherReady, observedGeneration, observedEpoch, deadline,
+                   now, objectRefs, ingressBacklog>>
 
 Tick ==
     /\ now < MaxTime
     /\ waitState \notin TerminalStates
     /\ now' = now + 1
-    /\ UNCHANGED <<generation, epoch, providerLive, ready, waitState,
-                   observedGeneration, observedEpoch, deadline, objectRefs,
-                   epollRefs, ingressBacklog>>
+    /\ UNCHANGED <<generation, otherGeneration, epoch, providerLive, ready,
+                   otherReady, waitState, observedGeneration, observedEpoch,
+                   deadline, objectRefs, epollRefs, ingressBacklog, wakeObject>>
 
 \* Concrete ADD/MOD pins a still-live target open description across the vfsd
 \* mutation. Its final guard release performs the same last-close purge, so a
@@ -247,16 +286,18 @@ ModifyInterestEpoch ==
     /\ objectRefs > 0
     /\ epoch # observedEpoch
     /\ observedEpoch' = epoch
-    /\ UNCHANGED <<generation, epoch, providerLive, ready, waitState,
-                   observedGeneration, deadline, now, objectRefs, epollRefs,
-                   ingressBacklog>>
+    /\ UNCHANGED <<generation, otherGeneration, epoch, providerLive, ready,
+                   otherReady, waitState, observedGeneration, deadline, now,
+                   objectRefs, epollRefs, ingressBacklog, wakeObject>>
 
 ResetWait ==
     /\ waitState \in TerminalStates
     /\ waitState' = "idle"
     /\ deadline' = 0
-    /\ UNCHANGED <<generation, epoch, providerLive, ready, observedGeneration,
-                   observedEpoch, now, objectRefs, epollRefs, ingressBacklog>>
+    /\ wakeObject' = 0
+    /\ UNCHANGED <<generation, otherGeneration, epoch, providerLive, ready,
+                   otherReady, observedGeneration, observedEpoch, now,
+                   objectRefs, epollRefs, ingressBacklog>>
 
 TerminalStutter ==
     /\ (waitState \in TerminalStates \/
@@ -269,6 +310,7 @@ Next ==
     \/ ExternalIngress
     \/ IngressStep
     \/ ProviderReady
+    \/ OtherProviderReady
     \/ ConsumeReady
     \/ ArmRecheck
     \/ TimeoutWake
@@ -296,9 +338,11 @@ Spec == Init /\ [][Next]_vars
 
 TypeOK ==
     /\ generation \in 1..MaxGeneration
+    /\ otherGeneration \in 1..2
     /\ epoch \in 1..MaxEpoch
     /\ providerLive \in BOOLEAN
     /\ ready \in BOOLEAN
+    /\ otherReady \in BOOLEAN
     /\ waitState \in WaitStates
     /\ observedGeneration \in 1..MaxGeneration
     /\ observedEpoch \in 1..MaxEpoch
@@ -307,11 +351,14 @@ TypeOK ==
     /\ objectRefs \in 0..MaxRefs
     /\ epollRefs \in 0..MaxRefs
     /\ ingressBacklog \in 0..MaxIngress
+    /\ wakeObject \in 0..2
 
 SleepingRequiresStableRecheck ==
     waitState = "sleeping" =>
         providerLive /\ ~ready /\ generation = observedGeneration /\
         epoch = observedEpoch /\ epollRefs > 0
+
+NoWrongObjectWake == wakeObject # 2
 
 (***************************************************************************
 TLAPS pilot: terminal Linux-visible outcomes cannot be mistaken for the

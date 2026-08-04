@@ -159,10 +159,12 @@ pub(crate) fn start_display_policy_endpoint() -> Result<(), i32> {
         return Err(errno_from_result(register));
     }
     boot_line("uiserver: display policy worker spawn begin");
-    thread::Builder::new()
-        .name(String::from("uiserver-display-policy"))
-        .spawn(move || serve_display_policy(endpoint as u64))
-        .map_err(|_| EINVAL)?;
+    spawn_ui_thread(
+        UiThreadRole::DisplayPolicy,
+        "uiserver-display-policy",
+        move || serve_display_policy(endpoint as u64),
+    )
+    .map_err(|_| EINVAL)?;
     boot_line("uiserver: display policy worker spawn done");
     diag_line("uiserver: display policy endpoint registered");
     Ok(())
@@ -551,11 +553,18 @@ pub(crate) fn diag_line(message: impl Into<String>) {
     static SENDER: OnceLock<mpsc::SyncSender<String>> = OnceLock::new();
     let sender = SENDER.get_or_init(|| {
         let (sender, receiver) = mpsc::sync_channel::<String>(128);
-        thread::spawn(move || {
-            require_background_thread_class();
-            while let Ok(message) = receiver.recv() {
-                observability_client::info!("uiserver", service, "{}", message);
-            }
+        spawn_ui_thread(
+            UiThreadRole::Background,
+            "uiserver-diagnostics",
+            move || {
+                while let Ok(message) = receiver.recv() {
+                    observability_client::info!("uiserver", service, "{}", message);
+                }
+            },
+        )
+        .unwrap_or_else(|_| {
+            debug_line("uiserver: diagnostics worker spawn failed");
+            std::process::exit(134);
         });
         sender
     });
@@ -624,6 +633,42 @@ pub(crate) fn debug_line(message: &str) {
 /// The ABI is self-demotion only, so failure must not leave a background or
 /// untrusted worker competing with input/present at elevated priority.  Exit
 /// the process rather than silently accepting that invalid scheduling model.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UiThreadRole {
+    Background,
+    Protocol,
+    DisplayPolicy,
+    Watchdog,
+    BootstrapGpu,
+}
+
+impl UiThreadRole {
+    const fn retains_boot_class(self) -> bool {
+        matches!(self, Self::BootstrapGpu)
+    }
+}
+
+/// The only production thread-spawn boundary in uiserver. A role is selected
+/// before the child can execute service work, so inherited process priority
+/// never becomes implicit authority. Only the bounded GPU bootstrap worker may
+/// retain boot class; every other role self-demotes before invoking its body.
+pub(crate) fn spawn_ui_thread<F, T>(
+    role: UiThreadRole,
+    name: impl Into<String>,
+    body: F,
+) -> std::io::Result<thread::JoinHandle<T>>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    thread::Builder::new().name(name.into()).spawn(move || {
+        if !role.retains_boot_class() {
+            require_background_thread_class();
+        }
+        body()
+    })
+}
+
 pub(crate) fn require_background_thread_class() {
     if !running_on_rustos() {
         return;
@@ -1426,8 +1471,8 @@ unsafe fn syscall1(number: usize, arg0: usize) -> isize {
 mod tests {
     use super::{
         input_poll_revents, translate_linux_input_event, trusted_ui_status, InputTranslationState,
-        LinuxInputEvent, LinuxInputTimeval, EV_KEY, INPUT_ACTION_PRESSED, INPUT_ACTION_RELEASED,
-        INPUT_KIND_KEYBOARD, POLLERR, POLLHUP, POLLIN, POLLNVAL,
+        LinuxInputEvent, LinuxInputTimeval, UiThreadRole, EV_KEY, INPUT_ACTION_PRESSED,
+        INPUT_ACTION_RELEASED, INPUT_KIND_KEYBOARD, POLLERR, POLLHUP, POLLIN, POLLNVAL,
     };
     use rustos_user_abi::{device, syscall};
 
@@ -1482,6 +1527,19 @@ mod tests {
             assert_eq!(input_poll_revents(terminal), Err(5));
             assert_eq!(input_poll_revents(POLLIN | terminal), Err(5));
         }
+    }
+
+    #[test]
+    fn only_bootstrap_gpu_role_retains_inherited_boot_class() {
+        for role in [
+            UiThreadRole::Background,
+            UiThreadRole::Protocol,
+            UiThreadRole::DisplayPolicy,
+            UiThreadRole::Watchdog,
+        ] {
+            assert!(!role.retains_boot_class(), "unexpected boot role {role:?}");
+        }
+        assert!(UiThreadRole::BootstrapGpu.retains_boot_class());
     }
 }
 

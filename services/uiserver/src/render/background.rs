@@ -7,10 +7,9 @@
 //! thread the first time the display is configured.
 
 use std::sync::mpsc::{self, Receiver};
-use std::thread;
 
 use crate::canvas::{Rect, SurfaceCanvas};
-use crate::sys::require_background_thread_class;
+use crate::sys::{spawn_ui_thread, UiThreadRole};
 
 use super::colors::{
     COLOR_AURORA_CYAN, COLOR_AURORA_MINT, COLOR_AURORA_VIOLET, COLOR_BG_DEEP, COLOR_BG_MID,
@@ -30,21 +29,25 @@ pub(crate) fn start_desktop_background_loader(
     height: usize,
 ) -> Receiver<DesktopBackground> {
     let (sender, receiver) = mpsc::sync_channel(1);
-    thread::spawn(move || {
-        require_background_thread_class();
-        let fast_pixels = build_fast_desktop_background(width, height);
-        let _ = sender.send(DesktopBackground {
-            width,
-            height,
-            pixels: fast_pixels,
-        });
-        let pixels = build_desktop_background(width, height);
-        let _ = sender.send(DesktopBackground {
-            width,
-            height,
-            pixels,
-        });
-    });
+    spawn_ui_thread(
+        UiThreadRole::Background,
+        "uiserver-desktop-background",
+        move || {
+            let fast_pixels = build_fast_desktop_background(width, height);
+            let _ = sender.send(DesktopBackground {
+                width,
+                height,
+                pixels: fast_pixels,
+            });
+            let pixels = build_desktop_background(width, height);
+            let _ = sender.send(DesktopBackground {
+                width,
+                height,
+                pixels,
+            });
+        },
+    )
+    .unwrap_or_else(|_| std::process::exit(134));
     receiver
 }
 

@@ -156,18 +156,22 @@ duplicate live token, or stale acknowledgement is a kernel invariant failure
 and panics.
 
 The reschedule IPI is the only no-payload, no-rendezvous exception: its durable
-owner is one per-target atomic request bit, and the fixed IPI is merely a
-coalesced notification. The sender admits only an `Online` target from the
+owner is one packed per-target atomic word containing a pending bit and a
+monotonic request sequence, and the fixed IPI is merely a coalesced
+notification. The sender admits only an `Online` target from the
 immutable boot CPU generation. A receiver interrupted with preemption disabled
 acknowledges the APIC but retains the request for a same-CPU syscall, timer, or
 `cond_resched` safe point. CPU hot-remove is prohibited until this exception is
 replaced by an explicit generation token.
 
 Each CPU also publishes one cache-line-separated lifecycle generation and
-monotonic request/notify/consume sequences. Request publication precedes the
-durable bit; only a remote 0->1 pending edge records notification; a local
-safe point, timer, RTC, syscall tail, or remote IPI records consumption after
-scheduling work. One notification may cover several requests. Acceptance
+monotonic request/notify/consume sequences. One AcqRel CAS publishes the next
+sequence together with pending=1, and one AcqRel CAS claims pending together
+with its exact sequence. A publication after that claim necessarily creates a
+new 0->1 edge; a publication before it is included in the claimed sequence.
+Only a remote 0->1 pending edge records notification; a local safe point,
+timer, RTC, syscall tail, or remote IPI records consumption after scheduling
+work. One notification may cover several requests. Acceptance
 requires same-generation `consume_seq >= request_seq_at_stop` and never
 requires a self IPI.
 
@@ -196,11 +200,36 @@ Each online CPU owns its local clockevent. Global time remains a validated
 monotonic clocksource; clockevent delivery and timekeeping are separate.
 Scheduling quantum is time-based and does not shrink as CPU count increases.
 Invariant-TSC capability establishes rate stability, not cross-CPU offset.
-Therefore raw TSC is a global monotonic source only for a one-CPU topology;
-SMP uses a validated 64-bit HPET. TSC frequency remains available for local
-TSC-deadline clockevents. SMP TSC timekeeping may be admitted only after an AP
-rendezvous measures and publishes bounded per-CPU offsets/skew and migration
-tests prove normalized monotonicity.
+A one-CPU topology may therefore publish raw TSC directly, while a
+multiprocessor topology starts on the validated 64-bit HPET. TSC frequency
+remains available for local TSC-deadline clockevents in both cases.
+
+A multiprocessor topology upgrades to raw TSC only through the bounded
+cross-CPU warp rendezvous. While each application processor is parked in
+`OnlineParked`, it and the boot processor both publish timestamps into one
+monotone shared word for a fixed window and record any observation of a local
+timestamp below an already-published one. That observation is the property the
+kernel actually depends on — no backwards time — rather than an assumption
+about hypervisor or firmware synchronization, and it cannot produce a false
+positive: a delay between reading the published value and taking the local
+timestamp can only make the local sample larger. This is the admission test
+used by Linux (`check_tsc_warp`) and FreeBSD (`comp_smp_tsc`).
+
+Admission is fail-closed and exact. Only a measured warp of zero on every
+application processor admits the upgrade; a nonzero warp, an uncalibrated rate,
+or a rendezvous that does not complete within its bounded deadline leaves the
+HPET in place for the whole boot. Promotion is a one-way upgrade performed by
+the boot processor while every other CPU is still parked before
+`SchedulerReady`, so no CPU can observe the two time domains out of order, and
+the new origin is chosen so the first TSC-derived reading is not earlier than
+the last HPET-derived one. The admitted skew is published as evidence rather
+than assumed.
+
+This matters beyond timekeeping accuracy. The HPET main counter is an MMIO
+read, so under a virtualized product topology every timestamp is an exit
+serialized against the other CPUs. Scheduler, timeout, and IPC paths sample
+time frequently enough that leaving a multiprocessor topology on that source
+makes timestamp cost scale with CPU count.
 
 ## 7. Scheduler and task ownership
 
@@ -578,9 +607,10 @@ The required mutation/retirement sequence is:
    lock;
 3. for retirement, first prove every task/slot/process reference has been
    detached and no CPU can publish that root again;
-4. conservatively snapshot every shootdown-eligible CPU, not only CPUs whose
-   active-root observation currently matches—the IRQ activation path cannot
-   take the sender's mutation lock;
+4. after the page-table edit, snapshot CPUs whose release-published active root
+   matches an address-space mutation; a changed activation writes CR3 before
+   publishing, while global mappings and retirement still target every
+   shootdown-eligible CPU;
 5. publish the token, release the mutation/raw lock, and send typed IPIs;
 6. invalidate locally and on every target;
 7. wait outside raw locks for generation-matched acknowledgements;
@@ -592,6 +622,22 @@ never depends on that threshold. A missing acknowledgement triggers a 100 ms
 diagnostic/resend cadence while the durable transaction and reclaim quarantine
 remain owned. Only a 2-second CPU-liveness failure may invoke the boot-only
 fail-stop policy; the elapsed 100 ms interval alone is never a panic reason.
+
+The unacknowledged-target policy is **system fail-stop**, chosen explicitly
+over CPU quarantine because the supported envelope has no hot-remove: a target
+that never acknowledges cannot be retired, so its outstanding translation
+cannot be proven dead. An expired deadline therefore panics with the frame
+still held behind its mutation guard. No timeout on this path may ever
+authorize reuse; freeing a frame a live CPU can still translate is memory
+corruption, not a latency symptom. Adopting quarantine instead would first
+require `Draining -> Parked -> Offline` CPU states and proof that the
+quarantined CPU owns no runnable task and no reclaim-blocking acknowledgement.
+
+The deadline is a dead-owner horizon, not a latency budget. A virtualized
+target may be descheduled by its host for a long interval while remaining
+healthy, so the bound is deliberately generous and the retry IPI carries
+liveness during it. Treating a host pause as a kernel deadlock is a false
+positive that this contract rejects.
 Stale acknowledgement, generation wrap, token reuse, or reclaim-before-ack is
 an internal memory-isolation failure and panics. An address space cannot be destroyed while
 any live reference, active-root owner, or shootdown obligation remains. A root
@@ -612,11 +658,11 @@ queues, timers, IPC donation, and current/ready ownership on every CPU.
   ABI state.
 - The release stack profile eagerly maps every usable stack page above one
   permanent guard page before the task becomes runnable. Consequently a valid
-  stack access does not enter `ProcessStateLock` from page-fault context. A
-  future lazy-growth profile must use immutable task/generation plans and a
-  `FaultDeferred` worker retry; transient lock contention may never be
-  reclassified as retirement. Only an already-published retirement or stale
-  generation may terminate that retry.
+  stack access does not enter `ProcessStateLock` from page-fault context. No
+  lazy-growth exception route is compiled into the enabled product. A future
+  lazy profile must first add an immutable task/generation plan, an explicit
+  `FaultDeferred` worker owner, and a retry/refinement proof; transient lock
+  contention may never be reclassified as retirement.
 - Exec reserves an exact frozen scheduler target token, releases the raw owner,
   stages the process/FD/MM bundle under `ProcessStateLock`, releases that lock,
   publishes the matching root/context under the scheduler owner, and finally
@@ -706,9 +752,10 @@ vector unmasked and the CPU allowed Online. Interrupt entry rearms a strictly
 future deadline before scheduler work, never changes the BSP PIT divisor, and
 uses local APIC EOI. Missing prerequisites fail AP admission rather than
 silently creating a non-preemptible CPU.
-The same calibrated TSC rate does not authorize global SMP timekeeping; until
-offset/skew admission exists, `clocksource-deadline` requires HPET for every
-multi-CPU topology.
+The same calibrated TSC rate does not by itself authorize global SMP
+timekeeping. A multi-CPU topology runs on HPET until the bounded cross-CPU warp
+rendezvous of section 6 admits raw TSC, and stays on HPET permanently if any
+application processor fails or does not complete that rendezvous.
 
 ## 10. Locking and memory ordering
 

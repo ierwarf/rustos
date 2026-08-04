@@ -32,6 +32,12 @@ const EARLY_SYSTEM_BOOTSTRAP_PATHS: &[&str] = &[
     "lib/x86_64-linux-gnu/libc.so.6",
     "lib/x86_64-linux-gnu/libgcc_s.so.1",
     "lib64/ld-linux-x86-64.so.2",
+    // WayClick is the mandatory first interactive desktop client. Treat it as
+    // part of the signed product bootstrap closure so reaching a usable UI
+    // does not depend on a cold DVM/FAT snapshot transaction. The executable
+    // remains loaderd/vfsd-owned and is still copied into a terminally sealed
+    // snapshot before execution; ring0 only exposes immutable signed bytes.
+    "apps/wayclick/wayclick.elf",
     "services/devmgrd/devmgrd.elf",
     "services/initd/initd.elf",
     "services/inputd/inputd.elf",
@@ -1273,6 +1279,7 @@ mod tests {
     #[test]
     fn early_system_allowlist_contains_the_minimal_dynamic_runtime_closure() {
         for required in [
+            "apps/wayclick/wayclick.elf",
             "etc/ld.so.cache",
             "lib64/ld-linux-x86-64.so.2",
             "lib/x86_64-linux-gnu/libc.so.6",

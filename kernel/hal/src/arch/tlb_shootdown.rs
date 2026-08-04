@@ -8,13 +8,35 @@
 //!   to every admitted CPU → flush local/remote translations → acknowledge →
 //!   permit reuse. Address-space activation publishes CR3/root lock-free.
 //! - **Concurrency:** the protocol lock is mutation-sender-only and is never
-//!   acquired by IRQ-time address-space activation or the IPI leaf. Conservative
-//!   all-CPU targeting closes activation/snapshot races without an IRQ lock.
+//!   acquired by IRQ-time address-space activation or the IPI leaf. An
+//!   address-space mutation targets the CPUs whose release-published active
+//!   root matches; global kernel mappings still target every eligible CPU.
 //! - **Failure:** missing eligibility, root mismatch, generation wrap, stale
 //!   mailbox, or acknowledgement timeout is an immediate kernel panic.
 //! - **Forbidden:** no CR3 write outside this module after SMP admission, no
 //!   frame reclaim before guard completion, and no handler-side lock.
 //! - **Evidence:** `tlb-shootdown-lifecycle`.
+//!
+//! # Unacknowledged-target policy
+//!
+//! The supported envelope has no CPU hot-remove, so a target that does not
+//! acknowledge within `ACK_LIVENESS_TIMEOUT_NS` cannot be retired and its
+//! outstanding translation cannot be proven dead. The chosen policy is
+//! therefore **system fail-stop**, not CPU quarantine: the watchdog panics
+//! while the frame is still held behind its mutation guard.
+//!
+//! The rejected alternative is to let the deadline expire into reclaim. That
+//! would free a frame a live CPU may still translate, which is memory
+//! corruption rather than a latency problem, so no timeout on this path may
+//! ever authorize reuse. A future quarantine policy would first have to add
+//! `Draining -> Parked -> Offline` CPU states, prove the quarantined CPU owns
+//! no runnable task and no reclaim-blocking acknowledgement, and only then may
+//! weaken this fail-stop.
+//!
+//! The deadline is a dead-owner horizon, not a latency budget: a virtualized
+//! target can be descheduled by its host for a long time while remaining
+//! perfectly healthy, so the bound is deliberately generous and the retry IPI
+//! carries liveness in the meantime.
 
 #[cfg(rustos_boot_image)]
 use core::hint::spin_loop;
@@ -194,7 +216,7 @@ fn lock_protocol_bounded() -> (
             "TLB invariant: mutation protocol entered from IRQ context"
         );
         let restore_interrupts = interrupts::are_enabled();
-        let started_at = super::clock::monotonic_nanos();
+        let mut deadline = super::clock::SpinDeadline::start();
         loop {
             if restore_interrupts {
                 interrupts::disable();
@@ -213,9 +235,7 @@ fn lock_protocol_bounded() -> (
             // may contend legitimately. Use the protocol's wall-clock bound,
             // not the generic diagnostic spin count, while still failing
             // closed on a lost owner or circular dependency.
-            if super::clock::monotonic_nanos().saturating_sub(started_at)
-                >= PROTOCOL_ACQUIRE_TIMEOUT_NS
-            {
+            if deadline.elapsed_nanos() >= PROTOCOL_ACQUIRE_TIMEOUT_NS {
                 panic!("TLB invariant: protocol lock acquisition timed out");
             }
             spin_loop();
@@ -245,9 +265,11 @@ fn unlock_protocol(
 /// Load one address-space root and publish it as this CPU's active root.
 ///
 /// This path runs in timer/software-schedule IRQ context and therefore must
-/// never wait for the mutation sender lock. Every completed mutation targets
-/// all shootdown-eligible CPUs, so an already-online concurrent activation is
-/// necessarily followed by that generation's flush.
+/// never wait for the mutation sender lock. A changed activation writes CR3
+/// before release-publishing the new root. Therefore a sender either observes
+/// the old matching root and targets it, or observes a different root whose
+/// preceding CR3 write already discarded translations; any later activation
+/// back to the mutation root performs another CR3 write before publication.
 pub fn activate_address_space(root: PhysAddr) {
     let root_raw = root.as_u64();
     assert!(
@@ -258,10 +280,9 @@ pub fn activate_address_space(root: PhysAddr) {
     interrupts::without_interrupts(|| {
         let logical_index = current_cpu_index();
         // ORDERING: Acquire observes this CPU's previous Release publication.
-        // The shootdown protocol targets every eligible CPU and flushes by an
-        // exact generation, so rewriting an already-active root adds no
-        // visibility. Avoiding that write preserves the CPU's TLB across
-        // same-process threads and same-task scheduler turns.
+        // A sender filters address-space mutations by this publication. A
+        // changed root is written to CR3 before the Release below, while an
+        // unchanged root remains an exact target for a concurrent mutation.
         // ORDERING: This Acquire is the exact same-CPU publication check.
         let active_root = ACTIVE_ROOT[logical_index].load(Ordering::Acquire);
         if !activation_requires_cr3_write(active_root, root_raw) {
@@ -269,8 +290,9 @@ pub fn activate_address_space(root: PhysAddr) {
         }
         write_cr3(root);
         // ORDERING: Release publishes the active root only after CR3 accepted
-        // the same frame. Shootdowns target every eligible CPU rather than
-        // racing this value as a target-selection filter.
+        // the same frame. A sender's Acquire may use this value for exact-root
+        // target selection only because every changed activation flushes via
+        // CR3 before this publication.
         ACTIVE_ROOT[logical_index].store(root_raw, Ordering::Release);
     });
 }
@@ -362,17 +384,15 @@ fn finish_shootdown(scope: MutationScope) {
         let target = usize::from(descriptor.logical_index);
         // ORDERING: Acquire observes online admission before target selection.
         let eligible = SHOOTDOWN_ELIGIBLE[target].load(Ordering::Acquire);
-        // ORDERING: Acquire observes the root published at target activation.
-        // It is diagnostic input only: filtering by it would race a later
-        // IRQ-time activation onto the mutation root.
+        // ORDERING: Acquire observes the root published after the target's CR3
+        // write. If it differs from an address-space mutation root, the prior
+        // write already discarded old translations; activation back to the
+        // mutated root must perform and publish another CR3 write.
         let active_root = ACTIVE_ROOT[target].load(Ordering::Acquire);
         if target == current || !shootdown_target_is_required(eligible, active_root, mutation_root)
         {
             continue;
         }
-        // Every eligible CPU is targeted. Filtering by the observed root would
-        // race an IRQ-time address-space activation that intentionally cannot
-        // take the mutation lock.
         assert_ne!(
             active_root, 0,
             "TLB invariant: eligible target has no active root"
@@ -380,14 +400,14 @@ fn finish_shootdown(scope: MutationScope) {
         // ORDERING: These Relaxed payload fields are not authority on their
         // own; the following Release request generation publishes both.
         ACK_GENERATION[target].store(0, Ordering::Relaxed);
-        REQUEST_ROOT[target].store(GLOBAL_SCOPE, Ordering::Relaxed);
+        REQUEST_ROOT[target].store(mutation_root, Ordering::Relaxed);
         // ORDERING: Release publishes the complete target mailbox.
         REQUEST_GENERATION[target].store(generation, Ordering::Release);
         targets[target] = true;
     }
 
-    // The sender also flushes unconditionally. This is deliberately broader
-    // than the mutation scope so a concurrent local activation cannot escape.
+    // The sender flushes unconditionally because it owns the page-table edit
+    // even when its current root changed during the mutation transaction.
     tlb::flush_all();
 
     for descriptor in topology.cpus() {
@@ -402,7 +422,10 @@ fn finish_shootdown(scope: MutationScope) {
         }
     }
 
-    let start = super::clock::monotonic_nanos();
+    // One batched deadline spans the complete acknowledgement quorum, so the
+    // liveness horizon still covers the whole shootdown rather than resetting
+    // per target.
+    let mut deadline = super::clock::SpinDeadline::start();
     for descriptor in topology.cpus() {
         let target = usize::from(descriptor.logical_index);
         if !targets[target] {
@@ -415,11 +438,13 @@ fn finish_shootdown(scope: MutationScope) {
             if ACK_GENERATION[target].load(Ordering::Acquire) == generation {
                 break;
             }
-            let elapsed = super::clock::monotonic_nanos().saturating_sub(start);
+            let elapsed = deadline.elapsed_nanos();
             if elapsed >= ACK_LIVENESS_TIMEOUT_NS {
                 panic!(
                     "TLB liveness watchdog: generation {generation} retained reclaim quarantine while logical CPU {} APIC {} failed to acknowledge after {}ns",
-                    descriptor.logical_index, descriptor.apic_id, elapsed
+                    descriptor.logical_index,
+                    descriptor.apic_id,
+                    deadline.exact_elapsed_nanos()
                 );
             }
             if elapsed >= retry_after {
@@ -452,9 +477,9 @@ pub(super) fn on_interrupt() {
         "TLB invariant: target received an unpublished shootdown"
     );
     let request_root = REQUEST_ROOT[logical_index].load(Ordering::Relaxed);
-    assert_eq!(
-        request_root, GLOBAL_SCOPE,
-        "TLB invariant: runtime shootdown was not conservatively global"
+    assert!(
+        request_root == GLOBAL_SCOPE || request_root.is_multiple_of(PAGE_SIZE),
+        "TLB invariant: runtime shootdown scope is invalid"
     );
     tlb::flush_all();
     // ORDERING: Release publishes flush completion for the exact generation.
@@ -471,15 +496,12 @@ const fn scope_root(scope: MutationScope) -> u64 {
 }
 
 #[cfg(any(rustos_boot_image, test))]
-const CONSERVATIVE_SHOOTDOWN_TARGETS: bool = true;
-
-#[cfg(any(rustos_boot_image, test))]
 const fn shootdown_target_is_required(
     eligible: bool,
-    _active_root: u64,
-    _mutation_root: u64,
+    active_root: u64,
+    mutation_root: u64,
 ) -> bool {
-    eligible && CONSERVATIVE_SHOOTDOWN_TARGETS
+    eligible && (mutation_root == GLOBAL_SCOPE || active_root == mutation_root)
 }
 
 #[cfg(any(rustos_boot_image, test))]
@@ -542,12 +564,12 @@ mod tests {
     }
 
     #[test]
-    fn shootdown_targets_every_eligible_cpu_regardless_of_root() {
+    fn address_space_shootdown_targets_only_matching_active_roots() {
         let root = MutationScope::AddressSpace(0x4000);
         assert_eq!(scope_root(root), 0x4000);
         assert_eq!(scope_root(MutationScope::Global), 0);
         assert!(shootdown_target_is_required(true, 0x4000, 0x4000));
-        assert!(shootdown_target_is_required(true, 0x5000, 0x4000));
+        assert!(!shootdown_target_is_required(true, 0x5000, 0x4000));
         assert!(shootdown_target_is_required(true, 0x5000, 0));
         assert!(!shootdown_target_is_required(false, 0x4000, 0x4000));
     }

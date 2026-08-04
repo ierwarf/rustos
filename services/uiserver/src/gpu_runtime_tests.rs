@@ -2,10 +2,10 @@
 
 use super::{
     copy_atlas_damage_to_slot, difference_bounds, gpu_completion_timed_out, gpu_provider_admission,
-    next_frame_deadline, reconstruction_damage_within_budget, snapshot_damage_for_slot,
-    AtlasDamageEpoch, DvmGpuAtlasDamage, GpuCompositorRuntime, GpuProviderAdmission, Rect,
-    GPU_COMPLETION_TIMEOUT, GPU_FIRST_FRAME_TIMEOUT, GPU_FRAME_INTERVAL,
-    GPU_INITIALIZATION_RETAINS_BOOT_CLASS, GPU_PROVIDER_HEALTH_INTERVAL,
+    gpu_ready_retry_backoff, next_frame_deadline, reconstruction_damage_within_budget,
+    snapshot_damage_for_slot, AtlasDamageEpoch, DvmGpuAtlasDamage, GpuCompositorRuntime,
+    GpuProviderAdmission, Rect, GPU_COMPLETION_TIMEOUT, GPU_FIRST_FRAME_TIMEOUT,
+    GPU_FRAME_INTERVAL, GPU_INITIALIZATION_RETAINS_BOOT_CLASS, GPU_PROVIDER_HEALTH_INTERVAL,
 };
 use crate::sys::DisplayInfo;
 use rustos_user_abi::device::{DISPLAY_INFO_FLAG_DVM_SCANOUT, DISPLAY_INFO_FLAG_GPU_COMPOSITOR};
@@ -22,6 +22,18 @@ fn display_with_flags(flags: u32) -> DisplayInfo {
         flags,
         generation: 1,
     }
+}
+
+#[test]
+fn gpu_provider_retry_backoff_is_bounded_and_exponential() {
+    assert_eq!(gpu_ready_retry_backoff(1), Duration::from_millis(50));
+    assert_eq!(gpu_ready_retry_backoff(2), Duration::from_millis(100));
+    assert_eq!(gpu_ready_retry_backoff(3), Duration::from_millis(200));
+    assert_eq!(gpu_ready_retry_backoff(4), Duration::from_millis(400));
+    assert_eq!(
+        gpu_ready_retry_backoff(u32::MAX),
+        Duration::from_millis(400)
+    );
 }
 
 #[test]

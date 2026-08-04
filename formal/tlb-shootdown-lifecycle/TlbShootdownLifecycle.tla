@@ -3,7 +3,7 @@ EXTENDS Naturals, FiniteSets
 
 (***************************************************************************
 Models address-space reference ownership, activation, serialized page-table
-mutation, conservative all-eligible target publication, exact-generation
+mutation, active-root-scoped target publication, exact-generation
 acknowledgement, and terminal root reclamation.
 
 The scheduler/process layer must release every task/slot/process reference and
@@ -37,11 +37,11 @@ RetireMutation == "retire-mutation"
 
 VARIABLES activeRoot, eligible, rootState, references, phase, mutationKind,
           mutationRoot, generation, targets, requestGeneration, ackGeneration,
-          lastActivationSameRoot, lastActivationReloaded
+          lastActivationSameRoot, lastActivationReloaded, targetSnapshotRoot
 
 vars == <<activeRoot, eligible, rootState, references, phase, mutationKind,
           mutationRoot, generation, targets, requestGeneration, ackGeneration,
-          lastActivationSameRoot, lastActivationReloaded>>
+          lastActivationSameRoot, lastActivationReloaded, targetSnapshotRoot>>
 
 Init ==
     /\ activeRoot = [cpu \in Cpus |-> NoneRoot]
@@ -57,8 +57,11 @@ Init ==
     /\ ackGeneration = [cpu \in Cpus |-> 0]
     /\ lastActivationSameRoot = FALSE
     /\ lastActivationReloaded = FALSE
+    /\ targetSnapshotRoot = [cpu \in Cpus |-> NoneRoot]
 
-TargetSnapshot(root) == {cpu \in Cpus: eligible[cpu]}
+EligibleTargets == {cpu \in Cpus: eligible[cpu]}
+AddressSpaceTargets(root) ==
+    {cpu \in Cpus: eligible[cpu] /\ activeRoot[cpu] = root}
 
 AcquireReference(root) ==
     /\ rootState[root] = RootLive
@@ -67,7 +70,7 @@ AcquireReference(root) ==
     /\ UNCHANGED <<activeRoot, eligible, rootState, phase, mutationKind,
                    mutationRoot, generation, targets, requestGeneration,
                    ackGeneration, lastActivationSameRoot,
-                   lastActivationReloaded>>
+                   lastActivationReloaded, targetSnapshotRoot>>
 
 ReleaseReference(root) ==
     /\ references[root] > 0
@@ -76,7 +79,7 @@ ReleaseReference(root) ==
     /\ UNCHANGED <<activeRoot, eligible, rootState, phase, mutationKind,
                    mutationRoot, generation, targets, requestGeneration,
                    ackGeneration, lastActivationSameRoot,
-                   lastActivationReloaded>>
+                   lastActivationReloaded, targetSnapshotRoot>>
 
 Activate(cpu, root) ==
     /\ rootState[root] = RootLive
@@ -86,7 +89,7 @@ Activate(cpu, root) ==
     /\ activeRoot' = [activeRoot EXCEPT ![cpu] = root]
     /\ UNCHANGED <<eligible, rootState, references, phase, mutationKind,
                    mutationRoot, generation, targets, requestGeneration,
-                   ackGeneration>>
+                   ackGeneration, targetSnapshotRoot>>
 
 Deactivate(cpu) ==
     /\ activeRoot[cpu] # NoneRoot
@@ -95,7 +98,7 @@ Deactivate(cpu) ==
     /\ lastActivationReloaded' = FALSE
     /\ UNCHANGED <<eligible, rootState, references, phase, mutationKind,
                    mutationRoot, generation, targets, requestGeneration,
-                   ackGeneration>>
+                   ackGeneration, targetSnapshotRoot>>
 
 Admit(cpu) ==
     /\ phase = Idle
@@ -105,7 +108,7 @@ Admit(cpu) ==
     /\ UNCHANGED <<activeRoot, rootState, references, phase, mutationKind,
                    mutationRoot, generation, targets, requestGeneration,
                    ackGeneration, lastActivationSameRoot,
-                   lastActivationReloaded>>
+                   lastActivationReloaded, targetSnapshotRoot>>
 
 BeginMutation(root) ==
     /\ phase = Idle
@@ -113,21 +116,23 @@ BeginMutation(root) ==
     /\ phase' = Editing
     /\ mutationKind' = EditMutation
     /\ mutationRoot' = root
-    \* IRQ-time activation deliberately does not wait for this sender lock.
-    /\ targets' = TargetSnapshot(root)
+    \* Target capture occurs only after the edit at Publish. An activation
+    \* before then is observed; a later changed activation reloads CR3 before
+    \* publishing the new root.
+    /\ targets' = {}
     /\ UNCHANGED <<activeRoot, eligible, rootState, references, generation,
                    requestGeneration, ackGeneration, lastActivationSameRoot,
-                   lastActivationReloaded>>
+                   lastActivationReloaded, targetSnapshotRoot>>
 
 BeginGlobalMutation ==
     /\ phase = Idle
     /\ phase' = Editing
     /\ mutationKind' = GlobalMutation
     /\ mutationRoot' = GlobalRoot
-    /\ targets' = TargetSnapshot(GlobalRoot)
+    /\ targets' = {}
     /\ UNCHANGED <<activeRoot, eligible, rootState, references, generation,
                    requestGeneration, ackGeneration, lastActivationSameRoot,
-                   lastActivationReloaded>>
+                   lastActivationReloaded, targetSnapshotRoot>>
 
 BeginRetirement(root) ==
     /\ phase = Idle
@@ -138,23 +143,30 @@ BeginRetirement(root) ==
     /\ phase' = Editing
     /\ mutationKind' = RetireMutation
     /\ mutationRoot' = root
-    /\ targets' = TargetSnapshot(root)
+    /\ targets' = {}
     /\ UNCHANGED <<activeRoot, eligible, references, generation,
                    requestGeneration, ackGeneration, lastActivationSameRoot,
-                   lastActivationReloaded>>
+                   lastActivationReloaded, targetSnapshotRoot>>
 
 Publish ==
     /\ phase = Editing
+    /\ LET publishTargets ==
+              IF mutationKind = EditMutation
+              THEN AddressSpaceTargets(mutationRoot)
+              ELSE EligibleTargets
+       IN /\ targets' = publishTargets
+          /\ requestGeneration' =
+              [cpu \in Cpus |->
+                  IF cpu \in publishTargets
+                  THEN generation + 1 ELSE requestGeneration[cpu]]
+          /\ ackGeneration' =
+              [cpu \in Cpus |->
+                  IF cpu \in publishTargets THEN 0 ELSE ackGeneration[cpu]]
+          /\ targetSnapshotRoot' = activeRoot
     /\ generation' = generation + 1
-    /\ requestGeneration' =
-        [cpu \in Cpus |->
-            IF cpu \in targets THEN generation + 1 ELSE requestGeneration[cpu]]
-    /\ ackGeneration' =
-        [cpu \in Cpus |->
-            IF cpu \in targets THEN 0 ELSE ackGeneration[cpu]]
     /\ phase' = Published
     /\ UNCHANGED <<activeRoot, eligible, rootState, references, mutationKind,
-                   mutationRoot, targets, lastActivationSameRoot,
+                   mutationRoot, lastActivationSameRoot,
                    lastActivationReloaded>>
 
 Acknowledge(cpu) ==
@@ -165,7 +177,7 @@ Acknowledge(cpu) ==
     /\ UNCHANGED <<activeRoot, eligible, rootState, references, phase,
                    mutationKind, mutationRoot, generation, targets,
                    requestGeneration, lastActivationSameRoot,
-                   lastActivationReloaded>>
+                   lastActivationReloaded, targetSnapshotRoot>>
 
 Finish ==
     /\ phase = Published
@@ -178,7 +190,7 @@ Finish ==
     /\ UNCHANGED <<activeRoot, eligible, references, mutationKind,
                    mutationRoot, generation, targets, requestGeneration,
                    ackGeneration, lastActivationSameRoot,
-                   lastActivationReloaded>>
+                   lastActivationReloaded, targetSnapshotRoot>>
 
 Terminal ==
     /\ phase = Complete
@@ -215,13 +227,17 @@ TypeOK ==
     /\ ackGeneration \in [Cpus -> Nat]
     /\ lastActivationSameRoot \in BOOLEAN
     /\ lastActivationReloaded \in BOOLEAN
+    /\ targetSnapshotRoot \in [Cpus -> Roots \cup {NoneRoot}]
 
 SameRootActivationDoesNotReload ==
     lastActivationSameRoot => ~lastActivationReloaded
 
-TargetsCoverEveryEligibleCpu ==
-    phase \in {Editing, Published} =>
-        targets = {cpu \in Cpus: eligible[cpu]}
+TargetsMatchMutationScope ==
+    phase \in {Published, Complete} =>
+        targets = IF mutationKind = EditMutation
+                  THEN {cpu \in Cpus:
+                            eligible[cpu] /\ targetSnapshotRoot[cpu] = mutationRoot}
+                  ELSE EligibleTargets
 
 PublishedTargetsOwnExactGeneration ==
     phase = Published =>

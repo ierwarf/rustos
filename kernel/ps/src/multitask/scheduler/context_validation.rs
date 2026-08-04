@@ -28,6 +28,64 @@ pub(super) fn context_validation_reason_code(reason: &'static str) -> u8 {
     }
 }
 
+use super::*;
+
+impl Scheduler {
+    pub(super) fn retire_invalid_ready_tasks(&mut self) {
+        let current_cpu = nucleus_core::util::lockdep::current_cpu_index();
+        for slot in runqueue::local_runnable_slots(current_cpu) {
+            if slot == ROOT_TASK_SLOT {
+                continue;
+            }
+            // Only a published runnable frame is immutable scheduler state.
+            // The current task's saved frame is the live kernel stack and may
+            // be overwritten until interrupt/syscall entry finishes saving
+            // it. Blocked, suspended, and retired slots are validated at their
+            // own transition; a foreign running slot is never inspected.
+            if !published_frame_is_stable(
+                slot,
+                self.current_task_slot(),
+                super::super::task_slot_is_running(slot),
+            ) {
+                continue;
+            }
+            let Some(context) = self.contexts[slot] else {
+                continue;
+            };
+            if !should_validate_published_ready_frame(
+                slot,
+                self.current_task_slot(),
+                self.retired[slot],
+                self.start_suspended[slot],
+                context.ready,
+                context.blocked,
+            ) {
+                continue;
+            }
+            if let Err(reason) =
+                self.validate_saved_context(slot, context.user_mode, context.saved_rsp)
+            {
+                self.log_invalid_context(slot, context.saved_rsp, reason, "ready-scan");
+                self.retire_slot_due_to_invalid_context(slot, context.saved_rsp, reason);
+            }
+        }
+    }
+
+    pub(super) fn periodic_ready_validation_due(&mut self) -> bool {
+        let turn = self
+            .current_dispatch_policy()
+            .ready_validation_turn
+            .saturating_add(1);
+        if turn >= READY_VALIDATION_INTERVAL_TURNS {
+            self.current_dispatch_policy_mut().ready_validation_turn = 0;
+            true
+        } else {
+            self.current_dispatch_policy_mut().ready_validation_turn = turn;
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::context_validation_reason_code;

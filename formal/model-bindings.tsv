@@ -6,10 +6,10 @@ cpu-affinity-observation/CpuAffinityObservation	refinement	cpu-affinity-observat
 task-affinity-lifecycle/TaskAffinityLifecycle	refinement	task-affinity-lifecycle	Nonempty Online-subset task and process masks, exact target ownership, forced migration, previous-mask return, fork inheritance, exec preservation, and current-processor observation refine Linux and Windows affinity ABI.
 clocksource-deadline/ClocksourceDeadline	refinement	monotonic-deadline-lifecycle	The clocksource model proves the deadline flow's time-domain and catch-up invariants.
 dvm-input-ring/DvmInputRing	refinement	dvm-input-ingress	Two authorized broker callers contend for one exact drain owner while cursor, reset, and epoch transitions remain single-consumer.
-dvm-transport-lifecycle/DvmTransportLifecycle	refinement	dvm-input-ingress	Generation-bound claims close at drain start and shared transport reset is admitted only after exact claim quiescence.
+dvm-transport-lifecycle/DvmTransportLifecycle	refinement	dvm-input-ingress	Packed epoch-state activation competes with drain in one CAS word; mapping publication precedes Active and reset/unmap follows exact claim quiescence.
 exception-retirement-lifecycle/ExceptionRetirementLifecycle	refinement	exception-retirement	Dedicated IST and lock-free NMI entry plus scalar-only user-fault diagnostics refine exception containment without untrusted memory probes.
 ipc-handle-transfer/IpcHandleTransfer	refinement	ipc-handle-transfer	The typed handle lifecycle is preceded by a canonical nonzero integer-ticket parser and exact one-shot registry lookup.
-ipc-transfer-authority/IpcTransferAuthority	refinement	ipc-handle-transfer	Kernel-bound receiver generation, service epoch, channel direction, stream position, and invisible copyout reservations refine one-shot descriptor transfer authority.
+ipc-transfer-authority/IpcTransferAuthority	refinement	ipc-handle-transfer	Provider-accepted bytes own the stream frontier; receiver-set epoch, service, channel, direction, exact position, and invisible copyout reservations bind one-shot descriptor authority.
 deferred-start/DeferredStart	refinement	deferred-process-activation	Suspended creation and one-shot activation refine the process activation transaction.
 devmgrd-sessiond-isolation/DevmgrdSessiondIsolation	refinement	service-call-authority	Bounded policy-worker isolation refines nested service-call progress and cancellation.
 dma-iommu-isolation/DmaIommuIsolation	refinement	boot-storage-handoff	IOMMU ownership and DMA revocation refine physical device handoff.
@@ -38,7 +38,7 @@ gui-dvm-install/GuiDvmInstall	evidence	gpu-frame-lifecycle	GUI DVM installation 
 gui-dvm-pixel-authority/GuiDvmPixelAuthority	refinement	gpu-frame-lifecycle	Pixel authority and revoke refine GPU frame ownership.
 gui-dvm-surface/GuiDvmSurface	refinement	gpu-frame-lifecycle	Surface bounds and generation ownership refine frame payload admission.
 input-readiness/InputReadiness	refinement	input-delivery-lifecycle	Check-arm-recheck readiness refines policy queue delivery.
-ipc-priority-inheritance/IpcPriorityInheritance	refinement	scheduler-dispatch	Reply-scoped donation refines scheduler dependency progress.
+ipc-priority-inheritance/IpcPriorityInheritance	refinement	scheduler-dispatch	Pre-admission capacity reservation and one exact reply-bound worker target refine scheduler dependency progress without process-wide promotion.
 ipc-priority-queue/IpcPriorityQueue	refinement	scheduler-dispatch	Kernel-derived priority ordering with FIFO lanes and a bounded System burst refines synchronous service progress without ordinary-call starvation.
 ipc-reply-recv-transaction/IpcReplyRecvTransaction	refinement	scheduler-dispatch	Preflight-before-consume, exact caller wake custody, check-arm-recheck receive, and phase-tagged terminal errors refine one kernel-entry service reply and receive handoff.
 ivshmem-pairing/IvshmemPairing	refinement	dvm-control-ingress	Exact peer pairing and disconnect refine DVM control lifetime.
@@ -58,11 +58,11 @@ scheduler-thread-demotion/SchedulerThreadDemotion	refinement	scheduler-dispatch	
 scheduler-wakeup/SchedulerWakeup	refinement	scheduler-lifecycle	Arm, token-only wake of a running task with no published frame, blocked-frame wake, atomic commit-reschedule, exact dispatch, waiter cleanup before timer acknowledgement, cancel, and retire refine task wait lifetime.
 msi-vector-lifecycle/MsiVectorLifecycle	refinement	msi-vector-ingress	Lease, exact handler bind, revocable commit, route, final provider publication, permanent retention, and atomic failed-publication rollback refine MSI-X authority lifetime.
 smp-release-admission/SmpReleaseAdmission	refinement	smp-release-admission	All-or-nothing multi-vCPU prerequisite admission prevents configuration from masquerading as SMP evidence.
-smp-reschedule-ipi/SmpRescheduleIpi	refinement	smp-reschedule-ipi-lifecycle	Per-CPU durable requests, coalesced fixed IPIs, locked deferral, and safe-point consumption refine cross-CPU rescheduling.
+smp-reschedule-ipi/SmpRescheduleIpi	refinement	smp-reschedule-ipi-lifecycle	A packed per-CPU pending-generation word, exact CAS claim, coalesced non-self notification, locked custody, and terminal consumption refine cross-CPU rescheduling.
 scheduler-cpu-ownership/SchedulerCpuOwnership	refinement	scheduler-cpu-ownership	CPU-local current-task uniqueness, two-phase incoming reservation and outgoing-stack retention through the assembly RSP switch, IRQ-atomic pending-to-held acquisition, exact preemption-unit accounting, guard pinning, safe dispatch, and fail-closed invalid release refine scheduler execution ownership.
 bootstrap-activation-handoff/BootstrapActivationHandoff	refinement	bootstrap-activation-handoff	Bounded FIFO activation retention, stale removal, overdue-turn preservation, and exact first dispatch refine supervisor-committed child handoff.
 synchronous-ipc-handoff/SynchronousIpcHandoff	refinement	scheduler-dispatch	Call enqueue and successful reply completion, bounded FIFO retention, exact peer dispatch, stale removal, and a forced fairness turn refine synchronous hand-back.
-tlb-shootdown-lifecycle/TlbShootdownLifecycle	refinement	tlb-shootdown-lifecycle	Explicit task/slot/process references, live-only activation, conservative eligible targets, exact acknowledgements, and terminal root retirement refine address-space translation lifetime.
+tlb-shootdown-lifecycle/TlbShootdownLifecycle	refinement	tlb-shootdown-lifecycle	Explicit task/slot/process references, CR3-before-active-root publication, exact matching-root targets, exact acknowledgements, and terminal root retirement refine address-space translation lifetime.
 cross-cpu-task-retirement/CrossCpuTaskRetirement	refinement	cross-cpu-task-retirement	Process exec sealing, remote target quiescence, sibling retirement, generation replacement, final shootdown, and reclaim refine cross-CPU process lifetime.
 robust-futex-owner-death/RobustFutexOwnerDeath	refinement	thread-exit-futex-cleanup	Aligned user-word admission, atomic owner-death compare-exchange, bounded retry, release clear_child_tid store, and post-publication wake refine Linux thread-exit cleanup.
 per-cpu-clockevent-lifecycle/PerCpuClockeventLifecycle	refinement	per-cpu-clockevent-lifecycle	Local timer programming before AP Online, deadline delivery, strict-future rearm, scheduler turn, and local EOI refine per-CPU preemption.
@@ -73,8 +73,8 @@ trusted-ui-boundary/TrustedUiBoundary	refinement	wayland-client-ingress	Trusted 
 ui-frame-budget/UiFrameBudget	refinement	gpu-frame-lifecycle	Main-loop budget and worker isolation refine frame progress.
 ui-main-loop-wakeup/UiMainLoopWakeup	refinement	gpu-frame-lifecycle	Atomic input-or-deadline wakeup refines idle main-loop progress.
 ui-input-motion/UiInputMotion	refinement	input-delivery-lifecycle	Motion coalescing and bounded delivery refine input lifecycle.
-input-ingestion-worker/InputIngestionWorker	refinement	input-delivery-lifecycle	Retained session-authority batches and bounded retry refine authenticated input delivery.
-userspace-wait-set/UserspaceWaitSet	refinement	waitset	Exact provider check-arm-recheck and generation/epoch observation refine generic wait-set readiness.
+input-ingestion-worker/InputIngestionWorker	refinement	input-delivery-lifecycle	Retained session-authority batches and one aggregate absolute deadline with remaining-budget child calls refine authenticated input delivery.
+userspace-wait-set/UserspaceWaitSet	refinement	waitset	Exact provider/object check-arm-recheck and generation/epoch observation refine generic wait-set readiness without cross-object wakes.
 wayland-accept-isolation/WaylandAcceptIsolation	refinement	wayland-client-ingress	Listener readiness admission, bounded accepted-stream ownership, overload rejection, and UI-independent accept progress refine untrusted Wayland client ingress.
 service-mutation-recovery/ServiceMutationRecovery	refinement	waitset	Exact replay-safe epoll control mutations and retained checkpoint state refine persistent interest-list admission and cleanup.
 vfio-release-authorization/VfioReleaseAuthorization	refinement	boot-storage-handoff	Exact release authorization refines VFIO handback.
@@ -90,4 +90,4 @@ acceptance-profile-publication/AcceptanceProfilePublication	refinement	commercia
 exec-address-space-transaction/ExecAddressSpaceTransaction	refinement	process-address-space-lifecycle	Scheduler reservation, ProcessState staging, raw-lock publication, exit-pending latch, and final visibility form one non-nested exec transaction.
 page-table-map-transaction/PageTableMapTransaction	refinement	memory-map	Intermediate page-table publication is commit-logged and a failed mapping restores exact topology before one shootdown and frame reclaim.
 gpu-submit-transaction/GpuSubmitTransaction	refinement	gpu-frame-lifecycle	Compiler checkpoint, transport acceptance, exact rejection rollback, and full retry refine GPU producer publication.
-user-stack-growth/UserStackGrowth	refinement	exception-retirement	Release stacks eagerly map every usable page above a permanent guard; the modeled deferred path forbids transient lock contention from retiring a live valid fault.
+user-stack-growth/UserStackGrowth	refinement	exception-retirement	Release stacks eagerly map every usable page above a permanent guard before publication; no lazy-growth exception transaction exists in the enabled topology.

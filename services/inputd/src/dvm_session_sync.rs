@@ -12,7 +12,7 @@
 //! - **Forbidden:** No decoder reset followed by later-ring drain, event
 //!   publication before grant, or replay of an already-ACKed transition.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rustos_user_abi::syscall::{InputIngressWire, NETD_DVM_SESSION_GRANT, NETD_DVM_SESSION_REVOKE};
 
@@ -20,6 +20,7 @@ use super::dvm_protocol::DvmOutcome;
 use super::{apply_dvm_ingress_wire, lock_input_queue_for_ingestion, SharedInputQueue};
 
 pub(super) const RETRY_BACKOFF: Duration = Duration::from_millis(10);
+pub(super) const RETRY_BACKOFF_MAX: Duration = Duration::from_millis(160);
 pub(super) const TIMEOUT: Duration = Duration::from_secs(5);
 /// A grant/revoke changes authenticated cross-service policy and can enter the
 /// net packet broker. It is not a non-consuming readiness query, so each
@@ -28,11 +29,48 @@ pub(super) const TIMEOUT: Duration = Duration::from_secs(5);
 pub(super) const CALL_DEADLINE_MS: u64 =
     rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS;
 
+/// One monotonic end-to-end deadline for the complete retained session batch.
+/// Every nested service call and retry sleep derives its budget from the same
+/// end instant; no phase may start a fresh stopwatch.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct AbsoluteDeadline {
+    end: Instant,
+}
+
+pub(super) fn retry_backoff_for_attempt(attempt: u32) -> Duration {
+    let shift = attempt.saturating_sub(1).min(4);
+    RETRY_BACKOFF
+        .saturating_mul(1_u32 << shift)
+        .min(RETRY_BACKOFF_MAX)
+}
+
+impl AbsoluteDeadline {
+    pub(super) fn after(now: Instant, budget: Duration) -> Self {
+        Self { end: now + budget }
+    }
+
+    fn remaining(self, now: Instant) -> Option<Duration> {
+        self.end
+            .checked_duration_since(now)
+            .filter(|left| !left.is_zero())
+    }
+
+    pub(super) fn child_timeout_ms(self, now: Instant, cap_ms: u64) -> Option<u64> {
+        let remaining_ms = u64::try_from(self.remaining(now)?.as_millis()).ok()?;
+        (remaining_ms != 0).then_some(remaining_ms.min(cap_ms))
+    }
+
+    pub(super) fn retry_backoff(self, now: Instant, cap: Duration) -> Option<Duration> {
+        self.remaining(now).map(|remaining| remaining.min(cap))
+    }
+}
+
 pub(super) fn apply(
     queue: &SharedInputQueue,
     outcomes: &mut [DvmOutcome],
     pending_events: &mut Vec<InputIngressWire>,
-    mut notify_session: impl FnMut(u32, u64) -> Result<(), i32>,
+    deadline: AbsoluteDeadline,
+    mut notify_session: impl FnMut(u32, u64, u64) -> Result<(), i32>,
 ) -> Result<(bool, bool), i32> {
     pending_events.clear();
     for outcome in outcomes.iter_mut() {
@@ -50,7 +88,13 @@ pub(super) fn apply(
             // The queue lock stays local to reset/publication. A synchronous
             // service call here while holding it would deadlock readers and
             // make netd startup ordering an input liveness dependency.
-            if let Err(errno) = notify_session(epoch, action) {
+            let Some(timeout_ms) = deadline.child_timeout_ms(Instant::now(), CALL_DEADLINE_MS)
+            else {
+                pending_events.clear();
+                lock_input_queue_for_ingestion(queue).reset_dvm_input();
+                return Err(libc::ETIMEDOUT);
+            };
+            if let Err(errno) = notify_session(epoch, action, timeout_ms) {
                 pending_events.clear();
                 lock_input_queue_for_ingestion(queue).reset_dvm_input();
                 return Err(errno);
@@ -76,14 +120,17 @@ pub(super) fn apply(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use rustos_user_abi::syscall::{
         InputIngressWire, InputPointerPacketWire, INPUTD_ACCESS_NATIVE,
         INPUTD_INGRESS_FLAG_DVM_SOURCE, INPUTD_INGRESS_KIND_POINTER_PACKET, NETD_DVM_SESSION_GRANT,
     };
 
-    use super::{apply, CALL_DEADLINE_MS, RETRY_BACKOFF, TIMEOUT};
+    use super::{
+        apply, retry_backoff_for_attempt, AbsoluteDeadline, CALL_DEADLINE_MS, RETRY_BACKOFF,
+        RETRY_BACKOFF_MAX, TIMEOUT,
+    };
     use crate::dvm_protocol::DvmOutcome;
     use crate::{lock_input_queue, lock_input_queue_for_ingestion, SharedInputQueueState};
 
@@ -108,14 +155,17 @@ mod tests {
             ..DvmOutcome::default()
         }];
         let mut observed_unlocked = false;
+        let deadline = AbsoluteDeadline::after(Instant::now(), TIMEOUT);
 
         let result = apply(
             &queue,
             &mut outcomes,
             &mut pending_events,
-            |epoch, action| {
+            deadline,
+            |epoch, action, timeout_ms| {
                 observed_unlocked = queue.queue.try_lock().is_ok();
                 assert_eq!((epoch, action), (7, NETD_DVM_SESSION_GRANT));
+                assert!(timeout_ms <= CALL_DEADLINE_MS);
                 Ok(())
             },
         );
@@ -136,9 +186,13 @@ mod tests {
         }];
 
         assert_eq!(
-            apply(&queue, &mut outcomes, &mut pending_events, |_, _| {
-                Err(libc::ETIMEDOUT)
-            }),
+            apply(
+                &queue,
+                &mut outcomes,
+                &mut pending_events,
+                AbsoluteDeadline::after(Instant::now(), TIMEOUT),
+                |_, _, _| { Err(libc::ETIMEDOUT) }
+            ),
             Err(libc::ETIMEDOUT)
         );
         assert_eq!(lock_input_queue(&queue).len(), 1);
@@ -167,9 +221,13 @@ mod tests {
         }];
 
         assert_eq!(
-            apply(&queue, &mut outcomes, &mut pending_events, |_, _| {
-                Err(libc::ENOSYS)
-            }),
+            apply(
+                &queue,
+                &mut outcomes,
+                &mut pending_events,
+                AbsoluteDeadline::after(Instant::now(), TIMEOUT),
+                |_, _, _| { Err(libc::ENOSYS) }
+            ),
             Err(libc::ENOSYS)
         );
         assert_eq!(outcomes[0].grant_epoch, Some(7));
@@ -181,7 +239,8 @@ mod tests {
                 &queue,
                 &mut outcomes,
                 &mut pending_events,
-                |epoch, action| {
+                AbsoluteDeadline::after(Instant::now(), TIMEOUT),
+                |epoch, action, _| {
                     assert_eq!((epoch, action), (7, NETD_DVM_SESSION_GRANT));
                     Ok(())
                 }
@@ -196,6 +255,8 @@ mod tests {
     #[test]
     fn session_authority_retry_deadline_is_bounded() {
         assert_eq!(RETRY_BACKOFF, Duration::from_millis(10));
+        assert_eq!(retry_backoff_for_attempt(1), RETRY_BACKOFF);
+        assert_eq!(retry_backoff_for_attempt(32), RETRY_BACKOFF_MAX);
         assert_eq!(TIMEOUT, Duration::from_secs(5));
         assert_eq!(
             CALL_DEADLINE_MS,
@@ -204,5 +265,17 @@ mod tests {
         assert!(CALL_DEADLINE_MS > rustos_user_abi::performance::IPC_READINESS_QUERY_HARD_LIMIT_MS);
         assert!(Duration::from_millis(CALL_DEADLINE_MS) < TIMEOUT);
         assert!(RETRY_BACKOFF < TIMEOUT);
+
+        let now = Instant::now();
+        let deadline = AbsoluteDeadline::after(now, Duration::from_millis(37));
+        assert_eq!(deadline.child_timeout_ms(now, 100), Some(37));
+        assert_eq!(
+            deadline.retry_backoff(now, Duration::from_millis(50)),
+            Some(Duration::from_millis(37))
+        );
+        assert_eq!(
+            deadline.child_timeout_ms(now + Duration::from_millis(37), 100),
+            None
+        );
     }
 }

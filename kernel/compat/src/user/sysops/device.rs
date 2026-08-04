@@ -209,15 +209,25 @@ pub(crate) fn ioctl_process_device_handle(
     request: u64,
     arg: u64,
 ) -> Result<u64, DeviceSysopError> {
-    let Some(display_target) =
+    let Some((display_target, gpu_atlas_create_slot)) =
         multitask::with_process_state_by_pid_mut(process_id, |process_state| {
-            fd_targets_display(process_state, fd)
+            let display_target = fd_targets_display(process_state, fd);
+            let gpu_atlas_create_slot = display_target
+                .then(|| {
+                    kernel_io_manager::api::device::display_gpu_atlas_create_slot_from_user(
+                        process_state,
+                        request,
+                        arg,
+                    )
+                })
+                .flatten();
+            (display_target, gpu_atlas_create_slot)
         })
     else {
         return Err(DeviceSysopError::Unsupported);
     };
     if display_target {
-        kernel_io_manager::api::device::prepare_display_ioctl(request);
+        kernel_io_manager::api::device::prepare_display_ioctl(request, gpu_atlas_create_slot);
     }
     let Some(result) = multitask::with_process_state_by_pid_mut(process_id, |process_state| {
         ioctl_via_process_state(process_id, process_state, fd, request, arg)
@@ -240,15 +250,25 @@ pub(crate) fn ioctl_current_process_fd(
     let Some(process_id) = multitask::current_user_process_id() else {
         return Err(DeviceSysopError::Unsupported);
     };
-    let Some(display_target) =
+    let Some((display_target, gpu_atlas_create_slot)) =
         multitask::with_current_user_process_state_mut(|_, _, process_state| {
-            fd_targets_display(process_state, fd)
+            let display_target = fd_targets_display(process_state, fd);
+            let gpu_atlas_create_slot = display_target
+                .then(|| {
+                    kernel_io_manager::api::device::display_gpu_atlas_create_slot_from_user(
+                        process_state,
+                        request,
+                        arg,
+                    )
+                })
+                .flatten();
+            (display_target, gpu_atlas_create_slot)
         })
     else {
         return Err(DeviceSysopError::Unsupported);
     };
     if display_target {
-        kernel_io_manager::api::device::prepare_display_ioctl(request);
+        kernel_io_manager::api::device::prepare_display_ioctl(request, gpu_atlas_create_slot);
     }
     let Some(result) = multitask::with_current_user_process_state_mut(|_, _, process_state| {
         ioctl_via_process_state(process_id, process_state, fd, request, arg)

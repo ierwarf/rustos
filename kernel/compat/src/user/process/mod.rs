@@ -430,15 +430,6 @@ fn build_process_bootstrap(
     let mut bootstrap = multitask::UserTaskBootstrap::new(abi, entry, stack_pointer);
     bootstrap.registers = launch.registers.into_task_registers();
     bootstrap.user_stack = user_stack;
-    if let (Some(stack), Some(state)) = (user_stack, linux_process_state.as_mut())
-        && stack.reserve_start < stack.committed_start
-    {
-        state
-            .reserve_range(stack.reserve_start, stack.committed_start)
-            .map_err(|_| {
-                ProcessLoadError::InvalidElf("failed to reserve Linux user stack range")
-            })?;
-    }
     bootstrap.linux_process_state = linux_process_state;
     bootstrap.linux_memory_map = linux_memory_map;
     bootstrap.linux_runtime_profile = linux_runtime_profile;

@@ -382,6 +382,10 @@ fn initialize_application_processors() {
 
     let entry = mm_api::higher_half_addr(rustos_ap_entry as *const () as usize as u64);
     let cr3 = mm_api::paging::kernel_root_phys().as_u64();
+    // Worst cross-CPU TSC warp observed while admitting the application
+    // processors. `None` means at least one rendezvous did not complete and the
+    // multiprocessor monotonic source stays on the validated MMIO counter.
+    let mut worst_tsc_warp_nanos: Option<u64> = Some(0);
     for logical_index in 1..cpu_count {
         let logical_index =
             u8::try_from(logical_index).expect("logical CPU index exceeds u8 capacity");
@@ -432,6 +436,23 @@ fn initialize_application_processors() {
                     u64::from(logical_index),
                     u64::from(discovered.apic_id),
                 );
+                // This AP is parked in its admission loop and is the only other
+                // running CPU, which makes it the exact bounded window in which
+                // the boot processor can prove the pair never observes time
+                // moving backwards. A rejected or incomplete rendezvous is
+                // fail-closed: the topology simply keeps the MMIO clocksource.
+                let measured =
+                    hal_api::arch::clock::measure_ap_tsc_warp_nanos(u32::from(logical_index));
+                debug::record_milestone(
+                    debug::LogCategory::Boot,
+                    "smp-ap-tsc-warp",
+                    u64::from(logical_index),
+                    measured.unwrap_or(u64::MAX),
+                );
+                worst_tsc_warp_nanos = match (worst_tsc_warp_nanos, measured) {
+                    (Some(worst), Some(observed)) => Some(worst.max(observed)),
+                    _ => None,
+                };
                 break;
             }
             if hal_api::arch::clock::monotonic_nanos().saturating_sub(started_at)
@@ -459,6 +480,28 @@ fn initialize_application_processors() {
         ),
         "kernel-mm could not retire AP startup pages R/NX"
     );
+
+    // Every AP is still parked before `SchedulerReady`, so the boot processor is
+    // the only CPU that can read the monotonic source. That makes this the one
+    // point where the global time domain can be replaced without any CPU
+    // observing the two domains out of order.
+    let promoted = worst_tsc_warp_nanos.and_then(hal_api::arch::clock::promote_smp_tsc_clocksource);
+    match promoted {
+        Some(clocksource) => debug::record_milestone(
+            debug::LogCategory::Boot,
+            "smp-clocksource-promoted",
+            clocksource.frequency_hz,
+            worst_tsc_warp_nanos.unwrap_or(u64::MAX),
+        ),
+        None => debug::record_milestone(
+            debug::LogCategory::Boot,
+            "smp-clocksource-retained",
+            hal_api::arch::clock::current_source()
+                .map(|clocksource| clocksource.frequency_hz)
+                .unwrap_or(0),
+            worst_tsc_warp_nanos.unwrap_or(u64::MAX),
+        ),
+    }
 }
 
 extern "C" fn rustos_ap_entry(
@@ -532,7 +575,14 @@ extern "C" fn rustos_ap_entry(
             "AP scheduler admission observed a stale CPU generation"
         );
         match snapshot.state {
-            CpuLifecycleState::OnlineParked => spin_loop(),
+            CpuLifecycleState::OnlineParked => {
+                // Parked admission is also the bounded window in which the boot
+                // processor proves this CPU never observes time moving
+                // backwards. Participation owns no lock and returns as soon as
+                // the source closes the window.
+                hal_api::arch::clock::tsc_sync_participate(u32::from(logical_index));
+                spin_loop();
+            }
             CpuLifecycleState::SchedulerReady => ps_api::boot::start_secondary_cpu(),
             unexpected => {
                 panic!("AP scheduler admission observed invalid lifecycle state {unexpected:?}")

@@ -59,7 +59,7 @@ use rustos_user_abi::syscall::{
 #[cfg(not(test))]
 use rustos_user_abi::syscall::{
     WaitSetSignalBrokerArgs, SYS_RUSTOS_ENTROPY_BROKER, SYS_RUSTOS_WAITSET_SIGNAL_BROKER,
-    WAITSET_ABI_VERSION, WAITSET_GLOBAL_OBJECT_ID, WAITSET_PROVIDER_NETD,
+    WAITSET_ABI_VERSION, WAITSET_PROVIDER_NETD,
 };
 use smoltcp::iface::{
     Config as SmolConfig, Interface, PollIngressSingleResult, PollResult, SocketHandle, SocketSet,
@@ -200,16 +200,30 @@ fn start_inet_readiness_worker() {
 
 fn inet_readiness_worker_loop() {
     loop {
-        let readiness_changed = {
+        let changed_tokens = {
             let mut state = net_state().lock().unwrap();
-            state
+            let before = state.inet_readiness_snapshot();
+            let readiness_changed = state
                 .inet
                 .as_mut()
-                .is_some_and(|stack| stack.poll_budget(INET_READINESS_POLL_BUDGET))
+                .is_some_and(|stack| stack.poll_budget(INET_READINESS_POLL_BUDGET));
+            if readiness_changed {
+                let after = state.inet_readiness_snapshot();
+                after
+                    .into_iter()
+                    .filter_map(|(token, readiness)| {
+                        (before
+                            .iter()
+                            .find(|(before_token, _)| *before_token == token)
+                            .is_none_or(|(_, previous)| *previous != readiness))
+                        .then_some(token)
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            }
         };
-        if readiness_changed {
-            advance_readiness_generation();
-        }
+        advance_readiness_generation(&changed_tokens);
         thread::sleep(INET_READINESS_POLL_INTERVAL);
     }
 }
@@ -626,7 +640,7 @@ fn run_blocking_request(request: &NetdIpcRequest, response: &mut NetdIpcResponse
             status
         };
         if status == 0 {
-            advance_readiness_generation();
+            advance_readiness_generation(&[request.socket_token]);
         }
         return status;
     }
@@ -692,6 +706,12 @@ fn dispatch_request(request: &NetdIpcRequest, response: &mut NetdIpcResponse) ->
             Err(errno) => return errno,
         }
     }
+    let mutates_readiness = request_mutates_readiness(request.op);
+    let readiness_targets = if mutates_readiness {
+        readiness_targets_for_request(request)
+    } else {
+        Vec::new()
+    };
     let status = match request.op {
         SYSCALL_OFFLOAD_OP_LINUX_SOCKET => handle_socket(request, response),
         SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR => handle_socketpair(request, response),
@@ -715,8 +735,9 @@ fn dispatch_request(request: &NetdIpcRequest, response: &mut NetdIpcResponse) ->
         SYSCALL_OFFLOAD_OP_LINUX_SHUTDOWN => handle_shutdown(request),
         _ => libc::EINVAL,
     };
-    if status == 0 && request_mutates_readiness(request.op) {
-        advance_readiness_generation();
+    let final_close = request.op != SYSCALL_OFFLOAD_OP_LINUX_CLOSE || response.value == 0;
+    if status == 0 && mutates_readiness && final_close {
+        advance_readiness_generation(&readiness_targets);
     }
     if replay_safe_ref {
         complete_ref_result(request, response, status);
@@ -923,11 +944,7 @@ mod ref_replay_tests {
 fn request_mutates_readiness(op: u16) -> bool {
     matches!(
         op,
-        SYSCALL_OFFLOAD_OP_LINUX_SOCKET
-            | SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR
-            | SYSCALL_OFFLOAD_OP_LINUX_DUP
-            | SYSCALL_OFFLOAD_OP_LINUX_CLOSE
-            | SYSCALL_OFFLOAD_OP_LINUX_BIND
+        SYSCALL_OFFLOAD_OP_LINUX_CLOSE
             | SYSCALL_OFFLOAD_OP_LINUX_LISTEN
             | SYSCALL_OFFLOAD_OP_LINUX_ACCEPT
             | SYSCALL_OFFLOAD_OP_LINUX_CONNECT
@@ -939,7 +956,39 @@ fn request_mutates_readiness(op: u16) -> bool {
     )
 }
 
-fn advance_readiness_generation() {
+fn readiness_targets_for_request(request: &NetdIpcRequest) -> Vec<u64> {
+    let state = net_state().lock().unwrap();
+    readiness_targets_in_state(request, &state)
+}
+
+fn readiness_targets_in_state(request: &NetdIpcRequest, state: &NetState) -> Vec<u64> {
+    let mut targets = Vec::with_capacity(3);
+    if request.socket_token != 0 {
+        targets.push(request.socket_token);
+    }
+    if let Some(socket) = state.sockets.get(&request.socket_token) {
+        if let UnixSocketState::Connected(connected) = &socket.state {
+            targets.push(connected.peer);
+        }
+    }
+    if request.op == SYSCALL_OFFLOAD_OP_LINUX_CONNECT
+        && sockaddr_family(request) == Some(linux_abi::AF_UNIX)
+    {
+        if let Ok(path) = sockaddr_path_from_payload(request) {
+            if let Some(listener) = state.bindings.get(&path) {
+                targets.push(*listener);
+            }
+        }
+    }
+    targets.sort_unstable();
+    targets.dedup();
+    targets
+}
+
+fn advance_readiness_generation(object_ids: &[u64]) {
+    if object_ids.is_empty() {
+        return;
+    }
     let generation = READINESS_GENERATION
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
             generation.checked_add(1)
@@ -949,19 +998,23 @@ fn advance_readiness_generation() {
             std::process::exit(134);
         })
         + 1;
-    publish_readiness_generation(generation);
+    for object_id in object_ids.iter().copied() {
+        if object_id != 0 {
+            publish_readiness_generation(object_id, generation);
+        }
+    }
 }
 
-fn publish_readiness_generation(generation: u64) {
+fn publish_readiness_generation(object_id: u64, generation: u64) {
     #[cfg(test)]
-    let _ = generation;
+    let _ = (object_id, generation);
     #[cfg(not(test))]
     {
         let args = WaitSetSignalBrokerArgs {
             abi_version: WAITSET_ABI_VERSION,
             provider: WAITSET_PROVIDER_NETD,
             flags: 0,
-            object_id: WAITSET_GLOBAL_OBJECT_ID,
+            object_id,
             generation,
             reserved0: 0,
         };
@@ -1088,6 +1141,13 @@ struct InetSocket {
     tcp: SocketHandle,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct InetReadiness {
+    can_recv: bool,
+    can_send: bool,
+    open: bool,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct SocketOptions {
     reuse_addr: bool,
@@ -1137,6 +1197,26 @@ impl NetState {
             self.inet = Some(InetStack::new()?);
         }
         Ok(self.inet.as_mut().unwrap())
+    }
+
+    fn inet_readiness_snapshot(&self) -> Vec<(u64, InetReadiness)> {
+        let Some(stack) = self.inet.as_ref() else {
+            return Vec::new();
+        };
+        self.inet_sockets
+            .iter()
+            .map(|(token, inet)| {
+                let socket = stack.sockets.get::<tcp::Socket>(inet.tcp);
+                (
+                    *token,
+                    InetReadiness {
+                        can_recv: socket.can_recv(),
+                        can_send: socket.can_send(),
+                        open: socket.is_open(),
+                    },
+                )
+            })
+            .collect()
     }
 }
 
@@ -2846,6 +2926,27 @@ mod local_socket_poll_tests {
                 send_closed: false,
             }),
         }
+    }
+
+    #[test]
+    fn unix_readiness_publication_targets_only_the_socket_and_its_peer() {
+        let first = 41_u64;
+        let second = 42_u64;
+        let unrelated = 43_u64;
+        let mut state = NetState::new();
+        state.sockets.insert(first, connected_socket(second));
+        state.sockets.insert(second, connected_socket(first));
+        state.sockets.insert(unrelated, connected_socket(u64::MAX));
+        let request = NetdIpcRequest {
+            op: SYSCALL_OFFLOAD_OP_LINUX_SENDTO,
+            socket_token: first,
+            ..NetdIpcRequest::default()
+        };
+
+        assert_eq!(
+            readiness_targets_in_state(&request, &state),
+            vec![first, second]
+        );
     }
 
     #[test]

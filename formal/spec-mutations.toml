@@ -21,6 +21,7 @@ required_models = [
     "exec-address-space-transaction/ExecAddressSpaceTransaction",
     "gpu-submit-transaction/GpuSubmitTransaction",
     "input-ingestion-worker/InputIngestionWorker",
+    "ipc-priority-inheritance/IpcPriorityInheritance",
     "ipc-priority-queue/IpcPriorityQueue",
     "ipc-reply-recv-transaction/IpcReplyRecvTransaction",
     "ipc-transfer-authority/IpcTransferAuthority",
@@ -198,6 +199,26 @@ invariant = "SingleFlightDrainOwnership"
 min_counterexample_states = 3
 
 [[mutation]]
+id = "dvm-transport-activation-overwrites-drain"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "dvm-transport-lifecycle/DvmTransportLifecycle"
+flow = "dvm-input-ingress"
+find = '''CommitActivation ==
+    /\ state = "Activating"
+    /\ mappingPublished
+    /\ state' = "Active"
+'''
+replace = '''CommitActivation ==
+    /\ state \in {"Activating", "Draining"}
+    /\ mappingPublished
+    /\ state' = "Active"
+'''
+occurrence = 1
+invariant = "DrainCancelsActivation"
+min_counterexample_states = 5
+
+[[mutation]]
 id = "dvm-transport-reset-before-quiescence"
 kind = "transition-guard-removal"
 severity = "critical"
@@ -207,6 +228,7 @@ find = '''CompleteDrain ==
     /\ state = "Draining"
     /\ claims = 0
     /\ state' = "Revoked"
+    /\ mappingPublished' = FALSE
     /\ resetCount' = resetCount + 1
     /\ resetWithClaim' = (claims # 0)
 '''
@@ -214,6 +236,7 @@ replace = '''CompleteDrain ==
     /\ state = "Draining"
     /\ claims \in 0..MaxClaims
     /\ state' = "Revoked"
+    /\ mappingPublished' = FALSE
     /\ resetCount' = resetCount + 1
     /\ resetWithClaim' = (claims # 0)
 '''
@@ -266,6 +289,27 @@ replace = '''    /\ processStateLockHeld' = TRUE
 occurrence = 1
 invariant = "OldBundleRetainedUntilVisibleCommit"
 min_counterexample_states = 5
+
+[[mutation]]
+id = "exec-publication-failure-commits-generation"
+kind = "transition-effect"
+severity = "high"
+model = "exec-address-space-transaction/ExecAddressSpaceTransaction"
+flow = "process-address-space-lifecycle"
+find = '''    /\ publicationFailed' = TRUE
+    /\ targetRetired' = exitPending
+    /\ UNCHANGED <<tokenUses, schedulerPublished, visibleGeneration,
+                    exitPending, oldBundleRetained, processStateLockHeld,
+                    locksNested>>'''
+replace = '''    /\ publicationFailed' = TRUE
+    /\ targetRetired' = exitPending
+    /\ visibleGeneration' = NewGeneration
+    /\ UNCHANGED <<tokenUses, schedulerPublished,
+                    exitPending, oldBundleRetained, processStateLockHeld,
+                    locksNested>>'''
+occurrence = 1
+invariant = "NoVisibleHalfExec"
+min_counterexample_states = 6
 
 [[mutation]]
 id = "exec-target-immediate-retire-during-transaction"
@@ -333,6 +377,33 @@ invariant = "AuthorityBatchIsRetained"
 min_counterexample_states = 2
 
 [[mutation]]
+id = "input-session-deadline-reset-per-attempt"
+kind = "transition-effect"
+severity = "high"
+model = "input-ingestion-worker/InputIngestionWorker"
+flow = "input-delivery-lifecycle"
+find = '''           sleepBudget == IF afterRemaining < AuthorityRetryBackoff
+                          THEN afterRemaining ELSE AuthorityRetryBackoff
+       IN authorityElapsed' = afterCall + sleepBudget'''
+replace = '''           sleepBudget == AuthorityRetryBackoff
+       IN authorityElapsed' = afterCall + sleepBudget'''
+occurrence = 1
+invariant = "TypeOK"
+min_counterexample_states = 7
+
+[[mutation]]
+id = "ipc-priority-capacity-admission-removed"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "ipc-priority-inheritance/IpcPriorityInheritance"
+flow = "scheduler-dispatch"
+find = "    /\\ DonationSlotsUsed < MaxDonations"
+replace = "    /\\ TRUE"
+occurrence = 1
+invariant = "TypeOK"
+min_counterexample_states = 3
+
+[[mutation]]
 id = "ipc-priority-ordinary-bypasses-system"
 kind = "transition-guard-removal"
 severity = "critical"
@@ -349,6 +420,58 @@ replace = '''DeliverOrdinary ==
 occurrence = 1
 invariant = "SystemBacklogCannotBeBypassed"
 min_counterexample_states = 4
+
+[[mutation]]
+id = "ipc-priority-process-wide-broker-promotion"
+kind = "transition-effect"
+severity = "critical"
+model = "ipc-priority-inheritance/IpcPriorityInheritance"
+flow = "scheduler-dispatch"
+find = "              /\\ receiverOf[reply] = task"
+replace = "              /\\ receiverOf[reply] \\in BrokerTasks\n              /\\ task \\in BrokerTasks"
+occurrence = 1
+invariant = "UnselectedBrokerIsNotPromoted"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "ipc-priority-reservation-blocks-before-publication"
+kind = "transition-effect"
+severity = "critical"
+model = "ipc-priority-inheritance/IpcPriorityInheritance"
+flow = "scheduler-dispatch"
+find = "    /\\ UNCHANGED taskState\n    /\\ lastPick' = NoTask"
+replace = "    /\\ taskState' = [taskState EXCEPT ![caller] = Blocked]\n    /\\ lastPick' = NoTask"
+occurrence = 1
+invariant = "ReservedCallerIsNotBlocked"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "ipc-priority-unbound-reply-promotes-without-worker"
+kind = "transition-effect"
+severity = "critical"
+model = "ipc-priority-inheritance/IpcPriorityInheritance"
+flow = "scheduler-dispatch"
+find = '''PublishCallUnbound(caller, reply) ==
+    /\ caller \in Tasks /\ reply \in Replies
+    /\ replyState[reply] = Reserved
+    /\ callerOf[reply] = caller
+    /\ taskState[caller] = Runnable
+    /\ taskState' = [taskState EXCEPT ![caller] = Blocked]
+    /\ replyState' = [replyState EXCEPT ![reply] = Queued]
+    /\ receiverOf' = [receiverOf EXCEPT ![reply] = NoTask]
+    /\ donation' = [donation EXCEPT ![reply] = FALSE]'''
+replace = '''PublishCallUnbound(caller, reply) ==
+    /\ caller \in Tasks /\ reply \in Replies
+    /\ replyState[reply] = Reserved
+    /\ callerOf[reply] = caller
+    /\ taskState[caller] = Runnable
+    /\ taskState' = [taskState EXCEPT ![caller] = Blocked]
+    /\ replyState' = [replyState EXCEPT ![reply] = Queued]
+    /\ receiverOf' = [receiverOf EXCEPT ![reply] = NoTask]
+    /\ donation' = [donation EXCEPT ![reply] = TRUE]'''
+occurrence = 1
+invariant = "DonationHasExactLiveReply"
+min_counterexample_states = 3
 
 [[mutation]]
 id = "ipc-reply-recv-commit-effect-removed"
@@ -404,6 +527,18 @@ invariant = "PreCommitFailurePreservesReply"
 min_counterexample_states = 2
 
 [[mutation]]
+id = "ipc-transfer-receiver-set-epoch-guard-removed"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "ipc-transfer-authority/IpcTransferAuthority"
+flow = "ipc-handle-transfer"
+find = "    /\\ receiverEpoch = receiverSetEpoch"
+replace = "    /\\ receiverEpoch \\in ReceiverEpochs"
+occurrence = 1
+invariant = "ReceiverSetCannotRedirect"
+min_counterexample_states = 4
+
+[[mutation]]
 id = "ipc-transfer-recipient-guard-removed"
 kind = "transition-guard-removal"
 severity = "critical"
@@ -414,6 +549,18 @@ replace = "    /\\ receiver \\in Receivers"
 occurrence = 1
 invariant = "OnlyIntendedRecipientInstalls"
 min_counterexample_states = 5
+
+[[mutation]]
+id = "ipc-transfer-requested-bytes-own-frontier"
+kind = "transition-effect"
+severity = "critical"
+model = "ipc-transfer-authority/IpcTransferAuthority"
+flow = "ipc-handle-transfer"
+find = "    /\\ committedPosition' = committedPosition + accepted"
+replace = "    /\\ committedPosition' = committedPosition + requested"
+occurrence = 1
+invariant = "AcceptedBytesOwnTheFrontier"
+min_counterexample_states = 2
 
 [[mutation]]
 id = "msi-committed-rollback-handler-retained"
@@ -636,6 +783,18 @@ invariant = "TransitionWakeSurvives"
 min_counterexample_states = 4
 
 [[mutation]]
+id = "smp-ipi-claim-drops-request-generation"
+kind = "transition-effect"
+severity = "critical"
+model = "smp-reschedule-ipi/SmpRescheduleIpi"
+flow = "smp-reschedule-ipi-lifecycle"
+find = "    /\\ claimedSeq' = [claimedSeq EXCEPT ![cpu] = requestSeq[cpu]]"
+replace = "    /\\ claimedSeq' = [claimedSeq EXCEPT ![cpu] = consumeSeq[cpu]]"
+occurrence = 2
+invariant = "NoUnownedClearedRequest"
+min_counterexample_states = 3
+
+[[mutation]]
 id = "smp-ipi-exact-target-publication-removed"
 kind = "transition-effect"
 severity = "critical"
@@ -644,7 +803,7 @@ flow = "smp-reschedule-ipi-lifecycle"
 find = "    /\\ request' = [request EXCEPT ![target] = TRUE]"
 replace = "    /\\ request' = request"
 occurrence = 2
-invariant = "PendingTargetHasDurableRequest"
+invariant = "NoUnownedClearedRequest"
 min_counterexample_states = 3
 
 [[mutation]]
@@ -653,10 +812,10 @@ kind = "transition-effect"
 severity = "critical"
 model = "smp-reschedule-ipi/SmpRescheduleIpi"
 flow = "smp-reschedule-ipi-lifecycle"
-find = "[targetPending EXCEPT ![target] = IF ~request[target] THEN TRUE ELSE @]"
-replace = "[targetPending EXCEPT ![target] = FALSE]"
+find = "[targetCustodyOwed EXCEPT\n          ![target] = IF ~request[target] THEN TRUE ELSE @]"
+replace = "[targetCustodyOwed EXCEPT\n          ![target] = FALSE]"
 occurrence = 1
-invariant = "LockedTargetCustodyIsNeverLost"
+invariant = "PendingTargetHasAuthority"
 min_counterexample_states = 2
 
 [[mutation]]
@@ -665,22 +824,24 @@ kind = "transition-effect"
 severity = "critical"
 model = "smp-reschedule-ipi/SmpRescheduleIpi"
 flow = "smp-reschedule-ipi-lifecycle"
-find = "    /\\ selfIpiSent' = FALSE"
-replace = "    /\\ selfIpiSent' = TRUE"
-occurrence = 2
-invariant = "NoSelfIpi"
+find = "![target] = IF ~request[target] /\\ source # target THEN source ELSE @"
+replace = "![target] = IF ~request[target] THEN source ELSE @"
+occurrence = 1
+invariant = "RemoteNotifyNeverTargetsFlusher"
 min_counterexample_states = 2
 
 [[mutation]]
-id = "tlb-active-root-target-filtered"
+id = "tlb-active-root-target-filter-removed"
 kind = "transition-effect"
 severity = "critical"
 model = "tlb-shootdown-lifecycle/TlbShootdownLifecycle"
 flow = "tlb-shootdown-lifecycle"
-find = "TargetSnapshot(root) == {cpu \\in Cpus: eligible[cpu]}"
-replace = "TargetSnapshot(root) == {cpu \\in Cpus: eligible[cpu] /\\ (root = GlobalRoot \\/ activeRoot[cpu] = root)}"
+find = '''AddressSpaceTargets(root) ==
+    {cpu \in Cpus: eligible[cpu] /\ activeRoot[cpu] = root}'''
+replace = '''AddressSpaceTargets(root) ==
+    {cpu \in Cpus: eligible[cpu]}'''
 occurrence = 1
-invariant = "TargetsCoverEveryEligibleCpu"
+invariant = "TargetsMatchMutationScope"
 min_counterexample_states = 3
 
 [[mutation]]
@@ -751,33 +912,27 @@ invariant = "SameRootActivationDoesNotReload"
 min_counterexample_states = 2
 
 [[mutation]]
-id = "user-stack-apply-under-scheduler-lock"
+id = "user-stack-eager-map-incomplete"
 kind = "transition-effect"
 severity = "critical"
 model = "user-stack-growth/UserStackGrowth"
 flow = "exception-retirement"
-find = "    /\\ processLock' = TRUE /\\ schedulerRaw' = FALSE"
-replace = "    /\\ processLock' = TRUE /\\ schedulerRaw' = TRUE"
-occurrence = 2
-invariant = "LockDomainsNeverOverlap"
+find = "    /\\ allUsableMapped' = TRUE"
+replace = "    /\\ allUsableMapped' = FALSE"
+occurrence = 1
+invariant = "MappedStateHasCompleteEagerStack"
 min_counterexample_states = 3
 
 [[mutation]]
-id = "user-stack-contention-retired-instead-of-deferred"
+id = "user-stack-guard-page-mapped"
 kind = "transition-effect"
 severity = "critical"
 model = "user-stack-growth/UserStackGrowth"
 flow = "exception-retirement"
-find = '''ApplyContentionDefers ==
-    /\ phase = Planned /\ ~taskRetired
-    /\ phase' = Deferred
-'''
-replace = '''ApplyContentionDefers ==
-    /\ phase = Planned /\ ~taskRetired
-    /\ phase' = Retired
-'''
+find = "    /\\ guardMapped' = FALSE"
+replace = "    /\\ guardMapped' = TRUE"
 occurrence = 1
-invariant = "RetiredPhaseRequiresPublishedRetirement"
+invariant = "MappedStateHasCompleteEagerStack"
 min_counterexample_states = 3
 
 [[mutation]]
@@ -790,6 +945,26 @@ find = "ready \\/ generation # observedGeneration"
 replace = "FALSE"
 occurrence = 1
 invariant = "SleepingRequiresStableRecheck"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "waitset-object-target-filter-removed"
+kind = "transition-effect"
+severity = "critical"
+model = "userspace-wait-set/UserspaceWaitSet"
+flow = "waitset"
+find = '''    /\ UNCHANGED <<generation, epoch, providerLive, ready, waitState,
+                   observedGeneration, observedEpoch, deadline, now, objectRefs,
+                   epollRefs, ingressBacklog, wakeObject>>
+'''
+replace = '''    /\ waitState' = IF waitState = "sleeping" THEN "woken" ELSE waitState
+    /\ wakeObject' = IF waitState = "sleeping" THEN 2 ELSE wakeObject
+    /\ UNCHANGED <<generation, epoch, providerLive, ready,
+                   observedGeneration, observedEpoch, deadline, now, objectRefs,
+                   epollRefs, ingressBacklog>>
+'''
+occurrence = 1
+invariant = "NoWrongObjectWake"
 min_counterexample_states = 3
 
 [[mutation]]

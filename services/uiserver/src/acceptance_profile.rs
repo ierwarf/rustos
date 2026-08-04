@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use runtime_control::read_bounded_config_snapshot;
 
-use crate::sys::{diag_line, require_background_thread_class, running_on_rustos};
+use crate::sys::{diag_line, running_on_rustos, spawn_ui_thread, UiThreadRole};
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static ANNOUNCED: AtomicBool = AtomicBool::new(false);
@@ -69,23 +69,20 @@ pub(crate) fn start_late_watcher() {
     if !running_on_rustos() || enabled() {
         return;
     }
-    let _ = thread::Builder::new()
-        .name(String::from("ui-acceptance-watch"))
-        .spawn(|| {
-            require_background_thread_class();
-            let deadline = Instant::now() + WATCH_LIMIT;
-            while Instant::now() < deadline {
-                let enabled = read_bounded_config_snapshot(CONTRACT_PATH, CONTRACT_MAX_BYTES)
-                    .ok()
-                    .is_some_and(|contents| exact_contract_enables_profile(&contents));
-                if enabled {
-                    ENABLED.store(true, Ordering::Release);
-                    announce_if_enabled();
-                    return;
-                }
-                thread::sleep(WATCH_INTERVAL);
+    let _ = spawn_ui_thread(UiThreadRole::Background, "ui-acceptance-watch", || {
+        let deadline = Instant::now() + WATCH_LIMIT;
+        while Instant::now() < deadline {
+            let enabled = read_bounded_config_snapshot(CONTRACT_PATH, CONTRACT_MAX_BYTES)
+                .ok()
+                .is_some_and(|contents| exact_contract_enables_profile(&contents));
+            if enabled {
+                ENABLED.store(true, Ordering::Release);
+                announce_if_enabled();
+                return;
             }
-        });
+            thread::sleep(WATCH_INTERVAL);
+        }
+    });
 }
 
 #[cfg(test)]

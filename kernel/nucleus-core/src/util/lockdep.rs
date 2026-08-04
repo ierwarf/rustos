@@ -35,6 +35,16 @@ use core::{
 use spin::{Mutex, MutexGuard};
 
 mod cpu_identity;
+#[cfg(any(rustos_boot_image, test))]
+mod dependency_graph;
+#[cfg(rustos_boot_image)]
+use dependency_graph::{
+    DEPENDENCIES, VALIDATED_RAW_EDGES, VALIDATED_TASK_EDGES, dependency_reaches,
+    edge_already_validated, irq_dependency_conflicts, mark_class_irq_unsafe,
+    publish_validated_edge, record_irq_usage,
+};
+#[cfg(any(rustos_boot_image, test))]
+use dependency_graph::graph_reaches;
 #[cfg(rustos_boot_image)]
 mod raw_diag;
 mod scheduler_diag;
@@ -42,7 +52,8 @@ mod scheduler_diag;
 mod spin_budget;
 
 pub use cpu_identity::{
-    bind_current_cpu_identity, current_cpu_index, finalize_cpu_identities, hardware_apic_id,
+    bind_current_cpu_identity, current_apic_id, current_cpu_index, finalize_cpu_identities,
+    hardware_apic_id,
     register_cpu_identity,
 };
 pub use scheduler_diag::{
@@ -103,6 +114,7 @@ pub enum LockClass {
     LinuxThreadState = 39,
     SchedulerRunQueue = 40,
     SchedulerMailbox = 41,
+    SchedulerPolicy = 42,
 }
 
 #[cfg(rustos_boot_image)]
@@ -152,9 +164,6 @@ impl TaskHeldStack {
 unsafe impl Sync for TaskHeldStack {}
 
 #[cfg(rustos_boot_image)]
-static DEPENDENCIES: [AtomicU64; MAX_LOCK_CLASSES] =
-    [const { AtomicU64::new(0) }; MAX_LOCK_CLASSES];
-#[cfg(rustos_boot_image)]
 static HELD_STACKS: PerCpuHeldStacks =
     PerCpuHeldStacks([const { UnsafeCell::new(HeldLockStack::new()) }; MAX_TRACKED_CPUS]);
 #[cfg(rustos_boot_image)]
@@ -169,10 +178,6 @@ static PREEMPT_PENDING_DEPTH: [AtomicUsize; MAX_TRACKED_CPUS] =
 #[cfg(rustos_boot_image)]
 static IRQ_CONTEXT_DEPTH: [AtomicUsize; MAX_TRACKED_CPUS] =
     [const { AtomicUsize::new(0) }; MAX_TRACKED_CPUS];
-#[cfg(rustos_boot_image)]
-static IRQ_SAFE_CLASSES: AtomicU64 = AtomicU64::new(0);
-#[cfg(rustos_boot_image)]
-static IRQ_UNSAFE_CLASSES: AtomicU64 = AtomicU64::new(0);
 #[cfg(rustos_boot_image)]
 static CURRENT_TASK_OWNER: [AtomicU64; MAX_TRACKED_CPUS] =
     [const { AtomicU64::new(0) }; MAX_TRACKED_CPUS];
@@ -346,9 +351,7 @@ pub fn record_sleepable_acquire(owner: u64, class: u8) {
             class
         );
         let class_index = validate_class(class);
-        // ORDERING: SeqCst places IRQ classification and dependency edges in
-        // one global order observed by every cycle/conflict query.
-        IRQ_UNSAFE_CLASSES.fetch_or(1_u64 << class_index, Ordering::SeqCst);
+        dependency_graph::mark_class_irq_unsafe(class_index);
         with_task_stack(owner, true, |stack| {
             assert!(
                 !stack.classes[..stack.len].contains(&class),
@@ -357,6 +360,9 @@ pub fn record_sleepable_acquire(owner: u64, class: u8) {
             );
             for held in &stack.classes[..stack.len] {
                 let held_index = usize::from(*held);
+                if edge_already_validated(&VALIDATED_TASK_EDGES, held_index, class_index) {
+                    continue;
+                }
                 // ORDERING: SeqCst publishes this edge in the same total order
                 // used by the following reverse-reachability check.
                 DEPENDENCIES[held_index].fetch_or(1_u64 << class_index, Ordering::SeqCst);
@@ -366,6 +372,7 @@ pub fn record_sleepable_acquire(owner: u64, class: u8) {
                     held,
                     class
                 );
+                publish_validated_edge(&VALIDATED_TASK_EDGES, held_index, class_index);
             }
             assert!(
                 stack.len < stack.classes.len(),
@@ -479,7 +486,7 @@ impl<T: ?Sized, const CLASS: u8> TrackedSpinLock<T, CLASS> {
         TrackedSpinGuard {
             guard: Some(guard),
             owner_cpu: tracked_guard_owner_cpu(),
-            owner_apic_id: hardware_apic_id(),
+            owner_apic_id: current_apic_id(),
             #[cfg(rustos_boot_image)]
             acquire_file: acquire_site.file(),
             #[cfg(rustos_boot_image)]
@@ -494,7 +501,7 @@ impl<T: ?Sized, const CLASS: u8> TrackedSpinLock<T, CLASS> {
         #[cfg(rustos_boot_image)]
         let acquire_cpu = current_cpu_index();
         #[cfg(rustos_boot_image)]
-        let acquire_apic_id = hardware_apic_id();
+        let acquire_apic_id = current_apic_id();
         #[cfg(rustos_boot_image)]
         disable_preemption();
         #[cfg(rustos_boot_image)]
@@ -507,7 +514,7 @@ impl<T: ?Sized, const CLASS: u8> TrackedSpinLock<T, CLASS> {
             Some(TrackedSpinGuard {
                 guard: Some(guard),
                 owner_cpu: tracked_guard_owner_cpu(),
-                owner_apic_id: hardware_apic_id(),
+                owner_apic_id: current_apic_id(),
                 #[cfg(rustos_boot_image)]
                 acquire_file: acquire_site.file(),
                 #[cfg(rustos_boot_image)]
@@ -519,7 +526,7 @@ impl<T: ?Sized, const CLASS: u8> TrackedSpinLock<T, CLASS> {
             #[cfg(rustos_boot_image)]
             {
                 let release_cpu = current_cpu_index();
-                let release_apic_id = hardware_apic_id();
+                let release_apic_id = current_apic_id();
                 let depth = preemption_depth();
                 assert!(
                     guard_release_is_admissible(
@@ -547,57 +554,62 @@ impl<T: ?Sized, const CLASS: u8> TrackedSpinLock<T, CLASS> {
         }
     }
 
-    /// Try one scheduler-lock acquisition from an IRQ dispatch that has
-    /// already proved `preemption_depth == 0`.
-    ///
-    /// This is intentionally narrower than an IRQ-safe lock: every normal raw
-    /// lock raises preemption depth, and timer/reschedule entry declines to
-    /// schedule when that depth is non-zero. Consequently the scheduler class
-    /// cannot interrupt an unsafe-class owner and must not poison the hard-IRQ
-    /// dependency graph. Other classes and ungated IRQ callers fail closed.
     #[track_caller]
-    pub fn try_lock_preemption_gated_irq(&self) -> Option<TrackedSpinGuard<'_, T, CLASS>> {
+    pub fn lock_scheduler_bounded(
+        &self,
+        mut timed_out: impl FnMut() -> bool,
+    ) -> Option<TrackedSpinGuard<'_, T, CLASS>> {
         #[cfg(rustos_boot_image)]
         {
-            assert_eq!(
-                CLASS,
-                LockClass::Scheduler as u8,
-                "preemption-gated IRQ acquisition is scheduler-only"
-            );
-            assert_ne!(
-                irq_context_depth(),
-                0,
-                "preemption-gated scheduler acquisition requires IRQ context"
-            );
-            assert!(
-                !preemption_disabled(),
-                "preemption-gated scheduler acquisition entered with raw lock held"
-            );
-            assert!(
-                !x86_64::instructions::interrupts::are_enabled(),
-                "preemption-gated scheduler acquisition requires local IRQ exclusion"
-            );
+            if CLASS != LockClass::Scheduler as u8 {
+                panic!("scheduler class required");
+            }
+            let irq_context = irq_context_depth() != 0;
+            if irq_context {
+                if preemption_disabled() {
+                    panic!("bounded IRQ scheduler acquisition entered with raw lock held");
+                }
+                if x86_64::instructions::interrupts::are_enabled() {
+                    panic!("bounded IRQ scheduler acquisition requires local IRQ exclusion");
+                }
+            }
             let acquire_site = Location::caller();
             disable_preemption();
-            let pending = before_acquire_with_irq_tracking(CLASS, acquire_site, false);
-            if let Some(guard) = self.inner.try_lock() {
-                after_acquire(pending);
-                Some(TrackedSpinGuard {
-                    guard: Some(guard),
-                    owner_cpu: tracked_guard_owner_cpu(),
-                    owner_apic_id: hardware_apic_id(),
-                    acquire_file: acquire_site.file(),
-                    acquire_line: acquire_site.line(),
-                    acquire_preemption_depth: preemption_depth(),
-                })
+            let pending = if irq_context {
+                before_acquire_with_irq_tracking(CLASS, acquire_site, false)
             } else {
-                cancel_pending_acquire_and_enable(CLASS);
-                None
+                before_acquire(CLASS, acquire_site)
+            };
+            loop {
+                while self.inner.is_locked() {
+                    if timed_out() {
+                        cancel_pending_acquire_and_enable(CLASS);
+                        return None;
+                    }
+                    spin_loop();
+                }
+                if let Some(guard) = self.inner.try_lock() {
+                    after_acquire(pending);
+                    return Some(TrackedSpinGuard {
+                        guard: Some(guard),
+                        owner_cpu: tracked_guard_owner_cpu(),
+                        owner_apic_id: current_apic_id(),
+                        acquire_file: acquire_site.file(),
+                        acquire_line: acquire_site.line(),
+                        acquire_preemption_depth: preemption_depth(),
+                    });
+                }
+                if timed_out() {
+                    cancel_pending_acquire_and_enable(CLASS);
+                    return None;
+                }
+                spin_loop();
             }
         }
         #[cfg(not(rustos_boot_image))]
         {
-            self.try_lock()
+            let _ = &mut timed_out;
+            Some(self.lock())
         }
     }
 }
@@ -605,8 +617,7 @@ impl<T: ?Sized, const CLASS: u8> TrackedSpinLock<T, CLASS> {
 #[cfg(rustos_boot_image)]
 #[inline]
 fn read_tsc() -> u64 {
-    // SAFETY: `_rdtsc` has no memory operand or privilege requirement; the
-    // value is used only as a monotonic raw-lock duration diagnostic.
+    // SAFETY: RDTSC has no memory operand or privilege requirement.
     unsafe { core::arch::x86_64::_rdtsc() }
 }
 
@@ -634,7 +645,7 @@ impl<T: ?Sized, const CLASS: u8> Drop for TrackedSpinGuard<'_, T, CLASS> {
         {
             x86_64::instructions::interrupts::without_interrupts(|| {
                 let release_cpu = current_cpu_index();
-                let release_apic_id = hardware_apic_id();
+                let release_apic_id = current_apic_id();
                 let depth = preemption_depth();
                 let admissible = guard_release_is_admissible(
                     self.owner_cpu,
@@ -763,7 +774,7 @@ pub fn preemption_snapshot() -> PreemptionSnapshot {
     {
         return x86_64::instructions::interrupts::without_interrupts(|| {
             let logical_cpu = current_cpu_index();
-            let apic_id = hardware_apic_id();
+            let apic_id = current_apic_id();
             // ORDERING: Acquire observes completed guard/pending transitions
             // before a scheduler gate consumes this coherent snapshot.
             let depth = PREEMPT_DISABLE_DEPTH[logical_cpu].load(Ordering::Acquire);
@@ -903,7 +914,8 @@ fn disable_preemption() {
 #[track_caller]
 fn enable_preemption(class: u8) {
     let cpu = current_cpu_index();
-    let apic_id = hardware_apic_id();
+    // The architectural identity is only rendered in the failure messages
+    // below. Deriving it eagerly cost a `CPUID` VM exit on every lock release.
     let held_depth = held_spin_lock_depth();
     let pending_depth = PREEMPT_PENDING_DEPTH[cpu].load(Ordering::Relaxed);
     // ORDERING: AcqRel publishes every protected write before the final depth
@@ -918,7 +930,7 @@ fn enable_preemption(class: u8) {
             "raw-spin preemption release mismatch class={} cpu={} apic={:#x} observed={} expected={} irq_depth={} held_depth={} pending_depth={} outer_class={:?}",
             class,
             cpu,
-            apic_id,
+            hardware_apic_id(),
             observed,
             held_depth
                 .checked_add(pending_depth)
@@ -933,7 +945,7 @@ fn enable_preemption(class: u8) {
             "raw-spin preemption depth underflow class={} cpu={} apic={:#x} observed={} irq_depth={} held_depth={} outer_class={:?}",
             class,
             cpu,
-            apic_id,
+            hardware_apic_id(),
             observed,
             irq_context_depth(),
             held_depth,
@@ -990,6 +1002,9 @@ fn before_acquire_with_irq_tracking(
             with_task_stack(owner, false, |stack| {
                 for held in &stack.classes[..stack.len] {
                     let held_index = usize::from(*held);
+                    if edge_already_validated(&VALIDATED_TASK_EDGES, held_index, class_index) {
+                        continue;
+                    }
                     // ORDERING: SeqCst publishes the edge before the reverse
                     // reachability query in the global lock graph.
                     DEPENDENCIES[held_index].fetch_or(1_u64 << class_index, Ordering::SeqCst);
@@ -1001,6 +1016,7 @@ fn before_acquire_with_irq_tracking(
                         acquire_site.file(),
                         acquire_site.line(),
                     );
+                    publish_validated_edge(&VALIDATED_TASK_EDGES, held_index, class_index);
                 }
             });
         }
@@ -1015,6 +1031,9 @@ fn before_acquire_with_irq_tracking(
         );
         for held in &stack.classes[..stack.len] {
             let held_index = usize::from(*held);
+            if edge_already_validated(&VALIDATED_RAW_EDGES, held_index, class_index) {
+                continue;
+            }
             // ORDERING: SeqCst publishes the raw dependency before conflict
             // and cycle checks read the globally ordered graph.
             DEPENDENCIES[held_index].fetch_or(1_u64 << class_index, Ordering::SeqCst);
@@ -1030,79 +1049,12 @@ fn before_acquire_with_irq_tracking(
                 held,
                 class
             );
+            publish_validated_edge(&VALIDATED_RAW_EDGES, held_index, class_index);
         }
     });
     PendingAcquire { class }
 }
 
-#[cfg(rustos_boot_image)]
-fn record_irq_usage(class: usize, acquire_site: &'static Location<'static>) {
-    let bit = 1_u64 << class;
-    if irq_context_depth() != 0 {
-        // ORDERING: SeqCst observes every prior unsafe classification before
-        // this IRQ-side admission and globally orders its safe publication.
-        let unsafe_classes = IRQ_UNSAFE_CLASSES.load(Ordering::SeqCst);
-        assert!(
-            unsafe_classes & bit == 0,
-            "IRQ-unsafe lock class acquired in interrupt context class={} acquire={}:{}",
-            class,
-            acquire_site.file(),
-            acquire_site.line(),
-        );
-        // ORDERING: SeqCst publishes IRQ-safe use before dependency queries
-        // or a process-context unsafe admission can proceed.
-        IRQ_SAFE_CLASSES.fetch_or(bit, Ordering::SeqCst);
-        assert!(
-            !class_reaches_any(class, unsafe_classes),
-            "IRQ-safe lock class reaches an IRQ-unsafe class class={}",
-            class
-        );
-    } else if x86_64::instructions::interrupts::are_enabled() {
-        // ORDERING: SeqCst observes all IRQ-safe publications before admitting
-        // an interruptible process-context acquisition.
-        let safe_classes = IRQ_SAFE_CLASSES.load(Ordering::SeqCst);
-        assert!(
-            safe_classes & bit == 0,
-            "IRQ-safe lock class acquired with interrupts enabled class={} acquire={}:{}",
-            class,
-            acquire_site.file(),
-            acquire_site.line(),
-        );
-        // ORDERING: SeqCst publishes the unsafe classification before the
-        // global reachability query and every future IRQ acquisition.
-        IRQ_UNSAFE_CLASSES.fetch_or(bit, Ordering::SeqCst);
-        assert!(
-            !any_class_reaches(safe_classes, class),
-            "IRQ-unsafe lock class is reachable from an IRQ-safe class class={}",
-            class
-        );
-    }
-}
-
-#[cfg(rustos_boot_image)]
-fn irq_dependency_conflicts(held: usize, acquired: usize) -> bool {
-    // ORDERING: SeqCst takes both classifications from the single global order
-    // shared with every class publication and dependency-edge insertion.
-    let safe_classes = IRQ_SAFE_CLASSES.load(Ordering::SeqCst);
-    let unsafe_classes = IRQ_UNSAFE_CLASSES.load(Ordering::SeqCst);
-    (safe_classes & (1_u64 << held) != 0 || any_class_reaches(safe_classes, held))
-        && (unsafe_classes & (1_u64 << acquired) != 0
-            || class_reaches_any(acquired, unsafe_classes))
-}
-
-#[cfg(rustos_boot_image)]
-fn class_reaches_any(class: usize, targets: u64) -> bool {
-    targets != 0
-        && (0..MAX_LOCK_CLASSES)
-            .any(|target| targets & (1_u64 << target) != 0 && dependency_reaches(class, target))
-}
-
-#[cfg(rustos_boot_image)]
-fn any_class_reaches(classes: u64, target: usize) -> bool {
-    classes != 0
-        && (0..MAX_LOCK_CLASSES)
-            .any(|class| classes & (1_u64 << class) != 0 && dependency_reaches(class, target))
-}
 
 #[cfg(not(rustos_boot_image))]
 fn before_acquire(class: u8, _acquire_site: ()) -> PendingAcquire {
@@ -1146,35 +1098,6 @@ fn release(class: u8) {
 
 #[cfg(not(rustos_boot_image))]
 fn release(_class: u8) {}
-
-#[cfg(rustos_boot_image)]
-fn dependency_reaches(start: usize, target: usize) -> bool {
-    graph_reaches(start, target, |node| {
-        // ORDERING: SeqCst observes edges in the same total order in which
-        // acquisitions publish them before asking this reachability question.
-        DEPENDENCIES[node].load(Ordering::SeqCst)
-    })
-}
-
-#[cfg(any(rustos_boot_image, test))]
-fn graph_reaches(start: usize, target: usize, mut edges: impl FnMut(usize) -> u64) -> bool {
-    let mut frontier = 1_u64 << start;
-    let mut visited = 0_u64;
-    while frontier != 0 {
-        let node = frontier.trailing_zeros() as usize;
-        let bit = 1_u64 << node;
-        frontier &= !bit;
-        if node == target {
-            return true;
-        }
-        if visited & bit != 0 {
-            continue;
-        }
-        visited |= bit;
-        frontier |= edges(node) & !visited;
-    }
-    false
-}
 
 #[cfg(rustos_boot_image)]
 fn with_current_stack<R>(f: impl FnOnce(&mut HeldLockStack) -> R) -> R {

@@ -371,6 +371,8 @@ seq=119 msg=\"milestone name=product-init-identity-ready\"";
     fn dvm_gpu_compositor_requires_real_virgl_fences_and_bounded_latency() {
         let ready = "rustos-dvm-gpu: ready contract=1 driver=virtio_gpu renderer=virgl_(AMD_Radeon_780M) backend-class=virtual-staged certification=registered commands=3 gpu-fence=1 acquire-fence=1 prime_us=12000 frames=120 fps_milli=60001 avg_us=400 max_us=900 wall_max_us=1000 frame_hash_a=ac8906df9029660b frame_hash_b=bc8906df9029660b hash-stable=1 hash-dynamic=1 negative=5 software=0 scheduler=rr priority=8 rttime-soft-us=50000 rttime-hard-us=100000 rttime-hard-action=terminate scheduler-restored=normal performance-target=1 scope-public-abi=0 scope-ui-connected=0 scope-scanout=0\nrustos-dvm-gpu: health sequence=1 completion_us=900 acquire-fence=1\nrustos-dvm-gpu: health sequence=2 completion_us=900 acquire-fence=1\nrustos-dvm-gpu: health sequence=3 completion_us=900 acquire-fence=1";
         assert!(dvm_gpu_compositor_ready(ready, VIRTUAL_GPU_EVIDENCE));
+        let recovered = format!("{}\nrustos-dvm-gpu: health sequence=1 completion_us=20000 acquire-fence=1\nrustos-dvm-gpu: health sequence=2 completion_us=900 acquire-fence=1\nrustos-dvm-gpu: health sequence=3 completion_us=900 acquire-fence=1\nrustos-dvm-gpu: health sequence=4 completion_us=900 acquire-fence=1", ready.lines().next().unwrap());
+        assert!(dvm_gpu_compositor_ready(&recovered, VIRTUAL_GPU_EVIDENCE));
         assert!(!dvm_gpu_compositor_ready(
             &ready.replace("software=0", "software=1"),
             VIRTUAL_GPU_EVIDENCE,

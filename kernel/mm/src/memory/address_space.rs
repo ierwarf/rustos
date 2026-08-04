@@ -996,7 +996,7 @@ impl Drop for ProcessAddressSpace {
 
         // Cross-CPU lifetime invariant: the scheduler/process retirement
         // barrier must remove every remote owner before any page-table frame is
-        // reclaimed. A conservative global shootdown also removes translations
+        // reclaimed. The generation-bound targeted shootdown also removes translations
         // cached before those CPUs switched roots; measured range/root-specific
         // retirement can replace it later without weakening this ordering.
         let reclaim_barrier =

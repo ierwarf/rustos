@@ -49,8 +49,8 @@ use crate::layout::{
     WINDOW_BORDER, WINDOW_TITLE_HEIGHT,
 };
 use crate::sys::{
-    diag_line, map_shared_fd_readable, require_background_thread_class, ui_profile_enabled,
-    InputEvent, SharedFdMapping, INPUT_ACTION_PRESSED, INPUT_ACTION_RELEASED,
+    diag_line, map_shared_fd_readable, spawn_ui_thread, ui_profile_enabled, InputEvent,
+    SharedFdMapping, UiThreadRole, INPUT_ACTION_PRESSED, INPUT_ACTION_RELEASED,
     INPUT_ACTION_REPEATED, INPUT_KIND_KEYBOARD,
 };
 use crate::wayland_accept::{start_wayland_acceptor, WaylandAcceptor};
@@ -225,51 +225,47 @@ impl WaylandCompositor {
         let (rearm_sender, rearm_receiver) = sync_channel::<()>(1);
         let needs_rearm = Arc::new(AtomicBool::new(false));
         let worker_needs_rearm = Arc::clone(&needs_rearm);
-        thread::Builder::new()
-            .name(String::from("wayland-readiness"))
-            .spawn(move || {
-                require_background_thread_class();
-                let mut event = libc::epoll_event { events: 0, u64: 0 };
-                let mut consecutive_transient_failures = 0_usize;
-                loop {
-                    let ready =
-                        unsafe { libc::epoll_wait(owned_fd.as_raw_fd(), &mut event, 1, -1) };
-                    if ready < 0 {
-                        let err = std::io::Error::last_os_error();
-                        if err.kind() == ErrorKind::Interrupted {
-                            continue;
-                        }
-                        if transient_wayland_readiness_error(err.kind())
-                            && consecutive_transient_failures
-                                < WAYLAND_READINESS_TRANSIENT_FAILURE_LIMIT
-                        {
-                            consecutive_transient_failures =
-                                consecutive_transient_failures.saturating_add(1);
-                            if consecutive_transient_failures == 1 {
-                                diag_line(format!(
-                                    "uiserver: Wayland readiness transient wait failure: {err}"
-                                ));
-                            }
-                            thread::sleep(WAYLAND_READINESS_RETRY_DELAY);
-                            continue;
-                        }
-                        diag_line(format!("uiserver: Wayland readiness wait failed: {err}"));
-                        std::process::exit(134);
-                    }
-                    consecutive_transient_failures = 0;
-                    if ready == 0 {
+        spawn_ui_thread(UiThreadRole::Protocol, "wayland-readiness", move || {
+            let mut event = libc::epoll_event { events: 0, u64: 0 };
+            let mut consecutive_transient_failures = 0_usize;
+            loop {
+                let ready = unsafe { libc::epoll_wait(owned_fd.as_raw_fd(), &mut event, 1, -1) };
+                if ready < 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() == ErrorKind::Interrupted {
                         continue;
                     }
-                    if !WAYLAND_READINESS_WAKE_LOGGED.swap(true, Ordering::AcqRel) {
-                        diag_line("uiserver: Wayland readiness wake observed");
+                    if transient_wayland_readiness_error(err.kind())
+                        && consecutive_transient_failures
+                            < WAYLAND_READINESS_TRANSIENT_FAILURE_LIMIT
+                    {
+                        consecutive_transient_failures =
+                            consecutive_transient_failures.saturating_add(1);
+                        if consecutive_transient_failures == 1 {
+                            diag_line(format!(
+                                "uiserver: Wayland readiness transient wait failure: {err}"
+                            ));
+                        }
+                        thread::sleep(WAYLAND_READINESS_RETRY_DELAY);
+                        continue;
                     }
-                    worker_needs_rearm.store(true, Ordering::Release);
-                    ui_wake_sender.signal();
-                    if rearm_receiver.recv().is_err() {
-                        break;
-                    }
+                    diag_line(format!("uiserver: Wayland readiness wait failed: {err}"));
+                    std::process::exit(134);
                 }
-            })?;
+                consecutive_transient_failures = 0;
+                if ready == 0 {
+                    continue;
+                }
+                if !WAYLAND_READINESS_WAKE_LOGGED.swap(true, Ordering::AcqRel) {
+                    diag_line("uiserver: Wayland readiness wake observed");
+                }
+                worker_needs_rearm.store(true, Ordering::Release);
+                ui_wake_sender.signal();
+                if rearm_receiver.recv().is_err() {
+                    break;
+                }
+            }
+        })?;
         self.readiness = Some(WaylandReadiness {
             rearm_sender,
             needs_rearm,

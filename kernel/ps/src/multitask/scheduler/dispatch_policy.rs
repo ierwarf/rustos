@@ -10,6 +10,12 @@
 use super::{
     MAX_ATOMIC_ACTIVATION_HANDOFFS, MAX_LATENCY_HANDOFF_HINTS, MAX_TASK, SlotHandoffQueue,
 };
+use nucleus_core::util::lockdep::{LockClass, TrackedSpinGuard, TrackedSpinLock};
+
+pub(super) type CpuDispatchLock =
+    TrackedSpinLock<CpuDispatchPolicy, { LockClass::SchedulerPolicy as u8 }>;
+pub(super) type CpuDispatchGuard<'a> =
+    TrackedSpinGuard<'a, CpuDispatchPolicy, { LockClass::SchedulerPolicy as u8 }>;
 
 pub(super) struct CpuDispatchPolicy {
     pub(super) next_pick_hint: Option<usize>,
@@ -24,6 +30,7 @@ pub(super) struct CpuDispatchPolicy {
     pub(super) system_dispatch_streak: u8,
     pub(super) latency_handoff_streak: u8,
     pub(super) sync_handoff_streak: u8,
+    pub(super) ready_validation_turn: u8,
 }
 
 impl CpuDispatchPolicy {
@@ -41,6 +48,7 @@ impl CpuDispatchPolicy {
             system_dispatch_streak: 0,
             latency_handoff_streak: 0,
             sync_handoff_streak: 0,
+            ready_validation_turn: 0,
         }
     }
 }

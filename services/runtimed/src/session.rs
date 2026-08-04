@@ -24,7 +24,7 @@ use rustos_user_abi::syscall::{
     IPC_SERVICE_DEVMGRD, IPC_SERVICE_SESSIOND, SESSIOND_CONSOLE_READINESS_LIVE,
     SESSIOND_CONSOLE_READINESS_READY, SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_REPLY,
     SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER, SYS_RUSTOS_WAITSET_SIGNAL_BROKER, WAITSET_ABI_VERSION,
-    WAITSET_GLOBAL_OBJECT_ID, WAITSET_PROVIDER_SESSIOND,
+    WAITSET_PROVIDER_SESSIOND,
 };
 
 use super::{
@@ -67,7 +67,7 @@ impl SessionRuntime {
                 .checked_add(1)
                 .expect("sessiond input readiness generation exhausted");
             #[cfg(not(test))]
-            publish_input_readiness(self.input_readiness_generation);
+            publish_input_readiness(session, self.input_readiness_generation);
         }
     }
 
@@ -826,7 +826,10 @@ fn handle_console_route_request(
             {
                 Ok(became_ready) => {
                     if became_ready {
-                        publish_input_readiness(state.session_runtime.input_readiness_generation());
+                        publish_input_readiness(
+                            input.session_handle,
+                            state.session_runtime.input_readiness_generation(),
+                        );
                     }
                     0
                 }
@@ -844,12 +847,12 @@ fn handle_console_route_request(
     }
 }
 
-fn publish_input_readiness(generation: u64) {
+fn publish_input_readiness(session: u64, generation: u64) {
     let args = WaitSetSignalBrokerArgs {
         abi_version: WAITSET_ABI_VERSION,
         provider: WAITSET_PROVIDER_SESSIOND,
         flags: 0,
-        object_id: WAITSET_GLOBAL_OBJECT_ID,
+        object_id: session,
         generation,
         reserved0: 0,
     };

@@ -85,6 +85,19 @@ static WITHDRAW_PENDING: AtomicBool = AtomicBool::new(false);
 static REVOKE_PENDING: AtomicBool = AtomicBool::new(false);
 static BROKER_CALLS: AtomicU64 = AtomicU64::new(0);
 static RECORDS_COPIED: AtomicU64 = AtomicU64::new(0);
+// Bounded drain observability. The host relay fails closed when the ring stays
+// full past its credit window, and total record counts cannot distinguish a
+// stalled consumer from one that is merely behind. These record how deep the
+// backlog actually got and how often a turn lost the single-flight claim, so
+// the failure is attributable without re-running with ad-hoc probes.
+static OUTSTANDING_HIGH_WATER: AtomicU64 = AtomicU64::new(0);
+static OUTSTANDING_HIGH_WATER_REPORTED: AtomicU64 = AtomicU64::new(0);
+static DRAIN_CLAIM_LOST: AtomicU64 = AtomicU64::new(0);
+static MAPPING_CLAIM_FAILURES: AtomicU64 = AtomicU64::new(0);
+static READINESS_POLLS: AtomicU64 = AtomicU64::new(0);
+/// Report only when the backlog high-water grows by a full broker turn, which
+/// bounds output to at most one line per turn-sized step of the ring.
+const OUTSTANDING_REPORT_STEP: u64 = MAX_RECORDS_PER_BROKER_TURN;
 static REVOKE_COUNT: AtomicU64 = AtomicU64::new(0);
 
 const INSTALL_REJECTION_NONE: u8 = 0;
@@ -136,6 +149,68 @@ struct MappedInputRing {
     resource_start: u64,
     mapped: *mut u8,
     header: DvmInputRingHeader,
+}
+
+/// The shared aperture address is usable only while this exact lifecycle
+/// generation holds an admitted claim. The drain owner may inspect and unmap
+/// the pointer after `finish_drain`, but ordinary broker/readiness paths must
+/// never load or dereference `SHARED_ADDR` without this guard.
+struct TransportMappingClaim<'a> {
+    lifecycle: Option<crate::transport_lifecycle::TransportClaim<'a>>,
+    generation: u64,
+    mapped: *mut u8,
+}
+
+impl TransportMappingClaim<'_> {
+    fn mapped(&self) -> *mut u8 {
+        self.mapped
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    fn validate_current(&self) -> bool {
+        self.lifecycle
+            .as_ref()
+            .is_some_and(crate::transport_lifecycle::TransportClaim::validate_current)
+    }
+
+    fn epoch(&self) -> u64 {
+        self.lifecycle
+            .as_ref()
+            .map_or(0, crate::transport_lifecycle::TransportClaim::epoch)
+    }
+}
+
+impl Drop for TransportMappingClaim<'_> {
+    fn drop(&mut self) {
+        // Release the aperture claim before asking the transport-specific
+        // drain owner to observe zero claims and unmap the retired generation.
+        drop(self.lifecycle.take());
+        finish_pending_lifecycle();
+    }
+}
+
+fn claim_installed_mapping() -> Option<TransportMappingClaim<'static>> {
+    if !INSTALLED.load(Ordering::Acquire) {
+        return None;
+    }
+    let generation = GENERATION.load(Ordering::Acquire);
+    let lifecycle = INPUT_LIFECYCLE.try_claim(generation)?;
+    let mapped = SHARED_ADDR.load(Ordering::Acquire) as *mut u8;
+    if mapped.is_null()
+        || !INSTALLED.load(Ordering::Acquire)
+        || GENERATION.load(Ordering::Acquire) != generation
+        || !lifecycle.validate_current()
+    {
+        return None;
+    }
+    Some(TransportMappingClaim {
+        lifecycle: Some(lifecycle),
+        generation,
+        mapped,
+    })
 }
 
 pub(crate) fn init() {
@@ -191,6 +266,10 @@ fn try_install_serialized() -> bool {
         ARMED_RESOURCE_START.store(ring.resource_start, Ordering::Release);
         MSIX_ARMED.store(true, Ordering::Release);
     }
+    let Some(activation) = INPUT_LIFECYCLE.activate_begin(ring.header.generation) else {
+        release_mapping(ring.mapped);
+        return false;
+    };
     let flags = read_u32(ring.mapped, DVM_INPUT_RING_FLAGS_OFFSET)
         & !DVM_INPUT_RING_FLAG_POLICY_CONSUMER_READY;
     write_u32(
@@ -203,10 +282,14 @@ fn try_install_serialized() -> bool {
     GENERATION.store(ring.header.generation, Ordering::Release);
     CONSUMER.store(ring.header.consumer, Ordering::Release);
     CONSUMER_WAKE_GENERATION.store(ring.header.consumer_wake_generation, Ordering::Release);
-    assert!(
-        INPUT_LIFECYCLE.activate(ring.header.generation),
-        "DVM input lifecycle activation failed during install"
-    );
+    if !activation.commit() {
+        SHARED_ADDR.store(0, Ordering::Release);
+        GENERATION.store(0, Ordering::Release);
+        CONSUMER.store(0, Ordering::Release);
+        CONSUMER_WAKE_GENERATION.store(0, Ordering::Release);
+        release_mapping(ring.mapped);
+        return false;
+    }
     INSTALLED.store(true, Ordering::Release);
     crate::debug::info!(
         input,
@@ -225,15 +308,15 @@ pub(crate) fn mark_policy_consumer_ready() -> bool {
     if !INSTALLED.load(Ordering::Acquire) && !try_install() {
         return false;
     }
-    let mapped = SHARED_ADDR.load(Ordering::Acquire) as *mut u8;
-    if mapped.is_null() {
+    let Some(mapping) = claim_installed_mapping() else {
         return false;
-    }
+    };
+    let mapped = mapping.mapped();
     let Some(header) = read_header(mapped) else {
         revoke("policy-ready-header-invalid");
         return false;
     };
-    if header.generation != GENERATION.load(Ordering::Acquire)
+    if header.generation != mapping.generation()
         || header.consumer != CONSUMER.load(Ordering::Acquire)
     {
         revoke("policy-ready-lifecycle-invalid");
@@ -243,9 +326,6 @@ pub(crate) fn mark_policy_consumer_ready() -> bool {
         revoke("policy-ready-transport-not-ready");
         return false;
     };
-    if !INPUT_LIFECYCLE.activate(header.generation) {
-        return false;
-    }
     if flags == header.flags {
         return true;
     }
@@ -287,11 +367,11 @@ pub(crate) fn withdraw_policy_consumer() {
         super::wait_queue::wake_input_waiters();
         return;
     }
-    let mapped = SHARED_ADDR.load(Ordering::Acquire) as *mut u8;
-    if mapped.is_null() {
+    let Some(mapping) = claim_installed_mapping() else {
         super::wait_queue::wake_input_waiters();
         return;
-    }
+    };
+    let mapped = mapping.mapped();
     let flags = read_u32(mapped, DVM_INPUT_RING_FLAGS_OFFSET);
     write_u32(
         mapped,
@@ -299,13 +379,14 @@ pub(crate) fn withdraw_policy_consumer() {
         flags & !DVM_INPUT_RING_FLAG_POLICY_CONSUMER_READY,
     );
     fence(Ordering::SeqCst);
-    let generation = GENERATION.load(Ordering::Acquire);
+    let generation = mapping.generation();
     INPUT_LIFECYCLE.request_drain();
     // ORDERING: the Release pending bit publishes the retired generation and
     // shared-ready withdrawal before any quiescent finisher resets cursors.
     WITHDRAW_PENDING.store(true, Ordering::Release);
     RESET_PENDING_GENERATION.store(generation.max(1), Ordering::Release);
     super::wait_queue::wake_input_waiters();
+    drop(mapping);
     wait_for_lifecycle_quiescence("policy-consumer-withdraw");
     crate::debug::warn!(
         input,
@@ -331,6 +412,7 @@ pub(crate) fn service_pending(dest: &mut [InputDvmRecordWire]) -> usize {
     // prior owner's cursor publication. A losing caller leaves all records and
     // reset authority untouched for the admitted owner or a later turn.
     if !try_claim_drain(&DRAIN_IN_PROGRESS) {
+        DRAIN_CLAIM_LOST.fetch_add(1, Ordering::Relaxed);
         return 0;
     }
     let _drain_guard = DrainGuard;
@@ -354,18 +436,12 @@ pub(crate) fn service_pending(dest: &mut [InputDvmRecordWire]) -> usize {
         RECORDS_COPIED.fetch_add(written as u64, Ordering::Relaxed);
         return written;
     }
-    let mapped = SHARED_ADDR.load(Ordering::Acquire) as *mut u8;
-    if mapped.is_null() {
-        RECORDS_COPIED.fetch_add(written as u64, Ordering::Relaxed);
-        return written;
-    }
-    // ORDERING: Acquire binds the shared-memory claim to the installed
-    // generation published before INSTALLED became visible.
-    let generation = GENERATION.load(Ordering::Acquire);
-    let Some(lifecycle_claim) = INPUT_LIFECYCLE.try_claim(generation) else {
+    let Some(mapping) = claim_installed_mapping() else {
         RECORDS_COPIED.fetch_add(written as u64, Ordering::Relaxed);
         return written;
     };
+    let mapped = mapping.mapped();
+    let generation = mapping.generation();
     let reset_written = written;
     let _ = IRQ_PENDING.swap(false, Ordering::AcqRel);
     let Some(header) = read_header(mapped) else {
@@ -387,6 +463,7 @@ pub(crate) fn service_pending(dest: &mut [InputDvmRecordWire]) -> usize {
     // bytes may be observed before the validated cursor becomes visible.
     fence(Ordering::Acquire);
     let available = header.producer - consumer;
+    record_outstanding_high_water(available);
     let capacity = (dest.len() - written) as u64;
     let count = available.min(MAX_RECORDS_PER_BROKER_TURN).min(capacity);
     for _ in 0..count {
@@ -417,7 +494,7 @@ pub(crate) fn service_pending(dest: &mut [InputDvmRecordWire]) -> usize {
         written += 1;
         consumer = consumer.saturating_add(1);
     }
-    if !lifecycle_claim.validate_current() || lifecycle_claim.epoch() != generation {
+    if !mapping.validate_current() || mapping.epoch() != generation {
         // ORDERING: publish the rejected generation for inputd's reset barrier
         // before this claim is dropped and another epoch may activate.
         RESET_PENDING_GENERATION.store(generation.max(1), Ordering::Release);
@@ -446,22 +523,17 @@ pub(crate) fn arm_consumer_wake() -> bool {
     if !INSTALLED.load(Ordering::Acquire) {
         return false;
     }
-    let mapped = SHARED_ADDR.load(Ordering::Acquire) as *mut u8;
-    if mapped.is_null() {
-        return false;
-    }
-    // ORDERING: Acquire selects the exact epoch before arming a shared wake;
-    // the claim recheck closes revoke between selection and publication.
-    let generation = GENERATION.load(Ordering::Acquire);
-    let Some(claim) = INPUT_LIFECYCLE.try_claim(generation) else {
+    let Some(mapping) = claim_installed_mapping() else {
         return false;
     };
+    let mapped = mapping.mapped();
+    let generation = mapping.generation();
     let current = CONSUMER_WAKE_GENERATION.load(Ordering::Acquire);
     let Some(next) = current.checked_add(1) else {
         revoke("consumer-wake-generation-wrapped");
         return false;
     };
-    if !claim.validate_current() || claim.epoch() != generation {
+    if !mapping.validate_current() || mapping.epoch() != generation {
         return false;
     }
     fence(Ordering::Release);
@@ -481,6 +553,7 @@ pub(crate) fn arm_consumer_wake() -> bool {
 /// include the raw producer/consumer state, not only the decoded ingress
 /// queue; otherwise that edge is lost and a finite poll can sleep forever.
 pub(crate) fn has_pending_records() -> bool {
+    READINESS_POLLS.fetch_add(1, Ordering::Relaxed);
     if RESET_PENDING_GENERATION.load(Ordering::Acquire) != 0 {
         return true;
     }
@@ -490,22 +563,77 @@ pub(crate) fn has_pending_records() -> bool {
     if !INSTALLED.load(Ordering::Acquire) {
         return false;
     }
-    let mapped = SHARED_ADDR.load(Ordering::Acquire) as *mut u8;
-    if mapped.is_null() {
-        return false;
-    }
+    let Some(mapping) = claim_installed_mapping() else {
+        // An installed transport whose lifecycle claim cannot be taken is
+        // mid activation or drain. Reporting "nothing pending" here lets the
+        // sole consumer sleep through that transition even though records may
+        // already be committed, and no later edge is owed to it. Force a
+        // broker turn instead, exactly as the malformed-header case below
+        // does, so the authoritative path observes the exact lifecycle state.
+        report_mapping_claim_failure();
+        return true;
+    };
+    let mapped = mapping.mapped();
     let Some(header) = read_header(mapped) else {
         // Force a broker turn to perform the authoritative revoke rather than
         // letting a malformed live transport strand a sleeping reader.
         return true;
     };
-    let generation = GENERATION.load(Ordering::Acquire);
+    let generation = mapping.generation();
     let consumer = CONSUMER.load(Ordering::Acquire);
     header.generation != generation
         || header.consumer != consumer
         || header.producer < consumer
         || header.producer.saturating_sub(consumer) > u64::from(DVM_INPUT_RING_SLOT_COUNT)
         || header.producer != consumer
+}
+
+/// Publishes a new backlog high-water mark at a bounded cadence.
+fn record_outstanding_high_water(available: u64) {
+    let previous = OUTSTANDING_HIGH_WATER.fetch_max(available, Ordering::Relaxed);
+    if available <= previous {
+        return;
+    }
+    let reported = OUTSTANDING_HIGH_WATER_REPORTED.load(Ordering::Relaxed);
+    if available < reported.saturating_add(OUTSTANDING_REPORT_STEP) {
+        return;
+    }
+    OUTSTANDING_HIGH_WATER_REPORTED.store(available, Ordering::Relaxed);
+    crate::debug::warn!(
+        input,
+        "dvm-input-ring: backlog high-water outstanding={} turns={} polls={} claim_lost={} mapping_claim_failed={} copied={}",
+        available,
+        BROKER_CALLS.load(Ordering::Relaxed),
+        READINESS_POLLS.load(Ordering::Relaxed),
+        DRAIN_CLAIM_LOST.load(Ordering::Relaxed),
+        MAPPING_CLAIM_FAILURES.load(Ordering::Relaxed),
+        RECORDS_COPIED.load(Ordering::Relaxed)
+    );
+}
+
+/// Publishes the exact lifecycle state that refused a readiness claim.
+///
+/// A claim failure on an installed transport is the one state in which the
+/// sole consumer can neither drain nor be owed a later edge, so it must be
+/// attributable without re-running with ad-hoc probes. Output is bounded to
+/// the first failure and then to exponentially spaced counts.
+fn report_mapping_claim_failure() {
+    let failures = MAPPING_CLAIM_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+    if failures != 1 && !failures.is_power_of_two() {
+        return;
+    }
+    crate::debug::warn!(
+        input,
+        "dvm-input-ring: readiness claim refused failures={} generation={} lifecycle_epoch={} in_flight={} installed={} polls={} turns={} copied={}",
+        failures,
+        GENERATION.load(Ordering::Acquire),
+        INPUT_LIFECYCLE.epoch(),
+        INPUT_LIFECYCLE.in_flight(),
+        INSTALLED.load(Ordering::Acquire),
+        READINESS_POLLS.load(Ordering::Relaxed),
+        BROKER_CALLS.load(Ordering::Relaxed),
+        RECORDS_COPIED.load(Ordering::Relaxed)
+    );
 }
 
 fn input_ring_interrupt(_vector: u8) {

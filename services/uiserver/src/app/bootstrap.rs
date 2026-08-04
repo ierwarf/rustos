@@ -12,8 +12,8 @@ use crate::gpu_runtime::GpuCompositorRuntime;
 use crate::sys::{
     boot_line, debug_line, diag_line, display_create_surface, display_get_info, display_present,
     display_present_rect, map_surface, open_console, open_display, open_input,
-    publish_input_pointer_surface, require_background_thread_class, DisplayInfo,
-    DisplaySurfaceCreate, SurfaceMapping, EAGAIN, ENODEV, ESTALE, PIXEL_FORMAT_BGRA8888,
+    publish_input_pointer_surface, spawn_ui_thread, DisplayInfo, DisplaySurfaceCreate,
+    SurfaceMapping, UiThreadRole, EAGAIN, ENODEV, ESTALE, PIXEL_FORMAT_BGRA8888,
 };
 const SURFACE_CREATE_RETRIES: usize = 4;
 // Retry budget for waiting on a primary display provider (for example the DVM
@@ -520,10 +520,14 @@ impl AppState {
 
 pub(crate) fn start_launcher_program_loader() -> Receiver<Vec<LauncherProgram>> {
     let (sender, receiver) = mpsc::channel();
-    thread::spawn(move || {
-        require_background_thread_class();
-        let _ = sender.send(load_launcher_programs());
-    });
+    spawn_ui_thread(
+        UiThreadRole::Background,
+        "uiserver-launcher-loader",
+        move || {
+            let _ = sender.send(load_launcher_programs());
+        },
+    )
+    .unwrap_or_else(|_| std::process::exit(134));
     receiver
 }
 

@@ -49,16 +49,16 @@ impl VfsState {
         }
         match request.header.op {
             COMMERCIAL_MAX_VFSD_OP_MOUNT_GRAPH => {
-                response.value0 = self.mount_generation;
-                response.value1 = u64::from(self.volume.is_some());
+                response.value0 = lock_vfs_storage().mount_generation;
+                response.value1 = u64::from(lock_vfs_storage().volume.is_some());
                 response.descriptor_count = 1;
                 response.descriptors[0] =
-                    vfs_descriptor("mount-graph", request.header.op, self.mount_generation, 0);
+                    vfs_descriptor("mount-graph", request.header.op, lock_vfs_storage().mount_generation, 0);
             }
             COMMERCIAL_MAX_VFSD_OP_PATH_RESOLVE => {
                 let path = commercial_request_path(request);
                 if let Some(path) = path {
-                    match self.metadata(path) {
+                    match lock_vfs_storage().metadata(path) {
                         Ok(metadata) => {
                             response.value0 = metadata.inode;
                             response.value1 = metadata.len;
@@ -91,15 +91,15 @@ impl VfsState {
                 fill_handle_descriptors(self, &mut response, RemoteKind::File);
             }
             COMMERCIAL_MAX_VFSD_OP_METADATA_POLICY => {
-                response.value0 = self.metadata_cache.len() as u64;
-                response.value1 = self.dir_entries_cache.len() as u64;
+                response.value0 = lock_vfs_storage().metadata_cache.len() as u64;
+                response.value1 = lock_vfs_storage().dir_entries_cache.len() as u64;
                 response.capability = vfs_capability("metadata-policy", request.header.op);
                 response.descriptor_count = 1;
                 response.descriptors[0] = vfs_descriptor(
                     "metadata-policy",
                     request.header.op,
-                    self.metadata_cache.len() as u64,
-                    self.dir_entries_cache.len() as u64,
+                    lock_vfs_storage().metadata_cache.len() as u64,
+                    lock_vfs_storage().dir_entries_cache.len() as u64,
                 );
             }
             _ => response.status = EINVAL,
@@ -147,6 +147,7 @@ impl VfsState {
 
     fn vfs_poll_query(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
         let mut mutated = false;
+        let mut mutated_epolls = Vec::new();
         match request.arg0 {
             VFS_POLL_QUERY_POLL => self.vfs_poll_once(request, response),
             VFS_POLL_QUERY_EPOLL_CREATE => {
@@ -166,10 +167,14 @@ impl VfsState {
                 }
                 self.epolls = candidate;
                 mutated = true;
+                mutated_epolls.push(request.remote_id);
             }
             VFS_POLL_QUERY_EPOLL_CTL => {
                 self.vfs_epoll_ctl(request, response);
                 mutated = response.status == 0;
+                if mutated {
+                    mutated_epolls.push(request.remote_id);
+                }
             }
             VFS_POLL_QUERY_EPOLL_SNAPSHOT => self.vfs_epoll_snapshot(request, response),
             VFS_POLL_QUERY_EPOLL_RETIRE => {
@@ -189,6 +194,7 @@ impl VfsState {
                 }
                 self.epolls = candidate;
                 mutated = true;
+                mutated_epolls.push(request.remote_id);
             }
             VFS_POLL_QUERY_EPOLL_PURGE_OBJECT => {
                 let Ok(provider) = u16::try_from(request.arg1) else {
@@ -200,6 +206,7 @@ impl VfsState {
                     return;
                 }
                 let interests = self.epolls.matching_interests(provider, request.arg2);
+                mutated_epolls.extend(interests.iter().map(|(token, _)| *token));
                 let mut candidate = self.epolls.clone();
                 mutated = candidate.purge(provider, request.arg2);
                 for (token, interest) in interests {
@@ -217,7 +224,9 @@ impl VfsState {
             _ => response.status = EINVAL,
         }
         if mutated {
-            self.advance_readiness_generation();
+            mutated_epolls.sort_unstable();
+            mutated_epolls.dedup();
+            self.advance_readiness_generation(&mutated_epolls);
         }
     }
 
@@ -323,18 +332,18 @@ impl VfsState {
         response.payload_len = (interests.len() * wire_size) as u32;
     }
 
-    fn advance_readiness_generation(&mut self) {
+    fn advance_readiness_generation(&mut self, object_ids: &[u64]) {
         self.readiness_generation = self
             .readiness_generation
             .checked_add(1)
             .expect("vfsd readiness generation exhausted");
         #[cfg(not(test))]
-        {
+        for object_id in object_ids.iter().copied() {
             let args = WaitSetSignalBrokerArgs {
                 abi_version: WAITSET_ABI_VERSION,
                 provider: WAITSET_PROVIDER_VFSD,
                 flags: 0,
-                object_id: WAITSET_GLOBAL_OBJECT_ID,
+                object_id,
                 generation: self.readiness_generation,
                 reserved0: 0,
             };
@@ -359,7 +368,7 @@ impl VfsState {
             response.status = EINVAL;
             return;
         };
-        match self.metadata(path) {
+        match lock_vfs_storage().metadata(path) {
             Ok(metadata) => {
                 let statx = build_linux_statx(metadata);
                 response.payload_len = LINUX_STATX_SIZE as u32;
@@ -378,7 +387,7 @@ impl VfsState {
             response.status = EINVAL;
             return;
         };
-        match self.metadata(path) {
+        match lock_vfs_storage().metadata(path) {
             Ok(metadata) => {
                 let stat = build_linux_stat(metadata);
                 response.payload_len = LINUX_STAT_SIZE as u32;
@@ -401,7 +410,7 @@ impl VfsState {
             response.status = EINVAL;
             return;
         };
-        response.status = match self.metadata(path) {
+        response.status = match lock_vfs_storage().metadata(path) {
             Ok(_) => 0,
             Err(errno) => errno,
         };
@@ -441,14 +450,14 @@ impl VfsState {
     }
 
     fn linux_mount(&mut self, response: &mut LinuxSyscallOffloadResponse) {
-        response.status = match self.advance_mount_generation() {
+        response.status = match lock_vfs_storage().advance_mount_generation() {
             Ok(()) => 0,
             Err(errno) => errno,
         };
     }
 
     fn linux_umount2(&mut self, response: &mut LinuxSyscallOffloadResponse) {
-        response.status = match self.advance_mount_generation() {
+        response.status = match lock_vfs_storage().advance_mount_generation() {
             Ok(()) => 0,
             Err(errno) => errno,
         };

@@ -2,8 +2,9 @@
 //!
 //! - **Owner:** `kernel-ps` owns the global scheduler lock and every dense
 //!   CPU's current-task publication.
-//! - **Boundary:** `Scheduler::current_task` is scratch loaded from and
-//!   returned to the invoking CPU's slot on every serialized access.
+//! - **Boundary:** a private CPU-local dispatch scratch slot is loaded from
+//!   and returned to the invoking CPU's published current slot.  The
+//!   `Scheduler` catalog never stores a shared mutable current-task field.
 //! - **Lifecycle:** BSP bootstrap ownership precedes AP idle publication. A
 //!   later handoff reserves the incoming slot while retaining the outgoing
 //!   stack, then assembly releases the outgoing owner only after switching
@@ -18,7 +19,6 @@
 //! - **Evidence:** `cpu-online-lifecycle`, `scheduler-lifecycle`, and
 //!   `scheduler-cpu-ownership`.
 
-use core::hint::spin_loop;
 use core::ops::{Deref, DerefMut};
 use core::panic::Location;
 use core::ptr;
@@ -42,12 +42,35 @@ static CURRENT_TASK_ACTIVE: [AtomicBool; nucleus_core::util::lockdep::MAX_TRACKE
     [const { AtomicBool::new(false) }; nucleus_core::util::lockdep::MAX_TRACKED_CPUS];
 static CURRENT_TASK_IDLE: [AtomicBool; nucleus_core::util::lockdep::MAX_TRACKED_CPUS] =
     [const { AtomicBool::new(false) }; nucleus_core::util::lockdep::MAX_TRACKED_CPUS];
+// This is private working state for one CPU's dispatch turn.  Unlike
+// `CURRENT_TASK_SLOTS`, it is never remote lifetime or execution authority:
+// remote readers use the release-published current/transition pair below.
+// Keeping it out of `Scheduler` removes the last mutable current-task scratch
+// word from the lifecycle catalog without publishing an incoming task before
+// the assembly RSP switch commits.
+static SCHEDULER_CURRENT_TASK_SCRATCH:
+    [AtomicUsize; nucleus_core::util::lockdep::MAX_TRACKED_CPUS] =
+    [const { AtomicUsize::new(0) }; nucleus_core::util::lockdep::MAX_TRACKED_CPUS];
 static TRANSITION_FROM_SLOTS: [AtomicUsize; nucleus_core::util::lockdep::MAX_TRACKED_CPUS] =
     [const { AtomicUsize::new(0) }; nucleus_core::util::lockdep::MAX_TRACKED_CPUS];
 static TRANSITION_ACTIVE: [AtomicBool; nucleus_core::util::lockdep::MAX_TRACKED_CPUS] =
     [const { AtomicBool::new(false) }; nucleus_core::util::lockdep::MAX_TRACKED_CPUS];
 
-const SCHEDULER_LOCK_TIMEOUT_NS: u64 = 100_000_000;
+
+// This remains a dead-owner fail-stop, not a scheduling latency budget. A KVM
+// vCPU can be descheduled by the host while it owns an otherwise bounded raw
+// scheduler transaction; treating a 100 ms host pause as a kernel deadlock
+// made healthy 8-vCPU boots panic. Match the existing TLB/reclaim fail-stop
+// horizon while lock wait/hold profiles continue to reject this global path
+// as a scalability architecture.
+const SCHEDULER_LOCK_TIMEOUT_NS: u64 = 2_000_000_000;
+// A dead-owner deadline must not be sampled on every spin iteration. The
+// global monotonic source is an MMIO counter until the multiprocessor TSC
+// admission promotes it, and under a virtualized product topology each such
+// read is an exit serialized against the other CPUs. Polling it per iteration
+// made every waiter actively slow the owner it was waiting for. The horizon is
+// two seconds, so a fixed spin batch costs no useful detection resolution.
+const SCHEDULER_LOCK_DEADLINE_POLL_SPINS: u32 = 1_024;
 const NO_SCHEDULER_OWNER: usize = usize::MAX;
 // ORDERING: the owner CPU is the release/acquire publication word for the
 // remaining diagnostic fields. These atomics never grant scheduler authority.
@@ -106,6 +129,11 @@ impl Drop for SchedulerAccessGuard {
             .guard
             .as_mut()
             .expect("scheduler guard missing during release");
+        let selected_task = scheduler_current_task_scratch_for_cpu(self.logical_index);
+        assert!(
+            selected_task < MAX_SCHEDULER_TASKS,
+            "scheduler invariant: CPU-local dispatch scratch slot exceeds capacity"
+        );
         guard.record_runtime_profile_lock_hold(
             crate::arch::clock::monotonic_nanos().saturating_sub(self.acquired_at_ns),
         );
@@ -115,7 +143,7 @@ impl Drop for SchedulerAccessGuard {
             "scheduler invariant: CPU returned a task before current-slot admission"
         );
         assert!(
-            !slot_has_remote_owner(self.logical_index, guard.current_task),
+            !slot_has_remote_owner(self.logical_index, selected_task),
             "scheduler invariant: one task selected concurrently on two CPUs"
         );
         // ORDERING: Acquire rejects a second scheduler return before assembly
@@ -124,17 +152,19 @@ impl Drop for SchedulerAccessGuard {
             !TRANSITION_ACTIVE[self.logical_index].load(Ordering::Acquire),
             "scheduler invariant: CPU entered scheduler before prior stack handoff committed"
         );
-        if guard.current_task != self.original_task {
+        if selected_task != self.original_task {
             // ORDERING: Publish the outgoing slot before activating the
             // transition. Remote lifetime and selection paths must retain its
             // stack until assembly has installed the incoming `rsp`.
             TRANSITION_FROM_SLOTS[self.logical_index].store(self.original_task, Ordering::Release);
+            // ORDERING: Release activates the transition only after the
+            // outgoing slot is published.
             TRANSITION_ACTIVE[self.logical_index].store(true, Ordering::Release);
         }
         // ORDERING: Release publishes the exact task slot selected for this
         // CPU. A changed handoff already published the outgoing transition,
         // so both stacks remain owned until the assembly commit callback.
-        CURRENT_TASK_SLOTS[self.logical_index].store(guard.current_task, Ordering::Release);
+        CURRENT_TASK_SLOTS[self.logical_index].store(selected_task, Ordering::Release);
         // ORDERING: Release publishes the selected slot's scheduler-derived
         // Idle class after the slot itself. Periodic interrupt leaves may use
         // this one bit only to retain an idle continuation when every local
@@ -193,30 +223,15 @@ pub(super) unsafe fn scheduler_mut() -> SchedulerAccessGuard {
         "scheduler invariant: AP entered before current-task admission"
     );
     let started_at = crate::arch::clock::monotonic_nanos();
-    let mut guard = loop {
-        let irq_context = nucleus_core::util::lockdep::irq_context_depth() != 0;
-        if irq_context {
-            assert!(
-                !nucleus_core::util::lockdep::preemption_disabled(),
-                "scheduler invariant: IRQ attempted dispatch while raw lock held depth={} class={:?}",
-                nucleus_core::util::lockdep::preemption_depth(),
-                nucleus_core::util::lockdep::current_lock_class()
-            );
-        }
-        let acquired = if irq_context {
-            SCHEDULER.try_lock_preemption_gated_irq()
-        } else {
-            SCHEDULER.try_lock()
-        };
-        if let Some(guard) = acquired {
-            break guard;
-        }
-        // Concurrent per-CPU clockevents legitimately serialize here. The
-        // generic raw-spin diagnostic count is too short under a descheduled
-        // vCPU, so enforce the scheduler's wall-clock failure bound instead.
-        if crate::arch::clock::monotonic_nanos().saturating_sub(started_at)
-            >= SCHEDULER_LOCK_TIMEOUT_NS
-        {
+    let mut deadline_poll_spins: u32 = 0;
+    let mut guard = SCHEDULER
+        .lock_scheduler_bounded(|| {
+            deadline_poll_spins = deadline_poll_spins.wrapping_add(1);
+            deadline_poll_spins.is_multiple_of(SCHEDULER_LOCK_DEADLINE_POLL_SPINS)
+                && crate::arch::clock::monotonic_nanos().saturating_sub(started_at)
+                    >= SCHEDULER_LOCK_TIMEOUT_NS
+        })
+        .unwrap_or_else(|| {
             let now = crate::arch::clock::monotonic_nanos();
             // ORDERING: Acquire of the owner CPU observes the diagnostic
             // fields published before that CPU entered the protected body.
@@ -246,9 +261,7 @@ pub(super) unsafe fn scheduler_mut() -> SchedulerAccessGuard {
                 owner_line,
                 now.saturating_sub(owner_acquired_ns),
             );
-        }
-        spin_loop();
-    };
+        });
     let acquired_at_ns = crate::arch::clock::monotonic_nanos();
     guard.record_runtime_profile_lock_wait(acquired_at_ns.saturating_sub(started_at));
     // ORDERING: Acquire restores this CPU's last published current-task slot
@@ -260,7 +273,7 @@ pub(super) unsafe fn scheduler_mut() -> SchedulerAccessGuard {
         !TRANSITION_ACTIVE[logical_index].load(Ordering::Acquire),
         "scheduler invariant: Rust reentry preceded assembly stack-handoff commit"
     );
-    guard.current_task = original_task;
+    set_scheduler_current_task_scratch_for_cpu(logical_index, original_task);
     // ORDERING: prepare every relaxed diagnostic field before release
     // publishing the owner CPU below.
     SCHEDULER_OWNER_SLOT.store(original_task, Ordering::Relaxed);
@@ -315,12 +328,60 @@ pub(super) fn publish_cpu_current_task(logical_index: usize, slot: usize) {
     // ORDERING: Release makes the initialized idle context visible before the
     // AP is allowed to enter scheduler code.
     CURRENT_TASK_SLOTS[logical_index].store(slot, Ordering::Release);
+    // The private scratch starts from the same initial context, but it is not
+    // an execution-owner publication.  The Release store above remains the
+    // only initial current-task authority observed by another CPU.
+    set_scheduler_current_task_scratch_for_cpu(logical_index, slot);
     // ORDERING: this Release follows the exact slot publication above. AP
     // initial publications are private idle tasks; BSP slot zero is still
     // bootstrap work here and becomes Idle only after `mark_root_idle`.
     CURRENT_TASK_IDLE[logical_index].store(logical_index != 0, Ordering::Release);
     // ORDERING: Release publishes ownership only after the exact task slot.
     CURRENT_TASK_ACTIVE[logical_index].store(true, Ordering::Release);
+}
+
+/// Returns the caller CPU's private scheduler-turn scratch slot.
+///
+/// This word is protected by the caller's scheduler dispatch exclusion and is
+/// deliberately not a substitute for `CURRENT_TASK_SLOTS`: only the latter,
+/// together with `TRANSITION_*`, grants remote execution/lifetime authority.
+#[inline]
+pub(super) fn scheduler_current_task_scratch() -> usize {
+    let logical_index = nucleus_core::util::lockdep::current_cpu_index();
+    scheduler_current_task_scratch_for_cpu(logical_index)
+}
+
+/// Replaces the caller CPU's private scheduler-turn scratch slot.
+///
+/// Callers hold the exact CPU's scheduler dispatch exclusion.  Publication to
+/// remote observers remains deferred to `SchedulerAccessGuard::drop`, after
+/// the outgoing stack-transition owner is installed.
+#[inline]
+pub(super) fn set_scheduler_current_task_scratch(slot: usize) {
+    let logical_index = nucleus_core::util::lockdep::current_cpu_index();
+    set_scheduler_current_task_scratch_for_cpu(logical_index, slot);
+}
+
+#[inline]
+fn scheduler_current_task_scratch_for_cpu(logical_index: usize) -> usize {
+    assert!(
+        logical_index < SCHEDULER_CURRENT_TASK_SCRATCH.len(),
+        "scheduler invariant: CPU-local dispatch scratch CPU exceeds capacity"
+    );
+    // ORDERING: this is same-CPU scratch behind the raw scheduler exclusion;
+    // a remote reader must instead acquire the release-published owner state.
+    SCHEDULER_CURRENT_TASK_SCRATCH[logical_index].load(Ordering::Relaxed)
+}
+
+#[inline]
+fn set_scheduler_current_task_scratch_for_cpu(logical_index: usize, slot: usize) {
+    assert!(
+        logical_index < SCHEDULER_CURRENT_TASK_SCRATCH.len() && slot < MAX_SCHEDULER_TASKS,
+        "scheduler invariant: invalid CPU-local dispatch scratch publication"
+    );
+    // ORDERING: see `scheduler_current_task_scratch_for_cpu`; this local
+    // working value is never a cross-CPU ownership publication.
+    SCHEDULER_CURRENT_TASK_SCRATCH[logical_index].store(slot, Ordering::Relaxed);
 }
 
 pub(super) fn current_cpu_task_is_idle(logical_index: usize) -> bool {
@@ -361,14 +422,7 @@ pub(super) extern "C" fn commit_context_switch() {
 }
 
 pub(super) fn task_slot_is_running(slot: usize) -> bool {
-    task_execution_owner_in(
-        &CURRENT_TASK_SLOTS,
-        &CURRENT_TASK_ACTIVE,
-        &TRANSITION_FROM_SLOTS,
-        &TRANSITION_ACTIVE,
-        slot,
-    )
-    .is_some()
+    task_execution_owner(slot).is_some()
 }
 
 pub(super) fn task_running_cpu(slot: usize) -> Option<usize> {

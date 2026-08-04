@@ -8,8 +8,10 @@
 //!   arm/block/wake, and retired/reap-pending states with one exact epoch.
 //!   A running task has consumed its published continuation; only a trapped or
 //!   blocked task owns a frame that may be validated for dispatch.
-//! - **Concurrency:** one tracked global scheduler lock serializes mutation
-//!   across CPUs while per-CPU current slots publish running ownership.
+//! - **Concurrency:** the lifecycle catalog currently serializes rare task
+//!   mutation while per-CPU current/transition slots publish execution
+//!   ownership.  A private CPU-local scratch slot carries an in-progress
+//!   dispatch turn; the catalog has no shared mutable current-task field.
 //! - **Failure:** Invalid published contexts quarantine and retire a user task;
 //!   raced wake/cancel refuses sleep; cleanup must acknowledge every
 //!   task-scoped registry before slot reuse.
@@ -28,6 +30,7 @@ mod context_validation;
 mod dispatch_policy;
 mod handoff_queue;
 mod handoffs;
+mod ipc_donation;
 mod linux_thread_state;
 mod locality;
 mod reclaim;
@@ -42,9 +45,6 @@ pub(in crate::multitask) fn local_dispatch_work_pending(cpu: usize) -> bool {
     runqueue::local_dispatch_work_pending(cpu)
 }
 
-pub(in crate::multitask) fn foreign_runnable_work_pending(cpu: usize) -> bool {
-    runqueue::foreign_runnable_work_pending(cpu)
-}
 mod smp;
 #[cfg(test)]
 mod synchronous_handoff_tests;
@@ -52,6 +52,7 @@ mod thread_slots;
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU8, Ordering};
 use core::{mem, ptr};
 
 use x86_64::PhysAddr;
@@ -73,7 +74,9 @@ use super::context::{SAVED_CONTEXT_BYTES, SavedContext};
 use super::process_table::{self, ProcessHandle};
 use super::{UserFaultDisposition, UserStackState, UserTaskBootstrap, initial_task_rflags};
 use context_validation::context_validation_reason_code;
-use dispatch_policy::CpuDispatchPolicy;
+use dispatch_policy::{CpuDispatchGuard, CpuDispatchLock, CpuDispatchPolicy};
+use runtime_profile::SchedulerPhase;
+use ipc_donation::{IpcDonationTarget, IpcPriorityDonation};
 use handoff_queue::SlotHandoffQueue;
 pub(super) use linux_thread_state::CurrentLinuxThreadBinding;
 use linux_thread_state::{LinuxThreadStateLock, empty_linux_thread_state_lock};
@@ -86,6 +89,9 @@ use reclaim::{RetiredSlotReclaim, RetirementSideEffect};
 // panic. Keep the scheduler allocation-free and explicitly bounded, but size
 // the product contract for service growth and application headroom.
 pub(super) const MAX_TASK: usize = 128;
+/// Sentinel for an unresolved donor-slot hint. `MAX_TASK` fits in `u8`, so the
+/// hint table stays one cache-friendly byte per donation entry.
+const NO_SLOT_HINT: u8 = u8::MAX;
 const _: () = assert!(kernel_ipc_runtime::api::MAX_ENDPOINT_WAKE_TASKS >= MAX_TASK);
 const ROOT_TASK_SLOT: usize = 0;
 const FIRST_DYNAMIC_TASK_SLOT: usize = 1;
@@ -169,6 +175,7 @@ const MAX_CONSECUTIVE_SYSTEM_DISPATCHES: u8 = 2;
 /// wakeup turn. Cap the burst so many sleepers cannot starve the critical lane.
 const MAX_CONSECUTIVE_LATENCY_HANDOFFS: u8 = 8;
 const MAX_CONSECUTIVE_SYNC_HANDOFFS: u8 = 8;
+const READY_VALIDATION_INTERVAL_TURNS: u8 = 32;
 /// An atomically published startup cohort receives one bounded first-turn
 /// prefix before the reply chain that resumes its loader/supervisor. This is
 /// capped by the activation ABI and never applies to ordinary single spawns.
@@ -286,44 +293,6 @@ struct TaskContext {
     windows_thread_state: Option<WindowsThreadRuntimeState>,
 }
 
-/// Immutable half of a recoverable user stack-growth transaction.
-///
-/// The scheduler publishes this plan under its raw owner, process state maps
-/// the pages after that owner is released, and the scheduler then validates
-/// the exact task/process/root tuple before committing metadata. Never acquire
-/// `ProcessStateLock` while constructing or committing this token.
-#[derive(Clone, Copy, Debug)]
-pub(super) struct UserStackGrowthPlan {
-    pub(super) slot: usize,
-    pub(super) task_id: u64,
-    pub(super) process_handle: ProcessHandle,
-    pub(super) address_space_root: u64,
-    pub(super) previous_stack: UserStackState,
-    pub(super) next_stack: UserStackState,
-    pub(super) growth_start: u64,
-    pub(super) growth_end: u64,
-    pub(super) page_count: usize,
-}
-
-/// A bounded priority-inheritance edge for one synchronous IPC reply
-/// capability.  The edge lasts only while that reply capability is live: the
-/// caller donates its effective scheduling class to the receiver, and the
-/// class therefore propagates through a nested synchronous call chain.
-///
-/// Keeping this in the scheduler rather than in the IPC object store avoids a
-/// dependency from `kernel-ipc-runtime` back into `kernel-ps`.  Its lifetime
-/// is still tied to the reply capability by the compat IPC boundary.
-#[derive(Clone, Copy)]
-struct IpcPriorityDonation {
-    reply: u64,
-    donor_task_id: u64,
-    /// Task-owned endpoints donate to their exact receiver. Process-owned
-    /// endpoints may not have a waiter at enqueue time, so their donation
-    /// covers the receiver process until a worker is known.
-    receiver_task_id: Option<u64>,
-    receiver_process_id: Option<u64>,
-}
-
 #[derive(Clone, Copy)]
 pub(super) struct TaskStart {
     pub(super) entry: fn(u64),
@@ -398,16 +367,31 @@ pub(super) struct Scheduler {
     /// profile. It is only a bounded fair-pick tie-break and grants no CPU
     /// ownership or affinity authority.
     task_last_cpu: [u8; MAX_TASK],
+    // Unit tests construct isolated scheduler instances without CPU-local
+    // boot state.  Production dispatch state lives in
+    // `cpu_local::SCHEDULER_CURRENT_TASK_SCRATCH`, never in this catalog.
+    #[cfg(test)]
     pub(super) current_task: usize,
     pending_reap: bool,
     /// Every hot-path policy value is owned by one logical CPU. The global
     /// scheduler object is currently only the lifecycle/catalog serializer;
     /// it must not create a second system-wide dispatch policy.
-    cpu_dispatch: [CpuDispatchPolicy; nucleus_core::util::lockdep::MAX_TRACKED_CPUS],
+    cpu_dispatch: [CpuDispatchLock; nucleus_core::util::lockdep::MAX_TRACKED_CPUS],
     /// At most one synchronous IPC wait can be active per runnable task, so
     /// `MAX_TASK` fixed entries cover every live donation without allocating
     /// from scheduler or IPC paths.
     ipc_priority_donations: [Option<IpcPriorityDonation>; MAX_TASK],
+    ipc_priority_donation_len: usize,
+    /// Self-validating donor-slot hints for the reply donation table.
+    ///
+    /// Class derivation resolves each donation's donor identity while scanning
+    /// every candidate on every pick pass, and the authoritative resolution is
+    /// an identity scan over all slots. That made selection quadratic in
+    /// runnable tasks and donation depth and was the dominant term of the
+    /// serialized dispatch critical section. Every hint is validated against
+    /// the exact live identity before use and repaired from the authoritative
+    /// scan on a miss, so a stale hint can never change a derived class.
+    donation_donor_slot_hints: [AtomicU8; MAX_TASK],
     /// Attribution remains fixed-size and is rendered only after the global
     /// scheduler owner is released; normal logging policy may discard it.
     runtime_profile_started_ticks: u64,
@@ -427,6 +411,13 @@ pub(super) struct Scheduler {
     runtime_profile_lock_hold_ns: u64,
     runtime_profile_lock_wait_max_ns: u64,
     runtime_profile_lock_hold_max_ns: u64,
+    /// Disjoint in-owner segment attribution. Total hold time alone cannot
+    /// separate a genuinely long critical section from a descheduled owner.
+    runtime_profile_phase_ns: [u64; runtime_profile::SCHEDULER_PHASE_COUNT],
+    /// Summed size of the local runnable candidate set across the window. The
+    /// pick passes are linear in this set, so attributing selection cost
+    /// requires knowing how many candidates each turn actually examined.
+    runtime_profile_runnable_samples: u64,
     /// True after the bootstrap root task has entered the permanent hlt loop.
     /// Before that, slot 0 still runs finalize work and remains schedulable.
     root_idle: bool,
@@ -460,11 +451,14 @@ impl Scheduler {
             process_affinity_masks: [UNRESTRICTED_CPU_MASK; MAX_TASK],
             affinity_migration_pending: [false; MAX_TASK],
             task_last_cpu: [NO_IDLE_CPU; MAX_TASK],
+            #[cfg(test)]
             current_task: 0,
             pending_reap: false,
-            cpu_dispatch: [const { CpuDispatchPolicy::new() };
+            cpu_dispatch: [const { CpuDispatchLock::new(CpuDispatchPolicy::new()) };
                 nucleus_core::util::lockdep::MAX_TRACKED_CPUS],
             ipc_priority_donations: [None; MAX_TASK],
+            ipc_priority_donation_len: 0,
+            donation_donor_slot_hints: [const { AtomicU8::new(NO_SLOT_HINT) }; MAX_TASK],
             runtime_profile_started_ticks: 0,
             runtime_profile_ns: [0; MAX_TASK],
             runtime_profile_dispatches: [0; MAX_TASK],
@@ -479,6 +473,8 @@ impl Scheduler {
             runtime_profile_lock_hold_ns: 0,
             runtime_profile_lock_wait_max_ns: 0,
             runtime_profile_lock_hold_max_ns: 0,
+            runtime_profile_phase_ns: [0; runtime_profile::SCHEDULER_PHASE_COUNT],
+            runtime_profile_runnable_samples: 0,
             root_idle: false,
             scheduler_tick_divisor: 0,
         }
@@ -494,14 +490,61 @@ impl Scheduler {
         cpu
     }
 
+    /// Returns this scheduler invocation's exact CPU-local current slot.
+    ///
+    /// Production code keeps this transient dispatch state beside the CPU,
+    /// not in the lifecycle catalog.  The public current/transition words in
+    /// `cpu_local` remain the only cross-CPU execution-owner publication.
     #[inline]
-    fn current_dispatch_policy(&self) -> &CpuDispatchPolicy {
-        &self.cpu_dispatch[Self::current_dispatch_cpu()]
+    fn current_task_slot(&self) -> usize {
+        #[cfg(test)]
+        {
+            self.current_task
+        }
+        #[cfg(not(test))]
+        {
+            super::cpu_local::scheduler_current_task_scratch()
+        }
+    }
+
+    /// Updates only this CPU's private dispatch scratch slot.  The enclosing
+    /// `SchedulerAccessGuard` publishes the selected slot after it installs
+    /// the outgoing stack-transition owner, so an early write cannot grant
+    /// remote ownership before the assembly RSP commit.
+    #[inline]
+    fn set_current_task_slot(&mut self, slot: usize) {
+        assert!(slot < MAX_TASK, "scheduler current slot exceeds capacity");
+        #[cfg(test)]
+        {
+            self.current_task = slot;
+        }
+        #[cfg(not(test))]
+        {
+            super::cpu_local::set_scheduler_current_task_scratch(slot);
+        }
+    }
+
+    /// Charges the elapsed segment to `phase` and rebases the marker.
+    ///
+    /// The scheduler owner already excludes every other CPU, so this is one
+    /// monotonic read plus a counter update. It exists because total hold time
+    /// cannot attribute a stall to a segment, and the release gate requires
+    /// that attribution rather than an assumption.
+    #[inline]
+    fn mark_phase(&mut self, phase: SchedulerPhase, marker: &mut u64) {
+        let now = crate::arch::clock::monotonic_nanos();
+        self.record_runtime_profile_phase(phase, now.saturating_sub(*marker));
+        *marker = now;
     }
 
     #[inline]
-    fn current_dispatch_policy_mut(&mut self) -> &mut CpuDispatchPolicy {
-        &mut self.cpu_dispatch[Self::current_dispatch_cpu()]
+    fn current_dispatch_policy(&self) -> CpuDispatchGuard<'_> {
+        self.cpu_dispatch[Self::current_dispatch_cpu()].lock()
+    }
+
+    #[inline]
+    fn current_dispatch_policy_mut(&self) -> CpuDispatchGuard<'_> {
+        self.cpu_dispatch[Self::current_dispatch_cpu()].lock()
     }
 
     fn slot_dispatch_cpu(&self, slot: usize) -> usize {
@@ -531,7 +574,8 @@ impl Scheduler {
     }
 
     fn remove_slot_from_dispatch_policies(&mut self, slot: usize) {
-        for policy in &mut self.cpu_dispatch {
+        for policy in &self.cpu_dispatch {
+            let mut policy = policy.lock();
             if policy.next_pick_hint == Some(slot) {
                 policy.next_pick_hint = None;
             }
@@ -575,7 +619,7 @@ impl Scheduler {
         if target_cpu == Self::current_dispatch_cpu() {
             self.apply_ipc_donation(slot);
         }
-        self.cpu_dispatch[target_cpu].next_pick_hint = Some(slot);
+        self.cpu_dispatch[target_cpu].lock().next_pick_hint = Some(slot);
     }
 
     pub(super) fn set_next_latency_pick_hint(&mut self, task_id: u64) -> bool {
@@ -589,7 +633,7 @@ impl Scheduler {
             return false;
         }
         let target_cpu = self.slot_dispatch_cpu(slot);
-        let policy = &self.cpu_dispatch[target_cpu];
+        let policy = self.cpu_dispatch[target_cpu].lock();
         if (0..policy.latency_pick_hint_len).any(|offset| {
             let index = (policy.latency_pick_hint_head + offset) % MAX_LATENCY_HANDOFF_HINTS;
             policy.latency_pick_hints[index] == Some(slot)
@@ -599,7 +643,8 @@ impl Scheduler {
         if policy.latency_pick_hint_len >= MAX_LATENCY_HANDOFF_HINTS {
             return false;
         }
-        let policy = &mut self.cpu_dispatch[target_cpu];
+        drop(policy);
+        let mut policy = self.cpu_dispatch[target_cpu].lock();
         let tail = (policy.latency_pick_hint_head + policy.latency_pick_hint_len)
             % MAX_LATENCY_HANDOFF_HINTS;
         policy.latency_pick_hints[tail] = Some(slot);
@@ -616,203 +661,17 @@ impl Scheduler {
     /// server boost on SMP and leaves a System caller behind unrelated User
     /// work until the server's next receive.
     pub(super) fn set_next_process_pick_hint(&mut self, process_id: u64) -> Option<u64> {
-        let slot = (0..MAX_TASK)
-            .filter(|slot| {
-                self.contexts[*slot].is_some_and(|context| {
-                    context.process_id == Some(process_id)
-                        && context.ready
-                        && self.handoff_slot_ready(*slot)
-                })
-            })
-            .min_by_key(|slot| {
-                self.contexts[*slot]
-                    .map(|context| (context.vruntime_ns, *slot))
-                    .unwrap_or((u64::MAX, *slot))
-            })?;
+        let slot = self.eligible_process_worker_slot(process_id)?;
         self.apply_ipc_donation(slot);
         let target_cpu = self.slot_dispatch_cpu(slot);
         self.cpu_dispatch[target_cpu]
+            .lock()
             .sync_pick_hints
             .enqueue(slot)
             .expect("scheduler synchronous process handoff queue overflow");
         #[cfg(not(test))]
         super::irq::request_target_reschedule(target_cpu);
         self.starts[slot].map(|start| start.id)
-    }
-
-    /// Makes `receiver_task_id` inherit the effective strict scheduling class
-    /// of `donor_task_id` until `reply` is completed or cancelled.  Repeating
-    /// this for a reply updates the receiver because a process-owned endpoint
-    /// may hand a queued request to a different worker than the one initially
-    /// woken by the sender.
-    pub(super) fn inherit_ipc_priority(
-        &mut self,
-        reply: u64,
-        donor_task_id: u64,
-        receiver_task_id: u64,
-    ) -> bool {
-        if reply == 0 || donor_task_id == receiver_task_id {
-            return false;
-        }
-        let Some(donor_slot) = self.find_task_slot(donor_task_id) else {
-            return false;
-        };
-        let Some(receiver_slot) = self.find_task_slot(receiver_task_id) else {
-            return false;
-        };
-        if self.retired[donor_slot] || self.retired[receiver_slot] {
-            return false;
-        }
-
-        self.upsert_ipc_priority_donation(reply, donor_task_id, Some(receiver_task_id), None)
-    }
-
-    /// Starts inheritance for every live worker of a process-owned endpoint.
-    /// This covers the enqueue-before-recv interval where no individual
-    /// receiver is sleeping in the endpoint waiter queue yet.
-    pub(super) fn inherit_ipc_priority_for_process(
-        &mut self,
-        reply: u64,
-        donor_task_id: u64,
-        receiver_process_id: u64,
-    ) -> bool {
-        if reply == 0 || receiver_process_id == 0 {
-            return false;
-        }
-        let Some(donor_slot) = self.find_task_slot(donor_task_id) else {
-            return false;
-        };
-        if self.retired[donor_slot]
-            || !self.contexts.iter().enumerate().any(|(slot, context)| {
-                !self.retired[slot]
-                    && context
-                        .is_some_and(|context| context.process_id == Some(receiver_process_id))
-            })
-        {
-            return false;
-        }
-
-        self.upsert_ipc_priority_donation(reply, donor_task_id, None, Some(receiver_process_id))
-    }
-
-    fn upsert_ipc_priority_donation(
-        &mut self,
-        reply: u64,
-        donor_task_id: u64,
-        receiver_task_id: Option<u64>,
-        receiver_process_id: Option<u64>,
-    ) -> bool {
-        if let Some(entry) = self
-            .ipc_priority_donations
-            .iter_mut()
-            .flatten()
-            .find(|entry| entry.reply == reply)
-        {
-            entry.donor_task_id = donor_task_id;
-            if receiver_task_id.is_some() {
-                entry.receiver_task_id = receiver_task_id;
-            }
-            if receiver_process_id.is_some() {
-                entry.receiver_process_id = receiver_process_id;
-            }
-            return true;
-        }
-        let Some(slot) = self
-            .ipc_priority_donations
-            .iter_mut()
-            .find(|entry| entry.is_none())
-        else {
-            // Do not turn a bounded accounting table into an availability
-            // failure on an ABI-visible IPC call.  The fixed bound covers the
-            // normal one-wait-per-task model; an exhausted table simply loses
-            // the latency boost for that call.
-            return false;
-        };
-        *slot = Some(IpcPriorityDonation {
-            reply,
-            donor_task_id,
-            receiver_task_id,
-            receiver_process_id,
-        });
-        true
-    }
-
-    /// Revokes the donation associated with a completed or cancelled reply
-    /// capability.  This is deliberately idempotent so reply/error/timeout
-    /// races cannot leave an inherited System class behind.
-    pub(super) fn release_ipc_priority(&mut self, reply: u64) -> bool {
-        let mut released = false;
-        for entry in &mut self.ipc_priority_donations {
-            if entry.is_some_and(|entry| entry.reply == reply) {
-                *entry = None;
-                released = true;
-            }
-        }
-        released
-    }
-
-    fn release_ipc_priorities_for_task(&mut self, task_id: u64) {
-        for entry in &mut self.ipc_priority_donations {
-            if entry.is_some_and(|entry| {
-                entry.donor_task_id == task_id || entry.receiver_task_id == Some(task_id)
-            }) {
-                *entry = None;
-            }
-        }
-    }
-
-    pub(super) fn release_ipc_priorities_for_process(&mut self, process_id: u64) {
-        for index in 0..MAX_TASK {
-            let Some(entry) = self.ipc_priority_donations[index] else {
-                continue;
-            };
-            if entry.receiver_process_id == Some(process_id)
-                || self.task_belongs_to_process(entry.donor_task_id, process_id)
-                || entry
-                    .receiver_task_id
-                    .is_some_and(|task_id| self.task_belongs_to_process(task_id, process_id))
-            {
-                self.ipc_priority_donations[index] = None;
-            }
-        }
-    }
-
-    fn task_belongs_to_process(&self, task_id: u64, process_id: u64) -> bool {
-        self.find_task_slot(task_id).is_some_and(|slot| {
-            self.contexts[slot].is_some_and(|context| context.process_id == Some(process_id))
-        })
-    }
-
-    fn apply_ipc_donation(&mut self, target_slot: usize) {
-        if target_slot == self.current_task || target_slot >= MAX_TASK {
-            return;
-        }
-        let Some(target) = self.contexts[target_slot] else {
-            return;
-        };
-        if !target.ready || !self.context_is_schedulable(target_slot, target) {
-            return;
-        }
-        let Some(current) = self.contexts[self.current_task] else {
-            return;
-        };
-        if !self.is_fair_candidate_slot(target_slot)
-            || !self.is_fair_candidate_slot(self.current_task)
-        {
-            return;
-        }
-        let caller_floor = current.vruntime_ns.saturating_sub(IPC_DONATION_BONUS_NS);
-        let class_floor = self
-            .slot_class(target_slot)
-            .map(|class| {
-                self.min_ready_vruntime_in_class(class)
-                    .saturating_sub(IPC_DONATION_BONUS_NS)
-            })
-            .unwrap_or(caller_floor);
-        let donated_floor = caller_floor.min(class_floor);
-        if let Some(target) = self.contexts[target_slot].as_mut() {
-            target.vruntime_ns = target.vruntime_ns.min(donated_floor);
-        }
     }
 
     fn pick_hint_candidate_slot(&self, hint: Option<usize>) -> Option<usize> {
@@ -836,20 +695,12 @@ impl Scheduler {
         let hint_class = self.slot_class(slot)?;
         if hint_class > SchedClass::System
             && self
-                .pick_min_vruntime_in_class(self.current_task, SchedClass::System)
+                .pick_min_vruntime_in_class(self.current_task_slot(), SchedClass::System)
                 .is_some()
         {
             return None;
         }
         Some(slot)
-    }
-
-    fn next_pick_hint_candidate_slot(&self) -> Option<usize> {
-        self.pick_hint_candidate_slot(self.current_dispatch_policy().next_pick_hint)
-    }
-
-    fn next_pick_hint_ready_slot(&self) -> Option<usize> {
-        self.pick_hint_ready_slot(self.current_dispatch_policy().next_pick_hint)
     }
 
     fn take_next_latency_pick_hint_ready_slot(&mut self) -> Option<usize> {
@@ -859,7 +710,7 @@ impl Scheduler {
         }
         while self.current_dispatch_policy().latency_pick_hint_len != 0 {
             let hint = {
-                let policy = self.current_dispatch_policy_mut();
+                let mut policy = self.current_dispatch_policy_mut();
                 let index = policy.latency_pick_hint_head;
                 let hint = policy.latency_pick_hints[index].take();
                 policy.latency_pick_hint_head = (index + 1) % MAX_LATENCY_HANDOFF_HINTS;
@@ -874,13 +725,12 @@ impl Scheduler {
     }
 
     fn take_next_pick_hint_ready_slot(&mut self) -> Option<usize> {
-        if self.current_dispatch_policy().next_pick_hint.is_some()
-            && self.next_pick_hint_candidate_slot().is_none()
-        {
+        let hint = self.current_dispatch_policy().next_pick_hint;
+        if hint.is_some() && self.pick_hint_candidate_slot(hint).is_none() {
             self.current_dispatch_policy_mut().next_pick_hint = None;
             return None;
         }
-        let slot = self.next_pick_hint_ready_slot()?;
+        let slot = self.pick_hint_ready_slot(hint)?;
         self.current_dispatch_policy_mut().next_pick_hint = None;
         Some(slot)
     }
@@ -934,11 +784,13 @@ impl Scheduler {
         self.runtime_profile_lock_hold_ns = 0;
         self.runtime_profile_lock_wait_max_ns = 0;
         self.runtime_profile_lock_hold_max_ns = 0;
-        self.current_task = ROOT_TASK_SLOT;
+        self.set_current_task_slot(ROOT_TASK_SLOT);
         self.pending_reap = false;
-        self.cpu_dispatch =
-            [const { CpuDispatchPolicy::new() }; nucleus_core::util::lockdep::MAX_TRACKED_CPUS];
+        for policy in &self.cpu_dispatch {
+            *policy.lock() = CpuDispatchPolicy::new();
+        }
         self.ipc_priority_donations = [None; MAX_TASK];
+        self.ipc_priority_donation_len = 0;
         self.root_idle = false;
         self.scheduler_tick_divisor = main_thread_pit_divisor;
         self.reset_stack_storage(ROOT_TASK_SLOT)
@@ -1212,18 +1064,20 @@ impl Scheduler {
         }
         visiting[slot] = true;
         let mut effective = base;
-        for donation in self.ipc_priority_donations.iter().flatten() {
-            let target_is_slot = donation
-                .receiver_task_id
-                .is_some_and(|task_id| self.starts[slot].is_some_and(|start| start.id == task_id))
-                || donation.receiver_process_id.is_some_and(|process_id| {
-                    self.contexts[slot]
-                        .is_some_and(|context| context.process_id == Some(process_id))
-                });
+        for (index, donation) in self.ipc_priority_donations[..self.ipc_priority_donation_len]
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| entry.as_ref().map(|entry| (index, entry)))
+        {
+            let target_is_slot = matches!(
+                donation.target,
+                IpcDonationTarget::BoundWorker(task_id)
+                    if self.starts[slot].is_some_and(|start| start.id == task_id)
+            );
             if !target_is_slot {
                 continue;
             }
-            let Some(donor_slot) = self.find_task_slot(donation.donor_task_id) else {
+            let Some(donor_slot) = self.resolve_donation_slot(index, donation.donor_task_id) else {
                 continue;
             };
             let Some(donor_class) = self.effective_slot_class(donor_slot, visiting) else {
@@ -1439,7 +1293,7 @@ impl Scheduler {
     /// donation. Synchronous service work regains only its caller-derived
     /// effective class and direct handoff until the exact reply terminates.
     pub(super) fn demote_current_user_task_to_user_class(&mut self) -> bool {
-        let Some(context) = self.contexts[self.current_task].as_mut() else {
+        let Some(context) = self.contexts[self.current_task_slot()].as_mut() else {
             return false;
         };
         if !context.user_mode {
@@ -1464,7 +1318,7 @@ impl Scheduler {
         if elapsed_ms < LONG_READY_WAIT_THRESHOLD_MS {
             return;
         }
-        // `self.current_task` is still the task that held the CPU while the
+        // The CPU-local current slot is still the task that held the CPU while the
         // picked slot sat ready. The scheduler raw owner must never enter the
         // synchronous debug transport, so publish an allocation-free per-CPU
         // journal record for later panic/probe inspection.
@@ -1528,7 +1382,7 @@ impl Scheduler {
     }
 
     fn describe_current_task(&self) -> (usize, u64, u64) {
-        let slot = self.current_task;
+        let slot = self.current_task_slot();
         let task = self
             .starts
             .get(slot)
@@ -1800,7 +1654,7 @@ impl Scheduler {
     }
 
     pub(super) fn current_saved_rsp(&self) -> usize {
-        self.contexts[self.current_task]
+        self.contexts[self.current_task_slot()]
             .map(|context| context.saved_rsp)
             .unwrap_or(0)
     }
@@ -1814,7 +1668,7 @@ impl Scheduler {
             return None;
         }
 
-        let context = self.contexts[self.current_task].as_mut()?;
+        let context = self.contexts[self.current_task_slot()].as_mut()?;
         let previous = (
             context.alternate_kernel_stack_base,
             context.alternate_kernel_stack_top,
@@ -1825,7 +1679,7 @@ impl Scheduler {
     }
 
     pub(super) fn restore_current_alternate_kernel_stack(&mut self, previous: (u64, u64)) {
-        if let Some(context) = self.contexts[self.current_task].as_mut() {
+        if let Some(context) = self.contexts[self.current_task_slot()].as_mut() {
             context.alternate_kernel_stack_base = previous.0;
             context.alternate_kernel_stack_top = previous.1;
         }
@@ -2458,7 +2312,7 @@ impl Scheduler {
             "scheduler invalid context source={} slot={} current={} reason={} saved_rsp={:#x} frame_end={:#x} stack=[{:#x},{:#x}) scheduler=[{:#x},{:#x}) context_ready={} context_blocked={} context_user={} context_stack=[{:#x},{:#x}) alt_stack=[{:#x},{:#x}) saved_rip={:#x} saved_cs={:#x} saved_frame_rsp={:#x} saved_ss={:#x} saved_rflags={:#x}",
             source,
             slot,
-            self.current_task,
+            self.current_task_slot(),
             reason,
             saved_rsp,
             frame_end,
@@ -2487,51 +2341,6 @@ impl Scheduler {
         );
     }
 
-    fn retire_invalid_ready_tasks(&mut self) {
-        let current_cpu = nucleus_core::util::lockdep::current_cpu_index();
-        for slot in runqueue::local_runnable_slots(current_cpu) {
-            if slot == ROOT_TASK_SLOT {
-                continue;
-            }
-            // Only a published runnable frame is immutable scheduler state.
-            // The current task's saved frame is the live kernel stack and may
-            // be overwritten until interrupt/syscall entry finishes saving
-            // it. Scanning that slot under load used to mistake a transient
-            // frame for corruption and retire a healthy process from the
-            // timer IRQ. Blocked, suspended, and already-retired slots are not
-            // dispatch candidates and are validated at their own transition.
-            // `self.current_task` is scratch for this guard's CPU only. A
-            // different CPU may still own this slot and mutate its live stack
-            // without holding the global scheduler lock.
-            if !published_frame_is_stable(
-                slot,
-                self.current_task,
-                super::task_slot_is_running(slot),
-            ) {
-                continue;
-            }
-            let Some(context) = self.contexts[slot] else {
-                continue;
-            };
-            if !should_validate_published_ready_frame(
-                slot,
-                self.current_task,
-                self.retired[slot],
-                self.start_suspended[slot],
-                context.ready,
-                context.blocked,
-            ) {
-                continue;
-            }
-            if let Err(reason) =
-                self.validate_saved_context(slot, context.user_mode, context.saved_rsp)
-            {
-                self.log_invalid_context(slot, context.saved_rsp, reason, "ready-scan");
-                self.retire_slot_due_to_invalid_context(slot, context.saved_rsp, reason);
-            }
-        }
-    }
-
     /// Enforce the scheduler's complete live-task state partition at the
     /// dispatch linearization point. After the outgoing task has published
     /// either Ready or Blocked, every other admitted task must be runnable,
@@ -2550,7 +2359,7 @@ impl Scheduler {
             }
             if live_task_state_is_partitioned(
                 slot,
-                self.current_task,
+                self.current_task_slot(),
                 self.retired[slot],
                 self.start_suspended[slot],
                 self.job_stopped[slot],
@@ -2565,7 +2374,7 @@ impl Scheduler {
                 slot,
                 task_id,
                 context.process_id,
-                self.current_task,
+                self.current_task_slot(),
                 context.ready,
                 context.blocked,
                 context.wake_armed
@@ -2587,9 +2396,10 @@ impl Scheduler {
         voluntary_yield: bool,
     ) -> SchedulerDispatch {
         let dispatch_cpu = nucleus_core::util::lockdep::current_cpu_index();
+        let mut phase_marker = crate::arch::clock::monotonic_nanos();
         #[cfg(not(test))]
         let current_cpu = dispatch_cpu;
-        let current_slot = self.current_task;
+        let current_slot = self.current_task_slot();
         let current_task_id = self.starts[current_slot]
             .map(|start| start.id)
             .expect("running task missing scheduler identity");
@@ -2627,6 +2437,8 @@ impl Scheduler {
             }
             self.retire_slot_due_to_invalid_context(current_slot, current_rsp, reason);
         }
+
+        self.mark_phase(SchedulerPhase::Account, &mut phase_marker);
 
         #[cfg(not(test))]
         {
@@ -2667,14 +2479,30 @@ impl Scheduler {
             }
         }
 
-        self.retire_invalid_ready_tasks();
+        self.mark_phase(SchedulerPhase::Balance, &mut phase_marker);
+
+        // The selected frame is validated on every dispatch below. Sweep all
+        // other immutable ready frames at a bounded diagnostic cadence rather
+        // than on every software handoff; the old O(local-runnable) sweep was
+        // a material part of the global-lock convoy under IPC-heavy SMP load.
+        if self.periodic_ready_validation_due() {
+            self.retire_invalid_ready_tasks();
+        }
         #[cfg(test)]
         self.assert_live_task_state_partition();
+        self.mark_phase(SchedulerPhase::Validate, &mut phase_marker);
 
         // Refresh cached min_vruntime: this is fed to newly-spawned tasks so
         // they do not preempt the rest of the system on creation alone.
         let local_min_vruntime = self.min_ready_vruntime();
         self.current_dispatch_policy_mut().last_min_vruntime_ns = local_min_vruntime;
+        #[cfg(not(test))]
+        {
+            self.runtime_profile_runnable_samples = self
+                .runtime_profile_runnable_samples
+                .saturating_add(runqueue::published_runnable_count(current_cpu) as u64);
+        }
+        self.mark_phase(SchedulerPhase::SelectVruntime, &mut phase_marker);
 
         // Pick order:
         //  1. The bounded first-turn prefix of one atomically activated
@@ -2789,6 +2617,8 @@ impl Scheduler {
                 },
             };
 
+        self.mark_phase(SchedulerPhase::SelectHandoff, &mut phase_marker);
+
         // Apply min-granularity guard: if the CFS pick differs from current
         // only by a few ns of vruntime advantage and current has not consumed
         // a slice of at least SCHED_MIN_GRANULARITY_NS, keep current to avoid
@@ -2799,6 +2629,7 @@ impl Scheduler {
         } else {
             self.maybe_keep_current(current_slot, next_idx, current_runtime_ns)
         };
+        self.mark_phase(SchedulerPhase::SelectPick, &mut phase_marker);
         if let Some(next) = self.contexts[next_idx] {
             match self.context_validation_error(next_idx, next, next.saved_rsp) {
                 None => {
@@ -2832,7 +2663,7 @@ impl Scheduler {
                     self.record_task_dispatch_cpu(next_idx, dispatch_cpu);
                     self.record_latency_handoff(latency_handoff_pick);
                     self.record_synchronous_handoff(sync_handoff_pick);
-                    self.current_task = next_idx;
+                    self.set_current_task_slot(next_idx);
                     let next_task_id = self.starts[next_idx]
                         .map(|start| start.id)
                         .expect("schedulable task missing lockdep owner identity");
@@ -2851,6 +2682,7 @@ impl Scheduler {
                             .checked_add(1)
                             .expect("task id exhausted lock owner token"),
                     );
+                    self.mark_phase(SchedulerPhase::Commit, &mut phase_marker);
                     return SchedulerDispatch::new(
                         next.saved_rsp,
                         self.scheduler_tick_divisor,
@@ -2896,6 +2728,7 @@ impl Scheduler {
         self.record_runtime_profile_dispatch(current_slot);
         self.record_runtime_profile_transition(current_slot, current_slot, dispatch_cpu);
         self.record_task_dispatch_cpu(current_slot, dispatch_cpu);
+        self.mark_phase(SchedulerPhase::Commit, &mut phase_marker);
         SchedulerDispatch::new(
             current.saved_rsp,
             self.scheduler_tick_divisor,
@@ -3030,44 +2863,46 @@ impl Scheduler {
     // ASSEMBLY: `task_entry_trampoline` is installed in a synthesized context.
     #[allow(dead_code)]
     pub(super) fn current_task_start(&self) -> Option<TaskStart> {
-        self.starts[self.current_task].filter(|_| {
-            self.contexts[self.current_task]
+        let slot = self.current_task_slot();
+        self.starts[slot].filter(|_| {
+            self.contexts[slot]
                 .map(|ctx| !ctx.user_mode)
                 .unwrap_or(false)
         })
     }
 
     pub(super) fn current_task_is_user_task(&self) -> bool {
-        self.contexts[self.current_task]
+        self.contexts[self.current_task_slot()]
             .map(|context| context.user_mode)
             .unwrap_or(false)
     }
 
     pub(super) fn current_task_is_idle_task(&self) -> bool {
-        self.slot_class(self.current_task) == Some(SchedClass::Idle)
+        self.slot_class(self.current_task_slot()) == Some(SchedClass::Idle)
     }
 
     pub(super) fn current_task_is_retired(&self) -> bool {
-        self.retired[self.current_task]
+        self.retired[self.current_task_slot()]
     }
 
     pub(super) fn current_task_is_blocked(&self) -> bool {
-        self.contexts[self.current_task]
+        self.contexts[self.current_task_slot()]
             .map(|context| context.blocked)
             .unwrap_or(false)
     }
 
     pub(super) fn current_process_handle(&self) -> Option<ProcessHandle> {
-        self.contexts[self.current_task]?.process_handle
+        self.contexts[self.current_task_slot()]?.process_handle
     }
 
     pub(super) fn prepare_current_task_execution(&mut self) {
+        let current_slot = self.current_task_slot();
         let current =
-            self.contexts[self.current_task].expect("scheduler selected a missing task context");
+            self.contexts[current_slot].expect("scheduler selected a missing task context");
         self.assert_current_task_affinity_allows_dispatch();
-        self.affinity_migration_pending[self.current_task] = false;
+        self.affinity_migration_pending[current_slot] = false;
         let return_to_user = self.context_returns_to_user(current);
-        self.validate_saved_context(self.current_task, current.user_mode, current.saved_rsp)
+        self.validate_saved_context(current_slot, current.user_mode, current.saved_rsp)
             .expect("scheduler selected an invalid task context");
         crate::memory::paging::load_address_space_phys(PhysAddr::new(current.address_space_root));
         if current.kernel_stack_top != 0 {
@@ -3081,7 +2916,7 @@ impl Scheduler {
         }
 
         let fs_base = self
-            .linux_thread_state(self.current_task)
+            .linux_thread_state(current_slot)
             .map(|state| state.fs_base)
             .unwrap_or(0);
         let user_gs_base = current
@@ -3113,8 +2948,9 @@ impl Scheduler {
     /// restored by every IRQ leaf because compiler-generated kernel code may
     /// use vector registers after the save boundary.
     pub(super) fn prepare_dispatched_task_execution(&mut self, dispatch: SchedulerDispatch) {
+        let mut phase_marker = crate::arch::clock::monotonic_nanos();
         assert_eq!(
-            self.current_task, dispatch.next_slot,
+            self.current_task_slot(), dispatch.next_slot,
             "scheduler invariant: architecture restore token does not name current task"
         );
         if !dispatch.requires_architectural_restore() {
@@ -3122,9 +2958,11 @@ impl Scheduler {
                 dispatch.previous_slot, dispatch.next_slot,
                 "scheduler invariant: same-task restore token changed slot identity"
             );
+            self.mark_phase(SchedulerPhase::ArchRestore, &mut phase_marker);
             return;
         }
         self.prepare_current_task_execution();
+        self.mark_phase(SchedulerPhase::ArchRestore, &mut phase_marker);
     }
 
     pub(super) fn reap_inactive_retired_slots(&mut self) -> Option<RetiredSlotReclaim> {
@@ -3133,7 +2971,7 @@ impl Scheduler {
         }
 
         self.finalize_deferred_retirements();
-        let active_root = self.contexts[self.current_task].map(|ctx| ctx.address_space_root);
+        let active_root = self.contexts[self.current_task_slot()].map(|ctx| ctx.address_space_root);
         let mut still_pending = false;
 
         for slot in FIRST_DYNAMIC_TASK_SLOT..MAX_TASK {
@@ -3201,19 +3039,25 @@ impl Scheduler {
     }
 
     pub(super) fn save_current_simd_state(&mut self) {
+        let mut phase_marker = crate::arch::clock::monotonic_nanos();
+        let slot = self.current_task_slot();
         unsafe {
-            save_state(&mut self.simd_states[self.current_task]);
+            save_state(&mut self.simd_states[slot]);
         }
+        self.mark_phase(SchedulerPhase::ArchRestore, &mut phase_marker);
     }
 
-    pub(super) fn restore_current_simd_state(&self) {
+    pub(super) fn restore_current_simd_state(&mut self) {
+        let mut phase_marker = crate::arch::clock::monotonic_nanos();
+        let slot = self.current_task_slot();
         unsafe {
-            restore_state(&self.simd_states[self.current_task]);
+            restore_state(&self.simd_states[slot]);
         }
+        self.mark_phase(SchedulerPhase::ArchRestore, &mut phase_marker);
     }
 
     pub(super) fn capture_current_syscall_user_simd(&mut self) -> Option<u64> {
-        let slot = self.current_task;
+        let slot = self.current_task_slot();
         let task_id = self.starts[slot]?.id;
         if self.syscall_user_simd_active[slot] {
             return None;
@@ -3226,7 +3070,7 @@ impl Scheduler {
     }
 
     pub(super) fn restore_current_syscall_user_simd(&mut self, task_id: u64) -> bool {
-        let slot = self.current_task;
+        let slot = self.current_task_slot();
         if self.starts[slot].is_none_or(|start| start.id != task_id)
             || !self.syscall_user_simd_active[slot]
         {
@@ -3242,7 +3086,7 @@ impl Scheduler {
     pub(super) fn current_user_process_binding(
         &self,
     ) -> Option<(u64, UserAbi, ProcessHandle, ConsoleSessionHandle)> {
-        let slot = self.current_task;
+        let slot = self.current_task_slot();
         let context = self.contexts[slot]?;
         if !context.user_mode {
             return None;
@@ -3260,7 +3104,7 @@ impl Scheduler {
     /// has installed any timeout recovery authority and therefore cannot spin
     /// behind unrelated same-process state mutation.
     pub(super) fn current_user_wait_binding(&self) -> Option<(u64, UserAbi, u64)> {
-        let slot = self.current_task;
+        let slot = self.current_task_slot();
         let context = self.contexts[slot]?;
         if !context.user_mode {
             return None;
@@ -3270,7 +3114,7 @@ impl Scheduler {
     }
 
     pub(super) fn current_linux_thread_state(&self) -> Option<LinuxThreadState> {
-        let slot = self.current_task;
+        let slot = self.current_task_slot();
         let context = self.contexts[slot]?;
         if !context.user_mode || context.user_abi != Some(UserAbi::Linux) {
             return None;
@@ -3279,7 +3123,7 @@ impl Scheduler {
     }
 
     pub(super) fn current_user_stack_state(&self) -> Option<UserStackState> {
-        let slot = self.current_task;
+        let slot = self.current_task_slot();
         let context = self.contexts[slot]?;
         if !context.user_mode {
             return None;
@@ -3288,16 +3132,17 @@ impl Scheduler {
     }
 
     pub(super) fn current_user_id(&self) -> Option<u64> {
-        let context = self.contexts[self.current_task]?;
+        let slot = self.current_task_slot();
+        let context = self.contexts[slot]?;
         if !context.user_mode {
             return None;
         }
 
-        self.starts[self.current_task].map(|start| start.id)
+        self.starts[slot].map(|start| start.id)
     }
 
     pub(super) fn current_user_log_ids(&self) -> Option<(u64, u64)> {
-        let slot = self.current_task;
+        let slot = self.current_task_slot();
         let context = self.contexts[slot]?;
         if !context.user_mode {
             return None;
@@ -3319,11 +3164,11 @@ impl Scheduler {
     }
 
     pub(super) fn current_task_id(&self) -> Option<u64> {
-        self.starts[self.current_task].map(|start| start.id)
+        self.starts[self.current_task_slot()].map(|start| start.id)
     }
 
     pub(super) fn current_console_session(&self) -> Option<ConsoleSessionHandle> {
-        self.contexts[self.current_task].map(|context| context.console_session)
+        self.contexts[self.current_task_slot()].map(|context| context.console_session)
     }
 
     pub(super) fn user_process_handles_snapshot(
@@ -3361,7 +3206,7 @@ impl Scheduler {
         new_root: u64,
         bootstrap: &mut UserTaskBootstrap,
     ) -> Option<ProcessHandle> {
-        let slot = self.current_task;
+        let slot = self.current_task_slot();
         let current_context = self.contexts[slot]?;
         if !current_context.user_mode {
             return None;
@@ -3487,7 +3332,7 @@ impl Scheduler {
             bootstrap.linux_thread_state,
         );
 
-        if slot == self.current_task {
+        if slot == self.current_task_slot() {
             crate::memory::paging::load_address_space_phys(PhysAddr::new(new_root));
             FsBase::write(VirtAddr::new(new_fs_base));
         }
@@ -3554,68 +3399,6 @@ impl Scheduler {
         (slots, count)
     }
 
-    #[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
-    pub(super) fn prepare_current_user_stack_growth_on_fault(
-        &self,
-        vector: u8,
-        error_code: Option<u64>,
-        cr2: u64,
-        rsp: u64,
-    ) -> Option<UserStackGrowthPlan> {
-        if vector != PAGE_FAULT_VECTOR || error_code.unwrap_or(0) & 0x1 != 0 {
-            return None;
-        }
-
-        let slot = self.current_task;
-        let context = self.contexts[slot]?;
-        if !context.user_mode || self.retired[slot] {
-            return None;
-        }
-        let mut stack_state = context.user_stack?;
-        let previous_stack = stack_state;
-        if !stack_state.contains_stack_pointer(rsp) || !stack_state.contains_reserved_address(cr2) {
-            return None;
-        }
-
-        let (growth_start, growth_end, page_count) = stack_state.grow_to_include_fault(cr2)?;
-        Some(UserStackGrowthPlan {
-            slot,
-            task_id: self.starts[slot]?.id,
-            process_handle: context.process_handle?,
-            address_space_root: context.address_space_root,
-            previous_stack,
-            next_stack: stack_state,
-            growth_start,
-            growth_end,
-            page_count,
-        })
-    }
-
-    pub(super) fn commit_current_user_stack_growth(&mut self, plan: UserStackGrowthPlan) -> bool {
-        if self.current_task != plan.slot
-            || self.retired[plan.slot]
-            || self.deferred_retire_reasons[plan.slot].is_some()
-            || self.retirement_cleanup[plan.slot].is_some()
-            || self.retirement_side_effects[plan.slot].is_some()
-            || self.retire_reasons[plan.slot].is_some()
-            || self.starts[plan.slot].map(|start| start.id) != Some(plan.task_id)
-        {
-            return false;
-        }
-        let Some(context) = self.contexts[plan.slot].as_mut() else {
-            return false;
-        };
-        if !context.user_mode
-            || context.process_handle != Some(plan.process_handle)
-            || context.address_space_root != plan.address_space_root
-            || context.user_stack != Some(plan.previous_stack)
-        {
-            return false;
-        }
-        context.user_stack = Some(plan.next_stack);
-        true
-    }
-
     pub(super) fn retire_current_user_task_due_to_fault(
         &mut self,
         vector: u8,
@@ -3624,7 +3407,7 @@ impl Scheduler {
         rip: u64,
         _rsp: u64,
     ) -> UserFaultDisposition {
-        let slot = self.current_task;
+        let slot = self.current_task_slot();
         let Some(context) = self.contexts[slot] else {
             return UserFaultDisposition::Unhandled;
         };
@@ -3725,7 +3508,7 @@ impl Scheduler {
     /// commit returns `false` and the caller stays runnable instead of
     /// sleeping with a lost wakeup.
     pub(super) fn arm_block_current_task(&mut self) -> bool {
-        let slot = self.current_task;
+        let slot = self.current_task_slot();
         if slot == ROOT_TASK_SLOT || self.retired[slot] || self.start_suspended[slot] {
             return false;
         }
@@ -3749,7 +3532,7 @@ impl Scheduler {
     /// condition and found work available. The task is still executing, so this
     /// must not mark it blocked.
     pub(super) fn cancel_block_current_task(&mut self) -> bool {
-        let slot = self.current_task;
+        let slot = self.current_task_slot();
         if slot == ROOT_TASK_SLOT || self.retired[slot] || self.start_suspended[slot] {
             return false;
         }
@@ -3770,7 +3553,7 @@ impl Scheduler {
     /// `wake_task`) and we should re-check the condition without sleeping,
     /// `None` on invalid context.
     pub(super) fn commit_block_current_task(&mut self) -> Option<bool> {
-        let slot = self.current_task;
+        let slot = self.current_task_slot();
         if slot == ROOT_TASK_SLOT || self.retired[slot] || self.start_suspended[slot] {
             return None;
         }
@@ -3832,7 +3615,7 @@ impl Scheduler {
                 ),
                 None => return false,
             };
-        let execution_owner = if slot == self.current_task {
+        let execution_owner = if slot == self.current_task_slot() {
             // Unit schedulers do not publish CPU-local ownership, and at
             // runtime this is the scheduler's exact current task.
             Some(super::cpu_local::TaskExecutionOwner::Current(
@@ -3973,15 +3756,16 @@ impl Scheduler {
         // An ordinary syscall return clears it and relies on the next PIT,
         // avoiding a nested voluntary-yield frame while keeping wake latency
         // bounded by one scheduler tick.
-        if waker_ready && slot != self.current_task {
-            let current_class = self.slot_class(self.current_task);
+        let current_slot = self.current_task_slot();
+        if waker_ready && slot != current_slot {
+            let current_class = self.slot_class(current_slot);
             let should_preempt = match (woken_class, current_class) {
                 // Cross-class: a higher-priority band has work, preempt.
                 (Some(wc), Some(cc)) if wc < cc => true,
                 // Same class: only preempt if the wake brings the waker
                 // distinctly ahead in vruntime — the CFS wake-preempt rule.
                 (Some(wc), Some(cc)) if wc == cc => {
-                    let current_v = self.contexts[self.current_task]
+                    let current_v = self.contexts[current_slot]
                         .map(|ctx| ctx.vruntime_ns)
                         .unwrap_or(0);
                     current_v.saturating_sub(waker_vruntime) >= SCHED_MIN_GRANULARITY_NS
@@ -4003,7 +3787,7 @@ impl Scheduler {
 
     pub(super) fn exit_current_task(&mut self) {
         crate::debug::trace_loc!();
-        let slot = self.current_task;
+        let slot = self.current_task_slot();
         if slot == ROOT_TASK_SLOT {
             panic!("scheduler root kernel task cannot exit");
         }
@@ -4022,7 +3806,7 @@ impl Scheduler {
     }
 
     pub(super) fn exit_current_process(&mut self) {
-        let current_slot = self.current_task;
+        let current_slot = self.current_task_slot();
         let Some(process_handle) =
             self.contexts[current_slot].and_then(|context| context.process_handle)
         else {
@@ -4098,6 +3882,32 @@ impl Scheduler {
         None
     }
 
+    /// Resolves donation entry `index`'s task identity to its live slot.
+    ///
+    /// The hint is only an accelerator: it is accepted solely when the named
+    /// slot still carries that exact live identity, and any miss falls back to
+    /// the authoritative scan and repairs the hint.
+    fn resolve_donation_slot(&self, index: usize, task_id: u64) -> Option<usize> {
+        // ORDERING: Relaxed is exact. The hint is an accelerator validated
+        // against live identity below, never ownership or publication authority,
+        // and every access already holds the scheduler owner.
+        let hint = usize::from(self.donation_donor_slot_hints[index].load(Ordering::Relaxed));
+        if hint < MAX_TASK
+            && !self.retired[hint]
+            && self.contexts[hint].is_some()
+            && self.starts[hint].is_some_and(|start| start.id == task_id)
+        {
+            return Some(hint);
+        }
+        let slot = self.find_task_slot(task_id)?;
+        // ORDERING: see the hint load above; repair is equally non-authoritative.
+        self.donation_donor_slot_hints[index].store(
+            u8::try_from(slot).expect("scheduler task slot exceeds donation hint capacity"),
+            Ordering::Relaxed,
+        );
+        Some(slot)
+    }
+
     fn find_task_slot(&self, task_id: u64) -> Option<usize> {
         for slot in 0..MAX_TASK {
             if self.retired[slot] || self.contexts[slot].is_none() {
@@ -4168,9 +3978,9 @@ mod tests {
     use alloc::boxed::Box;
 
     use super::{
-        ConsoleSessionHandle, MAX_CONSECUTIVE_SYSTEM_DISPATCHES, MAX_TASK, MIN_LOAD_WEIGHT,
-        NICE_0_LOAD, SCHED_CPU_LOCALITY_LAG_NS, SYSTEM_CLASS_WEIGHT_FLAG, SchedClass, Scheduler,
-        SchedulerDispatch, TaskContext, TaskStart, align_kernel_stack_top,
+        ConsoleSessionHandle, IpcDonationTarget, MAX_CONSECUTIVE_SYSTEM_DISPATCHES, MAX_TASK,
+        MIN_LOAD_WEIGHT, NICE_0_LOAD, SCHED_CPU_LOCALITY_LAG_NS, SYSTEM_CLASS_WEIGHT_FLAG,
+        SchedClass, Scheduler, SchedulerDispatch, TaskContext, TaskStart, align_kernel_stack_top,
     };
     use crate::memory::paging::ProcessAddressSpace;
     use crate::multitask::{UserTaskBootstrap, noop_task_entry, process_table};
@@ -4755,14 +4565,46 @@ mod tests {
         assert!(scheduler.release_ipc_priority(11));
         assert_eq!(scheduler.slot_class(3), Some(SchedClass::User));
 
-        // A process-owned endpoint can have no receiver waiter at enqueue
-        // time. Its live reply still promotes every runnable worker in the
-        // owner process until the reply terminally releases the donation.
-        assert!(scheduler.inherit_ipc_priority_for_process(12, 601, 62));
+        // A process-owned endpoint without a sleeping receiver must select an
+        // exact eligible worker before installing a System-class donation.
+        assert!(scheduler.reserve_ipc_priority(601));
+        let selected = scheduler
+            .bind_ipc_priority_to_process_worker(12, 601, 62)
+            .expect("eligible process worker");
+        assert_eq!(selected, 602);
         assert_eq!(scheduler.slot_class(2), Some(SchedClass::System));
-        assert_eq!(scheduler.set_next_process_pick_hint(62), Some(602));
         assert_eq!(scheduler.current_dispatch_policy().sync_pick_hints.len(), 1);
         assert!(scheduler.release_ipc_priority(12));
+        assert_eq!(scheduler.slot_class(2), Some(SchedClass::User));
+
+        // If the server is executing between receive calls, the reservation
+        // follows the reply until that exact worker dequeues the request.
+        scheduler.contexts[2].as_mut().unwrap().ready = false;
+        assert!(scheduler.reserve_ipc_priority(601));
+        assert!(
+            scheduler
+                .bind_ipc_priority_to_process_worker(13, 601, 62)
+                .is_none()
+        );
+        assert!(scheduler.attach_reserved_ipc_priority(13, 601));
+        assert!(
+            scheduler
+                .ipc_priority_donations
+                .iter()
+                .flatten()
+                .any(|entry| {
+                    entry.reply == 13 && matches!(entry.target, IpcDonationTarget::AwaitingReceiver)
+                })
+        );
+        assert_eq!(scheduler.slot_class(2), Some(SchedClass::User));
+        assert!(scheduler.release_ipc_priority(13));
+        assert_eq!(scheduler.slot_class(2), Some(SchedClass::User));
+
+        assert!(scheduler.reserve_ipc_priority(601));
+        assert!(scheduler.attach_reserved_ipc_priority(14, 601));
+        assert!(scheduler.inherit_ipc_priority(14, 601, 602));
+        assert_eq!(scheduler.slot_class(2), Some(SchedClass::System));
+        assert!(scheduler.release_ipc_priority(14));
         assert_eq!(scheduler.slot_class(2), Some(SchedClass::User));
     }
 
@@ -5385,17 +5227,20 @@ mod tests {
         let mut scheduler = boxed_scheduler();
         let user = test_process(904);
         scheduler.contexts[1] = Some(test_user_context(user));
-        scheduler.cpu_dispatch[1].system_dispatch_streak = MAX_CONSECUTIVE_SYSTEM_DISPATCHES;
-        scheduler.cpu_dispatch[1].next_pick_hint = Some(7);
+        {
+            let mut policy = scheduler.cpu_dispatch[1].lock();
+            policy.system_dispatch_streak = MAX_CONSECUTIVE_SYSTEM_DISPATCHES;
+            policy.next_pick_hint = Some(7);
+        }
 
         scheduler.record_dispatch_class(1);
         scheduler.current_dispatch_policy_mut().next_pick_hint = None;
 
-        assert_eq!(scheduler.cpu_dispatch[0].system_dispatch_streak, 0);
+        assert_eq!(scheduler.cpu_dispatch[0].lock().system_dispatch_streak, 0);
         assert_eq!(
-            scheduler.cpu_dispatch[1].system_dispatch_streak,
+            scheduler.cpu_dispatch[1].lock().system_dispatch_streak,
             MAX_CONSECUTIVE_SYSTEM_DISPATCHES
         );
-        assert_eq!(scheduler.cpu_dispatch[1].next_pick_hint, Some(7));
+        assert_eq!(scheduler.cpu_dispatch[1].lock().next_pick_hint, Some(7));
     }
 }

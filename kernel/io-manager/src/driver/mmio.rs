@@ -210,23 +210,26 @@ fn apply_direct_map_cache_mode(
         });
     }
 
-    for (applied, page) in new_pages.iter().enumerate() {
-        if !crate::memory::paging::update_direct_map_range_flags(
-            page.phys_page_base,
-            PAGE_4KIB as usize,
-            desired_flags,
-            DIRECT_MAP_CACHE_FLAG_MASK,
-        ) {
-            for restored in &new_pages[..applied] {
-                let _ = crate::memory::paging::update_direct_map_range_flags(
-                    restored.phys_page_base,
-                    PAGE_4KIB as usize,
-                    restored.original_cache_flags,
-                    DIRECT_MAP_CACHE_FLAG_MASK,
-                );
-            }
-            return false;
-        }
+    // The paging layer already provides one prepared, globally serialized
+    // range transaction and can retain huge leaves for complete 2 MiB spans.
+    // Calling it once per 4 KiB page split the same aperture repeatedly and
+    // performed two local invalidations for every page: a 48 MiB GPU atlas
+    // therefore issued 24,576 INVLPG operations during UI bootstrap. Existing
+    // retained pages were validated to use this exact cache mode, so applying
+    // the desired flags idempotently across the complete requested range is
+    // both the rollback-safe and the bounded operation.
+    let range_size = page_count.checked_mul(PAGE_4KIB as usize);
+    if !new_pages.is_empty()
+        && range_size.is_none_or(|range_size| {
+            !crate::memory::paging::update_direct_map_range_flags(
+                page_base,
+                range_size,
+                desired_flags,
+                DIRECT_MAP_CACHE_FLAG_MASK,
+            )
+        })
+    {
+        return false;
     }
 
     for index in retained_indices {

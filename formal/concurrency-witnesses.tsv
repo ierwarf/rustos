@@ -9,12 +9,12 @@ ipc_generation_reuse_never_aliases_stale_handle	kernel/ipc-runtime/src/ipc/slab.
 ipc_lock_class_graph_rejects_inverse_order	kernel/nucleus-core/src/util/lockdep.rs	before_acquire	observed-class-edge-cannot-close-a-cycle
 ipc_priority_lane_is_kernel_derived_and_starvation_bounded	kernel/ipc-runtime/src/ipc/endpoint_priority.rs	next_pending	kernel-derived-class-two-lane-fifo-and-two-system-one-ordinary-bound
 ipc_retirement_accepts_exact_global_capacity	kernel/ipc-runtime/src/ipc/mod.rs	cancel_endpoint_calls_for_task	exact-capacity-drain-terminates-without-false-overflow
-irq_safe_lock_class_never_depends_on_irq_unsafe_class	kernel/nucleus-core/src/util/lockdep.rs	record_irq_usage	irq-context-and-interrupt-enabled-use-cannot-share-a-class-or-safe-to-unsafe-path
+irq_safe_lock_class_never_depends_on_irq_unsafe_class	kernel/nucleus-core/src/util/lockdep/dependency_graph.rs	record_irq_usage	irq-context-and-interrupt-enabled-use-cannot-share-a-class-or-safe-to-unsafe-path
 shared_region_quota_survives_deferred_reclaim	kernel/ipc-runtime/src/ipc/mod.rs	service_deferred_shared_region_reclaims	owner-object-and-byte-charge-returns-only-after-backing-reclaim
 sigchld_snapshot_cannot_clear_future_cause	kernel/compat/src/user/syscall/linux/support.rs	signal_selection_is_current	selected-cause-subset-is-revalidated-before-removal
 sleepable_lock_class_cannot_nest_with_raw_spin	kernel/nucleus-core/src/util/lockdep.rs	record_sleepable_acquire	task-owned-wait-class-and-raw-spin-family-never-cross-nest
 scheduler_callback_runs_after_hook_registry_read_guard_is_released	kernel/hal/src/hooks.rs	commit_block_current_task_and_yield	hook-registry-snapshot-is-released-before-the-atomic-block-reschedule-callback
-reschedule_request_is_never_lost_across_concurrent_consume	kernel/ps/src/multitask/irq.rs	arm_remote_reschedule	coalesced-0-to-1-request-is-either-pending-or-exactly-consumed
+reschedule_request_is_never_lost_across_concurrent_consume	kernel/ps/src/multitask/reschedule_observation.rs	publish_request	packed-pending-sequence-cas-leaves-each-publication-pending-or-exactly-claimed
 tlb_mailbox_and_ack_publish_the_exact_generation	kernel/hal/src/arch/tlb_shootdown.rs	finish_shootdown	release-request-publishes-mailbox-and-release-ack-publishes-flush-before-reclaim
 recoverable_stack_growth_never_nests_scheduler_and_process_locks	kernel/ps/src/multitask/current.rs	retire_current_user_task_due_to_fault	plan-apply-commit-separates-raw-scheduler-and-process-state-lock-domains
 exec_installed_root_retains_generation_bound_owner	kernel/ps/src/multitask/process_table.rs	finalize_exec_state	authorized-reservation-survives-late-exit-through-mandatory-owner-transfer

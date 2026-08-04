@@ -447,7 +447,11 @@ pub const WAITSET_PROVIDER_NETD: u16 = 2;
 pub const WAITSET_PROVIDER_INPUTD: u16 = 3;
 pub const WAITSET_PROVIDER_SESSIOND: u16 = 4;
 pub const WAITSET_PROVIDER_MAX: u16 = WAITSET_PROVIDER_SESSIOND;
-pub const WAITSET_GLOBAL_OBJECT_ID: u64 = 0;
+/// inputd exposes two shared readiness objects. Every open description of one
+/// access ABI observes the same underlying bounded queue, so these stable IDs
+/// are the exact wait keys rather than per-fd aliases.
+pub const WAITSET_INPUT_NATIVE_OBJECT_ID: u64 = 1;
+pub const WAITSET_INPUT_EVDEV_OBJECT_ID: u64 = 2;
 pub const WAITSET_MAX_INTERESTS: usize = 512;
 
 #[repr(C)]
@@ -469,7 +473,7 @@ pub const fn waitset_signal_shape_valid(args: &WaitSetSignalBrokerArgs) -> bool 
         && args.provider >= WAITSET_PROVIDER_VFSD
         && args.provider <= WAITSET_PROVIDER_MAX
         && args.flags == 0
-        && args.object_id == WAITSET_GLOBAL_OBJECT_ID
+        && args.object_id != 0
         && args.generation != 0
         && args.reserved0 == 0
 }
@@ -496,7 +500,7 @@ mod waitset_signal_verification {
             assert!(args.provider >= WAITSET_PROVIDER_VFSD);
             assert!(args.provider <= WAITSET_PROVIDER_MAX);
             assert_eq!(args.flags, 0);
-            assert_eq!(args.object_id, WAITSET_GLOBAL_OBJECT_ID);
+            assert_ne!(args.object_id, 0);
             assert_ne!(args.generation, 0);
             assert_eq!(args.reserved0, 0);
         }
@@ -516,7 +520,7 @@ mod waitset_signal_verification {
             || args.provider < WAITSET_PROVIDER_VFSD
             || args.provider > WAITSET_PROVIDER_MAX
             || args.flags != 0
-            || args.object_id != WAITSET_GLOBAL_OBJECT_ID
+            || args.object_id == 0
             || args.generation == 0
             || args.reserved0 != 0;
         kani::assume(malformed);
@@ -667,7 +671,12 @@ pub const EARLY_SYSTEM_BROKER_ABI_VERSION: u16 = 1;
 pub const EARLY_SYSTEM_BROKER_OP_INFO: u16 = 1;
 pub const EARLY_SYSTEM_BROKER_OP_READ: u16 = 2;
 pub const EARLY_SYSTEM_BROKER_PATH_CAPACITY: usize = 96;
-pub const EARLY_SYSTEM_BROKER_MAX_IO_BYTES: usize = 4096;
+/// Maximum immutable bootstrap-image transfer per broker call. Executable
+/// snapshots are multi-megabyte sealed objects; a page-sized cap forced
+/// thousands of scheduler/syscall turns and exhausted the caller's absolute
+/// launch deadline. Keep one transfer equal to vfsd's bounded snapshot write
+/// chunk while retaining explicit allocation and user-buffer limits in ring0.
+pub const EARLY_SYSTEM_BROKER_MAX_IO_BYTES: usize = 256 * 1024;
 pub const BLOCK_BROKER_WAIT_MAX_TIMEOUT_MS: u64 = 30_000;
 pub const LINUX_STAT_SIZE: usize = 0x90;
 pub const LINUX_STATX_SIZE: usize = 0x100;
@@ -2837,8 +2846,8 @@ mod syscall_tests {
         VFS_EXECUTABLE_SNAPSHOT_ABI_VERSION, VFS_EXECUTABLE_SNAPSHOT_OP_OPEN, VFS_IPC_ABI_VERSION,
         VFS_IPC_OP_OPENAT, VFS_IPC_PAYLOAD_CAPACITY, VFS_IPC_RESPONSE_HEADER_BYTES,
         VfsExecutableSnapshotRequest, VfsExecutableSnapshotResponse, VfsIpcRequest, VfsIpcResponse,
-        WAITSET_ABI_VERSION, WAITSET_GLOBAL_OBJECT_ID, WAITSET_PROVIDER_VFSD,
-        WaitSetSignalBrokerArgs, identity_is_exact_sender, loader_service_role_allows_operation,
+        WAITSET_ABI_VERSION, WAITSET_PROVIDER_VFSD, WaitSetSignalBrokerArgs,
+        identity_is_exact_sender, loader_service_role_allows_operation,
         procd_sigchld_is_suppressed, waitset_signal_shape_valid,
     };
 
@@ -2866,11 +2875,15 @@ mod syscall_tests {
             abi_version: WAITSET_ABI_VERSION,
             provider: WAITSET_PROVIDER_VFSD,
             flags: 0,
-            object_id: WAITSET_GLOBAL_OBJECT_ID,
+            object_id: 0xfeed_beef,
             generation: 1,
             reserved0: 0,
         };
         assert!(waitset_signal_shape_valid(&valid));
+        assert!(!waitset_signal_shape_valid(&WaitSetSignalBrokerArgs {
+            object_id: 0,
+            ..valid
+        }));
         assert!(!waitset_signal_shape_valid(&WaitSetSignalBrokerArgs {
             generation: 0,
             ..valid

@@ -84,7 +84,7 @@ impl Scheduler {
     pub(in crate::multitask) fn current_linux_thread_binding(
         &mut self,
     ) -> Option<CurrentLinuxThreadBinding> {
-        let slot = self.current_task;
+        let slot = self.current_task_slot();
         let context = self.contexts[slot]?;
         if !context.user_mode {
             return None;
@@ -239,7 +239,7 @@ impl Scheduler {
     }
 
     pub(in crate::multitask) fn stop_current_linux_process(&mut self, signal: u64) -> bool {
-        let current = self.current_task;
+        let current = self.current_task_slot();
         let Some(process_id) = self.contexts[current].and_then(|context| {
             (context.user_mode && context.user_abi == Some(UserAbi::Linux))
                 .then_some(context.process_id)

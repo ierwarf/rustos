@@ -20,6 +20,7 @@ Finalizing == "finalizing"
 Finalized == "finalized"
 Exiting == "exiting"
 Cancelled == "cancelled"
+PublishFailed == "publish-failed"
 
 OldGeneration == 0
 NewGeneration == 1
@@ -107,6 +108,30 @@ CompletePublish ==
                     targetRetired, oldBundleRetained, processStateLockHeld,
                     locksNested, publicationFailed>>
 
+(***************************************************************************
+Publication is source-level fail-stop today: the reserved target is expected
+to remain exact, and losing it is a kernel invariant violation. Model that
+failure as a reachable terminal rollback instead of initializing a Boolean
+that no action could ever change. No new generation becomes visible, the old
+bundle remains authoritative, and an already-latched exit still retires the
+target. This action makes the failure proof non-vacuous without pretending
+that normal execution can recover after the invariant fault.
+***************************************************************************)
+FailPublish ==
+    /\ phase = Publishing
+    /\ schedulerLockHeld
+    /\ tokenLive
+    /\ tokenUses = 0
+    /\ phase' = IF exitPending THEN Exiting ELSE PublishFailed
+    /\ tokenLive' = FALSE
+    /\ stagedBundle' = FALSE
+    /\ schedulerLockHeld' = FALSE
+    /\ publicationFailed' = TRUE
+    /\ targetRetired' = exitPending
+    /\ UNCHANGED <<tokenUses, schedulerPublished, visibleGeneration,
+                    exitPending, oldBundleRetained, processStateLockHeld,
+                    locksNested>>
+
 BeginFinalize ==
     /\ phase = Published
     /\ schedulerPublished
@@ -154,11 +179,11 @@ CancelBeforeStage ==
                     publicationFailed>>
 
 Terminal ==
-    /\ phase \in {Finalized, Exiting, Cancelled}
+    /\ phase \in {Finalized, Exiting, Cancelled, PublishFailed}
     /\ UNCHANGED vars
 
 Next == ReserveExec \/ BeginStage \/ CompleteStage \/ BeginPublish
-        \/ CompletePublish \/ BeginFinalize \/ CompleteFinalize
+        \/ CompletePublish \/ FailPublish \/ BeginFinalize \/ CompleteFinalize
         \/ RequestExit \/ CancelBeforeStage \/ Terminal
 
 Spec ==
@@ -173,7 +198,7 @@ Spec ==
 
 TypeOK ==
     /\ phase \in {Idle, Reserved, Staging, Staged, Publishing, Published,
-                   Finalizing, Finalized, Exiting, Cancelled}
+                   Finalizing, Finalized, Exiting, Cancelled, PublishFailed}
     /\ tokenLive \in BOOLEAN
     /\ tokenUses \in 0..1
     /\ stagedBundle \in BOOLEAN
@@ -199,13 +224,20 @@ TokenSingleUse == tokenUses <= 1
 ProcessAndSchedulerLocksNeverNest ==
     /\ ~locksNested
     /\ ~(processStateLockHeld /\ schedulerLockHeld)
-NoNormalPublicationFailure == ~publicationFailed
+PublicationFailureRollsBack ==
+    publicationFailed =>
+        /\ phase \in {PublishFailed, Exiting}
+        /\ ~tokenLive
+        /\ ~stagedBundle
+        /\ ~schedulerPublished
+        /\ visibleGeneration = OldGeneration
+        /\ oldBundleRetained
 OldBundleRetainedUntilVisibleCommit ==
     visibleGeneration = OldGeneration => oldBundleRetained
 ExitEventuallyWins ==
     exitPending ~> phase \in {Exiting, Cancelled}
 ReservedExecEventuallySettles ==
     phase \in {Reserved, Staging, Staged, Publishing, Published, Finalizing}
-        ~> phase \in {Finalized, Exiting, Cancelled}
+        ~> phase \in {Finalized, Exiting, Cancelled, PublishFailed}
 
 =============================================================================

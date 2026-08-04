@@ -26,7 +26,8 @@ consumer progress, and they can never advance the fixed-ring cursor.
 *******************************************************************************)
 
 CONSTANTS Slots, Batch, MaxProduced, MaxClientPolls, MaxWakeGeneration,
-          MaxAuthorityRetries
+          MaxAuthorityRetries, MaxAuthorityTime, AuthorityCallCap,
+          AuthorityRetryBackoff
 
 NoOwner == "none"
 WorkerOwner == "inputd-ingestion-worker"
@@ -38,12 +39,12 @@ Exited == "exited"
 VARIABLES policyConsumerReady, workerState, producer, consumer, irqPending,
           consumerWakeGeneration, notifiedWakeGeneration,
           batchRemaining, clientPolls, inputdWakeSlot, lastConsumerOwner,
-          authorityPending, authorityRetries
+          authorityPending, authorityRetries, authorityElapsed
 
 vars == <<policyConsumerReady, workerState, producer, consumer, irqPending,
           consumerWakeGeneration, notifiedWakeGeneration,
           batchRemaining, clientPolls, inputdWakeSlot, lastConsumerOwner,
-          authorityPending, authorityRetries>>
+          authorityPending, authorityRetries, authorityElapsed>>
 
 Outstanding == producer - consumer
 NormalCapacity == Slots - 1
@@ -62,6 +63,7 @@ Init ==
     /\ lastConsumerOwner = NoOwner
     /\ authorityPending = FALSE
     /\ authorityRetries = 0
+    /\ authorityElapsed = 0
 
 \* A real client completes the policy-backed readiness check. The worker was
 \* already created by inputd; no client is permitted to become the consumer.
@@ -72,7 +74,7 @@ SetPolicyConsumerReady ==
     /\ UNCHANGED <<workerState, producer, consumer, irqPending,
                   consumerWakeGeneration, notifiedWakeGeneration,
                   batchRemaining, clientPolls, inputdWakeSlot, lastConsumerOwner,
-                  authorityPending, authorityRetries>>
+                  authorityPending, authorityRetries, authorityElapsed>>
 
 \* inputd registers its task first, publishes a new single-writer generation,
 \* then rechecks producer/consumer before committing the block.
@@ -87,7 +89,7 @@ ArmIngestionWorker ==
     /\ UNCHANGED <<policyConsumerReady, workerState, producer, consumer,
                   irqPending, notifiedWakeGeneration, batchRemaining,
                   clientPolls, lastConsumerOwner, authorityPending,
-                  authorityRetries>>
+                  authorityRetries, authorityElapsed>>
 
 \* L0 can produce only into a policy-ready ring with a live worker and keeps
 \* one slot reserved for authenticated cleanup.
@@ -108,7 +110,7 @@ Produce ==
     /\ UNCHANGED <<policyConsumerReady, workerState, consumer,
                   consumerWakeGeneration, batchRemaining, clientPolls,
                   inputdWakeSlot, lastConsumerOwner, authorityPending,
-                  authorityRetries>>
+                  authorityRetries, authorityElapsed>>
 
 \* The IRQ can be delayed or lost. The wait broker rechecks the raw cursors,
 \* so either an edge or outstanding work makes the worker runnable.
@@ -124,7 +126,7 @@ WakeIngestionWorker ==
     /\ UNCHANGED <<policyConsumerReady, producer, consumer,
                   consumerWakeGeneration, notifiedWakeGeneration,
                   clientPolls, lastConsumerOwner, authorityPending,
-                  authorityRetries>>
+                  authorityRetries, authorityElapsed>>
 
 \* The finite kernel timer is independent of MSI-X delivery. It turns a lost
 \* or indefinitely coalesced interrupt into the same authoritative cursor
@@ -139,7 +141,7 @@ WatchdogWakeIngestionWorker ==
     /\ UNCHANGED <<policyConsumerReady, producer, consumer, irqPending,
                   consumerWakeGeneration, notifiedWakeGeneration,
                   clientPolls, lastConsumerOwner, authorityPending,
-                  authorityRetries>>
+                  authorityRetries, authorityElapsed>>
 
 \* A commit that raced before arm publication is found by the authoritative
 \* post-registration cursor recheck; it needs no fabricated interrupt.
@@ -152,7 +154,7 @@ ObserveBacklogWithoutSleep ==
     /\ UNCHANGED <<policyConsumerReady, producer, consumer, irqPending,
                   consumerWakeGeneration, notifiedWakeGeneration,
                   clientPolls, inputdWakeSlot, lastConsumerOwner,
-                  authorityPending, authorityRetries>>
+                  authorityPending, authorityRetries, authorityElapsed>>
 
 \* Only the inputd worker advances RustOS's consumer cursor. Each broker
 \* invocation is bounded, even while catching up after a client stall.
@@ -166,7 +168,7 @@ DrainOne ==
     /\ UNCHANGED <<policyConsumerReady, workerState, producer, irqPending,
                   consumerWakeGeneration, notifiedWakeGeneration,
                   clientPolls, inputdWakeSlot, authorityPending,
-                  authorityRetries>>
+                  authorityRetries, authorityElapsed>>
 
 \* Session start/end synchronizes the authenticated DVM epoch with netd.
 \* `Syncing` denotes that inputd has released its policy queue lock before the
@@ -178,6 +180,7 @@ BeginAuthoritySync ==
     /\ workerState' = Syncing
     /\ authorityPending' = TRUE
     /\ authorityRetries' = 0
+    /\ authorityElapsed' = 0
     /\ UNCHANGED <<policyConsumerReady, producer, consumer, irqPending,
                   consumerWakeGeneration, notifiedWakeGeneration,
                   batchRemaining, clientPolls, inputdWakeSlot,
@@ -189,6 +192,7 @@ AuthoritySyncSuccess ==
     /\ workerState' = Draining
     /\ authorityPending' = FALSE
     /\ authorityRetries' = 0
+    /\ authorityElapsed' = 0
     /\ UNCHANGED <<policyConsumerReady, producer, consumer, irqPending,
                   consumerWakeGeneration, notifiedWakeGeneration,
                   batchRemaining, clientPolls, inputdWakeSlot,
@@ -201,7 +205,16 @@ AuthoritySyncFailure ==
     /\ workerState = Syncing
     /\ authorityPending
     /\ authorityRetries < MaxAuthorityRetries
+    /\ authorityElapsed < MaxAuthorityTime
     /\ authorityRetries' = authorityRetries + 1
+    /\ LET remaining == MaxAuthorityTime - authorityElapsed
+           callBudget == IF remaining < AuthorityCallCap
+                         THEN remaining ELSE AuthorityCallCap
+           afterCall == authorityElapsed + callBudget
+           afterRemaining == MaxAuthorityTime - afterCall
+           sleepBudget == IF afterRemaining < AuthorityRetryBackoff
+                          THEN afterRemaining ELSE AuthorityRetryBackoff
+       IN authorityElapsed' = afterCall + sleepBudget
     /\ UNCHANGED <<policyConsumerReady, workerState, producer, consumer,
                   irqPending, consumerWakeGeneration,
                   notifiedWakeGeneration, batchRemaining, clientPolls,
@@ -213,7 +226,7 @@ AuthoritySyncFailure ==
 AuthoritySyncTimeout ==
     /\ workerState = Syncing
     /\ authorityPending
-    /\ authorityRetries = MaxAuthorityRetries
+    /\ authorityRetries = MaxAuthorityRetries \/ authorityElapsed = MaxAuthorityTime
     /\ policyConsumerReady' = FALSE
     /\ workerState' = Exited
     /\ consumer' = producer
@@ -222,6 +235,7 @@ AuthoritySyncTimeout ==
     /\ batchRemaining' = 0
     /\ authorityPending' = FALSE
     /\ authorityRetries' = 0
+    /\ authorityElapsed' = 0
     /\ UNCHANGED <<producer, consumerWakeGeneration,
                   notifiedWakeGeneration, clientPolls,
                   lastConsumerOwner>>
@@ -239,6 +253,7 @@ ConsumerOwnerExit ==
     /\ batchRemaining' = 0
     /\ authorityPending' = FALSE
     /\ authorityRetries' = 0
+    /\ authorityElapsed' = 0
     /\ UNCHANGED <<producer, consumerWakeGeneration,
                   notifiedWakeGeneration, clientPolls,
                   lastConsumerOwner>>
@@ -249,6 +264,7 @@ RestartWorker ==
     /\ workerState' = Waiting
     /\ authorityPending' = FALSE
     /\ authorityRetries' = 0
+    /\ authorityElapsed' = 0
     /\ UNCHANGED <<policyConsumerReady, producer, consumer, irqPending,
                   consumerWakeGeneration, notifiedWakeGeneration,
                   batchRemaining, clientPolls, inputdWakeSlot,
@@ -263,7 +279,7 @@ FinishBoundedBatch ==
     /\ UNCHANGED <<policyConsumerReady, producer, consumer, irqPending,
                   consumerWakeGeneration, notifiedWakeGeneration,
                   clientPolls, lastConsumerOwner, authorityPending,
-                  authorityRetries>>
+                  authorityRetries, authorityElapsed>>
 
 \* An application may poll arbitrarily often or stop polling altogether. It
 \* neither wakes the worker nor changes producer/consumer ownership.
@@ -273,7 +289,7 @@ ClientPoll ==
     /\ UNCHANGED <<policyConsumerReady, workerState, producer, consumer,
                   irqPending, consumerWakeGeneration, notifiedWakeGeneration,
                   batchRemaining, inputdWakeSlot, lastConsumerOwner,
-                  authorityPending, authorityRetries>>
+                  authorityPending, authorityRetries, authorityElapsed>>
 
 Next ==
     \/ SetPolicyConsumerReady
@@ -307,6 +323,7 @@ TypeOK ==
     /\ lastConsumerOwner \in {NoOwner, WorkerOwner}
     /\ authorityPending \in BOOLEAN
     /\ authorityRetries \in 0..MaxAuthorityRetries
+    /\ authorityElapsed \in 0..MaxAuthorityTime
 
 CursorBound ==
     /\ producer >= consumer
@@ -335,6 +352,10 @@ ClientPollCannotOwnProgress ==
 
 AuthorityBatchIsRetained ==
     workerState = Syncing => authorityPending
+
+AuthorityDeadlineIsConserved ==
+    /\ authorityElapsed <= MaxAuthorityTime
+    /\ workerState # Syncing => authorityElapsed = 0
 
 Spec ==
     Init /\ [][Next]_vars

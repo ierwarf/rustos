@@ -424,8 +424,16 @@ pub mod device {
         crate::io::device::display::ioctl(process_id, process_state, request, arg)
     }
 
-    pub fn prepare_display_ioctl(request: u64) {
-        crate::io::device::display::prepare_ioctl(request);
+    pub fn display_gpu_atlas_create_slot_from_user(
+        process_state: &crate::user::process_state::UserProcessState,
+        request: u64,
+        arg: u64,
+    ) -> Option<u32> {
+        crate::io::device::display::gpu_atlas_create_slot_from_user(process_state, request, arg)
+    }
+
+    pub fn prepare_display_ioctl(request: u64, gpu_atlas_create_slot: Option<u32>) {
+        crate::io::device::display::prepare_ioctl(request, gpu_atlas_create_slot);
     }
 
     pub mod input {

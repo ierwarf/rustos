@@ -668,11 +668,6 @@ pub(super) fn published_runnable_count(cpu: usize) -> usize {
     (RUN_QUEUES[cpu].published_load.load(Ordering::Acquire) & 0xffff) as usize
 }
 
-pub(super) fn foreign_runnable_work_pending(local_cpu: usize) -> bool {
-    validate_cpu(local_cpu);
-    (0..MAX_TRACKED_CPUS).any(|cpu| cpu != local_cpu && published_runnable_count(cpu) != 0)
-}
-
 /// Reports whether the CPU-local dispatch owner has work beyond the task that
 /// is already running on this CPU.
 ///

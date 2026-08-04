@@ -369,14 +369,22 @@ fn wait_for_icr_idle() -> Result<(), StartupIpiError> {
     if base == 0 {
         return Err(StartupIpiError::LocalApicUnavailable);
     }
-    let start = super::clock::monotonic_nanos();
+    // Interrupt delivery is idle on the first observation for every ordinary
+    // reschedule, shootdown, and device IPI. Start the bounded deadline only
+    // after an actual busy observation so the common path reads no clocksource
+    // at all, and sample it in batches once it does exist.
+    let mut deadline: Option<super::clock::SpinDeadline> = None;
     loop {
         // SAFETY: the configured mapping owns the complete local-APIC page.
         let command = unsafe { ((base + APIC_ICR_LOW_OFFSET) as *const u32).read_volatile() };
         if command & APIC_ICR_DELIVERY_STATUS == 0 {
             return Ok(());
         }
-        if super::clock::monotonic_nanos().saturating_sub(start) >= ICR_DELIVERY_TIMEOUT_NS {
+        if deadline
+            .get_or_insert_with(super::clock::SpinDeadline::start)
+            .elapsed_nanos()
+            >= ICR_DELIVERY_TIMEOUT_NS
+        {
             return Err(StartupIpiError::DeliveryTimeout);
         }
         spin_loop();

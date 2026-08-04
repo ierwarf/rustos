@@ -76,7 +76,7 @@ impl Scheduler {
                 panic!("scheduler activation invariant: suspended task {task_id} lost its context");
             };
             assert!(
-                slot != self.current_task && !super::super::task_slot_is_running(slot),
+                slot != self.current_task_slot() && !super::super::task_slot_is_running(slot),
                 "scheduler activation invariant: suspended task {task_id} is already running"
             );
             if let Err(reason) =
@@ -112,7 +112,7 @@ impl Scheduler {
                 "scheduler activation invariant: authority commit changed suspension before cohort publication for task {task_id}"
             );
             assert!(
-                slot != self.current_task && !super::super::task_slot_is_running(slot),
+                slot != self.current_task_slot() && !super::super::task_slot_is_running(slot),
                 "scheduler activation invariant: authority commit made task {task_id} runnable before cohort publication"
             );
         }
@@ -123,6 +123,7 @@ impl Scheduler {
         if prioritize_atomic_cohort {
             assert!(
                 self.cpu_dispatch.iter().all(|policy| {
+                    let policy = policy.lock();
                     policy.atomic_activation_pick_hints.is_empty()
                         && policy.atomic_activation_handoff_remaining == 0
                 }),
@@ -143,7 +144,7 @@ impl Scheduler {
             // startup burst cannot consume or disable these exact first turns.
             if prioritize_atomic_cohort {
                 let target_cpu = self.slot_dispatch_cpu(slot);
-                let policy = &mut self.cpu_dispatch[target_cpu];
+                let mut policy = self.cpu_dispatch[target_cpu].lock();
                 let inserted = policy
                     .atomic_activation_pick_hints
                     .enqueue(slot)
@@ -174,6 +175,7 @@ impl Scheduler {
         }
         let target_cpu = self.slot_dispatch_cpu(slot);
         self.cpu_dispatch[target_cpu]
+            .lock()
             .sync_pick_hints
             .enqueue(slot)
             .expect("scheduler synchronous IPC handoff queue overflow");
@@ -192,6 +194,7 @@ impl Scheduler {
         }
         let target_cpu = self.slot_dispatch_cpu(slot);
         let inserted = self.cpu_dispatch[target_cpu]
+            .lock()
             .spawn_pick_hints
             .enqueue(slot)
             .expect("scheduler spawn handoff queue overflow");
@@ -242,7 +245,7 @@ impl Scheduler {
             > 0
         {
             let hint = {
-                let policy = self.current_dispatch_policy_mut();
+                let mut policy = self.current_dispatch_policy_mut();
                 policy.atomic_activation_handoff_remaining -= 1;
                 policy.atomic_activation_pick_hints.pop()
             };

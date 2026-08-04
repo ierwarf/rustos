@@ -10,6 +10,7 @@ use core::sync::atomic::{AtomicU8, Ordering};
 
 const PROFILE_TOP_TASKS: usize = 4;
 pub(super) const SCHEDULER_ENTRY_CAUSE_COUNT: usize = 4;
+pub(super) const SCHEDULER_PHASE_COUNT: usize = 8;
 const PROFILE_EMPTY: u8 = 0;
 const PROFILE_BUSY: u8 = 1;
 const PROFILE_READY: u8 = 2;
@@ -20,6 +21,32 @@ pub(in crate::multitask) enum SchedulerEntryCause {
     Rtc = 1,
     RescheduleIpi = 2,
     Software = 3,
+}
+
+/// Disjoint segments of one serialized scheduling decision.
+///
+/// Total lock hold alone cannot distinguish "the critical section is long"
+/// from "the owner was descheduled": the release gate needs the exact segment
+/// that consumed the time. These accumulate wall nanoseconds inside the
+/// scheduler owner and are rendered only after it is released.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::multitask) enum SchedulerPhase {
+    /// Outgoing runtime accounting, ready publication, and run-queue custody.
+    Account = 0,
+    /// Remote wake drain, idle steal, and bounded busy rebalance.
+    Balance = 1,
+    /// Bounded periodic validation sweep over immutable ready frames.
+    Validate = 2,
+    /// Class-minimum virtual-time refresh over the local runnable set.
+    SelectVruntime = 3,
+    /// Exact activation, synchronous, overdue, and bootstrap handoff chain.
+    SelectHandoff = 4,
+    /// Fair class selection and the minimum-granularity preemption guard.
+    SelectPick = 5,
+    /// Custody claim, dispatch records, and lockdep owner publication.
+    Commit = 6,
+    /// SIMD save/restore and the architectural task-state restore.
+    ArchRestore = 7,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -44,6 +71,8 @@ pub(in crate::multitask) struct SchedulerRuntimeProfile {
     pub(in crate::multitask) lock_hold_ns: u64,
     pub(in crate::multitask) lock_wait_max_ns: u64,
     pub(in crate::multitask) lock_hold_max_ns: u64,
+    pub(in crate::multitask) phase_ns: [u64; SCHEDULER_PHASE_COUNT],
+    pub(in crate::multitask) runnable_samples: u64,
     pub(in crate::multitask) top: [SchedulerRuntimeProfileEntry; PROFILE_TOP_TASKS],
 }
 
@@ -154,6 +183,50 @@ pub fn drain_scheduler_runtime_profile() -> usize {
             profile.lock_wait_max_ns / 1_000,
         ),
     );
+    // Disjoint in-owner segments in microseconds.
+    // arg0=(account, balance), arg1=(validate, select).
+    crate::debug::record_milestone(
+        crate::debug::LogCategory::Sched,
+        "kernel-scheduler-phase",
+        pack_u32_pair(
+            profile.phase_ns[SchedulerPhase::Account as usize] / 1_000,
+            profile.phase_ns[SchedulerPhase::Balance as usize] / 1_000,
+        ),
+        pack_u32_pair(
+            profile.phase_ns[SchedulerPhase::Validate as usize] / 1_000,
+            profile.phase_ns[SchedulerPhase::SelectVruntime as usize]
+                .saturating_add(profile.phase_ns[SchedulerPhase::SelectHandoff as usize])
+                .saturating_add(profile.phase_ns[SchedulerPhase::SelectPick as usize])
+                / 1_000,
+        ),
+    );
+    // arg0=(select vruntime, select handoff), arg1=(select pick, summed
+    // local runnable candidates across the window).
+    crate::debug::record_milestone(
+        crate::debug::LogCategory::Sched,
+        "kernel-scheduler-phase-select",
+        pack_u32_pair(
+            profile.phase_ns[SchedulerPhase::SelectVruntime as usize] / 1_000,
+            profile.phase_ns[SchedulerPhase::SelectHandoff as usize] / 1_000,
+        ),
+        pack_u32_pair(
+            profile.phase_ns[SchedulerPhase::SelectPick as usize] / 1_000,
+            profile.runnable_samples,
+        ),
+    );
+    // arg0=(commit, architectural restore), arg1=(attributed total, hold total).
+    crate::debug::record_milestone(
+        crate::debug::LogCategory::Sched,
+        "kernel-scheduler-phase-tail",
+        pack_u32_pair(
+            profile.phase_ns[SchedulerPhase::Commit as usize] / 1_000,
+            profile.phase_ns[SchedulerPhase::ArchRestore as usize] / 1_000,
+        ),
+        pack_u32_pair(
+            profile.phase_ns.iter().copied().sum::<u64>() / 1_000,
+            profile.lock_hold_ns / 1_000,
+        ),
+    );
     // arg0=(timer, software), arg1=(reschedule IPI, RTC). Keep the high-rate
     // entry causes in one fixed record; debugcon is itself a VM-exit under KVM.
     crate::debug::record_milestone(
@@ -254,6 +327,18 @@ impl Scheduler {
             self.runtime_profile_lock_hold_max_ns.max(elapsed_ns);
     }
 
+    /// Charges one disjoint scheduling segment. The caller already holds the
+    /// scheduler owner, so this is an allocation-free counter update and never
+    /// a second time source or diagnostic emission.
+    pub(in crate::multitask) fn record_runtime_profile_phase(
+        &mut self,
+        phase: SchedulerPhase,
+        elapsed_ns: u64,
+    ) {
+        let total = &mut self.runtime_profile_phase_ns[phase as usize];
+        *total = total.saturating_add(elapsed_ns);
+    }
+
     pub(in crate::multitask) fn record_runtime_profile_entry(
         &mut self,
         cause: SchedulerEntryCause,
@@ -288,6 +373,8 @@ impl Scheduler {
             lock_hold_ns: self.runtime_profile_lock_hold_ns,
             lock_wait_max_ns: self.runtime_profile_lock_wait_max_ns,
             lock_hold_max_ns: self.runtime_profile_lock_hold_max_ns,
+            phase_ns: self.runtime_profile_phase_ns,
+            runnable_samples: self.runtime_profile_runnable_samples,
             top: [SchedulerRuntimeProfileEntry::default(); PROFILE_TOP_TASKS],
         };
         for slot in 0..MAX_TASK {
@@ -321,6 +408,8 @@ impl Scheduler {
         self.runtime_profile_lock_hold_ns = 0;
         self.runtime_profile_lock_wait_max_ns = 0;
         self.runtime_profile_lock_hold_max_ns = 0;
+        self.runtime_profile_phase_ns.fill(0);
+        self.runtime_profile_runnable_samples = 0;
         self.runtime_profile_started_ticks = now_ticks;
         Some(profile)
     }
@@ -414,6 +503,8 @@ mod tests {
             lock_hold_ns: 0,
             lock_wait_max_ns: 0,
             lock_hold_max_ns: 0,
+            phase_ns: [0; SCHEDULER_PHASE_COUNT],
+            runnable_samples: 0,
             top: [SchedulerRuntimeProfileEntry::default(); PROFILE_TOP_TASKS],
         };
         assert!(pending.publish(profile));

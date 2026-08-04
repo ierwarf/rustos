@@ -23,7 +23,7 @@ impl Scheduler {
         &mut self,
         id: u64,
     ) -> Option<UserThreadSlotReservation> {
-        let current = self.contexts[self.current_task]?;
+        let current = self.contexts[self.current_task_slot()]?;
         let (inherited_task_mask, inherited_process_mask) =
             self.current_affinity_for_child_thread();
         if !current.user_mode {

@@ -1,5 +1,4 @@
 use std::string::String;
-use std::thread;
 use std::time::Instant;
 
 use runtime_control::RuntimeClient;
@@ -652,10 +651,14 @@ impl AppState {
 }
 
 fn launch_program_async(desktop_file_id: String) {
-    thread::spawn(move || {
-        sys::require_background_thread_class();
-        if let Ok(runtime) = RuntimeClient::open_default() {
-            let _ = runtime.request_launch_program_new_session(desktop_file_id.as_str());
-        }
-    });
+    sys::spawn_ui_thread(
+        sys::UiThreadRole::Background,
+        "uiserver-program-launch",
+        move || {
+            if let Ok(runtime) = RuntimeClient::open_default() {
+                let _ = runtime.request_launch_program_new_session(desktop_file_id.as_str());
+            }
+        },
+    )
+    .unwrap_or_else(|_| std::process::exit(134));
 }

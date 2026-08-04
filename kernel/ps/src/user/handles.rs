@@ -499,6 +499,50 @@ pub fn commit_ipc_transfer_enqueue(
     Ok(())
 }
 
+/// Bind an enqueued Unix-stream transfer batch to the concrete process that
+/// actually received its control record. The caller reaches this boundary
+/// only after the exact service/channel/side/stream position has been checked;
+/// a guessed ticket or a different socket cannot acquire receiver authority.
+pub fn bind_ipc_transfer_receiver_by_tickets(
+    tickets: &[KernelTransferTicket],
+    receiver: ProcessIdentity,
+    service: ServiceIdentity,
+    channel: ChannelIdentity,
+    stream_pos: u64,
+) -> Result<(), IpcTransferRegistryError> {
+    let mut objects = IPC_TRANSFER_OBJECTS.lock();
+    validate_ticket_batch(&objects, tickets, IpcTransferState::Enqueued)?;
+    let context = objects
+        .slots
+        .iter()
+        .find(|slot| slot.transfer_id == tickets[0].transfer_id())
+        .and_then(|slot| slot.context)
+        .ok_or(IpcTransferRegistryError::InvalidState)?;
+    if context.service != service
+        || context.channel != channel
+        || context.stream_start != stream_pos
+        || context.stream_end <= context.stream_start
+        || context
+            .intended_receiver
+            .is_some_and(|intended| intended != receiver)
+    {
+        return Err(IpcTransferRegistryError::BindingMismatch);
+    }
+    for ticket in tickets {
+        let slot = objects
+            .slots
+            .iter_mut()
+            .find(|slot| slot.transfer_id == ticket.transfer_id())
+            .expect("validated transfer ticket disappeared during receiver bind");
+        let mut bound = slot
+            .context
+            .expect("validated transfer ticket lost its binding context");
+        bound.intended_receiver = Some(receiver);
+        slot.context = Some(bound);
+    }
+    Ok(())
+}
+
 pub fn claim_ipc_transfer_entries_by_tickets(
     tickets: &[KernelTransferTicket],
     receiver: ProcessIdentity,
@@ -519,9 +563,7 @@ pub fn claim_ipc_transfer_entries_by_tickets(
         || context.channel != channel
         || context.stream_start != stream_pos
         || context.stream_end <= context.stream_start
-        || context
-            .intended_receiver
-            .is_some_and(|intended| intended != receiver)
+        || context.intended_receiver != Some(receiver)
     {
         return Err(IpcTransferRegistryError::BindingMismatch);
     }
@@ -1124,6 +1166,98 @@ mod transfer_registry_tests {
             ),
             Err(IpcTransferRegistryError::StaleDescriptor)
         ));
+    }
+
+    #[test]
+    fn unbound_stream_transfer_requires_exact_receive_time_process_binding() {
+        let token = u64::MAX - 703;
+        let device =
+            DeviceHandle::from_parts_with_token(DeviceId::Input, DeviceAccessKind::Evdev, token);
+        let entry = HandleEntry::new(KernelHandle::Device(device), 0, linux_abi::O_RDONLY);
+        let transferred = TransferredHandleEntry::from_entry(entry).expect("transferable input");
+        let descriptors =
+            register_ipc_transfer_entries(alloc::vec![transferred]).expect("register transfer");
+        let receiver = ProcessIdentity {
+            pid: 21,
+            generation: 8,
+        };
+        let service = ServiceIdentity {
+            service_id: 4,
+            epoch: 12,
+        };
+        let channel = ChannelIdentity {
+            channel_id: 19,
+            generation: 19,
+            receiver_side: 2,
+        };
+        let context = TransferContext {
+            source: ProcessIdentity {
+                pid: 17,
+                generation: 6,
+            },
+            service,
+            channel,
+            stream_start: 9,
+            stream_end: 10,
+            intended_receiver: None,
+        };
+        let tickets = bind_ipc_transfer_tickets(&descriptors, context).expect("mint tickets");
+        commit_ipc_transfer_enqueue(&tickets).expect("enqueue tickets");
+
+        assert!(matches!(
+            claim_ipc_transfer_entries_by_tickets(
+                &tickets,
+                receiver,
+                service,
+                channel,
+                context.stream_start,
+            ),
+            Err(IpcTransferRegistryError::BindingMismatch)
+        ));
+        assert!(matches!(
+            bind_ipc_transfer_receiver_by_tickets(
+                &tickets,
+                receiver,
+                service,
+                ChannelIdentity {
+                    receiver_side: 1,
+                    ..channel
+                },
+                context.stream_start,
+            ),
+            Err(IpcTransferRegistryError::BindingMismatch)
+        ));
+        bind_ipc_transfer_receiver_by_tickets(
+            &tickets,
+            receiver,
+            service,
+            channel,
+            context.stream_start,
+        )
+        .expect("bind exact receiving process");
+        assert!(matches!(
+            claim_ipc_transfer_entries_by_tickets(
+                &tickets,
+                ProcessIdentity {
+                    generation: receiver.generation + 1,
+                    ..receiver
+                },
+                service,
+                channel,
+                context.stream_start,
+            ),
+            Err(IpcTransferRegistryError::BindingMismatch)
+        ));
+        let entries = claim_ipc_transfer_entries_by_tickets(
+            &tickets,
+            receiver,
+            service,
+            channel,
+            context.stream_start,
+        )
+        .expect("claim exact receive-time binding");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].entry().handle().device_handle(), Some(device));
     }
 
     #[test]

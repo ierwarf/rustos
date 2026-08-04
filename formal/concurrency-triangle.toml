@@ -76,11 +76,11 @@ id = "reschedule-ipi"
 severity = "critical"
 flow = "smp-reschedule-ipi-lifecycle"
 model = "smp-reschedule-ipi/SmpRescheduleIpi"
-source = "kernel/ps/src/multitask/irq.rs"
-source_symbol = "arm_remote_reschedule"
+source = "kernel/ps/src/multitask/reschedule_observation.rs"
+source_symbol = "publish_request"
 source_anchors = [
-  "flag.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)",
-  "deferred_reschedule_flag(logical_index).swap(0, Ordering::AcqRel)",
+  "let next = (sequence << 1) | PENDING_BIT;",
+  "let claimed = current & !PENDING_BIT;",
 ]
 invariant = "a coalesced durable request is pending or exactly consumed at the target safe point"
 loom_test = "reschedule_request_is_never_lost_across_concurrent_consume"
@@ -115,7 +115,7 @@ model = "tlb-shootdown-lifecycle/TlbShootdownLifecycle"
 source = "kernel/hal/src/arch/tlb_shootdown.rs"
 source_symbol = "finish_shootdown"
 source_anchors = [
-  "REQUEST_ROOT[target].store(GLOBAL_SCOPE, Ordering::Relaxed)",
+  "REQUEST_ROOT[target].store(mutation_root, Ordering::Relaxed)",
   "REQUEST_GENERATION[target].store(generation, Ordering::Release)",
   "let generation = REQUEST_GENERATION[logical_index].load(Ordering::Acquire)",
 ]

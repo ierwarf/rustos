@@ -2,12 +2,12 @@
 # Formal Contract Registry
 
 - Schema: `3`
-- Registry SHA-256: `901f0a9a1102f5e31db65a4a82e24fb193ae192445a164bd9e0a11e97caa8980`
+- Registry SHA-256: `ade9718852e35cf7c3b5c166bc7d7d6531b09d4d4ea6a3d2d3579b83765c945f`
 - Models: `123`
 - Whole flows: `67`
-- Transitions: `625`
+- Transitions: `626`
 - Product runtime scenarios: `3`
-- Exact source witnesses: `470`
+- Exact source witnesses: `473`
 - Apalache pilots: `3`
 - TLAPS theorem models: `2`
 - Runtime-traced models: `7`
@@ -26,7 +26,7 @@
 | `bootstrap-activation-handoff` | `critical` | kernel-ps | bootstrap-activation-handoff/BootstrapActivationHandoff | 6 | 6 | first-turn, revoked |
 | `bootstrap-content-admission` | `critical` | kernel-io-manager | filesystem-content-integrity/FilesystemContentIntegrity | 2 | 2 | admitted, rejected |
 | `commercial-envelope` | `critical` | caller, kernel-ipc, service | commercial-service-envelope/CommercialServiceEnvelope | 6 | 6 | admitted, malformed-replied, peer-closed, reply-rejected, timed-out |
-| `commercial-product-boot` | `critical` | kernel-io-manager, rootd, storaged, uiserver, vfsd, wayclick, xtask-kvm | acceptance-profile-publication/AcceptanceProfilePublication, dvm-block-startup/DvmBlockStartup, dvm-display-readiness/DvmDisplayReadiness, input-ingestion-worker/InputIngestionWorker, product-boot/ProductBoot, rootd-bootstrap/RootdBootstrap, ui-frame-budget/UiFrameBudget | 18 | 18 | control-ready, failed, presented, revoked, storage-usable |
+| `commercial-product-boot` | `critical` | kernel-io-manager, rootd, storaged, uiserver, vfsd, wayclick, xtask-kvm | acceptance-profile-publication/AcceptanceProfilePublication, dvm-block-startup/DvmBlockStartup, dvm-display-readiness/DvmDisplayReadiness, input-ingestion-worker/InputIngestionWorker, product-boot/ProductBoot, rootd-bootstrap/RootdBootstrap, ui-frame-budget/UiFrameBudget | 19 | 19 | control-ready, failed, presented, revoked, storage-usable |
 | `cpu-affinity-observation` | `critical` | kernel-compat, kernel-hal, syscalld | cpu-affinity-observation/CpuAffinityObservation | 7 | 7 | rejected, replied |
 | `cpu-online-lifecycle` | `critical` | kernel-hal, kernel-mm, kernel-ps, nucleus-core | cpu-online-lifecycle/CpuOnlineLifecycle | 15 | 15 | invariant-panic, online |
 | `cpu-topology-admission` | `critical` | kernel-hal | cpu-topology-admission/CpuTopologyAdmission | 4 | 4 | published, rejected |
@@ -43,13 +43,13 @@
 | `dvm-volume-io` | `critical` | kernel-io-manager, vfsd | dvm-volume-io/DvmVolumeIo | 14 | 14 | complete, failed, geometry-rejected, image-rejected, rejected, reply-rejected, timed-out, unavailable |
 | `endpoint-lifecycle` | `critical` | kernel-compat, kernel-ipc-runtime, kernel-ps | endpoint-publication/EndpointPublication, endpoint-receiver-wakeup/EndpointReceiverWakeup, ipc-endpoint-ownership/IpcEndpointOwnership | 8 | 8 | rejected |
 | `entropy-boundary` | `critical` | kernel-compat, kernel-executive | entropy-broker-boundary/EntropyBrokerBoundary | 5 | 5 | boot-rejected, denied, served |
-| `exception-retirement` | `critical` | kernel-compat, kernel-executive, kernel-hal, kernel-ps | exception-retirement-lifecycle/ExceptionRetirementLifecycle, user-stack-growth/UserStackGrowth | 12 | 12 | growth-committed, kernel-panicked, nmi-returned, process-retired, resumed, thread-retired |
+| `exception-retirement` | `critical` | kernel-compat, kernel-executive, kernel-hal, kernel-ps | exception-retirement-lifecycle/ExceptionRetirementLifecycle, user-stack-growth/UserStackGrowth | 9 | 9 | growth-committed, kernel-panicked, nmi-returned, process-retired, resumed, thread-retired |
 | `executable-image-admission` | `critical` | image-admission | dual-abi-image-admission/DualAbiImageAdmission | 4 | 4 | admitted, rejected |
 | `futex-wait-lifecycle` | `critical` | kernel-compat, kernel-executive, kernel-ps | futex-waiter-lifecycle/FutexWaiterLifecycle | 9 | 9 | cancelled, owner-died, timed-out, woken |
 | `gpu-frame-lifecycle` | `critical` | kernel-io-manager, linux-dvm, uiserver | dvm-display-readiness/DvmDisplayReadiness, dvm-gpu-admission/DvmGpuAdmission, dvm-gpu-compositor/DvmGpuCompositor, gpu-submit-transaction/GpuSubmitTransaction | 14 | 14 | displayed, rejected, revoked |
 | `input-delivery-lifecycle` | `critical` | inputd, kernel-compat, kernel-io-manager, uiserver | dvm-input-ring/DvmInputRing, input-ingestion-worker/InputIngestionWorker, scheduler-wakeup/SchedulerWakeup, userspace-wait-set/UserspaceWaitSet | 19 | 19 | delivered, rejected, timed-out |
 | `ipc-call` | `critical` | kernel-compat, kernel-ipc-runtime | ipc-reply-deadline/IpcReplyDeadline | 7 | 7 | cancelled, peer-closed, replied |
-| `ipc-handle-transfer` | `critical` | kernel-compat, kernel-ipc-runtime, kernel-ps | ipc-handle-transfer/IpcHandleTransfer, ipc-transfer-authority/IpcTransferAuthority | 11 | 11 | dropped, provider-live, rejected |
+| `ipc-handle-transfer` | `critical` | kernel-compat, kernel-ipc-runtime, kernel-ps | ipc-handle-transfer/IpcHandleTransfer, ipc-transfer-authority/IpcTransferAuthority | 12 | 12 | dropped, provider-live, rejected |
 | `kernel-memory-protection` | `critical` | kernel-mm | page-table-lifecycle/PageTableLifecycle | 5 | 5 | rejected |
 | `kernel-resource-lifecycle` | `critical` | kernel-ipc-runtime, kernel-ps | kernel-resource-accounting/KernelResourceAccounting | 9 | 9 | quota-returned, rejected |
 | `loader-request-authority` | `critical` | initd, kernel-compat, loaderd | loader-request-authority/LoaderRequestAuthority | 6 | 6 | committed, denied |
@@ -68,7 +68,7 @@
 | `root-authority` | `critical` | kernel-compat, kernel-ipc-runtime, rootd | root-authority-publication/RootAuthorityPublication | 6 | 6 | denied, service-published |
 | `runtime-control-ingress` | `critical` | runtimed | runtime-control-authority/RuntimeControlAuthority | 5 | 5 | admitted, denied |
 | `scheduler-cpu-ownership` | `critical` | kernel-hal, kernel-ps, nucleus-core | scheduler-cpu-ownership/SchedulerCpuOwnership | 11 | 11 | invariant-panic |
-| `scheduler-dispatch` | `critical` | inputd, kernel-compat, kernel-ipc-runtime, kernel-ps, loaderd, runtimed, vfsd | ipc-priority-inheritance/IpcPriorityInheritance, ipc-priority-queue/IpcPriorityQueue, ipc-reply-recv-transaction/IpcReplyRecvTransaction, scheduler-admission/SchedulerAdmission, scheduler-cpu-distribution/SchedulerCpuDistribution, scheduler-thread-demotion/SchedulerThreadDemotion, synchronous-ipc-handoff/SynchronousIpcHandoff | 33 | 33 | peer-dispatched, revoked, system-dispatched, user-dispatched |
+| `scheduler-dispatch` | `critical` | inputd, kernel-compat, kernel-ipc-runtime, kernel-ps, loaderd, runtimed, uiserver, vfsd | ipc-priority-inheritance/IpcPriorityInheritance, ipc-priority-queue/IpcPriorityQueue, ipc-reply-recv-transaction/IpcReplyRecvTransaction, scheduler-admission/SchedulerAdmission, scheduler-cpu-distribution/SchedulerCpuDistribution, scheduler-thread-demotion/SchedulerThreadDemotion, synchronous-ipc-handoff/SynchronousIpcHandoff | 34 | 34 | peer-dispatched, revoked, system-dispatched, user-dispatched |
 | `scheduler-lifecycle` | `critical` | kernel-compat, kernel-hal, kernel-ps | scheduler-wakeup/SchedulerWakeup | 18 | 18 | retired |
 | `service-bootstrap` | `critical` | initd, kernel-compat, rootd | service-bootstrap-lifecycle/ServiceBootstrapLifecycle | 10 | 10 | denied, entry-rejected, ready |
 | `service-call-authority` | `critical` | kernel-compat, kernel-ipc-runtime | service-call-authority/ServiceCallAuthority | 6 | 6 | admitted, cleared, denied, stale |
@@ -83,6 +83,6 @@
 | `ui-main-loop-wakeup` | `critical` | kernel-hal, uiserver | ui-main-loop-wakeup/UiMainLoopWakeup | 5 | 5 | presented |
 | `user-memory-access` | `critical` | kernel-mm, kernel-ps | page-table-lifecycle/PageTableLifecycle, process-address-space-lifetime/ProcessAddressSpaceLifetime | 7 | 7 | rejected, returned, revoked |
 | `vfs-open-description` | `critical` | kernel-compat, kernel-ps, vfsd | userspace-wait-set/UserspaceWaitSet, vfs-open-description-recovery/VfsOpenDescriptionRecovery | 17 | 17 | tombstoned |
-| `waitset` | `critical` | kernel-compat, kernel-ps, vfsd | service-mutation-recovery/ServiceMutationRecovery, userspace-wait-set/UserspaceWaitSet | 12 | 12 | interrupted, ready, revoked, timed-out |
+| `waitset` | `critical` | kernel-compat, kernel-ps, vfsd | service-mutation-recovery/ServiceMutationRecovery, userspace-wait-set/UserspaceWaitSet | 13 | 13 | interrupted, ready, revoked, timed-out |
 | `wayland-client-ingress` | `critical` | uiserver | wayland-accept-isolation/WaylandAcceptIsolation | 9 | 9 | delivered, rejected, revoked |
 | `zero-trust-e2e` | `critical` | caller, kernel-ipc, object-owner, service-owner | zero-trust-service-flow/ZeroTrustServiceFlow | 10 | 10 | admitted, rejected, revoked, timed-out |

@@ -3,23 +3,14 @@
 impl VfsState {
     fn new() -> Self {
         Self {
-            volume: None,
             cwd: BTreeMap::new(),
             handles: BTreeMap::new(),
-            metadata_cache: BTreeMap::new(),
-            dir_entries_cache: BTreeMap::new(),
-            file_bytes_cache: BTreeMap::new(),
-            file_bytes_cache_bytes: 0,
-            executable_snapshot_cache: BTreeMap::new(),
-            executable_snapshot_cache_bytes: 0,
             epolls: WaitSetRegistry::default(),
             checkpoint_revisions: BTreeMap::new(),
             checkpoint_operations: BTreeMap::new(),
             checkpoint_records: BTreeMap::new(),
             readiness_generation: 1,
             next_handle: 1,
-            mount_generation: 1,
-            cache_generation: 1,
         }
     }
 
@@ -339,6 +330,9 @@ impl VfsState {
         self.checkpoint_records.get(&key).copied().ok_or(EIO)
     }
 
+}
+
+impl VfsStorage {
     fn invalidate_caches_if_remounted(&mut self) {
         if self.cache_generation != self.mount_generation {
             self.metadata_cache.clear();
@@ -358,5 +352,4 @@ impl VfsState {
         self.mount_generation = checked_next_generation(self.mount_generation).ok_or(EOVERFLOW)?;
         Ok(())
     }
-
 }
