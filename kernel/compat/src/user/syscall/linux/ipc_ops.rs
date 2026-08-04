@@ -2803,13 +2803,24 @@ pub(super) fn prepare_transfer_tickets_for_current_process(
     service: ServiceIdentity,
     channel: ChannelIdentity,
     stream_pos: u64,
+    receiver_open_description: u64,
 ) -> Result<PreparedTransferInstall, i64> {
     multitask::bind_ipc_transfer_receiver_by_tickets(
-        tickets, receiver, service, channel, stream_pos,
+        tickets,
+        receiver,
+        service,
+        channel,
+        stream_pos,
+        receiver_open_description,
     )
     .map_err(ipc_transfer_error_to_linux_errno)?;
     let entries = multitask::claim_ipc_transfer_entries_by_tickets(
-        tickets, receiver, service, channel, stream_pos,
+        tickets,
+        receiver,
+        service,
+        channel,
+        stream_pos,
+        receiver_open_description,
     )
     .map_err(ipc_transfer_error_to_linux_errno)?;
     let service_refs = service_transfer_refs(&entries);

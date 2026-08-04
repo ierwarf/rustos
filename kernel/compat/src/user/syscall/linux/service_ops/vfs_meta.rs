@@ -655,6 +655,7 @@ struct PendingNetdTransfers {
     stream: Option<multitask::SocketStreamGuard>,
     channel_id: u64,
     channel_side: u8,
+    socket_token: u64,
     receive: bool,
 }
 
@@ -666,6 +667,7 @@ impl Default for PendingNetdTransfers {
             stream: None,
             channel_id: 0,
             channel_side: 0,
+            socket_token: 0,
             receive: false,
         }
     }
@@ -684,6 +686,7 @@ impl PendingNetdTransfers {
         let stream = socket.begin_stream_send(len).ok_or(LINUX_EAGAIN)?;
         self.channel_id = socket.channel_id();
         self.channel_side = socket.channel_side();
+        self.socket_token = socket.token_id();
         self.stream = Some(stream);
         Ok(())
     }
@@ -692,6 +695,7 @@ impl PendingNetdTransfers {
         let stream = socket.begin_stream_receive().ok_or(LINUX_EAGAIN)?;
         self.channel_id = socket.channel_id();
         self.channel_side = socket.channel_side();
+        self.socket_token = socket.token_id();
         self.receive = true;
         self.stream = Some(stream);
         Ok(())
@@ -730,7 +734,7 @@ impl PendingNetdTransfers {
         self.receive
     }
 
-    fn receive_context(&self) -> Option<(u64, u64, u8)> {
+    fn receive_context(&self) -> Option<(u64, u64, u8, u64)> {
         if !self.receive {
             return None;
         }
@@ -738,6 +742,7 @@ impl PendingNetdTransfers {
             self.stream.as_ref()?.start(),
             self.channel_id,
             self.channel_side,
+            self.socket_token,
         ))
     }
 
@@ -896,6 +901,7 @@ fn send_transfer_context(
         stream_start: stream.start(),
         stream_end: stream.end(),
         intended_receiver: None,
+        receiver_open_description: 0,
     })
 }
 
@@ -916,7 +922,7 @@ fn copy_current_payload(request: &mut NetdIpcRequest, ptr: u64, len: u64) -> Res
 fn consume_netd_response_payload(
     request: &NetdIpcRequest,
     response: &NetdIpcResponse,
-    receive_context: Option<(u64, u64, u8)>,
+    receive_context: Option<(u64, u64, u8, u64)>,
 ) -> Result<(), i64> {
     let payload_len = response.payload_len as usize;
     if payload_len > NETD_IPC_PAYLOAD_CAPACITY {
@@ -1076,7 +1082,7 @@ fn write_current_control_payload(
     control_ptr: u64,
     control_capacity: u64,
     control: &[u8],
-    receive_context: (u64, u64, u8),
+    receive_context: (u64, u64, u8, u64),
 ) -> Result<
     (
         usize,
@@ -1193,7 +1199,7 @@ fn encode_transfer_control_payload(
 
 fn decode_transfer_control_payload(
     control: &[u8],
-    receive_context: (u64, u64, u8),
+    receive_context: (u64, u64, u8, u64),
 ) -> Result<
     (
         Vec<u8>,
@@ -1221,7 +1227,7 @@ fn decode_transfer_control_payload(
         return Ok((control.to_vec(), None));
     }
     let snapshot = multitask::current_user_snapshot().ok_or(LINUX_ESRCH)?;
-    let (stream_pos, channel_id, channel_side) = receive_context;
+    let (stream_pos, channel_id, channel_side, receiver_open_description) = receive_context;
     let prepared = super::super::ipc_ops::prepare_transfer_tickets_for_current_process(
         tickets.as_slice(),
         kernel_ipc_runtime::api::ProcessIdentity {
@@ -1239,6 +1245,7 @@ fn decode_transfer_control_payload(
             receiver_side: channel_side,
         },
         stream_pos,
+        receiver_open_description,
     )?;
     let fds = prepared.fds()?;
     let mut record = 0usize;

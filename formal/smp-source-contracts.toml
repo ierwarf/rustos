@@ -343,7 +343,7 @@ tokens = [
 ]
 
 [[required_sequences]]
-path = "kernel/ps/src/user/handles.rs"
+path = "kernel/ps/src/user/handles/transfer_registry.rs"
 tokens = [
     "pub fn bind_ipc_transfer_tickets(",
     "slot.context = Some(context);",
@@ -354,6 +354,10 @@ tokens = [
     "context.service != service",
     "context.channel != channel",
     "context.stream_start != stream_pos",
+    # A batch is bound to the exact open description that first claimed it, so
+    # no other description in a shared receiver set can take it afterwards.
+    "receiver_open_description == 0",
+    "context.receiver_open_description != receiver_open_description",
 ]
 
 [[required_sequences]]

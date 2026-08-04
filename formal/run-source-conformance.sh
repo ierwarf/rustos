@@ -343,7 +343,7 @@ while IFS='|' read -r model package test_name features; do
     checks=$((checks + 1))
 done <<'EOF'
 process-address-space-lifetime/ProcessAddressSpaceLifetime|kernel-ps|multitask::process_table::tests::process_address_space_and_exec_exit_are_serialized
-authority-identity-lifecycle/AuthorityIdentityLifecycle|kernel-ps|user::handles::transfer_registry_tests::authority_identity_exhaustion_fails_closed_before_wrap
+authority-identity-lifecycle/AuthorityIdentityLifecycle|kernel-ps|user::handles::transfer_registry::transfer_registry_tests::authority_identity_exhaustion_fails_closed_before_wrap
 authority-identity-lifecycle/AuthorityIdentityLifecycle|kernel-ps|multitask::identity_tests::task_identity_exhaustion_never_wraps_to_a_live_id
 authority-identity-lifecycle/AuthorityIdentityLifecycle|kernel-ps|multitask::process_table::tests::process_generations_fail_closed_instead_of_aliasing_stale_handles
 authority-identity-lifecycle/AuthorityIdentityLifecycle|kernel-compat|user::syscall::linux::proc_broker_ops::tests::broker_authority_identity_exhaustion_never_wraps
@@ -598,7 +598,7 @@ userspace-wait-set/UserspaceWaitSet|kernel-ps|user::handles::table::tests::close
 userspace-wait-set/UserspaceWaitSet|kernel-ps|user::handles::table::tests::close_cloexec_removes_only_flagged_entries
 userspace-wait-set/UserspaceWaitSet|kernel-ps|user::handles::table::tests::console_last_close_ignores_transient_handle_snapshot
 userspace-wait-set/UserspaceWaitSet|kernel-ps|user::handles::table::tests::duplicate_exact_replaces_target_and_applies_cloexec_flag
-userspace-wait-set/UserspaceWaitSet|kernel-ps|user::handles::transfer_registry_tests::console_token_liveness_tracks_descriptor_references_not_snapshots
+userspace-wait-set/UserspaceWaitSet|kernel-ps|user::handles::transfer_registry::transfer_registry_tests::console_token_liveness_tracks_descriptor_references_not_snapshots
 userspace-wait-set/UserspaceWaitSet|kernel-ps|user::epoll::tests::descriptor_references_are_explicit_and_transient_clones_do_not_count
 userspace-wait-set/UserspaceWaitSet|kernel-compat|user::syscall::linux::service_ops::vfs_meta::tests::tty_policy_route_requires_an_actual_console_open_description
 userspace-wait-set/UserspaceWaitSet|kernel-compat|user::syscall::linux::service_ops::vfs_socket::tests::transferred_input_description_keeps_the_waitset_service_reference
@@ -635,10 +635,10 @@ userspace-wait-set/UserspaceWaitSet|runtimed|session::tests::console_close_revok
 netd-deferred-reply/NetdDeferredReply|netd|local_socket_poll_tests::pending_slot_reservation_is_global_and_bounded
 netd-deferred-reply/NetdDeferredReply|netd|local_socket_poll_tests::poisoned_deferred_queue_is_drained_for_fail_closed_replies
 netd-deferred-reply/NetdDeferredReply|netd|local_socket_poll_tests::local_poll_wait_budget_matches_readiness_service_cap
-ipc-handle-transfer/IpcHandleTransfer|kernel-ps|user::handles::transfer_registry_tests::cancelled_transfer_moves_its_open_description_to_deferred_cleanup
-ipc-handle-transfer/IpcHandleTransfer|kernel-ps|user::handles::transfer_registry_tests::opaque_transfer_ticket_is_exact_one_shot_and_nonce_bound
-ipc-transfer-authority/IpcTransferAuthority|kernel-ps|user::handles::transfer_registry_tests::opaque_transfer_ticket_is_exact_one_shot_and_nonce_bound
-ipc-transfer-authority/IpcTransferAuthority|kernel-ps|user::handles::transfer_registry_tests::unbound_stream_transfer_requires_exact_receive_time_process_binding
+ipc-handle-transfer/IpcHandleTransfer|kernel-ps|user::handles::transfer_registry::transfer_registry_tests::cancelled_transfer_moves_its_open_description_to_deferred_cleanup
+ipc-handle-transfer/IpcHandleTransfer|kernel-ps|user::handles::transfer_registry::transfer_registry_tests::opaque_transfer_ticket_is_exact_one_shot_and_nonce_bound
+ipc-transfer-authority/IpcTransferAuthority|kernel-ps|user::handles::transfer_registry::transfer_registry_tests::opaque_transfer_ticket_is_exact_one_shot_and_nonce_bound
+ipc-transfer-authority/IpcTransferAuthority|kernel-ps|user::handles::transfer_registry::transfer_registry_tests::unbound_stream_transfer_requires_exact_receive_time_process_binding
 ipc-handle-transfer/IpcHandleTransfer|kernel-ps|user::handles::table::tests::receive_reservations_are_invisible_and_publish_atomically
 ipc-handle-transfer/IpcHandleTransfer|kernel-ps|user::handles::table::tests::cancelled_receive_reservation_is_reusable
 ipc-handle-transfer/IpcHandleTransfer|kernel-ps|user::handles::table::tests::stale_reservation_cannot_cancel_or_commit_after_exec_boundary

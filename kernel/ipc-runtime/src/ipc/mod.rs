@@ -249,6 +249,15 @@ pub struct TransferContext {
     pub stream_start: u64,
     pub stream_end: u64,
     pub intended_receiver: Option<ProcessIdentity>,
+    /// Receiving open-description token, zero until the first claim binds it.
+    ///
+    /// A shared AF_UNIX open description has no single receiver process at send
+    /// time, so `intended_receiver` alone leaves the batch claimable by any
+    /// process holding that description. Recording the exact open description
+    /// that first presented itself narrows the authority from "some member of
+    /// the receiver set" to "this exact description", and a later dup, fork, or
+    /// close cannot substitute a different one.
+    pub receiver_open_description: u64,
 }
 
 pub type EndpointReceived = (KernelReplyHandle, Vec<u8>, Vec<KernelTransferredHandle>);
