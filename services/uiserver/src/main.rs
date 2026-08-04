@@ -572,7 +572,8 @@ fn log_slow_present(
     }
     let message = if full_redraw {
         format!(
-            "uiserver: slow full present elapsed_ms={} render_ms={} present_ms={} rects={} pixels={} deferred_rects={} console_windows={} wayland_windows={} focused_session={} focused_wayland={:?}",
+            "uiserver: slow full present frame_seq={} elapsed_ms={} render_ms={} present_ms={} rects={} pixels={} deferred_rects={} console_windows={} wayland_windows={} focused_session={} focused_wayland={:?}",
+            loop_timing::current_frame_seq(),
             elapsed.as_millis(),
             render_elapsed.as_millis(),
             present_elapsed.as_millis(),
@@ -587,7 +588,8 @@ fn log_slow_present(
     } else {
         let rect = rect.unwrap_or_default();
         format!(
-            "uiserver: slow partial present elapsed_ms={} render_ms={} present_ms={} rect={}x{}@{},{} rects={} pixels={} deferred_rects={} console_windows={} wayland_windows={} focused_session={} focused_wayland={:?}",
+            "uiserver: slow partial present frame_seq={} elapsed_ms={} render_ms={} present_ms={} rect={}x{}@{},{} rects={} pixels={} deferred_rects={} console_windows={} wayland_windows={} focused_session={} focused_wayland={:?}",
+            loop_timing::current_frame_seq(),
             elapsed.as_millis(),
             render_elapsed.as_millis(),
             present_elapsed.as_millis(),
@@ -683,7 +685,8 @@ fn log_wayland_callback_only(state: &AppState, rect: canvas::Rect) {
         return;
     }
     diag_line(format!(
-        "uiserver: wayland callback-only dispatch rect={}x{}@{},{} console_windows={} wayland_windows={} focused_session={} focused_wayland={:?}",
+        "uiserver: wayland callback-only frame_seq={} dispatch rect={}x{}@{},{} console_windows={} wayland_windows={} focused_session={} focused_wayland={:?}",
+        loop_timing::current_frame_seq(),
         rect.width,
         rect.height,
         rect.x,
@@ -865,7 +868,10 @@ fn run() -> Result<(), i32> {
         total_loop_count = total_loop_count.saturating_add(1);
         watchdog.begin_loop(total_loop_count);
         let iteration_started = Instant::now();
-        let mut phase_timings = LoopPhaseTimings::default();
+        let mut phase_timings = LoopPhaseTimings {
+            frame_seq: loop_timing::next_frame_seq(),
+            ..LoopPhaseTimings::default()
+        };
 
         let gpu_completion_started = Instant::now();
         if phase_result("gpu-completion", state.poll_gpu_completions())? {
@@ -1233,6 +1239,7 @@ fn run() -> Result<(), i32> {
                 input.backlog_remaining,
             );
         }
+        loop_timing::log_frame_sample(&phase_timings, iteration_elapsed);
         profile::maybe_emit();
     }
 }
