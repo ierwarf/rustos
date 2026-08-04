@@ -110,7 +110,44 @@ Still worth closing regardless of the outcome: `arm_consumer_wake` documents
 "L0 rings at most once per generation" while `start_dvm_ingestion_worker`
 documents "L0 rings every committed record". Those cannot both be the contract.
 
-### Current blocker: rootd reply latency exceeds caller deadlines
+### Current blocker: inputd stops draining while retrying a session sync
+
+With the devmgrd registration fix in place, 8 vCPU reaches full readiness
+including storage, GPU, and UI, and then fails with the host relay's
+`fixed input-ring credit timeout outstanding=1279 limit=1279`.
+
+The guest side says exactly why:
+
+```
+inputd: DVM transport progress records=1 batch=1 batch_seq=1 stage=decoded
+inputd: DVM session authority sync retry errno=38 attempt=1
+inputd: DVM session authority sync retry errno=38 attempt=2
+inputd: DVM session authority sync retry errno=38 attempt=4
+```
+
+One record is decoded and `stage=published` never follows. The ingestion loop
+in `start_dvm_ingestion_worker` drains, decodes, then calls
+`dvm_session_sync::apply`, and retries that call with backoff until a five
+second deadline. While it retries it does not return to the drain, so the ring
+fills and the host fails closed at its 50 ms credit window.
+
+Two separate defects here, and they should not be conflated:
+
+1. `errno=38` is `ENOSYS`, which the caller treats as retryable. Earlier runs
+   did eventually reach `stage=published`, so netd is returning "not
+   implemented" to mean "not ready yet". A terminal errno standing in for a
+   transient condition is exactly what `V5-DEADLINE-012` forbids: the caller
+   cannot distinguish a provider that will never implement the op from one
+   that is still starting. netd should return a distinguishable transient
+   status, and inputd should fail fast on genuinely terminal ones.
+2. The larger defect is the coupling. `start_dvm_ingestion_worker` documents
+   that "device progress is independent of any application's read cadence",
+   and it is not: a downstream service handshake blocks device ingress. The
+   drain and the publish need to be separated so a stalled publish cannot stop
+   the ring from being emptied. Fixing only the errno semantics would leave
+   this intact and the next slow downstream would reproduce it.
+
+### Earlier blocker, now fixed: devmgrd registered before it could serve
 
 After the two commits above, boot on 8 vCPU stops with
 
