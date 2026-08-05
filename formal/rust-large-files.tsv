@@ -5,7 +5,7 @@ kernel/compat/src/user/syscall/linux/proc_broker_ops.rs	1920	compat-process-brok
 kernel/compat/src/user/syscall/linux/service_ops/ipc_helpers.rs	1886	compat-service-ipc	Split typed calls, response admission, retry policy, and tests.
 kernel/compat/src/user/syscall/linux/service_ops/vfs_meta.rs	1559	compat-vfs	Split metadata RPCs, message-vector copyout, and AF_UNIX transfer control transactions.
 kernel/compat/src/user/syscall/linux/service_ops/poll_epoll.rs	1370	compat-waitset	Split poll translation, epoll registration, waits, and lifecycle tests.
-kernel/compat/src/user/syscall/linux/service_ops/vfs_socket.rs	1603	compat-vfs	Split file-descriptor transport, socket transport, and response admission.
+kernel/compat/src/user/syscall/linux/service_ops/vfs_socket.rs	1592	compat-vfs	Split file-descriptor transport, socket transport, and response admission.
 kernel/io-manager/src/io/dvm_block.rs	1595	io-block	Split protocol admission, queue lifecycle, DMA aperture, and tests.
 kernel/io-manager/src/io/dvm_display.rs	1784	io-display	Split handshake, shared-surface lifecycle, present queue, and tests.
 kernel/ipc-runtime/src/ipc/mod.rs	3077	ipc-runtime	Split endpoint, reply, shared-region, accounting, and test modules.

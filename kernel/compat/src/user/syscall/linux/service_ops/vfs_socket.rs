@@ -1195,13 +1195,29 @@ fn call_netd_socket_token_op_bounded(op: u16, socket_token: u64) -> Result<u64, 
                 // The provider operation is already committed. Acknowledgement
                 // is maintenance and must not add another full IPC deadline to
                 // close/dup latency; preserve it as an exact replayable item.
-                enqueue_pending_netd_ref(PendingNetdRef {
+                // The provider operation is committed and the local descriptor
+                // is already released, so a full replay queue is a maintenance
+                // backlog and not the caller's failure. Propagating `ENOSPC`
+                // here makes `close` fail, which POSIX does not allow to leave
+                // the descriptor open and which callers treat as fatal:
+                // `wayland-server` dropped a live client on exactly this,
+                // retiring WayClick's surface mid-session.
+                if enqueue_pending_netd_ref(PendingNetdRef {
                     op,
                     socket_token,
                     operation_hi: request.operation_hi,
                     operation_lo: request.operation_lo,
                     acknowledge_only: true,
-                })?;
+                })
+                .is_err()
+                {
+                    crate::debug::record_milestone(
+                        crate::debug::LogCategory::Service,
+                        "netd-ref-ack-dropped",
+                        socket_token,
+                        u64::from(op),
+                    );
+                }
                 return Ok(response.value);
             }
             Err(errno)
@@ -1216,13 +1232,26 @@ fn call_netd_socket_token_op_bounded(op: u16, socket_token: u64) -> Result<u64, 
             Err(errno) => return Err(errno),
         }
     }
-    enqueue_pending_netd_ref(PendingNetdRef {
+    // A full replay queue must not replace the transport error that actually
+    // ended the retries. `last` is what the caller can act on; `ENOSPC` from
+    // the queue is an internal capacity fact the caller cannot distinguish
+    // from a terminal condition.
+    if enqueue_pending_netd_ref(PendingNetdRef {
         op,
         socket_token,
         operation_hi: request.operation_hi,
         operation_lo: request.operation_lo,
         acknowledge_only: false,
-    })?;
+    })
+    .is_err()
+    {
+        crate::debug::record_milestone(
+            crate::debug::LogCategory::Service,
+            "netd-ref-replay-dropped",
+            socket_token,
+            u64::from(op),
+        );
+    }
     Err(last)
 }
 
