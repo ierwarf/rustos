@@ -80,7 +80,7 @@ by writing the mapping down rather than by renaming either side.
 
 | item | what is actually missing |
 |---|---|
-| `V5-SCHED-GLOBAL-001` | no `PerCpuScheduler`, no backend selection; one `static SCHEDULER` still serializes every CPU. Section 2 |
+| `V5-SCHED-GLOBAL-001` | **narrower than the item text.** The per-CPU runqueue, owner words, remote mailboxes, and per-CPU selection all exist and are already lock-free. What is left is that the `Scheduler` struct's per-task arrays still sit behind one `TrackedSpinLock`, so the remaining work is a data-structure split. Stage one is done: the owner word and the legacy tables were proven to agree, zero mismatches at 1 and 8 vCPU. Section 2 |
 | `V5-FORMAL-SCHED-019` | `SchedulerCpuOwnership.tla` models the guard, not the removal of the guard. Section 2.7 |
 | `V5-VFSD-HOL-007` | **structure landed, runtime evidence owed.** The receive owner never blocks, the plan carries its mount generation and the commit refuses a stale one, and custody is a bounded two-worker pool. What is still owed is the measured control-lane residence bound in section 3, and the 2005 ms snapshot itself is still unattributed. Section 3 |
 | `V5-WAYLAND-HOL-013`, `V5-GPU-UI-OWNER-014` | no `WaylandProtocolOwner`, `SceneOwner`, `GpuSubmissionOwner`, or `FramePlan`. Section 4 |
@@ -95,22 +95,46 @@ of from identifiers.
 
 ### 2.1 What the measurement changed about the target
 
-Two sessions of measurement resized this item and the design has to reflect
-that, not the audit's original framing.
+Three sessions of measurement have resized this item twice, and the design has
+to reflect what is in the tree rather than the audit's framing.
 
-- The audit assumed dispatch selection was the serialized resource. It is not:
-  the guard is taken about eighteen times per dispatch, and the excess is wake,
-  pick hints, donation, affinity, and lifecycle traffic.
-- The largest callers were read-only identity queries, now answered from a
-  published per-slot record, and the syscall SIMD pair, now held outside the
-  lock entirely.
-- What remains on the lock after that is genuine scheduling: at 1 vCPU the top
-  caller is `irq.rs:712`, the voluntary-yield dispatch, and its worst owner turn
-  is essentially fully attributed to in-owner segments.
+**The audit's framing.** Dispatch selection is serialized by a global lock;
+build a per-CPU runqueue.
 
-So the target is not "make the critical section shorter". It is **CPU-local
-authority**, so that the fourteen-odd acquisitions a dispatch needs stop being
-global.
+**First correction, from the acquisition census.** The guard is taken about
+eighteen times per dispatch, and the excess is wake, pick hints, donation,
+affinity, and lifecycle traffic. The largest callers were read-only identity
+queries and the syscall SIMD pair, both now answered outside the lock.
+
+**Second correction, from reading `runqueue.rs`.** The per-CPU runqueue is not
+missing. It is implemented, and already lock-free with respect to the global
+scheduler lock:
+
+- it owns a per-slot `RunOwnerWord` with the full state machine
+  `Dormant -> Blocked/Local -> RemoteQueued -> Local -> Running`, plus explicit
+  `Migrating`, `Retiring`, and `Retired` custody;
+- `publish_remote_wake` CASes the owner word and takes only the *target's*
+  mailbox lock, with a 0->1 edge granting notification custody to exactly one
+  producer;
+- `drain_remote_wakes` takes only the mailbox lock and the target's own rq lock;
+- every selection, steal, balance, and locality path already iterates
+  `local_runnable_slots(cpu)`. There is no global ready scan anywhere.
+
+So what the global `SCHEDULER` lock still protects is neither the queue nor the
+selection. It is the `Scheduler` struct itself: one `TrackedSpinLock` over the
+per-task arrays — `contexts` (ready, blocked, vruntime, stacks, address-space
+root), `starts`, `retired`, the SIMD slots, and the lifecycle flags.
+
+**The remaining work for `V5-SCHED-GLOBAL-001` is therefore a data-structure
+split, not a scheduling-algorithm change.** The per-task fields only the owning
+CPU mutates have to leave the globally locked struct for per-slot storage whose
+writer is that CPU, exactly as the writer table in 2.4 states. The scheduling
+policy above them is already per-CPU and does not move.
+
+This is also why `context.ready` matters more than it looks. It duplicates what
+the owner word already says, and stage one proved they agree — zero mismatches
+at 1 and 8 vCPU. Removing it as authority is the first field of the split, not a
+cleanup.
 
 ### 2.2 Reference designs and what each contributes
 
@@ -248,23 +272,35 @@ admitted by utilization, which is the Zircon framing.
 
 ### 2.7 Cutover, and the model that has to come with it
 
-1. Compute the new state as a **shadow read-only** projection under the legacy
-   backend and emit divergence markers only.
-2. Select one authoritative backend at boot, `Legacy` or `PerCpu`. **Dual-write
-   is forbidden**; the audit is right that a dual-authority route is how this
-   kind of migration fails silently.
-3. Enable in order: 1 vCPU, then 2 with remote wake and mailbox, then migration
-   and steal, then donation and deadline at 4 and 8.
-4. Only after acceptance, delete `context.ready` authority, the global ready
-   scan, and the legacy formal model.
+Restated for what the tree actually is. The policy layer does not move; the
+per-task state does.
+
+1. **Prove the two authorities agree** while the global lock still serializes
+   both. Done: `run_authority::compare` sweeps every slot once per drain and
+   reports the first disagreement with a direction, and the calling CPU's
+   in-flight dispatch pair is excluded because it disagrees by construction.
+   Zero mismatches at 1 and 8 vCPU.
+2. **Retire `context.ready` as authority.** It duplicates the owner word, which
+   step one proved. Every reader moves to `runqueue::owner(slot)`; the field is
+   deleted rather than left as a shadow, because a shadow is what goes stale.
+3. **Move the remaining per-task fields out of the globally locked struct**, in
+   the writer classes of 2.4: saved frame, kernel stack, FPU/SIMD, TLS, and the
+   mm-active bit are written only by the `Running` owner, so they belong in
+   per-slot storage that CPU owns. Lifecycle rows stay behind the directory
+   token.
+4. **Delete the global guard** from the paths that no longer touch shared state,
+   and only then the legacy formal model.
+
+Each step keeps its own KVM gate at 1, then 2, then 4 and 8. Dual-write is
+forbidden throughout: the divergence sweep is a comparison of two authorities
+that already exist, not a second copy maintained in parallel.
 
 `V5-FORMAL-SCHED-019` closes with a refinement model whose variables are the
-owner word, the per-CPU queues, the transfer token, `current`, and the
-transition stack, and whose properties are exact-one ownership and a
-queue-to-owner refinement. It must kill these mutants: guard removal without
-owner-word protection, dual-write divergence between legacy and per-CPU state,
-transfer token reuse, and swapping the source and destination halves of a
-migration.
+owner word, the per-CPU queues, the transfer token, `current`, and the transition
+stack, and whose properties are exact-one ownership and a queue-to-owner
+refinement. It must kill these mutants: guard removal without owner-word
+protection, dual divergence between legacy and per-CPU state, transfer token
+reuse, and swapping the source and destination halves of a migration.
 
 ## 3. vfsd receive owner and bulk lane (`V5-VFSD-HOL-007`)
 
