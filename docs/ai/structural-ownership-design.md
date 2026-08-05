@@ -338,6 +338,27 @@ The remaining readers are therefore converted **one at a time, each with its own
 two-run gate**, and `context.ready` becomes diagnostic-only only when the last
 one is done. Anything else re-learns this at the cost of a build and two runs.
 
+That method paid immediately. Converting `handoff_slot_ready` alone panicked on
+both runs — `handoffs.rs:130`, a suspended task's frame failing validation — from
+a base that had read clean twice. So the batch failure was not three small
+effects; at least this one member is enough on its own.
+
+Why is not yet known, and the obvious explanation is wrong: `handoff_slot_ready`
+already excludes `start_suspended` slots, so the conversion does not change what
+it says about them. The only predicate that actually moved is `Migrating` — the
+old `ready && !blocked` could admit a slot in migration custody as a handoff
+target and `Local | RemoteQueued` cannot. Excluding it should be conservative,
+and it is not, which means something downstream depends on a migrating slot
+being nominated. That is what the next attempt has to establish before touching
+this site again.
+
+Two things follow for whoever picks this up. The panic reproduces at
+`36ab344` as well, so it is not created by these conversions — but it went from
+intermittent to two-for-two here, and a change that reliably provokes a
+pre-existing race is not therefore safe. And `context.ready` cannot become
+diagnostic-only until this site is understood, because it is the last predicate
+where "queued" and "not blocked" genuinely differ.
+
 `V5-FORMAL-SCHED-019` closes with a refinement model whose variables are the
 owner word, the per-CPU queues, the transfer token, `current`, and the transition
 stack, and whose properties are exact-one ownership and a queue-to-owner
