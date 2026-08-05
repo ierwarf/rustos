@@ -678,6 +678,48 @@ wrong. Sites inside `local_runnable_slots(cpu)` loops are redundant filters and
 are safe; the rest need per-site review. This is deliberately not started
 half-way.
 
+### Five blockers fixed to root cause, and where the FPS gate now stands
+
+8 vCPU reaches `RustOS missing=[]` and `Linux-DVM missing=[]`. It could not boot
+at the start of this session. Five defects were found, each to a mechanism
+rather than a symptom:
+
+1. **Activation panic, intermittent across three sessions.**
+   `reserve_user_thread_slot` guards its scan with `!thread_slot_reserved[slot]`;
+   the four allocation scans in `scheduler.rs` tested only for an absent
+   context, so a process spawn could take a slot a pending thread commit owned.
+   Both wrote the same stack and activation found a frame with correct bounds,
+   an intact canary, and all-zero contents. Fixed; three consecutive runs clean.
+2. **WayClick died with `wl_display` `Invalid new_id`.** The frame-callback send
+   gate also required a populated pixel cache, so a callback requested before
+   the first buffer copy was held forever while the client reused the protocol
+   id. Fixed by gating on visibility only.
+3. **`ENOSPC` from a full IPC donation table** failed the whole call. Priority
+   inheritance is an optimisation; it now degrades to `Ordinary` and reports
+   `ipc-donation-capacity-degraded`.
+4. **`ENOSPC` from a full netd replay queue made `close` fail**, which POSIX
+   does not permit and `wayland-server` treats as fatal. The acknowledgement is
+   dropped with a milestone instead; the retry-exhausted path returns the real
+   transport error.
+5. **Backpressure withheld the frame-callback permit.** `wayland_frame_permit`
+   was regranted only by `Rendered`, so a backpressured display stopped frame
+   callbacks and the client blocked in `blocking_dispatch` with no error.
+
+Items 3 and 4 are the same defect shape the audit already names in
+`V5-DEADLINE-012`: a transient capacity condition expressed as a terminal
+errno, which the caller cannot distinguish from a permanent failure.
+
+**Where the FPS gate stands.** WayClick's continuous frame loop and its
+`wayclick profile:` lines — which the gate's predicate reads — are both gated on
+`RUSTOS_WAYCLICK_PROFILE`. That variable *is* delivered: the client logs
+`wayclick: acceptance profile enabled`. So the remaining failure is not
+configuration. The loop still does not complete a one-second window on every
+run: one run reached 1232 frame callbacks, others reach a handful, and the
+client is still occasionally dropped. Attribute the next stall with the
+`frame_seq` join `V5-UI-PIPELINE-011` calls for rather than by inspection —
+every guess in this area so far has been wrong, and the two that were measured
+were both answered in a single run.
+
 ### Gate status
 
 - 1 vCPU: passes, with zero owner-word mismatches and zero identity divergence.
