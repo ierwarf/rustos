@@ -1624,6 +1624,19 @@ impl Scheduler {
         }
     }
 
+    /// The first slot an allocation may claim.
+    ///
+    /// A slot is free only when no context is bound **and** no thread
+    /// reservation holds it. `reserve_user_thread_slot` leaves the context
+    /// absent while it owns the slot, so testing the context alone hands a
+    /// reserved slot to a process allocation and both write the same stack.
+    #[cfg(test)]
+    pub(super) fn first_allocatable_slot(&self) -> usize {
+        (FIRST_DYNAMIC_TASK_SLOT..MAX_TASK)
+            .find(|slot| self.contexts[*slot].is_none() && !self.thread_slot_reserved[*slot])
+            .unwrap_or(MAX_TASK)
+    }
+
     fn reset_stack_storage(&mut self, slot: usize) -> Option<()> {
         self.allocate_stack_storage(slot)?;
         self.stack_storage_mut(slot).fill(0);
@@ -1922,7 +1935,7 @@ impl Scheduler {
         kernel_task_entry_rip: u64,
     ) -> Option<usize> {
         for slot in FIRST_DYNAMIC_TASK_SLOT..MAX_TASK {
-            if self.contexts[slot].is_none() {
+            if self.contexts[slot].is_none() && !self.thread_slot_reserved[slot] {
                 self.reset_stack_storage(slot)?;
                 let (kernel_stack_base, kernel_stack_top) = self.stack_bounds(slot);
                 self.contexts[slot] = Some(TaskContext {
@@ -1984,7 +1997,7 @@ impl Scheduler {
     ) -> Option<usize> {
         let inherited_process_mask = self.inherited_process_affinity(parent_process_id);
         for slot in FIRST_DYNAMIC_TASK_SLOT..MAX_TASK {
-            if self.contexts[slot].is_none() {
+            if self.contexts[slot].is_none() && !self.thread_slot_reserved[slot] {
                 self.reset_stack_storage(slot)?;
                 let saved_rsp =
                     self.init_user_task_context(slot, &bootstrap, user_cs, user_ss, rflags);
@@ -2093,7 +2106,7 @@ impl Scheduler {
         idle_entry: fn(u64),
     ) -> Option<usize> {
         for slot in FIRST_DYNAMIC_TASK_SLOT..MAX_TASK {
-            if self.contexts[slot].is_none() {
+            if self.contexts[slot].is_none() && !self.thread_slot_reserved[slot] {
                 self.reset_stack_storage(slot)?;
                 let saved_rsp =
                     self.init_user_task_context(slot, &bootstrap, user_cs, user_ss, rflags);
@@ -2164,7 +2177,7 @@ impl Scheduler {
         rflags: u64,
     ) -> Option<usize> {
         for slot in FIRST_DYNAMIC_TASK_SLOT..MAX_TASK {
-            if self.contexts[slot].is_none() {
+            if self.contexts[slot].is_none() && !self.thread_slot_reserved[slot] {
                 self.reset_stack_storage(slot)?;
                 let root_phys = process_state.address_space_root();
                 let _exec_path = String::from(process_state.exec_path());

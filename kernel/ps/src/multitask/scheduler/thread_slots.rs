@@ -148,3 +148,32 @@ impl Scheduler {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::FIRST_DYNAMIC_TASK_SLOT;
+    use super::super::tests::boxed_scheduler;
+
+    #[test]
+    fn a_reserved_thread_slot_is_never_handed_to_a_process_allocation() {
+        // `reserve_user_thread_slot` leaves `contexts[slot]` as `None` while it
+        // holds the slot, so an allocation scan that only tests for an absent
+        // context will take a slot a pending thread commit already owns. Both
+        // then write the same stack: the process allocation zeroes it and
+        // installs its frame, the thread commit installs its own context whose
+        // `saved_rsp` points into the zeroed region, and activation later finds
+        // a frame with correct bounds, an intact canary, and all-zero contents.
+        //
+        // That is the `handoffs.rs` activation panic that failed 8-vCPU runs
+        // intermittently across three sessions.
+        let mut scheduler = boxed_scheduler();
+        let reserved = FIRST_DYNAMIC_TASK_SLOT;
+        scheduler.thread_slot_reserved[reserved] = true;
+        assert!(scheduler.contexts[reserved].is_none());
+
+        // Every allocation scan must skip it while it stays reserved.
+        assert!(scheduler.first_allocatable_slot() > reserved);
+        scheduler.thread_slot_reserved[reserved] = false;
+        assert_eq!(scheduler.first_allocatable_slot(), reserved);
+    }
+}
