@@ -112,7 +112,11 @@ impl Scheduler {
             self.collect_live_process_sibling_slots(target_slot, process_handle);
         for slot in siblings.into_iter().take(count) {
             let running_cpu = super::super::cpu_local::task_running_cpu(slot);
-            if remote_task_requires_quiescence(slot, self.current_task_slot(), running_cpu.is_some()) {
+            if remote_task_requires_quiescence(
+                slot,
+                self.current_task_slot(),
+                running_cpu.is_some(),
+            ) {
                 self.quarantine_slot_for_deferred_retirement(slot, TaskRetireReason::Exited);
                 #[cfg(not(test))]
                 super::super::irq::request_target_reschedule(
@@ -285,7 +289,8 @@ impl Scheduler {
             .checked_sub(usize::from(logical_index))
             .expect("secondary idle slot underflow");
         assert_eq!(
-            self.current_task_slot(), expected_slot,
+            self.current_task_slot(),
+            expected_slot,
             "secondary CPU entered with another CPU's current task"
         );
         assert_eq!(

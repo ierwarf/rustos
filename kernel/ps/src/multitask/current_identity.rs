@@ -98,8 +98,7 @@ impl PublishedIdentity {
 )]
 const EMPTY_IDENTITY: PublishedIdentity = PublishedIdentity::empty();
 
-static IDENTITIES: [PublishedIdentity; MAX_SCHEDULER_TASKS] =
-    [EMPTY_IDENTITY; MAX_SCHEDULER_TASKS];
+static IDENTITIES: [PublishedIdentity; MAX_SCHEDULER_TASKS] = [EMPTY_IDENTITY; MAX_SCHEDULER_TASKS];
 
 /// Conservative per-slot "this thread may have a pending signal" hint, the
 /// same role `TIF_SIGPENDING` plays in Linux: syscall return checks it on every
@@ -202,7 +201,8 @@ pub(super) fn publish(slot: usize, identity: TaskIdentity) {
 
     // ORDERING: the odd version must be visible before any field changes, or a
     // reader could load a half-updated record and still see a stable version.
-    cell.version.store(version.wrapping_add(1), Ordering::Relaxed);
+    cell.version
+        .store(version.wrapping_add(1), Ordering::Relaxed);
     fence(Ordering::Release);
     cell.task_id
         .store(identity.task_id.unwrap_or(0), Ordering::Relaxed);
@@ -228,7 +228,8 @@ pub(super) fn clear(slot: usize) {
         0,
         "task identity: concurrent retirement for slot {slot}"
     );
-    cell.version.store(version.wrapping_add(1), Ordering::Relaxed);
+    cell.version
+        .store(version.wrapping_add(1), Ordering::Relaxed);
     fence(Ordering::Release);
     cell.flags.store(0, Ordering::Relaxed);
     cell.version

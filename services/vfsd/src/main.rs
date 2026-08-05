@@ -381,7 +381,6 @@ fn serve(endpoint: u64, mut state: VfsState) {
     }
 }
 
-
 fn reply_executable_snapshot(
     reply_cap: u64,
     sender_pid: u64,

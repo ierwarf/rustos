@@ -20,9 +20,9 @@ use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
 
 #[path = "handles/display_surface.rs"]
 mod display_surface;
-mod transfer_registry;
 #[path = "handles/table.rs"]
 mod table;
+mod transfer_registry;
 #[path = "handles/vfs.rs"]
 mod vfs;
 
@@ -190,8 +190,6 @@ impl ConsoleHandle {
             .map(|entry| entry.stream)
     }
 }
-
-
 
 fn fresh_ipc_transfer_nonce() -> u64 {
     loop {
@@ -502,5 +500,3 @@ fn file_rights_from_status_flags(status_flags: u64) -> FileHandleRights {
     }
     rights
 }
-
-

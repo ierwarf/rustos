@@ -182,7 +182,11 @@ pub(super) fn dependency_reaches(start: usize, target: usize) -> bool {
 }
 
 #[cfg(any(rustos_boot_image, test))]
-pub(super) fn graph_reaches(start: usize, target: usize, mut edges: impl FnMut(usize) -> u64) -> bool {
+pub(super) fn graph_reaches(
+    start: usize,
+    target: usize,
+    mut edges: impl FnMut(usize) -> u64,
+) -> bool {
     let mut frontier = 1_u64 << start;
     let mut visited = 0_u64;
     while frontier != 0 {

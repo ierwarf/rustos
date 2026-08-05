@@ -114,7 +114,10 @@ impl Scheduler {
         true
     }
 
-    pub(in crate::multitask) fn cancel_ipc_priority_reservation(&mut self, donor_task_id: u64) -> bool {
+    pub(in crate::multitask) fn cancel_ipc_priority_reservation(
+        &mut self,
+        donor_task_id: u64,
+    ) -> bool {
         let Some(index) = self.ipc_priority_donations[..self.ipc_priority_donation_len]
             .iter()
             .position(|entry| {
@@ -131,7 +134,11 @@ impl Scheduler {
     /// was waiting at publication time. The eventual `IPC_RECV` owns binding
     /// that reply to its concrete receiver; timeout/cancel can meanwhile
     /// revoke it by reply identity without retaining process-wide authority.
-    pub(in crate::multitask) fn attach_reserved_ipc_priority(&mut self, reply: u64, donor_task_id: u64) -> bool {
+    pub(in crate::multitask) fn attach_reserved_ipc_priority(
+        &mut self,
+        reply: u64,
+        donor_task_id: u64,
+    ) -> bool {
         if reply == 0 {
             return false;
         }

@@ -193,12 +193,8 @@ extern "C" fn snapshot_worker_entry() -> ! {
         let job = unsafe { (*SNAPSHOT_JOB.0.get()).assume_init_read() };
         // Storage is acquired inside, per phase and per chunk, never held
         // across the bulk read.
-        let _ = reply_executable_snapshot(
-            job.reply_cap,
-            job.sender_pid,
-            job.sender_tid,
-            &job.request,
-        );
+        let _ =
+            reply_executable_snapshot(job.reply_cap, job.sender_pid, job.sender_tid, &job.request);
         SNAPSHOT_JOB_ADMISSION.release();
     }
 }

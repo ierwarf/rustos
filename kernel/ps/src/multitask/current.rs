@@ -222,8 +222,7 @@ pub fn current_user_process_thread_count() -> Option<usize> {
 /// costs no scheduler lock.
 pub fn current_thread_may_have_pending_signals() -> bool {
     interrupts::without_interrupts(|| {
-        cpu_local::current_cpu_task_slot()
-            .is_none_or(super::current_identity::signal_pending)
+        cpu_local::current_cpu_task_slot().is_none_or(super::current_identity::signal_pending)
     })
 }
 

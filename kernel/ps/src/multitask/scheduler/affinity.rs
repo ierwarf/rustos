@@ -64,7 +64,8 @@ impl Scheduler {
             // production, a scheduler guard's scratch `current_task` is the
             // exact calling CPU slot loaded by `cpu_local::scheduler_mut`.
             .or_else(|| {
-                (slot == self.current_task_slot()).then(nucleus_core::util::lockdep::current_cpu_index)
+                (slot == self.current_task_slot())
+                    .then(nucleus_core::util::lockdep::current_cpu_index)
             });
         owner_cpu.is_some_and(|cpu| requested_mask & (1_u64 << cpu) == 0)
     }

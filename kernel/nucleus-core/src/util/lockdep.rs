@@ -37,13 +37,13 @@ use spin::{Mutex, MutexGuard};
 mod cpu_identity;
 #[cfg(any(rustos_boot_image, test))]
 mod dependency_graph;
+#[cfg(test)]
+use dependency_graph::graph_reaches;
 #[cfg(rustos_boot_image)]
 use dependency_graph::{
     DEPENDENCIES, VALIDATED_RAW_EDGES, VALIDATED_TASK_EDGES, dependency_reaches,
     edge_already_validated, irq_dependency_conflicts, publish_validated_edge, record_irq_usage,
 };
-#[cfg(test)]
-use dependency_graph::graph_reaches;
 #[cfg(rustos_boot_image)]
 mod raw_diag;
 mod scheduler_diag;
@@ -52,8 +52,7 @@ mod spin_budget;
 
 pub use cpu_identity::{
     bind_current_cpu_identity, current_apic_id, current_cpu_index, finalize_cpu_identities,
-    hardware_apic_id,
-    register_cpu_identity,
+    hardware_apic_id, register_cpu_identity,
 };
 pub use scheduler_diag::{
     SchedulerDispatchWitness, SchedulerObservation, SchedulerObservationKind,
@@ -1053,7 +1052,6 @@ fn before_acquire_with_irq_tracking(
     });
     PendingAcquire { class }
 }
-
 
 #[cfg(not(rustos_boot_image))]
 fn before_acquire(class: u8, _acquire_site: ()) -> PendingAcquire {
