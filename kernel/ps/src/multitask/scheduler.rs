@@ -574,7 +574,18 @@ impl Scheduler {
             && !self.job_stopped[slot]
             && !self.exec_target_quiesced[slot]
             && self.deferred_retire_reasons[slot].is_none()
-            && self.contexts[slot].is_some_and(|context| context.ready && !context.blocked)
+            // Queue membership replaces `context.ready`, but `!blocked` stays.
+            //
+            // The first conversion dropped it and panicked on both 8-vCPU runs.
+            // The predicates differ in *both* directions, not just the obvious
+            // one: a slot can be `Local` while `blocked` is already true —
+            // `commit_block_current_task` raises `blocked` before the next turn
+            // moves the owner word — and the old conjunction excluded it while
+            // queue membership alone admits it. Nominating that slot dispatches
+            // a task that believes it is blocked, which is how a suspended
+            // frame ends up failing validation.
+            && self.contexts[slot].is_some_and(|context| !context.blocked)
+            && self.slot_is_runnable(slot)
     }
 
     fn new_task_vruntime(&self) -> u64 {
