@@ -416,7 +416,7 @@ loader-request-authority/LoaderRequestAuthority|kernel-compat|user::syscall::lin
 remote-file-mapping/RemoteFileMapping|rustos-user-abi|syscall::syscall_tests::statx_offload_messages_fit_inline_ipc_v1
 remote-file-mapping/RemoteFileMapping|vfsd|tests::early_system_reads_chunk_larger_vfs_buffers_to_the_broker_bound
 remote-file-mapping/RemoteFileMapping|kernel-compat|user::syscall::linux::proc_broker_ops::tests::truncated_file_mapping_never_commits_zero_filled_tail
-syscall-simd-lifecycle/SyscallSimdLifecycle|kernel-ps|multitask::scheduler::tests::syscall_user_simd_snapshot_is_disjoint_from_scheduler_continuation
+syscall-simd-lifecycle/SyscallSimdLifecycle|kernel-ps|multitask::syscall_simd::tests::syscall_simd_image_is_captured_once_consumed_once_and_dropped_by_rebind
 syscall-simd-lifecycle/SyscallSimdLifecycle|kernel-compat|user::syscall::tests::sysret_validation_follows_last_interruptible_resume
 syscall-simd-lifecycle/SyscallSimdLifecycle|kernel-compat|user::syscall::tests::sysret_contract_rejects_forbidden_rflags
 syscall-simd-lifecycle/SyscallSimdLifecycle|kernel-compat|user::syscall::tests::syscall_entry_preserves_xmm_before_any_rust_dispatch

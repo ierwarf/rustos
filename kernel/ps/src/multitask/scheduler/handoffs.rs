@@ -13,9 +13,48 @@
 //! - **Evidence:** `atomic-process-activation-batch`,
 //!   `bootstrap-activation-handoff`, and `synchronous-ipc-handoff`.
 
-use super::{MAX_ATOMIC_ACTIVATION_HANDOFFS, MAX_CONSECUTIVE_SYNC_HANDOFFS, Scheduler};
+use super::{
+    MAX_ATOMIC_ACTIVATION_HANDOFFS, MAX_CONSECUTIVE_SYNC_HANDOFFS, Scheduler, TaskContext,
+};
 
 impl Scheduler {
+    /// Publishes the geometry and contents behind a rejected activation frame.
+    ///
+    /// Emitted as milestones because the ordinary log channel does not reach
+    /// the debug transport in the product configuration, and because the panic
+    /// that follows must not depend on formatting to be diagnosable.
+    fn report_invalid_activation_context(&self, task_id: u64, slot: usize, context: &TaskContext) {
+        let saved_rsp = context.saved_rsp as u64;
+        crate::debug::record_milestone(
+            crate::debug::LogCategory::Sched,
+            "sched-activation-invalid-slot",
+            (task_id << 32) | slot as u64,
+            saved_rsp,
+        );
+        crate::debug::record_milestone(
+            crate::debug::LogCategory::Sched,
+            "sched-activation-invalid-stack",
+            context.kernel_stack_base,
+            context.kernel_stack_top,
+        );
+        let (rflags, cs, rip, rsp) = match Self::saved_context_ref(context.saved_rsp) {
+            Some(saved) => (saved.rflags, saved.cs, saved.rip, saved.rsp),
+            None => (0, 0, 0, 0),
+        };
+        crate::debug::record_milestone(
+            crate::debug::LogCategory::Sched,
+            "sched-activation-invalid-frame",
+            rflags,
+            (cs << 32) | (rip & u64::from(u32::MAX)),
+        );
+        crate::debug::record_milestone(
+            crate::debug::LogCategory::Sched,
+            "sched-activation-invalid-frame-rsp",
+            rsp,
+            u64::from(self.stack_frame_is_all_zero(context.saved_rsp)),
+        );
+    }
+
     pub(in crate::multitask) fn activate_suspended_user_task(&mut self, task_id: u64) -> bool {
         self.activate_suspended_user_tasks(core::slice::from_ref(&task_id))
     }
@@ -82,6 +121,12 @@ impl Scheduler {
             if let Err(reason) =
                 self.validate_saved_context(slot, context.user_mode, context.saved_rsp)
             {
+                // The reason alone cannot separate "the frame was never
+                // written" from "the frame was written somewhere else" from
+                // "something overwrote it". Report the exact slot geometry and
+                // the words actually present so the next occurrence is
+                // attributable without another run.
+                self.report_invalid_activation_context(task_id, slot, &context);
                 panic!(
                     "scheduler activation invariant: suspended task {task_id} has invalid context: {reason}"
                 );

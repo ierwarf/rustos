@@ -6,11 +6,12 @@
 
 use super::*;
 use core::cell::UnsafeCell;
+use core::panic::Location;
 use core::sync::atomic::{AtomicU8, Ordering};
 
 const PROFILE_TOP_TASKS: usize = 4;
 pub(super) const SCHEDULER_ENTRY_CAUSE_COUNT: usize = 4;
-pub(super) const SCHEDULER_PHASE_COUNT: usize = 8;
+pub(super) const SCHEDULER_PHASE_COUNT: usize = 9;
 const PROFILE_EMPTY: u8 = 0;
 const PROFILE_BUSY: u8 = 1;
 const PROFILE_READY: u8 = 2;
@@ -47,6 +48,11 @@ pub(in crate::multitask) enum SchedulerPhase {
     Commit = 6,
     /// SIMD save/restore and the architectural task-state restore.
     ArchRestore = 7,
+    /// Everything one acquisition does before its caller runs: owner
+    /// publication and the deferred wake drain. This is in-owner cost charged
+    /// to whichever caller took the lock next rather than to what it asked
+    /// for, so it is only visible as a segment of its own.
+    Prologue = 8,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -75,6 +81,13 @@ pub(in crate::multitask) struct SchedulerRuntimeProfile {
     pub(in crate::multitask) lock_hold_ns: u64,
     pub(in crate::multitask) lock_wait_max_ns: u64,
     pub(in crate::multitask) lock_hold_max_ns: u64,
+    /// The acquisition site that produced `lock_hold_max_ns`, and the in-owner
+    /// segment time that same acquisition attributed. A maximum without these
+    /// cannot separate a long critical section from a descheduled vCPU: if the
+    /// attributed share is near zero the owner was not running.
+    pub(in crate::multitask) lock_hold_max_caller: Option<&'static Location<'static>>,
+    pub(in crate::multitask) lock_hold_max_attributed_ns: u64,
+    pub(in crate::multitask) deferred_wakes: u64,
     pub(in crate::multitask) phase_ns: [u64; SCHEDULER_PHASE_COUNT],
     pub(in crate::multitask) runnable_samples: u64,
     /// First slot whose lock-free identity record disagrees with the
@@ -200,6 +213,29 @@ pub fn drain_scheduler_runtime_profile() -> usize {
             profile.lock_wait_ns / 1_000,
             profile.lock_wait_max_ns / 1_000,
         ),
+    );
+    // The single worst owner turn of the window, with the segment time that
+    // same turn attributed and the site that acquired it.
+    // arg0=(hold max us, attributed us), arg1=(caller file hash, caller line).
+    crate::debug::record_milestone(
+        crate::debug::LogCategory::Sched,
+        "kernel-scheduler-hold-max",
+        pack_u32_pair(
+            profile.lock_hold_max_ns / 1_000,
+            profile.lock_hold_max_attributed_ns / 1_000,
+        ),
+        profile
+            .lock_hold_max_caller
+            .map(|caller| (u64::from(fnv1a32(caller.file())) << 32) | u64::from(caller.line()))
+            .unwrap_or(0),
+    );
+    // Owner publication plus the deferred wake drain, which every acquisition
+    // pays before its caller runs. arg0=prologue us, arg1=wakes drained.
+    crate::debug::record_milestone(
+        crate::debug::LogCategory::Sched,
+        "kernel-scheduler-phase-prologue",
+        profile.phase_ns[SchedulerPhase::Prologue as usize] / 1_000,
+        profile.deferred_wakes,
     );
     // Disjoint in-owner segments in microseconds.
     // arg0=(account, balance), arg1=(validate, select).
@@ -388,11 +424,48 @@ impl Scheduler {
             self.runtime_profile_lock_wait_max_ns.max(elapsed_ns);
     }
 
-    pub(in crate::multitask) fn record_runtime_profile_lock_hold(&mut self, elapsed_ns: u64) {
+    /// Charges one complete owner turn.
+    ///
+    /// `attributed_ns` is how much of this turn the in-owner segments claimed.
+    /// It is carried alongside the maximum rather than only summed, because the
+    /// window total cannot say whether the single worst turn was work or a
+    /// host-descheduled vCPU, and that distinction decides whether shortening
+    /// the critical section can help at all.
+    pub(in crate::multitask) fn record_runtime_profile_lock_hold(
+        &mut self,
+        elapsed_ns: u64,
+        attributed_ns: u64,
+        caller: &'static Location<'static>,
+    ) {
         self.runtime_profile_lock_hold_ns =
             self.runtime_profile_lock_hold_ns.saturating_add(elapsed_ns);
-        self.runtime_profile_lock_hold_max_ns =
-            self.runtime_profile_lock_hold_max_ns.max(elapsed_ns);
+        if elapsed_ns > self.runtime_profile_lock_hold_max_ns {
+            self.runtime_profile_lock_hold_max_ns = elapsed_ns;
+            self.runtime_profile_lock_hold_max_caller = Some(caller);
+            self.runtime_profile_lock_hold_max_attributed_ns = attributed_ns;
+        }
+    }
+
+    /// Total in-owner segment time so far, which is the baseline a single owner
+    /// turn is measured against.
+    #[inline]
+    pub(in crate::multitask) fn runtime_profile_phase_total_ns(&self) -> u64 {
+        self.runtime_profile_phase_ns
+            .iter()
+            .copied()
+            .fold(0_u64, u64::saturating_add)
+    }
+
+    /// Charges one acquisition prologue and the deferred wakes it drained.
+    pub(in crate::multitask) fn record_runtime_profile_prologue(
+        &mut self,
+        deferred_wakes: u64,
+        elapsed_ns: u64,
+    ) {
+        self.runtime_profile_deferred_wakes = self
+            .runtime_profile_deferred_wakes
+            .saturating_add(deferred_wakes);
+        self.record_runtime_profile_phase(SchedulerPhase::Prologue, elapsed_ns);
     }
 
     /// Charges one disjoint scheduling segment. The caller already holds the
@@ -442,6 +515,9 @@ impl Scheduler {
             lock_hold_ns: self.runtime_profile_lock_hold_ns,
             lock_wait_max_ns: self.runtime_profile_lock_wait_max_ns,
             lock_hold_max_ns: self.runtime_profile_lock_hold_max_ns,
+            lock_hold_max_caller: self.runtime_profile_lock_hold_max_caller,
+            lock_hold_max_attributed_ns: self.runtime_profile_lock_hold_max_attributed_ns,
+            deferred_wakes: self.runtime_profile_deferred_wakes,
             phase_ns: self.runtime_profile_phase_ns,
             runnable_samples: self.runtime_profile_runnable_samples,
             divergent_identity_slot: self.divergent_published_identity().unwrap_or(usize::MAX),
@@ -479,6 +555,9 @@ impl Scheduler {
         self.runtime_profile_lock_hold_ns = 0;
         self.runtime_profile_lock_wait_max_ns = 0;
         self.runtime_profile_lock_hold_max_ns = 0;
+        self.runtime_profile_lock_hold_max_caller = None;
+        self.runtime_profile_lock_hold_max_attributed_ns = 0;
+        self.runtime_profile_deferred_wakes = 0;
         self.runtime_profile_phase_ns.fill(0);
         self.runtime_profile_runnable_samples = 0;
         self.runtime_profile_started_ticks = now_ticks;
@@ -575,6 +654,9 @@ mod tests {
             lock_hold_ns: 0,
             lock_wait_max_ns: 0,
             lock_hold_max_ns: 0,
+            lock_hold_max_caller: None,
+            lock_hold_max_attributed_ns: 0,
+            deferred_wakes: 0,
             phase_ns: [0; SCHEDULER_PHASE_COUNT],
             runnable_samples: 0,
             divergent_identity_slot: usize::MAX,
@@ -657,8 +739,10 @@ mod tests {
         let mut scheduler = boxed_scheduler();
         scheduler.record_runtime_profile_lock_wait(300);
         scheduler.record_runtime_profile_lock_wait(700);
-        scheduler.record_runtime_profile_lock_hold(2_000);
-        scheduler.record_runtime_profile_lock_hold(1_000);
+        let worst = Location::caller();
+        let lesser = Location::caller();
+        scheduler.record_runtime_profile_lock_hold(2_000, 1_500, worst);
+        scheduler.record_runtime_profile_lock_hold(1_000, 900, lesser);
         scheduler.runtime_profile_started_ticks = 1;
 
         let now = 1 + crate::arch::rtc::ticks_per_second();
@@ -667,9 +751,35 @@ mod tests {
         assert_eq!(profile.lock_wait_max_ns, 700);
         assert_eq!(profile.lock_hold_ns, 3_000);
         assert_eq!(profile.lock_hold_max_ns, 2_000);
+        // The attribution must follow the maximum, not the last sample.
+        assert_eq!(profile.lock_hold_max_attributed_ns, 1_500);
+        assert_eq!(
+            profile.lock_hold_max_caller.map(Location::line),
+            Some(worst.line())
+        );
         assert_eq!(scheduler.runtime_profile_lock_wait_ns, 0);
         assert_eq!(scheduler.runtime_profile_lock_wait_max_ns, 0);
         assert_eq!(scheduler.runtime_profile_lock_hold_ns, 0);
         assert_eq!(scheduler.runtime_profile_lock_hold_max_ns, 0);
+        assert!(scheduler.runtime_profile_lock_hold_max_caller.is_none());
+        assert_eq!(scheduler.runtime_profile_lock_hold_max_attributed_ns, 0);
+    }
+
+    #[test]
+    fn acquisition_prologue_is_a_disjoint_segment_with_its_wake_count() {
+        let mut scheduler = boxed_scheduler();
+        scheduler.record_runtime_profile_prologue(0, 40);
+        scheduler.record_runtime_profile_prologue(3, 260);
+        assert_eq!(
+            scheduler.runtime_profile_phase_ns[SchedulerPhase::Prologue as usize],
+            300
+        );
+        assert_eq!(scheduler.runtime_profile_phase_total_ns(), 300);
+        scheduler.runtime_profile_started_ticks = 1;
+        let now = 1 + crate::arch::rtc::ticks_per_second();
+        let profile = scheduler.take_runtime_profile(now).expect("profile window");
+        assert_eq!(profile.deferred_wakes, 3);
+        assert_eq!(profile.phase_ns[SchedulerPhase::Prologue as usize], 300);
+        assert_eq!(scheduler.runtime_profile_deferred_wakes, 0);
     }
 }

@@ -48,14 +48,13 @@ static CURRENT_TASK_IDLE: [AtomicBool; nucleus_core::util::lockdep::MAX_TRACKED_
 // Keeping it out of `Scheduler` removes the last mutable current-task scratch
 // word from the lifecycle catalog without publishing an incoming task before
 // the assembly RSP switch commits.
-static SCHEDULER_CURRENT_TASK_SCRATCH:
-    [AtomicUsize; nucleus_core::util::lockdep::MAX_TRACKED_CPUS] =
+static SCHEDULER_CURRENT_TASK_SCRATCH: [AtomicUsize;
+    nucleus_core::util::lockdep::MAX_TRACKED_CPUS] =
     [const { AtomicUsize::new(0) }; nucleus_core::util::lockdep::MAX_TRACKED_CPUS];
 static TRANSITION_FROM_SLOTS: [AtomicUsize; nucleus_core::util::lockdep::MAX_TRACKED_CPUS] =
     [const { AtomicUsize::new(0) }; nucleus_core::util::lockdep::MAX_TRACKED_CPUS];
 static TRANSITION_ACTIVE: [AtomicBool; nucleus_core::util::lockdep::MAX_TRACKED_CPUS] =
     [const { AtomicBool::new(false) }; nucleus_core::util::lockdep::MAX_TRACKED_CPUS];
-
 
 // This remains a dead-owner fail-stop, not a scheduling latency budget. A KVM
 // vCPU can be descheduled by the host while it owns an otherwise bounded raw
@@ -167,6 +166,11 @@ pub(super) struct SchedulerAccessGuard {
     logical_index: usize,
     original_task: usize,
     acquired_at_ns: u64,
+    /// Carried so the window's worst hold can name the site that produced it.
+    caller: &'static Location<'static>,
+    /// In-owner segment total observed at acquisition. The difference against
+    /// the same total at release is what this turn actually attributed.
+    phase_total_at_acquire_ns: u64,
 }
 
 impl Deref for SchedulerAccessGuard {
@@ -198,8 +202,13 @@ impl Drop for SchedulerAccessGuard {
             selected_task < MAX_SCHEDULER_TASKS,
             "scheduler invariant: CPU-local dispatch scratch slot exceeds capacity"
         );
+        let attributed_ns = guard
+            .runtime_profile_phase_total_ns()
+            .saturating_sub(self.phase_total_at_acquire_ns);
         guard.record_runtime_profile_lock_hold(
             crate::arch::clock::monotonic_nanos().saturating_sub(self.acquired_at_ns),
+            attributed_ns,
+            self.caller,
         );
         // ORDERING: Acquire proves this CPU completed initial slot admission.
         assert!(
@@ -355,15 +364,26 @@ pub(super) unsafe fn scheduler_mut() -> SchedulerAccessGuard {
     // A wake raised by an IRQ that interrupted any raw owner cannot enter the
     // scheduler at that point. Consume those exact task identities only after
     // this CPU has safely acquired scheduler ownership.
+    let phase_total_at_acquire_ns = guard.runtime_profile_phase_total_ns();
     let deferred_wakes = super::deferred_wake::take_current_cpu(logical_index);
+    let deferred_wake_count = deferred_wakes.len();
     for task_id in deferred_wakes.iter() {
         let _ = guard.wake_task(task_id);
     }
+    // Charged unconditionally: the drain runs on every acquisition whether or
+    // not it finds work, and an unattributed prologue would read as a
+    // descheduled owner in the hold-maximum record.
+    guard.record_runtime_profile_prologue(
+        deferred_wake_count as u64,
+        crate::arch::clock::monotonic_nanos().saturating_sub(acquired_at_ns),
+    );
     SchedulerAccessGuard {
         guard: Some(guard),
         logical_index,
         original_task,
         acquired_at_ns,
+        caller,
+        phase_total_at_acquire_ns,
     }
 }
 
@@ -469,9 +489,10 @@ pub(super) fn current_cpu_task_slot() -> Option<usize> {
         return None;
     }
     let logical_index = nucleus_core::util::lockdep::current_cpu_index();
+    let slot = CURRENT_TASK_SLOTS.get(logical_index)?;
     // ORDERING: Acquire pairs with the current-slot publication in dispatch
     // and in `publish_cpu_current_task`.
-    Some(CURRENT_TASK_SLOTS.get(logical_index)?.load(Ordering::Acquire))
+    Some(slot.load(Ordering::Acquire))
 }
 
 pub(super) fn current_cpu_task_slot_admitted() -> bool {

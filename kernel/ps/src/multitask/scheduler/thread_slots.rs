@@ -108,7 +108,7 @@ impl Scheduler {
             }),
         });
         self.simd_states[slot] = SimdState::new();
-        self.syscall_user_simd_active[slot] = false;
+        super::super::syscall_simd::reset(slot);
         self.start_suspended[slot] = true;
         self.starts[slot] = Some(TaskStart {
             entry: super::super::noop_task_entry,

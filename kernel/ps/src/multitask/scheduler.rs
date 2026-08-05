@@ -76,12 +76,12 @@ use super::process_table::{self, ProcessHandle};
 use super::{UserFaultDisposition, UserStackState, UserTaskBootstrap, initial_task_rflags};
 use context_validation::context_validation_reason_code;
 use dispatch_policy::{CpuDispatchGuard, CpuDispatchLock, CpuDispatchPolicy};
-use runtime_profile::SchedulerPhase;
-use ipc_donation::{IpcDonationTarget, IpcPriorityDonation};
 use handoff_queue::SlotHandoffQueue;
+use ipc_donation::{IpcDonationTarget, IpcPriorityDonation};
 pub(super) use linux_thread_state::CurrentLinuxThreadBinding;
 use linux_thread_state::{LinuxThreadStateLock, empty_linux_thread_state_lock};
 use reclaim::{RetiredSlotReclaim, RetirementSideEffect};
+use runtime_profile::SchedulerPhase;
 
 // The enabled product topology boots roughly twenty policy/service processes
 // before the UI creates its bounded input, display, diagnostics, console, and
@@ -355,8 +355,6 @@ pub(super) struct Scheduler {
     job_stopped: [bool; MAX_TASK],
     retire_reasons: [Option<TaskRetireReason>; MAX_TASK],
     simd_states: [SimdState; MAX_TASK],
-    syscall_user_simd_states: [SimdState; MAX_TASK],
-    syscall_user_simd_active: [bool; MAX_TASK],
     starts: [Option<TaskStart>; MAX_TASK],
     stacks: [Option<Vec<u8>>; MAX_TASK],
     idle_cpu: [u8; MAX_TASK],
@@ -413,6 +411,13 @@ pub(super) struct Scheduler {
     runtime_profile_lock_hold_ns: u64,
     runtime_profile_lock_wait_max_ns: u64,
     runtime_profile_lock_hold_max_ns: u64,
+    /// The site and attributed segment time of the worst owner turn, kept so a
+    /// maximum can be charged to a caller instead of left unexplained.
+    runtime_profile_lock_hold_max_caller: Option<&'static core::panic::Location<'static>>,
+    runtime_profile_lock_hold_max_attributed_ns: u64,
+    /// Wakes raised while a raw owner was interrupted and drained by whichever
+    /// acquisition came next. They are in-owner cost with no requesting caller.
+    runtime_profile_deferred_wakes: u64,
     /// Disjoint in-owner segment attribution. Total hold time alone cannot
     /// separate a genuinely long critical section from a descheduled owner.
     runtime_profile_phase_ns: [u64; runtime_profile::SCHEDULER_PHASE_COUNT],
@@ -444,8 +449,6 @@ impl Scheduler {
             job_stopped: [false; MAX_TASK],
             retire_reasons: [None; MAX_TASK],
             simd_states: [SimdState::new(); MAX_TASK],
-            syscall_user_simd_states: [SimdState::new(); MAX_TASK],
-            syscall_user_simd_active: [false; MAX_TASK],
             starts: [None; MAX_TASK],
             stacks: [const { None }; MAX_TASK],
             idle_cpu: [NO_IDLE_CPU; MAX_TASK],
@@ -476,6 +479,9 @@ impl Scheduler {
             runtime_profile_lock_hold_ns: 0,
             runtime_profile_lock_wait_max_ns: 0,
             runtime_profile_lock_hold_max_ns: 0,
+            runtime_profile_lock_hold_max_caller: None,
+            runtime_profile_lock_hold_max_attributed_ns: 0,
+            runtime_profile_deferred_wakes: 0,
             runtime_profile_phase_ns: [0; runtime_profile::SCHEDULER_PHASE_COUNT],
             runtime_profile_runnable_samples: 0,
             root_idle: false,
@@ -758,8 +764,9 @@ impl Scheduler {
         }
 
         self.simd_states = [SimdState::new(); MAX_TASK];
-        self.syscall_user_simd_states = [SimdState::new(); MAX_TASK];
-        self.syscall_user_simd_active = [false; MAX_TASK];
+        for slot in 0..MAX_TASK {
+            super::syscall_simd::reset(slot);
+        }
         self.retired = [false; MAX_TASK];
         self.retirement_cleanup = [None; MAX_TASK];
         self.retirement_side_effects = [None; MAX_TASK];
@@ -787,6 +794,9 @@ impl Scheduler {
         self.runtime_profile_lock_hold_ns = 0;
         self.runtime_profile_lock_wait_max_ns = 0;
         self.runtime_profile_lock_hold_max_ns = 0;
+        self.runtime_profile_lock_hold_max_caller = None;
+        self.runtime_profile_lock_hold_max_attributed_ns = 0;
+        self.runtime_profile_deferred_wakes = 0;
         self.set_current_task_slot(ROOT_TASK_SLOT);
         self.pending_reap = false;
         for policy in &self.cpu_dispatch {
@@ -886,8 +896,7 @@ impl Scheduler {
         self.job_stopped[slot] = false;
         self.retire_reasons[slot] = None;
         self.simd_states[slot] = SimdState::new();
-        self.syscall_user_simd_states[slot] = SimdState::new();
-        self.syscall_user_simd_active[slot] = false;
+        super::syscall_simd::reset(slot);
         self.starts[slot] = None;
         self.publish_slot_identity(slot);
         self.idle_cpu[slot] = NO_IDLE_CPU;
@@ -1747,6 +1756,26 @@ impl Scheduler {
         Some(unsafe { &*(saved_rsp as *const SavedContext) })
     }
 
+    /// Whether the frame at `saved_rsp` is entirely zero.
+    ///
+    /// A zeroed frame means the stack was cleared and never written, which is a
+    /// different fault from a frame that was written and then corrupted. Only
+    /// the rejected-activation report calls this.
+    fn stack_frame_is_all_zero(&self, saved_rsp: usize) -> bool {
+        let Some(saved) = Self::saved_context_ref(saved_rsp) else {
+            return false;
+        };
+        // SAFETY: `saved_context_ref` validated the pointer and alignment, and
+        // the frame is `SAVED_CONTEXT_BYTES` of initialized stack storage.
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                saved as *const SavedContext as *const u8,
+                SAVED_CONTEXT_BYTES,
+            )
+        };
+        bytes.iter().all(|byte| *byte == 0)
+    }
+
     fn is_canonical_address(addr: u64) -> bool {
         let upper = addr >> 48;
         if ((addr >> 47) & 1) == 0 {
@@ -1882,7 +1911,7 @@ impl Scheduler {
                     windows_thread_state: None,
                 });
                 self.simd_states[slot] = SimdState::new();
-                self.syscall_user_simd_active[slot] = false;
+                super::syscall_simd::reset(slot);
                 self.starts[slot] = Some(TaskStart { entry, id });
                 self.publish_slot_identity(slot);
                 #[cfg(not(test))]
@@ -1983,7 +2012,7 @@ impl Scheduler {
                     }),
                 });
                 self.simd_states[slot] = SimdState::new();
-                self.syscall_user_simd_active[slot] = false;
+                super::syscall_simd::reset(slot);
                 self.starts[slot] = Some(TaskStart {
                     entry: idle_entry,
                     id,
@@ -2057,7 +2086,7 @@ impl Scheduler {
                     }),
                 });
                 self.simd_states[slot] = SimdState::new();
-                self.syscall_user_simd_active[slot] = false;
+                super::syscall_simd::reset(slot);
                 self.starts[slot] = Some(TaskStart {
                     entry: idle_entry,
                     id,
@@ -2127,7 +2156,7 @@ impl Scheduler {
                     windows_thread_state: None,
                 });
                 self.simd_states[slot] = SimdState::new();
-                self.syscall_user_simd_active[slot] = false;
+                super::syscall_simd::reset(slot);
                 self.starts[slot] = Some(TaskStart {
                     entry: super::noop_task_entry,
                     id,
@@ -2960,7 +2989,8 @@ impl Scheduler {
     pub(super) fn prepare_dispatched_task_execution(&mut self, dispatch: SchedulerDispatch) {
         let mut phase_marker = crate::arch::clock::monotonic_nanos();
         assert_eq!(
-            self.current_task_slot(), dispatch.next_slot,
+            self.current_task_slot(),
+            dispatch.next_slot,
             "scheduler invariant: architecture restore token does not name current task"
         );
         if !dispatch.requires_architectural_restore() {
@@ -3064,33 +3094,6 @@ impl Scheduler {
             restore_state(&self.simd_states[slot]);
         }
         self.mark_phase(SchedulerPhase::ArchRestore, &mut phase_marker);
-    }
-
-    pub(super) fn capture_current_syscall_user_simd(&mut self) -> Option<u64> {
-        let slot = self.current_task_slot();
-        let task_id = self.starts[slot]?.id;
-        if self.syscall_user_simd_active[slot] {
-            return None;
-        }
-        unsafe {
-            save_state(&mut self.syscall_user_simd_states[slot]);
-        }
-        self.syscall_user_simd_active[slot] = true;
-        Some(task_id)
-    }
-
-    pub(super) fn restore_current_syscall_user_simd(&mut self, task_id: u64) -> bool {
-        let slot = self.current_task_slot();
-        if self.starts[slot].is_none_or(|start| start.id != task_id)
-            || !self.syscall_user_simd_active[slot]
-        {
-            return false;
-        }
-        unsafe {
-            restore_state(&self.syscall_user_simd_states[slot]);
-        }
-        self.syscall_user_simd_active[slot] = false;
-        true
     }
 
     /// Re-derives and republishes the lock-free identity record for `slot`.
@@ -3309,7 +3312,7 @@ impl Scheduler {
 
         self.exec_target_quiesced[slot] = false;
         self.simd_states[slot] = SimdState::new();
-        self.syscall_user_simd_active[slot] = false;
+        super::syscall_simd::reset(slot);
         self.starts[slot] = Some(TaskStart {
             entry: super::noop_task_entry,
             id: process_id,
@@ -3378,7 +3381,7 @@ impl Scheduler {
         }
         self.exec_target_quiesced[slot] = false;
         self.simd_states[slot] = SimdState::new();
-        self.syscall_user_simd_active[slot] = false;
+        super::syscall_simd::reset(slot);
         self.starts[slot] = Some(TaskStart {
             entry: super::noop_task_entry,
             id: process_id,
@@ -4066,20 +4069,6 @@ mod tests {
 
         let switched = SchedulerDispatch::new(0x2000, 119, 7, 9);
         assert!(switched.requires_architectural_restore());
-    }
-
-    #[test]
-    fn syscall_user_simd_snapshot_is_disjoint_from_scheduler_continuation() {
-        let continuation_start = core::mem::offset_of!(Scheduler, simd_states);
-        let continuation_end =
-            continuation_start + core::mem::size_of::<[super::SimdState; MAX_TASK]>();
-        let snapshot_start = core::mem::offset_of!(Scheduler, syscall_user_simd_states);
-        let snapshot_end = snapshot_start + core::mem::size_of::<[super::SimdState; MAX_TASK]>();
-        let active_start = core::mem::offset_of!(Scheduler, syscall_user_simd_active);
-        let active_end = active_start + core::mem::size_of::<[bool; MAX_TASK]>();
-
-        assert!(continuation_end <= snapshot_start || snapshot_end <= continuation_start);
-        assert!(snapshot_end <= active_start || active_end <= snapshot_start);
     }
 
     pub(super) fn boxed_scheduler() -> Box<Scheduler> {

@@ -31,6 +31,10 @@ impl DeferredWakeBatch {
     pub(super) fn iter(&self) -> impl Iterator<Item = u64> + '_ {
         self.tasks[..self.len].iter().copied()
     }
+
+    pub(super) fn len(&self) -> usize {
+        self.len
+    }
 }
 
 struct DeferredWakeQueues([UnsafeCell<DeferredWakeBatch>; CPU_COUNT]);
