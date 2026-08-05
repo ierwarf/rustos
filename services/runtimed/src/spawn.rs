@@ -204,6 +204,18 @@ fn apply_kvm_acceptance_contract(entry: &mut LaunchEntry) {
     if contract.ui_profile && entry.desktop_file_id == "wayclick.desktop" {
         upsert_env(&mut entry.env, "RUSTOS_WAYCLICK_PROFILE=1");
     }
+    // WayClick's continuous frame loop and its FPS profile lines are both
+    // gated on that variable, so whether this branch was taken decides whether
+    // the 55 FPS gate can be measured at all. The uiserver branch demonstrably
+    // fires; this records the identity actually seen here so a mismatch names
+    // itself instead of being inferred from an absent profile line.
+    boot_line(
+        format!(
+            "runtimed: acceptance contract applied desktop_id={} ui_profile={} network_exercise={}",
+            entry.desktop_file_id, contract.ui_profile, contract.network_exercise
+        )
+        .as_str(),
+    );
     if contract.network_exercise && entry.desktop_file_id == "netprobe.desktop" {
         upsert_env(&mut entry.env, "RUSTOS_NETPROBE_QEMU=1");
     }

@@ -1080,6 +1080,23 @@ fn run() -> Result<(), i32> {
                 continue 'main_loop;
             }
             PresentUpdateResult::Backpressured => {
+                // Protocol progress is not the GPU's to withhold.
+                //
+                // The permit is taken when a frame callback is sent and was
+                // regranted only by `Rendered`, so a display that stays
+                // backpressured stopped frame callbacks outright. The client
+                // then blocks in `blocking_dispatch` forever: WayClick reached
+                // 1232 callbacks in one 8-vCPU run and a handful in others,
+                // with no error anywhere, because the compositor simply stopped
+                // answering.
+                //
+                // Backpressure is precisely a moment when the client may start
+                // drawing its next frame, which is what the protocol says a
+                // frame callback means. `V5-GPU-UI-OWNER-014` names this
+                // coupling; regranting here is the narrow form of the fix, and
+                // separating the submission owner from the protocol owner is
+                // the general one.
+                wayland_frame_permit = true;
                 watchdog.leave();
                 profile::record_backpressure_retry();
                 profile::maybe_emit();
