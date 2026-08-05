@@ -3198,7 +3198,16 @@ impl Scheduler {
         if self.retired[slot] {
             return LegacyPosition::Retiring;
         }
-        if context.ready {
+        // A suspended slot is not runnable, whatever `context.ready` says.
+        // `allocate_user_slot` initialises the context with `ready: true` and
+        // then admits the slot with `admit_runqueue_slot(slot, !start_suspended)`,
+        // so a service spawned suspended sits ready-but-unqueued by design until
+        // activation publishes it. Reading the field alone reported that as a
+        // `RunnableButUnqueued` divergence once per second for as long as such a
+        // slot existed — which is also the trap stage four would have walked
+        // into, since deleting the field naively would make every suspended task
+        // look runnable.
+        if context.ready && !self.start_suspended[slot] {
             return LegacyPosition::Runnable;
         }
         LegacyPosition::Blocked

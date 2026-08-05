@@ -10,7 +10,7 @@ kernel/io-manager/src/io/dvm_block.rs	1595	io-block	Split protocol admission, qu
 kernel/io-manager/src/io/dvm_display.rs	1784	io-display	Split handshake, shared-surface lifecycle, present queue, and tests.
 kernel/ipc-runtime/src/ipc/mod.rs	3077	ipc-runtime	Split endpoint, reply, shared-region, accounting, and test modules.
 kernel/mm/src/memory/address_space.rs	1440	memory	Split page-table mutation, VMA admission, teardown, and tests.
-kernel/ps/src/multitask/scheduler.rs	5471	scheduler	Syscall SIMD custody extracted to multitask/syscall_simd.rs; next split run queues, wakeup, deadlines, switching, accounting, and tests.
+kernel/ps/src/multitask/scheduler.rs	5480	scheduler	Syscall SIMD custody extracted to multitask/syscall_simd.rs; next split run queues, wakeup, deadlines, switching, accounting, and tests.
 kernel/ps/src/user/handles/table.rs	1312	process-handles	Split table mutation, transfer transactions, retirement, and tests.
 libs/driver-domain-host/src/lib.rs	5268	driver-domain-host	Split manifest, lease, QMP, recovery, and process supervision.
 libs/driver-domain-protocol/src/lib.rs	4149	driver-domain-protocol	Split block, network, input, display, and control wire modules.
