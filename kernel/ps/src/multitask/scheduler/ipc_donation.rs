@@ -50,7 +50,7 @@ impl Scheduler {
             .filter(|slot| {
                 self.contexts[*slot].is_some_and(|context| {
                     context.process_id == Some(process_id)
-                        && context.ready
+                        && self.slot_is_runnable(*slot)
                         && self.handoff_slot_ready(*slot)
                 })
             })
@@ -334,7 +334,8 @@ impl Scheduler {
         let Some(target) = self.contexts[target_slot] else {
             return;
         };
-        if !target.ready || !self.context_is_schedulable(target_slot, target) {
+        if !self.slot_is_runnable(target_slot) || !self.context_is_schedulable(target_slot, target)
+        {
             return;
         }
         let Some(current) = self.contexts[self.current_task_slot()] else {

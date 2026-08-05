@@ -999,7 +999,7 @@ impl Scheduler {
             let Some(ctx) = self.contexts[slot] else {
                 continue;
             };
-            if !ctx.ready {
+            if !self.slot_is_runnable(slot) {
                 continue;
             }
             if !self.context_is_schedulable(slot, ctx) {
@@ -1026,7 +1026,7 @@ impl Scheduler {
             let Some(ctx) = self.contexts[slot] else {
                 continue;
             };
-            if !ctx.ready {
+            if !self.slot_is_runnable(slot) {
                 continue;
             }
             if !self.context_is_schedulable(slot, ctx) {
@@ -1209,7 +1209,7 @@ impl Scheduler {
             let Some(context) = self.contexts[slot] else {
                 continue;
             };
-            if !context.ready
+            if !self.slot_is_runnable(slot)
                 || context.ready_since_ticks == 0
                 || !self.context_is_schedulable(slot, context)
                 || self.slot_class(slot) != Some(class)
@@ -3178,6 +3178,53 @@ impl Scheduler {
             runqueue::RunOwnerState::Retiring => QueueOwner::Retiring,
             runqueue::RunOwnerState::Retired => QueueOwner::Retired,
         }
+    }
+
+    /// Whether `slot` is queued and waiting to run.
+    ///
+    /// This is the authority `context.ready` used to be. The two are the same
+    /// predicate: dispatch clears `ready` on the task it selects at the same
+    /// moment `runqueue::claim_dispatch` moves its owner word to `Running`, so
+    /// `ready == true` is exactly `Local | RemoteQueued`. Stage one of
+    /// `V5-SCHED-GLOBAL-001` swept every slot once per second at 1 and 8 vCPU
+    /// and found no disagreement.
+    ///
+    /// Reading the owner word instead of the field is the point: the word is
+    /// updated by CAS and needs no lock, while the field lives in the globally
+    /// locked `Scheduler` struct. Every reader moved here is one fewer reason
+    /// for that struct to be shared.
+    ///
+    /// **This cannot answer for the task a CPU is currently executing**, and
+    /// that limit is a real gap rather than an accident of this helper.
+    /// `claim_dispatch` moves the owner word to `Running` and removes the slot
+    /// from the queue, so the word no longer records whether that task still
+    /// wants to run when it is preempted. Linux keeps exactly this distinction:
+    /// a running task remains `TASK_ON_RQ_QUEUED` in `p->on_rq` and only
+    /// `deactivate_task` removes it, so "running" and "runnable" stay separable.
+    ///
+    /// Until the owner word carries the same bit, the sites that ask about the
+    /// *current* slot — whether the outgoing task returns to its queue or is
+    /// published blocked, and whether the current task can still beat the fair
+    /// pick — must keep reading `context.ready`. Converting them would answer
+    /// "not runnable" for every running task and publish it blocked on every
+    /// preemption.
+    pub(super) fn slot_is_runnable(&self, slot: usize) -> bool {
+        // `admit_runqueue_slot` is `#[cfg(not(test))]`, so under unit test no
+        // slot is ever admitted and every owner word stays `Dormant`. That is
+        // worth stating plainly: the per-CPU runqueue's custody rules are
+        // exercised only by the KVM gates, never by `cargo test`, and this
+        // helper is not the place to change that. Reading the field here keeps
+        // the selection-policy tests testing selection policy; the owner word
+        // itself is covered by the once-per-drain divergence sweep on real runs.
+        #[cfg(test)]
+        {
+            return self.contexts[slot].is_some_and(|context| context.ready);
+        }
+        #[cfg(not(test))]
+        matches!(
+            runqueue::owner(slot).state,
+            runqueue::RunOwnerState::Local | runqueue::RunOwnerState::RemoteQueued
+        )
     }
 
     /// Compares the per-CPU owner word against the legacy tables for every slot.

@@ -57,7 +57,7 @@ impl Scheduler {
                 self.current_task_slot(),
                 self.retired[slot],
                 self.start_suspended[slot],
-                context.ready,
+                self.slot_is_runnable(slot),
                 context.blocked,
             ) {
                 continue;

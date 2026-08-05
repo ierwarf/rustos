@@ -300,7 +300,10 @@ impl Scheduler {
         let context = self.contexts[expected_slot]
             .expect("secondary CPU entered without an admitted idle context");
         assert!(
-            !context.user_mode && !context.ready && !context.blocked && context.saved_rsp == 0,
+            !context.user_mode
+                && !self.slot_is_runnable(expected_slot)
+                && !context.blocked
+                && context.saved_rsp == 0,
             "secondary CPU idle bootstrap state is inconsistent"
         );
         crate::memory::paging::load_address_space_phys(PhysAddr::new(context.address_space_root));

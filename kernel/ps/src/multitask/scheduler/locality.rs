@@ -57,7 +57,7 @@ impl Scheduler {
             let Some(context) = self.contexts[slot] else {
                 continue;
             };
-            if !context.ready || !self.context_is_schedulable(slot, context) {
+            if !self.slot_is_runnable(slot) || !self.context_is_schedulable(slot, context) {
                 continue;
             }
             let Some(class) = self.slot_class(slot) else {
@@ -101,7 +101,7 @@ impl Scheduler {
             let Some(context) = self.contexts[slot] else {
                 continue;
             };
-            if !context.ready || !self.context_is_schedulable(slot, context) {
+            if !self.slot_is_runnable(slot) || !self.context_is_schedulable(slot, context) {
                 continue;
             }
             let Some(class) = self.slot_class(slot) else {
@@ -159,7 +159,7 @@ impl Scheduler {
             let Some(ctx) = self.contexts[slot] else {
                 continue;
             };
-            if !ctx.ready || !self.context_is_schedulable(slot, ctx) {
+            if !self.slot_is_runnable(slot) || !self.context_is_schedulable(slot, ctx) {
                 continue;
             }
             if self.slot_class(slot) != Some(class) {
@@ -198,7 +198,7 @@ impl Scheduler {
             let Some(ctx) = self.contexts[slot] else {
                 continue;
             };
-            if !ctx.ready || !self.context_is_schedulable(slot, ctx) {
+            if !self.slot_is_runnable(slot) || !self.context_is_schedulable(slot, ctx) {
                 continue;
             }
             if self.slot_class(slot) != Some(class) {

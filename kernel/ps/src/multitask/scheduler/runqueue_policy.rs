@@ -121,7 +121,7 @@ impl Scheduler {
     pub(super) fn steal_one_for_idle_cpu(&self, target_cpu: usize) -> bool {
         let has_local_work = runqueue::local_runnable_slots(target_cpu).any(|slot| {
             self.contexts[slot].is_some_and(|context| {
-                context.ready
+                self.slot_is_runnable(slot)
                     && self.is_fair_candidate_slot(slot)
                     && self.context_is_schedulable(slot, context)
             })
@@ -142,7 +142,7 @@ impl Scheduler {
                 };
                 let affinity = self.task_affinity_masks[slot] & self.process_affinity_masks[slot];
                 if affinity & target_bit == 0
-                    || !context.ready
+                    || !self.slot_is_runnable(slot)
                     || !self.is_fair_candidate_slot(slot)
                     || !self.context_is_schedulable(slot, context)
                 {
@@ -199,7 +199,7 @@ impl Scheduler {
             let Some(context) = self.contexts[slot] else {
                 continue;
             };
-            if !context.ready
+            if !self.slot_is_runnable(slot)
                 || !self.is_fair_candidate_slot(slot)
                 || !self.context_is_schedulable(slot, context)
             {

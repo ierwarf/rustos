@@ -234,7 +234,7 @@ impl Scheduler {
         let Some(context) = self.contexts[slot] else {
             return;
         };
-        if !context.ready || !self.handoff_slot_ready(slot) {
+        if !self.slot_is_runnable(slot) || !self.handoff_slot_ready(slot) {
             return;
         }
         let target_cpu = self.slot_dispatch_cpu(slot);
