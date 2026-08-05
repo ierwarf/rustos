@@ -931,6 +931,39 @@ impl Scheduler {
             context.ready_since_ticks = 0;
         }
         context.ready = ready;
+        // Mirror into the owner word so a task that blocks while executing stops
+        // being runnable there too. This covers the funnelled writes; the
+        // fourteen direct assignments elsewhere are covered by
+        // `sync_running_runnable_bits` at guard release, because a mirror that
+        // depends on remembering to call it is a mirror that goes stale.
+        #[cfg(not(test))]
+        runqueue::set_runnable(slot, ready);
+    }
+
+    /// Re-mirrors the runnable bit for every slot a CPU is executing.
+    ///
+    /// Called once at guard release. Bounded by the CPU count, not the slot
+    /// count, because the bit only has to agree while a task is `Running`: a
+    /// queued or blocked slot carries it from its own state transition.
+    ///
+    /// This exists because mirroring at each write site does not work. There
+    /// are fourteen direct assignments to `context.ready`, several inside a
+    /// mutable borrow of the context that cannot call back into `self`, and the
+    /// first attempt to mirror only at the funnel diverged 7-9 times per second
+    /// at 8 vCPU while reading clean at 1. A wake on one CPU can change the
+    /// readiness of a task executing on another, so no single writer's own
+    /// release point covers it either.
+    #[cfg(not(test))]
+    pub(super) fn sync_running_runnable_bits(&self) {
+        for cpu in 0..nucleus_core::util::lockdep::MAX_TRACKED_CPUS {
+            let Some(slot) = super::cpu_local::published_current_slot(cpu) else {
+                continue;
+            };
+            let Some(context) = self.contexts.get(slot).and_then(|context| *context) else {
+                continue;
+            };
+            runqueue::set_runnable(slot, context.ready);
+        }
     }
 
     fn ticks_elapsed_ms(start_ticks: u64, end_ticks: u64) -> u64 {
@@ -3173,7 +3206,9 @@ impl Scheduler {
             runqueue::RunOwnerState::Local | runqueue::RunOwnerState::RemoteQueued => {
                 QueueOwner::Queued(cpu)
             }
-            runqueue::RunOwnerState::Running => QueueOwner::Running(cpu.unwrap_or(u8::MAX)),
+            runqueue::RunOwnerState::Running => {
+                QueueOwner::Running(cpu.unwrap_or(u8::MAX), snapshot.runnable)
+            }
             runqueue::RunOwnerState::Migrating => QueueOwner::Migrating(cpu),
             runqueue::RunOwnerState::Retiring => QueueOwner::Retiring,
             runqueue::RunOwnerState::Retired => QueueOwner::Retired,
@@ -3251,9 +3286,11 @@ impl Scheduler {
             if slot == dispatching || published == Some(slot) {
                 continue;
             }
-            if let Some(kind) =
-                run_authority::compare(self.queue_owner(slot), self.legacy_position(slot))
-            {
+            if let Some(kind) = run_authority::compare(
+                self.queue_owner(slot),
+                self.legacy_position(slot),
+                self.contexts[slot].is_some_and(|context| context.ready),
+            ) {
                 run_authority::record(slot, kind);
             }
         }

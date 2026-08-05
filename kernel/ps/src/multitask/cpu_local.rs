@@ -245,6 +245,12 @@ impl Drop for SchedulerAccessGuard {
         // ORDERING: the following Release is the derived-class publication.
         CURRENT_TASK_IDLE[self.logical_index]
             .store(guard.current_task_is_idle_task(), Ordering::Release);
+        // Re-mirror the runnable bit for every executing slot. Bounded by the
+        // CPU count and done here rather than at each write site, because a
+        // wake on one CPU can change the readiness of a task executing on
+        // another and no writer's own release point covers that.
+        #[cfg(not(test))]
+        guard.sync_running_runnable_bits();
         // ORDERING: diagnostic metadata is not lock authority. Release-clear
         // its publication immediately before the tracked guard releases the
         // real lock.
@@ -504,6 +510,22 @@ pub(super) fn current_cpu_task_slot_admitted() -> bool {
         // ORDERING: A current-task observation cannot be attributed safely
         // until assembly has release-cleared the outgoing stack transition.
         && !TRANSITION_ACTIVE[logical_index].load(Ordering::Acquire)
+}
+
+/// The slot `cpu` has published as current, if it has admitted one.
+///
+/// Unlike `current_cpu_task_slot`, this answers for any CPU rather than the
+/// caller's, and it deliberately does not exclude an active stack transition:
+/// the outgoing task of a transition is still executing as far as ownership is
+/// concerned, which is exactly the window the runnable bit has to stay correct
+/// across.
+pub(super) fn published_current_slot(cpu: usize) -> Option<usize> {
+    // ORDERING: Acquire pairs with initial current-slot publication.
+    if !CURRENT_TASK_ACTIVE.get(cpu)?.load(Ordering::Acquire) {
+        return None;
+    }
+    // ORDERING: Acquire pairs with the current-slot publication in dispatch.
+    Some(CURRENT_TASK_SLOTS.get(cpu)?.load(Ordering::Acquire))
 }
 
 /// Releases the outgoing stack only after the interrupt stub has changed

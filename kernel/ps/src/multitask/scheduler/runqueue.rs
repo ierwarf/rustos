@@ -31,7 +31,18 @@ const OWNER_CPU_BITS: u64 = 8;
 const OWNER_STATE_MASK: u64 = (1 << OWNER_STATE_BITS) - 1;
 const OWNER_CPU_MASK: u64 = (1 << OWNER_CPU_BITS) - 1;
 const OWNER_CPU_SHIFT: u64 = OWNER_STATE_BITS;
-const OWNER_GENERATION_SHIFT: u64 = OWNER_STATE_BITS + OWNER_CPU_BITS;
+/// "Still wants to run", independent of whether a CPU is executing it.
+///
+/// This is Linux's `p->on_rq == TASK_ON_RQ_QUEUED`, which the kernel documents
+/// as covering a task that is "present in a runqueue, either actively executing
+/// on a CPU or waiting to run". Without it, `Running` conflates executing with
+/// no longer runnable, and the question "does the outgoing task go back to its
+/// queue or get published blocked?" has no answer in the owner word — which is
+/// why `context.ready` still had readers after stage two of
+/// `V5-SCHED-GLOBAL-001`.
+const OWNER_RUNNABLE_SHIFT: u64 = OWNER_STATE_BITS + OWNER_CPU_BITS;
+const OWNER_RUNNABLE_BIT: u64 = 1 << OWNER_RUNNABLE_SHIFT;
+const OWNER_GENERATION_SHIFT: u64 = OWNER_RUNNABLE_SHIFT + 1;
 const OWNER_GENERATION_MAX: u64 = u64::MAX >> OWNER_GENERATION_SHIFT;
 const NO_CPU: usize = u8::MAX as usize;
 const BITMAP_WORDS: usize = MAX_TASK.div_ceil(64);
@@ -75,6 +86,8 @@ pub(super) struct RunOwnerSnapshot {
     pub(super) state: RunOwnerState,
     pub(super) cpu: Option<usize>,
     pub(super) generation: u64,
+    /// Whether the task still wants to run. See [`OWNER_RUNNABLE_SHIFT`].
+    pub(super) runnable: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -90,7 +103,27 @@ impl RunOwnerSnapshot {
             state,
             cpu,
             generation,
+            runnable: Self::state_implies_runnable(state),
         }
+    }
+
+    /// The runnable bit a state carries when it is first entered.
+    ///
+    /// `Running` is entered only from `Local`, so it starts runnable and stays
+    /// so until the task blocks in place. Everything else is decided by the
+    /// state alone.
+    const fn state_implies_runnable(state: RunOwnerState) -> bool {
+        matches!(
+            state,
+            RunOwnerState::Local
+                | RunOwnerState::RemoteQueued
+                | RunOwnerState::Running
+                | RunOwnerState::Migrating
+        )
+    }
+
+    const fn with_runnable(self, runnable: bool) -> Self {
+        Self { runnable, ..self }
     }
 
     fn encode(self) -> u64 {
@@ -101,6 +134,7 @@ impl RunOwnerSnapshot {
         let cpu = self.cpu.unwrap_or(NO_CPU);
         assert!(cpu <= NO_CPU, "scheduler owner CPU exceeds packed range");
         (self.generation << OWNER_GENERATION_SHIFT)
+            | if self.runnable { OWNER_RUNNABLE_BIT } else { 0 }
             | ((cpu as u64 & OWNER_CPU_MASK) << OWNER_CPU_SHIFT)
             | self.state as u64
     }
@@ -111,6 +145,7 @@ impl RunOwnerSnapshot {
             state: RunOwnerState::decode(raw),
             cpu: (cpu != NO_CPU).then_some(cpu),
             generation: raw >> OWNER_GENERATION_SHIFT,
+            runnable: raw & OWNER_RUNNABLE_BIT != 0,
         }
     }
 
@@ -355,6 +390,35 @@ pub(super) fn owner(slot: usize) -> RunOwnerSnapshot {
         .get(slot)
         .expect("scheduler owner slot exceeds capacity")
         .load()
+}
+
+/// Records whether the task still wants to run, without moving its state.
+///
+/// This is the in-place transition the owner word was missing. A task that
+/// blocks while it is executing stays `Running` — the CPU is still on its
+/// stack — but stops being runnable, and the next dispatch has to know which of
+/// those two it is in order to choose between returning it to its queue and
+/// publishing it blocked. Linux keeps the same two facts apart in `p->on_rq`
+/// and the task state.
+///
+/// The generation is deliberately not advanced: this is not a custody change,
+/// and bumping it would invalidate a mailbox record that is still correct.
+pub(super) fn set_runnable(slot: usize, runnable: bool) {
+    let word = OWNER_WORDS
+        .get(slot)
+        .expect("scheduler owner slot exceeds capacity");
+    loop {
+        let observed = word.load();
+        if observed.runnable == runnable {
+            return;
+        }
+        if word
+            .compare_exchange(observed, observed.with_runnable(runnable))
+            .is_ok()
+        {
+            return;
+        }
+    }
 }
 
 pub(super) fn admit_blocked(slot: usize) {

@@ -76,6 +76,11 @@ pub(super) enum Mismatch {
     RunnableButUnqueued = 3,
     /// One source considers the slot alive and the other does not.
     Lifetime = 4,
+    /// The slot is executing and the two sources disagree about whether it
+    /// still wants to run. The owner word's runnable bit decides whether a
+    /// preempted task returns to its queue or is published blocked, so a stale
+    /// bit either strands a runnable task or re-queues a blocked one.
+    RunningRunnableBit = 7,
 }
 
 /// The runqueue owner states this check distinguishes.
@@ -87,7 +92,9 @@ pub(super) enum QueueOwner {
     Dormant,
     Blocked,
     Queued(Option<u8>),
-    Running(u8),
+    /// The CPU executing it, and whether the owner word still calls it
+    /// runnable. The second field is Linux's `p->on_rq` for a running task.
+    Running(u8, bool),
     Migrating(Option<u8>),
     Retiring,
     Retired,
@@ -99,18 +106,33 @@ pub(super) enum QueueOwner {
 /// `Migrating` slot has, by construction, published its outgoing transition and
 /// not yet been adopted, so the two sources are allowed to describe different
 /// halves of that handoff.
-pub(super) const fn compare(queue: QueueOwner, legacy: LegacyPosition) -> Option<Mismatch> {
+///
+/// `legacy_running_is_runnable` is `context.ready` for the executing task. The
+/// owner word cannot be compared against a position for that case, because
+/// `Running` is a position and "still wants to run" is not; they are the two
+/// facts Linux keeps apart in `p->on_rq` and the task state.
+pub(super) const fn compare(
+    queue: QueueOwner,
+    legacy: LegacyPosition,
+    legacy_running_is_runnable: bool,
+) -> Option<Mismatch> {
     match (queue, legacy) {
-        // Exact execution ownership must agree on both the fact and the CPU.
-        (QueueOwner::Running(queue_cpu), LegacyPosition::Running(legacy_cpu)) => {
-            if queue_cpu == legacy_cpu {
+        // Exact execution ownership must agree on both the fact and the CPU,
+        // and on whether the executing task still wants to run.
+        (QueueOwner::Running(queue_cpu, _), LegacyPosition::Running(legacy_cpu))
+            if queue_cpu != legacy_cpu =>
+        {
+            Some(Mismatch::RunningOnDifferentCpus)
+        }
+        (QueueOwner::Running(_, runnable), LegacyPosition::Running(_)) => {
+            if runnable == legacy_running_is_runnable {
                 None
             } else {
-                Some(Mismatch::RunningOnDifferentCpus)
+                Some(Mismatch::RunningRunnableBit)
             }
         }
-        (QueueOwner::Running(_), LegacyPosition::Transition(_)) => None,
-        (QueueOwner::Running(_), _) => Some(Mismatch::QueueRunningLegacyNot),
+        (QueueOwner::Running(_, _), LegacyPosition::Transition(_)) => None,
+        (QueueOwner::Running(_, _), _) => Some(Mismatch::QueueRunningLegacyNot),
         (_, LegacyPosition::Running(_)) => Some(Mismatch::LegacyRunningQueueNot),
 
         // A queued task must be runnable, and a runnable task must be queued.
@@ -166,22 +188,86 @@ mod tests {
         // The mismatch that becomes a task on two CPUs once the global lock is
         // gone, so it is checked from both sides.
         assert_eq!(
-            compare(QueueOwner::Running(2), LegacyPosition::Running(2)),
+            compare(
+                QueueOwner::Running(2, true),
+                LegacyPosition::Running(2),
+                true
+            ),
             None
         );
         // The three directions are distinguished, because at one vCPU only two
         // of them are even reachable and a single kind cannot say which.
         assert_eq!(
-            compare(QueueOwner::Running(2), LegacyPosition::Running(3)),
+            compare(
+                QueueOwner::Running(2, true),
+                LegacyPosition::Running(3),
+                true
+            ),
             Some(Mismatch::RunningOnDifferentCpus)
         );
         assert_eq!(
-            compare(QueueOwner::Running(2), LegacyPosition::Blocked),
+            compare(QueueOwner::Running(2, true), LegacyPosition::Blocked, true),
             Some(Mismatch::QueueRunningLegacyNot)
         );
         assert_eq!(
-            compare(QueueOwner::Queued(Some(1)), LegacyPosition::Running(1)),
+            compare(
+                QueueOwner::Queued(Some(1)),
+                LegacyPosition::Running(1),
+                true
+            ),
             Some(Mismatch::LegacyRunningQueueNot)
+        );
+    }
+
+    #[test]
+    fn an_executing_task_must_agree_about_whether_it_still_wants_to_run() {
+        // Linux keeps these two apart: `p->on_rq == TASK_ON_RQ_QUEUED` covers a
+        // task "actively executing on a CPU or waiting to run", while the task
+        // state says whether it has blocked. Without the bit, the owner word
+        // cannot answer whether a preempted task returns to its queue.
+        assert_eq!(
+            compare(
+                QueueOwner::Running(1, true),
+                LegacyPosition::Running(1),
+                true
+            ),
+            None
+        );
+        assert_eq!(
+            compare(
+                QueueOwner::Running(1, false),
+                LegacyPosition::Running(1),
+                false
+            ),
+            None
+        );
+        // A task that blocked while executing but whose bit is still set would
+        // be re-queued; the reverse strands a runnable task.
+        assert_eq!(
+            compare(
+                QueueOwner::Running(1, true),
+                LegacyPosition::Running(1),
+                false
+            ),
+            Some(Mismatch::RunningRunnableBit)
+        );
+        assert_eq!(
+            compare(
+                QueueOwner::Running(1, false),
+                LegacyPosition::Running(1),
+                true
+            ),
+            Some(Mismatch::RunningRunnableBit)
+        );
+        // A different CPU still outranks the bit: that one is fatal after the
+        // cutover, this one is a scheduling error.
+        assert_eq!(
+            compare(
+                QueueOwner::Running(1, true),
+                LegacyPosition::Running(2),
+                false
+            ),
+            Some(Mismatch::RunningOnDifferentCpus)
         );
     }
 
@@ -190,11 +276,19 @@ mod tests {
         // The one legitimate half-state: the owner word has moved on while the
         // outgoing stack is still held. Reporting it would be noise.
         assert_eq!(
-            compare(QueueOwner::Running(0), LegacyPosition::Transition(0)),
+            compare(
+                QueueOwner::Running(0, true),
+                LegacyPosition::Transition(0),
+                true
+            ),
             None
         );
         assert_eq!(
-            compare(QueueOwner::Migrating(Some(0)), LegacyPosition::Blocked),
+            compare(
+                QueueOwner::Migrating(Some(0)),
+                LegacyPosition::Blocked,
+                true
+            ),
             None
         );
     }
@@ -202,37 +296,43 @@ mod tests {
     #[test]
     fn queued_and_runnable_must_mean_the_same_thing() {
         assert_eq!(
-            compare(QueueOwner::Queued(Some(0)), LegacyPosition::Blocked),
+            compare(QueueOwner::Queued(Some(0)), LegacyPosition::Blocked, true),
             Some(Mismatch::QueuedButBlocked)
         );
         assert_eq!(
-            compare(QueueOwner::Blocked, LegacyPosition::Runnable),
+            compare(QueueOwner::Blocked, LegacyPosition::Runnable, true),
             Some(Mismatch::RunnableButUnqueued)
         );
         assert_eq!(
-            compare(QueueOwner::Dormant, LegacyPosition::Runnable),
+            compare(QueueOwner::Dormant, LegacyPosition::Runnable, true),
             Some(Mismatch::RunnableButUnqueued)
         );
         assert_eq!(
-            compare(QueueOwner::Queued(Some(0)), LegacyPosition::Runnable),
+            compare(QueueOwner::Queued(Some(0)), LegacyPosition::Runnable, true),
             None
         );
-        assert_eq!(compare(QueueOwner::Blocked, LegacyPosition::Blocked), None);
+        assert_eq!(
+            compare(QueueOwner::Blocked, LegacyPosition::Blocked, true),
+            None
+        );
     }
 
     #[test]
     fn lifetime_must_agree_in_both_directions() {
         assert_eq!(
-            compare(QueueOwner::Retired, LegacyPosition::Runnable),
+            compare(QueueOwner::Retired, LegacyPosition::Runnable, true),
             Some(Mismatch::Lifetime)
         );
         assert_eq!(
-            compare(QueueOwner::Blocked, LegacyPosition::Absent),
+            compare(QueueOwner::Blocked, LegacyPosition::Absent, true),
             Some(Mismatch::Lifetime)
         );
-        assert_eq!(compare(QueueOwner::Retired, LegacyPosition::Absent), None);
         assert_eq!(
-            compare(QueueOwner::Retiring, LegacyPosition::Retiring),
+            compare(QueueOwner::Retired, LegacyPosition::Absent, true),
+            None
+        );
+        assert_eq!(
+            compare(QueueOwner::Retiring, LegacyPosition::Retiring, true),
             None
         );
     }
