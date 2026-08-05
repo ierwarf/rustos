@@ -318,9 +318,25 @@ three added the `on_rq` bit and hit three things worth knowing:
   follows is simple and was already implied: **a signal the sweep reports as
   inconsistent must not be consumed, however plausible it looks.**
 
-So step three is landed as observation only. The ten current-slot readers stay
-on the legacy fields until the bit reads zero for a full gate, and settling what
-the bit must mirror comes before converting any of them.
+Step three is landed with the bit consumed at exactly one site, the
+publish-blocked decision, which is the one the bit was added for. What the bit
+must mirror is settled: not `!blocked`, but the three-part expression the turn
+prologue already computes — `!retired && !blocked && the frame validates` — and
+the mirror belongs inside `mark_slot_ready` so the value is fresh in the same
+turn that reads it.
+
+A fourth attempt then converted `handoff_slot_ready`, `pick_hint_candidate_slot`,
+and `maybe_keep_current` together, and the gates rejected it: a panic on one
+8-vCPU run and 76 `RunnableButUnqueued` on the other, from a build that had read
+zero twice immediately before. It is reverted. The lesson is about batch size
+rather than about any one of the three — converting a group and gating the group
+cannot say which member did it, and all three are on paths where "queued",
+"running but still runnable", and "not blocked" are three different predicates
+that the legacy field happened to spell the same way.
+
+The remaining readers are therefore converted **one at a time, each with its own
+two-run gate**, and `context.ready` becomes diagnostic-only only when the last
+one is done. Anything else re-learns this at the cost of a build and two runs.
 
 `V5-FORMAL-SCHED-019` closes with a refinement model whose variables are the
 owner word, the per-CPU queues, the transfer token, `current`, and the transition
