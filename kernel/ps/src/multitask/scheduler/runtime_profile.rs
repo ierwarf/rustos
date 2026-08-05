@@ -94,12 +94,13 @@ pub(in crate::multitask) struct SchedulerRuntimeProfile {
     /// scheduler's own tables, or `usize::MAX` when publication is complete.
     /// This is the standing proof that no identity write site was missed.
     pub(in crate::multitask) divergent_identity_slot: usize,
-    /// First illegal per-CPU ownership edge of the window and how many were
-    /// rejected, or `None` when every transition had an edge.
+    /// First disagreement between the per-CPU owner word and the legacy tables
+    /// this window, with the total, or `None` when the two sources agreed.
     ///
-    /// The shadow for `V5-SCHED-GLOBAL-001`. Nothing consumes it; it exists so
-    /// the backend cutover is preceded by evidence rather than by confidence.
-    pub(in crate::multitask) run_authority_divergence: Option<(u64, u64)>,
+    /// The cutover evidence for `V5-SCHED-GLOBAL-001`. Nothing consumes it; it
+    /// exists so removing the global lock is preceded by proof that the owner
+    /// word already means what the legacy tables mean.
+    pub(in crate::multitask) run_authority_divergence: Option<(u64, u64, u64)>,
     pub(in crate::multitask) top: [SchedulerRuntimeProfileEntry; PROFILE_TOP_TASKS],
 }
 
@@ -313,12 +314,12 @@ pub fn drain_scheduler_runtime_profile() -> usize {
     // arg0 = packed first edge (present bit, slot, from state/cpu, to
     // state/cpu), arg1 = rejected edges this window. An empty window emits
     // nothing, so any occurrence is the signal.
-    if let Some((first, count)) = profile.run_authority_divergence {
+    if let Some((first, count, task_id)) = profile.run_authority_divergence {
         crate::debug::record_milestone(
             crate::debug::LogCategory::Sched,
-            "kernel-scheduler-run-authority-divergence",
+            "kernel-scheduler-run-authority-mismatch",
             first,
-            count,
+            pack_u32_pair(task_id, count),
         );
     }
     if profile.divergent_identity_slot != usize::MAX {
@@ -542,7 +543,20 @@ impl Scheduler {
                 // Sweep before taking the window so a position no publication
                 // site reached is charged to this window rather than the next.
                 self.sweep_run_authority();
-                super::super::run_authority::take_divergence_window()
+                super::super::run_authority::take_window().map(|(first, count)| {
+                    // Resolve the slot to its task while the lock is still
+                    // held. A slot number alone forces the reader to guess
+                    // which service it was, and guessing from a slot number is
+                    // how the previous misattributions started.
+                    let slot = ((first >> 32) & 0xFFFF) as usize;
+                    let task_id = self
+                        .starts
+                        .get(slot)
+                        .and_then(|start| *start)
+                        .map(|start| start.id)
+                        .unwrap_or(0);
+                    (first, count, task_id)
+                })
             },
             top: [SchedulerRuntimeProfileEntry::default(); PROFILE_TOP_TASKS],
         };

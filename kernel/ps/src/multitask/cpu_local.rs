@@ -245,28 +245,6 @@ impl Drop for SchedulerAccessGuard {
         // ORDERING: the following Release is the derived-class publication.
         CURRENT_TASK_IDLE[self.logical_index]
             .store(guard.current_task_is_idle_task(), Ordering::Release);
-        // Shadow the per-CPU ownership machine for the two slots this turn can
-        // have moved. Both positions are known by construction here, so this
-        // costs no scan: the selected slot is now executing on this CPU, and a
-        // changed outgoing slot is off-CPU with its stack still held, which is
-        // that machine's `Migrating` custody. `V5-SCHED-GLOBAL-001` step one.
-        let logical_cpu = u8::try_from(self.logical_index).unwrap_or(super::run_authority::NO_CPU);
-        if selected_task != self.original_task {
-            let _ = super::run_authority::observe(
-                self.original_task,
-                super::run_authority::RunOwner::new(
-                    super::run_authority::RunState::Migrating,
-                    logical_cpu,
-                ),
-            );
-        }
-        let _ = super::run_authority::observe(
-            selected_task,
-            super::run_authority::RunOwner::new(
-                super::run_authority::RunState::Running,
-                logical_cpu,
-            ),
-        );
         // ORDERING: diagnostic metadata is not lock authority. Release-clear
         // its publication immediately before the tracked guard releases the
         // real lock.

@@ -3129,67 +3129,86 @@ impl Scheduler {
 
     /// Returns the first slot whose published identity disagrees with the
     /// scheduler's own tables, or `None` when the publication is complete.
-    /// The ownership position the legacy tables imply for `slot`.
+    /// The position the legacy tables imply for `slot`.
     ///
-    /// This is the refinement map `V5-FORMAL-SCHED-019` needs written down:
-    /// execution ownership comes from the published current/transition pair,
-    /// runnability from `context.ready`, and lifetime from the retire flag and
-    /// the presence of a context. The per-CPU backend will hold these as one
-    /// word; today they are three sources, which is exactly why they can
+    /// This is half of the refinement map `V5-FORMAL-SCHED-019` needs written
+    /// down. Execution ownership comes from the published current/transition
+    /// pair, runnability from `context.ready`, and lifetime from the retire
+    /// flag and the presence of a context. `runqueue.rs` holds all three in one
+    /// word; here they are three sources, which is exactly why they can
     /// disagree.
-    pub(super) fn derived_run_owner(&self, slot: usize) -> run_authority::RunOwner {
-        use run_authority::{RunOwner, RunState};
+    fn legacy_position(&self, slot: usize) -> run_authority::LegacyPosition {
+        use run_authority::LegacyPosition;
         let Some(context) = self.contexts.get(slot).and_then(|context| *context) else {
-            return RunOwner::unowned(RunState::Retired);
+            return LegacyPosition::Absent;
         };
         if let Some(owner) = super::cpu_local::task_execution_owner(slot) {
-            let cpu = u8::try_from(match owner {
-                super::cpu_local::TaskExecutionOwner::Current(cpu) => cpu,
-                super::cpu_local::TaskExecutionOwner::Transition(cpu) => cpu,
-            })
-            .unwrap_or(run_authority::NO_CPU);
-            // A transition-from slot is off-CPU but its outgoing stack is still
-            // held, which is precisely the per-CPU `Migrating` custody.
             return match owner {
-                super::cpu_local::TaskExecutionOwner::Current(_) => {
-                    RunOwner::new(RunState::Running, cpu)
+                super::cpu_local::TaskExecutionOwner::Current(cpu) => {
+                    LegacyPosition::Running(u8::try_from(cpu).unwrap_or(u8::MAX))
                 }
-                super::cpu_local::TaskExecutionOwner::Transition(_) => {
-                    RunOwner::new(RunState::Migrating, cpu)
+                super::cpu_local::TaskExecutionOwner::Transition(cpu) => {
+                    LegacyPosition::Transition(u8::try_from(cpu).unwrap_or(u8::MAX))
                 }
             };
         }
         if self.retired[slot] {
-            return RunOwner::unowned(RunState::Retiring);
+            return LegacyPosition::Retiring;
         }
         if context.ready {
-            return RunOwner::unowned(RunState::Local);
+            return LegacyPosition::Runnable;
         }
-        RunOwner::unowned(RunState::Blocked)
+        LegacyPosition::Blocked
     }
 
-    /// Publishes that `slot` became runnable.
-    ///
-    /// Called from the sites that actually make a task runnable rather than
-    /// from every assignment to `context.ready`. The per-CPU backend's
-    /// `RemoteQueued -> Local` edge is this event, and hooking the event rather
-    /// than the field is what keeps the shadow meaningful: a field write with
-    /// no semantic event behind it is what the once-per-second sweep is for.
-    pub(super) fn observe_run_authority_local(&self, slot: usize) {
-        let _ = run_authority::observe(
-            slot,
-            run_authority::RunOwner::unowned(run_authority::RunState::Local),
-        );
+    /// The authoritative runqueue owner for `slot`, in the shape the comparison
+    /// takes.
+    fn queue_owner(&self, slot: usize) -> run_authority::QueueOwner {
+        use run_authority::QueueOwner;
+        let snapshot = runqueue::owner(slot);
+        let cpu = snapshot.cpu.and_then(|cpu| u8::try_from(cpu).ok());
+        match snapshot.state {
+            runqueue::RunOwnerState::Dormant => QueueOwner::Dormant,
+            runqueue::RunOwnerState::Blocked => QueueOwner::Blocked,
+            runqueue::RunOwnerState::Local | runqueue::RunOwnerState::RemoteQueued => {
+                QueueOwner::Queued(cpu)
+            }
+            runqueue::RunOwnerState::Running => QueueOwner::Running(cpu.unwrap_or(u8::MAX)),
+            runqueue::RunOwnerState::Migrating => QueueOwner::Migrating(cpu),
+            runqueue::RunOwnerState::Retiring => QueueOwner::Retiring,
+            runqueue::RunOwnerState::Retired => QueueOwner::Retired,
+        }
     }
 
-    /// Re-derives every slot and reports the first edge the per-CPU ownership
-    /// machine has no transition for.
+    /// Compares the per-CPU owner word against the legacy tables for every slot.
     ///
-    /// The completeness net. A publication site missed above shows up here as a
-    /// state the shadow never travelled to, rather than as silence.
+    /// Run under the lock, so both sources are one stable observation. A
+    /// disagreement is a cutover blocker: once the global lock is gone the owner
+    /// word is the only synchronisation between CPUs, and the execution-owner
+    /// kinds become a task running on two of them.
+    ///
+    /// The calling CPU's in-flight dispatch pair is excluded, and that exclusion
+    /// is load-bearing rather than convenient. This sweep runs from
+    /// `take_runtime_profile`, which the dispatch path calls *after* the
+    /// runqueue has claimed the incoming slot and *before*
+    /// `SchedulerAccessGuard::drop` publishes the new current/transition pair.
+    /// Both halves of that window therefore disagree by construction: the
+    /// incoming slot reads `QueueRunningLegacyNot` and the outgoing slot reads
+    /// `LegacyRunningQueueNot`. The first run reported exactly that, two per
+    /// second, every second. Those two slots are covered by the guard's own
+    /// duplicate-owner assertions, which fail the kernel rather than reporting.
     pub(super) fn sweep_run_authority(&self) {
+        let dispatching = self.current_task_slot();
+        let published = super::cpu_local::current_cpu_task_slot();
         for slot in 0..MAX_TASK {
-            let _ = run_authority::observe(slot, self.derived_run_owner(slot));
+            if slot == dispatching || published == Some(slot) {
+                continue;
+            }
+            if let Some(kind) =
+                run_authority::compare(self.queue_owner(slot), self.legacy_position(slot))
+            {
+                run_authority::record(slot, kind);
+            }
         }
     }
 
@@ -3444,9 +3463,6 @@ impl Scheduler {
             context.ready = true;
             context.ready_since_ticks = crate::arch::rtc::ticks();
         }
-        // An exec rebind makes the slot runnable again under a new image; in
-        // the per-CPU machine that is the queue-admission edge.
-        self.observe_run_authority_local(slot);
         self.exec_target_quiesced[slot] = false;
         self.simd_states[slot] = SimdState::new();
         super::syscall_simd::reset(slot);
@@ -3793,7 +3809,6 @@ impl Scheduler {
             context.ready = true;
             context.ready_since_ticks = crate::arch::rtc::ticks();
             context.blocked_since_ticks = 0;
-            self.observe_run_authority_local(slot);
             #[cfg(not(test))]
             if let Some(cpu) = runqueue::owner(slot).cpu {
                 super::irq::request_target_reschedule(cpu);
@@ -3855,14 +3870,6 @@ impl Scheduler {
                 context.ready && invalid_reason.is_none() && !self.job_stopped[slot],
             )
         };
-
-        // The ordinary wake edge. Observed after the context write so the
-        // shadow records the position the legacy tables now hold, and only when
-        // the wake actually made the task runnable — a wake that found an
-        // invalid context retires the slot instead.
-        if invalid_reason.is_none() {
-            self.observe_run_authority_local(slot);
-        }
 
         if invalid_reason.is_none() && blocked_since_ticks != 0 {
             self.maybe_log_blocked_wait(slot, task_id, process_id, blocked_since_ticks, now_ticks);
