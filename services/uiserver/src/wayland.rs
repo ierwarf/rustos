@@ -986,12 +986,22 @@ impl WaylandState {
                     .pending_buffer_releases
                     .drain(..)
                     .collect::<Vec<_>>();
-                let callbacks = if surface.alive
-                    && !surface.minimized
-                    && !surface.pixels.is_empty()
-                    && surface.width != 0
-                    && surface.height != 0
-                {
+                // Protocol progress must not be gated on render state.
+                //
+                // This used to also require a populated pixel cache and a
+                // non-zero size. A frame requested before the first buffer copy
+                // then had its callback withheld indefinitely, and the client
+                // reused the protocol id for its next request while the server
+                // still held the old object — which is how WayClick died with
+                // `wl_display` `Invalid new_id: 15` right after presenting its
+                // first frame. The instrumented run shows it plainly: every
+                // callback carries protocol id 15, and the two that never
+                // received `done` are the ones that stranded it.
+                //
+                // Visibility is a legitimate reason to withhold a callback; the
+                // compositor's own buffer bookkeeping is not, and the audit's
+                // `V5-WAYLAND-HOL-013` is exactly this coupling.
+                let callbacks = if surface.alive && !surface.minimized {
                     surface.pending_callbacks.drain(..).collect::<Vec<_>>()
                 } else {
                     Vec::new()
@@ -1010,6 +1020,10 @@ impl WaylandState {
                     .saturating_add(wait_micros);
                 self.callback_profile_max_wait_micros =
                     self.callback_profile_max_wait_micros.max(wait_micros);
+                crate::sys::debug_line(&format!(
+                    "uiserver: wayland frame callback done id={:?}",
+                    pending.callback.id()
+                ));
                 pending.callback.done(time);
             }
         }
@@ -2593,31 +2607,45 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for WaylandState {
                 }
             }
             wl_surface::Request::Frame { callback } => {
-                let callback_limit_reached = if let Ok(mut surface) = data.shared.lock() {
-                    WaylandState::surface_callback_count(&mut surface)
-                        >= MAX_WAYLAND_FRAME_CALLBACKS_PER_SURFACE
-                } else {
+                // The `new_id` is consumed unconditionally, before any decision.
+                //
+                // The client has already allocated this id and will not reuse
+                // it until the server destroys the object. Returning early
+                // without calling `data_init.init` leaves the id in a state the
+                // backend and the client disagree about, and the next
+                // `wl_surface.frame` fails with `wl_display` error
+                // `Invalid new_id`. WayClick hit exactly that after presenting
+                // its first frame, and it is fatal to the client rather than to
+                // the request that caused it.
+                let callback = data_init.init(callback, CallbackData);
+                // The client dies with a backend `Invalid new_id` after its
+                // first frame, which is an id-lifetime disagreement rather than
+                // anything this compositor posts. Log both ends of the callback
+                // object's life so the next run names the id instead of
+                // inviting another guess.
+                crate::sys::debug_line(&format!(
+                    "uiserver: wayland frame callback created id={:?}",
+                    callback.id()
+                ));
+
+                let Ok(mut surface) = data.shared.lock() else {
                     post_protocol_error(resource, "wl_surface.frame: surface unavailable".into());
                     return;
                 };
-                if callback_limit_reached {
-                    post_protocol_error(
-                        resource,
-                        format!(
-                            "wl_surface.frame: callback limit {} reached",
-                            MAX_WAYLAND_FRAME_CALLBACKS_PER_SURFACE
-                        ),
-                    );
+                if WaylandState::surface_callback_count(&mut surface)
+                    >= MAX_WAYLAND_FRAME_CALLBACKS_PER_SURFACE
+                {
+                    // Answer the callback instead of dropping it. A client that
+                    // is ahead of the compositor is throttling itself correctly;
+                    // failing its connection turns a backlog into an exit.
+                    drop(surface);
+                    callback.done(state.event_time_ms());
                     return;
                 }
-
-                let callback = data_init.init(callback, CallbackData);
-                if let Ok(mut surface) = data.shared.lock() {
-                    surface.pending_callbacks.push(PendingFrameCallback {
-                        callback,
-                        requested_at: Instant::now(),
-                    });
-                }
+                surface.pending_callbacks.push(PendingFrameCallback {
+                    callback,
+                    requested_at: Instant::now(),
+                });
             }
             wl_surface::Request::Damage {
                 x,
