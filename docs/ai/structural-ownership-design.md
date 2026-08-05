@@ -295,6 +295,33 @@ Each step keeps its own KVM gate at 1, then 2, then 4 and 8. Dual-write is
 forbidden throughout: the divergence sweep is a comparison of two authorities
 that already exist, not a second copy maintained in parallel.
 
+**What step two and three actually cost, recorded so the next attempt is
+cheaper.** Step two moved thirteen readers and held at zero mismatches. Step
+three added the `on_rq` bit and hit three things worth knowing:
+
+- Mirroring the bit only at the `mark_slot_ready` funnel read clean at 1 vCPU
+  and diverged 7-9 times per second at 8. Fourteen direct assignments bypass
+  that funnel, and no per-writer mirror can be complete anyway, because a wake
+  on one CPU changes the readiness of a task executing on another. Re-mirroring
+  every executing slot at guard release — bounded by CPU count, not slot count —
+  reached zero at both topologies. That is the landed state.
+- `context.ready` is overloaded and `!context.blocked` is **not** an equivalent
+  source for the bit. Switching the mirror to it raised the disagreement to 272
+  per window and introduced `RunnableButUnqueued` on top. `ready` is cleared at
+  dispatch to mean "removed from the queue" and set again in the next turn's
+  prologue to mean "still wants to run"; `blocked` is a third thing. Which of
+  the three is Linux's `on_rq` is exactly what step three still has to settle,
+  and it is not answerable by picking one field and hoping.
+- Consuming the bit at the publish-blocked decision while the sweep still
+  reported it inconsistent produced a corrupted kernel stack guard on one slot
+  at 8 vCPU — the signature of a task dispatched on two CPUs. The rule that
+  follows is simple and was already implied: **a signal the sweep reports as
+  inconsistent must not be consumed, however plausible it looks.**
+
+So step three is landed as observation only. The ten current-slot readers stay
+on the legacy fields until the bit reads zero for a full gate, and settling what
+the bit must mirror comes before converting any of them.
+
 `V5-FORMAL-SCHED-019` closes with a refinement model whose variables are the
 owner word, the per-CPU queues, the transfer token, `current`, and the transition
 stack, and whose properties are exact-one ownership and a queue-to-owner
