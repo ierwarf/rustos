@@ -602,23 +602,59 @@ fn emit_milestone_debugcon_line(record: MilestoneRecord) {
             }
             let _ = write!(
                 writer,
-                " msg=\"milestone seq={} cat={} name={} arg0={:#x} arg1={:#x}\"\r\n",
+                " msg=\"milestone seq={} cat={} name={} arg0={:#x} arg1={:#x} dropped={}\"\r\n",
                 record.seq,
                 record.category.as_str(),
                 record.name,
                 record.arg0,
                 record.arg1,
+                // ORDERING: Relaxed is sufficient; this is a monotonic loss
+                // count, not a publication of any other state.
+                MILESTONES_DROPPED.load(Ordering::Relaxed),
             );
             return;
         }
         spin_loop();
     }
+    // Every attempt lost the nonblocking sink. Count it: a diagnostic that can
+    // vanish without saying so is worse than no diagnostic, because the reader
+    // draws conclusions from a record they believe is complete. One 8-vCPU run
+    // lost 90 of 351 milestone sequence numbers, and the losses fell at the
+    // tail of the per-second scheduler drain, which is exactly where the
+    // per-caller acquisition census is emitted.
+    // ORDERING: Relaxed; the count is read only for reporting.
+    MILESTONES_DROPPED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Milestones whose emission lost the debug sink and were never written.
+///
+/// Reported on every line that does get out, so a reader can tell a complete
+/// record from a truncated one without reconstructing sequence gaps by hand.
+#[cfg(rustos_debug_print_enabled)]
+static MILESTONES_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Number of milestones lost to a busy debug sink so far.
+#[cfg(rustos_debug_print_enabled)]
+pub fn milestones_dropped() -> u64 {
+    // ORDERING: Relaxed; a monotonic counter with no other state attached.
+    MILESTONES_DROPPED.load(Ordering::Relaxed)
+}
+
+#[cfg(not(rustos_debug_print_enabled))]
+pub fn milestones_dropped() -> u64 {
+    0
 }
 
 #[cfg(rustos_debug_print_enabled)]
 fn milestone_requires_reliable_output(name: &str) -> bool {
     name.starts_with("smp-")
         || name.starts_with("product-")
+        // The once-per-second scheduler record is measurement, and a
+        // measurement that silently loses its tail is not evidence. These are
+        // emitted in one burst of about fourteen lines, so the later ones —
+        // the per-caller acquisition census — are the ones that lost the race
+        // under 8 vCPU contention.
+        || name.starts_with("kernel-scheduler-")
         || name == "dvm-block-first-completion"
         || name == "task-context-corrupted"
         || name == "linux-user-fault"
