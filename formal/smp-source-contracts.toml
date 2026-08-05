@@ -336,7 +336,13 @@ tokens = [
 [[required_sequences]]
 path = "kernel/compat/src/user/syscall/linux/ipc_ops.rs"
 tokens = [
-    "if donation_required && !multitask::reserve_ipc_priority(task_id)",
+# The reservation result selects the queue priority; it no longer aborts the
+# call. A full donation table is a scheduling condition, and failing the IPC
+# turned it into a terminal `ENOSPC` that killed a Wayland client whose
+# compositor was writing to it. The ordering that still matters is unchanged:
+# sample the reservation before the IPC slot lock, then enqueue, then bind the
+# reply, then cancel on an invalid commit.
+    "priority == EndpointCallPriority::System && multitask::reserve_ipc_priority(task_id)",
     "enqueue_endpoint_call_with_handles_and_priority(",
     "multitask::bind_reserved_ipc_priority(reply.raw(), task_id, receiver_task_id)",
     "cancel_reply_wait(reply, task_id, ReplyCancelReason::InvalidCommit)",

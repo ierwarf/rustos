@@ -2226,10 +2226,36 @@ fn enqueue_call_and_wake_with_handles(
     } else {
         EndpointCallPriority::Ordinary
     };
-    let donation_required = priority == EndpointCallPriority::System;
-    if donation_required && !multitask::reserve_ipc_priority(task_id) {
-        return Err(LINUX_ENOSPC);
-    }
+    // A full donation table degrades the call's priority; it does not fail the
+    // call.
+    //
+    // Priority inheritance is a scheduling optimisation. Returning `ENOSPC`
+    // when the table is full turns a transient scheduling condition into a
+    // terminal I/O error for the caller, and the caller has no way to tell the
+    // two apart — the same defect shape as netd answering "not ready yet" with
+    // `ENOSYS`, which `V5-DEADLINE-012` names. It cost a Wayland client: the
+    // compositor's socket write returned `ENOSPC`, `wayland-server` treats that
+    // as fatal, and WayClick's surface was retired mid-session with
+    // `alive=true`.
+    //
+    // seL4 and QNX both degrade rather than fail here: without a donated
+    // scheduling context the server runs at its own priority, which is slower,
+    // not incorrect. The audit's own counterexample for
+    // `V5-SCHED-DONATION-002` describes the same expectation — a caller that
+    // cannot donate blocks without the boost.
+    let donation_required =
+        priority == EndpointCallPriority::System && multitask::reserve_ipc_priority(task_id);
+    let priority = if priority == EndpointCallPriority::System && !donation_required {
+        crate::debug::record_milestone(
+            crate::debug::LogCategory::Sched,
+            "ipc-donation-capacity-degraded",
+            task_id,
+            0,
+        );
+        EndpointCallPriority::Ordinary
+    } else {
+        priority
+    };
     let (reply, receiver_to_wake) =
         match kernel_ipc_runtime::api::enqueue_endpoint_call_with_handles_and_priority(
             endpoint,
