@@ -136,6 +136,42 @@ the owner word already says, and stage one proved they agree — zero mismatches
 at 1 and 8 vCPU. Removing it as authority is the first field of the split, not a
 cleanup.
 
+### 2.1b Where the lock time actually goes, measured at 8 vCPU
+
+Steady state, per one-second window, eight vCPUs:
+
+| figure | value |
+|---|---:|
+| guard acquisitions | 143,000/s |
+| dispatches | 29,400/s |
+| acquisitions per dispatch | 4.9 |
+| lock hold total | 600 ms/s — 60 percent duty on one lock |
+| lock wait total | 950 ms/s |
+| in-owner attributed | 545 ms of the 600 — 91 percent |
+
+The 91 percent attribution matters: this is real critical-section work, not a
+descheduled vCPU, so shortening the section is a real lever and the earlier
+`CPUID`-style implementation win is not available again.
+
+By segment: `select` is 284 ms/s, and inside it `SelectHandoff` alone is
+238 ms/s — 40 percent of all lock hold, about 8 µs per dispatch. Everything else
+is small: balance 70, validate 43, commit 85, arch-restore 38, prologue 19.
+
+**One measured non-result, recorded so it is not retried.** `overdue_class_pick`
+runs inside that segment, scans every local runnable slot per dispatch, and
+called `slot_class` — which resolves the effective class through the donation
+chain — before the cheap ready-age test. Reordering the conjunction so the
+arithmetic age test rejects first moved the number by nothing: 8.2 µs per
+dispatch before, 8.5 after. The predicate chain is not the cost.
+
+What that leaves is the phase boundary itself. `pick_min_vruntime` and
+`pick_min_vruntime_excluding` — the CFS scan — are lexically inside the
+`SelectHandoff` span, so `SelectPick` reads under 1 ms/s while the actual pick is
+charged to handoff. Before attacking this segment again, **split the marks so
+the CFS pick is measured separately from the handoff chain**; otherwise the next
+attempt optimises whichever of the two the name suggests rather than whichever
+one costs.
+
 ### 2.2 Reference designs and what each contributes
 
 - **Linux scheduler domains** — <https://www.kernel.org/doc/html/latest/scheduler/sched-domains.html>.
