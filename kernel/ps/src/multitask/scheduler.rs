@@ -2523,10 +2523,20 @@ impl Scheduler {
                 let current_affinity = self.task_affinity_masks[current_slot]
                     & self.process_affinity_masks[current_slot];
                 let current_cpu_is_eligible = current_affinity & (1_u64 << current_cpu) != 0;
-                if self.retired[current_slot]
-                    || self.contexts[current_slot]
-                        .is_none_or(|context| !context.ready || context.blocked)
-                {
+                // The owner word answers this. `owner.runnable` is Linux's
+                // `p->on_rq` for an executing task, and this turn's prologue has
+                // already recomputed it a few lines above: `mark_slot_ready`
+                // sets `ready = !retired && !blocked && the frame validates`,
+                // and mirrors that into the word in the same call. Reading the
+                // word here is therefore reading this turn's decision, not the
+                // previous one.
+                //
+                // An earlier attempt converted this site while the mirror had
+                // been moved out of `mark_slot_ready`, so the bit was one
+                // prologue stale; it corrupted a kernel stack guard at 8 vCPU,
+                // which is what a task dispatched on two CPUs looks like. The
+                // freshness of this read is the whole precondition.
+                if self.retired[current_slot] || !owner.runnable {
                     runqueue::publish_blocked(current_slot, current_cpu, weight);
                 } else if !current_cpu_is_eligible {
                     runqueue::publish_blocked(current_slot, current_cpu, weight);
