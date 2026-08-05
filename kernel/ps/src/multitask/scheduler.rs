@@ -73,6 +73,7 @@ use crate::user::process_state::{UserProcessState, WindowsThreadRuntimeState};
 use super::context::{SAVED_CONTEXT_BYTES, SavedContext};
 use super::current_identity::{self, TaskIdentity};
 use super::process_table::{self, ProcessHandle};
+use super::run_authority;
 use super::{UserFaultDisposition, UserStackState, UserTaskBootstrap, initial_task_rflags};
 use context_validation::context_validation_reason_code;
 use dispatch_policy::{CpuDispatchGuard, CpuDispatchLock, CpuDispatchPolicy};
@@ -3128,6 +3129,70 @@ impl Scheduler {
 
     /// Returns the first slot whose published identity disagrees with the
     /// scheduler's own tables, or `None` when the publication is complete.
+    /// The ownership position the legacy tables imply for `slot`.
+    ///
+    /// This is the refinement map `V5-FORMAL-SCHED-019` needs written down:
+    /// execution ownership comes from the published current/transition pair,
+    /// runnability from `context.ready`, and lifetime from the retire flag and
+    /// the presence of a context. The per-CPU backend will hold these as one
+    /// word; today they are three sources, which is exactly why they can
+    /// disagree.
+    pub(super) fn derived_run_owner(&self, slot: usize) -> run_authority::RunOwner {
+        use run_authority::{RunOwner, RunState};
+        let Some(context) = self.contexts.get(slot).and_then(|context| *context) else {
+            return RunOwner::unowned(RunState::Retired);
+        };
+        if let Some(owner) = super::cpu_local::task_execution_owner(slot) {
+            let cpu = u8::try_from(match owner {
+                super::cpu_local::TaskExecutionOwner::Current(cpu) => cpu,
+                super::cpu_local::TaskExecutionOwner::Transition(cpu) => cpu,
+            })
+            .unwrap_or(run_authority::NO_CPU);
+            // A transition-from slot is off-CPU but its outgoing stack is still
+            // held, which is precisely the per-CPU `Migrating` custody.
+            return match owner {
+                super::cpu_local::TaskExecutionOwner::Current(_) => {
+                    RunOwner::new(RunState::Running, cpu)
+                }
+                super::cpu_local::TaskExecutionOwner::Transition(_) => {
+                    RunOwner::new(RunState::Migrating, cpu)
+                }
+            };
+        }
+        if self.retired[slot] {
+            return RunOwner::unowned(RunState::Retiring);
+        }
+        if context.ready {
+            return RunOwner::unowned(RunState::Local);
+        }
+        RunOwner::unowned(RunState::Blocked)
+    }
+
+    /// Publishes that `slot` became runnable.
+    ///
+    /// Called from the sites that actually make a task runnable rather than
+    /// from every assignment to `context.ready`. The per-CPU backend's
+    /// `RemoteQueued -> Local` edge is this event, and hooking the event rather
+    /// than the field is what keeps the shadow meaningful: a field write with
+    /// no semantic event behind it is what the once-per-second sweep is for.
+    pub(super) fn observe_run_authority_local(&self, slot: usize) {
+        let _ = run_authority::observe(
+            slot,
+            run_authority::RunOwner::unowned(run_authority::RunState::Local),
+        );
+    }
+
+    /// Re-derives every slot and reports the first edge the per-CPU ownership
+    /// machine has no transition for.
+    ///
+    /// The completeness net. A publication site missed above shows up here as a
+    /// state the shadow never travelled to, rather than as silence.
+    pub(super) fn sweep_run_authority(&self) {
+        for slot in 0..MAX_TASK {
+            let _ = run_authority::observe(slot, self.derived_run_owner(slot));
+        }
+    }
+
     pub(super) fn divergent_published_identity(&self) -> Option<usize> {
         (0..MAX_TASK)
             .find(|&slot| !current_identity::matches_authority(slot, self.slot_identity(slot)))
@@ -3379,6 +3444,9 @@ impl Scheduler {
             context.ready = true;
             context.ready_since_ticks = crate::arch::rtc::ticks();
         }
+        // An exec rebind makes the slot runnable again under a new image; in
+        // the per-CPU machine that is the queue-admission edge.
+        self.observe_run_authority_local(slot);
         self.exec_target_quiesced[slot] = false;
         self.simd_states[slot] = SimdState::new();
         super::syscall_simd::reset(slot);
@@ -3725,6 +3793,7 @@ impl Scheduler {
             context.ready = true;
             context.ready_since_ticks = crate::arch::rtc::ticks();
             context.blocked_since_ticks = 0;
+            self.observe_run_authority_local(slot);
             #[cfg(not(test))]
             if let Some(cpu) = runqueue::owner(slot).cpu {
                 super::irq::request_target_reschedule(cpu);
@@ -3786,6 +3855,14 @@ impl Scheduler {
                 context.ready && invalid_reason.is_none() && !self.job_stopped[slot],
             )
         };
+
+        // The ordinary wake edge. Observed after the context write so the
+        // shadow records the position the legacy tables now hold, and only when
+        // the wake actually made the task runnable — a wake that found an
+        // invalid context retires the slot instead.
+        if invalid_reason.is_none() {
+            self.observe_run_authority_local(slot);
+        }
 
         if invalid_reason.is_none() && blocked_since_ticks != 0 {
             self.maybe_log_blocked_wait(slot, task_id, process_id, blocked_since_ticks, now_ticks);

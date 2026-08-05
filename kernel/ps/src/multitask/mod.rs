@@ -8,6 +8,7 @@ mod process_state_lock;
 mod process_table;
 mod reschedule_observation;
 mod retirement;
+mod run_authority;
 mod scheduler;
 mod spawn;
 mod syscall_simd;

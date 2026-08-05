@@ -655,6 +655,11 @@ fn milestone_requires_reliable_output(name: &str) -> bool {
         // the per-caller acquisition census — are the ones that lost the race
         // under 8 vCPU contention.
         || name.starts_with("kernel-scheduler-")
+        // Emitted immediately before a fatal activation panic. A diagnostic
+        // that explains the panic about to happen is the last thing that may
+        // be dropped: the first 8-vCPU run with these records lost all four to
+        // a saturated sink and left the panic as unattributable as before.
+        || name.starts_with("sched-activation-")
         || name == "dvm-block-first-completion"
         || name == "task-context-corrupted"
         || name == "linux-user-fault"

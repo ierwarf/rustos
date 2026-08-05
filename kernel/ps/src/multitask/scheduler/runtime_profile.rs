@@ -94,6 +94,12 @@ pub(in crate::multitask) struct SchedulerRuntimeProfile {
     /// scheduler's own tables, or `usize::MAX` when publication is complete.
     /// This is the standing proof that no identity write site was missed.
     pub(in crate::multitask) divergent_identity_slot: usize,
+    /// First illegal per-CPU ownership edge of the window and how many were
+    /// rejected, or `None` when every transition had an edge.
+    ///
+    /// The shadow for `V5-SCHED-GLOBAL-001`. Nothing consumes it; it exists so
+    /// the backend cutover is preceded by evidence rather than by confidence.
+    pub(in crate::multitask) run_authority_divergence: Option<(u64, u64)>,
     pub(in crate::multitask) top: [SchedulerRuntimeProfileEntry; PROFILE_TOP_TASKS],
 }
 
@@ -304,6 +310,17 @@ pub fn drain_scheduler_runtime_profile() -> usize {
     // A divergence here means a slot mutated its identity without
     // republishing, which serves stale answers to syscall entry. It is
     // reported rather than left to inspection of the write sites.
+    // arg0 = packed first edge (present bit, slot, from state/cpu, to
+    // state/cpu), arg1 = rejected edges this window. An empty window emits
+    // nothing, so any occurrence is the signal.
+    if let Some((first, count)) = profile.run_authority_divergence {
+        crate::debug::record_milestone(
+            crate::debug::LogCategory::Sched,
+            "kernel-scheduler-run-authority-divergence",
+            first,
+            count,
+        );
+    }
     if profile.divergent_identity_slot != usize::MAX {
         crate::debug::record_milestone(
             crate::debug::LogCategory::Sched,
@@ -521,6 +538,12 @@ impl Scheduler {
             phase_ns: self.runtime_profile_phase_ns,
             runnable_samples: self.runtime_profile_runnable_samples,
             divergent_identity_slot: self.divergent_published_identity().unwrap_or(usize::MAX),
+            run_authority_divergence: {
+                // Sweep before taking the window so a position no publication
+                // site reached is charged to this window rather than the next.
+                self.sweep_run_authority();
+                super::super::run_authority::take_divergence_window()
+            },
             top: [SchedulerRuntimeProfileEntry::default(); PROFILE_TOP_TASKS],
         };
         for slot in 0..MAX_TASK {
@@ -660,6 +683,7 @@ mod tests {
             phase_ns: [0; SCHEDULER_PHASE_COUNT],
             runnable_samples: 0,
             divergent_identity_slot: usize::MAX,
+            run_authority_divergence: None,
             top: [SchedulerRuntimeProfileEntry::default(); PROFILE_TOP_TASKS],
         };
         assert!(pending.publish(profile));
