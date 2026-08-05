@@ -171,6 +171,13 @@ pub(crate) struct ExecutableSnapshotPlan {
     pub(crate) file_len: usize,
     pub(crate) metadata_len: u64,
     pub(crate) verbose: bool,
+    /// The mount generation the plan was resolved against.
+    ///
+    /// The bulk read runs without storage held, so a remount can land between
+    /// the plan and the commit. Sealing then would admit an image read from the
+    /// previous volume into the new generation's cache, where nothing would
+    /// ever invalidate it. The completion re-checks this before it seals.
+    pub(crate) mount_generation: u64,
 }
 
 pub(crate) enum ExecutableSnapshotAdmission {

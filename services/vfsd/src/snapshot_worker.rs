@@ -37,20 +37,36 @@ struct SnapshotJob {
 
 struct SnapshotJobSlot(UnsafeCell<MaybeUninit<SnapshotJob>>);
 
-// SAFETY: `SNAPSHOT_JOB_ADMISSION` is the publication authority. The receive
-// owner writes only in WRITING and publishes READY with Release; the sole
-// worker claims READY with Acquire, copies the fixed job, and returns IDLE.
+// SAFETY: the matching `SNAPSHOT_JOB_ADMISSION` entry is the publication
+// authority for its slot. The receive owner writes only in WRITING and
+// publishes READY with Release; one worker claims READY with Acquire, copies
+// the fixed job, and returns IDLE. Slots are never shared between admissions.
 unsafe impl Sync for SnapshotJobSlot {}
 
 #[repr(C, align(16))]
 struct SnapshotWorkerStack([u8; SNAPSHOT_WORKER_STACK_BYTES]);
 
-static SNAPSHOT_JOB_ADMISSION: SnapshotWorkerAdmission = SnapshotWorkerAdmission::new();
-static SNAPSHOT_WORKER_STARTED: AtomicBool = AtomicBool::new(false);
-static SNAPSHOT_JOB: SnapshotJobSlot = SnapshotJobSlot(UnsafeCell::new(MaybeUninit::uninit()));
+/// Bounded snapshot concurrency.
+///
+/// Two, not more, and the bound is a consequence rather than a preference.
+/// Every snapshot read serializes on the single storage owner, so a third
+/// worker could only queue there; what a second worker buys is that one
+/// snapshot can allocate, seal, and reply while another holds storage, and that
+/// a second concurrent request is served instead of being rejected as overload.
+///
+/// This is ownership structure, not a latency fix: a single caller issuing
+/// snapshots one at a time sees no difference. The per-snapshot phase report in
+/// `storage_owner` is what says where a slow snapshot's time actually goes.
+const SNAPSHOT_WORKERS: usize = 2;
+
+static SNAPSHOT_JOB_ADMISSION: [SnapshotWorkerAdmission; SNAPSHOT_WORKERS] =
+    [const { SnapshotWorkerAdmission::new() }; SNAPSHOT_WORKERS];
+static SNAPSHOT_WORKERS_STARTED: AtomicBool = AtomicBool::new(false);
+static SNAPSHOT_JOB: [SnapshotJobSlot; SNAPSHOT_WORKERS] =
+    [const { SnapshotJobSlot(UnsafeCell::new(MaybeUninit::uninit())) }; SNAPSHOT_WORKERS];
 #[cfg(not(test))]
-static mut SNAPSHOT_WORKER_STACK: SnapshotWorkerStack =
-    SnapshotWorkerStack([0; SNAPSHOT_WORKER_STACK_BYTES]);
+static mut SNAPSHOT_WORKER_STACKS: [SnapshotWorkerStack; SNAPSHOT_WORKERS] =
+    [const { SnapshotWorkerStack([0; SNAPSHOT_WORKER_STACK_BYTES]) }; SNAPSHOT_WORKERS];
 
 pub(super) fn demote_current_thread_or_exit(role: &str) {
     // SAFETY: the syscall takes no pointers and changes only the calling
@@ -104,45 +120,73 @@ pub(super) fn enqueue_executable_snapshot(
     if ensure_snapshot_worker().is_err() {
         return reply_snapshot_overload(reply_cap);
     }
-    if !SNAPSHOT_JOB_ADMISSION.try_reserve() {
+    let Some(index) = SNAPSHOT_JOB_ADMISSION
+        .iter()
+        .position(SnapshotWorkerAdmission::try_reserve)
+    else {
+        // Every worker is busy. The caller is told the provider is saturated
+        // rather than being left to time out, so it can distinguish "no
+        // capacity right now" from "this open failed".
         return reply_snapshot_overload(reply_cap);
-    }
-    // SAFETY: WRITING grants the sole receive owner exclusive slot access.
+    };
+    // SAFETY: WRITING grants the receive owner exclusive access to this exact
+    // slot; no other admission can be in WRITING for the same index.
     unsafe {
-        (*SNAPSHOT_JOB.0.get()).write(SnapshotJob {
+        (*SNAPSHOT_JOB[index].0.get()).write(SnapshotJob {
             reply_cap,
             sender_pid,
             sender_tid,
             request,
         });
     }
-    SNAPSHOT_JOB_ADMISSION.publish_ready();
+    SNAPSHOT_JOB_ADMISSION[index].publish_ready();
     0
 }
 
+/// Claims any published job, returning the slot the caller now owns.
+///
+/// Workers are interchangeable: a worker owns a slot for the duration of one
+/// job rather than for its lifetime, so the pool needs no per-worker identity
+/// and every worker can run the same entry.
+#[cfg(not(test))]
+fn claim_any_ready_job() -> Option<usize> {
+    SNAPSHOT_JOB_ADMISSION
+        .iter()
+        .position(SnapshotWorkerAdmission::try_claim)
+}
+
 pub(super) fn ensure_snapshot_worker() -> Result<(), i64> {
-    if SNAPSHOT_WORKER_STARTED.load(Ordering::Acquire) {
+    if SNAPSHOT_WORKERS_STARTED.load(Ordering::Acquire) {
         return Ok(());
     }
-    if SNAPSHOT_WORKER_STARTED
+    if SNAPSHOT_WORKERS_STARTED
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
     {
         return Ok(());
     }
-    if let Err(errno) = spawn_snapshot_worker() {
-        SNAPSHOT_WORKER_STARTED.store(false, Ordering::Release);
-        return Err(errno);
+    for index in 0..SNAPSHOT_WORKERS {
+        if let Err(errno) = spawn_snapshot_worker(index) {
+            // A partially started pool is still a correct pool: the workers
+            // that did start claim any slot. Only a pool with no worker at all
+            // is a failure, because then nothing would ever claim a job.
+            if index == 0 {
+                SNAPSHOT_WORKERS_STARTED.store(false, Ordering::Release);
+                return Err(errno);
+            }
+            break;
+        }
     }
     Ok(())
 }
 
 #[cfg(not(test))]
-fn spawn_snapshot_worker() -> Result<(), i64> {
-    // SAFETY: this computes the exclusive static stack's one-past-the-end
-    // address without dereferencing it; admission starts the worker once.
+fn spawn_snapshot_worker(index: usize) -> Result<(), i64> {
+    // SAFETY: this computes one exclusive static stack's one-past-the-end
+    // address without dereferencing it. `ensure_snapshot_worker` runs the loop
+    // once, so each index is handed out to exactly one worker.
     let stack_top = unsafe {
-        core::ptr::addr_of_mut!(SNAPSHOT_WORKER_STACK.0)
+        core::ptr::addr_of_mut!(SNAPSHOT_WORKER_STACKS[index])
             .cast::<u8>()
             .add(SNAPSHOT_WORKER_STACK_BYTES) as u64
     };
@@ -177,24 +221,25 @@ fn spawn_snapshot_worker() -> Result<(), i64> {
 }
 
 #[cfg(test)]
-fn spawn_snapshot_worker() -> Result<(), i64> {
+fn spawn_snapshot_worker(_index: usize) -> Result<(), i64> {
     Err(ENOSYS as i64)
 }
 
 #[cfg(not(test))]
 extern "C" fn snapshot_worker_entry() -> ! {
     loop {
-        if !SNAPSHOT_JOB_ADMISSION.try_claim() {
+        let Some(index) = claim_any_ready_job() else {
             rustos_svc_runtime::syscall::sleep_millis(1);
             continue;
-        }
+        };
         // SAFETY: Acquire of READY observes the complete fixed job, and BUSY
-        // excludes the receive owner until this copy has completed.
-        let job = unsafe { (*SNAPSHOT_JOB.0.get()).assume_init_read() };
-        // Storage is acquired inside, per phase and per chunk, never held
-        // across the bulk read.
+        // excludes the receive owner from this exact slot until the copy below
+        // has completed.
+        let job = unsafe { (*SNAPSHOT_JOB[index].0.get()).assume_init_read() };
+        // Storage is acquired inside, per phase, never held across the bulk
+        // read.
         let _ =
             reply_executable_snapshot(job.reply_cap, job.sender_pid, job.sender_tid, &job.request);
-        SNAPSHOT_JOB_ADMISSION.release();
+        SNAPSHOT_JOB_ADMISSION[index].release();
     }
 }

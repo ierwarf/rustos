@@ -92,6 +92,22 @@ const ENODEV: i32 = 19;
 const ENOSYS: i32 = 38;
 const ETIMEDOUT: i32 = 110;
 
+/// Whether a snapshot planned against `plan_generation` may still be sealed.
+///
+/// The bulk read runs with storage released, so a remount can land between the
+/// plan and the commit. Sealing a stale image would admit bytes from the
+/// previous volume into the current generation's cache, where no invalidation
+/// would ever reach them: every cache drop is keyed on the generation change
+/// that already happened. The caller re-plans instead, which is a transient
+/// condition rather than a failed open.
+///
+/// This lives here rather than beside the commit because `services/vfsd`'s
+/// binary target sets `test = false`, so a `#[test]` in `state_storage.rs`
+/// would never execute and would read as coverage while providing none.
+pub fn snapshot_plan_is_current(plan_generation: u64, mount_generation: u64) -> bool {
+    plan_generation == mount_generation
+}
+
 /// Bounds synchronous-console amplification from cancelled reply bursts.
 pub fn reply_failure_diagnostic_due(total: u64) -> bool {
     total == 1 || (total.is_power_of_two() && total.trailing_zeros() % 3 == 0)
@@ -554,6 +570,37 @@ mod tests {
         assert!(!admission.try_claim());
         admission.release();
         assert!(admission.try_reserve());
+    }
+
+    #[test]
+    fn a_remount_between_plan_and_commit_forbids_sealing_the_read_image() {
+        assert!(snapshot_plan_is_current(7, 7));
+        // A remount in either direction invalidates the plan. The generation is
+        // a monotonic counter, but the check must not assume the direction:
+        // "the mount I planned against" is the property, not "an older mount".
+        assert!(!snapshot_plan_is_current(7, 8));
+        assert!(!snapshot_plan_is_current(8, 7));
+    }
+
+    #[test]
+    fn snapshot_worker_admissions_are_independent_slots() {
+        // A pool is only a pool if one worker's job cannot occupy another's
+        // slot. Reserving one admission must leave the other claimable.
+        let pool = [
+            SnapshotWorkerAdmission::new(),
+            SnapshotWorkerAdmission::new(),
+        ];
+        assert!(pool[0].try_reserve());
+        assert!(pool[1].try_reserve());
+        pool[0].publish_ready();
+        // Only the published slot may be claimed; the other is still WRITING.
+        assert!(pool[0].try_claim());
+        assert!(!pool[1].try_claim());
+        pool[1].publish_ready();
+        assert!(pool[1].try_claim());
+        pool[0].release();
+        assert!(pool[0].try_reserve());
+        assert!(!pool[1].try_reserve());
     }
 
     #[test]

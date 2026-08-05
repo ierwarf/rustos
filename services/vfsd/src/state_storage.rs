@@ -322,6 +322,7 @@ impl VfsStorage {
             file_len,
             metadata_len: metadata.len,
             verbose: !early_system_owned || product_interactive_snapshot,
+            mount_generation: self.mount_generation,
         }))
     }
 
@@ -339,11 +340,21 @@ impl VfsStorage {
     }
 
     /// Seals the completed image and admits it to the mount-generation cache.
+    ///
+    /// The plan was resolved against a mount generation that the bulk read ran
+    /// outside of. A remount in between makes the bytes stale, and sealing them
+    /// would place an image from the previous volume into the current
+    /// generation's cache where no invalidation would ever reach it. The caller
+    /// re-plans instead; that is a transient condition, not a failed open.
     fn commit_executable_snapshot(
         &mut self,
         plan: &ExecutableSnapshotPlan,
         bytes: &[u8],
     ) -> Result<ExecutableSnapshotOpen, i32> {
+        self.invalidate_caches_if_remounted();
+        if !vfsd::snapshot_plan_is_current(plan.mount_generation, self.mount_generation) {
+            return Err(EAGAIN);
+        }
         let path = plan.path.clone();
         let file_len = plan.file_len;
         let fd = create_terminally_sealed_snapshot(path.as_str(), bytes)?;
