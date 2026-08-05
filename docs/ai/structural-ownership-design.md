@@ -48,6 +48,7 @@ Checked against the working tree, not against the audit's matrix.
 | `V5-IPC-AUTH-015` | `bind_ipc_transfer_receiver_by_tickets` pins `receiver_open_description` at bind and `claim_ipc_transfer_entries_by_tickets` requires the identical description, so dup, fork, or close inside the receiver set cannot move a bound batch |
 | `V5-FORMAL-IPC-018` | `IpcTransferAuthority.tla` sets `receiverSetEpoch` at `BindReceiver` and requires `receiverEpoch = receiverSetEpoch` at `Claim`; `PartialOrdinarySend(requested, accepted)` models provider-accepted length separately from requested |
 | `V5-DEADLINE-012` | `rustos_user_abi::deadline::AbsoluteDeadline` is the one shared arithmetic; inputd, loaderd, and vfsd derive every child timeout and retry sleep from one end instant, and the snapshot wire carries it. Three mutants fail without it |
+| `V5-MM-STACK-DEAD-021` | there is no lazy-growth route to delete. `USER_STACK_INITIAL_COMMIT_PAGES + USER_STACK_GUARD_PAGES == USER_STACK_RESERVE_PAGES` is a `const` assertion, no fault path grows a stack, and `release_stack_maps_every_usable_page_above_one_guard` pins `reserve_start == committed_start` |
 
 ### A correction, recorded because the mistake is instructive
 
@@ -84,8 +85,7 @@ by writing the mapping down rather than by renaming either side.
 | `V5-VFSD-HOL-007` | **structure landed, runtime evidence owed.** The receive owner never blocks, the plan carries its mount generation and the commit refuses a stale one, and custody is a bounded two-worker pool. What is still owed is the measured control-lane residence bound in section 3, and the 2005 ms snapshot itself is still unattributed. Section 3 |
 | `V5-WAYLAND-HOL-013`, `V5-GPU-UI-OWNER-014` | no `WaylandProtocolOwner`, `SceneOwner`, `GpuSubmissionOwner`, or `FramePlan`. Section 4 |
 | `V5-UI-PIPELINE-011` | `frame_seq` exists only inside `uiserver/main.rs` and `loop_timing.rs`; it never reaches the scheduler, IPC, or DVM relay. Section 5 |
-| `V5-TLB-SCALE-009` | targeting is sound but the argument is undocumented, and the quarantine-versus-fail-stop choice is still unmade. Section 8 |
-| `V5-MM-STACK-DEAD-021` | latent only; the product maps stacks eagerly. Section 9 |
+| `V5-TLB-SCALE-009` | **structure closed, runtime evidence owed.** `active_root_targeting_is_sound` asserts CR4.PCIDE is clear per admitted CPU, and the unacknowledged-target policy is documented as system fail-stop with the reclaim alternative rejected in writing. What is owed is the measured ACK latency distribution under a delayed vCPU. Section 8 |
 
 `V5-VFSD-HOL-007` being recorded closed while it times out is the reason section
 1 exists. The correction above is the reason it re-derives from source instead
@@ -407,42 +407,59 @@ keeping that map written down: the model and the source use different
 vocabulary for the same binding, and the next name-based search will draw the
 same wrong conclusion if the map is removed.
 
-## 8. TLB targeting residual (`V5-TLB-SCALE-009`)
+## 8. TLB targeting (`V5-TLB-SCALE-009`) — structure closed
 
-Current source is better than the audit assumed. `flush_for_reclaim` targets
-only CPUs whose published `ACTIVE_ROOT` matches the mutated root, or every
-eligible CPU for global scope. Linux's cache and TLB contract —
-<https://docs.kernel.org/core-api/cachetlb.html> — states the corresponding
-optimization directly: "if it can be proven that a user address space has never
-executed on a cpu (see `mm_cpumask()`), one need not perform a flush for this
-address space on that cpu", and that flushes happen *after* page table changes.
+Current source is better than the audit assumed, in two ways.
 
-RustOS gets the same property from a different fact: **the tree enables neither
-PCID nor INVPCID**, so a CR3 write flushes non-global entries, and a CPU that
-has switched away from a root retains no non-global translations for it. Active
-root matching is therefore sound *because PCID is off*, and that is a coupling,
-not a coincidence.
+`flush_for_reclaim` already targets only CPUs whose published `ACTIVE_ROOT`
+matches the mutated root, falling back to every eligible CPU for global scope.
+Linux's cache and TLB contract —
+<https://docs.kernel.org/core-api/cachetlb.html> — states the equivalent
+optimization: "if it can be proven that a user address space has never executed
+on a cpu (see `mm_cpumask()`), one need not perform a flush for this address
+space on that cpu", with flushes ordered after page-table changes.
 
-Three things close this item:
+RustOS reaches the same conclusion by a different route, and that route is a
+coupling rather than a coincidence: the tree enables **neither PCID nor
+INVPCID**, so a CR3 write flushes non-global entries and a CPU that switched
+away from a root provably retains none of its translations. With PCID enabled,
+translations survive the switch under their ASID; a CPU that merely *ran* the
+address space still holds them; and targeting by *currently active* root would
+skip exactly those CPUs and authorize reclaim of frames they can still
+translate. That is memory corruption, not a latency regression.
 
-1. State the argument where it can be broken: an assertion, or a compile-time
-   gate, that fails the build if PCID/INVPCID is enabled while active-root
-   targeting is in use. Enabling PCID must come with an ASID allocation, reuse,
-   and wrap proof, per Intel SDM Vol. 3 —
-   <https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html>.
-2. Make the unsupported-hot-remove policy one documented choice. A timeout must
-   never permit a free; either the CPU is quarantined or the system fail-stops,
-   and the contract names which.
-3. Runtime evidence: ACK latency distribution and reclaim sequencing under a
-   deliberately delayed vCPU, with zero reclaim-before-ACK.
+`active_root_targeting_is_sound` now asserts CR4.PCIDE is clear, checked per
+admitted CPU rather than once because PCIDE is a per-CPU control register and a
+BSP-only check would not cover an AP that came up differently. A mutant that
+weakens the predicate fails. Enabling PCID must therefore come with an ASID
+allocation, reuse, and wrap proof and a different target set, per Intel SDM
+Vol. 3 — <https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html>.
 
-## 9. Lazy stack growth (`V5-MM-STACK-DEAD-021`)
+The unacknowledged-target policy was already settled in source and did not need
+choosing: the module documents **system fail-stop**, not CPU quarantine, and
+records the rejected alternative — letting the deadline expire into reclaim —
+as memory corruption rather than a latency problem, so no timeout on this path
+may authorize reuse.
 
-The product maps stacks eagerly, so the fault-growth route is unreachable. The
-item closes by deleting the dead route rather than documenting it; if lazy
-growth is ever reintroduced it must distinguish process-state lock contention
-from an invalid address and use a bounded fault-retry continuation, because
-merging the two is what turns contention into a spurious fault.
+What remains is runtime evidence only: the ACK latency distribution and reclaim
+sequencing under a deliberately delayed vCPU, with zero reclaim-before-ACK.
+
+## 9. Lazy stack growth (`V5-MM-STACK-DEAD-021`) — closed
+
+There is no dead route to delete. The product maps every usable stack page
+eagerly above one permanent guard page, and that is enforced rather than
+documented: a `const` block asserts
+`USER_STACK_INITIAL_COMMIT_PAGES + USER_STACK_GUARD_PAGES == USER_STACK_RESERVE_PAGES`,
+so lowering the commit fails the build, and no page-fault path grows a stack.
+`release_stack_maps_every_usable_page_above_one_guard` pins
+`reserve_start == committed_start`.
+
+The reason the eager map exists is recorded where it will be read: exception
+context cannot wait for `ProcessStateLock`, because another thread may hold it
+when a valid growth fault arrives. If lazy growth is ever reintroduced it needs
+a deferred fault worker first, and it must distinguish lock contention from an
+invalid address — merging the two is what turns contention into a spurious
+fault.
 
 ## 10. Order of work
 
@@ -455,7 +472,11 @@ this document is a tuning change.
    without it.
 4. Section 2, the per-CPU scheduler, staged exactly as 2.7 describes.
 5. Section 4, the uiserver split, gated on the frame records not regressing.
-6. Section 8 and section 9.
+
+Sections 6, 7, 8, and 9 are done. Only sections 2 and 4 remain, and both are
+staged migrations rather than single changes: landing either without the
+validation each describes would repeat the per-slot owner-word failure, which
+passed every unit test and only broke in KVM.
 
 A per-item claim of closure requires the construct to exist in source *and* a
 mutant that fails without it. Source inspection alone is what produced the

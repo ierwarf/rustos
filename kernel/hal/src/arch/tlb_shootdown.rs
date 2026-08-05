@@ -302,9 +302,48 @@ pub fn activate_address_space(root: PhysAddr) {
 /// An AP is not a shootdown target before this call. Reloading CR3 immediately
 /// before eligibility closes the parked-to-online window without requiring a
 /// generation token in the no-payload reschedule protocol.
+/// Whether targeting only the CPUs whose active root matches is sound.
+///
+/// It is sound exactly while address-space tagging is off. Without PCID, a CR3
+/// write flushes every non-global translation, so a CPU that has switched away
+/// from a root provably retains none of its entries and needs no shootdown —
+/// the same conclusion Linux reaches from `mm_cpumask()`, by a different route.
+/// With PCID enabled, translations survive the switch under their ASID, a CPU
+/// that merely *ran* the address space still holds them, and targeting by
+/// *currently active* root would skip exactly those CPUs and free frames they
+/// can still translate.
+///
+/// So this is a coupling, not a coincidence, and enabling PCID silently would
+/// turn a latency optimization into memory corruption. Enabling it requires an
+/// ASID allocation, reuse, and wrap proof and a different target set, per Intel
+/// SDM Vol. 3 on CR3/PCID/INVPCID.
+const fn active_root_targeting_is_sound(cr4_pcide: bool) -> bool {
+    !cr4_pcide
+}
+
+/// CR4.PCIDE.
+const CR4_PCIDE_BIT: u64 = 1 << 17;
+
+#[cfg(rustos_boot_image)]
+fn assert_active_root_targeting_is_sound() {
+    let cr4: u64;
+    // SAFETY: reading CR4 has no side effects and takes no operand.
+    unsafe {
+        core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
+    }
+    assert!(
+        active_root_targeting_is_sound(cr4 & CR4_PCIDE_BIT != 0),
+        "TLB invariant: active-root shootdown targeting requires CR4.PCIDE clear;          with process-context identifiers enabled a CPU that has switched away          still holds tagged translations, so targeting the currently active root          would skip it and permit reclaim of frames it can still translate"
+    );
+}
+
 pub fn admit_current_cpu_online() {
     #[cfg(rustos_boot_image)]
     {
+        // Checked per admitted CPU rather than once: PCIDE is a per-CPU control
+        // register, so a single BSP check would not cover an AP that came up
+        // with a different CR4.
+        assert_active_root_targeting_is_sound();
         let (guard, restore_interrupts) = lock_protocol_bounded();
         let logical_index = current_cpu_index();
         // ORDERING: Acquire observes the root published by activation.
@@ -552,8 +591,8 @@ mod tests {
     use core::sync::atomic::{AtomicU64, Ordering};
 
     use super::{
-        MutationScope, acknowledgements_complete, activation_requires_cr3_write, scope_root,
-        shootdown_target_is_required,
+        CR4_PCIDE_BIT, MutationScope, acknowledgements_complete, activation_requires_cr3_write,
+        active_root_targeting_is_sound, scope_root, shootdown_target_is_required,
     };
 
     #[test]
@@ -561,6 +600,19 @@ mod tests {
         assert!(!activation_requires_cr3_write(0x4000, 0x4000));
         assert!(activation_requires_cr3_write(0, 0x4000));
         assert!(activation_requires_cr3_write(0x4000, 0x5000));
+    }
+
+    #[test]
+    fn active_root_targeting_is_sound_exactly_while_address_space_tagging_is_off() {
+        // Without PCID a CR3 write flushes non-global entries, so a CPU that
+        // switched away holds nothing for the old root and skipping it is
+        // sound. With PCID its translations survive under an ASID, and the
+        // same skip would authorize reclaim of frames it can still translate.
+        assert!(active_root_targeting_is_sound(false));
+        assert!(!active_root_targeting_is_sound(true));
+        // The bit position is architectural; a wrong constant would read some
+        // other CR4 control and silently pass.
+        assert_eq!(CR4_PCIDE_BIT, 1 << 17);
     }
 
     #[test]
