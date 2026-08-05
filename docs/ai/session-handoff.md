@@ -613,13 +613,85 @@ census is emitted. The census therefore reads as empty at 8 vCPU while it works
 at 1 vCPU. Any 8-vCPU scheduler measurement has to fix this first or it is
 reading a truncated record.
 
+### Structural session: what closed, and three corrections
+
+Audit items closed with a mutant that fails without them: `V5-DEADLINE-012`
+(one `AbsoluteDeadline` in `rustos-user-abi`, carried across the loaderd→vfsd
+wire), `V5-VFSD-HOL-007` structure (mount-generation revalidation at commit,
+bounded two-worker pool), `V5-TLB-SCALE-009` structure (CR4.PCIDE asserted clear
+per admitted CPU), `V5-MM-STACK-DEAD-021` (nothing owed), and the milestone
+loss reporting `V5-UI-PIPELINE-011` depends on. Implementation mutations 108/108.
+
+**The vfsd 2005 ms overrun is not in vfsd.** The phase probe added with the
+deadline work reports plan/read/commit per snapshot:
+
+```
+netd.elf     683360B  plan=976us read=0us    commit=1953us  total=2929us
+runtimed.elf 737424B  plan=976us read=1953us commit=1953us  total=4882us
+```
+
+Two to five milliseconds. Two sessions of inference that "the snapshot takes
+seconds" is refuted by measurement. The caller's `wait_ms=2005` is queueing,
+scheduling, or the reply path — not the snapshot work. Do not re-open that
+inference without a probe.
+
+**Three corrections, all the same mistake in different clothes.**
+
+1. `V5-IPC-AUTH-015` and `V5-FORMAL-IPC-018` were declared open/reopened because
+   `rg receiver_set_epoch` finds nothing. The property is implemented and
+   stronger: the bind pins `receiver_open_description` and the claim requires
+   the identical one. Refinement map now in the model header.
+2. The scheduler shadow validator was built as a second per-slot owner word.
+   `scheduler/runqueue.rs` already owns those words, and its header forbids
+   exactly that shadow. Replaced with a comparison of the two authorities that
+   exist.
+3. `V5-SCHED-GLOBAL-001` was taken at its title. The per-CPU runqueue,
+   owner-word state machine, remote wake mailboxes, and per-CPU selection all
+   exist and are already lock-free; `publish_remote_wake` and
+   `drain_remote_wakes` never take the global lock, and no path scans a global
+   ready set. What the global lock still protects is the `Scheduler` struct's
+   per-task arrays, so the item is a **data-structure split**, not a scheduler
+   rewrite.
+
+The rule that keeps failing to be applied: read the implementation, not the
+item title and not an identifier lifted from the audit's proposed design.
+
+### SCHED-GLOBAL-001 stage 1 is done, stage 2 is scoped
+
+`run_authority::compare` sweeps every slot once per drain, under the lock, and
+reports the first disagreement between `runqueue::owner(slot)` and the legacy
+tables with a direction. The calling CPU's in-flight dispatch pair is excluded,
+and that exclusion is load-bearing: the sweep runs from `take_runtime_profile`,
+after the runqueue claims the incoming slot and before the guard publishes the
+new current/transition pair, so both halves disagree by construction. The first
+run reported exactly that, two per second, every second.
+
+With the exclusion: **zero mismatches at 1 vCPU and zero at 8 vCPU**, no
+identity divergence, no panic. That is the refinement evidence the cutover
+needs.
+
+Stage 2 is retiring `context.ready` as authority — it duplicates the owner word
+and stage 1 proved they agree. It has about 25 non-test readers across seven
+files, and the semantics differ per site: `ready` is false for the currently
+running task while the owner word says `Running`, so a blanket substitution is
+wrong. Sites inside `local_runnable_slots(cpu)` loops are redundant filters and
+are safe; the rest need per-site review. This is deliberately not started
+half-way.
+
 ### Gate status
 
-- 1 vCPU: passes.
-- 2, 4, 8 vCPU: not passing. 8 vCPU is unstable at HEAD as described above; the
-  previous handoff's `RustOS missing=[]` result did not reproduce in five runs.
-- 55 FPS WayClick gate: not met and not measurable, because no 8-vCPU run
-  reaches a first presented frame.
+- 1 vCPU: passes, with zero owner-word mismatches and zero identity divergence.
+- 8 vCPU: reaches readiness and now stops only on `inputd: DVM keyboard ingress
+  observed` / `DVM pointer ingress observed`. Zero mismatches, zero panics, no
+  identity divergence. This is further than any previous run.
+- The `handoffs.rs:85` activation panic reproduces at HEAD and did not appear in
+  the last three runs. `report_invalid_activation_context` is now reliable
+  output, so the next occurrence names the slot geometry and frame contents.
+- 55 FPS WayClick gate: not met and not yet measurable — no 8-vCPU run reaches a
+  presented frame.
+- The milestone sink is still saturated under 8 vCPU load: `dropped=69` on the
+  last run. Scheduler and activation records are in the reliable set; the rest
+  are not.
 - No hook or signing bypass has been used at any point.
 
 ## Resume sequence
