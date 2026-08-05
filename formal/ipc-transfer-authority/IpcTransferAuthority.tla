@@ -7,6 +7,17 @@ source process generation, service epoch, channel generation/direction, exact
 stream position, and intended receiver. FD reservations remain invisible
 until every user data/control/header copy has completed. Every queue discard,
 peer close, copyout fault, and service restart is one terminal release edge.
+
+Refinement map to source. `receiverSetEpoch` is NOT a counter in the
+implementation: it corresponds to `receiver_open_description`, which
+`bind_ipc_transfer_receiver_by_tickets` pins on first bind and
+`claim_ipc_transfer_entries_by_tickets` requires to be identical. Pinning the
+exact receiving open description is stronger than an epoch, because dup, fork,
+and close are excluded by construction rather than by observing a counter.
+`BindReceiver` is that bind; `Claim`'s `receiverEpoch = receiverSetEpoch` is
+that equality. Searching the kernel for `receiver_set_epoch` finds nothing and
+has already produced one false "the model over-claims" conclusion; read
+`kernel/ps/src/user/handles/transfer_registry.rs` instead.
 ***************************************************************************)
 
 CONSTANTS Senders, Receivers, Services, Channels, Positions, Lengths,

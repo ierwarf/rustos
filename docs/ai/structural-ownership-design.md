@@ -19,8 +19,13 @@ to be misclassified from name-based searching, and a third — `V5-VFSD-HOL-007`
 recorded as closed — is contradicted by runtime: the executable snapshot times
 out at 2005 ms under 8 vCPU and fails `storaged` spawn repeatedly.
 
-So section 1 re-derives status from source. Everything after it is design for
+So section 1 re-derives status from source, and section 1 itself then had to be
+corrected once for the same name-based error. Everything after it is design for
 what that check found still open.
+
+A claim of closure here requires the construct to exist in source **and** a
+mutant that fails without it. Source inspection alone is what produced the
+matrix this document had to correct twice.
 
 ## 1. Verified status, re-derived from source
 
@@ -40,6 +45,35 @@ Checked against the working tree, not against the audit's matrix.
 | `V5-FORMAL-RESCHED-016` | `SmpRescheduleIpi.tla` carries `requestSeq`/`notifySeq` and a claim action; the vacuous `selfIpiSent` invariant is gone |
 | `V5-FORMAL-DVM-017` | `DvmTransportLifecycle.tla` carries `Activating`, `claims`, and `activationCancelled` |
 | `V5-FORMAL-EXEC-020` | `publicationFailed' = TRUE` is reachable from an action in `ExecAddressSpaceTransaction.tla` |
+| `V5-IPC-AUTH-015` | `bind_ipc_transfer_receiver_by_tickets` pins `receiver_open_description` at bind and `claim_ipc_transfer_entries_by_tickets` requires the identical description, so dup, fork, or close inside the receiver set cannot move a bound batch |
+| `V5-FORMAL-IPC-018` | `IpcTransferAuthority.tla` sets `receiverSetEpoch` at `BindReceiver` and requires `receiverEpoch = receiverSetEpoch` at `Claim`; `PartialOrdinarySend(requested, accepted)` models provider-accepted length separately from requested |
+| `V5-DEADLINE-012` | `rustos_user_abi::deadline::AbsoluteDeadline` is the one shared arithmetic; inputd, loaderd, and vfsd derive every child timeout and retry sleep from one end instant, and the snapshot wire carries it. Three mutants fail without it |
+
+### A correction, recorded because the mistake is instructive
+
+This document's first revision listed `V5-IPC-AUTH-015` as open and **reopened**
+`V5-FORMAL-IPC-018`, on the grounds that `IpcTransferAuthority.tla` models a
+`receiverSetEpoch` while `rg receiver_set_epoch` over `kernel/` and `libs/`
+returns nothing.
+
+That was wrong, and it was wrong in exactly the way this repository has been
+burned before: searching for an identifier taken from the audit's *proposed*
+design instead of reading the implementation. The property is implemented under
+a different and stronger name. The audit proposes an epoch counter bumped
+whenever the receiver set changes; the implementation instead pins the exact
+receiving open description on first bind and refuses any other. Pinning is
+stronger, because it does not depend on detecting *how* the set changed — dup,
+fork, and close are all excluded by construction rather than by observing a
+counter — and it needs no channel registry.
+
+**Refinement map, so the next reader does not repeat this.** Model
+`receiverSetEpoch` corresponds to source `receiver_open_description`; model
+`BindReceiver` corresponds to `bind_ipc_transfer_receiver_by_tickets`; model
+`Claim`'s `receiverEpoch = receiverSetEpoch` corresponds to the claim-side
+equality on `context.receiver_open_description`. The names differ because the
+model was written against the audit's vocabulary and the source against its own.
+That divergence is a documentation defect, not an authority gap, and it is fixed
+by writing the mapping down rather than by renaming either side.
 
 ### Open, and owned by this document
 
@@ -47,18 +81,15 @@ Checked against the working tree, not against the audit's matrix.
 |---|---|
 | `V5-SCHED-GLOBAL-001` | no `PerCpuScheduler`, no backend selection; one `static SCHEDULER` still serializes every CPU. Section 2 |
 | `V5-FORMAL-SCHED-019` | `SchedulerCpuOwnership.tla` models the guard, not the removal of the guard. Section 2.7 |
-| `V5-VFSD-HOL-007` | `ExecutableSnapshotPlan` exists, but there is one receive loop, one shared storage lock, a single-slot worker, and no control/bulk lane split. Section 3 |
+| `V5-VFSD-HOL-007` | **structure landed, runtime evidence owed.** The receive owner never blocks, the plan carries its mount generation and the commit refuses a stale one, and custody is a bounded two-worker pool. What is still owed is the measured control-lane residence bound in section 3, and the 2005 ms snapshot itself is still unattributed. Section 3 |
 | `V5-WAYLAND-HOL-013`, `V5-GPU-UI-OWNER-014` | no `WaylandProtocolOwner`, `SceneOwner`, `GpuSubmissionOwner`, or `FramePlan`. Section 4 |
 | `V5-UI-PIPELINE-011` | `frame_seq` exists only inside `uiserver/main.rs` and `loop_timing.rs`; it never reaches the scheduler, IPC, or DVM relay. Section 5 |
-| `V5-DEADLINE-012` | `AbsoluteDeadline` exists only in `inputd/dvm_session_sync.rs`. loaderd, vfsd, and the UI frame path each keep their own phase-local timeouts. Section 6 |
-| `V5-IPC-AUTH-015` | `IpcTransferTicketWire` binds `(transfer_id, nonce, batch_generation)`. There is no receiver-set epoch anywhere in `kernel/` or `libs/`. Section 7 |
-| `V5-FORMAL-IPC-018` | **reopened.** `IpcTransferAuthority.tla` models `receiverSetEpoch`, and its binding row claims it binds descriptor authority. The implementation has no such field, so the model proves a property of a system that does not exist. Section 7 |
 | `V5-TLB-SCALE-009` | targeting is sound but the argument is undocumented, and the quarantine-versus-fail-stop choice is still unmade. Section 8 |
 | `V5-MM-STACK-DEAD-021` | latent only; the product maps stacks eagerly. Section 9 |
 
-`V5-FORMAL-IPC-018` moving from closed to open is the reason section 1 exists.
-A model that is more capable than its implementation is not neutral: it reports
-green for an authority binding that no code performs.
+`V5-VFSD-HOL-007` being recorded closed while it times out is the reason section
+1 exists. The correction above is the reason it re-derives from source instead
+of from identifiers.
 
 ## 2. Per-CPU scheduler (`V5-SCHED-GLOBAL-001`, `V5-FORMAL-SCHED-019`)
 
@@ -368,25 +399,13 @@ This also removes the confusion that made a transient look terminal: a provider
 that is not ready yet must return a distinguishable transient status rather than
 `ENOSYS`, and a caller must fail fast on genuinely terminal errno values.
 
-## 7. Receiver-set epoch (`V5-IPC-AUTH-015`, `V5-FORMAL-IPC-018`)
+## 7. Transfer authority (`V5-IPC-AUTH-015`, `V5-FORMAL-IPC-018`) — closed
 
-Today `IpcTransferTicketWire` binds `(transfer_id, nonce, batch_generation)`.
-`IpcTransferAuthority.tla` binds a `receiverSetEpoch` that the implementation
-does not have, so the model currently over-claims.
-
-Design: a kernel channel registry keyed by the unix channel id owns a
-`receiver_set_epoch`, incremented on every event that changes which open
-descriptions may receive — `dup`, `fork`, `close` of a receiving description,
-and service epoch revoke. The ticket binds source, service, channel, receiving
-open-description generation, receiver-set epoch, and the accepted byte range. A
-claim requires that the claiming receiver is a current member of that set and
-that the epoch is unchanged. `TransferBatchAuthority` remains the terminal owner
-and the first terminal CAS wins across install, reject, peer close, queue
-discard, sender or receiver exit, and provider epoch revoke.
-
-Mutants the model must kill after the change: dropping the epoch check,
-dropping the membership check, allowing a duplicate commit, and dropping the
-peer-close terminal.
+Both are closed; see the correction in section 1 for why they briefly appeared
+open and for the model-to-source refinement map. Nothing is owed here beyond
+keeping that map written down: the model and the source use different
+vocabulary for the same binding, and the next name-based search will draw the
+same wrong conclusion if the map is removed.
 
 ## 8. TLB targeting residual (`V5-TLB-SCALE-009`)
 
@@ -432,12 +451,11 @@ this document is a tuning change.
 
 1. Section 6, the deadline type, because sections 3 and 4 both consume it.
 2. Section 3, vfsd lanes — the current runtime blocker.
-3. Section 7, receiver-set epoch, which also un-stales `FORMAL-IPC-018`.
-4. Section 5's loss-reported trace, since sections 2 and 4 are unverifiable
+3. Section 5's loss-reported trace, since sections 2 and 4 are unverifiable
    without it.
-5. Section 2, the per-CPU scheduler, staged exactly as 2.7 describes.
-6. Section 4, the uiserver split, gated on the frame records not regressing.
-7. Section 8 and section 9.
+4. Section 2, the per-CPU scheduler, staged exactly as 2.7 describes.
+5. Section 4, the uiserver split, gated on the frame records not regressing.
+6. Section 8 and section 9.
 
 A per-item claim of closure requires the construct to exist in source *and* a
 mutant that fails without it. Source inspection alone is what produced the
