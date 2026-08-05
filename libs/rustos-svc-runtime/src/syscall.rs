@@ -120,6 +120,8 @@ pub unsafe fn syscall6(number: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64,
 pub const SYS_MMAP: u64 = 9;
 pub const SYS_NANOSLEEP: u64 = 35;
 pub const SYS_EXIT_GROUP: u64 = 231;
+pub const SYS_CLOCK_GETTIME: u64 = 228;
+pub const CLOCK_MONOTONIC: u64 = 1;
 
 // Linux mmap flag bits we need for the allocator's lazy heap-growth path.
 pub const PROT_READ: u64 = 0x1;
@@ -160,6 +162,35 @@ pub unsafe fn mmap_anonymous(len: usize) -> i64 {
         u64::MAX, // fd = -1
         0,
     )
+}
+
+/// Reads `CLOCK_MONOTONIC` in nanoseconds.
+///
+/// This is the only time source a transaction deadline may be built from. The
+/// wall clock is not ordering authority: it can step, and a stepped budget
+/// either fails a healthy transaction or lets an expired one continue.
+///
+/// A failed read returns 0, which reads as "no time has passed" rather than as
+/// an expiry, so a clock fault cannot fabricate a deadline violation. The
+/// caller sees the transaction run to its other terminal condition instead.
+#[inline]
+pub fn monotonic_nanos() -> u64 {
+    let mut ts = KTimespec::default();
+    // SAFETY: the syscall writes exactly one `KTimespec` through this exclusive
+    // borrow and consumes no other pointer.
+    let status = unsafe {
+        syscall2(
+            SYS_CLOCK_GETTIME,
+            CLOCK_MONOTONIC,
+            (&mut ts as *mut KTimespec) as u64,
+        )
+    };
+    if status < 0 {
+        return 0;
+    }
+    let seconds = u64::try_from(ts.tv_sec).unwrap_or(0);
+    let nanos = u64::try_from(ts.tv_nsec).unwrap_or(0);
+    seconds.saturating_mul(1_000_000_000).saturating_add(nanos)
 }
 
 #[inline]

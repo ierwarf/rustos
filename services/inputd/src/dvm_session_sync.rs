@@ -12,16 +12,15 @@
 //! - **Forbidden:** No decoder reset followed by later-ring drain, event
 //!   publication before grant, or replay of an already-ACKed transition.
 
-use std::time::{Duration, Instant};
-
+use rustos_user_abi::deadline::{AbsoluteDeadline, NANOS_PER_MILLI, NANOS_PER_SEC};
 use rustos_user_abi::syscall::{InputIngressWire, NETD_DVM_SESSION_GRANT, NETD_DVM_SESSION_REVOKE};
 
 use super::dvm_protocol::DvmOutcome;
 use super::{apply_dvm_ingress_wire, lock_input_queue_for_ingestion, SharedInputQueue};
 
-pub(super) const RETRY_BACKOFF: Duration = Duration::from_millis(10);
-pub(super) const RETRY_BACKOFF_MAX: Duration = Duration::from_millis(160);
-pub(super) const TIMEOUT: Duration = Duration::from_secs(5);
+pub(super) const RETRY_BACKOFF_NS: u64 = 10 * NANOS_PER_MILLI;
+pub(super) const RETRY_BACKOFF_MAX_NS: u64 = 160 * NANOS_PER_MILLI;
+pub(super) const TIMEOUT_NS: u64 = 5 * NANOS_PER_SEC;
 /// A grant/revoke changes authenticated cross-service policy and can enter the
 /// net packet broker. It is not a non-consuming readiness query, so each
 /// attempt owns the interactive control budget while the retained batch keeps
@@ -29,40 +28,34 @@ pub(super) const TIMEOUT: Duration = Duration::from_secs(5);
 pub(super) const CALL_DEADLINE_MS: u64 =
     rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS;
 
-/// One monotonic end-to-end deadline for the complete retained session batch.
-/// Every nested service call and retry sleep derives its budget from the same
-/// end instant; no phase may start a fresh stopwatch.
-#[derive(Clone, Copy, Debug)]
-pub(super) struct AbsoluteDeadline {
-    end: Instant,
+/// `CLOCK_MONOTONIC` in nanoseconds.
+///
+/// The same base the `no_std` services read through
+/// `rustos_svc_runtime::syscall::monotonic_nanos`, so a deadline that crosses
+/// a service boundary keeps one time base. `Instant` cannot be used here: it
+/// exposes no absolute value, so it cannot express a deadline another service
+/// is meant to honour.
+pub(super) fn monotonic_nanos() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: the call writes exactly one `timespec` through this exclusive
+    // borrow and takes no other pointer.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } != 0 {
+        return 0;
+    }
+    u64::try_from(ts.tv_sec)
+        .unwrap_or(0)
+        .saturating_mul(NANOS_PER_SEC)
+        .saturating_add(u64::try_from(ts.tv_nsec).unwrap_or(0))
 }
 
-pub(super) fn retry_backoff_for_attempt(attempt: u32) -> Duration {
+pub(super) fn retry_backoff_for_attempt(attempt: u32) -> u64 {
     let shift = attempt.saturating_sub(1).min(4);
-    RETRY_BACKOFF
-        .saturating_mul(1_u32 << shift)
-        .min(RETRY_BACKOFF_MAX)
-}
-
-impl AbsoluteDeadline {
-    pub(super) fn after(now: Instant, budget: Duration) -> Self {
-        Self { end: now + budget }
-    }
-
-    fn remaining(self, now: Instant) -> Option<Duration> {
-        self.end
-            .checked_duration_since(now)
-            .filter(|left| !left.is_zero())
-    }
-
-    pub(super) fn child_timeout_ms(self, now: Instant, cap_ms: u64) -> Option<u64> {
-        let remaining_ms = u64::try_from(self.remaining(now)?.as_millis()).ok()?;
-        (remaining_ms != 0).then_some(remaining_ms.min(cap_ms))
-    }
-
-    pub(super) fn retry_backoff(self, now: Instant, cap: Duration) -> Option<Duration> {
-        self.remaining(now).map(|remaining| remaining.min(cap))
-    }
+    RETRY_BACKOFF_NS
+        .saturating_mul(1_u64 << shift)
+        .min(RETRY_BACKOFF_MAX_NS)
 }
 
 pub(super) fn apply(
@@ -88,7 +81,7 @@ pub(super) fn apply(
             // The queue lock stays local to reset/publication. A synchronous
             // service call here while holding it would deadlock readers and
             // make netd startup ordering an input liveness dependency.
-            let Some(timeout_ms) = deadline.child_timeout_ms(Instant::now(), CALL_DEADLINE_MS)
+            let Ok(timeout_ms) = deadline.child_timeout_ms(monotonic_nanos(), CALL_DEADLINE_MS)
             else {
                 pending_events.clear();
                 lock_input_queue_for_ingestion(queue).reset_dvm_input();
@@ -120,7 +113,6 @@ pub(super) fn apply(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::time::{Duration, Instant};
 
     use rustos_user_abi::syscall::{
         InputIngressWire, InputPointerPacketWire, INPUTD_ACCESS_NATIVE,
@@ -128,8 +120,8 @@ mod tests {
     };
 
     use super::{
-        apply, retry_backoff_for_attempt, AbsoluteDeadline, CALL_DEADLINE_MS, RETRY_BACKOFF,
-        RETRY_BACKOFF_MAX, TIMEOUT,
+        apply, monotonic_nanos, retry_backoff_for_attempt, AbsoluteDeadline, CALL_DEADLINE_MS,
+        RETRY_BACKOFF_MAX_NS, RETRY_BACKOFF_NS, TIMEOUT_NS,
     };
     use crate::dvm_protocol::DvmOutcome;
     use crate::{lock_input_queue, lock_input_queue_for_ingestion, SharedInputQueueState};
@@ -155,7 +147,7 @@ mod tests {
             ..DvmOutcome::default()
         }];
         let mut observed_unlocked = false;
-        let deadline = AbsoluteDeadline::after(Instant::now(), TIMEOUT);
+        let deadline = AbsoluteDeadline::after(monotonic_nanos(), TIMEOUT_NS);
 
         let result = apply(
             &queue,
@@ -190,7 +182,7 @@ mod tests {
                 &queue,
                 &mut outcomes,
                 &mut pending_events,
-                AbsoluteDeadline::after(Instant::now(), TIMEOUT),
+                AbsoluteDeadline::after(monotonic_nanos(), TIMEOUT_NS),
                 |_, _, _| { Err(libc::ETIMEDOUT) }
             ),
             Err(libc::ETIMEDOUT)
@@ -225,7 +217,7 @@ mod tests {
                 &queue,
                 &mut outcomes,
                 &mut pending_events,
-                AbsoluteDeadline::after(Instant::now(), TIMEOUT),
+                AbsoluteDeadline::after(monotonic_nanos(), TIMEOUT_NS),
                 |_, _, _| { Err(libc::ENOSYS) }
             ),
             Err(libc::ENOSYS)
@@ -239,7 +231,7 @@ mod tests {
                 &queue,
                 &mut outcomes,
                 &mut pending_events,
-                AbsoluteDeadline::after(Instant::now(), TIMEOUT),
+                AbsoluteDeadline::after(monotonic_nanos(), TIMEOUT_NS),
                 |epoch, action, _| {
                     assert_eq!((epoch, action), (7, NETD_DVM_SESSION_GRANT));
                     Ok(())
@@ -254,28 +246,37 @@ mod tests {
 
     #[test]
     fn session_authority_retry_deadline_is_bounded() {
-        assert_eq!(RETRY_BACKOFF, Duration::from_millis(10));
-        assert_eq!(retry_backoff_for_attempt(1), RETRY_BACKOFF);
-        assert_eq!(retry_backoff_for_attempt(32), RETRY_BACKOFF_MAX);
-        assert_eq!(TIMEOUT, Duration::from_secs(5));
+        assert_eq!(retry_backoff_for_attempt(1), RETRY_BACKOFF_NS);
+        assert_eq!(retry_backoff_for_attempt(32), RETRY_BACKOFF_MAX_NS);
         assert_eq!(
             CALL_DEADLINE_MS,
             rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS
         );
         assert!(CALL_DEADLINE_MS > rustos_user_abi::performance::IPC_READINESS_QUERY_HARD_LIMIT_MS);
-        assert!(Duration::from_millis(CALL_DEADLINE_MS) < TIMEOUT);
-        assert!(RETRY_BACKOFF < TIMEOUT);
+        // One per-call cap and one retry backoff must both fit inside the
+        // transaction budget, or the aggregate can only be met by luck.
+        assert!(CALL_DEADLINE_MS * super::NANOS_PER_MILLI < TIMEOUT_NS);
+        assert!(RETRY_BACKOFF_MAX_NS < TIMEOUT_NS);
 
-        let now = Instant::now();
-        let deadline = AbsoluteDeadline::after(now, Duration::from_millis(37));
-        assert_eq!(deadline.child_timeout_ms(now, 100), Some(37));
+        // The budget is shared, not restarted: 37 ms of budget caps a 100 ms
+        // call, and the exact end instant is terminal rather than a zero
+        // timeout, which the call ABI reads as "no timeout".
+        let deadline = AbsoluteDeadline::after(1_000, 37 * super::NANOS_PER_MILLI);
+        assert_eq!(deadline.child_timeout_ms(1_000, 100), Ok(37));
         assert_eq!(
-            deadline.retry_backoff(now, Duration::from_millis(50)),
-            Some(Duration::from_millis(37))
+            deadline.retry_backoff_ns(1_000, 50 * super::NANOS_PER_MILLI),
+            Ok(37 * super::NANOS_PER_MILLI)
         );
-        assert_eq!(
-            deadline.child_timeout_ms(now + Duration::from_millis(37), 100),
-            None
-        );
+        assert!(deadline
+            .child_timeout_ms(1_000 + 37 * super::NANOS_PER_MILLI, 100)
+            .is_err());
+    }
+
+    #[test]
+    fn the_monotonic_base_is_readable_and_never_moves_backwards() {
+        let first = monotonic_nanos();
+        let second = monotonic_nanos();
+        assert!(first != 0, "CLOCK_MONOTONIC must be readable");
+        assert!(second >= first);
     }
 }

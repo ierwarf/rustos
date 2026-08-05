@@ -35,6 +35,8 @@ use core::str;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use rustos_svc_runtime::ipc;
+use rustos_svc_runtime::syscall::monotonic_nanos;
+use rustos_user_abi::deadline::AbsoluteDeadline;
 use rustos_user_abi::linux as linux_abi;
 use rustos_user_abi::syscall::{
     CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
@@ -115,6 +117,7 @@ pub(crate) const EIO: i32 = 5;
 pub(crate) const ENOEXEC: i32 = 8;
 pub(crate) const EAGAIN: i32 = 11;
 pub(crate) const ENOMEM: i32 = 12;
+pub(crate) const ETIMEDOUT: i32 = 110;
 pub(crate) const EBUSY: i32 = 16;
 pub(crate) const EACCES: i32 = 13;
 pub(crate) const EBADF: i32 = 9;

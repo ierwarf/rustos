@@ -7,6 +7,7 @@ extern crate alloc;
 pub mod linux;
 
 pub mod console;
+pub mod deadline;
 pub mod device;
 pub mod ioctl;
 pub mod performance;

@@ -36,6 +36,7 @@ use rustos_image_admission::{
     admit_elf64_image, admit_pe64_image_headers, apply_pe64_base_relocations,
     validate_pe64_import_table, ByteAdmissionError,
 };
+use rustos_user_abi::deadline::{AbsoluteDeadline, NANOS_PER_MILLI};
 use rustos_user_abi::performance::EXECUTABLE_SNAPSHOT_HARD_LIMIT_MS;
 use rustos_user_abi::syscall::{
     loader_service_role_allows_operation, CommercialMaxCapabilityLeaseWire,
@@ -100,6 +101,7 @@ const EINVAL: i32 = 22;
 const EACCES: i32 = 13;
 const ENOEXEC: i32 = 8;
 const EOVERFLOW: i32 = 75;
+const ETIMEDOUT: i32 = 110;
 const ELF_READ_CHUNK_BYTES: usize = 256 * 1024;
 const ELF_MAX_SNAPSHOT_BYTES: u64 = 128 * 1024 * 1024;
 const ELF_HEADER_SIZE: usize = 64;
@@ -863,11 +865,20 @@ fn open_immutable_file_snapshot(path: &str) -> Result<i32, i32> {
     if pid <= 0 || tid <= 0 {
         return Err(EACCES);
     }
+    // One absolute end instant for the whole snapshot transaction. vfsd checks
+    // the same instant before it starts bulk work and again before it replies,
+    // so a provider that has already lost the race declines instead of
+    // replying into an abandoned reply capability.
+    let deadline = AbsoluteDeadline::after(
+        rustos_svc_runtime::syscall::monotonic_nanos(),
+        EXECUTABLE_SNAPSHOT_HARD_LIMIT_MS.saturating_mul(NANOS_PER_MILLI),
+    );
     let mut request = VfsExecutableSnapshotRequest {
         requester_pid: pid as u64,
         requester_tid: tid as u64,
         max_bytes: ELF_MAX_SNAPSHOT_BYTES,
         path_len: path.len() as u32,
+        deadline_ns: deadline.end_ns(),
         ..VfsExecutableSnapshotRequest::default()
     };
     request.path[..path.len()].copy_from_slice(path.as_bytes());
@@ -891,11 +902,22 @@ fn open_immutable_file_snapshot(path: &str) -> Result<i32, i32> {
     trace_line(&format!(
         "loaderd: executable snapshot call begin exec={path} timeout_ms={EXECUTABLE_SNAPSHOT_HARD_LIMIT_MS}"
     ));
+    // The call timeout is the remaining budget, never a fresh full one: this
+    // is the only site that owns the transaction's end instant.
+    let Ok(call_timeout_ms) = deadline.child_timeout_ms(
+        rustos_svc_runtime::syscall::monotonic_nanos(),
+        EXECUTABLE_SNAPSHOT_HARD_LIMIT_MS,
+    ) else {
+        debug_line(&format!(
+            "loaderd: executable snapshot budget expired before the call exec={path}"
+        ));
+        return Err(ETIMEDOUT);
+    };
     let status = unsafe {
         rustos_svc_runtime::syscall::syscall2(
             SYS_RUSTOS_IPC_CALL_WITH_HANDLES_BOUNDED,
             (&args as *const IpcCallWithHandlesArgs) as u64,
-            EXECUTABLE_SNAPSHOT_HARD_LIMIT_MS,
+            call_timeout_ms,
         )
     };
     if status < 0 {

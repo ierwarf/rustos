@@ -1538,6 +1538,17 @@ pub struct VfsExecutableSnapshotRequest {
     pub max_bytes: u64,
     pub path_len: u32,
     pub reserved0: u32,
+    /// The caller's absolute `CLOCK_MONOTONIC` deadline in nanoseconds, or 0
+    /// when the caller sets none.
+    ///
+    /// `CLOCK_MONOTONIC` is derived from the system tick counter, so this is
+    /// comparable in the provider's own process. Carrying the end instant
+    /// rather than a duration is what lets the provider decide *not* to reply:
+    /// a reply produced after the caller abandoned its reply capability is
+    /// rejected by the kernel and reported to the caller as a permission
+    /// failure, which is how a latency problem gets misread as an authority
+    /// problem. See `V5-DEADLINE-012`.
+    pub deadline_ns: u64,
     pub path: [u8; VFS_IPC_PATH_CAPACITY],
 }
 
@@ -1552,6 +1563,7 @@ impl Default for VfsExecutableSnapshotRequest {
             max_bytes: 0,
             path_len: 0,
             reserved0: 0,
+            deadline_ns: 0,
             path: [0; VFS_IPC_PATH_CAPACITY],
         }
     }

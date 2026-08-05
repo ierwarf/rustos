@@ -23,7 +23,7 @@ use std::slice;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
-use std::time::Instant;
+use std::time::Duration;
 
 mod dvm_protocol;
 mod dvm_session_sync;
@@ -916,9 +916,9 @@ fn start_dvm_ingestion_worker(queue: SharedInputQueue, log_state: Arc<DvmIngress
                         "inputd: DVM transport progress records={total_drained} batch={drained} batch_seq={nonempty_batches} stage=decoded"
                     ));
                 }
-                let session_sync_deadline = dvm_session_sync::AbsoluteDeadline::after(
-                    Instant::now(),
-                    dvm_session_sync::TIMEOUT,
+                let session_sync_deadline = rustos_user_abi::deadline::AbsoluteDeadline::after(
+                    dvm_session_sync::monotonic_nanos(),
+                    dvm_session_sync::TIMEOUT_NS,
                 );
                 let mut session_sync_attempts = 0_u32;
                 let observations = loop {
@@ -937,14 +937,10 @@ fn start_dvm_ingestion_worker(queue: SharedInputQueue, log_state: Arc<DvmIngress
                                     "inputd: DVM session authority sync retry errno={errno} attempt={session_sync_attempts}"
                                 ));
                             }
-                            let Some(backoff) = session_sync_deadline
-                                .retry_backoff(
-                                    Instant::now(),
-                                    dvm_session_sync::retry_backoff_for_attempt(
-                                        session_sync_attempts,
-                                    ),
-                                )
-                            else {
+                            let Ok(backoff_ns) = session_sync_deadline.retry_backoff_ns(
+                                dvm_session_sync::monotonic_nanos(),
+                                dvm_session_sync::retry_backoff_for_attempt(session_sync_attempts),
+                            ) else {
                                 debug_line(&format!(
                                     "inputd: DVM session authority sync timed out errno={errno} attempts={session_sync_attempts}"
                                 ));
@@ -956,7 +952,7 @@ fn start_dvm_ingestion_worker(queue: SharedInputQueue, log_state: Arc<DvmIngress
                             // records or resetting the decoder here would lose
                             // the sole authenticated SESSION_START and silently
                             // discard all subsequent input from the live epoch.
-                            thread::sleep(backoff);
+                            thread::sleep(Duration::from_nanos(backoff_ns));
                         }
                     }
                 };

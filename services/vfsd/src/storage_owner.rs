@@ -206,13 +206,44 @@ fn read_planned_executable_snapshot(plan: &ExecutableSnapshotPlan) -> Result<Vec
 /// stale plan: `commit_executable_snapshot` runs against the storage state at
 /// commit time and a remount between the phases invalidates the cache it
 /// writes into.
+/// The caller's absolute deadline, or `None` when it set none.
+///
+/// A zero `deadline_ns` is "unbounded", which is what an older caller sends. It
+/// is not treated as "already expired": that would fail every request from a
+/// caller that has not been updated yet.
+fn request_deadline(request: &VfsExecutableSnapshotRequest) -> Option<AbsoluteDeadline> {
+    (request.deadline_ns != 0).then(|| AbsoluteDeadline::after(request.deadline_ns, 0))
+}
+
+/// Whether the caller's budget is already gone.
+///
+/// Declining here is not a shortcut. A reply produced after the caller
+/// abandoned its reply capability is rejected by the kernel, and the caller
+/// surfaces that as a permission failure rather than as the timeout it is —
+/// exactly the misdiagnosis `V5-DEADLINE-012` exists to prevent. Refusing to
+/// start work the caller can no longer accept is the correct terminal.
+fn budget_expired(deadline: Option<AbsoluteDeadline>, now_ns: u64) -> bool {
+    deadline.is_some_and(|deadline| deadline.remaining_ns(now_ns).is_none())
+}
+
 pub(crate) fn open_executable_snapshot(
     request: &VfsExecutableSnapshotRequest,
 ) -> Result<ExecutableSnapshotOpen, i32> {
+    let deadline = request_deadline(request);
+    let started_ns = monotonic_nanos();
+    if budget_expired(deadline, started_ns) {
+        return Err(ETIMEDOUT);
+    }
     let plan = match lock_vfs_storage().plan_executable_snapshot(request)? {
         ExecutableSnapshotAdmission::Cached(open) => return Ok(open),
         ExecutableSnapshotAdmission::Read(plan) => plan,
     };
+    let planned_ns = monotonic_nanos();
+    // The whole bulk read is ahead; starting it with no budget left only
+    // produces a reply nobody is waiting for.
+    if budget_expired(deadline, planned_ns) {
+        return Err(ETIMEDOUT);
+    }
     if plan.verbose {
         ipc::debug_line(
             format!(
@@ -223,16 +254,30 @@ pub(crate) fn open_executable_snapshot(
             .as_str(),
         );
     }
+    let path = plan.path.clone();
+    let file_len = plan.file_len;
     let bytes = read_planned_executable_snapshot(&plan)?;
-    if plan.verbose {
-        ipc::debug_line(
-            format!(
-                "vfsd: executable snapshot volume-read done path={} bytes={}",
-                plan.path.as_str(),
-                bytes.len()
-            )
-            .as_str(),
-        );
-    }
-    lock_vfs_storage().commit_executable_snapshot(&plan, bytes.as_slice())
+    let read_ns = monotonic_nanos();
+    let result = lock_vfs_storage().commit_executable_snapshot(&plan, bytes.as_slice());
+    let committed_ns = monotonic_nanos();
+    // Emitted for every snapshot, not only slow ones. The caller can only ever
+    // report "the reply did not arrive"; without a provider-side split of plan,
+    // read, and commit there is no way to tell a slow device from a contended
+    // lock from a descheduled worker, and that ambiguity is what kept
+    // `V5-VFSD-HOL-007` open on inference.
+    ipc::debug_line(
+        format!(
+            "vfsd: executable snapshot phases path={path} bytes={file_len} plan_us={} read_us={} commit_us={} total_us={} status={}",
+            (planned_ns.saturating_sub(started_ns)) / 1_000,
+            (read_ns.saturating_sub(planned_ns)) / 1_000,
+            (committed_ns.saturating_sub(read_ns)) / 1_000,
+            (committed_ns.saturating_sub(started_ns)) / 1_000,
+            match &result {
+                Ok(_) => 0,
+                Err(errno) => *errno,
+            }
+        )
+        .as_str(),
+    );
+    result
 }
