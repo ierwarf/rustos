@@ -514,15 +514,113 @@ Note `lock hold max` rose to 298 us. That is a maximum, not a total, and the
 total hold fell; it has not been attributed yet and should be before this is
 called finished.
 
+### The lock-hold maximum is spawn, not dispatch
+
+The maximum is now attributed rather than left open. `record_runtime_profile_lock_hold`
+carries the acquiring `Location` and the in-owner segment time that same owner
+turn charged, and `kernel-scheduler-hold-max` reports all three: `arg0` packs
+(hold max us, attributed us), `arg1` packs (FNV-1a32 of the caller file, line).
+A maximum without the attributed share cannot distinguish a long critical
+section from a vCPU the host descheduled mid-hold.
+
+Every acquisition also charges an explicit `Prologue` segment covering owner
+publication and the deferred wake drain, emitted as
+`kernel-scheduler-phase-prologue` (arg0 = us, arg1 = wakes drained). Without it
+that work read as unattributed time and would have looked like a stall.
+
+Measured at 1 vCPU, per one-second window:
+
+| window | hold max | attributed | site |
+| --- | ---: | ---: | --- |
+| 0 | 2447 us | 2 us | `spawn.rs:321` (`start`, the one-time scheduler reset) |
+| 1 | 2435 us | 0 us | `spawn.rs:275` (`reserve_user_thread_slot`) |
+| 2 | 162 us | 160 us | `irq.rs:712` (software-yield dispatch) |
+| 3 | 155 us | 136 us | `irq.rs:266` (timer dispatch) |
+
+So the maxima split cleanly. In steady state the worst turn is a dispatch and
+about 95 percent of it is attributed in-owner work, which is the honest cost of
+the critical section. During boot the worst turns are *spawn* paths — slot
+allocation, stack zeroing, and address-space setup under the global lock — which
+carry no phase instrumentation at all, which is why their attributed share reads
+as zero. The 298 us in the table above was one of those, not a dispatch, and it
+does not indicate a regression in the identity work.
+
+`irq.rs:712` is `software_schedule_interrupt_dispatch`: it is the voluntary-yield
+dispatch itself, so its acquisitions are the scheduler doing its job. It cannot
+be removed the way the identity queries were; reducing it means reducing yields.
+
+### Syscall SIMD custody moved out of the scheduler lock
+
+`kernel/ps/src/multitask/syscall_simd.rs` now owns the per-slot entering-user
+SIMD image. It previously lived in two `Scheduler` fields, so both the syscall
+entry capture and the syscall return restore took the exclusive global lock,
+about 13.1k each per second, and each one carried a full `XSAVE`/`XRSTOR` inside
+the critical section.
+
+The buffer for a slot is reachable only by the CPU executing that slot's task at
+a syscall boundary with interrupts masked, and by `reset` when the scheduler
+binds or rebinds the slot under its lock. A slot cannot be current on two CPUs —
+`SchedulerAccessGuard::drop` fails the kernel if it ever is — so the exclusion
+does not need the lock. `SyscallUserSimdSnapshot` carries both the slot and the
+exact task bound to it, because the syscall body may block and resume on another
+CPU, and an exec rebind between entry and return must still be refused.
+
+1 vCPU passes end to end with this in place, which exercises the path on every
+syscall.
+
+### The 8 vCPU blocker is not the input-ring stall, and it is not new
+
+Five 8-vCPU runs were taken this session, two of them on a tree stashed back to
+`36ab344` so the baseline is measured rather than assumed. The build is unstable
+at 8 vCPU **at HEAD**, and it fails three different ways:
+
+| tree | outcome |
+| --- | --- |
+| HEAD `36ab344` | readiness timeout; missing `gpu-compositor active`, `wayclick: first frame presented`, `smp-cpu-first-user-dispatch arg0=0x6` |
+| HEAD `36ab344` | panic `handoffs.rs:85` — `suspended task 33 has invalid context: saved rflags lost the reserved bit` |
+| this session's tree | panic `handoffs.rs:85`, identical, task 36 |
+| this session's tree | `loaderd: executable snapshot call failed errno=110`, 17 retries, rootd restart budget exhausted |
+| this session's tree | readiness timeout; missing GPU/compositor markers, same snapshot timeouts |
+
+Two conclusions follow, and neither was visible before the baseline was taken.
+
+**The activation panic is pre-existing.** Identical site and message at HEAD.
+`activate_suspended_user_tasks` preflights a just-spawned suspended service and
+finds its saved frame zeroed: `saved_rsp` is inside the stack and the canary is
+intact, so the stack is the right one, but the frame at the top of it was never
+written or was cleared afterwards. `report_invalid_activation_context` now emits
+the slot, `saved_rsp`, both stack bounds, the frame's `rflags`/`cs`/`rip`/`rsp`,
+and whether the frame is entirely zero, so the next occurrence is attributable
+without another run. It did not recur in the three runs after it was added.
+
+**The dominant failure is `V5-VFSD-HOL-007` again, not the input ring.** The
+common thread in the runs that get furthest is
+`ipc slow call: endpoint=65539 wait_ms=2005` followed by
+`loaderd: executable snapshot call failed errno=110`, repeating for `storaged`
+until initd exhausts its retries. Meanwhile inputd is draining and publishing
+normally in the same run (`records=2305 batch_seq=2290 stage=published`), so the
+inputd drain/publish coupling the previous handoff named as the blocker does not
+reproduce as the thing holding the boot back. vfsd emits nothing at all on the
+snapshot path, which is why this keeps having to be inferred from the caller's
+timeout. Instrument `open_executable_snapshot` with the plan/first-block/
+last-block/seal/reply timestamps the audit's section 5.2 F prescribes before
+changing anything there.
+
+**The milestone ring drops records under 8 vCPU load.** 90 of 351 milestone
+sequence numbers are missing from one 8-vCPU log, and the drops fall at the end
+of the once-per-second drain, which is exactly where the per-caller acquisition
+census is emitted. The census therefore reads as empty at 8 vCPU while it works
+at 1 vCPU. Any 8-vCPU scheduler measurement has to fix this first or it is
+reading a truncated record.
+
 ### Gate status
 
-- 1 vCPU: passes, boot terminal 2824 ms.
-- 2, 4, 8 vCPU: reach readiness, fail on the input-ring drain stall. The 8 vCPU
-  run now reports `RustOS missing=[]` and `Linux-DVM missing=[]` and stops on
-  the DVM GPU/input leg, so the scheduler work moved the failure downstream.
-- 55 FPS WayClick gate: not met, still not measurable past the stall.
-- The scheduler identity work is committed. No hook or signing bypass has been
-  used at any point.
+- 1 vCPU: passes.
+- 2, 4, 8 vCPU: not passing. 8 vCPU is unstable at HEAD as described above; the
+  previous handoff's `RustOS missing=[]` result did not reproduce in five runs.
+- 55 FPS WayClick gate: not met and not measurable, because no 8-vCPU run
+  reaches a first presented frame.
+- No hook or signing bypass has been used at any point.
 
 ## Resume sequence
 
