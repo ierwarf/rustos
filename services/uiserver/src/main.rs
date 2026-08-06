@@ -71,6 +71,40 @@ const UI_PHASE_WAIT_RECHECK: usize = 8;
 const UI_PHASE_WAIT_PARK: usize = 9;
 const UI_PHASE_WAIT_RETURNED: usize = 10;
 
+/// Which call inside the Wayland phase the main loop is currently in.
+///
+/// The phase alone said "wayland" for a 3010 ms stall that killed the
+/// compositor mid-proof, and that is not enough to act on: the phase covers a
+/// client accept, a per-client dispatch, a pointer flush, and a socket flush,
+/// and every one of them reaches netd, which owns the AF_UNIX socket the
+/// protocol runs over. The watchdog reports this alongside the phase so the
+/// panic names the exact call rather than the span containing it.
+static WAYLAND_STEP: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) const WAYLAND_STEP_NONE: usize = 0;
+pub(crate) const WAYLAND_STEP_ACCEPT: usize = 1;
+pub(crate) const WAYLAND_STEP_DISPATCH: usize = 2;
+pub(crate) const WAYLAND_STEP_POINTER_FLUSH: usize = 3;
+pub(crate) const WAYLAND_STEP_FLUSH: usize = 4;
+pub(crate) const WAYLAND_STEP_SEND_CALLBACKS: usize = 5;
+pub(crate) const WAYLAND_STEP_CALLBACK_FLUSH: usize = 6;
+
+pub(crate) fn note_wayland_step(step: usize) {
+    WAYLAND_STEP.store(step, Ordering::Release);
+}
+
+fn wayland_step_name(step: usize) -> &'static str {
+    match step {
+        WAYLAND_STEP_ACCEPT => "accept",
+        WAYLAND_STEP_DISPATCH => "dispatch",
+        WAYLAND_STEP_POINTER_FLUSH => "pointer-flush",
+        WAYLAND_STEP_FLUSH => "flush",
+        WAYLAND_STEP_SEND_CALLBACKS => "send-callbacks",
+        WAYLAND_STEP_CALLBACK_FLUSH => "callback-flush",
+        _ => "none",
+    }
+}
+
 static FRAME_SAMPLE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static SLOW_CONSOLE_REFRESH_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static SLOW_PRESENT_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -122,8 +156,9 @@ impl UiLoopWatchdog {
                 continue;
             }
             diag_line(format!(
-                "uiserver watchdog panic: phase={} elapsed_ms={} loop_seq={}",
+                "uiserver watchdog panic: phase={} step={} elapsed_ms={} loop_seq={}",
                 ui_phase_name(phase_id),
+                wayland_step_name(WAYLAND_STEP.load(Ordering::Acquire)),
                 elapsed_ms,
                 loop_seq.load(Ordering::Acquire),
             ));

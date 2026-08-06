@@ -301,6 +301,7 @@ impl WaylandCompositor {
     pub(crate) fn tick(&mut self) -> bool {
         let tick_started = Instant::now();
         let accept_started = tick_started;
+        crate::note_wayland_step(crate::WAYLAND_STEP_ACCEPT);
         let mut accepted = 0_usize;
         while accepted < MAX_WAYLAND_CLIENT_ACCEPTS_PER_TICK {
             match self.acceptor.try_recv() {
@@ -328,6 +329,7 @@ impl WaylandCompositor {
         let accept_elapsed = accept_started.elapsed();
 
         let dispatch_started = Instant::now();
+        crate::note_wayland_step(crate::WAYLAND_STEP_DISPATCH);
         let clients = core::mem::take(&mut self.clients);
         let mut deferred_clients = Vec::new();
         let mut dispatch_clients = Vec::new();
@@ -372,9 +374,12 @@ impl WaylandCompositor {
             }
         }
         let dispatch_elapsed = dispatch_started.elapsed();
+        crate::note_wayland_step(crate::WAYLAND_STEP_POINTER_FLUSH);
         self.state.flush_pointer_motion(false);
         let flush_started = Instant::now();
+        crate::note_wayland_step(crate::WAYLAND_STEP_FLUSH);
         self.flush_clients();
+        crate::note_wayland_step(crate::WAYLAND_STEP_NONE);
         let flush_elapsed = flush_started.elapsed();
         let tick_elapsed = tick_started.elapsed();
         if ui_profile_enabled()
@@ -399,8 +404,11 @@ impl WaylandCompositor {
     /// Consume one compositor-issued frame permit by releasing copied SHM
     /// buffers and sending the pending one-shot callbacks.
     pub(crate) fn consume_frame_callback_permit(&mut self) {
+        crate::note_wayland_step(crate::WAYLAND_STEP_SEND_CALLBACKS);
         self.state.send_frame_callbacks();
+        crate::note_wayland_step(crate::WAYLAND_STEP_CALLBACK_FLUSH);
         self.flush_clients();
+        crate::note_wayland_step(crate::WAYLAND_STEP_NONE);
     }
 
     pub(crate) fn flush_clients(&mut self) {
