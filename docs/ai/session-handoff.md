@@ -856,3 +856,35 @@ backlog, which matches an outstanding count pinned exactly at the limit.
 
 `OUTSTANDING_HIGH_WATER` and `DRAIN_CLAIM_LOST` already exist in `dvm_ring.rs`
 for this question and are not yet reported anywhere.
+
+### Where the remaining 60 seconds go
+
+Boot is not the constraint. Measured timeline of the best run:
+
+    uiserver main loop      t=3.2s
+    wayclick spawn          t=3.6s
+    gpu-compositor active   t=3.6s
+    wayclick main enter     t=4.1s
+    first wayclick window   t=4.9s
+    last wayclick window    t=29.5s
+
+Twenty-six windows spanning 4.9 to 29.5 seconds, roughly one per second, then
+nothing for the remaining sixty seconds of a ninety-second run. The gate wants
+sixty consecutive and the run offers about eighty-five, so the shortfall is not
+launch latency and not window loss - the window numbers are contiguous.
+
+The compositor is not the one stopping. After the peer-ready rebind log was
+bounded, uiserver held 66.9 Hz across all fifty-seven of its own one-second
+windows in the same configuration, with no collapse.
+
+So the question is what stops WayClick at about thirty seconds while the
+compositor keeps running. Two things end near there and are worth checking in
+this order: the L0 input relay finishes its ~1700-event square and tears down,
+and the `--exercise-input` pointer stream stops with it. WayClick's later windows
+already show `redraw_requests=0 pointer_updates=0`, so it was self-driving by
+then and should not care - but that is an assumption, not a measurement.
+
+`frame_seq` now joins both completions, so the next step is to read whether
+WayClick's commits keep arriving at the compositor past t=30s. If they do, the
+loss is on the client's profile emission; if they stop, it is the client's
+dispatch loop and the join will say which completion it last saw.
