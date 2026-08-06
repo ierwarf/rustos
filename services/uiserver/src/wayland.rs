@@ -2658,15 +2658,26 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for WaylandState {
                 // its first frame, and it is fatal to the client rather than to
                 // the request that caused it.
                 let callback = data_init.init(callback, CallbackData);
-                // The client dies with a backend `Invalid new_id` after its
-                // first frame, which is an id-lifetime disagreement rather than
-                // anything this compositor posts. Log both ends of the callback
-                // object's life so the next run names the id instead of
-                // inviting another guess.
-                crate::sys::debug_line(&format!(
-                    "uiserver: wayland frame callback created id={:?}",
-                    callback.id()
-                ));
+                // Both ends of the callback object's life are logged, because
+                // the `Invalid new_id` failure that motivated them was an
+                // id-lifetime disagreement that no other record named.
+                //
+                // Bounded, like its `done` counterpart. Unbounded it emitted one
+                // line per frame - 277 per second at the rate this compositor
+                // now reaches - and every debugcon byte is a port write that
+                // exits to the host under one global lock. The acceptance proof
+                // counts one line per second from the client on that same
+                // transport, and this record was crowding it out: a run with
+                // WayClick alive and committing throughout still stopped
+                // producing window records after the ninth.
+                if WAYLAND_CALLBACK_ID_LOG_COUNT.fetch_add(1, Ordering::Relaxed)
+                    < MAX_WAYLAND_CALLBACK_ID_LOGS
+                {
+                    crate::sys::debug_line(&format!(
+                        "uiserver: wayland frame callback created id={:?}",
+                        callback.id()
+                    ));
+                }
 
                 let Ok(mut surface) = data.shared.lock() else {
                     post_protocol_error(resource, "wl_surface.frame: surface unavailable".into());
