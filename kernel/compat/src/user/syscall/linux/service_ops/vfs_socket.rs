@@ -724,7 +724,14 @@ pub fn syscall_linux_vfs_read(fd: u64, user_ptr: u64, user_len: u64) -> u64 {
         };
     }
     if current_socket_fd(fd) {
-        return syscall_linux_net6(
+        // A non-blocking receive is bounded by the interactive rail, and a
+        // receive that reaches that bound reports `EAGAIN`. See
+        // `syscall_linux_net6_with_timeout` for why both halves are required.
+        let nonblocking =
+            current_fd_status_flags(fd).is_some_and(|flags| flags & linux_abi::O_NONBLOCK != 0);
+        let timeout_ms = nonblocking
+            .then_some(rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS);
+        let result = super::vfs_meta::syscall_linux_net6_with_timeout(
             SYSCALL_OFFLOAD_OP_LINUX_RECVFROM,
             fd,
             user_ptr,
@@ -732,7 +739,12 @@ pub fn syscall_linux_vfs_read(fd: u64, user_ptr: u64, user_len: u64) -> u64 {
             0,
             0,
             0,
+            timeout_ms,
         );
+        if nonblocking && result == linux_errno(LINUX_ETIMEDOUT) {
+            return linux_errno(LINUX_EAGAIN);
+        }
+        return result;
     }
     if let Some(mut memfd) = current_memfd_handle(fd) {
         return super::local_memfd_io::read(&mut memfd, user_ptr, user_len);
@@ -816,7 +828,17 @@ pub fn syscall_linux_vfs_write(fd: u64, user_ptr: u64, user_len: u64) -> u64 {
         };
     }
     if current_socket_fd(fd) {
-        return syscall_linux_net6(
+        // The send half needs the same bound as the receive half, and for the
+        // stronger reason. A compositor writing events to a client whose
+        // receive buffer is full is the textbook Wayland head-of-line block -
+        // one slow client stops every other client and the compositor with it,
+        // which is what `V5-WAYLAND-HOL-013` names. On the bulk rail that block
+        // lasts 30 seconds; uiserver's watchdog ends the process at 3.
+        let nonblocking =
+            current_fd_status_flags(fd).is_some_and(|flags| flags & linux_abi::O_NONBLOCK != 0);
+        let timeout_ms = nonblocking
+            .then_some(rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS);
+        let result = super::vfs_meta::syscall_linux_net6_with_timeout(
             SYSCALL_OFFLOAD_OP_LINUX_SENDTO,
             fd,
             user_ptr,
@@ -824,7 +846,12 @@ pub fn syscall_linux_vfs_write(fd: u64, user_ptr: u64, user_len: u64) -> u64 {
             0,
             0,
             0,
+            timeout_ms,
         );
+        if nonblocking && result == linux_errno(LINUX_ETIMEDOUT) {
+            return linux_errno(LINUX_EAGAIN);
+        }
+        return result;
     }
     if let Some(mut memfd) = current_memfd_handle(fd) {
         return super::local_memfd_io::write(&mut memfd, user_ptr, user_len);

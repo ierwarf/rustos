@@ -578,6 +578,39 @@ pub fn syscall_linux_net6(
     arg4: u64,
     arg5: u64,
 ) -> u64 {
+    syscall_linux_net6_with_timeout(op, arg0, arg1, arg2, arg3, arg4, arg5, None)
+}
+
+/// The same offload with an explicit completion bound.
+///
+/// Without one every netd call takes the bulk-data rail, 30 seconds, including
+/// a receive on a socket the caller opened non-blocking. uiserver's Wayland
+/// dispatch reads its client sockets that way, and the instrumented run named
+/// the exact call: "phase=wayland step=dispatch elapsed_ms=3165", the
+/// compositor watchdog killing the process inside libwayland's per-client
+/// dispatch. `V5-WAYLAND-HOL-013` is that block.
+///
+/// A caller that declared O_NONBLOCK has already accepted `EAGAIN` as an
+/// answer, so bounding its receive costs it nothing it did not agree to - but
+/// only if the bound reports `EAGAIN`. The first attempt at this let
+/// `ETIMEDOUT` reach the caller and the run came back with a 30-second callback
+/// gap and two windows, because the whole Wayland dispatch model is built on
+/// `EAGAIN` being the ordinary, non-fatal answer on a ready-but-empty socket
+/// and treats anything else as a broken client.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors the six-argument Linux socket offload plus its completion bound"
+)]
+pub fn syscall_linux_net6_with_timeout(
+    op: u16,
+    arg0: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+    arg4: u64,
+    arg5: u64,
+    timeout_ms: Option<u64>,
+) -> u64 {
     let mut request = NetdIpcRequest {
         version: NETD_IPC_ABI_VERSION,
         op,
@@ -611,7 +644,11 @@ pub fn syscall_linux_net6(
         pending_transfers.drop_pending();
         return linux_errno(errno);
     }
-    match call_netd_ipc_request(&request) {
+    let result = match timeout_ms {
+        Some(timeout_ms) => call_netd_ipc_request_with_timeout(&request, timeout_ms),
+        None => call_netd_ipc_request(&request),
+    };
+    match result {
         Ok(response) => {
             let consumed = usize::try_from(response.value).ok();
             let result = consume_netd_response_payload(
