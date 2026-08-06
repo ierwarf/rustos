@@ -71,6 +71,17 @@ const MAX_WAYLAND_POINTER_RESOURCES: usize = 64;
 const MAX_WAYLAND_KEYBOARD_RESOURCES: usize = 64;
 const MAX_WAYLAND_FRAME_CALLBACKS_PER_SURFACE: usize = 8;
 const MAX_WAYLAND_DISPATCH_LOGS: usize = 16;
+/// Per-callback identity lines are bounded like every other diagnostic here.
+///
+/// They were unbounded, so a client running at 60 Hz put 60 lines per second on
+/// the debug transport for `done` alone. Every debugcon byte is a port write
+/// that exits to the host, under one global lock held with interrupts disabled,
+/// and the acceptance proof reads the same transport - so the frame evidence
+/// was crowding out the window records the proof counts. The identity of an
+/// individual callback mattered once, for the `Invalid new_id: 15` failure the
+/// comment in `send_frame_callbacks` records; a bounded prefix keeps that
+/// evidence for the case it was built for.
+const MAX_WAYLAND_CALLBACK_ID_LOGS: usize = 32;
 const MAX_WAYLAND_SLOW_TICK_LOGS: usize = 8;
 const SLOW_WAYLAND_TICK_MS: u128 = 16;
 const WAYLAND_POINTER_FRAME_INTERVAL: Duration = Duration::from_millis(15);
@@ -78,6 +89,7 @@ const WAYLAND_READINESS_TRANSIENT_FAILURE_LIMIT: usize = 8;
 const WAYLAND_READINESS_RETRY_DELAY: Duration = Duration::from_millis(1);
 
 static WAYLAND_DISPATCH_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+static WAYLAND_CALLBACK_ID_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static WAYLAND_SLOW_TICK_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static WAYLAND_READINESS_WAKE_LOGGED: AtomicBool = AtomicBool::new(false);
 
@@ -985,6 +997,13 @@ impl WaylandState {
 
     fn send_frame_callbacks(&mut self) {
         let time = self.event_time_ms();
+        // `V5-UI-PIPELINE-011`: both completions carry the frame identity that
+        // produced them. Release may precede presentation, so they are counted
+        // separately rather than assumed to move together.
+        let frame_seq = crate::loop_timing::current_frame_seq();
+        let mut released = 0_u64;
+        let mut completed = 0_u64;
+        let mut max_wait_micros = 0_u64;
         for surface in &self.surfaces {
             let (callbacks, releases) = {
                 let Ok(mut surface) = surface.shared.lock() else {
@@ -1017,6 +1036,7 @@ impl WaylandState {
                 (callbacks, releases)
             };
             for buffer in releases {
+                released = released.saturating_add(1);
                 buffer.release();
             }
             for pending in callbacks {
@@ -1028,12 +1048,24 @@ impl WaylandState {
                     .saturating_add(wait_micros);
                 self.callback_profile_max_wait_micros =
                     self.callback_profile_max_wait_micros.max(wait_micros);
-                crate::sys::debug_line(&format!(
-                    "uiserver: wayland frame callback done id={:?}",
-                    pending.callback.id()
-                ));
+                completed = completed.saturating_add(1);
+                max_wait_micros = max_wait_micros.max(wait_micros);
+                if WAYLAND_CALLBACK_ID_LOG_COUNT.fetch_add(1, Ordering::Relaxed)
+                    < MAX_WAYLAND_CALLBACK_ID_LOGS
+                {
+                    crate::sys::debug_line(&format!(
+                        "uiserver: wayland frame callback done frame_seq={frame_seq} id={:?}",
+                        pending.callback.id()
+                    ));
+                }
                 pending.callback.done(time);
             }
+        }
+        if (completed != 0 || released != 0) && crate::loop_timing::frame_seq_is_sampled(frame_seq)
+        {
+            crate::sys::debug_line(&format!(
+                "uiserver: frame completion frame_seq={frame_seq} callbacks={completed} releases={released} max_wait_us={max_wait_micros}"
+            ));
         }
         let profile_elapsed = self.callback_profile_started.elapsed();
         if ui_profile_enabled() && profile_elapsed >= Duration::from_secs(1) {

@@ -26,7 +26,7 @@ services/syscalld/src/linux_policy.rs	1532	syscalld	Split process, memory, entro
 services/uiserver/src/main.rs	1344	uiserver	Split the protocol, scene, and GPU submission owners per V5-GPU-UI-OWNER-014; the main loop is the shared owner that split removes.
 services/uiserver/src/render.rs	1619	uiserver-render	Split scene planning, damage, raster/composition, and tests.
 services/uiserver/src/sys.rs	1607	uiserver-sys	Split syscall wrappers by IPC, VM, wait, input, and display.
-services/uiserver/src/wayland.rs	3172	uiserver-wayland	Split protocol objects, dispatch, surface lifecycle, and tests.
+services/uiserver/src/wayland.rs	3204	uiserver-wayland	Split protocol objects, dispatch, surface lifecycle, and tests.
 tools/hostd/src/runtime.rs	2841	hostd	Split launch, QMP, process identity, recovery, and evidence sealing.
 tools/xtask/src/build/mod.rs	1505	xtask-build	Split build planning, signing, staging, and artifact validation.
 tools/xtask/src/formal_contracts/registry.rs	1583	xtask-formal	Split schema decode, semantic validation, generation, and tests.

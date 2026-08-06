@@ -105,6 +105,16 @@ pub(crate) fn log_slow_loop_iteration(
 /// contract rather than against the absence of stalls.
 const FRAME_SAMPLE_INTERVAL: u64 = 240;
 
+/// Whether this frame identity is one of the sampled ones.
+///
+/// Records that join a frame to something else share the sample cadence rather
+/// than each choosing their own. Every debugcon byte exits to the host, and the
+/// acceptance proof reads the same transport, so a per-frame record at 130 Hz
+/// crowds out the per-second window records the proof counts.
+pub(crate) fn frame_seq_is_sampled(frame_seq: u64) -> bool {
+    frame_seq != 0 && frame_seq.is_multiple_of(FRAME_SAMPLE_INTERVAL)
+}
+
 /// Emits one attribution record per sample interval.
 pub(crate) fn log_frame_sample(timings: &LoopPhaseTimings, iteration_elapsed: Duration) {
     if timings.frame_seq == 0 || !timings.frame_seq.is_multiple_of(FRAME_SAMPLE_INTERVAL) {
