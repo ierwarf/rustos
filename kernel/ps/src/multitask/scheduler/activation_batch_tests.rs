@@ -103,31 +103,41 @@ fn spawn_handoff_is_fifo_deduplicated_and_precedes_ipc_handoff() {
         2
     );
     assert_eq!(
-        scheduler.take_next_atomic_activation_handoff_ready_slot(),
+        scheduler.take_next_atomic_activation_handoff_ready_slot(
+            &mut scheduler.current_dispatch_policy()
+        ),
         Some(first)
     );
     assert_eq!(
-        scheduler.take_next_atomic_activation_handoff_ready_slot(),
+        scheduler.take_next_atomic_activation_handoff_ready_slot(
+            &mut scheduler.current_dispatch_policy()
+        ),
         Some(second)
     );
     assert_eq!(
-        scheduler.take_next_atomic_activation_handoff_ready_slot(),
+        scheduler.take_next_atomic_activation_handoff_ready_slot(
+            &mut scheduler.current_dispatch_policy()
+        ),
         None
     );
     assert_eq!(
-        scheduler.take_next_synchronous_pick_hint_ready_slot(),
+        scheduler
+            .take_next_synchronous_pick_hint_ready_slot(&mut scheduler.current_dispatch_policy()),
         Some(parent)
     );
-    assert_eq!(scheduler.take_next_pick_hint_ready_slot(), Some(first));
     assert_eq!(
-        scheduler.take_next_spawn_pick_hint_ready_slot(),
+        scheduler.take_next_pick_hint_ready_slot(&mut scheduler.current_dispatch_policy()),
+        Some(first)
+    );
+    assert_eq!(
+        scheduler.take_next_spawn_pick_hint_ready_slot(&mut scheduler.current_dispatch_policy()),
         Some(ordinary)
     );
     scheduler.set_next_spawn_pick_hint(802);
     scheduler.set_next_spawn_pick_hint(803);
     scheduler.clear_slot(first);
     assert_eq!(
-        scheduler.take_next_spawn_pick_hint_ready_slot(),
+        scheduler.take_next_spawn_pick_hint_ready_slot(&mut scheduler.current_dispatch_policy()),
         Some(second)
     );
 }

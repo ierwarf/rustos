@@ -214,6 +214,68 @@ but step 3 should be preceded by taking the 160 ms/s handoff chain apart — if
 that alone brings the hold under a few percent duty, the remaining stages become
 optional rather than mandatory.
 
+### 2.1d What the handoff chain was actually spending, and what removed it
+
+Taking the chain apart gave a result that no amount of reading the source would
+have produced, and it is worth stating plainly because it changes what the
+remaining stages are for.
+
+Each of the six chain members was self-timed at its call site. Every one came
+back between 0.95 and 2.5 µs per call, and the times did not track the work: the
+step that pops an empty queue and returns cost 0.81 µs, while the step that
+walks the local runnable set cost 0.86 µs. A cost that is flat across steps that
+do wildly different amounts of work is not the work.
+
+Two controls priced the alternative. An empty timed span read **0.032 µs**; one
+bare acquisition of this CPU's dispatch policy read **0.724 µs**. That is the
+whole explanation. The per-step costs fall out of the acquisition count exactly:
+one acquisition per step for the blocking hint, two for atomic activation and
+for the synchronous hint, three for bootstrap, and the two overdue steps are a
+scan plus at most one acquisition.
+
+The chain was taking the same per-CPU lock about ten times per dispatch.
+
+Why an uncontended per-CPU lock costs 0.72 µs is not a mystery either. Every
+`TrackedSpinLock` acquisition runs `disable_preemption`, the lock-order graph
+walk in `before_acquire`, a TSC read, an `after_acquire` under
+`without_interrupts`, and on release a second `without_interrupts` containing
+`current_cpu_index`, `current_apic_id`, and the guard-ownership check. That is
+three to four `RDTSCP` reads and two interrupt-flag save/restore pairs per
+acquisition. The instrumentation is worth its cost once per critical section.
+It is not worth it ten times inside one.
+
+The fix keeps the ownership boundary exactly and pays for it once: the chain
+acquires the current CPU's policy a single time and threads the guard through
+every step. Cross-CPU pushers still acquire the target CPU's policy on their
+own, which is the boundary `V5-SCHED-GLOBAL-001` needs to survive the cutover.
+
+The first attempt at this deadlocked-by-assertion rather than silently, which is
+the lockdep design working: `reserved_user_pick` reaches `user_reservation_due`,
+which took the same policy lock a second time, and the guest panicked with
+`recursive lock-class acquisition class=42` before boot reached rootd. Threading
+the guard into that path too is what made it correct. The lesson is the one the
+vfsd storage lock already taught — a second live guard on one lock inside one
+call is the failure, and the only reliable way to find them all is to let the
+class assertion do it.
+
+Measured at 8 vCPU, per dispatch, same instrumentation before and after:
+
+| step | before | after |
+| --- | ---: | ---: |
+| atomic activation | 1.42 µs | 0.039 µs |
+| synchronous hint | 1.42 µs | 0.059 µs |
+| overdue (mandatory) | 0.86 µs | 1.03 µs |
+| bootstrap | 2.11 µs | 0.046 µs |
+| blocking hint | 0.81 µs | 0.039 µs |
+| overdue or hint | 1.52 µs | 1.00 µs |
+| policy acquisition | — | 0.575 µs |
+| **chain total** | **7.39 µs** | **2.50 µs** |
+
+Two thirds of the chain was lock instrumentation on a lock that could not be
+contended. What remains is 2.0 µs of genuine class scans and one acquisition,
+and the two overdue steps are now the only members worth attacking — they are
+the same `overdue_class_pick` walk charged twice per dispatch.
+
 ### 2.2 Reference designs and what each contributes
 
 - **Linux scheduler domains** — <https://www.kernel.org/doc/html/latest/scheduler/sched-domains.html>.

@@ -288,3 +288,50 @@ pub(in crate::multitask) fn take_pick_scan_window() -> (u64, u64) {
         PICK_SCAN_CALLS.swap(0, core::sync::atomic::Ordering::Relaxed),
     )
 }
+
+/// Per-member cost of the handoff chain itself.
+///
+/// Splitting the fair pick and the two class scans out of `SelectHandoff` left
+/// 63 percent of the segment — about 5.6 us of every dispatch — attributed to
+/// nothing but the chain's own six steps. Each step is a separate hint queue
+/// with its own per-CPU policy lock traffic, so which of them owns that time is
+/// not derivable from the source; it has to be measured before any of them is
+/// touched.
+///
+/// Steps 2 and 5 re-enter the overdue class scan, so their totals overlap
+/// `HANDOFF_SCAN_NS` by construction. Every other step is disjoint.
+///
+/// Step 6 is the chain's single acquisition of this CPU's dispatch policy.
+///
+/// The first measurement returned every step between 0.95 and 2.5 us regardless
+/// of how much work it does — the step that finds an empty queue and returns
+/// cost nearly as much as the one that scans. Two controls priced that: an
+/// empty timed span read 0.032 us and one bare policy acquisition read
+/// 0.724 us, against a 0.72 us per-step floor. The chain was paying for
+/// acquisitions, not decisions, about ten of them per dispatch. It now takes
+/// the guard once and threads it, so step 6 is the entire acquisition cost the
+/// chain pays.
+pub(in crate::multitask) const HANDOFF_STEP_COUNT: usize = 7;
+static HANDOFF_STEP_NS: [core::sync::atomic::AtomicU64; HANDOFF_STEP_COUNT] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; HANDOFF_STEP_COUNT];
+static HANDOFF_STEP_CALLS: [core::sync::atomic::AtomicU64; HANDOFF_STEP_COUNT] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; HANDOFF_STEP_COUNT];
+
+pub(in crate::multitask) fn charge_handoff_step(step: usize, elapsed_ns: u64) {
+    let Some(total) = HANDOFF_STEP_NS.get(step) else {
+        return;
+    };
+    // ORDERING: Relaxed; diagnostic counters drained once per second.
+    total.fetch_add(elapsed_ns, core::sync::atomic::Ordering::Relaxed);
+    HANDOFF_STEP_CALLS[step].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Takes the window's per-step chain cost, clearing it for the next window.
+pub(in crate::multitask) fn take_handoff_step_window() -> [(u64, u64); HANDOFF_STEP_COUNT] {
+    core::array::from_fn(|step| {
+        (
+            HANDOFF_STEP_NS[step].swap(0, core::sync::atomic::Ordering::Relaxed),
+            HANDOFF_STEP_CALLS[step].swap(0, core::sync::atomic::Ordering::Relaxed),
+        )
+    })
+}

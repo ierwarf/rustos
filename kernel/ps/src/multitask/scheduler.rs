@@ -724,20 +724,18 @@ impl Scheduler {
         Some(slot)
     }
 
-    fn take_next_latency_pick_hint_ready_slot(&mut self) -> Option<usize> {
-        if self.current_dispatch_policy().latency_handoff_streak >= MAX_CONSECUTIVE_LATENCY_HANDOFFS
-        {
+    fn take_next_latency_pick_hint_ready_slot(
+        &self,
+        policy: &mut CpuDispatchGuard<'_>,
+    ) -> Option<usize> {
+        if policy.latency_handoff_streak >= MAX_CONSECUTIVE_LATENCY_HANDOFFS {
             return None;
         }
-        while self.current_dispatch_policy().latency_pick_hint_len != 0 {
-            let hint = {
-                let mut policy = self.current_dispatch_policy_mut();
-                let index = policy.latency_pick_hint_head;
-                let hint = policy.latency_pick_hints[index].take();
-                policy.latency_pick_hint_head = (index + 1) % MAX_LATENCY_HANDOFF_HINTS;
-                policy.latency_pick_hint_len -= 1;
-                hint
-            };
+        while policy.latency_pick_hint_len != 0 {
+            let index = policy.latency_pick_hint_head;
+            let hint = policy.latency_pick_hints[index].take();
+            policy.latency_pick_hint_head = (index + 1) % MAX_LATENCY_HANDOFF_HINTS;
+            policy.latency_pick_hint_len -= 1;
             if let Some(slot) = self.pick_hint_candidate_slot(hint) {
                 return Some(slot);
             }
@@ -745,14 +743,14 @@ impl Scheduler {
         None
     }
 
-    fn take_next_pick_hint_ready_slot(&mut self) -> Option<usize> {
-        let hint = self.current_dispatch_policy().next_pick_hint;
+    fn take_next_pick_hint_ready_slot(&self, policy: &mut CpuDispatchGuard<'_>) -> Option<usize> {
+        let hint = policy.next_pick_hint;
         if hint.is_some() && self.pick_hint_candidate_slot(hint).is_none() {
-            self.current_dispatch_policy_mut().next_pick_hint = None;
+            policy.next_pick_hint = None;
             return None;
         }
         let slot = self.pick_hint_ready_slot(hint)?;
-        self.current_dispatch_policy_mut().next_pick_hint = None;
+        policy.next_pick_hint = None;
         Some(slot)
     }
 
@@ -1231,17 +1229,21 @@ impl Scheduler {
     /// scheduler into a high-rate round-robin loop. Ordinary fair work stays
     /// governed by charged vruntime; exact event and synchronous IPC wakeups
     /// retain their separately bounded handoff queues.
-    fn reserved_user_pick(&self, current: usize) -> Option<usize> {
+    fn reserved_user_pick(&self, policy: &CpuDispatchGuard<'_>, current: usize) -> Option<usize> {
         let started_ns = crate::arch::clock::monotonic_nanos();
-        let picked = self.reserved_user_pick_inner(current);
+        let picked = self.reserved_user_pick_inner(policy, current);
         locality::charge_handoff_scan(
             crate::arch::clock::monotonic_nanos().saturating_sub(started_ns),
         );
         picked
     }
 
-    fn reserved_user_pick_inner(&self, current: usize) -> Option<usize> {
-        self.user_reservation_due()
+    fn reserved_user_pick_inner(
+        &self,
+        policy: &CpuDispatchGuard<'_>,
+        current: usize,
+    ) -> Option<usize> {
+        Self::user_reservation_due(policy)
             .then(|| self.pick_min_vruntime_in_class(current, SchedClass::User))
             .flatten()
     }
@@ -1328,16 +1330,17 @@ impl Scheduler {
     /// The hint remains pending when the overdue task wins, so the direct IPC
     /// handoff is delayed by one bounded recovery turn rather than discarded.
     fn take_overdue_system_or_pick_hint(
-        &mut self,
+        &self,
+        policy: &mut CpuDispatchGuard<'_>,
         current: usize,
         now_ticks: u64,
     ) -> Option<usize> {
         self.overdue_system_pick(current, now_ticks)
-            .or_else(|| self.take_next_pick_hint_ready_slot())
+            .or_else(|| self.take_next_pick_hint_ready_slot(policy))
     }
 
-    fn user_reservation_due(&self) -> bool {
-        self.current_dispatch_policy().system_dispatch_streak >= MAX_CONSECUTIVE_SYSTEM_DISPATCHES
+    fn user_reservation_due(policy: &CpuDispatchGuard<'_>) -> bool {
+        policy.system_dispatch_streak >= MAX_CONSECUTIVE_SYSTEM_DISPATCHES
     }
 
     fn record_dispatch_class(&mut self, slot: usize) {
@@ -2659,9 +2662,20 @@ impl Scheduler {
         // before the unrelated User reservation; a committed child
         // activation is already an explicit, one-shot bootstrap transfer and
         // must run before either category of ordinary IPC wakeup.
-        let atomic_activation_handoff = self.take_next_atomic_activation_handoff_ready_slot();
+        // One acquisition for the whole chain. Every step below reads or
+        // consumes this CPU's own dispatch hints, and taking the guard per step
+        // cost 0.72 us each measured against an empty control span — about
+        // 6 us of the 8 us critical section, on a lock that the global
+        // scheduler owner already makes uncontended. The ownership boundary is
+        // unchanged: cross-CPU pushers still acquire the target CPU's policy.
+        let mut policy = timed_handoff_step(6, || self.current_dispatch_policy());
+        let atomic_activation_handoff = timed_handoff_step(0, || {
+            self.take_next_atomic_activation_handoff_ready_slot(&mut policy)
+        });
         let sync_handoff = if atomic_activation_handoff.is_none() {
-            self.take_next_synchronous_pick_hint_ready_slot()
+            timed_handoff_step(1, || {
+                self.take_next_synchronous_pick_hint_ready_slot(&mut policy)
+            })
         } else {
             None
         };
@@ -2671,10 +2685,13 @@ impl Scheduler {
                 None => match sync_handoff {
                     Some(peer_slot) => (peer_slot, true, None, false, true),
                     None => {
-                        let mandatory_overdue =
-                            self.mandatory_overdue_system_pick(current_slot, now_ticks);
+                        let mandatory_overdue = timed_handoff_step(2, || {
+                            self.mandatory_overdue_system_pick(current_slot, now_ticks)
+                        });
                         let bootstrap_handoff = if mandatory_overdue.is_none() {
-                            self.take_next_bootstrap_handoff_ready_slot()
+                            timed_handoff_step(3, || {
+                                self.take_next_bootstrap_handoff_ready_slot(&mut policy)
+                            })
                         } else {
                             None
                         };
@@ -2688,22 +2705,31 @@ impl Scheduler {
                                     None => {
                                         let blocking_ipc_handoff = self.contexts[current_slot]
                                             .is_some_and(|context| context.blocked)
-                                            .then(|| self.take_next_pick_hint_ready_slot())
+                                            .then(|| {
+                                                timed_handoff_step(4, || {
+                                                    self.take_next_pick_hint_ready_slot(&mut policy)
+                                                })
+                                            })
                                             .flatten();
                                         let (next_idx, ipc_handoff, reserved_user_pick) =
                                             match blocking_ipc_handoff {
                                                 Some(receiver_slot) => (receiver_slot, true, None),
                                                 None => {
-                                                    match self.reserved_user_pick(current_slot) {
+                                                    match self
+                                                        .reserved_user_pick(&policy, current_slot)
+                                                    {
                                                         Some(user_slot) => {
                                                             (user_slot, false, Some(user_slot))
                                                         }
                                                         None => {
-                                                            let overdue_or_hint = self
-                                                                .take_overdue_system_or_pick_hint(
-                                                                    current_slot,
-                                                                    now_ticks,
-                                                                );
+                                                            let overdue_or_hint =
+                                                                timed_handoff_step(5, || {
+                                                                    self.take_overdue_system_or_pick_hint(
+                                                                        &mut policy,
+                                                                        current_slot,
+                                                                        now_ticks,
+                                                                    )
+                                                                });
                                                             let cfs_pick = if voluntary_yield {
                                                                 self.pick_min_vruntime_excluding(
                                                                     current_slot,
@@ -2747,6 +2773,8 @@ impl Scheduler {
                     }
                 },
             };
+
+        drop(policy);
 
         self.mark_phase(SchedulerPhase::SelectHandoff, &mut phase_marker);
 
@@ -4218,6 +4246,24 @@ impl Scheduler {
     }
 }
 
+/// Self-times one member of the handoff chain.
+///
+/// The chain runs in order on every dispatch and the phase marks cannot see
+/// inside it: one mark opens before the first step and the next closes after
+/// the last, so all six steps plus the match glue arrive as a single number.
+/// Wrapping the call sites is what separates them, and the steps are measured
+/// before any of them is changed — the one predicate reorder attempted on a
+/// guess moved nothing.
+fn timed_handoff_step<T>(step: usize, body: impl FnOnce() -> T) -> T {
+    let started_ns = crate::arch::clock::monotonic_nanos();
+    let value = body();
+    locality::charge_handoff_step(
+        step,
+        crate::arch::clock::monotonic_nanos().saturating_sub(started_ns),
+    );
+    value
+}
+
 #[cfg(rustos_log_sched_debug)]
 fn saved_context_rip(saved_rsp: usize) -> Option<u64> {
     if saved_rsp == 0 {
@@ -5095,13 +5141,17 @@ mod tests {
             .current_dispatch_policy_mut()
             .system_dispatch_streak = MAX_CONSECUTIVE_SYSTEM_DISPATCHES;
 
-        assert!(scheduler.user_reservation_due());
+        assert!(Scheduler::user_reservation_due(
+            &scheduler.current_dispatch_policy()
+        ));
         scheduler.record_dispatch_class(2);
         assert_eq!(
             scheduler.current_dispatch_policy().system_dispatch_streak,
             0
         );
-        assert!(!scheduler.user_reservation_due());
+        assert!(!Scheduler::user_reservation_due(
+            &scheduler.current_dispatch_policy()
+        ));
 
         scheduler.record_dispatch_class(1);
         assert_eq!(
@@ -5160,13 +5210,21 @@ mod tests {
             .expect("older user context")
             .vruntime_ns = 20;
 
-        assert!(!scheduler.user_reservation_due());
-        assert_eq!(scheduler.reserved_user_pick(current), None);
+        assert!(!Scheduler::user_reservation_due(
+            &scheduler.current_dispatch_policy()
+        ));
+        assert_eq!(
+            scheduler.reserved_user_pick(&scheduler.current_dispatch_policy(), current),
+            None
+        );
 
         scheduler
             .current_dispatch_policy_mut()
             .system_dispatch_streak = MAX_CONSECUTIVE_SYSTEM_DISPATCHES;
-        assert_eq!(scheduler.reserved_user_pick(current), Some(newer_user));
+        assert_eq!(
+            scheduler.reserved_user_pick(&scheduler.current_dispatch_policy(), current),
+            Some(newer_user)
+        );
     }
 
     #[test]
@@ -5330,7 +5388,11 @@ mod tests {
 
         let now_ticks = crate::arch::rtc::ticks_per_second().saturating_mul(2);
         assert_eq!(
-            scheduler.take_overdue_system_or_pick_hint(current, now_ticks),
+            scheduler.take_overdue_system_or_pick_hint(
+                &mut scheduler.current_dispatch_policy(),
+                current,
+                now_ticks
+            ),
             Some(overdue)
         );
         assert_eq!(
@@ -5343,7 +5405,11 @@ mod tests {
             .expect("overdue context")
             .ready = false;
         assert_eq!(
-            scheduler.take_overdue_system_or_pick_hint(current, now_ticks),
+            scheduler.take_overdue_system_or_pick_hint(
+                &mut scheduler.current_dispatch_policy(),
+                current,
+                now_ticks
+            ),
             Some(hinted)
         );
         assert_eq!(scheduler.current_dispatch_policy().next_pick_hint, None);
@@ -5410,7 +5476,8 @@ mod tests {
             None
         );
         assert_eq!(
-            scheduler.take_next_latency_pick_hint_ready_slot(),
+            scheduler
+                .take_next_latency_pick_hint_ready_slot(&mut scheduler.current_dispatch_policy()),
             Some(hinted)
         );
     }
@@ -5482,23 +5549,34 @@ mod tests {
         assert!(scheduler.set_next_latency_pick_hint(903));
         assert!(scheduler.set_next_latency_pick_hint(901));
         assert_eq!(
-            scheduler.take_next_latency_pick_hint_ready_slot(),
+            scheduler
+                .take_next_latency_pick_hint_ready_slot(&mut scheduler.current_dispatch_policy()),
             Some(user_slot)
         );
         assert_eq!(
-            scheduler.take_next_latency_pick_hint_ready_slot(),
+            scheduler
+                .take_next_latency_pick_hint_ready_slot(&mut scheduler.current_dispatch_policy()),
             Some(second_user_slot)
         );
-        assert_eq!(scheduler.take_next_latency_pick_hint_ready_slot(), None);
+        assert_eq!(
+            scheduler
+                .take_next_latency_pick_hint_ready_slot(&mut scheduler.current_dispatch_policy()),
+            None
+        );
 
         assert!(scheduler.set_next_latency_pick_hint(901));
         scheduler
             .current_dispatch_policy_mut()
             .latency_handoff_streak = super::MAX_CONSECUTIVE_LATENCY_HANDOFFS;
-        assert_eq!(scheduler.take_next_latency_pick_hint_ready_slot(), None);
+        assert_eq!(
+            scheduler
+                .take_next_latency_pick_hint_ready_slot(&mut scheduler.current_dispatch_policy()),
+            None
+        );
         scheduler.record_latency_handoff(false);
         assert_eq!(
-            scheduler.take_next_latency_pick_hint_ready_slot(),
+            scheduler
+                .take_next_latency_pick_hint_ready_slot(&mut scheduler.current_dispatch_policy()),
             Some(user_slot)
         );
     }

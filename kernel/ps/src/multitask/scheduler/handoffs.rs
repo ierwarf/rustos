@@ -14,7 +14,8 @@
 //!   `bootstrap-activation-handoff`, and `synchronous-ipc-handoff`.
 
 use super::{
-    MAX_ATOMIC_ACTIVATION_HANDOFFS, MAX_CONSECUTIVE_SYNC_HANDOFFS, Scheduler, TaskContext,
+    CpuDispatchGuard, MAX_ATOMIC_ACTIVATION_HANDOFFS, MAX_CONSECUTIVE_SYNC_HANDOFFS, Scheduler,
+    TaskContext,
 };
 
 impl Scheduler {
@@ -256,17 +257,23 @@ impl Scheduler {
     /// deferred-activation capability, so this order cannot open an
     /// unsupervised execution window. It does prevent a busy wakeup stream
     /// from stretching a committed bootstrap into whole seconds.
-    pub(super) fn take_next_bootstrap_handoff_ready_slot(&mut self) -> Option<(usize, bool)> {
-        self.take_next_spawn_pick_hint_ready_slot()
+    pub(super) fn take_next_bootstrap_handoff_ready_slot(
+        &self,
+        policy: &mut CpuDispatchGuard<'_>,
+    ) -> Option<(usize, bool)> {
+        self.take_next_spawn_pick_hint_ready_slot(policy)
             .map(|slot| (slot, false))
             .or_else(|| {
-                self.take_next_latency_pick_hint_ready_slot()
+                self.take_next_latency_pick_hint_ready_slot(policy)
                     .map(|slot| (slot, true))
             })
     }
 
-    pub(super) fn take_next_spawn_pick_hint_ready_slot(&mut self) -> Option<usize> {
-        while let Some(hint) = self.current_dispatch_policy_mut().spawn_pick_hints.pop() {
+    pub(super) fn take_next_spawn_pick_hint_ready_slot(
+        &self,
+        policy: &mut CpuDispatchGuard<'_>,
+    ) -> Option<usize> {
+        while let Some(hint) = policy.spawn_pick_hints.pop() {
             if let Some(slot) = self.pick_hint_candidate_slot(Some(hint)) {
                 return Some(slot);
             }
@@ -277,26 +284,18 @@ impl Scheduler {
     /// Dispatches only the cohort members covered by one atomic activation
     /// commit. Ordinary thread spawns live in a disjoint FIFO and therefore
     /// cannot consume this custody or disable the bounded first-turn prefix.
-    pub(super) fn take_next_atomic_activation_handoff_ready_slot(&mut self) -> Option<usize> {
+    pub(super) fn take_next_atomic_activation_handoff_ready_slot(
+        &self,
+        policy: &mut CpuDispatchGuard<'_>,
+    ) -> Option<usize> {
         assert!(
-            self.current_dispatch_policy()
-                .atomic_activation_handoff_remaining
-                <= MAX_ATOMIC_ACTIVATION_HANDOFFS,
+            policy.atomic_activation_handoff_remaining <= MAX_ATOMIC_ACTIVATION_HANDOFFS,
             "scheduler atomic activation handoff bound corrupted"
         );
-        while self
-            .current_dispatch_policy()
-            .atomic_activation_handoff_remaining
-            > 0
-        {
-            let hint = {
-                let mut policy = self.current_dispatch_policy_mut();
-                policy.atomic_activation_handoff_remaining -= 1;
-                policy.atomic_activation_pick_hints.pop()
-            };
-            let Some(hint) = hint else {
-                self.current_dispatch_policy_mut()
-                    .atomic_activation_handoff_remaining = 0;
+        while policy.atomic_activation_handoff_remaining > 0 {
+            policy.atomic_activation_handoff_remaining -= 1;
+            let Some(hint) = policy.atomic_activation_pick_hints.pop() else {
+                policy.atomic_activation_handoff_remaining = 0;
                 return None;
             };
             if let Some(slot) = self.pick_hint_candidate_slot(Some(hint)) {
@@ -306,11 +305,14 @@ impl Scheduler {
         None
     }
 
-    pub(super) fn take_next_synchronous_pick_hint_ready_slot(&mut self) -> Option<usize> {
-        if self.current_dispatch_policy().sync_handoff_streak >= MAX_CONSECUTIVE_SYNC_HANDOFFS {
+    pub(super) fn take_next_synchronous_pick_hint_ready_slot(
+        &self,
+        policy: &mut CpuDispatchGuard<'_>,
+    ) -> Option<usize> {
+        if policy.sync_handoff_streak >= MAX_CONSECUTIVE_SYNC_HANDOFFS {
             return None;
         }
-        while let Some(hint) = self.current_dispatch_policy_mut().sync_pick_hints.pop() {
+        while let Some(hint) = policy.sync_pick_hints.pop() {
             if let Some(slot) = self.pick_hint_candidate_slot(Some(hint)) {
                 return Some(slot);
             }

@@ -81,25 +81,36 @@ fn synchronous_ipc_handoff_is_fifo_deduplicated_and_fairness_bounded() {
         Some(overdue)
     );
     assert_eq!(
-        scheduler.take_next_synchronous_pick_hint_ready_slot(),
+        scheduler
+            .take_next_synchronous_pick_hint_ready_slot(&mut scheduler.current_dispatch_policy()),
         Some(first)
     );
     scheduler.record_synchronous_handoff(true);
     assert_eq!(
-        scheduler.take_next_synchronous_pick_hint_ready_slot(),
+        scheduler
+            .take_next_synchronous_pick_hint_ready_slot(&mut scheduler.current_dispatch_policy()),
         Some(second)
     );
 
     assert!(scheduler.set_next_synchronous_pick_hint(912));
     assert!(scheduler.set_next_synchronous_pick_hint(913));
     scheduler.current_dispatch_policy_mut().sync_handoff_streak = MAX_CONSECUTIVE_SYNC_HANDOFFS;
-    assert_eq!(scheduler.take_next_synchronous_pick_hint_ready_slot(), None);
+    assert_eq!(
+        scheduler
+            .take_next_synchronous_pick_hint_ready_slot(&mut scheduler.current_dispatch_policy()),
+        None
+    );
     assert_eq!(scheduler.current_dispatch_policy().sync_pick_hints.len(), 2);
     scheduler.record_synchronous_handoff(false);
     assert_eq!(
-        scheduler.take_next_synchronous_pick_hint_ready_slot(),
+        scheduler
+            .take_next_synchronous_pick_hint_ready_slot(&mut scheduler.current_dispatch_policy()),
         Some(first)
     );
     scheduler.clear_slot(second);
-    assert_eq!(scheduler.take_next_synchronous_pick_hint_ready_slot(), None);
+    assert_eq!(
+        scheduler
+            .take_next_synchronous_pick_hint_ready_slot(&mut scheduler.current_dispatch_policy()),
+        None
+    );
 }

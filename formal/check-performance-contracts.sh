@@ -221,11 +221,17 @@ if rg -Fq 'USER_READY_LATENCY_BOUND_MS' kernel/ps/src/multitask/scheduler.rs; th
     echo "unadmitted User wall-clock deadline bypasses fair-share accounting" >&2
     exit 1
 fi
-rg -Fq 'fn reserved_user_pick(&self, current: usize) -> Option<usize>' \
-    kernel/ps/src/multitask/scheduler.rs || {
-    echo "User reservation is no longer isolated from wall-clock ready age" >&2
+reserved_user_signature=$(sed -n \
+    '/fn reserved_user_pick(/,/-> Option<usize>/p' \
+    kernel/ps/src/multitask/scheduler.rs)
+grep -Fq 'current: usize' <<<"$reserved_user_signature" || {
+    echo "User reservation lost its current-slot argument" >&2
     exit 1
 }
+if grep -Eq 'ticks|now|deadline|latency' <<<"$reserved_user_signature"; then
+    echo "User reservation is no longer isolated from wall-clock ready age" >&2
+    exit 1
+fi
 rg -Fq 'background_probe_rank' services/runtimed/src/catalog.rs || {
     echo "background network probe can block the interactive launch path" >&2
     exit 1
@@ -582,7 +588,7 @@ rg -Fq 'sync_pick_hints: SlotHandoffQueue<MAX_TASK>' \
     echo "synchronous IPC peers no longer have complete bounded FIFO custody" >&2
     exit 1
 }
-rg -Uq 'let atomic_activation_handoff = self\.take_next_atomic_activation_handoff_ready_slot\(\);[\s\S]{0,500}let sync_handoff = if atomic_activation_handoff\.is_none\(\)[\s\S]{0,500}take_next_synchronous_pick_hint_ready_slot\(\)[\s\S]{0,800}match atomic_activation_handoff[\s\S]{0,800}match sync_handoff[\s\S]{0,500}mandatory_overdue_system_pick' \
+rg -Uq 'let atomic_activation_handoff =[\s\S]{0,200}take_next_atomic_activation_handoff_ready_slot\([^)]*\)[\s\S]{0,500}let sync_handoff = if atomic_activation_handoff\.is_none\(\)[\s\S]{0,500}take_next_synchronous_pick_hint_ready_slot\([^)]*\)[\s\S]{0,800}match atomic_activation_handoff[\s\S]{0,800}match sync_handoff[\s\S]{0,500}mandatory_overdue_system_pick' \
     kernel/ps/src/multitask/scheduler.rs || {
     echo "atomic activation or synchronous IPC handoff no longer precedes unrelated overdue work" >&2
     exit 1

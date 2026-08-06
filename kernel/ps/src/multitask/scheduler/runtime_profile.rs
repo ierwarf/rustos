@@ -94,6 +94,9 @@ pub(in crate::multitask) struct SchedulerRuntimeProfile {
     pub(in crate::multitask) pick_scan_calls: u64,
     pub(in crate::multitask) handoff_scan_ns: u64,
     pub(in crate::multitask) handoff_scan_calls: u64,
+    /// Per-member cost of the handoff chain, in the order the chain runs them.
+    /// `(ns, calls)`; steps two and five overlap `handoff_scan_ns`.
+    pub(in crate::multitask) handoff_steps: [(u64, u64); super::locality::HANDOFF_STEP_COUNT],
     pub(in crate::multitask) phase_ns: [u64; SCHEDULER_PHASE_COUNT],
     pub(in crate::multitask) runnable_samples: u64,
     /// First slot whose lock-free identity record disagrees with the
@@ -257,6 +260,23 @@ pub fn drain_scheduler_runtime_profile() -> usize {
         profile.handoff_scan_ns / 1_000,
         profile.handoff_scan_calls,
     );
+    // The chain's own six members, in run order. Everything the two scans above
+    // do not explain is here. arg0=us, arg1=calls.
+    for (step, name) in [
+        "kernel-scheduler-step-activation",
+        "kernel-scheduler-step-sync",
+        "kernel-scheduler-step-overdue",
+        "kernel-scheduler-step-bootstrap",
+        "kernel-scheduler-step-blocking-hint",
+        "kernel-scheduler-step-overdue-hint",
+        "kernel-scheduler-step-acquire",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (ns, calls) = profile.handoff_steps[step];
+        crate::debug::record_milestone(crate::debug::LogCategory::Sched, name, ns / 1_000, calls);
+    }
     // Owner publication plus the deferred wake drain, which every acquisition
     // pays before its caller runs. arg0=prologue us, arg1=wakes drained.
     crate::debug::record_milestone(
@@ -571,6 +591,7 @@ impl Scheduler {
                 ns
             },
             handoff_scan_calls,
+            handoff_steps: super::locality::take_handoff_step_window(),
             phase_ns: self.runtime_profile_phase_ns,
             runnable_samples: self.runtime_profile_runnable_samples,
             divergent_identity_slot: self.divergent_published_identity().unwrap_or(usize::MAX),
@@ -733,6 +754,7 @@ mod tests {
             pick_scan_calls: 0,
             handoff_scan_ns: 0,
             handoff_scan_calls: 0,
+            handoff_steps: [(0, 0); super::locality::HANDOFF_STEP_COUNT],
             phase_ns: [0; SCHEDULER_PHASE_COUNT],
             runnable_samples: 0,
             divergent_identity_slot: usize::MAX,
