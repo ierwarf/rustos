@@ -298,10 +298,7 @@ fn collect_one_poll_fd(
             {
                 return Err(LINUX_EBADF);
             }
-            let (ready, generation) = match input_device_readiness_for_access_with_timeout(
-                access,
-                waitset_provider_query_timeout_ms(deadline_tick),
-            ) {
+            let (ready, generation) = match input_readiness_for_access(access, deadline_tick) {
                 Ok(result) => result,
                 Err(errno) if provider_revoke_events(errno).is_some() => {
                     return Ok(provider_revoke_events(errno).unwrap());
@@ -395,6 +392,34 @@ fn transient_waitset_scan_error(errno: i64) -> bool {
     // under the original application deadline so a late reply cannot kill an
     // otherwise valid wait set.
     errno == LINUX_EPIPE
+}
+
+/// inputd's readiness for one access ABI, from what it has published if it has
+/// published anything, and from a bounded query only until it has.
+///
+/// The query is the fallback, not the rule. It is a synchronous round trip to
+/// a service that also does bulk decode work, and it runs on the wait-set scan
+/// path - every `epoll_wait` and every `poll`. One answer arriving past
+/// `WAITSET_PROVIDER_QUERY_TIMEOUT_MS` desynchronises caller and service
+/// permanently, because the caller cancels its reply and the service's next
+/// reply always answers the question before the one being asked. A measured
+/// 90-second run froze the pointer that way at t=21.3s: sixteen
+/// `ipc-service-reply-timeout` records, then ninety-eight consecutive rejected
+/// inputd replies, and an `epoll_wait` that never returned again.
+fn input_readiness_for_access(
+    access: u16,
+    deadline_tick: Option<u64>,
+) -> Result<(bool, u64), i64> {
+    if let Some(published) = super::super::broker_ops::waitset_broker_ops::published_provider_readiness(
+        WAITSET_PROVIDER_INPUTD,
+        waitset_input_object_id(access),
+    ) {
+        return Ok(published);
+    }
+    input_device_readiness_for_access_with_timeout(
+        access,
+        waitset_provider_query_timeout_ms(deadline_tick),
+    )
 }
 
 fn waitset_provider_query_timeout_ms(deadline_tick: Option<u64>) -> u64 {
@@ -1093,10 +1118,8 @@ fn collect_epoll_readiness(
                         interest.object_id,
                     )
                     .ok_or(LINUX_EBADF)?;
-                    let (is_ready, generation) = input_device_readiness_for_access_with_timeout(
-                        access,
-                        waitset_provider_query_timeout_ms(deadline_tick),
-                    )?;
+                    let (is_ready, generation) =
+                        input_readiness_for_access(access, deadline_tick)?;
                     merge_provider_observation(
                         &mut observations,
                         super::super::broker_ops::waitset_broker_ops::ProviderObservation {

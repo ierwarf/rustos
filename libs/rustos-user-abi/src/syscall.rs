@@ -454,6 +454,19 @@ pub const WAITSET_INPUT_NATIVE_OBJECT_ID: u64 = 1;
 pub const WAITSET_INPUT_EVDEV_OBJECT_ID: u64 = 2;
 pub const WAITSET_MAX_INTERESTS: usize = 512;
 
+/// The signalled object has data a reader can take right now.
+///
+/// A signal used to carry only "something changed", which left ring0 unable to
+/// answer a readiness question without asking the provider over IPC. That
+/// query is bounded at 16 ms and the provider is a service that also does bulk
+/// work, so one late answer desynchronises the two permanently: the caller
+/// abandons the reply, the provider's late reply is rejected, and every
+/// subsequent reply answers a question that was already abandoned. A measured
+/// run froze the pointer exactly that way at t=21.3s and never recovered.
+/// Carrying the readiness itself in the signal is what removes the query.
+pub const WAITSET_SIGNAL_FLAG_READY: u32 = 1;
+pub const WAITSET_SIGNAL_FLAG_MASK: u32 = WAITSET_SIGNAL_FLAG_READY;
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct WaitSetSignalBrokerArgs {
@@ -472,7 +485,7 @@ pub const fn waitset_signal_shape_valid(args: &WaitSetSignalBrokerArgs) -> bool 
     args.abi_version == WAITSET_ABI_VERSION
         && args.provider >= WAITSET_PROVIDER_VFSD
         && args.provider <= WAITSET_PROVIDER_MAX
-        && args.flags == 0
+        && args.flags & !WAITSET_SIGNAL_FLAG_MASK == 0
         && args.object_id != 0
         && args.generation != 0
         && args.reserved0 == 0
@@ -499,7 +512,7 @@ mod waitset_signal_verification {
             assert_eq!(args.abi_version, WAITSET_ABI_VERSION);
             assert!(args.provider >= WAITSET_PROVIDER_VFSD);
             assert!(args.provider <= WAITSET_PROVIDER_MAX);
-            assert_eq!(args.flags, 0);
+            assert_eq!(args.flags & !WAITSET_SIGNAL_FLAG_MASK, 0);
             assert_ne!(args.object_id, 0);
             assert_ne!(args.generation, 0);
             assert_eq!(args.reserved0, 0);
@@ -519,7 +532,7 @@ mod waitset_signal_verification {
         let malformed = args.abi_version != WAITSET_ABI_VERSION
             || args.provider < WAITSET_PROVIDER_VFSD
             || args.provider > WAITSET_PROVIDER_MAX
-            || args.flags != 0
+            || args.flags & !WAITSET_SIGNAL_FLAG_MASK != 0
             || args.object_id == 0
             || args.generation == 0
             || args.reserved0 != 0;

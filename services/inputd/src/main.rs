@@ -55,6 +55,7 @@ use rustos_user_abi::syscall::{
 use rustos_user_abi::syscall::{
     WaitSetSignalBrokerArgs, SYS_RUSTOS_WAITSET_SIGNAL_BROKER, WAITSET_ABI_VERSION,
     WAITSET_INPUT_EVDEV_OBJECT_ID, WAITSET_INPUT_NATIVE_OBJECT_ID, WAITSET_PROVIDER_INPUTD,
+    WAITSET_SIGNAL_FLAG_READY,
 };
 
 // The DVM ingestion worker waits on the MSI-X-published ring and transfers
@@ -238,7 +239,7 @@ impl InputQueue {
         let was_empty = self.events.is_empty();
         self.events.push_back(event);
         if was_empty {
-            self.advance_readiness_generation(true);
+            self.advance_readiness_generation();
         }
     }
 
@@ -274,19 +275,25 @@ impl InputQueue {
     fn pop_front(&mut self) -> Option<input_evdev::InputEvent> {
         let event = self.events.pop_front();
         if event.is_some() && self.events.is_empty() {
-            self.advance_readiness_generation(false);
+            self.advance_readiness_generation();
         }
         event
     }
 
-    fn advance_readiness_generation(&mut self, publish: bool) {
+    /// Publish every readiness transition, in both directions.
+    ///
+    /// Only the arrival edge used to be published, so ring0 knew when the
+    /// queue filled but never when it drained, and could not answer a
+    /// readiness question from what it already held - it had to ask over IPC.
+    /// A queue that goes empty is a readiness fact of exactly the same kind as
+    /// one that goes non-empty, and publishing both is what lets the waitset
+    /// answer locally.
+    fn advance_readiness_generation(&mut self) {
         self.readiness_generation = self
             .readiness_generation
             .checked_add(1)
             .expect("inputd readiness generation exhausted");
-        if publish {
-            publish_readiness_generation(self.readiness_generation);
-        }
+        publish_readiness(self.readiness_generation, !self.events.is_empty());
     }
 
     fn set_pointer_surface(&mut self, width: u32, height: u32, generation: u64) -> Result<(), i32> {
@@ -1335,11 +1342,12 @@ fn fetch_stats(queue: &InputQueue) -> Result<InputStatsWire, i32> {
     Ok(stats)
 }
 
-fn publish_readiness_generation(generation: u64) {
+fn publish_readiness(generation: u64, ready: bool) {
     #[cfg(test)]
-    let _ = generation;
+    let _ = (generation, ready);
     #[cfg(not(test))]
     {
+        let flags = if ready { WAITSET_SIGNAL_FLAG_READY } else { 0 };
         for object_id in [
             WAITSET_INPUT_NATIVE_OBJECT_ID,
             WAITSET_INPUT_EVDEV_OBJECT_ID,
@@ -1347,7 +1355,7 @@ fn publish_readiness_generation(generation: u64) {
             let args = WaitSetSignalBrokerArgs {
                 abi_version: WAITSET_ABI_VERSION,
                 provider: WAITSET_PROVIDER_INPUTD,
-                flags: 0,
+                flags,
                 object_id,
                 generation,
                 reserved0: 0,
@@ -1357,7 +1365,7 @@ fn publish_readiness_generation(generation: u64) {
                 (&args as *const WaitSetSignalBrokerArgs) as u64,
             );
             if result < 0 {
-                debug_line("inputd: readiness generation publication failed");
+                debug_line("inputd: readiness publication failed");
                 std::process::exit(134);
             }
         }

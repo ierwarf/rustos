@@ -17,12 +17,13 @@
 // own readiness state and generations; every wake is followed by a provider
 // recheck before Linux-visible readiness is returned.
 use super::*;
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use lazy_static::lazy_static;
 use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
 use rustos_user_abi::syscall::{
     WAITSET_MAX_INTERESTS, WAITSET_PROVIDER_INPUTD, WAITSET_PROVIDER_MAX, WAITSET_PROVIDER_NETD,
-    WAITSET_PROVIDER_SESSIOND, WAITSET_PROVIDER_VFSD, WaitSetSignalBrokerArgs,
-    waitset_signal_shape_valid,
+    WAITSET_PROVIDER_SESSIOND, WAITSET_PROVIDER_VFSD, WAITSET_SIGNAL_FLAG_READY,
+    WaitSetSignalBrokerArgs, waitset_signal_shape_valid,
 };
 // Preallocated system-wide observation slab. One task may arm the ABI maximum;
 // the remaining capacity admits ordinary multi-provider waits concurrently.
@@ -65,6 +66,114 @@ lazy_static! {
         [Option<InputOpenDescription>; INPUT_OPEN_DESCRIPTION_CAPACITY],
         { LockClass::InputOpenDescription as u8 },
     > = TrackedSpinLock::new([None; INPUT_OPEN_DESCRIPTION_CAPACITY]);
+}
+
+/// The last readiness a provider published for one object.
+///
+/// Answering "is this object readable" used to require an IPC round trip to the
+/// owning service on every wait-set scan, bounded at
+/// `WAITSET_PROVIDER_QUERY_TIMEOUT_MS`. That bound races the same service's
+/// bulk work, and losing the race once is permanent: the caller cancels its
+/// reply, the service's late reply is rejected, and from then on every reply
+/// answers an abandoned question. The provider already publishes a signal on
+/// every transition, so the readiness it implies is a fact ring0 can keep.
+///
+/// Slots are claimed once and never released - the set of readiness objects is
+/// small and stable, and a slot that could be recycled would let a stale
+/// generation reappear under a new identity.
+struct PublishedReadiness {
+    /// Non-zero once claimed. Written last, with release ordering, so a reader
+    /// that observes it also observes `object_id`.
+    provider: AtomicU32,
+    object_id: AtomicU64,
+    /// `generation << 1 | ready`. One word so the pair cannot be torn.
+    state: AtomicU64,
+}
+
+const PUBLISHED_READINESS_CAPACITY: usize = 16;
+
+#[allow(
+    clippy::declare_interior_mutable_const,
+    reason = "array initialiser for per-slot atomics; each slot is a distinct object"
+)]
+const PUBLISHED_READINESS_INIT: PublishedReadiness = PublishedReadiness {
+    provider: AtomicU32::new(0),
+    object_id: AtomicU64::new(0),
+    state: AtomicU64::new(0),
+};
+
+static PUBLISHED_READINESS: [PublishedReadiness; PUBLISHED_READINESS_CAPACITY] =
+    [PUBLISHED_READINESS_INIT; PUBLISHED_READINESS_CAPACITY];
+
+fn publish_provider_readiness(provider: u16, object_id: u64, generation: u64, ready: bool) {
+    let state = (generation << 1) | u64::from(ready);
+    for slot in PUBLISHED_READINESS.iter() {
+        // ORDERING: Acquire pairs with the Release claim below, so a reader
+        // that sees the provider also sees the object id it was claimed for.
+        let claimed = slot.provider.load(Ordering::Acquire);
+        if claimed == u32::from(provider) && slot.object_id.load(Ordering::Relaxed) == object_id {
+            store_readiness_if_newer(slot, state);
+            return;
+        }
+        if claimed != 0 {
+            continue;
+        }
+        // ORDERING: Relaxed is exact here; the Release in the claim below is
+        // what publishes this store to any reader that observes the provider.
+        slot.object_id.store(object_id, Ordering::Relaxed);
+        // ORDERING: AcqRel claims the slot and releases the object id written
+        // above; Acquire on failure observes the winner's claim.
+        if slot
+            .provider
+            .compare_exchange(0, u32::from(provider), Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            store_readiness_if_newer(slot, state);
+            return;
+        }
+    }
+}
+
+/// A generation never moves backwards, so a publication that lost a race to a
+/// newer one must not overwrite it.
+fn store_readiness_if_newer(slot: &PublishedReadiness, state: u64) {
+    // ORDERING: Acquire pairs with the AcqRel publication below so a competing
+    // publisher's newer generation is never overwritten by an older one.
+    let mut current = slot.state.load(Ordering::Acquire);
+    while state > current {
+        // ORDERING: AcqRel publishes the readiness word; Acquire on failure
+        // observes the concurrent publication and re-tests the generation.
+        match slot
+            .state
+            .compare_exchange(current, state, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => return,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+/// The readiness and generation a provider last published, if it has published
+/// at all. `None` means the wait set must fall back to asking the service.
+pub(crate) fn published_provider_readiness(provider: u16, object_id: u64) -> Option<(bool, u64)> {
+    for slot in PUBLISHED_READINESS.iter() {
+        // ORDERING: Acquire on the provider pairs with the claim's Release, so
+        // a slot that matches has its object id and state already visible;
+        // Relaxed is therefore exact for the id.
+        if slot.provider.load(Ordering::Acquire) == u32::from(provider)
+            && slot.object_id.load(Ordering::Relaxed) == object_id
+        {
+            // ORDERING: Acquire pairs with the publisher's AcqRel so readiness
+            // is never read older than the generation it is reported with.
+            let state = slot.state.load(Ordering::Acquire);
+            let generation = state >> 1;
+            if generation == 0 {
+                return None;
+            }
+            return Some((state & 1 != 0, generation));
+        }
+    }
+    None
 }
 
 pub(crate) fn register_input_open_description(token: u64, access: u16) -> Result<(), i64> {
@@ -264,6 +373,12 @@ pub(super) fn syscall_linux_rustos_waitset_signal_broker(args_ptr: u64) -> u64 {
     if !ipc_ops::process_owns_live_service_endpoint(process_id, service_id) {
         return linux_errno(LINUX_EPERM);
     }
+    publish_provider_readiness(
+        args.provider,
+        args.object_id,
+        args.generation,
+        args.flags & WAITSET_SIGNAL_FLAG_READY != 0,
+    );
     wake_matching(args.provider, Some(args.object_id), Some(args.generation));
     0
 }

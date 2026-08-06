@@ -822,14 +822,29 @@ pub fn read_input_device_via_inputd(
         request.pid = snapshot.process_id();
         request.tid = snapshot.thread_id();
     }
+    // A bound that expires is "nothing for you yet", not a failure, for a
+    // reader that opened the descriptor non-blocking - the same rule the socket
+    // halves follow. Leaking `ETIMEDOUT` here is what turned a busy inputd into
+    // a dead compositor: uiserver's input reader logged the timeout as an
+    // error, spun, fell to 2 Hz, stopped sending frame callbacks, and WayClick
+    // sat on its blocking display read for the full 30,000 ms bulk rail. One
+    // measured window recorded exactly that: `max_callback_gap_ms=30005`.
+    let nonblocking = status_flags & linux_abi::O_NONBLOCK != 0;
+    let timed_out_is_empty = |errno: i64| {
+        if nonblocking && errno == LINUX_ETIMEDOUT {
+            LINUX_EAGAIN
+        } else {
+            errno
+        }
+    };
     request.op = INPUTD_IPC_OP_AUTHORIZE_READ;
     if let Err(errno) = call_inputd_ipc_request(&request) {
-        return linux_errno(errno);
+        return linux_errno(timed_out_is_empty(errno));
     }
     request.op = INPUTD_IPC_OP_READ;
     let response = match call_inputd_read_request(&request) {
         Ok(response) => response,
-        Err(errno) => return linux_errno(errno),
+        Err(errno) => return linux_errno(timed_out_is_empty(errno)),
     };
     if response.payload_len as u64 > request.requested_len {
         return linux_errno(LINUX_EINVAL);
