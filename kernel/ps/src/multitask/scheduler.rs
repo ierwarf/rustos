@@ -1321,24 +1321,6 @@ impl Scheduler {
         self.overdue_system_pick(current, now_ticks)
     }
 
-    /// Selects an overdue strict-class continuation before an unrelated IPC
-    /// hint. A blocked caller's exact causal handoff is handled earlier in
-    /// `dispatch_schedule`; this helper covers only the ordinary runnable
-    /// case, where a continuous stream of fresh hints must not keep a
-    /// preempted System task inside a kernel transaction off-CPU forever.
-    ///
-    /// The hint remains pending when the overdue task wins, so the direct IPC
-    /// handoff is delayed by one bounded recovery turn rather than discarded.
-    fn take_overdue_system_or_pick_hint(
-        &self,
-        policy: &mut CpuDispatchGuard<'_>,
-        current: usize,
-        now_ticks: u64,
-    ) -> Option<usize> {
-        self.overdue_system_pick(current, now_ticks)
-            .or_else(|| self.take_next_pick_hint_ready_slot(policy))
-    }
-
     fn user_reservation_due(policy: &CpuDispatchGuard<'_>) -> bool {
         policy.system_dispatch_streak >= MAX_CONSECUTIVE_SYSTEM_DISPATCHES
     }
@@ -2722,12 +2704,23 @@ impl Scheduler {
                                                             (user_slot, false, Some(user_slot))
                                                         }
                                                         None => {
+                                                            // Overdue System work was already
+                                                            // offered `mandatory_overdue`, from
+                                                            // the same scan with the same
+                                                            // arguments, and reaching here means
+                                                            // it found nothing. Nothing between
+                                                            // the two touches readiness, class,
+                                                            // or the local queue, so a second
+                                                            // scan can only return None; it cost
+                                                            // 1.0 us of every dispatch. The
+                                                            // ordering it expressed is stronger
+                                                            // now, not weaker: overdue is offered
+                                                            // before the hint and before the
+                                                            // bootstrap and reservation arms too.
                                                             let overdue_or_hint =
                                                                 timed_handoff_step(5, || {
-                                                                    self.take_overdue_system_or_pick_hint(
+                                                                    self.take_next_pick_hint_ready_slot(
                                                                         &mut policy,
-                                                                        current_slot,
-                                                                        now_ticks,
                                                                     )
                                                                 });
                                                             let cfs_pick = if voluntary_yield {
@@ -5386,13 +5379,14 @@ mod tests {
         scheduler.current_task = current;
         scheduler.set_next_pick_hint(813);
 
+        // The chain offers overdue System work once, ahead of the hint, and
+        // leaves the hint pending when it wins. The second half also pins the
+        // premise that lets the chain scan once instead of twice: with the
+        // overdue task gone the same scan returns None, so re-running it before
+        // the hint could never have changed the outcome.
         let now_ticks = crate::arch::rtc::ticks_per_second().saturating_mul(2);
         assert_eq!(
-            scheduler.take_overdue_system_or_pick_hint(
-                &mut scheduler.current_dispatch_policy(),
-                current,
-                now_ticks
-            ),
+            scheduler.mandatory_overdue_system_pick(current, now_ticks),
             Some(overdue)
         );
         assert_eq!(
@@ -5405,11 +5399,11 @@ mod tests {
             .expect("overdue context")
             .ready = false;
         assert_eq!(
-            scheduler.take_overdue_system_or_pick_hint(
-                &mut scheduler.current_dispatch_policy(),
-                current,
-                now_ticks
-            ),
+            scheduler.mandatory_overdue_system_pick(current, now_ticks),
+            None
+        );
+        assert_eq!(
+            scheduler.take_next_pick_hint_ready_slot(&mut scheduler.current_dispatch_policy()),
             Some(hinted)
         );
         assert_eq!(scheduler.current_dispatch_policy().next_pick_hint, None);
