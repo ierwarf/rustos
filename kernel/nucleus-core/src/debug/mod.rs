@@ -602,7 +602,7 @@ fn emit_milestone_debugcon_line(record: MilestoneRecord) {
             }
             let _ = write!(
                 writer,
-                " msg=\"milestone seq={} cat={} name={} arg0={:#x} arg1={:#x} dropped={}\"\r\n",
+                " msg=\"milestone seq={} cat={} name={} arg0={:#x} arg1={:#x} dropped={} discarded_bytes={}\"\r\n",
                 record.seq,
                 record.category.as_str(),
                 record.name,
@@ -611,6 +611,10 @@ fn emit_milestone_debugcon_line(record: MilestoneRecord) {
                 // ORDERING: Relaxed is sufficient; this is a monotonic loss
                 // count, not a publication of any other state.
                 MILESTONES_DROPPED.load(Ordering::Relaxed),
+                // The userspace evidence path has its own loss, and it is the
+                // one the acceptance proof reads. Report it beside the
+                // milestone loss so neither can be mistaken for the other.
+                DEBUG_BYTES_DISCARDED.load(Ordering::Relaxed),
             );
             return;
         }
@@ -899,14 +903,51 @@ pub fn write_bytes(bytes: &[u8]) {
 #[cfg(not(rustos_debug_print_enabled))]
 pub fn write_bytes(_bytes: &[u8]) {}
 
+/// Bounded retries before a userspace debug write gives up on the output lock.
+///
+/// The lock is held with interrupts disabled, so a failed try always means the
+/// holder is a different CPU that is running and will release. Waiting for it is
+/// therefore safe, and a single attempt is not enough: at 8 vCPU the kernel,
+/// uiserver, inputd, and the client all print, and a lost race discarded the
+/// bytes outright.
+///
+/// That silence had teeth. The acceptance proof needs 60 consecutive one-second
+/// WayClick windows, and window sequence numbers showed the transport losing
+/// them - `window=0 1 2 3 5`, with four gone and no record that anything was
+/// missing. An evidence channel that drops evidence cannot be used to fail a
+/// proof, and it had been failing one.
+#[cfg(rustos_debug_print_enabled)]
+const DEBUG_OUTPUT_ACQUIRE_ATTEMPTS: usize = 4096;
+
+#[cfg(rustos_debug_print_enabled)]
+static DEBUG_BYTES_DISCARDED: AtomicU64 = AtomicU64::new(0);
+
+/// Bytes the debug transport discarded because the output lock stayed held.
+#[cfg(rustos_debug_print_enabled)]
+pub fn discarded_debug_bytes() -> u64 {
+    DEBUG_BYTES_DISCARDED.load(Ordering::Relaxed)
+}
+
+#[cfg(not(rustos_debug_print_enabled))]
+pub fn discarded_debug_bytes() -> u64 {
+    0
+}
+
 #[cfg(rustos_debug_print_enabled)]
 pub fn write_debugcon_only(bytes: &[u8]) {
     if bytes.is_empty() {
         return;
     }
-    if let Some(_guard) = try_debug_output_lock() {
-        print_bytes_unlocked(bytes);
+    for _ in 0..DEBUG_OUTPUT_ACQUIRE_ATTEMPTS {
+        if let Some(_guard) = try_debug_output_lock() {
+            print_bytes_unlocked(bytes);
+            return;
+        }
+        core::hint::spin_loop();
     }
+    // ORDERING: Relaxed. A diagnostic counter with no other state attached,
+    // read only by the once-per-second milestone burst.
+    DEBUG_BYTES_DISCARDED.fetch_add(bytes.len() as u64, Ordering::Relaxed);
 }
 
 #[cfg(not(rustos_debug_print_enabled))]

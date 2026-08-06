@@ -485,6 +485,17 @@ mod damage_tests {
 
 struct FrameProfile {
     enabled: bool,
+    /// Monotonic index of the window being reported.
+    ///
+    /// The acceptance proof needs 60 consecutive one-second windows and saw 40
+    /// in about 85 seconds of wall time, with a 40 ms worst callback gap across
+    /// all of them. Those two facts do not fit together: a client that never
+    /// paused longer than 40 ms cannot have lost half the run. Either the
+    /// windows were emitted and the lines did not survive the log the proof
+    /// parses, or the client really did stop. A sequence number separates them -
+    /// contiguous indices with a short run means the client stopped, gaps mean
+    /// the transport dropped the evidence.
+    window: u64,
     started_at: Instant,
     last_callback_at: Option<Instant>,
     redraw_requests: u64,
@@ -501,6 +512,7 @@ impl FrameProfile {
     fn new() -> Self {
         Self {
             enabled: profile_enabled(),
+            window: 0,
             started_at: Instant::now(),
             last_callback_at: None,
             redraw_requests: 0,
@@ -551,7 +563,8 @@ impl FrameProfile {
             .saturating_mul(1_000_000_000)
             .saturating_div(elapsed_micros);
         raw_stderr_line(&format!(
-            "wayclick profile: elapsed_ms={} commit_hz_milli={} callback_hz_milli={} redraw_requests={} pointer_updates={} commits={} callbacks={} buffer_releases={} max_callback_gap_ms={} redraw_ms={} max_redraw_ms={} callback_in_flight={} redraw_pending={}",
+            "wayclick profile: window={} elapsed_ms={} commit_hz_milli={} callback_hz_milli={} redraw_requests={} pointer_updates={} commits={} callbacks={} buffer_releases={} max_callback_gap_ms={} redraw_ms={} max_redraw_ms={} callback_in_flight={} redraw_pending={}",
+            self.window,
             elapsed_micros / 1_000,
             commit_hz_milli,
             callback_hz_milli,
@@ -566,6 +579,7 @@ impl FrameProfile {
             u8::from(callback_in_flight),
             u8::from(redraw_pending),
         ));
+        self.window = self.window.saturating_add(1);
         self.started_at = now;
         self.redraw_requests = 0;
         self.pointer_updates = 0;
