@@ -757,3 +757,76 @@ Update this page only when preparing another handoff or when the live goal,
 major blocker, hardware safety boundary, or validation ownership changes.
 Keep durable architecture in the focused AI contracts and detailed pass/fail
 evidence in its owning ledger; do not duplicate either here.
+
+## Session: the transient-as-terminal family, and the callback throttle
+
+Ten commits, `bef5f85..7aef2a2`. One change was reverted unshipped and is
+recorded below because the reason it failed is the useful part.
+
+### Scheduler critical section
+
+The `SelectHandoff` chain was self-timed per member. Every step cost 0.95 to
+2.5 us regardless of its work, and two controls explained it: an empty timed
+span read 0.032 us, one acquisition of the per-CPU dispatch policy read
+0.724 us. The chain took that lock about ten times per dispatch. It now takes it
+once and threads the guard; `reserved_user_pick` reaching `user_reservation_due`
+was the re-entrant path lockdep caught with `recursive lock-class acquisition
+class=42`.
+
+Separately, `take_overdue_system_or_pick_hint` re-ran `overdue_system_pick` with
+the same arguments four arms after `mandatory_overdue_system_pick`, so it could
+only return `None`. Deleted.
+
+Chain cost per dispatch: **7.39 -> 2.50 -> 1.50 us**. Lock hold duty at 8 vCPU:
+**60% -> 27%**. `SelectHandoff` is no longer the dominant segment (20%, against
+Commit 17% and Balance 15%).
+
+### Five defects of one shape
+
+Each was a transient condition returned as a terminal error, each reproduced,
+each verified gone:
+
+1. `bind_reserved_ipc_priority` failure cancelled its own reply and returned
+   `ENOSPC`, which surfaced as uiserver dying in a thread spawn with "failed to
+   allocate an alternative stack: No space left on device".
+2. `read_header` sampled the ring cursors producer-first, so a concurrent
+   consumer advance looked like corruption and revoked the transport.
+3. An all-zero header prefix is an unpublished aperture, not a corrupt one. The
+   field-level rejection record (`arg1=0x5f`) is what separated them.
+4. The inputd read took the bulk rail, 30,000 ms, against uiserver's own 3,000 ms
+   input watchdog. Nonblocking reads now take the interactive rail.
+5. Both halves of a nonblocking socket took the bulk rail. The send half was the
+   one still blocking Wayland dispatch.
+
+### The one that was reverted
+
+Bounding the socket receive while letting `ETIMEDOUT` reach the caller. Two
+windows, a 30,013 ms callback gap. The Wayland dispatch model treats `EAGAIN` as
+the ordinary answer on a ready-but-empty socket and anything else as a broken
+client, so the bound has to report `EAGAIN`. Re-landed with that mapping.
+
+### Frame rate
+
+`PresentUpdateResult::Idle` did not regrant the frame-callback permit, so a
+client with nothing new to show blocked in `blocking_dispatch`, sent no protocol
+input, and left `wayland_service_required` false - each side waiting for the
+other. Regranting doubled the measured rate: **111.8-141.0 Hz -> 259.2-288.0 Hz**,
+worst callback gap 39 ms, against a 55 Hz floor.
+
+### Where the gate stands
+
+Not met. Rates are far above target and window numbers are contiguous, so the
+shortfall is run length, not lost evidence. Runs still end for varying reasons;
+the last two were an input-ring credit timeout with the ring at its 1279-slot
+limit after 1695 relayed events, and the plain 90-second deadline at nine
+windows. The credit timeout is a consumer falling behind, not a frame-path
+problem.
+
+### Open
+
+- `V5-GPU-UI-OWNER-014`, the general owner split. Every fix above is the narrow
+  form of it; the design doc §4.2 has the shape.
+- `V5-SCHED-GLOBAL-001` stage 4. Optional by §2.1c's own criterion now that hold
+  duty is 27%, but the item is open.
+- Why WayClick accumulates only single-digit consecutive windows in 85 seconds.
+  `frame_seq` now joins both completions, which is the instrument for it.
