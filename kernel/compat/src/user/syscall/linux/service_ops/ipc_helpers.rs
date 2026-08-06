@@ -1558,11 +1558,28 @@ fn apply_devmgrd_ioctl_payload(
 
 pub fn call_inputd_read_request(request: &InputdIpcRequest) -> Result<InputdReadResponse, i64> {
     let start_ticks = crate::arch::rtc::ticks();
-    let response = ipc_ops::call_service_endpoint_with_class(
-        IPC_SERVICE_INPUTD,
-        as_bytes(request),
-        ipc_ops::ServiceIpcClass::BulkData,
-    )?;
+    // A nonblocking read cannot legitimately need the bulk-data rail. Its
+    // contract is to answer now or report that there is nothing, so a caller
+    // that waits 30 seconds for one is not waiting on data - it is waiting on a
+    // wedged service, and `EAGAIN` is a complete answer.
+    //
+    // The rail mattered: uiserver's input reader panics its own process at
+    // 3,000 ms, ten times sooner than this deadline can return anything, so the
+    // read had no path to report the stall it was in. Measured at 8 vCPU it
+    // took exactly that route - "read_input blocked elapsed_ms=3106
+    // read_attempts=507 completed_reads=506" - and the compositor teardown that
+    // followed ended the FPS proof at ten windows.
+    //
+    // A blocking read keeps the bulk rail. Its completion wait is genuinely
+    // open-ended, and cancelling one mid-authorization is what the cancellable
+    // authorization lease this file already notes has to land first.
+    let class = if request.flags & INPUTD_READ_FLAG_NONBLOCK != 0 {
+        ipc_ops::ServiceIpcClass::InteractiveControl
+    } else {
+        ipc_ops::ServiceIpcClass::BulkData
+    };
+    let response =
+        ipc_ops::call_service_endpoint_with_class(IPC_SERVICE_INPUTD, as_bytes(request), class)?;
     let detail = if request.flags & INPUTD_READ_FLAG_NONBLOCK != 0 {
         Some("nonblock")
     } else {
