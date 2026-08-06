@@ -669,6 +669,11 @@ fn milestone_requires_reliable_output(name: &str) -> bool {
         // which is how the fail-closed version of this path stayed hidden until
         // it killed the compositor.
         || name.starts_with("ipc-donation-")
+        // Input-ring lifecycle transitions. The L0 relay fails the whole proof
+        // when readiness disappears under it, and until these existed the only
+        // account of the transition lived in `debug::warn!`, which the product
+        // configuration does not route anywhere.
+        || name.starts_with("dvm-input-")
 }
 
 #[cfg(rustos_debug_print_enabled)]

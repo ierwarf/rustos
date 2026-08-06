@@ -270,14 +270,25 @@ fn try_install_serialized() -> bool {
         release_mapping(ring.mapped);
         return false;
     };
-    let flags = read_u32(ring.mapped, DVM_INPUT_RING_FLAGS_OFFSET)
-        & !DVM_INPUT_RING_FLAG_POLICY_CONSUMER_READY;
+    let previous_flags = read_u32(ring.mapped, DVM_INPUT_RING_FLAGS_OFFSET);
+    let flags = previous_flags & !DVM_INPUT_RING_FLAG_POLICY_CONSUMER_READY;
     write_u32(
         ring.mapped,
         DVM_INPUT_RING_FLAGS_OFFSET,
         flags | DVM_INPUT_RING_FLAG_RUSTOS_READY,
     );
     fence(Ordering::SeqCst);
+    // Install requires the next policy owner to re-publish, so it clears the
+    // policy bit. On a re-install that bit was set and an L0 producer is live,
+    // and the relay reads the cleared window as a terminal revocation.
+    if previous_flags & DVM_INPUT_RING_FLAG_POLICY_CONSUMER_READY != 0 {
+        crate::debug::record_milestone(
+            crate::debug::LogCategory::Input,
+            "dvm-input-policy-cleared-by-install",
+            ring.header.generation,
+            u64::from(previous_flags),
+        );
+    }
     SHARED_ADDR.store(ring.mapped as usize, Ordering::Release);
     GENERATION.store(ring.header.generation, Ordering::Release);
     CONSUMER.store(ring.header.consumer, Ordering::Release);
@@ -380,6 +391,12 @@ pub(crate) fn withdraw_policy_consumer() {
     );
     fence(Ordering::SeqCst);
     let generation = mapping.generation();
+    crate::debug::record_milestone(
+        crate::debug::LogCategory::Input,
+        "dvm-input-policy-withdrawn",
+        generation,
+        u64::from(flags),
+    );
     INPUT_LIFECYCLE.request_drain();
     // ORDERING: the Release pending bit publishes the retired generation and
     // shared-ready withdrawal before any quiescent finisher resets cursors.
@@ -643,7 +660,33 @@ fn input_ring_interrupt(_vector: u8) {
     super::wait_queue::wake_input_waiters();
 }
 
+/// Numeric identity of each revoke reason, in the order they appear above.
+///
+/// The reason reached only `debug::warn!`, which the product configuration does
+/// not route to the debug transport, so a transport revocation mid-relay left
+/// no record at all. The L0 relay bailed with "RustOS revoked input-ring
+/// transport or policy-consumer readiness" and nothing on this side said which
+/// check fired.
+fn revoke_reason_code(reason: &str) -> u64 {
+    match reason {
+        "policy-ready-header-invalid" => 1,
+        "policy-ready-lifecycle-invalid" => 2,
+        "policy-ready-transport-not-ready" => 3,
+        "header-invalid" => 4,
+        "cursor-or-generation-invalid" => 5,
+        "record-offset-invalid" => 6,
+        "consumer-wake-generation-wrapped" => 7,
+        _ => 0,
+    }
+}
+
 fn revoke(reason: &str) {
+    crate::debug::record_milestone(
+        crate::debug::LogCategory::Input,
+        "dvm-input-transport-revoked",
+        GENERATION.load(Ordering::Acquire),
+        revoke_reason_code(reason),
+    );
     INPUT_LIFECYCLE.request_drain();
     // ORDERING: drain closes admission before Release publishes revoke work;
     // the generation and waiter wake follow that publication.
@@ -944,10 +987,94 @@ fn read_header(mapped: *const u8) -> Option<DvmInputRingHeader> {
         .fill(0);
     bytes[DVM_INPUT_RING_CONSUMER_OFFSET..DVM_INPUT_RING_CONSUMER_OFFSET + size_of::<u64>()]
         .fill(0);
-    let mut header = DvmInputRingHeader::decode(&bytes)?;
-    header.producer = read_u64(mapped, DVM_INPUT_RING_PRODUCER_OFFSET);
+    let Some(mut header) = DvmInputRingHeader::decode(&bytes) else {
+        report_invalid_header(mapped, &bytes);
+        return None;
+    };
+    // Read the consumer first. `is_valid` requires `producer >= consumer`, and
+    // the pair cannot be sampled atomically: L0 advances the producer while a
+    // lifecycle retire on another CPU advances the consumer. Sampling the
+    // producer first admits the window where the consumer moves past the
+    // already-read producer, which `is_valid` cannot distinguish from a corrupt
+    // header - and the caller answers a corrupt header by revoking the whole
+    // transport. At 8 vCPU that fired mid-relay after about 140 events, clearing
+    // both ready bits, and the L0 relay failed the FPS proof with
+    // "RustOS revoked input-ring transport or policy-consumer readiness".
+    //
+    // In this order the invariant holds by construction rather than by luck.
+    // Both cursors advance monotonically, so a producer read strictly after a
+    // consumer read is at least the producer value that bounded that consumer,
+    // which is at least the consumer itself. The outstanding bound survives the
+    // same way: L0 admits at most a full ring beyond whatever consumer it last
+    // observed, and that observation cannot be newer than this one.
     header.consumer = read_u64(mapped, DVM_INPUT_RING_CONSUMER_OFFSET);
+    header.producer = read_u64(mapped, DVM_INPUT_RING_PRODUCER_OFFSET);
     header.is_valid().then_some(header)
+}
+
+/// Publishes which admission check rejected a header before the caller answers
+/// by revoking the transport.
+///
+/// The revoke reason said only `header-invalid`, which covers a magic, version,
+/// geometry, padding, flag, and generation check across a snapshot read
+/// byte-by-byte while other CPUs write some of those fields. Two candidate
+/// explanations were each worth a full 90-second acceptance run and neither was
+/// it. The failing field is cheap to publish and ends the guessing.
+fn report_invalid_header(mapped: *const u8, bytes: &[u8]) {
+    let flags = read_u32(mapped, DVM_INPUT_RING_FLAGS_OFFSET);
+    let generation = read_u64(mapped, 56);
+    let region_bytes = u64::from_le_bytes(bytes[16..24].try_into().unwrap_or_default());
+    let mut checks = 0_u64;
+    let mut set = |ok: bool, bit: u32| {
+        if !ok {
+            checks |= 1 << bit;
+        }
+    };
+    set(
+        bytes[0..8] == driver_domain_protocol::DVM_INPUT_RING_MAGIC,
+        0,
+    );
+    set(
+        u32::from_le_bytes(bytes[8..12].try_into().unwrap_or_default())
+            == driver_domain_protocol::DVM_INPUT_RING_VERSION,
+        1,
+    );
+    set(
+        u32::from_le_bytes(bytes[12..16].try_into().unwrap_or_default())
+            == driver_domain_protocol::DVM_INPUT_RING_HEADER_BYTES,
+        2,
+    );
+    set(
+        u32::from_le_bytes(bytes[24..28].try_into().unwrap_or_default())
+            == DVM_INPUT_RING_SLOT_COUNT,
+        3,
+    );
+    set(
+        u32::from_le_bytes(bytes[28..32].try_into().unwrap_or_default())
+            == DVM_INPUT_RING_RECORD_BYTES as u32,
+        4,
+    );
+    set(bytes[36..56].iter().all(|byte| *byte == 0), 5);
+    set(
+        region_bytes >= driver_domain_protocol::DVM_INPUT_RING_MIN_REGION_BYTES
+            && region_bytes <= DVM_INPUT_RING_APERTURE_BYTES,
+        6,
+    );
+    set(
+        flags & !driver_domain_protocol::DVM_INPUT_RING_KNOWN_FLAGS == 0,
+        7,
+    );
+    set(
+        flags & driver_domain_protocol::DVM_INPUT_RING_FLAG_READY != 0,
+        8,
+    );
+    set(generation != 0, 9);
+    crate::debug::record_milestone(
+        crate::debug::LogCategory::Input,
+        "dvm-input-header-rejected",
+        (u64::from(flags) << 32) | (generation & 0xffff_ffff),
+        checks,
+    );
 }
 
 fn arm_input_ring_interrupt(device: crate::arch::pci::PciDevice) -> Result<(), u8> {
