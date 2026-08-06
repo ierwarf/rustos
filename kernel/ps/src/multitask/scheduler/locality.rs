@@ -47,6 +47,13 @@ impl Scheduler {
     /// Walk scheduling classes in priority order and select the global
     /// least-vruntime task or one bounded local alternative in that class.
     pub(super) fn pick_min_vruntime(&self, current: usize) -> Option<usize> {
+        let started_ns = crate::arch::clock::monotonic_nanos();
+        let picked = self.pick_min_vruntime_inner(current);
+        charge_pick_scan(crate::arch::clock::monotonic_nanos().saturating_sub(started_ns));
+        picked
+    }
+
+    fn pick_min_vruntime_inner(&self, current: usize) -> Option<usize> {
         let mut best_by_class = [None::<(usize, u64)>; SchedClass::COUNT];
         let mut local_by_class = [None::<(usize, u64)>; SchedClass::COUNT];
         let current_cpu = nucleus_core::util::lockdep::current_cpu_index();
@@ -91,6 +98,13 @@ impl Scheduler {
     }
 
     pub(super) fn pick_min_vruntime_excluding(&self, excluded: usize) -> Option<usize> {
+        let started_ns = crate::arch::clock::monotonic_nanos();
+        let picked = self.pick_min_vruntime_excluding_inner(excluded);
+        charge_pick_scan(crate::arch::clock::monotonic_nanos().saturating_sub(started_ns));
+        picked
+    }
+
+    fn pick_min_vruntime_excluding_inner(&self, excluded: usize) -> Option<usize> {
         let mut best_by_class = [None::<(usize, u64, usize)>; SchedClass::COUNT];
         let mut local_by_class = [None::<(usize, u64, usize)>; SchedClass::COUNT];
         let current_cpu = nucleus_core::util::lockdep::current_cpu_index();
@@ -221,4 +235,56 @@ impl Scheduler {
         }
         Self::prefer_local_candidate(best, local)
     }
+}
+
+/// Self-timed cost of the fair-class pick scan.
+///
+/// The phase marks charge this to `SelectHandoff`, because both pick functions
+/// are lexically inside that span, so the scheduler profile reported handoff at
+/// 238 ms per second of lock hold — 40 percent of the total — while
+/// `SelectPick` read under 1 ms. A segment that names the wrong work invites
+/// optimising the wrong thing; one reorder of the handoff predicates was
+/// already spent that way and moved nothing.
+///
+/// Static rather than a `Scheduler` field because both functions take `&self`.
+/// The scheduler lock already serializes every writer.
+static PICK_SCAN_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static PICK_SCAN_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn charge_pick_scan(elapsed_ns: u64) {
+    // ORDERING: Relaxed. Diagnostic counters with no other state attached, read
+    // only by the once-per-second drain.
+    PICK_SCAN_NS.fetch_add(elapsed_ns, core::sync::atomic::Ordering::Relaxed);
+    PICK_SCAN_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Self-timed cost of the handoff chain's own scans.
+///
+/// Charged by the overdue-class and reserved-user scans, which are the other
+/// two O(local runnable) walks inside the `SelectHandoff` span. Splitting them
+/// from the fair pick is what says which of the three costs; the fair pick
+/// turned out to be 29 ms of a 216 ms segment, so it is not the one.
+static HANDOFF_SCAN_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static HANDOFF_SCAN_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+pub(in crate::multitask) fn charge_handoff_scan(elapsed_ns: u64) {
+    // ORDERING: Relaxed; diagnostic counters drained once per second.
+    HANDOFF_SCAN_NS.fetch_add(elapsed_ns, core::sync::atomic::Ordering::Relaxed);
+    HANDOFF_SCAN_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Takes the window's handoff-scan cost, clearing it for the next window.
+pub(in crate::multitask) fn take_handoff_scan_window() -> (u64, u64) {
+    (
+        HANDOFF_SCAN_NS.swap(0, core::sync::atomic::Ordering::Relaxed),
+        HANDOFF_SCAN_CALLS.swap(0, core::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// Takes the window's pick-scan cost, clearing it for the next window.
+pub(in crate::multitask) fn take_pick_scan_window() -> (u64, u64) {
+    (
+        PICK_SCAN_NS.swap(0, core::sync::atomic::Ordering::Relaxed),
+        PICK_SCAN_CALLS.swap(0, core::sync::atomic::Ordering::Relaxed),
+    )
 }

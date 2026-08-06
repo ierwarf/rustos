@@ -164,13 +164,55 @@ chain — before the cheap ready-age test. Reordering the conjunction so the
 arithmetic age test rejects first moved the number by nothing: 8.2 µs per
 dispatch before, 8.5 after. The predicate chain is not the cost.
 
-What that leaves is the phase boundary itself. `pick_min_vruntime` and
-`pick_min_vruntime_excluding` — the CFS scan — are lexically inside the
-`SelectHandoff` span, so `SelectPick` reads under 1 ms/s while the actual pick is
-charged to handoff. Before attacking this segment again, **split the marks so
-the CFS pick is measured separately from the handoff chain**; otherwise the next
-attempt optimises whichever of the two the name suggests rather than whichever
-one costs.
+The segment is now split three ways, by self-timing each scan rather than by
+moving the phase marks. At 8 vCPU, 28,592 dispatches in one window:
+
+| part of `SelectHandoff` (253 ms/s total) | cost | share |
+|---|---:|---:|
+| fair-class pick (`pick_min_vruntime*`) | 34 ms/s | 13% |
+| overdue-class and reserved-user scans | 59 ms/s | 23% |
+| **the handoff chain itself** | **160 ms/s** | **63%** |
+
+So neither scan is the cost. The 63 percent is the `take_next_*_ready_slot`
+sequence — atomic activation, synchronous pick hint, bootstrap handoff, latency
+pick hint, ordinary pick hint — run in order on every dispatch at about 5.6 µs
+per dispatch. That is the target, and it is not what the segment's name
+suggested; the earlier predicate reorder failed because it optimised the 23
+percent's inner loop.
+
+### 2.1c A big lock is not automatically the problem
+
+`V5-SCHED-GLOBAL-001` reads as "remove the global lock". The commercial
+microkernel literature does not support that as a general rule, and the
+measurement says which part of it applies here.
+
+seL4 — a verified, commercially deployed microkernel — ships SMP with a **big
+kernel lock** by choice. "For a Microkernel, a Big Lock Is Fine"
+(<https://trustworthy.systems/publications/nicta_full_text/8768.pdf>) and its
+longer evaluation (<https://arxiv.org/pdf/1609.08372>) argue that coarse-grained
+locking is viable for a microkernel because its critical sections are extremely
+short, and report it holding up to roughly eight cores for typical workloads.
+The seL4 FAQ frames the same choice: the big lock suits cores sharing an L2, and
+beyond that the answer is a multikernel rather than finer locking.
+
+Two things follow for RustOS, and they point in opposite directions.
+
+- **The core count is inside the regime that literature defends.** Eight vCPUs
+  sharing a cache is precisely where a big lock is reported to be fine.
+- **The critical section is not.** The workload the evaluation names as the one
+  that breaks a big lock is high-frequency IPC, and that is exactly this
+  system's profile: 143,000 acquisitions per second with 4.9 per dispatch. More
+  decisively, a microkernel dispatch that is "fine" under a big lock is
+  sub-microsecond; this one spends 8 µs in `SelectHandoff` alone, with 91
+  percent of the hold attributed to in-owner work.
+
+So the target is the critical section first, and the lock only if shortening it
+is not enough. That ordering also has better failure modes: shortening a segment
+is measurable per change and reversible, whereas the cutover is the step that
+turns a disagreement into a task on two CPUs. The staged ladder in 2.7 stands,
+but step 3 should be preceded by taking the 160 ms/s handoff chain apart — if
+that alone brings the hold under a few percent duty, the remaining stages become
+optional rather than mandatory.
 
 ### 2.2 Reference designs and what each contributes
 

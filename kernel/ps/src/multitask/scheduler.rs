@@ -1232,12 +1232,36 @@ impl Scheduler {
     /// governed by charged vruntime; exact event and synchronous IPC wakeups
     /// retain their separately bounded handoff queues.
     fn reserved_user_pick(&self, current: usize) -> Option<usize> {
+        let started_ns = crate::arch::clock::monotonic_nanos();
+        let picked = self.reserved_user_pick_inner(current);
+        locality::charge_handoff_scan(
+            crate::arch::clock::monotonic_nanos().saturating_sub(started_ns),
+        );
+        picked
+    }
+
+    fn reserved_user_pick_inner(&self, current: usize) -> Option<usize> {
         self.user_reservation_due()
             .then(|| self.pick_min_vruntime_in_class(current, SchedClass::User))
             .flatten()
     }
 
     fn overdue_class_pick(
+        &self,
+        current: usize,
+        now_ticks: u64,
+        class: SchedClass,
+        latency_bound_ms: u64,
+    ) -> Option<usize> {
+        let started_ns = crate::arch::clock::monotonic_nanos();
+        let picked = self.overdue_class_pick_inner(current, now_ticks, class, latency_bound_ms);
+        locality::charge_handoff_scan(
+            crate::arch::clock::monotonic_nanos().saturating_sub(started_ns),
+        );
+        picked
+    }
+
+    fn overdue_class_pick_inner(
         &self,
         current: usize,
         now_ticks: u64,

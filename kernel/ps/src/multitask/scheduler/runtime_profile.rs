@@ -88,6 +88,12 @@ pub(in crate::multitask) struct SchedulerRuntimeProfile {
     pub(in crate::multitask) lock_hold_max_caller: Option<&'static Location<'static>>,
     pub(in crate::multitask) lock_hold_max_attributed_ns: u64,
     pub(in crate::multitask) deferred_wakes: u64,
+    /// Self-timed fair-class pick scan, which the phase marks attribute to
+    /// `SelectHandoff` because both pick functions sit inside that span.
+    pub(in crate::multitask) pick_scan_ns: u64,
+    pub(in crate::multitask) pick_scan_calls: u64,
+    pub(in crate::multitask) handoff_scan_ns: u64,
+    pub(in crate::multitask) handoff_scan_calls: u64,
     pub(in crate::multitask) phase_ns: [u64; SCHEDULER_PHASE_COUNT],
     pub(in crate::multitask) runnable_samples: u64,
     /// First slot whose lock-free identity record disagrees with the
@@ -235,6 +241,21 @@ pub fn drain_scheduler_runtime_profile() -> usize {
             .lock_hold_max_caller
             .map(|caller| (u64::from(fnv1a32(caller.file())) << 32) | u64::from(caller.line()))
             .unwrap_or(0),
+    );
+    // The fair-class pick scan, self-timed because the phase marks charge it to
+    // `SelectHandoff`. arg0=us, arg1=calls.
+    crate::debug::record_milestone(
+        crate::debug::LogCategory::Sched,
+        "kernel-scheduler-phase-pick-scan",
+        profile.pick_scan_ns / 1_000,
+        profile.pick_scan_calls,
+    );
+    // The other two O(local runnable) walks inside the same span.
+    crate::debug::record_milestone(
+        crate::debug::LogCategory::Sched,
+        "kernel-scheduler-phase-handoff-scan",
+        profile.handoff_scan_ns / 1_000,
+        profile.handoff_scan_calls,
     );
     // Owner publication plus the deferred wake drain, which every acquisition
     // pays before its caller runs. arg0=prologue us, arg1=wakes drained.
@@ -519,6 +540,8 @@ impl Scheduler {
             return None;
         }
 
+        let mut pick_scan_calls = 0_u64;
+        let mut handoff_scan_calls = 0_u64;
         let mut profile = SchedulerRuntimeProfile {
             elapsed_ms: Scheduler::ticks_elapsed_ms(self.runtime_profile_started_ticks, now_ticks),
             total_runtime_ns: 0,
@@ -536,6 +559,18 @@ impl Scheduler {
             lock_hold_max_caller: self.runtime_profile_lock_hold_max_caller,
             lock_hold_max_attributed_ns: self.runtime_profile_lock_hold_max_attributed_ns,
             deferred_wakes: self.runtime_profile_deferred_wakes,
+            pick_scan_ns: {
+                let (ns, calls) = super::locality::take_pick_scan_window();
+                pick_scan_calls = calls;
+                ns
+            },
+            pick_scan_calls,
+            handoff_scan_ns: {
+                let (ns, calls) = super::locality::take_handoff_scan_window();
+                handoff_scan_calls = calls;
+                ns
+            },
+            handoff_scan_calls,
             phase_ns: self.runtime_profile_phase_ns,
             runnable_samples: self.runtime_profile_runnable_samples,
             divergent_identity_slot: self.divergent_published_identity().unwrap_or(usize::MAX),
@@ -694,6 +729,10 @@ mod tests {
             lock_hold_max_caller: None,
             lock_hold_max_attributed_ns: 0,
             deferred_wakes: 0,
+            pick_scan_ns: 0,
+            pick_scan_calls: 0,
+            handoff_scan_ns: 0,
+            handoff_scan_calls: 0,
             phase_ns: [0; SCHEDULER_PHASE_COUNT],
             runnable_samples: 0,
             divergent_identity_slot: usize::MAX,
