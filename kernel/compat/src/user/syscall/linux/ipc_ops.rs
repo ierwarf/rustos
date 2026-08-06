@@ -2312,11 +2312,6 @@ fn enqueue_call_and_wake_with_handles(
             true
         };
         donation_admitted |= inherited;
-        if !donation_admitted {
-            cancel_reply_wait(reply, task_id, ReplyCancelReason::InvalidCommit);
-            let _ = multitask::cancel_ipc_priority_reservation(task_id);
-            return Err(LINUX_ENOSPC);
-        }
         let woke = multitask::wake_task(receiver_task_id);
         ipc_trace!(
             "ipc call wake: endpoint={} receiver_task={} woke={} inherited={}",
@@ -2332,12 +2327,27 @@ fn enqueue_call_and_wake_with_handles(
         let _ = multitask::set_next_synchronous_pick_hint(receiver_task_id);
     }
     if !donation_admitted {
-        // Reply and donation capacity are one admission transaction for a
-        // System-class caller. Do not let it block after silently dropping the
-        // scheduling edge; terminal cancellation returns attached authority.
-        cancel_reply_wait(reply, task_id, ReplyCancelReason::InvalidCommit);
+        // The scheduling edge could not be installed. This used to cancel the
+        // reply and return `ENOSPC`, on the reasoning that a System caller must
+        // not block after silently losing its donation. That reasoning was
+        // wrong about the consequence: the caller does not block indefinitely,
+        // because `wait_for_reply` arms a bounded deadline and returns
+        // `ETIMEDOUT`, and the direct handoff hint below still runs. What the
+        // cancellation did produce was a terminal `ENOSPC` on a syscall that
+        // had already succeeded — observed as uiserver dying inside a thread
+        // spawn with "failed to allocate an alternative stack: No space left on
+        // device", which killed the compositor and the whole FPS proof with it.
+        //
+        // Donation capacity is a scheduling condition. Degrade the priority
+        // edge and keep the call, exactly as a full donation table already
+        // degrades at reservation time.
         let _ = multitask::cancel_ipc_priority_reservation(task_id);
-        return Err(LINUX_ENOSPC);
+        debug::record_milestone(
+            debug::LogCategory::Sched,
+            "ipc-donation-bind-degraded",
+            task_id,
+            reply.raw(),
+        );
     }
     Ok(reply)
 }

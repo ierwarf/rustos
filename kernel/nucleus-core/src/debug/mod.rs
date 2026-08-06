@@ -664,6 +664,11 @@ fn milestone_requires_reliable_output(name: &str) -> bool {
         || name == "task-context-corrupted"
         || name == "linux-user-fault"
         || name == "linux-thread-clone-rejected"
+        // A degraded donation is the record that a scheduling edge was dropped
+        // without failing the call. Losing it turns the degradation invisible,
+        // which is how the fail-closed version of this path stayed hidden until
+        // it killed the compositor.
+        || name.starts_with("ipc-donation-")
 }
 
 #[cfg(rustos_debug_print_enabled)]

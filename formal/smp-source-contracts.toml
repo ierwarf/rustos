@@ -341,11 +341,18 @@ tokens = [
 # turned it into a terminal `ENOSPC` that killed a Wayland client whose
 # compositor was writing to it. The ordering that still matters is unchanged:
 # sample the reservation before the IPC slot lock, then enqueue, then bind the
-# reply, then cancel on an invalid commit.
+# reply.
+#
+# The final token used to be the invalid-commit cancellation. Binding failure
+# was the last condition that reached it, and it had the same defect one step
+# later: a donation the scheduler could not install cancelled a syscall that
+# had already succeeded, and uiserver died mid thread-spawn on the resulting
+# `ENOSPC`. Binding failure now degrades, so what this sequence pins is that
+# the degradation is recorded rather than silent.
     "priority == EndpointCallPriority::System && multitask::reserve_ipc_priority(task_id)",
     "enqueue_endpoint_call_with_handles_and_priority(",
     "multitask::bind_reserved_ipc_priority(reply.raw(), task_id, receiver_task_id)",
-    "cancel_reply_wait(reply, task_id, ReplyCancelReason::InvalidCommit)",
+    "\"ipc-donation-bind-degraded\"",
 ]
 
 [[required_sequences]]
