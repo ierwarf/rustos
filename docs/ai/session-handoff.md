@@ -830,3 +830,29 @@ problem.
   duty is 27%, but the item is open.
 - Why WayClick accumulates only single-digit consecutive windows in 85 seconds.
   `frame_seq` now joins both completions, which is the instrument for it.
+
+### The failure the gate now ends on
+
+With every per-frame diagnostic bounded, discarded bytes fell 10,821 -> 5,347 ->
+3,097 and no log shape exceeds five occurrences in a run. The evidence channel
+is no longer the constraint.
+
+Two of the last three runs ended the same way:
+
+    RustOS input relay failed after forwarding 1692 events:
+    fixed input-ring credit timeout outstanding=1279 limit=1279 cleanup=false timeout_ms=50
+
+The ring is full at its 1279-slot limit and the host's 50 ms credit window
+expires. This is the consumer falling behind a burst, not a frame-path problem
+and not an error the relay can retry.
+
+The drain is `service_pending`, bounded to `MAX_RECORDS_PER_BROKER_TURN` = 256
+records per broker call, and it only runs when inputd calls the broker. A burst
+of 1692 needs at least seven consecutive turns. The thing to check first is
+whether a turn that hits its 256-record bound tells inputd there is more waiting,
+or whether inputd goes back to sleep and waits for the next MSI-X wake - the
+latter would cap drain throughput at one turn per interrupt regardless of
+backlog, which matches an outstanding count pinned exactly at the limit.
+
+`OUTSTANDING_HIGH_WATER` and `DRAIN_CLAIM_LOST` already exist in `dvm_ring.rs`
+for this question and are not yet reported anywhere.
