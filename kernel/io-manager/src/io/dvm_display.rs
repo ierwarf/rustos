@@ -161,6 +161,8 @@ static DROPPED_FRAMES: AtomicU64 = AtomicU64::new(0);
 static GUI_DVM_CONTROL_IRQ_PENDING: AtomicBool = AtomicBool::new(false);
 static GUI_DVM_OFFLINE_IRQ_PENDING: AtomicBool = AtomicBool::new(false);
 static GUI_DVM_PEER_READY: AtomicBool = AtomicBool::new(false);
+/// Last invitation whose rebind was reported. Diagnostic only.
+static GUI_DVM_LOGGED_INVITATION: AtomicU64 = AtomicU64::new(0);
 static GUI_DVM_EXPECTED_INVITATION: AtomicU64 = AtomicU64::new(0);
 static GUI_DVM_ACKED_CONTROL_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -1210,16 +1212,26 @@ fn drain_dvm_control() {
         GPU_SUBMIT_FLAGS.store(prime.submit_flags, Ordering::Release);
         GUI_DVM_PEER_READY.store(true, Ordering::Release);
         write_u64(DVM_GUI_SURFACE_POOL_READY_CONFIRMATION_OFFSET, expected);
-        nucleus_core::debug::write_debugcon_only_line(
-            alloc::format!(
-                "gui-dvm: peer ready lease rebound invitation={} context_epoch={}",
-                expected,
-                // ORDERING: Peer-ready Release publication precedes this
-                // diagnostic Acquire snapshot; the value is evidence only.
-                GPU_CONTEXT_EPOCH.load(Ordering::Acquire)
-            )
-            .as_bytes(),
-        );
+        // Log the rebind once per invitation. The confirmation itself is
+        // idempotent and re-runs on every control interrupt, which produced 928
+        // identical lines in one acceptance run - about 55 KB of debugcon port
+        // writes, each one a host exit taken under a global lock with
+        // interrupts disabled, on the same transport the acceptance proof reads
+        // its per-second windows from. The protocol path below is unchanged.
+        let already_confirmed =
+            GUI_DVM_LOGGED_INVITATION.swap(expected, Ordering::AcqRel) == expected;
+        if !already_confirmed {
+            nucleus_core::debug::write_debugcon_only_line(
+                alloc::format!(
+                    "gui-dvm: peer ready lease rebound invitation={} context_epoch={}",
+                    expected,
+                    // ORDERING: Peer-ready Release publication precedes this
+                    // diagnostic Acquire snapshot; the value is evidence only.
+                    GPU_CONTEXT_EPOCH.load(Ordering::Acquire)
+                )
+                .as_bytes(),
+            );
+        }
         // The first host present can legitimately precede Linux-DVM boot. In
         // that order its original doorbell is unobservable, so confirmation
         // is also the single replay-safe wakeup that lets the DVM consume the
