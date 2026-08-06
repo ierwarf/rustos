@@ -546,6 +546,24 @@ pub(crate) fn service_pending(dest: &mut [InputDvmRecordWire]) -> usize {
     }
     CONSUMER.store(consumer, Ordering::Release);
     RECORDS_COPIED.fetch_add(written as u64, Ordering::Relaxed);
+    if header.producer > consumer {
+        // The turn is bounded to `MAX_RECORDS_PER_BROKER_TURN` and left records
+        // behind. Re-arm on the backlog rather than on the producer's next
+        // interrupt: this function clears `IRQ_PENDING` on entry, so without
+        // this a consumer that fills one turn goes back to sleep holding a full
+        // ring, and drain throughput becomes one turn per interrupt regardless
+        // of how far behind it is.
+        //
+        // That is what the L0 relay was reporting: "fixed input-ring credit
+        // timeout outstanding=1279 limit=1279" after 1692 forwarded events -
+        // the outstanding count pinned exactly at the ring size, which is a
+        // consumer that stopped rather than one that is merely slow.
+        //
+        // ORDERING: Release publishes the advanced consumer cursor above before
+        // a woken reader observes the pending flag.
+        IRQ_PENDING.store(true, Ordering::Release);
+        super::wait_queue::wake_input_waiters();
+    }
     written
 }
 
