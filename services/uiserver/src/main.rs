@@ -1138,7 +1138,27 @@ fn run() -> Result<(), i32> {
                 thread::sleep(DISPLAY_BACKPRESSURE_RETRY_DELAY);
                 continue 'main_loop;
             }
-            PresentUpdateResult::Idle => false,
+            PresentUpdateResult::Idle => {
+                // Nothing to present is the clearest case of all: the client
+                // may start its next frame, because the compositor is done with
+                // everything it was given. Withholding the permit here closed a
+                // liveness hole rather than saving work - the client blocks in
+                // `blocking_dispatch` waiting for the callback, so it sends no
+                // protocol input, so `wayland_service_required` stays false and
+                // the tick that would deliver the callback never runs. Each
+                // side then waits for the other.
+                //
+                // The 15 ms cadence pulse does not rescue it. That path needs
+                // `wayland_callback_pending`, which a previous tick already
+                // cleared, and it is reached only from inside the tick that is
+                // no longer running.
+                //
+                // Same coupling as the `Backpressured` arm above and the same
+                // audit item, `V5-GPU-UI-OWNER-014`: protocol progress is not
+                // the scene's or the GPU's to withhold.
+                wayland_frame_permit = true;
+                false
+            }
         };
         watchdog.leave();
 
