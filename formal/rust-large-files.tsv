@@ -2,10 +2,10 @@
 kernel/compat/src/user/process/linux.rs	1767	compat-process	Split ELF state, signal frame, and Linux task lifecycle.
 kernel/compat/src/user/syscall/linux/ipc_ops.rs	3317	compat-ipc	Split endpoint calls, shared regions, handle transfer, and tests.
 kernel/compat/src/user/syscall/linux/proc_broker_ops.rs	1920	compat-process-broker	Split spawn, exec, wait, signal, and retirement broker clients.
-kernel/compat/src/user/syscall/linux/service_ops/ipc_helpers.rs	1842	compat-service-ipc	Split typed calls, response admission, retry policy, and tests.
-kernel/compat/src/user/syscall/linux/service_ops/poll_epoll.rs	1370	compat-waitset	Split poll translation, epoll registration, waits, and lifecycle tests.
-kernel/compat/src/user/syscall/linux/service_ops/vfs_meta.rs	1596	compat-vfs	Split metadata RPCs, message-vector copyout, and AF_UNIX transfer control transactions.
-kernel/compat/src/user/syscall/linux/service_ops/vfs_socket.rs	1619	compat-vfs	Split file-descriptor transport, socket transport, and response admission.
+kernel/compat/src/user/syscall/linux/service_ops/ipc_helpers.rs	1857	compat-service-ipc	Split typed calls, response admission, retry policy, and tests.
+kernel/compat/src/user/syscall/linux/service_ops/poll_epoll.rs	1393	compat-waitset	Split poll translation, epoll registration, waits, and lifecycle tests.
+kernel/compat/src/user/syscall/linux/service_ops/vfs_meta.rs	1634	compat-vfs	Split metadata RPCs, message-vector copyout, and AF_UNIX transfer control transactions.
+kernel/compat/src/user/syscall/linux/service_ops/vfs_socket.rs	1600	compat-vfs	Split file-descriptor transport, socket transport, and response admission.
 kernel/io-manager/src/io/dvm_block.rs	1595	io-block	Split protocol admission, queue lifecycle, DMA aperture, and tests.
 kernel/io-manager/src/io/dvm_display.rs	1796	io-display	Split handshake, shared-surface lifecycle, present queue, and tests.
 kernel/ipc-runtime/src/ipc/mod.rs	3077	ipc-runtime	Split endpoint, reply, shared-region, accounting, and test modules.
@@ -17,7 +17,7 @@ libs/driver-domain-protocol/src/lib.rs	4149	driver-domain-protocol	Split block, 
 libs/runtime-control/src/lib.rs	1341	runtime-control	Split codec, authority, command lifecycle, and tests.
 libs/rustos-image-admission/src/lib.rs	1518	image-admission	Split ELF, PE, region-plan, signature, and tests.
 libs/rustos-user-abi/src/linux.rs	1531	user-abi	Split Linux constants and structures by syscall family.
-libs/rustos-user-abi/src/syscall.rs	3125	user-abi	Split kernel mechanism ABI from service broker protocol families.
+libs/rustos-user-abi/src/syscall.rs	3138	user-abi	Split kernel mechanism ABI from service broker protocol families.
 services/initd/src/main.rs	1333	initd	Split loader wire calls, rootd lease reconciliation, and child supervision into typed modules.
 services/inputd/src/main.rs	1816	inputd	Split ingress admission, queue/readiness, service RPC, and runtime.
 services/netd/src/main.rs	3413	netd	Split device ingress, socket state, routing policy, service RPC, AF_UNIX segmented ancillary transport, and tests.

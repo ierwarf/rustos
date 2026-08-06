@@ -565,6 +565,21 @@ fn ioctl_is_display_policy_request(request_number: u64) -> bool {
 
 const NETD_MAX_IOVEC_COUNT: usize = 16;
 
+/// Whether `O_NONBLOCK` on the descriptor forbids this operation from waiting.
+///
+/// `poll` and `connect` are deliberately absent: waiting is the entire point of
+/// one, and the other answers a non-blocking caller with `EINPROGRESS` rather
+/// than by returning early.
+fn socket_op_honours_nonblock(op: u16) -> bool {
+    matches!(
+        op,
+        SYSCALL_OFFLOAD_OP_LINUX_SENDTO
+            | SYSCALL_OFFLOAD_OP_LINUX_RECVFROM
+            | SYSCALL_OFFLOAD_OP_LINUX_SENDMSG
+            | SYSCALL_OFFLOAD_OP_LINUX_RECVMSG
+    )
+}
+
 pub fn syscall_linux_net4(op: u16, arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
     syscall_linux_net6(op, arg0, arg1, arg2, arg3, 0, 0)
 }
@@ -597,6 +612,17 @@ pub fn syscall_linux_net6(
 /// gap and two windows, because the whole Wayland dispatch model is built on
 /// `EAGAIN` being the ordinary, non-fatal answer on a ready-but-empty socket
 /// and treats anything else as a broken client.
+///
+/// Callers do not have to ask for the bound. Bounding it at the two `read`/
+/// `write` call sites left `sendmsg` and `recvmsg` on the bulk rail, and those
+/// are the calls libwayland actually makes - it needs the control message for
+/// fd passing, so every compositor flush and every client read is a `sendmsg`
+/// or a `recvmsg`, never a `sendto` or a `recvfrom`. The run said so directly:
+/// "phase=wayland step=callback-flush elapsed_ms=3075", the watchdog killing
+/// uiserver inside `wl_display_flush_clients` at t=33.6s, and WayClick took a
+/// broken pipe one line later. So the rail is chosen here, once, from the
+/// descriptor's own `O_NONBLOCK` - the single place that already knows both
+/// the operation and the flags the caller opened the socket with.
 #[allow(
     clippy::too_many_arguments,
     reason = "mirrors the six-argument Linux socket offload plus its completion bound"
@@ -634,6 +660,14 @@ pub fn syscall_linux_net6_with_timeout(
         request.egid = security.egid();
     }
     populate_netd_socket_token(&mut request);
+    let nonblocking_bound = timeout_ms.is_none()
+        && socket_op_honours_nonblock(op)
+        && request.status_flags & linux_abi::O_NONBLOCK != 0;
+    let timeout_ms = if nonblocking_bound {
+        Some(rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS)
+    } else {
+        timeout_ms
+    };
     if let Err(errno) = populate_netd_request_payload(&mut request, &mut pending_transfers) {
         pending_transfers.drop_pending();
         return linux_errno(errno);
@@ -648,7 +682,7 @@ pub fn syscall_linux_net6_with_timeout(
         Some(timeout_ms) => call_netd_ipc_request_with_timeout(&request, timeout_ms),
         None => call_netd_ipc_request(&request),
     };
-    match result {
+    let outcome = match result {
         Ok(response) => {
             let consumed = usize::try_from(response.value).ok();
             let result = consume_netd_response_payload(
@@ -683,7 +717,11 @@ pub fn syscall_linux_net6_with_timeout(
             pending_transfers.drop_pending();
             linux_errno(errno)
         }
+    };
+    if nonblocking_bound && outcome == linux_errno(LINUX_ETIMEDOUT) {
+        return linux_errno(LINUX_EAGAIN);
     }
+    outcome
 }
 
 struct PendingNetdTransfers {
