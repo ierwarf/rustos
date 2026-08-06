@@ -822,29 +822,24 @@ pub fn read_input_device_via_inputd(
         request.pid = snapshot.process_id();
         request.tid = snapshot.thread_id();
     }
-    // A bound that expires is "nothing for you yet", not a failure, for a
-    // reader that opened the descriptor non-blocking - the same rule the socket
-    // halves follow. Leaking `ETIMEDOUT` here is what turned a busy inputd into
-    // a dead compositor: uiserver's input reader logged the timeout as an
-    // error, spun, fell to 2 Hz, stopped sending frame callbacks, and WayClick
-    // sat on its blocking display read for the full 30,000 ms bulk rail. One
-    // measured window recorded exactly that: `max_callback_gap_ms=30005`.
-    let nonblocking = status_flags & linux_abi::O_NONBLOCK != 0;
-    let timed_out_is_empty = |errno: i64| {
-        if nonblocking && errno == LINUX_ETIMEDOUT {
-            LINUX_EAGAIN
-        } else {
-            errno
-        }
-    };
+    // A timeout here is NOT reported as `EAGAIN`, unlike the socket halves.
+    // The difference is measured, not stylistic: mapping it made the reader
+    // treat "inputd did not answer" as "nothing to read", so it returned
+    // immediately to an epoll that reports ready from inputd's published state
+    // and issued the next pair of requests. Ten abandoned request pairs per
+    // second is exactly the load a service that already missed its deadline
+    // cannot recover from, and the run that carried the mapping never reached
+    // WayClick's first frame at all. Without it the same build held 54
+    // consecutive one-second windows at 410-428 Hz. `ETIMEDOUT` reaching the
+    // reader is what keeps the retry rate tied to the service's actual pace.
     request.op = INPUTD_IPC_OP_AUTHORIZE_READ;
     if let Err(errno) = call_inputd_ipc_request(&request) {
-        return linux_errno(timed_out_is_empty(errno));
+        return linux_errno(errno);
     }
     request.op = INPUTD_IPC_OP_READ;
     let response = match call_inputd_read_request(&request) {
         Ok(response) => response,
-        Err(errno) => return linux_errno(timed_out_is_empty(errno)),
+        Err(errno) => return linux_errno(errno),
     };
     if response.payload_len as u64 > request.requested_len {
         return linux_errno(LINUX_EINVAL);
