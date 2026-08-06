@@ -99,6 +99,10 @@ static READINESS_POLLS: AtomicU64 = AtomicU64::new(0);
 /// bounds output to at most one line per turn-sized step of the ring.
 const OUTSTANDING_REPORT_STEP: u64 = MAX_RECORDS_PER_BROKER_TURN;
 static REVOKE_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Turns skipped because the aperture prefix was not published yet. Counted so
+/// a persistent unpublished region is visible instead of looking like an idle
+/// ring.
+static UNPUBLISHED_HEADER_TURNS: AtomicU64 = AtomicU64::new(0);
 
 const INSTALL_REJECTION_NONE: u8 = 0;
 const INSTALL_REJECTION_ATTACH_BUDGET: u8 = 1;
@@ -323,9 +327,16 @@ pub(crate) fn mark_policy_consumer_ready() -> bool {
         return false;
     };
     let mapped = mapping.mapped();
-    let Some(header) = read_header(mapped) else {
-        revoke("policy-ready-header-invalid");
-        return false;
+    let header = match read_header(mapped) {
+        Ok(header) => header,
+        Err(HeaderRejection::Unpublished) => {
+            UNPUBLISHED_HEADER_TURNS.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        Err(HeaderRejection::Invalid) => {
+            revoke("policy-ready-header-invalid");
+            return false;
+        }
     };
     if header.generation != mapping.generation()
         || header.consumer != CONSUMER.load(Ordering::Acquire)
@@ -461,10 +472,18 @@ pub(crate) fn service_pending(dest: &mut [InputDvmRecordWire]) -> usize {
     let generation = mapping.generation();
     let reset_written = written;
     let _ = IRQ_PENDING.swap(false, Ordering::AcqRel);
-    let Some(header) = read_header(mapped) else {
-        revoke("header-invalid");
-        RECORDS_COPIED.fetch_add(reset_written as u64, Ordering::Relaxed);
-        return reset_written;
+    let header = match read_header(mapped) {
+        Ok(header) => header,
+        Err(HeaderRejection::Unpublished) => {
+            UNPUBLISHED_HEADER_TURNS.fetch_add(1, Ordering::Relaxed);
+            RECORDS_COPIED.fetch_add(reset_written as u64, Ordering::Relaxed);
+            return reset_written;
+        }
+        Err(HeaderRejection::Invalid) => {
+            revoke("header-invalid");
+            RECORDS_COPIED.fetch_add(reset_written as u64, Ordering::Relaxed);
+            return reset_written;
+        }
     };
     let mut consumer = CONSUMER.load(Ordering::Acquire);
     if header.generation != generation
@@ -591,7 +610,7 @@ pub(crate) fn has_pending_records() -> bool {
         return true;
     };
     let mapped = mapping.mapped();
-    let Some(header) = read_header(mapped) else {
+    let Ok(header) = read_header(mapped) else {
         // Force a broker turn to perform the authoritative revoke rather than
         // letting a malformed live transport strand a sleeping reader.
         return true;
@@ -717,7 +736,7 @@ fn finish_pending_lifecycle() {
         let mapped = SHARED_ADDR.load(Ordering::Acquire) as *mut u8;
         let valid = if mapped.is_null() {
             false
-        } else if let Some(header) = read_header(mapped) {
+        } else if let Ok(header) = read_header(mapped) {
             let consumer = CONSUMER.load(Ordering::Acquire);
             if header.generation == retired_generation
                 && header.consumer == consumer
@@ -934,7 +953,7 @@ fn find_input_ring() -> Option<MappedInputRing> {
             exact_aperture_rejection = last_rejection;
             return false;
         }
-        let Some(header) = read_header(mapped) else {
+        let Ok(header) = read_header(mapped) else {
             release_mapping(mapped);
             last_rejection = DISCOVERY_REJECTION_HEADER;
             exact_aperture_rejection = last_rejection;
@@ -974,7 +993,16 @@ fn find_input_ring() -> Option<MappedInputRing> {
     found
 }
 
-fn read_header(mapped: *const u8) -> Option<DvmInputRingHeader> {
+/// Why a header read did not yield a usable header.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum HeaderRejection {
+    /// The aperture has not published its immutable prefix yet. Skip the turn.
+    Unpublished,
+    /// The header is present and wrong. Revoke.
+    Invalid,
+}
+
+fn read_header(mapped: *const u8) -> Result<DvmInputRingHeader, HeaderRejection> {
     let mut bytes = [0_u8; DvmInputRingHeader::encoded_len()];
     for (index, byte) in bytes.iter_mut().enumerate() {
         *byte = unsafe { mapped.add(index).read_volatile() };
@@ -988,8 +1016,11 @@ fn read_header(mapped: *const u8) -> Option<DvmInputRingHeader> {
     bytes[DVM_INPUT_RING_CONSUMER_OFFSET..DVM_INPUT_RING_CONSUMER_OFFSET + size_of::<u64>()]
         .fill(0);
     let Some(mut header) = DvmInputRingHeader::decode(&bytes) else {
+        if header_is_unpublished(&bytes) {
+            return Err(HeaderRejection::Unpublished);
+        }
         report_invalid_header(mapped, &bytes);
-        return None;
+        return Err(HeaderRejection::Invalid);
     };
     // Read the consumer first. `is_valid` requires `producer >= consumer`, and
     // the pair cannot be sampled atomically: L0 advances the producer while a
@@ -1009,7 +1040,12 @@ fn read_header(mapped: *const u8) -> Option<DvmInputRingHeader> {
     // observed, and that observation cannot be newer than this one.
     header.consumer = read_u64(mapped, DVM_INPUT_RING_CONSUMER_OFFSET);
     header.producer = read_u64(mapped, DVM_INPUT_RING_PRODUCER_OFFSET);
-    header.is_valid().then_some(header)
+    if header.is_valid() {
+        Ok(header)
+    } else {
+        report_invalid_header(mapped, &bytes);
+        Err(HeaderRejection::Invalid)
+    }
 }
 
 /// Publishes which admission check rejected a header before the caller answers
@@ -1020,6 +1056,24 @@ fn read_header(mapped: *const u8) -> Option<DvmInputRingHeader> {
 /// byte-by-byte while other CPUs write some of those fields. Two candidate
 /// explanations were each worth a full 90-second acceptance run and neither was
 /// it. The failing field is cheap to publish and ends the guessing.
+/// Whether the header is unpublished rather than corrupt.
+///
+/// The magic is written once by L0 when it creates the aperture and never
+/// changes, so an all-zero magic is not a damaged header - it is a region whose
+/// publication this read got in front of. The field-level rejection record
+/// distinguished the two: `arg1=0x5f` failed magic, version, header size, slot
+/// count, record size, and region size together while the padding-must-be-zero
+/// check passed and a re-read of flags and generation returned 0x7 and 1. Only
+/// an all-zero prefix produces that combination.
+///
+/// Revoking on it is the transient-as-terminal defect again, and an expensive
+/// one: revocation clears both ready bits and retires every undelivered record,
+/// which is what the L0 relay reports as
+/// "RustOS revoked input-ring transport or policy-consumer readiness".
+fn header_is_unpublished(bytes: &[u8]) -> bool {
+    bytes.len() >= 8 && bytes[0..8].iter().all(|byte| *byte == 0)
+}
+
 fn report_invalid_header(mapped: *const u8, bytes: &[u8]) {
     let flags = read_u32(mapped, DVM_INPUT_RING_FLAGS_OFFSET);
     let generation = read_u64(mapped, 56);
