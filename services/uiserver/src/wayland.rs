@@ -386,6 +386,17 @@ impl WaylandCompositor {
             }
         }
         let dispatch_elapsed = dispatch_started.elapsed();
+        // Storage custody is settled by the dispatch that just copied it, so
+        // this runs every tick rather than on a frame permit.
+        let released = self.state.flush_buffer_releases();
+        if released != 0 {
+            let frame_seq = crate::loop_timing::current_frame_seq();
+            if crate::loop_timing::frame_seq_is_sampled(frame_seq) {
+                crate::sys::debug_line(&format!(
+                    "uiserver: buffer storage released frame_seq={frame_seq} releases={released}"
+                ));
+            }
+        }
         crate::note_wayland_step(crate::WAYLAND_STEP_POINTER_FLUSH);
         self.state.flush_pointer_motion(false);
         let flush_started = Instant::now();
@@ -413,8 +424,8 @@ impl WaylandCompositor {
         self.state.take_dirty()
     }
 
-    /// Consume one compositor-issued frame permit by releasing copied SHM
-    /// buffers and sending the pending one-shot callbacks.
+    /// Consume one compositor-issued frame permit by sending the pending
+    /// one-shot callbacks.
     pub(crate) fn consume_frame_callback_permit(&mut self) {
         crate::note_wayland_step(crate::WAYLAND_STEP_SEND_CALLBACKS);
         self.state.send_frame_callbacks();
@@ -995,24 +1006,49 @@ impl WaylandState {
         self.buffer_copy_profile_max_micros = self.buffer_copy_profile_max_micros.max(micros);
     }
 
+    /// Emit `BufferStorageReleased` for every buffer whose contents the
+    /// compositor has already copied out.
+    ///
+    /// `V5-GPU-UI-OWNER-014` §4.2 states the two completions separately and
+    /// says release "may precede presentation". It could not: the release
+    /// drain shared `send_frame_callbacks`, so a buffer the compositor had
+    /// provably finished reading at commit time stayed held until a frame
+    /// permit arrived. The client then waited a full presentation for storage
+    /// it could already have refilled. Storage custody ends when the copy
+    /// ends, and that is a different fact from a frame having been shown.
+    pub(crate) fn flush_buffer_releases(&mut self) -> u64 {
+        let mut released = 0_u64;
+        for surface in &self.surfaces {
+            let releases = {
+                let Ok(mut surface) = surface.shared.lock() else {
+                    continue;
+                };
+                surface
+                    .pending_buffer_releases
+                    .drain(..)
+                    .collect::<Vec<_>>()
+            };
+            for buffer in releases {
+                released = released.saturating_add(1);
+                buffer.release();
+            }
+        }
+        released
+    }
+
     fn send_frame_callbacks(&mut self) {
         let time = self.event_time_ms();
         // `V5-UI-PIPELINE-011`: both completions carry the frame identity that
         // produced them. Release may precede presentation, so they are counted
         // separately rather than assumed to move together.
         let frame_seq = crate::loop_timing::current_frame_seq();
-        let mut released = 0_u64;
         let mut completed = 0_u64;
         let mut max_wait_micros = 0_u64;
         for surface in &self.surfaces {
-            let (callbacks, releases) = {
+            let callbacks = {
                 let Ok(mut surface) = surface.shared.lock() else {
                     continue;
                 };
-                let releases = surface
-                    .pending_buffer_releases
-                    .drain(..)
-                    .collect::<Vec<_>>();
                 // Protocol progress must not be gated on render state.
                 //
                 // This used to also require a populated pixel cache and a
@@ -1028,17 +1064,12 @@ impl WaylandState {
                 // Visibility is a legitimate reason to withhold a callback; the
                 // compositor's own buffer bookkeeping is not, and the audit's
                 // `V5-WAYLAND-HOL-013` is exactly this coupling.
-                let callbacks = if surface.alive && !surface.minimized {
+                if surface.alive && !surface.minimized {
                     surface.pending_callbacks.drain(..).collect::<Vec<_>>()
                 } else {
                     Vec::new()
-                };
-                (callbacks, releases)
+                }
             };
-            for buffer in releases {
-                released = released.saturating_add(1);
-                buffer.release();
-            }
             for pending in callbacks {
                 let wait_micros =
                     u64::try_from(pending.requested_at.elapsed().as_micros()).unwrap_or(u64::MAX);
@@ -1061,10 +1092,9 @@ impl WaylandState {
                 pending.callback.done(time);
             }
         }
-        if (completed != 0 || released != 0) && crate::loop_timing::frame_seq_is_sampled(frame_seq)
-        {
+        if completed != 0 && crate::loop_timing::frame_seq_is_sampled(frame_seq) {
             crate::sys::debug_line(&format!(
-                "uiserver: frame completion frame_seq={frame_seq} callbacks={completed} releases={released} max_wait_us={max_wait_micros}"
+                "uiserver: frame completion frame_seq={frame_seq} callbacks={completed} max_wait_us={max_wait_micros}"
             ));
         }
         let profile_elapsed = self.callback_profile_started.elapsed();
