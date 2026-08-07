@@ -102,6 +102,16 @@ impl Scheduler {
         if task_ids.is_empty() {
             return false;
         }
+        // The cohort FIFO holds `MAX_ATOMIC_ACTIVATION_HANDOFFS` entries and
+        // publication enqueues one per member, so a larger cohort reached the
+        // enqueue and panicked ring0 - a supervisor choosing its own thread
+        // count could end the kernel. Size is knowable here, before any
+        // authority is consumed, which is exactly what this rollback-free
+        // preflight exists to decide. Rejecting returns the supervisor a
+        // clean failure with every target still suspended.
+        if task_ids.len() > MAX_ATOMIC_ACTIVATION_HANDOFFS {
+            return false;
+        }
         for (index, task_id) in task_ids.iter().copied().enumerate() {
             if task_id == 0 || task_ids[..index].contains(&task_id) {
                 return false;
@@ -165,15 +175,26 @@ impl Scheduler {
     }
 
     fn publish_suspended_user_tasks(&mut self, task_ids: &[u64]) {
-        let prioritize_atomic_cohort = task_ids.len() > 1;
-        if prioritize_atomic_cohort {
-            assert!(
-                self.cpu_dispatch.iter().all(|policy| {
-                    let policy = policy.lock();
-                    policy.atomic_activation_pick_hints.is_empty()
-                        && policy.atomic_activation_handoff_remaining == 0
-                }),
-                "scheduler activation invariant: overlapping atomic cohorts"
+        // A cohort's prioritised first turns are a latency property, not a
+        // correctness one: the `else` arm below starts the same tasks through
+        // ordinary spawn custody. So an earlier cohort that has not drained
+        // yet must not end the kernel - two multi-threaded processes launched
+        // close together is ordinary system behaviour, and the drain rate is
+        // whatever the other CPUs happen to be doing. Degrade the priority and
+        // say so, the same way a full IPC donation table degrades instead of
+        // failing its call.
+        let prioritize_atomic_cohort = task_ids.len() > 1
+            && self.cpu_dispatch.iter().all(|policy| {
+                let policy = policy.lock();
+                policy.atomic_activation_pick_hints.is_empty()
+                    && policy.atomic_activation_handoff_remaining == 0
+            });
+        if task_ids.len() > 1 && !prioritize_atomic_cohort {
+            crate::debug::record_milestone(
+                crate::debug::LogCategory::Sched,
+                "activation-cohort-priority-degraded",
+                task_ids[0],
+                task_ids.len() as u64,
             );
         }
         for task_id in task_ids.iter().copied() {
@@ -216,7 +237,15 @@ impl Scheduler {
         let Some(slot) = self.find_task_slot(task_id) else {
             return false;
         };
-        if !self.handoff_slot_ready(slot) {
+        // Admission into a pick-hint queue is the same question whichever
+        // queue it is, and this path used to ask less of a slot than the spawn
+        // path beside it: no saved context, no runnability. A hint for a slot
+        // the dispatcher cannot run is a dispatch turn spent selecting nothing,
+        // taken ahead of a slot that was ready.
+        if self.contexts[slot].is_none()
+            || !self.slot_is_runnable(slot)
+            || !self.handoff_slot_ready(slot)
+        {
             return false;
         }
         let target_cpu = self.slot_dispatch_cpu(slot);
@@ -232,10 +261,10 @@ impl Scheduler {
         let Some(slot) = self.find_task_slot(task_id) else {
             return;
         };
-        let Some(context) = self.contexts[slot] else {
-            return;
-        };
-        if !self.slot_is_runnable(slot) || !self.handoff_slot_ready(slot) {
+        if self.contexts[slot].is_none()
+            || !self.slot_is_runnable(slot)
+            || !self.handoff_slot_ready(slot)
+        {
             return;
         }
         let target_cpu = self.slot_dispatch_cpu(slot);
