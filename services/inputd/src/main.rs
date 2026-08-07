@@ -901,6 +901,11 @@ fn start_dvm_ingestion_worker(queue: SharedInputQueue, log_state: Arc<DvmIngress
                         std::process::exit(134);
                     }
                 }
+                // The consumer cursor is the only acknowledgement L0 sees and it
+                // advances once per broker call, so the credit window is
+                // governed by this whole turn rather than by the copy. Split
+                // the turn so the dominant phase is a reading, not a guess.
+                let turn_started_ns = dvm_session_sync::monotonic_nanos();
                 let drained = match drain_transport(&mut ingest_scratch) {
                     Ok(count) => count,
                     Err(errno) => {
@@ -908,10 +913,12 @@ fn start_dvm_ingestion_worker(queue: SharedInputQueue, log_state: Arc<DvmIngress
                         std::process::exit(134);
                     }
                 };
+                let drain_done_ns = dvm_session_sync::monotonic_nanos();
                 let mut outcomes = ingest_scratch[..drained]
                     .iter()
                     .map(|record| decoder.consume(record))
                     .collect::<Vec<_>>();
+                let decode_done_ns = dvm_session_sync::monotonic_nanos();
                 total_drained = total_drained.saturating_add(drained as u64);
                 if drained != 0 {
                     nonempty_batches = nonempty_batches.saturating_add(1);
@@ -970,6 +977,16 @@ fn start_dvm_ingestion_worker(queue: SharedInputQueue, log_state: Arc<DvmIngress
                     if total_drained >= next_progress_report {
                         next_progress_report = total_drained.saturating_add(256);
                     }
+                }
+                if report_progress {
+                    let sync_done_ns = dvm_session_sync::monotonic_nanos();
+                    debug_line(&format!(
+                        "inputd: DVM turn split records={total_drained} batch={drained} drain_us={} decode_us={} sync_us={} turn_us={}",
+                        drain_done_ns.saturating_sub(turn_started_ns) / 1_000,
+                        decode_done_ns.saturating_sub(drain_done_ns) / 1_000,
+                        sync_done_ns.saturating_sub(decode_done_ns) / 1_000,
+                        sync_done_ns.saturating_sub(turn_started_ns) / 1_000,
+                    ));
                 }
                 log_dvm_ingress_observation_flags(&log_state, observations);
                 retry_without_wait = ingest_batch_needs_immediate_retry(drained);

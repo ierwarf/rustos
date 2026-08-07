@@ -911,7 +911,38 @@ into the bounded queue, and may reach netd; then progress reporting; then
 the credit window is governed by the consumer's whole turn latency rather than
 by how fast it can copy. L0's window is 50 ms.
 
-Two candidates, in the order they should be measured rather than assumed:
+**Measured, and it overturns the arithmetic above.** Splitting the turn gave
+`batch=1 drain_us=0 decode_us=0 sync_us=1953 turn_us=1953`, repeated at every
+sampled point across a whole run. The consumer was taking **one record per
+wake** and paying a full ~2 ms session-sync turn for it, so it ran at roughly
+five hundred records per second no matter how far behind it was.
+`MAX_RECORDS_PER_BROKER_TURN` never bound anything, because only one record was
+ever available at the moment of the call - which also means
+`ingest_batch_needs_immediate_retry`, testing for an exactly-full 256 batch,
+could never fire. The consumer was strictly interrupt-paced.
+
+The turn's fixed cost belongs to the batch it covers, not to each record in it.
+**The obvious fix was tried and regressed; do not repeat it unchanged.** Looping
+`drain_transport` into the space left in the scratch buffer until the transport
+reports empty, with decode and session sync once for the whole batch, stopped
+the consumer outright: the run failed at 1281 forwarded events against 3673
+before it, the ring pinned at 1279 with about two records ever taken, and not a
+single `DVM turn split` line was emitted - `report_progress` needs `drained !=
+0`, so the drain was returning nothing at all.
+
+The likely reason is the arm/recheck protocol rather than the batching idea.
+`service_pending` clears `IRQ_PENDING` on entry and `arm_consumer_wake`
+publishes a generation the producer samples; extra drain calls inside one turn
+consume wake state the protocol expects one caller to consume once, and the
+consumer then sleeps holding a full ring. Read `arm_consumer_wake` and the
+`IRQ_PENDING` handshake before batching again - the amortisation is still the
+right goal, but it has to be expressed on the kernel side of that handshake,
+not by calling the broker in a loop from ring 3.
+
+The two candidates below were written before that measurement. Candidate 1 was
+right about where the time goes and wrong about why it mattered; candidate 2 was
+right that the retry test never fires, for a different reason than expected.
+Kept for the record:
 
 1. Time one ingestion turn end to end and split it into copy, session sync,
    decode, and publish. If session sync dominates, the fix is to advance the
