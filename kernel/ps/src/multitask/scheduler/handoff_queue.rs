@@ -89,3 +89,51 @@ impl<const CAPACITY: usize> SlotHandoffQueue<CAPACITY> {
         self.len
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{HandoffQueueFull, SlotHandoffQueue};
+
+    /// Direct white-box coverage for the generic FIFO custody primitive,
+    /// independent of any one scheduler-level handoff queue instantiation.
+    /// Integration paths (spawn/sync/atomic-activation handoffs) exercise
+    /// this type indirectly but do not necessarily drive it to capacity or
+    /// inspect its length after every `remove`, so this test owns those
+    /// exact boundary and post-compaction invariants.
+    #[test]
+    fn slot_handoff_queue_is_fifo_deduplicated_bounded_and_compacts_on_remove() {
+        let mut queue: SlotHandoffQueue<3> = SlotHandoffQueue::new();
+        assert!(queue.is_empty());
+
+        assert_eq!(queue.enqueue(10), Ok(true));
+        assert_eq!(queue.enqueue(10), Ok(false));
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.enqueue(20), Ok(true));
+        assert_eq!(queue.enqueue(30), Ok(true));
+        assert_eq!(queue.len(), 3);
+
+        // Capacity exhaustion is reported, not silently dropped or overwritten.
+        assert_eq!(queue.enqueue(40), Err(HandoffQueueFull));
+        assert_eq!(queue.len(), 3);
+
+        assert_eq!(queue.pop(), Some(10));
+        assert_eq!(queue.len(), 2);
+
+        // `remove` must compact both the retained entries and the length so a
+        // long-running retire/re-admit cycle cannot leak phantom occupancy
+        // that eventually starves every future handoff with a false "full".
+        assert_eq!(queue.enqueue(40), Ok(true));
+        queue.remove(30);
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue.pop(), Some(20));
+        assert_eq!(queue.pop(), Some(40));
+        assert_eq!(queue.pop(), None);
+        assert!(queue.is_empty());
+
+        // Removing an absent slot is a no-op, not a corruption.
+        assert_eq!(queue.enqueue(50), Ok(true));
+        queue.remove(999);
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.pop(), Some(50));
+    }
+}

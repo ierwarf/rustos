@@ -2686,6 +2686,43 @@ mod tests {
         });
     }
 
+    /// Authority confinement: the scheduler establishes bounded priority
+    /// inheritance for a process-owned endpoint by asking for the process
+    /// owner of a live reply. That must resolve to the exact owning process
+    /// for a process-owned endpoint and to nothing at all for a task-owned
+    /// or unowned one - never a fabricated identity that could grant
+    /// donation authority the caller never held.
+    #[test]
+    fn endpoint_receiver_process_for_reply_is_exact_and_never_fabricated() {
+        with_isolated_ipc_test(|| {
+            let process_endpoint =
+                super::create_endpoint_for_process(30).expect("process endpoint");
+            let (process_reply, _) =
+                super::enqueue_endpoint_call(process_endpoint, 1, b"request")
+                    .expect("enqueue process call");
+            assert_eq!(
+                super::endpoint_receiver_process_for_reply(process_reply),
+                Some(30)
+            );
+
+            let task_endpoint = super::create_endpoint_for_task(Some(31)).expect("task endpoint");
+            let (task_reply, _) = super::enqueue_endpoint_call(task_endpoint, 2, b"request")
+                .expect("enqueue task call");
+            assert_eq!(
+                super::endpoint_receiver_process_for_reply(task_reply),
+                None
+            );
+
+            let open_endpoint = super::create_endpoint().expect("unowned endpoint");
+            let (open_reply, _) = super::enqueue_endpoint_call(open_endpoint, 3, b"request")
+                .expect("enqueue open call");
+            assert_eq!(
+                super::endpoint_receiver_process_for_reply(open_reply),
+                None
+            );
+        });
+    }
+
     #[test]
     fn process_endpoint_quota_is_bounded_and_returned_on_exit() {
         with_isolated_ipc_test(|| {

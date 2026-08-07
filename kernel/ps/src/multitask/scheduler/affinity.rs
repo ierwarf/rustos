@@ -381,6 +381,10 @@ mod tests {
             assert_eq!(scheduler.task_affinity_masks[slot], 0b0011);
         }
         assert!(Scheduler::validate_requested_mask(0b1000, 0b1111, 0b0111).is_err());
+        // Isolate the online-mask condition from the container-mask one: a
+        // request for an offline CPU must be rejected even when the
+        // container would otherwise have admitted it.
+        assert!(Scheduler::validate_requested_mask(0b1_0000, 0b1111, 0b1_1111).is_err());
     }
 
     #[test]

@@ -17,6 +17,9 @@ import time
 from pathlib import Path
 
 
+TIMEOUT_RETURNCODE = -1024
+
+
 FIELDS = (
     "id",
     "severity",
@@ -128,16 +131,31 @@ def run_test(
     env["CARGO_TARGET_DIR"] = str(target_dir)
     env["CARGO_INCREMENTAL"] = "1"
     started = time.monotonic()
-    result = subprocess.run(
-        cargo_test_command(mutation),
-        cwd=checkout,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        timeout=timeout_ms / 1000,
-        env=env,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            cargo_test_command(mutation),
+            cwd=checkout,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=timeout_ms / 1000,
+            env=env,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as expired:
+        # A mutant that does not terminate is the strongest kill there is: the
+        # witness detected it by hanging. Letting `TimeoutExpired` escape made
+        # one such mutant crash the whole suite instead, which meant the entire
+        # class of non-termination bugs - a dropped loop decrement, a missing
+        # break - could not be registered at all.
+        captured = expired.output or b""
+        if isinstance(captured, bytes):
+            captured = captured.decode("utf-8", "replace")
+        result = subprocess.CompletedProcess(
+            expired.cmd,
+            returncode=TIMEOUT_RETURNCODE,
+            stdout=captured + f"\nrustos: witness exceeded max_ms={timeout_ms}\n",
+        )
     return result, round((time.monotonic() - started) * 1000)
 
 
@@ -213,8 +231,9 @@ def evaluate_mutation(
     # start here proves compilation succeeded and makes a nonzero exit an
     # execution-time mutant kill rather than an invalid mutant.
     exact_test_started = bool(re.search(r"running [1-9][0-9]* tests?", mutant.stdout))
-    killed = mutant.returncode != 0 and (
-        bool(re.search(r"test result: FAILED", mutant.stdout)) or exact_test_started
+    killed = mutant.returncode == TIMEOUT_RETURNCODE or (
+        mutant.returncode != 0
+        and (bool(re.search(r"test result: FAILED", mutant.stdout)) or exact_test_started)
     )
     if not killed:
         detail = (

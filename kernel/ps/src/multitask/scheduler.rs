@@ -5675,4 +5675,200 @@ mod tests {
         );
         assert_eq!(scheduler.cpu_dispatch[1].lock().next_pick_hint, Some(7));
     }
+
+    /// Authority confinement: a donation edge must never be installable
+    /// where the donor and receiver are the same task, and it must never
+    /// bind a receiver that is already retired. `bind_reserved_ipc_priority`
+    /// and `inherit_ipc_priority` each carry an independent guard for this;
+    /// this test drives both call paths so a guard removed from either one
+    /// is caught here rather than only through the other's redundancy.
+    #[test]
+    fn ipc_donation_rejects_self_referential_and_retired_targets() {
+        let _process_table = process_table::tests::isolate_process_table();
+        let mut scheduler = boxed_scheduler();
+        let owner = test_process(64);
+
+        let mut donor_context = test_user_context(owner);
+        donor_context.weight = SYSTEM_CLASS_WEIGHT_FLAG | NICE_0_LOAD;
+        scheduler.contexts[1] = Some(donor_context);
+        scheduler.starts[1] = Some(TaskStart {
+            entry: noop_task_entry,
+            id: 640,
+        });
+
+        // A task cannot donate priority to itself, even with a live
+        // reservation already pending for that exact donor (which is what
+        // `bind_reserved_ipc_priority` would otherwise happily match).
+        assert!(!scheduler.inherit_ipc_priority(20, 640, 640));
+        assert!(scheduler.reserve_ipc_priority(640));
+        assert!(
+            !scheduler.bind_reserved_ipc_priority(20, 640, 640),
+            "self-referential donation must be rejected even with a live reservation"
+        );
+        assert!(scheduler.cancel_ipc_priority_reservation(640));
+
+        // A retired receiver can never gain a bound donation. `find_task_slot`
+        // already hides retired slots, so a retired receiver id resolves to
+        // no slot at all and `inherit_ipc_priority` must fail closed rather
+        // than silently install an orphaned donation via its unreserved
+        // upsert fallback.
+        scheduler.contexts[2] = Some(test_user_context(owner));
+        scheduler.starts[2] = Some(TaskStart {
+            entry: noop_task_entry,
+            id: 641,
+        });
+        scheduler.retired[2] = true;
+
+        assert!(
+            !scheduler.inherit_ipc_priority(22, 640, 641),
+            "donation must not bind a retired receiver"
+        );
+        assert!(
+            !scheduler
+                .ipc_priority_donations
+                .iter()
+                .flatten()
+                .any(|entry| entry.reply == 22),
+            "a rejected donation must not leak an entry into the table"
+        );
+    }
+
+    /// Bounded donation: the fixed-capacity donation table must reject
+    /// admission at exactly `MAX_TASK` live entries, never one past it -
+    /// the backing array has no slot beyond that bound.
+    #[test]
+    fn ipc_priority_donation_capacity_is_bounded_by_max_task() {
+        let mut scheduler = boxed_scheduler();
+        assert!(scheduler.ipc_priority_donation_capacity_available());
+        scheduler.ipc_priority_donation_len = MAX_TASK - 1;
+        assert!(scheduler.ipc_priority_donation_capacity_available());
+        scheduler.ipc_priority_donation_len = MAX_TASK;
+        assert!(!scheduler.ipc_priority_donation_capacity_available());
+    }
+
+    /// Bounded donation: a direct handoff floors the target's vruntime
+    /// toward the caller's (so it is picked promptly) but must never raise
+    /// it above what it already had - a donation can only help a receiver,
+    /// never push it backward in the fair queue.
+    #[test]
+    fn ipc_donation_floors_target_vruntime_and_never_raises_it() {
+        let mut scheduler = boxed_scheduler();
+        let base = crate::memory::paging::USER_SPACE_BASE;
+        let user_cs = crate::arch::gdt::user_code_selector().0 as u64;
+        let user_ss = crate::arch::gdt::user_data_selector().0 as u64;
+        let allocate = |scheduler: &mut Scheduler, task_id, offset| {
+            scheduler
+                .allocate_user_slot(
+                    task_id,
+                    ProcessAddressSpace::empty_for_tests(),
+                    UserTaskBootstrap::new(
+                        UserAbi::Linux,
+                        x86_64::VirtAddr::new(base + offset),
+                        x86_64::VirtAddr::new(base + offset + 0x1_000),
+                    ),
+                    None,
+                    crate::arch::pit::divisor_from_micros(100),
+                    user_cs,
+                    user_ss,
+                    super::RFLAGS_RESERVED_BIT_1,
+                    false,
+                    noop_task_entry,
+                )
+                .expect("user slot")
+        };
+        let caller = allocate(&mut scheduler, 661, 0x2_000);
+        let target = allocate(&mut scheduler, 662, 0x4_000);
+        scheduler.current_task = caller;
+        scheduler.contexts[caller]
+            .as_mut()
+            .expect("caller context")
+            .vruntime_ns = 10_000_000;
+        scheduler.contexts[target]
+            .as_mut()
+            .expect("target context")
+            .vruntime_ns = 50_000_000;
+
+        scheduler.apply_ipc_donation(target);
+        let floored = scheduler.contexts[target]
+            .expect("target context")
+            .vruntime_ns;
+        assert!(
+            floored <= 10_000_000,
+            "donation must floor the target toward the caller, got {floored}"
+        );
+
+        // Whatever the computed floor is, a donation is a `min()` against the
+        // target's current vruntime: it can only hold it steady or lower it,
+        // never raise it above where it already stood.
+        scheduler.contexts[target]
+            .as_mut()
+            .expect("target context")
+            .vruntime_ns = 1_000;
+        scheduler.apply_ipc_donation(target);
+        assert!(
+            scheduler.contexts[target]
+                .expect("target context")
+                .vruntime_ns
+                <= 1_000,
+            "donation must never raise a target's vruntime above its prior value"
+        );
+
+        // The donated floor is the *tighter* (smaller) of the caller's own
+        // floor and the target class's floor, not the looser one: swapping
+        // `min` for `max` here cannot be caught by a bound that only checks
+        // "never raised", because the outer `.min()` against the target's
+        // prior value still absorbs an over-large floor. Isolate the two
+        // floor sources (caller is System class so it drops out of the
+        // target's own User-class scan) and pin the exact result.
+        scheduler.contexts[caller]
+            .as_mut()
+            .expect("caller context")
+            .weight = SYSTEM_CLASS_WEIGHT_FLAG | NICE_0_LOAD;
+        scheduler.contexts[caller]
+            .as_mut()
+            .expect("caller context")
+            .vruntime_ns = 20_000_000;
+        scheduler.contexts[target]
+            .as_mut()
+            .expect("target context")
+            .vruntime_ns = 100_000_000;
+        scheduler.apply_ipc_donation(target);
+        assert_eq!(
+            scheduler.contexts[target]
+                .expect("target context")
+                .vruntime_ns,
+            18_000_000,
+            "the donated floor must be the tighter (smaller) of the caller and class floors"
+        );
+
+        // A task cannot donate to itself: `target_slot == current_task_slot()`
+        // must short-circuit before any vruntime mutation.
+        let self_vruntime_before = scheduler.contexts[caller]
+            .expect("caller context")
+            .vruntime_ns;
+        scheduler.apply_ipc_donation(caller);
+        assert_eq!(
+            scheduler.contexts[caller]
+                .expect("caller context")
+                .vruntime_ns,
+            self_vruntime_before,
+            "a task must never donate to itself"
+        );
+
+        // Idle-thread invariant: an idle-classed slot can never receive a
+        // donation, even if it otherwise looks runnable.
+        scheduler.idle_cpu[target] = 0;
+        scheduler.contexts[target]
+            .as_mut()
+            .expect("target context")
+            .vruntime_ns = 999_999;
+        scheduler.apply_ipc_donation(target);
+        assert_eq!(
+            scheduler.contexts[target]
+                .expect("target context")
+                .vruntime_ns,
+            999_999,
+            "an idle-classed slot must never be donated to"
+        );
+    }
 }
