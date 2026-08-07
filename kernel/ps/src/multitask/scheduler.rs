@@ -91,6 +91,15 @@ use runtime_profile::SchedulerPhase;
 // panic. Keep the scheduler allocation-free and explicitly bounded, but size
 // the product contract for service growth and application headroom.
 pub(super) const MAX_TASK: usize = 128;
+/// How far a priority donation may propagate before the chain is truncated.
+///
+/// A real chain is a client calling a service that calls another service; four
+/// levels covers that with room to spare, and anything deeper is either a
+/// pathological topology or an attempt to drive kernel-stack depth from
+/// userspace. The bound is what keeps the recursion in `effective_slot_class`
+/// a constant cost inside the global scheduler lock rather than one that grows
+/// with how many tasks happen to be waiting on each other.
+const MAX_IPC_DONATION_CHAIN_DEPTH: usize = 4;
 /// Sentinel for an unresolved donor-slot hint. `MAX_TASK` fits in `u8`, so the
 /// hint table stays one cache-friendly byte per donation entry.
 const NO_SLOT_HINT: u8 = u8::MAX;
@@ -1096,7 +1105,7 @@ impl Scheduler {
     /// from silently becoming a strict-priority capability.
     fn slot_class(&self, slot: usize) -> Option<SchedClass> {
         let mut visiting = [false; MAX_TASK];
-        self.effective_slot_class(slot, &mut visiting)
+        self.effective_slot_class(slot, &mut visiting, 0)
     }
 
     /// Returns the kernel-derived effective IPC/scheduling class for a live
@@ -1112,11 +1121,29 @@ impl Scheduler {
         &self,
         slot: usize,
         visiting: &mut [bool; MAX_TASK],
+        depth: usize,
     ) -> Option<SchedClass> {
         let base = self.base_slot_class(slot)?;
         // A System task cannot be promoted further and root-idle must remain
         // an idle fallback even if stale external state tried to reference it.
         if base != SchedClass::User || visiting[slot] {
+            return Some(base);
+        }
+        // `visiting` breaks cycles but says nothing about depth, and this
+        // recurses on the kernel stack inside the global scheduler lock. A
+        // chain of `MAX_TASK` donations would be 128 nested frames there.
+        // seL4 proves acyclicity and a bounded chain depth as two separate
+        // properties for exactly this reason; only the first was expressed
+        // here. Truncating returns the base class, which under-promotes rather
+        // than over-promotes - the safe direction, since a donation only ever
+        // raises urgency.
+        if depth >= MAX_IPC_DONATION_CHAIN_DEPTH {
+            crate::debug::record_milestone(
+                crate::debug::LogCategory::Sched,
+                "ipc-donation-chain-truncated",
+                slot as u64,
+                depth as u64,
+            );
             return Some(base);
         }
         visiting[slot] = true;
@@ -1137,7 +1164,9 @@ impl Scheduler {
             let Some(donor_slot) = self.resolve_donation_slot(index, donation.donor_task_id) else {
                 continue;
             };
-            let Some(donor_class) = self.effective_slot_class(donor_slot, visiting) else {
+            let Some(donor_class) =
+                self.effective_slot_class(donor_slot, visiting, depth.saturating_add(1))
+            else {
                 continue;
             };
             if donor_class < effective {
