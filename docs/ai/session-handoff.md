@@ -997,24 +997,32 @@ Zircon's `ZX_CHANNEL_READABLE` deasserts for free because the kernel owns the
 queue. Ours is in ring 3, so every edge costs a crossing, and the design has to
 price that in rather than mirror the shape.
 
-### The scheduler unit-test harness dies past three processes
+### `cfg(test)` was disabling privileged code for the wrong crate
 
-Writing a regression test for the donation depth bound produced a repeatable
-`SIGSEGV` in `kernel-ps --lib`, and it is not the assertion that fails - a test
-reduced to setup plus one `slot_class` call still segfaults. The existing
-`synchronous_ipc_donation_promotes_and_revokes_a_transitive_user_chain` passes
-and differs only in scale: three `test_process` calls and two donations against
-seven and six. `RUST_MIN_STACK=16M` does not change it, so it is not simply the
-test thread's stack.
+Trying to pin the donation depth bound with a unit test produced a repeatable
+`SIGSEGV` in `kernel-ps --lib`. It was not the harness and not the process
+count: probes creating seven processes and seven scheduler contexts both pass.
+The whole failure reduces to one line.
 
-`MAX_PROCESS_OBJECTS` is 32, so capacity is not the limit either, and Rust would
-panic rather than segfault on an out-of-bounds index. The suspicion is
-`ProcessAddressSpace::empty_for_tests()` or something reachable from
-`process_table::create_process` doing unsafe work that only shows up once
-several handles are live at once.
+    crate::debug::record_milestone(LogCategory::Sched, "probe-alone", 1, 2);
 
-This matters beyond the one test: it caps how much of the scheduler can be
-covered by unit tests at all, and every donation and handoff property worth
-pinning needs more than three tasks to express. Reproduce with a loop of
-`test_process` calls under `process_table::tests::isolate_process_table` and
-bisect on the count before writing more scheduler tests.
+`print_bytes_unlocked` guards its `rep outsb` with `#[cfg(not(test))]`, and
+`cfg(test)` is true only while compiling the crate that owns the test. Every
+*dependent's* test binary links `nucleus-core` with `cfg(test)` false, so a host
+process executed a port-I/O instruction and died. `try_debug_output_lock`,
+`DebugOutputGuard::drop`, and `println_emergency` had the same guard.
+
+The consequence is larger than one test: **no `kernel-ps` test could touch any
+path that records a milestone**, which is most of the donation, handoff, and
+degrade logic - including every degrade path added this session. That is why the
+scheduler's most interesting properties had no coverage.
+
+The repo already has the right predicate. `cfg(rustos_boot_image)` is set by
+`xtask`'s kernel build and asserted there, and `formal/`'s source-conformance
+lane rejects `target_os = "none"` in its place. Three cases now: bare metal runs
+the port I/O, this crate's own tests print to stderr, and a dependent's test
+binary discards - correct, since `nucleus-core` is `no_std` and a host process
+was never meant to drive a debug port.
+
+Check the other `cfg(not(test))` sites in `kernel/hal` against the same
+question before writing tests that reach them.

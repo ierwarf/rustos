@@ -270,7 +270,14 @@ fn print_byte(byte: u8) {
 
 #[cfg(rustos_debug_print_enabled)]
 fn print_bytes_unlocked(bytes: &[u8]) {
-    #[cfg(not(test))]
+    // `cfg(test)` is not the question "does this build own the hardware".
+    // It is true only while compiling *this* crate under test, so every
+    // dependent's test binary links this crate with `cfg(test)` false - and a
+    // host process then executes `rep outsb` and dies on SIGSEGV. That is why
+    // no `kernel-ps` scheduler test could touch a path recording a milestone,
+    // which is most of the donation and handoff logic. `rustos_boot_image` is
+    // the fact that actually decides it.
+    #[cfg(all(rustos_boot_image, not(test)))]
     {
         if bytes.is_empty() {
             return;
@@ -290,22 +297,31 @@ fn print_bytes_unlocked(bytes: &[u8]) {
             );
         }
     }
+    // This crate's own tests keep a visible sink. A dependent's test binary
+    // gets neither: it is `no_std` here, so there is no stderr to reach, and a
+    // discarded diagnostic is the correct outcome for a host process that was
+    // never meant to drive a debug port.
     #[cfg(test)]
     {
         for &byte in bytes {
             print_byte(byte);
         }
     }
+
+    #[cfg(all(not(rustos_boot_image), not(test)))]
+    {
+        let _ = bytes;
+    }
 }
 
 #[cfg(rustos_debug_print_enabled)]
 struct DebugOutputGuard {
     _guard: spin::MutexGuard<'static, ()>,
-    #[cfg(not(test))]
+    #[cfg(all(rustos_boot_image, not(test)))]
     restore_interrupts: bool,
 }
 
-#[cfg(all(rustos_debug_print_enabled, not(test)))]
+#[cfg(all(rustos_debug_print_enabled, rustos_boot_image, not(test)))]
 impl Drop for DebugOutputGuard {
     fn drop(&mut self) {
         if self.restore_interrupts {
@@ -316,7 +332,7 @@ impl Drop for DebugOutputGuard {
 
 #[cfg(rustos_debug_print_enabled)]
 fn try_debug_output_lock() -> Option<DebugOutputGuard> {
-    #[cfg(not(test))]
+    #[cfg(all(rustos_boot_image, not(test)))]
     {
         let restore_interrupts = x86_64::instructions::interrupts::are_enabled();
         x86_64::instructions::interrupts::disable();
@@ -334,7 +350,7 @@ fn try_debug_output_lock() -> Option<DebugOutputGuard> {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(not(rustos_boot_image), test))]
     {
         Some(DebugOutputGuard {
             _guard: DEBUG_LOCK.lock(),
@@ -820,19 +836,20 @@ pub fn println_fmt(_args: fmt::Arguments<'_>) {}
 
 #[cfg(rustos_debug_print_enabled)]
 pub fn println_emergency(args: fmt::Arguments<'_>) {
-    #[cfg(not(test))]
+    #[cfg(all(rustos_boot_image, not(test)))]
     x86_64::instructions::interrupts::without_interrupts(|| {
         let mut writer = DebugconWriter;
         let _ = writer.write_fmt(args);
         let _ = writer.write_str("\r\n");
     });
 
-    #[cfg(test)]
+    #[cfg(any(not(rustos_boot_image), test))]
     {
         let mut writer = DebugconWriter;
         let _ = writer.write_fmt(args);
         let _ = writer.write_str("\r\n");
     }
+
 }
 
 #[cfg(not(rustos_debug_print_enabled))]

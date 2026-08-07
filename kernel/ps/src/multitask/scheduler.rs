@@ -5148,6 +5148,55 @@ mod tests {
         );
     }
 
+    /// A donation chain must not turn userspace topology into kernel-stack
+    /// depth. `visiting` breaks cycles; only the depth bound stops a long
+    /// acyclic chain, and seL4 proves the two separately for this reason.
+    #[test]
+    fn ipc_donation_chain_depth_is_bounded() {
+        let _process_table = process_table::tests::isolate_process_table();
+        let mut scheduler = boxed_scheduler();
+
+        // Slot 1 is the System donor; slots 2.. are User links, each inheriting
+        // from the one before it.
+        const LINKS: u64 = super::MAX_IPC_DONATION_CHAIN_DEPTH as u64 + 2;
+        let mut donor_context = test_user_context(test_process(950));
+        donor_context.weight = SYSTEM_CLASS_WEIGHT_FLAG | NICE_0_LOAD;
+        scheduler.contexts[1] = Some(donor_context);
+        scheduler.starts[1] = Some(TaskStart {
+            entry: noop_task_entry,
+            id: 950,
+        });
+        for link in 0..LINKS {
+            let slot = 2 + link as usize;
+            let id = 960 + link;
+            scheduler.contexts[slot] = Some(test_user_context(test_process(id)));
+            scheduler.starts[slot] = Some(TaskStart {
+                entry: noop_task_entry,
+                id,
+            });
+        }
+        for link in 0..LINKS {
+            let receiver = 960 + link;
+            let donor = if link == 0 { 950 } else { receiver - 1 };
+            assert!(
+                scheduler.inherit_ipc_priority(link + 1, donor, receiver),
+                "donation {link} must be installed"
+            );
+        }
+
+        // The near end inherits System, as the nested-broker test requires.
+        assert_eq!(scheduler.slot_class(2), Some(SchedClass::System));
+
+        // Past the bound propagation stops and the link keeps its base class.
+        // Under-promoting is the safe direction: a donation only ever raises
+        // urgency, so truncation can never grant authority it should not have.
+        assert_eq!(
+            scheduler.slot_class(2 + super::MAX_IPC_DONATION_CHAIN_DEPTH),
+            Some(SchedClass::User),
+            "a chain deeper than the donation bound must not propagate"
+        );
+    }
+
     #[test]
     fn bounded_system_burst_reserves_a_ready_user_turn() {
         let _process_table = process_table::tests::isolate_process_table();
