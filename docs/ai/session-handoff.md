@@ -955,3 +955,44 @@ Kept for the record:
 Do not raise `MAX_RECORDS_PER_BROKER_TURN` first. It is the constant that makes
 the ring drainable in a bounded number of turns, and moving it hides whichever
 of the two above is real.
+
+### The 2 ms is a syscall count, and it links the two open regressions
+
+`dvm_session_sync::apply` does nothing expensive for a single record with no
+session action: clear a vector, skip two empty epoch slots, take one event, take
+the queue lock, apply one wire. Two milliseconds does not live in any of that.
+
+It lives in `InputQueue::push` and `InputQueue::pop_front`, which call
+`advance_readiness_generation`, which calls `publish_readiness`, which is a
+`SYS_RUSTOS_WAITSET_SIGNAL_BROKER` syscall issued **once per object id** - and
+there are two, native and evdev. So each readiness transition is two syscalls.
+
+Before `f69a80f` only the arrival edge published, so a run of arrivals cost two
+syscalls total. `f69a80f` made both edges publish, and with the consumer taking
+one record per wake and uiserver reading it straight back out, the queue
+oscillates empty to non-empty and back on **every single record**: two
+transitions, four syscalls, per record. That is the shape of the measured
+`sync_us=1953`.
+
+This connects the two things left open:
+
+- The ingestion turn cost is not session sync and not the drain. It is
+  readiness publication amplified by an oscillating queue.
+- `f69a80f`'s own documented regression - uiserver's reader spinning on
+  `input read slow elapsed_ms=102 events=0` with the published bit latched
+  asserted - is the same change seen from the other side.
+
+Two things to try, in this order, and measure each:
+
+1. Publish both object ids in one syscall. The wire already carries
+   `object_id`; a publication that means "inputd's queue" does not need to be
+   sent twice. Halves the cost without changing any semantics.
+2. Do not publish a deassert that no one can be waiting on. A transition to
+   empty wakes nobody; its only purpose is keeping ring0's published bit
+   current for the next `epoll` scan. If the scan is rare relative to the
+   record rate - and at one record per wake it is - the deassert can be folded
+   into the next assert, or the bit can be published without a wake.
+
+Zircon's `ZX_CHANNEL_READABLE` deasserts for free because the kernel owns the
+queue. Ours is in ring 3, so every edge costs a crossing, and the design has to
+price that in rather than mirror the shape.
