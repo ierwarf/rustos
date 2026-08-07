@@ -888,3 +888,39 @@ then and should not care - but that is an assumption, not a measurement.
 WayClick's commits keep arriving at the compositor past t=30s. If they do, the
 loss is on the client's profile emission; if they stop, it is the client's
 dispatch loop and the join will say which completion it last saw.
+
+## The input-ring credit window is a consumer-turn problem, not a drain-rate one
+
+The last run of this session ended on the failure the previous handoff already
+named, but further along: `outstanding=1279 limit=1279` after **3673** forwarded
+events, against 1692 before the backlog re-arm landed. The consumer now gets
+more than twice as far and still pins at the ring size, so the re-arm was
+necessary and is not sufficient.
+
+The arithmetic is worth writing down because it says where to look.
+`MAX_RECORDS_PER_BROKER_TURN` is 256 and inputd's `ingest_scratch` is
+`INPUTD_INGEST_MAX_EVENTS`, also 256, so one broker call moves at most 256
+records and the 1279-slot ring needs five of them. The consumer cursor - which
+is the only acknowledgement L0 sees - is published to the shared aperture once
+per broker call, immediately after the copy loop. That part is prompt.
+
+What is not prompt is what inputd does *between* broker calls. Each turn runs
+`dvm_session_sync::apply`, which takes the queue lock, decodes the batch, pushes
+into the bounded queue, and may reach netd; then progress reporting; then
+`thread::yield_now()` before retrying. No cursor advances during any of it, so
+the credit window is governed by the consumer's whole turn latency rather than
+by how fast it can copy. L0's window is 50 ms.
+
+Two candidates, in the order they should be measured rather than assumed:
+
+1. Time one ingestion turn end to end and split it into copy, session sync,
+   decode, and publish. If session sync dominates, the fix is to advance the
+   cursor before it rather than after the turn.
+2. Check whether the five broker calls needed to clear a full ring actually
+   issue back to back. `ingest_batch_needs_immediate_retry` returns true only on
+   an exactly-full batch, so a 255-record batch waits for the next wake even
+   with a backlog behind it.
+
+Do not raise `MAX_RECORDS_PER_BROKER_TURN` first. It is the constant that makes
+the ring drainable in a bounded number of turns, and moving it hides whichever
+of the two above is real.
