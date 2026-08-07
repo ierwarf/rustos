@@ -15,6 +15,18 @@ case "$profile" in
     *) echo "invalid formal profile: $profile" >&2; exit 2 ;;
 esac
 
+# The formal lanes are what fill this device: each one keeps its own cargo
+# target tree, and a four-shard mutation run once exhausted the disk mid-lane -
+# which fails the gate and leaves the trees behind, strictly worse than having
+# reclaimed them first. Reclaim only when space is actually short, so an
+# ordinary run keeps its warm caches.
+reclaim_threshold_kb=$((20 * 1024 * 1024))
+available_kb="$(df -Pk "$repo_root" | awk 'NR==2 {print $4}')"
+if [[ -n "$available_kb" && "$available_kb" -lt "$reclaim_threshold_kb" ]]; then
+    printf 'formal: %s KiB free, reclaiming regenerable lane caches\n' "$available_kb"
+    bash "$repo_root/tools/reclaim-build-space.sh" || true
+fi
+
 verification_dir="$repo_root/build/formal/verification-run"
 mkdir -p "$verification_dir"
 run_marker="$(mktemp "$verification_dir/$profile.started.XXXXXX")"
