@@ -1428,12 +1428,22 @@ pub fn recv_endpoint_with_sender_and_limits(
 ) -> Result<Option<EndpointReceivedWithSender>, IpcError> {
     ENDPOINTS
         .with_mut(endpoint.raw(), |endpoint_object| {
-            let Some((lane, message_id)) = endpoint_object.next_pending() else {
-                return Ok(None);
-            };
+            // Every exit from this loop consumes the queue entry it looked at.
+            // The head of a lane is a position no failing message may keep:
+            // `consume_pending` used to run only on the success path, so one
+            // entry the receiver could not take - a stale id, a message bound
+            // to another endpoint, a request larger than the receiver's buffer
+            // - stayed at the head and was re-examined on every later receive.
+            // That is an endpoint wedged permanently by a single message, for
+            // every client of that service, and no timeout clears it: the
+            // caller's deadline reclaims its own reply and leaves the queue
+            // entry exactly where it was.
+            loop {
+                let Some((lane, message_id)) = endpoint_object.next_pending() else {
+                    return Ok(None);
+                };
 
-            let received = ENDPOINT_MESSAGES
-                .with_mut(message_id, |message| {
+                let outcome = ENDPOINT_MESSAGES.with_mut(message_id, |message| {
                     if message.endpoint_id != endpoint.raw() {
                         return Err(IpcError::InvalidHandle);
                     }
@@ -1450,10 +1460,21 @@ pub fn recv_endpoint_with_sender_and_limits(
                         attached_handles,
                         message.caller_task_id,
                     ))
-                })
-                .ok_or(IpcError::InvalidHandle)??;
-            endpoint_object.consume_pending(lane, message_id);
-            Ok(Some(received))
+                });
+
+                let Some(outcome) = outcome else {
+                    // The message object is gone - a cancelled call whose
+                    // caller reclaimed it, or an owner that exited. The lane
+                    // entry is stale, not a request; drop it and look at the
+                    // next one rather than reporting a failure the receiver
+                    // cannot act on.
+                    endpoint_object.consume_pending(lane, message_id);
+                    continue;
+                };
+
+                endpoint_object.consume_pending(lane, message_id);
+                return outcome.map(Some);
+            }
         })
         .ok_or(IpcError::InvalidHandle)?
 }
@@ -1823,10 +1844,34 @@ pub fn cancel_endpoint_call(reply: KernelReplyHandle, caller_task_id: u64) -> Re
     cancel_endpoint_call_with_transfers(reply, caller_task_id).map(|_| ())
 }
 
+/// What a cancellation actually reclaimed.
+///
+/// The two cases cost the system entirely different amounts and only one of
+/// them can compound. A call still queued is reclaimed whole: no receiver ever
+/// saw it and nothing was computed for it. A call already delivered leaves the
+/// service producing a reply that will be rejected on arrival, so the work is
+/// spent and the endpoint's next request starts that much later - the shape
+/// QNX addresses by delivering an unblock pulse to the server. Reporting the
+/// two as one success is what let ninety-eight consecutive rejected replies
+/// look like ordinary timeout handling in a measured run.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CancelledCallDisposition {
+    /// Reclaimed from the endpoint queue before any receiver took it.
+    Queued,
+    /// Already delivered; the receiver is still working on it.
+    InFlight,
+}
+
+#[derive(Debug)]
+pub struct CancelledCall {
+    pub transfers: Vec<KernelTransferredHandle>,
+    pub disposition: CancelledCallDisposition,
+}
+
 pub fn cancel_endpoint_call_with_transfers(
     reply: KernelReplyHandle,
     caller_task_id: u64,
-) -> Result<Vec<KernelTransferredHandle>, IpcError> {
+) -> Result<CancelledCall, IpcError> {
     let message_id = REPLIES
         .with(reply.raw(), |reply| {
             (!reply.consumed).then_some(reply.message_id)
@@ -1841,14 +1886,17 @@ pub fn cancel_endpoint_call_with_transfers(
         .ok_or(IpcError::InvalidArgument)?;
 
     let mut marked = false;
+    let mut was_queued = false;
     if ENDPOINTS
         .with_mut(endpoint_id, |endpoint| {
+            let before = endpoint.pending_len();
             endpoint
                 .pending_messages
                 .retain(|pending_message_id| *pending_message_id != message_id);
             endpoint
                 .pending_system_messages
                 .retain(|pending_message_id| *pending_message_id != message_id);
+            was_queued = endpoint.pending_len() != before;
             marked = mark_endpoint_call_consumed(message_id, reply.raw(), caller_task_id);
         })
         .is_none()
@@ -1863,7 +1911,14 @@ pub fn cancel_endpoint_call_with_transfers(
         .remove(message_id)
         .ok_or(IpcError::InvalidHandle)?;
     let _ = REPLIES.remove(reply.raw());
-    Ok(transfers_from_message(message))
+    Ok(CancelledCall {
+        transfers: transfers_from_message(message),
+        disposition: if was_queued {
+            CancelledCallDisposition::Queued
+        } else {
+            CancelledCallDisposition::InFlight
+        },
+    })
 }
 
 /// Cancels every endpoint call owned by a task being retired.  The caller may
@@ -1883,10 +1938,10 @@ pub fn cancel_endpoint_calls_for_task(
         let Some(reply_id) = ENDPOINT_MESSAGES.with(message_id, |message| message.reply_id) else {
             continue;
         };
-        let transfers =
+        let cancelled_call =
             cancel_endpoint_call_with_transfers(KernelReplyHandle::from_raw(reply_id), task_id)
                 .expect("published task-owned endpoint call lost exact cancellation state");
-        release_transfers(&transfers);
+        release_transfers(&cancelled_call.transfers);
         cancelled += 1;
     }
     if ENDPOINT_MESSAGES

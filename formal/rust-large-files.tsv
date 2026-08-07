@@ -1,6 +1,6 @@
 # path	line_limit	owner	required split boundary
 kernel/compat/src/user/process/linux.rs	1767	compat-process	Split ELF state, signal frame, and Linux task lifecycle.
-kernel/compat/src/user/syscall/linux/ipc_ops.rs	3317	compat-ipc	Split endpoint calls, shared regions, handle transfer, and tests.
+kernel/compat/src/user/syscall/linux/ipc_ops.rs	3331	compat-ipc	Split endpoint calls, shared regions, handle transfer, and tests.
 kernel/compat/src/user/syscall/linux/proc_broker_ops.rs	1920	compat-process-broker	Split spawn, exec, wait, signal, and retirement broker clients.
 kernel/compat/src/user/syscall/linux/service_ops/ipc_helpers.rs	1857	compat-service-ipc	Split typed calls, response admission, retry policy, and tests.
 kernel/compat/src/user/syscall/linux/service_ops/poll_epoll.rs	1393	compat-waitset	Split poll translation, epoll registration, waits, and lifecycle tests.
@@ -8,7 +8,7 @@ kernel/compat/src/user/syscall/linux/service_ops/vfs_meta.rs	1634	compat-vfs	Spl
 kernel/compat/src/user/syscall/linux/service_ops/vfs_socket.rs	1600	compat-vfs	Split file-descriptor transport, socket transport, and response admission.
 kernel/io-manager/src/io/dvm_block.rs	1595	io-block	Split protocol admission, queue lifecycle, DMA aperture, and tests.
 kernel/io-manager/src/io/dvm_display.rs	1796	io-display	Split handshake, shared-surface lifecycle, present queue, and tests.
-kernel/ipc-runtime/src/ipc/mod.rs	3077	ipc-runtime	Split endpoint, reply, shared-region, accounting, and test modules.
+kernel/ipc-runtime/src/ipc/mod.rs	3132	ipc-runtime	Split endpoint, reply, shared-region, accounting, and test modules.
 kernel/mm/src/memory/address_space.rs	1440	memory	Split page-table mutation, VMA admission, teardown, and tests.
 kernel/ps/src/multitask/scheduler.rs	5600	scheduler	Syscall SIMD custody extracted to multitask/syscall_simd.rs; the handoff chain carries per-step self-timing until its dominant member is found and removed; next split run queues, wakeup, deadlines, switching, accounting, and tests.
 kernel/ps/src/user/handles/table.rs	1312	process-handles	Split table mutation, transfer transactions, retirement, and tests.

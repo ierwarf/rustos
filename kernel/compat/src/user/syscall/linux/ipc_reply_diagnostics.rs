@@ -13,8 +13,53 @@ const EARLY_REPLY_REJECTION_SAMPLES: usize = 4;
 static IPC_REPLY_REJECTION_COUNT: AtomicUsize = AtomicUsize::new(0);
 static IPC_REPLY_REJECTION_RATE_STATE: AtomicU64 = AtomicU64::new(u64::MAX);
 
+/// Reply ids whose caller abandoned an already-delivered call.
+///
+/// A rejected reply reports `InvalidHandle` whether the service used a bogus
+/// capability or its caller simply gave up waiting, and those are opposite
+/// diagnoses: one is a broken service, the other is a service that cannot keep
+/// pace with the deadline its callers are setting. A measured run produced
+/// ninety-eight rejections that all read `reason=1` and said nothing about
+/// which. The cancellation path knows, so it leaves the id here for the
+/// rejection to find - a small ring, because only the recent ones can still be
+/// in flight.
+const ABANDONED_REPLY_RING: usize = 32;
+static ABANDONED_REPLIES: [AtomicU64; ABANDONED_REPLY_RING] =
+    [const { AtomicU64::new(0) }; ABANDONED_REPLY_RING];
+static ABANDONED_REPLY_CURSOR: AtomicUsize = AtomicUsize::new(0);
+
+/// Reason code for a reply rejected because its caller abandoned the call.
+const REPLY_REJECTION_REASON_ABANDONED: u64 = 7;
+
+pub(super) fn note_reply_abandoned_in_flight(reply: u64) {
+    if reply == 0 {
+        return;
+    }
+    // ORDERING: Relaxed is exact; the ring owns diagnostics only and a racing
+    // writer can at worst overwrite an entry that was about to be consumed.
+    let index = ABANDONED_REPLY_CURSOR.fetch_add(1, Ordering::Relaxed) % ABANDONED_REPLY_RING;
+    ABANDONED_REPLIES[index].store(reply, Ordering::Relaxed);
+}
+
+/// Consumes the record if this reply was abandoned, so a later genuine
+/// `InvalidHandle` on a recycled id is not misattributed.
+fn take_reply_abandonment(reply: u64) -> bool {
+    if reply == 0 {
+        return false;
+    }
+    ABANDONED_REPLIES.iter().any(|slot| {
+        // ORDERING: Relaxed is exact for a diagnostic claim; the compare
+        // exchange is what makes the record single-use.
+        slot.compare_exchange(reply, 0, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    })
+}
+
 pub(super) fn record_ipc_reply_rejection(reply: u64, receiver_process_id: u64, err: IpcError) {
     let reason = match err {
+        IpcError::InvalidHandle if take_reply_abandonment(reply) => {
+            REPLY_REJECTION_REASON_ABANDONED
+        }
         IpcError::InvalidHandle => 1_u64,
         IpcError::PermissionDenied => 2,
         IpcError::PeerClosed => 3,

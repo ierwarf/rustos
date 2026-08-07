@@ -2544,9 +2544,15 @@ enum ReplyCancelReason {
 fn cancel_reply_wait(reply: KernelReplyHandle, caller_task_id: u64, reason: ReplyCancelReason) {
     let result =
         kernel_ipc_runtime::api::cancel_endpoint_call_with_transfers(reply, caller_task_id);
-    if let Ok(discarded) = &result {
+    let mut in_flight = false;
+    if let Ok(cancelled) = &result {
         let _ = multitask::release_ipc_priority(reply.raw());
-        drop_transfer_descriptors(discarded.as_slice());
+        drop_transfer_descriptors(cancelled.transfers.as_slice());
+        in_flight = cancelled.disposition
+            == kernel_ipc_runtime::api::CancelledCallDisposition::InFlight;
+        if in_flight {
+            diagnostics::note_reply_abandoned_in_flight(reply.raw());
+        }
     }
     let status = u64::from(result.is_err());
     let milestone = match reason {
@@ -2559,7 +2565,15 @@ fn cancel_reply_wait(reply: KernelReplyHandle, caller_task_id: u64, reason: Repl
         debug::LogCategory::Compat,
         milestone,
         reply.raw(),
-        ((caller_task_id & 0xffff_ffff) << 32) | ((reason as u64) << 1) | status,
+        // Bit 0 is the cancellation's own success; bit 1 says the service was
+        // already holding the request. Only the second costs a round trip that
+        // nobody will accept, so the two must be separable in the record - a
+        // run where every cancellation is `in_flight` is a service that cannot
+        // catch up, not a caller that is merely impatient.
+        ((caller_task_id & 0xffff_ffff) << 32)
+            | ((reason as u64) << 2)
+            | (u64::from(in_flight) << 1)
+            | status,
     );
     ipc_trace!(
         "ipc reply cancellation: reply={} caller={} reason={} cancel={:?}",

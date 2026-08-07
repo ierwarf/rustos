@@ -1,4 +1,5 @@
 pub use crate::ipc::{
+    CancelledCall, CancelledCallDisposition,
     ChannelIdentity, EndpointCallPriority, EndpointReceived, EndpointReceivedWithSender,
     EndpointResponseTake, EndpointResponseWithHandles, EndpointWakeSet, IpcError,
     KernelEndpointHandle, KernelReplyHandle, KernelSharedRegionHandle,
@@ -197,7 +198,7 @@ pub mod endpoint {
     pub fn cancel_call_with_transfers(
         reply: KernelReplyHandle,
         caller_task_id: u64,
-    ) -> Result<alloc::vec::Vec<KernelTransferredHandle>, IpcError> {
+    ) -> Result<crate::ipc::CancelledCall, IpcError> {
         crate::ipc::cancel_endpoint_call_with_transfers(reply, caller_task_id)
     }
 
