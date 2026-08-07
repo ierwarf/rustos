@@ -5,7 +5,7 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
-#[cfg(not(test))]
+#[cfg(all(rustos_boot_image, not(test)))]
 use x86_64::instructions::interrupts;
 
 const INPUT_WAITERS_CAPACITY: usize = crate::multitask::MAX_SCHEDULER_TASKS;
@@ -102,12 +102,15 @@ pub(crate) fn wake_input_waiters() {
 }
 
 fn with_input_waiters<R>(f: impl FnOnce(&mut [Option<u64>; INPUT_WAITERS_CAPACITY]) -> R) -> R {
-    #[cfg(test)]
+    // A dependent crate's test binary links this with `cfg(test)` false, so
+    // guarding `cli`/`sti` on `cfg(test)` would run them in a host process.
+    // `rustos_boot_image` is the fact that decides whether we own the CPU.
+    #[cfg(any(not(rustos_boot_image), test))]
     {
         f(&mut INPUT_WAITERS.lock())
     }
 
-    #[cfg(not(test))]
+    #[cfg(all(rustos_boot_image, not(test)))]
     {
         interrupts::without_interrupts(|| f(&mut INPUT_WAITERS.lock()))
     }

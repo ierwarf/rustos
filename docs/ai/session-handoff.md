@@ -1026,3 +1026,18 @@ was never meant to drive a debug port.
 
 Check the other `cfg(not(test))` sites in `kernel/hal` against the same
 question before writing tests that reach them.
+
+### Still on `cfg(test)`: the heap
+
+`kernel/mm/src/memory/heap.rs` splits the entire allocator on `cfg(test)` -
+`LockedHeap`, `HEAP_ORDER`, the size constants, and the `phys`/`kernel_vm`
+imports are all `#[cfg(not(test))]`, with a separate slot-tracking allocator
+under `#[cfg(test)]`. That means a dependent crate's test binary compiles the
+*kernel* allocator, `#[global_allocator]` and all, into a host process.
+
+It has not crashed, which is why it went unnoticed, but it is the same mistake
+as the debug port and a much larger surface. It was left alone deliberately:
+changing which allocator a test binary selects is not a change to make at the
+end of a session. Do it on its own, with `kernel-ps` and `kernel-compat` test
+suites as the check, and use `rustos_boot_image` as the predicate the way
+`debug/mod.rs`, `input/wait_queue.rs`, and `memory/phys.rs` now do.

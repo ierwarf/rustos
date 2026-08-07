@@ -17,7 +17,7 @@ use core::ptr;
 
 use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
 use x86_64::PhysAddr;
-#[cfg(not(test))]
+#[cfg(all(rustos_boot_image, not(test)))]
 use x86_64::instructions::interrupts;
 
 use crate::memory::kernel_vm::{DIRECT_MAP_PHYS_LIMIT, higher_half_addr};
@@ -32,12 +32,15 @@ static PHYS_ALLOCATOR: TrackedSpinLock<PhysAllocatorState, { LockClass::Physical
 
 #[inline]
 fn irq_safe<T>(f: impl FnOnce() -> T) -> T {
-    #[cfg(not(test))]
+    // A dependent crate's test binary links this with `cfg(test)` false, which
+    // would put `cli`/`sti` in a host process. `rustos_boot_image` is the fact
+    // that decides whether we own the CPU.
+    #[cfg(all(rustos_boot_image, not(test)))]
     {
         interrupts::without_interrupts(f)
     }
 
-    #[cfg(test)]
+    #[cfg(any(not(rustos_boot_image), test))]
     {
         f()
     }
