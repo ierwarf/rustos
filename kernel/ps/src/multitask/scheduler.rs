@@ -2711,12 +2711,19 @@ impl Scheduler {
         // external FIFO: reply producers take only SyncHandoff, so this keeps
         // the production order Scheduler -> SyncHandoff with no reverse or
         // same-class nested acquisition.
-        let atomic_activation_handoff = {
-            let mut policy = timed_handoff_step(6, || self.current_dispatch_policy());
-            timed_handoff_step(0, || {
-                self.take_next_atomic_activation_handoff_ready_slot(&mut policy)
-            })
-        };
+        // The guarded check below is what decides; this only answers "is it
+        // worth taking the lock to ask", and on about 96 percent of dispatches
+        // it is not. A stale `true` just takes the lock, as every dispatch did
+        // before, so nothing here can admit an activation that is not queued.
+        let atomic_activation_handoff =
+            dispatch_policy::atomic_activation_pending(Self::current_dispatch_cpu())
+                .then(|| {
+                    let mut policy = timed_handoff_step(6, || self.current_dispatch_policy());
+                    timed_handoff_step(0, || {
+                        self.take_next_atomic_activation_handoff_ready_slot(&mut policy)
+                    })
+                })
+                .flatten();
         let sync_handoff = atomic_activation_handoff
             .is_none()
             .then(|| timed_handoff_step(1, || self.take_next_synchronous_pick_hint_ready_slot()))

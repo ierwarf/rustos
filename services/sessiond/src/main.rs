@@ -6,7 +6,20 @@ use runtime_control::{
     decode_c_string, load_autostart_program_entries, load_startup_entries, DesktopProgramEntry,
     RuntimeClient, StartupMode, DEFAULT_APPLICATIONS_DIR, DEFAULT_AUTOSTART_DIR,
 };
+/// Cadence while a launch is in flight. Settling and timeout are both judged
+/// against this loop, so it has to stay tight whenever something is pending.
 const POLL_INTERVAL: Duration = Duration::from_millis(8);
+/// Cadence once every autostart entry has been launched and nothing is
+/// pending.
+///
+/// Each pass is a full `snapshot_running_programs` round trip to runtimed, so
+/// the 8 ms cadence costs 125 of them per second for the entire life of the
+/// session - permanently, to watch a set that only changes when a program
+/// starts or exits. Nothing reacts to that snapshot faster than a launch does,
+/// so when no launch is pending there is nothing the tight cadence buys. It is
+/// restored the moment work appears, and `restart` entries are still noticed
+/// within this interval.
+const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const LAUNCH_SETTLE_DELAY: Duration = Duration::from_millis(40);
 const LAUNCH_START_TIMEOUT: Duration = Duration::from_secs(20);
 const RETRY_BACKOFF: Duration = Duration::from_millis(200);
@@ -184,7 +197,12 @@ fn main() {
             }
         }
 
-        thread::sleep(POLL_INTERVAL);
+        // A pending launch owns the tight cadence; an idle session does not.
+        thread::sleep(if pending_launch.is_some() {
+            POLL_INTERVAL
+        } else {
+            IDLE_POLL_INTERVAL
+        });
     }
 }
 
@@ -264,4 +282,19 @@ fn package_id_from_desktop_id(desktop_id: &str) -> String {
         .strip_suffix(".desktop")
         .unwrap_or(desktop_id)
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{IDLE_POLL_INTERVAL, LAUNCH_SETTLE_DELAY, POLL_INTERVAL};
+
+    #[test]
+    fn an_idle_session_backs_off_without_slowing_launch_settling() {
+        // Settling is judged by this loop, so the pending cadence has to stay
+        // fast enough to observe the settle delay rather than overshoot it.
+        assert!(POLL_INTERVAL < LAUNCH_SETTLE_DELAY);
+        // And the idle cadence has to be a real back-off, or the round trip it
+        // was meant to remove is still being paid.
+        assert!(IDLE_POLL_INTERVAL >= POLL_INTERVAL * 8);
+    }
 }

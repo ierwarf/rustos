@@ -223,6 +223,9 @@ impl Scheduler {
                     .atomic_activation_handoff_remaining
                     .checked_add(1)
                     .expect("scheduler atomic activation handoff count overflow");
+                // Advertise the work while still holding the target's lock, so
+                // its dispatcher can skip that lock when nothing is waiting.
+                super::dispatch_policy::publish_atomic_activation_pending(target_cpu);
             } else {
                 self.set_next_spawn_pick_hint(task_id);
             }
@@ -339,12 +342,18 @@ impl Scheduler {
             policy.atomic_activation_handoff_remaining -= 1;
             let Some(hint) = policy.atomic_activation_pick_hints.pop() else {
                 policy.atomic_activation_handoff_remaining = 0;
+                super::dispatch_policy::clear_atomic_activation_pending(
+                    Self::current_dispatch_cpu(),
+                );
                 return None;
             };
             if let Some(slot) = self.pick_hint_candidate_slot(Some(hint)) {
                 return Some(slot);
             }
         }
+        // Drained under the lock: clearing here cannot lose a concurrent
+        // enqueue, because that enqueue must hold this same lock to publish.
+        super::dispatch_policy::clear_atomic_activation_pending(Self::current_dispatch_cpu());
         None
     }
 
