@@ -5,9 +5,7 @@ struct RustosSmpReadiness {
     rustos_vcpus: u8,
 }
 
-const RUSTOS_SMP_READINESS: RustosSmpReadiness = RustosSmpReadiness {
-    rustos_vcpus: 1,
-};
+const RUSTOS_SMP_READINESS: RustosSmpReadiness = RustosSmpReadiness { rustos_vcpus: 1 };
 
 impl RustosSmpReadiness {
     fn validate(
@@ -192,9 +190,7 @@ fn spawn_rustos_guest(
             "unix:{},server,nowait",
             layout.rustos_monitor.display()
         ));
-    if std::env::var_os("RUSTOS_KVM_QEMU_INT_TRACE").as_deref()
-        == Some(std::ffi::OsStr::new("1"))
-    {
+    if std::env::var_os("RUSTOS_KVM_QEMU_INT_TRACE").as_deref() == Some(std::ffi::OsStr::new("1")) {
         rustos_command
             .args(["-d", "int,cpu_reset"])
             .arg("-D")
@@ -239,7 +235,9 @@ fn spawn_rustos_guest(
         .append(append_logs)
         .truncate(!append_logs)
         .open(&layout.rustos_stderr_log)?;
-    rustos_command.stdout(Stdio::null()).stderr(Stdio::from(stderr));
+    rustos_command
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(stderr));
     rustos_command
         .spawn()
         .context("failed to start RustOS QEMU/KVM guest")
@@ -333,7 +331,9 @@ fn spawn_dvm_guest(
         .append(append_logs)
         .truncate(!append_logs)
         .open(&layout.dvm_stderr_log)?;
-    dvm_command.stdout(Stdio::null()).stderr(Stdio::from(stderr));
+    dvm_command
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(stderr));
     if let Some(doorbell) = layout.dvm_display_doorbell.as_deref() {
         append_dvm_display_doorbell(&mut dvm_command, doorbell);
         append_dvm_display_pixels(
@@ -400,15 +400,19 @@ fn append_dvm_virtual_storage(command: &mut Command, disk: &Path) {
     command
         .arg("-drive")
         .arg(format!(
-            "file={},format=raw,if=none,id=dvm-storage-disk,cache=none,aio=threads",
+            "file={},format=raw,if=none,id=dvm-storage-disk,cache=none,aio=threads,readonly=on",
             disk.display()
         ))
         .arg("-device")
         // q35 already owns exactly one ICH9 AHCI controller. Attach the
         // private namespace to that controller instead of adding a second
         // NVMe controller, which would correctly fail the storage DVM's
-        // exact-single-controller admission.
-        .arg("ide-hd,drive=dvm-storage-disk,bus=ide.0,unit=0,id=dvm-storage-disk-device");
+        // exact-single-controller admission. QEMU's non-removable ide-hd
+        // frontend rejects a read-only block node; ide-cd is the AHCI
+        // frontend that advertises immutable media to Linux. ATAPI fixes the
+        // media block size at 2048 bytes; the signed header uses that same
+        // constant while capacity remains in protocol 512-byte sectors.
+        .arg("ide-cd,drive=dvm-storage-disk,bus=ide.0,unit=0,id=dvm-storage-disk-device");
 }
 
 fn append_dvm_display_pixels(command: &mut Command, path: &Path, read_only: bool) {
@@ -507,7 +511,9 @@ fn wait_for_parallel_boot(
         let rustos_log = fs::read_to_string(&layout.debugcon_log)?;
         let dvm_log = fs::read_to_string(&layout.dvm_serial_log)?;
         if options.expect_block_flush_fault && rustos_log.contains(RUSTOS_DVM_BLOCK_E2E_MARKER) {
-            bail!("storage-DVM flush fault proof observed an impossible E2E flush-success marker");
+            bail!(
+                "storage-DVM flush fault proof observed an impossible media-barrier success marker"
+            );
         }
         if options.gui_dvm_surfaces
             && let Some(failure) = dvm_display_failure(&dvm_log, options.physical_gpu_bdf.is_some())
@@ -520,6 +526,8 @@ fn wait_for_parallel_boot(
             .all(|marker| rustos_marker_present(&rustos_log, marker));
         let smp_runtime_ready =
             smp_runtime_missing_markers(&rustos_log, options.rustos_vcpus).is_empty();
+        let smp_ring3_qualification_ready = !options.smp_ring3_qualification
+            || smp_ring3_qualification_is_complete(&rustos_log, options.rustos_vcpus);
         let dvm_ready = options
             .expected_dvm_markers
             .iter()
@@ -602,6 +610,7 @@ fn wait_for_parallel_boot(
                 && rustos_log.contains(NETPROBE_QEMU_REACHABLE_MARKER));
         if rustos_ready
             && smp_runtime_ready
+            && smp_ring3_qualification_ready
             && dvm_ready
             && dvm_gpu_ready
             && ui_fps_ready
@@ -626,6 +635,9 @@ fn wait_for_parallel_boot(
                 &rustos_log,
                 options.rustos_vcpus,
             ));
+            if options.smp_ring3_qualification && !smp_ring3_qualification_ready {
+                missing_rustos.push("smp-ring3-qualification-v1".to_owned());
+            }
             let missing_dvm = options
                 .expected_dvm_markers
                 .iter()
@@ -774,12 +786,8 @@ impl RecoveryHarness<'_> {
                 self.layout.dvm_block_aperture.as_deref(),
                 self.layout.dvm_block_disk.as_deref(),
             ) {
-                create_dvm_block_aperture(
-                    aperture,
-                    disk,
-                    &self.config.storage_epoch_signing_key,
-                )
-                .context("reset signed DVM block region")?;
+                create_dvm_block_aperture(aperture, disk, &self.config.storage_epoch_signing_key)
+                    .context("reset signed DVM block region")?;
             }
             // QEMU's file chardev does not preserve append semantics uniformly
             // across supported distro builds. Give a fresh guest a fresh
@@ -865,17 +873,24 @@ impl RecoveryHarness<'_> {
                     .wait_for_exact_peer_count(1, DVM_BLOCK_FIRST_PEER_TIMEOUT)
                     .context("block DVM peer did not retire before restart")?;
             }
-            if let (Some(aperture), Some(disk)) = (
-                self.layout.dvm_block_aperture.as_deref(),
-                self.layout.dvm_block_disk.as_deref(),
-            ) {
-                rotate_dvm_block_epoch(
-                    aperture,
-                    disk,
-                    &self.config.storage_epoch_signing_key,
+            let successor_block_generation = if self.options.dvm_block_shmem {
+                let aperture = self
+                    .layout
+                    .dvm_block_aperture
+                    .as_deref()
+                    .context("DVM restart lost its block aperture")?;
+                let disk = self
+                    .layout
+                    .dvm_block_disk
+                    .as_deref()
+                    .context("DVM restart lost its block backing disk")?;
+                Some(
+                    rotate_dvm_block_epoch(aperture, disk, &self.config.storage_epoch_signing_key)
+                        .context("publish signed successor DVM block epoch")?,
                 )
-                .context("publish signed successor DVM block epoch")?;
-            }
+            } else {
+                None
+            };
             archive_recovery_log(&self.layout.dvm_serial_log)?;
             let recovery_relay = start_dvm_input_relay(
                 self.config,
@@ -903,6 +918,7 @@ impl RecoveryHarness<'_> {
                 self.options,
                 rustos_offset,
                 0,
+                successor_block_generation,
                 &recovery_relay,
             )?;
         }
@@ -923,11 +939,14 @@ fn wait_for_rustos_reboot_recovery(
     let mut control_ready = None;
     loop {
         check_guest_running(rustos, "fresh RustOS reboot", &layout.rustos_stderr_log)?;
-        check_guest_running(dvm, "Linux DVM during RustOS reboot", &layout.dvm_stderr_log)?;
+        check_guest_running(
+            dvm,
+            "Linux DVM during RustOS reboot",
+            &layout.dvm_stderr_log,
+        )?;
         let rustos_log = runtime_log_suffix(&layout.debugcon_log, rustos_offset)?;
         let dvm_log = runtime_log_suffix(&layout.dvm_serial_log, dvm_offset)?;
-        if runtime_stall_or_crash_observed(&rustos_log)
-            || runtime_stall_or_crash_observed(&dvm_log)
+        if runtime_stall_or_crash_observed(&rustos_log) || runtime_stall_or_crash_observed(&dvm_log)
         {
             bail!("RustOS reboot recovery observed a watchdog, stall, crash, or relay stop");
         }
@@ -1006,17 +1025,21 @@ fn wait_for_dvm_restart_recovery(
     options: &SmokeOptions,
     rustos_offset: usize,
     dvm_offset: usize,
+    expected_block_generation: Option<u64>,
     control_relay: &Receiver<Result<ProbeResult>>,
 ) -> Result<ProbeResult> {
     let deadline = Instant::now() + options.timeout;
     let mut control_ready = None;
     loop {
-        check_guest_running(rustos, "RustOS during DVM restart", &layout.rustos_stderr_log)?;
+        check_guest_running(
+            rustos,
+            "RustOS during DVM restart",
+            &layout.rustos_stderr_log,
+        )?;
         check_guest_running(dvm, "restarted Linux DVM", &layout.dvm_stderr_log)?;
         let rustos_log = runtime_log_suffix(&layout.debugcon_log, rustos_offset)?;
         let dvm_log = runtime_log_suffix(&layout.dvm_serial_log, dvm_offset)?;
-        if runtime_stall_or_crash_observed(&rustos_log)
-            || runtime_stall_or_crash_observed(&dvm_log)
+        if runtime_stall_or_crash_observed(&rustos_log) || runtime_stall_or_crash_observed(&dvm_log)
         {
             bail!("DVM restart recovery observed a watchdog, stall, crash, or relay stop");
         }
@@ -1036,8 +1059,13 @@ fn wait_for_dvm_restart_recovery(
         let display_ready = !options.gui_dvm_surfaces
             || (rustos_log.contains(GUI_DVM_OFFLINE_MARKER)
                 && rustos_log.contains(GUI_DVM_REBOUND_MARKER));
-        let storage_ready = !options.dvm_block_shmem
-            || rustos_log.contains("dvm-block: signed transport epoch rebound generation=");
+        let storage_ready = match expected_block_generation {
+            Some(generation) => {
+                rustos_log.contains("dvm-block: signed transport epoch rebound generation=")
+                    && verify_dvm_block_ready_generation(layout, generation).is_ok()
+            }
+            None => !options.dvm_block_shmem,
+        };
         if dvm_ready
             && display_ready
             && storage_ready

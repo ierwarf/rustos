@@ -468,7 +468,7 @@ pub(crate) fn gpu_atlas_slot_mapping(slot: u32) -> Option<(u64, *mut u8, usize)>
     if cached != 0 {
         return Some((phys_start, cached as *mut u8, len));
     }
-    let mapping = crate::driver::mmio::map(phys_start, len, true).cast::<u8>();
+    let mapping = crate::driver::mmio::map_write_combining(phys_start, len).cast::<u8>();
     if mapping.is_null() {
         return None;
     }
@@ -1578,7 +1578,7 @@ fn arm_gui_dvm_interrupts(device: crate::arch::pci::PciDevice) -> Option<GuiInte
     let Some(offline_message) = offline_lease.message() else {
         return None;
     };
-    let table = crate::driver::mmio::map(table_resource.start, table_len, false).cast::<u8>();
+    let table = crate::driver::mmio::map_uncached(table_resource.start, table_len).cast::<u8>();
     if table.is_null() {
         return None;
     }
@@ -1659,10 +1659,9 @@ fn find_ivshmem_gui_pool() -> Option<MappedGuiDvmPool> {
         {
             return false;
         }
-        let control = crate::driver::mmio::map(
+        let control = crate::driver::mmio::map_uncached(
             resource.start,
             DVM_GUI_SURFACE_POOL_HEADER_BYTES as usize,
-            false,
         )
         .cast::<u8>();
         if control.is_null() {
@@ -1675,7 +1674,8 @@ fn find_ivshmem_gui_pool() -> Option<MappedGuiDvmPool> {
         // BAR0 contains ivshmem control/doorbell registers, not framebuffer
         // memory. Both BAR0 and the BAR2 control header require uncached MMIO;
         // pixels live in the separately reserved cacheable memory device.
-        let doorbell = crate::driver::mmio::map(registers.start, registers_len, false).cast::<u8>();
+        let doorbell =
+            crate::driver::mmio::map_uncached(registers.start, registers_len).cast::<u8>();
         if doorbell.is_null() {
             release_gui_mappings(control, doorbell);
             return false;

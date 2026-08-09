@@ -2,6 +2,8 @@
 
 config BR2_PACKAGE_RUSTOS_DVM_NET
 	bool "rustos-dvm-net"
+	depends on BR2_LINUX_KERNEL
 	help
 	  Bounded raw Ethernet relay between the DVM-owned Linux NIC and the
-	  host-created RustOS two-ring ivshmem network transport.
+	  host-created RustOS two-ring ivshmem network transport. The package
+	  includes the exact-layout WB UIO adapter used by the relay.

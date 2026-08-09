@@ -360,6 +360,26 @@ static REMOTE_WAKE_MAILBOXES: [TrackedSpinLock<
 >; MAX_TRACKED_CPUS] = [const { TrackedSpinLock::new(RemoteWakeMailbox::new()) }; MAX_TRACKED_CPUS];
 static MAILBOX_PENDING: [AtomicU64; MAX_TRACKED_CPUS] =
     [const { AtomicU64::new(0) }; MAX_TRACKED_CPUS];
+#[cfg(test)]
+static TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+#[cfg(test)]
+static TEST_LOCAL_MIGRATING_OWNER: std::sync::Mutex<Option<RunOwnerSnapshot>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn record_test_local_migrating_owner(owner: RunOwnerSnapshot) {
+    *TEST_LOCAL_MIGRATING_OWNER.lock().unwrap() = Some(owner);
+}
+
+#[cfg(test)]
+fn take_test_local_migrating_owner() -> Option<RunOwnerSnapshot> {
+    TEST_LOCAL_MIGRATING_OWNER.lock().unwrap().take()
+}
+
+#[cfg(test)]
+fn reset_test_local_migrating_owner() {
+    *TEST_LOCAL_MIGRATING_OWNER.lock().unwrap() = None;
+}
 
 fn bitmap_location(slot: usize) -> (usize, u64) {
     assert!(slot < MAX_TASK, "scheduler rq slot exceeds capacity");
@@ -383,6 +403,11 @@ pub(super) fn reset_before_publication() {
         *mailbox = RemoteWakeMailbox::new();
         MAILBOX_PENDING[cpu].store(0, Ordering::Release);
     }
+}
+
+#[cfg(test)]
+pub(super) fn test_serial_guard() -> std::sync::MutexGuard<'static, ()> {
+    TEST_GUARD.lock().unwrap()
 }
 
 pub(super) fn owner(slot: usize) -> RunOwnerSnapshot {
@@ -581,6 +606,8 @@ pub(super) fn rehome_queued(slot: usize, target_cpu: usize, weight: u32) -> Remo
                     RUN_QUEUES[source_cpu].publish_load(&source);
                     continue;
                 }
+                #[cfg(test)]
+                record_test_local_migrating_owner(migrating);
                 RUN_QUEUES[source_cpu].publish_load(&source);
                 drop(source);
                 return publish_migrating_record(slot, migrating, target_cpu, weight);
@@ -750,16 +777,21 @@ pub(super) fn local_dispatch_work_pending(cpu: usize) -> bool {
     runnable_count != 0 || MAILBOX_PENDING[cpu].load(Ordering::Acquire) != 0
 }
 
-pub(super) fn is_local_runnable(slot: usize, cpu: usize) -> bool {
+/// Returns whether one acquire snapshot authorizes this CPU to dispatch `slot`.
+///
+/// `Local` names queue custody, but does not by itself authorize execution: a
+/// task may have blocked after its queue owner was published. The runnable bit
+/// and queue CPU must therefore come from this same owner snapshot.
+pub(super) fn is_local_dispatchable(slot: usize, cpu: usize) -> bool {
     validate_cpu(cpu);
     let owner = owner(slot);
-    owner.state == RunOwnerState::Local && owner.cpu == Some(cpu)
+    owner.state == RunOwnerState::Local && owner.cpu == Some(cpu) && owner.runnable
 }
 
 pub(super) fn claim_dispatch(slot: usize, cpu: usize, weight: u32) -> bool {
     validate_cpu(cpu);
     let owner = owner(slot);
-    if owner.state != RunOwnerState::Local || owner.cpu != Some(cpu) {
+    if owner.state != RunOwnerState::Local || owner.cpu != Some(cpu) || !owner.runnable {
         return false;
     }
     let mut rq = RUN_QUEUES[cpu].inner.lock();
@@ -863,9 +895,27 @@ pub(super) fn least_loaded_cpu(eligible_mask: u64, fallback_cpu: usize) -> usize
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
 
-    static TEST_GUARD: Mutex<()> = Mutex::new(());
+    struct RunQueueTestScope {
+        _serial: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl RunQueueTestScope {
+        fn new() -> Self {
+            let serial = TEST_GUARD.lock().unwrap();
+            reset_before_publication();
+            reset_test_local_migrating_owner();
+            Self { _serial: serial }
+        }
+    }
+
+    impl Drop for RunQueueTestScope {
+        fn drop(&mut self) {
+            reset_before_publication();
+            reset_test_local_migrating_owner();
+        }
+    }
 
     #[test]
     fn remote_wake_has_one_mailbox_and_one_local_owner() {
@@ -884,7 +934,7 @@ mod tests {
             RunOwnerSnapshot::new(RunOwnerState::RemoteQueued, Some(2), 3)
         );
         assert_eq!(drain_remote_wakes(2), 1);
-        assert!(is_local_runnable(7, 2));
+        assert!(is_local_dispatchable(7, 2));
         assert!(claim_dispatch(7, 2, 1024));
         assert_eq!(owner(7).state, RunOwnerState::Running);
         publish_blocked(7, 2, 1024);
@@ -922,7 +972,49 @@ mod tests {
         admit_blocked(11);
         publish_local(11, 3, 200);
         assert!(!claim_dispatch(11, 4, 200));
-        assert!(is_local_runnable(11, 3));
+        assert!(is_local_dispatchable(11, 3));
+    }
+
+    #[test]
+    fn nonrunnable_local_slot_cannot_be_claimed_until_its_exact_wake() {
+        let _scope = RunQueueTestScope::new();
+        let slot = 12;
+        let cpu = 3;
+        let weight = 220;
+        admit_blocked(slot);
+        publish_local(slot, cpu, weight);
+        set_runnable(slot, false);
+        let blocked = owner(slot);
+
+        assert_eq!(blocked.state, RunOwnerState::Local);
+        assert_eq!(blocked.cpu, Some(cpu));
+        assert!(!blocked.runnable);
+        assert!(!is_local_dispatchable(slot, cpu));
+        assert!(
+            !claim_dispatch(slot, cpu, weight),
+            "a Local owner with runnable=false must not consume queue custody"
+        );
+        assert_eq!(
+            owner(slot),
+            blocked,
+            "rejected claim must not advance generation"
+        );
+        assert_eq!(
+            published_runnable_count(cpu),
+            1,
+            "rejected claim must preserve queue membership"
+        );
+
+        set_runnable(slot, true);
+        let restored = owner(slot);
+        assert!(is_local_dispatchable(slot, cpu));
+        assert!(claim_dispatch(slot, cpu, weight));
+        let claimed = owner(slot);
+        assert_eq!(claimed.state, RunOwnerState::Running);
+        assert_eq!(claimed.cpu, Some(cpu));
+        assert!(claimed.runnable);
+        assert_eq!(claimed.generation, restored.generation + 1);
+        assert_eq!(published_runnable_count(cpu), 0);
     }
 
     #[test]
@@ -943,11 +1035,11 @@ mod tests {
             RemoteWakeOutcome::Published { cpu: 1, .. }
         ));
         assert_eq!(drain_remote_wakes(4), 1);
-        assert!(!is_local_runnable(13, 4));
+        assert!(!is_local_dispatchable(13, 4));
         // CPU 1 receives one current record rather than the old and new
         // generations occupying two finite mailbox entries.
         assert_eq!(drain_remote_wakes(1), 1);
-        assert!(is_local_runnable(13, 1));
+        assert!(is_local_dispatchable(13, 1));
     }
 
     #[test]
@@ -999,5 +1091,170 @@ mod tests {
         assert!(local_dispatch_work_pending(6));
         assert!(claim_dispatch(22, 6, 250));
         assert!(!local_dispatch_work_pending(6));
+    }
+
+    #[test]
+    fn migrating_owner_remains_runnable_until_mailbox_admission() {
+        let _guard = TEST_GUARD.lock().unwrap();
+        reset_before_publication();
+        let slot = 31;
+        let target_cpu = 4;
+        admit_blocked(slot);
+        let blocked = owner(slot);
+        let migrating = blocked.next(RunOwnerState::Migrating, Some(target_cpu));
+        OWNER_WORDS[slot]
+            .compare_exchange(blocked, migrating)
+            .expect("test migration owner publication");
+
+        assert_eq!(owner(slot), migrating);
+        assert!(
+            owner(slot).runnable,
+            "the migration handoff must remain schedulable before target mailbox admission"
+        );
+        assert!(matches!(
+            publish_migrating_record(slot, migrating, target_cpu, 125),
+            RemoteWakeOutcome::Published { cpu: 4, .. }
+        ));
+        assert!(owner(slot).runnable);
+        assert_eq!(drain_remote_wakes(target_cpu), 1);
+        assert!(is_local_dispatchable(slot, target_cpu));
+        retire(slot, 125);
+        release_retired(slot);
+        reset_before_publication();
+    }
+
+    #[test]
+    fn running_owner_runnable_bit_tracks_block_and_wake() {
+        let _guard = TEST_GUARD.lock().unwrap();
+        reset_before_publication();
+        let slot = 32;
+        let cpu = 2;
+        admit_running(slot, cpu);
+        assert!(owner(slot).runnable);
+
+        set_runnable(slot, false);
+        assert_eq!(owner(slot).state, RunOwnerState::Running);
+        assert_eq!(owner(slot).cpu, Some(cpu));
+        assert!(
+            !owner(slot).runnable,
+            "a running task that blocks must withdraw only its runnable bit"
+        );
+
+        set_runnable(slot, true);
+        assert_eq!(owner(slot).state, RunOwnerState::Running);
+        assert_eq!(owner(slot).cpu, Some(cpu));
+        assert!(
+            owner(slot).runnable,
+            "a wake raced with the running owner must restore its runnable bit"
+        );
+        retire(slot, 100);
+        release_retired(slot);
+        reset_before_publication();
+    }
+
+    #[test]
+    fn running_task_may_requeue_only_on_its_owner_cpu() {
+        let _guard = TEST_GUARD.lock().unwrap();
+        reset_before_publication();
+        let slot = 33;
+        let owner_cpu = 2;
+        admit_running(slot, owner_cpu);
+        let before = owner(slot);
+
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| publish_local(slot, owner_cpu + 1, 220))).is_err(),
+            "a foreign CPU cannot publish a running task into its local queue"
+        );
+        assert_eq!(owner(slot), before);
+        assert_eq!(published_runnable_count(owner_cpu), 0);
+        assert_eq!(published_runnable_count(owner_cpu + 1), 0);
+
+        publish_local(slot, owner_cpu, 220);
+        assert!(is_local_dispatchable(slot, owner_cpu));
+        assert_eq!(published_runnable_count(owner_cpu), 1);
+        retire(slot, 220);
+        release_retired(slot);
+        reset_before_publication();
+    }
+
+    #[test]
+    fn local_block_removes_exact_queue_membership() {
+        let _guard = TEST_GUARD.lock().unwrap();
+        reset_before_publication();
+        let cpu = 3;
+        let blocked = 34;
+        let unaffected = 35;
+        admit_blocked(blocked);
+        admit_blocked(unaffected);
+        publish_local(blocked, cpu, 140);
+        publish_local(unaffected, cpu, 160);
+        assert_eq!(published_runnable_count(cpu), 2);
+
+        publish_blocked(blocked, cpu, 140);
+        assert_eq!(owner(blocked).state, RunOwnerState::Blocked);
+        assert_eq!(owner(blocked).cpu, None);
+        assert!(!is_local_dispatchable(blocked, cpu));
+        assert_eq!(published_runnable_count(cpu), 1);
+        assert!(
+            is_local_dispatchable(unaffected, cpu),
+            "blocking one slot must preserve every other local membership"
+        );
+
+        retire(blocked, 140);
+        release_retired(blocked);
+        retire(unaffected, 160);
+        release_retired(unaffected);
+        reset_before_publication();
+    }
+
+    #[test]
+    fn migration_owner_names_target_until_mailbox_publication() {
+        let _scope = RunQueueTestScope::new();
+        let slot = 36;
+        let source_cpu = 1;
+        let target_cpu = 5;
+        let weight = 180;
+        admit_blocked(slot);
+        publish_local(slot, source_cpu, weight);
+
+        assert!(matches!(
+            rehome_queued(slot, target_cpu, weight),
+            RemoteWakeOutcome::Published { cpu: 5, .. }
+        ));
+        let migrating = take_test_local_migrating_owner()
+            .expect("local rehome must publish a transient migrating owner before its mailbox");
+        assert_eq!(migrating.state, RunOwnerState::Migrating);
+        assert_eq!(
+            migrating.cpu,
+            Some(target_cpu),
+            "the transient migration owner must identify the destination, never the source"
+        );
+        assert!(migrating.runnable);
+        assert_eq!(published_runnable_count(source_cpu), 0);
+        assert_eq!(drain_remote_wakes(target_cpu), 1);
+        assert!(is_local_dispatchable(slot, target_cpu));
+    }
+
+    #[test]
+    fn retirement_removes_local_queue_membership() {
+        let _guard = TEST_GUARD.lock().unwrap();
+        reset_before_publication();
+        let slot = 37;
+        let cpu = 6;
+        let weight = 200;
+        admit_blocked(slot);
+        publish_local(slot, cpu, weight);
+        assert!(is_local_dispatchable(slot, cpu));
+        assert_eq!(published_runnable_count(cpu), 1);
+
+        retire(slot, weight);
+        let retired = owner(slot);
+        assert_eq!(retired.state, RunOwnerState::Retired);
+        assert_eq!(retired.cpu, None);
+        assert!(!retired.runnable);
+        assert!(!is_local_dispatchable(slot, cpu));
+        assert_eq!(published_runnable_count(cpu), 0);
+        release_retired(slot);
+        reset_before_publication();
     }
 }

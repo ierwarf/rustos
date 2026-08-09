@@ -24,6 +24,12 @@ use nucleus_core::util::{
 pub(super) mod deadline;
 #[path = "ipc_helpers_diagnostics.rs"]
 mod diagnostics;
+#[path = "ipc_helpers/netd_socket_reply.rs"]
+mod netd_socket_reply;
+use netd_socket_reply::{
+    call_netd_socket_ipc_request_impl, install_prepared_netd_socket_response,
+    netd_reply_uses_prepared_socket, prepared_netd_socket_response_matches,
+};
 
 // A readiness probe cannot consume an event: it only transfers authenticated
 // ingress into inputd's policy queue. Bound that safe, idempotent operation so
@@ -1637,6 +1643,9 @@ fn call_netd_ipc_request_impl(
     request: &NetdIpcRequest,
     timeout_ms: Option<u64>,
 ) -> Result<NetdIpcResponse, i64> {
+    if netd_reply_uses_prepared_socket(request) {
+        return call_netd_socket_ipc_request_impl(request, timeout_ms);
+    }
     let start_ticks = crate::arch::rtc::ticks();
     let request_len = NETD_IPC_REQUEST_HEADER_SIZE
         .checked_add(request.payload_len as usize)
@@ -1666,12 +1675,30 @@ fn call_netd_ipc_request_impl(
         response.len() as i64,
         None,
     );
+    let mut decoded = decode_netd_ipc_response(request, response.as_slice())?;
+    if decoded.status != 0 {
+        return Err(decoded.status.unsigned_abs() as i64);
+    }
+    super::vfs_meta::consume_netd_release_payload(&mut decoded)?;
+    // The scheduling hint is consumed at the kernel IPC boundary and is not
+    // part of the Linux socket result exposed to compatibility callers.
+    decoded.reserved1 = 0;
+    Ok(decoded)
+}
+
+fn decode_netd_ipc_response(
+    request: &NetdIpcRequest,
+    response: &[u8],
+) -> Result<NetdIpcResponse, i64> {
     if response.len() < NETD_IPC_RESPONSE_HEADER_SIZE
         || response.len() > size_of::<NetdIpcResponse>()
     {
         return Err(LINUX_EINVAL);
     }
     let mut decoded = NetdIpcResponse::default();
+    // SAFETY: The byte slice was bounded to the concrete response object
+    // layout above, and `NetdIpcResponse` is a C wire record copied without
+    // dereferencing any pointer embedded in its bytes.
     unsafe {
         core::ptr::copy_nonoverlapping(
             response.as_ptr(),
@@ -1696,13 +1723,6 @@ fn call_netd_ipc_request_impl(
     {
         return Err(LINUX_EINVAL);
     }
-    if decoded.status != 0 {
-        return Err(decoded.status.unsigned_abs() as i64);
-    }
-    super::vfs_meta::consume_netd_release_payload(&mut decoded)?;
-    // The scheduling hint is consumed at the kernel IPC boundary and is not
-    // part of the Linux socket result exposed to compatibility callers.
-    decoded.reserved1 = 0;
     Ok(decoded)
 }
 
@@ -1721,113 +1741,8 @@ fn ticks_elapsed_ms(start_ticks: u64, end_ticks: u64) -> u64 {
         .saturating_div(ticks_per_second)
 }
 
-#[allow(
-    clippy::items_after_test_module,
-    reason = "focused response-envelope tests remain adjacent to the parser while public path helpers close the module"
-)]
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn empty_nonblocking_console_read_returns_eagain_without_retry() {
-        assert_eq!(empty_console_read_result(true, 0), Some(Err(LINUX_EAGAIN)));
-        assert_eq!(empty_console_read_result(false, 0), None);
-        assert_eq!(empty_console_read_result(true, 7), Some(Ok(7)));
-    }
-
-    #[test]
-    fn vfs_response_envelope_rejects_oversized_payload_before_slice_use() {
-        let mut response = VfsIpcResponse {
-            version: VFS_IPC_ABI_VERSION,
-            op: VFS_IPC_OP_OPENAT,
-            ..VfsIpcResponse::default()
-        };
-        assert_eq!(
-            validate_vfs_response_envelope(VFS_IPC_OP_OPENAT, &response),
-            Ok(())
-        );
-
-        response.payload_len = response.payload.len() as u32 + 1;
-        assert_eq!(
-            validate_vfs_response_envelope(VFS_IPC_OP_OPENAT, &response),
-            Err(LINUX_EINVAL)
-        );
-    }
-
-    #[test]
-    fn only_tombstoning_vfs_mutations_require_visibility_ack() {
-        let close = VfsIpcRequest {
-            op: VFS_IPC_OP_CLOSE,
-            ..VfsIpcRequest::default()
-        };
-        assert!(vfs_checkpoint_ack_required(&close));
-
-        let mut poll = VfsIpcRequest {
-            op: VFS_IPC_OP_POLL_QUERY,
-            arg0: VFS_POLL_QUERY_EPOLL_CTL,
-            arg1: linux_abi::EPOLL_CTL_ADD,
-            ..VfsIpcRequest::default()
-        };
-        assert!(!vfs_checkpoint_ack_required(&poll));
-        poll.arg1 = linux_abi::EPOLL_CTL_DEL;
-        assert!(vfs_checkpoint_ack_required(&poll));
-        poll.arg0 = VFS_POLL_QUERY_EPOLL_RETIRE;
-        assert!(vfs_checkpoint_ack_required(&poll));
-        poll.arg0 = VFS_POLL_QUERY_EPOLL_PURGE_OBJECT;
-        assert!(vfs_checkpoint_ack_required(&poll));
-
-        let read = VfsIpcRequest {
-            op: VFS_IPC_OP_READ,
-            ..VfsIpcRequest::default()
-        };
-        assert!(!vfs_checkpoint_ack_required(&read));
-    }
-
-    #[test]
-    fn epoll_snapshot_reads_are_retry_safe() {
-        let mut request = VfsIpcRequest {
-            op: VFS_IPC_OP_POLL_QUERY,
-            ..VfsIpcRequest::default()
-        };
-        request.arg0 = VFS_POLL_QUERY_EPOLL_SNAPSHOT;
-        assert!(vfs_request_is_replay_safe(&request));
-
-        request.arg0 = u64::MAX;
-        assert!(!vfs_request_is_replay_safe(&request));
-    }
-
-    #[test]
-    fn housekeeping_vfs_maintenance_is_one_bounded_replay_turn() {
-        assert_eq!(HOUSEKEEPING_VFS_MAINTENANCE_ATTEMPTS, 1);
-        assert_eq!(
-            rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS,
-            100
-        );
-    }
-
-    #[test]
-    fn procd_response_envelope_rejects_cross_op_and_oversized_payload() {
-        let mut response = ProcdIpcResponse {
-            op: PROCD_OP_SELECT_SIGNAL,
-            ..ProcdIpcResponse::default()
-        };
-        assert_eq!(
-            validate_procd_response_envelope(PROCD_OP_SELECT_SIGNAL, &response),
-            Ok(())
-        );
-        assert_eq!(
-            validate_procd_response_envelope(PROCD_OP_EXECVE, &response),
-            Err(LINUX_EINVAL)
-        );
-
-        response.payload_len = response.payload.len() as u32 + 1;
-        assert_eq!(
-            validate_procd_response_envelope(PROCD_OP_SELECT_SIGNAL, &response),
-            Err(LINUX_EINVAL)
-        );
-    }
-}
+mod tests;
 
 pub fn current_remote_vfs_handle(fd: u64) -> Option<multitask::RemoteVfsHandle> {
     multitask::with_current_user_process_state(|_, _, process_state| {

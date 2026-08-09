@@ -29,8 +29,8 @@ const DVM_E2E_EVENT_WAIT: Duration = Duration::from_secs(30);
 static mut STORAGED_BULK_RESPONSE_SLOT: StoragedBulkReadResponse =
     StoragedBulkReadResponse::zeroed();
 // Endpoint registration proves the service identity only. The generation is
-// published after its own read-only E2E FLUSH, and every request rebinds that
-// proof to current DVM geometry before touching storage.
+// published after its own read-only media-barrier completion, and every request
+// rebinds that liveness proof to current DVM geometry before touching storage.
 static DVM_E2E_READY_GENERATION: AtomicU64 = AtomicU64::new(0);
 // A readiness transition may cause many normal loader probes. Keep the first
 // one observable, but never let expected `EAGAIN` diagnostics become a DVM
@@ -171,8 +171,8 @@ fn note_dvm_request_ready() {
 
 fn dvm_block_e2e_marker(generation: u64) -> String {
     format!(
-        "storaged: dvm-block e2e flush completed generation={generation} \
-         path=vfs-policy->block-broker->shared-ring->linux-dvm->backing"
+        "storaged: dvm-block e2e media barrier completed generation={generation} \
+         path=vfs-policy->block-broker->shared-ring->linux-dvm->media-barrier"
     )
 }
 
@@ -698,8 +698,8 @@ mod tests {
     fn dvm_block_e2e_marker_names_the_complete_authority_path() {
         assert_eq!(
             dvm_block_e2e_marker(7),
-            "storaged: dvm-block e2e flush completed generation=7 \
-             path=vfs-policy->block-broker->shared-ring->linux-dvm->backing"
+            "storaged: dvm-block e2e media barrier completed generation=7 \
+             path=vfs-policy->block-broker->shared-ring->linux-dvm->media-barrier"
         );
     }
 

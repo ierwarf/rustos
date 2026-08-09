@@ -76,12 +76,9 @@ impl Scheduler {
             return None;
         }
         self.apply_ipc_donation(slot);
+        #[cfg(not(test))]
         let target_cpu = self.slot_dispatch_cpu(slot);
-        self.cpu_dispatch[target_cpu]
-            .lock()
-            .sync_pick_hints
-            .enqueue(slot)
-            .expect("scheduler synchronous process handoff queue overflow");
+        let _ = self.enqueue_synchronous_handoff_slot(slot);
         #[cfg(not(test))]
         super::super::irq::request_target_reschedule(target_cpu);
         Some(receiver_task_id)

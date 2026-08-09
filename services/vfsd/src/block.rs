@@ -17,7 +17,7 @@ use storage_core::{BlockDevice, IoResult, StorageError};
 use super::{EAGAIN, EINVAL, EIO, ENODEV, ENOSYS};
 use vfsd::{
     admit_dvm_block_geometry, cooperative_bulk_yield_state, storage_error_from_linux_status,
-    validate_dvm_block_range,
+    storage_service_lookup_errno, validate_dvm_block_range,
 };
 
 const IPC_BLOCK_PAYLOAD_BYTES: usize =
@@ -218,11 +218,7 @@ fn call_storaged(
         )
     };
     if endpoint <= 0 {
-        let errno = if endpoint < 0 {
-            (-endpoint) as i32
-        } else {
-            ENODEV
-        };
+        let errno = storage_service_lookup_errno(endpoint);
         if should_log_storage_failure(errno) {
             super::debug_line(&format!(
                 "vfsd: storaged call rejected stage=lookup errno={errno}"
@@ -280,11 +276,7 @@ fn call_storaged_bulk(request: &CommercialMaxProtocolRequest, out: &mut [u8]) ->
         )
     };
     if endpoint <= 0 {
-        let errno = if endpoint < 0 {
-            (-endpoint) as i32
-        } else {
-            ENODEV
-        };
+        let errno = storage_service_lookup_errno(endpoint);
         if should_log_storage_failure(errno) {
             super::debug_line(&format!(
                 "vfsd: storaged bulk call rejected stage=lookup errno={errno}"

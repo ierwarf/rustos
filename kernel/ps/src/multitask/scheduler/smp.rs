@@ -161,7 +161,7 @@ impl Scheduler {
     pub(super) fn context_is_schedulable(&self, slot: usize, context: TaskContext) -> bool {
         let current_cpu = nucleus_core::util::lockdep::current_cpu_index();
         #[cfg(not(test))]
-        if !runqueue::is_local_runnable(slot, current_cpu) {
+        if !runqueue::is_local_dispatchable(slot, current_cpu) {
             return false;
         }
         if candidate_has_foreign_execution_owner(
@@ -187,6 +187,39 @@ impl Scheduler {
         }
         !self.job_stopped[slot]
             && !self.exec_target_quiesced[slot]
+            && self
+                .context_validation_error(slot, context, context.saved_rsp)
+                .is_none()
+    }
+
+    /// Checks a queued continuation while an idle CPU considers moving it from
+    /// an explicitly named foreign source. This is deliberately separate from
+    /// [`Self::context_is_schedulable`]: the latter requires local dispatch
+    /// custody, while this path must inspect `Local(source_cpu)` before the
+    /// existing source-owner CAS transfers it through the target mailbox.
+    pub(super) fn context_is_migratable_from_source(
+        &self,
+        slot: usize,
+        context: TaskContext,
+        source_cpu: usize,
+        target_cpu: usize,
+    ) -> bool {
+        if source_cpu == target_cpu || !runqueue::is_local_dispatchable(slot, source_cpu) {
+            return false;
+        }
+        if super::super::cpu_local::task_running_cpu(slot).is_some() {
+            return false;
+        }
+        if slot == ROOT_TASK_SLOT || self.idle_cpu[slot] != NO_IDLE_CPU {
+            return false;
+        }
+        let target_bit = 1_u64
+            .checked_shl(u32::try_from(target_cpu).expect("logical CPU index overflow"))
+            .expect("logical CPU index exceeds affinity mask");
+        if self.task_affinity_masks[slot] & self.process_affinity_masks[slot] & target_bit == 0 {
+            return false;
+        }
+        self.handoff_slot_ready(slot)
             && self
                 .context_validation_error(slot, context, context.saved_rsp)
                 .is_none()
@@ -331,6 +364,9 @@ const fn remote_task_requires_quiescence(
 #[cfg(test)]
 mod tests {
     use super::{candidate_has_foreign_execution_owner, remote_task_requires_quiescence};
+    use crate::memory::paging::ProcessAddressSpace;
+    use crate::multitask::{UserTaskBootstrap, noop_task_entry, process_table};
+    use crate::user::abi::UserAbi;
 
     #[test]
     fn remote_or_transition_owned_task_is_not_schedulable() {
@@ -346,5 +382,74 @@ mod tests {
         assert!(remote_task_requires_quiescence(7, 3, true));
         assert!(!remote_task_requires_quiescence(3, 3, true));
         assert!(!remote_task_requires_quiescence(7, 3, false));
+    }
+
+    #[test]
+    fn source_migration_requires_exact_runnable_local_owner_and_target_affinity() {
+        let _process_table = process_table::tests::isolate_process_table();
+        let _cpu_publication = crate::multitask::cpu_local::test_publication_lock();
+        let _runqueue_guard = super::super::runqueue::test_serial_guard();
+        super::super::runqueue::reset_before_publication();
+        let mut scheduler = super::super::tests::boxed_scheduler();
+        let source_cpu = 1;
+        let target_cpu = 2;
+        let base = crate::memory::paging::USER_SPACE_BASE;
+        let user_cs = crate::arch::gdt::user_code_selector().0 as u64;
+        let user_ss = crate::arch::gdt::user_data_selector().0 as u64;
+        let slot = scheduler
+            .allocate_user_slot(
+                0x7d01,
+                ProcessAddressSpace::empty_for_tests(),
+                UserTaskBootstrap::new(
+                    UserAbi::Linux,
+                    x86_64::VirtAddr::new(base + 0x10_000),
+                    x86_64::VirtAddr::new(base + 0x11_000),
+                ),
+                None,
+                crate::arch::pit::divisor_from_micros(100),
+                user_cs,
+                user_ss,
+                super::super::RFLAGS_RESERVED_BIT_1,
+                false,
+                noop_task_entry,
+            )
+            .expect("source migration slot");
+        let target_mask = (1_u64 << source_cpu) | (1_u64 << target_cpu);
+        scheduler.initialize_slot_affinity(slot, target_mask, target_mask);
+        super::super::runqueue::admit_blocked(slot);
+        let context = scheduler.contexts[slot].expect("source migration context");
+        super::super::runqueue::publish_local(slot, source_cpu, context.weight);
+
+        assert!(scheduler.context_is_migratable_from_source(slot, context, source_cpu, target_cpu));
+        super::super::runqueue::set_runnable(slot, false);
+        assert!(
+            !scheduler.context_is_migratable_from_source(slot, context, source_cpu, target_cpu),
+            "Local runnable=false must not enter the idle-steal source set"
+        );
+
+        super::super::runqueue::set_runnable(slot, true);
+        scheduler.initialize_slot_affinity(slot, 1_u64 << source_cpu, 1_u64 << source_cpu);
+        assert!(
+            !scheduler.context_is_migratable_from_source(slot, context, source_cpu, target_cpu),
+            "a source candidate must carry target CPU affinity before migration"
+        );
+
+        scheduler.initialize_slot_affinity(slot, target_mask, target_mask);
+        {
+            let _transition_owner = crate::multitask::cpu_local::install_test_transition_owner(
+                source_cpu,
+                scheduler.current_task_slot(),
+                slot,
+            );
+            assert!(
+                !scheduler.context_is_migratable_from_source(slot, context, source_cpu, target_cpu),
+                "an outgoing transition stack owner must never enter a migration source set"
+            );
+        }
+        assert!(
+            scheduler.context_is_migratable_from_source(slot, context, source_cpu, target_cpu),
+            "dropping the exact execution owner must restore queued migration eligibility"
+        );
+        super::super::runqueue::reset_before_publication();
     }
 }

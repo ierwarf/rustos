@@ -24,7 +24,7 @@ into an implementation-wide or certification claim.
 | Recovery scenario matrix | `run-recovery-scenarios.sh` | Every registered checkpoint, service-restart, and storage disruption executes an exact bounded source witness and reaches its declared terminal state | Physical power-cut behavior or unregistered recovery transitions |
 | Source trace replay | `run-runtime-traces.sh` | Concrete runtime-control and successful bounded KVM P0 outcomes conform to registered model actions and topology requirements | Production fleet telemetry or every model transition |
 | Source decision witnesses | `run-source-conformance.sh` | The exact typed count in `docs/ai/formal-contracts.generated.md` executes mapped high-risk lifecycle, RPC, and IPC decisions; a duplicate, missing, renamed, or filtered witness fails the gate | Full transition-system equivalence, concurrency beyond the tested decision, target hardware, or the other registered models |
-| Mutation sensitivity | run-spec-mutations.sh; run-herd.sh; run-implementation-mutations.sh | Each registered TLA+ property/transition mutant is killed by its named invariant and normalized counterexample trace; each herd7 order mutant reaches its exact forbidden outcome; critical/high implementation mutants are killed by an executing witness rather than compile failure | Completeness against every possible mutation, source equivalence, or a production execution of a temporary model mutant |
+| Mutation sensitivity | run-spec-mutations.sh; run-herd.sh; run-implementation-mutations.sh | Each registered TLA+ property/transition mutant is killed by its named invariant and normalized counterexample trace; each herd7 order mutant reaches its exact forbidden outcome; critical/high implementation mutants are injected at a sealed exact source anchor and killed by their one resolved exact witness rather than compile or foreign-target failure | Completeness against every possible mutation, source equivalence, or a production execution of a temporary model mutant |
 
 Exact TLC reuse also reserves five minutes of remaining cache lifetime before a
 PR or SMP iteration begins. This prevents a pass admitted at run start from
@@ -91,6 +91,14 @@ not a bug. Keep it in `CONFORMANCE.md` until it is resolved.
   directories. The parent collects every exact exit status before sealing;
   concurrency changes wall time only and never skips, weakens, or converts a
   failed lane into evidence.
+- `bash formal/run-implementation-mutations.sh --check` is the mandatory cheap
+  registry preflight. A text that occurs once uses occurrence `N`; a deliberately
+  repeated text must select `N/M`, where `M` is the exact current total. The
+  runner rejects semantic duplicate rows, seals the resolved byte offset,
+  context, and source hash before copying, resolves exactly one fully qualified
+  libtest name, and records a kill only when that exact witness executes and
+  fails. Compile-only rejection, a different failing Cargo target, timeout before
+  witness execution, or source drift is invalid evidence rather than a kill.
 
 Kani stays with bounded parsers, ABI shapes, arithmetic partitions, and narrow
 unsafe-adjacent admission code. Function contracts are not credited merely

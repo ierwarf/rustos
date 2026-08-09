@@ -4,6 +4,8 @@
 //! suggestions.  Owners may use a shorter deadline, but widening one of these
 //! limits requires updating the owning contract and its executable evidence.
 
+use crate::syscall::WAITSET_MAX_INTERESTS;
+
 /// Optimization objective from kernel entry to an interactive desktop.
 pub const BOOT_TO_UI_TARGET_MS: u64 = 3_000;
 /// Product acceptance ceiling from kernel entry to an interactive desktop.
@@ -59,6 +61,18 @@ pub const SERVICE_LOOKUP_MAX_IPC_WITH_EXACT_GRANT: u32 = 0;
 /// publication/revocation mutation lock.
 pub const SERVICE_ENDPOINT_STABLE_LOOKUP_MAX_LOCK_ACQUISITIONS: u32 = 0;
 
+/// Global vfsd admission limit for live epoll provider objects.
+///
+/// The current kernel has 32 live process slots and 16-bit dynamic descriptor
+/// numbers.  Eight independently owned event loops per live process keeps
+/// ordinary runtime, UI, and compatibility use independent without admitting
+/// an unbounded service registry.  Every object remains subject to
+/// `WAITSET_MAX_INTERESTS`, so the product-wide persistent-interest ceiling is
+/// machine-readable below.
+pub const WAITSET_MAX_EPOLL_OBJECTS: usize = 8 * 32;
+/// Maximum persistent vfsd epoll interests across every admitted object.
+pub const WAITSET_MAX_GLOBAL_INTERESTS: usize = WAITSET_MAX_EPOLL_OBJECTS * WAITSET_MAX_INTERESTS;
+
 const _: () = assert!(BOOT_TO_UI_TARGET_MS < BOOT_TO_UI_HARD_LIMIT_MS);
 const _: () = assert!(UI_FRAME_CPU_TARGET_US < UI_FRAME_HARD_LIMIT_US);
 const _: () = assert!(UI_BOOT_GPU_ACTIVATION_BUDGET_MS < BOOT_TO_UI_HARD_LIMIT_MS);
@@ -72,3 +86,5 @@ const _: () = assert!(IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS < IPC_BOOT_CONTROL_H
 const _: () = assert!(EXECUTABLE_SNAPSHOT_HARD_LIMIT_MS < IPC_BOOT_CONTROL_HARD_LIMIT_MS);
 const _: () = assert!(DVM_STORAGE_BOOT_READY_HARD_LIMIT_MS < BOOT_TO_UI_HARD_LIMIT_MS);
 const _: () = assert!(IPC_BOOT_CONTROL_HARD_LIMIT_MS < IPC_BULK_DATA_HARD_LIMIT_MS);
+const _: () = assert!(WAITSET_MAX_EPOLL_OBJECTS <= u16::MAX as usize + 1);
+const _: () = assert!(WAITSET_MAX_GLOBAL_INTERESTS >= WAITSET_MAX_INTERESTS);

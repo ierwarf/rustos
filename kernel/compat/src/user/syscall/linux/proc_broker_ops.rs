@@ -117,7 +117,15 @@ struct ExecTransitionState {
 type ProcPrepareRegistry = FnvIndexMap<u64, ProcPrepareState, MAX_PROC_PREPARES>;
 type ExecTicketRegistry = FnvIndexMap<u64, ExecTicketState, MAX_EXEC_TICKETS>;
 type ExecTransitionRegistry = FnvIndexMap<u64, ExecTransitionState, MAX_EXEC_TRANSITIONS>;
-type DeferredActivationRegistry = FnvIndexMap<u64, u64, MAX_DEFERRED_ACTIVATIONS>;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DeferredActivationAuthority {
+    owner: multitask::ProcessIdentity,
+    target: multitask::ProcessIdentity,
+    qualification_required: bool,
+}
+
+type DeferredActivationRegistry =
+    FnvIndexMap<u64, DeferredActivationAuthority, MAX_DEFERRED_ACTIVATIONS>;
 
 static PROC_PREPARES: TrackedSpinLock<
     ProcPrepareRegistry,
@@ -129,10 +137,10 @@ static EXEC_TRANSITIONS: TrackedSpinLock<
     ExecTransitionRegistry,
     { LockClass::ProcBrokerRegistry as u8 },
 > = TrackedSpinLock::new(FnvIndexMap::new());
-/// A deferred process is inert until the exact process that requested its
-/// creation consumes this one-shot authority. Keeping this in ring0 makes the
-/// authority survive loaderd restart without trusting a replayed userspace PID
-/// claim.
+/// A deferred process is inert until the exact process/address-space identity
+/// that requested its creation consumes this one-shot authority. Keeping this
+/// in ring0 makes the authority survive loaderd restart without trusting a
+/// replayed userspace PID claim or a recycled PID generation.
 static DEFERRED_ACTIVATIONS: TrackedSpinLock<
     DeferredActivationRegistry,
     { LockClass::ProcBrokerRegistry as u8 },
@@ -250,7 +258,7 @@ pub(super) fn syscall_linux_rustos_proc_map_file_broker(args_ptr: u64) -> u64 {
 
 pub(super) fn syscall_linux_rustos_proc_map_file_batch_broker(args_ptr: u64) -> u64 {
     let Some(current_pid) = current_loader_process_id() else {
-        nucleus_core::debug::println_emergency(format_args!(
+        nucleus_core::debug::println_serialized(format_args!(
             "proc-map-file-batch denied stage=capability pid={:?} preempt_depth={}",
             multitask::current_user_process_id(),
             nucleus_core::util::lockdep::preemption_depth()
@@ -299,7 +307,7 @@ pub(super) fn syscall_linux_rustos_proc_map_file_batch_broker(args_ptr: u64) -> 
     if current_pid != state.owner_pid {
         let owner_pid = state.owner_pid;
         drop(prepares);
-        nucleus_core::debug::println_emergency(format_args!(
+        nucleus_core::debug::println_serialized(format_args!(
             "proc-map-file-batch denied stage=owner handle={} owner_pid={} current_pid={}",
             args.prepare_handle, owner_pid, current_pid
         ));
@@ -625,6 +633,8 @@ pub(super) fn syscall_linux_rustos_proc_commit_broker(args_ptr: u64) -> u64 {
         Ok(path) => path,
         Err(errno) => return linux_errno(errno),
     };
+    let qualification_required =
+        super::smp_qualification_ops::smp_qualification_exec_path_matches(exec_path.as_str());
     let argv_storage = match read_user_string_vector(
         args.argv_ptr,
         LOADER_SPAWN_MAX_ARG_COUNT,
@@ -731,6 +741,20 @@ pub(super) fn syscall_linux_rustos_proc_commit_broker(args_ptr: u64) -> u64 {
     match spawned {
         Ok(spawned) => {
             if args.flags & LOADER_SPAWN_FLAG_DEFER_START as u64 != 0 {
+                let Some(owner) = multitask::live_user_process_identity_by_pid(args.requester_pid)
+                else {
+                    let _ = multitask::terminate_user_process(spawned.pid);
+                    return linux_errno(LINUX_ESRCH);
+                };
+                let Some(target) = multitask::live_user_process_identity_by_pid(spawned.pid) else {
+                    let _ = multitask::terminate_user_process(spawned.pid);
+                    return linux_errno(LINUX_ESRCH);
+                };
+                let authority = DeferredActivationAuthority {
+                    owner,
+                    target,
+                    qualification_required,
+                };
                 let mut activations = DEFERRED_ACTIVATIONS.lock();
                 if activations.len() >= MAX_DEFERRED_ACTIVATIONS
                     || activations.contains_key(&spawned.pid)
@@ -739,7 +763,7 @@ pub(super) fn syscall_linux_rustos_proc_commit_broker(args_ptr: u64) -> u64 {
                     let _ = multitask::terminate_user_process(spawned.pid);
                     return linux_errno(LINUX_EAGAIN);
                 }
-                if activations.insert(spawned.pid, args.requester_pid).is_err() {
+                if activations.insert(spawned.pid, authority).is_err() {
                     drop(activations);
                     let _ = multitask::terminate_user_process(spawned.pid);
                     return linux_errno(LINUX_EAGAIN);
@@ -748,7 +772,7 @@ pub(super) fn syscall_linux_rustos_proc_commit_broker(args_ptr: u64) -> u64 {
                 // Close the requester-exit race on both sides of publication:
                 // cleanup either observes the new entry, or this recheck
                 // consumes it and retires the still-suspended target.
-                if multitask::is_user_process_exiting(args.requester_pid) {
+                if multitask::live_user_process_identity_by_pid(args.requester_pid) != Some(owner) {
                     DEFERRED_ACTIVATIONS.lock().remove(&spawned.pid);
                     let _ = multitask::terminate_user_process(spawned.pid);
                     return linux_errno(LINUX_ESRCH);
@@ -776,20 +800,54 @@ pub(super) fn syscall_linux_rustos_proc_activate_broker(args_ptr: u64) -> u64 {
     {
         return linux_errno(LINUX_EINVAL);
     }
+    // This syscall runs in loaderd's service context, but activation authority
+    // belongs to the original requester captured at deferred-spawn commit.
+    // Re-resolve that requester as a live, generation-bound identity so a
+    // restarted loaderd neither denies a valid request nor adopts its owner.
+    let (owner, target) = match resolve_deferred_activation_identities(
+        args.requester_pid,
+        args.target_pid,
+        multitask::live_user_process_identity_by_pid,
+    ) {
+        Ok(identities) => identities,
+        Err(errno) => return linux_errno(errno),
+    };
     let mut activations = DEFERRED_ACTIVATIONS.lock();
-    if !deferred_spawn_provenance_matches(&activations, args.target_pid, args.requester_pid) {
+    if !deferred_spawn_authority_matches(&activations, args.target_pid, owner, target) {
         return linux_errno(LINUX_EPERM);
     }
+    let authority = *activations
+        .get(&args.target_pid)
+        .expect("preflighted deferred activation authority");
+    let qualification_armed =
+        match super::smp_qualification_ops::prepare_smp_qualification_activation(
+            owner,
+            target,
+            authority.qualification_required,
+        ) {
+            Ok(armed) => armed,
+            Err(errno) => return linux_errno(errno),
+        };
     if !multitask::activate_suspended_user_tasks_with_commit(
         core::slice::from_ref(&args.target_pid),
         || {
             assert_eq!(
                 activations.remove(&args.target_pid),
-                Some(args.requester_pid),
+                Some(authority),
                 "proc activation invariant: preflighted authority disappeared while locked"
             );
         },
     ) {
+        // Scheduler preflight failed before the callback consumed the
+        // authority. Retire both records; a bound child must never remain
+        // eligible after a failed runnable publication.
+        let removed = activations.remove(&args.target_pid);
+        drop(activations);
+        if qualification_armed {
+            super::smp_qualification_ops::abort_smp_qualification_activation(target);
+        }
+        let _ = removed;
+        let _ = multitask::terminate_user_process(args.target_pid);
         return linux_errno(LINUX_ESRCH);
     }
     drop(activations);
@@ -823,15 +881,17 @@ pub(super) fn syscall_linux_rustos_proc_validate_deferred_spawn_broker(args_ptr:
     {
         return linux_errno(LINUX_EINVAL);
     }
-    if multitask::is_user_process_exiting(args.target_pid)
-        || multitask::is_user_process_exiting(args.requester_pid)
-    {
+    let Some(owner) = multitask::live_user_process_identity_by_pid(args.requester_pid) else {
         return linux_errno(LINUX_ESRCH);
-    }
-    if !deferred_spawn_provenance_matches(
+    };
+    let Some(target) = multitask::live_user_process_identity_by_pid(args.target_pid) else {
+        return linux_errno(LINUX_ESRCH);
+    };
+    if !deferred_spawn_authority_matches(
         &DEFERRED_ACTIVATIONS.lock(),
         args.target_pid,
-        args.requester_pid,
+        owner,
+        target,
     ) {
         return linux_errno(LINUX_EPERM);
     }
@@ -1248,18 +1308,24 @@ pub(super) fn syscall_linux_rustos_proc_abort_broker(args_ptr: u64) -> u64 {
 /// therefore removes owner-bound prepares plus target-bound tickets and saved
 /// register transitions before the process table retires that process.
 pub(super) fn cleanup_proc_broker_state_for_process(process_id: u64) -> (usize, usize, usize) {
+    // The process table has already linearized terminal teardown before this
+    // cleanup entry. Revoke the generation-bound qualification first so a
+    // reused PID cannot inherit an owner or target evidence grant.
+    super::smp_qualification_ops::revoke_smp_qualification_for_process(process_id);
     let mut deferred_targets = [0_u64; MAX_DEFERRED_ACTIVATIONS];
     let deferred_target_count = {
         let mut activations = DEFERRED_ACTIVATIONS.lock();
         let mut count = 0usize;
-        for (target_pid, requester_pid) in activations.iter() {
-            if *requester_pid == process_id && *target_pid != process_id {
+        for (target_pid, authority) in activations.iter() {
+            if authority.owner.process_id() == process_id && *target_pid != process_id {
                 deferred_targets[count] = *target_pid;
                 count += 1;
             }
         }
-        activations.retain(|target_pid, requester_pid| {
-            *target_pid != process_id && *requester_pid != process_id
+        activations.retain(|target_pid, authority| {
+            *target_pid != process_id
+                && authority.owner.process_id() != process_id
+                && authority.target.process_id() != process_id
         });
         count
     };
@@ -1628,30 +1694,73 @@ fn allocate_exec_ticket(tickets: &ExecTicketRegistry) -> Option<u64> {
     None
 }
 
-#[cfg(test)]
-fn consume_deferred_activation_authority(
-    activations: &mut DeferredActivationRegistry,
-    target_pid: u64,
+fn resolve_deferred_activation_identities<I>(
     requester_pid: u64,
-) -> bool {
-    if target_pid == 0
-        || requester_pid == 0
-        || activations.get(&target_pid).copied() != Some(requester_pid)
-    {
-        return false;
-    }
-    activations.remove(&target_pid);
-    true
+    target_pid: u64,
+    mut resolve_live_identity: impl FnMut(u64) -> Option<I>,
+) -> Result<(I, I), i64> {
+    let Some(owner) = resolve_live_identity(requester_pid) else {
+        return Err(LINUX_ESRCH);
+    };
+    let Some(target) = resolve_live_identity(target_pid) else {
+        return Err(LINUX_ESRCH);
+    };
+    Ok((owner, target))
 }
 
-fn deferred_spawn_provenance_matches(
+fn deferred_activation_identities_match<I: Eq>(
+    stored_owner: &I,
+    stored_target: &I,
+    owner: &I,
+    target: &I,
+) -> bool {
+    stored_owner == owner && stored_target == target
+}
+
+fn deferred_spawn_authority_matches(
     activations: &DeferredActivationRegistry,
     target_pid: u64,
-    requester_pid: u64,
+    owner: multitask::ProcessIdentity,
+    target: multitask::ProcessIdentity,
 ) -> bool {
     target_pid != 0
-        && requester_pid != 0
-        && activations.get(&target_pid).copied() == Some(requester_pid)
+        && owner.process_id() != 0
+        && target.process_id() == target_pid
+        && activations.get(&target_pid).is_some_and(|authority| {
+            deferred_activation_identities_match(
+                &authority.owner,
+                &authority.target,
+                &owner,
+                &target,
+            )
+        })
+}
+
+/// Linearize qualification binding with the deferred-child one-shot record.
+/// The callback runs while ProcBrokerRegistry is retained, and may acquire
+/// only the higher-ranked qualification binding lock. Therefore either bind
+/// installs `BoundSuspended` before activation can consume the child, or
+/// activation consumes the record first and a later bind fails closed.
+pub(super) fn with_deferred_activation_authority_for_smp_bind<R>(
+    target_pid: u64,
+    owner: multitask::ProcessIdentity,
+    target: multitask::ProcessIdentity,
+    register: impl FnOnce() -> Result<R, i64>,
+) -> Result<R, i64> {
+    let activations = DEFERRED_ACTIVATIONS.lock();
+    if !deferred_spawn_authority_matches(&activations, target_pid, owner, target)
+        || !activations
+            .get(&target_pid)
+            .is_some_and(|authority| authority.qualification_required)
+    {
+        return Err(LINUX_EPERM);
+    }
+    let result = register();
+    // Keep the authority guard live until the registration has returned. This
+    // is the bind-vs-activate serialization edge, not a best-effort lookup.
+    let _still_bound = activations.get(&target_pid).is_some();
+    drop(activations);
+    result
 }
 
 fn allocate_nonwrapping_broker_identity(counter: &AtomicU64) -> Option<u64> {
@@ -1779,115 +1888,4 @@ fn read_user_string_vector(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn broker_authority_identity_exhaustion_never_wraps() {
-        let counter = AtomicU64::new(u64::MAX);
-        assert_eq!(allocate_nonwrapping_broker_identity(&counter), None);
-        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
-    }
-
-    #[test]
-    fn file_mapping_len_must_fit_inside_memory_mapping() {
-        assert_eq!(validate_file_mapping_len(4096, 4096), Ok(()));
-        assert_eq!(validate_file_mapping_len(4096, 0), Ok(()));
-        assert_eq!(validate_file_mapping_len(4096, 4097), Err(LINUX_EINVAL));
-    }
-
-    #[test]
-    fn truncated_file_mapping_never_commits_zero_filled_tail() {
-        assert_eq!(validate_complete_file_copy(4096, 4096), Ok(()));
-        assert_eq!(validate_complete_file_copy(4096, 4095), Err(LINUX_EIO));
-        assert_eq!(validate_complete_file_copy(1, 0), Err(LINUX_EIO));
-    }
-
-    #[test]
-    fn executable_file_backing_requires_a_terminally_sealed_snapshot() {
-        let snapshot = MemfdHandle::new(String::from("loader-test"), true);
-        assert!(!executable_snapshot_is_immutable(&snapshot));
-        snapshot
-            .add_seals(
-                (linux_abi::F_SEAL_WRITE | linux_abi::F_SEAL_GROW | linux_abi::F_SEAL_SHRINK)
-                    as u32,
-            )
-            .expect("partial seals");
-        assert!(!executable_snapshot_is_immutable(&snapshot));
-        snapshot
-            .add_seals(linux_abi::F_SEAL_SEAL as u32)
-            .expect("terminal seal");
-        assert!(executable_snapshot_is_immutable(&snapshot));
-    }
-
-    #[test]
-    fn exited_prepare_owner_cannot_republish_after_cleanup() {
-        assert_eq!(proc_prepare_publication_status(true, 0), Err(LINUX_ESRCH));
-        assert_eq!(
-            proc_prepare_publication_status(false, MAX_PROC_PREPARES),
-            Err(LINUX_EAGAIN)
-        );
-        assert_eq!(
-            proc_prepare_publication_status(false, MAX_PROC_PREPARES - 1),
-            Ok(())
-        );
-    }
-
-    #[test]
-    fn deferred_activation_authority_is_exact_one_shot_and_nontransferable() {
-        let mut activations = DeferredActivationRegistry::new();
-        assert_eq!(activations.insert(41, 7), Ok(None));
-        assert!(deferred_spawn_provenance_matches(&activations, 41, 7));
-        assert!(!deferred_spawn_provenance_matches(&activations, 41, 8));
-        assert!(!consume_deferred_activation_authority(
-            &mut activations,
-            41,
-            8
-        ));
-        assert_eq!(activations.get(&41), Some(&7));
-        assert!(consume_deferred_activation_authority(
-            &mut activations,
-            41,
-            7
-        ));
-        assert!(!consume_deferred_activation_authority(
-            &mut activations,
-            41,
-            7
-        ));
-        assert!(!deferred_spawn_provenance_matches(&activations, 41, 7));
-    }
-
-    #[test]
-    fn loader_commit_revalidates_live_requester_role_before_consuming_authority() {
-        let source = include_str!("proc_broker_ops.rs");
-        let spawn_commit = source
-            .split("pub(super) fn syscall_linux_rustos_proc_commit_broker")
-            .nth(1)
-            .and_then(|rest| {
-                rest.split("pub(super) fn syscall_linux_rustos_proc_activate_broker")
-                    .next()
-            })
-            .expect("spawn commit broker");
-        let spawn_role = spawn_commit
-            .find("requester_owns_live_spawn_role(args.requester_pid)")
-            .expect("live spawn role recheck");
-        let prepare_consume = spawn_commit
-            .find("let state = {")
-            .expect("prepare authority consumption");
-        assert!(spawn_role < prepare_consume);
-
-        let exec_commit = source
-            .split("pub(super) fn syscall_linux_rustos_proc_exec_target_broker")
-            .nth(1)
-            .and_then(|rest| rest.split("fn exec_transition_from_prepared").next())
-            .expect("exec target broker");
-        let procd_role = exec_commit
-            .find("process_owns_live_service_endpoint(args.requester_pid, IPC_SERVICE_PROCD)")
-            .expect("live procd role recheck");
-        let ticket_consume = exec_commit
-            .find("let mut tickets = EXEC_TICKETS.lock()")
-            .expect("exec ticket consumption");
-        assert!(procd_role < ticket_consume);
-    }
-}
+mod tests;

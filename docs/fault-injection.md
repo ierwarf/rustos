@@ -100,7 +100,10 @@ cargo xtask kvm-smoke --timeout 30
 
 `formal/fault-scenarios.tsv` is the closed registry. Unknown, duplicate, and
 retired points fail both host configuration and guest admission instead of
-silently doing nothing. The storage-DVM flush failure has a first-class
+silently doing nothing. Each row names the live production source and the
+possibly separate source file that contains its exact executable witness, so a
+test-module move cannot turn test text into the claimed fault boundary. The
+storage-DVM flush failure has a first-class
 negative acceptance gate. The
 gate admits exactly one unconditional flush rule, requires both peers, exact
 geometry, and a real first completion, then rejects any fabricated flush
@@ -221,6 +224,9 @@ cargo xtask kvm-smoke --timeout 30
 
 `formal/fault-scenarios.tsv`가 닫힌 registry이며, 알 수 없거나 중복되거나
 폐기된 point는 조용히 무시되지 않고 host/guest admission에서 실패합니다.
+각 행은 실제 production `source`와 정확한 실행 witness가 있는
+`witness_source`를 별도로 지정하므로, 테스트 모듈 이동이 검증 대상 생산
+경계를 바꾸지 못합니다.
 storage-DVM flush 실패는 별도의 음성(negative) acceptance gate로 검증합니다.
 정확히 하나의 무조건 flush 실패 규칙만 허용하고, 양쪽 peer, 정확한 geometry,
 실제 첫 completion을 확인한 뒤 허위 flush 성공 표식이 나오면 실패합니다.

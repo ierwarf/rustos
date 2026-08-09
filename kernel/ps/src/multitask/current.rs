@@ -199,7 +199,34 @@ pub fn current_user_log_ids() -> Option<(u64, u64)> {
     if nucleus_core::util::lockdep::preemption_disabled() || !current_cpu_task_slot_admitted() {
         return None;
     }
-    interrupts::without_interrupts(|| unsafe { scheduler_ref().current_user_log_ids() })
+    interrupts::without_interrupts(|| {
+        published_or_scheduler_user_log_ids(published_current_user_log_ids(), || {
+            // SAFETY: interrupts are masked, so the current slot is stable.
+            unsafe { scheduler_ref().current_user_log_ids() }
+        })
+    })
+}
+
+/// Uses a complete per-CPU diagnostic identity before consulting scheduler
+/// authority. The outer `None` is deliberately reserved for an absent, odd,
+/// or incomplete publication; a complete kernel-task identity is `Some(None)`
+/// and must not take the scheduler lock merely to confirm it has no user PID.
+#[inline]
+fn published_or_scheduler_user_log_ids<F>(
+    published: Option<Option<(u64, u64)>>,
+    scheduler_fallback: F,
+) -> Option<(u64, u64)>
+where
+    F: FnOnce() -> Option<(u64, u64)>,
+{
+    published.unwrap_or_else(scheduler_fallback)
+}
+
+/// Returns a complete user log pair, a definitive kernel-task absence, or
+/// `None` when the seqlock record must be retried through scheduler authority.
+/// Callers must already have interrupts masked.
+fn published_current_user_log_ids() -> Option<Option<(u64, u64)>> {
+    published_current_identity()?.complete_user_log_ids()
 }
 
 pub fn user_log_ids_for_task(task_id: u64) -> Option<(u64, u64)> {
@@ -208,6 +235,38 @@ pub fn user_log_ids_for_task(task_id: u64) -> Option<(u64, u64)> {
 
 pub fn current_user_process_id() -> Option<u64> {
     current_user_log_ids().map(|(process_id, _)| process_id)
+}
+
+/// Snapshot the exact process and address-space authority of the active user
+/// task. This deliberately fails during exec or process teardown rather than
+/// handing a caller a PID-only identity that could be reused.
+pub fn current_user_process_identity() -> Option<process_table::ProcessIdentity> {
+    let (_, _, process) = retain_current_user_process_binding()?;
+    process.live_identity()
+}
+
+/// Return a live, generation-bound process identity for a non-current PID.
+/// The scheduler and process table own the liveness decision; callers must not
+/// infer it from a PID map or an old retained state reference.
+pub fn live_user_process_identity_by_pid(
+    process_id: u64,
+) -> Option<process_table::ProcessIdentity> {
+    process_table::live_process_identity_by_pid(process_id)
+}
+
+/// Resolve one live process only when its current executable path is exactly
+/// the expected kernel-private path. The identity is sampled before and after
+/// the state observation, so a concurrent exec/exit cannot publish authority
+/// based on a stale pathname.
+pub fn live_user_process_identity_with_exact_exec_path(
+    process_id: u64,
+    expected_exec_path: &str,
+) -> Option<process_table::ProcessIdentity> {
+    let identity = live_user_process_identity_by_pid(process_id)?;
+    let matches_path =
+        with_process_state_by_pid(process_id, |state| state.exec_path() == expected_exec_path)?;
+    (matches_path && live_user_process_identity_by_pid(process_id) == Some(identity))
+        .then_some(identity)
 }
 
 pub fn current_user_process_thread_count() -> Option<usize> {
@@ -449,6 +508,20 @@ pub fn bind_ipc_priority_to_process_worker(
 /// reply capability. It is safe to call more than once for terminal races.
 pub fn release_ipc_priority(reply: u64) -> bool {
     interrupts::without_interrupts(|| unsafe { scheduler_mut().release_ipc_priority(reply) })
+}
+
+/// Completes the scheduling side of a terminal reply with one Scheduler
+/// acquisition, then publishes only its opaque exact wake token to the
+/// target CPU's handoff owner.  A stale token deliberately loses urgency; it
+/// never falls back to the catalog hint path and cannot create execution
+/// authority.
+pub fn complete_ipc_reply_wake_handoff(reply: u64, task_id: u64) -> bool {
+    let token = interrupts::without_interrupts(|| unsafe {
+        scheduler_mut().complete_ipc_reply_wake_handoff(reply, task_id)
+    });
+    interrupts::without_interrupts(|| {
+        token.is_some_and(super::scheduler::enqueue_reply_wake_handoff)
+    })
 }
 
 pub fn release_ipc_priorities_for_process(process_id: u64) {
@@ -990,4 +1063,46 @@ pub fn complete_retired_task_cleanup(cleanup: super::RetiredTaskCleanup) -> bool
     interrupts::without_interrupts(|| unsafe {
         scheduler_mut().complete_retired_task_cleanup(cleanup)
     })
+}
+
+#[cfg(test)]
+mod log_identity_tests {
+    use core::cell::Cell;
+
+    use super::published_or_scheduler_user_log_ids;
+
+    #[test]
+    fn complete_published_log_identity_skips_scheduler_fallback() {
+        let fallback_calls = Cell::new(0);
+        assert_eq!(
+            published_or_scheduler_user_log_ids(Some(Some((23, 41))), || {
+                fallback_calls.set(fallback_calls.get() + 1);
+                Some((1, 2))
+            }),
+            Some((23, 41))
+        );
+        assert_eq!(fallback_calls.get(), 0);
+
+        assert_eq!(
+            published_or_scheduler_user_log_ids(Some(None), || {
+                fallback_calls.set(fallback_calls.get() + 1);
+                Some((1, 2))
+            }),
+            None
+        );
+        assert_eq!(fallback_calls.get(), 0);
+    }
+
+    #[test]
+    fn absent_or_incomplete_log_identity_uses_scheduler_fallback() {
+        let fallback_calls = Cell::new(0);
+        assert_eq!(
+            published_or_scheduler_user_log_ids(None, || {
+                fallback_calls.set(fallback_calls.get() + 1);
+                Some((29, 43))
+            }),
+            Some((29, 43))
+        );
+        assert_eq!(fallback_calls.get(), 1);
+    }
 }

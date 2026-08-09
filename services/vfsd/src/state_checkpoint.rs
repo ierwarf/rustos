@@ -15,6 +15,11 @@ impl VfsState {
     }
 
     fn restore_waitset_checkpoint(&mut self) -> Result<(), i32> {
+        // Rootd's checkpoint stream is untrusted until every parent, child,
+        // and capacity check succeeds. Build a new state and publish it only
+        // after the complete replay; an oversized epoll set cannot leave a
+        // partially restored live registry behind.
+        let mut candidate = Self::new();
         let mut cursor = 0_u64;
         let mut records = Vec::new();
         loop {
@@ -43,15 +48,15 @@ impl VfsState {
                 };
                 let key = checkpoint_revision_key(&record);
                 if !valid_checkpoint_record(&record)
-                    || self
+                    || candidate
                         .checkpoint_revisions
                         .insert(key, record.revision)
                         .is_some()
-                    || self
+                    || candidate
                         .checkpoint_operations
                         .insert(key, (record.operation_hi, record.operation_lo))
                         .is_some()
-                    || self.checkpoint_records.insert(key, record).is_some()
+                    || candidate.checkpoint_records.insert(key, record).is_some()
                 {
                     return Err(EIO);
                 }
@@ -66,6 +71,7 @@ impl VfsState {
             cursor = response.value0;
         }
 
+        let mut epoll_tokens = Vec::new();
         for record in records.iter().filter(|record| {
             record.parent_hi == 0
                 && record.parent_lo == 0
@@ -75,8 +81,12 @@ impl VfsState {
             if record.value_len != 0 {
                 return Err(EIO);
             }
-            self.epolls.restore(record.key_hi).map_err(|_| EIO)?;
+            epoll_tokens.push(record.key_hi);
         }
+        candidate
+            .epolls
+            .restore_all(&epoll_tokens)
+            .map_err(|_| EIO)?;
         for record in records.iter().filter(|record| {
             record.parent_lo == CHECKPOINT_EPOLL_TAG
                 && record.flags & SERVICE_CHECKPOINT_FLAG_TOMBSTONE == 0
@@ -92,11 +102,13 @@ impl VfsState {
             if record.key_hi != key_hi || record.key_lo != key_lo {
                 return Err(EIO);
             }
-            self.epolls
+            candidate
+                .epolls
                 .add(record.parent_hi, interest)
                 .map_err(|_| EIO)?;
         }
-        self.restore_open_descriptions(&records)?;
+        candidate.restore_open_descriptions(&records)?;
+        *self = candidate;
         Ok(())
     }
 

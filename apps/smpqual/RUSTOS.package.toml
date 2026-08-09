@@ -1,0 +1,12 @@
+id = "smpqual"
+kind = "app"
+execution_domain = "user"
+startup = "none"
+
+[build]
+builder = "c-demo"
+source = "smpqual.c"
+extra_args = ["-pthread"]
+
+[install]
+path = "apps/smpqual/smpqual.elf"

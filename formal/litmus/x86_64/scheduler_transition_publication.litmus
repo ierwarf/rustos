@@ -1,0 +1,12 @@
+X86_64 SchedulerTransitionPublication
+"P0 publishes outgoing, active, incoming, then assembly commit"
+{
+uint64_t transition=0; uint64_t active=0; uint64_t current=17;
+uint64_t 1:rax; uint64_t 1:rbx; uint64_t 1:rcx;
+}
+P0                       | P1                     ;
+movq $17,(transition)    | movq (current),%rax    ;
+movq $1,(active)         | movq (active),%rbx     ;
+movq $29,(current)       | movq (transition),%rcx ;
+movq $0,(active)         |                         ;
+exists (1:rcx=0 /\ (1:rax=29 \/ 1:rbx=1))

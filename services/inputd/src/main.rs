@@ -523,6 +523,7 @@ mod tests {
         lock_input_queue_for_ingestion, validate_commercial_request, DvmIngressLogState,
         InputQueue, SharedInputQueueState, INPUTD_INGEST_MAX_EVENTS,
     };
+    use crate::dvm_session_sync;
     use rustos_user_abi::syscall::{
         CommercialMaxProtocolRequest, InputIngressWire, InputPointerPacketWire,
         InputPointerPositionWire, InputdIpcRequest, COMMERCIAL_MAX_INPUTD_OP_INPUT_READER,
@@ -531,6 +532,63 @@ mod tests {
     };
     use std::sync::{mpsc, Arc};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn netd_dvm_session_request_uses_one_nonzero_transaction_end() {
+        let deadline = rustos_user_abi::deadline::AbsoluteDeadline::after(2_000_000, 80_000_000);
+        let (request, waiter_ms) = super::netd_dvm_session_request_with_deadline(
+            7,
+            rustos_user_abi::syscall::NETD_DVM_SESSION_GRANT,
+            41,
+            43,
+            deadline,
+            42_000_000,
+        )
+        .expect("deadline still has budget");
+
+        assert_eq!(request.deadline_ns, deadline.end_ns());
+        assert_ne!(request.deadline_ns, 0);
+        assert_eq!(waiter_ms, 40);
+        let (_, retry_waiter_ms) = super::netd_dvm_session_request_with_deadline(
+            7,
+            rustos_user_abi::syscall::NETD_DVM_SESSION_GRANT,
+            41,
+            43,
+            deadline,
+            81_999_999,
+        )
+        .expect("the final nanosecond rounds up to one bounded millisecond");
+        assert_eq!(retry_waiter_ms, 1);
+        assert_eq!(
+            super::netd_dvm_session_request_with_deadline(
+                7,
+                rustos_user_abi::syscall::NETD_DVM_SESSION_GRANT,
+                41,
+                43,
+                deadline,
+                deadline.end_ns(),
+            ),
+            Err(libc::ETIMEDOUT)
+        );
+
+        let transaction = rustos_user_abi::deadline::AbsoluteDeadline::after(0, 5_000_000_000);
+        let (request, call_cap_ms) = super::netd_dvm_session_request_with_deadline(
+            7,
+            rustos_user_abi::syscall::NETD_DVM_SESSION_GRANT,
+            41,
+            43,
+            transaction,
+            0,
+        )
+        .expect("five-second transaction is live");
+        assert_eq!(request.deadline_ns, transaction.end_ns());
+        assert_eq!(call_cap_ms, dvm_session_sync::CALL_DEADLINE_MS);
+        assert!(
+            u64::from(call_cap_ms).saturating_mul(rustos_user_abi::deadline::NANOS_PER_MILLI)
+                < transaction.end_ns(),
+            "interactive call cap must not replace the immutable transaction end"
+        );
+    }
 
     fn pointer_motion(dx: i32, dy: i32) -> input_evdev::InputEvent {
         input_evdev::InputEvent {
@@ -1142,7 +1200,41 @@ fn drain_transport(records: &mut [InputDvmRecordWire]) -> Result<usize, i32> {
     Ok((count as usize).min(records.len()))
 }
 
-fn notify_netd_dvm_session(epoch: u32, action: u64, timeout_ms: u64) -> Result<(), i32> {
+fn netd_dvm_session_request_with_deadline(
+    epoch: u32,
+    action: u64,
+    pid: u64,
+    tid: u64,
+    deadline: rustos_user_abi::deadline::AbsoluteDeadline,
+    now_ns: u64,
+) -> Result<(NetdIpcRequest, u64), i32> {
+    // Preserve the immutable transaction end on the wire. The bounded IPC
+    // syscall receives only this attempt's remaining interactive-control
+    // budget; kernel and netd enforce the effective end as
+    // `min(transaction_end, admission_time + class_cap)`.
+    let timeout_ms = deadline
+        .child_timeout_ms(now_ns, dvm_session_sync::CALL_DEADLINE_MS)
+        .map_err(|_| libc::ETIMEDOUT)?;
+    Ok((
+        NetdIpcRequest {
+            version: NETD_IPC_ABI_VERSION,
+            op: NETD_IPC_OP_DVM_SESSION,
+            pid,
+            tid,
+            arg0: u64::from(epoch),
+            arg1: action,
+            deadline_ns: deadline.end_ns(),
+            ..NetdIpcRequest::default()
+        },
+        timeout_ms,
+    ))
+}
+
+fn notify_netd_dvm_session(
+    epoch: u32,
+    action: u64,
+    deadline: rustos_user_abi::deadline::AbsoluteDeadline,
+) -> Result<(), i32> {
     if epoch == 0 || !matches!(action, NETD_DVM_SESSION_GRANT | NETD_DVM_SESSION_REVOKE) {
         return Err(libc::EINVAL);
     }
@@ -1162,15 +1254,14 @@ fn notify_netd_dvm_session(epoch: u32, action: u64, timeout_ms: u64) -> Result<(
         ));
         return Err(libc::ESRCH);
     }
-    let request = NetdIpcRequest {
-        version: NETD_IPC_ABI_VERSION,
-        op: NETD_IPC_OP_DVM_SESSION,
-        pid: pid as u64,
-        tid: tid as u64,
-        arg0: u64::from(epoch),
-        arg1: action,
-        ..NetdIpcRequest::default()
-    };
+    let (request, timeout_ms) = netd_dvm_session_request_with_deadline(
+        epoch,
+        action,
+        pid as u64,
+        tid as u64,
+        deadline,
+        dvm_session_sync::monotonic_nanos(),
+    )?;
     let mut response = NetdIpcResponse::default();
     let received = unsafe {
         rustos_svc_runtime::ipc::call_bounded(

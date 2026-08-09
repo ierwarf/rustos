@@ -27,6 +27,7 @@ FIELDS = (
     "target",
     "test",
     "source",
+    "witness_source",
 )
 
 REQUIRED_DISRUPTIONS = {
@@ -131,11 +132,16 @@ def read_registry(root: Path) -> list[dict[str, str]]:
         source = root / scenario["source"]
         if not source.is_file():
             raise SystemExit(f"{identity}: missing source {scenario['source']}")
+        witness_source = root / scenario["witness_source"]
+        if not witness_source.is_file():
+            raise SystemExit(
+                f"{identity}: missing witness source {scenario['witness_source']}"
+            )
         if not re.search(
             rf"\bfn\s+{re.escape(scenario['test'])}\s*\(",
-            source.read_text(encoding="utf-8"),
+            witness_source.read_text(encoding="utf-8"),
         ):
-            raise SystemExit(f"{identity}: source witness test is missing")
+            raise SystemExit(f"{identity}: witness source test is missing")
         scenarios.append(scenario)
 
     if [scenario["id"] for scenario in scenarios] != sorted(identities):
@@ -185,6 +191,9 @@ def run_scenario(root: Path, artifact_dir: Path, scenario: dict[str, str]) -> di
         "elapsed_ms": elapsed_ms,
         "source_sha256": hashlib.sha256(
             (root / scenario["source"]).read_bytes()
+        ).hexdigest(),
+        "witness_source_sha256": hashlib.sha256(
+            (root / scenario["witness_source"]).read_bytes()
         ).hexdigest(),
     }
 

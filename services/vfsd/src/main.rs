@@ -39,10 +39,11 @@ use rustos_svc_runtime::syscall::monotonic_nanos;
 use rustos_user_abi::deadline::AbsoluteDeadline;
 use rustos_user_abi::linux as linux_abi;
 use rustos_user_abi::syscall::{
-    CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
-    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, IpcReplyWithHandlesArgs,
-    ServiceCheckpointRecordWire, VfsExecutableSnapshotRequest, VfsExecutableSnapshotResponse,
-    VfsIpcRequest, VfsIpcResponse, WaitSetInterestWire, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
+    waitset_interest_shape_valid, CommercialMaxCapabilityLeaseWire,
+    CommercialMaxProtocolDescriptorWire, CommercialMaxProtocolRequest,
+    CommercialMaxProtocolResponse, IpcReplyWithHandlesArgs, ServiceCheckpointRecordWire,
+    VfsExecutableSnapshotRequest, VfsExecutableSnapshotResponse, VfsIpcRequest, VfsIpcResponse,
+    WaitSetInterestWire, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
     COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS, COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR,
     COMMERCIAL_MAX_PROTOCOL_VFSD, COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_COMPACT,
     COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE,
@@ -889,15 +890,7 @@ fn checkpoint_interest_key(interest: &WaitSetInterestRecord) -> (u64, u64) {
 }
 
 fn waitset_interest_from_wire(wire: &WaitSetInterestWire) -> Option<WaitSetInterestRecord> {
-    if wire.abi_version != WAITSET_ABI_VERSION
-        || wire.flags != 0
-        || wire.reserved0 != 0
-        || wire.provider == 0
-        || wire.provider > rustos_user_abi::syscall::WAITSET_PROVIDER_MAX
-        || wire.target_fd > u16::MAX as u64
-        || wire.object_id == 0
-        || wire.provider_epoch == 0
-    {
+    if !waitset_interest_shape_valid(wire) {
         return None;
     }
     Some(WaitSetInterestRecord {

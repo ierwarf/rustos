@@ -136,8 +136,8 @@ reason = "Robust-futex and clear_child_tid cleanup require aligned atomic user-w
 [[risk_surfaces]]
 path = "kernel/mm/src/memory/kernel_vm.rs"
 severity = "critical"
-flows = ["kernel-memory-protection", "tlb-shootdown-lifecycle"]
-reason = "Kernel image W xor X, direct-map permissions, MMIO windows, and global shootdowns share the active kernel page tables."
+flows = ["cpu-online-lifecycle", "kernel-memory-protection", "tlb-shootdown-lifecycle", "dvm-block-ingress", "dvm-input-ingress"]
+reason = "Kernel image W xor X, direct-map permissions, permanent APIC leaf retyping, per-CPU PAT selectors, MMIO windows, shared-RAM cache selectors, and global shootdowns share the active kernel page tables."
 
 [[risk_surfaces]]
 path = "kernel/mm/src/memory/address_space/rollback.rs"
@@ -268,14 +268,20 @@ reason = "Per-task and per-process masks, inheritance, exact previous-mask retur
 [[risk_surfaces]]
 path = "kernel/ps/src/multitask/scheduler/handoff_queue.rs"
 severity = "critical"
-flows = ["bootstrap-activation-handoff", "scheduler-dispatch"]
-reason = "Committed child first-turn and synchronous call-reply authority must remain bounded, FIFO, deduplicated, and retirement-safe."
+flows = ["bootstrap-activation-handoff"]
+reason = "Committed child first-turn authority remains bounded, FIFO, deduplicated, and retirement-safe."
 
 [[risk_surfaces]]
 path = "kernel/ps/src/multitask/scheduler/handoffs.rs"
 severity = "critical"
-flows = ["atomic-process-activation-batch", "bootstrap-activation-handoff", "scheduler-dispatch"]
-reason = "Activation and successful-reply admission must retain exact bounded custody while preserving a mandatory fairness turn."
+flows = ["atomic-process-activation-batch", "bootstrap-activation-handoff"]
+reason = "Activation admission retains exact bounded first-turn custody while preserving the activation fairness contract."
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/sync_handoff.rs"
+severity = "critical"
+flows = ["scheduler-dispatch"]
+reason = "The per-CPU direct-handoff FIFO retains exact reply `{task_id, owner_generation, target_cpu}` custody, rechecks it at selection, refreshes only a newer same-task reply generation in place, and has no stale-token fallback."
 
 [[risk_surfaces]]
 path = "kernel/ps/src/multitask/scheduler/reclaim.rs"
@@ -440,6 +446,24 @@ flows = ["dvm-block-ingress", "dvm-block-startup", "dvm-volume-io", "durable-blo
 reason = "Shared-ring storage authority, slot reuse, mutation durability, and revoke are data-loss boundaries."
 
 [[risk_surfaces]]
+path = "kernel/io-manager/src/driver/mmio.rs"
+severity = "critical"
+flows = ["dvm-block-ingress", "dvm-input-ingress", "memory-map"]
+reason = "One global physical interval registry must reserve before mutation and reject conflicting direct-map/MMIO-window or unowned permanent-leaf cache aliases before either mapping is published."
+
+[[risk_surfaces]]
+path = "kernel/executive/src/boot.rs"
+severity = "critical"
+flows = ["cpu-online-lifecycle"]
+reason = "The BSP must admit its permanent local-APIC UC direct-map leaf before APIC/PIC use, and every AP must reject a non-WB PAT0 then program/read back its local PAT contract before OnlineParked or private readiness exposes shared page-table cache modes."
+
+[[risk_surfaces]]
+path = "libs/driver-domain-host/src/lib.rs"
+severity = "critical"
+flows = ["dvm-input-ingress"]
+reason = "The host-owned input producer maps the fixed shared ring and must preserve the same ordinary shared-RAM cache contract as RustOS."
+
+[[risk_surfaces]]
 path = "kernel/io-manager/src/io/dvm_network.rs"
 severity = "critical"
 flows = ["dvm-network-ingress"]
@@ -527,7 +551,7 @@ reason = "The service loop owns byte-only reply-receive phase handling and must 
 path = "services/netd/src/main.rs"
 severity = "critical"
 flows = ["dvm-network-ingress", "netd-deferred-reply-lifecycle"]
-reason = "Netd owns packet admission and deferred socket reply settlement."
+reason = "Netd owns packet admission, one-time absolute deadline tightening, and exact deferred socket reply settlement."
 
 [[risk_surfaces]]
 path = "services/runtimed/src/spawn.rs"
@@ -652,9 +676,33 @@ models = [
 [[source_mappings]]
 path = "kernel/mm/src/memory/kernel_vm.rs"
 models = [
+    "cpu-online-lifecycle/CpuOnlineLifecycle",
+    "dvm-block-startup/DvmBlockStartup",
+    "dvm-block-transport/DvmBlockTransport",
+    "dvm-input-ring/DvmInputRing",
     "page-table-lifecycle/PageTableLifecycle",
     "tlb-shootdown-lifecycle/TlbShootdownLifecycle",
 ]
+
+[[source_mappings]]
+path = "kernel/io-manager/src/io/dvm_block.rs"
+models = [
+    "dvm-block-startup/DvmBlockStartup",
+    "dvm-block-transport/DvmBlockTransport",
+]
+
+[[source_mappings]]
+path = "kernel/io-manager/src/driver/mmio.rs"
+models = [
+    "dvm-block-startup/DvmBlockStartup",
+    "dvm-block-transport/DvmBlockTransport",
+    "dvm-input-ring/DvmInputRing",
+    "page-table-lifecycle/PageTableLifecycle",
+]
+
+[[source_mappings]]
+path = "libs/driver-domain-host/src/lib.rs"
+models = ["dvm-input-ring/DvmInputRing"]
 
 [[source_mappings]]
 path = "kernel/nucleus-core/src/bootstrap_stack.rs"
@@ -689,11 +737,28 @@ models = [
     "dvm-display-readiness/DvmDisplayReadiness",
     "dvm-block-transport/DvmBlockTransport",
     "smp-release-admission/SmpReleaseAdmission",
+    "smp-ring3-qualification/SmpRing3Qualification",
 ]
 
 [[source_mappings]]
 path = "tools/xtask/src/kvm.rs"
-models = ["smp-release-admission/SmpReleaseAdmission"]
+models = [
+    "dvm-block-transport/DvmBlockTransport",
+    "smp-release-admission/SmpReleaseAdmission",
+    "smp-ring3-qualification/SmpRing3Qualification",
+]
+
+[[source_mappings]]
+path = "tools/xtask/src/kvm/options.rs"
+models = ["smp-ring3-qualification/SmpRing3Qualification"]
+
+[[source_mappings]]
+path = "tools/xtask/src/kvm/evidence/smp_qualification.rs"
+models = ["smp-ring3-qualification/SmpRing3Qualification"]
+
+[[source_mappings]]
+path = "tools/xtask/src/stage/mod.rs"
+models = ["smp-ring3-qualification/SmpRing3Qualification"]
 
 [[source_mappings]]
 path = "tools/xtask/src/formal_contracts/evidence.rs"
@@ -704,11 +769,65 @@ path = "tools/xtask/src/kvm/layout.rs"
 models = [
     "ivshmem-pairing/IvshmemPairing",
     "dvm-block-transport/DvmBlockTransport",
+    "smp-ring3-qualification/SmpRing3Qualification",
+]
+
+[[source_mappings]]
+path = "tools/xtask/src/kvm/layout/block_transport.rs"
+models = [
+    "dvm-block-transport/DvmBlockTransport",
+    "smp-ring3-qualification/SmpRing3Qualification",
+]
+
+[[source_mappings]]
+path = "driver-domains/linux/board/linux.fragment"
+models = [
+    "dvm-block-transport/DvmBlockTransport",
+    "smp-ring3-qualification/SmpRing3Qualification",
+]
+
+[[source_mappings]]
+path = "driver-domains/linux/scripts/verify-kernel-config.sh"
+models = [
+    "dvm-block-transport/DvmBlockTransport",
+    "smp-ring3-qualification/SmpRing3Qualification",
+]
+
+[[source_mappings]]
+path = "driver-domains/linux/board/overlay/etc/init.d/S12rustos-dvm-block"
+models = [
+    "dvm-block-transport/DvmBlockTransport",
+    "smp-ring3-qualification/SmpRing3Qualification",
+]
+
+[[source_mappings]]
+path = "driver-domains/linux/package/rustos-dvm-block/src/rustos-dvm-block.c"
+models = [
+    "dvm-block-transport/DvmBlockTransport",
+    "smp-ring3-qualification/SmpRing3Qualification",
+]
+
+[[source_mappings]]
+path = "driver-domains/linux/package/rustos-dvm-block/src/rustos_dvm_block_uio.c"
+models = ["dvm-block-startup/DvmBlockStartup"]
+
+[[source_mappings]]
+path = "services/storaged/src/main.rs"
+models = [
+    "dvm-block-startup/DvmBlockStartup",
+    "dvm-block-transport/DvmBlockTransport",
 ]
 
 [[source_mappings]]
 path = "kernel/compat/src/user/syscall/linux/debug_ops.rs"
-models = ["product-boot/ProductBoot"]
+models = [
+    "product-boot/ProductBoot",
+    "smp-ring3-qualification/SmpRing3Qualification",
+]
+
+[[source_mappings]]
+path = "kernel/compat/src/user/syscall/linux/smp_qualification_ops.rs"
+models = ["smp-ring3-qualification/SmpRing3Qualification"]
 
 [[source_mappings]]
 path = "kernel/hal/src/arch/clock.rs"
@@ -818,7 +937,9 @@ path = "libs/rustos-user-abi/src/syscall.rs"
 models = [
     "ipc-handle-transfer/IpcHandleTransfer",
     "ipc-reply-recv-transaction/IpcReplyRecvTransaction",
+    "netd-deferred-reply/NetdDeferredReply",
     "sigchld-notification/SigchldNotification",
+    "smp-ring3-qualification/SmpRing3Qualification",
 ]
 
 [[source_mappings]]
@@ -845,11 +966,15 @@ path = "kernel/compat/src/user/syscall/linux/proc_broker_ops.rs"
 models = [
     "atomic-process-activation-batch/AtomicProcessActivationBatch",
     "deferred-process-activation/DeferredProcessActivation",
+    "smp-ring3-qualification/SmpRing3Qualification",
 ]
 
 [[source_mappings]]
 path = "kernel/compat/src/user/syscall/linux/proc_broker_ops/activation_batch.rs"
-models = ["atomic-process-activation-batch/AtomicProcessActivationBatch"]
+models = [
+    "atomic-process-activation-batch/AtomicProcessActivationBatch",
+    "smp-ring3-qualification/SmpRing3Qualification",
+]
 
 [[source_mappings]]
 path = "kernel/compat/src/user/syscall/linux/support.rs"
@@ -886,6 +1011,7 @@ models = [
 [[source_mappings]]
 path = "kernel/compat/src/user/syscall/linux/service_ops/vfs_socket.rs"
 models = [
+    "netd-deferred-reply/NetdDeferredReply",
     "vfs-open-description-recovery/VfsOpenDescriptionRecovery",
 ]
 
@@ -925,6 +1051,7 @@ path = "kernel/compat/src/user/syscall/linux/service_ops/vfs_meta.rs"
 models = [
     "ipc-handle-transfer/IpcHandleTransfer",
     "ipc-transfer-authority/IpcTransferAuthority",
+    "netd-deferred-reply/NetdDeferredReply",
 ]
 
 [[source_mappings]]
@@ -1025,6 +1152,7 @@ models = [
     "process-address-space-lifetime/ProcessAddressSpaceLifetime",
     "scheduler-cpu-distribution/SchedulerCpuDistribution",
     "scheduler-thread-demotion/SchedulerThreadDemotion",
+    "synchronous-ipc-handoff-concurrency/SynchronousIpcHandoffConcurrency",
     "synchronous-ipc-handoff/SynchronousIpcHandoff",
     "scheduler-wakeup/SchedulerWakeup",
     "syscall-simd-lifecycle/SyscallSimdLifecycle",
@@ -1069,9 +1197,22 @@ models = [
     "scheduler-cpu-ownership/SchedulerCpuOwnership",
     "scheduler-thread-demotion/SchedulerThreadDemotion",
     "smp-reschedule-ipi/SmpRescheduleIpi",
+    "synchronous-ipc-handoff-concurrency/SynchronousIpcHandoffConcurrency",
     "synchronous-ipc-handoff/SynchronousIpcHandoff",
     "task-affinity-lifecycle/TaskAffinityLifecycle",
     "user-stack-growth/UserStackGrowth",
+]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/runqueue_policy.rs"
+models = ["scheduler-active-balance/SchedulerActiveBalance"]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/runqueue.rs"
+models = [
+    "scheduler-cpu-distribution/SchedulerCpuDistribution",
+    "synchronous-ipc-handoff-concurrency/SynchronousIpcHandoffConcurrency",
+    "synchronous-ipc-handoff/SynchronousIpcHandoff",
 ]
 
 [[source_mappings]]
@@ -1101,22 +1242,30 @@ models = [
 
 [[source_mappings]]
 path = "kernel/ps/src/multitask/scheduler/handoff_queue.rs"
-models = [
-    "bootstrap-activation-handoff/BootstrapActivationHandoff",
-    "synchronous-ipc-handoff/SynchronousIpcHandoff",
-]
+models = ["bootstrap-activation-handoff/BootstrapActivationHandoff"]
 
 [[source_mappings]]
 path = "kernel/ps/src/multitask/scheduler/handoffs.rs"
 models = [
     "atomic-process-activation-batch/AtomicProcessActivationBatch",
     "bootstrap-activation-handoff/BootstrapActivationHandoff",
+    "synchronous-ipc-handoff-concurrency/SynchronousIpcHandoffConcurrency",
+    "synchronous-ipc-handoff/SynchronousIpcHandoff",
+]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/sync_handoff.rs"
+models = [
+    "synchronous-ipc-handoff-concurrency/SynchronousIpcHandoffConcurrency",
     "synchronous-ipc-handoff/SynchronousIpcHandoff",
 ]
 
 [[source_mappings]]
 path = "kernel/ps/src/multitask/scheduler/synchronous_handoff_tests.rs"
-models = ["synchronous-ipc-handoff/SynchronousIpcHandoff"]
+models = [
+    "synchronous-ipc-handoff-concurrency/SynchronousIpcHandoffConcurrency",
+    "synchronous-ipc-handoff/SynchronousIpcHandoff",
+]
 
 [[source_mappings]]
 path = "kernel/ps/src/multitask/scheduler/smp.rs"
@@ -1125,6 +1274,8 @@ models = [
     "cross-cpu-task-retirement/CrossCpuTaskRetirement",
     "scheduler-wakeup/SchedulerWakeup",
     "smp-reschedule-ipi/SmpRescheduleIpi",
+    "synchronous-ipc-handoff-concurrency/SynchronousIpcHandoffConcurrency",
+    "synchronous-ipc-handoff/SynchronousIpcHandoff",
 ]
 
 [[source_mappings]]
@@ -1179,13 +1330,19 @@ path = "kernel/compat/src/user/syscall/linux/ipc_ops.rs"
 models = [
     "input-ingestion-worker/InputIngestionWorker",
     "ipc-reply-recv-transaction/IpcReplyRecvTransaction",
+    "netd-deferred-reply/NetdDeferredReply",
     "service-call-authority/ServiceCallAuthority",
+    "synchronous-ipc-handoff-concurrency/SynchronousIpcHandoffConcurrency",
     "synchronous-ipc-handoff/SynchronousIpcHandoff",
 ]
 
 [[source_mappings]]
 path = "kernel/compat/src/user/syscall/linux/ipc_reply_recv.rs"
-models = ["ipc-reply-recv-transaction/IpcReplyRecvTransaction"]
+models = [
+    "ipc-reply-recv-transaction/IpcReplyRecvTransaction",
+    "synchronous-ipc-handoff-concurrency/SynchronousIpcHandoffConcurrency",
+    "synchronous-ipc-handoff/SynchronousIpcHandoff",
+]
 
 [[source_mappings]]
 path = "kernel/io-manager/src/api.rs"
@@ -1234,6 +1391,7 @@ path = "services/inputd/src/main.rs"
 models = [
     "input-ingestion-worker/InputIngestionWorker",
     "ipc-reply-recv-transaction/IpcReplyRecvTransaction",
+    "netd-deferred-reply/NetdDeferredReply",
 ]
 
 [[source_mappings]]
@@ -1242,7 +1400,10 @@ models = ["ipc-reply-recv-transaction/IpcReplyRecvTransaction"]
 
 [[source_mappings]]
 path = "services/inputd/src/dvm_session_sync.rs"
-models = ["input-ingestion-worker/InputIngestionWorker"]
+models = [
+    "input-ingestion-worker/InputIngestionWorker",
+    "netd-deferred-reply/NetdDeferredReply",
+]
 
 [[source_mappings]]
 path = "services/uiserver/src/input_loop.rs"
@@ -1303,11 +1464,69 @@ models = [
 
 [[source_mappings]]
 path = "services/vfsd/src/lib.rs"
-models = ["scheduler-thread-demotion/SchedulerThreadDemotion"]
+models = [
+    "dvm-volume-io/DvmVolumeIo",
+    "scheduler-thread-demotion/SchedulerThreadDemotion",
+    "smp-ring3-qualification/SmpRing3Qualification",
+    "userspace-wait-set/WaitSetRegistry",
+]
+
+[[source_mappings]]
+path = "services/vfsd/src/state_checkpoint.rs"
+models = ["userspace-wait-set/WaitSetRegistry"]
 
 [[source_mappings]]
 path = "services/runtimed/src/main.rs"
-models = ["ui-frame-budget/UiFrameBudget"]
+models = [
+    "ui-frame-budget/UiFrameBudget",
+    "smp-ring3-qualification/SmpRing3Qualification",
+]
+
+[[source_mappings]]
+path = "services/runtimed/src/socket.rs"
+models = ["smp-ring3-qualification/SmpRing3Qualification"]
+
+[[source_mappings]]
+path = "services/runtimed/src/spawn.rs"
+models = ["smp-ring3-qualification/SmpRing3Qualification"]
+
+[[source_mappings]]
+path = "services/runtimed/src/catalog.rs"
+models = ["smp-ring3-qualification/SmpRing3Qualification"]
+
+[[source_mappings]]
+path = "services/runtimed/src/kvm_smp_qualification.rs"
+models = ["smp-ring3-qualification/SmpRing3Qualification"]
+
+[[source_mappings]]
+path = "apps/smpqual/smpqual.c"
+models = ["smp-ring3-qualification/SmpRing3Qualification"]
+
+[[source_mappings]]
+path = "tools/xtask/src/kvm/evidence.rs"
+models = ["smp-ring3-qualification/SmpRing3Qualification"]
+
+[[source_mappings]]
+path = "kernel/compat/src/user/sysops/console.rs"
+models = ["smp-ring3-qualification/SmpRing3Qualification"]
+
+[[source_mappings]]
+path = "kernel/nucleus-core/src/debug/mod.rs"
+models = ["smp-ring3-qualification/SmpRing3Qualification"]
+
+[[source_mappings]]
+path = "kernel/io-manager/src/io/dvm_block/revoke.rs"
+models = [
+    "dvm-block-startup/DvmBlockStartup",
+    "dvm-block-transport/DvmBlockTransport",
+]
+
+[[source_mappings]]
+path = "kernel/io-manager/src/io/dvm_block/tests.rs"
+models = [
+    "dvm-block-startup/DvmBlockStartup",
+    "dvm-block-transport/DvmBlockTransport",
+]
 
 [[source_mappings]]
 path = "services/rootd/src/main.rs"
@@ -1459,12 +1678,14 @@ required_models = [
     "product-boot/ProductBoot",
     "robust-futex-owner-death/RobustFutexOwnerDeath",
     "scheduler-cpu-ownership/SchedulerCpuOwnership",
+    "smp-ring3-qualification/SmpRing3Qualification",
     "smp-release-admission/SmpReleaseAdmission",
     "smp-reschedule-ipi/SmpRescheduleIpi",
     "syscall-simd-lifecycle/SyscallSimdLifecycle",
     "task-affinity-lifecycle/TaskAffinityLifecycle",
     "tlb-shootdown-lifecycle/TlbShootdownLifecycle",
     "userspace-wait-set/UserspaceWaitSet",
+    "userspace-wait-set/WaitSetRegistry",
     "user-stack-growth/UserStackGrowth",
 ]
 required_evidence = [
@@ -1515,6 +1736,7 @@ required_models = [
     "per-cpu-clockevent-lifecycle/PerCpuClockeventLifecycle",
     "syscall-simd-lifecycle/SyscallSimdLifecycle",
     "process-address-space-lifetime/ProcessAddressSpaceLifetime",
+    "smp-ring3-qualification/SmpRing3Qualification",
     "smp-release-admission/SmpReleaseAdmission",
     "user-stack-growth/UserStackGrowth",
 ]

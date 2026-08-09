@@ -96,6 +96,8 @@ struct SmokeOptions {
     dvm_block_shmem: bool,
     rustos_vcpus: u8,
     smp_iteration: bool,
+    smp_ring3_qualification: bool,
+    smp_evidence_cohort: Option<String>,
     physical_gpu_bdf: Option<String>,
     physical_gpu_firmware: Option<PathBuf>,
     min_ui_fps: Option<u32>,
@@ -231,6 +233,18 @@ where
     }
     let input_doorbell = start_dvm_input_doorbell(&layout)?;
     let input_relay_gate = Arc::new(AtomicBool::new(false));
+    let display_doorbell = start_dvm_display_doorbell(&layout)?;
+    let block_doorbell = start_dvm_block_doorbell(&layout)?;
+    let guest_display = smoke_guest_display(&options)?;
+    let host_render_node = if guest_display != GuestDisplay::Physical {
+        Some(require_host_render_node()?)
+    } else {
+        None
+    };
+    let launch_evidence =
+        smp_qualification::capture_kvm_launch_evidence(config, &artifacts, &layout, &options)?;
+    // The bounded relay owns `options.timeout`; arm it only after potentially
+    // expensive prelaunch evidence capture and immediately before guest spawn.
     let control_relay = start_dvm_input_relay(
         config,
         options.timeout,
@@ -240,14 +254,6 @@ where
         layout.dvm_control_secret.clone(),
         Arc::clone(&input_relay_gate),
     )?;
-    let display_doorbell = start_dvm_display_doorbell(&layout)?;
-    let block_doorbell = start_dvm_block_doorbell(&layout)?;
-    let guest_display = smoke_guest_display(&options)?;
-    let host_render_node = if guest_display != GuestDisplay::Physical {
-        Some(require_host_render_node()?)
-    } else {
-        None
-    };
     let (mut rustos, mut dvm) = spawn_guests(
         &qemu,
         config,
@@ -318,7 +324,11 @@ where
         crate::formal_contracts::record_kvm_runtime_trace(
             &config.root_dir,
             crate::formal_contracts::KvmRuntimeObservation {
-                elapsed_ms: boot_started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+                elapsed_ms: boot_started
+                    .elapsed()
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or(u64::MAX),
                 storage: options.dvm_block_shmem,
                 input: true,
                 display: options.gui_dvm_surfaces,
@@ -332,9 +342,9 @@ where
     }
     let success_evidence = write_kvm_success_summary(
         config,
-        &artifacts,
         &layout,
         &options,
+        launch_evidence.as_ref(),
         boot_started.elapsed(),
     )?;
     println!(
@@ -395,11 +405,7 @@ fn select_smoke_guest_display(options: &SmokeOptions, host_has_gui: bool) -> Res
 /// closes the DVM QEMU window or interrupts it. Acceptance is still enforced
 /// when the session closes; a slow but progressing debug boot is not killed by
 /// an arbitrary startup deadline.
-pub(crate) fn kvm_run_command(
-    config: &Config,
-    build_image: bool,
-    rustos_vcpus: u8,
-) -> Result<()> {
+pub(crate) fn kvm_run_command(config: &Config, build_image: bool, rustos_vcpus: u8) -> Result<()> {
     let _launch_lock = acquire_kvm_launch_lock(&config.build_dir.join("kvm"))?;
     if build_image {
         crate::build::build(config, false)?;
@@ -422,6 +428,8 @@ pub(crate) fn kvm_run_command(
         // Interactive SMP uses the same exact-tree bounded evidence profile as
         // the topology smoke run. It is observation, not a release/FPS claim.
         smp_iteration: rustos_vcpus > 1,
+        smp_ring3_qualification: false,
+        smp_evidence_cohort: None,
         physical_gpu_bdf: None,
         physical_gpu_firmware: None,
         min_ui_fps: None,
@@ -689,6 +697,8 @@ where
         dvm_block_shmem: false,
         rustos_vcpus: 1,
         smp_iteration: false,
+        smp_ring3_qualification: false,
+        smp_evidence_cohort: None,
         physical_gpu_bdf: None,
         physical_gpu_firmware: None,
         min_ui_fps: None,
@@ -714,9 +724,19 @@ where
             "--gui-dvm-surfaces" => options.gui_dvm_surfaces = true,
             "--dvm-network-shmem" => options.dvm_network_shmem = true,
             "--dvm-block-shmem" => options.dvm_block_shmem = true,
-            "--rustos-vcpus" => options.rustos_vcpus =
-                parse_rustos_vcpus(next_value(&mut args, "--rustos-vcpus")?)?,
+            "--rustos-vcpus" => {
+                options.rustos_vcpus = parse_rustos_vcpus(next_value(&mut args, "--rustos-vcpus")?)?
+            }
             "--smp-iteration" => options.smp_iteration = true,
+            "--smp-ring3-qualification" => options.smp_ring3_qualification = true,
+            "--smp-evidence-cohort" => {
+                if options.smp_evidence_cohort.is_some() {
+                    bail!("--smp-evidence-cohort was supplied more than once");
+                }
+                let cohort = next_value(&mut args, "--smp-evidence-cohort")?;
+                validate_smp_evidence_cohort(&cohort)?;
+                options.smp_evidence_cohort = Some(cohort);
+            }
             "--physical-gpu" | "--physical-amdgpu" => {
                 if options.physical_gpu_bdf.is_some() {
                     bail!("physical GPU BDF was supplied more than once");
@@ -816,10 +836,26 @@ where
             || options.physical_gpu_bdf.is_some()
             || options.physical_gpu_firmware.is_some()
         {
-            bail!(
-                "--smp-iteration cannot be used for FPS, recovery, or physical-GPU acceptance"
-            );
+            bail!("--smp-iteration cannot be used for FPS, recovery, or physical-GPU acceptance");
         }
+    }
+    if options.smp_ring3_qualification {
+        if !options.smp_iteration {
+            bail!("--smp-ring3-qualification requires --smp-iteration");
+        }
+        if options.smp_evidence_cohort.is_none() {
+            bail!("--smp-ring3-qualification requires --smp-evidence-cohort");
+        }
+        if !matches!(options.rustos_vcpus, 1 | 2 | 4 | 8) {
+            bail!("--smp-ring3-qualification requires --rustos-vcpus to be one of 1, 2, 4, or 8");
+        }
+        // The per-run private qualification contract is outside the signed
+        // early-system closure and is visible to runtimed only through the
+        // production DVM-backed FAT volume. The evidence executable itself is
+        // separately pinned inside early-system against DVM substitution.
+        options.dvm_block_shmem = true;
+    } else if options.smp_evidence_cohort.is_some() {
+        bail!("--smp-evidence-cohort requires --smp-ring3-qualification");
     }
     if options.storage_only {
         if options.exercise_input
@@ -956,6 +992,17 @@ where
     args.next()
         .filter(|value| !value.is_empty())
         .with_context(|| format!("missing value for {option}"))
+}
+
+fn validate_smp_evidence_cohort(value: &str) -> Result<()> {
+    if value.len() != 32
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        bail!("--smp-evidence-cohort must be exactly 32 lowercase hexadecimal characters");
+    }
+    Ok(())
 }
 
 fn dvm_dir(config: &Config) -> PathBuf {

@@ -25,6 +25,15 @@ use super::{
     scheduler_initialized, scheduler_mut,
 };
 
+#[cfg(test)]
+mod test_support;
+#[cfg(test)]
+pub(super) use test_support::{
+    flush_deferred_target_reschedules, prepare_test_deferred_target_reschedule,
+    reset_test_deferred_target_reschedule_flush_epoch, test_deferred_target_reschedule_flush_epoch,
+    test_deferred_target_reschedule_pending_mask, test_deferred_target_reschedule_sent_mask,
+};
+
 static AP_FIRST_WORK_DISPATCH_RECORDED: [AtomicBool;
     nucleus_core::util::lockdep::MAX_TRACKED_CPUS] =
     [const { AtomicBool::new(false) }; nucleus_core::util::lockdep::MAX_TRACKED_CPUS];
@@ -36,7 +45,6 @@ static CPU_FIRST_USER_DISPATCH_RECORDED: [AtomicBool;
 static CPU_FIRST_RESCHEDULE_IPI_RECORDED: [AtomicBool;
     nucleus_core::util::lockdep::MAX_TRACKED_CPUS] =
     [const { AtomicBool::new(false) }; nucleus_core::util::lockdep::MAX_TRACKED_CPUS];
-#[cfg(not(test))]
 static TARGET_RESCHEDULE_IPI_PENDING: AtomicU64 = AtomicU64::new(0);
 static PERIODIC_FAIRNESS_TICKS: [core::sync::atomic::AtomicU8;
     nucleus_core::util::lockdep::MAX_TRACKED_CPUS] =
@@ -571,39 +579,55 @@ fn send_target_reschedule_ipi(target: usize, generation: u64, sequence: u64) {
 /// Emit exact target notification edges after the scheduler raw lock has
 /// actually been released. Multiple flushers are safe: each target bit
 /// coalesces IPIs and a racing publication remains for the next safe point.
-pub(super) fn flush_deferred_target_reschedules() {
-    #[cfg(not(test))]
-    {
-        if !scheduler_initialized() {
-            return;
+fn flush_deferred_target_reschedules_with(
+    scheduler_ready: bool,
+    current_cpu: usize,
+    mut online_generation: impl FnMut(usize) -> Option<u64>,
+    mut pending_sequence: impl FnMut(usize) -> Option<u64>,
+    mut send: impl FnMut(usize, u64, u64),
+) {
+    if !scheduler_ready {
+        return;
+    }
+    // ORDERING: AcqRel claims every target whose mailbox/request became
+    // durable while a raw scheduler owner disabled preemption. New target bits
+    // racing this swap remain for the next safe point.
+    let targeted = TARGET_RESCHEDULE_IPI_PENDING.swap(0, Ordering::AcqRel);
+    for target in 0..nucleus_core::util::lockdep::MAX_TRACKED_CPUS {
+        if targeted & (1_u64 << target) == 0 {
+            continue;
         }
-        // ORDERING: AcqRel claims every target whose mailbox/request became
-        // durable while a raw scheduler owner disabled preemption. New target
-        // bits racing this swap remain for the next safe point.
-        let targeted = TARGET_RESCHEDULE_IPI_PENDING.swap(0, Ordering::AcqRel);
-        for target in 0..nucleus_core::util::lockdep::MAX_TRACKED_CPUS {
-            if targeted & (1_u64 << target) == 0 {
-                continue;
-            }
-            if !remote_notification_required(target, current_cpu_index()) {
-                // The durable local request is enough. xAPIC fixed self-IPIs
-                // are forbidden and the return path is already a safe point.
-                continue;
-            }
-            let logical_index =
-                u8::try_from(target).expect("scheduler deferred target exceeds lifecycle identity");
-            let snapshot = cpu::lifecycle_snapshot(logical_index)
-                .filter(|snapshot| snapshot.state == cpu::CpuLifecycleState::Online)
-                .expect("scheduler deferred target is not Online");
-            if super::reschedule_observation::request_pending(target) {
-                send_target_reschedule_ipi(
-                    target,
-                    snapshot.generation,
-                    super::reschedule_observation::request_sequence_snapshot(target),
-                );
-            }
+        if !remote_notification_required(target, current_cpu) {
+            // The durable local request is enough. xAPIC fixed self-IPIs are
+            // forbidden and the return path is already a safe point.
+            continue;
+        }
+        let generation = online_generation(target)
+            .unwrap_or_else(|| panic!("scheduler deferred target is not Online: {target}"));
+        if let Some(sequence) = pending_sequence(target) {
+            send(target, generation, sequence);
         }
     }
+}
+
+#[cfg(not(test))]
+pub(super) fn flush_deferred_target_reschedules() {
+    flush_deferred_target_reschedules_with(
+        scheduler_initialized(),
+        current_cpu_index(),
+        |target| {
+            let logical_index =
+                u8::try_from(target).expect("scheduler deferred target exceeds lifecycle identity");
+            cpu::lifecycle_snapshot(logical_index)
+                .filter(|snapshot| snapshot.state == cpu::CpuLifecycleState::Online)
+                .map(|snapshot| snapshot.generation)
+        },
+        |target| {
+            super::reschedule_observation::request_pending(target)
+                .then(|| super::reschedule_observation::request_sequence_snapshot(target))
+        },
+        send_target_reschedule_ipi,
+    );
 }
 
 /// Requests a voluntary switch in the common interruptible syscall tail.

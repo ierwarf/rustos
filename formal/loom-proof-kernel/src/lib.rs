@@ -966,4 +966,216 @@ mod tests {
             assert_eq!(announcements.load(Ordering::Acquire), 1);
         });
     }
+
+    /// Mirrors handoff publication plus the assembly-side commit. Seeing the
+    /// incoming current slot, or seeing the pre-commit active phase, must
+    /// reveal the exact outgoing stack slot. The active bit may legitimately
+    /// be clear after commit; the outgoing slot value remains published.
+    #[test]
+    fn scheduler_transition_publication_never_loses_outgoing_stack_owner() {
+        loom::model(|| {
+            const OUTGOING: usize = 17;
+            const INCOMING: usize = 29;
+
+            let current = Arc::new(AtomicUsize::new(OUTGOING));
+            let transition = Arc::new(AtomicUsize::new(0));
+            let transition_active = Arc::new(AtomicBool::new(false));
+
+            let writer_current = Arc::clone(&current);
+            let writer_transition = Arc::clone(&transition);
+            let writer_active = Arc::clone(&transition_active);
+            let writer = thread::spawn(move || {
+                writer_transition.store(OUTGOING, Ordering::Release);
+                writer_active.store(true, Ordering::Release);
+                writer_current.store(INCOMING, Ordering::Release);
+                writer_active.store(false, Ordering::Release);
+            });
+
+            let reader_current = Arc::clone(&current);
+            let reader_transition = Arc::clone(&transition);
+            let reader_active = Arc::clone(&transition_active);
+            let reader = thread::spawn(move || {
+                let observed_current = reader_current.load(Ordering::Acquire);
+                let observed_active = reader_active.load(Ordering::Acquire);
+                let observed_transition = reader_transition.load(Ordering::Acquire);
+                if observed_current == INCOMING || observed_active {
+                    assert_eq!(observed_transition, OUTGOING);
+                }
+            });
+
+            writer.join().unwrap();
+            reader.join().unwrap();
+            assert_eq!(current.load(Ordering::Acquire), INCOMING);
+            assert!(!transition_active.load(Ordering::Acquire));
+            assert_eq!(transition.load(Ordering::Acquire), OUTGOING);
+        });
+    }
+
+    /// Refines a blocked outgoing task's wake across the assembly transition.
+    /// The owner CAS is followed by the target mailbox publication and its
+    /// notification hint.  Draining may happen before assembly commits, but a
+    /// dispatch claim cannot; after commit exactly one claim consumes custody.
+    #[test]
+    fn scheduler_transition_wake_has_one_queued_owner_until_commit() {
+        loom::model(|| {
+            const BLOCKED: usize = 0;
+            const REMOTE_QUEUED: usize = 1;
+            const LOCAL: usize = 2;
+            const RUNNING: usize = 3;
+
+            struct WakeState {
+                transition_active: AtomicBool,
+                owner: AtomicUsize,
+                mailbox: Mutex<bool>,
+                notified: AtomicBool,
+                claims: AtomicUsize,
+                claim_before_commit: AtomicBool,
+                wake_published: AtomicBool,
+                target_claim_attempted: AtomicBool,
+            }
+
+            let state = Arc::new(WakeState {
+                transition_active: AtomicBool::new(true),
+                owner: AtomicUsize::new(BLOCKED),
+                mailbox: Mutex::new(false),
+                notified: AtomicBool::new(false),
+                claims: AtomicUsize::new(0),
+                claim_before_commit: AtomicBool::new(false),
+                wake_published: AtomicBool::new(false),
+                target_claim_attempted: AtomicBool::new(false),
+            });
+
+            let wake_state = Arc::clone(&state);
+            let wake = thread::spawn(move || {
+                assert!(
+                    wake_state
+                        .owner
+                        .compare_exchange(
+                            BLOCKED,
+                            REMOTE_QUEUED,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                );
+                *wake_state.mailbox.lock().unwrap() = true;
+                wake_state.notified.store(true, Ordering::Release);
+                wake_state.wake_published.store(true, Ordering::Release);
+            });
+
+            let target_state = Arc::clone(&state);
+            let target = thread::spawn(move || {
+                while !target_state.wake_published.load(Ordering::Acquire) {
+                    thread::yield_now();
+                }
+                {
+                    let mut mailbox = target_state.mailbox.lock().unwrap();
+                    if *mailbox {
+                        // Clearing the hint while holding the mailbox owner
+                        // closes the producer/drainer race. A later 0->1 edge
+                        // may be spurious, but can never create custody.
+                        target_state.notified.store(false, Ordering::Release);
+                        *mailbox = false;
+                        assert!(
+                            target_state
+                                .owner
+                                .compare_exchange(
+                                    REMOTE_QUEUED,
+                                    LOCAL,
+                                    Ordering::AcqRel,
+                                    Ordering::Acquire,
+                                )
+                                .is_ok()
+                        );
+                    }
+                }
+                // Keep the observed assembly state adjacent to the owner-CAS
+                // that linearizes a dispatch claim.  The latch is deliberately
+                // retained even though the production guard prevents it: a
+                // mutant that removes that guard must leave a durable witness
+                // rather than being hidden by the post-join recovery below.
+                let transition_active_at_claim =
+                    target_state.transition_active.load(Ordering::Acquire);
+                if !transition_active_at_claim
+                    && target_state
+                        .owner
+                        .compare_exchange(LOCAL, RUNNING, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                {
+                    if transition_active_at_claim {
+                        target_state
+                            .claim_before_commit
+                            .store(true, Ordering::Release);
+                    }
+                    target_state.claims.fetch_add(1, Ordering::AcqRel);
+                }
+                target_state
+                    .target_claim_attempted
+                    .store(true, Ordering::Release);
+            });
+
+            let commit_state = Arc::clone(&state);
+            let commit = thread::spawn(move || {
+                while !commit_state.target_claim_attempted.load(Ordering::Acquire) {
+                    thread::yield_now();
+                }
+                commit_state
+                    .transition_active
+                    .store(false, Ordering::Release);
+            });
+
+            wake.join().unwrap();
+            target.join().unwrap();
+            commit.join().unwrap();
+
+            assert!(
+                !state.claim_before_commit.load(Ordering::Acquire),
+                "a target claim before assembly commit must not be masked by recovery"
+            );
+
+            // A missed, coalesced, or spurious IPI is only a latency event.
+            // The target's ordinary safe point consumes the durable record.
+            {
+                let mut mailbox = state.mailbox.lock().unwrap();
+                if *mailbox {
+                    *mailbox = false;
+                    assert!(
+                        state
+                            .owner
+                            .compare_exchange(
+                                REMOTE_QUEUED,
+                                LOCAL,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            )
+                            .is_ok()
+                    );
+                }
+                state.notified.store(false, Ordering::Release);
+            }
+            let transition_active_at_claim = state.transition_active.load(Ordering::Acquire);
+            if !transition_active_at_claim
+                && state
+                    .owner
+                    .compare_exchange(LOCAL, RUNNING, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                if transition_active_at_claim {
+                    state.claim_before_commit.store(true, Ordering::Release);
+                }
+                state.claims.fetch_add(1, Ordering::AcqRel);
+            }
+
+            assert!(!state.transition_active.load(Ordering::Acquire));
+            assert!(
+                !state.claim_before_commit.load(Ordering::Acquire),
+                "every successful claim must follow assembly commit"
+            );
+            assert!(!*state.mailbox.lock().unwrap());
+            assert_eq!(state.owner.load(Ordering::Acquire), RUNNING);
+            assert_eq!(state.claims.load(Ordering::Acquire), 1);
+        });
+    }
+
+    include!("smp_qualification_tests.rs");
 }

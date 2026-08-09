@@ -196,6 +196,63 @@ static IPC_DEFERRED_TRANSFER_DROPS: TrackedSpinLock<
 static NEXT_IPC_TRANSFER_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_IPC_TRANSFER_BATCH_GENERATION: AtomicU64 = AtomicU64::new(1);
 
+/// Registers the one initial netd-owned reference of a newly created AF_INET
+/// stream socket for reply-bound publication.
+///
+/// This deliberately constructs a non-visible [`TransferredHandleEntry`]
+/// instead of installing a temporary fd and duplicating it.  The entry owns
+/// netd's existing `refs = 1` reference.  A caller that cannot bind the
+/// returned descriptor to its exact reply must use
+/// [`reclaim_unbound_inet_socket_transfer`] and let netd discard that token;
+/// this substrate never issues provider close work for an unpublished socket.
+pub fn register_new_inet_socket_transfer(
+    token: u64,
+    domain: u64,
+    socket_type: u64,
+    protocol: u64,
+) -> Result<KernelTransferredHandle, IpcTransferRegistryError> {
+    let base_type = socket_type & linux_abi::SOCK_TYPE_MASK;
+    let open_flags = socket_type & (linux_abi::SOCK_NONBLOCK | linux_abi::SOCK_CLOEXEC);
+    if token == 0
+        || domain != linux_abi::AF_INET
+        || base_type != linux_abi::SOCK_STREAM
+        || socket_type != (base_type | open_flags)
+    {
+        return Err(IpcTransferRegistryError::InvalidDescriptor);
+    }
+    let fd_flags = if open_flags & linux_abi::SOCK_CLOEXEC != 0 {
+        FD_CLOEXEC
+    } else {
+        0
+    };
+    let entry = HandleEntry::new(
+        KernelHandle::InetSocket(InetSocketHandle::from_token(
+            token, domain, base_type, protocol,
+        )),
+        fd_flags,
+        open_flags,
+    );
+    let transferred = TransferredHandleEntry::from_initial_entry(entry)
+        .ok_or(IpcTransferRegistryError::InvalidDescriptor)?;
+    let descriptors = register_ipc_transfer_entries(alloc::vec![transferred])?;
+    let [descriptor] = descriptors.as_slice() else {
+        unreachable!("one initial Inet socket entry must create one transfer descriptor");
+    };
+    Ok(*descriptor)
+}
+
+/// Reclaims an unpublished initial AF_INET transfer without provider cleanup.
+///
+/// Binding can fail because the caller abandoned, consumed, or never owned the
+/// reply capability.  Removing the registry entry first prevents a stranded
+/// descriptor, while dropping the local entry intentionally leaves the sole
+/// provider reference for netd's explicit unpublished-token discard path.
+pub fn reclaim_unbound_inet_socket_transfer(descriptor: KernelTransferredHandle) {
+    if let Ok(entries) = take_ipc_transfer_entries(core::slice::from_ref(&descriptor)) {
+        drop(entries);
+    }
+}
+
 pub fn register_ipc_transfer_entries(
     entries: Vec<TransferredHandleEntry>,
 ) -> Result<Vec<KernelTransferredHandle>, IpcTransferRegistryError> {
@@ -585,6 +642,23 @@ mod transfer_registry_tests {
         let dropped = take_deferred_ipc_transfer_drops(1);
         assert_eq!(dropped.len(), 1);
         assert_eq!(dropped[0].entry().handle().device_handle(), Some(device));
+    }
+
+    #[test]
+    fn failed_reply_binding_reclaims_initial_inet_descriptor_without_deferred_release() {
+        let descriptor = register_new_inet_socket_transfer(
+            u64::MAX - 703,
+            linux_abi::AF_INET,
+            linux_abi::SOCK_STREAM | linux_abi::SOCK_NONBLOCK,
+            6,
+        )
+        .expect("register initial Inet socket transfer");
+
+        reclaim_unbound_inet_socket_transfer(descriptor);
+        assert!(matches!(
+            take_ipc_transfer_entries(&[descriptor]),
+            Err(IpcTransferRegistryError::StaleDescriptor)
+        ));
     }
 
     #[test]

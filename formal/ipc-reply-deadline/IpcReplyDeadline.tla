@@ -39,10 +39,16 @@ Free == "free"
 Queued == "queued"
 Dequeued == "dequeued"
 Replied == "replied"
+Taking == "taking"
 Cancelled == "cancelled"
 PeerClosed == "peer-closed"
 Consumed == "consumed"
 Abandoned == "abandoned"
+
+NoPublication == "none"
+PendingPublication == "pending"
+VisiblePublication == "visible"
+DroppedPublication == "dropped"
 
 VARIABLES now,
           taskState,
@@ -53,11 +59,12 @@ VARIABLES now,
           serverOf,
           replyDeadline,
           replyUsed,
+          publicationState,
           observedOutcome,
           lastOutcomeReply
 
 vars == <<now, taskState, waitFor, timerDeadline, replyState, callerOf,
-          serverOf, replyDeadline, replyUsed, observedOutcome,
+          serverOf, replyDeadline, replyUsed, publicationState, observedOutcome,
           lastOutcomeReply>>
 
 NoOutcome == "none"
@@ -66,7 +73,7 @@ TimedOut == "timed-out"
 PeerClosedOutcome == "peer-closed"
 
 LiveReply(r) == replyState[r] \in {Queued, Dequeued}
-OutstandingReply(r) == replyState[r] \in {Queued, Dequeued, Replied}
+OutstandingReply(r) == replyState[r] \in {Queued, Dequeued, Replied, Taking}
 
 WaitedReply(t) == waitFor[t]
 WaitingServer(t) ==
@@ -88,6 +95,7 @@ Init ==
     /\ serverOf = [r \in Replies |-> NoTask]
     /\ replyDeadline = [r \in Replies |-> NoTimer]
     /\ replyUsed = [r \in Replies |-> FALSE]
+    /\ publicationState = [r \in Replies |-> NoPublication]
     /\ observedOutcome = [t \in Tasks |-> NoOutcome]
     /\ lastOutcomeReply = [t \in Tasks |-> NoReply]
 
@@ -113,7 +121,8 @@ EnqueueCall(caller, server, reply) ==
     /\ replyDeadline' = [replyDeadline EXCEPT ![reply] = now + DeadlineTicks]
     /\ observedOutcome' = [observedOutcome EXCEPT ![caller] = NoOutcome]
     /\ lastOutcomeReply' = [lastOutcomeReply EXCEPT ![caller] = NoReply]
-    /\ UNCHANGED <<now, taskState, timerDeadline, replyUsed>>
+    /\ UNCHANGED <<now, taskState, timerDeadline, replyUsed,
+                  publicationState>>
 
 DequeueCall(server, reply) ==
     /\ server \in Tasks
@@ -123,7 +132,28 @@ DequeueCall(server, reply) ==
     /\ serverOf[reply] = server
     /\ replyState' = [replyState EXCEPT ![reply] = Dequeued]
     /\ UNCHANGED <<now, taskState, waitFor, timerDeadline, callerOf, serverOf,
-                  replyDeadline, replyUsed, observedOutcome, lastOutcomeReply>>
+                  replyDeadline, replyUsed, publicationState, observedOutcome,
+                  lastOutcomeReply>>
+
+(*******************************************************************************
+An optional handle publication is prepared only after the server owns the
+exact dequeued reply.  It remains invisible while the reply is live.  The
+concrete kernel stores the opaque transfer descriptor on that endpoint
+message before returning from the prepare broker, so cancellation and server
+exit cannot miss the resource.
+*******************************************************************************)
+PreparePublication(server, reply) ==
+    /\ server \in Tasks
+    /\ reply \in Replies
+    /\ taskState[server] = Runnable
+    /\ replyState[reply] = Dequeued
+    /\ serverOf[reply] = server
+    /\ publicationState[reply] = NoPublication
+    /\ publicationState' =
+        [publicationState EXCEPT ![reply] = PendingPublication]
+    /\ UNCHANGED <<now, taskState, waitFor, timerDeadline, replyState,
+                  callerOf, serverOf, replyDeadline, replyUsed,
+                  observedOutcome, lastOutcomeReply>>
 
 (*******************************************************************************
 This is the response write plus the caller wake.  The concrete reply object is
@@ -142,7 +172,7 @@ CompleteReply(server, reply) ==
     /\ taskState' = [taskState EXCEPT ![callerOf[reply]] = Runnable]
     /\ timerDeadline' = [timerDeadline EXCEPT ![callerOf[reply]] = NoTimer]
     /\ UNCHANGED <<now, waitFor, callerOf, serverOf, replyDeadline,
-                  observedOutcome, lastOutcomeReply>>
+                  publicationState, observedOutcome, lastOutcomeReply>>
 
 (*******************************************************************************
 The first poll handles a reply that arrived before arm; the second poll is
@@ -158,7 +188,8 @@ ArmBlock(caller) ==
     /\ timerDeadline[caller] = NoTimer
     /\ taskState' = [taskState EXCEPT ![caller] = Armed]
     /\ UNCHANGED <<now, waitFor, timerDeadline, replyState, callerOf, serverOf,
-                  replyDeadline, replyUsed, observedOutcome, lastOutcomeReply>>
+                  replyDeadline, replyUsed, publicationState, observedOutcome,
+                  lastOutcomeReply>>
 
 ArmDeadlineTimer(caller) ==
     /\ caller \in Tasks
@@ -170,7 +201,8 @@ ArmDeadlineTimer(caller) ==
     /\ timerDeadline' =
         [timerDeadline EXCEPT ![caller] = replyDeadline[waitFor[caller]]]
     /\ UNCHANGED <<now, taskState, waitFor, replyState, callerOf, serverOf,
-                  replyDeadline, replyUsed, observedOutcome, lastOutcomeReply>>
+                  replyDeadline, replyUsed, publicationState, observedOutcome,
+                  lastOutcomeReply>>
 
 CommitBlock(caller) ==
     /\ caller \in Tasks
@@ -181,17 +213,43 @@ CommitBlock(caller) ==
     /\ timerDeadline[caller] > now
     /\ taskState' = [taskState EXCEPT ![caller] = Blocked]
     /\ UNCHANGED <<now, waitFor, timerDeadline, replyState, callerOf, serverOf,
-                  replyDeadline, replyUsed, observedOutcome, lastOutcomeReply>>
+                  replyDeadline, replyUsed, publicationState, observedOutcome,
+                  lastOutcomeReply>>
 
-TakeCompletedReply(caller, reply) ==
+(*******************************************************************************
+The concrete caller samples time on both sides of the destructive response
+take.  Splitting that operation exposes the only relevant race: a reply and
+its pending publication may be removed from the queue, but expiry can still
+win before the resource becomes visible in the caller's handle table.
+*******************************************************************************)
+BeginTakeCompletedReply(caller, reply) ==
     /\ caller \in Tasks
     /\ reply \in Replies
     /\ taskState[caller] = Runnable
     /\ waitFor[caller] = reply
     /\ callerOf[reply] = caller
     /\ replyState[reply] = Replied
+    /\ now < replyDeadline[reply]
+    /\ replyState' = [replyState EXCEPT ![reply] = Taking]
+    /\ UNCHANGED <<now, taskState, waitFor, timerDeadline, callerOf, serverOf,
+                  replyDeadline, replyUsed, publicationState,
+                  observedOutcome, lastOutcomeReply>>
+
+FinishTakeBeforeDeadline(caller, reply) ==
+    /\ caller \in Tasks
+    /\ reply \in Replies
+    /\ taskState[caller] = Runnable
+    /\ waitFor[caller] = reply
+    /\ callerOf[reply] = caller
+    /\ replyState[reply] = Taking
+    /\ now < replyDeadline[reply]
     /\ waitFor' = [waitFor EXCEPT ![caller] = NoReply]
     /\ replyState' = [replyState EXCEPT ![reply] = Consumed]
+    /\ publicationState' =
+        [publicationState EXCEPT
+            ![reply] = IF @ = PendingPublication
+                      THEN VisiblePublication
+                      ELSE @]
     /\ observedOutcome' = [observedOutcome EXCEPT ![caller] = ReplyReceived]
     /\ lastOutcomeReply' = [lastOutcomeReply EXCEPT ![caller] = reply]
     /\ UNCHANGED <<now, taskState, timerDeadline, callerOf, serverOf,
@@ -229,6 +287,12 @@ ExitTask(task) ==
     /\ replyUsed' =
         [r \in Replies |->
             IF r \in ClosedCalls THEN TRUE ELSE replyUsed[r]]
+    /\ publicationState' =
+        [r \in Replies |->
+            IF r \in (ClosedCalls \cup AbandonedCalls)
+               /\ publicationState[r] = PendingPublication
+            THEN DroppedPublication
+            ELSE publicationState[r]]
     /\ observedOutcome' =
         [t \in Tasks |->
             IF t # task /\ waitFor[t] \in ClosedCalls THEN PeerClosedOutcome
@@ -246,7 +310,7 @@ has no state in which a control waiter remains blocked at or past its deadline.
 *******************************************************************************)
 Tick ==
     LET DueCalls ==
-        {r \in Replies : LiveReply(r) /\ replyDeadline[r] = now + 1} IN
+        {r \in Replies : OutstandingReply(r) /\ replyDeadline[r] = now + 1} IN
     /\ now < MaxTick
     /\ now' = now + 1
     /\ replyState' =
@@ -269,17 +333,26 @@ Tick ==
             IF \E r \in DueCalls : callerOf[r] = t
             THEN CHOOSE r \in DueCalls : callerOf[r] = t
             ELSE lastOutcomeReply[t]]
+    /\ publicationState' =
+        [r \in Replies |->
+            IF r \in DueCalls /\ publicationState[r] = PendingPublication
+            THEN DroppedPublication
+            ELSE publicationState[r]]
     /\ UNCHANGED <<callerOf, serverOf, replyDeadline, replyUsed>>
 
 Next ==
     \/ \E caller \in Tasks, server \in Tasks, reply \in Replies :
         EnqueueCall(caller, server, reply)
     \/ \E server \in Tasks, reply \in Replies : DequeueCall(server, reply)
+    \/ \E server \in Tasks, reply \in Replies : PreparePublication(server, reply)
     \/ \E server \in Tasks, reply \in Replies : CompleteReply(server, reply)
     \/ \E caller \in Tasks : ArmBlock(caller)
     \/ \E caller \in Tasks : ArmDeadlineTimer(caller)
     \/ \E caller \in Tasks : CommitBlock(caller)
-    \/ \E caller \in Tasks, reply \in Replies : TakeCompletedReply(caller, reply)
+    \/ \E caller \in Tasks, reply \in Replies :
+        BeginTakeCompletedReply(caller, reply)
+    \/ \E caller \in Tasks, reply \in Replies :
+        FinishTakeBeforeDeadline(caller, reply)
     \/ \E task \in Tasks : ExitTask(task)
     \/ Tick
 
@@ -294,12 +367,15 @@ TypeOK ==
     /\ taskState \in [Tasks -> {Runnable, Armed, Blocked, Exited}]
     /\ waitFor \in [Tasks -> Replies \cup {NoReply}]
     /\ timerDeadline \in [Tasks -> 0..MaxTick]
-    /\ replyState \in [Replies -> {Free, Queued, Dequeued, Replied, Cancelled,
-                                   PeerClosed, Consumed, Abandoned}]
+    /\ replyState \in [Replies -> {Free, Queued, Dequeued, Replied, Taking,
+                                   Cancelled, PeerClosed, Consumed, Abandoned}]
     /\ callerOf \in [Replies -> Tasks \cup {NoTask}]
     /\ serverOf \in [Replies -> Tasks \cup {NoTask}]
     /\ replyDeadline \in [Replies -> 0..MaxTick]
     /\ replyUsed \in [Replies -> BOOLEAN]
+    /\ publicationState \in
+        [Replies -> {NoPublication, PendingPublication, VisiblePublication,
+                     DroppedPublication}]
     /\ observedOutcome \in
         [Tasks -> {NoOutcome, ReplyReceived, TimedOut, PeerClosedOutcome}]
     /\ lastOutcomeReply \in [Tasks -> Replies \cup {NoReply}]
@@ -308,7 +384,7 @@ ExactCallerOwnsEveryWait ==
     \A t \in Tasks :
         waitFor[t] # NoReply =>
             /\ callerOf[waitFor[t]] = t
-            /\ replyState[waitFor[t]] \in {Queued, Dequeued, Replied}
+            /\ replyState[waitFor[t]] \in {Queued, Dequeued, Replied, Taking}
 
 AtMostOneOutstandingControlCallPerTask ==
     \A t \in Tasks :
@@ -325,9 +401,9 @@ LiveCallHasExactLiveEndpoints ==
 
 OneShotReplyCannotBeReopened ==
     \A r \in Replies :
-        /\ replyState[r] \in {Replied, PeerClosed, Consumed} => replyUsed[r]
-        /\ replyUsed[r] => replyState[r] \in {Replied, PeerClosed, Consumed,
-                                                 Abandoned}
+        /\ replyState[r] \in {Replied, Taking, PeerClosed, Consumed} => replyUsed[r]
+        /\ replyUsed[r] => replyState[r] \in {Replied, Taking, Cancelled,
+                                               PeerClosed, Consumed, Abandoned}
 
 BlockedWaitHasAnArmedExactDeadline ==
     \A t \in Tasks :
@@ -380,6 +456,33 @@ ExitedTaskRetainsNoWaitAuthority ==
         taskState[t] = Exited =>
             /\ waitFor[t] = NoReply
             /\ timerDeadline[t] = NoTimer
+
+PendingPublicationIsOwnedByOneLiveReply ==
+    \A r \in Replies :
+        publicationState[r] = PendingPublication =>
+            /\ replyState[r] \in {Dequeued, Replied, Taking}
+            /\ callerOf[r] # NoTask
+            /\ serverOf[r] # NoTask
+
+VisiblePublicationRequiresConsumedTimelyReply ==
+    \A r \in Replies :
+        publicationState[r] = VisiblePublication =>
+            /\ replyState[r] = Consumed
+            /\ replyUsed[r]
+
+TerminalReplyRetainsNoPendingPublication ==
+    \A r \in Replies :
+        replyState[r] \in {Cancelled, PeerClosed, Consumed, Abandoned} =>
+            publicationState[r] # PendingPublication
+
+TakingReplyStillPrecedesDeadline ==
+    \A r \in Replies :
+        replyState[r] = Taking => now < replyDeadline[r]
+
+DroppedPublicationNeverBecomesVisible ==
+    \A r \in Replies :
+        publicationState[r] = DroppedPublication =>
+            replyState[r] \in {Cancelled, PeerClosed, Abandoned}
 
 BlockedCallerEventuallyUnblocks ==
     \A t \in Tasks:

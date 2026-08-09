@@ -42,7 +42,7 @@ use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
 macro_rules! ipc_trace {
     ($($arg:tt)*) => {
         if IPC_TRACE_VERBOSE {
-            debug::println_emergency(format_args!($($arg)*));
+            debug::println_serialized(format_args!($($arg)*));
         }
     };
 }
@@ -522,6 +522,30 @@ pub(crate) fn service_endpoint_epoch(service_id: u64) -> Option<u64> {
     let epoch = SERVICE_ENDPOINT_EPOCHS[index].load(Ordering::Acquire);
     (endpoint != 0 && owner != 0 && epoch != 0 && !multitask::is_user_process_exiting(owner))
         .then_some(epoch)
+}
+
+/// Return the exact live service endpoint owner and epoch as one serialized
+/// observation.  Callers bind both values; an endpoint restart, revoke, or
+/// PID reuse must not turn an old owner claim into new authority.
+pub(crate) fn live_service_endpoint_owner_and_epoch(service_id: u64) -> Option<(u64, u64)> {
+    let (owner, epoch) = published_service_endpoint_owner_and_epoch(service_id)?;
+    (!multitask::is_user_process_exiting(owner)).then_some((owner, epoch))
+}
+
+/// Return a serialized publication snapshot without taking the process-table
+/// lock. ProcBroker-held transactions use this only with an identity sampled
+/// before acquiring ProcBrokerRegistry; taking ProcessTable beneath that lock
+/// would create a reverse lifecycle dependency.
+pub(crate) fn published_service_endpoint_owner_and_epoch(service_id: u64) -> Option<(u64, u64)> {
+    let index = service_index(service_id)?;
+    let _registry = SERVICE_ENDPOINT_REGISTRY_MUTATION.lock();
+    // ORDERING: the registry mutation lock serializes compound publication;
+    // Acquire pairs with each endpoint/owner/epoch Release store so this
+    // snapshot never authenticates fields from different publications.
+    let endpoint = SERVICE_ENDPOINTS[index].load(Ordering::Acquire);
+    let owner = SERVICE_ENDPOINT_OWNERS[index].load(Ordering::Acquire);
+    let epoch = SERVICE_ENDPOINT_EPOCHS[index].load(Ordering::Acquire);
+    (endpoint != 0 && owner != 0 && epoch != 0).then_some((owner, epoch))
 }
 
 fn next_service_endpoint_epoch(current: u64) -> Option<u64> {
@@ -1360,6 +1384,11 @@ fn syscall_linux_rustos_ipc_call_with_timeout(
         request.len()
     );
     let copy_ticks = crate::arch::rtc::ticks();
+    // Sample the endpoint binding before enqueue. A provider restart after the
+    // call is queued cannot replace the caller's wire end with a new relative
+    // reply budget.
+    let reply_deadline =
+        service_reply_deadline_tick_for_endpoint(endpoint, request.as_slice(), timeout_ms);
     let reply = match enqueue_call_and_wake(endpoint, request.as_slice()) {
         Ok(reply) => reply,
         Err(errno) => return linux_errno(errno),
@@ -1372,10 +1401,11 @@ fn syscall_linux_rustos_ipc_call_with_timeout(
     );
     let send_ticks = crate::arch::rtc::ticks();
     ipc_trace!("ipc call waiting: endpoint={}", endpoint.raw());
-    let response = match wait_for_service_reply_with_timeout(reply, timeout_ms) {
-        Ok(response) => response,
-        Err(errno) => return linux_errno(errno),
-    };
+    let response =
+        match wait_for_service_reply_with_deadline_tick(reply, reply_deadline, timeout_ms) {
+            Ok(response) => response,
+            Err(errno) => return linux_errno(errno),
+        };
     let wait_ticks = crate::arch::rtc::ticks();
     let Ok(reply_capacity) = usize::try_from(reply_capacity) else {
         return linux_errno(LINUX_EINVAL);
@@ -1770,13 +1800,11 @@ pub(super) fn syscall_linux_rustos_ipc_reply(
             return linux_errno(ipc_error_to_linux_errno(err));
         }
     };
-    let _ = multitask::release_ipc_priority(reply);
     let reply_ticks = crate::arch::rtc::ticks();
-    let woke = multitask::wake_task(task_id);
     // Direct hand-back to the caller: the service is about to wait on its
     // endpoint again, so donate the remaining quantum to the original caller
     // instead of round-robining away from a freshly-completed reply.
-    if woke && multitask::set_next_synchronous_pick_hint(task_id) {
+    if multitask::complete_ipc_reply_wake_handoff(reply, task_id) {
         // The common syscall tail consumes this request with IF enabled. The
         // shared synchronous IPC FIFO is burst-bounded, so direct hand-back
         // cannot erase the scheduler's overdue-task fairness turn.
@@ -2064,8 +2092,7 @@ pub(super) fn syscall_linux_rustos_ipc_reply_with_handles(args_ptr: u64) -> u64 
             return linux_errno(ipc_error_to_linux_errno(err));
         }
     };
-    let _ = multitask::release_ipc_priority(args.reply_cap);
-    if multitask::wake_task(task_id) && multitask::set_next_synchronous_pick_hint(task_id) {
+    if multitask::complete_ipc_reply_wake_handoff(args.reply_cap, task_id) {
         multitask::request_deferred_reschedule();
     }
     0
@@ -2113,7 +2140,7 @@ impl ServiceIpcClass {
         }
     }
 
-    const fn cap_timeout_ms(self, requested_timeout_ms: u64) -> u64 {
+    pub(super) const fn cap_timeout_ms(self, requested_timeout_ms: u64) -> u64 {
         let requested = if requested_timeout_ms == 0 {
             1
         } else {
@@ -2162,7 +2189,8 @@ fn call_service_endpoint_with_timeout(
     let start_ticks = crate::arch::rtc::ticks();
     let reply = enqueue_call_and_wake(endpoint, request)?;
     let send_ticks = crate::arch::rtc::ticks();
-    let response = wait_for_service_reply_with_timeout(reply, timeout_ms)?;
+    let reply_deadline = service_reply_deadline_tick_for_service(service_id, request, timeout_ms);
+    let response = wait_for_service_reply_with_deadline_tick(reply, reply_deadline, timeout_ms)?;
     let reply_ticks = crate::arch::rtc::ticks();
     log_slow_ipc_call(
         "service",
@@ -2184,12 +2212,57 @@ pub(super) fn call_service_endpoint_with_received_entries(
     request: &[u8],
     handle_capacity: usize,
 ) -> Result<(Vec<u8>, Vec<multitask::TransferredHandleEntry>), i64> {
+    call_service_endpoint_with_received_entries_with_timeout(
+        service_id,
+        request,
+        handle_capacity,
+        ServiceIpcClass::BulkData.timeout_ms(),
+    )
+}
+
+/// Calls one service endpoint and takes no more than `handle_capacity`
+/// descriptors under the same class and wire deadline as its byte reply.
+///
+/// A transfer-registry failure cannot strand a timely reply descriptor: the
+/// still-owned descriptor vector is explicitly returned to the deferred-drop
+/// owner before this function reports its errno.
+pub(super) fn call_service_endpoint_with_received_entries_with_timeout(
+    service_id: u64,
+    request: &[u8],
+    handle_capacity: usize,
+    timeout_ms: u64,
+) -> Result<(Vec<u8>, Vec<multitask::TransferredHandleEntry>), i64> {
+    let reply_deadline = service_reply_deadline_tick_for_service(service_id, request, timeout_ms);
+    call_service_endpoint_with_received_entries_until(
+        service_id,
+        request,
+        handle_capacity,
+        reply_deadline,
+    )
+}
+
+/// Performs the descriptor-bearing call against one precomputed absolute end.
+/// Callers that publish a resource after decoding retain this same tick for
+/// their final publication decision instead of refreshing a relative timeout.
+pub(super) fn call_service_endpoint_with_received_entries_until(
+    service_id: u64,
+    request: &[u8],
+    handle_capacity: usize,
+    reply_deadline: u64,
+) -> Result<(Vec<u8>, Vec<multitask::TransferredHandleEntry>), i64> {
     let endpoint = service_endpoint(service_id).ok_or(LINUX_ENOSYS)?;
     let start_ticks = crate::arch::rtc::ticks();
     let reply = enqueue_call_and_wake(endpoint, request)?;
-    let (response, descriptors) = wait_for_service_reply_with_handle_limit(reply, handle_capacity)?;
+    let (response, descriptors) =
+        wait_for_reply_with_deadline(reply, handle_capacity, reply_deadline)?;
     let reply_ticks = crate::arch::rtc::ticks();
-    let entries = take_transfer_entries(descriptors.as_slice())?;
+    let entries = match take_transfer_entries(descriptors.as_slice()) {
+        Ok(entries) => entries,
+        Err(errno) => {
+            drop_transfer_descriptors(descriptors.as_slice());
+            return Err(errno);
+        }
+    };
     log_slow_ipc_call(
         "service-handles",
         endpoint.raw(),
@@ -2360,7 +2433,19 @@ fn wait_for_service_reply_with_timeout(
     reply: KernelReplyHandle,
     timeout_ms: u64,
 ) -> Result<Vec<u8>, i64> {
-    match wait_for_reply_with_deadline(reply, 0, service_ipc_deadline_tick_after(timeout_ms)) {
+    wait_for_service_reply_with_deadline_tick(
+        reply,
+        service_ipc_deadline_tick_after(timeout_ms),
+        timeout_ms,
+    )
+}
+
+fn wait_for_service_reply_with_deadline_tick(
+    reply: KernelReplyHandle,
+    deadline_tick: u64,
+    timeout_ms: u64,
+) -> Result<Vec<u8>, i64> {
+    match wait_for_reply_with_deadline(reply, 0, deadline_tick) {
         Ok(response) => Ok(response.0),
         Err(errno) => {
             // An abandoned reply capability is the start of a failure chain
@@ -2394,13 +2479,6 @@ fn record_service_reply_timeout(reply: KernelReplyHandle, timeout_ms: u64, errno
     );
 }
 
-fn wait_for_service_reply_with_handle_limit(
-    reply: KernelReplyHandle,
-    handle_capacity: usize,
-) -> Result<(Vec<u8>, Vec<KernelTransferredHandle>), i64> {
-    wait_for_service_reply_with_handle_limit_after(reply, handle_capacity, SERVICE_IPC_TIMEOUT_MS)
-}
-
 fn wait_for_service_reply_with_handle_limit_after(
     reply: KernelReplyHandle,
     handle_capacity: usize,
@@ -2420,21 +2498,41 @@ fn wait_for_reply_with_deadline(
 ) -> Result<(Vec<u8>, Vec<KernelTransferredHandle>), i64> {
     let caller_task_id = multitask::current_task_id().ok_or(LINUX_EINVAL)?;
     loop {
+        // Sample expiry on both sides of the queue take. A reply cannot win
+        // if expiry was already visible or becomes visible during the take.
+        let expired_before_take = reply_deadline_expired(deadline_tick);
+        if !rustos_user_abi::deadline::reply_observation_allows_publication(
+            expired_before_take,
+            false,
+        ) {
+            cancel_reply_wait(reply, caller_task_id, ReplyCancelReason::DeadlineBeforeArm);
+            return Err(LINUX_ETIMEDOUT);
+        }
         match take_endpoint_response_for_wait(reply, handle_capacity) {
             Ok(Some(response)) => {
+                if !rustos_user_abi::deadline::reply_observation_allows_publication(
+                    expired_before_take,
+                    reply_deadline_expired(deadline_tick),
+                ) {
+                    disarm_reply_deadline_waiter(caller_task_id);
+                    drop_transfer_descriptors(response.1.as_slice());
+                    return Err(LINUX_ETIMEDOUT);
+                }
                 disarm_reply_deadline_waiter(caller_task_id);
                 return Ok(response);
             }
             Ok(None) => {}
             Err(errno) => {
                 disarm_reply_deadline_waiter(caller_task_id);
+                if errno == LINUX_EOVERFLOW {
+                    // A byte-only caller cannot own a response descriptor.
+                    // Cancel while the reply remains live so the normal
+                    // transfer result reaches deferred provider cleanup.
+                    cancel_reply_wait(reply, caller_task_id, ReplyCancelReason::TransferCapacity);
+                }
                 record_ipc_reply_wait_failure(reply, caller_task_id, errno);
                 return Err(errno);
             }
-        }
-        if reply_deadline_expired(deadline_tick) {
-            cancel_reply_wait(reply, caller_task_id, ReplyCancelReason::DeadlineBeforeArm);
-            return Err(LINUX_ETIMEDOUT);
         }
         if !multitask::arm_block_current_task() {
             cancel_reply_wait(reply, caller_task_id, ReplyCancelReason::InvalidArm);
@@ -2449,8 +2547,27 @@ fn wait_for_reply_with_deadline(
         // first take and arming, the wake_task call landed before arm_block, so
         // wake_armed would be set but no further wake arrives; re-checking the
         // queue here picks up that response without sleeping.
+        let expired_before_take = reply_deadline_expired(deadline_tick);
+        if !rustos_user_abi::deadline::reply_observation_allows_publication(
+            expired_before_take,
+            false,
+        ) {
+            disarm_reply_deadline_waiter(caller_task_id);
+            let _ = multitask::wake_task(caller_task_id);
+            cancel_reply_wait(reply, caller_task_id, ReplyCancelReason::DeadlineAfterArm);
+            return Err(LINUX_ETIMEDOUT);
+        }
         match take_endpoint_response_for_wait(reply, handle_capacity) {
             Ok(Some(response)) => {
+                if !rustos_user_abi::deadline::reply_observation_allows_publication(
+                    expired_before_take,
+                    reply_deadline_expired(deadline_tick),
+                ) {
+                    disarm_reply_deadline_waiter(caller_task_id);
+                    let _ = multitask::cancel_block_current_task();
+                    drop_transfer_descriptors(response.1.as_slice());
+                    return Err(LINUX_ETIMEDOUT);
+                }
                 disarm_reply_deadline_waiter(caller_task_id);
                 let _ = multitask::cancel_block_current_task();
                 return Ok(response);
@@ -2459,6 +2576,11 @@ fn wait_for_reply_with_deadline(
             Err(errno) => {
                 disarm_reply_deadline_waiter(caller_task_id);
                 let _ = multitask::cancel_block_current_task();
+                if errno == LINUX_EOVERFLOW {
+                    // See the pre-arm case: capacity rejection is terminal
+                    // for this caller and must retire a prepared reply handle.
+                    cancel_reply_wait(reply, caller_task_id, ReplyCancelReason::TransferCapacity);
+                }
                 record_ipc_reply_wait_failure(reply, caller_task_id, errno);
                 return Err(errno);
             }
@@ -2520,7 +2642,79 @@ fn service_ipc_deadline_tick_after(timeout_ms: u64) -> u64 {
     crate::arch::rtc::ticks().saturating_add(timeout_ticks)
 }
 
-fn reply_deadline_expired(deadline_tick: u64) -> bool {
+/// A netd ABI v7 request carries the initiator's `CLOCK_MONOTONIC` end
+/// instant. `monotonic_timespec` uses this exact tick-to-nanoseconds mapping,
+/// so flooring the inverse conversion cannot make a reply waiter outlive the
+/// advertised wire deadline. The wire value is clamped to the already-admitted
+/// relative class cap, so untrusted input cannot widen a caller's timeout.
+/// Other service requests retain their established relative behavior.
+fn netd_deadline_tick_from_request(request: &[u8], ticks_per_second: u64) -> Option<u64> {
+    if request.len() < NETD_IPC_REQUEST_HEADER_SIZE {
+        return None;
+    }
+    let version = u16::from_ne_bytes(request.get(..size_of::<u16>())?.try_into().ok()?);
+    if version != NETD_IPC_ABI_VERSION {
+        return None;
+    }
+    let offset = core::mem::offset_of!(NetdIpcRequest, deadline_ns);
+    let bytes = request.get(offset..offset.checked_add(size_of::<u64>())?)?;
+    let deadline_ns = u64::from_ne_bytes(bytes.try_into().ok()?);
+    (deadline_ns != 0).then(|| {
+        u64::try_from(
+            u128::from(deadline_ns)
+                .saturating_mul(u128::from(ticks_per_second.max(1)))
+                .saturating_div(u128::from(1_000_000_000_u64)),
+        )
+        .unwrap_or(u64::MAX)
+    })
+}
+
+fn bounded_netd_reply_deadline_tick(
+    relative_deadline_tick: u64,
+    request: &[u8],
+    ticks_per_second: u64,
+) -> u64 {
+    netd_deadline_tick_from_request(request, ticks_per_second)
+        .map_or(relative_deadline_tick, |wire_deadline_tick| {
+            wire_deadline_tick.min(relative_deadline_tick)
+        })
+}
+
+pub(super) fn service_reply_deadline_tick_for_service(
+    service_id: u64,
+    request: &[u8],
+    timeout_ms: u64,
+) -> u64 {
+    let relative_deadline = service_ipc_deadline_tick_after(timeout_ms);
+    if service_id == linux_abi::IPC_SERVICE_NETD {
+        return bounded_netd_reply_deadline_tick(
+            relative_deadline,
+            request,
+            crate::arch::rtc::ticks_per_second(),
+        );
+    }
+    relative_deadline
+}
+
+fn service_reply_deadline_tick_for_endpoint(
+    endpoint: KernelEndpointHandle,
+    request: &[u8],
+    timeout_ms: u64,
+) -> u64 {
+    let relative_deadline = service_ipc_deadline_tick_after(timeout_ms);
+    if service_endpoint(linux_abi::IPC_SERVICE_NETD)
+        .is_some_and(|netd| netd.raw() == endpoint.raw())
+    {
+        return bounded_netd_reply_deadline_tick(
+            relative_deadline,
+            request,
+            crate::arch::rtc::ticks_per_second(),
+        );
+    }
+    relative_deadline
+}
+
+pub(super) fn reply_deadline_expired(deadline_tick: u64) -> bool {
     crate::arch::rtc::ticks() >= deadline_tick
 }
 
@@ -2539,6 +2733,7 @@ enum ReplyCancelReason {
     InvalidArm = 2,
     DeadlineAfterArm = 3,
     InvalidCommit = 4,
+    TransferCapacity = 5,
 }
 
 fn cancel_reply_wait(reply: KernelReplyHandle, caller_task_id: u64, reason: ReplyCancelReason) {
@@ -2548,8 +2743,8 @@ fn cancel_reply_wait(reply: KernelReplyHandle, caller_task_id: u64, reason: Repl
     if let Ok(cancelled) = &result {
         let _ = multitask::release_ipc_priority(reply.raw());
         drop_transfer_descriptors(cancelled.transfers.as_slice());
-        in_flight = cancelled.disposition
-            == kernel_ipc_runtime::api::CancelledCallDisposition::InFlight;
+        in_flight =
+            cancelled.disposition == kernel_ipc_runtime::api::CancelledCallDisposition::InFlight;
         if in_flight {
             diagnostics::note_reply_abandoned_in_flight(reply.raw());
         }
@@ -2559,7 +2754,9 @@ fn cancel_reply_wait(reply: KernelReplyHandle, caller_task_id: u64, reason: Repl
         ReplyCancelReason::DeadlineBeforeArm | ReplyCancelReason::DeadlineAfterArm => {
             "ipc-reply-timeout"
         }
-        ReplyCancelReason::InvalidArm | ReplyCancelReason::InvalidCommit => "ipc-reply-cancelled",
+        ReplyCancelReason::InvalidArm
+        | ReplyCancelReason::InvalidCommit
+        | ReplyCancelReason::TransferCapacity => "ipc-reply-cancelled",
     };
     debug::record_milestone(
         debug::LogCategory::Compat,
@@ -2891,7 +3088,7 @@ pub(super) fn prepare_transfer_tickets_for_current_process(
     })
 }
 
-fn install_transfer_entries_for_current_process(
+pub(super) fn install_transfer_entries_for_current_process(
     entries: Vec<multitask::TransferredHandleEntry>,
 ) -> Result<Vec<i32>, i64> {
     let service_refs = service_transfer_refs(&entries);
@@ -3075,7 +3272,7 @@ fn log_slow_ipc_call(
         let send_ms = ticks_elapsed_ms(export_ticks, send_ticks);
         let wait_ms = ticks_elapsed_ms(send_ticks, wait_ticks);
         let write_ms = ticks_elapsed_ms(wait_ticks, write_ticks);
-        debug::println_emergency(format_args!(
+        debug::println_serialized(format_args!(
             "ipc slow {}: endpoint={} total_ms={} copy_ms={} export_ms={} send_ms={} wait_ms={} write_ms={} request_len={} response_len={}",
             kind,
             endpoint,
@@ -3103,7 +3300,7 @@ fn log_slow_ipc_reply(
     maybe_log_slow_ipc(total_ms, || {
         let copy_ms = ticks_elapsed_ms(start_ticks, copy_ticks);
         let reply_ms = ticks_elapsed_ms(copy_ticks, reply_ticks);
-        debug::println_emergency(format_args!(
+        debug::println_serialized(format_args!(
             "ipc slow {}: reply={} total_ms={} copy_ms={} reply_ms={} response_len={}",
             kind, reply, total_ms, copy_ms, reply_ms, response_len,
         ));
@@ -3111,221 +3308,4 @@ fn log_slow_ipc_reply(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn public_ipc_calls_share_the_finite_service_deadline() {
-        const {
-            assert!(SERVICE_IPC_TIMEOUT_MS > 0);
-            assert!(SERVICE_IPC_TIMEOUT_MS <= IPC_WAIT_SERVICE_ENDPOINT_MAX_TIMEOUT_MS);
-        }
-        assert_eq!(
-            ServiceIpcClass::ReadinessQuery.timeout_ms(),
-            rustos_user_abi::performance::IPC_READINESS_QUERY_HARD_LIMIT_MS
-        );
-        assert_eq!(
-            ServiceIpcClass::InteractiveControl.timeout_ms(),
-            rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS
-        );
-        assert_eq!(
-            ServiceIpcClass::BootControl.timeout_ms(),
-            rustos_user_abi::performance::IPC_BOOT_CONTROL_HARD_LIMIT_MS
-        );
-        assert_eq!(
-            ServiceIpcClass::BulkData.timeout_ms(),
-            SERVICE_IPC_TIMEOUT_MS
-        );
-        assert_eq!(
-            ServiceIpcClass::ReadinessQuery.cap_timeout_ms(u64::MAX),
-            rustos_user_abi::performance::IPC_READINESS_QUERY_HARD_LIMIT_MS
-        );
-        assert!(!bounded_ipc_call_timeout_is_valid(0));
-        assert!(bounded_ipc_call_timeout_is_valid(
-            rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS
-        ));
-        assert!(!bounded_ipc_call_timeout_is_valid(
-            SERVICE_IPC_TIMEOUT_MS + 1
-        ));
-        assert_eq!(
-            rustos_user_abi::syscall::SYS_RUSTOS_IPC_CALL_WITH_HANDLES_BOUNDED,
-            0x5255_0045
-        );
-        assert_eq!(ServiceIpcClass::BootControl.cap_timeout_ms(37), 37);
-        assert_eq!(ServiceIpcClass::InteractiveControl.cap_timeout_ms(0), 1);
-    }
-
-    #[test]
-    fn retired_task_cleanup_removes_service_endpoint_waiter_exactly_once() {
-        let task_id = u64::MAX - 401;
-        assert!(register_service_endpoint_waiter(ServiceEndpointWaiter {
-            task_id,
-            service_id: linux_abi::IPC_SERVICE_VFSD,
-            expected_pid: u64::MAX - 402,
-        }));
-        assert_eq!(remove_service_endpoint_waiter(task_id), 1);
-        assert_eq!(remove_service_endpoint_waiter(task_id), 0);
-    }
-
-    #[test]
-    fn service_endpoint_waiter_rearm_replaces_without_allocating_another_slot() {
-        let mut table = ServiceEndpointWaiterTable::new();
-        assert!(table.register(ServiceEndpointWaiter {
-            task_id: 41,
-            service_id: linux_abi::IPC_SERVICE_VFSD,
-            expected_pid: 51,
-        }));
-        assert!(table.register(ServiceEndpointWaiter {
-            task_id: 41,
-            service_id: linux_abi::IPC_SERVICE_NETD,
-            expected_pid: 61,
-        }));
-        let (_, old_count) = table.take_matching(|waiter| waiter.expected_pid == 51);
-        assert_eq!(old_count, 0);
-        let (tasks, new_count) = table.take_matching(|waiter| waiter.expected_pid == 61);
-        assert_eq!(new_count, 1);
-        assert_eq!(tasks[0], 41);
-    }
-
-    #[test]
-    #[allow(
-        clippy::assertions_on_constants,
-        reason = "the mutation witness must compile a reduced capacity and fail at runtime"
-    )]
-    fn service_endpoint_waiter_capacity_covers_every_scheduler_task() {
-        assert!(MAX_SERVICE_ENDPOINT_WAITERS >= multitask::MAX_SCHEDULER_TASKS);
-    }
-
-    #[test]
-    fn service_endpoint_epoch_changes_on_every_publication_boundary() {
-        assert_eq!(next_service_endpoint_epoch(0), Some(1));
-        assert_eq!(next_service_endpoint_epoch(1), Some(2));
-        assert_eq!(next_service_endpoint_epoch(u64::MAX), None);
-    }
-
-    #[test]
-    fn stable_service_endpoint_snapshot_rejects_revoked_owners() {
-        assert_eq!(SERVICE_ENDPOINT_STABLE_READ_ATTEMPTS, 3);
-        assert_eq!(stable_service_endpoint_snapshot(47, 41, false), 47);
-        assert_eq!(stable_service_endpoint_snapshot(0, 41, false), 0);
-        assert_eq!(stable_service_endpoint_snapshot(47, 0, false), 0);
-        assert_eq!(stable_service_endpoint_snapshot(47, 41, true), 0);
-    }
-
-    #[test]
-    fn cached_service_call_grant_is_exact_process_and_epoch() {
-        assert!(cached_service_call_grant_matches(41, 7, 41, 7));
-        assert!(!cached_service_call_grant_matches(41, 7, 42, 7));
-        assert!(!cached_service_call_grant_matches(41, 7, 41, 8));
-        assert!(!cached_service_call_grant_matches(0, 7, 0, 7));
-        assert!(!cached_service_call_grant_matches(41, 0, 41, 0));
-    }
-
-    #[test]
-    fn inputd_owner_exit_withdraws_the_separate_ring_policy_lease() {
-        assert!(service_exit_requires_input_policy_withdrawal(
-            linux_abi::IPC_SERVICE_INPUTD
-        ));
-        assert!(!service_exit_requires_input_policy_withdrawal(
-            linux_abi::IPC_SERVICE_NETD
-        ));
-    }
-
-    #[test]
-    fn root_service_publication_is_boot_owner_sealed_and_epoch_bound() {
-        assert!(rootd_bootstrap_owner_allows(0, 41));
-        assert!(rootd_bootstrap_owner_allows(41, 41));
-        assert!(!rootd_bootstrap_owner_allows(41, 42));
-        assert!(!rootd_bootstrap_owner_allows(0, 0));
-
-        assert!(rootd_authorization_epoch_matches(7, 101, 41, 7, false));
-        assert!(!rootd_authorization_epoch_matches(7, 101, 41, 8, false));
-        assert!(!rootd_authorization_epoch_matches(7, 0, 41, 7, false));
-        assert!(!rootd_authorization_epoch_matches(7, 101, 41, 7, true));
-    }
-
-    #[test]
-    fn service_call_grants_are_exact_epoch_bounded_and_revocable() {
-        let mut grants = [ServiceCallGrant::empty(); 2];
-        assert_eq!(record_service_call_grant(&mut grants, 41, 3, 7), Ok(()));
-        assert!(has_service_call_grant(&grants, 41, 3, 7));
-        assert!(!has_service_call_grant(&grants, 42, 3, 7));
-        assert!(!has_service_call_grant(&grants, 41, 3, 8));
-
-        assert_eq!(record_service_call_grant(&mut grants, 41, 3, 8), Ok(()));
-        assert!(!has_service_call_grant(&grants, 41, 3, 7));
-        assert!(has_service_call_grant(&grants, 41, 3, 8));
-
-        assert_eq!(record_service_call_grant(&mut grants, 42, 4, 9), Ok(()));
-        assert_eq!(
-            record_service_call_grant(&mut grants, 43, 5, 10),
-            Err(LINUX_ENOSPC)
-        );
-        clear_service_call_grants(&mut grants, 41);
-        assert!(!has_service_call_grant(&grants, 41, 3, 8));
-        assert!(has_service_call_grant(&grants, 42, 4, 9));
-    }
-
-    fn matching_commercial_response()
-    -> (CommercialMaxProtocolRequest, CommercialMaxProtocolResponse) {
-        let mut request = CommercialMaxProtocolRequest::default();
-        request.header.protocol =
-            rustos_user_abi::syscall::COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR;
-        request.header.op = rustos_user_abi::syscall::COMMERCIAL_MAX_ROOTD_OP_SERVICE_LOOKUP;
-        request.header.service_id = linux_abi::IPC_SERVICE_ROOTD;
-        request.header.subject_pid = 41;
-        request.header.subject_tid = 43;
-        request.header.ticket = 47;
-        let response = CommercialMaxProtocolResponse {
-            header: request.header,
-            ..CommercialMaxProtocolResponse::default()
-        };
-        (request, response)
-    }
-
-    #[test]
-    fn commercial_response_envelope_is_bound_to_request_and_bounded() {
-        let (request, response) = matching_commercial_response();
-        assert_eq!(
-            validate_commercial_response_envelope(&request, &response),
-            Ok(())
-        );
-
-        let mut wrong_subject = response;
-        wrong_subject.header.subject_tid += 1;
-        assert_eq!(
-            validate_commercial_response_envelope(&request, &wrong_subject),
-            Err(LINUX_EINVAL)
-        );
-
-        let mut reserved = response;
-        reserved.reserved1 = 1;
-        assert_eq!(
-            validate_commercial_response_envelope(&request, &reserved),
-            Err(LINUX_EINVAL)
-        );
-
-        let mut too_many_descriptors = response;
-        too_many_descriptors.descriptor_count = (too_many_descriptors.descriptors.len() + 1) as u16;
-        assert_eq!(
-            validate_commercial_response_envelope(&request, &too_many_descriptors),
-            Err(LINUX_EINVAL)
-        );
-
-        let mut oversized_capability_label = response;
-        oversized_capability_label.capability.label_len =
-            (oversized_capability_label.capability.label.len() + 1) as u16;
-        assert_eq!(
-            validate_commercial_response_envelope(&request, &oversized_capability_label),
-            Err(LINUX_EINVAL)
-        );
-
-        let mut malformed_descriptor = response;
-        malformed_descriptor.descriptor_count = 1;
-        malformed_descriptor.descriptors[0].reserved0 = 1;
-        assert_eq!(
-            validate_commercial_response_envelope(&request, &malformed_descriptor),
-            Err(LINUX_EINVAL)
-        );
-    }
-}
+mod tests;

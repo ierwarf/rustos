@@ -103,6 +103,15 @@ scope = "kernel/compat/src/user/syscall/linux/proc_broker_ops.rs"
 regex = '(?s)fn syscall_linux_rustos_proc_activate_broker.*?let mut activations = DEFERRED_ACTIVATIONS\.lock\(\);(?:(?!drop\(activations\)).)*record_milestone'
 reason = "single activation evidence must run only after the capability registry guard is released"
 
+# Qualification is a separate kernel-owned authority, not a debug payload
+# convention.  The product-milestone dispatcher must remain a thin caller of
+# the binding FSM; restoring either historical helper would make the phase
+# decision depend on a weaker, payload-adjacent admission path.
+[[forbidden_patterns]]
+scope = "kernel/compat/src/user/syscall/linux/debug_ops.rs"
+regex = '\\b(?:smp_qualification_milestone_admitted|current_process_smp_qualification)\\b'
+reason = "SMP qualification phases must use the binding FSM rather than a legacy debug-path gate"
+
 [[forbidden_patterns]]
 scope = "kernel/hal/src/arch/idt/handlers.rs"
 regex = 'stack_frame\.stack_pointer\.as_u64\(\)\s+as\s+\*const|slice::from_raw_parts'
@@ -282,11 +291,16 @@ tokens = [
 [[required_sequences]]
 path = "kernel/ps/src/multitask/irq.rs"
 tokens = [
+    "fn flush_deferred_target_reschedules_with(",
     "let targeted = TARGET_RESCHEDULE_IPI_PENDING.swap(0, Ordering::AcqRel);",
-    "if !remote_notification_required(target, current_cpu_index())",
+    "if !remote_notification_required(target, current_cpu)",
+    "if let Some(sequence) = pending_sequence(target)",
+    "send(target, generation, sequence);",
+    "pub(super) fn flush_deferred_target_reschedules()",
+    "current_cpu_index(),",
     "reschedule_observation::request_pending(target)",
-    "send_target_reschedule_ipi(",
     "reschedule_observation::request_sequence_snapshot(target)",
+    "send_target_reschedule_ipi,",
 ]
 
 [[required_sequences]]
@@ -437,6 +451,107 @@ tokens = [
     "kernel_generated_futex_key_candidates(",
     "Some(shared) => [Some(shared), Some(private)]",
     "wake_futex_waiter_candidates(",
+]
+
+# The KVM-private qualification is bound while the exact deferred-activation
+# authority remains held.  PID alone is insufficient: the binding owns both
+# process and MM generations, and the owner must still be the live SESSIOND
+# endpoint at the captured epoch.
+[[required_sequences]]
+path = "kernel/compat/src/user/syscall/linux/smp_qualification_ops.rs"
+tokens = [
+    "pub(super) fn syscall_linux_rustos_smp_qualification_bind",
+    "smp_qualification_bind_shape_valid(&args)",
+    "current_user_process_identity()",
+    "live_service_endpoint_owner_and_epoch(IPC_SERVICE_SESSIOND)",
+    "live_sessiond_endpoint_matches(owner_identity, endpoint_epoch)",
+    "live_user_process_identity_with_exact_exec_path(",
+    "with_deferred_activation_authority_for_smp_bind(",
+    "install_bound_smp_qualification(&mut SMP_QUALIFICATION_BINDING.lock(), binding)",
+]
+
+# Activation owns the deferred authority and arms an immutable absolute deadline
+# before scheduler publication.  It intentionally uses the endpoint snapshot
+# without taking ProcessTable again under ProcBrokerRegistry.
+[[required_sequences]]
+path = "kernel/compat/src/user/syscall/linux/smp_qualification_ops.rs"
+tokens = [
+    "pub(super) fn prepare_smp_qualification_activation",
+    "if !qualification_required",
+    "published_service_endpoint_owner_and_epoch(IPC_SERVICE_SESSIOND)",
+    "let mut registry = SMP_QUALIFICATION_BINDING.lock();",
+    "let now_tick = crate::arch::rtc::ticks();",
+    "binding.activate(owner, endpoint_epoch, target, now_tick, ticks_per_second)?;",
+]
+
+# A phase samples the absolute deadline and mutates the worker FSM under the
+# same binding lock.  Debug output is deliberately later; its endpoint epoch
+# is revalidated before that output can make an accepted phase observable.
+[[required_sequences]]
+path = "kernel/compat/src/user/syscall/linux/smp_qualification_ops.rs"
+tokens = [
+    "pub(super) fn admit_smp_qualification_milestone",
+    "current_user_process_identity()",
+    "live_service_endpoint_owner_and_epoch(IPC_SERVICE_SESSIOND)",
+    "let mut registry = SMP_QUALIFICATION_BINDING.lock();",
+    "let now_tick = crate::arch::rtc::ticks();",
+    "binding.admit_phase(",
+    "live_sessiond_endpoint_matches(owner, endpoint_epoch)",
+    "terminalize_binding_after_endpoint_revalidation(binding_id, target);",
+]
+
+[[required_sequences]]
+path = "kernel/compat/src/user/syscall/linux/proc_broker_ops.rs"
+tokens = [
+    "let qualification_required =",
+    "smp_qualification_exec_path_matches(exec_path.as_str())",
+    "let authority = DeferredActivationAuthority {",
+    "qualification_required,",
+    "pub(super) fn syscall_linux_rustos_proc_activate_broker",
+    "prepare_smp_qualification_activation(",
+    "authority.qualification_required,",
+    "activate_suspended_user_tasks_with_commit(",
+    "abort_smp_qualification_activation(target);",
+]
+
+[[required_sequences]]
+path = "kernel/compat/src/user/syscall/linux/proc_broker_ops.rs"
+tokens = [
+    "pub(super) fn with_deferred_activation_authority_for_smp_bind",
+    "let activations = DEFERRED_ACTIVATIONS.lock();",
+    "authority.qualification_required",
+    "let result = register();",
+    "drop(activations);",
+]
+
+[[required_sequences]]
+path = "kernel/compat/src/user/syscall/linux/proc_broker_ops.rs"
+tokens = [
+    "pub(super) fn cleanup_proc_broker_state_for_process",
+    "revoke_smp_qualification_for_process(process_id);",
+    "let mut activations = DEFERRED_ACTIVATIONS.lock();",
+]
+
+[[required_sequences]]
+path = "kernel/compat/src/user/syscall/linux/proc_broker_ops/activation_batch.rs"
+tokens = [
+    "const fn deferred_authority_is_batch_eligible(qualification_required: bool) -> bool",
+    "!qualification_required",
+    "fn deferred_authority_matches_exact_batch_request",
+    "&& deferred_authority_is_batch_eligible(qualification_required)",
+    "syscall_linux_rustos_proc_activate_batch_broker",
+    "let mut exact_targets = [None; LOADER_ACTIVATE_BATCH_MAX_TARGETS];",
+    "let mut activations = DEFERRED_ACTIVATIONS.lock();",
+    "deferred_authority_matches_exact_batch_request(",
+    "activate_suspended_user_tasks_with_commit(targets, ||",
+]
+
+[[required_sequences]]
+path = "kernel/compat/src/user/syscall/linux/debug_ops.rs"
+tokens = [
+    "pub(super) fn syscall_linux_rustos_product_milestone",
+    "admit_smp_qualification_milestone(milestone, arg0, arg1, current_cpu)",
+    "debug::record_milestone(debug::LogCategory::Compat, name, arg0, recorded_arg1);",
 ]
 
 # Each named authority must remain a bounded dense logical-CPU array. This

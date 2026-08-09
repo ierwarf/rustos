@@ -668,6 +668,14 @@ pub fn syscall_linux_net6_with_timeout(
     } else {
         timeout_ms
     };
+    // The wire deadline is fixed before payload preparation and is shared by
+    // the service-side admission and our reply-cap wait. In particular, the
+    // nonblocking rail must not enqueue with a fresh 16 ms wait after copying
+    // a large control message.
+    let deadline_class = timeout_ms.map_or(ipc_ops::ServiceIpcClass::BulkData, |_| {
+        super::ipc_helpers::deadline::netd_timeout_class(op)
+    });
+    request.deadline_ns = netd_deadline_after_class(deadline_class, timeout_ms);
     if let Err(errno) = populate_netd_request_payload(&mut request, &mut pending_transfers) {
         pending_transfers.drop_pending();
         return linux_errno(errno);
@@ -722,6 +730,47 @@ pub fn syscall_linux_net6_with_timeout(
         return linux_errno(LINUX_EAGAIN);
     }
     outcome
+}
+
+pub(super) const NETD_NANOS_PER_MILLI: u64 = 1_000_000;
+const NETD_NANOS_PER_SECOND: u64 = 1_000_000_000;
+
+/// The kernel's `CLOCK_MONOTONIC` conversion is the authority for compat
+/// deadlines. It deliberately derives both request wire time and retry
+/// accounting from the same RTC tick source that arms the reply waiter.
+pub(super) fn netd_monotonic_nanos() -> u64 {
+    let now = super::process_time::monotonic_timespec();
+    u64::try_from(now.tv_sec)
+        .unwrap_or(0)
+        .saturating_mul(NETD_NANOS_PER_SECOND)
+        .saturating_add(u64::try_from(now.tv_nsec).unwrap_or(0))
+}
+
+pub(super) fn netd_deadline_after_class(
+    class: ipc_ops::ServiceIpcClass,
+    requested_timeout_ms: Option<u64>,
+) -> u64 {
+    netd_deadline_after_ms(
+        netd_monotonic_nanos(),
+        requested_timeout_ms.map_or(class.timeout_ms(), |timeout_ms| {
+            class.cap_timeout_ms(timeout_ms)
+        }),
+    )
+}
+
+pub(super) const fn netd_deadline_after_ms(now_ns: u64, timeout_ms: u64) -> u64 {
+    now_ns.saturating_add(timeout_ms.saturating_mul(NETD_NANOS_PER_MILLI))
+}
+
+pub(super) fn netd_deadline_remaining_ms(deadline_ns: u64) -> Option<u64> {
+    netd_deadline_remaining_ms_at(deadline_ns, netd_monotonic_nanos())
+}
+
+pub(super) const fn netd_deadline_remaining_ms_at(deadline_ns: u64, now_ns: u64) -> Option<u64> {
+    if deadline_ns == 0 || now_ns >= deadline_ns {
+        return None;
+    }
+    Some((deadline_ns - now_ns).div_ceil(NETD_NANOS_PER_MILLI))
 }
 
 struct PendingNetdTransfers {
@@ -1577,58 +1626,4 @@ fn write_current_sockopt_payload(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{
-        encode_transfer_tickets, ioctl_is_display_policy_request, is_console_handle,
-        read_transfer_ticket,
-    };
-    use crate::multitask;
-
-    #[test]
-    fn tty_policy_route_requires_an_actual_console_open_description() {
-        let console = multitask::KernelHandle::Console(multitask::ConsoleHandle::new(
-            multitask::ConsoleStreamKind::Input,
-        ));
-        let epoll = multitask::KernelHandle::Epoll(multitask::EpollHandle::new());
-        assert!(is_console_handle(&console));
-        assert!(!is_console_handle(&epoll));
-    }
-
-    #[test]
-    fn ui_policy_direct_set_is_limited_to_display_contracts() {
-        assert!(ioctl_is_display_policy_request(
-            rustos_user_abi::device::DISPLAY_IOCTL_GET_INFO
-        ));
-        assert!(ioctl_is_display_policy_request(
-            rustos_user_abi::device::DISPLAY_IOCTL_CREATE_SURFACE
-        ));
-        assert!(ioctl_is_display_policy_request(
-            rustos_user_abi::device::DISPLAY_IOCTL_GPU_GET_INFO
-        ));
-        assert!(ioctl_is_display_policy_request(
-            rustos_user_abi::device::DISPLAY_IOCTL_GPU_SUBMIT
-        ));
-        assert!(ioctl_is_display_policy_request(
-            rustos_user_abi::device::DISPLAY_IOCTL_GPU_QUERY_COMPLETION
-        ));
-        assert!(!ioctl_is_display_policy_request(
-            rustos_user_abi::console::CONSOLE_IOCTL_GET_STATE
-        ));
-    }
-
-    #[test]
-    fn transfer_ticket_wire_is_integer_only_exact_and_nonzero() {
-        let ticket = kernel_ipc_runtime::api::KernelTransferTicket::new(7, 11, 13)
-            .expect("valid transfer ticket");
-        let bytes = encode_transfer_tickets(&[ticket]).expect("encode ticket");
-        assert_eq!(read_transfer_ticket(&bytes), Ok(ticket));
-
-        let mut zero_id = bytes.clone();
-        zero_id[..8].fill(0);
-        assert!(read_transfer_ticket(&zero_id).is_err());
-        let mut zero_nonce = bytes.clone();
-        zero_nonce[8..].fill(0);
-        assert!(read_transfer_ticket(&zero_nonce).is_err());
-        assert!(read_transfer_ticket(&bytes[..15]).is_err());
-    }
-}
+mod tests;

@@ -70,6 +70,24 @@ pub const WRITE_COMBINE_BIT: PageTableFlags = PageTableFlags::from_bits_retain(1
 const WRITE_COMBINE_PAGE_BIT: PageTableFlags = PageTableFlags::HUGE_PAGE;
 const MMIO_UNCACHED_FLAGS: PageTableFlags = PageTableFlags::NO_CACHE;
 const MMIO_WRITE_COMBINE_FLAGS: PageTableFlags = WRITE_COMBINE_BIT;
+const IA32_PAT_MSR: u32 = 0x277;
+const PAT_SLOT0_SHIFT: u32 = 0;
+const PAT_SLOT2_SHIFT: u32 = 16;
+const PAT_SLOT4_SHIFT: u32 = 32;
+const PAT_ENTRY_MASK: u64 = 0xff;
+const PAT_WRITE_BACK: u64 = 0x06;
+const PAT_UNCACHEABLE: u64 = 0x00;
+const PAT_WRITE_COMBINING: u64 = 0x01;
+const PAT_KERNEL_CACHE_SLOT_MASK: u64 = (PAT_ENTRY_MASK << PAT_SLOT0_SHIFT)
+    | (PAT_ENTRY_MASK << PAT_SLOT2_SHIFT)
+    | (PAT_ENTRY_MASK << PAT_SLOT4_SHIFT);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PhysicalMappingCacheMode {
+    WriteBack,
+    Uncached,
+    WriteCombine,
+}
 
 #[derive(Clone, Copy)]
 struct MmioWindowSlot {
@@ -542,6 +560,39 @@ impl<const SIZE_GB: usize> PML4<SIZE_GB> {
         Some(page.flags())
     }
 
+    fn direct_map_phys_cache_flags(&self, phys_addr: u64) -> Option<PageTableFlags> {
+        if phys_addr >= DIRECT_MAP_PHYS_LIMIT {
+            return None;
+        }
+
+        let block_index = phys_addr / HUGE_2MIB;
+        let entry = self.pd_entry_ref(block_index);
+        if entry.is_unused() {
+            return None;
+        }
+        if entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+            return Some(
+                entry.flags()
+                    & (PageTableFlags::NO_CACHE
+                        | PageTableFlags::WRITE_THROUGH
+                        | WRITE_COMBINE_BIT),
+            );
+        }
+
+        let slot = self.find_split_slot(block_index)?;
+        let page_index = ((phys_addr % HUGE_2MIB) / PAGE_4KIB) as usize;
+        let page = &self.split_pt[slot][page_index];
+        if page.is_unused() {
+            return None;
+        }
+        let mut normalized =
+            page.flags() & (PageTableFlags::NO_CACHE | PageTableFlags::WRITE_THROUGH);
+        if page.flags().contains(WRITE_COMBINE_PAGE_BIT) {
+            normalized |= WRITE_COMBINE_BIT;
+        }
+        Some(normalized)
+    }
+
     fn direct_map_huge_flags(flags: PageTableFlags) -> PageTableFlags {
         flags
     }
@@ -659,8 +710,11 @@ impl<const SIZE_GB: usize> PML4<SIZE_GB> {
 }
 
 pub fn init(boot_info_ptr: *const BootInfo) {
+    assert!(
+        initialize_current_cpu_cache_attributes(),
+        "BSP could not verify its x86 PAT write-combining slot"
+    );
     unsafe {
-        set_pat_wc_slot4();
         interrupts::without_interrupts(|| {
             Efer::write(Efer::read() | EferFlags::NO_EXECUTE_ENABLE);
             crate::debug::boot_trace::println_fmt(format_args!("kernel: paging nxe enabled"));
@@ -724,10 +778,10 @@ pub fn kernel_virtual_to_physical_addr(addr: u64) -> u64 {
     kernel_virtual_to_physical(addr)
 }
 
-pub fn direct_map_flags_for_phys(phys_addr: u64) -> Option<PageTableFlags> {
+pub fn direct_map_cache_flags_for_phys(phys_addr: u64) -> Option<PageTableFlags> {
     interrupts::without_interrupts(|| {
         let pml4 = KERNEL_PML4.lock();
-        pml4.direct_map_phys_flags(phys_addr)
+        pml4.direct_map_phys_cache_flags(phys_addr)
     })
 }
 
@@ -835,11 +889,47 @@ pub fn debug_direct_map_flags_for_addr(addr: u64) -> Option<PageTableFlags> {
 }
 
 pub fn map_mmio_range(phys_addr: u64, size: usize) -> Option<u64> {
-    map_mmio_range_internal(phys_addr, size, false)
+    map_physical_range_internal(phys_addr, size, PhysicalMappingCacheMode::Uncached)
 }
 
 pub fn map_mmio_range_wc(phys_addr: u64, size: usize) -> Option<u64> {
-    map_mmio_range_internal(phys_addr, size, true)
+    map_physical_range_internal(phys_addr, size, PhysicalMappingCacheMode::WriteCombine)
+}
+
+/// Map an exact RAM-backed shared-memory aperture as coherent write-back data.
+///
+/// This is deliberately separate from the MMIO helpers: callers must first
+/// authenticate that the PCI resource is ordinary prefetchable shared RAM,
+/// never device registers. Atomic shared-memory protocols require one WB
+/// memory type on every participant; WC is reserved for write-mostly payloads.
+pub fn map_shared_memory_range(phys_addr: u64, size: usize) -> Option<u64> {
+    map_physical_range_internal(phys_addr, size, PhysicalMappingCacheMode::WriteBack)
+}
+
+/// Permanently admit an early-boot device page through the existing direct map.
+///
+/// Dynamic driver mappings are owned by io-manager's cache-mode registry. The
+/// local APIC is different: it is installed before io-manager exists and lives
+/// for the entire boot. Retyping its direct-map leaf avoids creating a second
+/// UC high-window alias beside the default WB direct map.
+pub fn map_permanent_boot_mmio_uncached(phys_addr: u64, size: usize) -> Option<u64> {
+    let end = phys_addr.checked_add(size as u64)?;
+    if size == 0 || end > DIRECT_MAP_PHYS_LIMIT {
+        return None;
+    }
+    if !update_direct_map_range_flags_batched(
+        phys_addr,
+        size,
+        MMIO_UNCACHED_FLAGS,
+        PageTableFlags::NO_CACHE | PageTableFlags::WRITE_THROUGH | WRITE_COMBINE_BIT,
+    ) {
+        return None;
+    }
+    Some(higher_half_addr(phys_addr))
+}
+
+const fn high_window_physical_range_is_admissible(phys_addr: u64, size: usize) -> bool {
+    size != 0 && phys_addr >= DIRECT_MAP_PHYS_LIMIT && phys_addr.checked_add(size as u64).is_some()
 }
 
 pub fn unmap_mmio_range(virt_addr: u64, size: usize) -> bool {
@@ -870,17 +960,55 @@ pub(crate) unsafe fn phys_to_table_mut(phys: PhysAddr) -> &'static mut PageTable
     unsafe { &mut *(higher_half_addr(phys.as_u64()) as *mut PageTable) }
 }
 
-fn set_pat_wc_slot4() {
-    const IA32_PAT: u32 = 0x277;
-    const PAT_WC: u64 = 0x01;
+const fn pat_with_kernel_cache_contract(pat: u64) -> u64 {
+    (pat & !PAT_KERNEL_CACHE_SLOT_MASK)
+        | (PAT_WRITE_BACK << PAT_SLOT0_SHIFT)
+        | (PAT_UNCACHEABLE << PAT_SLOT2_SHIFT)
+        | (PAT_WRITE_COMBINING << PAT_SLOT4_SHIFT)
+}
 
-    let mut msr = Msr::new(IA32_PAT);
-    let mut pat = unsafe { msr.read() };
-    pat &= !(0xff_u64 << 32);
-    pat |= PAT_WC << 32;
-    unsafe {
-        msr.write(pat);
+const fn pat_entry(pat: u64, shift: u32) -> u64 {
+    (pat >> shift) & PAT_ENTRY_MASK
+}
+
+const fn pat_kernel_cache_contract_is_exact(expected: u64, observed: u64) -> bool {
+    observed == expected
+        && pat_entry(observed, PAT_SLOT0_SHIFT) == PAT_WRITE_BACK
+        && pat_entry(observed, PAT_SLOT2_SHIFT) == PAT_UNCACHEABLE
+        && pat_entry(observed, PAT_SLOT4_SHIFT) == PAT_WRITE_COMBINING
+}
+
+const fn pat_initial_write_back_selector_is_admissible(pat: u64) -> bool {
+    pat_entry(pat, PAT_SLOT0_SHIFT) == PAT_WRITE_BACK
+}
+
+/// Program and verify the cache-selector contract on the current CPU.
+///
+/// IA32_PAT is per logical CPU. Every AP must execute this before publishing
+/// `OnlineParked`, because all CPUs share page tables whose selectors 0, 2,
+/// and 4 are used by WB shared RAM, UC device registers, and WC payloads.
+pub fn initialize_current_cpu_cache_attributes() -> bool {
+    let mut msr = Msr::new(IA32_PAT_MSR);
+    let pat = unsafe { msr.read() };
+    // Slot 0 backs every ordinary kernel mapping already used by this CPU.
+    // Retyping it live would require the full architectural cache-disable and
+    // flush sequence, so a non-WB firmware/virtualization value fails closed.
+    if !pat_initial_write_back_selector_is_admissible(pat) {
+        return false;
     }
+    let expected = pat_with_kernel_cache_contract(pat);
+    if pat != expected {
+        unsafe {
+            msr.write(expected);
+        }
+    }
+    let observed = unsafe { msr.read() };
+    pat_kernel_cache_contract_is_exact(expected, observed)
+}
+
+#[cfg(test)]
+fn pat_without_kernel_cache_slots(value: u64) -> u64 {
+    value & !PAT_KERNEL_CACHE_SLOT_MASK
 }
 
 fn kernel_virtual_to_physical(addr: u64) -> u64 {
@@ -1175,8 +1303,24 @@ fn mmio_slot_base(slot: usize) -> u64 {
     MMIO_WINDOW_BASE + slot as u64 * HUGE_2MIB
 }
 
-fn map_mmio_range_internal(phys_addr: u64, size: usize, write_combine: bool) -> Option<u64> {
-    if size == 0 {
+fn physical_mapping_cache_flags(cache_mode: PhysicalMappingCacheMode) -> PageTableFlags {
+    match cache_mode {
+        PhysicalMappingCacheMode::WriteBack => PageTableFlags::empty(),
+        PhysicalMappingCacheMode::Uncached => MMIO_UNCACHED_FLAGS,
+        PhysicalMappingCacheMode::WriteCombine => MMIO_WRITE_COMBINE_FLAGS,
+    }
+}
+
+fn map_physical_range_internal(
+    phys_addr: u64,
+    size: usize,
+    cache_mode: PhysicalMappingCacheMode,
+) -> Option<u64> {
+    // Physical memory below this boundary already has a direct-map alias.
+    // Only the permanent boot-MMIO path or io-manager's cache registry may
+    // retype it; a second high-window mapping would evade global cache-mode
+    // ownership and could create a WB/UC/WC alias.
+    if !high_window_physical_range_is_admissible(phys_addr, size) {
         return None;
     }
 
@@ -1185,11 +1329,7 @@ fn map_mmio_range_internal(phys_addr: u64, size: usize, write_combine: bool) -> 
     let last = phys_addr.checked_add(size.saturating_sub(1) as u64)?;
     let last_block = last / HUGE_2MIB;
     let block_count = (last_block - phys_block + 1) as usize;
-    let flags = if write_combine {
-        MMIO_WRITE_COMBINE_FLAGS
-    } else {
-        MMIO_UNCACHED_FLAGS
-    };
+    let flags = physical_mapping_cache_flags(cache_mode);
 
     let _tlb_guard = kernel_hal::api::arch::tlb::begin_global_mapping_mutation();
     interrupts::without_interrupts(|| {
@@ -1203,6 +1343,65 @@ fn map_mmio_range_internal(phys_addr: u64, size: usize, write_combine: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_memory_mapping_is_write_back_not_mmio_or_write_combining() {
+        assert_eq!(
+            physical_mapping_cache_flags(PhysicalMappingCacheMode::WriteBack),
+            PageTableFlags::empty()
+        );
+        assert_eq!(
+            physical_mapping_cache_flags(PhysicalMappingCacheMode::Uncached),
+            PageTableFlags::NO_CACHE
+        );
+        assert_eq!(
+            physical_mapping_cache_flags(PhysicalMappingCacheMode::WriteCombine),
+            WRITE_COMBINE_BIT
+        );
+    }
+
+    #[test]
+    fn high_window_never_aliases_a_direct_mapped_physical_range() {
+        assert!(!high_window_physical_range_is_admissible(
+            DIRECT_MAP_PHYS_LIMIT - PAGE_4KIB,
+            PAGE_4KIB as usize
+        ));
+        assert!(high_window_physical_range_is_admissible(
+            DIRECT_MAP_PHYS_LIMIT,
+            PAGE_4KIB as usize
+        ));
+        assert!(!high_window_physical_range_is_admissible(
+            u64::MAX - PAGE_4KIB + 1,
+            PAGE_4KIB as usize
+        ));
+    }
+
+    #[test]
+    fn pat_cache_contract_update_is_exact_idempotent_and_cpu_local() {
+        let original = 0x1234_5678_9abc_def0;
+        let updated = pat_with_kernel_cache_contract(original);
+        assert_eq!(pat_entry(updated, PAT_SLOT0_SHIFT), PAT_WRITE_BACK);
+        assert_eq!(pat_entry(updated, PAT_SLOT2_SHIFT), PAT_UNCACHEABLE);
+        assert_eq!(pat_entry(updated, PAT_SLOT4_SHIFT), PAT_WRITE_COMBINING);
+        assert_eq!(
+            pat_without_kernel_cache_slots(updated),
+            pat_without_kernel_cache_slots(original)
+        );
+        assert_eq!(pat_with_kernel_cache_contract(updated), updated);
+        assert!(pat_initial_write_back_selector_is_admissible(updated));
+        assert!(!pat_initial_write_back_selector_is_admissible(
+            updated ^ PAT_ENTRY_MASK
+        ));
+        assert!(pat_kernel_cache_contract_is_exact(updated, updated));
+        assert!(!pat_kernel_cache_contract_is_exact(
+            updated,
+            updated ^ (PAT_ENTRY_MASK << PAT_SLOT4_SHIFT)
+        ));
+        assert!(!pat_kernel_cache_contract_is_exact(
+            updated,
+            updated ^ (PAT_ENTRY_MASK << 8)
+        ));
+    }
 
     #[test]
     fn direct_map_update_bounds_are_aligned_nonempty_and_nonwrapping() {

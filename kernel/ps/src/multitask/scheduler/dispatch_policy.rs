@@ -25,11 +25,9 @@ pub(super) struct CpuDispatchPolicy {
     pub(super) spawn_pick_hints: SlotHandoffQueue<MAX_TASK>,
     pub(super) atomic_activation_pick_hints: SlotHandoffQueue<MAX_ATOMIC_ACTIVATION_HANDOFFS>,
     pub(super) atomic_activation_handoff_remaining: usize,
-    pub(super) sync_pick_hints: SlotHandoffQueue<MAX_TASK>,
     pub(super) last_min_vruntime_ns: u64,
     pub(super) system_dispatch_streak: u8,
     pub(super) latency_handoff_streak: u8,
-    pub(super) sync_handoff_streak: u8,
     pub(super) ready_validation_turn: u8,
 }
 
@@ -43,11 +41,9 @@ impl CpuDispatchPolicy {
             spawn_pick_hints: SlotHandoffQueue::new(),
             atomic_activation_pick_hints: SlotHandoffQueue::new(),
             atomic_activation_handoff_remaining: 0,
-            sync_pick_hints: SlotHandoffQueue::new(),
             last_min_vruntime_ns: 0,
             system_dispatch_streak: 0,
             latency_handoff_streak: 0,
-            sync_handoff_streak: 0,
             ready_validation_turn: 0,
         }
     }

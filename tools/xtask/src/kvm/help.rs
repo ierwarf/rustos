@@ -33,23 +33,36 @@ options:
                        after initial readiness, force an abrupt Linux-DVM exit
                        and/or restart RustOS in a fresh QEMU process;
                        require a new authenticated epoch and full readiness
+  --smp-iteration      require framed, checksummed per-CPU scheduler lifecycle
+                       evidence; restricted to a bounded 30-second KVM smoke
+  --smp-ring3-qualification
+                       with --smp-iteration, inject a private KVM-only Ring3
+                       workload contract and require one pinned ready/start/
+                       finish proof from every requested CPU (1, 2, 4, or 8);
+                       requires --smp-evidence-cohort
+  --smp-evidence-cohort <32-lowercase-hex>
+                       bind one 1/2/4/8 Ring3 qualification matrix to an
+                       explicit path-safe cohort; the runner archives unique
+                       JSON, checksum, debugcon, DVM serial, and contract
+                       artifacts without replacing an earlier run
   --gui-dvm-surfaces   enable the V3 GUI-DVM control/pixel backing and private
                        three-slot GPU atlas transport, plus the production DVM
                        block provider needed by the visible desktop; no
                        standalone legacy surface or native-GPU path is accepted
   --dvm-network-shmem  attach the bounded RustOS↔DVM Ethernet ring; RustOS keeps
                        no native virtio-net device in this topology
-  --dvm-block-shmem    attach a private virtual NVMe namespace only to Linux
-                       DVM and the fixed RustOS↔DVM block ring; RustOS receives
-                       no native storage controller
+  --dvm-block-shmem    attach a private read-only ATAPI namespace to Linux DVM
+                       through its existing q35 AHCI controller and the fixed
+                       RustOS↔DVM block ring; RustOS receives no native storage
+                       controller
   --storage-dvm-only   run the independent storage-DVM acceptance gate: enable
                        --dvm-block-shmem and require boot, both block peers,
-                       first completion, and E2E flush without depending on UI,
-                       input, network, or GPU readiness markers
+                       first completion, and a read-only media barrier without
+                       depending on UI, input, network, or GPU readiness markers
   --storage-dvm-expect-flush-fault
                        with --storage-dvm-only and exactly block.flush=fail,
-                       require a pre-publication DeviceFault and reject any E2E
-                       flush-success marker
+                       require a pre-publication DeviceFault and reject any
+                       media-barrier success marker
   --physical-gpu <BDF> non-commercial lab mode: attach one already-bound GPU
                        from the sealed physical-GPU profile registry through
                        IOMMUFD instead of virtio-GPU; never binds, unbinds, or

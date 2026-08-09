@@ -233,11 +233,12 @@ makes timestamp cost scale with CPU count.
 
 ## 7. Scheduler and task ownership
 
-The target per-CPU design gives each online CPU one run queue and at most one
-current task. The present release candidate still has a serialized global
-ready table plus per-CPU current ownership; it must satisfy the same exact-one
-state partition, but does not satisfy the scalability acceptance gate. Each
-live task is in exactly one state:
+Each online CPU owns one run queue, one remote-wake mailbox, and at most one
+current task. The owner word is the queue/execution authority; the global
+`Scheduler` catalog lock and legacy per-context lifecycle fields remain a
+serialized control-plane seam, so this is not yet the final scalability
+acceptance point. It must nevertheless satisfy the same exact-one state
+partition. Each live task is in exactly one state:
 
 ```text
 Running(cpu, generation)
@@ -253,6 +254,18 @@ be current on two CPUs, appear in two queues, or be both queued and current.
 Wake-before-block retains the existing arm/recheck/commit guarantee across
 CPUs. Migration uses an exact epoch; a stale dequeue, wake, timer, IPI, or
 retirement event cannot revive or duplicate a task.
+
+One acquire snapshot authorizes a local dispatch only when it says
+`Local(exact_cpu) && runnable`. `claim_dispatch` applies the same predicate
+before touching queue membership or attempting an owner CAS, so a blocked task
+that temporarily retains local queue custody cannot consume a dispatch turn.
+Legacy `context.ready` and pick hints may narrow policy order but cannot create
+execution authority. A foreign idle-steal scan uses a distinct source-
+migration predicate: it requires `Local(source_cpu) && runnable`, no current or
+transition execution owner, target task-and-process affinity, handoff
+admission, and a valid immutable frame before the existing source-owner CAS
+publishes the target mailbox. Applying the local target-dispatch predicate to a
+foreign source is forbidden because it would reject every valid steal.
 
 Per-CPU load balancing is introduced conservatively:
 
@@ -343,6 +356,19 @@ violates execution ownership.
   a CPU-local transition slot. The interrupt stub changes `rsp` to the
   validated incoming frame before its lock-free commit callback releases that
   outgoing owner.
+- Every admitted task must occupy exactly one execution-authority class:
+  current, stack-transition, or ready. Ready removal and stack-switch commit
+  are therefore authority transfers, not independent bookkeeping updates; a
+  lost-ready mutation must violate the model even when no duplicate owner is
+  present. A CPU with a published scheduler guard cannot simultaneously expose
+  a stack-transition owner.
+- `scheduler-transition-publication` binds outgoing-slot, active-phase,
+  incoming-current, and assembly-commit publication to a Loom interleaving
+  kernel, Shuttle PCT schedules, and an x86_64 herd7 baseline/mutant pair. An
+  observer that sees either incoming current or the active pre-commit phase
+  must see the exact outgoing stack slot; the active bit may normally be clear
+  after commit. The evidence covers only this registered two-owner protocol;
+  target assembly and runtime handoff remain required gates.
   This two-phase edge prevents another CPU from restoring a frame whose stack
   the first CPU is still using. Scheduler-backed task decoration and snapshots
   are unavailable during that short transition rather than fabricating the
@@ -372,10 +398,13 @@ violates execution ownership.
   its kernel side-effect token and userspace retirement acknowledgement are
   both consumed. A scheduler turn may publish a fixed lock-free diagnostic
   record, but cannot make remote CPUs spin behind reclamation or output.
-- One-shot `smp-*` qualification milestones use a fixed bounded retry on the
-  nonblocking debug output lock. Ordinary logs remain lossy. This prevents
-  simultaneous CPUs from turning a completed lifecycle edge into false
-  negative KVM evidence without permitting an unbounded IRQ or raw-lock wait.
+- Only `smp-qualification-ready`, `smp-qualification-start`,
+  `smp-qualification-finish`, and `smp-qualification-complete` are
+  QualificationCritical and use the fixed bounded retry on the nonblocking
+  debug output lock. Scheduler measurements make one attempt; ordinary logs
+  remain lossy. This prevents simultaneous CPUs from turning a completed
+  lifecycle edge into false negative KVM evidence without permitting an
+  unbounded IRQ or raw-lock wait.
 
 This follows the Linux raw-spin owner/preemption rule: spinning locks have
 strict owner semantics, disable preemption in the non-RT model, and pin a task
@@ -464,8 +493,19 @@ custody for the exact peer needed to advance it:
 - call enqueue publishes the exact waiting receiver, or the least-vruntime
   runnable worker of a process-owned endpoint, after reply-capability and
   priority-donation authority exist;
-- normal and handle-bearing reply completion publishes the exact awakened
-  caller only after successful reply-capability consumption;
+- normal and handle-bearing reply completion releases its reply-scoped
+  donation, wakes the exact caller, and captures one opaque `{slot, task ID,
+  run-owner generation, target CPU}` token under the same Scheduler
+  transaction, only after successful reply-capability consumption;
+- after that Scheduler transaction drops, the token may enter only its captured
+  CPU's FIFO and only while the exact task ID, owner generation, target CPU,
+  runnable flag, and `Local`/`RemoteQueued` owner state still match; a stale,
+  migrated, retired, or withdrawn token loses urgency without a catalog/global
+  hint fallback or second publication;
+- selection repeats the exact reply-record custody predicate. A newer reply
+  generation for the same task refreshes one stale FIFO position in place;
+  an older reply generation or a generic hint cannot weaken that record, and a
+  migration away and back cannot revive the prior generation;
 - all call and reply publications share one allocation-free FIFO bounded by
   `MAX_TASK`, so concurrent CPUs cannot overwrite an older transaction;
 - duplicate publication consumes no capacity, retirement removes only the
@@ -831,6 +871,50 @@ directly are never release evidence. The launched topology becomes accepted
 only after every requested logical CPU emits exact online, idle-entry, first
 user-dispatch, first clockevent, and—when more than one CPU is requested—
 first reschedule-IPI evidence.
+
+Every mandatory SMP milestone is one allocation-free, self-framed v1 record.
+The kernel renders the complete line into fixed storage, covers every semantic
+field with a deterministic FNV-1a-64 checksum, acquires the shared output lock,
+and performs one debugcon transfer. Healthy-runtime diagnostics use the same
+serialized path; only the terminal panic path may bypass it. The host accepts
+an SMP event only after validating the complete outer record, canonical inner
+field order, checksum, CPU/generation arguments, and strictly increasing output
+sequence. A surviving `name=... arg0=...` substring inside a torn or interleaved
+line is evidence loss, never a lifecycle proof. SMP success evidence schema v6
+names v5 as its predecessor and stores every verified event with its source
+line, guest timestamp/tick, milestone and output sequences, CPU, arguments,
+qualification-local loss counters, and checksum. A QualificationCritical
+frame snapshots only the counters lost by earlier QualificationCritical
+frames; a critical drop increments both the global diagnostic and local
+qualification counters, so a later critical frame fails closed without foreign
+diagnostic contamination. Before QEMU launch it seals the exact formal
+verification record, RustOS boot/runtime images, the actual read-only attached
+DVM block disk path/bytes/SHA-256, its signed `READ_ONLY` transport header and
+Linux `BLKROGET` agreement, the signed
+`system/boot/early-system.img#apps/smpqual/smpqual.elf` artifact, DVM
+kernel/rootfs, and private qualification contract; success publication
+revalidates those immutable bytes and writes a unique, non-overwriting vCPU/run
+archive under one explicit matrix cohort. An integer marker count alone is not
+publishable evidence. The forced private block provider copies and mode-seals
+its snapshot, file-syncs it, and containing-directory-syncs it before aperture
+creation/signing. It attaches as `readonly=on` `ide-cd` on existing q35 AHCI
+`ide.0`; exact built-in `CONFIG_BLK_DEV_SR=y` owns immutable ATAPI while modular
+`sd_mod` owns writable AHCI. Signed and host-verified media geometry is
+2048/2048 bytes with 512-byte protocol-sector capacity accounting and a
+FLUSH-only feature word, never FUA. A generation-bound read-only media-barrier
+completion proves VFS-to-Linux-DVM liveness and does not claim backing-image
+write durability. For multi-vCPU
+topologies the receive-side `smp-cpu-first-reschedule-ipi` event is required;
+the sender-side `smp-resched-route` hint cannot substitute for it.
+
+The boot topology gate and the distribution-performance gate are distinct. A
+natural boot's first user dispatch proves that every admitted CPU executed at
+least one real Ring3 continuation; it does not prove balanced work, fairness,
+or affinity correctness. Distribution qualification therefore additionally
+uses an exact per-CPU Ring3 workload and records assigned/observed CPU,
+task/process identity, completed work, runtime, and first/last timestamps. A
+global dispatch/migration total or the number of boot services cannot replace
+those per-CPU observations.
 
 The edit/boot loop has a separate `smp-iteration` evidence profile. It reruns
 source conformance and the fixed high-risk SMP model set with a 30-second

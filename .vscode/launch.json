@@ -5,7 +5,7 @@
       "name": "RustOS: verified KVM desktop",
       "type": "node-terminal",
       "request": "launch",
-      "command": "exec cargo xtask kvm-run --build",
+      "command": "exec cargo xtask kvm-run --build --rustos-vcpus 8",
       "cwd": "${workspaceFolder}"
     }
   ]

@@ -20,7 +20,7 @@
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering, fence};
 
 use driver_domain_protocol::{
-    DVM_NET_HEADER_BYTES, DVM_NET_RECORD_BYTES, DVM_NET_SLOT_BYTES, DvmNetHeader,
+    DVM_NET_APERTURE_BYTES, DVM_NET_RECORD_BYTES, DVM_NET_SLOT_BYTES, DvmNetHeader,
     validate_dvm_ethernet_frame,
 };
 
@@ -118,7 +118,7 @@ pub(crate) fn try_install() -> bool {
             last_rejection = "missing-bar";
             return false;
         };
-        if resource.is_io || resource.size < u64::from(DVM_NET_HEADER_BYTES) {
+        if !fixed_network_shared_bar_shape(resource.is_io, resource.prefetchable, resource.size) {
             last_rejection = "invalid-bar";
             return false;
         }
@@ -126,10 +126,11 @@ pub(crate) fn try_install() -> bool {
             last_rejection = "bar-too-large";
             return false;
         };
-        // ivshmem exposes shared RAM rather than device control registers.
-        // Match the display aperture's write-combining mapping; the explicit
-        // acquire/release ring counters provide the cross-domain ordering.
-        let mapped = crate::driver::mmio::map(resource.start, resource_len, true).cast::<u8>();
+        // BAR2 is QEMU RAM shared with the Linux relay's custom WB UIO map.
+        // Header/cursor words are cross-domain atomics, so WC/UC aliases are
+        // forbidden even though payload bytes themselves are single-owner.
+        let mapped =
+            crate::driver::mmio::map_shared_write_back(resource.start, resource_len).cast::<u8>();
         if mapped.is_null() {
             last_rejection = "map-failed";
             return false;
@@ -139,7 +140,7 @@ pub(crate) fn try_install() -> bool {
             last_rejection = "invalid-header";
             return false;
         };
-        if header.region_bytes > resource.size {
+        if header.region_bytes != DVM_NET_APERTURE_BYTES {
             crate::driver::mmio::unmap(mapped.cast());
             last_rejection = "header-outside-bar";
             return false;
@@ -197,6 +198,10 @@ pub(crate) fn try_install() -> bool {
         region
     );
     true
+}
+
+const fn fixed_network_shared_bar_shape(is_io: bool, prefetchable: bool, size: u64) -> bool {
+    !is_io && prefetchable && size == DVM_NET_APERTURE_BYTES
 }
 
 pub(crate) fn transport_status() -> PacketTransportStatus {
@@ -387,8 +392,20 @@ fn slot_at(state: &DvmNetworkState, offset: u64, sequence: u32) -> Option<*mut u
 
 fn read_header(mapped: *const u8) -> Option<DvmNetHeader> {
     let mut bytes = [0_u8; DVM_NET_RECORD_BYTES];
-    for (index, byte) in bytes.iter_mut().enumerate() {
-        *byte = unsafe { mapped.add(index).read_volatile() };
+    // The flags and four cursor words at 36..56 remain live cross-domain
+    // atomics.  A bytewise volatile snapshot of those words would race their
+    // atomic writers.  Snapshot only immutable fields, then insert the flags
+    // through the same Acquire load used by the steady-state protocol.  The
+    // decoder intentionally ignores the zeroed cursor bytes.
+    for index in 0..36 {
+        // SAFETY: the admitted fixed aperture spans the complete 64-byte
+        // header and these immutable bytes are never rewritten after READY.
+        bytes[index] = unsafe { mapped.add(index).read_volatile() };
+    }
+    bytes[36..40].copy_from_slice(&read_u32(mapped, 36).to_le_bytes());
+    for index in 56..DVM_NET_RECORD_BYTES {
+        // SAFETY: generation is immutable for the admitted aperture lifetime.
+        bytes[index] = unsafe { mapped.add(index).read_volatile() };
     }
     DvmNetHeader::decode(&bytes)
 }
@@ -409,7 +426,52 @@ fn write_u32(base: *mut u8, offset: usize, value: u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::TransportLease;
+    use super::{DVM_NET_APERTURE_BYTES, TransportLease, fixed_network_shared_bar_shape};
+
+    #[test]
+    fn network_shared_ring_requires_exact_prefetchable_write_back_memory() {
+        assert!(fixed_network_shared_bar_shape(
+            false,
+            true,
+            DVM_NET_APERTURE_BYTES
+        ));
+        assert!(!fixed_network_shared_bar_shape(
+            false,
+            false,
+            DVM_NET_APERTURE_BYTES
+        ));
+        assert!(!fixed_network_shared_bar_shape(
+            true,
+            true,
+            DVM_NET_APERTURE_BYTES
+        ));
+        assert!(!fixed_network_shared_bar_shape(
+            false,
+            true,
+            DVM_NET_APERTURE_BYTES / 2
+        ));
+        let production = include_str!("dvm_network.rs")
+            .split_once("#[cfg(test)]")
+            .expect("network tests must remain below production")
+            .0;
+        assert_eq!(
+            production.matches("mmio::map_shared_write_back(").count(),
+            1
+        );
+        assert!(!production.contains("mmio::map_write_combining(resource.start, resource_len)"));
+    }
+
+    #[test]
+    fn network_header_snapshot_excludes_live_atomic_cursor_bytes() {
+        let production = include_str!("dvm_network.rs")
+            .split_once("#[cfg(test)]")
+            .expect("network tests must remain below production")
+            .0;
+        assert!(production.contains("for index in 0..36"));
+        assert!(production.contains("read_u32(mapped, 36)"));
+        assert!(production.contains("for index in 56..DVM_NET_RECORD_BYTES"));
+        assert!(!production.contains("bytes.iter_mut().enumerate()"));
+    }
 
     #[test]
     fn control_lease_requires_nonzero_epoch_and_exact_revocation() {

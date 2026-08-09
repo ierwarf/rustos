@@ -2,10 +2,11 @@
 
 extern crate alloc;
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU8, Ordering};
+use rustos_user_abi::performance::{WAITSET_MAX_EPOLL_OBJECTS, WAITSET_MAX_GLOBAL_INTERESTS};
 use rustos_user_abi::syscall::{
     DvmBlockInfoWire, ServiceCheckpointRecordWire, EARLY_SYSTEM_BROKER_MAX_IO_BYTES,
     SERVICE_CHECKPOINT_ABI_VERSION, SERVICE_CHECKPOINT_FLAG_TOMBSTONE, VFS_IPC_OP_FTRUNCATE,
@@ -87,6 +88,7 @@ impl Default for SnapshotWorkerAdmission {
 
 const EINTR: i32 = 4;
 const EIO: i32 = 5;
+const EAGAIN: i32 = 11;
 const EINVAL: i32 = 22;
 const ENODEV: i32 = 19;
 const ENOSYS: i32 = 38;
@@ -155,7 +157,7 @@ pub fn admit_dvm_block_geometry(
     response_generation: u64,
     response_capacity_sectors: u64,
     maximum_block_size: usize,
-    known_flags: u32,
+    expected_flags: u32,
 ) -> Result<(usize, u64), i32> {
     let block_size = usize::try_from(info.logical_block_size).map_err(|_| EINVAL)?;
     if info.generation != response_generation
@@ -167,7 +169,10 @@ pub fn admit_dvm_block_geometry(
         || !info
             .physical_block_size
             .is_multiple_of(info.logical_block_size)
-        || info.flags & !known_flags != 0
+        // Geometry admission also fixes the transport authority. Accepting a
+        // writable signed epoch here would let the DVM volume silently exceed
+        // the read-only policy requested by BootBlockDevice.
+        || info.flags != expected_flags
         || info.reserved0 != 0
     {
         return Err(EIO);
@@ -189,11 +194,36 @@ pub fn storage_error_from_linux_status(status: i64) -> StorageError {
         .and_then(|errno| i32::try_from(errno).ok());
     match errno {
         Some(EINTR) => StorageError::Interrupted,
+        Some(EAGAIN) => StorageError::WouldBlock,
         Some(EINVAL) => StorageError::InvalidInput,
         Some(ETIMEDOUT) => StorageError::Timeout,
         Some(ENODEV) => StorageError::NotPresent,
         Some(ENOSYS) => StorageError::Unsupported,
         _ => StorageError::DeviceFault,
+    }
+}
+
+/// Converts a service-directory lookup result into the VFS storage-backend
+/// status. An unpublished storaged endpoint is a retryable lifecycle state,
+/// never proof that the requested filesystem path is absent.
+pub const fn storage_service_lookup_errno(endpoint: i64) -> i32 {
+    if endpoint == 0 || endpoint == -(ENOENT as i64) {
+        EAGAIN
+    } else if endpoint < 0 && endpoint >= -(i32::MAX as i64) {
+        (-endpoint) as i32
+    } else {
+        EIO
+    }
+}
+
+/// Preserves retryable block-backend failures across the FAT adapter rather
+/// than collapsing a readiness race into a permanent device fault.
+pub const fn storage_io_error_to_linux_errno(error: StorageError) -> i32 {
+    match error {
+        StorageError::WouldBlock => EAGAIN,
+        StorageError::NotPresent => ENODEV,
+        StorageError::InvalidInput => EINVAL,
+        _ => EIO,
     }
 }
 
@@ -367,35 +397,54 @@ pub enum WaitSetRegistryError {
     Overflow,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct WaitSetRegistry {
     epolls: BTreeMap<u64, WaitSetEpoll>,
+    object_interests: BTreeMap<(u16, u64), BTreeSet<WaitSetObjectInterest>>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct WaitSetEpoll {
     interests: BTreeMap<WaitSetInterestKey, WaitSetInterestRecord>,
     cursor: usize,
 }
 
+/// One reverse-index membership. The index makes final-object retirement
+/// proportional to exactly the affected registrations rather than every live
+/// epoll object. Its cardinality is bounded by
+/// `WAITSET_MAX_GLOBAL_INTERESTS`.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct WaitSetObjectInterest {
+    epoll_token: u64,
+    key: WaitSetInterestKey,
+}
+
 impl WaitSetRegistry {
     pub fn create(&mut self, token: u64) -> Result<(), WaitSetRegistryError> {
-        if token == 0 || self.epolls.contains_key(&token) {
-            return Err(WaitSetRegistryError::Exists);
-        }
-        self.epolls.insert(
-            token,
-            WaitSetEpoll {
-                interests: BTreeMap::new(),
-                cursor: 0,
-            },
-        );
-        Ok(())
+        self.insert_epoll(token)
     }
 
     pub fn restore(&mut self, token: u64) -> Result<(), WaitSetRegistryError> {
+        self.insert_epoll(token)
+    }
+
+    /// Restores a checkpoint batch as one registry transaction. A malformed
+    /// or over-capacity batch leaves the pre-existing registry untouched.
+    pub fn restore_all(&mut self, tokens: &[u64]) -> Result<(), WaitSetRegistryError> {
+        let mut candidate = self.clone();
+        for token in tokens {
+            candidate.restore(*token)?;
+        }
+        *self = candidate;
+        Ok(())
+    }
+
+    fn insert_epoll(&mut self, token: u64) -> Result<(), WaitSetRegistryError> {
         if token == 0 || self.epolls.contains_key(&token) {
             return Err(WaitSetRegistryError::Exists);
+        }
+        if self.epolls.len() >= WAITSET_MAX_EPOLL_OBJECTS {
+            return Err(WaitSetRegistryError::Capacity);
         }
         self.epolls.insert(
             token,
@@ -407,11 +456,56 @@ impl WaitSetRegistry {
         Ok(())
     }
 
+    fn object_key(key: WaitSetInterestKey) -> (u16, u64) {
+        (key.provider, key.object_id)
+    }
+
+    fn insert_object_interest(&mut self, token: u64, key: WaitSetInterestKey) {
+        let members = self
+            .object_interests
+            .entry(Self::object_key(key))
+            .or_default();
+        let inserted = members.insert(WaitSetObjectInterest {
+            epoll_token: token,
+            key,
+        });
+        assert!(inserted, "waitset reverse index duplicated a live interest");
+        assert!(
+            members.len() <= WAITSET_MAX_GLOBAL_INTERESTS,
+            "waitset reverse index exceeded global interest capacity"
+        );
+    }
+
+    fn remove_object_interest(&mut self, token: u64, key: WaitSetInterestKey) {
+        let object = Self::object_key(key);
+        let remove_bucket = {
+            let members = self
+                .object_interests
+                .get_mut(&object)
+                .expect("waitset reverse index lacks a live object");
+            assert!(
+                members.remove(&WaitSetObjectInterest {
+                    epoll_token: token,
+                    key,
+                }),
+                "waitset reverse index lacks a live interest"
+            );
+            members.is_empty()
+        };
+        if remove_bucket {
+            self.object_interests.remove(&object);
+        }
+    }
+
     pub fn retire(&mut self, token: u64) -> Result<(), WaitSetRegistryError> {
-        self.epolls
+        let epoll = self
+            .epolls
             .remove(&token)
-            .map(|_| ())
-            .ok_or(WaitSetRegistryError::NotFound)
+            .ok_or(WaitSetRegistryError::NotFound)?;
+        for interest in epoll.interests.into_values() {
+            self.remove_object_interest(token, interest.key);
+        }
+        Ok(())
     }
 
     pub fn add(
@@ -430,6 +524,7 @@ impl WaitSetRegistry {
             return Err(WaitSetRegistryError::Capacity);
         }
         epoll.interests.insert(interest.key, interest);
+        self.insert_object_interest(token, interest.key);
         Ok(())
     }
 
@@ -458,28 +553,44 @@ impl WaitSetRegistry {
             .epolls
             .get_mut(&token)
             .ok_or(WaitSetRegistryError::NotFound)?;
-        epoll
+        let interest = epoll
             .interests
             .remove(&key)
-            .map(|_| ())
-            .ok_or(WaitSetRegistryError::NotFound)
+            .ok_or(WaitSetRegistryError::NotFound)?;
+        self.remove_object_interest(token, interest.key);
+        Ok(())
     }
 
-    pub fn purge(&mut self, provider: u16, object_id: u64) -> bool {
-        let mut changed = false;
-        for epoll in self.epolls.values_mut() {
-            let before = epoll.interests.len();
-            epoll
-                .interests
-                .retain(|key, _| key.provider != provider || key.object_id != object_id);
-            changed |= epoll.interests.len() != before;
+    /// Removes exactly one provider object from every live epoll object.
+    ///
+    /// The reverse index owns all work for this turn, so no purge scans the
+    /// whole registry or allocates a transient whole-registry work list.
+    /// The return value is bounded by `WAITSET_MAX_GLOBAL_INTERESTS`.
+    pub fn purge(&mut self, provider: u16, object_id: u64) -> usize {
+        let Some(members) = self.object_interests.remove(&(provider, object_id)) else {
+            return 0;
+        };
+        let purged = members.len();
+        assert!(
+            purged <= WAITSET_MAX_GLOBAL_INTERESTS,
+            "waitset purge exceeded global interest capacity"
+        );
+        for member in members {
+            let epoll = self
+                .epolls
+                .get_mut(&member.epoll_token)
+                .expect("waitset reverse index references a retired epoll");
+            assert!(
+                epoll.interests.remove(&member.key).is_some(),
+                "waitset reverse index references a missing interest"
+            );
             if epoll.interests.is_empty() {
                 epoll.cursor = 0;
             } else {
                 epoll.cursor %= epoll.interests.len();
             }
         }
-        changed
+        purged
     }
 
     pub fn matching_interests(
@@ -487,18 +598,29 @@ impl WaitSetRegistry {
         provider: u16,
         object_id: u64,
     ) -> Vec<(u64, WaitSetInterestRecord)> {
-        self.epolls
-            .iter()
-            .flat_map(|(token, epoll)| {
-                epoll
-                    .interests
-                    .values()
-                    .filter(move |interest| {
-                        interest.key.provider == provider && interest.key.object_id == object_id
-                    })
-                    .map(move |interest| (*token, *interest))
-            })
-            .collect()
+        let Some(members) = self.object_interests.get(&(provider, object_id)) else {
+            return Vec::new();
+        };
+        assert!(
+            members.len() <= WAITSET_MAX_GLOBAL_INTERESTS,
+            "waitset reverse index exceeded global interest capacity"
+        );
+        // `WaitSetObjectInterest` orders token before interest key. Callers
+        // can therefore collapse this bounded list into one readiness update
+        // per affected epoll without another allocation or global scan.
+        let mut matches = Vec::with_capacity(members.len());
+        for member in members {
+            let epoll = self
+                .epolls
+                .get(&member.epoll_token)
+                .expect("waitset reverse index references a retired epoll");
+            let interest = epoll
+                .interests
+                .get(&member.key)
+                .expect("waitset reverse index references a missing interest");
+            matches.push((member.epoll_token, *interest));
+        }
+        matches
     }
 
     pub fn snapshot(
@@ -675,6 +797,14 @@ mod tests {
         assert!(admit_dvm_block_geometry(valid, 8, 8192, 64 * 1024, 1).is_err());
         assert!(admit_dvm_block_geometry(valid, 7, 4096, 64 * 1024, 1).is_err());
         assert!(admit_dvm_block_geometry(
+            DvmBlockInfoWire { flags: 0, ..valid },
+            7,
+            8192,
+            64 * 1024,
+            1
+        )
+        .is_err());
+        assert!(admit_dvm_block_geometry(
             DvmBlockInfoWire { flags: 3, ..valid },
             7,
             8192,
@@ -704,6 +834,10 @@ mod tests {
             StorageError::Interrupted
         );
         assert_eq!(
+            storage_error_from_linux_status(-11),
+            StorageError::WouldBlock
+        );
+        assert_eq!(
             storage_error_from_linux_status(-19),
             StorageError::NotPresent
         );
@@ -719,6 +853,29 @@ mod tests {
         assert_eq!(
             storage_error_from_linux_status(i64::MIN),
             StorageError::DeviceFault
+        );
+    }
+
+    #[test]
+    fn unpublished_storaged_is_retryable_not_a_missing_file() {
+        assert_eq!(storage_service_lookup_errno(0), EAGAIN);
+        assert_eq!(storage_service_lookup_errno(-(ENOENT as i64)), EAGAIN);
+        assert_eq!(storage_service_lookup_errno(-13), 13);
+        assert_eq!(storage_service_lookup_errno(i64::MIN), EIO);
+    }
+
+    #[test]
+    fn bulk_readiness_race_remains_eagain_through_the_fat_adapter() {
+        let storage_error = storage_error_from_linux_status(-(EAGAIN as i64));
+        assert_eq!(storage_error, StorageError::WouldBlock);
+        assert_eq!(storage_io_error_to_linux_errno(storage_error), EAGAIN);
+        assert_eq!(
+            storage_io_error_to_linux_errno(StorageError::NotPresent),
+            ENODEV
+        );
+        assert_eq!(
+            storage_io_error_to_linux_errno(StorageError::DeviceFault),
+            EIO
         );
     }
 
@@ -897,7 +1054,7 @@ mod tests {
             registry.snapshot(41, WAITSET_MAX_INTERESTS).unwrap().len(),
             2
         );
-        assert!(registry.purge(2, 101));
+        assert_eq!(registry.purge(2, 101), 1);
         assert_eq!(
             registry.snapshot(41, WAITSET_MAX_INTERESTS).unwrap(),
             vec![interest(5, 102)]
@@ -905,11 +1062,66 @@ mod tests {
     }
 
     #[test]
+    fn epoll_object_cap_admits_the_boundary_and_rejects_one_more_unchanged() {
+        let mut registry = WaitSetRegistry::default();
+        for token in 1..=WAITSET_MAX_EPOLL_OBJECTS as u64 {
+            registry.create(token).unwrap();
+        }
+        let before = registry.clone();
+
+        assert_eq!(
+            registry.create(WAITSET_MAX_EPOLL_OBJECTS as u64 + 1),
+            Err(WaitSetRegistryError::Capacity)
+        );
+        assert_eq!(registry, before);
+    }
+
+    #[test]
+    fn checkpoint_restore_over_capacity_is_atomic() {
+        let mut registry = WaitSetRegistry::default();
+        registry.create(900_000).unwrap();
+        let before = registry.clone();
+        let tokens = (1..=WAITSET_MAX_EPOLL_OBJECTS as u64).collect::<Vec<_>>();
+
+        assert_eq!(
+            registry.restore_all(&tokens),
+            Err(WaitSetRegistryError::Capacity)
+        );
+        assert_eq!(registry, before);
+    }
+
+    #[test]
+    fn purge_exact_object_uses_only_the_bounded_reverse_membership() {
+        let mut registry = WaitSetRegistry::default();
+        registry.create(41).unwrap();
+        registry.create(42).unwrap();
+        registry.add(41, interest(5, 101)).unwrap();
+        registry.add(41, interest(5, 102)).unwrap();
+        registry.add(42, interest(6, 101)).unwrap();
+
+        assert_eq!(registry.matching_interests(2, 101).len(), 2);
+        let purged = registry.purge(2, 101);
+        assert_eq!(purged, 2);
+        assert!(purged <= WAITSET_MAX_GLOBAL_INTERESTS);
+        assert!(registry.matching_interests(2, 101).is_empty());
+        assert_eq!(
+            registry.snapshot(41, WAITSET_MAX_INTERESTS).unwrap(),
+            vec![interest(5, 102)]
+        );
+        assert!(registry
+            .snapshot(42, WAITSET_MAX_INTERESTS)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
     fn epoll_registry_has_one_service_lifetime_until_final_retire() {
         let mut registry = WaitSetRegistry::default();
         registry.create(73).unwrap();
+        registry.add(73, interest(8, 301)).unwrap();
         assert!(registry.snapshot(73, 1).is_ok());
         registry.retire(73).unwrap();
+        assert!(registry.matching_interests(2, 301).is_empty());
         assert_eq!(
             registry.snapshot(73, 1),
             Err(WaitSetRegistryError::NotFound)
@@ -946,5 +1158,6 @@ mod tests {
         assert_eq!(registry.snapshot(41, 2).unwrap(), vec![restarted]);
         registry.delete(41, restarted.key).unwrap();
         assert!(registry.snapshot(41, 2).unwrap().is_empty());
+        assert!(registry.matching_interests(2, 101).is_empty());
     }
 }

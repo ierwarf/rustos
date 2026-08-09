@@ -42,10 +42,11 @@ load_storage_controller() {
         driver=$(basename "$(readlink -f "$device/driver")")
         case "$class:$driver" in
             0x0106*:ahci)
-                # AHCI owns the controller, while sd_mod owns the block
-                # namespace below its SCSI host. Minimal DVM images have no
-                # general cold-plug daemon, so admit the complete driver
-                # closure explicitly before starting the relay.
+                # AHCI owns the controller. Signed sd_mod owns writable disk
+                # namespaces, while built-in sr owns the immutable ATAPI
+                # qualification namespace. Minimal DVM images have no general
+                # cold-plug daemon, so admit the complete driver closure
+                # explicitly before starting the relay.
                 modprobe sd_mod || return 1
                 ;;
             0x0108*:nvme) ;;

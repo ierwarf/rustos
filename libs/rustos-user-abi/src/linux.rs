@@ -1392,7 +1392,6 @@ fn push_unique_runtime_dir(dest: &mut Vec<String>, value: &str) {
     }
     dest.push(value.to_string());
 }
-
 // Debug-only private syscall for RustOS userspace tracing.
 pub const SYS_RUSTOS_DEBUG_PRINT: u64 = crate::syscall::SYS_RUSTOS_DEBUG_PRINT;
 pub const SYS_RUSTOS_PRODUCT_MILESTONE: u64 = crate::syscall::SYS_RUSTOS_PRODUCT_MILESTONE;
@@ -1403,6 +1402,7 @@ pub const PRODUCT_MILESTONE_STORAGE_READY: u64 = crate::syscall::PRODUCT_MILESTO
 pub const PRODUCT_MILESTONE_EXECUTABLE_SNAPSHOT_SEALED: u64 =
     crate::syscall::PRODUCT_MILESTONE_EXECUTABLE_SNAPSHOT_SEALED;
 pub const PRODUCT_MILESTONE_FIRST_FRAME: u64 = crate::syscall::PRODUCT_MILESTONE_FIRST_FRAME;
+pub use crate::syscall::smp_qualification::*;
 pub const SYS_RUSTOS_SPAWN_EXEC: u64 = crate::syscall::SYS_RUSTOS_SPAWN_EXEC;
 pub const SYS_RUSTOS_IPC_ENDPOINT_CREATE: u64 = crate::syscall::SYS_RUSTOS_IPC_ENDPOINT_CREATE;
 pub const SYS_RUSTOS_IPC_CALL: u64 = crate::syscall::SYS_RUSTOS_IPC_CALL;

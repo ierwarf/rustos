@@ -204,7 +204,7 @@ if rg -Fq 'guest_deadline_reached' tools/xtask/src/kvm/{guest.rs,options.rs}; th
     echo "KVM regained an independent guest boot deadline during the SMP qualification run" >&2
     exit 1
 fi
-rg -Fq 'rustos_vcpus: 1,' tools/xtask/src/kvm/guest.rs || {
+rg -Fq 'rustos_vcpus: 1' tools/xtask/src/kvm/guest.rs || {
     echo "default KVM topology regained an unrequested RustOS vCPU that contends with the DVM" >&2
     exit 1
 }
@@ -583,19 +583,31 @@ if rg -Fq 'let mut chunk = [0_u8; 256];' \
     echo "local memfd write regained its 256-byte scheduler amplification loop" >&2
     exit 1
 fi
-rg -Fq 'sync_pick_hints: SlotHandoffQueue<MAX_TASK>' \
-    kernel/ps/src/multitask/scheduler/dispatch_policy.rs || {
+rg -Fq 'static SYNC_HANDOFFS: [SyncHandoffLock; MAX_TRACKED_CPUS]' \
+    kernel/ps/src/multitask/scheduler/sync_handoff.rs || {
     echo "synchronous IPC peers no longer have complete bounded FIFO custody" >&2
     exit 1
 }
-rg -Uq 'let atomic_activation_handoff =[\s\S]{0,200}take_next_atomic_activation_handoff_ready_slot\([^)]*\)[\s\S]{0,500}let sync_handoff = if atomic_activation_handoff\.is_none\(\)[\s\S]{0,500}take_next_synchronous_pick_hint_ready_slot\([^)]*\)[\s\S]{0,800}match atomic_activation_handoff[\s\S]{0,800}match sync_handoff[\s\S]{0,500}mandatory_overdue_system_pick' \
-    kernel/ps/src/multitask/scheduler.rs || {
+scheduler_source=kernel/ps/src/multitask/scheduler.rs
+rg -Uq 'let sync_handoff = atomic_activation_handoff\n[[:space:]]*\.is_none\(\)\n[[:space:]]*\.then\(\|\| timed_handoff_step\(1, \|\| self\.take_next_synchronous_pick_hint_ready_slot\(\)\)\)' \
+    "$scheduler_source" || {
     echo "atomic activation or synchronous IPC handoff no longer precedes unrelated overdue work" >&2
     exit 1
 }
-if [ "$(rg -c 'set_next_synchronous_pick_hint\(task_id\)' \
-    kernel/compat/src/user/syscall/linux/ipc_ops.rs)" -lt 2 ]; then
-    echo "one IPC reply ABI bypasses terminal caller handoff custody" >&2
+atomic_handoff_line=$(rg -n -m1 'let atomic_activation_handoff =' "$scheduler_source" | cut -d: -f1)
+sync_handoff_line=$(rg -n -m1 'let sync_handoff = atomic_activation_handoff' "$scheduler_source" | cut -d: -f1)
+overdue_pick_line=$(rg -n -m1 'self\.mandatory_overdue_system_pick\(current_slot, now_ticks\)' \
+    "$scheduler_source" | cut -d: -f1)
+if [ -z "$atomic_handoff_line" ] || [ -z "$sync_handoff_line" ] || \
+    [ -z "$overdue_pick_line" ] || [ "$atomic_handoff_line" -ge "$sync_handoff_line" ] || \
+    [ "$sync_handoff_line" -ge "$overdue_pick_line" ]; then
+    echo "atomic activation or synchronous IPC handoff no longer precedes unrelated overdue work" >&2
+    exit 1
+fi
+if [ "$(rg -c 'complete_ipc_reply_wake_handoff\(' \
+    kernel/compat/src/user/syscall/linux/{ipc_ops.rs,ipc_reply_recv.rs} | \
+    awk -F: '{ total += $2 } END { print total + 0 }')" -ne 3 ]; then
+    echo "one terminal IPC reply ABI bypasses the combined donation/wake handoff" >&2
     exit 1
 fi
 rg -Fq 'set_next_synchronous_pick_hint(receiver_task_id)' \

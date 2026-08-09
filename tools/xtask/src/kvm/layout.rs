@@ -26,7 +26,9 @@ fn prepare_layout(config: &Config, options: &SmokeOptions) -> Result<KvmLayout> 
     // snapshot mode below protects it from guest writes, avoiding a full disk
     // copy on every F5. Only proof options that patch private boot content
     // receive a per-run image.
-    let runtime_disk = if options.min_ui_fps.is_some() || options.exercise_network {
+    let needs_private_contracts =
+        options.min_ui_fps.is_some() || options.exercise_network || options.smp_ring3_qualification;
+    let runtime_disk = if needs_private_contracts {
         let runtime_disk = run_dir.join("rustos-kvm.img");
         fs::copy(&config.boot_disk_image, &runtime_disk).with_context(|| {
             format!(
@@ -38,11 +40,16 @@ fn prepare_layout(config: &Config, options: &SmokeOptions) -> Result<KvmLayout> 
     } else {
         config.boot_disk_image.clone()
     };
-    if options.min_ui_fps.is_some() || options.exercise_network {
-        write_private_acceptance_contract(
+    if needs_private_contracts {
+        write_private_kvm_contracts(
             &runtime_disk,
-            options.min_ui_fps.is_some(),
-            options.exercise_network,
+            options
+                .min_ui_fps
+                .is_some()
+                .then_some((options.min_ui_fps.is_some(), options.exercise_network)),
+            options
+                .smp_ring3_qualification
+                .then_some(options.rustos_vcpus),
         )?;
     }
     let display_backing_dir = if options.gui_dvm_surfaces {
@@ -92,6 +99,7 @@ fn prepare_layout(config: &Config, options: &SmokeOptions) -> Result<KvmLayout> 
             )
         })?;
         fs::set_permissions(&disk, std::fs::Permissions::from_mode(0o600))?;
+        sync_private_dvm_block_snapshot(&disk, &run_dir)?;
         let aperture = run_dir.join("dvm-block.ivshmem");
         create_dvm_block_aperture(&aperture, &disk, &config.storage_epoch_signing_key)?;
         (
@@ -236,114 +244,7 @@ fn create_dvm_network_shmem(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn create_dvm_block_aperture(path: &Path, disk: &Path, signing_key_path: &Path) -> Result<()> {
-    for candidate in [path, disk] {
-        if candidate.to_string_lossy().contains(',') {
-            bail!(
-                "KVM storage-DVM path contains an unsupported QEMU option separator: {}",
-                candidate.display()
-            );
-        }
-    }
-    let disk_bytes = fs::metadata(disk)
-        .with_context(|| format!("inspect private storage-DVM disk {}", disk.display()))?
-        .len();
-    if disk_bytes == 0 || !disk_bytes.is_multiple_of(512) {
-        bail!("private storage-DVM disk must be non-empty and 512-byte aligned");
-    }
-    let signing_key = crate::storage_epoch::load_signing_key(signing_key_path)?;
-    let header = crate::storage_epoch::sign_epoch(
-        &signing_key,
-        DvmBlockHeader::new(
-            1,
-            disk_bytes / 512,
-            512,
-            512,
-            DVM_BLOCK_FEATURE_FLUSH | DVM_BLOCK_FEATURE_FUA,
-        ),
-    );
-    if !header.is_valid() {
-        bail!("refusing to create invalid fixed DVM block header");
-    }
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .read(true)
-        .write(true)
-        .open(path)
-        .with_context(|| format!("create DVM block aperture {}", path.display()))?;
-    file.set_len(DVM_BLOCK_APERTURE_BYTES)
-        .with_context(|| format!("size DVM block aperture {}", path.display()))?;
-    file.write_all(&header.encode())
-        .with_context(|| format!("write DVM block header {}", path.display()))?;
-    file.sync_all()
-        .with_context(|| format!("sync DVM block aperture {}", path.display()))?;
-    fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(())
-}
-
-/// Publish a new L0-authorized block transport epoch without replacing the
-/// backing file while RustOS still maps it.
-///
-/// The caller must first prove that the DVM peer has exited. RustOS may retain
-/// the mapping, but it will reject the changed generation, revoke every
-/// predecessor request, and admit this zero-cursor epoch only after verifying
-/// its signature. This is the storage equivalent of check-revoke-rebind; it
-/// never teaches either guest to accept the predecessor's mutable ring state.
-fn rotate_dvm_block_epoch(
-    path: &Path,
-    disk: &Path,
-    signing_key_path: &Path,
-) -> Result<u64> {
-    let disk_bytes = fs::metadata(disk)
-        .with_context(|| format!("inspect private storage-DVM disk {}", disk.display()))?
-        .len();
-    if disk_bytes == 0 || !disk_bytes.is_multiple_of(512) {
-        bail!("private storage-DVM disk must remain non-empty and 512-byte aligned");
-    }
-    let signing_key = crate::storage_epoch::load_signing_key(signing_key_path)?;
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .with_context(|| format!("open live DVM block aperture {}", path.display()))?;
-    let mut bytes = [0_u8; DVM_BLOCK_HEADER_RECORD_BYTES];
-    file.read_exact(&mut bytes)
-        .with_context(|| format!("read live DVM block header {}", path.display()))?;
-    let predecessor = DvmBlockHeader::decode(&bytes)
-        .context("live DVM block aperture contains an invalid predecessor header")?;
-    let expected_signature = crate::storage_epoch::sign_epoch(
-        &signing_key,
-        predecessor.with_epoch_signature([0; 64]),
-    )
-    .epoch_signature;
-    if predecessor.epoch_signature != expected_signature {
-        bail!("refusing to rotate a DVM block epoch not authorized by this L0");
-    }
-    if predecessor.capacity_sectors != disk_bytes / 512 {
-        bail!("live DVM block epoch geometry diverged from its private backing disk");
-    }
-    let generation = predecessor
-        .generation
-        .checked_add(1)
-        .context("DVM block transport generation exhausted")?;
-    let successor = crate::storage_epoch::sign_epoch(
-        &signing_key,
-        DvmBlockHeader::new(
-            generation,
-            predecessor.capacity_sectors,
-            predecessor.logical_block_size,
-            predecessor.physical_block_size,
-            predecessor.features,
-        ),
-    );
-    file.seek(SeekFrom::Start(0))?;
-    file.write_all(&successor.encode())
-        .with_context(|| format!("publish successor DVM block header {}", path.display()))?;
-    file.sync_data()
-        .with_context(|| format!("sync successor DVM block header {}", path.display()))?;
-    Ok(generation)
-}
+include!("layout/block_transport.rs");
 
 /// Allocate the production GUI-DVM three-surface pool for the KVM topology.
 /// The L0 runner creates every slot and control record before either guest
@@ -555,7 +456,19 @@ fn verify_dvm_network_round_trip(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn dvm_block_header_matches_ready_generation(
+    header: DvmBlockHeader,
+    expected_generation: u64,
+) -> bool {
+    let ready = DVM_BLOCK_FLAG_RUSTOS_READY | DVM_BLOCK_FLAG_DVM_READY | DVM_BLOCK_FLAG_READ_ONLY;
+    header.flags & ready == ready && header.generation == expected_generation
+}
+
 fn verify_dvm_block_ready(layout: &KvmLayout) -> Result<()> {
+    verify_dvm_block_ready_generation(layout, 1)
+}
+
+fn verify_dvm_block_ready_generation(layout: &KvmLayout, expected_generation: u64) -> Result<()> {
     let aperture = layout
         .dvm_block_aperture
         .as_deref()
@@ -571,32 +484,48 @@ fn verify_dvm_block_ready(layout: &KvmLayout) -> Result<()> {
         .with_context(|| format!("read live DVM block header {}", aperture.display()))?;
     let header = DvmBlockHeader::decode(&bytes)
         .context("live DVM block aperture contains an invalid header")?;
-    let ready = DVM_BLOCK_FLAG_RUSTOS_READY | DVM_BLOCK_FLAG_DVM_READY;
-    if header.flags & ready != ready {
+    if !dvm_block_header_matches_ready_generation(header, expected_generation) {
         bail!(
-            "DVM block peers did not both publish readiness flags={:#x}",
-            header.flags
+            "DVM block peers did not publish expected read-only dual readiness generation={} actual_generation={} flags={:#x}",
+            expected_generation,
+            header.generation,
+            header.flags,
         );
     }
     let disk_bytes = fs::metadata(disk)
         .with_context(|| format!("inspect live storage-DVM disk {}", disk.display()))?
         .len();
-    if header.generation != 1
-        || disk_bytes == 0
-        || !disk_bytes.is_multiple_of(512)
+    if disk_bytes == 0
+        || !disk_bytes.is_multiple_of(u64::from(DVM_BLOCK_MEDIA_BLOCK_BYTES))
         || header.capacity_sectors != disk_bytes / 512
-        || header.logical_block_size != 512
-        || header.physical_block_size != 512
+        || header.logical_block_size != DVM_BLOCK_MEDIA_BLOCK_BYTES
+        || header.physical_block_size != DVM_BLOCK_MEDIA_BLOCK_BYTES
     {
         bail!("live DVM block geometry diverged from the private backing disk");
     }
     Ok(())
 }
 
-fn write_private_acceptance_contract(
+fn render_private_acceptance_contract(ui_profile: bool, network_exercise: bool) -> String {
+    format!(
+        "contract=rustos-kvm-acceptance-v1\nui_profile={}\nnetwork_exercise={}\n",
+        u8::from(ui_profile),
+        u8::from(network_exercise),
+    )
+}
+
+fn render_smp_ring3_qualification_contract(workers: u8) -> String {
+    format!(
+        "contract=rustos-kvm-smp-qualification-v1\nworkers={workers}\nwork_units={SMP_QUALIFICATION_WORK_UNITS}\ndeadline_ms={SMP_QUALIFICATION_DEADLINE_MS}\n"
+    )
+}
+
+/// Write every per-run KVM contract through one mounted private FAT image.
+/// Acceptance-v1 stays verbatim; Ring3 uses a disjoint path and proof mode.
+fn write_private_kvm_contracts(
     runtime_disk: &Path,
-    ui_profile: bool,
-    network_exercise: bool,
+    acceptance: Option<(bool, bool)>,
+    smp_ring3_workers: Option<u8>,
 ) -> Result<()> {
     let disk = std::fs::OpenOptions::new()
         .read(true)
@@ -608,24 +537,59 @@ fn write_private_acceptance_contract(
     let fs = fatfs::FileSystem::new(image, fatfs::FsOptions::new())?;
     {
         let root = fs.root_dir();
-        let mut contract = root
-            .create_file(PRIVATE_ACCEPTANCE_CONTRACT_PATH)
-            .with_context(|| {
-                format!(
-                    "create private KVM acceptance contract {PRIVATE_ACCEPTANCE_CONTRACT_PATH}"
-                )
-            })?;
-        contract.truncate()?;
-        let contents = format!(
-            "contract=rustos-kvm-acceptance-v1\nui_profile={}\nnetwork_exercise={}\n",
-            u8::from(ui_profile),
-            u8::from(network_exercise),
-        );
-        FatWrite::write_all(&mut contract, contents.as_bytes())?;
-        FatWrite::flush(&mut contract)?;
+        if let Some((ui_profile, network_exercise)) = acceptance {
+            let mut contract = root
+                .create_file(PRIVATE_ACCEPTANCE_CONTRACT_PATH)
+                .context("create private KVM acceptance contract file")?;
+            contract.truncate()?;
+            let contents = render_private_acceptance_contract(ui_profile, network_exercise);
+            FatWrite::write_all(&mut contract, contents.as_bytes())?;
+            FatWrite::flush(&mut contract)?;
+        }
+        if let Some(workers) = smp_ring3_workers {
+            let mut contract = root
+                .create_file(PRIVATE_SMP_QUALIFICATION_CONTRACT_PATH)
+                .with_context(|| {
+                    format!(
+                        "create private KVM SMP qualification contract {PRIVATE_SMP_QUALIFICATION_CONTRACT_PATH}"
+                    )
+                })?;
+            contract.truncate()?;
+            let contents = render_smp_ring3_qualification_contract(workers);
+            FatWrite::write_all(&mut contract, contents.as_bytes())?;
+            FatWrite::flush(&mut contract)?;
+        }
     }
     fs.unmount()?;
     Ok(())
+}
+
+fn read_private_smp_ring3_qualification_contract(runtime_disk: &Path) -> Result<Vec<u8>> {
+    read_private_kvm_file(runtime_disk, PRIVATE_SMP_QUALIFICATION_CONTRACT_PATH)
+}
+
+fn read_private_early_system_image(runtime_disk: &Path) -> Result<Vec<u8>> {
+    read_private_kvm_file(runtime_disk, "system/boot/early-system.img")
+}
+
+fn read_private_kvm_file(runtime_disk: &Path, path: &str) -> Result<Vec<u8>> {
+    let disk = std::fs::OpenOptions::new()
+        .read(true)
+        .open(runtime_disk)
+        .with_context(|| format!("open private KVM disk {}", runtime_disk.display()))?;
+    let mut image = fatfs::StdIoWrapper::new(disk);
+    image.seek(fatfs::SeekFrom::Start(0))?;
+    let fs = fatfs::FileSystem::new(image, fatfs::FsOptions::new())?;
+    let mut contents = Vec::new();
+    {
+        let mut contract = fs
+            .root_dir()
+            .open_file(path)
+            .with_context(|| format!("open private KVM file {path}"))?;
+        contract.read_to_end(&mut contents)?;
+    }
+    fs.unmount()?;
+    Ok(contents)
 }
 
 fn require_qemu(config: &Config) -> Result<PathBuf> {

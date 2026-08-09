@@ -17,6 +17,9 @@ kernel/hal/src/arch/gdt.rs	4	0
 kernel/hal/src/interrupt_stubs.rs	0	0
 kernel/lowlevel/src/interrupts.rs	3	4
 kernel/ipc-runtime/src/ipc/mod.rs	1	12
+kernel/io-manager/src/driver/mmio.rs	0	0
+kernel/executive/src/boot.rs	2	1
+libs/driver-domain-host/src/lib.rs	23	4
 kernel/ipc-runtime/src/ipc/endpoint_priority.rs	0	0
 kernel/mm/src/memory/address_space.rs	24	0
 kernel/mm/src/memory/address_space/atomic_user.rs	0	0
@@ -37,6 +40,7 @@ kernel/ps/src/multitask/scheduler.rs	16	0
 kernel/ps/src/multitask/scheduler/affinity.rs	0	0
 kernel/ps/src/multitask/scheduler/handoff_queue.rs	0	0
 kernel/ps/src/multitask/scheduler/handoffs.rs	0	0
+kernel/ps/src/multitask/scheduler/sync_handoff.rs	0	0
 kernel/ps/src/multitask/scheduler/reclaim.rs	0	0
 kernel/ps/src/multitask/cpu_local.rs	0	0
 kernel/ps/src/multitask/scheduler/smp.rs	0	0
@@ -66,7 +70,7 @@ kernel/compat/src/user/syscall/linux/block_broker_ops.rs	0	0
 kernel/compat/src/user/syscall/linux/input_broker_ops.rs	1	0
 kernel/compat/src/user/syscall/windows/api.rs	0	0
 kernel/compat/src/user/syscall/windows/dispatch.rs	0	0
-kernel/io-manager/src/io/dvm_block.rs	21	72
+kernel/io-manager/src/io/dvm_block.rs	15	47
 kernel/io-manager/src/io/dvm_network.rs	6	12
 kernel/io-manager/src/input/dvm_ring.rs	10	76
 kernel/io-manager/src/io/dvm_display.rs	13	219

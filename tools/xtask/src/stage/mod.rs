@@ -32,6 +32,11 @@ const EARLY_SYSTEM_BOOTSTRAP_PATHS: &[&str] = &[
     "lib/x86_64-linux-gnu/libc.so.6",
     "lib/x86_64-linux-gnu/libgcc_s.so.1",
     "lib64/ld-linux-x86-64.so.2",
+    // The qualification contract remains a private DVM-volume input, but its
+    // executable is trusted evidence code. Keep the exact ELF inside the
+    // bootloader-authenticated early-system closure so a driver domain cannot
+    // substitute a program that merely fabricates valid phase syscalls.
+    "apps/smpqual/smpqual.elf",
     // WayClick is the mandatory first interactive desktop client. Treat it as
     // part of the signed product bootstrap closure so reaching a usable UI
     // does not depend on a cold DVM/FAT snapshot transaction. The executable
@@ -1211,25 +1216,7 @@ fn cleanup_stale_build_paths(config: &Config) -> Result<()> {
     Ok(())
 }
 
-fn stage_image_asset_overlay(src_root: &Path, dst_root: &Path) -> Result<()> {
-    copy_tree_files(src_root, dst_root)
-}
-
-fn generate_dynamic_linker_cache(image_dir: &Path) -> Result<()> {
-    let ld_so_conf = image_dir.join(LD_SO_CONF_PATH);
-    if !ld_so_conf.is_file() {
-        return Ok(());
-    }
-
-    let Some(ldconfig) = command_in_path("ldconfig") else {
-        bail!(
-            "missing ldconfig required to generate dynamic linker cache from {}",
-            ld_so_conf.display()
-        );
-    };
-
-    run_command(Command::new(ldconfig).arg("-r").arg(image_dir))
-}
+include!("finalization.rs");
 
 #[cfg(test)]
 mod tests {
@@ -1279,6 +1266,7 @@ mod tests {
     #[test]
     fn early_system_allowlist_contains_the_minimal_dynamic_runtime_closure() {
         for required in [
+            "apps/smpqual/smpqual.elf",
             "apps/wayclick/wayclick.elf",
             "etc/ld.so.cache",
             "lib64/ld-linux-x86-64.so.2",

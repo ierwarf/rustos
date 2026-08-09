@@ -10,7 +10,7 @@ python3 "$repo_root/formal/check-fault-scenarios.py" \
     --summary "$artifact_dir/summary.json"
 
 declare -A witnesses=()
-while IFS=$'\t' read -r point _severity _owner _source _expected _evidence witness; do
+while IFS=$'\t' read -r point _severity _owner _source _expected _evidence _witness_source witness; do
     [[ -n "$point" && "$point" != \#* ]] || continue
     witnesses["$witness"]=1
 done <"$repo_root/formal/fault-scenarios.tsv"

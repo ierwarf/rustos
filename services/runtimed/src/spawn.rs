@@ -24,16 +24,22 @@ use std::time::{Duration, Instant};
 use runtime_control::read_bounded_config_snapshot;
 use rustos_user_abi::performance::IPC_BOOT_CONTROL_HARD_LIMIT_MS;
 use rustos_user_abi::syscall::{
-    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, LoaderSpawnRequest,
-    LoaderSpawnResponse, RustosIpcWaitServiceEndpointArgs, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
-    COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR, COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL,
-    IPC_SERVICE_LOADERD, IPC_SERVICE_ROOTD, IPC_SERVICE_UISERVER,
-    IPC_WAIT_SERVICE_ENDPOINT_ABI_VERSION, LOADER_OP_ACTIVATE, LOADER_OP_SPAWN_EXEC,
-    LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES, LOADER_SPAWN_ENV_BYTES,
-    LOADER_SPAWN_EXEC_PATH_CAPACITY, LOADER_SPAWN_FLAG_DEFER_START, SYS_RUSTOS_IPC_CALL_BOUNDED,
+    smp_qualification_bind_shape_valid, CommercialMaxProtocolRequest,
+    CommercialMaxProtocolResponse, LoaderSpawnRequest, LoaderSpawnResponse,
+    RustosIpcWaitServiceEndpointArgs, RustosSmpQualificationBindArgs,
+    COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR,
+    COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL, IPC_SERVICE_LOADERD, IPC_SERVICE_ROOTD,
+    IPC_SERVICE_UISERVER, IPC_WAIT_SERVICE_ENDPOINT_ABI_VERSION, LOADER_OP_ACTIVATE,
+    LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES,
+    LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_EXEC_PATH_CAPACITY, LOADER_SPAWN_FLAG_DEFER_START,
+    SMP_QUALIFICATION_BIND_ABI_VERSION, SYS_RUSTOS_IPC_CALL_BOUNDED,
     SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_WAIT_SERVICE_ENDPOINT,
+    SYS_RUSTOS_SMP_QUALIFICATION_BIND,
 };
 
+use super::kvm_smp_qualification::{
+    qualification_contract_for_launch, KvmSmpQualificationContract,
+};
 use super::{
     boot_line, AT_FDCWD, CONSOLE_PATH, CONSOLE_SESSION_STATE_LOADING_IMAGE,
     CONSOLE_SESSION_STATE_RUNNING, CONSOLE_SESSION_STATE_SPAWNING, DEFAULT_USER_TASK_WEIGHT_MICROS,
@@ -57,6 +63,8 @@ pub(super) fn spawn_tracked_process(
     mut entry: LaunchEntry,
 ) -> Result<(), i32> {
     apply_kvm_acceptance_contract(&mut entry);
+    let qualification_contract =
+        qualification_contract_for_launch(&entry).map_err(|()| libc::EINVAL)?;
     boot_line(
         format!(
             "runtimed: spawn begin desktop_id={} exec={} console_hosted={} logical_admin={}",
@@ -151,9 +159,19 @@ pub(super) fn spawn_tracked_process(
         },
     );
 
-    if let Err(err) = activate_spawned_process(pid) {
+    // The private workload becomes runnable only after ring0 has bound this
+    // exact suspended child to runtimed's live SESSIOND generation and the
+    // closed qualification contract. Bind failure is terminal for the child;
+    // falling through to loader activation would create unauthenticated KVM
+    // evidence under the same executable path.
+    if let Err((stage, err)) = bind_then_activate_spawned_process(
+        pid,
+        qualification_contract,
+        bind_smp_qualification,
+        activate_spawned_process,
+    ) {
         state.running.remove(&pid);
-        retire_failed_spawn_or_abort(pid, "loader-activate");
+        retire_failed_spawn_or_abort(pid, stage.cleanup_stage());
         release_failed_session(state, session_handle);
         return Err(err);
     }
@@ -175,6 +193,76 @@ pub(super) fn spawn_tracked_process(
         super::session::focus_session_after_spawn(state, inserted_session_handle);
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreActivationStage {
+    SmpQualificationBind,
+    LoaderActivate,
+}
+
+impl PreActivationStage {
+    const fn cleanup_stage(self) -> &'static str {
+        match self {
+            Self::SmpQualificationBind => "smp-qualification-bind",
+            Self::LoaderActivate => "loader-activate",
+        }
+    }
+}
+
+fn bind_then_activate_spawned_process<Bind, Activate>(
+    pid: i32,
+    qualification_contract: Option<KvmSmpQualificationContract>,
+    mut bind: Bind,
+    mut activate: Activate,
+) -> Result<(), (PreActivationStage, i32)>
+where
+    Bind: FnMut(i32, KvmSmpQualificationContract) -> Result<(), i32>,
+    Activate: FnMut(i32) -> Result<(), i32>,
+{
+    if let Some(contract) = qualification_contract {
+        bind(pid, contract).map_err(|errno| (PreActivationStage::SmpQualificationBind, errno))?;
+    }
+    activate(pid).map_err(|errno| (PreActivationStage::LoaderActivate, errno))
+}
+
+fn smp_qualification_bind_args(
+    pid: i32,
+    contract: KvmSmpQualificationContract,
+) -> Result<RustosSmpQualificationBindArgs, i32> {
+    if pid <= 0 {
+        return Err(libc::EINVAL);
+    }
+    let args = RustosSmpQualificationBindArgs {
+        abi_version: SMP_QUALIFICATION_BIND_ABI_VERSION,
+        target_pid: u64::try_from(pid).map_err(|_| libc::EINVAL)?,
+        workers: u32::from(contract.workers),
+        work_units: u64::from(contract.work_units),
+        deadline_ms: contract.deadline_ms,
+        ..RustosSmpQualificationBindArgs::default()
+    };
+    smp_qualification_bind_shape_valid(&args)
+        .then_some(args)
+        .ok_or(libc::EINVAL)
+}
+
+fn bind_smp_qualification(pid: i32, contract: KvmSmpQualificationContract) -> Result<(), i32> {
+    let args = smp_qualification_bind_args(pid, contract)?;
+    // SAFETY: `args` is a fully initialized, locally shape-validated fixed ABI
+    // record and remains live for the duration of the synchronous syscall.
+    let result = unsafe {
+        libc::syscall(
+            SYS_RUSTOS_SMP_QUALIFICATION_BIND as libc::c_long,
+            (&args as *const RustosSmpQualificationBindArgs) as u64,
+        ) as i64
+    };
+    if result < 0 {
+        Err((-result) as i32)
+    } else if result != 0 {
+        Err(libc::EINVAL)
+    } else {
+        Ok(())
+    }
 }
 
 fn apply_kvm_acceptance_contract(entry: &mut LaunchEntry) {
@@ -821,13 +909,105 @@ fn last_errno() -> i32 {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
     use super::{
-        admitted_task_weight_micros, build_exec_argv, build_exec_env_with_defaults,
-        cleanup_failed_spawn, parse_kvm_acceptance_contract, upsert_env,
+        admitted_task_weight_micros, bind_then_activate_spawned_process, build_exec_argv,
+        build_exec_env_with_defaults, cleanup_failed_spawn, parse_kvm_acceptance_contract,
+        smp_qualification_bind_args, upsert_env,
     };
     use crate::{
-        MAX_UNTRUSTED_TASK_WEIGHT_MICROS, UI_SERVER_EXEC_PATH, UI_SERVER_TASK_WEIGHT_MICROS,
+        kvm_smp_qualification::KvmSmpQualificationContract, MAX_UNTRUSTED_TASK_WEIGHT_MICROS,
+        UI_SERVER_EXEC_PATH, UI_SERVER_TASK_WEIGHT_MICROS,
     };
+    use rustos_user_abi::syscall::SMP_QUALIFICATION_BIND_ABI_VERSION;
+
+    const QUALIFICATION: KvmSmpQualificationContract = KvmSmpQualificationContract {
+        workers: 4,
+        work_units: 1_000_000,
+        deadline_ms: 5_000,
+    };
+
+    #[test]
+    fn qualification_bind_is_exact_and_precedes_activation() {
+        let args = smp_qualification_bind_args(41, QUALIFICATION).expect("valid bind wire");
+        assert_eq!(args.abi_version, SMP_QUALIFICATION_BIND_ABI_VERSION);
+        assert_eq!(args.target_pid, 41);
+        assert_eq!(args.workers, 4);
+        assert_eq!(args.work_units, 1_000_000);
+        assert_eq!(args.deadline_ms, 5_000);
+        assert_eq!(args.flags, 0);
+        assert_eq!(args.reserved0, 0);
+        assert_eq!(args.reserved1, 0);
+        assert_eq!(args.reserved2, 0);
+        assert!(smp_qualification_bind_args(0, QUALIFICATION).is_err());
+        assert!(smp_qualification_bind_args(-1, QUALIFICATION).is_err());
+        assert!(smp_qualification_bind_args(
+            41,
+            KvmSmpQualificationContract {
+                deadline_ms: 5_001,
+                ..QUALIFICATION
+            }
+        )
+        .is_err());
+
+        let calls = RefCell::new(Vec::new());
+        bind_then_activate_spawned_process(
+            41,
+            Some(QUALIFICATION),
+            |pid, contract| {
+                assert_eq!((pid, contract), (41, QUALIFICATION));
+                calls.borrow_mut().push("bind");
+                Ok(())
+            },
+            |pid| {
+                assert_eq!(pid, 41);
+                calls.borrow_mut().push("activate");
+                Ok(())
+            },
+        )
+        .expect("bind then activate");
+        assert_eq!(&*calls.borrow(), &["bind", "activate"]);
+    }
+
+    #[test]
+    fn qualification_bind_failure_never_activates_the_child() {
+        let activation_count = RefCell::new(0_u32);
+        let failure = bind_then_activate_spawned_process(
+            42,
+            Some(QUALIFICATION),
+            |_, _| Err(libc::EPERM),
+            |_| {
+                *activation_count.borrow_mut() += 1;
+                Ok(())
+            },
+        )
+        .expect_err("bind failure must be terminal");
+        assert_eq!(failure.1, libc::EPERM);
+        assert_eq!(*activation_count.borrow(), 0);
+    }
+
+    #[test]
+    fn ordinary_launch_skips_private_bind_and_activates_once() {
+        let bind_count = RefCell::new(0_u32);
+        let activation_count = RefCell::new(0_u32);
+        bind_then_activate_spawned_process(
+            43,
+            None,
+            |_, _| {
+                *bind_count.borrow_mut() += 1;
+                Ok(())
+            },
+            |pid| {
+                assert_eq!(pid, 43);
+                *activation_count.borrow_mut() += 1;
+                Ok(())
+            },
+        )
+        .expect("ordinary activation");
+        assert_eq!(*bind_count.borrow(), 0);
+        assert_eq!(*activation_count.borrow(), 1);
+    }
 
     #[test]
     fn catalog_weight_cannot_promote_an_untrusted_program() {

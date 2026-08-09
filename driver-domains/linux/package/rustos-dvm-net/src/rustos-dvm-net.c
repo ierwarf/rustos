@@ -26,14 +26,15 @@
 
 #define MAGIC "RSDVMNT1"
 #define HEADER_BYTES 4096U
-#define RECORD_BYTES 64U
 #define SLOT_COUNT 64U
 #define SLOT_BYTES 2048U
 #define MTU 1514U
 #define FLAG_READY 1U
 #define FLAG_DVM_READY 2U
 #define KNOWN_FLAGS (FLAG_READY | FLAG_DVM_READY)
-#define REGION_BYTES (HEADER_BYTES + 2U * SLOT_COUNT * SLOT_BYTES)
+#define USED_BYTES (HEADER_BYTES + 2U * SLOT_COUNT * SLOT_BYTES)
+#define APERTURE_BYTES (512U * 1024U)
+#define UIO_NAME "rustos-dvm-net"
 #define FLAGS 36U
 #define TX_HEAD 40U
 #define TX_TAIL 44U
@@ -42,10 +43,18 @@
 #define TX_RING HEADER_BYTES
 #define RX_RING (HEADER_BYTES + SLOT_COUNT * SLOT_BYTES)
 
+_Static_assert(USED_BYTES <= APERTURE_BYTES, "network rings exceed BAR2");
+_Static_assert((FLAGS % _Alignof(uint32_t)) == 0U, "flags must be atomic aligned");
+_Static_assert((TX_HEAD % _Alignof(uint32_t)) == 0U, "tx head must be atomic aligned");
+_Static_assert((TX_TAIL % _Alignof(uint32_t)) == 0U, "tx tail must be atomic aligned");
+_Static_assert((RX_HEAD % _Alignof(uint32_t)) == 0U, "rx head must be atomic aligned");
+_Static_assert((RX_TAIL % _Alignof(uint32_t)) == 0U, "rx tail must be atomic aligned");
+
 struct shared_net { int fd; volatile uint8_t *base; size_t bytes; uint32_t tx_tail; uint32_t rx_head; int last_tx_errno; };
 struct raw_endpoint { int fd; struct sockaddr_ll address; };
 
 static void relay_log(const char *format, ...) __attribute__((format(printf, 1, 2)));
+static void close_shared(struct shared_net *net);
 
 static void relay_log(const char *format, ...) {
     char line[512];
@@ -63,45 +72,61 @@ static uint32_t le32(const volatile uint8_t *p) { return __atomic_load_n((const 
 static uint64_t le64(const volatile uint8_t *p) { uint64_t v = 0; unsigned int i; for (i = 0; i < 8; i++) v |= (uint64_t)p[i] << (8U * i); return v; }
 static void put32(volatile uint8_t *p, uint32_t v) { __atomic_store_n((volatile uint32_t *)p, v, __ATOMIC_RELEASE); }
 
-static int matching_bar(char *out, size_t out_len, size_t *bytes) {
-    DIR *dir = opendir("/sys/bus/pci/devices"); struct dirent *entry;
+static int read_text_file(const char *path, char *buffer, size_t capacity) {
+    ssize_t count; int fd;
+    if (capacity < 2U) { errno = EINVAL; return -1; }
+    fd = open(path, O_RDONLY | O_CLOEXEC); if (fd < 0) return -1;
+    count = read(fd, buffer, capacity - 1U); close(fd);
+    if (count <= 0 || (size_t)count >= capacity) { errno = EPROTO; return -1; }
+    while (count > 0 && (buffer[count - 1] == '\n' || buffer[count - 1] == '\r' || buffer[count - 1] == ' ' || buffer[count - 1] == '\t')) count--;
+    buffer[count] = '\0';
+    if (count == 0) { errno = EPROTO; return -1; }
+    return 0;
+}
+
+static int read_u64_file(const char *path, uint64_t *value) {
+    char text[64], *end = NULL; unsigned long long parsed;
+    if (read_text_file(path, text, sizeof(text))) return -1;
+    errno = 0; parsed = strtoull(text, &end, 0);
+    if (errno || end == text || *end != '\0') { errno = EPROTO; return -1; }
+    *value = (uint64_t)parsed; return 0;
+}
+
+static int find_uio(char *name, size_t name_capacity) {
+    DIR *dir = opendir("/sys/class/uio"); struct dirent *entry; char selected[32] = "";
     if (!dir) return -1;
     while ((entry = readdir(dir))) {
-        char base[64], vendor[80], device[80], resource[80], value[32]; FILE *f; unsigned long long start, end, flags; unsigned int line;
-        if (entry->d_name[0] == '.' || strnlen(entry->d_name, 16U) == 16U) continue;
-        snprintf(base, sizeof(base), "/sys/bus/pci/devices/%.15s", entry->d_name);
-        snprintf(vendor, sizeof(vendor), "%s/vendor", base); f = fopen(vendor, "re"); if (!f || !fgets(value, sizeof(value), f)) { if (f) fclose(f); continue; } fclose(f);
-        if (strncmp(value, "0x1af4", 6) != 0) continue;
-        snprintf(device, sizeof(device), "%s/device", base); f = fopen(device, "re"); if (!f || !fgets(value, sizeof(value), f)) { if (f) fclose(f); continue; } fclose(f);
-        if (strncmp(value, "0x1110", 6) != 0) continue;
-        snprintf(resource, sizeof(resource), "%s/resource", base); f = fopen(resource, "re"); if (!f) continue;
-        for (line = 0; line <= 2U; line++) if (fscanf(f, "%llx %llx %llx", &start, &end, &flags) != 3) break;
-        fclose(f);
-        if (line != 3U || end < start || end - start + 1U < RECORD_BYTES) continue;
-        snprintf(resource, sizeof(resource), "%s/resource2", base);
-        int fd = open(resource, O_RDONLY | O_CLOEXEC); volatile uint8_t *map;
-        if (fd < 0) continue;
-        map = mmap(NULL, (size_t)(end - start + 1U), PROT_READ, MAP_SHARED, fd, 0);
-        close(fd);
-        if (map == MAP_FAILED) continue;
-        uint32_t transport_flags = le32(map + FLAGS);
-        int match = memcmp((const void *)map, MAGIC, 8) == 0 && le32(map + 8) == 1U && le32(map + 12) == HEADER_BYTES && le64(map + 16) >= REGION_BYTES && (transport_flags & FLAG_READY) != 0 && (transport_flags & ~KNOWN_FLAGS) == 0;
-        munmap((void *)map, (size_t)(end - start + 1U));
-        if (!match) continue;
-        if (snprintf(out, out_len, "%s/resource2", base) >= (int)out_len) continue;
-        *bytes = (size_t)(end - start + 1U); closedir(dir); return 0;
+        char path[PATH_MAX], value[64];
+        if (strncmp(entry->d_name, "uio", 3U) != 0 || entry->d_name[3] == '\0') continue;
+        if (snprintf(path, sizeof(path), "/sys/class/uio/%s/name", entry->d_name) >= (int)sizeof(path) || read_text_file(path, value, sizeof(value)) || strcmp(value, UIO_NAME)) continue;
+        if (selected[0] != '\0') { closedir(dir); errno = EEXIST; return -1; }
+        if (snprintf(selected, sizeof(selected), "%s", entry->d_name) >= (int)sizeof(selected)) { closedir(dir); errno = ENAMETOOLONG; return -1; }
     }
-    closedir(dir); errno = ENODEV; return -1;
+    closedir(dir);
+    if (selected[0] == '\0') { errno = ENODEV; return -1; }
+    {
+        char path[PATH_MAX]; uint64_t bytes;
+        if (snprintf(path, sizeof(path), "/sys/class/uio/%s/maps/map0/size", selected) >= (int)sizeof(path) || read_u64_file(path, &bytes) || bytes != APERTURE_BYTES) { errno = EPROTO; return -1; }
+    }
+    if (snprintf(name, name_capacity, "%s", selected) >= (int)name_capacity) { errno = ENAMETOOLONG; return -1; }
+    return 0;
+}
+
+static int header_is_valid(const volatile uint8_t *base) {
+    uint32_t flags = le32(base + FLAGS), tx_head = le32(base + TX_HEAD), tx_tail = le32(base + TX_TAIL), rx_head = le32(base + RX_HEAD), rx_tail = le32(base + RX_TAIL);
+    return memcmp((const void *)base, MAGIC, 8) == 0 && le32(base + 8) == 1U && le32(base + 12) == HEADER_BYTES && le64(base + 16) == APERTURE_BYTES && le32(base + 24) == SLOT_COUNT && le32(base + 28) == SLOT_BYTES && le32(base + 32) == MTU && (flags & FLAG_READY) != 0 && (flags & ~KNOWN_FLAGS) == 0 && le64(base + 56) != 0 && tx_head >= tx_tail && tx_head - tx_tail <= SLOT_COUNT && rx_head >= rx_tail && rx_head - rx_tail <= SLOT_COUNT;
 }
 
 static int open_shared(struct shared_net *net) {
-    char path[80]; size_t bytes;
+    char name[32], path[PATH_MAX];
     memset(net, 0, sizeof(*net)); net->fd = -1;
-    if (matching_bar(path, sizeof(path), &bytes) || bytes < REGION_BYTES) return -1;
+    if (find_uio(name, sizeof(name)) || snprintf(path, sizeof(path), "/dev/%s", name) >= (int)sizeof(path)) return -1;
     net->fd = open(path, O_RDWR | O_CLOEXEC); if (net->fd < 0) return -1;
-    net->base = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, net->fd, 0);
-    if (net->base == MAP_FAILED) { close(net->fd); return -1; }
-    net->bytes = bytes; net->tx_tail = le32(net->base + TX_TAIL); net->rx_head = le32(net->base + RX_HEAD); return 0;
+    net->base = mmap(NULL, APERTURE_BYTES, PROT_READ | PROT_WRITE, MAP_SHARED, net->fd, 0);
+    if (net->base == MAP_FAILED) { net->base = NULL; close(net->fd); net->fd = -1; return -1; }
+    net->bytes = APERTURE_BYTES;
+    if (!header_is_valid(net->base)) { errno = EPROTO; close_shared(net); return -1; }
+    net->tx_tail = le32(net->base + TX_TAIL); net->rx_head = le32(net->base + RX_HEAD); return 0;
 }
 
 static void close_shared(struct shared_net *net) {
@@ -147,12 +172,11 @@ static int raw_socket(struct raw_endpoint *endpoint) {
 }
 
 static void mark_dvm_ready(struct shared_net *net) {
-    (void)__atomic_fetch_or((volatile uint32_t *)(net->base + FLAGS), FLAG_DVM_READY, __ATOMIC_RELEASE);
+    (void)__atomic_fetch_or((volatile uint32_t *)(net->base + FLAGS), FLAG_DVM_READY, __ATOMIC_ACQ_REL);
 }
 
 static void drain_tx(const struct raw_endpoint *raw, struct shared_net *net) {
     uint32_t head = le32(net->base + TX_HEAD);
-    __sync_synchronize();
     while (head - net->tx_tail <= SLOT_COUNT && head != net->tx_tail) {
         volatile uint8_t *s = slot(net->base, TX_RING, net->tx_tail); uint32_t len = le32(s);
         if (len == 0 || len > MTU) break;
@@ -169,7 +193,7 @@ static void drain_tx(const struct raw_endpoint *raw, struct shared_net *net) {
             net->last_tx_errno = tx_errno;
             return;
         }
-        net->last_tx_errno = 0; net->tx_tail++; __sync_synchronize(); put32(net->base + TX_TAIL, net->tx_tail);
+        net->last_tx_errno = 0; net->tx_tail++; put32(net->base + TX_TAIL, net->tx_tail);
     }
 }
 
@@ -182,7 +206,7 @@ static void drain_rx(const struct raw_endpoint *raw, struct shared_net *net) {
         tail = le32(net->base + RX_TAIL);
         if (net->rx_head - tail > SLOT_COUNT || net->rx_head - tail == SLOT_COUNT) return;
         volatile uint8_t *s = slot(net->base, RX_RING, net->rx_head); unsigned int i; for (i = 0; i < (unsigned int)len; i++) s[4U + i] = frame[i]; put32(s, (uint32_t)len);
-        __sync_synchronize(); net->rx_head++; put32(net->base + RX_HEAD, net->rx_head);
+        net->rx_head++; put32(net->base + RX_HEAD, net->rx_head);
     }
 }
 

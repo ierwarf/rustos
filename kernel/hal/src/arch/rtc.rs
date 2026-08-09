@@ -131,15 +131,18 @@ impl SleepWaiterTable {
         ready_len
     }
 
-    fn remove_task(&mut self, task_id: u64) {
+    fn remove_task(&mut self, task_id: u64) -> bool {
+        let mut removed = false;
         for slot in self.slots.iter_mut() {
             if slot
                 .map(|waiter| waiter.task_id == task_id)
                 .unwrap_or(false)
             {
                 *slot = None;
+                removed = true;
             }
         }
+        removed
     }
 }
 
@@ -568,14 +571,20 @@ fn register_sleep_waiter(task_id: u64, wake_tick: u64) -> bool {
     // Process context must therefore exclude that interrupt while holding the
     // spin lock; otherwise the IRQ can preempt this CPU and deadlock trying to
     // acquire the same non-reentrant lock.
-    let inserted = interrupts::without_interrupts(|| {
-        RTC_SLEEP_WAITERS.lock().insert_or_update(SleepWaiter {
-            task_id,
-            wake_tick,
-            last_notify_tick: RTC_SLEEP_UNNOTIFIED_TICK,
-            notification_count: 0,
-        })
-    });
+    let waiter = SleepWaiter {
+        task_id,
+        wake_tick,
+        last_notify_tick: RTC_SLEEP_UNNOTIFIED_TICK,
+        notification_count: 0,
+    };
+    #[cfg(rustos_boot_image)]
+    let inserted =
+        interrupts::without_interrupts(|| RTC_SLEEP_WAITERS.lock().insert_or_update(waiter));
+    // Host tests have no RTC interrupt consumer, and executing CLI/STI outside
+    // ring0 is invalid. Keep the same single-lock transaction without issuing
+    // privileged instructions in a non-boot build.
+    #[cfg(not(rustos_boot_image))]
+    let inserted = RTC_SLEEP_WAITERS.lock().insert_or_update(waiter);
     if inserted {
         true
     } else {
@@ -592,11 +601,18 @@ pub fn arm_sleep_waiter_until_tick(task_id: u64, wake_tick: u64) -> bool {
     register_sleep_waiter(task_id, wake_tick)
 }
 
-pub fn disarm_sleep_waiter(task_id: u64) {
+/// Release the exact task's deadline record and report whether this call owned
+/// one. A wait transaction can use the result to prove that completion did not
+/// leave stale timer authority behind for a later reuse of the same task.
+pub fn disarm_sleep_waiter(task_id: u64) -> bool {
     #[cfg(rustos_boot_image)]
-    interrupts::without_interrupts(|| RTC_SLEEP_WAITERS.lock().remove_task(task_id));
+    {
+        interrupts::without_interrupts(|| RTC_SLEEP_WAITERS.lock().remove_task(task_id))
+    }
     #[cfg(not(rustos_boot_image))]
-    RTC_SLEEP_WAITERS.lock().remove_task(task_id);
+    {
+        RTC_SLEEP_WAITERS.lock().remove_task(task_id)
+    }
 }
 
 fn wake_ready_sleepers(now: u64) {

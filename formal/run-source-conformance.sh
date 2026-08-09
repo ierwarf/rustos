@@ -21,6 +21,26 @@ if boot_cfg_misuse="$(rg -n 'target_os[[:space:]]*=[[:space:]]*"none"' kernel --
     exit 1
 fi
 
+# `println_emergency` deliberately bypasses the shared debug-output lock so a
+# nested panic can still report why the machine stopped. Letting any ordinary
+# diagnostic use it can splice bytes into a mandatory SMP milestone and turn a
+# completed CPU transition into false-negative (or substring-based false
+# positive) KVM evidence. All healthy-runtime writers must take the bounded
+# serialized line path.
+while IFS= read -r emergency_source; do
+    case "$emergency_source" in
+        # `debug/tests.rs` is included only by `#[cfg(test)] mod tests`; its
+        # function-pointer binding proves the panic-only API remains distinct
+        # and cannot become a healthy-runtime writer.
+        kernel/nucleus-core/src/debug/mod.rs|kernel/nucleus-core/src/debug/tests.rs|kernel/executive/src/boot.rs) ;;
+        *)
+            printf '%s\n' "$emergency_source" >&2
+            echo 'non-panic debug output must not bypass milestone serialization' >&2
+            exit 1
+            ;;
+    esac
+done < <(rg -l 'println_emergency' kernel --glob '*.rs' | sort)
+
 # Blocking is one scheduler transition: publishing a public commit-only leaf
 # would let callers reintroduce an interruptible commit/yield gap that the
 # SchedulerWakeup model deliberately excludes.
@@ -171,6 +191,25 @@ if ! grep -Fq 'super::reschedule_observation::publish_request(' <<<"$reschedule_
     exit 1
 fi
 
+# Busy-CPU balancing is driven by loaded opportunities, never by a global RTC
+# residue that one CPU's scheduling cadence may fail to visit. Candidate
+# selection must also retain the source-migration predicate: it excludes
+# current/transition stack owners before the existing owner-CAS/mailbox move.
+active_balance_body="$(
+    sed -n '/pub(super) fn rebalance_one_from_busy_cpu(/,/pub(super) fn request_runqueue_owner_reschedule/p' \
+        kernel/ps/src/multitask/scheduler/runqueue_policy.rs
+)"
+if ! grep -Fq 'ACTIVE_BALANCE_OPPORTUNITIES[source_cpu].fetch_add(1, Ordering::Relaxed)' \
+        <<<"$active_balance_body" \
+    || ! grep -Fq 'active_balance_opportunity_due(previous_opportunities)' \
+        <<<"$active_balance_body" \
+    || ! grep -Fq 'context_is_migratable_from_source(slot, context, source_cpu, target_cpu)' \
+        <<<"$active_balance_body" \
+    || grep -Fq 'context_is_schedulable(slot, context)' <<<"$active_balance_body"; then
+    echo 'active balance must use loaded-opportunity cadence and exclude every execution owner' >&2
+    exit 1
+fi
+
 input_drain_body="$(
     sed -n '/^pub(crate) fn service_pending(/,/^pub(crate) fn has_pending_records()/p' \
         kernel/io-manager/src/input/dvm_ring.rs
@@ -294,6 +333,19 @@ if ! grep -Fq 'enqueue_executable_snapshot(reply_cap, sender_pid, sender_tid, *r
     exit 1
 fi
 
+# VFS geometry admission is an authority equality check.  Treating the signed
+# flag word as an allowed-bit mask would admit flags=0 (writable) when the
+# caller requires the exact READ_ONLY authority.
+vfs_geometry_body="$(
+    sed -n '/^pub fn admit_dvm_block_geometry(/,/^pub fn storage_error_from_linux_status/p' \
+        services/vfsd/src/lib.rs
+)"
+if ! grep -Fq '|| info.flags != expected_flags' <<<"$vfs_geometry_body" \
+    || grep -Fq 'info.flags & !expected_flags' <<<"$vfs_geometry_body"; then
+    echo 'vfsd DVM geometry must require the exact expected READ_ONLY flag authority' >&2
+    exit 1
+fi
+
 time_hot_path_body="$(
     sed -n '/^pub fn syscall_linux_nanosleep(/,/^fn rtc_datetime_to_unix_seconds(/p' \
         kernel/compat/src/user/syscall/linux/service_ops/process_time.rs
@@ -304,6 +356,398 @@ if ! grep -Fq 'validate_time_hot_path_locally' <<<"$time_hot_path_body"; then
 fi
 if grep -Eq 'request_syscalld|with_current_user_process_state(_mut)?' <<<"$time_hot_path_body"; then
     echo 'clock and sleep hot paths must not depend on process-state or policy-service latency' >&2
+    exit 1
+fi
+
+join_line="$(rg -n 'pthread_join\(threads\[index\]' apps/smpqual/smpqual.c | head -n 1 | cut -d: -f1)"
+complete_line="$(rg -n 'emit_milestone\(PRODUCT_MILESTONE_SMPQUAL_COMPLETE' apps/smpqual/smpqual.c | head -n 1 | cut -d: -f1)"
+smp_bind_body="$(sed -n '/^pub(super) fn syscall_linux_rustos_smp_qualification_bind/,/^pub(super) fn prepare_smp_qualification_activation/p' kernel/compat/src/user/syscall/linux/smp_qualification_ops.rs)"
+smp_activation_body="$(sed -n '/^pub(super) fn prepare_smp_qualification_activation/,/^pub(super) fn abort_smp_qualification_activation/p' kernel/compat/src/user/syscall/linux/smp_qualification_ops.rs)"
+smp_phase_body="$(sed -n '/^pub(super) fn admit_smp_qualification_milestone/,/^pub(super) fn revoke_smp_qualification_for_process/p' kernel/compat/src/user/syscall/linux/smp_qualification_ops.rs)"
+proc_activate_body="$(sed -n '/^pub(super) fn syscall_linux_rustos_proc_activate_broker/,/^pub(super) fn syscall_linux_rustos_proc_validate_deferred_spawn_broker/p' kernel/compat/src/user/syscall/linux/proc_broker_ops.rs)"
+smp_ring3_option_body="$(sed -n '/^    if options.smp_ring3_qualification {/,/^    } else if options.smp_evidence_cohort.is_some() {/p' tools/xtask/src/kvm/options.rs)"
+ordinary_catalog_body="$(sed -n '/^pub(super) fn load_launch_catalog/,/^\/\/\/ Reconciles the private/p' services/runtimed/src/catalog.rs)"
+qualification_reconcile_body="$(sed -n '/^pub(super) fn reconcile_kvm_smp_qualification_into_state/,/^fn defer_qualification_catalog_retry/p' services/runtimed/src/catalog.rs)"
+qualification_candidate_body="$(sed -n '/^fn qualification_catalog_candidate/,/^fn validate_ui_bootstrap_metadata/p' services/runtimed/src/catalog.rs)"
+dvm_read_only_header_body="$(sed -n '/^fn dvm_read_only_block_header(/,/^fn create_dvm_block_aperture/p' tools/xtask/src/kvm/layout/block_transport.rs)"
+dvm_snapshot_sync_body="$(sed -n '/^fn sync_private_dvm_block_snapshot(/,/^fn create_dvm_block_aperture/p' tools/xtask/src/kvm/layout/block_transport.rs)"
+dvm_block_create_body="$(sed -n '/^fn create_dvm_block_aperture(/,/^fn rotate_dvm_block_epoch/p' tools/xtask/src/kvm/layout/block_transport.rs)"
+dvm_block_rotate_body="$(sed -n '/^fn rotate_dvm_block_epoch(/,$p' tools/xtask/src/kvm/layout/block_transport.rs)"
+dvm_virtual_storage_body="$(sed -n '/^fn append_dvm_virtual_storage(/,/^fn append_dvm_display_pixels/p' tools/xtask/src/kvm/guest.rs)"
+dvm_recovery_harness_body="$(sed -n '/^impl RecoveryHarness/,/^fn wait_for_rustos_reboot_recovery/p' tools/xtask/src/kvm/guest.rs)"
+dvm_restart_recovery_body="$(sed -n '/^fn wait_for_dvm_restart_recovery(/,$p' tools/xtask/src/kvm/guest.rs)"
+dvm_ready_generation_body="$(sed -n '/^fn dvm_block_header_matches_ready_generation(/,/^fn verify_dvm_block_ready(/p' tools/xtask/src/kvm/layout.rs)"
+dvm_block_ready_body="$(sed -n '/^fn verify_dvm_block_ready_generation(/,/^fn render_private_acceptance_contract/p' tools/xtask/src/kvm/layout.rs)"
+dvm_block_revoke_body="$(sed -n '/^impl DvmBlockState {/,/^#\[cfg(not(test))\]/p' kernel/io-manager/src/io/dvm_block/revoke.rs)"
+dvm_block_revoke_report_body="$(sed -n '/^fn report_transport_revoke(/,/^#\[cfg(test)\]/p' kernel/io-manager/src/io/dvm_block/revoke.rs)"
+dvm_block_revoke_reason_body="$(sed -n '/^pub(super) enum DvmBlockRevokeReason {/,/^    #\[cfg(test)\]/p' kernel/io-manager/src/io/dvm_block/revoke.rs)"
+dvm_block_flush_read_body="$(sed -n '/^fn valid_flush_completion_keeps_transport_live_for_first_64kib_read(/,/^#\[test\]/p' kernel/io-manager/src/io/dvm_block/tests.rs)"
+dvm_block_cache_source="$(cat kernel/io-manager/src/io/dvm_block.rs)"
+dvm_input_cache_source="$(cat kernel/io-manager/src/input/dvm_ring.rs)"
+dvm_display_cache_source="$(cat kernel/io-manager/src/io/dvm_display.rs)"
+kernel_vm_cache_source="$(cat kernel/mm/src/memory/kernel_vm.rs)"
+input_ring_atomic_production="$(sed '/^#\[cfg(test)\]/,$d' kernel/io-manager/src/input/dvm_ring.rs)"
+host_input_ring_atomic_production="$(sed '/^#\[cfg(test)\]/,$d' libs/driver-domain-host/src/lib.rs)"
+input_ring_snapshot_body="$(sed -n '/^fn copy_immutable_header_bytes(/,/^fn write_control_words_to_header_bytes(/p' kernel/io-manager/src/input/dvm_ring.rs)"
+host_input_ring_snapshot_body="$(sed -n '/^fn copy_immutable_input_header_bytes(/,/^fn write_control_words_to_input_header_bytes(/p' libs/driver-domain-host/src/lib.rs)"
+input_ring_load_order_body="$(sed -n '/^const fn shared_control_load_order(/,/^}/p' kernel/io-manager/src/input/dvm_ring.rs)"
+input_ring_publish_order_body="$(sed -n '/^const fn shared_control_publish_order(/,/^}/p' kernel/io-manager/src/input/dvm_ring.rs)"
+input_ring_update_order_body="$(sed -n '/^const fn shared_control_update_order(/,/^}/p' kernel/io-manager/src/input/dvm_ring.rs)"
+input_ring_update_failure_order_body="$(sed -n '/^const fn shared_control_update_failure_order(/,/^}/p' kernel/io-manager/src/input/dvm_ring.rs)"
+host_input_ring_load_order_body="$(sed -n '/^const fn shared_control_load_order(/,/^}/p' libs/driver-domain-host/src/lib.rs)"
+host_input_ring_publish_order_body="$(sed -n '/^const fn shared_control_publish_order(/,/^}/p' libs/driver-domain-host/src/lib.rs)"
+mmio_mapping_body="$(sed -n '/^fn map_with_cache_mode(/,/^pub(crate) fn unmap(/p' kernel/io-manager/src/driver/mmio.rs)"
+mmio_direct_override_body="$(sed -n '/^fn apply_direct_map_cache_mode(/,/^fn restore_direct_map_cache_mode(/p' kernel/io-manager/src/driver/mmio.rs)"
+permanent_boot_mmio_body="$(sed -n '/^pub fn map_permanent_boot_mmio_uncached(/,/^pub fn unmap_mmio_range(/p' kernel/mm/src/memory/kernel_vm.rs)"
+high_window_mapping_body="$(sed -n '/^fn map_physical_range_internal(/,/^fn physical_mapping_cache_flags(/p' kernel/mm/src/memory/kernel_vm.rs)"
+pat_initialize_body="$(sed -n '/^pub fn initialize_current_cpu_cache_attributes()/,/^#\[cfg(test)\]/p' kernel/mm/src/memory/kernel_vm.rs)"
+pat_contract_body="$(sed -n '/^const fn pat_with_kernel_cache_contract(/,/^\/\/\//p' kernel/mm/src/memory/kernel_vm.rs)"
+ap_entry_body="$(sed -n '/^extern "C" fn rustos_ap_entry(/,/^    loop {/p' kernel/executive/src/boot.rs)"
+boot_initialize_body="$(sed -n '/^pub unsafe fn initialize_kernel(/,/^fn initialize_application_processors(/p' kernel/executive/src/boot.rs)"
+mmio_conflict_line="$(grep -n -m1 -F 'cache_modes_conflict(' <<<"$mmio_mapping_body" | cut -d: -f1)"
+mmio_straddle_guard_line="$(grep -n -m1 -F 'if physical_range_straddles_direct_map_limit(phys_start, phys_end) {' <<<"$mmio_mapping_body" | cut -d: -f1)"
+mmio_registry_reserve_line="$(grep -n -m1 -F 'if registry.mappings.try_reserve(1).is_err() {' <<<"$mmio_mapping_body" | cut -d: -f1)"
+mmio_direct_map_line="$(grep -n -m1 -F 'direct_map_mapping(phys_start, size)' <<<"$mmio_mapping_body" | cut -d: -f1)"
+mmio_window_map_line="$(grep -n -m1 -F 'crate::memory::paging::map_shared_memory_range(phys_start, size)' <<<"$mmio_mapping_body" | cut -d: -f1)"
+mmio_override_reserve_line="$(grep -n -m1 -F 'if overrides.try_reserve(page_count).is_err()' <<<"$mmio_direct_override_body" | cut -d: -f1)"
+mmio_direct_map_update_line="$(grep -n -m1 -F 'crate::memory::paging::update_direct_map_range_flags(' <<<"$mmio_direct_override_body" | cut -d: -f1)"
+ap_pat_init_line="$(grep -n -m1 -F 'mm_api::boot::initialize_current_cpu_cache_attributes()' <<<"$ap_entry_body" | cut -d: -f1)"
+ap_online_parked_line="$(grep -n -m1 -F 'CpuLifecycleState::OnlineParked' <<<"$ap_entry_body" | cut -d: -f1)"
+ap_private_ready_line="$(grep -n -m1 -F '"smp-ap-private-ready"' <<<"$ap_entry_body" | cut -d: -f1)"
+apic_permanent_map_line="$(grep -n -m1 -F 'mm_api::paging::map_permanent_boot_mmio_uncached(local_apic_phys, 4096)' <<<"$boot_initialize_body" | cut -d: -f1)"
+apic_configure_line="$(grep -n -m1 -F 'hal_api::cpu::configure_local_apic_mmio(local_apic_phys, local_apic_virt)' <<<"$boot_initialize_body" | cut -d: -f1)"
+apic_pic_line="$(grep -n -m1 -F 'hal_api::init_pic();' <<<"$boot_initialize_body" | cut -d: -f1)"
+raw_high_window_callers="$(rg -l -F 'map_physical_range_internal(' --glob '*.rs' kernel | LC_ALL=C sort)"
+raw_direct_map_update_callers="$(rg -l -F 'update_direct_map_range_flags(' --glob '*.rs' kernel | LC_ALL=C sort)"
+direct_map_cache_flag_callers="$(rg -l -F 'direct_map_cache_flags_for_phys(' --glob '*.rs' kernel | LC_ALL=C sort)"
+debug_milestone_class_body="$(sed -n '/^fn milestone_output_class(/,/^}$/p' kernel/nucleus-core/src/debug/mod.rs)"
+debug_milestone_loss_snapshot_body="$(sed -n '/^fn milestone_loss_snapshot(/,/^}$/p' kernel/nucleus-core/src/debug/mod.rs)"
+debug_milestone_drop_body="$(sed -n '/^fn record_milestone_output_drop_to(/,/^}$/p' kernel/nucleus-core/src/debug/mod.rs)"
+dvm_revoke_reason_count="$(grep -Ec '^[[:space:]]{4}[A-Za-z][A-Za-z0-9]* = [1-9][0-9]*,$' <<<"$dvm_block_revoke_reason_body")"
+dvm_revoke_guard_line="$(grep -n -m1 -F 'if self.revoked {' <<<"$dvm_block_revoke_body" | cut -d: -f1)"
+dvm_revoke_observation_line="$(grep -n -m1 -F 'let observation = DvmBlockRevokeObservation {' <<<"$dvm_block_revoke_body" | cut -d: -f1)"
+dvm_revoke_terminal_line="$(grep -n -m1 -F 'self.revoked = true;' <<<"$dvm_block_revoke_body" | cut -d: -f1)"
+dvm_revoke_observer_line="$(grep -n -m1 -F 'observer(observation);' <<<"$dvm_block_revoke_body" | cut -d: -f1)"
+dvm_revoke_pending_clear_line="$(grep -n -m1 -F 'self.pending = [None; QUEUE_DEPTH];' <<<"$dvm_block_revoke_body" | cut -d: -f1)"
+dvm_revoke_flags_clear_line="$(grep -n -m1 -F 'fetch_and_u32(' <<<"$dvm_block_revoke_body" | cut -d: -f1)"
+dvm_snapshot_file_open_line="$(grep -n -m1 -F 'std::fs::File::open(disk)' <<<"$dvm_snapshot_sync_body" | cut -d: -f1)"
+dvm_snapshot_first_sync_line="$(grep -n -m1 -F '.sync_all()' <<<"$dvm_snapshot_sync_body" | cut -d: -f1)"
+dvm_snapshot_directory_open_line="$(grep -n -m1 -F 'std::fs::File::open(directory)' <<<"$dvm_snapshot_sync_body" | cut -d: -f1)"
+dvm_snapshot_last_sync_line="$(grep -n -F '.sync_all()' <<<"$dvm_snapshot_sync_body" | tail -n 1 | cut -d: -f1)"
+dvm_snapshot_copy_line="$(rg -n -m1 -F 'fs::copy(&runtime_disk, &disk)' tools/xtask/src/kvm/layout.rs | cut -d: -f1)"
+dvm_snapshot_permissions_line="$(rg -n -m1 -F 'fs::set_permissions(&disk, std::fs::Permissions::from_mode(0o600))?' tools/xtask/src/kvm/layout.rs | cut -d: -f1)"
+dvm_snapshot_sync_call_line="$(rg -n -m1 -F 'sync_private_dvm_block_snapshot(&disk, &run_dir)?' tools/xtask/src/kvm/layout.rs | cut -d: -f1)"
+dvm_snapshot_aperture_line="$(rg -n -m1 -F 'create_dvm_block_aperture(&aperture, &disk, &config.storage_epoch_signing_key)?' tools/xtask/src/kvm/layout.rs | cut -d: -f1)"
+# The v6 SMP evidence snapshot is an admission boundary, not a post-hoc
+# report.  Keep both calls in the *smoke* orchestration body: a matching call
+# elsewhere (notably kvm-run) cannot establish that the bytes were captured
+# before this pair of QEMU processes was spawned.
+kvm_smoke_body="$(sed -n '/^pub(crate) fn kvm_smoke_command<I>(/,/^fn smoke_guest_display(/p' tools/xtask/src/kvm/options.rs)"
+kvm_launch_capture_line="$(grep -n -m1 'smp_qualification::capture_kvm_launch_evidence' <<<"$kvm_smoke_body" | cut -d: -f1)"
+kvm_bounded_input_relay_line="$(grep -n -m1 'let control_relay = start_dvm_input_relay(' <<<"$kvm_smoke_body" | cut -d: -f1)"
+kvm_guest_spawn_line="$(grep -n -m1 'let (mut rustos, mut dvm) = spawn_guests(' <<<"$kvm_smoke_body" | cut -d: -f1)"
+kvm_boot_started_line="$(grep -n -m1 'let boot_started = Instant::now();' <<<"$kvm_smoke_body" | cut -d: -f1)"
+kvm_deadline_line="$(grep -n -m1 'let deadline = boot_started + options.timeout;' <<<"$kvm_smoke_body" | cut -d: -f1)"
+kvm_precapture_body="$(sed '/smp_qualification::capture_kvm_launch_evidence/,$d' <<<"$kvm_smoke_body")"
+kvm_interactive_body="$(sed -n '/^pub(crate) fn kvm_run_command(/,/^fn log_kvm_start_phase(/p' tools/xtask/src/kvm/options.rs)"
+
+# Block/input BAR2 is coherent shared RAM, not a framebuffer or controller
+# register window. The physical-interval guard runs before either direct-map or
+# high-window installation, so a cache-mode mismatch cannot become an alias.
+if ! grep -Fq '!is_io && prefetchable && size == DVM_BLOCK_APERTURE_BYTES' <<<"$dvm_block_cache_source" \
+    || ! grep -Fq 'crate::driver::mmio::map_shared_write_back(resource.start, resource_len).cast::<u8>();' <<<"$dvm_block_cache_source" \
+    || ! grep -Fq 'shared_start={:#x} shared_size={:#x} shared_prefetchable={} shared_64={} cache=wb' <<<"$dvm_block_cache_source" \
+    || ! grep -Fq '!is_io && prefetchable && size == DVM_INPUT_RING_APERTURE_BYTES' <<<"$dvm_input_cache_source" \
+    || ! grep -Fq 'crate::driver::mmio::map_shared_write_back(resource.start, resource_len).cast::<u8>();' <<<"$dvm_input_cache_source" \
+    || ! grep -Fq 'PhysicalMappingCacheMode::WriteBack => PageTableFlags::empty(),' kernel/mm/src/memory/kernel_vm.rs \
+    || ! grep -Fq '!(shared->flags & IORESOURCE_PREFETCH)' driver-domains/linux/package/rustos-dvm-block/src/rustos_dvm_block_uio.c \
+    || ! grep -Fq '~_PAGE_CACHE_MASK' driver-domains/linux/package/rustos-dvm-block/src/rustos_dvm_block_uio.c \
+    || ! grep -Fq 'remap_pfn_range' driver-domains/linux/package/rustos-dvm-block/src/rustos_dvm_block_uio.c \
+    || ! grep -Fq 'libc::MAP_SHARED' libs/driver-domain-host/src/lib.rs \
+    || rg -q -e 'fn[[:space:]]+map[[:space:]]*\(' kernel/io-manager/src/driver/mmio.rs; then
+    echo 'DVM block/input shared RAM must be exact prefetchable WB, Linux BAR2 must clear PAT cache flags, host input must MAP_SHARED, and ambiguous mmio::map must remain absent' >&2
+    exit 1
+fi
+if ! grep -Fq 'const fn shared_control_load_order() -> Ordering {' <<<"$input_ring_atomic_production" \
+    || ! grep -Fq 'const fn shared_control_publish_order() -> Ordering {' <<<"$input_ring_atomic_production" \
+    || ! grep -Fq 'const fn shared_control_update_order() -> Ordering {' <<<"$input_ring_atomic_production" \
+    || ! grep -Fq 'const fn shared_control_update_failure_order() -> Ordering {' <<<"$input_ring_atomic_production" \
+    || ! grep -Fq 'Ordering::Acquire' <<<"$input_ring_atomic_production" \
+    || ! grep -Fq 'Ordering::Release' <<<"$input_ring_atomic_production" \
+    || ! grep -Fq 'Ordering::AcqRel' <<<"$input_ring_atomic_production" \
+    || ! grep -Fq 'AtomicU32::from_ptr' <<<"$input_ring_atomic_production" \
+    || ! grep -Fq 'AtomicU64::from_ptr' <<<"$input_ring_atomic_production" \
+    || ! grep -Fq 'word.load(shared_control_load_order())' <<<"$input_ring_atomic_production" \
+    || ! grep -Fq 'word.fetch_update(' <<<"$input_ring_atomic_production" \
+    || ! grep -Fq 'shared_control_update_order()' <<<"$input_ring_atomic_production" \
+    || ! grep -Fq 'shared_control_update_failure_order()' <<<"$input_ring_atomic_production" \
+    || ! grep -Fq 'word.store(value.to_le(), ordering);' <<<"$input_ring_atomic_production" \
+    || ! grep -Fq 'DVM_INPUT_RING_FLAGS_OFFSET + size_of::<u32>()..DVM_INPUT_RING_PRODUCER_OFFSET' <<<"$input_ring_snapshot_body" \
+    || ! grep -Fq 'DVM_INPUT_RING_CONSUMER_WAKE_GENERATION_OFFSET + size_of::<u64>()..bytes.len()' <<<"$input_ring_snapshot_body" \
+    || ! grep -Fq 'fn write_control_words_to_header_bytes' <<<"$input_ring_atomic_production" \
+    || ! grep -Fq 'const fn shared_control_load_order() -> Ordering {' <<<"$host_input_ring_atomic_production" \
+    || ! grep -Fq 'const fn shared_control_publish_order() -> Ordering {' <<<"$host_input_ring_atomic_production" \
+    || ! grep -Fq 'AtomicU32::from_ptr' <<<"$host_input_ring_atomic_production" \
+    || ! grep -Fq 'AtomicU64::from_ptr' <<<"$host_input_ring_atomic_production" \
+    || ! grep -Fq 'word.store(value.to_le(), shared_control_publish_order());' <<<"$host_input_ring_atomic_production" \
+    || ! grep -Fq 'let wake_generation =' <<<"$host_input_ring_atomic_production" \
+    || ! grep -Fq 'fn write_control_words_to_input_header_bytes' <<<"$host_input_ring_atomic_production" \
+    || ! grep -Fq 'DVM_INPUT_RING_FLAGS_OFFSET + size_of::<u32>()..DVM_INPUT_RING_PRODUCER_OFFSET' <<<"$host_input_ring_snapshot_body" \
+    || ! grep -Fq 'DVM_INPUT_RING_CONSUMER_WAKE_GENERATION_OFFSET + size_of::<u64>()..bytes.len()' <<<"$host_input_ring_snapshot_body"; then
+    echo 'DVM input control words must use aligned acquire/release atomics, AcqRel flag updates, and immutable-only volatile header snapshots on both RustOS and L0' >&2
+    exit 1
+fi
+if [[ -z "$mmio_straddle_guard_line" || -z "$mmio_conflict_line" || -z "$mmio_registry_reserve_line" || -z "$mmio_direct_map_line" || -z "$mmio_window_map_line" ]] \
+    || (( mmio_straddle_guard_line >= mmio_conflict_line || mmio_conflict_line >= mmio_registry_reserve_line || mmio_registry_reserve_line >= mmio_direct_map_line || mmio_registry_reserve_line >= mmio_window_map_line )) \
+    || ! grep -Fq 'registry.mappings.iter().any(|mapping| {' <<<"$mmio_mapping_body" \
+    || ! grep -Fq 'left_start < right_end && right_start < left_end' kernel/io-manager/src/driver/mmio.rs \
+    || ! grep -Fq 'start < crate::memory::kernel_vm::DIRECT_MAP_PHYS_LIMIT' kernel/io-manager/src/driver/mmio.rs \
+    || ! grep -Fq 'end_exclusive > crate::memory::kernel_vm::DIRECT_MAP_PHYS_LIMIT' kernel/io-manager/src/driver/mmio.rs \
+    || [[ -z "$mmio_override_reserve_line" || -z "$mmio_direct_map_update_line" || "$mmio_override_reserve_line" -ge "$mmio_direct_map_update_line" ]] \
+    || ! grep -Fq 'new_pages.try_reserve(page_count).is_err()' <<<"$mmio_direct_override_body" \
+    || ! grep -Fq 'retained_indices.try_reserve(page_count).is_err()' <<<"$mmio_direct_override_body"; then
+    echo 'global physical overlap, direct-map-boundary, and reserve-before-PTE-mutation guards must fail before an alias or partial mapping can publish' >&2
+    exit 1
+fi
+if [[ "$raw_high_window_callers" != "kernel/mm/src/memory/kernel_vm.rs" ]] \
+    || [[ "$raw_direct_map_update_callers" != $'kernel/io-manager/src/driver/mmio.rs\nkernel/mm/src/memory/kernel_vm.rs\nkernel/mm/src/memory/paging.rs' ]] \
+    || [[ "$direct_map_cache_flag_callers" != $'kernel/io-manager/src/driver/mmio.rs\nkernel/mm/src/memory/kernel_vm.rs\nkernel/mm/src/memory/paging.rs' ]] \
+    || rg -q -F 'direct_map_flags_for_phys' kernel \
+    || ! grep -Fq 'if phys_addr < DIRECT_MAP_PHYS_LIMIT {' <<<"$high_window_mapping_body" \
+    || ! grep -Fq 'if size == 0 || end > DIRECT_MAP_PHYS_LIMIT {' <<<"$permanent_boot_mmio_body" \
+    || ! grep -Fq 'update_direct_map_range_flags_batched(' <<<"$permanent_boot_mmio_body" \
+    || ! grep -Fq 'crate::memory::paging::direct_map_cache_flags_for_phys(phys_page)' <<<"$mmio_direct_override_body" \
+    || ! grep -Fq 'if existing_mode != MmioCacheMode::SharedWriteBack && existing_mode != cache_mode {' <<<"$mmio_direct_override_body" \
+    || ! grep -Fq 'crate::driver::mmio::map_write_combining(phys_start, len).cast::<u8>();' <<<"$dvm_display_cache_source" \
+    || grep -Fq 'update_direct_map_range_flags' <<<"$dvm_display_cache_source" \
+    || [[ -z "$apic_permanent_map_line" || -z "$apic_configure_line" || -z "$apic_pic_line" ]] \
+    || (( apic_permanent_map_line >= apic_configure_line || apic_configure_line >= apic_pic_line )); then
+    echo 'direct-map cache aliases must use only the whitelisted owners: permanent APIC UC retyping precedes APIC/PIC use, high-window maps reject direct-map physical addresses, and display WC routes through io-manager' >&2
+    exit 1
+fi
+if ! grep -Fq 'let pat = unsafe { msr.read() };' <<<"$pat_initialize_body" \
+    || ! grep -Fq 'if !pat_initial_write_back_selector_is_admissible(pat) {' <<<"$pat_initialize_body" \
+    || ! grep -Fq 'return false;' <<<"$pat_initialize_body" \
+    || ! grep -Fq 'let expected = pat_with_kernel_cache_contract(pat);' <<<"$pat_initialize_body" \
+    || ! grep -Fq 'msr.write(expected);' <<<"$pat_initialize_body" \
+    || ! grep -Fq 'let observed = unsafe { msr.read() };' <<<"$pat_initialize_body" \
+    || ! grep -Fq 'pat_kernel_cache_contract_is_exact(expected, observed)' <<<"$pat_initialize_body" \
+    || ! grep -Fq 'const fn pat_initial_write_back_selector_is_admissible(pat: u64) -> bool {' <<<"$pat_contract_body" \
+    || ! grep -Fq 'pat_entry(pat, PAT_SLOT0_SHIFT) == PAT_WRITE_BACK' <<<"$pat_contract_body" \
+    || ! grep -Fq 'observed == expected' <<<"$pat_contract_body" \
+    || ! grep -Fq 'pat_entry(observed, PAT_SLOT0_SHIFT) == PAT_WRITE_BACK' <<<"$pat_contract_body" \
+    || ! grep -Fq 'pat_entry(observed, PAT_SLOT2_SHIFT) == PAT_UNCACHEABLE' <<<"$pat_contract_body" \
+    || ! grep -Fq 'pat_entry(observed, PAT_SLOT4_SHIFT) == PAT_WRITE_COMBINING' <<<"$pat_contract_body" \
+    || [[ -z "$ap_pat_init_line" || -z "$ap_online_parked_line" || -z "$ap_private_ready_line" ]] \
+    || (( ap_pat_init_line >= ap_online_parked_line || ap_pat_init_line >= ap_private_ready_line )); then
+    echo 'each AP must reject a non-WB initial PAT0, program PAT2=UC/PAT4=WC, and exactly read back the full PAT contract before OnlineParked or private readiness publication' >&2
+    exit 1
+fi
+
+# DVM block revoke is a terminal evidence boundary.  Keep its closed production
+# reason vocabulary, immutable pre-clear snapshot, and milestone ABI pinned to
+# the source even though the runtime reporter is excluded from unit-test cfg.
+if [[ "$dvm_revoke_reason_count" != 12 ]] \
+    || ! grep -Fq 'reason: DvmBlockRevokeReason,' <<<"$dvm_block_revoke_body" \
+    || ! grep -Fq 'generation: self.geometry.generation,' <<<"$dvm_block_revoke_body" \
+    || ! grep -Fq 'flags: load_u32(self.base, FLAGS_OFFSET, Ordering::Acquire),' <<<"$dvm_block_revoke_body" \
+    || ! grep -Fq 'expected_fixed_flags: self.geometry.flags & !DVM_BLOCK_FLAG_DVM_READY,' <<<"$dvm_block_revoke_body" \
+    || ! grep -Fq 'request_producer: load_u64(self.base, REQUEST_PRODUCER_OFFSET, Ordering::Acquire),' <<<"$dvm_block_revoke_body" \
+    || ! grep -Fq 'request_consumer: load_u64(self.base, REQUEST_CONSUMER_OFFSET, Ordering::Acquire),' <<<"$dvm_block_revoke_body" \
+    || ! grep -Fq 'completion_producer: load_u64(self.base, COMPLETION_PRODUCER_OFFSET, Ordering::Acquire),' <<<"$dvm_block_revoke_body" \
+    || ! grep -Fq 'completion_consumer: load_u64(self.base, COMPLETION_CONSUMER_OFFSET, Ordering::Acquire),' <<<"$dvm_block_revoke_body" \
+    || ! grep -Fq '"dvm-block-transport-revoked"' <<<"$dvm_block_revoke_report_body" \
+    || ! grep -Fq 'observation.reason as u64,' <<<"$dvm_block_revoke_report_body" \
+    || ! grep -Fq 'observation.generation,' <<<"$dvm_block_revoke_report_body" \
+    || ! grep -Fq 'DvmBlockOperation::Flush' <<<"$dvm_block_flush_read_body" \
+    || ! grep -Fq '.finish(flush)' <<<"$dvm_block_flush_read_body" \
+    || ! grep -Fq 'DvmBlockOperation::Read' <<<"$dvm_block_flush_read_body" \
+    || ! grep -Fq 'DVM_BLOCK_DATA_SLOT_BYTES' <<<"$dvm_block_flush_read_body" \
+    || ! grep -Fq 'assert!(!state.revoked);' <<<"$dvm_block_flush_read_body"; then
+    echo 'DVM block revoke must retain 12 production reasons, one pre-clear snapshot, the reason/generation milestone ABI, and valid FLUSH-to-first-64KiB-READ liveness' >&2
+    exit 1
+fi
+if [[ -z "$dvm_revoke_guard_line" || -z "$dvm_revoke_observation_line" || -z "$dvm_revoke_terminal_line" \
+    || -z "$dvm_revoke_observer_line" || -z "$dvm_revoke_pending_clear_line" || -z "$dvm_revoke_flags_clear_line" ]] \
+    || (( dvm_revoke_guard_line >= dvm_revoke_observation_line \
+        || dvm_revoke_observation_line >= dvm_revoke_terminal_line \
+        || dvm_revoke_terminal_line >= dvm_revoke_observer_line \
+        || dvm_revoke_observer_line >= dvm_revoke_pending_clear_line \
+        || dvm_revoke_pending_clear_line >= dvm_revoke_flags_clear_line )); then
+    echo 'DVM block revoke must reject a second report and snapshot before terminal clear' >&2
+    exit 1
+fi
+
+# Only the four closed qualification names may use qualification-local loss
+# counters.  Scheduler records stay one-attempt measurements, while the host
+# parser rejects any nonzero local evidence loss before accepting a workload.
+debug_qualification_class_failed=0
+for debug_qualification_name in smp-qualification-ready smp-qualification-start smp-qualification-finish smp-qualification-complete; do
+    grep -Fq "\"$debug_qualification_name\"" <<<"$debug_milestone_class_body" || debug_qualification_class_failed=1
+done
+if [[ "$debug_qualification_class_failed" != 0 ]] \
+    || ! grep -Fq 'MilestoneOutputClass::QualificationCritical' <<<"$debug_milestone_class_body" \
+    || ! grep -Fq '_ if name.starts_with("kernel-scheduler-") => MilestoneOutputClass::Measurement,' <<<"$debug_milestone_class_body" \
+    || ! grep -Fq '|| name == "dvm-block-transport-revoked"' <<<"$debug_milestone_class_body" \
+    || ! grep -Fq 'MilestoneOutputClass::Required' <<<"$debug_milestone_class_body" \
+    || ! grep -Fq 'MilestoneOutputClass::QualificationCritical => (' <<<"$debug_milestone_loss_snapshot_body" \
+    || ! grep -Fq 'qualification_milestones_dropped,' <<<"$debug_milestone_loss_snapshot_body" \
+    || ! grep -Fq 'qualification_discarded_bytes,' <<<"$debug_milestone_loss_snapshot_body" \
+    || ! grep -Fq 'milestones_dropped.fetch_add(1, Ordering::Relaxed);' <<<"$debug_milestone_drop_body" \
+    || ! grep -Fq 'qualification_milestones_dropped.fetch_add(1, Ordering::Relaxed);' <<<"$debug_milestone_drop_body" \
+    || ! grep -Fq 'qualification_discarded_bytes.fetch_add(discarded_bytes, Ordering::Relaxed);' <<<"$debug_milestone_drop_body" \
+    || ! rg -Fq 'event.milestones_dropped != 0' tools/xtask/src/kvm.rs \
+    || ! rg -Fq '|| event.debug_bytes_discarded != 0' tools/xtask/src/kvm.rs; then
+    echo 'qualification debug evidence must use its exact four classes, local fail-closed loss counters, a one-attempt scheduler measurement, Required DVM revoke, and parser loss rejection' >&2
+    exit 1
+fi
+
+if [[ -z "$join_line" || -z "$complete_line" || "$complete_line" -le "$join_line" ]] \
+    || [[ -z "$kvm_launch_capture_line" || -z "$kvm_bounded_input_relay_line" || -z "$kvm_guest_spawn_line" || -z "$kvm_boot_started_line" || -z "$kvm_deadline_line" ]] \
+    || [[ "$kvm_launch_capture_line" -ge "$kvm_bounded_input_relay_line" || "$kvm_bounded_input_relay_line" -ge "$kvm_guest_spawn_line" || "$kvm_guest_spawn_line" -ge "$kvm_boot_started_line" || "$kvm_boot_started_line" -ge "$kvm_deadline_line" ]] \
+    || grep -Fq 'start_dvm_input_relay(' <<<"$kvm_precapture_body" \
+    || grep -Fq 'start_dvm_input_relay_unbounded(' <<<"$kvm_smoke_body" \
+    || ! grep -Fq 'start_dvm_input_relay_unbounded(' <<<"$kvm_interactive_body" \
+    || ! rg -Fq 'atomic_load_explicit(&shared.completed_workers, memory_order_acquire) != shared.config.workers' apps/smpqual/smpqual.c \
+    || ! rg -Fq 'private_smp_qualification:' services/runtimed/src/main.rs \
+    || ! rg -Fq 'private_smp_qualification: Some(contract)' services/runtimed/src/kvm_smp_qualification.rs \
+    || ! rg -Fq 'Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None)' services/runtimed/src/kvm_smp_qualification.rs \
+    || ! rg -Fq 'Err(error) => Err(stable_snapshot_errno(error)),' services/runtimed/src/kvm_smp_qualification.rs \
+    || ! rg -Fq 'map_err(|_| libc::EINVAL),' services/runtimed/src/kvm_smp_qualification.rs \
+    || ! rg -Fq 'if policy_catalog_load_due(state.launch_catalog_loaded)' services/runtimed/src/main.rs \
+    || rg -Fq 'state.ui_ready && policy_catalog_load_due' services/runtimed/src/main.rs \
+    || grep -Fq 'load_kvm_smp_qualification_contract()' <<<"$ordinary_catalog_body" \
+    || ! grep -Fq 'if !state.launch_catalog_loaded || state.qualification_catalog_resolved {' <<<"$qualification_reconcile_body" \
+    || ! grep -Fq 'Err(errno) => return defer_qualification_catalog_retry(state, errno),' <<<"$qualification_reconcile_body" \
+    || ! grep -Fq 'state.launch_entries = candidate;' <<<"$qualification_reconcile_body" \
+    || ! grep -Fq 'let contract = contract?;' <<<"$qualification_candidate_body" \
+    || ! rg -Fq 'super::STORAGE_NOT_READY_RETRY_BACKOFF' services/runtimed/src/catalog.rs \
+    || ! rg -Fq '.min(super::MAX_LAUNCH_RETRY_BACKOFF)' services/runtimed/src/catalog.rs \
+    || ! rg -Fq 'if endpoint == 0 || endpoint == -(ENOENT as i64) {' services/vfsd/src/lib.rs \
+    || ! rg -Fq '        EAGAIN' services/vfsd/src/lib.rs \
+    || [[ "$(rg -F -c 'let errno = storage_service_lookup_errno(endpoint);' services/vfsd/src/block.rs)" != 2 ]] \
+    || ! rg -Fq '    "apps/smpqual/smpqual.elf",' tools/xtask/src/stage/mod.rs \
+    || ! rg -Fq 'entry.exec == UI_SERVER_EXEC_PATH' services/runtimed/src/socket.rs \
+    || ! rg -Fq 'super::kvm_smp_qualification::qualification_contract_for_launch(entry)' services/runtimed/src/socket.rs \
+    || ! rg -Fq 'Ok(Some(_))' services/runtimed/src/socket.rs \
+    || rg -Fq 'entry.private_smp_qualification.is_some()' services/runtimed/src/socket.rs \
+    || ! rg -Fq 'if !state.ui_ready && !may_precede_ui_ready' services/runtimed/src/socket.rs \
+    || ! rg -Fq 'bind_then_activate_spawned_process(' services/runtimed/src/spawn.rs \
+    || ! rg -Fq 'retire_failed_spawn_or_abort(pid, stage.cleanup_stage())' services/runtimed/src/spawn.rs \
+    || ! grep -Fq 'smp_qualification_bind_shape_valid(&args)' <<<"$smp_bind_body" \
+    || ! grep -Fq 'live_user_process_identity_with_exact_exec_path(' <<<"$smp_bind_body" \
+    || ! grep -Fq 'live_sessiond_endpoint_matches(owner_identity, endpoint_epoch)' <<<"$smp_bind_body" \
+    || ! grep -Fq 'with_deferred_activation_authority_for_smp_bind(' <<<"$smp_bind_body" \
+    || ! grep -Fq 'if !qualification_required' <<<"$smp_activation_body" \
+    || ! grep -Fq 'published_service_endpoint_owner_and_epoch(IPC_SERVICE_SESSIOND)' <<<"$smp_activation_body" \
+    || grep -Fq 'live_user_process_identity_by_pid' <<<"$smp_activation_body" \
+    || ! grep -Fq 'let now_tick = crate::arch::rtc::ticks();' <<<"$smp_activation_body" \
+    || ! grep -Fq 'binding.activate(owner, endpoint_epoch, target, now_tick, ticks_per_second)?;' <<<"$smp_activation_body" \
+    || ! grep -Fq 'let now_tick = crate::arch::rtc::ticks();' <<<"$smp_phase_body" \
+    || ! grep -Fq 'binding.admit_phase(' <<<"$smp_phase_body" \
+    || ! grep -Fq 'terminalize_binding_after_endpoint_revalidation(binding_id, target);' <<<"$smp_phase_body" \
+    || ! grep -Fq 'authority.qualification_required,' <<<"$proc_activate_body" \
+    || ! grep -Fq 'activate_suspended_user_tasks_with_commit(' <<<"$proc_activate_body" \
+    || ! rg -Fq 'const fn deferred_authority_is_batch_eligible(qualification_required: bool) -> bool' kernel/compat/src/user/syscall/linux/proc_broker_ops/activation_batch.rs \
+    || ! rg -Fq '&& deferred_authority_is_batch_eligible(qualification_required)' kernel/compat/src/user/syscall/linux/proc_broker_ops/activation_batch.rs \
+    || ! rg -Fq 'let mut exact_targets = [None; LOADER_ACTIVATE_BATCH_MAX_TARGETS];' kernel/compat/src/user/syscall/linux/proc_broker_ops/activation_batch.rs \
+    || ! rg -Fq 'deferred_authority_matches_exact_batch_request(' kernel/compat/src/user/syscall/linux/proc_broker_ops/activation_batch.rs \
+    || ! rg -Fq 'assert_eq!(authority.target, exact_target);' kernel/compat/src/user/syscall/linux/proc_broker_ops/activation_batch.rs \
+    || ! rg -Fq 'revoke_smp_qualification_for_process(process_id);' kernel/compat/src/user/syscall/linux/proc_broker_ops.rs \
+    || ! rg -Fq 'admit_smp_qualification_milestone(milestone, arg0, arg1, current_cpu)' kernel/compat/src/user/syscall/linux/debug_ops.rs \
+    || ! rg -Fq 'debug::write_user_bytes_serialized(&chunk[..chunk_len]);' kernel/compat/src/user/syscall/linux/debug_ops.rs \
+    || rg -Fq 'debug::write_bytes(&chunk[..chunk_len]);' kernel/compat/src/user/syscall/linux/debug_ops.rs \
+    || ! rg -Fq 'crate::debug::write_user_bytes_serialized(&chunk[..chunk_len]);' kernel/compat/src/user/sysops/console.rs \
+    || rg -Fq 'crate::debug::write_bytes(&chunk[..chunk_len]);' kernel/compat/src/user/sysops/console.rs \
+    || rg -q 'fn write_bytes' kernel/nucleus-core/src/debug/mod.rs \
+    || ! rg -Fq 'let expected_events = usize::from(workers) * 3 + 1;' tools/xtask/src/kvm.rs \
+    || ! rg -Fq 'SMP Ring3 qualification requires one terminal completion record' tools/xtask/src/kvm.rs \
+    || ! rg -Fq 'schema: "rustos-kvm-smp-correctness-evidence-v6"' tools/xtask/src/kvm/evidence.rs \
+    || ! rg -Fq 'predecessor_schema: "rustos-kvm-smp-correctness-evidence-v5"' tools/xtask/src/kvm/evidence.rs \
+    || ! rg -Fq 'smp_evidence_cohort: snapshot.run.cohort.clone()' tools/xtask/src/kvm/evidence.rs \
+    || ! rg -Fq -- '--smp-ring3-qualification requires --smp-evidence-cohort' tools/xtask/src/kvm/options.rs \
+    || ! grep -Fq 'options.dvm_block_shmem = true;' <<<"$smp_ring3_option_body" \
+    || ! grep -Fq '"file={},format=raw,if=none,id=dvm-storage-disk,cache=none,aio=threads,readonly=on",' <<<"$dvm_virtual_storage_body" \
+    || ! grep -Fq 'ide-cd,drive=dvm-storage-disk,bus=ide.0,unit=0,id=dvm-storage-disk-device' <<<"$dvm_virtual_storage_body" \
+    || grep -Fq 'ide-hd,drive=dvm-storage-disk' <<<"$dvm_virtual_storage_body" \
+    || grep -Eq 'logical_block_size|physical_block_size' <<<"$dvm_virtual_storage_body" \
+    || ! rg -Fq 'const DVM_BLOCK_MEDIA_BLOCK_BYTES: u32 = 2048;' tools/xtask/src/kvm.rs \
+    || ! rg -Fq 'const DVM_BLOCK_MEDIA_FEATURES: u64 = DVM_BLOCK_FEATURE_FLUSH;' tools/xtask/src/kvm.rs \
+    || ! rg -Fxq 'CONFIG_BLK_DEV_SR=y' driver-domains/linux/board/linux.fragment \
+    || ! rg -Fq 'grep -qx "${1}=y" "$config"' driver-domains/linux/scripts/verify-kernel-config.sh \
+    || ! rg -Fxq 'require_builtin CONFIG_BLK_DEV_SR' driver-domains/linux/scripts/verify-kernel-config.sh \
+    || ! rg -Fq 'built-in sr owns the immutable ATAPI' driver-domains/linux/board/overlay/etc/init.d/S12rustos-dvm-block \
+    || ! rg -Fq 'Signed sd_mod owns writable disk' driver-domains/linux/board/overlay/etc/init.d/S12rustos-dvm-block \
+    || rg -Fq 'modprobe sr_mod' driver-domains/linux/board/overlay/etc/init.d/S12rustos-dvm-block \
+    || [[ -z "$dvm_snapshot_file_open_line" || -z "$dvm_snapshot_first_sync_line" || -z "$dvm_snapshot_directory_open_line" || -z "$dvm_snapshot_last_sync_line" ]] \
+    || [[ "$dvm_snapshot_file_open_line" -ge "$dvm_snapshot_first_sync_line" || "$dvm_snapshot_first_sync_line" -ge "$dvm_snapshot_directory_open_line" || "$dvm_snapshot_directory_open_line" -ge "$dvm_snapshot_last_sync_line" ]] \
+    || [[ "$(grep -F -c '.sync_all()' <<<"$dvm_snapshot_sync_body")" != 2 ]] \
+    || [[ -z "$dvm_snapshot_copy_line" || -z "$dvm_snapshot_permissions_line" || -z "$dvm_snapshot_sync_call_line" || -z "$dvm_snapshot_aperture_line" ]] \
+    || [[ "$dvm_snapshot_copy_line" -ge "$dvm_snapshot_permissions_line" || "$dvm_snapshot_permissions_line" -ge "$dvm_snapshot_sync_call_line" || "$dvm_snapshot_sync_call_line" -ge "$dvm_snapshot_aperture_line" ]] \
+    || ! grep -Fq 'header.flags = DVM_BLOCK_FLAG_READ_ONLY;' <<<"$dvm_read_only_header_body" \
+    || ! grep -Fq 'dvm_read_only_block_header(' <<<"$dvm_block_create_body" \
+    || ! grep -Fq 'disk_bytes.is_multiple_of(u64::from(DVM_BLOCK_MEDIA_BLOCK_BYTES))' <<<"$dvm_block_create_body" \
+    || [[ "$(grep -F -c 'DVM_BLOCK_MEDIA_BLOCK_BYTES,' <<<"$dvm_block_create_body")" != 2 ]] \
+    || ! grep -Fq 'predecessor.flags & DVM_BLOCK_FLAG_READ_ONLY == 0' <<<"$dvm_block_rotate_body" \
+    || ! grep -Fq 'dvm_read_only_block_header(' <<<"$dvm_block_rotate_body" \
+    || ! rg -Fq 'let ready = DVM_BLOCK_FLAG_RUSTOS_READY | DVM_BLOCK_FLAG_DVM_READY | DVM_BLOCK_FLAG_READ_ONLY;' tools/xtask/src/kvm/layout.rs \
+    || ! grep -Fq 'header.flags & ready == ready && header.generation == expected_generation' <<<"$dvm_ready_generation_body" \
+    || ! grep -Fq 'let successor_block_generation = if self.options.dvm_block_shmem {' <<<"$dvm_recovery_harness_body" \
+    || ! grep -Fq 'rotate_dvm_block_epoch(aperture, disk, &self.config.storage_epoch_signing_key)' <<<"$dvm_recovery_harness_body" \
+    || ! grep -Fq 'successor_block_generation,' <<<"$dvm_recovery_harness_body" \
+    || ! grep -Fq 'expected_block_generation: Option<u64>,' <<<"$dvm_restart_recovery_body" \
+    || ! grep -Fq 'rustos_log.contains("dvm-block: signed transport epoch rebound generation=")' <<<"$dvm_restart_recovery_body" \
+    || ! grep -Fq 'verify_dvm_block_ready_generation(layout, generation).is_ok()' <<<"$dvm_restart_recovery_body" \
+    || ! grep -Fq 'disk_bytes.is_multiple_of(u64::from(DVM_BLOCK_MEDIA_BLOCK_BYTES))' <<<"$dvm_block_ready_body" \
+    || ! grep -Fq 'header.logical_block_size != DVM_BLOCK_MEDIA_BLOCK_BYTES' <<<"$dvm_block_ready_body" \
+    || ! grep -Fq 'header.physical_block_size != DVM_BLOCK_MEDIA_BLOCK_BYTES' <<<"$dvm_block_ready_body" \
+    || ! rg -Fq 'ioctl(device->fd, BLKROGET, &read_only) != 0' driver-domains/linux/package/rustos-dvm-block/src/rustos-dvm-block.c \
+    || ! rg -Fq 'device->read_only !=' driver-domains/linux/package/rustos-dvm-block/src/rustos-dvm-block.c \
+    || ! rg -Fq '((header->flags & DVM_BLOCK_FLAG_READ_ONLY) != 0U) ||' driver-domains/linux/package/rustos-dvm-block/src/rustos-dvm-block.c \
+    || ! rg -Fq 'errno = EPROTO;' driver-domains/linux/package/rustos-dvm-block/src/rustos-dvm-block.c \
+    || ! rg -Fq 'storaged: dvm-block e2e media barrier completed generation=' services/storaged/src/main.rs \
+    || ! rg -Fq 'path=vfs-policy->block-broker->shared-ring->linux-dvm->media-barrier' services/storaged/src/main.rs \
+    || ! rg -Fq 'let rustos_runtime_image = binary_artifact(&config.root_dir, &layout.runtime_disk)?;' tools/xtask/src/kvm/evidence/smp_qualification.rs \
+    || ! rg -Fq 'dvm_attached_block_disk: Option<KvmSuccessArtifact>,' tools/xtask/src/kvm/evidence/smp_qualification.rs \
+    || ! rg -Fq 'smpqual_early_system_executable: Option<KvmSuccessArtifact>,' tools/xtask/src/kvm/evidence/smp_qualification.rs \
+    || ! rg -Fq 'let dvm_attached_block_disk = capture_dvm_attached_block_disk(' tools/xtask/src/kvm/evidence/smp_qualification.rs \
+    || ! rg -Fq 'then(|| capture_smpqual_early_system_executable(&layout.runtime_disk))' tools/xtask/src/kvm/evidence/smp_qualification.rs \
+    || ! rg -Fq 'path: "system/boot/early-system.img#apps/smpqual/smpqual.elf".to_owned(),' tools/xtask/src/kvm/evidence/smp_qualification.rs \
+    || ! rg -Fq 'verify_prelaunch_snapshot(&archive.root, snapshot)?' tools/xtask/src/kvm/evidence/smp_qualification.rs \
+    || ! rg -Fq 'verify_dvm_attached_block_disk_matches_runtime(snapshot)?;' tools/xtask/src/kvm/evidence/smp_qualification.rs \
+    || ! rg -Fq 'let observed = capture_smpqual_early_system_executable(&runtime_disk)?;' tools/xtask/src/kvm/evidence/smp_qualification.rs \
+    || ! rg -Fq 'fs::hard_link(&self.temporary_path, &self.final_path)' tools/xtask/src/kvm/evidence/smp_qualification.rs; then
+    echo 'SMP Ring3 qualification source no longer preserves UI-independent private injection, the closed pre-UI exception, bind-before-activate cleanup, generation-bound kernel FSM admission, escaped user debug, join-before-complete, 3N+1 evidence, v6 pre-spawn DVM and early-system executable attestations, durable snapshot-before-signing order, QEMU readonly ATAPI/header/Linux-relay agreement with built-in sr at exact 2048-byte FLUSH-only media geometry, exact media-barrier authority path, exact successor-generation recovery, publication-time drift rejection, or non-overwriting archive publication' >&2
+    exit 1
+fi
+
+# A terminal reply crosses the global scheduler catalog exactly once.  That
+# transaction revokes donation, wakes the exact task, and mints one opaque
+# owner-generation token; publication happens only after the catalog guard is
+# gone, and selection revalidates the same custody with no generic fallback.
+reply_current_body="$(sed -n '/^pub fn complete_ipc_reply_wake_handoff(/,/^pub fn release_ipc_priorities_for_process/p' kernel/ps/src/multitask/current.rs)"
+reply_scheduler_body="$(sed -n '/^    pub(super) fn complete_ipc_reply_wake_handoff(/,/^    fn wake_task_slot/p' kernel/ps/src/multitask/scheduler.rs)"
+reply_enqueue_body="$(sed -n '/^fn enqueue_reply_wake_after_catalog(/,/^pub(super) fn enqueue_reply_wake/p' kernel/ps/src/multitask/scheduler/sync_handoff.rs)"
+reply_selection_body="$(sed -n '/^    fn synchronous_handoff_record_is_ready(/,/^    pub(super) fn take_next_synchronous_pick_hint_ready_slot/p' kernel/ps/src/multitask/scheduler/handoffs.rs)"
+plain_reply_body="$(sed -n '/^pub(super) fn syscall_linux_rustos_ipc_reply(/,/^pub(super) fn syscall_linux_rustos_ipc_call_with_handles/p' kernel/compat/src/user/syscall/linux/ipc_ops.rs)"
+handle_reply_body="$(sed -n '/^pub(super) fn syscall_linux_rustos_ipc_reply_with_handles/,/^pub(super) fn call_linux_syscall_endpoint/p' kernel/compat/src/user/syscall/linux/ipc_ops.rs)"
+reply_recv_body="$(sed -n '/^pub(super) fn syscall_linux_rustos_ipc_reply_recv_with_sender/,$p' kernel/compat/src/user/syscall/linux/ipc_reply_recv.rs)"
+if ! grep -Fq 'scheduler_mut().complete_ipc_reply_wake_handoff(reply, task_id)' <<<"$reply_current_body" \
+    || ! grep -Fq 'token.is_some_and(super::scheduler::enqueue_reply_wake_handoff)' <<<"$reply_current_body" \
+    || ! grep -Fq 'let _ = self.release_ipc_priority(reply);' <<<"$reply_scheduler_body" \
+    || ! grep -Fq 'if !self.wake_task_slot(slot)' <<<"$reply_scheduler_body" \
+    || ! grep -Fq 'ReplyWakeHandoff::from_owner(slot, task_id, owner)' <<<"$reply_scheduler_body" \
+    || ! grep -Fq 'if !owner_still_matches(token)' <<<"$reply_enqueue_body" \
+    || ! grep -Fq 'owner_still_matches(token) && retained' <<<"$reply_enqueue_body" \
+    || ! grep -Fq 'record.has_current_dispatch_custody()' <<<"$reply_selection_body" \
+    || ! grep -Fq 'self.pick_hint_candidate_slot(Some(record.slot())).is_some()' <<<"$reply_selection_body" \
+    || ! grep -Fq 'multitask::complete_ipc_reply_wake_handoff(reply, task_id)' <<<"$plain_reply_body" \
+    || ! grep -Fq 'multitask::complete_ipc_reply_wake_handoff(args.reply_cap, task_id)' <<<"$handle_reply_body" \
+    || ! grep -Fq 'multitask::complete_ipc_reply_wake_handoff(args.reply_cap, caller_task_id)' <<<"$reply_recv_body" \
+    || grep -Eq 'release_ipc_priority|wake_task|set_next_synchronous_pick_hint' <<<"$plain_reply_body" \
+    || grep -Eq 'release_ipc_priority|wake_task|set_next_synchronous_pick_hint' <<<"$handle_reply_body" \
+    || grep -Eq 'release_ipc_priority|wake_task|set_next_synchronous_pick_hint' <<<"$reply_recv_body"; then
+    echo 'terminal IPC replies must retain one exact post-catalog per-CPU handoff token without legacy fallback' >&2
     exit 1
 fi
 
@@ -402,14 +846,22 @@ dvm-control-endpoint/DvmControlEndpoint|rustos-driver-domain-host|tests::control
 dvm-block-transport/DvmBlockTransport|kernel-io-manager|io::dvm_block::tests::request_and_completion_bind_exact_slot_epoch_and_durability
 dvm-block-transport/DvmBlockTransport|kernel-io-manager|io::dvm_block::tests::stale_completion_revokes_the_transport
 dvm-block-transport/DvmBlockTransport|kernel-io-manager|io::dvm_block::tests::revoked_transport_accepts_only_a_signed_newer_epoch
+dvm-block-transport/DvmBlockTransport|kernel-io-manager|io::dvm_block::tests::revoke_reports_once_before_clearing_and_is_terminal
+dvm-block-transport/DvmBlockTransport|kernel-io-manager|io::dvm_block::tests::valid_flush_completion_keeps_transport_live_for_first_64kib_read
+dvm-block-transport/DvmBlockTransport|xtask|kvm::tests::dvm_block_recovery_readiness_tracks_the_exact_successor_generation
+dvm-block-transport/DvmBlockTransport|xtask|kvm::tests::dvm_attached_block_disk_requires_qemu_read_only_backing
+dvm-block-transport/DvmBlockTransport|xtask|kvm::tests::dvm_block_read_only_media_driver_closure_is_explicit
+dvm-block-transport/DvmBlockTransport|xtask|kvm::tests::dvm_block_read_only_media_geometry_matches_atapi_capacity
 dvm-block-startup/DvmBlockStartup|kernel-io-manager|io::dvm_block::tests::startup_not_ready_is_sleepable_not_a_fault_event
 dvm-block-startup/DvmBlockStartup|kernel-io-manager|io::dvm_block::tests::fixed_nonblock_ivshmem_topology_is_negative_cached_only_after_enumeration
 dvm-block-startup/DvmBlockStartup|kernel-io-manager|io::dvm_block::tests::readiness_may_arrive_once_but_cannot_be_withdrawn
 dvm-block-startup/DvmBlockStartup|kernel-io-manager|io::dvm_block::tests::readiness_publication_is_conditional_and_non_mutating_on_mismatch
+dvm-block-startup/DvmBlockStartup|kernel-io-manager|io::dvm_block::tests::revoke_reports_once_before_clearing_and_is_terminal
 dvm-block-startup/DvmBlockStartup|storaged|block::tests::startup_wait_slice_is_bounded_and_nonzero
 dvm-block-startup/DvmBlockStartup|storaged|block::tests::generation_mismatch_is_stale_not_a_fallback
 dvm-block-startup/DvmBlockStartup|storaged|tests::dvm_block_e2e_marker_names_the_complete_authority_path
 deferred-process-activation/DeferredProcessActivation|kernel-compat|user::syscall::linux::proc_broker_ops::tests::deferred_activation_authority_is_exact_one_shot_and_nontransferable
+deferred-process-activation/DeferredProcessActivation|kernel-compat|user::syscall::linux::proc_broker_ops::tests::single_activation_resolves_claimed_requester_identity_not_loaderd_context
 loader-request-authority/LoaderRequestAuthority|rustos-user-abi|syscall::syscall_tests::privileged_loader_operations_have_an_explicit_service_role_matrix
 loader-request-authority/LoaderRequestAuthority|initd|tests::init_identity_is_published_before_any_loader_request_and_is_marked_requestless
 loader-request-authority/LoaderRequestAuthority|kernel-compat|user::syscall::linux::proc_broker_ops::tests::loader_commit_revalidates_live_requester_role_before_consuming_authority
@@ -451,6 +903,7 @@ scheduler-cpu-ownership/SchedulerCpuOwnership|kernel-hal|interrupt_stubs::tests:
 scheduler-cpu-ownership/SchedulerCpuOwnership|kernel-ps|multitask::cpu_local::tests::current_task_ownership_ignores_offline_slots_and_is_cpu_distinct
 scheduler-cpu-ownership/SchedulerCpuOwnership|kernel-ps|multitask::irq::tests::reschedule_ipi_gate_retains_locked_work_and_dispatches_only_at_safe_point
 scheduler-cpu-ownership/SchedulerCpuOwnership|kernel-ps|multitask::scheduler::tests::architectural_restore_is_required_exactly_for_a_task_switch
+scheduler-cpu-ownership/SchedulerCpuOwnership|kernel-ps|multitask::scheduler::tests::wake_transition_publishes_one_owner_before_commit_and_claims_once_after
 scheduler-cpu-ownership/SchedulerCpuOwnership|kernel-ps|multitask::scheduler::smp::tests::remote_or_transition_owned_task_is_not_schedulable
 scheduler-cpu-ownership/SchedulerCpuOwnership|nucleus-core|util::lockdep::tests::tracked_guard_release_requires_same_cpu_apic_and_positive_depth
 scheduler-cpu-ownership/SchedulerCpuOwnership|nucleus-core|util::lockdep::tests::pending_acquire_units_cannot_consume_a_held_guard_pin
@@ -492,11 +945,23 @@ scheduler-cpu-distribution/SchedulerCpuDistribution|kernel-ps|multitask::schedul
 scheduler-cpu-distribution/SchedulerCpuDistribution|kernel-ps|multitask::irq::tests::syscall_tail_consumes_every_deferred_or_handoff_request_exactly_once
 scheduler-cpu-distribution/SchedulerCpuDistribution|kernel-ps|multitask::scheduler::runtime_profile::tests::runtime_profile_distinguishes_switches_roots_and_migrations
 scheduler-cpu-distribution/SchedulerCpuDistribution|kernel-ps|multitask::scheduler::runtime_profile::tests::runtime_profile_lock_totals_and_maxima_are_destructive
+scheduler-active-balance/SchedulerActiveBalance|kernel-ps|multitask::scheduler::runqueue_policy::tests::active_balance_is_due_first_then_every_eighth_loaded_opportunity
+scheduler-active-balance/SchedulerActiveBalance|kernel-ps|multitask::scheduler::smp::tests::source_migration_requires_exact_runnable_local_owner_and_target_affinity
 scheduler-thread-demotion/SchedulerThreadDemotion|kernel-ps|multitask::scheduler::tests::self_demotion_removes_base_system_class_and_caps_fair_weight
 scheduler-thread-demotion/SchedulerThreadDemotion|vfsd|tests::ui_bootstrap_demotion_requires_successful_terminal_snapshot_reply
 scheduler-thread-demotion/SchedulerThreadDemotion|loaderd|tests::ui_bootstrap_demotion_is_custodied_until_terminal_reply
 scheduler-thread-demotion/SchedulerThreadDemotion|uiserver|sys::tests::only_bootstrap_gpu_role_retains_inherited_boot_class
 synchronous-ipc-handoff/SynchronousIpcHandoff|kernel-ps|multitask::scheduler::synchronous_handoff_tests::synchronous_ipc_handoff_is_fifo_deduplicated_and_fairness_bounded
+synchronous-ipc-handoff/SynchronousIpcHandoff|kernel-ps|multitask::scheduler::synchronous_handoff_tests::reply_wake_token_mint_requires_exact_task_and_dispatch_custody
+synchronous-ipc-handoff/SynchronousIpcHandoff|kernel-ps|multitask::scheduler::synchronous_handoff_tests::terminal_reply_releases_donation_and_wakes_exact_caller_in_one_scheduler_operation
+synchronous-ipc-handoff/SynchronousIpcHandoff|kernel-ps|multitask::scheduler::sync_handoff::tests::reply_wake_token_rejects_stale_owner_generation_migration_and_retirement
+synchronous-ipc-handoff/SynchronousIpcHandoff|kernel-ps|multitask::scheduler::sync_handoff::tests::reply_generation_refresh_replaces_in_place_and_stale_generation_loses_urgency
+synchronous-ipc-handoff/SynchronousIpcHandoff|kernel-ps|multitask::scheduler::sync_handoff::tests::generic_handoff_cannot_downgrade_reply_generation_custody
+synchronous-ipc-handoff/SynchronousIpcHandoff|kernel-ps|multitask::scheduler::sync_handoff::tests::stale_reply_enqueue_has_no_scheduler_or_global_fallback
+synchronous-ipc-handoff/SynchronousIpcHandoff|kernel-ps|multitask::scheduler::sync_handoff::tests::reply_enqueue_rechecks_owner_after_the_exact_target_queue_mutation
+synchronous-ipc-handoff-concurrency/SynchronousIpcHandoffConcurrency|kernel-ps|multitask::scheduler::sync_handoff::tests::reply_wake_token_rejects_stale_owner_generation_migration_and_retirement
+synchronous-ipc-handoff-concurrency/SynchronousIpcHandoffConcurrency|kernel-ps|multitask::scheduler::sync_handoff::tests::stale_reply_enqueue_has_no_scheduler_or_global_fallback
+synchronous-ipc-handoff-concurrency/SynchronousIpcHandoffConcurrency|kernel-ps|multitask::scheduler::sync_handoff::tests::reply_enqueue_rechecks_owner_after_the_exact_target_queue_mutation
 ipc-priority-inheritance/IpcPriorityInheritance|kernel-ps|multitask::scheduler::tests::synchronous_ipc_donation_promotes_and_revokes_a_transitive_user_chain
 ipc-priority-queue/IpcPriorityQueue|kernel-ipc-runtime|ipc::tests::receiver_waiter_tests::endpoint_system_calls_bypass_backlog_without_starving_ordinary_lane
 pci-bar-discovery/PciBarDiscovery|kernel-hal|arch::pci::tests::mem64_bar_size_uses_the_lowest_implemented_mask_bit
@@ -625,6 +1090,8 @@ userspace-wait-set/UserspaceWaitSet|vfsd|tests::epoll_membership_binds_open_desc
 userspace-wait-set/UserspaceWaitSet|vfsd|tests::epoll_registry_has_one_service_lifetime_until_final_retire
 userspace-wait-set/UserspaceWaitSet|vfsd|tests::epoll_snapshot_rotates_a_persistently_ready_prefix
 userspace-wait-set/UserspaceWaitSet|vfsd|tests::provider_restart_updates_epoch_without_duplicating_registration_identity
+userspace-wait-set/WaitSetRegistry|vfsd|tests::epoll_object_cap_admits_the_boundary_and_rejects_one_more_unchanged
+userspace-wait-set/WaitSetRegistry|vfsd|tests::checkpoint_restore_over_capacity_is_atomic
 userspace-wait-set/UserspaceWaitSet|uiserver|wayland::tests::wayland_readiness_requires_one_dispatch_before_rearm
 userspace-wait-set/UserspaceWaitSet|uiserver|wayland::tests::wayland_readiness_retries_only_transient_transport_failures
 userspace-wait-set/UserspaceWaitSet|uiserver|wayland_accept::tests::wayland_accept_uses_blocking_readiness_not_probe_cadence
@@ -634,7 +1101,9 @@ userspace-wait-set/UserspaceWaitSet|runtimed|session::tests::console_readiness_g
 userspace-wait-set/UserspaceWaitSet|runtimed|session::tests::console_close_revokes_readiness_without_resurrecting_the_session
 netd-deferred-reply/NetdDeferredReply|netd|local_socket_poll_tests::pending_slot_reservation_is_global_and_bounded
 netd-deferred-reply/NetdDeferredReply|netd|local_socket_poll_tests::poisoned_deferred_queue_is_drained_for_fail_closed_replies
-netd-deferred-reply/NetdDeferredReply|netd|local_socket_poll_tests::local_poll_wait_budget_matches_readiness_service_cap
+netd-deferred-reply/NetdDeferredReply|netd|local_socket_poll_tests::admission_clamps_each_operation_class_once_without_freshening
+netd-deferred-reply/NetdDeferredReply|netd|local_socket_poll_tests::expired_work_is_rejected_before_any_queue_reservation
+netd-deferred-reply/NetdDeferredReply|netd|local_socket_poll_tests::expired_detached_local_poll_replies_and_releases_exactly_once
 ipc-handle-transfer/IpcHandleTransfer|kernel-ps|user::handles::transfer_registry::transfer_registry_tests::cancelled_transfer_moves_its_open_description_to_deferred_cleanup
 ipc-handle-transfer/IpcHandleTransfer|kernel-ps|user::handles::transfer_registry::transfer_registry_tests::opaque_transfer_ticket_is_exact_one_shot_and_nonce_bound
 ipc-transfer-authority/IpcTransferAuthority|kernel-ps|user::handles::transfer_registry::transfer_registry_tests::opaque_transfer_ticket_is_exact_one_shot_and_nonce_bound
@@ -698,6 +1167,7 @@ bootstrap-activation-handoff/BootstrapActivationHandoff|kernel-ps|multitask::sch
 atomic-process-activation-batch/AtomicProcessActivationBatch|initd|activation::tests::activation_batch_is_exact_bounded_and_zero_tailed
 atomic-process-activation-batch/AtomicProcessActivationBatch|rustos-user-abi|syscall::activation_batch::tests::requester_identity_is_bound_to_the_kernel_sender
 atomic-process-activation-batch/AtomicProcessActivationBatch|kernel-compat|user::syscall::linux::proc_broker_ops::activation_batch::tests::activation_batch_keeps_preflight_and_commit_under_registry_lock
+atomic-process-activation-batch/AtomicProcessActivationBatch|kernel-compat|user::syscall::linux::proc_broker_ops::activation_batch::tests::exact_batch_authority_rejects_pid_equal_generation_or_mm_replacement
 atomic-process-activation-batch/AtomicProcessActivationBatch|kernel-compat|user::syscall::linux::proc_broker_ops::tests::deferred_activation_authority_is_exact_one_shot_and_nontransferable
 atomic-process-activation-batch/AtomicProcessActivationBatch|kernel-ps|multitask::scheduler::activation_batch_tests::spawn_handoff_is_fifo_deduplicated_and_precedes_ipc_handoff
 atomic-process-activation-batch/AtomicProcessActivationBatch|kernel-ps|multitask::scheduler::activation_batch_tests::authority_commit_is_checked_while_the_complete_cohort_is_still_suspended
@@ -739,6 +1209,14 @@ ipc-reply-deadline/IpcReplyDeadline|rootd|control_drain::tests::root_control_dra
 ipc-reply-deadline/IpcReplyDeadline|runtimed|tests::session_control_drain_services_a_bounded_ready_burst
 ipc-reply-deadline/IpcReplyDeadline|kernel-compat|user::syscall::linux::ipc_ops::tests::public_ipc_calls_share_the_finite_service_deadline
 ipc-reply-deadline/IpcReplyDeadline|kernel-compat|user::syscall::linux::ipc_ops::tests::stable_service_endpoint_snapshot_rejects_revoked_owners
+ipc-reply-deadline/IpcReplyDeadline|kernel-ipc-runtime|ipc::tests::prepared_reply_bind_rejects_foreign_and_duplicate_owner_without_mutation
+ipc-reply-deadline/IpcReplyDeadline|kernel-ipc-runtime|ipc::tests::cancelling_before_reply_returns_prepared_descriptor_once
+ipc-reply-deadline/IpcReplyDeadline|kernel-ipc-runtime|ipc::tests::endpoint_failure_returns_prepared_descriptor_in_error_cleanup
+ipc-reply-deadline/IpcReplyDeadline|kernel-compat|user::syscall::linux::service_ops::ipc_helpers::tests::timely_netd_socket_decode_installs_one_exact_entry_and_returns_that_fd
+ipc-reply-deadline/IpcReplyDeadline|kernel-compat|user::syscall::linux::service_ops::ipc_helpers::tests::only_inet_stream_socket_creation_requires_a_prepared_reply_entry
+ipc-handle-transfer/IpcHandleTransfer|kernel-ps|user::handles::transfer_registry::transfer_registry_tests::failed_reply_binding_reclaims_initial_inet_descriptor_without_deferred_release
+netd-deferred-reply/NetdDeferredReply|netd|packet_provider_state_tests::rejected_prepared_inet_publication_discards_the_unpublished_token_once
+netd-deferred-reply/NetdDeferredReply|netd|packet_provider_state_tests::inet_provider_start_deadline_and_token_gate_precede_the_start_closure
 ipc-reply-recv-transaction/IpcReplyRecvTransaction|rustos-user-abi|syscall::ipc_reply_recv::tests::reply_recv_wire_shape_and_error_partition_are_stable
 ipc-reply-recv-transaction/IpcReplyRecvTransaction|rustos-svc-runtime|ipc::tests::reply_recv_phase_tag_cannot_alias_linux_errno
 ipc-reply-recv-transaction/IpcReplyRecvTransaction|kernel-compat|user::syscall::linux::ipc_ops::ipc_reply_recv::tests::reply_recv_precommit_shape_is_exact_and_versioned
@@ -751,6 +1229,7 @@ ipc-reply-recv-transaction/IpcReplyRecvTransaction|loaderd|tests::reply_recv_rec
 commercial-service-envelope/CommercialServiceEnvelope|rustos-user-abi|syscall::syscall_tests::commercial_request_envelope_rejects_reserved_flags_and_oversized_lengths
 commercial-service-envelope/CommercialServiceEnvelope|rustos-user-abi|syscall::syscall_tests::commercial_response_envelope_matches_exact_request_and_bounds_nested_fields
 commercial-service-envelope/CommercialServiceEnvelope|kernel-compat|user::syscall::linux::ipc_ops::tests::commercial_response_envelope_is_bound_to_request_and_bounded
+commercial-service-envelope/CommercialServiceEnvelope|netd|commercial_protocol::tests::commercial_netd_requests_are_closed_and_canonical
 zero-trust-service-flow/ZeroTrustServiceFlow|rustos-user-abi|syscall::syscall_tests::service_subject_identity_is_never_a_zero_or_foreign_wildcard
 zero-trust-service-flow/ZeroTrustServiceFlow|rustos-user-abi|syscall::syscall_tests::commercial_request_envelope_rejects_reserved_flags_and_oversized_lengths
 zero-trust-service-flow/ZeroTrustServiceFlow|rustos-user-abi|syscall::syscall_tests::loader_requester_identity_is_bound_to_the_kernel_sender
@@ -809,12 +1288,71 @@ user-stack-growth/UserStackGrowth|kernel-compat|user::process::tests::release_st
 exec-address-space-transaction/ExecAddressSpaceTransaction|kernel-ps|multitask::process_table::tests::process_address_space_and_exec_exit_are_serialized
 exec-address-space-transaction/ExecAddressSpaceTransaction|kernel-ps|multitask::process_table::tests::exec_seal_rejects_thread_attachment_until_cancel
 scheduler-cpu-ownership/SchedulerCpuOwnership|kernel-ps|multitask::scheduler::tests::ready_scanner_never_reads_a_frame_owned_by_any_cpu
+scheduler-cpu-distribution/SchedulerCpuDistribution|nucleus-core|debug::tests::milestone_frame_is_complete_self_framed_and_checksum_verified
+scheduler-cpu-distribution/SchedulerCpuDistribution|nucleus-core|debug::tests::milestone_render_overflow_is_an_explicit_failure_before_publication
+scheduler-cpu-distribution/SchedulerCpuDistribution|xtask|kvm::tests::smp_runtime_rejects_interleaved_or_route_only_substrings_as_evidence
 clocksource-deadline/ClocksourceDeadline|kernel-hal|arch::clock::tests::raw_tsc_global_clock_is_rejected_until_smp_offsets_are_admitted
 exception-retirement-lifecycle/ExceptionRetirementLifecycle|kernel-hal|arch::gdt::tests::per_cpu_privilege_and_ist_stacks_are_aligned_and_disjoint
 ipc-handle-transfer/IpcHandleTransfer|rustos-user-abi|tests::ipc_transfer_ticket_wire_is_canonical_and_rejects_zero_authority
 robust-futex-owner-death/RobustFutexOwnerDeath|kernel-compat|user::syscall::linux::service_ops::futex_thread::tests::kernel_generated_wake_uses_shared_then_exact_private_fallback
 gpu-submit-transaction/GpuSubmitTransaction|uiserver|gpu_scene::tests::rejected_transport_submit_restores_exact_compiler_timeline
 acceptance-profile-publication/AcceptanceProfilePublication|uiserver|acceptance_profile::tests::late_acceptance_profile_requires_the_exact_complete_contract
+smp-ring3-qualification/SmpRing3Qualification|rustos-user-abi|syscall::syscall_tests::smp_qualification_worker_shape_is_exact_and_bounded
+smp-ring3-qualification/SmpRing3Qualification|rustos-user-abi|syscall::syscall_tests::smp_qualification_bind_shape_is_closed_and_bounded
+smp-ring3-qualification/SmpRing3Qualification|kernel-compat|user::syscall::linux::debug_ops::product_milestone_tests::smp_qualification_milestone_binds_worker_to_the_kernel_observed_cpu
+smp-ring3-qualification/SmpRing3Qualification|kernel-compat|user::syscall::linux::debug_ops::product_milestone_tests::smp_qualification_milestone_rejects_unbounded_workers_and_work
+smp-ring3-qualification/SmpRing3Qualification|kernel-compat|user::syscall::linux::debug_ops::product_milestone_tests::product_milestones_are_a_closed_fixed_name_vocabulary
+smp-ring3-qualification/SmpRing3Qualification|nucleus-core|debug::tests::ring3_debug_bytes_are_bounded_and_cannot_open_a_milestone_frame
+smp-ring3-qualification/SmpRing3Qualification|nucleus-core|debug::tests::qualification_output_class_is_exact_and_scheduler_is_measurement
+smp-ring3-qualification/SmpRing3Qualification|nucleus-core|debug::tests::qualification_loss_snapshot_isolated_and_fail_closed
+smp-ring3-qualification/SmpRing3Qualification|nucleus-core|debug::tests::qualification_drop_is_visible_only_to_following_critical_evidence
+smp-ring3-qualification/SmpRing3Qualification|kernel-compat|user::syscall::linux::debug_ops::product_milestone_tests::user_debug_syscall_has_no_raw_debugcon_payload_path
+smp-ring3-qualification/SmpRing3Qualification|kernel-compat|user::sysops::console::tests::system_console_debug_mirror_never_writes_raw_user_bytes
+smp-ring3-qualification/SmpRing3Qualification|runtimed|kvm_smp_qualification::tests::parser_accepts_only_the_canonical_ordered_contract
+smp-ring3-qualification/SmpRing3Qualification|runtimed|kvm_smp_qualification::tests::parser_rejects_worker_set_and_safe_bound_violations
+smp-ring3-qualification/SmpRing3Qualification|runtimed|kvm_smp_qualification::tests::absent_or_invalid_contract_injects_nothing
+smp-ring3-qualification/SmpRing3Qualification|runtimed|kvm_smp_qualification::tests::exact_contract_injects_one_private_nonprivileged_nonrestarting_launch
+smp-ring3-qualification/SmpRing3Qualification|runtimed|kvm_smp_qualification::tests::missing_contract_is_the_only_normal_no_qualification_result
+smp-ring3-qualification/SmpRing3Qualification|runtimed|kvm_smp_qualification::tests::snapshot_failures_preserve_raw_errno_or_use_stable_errno
+smp-ring3-qualification/SmpRing3Qualification|runtimed|kvm_smp_qualification::tests::malformed_contract_is_an_einval_catalog_failure
+smp-ring3-qualification/SmpRing3Qualification|runtimed|catalog::tests::qualification_load_failure_leaves_published_ordinary_entries_unchanged
+smp-ring3-qualification/SmpRing3Qualification|runtimed|catalog::tests::qualification_retry_backoff_is_bounded_and_monotonic
+smp-ring3-qualification/SmpRing3Qualification|vfsd|tests::unpublished_storaged_is_retryable_not_a_missing_file
+smp-ring3-qualification/SmpRing3Qualification|vfsd|tests::storage_geometry_rejects_provider_overflow_unknown_flags_and_foreign_binding
+smp-ring3-qualification/SmpRing3Qualification|runtimed|tests::policy_catalog_load_is_not_gated_by_ui_readiness
+smp-ring3-qualification/SmpRing3Qualification|runtimed|socket::tests::only_ui_bootstrap_or_private_smp_qualification_may_launch_before_ui_ready
+smp-ring3-qualification/SmpRing3Qualification|runtimed|spawn::tests::qualification_bind_is_exact_and_precedes_activation
+smp-ring3-qualification/SmpRing3Qualification|runtimed|spawn::tests::qualification_bind_failure_never_activates_the_child
+smp-ring3-qualification/SmpRing3Qualification|kernel-compat|user::syscall::linux::smp_qualification_ops::tests::private_exec_and_missing_binding_activation_are_fail_closed
+smp-ring3-qualification/SmpRing3Qualification|kernel-compat|user::syscall::linux::smp_qualification_ops::tests::exact_worker_topologies_bind_and_complete_once
+smp-ring3-qualification/SmpRing3Qualification|kernel-compat|user::syscall::linux::smp_qualification_ops::tests::ready_barrier_identity_and_phase_rejections_are_atomic
+smp-ring3-qualification/SmpRing3Qualification|kernel-compat|user::syscall::linux::smp_qualification_ops::tests::immutable_work_deadline_and_endpoint_generation_fail_closed
+smp-ring3-qualification/SmpRing3Qualification|kernel-compat|user::syscall::linux::smp_qualification_ops::tests::pid_generation_and_mm_generation_substitution_terminally_revoke
+smp-ring3-qualification/SmpRing3Qualification|kernel-compat|user::syscall::linux::smp_qualification_ops::tests::post_admission_endpoint_revalidation_rejects_revoke_and_terminalizes
+smp-ring3-qualification/SmpRing3Qualification|kernel-compat|user::syscall::linux::smp_qualification_ops::tests::complete_cannot_precede_every_worker_finish
+smp-ring3-qualification/SmpRing3Qualification|kernel-compat|user::syscall::linux::smp_qualification_ops::tests::bind_registration_is_linearized_with_deferred_activation_authority
+smp-ring3-qualification/SmpRing3Qualification|kernel-compat|user::syscall::linux::smp_qualification_ops::tests::process_cleanup_revokes_qualification_before_deferred_authority_reuse
+smp-ring3-qualification/SmpRing3Qualification|kernel-compat|user::syscall::linux::proc_broker_ops::activation_batch::tests::private_qualification_authority_is_never_batch_eligible
+smp-ring3-qualification/SmpRing3Qualification|xtask|kvm::tests::smoke_readiness_budget_starts_only_after_both_guests_spawn
+smp-ring3-qualification/SmpRing3Qualification|xtask|kvm::tests::smp_ring3_qualification_accepts_complete_exact_worker_sets
+smp-ring3-qualification/SmpRing3Qualification|xtask|kvm::tests::smp_ring3_qualification_rejects_missing_duplicate_and_replayed_phases
+smp-ring3-qualification/SmpRing3Qualification|xtask|kvm::tests::smp_ring3_qualification_rejects_process_and_thread_substitution
+smp-ring3-qualification/SmpRing3Qualification|xtask|kvm::tests::smp_ring3_qualification_rejects_loss_wrong_cpu_and_work
+smp-ring3-qualification/SmpRing3Qualification|xtask|kvm::tests::smp_ring3_qualification_rejects_phase_order_and_deadline
+smp-ring3-qualification/SmpRing3Qualification|xtask|kvm::tests::smp_ring3_qualification_rejects_interleaved_tampered_and_plain_frames
+smp-ring3-qualification/SmpRing3Qualification|xtask|kvm::tests::smp_ring3_qualification_has_exact_private_kvm_admission
+smp-ring3-qualification/SmpRing3Qualification|xtask|kvm::tests::dvm_attached_block_disk_requires_qemu_read_only_backing
+smp-ring3-qualification/SmpRing3Qualification|xtask|kvm::tests::dvm_block_transport_header_matches_read_only_qemu_backing
+smp-ring3-qualification/SmpRing3Qualification|xtask|kvm::tests::dvm_block_read_only_media_driver_closure_is_explicit
+smp-ring3-qualification/SmpRing3Qualification|xtask|kvm::tests::dvm_block_read_only_media_geometry_matches_atapi_capacity
+smp-ring3-qualification/SmpRing3Qualification|xtask|stage::tests::early_system_allowlist_contains_the_minimal_dynamic_runtime_closure
+dvm-block-startup/DvmBlockStartup|kernel-io-manager|io::dvm_block::tests::block_shared_aperture_requires_prefetchable_write_back_atomic_memory
+dvm-input-ring/DvmInputRing|kernel-io-manager|input::dvm_ring::tests::input_shared_ring_requires_prefetchable_write_back_atomic_memory
+page-table-lifecycle/PageTableLifecycle|kernel-io-manager|driver::mmio::tests::overlapping_physical_ranges_reject_mixed_cache_modes
+page-table-lifecycle/PageTableLifecycle|kernel-mm|memory::kernel_vm::tests::shared_memory_mapping_is_write_back_not_mmio_or_write_combining
+cpu-online-lifecycle/CpuOnlineLifecycle|kernel-mm|memory::kernel_vm::tests::pat_cache_contract_update_is_exact_idempotent_and_cpu_local
+cpu-online-lifecycle/CpuOnlineLifecycle|kernel-executive|boot::tests::ap_cache_attributes_are_verified_before_private_ready_publication
+cpu-online-lifecycle/CpuOnlineLifecycle|kernel-executive|boot::tests::local_apic_uses_one_permanent_uncached_direct_map_alias
 EOF
 
 jq -s --arg schema rustos-formal-source-conformance-v1 \

@@ -221,10 +221,13 @@ impl VfsState {
                     return;
                 }
                 let interests = self.epolls.matching_interests(provider, request.arg2);
-                mutated_epolls.extend(interests.iter().map(|(token, _)| *token));
-                let mut candidate = self.epolls.clone();
-                mutated = candidate.purge(provider, request.arg2);
+                let expected_purged = interests.len();
+                let mut previous_token = None;
                 for (token, interest) in interests {
+                    if previous_token != Some(token) {
+                        mutated_epolls.push(token);
+                        previous_token = Some(token);
+                    }
                     let record = checkpoint_interest_record(token, interest, true);
                     let key = checkpoint_revision_key(&record);
                     if !self.checkpoint_operation_replayed(request, key) {
@@ -234,7 +237,12 @@ impl VfsState {
                         }
                     }
                 }
-                self.epolls = candidate;
+                let purged = self.epolls.purge(provider, request.arg2);
+                assert_eq!(
+                    purged, expected_purged,
+                    "vfsd epoll purge lost reverse-index membership"
+                );
+                mutated = purged != 0;
             }
             _ => response.status = EINVAL,
         }

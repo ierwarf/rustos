@@ -135,7 +135,14 @@ start_relays() {
         echo "rustos-dvm: display MSI-X UIO module unavailable; refusing display relay" >&2
         return 1
     fi
-    start_relay net /usr/libexec/rustos-dvm-net
+    if modprobe rustos_dvm_net_uio; then
+        start_relay net /usr/libexec/rustos-dvm-net
+    else
+        echo "rustos-dvm: network WB UIO module unavailable; refusing network relay" >&2
+        stop_relay display
+        stop_relay gpu
+        return 1
+    fi
 }
 
 stop_relays() {

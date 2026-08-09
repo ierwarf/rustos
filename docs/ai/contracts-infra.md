@@ -710,9 +710,13 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
 
 The closed registry is `formal/fault-scenarios.tsv` and currently contains
 `alloc.frame`, `block.read`, `block.write`, `block.flush`,
-`display.present`, `display.provider.register`, and `process.spawn`.
+`display.present`, `display.provider.register`, `handle.commit`,
+`handle.reserve`, `ipc.endpoint.enqueue`, `ipc.endpoint.reply`,
+`process.spawn`, and `waitset.register`.
 Configuration and guest admission reject unknown, retired, and duplicate
-points. Normal product configuration keeps injection disabled; an
+points. Production `source` and executable `witness_source` are separate,
+mandatory registry fields and are both validated. Normal product configuration
+keeps injection disabled; an
 `RUSTOS_FAULTS` override replaces the matching `off` rule instead of appending
 a shadowed duplicate. Only `block.flush` currently claims a negative KVM
 acceptance profile; the registry labels the remaining runtime gaps explicitly.

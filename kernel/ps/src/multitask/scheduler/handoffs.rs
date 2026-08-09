@@ -14,8 +14,7 @@
 //!   `bootstrap-activation-handoff`, and `synchronous-ipc-handoff`.
 
 use super::{
-    CpuDispatchGuard, MAX_ATOMIC_ACTIVATION_HANDOFFS, MAX_CONSECUTIVE_SYNC_HANDOFFS, Scheduler,
-    TaskContext,
+    CpuDispatchGuard, MAX_ATOMIC_ACTIVATION_HANDOFFS, Scheduler, TaskContext, sync_handoff,
 };
 
 impl Scheduler {
@@ -248,13 +247,28 @@ impl Scheduler {
         {
             return false;
         }
-        let target_cpu = self.slot_dispatch_cpu(slot);
-        self.cpu_dispatch[target_cpu]
-            .lock()
-            .sync_pick_hints
-            .enqueue(slot)
-            .expect("scheduler synchronous IPC handoff queue overflow");
+        self.enqueue_synchronous_handoff_slot(slot);
         true
+    }
+
+    /// Publishes one exact synchronous handoff into the sole per-CPU ordering
+    /// owner.  Lifecycle and runqueue admission were checked by the caller
+    /// under Scheduler; this routine never creates runnable or execution
+    /// authority.
+    pub(super) fn enqueue_synchronous_handoff_slot(&mut self, slot: usize) -> bool {
+        let Some(task_id) = self.starts[slot].map(|start| start.id) else {
+            return false;
+        };
+        let target_cpu = self.slot_dispatch_cpu(slot);
+        let record = sync_handoff::SyncHandoffRecord::new(slot, task_id);
+        #[cfg(test)]
+        {
+            return self.sync_handoff_states[target_cpu].lock().enqueue(record);
+        }
+        #[cfg(not(test))]
+        {
+            sync_handoff::enqueue(target_cpu, record)
+        }
     }
 
     pub(in crate::multitask) fn set_next_spawn_pick_hint(&mut self, task_id: u64) {
@@ -334,30 +348,52 @@ impl Scheduler {
         None
     }
 
-    pub(super) fn take_next_synchronous_pick_hint_ready_slot(
-        &self,
-        policy: &mut CpuDispatchGuard<'_>,
-    ) -> Option<usize> {
-        if policy.sync_handoff_streak >= MAX_CONSECUTIVE_SYNC_HANDOFFS {
-            return None;
-        }
-        while let Some(hint) = policy.sync_pick_hints.pop() {
-            if let Some(slot) = self.pick_hint_candidate_slot(Some(hint)) {
-                return Some(slot);
-            }
-        }
-        None
+    /// The exact validation predicate is shared by the static production
+    /// backend and each test scheduler's isolated `SyncHandoffState`.
+    fn synchronous_handoff_record_is_ready(&self, record: sync_handoff::SyncHandoffRecord) -> bool {
+        self.starts
+            .get(record.slot())
+            .and_then(|start| *start)
+            .is_some_and(|start| start.id == record.task_id())
+            && record.has_current_dispatch_custody()
+            && self.pick_hint_candidate_slot(Some(record.slot())).is_some()
+    }
+
+    pub(super) fn take_next_synchronous_pick_hint_ready_slot(&self) -> Option<usize> {
+        let cpu = Self::current_dispatch_cpu();
+        #[cfg(test)]
+        return self.sync_handoff_states[cpu]
+            .lock()
+            .take_next_ready(|record| self.synchronous_handoff_record_is_ready(record));
+        #[cfg(not(test))]
+        sync_handoff::take_next_ready(cpu, |record| {
+            self.synchronous_handoff_record_is_ready(record)
+        })
     }
 
     pub(super) fn record_synchronous_handoff(&mut self, synchronous_handoff: bool) {
-        let next = if synchronous_handoff {
-            self.current_dispatch_policy()
-                .sync_handoff_streak
-                .saturating_add(1)
-                .min(MAX_CONSECUTIVE_SYNC_HANDOFFS)
-        } else {
-            0
-        };
-        self.current_dispatch_policy_mut().sync_handoff_streak = next;
+        let cpu = Self::current_dispatch_cpu();
+        #[cfg(test)]
+        {
+            self.sync_handoff_states[cpu]
+                .lock()
+                .record_dispatch(synchronous_handoff);
+        }
+        #[cfg(not(test))]
+        sync_handoff::record_dispatch(cpu, synchronous_handoff);
+    }
+
+    #[cfg(test)]
+    pub(super) fn synchronous_handoff_len_for_tests(&self) -> usize {
+        self.sync_handoff_states[Self::current_dispatch_cpu()]
+            .lock()
+            .len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_synchronous_handoff_streak_for_tests(&mut self, handoff_streak: u8) {
+        self.sync_handoff_states[Self::current_dispatch_cpu()]
+            .lock()
+            .set_handoff_streak(handoff_streak);
     }
 }

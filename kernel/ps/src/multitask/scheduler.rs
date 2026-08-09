@@ -37,12 +37,20 @@ mod reclaim;
 mod runqueue;
 mod runqueue_policy;
 mod runtime_profile;
+mod sync_handoff;
 pub(in crate::multitask) use runtime_profile::SchedulerEntryCause;
 pub use runtime_profile::drain_scheduler_runtime_profile;
 pub(in crate::multitask) use runtime_profile::publish_scheduler_runtime_profile;
 
 pub(in crate::multitask) fn local_dispatch_work_pending(cpu: usize) -> bool {
     runqueue::local_dispatch_work_pending(cpu)
+}
+
+/// Enqueue the opaque post-reply token only after the scheduler catalog guard
+/// that issued it has dropped.  The target owner validates its runqueue
+/// generation without re-entering Scheduler.
+pub(super) fn enqueue_reply_wake_handoff(token: ReplyWakeHandoff) -> bool {
+    sync_handoff::enqueue_reply_wake(token)
 }
 
 mod smp;
@@ -83,6 +91,7 @@ pub(super) use linux_thread_state::CurrentLinuxThreadBinding;
 use linux_thread_state::{LinuxThreadStateLock, empty_linux_thread_state_lock};
 use reclaim::{RetiredSlotReclaim, RetirementSideEffect};
 use runtime_profile::SchedulerPhase;
+use sync_handoff::ReplyWakeHandoff;
 
 // The enabled product topology boots roughly twenty policy/service processes
 // before the UI creates its bounded input, display, diagnostics, console, and
@@ -386,6 +395,12 @@ pub(super) struct Scheduler {
     /// scheduler object is currently only the lifecycle/catalog serializer;
     /// it must not create a second system-wide dispatch policy.
     cpu_dispatch: [CpuDispatchLock; nucleus_core::util::lockdep::MAX_TRACKED_CPUS],
+    /// Unit-test schedulers own disjoint instances of the exact production
+    /// synchronous-handoff state machine. Production storage remains the
+    /// per-CPU static backend in `sync_handoff`.
+    #[cfg(test)]
+    sync_handoff_states:
+        [sync_handoff::SyncHandoffLock; nucleus_core::util::lockdep::MAX_TRACKED_CPUS],
     /// At most one synchronous IPC wait can be active per runnable task, so
     /// `MAX_TASK` fixed entries cover every live donation without allocating
     /// from scheduler or IPC paths.
@@ -471,6 +486,8 @@ impl Scheduler {
             pending_reap: false,
             cpu_dispatch: [const { CpuDispatchLock::new(CpuDispatchPolicy::new()) };
                 nucleus_core::util::lockdep::MAX_TRACKED_CPUS],
+            #[cfg(test)]
+            sync_handoff_states: sync_handoff::per_scheduler_locks(),
             ipc_priority_donations: [None; MAX_TASK],
             ipc_priority_donation_len: 0,
             donation_donor_slot_hints: [const { AtomicU8::new(NO_SLOT_HINT) }; MAX_TASK],
@@ -625,8 +642,13 @@ impl Scheduler {
             policy.latency_pick_hint_len = retained;
             policy.spawn_pick_hints.remove(slot);
             policy.atomic_activation_pick_hints.remove(slot);
-            policy.sync_pick_hints.remove(slot);
         }
+        #[cfg(test)]
+        for state in &mut self.sync_handoff_states {
+            state.lock().remove_slot(slot);
+        }
+        #[cfg(not(test))]
+        sync_handoff::remove_slot_all_cpus(slot);
     }
 
     /// Sets a "donate" hint that biases the next scheduler pick toward the
@@ -693,12 +715,9 @@ impl Scheduler {
     pub(super) fn set_next_process_pick_hint(&mut self, process_id: u64) -> Option<u64> {
         let slot = self.eligible_process_worker_slot(process_id)?;
         self.apply_ipc_donation(slot);
+        #[cfg(not(test))]
         let target_cpu = self.slot_dispatch_cpu(slot);
-        self.cpu_dispatch[target_cpu]
-            .lock()
-            .sync_pick_hints
-            .enqueue(slot)
-            .expect("scheduler synchronous process handoff queue overflow");
+        let _ = self.enqueue_synchronous_handoff_slot(slot);
         #[cfg(not(test))]
         super::irq::request_target_reschedule(target_cpu);
         self.starts[slot].map(|start| start.id)
@@ -709,8 +728,14 @@ impl Scheduler {
         if slot >= MAX_TASK {
             return None;
         }
+        // A hint only suggests an ordering. The same lifecycle/queue admission
+        // gate as every other handoff remains authoritative, so a stale hint
+        // cannot resurrect a blocked, retired, or non-runnable slot.
+        if !self.handoff_slot_ready(slot) {
+            return None;
+        }
         let context = self.contexts[slot]?;
-        if !context.ready || !self.context_is_schedulable(slot, context) {
+        if !self.context_is_schedulable(slot, context) {
             return None;
         }
         Some(slot)
@@ -821,6 +846,14 @@ impl Scheduler {
         for policy in &self.cpu_dispatch {
             *policy.lock() = CpuDispatchPolicy::new();
         }
+        #[cfg(test)]
+        {
+            for state in &self.sync_handoff_states {
+                *state.lock() = sync_handoff::SyncHandoffState::new();
+            }
+        }
+        #[cfg(not(test))]
+        sync_handoff::reset_all_cpus();
         self.ipc_priority_donations = [None; MAX_TASK];
         self.ipc_priority_donation_len = 0;
         self.root_idle = false;
@@ -2673,23 +2706,22 @@ impl Scheduler {
         // before the unrelated User reservation; a committed child
         // activation is already an explicit, one-shot bootstrap transfer and
         // must run before either category of ordinary IPC wakeup.
-        // One acquisition for the whole chain. Every step below reads or
-        // consumes this CPU's own dispatch hints, and taking the guard per step
-        // cost 0.72 us each measured against an empty control span — about
-        // 6 us of the 8 us critical section, on a lock that the global
-        // scheduler owner already makes uncontended. The ownership boundary is
-        // unchanged: cross-CPU pushers still acquire the target CPU's policy.
-        let mut policy = timed_handoff_step(6, || self.current_dispatch_policy());
-        let atomic_activation_handoff = timed_handoff_step(0, || {
-            self.take_next_atomic_activation_handoff_ready_slot(&mut policy)
-        });
-        let sync_handoff = if atomic_activation_handoff.is_none() {
-            timed_handoff_step(1, || {
-                self.take_next_synchronous_pick_hint_ready_slot(&mut policy)
+        // Sync handoff custody is deliberately separate from the remaining
+        // CPU dispatch policy.  Drop that policy guard before consuming the
+        // external FIFO: reply producers take only SyncHandoff, so this keeps
+        // the production order Scheduler -> SyncHandoff with no reverse or
+        // same-class nested acquisition.
+        let atomic_activation_handoff = {
+            let mut policy = timed_handoff_step(6, || self.current_dispatch_policy());
+            timed_handoff_step(0, || {
+                self.take_next_atomic_activation_handoff_ready_slot(&mut policy)
             })
-        } else {
-            None
         };
+        let sync_handoff = atomic_activation_handoff
+            .is_none()
+            .then(|| timed_handoff_step(1, || self.take_next_synchronous_pick_hint_ready_slot()))
+            .flatten();
+        let mut policy = timed_handoff_step(6, || self.current_dispatch_policy());
         let (next_idx, ipc_handoff, reserved_user_pick, latency_handoff_pick, sync_handoff_pick) =
             match atomic_activation_handoff {
                 Some(child_slot) => (child_slot, true, None, false, false),
@@ -3264,6 +3296,7 @@ impl Scheduler {
             user_mode: context.user_mode,
             abi: context.user_abi,
             process_handle: context.process_handle,
+            process_id: context.process_id,
             console_session: context.console_session,
         })
     }
@@ -3937,6 +3970,43 @@ impl Scheduler {
         self.wake_task_slot(slot)
     }
 
+    /// Completes the scheduler half of a terminal IPC reply under one catalog
+    /// acquisition.  The returned proof carries no lifecycle authority: it is
+    /// only an exact post-wake runqueue snapshot for the external per-CPU
+    /// synchronous-handoff owner.
+    pub(super) fn complete_ipc_reply_wake_handoff(
+        &mut self,
+        reply: u64,
+        task_id: u64,
+    ) -> Option<ReplyWakeHandoff> {
+        let _ = self.release_ipc_priority(reply);
+        let slot = self.find_task_slot(task_id)?;
+        if !self.wake_task_slot(slot) {
+            return None;
+        }
+        self.reply_wake_handoff(slot, task_id)
+    }
+
+    fn reply_wake_handoff(&self, slot: usize, task_id: u64) -> Option<ReplyWakeHandoff> {
+        self.reply_wake_handoff_from_owner(slot, task_id, runqueue::owner(slot))
+    }
+
+    /// Pure token-mint decision shared by the production owner-word read and
+    /// host witnesses. Keeping this outside `cfg(not(test))` makes the exact
+    /// identity/runnability/custody seam executable without weakening the
+    /// unit-test isolation of the global runqueue backend.
+    fn reply_wake_handoff_from_owner(
+        &self,
+        slot: usize,
+        task_id: u64,
+        owner: runqueue::RunOwnerSnapshot,
+    ) -> Option<ReplyWakeHandoff> {
+        if self.starts[slot].is_none_or(|start| start.id != task_id) {
+            return None;
+        }
+        ReplyWakeHandoff::from_owner(slot, task_id, owner)
+    }
+
     fn wake_task_slot(&mut self, slot: usize) -> bool {
         if self.retired[slot] || self.start_suspended[slot] {
             return false;
@@ -3993,15 +4063,26 @@ impl Scheduler {
             context.blocked_since_ticks = 0;
             return true;
         }
-        if matches!(
-            execution_owner,
-            Some(super::cpu_local::TaskExecutionOwner::Transition(_))
-        ) {
+        if let Some(super::cpu_local::TaskExecutionOwner::Transition(transition_cpu)) =
+            execution_owner
+        {
             // The outgoing frame is already published, but the old kernel
-            // stack remains owned by assembly. Preserve the wake as runnable;
-            // candidate selection rejects the slot until transition release.
-            // Treating this as Current would clear `ready`, and transition
-            // completion would then leave the task with no owner and no queue.
+            // stack remains owned by assembly. Publish exact mailbox custody
+            // before clearing the block state: `ready` is only a diagnostic
+            // refinement here and can never be the wake's sole authority.
+            // Candidate selection still rejects this slot while the transition
+            // owner retains its stack, so the publication cannot dispatch
+            // until assembly release-clears that ownership.
+            //
+            // A rejected result preserves the existing terminal or migration
+            // owner and leaves the scheduler context untouched. `Local`,
+            // `RemoteQueued`, and `Running` are already authoritative and
+            // must not receive a second queue or mailbox record.
+            match self.publish_runqueue_wake_to(slot, transition_cpu) {
+                runqueue::RemoteWakeOutcome::Rejected => return false,
+                runqueue::RemoteWakeOutcome::AlreadyOwned { .. }
+                | runqueue::RemoteWakeOutcome::Published { .. } => {}
+            }
             let context = self.contexts[slot]
                 .as_mut()
                 .expect("transitioning scheduler slot lost its context during wake");
@@ -4010,12 +4091,6 @@ impl Scheduler {
             context.ready = true;
             context.ready_since_ticks = crate::arch::rtc::ticks();
             context.blocked_since_ticks = 0;
-            #[cfg(not(test))]
-            if let Some(cpu) = runqueue::owner(slot).cpu {
-                super::irq::request_target_reschedule(cpu);
-            }
-            #[cfg(test)]
-            super::request_deferred_reschedule();
             return true;
         }
         let already_runnable = was_ready && !was_blocked && !wake_was_armed;
@@ -4338,1537 +4413,4 @@ const fn align_kernel_stack_top(raw_top: usize) -> usize {
 }
 
 #[cfg(test)]
-mod tests {
-    use alloc::boxed::Box;
-
-    use super::{
-        ConsoleSessionHandle, IpcDonationTarget, MAX_CONSECUTIVE_SYSTEM_DISPATCHES, MAX_TASK,
-        MIN_LOAD_WEIGHT, NICE_0_LOAD, SCHED_CPU_LOCALITY_LAG_NS, SYSTEM_CLASS_WEIGHT_FLAG,
-        SchedClass, Scheduler, SchedulerDispatch, TaskContext, TaskStart, align_kernel_stack_top,
-    };
-    use crate::memory::paging::ProcessAddressSpace;
-    use crate::multitask::{UserTaskBootstrap, noop_task_entry, process_table};
-    use crate::user::abi::UserAbi;
-    use crate::user::linux::LinuxThreadState;
-    use crate::user::process_state::UserProcessState;
-    use kernel_ipc_runtime::api::{EndpointResponseTake, IpcError};
-
-    static TEST_SCHEDULER_TEMPLATE: Scheduler = Scheduler::new();
-
-    #[test]
-    fn kernel_stack_top_is_aligned_for_sysv_rust_calls() {
-        for low_bits in 0..16 {
-            let top = align_kernel_stack_top(0x10_000 + low_bits);
-            assert_eq!(top & 0xF, 0);
-            assert!(top <= 0x10_000 + low_bits);
-            assert!((0x10_000 + low_bits) - top < 16);
-        }
-    }
-
-    #[test]
-    fn architectural_restore_is_required_exactly_for_a_task_switch() {
-        let same = SchedulerDispatch::new(0x1000, 119, 7, 7);
-        assert!(!same.requires_architectural_restore());
-
-        let switched = SchedulerDispatch::new(0x2000, 119, 7, 9);
-        assert!(switched.requires_architectural_restore());
-    }
-
-    pub(super) fn boxed_scheduler() -> Box<Scheduler> {
-        let mut scheduler = Box::<Scheduler>::new_uninit();
-        unsafe {
-            // The const template owns no heap allocation: every Vec-bearing
-            // field is `None`. Copy it directly into the heap allocation so
-            // debug test threads never materialize the large SIMD arrays on
-            // their small harness stack.
-            core::ptr::copy_nonoverlapping(
-                core::ptr::addr_of!(TEST_SCHEDULER_TEMPLATE),
-                scheduler.as_mut_ptr(),
-                1,
-            );
-            scheduler.assume_init()
-        }
-    }
-
-    pub(super) fn test_user_context(handle: process_table::ProcessHandle) -> TaskContext {
-        TaskContext {
-            saved_rsp: 0,
-            ready: true,
-            ready_since_ticks: 0,
-            blocked: false,
-            blocked_since_ticks: 0,
-            wake_armed: false,
-            weight: NICE_0_LOAD,
-            vruntime_ns: 0,
-            exec_start_ticks: 0,
-            address_space_root: 0,
-            kernel_stack_base: 0,
-            kernel_stack_top: 0,
-            alternate_kernel_stack_base: 0,
-            alternate_kernel_stack_top: 0,
-            user_mode: true,
-            user_abi: Some(UserAbi::Linux),
-            console_session: ConsoleSessionHandle::SYSTEM,
-            process_handle: Some(handle),
-            process_id: process_table::with_process_state(handle, |pid, _| pid),
-            user_stack: None,
-            windows_thread_state: None,
-        }
-    }
-
-    pub(super) fn test_process(id: u64) -> process_table::ProcessHandle {
-        process_table::create_process(
-            id,
-            UserProcessState::new(
-                ProcessAddressSpace::empty_for_tests(),
-                None,
-                None,
-                None,
-                None,
-                false,
-                "/test.elf",
-            ),
-        )
-        .expect("process handle")
-    }
-
-    #[test]
-    fn ready_validation_accepts_only_immutable_published_frames() {
-        use super::should_validate_published_ready_frame as should_validate;
-
-        assert!(should_validate(2, 1, false, false, true, false));
-        assert!(!should_validate(1, 1, false, false, true, false));
-        assert!(!should_validate(2, 1, true, false, true, false));
-        assert!(!should_validate(2, 1, false, true, true, false));
-        assert!(!should_validate(2, 1, false, false, false, false));
-        assert!(!should_validate(2, 1, false, false, true, true));
-    }
-
-    #[test]
-    fn ready_scanner_never_reads_a_frame_owned_by_any_cpu() {
-        use super::published_frame_is_stable as stable;
-
-        assert!(stable(2, 1, false));
-        assert!(!stable(1, 1, false));
-        assert!(!stable(2, 1, true));
-    }
-
-    #[test]
-    fn live_noncurrent_task_must_retain_one_scheduler_state_owner() {
-        use super::live_task_state_is_partitioned as partitioned;
-
-        assert!(partitioned(1, 1, false, false, false, false, false));
-        assert!(partitioned(2, 1, false, false, false, true, false));
-        assert!(partitioned(2, 1, false, false, false, false, true));
-        assert!(partitioned(2, 1, true, false, false, false, false));
-        assert!(partitioned(2, 1, false, true, false, false, false));
-        assert!(partitioned(2, 1, false, false, true, false, false));
-        assert!(!partitioned(2, 1, false, false, false, false, false));
-    }
-
-    #[test]
-    fn collect_process_sibling_slots_returns_matching_user_slots_only() {
-        let _process_table = process_table::tests::isolate_process_table();
-        let mut scheduler = boxed_scheduler();
-        let owner = test_process(1);
-        let other = test_process(2);
-
-        scheduler.contexts[1] = Some(test_user_context(owner));
-        scheduler.contexts[2] = Some(test_user_context(owner));
-        scheduler.contexts[3] = Some(test_user_context(other));
-        scheduler.contexts[4] = Some(TaskContext {
-            user_mode: false,
-            process_handle: Some(owner),
-            ..test_user_context(owner)
-        });
-
-        scheduler.retired[2] = true;
-        scheduler.contexts[5] = Some(test_user_context(owner));
-
-        let (slots, count) = scheduler.collect_live_process_sibling_slots(1, owner);
-        assert_eq!(count, 1);
-        assert_eq!(slots[0], 5);
-        assert!(slots[1..MAX_TASK].iter().all(|slot| *slot == 0));
-    }
-
-    #[test]
-    fn process_stop_is_scheduler_wide_and_sigcont_resumes_before_delivery() {
-        let _process_table = process_table::tests::isolate_process_table();
-        let mut scheduler = boxed_scheduler();
-        let process = test_process(48);
-        process_table::attach_task(process).expect("second thread");
-        let leader = test_user_context(process);
-        let worker = test_user_context(process);
-        scheduler.contexts[1] = Some(leader);
-        scheduler.contexts[2] = Some(worker);
-        scheduler.starts[1] = Some(TaskStart {
-            entry: noop_task_entry,
-            id: 48,
-        });
-        scheduler.starts[2] = Some(TaskStart {
-            entry: noop_task_entry,
-            id: 49,
-        });
-        scheduler.install_linux_thread_state(1, Some(48), Some(LinuxThreadState::default()));
-        scheduler.install_linux_thread_state(2, Some(49), Some(LinuxThreadState::default()));
-        scheduler.current_task = 1;
-
-        assert!(scheduler.stop_current_linux_process(19));
-        assert!(scheduler.job_stopped[1]);
-        assert!(scheduler.job_stopped[2]);
-        assert!(!scheduler.stop_current_linux_process(19));
-
-        assert!(scheduler.queue_linux_signal(48, 48, rustos_user_abi::linux::SIGCONT));
-        assert!(!scheduler.job_stopped[1]);
-        assert!(!scheduler.job_stopped[2]);
-        let pending = scheduler
-            .linux_thread_state(1)
-            .map(|state| state.pending_signals)
-            .unwrap_or(0);
-        assert_ne!(
-            pending
-                & crate::user::sysops::linux::linux_signal_bit(rustos_user_abi::linux::SIGCONT)
-                    .unwrap(),
-            0
-        );
-
-        process_table::note_process_exit_status(48, 0).expect("record exit");
-        process_table::detach_task(process).expect("detach leader");
-        process_table::detach_task(process).expect("detach worker");
-        assert_eq!(process_table::reap_exited_processes(), 1);
-    }
-
-    #[test]
-    fn unmasked_signal_revokes_a_pending_block_arm() {
-        let _process_table = process_table::tests::isolate_process_table();
-        let mut scheduler = boxed_scheduler();
-        let process = test_process(52);
-        let mut context = test_user_context(process);
-        context.ready = false;
-        scheduler.contexts[1] = Some(context);
-        scheduler.starts[1] = Some(TaskStart {
-            entry: noop_task_entry,
-            id: 52,
-        });
-        scheduler.install_linux_thread_state(1, Some(52), Some(LinuxThreadState::default()));
-        scheduler.current_task = 1;
-
-        assert!(scheduler.arm_block_current_task());
-        assert!(scheduler.contexts[1].expect("armed context").wake_armed);
-        assert!(scheduler.queue_linux_signal(52, 52, 15));
-        let context = scheduler.contexts[1].expect("signalled context");
-        assert!(!context.wake_armed);
-        assert!(!context.blocked);
-        assert!(!context.ready);
-        assert_eq!(scheduler.commit_block_current_task(), Some(false));
-
-        process_table::note_process_exit_status(52, 0).expect("record exit");
-        process_table::detach_task(process).expect("detach thread");
-        assert_eq!(process_table::reap_exited_processes(), 1);
-    }
-
-    #[test]
-    fn process_sigchld_prefers_leader_and_retains_exact_coalesced_causes() {
-        let _process_table = process_table::tests::isolate_process_table();
-        let mut scheduler = boxed_scheduler();
-        let process = test_process(50);
-        process_table::attach_task(process).expect("second thread");
-        let leader = test_user_context(process);
-        let worker = test_user_context(process);
-        scheduler.contexts[1] = Some(leader);
-        scheduler.contexts[2] = Some(worker);
-        scheduler.starts[1] = Some(TaskStart {
-            entry: noop_task_entry,
-            id: 50,
-        });
-        scheduler.starts[2] = Some(TaskStart {
-            entry: noop_task_entry,
-            id: 51,
-        });
-        scheduler.install_linux_thread_state(1, Some(50), Some(LinuxThreadState::default()));
-        scheduler.install_linux_thread_state(2, Some(51), Some(LinuxThreadState::default()));
-        scheduler.current_task = 1;
-
-        assert!(
-            scheduler.queue_linux_process_sigchld(
-                50,
-                rustos_user_abi::syscall::PROCD_SIGCHLD_EVENT_STOP
-            )
-        );
-        assert_eq!(
-            scheduler
-                .linux_thread_state(1)
-                .map(|state| state.pending_sigchld_events),
-            Some(rustos_user_abi::syscall::PROCD_SIGCHLD_EVENT_STOP)
-        );
-
-        scheduler.current_task = 2;
-        scheduler.transfer_pending_process_sigchld(1);
-        assert_eq!(
-            scheduler
-                .linux_thread_state(1)
-                .map(|state| state.pending_sigchld_events),
-            Some(0)
-        );
-        assert_eq!(
-            scheduler
-                .linux_thread_state(2)
-                .map(|state| state.pending_sigchld_events),
-            Some(rustos_user_abi::syscall::PROCD_SIGCHLD_EVENT_STOP)
-        );
-
-        scheduler.retired[1] = true;
-        assert!(scheduler.queue_linux_process_sigchld(
-            50,
-            rustos_user_abi::syscall::PROCD_SIGCHLD_EVENT_CONTINUE
-        ));
-        assert_eq!(
-            scheduler
-                .linux_thread_state(2)
-                .map(|state| state.pending_sigchld_events),
-            Some(
-                rustos_user_abi::syscall::PROCD_SIGCHLD_EVENT_STOP
-                    | rustos_user_abi::syscall::PROCD_SIGCHLD_EVENT_CONTINUE
-            )
-        );
-
-        process_table::note_process_exit_status(50, 0).expect("record exit");
-        process_table::detach_task(process).expect("detach leader");
-        process_table::detach_task(process).expect("detach worker");
-        assert_eq!(process_table::reap_exited_processes(), 1);
-    }
-
-    #[test]
-    fn terminate_user_process_retires_every_live_sibling() {
-        let _process_table = process_table::tests::isolate_process_table();
-        let mut scheduler = boxed_scheduler();
-        let owner = test_process(41);
-        let other = test_process(42);
-
-        scheduler.contexts[1] = Some(test_user_context(owner));
-        scheduler.contexts[2] = Some(test_user_context(owner));
-        scheduler.contexts[3] = Some(test_user_context(other));
-        scheduler.starts[1] = Some(TaskStart {
-            entry: noop_task_entry,
-            id: 41,
-        });
-        scheduler.starts[2] = Some(TaskStart {
-            entry: noop_task_entry,
-            id: 43,
-        });
-        scheduler.starts[3] = Some(TaskStart {
-            entry: noop_task_entry,
-            id: 42,
-        });
-
-        assert!(scheduler.terminate_user_process(41, Some(7)));
-        assert_eq!(process_table::is_process_exiting(41), Some(true));
-        assert!(scheduler.retired[1]);
-        assert!(scheduler.retired[2]);
-        assert!(!scheduler.retired[3]);
-    }
-
-    #[test]
-    fn terminating_the_last_task_marks_its_process_exiting() {
-        let _process_table = process_table::tests::isolate_process_table();
-        let mut scheduler = boxed_scheduler();
-        let owner = test_process(45);
-        scheduler.contexts[1] = Some(test_user_context(owner));
-        scheduler.starts[1] = Some(TaskStart {
-            entry: noop_task_entry,
-            id: 451,
-        });
-
-        assert!(scheduler.terminate_user_task(451, Some(7)));
-        assert_eq!(process_table::is_process_exiting(45), Some(true));
-        assert!(scheduler.retired[1]);
-    }
-
-    #[test]
-    fn retirement_revokes_task_and_process_ipc_authority() {
-        let _process_table = process_table::tests::isolate_process_table();
-        let mut scheduler = boxed_scheduler();
-        let owner = test_process(94);
-        scheduler.contexts[1] = Some(test_user_context(owner));
-        scheduler.starts[1] = Some(TaskStart {
-            entry: noop_task_entry,
-            id: 941,
-        });
-
-        let task_endpoint =
-            kernel_ipc_runtime::api::create_endpoint_for_task(941).expect("task-owned endpoint");
-        let process_endpoint = kernel_ipc_runtime::api::create_endpoint_for_process(94)
-            .expect("process-owned endpoint");
-        let (task_reply, _) =
-            kernel_ipc_runtime::api::enqueue_endpoint_call(task_endpoint, 951, b"task")
-                .expect("task call");
-        let (process_reply, _) =
-            kernel_ipc_runtime::api::enqueue_endpoint_call(process_endpoint, 952, b"process")
-                .expect("process call");
-
-        scheduler.retire_slot(
-            1,
-            super::TaskRetireReason::Terminated {
-                requested_by_pid: None,
-            },
-        );
-        scheduler
-            .take_retirement_side_effect()
-            .expect("retirement side effects")
-            .complete(|task_id| {
-                let _ = scheduler.wake_task(task_id);
-            });
-
-        assert!(matches!(
-            kernel_ipc_runtime::api::take_endpoint_response_detailed(task_reply, 0),
-            Ok(EndpointResponseTake::Error {
-                error: IpcError::PeerClosed,
-                discarded_request_handles,
-            }) if discarded_request_handles.is_empty()
-        ));
-        assert!(matches!(
-            kernel_ipc_runtime::api::take_endpoint_response_detailed(process_reply, 0),
-            Ok(EndpointResponseTake::Error {
-                error: IpcError::PeerClosed,
-                discarded_request_handles,
-            }) if discarded_request_handles.is_empty()
-        ));
-        assert_eq!(
-            kernel_ipc_runtime::api::enqueue_endpoint_call(task_endpoint, 953, b"late-task"),
-            Err(IpcError::InvalidHandle)
-        );
-        assert_eq!(
-            kernel_ipc_runtime::api::enqueue_endpoint_call(process_endpoint, 954, b"late-process"),
-            Err(IpcError::InvalidHandle)
-        );
-    }
-
-    #[test]
-    fn retired_user_slot_waits_for_exact_runtime_cleanup_ack() {
-        let _process_table = process_table::tests::isolate_process_table();
-        let mut scheduler = boxed_scheduler();
-        let owner = test_process(96);
-        scheduler.contexts[1] = Some(test_user_context(owner));
-        scheduler.starts[1] = Some(TaskStart {
-            entry: noop_task_entry,
-            id: 961,
-        });
-
-        scheduler.retire_slot(1, super::TaskRetireReason::Exited);
-        let cleanup = scheduler
-            .next_retired_task_cleanup()
-            .expect("retired user task cleanup");
-        assert_eq!(cleanup.task_id(), 961);
-        assert_eq!(cleanup.process_id(), 96);
-        assert!(cleanup.process_terminal());
-        // Retain the external side-effect token locally so this assertion
-        // isolates the runtime-cleanup acknowledgement gate. If that gate is
-        // removed, the retired stack becomes reclaimable before its exact
-        // userspace cleanup acknowledgement.
-        let side_effect = scheduler
-            .take_retirement_side_effect()
-            .expect("retirement side effects");
-        assert!(scheduler.reap_inactive_retired_slots().is_none());
-        assert!(scheduler.contexts[1].is_some());
-
-        assert!(
-            !scheduler.complete_retired_task_cleanup(crate::multitask::RetiredTaskCleanup {
-                task_id: 962,
-                process_id: 96,
-                process_terminal: true,
-                clear_child_tid: 0,
-                robust_list_head: 0,
-                robust_list_len: 0,
-            })
-        );
-        assert!(scheduler.complete_retired_task_cleanup(cleanup));
-        side_effect.complete(|task_id| {
-            let _ = scheduler.wake_task(task_id);
-        });
-        let reclaim = scheduler
-            .reap_inactive_retired_slots()
-            .expect("retired slot reclaim");
-        assert!(scheduler.contexts[1].is_none());
-        assert_eq!(process_table::thread_count_by_pid(96), Some(1));
-        reclaim.complete();
-        assert_eq!(process_table::thread_count_by_pid(96), Some(0));
-        assert_eq!(process_table::reap_exited_processes(), 1);
-    }
-
-    #[test]
-    fn retirement_cleanup_stamps_process_terminal_only_on_last_live_thread() {
-        let _process_table = process_table::tests::isolate_process_table();
-        let mut scheduler = boxed_scheduler();
-        let owner = test_process(97);
-        scheduler.contexts[1] = Some(test_user_context(owner));
-        scheduler.contexts[2] = Some(test_user_context(owner));
-        scheduler.starts[1] = Some(TaskStart {
-            entry: noop_task_entry,
-            id: 971,
-        });
-        scheduler.starts[2] = Some(TaskStart {
-            entry: noop_task_entry,
-            id: 972,
-        });
-
-        scheduler.retire_slot(1, super::TaskRetireReason::Exited);
-        let first = scheduler
-            .next_retired_task_cleanup()
-            .expect("first thread cleanup");
-        assert_eq!(first.task_id(), 971);
-        assert!(!first.process_terminal());
-        assert!(scheduler.complete_retired_task_cleanup(first));
-
-        scheduler.retire_slot(2, super::TaskRetireReason::Exited);
-        let last = scheduler
-            .next_retired_task_cleanup()
-            .expect("last thread cleanup");
-        assert_eq!(last.task_id(), 972);
-        assert!(last.process_terminal());
-    }
-
-    #[test]
-    fn exec_sibling_slot_stays_quarantined_until_runtime_cleanup() {
-        let _process_table = process_table::tests::isolate_process_table();
-        let mut scheduler = boxed_scheduler();
-        let owner = test_process(98);
-        scheduler.contexts[1] = Some(test_user_context(owner));
-        scheduler.contexts[2] = Some(test_user_context(owner));
-        scheduler.starts[1] = Some(TaskStart {
-            entry: noop_task_entry,
-            id: 981,
-        });
-        scheduler.starts[2] = Some(TaskStart {
-            entry: noop_task_entry,
-            id: 982,
-        });
-
-        scheduler.retire_exec_sibling_slot(2);
-        assert!(scheduler.retired[2]);
-        assert!(scheduler.contexts[2].is_some());
-        assert_eq!(scheduler.contexts[2].unwrap().process_handle, None);
-        assert_eq!(
-            scheduler
-                .next_retired_task_cleanup()
-                .map(|cleanup| cleanup.task_id()),
-            Some(982)
-        );
-        let _ = scheduler.reap_inactive_retired_slots();
-        assert!(scheduler.contexts[2].is_some());
-    }
-
-    #[test]
-    fn rejected_thread_attachment_releases_unpublished_stack() {
-        let _process_table = process_table::tests::isolate_process_table();
-        let mut scheduler = boxed_scheduler();
-        let owner = test_process(95);
-        scheduler.current_task = 1;
-        scheduler.contexts[1] = Some(test_user_context(owner));
-        process_table::mark_process_exiting(95).expect("mark exiting");
-        assert!(scheduler.reserve_user_thread_slot(951).is_none());
-        assert!(scheduler.contexts[2].is_none());
-        assert!(scheduler.stacks[2].is_none());
-    }
-
-    #[test]
-    fn synchronous_ipc_donation_promotes_and_revokes_a_transitive_user_chain() {
-        let _process_table = process_table::tests::isolate_process_table();
-        let mut scheduler = boxed_scheduler();
-        let interactive = test_process(61);
-        let broker = test_process(62);
-        let policy = test_process(63);
-
-        let mut interactive_context = test_user_context(interactive);
-        interactive_context.weight = SYSTEM_CLASS_WEIGHT_FLAG | NICE_0_LOAD;
-        scheduler.contexts[1] = Some(interactive_context);
-        scheduler.contexts[2] = Some(test_user_context(broker));
-        scheduler.contexts[3] = Some(test_user_context(policy));
-        scheduler.starts[1] = Some(TaskStart {
-            entry: noop_task_entry,
-            id: 601,
-        });
-        scheduler.starts[2] = Some(TaskStart {
-            entry: noop_task_entry,
-            id: 602,
-        });
-        scheduler.starts[3] = Some(TaskStart {
-            entry: noop_task_entry,
-            id: 603,
-        });
-
-        assert_eq!(scheduler.slot_class(2), Some(SchedClass::User));
-        assert_eq!(scheduler.slot_class(3), Some(SchedClass::User));
-        assert!(scheduler.inherit_ipc_priority(10, 601, 602));
-        assert_eq!(scheduler.slot_class(2), Some(SchedClass::System));
-
-        // The broker's nested synchronous call must pass the original
-        // interactive class through to the final policy server.
-        assert!(scheduler.inherit_ipc_priority(11, 602, 603));
-        assert_eq!(scheduler.slot_class(3), Some(SchedClass::System));
-
-        // A completed outer reply immediately restores both servers to their
-        // manifest-derived class; no priority boost can leak past capability
-        // lifetime.
-        assert!(scheduler.release_ipc_priority(10));
-        assert_eq!(scheduler.slot_class(2), Some(SchedClass::User));
-        assert_eq!(scheduler.slot_class(3), Some(SchedClass::User));
-        assert!(scheduler.release_ipc_priority(11));
-        assert_eq!(scheduler.slot_class(3), Some(SchedClass::User));
-
-        // A process-owned endpoint without a sleeping receiver must select an
-        // exact eligible worker before installing a System-class donation.
-        assert!(scheduler.reserve_ipc_priority(601));
-        let selected = scheduler
-            .bind_ipc_priority_to_process_worker(12, 601, 62)
-            .expect("eligible process worker");
-        assert_eq!(selected, 602);
-        assert_eq!(scheduler.slot_class(2), Some(SchedClass::System));
-        assert_eq!(scheduler.current_dispatch_policy().sync_pick_hints.len(), 1);
-        assert!(scheduler.release_ipc_priority(12));
-        assert_eq!(scheduler.slot_class(2), Some(SchedClass::User));
-
-        // If the server is executing between receive calls, the reservation
-        // follows the reply until that exact worker dequeues the request.
-        scheduler.contexts[2].as_mut().unwrap().ready = false;
-        assert!(scheduler.reserve_ipc_priority(601));
-        assert!(
-            scheduler
-                .bind_ipc_priority_to_process_worker(13, 601, 62)
-                .is_none()
-        );
-        assert!(scheduler.attach_reserved_ipc_priority(13, 601));
-        assert!(
-            scheduler
-                .ipc_priority_donations
-                .iter()
-                .flatten()
-                .any(|entry| {
-                    entry.reply == 13 && matches!(entry.target, IpcDonationTarget::AwaitingReceiver)
-                })
-        );
-        assert_eq!(scheduler.slot_class(2), Some(SchedClass::User));
-        assert!(scheduler.release_ipc_priority(13));
-        assert_eq!(scheduler.slot_class(2), Some(SchedClass::User));
-
-        assert!(scheduler.reserve_ipc_priority(601));
-        assert!(scheduler.attach_reserved_ipc_priority(14, 601));
-        assert!(scheduler.inherit_ipc_priority(14, 601, 602));
-        assert_eq!(scheduler.slot_class(2), Some(SchedClass::System));
-        assert!(scheduler.release_ipc_priority(14));
-        assert_eq!(scheduler.slot_class(2), Some(SchedClass::User));
-    }
-
-    #[test]
-    fn scheduler_block_arm_is_exact_race_safe_and_terminally_revoked() {
-        let mut scheduler = boxed_scheduler();
-        let base = crate::memory::paging::USER_SPACE_BASE;
-        let user_cs = crate::arch::gdt::user_code_selector().0 as u64;
-        let user_ss = crate::arch::gdt::user_data_selector().0 as u64;
-        let slot = scheduler
-            .allocate_user_slot(
-                690,
-                ProcessAddressSpace::empty_for_tests(),
-                UserTaskBootstrap::new(
-                    UserAbi::Linux,
-                    x86_64::VirtAddr::new(base + 0x2_000),
-                    x86_64::VirtAddr::new(base + 0x4_000),
-                ),
-                None,
-                crate::arch::pit::divisor_from_micros(100),
-                user_cs,
-                user_ss,
-                super::RFLAGS_RESERVED_BIT_1,
-                false,
-                noop_task_entry,
-            )
-            .expect("user slot");
-        scheduler.current_task = slot;
-        scheduler.contexts[slot]
-            .as_mut()
-            .expect("dispatched context")
-            .ready = false;
-
-        assert!(scheduler.arm_block_current_task());
-        assert!(scheduler.contexts[slot].expect("context").wake_armed);
-        assert!(scheduler.wake_task(690));
-        assert!(!scheduler.contexts[slot].expect("context").wake_armed);
-        assert_eq!(scheduler.commit_block_current_task(), Some(false));
-        assert!(!scheduler.contexts[slot].expect("context").ready);
-
-        assert!(scheduler.arm_block_current_task());
-        assert_eq!(scheduler.commit_block_current_task(), Some(true));
-        let blocked = scheduler.contexts[slot].expect("context");
-        assert!(blocked.blocked);
-        assert!(!blocked.ready);
-        assert!(!scheduler.arm_block_current_task());
-        assert!(!scheduler.cancel_block_current_task());
-
-        scheduler.current_task = super::ROOT_TASK_SLOT;
-        assert!(scheduler.wake_task(690));
-        assert!(scheduler.contexts[slot].expect("context").ready);
-        scheduler.contexts[slot]
-            .as_mut()
-            .expect("redispatched context")
-            .ready = false;
-        scheduler.current_task = slot;
-        assert!(scheduler.arm_block_current_task());
-        scheduler.retire_slot(slot, super::TaskRetireReason::Exited);
-        let retired = scheduler.contexts[slot].expect("retired context");
-        assert!(scheduler.retired[slot]);
-        assert!(!retired.wake_armed);
-        assert!(!scheduler.wake_task(690));
-        assert_eq!(scheduler.commit_block_current_task(), None);
-    }
-
-    #[test]
-    fn raced_wake_never_validates_a_consumed_current_frame() {
-        let mut scheduler = boxed_scheduler();
-        let slot = 1;
-        scheduler.contexts[slot] = Some(TaskContext {
-            // Dispatch consumed this frame. Deliberately leave an address that
-            // could never be validated as a published continuation.
-            saved_rsp: 0,
-            ready: false,
-            ready_since_ticks: 0,
-            blocked: false,
-            blocked_since_ticks: 0,
-            wake_armed: true,
-            weight: NICE_0_LOAD,
-            vruntime_ns: 0,
-            exec_start_ticks: 0,
-            address_space_root: 0,
-            kernel_stack_base: 0,
-            kernel_stack_top: 0,
-            alternate_kernel_stack_base: 0,
-            alternate_kernel_stack_top: 0,
-            user_mode: true,
-            user_abi: Some(UserAbi::Linux),
-            console_session: ConsoleSessionHandle::SYSTEM,
-            process_handle: None,
-            process_id: None,
-            user_stack: None,
-            windows_thread_state: None,
-        });
-        scheduler.starts[slot] = Some(TaskStart {
-            entry: noop_task_entry,
-            id: 691,
-        });
-        scheduler.current_task = slot;
-
-        assert!(scheduler.wake_task(691));
-        let context = scheduler.contexts[slot].expect("running task survived raced wake");
-        assert!(!scheduler.retired[slot]);
-        assert!(!context.ready);
-        assert!(!context.blocked);
-        assert!(!context.wake_armed);
-        assert_eq!(scheduler.commit_block_current_task(), Some(false));
-
-        // Commit publishes `blocked` before the caller enters its software
-        // schedule trap. A remote CPU can wake in that exact interval while
-        // the current stack frame is still consumed and intentionally invalid.
-        assert!(scheduler.arm_block_current_task());
-        assert_eq!(scheduler.commit_block_current_task(), Some(true));
-        assert!(scheduler.contexts[slot].expect("committed block").blocked);
-        assert!(scheduler.wake_task(691));
-        let context = scheduler.contexts[slot].expect("post-commit wake survived");
-        assert!(!scheduler.retired[slot]);
-        assert!(!context.ready);
-        assert!(!context.blocked);
-        assert!(!context.wake_armed);
-    }
-
-    #[test]
-    fn strict_class_requires_explicit_admission_not_a_large_cfs_weight() {
-        let _process_table = process_table::tests::isolate_process_table();
-        let mut scheduler = boxed_scheduler();
-        let broker = test_process(69);
-        let interactive = test_process(70);
-
-        let mut broker_context = test_user_context(broker);
-        broker_context.weight = 4 * NICE_0_LOAD;
-        let mut interactive_context = test_user_context(interactive);
-        interactive_context.weight = SYSTEM_CLASS_WEIGHT_FLAG | NICE_0_LOAD;
-        scheduler.contexts[1] = Some(broker_context);
-        scheduler.contexts[2] = Some(interactive_context);
-
-        assert_eq!(scheduler.slot_class(1), Some(SchedClass::User));
-        assert_eq!(scheduler.slot_class(2), Some(SchedClass::System));
-    }
-
-    #[test]
-    fn self_demotion_removes_base_system_class_and_caps_fair_weight() {
-        let _process_table = process_table::tests::isolate_process_table();
-        let mut scheduler = boxed_scheduler();
-        let helper = test_process(73);
-        let donor = test_process(74);
-
-        let mut helper_context = test_user_context(helper);
-        helper_context.weight = SYSTEM_CLASS_WEIGHT_FLAG | (4 * NICE_0_LOAD);
-        let mut donor_context = test_user_context(donor);
-        donor_context.weight = SYSTEM_CLASS_WEIGHT_FLAG | NICE_0_LOAD;
-        scheduler.contexts[1] = Some(helper_context);
-        scheduler.contexts[2] = Some(donor_context);
-        scheduler.starts[1] = Some(TaskStart {
-            entry: noop_task_entry,
-            id: 702,
-        });
-        scheduler.starts[2] = Some(TaskStart {
-            entry: noop_task_entry,
-            id: 701,
-        });
-        scheduler.current_task = 1;
-
-        assert!(scheduler.demote_current_user_task_to_user_class());
-        assert_eq!(scheduler.slot_class(1), Some(SchedClass::User));
-        assert_eq!(
-            scheduler.contexts[1].expect("current context").weight,
-            NICE_0_LOAD
-        );
-
-        // A synchronous reply donation is a separate, capability-scoped
-        // source of priority.  Demotion must not turn a pending interactive
-        // request into an unbounded priority inversion.
-        assert!(scheduler.inherit_ipc_priority(13, 701, 702));
-        assert_eq!(scheduler.slot_class(1), Some(SchedClass::System));
-        assert!(scheduler.demote_current_user_task_to_user_class());
-        assert_eq!(scheduler.slot_class(1), Some(SchedClass::System));
-        assert!(scheduler.release_ipc_priority(13));
-        assert_eq!(scheduler.slot_class(1), Some(SchedClass::User));
-
-        // The syscall is surrender-only. A task already below the nominal
-        // share must not be able to raise its weight by invoking it.
-        scheduler.contexts[1]
-            .as_mut()
-            .expect("current context")
-            .weight = SYSTEM_CLASS_WEIGHT_FLAG | MIN_LOAD_WEIGHT;
-        assert!(scheduler.demote_current_user_task_to_user_class());
-        assert_eq!(
-            scheduler.contexts[1].expect("current context").weight,
-            MIN_LOAD_WEIGHT
-        );
-    }
-
-    /// A donation chain must not turn userspace topology into kernel-stack
-    /// depth. `visiting` breaks cycles; only the depth bound stops a long
-    /// acyclic chain, and seL4 proves the two separately for this reason.
-    #[test]
-    fn ipc_donation_chain_depth_is_bounded() {
-        let _process_table = process_table::tests::isolate_process_table();
-        let mut scheduler = boxed_scheduler();
-
-        // Slot 1 is the System donor; slots 2.. are User links, each inheriting
-        // from the one before it.
-        const LINKS: u64 = super::MAX_IPC_DONATION_CHAIN_DEPTH as u64 + 2;
-        let mut donor_context = test_user_context(test_process(950));
-        donor_context.weight = SYSTEM_CLASS_WEIGHT_FLAG | NICE_0_LOAD;
-        scheduler.contexts[1] = Some(donor_context);
-        scheduler.starts[1] = Some(TaskStart {
-            entry: noop_task_entry,
-            id: 950,
-        });
-        for link in 0..LINKS {
-            let slot = 2 + link as usize;
-            let id = 960 + link;
-            scheduler.contexts[slot] = Some(test_user_context(test_process(id)));
-            scheduler.starts[slot] = Some(TaskStart {
-                entry: noop_task_entry,
-                id,
-            });
-        }
-        for link in 0..LINKS {
-            let receiver = 960 + link;
-            let donor = if link == 0 { 950 } else { receiver - 1 };
-            assert!(
-                scheduler.inherit_ipc_priority(link + 1, donor, receiver),
-                "donation {link} must be installed"
-            );
-        }
-
-        // The near end inherits System, as the nested-broker test requires.
-        assert_eq!(scheduler.slot_class(2), Some(SchedClass::System));
-
-        // Past the bound propagation stops and the link keeps its base class.
-        // Under-promoting is the safe direction: a donation only ever raises
-        // urgency, so truncation can never grant authority it should not have.
-        assert_eq!(
-            scheduler.slot_class(2 + super::MAX_IPC_DONATION_CHAIN_DEPTH),
-            Some(SchedClass::User),
-            "a chain deeper than the donation bound must not propagate"
-        );
-    }
-
-    #[test]
-    fn bounded_system_burst_reserves_a_ready_user_turn() {
-        let _process_table = process_table::tests::isolate_process_table();
-        let mut scheduler = boxed_scheduler();
-        let system = test_process(71);
-        let user = test_process(72);
-
-        let mut system_context = test_user_context(system);
-        system_context.weight = SYSTEM_CLASS_WEIGHT_FLAG | NICE_0_LOAD;
-        scheduler.contexts[1] = Some(system_context);
-        scheduler.contexts[2] = Some(test_user_context(user));
-        scheduler
-            .current_dispatch_policy_mut()
-            .system_dispatch_streak = MAX_CONSECUTIVE_SYSTEM_DISPATCHES;
-
-        assert!(Scheduler::user_reservation_due(
-            &scheduler.current_dispatch_policy()
-        ));
-        scheduler.record_dispatch_class(2);
-        assert_eq!(
-            scheduler.current_dispatch_policy().system_dispatch_streak,
-            0
-        );
-        assert!(!Scheduler::user_reservation_due(
-            &scheduler.current_dispatch_policy()
-        ));
-
-        scheduler.record_dispatch_class(1);
-        assert_eq!(
-            scheduler.current_dispatch_policy().system_dispatch_streak,
-            1
-        );
-    }
-
-    #[test]
-    fn user_reservation_obeys_vruntime_without_a_wall_clock_bypass() {
-        let mut scheduler = boxed_scheduler();
-        let base = crate::memory::paging::USER_SPACE_BASE;
-        let user_cs = crate::arch::gdt::user_code_selector().0 as u64;
-        let user_ss = crate::arch::gdt::user_data_selector().0 as u64;
-        let mut allocate = |task_id, offset, weight| {
-            scheduler
-                .allocate_user_slot(
-                    task_id,
-                    ProcessAddressSpace::empty_for_tests(),
-                    UserTaskBootstrap::new(
-                        UserAbi::Linux,
-                        x86_64::VirtAddr::new(base + offset),
-                        x86_64::VirtAddr::new(base + offset + 0x1_000),
-                    ),
-                    None,
-                    weight,
-                    user_cs,
-                    user_ss,
-                    super::RFLAGS_RESERVED_BIT_1,
-                    false,
-                    noop_task_entry,
-                )
-                .expect("user slot")
-        };
-        let current = allocate(
-            75,
-            0x2_000,
-            crate::arch::pit::divisor_from_micros(2_000) | super::INTERACTIVE_PIT_DIVISOR_FLAG,
-        );
-        let newer_user = allocate(76, 0x4_000, crate::arch::pit::divisor_from_micros(100));
-        let older_user = allocate(77, 0x6_000, crate::arch::pit::divisor_from_micros(100));
-        scheduler.contexts[newer_user]
-            .as_mut()
-            .expect("newer user context")
-            .ready_since_ticks = 2;
-        scheduler.contexts[newer_user]
-            .as_mut()
-            .expect("newer user context")
-            .vruntime_ns = 10;
-        scheduler.contexts[older_user]
-            .as_mut()
-            .expect("older user context")
-            .ready_since_ticks = 1;
-        scheduler.contexts[older_user]
-            .as_mut()
-            .expect("older user context")
-            .vruntime_ns = 20;
-
-        assert!(!Scheduler::user_reservation_due(
-            &scheduler.current_dispatch_policy()
-        ));
-        assert_eq!(
-            scheduler.reserved_user_pick(&scheduler.current_dispatch_policy(), current),
-            None
-        );
-
-        scheduler
-            .current_dispatch_policy_mut()
-            .system_dispatch_streak = MAX_CONSECUTIVE_SYSTEM_DISPATCHES;
-        assert_eq!(
-            scheduler.reserved_user_pick(&scheduler.current_dispatch_policy(), current),
-            Some(newer_user)
-        );
-    }
-
-    #[test]
-    fn fair_locality_is_bounded_by_class_and_vruntime_lag() {
-        let mut scheduler = boxed_scheduler();
-        let base = crate::memory::paging::USER_SPACE_BASE;
-        let user_cs = crate::arch::gdt::user_code_selector().0 as u64;
-        let user_ss = crate::arch::gdt::user_data_selector().0 as u64;
-        let mut allocate = |task_id, offset| {
-            scheduler
-                .allocate_user_slot(
-                    task_id,
-                    ProcessAddressSpace::empty_for_tests(),
-                    UserTaskBootstrap::new(
-                        UserAbi::Linux,
-                        x86_64::VirtAddr::new(base + offset),
-                        x86_64::VirtAddr::new(base + offset + 0x1_000),
-                    ),
-                    None,
-                    crate::arch::pit::divisor_from_micros(100),
-                    user_cs,
-                    user_ss,
-                    super::RFLAGS_RESERVED_BIT_1,
-                    false,
-                    noop_task_entry,
-                )
-                .expect("user slot")
-        };
-        let current = allocate(781, 0x2_000);
-        let global_min = allocate(782, 0x4_000);
-        let local = allocate(783, 0x6_000);
-        scheduler.current_task = current;
-        scheduler.task_last_cpu[current] = 0;
-        scheduler.task_last_cpu[global_min] = 1;
-        scheduler.task_last_cpu[local] = 0;
-        scheduler.contexts[current]
-            .as_mut()
-            .expect("current context")
-            .vruntime_ns = 10_000_000;
-        scheduler.contexts[global_min]
-            .as_mut()
-            .expect("global context")
-            .vruntime_ns = 1_000_000;
-        scheduler.contexts[local]
-            .as_mut()
-            .expect("local context")
-            .vruntime_ns = 1_000_000 + SCHED_CPU_LOCALITY_LAG_NS;
-
-        assert_eq!(scheduler.pick_min_vruntime(current), Some(local));
-
-        scheduler.contexts[local]
-            .as_mut()
-            .expect("local context")
-            .vruntime_ns = 1_000_001 + SCHED_CPU_LOCALITY_LAG_NS;
-        assert_eq!(scheduler.pick_min_vruntime(current), Some(global_min));
-
-        scheduler.contexts[global_min]
-            .as_mut()
-            .expect("global context")
-            .weight |= SYSTEM_CLASS_WEIGHT_FLAG;
-        scheduler.contexts[global_min]
-            .as_mut()
-            .expect("global context")
-            .vruntime_ns = u64::MAX / 2;
-        assert_eq!(scheduler.pick_min_vruntime(current), Some(global_min));
-    }
-
-    #[test]
-    fn overdue_system_task_is_forced_after_latency_bound() {
-        let mut scheduler = boxed_scheduler();
-        let base = crate::memory::paging::USER_SPACE_BASE;
-        let user_cs = crate::arch::gdt::user_code_selector().0 as u64;
-        let user_ss = crate::arch::gdt::user_data_selector().0 as u64;
-        let bootstrap = |offset| {
-            UserTaskBootstrap::new(
-                UserAbi::Linux,
-                x86_64::VirtAddr::new(base + offset),
-                x86_64::VirtAddr::new(base + offset + 0x1_000),
-            )
-        };
-        let current = scheduler
-            .allocate_user_slot(
-                701,
-                ProcessAddressSpace::empty_for_tests(),
-                bootstrap(0x2_000),
-                None,
-                crate::arch::pit::divisor_from_micros(100),
-                user_cs,
-                user_ss,
-                super::RFLAGS_RESERVED_BIT_1,
-                false,
-                noop_task_entry,
-            )
-            .expect("current slot");
-        let interactive = scheduler
-            .allocate_user_slot(
-                702,
-                ProcessAddressSpace::empty_for_tests(),
-                bootstrap(0x4_000),
-                None,
-                crate::arch::pit::divisor_from_micros(2_000) | super::INTERACTIVE_PIT_DIVISOR_FLAG,
-                user_cs,
-                user_ss,
-                super::RFLAGS_RESERVED_BIT_1,
-                false,
-                noop_task_entry,
-            )
-            .expect("interactive slot");
-        scheduler.contexts[interactive]
-            .as_mut()
-            .expect("interactive context")
-            .ready_since_ticks = 1;
-
-        let now_ticks = crate::arch::rtc::ticks_per_second().saturating_mul(2);
-        assert_eq!(
-            scheduler.overdue_system_pick(current, now_ticks),
-            Some(interactive)
-        );
-    }
-
-    #[test]
-    fn overdue_system_continuation_precedes_unrelated_ipc_hint_without_losing_it() {
-        let mut scheduler = boxed_scheduler();
-        let base = crate::memory::paging::USER_SPACE_BASE;
-        let user_cs = crate::arch::gdt::user_code_selector().0 as u64;
-        let user_ss = crate::arch::gdt::user_data_selector().0 as u64;
-        let mut allocate = |task_id, offset| {
-            scheduler
-                .allocate_user_slot(
-                    task_id,
-                    ProcessAddressSpace::empty_for_tests(),
-                    UserTaskBootstrap::new(
-                        UserAbi::Linux,
-                        x86_64::VirtAddr::new(base + offset),
-                        x86_64::VirtAddr::new(base + offset + 0x1_000),
-                    ),
-                    None,
-                    crate::arch::pit::divisor_from_micros(2_000)
-                        | super::INTERACTIVE_PIT_DIVISOR_FLAG,
-                    user_cs,
-                    user_ss,
-                    super::RFLAGS_RESERVED_BIT_1,
-                    false,
-                    noop_task_entry,
-                )
-                .expect("System task slot")
-        };
-        let current = allocate(811, 0x2_000);
-        let overdue = allocate(812, 0x4_000);
-        let hinted = allocate(813, 0x6_000);
-        scheduler.contexts[overdue]
-            .as_mut()
-            .expect("overdue context")
-            .ready_since_ticks = 1;
-        scheduler.contexts[hinted]
-            .as_mut()
-            .expect("hinted context")
-            .ready_since_ticks = 0;
-        scheduler.current_task = current;
-        scheduler.set_next_pick_hint(813);
-
-        // The chain offers overdue System work once, ahead of the hint, and
-        // leaves the hint pending when it wins. The second half also pins the
-        // premise that lets the chain scan once instead of twice: with the
-        // overdue task gone the same scan returns None, so re-running it before
-        // the hint could never have changed the outcome.
-        let now_ticks = crate::arch::rtc::ticks_per_second().saturating_mul(2);
-        assert_eq!(
-            scheduler.mandatory_overdue_system_pick(current, now_ticks),
-            Some(overdue)
-        );
-        assert_eq!(
-            scheduler.current_dispatch_policy().next_pick_hint,
-            Some(hinted)
-        );
-
-        scheduler.contexts[overdue]
-            .as_mut()
-            .expect("overdue context")
-            .ready = false;
-        assert_eq!(
-            scheduler.mandatory_overdue_system_pick(current, now_ticks),
-            None
-        );
-        assert_eq!(
-            scheduler.take_next_pick_hint_ready_slot(&mut scheduler.current_dispatch_policy()),
-            Some(hinted)
-        );
-        assert_eq!(scheduler.current_dispatch_policy().next_pick_hint, None);
-    }
-
-    #[test]
-    fn overdue_system_continuation_precedes_a_fresh_latency_handoff() {
-        let mut scheduler = boxed_scheduler();
-        let base = crate::memory::paging::USER_SPACE_BASE;
-        let user_cs = crate::arch::gdt::user_code_selector().0 as u64;
-        let user_ss = crate::arch::gdt::user_data_selector().0 as u64;
-        let mut allocate = |task_id, offset, system| {
-            scheduler
-                .allocate_user_slot(
-                    task_id,
-                    ProcessAddressSpace::empty_for_tests(),
-                    UserTaskBootstrap::new(
-                        UserAbi::Linux,
-                        x86_64::VirtAddr::new(base + offset),
-                        x86_64::VirtAddr::new(base + offset + 0x1_000),
-                    ),
-                    None,
-                    crate::arch::pit::divisor_from_micros(if system { 2_000 } else { 100 })
-                        | if system {
-                            super::INTERACTIVE_PIT_DIVISOR_FLAG
-                        } else {
-                            0
-                        },
-                    user_cs,
-                    user_ss,
-                    super::RFLAGS_RESERVED_BIT_1,
-                    false,
-                    noop_task_entry,
-                )
-                .expect("task slot")
-        };
-        let current = allocate(821, 0x2_000, true);
-        let overdue = allocate(822, 0x4_000, true);
-        let hinted = allocate(823, 0x6_000, false);
-        let now_ticks = crate::arch::rtc::ticks_per_second().saturating_mul(2);
-        scheduler.contexts[overdue]
-            .as_mut()
-            .expect("overdue context")
-            .ready_since_ticks = 1;
-        scheduler.contexts[hinted]
-            .as_mut()
-            .expect("hinted context")
-            .ready_since_ticks = now_ticks;
-        scheduler.current_task = current;
-        assert!(scheduler.set_next_latency_pick_hint(823));
-
-        assert_eq!(
-            scheduler.mandatory_overdue_system_pick(current, now_ticks),
-            Some(overdue)
-        );
-        assert_eq!(scheduler.current_dispatch_policy().latency_pick_hint_len, 1);
-
-        scheduler.contexts[overdue]
-            .as_mut()
-            .expect("overdue context")
-            .ready = false;
-        assert_eq!(
-            scheduler.mandatory_overdue_system_pick(current, now_ticks),
-            None
-        );
-        assert_eq!(
-            scheduler
-                .take_next_latency_pick_hint_ready_slot(&mut scheduler.current_dispatch_policy()),
-            Some(hinted)
-        );
-    }
-
-    #[test]
-    fn event_wait_handoff_is_fifo_deduplicated_and_burst_bounded() {
-        let mut scheduler = boxed_scheduler();
-        let base = crate::memory::paging::USER_SPACE_BASE;
-        let user_cs = crate::arch::gdt::user_code_selector().0 as u64;
-        let user_ss = crate::arch::gdt::user_data_selector().0 as u64;
-        let bootstrap = |offset| {
-            UserTaskBootstrap::new(
-                UserAbi::Linux,
-                x86_64::VirtAddr::new(base + offset),
-                x86_64::VirtAddr::new(base + offset + 0x1_000),
-            )
-        };
-        let user_slot = scheduler
-            .allocate_user_slot(
-                901,
-                ProcessAddressSpace::empty_for_tests(),
-                bootstrap(0x2_000),
-                None,
-                crate::arch::pit::divisor_from_micros(100),
-                user_cs,
-                user_ss,
-                super::RFLAGS_RESERVED_BIT_1,
-                false,
-                noop_task_entry,
-            )
-            .expect("user slot");
-        let system_slot = scheduler
-            .allocate_user_slot(
-                902,
-                ProcessAddressSpace::empty_for_tests(),
-                bootstrap(0x4_000),
-                None,
-                crate::arch::pit::divisor_from_micros(2_000) | super::INTERACTIVE_PIT_DIVISOR_FLAG,
-                user_cs,
-                user_ss,
-                super::RFLAGS_RESERVED_BIT_1,
-                false,
-                noop_task_entry,
-            )
-            .expect("system slot");
-        let second_user_slot = scheduler
-            .allocate_user_slot(
-                903,
-                ProcessAddressSpace::empty_for_tests(),
-                bootstrap(0x6_000),
-                None,
-                crate::arch::pit::divisor_from_micros(100),
-                user_cs,
-                user_ss,
-                super::RFLAGS_RESERVED_BIT_1,
-                false,
-                noop_task_entry,
-            )
-            .expect("second user slot");
-
-        assert_eq!(scheduler.slot_class(user_slot), Some(SchedClass::User));
-        assert_eq!(scheduler.slot_class(system_slot), Some(SchedClass::System));
-        assert_eq!(
-            scheduler.slot_class(second_user_slot),
-            Some(SchedClass::User)
-        );
-        assert!(scheduler.set_next_latency_pick_hint(901));
-        assert!(!scheduler.set_next_latency_pick_hint(902));
-        assert!(scheduler.set_next_latency_pick_hint(903));
-        assert!(scheduler.set_next_latency_pick_hint(901));
-        assert_eq!(
-            scheduler
-                .take_next_latency_pick_hint_ready_slot(&mut scheduler.current_dispatch_policy()),
-            Some(user_slot)
-        );
-        assert_eq!(
-            scheduler
-                .take_next_latency_pick_hint_ready_slot(&mut scheduler.current_dispatch_policy()),
-            Some(second_user_slot)
-        );
-        assert_eq!(
-            scheduler
-                .take_next_latency_pick_hint_ready_slot(&mut scheduler.current_dispatch_policy()),
-            None
-        );
-
-        assert!(scheduler.set_next_latency_pick_hint(901));
-        scheduler
-            .current_dispatch_policy_mut()
-            .latency_handoff_streak = super::MAX_CONSECUTIVE_LATENCY_HANDOFFS;
-        assert_eq!(
-            scheduler
-                .take_next_latency_pick_hint_ready_slot(&mut scheduler.current_dispatch_policy()),
-            None
-        );
-        scheduler.record_latency_handoff(false);
-        assert_eq!(
-            scheduler
-                .take_next_latency_pick_hint_ready_slot(&mut scheduler.current_dispatch_policy()),
-            Some(user_slot)
-        );
-    }
-
-    #[test]
-    fn dispatch_fairness_and_handoff_state_is_cpu_isolated() {
-        let _process_table = process_table::tests::isolate_process_table();
-        let mut scheduler = boxed_scheduler();
-        let user = test_process(904);
-        scheduler.contexts[1] = Some(test_user_context(user));
-        {
-            let mut policy = scheduler.cpu_dispatch[1].lock();
-            policy.system_dispatch_streak = MAX_CONSECUTIVE_SYSTEM_DISPATCHES;
-            policy.next_pick_hint = Some(7);
-        }
-
-        scheduler.record_dispatch_class(1);
-        scheduler.current_dispatch_policy_mut().next_pick_hint = None;
-
-        assert_eq!(scheduler.cpu_dispatch[0].lock().system_dispatch_streak, 0);
-        assert_eq!(
-            scheduler.cpu_dispatch[1].lock().system_dispatch_streak,
-            MAX_CONSECUTIVE_SYSTEM_DISPATCHES
-        );
-        assert_eq!(scheduler.cpu_dispatch[1].lock().next_pick_hint, Some(7));
-    }
-
-    /// Authority confinement: a donation edge must never be installable
-    /// where the donor and receiver are the same task, and it must never
-    /// bind a receiver that is already retired. `bind_reserved_ipc_priority`
-    /// and `inherit_ipc_priority` each carry an independent guard for this;
-    /// this test drives both call paths so a guard removed from either one
-    /// is caught here rather than only through the other's redundancy.
-    #[test]
-    fn ipc_donation_rejects_self_referential_and_retired_targets() {
-        let _process_table = process_table::tests::isolate_process_table();
-        let mut scheduler = boxed_scheduler();
-        let owner = test_process(64);
-
-        let mut donor_context = test_user_context(owner);
-        donor_context.weight = SYSTEM_CLASS_WEIGHT_FLAG | NICE_0_LOAD;
-        scheduler.contexts[1] = Some(donor_context);
-        scheduler.starts[1] = Some(TaskStart {
-            entry: noop_task_entry,
-            id: 640,
-        });
-
-        // A task cannot donate priority to itself, even with a live
-        // reservation already pending for that exact donor (which is what
-        // `bind_reserved_ipc_priority` would otherwise happily match).
-        assert!(!scheduler.inherit_ipc_priority(20, 640, 640));
-        assert!(scheduler.reserve_ipc_priority(640));
-        assert!(
-            !scheduler.bind_reserved_ipc_priority(20, 640, 640),
-            "self-referential donation must be rejected even with a live reservation"
-        );
-        assert!(scheduler.cancel_ipc_priority_reservation(640));
-
-        // A retired receiver can never gain a bound donation. `find_task_slot`
-        // already hides retired slots, so a retired receiver id resolves to
-        // no slot at all and `inherit_ipc_priority` must fail closed rather
-        // than silently install an orphaned donation via its unreserved
-        // upsert fallback.
-        scheduler.contexts[2] = Some(test_user_context(owner));
-        scheduler.starts[2] = Some(TaskStart {
-            entry: noop_task_entry,
-            id: 641,
-        });
-        scheduler.retired[2] = true;
-
-        assert!(
-            !scheduler.inherit_ipc_priority(22, 640, 641),
-            "donation must not bind a retired receiver"
-        );
-        assert!(
-            !scheduler
-                .ipc_priority_donations
-                .iter()
-                .flatten()
-                .any(|entry| entry.reply == 22),
-            "a rejected donation must not leak an entry into the table"
-        );
-    }
-
-    /// Bounded donation: the fixed-capacity donation table must reject
-    /// admission at exactly `MAX_TASK` live entries, never one past it -
-    /// the backing array has no slot beyond that bound.
-    #[test]
-    fn ipc_priority_donation_capacity_is_bounded_by_max_task() {
-        let mut scheduler = boxed_scheduler();
-        assert!(scheduler.ipc_priority_donation_capacity_available());
-        scheduler.ipc_priority_donation_len = MAX_TASK - 1;
-        assert!(scheduler.ipc_priority_donation_capacity_available());
-        scheduler.ipc_priority_donation_len = MAX_TASK;
-        assert!(!scheduler.ipc_priority_donation_capacity_available());
-    }
-
-    /// Bounded donation: a direct handoff floors the target's vruntime
-    /// toward the caller's (so it is picked promptly) but must never raise
-    /// it above what it already had - a donation can only help a receiver,
-    /// never push it backward in the fair queue.
-    #[test]
-    fn ipc_donation_floors_target_vruntime_and_never_raises_it() {
-        let mut scheduler = boxed_scheduler();
-        let base = crate::memory::paging::USER_SPACE_BASE;
-        let user_cs = crate::arch::gdt::user_code_selector().0 as u64;
-        let user_ss = crate::arch::gdt::user_data_selector().0 as u64;
-        let allocate = |scheduler: &mut Scheduler, task_id, offset| {
-            scheduler
-                .allocate_user_slot(
-                    task_id,
-                    ProcessAddressSpace::empty_for_tests(),
-                    UserTaskBootstrap::new(
-                        UserAbi::Linux,
-                        x86_64::VirtAddr::new(base + offset),
-                        x86_64::VirtAddr::new(base + offset + 0x1_000),
-                    ),
-                    None,
-                    crate::arch::pit::divisor_from_micros(100),
-                    user_cs,
-                    user_ss,
-                    super::RFLAGS_RESERVED_BIT_1,
-                    false,
-                    noop_task_entry,
-                )
-                .expect("user slot")
-        };
-        let caller = allocate(&mut scheduler, 661, 0x2_000);
-        let target = allocate(&mut scheduler, 662, 0x4_000);
-        scheduler.current_task = caller;
-        scheduler.contexts[caller]
-            .as_mut()
-            .expect("caller context")
-            .vruntime_ns = 10_000_000;
-        scheduler.contexts[target]
-            .as_mut()
-            .expect("target context")
-            .vruntime_ns = 50_000_000;
-
-        scheduler.apply_ipc_donation(target);
-        let floored = scheduler.contexts[target]
-            .expect("target context")
-            .vruntime_ns;
-        assert!(
-            floored <= 10_000_000,
-            "donation must floor the target toward the caller, got {floored}"
-        );
-
-        // Whatever the computed floor is, a donation is a `min()` against the
-        // target's current vruntime: it can only hold it steady or lower it,
-        // never raise it above where it already stood.
-        scheduler.contexts[target]
-            .as_mut()
-            .expect("target context")
-            .vruntime_ns = 1_000;
-        scheduler.apply_ipc_donation(target);
-        assert!(
-            scheduler.contexts[target]
-                .expect("target context")
-                .vruntime_ns
-                <= 1_000,
-            "donation must never raise a target's vruntime above its prior value"
-        );
-
-        // The donated floor is the *tighter* (smaller) of the caller's own
-        // floor and the target class's floor, not the looser one: swapping
-        // `min` for `max` here cannot be caught by a bound that only checks
-        // "never raised", because the outer `.min()` against the target's
-        // prior value still absorbs an over-large floor. Isolate the two
-        // floor sources (caller is System class so it drops out of the
-        // target's own User-class scan) and pin the exact result.
-        scheduler.contexts[caller]
-            .as_mut()
-            .expect("caller context")
-            .weight = SYSTEM_CLASS_WEIGHT_FLAG | NICE_0_LOAD;
-        scheduler.contexts[caller]
-            .as_mut()
-            .expect("caller context")
-            .vruntime_ns = 20_000_000;
-        scheduler.contexts[target]
-            .as_mut()
-            .expect("target context")
-            .vruntime_ns = 100_000_000;
-        scheduler.apply_ipc_donation(target);
-        assert_eq!(
-            scheduler.contexts[target]
-                .expect("target context")
-                .vruntime_ns,
-            18_000_000,
-            "the donated floor must be the tighter (smaller) of the caller and class floors"
-        );
-
-        // A task cannot donate to itself: `target_slot == current_task_slot()`
-        // must short-circuit before any vruntime mutation.
-        let self_vruntime_before = scheduler.contexts[caller]
-            .expect("caller context")
-            .vruntime_ns;
-        scheduler.apply_ipc_donation(caller);
-        assert_eq!(
-            scheduler.contexts[caller]
-                .expect("caller context")
-                .vruntime_ns,
-            self_vruntime_before,
-            "a task must never donate to itself"
-        );
-
-        // Idle-thread invariant: an idle-classed slot can never receive a
-        // donation, even if it otherwise looks runnable.
-        scheduler.idle_cpu[target] = 0;
-        scheduler.contexts[target]
-            .as_mut()
-            .expect("target context")
-            .vruntime_ns = 999_999;
-        scheduler.apply_ipc_donation(target);
-        assert_eq!(
-            scheduler.contexts[target]
-                .expect("target context")
-                .vruntime_ns,
-            999_999,
-            "an idle-classed slot must never be donated to"
-        );
-    }
-}
+mod tests;

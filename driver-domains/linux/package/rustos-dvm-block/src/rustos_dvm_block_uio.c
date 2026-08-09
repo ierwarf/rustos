@@ -69,6 +69,8 @@ static bool rustos_dvm_cursor_pair_valid(u64 producer, u64 consumer)
 
 static int rustos_dvm_block_validate_aperture(struct pci_dev *pdev)
 {
+	struct resource *shared =
+		&pdev->resource[RUSTOS_IVSHMEM_SHARED_BAR];
 	void __iomem *mapped;
 	u8 bytes[RUSTOS_DVM_BLOCK_RECORD_BYTES];
 	u64 features;
@@ -82,10 +84,16 @@ static int rustos_dvm_block_validate_aperture(struct pci_dev *pdev)
 	u32 flags;
 	int result = -ENODEV;
 
-	if (pci_resource_len(pdev, RUSTOS_IVSHMEM_SHARED_BAR) !=
-	    RUSTOS_DVM_BLOCK_APERTURE_BYTES)
+	if (!(shared->flags & IORESOURCE_MEM) ||
+	    !(shared->flags & IORESOURCE_PREFETCH) ||
+	    resource_size(shared) != RUSTOS_DVM_BLOCK_APERTURE_BYTES)
 		return -ENODEV;
-	mapped = pci_iomap(pdev, RUSTOS_IVSHMEM_SHARED_BAR, sizeof(bytes));
+	/*
+	 * BAR2 is shared RAM and every live participant maps it WB.  Do not use
+	 * pci_iomap() even for header discovery: on x86 that may create a
+	 * temporary UC alias while RustOS and the relay retain WB mappings.
+	 */
+	mapped = ioremap_cache(shared->start, sizeof(bytes));
 	if (!mapped)
 		return -ENOMEM;
 	memcpy_fromio(bytes, mapped, sizeof(bytes));
@@ -127,7 +135,7 @@ static int rustos_dvm_block_validate_aperture(struct pci_dev *pdev)
 					 completion_consumer))
 		result = 0;
 
-	pci_iounmap(pdev, mapped);
+	iounmap(mapped);
 	return result;
 }
 
@@ -208,6 +216,7 @@ static int rustos_dvm_block_probe(struct pci_dev *pdev,
 	    resource_size(registers) <
 		    RUSTOS_IVSHMEM_DOORBELL_OFFSET + sizeof(u32) ||
 	    !(shared->flags & IORESOURCE_MEM) ||
+	    !(shared->flags & IORESOURCE_PREFETCH) ||
 	    resource_size(shared) != RUSTOS_DVM_BLOCK_APERTURE_BYTES)
 		return -ENODEV;
 

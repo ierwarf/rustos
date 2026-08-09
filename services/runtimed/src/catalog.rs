@@ -102,7 +102,8 @@ pub(super) fn load_launch_catalog(
         .collect::<Vec<_>>();
 
     let launch_started = Instant::now();
-    let launch_entries = load_launch_entries(&programs, autostart_entries)?;
+    let mut launch_entries = load_launch_entries(&programs, autostart_entries)?;
+    sort_launch_entries(&mut launch_entries);
     let launch_elapsed = launch_started.elapsed().as_millis();
     boot_line(
         format!(
@@ -114,6 +115,83 @@ pub(super) fn load_launch_catalog(
     );
 
     Ok((programs, launch_entries))
+}
+
+/// Reconciles the private, DVM-volume qualification policy after the signed
+/// early-system catalog has committed. A transient storage failure never
+/// publishes a partial policy and never rolls back ordinary launch progress.
+pub(super) fn reconcile_kvm_smp_qualification_into_state(state: &mut BrokerState) -> bool {
+    if !state.launch_catalog_loaded || state.qualification_catalog_resolved {
+        return false;
+    }
+    if state
+        .qualification_catalog_retry_after
+        .is_some_and(|retry_after| Instant::now() < retry_after)
+    {
+        return false;
+    }
+
+    let candidate = match qualification_catalog_candidate(
+        &state.launch_entries,
+        super::kvm_smp_qualification::load_kvm_smp_qualification_contract(),
+    ) {
+        Ok(candidate) => candidate,
+        Err(errno) => return defer_qualification_catalog_retry(state, errno),
+    };
+    let injected = candidate.len() != state.launch_entries.len();
+    state.launch_entries = candidate;
+    state.qualification_catalog_resolved = true;
+    state.qualification_catalog_retry_after = None;
+    state.qualification_catalog_last_error = None;
+    state.qualification_catalog_failures = 0;
+    if injected {
+        debug_line("runtimed: private SMP qualification policy injected");
+        boot_line("runtimed: private SMP qualification policy injected");
+    }
+    true
+}
+
+fn defer_qualification_catalog_retry(state: &mut BrokerState, errno: i32) -> bool {
+    state.qualification_catalog_failures = state.qualification_catalog_failures.saturating_add(1);
+    state.qualification_catalog_retry_after = Some(
+        Instant::now() + qualification_catalog_retry_backoff(state.qualification_catalog_failures),
+    );
+    if state.qualification_catalog_last_error != Some(errno) {
+        debug_line(format!("runtimed: qualification catalog pending errno={errno}").as_str());
+        state.qualification_catalog_last_error = Some(errno);
+    }
+    false
+}
+
+fn qualification_catalog_retry_backoff(consecutive_failures: u32) -> std::time::Duration {
+    let exponent = consecutive_failures.saturating_sub(1).min(6);
+    super::STORAGE_NOT_READY_RETRY_BACKOFF
+        .saturating_mul(1_u32 << exponent)
+        .min(super::MAX_LAUNCH_RETRY_BACKOFF)
+}
+
+fn sort_launch_entries(launch_entries: &mut [LaunchEntry]) {
+    launch_entries.sort_by(|lhs, rhs| {
+        launch_entry_priority(lhs)
+            .cmp(&launch_entry_priority(rhs))
+            .then_with(|| lhs.desktop_file_id.cmp(&rhs.desktop_file_id))
+            .then_with(|| lhs.display_name.cmp(&rhs.display_name))
+            .then_with(|| lhs.exec.cmp(&rhs.exec))
+    });
+}
+
+fn qualification_catalog_candidate(
+    published_entries: &[LaunchEntry],
+    contract: Result<Option<super::kvm_smp_qualification::KvmSmpQualificationContract>, i32>,
+) -> Result<Vec<LaunchEntry>, i32> {
+    // Resolve the external snapshot before cloning the published ordinary
+    // catalog. This keeps the normal no-DVM retry path allocation-free.
+    let contract = contract?;
+    let mut candidate = published_entries.to_vec();
+    super::kvm_smp_qualification::inject_kvm_smp_qualification_launch(&mut candidate, contract)
+        .map_err(|()| libc::EINVAL)?;
+    sort_launch_entries(&mut candidate);
+    Ok(candidate)
 }
 
 fn validate_ui_bootstrap_metadata(programs: &BTreeMap<String, ProgramMetadata>) -> Result<(), i32> {
@@ -165,6 +243,7 @@ fn load_launch_entries(
             console_hosted: metadata.console_hosted,
             args: metadata.args.clone(),
             env: metadata.env.clone(),
+            private_smp_qualification: None,
         });
     }
 
@@ -188,6 +267,7 @@ fn load_launch_entries(
             console_hosted: metadata.console_hosted,
             args: metadata.args,
             env: metadata.env,
+            private_smp_qualification: None,
         });
     }
 
@@ -296,10 +376,12 @@ pub(super) fn runtime_deps_satisfied(
 #[cfg(test)]
 mod tests {
     use super::{
-        launch_entry_priority, validate_ui_bootstrap_metadata, LaunchEntry, ProgramMetadata,
-        StartupMode, UI_SERVER_BOOTSTRAP_ENV, UI_SERVER_CATALOG_WEIGHT_MICROS,
+        launch_entry_priority, qualification_catalog_candidate,
+        qualification_catalog_retry_backoff, validate_ui_bootstrap_metadata, LaunchEntry,
+        ProgramMetadata, StartupMode, UI_SERVER_BOOTSTRAP_ENV, UI_SERVER_CATALOG_WEIGHT_MICROS,
         UI_SERVER_DESKTOP_FILE_ID, UI_SERVER_EXEC_PATH,
     };
+    use crate::kvm_smp_qualification::KvmSmpQualificationContract;
     use std::collections::BTreeMap;
 
     fn app(desktop_file_id: &str) -> LaunchEntry {
@@ -315,6 +397,7 @@ mod tests {
             console_hosted: false,
             args: Vec::new(),
             env: Vec::new(),
+            private_smp_qualification: None,
         }
     }
 
@@ -323,6 +406,58 @@ mod tests {
         assert!(
             launch_entry_priority(&app("wayclick.desktop"))
                 < launch_entry_priority(&app("netprobe.desktop"))
+        );
+    }
+
+    #[test]
+    fn qualification_load_failure_leaves_published_ordinary_entries_unchanged() {
+        let entries = vec![app("ordinary.desktop")];
+        let original = entries.clone();
+        assert_eq!(
+            qualification_catalog_candidate(&entries, Err(libc::EAGAIN)),
+            Err(libc::EAGAIN)
+        );
+        assert_eq!(entries, original);
+    }
+
+    #[test]
+    fn qualification_retry_backoff_is_bounded_and_monotonic() {
+        let first = qualification_catalog_retry_backoff(1);
+        let second = qualification_catalog_retry_backoff(2);
+        let saturated = qualification_catalog_retry_backoff(u32::MAX);
+        assert_eq!(first, crate::STORAGE_NOT_READY_RETRY_BACKOFF);
+        assert!(second > first);
+        assert_eq!(saturated, crate::MAX_LAUNCH_RETRY_BACKOFF);
+    }
+
+    #[test]
+    fn absent_qualification_contract_keeps_ordinary_catalog_unchanged() {
+        let entries = vec![app("ordinary.desktop")];
+        let original = entries.clone();
+        let candidate =
+            qualification_catalog_candidate(&entries, Ok(None)).expect("normal product catalog");
+        assert_eq!(candidate, original);
+    }
+
+    #[test]
+    fn exact_qualification_contract_adds_one_catalog_policy() {
+        let entries = vec![app("ordinary.desktop")];
+        let entries = qualification_catalog_candidate(
+            &entries,
+            Ok(Some(KvmSmpQualificationContract {
+                workers: 1,
+                work_units: 1,
+                deadline_ms: 100,
+            })),
+        )
+        .expect("exact qualification contract");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.private_smp_qualification.is_some())
+                .count(),
+            1
         );
     }
 

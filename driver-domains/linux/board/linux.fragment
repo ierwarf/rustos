@@ -78,6 +78,10 @@ CONFIG_BRIDGE=m
 CONFIG_VLAN_8021Q=m
 CONFIG_SCSI=y
 CONFIG_BLK_DEV_SD=m
+# The KVM qualification volume is immutable ATAPI media on the assigned AHCI
+# controller. Keep its sr namespace in the signed kernel image so early S12
+# storage admission never depends on an unverified cold-plug helper.
+CONFIG_BLK_DEV_SR=y
 # Physical storage controllers are assigned after the initramfs is live.
 # Keep their device-class drivers signed and modular so the storage bootstrap
 # admits only the exact PCI modalias closure selected by S12.

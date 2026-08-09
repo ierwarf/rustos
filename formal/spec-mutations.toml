@@ -15,6 +15,7 @@ required_models = [
     "clocksource-deadline/ClocksourceDeadline",
     "cpu-online-lifecycle/CpuOnlineLifecycle",
     "cross-cpu-task-retirement/CrossCpuTaskRetirement",
+    "dvm-block-startup/DvmBlockStartup",
     "dvm-input-ring/DvmInputRing",
     "dvm-transport-lifecycle/DvmTransportLifecycle",
     "exception-retirement-lifecycle/ExceptionRetirementLifecycle",
@@ -23,21 +24,28 @@ required_models = [
     "input-ingestion-worker/InputIngestionWorker",
     "ipc-priority-inheritance/IpcPriorityInheritance",
     "ipc-priority-queue/IpcPriorityQueue",
+    "ipc-reply-deadline/IpcReplyDeadline",
     "ipc-reply-recv-transaction/IpcReplyRecvTransaction",
     "ipc-transfer-authority/IpcTransferAuthority",
     "msi-vector-lifecycle/MsiVectorLifecycle",
+    "netd-deferred-reply/NetdDeferredReply",
     "page-table-map-transaction/PageTableMapTransaction",
     "per-cpu-clockevent-lifecycle/PerCpuClockeventLifecycle",
     "product-boot/ProductBoot",
     "robust-futex-owner-death/RobustFutexOwnerDeath",
+    "scheduler-active-balance/SchedulerActiveBalance",
     "scheduler-cpu-distribution/SchedulerCpuDistribution",
     "scheduler-cpu-ownership/SchedulerCpuOwnership",
     "scheduler-thread-demotion/SchedulerThreadDemotion",
     "scheduler-wakeup/SchedulerWakeup",
     "smp-reschedule-ipi/SmpRescheduleIpi",
+    "smp-ring3-qualification/SmpRing3Qualification",
+    "synchronous-ipc-handoff-concurrency/SynchronousIpcHandoffConcurrency",
+    "synchronous-ipc-handoff/SynchronousIpcHandoff",
     "tlb-shootdown-lifecycle/TlbShootdownLifecycle",
     "user-stack-growth/UserStackGrowth",
     "userspace-wait-set/UserspaceWaitSet",
+    "userspace-wait-set/WaitSetRegistry",
     "wayland-accept-isolation/WaylandAcceptIsolation",
 ]
 
@@ -94,6 +102,30 @@ invariant = "AuthorityConsumptionRetainsSuspension"
 min_counterexample_states = 3
 
 [[mutation]]
+id = "activation-target-generation-preflight-removed"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "atomic-process-activation-batch/AtomicProcessActivationBatch"
+flow = "atomic-process-activation-batch"
+find = '    /\ TargetIdentityIsExact'
+replace = '    /\ TRUE'
+occurrence = 1
+invariant = "TargetIdentityReplacementCannotActivate"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "activation-target-identity-pid-only"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "atomic-process-activation-batch/AtomicProcessActivationBatch"
+flow = "atomic-process-activation-batch"
+find = "    TargetIdentity(currentGeneration) = TargetIdentity(snapshotGeneration)"
+replace = "    TargetIdentity(currentGeneration).pid = TargetIdentity(snapshotGeneration).pid"
+occurrence = 1
+invariant = "TargetIdentityReplacementCannotActivate"
+min_counterexample_states = 2
+
+[[mutation]]
 id = "clock-raw-tsc-smp-admission-guard-removed"
 kind = "transition-guard-removal"
 severity = "critical"
@@ -106,6 +138,50 @@ invariant = "RawTscRequiresUniprocessorTopology"
 min_counterexample_states = 2
 
 [[mutation]]
+id = "cpu-online-pat-readback-before-private-ready-removed"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "cpu-online-lifecycle/CpuOnlineLifecycle"
+flow = "cpu-online-lifecycle"
+find = '''PublishPrivateState(cpu) ==
+    /\ state[cpu] = Starting
+    /\ generation[cpu] = 1
+    /\ PatKernelCacheContractReady(cpu)'''
+replace = '''PublishPrivateState(cpu) ==
+    /\ state[cpu] = Starting
+    /\ generation[cpu] = 1
+    /\ TRUE'''
+occurrence = 1
+invariant = "BspAndEveryApReadBackExactPatBeforePrivateReady"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "cpu-online-pat-slot0-readback-corrupted"
+kind = "transition-effect"
+severity = "critical"
+model = "cpu-online-lifecycle/CpuOnlineLifecycle"
+flow = "cpu-online-lifecycle"
+find = "    /\\ patReadback' = [patReadback EXCEPT ![cpu] = PatKernelCacheContract]"
+replace = '''    /\ patReadback' = [patReadback EXCEPT ![cpu] =
+        [slot0 |-> "uc", slot2 |-> "uc", slot4 |-> "wc"]]'''
+occurrence = 1
+invariant = "ExactPatReadbackRequiresWbUcWcSelectors"
+min_counterexample_states = 5
+
+[[mutation]]
+id = "cpu-online-pat-slot2-readback-corrupted"
+kind = "transition-effect"
+severity = "critical"
+model = "cpu-online-lifecycle/CpuOnlineLifecycle"
+flow = "cpu-online-lifecycle"
+find = "    /\\ patReadback' = [patReadback EXCEPT ![cpu] = PatKernelCacheContract]"
+replace = '''    /\ patReadback' = [patReadback EXCEPT ![cpu] =
+        [slot0 |-> "wb", slot2 |-> "wb", slot4 |-> "wc"]]'''
+occurrence = 1
+invariant = "ExactPatReadbackRequiresWbUcWcSelectors"
+min_counterexample_states = 5
+
+[[mutation]]
 id = "cpu-online-restart-fails-open"
 kind = "transition-effect"
 severity = "critical"
@@ -116,14 +192,20 @@ find = '''RejectRestart(cpu) ==
     /\ restartAttempted' = TRUE
     /\ panicRaised' = TRUE
     /\ UNCHANGED <<state, generation, privateReady, schedulerReady,
-                   dispatchAuthority, failedSeen, staleGenerationAttempted>>'''
+                   dispatchAuthority, failedSeen, staleGenerationAttempted,
+                   initialPatSlot0, patSlot0Validated, patProgrammed,
+                   patReadback, sharedMemoryWbMapped,
+                   sharedMemorySelector>>'''
 replace = '''RejectRestart(cpu) ==
     /\ state[cpu] = Failed
     /\ state' = [state EXCEPT ![cpu] = Starting]
     /\ restartAttempted' = TRUE
     /\ panicRaised' = FALSE
     /\ UNCHANGED <<generation, privateReady, schedulerReady,
-                   dispatchAuthority, failedSeen, staleGenerationAttempted>>'''
+                   dispatchAuthority, failedSeen, staleGenerationAttempted,
+                   initialPatSlot0, patSlot0Validated, patProgrammed,
+                   patReadback, sharedMemoryWbMapped,
+                   sharedMemorySelector>>'''
 occurrence = 1
 invariant = "FailedStateIsTerminalForBoot"
 min_counterexample_states = 3
@@ -157,6 +239,18 @@ invariant = "InvalidGenerationFailsClosed"
 min_counterexample_states = 2
 
 [[mutation]]
+id = "cpu-online-wb-shared-memory-uses-wc-selector"
+kind = "transition-effect"
+severity = "critical"
+model = "cpu-online-lifecycle/CpuOnlineLifecycle"
+flow = "cpu-online-lifecycle"
+find = "    /\\ sharedMemorySelector' = WbSelector"
+replace = "    /\\ sharedMemorySelector' = WcSlot4Selector"
+occurrence = 1
+invariant = "WbSharedMemoryDoesNotUseWcSelector"
+min_counterexample_states = 2
+
+[[mutation]]
 id = "cross-cpu-replace-before-sibling-detach"
 kind = "transition-guard-removal"
 severity = "critical"
@@ -177,6 +271,47 @@ replace = '''Replace ==
 occurrence = 1
 invariant = "ReplacementRequiresAllOldExecutionStopped"
 min_counterexample_states = 3
+
+[[mutation]]
+id = "dvm-block-install-prefetchable-wb-gate-removed"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "dvm-block-startup/DvmBlockStartup"
+flow = "commercial-product-boot"
+find = '''    /\ barPrefetchable
+    /\ rustosApertureCache = "wb"'''
+replace = "    /\\ TRUE"
+occurrence = 1
+invariant = "InstalledTransportHasPrefetchableRustosWbAperture"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "dvm-block-rustos-wc-alias-admitted"
+kind = "transition-effect"
+severity = "critical"
+model = "dvm-block-startup/DvmBlockStartup"
+flow = "commercial-product-boot"
+find = "    /\\ rustosApertureCache' = \"wb\""
+replace = "    /\\ rustosApertureCache' = \"wc\""
+occurrence = 1
+invariant = "RustosAtomicApertureNeverUsesWc"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "dvm-block-successor-exact-admission-bypassed"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "dvm-block-startup/DvmBlockStartup"
+flow = "commercial-product-boot"
+find = '''    /\ candidateGeneration > generation
+    /\ candidateCursorsZero
+    /\ candidateSignatureValid'''
+replace = '''    /\ TRUE
+    /\ TRUE
+    /\ TRUE'''
+occurrence = 1
+invariant = "ReboundEpochIsStrictlyNewerSignedZeroCursor"
+min_counterexample_states = 8
 
 [[mutation]]
 id = "dvm-input-drain-owner-guard-removed"
@@ -309,7 +444,7 @@ replace = '''    /\ publicationFailed' = TRUE
                     locksNested>>'''
 occurrence = 1
 invariant = "NoVisibleHalfExec"
-min_counterexample_states = 6
+min_counterexample_states = 5
 
 [[mutation]]
 id = "exec-target-immediate-retire-during-transaction"
@@ -474,6 +609,58 @@ invariant = "DonationHasExactLiveReply"
 min_counterexample_states = 3
 
 [[mutation]]
+id = "ipc-reply-publication-eagerly-visible"
+kind = "transition-effect"
+severity = "critical"
+model = "ipc-reply-deadline/IpcReplyDeadline"
+flow = "ipc-call"
+find = "        [publicationState EXCEPT ![reply] = PendingPublication]"
+replace = "        [publicationState EXCEPT ![reply] = VisiblePublication]"
+occurrence = 1
+invariant = "VisiblePublicationRequiresConsumedTimelyReply"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "ipc-reply-publication-expiry-drop-omitted"
+kind = "transition-effect"
+severity = "critical"
+model = "ipc-reply-deadline/IpcReplyDeadline"
+flow = "ipc-call"
+find = '''            IF r \in DueCalls /\ publicationState[r] = PendingPublication
+            THEN DroppedPublication
+            ELSE publicationState[r]'''
+replace = '''            IF r \in DueCalls /\ publicationState[r] = PendingPublication
+            THEN publicationState[r]
+            ELSE publicationState[r]'''
+occurrence = 1
+invariant = "PendingPublicationIsOwnedByOneLiveReply"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "ipc-reply-publication-taking-expiry-omitted"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "ipc-reply-deadline/IpcReplyDeadline"
+flow = "ipc-call"
+find = 'OutstandingReply(r) == replyState[r] \in {Queued, Dequeued, Replied, Taking}'
+replace = 'OutstandingReply(r) == replyState[r] \in {Queued, Dequeued, Replied}'
+occurrence = 1
+invariant = "TakingReplyStillPrecedesDeadline"
+min_counterexample_states = 5
+
+[[mutation]]
+id = "ipc-reply-publication-timely-take-commit-omitted"
+kind = "transition-effect"
+severity = "critical"
+model = "ipc-reply-deadline/IpcReplyDeadline"
+flow = "ipc-call"
+find = "                      THEN VisiblePublication"
+replace = "                      THEN PendingPublication"
+occurrence = 1
+invariant = "PendingPublicationIsOwnedByOneLiveReply"
+min_counterexample_states = 5
+
+[[mutation]]
 id = "ipc-reply-recv-commit-effect-removed"
 kind = "transition-effect"
 severity = "critical"
@@ -583,6 +770,73 @@ invariant = "FailedPublicationHasNoAuthority"
 min_counterexample_states = 3
 
 [[mutation]]
+id = "netd-admission-class-cap-omitted"
+kind = "transition-effect"
+severity = "critical"
+model = "netd-deferred-reply/NetdDeferredReply"
+flow = "netd-deferred-reply-lifecycle"
+find = "    /\\ effectiveEnd' = [effectiveEnd EXCEPT ![r] = StampedEndAt(now)]"
+replace = "    /\\ effectiveEnd' = [effectiveEnd EXCEPT ![r] = WireEnd]"
+occurrence = 1
+invariant = "StampedEndMatchesAdmissionClamp"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "netd-admission-expiry-guard-removed"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "netd-deferred-reply/NetdDeferredReply"
+flow = "netd-deferred-reply-lifecycle"
+find = '''Admit(r) ==
+    /\ phase[r] = Free
+    /\ now < WireEnd
+    /\ Cardinality(reserved) < MaxPending
+'''
+replace = '''Admit(r) ==
+    /\ phase[r] = Free
+    /\ TRUE
+    /\ Cardinality(reserved) < MaxPending
+'''
+occurrence = 1
+invariant = "AdmittedBeforeWireDeadline"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "netd-expiry-reservation-release-omitted"
+kind = "transition-effect"
+severity = "critical"
+model = "netd-deferred-reply/NetdDeferredReply"
+flow = "netd-deferred-reply-lifecycle"
+find = "    /\\ reserved' = {r \\in reserved : ~ExpiresOnTick(r)}"
+replace = "    /\\ reserved' = reserved"
+occurrence = 1
+invariant = "ReservationMatchesLiveDeferredRequest"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "netd-requeue-refreshes-stamped-deadline"
+kind = "transition-effect"
+severity = "critical"
+model = "netd-deferred-reply/NetdDeferredReply"
+flow = "netd-deferred-reply-lifecycle"
+find = '''Requeue(r) ==
+    /\ phase[r] = Detached
+    /\ phase' = [phase EXCEPT ![r] = Queued]
+    /\ UNCHANGED <<now, reserved, replyAttempts, outcome, admittedAt,
+                   effectiveEnd, rejection>>
+'''
+replace = '''Requeue(r) ==
+    /\ phase[r] = Detached
+    /\ phase' = [phase EXCEPT ![r] = Queued]
+    /\ effectiveEnd' = [effectiveEnd EXCEPT ![r] = StampedEndAt(now)]
+    /\ UNCHANGED <<now, reserved, replyAttempts, outcome, admittedAt,
+                   rejection>>
+'''
+occurrence = 1
+invariant = "StampedEndMatchesAdmissionClamp"
+min_counterexample_states = 4
+
+[[mutation]]
 id = "nmi-acquires-interrupted-lock"
 kind = "transition-effect"
 severity = "critical"
@@ -669,6 +923,63 @@ invariant = "PresentedHasCompleteAuthorityChain"
 min_counterexample_states = 2
 
 [[mutation]]
+id = "scheduler-active-balance-due-guard-removed"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "scheduler-active-balance/SchedulerActiveBalance"
+flow = "scheduler-dispatch"
+find = '''TransferOne(task) ==
+    /\ Due
+    /\ Migratable(task)'''
+replace = '''TransferOne(task) ==
+    /\ TRUE
+    /\ Migratable(task)'''
+occurrence = 1
+invariant = "EveryTransferOccursOnDueOpportunity"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "scheduler-active-balance-execution-owner-admitted"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "scheduler-active-balance/SchedulerActiveBalance"
+flow = "scheduler-dispatch"
+find = '''QueueOnlyUnowned(task) ==
+    /\ task \in sourceQueue
+    /\ ~ExecutionOwned(task)
+    /\ task \notin transitioning'''
+replace = '''QueueOnlyUnowned(task) == SourceOwned(task)'''
+occurrence = 1
+invariant = "EachTaskHasExactlyOneCustody"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "scheduler-active-balance-mailbox-request-omitted"
+kind = "transition-effect"
+severity = "critical"
+model = "scheduler-active-balance/SchedulerActiveBalance"
+flow = "scheduler-dispatch"
+find = '''    /\ requestTarget' = [requestTarget EXCEPT ![task] = Target]'''
+replace = '''    /\ requestTarget' = [requestTarget EXCEPT ![task] = NoCpu]'''
+occurrence = 1
+invariant = "RemoteMailboxHasExactRequest"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "scheduler-active-balance-target-redirected"
+kind = "transition-effect"
+severity = "critical"
+model = "scheduler-active-balance/SchedulerActiveBalance"
+flow = "scheduler-dispatch"
+find = '''    /\ mailbox' = [mailbox EXCEPT ![task] = Target]
+    /\ requestTarget' = [requestTarget EXCEPT ![task] = Target]'''
+replace = '''    /\ mailbox' = [mailbox EXCEPT ![task] = WrongTarget]
+    /\ requestTarget' = [requestTarget EXCEPT ![task] = WrongTarget]'''
+occurrence = 1
+invariant = "RemoteCustodyUsesEligibleTarget"
+min_counterexample_states = 3
+
+[[mutation]]
 id = "scheduler-class-burst-cap-removed"
 kind = "transition-guard-removal"
 severity = "critical"
@@ -707,6 +1018,88 @@ replace = '''    /\ baseWeight' = baseWeight'''
 occurrence = 1
 invariant = "DemotionCapsPermanentWeight"
 min_counterexample_states = 2
+
+[[mutation]]
+id = "scheduler-dispatch-exact-queue-cpu-guard-removed"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "scheduler-cpu-ownership/SchedulerCpuOwnership"
+flow = "scheduler-cpu-ownership"
+find = '''BeginDispatch(cpu, nextTask) ==
+    /\ ~panicked
+    /\ preemptDepth[cpu] = 0
+    /\ guardTask[cpu] = NoTask
+    /\ transitionFrom[cpu] = NoTask
+    /\ nextTask \in ready
+    /\ nextTask \notin blocked
+    /\ nextTask \notin mailbox
+    /\ StackTransitionCommitted(nextTask)
+    /\ localQueueCpu[nextTask] = cpu'''
+replace = '''BeginDispatch(cpu, nextTask) ==
+    /\ ~panicked
+    /\ preemptDepth[cpu] = 0
+    /\ guardTask[cpu] = NoTask
+    /\ transitionFrom[cpu] = NoTask
+    /\ nextTask \in ready
+    /\ nextTask \notin blocked
+    /\ nextTask \notin mailbox
+    /\ StackTransitionCommitted(nextTask)
+    /\ TRUE'''
+occurrence = 1
+invariant = "RecordedDispatchClaimIsLocalExactRunnable"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "scheduler-dispatch-queue-custody-retained"
+kind = "transition-effect"
+severity = "critical"
+model = "scheduler-cpu-ownership/SchedulerCpuOwnership"
+flow = "scheduler-cpu-ownership"
+find = '''       /\ taskCpu' = [taskCpu EXCEPT
+            ![nextTask] = cpu]
+       /\ ready' = ready \ {nextTask}
+       /\ legacyReady' = legacyReady \ {nextTask}
+       /\ localQueueCpu' = [localQueueCpu EXCEPT ![nextTask] = NoCpu]'''
+replace = '''       /\ taskCpu' = [taskCpu EXCEPT
+            ![nextTask] = cpu]
+       /\ ready' = ready \ {nextTask}
+       /\ legacyReady' = legacyReady \ {nextTask}
+       /\ localQueueCpu' = [localQueueCpu EXCEPT ![nextTask] = @]'''
+occurrence = 1
+invariant = "RunningTasksHaveNoQueueCustody"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "scheduler-dispatch-runnable-guard-removed"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "scheduler-cpu-ownership/SchedulerCpuOwnership"
+flow = "scheduler-cpu-ownership"
+find = '''BeginDispatch(cpu, nextTask) ==
+    /\ ~panicked
+    /\ preemptDepth[cpu] = 0
+    /\ guardTask[cpu] = NoTask
+    /\ transitionFrom[cpu] = NoTask
+    /\ nextTask \in ready
+    /\ nextTask \notin blocked
+    /\ nextTask \notin mailbox
+    /\ StackTransitionCommitted(nextTask)
+    /\ localQueueCpu[nextTask] = cpu
+    /\ runnable[nextTask]'''
+replace = '''BeginDispatch(cpu, nextTask) ==
+    /\ ~panicked
+    /\ preemptDepth[cpu] = 0
+    /\ guardTask[cpu] = NoTask
+    /\ transitionFrom[cpu] = NoTask
+    /\ nextTask \in ready
+    /\ nextTask \notin blocked
+    /\ nextTask \notin mailbox
+    /\ StackTransitionCommitted(nextTask)
+    /\ localQueueCpu[nextTask] = cpu
+    /\ TRUE'''
+occurrence = 1
+invariant = "RecordedDispatchClaimIsLocalExactRunnable"
+min_counterexample_states = 3
 
 [[mutation]]
 id = "scheduler-fair-user-vruntime-guard-removed"
@@ -760,6 +1153,66 @@ replace = '''CommitStackSwitch(cpu) ==
 occurrence = 1
 invariant = "ReadyTasksAreNotRunning"
 min_counterexample_states = 3
+
+[[mutation]]
+id = "scheduler-ready-authority-lost"
+kind = "transition-effect"
+severity = "critical"
+model = "scheduler-cpu-ownership/SchedulerCpuOwnership"
+flow = "scheduler-cpu-ownership"
+find = '''       /\ ready' = IF previous \in (blocked \cup ready)
+                    THEN ready ELSE ready \cup {previous}'''
+replace = '''       /\ ready' = ready'''
+occurrence = 1
+invariant = "LegacyReadyHasPublishedCustody"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "scheduler-transition-legacy-ready-before-custody"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "scheduler-cpu-ownership/SchedulerCpuOwnership"
+flow = "scheduler-cpu-ownership"
+find = '''PublishLegacyReady(task) ==
+    /\ ~panicked
+    /\ task \in blocked
+    /\ task \in mailbox
+    /\ mailboxCpu[task] \in Cpus
+    /\ task \notin legacyReady'''
+replace = '''PublishLegacyReady(task) ==
+    /\ ~panicked
+    /\ task \in blocked
+    /\ TRUE
+    /\ task \notin legacyReady'''
+occurrence = 1
+invariant = "LegacyReadyHasPublishedCustody"
+min_counterexample_states = 5
+
+[[mutation]]
+id = "scheduler-transition-mailbox-publication-omitted"
+kind = "transition-effect"
+severity = "critical"
+model = "scheduler-cpu-ownership/SchedulerCpuOwnership"
+flow = "scheduler-cpu-ownership"
+find = "    /\\ mailbox' = mailbox \\cup {task}"
+replace = "    /\\ mailbox' = mailbox"
+occurrence = 1
+invariant = "MailboxCpuMatchesPublishedMailbox"
+min_counterexample_states = 5
+
+[[mutation]]
+id = "scheduler-transition-precommit-claim"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "scheduler-cpu-ownership/SchedulerCpuOwnership"
+flow = "scheduler-cpu-ownership"
+find = '''StackTransitionCommitted(task) ==
+    \A source \in Cpus: transitionFrom[source] # task'''
+replace = '''StackTransitionCommitted(task) ==
+    TRUE'''
+occurrence = 1
+invariant = "ReadyTasksAreNotRunning"
+min_counterexample_states = 7
 
 [[mutation]]
 id = "scheduler-transition-wake-dropped"
@@ -829,6 +1282,1032 @@ replace = "![target] = IF ~request[target] THEN source ELSE @"
 occurrence = 1
 invariant = "RemoteNotifyNeverTargetsFlusher"
 min_counterexample_states = 2
+
+[[mutation]]
+id = "smp-ring3-activate-without-bind-admitted"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "smp-ring3-qualification/SmpRing3Qualification"
+flow = "smp-ring3-qualification"
+find = '''Activate ==
+    /\ result = Pending
+    /\ BindingIsLiveExact'''
+replace = '''Activate ==
+    /\ result = Pending
+    /\ TRUE'''
+occurrence = 1
+invariant = "BindingLifecycleIsExact"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "smp-ring3-activation-deadline-stamp-bypassed"
+kind = "transition-effect"
+severity = "critical"
+model = "smp-ring3-qualification/SmpRing3Qualification"
+flow = "smp-ring3-qualification"
+find = "    /\\ absoluteDeadline' = now + QualifiedDeadline"
+replace = "    /\\ absoluteDeadline' = now + QualifiedDeadline + 1"
+occurrence = 1
+invariant = "ActivationStampsImmutableAbsoluteDeadline"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "smp-ring3-bind-after-activation-admitted"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "smp-ring3-qualification/SmpRing3Qualification"
+flow = "smp-ring3-qualification"
+find = '''Bind(owner, target) ==
+    /\ result = Pending
+    /\ bindingState = Deferred'''
+replace = '''Bind(owner, target) ==
+    /\ result = Pending
+    /\ bindingState \in {Deferred, Active}'''
+occurrence = 1
+invariant = "BindBeforeActivationAndNoRebind"
+min_counterexample_states = 5
+
+[[mutation]]
+id = "smp-ring3-bind-owner-authority-bypassed"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "smp-ring3-qualification/SmpRing3Qualification"
+flow = "smp-ring3-qualification"
+find = '''    /\ owner = SessiondAuthority
+    /\ owner = liveOwnerAuthority
+    /\ owner = deferredOwnerAuthority'''
+replace = '''    /\ TRUE
+    /\ TRUE
+    /\ TRUE'''
+occurrence = 1
+invariant = "BindingLifecycleIsExact"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "smp-ring3-bind-target-generation-bypassed"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "smp-ring3-qualification/SmpRing3Qualification"
+flow = "smp-ring3-qualification"
+find = '''    /\ target = liveTargetIdentity
+    /\ target = deferredTargetIdentity'''
+replace = '''    /\ TRUE
+    /\ TRUE'''
+occurrence = 1
+invariant = "BindingLifecycleIsExact"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "smp-ring3-binding-id-zero-admitted"
+kind = "transition-effect"
+severity = "critical"
+model = "smp-ring3-qualification/SmpRing3Qualification"
+flow = "smp-ring3-qualification"
+find = '''CorrectRecord(worker) ==
+    RecordFor(worker, worker, QualificationPid, worker + 1, QualifiedWork,
+              now, absoluteDeadline, bindingId)'''
+replace = '''CorrectRecord(worker) ==
+    RecordFor(worker, worker, QualificationPid, worker + 1, QualifiedWork,
+              now, absoluteDeadline, NoBindingId)'''
+occurrence = 1
+invariant = "NonzeroUniformKernelBindingId"
+min_counterexample_states = 5
+
+[[mutation]]
+id = "smp-ring3-complete-before-join-admitted"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "smp-ring3-qualification/SmpRing3Qualification"
+flow = "smp-ring3-qualification"
+find = '''RecordComplete ==
+    /\ ActiveRecordAdmission(0)
+    /\ AllJoined'''
+replace = '''RecordComplete ==
+    /\ ActiveRecordAdmission(0)
+    /\ TRUE'''
+occurrence = 1
+invariant = "WorkerFsmAndJoinBeforeComplete"
+min_counterexample_states = 5
+
+[[mutation]]
+id = "smp-ring3-complete-omission-admitted"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "smp-ring3-qualification/SmpRing3Qualification"
+flow = "smp-ring3-qualification"
+find = '''Succeed ==
+    /\ result = Pending
+    /\ bindingState = Active
+    /\ TerminalRecorded'''
+replace = '''Succeed ==
+    /\ result = Pending
+    /\ bindingState = Active
+    /\ AllJoined'''
+occurrence = 1
+invariant = "SuccessfulQualificationHasEveryExactEvidenceRecord"
+min_counterexample_states = 5
+
+[[mutation]]
+id = "smp-ring3-critical-drop-accounting-bypassed"
+kind = "transition-effect"
+severity = "critical"
+model = "smp-ring3-qualification/SmpRing3Qualification"
+flow = "smp-ring3-qualification"
+find = '''DropReady(worker) ==
+    /\ CriticalOutputDropAdmission(worker)
+    /\ worker = 0
+    /\ workerPhase[worker] = WorkerInit
+    /\ evidence' = [evidence EXCEPT ![Ready][worker] = CorrectRecord(worker)]
+    /\ workerPhase' = [workerPhase EXCEPT ![worker] = WorkerReady]
+    /\ catalog' = [catalog EXCEPT
+                       !.output.criticalDropped = TRUE,
+                       !.output.qualificationMilestonesDropped = 1,
+                       !.output.qualificationDebugBytesDiscarded = 1]'''
+replace = '''DropReady(worker) ==
+    /\ CriticalOutputDropAdmission(worker)
+    /\ worker = 0
+    /\ workerPhase[worker] = WorkerInit
+    /\ evidence' = [evidence EXCEPT ![Ready][worker] = CorrectRecord(worker)]
+    /\ workerPhase' = [workerPhase EXCEPT ![worker] = WorkerReady]
+    /\ catalog' = [catalog EXCEPT !.output.criticalDropped = TRUE]'''
+occurrence = 1
+invariant = "QualificationCriticalOutputAccountingIsExact"
+min_counterexample_states = 6
+
+[[mutation]]
+id = "smp-ring3-deadline-admission-gate-bypassed"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "smp-ring3-qualification/SmpRing3Qualification"
+flow = "smp-ring3-qualification"
+find = '''ActiveRecordAdmission(worker) ==
+    /\ result = Pending
+    /\ bindingState = Active
+    /\ worker \in ExpectedWorkers
+    /\ bindingId = KernelBindingId
+    /\ liveOwnerAuthority = boundOwnerAuthority
+    /\ liveTargetIdentity = boundTargetIdentity
+    /\ now < absoluteDeadline'''
+replace = '''ActiveRecordAdmission(worker) ==
+    /\ result = Pending
+    /\ bindingState = Active
+    /\ worker \in ExpectedWorkers
+    /\ bindingId = KernelBindingId
+    /\ liveOwnerAuthority = boundOwnerAuthority
+    /\ liveTargetIdentity = boundTargetIdentity
+    /\ TRUE'''
+occurrence = 1
+invariant = "NoAcceptedEvidenceAtOrAfterDeadline"
+min_counterexample_states = 5
+
+[[mutation]]
+id = "smp-ring3-deadline-refresh-accepted"
+kind = "transition-effect"
+severity = "critical"
+model = "smp-ring3-qualification/SmpRing3Qualification"
+flow = "smp-ring3-qualification"
+find = '''RejectDeadlineRefresh ==
+    /\ result = Pending
+    /\ bindingState = Active
+    /\ UNCHANGED vars'''
+replace = '''RejectDeadlineRefresh ==
+    /\ result = Pending
+    /\ bindingState = Active
+    /\ absoluteDeadline' = absoluteDeadline + 1
+    /\ UNCHANGED <<workerCount, evidence, completed, workerPhase,
+                    bindingState, liveOwnerAuthority, liveTargetIdentity,
+                    deferredOwnerAuthority, deferredTargetIdentity,
+                    boundOwnerAuthority, boundTargetIdentity, bindingId,
+                    activationCount, activationTick, now,
+                    uiReady, catalog, duplicateEvidenceAccepted, expiredEvidenceAccepted, result>>'''
+occurrence = 1
+invariant = "ActivationStampsImmutableAbsoluteDeadline"
+min_counterexample_states = 5
+
+[[mutation]]
+id = "smp-ring3-duplicate-evidence-accepted"
+kind = "transition-effect"
+severity = "critical"
+model = "smp-ring3-qualification/SmpRing3Qualification"
+flow = "smp-ring3-qualification"
+find = '''RejectDuplicateEvidence ==
+    /\ result = Pending
+    /\ \E worker \in ExpectedWorkers:
+          Recorded(Ready, worker) \/ Recorded(Start, worker) \/ Recorded(Finish, worker)
+    /\ UNCHANGED vars'''
+replace = '''RejectDuplicateEvidence ==
+    /\ result = Pending
+    /\ \E worker \in ExpectedWorkers:
+          Recorded(Ready, worker) \/ Recorded(Start, worker) \/ Recorded(Finish, worker)
+    /\ duplicateEvidenceAccepted' = TRUE
+    /\ UNCHANGED <<workerCount, evidence, completed, workerPhase,
+                    bindingState, liveOwnerAuthority, liveTargetIdentity,
+                    deferredOwnerAuthority, deferredTargetIdentity,
+                    boundOwnerAuthority, boundTargetIdentity, bindingId,
+                    activationCount, activationTick, absoluteDeadline, now,
+                    uiReady, catalog, expiredEvidenceAccepted, result>>'''
+occurrence = 1
+invariant = "MalformedEvidenceIsNeverAccepted"
+min_counterexample_states = 5
+
+[[mutation]]
+id = "smp-ring3-expired-evidence-accepted"
+kind = "transition-effect"
+severity = "critical"
+model = "smp-ring3-qualification/SmpRing3Qualification"
+flow = "smp-ring3-qualification"
+find = '''RejectExpiredEvidence ==
+    /\ result = Pending
+    /\ bindingState = Active
+    /\ now >= absoluteDeadline
+    /\ UNCHANGED vars'''
+replace = '''RejectExpiredEvidence ==
+    /\ result = Pending
+    /\ bindingState = Active
+    /\ now >= absoluteDeadline
+    /\ expiredEvidenceAccepted' = TRUE
+    /\ UNCHANGED <<workerCount, evidence, completed, workerPhase,
+                    bindingState, liveOwnerAuthority, liveTargetIdentity,
+                    deferredOwnerAuthority, deferredTargetIdentity,
+                    boundOwnerAuthority, boundTargetIdentity, bindingId,
+                    activationCount, activationTick, absoluteDeadline, now,
+                    uiReady, catalog, duplicateEvidenceAccepted, result>>'''
+occurrence = 1
+invariant = "MalformedEvidenceIsNeverAccepted"
+min_counterexample_states = 5
+
+[[mutation]]
+id = "smp-ring3-finish-before-start-admitted"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "smp-ring3-qualification/SmpRing3Qualification"
+flow = "smp-ring3-qualification"
+find = "    /\\ FinishAdmission(worker)"
+replace = "    /\\ TRUE"
+occurrence = 1
+invariant = "FinishRequiresOwnStartAndGlobalBoundedWork"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "smp-ring3-foreign-worker-evidence-accepted"
+kind = "transition-effect"
+severity = "critical"
+model = "smp-ring3-qualification/SmpRing3Qualification"
+flow = "smp-ring3-qualification"
+find = '''RejectForeignWorkerEvidence ==
+    /\ result = Pending
+    /\ bindingState = Active
+    /\ workerCount < MaxWorkers
+    /\ UNCHANGED vars'''
+replace = '''RejectForeignWorkerEvidence ==
+    /\ result = Pending
+    /\ bindingState = Active
+    /\ workerCount < MaxWorkers
+    /\ evidence' = [evidence EXCEPT ![Ready][MaxWorkers - 1] =
+        ForeignRecord(now)]
+    /\ UNCHANGED <<workerCount, completed, workerPhase, bindingState,
+                    liveOwnerAuthority, liveTargetIdentity,
+                    deferredOwnerAuthority, deferredTargetIdentity,
+                    boundOwnerAuthority, boundTargetIdentity, bindingId,
+                    activationCount, activationTick, absoluteDeadline, now,
+                    uiReady, catalog, duplicateEvidenceAccepted, expiredEvidenceAccepted, result>>'''
+occurrence = 1
+invariant = "ExactWorkerCpuBijectionAndStampedIdentity"
+min_counterexample_states = 5
+
+[[mutation]]
+id = "smp-ring3-owner-revoke-cleanup-bypassed"
+kind = "transition-revocation"
+severity = "critical"
+model = "smp-ring3-qualification/SmpRing3Qualification"
+flow = "smp-ring3-qualification"
+find = '''    /\ liveOwnerAuthority' = ReusedSessiondAuthority
+    /\ bindingState' = Revoked'''
+replace = '''    /\ liveOwnerAuthority' = ReusedSessiondAuthority
+    /\ bindingState' = Active'''
+occurrence = 1
+invariant = "ActiveBindingMatchesLiveOwnerAndTarget"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "smp-ring3-private-admission-dvm-executable-provenance-bypassed"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "smp-ring3-qualification/SmpRing3Qualification"
+flow = "smp-ring3-qualification"
+find = '''PrivateDeferredChildAdmissionEnabled ==
+    /\ result = Pending
+    /\ bindingState = NotCreated
+    /\ liveOwnerAuthority = SessiondAuthority
+    /\ liveTargetIdentity = QualificationIdentity
+    /\ ProductionVolumeReady
+    /\ ExactPrivateContractVisible
+    /\ TrustedQualificationExecutableSelected'''
+replace = '''PrivateDeferredChildAdmissionEnabled ==
+    /\ result = Pending
+    /\ bindingState = NotCreated
+    /\ liveOwnerAuthority = SessiondAuthority
+    /\ liveTargetIdentity = QualificationIdentity
+    /\ ProductionVolumeReady
+    /\ ExactPrivateContractVisible'''
+occurrence = 1
+invariant = "AttemptedDvmExecutableSubstitutionNeverEnablesPrivateAdmission"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "smp-ring3-private-admission-production-volume-gate-bypassed"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "smp-ring3-qualification/SmpRing3Qualification"
+flow = "smp-ring3-qualification"
+find = '''PrivateDeferredChildAdmissionEnabled ==
+    /\ result = Pending
+    /\ bindingState = NotCreated
+    /\ liveOwnerAuthority = SessiondAuthority
+    /\ liveTargetIdentity = QualificationIdentity
+    /\ ProductionVolumeReady
+    /\ ExactPrivateContractVisible
+    /\ TrustedQualificationExecutableSelected'''
+replace = '''PrivateDeferredChildAdmissionEnabled ==
+    /\ result = Pending
+    /\ bindingState = NotCreated
+    /\ liveOwnerAuthority = SessiondAuthority
+    /\ liveTargetIdentity = QualificationIdentity
+    /\ ExactPrivateContractVisible
+    /\ TrustedQualificationExecutableSelected'''
+occurrence = 1
+invariant = "PrivateDeferredChildAdmissionRequiresReadyExactProductionContract"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "smp-ring3-private-admission-ui-ready-gate-restored"
+kind = "transition-effect"
+severity = "critical"
+model = "smp-ring3-qualification/SmpRing3Qualification"
+flow = "smp-ring3-qualification"
+find = '''PrivateDeferredChildAdmissionEnabled ==
+    /\ result = Pending
+    /\ bindingState = NotCreated
+    /\ liveOwnerAuthority = SessiondAuthority
+    /\ liveTargetIdentity = QualificationIdentity
+    /\ ProductionVolumeReady
+    /\ ExactPrivateContractVisible
+    /\ TrustedQualificationExecutableSelected'''
+replace = '''PrivateDeferredChildAdmissionEnabled ==
+    /\ result = Pending
+    /\ bindingState = NotCreated
+    /\ liveOwnerAuthority = SessiondAuthority
+    /\ liveTargetIdentity = QualificationIdentity
+    /\ ProductionVolumeReady
+    /\ ExactPrivateContractVisible
+    /\ TrustedQualificationExecutableSelected
+    /\ uiReady'''
+occurrence = 1
+invariant = "PrivateDeferredChildAdmissionIsUiIndependent"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "smp-ring3-ready-barrier-bypassed"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "smp-ring3-qualification/SmpRing3Qualification"
+flow = "smp-ring3-qualification"
+find = '''    /\ AllReady
+    /\ worker = NextStartedWorker
+    /\ workerPhase[worker] = WorkerReady'''
+replace = '''    /\ TRUE
+    /\ worker = NextStartedWorker
+    /\ workerPhase[worker] = WorkerReady'''
+occurrence = 1
+invariant = "ReadyBarrierPrecedesEveryStart"
+min_counterexample_states = 5
+
+[[mutation]]
+id = "smp-ring3-scheduler-measurement-loss-contaminates-qualification-accounting"
+kind = "transition-effect"
+severity = "critical"
+model = "smp-ring3-qualification/SmpRing3Qualification"
+flow = "smp-ring3-qualification"
+find = '''DropSchedulerMeasurement ==
+    /\ ActiveRecordAdmission(0)
+    /\ ~output.schedulerMeasurementDropped
+    /\ catalog' = [catalog EXCEPT !.output.schedulerMeasurementDropped = TRUE]'''
+replace = '''DropSchedulerMeasurement ==
+    /\ ActiveRecordAdmission(0)
+    /\ ~output.schedulerMeasurementDropped
+    /\ catalog' = [catalog EXCEPT
+                       !.output.schedulerMeasurementDropped = TRUE,
+                       !.output.qualificationMilestonesDropped = 1]'''
+occurrence = 1
+invariant = "SchedulerMeasurementLossDoesNotTaintQualificationAccounting"
+min_counterexample_states = 6
+
+[[mutation]]
+id = "smp-ring3-success-output-clean-guard-bypassed"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "smp-ring3-qualification/SmpRing3Qualification"
+flow = "smp-ring3-qualification"
+find = '''    /\ QualificationEvidenceEventCount = 3 * workerCount + 1
+    /\ QualificationOutputClean
+    /\ bindingState' = Terminal'''
+replace = '''    /\ QualificationEvidenceEventCount = 3 * workerCount + 1
+    /\ TRUE
+    /\ bindingState' = Terminal'''
+occurrence = 1
+invariant = "SuccessfulQualificationHasCleanExactOutput"
+min_counterexample_states = 10
+
+[[mutation]]
+id = "smp-ring3-target-invalidation-cleanup-bypassed"
+kind = "transition-revocation"
+severity = "critical"
+model = "smp-ring3-qualification/SmpRing3Qualification"
+flow = "smp-ring3-qualification"
+find = '''    /\ liveTargetIdentity' = next
+    /\ bindingState' = Revoked'''
+replace = '''    /\ liveTargetIdentity' = next
+    /\ bindingState' = Active'''
+occurrence = 1
+invariant = "ActiveBindingMatchesLiveOwnerAndTarget"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "smp-ring3-transient-volume-unavailable-accepted-as-absent"
+kind = "transition-effect"
+severity = "critical"
+model = "smp-ring3-qualification/SmpRing3Qualification"
+flow = "smp-ring3-qualification"
+find = '''ObserveTransientProductionVolumeUnavailable ==
+    /\ result = Pending
+    /\ bindingState = NotCreated
+    /\ ~ProductionVolumeReady
+    /\ catalog.privateState = PrivateQualificationPending
+    /\ catalog.observation # CatalogVolumeTransientlyUnavailable
+    /\ catalog' = [catalog EXCEPT
+                       !.observation = CatalogVolumeTransientlyUnavailable]
+    /\ UNCHANGED <<workerCount, evidence, completed, workerPhase,
+                    bindingState, liveOwnerAuthority, liveTargetIdentity,
+                    deferredOwnerAuthority, deferredTargetIdentity,
+                    boundOwnerAuthority, boundTargetIdentity, bindingId,
+                    activationCount, activationTick, absoluteDeadline, now,
+                    uiReady, duplicateEvidenceAccepted, expiredEvidenceAccepted, result>>'''
+replace = '''ObserveTransientProductionVolumeUnavailable ==
+    /\ result = Pending
+    /\ bindingState = NotCreated
+    /\ ~ProductionVolumeReady
+    /\ catalog.privateState = PrivateQualificationPending
+    /\ catalog.observation # CatalogVolumeTransientlyUnavailable
+    /\ catalog' = [catalog EXCEPT
+                       !.privateState = PrivateContractAbsent,
+                       !.observation = CatalogVolumeTransientlyUnavailable]
+    /\ UNCHANGED <<workerCount, evidence, completed, workerPhase,
+                    bindingState, liveOwnerAuthority, liveTargetIdentity,
+                    deferredOwnerAuthority, deferredTargetIdentity,
+                    boundOwnerAuthority, boundTargetIdentity, bindingId,
+                    activationCount, activationTick, absoluteDeadline, now,
+                    uiReady, duplicateEvidenceAccepted, expiredEvidenceAccepted, result>>'''
+occurrence = 1
+invariant = "TransientProductionVolumeUnavailabilityRemainsPending"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "smp-ring3-work-immutability-bypassed"
+kind = "transition-effect"
+severity = "critical"
+model = "smp-ring3-qualification/SmpRing3Qualification"
+flow = "smp-ring3-qualification"
+find = '''RecordReady(worker) ==
+    /\ ActiveRecordAdmission(worker)
+    /\ worker = NextReadyWorker
+    /\ workerPhase[worker] = WorkerInit
+    /\ evidence' = [evidence EXCEPT ![Ready][worker] = CorrectRecord(worker)]'''
+replace = '''RecordReady(worker) ==
+    /\ ActiveRecordAdmission(worker)
+    /\ worker = NextReadyWorker
+    /\ workerPhase[worker] = WorkerInit
+    /\ evidence' = [evidence EXCEPT ![Ready][worker] =
+        RecordFor(worker, worker, QualificationPid, worker + 1, 0,
+                  now, absoluteDeadline, bindingId)]'''
+occurrence = 1
+invariant = "PhaseMetadataIsImmutableAndBounded"
+min_counterexample_states = 5
+
+[[mutation]]
+id = "synchronous-concurrency-begin-publication-slot-redirected"
+kind = "transition-effect"
+severity = "critical"
+model = "synchronous-ipc-handoff-concurrency/SynchronousIpcHandoffConcurrency"
+flow = "scheduler-dispatch"
+find = '''       /\ publicationBegins' = [publicationBegins EXCEPT ![task] = 1]'''
+replace = '''       /\ publicationBegins' = [publicationBegins EXCEPT ![CHOOSE other \in Tasks : other # task] = 1]'''
+occurrence = 1
+invariant = "QueuedRecordsOnlyComeFromBegin"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "synchronous-concurrency-begin-target-fifo-redirected"
+kind = "transition-effect"
+severity = "critical"
+model = "synchronous-ipc-handoff-concurrency/SynchronousIpcHandoffConcurrency"
+flow = "scheduler-dispatch"
+find = '''       /\ queue' = [queue EXCEPT ![targetCpu] = nextQueue]'''
+replace = '''       /\ queue' = [queue EXCEPT ![CHOOSE other \in Cpus : other # targetCpu] = nextQueue]'''
+occurrence = 1
+invariant = "QueuedRecordsStayOnCapturedCpu"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "synchronous-concurrency-nonlocal-consume-guard-bypassed"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "synchronous-ipc-handoff-concurrency/SynchronousIpcHandoffConcurrency"
+flow = "scheduler-dispatch"
+find = '''ConsumeNonDispatchableHead(cpu) ==
+    /\ cpu \in Cpus
+    /\ Len(queue[cpu]) > 0
+    /\ LET record == Head(queue[cpu]) IN
+       /\ ~SelectionAdmission(record, cpu)'''
+replace = '''ConsumeNonDispatchableHead(cpu) ==
+    /\ cpu \in Cpus
+    /\ Len(queue[cpu]) > 0
+    /\ LET record == Head(queue[cpu]) IN
+       /\ TRUE'''
+occurrence = 1
+invariant = "NonLocalHeadNeverDispatches"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "synchronous-concurrency-post-enqueue-recheck-bypassed"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "synchronous-ipc-handoff-concurrency/SynchronousIpcHandoffConcurrency"
+flow = "scheduler-dispatch"
+find = '''    /\ LET accepted == PublicationAdmission(task)
+       IN'''
+replace = '''    /\ LET accepted == TRUE
+       IN'''
+occurrence = 1
+invariant = "PostEnqueueObserverNeverBypassed"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "synchronous-concurrency-publication-generation-bypassed"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "synchronous-ipc-handoff-concurrency/SynchronousIpcHandoffConcurrency"
+flow = "scheduler-dispatch"
+find = '''PublicationAdmission(task) ==
+    /\ tokenPhase[task] \in {TokenMinted, TokenBegun}
+    /\ tokenRecord[task].slot = task
+    /\ tokenRecord[task].taskId = TaskId(task)
+    /\ tokenRecord[task].generation = ownerGeneration[task]'''
+replace = '''PublicationAdmission(task) ==
+    /\ tokenPhase[task] \in {TokenMinted, TokenBegun}
+    /\ tokenRecord[task].slot = task
+    /\ tokenRecord[task].taskId = TaskId(task)
+    /\ TRUE'''
+occurrence = 1
+invariant = "PublicationObserverNeverBypassed"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "synchronous-concurrency-publication-target-cpu-bypassed"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "synchronous-ipc-handoff-concurrency/SynchronousIpcHandoffConcurrency"
+flow = "scheduler-dispatch"
+find = '''PublicationAdmission(task) ==
+    /\ tokenPhase[task] \in {TokenMinted, TokenBegun}
+    /\ tokenRecord[task].slot = task
+    /\ tokenRecord[task].taskId = TaskId(task)
+    /\ tokenRecord[task].generation = ownerGeneration[task]
+    /\ tokenRecord[task].cpu = ownerCpu[task]'''
+replace = '''PublicationAdmission(task) ==
+    /\ tokenPhase[task] \in {TokenMinted, TokenBegun}
+    /\ tokenRecord[task].slot = task
+    /\ tokenRecord[task].taskId = TaskId(task)
+    /\ tokenRecord[task].generation = ownerGeneration[task]
+    /\ TRUE'''
+occurrence = 1
+invariant = "PublicationObserverNeverBypassed"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "synchronous-concurrency-retirement-purge-bypassed"
+kind = "transition-effect"
+severity = "critical"
+model = "synchronous-ipc-handoff-concurrency/SynchronousIpcHandoffConcurrency"
+flow = "scheduler-dispatch"
+find = '''    /\ queue' = PurgeSlotEverywhere(task)'''
+replace = '''    /\ queue' = queue'''
+occurrence = 1
+invariant = "RetirementPurgesEveryCpuFifo"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "synchronous-concurrency-scheduler-serialization-bypassed"
+kind = "transition-effect"
+severity = "critical"
+model = "synchronous-ipc-handoff-concurrency/SynchronousIpcHandoffConcurrency"
+flow = "scheduler-dispatch"
+find = '''       /\ replyCommitSerial' = [replyCommitSerial EXCEPT ![task] = schedulerSerial + 1]'''
+replace = '''       /\ replyCommitSerial' = [replyCommitSerial EXCEPT ![task] = schedulerSerial]'''
+occurrence = 1
+invariant = "SchedulerReplyWakesAreSerialized"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "synchronous-concurrency-selection-local-custody-bypassed"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "synchronous-ipc-handoff-concurrency/SynchronousIpcHandoffConcurrency"
+flow = "scheduler-dispatch"
+find = '''SelectionAdmission(record, cpu) ==
+    /\ record \in RecordType
+    /\ record.cpu = cpu
+    /\ record.slot \in Tasks
+    /\ record.taskId = TaskId(record.slot)
+    /\ record.generation = ownerGeneration[record.slot]
+    /\ ownerCpu[record.slot] = cpu
+    /\ taskState[record.slot] = TaskRunnable
+    /\ ownerRunnable[record.slot]
+    /\ ownerState[record.slot] = Local'''
+replace = '''SelectionAdmission(record, cpu) ==
+    /\ record \in RecordType
+    /\ record.cpu = cpu
+    /\ record.slot \in Tasks
+    /\ record.taskId = TaskId(record.slot)
+    /\ record.generation = ownerGeneration[record.slot]
+    /\ ownerCpu[record.slot] = cpu
+    /\ taskState[record.slot] = TaskRunnable
+    /\ ownerRunnable[record.slot]
+    /\ TRUE'''
+occurrence = 1
+invariant = "DispatchObserverNeverBypassed"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "synchronous-concurrency-stale-drop-fallback-published"
+kind = "transition-effect"
+severity = "critical"
+model = "synchronous-ipc-handoff-concurrency/SynchronousIpcHandoffConcurrency"
+flow = "scheduler-dispatch"
+find = '''    /\ tokenPhase' = [tokenPhase EXCEPT ![task] = TokenDropped]
+    /\ tokenUses' = [tokenUses EXCEPT ![task] = 1]
+    /\ UNCHANGED <<taskState, ownerGeneration, ownerCpu, ownerState,
+                    ownerRunnable, replyDonation, tokenRecord, queue,
+                    publicationBegins, postAccepted, schedulerSerial,'''
+replace = '''    /\ tokenPhase' = [tokenPhase EXCEPT ![task] = TokenDropped]
+    /\ tokenUses' = [tokenUses EXCEPT ![task] = 1]
+    /\ publicationBegins' = [publicationBegins EXCEPT ![task] = 1]
+    /\ UNCHANGED <<taskState, ownerGeneration, ownerCpu, ownerState,
+                    ownerRunnable, replyDonation, tokenRecord, queue,
+                    postAccepted, schedulerSerial,'''
+occurrence = 1
+invariant = "StaleDropHasNoFallbackPublication"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "synchronous-generic-handoff-target-fifo-redirected"
+kind = "transition-effect"
+severity = "critical"
+model = "synchronous-ipc-handoff/SynchronousIpcHandoff"
+flow = "scheduler-dispatch"
+find = '''       /\ queue' = [queue EXCEPT ![cpu] = nextQueue]'''
+replace = '''       /\ queue' = [queue EXCEPT ![CHOOSE other \in Cpus : other # cpu] = nextQueue]'''
+occurrence = 1
+invariant = "QueueRecordsBelongToTheirCpu"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "synchronous-generic-handoff-weakens-reply-custody"
+kind = "transition-effect"
+severity = "critical"
+model = "synchronous-ipc-handoff/SynchronousIpcHandoff"
+flow = "scheduler-dispatch"
+find = '''           nextQueue ==
+               IF NoQueuedTaskId(cpu, taskId[slot])
+               THEN Append(queue[cpu], record)
+               ELSE queue[cpu]'''
+replace = '''           nextQueue ==
+               IF NoQueuedTaskId(cpu, taskId[slot])
+               THEN Append(queue[cpu], record)
+               ELSE ReplaceSameTaskRecord(queue[cpu], taskId[slot], record)'''
+occurrence = 1
+invariant = "GenericNeverDowngradesReplyCustody"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "synchronous-nondispatchable-head-fairness-bypassed"
+kind = "transition-guard-removal"
+severity = "high"
+model = "synchronous-ipc-handoff/SynchronousIpcHandoff"
+flow = "scheduler-dispatch"
+find = '''DropNonDispatchableQueuedHandoff(cpu) ==
+    /\ cpu \in Cpus
+    /\ Len(queue[cpu]) > 0
+    /\ handoffBurst[cpu] < MaxHandoffBurst'''
+replace = '''DropNonDispatchableQueuedHandoff(cpu) ==
+    /\ cpu \in Cpus
+    /\ Len(queue[cpu]) > 0
+    /\ TRUE'''
+occurrence = 1
+invariant = "NonDispatchableHeadRespectsFairnessPrecedence"
+min_counterexample_states = 5
+
+[[mutation]]
+id = "synchronous-reply-handoff-fairness-bypassed"
+kind = "transition-guard-removal"
+severity = "high"
+model = "synchronous-ipc-handoff/SynchronousIpcHandoff"
+flow = "scheduler-dispatch"
+find = '''DispatchHandoff(cpu) ==
+    /\ cpu \in Cpus
+    /\ Len(queue[cpu]) > 0
+    /\ handoffBurst[cpu] < MaxHandoffBurst'''
+replace = '''DispatchHandoff(cpu) ==
+    /\ cpu \in Cpus
+    /\ Len(queue[cpu]) > 0
+    /\ TRUE'''
+occurrence = 1
+invariant = "HandoffBurstIsBounded"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "synchronous-reply-handoff-fairness-charged-to-wrong-cpu"
+kind = "transition-effect"
+severity = "high"
+model = "synchronous-ipc-handoff/SynchronousIpcHandoff"
+flow = "scheduler-dispatch"
+find = '''    /\ handoffBurst' = [handoffBurst EXCEPT ![cpu] = @ + 1]'''
+replace = '''    /\ handoffBurst' = [handoffBurst EXCEPT ![CHOOSE other \in Cpus : other # cpu] = @ + 1]'''
+occurrence = 1
+invariant = "HandoffBurstIsBounded"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "synchronous-reply-record-selection-owner-check-bypassed"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "synchronous-ipc-handoff/SynchronousIpcHandoff"
+flow = "scheduler-dispatch"
+find = '''ReplyRecordIsLocallyDispatchable(record, cpu) ==
+    /\ record \in RecordType
+    /\ record.kind = Reply
+    /\ record.cpu = cpu
+    /\ record.taskId = taskId[record.slot]
+    /\ record.ownerGeneration = ownerGeneration[record.slot]'''
+replace = '''ReplyRecordIsLocallyDispatchable(record, cpu) ==
+    /\ record \in RecordType
+    /\ record.kind = Reply
+    /\ record.cpu = cpu
+    /\ record.taskId = taskId[record.slot]
+    /\ TRUE'''
+occurrence = 1
+invariant = "StaleRecordNeverDispatches"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "synchronous-reply-selection-local-custody-bypassed"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "synchronous-ipc-handoff/SynchronousIpcHandoff"
+flow = "scheduler-dispatch"
+find = '''ReplyRecordIsLocallyDispatchable(record, cpu) ==
+    /\ record \in RecordType
+    /\ record.kind = Reply
+    /\ record.cpu = cpu
+    /\ record.taskId = taskId[record.slot]
+    /\ record.ownerGeneration = ownerGeneration[record.slot]
+    /\ ownerCpu[record.slot] = cpu
+    /\ taskState[record.slot] = Runnable
+    /\ ownerRunnable[record.slot]
+    /\ ownerState[record.slot] = Local'''
+replace = '''ReplyRecordIsLocallyDispatchable(record, cpu) ==
+    /\ record \in RecordType
+    /\ record.kind = Reply
+    /\ record.cpu = cpu
+    /\ record.taskId = taskId[record.slot]
+    /\ record.ownerGeneration = ownerGeneration[record.slot]
+    /\ ownerCpu[record.slot] = cpu
+    /\ taskState[record.slot] = Runnable
+    /\ ownerRunnable[record.slot]
+    /\ TRUE'''
+occurrence = 1
+invariant = "StaleRecordNeverDispatches"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "synchronous-reply-token-call-refresh-disabled"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "synchronous-ipc-handoff/SynchronousIpcHandoff"
+flow = "scheduler-dispatch"
+find = '''ReplyTokenRefreshesExisting(slot) ==
+    \E index \in 1..Len(queue[tokenRecord[slot].cpu]) :
+        /\ queue[tokenRecord[slot].cpu][index].taskId = tokenRecord[slot].taskId
+        /\ (queue[tokenRecord[slot].cpu][index].kind = Call \/'''
+replace = '''ReplyTokenRefreshesExisting(slot) ==
+    \E index \in 1..Len(queue[tokenRecord[slot].cpu]) :
+        /\ queue[tokenRecord[slot].cpu][index].taskId = tokenRecord[slot].taskId
+        /\ (FALSE \/'''
+occurrence = 1
+invariant = "ReplyRefreshMatchesMonotonicQueueSemantics"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "synchronous-reply-token-cross-cpu-global-dedup"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "synchronous-ipc-handoff/SynchronousIpcHandoff"
+flow = "scheduler-dispatch"
+find = '''           nextQueue ==
+               IF NoQueuedTaskId(targetCpu, tokenRecord[slot].taskId)
+               THEN Append(queue[targetCpu], tokenRecord[slot])'''
+replace = '''           nextQueue ==
+               IF tokenRecord[slot].taskId \notin
+                   UNION {QueueTaskIds(other) : other \in Cpus}
+               THEN Append(queue[targetCpu], tokenRecord[slot])'''
+occurrence = 1
+invariant = "ReplyRefreshMatchesMonotonicQueueSemantics"
+min_counterexample_states = 5
+
+[[mutation]]
+id = "synchronous-reply-token-double-publish"
+kind = "transition-effect"
+severity = "critical"
+model = "synchronous-ipc-handoff/SynchronousIpcHandoff"
+flow = "scheduler-dispatch"
+find = '''    /\ publicationPending' = [publicationPending EXCEPT ![slot] = FALSE]
+    /\ tokenLive' = [tokenLive EXCEPT ![slot] = FALSE]'''
+replace = '''    /\ publicationPending' = [publicationPending EXCEPT ![slot] = FALSE]
+    /\ UNCHANGED tokenLive'''
+occurrence = 1
+invariant = "ReplyTokenPublishesAtMostOnce"
+min_counterexample_states = 5
+
+[[mutation]]
+id = "synchronous-reply-token-owner-generation-bypassed"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "synchronous-ipc-handoff/SynchronousIpcHandoff"
+flow = "scheduler-dispatch"
+find = "    /\\ tokenRecord[slot].ownerGeneration = ownerGeneration[slot]"
+replace = "    /\\ TRUE"
+occurrence = 1
+invariant = "NoStaleTokenFallbackOrPublication"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "synchronous-reply-token-owner-state-bypassed"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "synchronous-ipc-handoff/SynchronousIpcHandoff"
+flow = "scheduler-dispatch"
+find = '''TokenMatchesOwner(slot) ==
+    /\ tokenLive[slot]
+    /\ tokenRecord[slot].kind = Reply
+    /\ tokenRecord[slot].ownerGeneration = ownerGeneration[slot]
+    /\ tokenRecord[slot].cpu = ownerCpu[slot]
+    /\ ownerRunnable[slot]
+    /\ ownerState[slot] \in {Local, RemoteQueued}'''
+replace = '''TokenMatchesOwner(slot) ==
+    /\ tokenLive[slot]
+    /\ tokenRecord[slot].kind = Reply
+    /\ tokenRecord[slot].ownerGeneration = ownerGeneration[slot]
+    /\ tokenRecord[slot].cpu = ownerCpu[slot]
+    /\ ownerRunnable[slot]
+    /\ TRUE'''
+occurrence = 1
+invariant = "NoStaleTokenFallbackOrPublication"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "synchronous-reply-token-post-enqueue-recheck-bypassed"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "synchronous-ipc-handoff/SynchronousIpcHandoff"
+flow = "scheduler-dispatch"
+find = '''    /\ invalidPostCheck' =
+        (invalidPostCheck \/
+            (TokenMatchesOwner(slot) /\ ~ObservedTokenMatchesOwner(slot)))'''
+replace = '''    /\ invalidPostCheck' =
+        (invalidPostCheck \/
+            (TRUE /\ ~ObservedTokenMatchesOwner(slot)))'''
+occurrence = 1
+invariant = "PostEnqueueSuccessRequiresExactOwner"
+min_counterexample_states = 6
+
+[[mutation]]
+id = "synchronous-reply-token-publication-pending-slot-redirected"
+kind = "transition-effect"
+severity = "critical"
+model = "synchronous-ipc-handoff/SynchronousIpcHandoff"
+flow = "scheduler-dispatch"
+find = '''       /\ publicationPending' = [publicationPending EXCEPT ![slot] = TRUE]'''
+replace = '''       /\ publicationPending' = [publicationPending EXCEPT ![CHOOSE other \in Tasks : other # slot] = TRUE]'''
+occurrence = 1
+invariant = "ReplyTokenPublishesAtMostOnce"
+min_counterexample_states = 5
+
+[[mutation]]
+id = "synchronous-reply-token-reply-refresh-disabled"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "synchronous-ipc-handoff/SynchronousIpcHandoff"
+flow = "scheduler-dispatch"
+find = '''            (queue[tokenRecord[slot].cpu][index].kind = Reply /\
+             tokenRecord[slot].ownerGeneration >=
+                 queue[tokenRecord[slot].cpu][index].ownerGeneration))'''
+replace = '''            (queue[tokenRecord[slot].cpu][index].kind = Reply /\ FALSE))'''
+occurrence = 1
+invariant = "ReplyRefreshMatchesMonotonicQueueSemantics"
+min_counterexample_states = 7
+
+[[mutation]]
+id = "synchronous-reply-token-runnable-bypassed"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "synchronous-ipc-handoff/SynchronousIpcHandoff"
+flow = "scheduler-dispatch"
+find = '''TokenMatchesOwner(slot) ==
+    /\ tokenLive[slot]
+    /\ tokenRecord[slot].kind = Reply
+    /\ tokenRecord[slot].ownerGeneration = ownerGeneration[slot]
+    /\ tokenRecord[slot].cpu = ownerCpu[slot]
+    /\ ownerRunnable[slot]'''
+replace = '''TokenMatchesOwner(slot) ==
+    /\ tokenLive[slot]
+    /\ tokenRecord[slot].kind = Reply
+    /\ tokenRecord[slot].ownerGeneration = ownerGeneration[slot]
+    /\ tokenRecord[slot].cpu = ownerCpu[slot]
+    /\ TRUE'''
+occurrence = 1
+invariant = "NoStaleTokenFallbackOrPublication"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "synchronous-reply-token-stale-fallback-published"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "synchronous-ipc-handoff/SynchronousIpcHandoff"
+flow = "scheduler-dispatch"
+find = '''BeginReplyTokenPublication(slot) ==
+    /\ slot \in Tasks
+    /\ ~publicationPending[slot]
+    /\ TokenMatchesOwner(slot)'''
+replace = '''BeginReplyTokenPublication(slot) ==
+    /\ slot \in Tasks
+    /\ ~publicationPending[slot]
+    /\ tokenLive[slot]'''
+occurrence = 1
+invariant = "NoStaleTokenFallbackOrPublication"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "synchronous-reply-token-target-cpu-bypassed"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "synchronous-ipc-handoff/SynchronousIpcHandoff"
+flow = "scheduler-dispatch"
+find = "    /\\ tokenRecord[slot].cpu = ownerCpu[slot]"
+replace = "    /\\ TRUE"
+occurrence = 1
+invariant = "NoStaleTokenFallbackOrPublication"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "synchronous-reply-token-target-fifo-redirected"
+kind = "transition-effect"
+severity = "critical"
+model = "synchronous-ipc-handoff/SynchronousIpcHandoff"
+flow = "scheduler-dispatch"
+find = '''       /\ queue' = [queue EXCEPT ![targetCpu] = nextQueue]'''
+replace = '''       /\ queue' = [queue EXCEPT ![CHOOSE other \in Cpus : other # targetCpu] = nextQueue]'''
+occurrence = 1
+invariant = "QueueRecordsBelongToTheirCpu"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "synchronous-reply-token-task-identity-bypassed"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "synchronous-ipc-handoff/SynchronousIpcHandoff"
+flow = "scheduler-dispatch"
+find = '''ReplyRecordIsLocallyDispatchable(record, cpu) ==
+    /\ record \in RecordType
+    /\ record.kind = Reply
+    /\ record.cpu = cpu
+    /\ record.taskId = taskId[record.slot]'''
+replace = '''ReplyRecordIsLocallyDispatchable(record, cpu) ==
+    /\ record \in RecordType
+    /\ record.kind = Reply
+    /\ record.cpu = cpu
+    /\ TRUE'''
+occurrence = 1
+invariant = "StaleRecordNeverDispatches"
+min_counterexample_states = 5
 
 [[mutation]]
 id = "tlb-active-root-target-filter-removed"
@@ -966,6 +2445,45 @@ replace = '''    /\ waitState' = IF waitState = "sleeping" THEN "woken" ELSE wai
 occurrence = 1
 invariant = "NoWrongObjectWake"
 min_counterexample_states = 3
+
+[[mutation]]
+id = "waitset-registry-object-cap-removed"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "userspace-wait-set/WaitSetRegistry"
+flow = "waitset"
+find = "    /\\ Cardinality(epollLive) < MaxEpollObjects"
+replace = "    /\\ TRUE"
+occurrence = 1
+invariant = "LiveEpollObjectsRemainBounded"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "waitset-registry-per-epoll-cap-removed"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "userspace-wait-set/WaitSetRegistry"
+flow = "waitset"
+find = "    /\\ Cardinality(interests[epoll]) < MaxInterestsPerEpoll"
+replace = "    /\\ TRUE"
+occurrence = 1
+invariant = "PerEpollInterestCountsStayBounded"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "waitset-registry-rejected-restore-prefix-commit"
+kind = "transition-effect"
+severity = "critical"
+model = "userspace-wait-set/WaitSetRegistry"
+flow = "waitset"
+find = '''             ELSE /\ UNCHANGED <<epollLive, interests>>'''
+replace = '''             ELSE /\ \E prefix \in candidate.live:
+                    /\ epollLive' = epollLive \cup {prefix}
+                    /\ interests' = [interests EXCEPT
+                        ![prefix] = candidate.interests[prefix]]'''
+occurrence = 1
+invariant = "RejectedRestorePreservesExactPriorState"
+min_counterexample_states = 2
 
 [[mutation]]
 id = "wayland-accept-readiness-guard-removed"

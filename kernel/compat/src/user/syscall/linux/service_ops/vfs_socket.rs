@@ -578,123 +578,7 @@ fn duplicate_fd_transaction(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn descriptor_exhaustion_is_not_reported_as_a_bad_source_fd() {
-        assert_eq!(duplicate_install_errno(VfsDupMode::Dup), LINUX_EMFILE);
-        assert_eq!(duplicate_install_errno(VfsDupMode::Dup2), LINUX_EBADF);
-        assert_eq!(duplicate_install_errno(VfsDupMode::Dup3), LINUX_EBADF);
-    }
-
-    #[test]
-    fn netd_reference_mutation_owns_the_complete_interactive_deadline() {
-        assert_eq!(
-            NETD_REF_OPERATION_TIMEOUT_MS,
-            rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS
-        );
-        assert_eq!(
-            super::ipc_helpers::deadline::remaining_service_timeout_ms(
-                NETD_REF_OPERATION_TIMEOUT_MS,
-                0,
-            ),
-            Some(100)
-        );
-        assert!(
-            !super::ipc_helpers::deadline::retryable_early_service_transport_error(LINUX_ETIMEDOUT)
-        );
-    }
-
-    #[test]
-    fn transferred_input_description_keeps_the_waitset_service_reference() {
-        let device = kernel_object::api::device::DeviceHandle::from_parts_with_token(
-            kernel_object::api::device::DeviceId::Input,
-            kernel_object::api::device::DeviceAccessKind::Evdev,
-            u64::MAX - 811,
-        );
-        assert_eq!(
-            service_handle_ref_for_handle(&multitask::KernelHandle::Device(device)),
-            Some(ServiceHandleRef::Input(device.token_id()))
-        );
-    }
-
-    #[test]
-    fn fork_service_refs_come_from_the_frozen_child_handle_snapshot() {
-        let mut parent = multitask::HandleTable::new();
-        let inherited = multitask::EpollHandle::new();
-        let inherited_token = inherited.token_id();
-        let fd = parent
-            .install(multitask::KernelHandle::Epoll(inherited))
-            .expect("epoll fd");
-        let child_snapshot = parent.clone();
-
-        assert!(parent.close(fd).is_some());
-        let replacement = multitask::EpollHandle::new();
-        let replacement_token = replacement.token_id();
-        assert_eq!(
-            parent.install(multitask::KernelHandle::Epoll(replacement)),
-            Some(fd)
-        );
-
-        let inherited_refs = service_handle_refs_from_table(&child_snapshot);
-        let replacement_refs = service_handle_refs_from_table(&parent);
-        assert!(matches!(
-            inherited_refs.as_slice(),
-            [ServiceHandleRef::Epoll(epoll)] if epoll.token_id() == inherited_token
-        ));
-        assert!(matches!(
-            replacement_refs.as_slice(),
-            [ServiceHandleRef::Epoll(epoll)] if epoll.token_id() == replacement_token
-        ));
-    }
-
-    #[test]
-    fn exit_service_refs_come_from_the_exact_closed_handle_set() {
-        let mut handles = multitask::HandleTable::new();
-        let epoll = multitask::EpollHandle::new();
-        let token = epoll.token_id();
-        handles
-            .install(multitask::KernelHandle::Epoll(epoll))
-            .expect("epoll fd");
-
-        let closed = handles.close_all();
-        assert!(handles.entries_snapshot(false).is_empty());
-        let refs = service_handle_refs_from_handles(&closed);
-        assert!(matches!(
-            refs.as_slice(),
-            [ServiceHandleRef::Epoll(epoll)] if epoll.token_id() == token
-        ));
-    }
-
-    #[test]
-    fn remote_vfs_refs_are_local_and_provider_close_is_final_only() {
-        let id = u64::MAX - 0x5f5;
-        assert_eq!(register_remote_vfs_open_description(id), Ok(()));
-        assert_eq!(acquire_remote_vfs_descriptor_ref(id), Ok(()));
-        assert_eq!(release_remote_vfs_descriptor_ref(id), Ok(false));
-        assert_eq!(release_remote_vfs_descriptor_ref(id), Ok(true));
-        assert_eq!(release_remote_vfs_descriptor_ref(id), Err(LINUX_EBADF));
-    }
-
-    #[test]
-    fn remote_vfs_registry_preserves_collision_chains_across_tombstones() {
-        let first = 0xfedc_ba98_7654_0001;
-        let bucket = RemoteVfsRefRegistry::probe_start(first);
-        let second = (first + 1..first + REMOTE_VFS_OPEN_DESCRIPTION_CAPACITY as u64 + 2)
-            .find(|candidate| RemoteVfsRefRegistry::probe_start(*candidate) == bucket)
-            .expect("bounded hash range contains a collision");
-
-        assert_eq!(register_remote_vfs_open_description(first), Ok(()));
-        assert_eq!(register_remote_vfs_open_description(second), Ok(()));
-        assert_eq!(release_remote_vfs_descriptor_ref(first), Ok(true));
-        assert_eq!(acquire_remote_vfs_descriptor_ref(second), Ok(()));
-        assert_eq!(release_remote_vfs_descriptor_ref(second), Ok(false));
-        assert_eq!(release_remote_vfs_descriptor_ref(second), Ok(true));
-        assert_eq!(register_remote_vfs_open_description(first), Ok(()));
-        assert_eq!(release_remote_vfs_descriptor_ref(first), Ok(true));
-    }
-}
+mod tests;
 
 pub fn syscall_linux_vfs_read(fd: u64, user_ptr: u64, user_len: u64) -> u64 {
     if let Some((console, status_flags)) = current_console_handle_and_status_flags(fd) {
@@ -1155,13 +1039,14 @@ fn current_socket_token_and_flags(fd: u64) -> Option<(u64, u64)> {
     .flatten()
 }
 
-pub fn new_netd_socket_request(op: u16, socket_token: u64) -> NetdIpcRequest {
+fn new_netd_socket_request(op: u16, socket_token: u64, deadline_ns: u64) -> NetdIpcRequest {
     let mut operation = [0_u8; 16];
     nucleus_core::util::random::Random::new().fill_bytes(&mut operation);
     let mut request = NetdIpcRequest {
         version: NETD_IPC_ABI_VERSION,
         op,
         socket_token,
+        deadline_ns,
         operation_hi: u64::from_le_bytes(operation[..8].try_into().unwrap()),
         operation_lo: u64::from_le_bytes(operation[8..].try_into().unwrap()),
         ..NetdIpcRequest::default()
@@ -1187,15 +1072,14 @@ pub fn call_netd_socket_token_op(op: u16, socket_token: u64) -> Result<u64, i64>
 }
 
 fn call_netd_socket_token_op_bounded(op: u16, socket_token: u64) -> Result<u64, i64> {
-    let request = new_netd_socket_request(op, socket_token);
-    let start_ticks = crate::arch::rtc::ticks();
+    let deadline_ns = super::vfs_meta::netd_deadline_after_class(
+        ipc_ops::ServiceIpcClass::InteractiveControl,
+        Some(NETD_REF_OPERATION_TIMEOUT_MS),
+    );
+    let request = new_netd_socket_request(op, socket_token, deadline_ns);
     let mut last = LINUX_ETIMEDOUT;
     for attempt in 0..NETD_REF_OPERATION_ATTEMPTS {
-        let elapsed_ms = netd_ref_elapsed_ms(start_ticks, crate::arch::rtc::ticks());
-        let Some(timeout_ms) = super::ipc_helpers::deadline::remaining_service_timeout_ms(
-            NETD_REF_OPERATION_TIMEOUT_MS,
-            elapsed_ms,
-        ) else {
+        let Some(timeout_ms) = super::vfs_meta::netd_deadline_remaining_ms(deadline_ns) else {
             break;
         };
         match call_netd_ipc_request_with_timeout(&request, timeout_ms) {
@@ -1287,7 +1171,14 @@ fn drain_pending_netd_refs() -> usize {
             return attempted;
         };
         attempted += 1;
-        let mut request = new_netd_socket_request(pending.op, pending.socket_token);
+        let mut request = new_netd_socket_request(
+            pending.op,
+            pending.socket_token,
+            super::vfs_meta::netd_deadline_after_class(
+                ipc_ops::ServiceIpcClass::InteractiveControl,
+                Some(rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS),
+            ),
+        );
         request.operation_hi = pending.operation_hi;
         request.operation_lo = pending.operation_lo;
         let completed = if pending.acknowledge_only {
@@ -1330,7 +1221,14 @@ fn drain_pending_netd_refs() -> usize {
 }
 
 fn send_netd_ref_ack_with_timeout(request: &NetdIpcRequest, timeout_ms: u64) -> Result<(), i64> {
-    let mut ack = new_netd_socket_request(NETD_IPC_OP_REF_ACK, request.socket_token);
+    let mut ack = new_netd_socket_request(
+        NETD_IPC_OP_REF_ACK,
+        request.socket_token,
+        super::vfs_meta::netd_deadline_after_class(
+            ipc_ops::ServiceIpcClass::InteractiveControl,
+            Some(timeout_ms),
+        ),
+    );
     ack.arg0 = request.op as u64;
     ack.operation_hi = request.operation_hi;
     ack.operation_lo = request.operation_lo;
@@ -1341,20 +1239,19 @@ fn send_netd_ref_ack_with_timeout(request: &NetdIpcRequest, timeout_ms: u64) -> 
     Ok(())
 }
 
-fn netd_ref_elapsed_ms(start_ticks: u64, end_ticks: u64) -> u64 {
-    let ticks_per_second = crate::arch::rtc::ticks_per_second().max(1);
-    end_ticks
-        .saturating_sub(start_ticks)
-        .saturating_mul(1000)
-        .saturating_div(ticks_per_second)
-}
-
 pub fn poll_netd_socket_token(
     socket_token: u64,
     events: u32,
     timeout_ms: u64,
 ) -> Result<(u32, u64), i64> {
-    let mut request = new_netd_socket_request(SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET, socket_token);
+    let mut request = new_netd_socket_request(
+        SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET,
+        socket_token,
+        super::vfs_meta::netd_deadline_after_class(
+            ipc_ops::ServiceIpcClass::ReadinessQuery,
+            Some(timeout_ms),
+        ),
+    );
     request.arg1 = events as u64;
     request.arg2 = NETD_POLL_MODE_QUERY;
     let response = call_netd_ipc_request_with_timeout(&request, timeout_ms)?;
@@ -1559,7 +1456,11 @@ fn call_netd_socket_payload(fd: u64, op: u16, payload: &[u8]) -> Result<u64, i64
     if payload.len() > NETD_IPC_PAYLOAD_CAPACITY {
         return Err(LINUX_EINVAL);
     }
-    let mut request = new_netd_socket_request(op, token);
+    let mut request = new_netd_socket_request(
+        op,
+        token,
+        super::vfs_meta::netd_deadline_after_class(ipc_ops::ServiceIpcClass::BulkData, None),
+    );
     request.arg0 = fd;
     request.status_flags = status_flags;
     request.payload_len = payload.len() as u32;

@@ -4,7 +4,9 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use rustos_user_abi::syscall::{
     IPC_SERVICE_CAP_NET_POLICY, NET_BROKER_OP_PACKET_LEASE_GRANT, NET_BROKER_OP_PACKET_LEASE_RESET,
     NET_BROKER_OP_PACKET_LEASE_REVOKE, NET_BROKER_OP_PACKET_RX, NET_BROKER_OP_PACKET_STATUS,
-    NET_BROKER_OP_PACKET_TX, NET_BROKER_OP_UNIX_CONNECT_BIND, RustosNetBrokerArgs,
+    NET_BROKER_OP_PACKET_TX, NET_BROKER_OP_PREPARE_SOCKET_PUBLICATION,
+    NET_BROKER_OP_UNIX_CONNECT_BIND, NetBrokerPrepareSocketPublication, RustosNetBrokerArgs,
+    net_broker_socket_publication_shape_valid,
 };
 use x86_64::VirtAddr;
 
@@ -33,6 +35,7 @@ fn dispatch_net_broker(args: &RustosNetBrokerArgs) -> Result<u64, i64> {
         SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR => broker_socketpair(args),
         SYSCALL_OFFLOAD_OP_LINUX_ACCEPT => broker_accept(args),
         NET_BROKER_OP_UNIX_CONNECT_BIND => broker_unix_connect_bind(args),
+        NET_BROKER_OP_PREPARE_SOCKET_PUBLICATION => broker_prepare_socket_publication(args),
         NET_BROKER_OP_PACKET_STATUS => broker_packet_status(),
         NET_BROKER_OP_PACKET_TX => broker_packet_tx(args),
         NET_BROKER_OP_PACKET_RX => broker_packet_rx(args),
@@ -40,6 +43,73 @@ fn dispatch_net_broker(args: &RustosNetBrokerArgs) -> Result<u64, i64> {
         NET_BROKER_OP_PACKET_LEASE_REVOKE => broker_packet_lease(args, false),
         NET_BROKER_OP_PACKET_LEASE_RESET => broker_packet_lease_reset(args),
         _ => Err(LINUX_EINVAL),
+    }
+}
+
+/// Moves one newly-created netd AF_INET stream reference into the exact reply
+/// message.  There is intentionally no target-process fd installation in this
+/// broker path: only the caller-side timely reply take publishes a descriptor.
+fn broker_prepare_socket_publication(args: &RustosNetBrokerArgs) -> Result<u64, i64> {
+    if args.arg0 == 0
+        || args.arg1 != 0
+        || args.arg2 != 0
+        || args.arg3 != 0
+        || args.arg4 != 0
+        || args.arg5 != 0
+    {
+        return Err(LINUX_EINVAL);
+    }
+    let publication =
+        usermem::read_current_user_struct::<NetBrokerPrepareSocketPublication>(args.arg0)
+            .map_err(address_space_error_to_linux_errno)?;
+    if !net_broker_socket_publication_shape_valid(&publication)
+        || publication.caller_pid != args.process_id
+    {
+        return Err(LINUX_EINVAL);
+    }
+    let netd_process_id = multitask::current_user_process_id().ok_or(LINUX_EPERM)?;
+    let descriptor = multitask::register_new_inet_socket_transfer(
+        publication.socket_token,
+        publication.domain,
+        publication.socket_type,
+        publication.protocol,
+    )
+    .map_err(transfer_registry_error_to_linux_errno)?;
+    let reply = kernel_ipc_runtime::api::KernelReplyHandle::from_raw(publication.reply_cap);
+    if let Err(error) = kernel_ipc_runtime::api::endpoint::bind_prepared_reply_handles_for_process(
+        reply,
+        netd_process_id,
+        alloc::vec![descriptor],
+    ) {
+        // LIFECYCLE: This only removes the non-visible registry entry.  Netd
+        // still owns the provider's initial reference and performs the sole
+        // unpublished-token discard after this broker call fails.
+        for descriptor in error.handles {
+            multitask::reclaim_unbound_inet_socket_transfer(descriptor);
+        }
+        return Err(ipc_error_to_linux_errno(error.error));
+    }
+    Ok(0)
+}
+
+fn transfer_registry_error_to_linux_errno(error: multitask::IpcTransferRegistryError) -> i64 {
+    match error {
+        multitask::IpcTransferRegistryError::Exhausted => LINUX_ENOMEM,
+        multitask::IpcTransferRegistryError::BindingMismatch
+        | multitask::IpcTransferRegistryError::InvalidDescriptor => LINUX_EINVAL,
+        multitask::IpcTransferRegistryError::InvalidState
+        | multitask::IpcTransferRegistryError::StaleDescriptor => LINUX_ESTALE,
+    }
+}
+
+fn ipc_error_to_linux_errno(error: kernel_ipc_runtime::api::IpcError) -> i64 {
+    match error {
+        kernel_ipc_runtime::api::IpcError::InvalidHandle
+        | kernel_ipc_runtime::api::IpcError::InvalidArgument => LINUX_EINVAL,
+        kernel_ipc_runtime::api::IpcError::PermissionDenied => LINUX_EPERM,
+        kernel_ipc_runtime::api::IpcError::PeerClosed => LINUX_EPIPE,
+        kernel_ipc_runtime::api::IpcError::BufferTooSmall => LINUX_EOVERFLOW,
+        kernel_ipc_runtime::api::IpcError::NoMemory => LINUX_ENOMEM,
     }
 }
 
@@ -134,16 +204,6 @@ fn broker_socket(args: &RustosNetBrokerArgs) -> Result<u64, i64> {
             multitask::KernelHandle::Socket(multitask::SocketHandle::from_token(
                 args.arg3, domain, base_type, protocol,
             ))
-        }
-        (linux_abi::AF_INET, linux_abi::SOCK_STREAM)
-        | (linux_abi::AF_INET, linux_abi::SOCK_DGRAM) => {
-            let handle = if args.arg3 != 0 {
-                multitask::InetSocketHandle::from_token(args.arg3, domain, base_type, protocol)
-            } else {
-                multitask::InetSocketHandle::new(domain, base_type, protocol)
-                    .ok_or(LINUX_EOVERFLOW)?
-            };
-            multitask::KernelHandle::InetSocket(handle)
         }
         _ => return Err(LINUX_EAFNOSUPPORT),
     };

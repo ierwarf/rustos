@@ -79,8 +79,7 @@ fn spawn_handoff_is_fifo_deduplicated_and_precedes_ipc_handoff() {
             .is_empty()
     );
     assert_eq!(
-        scheduler
-            .take_next_spawn_pick_hint_ready_slot(&mut scheduler.current_dispatch_policy()),
+        scheduler.take_next_spawn_pick_hint_ready_slot(&mut scheduler.current_dispatch_policy()),
         Some(first)
     );
     scheduler.start_suspended[first] = true;
@@ -153,8 +152,7 @@ fn spawn_handoff_is_fifo_deduplicated_and_precedes_ipc_handoff() {
         None
     );
     assert_eq!(
-        scheduler
-            .take_next_synchronous_pick_hint_ready_slot(&mut scheduler.current_dispatch_policy()),
+        scheduler.take_next_synchronous_pick_hint_ready_slot(),
         Some(parent)
     );
     assert_eq!(

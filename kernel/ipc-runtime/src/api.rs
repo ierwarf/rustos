@@ -1,16 +1,16 @@
 pub use crate::ipc::{
-    CancelledCall, CancelledCallDisposition,
-    ChannelIdentity, EndpointCallPriority, EndpointReceived, EndpointReceivedWithSender,
-    EndpointResponseTake, EndpointResponseWithHandles, EndpointWakeSet, IpcError,
-    KernelEndpointHandle, KernelReplyHandle, KernelSharedRegionHandle,
-    KernelSharedRegionMappingHold, KernelTransferTicket, KernelTransferredHandle,
-    MAX_ENDPOINT_WAKE_TASKS, ProcessIdentity, ServiceIdentity, TransferContext,
+    CancelledCall, CancelledCallDisposition, ChannelIdentity, EndpointCallPriority,
+    EndpointReceived, EndpointReceivedWithSender, EndpointResponseTake,
+    EndpointResponseWithHandles, EndpointWakeSet, IpcError, KernelEndpointHandle,
+    KernelReplyHandle, KernelSharedRegionHandle, KernelSharedRegionMappingHold,
+    KernelTransferTicket, KernelTransferredHandle, MAX_ENDPOINT_WAKE_TASKS,
+    PreparedReplyHandleBindError, ProcessIdentity, ServiceIdentity, TransferContext,
 };
 
 pub mod endpoint {
     pub use crate::ipc::{
         EndpointCallPriority, EndpointWakeSet, IpcError, KernelEndpointHandle, KernelReplyHandle,
-        KernelTransferredHandle,
+        KernelTransferredHandle, PreparedReplyHandleBindError,
     };
 
     pub fn create() -> Result<KernelEndpointHandle, IpcError> {
@@ -68,6 +68,17 @@ pub mod endpoint {
 
     pub fn receiver_process_for_reply(reply: KernelReplyHandle) -> Option<u64> {
         crate::ipc::endpoint_receiver_process_for_reply(reply)
+    }
+
+    /// Binds broker-prepared descriptors to one live reply owned by the exact
+    /// receiving process.  On error, the returned error retains descriptor
+    /// ownership for the broker's unpublished-object rollback path.
+    pub fn bind_prepared_reply_handles_for_process(
+        reply: KernelReplyHandle,
+        receiver_process_id: u64,
+        handles: alloc::vec::Vec<KernelTransferredHandle>,
+    ) -> Result<(), PreparedReplyHandleBindError> {
+        crate::ipc::bind_prepared_reply_handles_for_process(reply, receiver_process_id, handles)
     }
 
     pub fn recv(

@@ -51,6 +51,10 @@ pub mod boot {
         crate::memory::paging::init(boot_info_ptr);
     }
 
+    pub fn initialize_current_cpu_cache_attributes() -> bool {
+        crate::memory::kernel_vm::initialize_current_cpu_cache_attributes()
+    }
+
     pub fn init_phys(boot_info_ptr: *const BootInfo) {
         crate::memory::phys::init(boot_info_ptr);
     }

@@ -43,12 +43,12 @@ def main() -> int:
         if not line or line.startswith("#"):
             continue
         fields = line.split("\t")
-        if len(fields) != 7:
+        if len(fields) != 8:
             failures.append(
                 f"{registry_path}:{line_number} has {len(fields)} fields"
             )
             continue
-        point, severity, owner, source, expected, evidence, witness = fields
+        point, severity, owner, source, expected, evidence, witness_source, witness = fields
         if severity not in {"critical", "high"}:
             failures.append(f"{point}: fault boundary is not critical/high")
         if evidence not in {"kvm-storage", "source-test"}:
@@ -69,12 +69,15 @@ def main() -> int:
                 failures.append(
                     f"{point}: source witness package {package!r} is not unique"
                 )
-            if source_path.is_file() and not re.search(
+            witness_source_path = root / witness_source
+            if not witness_source_path.is_file():
+                failures.append(f"{point}: missing witness source {witness_source}")
+            elif not re.search(
                 rf"\bfn\s+{re.escape(test)}\s*\(",
-                source_path.read_text(encoding="utf-8"),
+                witness_source_path.read_text(encoding="utf-8"),
             ):
                 failures.append(
-                    f"{point}: source does not define witness test {test!r}"
+                    f"{point}: witness source does not define test {test!r}"
                 )
         scenarios.append(
             {
@@ -84,6 +87,7 @@ def main() -> int:
                 "source": source,
                 "expected_failure": expected,
                 "runtime_evidence": evidence,
+                "witness_source": witness_source,
                 "source_witness": witness,
             }
         )

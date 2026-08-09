@@ -63,7 +63,7 @@ pub(super) fn apply(
     outcomes: &mut [DvmOutcome],
     pending_events: &mut Vec<InputIngressWire>,
     deadline: AbsoluteDeadline,
-    mut notify_session: impl FnMut(u32, u64, u64) -> Result<(), i32>,
+    mut notify_session: impl FnMut(u32, u64, AbsoluteDeadline) -> Result<(), i32>,
 ) -> Result<(bool, bool), i32> {
     pending_events.clear();
     for outcome in outcomes.iter_mut() {
@@ -81,13 +81,12 @@ pub(super) fn apply(
             // The queue lock stays local to reset/publication. A synchronous
             // service call here while holding it would deadlock readers and
             // make netd startup ordering an input liveness dependency.
-            let Ok(timeout_ms) = deadline.child_timeout_ms(monotonic_nanos(), CALL_DEADLINE_MS)
-            else {
+            if deadline.remaining_ns(monotonic_nanos()).is_none() {
                 pending_events.clear();
                 lock_input_queue_for_ingestion(queue).reset_dvm_input();
                 return Err(libc::ETIMEDOUT);
-            };
-            if let Err(errno) = notify_session(epoch, action, timeout_ms) {
+            }
+            if let Err(errno) = notify_session(epoch, action, deadline) {
                 pending_events.clear();
                 lock_input_queue_for_ingestion(queue).reset_dvm_input();
                 return Err(errno);
@@ -154,10 +153,10 @@ mod tests {
             &mut outcomes,
             &mut pending_events,
             deadline,
-            |epoch, action, timeout_ms| {
+            |epoch, action, received_deadline| {
                 observed_unlocked = queue.queue.try_lock().is_ok();
                 assert_eq!((epoch, action), (7, NETD_DVM_SESSION_GRANT));
-                assert!(timeout_ms <= CALL_DEADLINE_MS);
+                assert_eq!(received_deadline, deadline);
                 Ok(())
             },
         );

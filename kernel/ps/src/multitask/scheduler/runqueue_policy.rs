@@ -7,7 +7,23 @@
 use super::*;
 
 #[cfg(not(test))]
-const ACTIVE_BALANCE_INTERVAL_TICKS: u64 = 8;
+use core::sync::atomic::{AtomicU8, Ordering};
+
+const ACTIVE_BALANCE_INTERVAL_OPPORTUNITIES: u8 = 8;
+
+/// Returns whether the next loaded balance opportunity must inspect this CPU.
+///
+/// The counter contains the number of earlier calls that observed at least two
+/// published runnable continuations on the exact source CPU. Zero therefore
+/// makes the first loaded opportunity due; later attempts are separated by at
+/// most eight such opportunities. RTC time is deliberately not an input.
+const fn active_balance_opportunity_due(previous_opportunities: u8) -> bool {
+    previous_opportunities % ACTIVE_BALANCE_INTERVAL_OPPORTUNITIES == 0
+}
+
+#[cfg(not(test))]
+static ACTIVE_BALANCE_OPPORTUNITIES: [AtomicU8; nucleus_core::util::lockdep::MAX_TRACKED_CPUS] =
+    [const { AtomicU8::new(0) }; nucleus_core::util::lockdep::MAX_TRACKED_CPUS];
 
 const fn runqueue_is_imbalanced(source_count: usize, target_count: usize) -> bool {
     source_count > target_count.saturating_add(1)
@@ -66,21 +82,36 @@ impl Scheduler {
         runqueue::least_loaded_cpu(eligible, preferred)
     }
 
+    /// Publishes one exact wake to a placement target chosen by the caller.
+    ///
+    /// The owner-word CAS and mailbox record remain the authority in every
+    /// build.  Callers that already have an exact target (the outgoing CPU of
+    /// an assembly transition, for example) use this rather than recreating
+    /// the publication protocol around a test-only mirror.
+    pub(super) fn publish_runqueue_wake_to(
+        &self,
+        slot: usize,
+        target: usize,
+    ) -> runqueue::RemoteWakeOutcome {
+        let Some(context) = self.contexts[slot] else {
+            return runqueue::RemoteWakeOutcome::Rejected;
+        };
+        let outcome = runqueue::publish_remote_wake(slot, target, context.weight);
+        #[cfg(not(test))]
+        if let runqueue::RemoteWakeOutcome::Published { cpu, notify: true } = outcome {
+            // Notification only shortens the latency to observe the already
+            // published mailbox owner; it never creates wake authority.
+            super::super::irq::request_target_reschedule(cpu);
+        }
+        outcome
+    }
+
     #[cfg(not(test))]
     pub(super) fn publish_runqueue_wake(&self, slot: usize) -> bool {
-        let Some(context) = self.contexts[slot] else {
-            return false;
-        };
-        let target = self.runqueue_target_cpu(slot);
-        match runqueue::publish_remote_wake(slot, target, context.weight) {
+        match self.publish_runqueue_wake_to(slot, self.runqueue_target_cpu(slot)) {
             runqueue::RemoteWakeOutcome::Rejected => false,
             runqueue::RemoteWakeOutcome::AlreadyOwned { .. } => true,
-            runqueue::RemoteWakeOutcome::Published { cpu, notify } => {
-                if notify {
-                    super::super::irq::request_target_reschedule(cpu);
-                }
-                true
-            }
+            runqueue::RemoteWakeOutcome::Published { .. } => true,
         }
     }
 
@@ -130,7 +161,6 @@ impl Scheduler {
             return false;
         }
 
-        let target_bit = 1_u64 << target_cpu;
         let mut selected: Option<(SchedClass, u64, usize)> = None;
         for source_cpu in 0..nucleus_core::util::lockdep::MAX_TRACKED_CPUS {
             if source_cpu == target_cpu || runqueue::published_runnable_count(source_cpu) == 0 {
@@ -140,11 +170,9 @@ impl Scheduler {
                 let Some(context) = self.contexts[slot] else {
                     continue;
                 };
-                let affinity = self.task_affinity_masks[slot] & self.process_affinity_masks[slot];
-                if affinity & target_bit == 0
-                    || !self.slot_is_runnable(slot)
-                    || !self.is_fair_candidate_slot(slot)
-                    || !self.context_is_schedulable(slot, context)
+                if !self.is_fair_candidate_slot(slot)
+                    || !self
+                        .context_is_migratable_from_source(slot, context, source_cpu, target_cpu)
                 {
                     continue;
                 }
@@ -183,14 +211,18 @@ impl Scheduler {
     /// bounded periodic balance. Transfer retains the one-owner CAS/mailbox
     /// protocol and therefore never takes two runqueue locks.
     #[cfg(not(test))]
-    pub(super) fn rebalance_one_from_busy_cpu(&self, source_cpu: usize, now_ticks: u64) -> bool {
-        if now_ticks % ACTIVE_BALANCE_INTERVAL_TICKS
-            != (source_cpu as u64 % ACTIVE_BALANCE_INTERVAL_TICKS)
-        {
-            return false;
-        }
+    pub(super) fn rebalance_one_from_busy_cpu(&self, source_cpu: usize, _now_ticks: u64) -> bool {
         let source_count = runqueue::published_runnable_count(source_cpu);
         if source_count < 2 {
+            return false;
+        }
+        // ORDERING: This counter only bounds independent placement-policy
+        // scans; it publishes no runqueue, task, or execution ownership. The
+        // source-owner CAS and target mailbox provide those synchronization
+        // edges, so Relaxed keeps the cadence local to this source CPU.
+        let previous_opportunities =
+            ACTIVE_BALANCE_OPPORTUNITIES[source_cpu].fetch_add(1, Ordering::Relaxed);
+        if !active_balance_opportunity_due(previous_opportunities) {
             return false;
         }
 
@@ -199,10 +231,7 @@ impl Scheduler {
             let Some(context) = self.contexts[slot] else {
                 continue;
             };
-            if !self.slot_is_runnable(slot)
-                || !self.is_fair_candidate_slot(slot)
-                || !self.context_is_schedulable(slot, context)
-            {
+            if !self.slot_is_runnable(slot) || !self.is_fair_candidate_slot(slot) {
                 continue;
             }
             let Some(class) = self.slot_class(slot) else {
@@ -218,6 +247,7 @@ impl Scheduler {
                     source_count,
                     runqueue::published_runnable_count(target_cpu),
                 )
+                || !self.context_is_migratable_from_source(slot, context, source_cpu, target_cpu)
             {
                 continue;
             }
@@ -262,7 +292,7 @@ impl Scheduler {
 
 #[cfg(test)]
 mod tests {
-    use super::runqueue_is_imbalanced;
+    use super::{active_balance_opportunity_due, runqueue_is_imbalanced};
 
     #[test]
     fn active_balance_requires_more_than_one_excess_runnable() {
@@ -270,5 +300,31 @@ mod tests {
         assert!(!runqueue_is_imbalanced(4, 3));
         assert!(runqueue_is_imbalanced(2, 0));
         assert!(runqueue_is_imbalanced(5, 3));
+    }
+
+    #[test]
+    fn active_balance_is_due_first_then_every_eighth_loaded_opportunity() {
+        for previous_opportunities in 0_u8..=24 {
+            let expected = matches!(previous_opportunities, 0 | 8 | 16 | 24);
+            assert_eq!(
+                active_balance_opportunity_due(previous_opportunities),
+                expected,
+                "unexpected balance cadence after {previous_opportunities} loaded opportunities"
+            );
+        }
+    }
+
+    #[test]
+    fn active_balance_cadence_is_independent_of_rtc_residue() {
+        let expected = [true, false, false, false, false, false, false, false, true];
+        for rtc_residue in 0_u64..8 {
+            for (previous_opportunities, due) in expected.into_iter().enumerate() {
+                assert_eq!(
+                    active_balance_opportunity_due(previous_opportunities as u8),
+                    due,
+                    "RTC residue {rtc_residue} changed balance cadence"
+                );
+            }
+        }
     }
 }

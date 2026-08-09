@@ -6,6 +6,7 @@ from __future__ import annotations
 import csv
 import pathlib
 import re
+import subprocess
 import sys
 import tomllib
 
@@ -13,8 +14,10 @@ import tomllib
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 FORMAL = ROOT / "formal"
 REGISTRY = FORMAL / "concurrency-triangle.toml"
-LOOM = FORMAL / "loom-proof-kernel" / "src" / "lib.rs"
-SHUTTLE = FORMAL / "shuttle-proof-kernel" / "src" / "lib.rs"
+LOOM_ROOT = FORMAL / "loom-proof-kernel" / "src"
+SHUTTLE_ROOT = FORMAL / "shuttle-proof-kernel" / "src"
+LOOM_MANIFEST = FORMAL / "loom-proof-kernel" / "Cargo.toml"
+SHUTTLE_MANIFEST = FORMAL / "shuttle-proof-kernel" / "Cargo.toml"
 FLOWS = FORMAL / "system-flows.tsv"
 LOCK = FORMAL / "herdtools.lock"
 
@@ -30,6 +33,37 @@ def require(condition: bool, message: str) -> None:
 
 def function_exists(source: str, function: str) -> bool:
     return re.search(rf"\bfn\s+{re.escape(function)}\s*\(", source) is not None
+
+
+def proof_function_count(source: str, function: str) -> int:
+    return len(re.findall(rf"\bfn\s+{re.escape(function)}\s*\(", source))
+
+
+def rust_tree_source(root: pathlib.Path) -> str:
+    sources = sorted(root.rglob("*.rs"))
+    require(bool(sources), f"missing Rust proof sources under {root.relative_to(ROOT)}")
+    return "\n".join(source.read_text(encoding="utf-8") for source in sources)
+
+
+def compiled_tests(manifest: pathlib.Path) -> str:
+    return subprocess.check_output(
+        [
+            "cargo",
+            "test",
+            "-q",
+            "--manifest-path",
+            str(manifest),
+            "--",
+            "--list",
+        ],
+        cwd=ROOT,
+        text=True,
+        stderr=subprocess.STDOUT,
+    )
+
+
+def compiled_test_exists(test_list: str, function: str) -> bool:
+    return f"tests::{function}: test" in test_list.splitlines()
 
 
 def main() -> None:
@@ -60,8 +94,10 @@ def main() -> None:
                 {key.lstrip("# ").strip(): value for key, value in row.items()}
                 for row in csv.DictReader(handle, delimiter="\t")
             ]
-        loom_source = LOOM.read_text(encoding="utf-8")
-        shuttle_source = SHUTTLE.read_text(encoding="utf-8")
+        loom_source = rust_tree_source(LOOM_ROOT)
+        shuttle_source = rust_tree_source(SHUTTLE_ROOT)
+        loom_tests = compiled_tests(LOOM_MANIFEST)
+        shuttle_tests = compiled_tests(SHUTTLE_MANIFEST)
         herd_seen: set[str] = set()
         for entry in scenarios:
             ident = entry["id"]
@@ -80,8 +116,10 @@ def main() -> None:
                 any(row.get("flow_id") == entry["flow"] and row.get("model") == entry["model"] and row.get("source") == entry["source"] for row in flow_rows),
                 f"{ident}: no matching system-flow row",
             )
-            require(function_exists(loom_source, entry["loom_test"]), f"{ident}: missing Loom test {entry['loom_test']}")
-            require(function_exists(shuttle_source, entry["shuttle_test"]), f"{ident}: missing Shuttle test {entry['shuttle_test']}")
+            require(proof_function_count(loom_source, entry["loom_test"]) == 1, f"{ident}: Loom test must have one exact source definition {entry['loom_test']}")
+            require(proof_function_count(shuttle_source, entry["shuttle_test"]) == 1, f"{ident}: Shuttle test must have one exact source definition {entry['shuttle_test']}")
+            require(compiled_test_exists(loom_tests, entry["loom_test"]), f"{ident}: Loom test is not compiled {entry['loom_test']}")
+            require(compiled_test_exists(shuttle_tests, entry["shuttle_test"]), f"{ident}: Shuttle test is not compiled {entry['shuttle_test']}")
 
             herd_test = entry.get("herd_test")
             herd_mutant = entry.get("herd_mutant")
@@ -109,7 +147,7 @@ def main() -> None:
         package_digest = lock.get("package_sha256")
         require(lock.get("package_version") == "7.58-1", "herdtools package must pin 7.58-1")
         require(isinstance(package_digest, str) and re.fullmatch(r"[0-9a-f]{64}", package_digest) is not None, "invalid herdtools package SHA-256")
-    except (OSError, tomllib.TOMLDecodeError, ValueError) as error:
+    except (OSError, subprocess.CalledProcessError, tomllib.TOMLDecodeError, ValueError) as error:
         print(f"concurrency triangle check failed: {error}", file=sys.stderr)
         raise SystemExit(1)
     print(f"concurrency triangle is valid scenarios={len(scenarios)} herd_litmus={len(herd_seen) // 2}")

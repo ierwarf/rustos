@@ -1,5 +1,7 @@
 pub mod boot_trace;
 mod kdiag_macros;
+#[cfg(rustos_debug_print_enabled)]
+mod milestone_frame;
 
 use alloc::string::String;
 use alloc::vec;
@@ -40,6 +42,25 @@ const SYNTHETIC_WARNING_MODULE_PATH: &str = "nucleus_core::debug";
 const MILESTONE_CAPACITY: usize = 128;
 #[cfg(rustos_debug_print_enabled)]
 const REQUIRED_MILESTONE_OUTPUT_ATTEMPTS: usize = 1 << 20;
+// Every regular diagnostic is rendered before it takes DEBUG_LOCK, so one
+// owned buffer can be sent with one debugcon write after the bounded acquire.
+// The existing ordinary call sites below admit substantially less than this;
+// an oversize line is discarded whole rather than becoming misleading partial
+// evidence.
+#[cfg(rustos_debug_print_enabled)]
+const SERIALIZED_DEBUGCON_LINE_CAPACITY: usize = 512;
+#[cfg(rustos_debug_print_enabled)]
+const USER_DEBUG_ESCAPED_PAYLOAD_BYTES: usize = 480;
+// Milestones duplicate their semantic record in the self-framing evidence
+// payload and therefore need more headroom than an ordinary diagnostic. A
+// render that exceeds this fixed allocation-free bound panics before emitting
+// any bytes; it must never fabricate a truncated acceptance marker.
+#[cfg(rustos_debug_print_enabled)]
+const MILESTONE_DEBUGCON_LINE_CAPACITY: usize = 1024;
+#[cfg(rustos_debug_print_enabled)]
+const FNV1A64_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+#[cfg(rustos_debug_print_enabled)]
+const FNV1A64_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CurrentUserLogContext {
@@ -222,6 +243,48 @@ impl fmt::Write for DebugconWriter {
         if !s.is_empty() {
             print_bytes_unlocked(s.as_bytes());
         }
+        Ok(())
+    }
+}
+
+/// Fixed, stack-backed line storage for a debugcon record.
+///
+/// The writer rejects the entire next fragment when it cannot fit. Callers
+/// only publish after formatting succeeds, so an overflow can never expose a
+/// prefix that looks like complete evidence.
+#[cfg(rustos_debug_print_enabled)]
+struct FixedDebugconLine<const N: usize> {
+    bytes: [u8; N],
+    len: usize,
+}
+
+#[cfg(rustos_debug_print_enabled)]
+impl<const N: usize> FixedDebugconLine<N> {
+    const fn new() -> Self {
+        Self {
+            bytes: [0; N],
+            len: 0,
+        }
+    }
+
+    fn bytes(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+}
+
+#[cfg(rustos_debug_print_enabled)]
+impl<const N: usize> fmt::Write for FixedDebugconLine<N> {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        let end = self.len.checked_add(value.len()).ok_or(fmt::Error)?;
+        if end > N {
+            return Err(fmt::Error);
+        }
+        self.bytes[self.len..end].copy_from_slice(value.as_bytes());
+        self.len = end;
         Ok(())
     }
 }
@@ -548,6 +611,35 @@ pub fn log_args(category: LogCategory, level: LogLevel, args: fmt::Arguments<'_>
 pub fn log_args(_category: LogCategory, _level: LogLevel, _args: fmt::Arguments<'_>) {}
 
 #[cfg(rustos_debug_print_enabled)]
+fn render_serialized_debugcon_line<const N: usize>(
+    line: &mut FixedDebugconLine<N>,
+    args: fmt::Arguments<'_>,
+) -> fmt::Result {
+    line.write_fmt(args)?;
+    line.write_str("\r\n")
+}
+
+#[cfg(rustos_debug_print_enabled)]
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(FNV1A64_OFFSET_BASIS, |checksum, byte| {
+        (checksum ^ u64::from(*byte)).wrapping_mul(FNV1A64_PRIME)
+    })
+}
+
+/// Pure frame verifier used by the unit tests. It accepts only a complete v1
+/// milestone frame with an exact suffix and a checksum matching every semantic
+/// payload byte.
+#[cfg(all(rustos_debug_print_enabled, test))]
+fn verify_milestone_debugcon_line(line: &[u8]) -> bool {
+    let Some((semantic_start, checksum_offset, expected_checksum)) =
+        milestone_frame::parse_milestone_debugcon_checksum(line)
+    else {
+        return false;
+    };
+    fnv1a64(&line[semantic_start..checksum_offset]) == expected_checksum
+}
+
+#[cfg(rustos_debug_print_enabled)]
 pub fn record_milestone(category: LogCategory, name: &'static str, arg0: u64, arg1: u64) {
     let (tick, ts_us) = current_tick_and_micros();
     let record = MilestoneRecord {
@@ -577,81 +669,93 @@ fn emit_milestone_debugcon_line(record: MilestoneRecord) {
         return;
     }
     let user_context = current_user_context();
-    // Commercial acceptance gates must not confuse a busy debug sink with a
-    // missing CPU or product transition. These milestones are one-shot and
-    // retry the nonblocking output lock for a fixed bound; ordinary diagnostic
-    // traffic remains best-effort.
-    let attempts = if milestone_requires_reliable_output(record.name) {
-        REQUIRED_MILESTONE_OUTPUT_ATTEMPTS
-    } else {
-        1
-    };
-    for _ in 0..attempts {
+    let output_class = milestone_output_class(record.name);
+    if output_class == MilestoneOutputClass::QualificationCritical {
+        // Critical evidence accounts only for its own rendered loss.
+        let line = render_milestone_debugcon_line(record, user_context, output_class);
+        for _ in 0..output_class.output_attempts() {
+            if let Some(_guard) = try_debug_output_lock() {
+                print_bytes_unlocked(line.bytes());
+                return;
+            }
+            spin_loop();
+        }
+        record_milestone_output_drop(output_class, line.len() as u64);
+        return;
+    }
+
+    // Measurements are one-shot; Required keeps its bounded retry.
+    for _ in 0..output_class.output_attempts() {
         if let Some(_guard) = try_debug_output_lock() {
-            let mut writer = DebugconWriter;
-            let log_seq = LOG_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let _ = write!(
-                writer,
-                "seq={} ts_us={} tick={} lvl=info cat={} mod={} line=0 pid=",
-                log_seq,
-                record.ts_us,
-                record.tick,
-                record.category.as_str(),
-                SYNTHETIC_WARNING_MODULE_PATH,
-            );
-            match user_context.map(|context| context.process_id) {
-                Some(process_id) => {
-                    let _ = write!(writer, "{process_id}");
-                }
-                None => {
-                    let _ = writer.write_str("-");
-                }
-            }
-            let _ = writer.write_str(" tid=");
-            match user_context.map(|context| context.thread_id) {
-                Some(thread_id) => {
-                    let _ = write!(writer, "{thread_id}");
-                }
-                None => {
-                    let _ = writer.write_str("-");
-                }
-            }
-            let _ = write!(
-                writer,
-                " msg=\"milestone seq={} cat={} name={} arg0={:#x} arg1={:#x} dropped={} discarded_bytes={}\"\r\n",
-                record.seq,
-                record.category.as_str(),
-                record.name,
-                record.arg0,
-                record.arg1,
-                // ORDERING: Relaxed is sufficient; this is a monotonic loss
-                // count, not a publication of any other state.
-                MILESTONES_DROPPED.load(Ordering::Relaxed),
-                // The userspace evidence path has its own loss, and it is the
-                // one the acceptance proof reads. Report it beside the
-                // milestone loss so neither can be mistaken for the other.
-                DEBUG_BYTES_DISCARDED.load(Ordering::Relaxed),
-            );
+            let line = render_milestone_debugcon_line(record, user_context, output_class);
+            // `line` is complete before the first port I/O. While DEBUG_LOCK
+            // remains held, one `rep outsb` publishes the whole frame, so a
+            // regular diagnostic cannot splice bytes into this milestone.
+            print_bytes_unlocked(line.bytes());
             return;
         }
         spin_loop();
     }
-    // Every attempt lost the nonblocking sink. Count it: a diagnostic that can
-    // vanish without saying so is worse than no diagnostic, because the reader
-    // draws conclusions from a record they believe is complete. One 8-vCPU run
-    // lost 90 of 351 milestone sequence numbers, and the losses fell at the
-    // tail of the per-second scheduler drain, which is exactly where the
-    // per-caller acquisition census is emitted.
-    // ORDERING: Relaxed; the count is read only for reporting.
-    MILESTONES_DROPPED.fetch_add(1, Ordering::Relaxed);
+    record_milestone_output_drop(output_class, 0);
 }
 
+#[cfg(rustos_debug_print_enabled)]
+fn render_milestone_debugcon_line(
+    record: MilestoneRecord,
+    user_context: Option<CurrentUserLogContext>,
+    output_class: MilestoneOutputClass,
+) -> FixedDebugconLine<MILESTONE_DEBUGCON_LINE_CAPACITY> {
+    let (dropped, discarded_bytes) = milestone_loss_snapshot(
+        output_class,
+        MILESTONES_DROPPED.load(Ordering::Relaxed),
+        DEBUG_BYTES_DISCARDED.load(Ordering::Relaxed),
+        QUALIFICATION_MILESTONES_DROPPED.load(Ordering::Relaxed),
+        QUALIFICATION_DEBUG_BYTES_DISCARDED.load(Ordering::Relaxed),
+    );
+    let mut line = FixedDebugconLine::new();
+    milestone_frame::render_milestone_debugcon_line(
+        &mut line,
+        LOG_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+        record,
+        user_context,
+        dropped,
+        discarded_bytes,
+    )
+    .expect("milestone debugcon line exceeds fixed evidence buffer");
+    line
+}
+
+#[cfg(rustos_debug_print_enabled)]
+fn record_milestone_output_drop(output_class: MilestoneOutputClass, discarded_bytes: u64) {
+    record_milestone_output_drop_to(
+        output_class,
+        discarded_bytes,
+        &MILESTONES_DROPPED,
+        &QUALIFICATION_MILESTONES_DROPPED,
+        &QUALIFICATION_DEBUG_BYTES_DISCARDED,
+    );
+}
+#[cfg(rustos_debug_print_enabled)]
+fn record_milestone_output_drop_to(
+    output_class: MilestoneOutputClass,
+    discarded_bytes: u64,
+    milestones_dropped: &AtomicU64,
+    qualification_milestones_dropped: &AtomicU64,
+    qualification_discarded_bytes: &AtomicU64,
+) {
+    milestones_dropped.fetch_add(1, Ordering::Relaxed);
+    if output_class == MilestoneOutputClass::QualificationCritical {
+        qualification_milestones_dropped.fetch_add(1, Ordering::Relaxed);
+        qualification_discarded_bytes.fetch_add(discarded_bytes, Ordering::Relaxed);
+    }
+}
 /// Milestones whose emission lost the debug sink and were never written.
-///
-/// Reported on every line that does get out, so a reader can tell a complete
-/// record from a truncated one without reconstructing sequence gaps by hand.
 #[cfg(rustos_debug_print_enabled)]
 static MILESTONES_DROPPED: AtomicU64 = AtomicU64::new(0);
+#[cfg(rustos_debug_print_enabled)]
+static QUALIFICATION_MILESTONES_DROPPED: AtomicU64 = AtomicU64::new(0);
+#[cfg(rustos_debug_print_enabled)]
+static QUALIFICATION_DEBUG_BYTES_DISCARDED: AtomicU64 = AtomicU64::new(0);
 
 /// Number of milestones lost to a busy debug sink so far.
 #[cfg(rustos_debug_print_enabled)]
@@ -666,34 +770,64 @@ pub fn milestones_dropped() -> u64 {
 }
 
 #[cfg(rustos_debug_print_enabled)]
-fn milestone_requires_reliable_output(name: &str) -> bool {
-    name.starts_with("smp-")
-        || name.starts_with("product-")
-        // The once-per-second scheduler record is measurement, and a
-        // measurement that silently loses its tail is not evidence. These are
-        // emitted in one burst of about fourteen lines, so the later ones —
-        // the per-caller acquisition census — are the ones that lost the race
-        // under 8 vCPU contention.
-        || name.starts_with("kernel-scheduler-")
-        // Emitted immediately before a fatal activation panic. A diagnostic
-        // that explains the panic about to happen is the last thing that may
-        // be dropped: the first 8-vCPU run with these records lost all four to
-        // a saturated sink and left the panic as unattributable as before.
-        || name.starts_with("sched-activation-")
-        || name == "dvm-block-first-completion"
-        || name == "task-context-corrupted"
-        || name == "linux-user-fault"
-        || name == "linux-thread-clone-rejected"
-        // A degraded donation is the record that a scheduling edge was dropped
-        // without failing the call. Losing it turns the degradation invisible,
-        // which is how the fail-closed version of this path stayed hidden until
-        // it killed the compositor.
-        || name.starts_with("ipc-donation-")
-        // Input-ring lifecycle transitions. The L0 relay fails the whole proof
-        // when readiness disappears under it, and until these existed the only
-        // account of the transition lived in `debug::warn!`, which the product
-        // configuration does not route anywhere.
-        || name.starts_with("dvm-input-")
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MilestoneOutputClass {
+    BestEffort,
+    Measurement,
+    Required,
+    QualificationCritical,
+}
+
+#[cfg(rustos_debug_print_enabled)]
+impl MilestoneOutputClass {
+    const fn output_attempts(self) -> usize {
+        match self {
+            Self::Required | Self::QualificationCritical => REQUIRED_MILESTONE_OUTPUT_ATTEMPTS,
+            Self::BestEffort | Self::Measurement => 1,
+        }
+    }
+}
+
+#[cfg(rustos_debug_print_enabled)]
+fn milestone_output_class(name: &str) -> MilestoneOutputClass {
+    match name {
+        "smp-qualification-ready"
+        | "smp-qualification-start"
+        | "smp-qualification-finish"
+        | "smp-qualification-complete" => MilestoneOutputClass::QualificationCritical,
+        _ if name.starts_with("kernel-scheduler-") => MilestoneOutputClass::Measurement,
+        _ if name.starts_with("smp-")
+            || name.starts_with("product-")
+            || name.starts_with("sched-activation-")
+            || name == "dvm-block-first-completion"
+            || name == "dvm-block-transport-revoked"
+            || name == "task-context-corrupted"
+            || name == "linux-user-fault"
+            || name == "linux-thread-clone-rejected"
+            || name.starts_with("ipc-donation-")
+            || name.starts_with("dvm-input-") =>
+        {
+            MilestoneOutputClass::Required
+        }
+        _ => MilestoneOutputClass::BestEffort,
+    }
+}
+
+#[cfg(rustos_debug_print_enabled)]
+fn milestone_loss_snapshot(
+    output_class: MilestoneOutputClass,
+    milestones_dropped: u64,
+    discarded_bytes: u64,
+    qualification_milestones_dropped: u64,
+    qualification_discarded_bytes: u64,
+) -> (u64, u64) {
+    match output_class {
+        MilestoneOutputClass::QualificationCritical => (
+            qualification_milestones_dropped,
+            qualification_discarded_bytes,
+        ),
+        _ => (milestones_dropped, discarded_bytes),
+    }
 }
 
 #[cfg(rustos_debug_print_enabled)]
@@ -824,16 +958,111 @@ pub fn println_newline() {}
 
 #[cfg(rustos_debug_print_enabled)]
 pub fn println_fmt(args: fmt::Arguments<'_>) {
-    if let Some(_guard) = try_debug_output_lock() {
-        let mut writer = DebugconWriter;
-        let _ = writer.write_fmt(args);
-        let _ = writer.write_str("\r\n");
+    println_serialized(args);
+}
+
+/// Emits one non-panic diagnostic as one complete, bounded-retry debugcon
+/// line. It never publishes a partial formatted line: rendering completes in
+/// fixed storage before the port write, then DEBUG_LOCK remains held through
+/// exactly one `print_bytes_unlocked` call.
+#[cfg(rustos_debug_print_enabled)]
+pub fn println_serialized(args: fmt::Arguments<'_>) {
+    let mut line = FixedDebugconLine::<SERIALIZED_DEBUGCON_LINE_CAPACITY>::new();
+    if render_serialized_debugcon_line(&mut line, args).is_err() {
+        // The whole line is intentionally omitted. Reporting a prefix would
+        // turn an unavailable diagnostic into false structured evidence.
+        DEBUG_BYTES_DISCARDED.fetch_add(line.len() as u64, Ordering::Relaxed);
+        return;
+    }
+    for _ in 0..DEBUG_OUTPUT_ACQUIRE_ATTEMPTS {
+        if let Some(_guard) = try_debug_output_lock() {
+            print_bytes_unlocked(line.bytes());
+            return;
+        }
+        spin_loop();
+    }
+    DEBUG_BYTES_DISCARDED.fetch_add(line.len() as u64, Ordering::Relaxed);
+}
+
+#[cfg(rustos_debug_print_enabled)]
+struct EscapedUserDebugPayload<'a>(&'a [u8]);
+
+#[cfg(rustos_debug_print_enabled)]
+const fn escaped_user_debug_byte_width(byte: u8) -> usize {
+    match byte {
+        b'\n' | b'\r' | b'\t' | b'"' | b'\\' => 2,
+        0x20..=0x7e => 1,
+        _ => 4,
+    }
+}
+
+#[cfg(rustos_debug_print_enabled)]
+fn bounded_user_debug_payload_prefix(payload: &[u8]) -> usize {
+    let mut encoded = 0;
+    let mut count = 0;
+    for &byte in payload {
+        let width = escaped_user_debug_byte_width(byte);
+        if encoded + width > USER_DEBUG_ESCAPED_PAYLOAD_BYTES {
+            break;
+        }
+        encoded += width;
+        count += 1;
+    }
+    count
+}
+
+#[cfg(rustos_debug_print_enabled)]
+impl fmt::Display for EscapedUserDebugPayload<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for &byte in self.0 {
+            match byte {
+                b'\n' => formatter.write_str("\\n")?,
+                b'\r' => formatter.write_str("\\r")?,
+                b'\t' => formatter.write_str("\\t")?,
+                b'"' => formatter.write_str("\\\"")?,
+                b'\\' => formatter.write_str("\\\\")?,
+                0x20..=0x7e => formatter.write_char(char::from(byte))?,
+                _ => write!(formatter, "\\x{byte:02x}")?,
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Emits bytes copied from Ring3 without granting them a raw debugcon line.
+///
+/// The fixed prefix plus control/quote escaping makes it impossible for a
+/// userspace console/debug write to create a line that the milestone parser
+/// can confuse with a kernel-stamped evidence frame. Printable diagnostic
+/// substrings remain visible to existing bounded marker searches.
+#[cfg(rustos_debug_print_enabled)]
+pub fn write_user_bytes_serialized(bytes: &[u8]) {
+    let mut written = 0;
+    while written < bytes.len() {
+        let payload_len = bounded_user_debug_payload_prefix(&bytes[written..]);
+        debug_assert!(payload_len != 0);
+        println_serialized(format_args!(
+            "user-debug payload={}",
+            EscapedUserDebugPayload(&bytes[written..written + payload_len])
+        ));
+        written += payload_len;
     }
 }
 
 #[cfg(not(rustos_debug_print_enabled))]
+pub fn write_user_bytes_serialized(_bytes: &[u8]) {}
+
+#[cfg(not(rustos_debug_print_enabled))]
 pub fn println_fmt(_args: fmt::Arguments<'_>) {}
 
+#[cfg(not(rustos_debug_print_enabled))]
+pub fn println_serialized(_args: fmt::Arguments<'_>) {}
+
+/// Lock-free panic/emergency output that deliberately bypasses DEBUG_LOCK.
+///
+/// Only panic handling or a re-entrant emergency condition may use this API.
+/// Ordinary diagnostics must use [`println_serialized`] so their complete line
+/// cannot interleave with a milestone or another normal diagnostic.
 #[cfg(rustos_debug_print_enabled)]
 pub fn println_emergency(args: fmt::Arguments<'_>) {
     #[cfg(all(rustos_boot_image, not(test)))]
@@ -849,7 +1078,6 @@ pub fn println_emergency(args: fmt::Arguments<'_>) {
         let _ = writer.write_fmt(args);
         let _ = writer.write_str("\r\n");
     }
-
 }
 
 #[cfg(not(rustos_debug_print_enabled))]
@@ -911,14 +1139,6 @@ pub fn dump_recent_trace_locations(reason: &str) {
 
 #[cfg(not(rustos_debug_print_enabled))]
 pub fn dump_recent_trace_locations(_reason: &str) {}
-
-#[cfg(rustos_debug_print_enabled)]
-pub fn write_bytes(bytes: &[u8]) {
-    write_debugcon_only(bytes);
-}
-
-#[cfg(not(rustos_debug_print_enabled))]
-pub fn write_bytes(_bytes: &[u8]) {}
 
 /// Bounded retries before a userspace debug write gives up on the output lock.
 ///
@@ -1074,97 +1294,5 @@ macro_rules! diag_error {
 }
 
 #[cfg(all(test, rustos_debug_print_enabled))]
-mod tests {
-    use alloc::string::String;
-
-    use super::*;
-
-    #[test]
-    fn render_log_line_uses_fixed_field_order() {
-        let mut line = String::new();
-        let _ = render_log_line(
-            &mut line,
-            RenderedLogMetadata {
-                seq: 7,
-                ts_us: 19,
-                tick: 23,
-                category: LogCategory::Usb,
-                level: LogLevel::Warn,
-                module_path: "kernel::usb::core",
-                line: 41,
-                process_id: Some(100),
-                thread_id: Some(200),
-            },
-            format_args!("controller ready"),
-        );
-
-        assert_eq!(
-            line,
-            "seq=7 ts_us=19 tick=23 lvl=warn cat=usb mod=kernel::usb::core line=41 pid=100 tid=200 msg=\"controller ready\"\n"
-        );
-    }
-
-    #[test]
-    fn render_log_line_escapes_message_text() {
-        let mut line = String::new();
-        let _ = render_log_line(
-            &mut line,
-            RenderedLogMetadata {
-                seq: 1,
-                ts_us: 2,
-                tick: 3,
-                category: LogCategory::Debug,
-                level: LogLevel::Info,
-                module_path: "kernel::debug",
-                line: 9,
-                process_id: None,
-                thread_id: None,
-            },
-            format_args!("quote=\" path=\\ newline=\n tab=\t"),
-        );
-
-        assert_eq!(
-            line,
-            "seq=1 ts_us=2 tick=3 lvl=info cat=debug mod=kernel::debug line=9 pid=- tid=- msg=\"quote=\\\" path=\\\\ newline=\\n tab=\\t\"\n"
-        );
-    }
-
-    #[test]
-    fn wrapped_snapshot_prepends_drop_warning() {
-        let ring = KernelTextRing::<24>::new();
-        let _ = ObservatorySink::write_str(&ring, "alpha line is long enough\n");
-        let _ = ObservatorySink::write_str(&ring, "beta line is also long\n");
-        let _ = ObservatorySink::write_str(&ring, "gamma\n");
-
-        let snapshot = String::from_utf8(ring.snapshot_bytes()).unwrap();
-        assert!(snapshot.starts_with(
-            "seq=0 ts_us=0 tick=0 lvl=warn cat=debug mod=nucleus_core::debug line=0 pid=- tid=- msg=\"oldest logs dropped\"\n"
-        ));
-        assert!(snapshot.contains("gamma"));
-    }
-
-    #[test]
-    fn high_frequency_ipc_timeout_milestones_stay_off_debugcon() {
-        // Timeout evidence remains in the bounded milestone ring and is
-        // included in explicit postmortem dumps. Emitting one formatted
-        // debugcon line per readiness timeout would turn each byte into a KVM
-        // port-I/O exit and make the diagnostic path amplify the overload.
-        assert!(!milestone_debugcon_visible("ipc-reply-timeout"));
-        assert!(milestone_debugcon_visible("proc-commit-address-space-done"));
-    }
-
-    #[test]
-    fn acceptance_milestones_retry_the_contended_debug_sink() {
-        assert!(milestone_requires_reliable_output("smp-cpu-online"));
-        assert!(milestone_requires_reliable_output("product-storage-ready"));
-        assert!(milestone_requires_reliable_output(
-            "dvm-block-first-completion"
-        ));
-        assert!(milestone_requires_reliable_output("task-context-corrupted"));
-        assert!(milestone_requires_reliable_output("linux-user-fault"));
-        assert!(milestone_requires_reliable_output(
-            "linux-thread-clone-rejected"
-        ));
-        assert!(!milestone_requires_reliable_output("ipc-reply-rejected"));
-    }
-}
+#[path = "tests.rs"]
+mod tests;

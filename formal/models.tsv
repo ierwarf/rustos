@@ -1,6 +1,6 @@
 # model	class	deadlock_policy	deadlock_reason	pr_timeout_s	nightly_timeout_s	nightly_mode	apalache	tlaps	trace
 authority-identity-lifecycle/AuthorityIdentityLifecycle	safety	intentional-terminal	bounded identity namespace may exhaust	30	120	exhaustive	no	no	no
-atomic-process-activation-batch/AtomicProcessActivationBatch	safety	check	committed rejected and requester-exit terminals stutter while all-or-nothing activation remains explicit	30	120	exhaustive	no	no	no
+atomic-process-activation-batch/AtomicProcessActivationBatch	safety	check	committed rejected and requester-exit terminals stutter while full target identities and all-or-nothing activation remain explicit	30	120	exhaustive	no	no	no
 cpu-affinity-observation/CpuAffinityObservation	safety	check	reply and rejection terminals stutter while exact online-mask publication remains explicit	30	120	exhaustive	no	no	no
 task-affinity-lifecycle/TaskAffinityLifecycle	safety	check	rejected affinity requests stutter while successful changes retain explicit migration fork and exec progress	30	120	exhaustive	no	no	no
 acpi-table-admission/AcpiTableAdmission	safety	intentional-terminal	malformed firmware selects no partial ECAM or HPET authority	30	120	exhaustive	no	no	no
@@ -9,7 +9,8 @@ cpu-online-lifecycle/CpuOnlineLifecycle	safety	check	all-failed terminal state s
 smp-reschedule-ipi/SmpRescheduleIpi	temporal	check	critical-section exit must flush every exact target custody bit and every published request must reach a safe dispatch	30	120	exhaustive	no	no	no
 scheduler-cpu-ownership/SchedulerCpuOwnership	safety	check	fail-closed invalid attempts and ordinary acquire release dispatch transitions all retain enabled stutter or progress	30	120	exhaustive	no	no	no
 bootstrap-activation-handoff/BootstrapActivationHandoff	safety	check	terminal and duplicate-activation stutter preserves deadlock checking while bounded FIFO ownership remains explicit	30	120	exhaustive	no	no	no
-synchronous-ipc-handoff/SynchronousIpcHandoff	safety	check	explicit terminal stutter preserves deadlock checking while bounded FIFO call-reply custody remains explicit	30	120	exhaustive	no	no	no
+synchronous-ipc-handoff/SynchronousIpcHandoff	safety	check	explicit terminal stutter preserves deadlock checking while one Scheduler reply transaction, post-drop exact token publication, stale-token discard, in-place generation refresh, and bounded FIFO custody remain explicit	30	120	exhaustive	no	no	no
+synchronous-ipc-handoff-concurrency/SynchronousIpcHandoffConcurrency	safety	check	explicit terminal stutter preserves deadlock checking while two independent Scheduler reply wakes, per-task Begin/Finish publication, exact Local or RemoteQueued custody, cross-CPU FIFO retention, and retirement purge remain explicit	30	120	exhaustive	no	no	no
 tlb-shootdown-lifecycle/TlbShootdownLifecycle	safety	check	explicit reclaimed terminal state stutters so deadlock checking remains enabled	30	120	exhaustive	no	no	no
 cross-cpu-task-retirement/CrossCpuTaskRetirement	safety	check	reclaimed and fail-closed timeout terminals stutter while ownership invariants remain checked	30	120	exhaustive	no	no	no
 robust-futex-owner-death/RobustFutexOwnerDeath	safety	check	completed and rejected cleanup terminals stutter while atomic publication invariants remain checked	30	120	exhaustive	no	no	no
@@ -103,14 +104,17 @@ service-heap-lifecycle/ServiceHeapLifecycle	safety	check	explicit terminal alloc
 rootd-restart-backoff/RootdRestartBackoff	temporal	intentional-terminal	restart budget may terminate	120	900	exhaustive	no	no	no
 runtime-control-rpc/RuntimeControlRpc	safety	intentional-terminal	one response resolves the RPC	120	900	exhaustive	no	no	yes
 runtime-control-authority/RuntimeControlAuthority	safety	intentional-terminal	control request is admitted or denied	30	120	exhaustive	no	no	no
+scheduler-active-balance/SchedulerActiveBalance	temporal	check	loaded opportunity, mailbox drain, and target dispatch remain live under explicit fairness	30	120	exhaustive	no	no	no
 scheduler-admission/SchedulerAdmission	temporal	intentional-terminal	admission decision is terminal	120	900	exhaustive	no	no	no
 scheduler-cpu-distribution/SchedulerCpuDistribution	temporal	intentional-terminal	bounded schedule may stop	120	900	exhaustive+simulate	no	no	no
 scheduler-thread-demotion/SchedulerThreadDemotion	safety	intentional-terminal	thread restoration may terminate	120	900	exhaustive	no	no	no
 scheduler-wakeup/SchedulerWakeup	temporal	intentional-terminal	retired task outcome is terminal	120	900	exhaustive	no	no	no
 smp-release-admission/SmpReleaseAdmission	safety	check	terminal admission states stutter so deadlock checking remains enabled	30	120	exhaustive	no	no	no
+smp-ring3-qualification/SmpRing3Qualification	temporal	check	bounded worker phases and post-join terminal completion remain live under explicit fairness	30	120	exhaustive	no	no	no
 trusted-ui-boundary/TrustedUiBoundary	safety	intentional-terminal	prompt authority may revoke	120	900	exhaustive	no	no	no
 zero-trust-service-flow/ZeroTrustServiceFlow	temporal	intentional-terminal	request may be rejected revoked timed out or admitted	120	900	exhaustive	no	no	no
 userspace-wait-set/UserspaceWaitSet	temporal	check	explicit terminal stutter preserves deadlock checking	120	900	exhaustive	yes	yes	no
+userspace-wait-set/WaitSetRegistry	safety	check	create delete retire and transactional restore always retain a bounded next transition	30	120	exhaustive	no	no	no
 ui-frame-budget/UiFrameBudget	temporal	intentional-terminal	bounded frame epoch may stop	120	900	exhaustive	no	no	yes
 ui-main-loop-wakeup/UiMainLoopWakeup	temporal	check	explicit terminal stutter preserves deadlock checking	120	900	exhaustive	no	no	no
 ui-input-motion/UiInputMotion	temporal	intentional-terminal	bounded motion trace may stop	120	900	exhaustive	no	no	no

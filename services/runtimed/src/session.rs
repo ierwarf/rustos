@@ -448,6 +448,7 @@ fn spawn_ui_server_once(state: &mut BrokerState) -> Result<(), i32> {
         console_hosted: false,
         args,
         env,
+        private_smp_qualification: None,
     };
     super::spawn::spawn_tracked_process(state, entry)
 }

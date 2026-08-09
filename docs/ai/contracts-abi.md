@@ -260,6 +260,27 @@ MMIO mapping. The sole accepted GUI topology is the V3 `RSGUI002` three-slot
 GUI-DVM pool; V2, polling, a firmware framebuffer, and a native-GPU fallback
 are not parsed or selected.
 
+The block aperture and RDI1 input ring are atomic shared RAM, not generic
+MMIO: RustOS admits only an exact prefetchable non-I/O BAR and maps it WB;
+the Linux block relay requires the same `IORESOURCE_PREFETCH` resource and
+clears x86 PAT cache bits before `remap_pfn_range`, while L0's input producer
+uses ordinary `MAP_SHARED`. The MMIO registry rejects every overlapping
+physical interval with a different cache mode before choosing either the
+direct-map or high mapping window, including an interval straddling the
+direct-map limit. Publication metadata reserves before either direct-map or
+high-window mutation; direct-map override, new-page, and retained-index
+metadata each reserve their worst-case page count before a PTE change. No
+`mmio::map` boolean selector exists. Each AP rejects a non-WB preexisting
+PAT0 rather than retyping an active selector, then programs PAT2=UC/PAT4=WC
+and exactly reads back the full expected PAT MSR before
+`OnlineParked`/private-ready publication; WB is the empty selector. These
+rules cover block/input control memory only: display pixel memory remains its
+separate cache-mode contract and uses the io-manager WC mapper. Raw
+direct-map retyping is limited to kernel-mm's permanent boot-MMIO path and
+io-manager's owned mapping transaction: the BSP retypes the existing APIC leaf
+UC before APIC/PIC use, while generic high-window mapping rejects every
+physical address below the direct-map limit.
+
 When the RDI1 version-3 ring reaches its normal reserve-preserving limit, L0 waits for
 consumer credit for at most 50 ms rather than dropping a valid user frame or
 spinning. Progress resumes on the observed consumer cursor; no credit before
@@ -825,6 +846,22 @@ policy remains with the owning service.
   stream to that token plus the
   exact sessiond endpoint epoch; final retirement purges the matching vfsd
   interest, and a stale token fails closed even if purge delivery failed.
+  The shared `WaitSetInterestWire` admission function is the single envelope
+  validator on both sides of the boundary: ABI v1, a known provider, zero
+  flags/reserved word, a target fd representable by the bounded fd table, and
+  nonzero object/endpoint-epoch authority are mandatory before either ring0 or
+  vfsd resolves an interest. Proof-indexed Kani harnesses exhaust the symbolic
+  envelope partition and require both accepted and rejected witnesses; they do
+  not prove provider lookup, fd lifetime, or concurrent wake behavior.
+  Vfsd admits at most 256 live epoll objects and 512 interests per object, for
+  a machine-readable global ceiling of 131,072 persistent interests. Live
+  create and checkpoint restore fail closed at the object boundary; batch
+  restore is built in a candidate registry and becomes visible only after the
+  complete batch validates, so a duplicate or cap overflow preserves the exact
+  prior registry. A bounded reverse index maps each provider-object identity to
+  its exact `(epoll, interest-key)` memberships. Final-object purge removes
+  only that set and is proportional to affected registrations rather than a
+  clone or scan of every live epoll object.
   EPOLL_CTL_ADD/MOD pins the exact provider or console open description across
   the vfsd mutation. Releasing that transaction guard performs normal
   last-close purge, so a concurrent final close cannot purge first and then
@@ -1110,15 +1147,18 @@ policy remains with the owning service.
   boot-block broker.
 - Storaged startup performs one generation-bound, non-mutating FLUSH and emits
   its storage E2E proof only after the request crosses the block broker and
-  shared ring, the Linux DVM completes the backing-device flush, and storaged
-  consumes the exact completion. Storage-DVM KVM acceptance requires this
-  proof in addition to both peer readiness flags and exact geometry.
+  shared ring, the Linux DVM completes the read-only media barrier, and
+  storaged consumes the exact completion. This proves transport liveness, not
+  backing-image write durability; the host separately syncs the private image
+  and its containing directory before signing the aperture. Storage-DVM KVM
+  acceptance requires this proof in addition to both peer readiness flags and
+  exact geometry.
   `cargo xtask kvm-smoke --timeout 30 --storage-dvm-only` is the independent
   acceptance gate; it cannot fail or pass because of a UI/GPU marker.
 - Storage transport availability is a separate state from the `storaged`
   endpoint namespace publication. A registered endpoint proves only the exact
   service owner and capability lease; it must not make a caller wait behind a
-  startup FLUSH or a different caller's `DVM_READY` wait. The startup E2E
+  startup media barrier or a different caller's `DVM_READY` wait. The startup
   proof remains generation-bound and mandatory for its acceptance gate, while
   requests before that proof receive an explicit bounded not-ready result and
   retry through their owning policy path. The early-system runtime/compositor
@@ -1154,14 +1194,17 @@ policy remains with the owning service.
   breach, and prove that a display/network DVM restart neither revokes nor
   stalls an already-live storage generation.
 - Boot diagnosis records kernel-stamped `dvm-block-transport-installed`,
-  `dvm-block-peer-ready`, and `dvm-block-first-completion` milestones together
+  `dvm-block-peer-ready`, `dvm-block-first-completion`, and the Required
+  `dvm-block-transport-revoked` milestone. The revoke frame binds a closed
+  nonzero reason in `arg0` and the installed generation in `arg1`, while the
+  fixed diagnostic line records the pre-clear flags and ring cursors. Together
   with `ipc-service-capability-request`, `ipc-service-capability-reply`, and
-  `ipc-service-register`. These delimit transport admission, the first real
-  DVM completion, rootd capability latency, and endpoint publication without
-  treating debug print ordering as timing evidence. A UI-critical path above
-  five seconds is a failed performance acceptance result; the three-second
-  target is the optimization objective, not permission to bypass storage or
-  rootd authorization.
+  `ipc-service-register`, these delimit transport admission, the first real
+  DVM completion, terminal transport evidence, rootd capability latency, and
+  endpoint publication without treating debug print ordering as timing
+  evidence. A UI-critical path above five seconds is a failed performance
+  acceptance result; the three-second target is the optimization objective,
+  not permission to bypass storage or rootd authorization.
 - Physical display and storage device classes are signed loadable modules:
   `i915`, `xe`, `amdgpu`, `nvidia-drm`, AHCI, and NVMe may be selected only by
   a kernel-produced modalias for an assigned PCI function after the DVM is
@@ -1675,7 +1718,31 @@ kernel frame.
 
 Routed Linux ops after bootstrap: `socket`, `socketpair`, socket `dup`/`dup2`/`dup3`, socket `close`, socket `read`/`write`/`writev`, `bind`, `listen`, `accept`/`accept4`, `connect`, `sendto`, `recvfrom`, `sendmsg`, `recvmsg`, `getsockname`, `getpeername`, `setsockopt`, `getsockopt`, `shutdown`.
 
-netd invokes gated `SYS_RUSTOS_NET_BROKER` with target pid. Net broker arg struct carries six 64-bit syscall arg slots. Kernel performs handle install and target user-memory validation/copy; AF_UNIX socket lifecycle, binding/listen queues, byte queues, and socket option policy belong to netd. Version-2 `NetdIpcRequest`/`Response` frames copy an exact 120/32-byte header plus only the actual bounded payload, rather than a fixed maximum-size buffer. They carry `socket_token`, fd `status_flags`, and a bounded inline payload for this service-owned socket path.
+netd invokes gated `SYS_RUSTOS_NET_BROKER` with target pid. Net broker arg struct carries six 64-bit syscall arg slots. Kernel performs handle install and target user-memory validation/copy; AF_UNIX socket lifecycle, binding/listen queues, byte queues, and socket option policy belong to netd. Version-7 `NetdIpcRequest`/`Response` frames copy an exact 136/32-byte header plus only the actual bounded payload, rather than a fixed maximum-size buffer. Request offset 112 carries a mandatory nonzero absolute `CLOCK_MONOTONIC` deadline; the frames also carry `socket_token`, fd `status_flags`, and a bounded inline payload for this service-owned socket path.
+
+The producer fixes that transaction end before payload preparation and reuses
+it for every foreground retry. The kernel reply wait floors the same monotonic
+nanosecond value into its RTC tick domain and takes the earlier of the wire end
+and its already-admitted service-class end. Netd then tightens the request once
+at admission to 16 ms for readiness, 100 ms for DVM session and reference
+control, or 30 s for bulk work. Queueing, worker dequeue, provider polling, and
+retry may consume the stamped remainder but cannot mint another class budget.
+An expired detached poll makes one terminal `ETIMEDOUT` reply attempt and
+releases its slot; a reply consumed after the caller deadline is discarded,
+including transferred descriptors, instead of reviving the completed call.
+
+This deliberately combines three established microkernel properties without
+copying their ABI: L4Re exposes absolute IPC timeouts and warns that a finite
+receive timeout can leave a server holding a temporary reply capability;
+seL4 MCS uses explicit one-shot reply objects to track reply authority and
+scheduling-context donation; QNX ties synchronous send/receive/reply state to
+priority inheritance. RustOS therefore keeps reply authority explicit and
+one-shot, keeps scheduling donation bounded by that reply, and additionally
+propagates one end instant through ring3 queues where a kernel-only relative
+timeout cannot bound service-side resource ownership. See the official
+[L4Re IPC documentation](https://l4re.org/doc/l4re_concepts_ipc.html),
+[seL4 MCS documentation](https://docs.sel4.systems/Tutorials/mcs), and
+[QNX message-passing documentation](https://qnx.com/developers/docs/8.0/com.qnx.doc.neutrino.sys_arch/topic/ipc.html).
 
 Four fixed netd request receivers prevent an unrelated caller from serializing
 all local AF_UNIX work. Blocking INET connect/send/recv waits run in a separate

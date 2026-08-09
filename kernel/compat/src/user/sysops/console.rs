@@ -33,7 +33,7 @@ pub(crate) fn write_from_current_process(
         }
         total_written += tty::write_to_session(session, &chunk[..chunk_len]);
         if session.is_system() {
-            crate::debug::write_bytes(&chunk[..chunk_len]);
+            crate::debug::write_user_bytes_serialized(&chunk[..chunk_len]);
         }
         copied += chunk_len;
     }
@@ -97,6 +97,19 @@ fn log_console_user_buffer_failure(
             address_space_root,
             err,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn system_console_debug_mirror_never_writes_raw_user_bytes() {
+        let source = include_str!("console.rs");
+        let payload = "&chunk[..chunk_len]);";
+        let serialized = ["crate::debug::write_user_bytes_serialized(", payload].concat();
+        let raw = ["crate::debug::write_bytes(", payload].concat();
+        assert!(source.contains(serialized.as_str()));
+        assert!(!source.contains(raw.as_str()));
     }
 }
 

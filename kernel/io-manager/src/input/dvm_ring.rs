@@ -18,8 +18,10 @@
 // launch-created aperture, arms one MSI-X wake vector, and drains bounded
 // records only for inputd's capability-gated broker. inputd retains all input
 // policy, translation, modifier state, and client-read ownership.
-use core::mem::size_of;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering, fence};
+use core::mem::{align_of, size_of};
+use core::sync::atomic::{
+    AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence,
+};
 
 use driver_domain_protocol::{
     DVM_INPUT_RING_APERTURE_BYTES, DVM_INPUT_RING_CONSUMER_OFFSET,
@@ -44,6 +46,41 @@ const MSIX_ENTRY_VECTOR_CONTROL_OFFSET: usize = 12;
 const MSIX_ENTRY_VECTOR_MASKED: u32 = 1;
 const MAX_RECORDS_PER_BROKER_TURN: u64 = 256;
 const MAX_ATTACH_ATTEMPTS_PER_BOOT: u8 = 8;
+
+/// Every shared control word is addressed through `Atomic*::from_ptr`; the
+/// encoded ring layout remains bytes-on-the-wire rather than a Rust struct.
+const fn input_ring_atomic_control_layout_is_valid() -> bool {
+    DVM_INPUT_RING_FLAGS_OFFSET % align_of::<AtomicU32>() == 0
+        && DVM_INPUT_RING_PRODUCER_OFFSET % align_of::<AtomicU64>() == 0
+        && DVM_INPUT_RING_CONSUMER_OFFSET % align_of::<AtomicU64>() == 0
+        && DVM_INPUT_RING_CONSUMER_WAKE_GENERATION_OFFSET % align_of::<AtomicU64>() == 0
+        && DVM_INPUT_RING_FLAGS_OFFSET + size_of::<AtomicU32>() <= DVM_INPUT_RING_PRODUCER_OFFSET
+        && DVM_INPUT_RING_PRODUCER_OFFSET + size_of::<AtomicU64>() <= DVM_INPUT_RING_CONSUMER_OFFSET
+        && DVM_INPUT_RING_CONSUMER_OFFSET + size_of::<AtomicU64>()
+            <= DVM_INPUT_RING_CONSUMER_WAKE_GENERATION_OFFSET
+        && DVM_INPUT_RING_CONSUMER_WAKE_GENERATION_OFFSET + size_of::<AtomicU64>()
+            <= DvmInputRingHeader::encoded_len()
+        && size_of::<AtomicU32>() == size_of::<u32>()
+        && size_of::<AtomicU64>() == size_of::<u64>()
+}
+
+const _: () = assert!(input_ring_atomic_control_layout_is_valid());
+
+const fn shared_control_load_order() -> Ordering {
+    Ordering::Acquire
+}
+
+const fn shared_control_publish_order() -> Ordering {
+    Ordering::Release
+}
+
+const fn shared_control_update_order() -> Ordering {
+    Ordering::AcqRel
+}
+
+const fn shared_control_update_failure_order() -> Ordering {
+    Ordering::Acquire
+}
 
 static INSTALLED: AtomicBool = AtomicBool::new(false);
 /// Serialize first attachment and recovery attachment. A concurrent init and
@@ -274,14 +311,14 @@ fn try_install_serialized() -> bool {
         release_mapping(ring.mapped);
         return false;
     };
-    let previous_flags = read_u32(ring.mapped, DVM_INPUT_RING_FLAGS_OFFSET);
-    let flags = previous_flags & !DVM_INPUT_RING_FLAG_POLICY_CONSUMER_READY;
-    write_u32(
-        ring.mapped,
-        DVM_INPUT_RING_FLAGS_OFFSET,
-        flags | DVM_INPUT_RING_FLAG_RUSTOS_READY,
-    );
-    fence(Ordering::SeqCst);
+    let (previous_flags, _) = update_shared_flags(ring.mapped, |flags| {
+        Some(
+            (flags & !DVM_INPUT_RING_FLAG_POLICY_CONSUMER_READY) | DVM_INPUT_RING_FLAG_RUSTOS_READY,
+        )
+    })
+    .expect("fixed input-ring flag update is unconditional");
+    // ORDERING: AcqRel reads the L0-published READY state and releases this
+    // RustOS-ready/policy-clear transition to the producer before activation.
     // Install requires the next policy owner to re-publish, so it clears the
     // policy bit. On a re-install that bit was set and an L0 producer is live,
     // and the relay reads the cleared window as a terminal revocation.
@@ -344,11 +381,12 @@ pub(crate) fn mark_policy_consumer_ready() -> bool {
         revoke("policy-ready-lifecycle-invalid");
         return false;
     }
-    let Some(flags) = admitted_policy_ready_flags(header.flags) else {
+    let flags = load_shared_flags(mapped);
+    let Some(admitted_flags) = admitted_policy_ready_flags(flags) else {
         revoke("policy-ready-transport-not-ready");
         return false;
     };
-    if flags == header.flags {
+    if admitted_flags == flags {
         return true;
     }
     // A replacement inputd must never inherit records committed for a dead
@@ -356,17 +394,28 @@ pub(crate) fn mark_policy_consumer_ready() -> bool {
     // bit is clear, but one already-admitted commit may race that withdrawal.
     // Retire all pre-admission records before publishing the new owner.
     if header.producer != header.consumer {
-        fence(Ordering::Release);
-        write_u64(mapped, DVM_INPUT_RING_CONSUMER_OFFSET, header.producer);
+        // ORDERING: Release retires the prior owner's records before the
+        // policy-ready AcqRel update admits L0 production for this owner.
+        store_shared_u64(
+            mapped,
+            DVM_INPUT_RING_CONSUMER_OFFSET,
+            header.producer,
+            shared_control_publish_order(),
+        );
         CONSUMER.store(header.producer, Ordering::Release);
         RESET_PENDING_GENERATION.store(header.generation, Ordering::Release);
     }
-    write_u32(
-        mapped,
-        DVM_INPUT_RING_FLAGS_OFFSET,
-        flags | DVM_INPUT_RING_FLAG_POLICY_CONSUMER_READY,
-    );
-    fence(Ordering::SeqCst);
+    if update_shared_flags(mapped, |current| {
+        (current & DVM_INPUT_RING_FLAG_RUSTOS_READY != 0)
+            .then_some(current | DVM_INPUT_RING_FLAG_POLICY_CONSUMER_READY)
+    })
+    .is_none()
+    {
+        revoke("policy-ready-transport-not-ready");
+        return false;
+    }
+    // ORDERING: AcqRel publishes the exact policy-consumer admission after
+    // the retired cursor is visible to the L0 producer.
     crate::debug::record_milestone(
         crate::debug::LogCategory::Input,
         "dvm-input-policy-ready",
@@ -394,13 +443,12 @@ pub(crate) fn withdraw_policy_consumer() {
         return;
     };
     let mapped = mapping.mapped();
-    let flags = read_u32(mapped, DVM_INPUT_RING_FLAGS_OFFSET);
-    write_u32(
-        mapped,
-        DVM_INPUT_RING_FLAGS_OFFSET,
-        flags & !DVM_INPUT_RING_FLAG_POLICY_CONSUMER_READY,
-    );
-    fence(Ordering::SeqCst);
+    let (flags, _) = update_shared_flags(mapped, |current| {
+        Some(current & !DVM_INPUT_RING_FLAG_POLICY_CONSUMER_READY)
+    })
+    .expect("fixed input-ring policy withdrawal is unconditional");
+    // ORDERING: AcqRel withdraws policy readiness before the lifecycle drain
+    // publishes its reset barrier and wakes the former policy consumer.
     let generation = mapping.generation();
     crate::debug::record_milestone(
         crate::debug::LogCategory::Input,
@@ -495,9 +543,9 @@ pub(crate) fn service_pending(dest: &mut [InputDvmRecordWire]) -> usize {
         RECORDS_COPIED.fetch_add(reset_written as u64, Ordering::Relaxed);
         return reset_written;
     }
-    // Pairs with L0's release fence before it advances `producer`. No record
-    // bytes may be observed before the validated cursor becomes visible.
-    fence(Ordering::Acquire);
+    // ORDERING: the Acquire producer-cursor load in `read_header` pairs with
+    // L0's Release cursor publication. No record bytes may be observed before
+    // the validated cursor becomes visible.
     let available = header.producer - consumer;
     record_outstanding_high_water(available);
     let capacity = (dest.len() - written) as u64;
@@ -537,13 +585,14 @@ pub(crate) fn service_pending(dest: &mut [InputDvmRecordWire]) -> usize {
         RECORDS_COPIED.fetch_add(reset_written as u64, Ordering::Relaxed);
         return reset_written;
     }
-    fence(Ordering::Release);
-    unsafe {
-        mapped
-            .add(DVM_INPUT_RING_CONSUMER_OFFSET)
-            .cast::<u64>()
-            .write_volatile(consumer.to_le());
-    }
+    // ORDERING: Release publishes copied-record ownership retirement before
+    // L0 acquires the consumer cursor and reuses the slot for a later frame.
+    store_shared_u64(
+        mapped,
+        DVM_INPUT_RING_CONSUMER_OFFSET,
+        consumer,
+        shared_control_publish_order(),
+    );
     CONSUMER.store(consumer, Ordering::Release);
     RECORDS_COPIED.fetch_add(written as u64, Ordering::Relaxed);
     if header.producer > consumer {
@@ -590,13 +639,14 @@ pub(crate) fn arm_consumer_wake() -> bool {
     if !mapping.validate_current() || mapping.epoch() != generation {
         return false;
     }
-    fence(Ordering::Release);
-    unsafe {
-        mapped
-            .add(DVM_INPUT_RING_CONSUMER_WAKE_GENERATION_OFFSET)
-            .cast::<u64>()
-            .write_volatile(next.to_le());
-    }
+    // ORDERING: Release publishes the registered waiter before L0's Acquire
+    // wake-generation read decides whether to send its MSI-X edge.
+    store_shared_u64(
+        mapped,
+        DVM_INPUT_RING_CONSUMER_WAKE_GENERATION_OFFSET,
+        next,
+        shared_control_publish_order(),
+    );
     CONSUMER_WAKE_GENERATION.store(next, Ordering::Release);
     true
 }
@@ -761,10 +811,14 @@ fn finish_pending_lifecycle() {
                 && header.producer >= consumer
                 && header.producer.saturating_sub(consumer) <= u64::from(DVM_INPUT_RING_SLOT_COUNT)
             {
-                // ORDERING: publish cursor bytes before the Release cursor and
-                // pending-bit stores expose withdrawal completion.
-                fence(Ordering::Release);
-                write_u64(mapped, DVM_INPUT_RING_CONSUMER_OFFSET, header.producer);
+                // ORDERING: Release publishes withdrawal's retired cursor
+                // before the pending-bit store exposes completion to L0.
+                store_shared_u64(
+                    mapped,
+                    DVM_INPUT_RING_CONSUMER_OFFSET,
+                    header.producer,
+                    shared_control_publish_order(),
+                );
                 CONSUMER.store(header.producer, Ordering::Release);
                 IRQ_PENDING.store(false, Ordering::Release);
                 true
@@ -788,13 +842,15 @@ fn finish_pending_lifecycle() {
     INSTALLED.store(false, Ordering::Release);
     let mapped = SHARED_ADDR.swap(0, Ordering::AcqRel) as *mut u8;
     if !mapped.is_null() {
-        let flags = read_u32(mapped, DVM_INPUT_RING_FLAGS_OFFSET);
-        write_u32(
-            mapped,
-            DVM_INPUT_RING_FLAGS_OFFSET,
-            flags & !(DVM_INPUT_RING_FLAG_RUSTOS_READY | DVM_INPUT_RING_FLAG_POLICY_CONSUMER_READY),
-        );
-        fence(Ordering::SeqCst);
+        let _ = update_shared_flags(mapped, |flags| {
+            Some(
+                flags
+                    & !(DVM_INPUT_RING_FLAG_RUSTOS_READY
+                        | DVM_INPUT_RING_FLAG_POLICY_CONSUMER_READY),
+            )
+        });
+        // ORDERING: AcqRel withdraws both RustOS-owned ready bits before this
+        // mapping can be released and L0 observes a terminal revocation.
     }
     release_mapping(mapped);
     IRQ_PENDING.store(false, Ordering::Release);
@@ -866,7 +922,7 @@ fn report_install_rejection_once() {
     if INSTALL_REJECTION_REPORTED.swap(true, Ordering::AcqRel) {
         return;
     }
-    crate::debug::println_emergency(format_args!(
+    crate::debug::println_serialized(format_args!(
         "DVM input ring rejected: reason={} discovery={} ivshmem_candidates={} exact_apertures={} aperture_start={:#x}",
         install_rejection_name(INSTALL_REJECTION.load(Ordering::Acquire)),
         discovery_rejection_name(DISCOVERY_REJECTION.load(Ordering::Acquire)),
@@ -930,6 +986,10 @@ fn release_mapping(mapped: *mut u8) {
     }
 }
 
+const fn fixed_input_shared_bar_shape(is_io: bool, prefetchable: bool, size: u64) -> bool {
+    !is_io && prefetchable && size == DVM_INPUT_RING_APERTURE_BYTES
+}
+
 fn find_input_ring() -> Option<MappedInputRing> {
     let mut found = None;
     let mut ivshmem_candidates = 0_u32;
@@ -949,7 +1009,7 @@ fn find_input_ring() -> Option<MappedInputRing> {
             last_rejection = DISCOVERY_REJECTION_REGISTER_BAR;
             return false;
         };
-        if resource.is_io || resource.size != DVM_INPUT_RING_APERTURE_BYTES {
+        if !fixed_input_shared_bar_shape(resource.is_io, resource.prefetchable, resource.size) {
             last_rejection = DISCOVERY_REJECTION_APERTURE_GEOMETRY;
             return false;
         }
@@ -965,8 +1025,18 @@ fn find_input_ring() -> Option<MappedInputRing> {
             exact_aperture_rejection = last_rejection;
             return false;
         };
-        let mapped = crate::driver::mmio::map(resource.start, resource_len, true).cast::<u8>();
+        // The L0 producer maps the launch-owned file as ordinary shared RAM.
+        // Match it with WB here: this ring uses acquire/release atomics, not a
+        // write-mostly framebuffer contract.
+        let mapped =
+            crate::driver::mmio::map_shared_write_back(resource.start, resource_len).cast::<u8>();
         if mapped.is_null() {
+            last_rejection = DISCOVERY_REJECTION_MAPPING;
+            exact_aperture_rejection = last_rejection;
+            return false;
+        }
+        if !shared_control_words_are_aligned(mapped) {
+            release_mapping(mapped);
             last_rejection = DISCOVERY_REJECTION_MAPPING;
             exact_aperture_rejection = last_rejection;
             return false;
@@ -1012,7 +1082,7 @@ fn find_input_ring() -> Option<MappedInputRing> {
 }
 
 /// Why a header read did not yield a usable header.
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HeaderRejection {
     /// The aperture has not published its immutable prefix yet. Skip the turn.
     Unpublished,
@@ -1022,21 +1092,17 @@ enum HeaderRejection {
 
 fn read_header(mapped: *const u8) -> Result<DvmInputRingHeader, HeaderRejection> {
     let mut bytes = [0_u8; DvmInputRingHeader::encoded_len()];
-    for (index, byte) in bytes.iter_mut().enumerate() {
-        *byte = unsafe { mapped.add(index).read_volatile() };
+    copy_immutable_header_bytes(mapped, &mut bytes);
+    if header_is_unpublished(&bytes) {
+        return Err(HeaderRejection::Unpublished);
     }
+    // The mutable control words have independent atomic owners. Copying them
+    // bytewise would be a non-atomic race with a valid cursor/ready update.
+    write_control_words_to_header_bytes(mapped, &mut bytes);
     // Geometry is immutable for the boot, but the two cursors are independent
-    // concurrent writers. Do not validate a byte-by-byte snapshot of a cursor:
-    // a valid aligned u64 update could otherwise look torn and permanently
-    // revoke the input transport under sustained pointer traffic.
-    bytes[DVM_INPUT_RING_PRODUCER_OFFSET..DVM_INPUT_RING_PRODUCER_OFFSET + size_of::<u64>()]
-        .fill(0);
-    bytes[DVM_INPUT_RING_CONSUMER_OFFSET..DVM_INPUT_RING_CONSUMER_OFFSET + size_of::<u64>()]
-        .fill(0);
-    let Some(mut header) = DvmInputRingHeader::decode(&bytes) else {
-        if header_is_unpublished(&bytes) {
-            return Err(HeaderRejection::Unpublished);
-        }
+    // concurrent writers. Atomic consumer-before-producer loads preserve the
+    // monotonic cursor invariant without a torn byte snapshot.
+    let Some(header) = DvmInputRingHeader::decode(&bytes) else {
         report_invalid_header(mapped, &bytes);
         return Err(HeaderRejection::Invalid);
     };
@@ -1056,8 +1122,6 @@ fn read_header(mapped: *const u8) -> Result<DvmInputRingHeader, HeaderRejection>
     // which is at least the consumer itself. The outstanding bound survives the
     // same way: L0 admits at most a full ring beyond whatever consumer it last
     // observed, and that observation cannot be newer than this one.
-    header.consumer = read_u64(mapped, DVM_INPUT_RING_CONSUMER_OFFSET);
-    header.producer = read_u64(mapped, DVM_INPUT_RING_PRODUCER_OFFSET);
     if header.is_valid() {
         Ok(header)
     } else {
@@ -1093,8 +1157,8 @@ fn header_is_unpublished(bytes: &[u8]) -> bool {
 }
 
 fn report_invalid_header(mapped: *const u8, bytes: &[u8]) {
-    let flags = read_u32(mapped, DVM_INPUT_RING_FLAGS_OFFSET);
-    let generation = read_u64(mapped, 56);
+    let flags = load_shared_flags(mapped);
+    let generation = read_immutable_u64(mapped, 56);
     let region_bytes = u64::from_le_bytes(bytes[16..24].try_into().unwrap_or_default());
     let mut checks = 0_u64;
     let mut set = |ok: bool, bit: u32| {
@@ -1177,7 +1241,7 @@ fn arm_input_ring_interrupt(device: crate::arch::pci::PciDevice) -> Result<(), u
         return Err(INSTALL_REJECTION_HANDLER_REGISTRATION);
     }
     let message = vector_lease.message().ok_or(INSTALL_REJECTION_MESSAGE)?;
-    let table = crate::driver::mmio::map(table_resource.start, table_len, false).cast::<u8>();
+    let table = crate::driver::mmio::map_uncached(table_resource.start, table_len).cast::<u8>();
     if table.is_null() {
         return Err(INSTALL_REJECTION_TABLE_MAPPING);
     }
@@ -1218,20 +1282,120 @@ unsafe fn program_msix_entry(entry: *mut u8, message: crate::arch::msi::MsiMessa
     }
 }
 
-fn read_u32(base: *const u8, offset: usize) -> u32 {
-    unsafe { u32::from_le(base.add(offset).cast::<u32>().read_volatile()) }
+fn shared_control_words_are_aligned(base: *const u8) -> bool {
+    let base = base as usize;
+    base != 0
+        && base
+            .checked_add(DVM_INPUT_RING_FLAGS_OFFSET)
+            .is_some_and(|address| address % align_of::<AtomicU32>() == 0)
+        && base
+            .checked_add(DVM_INPUT_RING_PRODUCER_OFFSET)
+            .is_some_and(|address| address % align_of::<AtomicU64>() == 0)
+        && base
+            .checked_add(DVM_INPUT_RING_CONSUMER_OFFSET)
+            .is_some_and(|address| address % align_of::<AtomicU64>() == 0)
+        && base
+            .checked_add(DVM_INPUT_RING_CONSUMER_WAKE_GENERATION_OFFSET)
+            .is_some_and(|address| address % align_of::<AtomicU64>() == 0)
 }
 
-fn read_u64(base: *const u8, offset: usize) -> u64 {
-    unsafe { u64::from_le(base.add(offset).cast::<u64>().read_volatile()) }
+fn load_shared_flags(base: *const u8) -> u32 {
+    load_shared_u32(base, DVM_INPUT_RING_FLAGS_OFFSET)
 }
 
-fn write_u32(base: *mut u8, offset: usize, value: u32) {
-    unsafe { base.add(offset).cast::<u32>().write_volatile(value.to_le()) }
+fn load_shared_u32(base: *const u8, offset: usize) -> u32 {
+    debug_assert!(shared_control_words_are_aligned(base));
+    // SAFETY: install admits a page-aligned WB mapping and the checked fixed
+    // offset is aligned for `AtomicU32`. This temporary reference names only
+    // the atomic control word; all concurrent accesses use these atomic helpers.
+    let word = unsafe { AtomicU32::from_ptr(base.cast_mut().add(offset).cast::<u32>()) };
+    u32::from_le(word.load(shared_control_load_order()))
 }
 
-fn write_u64(base: *mut u8, offset: usize, value: u64) {
-    unsafe { base.add(offset).cast::<u64>().write_volatile(value.to_le()) }
+fn load_shared_u64(base: *const u8, offset: usize) -> u64 {
+    debug_assert!(shared_control_words_are_aligned(base));
+    // SAFETY: install admits a page-aligned WB mapping and the checked fixed
+    // offset is aligned for `AtomicU64`. This temporary reference names only
+    // the atomic control word; all concurrent accesses use these atomic helpers.
+    let word = unsafe { AtomicU64::from_ptr(base.cast_mut().add(offset).cast::<u64>()) };
+    u64::from_le(word.load(shared_control_load_order()))
+}
+
+fn store_shared_u64(base: *mut u8, offset: usize, value: u64, ordering: Ordering) {
+    debug_assert!(shared_control_words_are_aligned(base));
+    // SAFETY: install admits a page-aligned WB mapping and the checked fixed
+    // offset is aligned for `AtomicU64`. This temporary reference names only
+    // the atomic control word; all concurrent accesses use these atomic helpers.
+    let word = unsafe { AtomicU64::from_ptr(base.add(offset).cast::<u64>()) };
+    word.store(value.to_le(), ordering);
+}
+
+fn update_shared_flags(
+    base: *mut u8,
+    mut update: impl FnMut(u32) -> Option<u32>,
+) -> Option<(u32, u32)> {
+    debug_assert!(shared_control_words_are_aligned(base));
+    // SAFETY: install admits a page-aligned WB mapping and the checked fixed
+    // offset is aligned for `AtomicU32`. This temporary reference names only
+    // the atomic control word; all concurrent accesses use these atomic helpers.
+    let word = unsafe { AtomicU32::from_ptr(base.add(DVM_INPUT_RING_FLAGS_OFFSET).cast::<u32>()) };
+    let mut observed = word.load(shared_control_load_order());
+    loop {
+        let previous = u32::from_le(observed);
+        let next = update(previous)?;
+        match word.compare_exchange_weak(
+            observed,
+            next.to_le(),
+            shared_control_update_order(),
+            shared_control_update_failure_order(),
+        ) {
+            Ok(_) => return Some((previous, next)),
+            Err(current) => observed = current,
+        }
+    }
+}
+
+fn copy_immutable_header_bytes(mapped: *const u8, bytes: &mut [u8]) {
+    for range in [
+        0..DVM_INPUT_RING_FLAGS_OFFSET,
+        DVM_INPUT_RING_FLAGS_OFFSET + size_of::<u32>()..DVM_INPUT_RING_PRODUCER_OFFSET,
+        DVM_INPUT_RING_PRODUCER_OFFSET + size_of::<u64>()..DVM_INPUT_RING_CONSUMER_OFFSET,
+        DVM_INPUT_RING_CONSUMER_WAKE_GENERATION_OFFSET + size_of::<u64>()..bytes.len(),
+    ] {
+        for index in range {
+            // SAFETY: `read_header` is called only for an admitted fixed-size
+            // mapping, and these ranges exclude every concurrently mutable word.
+            bytes[index] = unsafe { mapped.add(index).read_volatile() };
+        }
+    }
+}
+
+fn write_control_words_to_header_bytes(mapped: *const u8, bytes: &mut [u8]) {
+    let flags = load_shared_flags(mapped);
+    // ORDERING: consumer first, then producer, makes the monotonic ring bound
+    // valid for this non-atomic composite snapshot.
+    let consumer = load_shared_u64(mapped, DVM_INPUT_RING_CONSUMER_OFFSET);
+    let producer = load_shared_u64(mapped, DVM_INPUT_RING_PRODUCER_OFFSET);
+    let wake_generation = load_shared_u64(mapped, DVM_INPUT_RING_CONSUMER_WAKE_GENERATION_OFFSET);
+    bytes[DVM_INPUT_RING_FLAGS_OFFSET..DVM_INPUT_RING_FLAGS_OFFSET + size_of::<u32>()]
+        .copy_from_slice(&flags.to_le_bytes());
+    bytes[DVM_INPUT_RING_PRODUCER_OFFSET..DVM_INPUT_RING_PRODUCER_OFFSET + size_of::<u64>()]
+        .copy_from_slice(&producer.to_le_bytes());
+    bytes[DVM_INPUT_RING_CONSUMER_OFFSET..DVM_INPUT_RING_CONSUMER_OFFSET + size_of::<u64>()]
+        .copy_from_slice(&consumer.to_le_bytes());
+    bytes[DVM_INPUT_RING_CONSUMER_WAKE_GENERATION_OFFSET
+        ..DVM_INPUT_RING_CONSUMER_WAKE_GENERATION_OFFSET + size_of::<u64>()]
+        .copy_from_slice(&wake_generation.to_le_bytes());
+}
+
+fn read_immutable_u64(base: *const u8, offset: usize) -> u64 {
+    let mut bytes = [0_u8; size_of::<u64>()];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        // SAFETY: generation is immutable after L0 initializes the admitted
+        // aperture; callers use this only for header diagnostics.
+        *byte = unsafe { base.add(offset + index).read_volatile() };
+    }
+    u64::from_le_bytes(bytes)
 }
 
 #[cfg(test)]
@@ -1249,6 +1413,76 @@ mod tests {
     }
 
     #[test]
+    fn input_ring_control_words_are_atomic_and_ordered() {
+        assert!(input_ring_atomic_control_layout_is_valid());
+        assert_eq!(shared_control_load_order(), Ordering::Acquire);
+        assert_eq!(shared_control_publish_order(), Ordering::Release);
+        assert_eq!(shared_control_update_order(), Ordering::AcqRel);
+        assert_eq!(shared_control_update_failure_order(), Ordering::Acquire);
+
+        let mut backing = [0_u64; 32];
+        let base = backing.as_mut_ptr().cast::<u8>();
+        assert!(shared_control_words_are_aligned(base));
+
+        let header = DvmInputRingHeader::new(DVM_INPUT_RING_APERTURE_BYTES, 9).encode();
+        for (index, byte) in header.iter().enumerate() {
+            // SAFETY: this test initializes private backing before any atomic
+            // view exists, so there is no concurrent shared-memory access.
+            unsafe { base.add(index).write_volatile(*byte) };
+        }
+        assert_eq!(
+            load_shared_flags(base),
+            driver_domain_protocol::DVM_INPUT_RING_FLAG_READY
+        );
+
+        store_shared_u64(
+            base,
+            DVM_INPUT_RING_PRODUCER_OFFSET,
+            7,
+            shared_control_publish_order(),
+        );
+        store_shared_u64(
+            base,
+            DVM_INPUT_RING_CONSUMER_OFFSET,
+            3,
+            shared_control_publish_order(),
+        );
+        store_shared_u64(
+            base,
+            DVM_INPUT_RING_CONSUMER_WAKE_GENERATION_OFFSET,
+            11,
+            shared_control_publish_order(),
+        );
+        assert_eq!(load_shared_u64(base, DVM_INPUT_RING_PRODUCER_OFFSET), 7);
+        assert_eq!(load_shared_u64(base, DVM_INPUT_RING_CONSUMER_OFFSET), 3);
+        assert_eq!(
+            load_shared_u64(base, DVM_INPUT_RING_CONSUMER_WAKE_GENERATION_OFFSET),
+            11
+        );
+        let snapshot = read_header(base).unwrap();
+        assert_eq!(
+            (
+                snapshot.producer,
+                snapshot.consumer,
+                snapshot.consumer_wake_generation
+            ),
+            (7, 3, 11)
+        );
+
+        let production = include_str!("dvm_ring.rs")
+            .split_once("#[cfg(test)]")
+            .expect("input-ring tests remain below production")
+            .0;
+        assert!(production.contains("AtomicU32::from_ptr"));
+        assert!(production.contains("AtomicU64::from_ptr"));
+        assert!(production.contains("fn write_control_words_to_header_bytes"));
+        assert!(!production.contains(".write_volatile(consumer.to_le())"));
+        assert!(!production.contains(
+            "DVM_INPUT_RING_CONSUMER_WAKE_GENERATION_OFFSET)\n            .cast::<u64>()"
+        ));
+    }
+
+    #[test]
     fn policy_consumer_readiness_requires_transport_and_is_idempotent() {
         let provider_ready = driver_domain_protocol::DVM_INPUT_RING_FLAG_READY;
         assert_eq!(admitted_policy_ready_flags(provider_ready), None);
@@ -1257,6 +1491,35 @@ mod tests {
         let admitted = transport_ready | DVM_INPUT_RING_FLAG_POLICY_CONSUMER_READY;
         assert_eq!(admitted_policy_ready_flags(transport_ready), Some(admitted));
         assert_eq!(admitted_policy_ready_flags(admitted), Some(admitted));
+    }
+
+    #[test]
+    fn input_shared_ring_requires_prefetchable_write_back_atomic_memory() {
+        assert!(fixed_input_shared_bar_shape(
+            false,
+            true,
+            DVM_INPUT_RING_APERTURE_BYTES
+        ));
+        assert!(!fixed_input_shared_bar_shape(
+            false,
+            false,
+            DVM_INPUT_RING_APERTURE_BYTES
+        ));
+        assert!(!fixed_input_shared_bar_shape(
+            true,
+            true,
+            DVM_INPUT_RING_APERTURE_BYTES
+        ));
+
+        let production = include_str!("dvm_ring.rs")
+            .split_once("#[cfg(test)]")
+            .expect("input-ring tests must remain below production")
+            .0;
+        assert_eq!(
+            production.matches("mmio::map_shared_write_back(").count(),
+            1
+        );
+        assert!(!production.contains("mmio::map_write_combining(resource.start, resource_len)"));
     }
 
     #[test]

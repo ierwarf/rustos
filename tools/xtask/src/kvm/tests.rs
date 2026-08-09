@@ -3,93 +3,107 @@
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_UI_FPS_ACTIVE_WINDOWS, DVM_BLOCK_READY_MARKER, DVM_BOOTSTRAP_FRAME_MARKER,
-        DVM_CONTROL_AUTHENTICATION, DVM_CONTROL_CAPABILITIES,
-        DVM_CONTROL_PROTOCOL, DVM_CONTROL_STATE, DVM_CONTROL_TRANSPORT, DVM_DISPLAY_REGION_BYTES,
-        DVM_GPU_COMPOSITOR_MARKER, DVM_KEYBOARD_INGRESS_MARKER, DVM_POINTER_INGRESS_MARKER,
-        DvmNetworkCounters, GuestDisplay, MAX_SMOKE_TIMEOUT, PHYSICAL_GPU_PROFILES,
-        RUSTOS_BOOT_MARKER,
-        RUSTOS_DVM_BLOCK_E2E_MARKER, RUSTOS_DVM_BLOCK_FIRST_COMPLETION_MARKER,
-        RUSTOS_DVM_BLOCK_FLUSH_FAULT_MARKER, RUSTOS_DVM_BLOCK_MARKER,
-        RUSTOS_GPU_SCENE_COMPILER_MARKER, RUSTOS_INIT_IDENTITY_MARKER,
-        RUSTOS_POST_INIT_PROVENANCE_MARKER, VIRTUAL_GPU_EVIDENCE, WayclickProfileObservation,
-        WAYCLICK_FIRST_FRAME_MARKER,
+        DEFAULT_UI_FPS_ACTIVE_WINDOWS, DVM_BLOCK_FEATURE_FLUSH, DVM_BLOCK_FLAG_DVM_READY,
+        DVM_BLOCK_FLAG_READ_ONLY, DVM_BLOCK_FLAG_RUSTOS_READY, DVM_BLOCK_MEDIA_BLOCK_BYTES,
+        DVM_BLOCK_MEDIA_FEATURES, DVM_BLOCK_READY_MARKER, DVM_BOOTSTRAP_FRAME_MARKER,
+        DVM_CONTROL_AUTHENTICATION,
+        DVM_CONTROL_CAPABILITIES, DVM_CONTROL_PROTOCOL, DVM_CONTROL_STATE, DVM_CONTROL_TRANSPORT,
+        DVM_DISPLAY_REGION_BYTES, DVM_GPU_COMPOSITOR_MARKER, DVM_KEYBOARD_INGRESS_MARKER,
+        DVM_POINTER_INGRESS_MARKER, DvmNetworkCounters, GuestDisplay, MAX_SMOKE_TIMEOUT,
+        PHYSICAL_GPU_PROFILES, RUSTOS_BOOT_MARKER, RUSTOS_DVM_BLOCK_E2E_MARKER,
+        RUSTOS_DVM_BLOCK_FIRST_COMPLETION_MARKER, RUSTOS_DVM_BLOCK_FLUSH_FAULT_MARKER,
+        RUSTOS_DVM_BLOCK_MARKER, RUSTOS_GPU_SCENE_COMPILER_MARKER, RUSTOS_INIT_IDENTITY_MARKER,
+        RUSTOS_POST_INIT_PROVENANCE_MARKER, RUSTOS_SMP_READINESS, RustosSmpReadiness,
+        SMP_QUALIFICATION_DEADLINE_US, SMP_QUALIFICATION_WORK_BITS, SMP_QUALIFICATION_WORK_UNITS,
+        VIRTUAL_GPU_EVIDENCE, WAYCLICK_FIRST_FRAME_MARKER, WayclickProfileObservation,
         acquire_kvm_launch_lock, append_dvm_display_pixels, append_dvm_input_devices,
-        append_dvm_network_device, append_dvm_virtual_gpu, append_physical_gpu,
-        claim_physical_gpu_launch_in, causal_tail, dvm_display_failure, dvm_display_provider_ready,
+        append_dvm_network_device, append_dvm_virtual_gpu, append_dvm_virtual_storage,
+        append_physical_gpu, causal_tail, claim_physical_gpu_launch_in,
+        dvm_block_header_matches_ready_generation, dvm_display_failure, dvm_display_provider_ready,
         dvm_display_relay_meets_fps, dvm_display_relay_ready, dvm_gpu_compositor_ready,
         dvm_gpu_device, dvm_machine, dvm_physical_frames_ready, dvm_pointer_device,
-        guest_cid_for_process, is_sha256, mesa_dri_prime_for_pci_bdf,
-        parse_dvm_control_contract_text, parse_manifest_text, parse_smoke_options,
-        physical_gpu_profile, prepare_runtime_log, qemu_display_backend, required_dvm_gpu_ready,
-        rustos_marker_present, RustosSmpReadiness, RUSTOS_SMP_READINESS,
-        smp_runtime_missing_markers,
-        runtime_stall_or_crash_observed, select_smoke_guest_display,
-        uiserver_has_interactive_slow_loop, uiserver_idle_ticks_healthy,
-        uiserver_profile_input_pipeline_healthy, uiserver_profile_meets_fps,
-        validate_manifest_values, validate_storage_fault_expectation, vfio_device_cdev_path,
+        dvm_read_only_block_header, guest_cid_for_process, is_sha256, mesa_dri_prime_for_pci_bdf,
+        milestone_frame_checksum, parse_dvm_control_contract_text, parse_manifest_text,
+        parse_smoke_options, parse_verified_milestone_frame,
+        parse_verified_smp_qualification_event, parse_verified_smp_runtime_event,
+        physical_gpu_profile, prepare_runtime_log, qemu_display_backend,
+        render_private_acceptance_contract, render_smp_ring3_qualification_contract,
+        required_dvm_gpu_ready, runtime_stall_or_crash_observed, rustos_marker_present,
+        select_smoke_guest_display, smp_ring3_qualification_is_complete,
+        smp_runtime_missing_markers, uiserver_has_interactive_slow_loop,
+        uiserver_idle_ticks_healthy, uiserver_profile_input_pipeline_healthy,
+        uiserver_profile_meets_fps, validate_manifest_values,
+        validate_smp_ring3_qualification_events, validate_storage_fault_expectation,
+        verified_smp_qualification_events, verified_smp_runtime_events, vfio_device_cdev_path,
         wayclick_profile_meets_fps, wayclick_profile_observation,
     };
     use std::{fs, path::Path, process::Command, time::Duration};
 
+    #[path = "smp_ring3_qualification.rs"]
+    mod smp_ring3_qualification;
+
+    #[path = "dvm_block.rs"]
+    mod dvm_block;
+
     #[test]
     fn rustos_smp_topology_is_machine_gated_on_complete_prerequisites() {
-        assert_eq!(RUSTOS_SMP_READINESS.rustos_vcpus, 1);
-        assert!(RUSTOS_SMP_READINESS.validate(None).is_ok());
-
-        let incomplete_multi = RustosSmpReadiness {
-            rustos_vcpus: 2,
-            ..RUSTOS_SMP_READINESS
-        };
-        assert!(incomplete_multi.validate(None).is_err());
-
-        let evidence = crate::formal_contracts::validated_smp_launch_evidence_for_tests();
-        assert!(incomplete_multi.validate(Some(&evidence)).is_ok());
+        smp_ring3_qualification::rustos_smp_topology_is_machine_gated_on_complete_prerequisites();
     }
 
     #[test]
     fn rustos_smp_runtime_requires_every_requested_cpu_event_class() {
-        let mut log = String::new();
-        for cpu in 0..2 {
-            for name in [
-                "smp-cpu-online",
-                "smp-cpu-idle-enter",
-                "smp-cpu-first-clockevent",
-                "smp-cpu-first-user-dispatch",
-            ] {
-                log.push_str(format!("name={name} arg0=0x{cpu:x} arg1=0x1\n").as_str());
-            }
-            log.push_str(
-                format!("name=smp-resched-route arg0=0x{cpu:x} arg1=0x100000000000001\n")
-                    .as_str(),
-            );
-        }
-        assert!(smp_runtime_missing_markers(&log, 2).is_empty());
-        let incomplete = log.replace(
-            "name=smp-cpu-first-user-dispatch arg0=0x1 arg1=0x1\n",
-            "",
-        );
-        assert_eq!(
-            smp_runtime_missing_markers(&incomplete, 2),
-            vec!["name=smp-cpu-first-user-dispatch arg0=0x1"]
+        smp_ring3_qualification::rustos_smp_runtime_requires_every_requested_cpu_event_class();
+    }
+
+    #[test]
+    fn smp_runtime_rejects_interleaved_or_route_only_substrings_as_evidence() {
+        smp_ring3_qualification::smp_runtime_rejects_interleaved_or_route_only_substrings_as_evidence();
+    }
+
+    #[test]
+    fn smp_ring3_qualification_accepts_complete_exact_worker_sets() {
+        smp_ring3_qualification::smp_ring3_qualification_accepts_complete_exact_worker_sets();
+    }
+
+    #[test]
+    fn smp_ring3_qualification_rejects_missing_duplicate_and_replayed_phases() {
+        smp_ring3_qualification::smp_ring3_qualification_rejects_missing_duplicate_and_replayed_phases();
+    }
+
+    #[test]
+    fn smp_ring3_qualification_rejects_process_and_thread_substitution() {
+        smp_ring3_qualification::smp_ring3_qualification_rejects_process_and_thread_substitution();
+    }
+
+    #[test]
+    fn smp_ring3_qualification_rejects_loss_wrong_cpu_and_work() {
+        smp_ring3_qualification::smp_ring3_qualification_rejects_loss_wrong_cpu_and_work();
+    }
+
+    #[test]
+    fn smp_ring3_qualification_rejects_zero_or_nonuniform_kernel_binding() {
+        smp_ring3_qualification::smp_ring3_qualification_rejects_zero_or_nonuniform_kernel_binding(
         );
     }
 
     #[test]
-    fn smp_boot_acceptance_uses_kernel_stamped_milestones_when_text_interleaves() {
-        let log = "seq=107 msg=\"milestone name=product-root-core-ready\"\n\
-seq=119 msg=\"milestone name=product-init-identity-ready\"";
-        assert!(rustos_marker_present(log, RUSTOS_BOOT_MARKER));
-        assert!(rustos_marker_present(log, RUSTOS_INIT_IDENTITY_MARKER));
-        assert!(!rustos_marker_present(log, RUSTOS_GPU_SCENE_COMPILER_MARKER));
+    fn smp_ring3_qualification_rejects_phase_order_and_deadline() {
+        smp_ring3_qualification::smp_ring3_qualification_rejects_phase_order_and_deadline();
+    }
 
-        let successor_only =
-            "seq=119 msg=\"milestone name=product-init-identity-ready arg0=0x0 arg1=0x0\"";
-        assert!(rustos_marker_present(successor_only, RUSTOS_BOOT_MARKER));
-        assert!(rustos_marker_present(
-            successor_only,
-            RUSTOS_INIT_IDENTITY_MARKER
-        ));
+    #[test]
+    fn smp_ring3_qualification_rejects_interleaved_tampered_and_plain_frames() {
+        smp_ring3_qualification::smp_ring3_qualification_rejects_interleaved_tampered_and_plain_frames();
+    }
+
+    #[test]
+    fn private_kvm_contract_renderers_are_canonical() {
+        smp_ring3_qualification::private_kvm_contract_renderers_are_canonical();
+    }
+
+    #[test]
+    fn smp_boot_acceptance_uses_kernel_stamped_milestones_when_text_interleaves() {
+        smp_ring3_qualification::smp_boot_acceptance_uses_kernel_stamped_milestones_when_text_interleaves();
     }
 
     #[test]
@@ -174,62 +188,17 @@ seq=119 msg=\"milestone name=product-init-identity-ready\"";
 
     #[test]
     fn smp_iteration_is_bounded_and_cannot_claim_acceptance() {
-        let options = parse_smoke_options(
-            vec![
-                "--rustos-vcpus".into(),
-                "2".into(),
-                "--smp-iteration".into(),
-                "--timeout".into(),
-                "30".into(),
-            ]
-            .into_iter(),
-        )
-        .unwrap();
-        assert!(options.smp_iteration);
-        assert_eq!(options.rustos_vcpus, 2);
-        assert!(
-            parse_smoke_options(
-                vec![
-                    "--rustos-vcpus".into(),
-                    "2".into(),
-                    "--smp-iteration".into(),
-                    "--timeout".into(),
-                    "31".into(),
-                ]
-                .into_iter()
-            )
-            .is_err()
-        );
-        assert!(
-            parse_smoke_options(
-                vec![
-                    "--rustos-vcpus".into(),
-                    "2".into(),
-                    "--smp-iteration".into(),
-                    "--timeout".into(),
-                    "30".into(),
-                    "--min-ui-fps".into(),
-                    "55".into(),
-                ]
-                .into_iter()
-            )
-            .is_err()
-        );
-        assert!(
-            parse_smoke_options(
-                vec![
-                    "--rustos-vcpus".into(),
-                    "2".into(),
-                    "--smp-iteration".into(),
-                    "--timeout".into(),
-                    "30".into(),
-                    "--recovery-probe".into(),
-                    "all".into(),
-                ]
-                .into_iter()
-            )
-            .is_err()
-        );
+        smp_ring3_qualification::smp_iteration_is_bounded_and_cannot_claim_acceptance();
+    }
+
+    #[test]
+    fn smp_ring3_qualification_has_exact_private_kvm_admission() {
+        smp_ring3_qualification::smp_ring3_qualification_has_exact_private_kvm_admission();
+    }
+
+    #[test]
+    fn smp_evidence_cohort_is_strict_and_paired() {
+        smp_ring3_qualification::smp_evidence_cohort_is_strict_and_paired();
     }
 
     #[test]
@@ -250,14 +219,7 @@ seq=119 msg=\"milestone name=product-init-identity-ready\"";
 
     #[test]
     fn smoke_readiness_budget_starts_only_after_both_guests_spawn() {
-        let source = include_str!("options.rs");
-        let spawn = source
-            .find("let (mut rustos, mut dvm) = spawn_guests(")
-            .expect("parallel guest spawn");
-        let deadline = source
-            .find("let deadline = boot_started + options.timeout;")
-            .expect("readiness deadline");
-        assert!(spawn < deadline);
+        smp_ring3_qualification::smoke_readiness_budget_starts_only_after_both_guests_spawn();
     }
 
     #[test]
@@ -276,8 +238,16 @@ seq=119 msg=\"milestone name=product-init-identity-ready\"";
         let options = parse_smoke_options(vec!["--gui-dvm-surfaces".into()].into_iter()).unwrap();
         assert!(options.gui_dvm_surfaces);
         assert!(options.dvm_block_shmem);
-        assert!(options.expected_markers.contains(&RUSTOS_DVM_BLOCK_E2E_MARKER.to_owned()));
-        assert!(options.expected_markers.contains(&WAYCLICK_FIRST_FRAME_MARKER.to_owned()));
+        assert!(
+            options
+                .expected_markers
+                .contains(&RUSTOS_DVM_BLOCK_E2E_MARKER.to_owned())
+        );
+        assert!(
+            options
+                .expected_markers
+                .contains(&WAYCLICK_FIRST_FRAME_MARKER.to_owned())
+        );
         assert!(
             options
                 .expected_dvm_markers
@@ -371,7 +341,10 @@ seq=119 msg=\"milestone name=product-init-identity-ready\"";
     fn dvm_gpu_compositor_requires_real_virgl_fences_and_bounded_latency() {
         let ready = "rustos-dvm-gpu: ready contract=1 driver=virtio_gpu renderer=virgl_(AMD_Radeon_780M) backend-class=virtual-staged certification=registered commands=3 gpu-fence=1 acquire-fence=1 prime_us=12000 frames=120 fps_milli=60001 avg_us=400 max_us=900 wall_max_us=1000 frame_hash_a=ac8906df9029660b frame_hash_b=bc8906df9029660b hash-stable=1 hash-dynamic=1 negative=5 software=0 scheduler=rr priority=8 rttime-soft-us=50000 rttime-hard-us=100000 rttime-hard-action=terminate scheduler-restored=normal performance-target=1 scope-public-abi=0 scope-ui-connected=0 scope-scanout=0\nrustos-dvm-gpu: health sequence=1 completion_us=900 acquire-fence=1\nrustos-dvm-gpu: health sequence=2 completion_us=900 acquire-fence=1\nrustos-dvm-gpu: health sequence=3 completion_us=900 acquire-fence=1";
         assert!(dvm_gpu_compositor_ready(ready, VIRTUAL_GPU_EVIDENCE));
-        let recovered = format!("{}\nrustos-dvm-gpu: health sequence=1 completion_us=20000 acquire-fence=1\nrustos-dvm-gpu: health sequence=2 completion_us=900 acquire-fence=1\nrustos-dvm-gpu: health sequence=3 completion_us=900 acquire-fence=1\nrustos-dvm-gpu: health sequence=4 completion_us=900 acquire-fence=1", ready.lines().next().unwrap());
+        let recovered = format!(
+            "{}\nrustos-dvm-gpu: health sequence=1 completion_us=20000 acquire-fence=1\nrustos-dvm-gpu: health sequence=2 completion_us=900 acquire-fence=1\nrustos-dvm-gpu: health sequence=3 completion_us=900 acquire-fence=1\nrustos-dvm-gpu: health sequence=4 completion_us=900 acquire-fence=1",
+            ready.lines().next().unwrap()
+        );
         assert!(dvm_gpu_compositor_ready(&recovered, VIRTUAL_GPU_EVIDENCE));
         assert!(!dvm_gpu_compositor_ready(
             &ready.replace("software=0", "software=1"),
@@ -564,10 +537,8 @@ seq=119 msg=\"milestone name=product-init-identity-ready\"";
 
     #[test]
     fn recovery_probe_requires_fresh_rustos_and_dvm_process_epochs() {
-        let options = parse_smoke_options(
-            vec!["--recovery-probe".into(), "all".into()].into_iter(),
-        )
-        .unwrap();
+        let options =
+            parse_smoke_options(vec!["--recovery-probe".into(), "all".into()].into_iter()).unwrap();
         assert!(options.recovery_probe.includes_rustos_reboot());
         assert!(options.recovery_probe.includes_dvm_restart());
         assert!(
@@ -782,18 +753,9 @@ seq=119 msg=\"milestone name=product-init-identity-ready\"";
                 "uiserver: update tick elapsed_ms=1000 loops=200 total_loops=200 frames=60 cursor_moves=60 cursor={cursor} presented_cursor={cursor} backlog=false backlog_loops=0 input_loop_events=60 input_gap_ms=20 input_last_age_ms=5 input_drops=0 input_slow=0 input_errors=0 background_thread_demotions=7"
             )
         };
-        let log = [
-            window("800,450"),
-            window("992,450"),
-            window("992,642"),
-        ]
-        .join("\n");
+        let log = [window("800,450"), window("992,450"), window("992,642")].join("\n");
         assert!(uiserver_profile_meets_fps(&log, 55, 3));
-        assert!(uiserver_profile_input_pipeline_healthy(
-            &log,
-            3,
-            Some(55)
-        ));
+        assert!(uiserver_profile_input_pipeline_healthy(&log, 3, Some(55)));
         assert!(!uiserver_profile_input_pipeline_healthy(
             &log.replace("presented_cursor=992,642", "presented_cursor=991,642"),
             3,
@@ -809,11 +771,7 @@ seq=119 msg=\"milestone name=product-init-identity-ready\"";
             "uiserver: update tick elapsed_ms=1007 frames=65 cursor_moves=55 cursor=992,555 presented_cursor=992,555 backlog=false input_loop_events=66 input_gap_ms=34 input_last_age_ms=1 input_drops_window=0 input_slow_window=0 input_errors_window=0 background_thread_demotions=10",
         ]
         .join("\n");
-        assert!(uiserver_profile_input_pipeline_healthy(
-            &log,
-            3,
-            Some(55)
-        ));
+        assert!(uiserver_profile_input_pipeline_healthy(&log, 3, Some(55)));
         assert!(!uiserver_profile_input_pipeline_healthy(
             &log.replacen("input_gap_ms=50", "input_gap_ms=51", 1),
             3,
@@ -880,9 +838,9 @@ vfsd: volume-read begin path=apps/wayclick/wayclick.elf ts_us=200";
         assert_eq!(events[1].guest_ts_us, Some(150));
         assert_eq!(events[2].guest_ts_us, Some(200));
         assert!(
-            events
-                .iter()
-                .all(|event| !event.record.contains("unrelated") && !event.record.contains("secret"))
+            events.iter().all(
+                |event| !event.record.contains("unrelated") && !event.record.contains("secret")
+            )
         );
     }
 
@@ -1037,6 +995,31 @@ uiserver: slow loop iter_ms=51 wayland_ms=0 present_ms=51 console_windows=1 wayl
                 && arg.contains("readonly=on,rom=on")
                 && !arg.contains("prealloc=on")
         }));
+    }
+
+    #[test]
+    fn dvm_attached_block_disk_requires_qemu_read_only_backing() {
+        dvm_block::dvm_attached_block_disk_requires_qemu_read_only_backing();
+    }
+
+    #[test]
+    fn dvm_block_transport_header_matches_read_only_qemu_backing() {
+        dvm_block::dvm_block_transport_header_matches_read_only_qemu_backing();
+    }
+
+    #[test]
+    fn dvm_block_read_only_media_geometry_matches_atapi_capacity() {
+        dvm_block::dvm_block_read_only_media_geometry_matches_atapi_capacity();
+    }
+
+    #[test]
+    fn dvm_block_read_only_media_driver_closure_is_explicit() {
+        dvm_block::dvm_block_read_only_media_driver_closure_is_explicit();
+    }
+
+    #[test]
+    fn dvm_block_recovery_readiness_tracks_the_exact_successor_generation() {
+        dvm_block::dvm_block_recovery_readiness_tracks_the_exact_successor_generation();
     }
 
     #[test]

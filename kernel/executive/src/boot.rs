@@ -1,3 +1,20 @@
+//! BSP/AP bootstrap and terminal kernel-failure orchestration.
+//!
+//! - **Owner:** `kernel-executive` owns boot phase transitions; HAL, MM, PS,
+//!   and compatibility crates retain their narrow mechanism ownership.
+//! - **Boundary:** Boot protocol records, firmware topology, AP identities,
+//!   PAT state, and early service images are validated before publication.
+//! - **Lifecycle:** Establish BSP memory/interrupt state, launch each exact AP,
+//!   verify its CPU-local cache contract, publish OnlineParked, then enter the
+//!   service bootstrap and supervisor lifecycle.
+//! - **Concurrency:** BSP admission and per-AP startup records serialize shared
+//!   page-table use; each CPU programs and reads back its own PAT MSR.
+//! - **Failure:** Identity, timeout, PAT, mapping, image, or service admission
+//!   failures stop publication and retain allocation-free panic evidence.
+//! - **Forbidden:** No AP private-ready before PAT verification, no mixed-cache
+//!   APIC alias, and no fabricated service or CPU readiness.
+//! - **Evidence:** CPU-online TLC, AP cache-order tests, and bounded KVM gates.
+
 use boot_protocol::{BootInfo, BootVolumeTransport};
 use core::hint::spin_loop;
 use core::panic::PanicInfo;
@@ -249,7 +266,7 @@ pub unsafe fn initialize_kernel(boot_info_ptr: *const BootInfo) {
             "ACPI MADT and IA32_APIC_BASE disagree on the local APIC page"
         );
     }
-    let local_apic_virt = mm_api::paging::map_mmio_range(local_apic_phys, 4096)
+    let local_apic_virt = mm_api::paging::map_permanent_boot_mmio_uncached(local_apic_phys, 4096)
         .expect("kernel-mm could not admit the local APIC MMIO page");
     assert!(
         hal_api::cpu::configure_local_apic_mmio(local_apic_phys, local_apic_virt),
@@ -544,6 +561,10 @@ extern "C" fn rustos_ap_entry(
         CpuLifecycleState::Starting,
         "AP startup entered outside Starting"
     );
+    assert!(
+        mm_api::boot::initialize_current_cpu_cache_attributes(),
+        "AP could not verify its x86 PAT write-combining slot"
+    );
     debug::record_milestone(
         debug::LogCategory::Boot,
         "smp-ap-rust-entry",
@@ -785,5 +806,42 @@ fn scheduled_kernel_main(_id: u64) {
 fn trace_service_phase(_phase: &'static str) {
     if debug::enabled!(heartbeat, debug) {
         debug::debug!(heartbeat, "service loop phase: {}", _phase);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn local_apic_uses_one_permanent_uncached_direct_map_alias() {
+        let production = include_str!("boot.rs")
+            .split_once("#[cfg(test)]")
+            .expect("boot tests must remain below production")
+            .0;
+        assert!(
+            production.contains(
+                "mm_api::paging::map_permanent_boot_mmio_uncached(local_apic_phys, 4096)"
+            )
+        );
+        assert!(!production.contains("mm_api::paging::map_mmio_range(local_apic_phys, 4096)"));
+    }
+
+    #[test]
+    fn ap_cache_attributes_are_verified_before_private_ready_publication() {
+        let source = include_str!("boot.rs");
+        let ap_entry = source
+            .split_once("extern \"C\" fn rustos_ap_entry(")
+            .expect("AP entry must remain source-visible")
+            .1;
+        let cache_init = ap_entry
+            .find("mm_api::boot::initialize_current_cpu_cache_attributes()")
+            .expect("AP entry must initialize its local PAT");
+        let online_parked = ap_entry
+            .find("CpuLifecycleState::OnlineParked")
+            .expect("AP entry must publish OnlineParked");
+        let private_ready = ap_entry
+            .find("\"smp-ap-private-ready\"")
+            .expect("AP entry must publish private readiness");
+        assert!(cache_init < online_parked);
+        assert!(cache_init < private_ready);
     }
 }

@@ -62,10 +62,8 @@ pub(super) fn syscall_linux_rustos_ipc_reply_recv_with_sender(args_ptr: u64) -> 
             return linux_errno(ipc_error_to_linux_errno(err));
         }
     };
-    let _ = multitask::release_ipc_priority(args.reply_cap);
     let reply_ticks = crate::arch::rtc::ticks();
-    let handoff_queued = multitask::wake_task(caller_task_id)
-        && multitask::set_next_synchronous_pick_hint(caller_task_id);
+    let handoff_queued = multitask::complete_ipc_reply_wake_handoff(args.reply_cap, caller_task_id);
     log_slow_ipc_reply(
         "reply-recv",
         args.reply_cap,

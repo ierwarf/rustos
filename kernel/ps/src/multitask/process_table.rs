@@ -38,6 +38,30 @@ pub struct ProcessHandle {
     generation: u32,
 }
 
+/// Stable, live process authority used at capability boundaries. A PID is only
+/// a routing label; callers retain both the process-table and address-space
+/// generations so PID reuse and exec cannot inherit a prior grant.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProcessIdentity {
+    process_id: u64,
+    process_generation: u32,
+    mm_generation: u32,
+}
+
+impl ProcessIdentity {
+    pub const fn process_id(self) -> u64 {
+        self.process_id
+    }
+
+    pub const fn process_generation(self) -> u32 {
+        self.process_generation
+    }
+
+    pub const fn mm_generation(self) -> u32 {
+        self.mm_generation
+    }
+}
+
 impl ProcessHandle {
     pub const fn new(index: usize, generation: u32) -> Self {
         Self { index, generation }
@@ -106,6 +130,10 @@ impl ExecFinalize {
 impl ProcessRef {
     pub const fn process_id(&self) -> u64 {
         self.process_id
+    }
+
+    pub fn live_identity(&self) -> Option<ProcessIdentity> {
+        live_process_identity(self.handle)
     }
 
     pub fn with_state<R>(&self, f: impl FnOnce(u64, &UserProcessState) -> R) -> R {
@@ -366,6 +394,44 @@ pub fn retain_process_by_pid(process_id: u64) -> Option<ProcessRef> {
         });
     }
     None
+}
+
+/// Resolve a PID to its live generational authority. Processes that are
+/// exiting or transitioning address spaces are deliberately not identities:
+/// publication during either interval would make an old capability survive a
+/// teardown or exec boundary.
+pub fn live_process_identity_by_pid(process_id: u64) -> Option<ProcessIdentity> {
+    let table = PROCESS_TABLE.lock();
+    table.slots.iter().find_map(|slot| {
+        let object = slot.object.as_deref()?;
+        (object.process_id == process_id
+            && !object.exiting
+            && !object.exec_in_progress
+            && !object.exec_state_staged)
+            .then_some(ProcessIdentity {
+                process_id,
+                process_generation: slot.generation,
+                mm_generation: object.mm_generation,
+            })
+    })
+}
+
+/// Resolve one scheduler-held process handle to a live identity without
+/// accepting a recycled slot generation.
+pub fn live_process_identity(handle: ProcessHandle) -> Option<ProcessIdentity> {
+    let table = PROCESS_TABLE.lock();
+    let slot = table
+        .slots
+        .get(handle.index())
+        .filter(|slot| slot.generation == handle.generation())?;
+    let object = slot.object.as_deref()?;
+    (!object.exiting && !object.exec_in_progress && !object.exec_state_staged).then_some(
+        ProcessIdentity {
+            process_id: object.process_id,
+            process_generation: handle.generation(),
+            mm_generation: object.mm_generation,
+        },
+    )
 }
 
 pub fn release_process_ref(handle: ProcessHandle) {

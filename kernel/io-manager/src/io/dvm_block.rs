@@ -35,7 +35,10 @@ use crate::sync::KernelWaitLock;
 
 #[path = "block_interrupt_install.rs"]
 mod interrupt_install;
+#[path = "dvm_block/revoke.rs"]
+mod revoke;
 use interrupt_install::{BlockInterruptInstall, program_msix_entry};
+use revoke::DvmBlockRevokeReason;
 
 const IVSHMEM_VENDOR_ID: u16 = 0x1af4;
 const IVSHMEM_DEVICE_ID: u16 = 0x1110;
@@ -167,7 +170,7 @@ impl DvmBlockState {
         }
         let flags = load_u32(self.base, FLAGS_OFFSET, Ordering::Acquire);
         let expected_fixed_flags = self.geometry.flags & !DVM_BLOCK_FLAG_DVM_READY;
-        let fixed_header_matches = load_u64(self.base, 0, Ordering::Acquire)
+        let immutable_header_matches = load_u64(self.base, 0, Ordering::Acquire)
             == u64::from_le_bytes(DVM_BLOCK_MAGIC)
             && load_u32(self.base, 8, Ordering::Acquire) == DVM_BLOCK_VERSION
             && load_u32(self.base, 12, Ordering::Acquire) == DVM_BLOCK_HEADER_BYTES
@@ -186,19 +189,30 @@ impl DvmBlockState {
                 == self.geometry.logical_block_size
             && load_u32(self.base, PHYSICAL_BLOCK_SIZE_OFFSET, Ordering::Acquire)
                 == self.geometry.physical_block_size
-            && load_u32(self.base, RESERVED_OFFSET, Ordering::Acquire) == 0
-            && epoch_signature_matches(self.base, &self.geometry.epoch_signature);
-        if !fixed_header_matches
-            || flags & !DVM_BLOCK_KNOWN_FLAGS != 0
-            || flags & DVM_BLOCK_FLAG_RUSTOS_READY == 0
-            || flags & !DVM_BLOCK_FLAG_DVM_READY != expected_fixed_flags
-        {
-            self.revoke();
+            && load_u32(self.base, RESERVED_OFFSET, Ordering::Acquire) == 0;
+        if !immutable_header_matches {
+            self.revoke(DvmBlockRevokeReason::HeaderImmutableMismatch);
+            return Err(DvmBlockError::Revoked);
+        }
+        if !epoch_signature_matches(self.base, &self.geometry.epoch_signature) {
+            self.revoke(DvmBlockRevokeReason::EpochSignatureMismatch);
+            return Err(DvmBlockError::Revoked);
+        }
+        if flags & !DVM_BLOCK_KNOWN_FLAGS != 0 {
+            self.revoke(DvmBlockRevokeReason::UnknownFlags);
+            return Err(DvmBlockError::Revoked);
+        }
+        if flags & DVM_BLOCK_FLAG_RUSTOS_READY == 0 {
+            self.revoke(DvmBlockRevokeReason::RustosReadyLost);
+            return Err(DvmBlockError::Revoked);
+        }
+        if flags & !DVM_BLOCK_FLAG_DVM_READY != expected_fixed_flags {
+            self.revoke(DvmBlockRevokeReason::StaticFlagsChanged);
             return Err(DvmBlockError::Revoked);
         }
         if flags & DVM_BLOCK_FLAG_DVM_READY == 0 {
             if self.ready_observed {
-                self.revoke();
+                self.revoke(DvmBlockRevokeReason::DvmReadyWithdrawn);
                 return Err(DvmBlockError::Revoked);
             }
             return Err(DvmBlockError::Busy);
@@ -342,7 +356,7 @@ impl DvmBlockState {
         if producer < self.completion_consumer
             || producer.saturating_sub(self.completion_consumer) > u64::from(DVM_BLOCK_QUEUE_DEPTH)
         {
-            self.revoke();
+            self.revoke(DvmBlockRevokeReason::CursorInvalid);
             return Err(DvmBlockError::Protocol);
         }
         if producer > self.completion_consumer
@@ -362,21 +376,23 @@ impl DvmBlockState {
                 completion_record(self, self.completion_consumer).ok_or(DvmBlockError::Protocol)?;
             let record = read_record(source);
             let Some(completion) = DvmBlockCompletion::decode(&record) else {
-                self.revoke();
+                self.revoke(DvmBlockRevokeReason::Decode);
                 return Err(DvmBlockError::Protocol);
             };
             let Some(pending) = self.pending.get_mut(completion.data_slot as usize) else {
-                self.revoke();
+                self.revoke(DvmBlockRevokeReason::SlotInvalid);
                 return Err(DvmBlockError::Protocol);
             };
             let Some(pending) = pending.as_mut() else {
-                self.revoke();
+                self.revoke(DvmBlockRevokeReason::NoPending);
                 return Err(DvmBlockError::Protocol);
             };
-            if pending.completion.is_some()
-                || !completion.is_valid_for(self.geometry, pending.request)
-            {
-                self.revoke();
+            if pending.completion.is_some() {
+                self.revoke(DvmBlockRevokeReason::Duplicate);
+                return Err(DvmBlockError::Protocol);
+            }
+            if !completion.is_valid_for(self.geometry, pending.request) {
+                self.revoke(DvmBlockRevokeReason::Mismatch);
                 return Err(DvmBlockError::Protocol);
             }
             let completion = if pending.inject_device_fault {
@@ -508,22 +524,6 @@ impl DvmBlockState {
         }
         Ok(())
     }
-
-    fn revoke(&mut self) {
-        if self.revoked {
-            return;
-        }
-        self.revoked = true;
-        self.pending = [None; QUEUE_DEPTH];
-        fetch_and_u32(
-            self.base,
-            FLAGS_OFFSET,
-            !DVM_BLOCK_FLAG_RUSTOS_READY,
-            Ordering::AcqRel,
-        );
-        IRQ_PENDING.store(true, Ordering::Release);
-        wake_waiters();
-    }
 }
 
 fn fault_point_for_operation(operation: DvmBlockOperation) -> &'static str {
@@ -625,7 +625,11 @@ pub(crate) fn try_install() -> bool {
         INSTALLED.store(true, Ordering::Release);
         return true;
     }
-    let mut installed: Option<(DvmBlockState, crate::arch::pci::PciDevice)> = None;
+    let mut installed: Option<(
+        DvmBlockState,
+        crate::arch::pci::PciDevice,
+        crate::arch::pci::PciResource,
+    )> = None;
     let mut ambiguous = false;
     let mut candidate_count = 0_u32;
     let mut matching_shape_count = 0_u32;
@@ -644,12 +648,13 @@ pub(crate) fn try_install() -> bool {
             reject_stage = "register-bar-missing";
             return false;
         };
-        if resource.is_io || resource.size != DVM_BLOCK_APERTURE_BYTES {
+        if !fixed_block_shared_bar_shape(resource.is_io, resource.prefetchable, resource.size) {
             reject_stage = "shared-bar-shape";
             rejected_shared_bar = Some((
                 resource.start,
                 resource.size,
                 resource.is_io,
+                resource.prefetchable,
                 resource.is_64bit,
             ));
             return false;
@@ -667,7 +672,11 @@ pub(crate) fn try_install() -> bool {
             reject_stage = "shared-bar-host-width";
             return false;
         };
-        let mapped = crate::driver::mmio::map(resource.start, resource_len, true).cast::<u8>();
+        // BAR2 is QEMU RAM shared with the Linux relay, whose UIO mapping is
+        // explicitly WB. The cursor/ready fields are Rust/C atomics, so WC or
+        // UC aliases are not an admissible implementation of this protocol.
+        let mapped =
+            crate::driver::mmio::map_shared_write_back(resource.start, resource_len).cast::<u8>();
         if mapped.is_null() {
             reject_stage = "shared-bar-map";
             return false;
@@ -690,13 +699,14 @@ pub(crate) fn try_install() -> bool {
             crate::driver::mmio::unmap(mapped.cast());
             return false;
         };
-        let doorbell = crate::driver::mmio::map(registers.start, registers_len, false).cast::<u8>();
+        let doorbell =
+            crate::driver::mmio::map_uncached(registers.start, registers_len).cast::<u8>();
         if doorbell.is_null() {
             reject_stage = "register-bar-map";
             crate::driver::mmio::unmap(mapped.cast());
             return false;
         }
-        if let Some((previous, _)) = installed.take() {
+        if let Some((previous, _, _)) = installed.take() {
             release_state_mappings(&previous);
             crate::driver::mmio::unmap(mapped.cast());
             crate::driver::mmio::unmap(doorbell.cast());
@@ -709,23 +719,30 @@ pub(crate) fn try_install() -> bool {
             crate::driver::mmio::unmap(doorbell.cast());
             return false;
         }
-        installed = Some((DvmBlockState::new(mapped, doorbell, header), device));
+        installed = Some((
+            DvmBlockState::new(mapped, doorbell, header),
+            device,
+            resource,
+        ));
         false
     });
-    let Some((mut state, device)) = installed else {
+    let Some((mut state, device, shared_bar)) = installed else {
         let topology_absent =
             fixed_pci_topology_lacks_block_aperture(candidate_count, matching_shape_count);
         if topology_absent {
             TOPOLOGY_ABSENT.store(true, Ordering::Release);
         }
-        let diagnostic = if let Some((start, size, is_io, is_64bit)) = rejected_shared_bar {
+        let diagnostic = if let Some((start, size, is_io, prefetchable, is_64bit)) =
+            rejected_shared_bar
+        {
             alloc::format!(
-                "dvm-block: install rejected stage={} ivshmem_candidates={} shared_start={:#x} shared_size={:#x} shared_io={} shared_64={}",
+                "dvm-block: install rejected stage={} ivshmem_candidates={} shared_start={:#x} shared_size={:#x} shared_io={} shared_prefetchable={} shared_64={}",
                 reject_stage,
                 candidate_count,
                 start,
                 size,
                 is_io,
+                prefetchable,
                 is_64bit,
             )
         } else {
@@ -768,11 +785,15 @@ pub(crate) fn try_install() -> bool {
     state.signal_request();
     nucleus_core::debug::write_debugcon_only_line(
         alloc::format!(
-            "dvm-block: transport installed generation={} sectors={} logical={} physical={}",
+            "dvm-block: transport installed generation={} sectors={} logical={} physical={} shared_start={:#x} shared_size={:#x} shared_prefetchable={} shared_64={} cache=wb",
             state.geometry.generation,
             state.geometry.capacity_sectors,
             state.geometry.logical_block_size,
             state.geometry.physical_block_size,
+            shared_bar.start,
+            shared_bar.size,
+            shared_bar.prefetchable,
+            shared_bar.is_64bit,
         )
         .as_bytes(),
     );
@@ -793,6 +814,10 @@ const fn fixed_pci_topology_lacks_block_aperture(
     matching_shapes: u32,
 ) -> bool {
     ivshmem_candidates != 0 && matching_shapes == 0
+}
+
+const fn fixed_block_shared_bar_shape(is_io: bool, prefetchable: bool, size: u64) -> bool {
+    !is_io && prefetchable && size == DVM_BLOCK_APERTURE_BYTES
 }
 
 fn try_rebind_signed_epoch(state: &mut DvmBlockState) -> bool {
@@ -1104,7 +1129,7 @@ fn arm_block_ring_interrupt(device: crate::arch::pci::PciDevice) -> Option<Block
     let Some(message) = vector_lease.message() else {
         return None;
     };
-    let table = crate::driver::mmio::map(table_resource.start, table_len, false).cast::<u8>();
+    let table = crate::driver::mmio::map_uncached(table_resource.start, table_len).cast::<u8>();
     if table.is_null() {
         return None;
     }
@@ -1179,404 +1204,6 @@ fn store_u64(base: *mut u8, offset: usize, value: u64, ordering: Ordering) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use alloc::vec;
-    use driver_domain_protocol::{
-        DVM_BLOCK_FEATURE_FLUSH, DVM_BLOCK_FEATURE_FUA, DVM_BLOCK_FLAG_DVM_READY,
-    };
-    use ed25519_dalek::{Signer, SigningKey};
-
-    #[test]
-    fn fixed_nonblock_ivshmem_topology_is_negative_cached_only_after_enumeration() {
-        assert!(!fixed_pci_topology_lacks_block_aperture(0, 0));
-        assert!(fixed_pci_topology_lacks_block_aperture(2, 0));
-        assert!(!fixed_pci_topology_lacks_block_aperture(2, 1));
-    }
-
-    fn aperture_bytes(aperture: &mut [u64]) -> &mut [u8] {
-        // SAFETY: The u64 backing guarantees the production ABI's alignment;
-        // the byte slice spans the exact same initialized allocation.
-        unsafe {
-            core::slice::from_raw_parts_mut(
-                aperture.as_mut_ptr().cast::<u8>(),
-                core::mem::size_of_val(aperture),
-            )
-        }
-    }
-
-    fn test_state() -> (alloc::vec::Vec<u64>, alloc::vec::Vec<u32>, DvmBlockState) {
-        let mut aperture = vec![0_u64; DVM_BLOCK_APERTURE_BYTES as usize / 8];
-        let mut registers =
-            vec![0_u32; (IVSHMEM_DOORBELL_OFFSET + core::mem::size_of::<u32>()) / 4];
-        let mut header = DvmBlockHeader::new(
-            7,
-            1024 * 1024,
-            4096,
-            4096,
-            DVM_BLOCK_FEATURE_FLUSH | DVM_BLOCK_FEATURE_FUA,
-        )
-        .with_epoch_signature([0x5a; 64]);
-        header.flags |= DVM_BLOCK_FLAG_RUSTOS_READY | DVM_BLOCK_FLAG_DVM_READY;
-        aperture_bytes(&mut aperture)[..DVM_BLOCK_HEADER_RECORD_BYTES]
-            .copy_from_slice(&header.encode());
-        let state = DvmBlockState::new(
-            aperture.as_mut_ptr().cast::<u8>(),
-            registers.as_mut_ptr().cast::<u8>(),
-            header,
-        );
-        (aperture, registers, state)
-    }
-
-    #[test]
-    fn revoked_transport_accepts_only_a_signed_newer_epoch() {
-        let (mut aperture, _registers, mut state) = test_state();
-        let key = SigningKey::from_bytes(&[0x42; 32]);
-        state.revoke();
-
-        let unsigned = DvmBlockHeader::new(
-            8,
-            1024 * 1024,
-            4096,
-            4096,
-            DVM_BLOCK_FEATURE_FLUSH | DVM_BLOCK_FEATURE_FUA,
-        );
-        let forged = unsigned.with_epoch_signature([0x33; 64]);
-        aperture_bytes(&mut aperture)[..DVM_BLOCK_HEADER_RECORD_BYTES]
-            .copy_from_slice(&forged.encode());
-        assert!(!try_rebind_signed_epoch_with_key(
-            &mut state,
-            key.verifying_key().to_bytes()
-        ));
-        assert!(state.revoked);
-
-        let signed =
-            unsigned.with_epoch_signature(key.sign(&unsigned.epoch_signing_bytes()).to_bytes());
-        aperture_bytes(&mut aperture)[..DVM_BLOCK_HEADER_RECORD_BYTES]
-            .copy_from_slice(&signed.encode());
-        assert!(try_rebind_signed_epoch_with_key(
-            &mut state,
-            key.verifying_key().to_bytes()
-        ));
-        assert_eq!(state.geometry.generation, 8);
-        assert!(!state.revoked);
-        assert_ne!(
-            load_u32(state.base, FLAGS_OFFSET, Ordering::Acquire) & DVM_BLOCK_FLAG_RUSTOS_READY,
-            0
-        );
-    }
-
-    #[test]
-    fn readiness_publication_is_conditional_and_non_mutating_on_mismatch() {
-        let (_aperture, _registers, state) = test_state();
-        let original = load_u32(state.base, FLAGS_OFFSET, Ordering::Acquire);
-        assert!(!publish_rustos_ready(state.base, 0));
-        assert_eq!(
-            load_u32(state.base, FLAGS_OFFSET, Ordering::Acquire),
-            original
-        );
-
-        fetch_and_u32(
-            state.base,
-            FLAGS_OFFSET,
-            !DVM_BLOCK_FLAG_RUSTOS_READY,
-            Ordering::AcqRel,
-        );
-        assert!(publish_rustos_ready(state.base, DVM_BLOCK_FLAG_DVM_READY));
-        assert_eq!(
-            load_u32(state.base, FLAGS_OFFSET, Ordering::Acquire),
-            DVM_BLOCK_FLAG_DVM_READY | DVM_BLOCK_FLAG_RUSTOS_READY
-        );
-    }
-
-    #[test]
-    fn request_and_completion_bind_exact_slot_epoch_and_durability() {
-        let (mut aperture, registers, mut state) = test_state();
-        let data = vec![0x5a_u8; 4096];
-        let ticket = state
-            .submit(DvmBlockOperation::Write, 8, &data, 4096, true)
-            .unwrap();
-        let request_offset = DVM_BLOCK_REQUEST_RING_OFFSET as usize;
-        let request: [u8; DVM_BLOCK_RECORD_BYTES] = aperture_bytes(&mut aperture)
-            [request_offset..request_offset + DVM_BLOCK_RECORD_BYTES]
-            .try_into()
-            .unwrap();
-        let request = DvmBlockRequest::decode(&request).unwrap();
-        assert_eq!(request.request_id, ticket.request_id);
-        assert_eq!(
-            registers[IVSHMEM_DOORBELL_OFFSET / 4],
-            ivshmem_doorbell_value(BLOCK_DVM_PEER_ID, BLOCK_DVM_REQUEST_VECTOR_INDEX)
-        );
-        assert_eq!(
-            &aperture_bytes(&mut aperture)
-                [DVM_BLOCK_DATA_OFFSET as usize..DVM_BLOCK_DATA_OFFSET as usize + data.len()],
-            data.as_slice()
-        );
-
-        let completion = DvmBlockCompletion {
-            generation: request.generation,
-            request_id: request.request_id,
-            operation_id: request.operation_id,
-            status: DvmBlockCompletionStatus::Success,
-            data_slot: request.data_slot,
-            completed_bytes: request.data_len,
-            durable_through_operation_id: request.operation_id,
-        };
-        let completion_offset = DVM_BLOCK_COMPLETION_RING_OFFSET as usize;
-        aperture_bytes(&mut aperture)
-            [completion_offset..completion_offset + DVM_BLOCK_RECORD_BYTES]
-            .copy_from_slice(&completion.encode());
-        let base = aperture.as_mut_ptr().cast::<u8>();
-        store_u64(base, REQUEST_CONSUMER_OFFSET, 1, Ordering::Release);
-        store_u64(base, COMPLETION_PRODUCER_OFFSET, 1, Ordering::Release);
-        assert_eq!(
-            state.poll(ticket, &mut []).unwrap(),
-            DvmBlockPoll::Completed(0)
-        );
-    }
-
-    #[test]
-    fn stale_completion_revokes_the_transport() {
-        let (mut aperture, _registers, mut state) = test_state();
-        let ticket = state
-            .submit(DvmBlockOperation::Read, 8, &[], 4096, false)
-            .unwrap();
-        let completion = DvmBlockCompletion {
-            generation: ticket.generation - 1,
-            request_id: ticket.request_id,
-            operation_id: 0,
-            status: DvmBlockCompletionStatus::Success,
-            data_slot: ticket.data_slot,
-            completed_bytes: 4096,
-            durable_through_operation_id: 0,
-        };
-        let completion_offset = DVM_BLOCK_COMPLETION_RING_OFFSET as usize;
-        aperture_bytes(&mut aperture)
-            [completion_offset..completion_offset + DVM_BLOCK_RECORD_BYTES]
-            .copy_from_slice(&completion.encode());
-        let base = aperture.as_mut_ptr().cast::<u8>();
-        store_u64(base, REQUEST_CONSUMER_OFFSET, 1, Ordering::Release);
-        store_u64(base, COMPLETION_PRODUCER_OFFSET, 1, Ordering::Release);
-        assert_eq!(
-            state.poll(ticket, &mut [0_u8; 4096]),
-            Err(DvmBlockError::Protocol)
-        );
-        assert!(state.revoked);
-    }
-
-    #[test]
-    fn fault_points_cover_reads_mutations_and_durability() {
-        assert_eq!(
-            fault_point_for_operation(DvmBlockOperation::Read),
-            "block.read"
-        );
-        assert_eq!(
-            fault_point_for_operation(DvmBlockOperation::Write),
-            "block.write"
-        );
-        assert_eq!(
-            fault_point_for_operation(DvmBlockOperation::Discard),
-            "block.write"
-        );
-        assert_eq!(
-            fault_point_for_operation(DvmBlockOperation::WriteZeroes),
-            "block.write"
-        );
-        assert_eq!(
-            fault_point_for_operation(DvmBlockOperation::Flush),
-            "block.flush"
-        );
-
-        for (operation, data, data_len) in [
-            (DvmBlockOperation::Read, &[][..], 4096),
-            (DvmBlockOperation::Write, &[0x5a_u8; 4096][..], 4096),
-        ] {
-            let (mut aperture, registers, mut state) = test_state();
-            let request_id = state.next_request_id;
-            let operation_id = state.next_operation_id;
-            assert_eq!(
-                state.submit_with_fault_decision(operation, 8, data, data_len, false, |_| true),
-                Err(DvmBlockError::DeviceFault)
-            );
-            assert_eq!(state.next_request_id, request_id);
-            assert_eq!(state.next_operation_id, operation_id);
-            assert_eq!(state.request_producer, 0);
-            assert!(state.pending.iter().all(Option::is_none));
-            assert_eq!(
-                load_u64(state.base, REQUEST_PRODUCER_OFFSET, Ordering::Acquire),
-                0
-            );
-            assert_eq!(registers[IVSHMEM_DOORBELL_OFFSET / 4], 0);
-            assert!(
-                aperture_bytes(&mut aperture)
-                    [DVM_BLOCK_DATA_OFFSET as usize..DVM_BLOCK_DATA_OFFSET as usize + 4096]
-                    .iter()
-                    .all(|byte| *byte == 0)
-            );
-        }
-
-        let (mut aperture, registers, mut state) = test_state();
-        let ticket = state
-            .submit_with_fault_decision(DvmBlockOperation::Flush, 0, &[], 0, false, |_| true)
-            .expect("fault injection must preserve a real DVM request/completion round trip");
-        assert_eq!(state.request_producer, 1);
-        assert_eq!(
-            load_u64(state.base, REQUEST_PRODUCER_OFFSET, Ordering::Acquire),
-            1
-        );
-        assert_ne!(registers[IVSHMEM_DOORBELL_OFFSET / 4], 0);
-
-        let request_offset = DVM_BLOCK_REQUEST_RING_OFFSET as usize;
-        let request = DvmBlockRequest::decode(
-            &aperture_bytes(&mut aperture)[request_offset..request_offset + DVM_BLOCK_RECORD_BYTES]
-                .try_into()
-                .unwrap(),
-        )
-        .unwrap();
-        let completion = DvmBlockCompletion {
-            generation: request.generation,
-            request_id: request.request_id,
-            operation_id: request.operation_id,
-            status: DvmBlockCompletionStatus::Success,
-            data_slot: request.data_slot,
-            completed_bytes: 0,
-            durable_through_operation_id: request.operation_id,
-        };
-        let completion_offset = DVM_BLOCK_COMPLETION_RING_OFFSET as usize;
-        aperture_bytes(&mut aperture)
-            [completion_offset..completion_offset + DVM_BLOCK_RECORD_BYTES]
-            .copy_from_slice(&completion.encode());
-        store_u64(state.base, REQUEST_CONSUMER_OFFSET, 1, Ordering::Release);
-        store_u64(state.base, COMPLETION_PRODUCER_OFFSET, 1, Ordering::Release);
-        assert_eq!(state.poll(ticket, &mut []), Err(DvmBlockError::DeviceFault));
-        state.finish(ticket).unwrap();
-        assert!(state.pending.iter().all(Option::is_none));
-    }
-
-    #[test]
-    fn cancellation_keeps_the_slot_owned_until_the_exact_completion() {
-        let (mut aperture, _registers, mut state) = test_state();
-        let ticket = state
-            .submit(DvmBlockOperation::Read, 8, &[], 4096, false)
-            .unwrap();
-        state.cancel(ticket).unwrap();
-        assert!(state.pending[ticket.data_slot as usize].is_some());
-        assert_eq!(
-            state.poll(ticket, &mut [0_u8; 4096]),
-            Err(DvmBlockError::Cancelled)
-        );
-
-        let completion = DvmBlockCompletion {
-            generation: ticket.generation,
-            request_id: ticket.request_id,
-            operation_id: 0,
-            status: DvmBlockCompletionStatus::Success,
-            data_slot: ticket.data_slot,
-            completed_bytes: 4096,
-            durable_through_operation_id: 0,
-        };
-        let completion_offset = DVM_BLOCK_COMPLETION_RING_OFFSET as usize;
-        aperture_bytes(&mut aperture)
-            [completion_offset..completion_offset + DVM_BLOCK_RECORD_BYTES]
-            .copy_from_slice(&completion.encode());
-        let base = aperture.as_mut_ptr().cast::<u8>();
-        store_u64(base, REQUEST_CONSUMER_OFFSET, 1, Ordering::Release);
-        store_u64(base, COMPLETION_PRODUCER_OFFSET, 1, Ordering::Release);
-        assert_eq!(
-            state.poll(ticket, &mut [0_u8; 4096]),
-            Err(DvmBlockError::Revoked)
-        );
-        assert!(state.pending[ticket.data_slot as usize].is_none());
-        assert!(!state.revoked);
-    }
-
-    #[test]
-    fn invalid_submission_does_not_consume_request_or_operation_identity() {
-        let (_aperture, registers, mut state) = test_state();
-        let request_id = state.next_request_id;
-        let operation_id = state.next_operation_id;
-        assert_eq!(
-            state.submit_with_fault_decision(
-                DvmBlockOperation::Write,
-                u64::MAX,
-                &[0_u8; 4096],
-                4096,
-                false,
-                |_| false,
-            ),
-            Err(DvmBlockError::Invalid)
-        );
-        assert_eq!(state.next_request_id, request_id);
-        assert_eq!(state.next_operation_id, operation_id);
-        assert_eq!(state.request_producer, 0);
-        assert!(state.pending.iter().all(Option::is_none));
-        assert_eq!(registers[IVSHMEM_DOORBELL_OFFSET / 4], 0);
-    }
-
-    #[test]
-    fn retired_task_disarm_releases_block_waiter_exactly_once() {
-        let task_id = u64::MAX - 701;
-        assert!(arm_waiter(task_id));
-        assert!(disarm_waiter(task_id));
-        assert!(!disarm_waiter(task_id));
-    }
-
-    #[test]
-    #[allow(
-        clippy::assertions_on_constants,
-        reason = "the mutation witness must compile a reduced capacity and fail at runtime"
-    )]
-    fn block_waiter_capacity_covers_every_scheduler_task() {
-        assert!(WAITERS_CAPACITY >= crate::multitask::MAX_SCHEDULER_TASKS);
-    }
-
-    #[test]
-    fn readiness_may_arrive_once_but_cannot_be_withdrawn() {
-        let (mut aperture, _registers, mut state) = test_state();
-        let base = aperture.as_mut_ptr().cast::<u8>();
-        let flags = load_u32(base, FLAGS_OFFSET, Ordering::Acquire);
-        unsafe {
-            AtomicU32::from_ptr(base.add(FLAGS_OFFSET).cast::<u32>())
-                .store(flags & !DVM_BLOCK_FLAG_DVM_READY, Ordering::Release);
-        }
-        state.ready_observed = false;
-        assert_eq!(state.current_header(), Err(DvmBlockError::Busy));
-        assert!(!state.revoked);
-
-        unsafe {
-            AtomicU32::from_ptr(base.add(FLAGS_OFFSET).cast::<u32>())
-                .store(flags, Ordering::Release);
-        }
-        assert!(state.current_header().is_ok());
-        unsafe {
-            AtomicU32::from_ptr(base.add(FLAGS_OFFSET).cast::<u32>())
-                .store(flags & !DVM_BLOCK_FLAG_DVM_READY, Ordering::Release);
-        }
-        assert_eq!(state.current_header(), Err(DvmBlockError::Revoked));
-        assert!(state.revoked);
-    }
-
-    #[test]
-    fn startup_not_ready_is_sleepable_not_a_fault_event() {
-        let (mut aperture, _registers, mut state) = test_state();
-        let base = aperture.as_mut_ptr().cast::<u8>();
-        let flags = load_u32(base, FLAGS_OFFSET, Ordering::Acquire);
-        unsafe {
-            AtomicU32::from_ptr(base.add(FLAGS_OFFSET).cast::<u32>())
-                .store(flags & !DVM_BLOCK_FLAG_DVM_READY, Ordering::Release);
-        }
-        state.ready_observed = false;
-
-        assert!(!state.completion_or_fault_pending());
-        assert!(!state.revoked);
-
-        unsafe {
-            AtomicU32::from_ptr(base.add(FLAGS_OFFSET).cast::<u32>())
-                .store(flags, Ordering::Release);
-        }
-        assert!(state.completion_or_fault_pending());
-        assert!(!state.completion_or_fault_pending());
-        assert!(state.ready_observed);
-    }
-}
+#[path = "dvm_block/tests.rs"]
+mod tests;
 // RING3-MIGRATION-REFERENCE END: storage-DVM block transport substrate.

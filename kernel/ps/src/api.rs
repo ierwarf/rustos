@@ -14,6 +14,7 @@
 //! - **Evidence:** `scheduler-lifecycle`,
 //!   `process-address-space-lifecycle`, `syscall-simd-lifecycle`, and
 //!   `user-memory-access`.
+pub use crate::multitask::ProcessIdentity;
 pub use crate::multitask::SyscallUserSimdSnapshot;
 pub use crate::multitask::{
     AffinityCommit, AffinityError, CurrentKernelStackScope, CurrentUserSnapshot,
@@ -27,13 +28,15 @@ pub use crate::multitask::{
     activate_suspended_user_tasks_with_commit, arm_block_current_task,
     attach_reserved_ipc_priority, bind_ipc_priority_to_process_worker, bind_reserved_ipc_priority,
     cancel_block_current_task, cancel_ipc_priority_reservation,
-    commit_block_current_task_and_yield, complete_retired_task_cleanup, current_linux_thread_state,
+    commit_block_current_task_and_yield, complete_ipc_reply_wake_handoff,
+    complete_retired_task_cleanup, current_linux_thread_state,
     current_thread_may_have_pending_signals, current_user_address_space,
-    current_user_process_thread_count, current_user_stack_state, current_user_thread_id,
-    current_user_wait_binding, demote_current_user_task_to_user_class,
+    current_user_process_identity, current_user_process_thread_count, current_user_stack_state,
+    current_user_thread_id, current_user_wait_binding, demote_current_user_task_to_user_class,
     drain_scheduler_runtime_profile, exec_current_user_process, exec_user_process_by_pid,
     exit_current_user_process, exit_current_user_task, inherit_ipc_priority,
     is_user_process_exiting, is_user_task_alive, linux_task_affinity, linux_thread_snapshot_by_ids,
+    live_user_process_identity_by_pid, live_user_process_identity_with_exact_exec_path,
     mark_user_process_exiting, mark_user_process_exiting_once, next_retired_task_cleanup,
     note_process_exit_status, queue_linux_process_sigchld, queue_linux_signal,
     release_ipc_priorities_for_process, release_ipc_priority, reserve_ipc_priority,
@@ -58,7 +61,8 @@ pub use crate::user::handles::{
     bind_ipc_transfer_receiver_by_tickets, bind_ipc_transfer_tickets,
     claim_ipc_transfer_entries_by_tickets, commit_ipc_transfer_enqueue,
     drop_ipc_transfer_descriptors, drop_ipc_transfer_tickets, drop_ipc_transfers_for_service_epoch,
-    register_ipc_transfer_entries, take_deferred_ipc_transfer_drops, take_ipc_transfer_entries,
+    reclaim_unbound_inet_socket_transfer, register_ipc_transfer_entries,
+    register_new_inet_socket_transfer, take_deferred_ipc_transfer_drops, take_ipc_transfer_entries,
 };
 
 pub fn service_deferred_shared_region_reclaims(max_pages: usize) -> usize {

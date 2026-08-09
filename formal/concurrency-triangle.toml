@@ -90,6 +90,76 @@ herd_mutant = "formal/litmus/x86_64/reschedule_request_publication.mutant.litmus
 herd_cat = "x86tso-mixed.cat"
 
 [[scenario]]
+id = "scheduler-transition-publication"
+severity = "critical"
+flow = "scheduler-cpu-ownership"
+model = "scheduler-cpu-ownership/SchedulerCpuOwnership"
+source = "kernel/ps/src/multitask/cpu_local.rs"
+source_symbol = "drop"
+source_anchors = [
+  "TRANSITION_FROM_SLOTS[self.logical_index].store(self.original_task, Ordering::Release)",
+  "TRANSITION_ACTIVE[self.logical_index].store(true, Ordering::Release)",
+  "CURRENT_TASK_SLOTS[self.logical_index].store(selected_task, Ordering::Release)",
+  "TRANSITION_ACTIVE[logical_index].store(false, Ordering::Release)",
+]
+invariant = "an observed incoming current or active pre-commit phase retains the exact outgoing stack slot; active may clear only at assembly commit"
+loom_test = "scheduler_transition_publication_never_loses_outgoing_stack_owner"
+shuttle_test = "scheduler_switch_never_exposes_incoming_without_outgoing_owner"
+herd_test = "formal/litmus/x86_64/scheduler_transition_publication.litmus"
+herd_mutant = "formal/litmus/x86_64/scheduler_transition_publication.mutant.litmus"
+herd_cat = "x86tso-mixed.cat"
+
+[[scenario]]
+id = "scheduler-transition-wake-owner"
+severity = "critical"
+flow = "scheduler-cpu-ownership"
+model = "scheduler-cpu-ownership/SchedulerCpuOwnership"
+source = "kernel/ps/src/multitask/scheduler.rs"
+source_symbol = "wake_task_slot"
+source_anchors = [
+  "TaskExecutionOwner::Transition(transition_cpu)",
+  "match self.publish_runqueue_wake_to(slot, transition_cpu)",
+  "context.ready = true;",
+]
+invariant = "a blocked transition wake publishes one durable target mailbox owner before legacy ready changes, cannot dispatch before assembly commit, and is claimed at most once after commit"
+loom_test = "scheduler_transition_wake_has_one_queued_owner_until_commit"
+shuttle_test = "scheduler_transition_wake_has_one_mailbox_owner_until_commit"
+herd_not_applicable = "the decisive property composes assembly transition state, an owner-word CAS, and a lock-protected mailbox drain; the atomic transition publication already has a separate x86_64 litmus, while an ISA-only wake litmus would omit queue identity and one-shot dispatch"
+
+[[scenario]]
+id = "smp-qualification-deferred-bind"
+severity = "critical"
+flow = "deferred-process-activation"
+model = "deferred-process-activation/DeferredProcessActivation"
+source = "kernel/compat/src/user/syscall/linux/proc_broker_ops.rs"
+source_symbol = "syscall_linux_rustos_proc_activate_broker"
+source_anchors = [
+  "let activations = DEFERRED_ACTIVATIONS.lock();",
+  "prepare_smp_qualification_activation(",
+  "multitask::activate_suspended_user_tasks_with_commit(",
+]
+invariant = "the kernel-derived qualification-required deferred authority reaches runnable state only through BoundSuspended then Active under the shared ProcBroker transaction; a late bind and batch activation both fail closed, while ordinary activation has no SESSIOND dependency"
+loom_test = "smp_qualification_required_deferred_bind_serializes_activation"
+shuttle_test = "smp_qualification_required_deferred_bind_serializes_activation"
+herd_not_applicable = "the decisive edge is a lock-protected one-shot authority transaction spanning bind callbacks and scheduler publication; an ISA-only litmus cannot represent required-child or batch eligibility policy"
+
+[[scenario]]
+id = "smp-qualification-phase-revalidation"
+severity = "critical"
+flow = "smp-ring3-qualification"
+model = "smp-ring3-qualification/SmpRing3Qualification"
+source = "kernel/compat/src/user/syscall/linux/debug_ops.rs"
+source_symbol = "syscall_linux_rustos_product_milestone"
+source_anchors = [
+  "match admit_smp_qualification_milestone(milestone, arg0, arg1, current_cpu)",
+  "debug::record_milestone(debug::LogCategory::Compat, name, arg0, recorded_arg1);",
+]
+invariant = "after phase admission, evidence may publish only if the post-admission compound SESSIOND owner identity and endpoint epoch still match; revoke or re-register terminalizes the binding and emits no evidence"
+loom_test = "smp_qualification_phase_revalidation_terminalizes_on_sessiond_epoch_change"
+shuttle_test = "smp_qualification_phase_revalidation_terminalizes_on_sessiond_epoch_change"
+herd_not_applicable = "the decisive edge spans endpoint owner identity, endpoint epoch, a lock-protected qualification FSM, and debug emission; reducing it to raw loads would omit terminalization and output suppression"
+
+[[scenario]]
 id = "tlb-ack-reclaim"
 severity = "critical"
 flow = "tlb-shootdown-lifecycle"

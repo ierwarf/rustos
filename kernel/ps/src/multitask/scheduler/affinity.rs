@@ -297,6 +297,8 @@ impl Scheduler {
 
 #[cfg(test)]
 mod tests {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
     use super::super::tests::{boxed_scheduler, test_process, test_user_context};
     use super::*;
 
@@ -385,6 +387,93 @@ mod tests {
         // request for an offline CPU must be rejected even when the
         // container would otherwise have admitted it.
         assert!(Scheduler::validate_requested_mask(0b1_0000, 0b1111, 0b1_1111).is_err());
+    }
+
+    #[test]
+    fn foreign_task_affinity_is_permission_denied() {
+        // Both task identities are attached to the global process table, so
+        // retain its test isolation through the complete rejected request.
+        let _process_table = process_table::tests::isolate_process_table();
+        let mut scheduler = boxed_scheduler();
+        let caller_process = test_process(0xaff1_0101);
+        let foreign_process = test_process(0xaff1_0102);
+        let caller = FIRST_DYNAMIC_TASK_SLOT;
+        let foreign = caller + 1;
+        install_task(
+            &mut scheduler,
+            caller,
+            0xaff1_1101,
+            caller_process,
+            UserAbi::Linux,
+            0b0011,
+            0b0111,
+        );
+        install_task(
+            &mut scheduler,
+            foreign,
+            0xaff1_1102,
+            foreign_process,
+            UserAbi::Linux,
+            0b0101,
+            0b0111,
+        );
+        scheduler.current_task = caller;
+        scheduler.affinity_migration_pending[caller] = true;
+        scheduler.affinity_migration_pending[foreign] = false;
+
+        let before = (
+            scheduler.task_affinity_masks[caller],
+            scheduler.process_affinity_masks[caller],
+            scheduler.affinity_migration_pending[caller],
+            scheduler.task_affinity_masks[foreign],
+            scheduler.process_affinity_masks[foreign],
+            scheduler.affinity_migration_pending[foreign],
+        );
+        assert_eq!(
+            scheduler.set_linux_task_affinity(0xaff1_1102, 0b0010, 0b0111),
+            Err(AffinityError::PermissionDenied)
+        );
+        assert_eq!(
+            (
+                scheduler.task_affinity_masks[caller],
+                scheduler.process_affinity_masks[caller],
+                scheduler.affinity_migration_pending[caller],
+                scheduler.task_affinity_masks[foreign],
+                scheduler.process_affinity_masks[foreign],
+                scheduler.affinity_migration_pending[foreign],
+            ),
+            before,
+            "foreign affinity rejection must not commit masks or migration state"
+        );
+    }
+
+    #[test]
+    fn dispatch_panics_when_current_mask_excludes_cpu() {
+        let _process_table = process_table::tests::isolate_process_table();
+        let mut scheduler = boxed_scheduler();
+        let process = test_process(0xaff1_0103);
+        let slot = FIRST_DYNAMIC_TASK_SLOT;
+        let current_cpu = nucleus_core::util::lockdep::current_cpu_index();
+        let permitted_elsewhere = if current_cpu == 0 { 1 } else { 0 };
+        let excluded_current_mask = 1_u64 << permitted_elsewhere;
+        install_task(
+            &mut scheduler,
+            slot,
+            0xaff1_1103,
+            process,
+            UserAbi::Linux,
+            excluded_current_mask,
+            excluded_current_mask,
+        );
+        scheduler.current_task = slot;
+
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                scheduler.assert_current_task_affinity_allows_dispatch();
+            }))
+            .is_err(),
+            "dispatch outside the committed affinity mask must fail-stop"
+        );
     }
 
     #[test]

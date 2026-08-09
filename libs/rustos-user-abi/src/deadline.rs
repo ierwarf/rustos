@@ -23,6 +23,20 @@
 //! caller's, and only the arithmetic is shared. What must not differ between
 //! them is the arithmetic, which is exactly what was diverging.
 
+/// Returns whether a reply observed across a destructive queue take may be
+/// published to its caller.
+///
+/// Expiry is sampled immediately before and after the take. Publication is
+/// admitted only when both samples remain unexpired, so a reply that becomes
+/// visible during an expired take cannot revive the caller's authority.
+#[must_use]
+pub const fn reply_observation_allows_publication(
+    expired_before_take: bool,
+    expired_after_take: bool,
+) -> bool {
+    !expired_before_take && !expired_after_take
+}
+
 /// The transaction budget is exhausted. Callers fail closed; they do not retry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DeadlineExpired;
@@ -193,5 +207,50 @@ mod tests {
         assert_eq!(deadline.elapsed_ns(50), 0);
         assert_eq!(deadline.elapsed_ns(300), 200);
         assert_eq!(deadline.elapsed_ns(5_000), 400);
+    }
+
+    #[test]
+    fn reply_publication_requires_two_unexpired_observations() {
+        assert!(reply_observation_allows_publication(false, false));
+        assert!(!reply_observation_allows_publication(true, false));
+        assert!(!reply_observation_allows_publication(false, true));
+        assert!(!reply_observation_allows_publication(true, true));
+    }
+}
+
+#[cfg(kani)]
+mod reply_observation_verification {
+    use super::*;
+
+    #[kani::proof]
+    fn accepted_reply_observation_has_two_unexpired_samples() {
+        let expired_before_take: bool = kani::any();
+        let expired_after_take: bool = kani::any();
+        let accepted =
+            reply_observation_allows_publication(expired_before_take, expired_after_take);
+
+        kani::cover!(accepted);
+        if accepted {
+            assert!(!expired_before_take);
+            assert!(!expired_after_take);
+        }
+    }
+
+    #[kani::proof]
+    fn pre_expired_reply_observation_never_publishes() {
+        let expired_after_take: bool = kani::any();
+        let accepted = reply_observation_allows_publication(true, expired_after_take);
+
+        kani::cover!(!expired_after_take);
+        kani::cover!(expired_after_take);
+        assert!(!accepted);
+    }
+
+    #[kani::proof]
+    fn expiry_during_reply_take_never_publishes() {
+        let accepted = reply_observation_allows_publication(false, true);
+
+        kani::cover!(!accepted);
+        assert!(!accepted);
     }
 }

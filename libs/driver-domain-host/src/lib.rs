@@ -8,6 +8,20 @@
 //! fixed binary frame to RustOS's dedicated virtual transport.  High bandwidth
 //! devices (network, block, GPU) need their own paravirtual backends and must
 //! not be tunneled through this control relay.
+//!
+//! - **Owner:** L0 owns DVM launch identity, private control leases, event
+//!   admission, and host-side single-producer input-ring publication.
+//! - **Boundary:** Guest vsock frames, QMP state, image metadata, and shared
+//!   ring control words are untrusted until version, identity, and bounds checks.
+//! - **Lifecycle:** Create immutable launch state, authenticate one live lease,
+//!   publish bounded events, revoke exact generations, and reap every resource.
+//! - **Concurrency:** Host mutexes and aligned Acquire/Release atomics serialize
+//!   lease transitions and the shared input-ring producer/consumer protocol.
+//! - **Failure:** Timeout, generation drift, malformed input, full rings, and
+//!   child failure revoke or backpressure without advancing shared ownership.
+//! - **Forbidden:** No guest-chosen host path, direct RustOS authority, stale
+//!   lease reuse, bytewise access to live atomic words, or unbounded queueing.
+//! - **Evidence:** Driver-domain host tests, DVM input model, and KVM recovery.
 
 pub mod ivshmem;
 pub use ivshmem::{IvshmemDoorbellServer, IvshmemInputProducer};
@@ -15,22 +29,23 @@ pub use ivshmem::{IvshmemDoorbellServer, IvshmemInputProducer};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Read, Write};
-use std::mem::size_of;
+use std::mem::{align_of, size_of};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 pub use driver_domain_protocol::{
     DVM_BLOCK_DATA_SLOT_BYTES, DVM_BLOCK_KNOWN_FEATURES, DVM_BLOCK_QUEUE_DEPTH,
-    DVM_BLOCK_REQUIRED_FEATURES, DVM_INPUT_RING_APERTURE_BYTES,
+    DVM_BLOCK_REQUIRED_FEATURES, DVM_INPUT_RING_APERTURE_BYTES, DVM_INPUT_RING_CONSUMER_OFFSET,
     DVM_INPUT_RING_CONSUMER_WAKE_GENERATION_OFFSET, DVM_INPUT_RING_FLAG_POLICY_CONSUMER_READY,
-    DVM_INPUT_RING_FLAG_RUSTOS_READY, DVM_INPUT_RING_HEADER_BYTES, DVM_INPUT_RING_PRODUCER_OFFSET,
-    DVM_INPUT_RING_RECORD_BYTES, DVM_INPUT_RING_SLOT_COUNT, DvmInputFrameError, DvmInputRingHeader,
-    LINUX_EVDEV_KEY_MAX, RUSTOS_INPUT_FRAME_BYTES, RUSTOS_POINTER_BUTTON_MASK,
-    RUSTOS_POINTER_POSITION_MAX_X, RUSTOS_POINTER_POSITION_MAX_Y, RustosInputFrame,
+    DVM_INPUT_RING_FLAG_RUSTOS_READY, DVM_INPUT_RING_FLAGS_OFFSET, DVM_INPUT_RING_HEADER_BYTES,
+    DVM_INPUT_RING_PRODUCER_OFFSET, DVM_INPUT_RING_RECORD_BYTES, DVM_INPUT_RING_SLOT_COUNT,
+    DvmInputFrameError, DvmInputRingHeader, LINUX_EVDEV_KEY_MAX, RUSTOS_INPUT_FRAME_BYTES,
+    RUSTOS_POINTER_BUTTON_MASK, RUSTOS_POINTER_POSITION_MAX_X, RUSTOS_POINTER_POSITION_MAX_Y,
+    RustosInputFrame,
 };
 
 /// The DVM control listener port is derived from the owner-private per-launch
@@ -51,6 +66,33 @@ const INPUT_RELAY_MAX_FRAMES_PER_SECOND: u32 = 256;
 /// relay may wait only within the end-to-end input latency bound before it
 /// fails closed with a transport-health diagnosis.
 const INPUT_RING_CREDIT_TIMEOUT: Duration = Duration::from_millis(50);
+
+/// The shared wire record stays byte-addressed; only its concurrent control
+/// words are viewed through aligned atomics.
+const fn input_ring_atomic_control_layout_is_valid() -> bool {
+    DVM_INPUT_RING_FLAGS_OFFSET % align_of::<AtomicU32>() == 0
+        && DVM_INPUT_RING_PRODUCER_OFFSET % align_of::<AtomicU64>() == 0
+        && DVM_INPUT_RING_CONSUMER_OFFSET % align_of::<AtomicU64>() == 0
+        && DVM_INPUT_RING_CONSUMER_WAKE_GENERATION_OFFSET % align_of::<AtomicU64>() == 0
+        && DVM_INPUT_RING_FLAGS_OFFSET + size_of::<AtomicU32>() <= DVM_INPUT_RING_PRODUCER_OFFSET
+        && DVM_INPUT_RING_PRODUCER_OFFSET + size_of::<AtomicU64>() <= DVM_INPUT_RING_CONSUMER_OFFSET
+        && DVM_INPUT_RING_CONSUMER_OFFSET + size_of::<AtomicU64>()
+            <= DVM_INPUT_RING_CONSUMER_WAKE_GENERATION_OFFSET
+        && DVM_INPUT_RING_CONSUMER_WAKE_GENERATION_OFFSET + size_of::<AtomicU64>()
+            <= DvmInputRingHeader::encoded_len()
+        && size_of::<AtomicU32>() == size_of::<u32>()
+        && size_of::<AtomicU64>() == size_of::<u64>()
+}
+
+const _: () = assert!(input_ring_atomic_control_layout_is_valid());
+
+const fn shared_control_load_order() -> Ordering {
+    Ordering::Acquire
+}
+
+const fn shared_control_publish_order() -> Ordering {
+    Ordering::Release
+}
 // Every live hostd process allocates a relay epoch once. The fixed input ring
 // carries that epoch plus a per-epoch frame sequence, so time/PID derived
 // values are not sufficient: two rapid reconnects can collide. Stop before
@@ -2773,6 +2815,10 @@ impl InputRingSink {
         if mapped == libc::MAP_FAILED.cast::<u8>() {
             return Err(std::io::Error::last_os_error()).context("map input-ring backing");
         }
+        if !shared_control_words_are_aligned(mapped) {
+            unsafe { libc::munmap(mapped.cast::<libc::c_void>(), mapped_len) };
+            bail!("input-ring backing does not align atomic control words");
+        }
         let header = read_input_ring_header(mapped)?;
         if header.region_bytes != DVM_INPUT_RING_APERTURE_BYTES {
             unsafe { libc::munmap(mapped.cast::<libc::c_void>(), mapped_len) };
@@ -2797,9 +2843,7 @@ impl InputRingSink {
     }
 
     fn header(&self) -> Result<DvmInputRingHeader> {
-        let header = read_input_ring_header(self.mapped)?;
-        std::sync::atomic::fence(Ordering::Acquire);
-        Ok(header)
+        read_input_ring_header(self.mapped)
     }
 
     fn write_frame(&mut self, frame: &RustosInputFrame, cleanup: bool) -> Result<()> {
@@ -2845,31 +2889,22 @@ impl InputRingSink {
             unsafe { self.mapped.add(offset + index).write_volatile(*byte) };
         }
         debug_assert_eq!(end - offset, RUSTOS_INPUT_FRAME_BYTES);
-        std::sync::atomic::fence(Ordering::Release);
         let next = header
             .producer
             .checked_add(1)
             .ok_or_else(|| anyhow!("input-ring producer wrapped"))?;
-        unsafe {
-            self.mapped
-                .add(DVM_INPUT_RING_PRODUCER_OFFSET)
-                .cast::<u64>()
-                .write_volatile(next.to_le());
-        }
+        // ORDERING: Release publishes the complete volatile payload before
+        // RustOS acquires this producer cursor and reads the fixed slot.
+        store_shared_u64(self.mapped, DVM_INPUT_RING_PRODUCER_OFFSET, next);
         self.producer_cursor = next;
         // Sample the consumer-owned generation only after the release-ordered
         // producer cursor is visible. If inputd armed before this commit, L0
         // observes the new generation and rings. If it armed after an earlier
         // sample, inputd's post-arm cursor recheck observes this commit.
-        std::sync::atomic::fence(Ordering::Acquire);
-        let wake_generation = unsafe {
-            u64::from_le(
-                self.mapped
-                    .add(DVM_INPUT_RING_CONSUMER_WAKE_GENERATION_OFFSET)
-                    .cast::<u64>()
-                    .read_volatile(),
-            )
-        };
+        // ORDERING: Acquire observes the waiter registration published before
+        // RustOS increments its consumer wake generation.
+        let wake_generation =
+            load_shared_u64(self.mapped, DVM_INPUT_RING_CONSUMER_WAKE_GENERATION_OFFSET);
         const INPUT_RING_RECOVERY_KICK_RECORDS: u64 = 2;
         let recovery_kick = next.saturating_sub(header.consumer)
             >= INPUT_RING_RECOVERY_KICK_RECORDS
@@ -2923,10 +2958,90 @@ impl RustosInputSink for InputRingSink {
 
 fn read_input_ring_header(mapped: *const u8) -> Result<DvmInputRingHeader> {
     let mut bytes = [0_u8; DvmInputRingHeader::encoded_len()];
-    for (index, byte) in bytes.iter_mut().enumerate() {
-        *byte = unsafe { mapped.add(index).read_volatile() };
-    }
+    copy_immutable_input_header_bytes(mapped, &mut bytes);
+    write_control_words_to_input_header_bytes(mapped, &mut bytes);
     DvmInputRingHeader::decode(&bytes).ok_or_else(|| anyhow!("invalid fixed input-ring header"))
+}
+
+fn shared_control_words_are_aligned(base: *const u8) -> bool {
+    let base = base as usize;
+    base != 0
+        && base
+            .checked_add(DVM_INPUT_RING_FLAGS_OFFSET)
+            .is_some_and(|address| address % align_of::<AtomicU32>() == 0)
+        && base
+            .checked_add(DVM_INPUT_RING_PRODUCER_OFFSET)
+            .is_some_and(|address| address % align_of::<AtomicU64>() == 0)
+        && base
+            .checked_add(DVM_INPUT_RING_CONSUMER_OFFSET)
+            .is_some_and(|address| address % align_of::<AtomicU64>() == 0)
+        && base
+            .checked_add(DVM_INPUT_RING_CONSUMER_WAKE_GENERATION_OFFSET)
+            .is_some_and(|address| address % align_of::<AtomicU64>() == 0)
+}
+
+fn load_shared_flags(base: *const u8) -> u32 {
+    debug_assert!(shared_control_words_are_aligned(base));
+    // SAFETY: `connect` rejects unaligned mappings and this fixed offset has
+    // atomic alignment. The temporary reference names only the shared atomic
+    // word; no concurrent access uses a non-atomic reference to that word.
+    let word = unsafe {
+        AtomicU32::from_ptr(
+            base.cast_mut()
+                .add(DVM_INPUT_RING_FLAGS_OFFSET)
+                .cast::<u32>(),
+        )
+    };
+    u32::from_le(word.load(shared_control_load_order()))
+}
+
+fn load_shared_u64(base: *const u8, offset: usize) -> u64 {
+    debug_assert!(shared_control_words_are_aligned(base));
+    // SAFETY: `connect` rejects unaligned mappings and every caller supplies a
+    // fixed u64 control offset. The temporary reference is atomic-only.
+    let word = unsafe { AtomicU64::from_ptr(base.cast_mut().add(offset).cast::<u64>()) };
+    u64::from_le(word.load(shared_control_load_order()))
+}
+
+fn store_shared_u64(base: *mut u8, offset: usize, value: u64) {
+    debug_assert!(shared_control_words_are_aligned(base));
+    // SAFETY: `connect` rejects unaligned mappings and every caller supplies a
+    // fixed u64 control offset. The temporary reference is atomic-only.
+    let word = unsafe { AtomicU64::from_ptr(base.add(offset).cast::<u64>()) };
+    word.store(value.to_le(), shared_control_publish_order());
+}
+
+fn copy_immutable_input_header_bytes(mapped: *const u8, bytes: &mut [u8]) {
+    for range in [
+        0..DVM_INPUT_RING_FLAGS_OFFSET,
+        DVM_INPUT_RING_FLAGS_OFFSET + size_of::<u32>()..DVM_INPUT_RING_PRODUCER_OFFSET,
+        DVM_INPUT_RING_PRODUCER_OFFSET + size_of::<u64>()..DVM_INPUT_RING_CONSUMER_OFFSET,
+        DVM_INPUT_RING_CONSUMER_WAKE_GENERATION_OFFSET + size_of::<u64>()..bytes.len(),
+    ] {
+        for index in range {
+            // SAFETY: the fixed mapped aperture contains the encoded header;
+            // these ranges exclude all concurrently mutable control words.
+            bytes[index] = unsafe { mapped.add(index).read_volatile() };
+        }
+    }
+}
+
+fn write_control_words_to_input_header_bytes(mapped: *const u8, bytes: &mut [u8]) {
+    let flags = load_shared_flags(mapped);
+    // ORDERING: acquire consumer before producer so a consumer advance cannot
+    // make a valid ring snapshot appear as an impossible producer underflow.
+    let consumer = load_shared_u64(mapped, DVM_INPUT_RING_CONSUMER_OFFSET);
+    let producer = load_shared_u64(mapped, DVM_INPUT_RING_PRODUCER_OFFSET);
+    let wake_generation = load_shared_u64(mapped, DVM_INPUT_RING_CONSUMER_WAKE_GENERATION_OFFSET);
+    bytes[DVM_INPUT_RING_FLAGS_OFFSET..DVM_INPUT_RING_FLAGS_OFFSET + size_of::<u32>()]
+        .copy_from_slice(&flags.to_le_bytes());
+    bytes[DVM_INPUT_RING_PRODUCER_OFFSET..DVM_INPUT_RING_PRODUCER_OFFSET + size_of::<u64>()]
+        .copy_from_slice(&producer.to_le_bytes());
+    bytes[DVM_INPUT_RING_CONSUMER_OFFSET..DVM_INPUT_RING_CONSUMER_OFFSET + size_of::<u64>()]
+        .copy_from_slice(&consumer.to_le_bytes());
+    bytes[DVM_INPUT_RING_CONSUMER_WAKE_GENERATION_OFFSET
+        ..DVM_INPUT_RING_CONSUMER_WAKE_GENERATION_OFFSET + size_of::<u64>()]
+        .copy_from_slice(&wake_generation.to_le_bytes());
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4165,25 +4280,83 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::AtomicU32;
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        CONTROL_PORT_FLOOR, CONTROL_SECRET_BYTES, ControlContract, ControlSecret, DeviceClass,
-        DeviceTransport, DriverDomainFleetPolicy, DriverDomainPolicy, FileLeaseStore,
-        INPUT_STREAM_REQUEST_ID, InputRelayRate, IommuTopology, LaunchPlan, LinuxEvdevInputEvent,
-        LinuxEvdevKeyEvent, ReleaseAuthorization, RustosInputFrame, SysfsVfioOps, ValidatedLease,
-        VfioLeaseRecord, VfioLeaseState, VfioOps, VfioReleaseBinding, acquire_vfio_lease,
-        allocate_input_epoch, control_proof, inspect_vfio_lease, inspect_vfio_lease_preflight,
-        parse_block_evidence, parse_display_evidence, parse_linux_evdev_input_event, parse_message,
-        reset_vfio_group, restore_vfio_lease, validate_hello, validate_host_display_assignment,
-        validate_physical_display_assignment, validate_physical_storage_assignment,
-        validate_physical_storage_identity, validate_reset_scope_assignment,
-        validate_vfio_bind_dma_quiescence,
+        CONTROL_PORT_FLOOR, CONTROL_SECRET_BYTES, ControlContract, ControlSecret,
+        DVM_INPUT_RING_APERTURE_BYTES, DVM_INPUT_RING_CONSUMER_OFFSET,
+        DVM_INPUT_RING_CONSUMER_WAKE_GENERATION_OFFSET, DVM_INPUT_RING_PRODUCER_OFFSET,
+        DeviceClass, DeviceTransport, DriverDomainFleetPolicy, DriverDomainPolicy,
+        DvmInputRingHeader, FileLeaseStore, INPUT_STREAM_REQUEST_ID, InputRelayRate, IommuTopology,
+        LaunchPlan, LinuxEvdevInputEvent, LinuxEvdevKeyEvent, ReleaseAuthorization,
+        RustosInputFrame, SysfsVfioOps, ValidatedLease, VfioLeaseRecord, VfioLeaseState, VfioOps,
+        VfioReleaseBinding, acquire_vfio_lease, allocate_input_epoch, control_proof,
+        input_ring_atomic_control_layout_is_valid, inspect_vfio_lease,
+        inspect_vfio_lease_preflight, load_shared_flags, load_shared_u64, parse_block_evidence,
+        parse_display_evidence, parse_linux_evdev_input_event, parse_message,
+        read_input_ring_header, reset_vfio_group, restore_vfio_lease, shared_control_load_order,
+        shared_control_publish_order, shared_control_words_are_aligned, store_shared_u64,
+        validate_hello, validate_host_display_assignment, validate_physical_display_assignment,
+        validate_physical_storage_assignment, validate_physical_storage_identity,
+        validate_reset_scope_assignment, validate_vfio_bind_dma_quiescence,
     };
     use anyhow::Result;
 
     const VALID: &str = "CONTROL_SCHEMA=1\nCONTROL_PROTOCOL=agent-v1\nCONTROL_STATE=control\nCONTROL_TRANSPORT=kvm-vsock\nCONTROL_AUTHENTICATION=dvm-agent-hmac-sha256-v1\nCONTROL_CAPABILITIES=health,device-inventory,driver-inventory,display-evidence-v2,block-evidence-v1,input-stream\n";
+
+    #[test]
+    fn input_ring_control_words_are_atomic_and_ordered() {
+        assert!(input_ring_atomic_control_layout_is_valid());
+        assert_eq!(shared_control_load_order(), Ordering::Acquire);
+        assert_eq!(shared_control_publish_order(), Ordering::Release);
+
+        let mut backing = [0_u64; 32];
+        let base = backing.as_mut_ptr().cast::<u8>();
+        assert!(shared_control_words_are_aligned(base));
+
+        let header = DvmInputRingHeader::new(DVM_INPUT_RING_APERTURE_BYTES, 9).encode();
+        for (index, byte) in header.iter().enumerate() {
+            // SAFETY: this test initializes private backing before any atomic
+            // view exists, so there is no concurrent shared-memory access.
+            unsafe { base.add(index).write_volatile(*byte) };
+        }
+        assert_eq!(
+            load_shared_flags(base),
+            driver_domain_protocol::DVM_INPUT_RING_FLAG_READY
+        );
+
+        store_shared_u64(base, DVM_INPUT_RING_PRODUCER_OFFSET, 7);
+        store_shared_u64(base, DVM_INPUT_RING_CONSUMER_OFFSET, 3);
+        store_shared_u64(base, DVM_INPUT_RING_CONSUMER_WAKE_GENERATION_OFFSET, 11);
+        assert_eq!(load_shared_u64(base, DVM_INPUT_RING_PRODUCER_OFFSET), 7);
+        assert_eq!(load_shared_u64(base, DVM_INPUT_RING_CONSUMER_OFFSET), 3);
+        assert_eq!(
+            load_shared_u64(base, DVM_INPUT_RING_CONSUMER_WAKE_GENERATION_OFFSET),
+            11
+        );
+        let snapshot = read_input_ring_header(base).unwrap();
+        assert_eq!(
+            (
+                snapshot.producer,
+                snapshot.consumer,
+                snapshot.consumer_wake_generation
+            ),
+            (7, 3, 11)
+        );
+
+        let production = include_str!("lib.rs")
+            .split_once("#[cfg(test)]")
+            .expect("host tests remain below production")
+            .0;
+        assert!(production.contains("AtomicU32::from_ptr"));
+        assert!(production.contains("AtomicU64::from_ptr"));
+        assert!(production.contains("fn write_control_words_to_input_header_bytes"));
+        assert!(!production.contains(".write_volatile(next.to_le())"));
+        assert!(!production.contains(
+            "DVM_INPUT_RING_CONSUMER_WAKE_GENERATION_OFFSET)\n                    .cast::<u64>()"
+        ));
+    }
 
     #[test]
     fn relay_epochs_are_monotonic_and_fail_closed_before_reuse() {

@@ -56,6 +56,11 @@ static TRANSITION_FROM_SLOTS: [AtomicUsize; nucleus_core::util::lockdep::MAX_TRA
 static TRANSITION_ACTIVE: [AtomicBool; nucleus_core::util::lockdep::MAX_TRACKED_CPUS] =
     [const { AtomicBool::new(false) }; nucleus_core::util::lockdep::MAX_TRACKED_CPUS];
 
+#[cfg(test)]
+mod test_support;
+#[cfg(test)]
+pub(super) use test_support::{install_test_transition_owner, test_publication_lock};
+
 // This remains a dead-owner fail-stop, not a scheduling latency budget. A KVM
 // vCPU can be descheduled by the host while it owns an otherwise bounded raw
 // scheduler transaction; treating a 100 ms host pause as a kernel deadlock
@@ -191,6 +196,40 @@ impl DerefMut for SchedulerAccessGuard {
     }
 }
 
+/// The release-published ownership edge of one scheduler guard.
+///
+/// Keeping this narrow operation separate from lock profiling makes its
+/// release/acquire contract directly testable while `SchedulerAccessGuard`
+/// still owns its only production call site and ordering.
+struct SchedulerGuardReleasePublication {
+    logical_index: usize,
+    original_task: usize,
+}
+
+impl SchedulerGuardReleasePublication {
+    fn publish(self, selected_task: usize, selected_task_is_idle: bool) {
+        if selected_task != self.original_task {
+            // ORDERING: Publish the outgoing slot before activating the
+            // transition. Remote lifetime and selection paths must retain its
+            // stack until assembly has installed the incoming `rsp`.
+            TRANSITION_FROM_SLOTS[self.logical_index].store(self.original_task, Ordering::Release);
+            // ORDERING: Release activates the transition only after the
+            // outgoing slot is published.
+            TRANSITION_ACTIVE[self.logical_index].store(true, Ordering::Release);
+        }
+        // ORDERING: Release publishes the exact task slot selected for this
+        // CPU. A changed handoff already published the outgoing transition,
+        // so both stacks remain owned until the assembly commit callback.
+        CURRENT_TASK_SLOTS[self.logical_index].store(selected_task, Ordering::Release);
+        // ORDERING: Release publishes the selected slot's scheduler-derived
+        // Idle class after the slot itself. Periodic interrupt leaves may use
+        // this one bit only to retain an idle continuation when every local
+        // and foreign runqueue publication is empty.
+        // ORDERING: the following Release is the derived-class publication.
+        CURRENT_TASK_IDLE[self.logical_index].store(selected_task_is_idle, Ordering::Release);
+    }
+}
+
 impl Drop for SchedulerAccessGuard {
     fn drop(&mut self) {
         let guard = self
@@ -225,26 +264,11 @@ impl Drop for SchedulerAccessGuard {
             !TRANSITION_ACTIVE[self.logical_index].load(Ordering::Acquire),
             "scheduler invariant: CPU entered scheduler before prior stack handoff committed"
         );
-        if selected_task != self.original_task {
-            // ORDERING: Publish the outgoing slot before activating the
-            // transition. Remote lifetime and selection paths must retain its
-            // stack until assembly has installed the incoming `rsp`.
-            TRANSITION_FROM_SLOTS[self.logical_index].store(self.original_task, Ordering::Release);
-            // ORDERING: Release activates the transition only after the
-            // outgoing slot is published.
-            TRANSITION_ACTIVE[self.logical_index].store(true, Ordering::Release);
+        SchedulerGuardReleasePublication {
+            logical_index: self.logical_index,
+            original_task: self.original_task,
         }
-        // ORDERING: Release publishes the exact task slot selected for this
-        // CPU. A changed handoff already published the outgoing transition,
-        // so both stacks remain owned until the assembly commit callback.
-        CURRENT_TASK_SLOTS[self.logical_index].store(selected_task, Ordering::Release);
-        // ORDERING: Release publishes the selected slot's scheduler-derived
-        // Idle class after the slot itself. Periodic interrupt leaves may use
-        // this one bit only to retain an idle continuation when every local
-        // and foreign runqueue publication is empty.
-        // ORDERING: the following Release is the derived-class publication.
-        CURRENT_TASK_IDLE[self.logical_index]
-            .store(guard.current_task_is_idle_task(), Ordering::Release);
+        .publish(selected_task, guard.current_task_is_idle_task());
         // Re-mirror the runnable bit for every executing slot. Bounded by the
         // CPU count and done here rather than at each write site, because a
         // wake on one CPU can change the readiness of a task executing on
@@ -680,10 +704,32 @@ fn task_execution_owner_in(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        AtomicBool, AtomicUsize, Ordering, TaskExecutionOwner, slot_has_owner_in,
-        slot_is_running_in, task_execution_owner_in,
+    use super::super::irq;
+    use super::test_support::{
+        install_test_current_owner, install_test_transition_owner_with_admission,
+        test_scheduler_guard_for_release,
     };
+    use super::{
+        AtomicBool, AtomicUsize, Ordering, SchedulerGuardReleasePublication, TaskExecutionOwner,
+        slot_has_owner_in, slot_is_running_in, task_execution_owner, task_execution_owner_in,
+        test_publication_lock,
+    };
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    struct DeferredTargetFlushReset;
+
+    impl DeferredTargetFlushReset {
+        fn new() -> Self {
+            irq::reset_test_deferred_target_reschedule_flush_epoch();
+            Self
+        }
+    }
+
+    impl Drop for DeferredTargetFlushReset {
+        fn drop(&mut self) {
+            irq::reset_test_deferred_target_reschedule_flush_epoch();
+        }
+    }
 
     #[test]
     fn current_task_ownership_ignores_offline_slots_and_is_cpu_distinct() {
@@ -782,5 +828,104 @@ mod tests {
             &transition_active,
             17
         ));
+
+        let _serial = test_publication_lock();
+        let inactive_cpu = nucleus_core::util::lockdep::MAX_TRACKED_CPUS - 2;
+        let active_cpu = nucleus_core::util::lockdep::MAX_TRACKED_CPUS - 1;
+        let retained_slot = super::MAX_SCHEDULER_TASKS - 3;
+        let _inactive = install_test_transition_owner_with_admission(
+            inactive_cpu,
+            retained_slot - 1,
+            retained_slot,
+            false,
+        );
+        let _active = install_test_transition_owner_with_admission(
+            active_cpu,
+            retained_slot,
+            retained_slot - 2,
+            true,
+        );
+        assert_eq!(
+            task_execution_owner(retained_slot),
+            Some(TaskExecutionOwner::Current(active_cpu)),
+            "an inactive CPU's stale transition must not collide with the active current owner"
+        );
+    }
+
+    #[test]
+    fn duplicate_current_or_transition_owner_panics() {
+        let slots = [AtomicUsize::new(41), AtomicUsize::new(52)];
+        let active = [AtomicBool::new(true), AtomicBool::new(true)];
+        let transition_slots = [AtomicUsize::new(0), AtomicUsize::new(41)];
+        let transition_active = [AtomicBool::new(false), AtomicBool::new(true)];
+
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                let _ = task_execution_owner_in(
+                    &slots,
+                    &active,
+                    &transition_slots,
+                    &transition_active,
+                    41,
+                );
+            }))
+            .is_err(),
+            "one slot published by two current/transition owners must fail-stop"
+        );
+    }
+
+    #[test]
+    fn scheduler_guard_release_flushes_deferred_target_notification() {
+        let _serial = test_publication_lock();
+        let _flush_reset = DeferredTargetFlushReset::new();
+        let logical_index = 0;
+        let original_task = super::MAX_SCHEDULER_TASKS - 5;
+        let selected_task = super::MAX_SCHEDULER_TASKS - 4;
+        let _publication = install_test_current_owner(logical_index, original_task);
+        let target_cpu = 1;
+        irq::prepare_test_deferred_target_reschedule(target_cpu);
+
+        let guard = test_scheduler_guard_for_release(logical_index, original_task, selected_task);
+        drop(guard);
+
+        assert_eq!(irq::test_deferred_target_reschedule_pending_mask(), 0);
+        assert_eq!(
+            irq::test_deferred_target_reschedule_sent_mask(),
+            1_u64 << target_cpu,
+            "the release path must claim and validate the exact remote target"
+        );
+        assert_eq!(
+            irq::test_deferred_target_reschedule_flush_epoch(),
+            1,
+            "the live SchedulerAccessGuard release must send one validated target notification"
+        );
+    }
+
+    #[test]
+    fn guard_switch_publishes_outgoing_transition_before_current_slot() {
+        let _serial = test_publication_lock();
+        let logical_index = nucleus_core::util::lockdep::MAX_TRACKED_CPUS - 1;
+        let outgoing_slot = super::MAX_SCHEDULER_TASKS - 7;
+        let incoming_slot = super::MAX_SCHEDULER_TASKS - 6;
+        let publication = install_test_current_owner(logical_index, outgoing_slot);
+
+        SchedulerGuardReleasePublication {
+            logical_index,
+            original_task: outgoing_slot,
+        }
+        .publish(incoming_slot, false);
+
+        assert_eq!(
+            task_execution_owner(outgoing_slot),
+            Some(TaskExecutionOwner::Transition(logical_index)),
+            "the outgoing stack must become a transition owner before incoming current publication"
+        );
+        assert_eq!(
+            task_execution_owner(incoming_slot),
+            Some(TaskExecutionOwner::Current(logical_index)),
+            "the same live publication must install the selected current slot"
+        );
+        publication.commit_assembly();
+        assert_eq!(task_execution_owner(outgoing_slot), None);
     }
 }

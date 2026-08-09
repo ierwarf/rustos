@@ -9,6 +9,7 @@ pub(crate) mod offload_ops;
 mod proc_broker_ops;
 mod scheduler_ops;
 mod service_ops;
+mod smp_qualification_ops;
 mod support;
 mod syscalld_ops;
 
@@ -34,6 +35,7 @@ use proc_broker_ops::syscall_linux_rustos_proc_activate_batch_broker as proc_act
 use proc_broker_ops::*;
 use scheduler_ops::*;
 use service_ops::*;
+use smp_qualification_ops::*;
 use support::*;
 use syscalld_ops::*;
 
@@ -103,6 +105,7 @@ use rustos_user_abi::syscall::{
     VfsIpcResponse, WAITSET_ABI_VERSION, WAITSET_INPUT_EVDEV_OBJECT_ID,
     WAITSET_INPUT_NATIVE_OBJECT_ID, WAITSET_MAX_INTERESTS, WAITSET_PROVIDER_INPUTD,
     WAITSET_PROVIDER_NETD, WAITSET_PROVIDER_SESSIOND, WAITSET_PROVIDER_VFSD, WaitSetInterestWire,
+    waitset_interest_shape_valid,
 };
 
 use super::SyscallFrame;
@@ -169,6 +172,9 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
         linux_abi::SYS_RUSTOS_DEBUG_PRINT => syscall_linux_rustos_debug_print(frame.rdi, frame.rsi),
         linux_abi::SYS_RUSTOS_PRODUCT_MILESTONE => {
             syscall_linux_rustos_product_milestone(frame.rdi, frame.rsi, frame.rdx)
+        }
+        linux_abi::SYS_RUSTOS_SMP_QUALIFICATION_BIND => {
+            syscall_linux_rustos_smp_qualification_bind(frame.rdi)
         }
         linux_abi::SYS_RUSTOS_SPAWN_EXEC => syscall_linux_loader_spawn_exec(
             frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,

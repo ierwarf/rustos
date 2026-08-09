@@ -38,8 +38,8 @@ pub fn kernel_virtual_to_physical_addr(addr: u64) -> u64 {
     crate::memory::kernel_vm::kernel_virtual_to_physical_addr(addr)
 }
 
-pub fn direct_map_flags_for_phys(phys_addr: u64) -> Option<PageTableFlags> {
-    crate::memory::kernel_vm::direct_map_flags_for_phys(phys_addr)
+pub fn direct_map_cache_flags_for_phys(phys_addr: u64) -> Option<PageTableFlags> {
+    crate::memory::kernel_vm::direct_map_cache_flags_for_phys(phys_addr)
 }
 
 pub fn update_direct_map_range_flags(
@@ -78,6 +78,14 @@ pub fn map_mmio_range(phys_addr: u64, size: usize) -> Option<u64> {
 
 pub fn map_mmio_range_wc(phys_addr: u64, size: usize) -> Option<u64> {
     crate::memory::kernel_vm::map_mmio_range_wc(phys_addr, size)
+}
+
+pub fn map_shared_memory_range(phys_addr: u64, size: usize) -> Option<u64> {
+    crate::memory::kernel_vm::map_shared_memory_range(phys_addr, size)
+}
+
+pub fn map_permanent_boot_mmio_uncached(phys_addr: u64, size: usize) -> Option<u64> {
+    crate::memory::kernel_vm::map_permanent_boot_mmio_uncached(phys_addr, size)
 }
 
 pub fn unmap_mmio_range(virt_addr: u64, size: usize) -> bool {

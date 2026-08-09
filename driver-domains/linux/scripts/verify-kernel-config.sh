@@ -16,6 +16,13 @@ require_enabled() {
     }
 }
 
+require_builtin() {
+    grep -qx "${1}=y" "$config" || {
+        echo "rustos-linux-dvm: required kernel feature is not built in: $1" >&2
+        exit 1
+    }
+}
+
 require_module() {
     grep -qx "${1}=m" "$config" || {
         echo "rustos-linux-dvm: required kernel feature is not modular: $1" >&2
@@ -77,6 +84,7 @@ require_module CONFIG_DRM_AMDGPU
 require_enabled CONFIG_DRM_AMD_DC
 require_enabled CONFIG_DRM_FBDEV_EMULATION
 require_module CONFIG_BLK_DEV_SD
+require_builtin CONFIG_BLK_DEV_SR
 require_module CONFIG_ATA
 require_module CONFIG_SATA_AHCI
 require_module CONFIG_BLK_DEV_NVME

@@ -5,14 +5,16 @@ EXTENDS Naturals, FiniteSets, Sequences
 Models the all-or-nothing publication of one bounded suspended-child cohort.
 
 Policy selects the cohort in initd. Loaderd binds the requester to the
-kernel-stamped IPC sender. Ring0 holds ProcBrokerRegistry before acquiring the
-Scheduler lock, validates every exact one-shot capability and suspended task,
-then consumes every capability while every target remains suspended and
-publishes every runnable task in the same rollback-free critical section. The
-model exposes that lock-held interior as `AuthorityConsumed` only to prove the
-execution order; no external action, requester exit, dispatch, or reply can
-interleave it. A malformed or foreign cohort changes neither task nor
-capability state.
+kernel-stamped IPC sender. Ring0 snapshots every bounded target
+`ProcessIdentity` before acquiring ProcBrokerRegistry. Under that registry
+lock it rechecks the full PID/process-generation/MM-generation identity
+against the deferred authority, then acquires the Scheduler lock, consumes
+every capability while every target remains suspended, and publishes every
+runnable task in the same rollback-free critical section. The model exposes
+that lock-held interior as `AuthorityConsumed` only to prove the execution
+order; no external action, requester exit, dispatch, or reply can interleave
+it. A malformed, foreign, or PID-equal replaced cohort changes neither task
+nor capability state.
 
 Concrete owners:
   * services/initd/src/main.rs
@@ -42,16 +44,41 @@ Exited == "exited"
 Batch == <<BatchFirst, BatchSecond, BatchThird>>
 BatchSet == {Batch[index] : index \in 1..Len(Batch)}
 
+GenerationRaceTarget == BatchFirst
+SnapshotGeneration == 1
+ReplacementGeneration == 2
+
+\* One non-reusable generation represents the exact process-table/MM pair.
+\* A replacement retains the numeric PID while substituting that full pair.
+TargetIdentity(generation) ==
+    [pid |-> GenerationRaceTarget,
+     processGeneration |-> generation,
+     mmGeneration |-> generation]
+
 VARIABLES taskState, authority, shapeValid, phase, queue, ordinaryQueue,
-          dispatched, replyResumed
+          dispatched, replyResumed, snapshotGeneration, currentGeneration
 
 vars ==
     <<taskState, authority, shapeValid, phase, queue, ordinaryQueue,
-      dispatched, replyResumed>>
+      dispatched, replyResumed, snapshotGeneration, currentGeneration>>
+
+TargetIdentityIsExact ==
+    TargetIdentity(currentGeneration) = TargetIdentity(snapshotGeneration)
+
+TargetIdentityReplaced ==
+    /\ TargetIdentity(currentGeneration).pid =
+        TargetIdentity(snapshotGeneration).pid
+    /\ currentGeneration # snapshotGeneration
+
+AllBatchTargetIdentitiesExact == TargetIdentityIsExact
 
 Init ==
     /\ taskState = [task \in Targets |-> Suspended]
     /\ authority = [task \in Targets |-> Live]
+    \* Initial resolution completes before the ProcBrokerRegistry critical
+    \* section. The authority record binds this exact snapshot generation.
+    /\ snapshotGeneration = SnapshotGeneration
+    /\ currentGeneration = SnapshotGeneration
     /\ shapeValid = TRUE
     /\ phase = Idle
     /\ queue = <<>>
@@ -68,7 +95,7 @@ CorruptAuthority(task) ==
     /\ authority' = [authority EXCEPT ![task] = ForeignAuthority]
     /\ UNCHANGED
         <<taskState, shapeValid, phase, queue, ordinaryQueue,
-          dispatched, replyResumed>>
+          dispatched, replyResumed, snapshotGeneration, currentGeneration>>
 
 CorruptShape ==
     /\ phase = Idle
@@ -76,13 +103,22 @@ CorruptShape ==
     /\ shapeValid' = FALSE
     /\ UNCHANGED
         <<taskState, authority, phase, queue, ordinaryQueue,
-          dispatched, replyResumed>>
+          dispatched, replyResumed, snapshotGeneration, currentGeneration>>
+
+ReplaceTargetIdentity ==
+    /\ phase = Idle
+    /\ currentGeneration = snapshotGeneration
+    /\ currentGeneration' = ReplacementGeneration
+    /\ UNCHANGED
+        <<taskState, authority, shapeValid, phase, queue, ordinaryQueue,
+          dispatched, replyResumed, snapshotGeneration>>
 
 BatchPreflightOK ==
     /\ shapeValid
     /\ Len(Batch) \in 1..8
     /\ \A left, right \in 1..Len(Batch):
         left # right => Batch[left] # Batch[right]
+    /\ TargetIdentityIsExact
     /\ \A task \in BatchSet:
         /\ taskState[task] = Suspended
         /\ authority[task] = Live
@@ -96,7 +132,7 @@ ConsumeAuthority ==
     /\ phase' = AuthorityConsumed
     /\ UNCHANGED
         <<taskState, shapeValid, queue, ordinaryQueue, dispatched,
-          replyResumed>>
+          replyResumed, snapshotGeneration, currentGeneration>>
 
 PublishBatch ==
     /\ phase = AuthorityConsumed
@@ -110,7 +146,8 @@ PublishBatch ==
     /\ queue' = Batch
     /\ dispatched' = <<>>
     /\ replyResumed' = FALSE
-    /\ UNCHANGED <<authority, shapeValid, ordinaryQueue>>
+    /\ UNCHANGED <<authority, shapeValid, ordinaryQueue,
+                   snapshotGeneration, currentGeneration>>
 
 DispatchBatchHead ==
     /\ phase = Committed
@@ -119,7 +156,7 @@ DispatchBatchHead ==
     /\ dispatched' = Append(dispatched, Head(queue))
     /\ UNCHANGED
         <<taskState, authority, shapeValid, phase, ordinaryQueue,
-          replyResumed>>
+          replyResumed, snapshotGeneration, currentGeneration>>
 
 ResumeLoaderReply ==
     /\ phase = Committed
@@ -129,7 +166,7 @@ ResumeLoaderReply ==
     /\ replyResumed' = TRUE
     /\ UNCHANGED
         <<taskState, authority, shapeValid, phase, queue, ordinaryQueue,
-          dispatched>>
+          dispatched, snapshotGeneration, currentGeneration>>
 
 RejectBatch ==
     /\ phase = Idle
@@ -137,7 +174,7 @@ RejectBatch ==
     /\ phase' = Rejected
     /\ UNCHANGED
         <<taskState, authority, shapeValid, queue, ordinaryQueue,
-          dispatched, replyResumed>>
+          dispatched, replyResumed, snapshotGeneration, currentGeneration>>
 
 RequesterExit ==
     /\ phase = Idle
@@ -149,7 +186,8 @@ RequesterExit ==
             IF task \in BatchSet THEN Revoked ELSE authority[task]]
     /\ phase' = Exited
     /\ UNCHANGED
-        <<shapeValid, queue, ordinaryQueue, dispatched, replyResumed>>
+        <<shapeValid, queue, ordinaryQueue, dispatched, replyResumed,
+          snapshotGeneration, currentGeneration>>
 
 TerminalStutter ==
     /\ (phase \in {Rejected, Exited} \/ (phase = Committed /\ replyResumed))
@@ -158,6 +196,7 @@ TerminalStutter ==
 Next ==
     \/ \E task \in Targets: CorruptAuthority(task)
     \/ CorruptShape
+    \/ ReplaceTargetIdentity
     \/ ConsumeAuthority
     \/ PublishBatch
     \/ DispatchBatchHead
@@ -172,12 +211,18 @@ TypeOK ==
     /\ taskState \in [Targets -> {Suspended, Runnable, Retired}]
     /\ authority \in
         [Targets -> {Live, Consumed, Revoked, ForeignAuthority}]
+    /\ snapshotGeneration = SnapshotGeneration
+    /\ currentGeneration \in {SnapshotGeneration, ReplacementGeneration}
     /\ shapeValid \in BOOLEAN
     /\ phase \in {Idle, AuthorityConsumed, Committed, Rejected, Exited}
     /\ queue \in Seq(Targets)
     /\ ordinaryQueue \in Seq({Ordinary})
     /\ dispatched \in Seq(Targets)
     /\ replyResumed \in BOOLEAN
+
+TargetIdentityFieldsStayPidBound ==
+    /\ TargetIdentity(snapshotGeneration).pid = GenerationRaceTarget
+    /\ TargetIdentity(currentGeneration).pid = GenerationRaceTarget
 
 BatchIsBoundedAndUnique ==
     /\ Len(Batch) \in 1..8
@@ -188,6 +233,7 @@ NoPartialPublication ==
     phase = Committed =>
         /\ \A task \in BatchSet: taskState[task] = Runnable
         /\ \A task \in BatchSet: authority[task] = Consumed
+        /\ AllBatchTargetIdentitiesExact
         /\ dispatched \o queue = Batch
 
 NoRunnablePublicationBeforePublish ==
@@ -202,6 +248,7 @@ AuthorityConsumptionRetainsSuspension ==
         /\ \A task \in BatchSet:
             /\ taskState[task] = Suspended
             /\ authority[task] = Consumed
+        /\ AllBatchTargetIdentitiesExact
         /\ queue = <<>>
         /\ dispatched = <<>>
         /\ ~replyResumed
@@ -214,6 +261,29 @@ CapabilityConsumptionRequiresCompletePreflight ==
 RunnableRequiresConsumedAuthority ==
     \A task \in BatchSet:
         taskState[task] = Runnable => authority[task] = Consumed
+
+ConsumedOrPublishedTargetsMatchResolvedIdentity ==
+    phase \in {AuthorityConsumed, Committed} =>
+        AllBatchTargetIdentitiesExact
+
+TargetIdentityReplacementCannotActivate ==
+    TargetIdentityReplaced =>
+        /\ phase \notin {AuthorityConsumed, Committed}
+        /\ \A task \in BatchSet: authority[task] # Consumed
+        /\ \A task \in BatchSet: taskState[task] # Runnable
+        /\ queue = <<>>
+        /\ dispatched = <<>>
+        /\ ~replyResumed
+
+ReplacementRejectionPreservesCohort ==
+    /\ phase = Rejected
+    /\ TargetIdentityReplaced
+    => /\ \A task \in BatchSet:
+            /\ taskState[task] = Suspended
+            /\ authority[task] # Consumed
+       /\ queue = <<>>
+       /\ dispatched = <<>>
+       /\ ~replyResumed
 
 RejectedBatchPreservesTargets ==
     phase = Rejected =>

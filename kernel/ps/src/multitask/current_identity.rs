@@ -33,7 +33,8 @@ const FLAG_PUBLISHED: u32 = 1 << 0;
 const FLAG_TASK_ID: u32 = 1 << 1;
 const FLAG_USER_MODE: u32 = 1 << 2;
 const FLAG_PROCESS: u32 = 1 << 3;
-const ABI_SHIFT: u32 = 4;
+const FLAG_PROCESS_ID: u32 = 1 << 4;
+const ABI_SHIFT: u32 = 5;
 const ABI_MASK: u32 = 0b11 << ABI_SHIFT;
 const ABI_NONE: u32 = 0;
 const ABI_LINUX: u32 = 1;
@@ -48,6 +49,9 @@ pub(super) struct TaskIdentity {
     pub(super) user_mode: bool,
     pub(super) abi: Option<UserAbi>,
     pub(super) process_handle: Option<ProcessHandle>,
+    /// Immutable PID bound to this task slot. This is diagnostic identity
+    /// only; the scheduler's slot/current-owner state remains authoritative.
+    pub(super) process_id: Option<u64>,
     pub(super) console_session: ConsoleSessionHandle,
 }
 
@@ -67,6 +71,18 @@ impl TaskIdentity {
             self.console_session,
         ))
     }
+
+    /// Returns a definitive log identity when this record is complete.
+    ///
+    /// The outer `None` means a user record is incomplete and callers must
+    /// use the locked authority. `Some(None)` is a complete kernel-task
+    /// record, which conclusively has no user log identity.
+    pub(super) fn complete_user_log_ids(&self) -> Option<Option<(u64, u64)>> {
+        if !self.user_mode {
+            return Some(None);
+        }
+        Some(Some((self.process_id?, self.task_id?)))
+    }
 }
 
 struct PublishedIdentity {
@@ -76,6 +92,8 @@ struct PublishedIdentity {
     task_id: AtomicU64,
     /// `index << 32 | generation`, meaningful only under `FLAG_PROCESS`.
     process: AtomicU64,
+    /// Meaningful only under `FLAG_PROCESS_ID`.
+    process_id: AtomicU64,
     console: AtomicU64,
     flags: AtomicU32,
 }
@@ -86,6 +104,7 @@ impl PublishedIdentity {
             version: AtomicU64::new(0),
             task_id: AtomicU64::new(0),
             process: AtomicU64::new(0),
+            process_id: AtomicU64::new(0),
             console: AtomicU64::new(0),
             flags: AtomicU32::new(0),
         }
@@ -198,6 +217,9 @@ pub(super) fn publish(slot: usize, identity: TaskIdentity) {
     if identity.task_id.is_some() {
         flags |= FLAG_TASK_ID;
     }
+    if identity.process_id.is_some() {
+        flags |= FLAG_PROCESS_ID;
+    }
 
     // ORDERING: the odd version must be visible before any field changes, or a
     // reader could load a half-updated record and still see a stable version.
@@ -207,6 +229,8 @@ pub(super) fn publish(slot: usize, identity: TaskIdentity) {
     cell.task_id
         .store(identity.task_id.unwrap_or(0), Ordering::Relaxed);
     cell.process.store(process, Ordering::Relaxed);
+    cell.process_id
+        .store(identity.process_id.unwrap_or(0), Ordering::Relaxed);
     cell.console
         .store(identity.console_session.raw(), Ordering::Relaxed);
     cell.flags.store(flags, Ordering::Relaxed);
@@ -231,6 +255,12 @@ pub(super) fn clear(slot: usize) {
     cell.version
         .store(version.wrapping_add(1), Ordering::Relaxed);
     fence(Ordering::Release);
+    // Clearing every scalar while the record is odd makes a stale PID/task
+    // pair unrepresentable even to future maintenance code that adds flags.
+    cell.task_id.store(0, Ordering::Relaxed);
+    cell.process.store(0, Ordering::Relaxed);
+    cell.process_id.store(0, Ordering::Relaxed);
+    cell.console.store(0, Ordering::Relaxed);
     cell.flags.store(0, Ordering::Relaxed);
     cell.version
         .store(version.wrapping_add(2), Ordering::Release);
@@ -249,6 +279,7 @@ pub(super) fn read(slot: usize) -> Option<TaskIdentity> {
     let flags = cell.flags.load(Ordering::Relaxed);
     let task_id = cell.task_id.load(Ordering::Relaxed);
     let process = cell.process.load(Ordering::Relaxed);
+    let process_id = cell.process_id.load(Ordering::Relaxed);
     let console = cell.console.load(Ordering::Relaxed);
     // ORDERING: this fence keeps the field loads above from being reordered
     // after the version re-read that validates them.
@@ -261,6 +292,7 @@ pub(super) fn read(slot: usize) -> Option<TaskIdentity> {
         user_mode: flags & FLAG_USER_MODE != 0,
         abi: decode_abi(flags),
         process_handle: decode_process(process, flags),
+        process_id: (flags & FLAG_PROCESS_ID != 0).then_some(process_id),
         console_session: ConsoleSessionHandle::from_raw(console),
     })
 }
@@ -291,10 +323,15 @@ mod tests {
             user_mode: true,
             abi: Some(UserAbi::Linux),
             process_handle: Some(ProcessHandle::new(7, 9)),
+            process_id: Some(23),
             console_session: ConsoleSessionHandle::from_raw(5),
         };
         publish(slot, identity);
         assert_eq!(read(slot), Some(identity));
+        assert_eq!(
+            read(slot).and_then(|read| read.complete_user_log_ids()),
+            Some(Some((23, 41)))
+        );
         assert_eq!(
             read(slot).and_then(|read| read.user_binding()),
             Some((
@@ -306,6 +343,9 @@ mod tests {
         );
         clear(slot);
         assert_eq!(read(slot), None);
+        let cleared = &IDENTITIES[slot];
+        assert_eq!(cleared.task_id.load(Ordering::Relaxed), 0);
+        assert_eq!(cleared.process_id.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -318,12 +358,53 @@ mod tests {
                 user_mode: false,
                 abi: None,
                 process_handle: None,
+                process_id: None,
                 console_session: ConsoleSessionHandle::SYSTEM,
             },
         );
         let published = read(slot).expect("published identity");
         assert_eq!(published.task_id, Some(12));
         assert_eq!(published.user_binding(), None);
+        clear(slot);
+    }
+
+    #[test]
+    fn incomplete_user_or_odd_publication_requires_locked_log_lookup() {
+        let slot = 5;
+        clear(slot);
+        assert_eq!(
+            read(slot).and_then(|identity| identity.complete_user_log_ids()),
+            None
+        );
+
+        let incomplete = TaskIdentity {
+            task_id: Some(73),
+            user_mode: true,
+            abi: Some(UserAbi::Linux),
+            process_handle: Some(ProcessHandle::new(2, 4)),
+            process_id: None,
+            console_session: ConsoleSessionHandle::from_raw(7),
+        };
+        publish(slot, incomplete);
+        assert_eq!(
+            read(slot).and_then(|identity| identity.complete_user_log_ids()),
+            None
+        );
+
+        let complete = TaskIdentity {
+            process_id: Some(31),
+            ..incomplete
+        };
+        publish(slot, complete);
+        let cell = &IDENTITIES[slot];
+        let stable_version = cell.version.load(Ordering::Relaxed);
+        cell.version
+            .store(stable_version.wrapping_add(1), Ordering::Relaxed);
+        assert_eq!(
+            read(slot).and_then(|identity| identity.complete_user_log_ids()),
+            None
+        );
+        cell.version.store(stable_version, Ordering::Relaxed);
         clear(slot);
     }
 

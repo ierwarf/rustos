@@ -36,14 +36,14 @@ failure output as the primary debugging context.
 | `make -C driver-domains/linux dev-net` | compile only the cached DVM network package; no rootfs or artifact is created | `out/buildroot-output/target/` only | cold/stale configuration; run `build` first |
 | `cargo xtask kvm-smoke` | concurrently boot Linux DVM and RustOS with QEMU/KVM | `build/kvm/` | unavailable `/dev/kvm`, guest exit, missing readiness marker |
 | `cargo xtask kvm-smoke --timeout 30 --gui-dvm-surfaces --dvm-network-shmem --dvm-block-shmem --recovery-probe all` | after positive readiness, abruptly terminate and relaunch the Linux DVM and then reboot RustOS in a fresh QEMU process; require fresh authenticated control, display, storage, and service epochs rather than old log markers | `build/kvm/` and private DVM apertures | stale evidence, peer-ID drift, missing revoke/rebind, failed authenticated relay, missing fresh boot/service markers, guest exit, or deadline |
-| `cargo xtask kvm-smoke --timeout 30 --storage-dvm-only` | independently prove the virtual storage-DVM topology: authenticated peer readiness, exact signed geometry, first completion, and E2E backing-device flush without accepting unrelated UI/GPU markers | `build/kvm/` and private DVM block disk/aperture | missing block peer, malformed geometry/signature, absent completion/flush, guest exit, or deadline |
-| `RUSTOS_FAULTS='block.flush=fail' cargo xtask kvm-smoke --timeout 30 --storage-dvm-only --storage-dvm-expect-flush-fault` | prove the same storage-DVM topology independently observes a live generation-bound completion and then reports flush `DeviceFault` without emitting the E2E flush-success marker | `build/kvm/` and private DVM block disk/aperture | absent/competing fault rule, missing peer/geometry/completion/fault marker, impossible flush-success marker, guest exit, or deadline |
+| `cargo xtask kvm-smoke --timeout 30 --storage-dvm-only` | independently prove the virtual storage-DVM topology: authenticated peer readiness, exact signed geometry, first completion, and a generation-bound read-only media barrier without accepting unrelated UI/GPU markers; this is a transport-liveness check, not backing-image write-durability evidence | `build/kvm/` and private DVM block disk/aperture | missing block peer, malformed geometry/signature, absent completion/media barrier, guest exit, or deadline |
+| `RUSTOS_FAULTS='block.flush=fail' cargo xtask kvm-smoke --timeout 30 --storage-dvm-only --storage-dvm-expect-flush-fault` | prove the same storage-DVM topology independently observes a live generation-bound completion and then reports media-barrier `DeviceFault` without emitting the success marker | `build/kvm/` and private DVM block disk/aperture | absent/competing fault rule, missing peer/geometry/completion/fault marker, impossible media-barrier success marker, guest exit, or deadline |
 | `cargo xtask kvm-smoke --timeout 30 --gui-dvm-surfaces --physical-gpu <BDF> --gpu-firmware <TABLE>` | explicitly non-commercial physical-GPU lab run through the sealed device-profile registry; the current registered profile is AMD `1002:1900` with a relocated VFCT. QEMU 11.0 or newer uses IOMMUFD and VFIO PCI-BAR DMA-BUF mapping, executes the real `uiserver` GPU scene, and scans it out on the physical connector. Because this lane disables reset, an atomic boot-ID claim permits exactly one launch attempt per host boot. The runner never binds, unbinds, or resets the device and attaches no network device. `--physical-amdgpu`/`--amd-vfct` remain compatibility aliases | `build/kvm/` plus the physical display | repeated launch in one boot, unknown/ambiguous profile, unsafe VFIO/IOMMUFD/profile firmware state, inaccessible per-device cdev, unavailable VFIO BAR DMA-BUF support, inherited memlock below 4 GiB, reset-dirty driver probe, missing end-to-end GPU completion, or guest exit; never counts as supervised reset/revoke evidence |
 | `tools/prepare-physical-amdgpu-vfio-lab.sh [--check] [AMD_VFCT]` | prepare only GA403UM AMD `1002:1900` for the non-commercial physical-QEMU lab lane: require a pre-unbound or already-correct function, singleton IOMMU group, disabled reset and idle-D3, cleared bus mastering, limited cdev ACLs, inherited memlock, IOMMUFD probe, and physical dry-run; never unbinds, resets, starts QEMU, or admits another VFIO function | AMD `0000:65:00.0` VFIO binding and transient sysfs/ACL/rlimit state; `build/kvm/` dry-run inputs | wrong hardware, active host driver, another VFIO function, unsafe reset/DMA state, missing access, invalid VFCT, or failed dry-run |
 | `tools/configure-amdgpu-vfio-early-bind.sh [--apply]` | plan by default; with `--apply`, install the exact GA403UM `1002:1900` vfio-pci ID/idle-D3 policy, amdgpu blacklist, and initramfs module entry, then update initramfs without touching the live driver | `/etc/modprobe.d/rustos-amd-vfio.conf`, `/etc/initramfs-tools/modules`, initramfs | wrong/multiple AMD displays, conflicting policy, modified owned file, duplicate module entry, or initramfs failure |
 | `tools/remove-amdgpu-vfio-early-bind.sh [--apply]` | plan by default; with `--apply`, remove only the exact RustOS policy and exact initramfs module entry, update initramfs, and leave the live device untouched so amdgpu may bind on the next cold boot | same persistent files and initramfs | modified/foreign policy, duplicate entry, separate GRUB override, or initramfs failure |
 | `cargo xtask kvm-run` | start the interactive Linux-DVM display session from the existing signed RustOS image; require a kernel-timestamped WayClick first frame before the operator closes QEMU, then record real pointer ingress and healthy idle UI ticks | `build/kvm/` including a bounded `failure-summary.json` on startup/stall failure | stale RustOS image, unavailable GUI backend, `/dev/kvm`, missing acceptance evidence when the window closes, or a guest exit |
-| `cargo xtask kvm-run --build` | build/sign the RustOS image and then enter the exact same verified cached-DVM interactive path; this is the sole VS Code F5 command and uses the same outer-session readiness oracle | signed RustOS image plus `build/kvm/` | build/sign failure, invalid cached DVM, a real guest/stall failure, or missing acceptance evidence when the window closes |
+| `cargo xtask kvm-run --build --rustos-vcpus 8` | build/sign the RustOS image and then enter the exact same verified cached-DVM interactive path at the supported maximum eight-vCPU SMP topology; this is the sole VS Code F5 command and uses the same source-bound SMP and outer-session readiness oracles | signed RustOS image plus `build/kvm/` | build/sign failure, stale/missing SMP evidence, invalid cached DVM, a real guest/stall failure, or missing acceptance evidence when the window closes |
 | `cargo run -p rustos-hostd -- discover` | read host IOMMU groups | none | IOMMU unavailable or unreadable sysfs |
 | `cargo run -p rustos-hostd -- preflight --plan <file>` | require complete, non-protected IOMMU-group ownership and reject live `boot_vga`/connected DRM displays | none | incomplete group, declared host-critical BDF, or active L0 display |
 | `cargo run -p rustos-hostd -- preflight-physical --plan <file> --dvm-artifact-manifest <file> --device-policy <file> --qemu <file>` | before any VFIO bind, validate topology, live display, lease-contained reset scope, DMA-safe VFIO bind configuration, at least 4 GiB soft memlock, exact policy/QEMU/bundle, exact checksummed AMD VFCT/ATOM VBIOS, and an empty IOMMUFD IOAS allocate/destroy probe | none | unsafe/mismatched runtime input, reset scope escaping the lease, insufficient pinning budget, idle-D3 DMA window, missing/mismatched VBIOS, or unusable IOMMUFD ABI |
@@ -58,7 +58,10 @@ failure output as the primary debugging context.
 ## VS Code F5 contract
 
 The single F5 configuration, `RustOS: verified KVM desktop`, executes only
-`cargo xtask kvm-run --build`. The option builds and signs RustOS in-process,
+`cargo xtask kvm-run --build --rustos-vcpus 8`. The fixed eight-vCPU option
+keeps the interactive developer path on the maximum supported SMP topology and
+therefore requires the same fresh source-bound SMP evidence as any other
+multi-vCPU launch. The option builds and signs RustOS in-process,
 then the runner verifies the existing signed Linux DVM bundle before QEMU
 starts. The runner holds one nonblocking launch lock across build, shared-file
 preparation, both QEMU children, and final evidence, and assigns a
@@ -109,7 +112,8 @@ is never enabled in normal F5 or acceptance runs and is not success evidence.
 | `bash formal/run-sanitizers.sh --profile=all` | rebuild and execute registered critical/high host-testable Rust boundaries with the pinned address/thread instrumentation profiles | `build/formal/sanitizers/` | instrumented test failure, unsupported target, or per-target deadline |
 | `bash formal/run-abi-differential.sh` | compare compiled RustOS Linux/Windows ABI constants and layouts with native Linux and MinGW/Wine reference probes; permit only exact expiring divergences | `build/formal/abi-differential/` | missing reference tool, ABI drift, stale divergence, or probe failure |
 | `bash formal/run-recovery-scenarios.sh` | execute the bounded checkpoint, service-restart, and storage recovery matrix with exact source witnesses | `build/formal/recovery-scenarios/` | missing transition class, zero-test filter, failed terminal state, or deadline |
-| `bash formal/run-implementation-mutations.sh` | isolate the live source tree, inject registered critical/high implementation regressions, and require the exact witness to kill every mutant | `build/formal/implementation-mutations/` | survived mutant, compile-only rejection, missing source anchor, or zero-test witness |
+| `bash formal/run-implementation-mutations.sh --check` | validate every implementation-mutation row without invoking Cargo: a unique anchor uses `N`, an intentionally repeated anchor uses exact `N/M`, and duplicate mutation semantics are rejected | none | stale/ambiguous source anchor, wrong source/package path, duplicate ID, or duplicate mutation semantics |
+| `bash formal/run-implementation-mutations.sh [--only <id> ...]` | seal each resolved source offset/context/hash in an isolated live-tree copy, resolve one fully qualified libtest name, run that exact witness before and after injecting each registered critical/high regression, and require the witness itself to kill the mutant | `build/formal/implementation-mutations/` | survived mutant, compile-only or foreign-target rejection, source-seal drift, ambiguous/missing witness, or an exact witness that did not execute |
 | `cargo test -p contract-tests` | active DVM transport, user ABI, keyboard, boot-random, and fault-rule layout tests | `target/` | active contract/layout regression |
 | `git diff --check` | whitespace sanity | none | trailing whitespace/conflict marker |
 
@@ -269,13 +273,14 @@ fallback.
   unrelated GPU-scene/compositor acceptance requirements. It still requires
   RustOS boot/provenance, the authenticated DVM control handshake, both block
   readiness markers, the first completion, exact live geometry, and storaged's
-  end-to-end flush. It cannot be combined with UI, input, network, FPS, or
-  physical-GPU proof options.
+  generation-bound read-only media barrier. This is transport-liveness
+  evidence, not backing-image write-durability evidence. It cannot be combined
+  with UI, input, network, FPS, or physical-GPU proof options.
 - `--storage-dvm-expect-flush-fault` is valid only with
   `--storage-dvm-only` and exactly one active `block.flush=fail` rule. It
   replaces the positive E2E marker with the exact live-generation injection
   marker, retains peer/geometry/first-completion admission, and fails
-  immediately if a flush-success marker appears.
+  immediately if a media-barrier success marker appears.
 - The default marker is `rootd: core services ready, spawning initd via loaderd`;
   its kernel-stamped `product-root-core-ready` record is equivalent. Because
   the bounded observability channel may drop one contended record, the strictly
@@ -372,8 +377,9 @@ fallback.
   per-CPU-clockevent prerequisite is admitted. This option selects a test
   topology; it is not release evidence without the matching bounded run.
 - Iterative SMP debugging uses `bash formal/verify-smp-iteration.sh` followed
-  by `cargo xtask kvm-smoke --timeout 30 --rustos-vcpus <2|4|8>
-  --smp-iteration`. The exact-tree seal covers source conformance and the
+  by `cargo xtask kvm-smoke --timeout 30 --rustos-vcpus <1|2|4|8>
+  --smp-iteration --smp-ring3-qualification --smp-evidence-cohort <32hex>`.
+  The exact-tree seal covers source conformance and the
   bounded high-risk SMP model set. `--smp-iteration` rejects runs longer than
   30 seconds and cannot be combined with FPS, recovery, or physical-GPU
   acceptance. Its TLC sub-lane reuses only exact-input recent passes and runs

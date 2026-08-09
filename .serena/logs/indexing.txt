@@ -1,0 +1,2 @@
+tools/hostd/.hostd-qmp-test-575279-0/qmp.sock
+[Errno 6] No such device or address: '/home/hongii/rustos/tools/hostd/.hostd-qmp-test-575279-0/qmp.sock'

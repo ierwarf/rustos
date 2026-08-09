@@ -405,6 +405,7 @@ fn handle_launch(
             console_hosted: metadata.console_hosted,
             args: metadata.args,
             env: metadata.env,
+            private_smp_qualification: None,
         },
     )?;
     super::util::write_response(
@@ -559,27 +560,6 @@ pub(super) fn ensure_policy_launches(state: &mut BrokerState) -> bool {
         {
             continue;
         }
-        if pending_service_launch
-            && !entry.exec.starts_with("services/")
-            && (!state.ui_ready || !pending_desktop_launch)
-        {
-            continue;
-        }
-        if !state.ui_ready && entry.exec != UI_SERVER_EXEC_PATH {
-            continue;
-        }
-        if state.ui_ready
-            && pending_desktop_launch
-            && entry.exec.starts_with("services/")
-            && entry.exec != UI_SERVER_EXEC_PATH
-        {
-            continue;
-        }
-        if !entry.exec.starts_with("services/") && !super::spawn::loader_endpoint_ready() {
-            schedule_launch_retry(state, entry.desktop_file_id.as_str(), libc::ENOSYS);
-            continue;
-        }
-
         if entry.restart {
             if running_packages.contains(&entry.package_id) {
                 continue;
@@ -594,6 +574,29 @@ pub(super) fn ensure_policy_launches(state: &mut BrokerState) -> bool {
             &running_packages,
             &state.launched_once,
         ) {
+            continue;
+        }
+
+        let may_precede_ui_ready = launch_may_precede_ui_ready(&entry);
+        if pending_service_launch
+            && !entry.exec.starts_with("services/")
+            && !may_precede_ui_ready
+            && (!state.ui_ready || !pending_desktop_launch)
+        {
+            continue;
+        }
+        if !state.ui_ready && !may_precede_ui_ready {
+            continue;
+        }
+        if state.ui_ready
+            && pending_desktop_launch
+            && entry.exec.starts_with("services/")
+            && entry.exec != UI_SERVER_EXEC_PATH
+        {
+            continue;
+        }
+        if !entry.exec.starts_with("services/") && !super::spawn::loader_endpoint_ready() {
+            schedule_launch_retry(state, entry.desktop_file_id.as_str(), libc::ENOSYS);
             continue;
         }
 
@@ -643,6 +646,14 @@ pub(super) fn ensure_policy_launches(state: &mut BrokerState) -> bool {
     launched_any
 }
 
+fn launch_may_precede_ui_ready(entry: &LaunchEntry) -> bool {
+    entry.exec == UI_SERVER_EXEC_PATH
+        || matches!(
+            super::kvm_smp_qualification::qualification_contract_for_launch(entry),
+            Ok(Some(_))
+        )
+}
+
 fn launch_retry_backoff(errno: i32, consecutive_failures: u32) -> std::time::Duration {
     let base = if errno == libc::EAGAIN {
         STORAGE_NOT_READY_RETRY_BACKOFF
@@ -679,14 +690,57 @@ mod tests {
     use std::time::Instant;
 
     use super::{
-        launch_retry_backoff, read_request_progress, runtime_request_role_authorized,
-        PendingRuntimeClient, RequestReadProgress, RuntimePeerCredentials, OP_NOTIFY_READY,
-        OP_REQUEST_LAUNCH_PATH, OP_REQUEST_TERMINATE, OP_SNAPSHOT_RUNNING_PROGRAMS,
+        launch_may_precede_ui_ready, launch_retry_backoff, read_request_progress,
+        runtime_request_role_authorized, PendingRuntimeClient, RequestReadProgress,
+        RuntimePeerCredentials, OP_NOTIFY_READY, OP_REQUEST_LAUNCH_PATH, OP_REQUEST_TERMINATE,
+        OP_SNAPSHOT_RUNNING_PROGRAMS,
+    };
+    use crate::kvm_smp_qualification::{
+        inject_kvm_smp_qualification_launch, KvmSmpQualificationContract,
     };
     use crate::{
-        RuntimeRequest, MAX_LAUNCH_RETRY_BACKOFF, RETRY_BACKOFF, SERVICE_REQUEST_TIMEOUT,
-        STORAGE_NOT_READY_RETRY_BACKOFF,
+        LaunchEntry, RuntimeRequest, DEFAULT_USER_TASK_WEIGHT_MICROS, MAX_LAUNCH_RETRY_BACKOFF,
+        RETRY_BACKOFF, SERVICE_REQUEST_TIMEOUT, STORAGE_NOT_READY_RETRY_BACKOFF,
+        UI_SERVER_EXEC_PATH,
     };
+
+    #[test]
+    fn only_ui_bootstrap_or_private_smp_qualification_may_launch_before_ui_ready() {
+        let ordinary = LaunchEntry {
+            package_id: String::from("settings"),
+            desktop_file_id: String::from("settings.desktop"),
+            display_name: String::from("Settings"),
+            exec: String::from("apps/settings/settings.elf"),
+            runtime_deps: Vec::new(),
+            restart: false,
+            weight_micros: DEFAULT_USER_TASK_WEIGHT_MICROS,
+            logical_admin: false,
+            console_hosted: false,
+            args: Vec::new(),
+            env: Vec::new(),
+            private_smp_qualification: None,
+        };
+        assert!(!launch_may_precede_ui_ready(&ordinary));
+
+        let mut ui_server = ordinary.clone();
+        ui_server.exec = String::from(UI_SERVER_EXEC_PATH);
+        assert!(launch_may_precede_ui_ready(&ui_server));
+
+        let contract = KvmSmpQualificationContract {
+            workers: 1,
+            work_units: 1_000_000,
+            deadline_ms: 5_000,
+        };
+        let mut entries = Vec::new();
+        inject_kvm_smp_qualification_launch(&mut entries, Some(contract))
+            .expect("inject exact private launch");
+        let private = entries.pop().expect("private launch");
+        assert!(launch_may_precede_ui_ready(&private));
+
+        let mut forged = private;
+        forged.exec = ordinary.exec;
+        assert!(!launch_may_precede_ui_ready(&forged));
+    }
 
     #[test]
     fn partial_background_client_never_busy_waits_the_policy_loop() {

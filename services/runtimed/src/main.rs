@@ -12,6 +12,7 @@ use rustos_user_abi::syscall::{
 };
 
 mod catalog;
+mod kvm_smp_qualification;
 mod session;
 mod socket;
 mod spawn;
@@ -128,6 +129,10 @@ pub(crate) struct LaunchEntry {
     pub(crate) console_hosted: bool,
     pub(crate) args: Vec<String>,
     pub(crate) env: Vec<String>,
+    /// Set only by the private KVM contract injector. Signed catalog metadata
+    /// cannot manufacture qualification authority by copying reserved names.
+    pub(crate) private_smp_qualification:
+        Option<kvm_smp_qualification::KvmSmpQualificationContract>,
 }
 
 #[derive(Clone, Debug)]
@@ -173,6 +178,10 @@ pub(crate) struct BrokerState {
     pub(crate) launch_catalog_loaded: bool,
     pub(crate) launch_catalog_retry_after: Option<Instant>,
     pub(crate) launch_catalog_last_error: Option<i32>,
+    pub(crate) qualification_catalog_resolved: bool,
+    pub(crate) qualification_catalog_retry_after: Option<Instant>,
+    pub(crate) qualification_catalog_last_error: Option<i32>,
+    pub(crate) qualification_catalog_failures: u32,
 }
 
 pub(crate) fn boot_line(message: &str) {
@@ -240,6 +249,10 @@ fn main() {
         launch_catalog_loaded: false,
         launch_catalog_retry_after: None,
         launch_catalog_last_error: None,
+        qualification_catalog_resolved: false,
+        qualification_catalog_retry_after: None,
+        qualification_catalog_last_error: None,
+        qualification_catalog_failures: 0,
     };
     let mut runtime_connections = socket::RuntimeConnections::default();
     let _ = ensure_ui_bootstrap(&mut state);
@@ -248,9 +261,21 @@ fn main() {
         did_work |= drain_session_request_burst(session_endpoint, &mut state) != 0;
         did_work |= spawn::reap_children(&mut state);
         did_work |= ensure_ui_bootstrap(&mut state);
-        if state.ui_ready && !state.launch_catalog_loaded {
+        // The private SMP qualification workload validates scheduler and IPC
+        // progress, not display readiness.  Load the signed catalog after the
+        // synchronous UI bootstrap attempt even when the display provider
+        // later fails; `ensure_policy_launches` still keeps every ordinary
+        // service and desktop entry behind the UI-ready policy boundary.
+        if policy_catalog_load_due(state.launch_catalog_loaded) {
             did_work |= catalog::load_launch_catalog_into_state(&mut state);
         }
+        // The signed ordinary launch catalog is an early-system dependency;
+        // the private qualification contract is deliberately DVM-volume
+        // state. Reconcile the latter independently so an unavailable storage
+        // topology cannot hold the ordinary UI/application catalog hostage,
+        // while a requested qualification remains pending until an exact
+        // snapshot is visible.
+        did_work |= catalog::reconcile_kvm_smp_qualification_into_state(&mut state);
         // Converge signed launch policy before servicing another control
         // client. In particular, a background snapshot client must not delay
         // the first desktop launch after the catalog-ready transition.
@@ -261,6 +286,10 @@ fn main() {
         }
         thread::sleep(spawn::next_idle_delay(&state));
     }
+}
+
+fn policy_catalog_load_due(launch_catalog_loaded: bool) -> bool {
+    !launch_catalog_loaded
 }
 
 fn drain_session_request_burst(endpoint: Option<u64>, state: &mut BrokerState) -> usize {
@@ -339,9 +368,28 @@ fn require_post_ui_user_class() {
 #[cfg(test)]
 mod tests {
     use super::{
-        drain_bounded_requests, IDLE_POLL_INTERVAL, IPC_CONTROL_DRAIN_BUDGET,
-        SESSION_REQUEST_DRAIN_BUDGET,
+        drain_bounded_requests, policy_catalog_load_due, IDLE_POLL_INTERVAL,
+        IPC_CONTROL_DRAIN_BUDGET, SESSION_REQUEST_DRAIN_BUDGET,
     };
+
+    #[test]
+    fn policy_catalog_load_is_not_gated_by_ui_readiness() {
+        assert!(policy_catalog_load_due(false));
+        assert!(!policy_catalog_load_due(true));
+
+        let source = include_str!("main.rs");
+        let production_gate = concat!(
+            "if policy_catalog_load_due",
+            "(state.launch_catalog_loaded) {"
+        );
+        let forbidden_ui_gate = concat!(
+            "if state.ui_ready",
+            " && policy_catalog_load_due",
+            "(state.launch_catalog_loaded) {"
+        );
+        assert!(source.contains(production_gate));
+        assert!(!source.contains(forbidden_ui_gate));
+    }
 
     #[test]
     fn steady_supervisor_poll_is_bounded_without_two_millisecond_churn() {

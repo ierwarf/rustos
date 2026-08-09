@@ -16,6 +16,7 @@ const MAX_GPT_PARTITION_ENTRIES: usize = 4096;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StorageError {
     Interrupted,
+    WouldBlock,
     UnexpectedEof,
     WriteZero,
     InvalidInput,

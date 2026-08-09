@@ -13,8 +13,8 @@ use super::{
     AT_FDCWD_U32, AT_FDCWD_U64, BOOT_DIRECTORY_MODE_BITS, BOOT_FILE_MODE_BITS, DEFAULT_BLOCK_SIZE,
     DEVICE_FILE_MODE_BITS, DT_CHR, DT_DIR, DT_REG, EINVAL,
 };
-use storage_core::StorageError;
 use storage_fat::FatError;
+use vfsd::storage_io_error_to_linux_errno;
 
 pub(super) fn normalize_absolute_path(base_path: &str, path: &str) -> Result<String, i32> {
     let capacity = base_path
@@ -65,9 +65,7 @@ pub(super) fn map_fat_error(err: FatError) -> i32 {
     match err {
         fatfs::Error::NotFound => super::ENOENT,
         fatfs::Error::InvalidInput => EINVAL,
-        fatfs::Error::Io(StorageError::NotPresent) => super::ENODEV,
-        fatfs::Error::Io(StorageError::InvalidInput) => EINVAL,
-        fatfs::Error::Io(_) => super::EIO,
+        fatfs::Error::Io(error) => storage_io_error_to_linux_errno(error),
         _ => super::EIO,
     }
 }

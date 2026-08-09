@@ -1,10 +1,12 @@
 mod activation_batch;
 mod affinity;
 mod ipc_reply_recv;
+pub mod smp_qualification;
 
 pub use activation_batch::*;
 pub use affinity::*;
 pub use ipc_reply_recv::*;
+pub use smp_qualification::*;
 
 pub const SYS_RUSTOS_DEBUG_PRINT: u64 = 0x5255_0001;
 pub const SYS_RUSTOS_SPAWN_EXEC: u64 = 0x5255_0002;
@@ -114,6 +116,45 @@ pub const PRODUCT_MILESTONE_DISPLAY_READY: u64 = 2;
 pub const PRODUCT_MILESTONE_STORAGE_READY: u64 = 3;
 pub const PRODUCT_MILESTONE_EXECUTABLE_SNAPSHOT_SEALED: u64 = 4;
 pub const PRODUCT_MILESTONE_FIRST_FRAME: u64 = 5;
+/// Retained source-contract predicate for the versioned SMP qualification
+/// wire. The public validator lives in `smp_qualification`; this narrow shim
+/// keeps the registered mutation anchors co-located with the syscall ABI root.
+pub(super) const fn smp_qualification_bind_shape_contract(
+    args: &RustosSmpQualificationBindArgs,
+) -> bool {
+    args.abi_version == SMP_QUALIFICATION_BIND_ABI_VERSION
+        && args.flags == 0
+        && args.reserved0 == 0
+        && args.target_pid != 0
+        && matches!(args.workers, 1 | 2 | 4 | 8)
+        && args.reserved1 == 0
+        && args.work_units != 0
+        && args.work_units <= SMP_QUALIFICATION_MAX_WORK_UNITS
+        && args.deadline_ms != 0
+        && args.deadline_ms <= SMP_QUALIFICATION_MAX_DEADLINE_MS
+        && args.reserved2 == 0
+}
+
+/// Retained source-contract predicate for the kernel-stamped worker record.
+/// The public validator and its Kani proofs live in `smp_qualification`.
+pub(super) const fn smp_qualification_worker_shape_contract(
+    packed_worker: u64,
+    work_units: u64,
+    current_cpu: u32,
+) -> bool {
+    let (observed_cpu, worker_id) = unpack_smp_qualification_worker(packed_worker);
+    observed_cpu == current_cpu
+        && worker_id < SMP_QUALIFICATION_MAX_WORKERS
+        && work_units != 0
+        && work_units <= SMP_QUALIFICATION_MAX_WORK_UNITS
+}
+
+/// Kani reuses this exact source-contract bound so the registered duplicate
+/// mutation anchor remains explicit rather than being retargeted by a split.
+#[cfg(kani)]
+pub(super) const fn smp_qualification_worker_bound_kani_contract(worker_id: u32) -> bool {
+    worker_id < SMP_QUALIFICATION_MAX_WORKERS
+}
 /// Irreversibly removes the caller's base System scheduling admission.
 ///
 /// This is deliberately a self-demotion only: it never accepts a requested
@@ -561,6 +602,72 @@ pub struct WaitSetInterestWire {
     pub reserved0: u32,
     pub data: u64,
 }
+
+/// Validate the complete persistent epoll-interest wire shape before either
+/// ring0 or vfsd resolves provider and open-description authority.
+pub const fn waitset_interest_shape_valid(wire: &WaitSetInterestWire) -> bool {
+    wire.abi_version == WAITSET_ABI_VERSION
+        && wire.provider >= WAITSET_PROVIDER_VFSD
+        && wire.provider <= WAITSET_PROVIDER_MAX
+        && wire.flags == 0
+        && wire.target_fd <= u16::MAX as u64
+        && wire.object_id != 0
+        && wire.provider_epoch != 0
+        && wire.reserved0 == 0
+}
+
+#[cfg(kani)]
+mod waitset_interest_verification {
+    use super::*;
+
+    fn arbitrary_interest() -> WaitSetInterestWire {
+        WaitSetInterestWire {
+            abi_version: kani::any(),
+            provider: kani::any(),
+            flags: kani::any(),
+            target_fd: kani::any(),
+            object_id: kani::any(),
+            provider_epoch: kani::any(),
+            events: kani::any(),
+            reserved0: kani::any(),
+            data: kani::any(),
+        }
+    }
+
+    #[kani::proof]
+    fn accepted_waitset_interest_has_exact_bounded_shape() {
+        let wire = arbitrary_interest();
+        let accepted = waitset_interest_shape_valid(&wire);
+        kani::cover!(accepted);
+        kani::cover!(!accepted);
+        if accepted {
+            assert_eq!(wire.abi_version, WAITSET_ABI_VERSION);
+            assert!(wire.provider >= WAITSET_PROVIDER_VFSD);
+            assert!(wire.provider <= WAITSET_PROVIDER_MAX);
+            assert_eq!(wire.flags, 0);
+            assert!(wire.target_fd <= u16::MAX as u64);
+            assert_ne!(wire.object_id, 0);
+            assert_ne!(wire.provider_epoch, 0);
+            assert_eq!(wire.reserved0, 0);
+        }
+    }
+
+    #[kani::proof]
+    fn malformed_waitset_interest_is_never_accepted() {
+        let wire = arbitrary_interest();
+        let malformed = wire.abi_version != WAITSET_ABI_VERSION
+            || wire.provider < WAITSET_PROVIDER_VFSD
+            || wire.provider > WAITSET_PROVIDER_MAX
+            || wire.flags != 0
+            || wire.target_fd > u16::MAX as u64
+            || wire.object_id == 0
+            || wire.provider_epoch == 0
+            || wire.reserved0 != 0;
+        kani::assume(malformed);
+        kani::cover!(malformed);
+        assert!(!waitset_interest_shape_valid(&wire));
+    }
+}
 pub const VFS_IPC_PATH_CAPACITY: usize = 512;
 pub const VFS_IPC_REQUEST_PAYLOAD_CAPACITY: usize = 512;
 /// Fixed bytes preceding `VfsIpcResponse::payload` in the version-4 wire ABI.
@@ -615,9 +722,9 @@ pub const ROOTD_LEASE_STATE_RUNNING: u16 = 1;
 pub const ROOTD_LEASE_STATE_EXITED: u16 = 2;
 pub const ROOTD_LEASE_STATE_RESTART_PENDING: u16 = 3;
 pub const ROOTD_LEASE_STATE_FAILED: u16 = 4;
-pub const NETD_IPC_ABI_VERSION: u16 = 6;
+pub const NETD_IPC_ABI_VERSION: u16 = 7;
 pub const NETD_IPC_PAYLOAD_CAPACITY: usize = 32 * 1024;
-/// Netd v2 sends only the fixed header plus `payload_len`; the unused tail of
+/// Netd v7 sends only the fixed header plus `payload_len`; the unused tail of
 /// the in-memory transport buffer is not copied through the kernel IPC path.
 pub const NETD_IPC_REQUEST_HEADER_SIZE: usize =
     core::mem::size_of::<NetdIpcRequest>() - NETD_IPC_PAYLOAD_CAPACITY;
@@ -647,6 +754,12 @@ pub const NET_BROKER_OP_PACKET_LEASE_RESET: u16 = 0x8006;
 /// Atomically binds a connecting AF_UNIX open description to a kernel-minted
 /// channel generation before netd publishes the accepted peer.
 pub const NET_BROKER_OP_UNIX_CONNECT_BIND: u16 = 0x8010;
+/// Prepare the one AF_INET stream socket descriptor that is attached to the
+/// current netd reply.  This is deliberately a prepare operation: it never
+/// installs an fd into the target process before that caller accepts the
+/// exact reply capability.
+pub const NET_BROKER_OP_PREPARE_SOCKET_PUBLICATION: u16 = 0x8011;
+pub const NET_BROKER_SOCKET_PUBLICATION_VERSION: u16 = 1;
 /// Kernel-only acknowledgement that retires one completed replay-safe
 /// dup/close operation from netd's bounded reconciliation table.
 pub const NETD_IPC_OP_REF_ACK: u16 = 0x8004;
@@ -1949,6 +2062,165 @@ pub struct RustosNetBrokerArgs {
     pub arg5: u64,
 }
 
+/// Versioned, address-free payload for
+/// [`NET_BROKER_OP_PREPARE_SOCKET_PUBLICATION`].
+///
+/// `reply_cap` is the exact live endpoint reply received by netd, while
+/// `caller_pid` is the process that will take the descriptor.  The outer
+/// broker record names the same caller and points to this record through
+/// `arg0`; all remaining outer arguments stay zero.  This prevents a service
+/// from publishing a socket into an arbitrary process or from reusing a
+/// reply capability for a different caller.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NetBrokerPrepareSocketPublication {
+    pub version: u16,
+    pub reserved0: u16,
+    pub reserved1: u32,
+    pub reply_cap: u64,
+    pub caller_pid: u64,
+    pub socket_token: u64,
+    pub domain: u64,
+    pub socket_type: u64,
+    pub protocol: u64,
+    pub reserved2: u64,
+    pub reserved3: u64,
+}
+
+// These are the fixed x86_64 Linux socket ABI values carried by this wire.
+// `syscall` is also compiled without the optional Linux state module, so keep
+// the shape predicate available there and verify the values against that
+// module whenever the compatibility feature is selected.
+const NET_BROKER_PUBLICATION_AF_INET: u64 = 2;
+const NET_BROKER_PUBLICATION_SOCK_STREAM: u64 = 1;
+const NET_BROKER_PUBLICATION_SOCK_TYPE_MASK: u64 = 0xf;
+const NET_BROKER_PUBLICATION_SOCK_NONBLOCK: u64 = 0o4000;
+const NET_BROKER_PUBLICATION_SOCK_CLOEXEC: u64 = 0o2000000;
+const NET_BROKER_PUBLICATION_ALLOWED_SOCKET_FLAGS: u64 =
+    NET_BROKER_PUBLICATION_SOCK_NONBLOCK | NET_BROKER_PUBLICATION_SOCK_CLOEXEC;
+
+#[cfg(feature = "linux-compat-state")]
+const _: () = {
+    assert!(NET_BROKER_PUBLICATION_AF_INET == crate::linux::AF_INET);
+    assert!(NET_BROKER_PUBLICATION_SOCK_STREAM == crate::linux::SOCK_STREAM);
+    assert!(NET_BROKER_PUBLICATION_SOCK_TYPE_MASK == crate::linux::SOCK_TYPE_MASK);
+    assert!(NET_BROKER_PUBLICATION_SOCK_NONBLOCK == crate::linux::SOCK_NONBLOCK);
+    assert!(NET_BROKER_PUBLICATION_SOCK_CLOEXEC == crate::linux::SOCK_CLOEXEC);
+};
+
+/// Returns whether a reply-bound socket-publication record has the intrinsic,
+/// versioned AF_INET stream shape.  The broker separately binds `caller_pid`
+/// to the outer request's process identity and the reply capability to netd's
+/// live endpoint owner.
+pub const fn net_broker_socket_publication_shape_valid(
+    publication: &NetBrokerPrepareSocketPublication,
+) -> bool {
+    let base_type = publication.socket_type & NET_BROKER_PUBLICATION_SOCK_TYPE_MASK;
+    let unknown_socket_bits = publication.socket_type
+        & !(NET_BROKER_PUBLICATION_SOCK_TYPE_MASK | NET_BROKER_PUBLICATION_ALLOWED_SOCKET_FLAGS);
+    publication.version == NET_BROKER_SOCKET_PUBLICATION_VERSION
+        && publication.reserved0 == 0
+        && publication.reserved1 == 0
+        && publication.reserved2 == 0
+        && publication.reserved3 == 0
+        && publication.reply_cap != 0
+        && publication.caller_pid != 0
+        && publication.socket_token != 0
+        && publication.domain == NET_BROKER_PUBLICATION_AF_INET
+        && base_type == NET_BROKER_PUBLICATION_SOCK_STREAM
+        && unknown_socket_bits == 0
+}
+
+#[cfg(kani)]
+mod net_broker_socket_publication_verification {
+    use super::*;
+
+    fn arbitrary_publication() -> NetBrokerPrepareSocketPublication {
+        NetBrokerPrepareSocketPublication {
+            version: kani::any(),
+            reserved0: kani::any(),
+            reserved1: kani::any(),
+            reply_cap: kani::any(),
+            caller_pid: kani::any(),
+            socket_token: kani::any(),
+            domain: kani::any(),
+            socket_type: kani::any(),
+            protocol: kani::any(),
+            reserved2: kani::any(),
+            reserved3: kani::any(),
+        }
+    }
+
+    #[kani::proof]
+    fn accepted_socket_publication_has_every_exact_intrinsic_property() {
+        let publication = arbitrary_publication();
+        let accepted = net_broker_socket_publication_shape_valid(&publication);
+        kani::cover!(accepted);
+        if accepted {
+            assert_eq!(publication.version, NET_BROKER_SOCKET_PUBLICATION_VERSION);
+            assert_eq!(publication.reserved0, 0);
+            assert_eq!(publication.reserved1, 0);
+            assert_eq!(publication.reserved2, 0);
+            assert_eq!(publication.reserved3, 0);
+            assert_ne!(publication.reply_cap, 0);
+            assert_ne!(publication.caller_pid, 0);
+            assert_ne!(publication.socket_token, 0);
+            assert_eq!(publication.domain, NET_BROKER_PUBLICATION_AF_INET);
+            assert_eq!(
+                publication.socket_type & NET_BROKER_PUBLICATION_SOCK_TYPE_MASK,
+                NET_BROKER_PUBLICATION_SOCK_STREAM
+            );
+            assert_eq!(
+                publication.socket_type
+                    & !(NET_BROKER_PUBLICATION_SOCK_TYPE_MASK
+                        | NET_BROKER_PUBLICATION_ALLOWED_SOCKET_FLAGS),
+                0
+            );
+        }
+    }
+
+    #[kani::proof]
+    fn malformed_socket_publication_intrinsic_field_is_rejected() {
+        let publication = arbitrary_publication();
+        let malformed = publication.version != NET_BROKER_SOCKET_PUBLICATION_VERSION
+            || publication.reserved0 != 0
+            || publication.reserved1 != 0
+            || publication.reserved2 != 0
+            || publication.reserved3 != 0
+            || publication.reply_cap == 0
+            || publication.caller_pid == 0
+            || publication.socket_token == 0
+            || publication.domain != NET_BROKER_PUBLICATION_AF_INET
+            || publication.socket_type & NET_BROKER_PUBLICATION_SOCK_TYPE_MASK
+                != NET_BROKER_PUBLICATION_SOCK_STREAM
+            || publication.socket_type
+                & !(NET_BROKER_PUBLICATION_SOCK_TYPE_MASK
+                    | NET_BROKER_PUBLICATION_ALLOWED_SOCKET_FLAGS)
+                != 0;
+        kani::assume(malformed);
+        kani::cover!(publication.version != NET_BROKER_SOCKET_PUBLICATION_VERSION);
+        kani::cover!(publication.reserved0 != 0);
+        kani::cover!(publication.reserved1 != 0);
+        kani::cover!(publication.reserved2 != 0);
+        kani::cover!(publication.reserved3 != 0);
+        kani::cover!(publication.reply_cap == 0);
+        kani::cover!(publication.caller_pid == 0);
+        kani::cover!(publication.socket_token == 0);
+        kani::cover!(publication.domain != NET_BROKER_PUBLICATION_AF_INET);
+        kani::cover!(
+            publication.socket_type & NET_BROKER_PUBLICATION_SOCK_TYPE_MASK
+                != NET_BROKER_PUBLICATION_SOCK_STREAM
+        );
+        kani::cover!(
+            publication.socket_type
+                & !(NET_BROKER_PUBLICATION_SOCK_TYPE_MASK
+                    | NET_BROKER_PUBLICATION_ALLOWED_SOCKET_FLAGS)
+                != 0
+        );
+        assert!(!net_broker_socket_publication_shape_valid(&publication));
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NetdIpcRequest {
@@ -1971,7 +2243,9 @@ pub struct NetdIpcRequest {
     pub arg5: u64,
     pub operation_hi: u64,
     pub operation_lo: u64,
-    pub reserved0: u64,
+    /// Caller-owned absolute `CLOCK_MONOTONIC` deadline in nanoseconds.
+    /// Zero is reserved for an uninitialized request and is rejected by netd.
+    pub deadline_ns: u64,
     pub socket_token: u64,
     pub status_flags: u64,
     pub payload: [u8; NETD_IPC_PAYLOAD_CAPACITY],
@@ -1999,7 +2273,7 @@ impl Default for NetdIpcRequest {
             arg5: 0,
             operation_hi: 0,
             operation_lo: 0,
-            reserved0: 0,
+            deadline_ns: 0,
             socket_token: 0,
             status_flags: 0,
             payload: [0; NETD_IPC_PAYLOAD_CAPACITY],
@@ -2850,289 +3124,6 @@ impl Default for LinuxUtsName {
 }
 
 #[cfg(test)]
-mod syscall_tests {
-    use core::mem::size_of;
-
-    use super::{
-        CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, IPC_ABI_VERSION,
-        IPC_MAX_INLINE_BYTES, IPC_SERVICE_DEVMGRD, IPC_SERVICE_INITD, IPC_SERVICE_PROCD,
-        IPC_SERVICE_ROOTD, IPC_SERVICE_SESSIOND, LINUX_RLIMIT_SIZE, LINUX_SIGACTION_SIZE,
-        LINUX_STATX_SIZE, LINUX_TIMESPEC_SIZE, LINUX_UTSNAME_SIZE, LOADER_OP_ACTIVATE,
-        LOADER_OP_EXEC_TARGET, LOADER_OP_SPAWN_EXEC, LinuxRlimit, LinuxSigActionWire,
-        LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse, LinuxTimespecWire, LinuxUtsName,
-        LoaderSpawnRequest, NETD_IPC_PAYLOAD_CAPACITY, NETD_IPC_REQUEST_HEADER_SIZE,
-        NETD_IPC_RESPONSE_HEADER_SIZE, NetdIpcRequest, NetdIpcResponse,
-        PROCD_SIGACTION_SA_NOCLDSTOP, PROCD_SIGCHLD_EVENT_EXIT, PROCD_SIGCHLD_EVENT_MASK,
-        RustosIpcValidateServiceOwnerArgs, STORAGED_BULK_READ_PAYLOAD_CAPACITY,
-        STORAGED_BULK_READ_RESPONSE_HEADER_BYTES, SYSCALL_OFFLOAD_ABI_VERSION,
-        SYSCALL_OFFLOAD_OP_LINUX_ARCH_PRCTL_POLICY, SYSCALL_OFFLOAD_OP_LINUX_MPROTECT,
-        SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET, SYSCALL_OFFLOAD_OP_LINUX_STATX,
-        SYSCALL_OFFLOAD_PATH_CAPACITY, SYSCALL_OFFLOAD_PAYLOAD_CAPACITY, StoragedBulkReadResponse,
-        VFS_EXECUTABLE_SNAPSHOT_ABI_VERSION, VFS_EXECUTABLE_SNAPSHOT_OP_OPEN, VFS_IPC_ABI_VERSION,
-        VFS_IPC_OP_OPENAT, VFS_IPC_PAYLOAD_CAPACITY, VFS_IPC_RESPONSE_HEADER_BYTES,
-        VfsExecutableSnapshotRequest, VfsExecutableSnapshotResponse, VfsIpcRequest, VfsIpcResponse,
-        WAITSET_ABI_VERSION, WAITSET_PROVIDER_VFSD, WaitSetSignalBrokerArgs,
-        identity_is_exact_sender, loader_service_role_allows_operation,
-        procd_sigchld_is_suppressed, waitset_signal_shape_valid,
-    };
-
-    #[test]
-    fn nocldstop_suppresses_only_nonterminal_child_state_changes() {
-        let stop_or_continue = PROCD_SIGCHLD_EVENT_MASK & !PROCD_SIGCHLD_EVENT_EXIT;
-        assert!(procd_sigchld_is_suppressed(
-            stop_or_continue,
-            PROCD_SIGACTION_SA_NOCLDSTOP
-        ));
-        assert!(!procd_sigchld_is_suppressed(
-            stop_or_continue | PROCD_SIGCHLD_EVENT_EXIT,
-            PROCD_SIGACTION_SA_NOCLDSTOP
-        ));
-        assert!(!procd_sigchld_is_suppressed(stop_or_continue, 0));
-        assert!(!procd_sigchld_is_suppressed(
-            0,
-            PROCD_SIGACTION_SA_NOCLDSTOP
-        ));
-    }
-
-    #[test]
-    fn waitset_signal_requires_the_exact_public_wire_shape() {
-        let valid = WaitSetSignalBrokerArgs {
-            abi_version: WAITSET_ABI_VERSION,
-            provider: WAITSET_PROVIDER_VFSD,
-            flags: 0,
-            object_id: 0xfeed_beef,
-            generation: 1,
-            reserved0: 0,
-        };
-        assert!(waitset_signal_shape_valid(&valid));
-        assert!(!waitset_signal_shape_valid(&WaitSetSignalBrokerArgs {
-            object_id: 0,
-            ..valid
-        }));
-        assert!(!waitset_signal_shape_valid(&WaitSetSignalBrokerArgs {
-            generation: 0,
-            ..valid
-        }));
-        assert!(!waitset_signal_shape_valid(&WaitSetSignalBrokerArgs {
-            provider: 0,
-            ..valid
-        }));
-        assert!(!waitset_signal_shape_valid(&WaitSetSignalBrokerArgs {
-            reserved0: 1,
-            ..valid
-        }));
-    }
-
-    #[test]
-    fn commercial_response_envelope_matches_exact_request_and_bounds_nested_fields() {
-        let mut request = CommercialMaxProtocolRequest::default();
-        request.header.protocol = 7;
-        request.header.op = 3;
-        request.header.service_id = 11;
-        request.header.subject_pid = 13;
-        request.header.subject_tid = 17;
-        request.header.ticket = 19;
-        let mut response = CommercialMaxProtocolResponse {
-            header: request.header,
-            ..CommercialMaxProtocolResponse::default()
-        };
-        assert!(response.is_valid_envelope_for(&request));
-
-        response.header.ticket += 1;
-        assert!(!response.is_valid_envelope_for(&request));
-        response.header = request.header;
-        response.descriptor_count = 1;
-        response.descriptors[0].name_len = (response.descriptors[0].name.len() + 1) as u16;
-        assert!(!response.is_valid_envelope_for(&request));
-        response.descriptors[0].name_len = 0;
-        response.capability.reserved1 = 1;
-        assert!(!response.is_valid_envelope_for(&request));
-    }
-
-    #[test]
-    fn commercial_request_envelope_rejects_reserved_flags_and_oversized_lengths() {
-        let mut request = CommercialMaxProtocolRequest::default();
-        assert!(request.has_valid_envelope());
-        request.header.flags = 1;
-        assert!(!request.has_valid_envelope());
-        request.header.flags = 0;
-        request.payload_len = (request.payload.len() + 1) as u32;
-        assert!(!request.has_valid_envelope());
-        request.payload_len = 0;
-        request.path_len = (request.path.len() + 1) as u32;
-        assert!(!request.has_valid_envelope());
-    }
-
-    #[test]
-    fn service_subject_identity_is_never_a_zero_or_foreign_wildcard() {
-        let mut request = CommercialMaxProtocolRequest::default();
-        assert!(!request.subject_is_exact_sender(17, 19));
-        request.header.subject_pid = 17;
-        request.header.subject_tid = 19;
-        assert!(request.subject_is_exact_sender(17, 19));
-        assert!(!request.subject_is_exact_sender(17, 20));
-        assert!(!identity_is_exact_sender(17, 0, 17, 0));
-    }
-
-    #[test]
-    fn loader_requester_identity_is_bound_to_the_kernel_sender() {
-        let mut request = LoaderSpawnRequest::default();
-        assert!(!request.requester_is_exact_sender(23));
-        request.requester_pid = 23;
-        assert!(request.requester_is_exact_sender(23));
-        assert!(!request.requester_is_exact_sender(29));
-
-        let owner = RustosIpcValidateServiceOwnerArgs {
-            abi_version: IPC_ABI_VERSION,
-            service_id: IPC_SERVICE_DEVMGRD,
-            process_id: 23,
-            ..RustosIpcValidateServiceOwnerArgs::default()
-        };
-        assert_eq!(owner.flags, 0);
-        assert_eq!(owner.reserved0, 0);
-        assert_eq!(owner.reserved1, 0);
-    }
-
-    #[test]
-    fn privileged_loader_operations_have_an_explicit_service_role_matrix() {
-        for service_id in [IPC_SERVICE_ROOTD, IPC_SERVICE_INITD, IPC_SERVICE_SESSIOND] {
-            assert!(loader_service_role_allows_operation(
-                LOADER_OP_SPAWN_EXEC,
-                service_id,
-            ));
-        }
-        assert!(!loader_service_role_allows_operation(
-            LOADER_OP_SPAWN_EXEC,
-            IPC_SERVICE_PROCD,
-        ));
-        assert!(loader_service_role_allows_operation(
-            LOADER_OP_EXEC_TARGET,
-            IPC_SERVICE_PROCD,
-        ));
-        assert!(!loader_service_role_allows_operation(
-            LOADER_OP_EXEC_TARGET,
-            IPC_SERVICE_ROOTD,
-        ));
-        assert!(!loader_service_role_allows_operation(
-            LOADER_OP_ACTIVATE,
-            IPC_SERVICE_ROOTD,
-        ));
-    }
-
-    #[test]
-    fn storaged_bulk_read_response_fills_one_exact_inline_message() {
-        assert_eq!(
-            core::mem::offset_of!(StoragedBulkReadResponse, payload),
-            STORAGED_BULK_READ_RESPONSE_HEADER_BYTES
-        );
-        assert_eq!(
-            STORAGED_BULK_READ_PAYLOAD_CAPACITY,
-            IPC_MAX_INLINE_BYTES - STORAGED_BULK_READ_RESPONSE_HEADER_BYTES
-        );
-        assert_eq!(size_of::<StoragedBulkReadResponse>(), IPC_MAX_INLINE_BYTES);
-    }
-
-    #[test]
-    fn storaged_bulk_read_response_binds_the_complete_request_header() {
-        let mut request = CommercialMaxProtocolRequest::default();
-        request.header.protocol = 5;
-        request.header.op = 12;
-        request.header.ticket = 19;
-        let mut response = StoragedBulkReadResponse {
-            header: request.header,
-            ..StoragedBulkReadResponse::default()
-        };
-        assert!(response.is_valid_envelope_for(&request));
-
-        response.header.ticket += 1;
-        assert!(!response.is_valid_envelope_for(&request));
-        response.header = request.header;
-        response.reserved0 = 1;
-        assert!(!response.is_valid_envelope_for(&request));
-        response.reserved0 = 0;
-        response.payload_len = (response.payload.len() + 1) as u32;
-        assert!(!response.is_valid_envelope_for(&request));
-    }
-
-    #[test]
-    fn statx_offload_messages_fit_inline_ipc_v1() {
-        assert!(size_of::<LinuxSyscallOffloadRequest>() <= IPC_MAX_INLINE_BYTES);
-        assert!(size_of::<LinuxSyscallOffloadResponse>() <= IPC_MAX_INLINE_BYTES);
-        assert!(size_of::<VfsIpcRequest>() <= IPC_MAX_INLINE_BYTES);
-        assert!(size_of::<VfsExecutableSnapshotRequest>() <= IPC_MAX_INLINE_BYTES);
-        assert!(size_of::<VfsExecutableSnapshotResponse>() <= IPC_MAX_INLINE_BYTES);
-        assert_eq!(
-            core::mem::offset_of!(VfsIpcResponse, payload),
-            VFS_IPC_RESPONSE_HEADER_BYTES
-        );
-        assert_eq!(size_of::<VfsIpcResponse>(), IPC_MAX_INLINE_BYTES);
-        assert_eq!(
-            VFS_IPC_PAYLOAD_CAPACITY,
-            IPC_MAX_INLINE_BYTES - VFS_IPC_RESPONSE_HEADER_BYTES
-        );
-        assert_eq!(LINUX_STATX_SIZE, 0x100);
-        assert_eq!(SYSCALL_OFFLOAD_PATH_CAPACITY, 256);
-        assert_eq!(SYSCALL_OFFLOAD_PAYLOAD_CAPACITY, 0x200);
-        assert_eq!(LINUX_RLIMIT_SIZE, size_of::<LinuxRlimit>());
-        assert_eq!(LINUX_TIMESPEC_SIZE, size_of::<LinuxTimespecWire>());
-        assert_eq!(LINUX_SIGACTION_SIZE, size_of::<LinuxSigActionWire>());
-        assert_eq!(LINUX_UTSNAME_SIZE, size_of::<LinuxUtsName>());
-    }
-
-    #[test]
-    fn statx_offload_defaults_are_valid_v1_headers() {
-        let request = LinuxSyscallOffloadRequest::default();
-        assert_eq!(request.version, SYSCALL_OFFLOAD_ABI_VERSION);
-        assert_eq!(request.op, SYSCALL_OFFLOAD_OP_LINUX_STATX);
-        assert_eq!(request.reserved0, 0);
-
-        let response = LinuxSyscallOffloadResponse::default();
-        assert_eq!(response.version, SYSCALL_OFFLOAD_ABI_VERSION);
-        assert_eq!(response.op, SYSCALL_OFFLOAD_OP_LINUX_STATX);
-        assert_eq!(response.reserved0, 0);
-        assert_eq!(response.payload_len, 0);
-
-        let vfs_request = VfsIpcRequest::default();
-        assert_eq!(vfs_request.version, VFS_IPC_ABI_VERSION);
-        assert_eq!(vfs_request.op, VFS_IPC_OP_OPENAT);
-
-        let vfs_response = VfsIpcResponse::default();
-        assert_eq!(vfs_response.version, VFS_IPC_ABI_VERSION);
-        assert_eq!(vfs_response.op, VFS_IPC_OP_OPENAT);
-        assert_eq!(vfs_response.reserved0, 0);
-
-        let snapshot_request = VfsExecutableSnapshotRequest::default();
-        assert_eq!(
-            snapshot_request.version,
-            VFS_EXECUTABLE_SNAPSHOT_ABI_VERSION
-        );
-        assert_eq!(snapshot_request.op, VFS_EXECUTABLE_SNAPSHOT_OP_OPEN);
-    }
-
-    #[test]
-    fn socket_poll_owns_a_unique_offload_operation() {
-        assert_ne!(
-            SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET,
-            SYSCALL_OFFLOAD_OP_LINUX_MPROTECT
-        );
-        const {
-            assert!(
-                SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET > SYSCALL_OFFLOAD_OP_LINUX_ARCH_PRCTL_POLICY
-            );
-        }
-    }
-
-    #[test]
-    fn netd_v5_wire_headers_exclude_the_reserved_payload_tail() {
-        assert_eq!(NETD_IPC_REQUEST_HEADER_SIZE, 136);
-        assert_eq!(NETD_IPC_RESPONSE_HEADER_SIZE, 32);
-        assert_eq!(
-            size_of::<NetdIpcRequest>(),
-            NETD_IPC_REQUEST_HEADER_SIZE + NETD_IPC_PAYLOAD_CAPACITY
-        );
-        assert_eq!(
-            size_of::<NetdIpcResponse>(),
-            NETD_IPC_RESPONSE_HEADER_SIZE + NETD_IPC_PAYLOAD_CAPACITY
-        );
-    }
-}
+mod smp_qualification_tests;
+#[cfg(test)]
+mod syscall_tests;

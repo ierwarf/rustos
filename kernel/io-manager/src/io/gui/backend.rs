@@ -5,7 +5,6 @@ use boot_protocol::FramebufferInfo;
 
 use super::framebuffer::{Framebuffer, FramebufferRect, build_framebuffer};
 use super::{GuiDisplayInfo, GuiPresentOutcome};
-use crate::memory::paging;
 use crate::sync::KernelWaitLock;
 
 const ENABLE_FRAMEBUFFER_WRITE_COMBINE: bool = true;
@@ -46,8 +45,8 @@ impl DisplayBackend {
         if !framebuffer_info_is_valid(info) {
             return false;
         }
-        if ENABLE_FRAMEBUFFER_WRITE_COMBINE {
-            mark_framebuffer_write_combine(info);
+        if ENABLE_FRAMEBUFFER_WRITE_COMBINE && !mark_framebuffer_write_combine(info) {
+            return false;
         }
         self.generation = next_display_generation(self.generation);
         self.instance = BackendInstance::Framebuffer(FramebufferDisplayBackend {
@@ -201,13 +200,8 @@ fn display_present_faulted() -> bool {
     false
 }
 
-fn mark_framebuffer_write_combine(info: FramebufferInfo) {
-    let _ = crate::memory::paging::update_direct_map_range_flags(
-        info.addr,
-        info.size as usize,
-        paging::WRITE_COMBINE_BIT,
-        x86_64::structures::paging::PageTableFlags::empty(),
-    );
+fn mark_framebuffer_write_combine(info: FramebufferInfo) -> bool {
+    !crate::driver::mmio::map_write_combining(info.addr, info.size as usize).is_null()
 }
 
 fn framebuffer_info_is_valid(info: FramebufferInfo) -> bool {

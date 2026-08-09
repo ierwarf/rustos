@@ -43,6 +43,21 @@ harnesses = [
 depends_on = []
 
 [[proof]]
+id = "ipc-reply-deadline-observation"
+kind = "kani"
+package = "rustos-user-abi"
+source = "libs/rustos-user-abi/src/deadline.rs"
+symbol = "reply_observation_allows_publication"
+formal_model = "ipc-reply-deadline/IpcReplyDeadline"
+scope = "exhaustive pre-take and post-take expiry partition for fail-closed reply publication"
+harnesses = [
+  "accepted_reply_observation_has_two_unexpired_samples",
+  "pre_expired_reply_observation_never_publishes",
+  "expiry_during_reply_take_never_publishes",
+]
+depends_on = []
+
+[[proof]]
 id = "ipc-reply-recv-wire"
 kind = "kani"
 package = "rustos-user-abi"
@@ -69,6 +84,20 @@ harnesses = [
   "accepted_ticket_is_nonzero_and_canonical",
   "every_nonzero_ticket_round_trips",
   "either_zero_field_is_rejected",
+]
+depends_on = []
+
+[[proof]]
+id = "netd-prepared-socket-publication-wire"
+kind = "kani"
+package = "rustos-user-abi"
+source = "libs/rustos-user-abi/src/syscall.rs"
+symbol = "net_broker_socket_publication_shape_valid"
+formal_model = "ipc-reply-deadline/IpcReplyDeadline"
+scope = "exhaustive intrinsic version, reserved, nonzero authority, AF_INET stream, and socket-flag admission for reply-bound publication"
+harnesses = [
+  "accepted_socket_publication_has_every_exact_intrinsic_property",
+  "malformed_socket_publication_intrinsic_field_is_rejected",
 ]
 depends_on = []
 
@@ -107,6 +136,33 @@ lemmas = [
 depends_on = ["runtime-response"]
 
 [[proof]]
+id = "smp-qualification-bind-wire"
+kind = "kani"
+package = "rustos-user-abi"
+source = "libs/rustos-user-abi/src/syscall/smp_qualification.rs"
+symbol = "smp_qualification_bind_shape_valid"
+formal_model = "smp-ring3-qualification/SmpRing3Qualification"
+scope = "exhaustive closed versioned SMP qualification bind ABI: reserved words, exact topology, bounded work, target PID, and finite deadline"
+harnesses = [
+  "smp_qualification_bind_shape_is_closed_and_bounded",
+]
+depends_on = []
+
+[[proof]]
+id = "smp-qualification-worker-wire"
+kind = "kani"
+package = "rustos-user-abi"
+source = "libs/rustos-user-abi/src/syscall/smp_qualification.rs"
+symbol = "smp_qualification_worker_shape_valid"
+formal_model = "smp-ring3-qualification/SmpRing3Qualification"
+scope = "exhaustive packed RDTSCP CPU and worker round trip plus exact admitted worker and work intrinsic bounds"
+harnesses = [
+  "packed_worker_round_trips_every_cpu_and_worker_word",
+  "admitted_worker_has_every_exact_intrinsic_bound",
+]
+depends_on = []
+
+[[proof]]
 id = "tlb-exact-ack"
 kind = "verus"
 proof_file = "formal/verus-proof-kernel/tlb_acknowledgement.rs"
@@ -118,6 +174,20 @@ scope = "unbounded target-index partition for exact-generation acknowledgement a
 lemmas = [
   "complete_requires_an_exact_acknowledgement_for_each_target",
   "mismatched_acknowledgement_shape_cannot_admit_reclaim",
+]
+depends_on = []
+
+[[proof]]
+id = "waitset-interest-wire"
+kind = "kani"
+package = "rustos-user-abi"
+source = "libs/rustos-user-abi/src/syscall.rs"
+symbol = "waitset_interest_shape_valid"
+formal_model = "userspace-wait-set/UserspaceWaitSet"
+scope = "exhaustive persistent epoll-interest envelope bounds before provider and open-description authority lookup"
+harnesses = [
+  "accepted_waitset_interest_has_exact_bounded_shape",
+  "malformed_waitset_interest_is_never_accepted",
 ]
 depends_on = []
 

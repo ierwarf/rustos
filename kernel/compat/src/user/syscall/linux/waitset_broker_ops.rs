@@ -480,11 +480,96 @@ mod tests {
 
     #[test]
     fn waiter_capacity_admits_one_maximal_arm_and_bounded_concurrency() {
-        assert_eq!(
-            WAITSET_WAITER_CAPACITY,
-            super::multitask::MAX_SCHEDULER_TASKS * super::WAITSET_OBSERVATIONS_PER_TASK_BUDGET
+        struct WaitsetCleanup([u64; 2]);
+
+        impl Drop for WaitsetCleanup {
+            fn drop(&mut self) {
+                for task_id in self.0 {
+                    super::remove_waitset_waiters(task_id);
+                }
+            }
+        }
+
+        let _guard = WAITSET_TEST_GUARD.lock();
+        let task_a = u64::MAX - 21;
+        let task_b = u64::MAX - 22;
+        let process_a = u64::MAX - 23;
+        let process_b = u64::MAX - 24;
+        let first = (0..super::WAITSET_MAX_OBSERVATIONS)
+            .map(|index| ProviderObservation {
+                provider: WAITSET_PROVIDER_NETD,
+                object_id: index as u64 + 1,
+                generation: 8,
+            })
+            .collect::<alloc::vec::Vec<_>>();
+        let second = [ProviderObservation {
+            provider: WAITSET_PROVIDER_NETD,
+            object_id: u64::MAX - 52,
+            generation: 9,
+        }];
+        let _cleanup = WaitsetCleanup([task_a, task_b]);
+
+        register_waitset_waiters(task_a, process_a, &first).expect("arm one maximal waiter set");
+        register_waitset_waiters(task_b, process_b, &second).expect("arm second waiter");
+        assert!(waitset_waiters_match(task_a, process_a, &first));
+        assert!(waitset_waiters_match(task_b, process_b, &second));
+
+        let mut wake_tasks = [0_u64; WAITSET_WAITER_CAPACITY];
+        let count = take_matching_waiters(
+            WAITSET_PROVIDER_NETD,
+            Some(first[0].object_id),
+            Some(9),
+            &mut wake_tasks,
         );
-        assert!(WAITSET_WAITER_CAPACITY >= super::WAITSET_MAX_OBSERVATIONS);
+        assert_eq!(&wake_tasks[..count], &[task_a]);
+        assert!(!waitset_waiters_match(task_a, process_a, &first));
+        assert!(waitset_waiters_match(task_b, process_b, &second));
+    }
+
+    #[test]
+    fn waitset_capacity_preflight_allows_exact_replacement_when_full() {
+        struct WaitsetCleanup(alloc::vec::Vec<u64>);
+
+        impl Drop for WaitsetCleanup {
+            fn drop(&mut self) {
+                for task_id in self.0.iter().copied() {
+                    super::remove_waitset_waiters(task_id);
+                }
+            }
+        }
+
+        let _guard = WAITSET_TEST_GUARD.lock();
+        let mut cleanup = WaitsetCleanup(alloc::vec::Vec::new());
+        let mut remaining = WAITSET_WAITER_CAPACITY;
+        let mut first = None;
+        while remaining != 0 {
+            let count = remaining.min(super::WAITSET_MAX_OBSERVATIONS);
+            let task_id = u64::MAX - 1_000 - cleanup.0.len() as u64;
+            let process_id = task_id - 100;
+            let observations = (0..count)
+                .map(|index| ProviderObservation {
+                    provider: WAITSET_PROVIDER_NETD,
+                    object_id: index as u64 + 1,
+                    generation: task_id,
+                })
+                .collect::<alloc::vec::Vec<_>>();
+            register_waitset_waiters(task_id, process_id, &observations)
+                .expect("fill exact waiter capacity");
+            if first.is_none() {
+                first = Some((task_id, process_id, observations.clone()));
+            }
+            cleanup.0.push(task_id);
+            remaining -= count;
+        }
+        assert_eq!(
+            super::WAITSET_WAITERS.lock().iter().flatten().count(),
+            WAITSET_WAITER_CAPACITY
+        );
+
+        let (task_id, process_id, observations) = first.expect("one exact-capacity waiter set");
+        register_waitset_waiters(task_id, process_id, &observations)
+            .expect("an exact replacement owns its existing capacity");
+        assert!(waitset_waiters_match(task_id, process_id, &observations));
     }
 
     #[test]
@@ -547,6 +632,43 @@ mod tests {
         assert_eq!(remove_waitset_waiters(task_id), 1);
         assert_eq!(remove_waitset_waiters(task_id), 0);
         assert!(!waitset_waiters_match(task_id, process_id, &observations));
+    }
+
+    #[test]
+    fn waitset_match_requires_exact_task_process_pair() {
+        struct WaitsetCleanup(u64);
+
+        impl Drop for WaitsetCleanup {
+            fn drop(&mut self) {
+                super::remove_waitset_waiters(self.0);
+            }
+        }
+
+        let _guard = WAITSET_TEST_GUARD.lock();
+        let task_a = u64::MAX - 111;
+        let task_b = u64::MAX - 112;
+        let process_a = u64::MAX - 113;
+        let process_b = u64::MAX - 114;
+        let observations = [ProviderObservation {
+            provider: WAITSET_PROVIDER_NETD,
+            object_id: 43,
+            generation: 9,
+        }];
+        let _cleanup = WaitsetCleanup(task_a);
+
+        register_waitset_waiters(task_a, process_a, &observations)
+            .expect("register exact task/process waiter");
+        assert!(!waitset_waiters_match(task_a, process_b, &observations));
+        assert!(!waitset_waiters_match(task_b, process_a, &observations));
+        assert!(waitset_waiters_match(task_a, process_a, &observations));
+
+        // Only a matching commit may consume the waiter and nominate its task
+        // for scheduler wakeup. The two cross-pairs leave it installed.
+        let mut wake_tasks = [0_u64; super::WAITSET_WAITER_CAPACITY];
+        let count =
+            take_matching_waiters(WAITSET_PROVIDER_NETD, Some(43), Some(10), &mut wake_tasks);
+        assert_eq!(&wake_tasks[..count], &[task_a]);
+        assert!(!waitset_waiters_match(task_a, process_a, &observations));
     }
 
     #[test]
