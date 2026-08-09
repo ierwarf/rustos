@@ -50,11 +50,69 @@ const APIC_DELIVERY_MODE_FIXED: u32 = 0b000 << 8;
 const APIC_DELIVERY_MODE_INIT: u32 = 0b101 << 8;
 const APIC_DELIVERY_MODE_STARTUP: u32 = 0b110 << 8;
 const CPUID_FEATURE_APIC: u32 = 1 << 9;
-const INIT_SETTLE_NS: u64 = 10_000_000;
+/// Legacy INIT settle wait, required only by pre-P4 era parts.
+const LEGACY_INIT_SETTLE_NS: u64 = 10_000_000;
+const CPUID_VENDOR_INTEL: [u32; 3] = [0x756e_6547, 0x4965_6e69, 0x6c65_746e];
+const CPUID_VENDOR_AMD: [u32; 3] = [0x6874_7541, 0x6974_6e65, 0x444d_4163];
+const CPUID_VENDOR_HYGON: [u32; 3] = [0x6f72_7948, 0x6e65_6748, 0x3638_6f6e];
 const SIPI_SETTLE_NS: u64 = 200_000;
 const ICR_DELIVERY_TIMEOUT_NS: u64 = 100_000_000;
 
 pub type MsiHandler = fn(u8);
+
+/// Whether this CPU needs the legacy 10 ms wait between INIT de-assert and the
+/// first SIPI.
+///
+/// The MP specification's 10 ms is a property of pre-P4 era parts. Linux
+/// encodes exactly that in `smp_quirk_init_udelay()`: Intel family 6, AMD
+/// family 0xf or newer, and Hygon family 0x18 or newer use no delay at all,
+/// and only anything older keeps the legacy value. Every 64-bit part and every
+/// virtual CPU falls in the first set, where the wait is 10 ms of dead boot
+/// time per application processor - 70 ms at the supported eight-CPU maximum.
+const fn legacy_init_settle_required(vendor: [u32; 3], family: u32) -> bool {
+    if vendor[0] == CPUID_VENDOR_INTEL[0]
+        && vendor[1] == CPUID_VENDOR_INTEL[1]
+        && vendor[2] == CPUID_VENDOR_INTEL[2]
+    {
+        return family != 6;
+    }
+    if vendor[0] == CPUID_VENDOR_AMD[0]
+        && vendor[1] == CPUID_VENDOR_AMD[1]
+        && vendor[2] == CPUID_VENDOR_AMD[2]
+    {
+        return family < 0xf;
+    }
+    if vendor[0] == CPUID_VENDOR_HYGON[0]
+        && vendor[1] == CPUID_VENDOR_HYGON[1]
+        && vendor[2] == CPUID_VENDOR_HYGON[2]
+    {
+        return family < 0x18;
+    }
+    // An unrecognized vendor keeps the conservative wait: a boot that is 70 ms
+    // slower is a cost, and an application processor that never starts is not.
+    true
+}
+
+/// Display family, assembled the way the architecture specifies.
+const fn cpuid_display_family(leaf1_eax: u32) -> u32 {
+    let base = (leaf1_eax >> 8) & 0xf;
+    if base == 0xf {
+        base + ((leaf1_eax >> 20) & 0xff)
+    } else {
+        base
+    }
+}
+
+fn init_settle_ns() -> u64 {
+    let vendor_leaf = __cpuid(0);
+    let vendor = [vendor_leaf.ebx, vendor_leaf.edx, vendor_leaf.ecx];
+    let family = cpuid_display_family(__cpuid(1).eax);
+    if legacy_init_settle_required(vendor, family) {
+        LEGACY_INIT_SETTLE_NS
+    } else {
+        0
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MsiMessage {
@@ -263,7 +321,7 @@ pub fn start_application_processor(
         u64::from(apic_id),
         0,
     );
-    busy_wait_ns(INIT_SETTLE_NS);
+    busy_wait_ns(init_settle_ns());
     crate::debug::record_milestone(
         crate::debug::LogCategory::Boot,
         "smp-init-settled",
@@ -580,6 +638,35 @@ fn end_of_interrupt() {
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        CPUID_VENDOR_AMD, CPUID_VENDOR_HYGON, CPUID_VENDOR_INTEL, cpuid_display_family,
+        legacy_init_settle_required,
+    };
+
+    #[test]
+    fn only_pre_p4_era_parts_keep_the_legacy_init_settle_wait() {
+        // Every 64-bit part and every virtual CPU is in the no-delay set, which
+        // is what makes the wait pure boot latency at eight CPUs.
+        assert!(!legacy_init_settle_required(CPUID_VENDOR_INTEL, 6));
+        assert!(!legacy_init_settle_required(CPUID_VENDOR_AMD, 0xf));
+        assert!(!legacy_init_settle_required(CPUID_VENDOR_AMD, 0x19));
+        assert!(!legacy_init_settle_required(CPUID_VENDOR_HYGON, 0x18));
+
+        assert!(legacy_init_settle_required(CPUID_VENDOR_INTEL, 5));
+        assert!(legacy_init_settle_required(CPUID_VENDOR_INTEL, 15));
+        assert!(legacy_init_settle_required(CPUID_VENDOR_AMD, 6));
+        assert!(legacy_init_settle_required(CPUID_VENDOR_HYGON, 0x17));
+        // An unknown vendor must not be given the fast path.
+        assert!(legacy_init_settle_required([0, 0, 0], 6));
+    }
+
+    #[test]
+    fn display_family_extends_only_when_the_base_field_is_saturated() {
+        assert_eq!(cpuid_display_family(0x0000_0600), 6);
+        assert_eq!(cpuid_display_family(0x0000_0f00), 0xf);
+        assert_eq!(cpuid_display_family(0x00a0_0f00), 0xf + 0xa);
+    }
+
     use core::sync::atomic::Ordering;
 
     use super::{

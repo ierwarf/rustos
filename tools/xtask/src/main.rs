@@ -15,7 +15,10 @@ type Result<T> = anyhow::Result<T>;
 
 fn main() {
     if let Err(err) = cli::run() {
-        eprintln!("xtask: {err}");
+        // `{err}` prints only the outermost context, which hides the cause a
+        // failing lane was written to report. Every layer added a context
+        // string precisely so the reader gets the chain, so print it.
+        eprintln!("xtask: {err:#}");
         std::process::exit(1);
     }
 }
