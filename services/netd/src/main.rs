@@ -137,6 +137,17 @@ const AUTHENTICATED_CONTROL_RETRY: Duration = Duration::from_millis(4);
 /// budget before yielding, even if a hostile producer keeps refilling the ring.
 // The DVM ring has no userspace eventfd; 10 ms avoids unchanged-readiness wakeup churn.
 const INET_READINESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// Cadence when no socket exists to service.
+///
+/// This worker takes the global net lock every tick to drive TCP timers and
+/// retransmits, which is work only a live socket can need. With no sockets
+/// there is none, yet the tick still acquired the lock a hundred times a
+/// second for the whole life of the session, contending with the request loop
+/// that shares it. The stack exposes no next-deadline hint to sleep against
+/// (smoltcp's `poll_delay` has no equivalent here), so back off on the one
+/// condition that is certain instead, and return to the tight cadence the
+/// moment a socket exists.
+const INET_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const INET_READINESS_POLL_BUDGET: usize = 32;
 const QEMU_USERNET_ADDR: Ipv4Address = Ipv4Address::new(10, 0, 2, 15);
 const QEMU_USERNET_GATEWAY: Ipv4Address = Ipv4Address::new(10, 0, 2, 2);
@@ -228,7 +239,12 @@ fn inet_readiness_worker_loop() {
             }
         };
         advance_readiness_generation(&changed_tokens);
-        thread::sleep(INET_READINESS_POLL_INTERVAL);
+        let has_sockets = !net_state().lock().unwrap().inet_sockets.is_empty();
+        thread::sleep(if has_sockets {
+            INET_READINESS_POLL_INTERVAL
+        } else {
+            INET_IDLE_POLL_INTERVAL
+        });
     }
 }
 
@@ -3323,4 +3339,21 @@ fn debug_line(message: &str) {
         line.as_ptr() as u64,
         (len + 1) as u64,
     );
+}
+
+#[cfg(test)]
+mod idle_cadence_tests {
+    use super::{INET_IDLE_POLL_INTERVAL, INET_READINESS_POLL_INTERVAL};
+
+    #[test]
+    fn an_idle_stack_backs_off_without_relaxing_the_live_socket_cadence() {
+        // A live socket keeps the timer/retransmit cadence it had.
+        assert_eq!(
+            INET_READINESS_POLL_INTERVAL,
+            std::time::Duration::from_millis(10)
+        );
+        // And the idle cadence has to be a real back-off, or the global net
+        // lock is still being taken at the same rate for no work.
+        assert!(INET_IDLE_POLL_INTERVAL >= INET_READINESS_POLL_INTERVAL * 4);
+    }
 }

@@ -19,11 +19,20 @@
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 
+use crate::util::lockdep::MAX_TRACKED_CPUS;
+
 use super::{CurrentUserLogContext, MilestoneOutputClass, MilestoneRecord};
 
-/// Parked lines. Deep enough to cover a burst from every CPU of the supported
-/// topology several times over, while staying a fixed static cost.
-const DEFERRED_SLOTS: usize = 64;
+/// Parked records per CPU.
+///
+/// The ring was one shared array, which made every parker CAS its way along
+/// slots other CPUs were claiming at the same time, and made overflow global:
+/// one noisy CPU could consume the depth the others needed, which is what
+/// `dropped=164` was. Linux gives printk per-CPU buffers for the same reason.
+/// A parker now only ever touches its own CPU's slots, so the claim is
+/// uncontended and a burst is charged to the CPU that produced it. Total depth
+/// also rises with the topology instead of being shared out.
+const DEFERRED_SLOTS_PER_CPU: usize = 64;
 /// Longest line the ring accepts, matching the serialized diagnostic bound.
 pub(super) const DEFERRED_LINE_BYTES: usize = 512;
 
@@ -77,16 +86,31 @@ impl Slot {
 unsafe impl Sync for Slot {}
 
 struct DeferredRing {
-    slots: [Slot; DEFERRED_SLOTS],
+    /// One private slot array per CPU. `next_sequence` stays global: it is what
+    /// lets the drainer merge the rings back into the order the records were
+    /// parked in, across CPUs.
+    cpu_slots: [[Slot; DEFERRED_SLOTS_PER_CPU]; MAX_TRACKED_CPUS],
     next_sequence: AtomicU64,
 }
 
 impl DeferredRing {
     const fn new() -> Self {
         Self {
-            slots: [const { Slot::new() }; DEFERRED_SLOTS],
+            cpu_slots: [const { [const { Slot::new() }; DEFERRED_SLOTS_PER_CPU] };
+                MAX_TRACKED_CPUS],
             next_sequence: AtomicU64::new(0),
         }
+    }
+
+    /// The parking CPU's own slots. An unknown index would alias another CPU's
+    /// ring, so it is folded to zero rather than trusted.
+    fn local_slots(&self) -> &[Slot; DEFERRED_SLOTS_PER_CPU] {
+        let cpu = crate::util::lockdep::current_cpu_index();
+        &self.cpu_slots[if cpu < MAX_TRACKED_CPUS { cpu } else { 0 }]
+    }
+
+    fn every_slot(&self) -> impl Iterator<Item = &Slot> {
+        self.cpu_slots.iter().flat_map(|slots| slots.iter())
     }
 }
 
@@ -98,7 +122,7 @@ pub(super) fn park(bytes: &[u8]) -> bool {
     if bytes.is_empty() || bytes.len() > DEFERRED_LINE_BYTES {
         return false;
     }
-    for slot in DEFERRED.slots.iter() {
+    for slot in DEFERRED.local_slots().iter() {
         // ORDERING: AcqRel claims the slot before any byte is written to it,
         // so no drainer can observe a partially filled record.
         if slot
@@ -128,7 +152,7 @@ pub(super) fn park(bytes: &[u8]) -> bool {
 
 /// Park one milestone that could not reach the sink.
 pub(super) fn park_milestone(parked: ParkedMilestone) -> bool {
-    for slot in DEFERRED.slots.iter() {
+    for slot in DEFERRED.local_slots().iter() {
         // ORDERING: AcqRel claims the slot before it is written, so no drainer
         // can observe a partially published record.
         if slot
@@ -161,7 +185,7 @@ pub(super) fn drain(
 ) {
     loop {
         let mut oldest: Option<(u64, &Slot)> = None;
-        for slot in DEFERRED.slots.iter() {
+        for slot in DEFERRED.every_slot() {
             // ORDERING: Acquire pairs with the parking CPU's Release, so the
             // bytes are visible before they are read.
             if slot.state.load(Ordering::Acquire) != SLOT_READY {
@@ -195,8 +219,21 @@ pub(super) fn drain(
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFERRED, DEFERRED_LINE_BYTES, DEFERRED_SLOTS, drain, park};
+    use super::{DEFERRED, DEFERRED_LINE_BYTES, DEFERRED_SLOTS_PER_CPU, drain, park};
     use alloc::vec::Vec;
+
+    /// The rings are process-wide statics and every test here fills and drains
+    /// them, so they must not run concurrently or one test consumes another's
+    /// records.
+    static TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn serialized() -> std::sync::MutexGuard<'static, ()> {
+        let guard = TEST_GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _ = drain_all();
+        guard
+    }
 
     fn drain_all() -> Vec<Vec<u8>> {
         let mut seen = Vec::new();
@@ -206,7 +243,7 @@ mod tests {
 
     #[test]
     fn parked_lines_emit_oldest_first_and_free_their_slots() {
-        let _ = drain_all();
+        let _serial = serialized();
         assert!(park(b"first"));
         assert!(park(b"second"));
         assert!(park(b"third"));
@@ -221,24 +258,45 @@ mod tests {
 
     #[test]
     fn a_full_ring_refuses_rather_than_overwriting_a_parked_line() {
-        let _ = drain_all();
-        for _ in 0..DEFERRED_SLOTS {
+        let _serial = serialized();
+        for _ in 0..DEFERRED_SLOTS_PER_CPU {
             assert!(park(b"x"));
         }
         // The caller must account this loss; silently dropping the oldest
         // record would make the gap invisible.
         assert!(!park(b"x"));
-        assert_eq!(drain_all().len(), DEFERRED_SLOTS);
+        assert_eq!(drain_all().len(), DEFERRED_SLOTS_PER_CPU);
     }
 
     #[test]
     fn an_oversized_or_empty_line_is_refused_before_any_slot_is_claimed() {
-        let _ = drain_all();
+        let _serial = serialized();
         assert!(!park(b""));
         assert!(!park(&[b'x'; DEFERRED_LINE_BYTES + 1]));
         assert!(drain_all().is_empty());
         assert!(park(&[b'x'; DEFERRED_LINE_BYTES]));
         assert_eq!(drain_all().len(), 1);
         let _ = &DEFERRED;
+    }
+
+    #[test]
+    fn one_cpus_burst_cannot_consume_the_depth_another_cpu_needs() {
+        let _serial = serialized();
+        // Filling this CPU's ring must not reach any other CPU's slots; that
+        // sharing is what let one noisy CPU drop everyone else's records.
+        for _ in 0..DEFERRED_SLOTS_PER_CPU {
+            assert!(park(b"x"));
+        }
+        assert!(!park(b"x"));
+
+        let remaining = DEFERRED
+            .cpu_slots
+            .iter()
+            .skip(1)
+            .flat_map(|slots| slots.iter())
+            .filter(|slot| slot.state.load(core::sync::atomic::Ordering::Acquire) != super::SLOT_EMPTY)
+            .count();
+        assert_eq!(remaining, 0);
+        assert_eq!(drain_all().len(), DEFERRED_SLOTS_PER_CPU);
     }
 }
