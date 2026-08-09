@@ -23,7 +23,7 @@ services/netd/src/main.rs	3413	netd	Split device ingress, socket state, routing 
 services/rootd/src/main.rs	2935	rootd	Split bootstrap graph, authority leases, restart policy, and checkpoints.
 services/syscalld/src/linux_policy.rs	1532	syscalld	Split process, memory, entropy, credential, and advisory policies.
 services/uiserver/src/main.rs	1364	uiserver	Split the protocol, scene, and GPU submission owners per V5-GPU-UI-OWNER-014; the main loop is the shared owner that split removes.
-services/uiserver/src/render.rs	1619	uiserver-render	Split scene planning, damage, raster/composition, and tests.
+services/uiserver/src/render.rs	1668	uiserver-render	Split scene planning, damage, raster/composition, and tests.
 services/uiserver/src/sys.rs	1607	uiserver-sys	Split syscall wrappers by IPC, VM, wait, input, and display.
 services/uiserver/src/wayland.rs	3245	uiserver-wayland	Split protocol objects, dispatch, surface lifecycle, and tests.
 tools/hostd/src/runtime.rs	2841	hostd	Split launch, QMP, process identity, recovery, and evidence sealing.

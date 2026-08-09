@@ -470,6 +470,12 @@ impl GpuSceneCompiler {
         let mut commands = Vec::with_capacity(command_count);
         commands.push(clear_command(clear_rgba));
         for layer in layers {
+            // A layer that has been dragged entirely off the output contributes
+            // nothing; emitting a zero-area quad for it would be malformed.
+            let Some(layer) = clip_layer_to_output(*layer, output_width, output_height) else {
+                continue;
+            };
+            let layer = &layer;
             let command = match layer.kind {
                 GpuLayerKind::Solid { rgba } => layer_command(
                     *layer,
@@ -657,6 +663,67 @@ fn clear_command(rgba: u32) -> DvmGpuRenderCommand {
         tilt_y: 0,
         perspective: 0,
     }
+}
+
+/// Clips one layer's destination to the output rectangle.
+///
+/// The window manager deliberately lets a window be dragged past the desktop
+/// edge - `clamp_wayland_frame` only guarantees that enough of the title bar
+/// stays reachable, and says so - so a layer destination is not required to
+/// lie inside the output. The render contract admits the opposite: a quad
+/// whose destination leaves the output is a malformed batch, not a partly
+/// visible window. Clipping here is what makes the two agree, and it is the
+/// same clip `gpu_cursor_layer` already applies to the cursor sprite.
+///
+/// A destination is unsigned and the output starts at the origin, so only the
+/// far edges can ever be trimmed and the visible part always keeps the
+/// destination's origin. That makes the clip a pure shortening of both extents:
+/// destination and source are pinned to the same size for every textured layer,
+/// so cropping N pixels off the right or bottom drops the same N source
+/// columns or rows and leaves the source origin alone. Where that
+/// correspondence does not hold - a transformed quad, or a source that is not
+/// the destination's size - the layer is passed through unchanged and the
+/// contract check still rejects it. Cropping those would move the image rather
+/// than clip it.
+///
+/// `None` means nothing of the layer is on screen and no command is emitted.
+fn clip_layer_to_output(
+    layer: GpuSceneLayer,
+    output_width: u32,
+    output_height: u32,
+) -> Option<GpuSceneLayer> {
+    let output = Rect {
+        x: 0,
+        y: 0,
+        width: output_width as usize,
+        height: output_height as usize,
+    };
+    let visible = layer.destination.intersect(output);
+    if visible == layer.destination {
+        return Some(layer);
+    }
+    if visible.is_empty() {
+        return None;
+    }
+    if layer.transform != GpuLayerTransform::flat() {
+        return Some(layer);
+    }
+    debug_assert_eq!(
+        (visible.x, visible.y),
+        (layer.destination.x, layer.destination.y)
+    );
+    let mut clipped = layer;
+    clipped.destination = visible;
+    if let GpuLayerKind::Texture { region } = &mut clipped.kind {
+        if region.source_rect.width != layer.destination.width
+            || region.source_rect.height != layer.destination.height
+        {
+            return Some(layer);
+        }
+        region.source_rect.width = visible.width;
+        region.source_rect.height = visible.height;
+    }
+    Some(clipped)
 }
 
 fn layer_command(
@@ -1035,7 +1102,7 @@ mod tests {
     }
 
     #[test]
-    fn scene_compiler_rejects_rebound_token_and_out_of_bounds_layer() {
+    fn scene_compiler_rejects_rebound_token_and_unclippable_out_of_bounds_layer() {
         let mut compiler = ready_compiler();
         assert_eq!(
             compiler.compile(
@@ -1047,10 +1114,65 @@ mod tests {
             ),
             Err(GpuSceneError::TokenRebound)
         );
+        // A scaled layer has no pixel-for-pixel source correspondence, so the
+        // clip cannot crop it and the contract check must still reject it.
+        let mut scaled = layer(texture(8, 2), 1100);
+        if let GpuLayerKind::Texture { region } = &mut scaled.kind {
+            region.source_rect.width = 160;
+        }
         assert_eq!(
-            compiler.compile(1280, 720, 1, 0, &[layer(texture(8, 2), 1100)]),
+            compiler.compile(1280, 720, 1, 0, &[scaled]),
             Err(GpuSceneError::InvalidLayer)
         );
+    }
+
+    #[test]
+    fn a_window_dragged_past_the_bottom_edge_is_cropped_rather_than_rejected() {
+        // `clamp_wayland_frame` lets the body leave the desktop, so this is the
+        // geometry a real drag to the bottom produces. Rejecting it took the
+        // whole compositor down with EINVAL.
+        let mut compiler = ready_compiler();
+        let batch = compiler
+            .compile(1280, 120, 1, 0, &[layer(texture(0x200, 3), 0)])
+            .expect("a partly off-screen window still compiles");
+
+        assert_eq!(batch.commands.len(), 2);
+        let quad = batch.commands[1];
+        assert_eq!(quad.destination_y, 20);
+        assert_eq!(quad.destination_height, 100);
+        assert_eq!(quad.destination_width, 320);
+        // Cropping the bottom keeps the source origin and shortens the span.
+        assert_eq!(quad.source_v, 0);
+        assert!(u32::from(quad.source_height) < u32::from(u16::MAX));
+    }
+
+    #[test]
+    fn a_window_dragged_past_the_right_edge_crops_the_source_to_match() {
+        let clipped = clip_layer_to_output(layer(texture(0x201, 3), 1100), 1280, 720)
+            .expect("part of the window is still on screen");
+
+        assert_eq!(clipped.destination.x, 1100);
+        assert_eq!(clipped.destination.width, 180);
+        let GpuLayerKind::Texture { region } = clipped.kind else {
+            panic!("clipping must not change the layer kind");
+        };
+        // A cropped destination must carry a source of exactly its own size,
+        // or the visible part of the window is sampled from the wrong texels.
+        assert_eq!(region.source_rect.x, 0);
+        assert_eq!(region.source_rect.width, 180);
+        assert_eq!(region.source_rect.height, clipped.destination.height);
+    }
+
+    #[test]
+    fn a_layer_entirely_off_the_output_contributes_no_command() {
+        assert!(clip_layer_to_output(layer(texture(0x202, 3), 1280), 1280, 720).is_none());
+
+        let mut compiler = ready_compiler();
+        let batch = compiler
+            .compile(1280, 720, 1, 0, &[layer(texture(0x203, 3), 4000)])
+            .expect("an off-screen window is absent, not malformed");
+        assert_eq!(batch.commands.len(), 1);
+        assert_eq!(batch.sources.len(), 0);
     }
 
     #[test]

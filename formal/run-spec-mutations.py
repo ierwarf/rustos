@@ -326,6 +326,15 @@ def main() -> int:
                 "TLA_SPEC_OVERRIDE": str(mutant),
                 "TLA_CONFIG_OVERRIDE": str(mutant_config),
                 "TLA_ARTIFACT_DIR": str(artifact),
+                # TLC stops at the first invariant it sees violated, and with
+                # several workers which one that is depends on the order the
+                # state space happens to be explored. A kill check asserts
+                # *which* invariant rejected the mutant, so it is a claim only
+                # a deterministic exploration can carry: on `auto` the same
+                # mutant is killed by a different invariant from run to run and
+                # the lane fails at random. Baselines keep `auto` - "nothing
+                # was violated" does not depend on the order.
+                "TLC_WORKERS": "1",
             }
             result = run(
                 ["bash", str(root / "formal/run-tlc.sh"), "--profile", "pr", model],

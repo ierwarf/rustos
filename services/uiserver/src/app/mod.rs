@@ -4,8 +4,8 @@ mod runtime;
 
 pub(crate) use bootstrap::start_launcher_program_loader;
 pub(crate) use runtime::{
-    start_console_command_dispatcher, start_console_refresh_worker, ConsoleCommandDispatcher,
-    ConsoleCommandSnapshot,
+    drain_console_refreshes, start_console_command_dispatcher, start_console_refresh_worker,
+    ConsoleCommandDispatcher, ConsoleCommandSnapshot,
 };
 
 use std::os::fd::OwnedFd;

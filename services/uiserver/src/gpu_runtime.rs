@@ -1282,7 +1282,12 @@ fn damage_union(
     })
 }
 
-fn gpu_scene_errno(_error: GpuSceneError) -> i32 {
+/// Every scene rejection is a contract violation, so they share one errno.
+/// The errno alone cannot say which contract broke, and the compositor exits
+/// on it, so the caller would be left with a bare `errno=22` and no way back
+/// to the rule that rejected the frame. Name it here, once, at the conversion.
+fn gpu_scene_errno(error: GpuSceneError) -> i32 {
+    debug_line(&format!("uiserver: gpu scene rejected reason={error:?}"));
     EINVAL
 }
 

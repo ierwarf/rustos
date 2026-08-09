@@ -864,7 +864,7 @@ fn run() -> Result<(), i32> {
     diag_line("uiserver: post-present init done");
     log_boot_stage(boot_started, "post_present_init");
     let launcher_programs = start_launcher_program_loader();
-    let console_refreshes = start_console_refresh_worker();
+    let console_refreshes = start_console_refresh_worker(input_events.wake_sender());
     let mut next_runtime_poll = Instant::now();
     let mut next_console_poll = Instant::now() + CONSOLE_POLL_SLEEP;
     let mut next_cursor_blink = Instant::now() + CURSOR_BLINK_INTERVAL;
@@ -1036,15 +1036,15 @@ fn run() -> Result<(), i32> {
         let console_phase_started = Instant::now();
         let now = console_phase_started;
         watchdog.enter(UI_PHASE_CONSOLE);
-        if now >= next_console_poll {
-            let refresh_started = Instant::now();
-            let mut console_update = VisualUpdate::default();
-            while let Ok(refresh) = console_refreshes.try_recv() {
-                console_update.absorb(phase_result(
-                    "console-refresh",
-                    state.apply_console_refresh(refresh),
-                )?);
-            }
+        // Drain on arrival, not on the interval: the refresh worker publishes a
+        // readiness edge, and gating on the poll would hold its output past it.
+        let refresh_started = Instant::now();
+        let mut console_update = VisualUpdate::default();
+        let drained = phase_result(
+            "console-refresh",
+            app::drain_console_refreshes(&mut state, &console_refreshes, &mut console_update),
+        )?;
+        if drained || now >= next_console_poll {
             let changed = !console_update.is_empty();
             pending_update.absorb(console_update);
             let refresh_elapsed = refresh_started.elapsed();

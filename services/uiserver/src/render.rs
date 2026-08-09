@@ -381,13 +381,21 @@ pub(crate) fn update_gpu_layer_destinations(
             wayland_windows.push(window);
         }
     }
-    if wayland_windows.len() != wayland_bindings.len() {
-        return false;
-    }
-    for (window, binding) in wayland_windows.into_iter().zip(wayland_bindings) {
+    // Bindings, not windows, are the authority on what this scene contains: a
+    // window the atlas had no room for is absent from both, and demanding equal
+    // lengths would force a full rebuild every frame while that held. Reuse
+    // already requires an unchanged `gpu_scene_reuse_signature`, which covers
+    // every window's identity, size and minimized state, so a binding that
+    // cannot find its window is a real mismatch and still fails closed.
+    for binding in wayland_bindings {
+        let Some(window) = wayland_windows
+            .iter()
+            .find(|window| window.surface_id == binding.surface_id)
+        else {
+            return false;
+        };
         let destination = wayland_window_outer_rect(window);
-        if window.surface_id != binding.surface_id
-            || (Some(window.surface_id) == focused_wayland) != binding.focused
+        if (Some(window.surface_id) == focused_wayland) != binding.focused
             || !update_gpu_texture_layer_destination(
                 layers,
                 binding.layer_index,
@@ -496,23 +504,30 @@ pub(crate) fn update_wayland_gpu_textures(
             windows.push(window);
         }
     }
-    if windows.len() != bindings.len()
-        || windows
+    // As in `update_gpu_layer_destinations`, a window the atlas could not fit
+    // has no binding and must not force a rebuild; the bindings drive.
+    if bindings.iter().any(|binding| {
+        windows
             .iter()
-            .zip(bindings.iter())
-            .any(|(window, binding)| {
+            .find(|window| window.surface_id == binding.surface_id)
+            .is_none_or(|window| {
                 let outer = wayland_window_outer_rect(window);
-                window.surface_id != binding.surface_id
-                    || (Some(window.surface_id) == focused) != binding.focused
+                (Some(window.surface_id) == focused) != binding.focused
                     || outer.width != binding.source_rect.width
                     || outer.height != binding.source_rect.height
             })
-    {
+    }) {
         return Ok(None);
     }
 
     let mut damage = Vec::new();
-    for (window, binding) in windows.into_iter().zip(bindings.iter_mut()) {
+    for binding in bindings.iter_mut() {
+        let Some(window) = windows
+            .iter()
+            .find(|window| window.surface_id == binding.surface_id)
+        else {
+            return Ok(None);
+        };
         if window.content_version == binding.content_version {
             continue;
         }
@@ -1011,7 +1026,15 @@ fn push_wayland_gpu_layer(
     }
     let pixels = render_wayland_gpu_texture(window, focused)?;
     let source_rect =
-        packer.place_xrgb(pixels.as_slice(), outer.width, outer.height, outer.width)?;
+        match packer.place_xrgb(pixels.as_slice(), outer.width, outer.height, outer.width) {
+            Ok(source_rect) => source_rect,
+            // A full atlas is a capacity limit, not a malformed scene. Clients
+            // choose how many surfaces exist and how large they are, so
+            // propagating this would let any client end the compositor - and
+            // every other client's session with it - by opening windows.
+            Err(GpuSceneError::AtlasFull) => return Ok(None),
+            Err(err) => return Err(err),
+        };
     layers.push(GpuSceneLayer {
         destination: outer,
         opacity: u8::MAX,
@@ -1446,9 +1469,10 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        copy_opaque_wayland_damage_to_atlas, update_gpu_texture_layer_destination,
-        wayland_window_client_rect, wayland_window_outer_rect, GpuLayerKind, GpuLayerTransform,
-        GpuSceneLayer, GpuTextureCapability, GpuTextureRegion, Rect, WaylandWindowSnapshot,
+        copy_opaque_wayland_damage_to_atlas, push_wayland_gpu_layer,
+        update_gpu_texture_layer_destination, wayland_window_client_rect,
+        wayland_window_outer_rect, GpuAtlasPacker, GpuLayerKind, GpuLayerTransform, GpuSceneLayer,
+        GpuTextureCapability, GpuTextureRegion, Rect, WaylandWindowSnapshot,
     };
 
     fn snapshot(pixels: Vec<u32>, damage: Rect) -> WaylandWindowSnapshot {
@@ -1615,5 +1639,30 @@ mod tests {
             source_rect,
             Rect { width: 95, ..moved }
         ));
+    }
+
+    #[test]
+    fn a_window_the_atlas_cannot_fit_is_left_out_rather_than_ending_the_scene() {
+        // Clients choose how many surfaces exist and how large they are, so a
+        // full atlas must cost one window, never the compositor.
+        let mut pixels = vec![0_u32; 16 * 16];
+        let mut packer = GpuAtlasPacker::new(pixels.as_mut_slice(), 16, 16, 16).expect("packer");
+        let mut layers = Vec::new();
+        let atlas = GpuTextureCapability {
+            token: 1,
+            generation: 1,
+            content_epoch: 1,
+            binding_slot: 0,
+            width: 16,
+            height: 16,
+            stride_bytes: 64,
+        };
+
+        let window = snapshot(vec![0xff00_0000; 12], Rect::empty());
+        let placed = push_wayland_gpu_layer(&mut packer, &mut layers, atlas, &window, false)
+            .expect("a full atlas is a capacity limit, not a malformed scene");
+
+        assert!(placed.is_none());
+        assert!(layers.is_empty());
     }
 }

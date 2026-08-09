@@ -1,5 +1,18 @@
 // SPDX-License-Identifier: MIT
 
+/// Whether an `open` metadata errno is an answer rather than a fault.
+///
+/// `open` is how a caller asks whether a path exists, so `ENOENT` is the
+/// defined reply to a probe and not something the filesystem got wrong -
+/// Linux logs nothing for it either. Storage that has not finished coming up
+/// is likewise a retry, not a fault. Both arrive at a steady cadence from
+/// pollers, and every line they write competes for the one serialized debug
+/// sink that carries the acceptance evidence, so logging them turns a normal
+/// probe into evidence loss. Genuine faults still get a line.
+fn open_metadata_errno_is_routine(errno: i32) -> bool {
+    errno == ENOENT || block::is_transient_storage_not_ready(errno)
+}
+
 impl VfsState {
     fn cwd_for_pid(&mut self, pid: u64) -> String {
         self.cwd
@@ -104,7 +117,7 @@ impl VfsState {
         }
 
         let metadata = lock_vfs_storage().metadata(path).inspect_err(|&errno| {
-            if !block::is_transient_storage_not_ready(errno) {
+            if !open_metadata_errno_is_routine(errno) {
                 debug_line(&format!(
                     "vfsd: open failed stage=metadata errno={errno} path={path}"
                 ));
