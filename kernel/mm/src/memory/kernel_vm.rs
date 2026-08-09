@@ -26,7 +26,6 @@ use x86_64::PhysAddr;
 use x86_64::VirtAddr;
 use x86_64::instructions::{interrupts, tlb};
 use x86_64::registers::control::{Cr3, Cr3Flags};
-use x86_64::registers::model_specific::Msr;
 use x86_64::registers::model_specific::{Efer, EferFlags};
 use x86_64::structures::paging::page_table::PageTableEntry;
 use x86_64::structures::paging::{PageTable, PageTableFlags, PhysFrame};
@@ -70,18 +69,6 @@ pub const WRITE_COMBINE_BIT: PageTableFlags = PageTableFlags::from_bits_retain(1
 const WRITE_COMBINE_PAGE_BIT: PageTableFlags = PageTableFlags::HUGE_PAGE;
 const MMIO_UNCACHED_FLAGS: PageTableFlags = PageTableFlags::NO_CACHE;
 const MMIO_WRITE_COMBINE_FLAGS: PageTableFlags = WRITE_COMBINE_BIT;
-const IA32_PAT_MSR: u32 = 0x277;
-const PAT_SLOT0_SHIFT: u32 = 0;
-const PAT_SLOT2_SHIFT: u32 = 16;
-const PAT_SLOT4_SHIFT: u32 = 32;
-const PAT_ENTRY_MASK: u64 = 0xff;
-const PAT_WRITE_BACK: u64 = 0x06;
-const PAT_UNCACHEABLE: u64 = 0x00;
-const PAT_WRITE_COMBINING: u64 = 0x01;
-const PAT_KERNEL_CACHE_SLOT_MASK: u64 = (PAT_ENTRY_MASK << PAT_SLOT0_SHIFT)
-    | (PAT_ENTRY_MASK << PAT_SLOT2_SHIFT)
-    | (PAT_ENTRY_MASK << PAT_SLOT4_SHIFT);
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PhysicalMappingCacheMode {
     WriteBack,
@@ -711,8 +698,8 @@ impl<const SIZE_GB: usize> PML4<SIZE_GB> {
 
 pub fn init(boot_info_ptr: *const BootInfo) {
     assert!(
-        initialize_current_cpu_cache_attributes(),
-        "BSP could not verify its x86 PAT write-combining slot"
+        capture_boot_cpu_cache_attributes(),
+        "BSP could not seal its x86 MTRR/PAT/cache baseline"
     );
     unsafe {
         interrupts::without_interrupts(|| {
@@ -928,8 +915,38 @@ pub fn map_permanent_boot_mmio_uncached(phys_addr: u64, size: usize) -> Option<u
     Some(higher_half_addr(phys_addr))
 }
 
-const fn high_window_physical_range_is_admissible(phys_addr: u64, size: usize) -> bool {
-    size != 0 && phys_addr >= DIRECT_MAP_PHYS_LIMIT && phys_addr.checked_add(size as u64).is_some()
+/// Admit one high-window range against a physical-address ceiling.
+///
+/// Every caller reaches here with a device-derived address: a PCI BAR, an
+/// ivshmem aperture, or a field a driver domain wrote. A range the CPU cannot
+/// address must be rejected here, because the page-table entry built from it
+/// would otherwise be constructed from an unencodable address and abort the
+/// kernel on untrusted input.
+const fn high_window_range_is_admissible(phys_addr: u64, size: usize, limit: u64) -> bool {
+    size != 0
+        && phys_addr >= DIRECT_MAP_PHYS_LIMIT
+        && match phys_addr.checked_add(size as u64) {
+            Some(end) => end <= limit,
+            None => false,
+        }
+}
+
+fn high_window_physical_range_is_admissible(phys_addr: u64, size: usize) -> bool {
+    let limit = super::cache_attributes::max_physical_address();
+    if high_window_range_is_admissible(phys_addr, size, limit) {
+        return true;
+    }
+    if size != 0 && phys_addr >= DIRECT_MAP_PHYS_LIMIT {
+        // Debugcon, not the text ring: a rejected device range is the only
+        // record that a driver silently lost its aperture, and the acceptance
+        // harness can read it.
+        let mut line = alloc::format!(
+            "kernel: mmio range rejected phys={phys_addr:#x} size={size:#x} limit={limit:#x}"
+        );
+        line.push('\n');
+        crate::debug::write_debugcon_only_line(line.as_bytes());
+    }
+    false
 }
 
 pub fn unmap_mmio_range(virt_addr: u64, size: usize) -> bool {
@@ -960,55 +977,12 @@ pub(crate) unsafe fn phys_to_table_mut(phys: PhysAddr) -> &'static mut PageTable
     unsafe { &mut *(higher_half_addr(phys.as_u64()) as *mut PageTable) }
 }
 
-const fn pat_with_kernel_cache_contract(pat: u64) -> u64 {
-    (pat & !PAT_KERNEL_CACHE_SLOT_MASK)
-        | (PAT_WRITE_BACK << PAT_SLOT0_SHIFT)
-        | (PAT_UNCACHEABLE << PAT_SLOT2_SHIFT)
-        | (PAT_WRITE_COMBINING << PAT_SLOT4_SHIFT)
+pub fn capture_boot_cpu_cache_attributes() -> bool {
+    super::cache_attributes::capture_boot_cpu_cache_attributes()
 }
 
-const fn pat_entry(pat: u64, shift: u32) -> u64 {
-    (pat >> shift) & PAT_ENTRY_MASK
-}
-
-const fn pat_kernel_cache_contract_is_exact(expected: u64, observed: u64) -> bool {
-    observed == expected
-        && pat_entry(observed, PAT_SLOT0_SHIFT) == PAT_WRITE_BACK
-        && pat_entry(observed, PAT_SLOT2_SHIFT) == PAT_UNCACHEABLE
-        && pat_entry(observed, PAT_SLOT4_SHIFT) == PAT_WRITE_COMBINING
-}
-
-const fn pat_initial_write_back_selector_is_admissible(pat: u64) -> bool {
-    pat_entry(pat, PAT_SLOT0_SHIFT) == PAT_WRITE_BACK
-}
-
-/// Program and verify the cache-selector contract on the current CPU.
-///
-/// IA32_PAT is per logical CPU. Every AP must execute this before publishing
-/// `OnlineParked`, because all CPUs share page tables whose selectors 0, 2,
-/// and 4 are used by WB shared RAM, UC device registers, and WC payloads.
-pub fn initialize_current_cpu_cache_attributes() -> bool {
-    let mut msr = Msr::new(IA32_PAT_MSR);
-    let pat = unsafe { msr.read() };
-    // Slot 0 backs every ordinary kernel mapping already used by this CPU.
-    // Retyping it live would require the full architectural cache-disable and
-    // flush sequence, so a non-WB firmware/virtualization value fails closed.
-    if !pat_initial_write_back_selector_is_admissible(pat) {
-        return false;
-    }
-    let expected = pat_with_kernel_cache_contract(pat);
-    if pat != expected {
-        unsafe {
-            msr.write(expected);
-        }
-    }
-    let observed = unsafe { msr.read() };
-    pat_kernel_cache_contract_is_exact(expected, observed)
-}
-
-#[cfg(test)]
-fn pat_without_kernel_cache_slots(value: u64) -> u64 {
-    value & !PAT_KERNEL_CACHE_SLOT_MASK
+pub fn initialize_application_processor_cache_attributes() -> bool {
+    super::cache_attributes::initialize_application_processor_cache_attributes()
 }
 
 fn kernel_virtual_to_physical(addr: u64) -> u64 {
@@ -1362,44 +1336,49 @@ mod tests {
 
     #[test]
     fn high_window_never_aliases_a_direct_mapped_physical_range() {
-        assert!(!high_window_physical_range_is_admissible(
+        const LIMIT: u64 = 1 << 46;
+        assert!(!high_window_range_is_admissible(
             DIRECT_MAP_PHYS_LIMIT - PAGE_4KIB,
-            PAGE_4KIB as usize
+            PAGE_4KIB as usize,
+            LIMIT
         ));
-        assert!(high_window_physical_range_is_admissible(
+        assert!(high_window_range_is_admissible(
             DIRECT_MAP_PHYS_LIMIT,
-            PAGE_4KIB as usize
+            PAGE_4KIB as usize,
+            LIMIT
         ));
-        assert!(!high_window_physical_range_is_admissible(
+        assert!(!high_window_range_is_admissible(
             u64::MAX - PAGE_4KIB + 1,
-            PAGE_4KIB as usize
+            PAGE_4KIB as usize,
+            LIMIT
         ));
     }
 
     #[test]
-    fn pat_cache_contract_update_is_exact_idempotent_and_cpu_local() {
-        let original = 0x1234_5678_9abc_def0;
-        let updated = pat_with_kernel_cache_contract(original);
-        assert_eq!(pat_entry(updated, PAT_SLOT0_SHIFT), PAT_WRITE_BACK);
-        assert_eq!(pat_entry(updated, PAT_SLOT2_SHIFT), PAT_UNCACHEABLE);
-        assert_eq!(pat_entry(updated, PAT_SLOT4_SHIFT), PAT_WRITE_COMBINING);
-        assert_eq!(
-            pat_without_kernel_cache_slots(updated),
-            pat_without_kernel_cache_slots(original)
-        );
-        assert_eq!(pat_with_kernel_cache_contract(updated), updated);
-        assert!(pat_initial_write_back_selector_is_admissible(updated));
-        assert!(!pat_initial_write_back_selector_is_admissible(
-            updated ^ PAT_ENTRY_MASK
+    fn a_device_range_above_the_addressable_ceiling_is_rejected_not_mapped() {
+        const LIMIT: u64 = 1 << 46;
+        // The exact last addressable page is still admissible.
+        assert!(high_window_range_is_admissible(
+            LIMIT - PAGE_4KIB,
+            PAGE_4KIB as usize,
+            LIMIT
         ));
-        assert!(pat_kernel_cache_contract_is_exact(updated, updated));
-        assert!(!pat_kernel_cache_contract_is_exact(
-            updated,
-            updated ^ (PAT_ENTRY_MASK << PAT_SLOT4_SHIFT)
+        // One page past it is not, and neither is a range that only ends past
+        // it. Both are what an unrestored BAR probe mask decodes to.
+        assert!(!high_window_range_is_admissible(
+            LIMIT,
+            PAGE_4KIB as usize,
+            LIMIT
         ));
-        assert!(!pat_kernel_cache_contract_is_exact(
-            updated,
-            updated ^ (PAT_ENTRY_MASK << 8)
+        assert!(!high_window_range_is_admissible(
+            LIMIT - PAGE_4KIB,
+            2 * PAGE_4KIB as usize,
+            LIMIT
+        ));
+        assert!(!high_window_range_is_admissible(
+            0xffff_ffff_0000_0000,
+            PAGE_4KIB as usize,
+            LIMIT
         ));
     }
 

@@ -91,6 +91,15 @@ rustos_ap_real_mode:
     mov %ax, %ds
     mov %ax, %es
     mov %ax, %ss
+    # INIT leaves CR0.NW and CR0.CD set on supported x86 platforms.  Enter the
+    # architecturally defined no-fill state (CD=1, NW=0) and discard any reset
+    # cache contents before the AP reads the shared startup mailbox.  Kernel-mm
+    # installs the BSP MTRR/PAT baseline and only then clears CD before the AP
+    # may publish private readiness.
+    mov %cr0, %eax
+    and $0xdfffffff, %eax
+    mov %eax, %cr0
+    wbinvd
     lgdtw rustos_ap_boot_gdt_desc - rustos_ap_trampoline_start
     mov %cr0, %eax
     or $0x1, %eax

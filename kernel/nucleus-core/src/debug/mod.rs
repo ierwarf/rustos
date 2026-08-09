@@ -1,7 +1,13 @@
 pub mod boot_trace;
+#[cfg(rustos_debug_print_enabled)]
+mod deferred;
+#[cfg(rustos_debug_print_enabled)]
+mod milestone_class;
 mod kdiag_macros;
 #[cfg(rustos_debug_print_enabled)]
 mod milestone_frame;
+#[cfg(rustos_debug_print_enabled)]
+use milestone_class::{MilestoneOutputClass, milestone_loss_snapshot, milestone_output_class};
 
 use alloc::string::String;
 use alloc::vec;
@@ -670,33 +676,56 @@ fn emit_milestone_debugcon_line(record: MilestoneRecord) {
     }
     let user_context = current_user_context();
     let output_class = milestone_output_class(record.name);
-    if output_class == MilestoneOutputClass::QualificationCritical {
-        // Critical evidence accounts only for its own rendered loss.
-        let line = render_milestone_debugcon_line(record, user_context, output_class);
-        for _ in 0..output_class.output_attempts() {
-            if let Some(_guard) = try_debug_output_lock() {
-                print_bytes_unlocked(line.bytes());
-                return;
-            }
-            spin_loop();
-        }
-        record_milestone_output_drop(output_class, line.len() as u64);
-        return;
-    }
-
-    // Measurements are one-shot; Required keeps its bounded retry.
+    // Measurements are one-shot; Required and QualificationCritical keep the
+    // bounded retry.
     for _ in 0..output_class.output_attempts() {
         if let Some(_guard) = try_debug_output_lock() {
+            drain_deferred_records();
+            // Rendering allocates the output sequence, so it must run under
+            // DEBUG_LOCK: rendering first lets a CPU that loses the acquisition
+            // race publish a lower sequence after a higher one is already on the
+            // wire, which the host validator reads as replayed evidence. `line` is
+            // then complete before the first port I/O, so one `rep outsb` publishes
+            // the whole frame without a diagnostic splicing bytes into it.
             let line = render_milestone_debugcon_line(record, user_context, output_class);
-            // `line` is complete before the first port I/O. While DEBUG_LOCK
-            // remains held, one `rep outsb` publishes the whole frame, so a
-            // regular diagnostic cannot splice bytes into this milestone.
             print_bytes_unlocked(line.bytes());
             return;
         }
         spin_loop();
     }
-    record_milestone_output_drop(output_class, 0);
+    // The sink stayed held. A class whose loss the harness reads as a failure
+    // parks its record - not its rendered bytes, so the drainer still
+    // allocates the output sequence under the sink.
+    if output_class.must_reach_sink()
+        && deferred::park_milestone(deferred::ParkedMilestone {
+            record,
+            user_context,
+            output_class,
+        })
+    {
+        return;
+    }
+    // Critical evidence accounts only for its own rendered loss; the unwritten
+    // frame leaves a sequence gap, never a duplicate.
+    let discarded_bytes = if output_class == MilestoneOutputClass::QualificationCritical {
+        render_milestone_debugcon_line(record, user_context, output_class).len() as u64
+    } else {
+        0
+    };
+    record_milestone_output_drop(output_class, discarded_bytes);
+}
+
+/// Emit every parked record. The caller must hold the output sink.
+#[cfg(rustos_debug_print_enabled)]
+fn drain_deferred_records() {
+    deferred::drain(print_bytes_unlocked, |parked| {
+        let line = render_milestone_debugcon_line(
+            parked.record,
+            parked.user_context,
+            parked.output_class,
+        );
+        print_bytes_unlocked(line.bytes());
+    });
 }
 
 #[cfg(rustos_debug_print_enabled)]
@@ -769,66 +798,6 @@ pub fn milestones_dropped() -> u64 {
     0
 }
 
-#[cfg(rustos_debug_print_enabled)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum MilestoneOutputClass {
-    BestEffort,
-    Measurement,
-    Required,
-    QualificationCritical,
-}
-
-#[cfg(rustos_debug_print_enabled)]
-impl MilestoneOutputClass {
-    const fn output_attempts(self) -> usize {
-        match self {
-            Self::Required | Self::QualificationCritical => REQUIRED_MILESTONE_OUTPUT_ATTEMPTS,
-            Self::BestEffort | Self::Measurement => 1,
-        }
-    }
-}
-
-#[cfg(rustos_debug_print_enabled)]
-fn milestone_output_class(name: &str) -> MilestoneOutputClass {
-    match name {
-        "smp-qualification-ready"
-        | "smp-qualification-start"
-        | "smp-qualification-finish"
-        | "smp-qualification-complete" => MilestoneOutputClass::QualificationCritical,
-        _ if name.starts_with("kernel-scheduler-") => MilestoneOutputClass::Measurement,
-        _ if name.starts_with("smp-")
-            || name.starts_with("product-")
-            || name.starts_with("sched-activation-")
-            || name == "dvm-block-first-completion"
-            || name == "dvm-block-transport-revoked"
-            || name == "task-context-corrupted"
-            || name == "linux-user-fault"
-            || name == "linux-thread-clone-rejected"
-            || name.starts_with("ipc-donation-")
-            || name.starts_with("dvm-input-") =>
-        {
-            MilestoneOutputClass::Required
-        }
-        _ => MilestoneOutputClass::BestEffort,
-    }
-}
-
-#[cfg(rustos_debug_print_enabled)]
-fn milestone_loss_snapshot(
-    output_class: MilestoneOutputClass,
-    milestones_dropped: u64,
-    discarded_bytes: u64,
-    qualification_milestones_dropped: u64,
-    qualification_discarded_bytes: u64,
-) -> (u64, u64) {
-    match output_class {
-        MilestoneOutputClass::QualificationCritical => (
-            qualification_milestones_dropped,
-            qualification_discarded_bytes,
-        ),
-        _ => (milestones_dropped, discarded_bytes),
-    }
-}
 
 #[cfg(rustos_debug_print_enabled)]
 fn milestone_debugcon_visible(name: &str) -> bool {
@@ -976,12 +945,16 @@ pub fn println_serialized(args: fmt::Arguments<'_>) {
     }
     for _ in 0..DEBUG_OUTPUT_ACQUIRE_ATTEMPTS {
         if let Some(_guard) = try_debug_output_lock() {
+            drain_deferred_records();
             print_bytes_unlocked(line.bytes());
             return;
         }
         spin_loop();
     }
-    DEBUG_BYTES_DISCARDED.fetch_add(line.len() as u64, Ordering::Relaxed);
+    // Park for whichever CPU takes the sink next, rather than discarding.
+    if !deferred::park(line.bytes()) {
+        DEBUG_BYTES_DISCARDED.fetch_add(line.len() as u64, Ordering::Relaxed);
+    }
 }
 
 #[cfg(rustos_debug_print_enabled)]
@@ -1140,19 +1113,13 @@ pub fn dump_recent_trace_locations(reason: &str) {
 #[cfg(not(rustos_debug_print_enabled))]
 pub fn dump_recent_trace_locations(_reason: &str) {}
 
-/// Bounded retries before a userspace debug write gives up on the output lock.
+/// Bounded retries before a diagnostic hands its line to [`deferred`].
 ///
-/// The lock is held with interrupts disabled, so a failed try always means the
-/// holder is a different CPU that is running and will release. Waiting for it is
-/// therefore safe, and a single attempt is not enough: at 8 vCPU the kernel,
-/// uiserver, inputd, and the client all print, and a lost race discarded the
-/// bytes outright.
-///
-/// That silence had teeth. The acceptance proof needs 60 consecutive one-second
-/// WayClick windows, and window sequence numbers showed the transport losing
-/// them - `window=0 1 2 3 5`, with four gone and no record that anything was
-/// missing. An evidence channel that drops evidence cannot be used to fail a
-/// proof, and it had been failing one.
+/// The sink is held with interrupts disabled, so a failed try always means a
+/// different, running CPU holds it. Retrying is therefore safe and one attempt
+/// is not enough: at 8 vCPU the kernel, uiserver, inputd, and the client all
+/// print. Retries bound the loss but cannot remove it on an unfair lock, which
+/// is why exhausting them parks the line instead of discarding it.
 #[cfg(rustos_debug_print_enabled)]
 const DEBUG_OUTPUT_ACQUIRE_ATTEMPTS: usize = 4096;
 
@@ -1177,10 +1144,14 @@ pub fn write_debugcon_only(bytes: &[u8]) {
     }
     for _ in 0..DEBUG_OUTPUT_ACQUIRE_ATTEMPTS {
         if let Some(_guard) = try_debug_output_lock() {
+            drain_deferred_records();
             print_bytes_unlocked(bytes);
             return;
         }
         core::hint::spin_loop();
+    }
+    if deferred::park(bytes) {
+        return;
     }
     // ORDERING: Relaxed. A diagnostic counter with no other state attached,
     // read only by the once-per-second milestone burst.

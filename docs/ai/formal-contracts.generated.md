@@ -2,20 +2,20 @@
 # Formal Contract Registry
 
 - Schema: `3`
-- Registry SHA-256: `9c0720123f3fcfb68504b1119d7bf8fd572eb64b7d89b2cf2522e4778a56b1f4`
+- Registry SHA-256: `a97bc640951bc189d2479921abf2601facc753804570271b52923d860169d0a6`
 - Models: `127`
 - Whole flows: `68`
-- Transitions: `685`
+- Transitions: `687`
 - Product runtime scenarios: `3`
-- Exact source witnesses: `567`
+- Exact source witnesses: `573`
 - Apalache pilots: `3`
 - TLAPS theorem models: `2`
 - Runtime-traced models: `7`
 - Intentional-terminal exceptions: `91` (ceiling `91`)
 - Cyclic strongly connected components: `42`
-- Supporting model bindings: `98`
-- Explicit critical/high risk surfaces: `99`
-- Additional source mappings: `160`
+- Supporting model bindings: `99`
+- Explicit critical/high risk surfaces: `100`
+- Additional source mappings: `164`
 
 | Flow | Severity | Owners | Models | Requirements | Hazards | Sinks |
 | --- | --- | --- | --- | ---: | ---: | --- |
@@ -28,7 +28,7 @@
 | `commercial-envelope` | `critical` | caller, kernel-ipc, netd, service | commercial-service-envelope/CommercialServiceEnvelope | 6 | 6 | admitted, malformed-replied, peer-closed, reply-rejected, timed-out |
 | `commercial-product-boot` | `critical` | kernel-io-manager, rootd, storaged, uiserver, vfsd, wayclick, xtask-kvm | acceptance-profile-publication/AcceptanceProfilePublication, dvm-block-startup/DvmBlockStartup, dvm-display-readiness/DvmDisplayReadiness, input-ingestion-worker/InputIngestionWorker, product-boot/ProductBoot, rootd-bootstrap/RootdBootstrap, ui-frame-budget/UiFrameBudget | 19 | 19 | control-ready, failed, presented, revoked, storage-usable |
 | `cpu-affinity-observation` | `critical` | kernel-compat, kernel-hal, syscalld | cpu-affinity-observation/CpuAffinityObservation | 7 | 7 | rejected, replied |
-| `cpu-online-lifecycle` | `critical` | kernel-executive, kernel-hal, kernel-mm, kernel-ps, nucleus-core | cpu-online-lifecycle/CpuOnlineLifecycle | 17 | 17 | invariant-panic, online |
+| `cpu-online-lifecycle` | `critical` | kernel-executive, kernel-hal, kernel-mm, kernel-ps, nucleus-core | cpu-online-lifecycle/CpuOnlineLifecycle | 19 | 19 | invariant-panic, online |
 | `cpu-topology-admission` | `critical` | kernel-hal | cpu-topology-admission/CpuTopologyAdmission | 4 | 4 | published, rejected |
 | `cross-cpu-task-retirement` | `critical` | kernel-hal, kernel-mm, kernel-ps | cross-cpu-task-retirement/CrossCpuTaskRetirement | 8 | 8 | invariant-panic, reclaimed |
 | `deferred-process-activation` | `critical` | kernel-compat | deferred-process-activation/DeferredProcessActivation | 6 | 6 | exited, rejected, revoked |

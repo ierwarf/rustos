@@ -137,7 +137,13 @@ reason = "Robust-futex and clear_child_tid cleanup require aligned atomic user-w
 path = "kernel/mm/src/memory/kernel_vm.rs"
 severity = "critical"
 flows = ["cpu-online-lifecycle", "kernel-memory-protection", "tlb-shootdown-lifecycle", "dvm-block-ingress", "dvm-input-ingress"]
-reason = "Kernel image W xor X, direct-map permissions, permanent APIC leaf retyping, per-CPU PAT selectors, MMIO windows, shared-RAM cache selectors, and global shootdowns share the active kernel page tables."
+reason = "Kernel image W xor X, direct-map permissions, permanent APIC leaf retyping, MMIO windows, shared-RAM cache selectors, and global shootdowns share the active kernel page tables."
+
+[[risk_surfaces]]
+path = "kernel/mm/src/memory/cache_attributes.rs"
+severity = "critical"
+flows = ["cpu-online-lifecycle"]
+reason = "A sealed BSP MTRR/PAT/cache baseline must be restored and exactly read back by every reset-state AP before it enables caching, exposes shared page-table memory types, or publishes OnlineParked."
 
 [[risk_surfaces]]
 path = "kernel/mm/src/memory/address_space/rollback.rs"
@@ -685,6 +691,10 @@ models = [
 ]
 
 [[source_mappings]]
+path = "kernel/mm/src/memory/cache_attributes.rs"
+models = ["cpu-online-lifecycle/CpuOnlineLifecycle"]
+
+[[source_mappings]]
 path = "kernel/io-manager/src/io/dvm_block.rs"
 models = [
     "dvm-block-startup/DvmBlockStartup",
@@ -810,6 +820,18 @@ models = [
 [[source_mappings]]
 path = "driver-domains/linux/package/rustos-dvm-block/src/rustos_dvm_block_uio.c"
 models = ["dvm-block-startup/DvmBlockStartup"]
+
+[[source_mappings]]
+path = "driver-domains/linux/board/overlay/etc/init.d/S48rustos-dvm-net"
+models = ["dvm-network-ring/DvmNetworkRing"]
+
+[[source_mappings]]
+path = "driver-domains/linux/package/rustos-dvm-net/src/rustos-dvm-net.c"
+models = ["dvm-network-ring/DvmNetworkRing"]
+
+[[source_mappings]]
+path = "driver-domains/linux/package/rustos-dvm-net/src/rustos_dvm_net_uio.c"
+models = ["dvm-network-ring/DvmNetworkRing"]
 
 [[source_mappings]]
 path = "services/storaged/src/main.rs"

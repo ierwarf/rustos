@@ -93,6 +93,7 @@ MapRustosAtomicApertureWb ==
 MapLinuxAtomicApertureWb ==
     /\ phase \notin {"using", "timed-out"}
     /\ LinuxDriverContractHolds
+    /\ barPrefetchable
     /\ linuxApertureCache # "wb"
     /\ linuxApertureCache' = "wb"
     /\ UNCHANGED <<phase, rustosReady, peerReady, publicationFailed, waitState,
@@ -292,15 +293,16 @@ UseVolume ==
                    rebound, lastRebindWasExact>>
 
 Revoke ==
-    /\ phase \in {"armed", "ready", "proven"}
+    /\ phase \in {"armed", "ready", "proven", "using"}
     /\ phase' = "revoked"
     /\ rustosReady' = FALSE
     /\ waitState' = "idle"
     /\ dataPlaneProven' = FALSE
+    /\ volumeUsed' = FALSE
     /\ successorOffered' = FALSE
     /\ revokedPeerReady' = peerReady
     /\ UNCHANGED <<peerReady, publicationFailed, observedReady, now, deadline,
-                   volumeUsed, barPrefetchable, rustosApertureCache,
+                   barPrefetchable, rustosApertureCache,
                    linuxApertureCache, generation, candidateGeneration,
                    candidateSignatureValid, candidateCursorsZero,
                    candidateReadyClear, previousGeneration, rebound,
@@ -344,8 +346,8 @@ RebindSignedSuccessor ==
     /\ previousGeneration' = generation
     /\ rebound' = TRUE
     /\ lastRebindWasExact' =
-          candidateGeneration > generation /\ candidateCursorsZero
-          /\ candidateSignatureValid /\ candidateReadyClear
+          (candidateGeneration > generation /\ candidateCursorsZero
+           /\ candidateSignatureValid /\ candidateReadyClear)
     /\ UNCHANGED <<peerReady, now, deadline, barPrefetchable,
                    rustosApertureCache, linuxApertureCache,
                    candidateGeneration, candidateSignatureValid,

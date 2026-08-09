@@ -17,6 +17,7 @@ required_models = [
     "cross-cpu-task-retirement/CrossCpuTaskRetirement",
     "dvm-block-startup/DvmBlockStartup",
     "dvm-input-ring/DvmInputRing",
+    "dvm-network-ring/DvmNetworkRing",
     "dvm-transport-lifecycle/DvmTransportLifecycle",
     "exception-retirement-lifecycle/ExceptionRetirementLifecycle",
     "exec-address-space-transaction/ExecAddressSpaceTransaction",
@@ -138,6 +139,58 @@ invariant = "RawTscRequiresUniprocessorTopology"
 min_counterexample_states = 2
 
 [[mutation]]
+id = "cpu-online-ap-cache-enable-before-mtrr-restore"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "cpu-online-lifecycle/CpuOnlineLifecycle"
+flow = "cpu-online-lifecycle"
+find = '''EnableApCache(cpu) ==
+    /\ cpu # Bsp
+    /\ state[cpu] = Starting
+    /\ cacheState[cpu] = NoFillCache
+    /\ mtrrBaselineRestored[cpu]'''
+replace = '''EnableApCache(cpu) ==
+    /\ cpu # Bsp
+    /\ state[cpu] = Starting
+    /\ cacheState[cpu] = NoFillCache
+    /\ TRUE'''
+occurrence = 1
+invariant = "ApCacheEnableRequiresExactRestoredMemoryTypes"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "cpu-online-ap-no-fill-transition-bypassed"
+kind = "transition-effect"
+severity = "critical"
+model = "cpu-online-lifecycle/CpuOnlineLifecycle"
+flow = "cpu-online-lifecycle"
+find = "    /\\ cacheState' = [cacheState EXCEPT ![cpu] = NoFillCache]"
+replace = "    /\\ cacheState' = [cacheState EXCEPT ![cpu] = CacheEnabled]"
+occurrence = 1
+invariant = "ApCacheEnableRequiresExactRestoredMemoryTypes"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "cpu-online-ap-restore-before-bsp-baseline"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "cpu-online-lifecycle/CpuOnlineLifecycle"
+flow = "cpu-online-lifecycle"
+find = '''RestoreApMemoryTypeBaseline(cpu) ==
+    /\ cpu # Bsp
+    /\ state[cpu] = Starting
+    /\ cacheState[cpu] = NoFillCache
+    /\ bspMemoryTypeBaselineCaptured'''
+replace = '''RestoreApMemoryTypeBaseline(cpu) ==
+    /\ cpu # Bsp
+    /\ state[cpu] = Starting
+    /\ cacheState[cpu] = NoFillCache
+    /\ TRUE'''
+occurrence = 1
+invariant = "BspBaselinePrecedesEveryApRestore"
+min_counterexample_states = 4
+
+[[mutation]]
 id = "cpu-online-pat-readback-before-private-ready-removed"
 kind = "transition-guard-removal"
 severity = "critical"
@@ -146,11 +199,11 @@ flow = "cpu-online-lifecycle"
 find = '''PublishPrivateState(cpu) ==
     /\ state[cpu] = Starting
     /\ generation[cpu] = 1
-    /\ PatKernelCacheContractReady(cpu)'''
+    /\ CpuMemoryTypeContractReady(cpu)'''
 replace = '''PublishPrivateState(cpu) ==
     /\ state[cpu] = Starting
     /\ generation[cpu] = 1
-    /\ TRUE'''
+    /\ patSlot0Validated[cpu]'''
 occurrence = 1
 invariant = "BspAndEveryApReadBackExactPatBeforePrivateReady"
 min_counterexample_states = 3
@@ -195,7 +248,8 @@ find = '''RejectRestart(cpu) ==
                    dispatchAuthority, failedSeen, staleGenerationAttempted,
                    initialPatSlot0, patSlot0Validated, patProgrammed,
                    patReadback, sharedMemoryWbMapped,
-                   sharedMemorySelector>>'''
+                   sharedMemorySelector, bspMemoryTypeBaselineCaptured,
+                   mtrrBaselineRestored, cacheState>>'''
 replace = '''RejectRestart(cpu) ==
     /\ state[cpu] = Failed
     /\ state' = [state EXCEPT ![cpu] = Starting]
@@ -205,7 +259,8 @@ replace = '''RejectRestart(cpu) ==
                    dispatchAuthority, failedSeen, staleGenerationAttempted,
                    initialPatSlot0, patSlot0Validated, patProgrammed,
                    patReadback, sharedMemoryWbMapped,
-                   sharedMemorySelector>>'''
+                   sharedMemorySelector, bspMemoryTypeBaselineCaptured,
+                   mtrrBaselineRestored, cacheState>>'''
 occurrence = 1
 invariant = "FailedStateIsTerminalForBoot"
 min_counterexample_states = 3
@@ -331,6 +386,108 @@ replace = '''BeginBrokerTurn(caller) ==
 '''
 occurrence = 1
 invariant = "SingleFlightDrainOwnership"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "dvm-network-install-atomic-control-bypass"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "dvm-network-ring/DvmNetworkRing"
+flow = "dvm-network-ingress"
+find = '''Install ==
+    /\ ~installed
+    /\ rawHeader = ValidHeader
+    /\ cacheContract.barPrefetchable
+    /\ cacheContract.rustos = "wb"
+    /\ cacheContract.rustosAtomics'''
+replace = '''Install ==
+    /\ ~installed
+    /\ rawHeader = ValidHeader
+    /\ cacheContract.barPrefetchable
+    /\ cacheContract.rustos = "wb"
+    /\ TRUE'''
+occurrence = 1
+invariant = "InstalledTransportHasPrefetchableRustosWbAtomics"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "dvm-network-install-prefetchable-bypass"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "dvm-network-ring/DvmNetworkRing"
+flow = "dvm-network-ingress"
+find = '''Install ==
+    /\ ~installed
+    /\ rawHeader = ValidHeader
+    /\ cacheContract.barPrefetchable
+    /\ cacheContract.rustos = "wb"'''
+replace = '''Install ==
+    /\ ~installed
+    /\ rawHeader = ValidHeader
+    /\ TRUE
+    /\ cacheContract.rustos = "wb"'''
+occurrence = 1
+invariant = "InstalledTransportHasPrefetchableRustosWbAtomics"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "dvm-network-install-rustos-wb-bypass"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "dvm-network-ring/DvmNetworkRing"
+flow = "dvm-network-ingress"
+find = '''Install ==
+    /\ ~installed
+    /\ rawHeader = ValidHeader
+    /\ cacheContract.barPrefetchable
+    /\ cacheContract.rustos = "wb"'''
+replace = '''Install ==
+    /\ ~installed
+    /\ rawHeader = ValidHeader
+    /\ cacheContract.barPrefetchable
+    /\ TRUE'''
+occurrence = 1
+invariant = "InstalledTransportHasPrefetchableRustosWbAtomics"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "dvm-network-linux-atomic-readiness-bypass"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "dvm-network-ring/DvmNetworkRing"
+flow = "dvm-network-ingress"
+find = '''PublishLinuxReady ==
+    /\ installed
+    /\ ~linuxReady
+    /\ cacheContract.linux = "wb"
+    /\ cacheContract.linuxAtomics'''
+replace = '''PublishLinuxReady ==
+    /\ installed
+    /\ ~linuxReady
+    /\ cacheContract.linux = "wb"
+    /\ TRUE'''
+occurrence = 1
+invariant = "LinuxDataPlaneRequiresWbAtomics"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "dvm-network-linux-wb-readiness-bypass"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "dvm-network-ring/DvmNetworkRing"
+flow = "dvm-network-ingress"
+find = '''PublishLinuxReady ==
+    /\ installed
+    /\ ~linuxReady
+    /\ cacheContract.linux = "wb"
+    /\ cacheContract.linuxAtomics'''
+replace = '''PublishLinuxReady ==
+    /\ installed
+    /\ ~linuxReady
+    /\ TRUE
+    /\ cacheContract.linuxAtomics'''
+occurrence = 1
+invariant = "LinuxDataPlaneRequiresWbAtomics"
 min_counterexample_states = 3
 
 [[mutation]]
@@ -1398,7 +1555,8 @@ flow = "smp-ring3-qualification"
 find = '''Succeed ==
     /\ result = Pending
     /\ bindingState = Active
-    /\ TerminalRecorded'''
+    /\ TerminalRecorded
+    /\ QualificationEvidenceEventCount = 3 * workerCount + 1'''
 replace = '''Succeed ==
     /\ result = Pending
     /\ bindingState = Active

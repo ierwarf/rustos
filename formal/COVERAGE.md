@@ -110,7 +110,7 @@ failed infrastructure gates rather than implied successes:
 | An unallocated MSI vector accepts a handler/device route, failed MSI-X setup leaks a vector, a vector is rebound, or committed route identity is recycled | msi-vector-lifecycle | kernel/hal/src/arch/msi.rs and every DVM MSI-X installer |
 | Malformed firmware supplies an oversized or misidentified root table, partial MCFG entry, overlapping/unbounded ECAM aperture, or invalid HPET GAS and ring0 publishes any partial authority | acpi-table-admission | kernel/hal/src/arch/acpi.rs |
 | A truncated, duplicate, BSP-absent, hot-add-only, over-capacity, or invalid-address MADT publishes a partial CPU set, the BSP is not logical CPU zero, or raw APIC IDs become array indexes | cpu-topology-admission | kernel/hal/src/arch/acpi.rs |
-| A CPU skips private or scheduler readiness, a stale generation changes state, an unsupported in-boot restart reuses generation one instead of panicking, fixed trampoline pages alias the allocator or remain W+X, INIT/SIPI targets the wrong AP, a mailbox is reused concurrently, two CPUs share private architecture state, lockdep aliases per-CPU state, or dispatch appears before full online | cpu-online-lifecycle | kernel/nucleus-core/src/ap_trampoline.rs, kernel/hal/src/arch/{smp,gdt,msi}.rs, kernel/ps/src/user/syscall.rs, kernel/mm/src/memory/phys.rs, kernel/nucleus-core/src/util/lockdep.rs, and kernel/executive/src/boot.rs |
+| A CPU skips private or scheduler readiness, a stale generation changes state, an unsupported in-boot restart reuses generation one instead of panicking, the BSP fails to seal one exact MTRR/PAT/cache baseline before SIPI, a reset AP enables cache or publishes private readiness before no-fill restore/readback, fixed trampoline pages alias the allocator or remain W+X, INIT/SIPI targets the wrong AP, a mailbox is reused concurrently, two CPUs share private architecture state, lockdep aliases per-CPU state, or dispatch appears before full online | cpu-online-lifecycle | kernel/nucleus-core/src/{ap_trampoline.rs,multiboot2_entry.S}, kernel/mm/src/memory/cache_attributes.rs, kernel/hal/src/arch/{smp,gdt,msi}.rs, kernel/ps/src/user/syscall.rs, kernel/mm/src/memory/phys.rs, kernel/nucleus-core/src/util/lockdep.rs, and kernel/executive/src/boot.rs |
 | A task is current on two CPUs, a remote wake loses its exact target request or lock-held target custody, ordinary local work broadcasts to unrelated CPUs, the unlock flusher sends an unsupported fixed self-IPI, repeated wakes storm IPIs, a raw-lock interruption consumes work, or a private fixed IPI targets an invalid CPU/vector | smp-reschedule-ipi-lifecycle | kernel/ps/src/multitask/{cpu_local,irq}.rs, kernel/ps/src/multitask/scheduler/{runqueue_policy,smp}.rs, kernel/hal/src/arch/msi.rs, and kernel/lowlevel/src/interrupts.rs |
 | A pending raw acquisition consumes another guard's preemption pin, pending-to-held publication or failed-acquire cancellation is interruptible, a raw guard releases on another CPU/APIC identity, preemption depth underflows, an IRQ dispatches while any nesting remains, scheduler scratch is mistaken for remote ownership, current-task publication duplicates one running task, a blocked transition wake is represented only by legacy `ready` without one mailbox/runqueue owner, that queued wake dispatches before assembly commit or is claimed twice afterward, a ready scan reads a frame owned by any CPU, a real slot switch skips task-specific architecture restoration, a same-task turn redundantly flushes that state, or the outgoing task stack becomes remotely runnable before assembly switches `rsp` to the incoming frame | scheduler-cpu-ownership | kernel/nucleus-core/src/util/lockdep.rs, kernel/lowlevel/src/interrupts.rs, kernel/hal/src/interrupt_stubs.rs, and kernel/ps/src/multitask/{cpu_local,irq,scheduler,scheduler/runqueue_policy}.rs |
 | A matching active root is omitted from an address-space mutation snapshot, a global mutation filters any eligible CPU, changed activation publishes before its CR3 flush, retirement starts while a task/slot/process reference remains, a Retiring/Reclaimed root is activated again, an identical active root unnecessarily reloads CR3, stale translations survive acknowledgement, an acknowledgement aliases another generation, or a frame is reclaimed before every captured target flush | tlb-shootdown-lifecycle | kernel/hal/src/arch/tlb_shootdown.rs, kernel/mm/src/memory/{address_space,kernel_vm}.rs, kernel/mm/src/memory/address_space/rollback.rs, and kernel/ps/src/multitask/{scheduler,process_table}.rs |
@@ -751,18 +751,20 @@ runtime contention, DVM behavior, and sustained FPS remain separate KVM gates.
 
 ## Shared-RAM cache and AP PAT coverage
 
-Covered cache-alias threats are a non-prefetchable block/input BAR accepted as
-atomic RAM, a RustOS or Linux WC/UC alias of the WB aperture, a host input
-producer without ordinary `MAP_SHARED`, and mixed cache mappings that overlap
+Covered cache-alias threats are a non-prefetchable block/input/network BAR
+accepted as atomic RAM, a RustOS or Linux WC/UC alias of the WB aperture, a
+host input producer without ordinary `MAP_SHARED`, a network relay that opens
+raw PCI `resource2` instead of its exact WB UIO mapping, bytewise snapshots of
+live atomic network cursors, and mixed cache mappings that overlap
 through the direct map, high window, or their boundary. The cache-selector
 witness requires WB's empty page-table flags. Mapping coverage also includes
 allocation failure leaving cache ownership and PTEs unchanged: all registry,
 override, new-page, and retained-index capacity is reserved before its
 mutation. CPU-online coverage includes an AP that publishes `OnlineParked` or
 private-ready without an admissible current-CPU PAT0=WB, PAT2=UC/PAT4=WC
-programming, and exact full-MSR readback. The scope is deliberately block/input
-and CPU cache state; network remains unresolved and display pixels retain their
-separate contract.
+programming, and exact full-MSR readback. The scope covers block/input/network
+atomic shared control plus CPU cache state; display pixels retain their separate
+write-mostly WC contract.
 
 Permanent-boot coverage separately rejects a second high-window alias of the
 local APIC direct-map leaf, an early APIC/PIC use before its UC retype, raw

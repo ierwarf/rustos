@@ -280,6 +280,23 @@ pub unsafe fn initialize_kernel(boot_info_ptr: *const BootInfo) {
     hal_api::init_pic();
     announce_ready("PIC", b"PIC initialized.\r\n");
 
+    // Size every BAR once here, while no driver owns a function, then seal the
+    // probe away. A size probe disables the function's decode and writes all
+    // ones into the BAR, so repeating it from a later driver scan makes a
+    // concurrent CPU read another driver's live aperture as undecoded zeros.
+    // This is the single point at which that operation is safe.
+    let sized_bars = hal_api::arch::pci::enumerate_and_seal_resources();
+    assert!(
+        hal_api::arch::pci::resource_enumeration_is_sealed(),
+        "PCI resource enumeration must be sealed before the first driver probe"
+    );
+    debug::record_milestone(
+        debug::LogCategory::Boot,
+        "pci-resources-sealed",
+        sized_bars as u64,
+        1,
+    );
+
     // ivshmem is a PCI function. The DVM providers must be probed only after
     // ACPI has published the PCI bus regions; probing earlier silently sees no
     // device and can make a firmware framebuffer look like a live DVM path.
@@ -562,8 +579,8 @@ extern "C" fn rustos_ap_entry(
         "AP startup entered outside Starting"
     );
     assert!(
-        mm_api::boot::initialize_current_cpu_cache_attributes(),
-        "AP could not verify its x86 PAT write-combining slot"
+        mm_api::boot::initialize_application_processor_cache_attributes(),
+        "AP could not restore its BSP MTRR/PAT/cache baseline"
     );
     debug::record_milestone(
         debug::LogCategory::Boot,
@@ -833,8 +850,8 @@ mod tests {
             .expect("AP entry must remain source-visible")
             .1;
         let cache_init = ap_entry
-            .find("mm_api::boot::initialize_current_cpu_cache_attributes()")
-            .expect("AP entry must initialize its local PAT");
+            .find("mm_api::boot::initialize_application_processor_cache_attributes()")
+            .expect("AP entry must restore its local MTRR/PAT/cache baseline");
         let online_parked = ap_entry
             .find("CpuLifecycleState::OnlineParked")
             .expect("AP entry must publish OnlineParked");

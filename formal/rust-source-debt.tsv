@@ -25,6 +25,7 @@ kernel/mm/src/memory/address_space.rs	24	0
 kernel/mm/src/memory/address_space/atomic_user.rs	0	0
 kernel/mm/src/memory/address_space/rollback.rs	0	0
 kernel/mm/src/memory/kernel_vm.rs	16	0
+kernel/mm/src/memory/cache_attributes.rs	0	0
 kernel/mm/src/memory/phys.rs	5	0
 kernel/mm/src/memory/heap.rs	9	0
 kernel/mm/src/api.rs	0	0

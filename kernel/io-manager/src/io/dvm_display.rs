@@ -1471,6 +1471,33 @@ fn slot_offset(slot: usize) -> Option<usize> {
     (DVM_GUI_SURFACE_POOL_HEADER_BYTES as usize).checked_add(slot.checked_mul(slot_bytes)?)
 }
 
+/// Whether a registered scanout buffer lies inside the pixel region this
+/// kernel published.
+///
+/// A display provider registers an address only so the present path can blit
+/// through it; the provenance of that memory is the kernel's, never the
+/// caller's. Linux DRM removes the ambiguity outright by taking a GEM handle
+/// instead of an address, so the kernel resolves memory it already owns. This
+/// is the same rule expressed as a containment check: an address the kernel
+/// did not publish is not a scanout buffer, whatever the caller says.
+pub(crate) fn scanout_region_contains(addr: u64, size: u64) -> bool {
+    // Bound against the region the kernel owns by construction, not against
+    // whatever the pool handshake has published so far. Provenance is a
+    // property of the memory, so it must not depend on how much of the
+    // transport happens to be installed when a provider registers.
+    let region_start = crate::memory::higher_half_addr(GUI_DVM_PIXEL_REGION_PHYS_ADDR);
+    if size == 0 {
+        return false;
+    }
+    let (Some(end), Some(region_end)) = (
+        addr.checked_add(size),
+        region_start.checked_add(GUI_DVM_PIXEL_REGION_BYTES),
+    ) else {
+        return false;
+    };
+    addr >= region_start && end <= region_end
+}
+
 /// A replacement provider must not leave an installed GUI-DVM pool reachable.
 pub(crate) fn on_framebuffer_installed(framebuffer_addr: u64) {
     let pixel_addr = SHARED_PIXEL_ADDR.load(Ordering::Acquire);
@@ -1507,13 +1534,19 @@ fn gui_dvm_offline_interrupt(_vector: u8) {
 /// device cannot turn them into a generic guest-selected interrupt allocator.
 struct GuiInterruptInstall {
     capability: crate::arch::pci::MsixCapability,
-    device: crate::arch::pci::PciDevice,
+    /// Exclusive claim on the function, held for the transaction's whole life
+    /// so no other driver can reprogram the interrupts this one armed.
+    attach: Option<crate::arch::pci::PciAttach>,
     control: Option<crate::arch::msi::CommittedMsiVector>,
     offline: Option<crate::arch::msi::CommittedMsiVector>,
 }
 
 impl GuiInterruptInstall {
     fn retain_permanent(mut self) {
+        self.attach
+            .take()
+            .expect("GUI DVM interrupt transaction lost its device claim")
+            .retain_permanent();
         self.control
             .take()
             .expect("GUI DVM interrupt transaction lost control vector")
@@ -1527,9 +1560,12 @@ impl GuiInterruptInstall {
 
 impl Drop for GuiInterruptInstall {
     fn drop(&mut self) {
-        if self.control.is_some() || self.offline.is_some() {
-            self.capability.set_function_masked(self.device, true);
-            self.capability.set_enabled(self.device, false);
+        if let (Some(attach), true) = (
+            self.attach.as_ref(),
+            self.control.is_some() || self.offline.is_some(),
+        ) {
+            self.capability.set_function_masked(attach, true);
+            self.capability.set_enabled(attach, false);
             drop(self.offline.take());
             drop(self.control.take());
         }
@@ -1537,6 +1573,9 @@ impl Drop for GuiInterruptInstall {
 }
 
 fn arm_gui_dvm_interrupts(device: crate::arch::pci::PciDevice) -> Option<GuiInterruptInstall> {
+    // Claim the function before the first configuration write; this transport
+    // owns its ivshmem function outright for the rest of the boot.
+    let attach = crate::arch::pci::attach(device, crate::arch::pci::PciAttachMode::Exclusive)?;
     let Some(capability) = device.msix_capability() else {
         return None;
     };
@@ -1558,8 +1597,8 @@ fn arm_gui_dvm_interrupts(device: crate::arch::pci::PciDevice) -> Option<GuiInte
     {
         return None;
     }
-    capability.set_function_masked(device, true);
-    capability.set_enabled(device, false);
+    capability.set_function_masked(&attach, true);
+    capability.set_enabled(&attach, false);
     let Some(mut control_lease) = crate::arch::msi::MsiVectorLease::allocate() else {
         return None;
     };
@@ -1597,12 +1636,12 @@ fn arm_gui_dvm_interrupts(device: crate::arch::pci::PciDevice) -> Option<GuiInte
         );
     }
     fence(Ordering::SeqCst);
-    capability.set_enabled(device, true);
-    capability.set_function_masked(device, false);
+    capability.set_enabled(&attach, true);
+    capability.set_function_masked(&attach, false);
     crate::driver::mmio::unmap(table.cast());
     Some(GuiInterruptInstall {
         capability,
-        device,
+        attach: Some(attach),
         control: Some(control_lease.commit()),
         offline: Some(offline_lease.commit()),
     })

@@ -7,10 +7,14 @@ publish scheduling authority before its private architectural state and
 scheduler substrate are ready. IA32_PAT is per logical CPU, so the BSP and
 every AP program and exactly read back slot 0 as WB, slot 2 as UC, and slot 4
 as WC before private-ready publication or dispatch. The shared-RAM WB mapping
-uses slot 0 and does not depend on the WC selector in slot 4.
+uses slot 0 and does not depend on the WC selector in slot 4. INIT leaves an AP
+cache-disabled; the AP must first enter CD=1/NW=0 no-fill mode, restore the
+sealed BSP MTRR/PAT baseline, and only then enable caching. No AP can publish
+private readiness from reset cache state or a reset/foreign MTRR baseline.
 
 Concrete owner:
   * kernel/hal/src/arch/smp.rs
+  * kernel/mm/src/memory/cache_attributes.rs
   * kernel/mm/src/memory/kernel_vm.rs
 ***************************************************************************)
 
@@ -35,22 +39,35 @@ UnmappedSelector == "unmapped"
 CacheSelectors == {UnmappedSelector, WbSelector, WcSlot4Selector}
 PatRequiredStates == {OnlineParked, SchedulerReady, Online, Quarantined}
 
+ResetCacheDisabled == "reset-cache-disabled"
+NoFillCache == "no-fill-cache"
+CacheEnabled == "cache-enabled"
+CacheStates == {ResetCacheDisabled, NoFillCache, CacheEnabled}
+
 VARIABLES state, generation, privateReady, schedulerReady, dispatchAuthority,
           failedSeen, staleGenerationAttempted, restartAttempted, panicRaised,
           initialPatSlot0, patSlot0Validated, patProgrammed, patReadback,
           sharedMemoryWbMapped,
-          sharedMemorySelector
+          sharedMemorySelector, bspMemoryTypeBaselineCaptured,
+          mtrrBaselineRestored, cacheState
 
 vars == <<state, generation, privateReady, schedulerReady, dispatchAuthority,
           failedSeen, staleGenerationAttempted, restartAttempted, panicRaised,
           initialPatSlot0, patSlot0Validated, patProgrammed, patReadback,
           sharedMemoryWbMapped,
-          sharedMemorySelector>>
+          sharedMemorySelector, bspMemoryTypeBaselineCaptured,
+          mtrrBaselineRestored, cacheState>>
 
 PatKernelCacheContractReady(cpu) ==
     patSlot0Validated[cpu]
     /\ patProgrammed[cpu] = PatKernelCacheContract
     /\ patReadback[cpu] = PatKernelCacheContract
+
+CpuMemoryTypeContractReady(cpu) ==
+    /\ bspMemoryTypeBaselineCaptured
+    /\ mtrrBaselineRestored[cpu]
+    /\ cacheState[cpu] = CacheEnabled
+    /\ PatKernelCacheContractReady(cpu)
 
 Init ==
     /\ state = [cpu \in Cpus |-> Discovered]
@@ -70,6 +87,10 @@ Init ==
     /\ patReadback = [cpu \in Cpus |-> PatUnread]
     /\ sharedMemoryWbMapped = FALSE
     /\ sharedMemorySelector = UnmappedSelector
+    /\ bspMemoryTypeBaselineCaptured = FALSE
+    /\ mtrrBaselineRestored = [cpu \in Cpus |-> FALSE]
+    /\ cacheState = [cpu \in Cpus |->
+          IF cpu = Bsp THEN CacheEnabled ELSE ResetCacheDisabled]
 
 Start(cpu) ==
     /\ state[cpu] = Discovered
@@ -78,10 +99,25 @@ Start(cpu) ==
                    failedSeen, staleGenerationAttempted, restartAttempted,
                    panicRaised, initialPatSlot0, patSlot0Validated,
                    patProgrammed, patReadback,
-                   sharedMemoryWbMapped, sharedMemorySelector>>
+                   sharedMemoryWbMapped, sharedMemorySelector,
+                   bspMemoryTypeBaselineCaptured, mtrrBaselineRestored,
+                   cacheState>>
+
+EnterApNoFillCache(cpu) ==
+    /\ cpu # Bsp
+    /\ state[cpu] = Starting
+    /\ cacheState[cpu] = ResetCacheDisabled
+    /\ cacheState' = [cacheState EXCEPT ![cpu] = NoFillCache]
+    /\ UNCHANGED <<state, generation, privateReady, schedulerReady,
+                   dispatchAuthority, failedSeen, staleGenerationAttempted,
+                   restartAttempted, panicRaised, initialPatSlot0,
+                   patSlot0Validated, patProgrammed, patReadback,
+                   sharedMemoryWbMapped, sharedMemorySelector,
+                   bspMemoryTypeBaselineCaptured, mtrrBaselineRestored>>
 
 ValidatePatSlot0Wb(cpu) ==
     /\ state[cpu] = Starting
+    /\ (cpu = Bsp \/ cacheState[cpu] = NoFillCache)
     /\ initialPatSlot0[cpu] = "wb"
     /\ ~patSlot0Validated[cpu]
     /\ patSlot0Validated' = [patSlot0Validated EXCEPT ![cpu] = TRUE]
@@ -89,20 +125,24 @@ ValidatePatSlot0Wb(cpu) ==
                    dispatchAuthority, failedSeen, staleGenerationAttempted,
                    restartAttempted, panicRaised, initialPatSlot0,
                    patProgrammed, patReadback, sharedMemoryWbMapped,
-                   sharedMemorySelector>>
+                   sharedMemorySelector, bspMemoryTypeBaselineCaptured,
+                   mtrrBaselineRestored, cacheState>>
 
 RejectInvalidPatSlot0(cpu) ==
     /\ state[cpu] = Starting
+    /\ (cpu = Bsp \/ cacheState[cpu] = NoFillCache)
     /\ initialPatSlot0[cpu] # "wb"
     /\ panicRaised' = TRUE
     /\ UNCHANGED <<state, generation, privateReady, schedulerReady,
                    dispatchAuthority, failedSeen, staleGenerationAttempted,
                    restartAttempted, initialPatSlot0, patSlot0Validated,
                    patProgrammed, patReadback, sharedMemoryWbMapped,
-                   sharedMemorySelector>>
+                   sharedMemorySelector, bspMemoryTypeBaselineCaptured,
+                   mtrrBaselineRestored, cacheState>>
 
 ProgramPatKernelCacheContract(cpu) ==
     /\ state[cpu] = Starting
+    /\ (cpu = Bsp \/ cacheState[cpu] = NoFillCache)
     /\ patSlot0Validated[cpu]
     /\ patProgrammed[cpu].slot2 = "unset"
     /\ patProgrammed[cpu].slot4 = "unset"
@@ -114,10 +154,13 @@ ProgramPatKernelCacheContract(cpu) ==
                    dispatchAuthority, failedSeen, staleGenerationAttempted,
                    restartAttempted, panicRaised, initialPatSlot0,
                    patSlot0Validated, patReadback,
-                   sharedMemoryWbMapped, sharedMemorySelector>>
+                   sharedMemoryWbMapped, sharedMemorySelector,
+                   bspMemoryTypeBaselineCaptured, mtrrBaselineRestored,
+                   cacheState>>
 
 ReadbackPatKernelCacheContract(cpu) ==
     /\ state[cpu] = Starting
+    /\ (cpu = Bsp \/ cacheState[cpu] = NoFillCache)
     /\ patProgrammed[cpu] = PatKernelCacheContract
     /\ patReadback[cpu] = PatUnread
     /\ patReadback' = [patReadback EXCEPT ![cpu] = PatKernelCacheContract]
@@ -125,7 +168,50 @@ ReadbackPatKernelCacheContract(cpu) ==
                    dispatchAuthority, failedSeen, staleGenerationAttempted,
                    restartAttempted, panicRaised, initialPatSlot0,
                    patSlot0Validated, patProgrammed,
-                   sharedMemoryWbMapped, sharedMemorySelector>>
+                   sharedMemoryWbMapped, sharedMemorySelector,
+                   bspMemoryTypeBaselineCaptured, mtrrBaselineRestored,
+                   cacheState>>
+
+CaptureBspMemoryTypeBaseline ==
+    /\ state[Bsp] = Starting
+    /\ cacheState[Bsp] = CacheEnabled
+    /\ PatKernelCacheContractReady(Bsp)
+    /\ ~bspMemoryTypeBaselineCaptured
+    /\ bspMemoryTypeBaselineCaptured' = TRUE
+    /\ mtrrBaselineRestored' = [mtrrBaselineRestored EXCEPT ![Bsp] = TRUE]
+    /\ UNCHANGED <<state, generation, privateReady, schedulerReady,
+                   dispatchAuthority, failedSeen, staleGenerationAttempted,
+                   restartAttempted, panicRaised, initialPatSlot0,
+                   patSlot0Validated, patProgrammed, patReadback,
+                   sharedMemoryWbMapped, sharedMemorySelector, cacheState>>
+
+RestoreApMemoryTypeBaseline(cpu) ==
+    /\ cpu # Bsp
+    /\ state[cpu] = Starting
+    /\ cacheState[cpu] = NoFillCache
+    /\ bspMemoryTypeBaselineCaptured
+    /\ ~mtrrBaselineRestored[cpu]
+    /\ mtrrBaselineRestored' = [mtrrBaselineRestored EXCEPT ![cpu] = TRUE]
+    /\ UNCHANGED <<state, generation, privateReady, schedulerReady,
+                   dispatchAuthority, failedSeen, staleGenerationAttempted,
+                   restartAttempted, panicRaised, initialPatSlot0,
+                   patSlot0Validated, patProgrammed, patReadback,
+                   sharedMemoryWbMapped, sharedMemorySelector,
+                   bspMemoryTypeBaselineCaptured, cacheState>>
+
+EnableApCache(cpu) ==
+    /\ cpu # Bsp
+    /\ state[cpu] = Starting
+    /\ cacheState[cpu] = NoFillCache
+    /\ mtrrBaselineRestored[cpu]
+    /\ PatKernelCacheContractReady(cpu)
+    /\ cacheState' = [cacheState EXCEPT ![cpu] = CacheEnabled]
+    /\ UNCHANGED <<state, generation, privateReady, schedulerReady,
+                   dispatchAuthority, failedSeen, staleGenerationAttempted,
+                   restartAttempted, panicRaised, initialPatSlot0,
+                   patSlot0Validated, patProgrammed, patReadback,
+                   sharedMemoryWbMapped, sharedMemorySelector,
+                   bspMemoryTypeBaselineCaptured, mtrrBaselineRestored>>
 
 MapSharedMemoryWb ==
     /\ ~sharedMemoryWbMapped
@@ -134,19 +220,22 @@ MapSharedMemoryWb ==
     /\ UNCHANGED <<state, generation, privateReady, schedulerReady,
                    dispatchAuthority, failedSeen, staleGenerationAttempted,
                    restartAttempted, panicRaised, initialPatSlot0,
-                   patSlot0Validated, patProgrammed, patReadback>>
+                   patSlot0Validated, patProgrammed, patReadback,
+                   bspMemoryTypeBaselineCaptured, mtrrBaselineRestored,
+                   cacheState>>
 
 PublishPrivateState(cpu) ==
     /\ state[cpu] = Starting
     /\ generation[cpu] = 1
-    /\ PatKernelCacheContractReady(cpu)
+    /\ CpuMemoryTypeContractReady(cpu)
     /\ state' = [state EXCEPT ![cpu] = OnlineParked]
     /\ privateReady' = [privateReady EXCEPT ![cpu] = TRUE]
     /\ UNCHANGED <<generation, schedulerReady, dispatchAuthority, failedSeen,
                    staleGenerationAttempted, restartAttempted, panicRaised,
                    initialPatSlot0, patSlot0Validated, patProgrammed,
                    patReadback, sharedMemoryWbMapped,
-                   sharedMemorySelector>>
+                   sharedMemorySelector, bspMemoryTypeBaselineCaptured,
+                   mtrrBaselineRestored, cacheState>>
 
 PublishScheduler(cpu) ==
     /\ state[cpu] = OnlineParked
@@ -157,20 +246,22 @@ PublishScheduler(cpu) ==
                    staleGenerationAttempted, restartAttempted, panicRaised,
                    initialPatSlot0, patSlot0Validated, patProgrammed,
                    patReadback, sharedMemoryWbMapped,
-                   sharedMemorySelector>>
+                   sharedMemorySelector, bspMemoryTypeBaselineCaptured,
+                   mtrrBaselineRestored, cacheState>>
 
 AdmitDispatch(cpu) ==
     /\ state[cpu] = SchedulerReady
     /\ privateReady[cpu]
     /\ schedulerReady[cpu]
-    /\ PatKernelCacheContractReady(cpu)
+    /\ CpuMemoryTypeContractReady(cpu)
     /\ state' = [state EXCEPT ![cpu] = Online]
     /\ dispatchAuthority' = [dispatchAuthority EXCEPT ![cpu] = TRUE]
     /\ UNCHANGED <<generation, privateReady, schedulerReady, failedSeen,
                    staleGenerationAttempted, restartAttempted, panicRaised,
                    initialPatSlot0, patSlot0Validated, patProgrammed,
                    patReadback, sharedMemoryWbMapped,
-                   sharedMemorySelector>>
+                   sharedMemorySelector, bspMemoryTypeBaselineCaptured,
+                   mtrrBaselineRestored, cacheState>>
 
 Quarantine(cpu) ==
     /\ state[cpu] = Online
@@ -180,7 +271,8 @@ Quarantine(cpu) ==
                    staleGenerationAttempted, restartAttempted, panicRaised,
                    initialPatSlot0, patSlot0Validated, patProgrammed,
                    patReadback, sharedMemoryWbMapped,
-                   sharedMemorySelector>>
+                   sharedMemorySelector, bspMemoryTypeBaselineCaptured,
+                   mtrrBaselineRestored, cacheState>>
 
 Fail(cpu) ==
     /\ state[cpu] \in {Starting, OnlineParked, SchedulerReady, Quarantined}
@@ -191,7 +283,8 @@ Fail(cpu) ==
                    staleGenerationAttempted, restartAttempted, panicRaised,
                    initialPatSlot0, patSlot0Validated, patProgrammed,
                    patReadback, sharedMemoryWbMapped,
-                   sharedMemorySelector>>
+                   sharedMemorySelector, bspMemoryTypeBaselineCaptured,
+                   mtrrBaselineRestored, cacheState>>
 
 RejectStaleGeneration ==
     /\ staleGenerationAttempted' = TRUE
@@ -200,7 +293,8 @@ RejectStaleGeneration ==
                    dispatchAuthority, failedSeen, restartAttempted,
                    initialPatSlot0, patSlot0Validated, patProgrammed,
                    patReadback, sharedMemoryWbMapped,
-                   sharedMemorySelector>>
+                   sharedMemorySelector, bspMemoryTypeBaselineCaptured,
+                   mtrrBaselineRestored, cacheState>>
 
 RejectRestart(cpu) ==
     /\ state[cpu] = Failed
@@ -210,7 +304,8 @@ RejectRestart(cpu) ==
                    dispatchAuthority, failedSeen, staleGenerationAttempted,
                    initialPatSlot0, patSlot0Validated, patProgrammed,
                    patReadback, sharedMemoryWbMapped,
-                   sharedMemorySelector>>
+                   sharedMemorySelector, bspMemoryTypeBaselineCaptured,
+                   mtrrBaselineRestored, cacheState>>
 
 Terminal ==
     /\ \A cpu \in Cpus : state[cpu] = Failed
@@ -226,10 +321,13 @@ Next ==
     ELSE
         \/ \E cpu \in Cpus:
             Start(cpu)
+            \/ EnterApNoFillCache(cpu)
             \/ ValidatePatSlot0Wb(cpu)
             \/ RejectInvalidPatSlot0(cpu)
             \/ ProgramPatKernelCacheContract(cpu)
             \/ ReadbackPatKernelCacheContract(cpu)
+            \/ RestoreApMemoryTypeBaseline(cpu)
+            \/ EnableApCache(cpu)
             \/ PublishPrivateState(cpu)
             \/ PublishScheduler(cpu)
             \/ AdmitDispatch(cpu)
@@ -237,6 +335,7 @@ Next ==
             \/ Fail(cpu)
             \/ RejectRestart(cpu)
         \/ MapSharedMemoryWb
+        \/ CaptureBspMemoryTypeBaseline
         \/ RejectStaleGeneration
         \/ Terminal
 
@@ -261,6 +360,9 @@ TypeOK ==
     /\ patReadback \in [Cpus -> PatStates]
     /\ sharedMemoryWbMapped \in BOOLEAN
     /\ sharedMemorySelector \in CacheSelectors
+    /\ bspMemoryTypeBaselineCaptured \in BOOLEAN
+    /\ mtrrBaselineRestored \in [Cpus -> BOOLEAN]
+    /\ cacheState \in [Cpus -> CacheStates]
 
 BootEpochGenerationIsFixed ==
     \A cpu \in Cpus : generation[cpu] = 1
@@ -285,11 +387,24 @@ InvalidPatSlot0CannotReachPrivateReady ==
 BspAndEveryApReadBackExactPatBeforePrivateReady ==
     \A cpu \in Cpus:
         state[cpu] \in PatRequiredStates =>
-            PatKernelCacheContractReady(cpu) /\ privateReady[cpu]
+            CpuMemoryTypeContractReady(cpu) /\ privateReady[cpu]
 
 PrivateReadyRequiresExactPatReadback ==
+    \A cpu \in Cpus: privateReady[cpu] => CpuMemoryTypeContractReady(cpu)
+
+BspBaselinePrecedesEveryApRestore ==
+    \A cpu \in Cpus: mtrrBaselineRestored[cpu] => bspMemoryTypeBaselineCaptured
+
+ResetOrNoFillApCannotPublishPrivateReady ==
     \A cpu \in Cpus:
-        privateReady[cpu] => PatKernelCacheContractReady(cpu)
+        cacheState[cpu] # CacheEnabled =>
+            ~privateReady[cpu] /\ ~dispatchAuthority[cpu]
+
+ApCacheEnableRequiresExactRestoredMemoryTypes ==
+    \A cpu \in Cpus:
+        cpu # Bsp /\ cacheState[cpu] = CacheEnabled =>
+            /\ mtrrBaselineRestored[cpu]
+            /\ PatKernelCacheContractReady(cpu)
 
 WbSharedMemoryDoesNotUseWcSelector ==
     sharedMemoryWbMapped => sharedMemorySelector = WbSelector
@@ -300,7 +415,7 @@ DispatchRequiresCompleteCpu ==
             /\ state[cpu] = Online
             /\ privateReady[cpu]
             /\ schedulerReady[cpu]
-            /\ PatKernelCacheContractReady(cpu)
+            /\ CpuMemoryTypeContractReady(cpu)
 
 OnlineRequiresCompleteCpu ==
     \A cpu \in Cpus:
@@ -308,7 +423,7 @@ OnlineRequiresCompleteCpu ==
             /\ privateReady[cpu]
             /\ schedulerReady[cpu]
             /\ dispatchAuthority[cpu]
-            /\ PatKernelCacheContractReady(cpu)
+            /\ CpuMemoryTypeContractReady(cpu)
 
 FailedCpuOwnsNoDispatch ==
     \A cpu \in Cpus : state[cpu] = Failed => ~dispatchAuthority[cpu]

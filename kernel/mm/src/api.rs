@@ -47,12 +47,16 @@ pub mod address_space {
 pub mod boot {
     use super::BootInfo;
 
+    pub fn capture_boot_cpu_cache_attributes() -> bool {
+        crate::memory::kernel_vm::capture_boot_cpu_cache_attributes()
+    }
+
     pub fn init_paging(boot_info_ptr: *const BootInfo) {
         crate::memory::paging::init(boot_info_ptr);
     }
 
-    pub fn initialize_current_cpu_cache_attributes() -> bool {
-        crate::memory::kernel_vm::initialize_current_cpu_cache_attributes()
+    pub fn initialize_application_processor_cache_attributes() -> bool {
+        crate::memory::kernel_vm::initialize_application_processor_cache_attributes()
     }
 
     pub fn init_phys(boot_info_ptr: *const BootInfo) {

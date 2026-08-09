@@ -384,10 +384,12 @@ dvm_block_revoke_reason_body="$(sed -n '/^pub(super) enum DvmBlockRevokeReason {
 dvm_block_flush_read_body="$(sed -n '/^fn valid_flush_completion_keeps_transport_live_for_first_64kib_read(/,/^#\[test\]/p' kernel/io-manager/src/io/dvm_block/tests.rs)"
 dvm_block_cache_source="$(cat kernel/io-manager/src/io/dvm_block.rs)"
 dvm_input_cache_source="$(cat kernel/io-manager/src/input/dvm_ring.rs)"
+dvm_network_cache_source="$(cat kernel/io-manager/src/io/dvm_network.rs)"
 dvm_display_cache_source="$(cat kernel/io-manager/src/io/dvm_display.rs)"
 kernel_vm_cache_source="$(cat kernel/mm/src/memory/kernel_vm.rs)"
 input_ring_atomic_production="$(sed '/^#\[cfg(test)\]/,$d' kernel/io-manager/src/input/dvm_ring.rs)"
 host_input_ring_atomic_production="$(sed '/^#\[cfg(test)\]/,$d' libs/driver-domain-host/src/lib.rs)"
+network_ring_atomic_production="$(sed '/^#\[cfg(test)\]/,$d' kernel/io-manager/src/io/dvm_network.rs)"
 input_ring_snapshot_body="$(sed -n '/^fn copy_immutable_header_bytes(/,/^fn write_control_words_to_header_bytes(/p' kernel/io-manager/src/input/dvm_ring.rs)"
 host_input_ring_snapshot_body="$(sed -n '/^fn copy_immutable_input_header_bytes(/,/^fn write_control_words_to_input_header_bytes(/p' libs/driver-domain-host/src/lib.rs)"
 input_ring_load_order_body="$(sed -n '/^const fn shared_control_load_order(/,/^}/p' kernel/io-manager/src/input/dvm_ring.rs)"
@@ -400,28 +402,33 @@ mmio_mapping_body="$(sed -n '/^fn map_with_cache_mode(/,/^pub(crate) fn unmap(/p
 mmio_direct_override_body="$(sed -n '/^fn apply_direct_map_cache_mode(/,/^fn restore_direct_map_cache_mode(/p' kernel/io-manager/src/driver/mmio.rs)"
 permanent_boot_mmio_body="$(sed -n '/^pub fn map_permanent_boot_mmio_uncached(/,/^pub fn unmap_mmio_range(/p' kernel/mm/src/memory/kernel_vm.rs)"
 high_window_mapping_body="$(sed -n '/^fn map_physical_range_internal(/,/^fn physical_mapping_cache_flags(/p' kernel/mm/src/memory/kernel_vm.rs)"
-pat_initialize_body="$(sed -n '/^pub fn initialize_current_cpu_cache_attributes()/,/^#\[cfg(test)\]/p' kernel/mm/src/memory/kernel_vm.rs)"
-pat_contract_body="$(sed -n '/^const fn pat_with_kernel_cache_contract(/,/^\/\/\//p' kernel/mm/src/memory/kernel_vm.rs)"
+cache_attributes_source="$(cat kernel/mm/src/memory/cache_attributes.rs)"
+bsp_cache_capture_body="$(sed -n '/^pub(super) fn capture_boot_cpu_cache_attributes()/,/^fn restore_mtrr_and_pat_baseline(/p' kernel/mm/src/memory/cache_attributes.rs)"
+ap_cache_initialize_body="$(sed -n '/^pub(super) fn initialize_application_processor_cache_attributes()/,/^#\[cfg(test)\]/p' kernel/mm/src/memory/cache_attributes.rs)"
+pat_contract_body="$(sed -n '/^const fn pat_with_kernel_cache_contract(/,/^fn read_msr(/p' kernel/mm/src/memory/cache_attributes.rs)"
+ap_trampoline_source="$(cat kernel/nucleus-core/src/multiboot2_entry.S)"
 ap_entry_body="$(sed -n '/^extern "C" fn rustos_ap_entry(/,/^    loop {/p' kernel/executive/src/boot.rs)"
 boot_initialize_body="$(sed -n '/^pub unsafe fn initialize_kernel(/,/^fn initialize_application_processors(/p' kernel/executive/src/boot.rs)"
-mmio_conflict_line="$(grep -n -m1 -F 'cache_modes_conflict(' <<<"$mmio_mapping_body" | cut -d: -f1)"
+mmio_conflict_line="$(grep -n -m1 -F 'physical_ranges_overlap(mapping.phys_start, mapping.size, phys_start, size)' <<<"$mmio_mapping_body" | cut -d: -f1)"
 mmio_straddle_guard_line="$(grep -n -m1 -F 'if physical_range_straddles_direct_map_limit(phys_start, phys_end) {' <<<"$mmio_mapping_body" | cut -d: -f1)"
 mmio_registry_reserve_line="$(grep -n -m1 -F 'if registry.mappings.try_reserve(1).is_err() {' <<<"$mmio_mapping_body" | cut -d: -f1)"
 mmio_direct_map_line="$(grep -n -m1 -F 'direct_map_mapping(phys_start, size)' <<<"$mmio_mapping_body" | cut -d: -f1)"
 mmio_window_map_line="$(grep -n -m1 -F 'crate::memory::paging::map_shared_memory_range(phys_start, size)' <<<"$mmio_mapping_body" | cut -d: -f1)"
 mmio_override_reserve_line="$(grep -n -m1 -F 'if overrides.try_reserve(page_count).is_err()' <<<"$mmio_direct_override_body" | cut -d: -f1)"
 mmio_direct_map_update_line="$(grep -n -m1 -F 'crate::memory::paging::update_direct_map_range_flags(' <<<"$mmio_direct_override_body" | cut -d: -f1)"
-ap_pat_init_line="$(grep -n -m1 -F 'mm_api::boot::initialize_current_cpu_cache_attributes()' <<<"$ap_entry_body" | cut -d: -f1)"
+ap_memory_type_init_line="$(grep -n -m1 -F 'mm_api::boot::initialize_application_processor_cache_attributes()' <<<"$ap_entry_body" | cut -d: -f1)"
 ap_online_parked_line="$(grep -n -m1 -F 'CpuLifecycleState::OnlineParked' <<<"$ap_entry_body" | cut -d: -f1)"
 ap_private_ready_line="$(grep -n -m1 -F '"smp-ap-private-ready"' <<<"$ap_entry_body" | cut -d: -f1)"
+ap_no_fill_cr0_line="$(grep -n -m1 -F 'and $0xdfffffff, %eax' <<<"$ap_trampoline_source" | cut -d: -f1)"
+ap_no_fill_wbinvd_line="$(grep -n -m1 -F 'wbinvd' <<<"$ap_trampoline_source" | cut -d: -f1)"
 apic_permanent_map_line="$(grep -n -m1 -F 'mm_api::paging::map_permanent_boot_mmio_uncached(local_apic_phys, 4096)' <<<"$boot_initialize_body" | cut -d: -f1)"
 apic_configure_line="$(grep -n -m1 -F 'hal_api::cpu::configure_local_apic_mmio(local_apic_phys, local_apic_virt)' <<<"$boot_initialize_body" | cut -d: -f1)"
 apic_pic_line="$(grep -n -m1 -F 'hal_api::init_pic();' <<<"$boot_initialize_body" | cut -d: -f1)"
 raw_high_window_callers="$(rg -l -F 'map_physical_range_internal(' --glob '*.rs' kernel | LC_ALL=C sort)"
 raw_direct_map_update_callers="$(rg -l -F 'update_direct_map_range_flags(' --glob '*.rs' kernel | LC_ALL=C sort)"
 direct_map_cache_flag_callers="$(rg -l -F 'direct_map_cache_flags_for_phys(' --glob '*.rs' kernel | LC_ALL=C sort)"
-debug_milestone_class_body="$(sed -n '/^fn milestone_output_class(/,/^}$/p' kernel/nucleus-core/src/debug/mod.rs)"
-debug_milestone_loss_snapshot_body="$(sed -n '/^fn milestone_loss_snapshot(/,/^}$/p' kernel/nucleus-core/src/debug/mod.rs)"
+debug_milestone_class_body="$(sed -n '/^pub(super) fn milestone_output_class(/,/^}$/p' kernel/nucleus-core/src/debug/milestone_class.rs)"
+debug_milestone_loss_snapshot_body="$(sed -n '/^pub(super) fn milestone_loss_snapshot(/,/^}$/p' kernel/nucleus-core/src/debug/milestone_class.rs)"
 debug_milestone_drop_body="$(sed -n '/^fn record_milestone_output_drop_to(/,/^}$/p' kernel/nucleus-core/src/debug/mod.rs)"
 dvm_revoke_reason_count="$(grep -Ec '^[[:space:]]{4}[A-Za-z][A-Za-z0-9]* = [1-9][0-9]*,$' <<<"$dvm_block_revoke_reason_body")"
 dvm_revoke_guard_line="$(grep -n -m1 -F 'if self.revoked {' <<<"$dvm_block_revoke_body" | cut -d: -f1)"
@@ -451,7 +458,7 @@ kvm_deadline_line="$(grep -n -m1 'let deadline = boot_started + options.timeout;
 kvm_precapture_body="$(sed '/smp_qualification::capture_kvm_launch_evidence/,$d' <<<"$kvm_smoke_body")"
 kvm_interactive_body="$(sed -n '/^pub(crate) fn kvm_run_command(/,/^fn log_kvm_start_phase(/p' tools/xtask/src/kvm/options.rs)"
 
-# Block/input BAR2 is coherent shared RAM, not a framebuffer or controller
+# Block/input/network BAR2 is coherent shared RAM, not a framebuffer or controller
 # register window. The physical-interval guard runs before either direct-map or
 # high-window installation, so a cache-mode mismatch cannot become an alias.
 if ! grep -Fq '!is_io && prefetchable && size == DVM_BLOCK_APERTURE_BYTES' <<<"$dvm_block_cache_source" \
@@ -459,13 +466,38 @@ if ! grep -Fq '!is_io && prefetchable && size == DVM_BLOCK_APERTURE_BYTES' <<<"$
     || ! grep -Fq 'shared_start={:#x} shared_size={:#x} shared_prefetchable={} shared_64={} cache=wb' <<<"$dvm_block_cache_source" \
     || ! grep -Fq '!is_io && prefetchable && size == DVM_INPUT_RING_APERTURE_BYTES' <<<"$dvm_input_cache_source" \
     || ! grep -Fq 'crate::driver::mmio::map_shared_write_back(resource.start, resource_len).cast::<u8>();' <<<"$dvm_input_cache_source" \
+    || ! grep -Fq '!is_io && prefetchable && size == DVM_NET_APERTURE_BYTES' <<<"$dvm_network_cache_source" \
+    || ! grep -Fq 'crate::driver::mmio::map_shared_write_back(resource.start, resource_len).cast::<u8>();' <<<"$dvm_network_cache_source" \
     || ! grep -Fq 'PhysicalMappingCacheMode::WriteBack => PageTableFlags::empty(),' kernel/mm/src/memory/kernel_vm.rs \
     || ! grep -Fq '!(shared->flags & IORESOURCE_PREFETCH)' driver-domains/linux/package/rustos-dvm-block/src/rustos_dvm_block_uio.c \
+    || ! grep -Fq 'mapped = ioremap_cache(shared->start, sizeof(bytes));' driver-domains/linux/package/rustos-dvm-block/src/rustos_dvm_block_uio.c \
     || ! grep -Fq '~_PAGE_CACHE_MASK' driver-domains/linux/package/rustos-dvm-block/src/rustos_dvm_block_uio.c \
     || ! grep -Fq 'remap_pfn_range' driver-domains/linux/package/rustos-dvm-block/src/rustos_dvm_block_uio.c \
+    || ! grep -Fq '!(shared->flags & IORESOURCE_PREFETCH)' driver-domains/linux/package/rustos-dvm-net/src/rustos_dvm_net_uio.c \
+    || ! grep -Fq 'mapped = ioremap_cache(shared->start, sizeof(bytes));' driver-domains/linux/package/rustos-dvm-net/src/rustos_dvm_net_uio.c \
+    || ! grep -Fq '~_PAGE_CACHE_MASK' driver-domains/linux/package/rustos-dvm-net/src/rustos_dvm_net_uio.c \
+    || ! grep -Fq 'UIO_IRQ_NONE' driver-domains/linux/package/rustos-dvm-net/src/rustos_dvm_net_uio.c \
+    || ! grep -Fq 'modprobe rustos_dvm_net_uio' driver-domains/linux/board/overlay/etc/init.d/S48rustos-dvm-net \
+    || ! grep -Fq '"/sys/class/uio"' driver-domains/linux/package/rustos-dvm-net/src/rustos-dvm-net.c \
+    || ! grep -Fq '#define UIO_NAME "rustos-dvm-net"' driver-domains/linux/package/rustos-dvm-net/src/rustos-dvm-net.c \
+    || grep -Fq '/sys/bus/pci/devices' driver-domains/linux/package/rustos-dvm-net/src/rustos-dvm-net.c \
+    || grep -Fq 'resource2' driver-domains/linux/package/rustos-dvm-net/src/rustos-dvm-net.c \
     || ! grep -Fq 'libc::MAP_SHARED' libs/driver-domain-host/src/lib.rs \
     || rg -q -e 'fn[[:space:]]+map[[:space:]]*\(' kernel/io-manager/src/driver/mmio.rs; then
-    echo 'DVM block/input shared RAM must be exact prefetchable WB, Linux BAR2 must clear PAT cache flags, host input must MAP_SHARED, and ambiguous mmio::map must remain absent' >&2
+    echo 'DVM block/input/network shared RAM must be exact prefetchable WB, Linux BAR2 must clear PAT cache flags, raw network resource2 access must remain absent, host input must MAP_SHARED, and ambiguous mmio::map must remain absent' >&2
+    exit 1
+fi
+if ! grep -Fq 'use core::sync::atomic::{AtomicBool, AtomicU32, Ordering, fence};' <<<"$network_ring_atomic_production" \
+    || ! grep -Fq ').load(Ordering::Acquire)' <<<"$network_ring_atomic_production" \
+    || ! grep -Fq ').store(u32::from_le(value), Ordering::Release)' <<<"$network_ring_atomic_production" \
+    || ! grep -Fq 'for index in 0..36' <<<"$network_ring_atomic_production" \
+    || ! grep -Fq 'read_u32(mapped, 36)' <<<"$network_ring_atomic_production" \
+    || ! grep -Fq 'for index in 56..DVM_NET_RECORD_BYTES' <<<"$network_ring_atomic_production" \
+    || grep -Fq 'bytes.iter_mut().enumerate()' <<<"$network_ring_atomic_production" \
+    || ! grep -Fq '__ATOMIC_ACQUIRE' driver-domains/linux/package/rustos-dvm-net/src/rustos-dvm-net.c \
+    || ! grep -Fq '__ATOMIC_RELEASE' driver-domains/linux/package/rustos-dvm-net/src/rustos-dvm-net.c \
+    || ! grep -Fq '__ATOMIC_ACQ_REL' driver-domains/linux/package/rustos-dvm-net/src/rustos-dvm-net.c; then
+    echo 'DVM network control words must use aligned Acquire/Release atomics and immutable-only byte snapshots on both sides' >&2
     exit 1
 fi
 if ! grep -Fq 'const fn shared_control_load_order() -> Ordering {' <<<"$input_ring_atomic_production" \
@@ -478,7 +510,7 @@ if ! grep -Fq 'const fn shared_control_load_order() -> Ordering {' <<<"$input_ri
     || ! grep -Fq 'AtomicU32::from_ptr' <<<"$input_ring_atomic_production" \
     || ! grep -Fq 'AtomicU64::from_ptr' <<<"$input_ring_atomic_production" \
     || ! grep -Fq 'word.load(shared_control_load_order())' <<<"$input_ring_atomic_production" \
-    || ! grep -Fq 'word.fetch_update(' <<<"$input_ring_atomic_production" \
+    || ! grep -Fq 'word.compare_exchange_weak(' <<<"$input_ring_atomic_production" \
     || ! grep -Fq 'shared_control_update_order()' <<<"$input_ring_atomic_production" \
     || ! grep -Fq 'shared_control_update_failure_order()' <<<"$input_ring_atomic_production" \
     || ! grep -Fq 'word.store(value.to_le(), ordering);' <<<"$input_ring_atomic_production" \
@@ -499,13 +531,12 @@ if ! grep -Fq 'const fn shared_control_load_order() -> Ordering {' <<<"$input_ri
 fi
 if [[ -z "$mmio_straddle_guard_line" || -z "$mmio_conflict_line" || -z "$mmio_registry_reserve_line" || -z "$mmio_direct_map_line" || -z "$mmio_window_map_line" ]] \
     || (( mmio_straddle_guard_line >= mmio_conflict_line || mmio_conflict_line >= mmio_registry_reserve_line || mmio_registry_reserve_line >= mmio_direct_map_line || mmio_registry_reserve_line >= mmio_window_map_line )) \
-    || ! grep -Fq 'registry.mappings.iter().any(|mapping| {' <<<"$mmio_mapping_body" \
+    || ! grep -Fq 'physical_ranges_overlap(mapping.phys_start, mapping.size, phys_start, size)' <<<"$mmio_mapping_body" \
     || ! grep -Fq 'left_start < right_end && right_start < left_end' kernel/io-manager/src/driver/mmio.rs \
     || ! grep -Fq 'start < crate::memory::kernel_vm::DIRECT_MAP_PHYS_LIMIT' kernel/io-manager/src/driver/mmio.rs \
     || ! grep -Fq 'end_exclusive > crate::memory::kernel_vm::DIRECT_MAP_PHYS_LIMIT' kernel/io-manager/src/driver/mmio.rs \
     || [[ -z "$mmio_override_reserve_line" || -z "$mmio_direct_map_update_line" || "$mmio_override_reserve_line" -ge "$mmio_direct_map_update_line" ]] \
-    || ! grep -Fq 'new_pages.try_reserve(page_count).is_err()' <<<"$mmio_direct_override_body" \
-    || ! grep -Fq 'retained_indices.try_reserve(page_count).is_err()' <<<"$mmio_direct_override_body"; then
+    || ! grep -Fq 'new_pages.try_reserve(page_count).is_err()' <<<"$mmio_direct_override_body"; then
     echo 'global physical overlap, direct-map-boundary, and reserve-before-PTE-mutation guards must fail before an alias or partial mapping can publish' >&2
     exit 1
 fi
@@ -513,7 +544,10 @@ if [[ "$raw_high_window_callers" != "kernel/mm/src/memory/kernel_vm.rs" ]] \
     || [[ "$raw_direct_map_update_callers" != $'kernel/io-manager/src/driver/mmio.rs\nkernel/mm/src/memory/kernel_vm.rs\nkernel/mm/src/memory/paging.rs' ]] \
     || [[ "$direct_map_cache_flag_callers" != $'kernel/io-manager/src/driver/mmio.rs\nkernel/mm/src/memory/kernel_vm.rs\nkernel/mm/src/memory/paging.rs' ]] \
     || rg -q -F 'direct_map_flags_for_phys' kernel \
-    || ! grep -Fq 'if phys_addr < DIRECT_MAP_PHYS_LIMIT {' <<<"$high_window_mapping_body" \
+    || ! grep -Fq 'if !high_window_physical_range_is_admissible(phys_addr, size) {' <<<"$high_window_mapping_body" \
+    || ! grep -Fq '&& phys_addr >= DIRECT_MAP_PHYS_LIMIT' kernel/mm/src/memory/kernel_vm.rs \
+    || ! grep -Fq 'Some(end) => end <= limit,' kernel/mm/src/memory/kernel_vm.rs \
+    || ! grep -Fq 'let limit = super::cache_attributes::max_physical_address();' kernel/mm/src/memory/kernel_vm.rs \
     || ! grep -Fq 'if size == 0 || end > DIRECT_MAP_PHYS_LIMIT {' <<<"$permanent_boot_mmio_body" \
     || ! grep -Fq 'update_direct_map_range_flags_batched(' <<<"$permanent_boot_mmio_body" \
     || ! grep -Fq 'crate::memory::paging::direct_map_cache_flags_for_phys(phys_page)' <<<"$mmio_direct_override_body" \
@@ -525,22 +559,34 @@ if [[ "$raw_high_window_callers" != "kernel/mm/src/memory/kernel_vm.rs" ]] \
     echo 'direct-map cache aliases must use only the whitelisted owners: permanent APIC UC retyping precedes APIC/PIC use, high-window maps reject direct-map physical addresses, and display WC routes through io-manager' >&2
     exit 1
 fi
-if ! grep -Fq 'let pat = unsafe { msr.read() };' <<<"$pat_initialize_body" \
-    || ! grep -Fq 'if !pat_initial_write_back_selector_is_admissible(pat) {' <<<"$pat_initialize_body" \
-    || ! grep -Fq 'return false;' <<<"$pat_initialize_body" \
-    || ! grep -Fq 'let expected = pat_with_kernel_cache_contract(pat);' <<<"$pat_initialize_body" \
-    || ! grep -Fq 'msr.write(expected);' <<<"$pat_initialize_body" \
-    || ! grep -Fq 'let observed = unsafe { msr.read() };' <<<"$pat_initialize_body" \
-    || ! grep -Fq 'pat_kernel_cache_contract_is_exact(expected, observed)' <<<"$pat_initialize_body" \
+if ! grep -Fq 'compare_exchange(' <<<"$bsp_cache_capture_body" \
+    || ! grep -Fq 'cpu_memory_type_features_are_admissible(features)' <<<"$bsp_cache_capture_body" \
+    || ! grep -Fq '!cache_is_enabled(read_cr0())' <<<"$bsp_cache_capture_body" \
+    || ! grep -Fq 'let cap = read_msr(IA32_MTRR_CAP_MSR);' <<<"$bsp_cache_capture_body" \
+    || ! grep -Fq 'let expected_pat = pat_with_kernel_cache_contract(initial_pat);' <<<"$bsp_cache_capture_body" \
+    || ! grep -Fq 'BSP_MTRR_CAP.store(cap, Ordering::Relaxed);' <<<"$bsp_cache_capture_body" \
+    || ! grep -Fq 'BSP_MTRR_DEF_TYPE.store(read_msr(IA32_MTRR_DEF_TYPE_MSR), Ordering::Relaxed);' <<<"$bsp_cache_capture_body" \
+    || ! grep -Fq 'BASELINE_STATE.store(BASELINE_READY, Ordering::Release);' <<<"$bsp_cache_capture_body" \
+    || ! grep -Fq 'BASELINE_STATE.load(Ordering::Acquire) != BASELINE_READY' <<<"$ap_cache_initialize_body" \
+    || ! grep -Fq 'cap != BSP_MTRR_CAP.load(Ordering::Relaxed)' <<<"$ap_cache_initialize_body" \
+    || ! grep -Fq 'read_cr4() & CR4_PAGE_GLOBAL_ENABLE != 0' <<<"$ap_cache_initialize_body" \
+    || ! grep -Fq 'write_cr0(no_fill_cache_state(read_cr0()));' <<<"$ap_cache_initialize_body" \
+    || ! grep -Fq 'writeback_and_invalidate_caches();' <<<"$ap_cache_initialize_body" \
+    || ! grep -Fq 'flush_tlb_without_global_pages();' <<<"$ap_cache_initialize_body" \
+    || ! grep -Fq 'restore_mtrr_and_pat_baseline(cap);' <<<"$ap_cache_initialize_body" \
+    || ! grep -Fq 'write_cr0(read_cr0() & !CR0_CACHE_CONTROL_MASK);' <<<"$ap_cache_initialize_body" \
+    || ! grep -Fq 'cache_is_enabled(read_cr0()) && current_cpu_matches_sealed_baseline(cap)' <<<"$ap_cache_initialize_body" \
     || ! grep -Fq 'const fn pat_initial_write_back_selector_is_admissible(pat: u64) -> bool {' <<<"$pat_contract_body" \
     || ! grep -Fq 'pat_entry(pat, PAT_SLOT0_SHIFT) == PAT_WRITE_BACK' <<<"$pat_contract_body" \
     || ! grep -Fq 'observed == expected' <<<"$pat_contract_body" \
     || ! grep -Fq 'pat_entry(observed, PAT_SLOT0_SHIFT) == PAT_WRITE_BACK' <<<"$pat_contract_body" \
     || ! grep -Fq 'pat_entry(observed, PAT_SLOT2_SHIFT) == PAT_UNCACHEABLE' <<<"$pat_contract_body" \
     || ! grep -Fq 'pat_entry(observed, PAT_SLOT4_SHIFT) == PAT_WRITE_COMBINING' <<<"$pat_contract_body" \
-    || [[ -z "$ap_pat_init_line" || -z "$ap_online_parked_line" || -z "$ap_private_ready_line" ]] \
-    || (( ap_pat_init_line >= ap_online_parked_line || ap_pat_init_line >= ap_private_ready_line )); then
-    echo 'each AP must reject a non-WB initial PAT0, program PAT2=UC/PAT4=WC, and exactly read back the full PAT contract before OnlineParked or private readiness publication' >&2
+    || [[ -z "$ap_memory_type_init_line" || -z "$ap_online_parked_line" || -z "$ap_private_ready_line" ]] \
+    || (( ap_memory_type_init_line >= ap_online_parked_line || ap_memory_type_init_line >= ap_private_ready_line )) \
+    || [[ -z "$ap_no_fill_cr0_line" || -z "$ap_no_fill_wbinvd_line" ]] \
+    || (( ap_no_fill_cr0_line >= ap_no_fill_wbinvd_line )); then
+    echo 'the BSP must seal an exact MTRR/PAT baseline before SIPI; every AP must enter reset no-fill, restore and read back that baseline, then enable caches before OnlineParked or private readiness publication' >&2
     exit 1
 fi
 
@@ -814,6 +860,8 @@ dvm-network-ring/DvmNetworkRing|driver-domain-protocol|tests::dvm_ethernet_paylo
 dvm-network-ring/DvmNetworkRing|driver-domain-protocol|tests::dvm_ethernet_payload_accepts_only_bounded_ipv4_or_arp
 dvm-network-ring/DvmNetworkRing|driver-domain-protocol|tests::net_contract_has_two_bounded_fixed_rings
 dvm-network-ring/DvmNetworkRing|kernel-io-manager|io::dvm_network::tests::control_lease_requires_nonzero_epoch_and_exact_revocation
+dvm-network-ring/DvmNetworkRing|kernel-io-manager|io::dvm_network::tests::network_header_snapshot_excludes_live_atomic_cursor_bytes
+dvm-network-ring/DvmNetworkRing|kernel-io-manager|io::dvm_network::tests::network_shared_ring_requires_exact_prefetchable_write_back_memory
 dvm-network-ring/DvmNetworkRing|kernel-io-manager|io::dvm_network::tests::stale_cleanup_cannot_revoke_replaced_control_lease
 dvm-network-ring/DvmNetworkRing|netd|dvm_session_policy_tests::netd_session_policy_is_exact_idempotent_and_stale_safe
 dvm-network-ring/DvmNetworkRing|rootd|tests::inputd_lookup_authority_is_only_the_netd_lifecycle_handoff|host-test
@@ -1350,7 +1398,11 @@ dvm-block-startup/DvmBlockStartup|kernel-io-manager|io::dvm_block::tests::block_
 dvm-input-ring/DvmInputRing|kernel-io-manager|input::dvm_ring::tests::input_shared_ring_requires_prefetchable_write_back_atomic_memory
 page-table-lifecycle/PageTableLifecycle|kernel-io-manager|driver::mmio::tests::overlapping_physical_ranges_reject_mixed_cache_modes
 page-table-lifecycle/PageTableLifecycle|kernel-mm|memory::kernel_vm::tests::shared_memory_mapping_is_write_back_not_mmio_or_write_combining
-cpu-online-lifecycle/CpuOnlineLifecycle|kernel-mm|memory::kernel_vm::tests::pat_cache_contract_update_is_exact_idempotent_and_cpu_local
+cpu-online-lifecycle/CpuOnlineLifecycle|kernel-mm|memory::cache_attributes::tests::pat_cache_contract_update_is_exact_idempotent_and_cpu_local
+cpu-online-lifecycle/CpuOnlineLifecycle|kernel-mm|memory::cache_attributes::tests::ap_memory_type_admission_requires_features_capacity_and_no_fill_state
+cpu-online-lifecycle/CpuOnlineLifecycle|kernel-mm|memory::cache_attributes::tests::ap_restore_sequence_is_before_cache_enable_and_private_readback
+cpu-online-lifecycle/CpuOnlineLifecycle|kernel-mm|memory::cache_attributes::tests::ap_restore_requires_the_sealed_bsp_baseline_and_exact_capability
+cpu-online-lifecycle/CpuOnlineLifecycle|nucleus-core|ap_trampoline::tests::reset_cache_state_enters_no_fill_before_mailbox_or_paging
 cpu-online-lifecycle/CpuOnlineLifecycle|kernel-executive|boot::tests::ap_cache_attributes_are_verified_before_private_ready_publication
 cpu-online-lifecycle/CpuOnlineLifecycle|kernel-executive|boot::tests::local_apic_uses_one_permanent_uncached_direct_map_alias
 EOF

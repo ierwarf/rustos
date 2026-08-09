@@ -210,8 +210,16 @@ fn qualification_output_class_is_exact_and_scheduler_is_measurement() {
         milestone_output_class("kernel-scheduler-phase"),
         MilestoneOutputClass::Measurement
     );
+    // A measurement gets one attempt; the classes the harness reads as
+    // evidence keep the bounded retry.
     assert_eq!(
         milestone_output_class("kernel-scheduler-phase").output_attempts(),
+        1
+    );
+    assert!(milestone_output_class("smp-qualification-ready").output_attempts() > 1);
+    assert!(milestone_output_class("dvm-block-transport-revoked").output_attempts() > 1);
+    assert_eq!(
+        milestone_output_class("proc-prepare-published").output_attempts(),
         1
     );
     assert_eq!(

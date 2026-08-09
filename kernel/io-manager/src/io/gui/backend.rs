@@ -7,7 +7,6 @@ use super::framebuffer::{Framebuffer, FramebufferRect, build_framebuffer};
 use super::{GuiDisplayInfo, GuiPresentOutcome};
 use crate::sync::KernelWaitLock;
 
-const ENABLE_FRAMEBUFFER_WRITE_COMBINE: bool = true;
 
 #[allow(
     clippy::large_enum_variant,
@@ -42,10 +41,7 @@ impl DisplayBackend {
     }
 
     fn install_framebuffer(&mut self, info: FramebufferInfo, flags: u32) -> bool {
-        if !framebuffer_info_is_valid(info) {
-            return false;
-        }
-        if ENABLE_FRAMEBUFFER_WRITE_COMBINE && !mark_framebuffer_write_combine(info) {
+        if !framebuffer_info_is_valid(info) || !scanout_provenance_is_admissible(info) {
             return false;
         }
         self.generation = next_display_generation(self.generation);
@@ -200,8 +196,22 @@ fn display_present_faulted() -> bool {
     false
 }
 
-fn mark_framebuffer_write_combine(info: FramebufferInfo) -> bool {
-    !crate::driver::mmio::map_write_combining(info.addr, info.size as usize).is_null()
+/// A registered scanout buffer must be memory this kernel already published.
+///
+/// The registration's address is a kernel virtual address the present path
+/// blits through. Treating it as a physical address - which the removed
+/// write-combine retype did - both aborts on an unmappable value and would
+/// retype memory the driver domain reads write-back. Cache-mode ownership for
+/// display payloads belongs to io-manager's registry, which retypes the atlas
+/// slots from their real physical base; nothing about a registration may
+/// change the memory type of the shared pixel region.
+fn scanout_provenance_is_admissible(info: FramebufferInfo) -> bool {
+    crate::io::dvm_display::scanout_region_contains(info.addr, info.size)
+        && (info.back_buffer_addr == 0
+            || crate::io::dvm_display::scanout_region_contains(
+                info.back_buffer_addr,
+                info.back_buffer_size,
+            ))
 }
 
 fn framebuffer_info_is_valid(info: FramebufferInfo) -> bool {

@@ -113,6 +113,7 @@ pub enum LockClass {
     SchedulerRunQueue = 40,
     SchedulerMailbox = 41,
     SchedulerPolicy = 42,
+    PciConfigTransaction = 43,
 }
 
 #[cfg(rustos_boot_image)]

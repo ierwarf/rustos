@@ -1097,6 +1097,10 @@ fn write_record(base: *mut u8, bytes: &[u8; DVM_BLOCK_RECORD_BYTES]) {
 }
 
 fn arm_block_ring_interrupt(device: crate::arch::pci::PciDevice) -> Option<BlockInterruptInstall> {
+    // Claim the function before the first configuration write. An exclusive
+    // claim is the correct strength here: this transport owns its ivshmem
+    // function outright and nothing else may reprogram its MSI-X state.
+    let attach = crate::arch::pci::attach(device, crate::arch::pci::PciAttachMode::Exclusive)?;
     let Some(capability) = device.msix_capability() else {
         return None;
     };
@@ -1118,8 +1122,8 @@ fn arm_block_ring_interrupt(device: crate::arch::pci::PciDevice) -> Option<Block
     {
         return None;
     }
-    capability.set_function_masked(device, true);
-    capability.set_enabled(device, false);
+    capability.set_function_masked(&attach, true);
+    capability.set_enabled(&attach, false);
     let Some(mut vector_lease) = crate::arch::msi::MsiVectorLease::allocate() else {
         return None;
     };
@@ -1142,12 +1146,12 @@ fn arm_block_ring_interrupt(device: crate::arch::pci::PciDevice) -> Option<Block
             .write_volatile(0);
     }
     core::sync::atomic::fence(Ordering::SeqCst);
-    capability.set_enabled(device, true);
-    capability.set_function_masked(device, false);
+    capability.set_enabled(&attach, true);
+    capability.set_function_masked(&attach, false);
     crate::driver::mmio::unmap(table.cast());
     Some(BlockInterruptInstall {
         capability,
-        device,
+        attach: Some(attach),
         vector: Some(vector_lease.commit()),
     })
 }

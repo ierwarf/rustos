@@ -154,6 +154,7 @@ const INSTALL_REJECTION_VECTOR_ALLOCATION: u8 = 9;
 const INSTALL_REJECTION_HANDLER_REGISTRATION: u8 = 10;
 const INSTALL_REJECTION_MESSAGE: u8 = 11;
 const INSTALL_REJECTION_TABLE_MAPPING: u8 = 12;
+const INSTALL_REJECTION_DEVICE_CLAIM: u8 = 13;
 
 const DISCOVERY_REJECTION_NONE: u8 = 0;
 const DISCOVERY_REJECTION_NO_IVSHMEM: u8 = 1;
@@ -965,6 +966,7 @@ fn install_rejection_name(reason: u8) -> &'static str {
         INSTALL_REJECTION_HANDLER_REGISTRATION => "msi-handler-registration-failed",
         INSTALL_REJECTION_MESSAGE => "msi-message-unavailable",
         INSTALL_REJECTION_TABLE_MAPPING => "msix-table-map-failed",
+        INSTALL_REJECTION_DEVICE_CLAIM => "device-already-claimed",
         _ => "unknown-install-rejection",
     }
 }
@@ -1214,6 +1216,10 @@ fn report_invalid_header(mapped: *const u8, bytes: &[u8]) {
 }
 
 fn arm_input_ring_interrupt(device: crate::arch::pci::PciDevice) -> Result<(), u8> {
+    // Claim the function before the first configuration write; this transport
+    // owns its ivshmem function outright for the rest of the boot.
+    let attach = crate::arch::pci::attach(device, crate::arch::pci::PciAttachMode::Exclusive)
+        .ok_or(INSTALL_REJECTION_DEVICE_CLAIM)?;
     let capability = device
         .msix_capability()
         .ok_or(INSTALL_REJECTION_MSIX_CAPABILITY)?;
@@ -1233,8 +1239,8 @@ fn arm_input_ring_interrupt(device: crate::arch::pci::PciDevice) -> Result<(), u
     {
         return Err(INSTALL_REJECTION_MSIX_TABLE_BOUNDS);
     }
-    capability.set_function_masked(device, true);
-    capability.set_enabled(device, false);
+    capability.set_function_masked(&attach, true);
+    capability.set_enabled(&attach, false);
     let mut vector_lease =
         crate::arch::msi::MsiVectorLease::allocate().ok_or(INSTALL_REJECTION_VECTOR_ALLOCATION)?;
     if !vector_lease.register_handler(input_ring_interrupt) {
@@ -1254,10 +1260,11 @@ fn arm_input_ring_interrupt(device: crate::arch::pci::PciDevice) -> Result<(), u
             .write_volatile(0);
     }
     fence(Ordering::SeqCst);
-    capability.set_enabled(device, true);
-    capability.set_function_masked(device, false);
+    capability.set_enabled(&attach, true);
+    capability.set_function_masked(&attach, false);
     crate::driver::mmio::unmap(table.cast());
     vector_lease.commit().retain_permanent();
+    attach.retain_permanent();
     Ok(())
 }
 

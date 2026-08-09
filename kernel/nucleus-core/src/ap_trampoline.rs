@@ -222,4 +222,32 @@ mod tests {
         corrupt.magic_complement ^= 1;
         assert!(!corrupt.is_valid());
     }
+
+    #[test]
+    fn reset_cache_state_enters_no_fill_before_mailbox_or_paging() {
+        let source = include_str!("multiboot2_entry.S");
+        let real_mode = source
+            .split_once("rustos_ap_real_mode:")
+            .expect("AP real-mode entry must remain source-visible")
+            .1
+            .split_once("rustos_ap_protected_mode:")
+            .expect("AP protected-mode entry must remain source-visible")
+            .0;
+        let clear_nw = real_mode
+            .find("and $0xdfffffff, %eax")
+            .expect("AP reset path must clear CR0.NW while retaining CR0.CD");
+        let write_cr0 = real_mode[clear_nw..]
+            .find("mov %eax, %cr0")
+            .map(|offset| clear_nw + offset)
+            .expect("AP reset path must publish no-fill CR0 state");
+        let flush = real_mode
+            .find("wbinvd")
+            .expect("AP reset path must invalidate reset cache contents");
+        let mailbox_or_paging = real_mode
+            .find("lgdtw")
+            .expect("AP must load the transition GDT");
+        assert!(clear_nw < write_cr0);
+        assert!(write_cr0 < flush);
+        assert!(flush < mailbox_or_paging);
+    }
 }

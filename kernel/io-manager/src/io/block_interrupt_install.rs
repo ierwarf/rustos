@@ -9,12 +9,19 @@ use super::{
 
 pub(super) struct BlockInterruptInstall {
     pub(super) capability: crate::arch::pci::MsixCapability,
-    pub(super) device: crate::arch::pci::PciDevice,
+    /// Exclusive claim on the function. Held for the transaction's whole life
+    /// so no other driver can reprogram the interrupt this one armed, and so
+    /// teardown still owns the function it is quiescing.
+    pub(super) attach: Option<crate::arch::pci::PciAttach>,
     pub(super) vector: Option<crate::arch::msi::CommittedMsiVector>,
 }
 
 impl BlockInterruptInstall {
     pub(super) fn retain_permanent(mut self) {
+        self.attach
+            .take()
+            .expect("DVM block interrupt transaction lost its device claim")
+            .retain_permanent();
         let vector = self
             .vector
             .take()
@@ -28,12 +35,12 @@ impl BlockInterruptInstall {
 
 impl Drop for BlockInterruptInstall {
     fn drop(&mut self) {
-        if self.vector.is_some() {
+        if let (Some(attach), true) = (self.attach.as_ref(), self.vector.is_some()) {
             // Reverse device publication before revoking handler/vector
             // authority. Config-space readback in these helpers is the posted
             // write completion barrier.
-            self.capability.set_function_masked(self.device, true);
-            self.capability.set_enabled(self.device, false);
+            self.capability.set_function_masked(attach, true);
+            self.capability.set_enabled(attach, false);
             drop(self.vector.take());
         }
     }
