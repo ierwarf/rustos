@@ -80,6 +80,16 @@ def main() -> int:
     parser.add_argument("--topology", required=True)
     parser.add_argument("--summary", type=Path, required=True)
     parser.add_argument(
+        "--deadlines-advisory",
+        action="store_true",
+        help=(
+            "report a step that landed after its absolute deadline instead of "
+            "rejecting the event; the operator-owned interactive lane records "
+            "the overshoot without failing, while every acceptance lane "
+            "keeps enforcing it"
+        ),
+    )
+    parser.add_argument(
         "--classify-stale",
         action="store_true",
         help="return 3, not a validation failure, when only bound inputs are stale",
@@ -87,6 +97,7 @@ def main() -> int:
     args = parser.parse_args()
 
     failures: list[str] = []
+    overshoot: list[str] = []
     events: list[dict[str, object]] = []
     try:
         scenario = load_scenario(args.registry, args.topology)
@@ -161,7 +172,11 @@ def main() -> int:
             if int(event["elapsed_ms"]) != (int(event["guest_ts_us"]) + 999) // 1000:
                 raise ValueError("elapsed_ms is not derived from guest_ts_us")
             if int(event["elapsed_ms"]) > int(event["deadline_ms"]):
-                raise ValueError("event missed its absolute scenario deadline")
+                if not args.deadlines_advisory:
+                    raise ValueError("event missed its absolute scenario deadline")
+                overshoot.append(
+                    f"{event['step']}: {event['elapsed_ms']} > {event['deadline_ms']} ms"
+                )
             if (
                 not isinstance(event["requires"], list)
                 or not event["requires"]
@@ -292,9 +307,12 @@ def main() -> int:
         for stale in stale_inputs:
             print(stale)
         return 3
+    for late in overshoot:
+        print(f"runtime trace step landed after its absolute deadline: {late}")
     print(
         f"kvm runtime trace conformance passed scenario={scenario_name} "
         f"events={len(events)} terminal_ms={events[-1]['elapsed_ms']}"
+        + (f" advisory_deadline_overshoot={len(overshoot)}" if overshoot else "")
     )
     return 0
 

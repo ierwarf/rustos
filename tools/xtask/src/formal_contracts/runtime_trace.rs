@@ -18,6 +18,14 @@ pub(crate) struct KvmRuntimeObservation {
     pub network: bool,
     pub ui_budget: bool,
     pub storage_only: bool,
+    /// Whether a step that lands after its absolute deadline fails the run.
+    ///
+    /// The interactive lane is operator-owned and, by its own documented
+    /// contract, does not terminate on a boot-to-UI deadline: a developer
+    /// pausing at a breakpoint or a cold host cache is not a product
+    /// regression. It still records every observed timestamp, so the
+    /// measurement stays available; only the acceptance lanes enforce it.
+    pub enforce_deadlines: bool,
 }
 
 #[derive(Serialize)]
@@ -104,7 +112,14 @@ pub(crate) fn record_kvm_runtime_trace(
     let run_id = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
     let artifact_dir = root.join("build/formal/runtime-traces");
     fs::create_dir_all(&artifact_dir)?;
-    let trace = artifact_dir.join("kvm-p0.jsonl");
+    // A lane that does not enforce deadlines must not overwrite the acceptance
+    // artifact: `run-runtime-traces.sh` replays that file strictly, so one
+    // relaxed interactive session would otherwise fail every later seal.
+    let trace = artifact_dir.join(if observation.enforce_deadlines {
+        "kvm-p0.jsonl"
+    } else {
+        "kvm-p0-interactive.jsonl"
+    });
     let mut output = Vec::new();
     for step in steps {
         let (line_number, guest_ts_us) = match step.log.as_str() {
@@ -136,11 +151,19 @@ pub(crate) fn record_kvm_runtime_trace(
         }
         let elapsed_ms = guest_ts_us.saturating_add(999) / 1_000;
         if elapsed_ms > step.deadline_ms {
-            bail!(
-                "runtime trace step {} missed its absolute deadline: {} > {} ms",
-                step.step,
-                elapsed_ms,
-                step.deadline_ms
+            if observation.enforce_deadlines {
+                bail!(
+                    "runtime trace step {} missed its absolute deadline: {} > {} ms",
+                    step.step,
+                    elapsed_ms,
+                    step.deadline_ms
+                );
+            }
+            // Recorded, not enforced: the operator-owned lane reports the
+            // overshoot so it stays visible without failing the session.
+            println!(
+                "xtask: runtime trace step {} landed after its absolute deadline: {} > {} ms (not enforced on the interactive lane)",
+                step.step, elapsed_ms, step.deadline_ms
             );
         }
         observed_guest_ts_us.insert(step.step.as_str(), guest_ts_us);
@@ -175,10 +198,20 @@ pub(crate) fn record_kvm_runtime_trace(
     fs::write(&trace, output)?;
 
     let checker = root.join("formal/check-kvm-runtime-trace.py");
-    let summary = artifact_dir.join("kvm-p0-summary.json");
-    let status = Command::new("python3")
-        .arg(checker)
-        .arg(&trace)
+    let summary = artifact_dir.join(if observation.enforce_deadlines {
+        "kvm-p0-summary.json"
+    } else {
+        "kvm-p0-interactive-summary.json"
+    });
+    let mut command = Command::new("python3");
+    command.arg(checker).arg(&trace);
+    if !observation.enforce_deadlines {
+        // The replay must apply the same rule the recorder just did, or the
+        // steps it let through would be rejected here and the trace would be
+        // shorter than its scenario.
+        command.arg("--deadlines-advisory");
+    }
+    let status = command
         .args(["--registry"])
         .arg(root.join("formal/product-scenarios.tsv"))
         .args(["--root"])
