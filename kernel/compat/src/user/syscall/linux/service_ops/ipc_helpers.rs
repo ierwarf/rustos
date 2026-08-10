@@ -1012,9 +1012,26 @@ pub fn console_read_via_sessiond(
     }
 
     let mut copied = 0usize;
+    // MEASUREMENT: a blocking console read is the shell's own wait for a
+    // keystroke, and it is a poll loop rather than a readiness wait, because
+    // runtimed answers `CONSOLE_ROUTE_READ` and `CONSOLE_ROUTE_READINESS` as
+    // immediate snapshots with no way to hold a reply until data arrives. Each
+    // empty pass therefore costs one full service round trip plus one tick of
+    // sleep. `empty_polls` and the elapsed wall time are what say whether this
+    // loop is a real term in keystroke-to-echo latency or a rounding error
+    // beside the 16 ms poll boundaries above it in uiserver.
+    let mut empty_polls = 0u64;
+    // One empty pass measured about 14.7 ms against a `sleep(1)` that asks for
+    // two 976.5625 us ticks. The overshoot is either the service round trip or
+    // the sleep itself, and those have different repairs, so both halves are
+    // timed rather than inferred from the total.
+    let mut route_ns = 0u64;
+    let mut sleep_ns = 0u64;
+    let waited_from_ns = crate::arch::rtc::monotonic_nanos();
     while copied < user_len {
         let chunk_len =
             (user_len - copied).min(CommercialMaxProtocolResponse::default().payload.len());
+        let route_started_ns = crate::arch::rtc::monotonic_nanos();
         let response = call_sessiond_console_route(
             snapshot.process_id(),
             snapshot.thread_id(),
@@ -1023,6 +1040,8 @@ pub fn console_read_via_sessiond(
             &[],
             chunk_len,
         )?;
+        route_ns = route_ns
+            .saturating_add(crate::arch::rtc::monotonic_nanos().saturating_sub(route_started_ns));
         let read = response.payload_len as usize;
         if read > chunk_len {
             return Err(LINUX_EINVAL);
@@ -1031,9 +1050,17 @@ pub fn console_read_via_sessiond(
             if let Some(result) = empty_console_read_result(nonblocking, copied) {
                 return result;
             }
+            empty_polls = empty_polls.saturating_add(1);
+            let sleep_started_ns = crate::arch::rtc::monotonic_nanos();
             multitask::yield_now();
             crate::arch::rtc::sleep(1);
+            sleep_ns = sleep_ns.saturating_add(
+                crate::arch::rtc::monotonic_nanos().saturating_sub(sleep_started_ns),
+            );
             continue;
+        }
+        if empty_polls != 0 {
+            record_console_read_wait(empty_polls, waited_from_ns, route_ns, sleep_ns);
         }
         let dest = user_ptr.checked_add(copied as u64).ok_or(LINUX_EINVAL)?;
         usermem::write_current_user_bytes(dest, &response.payload[..read])
@@ -1045,6 +1072,40 @@ pub fn console_read_via_sessiond(
         }
     }
     Ok(copied as u64)
+}
+
+/// Publishes how long one blocking console read spun before data appeared.
+///
+/// Sampled on the same bounded schedule every high-frequency milestone in this
+/// kernel uses: a debugcon line costs roughly 335 us fixed plus 11.1 us per
+/// byte, and an idle shell polls about a thousand times a second, so an
+/// unbounded record here would cost more than the thing it measures.
+///
+/// arg0=(empty poll passes, waited microseconds), arg1=running sample count.
+fn record_console_read_wait(
+    empty_polls: u64,
+    waited_from_ns: u64,
+    route_ns: u64,
+    sleep_ns: u64,
+) {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static CONSOLE_READ_WAITS: AtomicU64 = AtomicU64::new(0);
+    const EARLY_CONSOLE_READ_WAIT_SAMPLES: u64 = 32;
+
+    // ORDERING: Relaxed is exact; this counter owns diagnostics only and
+    // orders nothing.
+    let total = CONSOLE_READ_WAITS.fetch_add(1, Ordering::Relaxed) + 1;
+    if total > EARLY_CONSOLE_READ_WAIT_SAMPLES && total % 256 != 0 {
+        return;
+    }
+    let waited_us = crate::arch::rtc::monotonic_nanos().saturating_sub(waited_from_ns) / 1_000;
+    nucleus_core::debug::record_milestone(
+        nucleus_core::debug::LogCategory::Compat,
+        "console-read-wait",
+        ((empty_polls & 0xffff_ffff) << 32) | (waited_us & 0xffff_ffff),
+        (((route_ns / 1_000) & 0xffff_ffff) << 32) | ((sleep_ns / 1_000) & 0xffff_ffff),
+    );
+    let _ = total;
 }
 
 fn empty_console_read_result(nonblocking: bool, copied: usize) -> Option<Result<u64, i64>> {
@@ -1652,18 +1713,37 @@ fn call_netd_ipc_request_impl(
         .filter(|len| *len <= size_of::<NetdIpcRequest>())
         .ok_or(LINUX_EINVAL)?;
     let request_bytes = &as_bytes(request)[..request_len];
+    // TRANSPORT BOUNDARY. Everything below this point means netd answered.
+    // A failure *here* means the reply never arrived, and that is the only
+    // case where the caller cannot tell whether the byte movement happened -
+    // the request is already on netd's endpoint queue and netd still runs it.
+    // Recording it further out would also catch netd's own status replies,
+    // where `EAGAIN` on an empty non-blocking receive is the ordinary answer.
     let response = match timeout_ms {
         Some(timeout_ms) => ipc_ops::call_service_endpoint_with_class_deadline(
             IPC_SERVICE_NETD,
             request_bytes,
             deadline::netd_timeout_class(request.op),
             timeout_ms,
-        )?,
+        ),
         None => ipc_ops::call_service_endpoint_with_class(
             IPC_SERVICE_NETD,
             request_bytes,
             ipc_ops::ServiceIpcClass::BulkData,
-        )?,
+        ),
+    };
+    let response = match response {
+        Ok(response) => response,
+        Err(errno) => {
+            if super::vfs_meta::socket_op_moves_stream_bytes(request.op) {
+                super::vfs_meta::record_stream_break(
+                    super::vfs_meta::STREAM_BREAK_ABANDONED_IN_FLIGHT,
+                    request,
+                    errno.unsigned_abs() as usize,
+                );
+            }
+            return Err(errno);
+        }
     };
     let elapsed_ms = ticks_elapsed_ms(start_ticks, crate::arch::rtc::ticks());
     diagnostics::log_slow_service_call(

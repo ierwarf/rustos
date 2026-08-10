@@ -535,11 +535,15 @@ pub(crate) fn service_pending(dest: &mut [InputDvmRecordWire]) -> usize {
         }
     };
     let mut consumer = CONSUMER.load(Ordering::Acquire);
-    if header.generation != generation
-        || header.consumer != consumer
-        || header.producer < consumer
-        || header.producer.saturating_sub(consumer) > u64::from(DVM_INPUT_RING_SLOT_COUNT)
-    {
+    // Four independent conditions used to answer with one reason code, and the
+    // run said only "cursor-or-generation-invalid". That is the same dead end
+    // `report_invalid_header` was written to end for the header checks: a
+    // single name over several checks costs a full acceptance run per candidate
+    // and can still name none of them. Publish which one fired, with the values
+    // that made it fire, before deciding whether it is transient or terminal.
+    let mismatch = cursor_generation_mismatch(&header, generation, consumer);
+    if mismatch != 0 {
+        report_cursor_generation_mismatch(mismatch, &header, generation, consumer);
         revoke("cursor-or-generation-invalid");
         RECORDS_COPIED.fetch_add(reset_written as u64, Ordering::Relaxed);
         return reset_written;
@@ -766,6 +770,62 @@ fn revoke_reason_code(reason: &str) -> u64 {
         "consumer-wake-generation-wrapped" => 7,
         _ => 0,
     }
+}
+
+const CURSOR_MISMATCH_GENERATION: u64 = 1 << 0;
+const CURSOR_MISMATCH_CONSUMER: u64 = 1 << 1;
+const CURSOR_MISMATCH_PRODUCER_BEHIND: u64 = 1 << 2;
+const CURSOR_MISMATCH_OUTSTANDING: u64 = 1 << 3;
+
+/// Which of the four cursor/generation admission checks reject this snapshot.
+///
+/// Returns a bitmap rather than a bool so a caller can tell a lifecycle change
+/// apart from a stale cursor read. They are not the same kind of event: a
+/// generation change means the mapping this drain claimed is no longer the
+/// installed one, while a consumer mismatch means the shared snapshot and this
+/// CPU's cursor were read at different instants.
+fn cursor_generation_mismatch(
+    header: &DvmInputRingHeader,
+    generation: u64,
+    consumer: u64,
+) -> u64 {
+    let mut mismatch = 0;
+    if header.generation != generation {
+        mismatch |= CURSOR_MISMATCH_GENERATION;
+    }
+    if header.consumer != consumer {
+        mismatch |= CURSOR_MISMATCH_CONSUMER;
+    }
+    if header.producer < consumer {
+        mismatch |= CURSOR_MISMATCH_PRODUCER_BEHIND;
+    }
+    if header.producer.saturating_sub(consumer) > u64::from(DVM_INPUT_RING_SLOT_COUNT) {
+        mismatch |= CURSOR_MISMATCH_OUTSTANDING;
+    }
+    mismatch
+}
+
+/// Publishes the exact check and the exact cursors behind one revocation.
+///
+/// arg0=(mismatch bitmap, claimed generation), arg1=(header consumer delta from
+/// this CPU's cursor, outstanding record count). The deltas are published rather
+/// than the raw 64-bit cursors because the question these answer is "by how far
+/// did the two observations disagree" - a disagreement of one record is a read
+/// straddling a concurrent advance, and a large or negative one is not.
+fn report_cursor_generation_mismatch(
+    mismatch: u64,
+    header: &DvmInputRingHeader,
+    generation: u64,
+    consumer: u64,
+) {
+    let consumer_delta = header.consumer.wrapping_sub(consumer);
+    let outstanding = header.producer.wrapping_sub(consumer);
+    crate::debug::record_milestone(
+        crate::debug::LogCategory::Input,
+        "dvm-input-cursor-mismatch",
+        (mismatch << 32) | (generation & 0xffff_ffff),
+        ((consumer_delta & 0xffff_ffff) << 32) | (outstanding & 0xffff_ffff),
+    );
 }
 
 fn revoke(reason: &str) {

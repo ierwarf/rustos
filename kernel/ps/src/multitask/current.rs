@@ -327,10 +327,34 @@ pub fn current_user_wait_binding() -> Option<(u64, UserAbi, u64)> {
     interrupts::without_interrupts(|| unsafe { scheduler_ref().current_user_wait_binding() })
 }
 
+/// Snapshot the current user task's identity and security state.
+///
+/// # Why this reads the published record first
+///
+/// This asks only about the task already running on the asking CPU, so the
+/// answer is per-CPU by construction and the global scheduler lock adds nothing
+/// but serialization. The acquisition census measured this exact call site at
+/// 7,197 acquisitions per second at 8 vCPU - 6.8% of all global scheduler lock
+/// traffic - purely because it took the locked path while
+/// `current_user_abi` and `retain_current_user_process_binding` beside it
+/// already took the published one. `TaskIdentity::user_binding` returns the
+/// same four fields `current_user_process_binding` does; the only difference
+/// was the lock.
+///
+/// The fallback is not optional and must not be removed: `published_current_identity`
+/// returns `None` for a slot that was never published *and* for a reader that
+/// caught a writer between the two halves of a seqlock update. Both cases are
+/// ordinary, and both must resolve through scheduler authority rather than be
+/// reported as "no user task" - answering `None` here would tell a syscall that
+/// its own caller does not exist.
 pub fn current_user_snapshot() -> Option<CurrentUserSnapshot> {
     let (thread_id, abi, process_handle, console_session) =
-        interrupts::without_interrupts(|| unsafe {
-            scheduler_ref().current_user_process_binding()
+        interrupts::without_interrupts(|| {
+            if let Some(identity) = published_current_identity() {
+                return identity.user_binding();
+            }
+            // SAFETY: interrupts are masked, so the current slot is stable.
+            unsafe { scheduler_ref().current_user_process_binding() }
         })?;
     process_table::with_process_state(process_handle, |process_id, process_state| {
         CurrentUserSnapshot::new(

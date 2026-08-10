@@ -58,6 +58,11 @@ const WAYLAND_FRAME_CALLBACK_INTERVAL: Duration = Duration::from_millis(15);
 const PARTIAL_RENDER_BUDGET: Duration = Duration::from_millis(8);
 const DISPLAY_BACKPRESSURE_RETRY_DELAY: Duration = Duration::from_millis(1);
 const SLOW_LOOP_THRESHOLD: Duration = Duration::from_millis(50);
+/// Report an input event that took longer than one 16 ms poll boundary to
+/// reach the screen. Below that the loop is already doing the best its poll
+/// structure allows and the line would only be noise; above it, the count of
+/// boundaries crossed is exactly the quantity worth acting on.
+const INPUT_TO_PRESENT_REPORT_THRESHOLD: Duration = Duration::from_millis(20);
 
 const UI_PHASE_IDLE: usize = 0;
 const UI_PHASE_INPUT: usize = 1;
@@ -891,6 +896,9 @@ fn run() -> Result<(), i32> {
     let mut input_backlog_window = 0_u64;
     let mut processed_input_events_total = 0_u64;
     let mut last_input_processed_at: Option<Instant> = None;
+    // Armed by the first input-bearing iteration since the last present,
+    // disarmed by the present that carries it. See the arming site.
+    let mut input_awaiting_present: Option<Instant> = None;
     let mut max_input_gap_ms_window = 0_u64;
     let mut input_drops_summary_baseline = 0_u64;
     let mut input_slow_summary_baseline = 0_u64;
@@ -962,6 +970,17 @@ fn run() -> Result<(), i32> {
             input_backlog_window = input_backlog_window.saturating_add(1);
         }
         pending_update.absorb(input.visual_update);
+        // MEASUREMENT: the wall time from an input event being processed to the
+        // frame that carries its consequence to the screen. The per-frame phase
+        // breakdown already shows that the work itself is tens of microseconds,
+        // so what matters for perceived responsiveness is how many 16 ms poll
+        // boundaries a keystroke has to sit through before it is presented.
+        // Only the first input-bearing iteration since the last present arms
+        // this, so a burst of typing reports the age of its oldest unpresented
+        // event rather than resetting the clock on every key.
+        if input.input_events > 0 && input_awaiting_present.is_none() {
+            input_awaiting_present = Some(input_started);
+        }
         phase_timings.input = input_started.elapsed();
 
         let wayland_started = Instant::now();
@@ -1163,6 +1182,25 @@ fn run() -> Result<(), i32> {
         watchdog.leave();
 
         phase_timings.main_present = main_present_started.elapsed();
+
+        let armed_input = if rendered {
+            input_awaiting_present.take()
+        } else {
+            None
+        };
+        if let Some(armed) = armed_input {
+            let input_to_present = armed.elapsed();
+            if input_to_present >= INPUT_TO_PRESENT_REPORT_THRESHOLD {
+                diag_line(format!(
+                    "uiserver: input-to-present us={} input_us={} wayland_us={} console_us={} present_us={}",
+                    input_to_present.as_micros(),
+                    phase_timings.input.as_micros(),
+                    phase_timings.wayland.as_micros(),
+                    phase_timings.console.as_micros(),
+                    phase_timings.main_present.as_micros(),
+                ));
+            }
+        }
 
         let input_reader = input_events.snapshot();
         profile::record_input_health(

@@ -383,6 +383,20 @@ if grep -Fq 'crate::arch::rtc::now()' <<<"$realtime_report_body"; then
     echo 'CLOCK_REALTIME must not read the calendar chip on the query path' >&2
     exit 1
 fi
+# Asking for the identity of the task already running on the asking CPU is a
+# per-CPU question. Answering it through the exclusive global scheduler lock
+# cost 7,197 acquisitions/s at 8 vCPU from this one site while two sibling
+# functions in the same file already read the published seqlock record. The
+# locked call must remain as the fallback: a `None` publication means "retry
+# under authority", never "there is no user task".
+current_snapshot_body="$(
+    sed -n '/^pub fn current_user_snapshot(/,/^}/p' kernel/ps/src/multitask/current.rs
+)"
+if ! grep -Fq 'published_current_identity()' <<<"$current_snapshot_body" \
+    || ! grep -Fq 'scheduler_ref().current_user_process_binding()' <<<"$current_snapshot_body"; then
+    echo 'the current-task identity snapshot must read the published record before the global scheduler lock, and must keep the locked fallback' >&2
+    exit 1
+fi
 
 join_line="$(rg -n 'pthread_join\(threads\[index\]' apps/smpqual/smpqual.c | head -n 1 | cut -d: -f1)"
 complete_line="$(rg -n 'emit_milestone\(PRODUCT_MILESTONE_SMPQUAL_COMPLETE' apps/smpqual/smpqual.c | head -n 1 | cut -d: -f1)"

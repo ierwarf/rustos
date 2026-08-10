@@ -700,15 +700,37 @@ pub fn syscall_linux_net6_with_timeout(
             );
             if pending_transfers.is_receive() {
                 if !consumed.is_some_and(|len| pending_transfers.commit_receive(len)) {
+                    // netd already dequeued these bytes from the peer's stream;
+                    // no other copy of them exists anywhere in the system.
+                    record_stream_break(
+                        STREAM_BREAK_RECEIVE_UNCOMMITTED,
+                        &request,
+                        consumed.unwrap_or(0),
+                    );
                     pending_transfers.drop_pending();
                     return linux_errno(LINUX_EIO);
                 }
+                if let Err(errno) = result.as_ref() {
+                    // The bytes left netd's queue and then failed to reach the
+                    // caller's buffer. The caller sees an error and reads again
+                    // from the byte after the hole.
+                    record_stream_break(
+                        STREAM_BREAK_RECEIVE_COPYOUT,
+                        &request,
+                        errno.unsigned_abs() as usize,
+                    );
+                }
             } else if result.is_ok() {
                 let Some(accepted) = consumed else {
+                    record_stream_break(STREAM_BREAK_SEND_UNREPORTED, &request, 0);
                     pending_transfers.drop_pending();
                     return linux_errno(LINUX_EIO);
                 };
                 if pending_transfers.commit_send(accepted).is_err() {
+                    // netd accepted `accepted` bytes onto the peer's queue, but
+                    // this caller is about to be told the call failed, so a
+                    // stream writer will resend the exact same bytes.
+                    record_stream_break(STREAM_BREAK_SEND_UNCOMMITTED, &request, accepted);
                     pending_transfers.drop_pending();
                     return linux_errno(LINUX_ESTALE);
                 }
@@ -721,6 +743,12 @@ pub fn syscall_linux_net6_with_timeout(
                 }
             }
         }
+        // A netd status reply is NOT recorded here. `EAGAIN` on an empty
+        // non-blocking receive is the ordinary answer and arrives thousands of
+        // times a second; counting it as a stream break buries the real events
+        // under normal traffic. Only a reply that never arrived is ambiguous,
+        // and only the transport can tell the two apart, so that record is
+        // taken at the transport boundary in `call_netd_ipc_request_impl`.
         Err(errno) => {
             pending_transfers.drop_pending();
             linux_errno(errno)
@@ -730,6 +758,95 @@ pub fn syscall_linux_net6_with_timeout(
         return linux_errno(LINUX_EAGAIN);
     }
     outcome
+}
+
+/// Operations whose completion moves bytes across a stream boundary.
+///
+/// These are exactly the operations for which "did it happen?" has an
+/// observable answer that no later call can recover: a send that was accepted
+/// cannot be un-accepted, and a receive that dequeued bytes cannot put them
+/// back. `connect`, `bind`, `poll` and the option calls are all safely
+/// repeatable and are deliberately absent.
+pub(super) const fn socket_op_moves_stream_bytes(op: u16) -> bool {
+    matches!(
+        op,
+        SYSCALL_OFFLOAD_OP_LINUX_SENDTO
+            | SYSCALL_OFFLOAD_OP_LINUX_SENDMSG
+            | SYSCALL_OFFLOAD_OP_LINUX_RECVFROM
+            | SYSCALL_OFFLOAD_OP_LINUX_RECVMSG
+    )
+}
+
+const STREAM_BREAK_RECEIVE_UNCOMMITTED: u64 = 1;
+const STREAM_BREAK_RECEIVE_COPYOUT: u64 = 2;
+const STREAM_BREAK_SEND_UNCOMMITTED: u64 = 3;
+const STREAM_BREAK_SEND_UNREPORTED: u64 = 4;
+pub(super) const STREAM_BREAK_ABANDONED_IN_FLIGHT: u64 = 5;
+
+/// Names a point where this syscall is about to report an outcome that does not
+/// match what netd already did to the stream.
+///
+/// # Why this exists as its own milestone
+///
+/// Every site that calls this has the same shape: netd has *already* committed
+/// the byte movement, and the compat layer then fails on the way back. A stream
+/// caller cannot tell that apart from "nothing happened", so it does the only
+/// thing a stream caller can do - it retries. A retried send duplicates bytes on
+/// the wire; a failed receive drops them. Both land on the peer as a byte stream
+/// that no longer parses, and the peer reports it as a protocol error against
+/// whatever message straddles the damage. That report names the victim, never
+/// the cause, which is why the cause has to name itself here.
+///
+/// This is a diagnostic, not a repair. The repair is a replay slot keyed by the
+/// stream position that `SocketStreamGuard` already maintains, matching the
+/// operation-ID replay slot netd keeps for reference mutations. Until that
+/// exists, this milestone is the only evidence that distinguishes a corrupted
+/// stream from a misbehaving peer.
+///
+/// # Why the sampling bound is mandatory, not a nicety
+///
+/// `record_milestone` writes a synchronous debugcon line, and a debugcon line
+/// was measured at roughly 335 us fixed plus 11.1 us per byte. Stream breaks
+/// arrive in bursts by their nature - a compositor flush loop that retries a
+/// rejected write retries it immediately - so an unbounded record here would
+/// spend milliseconds of CPU per event inside a socket syscall and convert a
+/// data-integrity fault into a hang. `contracts-abi.md` states the same rule
+/// for `ipc-reply-timeout`: a high-frequency milestone stays in the bounded
+/// in-kernel ring and must not emit a line per occurrence.
+///
+/// Each class keeps its own counter so a common class cannot mask a rare one,
+/// and `arg1` carries the running total for that class, so a suppressed line is
+/// still countable from the lines that do appear.
+pub(super) fn record_stream_break(class: u64, request: &NetdIpcRequest, detail: usize) {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    // Indexed by class; slot 0 is unused so a class value maps directly.
+    static STREAM_BREAKS: [AtomicU64; 6] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
+    const EARLY_STREAM_BREAK_SAMPLES: u64 = 8;
+
+    let Some(counter) = STREAM_BREAKS.get(class as usize) else {
+        return;
+    };
+    // ORDERING: Relaxed is exact; this counter owns diagnostics only and
+    // orders nothing.
+    let total = counter.fetch_add(1, Ordering::Relaxed) + 1;
+    if total > EARLY_STREAM_BREAK_SAMPLES && !total.is_power_of_two() {
+        return;
+    }
+    // arg0=(class, offload op, running total for this class),
+    // arg1=(socket token, class-specific detail: accepted bytes or errno).
+    nucleus_core::debug::record_milestone(
+        nucleus_core::debug::LogCategory::Compat,
+        "socket-stream-break",
+        (class << 48) | (u64::from(request.op) << 32) | (total & 0xffff_ffff),
+        ((request.socket_token & 0xffff_ffff) << 32) | (detail as u64 & 0xffff_ffff),
+    );
 }
 
 pub(super) const NETD_NANOS_PER_MILLI: u64 = 1_000_000;
