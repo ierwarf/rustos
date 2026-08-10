@@ -2,12 +2,12 @@
 # Formal Contract Registry
 
 - Schema: `3`
-- Registry SHA-256: `a97bc640951bc189d2479921abf2601facc753804570271b52923d860169d0a6`
+- Registry SHA-256: `71b7bd6c861dcc904505700f73d06fe87af675223438098d2534c81e32f24221`
 - Models: `127`
 - Whole flows: `68`
-- Transitions: `687`
+- Transitions: `688`
 - Product runtime scenarios: `3`
-- Exact source witnesses: `573`
+- Exact source witnesses: `574`
 - Apalache pilots: `3`
 - TLAPS theorem models: `2`
 - Runtime-traced models: `7`
@@ -54,7 +54,7 @@
 | `kernel-resource-lifecycle` | `critical` | kernel-ipc-runtime, kernel-ps | kernel-resource-accounting/KernelResourceAccounting | 9 | 9 | quota-returned, rejected |
 | `loader-request-authority` | `critical` | initd, kernel-compat, loaderd | loader-request-authority/LoaderRequestAuthority | 6 | 6 | committed, denied |
 | `memory-map` | `critical` | kernel-compat, kernel-mm, syscalld | page-table-lifecycle/PageTableLifecycle, page-table-map-transaction/PageTableMapTransaction | 8 | 8 | rejected, unmapped |
-| `monotonic-deadline-lifecycle` | `critical` | kernel-compat, kernel-hal, kernel-ps | clocksource-deadline/ClocksourceDeadline | 12 | 12 | cancelled, retired, source-rejected, timed-out |
+| `monotonic-deadline-lifecycle` | `critical` | kernel-compat, kernel-hal, kernel-ps | clocksource-deadline/ClocksourceDeadline | 13 | 13 | cancelled, reported, retired, source-rejected, timed-out |
 | `msi-vector-ingress` | `critical` | kernel-hal, kernel-io-manager | msi-vector-lifecycle/MsiVectorLifecycle | 8 | 8 | free, permanent, rejected |
 | `netd-deferred-reply-lifecycle` | `critical` | netd | netd-deferred-reply/NetdDeferredReply | 10 | 10 | discarded, provider-not-started, rejected, replied, timed-out |
 | `pci-resource-discovery` | `critical` | kernel-hal | pci-bar-discovery/PciBarDiscovery | 9 | 9 | published, rejected |

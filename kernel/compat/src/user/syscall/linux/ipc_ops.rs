@@ -2643,11 +2643,13 @@ fn service_ipc_deadline_tick_after(timeout_ms: u64) -> u64 {
 }
 
 /// A netd ABI v7 request carries the initiator's `CLOCK_MONOTONIC` end
-/// instant. `monotonic_timespec` uses this exact tick-to-nanoseconds mapping,
-/// so flooring the inverse conversion cannot make a reply waiter outlive the
-/// advertised wire deadline. The wire value is clamped to the already-admitted
-/// relative class cap, so untrusted input cannot widen a caller's timeout.
-/// Other service requests retain their established relative behavior.
+/// instant, which is reported at clocksource resolution and so does not land
+/// on a tick boundary. Flooring is what keeps that safe: the waiter is armed on
+/// the last tick at or before the advertised instant, so it can expire early by
+/// up to one tick but can never outlive the deadline its initiator published.
+/// The wire value is clamped to the already-admitted relative class cap, so
+/// untrusted input cannot widen a caller's timeout. Other service requests
+/// retain their established relative behavior.
 fn netd_deadline_tick_from_request(request: &[u8], ticks_per_second: u64) -> Option<u64> {
     if request.len() < NETD_IPC_REQUEST_HEADER_SIZE {
         return None;

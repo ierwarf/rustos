@@ -358,6 +358,31 @@ if grep -Eq 'request_syscalld|with_current_user_process_state(_mut)?' <<<"$time_
     echo 'clock and sleep hot paths must not depend on process-state or policy-service latency' >&2
     exit 1
 fi
+# REQ-CLK-013. The tick domain numbers the deadline wheel; it is not the
+# resolution an instant is reported at. Deriving the reported timespec from
+# `ticks()` rounded every `CLOCK_MONOTONIC` answer to 1/1024 s, which is coarser
+# than most intervals ring 3 measures and made its own timings unreadable.
+monotonic_report_body="$(
+    sed -n '/^pub fn monotonic_timespec(/,/^}/p' \
+        kernel/compat/src/user/syscall/linux/service_ops/process_time.rs
+)"
+if ! grep -Fq 'crate::arch::rtc::monotonic_nanos()' <<<"$monotonic_report_body" \
+    || grep -Eq 'ticks\(\)|ticks_per_second' <<<"$monotonic_report_body"; then
+    echo 'the reported monotonic instant must come from the clocksource, not the tick domain' >&2
+    exit 1
+fi
+# The calendar chip is read under `without_interrupts` and answers with
+# one-second resolution; under virtualization each of its port accesses is an
+# exit. Serving every `CLOCK_REALTIME` query from it is what the latched epoch
+# exists to prevent.
+realtime_report_body="$(
+    sed -n '/^pub fn realtime_timespec(/,/^}/p' \
+        kernel/compat/src/user/syscall/linux/service_ops/process_time.rs
+)"
+if grep -Fq 'crate::arch::rtc::now()' <<<"$realtime_report_body"; then
+    echo 'CLOCK_REALTIME must not read the calendar chip on the query path' >&2
+    exit 1
+fi
 
 join_line="$(rg -n 'pthread_join\(threads\[index\]' apps/smpqual/smpqual.c | head -n 1 | cut -d: -f1)"
 complete_line="$(rg -n 'emit_milestone\(PRODUCT_MILESTONE_SMPQUAL_COMPLETE' apps/smpqual/smpqual.c | head -n 1 | cut -d: -f1)"
@@ -928,6 +953,7 @@ clocksource-deadline/ClocksourceDeadline|kernel-hal|arch::rtc::tests::sleep_dead
 clocksource-deadline/ClocksourceDeadline|kernel-hal|arch::rtc::tests::sleep_waiter_update_expiry_and_cancel_preserve_exact_task_ownership
 clocksource-deadline/ClocksourceDeadline|kernel-hal|arch::rtc::tests::sleep_waiter_clockevent_collision_is_nonblocking_and_retryable
 clocksource-deadline/ClocksourceDeadline|kernel-compat|user::syscall::linux::service_ops::process_time::tests::time_hot_path_admission_is_local_and_complete
+clocksource-deadline/ClocksourceDeadline|kernel-compat|user::syscall::linux::service_ops::process_time::tests::a_monotonic_instant_between_two_ticks_keeps_its_own_resolution
 clocksource-deadline/ClocksourceDeadline|kernel-ps|multitask::scheduler::tests::scheduler_block_arm_is_exact_race_safe_and_terminally_revoked
 cpu-topology-admission/CpuTopologyAdmission|kernel-hal|arch::acpi::tests::madt_cpu_topology_is_dense_unique_bounded_and_atomic
 cpu-topology-admission/CpuTopologyAdmission|kernel-hal|arch::acpi::tests::madt_rejects_truncation_hot_add_only_and_bad_apic_override

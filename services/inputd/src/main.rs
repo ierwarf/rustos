@@ -988,8 +988,15 @@ fn start_dvm_ingestion_worker(queue: SharedInputQueue, log_state: Arc<DvmIngress
                         "inputd: DVM transport progress records={total_drained} batch={drained} batch_seq={nonempty_batches} stage=decoded"
                     ));
                 }
+                // Start the sync clock after the stage line, not before it.
+                // Reporting happens on one turn in 256, and a debugcon line is
+                // a port write per byte; leaving it inside the window made the
+                // sampled turn the only expensive one and charged its cost to
+                // the phase under investigation. The stage lines still bracket
+                // the sync so a hang leaves the same evidence it always did.
+                let sync_started_ns = dvm_session_sync::monotonic_nanos();
                 let session_sync_deadline = rustos_user_abi::deadline::AbsoluteDeadline::after(
-                    dvm_session_sync::monotonic_nanos(),
+                    sync_started_ns,
                     dvm_session_sync::TIMEOUT_NS,
                 );
                 let mut session_sync_attempts = 0_u32;
@@ -1028,6 +1035,9 @@ fn start_dvm_ingestion_worker(queue: SharedInputQueue, log_state: Arc<DvmIngress
                         }
                     }
                 };
+                let sync_done_ns = report_progress
+                    .then(dvm_session_sync::monotonic_nanos)
+                    .unwrap_or(sync_started_ns);
                 if report_progress {
                     debug_line(&format!(
                         "inputd: DVM transport progress records={total_drained} batch={drained} batch_seq={nonempty_batches} stage=published"
@@ -1035,15 +1045,18 @@ fn start_dvm_ingestion_worker(queue: SharedInputQueue, log_state: Arc<DvmIngress
                     if total_drained >= next_progress_report {
                         next_progress_report = total_drained.saturating_add(256);
                     }
-                }
-                if report_progress {
-                    let sync_done_ns = dvm_session_sync::monotonic_nanos();
+                    let drain_ns = drain_done_ns.saturating_sub(turn_started_ns);
+                    let decode_ns = decode_done_ns.saturating_sub(drain_done_ns);
+                    let sync_ns = sync_done_ns.saturating_sub(sync_started_ns);
+                    // The three phases sum to the turn. Wall time from the wake
+                    // to here does not, because the stage lines above sit
+                    // between them and are not work the other 255 turns do.
                     debug_line(&format!(
                         "inputd: DVM turn split records={total_drained} batch={drained} drain_us={} decode_us={} sync_us={} turn_us={}",
-                        drain_done_ns.saturating_sub(turn_started_ns) / 1_000,
-                        decode_done_ns.saturating_sub(drain_done_ns) / 1_000,
-                        sync_done_ns.saturating_sub(decode_done_ns) / 1_000,
-                        sync_done_ns.saturating_sub(turn_started_ns) / 1_000,
+                        drain_ns / 1_000,
+                        decode_ns / 1_000,
+                        sync_ns / 1_000,
+                        drain_ns.saturating_add(decode_ns).saturating_add(sync_ns) / 1_000,
                     ));
                 }
                 log_dvm_ingress_observation_flags(&log_state, observations);

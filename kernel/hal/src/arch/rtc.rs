@@ -296,6 +296,34 @@ pub fn now() -> RtcDateTime {
     interrupts::without_interrupts(read_stable_datetime)
 }
 
+/// Elapsed time on the validated clocksource, in nanoseconds.
+///
+/// This is the value `ticks()` is derived from, and the one a caller wants
+/// whenever it is reporting or comparing an instant rather than indexing the
+/// tick-numbered deadline wheel. Rounding to `RTC_TICKS_PER_SEC` throws away
+/// just under a millisecond, which is larger than most of the intervals the
+/// system measures.
+///
+/// Before the clocksource is admitted there is no counter to read, so the
+/// periodic interrupt count is the only elapsed-time evidence that exists;
+/// scaling it keeps this function's domain continuous across that handover
+/// rather than reporting zero for the whole of early boot. `ticks()` keeps its
+/// own copy of that fallback because one tick is 976562.5 nanoseconds, so a
+/// tick count routed through integer nanoseconds would not come back whole.
+pub fn monotonic_nanos() -> u64 {
+    let nanos = crate::arch::clock::monotonic_nanos();
+    if nanos == 0 && crate::arch::clock::current_source().is_none() {
+        // ORDERING: acquire matches the interrupt handler's release increment,
+        // so a reader that sees the count also sees the state that edge left.
+        return u64::try_from(
+            u128::from(RTC_TICKS.load(Ordering::Acquire)).saturating_mul(1_000_000_000_u128)
+                / u128::from(RTC_TICKS_PER_SEC),
+        )
+        .unwrap_or(u64::MAX);
+    }
+    nanos
+}
+
 pub fn ticks() -> u64 {
     let nanos = crate::arch::clock::monotonic_nanos();
     if nanos == 0 && crate::arch::clock::current_source().is_none() {

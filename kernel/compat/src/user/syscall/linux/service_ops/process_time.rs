@@ -319,26 +319,102 @@ pub fn sleep_until_timespec_substrate(clock_id: u64, deadline: LinuxTimespecWire
     sleep_relative_timespec_substrate(LinuxTimespecWire { tv_sec, tv_nsec });
 }
 
+/// Reports the validated clocksource directly, in its own resolution.
+///
+/// `CLOCK_MONOTONIC` is the only instant userspace can read, so it is what
+/// every service measures an interval with. Routing it through the
+/// tick-numbered deadline wheel rounded every answer to 1/1024 s, and a
+/// millisecond is longer than most of what ring 3 measures: inputd reported
+/// `drain_us=0 decode_us=0` for work it had certainly done, and the transport
+/// turn it could see came back as a choice between 0, 977, and 1953
+/// microseconds. The tick domain remains the authority for *arming* a
+/// deadline; it was never the authority for reporting an instant.
 pub fn monotonic_timespec() -> LinuxTimespecWire {
-    let ticks = crate::arch::rtc::ticks();
-    let ticks_per_second = crate::arch::rtc::ticks_per_second().max(1);
+    timespec_from_nanos(crate::arch::rtc::monotonic_nanos())
+}
+
+fn timespec_from_nanos(nanos: u64) -> LinuxTimespecWire {
     LinuxTimespecWire {
-        tv_sec: (ticks / ticks_per_second) as i64,
-        tv_nsec: ((ticks % ticks_per_second).saturating_mul(1_000_000_000) / ticks_per_second)
-            as i64,
+        tv_sec: (nanos / 1_000_000_000) as i64,
+        tv_nsec: (nanos % 1_000_000_000) as i64,
     }
 }
 
+/// Wall-clock nanoseconds at monotonic zero, latched on the first successful
+/// calendar read and never re-read afterwards.
+///
+/// Reading the CMOS calendar is not a cheap query. `rtc::now` disables
+/// interrupts, spins until the chip is not mid-update, and then reads seven
+/// registers twice over to prove the value did not change underneath it. Every
+/// one of those is a port access, and under hardware virtualization every port
+/// access is a VM exit, so a `clock_gettime(CLOCK_REALTIME)` cost upwards of
+/// thirty exits with interrupts off - to answer with a value whose resolution
+/// was one second.
+///
+/// Anchoring the calendar to the validated monotonic clocksource once is what
+/// every general-purpose kernel does with its wall clock, and it is what makes
+/// the answer both cheap and finer than a second. The absolute error is
+/// whatever the one-second calendar read carried at latch time, which is the
+/// same error the repeated read had; what changes is that the value now
+/// advances continuously and cannot be observed going backwards.
+static REALTIME_EPOCH_NANOS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+static REALTIME_EPOCH_LATCHED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 pub fn realtime_timespec() -> LinuxTimespecWire {
-    let now = crate::arch::rtc::now();
-    let seconds = rtc_datetime_to_unix_seconds(
-        now.year, now.month, now.day, now.hour, now.minute, now.second,
-    )
-    .unwrap_or(0);
-    LinuxTimespecWire {
-        tv_sec: seconds as i64,
-        tv_nsec: 0,
+    use core::sync::atomic::Ordering;
+    // ORDERING: acquire pairs with the release that publishes the latch, so a
+    // CPU that sees the flag also sees the epoch the winning CPU wrote.
+    if REALTIME_EPOCH_LATCHED.load(Ordering::Acquire) {
+        return timespec_from_nanos(
+            REALTIME_EPOCH_NANOS
+                .load(Ordering::Relaxed)
+                .saturating_add(crate::arch::rtc::monotonic_nanos()),
+        );
     }
+    latch_realtime_epoch()
+}
+
+#[cold]
+fn latch_realtime_epoch() -> LinuxTimespecWire {
+    use core::sync::atomic::Ordering;
+    let now = crate::arch::rtc::now();
+    let Some(seconds) = rtc_datetime_to_unix_seconds(
+        now.year, now.month, now.day, now.hour, now.minute, now.second,
+    ) else {
+        // An unreadable calendar stays unreadable rather than latching a
+        // fabricated epoch that every later query would inherit.
+        return LinuxTimespecWire {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+    };
+    let wall_nanos = seconds.saturating_mul(1_000_000_000);
+    if crate::arch::clock::current_source().is_none() {
+        // No admitted elapsed-time domain to anchor against yet. Answer from
+        // the calendar and try again on the next query.
+        return timespec_from_nanos(wall_nanos);
+    }
+    let monotonic = crate::arch::rtc::monotonic_nanos();
+    let epoch = wall_nanos.saturating_sub(monotonic);
+    // ORDERING: exactly one CPU may install the epoch, so the write is a
+    // compare-exchange against the never-latched zero rather than a store.
+    if REALTIME_EPOCH_NANOS
+        .compare_exchange(0, epoch, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        // ORDERING: release keeps the epoch write ahead of the flag that
+        // advertises it, so the acquiring fast path cannot read a zero epoch.
+        REALTIME_EPOCH_LATCHED.store(true, Ordering::Release);
+    }
+    // A CPU that lost the race reads the winner's epoch, so both return the
+    // same time domain from this call onwards.
+    timespec_from_nanos(
+        REALTIME_EPOCH_NANOS
+            .load(Ordering::Relaxed)
+            .saturating_add(monotonic),
+    )
 }
 
 fn rtc_datetime_to_unix_seconds(
@@ -501,6 +577,35 @@ fn record_clone_result(kind: u64, result: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_monotonic_instant_between_two_ticks_keeps_its_own_resolution() {
+        let ticks_per_second = crate::arch::rtc::ticks_per_second();
+        let tick_nanos = 1_000_000_000 / ticks_per_second;
+        // Two instants inside one tick. The tick-numbered deadline wheel cannot
+        // tell them apart, which is exactly why reporting an instant must not
+        // be routed through it.
+        let early = 7 * tick_nanos + 1_000;
+        let late = 7 * tick_nanos + tick_nanos - 1_000;
+
+        assert_eq!(
+            timespec_from_nanos(early).tv_nsec as u64,
+            early,
+            "a sub-tick instant must survive the conversion",
+        );
+        assert!(timespec_from_nanos(early).tv_nsec < timespec_from_nanos(late).tv_nsec);
+
+        // The seconds split stays exact across a boundary that is not a whole
+        // number of ticks.
+        let crossing = 3 * 1_000_000_000 + 12_345;
+        assert_eq!(
+            timespec_from_nanos(crossing),
+            LinuxTimespecWire {
+                tv_sec: 3,
+                tv_nsec: 12_345,
+            }
+        );
+    }
 
     #[test]
     fn time_hot_path_admission_is_local_and_complete() {
