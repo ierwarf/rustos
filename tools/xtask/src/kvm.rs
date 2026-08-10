@@ -721,4 +721,5 @@ include!("kvm/help.rs");
 include!("kvm/layout.rs");
 include!("kvm/guest.rs");
 include!("kvm/evidence.rs");
+include!("kvm/user_debug_records.rs");
 include!("kvm/tests.rs");

@@ -329,11 +329,12 @@ fn dvm_display_relay_ready(log: &str, physical_amdgpu: bool) -> bool {
 
 fn read_runtime_log_if_present(path: &Path) -> Result<String> {
     match fs::read_to_string(path) {
-        Ok(log) => Ok(log),
+        Ok(log) => Ok(rejoin_user_debug_records(&log)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
         Err(error) => Err(error).with_context(|| format!("read runtime log {}", path.display())),
     }
 }
+
 
 #[derive(Debug, Serialize)]
 struct KvmFailureLog {

@@ -508,7 +508,12 @@ fn wait_for_parallel_boot(
     loop {
         check_guest_running(rustos, "RustOS", &layout.rustos_stderr_log)?;
         check_guest_running(dvm, "Linux DVM", &layout.dvm_stderr_log)?;
-        let rustos_log = fs::read_to_string(&layout.debugcon_log)?;
+        // The debug syscall envelopes every 256-byte chunk separately, so a
+        // long service line arrives as several records and must be put back
+        // together before any predicate below reads a field off it.
+        let rustos_log = rejoin_user_debug_records(&fs::read_to_string(
+            &layout.debugcon_log,
+        )?);
         let dvm_log = fs::read_to_string(&layout.dvm_serial_log)?;
         if options.expect_block_flush_fault && rustos_log.contains(RUSTOS_DVM_BLOCK_E2E_MARKER) {
             bail!(
@@ -709,7 +714,9 @@ fn runtime_log_suffix(path: &Path, offset: usize) -> Result<String> {
     let suffix = log
         .get(offset..)
         .context("runtime log was truncated during a recovery proof")?;
-    Ok(suffix.to_owned())
+    // The offset indexes the raw file, so slice first and rejoin the chunked
+    // ring 3 records afterwards.
+    Ok(rejoin_user_debug_records(suffix))
 }
 
 fn archive_recovery_log(path: &Path) -> Result<()> {

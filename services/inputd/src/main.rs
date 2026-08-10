@@ -1039,9 +1039,18 @@ fn start_dvm_ingestion_worker(queue: SharedInputQueue, log_state: Arc<DvmIngress
                     .then(dvm_session_sync::monotonic_nanos)
                     .unwrap_or(sync_started_ns);
                 if report_progress {
-                    debug_line(&format!(
+                    let published = format!(
                         "inputd: DVM transport progress records={total_drained} batch={drained} batch_seq={nonempty_batches} stage=published"
-                    ));
+                    );
+                    let published_line_bytes = published.len();
+                    debug_line(&published);
+                    // `sync_done_ns` was taken immediately before that line, so
+                    // this brackets exactly one `debug_line`. It is the price of
+                    // a debugcon line in this topology, which is what decides
+                    // whether any diagnostic belongs on a per-event path - and
+                    // it was the whole of the 2 ms this split used to report as
+                    // session sync.
+                    let log_done_ns = dvm_session_sync::monotonic_nanos();
                     if total_drained >= next_progress_report {
                         next_progress_report = total_drained.saturating_add(256);
                     }
@@ -1052,11 +1061,12 @@ fn start_dvm_ingestion_worker(queue: SharedInputQueue, log_state: Arc<DvmIngress
                     // to here does not, because the stage lines above sit
                     // between them and are not work the other 255 turns do.
                     debug_line(&format!(
-                        "inputd: DVM turn split records={total_drained} batch={drained} drain_us={} decode_us={} sync_us={} turn_us={}",
+                        "inputd: DVM turn split records={total_drained} batch={drained} drain_us={} decode_us={} sync_us={} turn_us={} log_us={} log_bytes={published_line_bytes}",
                         drain_ns / 1_000,
                         decode_ns / 1_000,
                         sync_ns / 1_000,
                         drain_ns.saturating_add(decode_ns).saturating_add(sync_ns) / 1_000,
+                        log_done_ns.saturating_sub(sync_done_ns) / 1_000,
                     ));
                 }
                 log_dvm_ingress_observation_flags(&log_state, observations);

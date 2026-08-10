@@ -1041,3 +1041,171 @@ changing which allocator a test binary selects is not a change to make at the
 end of a session. Do it on its own, with `kernel-ps` and `kernel-compat` test
 suites as the check, and use `rustos_boot_image` as the predicate the way
 `debug/mod.rs`, `input/wait_queue.rs`, and `memory/phys.rs` now do.
+
+## The 2 ms was the diagnostic, not the syscalls, and the sink has a price
+
+`sync_us=1953` was never session sync. The split took `decode_done_ns` *before*
+the `stage=decoded` line and `sync_done_ns` *after* the `stage=published` line,
+so both debugcon writes sat inside the window labelled session sync. Progress is
+reported on one turn in 256, which made the sampled turn the only expensive one
+in the run and charged its cost to the phase under investigation.
+
+Moving the two timestamps inside the lines - changing nothing else, and touching
+no readiness path - gives the turn as it always was:
+
+    drain_us=21 decode_us=7 sync_us=14 turn_us=40 log_us=1215 log_bytes=82
+
+**This retires "The 2 ms is a syscall count, and it links the two open
+regressions" above.** `apply` is 14 to 380 us, and `publish_readiness` is inside
+that figure, so the readiness publication cannot be two milliseconds and the two
+items it proposed - one syscall for both object ids, and folding the deassert -
+are not worth the 2 ms they were costed against. They may still be worth doing
+on their own merits; they are not a fix for a cost that does not exist. The
+regression `f69a80f` recorded from the reader side is a separate observation and
+stays open on its own evidence.
+
+### What a debugcon line costs
+
+`log_us` self-times one `debug_line`. Two lengths, same run, 1 vCPU:
+
+| line bytes | cost |
+| ---: | ---: |
+| 82 | 1246 us |
+| 145 | 1946 us |
+
+That is **~335 us fixed plus ~11.1 us per byte** - the fixed part is the syscall
+and the serialisation lock, the slope is the port write per byte reaching a host
+file. A diagnostic on a per-event path is therefore twenty-five times the event
+it describes, and the rule "keep debugcon off hot paths" now has a number behind
+it rather than a reputation.
+
+Applied to the kernel's own output, measured over a 104 s 1 vCPU run: 41.0
+lines/s and 10.3 KiB/s in total, which the model prices at **~131 ms/s, or 13
+percent of one CPU**. The scheduler runtime profile is 21.6 lines/s at a mean of
+326 bytes, so **~85 ms/s of that is the profiler**, and it is 67 percent of all
+log bytes.
+
+Two things follow, and neither is "delete the profiler":
+
+1. This is a harness cost, not a product one. `rustos_debug_print_enabled` gates
+   the whole sink and a product image has no debugcon. But it is 13 percent of
+   one CPU *inside the runs that certify performance*, so every acceptance
+   measurement is taken on a machine the instrument is loading.
+2. The cheap reduction is the envelope, not the content. A milestone line
+   carries `seq`, `ts_us`, `tick`, `cat`, `pid`, and `tid` in the outer log
+   frame *and* again inside `milestone-begin ... milestone-end`, plus a constant
+   `mod=nucleus_core::debug line=0`. That is roughly 95 of the 326 bytes, about
+   28 percent, for no information. It was left alone deliberately: the inner
+   frame is checksummed and parsed by `check-kvm-runtime-trace.py`, so changing
+   it is an evidence-format change and belongs in its own session with those
+   parsers as the check.
+
+### The acquisition census only named half the contention
+
+At 8 vCPU, 38,105 dispatches/s, median of 107 windows:
+
+| | |
+| --- | ---: |
+| lock acquisitions | 144,602 /s |
+| per dispatch | 3.79 |
+| hold | 738.6 ms/s |
+| wait | 2059.5 ms/s |
+| attributed in-owner | 652.6 ms/s |
+
+In-owner segments, ms/s: select 242.8 (of which handoff 165.1, vruntime 76.4,
+pick 1.4), commit 136.7, balance 110.2, validate 73.1, arch-restore 56.4,
+prologue 25.1, account 9.4. Inside select-handoff: pick-scan 57.0 over 54,559
+calls, handoff-scan 35.5 over 67,044, step-overdue 36.3 over 33,526,
+step-acquire 24.1 over 38,118, step-sync 16.0 over 38,120, and
+**step-activation 0.0 over 0 calls** - `7118ea1` removed it entirely.
+
+The four emitted census sites were `irq.rs:736` 24,546/s, `current.rs:416`
+(`arm_block_current_task`) 16,435/s, `irq.rs:850`
+(`commit_block_current_task`) 15,904/s, `irq.rs:676` 13,830/s. That is 70,715
+of 144,602: **half the acquisitions had no caller attached**, because the census
+tracks 64 sites and emitted 4. Widened to 8 behind a one-percent floor, so a
+quiet window still pays for nothing and the next measurement can name the rest.
+
+Do not start the `Scheduler` per-task array split until that report is read. The
+two block sites above are already 22 percent of acquisitions and are structural
+- the arm/recheck/commit protocol requires the recheck to happen outside the
+lock - so whether they can move to a CPU-owned lock is a different question from
+whether the struct needs splitting, and the unnamed half may contain something
+cheaper than either.
+
+### Correction to "The lock-hold maximum is spawn, not dispatch"
+
+The heading overstates what that section's own body says. At 8 vCPU in steady
+state the maximum is attributed to `irq.rs:736` in 67 windows and `irq.rs:676`
+in 28, against `spawn.rs` in 2 - so it is dispatch, and the spawn maxima are the
+boot-time observation the body already described. Median hold max is 97 us with
+89 us attributed. The line numbers in that table have also moved: `irq.rs:712`
+is now `irq.rs:736`.
+
+### The UI input gate could not pass, for a formatting reason
+
+`ui_input_ready` was false in every run at every vCPU count, and it was not the
+input pipeline. The ring 3 debug syscall copies `USER_DEBUG_CHUNK_BYTES` (256)
+per pass and gives each chunk its own kernel-owned `user-debug payload=`
+envelope, so a service line longer than that reaches the log as several records
+split wherever byte 256 landed - usually mid-token:
+
+    user-debug payload=... cursor_mismatches=0 cur
+    user-debug payload=sor=992,594 presented_cursor=992,594 background_thread_demotions=13 ...
+    user-debug payload=_ms=0 part_ren_ms=0 part_prs_ms=1 mpix=2 spins=0\n
+
+`uiserver profile:` is 562 bytes, so `cursor`, `presented_cursor`,
+`cursor_moves`, and `background_thread_demotions` all landed on a record with no
+prefix. `parse_ui_profile_input_window` uses `?` on every field, so it returned
+`None` for **every** window and the gate could not pass whatever the guest did.
+The line grew past 256 bytes at some point and took the gate with it silently;
+the existing tests fed the predicate whole lines, so they never saw it.
+
+Fixed on the reader side, in `rejoin_user_debug_records`, because the chunking
+is a deliberate property of the transport - the envelope is what stops ring 3
+forging a milestone frame - and every line-oriented consumer has to undo it, not
+just this one. Records are joined until one ends with the escaped newline the
+producer wrote, bounded at 16. With that, the same predicate at the same
+thresholds reports **`input=true`** at 8 vCPU: five consecutive windows at
+input 61.6/s against a floor of 55, cursor 60.6/s against 50, and a cursor span
+of 192 against 96.
+
+Note this also un-hides evidence for every other predicate that scans the log,
+including the stall and crash markers. A gate that was green only because its
+failure marker was split will now go red, and that is the correct reading.
+
+### Open, and now the top defect: uiserver sends a malformed Wayland message
+
+With input green, the 8 vCPU run ends on `wayclick=false` because the client
+died five seconds in:
+
+    Protocol error 0 on object @0: Malformed Wayland message.
+    wayclick: dispatch failed: Backend(Protocol(ProtocolError { code: 0,
+        object_id: 0, object_interface: "", message: "Malformed Wayland message." }))
+
+It is intermittent - an earlier 8 vCPU run on the same build sustained 113
+one-second wayclick windows - and it is not the compositor crashing: uiserver
+keeps logging `wayland dispatched count=3` after the client is gone, and there
+is no watchdog panic in that run. The compositor's last acts were ordinary
+`wl_callback.done` sends at `frame_seq=115`.
+
+What it is not: a concurrent-writer race. `flush_clients` takes `&mut self`, so
+two threads cannot be inside the same `WaylandServer`.
+
+What to check first, in order:
+
+1. **A silent short write in the socket ABI.** `display.flush_clients()`
+   returned `Ok` - there is not one `uiserver: wayland flush failed` in the run
+   - so `wayland-server` believes it wrote every byte while the client's parser
+   desynchronised. That is the signature of a write that reports success for
+   fewer bytes than it transferred, or a returned count the library trusts.
+   This is a userspace ABI question, not a compositor one: read the AF_UNIX
+   `sendmsg`/`writev` return path and check the short-write and `EAGAIN` cases
+   against what `wayland-backend` assumes.
+2. Ancillary data. `object_id: 0` means the client faulted on the header before
+   it could attribute the message, which fits a byte-offset slip more than a bad
+   argument in one event.
+3. Only then look at event construction.
+
+Reproduce with `--rustos-vcpus 8 --min-ui-fps 30 --ui-proof-windows 5`; expect
+to need several runs.

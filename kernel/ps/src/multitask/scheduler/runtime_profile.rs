@@ -186,6 +186,13 @@ fn pack_u32_pair(high: u64, low: u64) -> u64 {
     (high << 32) | low
 }
 
+/// Whether an acquisition site explains enough of the window to be worth a
+/// debugcon line. The census is sorted, so the first site that fails this ends
+/// the report.
+fn acquire_site_is_reportable(count: u64, acquisitions: u64) -> bool {
+    count != 0 && count.saturating_mul(100) >= acquisitions
+}
+
 /// Stable 32-bit file identity for the acquisition census.
 fn fnv1a32(value: &str) -> u32 {
     let mut hash = 0x811c_9dc5_u32;
@@ -374,18 +381,33 @@ pub fn drain_scheduler_runtime_profile() -> usize {
     // Milestones, not level-filtered logs: the ordinary info channel does not
     // reach the debug transport in the product configuration, and a diagnostic
     // that cannot be read is not evidence.
-    for (index, (file, line, count)) in census.iter().take(4).enumerate() {
-        if *count == 0 {
+    //
+    // Four names left most of the traffic anonymous. At eight vCPUs the census
+    // reported 144,602 acquisitions per second and the four emitted sites
+    // accounted for 70,715 of them, so the majority of the contention had no
+    // caller attached to it and no cut could be argued from the record. The
+    // sites are tracked sixty-four deep already; only the reporting was narrow.
+    //
+    // The floor is what keeps the wider report from costing anything on a quiet
+    // system: a site below a percent of the window explains none of the wait,
+    // and each name is a debugcon line, which is a port write per byte.
+    const ACQUIRE_SITE_NAMES: [&str; 8] = [
+        "kernel-scheduler-acquire-0",
+        "kernel-scheduler-acquire-1",
+        "kernel-scheduler-acquire-2",
+        "kernel-scheduler-acquire-3",
+        "kernel-scheduler-acquire-4",
+        "kernel-scheduler-acquire-5",
+        "kernel-scheduler-acquire-6",
+        "kernel-scheduler-acquire-7",
+    ];
+    for (name, (file, line, count)) in ACQUIRE_SITE_NAMES.into_iter().zip(census.iter()) {
+        if !acquire_site_is_reportable(*count, profile.lock_acquisitions) {
             break;
         }
         crate::debug::record_milestone(
             crate::debug::LogCategory::Sched,
-            match index {
-                0 => "kernel-scheduler-acquire-0",
-                1 => "kernel-scheduler-acquire-1",
-                2 => "kernel-scheduler-acquire-2",
-                _ => "kernel-scheduler-acquire-3",
-            },
+            name,
             *count,
             // The line alone is ambiguous across files, so pack a stable file
             // hash beside it. Offline, hashing a candidate path identifies the
@@ -880,5 +902,29 @@ mod tests {
         assert_eq!(profile.deferred_wakes, 3);
         assert_eq!(profile.phase_ns[SchedulerPhase::Prologue as usize], 300);
         assert_eq!(scheduler.runtime_profile_deferred_wakes, 0);
+    }
+
+    #[test]
+    fn an_acquisition_site_below_a_percent_of_its_window_ends_the_report() {
+        use super::acquire_site_is_reportable;
+        let acquisitions = 144_602;
+
+        // The four sites that were already named, and the fifth that was not.
+        assert!(acquire_site_is_reportable(24_546, acquisitions));
+        assert!(acquire_site_is_reportable(13_830, acquisitions));
+        // Exactly one percent still explains a percent of the wait.
+        assert!(acquire_site_is_reportable(1_447, acquisitions));
+        assert!(!acquire_site_is_reportable(1_445, acquisitions));
+
+        // A site with no acquisitions ends the report whatever the window is,
+        // including an empty one, where every site would otherwise qualify.
+        assert!(!acquire_site_is_reportable(0, acquisitions));
+        assert!(!acquire_site_is_reportable(0, 0));
+        assert!(acquire_site_is_reportable(1, 0));
+
+        // A window large enough to overflow the percent multiply must not wrap
+        // into reporting a site that explains nothing.
+        assert!(!acquire_site_is_reportable(1, u64::MAX));
+        assert!(acquire_site_is_reportable(u64::MAX, u64::MAX));
     }
 }
