@@ -937,7 +937,7 @@ fn populate_netd_request_payload(
         SYSCALL_OFFLOAD_OP_LINUX_SENDMSG => {
             let header = usermem::read_current_user_struct::<linux_abi::LinuxMsghdr>(request.arg1)
                 .map_err(address_space_error_to_linux_errno)?;
-            let bytes = read_current_iovec_payload(header.msg_iov, header.msg_iovlen)?;
+            let mut bytes = read_current_iovec_payload(header.msg_iov, header.msg_iovlen)?;
             let socket = current_unix_socket_handle(request.arg0).ok_or(LINUX_ENOTSOCK)?;
             pending_transfers.begin_send(&socket, bytes.len())?;
             let raw_control =
@@ -946,13 +946,31 @@ fn populate_netd_request_payload(
             let control = encode_transfer_control_payload(raw_control.as_slice(), context)?;
             pending_transfers.extend(control.descriptors.as_slice());
             pending_transfers.extend_tickets(control.tickets.as_slice());
+            // One offload payload is a bounded buffer, but that bound belongs to
+            // this transport and not to the caller's ABI. Linux `sendmsg` on a
+            // stream socket never answers `EINVAL` because a buffer inside the
+            // kernel was smaller than the request; it takes a prefix and returns
+            // how much it took, which is what every stream writer is built to
+            // handle. Returning `EINVAL` made a legal call look like a
+            // programming error to a caller that had done nothing wrong.
+            //
+            // The reservation above only fixes an upper bound, so committing
+            // fewer bytes than were reserved is already the supported partial
+            // path. Descriptors are the exception: they attach to the message,
+            // so a prefix would deliver them against the wrong bytes. That case
+            // is a message this transport cannot carry atomically, which is what
+            // `EMSGSIZE` means.
+            let capacity = sendmsg_data_capacity(control.bytes.len())?;
+            if bytes.len() > capacity {
+                if !control.bytes.is_empty() {
+                    return Err(LINUX_EMSGSIZE);
+                }
+                bytes.truncate(capacity);
+            }
             let payload_len = NETD_SENDMSG_PAYLOAD_HEADER_SIZE
                 .checked_add(bytes.len())
                 .and_then(|len| len.checked_add(control.bytes.len()))
                 .ok_or(LINUX_EINVAL)?;
-            if payload_len > NETD_IPC_PAYLOAD_CAPACITY {
-                return Err(LINUX_EINVAL);
-            }
             request.payload[0..4].copy_from_slice(&(bytes.len() as u32).to_ne_bytes());
             request.payload[4..8].copy_from_slice(&(control.bytes.len() as u32).to_ne_bytes());
             request.payload[8..12].copy_from_slice(&0_u32.to_ne_bytes());
@@ -1138,6 +1156,18 @@ pub(super) fn consume_netd_release_payload(response: &mut NetdIpcResponse) -> Re
     response.payload_len = visible_len as u32;
     response.reserved0 = 0;
     Ok(())
+}
+
+/// Stream bytes one offload payload can carry beside its control block.
+///
+/// Zero room is not a short write, it is a message with no prefix to take, so
+/// it reports the same `EMSGSIZE` as a control block that cannot fit at all.
+fn sendmsg_data_capacity(control_len: usize) -> Result<usize, i64> {
+    NETD_IPC_PAYLOAD_CAPACITY
+        .checked_sub(NETD_SENDMSG_PAYLOAD_HEADER_SIZE)
+        .and_then(|room| room.checked_sub(control_len))
+        .filter(|room| *room != 0)
+        .ok_or(LINUX_EMSGSIZE)
 }
 
 fn read_current_iovec_payload(iov_ptr: u64, iov_len: u64) -> Result<Vec<u8>, i64> {

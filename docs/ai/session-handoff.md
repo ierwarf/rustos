@@ -1209,3 +1209,38 @@ What to check first, in order:
 
 Reproduce with `--rustos-vcpus 8 --min-ui-fps 30 --ui-proof-windows 5`; expect
 to need several runs.
+
+### Chasing the malformed message: what is eliminated, and the ABI defect it found
+
+Three candidates ruled out by reading the code, so the next session does not
+repeat them:
+
+- **Concurrent writers.** `flush_clients` takes `&mut self`; two threads cannot
+  be inside the same `WaylandServer`.
+- **A stream-position desync on an error path.** `begin_stream_send(len)` only
+  reserves `[start, start+len)` and sets `send_in_flight`; `send_position` moves
+  only in `commit_send`, and `SocketStreamGuard::drop` clears the busy flag
+  without touching the position. An error between reservation and commit is
+  therefore safe - it loses a turn, not a byte.
+- **netd's short-write accounting.** `send_socket_message` returns
+  `room.min(bytes.len())`, and refuses a partial write outright when the message
+  carries control data. Both are correct AF_UNIX stream semantics.
+
+The search did find a real ABI defect on that path, now fixed. Marshalling a
+`sendmsg` answered `EINVAL` whenever header + data + control exceeded
+`NETD_IPC_PAYLOAD_CAPACITY`. Linux never answers a stream `sendmsg` that way: an
+internal buffer bound is not the caller's error, and a stream writer is built to
+retry a short write but not an argument fault. It now takes a prefix and reports
+it - the reservation already permits committing fewer bytes than reserved - and
+reserves `EMSGSIZE` for the case a prefix cannot express, which is a message
+carrying descriptors, since those attach to the message and would be delivered
+against the wrong bytes.
+
+**This is not confirmed as the cause of the malformed message.** A Wayland
+connection buffer flushes in 4 KB chunks against a 32 KB payload, so the bound
+should not be reached on that socket; the defect was found while looking, and is
+worth having on its own. The symptom remains intermittent - one 8 vCPU run on
+the same build sustained 113 wayclick windows - so reproduce before concluding
+anything. What is left to check, in order: the receive side's segment
+reassembly, whether `recv_socket_bytes` can split a segment across a control
+boundary, and only then event construction.
