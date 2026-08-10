@@ -2,11 +2,10 @@ use std::ffi::CString;
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
 use std::mem::size_of;
-use std::os::fd::FromRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::OnceLock;
-use std::thread;
 use std::time::{Duration, Instant};
 
 const PROTOCOL_VERSION: u16 = 1;
@@ -356,6 +355,48 @@ fn connect_nonblocking_unix(path: &str) -> Result<UnixStream, i32> {
     Ok(unsafe { UnixStream::from_raw_fd(fd) })
 }
 
+/// Wait until the socket is ready in `events`, or the deadline passes.
+///
+/// # Why this is a poll and not a yield
+/// The stream is deliberately non-blocking so a dead runtimed cannot hang the
+/// caller at connect. That made every short read or write spin
+/// `thread::yield_now()` until the peer caught up - up to `RPC_IO_TIMEOUT` of a
+/// core, burned by uiserver and sessiond on *every* runtimed RPC, competing for
+/// CPU with the very loop they are waiting for. The descriptor is pollable, so
+/// waiting on it directly costs nothing while idle and wakes on the first byte.
+///
+/// The caller's deadline is passed in rather than recomputed here, so the total
+/// bound stays `RPC_IO_TIMEOUT` for the whole transfer instead of resetting on
+/// every partial chunk.
+fn wait_for_socket_ready(stream: &UnixStream, deadline: Instant, events: i16) -> Result<(), i32> {
+    let now = Instant::now();
+    if now >= deadline {
+        return Err(libc::ETIMEDOUT);
+    }
+    let timeout_ms = i32::try_from((deadline - now).as_millis())
+        .unwrap_or(i32::MAX)
+        .max(1);
+    let mut poll_fd = libc::pollfd {
+        fd: stream.as_raw_fd(),
+        events,
+        revents: 0,
+    };
+    let ready = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
+    if ready < 0 {
+        let err = last_errno();
+        // A signal is not a transfer failure. Returning lets the caller retry
+        // the operation; the shared deadline still bounds the loop.
+        if err == libc::EINTR {
+            return Ok(());
+        }
+        return Err(err);
+    }
+    if ready == 0 {
+        return Err(libc::ETIMEDOUT);
+    }
+    Ok(())
+}
+
 fn write_all_retry(stream: &mut UnixStream, mut bytes: &[u8]) -> Result<(), i32> {
     let deadline = Instant::now() + RPC_IO_TIMEOUT;
     while !bytes.is_empty() {
@@ -363,10 +404,7 @@ fn write_all_retry(stream: &mut UnixStream, mut bytes: &[u8]) -> Result<(), i32>
             Ok(0) => return Err(libc::EPIPE),
             Ok(written) => bytes = &bytes[written..],
             Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                if Instant::now() >= deadline {
-                    return Err(libc::ETIMEDOUT);
-                }
-                thread::yield_now();
+                wait_for_socket_ready(stream, deadline, libc::POLLOUT)?;
             }
             Err(err) => return Err(io_errno(err)),
         }
@@ -384,10 +422,7 @@ fn read_exact_retry(stream: &mut UnixStream, mut bytes: &mut [u8]) -> Result<(),
                 bytes = &mut remaining[read..];
             }
             Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                if Instant::now() >= deadline {
-                    return Err(libc::ETIMEDOUT);
-                }
-                thread::yield_now();
+                wait_for_socket_ready(stream, deadline, libc::POLLIN)?;
             }
             Err(err) => return Err(io_errno(err)),
         }

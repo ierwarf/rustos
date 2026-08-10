@@ -435,6 +435,20 @@ if ! grep -Fq 'earliest_console_read_deadline()' <<<"$runtimed_delay_body"; then
     echo 'the runtimed idle budget must include the soonest parked console-read deadline' >&2
     exit 1
 fi
+# The runtimed control socket is deliberately non-blocking so a dead peer cannot
+# hang connect. That makes a short read/write spin unless it waits on the
+# descriptor: uiserver and sessiond issue these RPCs on their own hot paths, and
+# a yield loop here burns a core against the very service it is waiting for.
+runtime_rpc_body="$(
+    sed -n '/^fn write_all_retry(/,/^}/p;/^fn read_exact_retry(/,/^}/p' \
+        libs/runtime-control/src/lib.rs
+)"
+if grep -Fq 'thread::yield_now()' <<<"$runtime_rpc_body" \
+    || ! grep -Fq 'wait_for_socket_ready(stream, deadline, libc::POLLOUT)' <<<"$runtime_rpc_body" \
+    || ! grep -Fq 'wait_for_socket_ready(stream, deadline, libc::POLLIN)' <<<"$runtime_rpc_body"; then
+    echo 'the runtimed control RPC must wait on the socket for readiness, never spin yielding' >&2
+    exit 1
+fi
 # Rootd has the same lifecycle/control split as runtimed: its bounded drain may
 # not block, but the post-init idle turn must wake on a control message or the
 # shared supervisor budget. Keeping the old timer-only helper here would put a
