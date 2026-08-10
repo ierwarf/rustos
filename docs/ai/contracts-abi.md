@@ -633,7 +633,7 @@ policy remains with the owning service.
   queue discard, peer exit, and service-epoch replacement release every queued
   batch. Destination FD numbers remain invisible reservations until data,
   control, and message-header copyout all succeed, then publish atomically.
-- Supervisor services polling independent brokers must use `SYS_RUSTOS_IPC_TRY_RECV`, not blocking `SYS_RUSTOS_IPC_RECV`.
+- Supervisor services draining independent brokers must use `SYS_RUSTOS_IPC_TRY_RECV`, not blocking `SYS_RUSTOS_IPC_RECV`. Their *idle* wait is `SYS_RUSTOS_IPC_RECV_WITH_SENDER_BOUNDED`, not a timer; see the IPC Wait Discipline section.
 - FD-table transfer goes through `kernel_ps::api::TransferredHandleEntry` + `HandleTable::{duplicate_for_transfer, install_transferred}`. Source class + rights must permit descriptor transfer; directory FDs are file capabilities and transferable for VFS migration.
 - Userspace handle-aware IPC: `SYS_RUSTOS_IPC_{CALL,RECV,REPLY}_WITH_HANDLES` with `Ipc*WithHandlesArgs`. Send handles = Linux fd arrays; received handles install into receiver fd table and return as `i32` fd arrays + `u16` count. `recv_fd_count_ptr` mandatory even when no handles returned. Counts bounded by `IPC_MAX_TRANSFER_HANDLES`.
 
@@ -674,9 +674,26 @@ policy remains with the owning service.
   in receive on that endpoint. Task exit must also prune stale receiver
   waiters owned by the exiting task from every endpoint.
 - A single-endpoint service may block in `SYS_RUSTOS_IPC_RECV`. Supervisors
-  with multiple independent event sources must drain with
-  `SYS_RUSTOS_IPC_TRY_RECV` / `rustos_svc_runtime::ipc::try_recv` and use a
-  bounded yield/sleep between drain passes.
+  with multiple independent event sources must still *drain* with
+  `SYS_RUSTOS_IPC_TRY_RECV` / `rustos_svc_runtime::ipc::try_recv`, because a
+  drain pass has other sources to visit and may not block on any one of them.
+- A supervisor that has finished a drain pass with no work must idle in
+  `SYS_RUSTOS_IPC_RECV_WITH_SENDER_BOUNDED` on its endpoint, not in a timer.
+  The deadline is the soonest of its own pending deadlines, so the sources with
+  no wake object keep exactly the visiting interval they had, while a request
+  that does arrive is serviced on arrival. A flat sleep between drain passes is
+  no longer acceptable: it places the whole idle interval in front of every
+  synchronous caller, which is how a 10 ms supervisor sleep became the dominant
+  term in keystroke latency. `EAGAIN` from the bounded receive means the budget
+  expired with nothing queued and is the same "no work" answer `try_recv` gives.
+- A service that answers a request the caller is blocked on may hold the reply
+  capability instead of answering "not yet", provided the wait budget it honours
+  is statically below the caller's own IPC class deadline, the number of held
+  capabilities is bounded, and every held capability's deadline is folded into
+  the service's idle wait. Netd's deferred local polls and runtimed's parked
+  console reads are the two instances; both consume request state into the reply
+  before it is sent, so a budget above the caller's class deadline would hand
+  consumed bytes to a capability compat had already cancelled.
 - Rootd and runtimed use the shared `IPC_CONTROL_DRAIN_BUDGET` to process at
   most 32 already-queued control requests before returning to lifecycle,
   launch, catalog, and socket work. The kernel's 64-call endpoint admission

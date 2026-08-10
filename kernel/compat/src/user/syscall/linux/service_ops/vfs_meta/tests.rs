@@ -80,9 +80,7 @@ fn transfer_ticket_wire_is_integer_only_exact_and_nonzero() {
 #[test]
 fn an_oversized_stream_sendmsg_takes_a_prefix_rather_than_rejecting_the_call() {
     use super::{LINUX_EMSGSIZE, sendmsg_data_capacity};
-    use rustos_user_abi::syscall::{
-        NETD_IPC_PAYLOAD_CAPACITY, NETD_SENDMSG_PAYLOAD_HEADER_SIZE,
-    };
+    use rustos_user_abi::syscall::{NETD_IPC_PAYLOAD_CAPACITY, NETD_SENDMSG_PAYLOAD_HEADER_SIZE};
 
     let room = NETD_IPC_PAYLOAD_CAPACITY - NETD_SENDMSG_PAYLOAD_HEADER_SIZE;
     assert_eq!(sendmsg_data_capacity(0), Ok(room));

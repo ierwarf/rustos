@@ -105,6 +105,24 @@ pub const SYS_RUSTOS_IPC_CALL_BOUNDED: u64 = 0x5255_0044;
 /// reply and every in-flight transfer descriptor just like the byte-only
 /// bounded call.
 pub const SYS_RUSTOS_IPC_CALL_WITH_HANDLES_BOUNDED: u64 = 0x5255_0045;
+/// Blocking receive with an explicit finite deadline in milliseconds: the next
+/// request on the endpoint, or `EAGAIN` once the deadline passes with nothing
+/// queued. The argument block is `IpcRecvWithSenderArgs`; the second syscall
+/// argument is the timeout.
+///
+/// # Why a supervisor needs this and `IPC_RECV` will not do
+/// A service with exactly one event source blocks in `SYS_RUSTOS_IPC_RECV` and
+/// is woken by its sender. A supervisor has several - endpoint traffic, child
+/// exits, a listening socket, retry deadlines - and blocking forever on any one
+/// of them abandons the rest. Without a deadline the only remaining option is
+/// to poll all of them on a timer, which is what every supervisor in this tree
+/// used to do, and what put a flat 10 ms in front of each keystroke.
+///
+/// This is the same shape commercial microkernels settled on: one wait object
+/// plus a deadline. Zircon spells it `zx_port_wait(port, deadline, packet)`,
+/// QNX spells it `MsgReceive` under `TimerTimeout`. The endpoint is already a
+/// multi-sender object here, so the deadline was the only missing half.
+pub const SYS_RUSTOS_IPC_RECV_WITH_SENDER_BOUNDED: u64 = 0x5255_004a;
 /// Emits one kernel-timestamped, fixed-name product acceptance milestone.
 ///
 /// This is observability only: it grants no authority and accepts only the
@@ -1018,6 +1036,31 @@ pub const SESSIOND_CONSOLE_READINESS_READY: u64 = 1 << 0;
 pub const SESSIOND_CONSOLE_READINESS_LIVE: u64 = 1 << 1;
 pub const SESSIOND_CONSOLE_READINESS_MASK: u64 =
     SESSIOND_CONSOLE_READINESS_READY | SESSIOND_CONSOLE_READINESS_LIVE;
+/// Wait budget, in milliseconds, that a `CONSOLE_ROUTE_READ` caller may park
+/// inside the console broker. It travels in the otherwise-unused `arg1` of the
+/// console-route request.
+///
+/// # Why a parked read is not a timeout ABI
+/// This is not a public `IPC_CALL` timeout: no Linux ELF or Windows PE caller
+/// can reach it. It is the console broker's *reply* schedule for a read that
+/// kernel compat already issues on a blocked shell's behalf, and it is the
+/// difference between one IPC round trip per keystroke and one per poll tick.
+///
+/// # Why zero must keep meaning "answer now"
+/// Every console-route caller that predates this field leaves `arg1` at its
+/// `Default` zero. Zero therefore has to stay the immediate snapshot, or those
+/// callers silently acquire a quarter-second stall.
+pub const SESSIOND_CONSOLE_READ_WAIT_MAX_MS: u64 = 250;
+/// # Why this bound is a correctness invariant, not tuning
+/// A parked read consumes the session's input bytes into its reply *before* it
+/// can know the reply landed. That is only safe while the caller is still
+/// blocked waiting for it. Kernel compat issues console reads in the
+/// `BulkData` class, so compat abandons the reply capability after
+/// `IPC_BULK_DATA_HARD_LIMIT_MS`. Parking for longer than that would let the
+/// broker hand consumed keystrokes to a capability compat had already
+/// cancelled - keystrokes that no longer exist anywhere. Keep this strict.
+const _: () =
+    assert!(SESSIOND_CONSOLE_READ_WAIT_MAX_MS < crate::performance::IPC_BULK_DATA_HARD_LIMIT_MS);
 pub const COMMERCIAL_MAX_PAGERD_OP_BACKING_OBJECT: u16 = 1;
 pub const COMMERCIAL_MAX_PAGERD_OP_PAGE_CACHE_POLICY: u16 = 2;
 pub const COMMERCIAL_MAX_PAGERD_OP_FAULT_RESOLVE: u16 = 3;
@@ -2334,6 +2377,23 @@ pub struct IpcCallWithHandlesArgs {
     pub reserved0: u32,
     pub recv_fds_ptr: u64,
     pub recv_fd_count_ptr: u64,
+}
+
+/// Argument block for `SYS_RUSTOS_IPC_RECV_WITH_SENDER_BOUNDED`.
+///
+/// These are exactly the six registers `SYS_RUSTOS_IPC_RECV_WITH_SENDER` takes.
+/// They move into a struct only because the deadline needs a seventh argument
+/// and the syscall register ABI has six, which is the same reason
+/// `IpcCallWithHandlesArgs` exists.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct IpcRecvWithSenderArgs {
+    pub endpoint: u64,
+    pub request_ptr: u64,
+    pub request_capacity: u64,
+    pub reply_cap_ptr: u64,
+    pub sender_pid_ptr: u64,
+    pub sender_tid_ptr: u64,
 }
 
 #[repr(C)]

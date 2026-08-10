@@ -628,7 +628,6 @@ impl PciDevice {
         }
     }
 
-
     fn write_u16(self, offset: u8, value: u16) {
         let _transaction = CONFIG_STATE.lock();
         self.write_u16_raw(offset, value);
@@ -643,8 +642,6 @@ impl PciDevice {
         self.write_u16_raw(COMMAND_OFFSET, next);
         next
     }
-
-
 
     fn write_u16_raw(self, offset: u8, value: u16) {
         let aligned = offset & !0x3;

@@ -85,6 +85,9 @@ pub(super) fn syscall_linux_rustos_ipc_reply_recv_with_sender(args_ptr: u64) -> 
         args.next_reply_cap_ptr,
         args.sender_pid_ptr,
         args.sender_tid_ptr,
+        // Reply-and-receive belongs to a single-endpoint server, which has
+        // nothing else to service and so has no reason to wake early.
+        None,
     ) {
         Ok((received, yielded)) => {
             if handoff_queued && !yielded {

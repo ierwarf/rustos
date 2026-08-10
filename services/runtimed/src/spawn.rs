@@ -488,6 +488,13 @@ pub(super) fn reap_children(state: &mut BrokerState) -> bool {
     reaped_any
 }
 
+/// How long the broker may stay idle before it must run again.
+///
+/// # Why every deadline has to be represented here
+/// This is the broker's only timer. Anything with a due time that is not folded
+/// into this value gets serviced late by however long the idle wait happens to
+/// be - which is exactly how a parked console read could outlive its budget
+/// while the broker slept with nothing else to do.
 pub(super) fn next_idle_delay(state: &BrokerState) -> Duration {
     let now = Instant::now();
     let retry_delay = state
@@ -496,7 +503,12 @@ pub(super) fn next_idle_delay(state: &BrokerState) -> Duration {
         .map(|deadline| deadline.saturating_duration_since(now))
         .min()
         .unwrap_or(IDLE_POLL_INTERVAL);
-    retry_delay.min(IDLE_POLL_INTERVAL)
+    let parked_read_delay = state
+        .session_runtime
+        .earliest_console_read_deadline()
+        .map(|deadline| deadline.saturating_duration_since(now))
+        .unwrap_or(IDLE_POLL_INTERVAL);
+    retry_delay.min(parked_read_delay).min(IDLE_POLL_INTERVAL)
 }
 
 pub(super) fn spawn_exec(

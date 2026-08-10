@@ -1,9 +1,9 @@
 pub mod boot_trace;
 #[cfg(rustos_debug_print_enabled)]
 mod deferred;
+mod kdiag_macros;
 #[cfg(rustos_debug_print_enabled)]
 mod milestone_class;
-mod kdiag_macros;
 #[cfg(rustos_debug_print_enabled)]
 mod milestone_frame;
 #[cfg(rustos_debug_print_enabled)]
@@ -719,11 +719,8 @@ fn emit_milestone_debugcon_line(record: MilestoneRecord) {
 #[cfg(rustos_debug_print_enabled)]
 fn drain_deferred_records() {
     deferred::drain(print_bytes_unlocked, |parked| {
-        let line = render_milestone_debugcon_line(
-            parked.record,
-            parked.user_context,
-            parked.output_class,
-        );
+        let line =
+            render_milestone_debugcon_line(parked.record, parked.user_context, parked.output_class);
         print_bytes_unlocked(line.bytes());
     });
 }
@@ -797,7 +794,6 @@ pub fn milestones_dropped() -> u64 {
 pub fn milestones_dropped() -> u64 {
     0
 }
-
 
 #[cfg(rustos_debug_print_enabled)]
 fn milestone_debugcon_visible(name: &str) -> bool {

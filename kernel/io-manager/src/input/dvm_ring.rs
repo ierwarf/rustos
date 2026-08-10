@@ -784,11 +784,7 @@ const CURSOR_MISMATCH_OUTSTANDING: u64 = 1 << 3;
 /// generation change means the mapping this drain claimed is no longer the
 /// installed one, while a consumer mismatch means the shared snapshot and this
 /// CPU's cursor were read at different instants.
-fn cursor_generation_mismatch(
-    header: &DvmInputRingHeader,
-    generation: u64,
-    consumer: u64,
-) -> u64 {
+fn cursor_generation_mismatch(header: &DvmInputRingHeader, generation: u64, consumer: u64) -> u64 {
     let mut mismatch = 0;
     if header.generation != generation {
         mismatch |= CURSOR_MISMATCH_GENERATION;

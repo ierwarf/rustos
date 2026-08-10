@@ -40,8 +40,8 @@ use core::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use rustos_user_abi::syscall::{
     CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
     CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, CoreServiceLeaseWire,
-    LifecycleDrainBrokerArgs, LifecycleEventWire, LoaderSpawnRequest, LoaderSpawnResponse,
-    RustosProcValidateDeferredSpawnBrokerArgs, RustosRootdTerminateBrokerArgs,
+    IpcRecvWithSenderArgs, LifecycleDrainBrokerArgs, LifecycleEventWire, LoaderSpawnRequest,
+    LoaderSpawnResponse, RustosProcValidateDeferredSpawnBrokerArgs, RustosRootdTerminateBrokerArgs,
     ServiceCheckpointRecordWire, COMMERCIAL_MAX_CAPABILITY_OP_LEASE_GRANT,
     COMMERCIAL_MAX_CAPABILITY_OP_LEASE_RENEW, COMMERCIAL_MAX_CAPABILITY_OP_LEASE_REVOKE,
     COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_CAPABILITY,
@@ -63,8 +63,9 @@ use rustos_user_abi::syscall::{
     ROOTD_LEASE_STATE_FAILED, ROOTD_LEASE_STATE_RESTART_PENDING, ROOTD_LEASE_STATE_RUNNING,
     ROOTD_TERMINATE_BROKER_ABI_VERSION, SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_IPC_CALL,
     SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
-    SYS_RUSTOS_IPC_RECV_WITH_SENDER, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT,
-    SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER, SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER,
+    SYS_RUSTOS_IPC_RECV_WITH_SENDER, SYS_RUSTOS_IPC_RECV_WITH_SENDER_BOUNDED,
+    SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
+    SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER, SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER,
     SYS_RUSTOS_PROC_VALIDATE_DEFERRED_SPAWN_BROKER, SYS_RUSTOS_PRODUCT_MILESTONE,
     SYS_RUSTOS_ROOTD_TERMINATE_BROKER, SYS_RUSTOS_ROOTD_WAIT_BROKER, SYS_RUSTOS_SPAWN_EXEC,
     TASK_WEIGHT_INTERACTIVE_FLAG,
@@ -338,6 +339,7 @@ pub extern "C" fn __rustos_rootd_start() -> ! {
                 &mut post_init_leases,
                 &mut service_checkpoints,
                 false,
+                None,
             )
         });
         restart_failed_leases(
@@ -380,6 +382,7 @@ pub extern "C" fn __rustos_rootd_start() -> ! {
                 &mut post_init_leases,
                 &mut service_checkpoints,
                 false,
+                None,
             )
         });
         restart_failed_leases(
@@ -388,7 +391,18 @@ pub extern "C" fn __rustos_rootd_start() -> ! {
             &mut post_init_leases,
             &mut service_checkpoints,
         );
-        supervisor_idle();
+        // The drain above is deliberately nonblocking. Once all ready
+        // messages are consumed, this one wait is the idle boundary: a new
+        // control message wakes rootd immediately, while the bounded budget
+        // gives lifecycle/restart sources their next visit.
+        let _ = serve_rootd_once(
+            endpoint,
+            &leases,
+            &mut post_init_leases,
+            &mut service_checkpoints,
+            false,
+            Some(rustos_user_abi::performance::ROOTD_SUPERVISOR_IDLE_POLL_MS),
+        );
     }
 }
 
@@ -533,6 +547,7 @@ fn spawn_initd_via_loaderd(
                     post_init_leases,
                     service_checkpoints,
                     false,
+                    None,
                 );
                 restart_failed_leases(endpoint, leases, post_init_leases, service_checkpoints);
                 yield_now();
@@ -704,6 +719,7 @@ fn serve_rootd_once(
     post_init_leases: &mut [PostInitLease],
     service_checkpoints: &mut ServiceCheckpointStore,
     blocking: bool,
+    timeout_ms: Option<u64>,
 ) -> bool {
     if endpoint == 0 {
         fail_closed(b"rootd: fatal missing supervisor endpoint\n");
@@ -712,22 +728,41 @@ fn serve_rootd_once(
     let mut reply_cap = 0_u64;
     let mut sender_pid = 0_u64;
     let mut sender_tid = 0_u64;
-    let recv_syscall = if blocking {
-        SYS_RUSTOS_IPC_RECV_WITH_SENDER
-    } else {
-        SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER
+    let received = match timeout_ms {
+        Some(timeout_ms) => {
+            let args = IpcRecvWithSenderArgs {
+                endpoint,
+                request_ptr: (&mut request as *mut CommercialMaxProtocolRequest) as u64,
+                request_capacity: size_of::<CommercialMaxProtocolRequest>() as u64,
+                reply_cap_ptr: (&mut reply_cap as *mut u64) as u64,
+                sender_pid_ptr: (&mut sender_pid as *mut u64) as u64,
+                sender_tid_ptr: (&mut sender_tid as *mut u64) as u64,
+            };
+            syscall2(
+                SYS_RUSTOS_IPC_RECV_WITH_SENDER_BOUNDED,
+                (&args as *const IpcRecvWithSenderArgs) as u64,
+                timeout_ms.max(1),
+            )
+        }
+        None => {
+            let recv_syscall = if blocking {
+                SYS_RUSTOS_IPC_RECV_WITH_SENDER
+            } else {
+                SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER
+            };
+            syscall6(
+                recv_syscall,
+                endpoint,
+                (&mut request as *mut CommercialMaxProtocolRequest) as u64,
+                size_of::<CommercialMaxProtocolRequest>() as u64,
+                (&mut reply_cap as *mut u64) as u64,
+                (&mut sender_pid as *mut u64) as u64,
+                (&mut sender_tid as *mut u64) as u64,
+            )
+        }
     };
-    let received = syscall6(
-        recv_syscall,
-        endpoint,
-        (&mut request as *mut CommercialMaxProtocolRequest) as u64,
-        size_of::<CommercialMaxProtocolRequest>() as u64,
-        (&mut reply_cap as *mut u64) as u64,
-        (&mut sender_pid as *mut u64) as u64,
-        (&mut sender_tid as *mut u64) as u64,
-    );
     if received < 0 {
-        if blocking {
+        if blocking && timeout_ms.is_none() {
             fail_closed(b"rootd: fatal supervisor blocking recv failed\n");
         }
         return false;
@@ -2086,6 +2121,7 @@ extern "C" fn loader_supervisor_worker_entry() -> ! {
                 post_init_leases,
                 service_checkpoints,
                 true,
+                None,
             );
         }
         LOADER_WORKER_STATE.store(LOADER_WORKER_EXITED, Ordering::Release);
@@ -2311,15 +2347,6 @@ fn yield_now() {
     let _ = syscall0(SYS_SCHED_YIELD);
 }
 
-fn supervisor_idle() {
-    // No multi-source lifecycle/control wait object exists at this boundary.
-    // The capability-gated timer broker bounds polling without leaving this
-    // System-class supervisor runnable and starving the display causal chain.
-    let delay_ms = rustos_user_abi::performance::ROOTD_SUPERVISOR_IDLE_POLL_MS;
-    let delay_ms = u32::try_from(delay_ms).expect("rootd idle poll interval exceeds broker ABI");
-    wait_for_restart_backoff(delay_ms);
-}
-
 fn fail_closed(message: &[u8]) -> ! {
     debug_line(message);
     loop {
@@ -2487,6 +2514,18 @@ mod tests {
             .expect("first rootd service action");
         assert!(allocator < first_service_action);
         assert_eq!(source.matches("RootdBumpAllocator").count(), 1);
+    }
+
+    #[test]
+    fn post_init_supervisor_uses_bounded_message_or_timeout_receive() {
+        let source = include_str!("main.rs");
+        assert!(source.contains("SYS_RUSTOS_IPC_RECV_WITH_SENDER_BOUNDED"));
+        assert!(source.lines().any(|line| {
+            line.trim() == "Some(rustos_user_abi::performance::ROOTD_SUPERVISOR_IDLE_POLL_MS),"
+        }));
+        assert!(!source
+            .lines()
+            .any(|line| line.trim() == "fn supervisor_idle()"));
     }
 
     #[test]

@@ -135,6 +135,11 @@ mod tests {
         assert_eq!(syscall::SYS_RUSTOS_IPC_TRY_RECV, 0x5255_0035);
         assert_eq!(syscall::SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER, 0x5255_0036);
         assert_eq!(syscall::SYS_RUSTOS_IPC_RECV_WITH_SENDER, 0x5255_0038);
+        assert_eq!(
+            syscall::SYS_RUSTOS_IPC_RECV_WITH_SENDER_BOUNDED,
+            0x5255_004a
+        );
+        assert_eq!(size_of::<syscall::IpcRecvWithSenderArgs>(), 48);
         assert_eq!(syscall::SYS_RUSTOS_IPC_WAIT_SERVICE_ENDPOINT, 0x5255_0039);
         assert_eq!(syscall::SYS_RUSTOS_PROC_ACTIVATE_BROKER, 0x5255_003a);
         assert_eq!(syscall::SYS_RUSTOS_PROC_ACTIVATE_BATCH_BROKER, 0x5255_0047);

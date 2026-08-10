@@ -1012,25 +1012,32 @@ pub fn console_read_via_sessiond(
     }
 
     let mut copied = 0usize;
-    // MEASUREMENT: a blocking console read is the shell's own wait for a
-    // keystroke, and it is a poll loop rather than a readiness wait, because
-    // runtimed answers `CONSOLE_ROUTE_READ` and `CONSOLE_ROUTE_READINESS` as
-    // immediate snapshots with no way to hold a reply until data arrives. Each
-    // empty pass therefore costs one full service round trip plus one tick of
-    // sleep. `empty_polls` and the elapsed wall time are what say whether this
-    // loop is a real term in keystroke-to-echo latency or a rounding error
-    // beside the 16 ms poll boundaries above it in uiserver.
+    // A blocking console read is the shell's own wait for a keystroke. It used
+    // to be a poll loop - ask, get "nothing yet", sleep a tick, ask again -
+    // because runtimed answered `CONSOLE_ROUTE_READ` as an immediate snapshot
+    // with no way to hold a reply until data arrived. Measured at 8 vCPU that
+    // cost about 14.7 ms per empty pass, roughly 10.9 ms of it the round trip
+    // itself, for a keystroke that had not happened yet.
+    //
+    // The read now carries a wait budget, so the broker holds it and answers
+    // when a byte appears. The loop below still exists, but a well-behaved
+    // broker drives it once per keystroke instead of once per tick.
     let mut empty_polls = 0u64;
-    // One empty pass measured about 14.7 ms against a `sleep(1)` that asks for
-    // two 976.5625 us ticks. The overshoot is either the service round trip or
-    // the sleep itself, and those have different repairs, so both halves are
-    // timed rather than inferred from the total.
     let mut route_ns = 0u64;
     let mut sleep_ns = 0u64;
     let waited_from_ns = crate::arch::rtc::monotonic_nanos();
     while copied < user_len {
         let chunk_len =
             (user_len - copied).min(CommercialMaxProtocolResponse::default().payload.len());
+        // Only a reader that must wait, and has nothing to return yet, asks the
+        // broker to hold the read. `empty_console_read_result` already answers
+        // every other reader from what it has, so asking to wait would be a
+        // budget nobody is waiting on.
+        let wait_ms = if nonblocking || copied != 0 {
+            0
+        } else {
+            SESSIOND_CONSOLE_READ_WAIT_MAX_MS
+        };
         let route_started_ns = crate::arch::rtc::monotonic_nanos();
         let response = call_sessiond_console_route(
             snapshot.process_id(),
@@ -1039,9 +1046,10 @@ pub fn console_read_via_sessiond(
             COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_READ,
             &[],
             chunk_len,
+            wait_ms,
         )?;
-        route_ns = route_ns
-            .saturating_add(crate::arch::rtc::monotonic_nanos().saturating_sub(route_started_ns));
+        let route_elapsed_ns = crate::arch::rtc::monotonic_nanos().saturating_sub(route_started_ns);
+        route_ns = route_ns.saturating_add(route_elapsed_ns);
         let read = response.payload_len as usize;
         if read > chunk_len {
             return Err(LINUX_EINVAL);
@@ -1051,12 +1059,21 @@ pub fn console_read_via_sessiond(
                 return result;
             }
             empty_polls = empty_polls.saturating_add(1);
-            let sleep_started_ns = crate::arch::rtc::monotonic_nanos();
-            multitask::yield_now();
-            crate::arch::rtc::sleep(1);
-            sleep_ns = sleep_ns.saturating_add(
-                crate::arch::rtc::monotonic_nanos().saturating_sub(sleep_started_ns),
-            );
+            // A parked read spends its whole budget before answering empty, so
+            // re-asking immediately is right. An early empty answer means the
+            // broker did not park it - its park bound is full, or it predates
+            // parking - and re-asking immediately would be a hot spin against a
+            // service that has nothing to give. Sleep exactly as the old loop
+            // did in that case. This fallback is not dead code: it is the only
+            // thing standing between a full park queue and a spinning kernel.
+            if route_elapsed_ns < unparked_console_read_threshold_ns(wait_ms) {
+                let sleep_started_ns = crate::arch::rtc::monotonic_nanos();
+                multitask::yield_now();
+                crate::arch::rtc::sleep(1);
+                sleep_ns = sleep_ns.saturating_add(
+                    crate::arch::rtc::monotonic_nanos().saturating_sub(sleep_started_ns),
+                );
+            }
             continue;
         }
         if empty_polls != 0 {
@@ -1082,12 +1099,7 @@ pub fn console_read_via_sessiond(
 /// unbounded record here would cost more than the thing it measures.
 ///
 /// arg0=(empty poll passes, waited microseconds), arg1=running sample count.
-fn record_console_read_wait(
-    empty_polls: u64,
-    waited_from_ns: u64,
-    route_ns: u64,
-    sleep_ns: u64,
-) {
+fn record_console_read_wait(empty_polls: u64, waited_from_ns: u64, route_ns: u64, sleep_ns: u64) {
     use core::sync::atomic::{AtomicU64, Ordering};
     static CONSOLE_READ_WAITS: AtomicU64 = AtomicU64::new(0);
     const EARLY_CONSOLE_READ_WAIT_SAMPLES: u64 = 32;
@@ -1106,6 +1118,19 @@ fn record_console_read_wait(
         (((route_ns / 1_000) & 0xffff_ffff) << 32) | ((sleep_ns / 1_000) & 0xffff_ffff),
     );
     let _ = total;
+}
+
+/// Below this much elapsed time, an empty console read plainly did not wait,
+/// whatever budget it asked for.
+///
+/// Half the requested budget is deliberately loose. It only has to separate
+/// "the broker held this for a quarter second" from "the broker answered at
+/// once", and those differ by orders of magnitude, so no plausible scheduling
+/// jitter can move a read across this line. A zero budget gives a zero
+/// threshold, which no caller can fall below - non-blocking readers never
+/// reach the fallback.
+fn unparked_console_read_threshold_ns(wait_ms: u64) -> u64 {
+    wait_ms.saturating_mul(1_000_000) / 2
 }
 
 fn empty_console_read_result(nonblocking: bool, copied: usize) -> Option<Result<u64, i64>> {
@@ -1143,6 +1168,7 @@ pub fn console_write_via_sessiond(user_ptr: u64, user_len: usize) -> Result<u64,
             COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_WRITE,
             &chunk[..chunk_len],
             0,
+            0,
         )?;
         let written = usize::try_from(response.value0).map_err(|_| LINUX_EINVAL)?;
         if written > chunk_len {
@@ -1160,6 +1186,9 @@ pub fn console_write_via_sessiond(user_ptr: u64, user_len: usize) -> Result<u64,
     Ok(copied as u64)
 }
 
+/// `wait_ms` is how long the console broker may hold a read that finds no
+/// bytes. Zero is the immediate snapshot every non-read route uses and every
+/// caller used before reads could be parked.
 fn call_sessiond_console_route(
     subject_pid: u64,
     subject_tid: u64,
@@ -1167,6 +1196,7 @@ fn call_sessiond_console_route(
     route_request: u64,
     payload: &[u8],
     read_capacity: usize,
+    wait_ms: u64,
 ) -> Result<CommercialMaxProtocolResponse, i64> {
     let mut request = CommercialMaxProtocolRequest::default();
     if payload.len() > request.payload.len() {
@@ -1179,6 +1209,7 @@ fn call_sessiond_console_route(
     request.header.subject_pid = subject_pid;
     request.header.subject_tid = subject_tid;
     request.arg0 = route_request;
+    request.arg1 = wait_ms;
     request.arg2 = session_handle;
     request.arg3 = read_capacity as u64;
     request.payload[..payload.len()].copy_from_slice(payload);

@@ -30,16 +30,17 @@ use std::time::{Duration, Instant as StdInstant};
 use rustos_user_abi::linux as linux_abi;
 use rustos_user_abi::syscall::{
     CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
-    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, NetBrokerPrepareSocketPublication,
-    NetdIpcRequest, NetdIpcResponse, RustosNetBrokerArgs, COMMERCIAL_MAX_NETD_OP_ADDRESS_BIND,
-    COMMERCIAL_MAX_NETD_OP_FD_TRANSFER, COMMERCIAL_MAX_NETD_OP_PACKET_LEASE,
-    COMMERCIAL_MAX_NETD_OP_ROUTE_POLICY, COMMERCIAL_MAX_NETD_OP_SOCKET_NAMESPACE,
-    COMMERCIAL_MAX_NETD_OP_SOCKET_OPTIONS, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
-    COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS, COMMERCIAL_MAX_PROTOCOL_NETD, IPC_SERVICE_INPUTD,
-    IPC_SERVICE_NETD, NETD_DVM_SESSION_GRANT, NETD_DVM_SESSION_REVOKE, NETD_IPC_ABI_VERSION,
-    NETD_IPC_OP_DVM_SESSION, NETD_IPC_OP_REF_ACK, NETD_IPC_REQUEST_HEADER_SIZE,
-    NETD_IPC_RESPONSE_FLAG_LATENCY_HANDOFF, NETD_IPC_RESPONSE_HEADER_SIZE, NETD_POLL_MODE_QUERY,
-    NETD_POLL_MODE_WAIT, NETD_RECVMSG_PAYLOAD_HEADER_SIZE, NETD_SENDMSG_PAYLOAD_HEADER_SIZE,
+    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, IpcRecvWithSenderArgs,
+    NetBrokerPrepareSocketPublication, NetdIpcRequest, NetdIpcResponse, RustosNetBrokerArgs,
+    COMMERCIAL_MAX_NETD_OP_ADDRESS_BIND, COMMERCIAL_MAX_NETD_OP_FD_TRANSFER,
+    COMMERCIAL_MAX_NETD_OP_PACKET_LEASE, COMMERCIAL_MAX_NETD_OP_ROUTE_POLICY,
+    COMMERCIAL_MAX_NETD_OP_SOCKET_NAMESPACE, COMMERCIAL_MAX_NETD_OP_SOCKET_OPTIONS,
+    COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS,
+    COMMERCIAL_MAX_PROTOCOL_NETD, IPC_SERVICE_INPUTD, IPC_SERVICE_NETD, NETD_DVM_SESSION_GRANT,
+    NETD_DVM_SESSION_REVOKE, NETD_IPC_ABI_VERSION, NETD_IPC_OP_DVM_SESSION, NETD_IPC_OP_REF_ACK,
+    NETD_IPC_REQUEST_HEADER_SIZE, NETD_IPC_RESPONSE_FLAG_LATENCY_HANDOFF,
+    NETD_IPC_RESPONSE_HEADER_SIZE, NETD_POLL_MODE_QUERY, NETD_POLL_MODE_WAIT,
+    NETD_RECVMSG_PAYLOAD_HEADER_SIZE, NETD_SENDMSG_PAYLOAD_HEADER_SIZE,
     NET_BROKER_OP_PACKET_LEASE_GRANT, NET_BROKER_OP_PACKET_LEASE_RESET,
     NET_BROKER_OP_PACKET_LEASE_REVOKE, NET_BROKER_OP_PACKET_RX, NET_BROKER_OP_PACKET_STATUS,
     NET_BROKER_OP_PACKET_TX, NET_BROKER_OP_PREPARE_SOCKET_PUBLICATION, NET_BROKER_PACKET_MTU,
@@ -54,7 +55,8 @@ use rustos_user_abi::syscall::{
     SYSCALL_OFFLOAD_OP_LINUX_SENDTO, SYSCALL_OFFLOAD_OP_LINUX_SETSOCKOPT,
     SYSCALL_OFFLOAD_OP_LINUX_SHUTDOWN, SYSCALL_OFFLOAD_OP_LINUX_SOCKET,
     SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR, SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
-    SYS_RUSTOS_IPC_RECV_WITH_SENDER, SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_NET_BROKER,
+    SYS_RUSTOS_IPC_RECV_WITH_SENDER, SYS_RUSTOS_IPC_RECV_WITH_SENDER_BOUNDED, SYS_RUSTOS_IPC_REPLY,
+    SYS_RUSTOS_NET_BROKER,
 };
 #[cfg(not(test))]
 use rustos_user_abi::syscall::{
@@ -255,16 +257,43 @@ fn serve_request_loop(endpoint: u64) {
         let mut reply_cap = 0_u64;
         let mut sender_pid = 0_u64;
         let mut sender_tid = 0_u64;
-        let received = syscall6(
-            SYS_RUSTOS_IPC_RECV_WITH_SENDER,
-            endpoint,
-            (&mut request as *mut NetdIpcRequest) as u64,
-            size_of::<NetdIpcRequest>() as u64,
-            (&mut reply_cap as *mut u64) as u64,
-            (&mut sender_pid as *mut u64) as u64,
-            (&mut sender_tid as *mut u64) as u64,
-        );
+        // With nothing deferred this loop has exactly one event source and may
+        // block on it indefinitely. With a poll deferred it has two, and the
+        // second one is a deadline only this loop can honour.
+        let idle_budget_ms = next_local_poll_budget_ms();
+        let received = match idle_budget_ms {
+            None => syscall6(
+                SYS_RUSTOS_IPC_RECV_WITH_SENDER,
+                endpoint,
+                (&mut request as *mut NetdIpcRequest) as u64,
+                size_of::<NetdIpcRequest>() as u64,
+                (&mut reply_cap as *mut u64) as u64,
+                (&mut sender_pid as *mut u64) as u64,
+                (&mut sender_tid as *mut u64) as u64,
+            ),
+            Some(budget_ms) => {
+                let args = IpcRecvWithSenderArgs {
+                    endpoint,
+                    request_ptr: (&mut request as *mut NetdIpcRequest) as u64,
+                    request_capacity: size_of::<NetdIpcRequest>() as u64,
+                    reply_cap_ptr: (&mut reply_cap as *mut u64) as u64,
+                    sender_pid_ptr: (&mut sender_pid as *mut u64) as u64,
+                    sender_tid_ptr: (&mut sender_tid as *mut u64) as u64,
+                };
+                syscall2(
+                    SYS_RUSTOS_IPC_RECV_WITH_SENDER_BOUNDED,
+                    (&args as *const IpcRecvWithSenderArgs) as u64,
+                    budget_ms,
+                )
+            }
+        };
         if received < 0 {
+            // An expired budget already spent its wait, and the waiter it was
+            // protecting is due now. Backing off again would delay exactly the
+            // reply this budget existed to deliver.
+            if idle_budget_ms.is_some() && received == -(libc::EAGAIN as i64) {
+                continue;
+            }
             thread::sleep(RECV_BACKOFF);
             continue;
         }
@@ -638,6 +667,41 @@ struct DeferredLocalPoll {
     request: Box<NetdIpcRequest>,
     reply_cap: u64,
 }
+
+/// Milliseconds until the soonest deferred local poll must be answered, or
+/// `None` when nothing is deferred.
+///
+/// # Why the service loop cannot block forever while this is `Some`
+/// A deferred local poll is answered only by `service_local_poll_waiters`, and
+/// that runs only around a received request. With the endpoint idle, a waiter
+/// whose deadline has passed was therefore neither replied to nor timed out -
+/// it simply waited for unrelated traffic to arrive and remind netd it existed.
+/// AF_UNIX is how Wayland clients reach uiserver, so "unrelated traffic" is not
+/// a latency bound anyone should depend on. While any poll is deferred the loop
+/// waits with this budget instead.
+fn next_local_poll_budget_ms() -> Option<u64> {
+    let waiters = local_poll_waiters().lock().ok()?;
+    let earliest = waiters
+        .iter()
+        .map(|waiter| waiter.request.deadline_ns)
+        .min()?;
+    let now_ns = rustos_svc_runtime::syscall::monotonic_nanos();
+    Some(local_poll_budget_ms_for_deadline(earliest, now_ns))
+}
+
+fn local_poll_budget_ms_for_deadline(earliest_ns: u64, now_ns: u64) -> u64 {
+    // Round up and floor at one: the kernel rejects a zero budget, and a
+    // deadline that has already passed still needs one pass to be answered.
+    earliest_ns
+        .saturating_sub(now_ns)
+        .div_ceil(1_000_000)
+        .clamp(1, NETD_MAX_IDLE_WAIT_MS)
+}
+
+/// Ceiling on one bounded receive, so a far-future waiter deadline cannot be
+/// handed to the kernel as an out-of-range budget.
+const NETD_MAX_IDLE_WAIT_MS: u64 =
+    rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS;
 
 fn local_poll_waiters() -> &'static Mutex<VecDeque<DeferredLocalPoll>> {
     static WAITERS: OnceLock<Mutex<VecDeque<DeferredLocalPoll>>> = OnceLock::new();
@@ -3343,7 +3407,10 @@ fn debug_line(message: &str) {
 
 #[cfg(test)]
 mod idle_cadence_tests {
-    use super::{INET_IDLE_POLL_INTERVAL, INET_READINESS_POLL_INTERVAL};
+    use super::{
+        local_poll_budget_ms_for_deadline, INET_IDLE_POLL_INTERVAL, INET_READINESS_POLL_INTERVAL,
+        NETD_MAX_IDLE_WAIT_MS,
+    };
 
     #[test]
     fn an_idle_stack_backs_off_without_relaxing_the_live_socket_cadence() {
@@ -3355,5 +3422,23 @@ mod idle_cadence_tests {
         // And the idle cadence has to be a real back-off, or the global net
         // lock is still being taken at the same rate for no work.
         assert!(INET_IDLE_POLL_INTERVAL >= INET_READINESS_POLL_INTERVAL * 4);
+    }
+
+    #[test]
+    fn deferred_poll_deadline_always_wakes_the_request_owner() {
+        assert_eq!(local_poll_budget_ms_for_deadline(10_000_000, 10_000_000), 1);
+        assert_eq!(local_poll_budget_ms_for_deadline(9_000_000, 10_000_000), 1);
+        assert_eq!(local_poll_budget_ms_for_deadline(12_500_000, 10_000_000), 3);
+        assert_eq!(
+            local_poll_budget_ms_for_deadline(u64::MAX, 0),
+            NETD_MAX_IDLE_WAIT_MS
+        );
+        let source = include_str!("main.rs");
+        assert!(
+            source
+                .lines()
+                .any(|line| line.trim()
+                    == "Some(local_poll_budget_ms_for_deadline(earliest, now_ns))")
+        );
     }
 }

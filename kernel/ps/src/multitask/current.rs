@@ -348,14 +348,13 @@ pub fn current_user_wait_binding() -> Option<(u64, UserAbi, u64)> {
 /// reported as "no user task" - answering `None` here would tell a syscall that
 /// its own caller does not exist.
 pub fn current_user_snapshot() -> Option<CurrentUserSnapshot> {
-    let (thread_id, abi, process_handle, console_session) =
-        interrupts::without_interrupts(|| {
-            if let Some(identity) = published_current_identity() {
-                return identity.user_binding();
-            }
-            // SAFETY: interrupts are masked, so the current slot is stable.
-            unsafe { scheduler_ref().current_user_process_binding() }
-        })?;
+    let (thread_id, abi, process_handle, console_session) = interrupts::without_interrupts(|| {
+        if let Some(identity) = published_current_identity() {
+            return identity.user_binding();
+        }
+        // SAFETY: interrupts are masked, so the current slot is stable.
+        unsafe { scheduler_ref().current_user_process_binding() }
+    })?;
     process_table::with_process_state(process_handle, |process_id, process_state| {
         CurrentUserSnapshot::new(
             abi,

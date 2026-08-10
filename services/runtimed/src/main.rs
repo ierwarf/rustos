@@ -259,6 +259,10 @@ fn main() {
     loop {
         let mut did_work = false;
         did_work |= drain_session_request_burst(session_endpoint, &mut state) != 0;
+        // Immediately after the drain, so a keystroke delivered by that same
+        // burst releases the reader parked on it within this pass rather than
+        // after another idle interval.
+        did_work |= session::service_console_read_waiters(&mut state);
         did_work |= spawn::reap_children(&mut state);
         did_work |= ensure_ui_bootstrap(&mut state);
         // The private SMP qualification workload validates scheduler and IPC
@@ -284,7 +288,25 @@ fn main() {
         if did_work {
             continue;
         }
-        thread::sleep(spawn::next_idle_delay(&state));
+        // Idle. Wait on the session endpoint rather than on a timer.
+        //
+        // This loop used to sleep a flat interval here, which meant an arriving
+        // request waited out the remainder of that sleep before the broker
+        // looked at it. Measured at 8 vCPU it put about 10.9 ms in front of
+        // every console round trip, and the shell issues one of those per
+        // keystroke.
+        //
+        // The endpoint is the only source with a wake object, so it is the one
+        // worth blocking on; the budget preserves the old visiting interval for
+        // child exits, the control socket, and retry deadlines, none of which
+        // can wake anything. Without an endpoint there is nothing to block on,
+        // so that case keeps the timer.
+        let idle_delay = spawn::next_idle_delay(&state);
+        if session_endpoint.is_some() {
+            session::service_session_endpoint(session_endpoint, &mut state, Some(idle_delay));
+        } else {
+            thread::sleep(idle_delay);
+        }
     }
 }
 
@@ -294,7 +316,7 @@ fn policy_catalog_load_due(launch_catalog_loaded: bool) -> bool {
 
 fn drain_session_request_burst(endpoint: Option<u64>, state: &mut BrokerState) -> usize {
     drain_bounded_requests(SESSION_REQUEST_DRAIN_BUDGET, || {
-        session::service_session_endpoint(endpoint, state)
+        session::service_session_endpoint(endpoint, state, None)
     })
 }
 
@@ -394,6 +416,21 @@ mod tests {
     #[test]
     fn steady_supervisor_poll_is_bounded_without_two_millisecond_churn() {
         assert_eq!(IDLE_POLL_INTERVAL, std::time::Duration::from_millis(10));
+    }
+
+    #[test]
+    fn idle_supervisor_waits_on_session_messages_with_a_deadline() {
+        let source = include_str!("main.rs");
+        assert!(source.contains(
+            "session::service_session_endpoint(session_endpoint, &mut state, Some(idle_delay))"
+        ));
+        assert_eq!(
+            source
+                .lines()
+                .filter(|line| line.trim() == "thread::sleep(idle_delay);")
+                .count(),
+            1
+        );
     }
 
     #[test]

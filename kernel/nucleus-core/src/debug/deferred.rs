@@ -17,7 +17,7 @@
 //! has been unavailable for longer than the ring is deep, which is a real
 //! transport failure and not something to paper over.
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use crate::util::lockdep::MAX_TRACKED_CPUS;
 
@@ -127,15 +127,22 @@ pub(super) fn park(bytes: &[u8]) -> bool {
         // so no drainer can observe a partially filled record.
         if slot
             .state
-            .compare_exchange(SLOT_EMPTY, SLOT_WRITING, Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange(
+                SLOT_EMPTY,
+                SLOT_WRITING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
             .is_err()
         {
             continue;
         }
         // Sequence is taken after the claim so parked order matches emission
         // order even when several CPUs park concurrently.
-        slot.sequence
-            .store(DEFERRED.next_sequence.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
+        slot.sequence.store(
+            DEFERRED.next_sequence.fetch_add(1, Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
         // SAFETY: this CPU owns the slot for the whole `SLOT_WRITING` window.
         unsafe {
             let buffer = &mut *slot.bytes.get();
@@ -157,7 +164,12 @@ pub(super) fn park_milestone(parked: ParkedMilestone) -> bool {
         // can observe a partially published record.
         if slot
             .state
-            .compare_exchange(SLOT_EMPTY, SLOT_WRITING, Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange(
+                SLOT_EMPTY,
+                SLOT_WRITING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
             .is_err()
         {
             continue;
@@ -294,7 +306,9 @@ mod tests {
             .iter()
             .skip(1)
             .flat_map(|slots| slots.iter())
-            .filter(|slot| slot.state.load(core::sync::atomic::Ordering::Acquire) != super::SLOT_EMPTY)
+            .filter(|slot| {
+                slot.state.load(core::sync::atomic::Ordering::Acquire) != super::SLOT_EMPTY
+            })
             .count();
         assert_eq!(remaining, 0);
         assert_eq!(drain_all().len(), DEFERRED_SLOTS_PER_CPU);

@@ -397,6 +397,55 @@ if ! grep -Fq 'published_current_identity()' <<<"$current_snapshot_body" \
     echo 'the current-task identity snapshot must read the published record before the global scheduler lock, and must keep the locked fallback' >&2
     exit 1
 fi
+# A bounded receive can leave the block by timer instead of by sender. A sender
+# pops the receiver it wakes; a timer does not, so a task that resumes on its
+# deadline is still published as this endpoint's next receiver. Leaving it there
+# sends the endpoint's next request to a task that is not waiting for it and
+# wakes nobody else - a lost wakeup that looks like a hung service. The
+# withdrawal and the timer must therefore stay together.
+bounded_recv_body="$(
+    sed -n '/^fn recv_with_sender_blocking_prepared(/,/^}/p' \
+        kernel/compat/src/user/syscall/linux/ipc_ops.rs
+)"
+if ! grep -Fq 'arm_sleep_waiter_until_tick' <<<"$bounded_recv_body" \
+    || ! grep -Fq 'remove_endpoint_waiters_for_task' <<<"$bounded_recv_body"; then
+    echo 'the bounded endpoint receive must arm a deadline waiter and must withdraw its endpoint receiver waiter when it resumes' >&2
+    exit 1
+fi
+# The supervisor idle wait is the whole point of the bounded receive: a flat
+# sleep here puts the entire idle interval in front of every synchronous caller,
+# which is how a 10 ms sleep became the dominant term in keystroke latency.
+runtimed_idle_body="$(
+    sed -n '/^        let idle_delay = spawn::next_idle_delay(&state);/,/^    }$/p' \
+        services/runtimed/src/main.rs
+)"
+if ! grep -Fq 'service_session_endpoint(session_endpoint, &mut state, Some(idle_delay))' \
+    <<<"$runtimed_idle_body"; then
+    echo 'the runtimed idle wait must block on the session endpoint with a bounded deadline, not on a timer' >&2
+    exit 1
+fi
+# A parked console read is answered by the same loop that idles. If its deadline
+# is not folded into the idle budget, the broker can sleep straight through it
+# whenever it has nothing else to do, and the read outlives the budget it
+# promised its caller.
+runtimed_delay_body="$(
+    sed -n '/^pub(super) fn next_idle_delay(/,/^}/p' services/runtimed/src/spawn.rs
+)"
+if ! grep -Fq 'earliest_console_read_deadline()' <<<"$runtimed_delay_body"; then
+    echo 'the runtimed idle budget must include the soonest parked console-read deadline' >&2
+    exit 1
+fi
+# Rootd has the same lifecycle/control split as runtimed: its bounded drain may
+# not block, but the post-init idle turn must wake on a control message or the
+# shared supervisor budget. Keeping the old timer-only helper here would put a
+# full interval in front of every restart-policy caller.
+rootd_source="$(cat services/rootd/src/main.rs)"
+if ! grep -Fq 'SYS_RUSTOS_IPC_RECV_WITH_SENDER_BOUNDED' <<<"$rootd_source" \
+    || ! grep -Fq 'ROOTD_SUPERVISOR_IDLE_POLL_MS' <<<"$rootd_source" \
+    || grep -Eq '^fn supervisor_idle\(\)' <<<"$rootd_source"; then
+    echo 'rootd post-init supervision must use bounded message-or-timeout receive, not timer-only supervisor idle' >&2
+    exit 1
+fi
 
 join_line="$(rg -n 'pthread_join\(threads\[index\]' apps/smpqual/smpqual.c | head -n 1 | cut -d: -f1)"
 complete_line="$(rg -n 'emit_milestone\(PRODUCT_MILESTONE_SMPQUAL_COMPLETE' apps/smpqual/smpqual.c | head -n 1 | cut -d: -f1)"

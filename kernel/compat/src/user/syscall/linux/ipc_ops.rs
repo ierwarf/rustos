@@ -216,6 +216,7 @@ pub(super) fn is_linux_rustos_ipc_syscall(syscall_number: u64) -> bool {
             | linux_abi::SYS_RUSTOS_IPC_TRY_RECV
             | linux_abi::SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER
             | linux_abi::SYS_RUSTOS_IPC_RECV_WITH_SENDER
+            | linux_abi::SYS_RUSTOS_IPC_RECV_WITH_SENDER_BOUNDED
             | linux_abi::SYS_RUSTOS_IPC_REPLY_RECV_WITH_SENDER
             | linux_abi::SYS_RUSTOS_IPC_REPLY
             | linux_abi::SYS_RUSTOS_IPC_CALL_WITH_HANDLES
@@ -261,6 +262,9 @@ pub(super) fn dispatch_linux_rustos_ipc_syscall(frame: &SyscallFrame) -> u64 {
         linux_abi::SYS_RUSTOS_IPC_RECV_WITH_SENDER => syscall_linux_rustos_ipc_recv_with_sender(
             frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
         ),
+        linux_abi::SYS_RUSTOS_IPC_RECV_WITH_SENDER_BOUNDED => {
+            syscall_linux_rustos_ipc_recv_with_sender_bounded(frame.rdi, frame.rsi)
+        }
         linux_abi::SYS_RUSTOS_IPC_REPLY_RECV_WITH_SENDER => {
             ipc_reply_recv::syscall_linux_rustos_ipc_reply_recv_with_sender(frame.rdi)
         }
@@ -1588,6 +1592,65 @@ pub(super) fn syscall_linux_rustos_ipc_recv_with_sender(
         reply_cap_ptr,
         sender_pid_ptr,
         sender_tid_ptr,
+        None,
+    ) {
+        Ok((received, _yielded)) => received as u64,
+        Err((errno, _yielded)) => linux_errno(errno),
+    }
+}
+
+/// Receive one request, or give up once `timeout_ms` has passed.
+///
+/// # Why `EAGAIN` and not `ETIMEDOUT`
+/// An expired budget here means precisely what an empty `IPC_TRY_RECV` means:
+/// nothing was queued. Callers of this syscall are supervisors that alternate
+/// between draining an endpoint and servicing other sources, so the empty
+/// answer has to be the same errno they already handle, or every one of them
+/// grows a second "nothing happened" branch that is easy to get wrong.
+/// `ETIMEDOUT` stays reserved for the *call* side, where a deadline means a
+/// peer failed to answer and the reply identity had to be cancelled.
+pub(super) fn syscall_linux_rustos_ipc_recv_with_sender_bounded(
+    args_ptr: u64,
+    timeout_ms: u64,
+) -> u64 {
+    if !bounded_ipc_call_timeout_is_valid(timeout_ms) {
+        return linux_errno(LINUX_EINVAL);
+    }
+    let args = match usermem::read_current_user_struct::<
+        rustos_user_abi::syscall::IpcRecvWithSenderArgs,
+    >(args_ptr)
+    {
+        Ok(args) => args,
+        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
+    };
+    let (endpoint, task_id, _process_id, request_capacity) = match prepare_recv_with_sender(
+        args.endpoint,
+        args.request_ptr,
+        args.request_capacity,
+        args.reply_cap_ptr,
+        args.sender_pid_ptr,
+        args.sender_tid_ptr,
+    ) {
+        Ok(prepared) => prepared,
+        Err(errno) => return linux_errno(errno),
+    };
+    let ticks_per_second = crate::arch::rtc::ticks_per_second().max(1);
+    // Round the deadline up: a budget shorter than one tick must still buy one
+    // tick of waiting, or a caller asking for 1 ms would spin.
+    let deadline_ticks = timeout_ms
+        .saturating_mul(ticks_per_second)
+        .div_ceil(1000)
+        .max(1);
+    let deadline_tick = crate::arch::rtc::ticks().saturating_add(deadline_ticks);
+    match recv_with_sender_blocking_prepared(
+        endpoint,
+        task_id,
+        args.request_ptr,
+        request_capacity,
+        args.reply_cap_ptr,
+        args.sender_pid_ptr,
+        args.sender_tid_ptr,
+        Some(deadline_tick),
     ) {
         Ok((received, _yielded)) => received as u64,
         Err((errno, _yielded)) => linux_errno(errno),
@@ -1629,6 +1692,12 @@ fn prepare_recv_with_sender(
 /// committed a block and crossed the scheduler; reply-receive uses it to avoid
 /// issuing a redundant syscall-tail reschedule after the exact caller already
 /// received its direct handoff.
+///
+/// `deadline_tick` is `None` for the historical wait-forever receive. When it
+/// is `Some`, the same block additionally arms an RTC waiter, so the task
+/// resumes on whichever comes first: a sender, or the deadline. That is the
+/// one primitive a multi-source supervisor needs in order to stop polling.
+#[allow(clippy::too_many_arguments)]
 fn recv_with_sender_blocking_prepared(
     endpoint: KernelEndpointHandle,
     task_id: u64,
@@ -1637,6 +1706,7 @@ fn recv_with_sender_blocking_prepared(
     reply_cap_ptr: u64,
     sender_pid_ptr: u64,
     sender_tid_ptr: u64,
+    deadline_tick: Option<u64>,
 ) -> Result<(usize, bool), (i64, bool)> {
     let mut yielded = false;
     loop {
@@ -1662,6 +1732,13 @@ fn recv_with_sender_blocking_prepared(
                 return Ok((request.len(), yielded));
             }
             Ok(None) => {
+                // The queue is empty. A bounded receive that is already out of
+                // budget answers here, *after* the receive attempt above, so a
+                // request that landed in the final tick is still delivered
+                // rather than discarded by an expiry test that ran first.
+                if deadline_tick.is_some_and(|deadline| crate::arch::rtc::ticks() >= deadline) {
+                    return Err((LINUX_EAGAIN, yielded));
+                }
                 if !multitask::arm_block_current_task() {
                     return Err((LINUX_EINVAL, yielded));
                 }
@@ -1678,7 +1755,27 @@ fn recv_with_sender_blocking_prepared(
                     let _ = multitask::cancel_block_current_task();
                     continue;
                 }
-                match multitask::commit_block_current_task_and_yield() {
+                if let Some(deadline) = deadline_tick {
+                    if !crate::arch::rtc::arm_sleep_waiter_until_tick(task_id, deadline) {
+                        // Leaving the receiver waiter published while abandoning
+                        // the block would let a sender hand this endpoint's next
+                        // request to a task that is not waiting for it, and no
+                        // other receiver would be woken. Withdraw it first.
+                        kernel_ipc_runtime::api::remove_endpoint_waiters_for_task(task_id);
+                        let _ = multitask::cancel_block_current_task();
+                        return Err((LINUX_EBUSY, yielded));
+                    }
+                }
+                let committed = multitask::commit_block_current_task_and_yield();
+                if deadline_tick.is_some() {
+                    crate::arch::rtc::disarm_sleep_waiter(task_id);
+                    // A sender that woke this task already popped it from the
+                    // endpoint's receiver list; a timer wake did not. Withdraw
+                    // unconditionally - the second removal is a no-op, while a
+                    // missed one is a permanently misrouted wake.
+                    kernel_ipc_runtime::api::remove_endpoint_waiters_for_task(task_id);
+                }
+                match committed {
                     Some(true) => yielded = true,
                     Some(false) => continue,
                     None => return Err((LINUX_EINVAL, yielded)),

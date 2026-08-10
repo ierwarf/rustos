@@ -21,7 +21,9 @@ impl MilestoneOutputClass {
 
     pub(super) const fn output_attempts(self) -> usize {
         match self {
-            Self::Required | Self::QualificationCritical => super::REQUIRED_MILESTONE_OUTPUT_ATTEMPTS,
+            Self::Required | Self::QualificationCritical => {
+                super::REQUIRED_MILESTONE_OUTPUT_ATTEMPTS
+            }
             Self::BestEffort | Self::Measurement => 1,
         }
     }

@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::mem::size_of;
 use std::sync::atomic::Ordering;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use keyboard_core::KeyCode;
 use runtime_control::{
@@ -15,14 +15,15 @@ use rustos_user_abi::device::{InputEvent, INPUT_ACTION_RELEASED, INPUT_KIND_KEYB
 use rustos_user_abi::linux::LinuxTermios;
 use rustos_user_abi::syscall::{
     CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
-    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, WaitSetSignalBrokerArgs,
-    COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_SESSIOND,
+    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, IpcRecvWithSenderArgs,
+    WaitSetSignalBrokerArgs, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_SESSIOND,
     COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_READ, COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_READINESS,
     COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_WRITE, COMMERCIAL_MAX_SESSIOND_OP_CONSOLE_ROUTE,
     COMMERCIAL_MAX_SESSIOND_OP_FOREGROUND_FOCUS, COMMERCIAL_MAX_SESSIOND_OP_SESSION_GRAPH,
     COMMERCIAL_MAX_SESSIOND_OP_TTY_LINE_DISCIPLINE, COMMERCIAL_MAX_SESSIOND_OP_UI_BOOTSTRAP,
     IPC_SERVICE_DEVMGRD, IPC_SERVICE_SESSIOND, SESSIOND_CONSOLE_READINESS_LIVE,
-    SESSIOND_CONSOLE_READINESS_READY, SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_REPLY,
+    SESSIOND_CONSOLE_READINESS_READY, SESSIOND_CONSOLE_READ_WAIT_MAX_MS,
+    SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_RECV_WITH_SENDER_BOUNDED, SYS_RUSTOS_IPC_REPLY,
     SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER, SYS_RUSTOS_WAITSET_SIGNAL_BROKER, WAITSET_ABI_VERSION,
     WAITSET_PROVIDER_SESSIOND,
 };
@@ -39,10 +40,49 @@ const INPUT_BUFFER_CAPACITY: usize = 1024;
 const EDIT_BUFFER_CAPACITY: usize = 256;
 const OUTPUT_BUFFER_CAPACITY: usize = 4096;
 
+/// How many console reads may sit parked at once.
+///
+/// # Why this is small
+/// A parked read holds a reply capability, not an endpoint queue slot: the
+/// request was already received, so it no longer counts against
+/// `MAX_ENDPOINT_PENDING_MESSAGES`. What it does hold is broker memory - one
+/// boxed request each - and a promise to answer. Real console readers are one
+/// per foreground TTY session, so eight is generous. Overflow is not an error:
+/// a ninth reader is answered immediately with the historical empty snapshot
+/// and simply polls the way every reader did before.
+const MAX_PARKED_CONSOLE_READS: usize = 8;
+
+/// One console `read()` held inside the broker instead of being answered
+/// "no bytes yet".
+///
+/// # Why this type exists
+/// A shell blocked in `read()` used to cost one IPC round trip per poll tick
+/// forever. Measured at 8 vCPU that was ~14.7 ms per empty poll - ~10.9 ms of
+/// it waiting for this very broker to finish an unrelated idle sleep - for a
+/// keystroke that had not arrived yet. Parking the read turns the steady state
+/// from "ask repeatedly until something is there" into "answer once, when
+/// something is there".
+///
+/// # Why the whole request is retained
+/// Completion re-runs the ordinary console-route handler against this stored
+/// request, so the parked answer is shaped by exactly the same code as an
+/// immediate answer. Kernel compat validates the response envelope field by
+/// field against the request it sent; rebuilding the envelope by hand here
+/// would be a second, silently diverging copy of that shaping.
+struct ConsoleReadWaiter {
+    /// Stored with `arg1` cleared, which is what makes the re-run above answer
+    /// immediately instead of parking the request a second time.
+    request: Box<CommercialMaxProtocolRequest>,
+    reply_cap: u64,
+    session: u64,
+    deadline: Instant,
+}
+
 pub(crate) struct SessionRuntime {
     sessions: BTreeMap<u64, TtySessionState>,
     output_generation: u64,
     input_readiness_generation: u64,
+    console_read_waiters: VecDeque<ConsoleReadWaiter>,
 }
 
 impl Default for SessionRuntime {
@@ -51,6 +91,7 @@ impl Default for SessionRuntime {
             sessions: BTreeMap::new(),
             output_generation: 0,
             input_readiness_generation: 1,
+            console_read_waiters: VecDeque::new(),
         }
     }
 }
@@ -128,6 +169,41 @@ impl SessionRuntime {
 
     fn pending_input_len(&self, session: u64) -> Option<usize> {
         self.sessions.get(&session).map(|state| state.input.len())
+    }
+
+    /// Park a console read, or refuse when the bound is already met.
+    fn park_console_read(&mut self, waiter: ConsoleReadWaiter) -> bool {
+        if self.console_read_waiters.len() >= MAX_PARKED_CONSOLE_READS {
+            return false;
+        }
+        self.console_read_waiters.push_back(waiter);
+        true
+    }
+
+    /// Take the parked reads out so they can be completed while `BrokerState`
+    /// is mutably borrowed. Every taken waiter is either answered or handed
+    /// back by [`restore_console_read_waiters`]; dropping one silently would
+    /// strand a blocked caller until compat's own deadline fired.
+    fn take_console_read_waiters(&mut self) -> VecDeque<ConsoleReadWaiter> {
+        std::mem::take(&mut self.console_read_waiters)
+    }
+
+    fn restore_console_read_waiters(&mut self, waiters: VecDeque<ConsoleReadWaiter>) {
+        // Parked reads are restored in front of anything parked while they were
+        // being serviced, so a reader cannot be starved by later arrivals.
+        for waiter in waiters.into_iter().rev() {
+            self.console_read_waiters.push_front(waiter);
+        }
+    }
+
+    /// The soonest a parked read must be answered even if no byte ever arrives.
+    /// The idle wait uses this so a parked read cannot outlive its budget just
+    /// because the broker had nothing else to do.
+    pub(crate) fn earliest_console_read_deadline(&self) -> Option<Instant> {
+        self.console_read_waiters
+            .iter()
+            .map(|waiter| waiter.deadline)
+            .min()
     }
 
     fn output_generation(&self) -> u64 {
@@ -510,7 +586,19 @@ pub(super) fn create_session_endpoint() -> Option<u64> {
     Some(endpoint as u64)
 }
 
-pub(super) fn service_session_endpoint(endpoint: Option<u64>, state: &mut BrokerState) -> bool {
+/// Service one session request.
+///
+/// `wait` is `None` for a drain pass, which must never block because the caller
+/// still has other sources to visit. It is `Some(budget)` for the broker's idle
+/// wait, where blocking on this endpoint *is* the idle: an arriving request
+/// wakes the broker at once, and the budget still bounds how long the sources
+/// that have no wake object - child exits, the control socket, retry deadlines
+/// - wait for their next visit.
+pub(super) fn service_session_endpoint(
+    endpoint: Option<u64>,
+    state: &mut BrokerState,
+    wait: Option<Duration>,
+) -> bool {
     let Some(endpoint) = endpoint else {
         return false;
     };
@@ -518,16 +606,39 @@ pub(super) fn service_session_endpoint(endpoint: Option<u64>, state: &mut Broker
     let mut reply_cap = 0_u64;
     let mut sender_pid = 0_u64;
     let mut sender_tid = 0_u64;
-    let received = unsafe {
-        libc::syscall(
-            SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER as libc::c_long,
-            endpoint,
-            (&mut request as *mut CommercialMaxProtocolRequest) as u64,
-            size_of::<CommercialMaxProtocolRequest>() as u64,
-            (&mut reply_cap as *mut u64) as u64,
-            (&mut sender_pid as *mut u64) as u64,
-            (&mut sender_tid as *mut u64) as u64,
-        ) as i64
+    let received = match wait {
+        None => unsafe {
+            libc::syscall(
+                SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER as libc::c_long,
+                endpoint,
+                (&mut request as *mut CommercialMaxProtocolRequest) as u64,
+                size_of::<CommercialMaxProtocolRequest>() as u64,
+                (&mut reply_cap as *mut u64) as u64,
+                (&mut sender_pid as *mut u64) as u64,
+                (&mut sender_tid as *mut u64) as u64,
+            ) as i64
+        },
+        Some(budget) => {
+            // The kernel rejects a zero budget, and a due deadline can round to
+            // zero here. One millisecond is the floor that keeps an expired
+            // timer from turning this wait into a spin.
+            let budget_ms = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX).max(1);
+            let args = IpcRecvWithSenderArgs {
+                endpoint,
+                request_ptr: (&mut request as *mut CommercialMaxProtocolRequest) as u64,
+                request_capacity: size_of::<CommercialMaxProtocolRequest>() as u64,
+                reply_cap_ptr: (&mut reply_cap as *mut u64) as u64,
+                sender_pid_ptr: (&mut sender_pid as *mut u64) as u64,
+                sender_tid_ptr: (&mut sender_tid as *mut u64) as u64,
+            };
+            unsafe {
+                libc::syscall(
+                    SYS_RUSTOS_IPC_RECV_WITH_SENDER_BOUNDED as libc::c_long,
+                    (&args as *const IpcRecvWithSenderArgs) as u64,
+                    budget_ms,
+                ) as i64
+            }
+        }
     };
     if received < 0 {
         return false;
@@ -552,6 +663,25 @@ pub(super) fn service_session_endpoint(endpoint: Option<u64>, state: &mut Broker
     } else {
         handle_session_request(&request, state, &mut response)
     };
+    // A console read that succeeded, found nothing, and whose caller asked to
+    // wait is held instead of answered. Everything else - refusals, failures,
+    // and reads that did find bytes - is answered right here, unchanged.
+    if let Some(budget) = console_read_park_budget(&request, &response) {
+        let session = request.arg2;
+        let mut parked = Box::new(request);
+        parked.arg1 = 0;
+        if state.session_runtime.park_console_read(ConsoleReadWaiter {
+            request: parked,
+            reply_cap,
+            session,
+            deadline: Instant::now() + budget,
+        }) {
+            return true;
+        }
+        // The park bound is full. Fall through and answer the empty snapshot,
+        // which is exactly what this caller would have received before reads
+        // could be parked at all.
+    }
     let reply = unsafe {
         libc::syscall(
             SYS_RUSTOS_IPC_REPLY as libc::c_long,
@@ -564,6 +694,98 @@ pub(super) fn service_session_endpoint(endpoint: Option<u64>, state: &mut Broker
         super::spawn::debug_line("runtimed: session reply failed");
     }
     true
+}
+
+/// How long this console read may wait, or `None` when it must be answered now.
+///
+/// # Why an empty read is the only parkable one
+/// A failure carries a reason the caller needs immediately, and a read that
+/// already found bytes has something to deliver. Holding either back would add
+/// latency rather than remove it. Only the "nothing yet" answer is worth
+/// replacing with "nothing yet, so I will tell you when".
+fn console_read_park_budget(
+    request: &CommercialMaxProtocolRequest,
+    response: &CommercialMaxProtocolResponse,
+) -> Option<Duration> {
+    if request.header.op != COMMERCIAL_MAX_SESSIOND_OP_CONSOLE_ROUTE
+        || request.arg0 != COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_READ
+    {
+        return None;
+    }
+    if response.status != 0 || response.payload_len != 0 {
+        return None;
+    }
+    // Zero is every pre-existing caller's `arg1`, and it has to keep meaning
+    // "answer now" or those callers silently gain a quarter-second stall.
+    if request.arg1 == 0 {
+        return None;
+    }
+    Some(Duration::from_millis(
+        request.arg1.min(SESSIOND_CONSOLE_READ_WAIT_MAX_MS),
+    ))
+}
+
+/// Answer every parked console read that now has bytes, has run out of budget,
+/// or has lost its session. Returns whether any caller was answered.
+///
+/// # Why a vanished session counts as ready
+/// `pending_input_len` returns `None` for a session that no longer exists. That
+/// reader must be released, not held: the bytes it is waiting for can never
+/// arrive. Completing it runs the ordinary handler, which answers `ENODEV` -
+/// the same error it would have received without parking.
+pub(super) fn service_console_read_waiters(state: &mut BrokerState) -> bool {
+    if state.session_runtime.console_read_waiters.is_empty() {
+        return false;
+    }
+    let parked = state.session_runtime.take_console_read_waiters();
+    let now = Instant::now();
+    let mut still_parked = VecDeque::new();
+    let mut answered = false;
+    for waiter in parked {
+        let ready = state
+            .session_runtime
+            .pending_input_len(waiter.session)
+            .is_none_or(|pending| pending != 0);
+        if !ready && now < waiter.deadline {
+            still_parked.push_back(waiter);
+            continue;
+        }
+        answer_parked_console_read(waiter, state);
+        answered = true;
+    }
+    state
+        .session_runtime
+        .restore_console_read_waiters(still_parked);
+    answered
+}
+
+/// # Why consuming before replying is safe here, and only here
+/// Running the handler moves the session's input bytes into the response, and
+/// nothing can put them back if the reply then fails. That is tolerable only
+/// because the caller is still blocked waiting: `SESSIOND_CONSOLE_READ_WAIT_MAX_MS`
+/// is statically asserted below compat's `BulkData` deadline, so compat cannot
+/// have cancelled this capability while the read was parked. The one remaining
+/// way to lose the reply is the caller dying, and a dead reader's keystrokes
+/// are meant to be discarded. Raise that constant above the compat deadline and
+/// this becomes silent input loss.
+fn answer_parked_console_read(waiter: ConsoleReadWaiter, state: &mut BrokerState) {
+    let mut response = CommercialMaxProtocolResponse {
+        header: waiter.request.header,
+        ..CommercialMaxProtocolResponse::default()
+    };
+    response.header.version = COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
+    response.status = handle_session_request(&waiter.request, state, &mut response);
+    let reply = unsafe {
+        libc::syscall(
+            SYS_RUSTOS_IPC_REPLY as libc::c_long,
+            waiter.reply_cap,
+            (&response as *const CommercialMaxProtocolResponse) as u64,
+            size_of::<CommercialMaxProtocolResponse>() as u64,
+        ) as i64
+    };
+    if reply < 0 {
+        super::spawn::debug_line("runtimed: parked console read reply failed");
+    }
 }
 
 fn session_ingress_identity_authorized(
@@ -1098,14 +1320,20 @@ fn merge_manifest_env_into(env: &mut Vec<String>, manifest_env: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::{
-        session_ingress_identity_authorized, ui_bootstrap_may_retry_immediately, SessionRuntime,
+        console_read_park_budget, session_ingress_identity_authorized,
+        ui_bootstrap_may_retry_immediately, ConsoleReadWaiter, SessionRuntime,
+        MAX_PARKED_CONSOLE_READS,
     };
     use keyboard_core::KeyCode;
     use rustos_user_abi::device::{InputEvent, INPUT_ACTION_PRESSED, INPUT_KIND_KEYBOARD};
     use rustos_user_abi::linux::LinuxTermios;
     use rustos_user_abi::syscall::{
-        CommercialMaxProtocolRequest, COMMERCIAL_MAX_SESSIOND_OP_UI_BOOTSTRAP,
+        CommercialMaxProtocolRequest, CommercialMaxProtocolResponse,
+        COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_READ, COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_WRITE,
+        COMMERCIAL_MAX_SESSIOND_OP_CONSOLE_ROUTE, COMMERCIAL_MAX_SESSIOND_OP_UI_BOOTSTRAP,
+        SESSIOND_CONSOLE_READ_WAIT_MAX_MS,
     };
+    use std::time::{Duration, Instant};
 
     #[test]
     fn session_ingress_requires_exact_sender_or_narrow_devmgrd_delegation() {
@@ -1126,6 +1354,48 @@ mod tests {
         assert!(ui_bootstrap_may_retry_immediately(libc::ETIMEDOUT));
         assert!(!ui_bootstrap_may_retry_immediately(libc::EAGAIN));
         assert!(!ui_bootstrap_may_retry_immediately(libc::EINVAL));
+    }
+
+    #[test]
+    fn console_read_parking_is_opt_in_bounded_and_read_only() {
+        let mut request = CommercialMaxProtocolRequest::default();
+        request.header.op = COMMERCIAL_MAX_SESSIOND_OP_CONSOLE_ROUTE;
+        request.arg0 = COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_READ;
+        let response = CommercialMaxProtocolResponse::default();
+
+        assert!(console_read_park_budget(&request, &response).is_none());
+        request.arg1 = 17;
+        assert_eq!(
+            console_read_park_budget(&request, &response),
+            Some(Duration::from_millis(17))
+        );
+        request.arg1 = u64::MAX;
+        assert_eq!(
+            console_read_park_budget(&request, &response),
+            Some(Duration::from_millis(SESSIOND_CONSOLE_READ_WAIT_MAX_MS))
+        );
+        request.arg0 = COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_WRITE;
+        assert!(console_read_park_budget(&request, &response).is_none());
+    }
+
+    #[test]
+    fn parked_console_read_capacity_and_deadline_are_explicit() {
+        let mut runtime = SessionRuntime::default();
+        for index in 0..MAX_PARKED_CONSOLE_READS {
+            assert!(runtime.park_console_read(ConsoleReadWaiter {
+                request: Box::new(CommercialMaxProtocolRequest::default()),
+                reply_cap: index as u64 + 1,
+                session: index as u64,
+                deadline: Instant::now() + Duration::from_millis(index as u64 + 1),
+            }));
+        }
+        assert!(!runtime.park_console_read(ConsoleReadWaiter {
+            request: Box::new(CommercialMaxProtocolRequest::default()),
+            reply_cap: 99,
+            session: 99,
+            deadline: Instant::now() + Duration::from_secs(1),
+        }));
+        assert!(runtime.earliest_console_read_deadline().is_some());
     }
 
     fn key_event(code: u32, text: u8) -> InputEvent {

@@ -7,7 +7,6 @@ use super::framebuffer::{Framebuffer, FramebufferRect, build_framebuffer};
 use super::{GuiDisplayInfo, GuiPresentOutcome};
 use crate::sync::KernelWaitLock;
 
-
 #[allow(
     clippy::large_enum_variant,
     reason = "the framebuffer and fixed dirty-tile map live in one static kernel object so provider installation never allocates"

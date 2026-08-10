@@ -100,13 +100,17 @@ rg -Fq 'ROOTD_SUPERVISOR_IDLE_POLL_MS: u64 = 10' "$performance" || {
     echo "rootd steady-state supervisor poll bound drifted" >&2
     exit 1
 }
-supervisor_idle_body="$(sed -n '/fn supervisor_idle()/,/^}/p' "$rootd")"
-grep -Fq 'wait_for_restart_backoff(delay_ms)' <<<"$supervisor_idle_body" || {
-    echo "rootd steady-state supervisor stopped using the bounded wait broker" >&2
+rootd_source="$(cat "$rootd")"
+grep -Fq 'SYS_RUSTOS_IPC_RECV_WITH_SENDER_BOUNDED' <<<"$rootd_source" || {
+    echo "rootd steady-state supervisor stopped using the bounded IPC receive" >&2
     exit 1
 }
-if grep -Fq 'yield_now()' <<<"$supervisor_idle_body"; then
-    echo "rootd steady-state supervisor regressed to a runnable yield loop" >&2
+grep -Fq 'Some(rustos_user_abi::performance::ROOTD_SUPERVISOR_IDLE_POLL_MS)' <<<"$rootd_source" || {
+    echo "rootd steady-state supervisor lost its bounded message-or-timeout deadline" >&2
+    exit 1
+}
+if grep -Eq '^fn supervisor_idle\(\)' <<<"$rootd_source"; then
+    echo "rootd steady-state supervisor regressed to the removed flat idle helper" >&2
     exit 1
 fi
 

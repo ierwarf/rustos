@@ -357,8 +357,7 @@ fn timespec_from_nanos(nanos: u64) -> LinuxTimespecWire {
 /// whatever the one-second calendar read carried at latch time, which is the
 /// same error the repeated read had; what changes is that the value now
 /// advances continuously and cannot be observed going backwards.
-static REALTIME_EPOCH_NANOS: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+static REALTIME_EPOCH_NANOS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static REALTIME_EPOCH_LATCHED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
