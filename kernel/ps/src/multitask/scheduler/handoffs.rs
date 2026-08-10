@@ -375,9 +375,17 @@ impl Scheduler {
             .lock()
             .take_next_ready(|record| self.synchronous_handoff_record_is_ready(record));
         #[cfg(not(test))]
-        sync_handoff::take_next_ready(cpu, |record| {
-            self.synchronous_handoff_record_is_ready(record)
-        })
+        {
+            // The guarded call below still decides; this only answers whether
+            // taking its lock can find anything, which on most dispatches it
+            // cannot.
+            if !sync_handoff::pending(cpu) {
+                return None;
+            }
+            sync_handoff::take_next_ready(cpu, |record| {
+                self.synchronous_handoff_record_is_ready(record)
+            })
+        }
     }
 
     pub(super) fn record_synchronous_handoff(&mut self, synchronous_handoff: bool) {

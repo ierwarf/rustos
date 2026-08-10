@@ -306,12 +306,58 @@ fn state_for_cpu(cpu: usize) -> &'static SyncHandoffLock {
         .expect("scheduler synchronous handoff CPU exceeds capacity")
 }
 
+/// Lock-free "this CPU's synchronous FIFO may hold a record".
+///
+/// `take_next_ready` ran on every dispatch and took this CPU's FIFO lock only
+/// to read `len == 0`, which is the answer on the large majority of them -
+/// 26.5 ms/s of lock time at eight vCPUs, the second largest step in the
+/// handoff chain after the dispatch policy guard.
+///
+/// One-sided in the same way as the atomic-activation hint: an enqueue sets
+/// it, and only the consumer clears it, after observing the FIFO drained under
+/// the same lock. A stale `true` costs one acquisition, exactly what every
+/// dispatch paid before. A stale `false` would strand a committed reply, and
+/// cannot arise, because a successful enqueue always publishes and the
+/// consumer only clears on an empty queue it has seen under the lock.
+static SYNC_HANDOFF_PENDING: [core::sync::atomic::AtomicBool; MAX_TRACKED_CPUS] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; MAX_TRACKED_CPUS];
+
+/// Enqueue into one target FIFO and advertise it to that CPU's dispatcher.
+fn enqueue_and_publish(target_cpu: usize, record: SyncHandoffRecord) -> bool {
+    let retained = state_for_cpu(target_cpu).lock().enqueue(record);
+    if retained {
+        if let Some(pending) = SYNC_HANDOFF_PENDING.get(target_cpu) {
+            // ORDERING: release publishes the enqueued record before the flag
+            // that advertises it.
+            pending.store(true, core::sync::atomic::Ordering::Release);
+        }
+    }
+    retained
+}
+
+/// Whether taking the FIFO lock can find anything. Test schedulers drive
+/// isolated `SyncHandoffState`s rather than these statics, so they always take
+/// the guarded path.
+pub(super) fn pending(cpu: usize) -> bool {
+    #[cfg(test)]
+    {
+        let _ = cpu;
+        true
+    }
+    #[cfg(not(test))]
+    SYNC_HANDOFF_PENDING.get(cpu).is_some_and(|pending| {
+        // ORDERING: acquire pairs with the enqueueing CPU's release, so
+        // observing the flag also observes the record it advertises.
+        pending.load(core::sync::atomic::Ordering::Acquire)
+    })
+}
+
 /// Enqueues a catalog-validated generic handoff while the caller still holds
 /// the scheduler lock.  This is the only production publisher for non-reply
 /// synchronous handoffs.
 #[cfg(not(test))]
 pub(super) fn enqueue(target_cpu: usize, record: SyncHandoffRecord) -> bool {
-    state_for_cpu(target_cpu).lock().enqueue(record)
+    enqueue_and_publish(target_cpu, record)
 }
 
 /// Runs the post-catalog reply publication against exactly one target FIFO.
@@ -340,7 +386,7 @@ pub(super) fn enqueue_reply_wake(token: ReplyWakeHandoff) -> bool {
     enqueue_reply_wake_after_catalog(
         token,
         ReplyWakeHandoff::owner_still_matches,
-        |target_cpu, record| state_for_cpu(target_cpu).lock().enqueue(record),
+        enqueue_and_publish,
     )
 }
 
@@ -351,7 +397,20 @@ pub(super) fn take_next_ready(
     cpu: usize,
     ready: impl FnMut(SyncHandoffRecord) -> bool,
 ) -> Option<usize> {
-    state_for_cpu(cpu).lock().take_next_ready(ready)
+    let mut state = state_for_cpu(cpu).lock();
+    let taken = state.take_next_ready(ready);
+    // Clear only on a queue this CPU has just seen empty under the lock. A
+    // capped handoff streak returns None with records still queued, and
+    // clearing there would strand them.
+    if taken.is_none() && state.len == 0 {
+        if let Some(pending) = SYNC_HANDOFF_PENDING.get(cpu) {
+            // ORDERING: release keeps the clear behind the drain that
+            // justified it, so a producer that observes `false` has already
+            // had its record consumed rather than merely enqueued.
+            pending.store(false, core::sync::atomic::Ordering::Release);
+        }
+    }
+    taken
 }
 
 #[cfg(not(test))]
@@ -614,5 +673,18 @@ mod tests {
         );
         assert_eq!(owner_observations, 2, "the owner is sampled on both sides");
         assert_eq!(target_enqueue_calls, 1, "only the captured CPU is touched");
+    }
+
+    #[test]
+    fn a_capped_handoff_streak_must_not_clear_a_queue_that_still_holds_records() {
+        // `take_next_ready` returns None on a capped streak without draining.
+        // Clearing the pending hint there would strand every queued reply
+        // until something else happened to enqueue again.
+        let mut state = SyncHandoffState::new();
+        assert!(state.enqueue(SyncHandoffRecord::new(1, 7)));
+        state.set_handoff_streak(MAX_CONSECUTIVE_SYNC_HANDOFFS);
+
+        assert_eq!(state.take_next_ready(|_| true), None);
+        assert_ne!(state.len, 0, "a capped streak must leave the record queued");
     }
 }
