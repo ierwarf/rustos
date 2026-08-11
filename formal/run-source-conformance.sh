@@ -438,6 +438,54 @@ if ! grep -Fq 'earliest_console_read_deadline()' <<<"$runtimed_delay_body" \
     echo 'the runtimed idle budget must include every reply deadline it is holding' >&2
     exit 1
 fi
+# The console has two observers with opposite interests: a shell waiting to read
+# its own session, and a compositor waiting for anything it draws to change.
+# Only the first had a readiness subject, so the second ran a timer. Every
+# mutation the compositor can see must move the one token it waits on, and the
+# edge must be published where the token moves rather than at each call site -
+# a forgotten publication is silent and strands a waiter that stopped polling.
+graph_advance_body="$(
+    sed -n '/^    fn advance_graph_generation(/,/^    }/p' services/runtimed/src/session.rs
+)"
+if ! grep -Fq 'publish_console_graph_readiness(self.output_generation)' <<<"$graph_advance_body"; then
+    echo 'the console graph token must publish its wait-set edge where the token moves' >&2
+    exit 1
+fi
+for mutation in create_session remove_session write_to_session handle_input_event; do
+    body="$(sed -n "/^    \(pub(crate) \)\?fn ${mutation}(/,/^    }/p" services/runtimed/src/session.rs)"
+    if ! grep -Fq 'advance_graph_generation()' <<<"$body"; then
+        echo "console mutation ${mutation} must advance the graph token the compositor waits on" >&2
+        exit 1
+    fi
+done
+# A parked graph wait is answered by the broker pass, so the pass has to visit
+# it, and its deadline has to be inside the idle budget or the broker can sleep
+# through a promise it made.
+if ! rg -Fq 'session::service_console_graph_waiters(&mut state)' services/runtimed/src/main.rs; then
+    echo 'the runtimed loop must answer parked console-graph waits every pass' >&2
+    exit 1
+fi
+if ! grep -Fq '.min(parked_graph_delay)' <<<"$runtimed_delay_body"; then
+    echo 'the runtimed idle budget must include the soonest parked console-graph deadline' >&2
+    exit 1
+fi
+# The compositor must wait on that edge instead of a timer, and the wait must
+# not be routed through devmgrd: devmgrd serves from a single loop, so a held
+# reply there stalls every unrelated device ioctl for the whole park.
+console_refresh_body="$(
+    sed -n '/^pub(crate) fn start_console_refresh_worker(/,/^}/p' services/uiserver/src/app/runtime.rs
+)"
+if ! grep -Fq 'console_wait_graph(' <<<"$console_refresh_body" \
+    || grep -Fq 'wait_for_edge' <<<"$console_refresh_body"; then
+    echo 'the uiserver console refresh must block on the console graph edge, not on an interval' >&2
+    exit 1
+fi
+if ! rg -Fq 'if request_number == rustos_user_abi::console::CONSOLE_IOCTL_WAIT_GRAPH {' \
+    kernel/compat/src/user/syscall/linux/service_ops/vfs_meta.rs; then
+    echo 'the console graph wait must take the direct broker rail, never the devmgrd forward' >&2
+    exit 1
+fi
+
 # A change token that changes when it is read tells every caller that everything
 # changed, every time. The console snapshot once raised its reported generation
 # to a counter the handler itself incremented, so uiserver's refresh worker

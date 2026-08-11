@@ -1032,10 +1032,50 @@ pub const COMMERCIAL_MAX_SESSIOND_OP_UI_BOOTSTRAP: u16 = 5;
 pub const COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_READ: u64 = 0x100;
 pub const COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_WRITE: u64 = 0x101;
 pub const COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_READINESS: u64 = 0x102;
+/// Readiness of the console *graph* - the manager's view of every session's
+/// title, state, focus, and produced output - rather than of one session's
+/// input.
+///
+/// # Why the console needs a second readiness subject
+/// A console has two independent observers with opposite interests. A shell
+/// waits to *read* its own session; a compositor waits for *anything it draws*
+/// to change. Only the first had a readiness subject, so the compositor had no
+/// edge to wait on and ran a fixed-interval snapshot loop instead - the last
+/// timer in the keystroke-to-pixel path. This is the same object-signal shape
+/// commercial microkernels use for exactly this problem: Genode's
+/// `Terminal::Session::read_avail_sigh`, Zircon's readable signal on a PTY
+/// observed through a port, QNX's `ionotify` armed pulse.
+pub const COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_GRAPH_READINESS: u64 = 0x103;
 pub const SESSIOND_CONSOLE_READINESS_READY: u64 = 1 << 0;
 pub const SESSIOND_CONSOLE_READINESS_LIVE: u64 = 1 << 1;
 pub const SESSIOND_CONSOLE_READINESS_MASK: u64 =
     SESSIOND_CONSOLE_READINESS_READY | SESSIOND_CONSOLE_READINESS_LIVE;
+/// Wait-set object identity of the console graph.
+///
+/// Session readiness is published under the session handle, and a live session
+/// handle is never zero, so zero is free and unambiguous for the one object
+/// that is not a session.
+pub const SESSIOND_CONSOLE_GRAPH_OBJECT_ID: u64 = 0;
+/// Longest the console broker may hold a graph-readiness reply while the graph
+/// has not moved.
+///
+/// # Why this bound is a correctness invariant
+/// Kernel compat issues this query in the `InteractiveControl` class, so it
+/// abandons the reply capability after `IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS`.
+/// Parking past that would let the broker answer a capability compat had
+/// already cancelled, turning every wait into a timeout. Nothing is consumed
+/// into this reply, so unlike a parked read a lost answer costs a re-arm
+/// rather than lost keystrokes.
+///
+/// # Why this budget is not the latency
+/// It is the re-arm interval of an idle compositor, not the delay before it
+/// sees a change. A graph edge answers every parked wait in the pass that
+/// produced it, so shell output reaches the screen on the edge; this bound
+/// only decides how often a compositor with nothing happening asks again.
+pub const SESSIOND_CONSOLE_GRAPH_WAIT_MAX_MS: u64 = 80;
+const _: () = assert!(
+    SESSIOND_CONSOLE_GRAPH_WAIT_MAX_MS < crate::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS
+);
 /// Wait budget, in milliseconds, that a `CONSOLE_ROUTE_READ` caller may park
 /// inside the console broker. It travels in the otherwise-unused `arg1` of the
 /// console-route request.

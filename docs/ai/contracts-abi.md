@@ -705,6 +705,31 @@ policy remains with the owning service.
   and the number of parked connections is capped by `MAX_RUNTIME_WATCHERS`.
   Past that cap the server answers immediately, which degrades a watcher to the
   poller it replaced instead of pinning descriptors.
+- A console has two observers with opposite interests, and each needs its own
+  readiness subject. A shell waits to *read its own session*; a compositor waits
+  for *anything it draws* to change. Only the first existed, so the second ran a
+  fixed-interval snapshot loop - the last timer between a shell writing and a
+  pixel changing. `COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_GRAPH_READINESS` is the
+  second subject, published on the wait set under
+  `SESSIOND_CONSOLE_GRAPH_OBJECT_ID` (zero, which no live session handle can
+  be). This is the object-signal shape commercial microkernels use for exactly
+  this problem: Genode's `Terminal::Session::read_avail_sigh`, a Zircon readable
+  signal observed through a port, a QNX `ionotify` armed pulse.
+- The graph token must advance in `advance_graph_generation` and nowhere else,
+  and every compositor-visible mutation must go through it - session create and
+  remove as well as output and echoed keys. A publication forgotten at a call
+  site is silent, and it strands a waiter that has deliberately stopped polling.
+- `CONSOLE_IOCTL_WAIT_GRAPH` takes the direct console-broker rail rather than
+  the devmgrd forward every other console ioctl uses. devmgrd serves its clients
+  from one loop, so a reply held there would stall every unrelated device ioctl
+  for the whole park; console read, write, and per-session readiness already
+  route direct for the same reason. Compat authorizes it instead, on the console
+  handle itself, since a manager view is not session-bound.
+- `SESSIOND_CONSOLE_GRAPH_WAIT_MAX_MS` is a re-arm interval, not a latency. The
+  edge answers every parked wait in the pass that produced it; the bound only
+  decides how often an idle compositor asks again, and it must stay statically
+  below `IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS`, the class deadline that carries
+  the call.
 - A change token must not change when it is observed. Reporting one is a read:
   a handler that advances the value it reports tells every caller that
   everything changed, every time, and a caller that reacts to change then

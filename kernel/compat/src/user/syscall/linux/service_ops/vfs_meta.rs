@@ -469,6 +469,24 @@ pub fn syscall_linux_vfs_mount(
     }
 }
 
+/// Copy the caller's wait request in, hold it in the console broker until the
+/// graph moves past the generation it presented, and copy the answer back.
+fn console_wait_graph(arg: u64) -> Result<u64, i64> {
+    let mut request =
+        usermem::read_current_user_struct::<rustos_user_abi::console::ConsoleWaitGraphRequest>(arg)
+            .map_err(super::super::address_space_error_to_linux_errno)?;
+    if request.reserved != 0 {
+        return Err(LINUX_EINVAL);
+    }
+    request.generation = super::ipc_helpers::console_graph_readiness_via_sessiond(
+        request.generation,
+        u64::from(request.wait_ms),
+    )?;
+    usermem::write_current_user_struct(arg, &request)
+        .map_err(super::super::address_space_error_to_linux_errno)?;
+    Ok(0)
+}
+
 pub fn syscall_linux_vfs_umount2(target_ptr: u64, flags: u64) -> u64 {
     let path = match copy_current_user_path(target_ptr, VFS_IPC_PATH_CAPACITY) {
         Ok(path) => path,
@@ -487,6 +505,22 @@ pub fn syscall_linux_vfs_umount2(target_ptr: u64, flags: u64) -> u64 {
 }
 
 pub fn syscall_linux_ioctl(fd: u64, request_number: u64, arg: u64) -> u64 {
+    // A console-graph wait is answered by the console broker holding the reply
+    // until the graph moves. Asking devmgrd to authorize and forward it would
+    // park devmgrd's single serving loop for the whole wait, stalling every
+    // unrelated device ioctl behind a call whose entire purpose is to block.
+    // Console read, write, and per-session readiness already take this direct
+    // rail for the same reason. The console handle is the authority: a caller
+    // without one is refused here, before the broker is reached.
+    if request_number == rustos_user_abi::console::CONSOLE_IOCTL_WAIT_GRAPH {
+        if !current_kernel_handle(fd).is_some_and(|handle| is_console_handle(&handle)) {
+            return linux_errno(LINUX_ENOTTY);
+        }
+        return match console_wait_graph(arg) {
+            Ok(value) => value,
+            Err(errno) => linux_errno(errno),
+        };
+    }
     let route = if ioctl_is_direct_display_present(request_number)
         || ioctl_is_display_policy_request(request_number)
             && ipc_ops::current_process_has_service_capability(

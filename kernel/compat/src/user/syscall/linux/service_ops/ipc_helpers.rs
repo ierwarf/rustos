@@ -995,6 +995,61 @@ pub fn console_readiness_via_sessiond_with_timeout(
     ))
 }
 
+/// Wait for the console graph to move past `known_generation`, for at most
+/// `wait_ms`, and return the generation the broker reports.
+///
+/// # Why this does not go through devmgrd
+/// Every other console ioctl is authorized by devmgrd and forwarded, which is
+/// right for operations that mutate a device. This one only waits, and devmgrd
+/// serves its clients from a single loop: a held reply there would stall every
+/// unrelated device ioctl for the whole park. Console read, write, and
+/// per-session readiness already route straight to the console broker for the
+/// same reason, and this is that same rail.
+///
+/// # What authorizes it instead
+/// The console-manager view is not session-bound, so there is no session to
+/// check ownership of. The authority is the console handle itself: the caller
+/// must already hold an open console description, which only a component the
+/// device policy admitted to the console can obtain.
+pub fn console_graph_readiness_via_sessiond(
+    known_generation: u64,
+    wait_ms: u64,
+) -> Result<u64, i64> {
+    let snapshot = multitask::current_user_snapshot().ok_or(LINUX_EINVAL)?;
+    let mut request = CommercialMaxProtocolRequest::default();
+    request.header.version = COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
+    request.header.protocol = COMMERCIAL_MAX_PROTOCOL_SESSIOND;
+    request.header.op = COMMERCIAL_MAX_SESSIOND_OP_CONSOLE_ROUTE;
+    request.header.service_id = IPC_SERVICE_SESSIOND;
+    request.header.subject_pid = snapshot.process_id();
+    request.header.subject_tid = snapshot.thread_id();
+    request.arg0 = COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_GRAPH_READINESS;
+    request.arg1 = wait_ms.min(SESSIOND_CONSOLE_GRAPH_WAIT_MAX_MS);
+    request.arg2 = known_generation;
+    let response = ipc_ops::call_service_endpoint_with_class_deadline(
+        IPC_SERVICE_SESSIOND,
+        as_bytes(&request),
+        ipc_ops::ServiceIpcClass::InteractiveControl,
+        rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS,
+    )?;
+    if response.len() != size_of::<CommercialMaxProtocolResponse>() {
+        return Err(LINUX_EINVAL);
+    }
+    let response = read_unaligned::<CommercialMaxProtocolResponse>(response.as_slice());
+    ipc_ops::validate_commercial_response_envelope(&request, &response)?;
+    if response.status != 0 {
+        return Err(response.status.unsigned_abs() as i64);
+    }
+    if response.descriptor_count != 1
+        || response.payload_len != 0
+        || response.value1 == 0
+        || response.value0 & !SESSIOND_CONSOLE_READINESS_MASK != 0
+    {
+        return Err(LINUX_EINVAL);
+    }
+    Ok(response.value1)
+}
+
 pub fn console_read_via_sessiond(
     user_ptr: u64,
     user_len: usize,

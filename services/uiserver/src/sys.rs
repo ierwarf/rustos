@@ -16,7 +16,7 @@ use rustos_user_abi::{console as console_abi, device as device_abi, syscall as s
 
 use console_abi::{
     ConsoleSendInputEventRequest, ConsoleSetFocusRequest, ConsoleSnapshotSessionOutputRequest,
-    ConsoleSnapshotSessionsRequest,
+    ConsoleSnapshotSessionsRequest, ConsoleWaitGraphRequest,
 };
 pub(crate) use console_abi::{ConsoleSessionInfo, ConsoleStateInfo};
 pub(crate) use device_abi::{
@@ -473,6 +473,7 @@ const CONSOLE_IOCTL_GET_STATE: usize = console_abi::CONSOLE_IOCTL_GET_STATE as u
 const CONSOLE_IOCTL_SNAPSHOT_SESSION_OUTPUT: usize =
     console_abi::CONSOLE_IOCTL_SNAPSHOT_SESSION_OUTPUT as usize;
 const CONSOLE_IOCTL_SET_FOCUS: usize = console_abi::CONSOLE_IOCTL_SET_FOCUS as usize;
+const CONSOLE_IOCTL_WAIT_GRAPH: usize = console_abi::CONSOLE_IOCTL_WAIT_GRAPH as usize;
 const CONSOLE_IOCTL_SEND_INPUT_EVENT: usize = console_abi::CONSOLE_IOCTL_SEND_INPUT_EVENT as usize;
 const CONSOLE_IOCTL_SNAPSHOT_SESSIONS: usize =
     console_abi::CONSOLE_IOCTL_SNAPSHOT_SESSIONS as usize;
@@ -1241,6 +1242,23 @@ pub(crate) fn console_snapshot_session_output(
     ioctl_with_mut(fd, CONSOLE_IOCTL_SNAPSHOT_SESSION_OUTPUT, &mut request)?;
     let count = usize::try_from(request.count).unwrap_or(bytes.len());
     Ok(count.min(bytes.len()))
+}
+
+/// Block until the console graph differs from `generation`, for at most
+/// `wait`. Returns the generation the broker reports; an unchanged value means
+/// the wait re-armed rather than observed a change.
+pub(crate) fn console_wait_graph(
+    fd: RawFd,
+    generation: u64,
+    wait: std::time::Duration,
+) -> Result<u64, i32> {
+    let mut request = ConsoleWaitGraphRequest {
+        generation,
+        wait_ms: u32::try_from(wait.as_millis()).unwrap_or(u32::MAX),
+        reserved: 0,
+    };
+    ioctl_with_mut(fd, CONSOLE_IOCTL_WAIT_GRAPH, &mut request)?;
+    Ok(request.generation)
 }
 
 pub(crate) fn console_set_focus(

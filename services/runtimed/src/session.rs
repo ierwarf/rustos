@@ -16,13 +16,15 @@ use rustos_user_abi::syscall::{
     CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
     CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, IpcRecvWithSenderArgs,
     WaitSetSignalBrokerArgs, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_SESSIOND,
+    COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_GRAPH_READINESS,
     COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_READ, COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_READINESS,
     COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_WRITE, COMMERCIAL_MAX_SESSIOND_OP_CONSOLE_ROUTE,
     COMMERCIAL_MAX_SESSIOND_OP_FOREGROUND_FOCUS, COMMERCIAL_MAX_SESSIOND_OP_SESSION_GRAPH,
     COMMERCIAL_MAX_SESSIOND_OP_TTY_LINE_DISCIPLINE, COMMERCIAL_MAX_SESSIOND_OP_UI_BOOTSTRAP,
-    IPC_SERVICE_DEVMGRD, IPC_SERVICE_SESSIOND, SESSIOND_CONSOLE_READINESS_LIVE,
-    SESSIOND_CONSOLE_READINESS_READY, SESSIOND_CONSOLE_READ_WAIT_MAX_MS,
-    SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_RECV_WITH_SENDER_BOUNDED, SYS_RUSTOS_IPC_REPLY,
+    IPC_SERVICE_DEVMGRD, IPC_SERVICE_SESSIOND, SESSIOND_CONSOLE_GRAPH_WAIT_MAX_MS,
+    SESSIOND_CONSOLE_READINESS_LIVE, SESSIOND_CONSOLE_READINESS_READY,
+    SESSIOND_CONSOLE_READ_WAIT_MAX_MS, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
+    SYS_RUSTOS_IPC_RECV_WITH_SENDER_BOUNDED, SYS_RUSTOS_IPC_REPLY,
     SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER, SYS_RUSTOS_WAITSET_SIGNAL_BROKER, WAITSET_ABI_VERSION,
     WAITSET_PROVIDER_SESSIOND,
 };
@@ -50,6 +52,12 @@ const OUTPUT_BUFFER_CAPACITY: usize = 4096;
 /// and simply polls the way every reader did before.
 const MAX_PARKED_CONSOLE_READS: usize = 8;
 
+/// How many console-graph waits may sit parked at once. Its observers are
+/// compositors, of which a running system has one, so this is bound-for-safety
+/// rather than a working set. Overflow answers immediately, which returns that
+/// caller to the interval poll it used before rather than failing it.
+const MAX_PARKED_CONSOLE_GRAPH_WAITS: usize = 4;
+
 /// One console `read()` held inside the broker instead of being answered
 /// "no bytes yet".
 ///
@@ -76,11 +84,30 @@ struct ConsoleReadWaiter {
     deadline: Instant,
 }
 
+/// One console-graph readiness query held until it would report something the
+/// caller has not already seen.
+///
+/// # Why this is a separate queue from parked reads
+/// A parked read is owed to one session and released by bytes arriving in it.
+/// A parked graph wait is owed to the compositor and released by anything at
+/// all moving. They share a shape, not a readiness test, and merging them
+/// would put a session handle on a waiter that is deliberately about no
+/// particular session.
+struct ConsoleGraphWaiter {
+    /// Stored with `arg1` cleared, so completion re-runs the ordinary handler
+    /// and answers immediately instead of parking a second time.
+    request: Box<CommercialMaxProtocolRequest>,
+    reply_cap: u64,
+    known_generation: u64,
+    deadline: Instant,
+}
+
 pub(crate) struct SessionRuntime {
     sessions: BTreeMap<u64, TtySessionState>,
     output_generation: u64,
     input_readiness_generation: u64,
     console_read_waiters: VecDeque<ConsoleReadWaiter>,
+    console_graph_waiters: VecDeque<ConsoleGraphWaiter>,
 }
 
 impl Default for SessionRuntime {
@@ -90,13 +117,20 @@ impl Default for SessionRuntime {
             output_generation: 0,
             input_readiness_generation: 1,
             console_read_waiters: VecDeque::new(),
+            console_graph_waiters: VecDeque::new(),
         }
     }
 }
 
 impl SessionRuntime {
     pub(crate) fn create_session(&mut self, session: u64) {
-        self.sessions.entry(session).or_default();
+        // Recreating a live session must keep its buffers, so the vacancy is
+        // tested rather than overwritten; only a genuinely new session is a
+        // change the compositor has to redraw for.
+        if let std::collections::btree_map::Entry::Vacant(entry) = self.sessions.entry(session) {
+            entry.insert(TtySessionState::default());
+            self.advance_graph_generation();
+        }
     }
 
     pub(crate) fn remove_session(&mut self, session: u64) {
@@ -107,14 +141,36 @@ impl SessionRuntime {
                 .expect("sessiond input readiness generation exhausted");
             #[cfg(not(test))]
             publish_input_readiness(session, self.input_readiness_generation);
+            self.advance_graph_generation();
         }
+    }
+
+    /// Move the console graph's change token and tell anyone waiting on it.
+    ///
+    /// # Why this is one token for the whole graph
+    /// Its observer is a compositor, and a compositor redraws from a snapshot
+    /// of every session at once: a title, a focus move, a session appearing,
+    /// and a byte of output are all the same event to it - "the picture is
+    /// stale". Splitting the token per session would only make that observer
+    /// reassemble it, and would let a change it does render slip through a
+    /// subject it was not watching.
+    ///
+    /// # Why the signal is published here rather than by the caller
+    /// Every mutation that reaches the graph goes through this method, so the
+    /// edge cannot be forgotten at a call site. That matters more than usual
+    /// here: a missed publication is silent, and it strands a waiter that has
+    /// deliberately stopped polling.
+    fn advance_graph_generation(&mut self) {
+        self.output_generation = self.output_generation.wrapping_add(1).max(1);
+        #[cfg(not(test))]
+        publish_console_graph_readiness(self.output_generation);
     }
 
     fn write_to_session(&mut self, session: u64, bytes: &[u8]) -> Option<usize> {
         let state = self.sessions.get_mut(&session)?;
         let written = state.write(bytes);
         if written != 0 {
-            self.output_generation = self.output_generation.wrapping_add(1).max(1);
+            self.advance_graph_generation();
         }
         Some(written)
     }
@@ -142,7 +198,7 @@ impl SessionRuntime {
             (changed, !was_ready && !state.input.is_empty())
         };
         if changed {
-            self.output_generation = self.output_generation.wrapping_add(1).max(1);
+            self.advance_graph_generation();
         }
         if became_ready {
             self.input_readiness_generation = self
@@ -167,6 +223,22 @@ impl SessionRuntime {
 
     fn pending_input_len(&self, session: u64) -> Option<usize> {
         self.sessions.get(&session).map(|state| state.input.len())
+    }
+
+    /// Park a console-graph wait, or refuse when the bound is already met.
+    fn park_console_graph_wait(&mut self, waiter: ConsoleGraphWaiter) -> bool {
+        if self.console_graph_waiters.len() >= MAX_PARKED_CONSOLE_GRAPH_WAITS {
+            return false;
+        }
+        self.console_graph_waiters.push_back(waiter);
+        true
+    }
+
+    pub(crate) fn earliest_console_graph_deadline(&self) -> Option<Instant> {
+        self.console_graph_waiters
+            .iter()
+            .map(|waiter| waiter.deadline)
+            .min()
     }
 
     /// Park a console read, or refuse when the bound is already met.
@@ -205,6 +277,12 @@ impl SessionRuntime {
     }
 
     fn output_generation(&self) -> u64 {
+        self.output_generation
+    }
+
+    /// The console graph's change token. Same counter as the output
+    /// generation: everything the compositor can see moves it.
+    fn graph_generation(&self) -> u64 {
         self.output_generation
     }
 
@@ -664,7 +742,27 @@ pub(super) fn service_session_endpoint(
     // A console read that succeeded, found nothing, and whose caller asked to
     // wait is held instead of answered. Everything else - refusals, failures,
     // and reads that did find bytes - is answered right here, unchanged.
-    if let Some(budget) = console_read_park_budget(&request, &response) {
+    // A graph wait whose answer would repeat what the caller already holds is
+    // held instead of answered - the compositor asked to be told when the
+    // picture changes, and "it has not" is not that answer.
+    if let Some(budget) = console_graph_wait_park_budget(&request, &response) {
+        let known_generation = request.arg2;
+        let mut parked = Box::new(request);
+        parked.arg1 = 0;
+        if state
+            .session_runtime
+            .park_console_graph_wait(ConsoleGraphWaiter {
+                request: parked,
+                reply_cap,
+                known_generation,
+                deadline: Instant::now() + budget,
+            })
+        {
+            return true;
+        }
+        // The park bound is full; fall through and answer now, which returns
+        // this caller to the interval poll it used before parking existed.
+    } else if let Some(budget) = console_read_park_budget(&request, &response) {
         let session = request.arg2;
         let mut parked = Box::new(request);
         parked.arg1 = 0;
@@ -701,6 +799,36 @@ pub(super) fn service_session_endpoint(
 /// already found bytes has something to deliver. Holding either back would add
 /// latency rather than remove it. Only the "nothing yet" answer is worth
 /// replacing with "nothing yet, so I will tell you when".
+/// How long this console-graph wait may be held, or `None` when it must be
+/// answered now.
+///
+/// # Why only an unchanged answer is parkable
+/// The caller sends the generation it already has. If the graph has moved, the
+/// reply carries news and holding it would be pure latency. If it has not, the
+/// reply says nothing the caller does not know, and holding it is the entire
+/// point.
+fn console_graph_wait_park_budget(
+    request: &CommercialMaxProtocolRequest,
+    response: &CommercialMaxProtocolResponse,
+) -> Option<Duration> {
+    if request.header.op != COMMERCIAL_MAX_SESSIOND_OP_CONSOLE_ROUTE
+        || request.arg0 != COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_GRAPH_READINESS
+    {
+        return None;
+    }
+    if response.status != 0 || response.value1 != request.arg2 {
+        return None;
+    }
+    // Zero keeps meaning "answer now", so a caller that does not know about
+    // parking never acquires a stall it did not ask for.
+    if request.arg1 == 0 {
+        return None;
+    }
+    Some(Duration::from_millis(
+        request.arg1.min(SESSIOND_CONSOLE_GRAPH_WAIT_MAX_MS),
+    ))
+}
+
 fn console_read_park_budget(
     request: &CommercialMaxProtocolRequest,
     response: &CommercialMaxProtocolResponse,
@@ -731,6 +859,63 @@ fn console_read_park_budget(
 /// reader must be released, not held: the bytes it is waiting for can never
 /// arrive. Completing it runs the ordinary handler, which answers `ENODEV` -
 /// the same error it would have received without parking.
+/// Answer every parked graph wait whose graph has moved or whose budget ran
+/// out. Returns whether any caller was answered.
+///
+/// # Why the whole queue is walked rather than one waiter
+/// A graph edge is global: if it moved for one waiter it moved for all of
+/// them. There is no per-waiter readiness to test beyond the token each one
+/// arrived holding.
+pub(super) fn service_console_graph_waiters(state: &mut BrokerState) -> bool {
+    if state.session_runtime.console_graph_waiters.is_empty() {
+        return false;
+    }
+    let parked = std::mem::take(&mut state.session_runtime.console_graph_waiters);
+    let generation = state.session_runtime.graph_generation();
+    let now = Instant::now();
+    let mut still_parked = VecDeque::new();
+    let mut answered = false;
+    for waiter in parked {
+        if generation == waiter.known_generation && now < waiter.deadline {
+            still_parked.push_back(waiter);
+            continue;
+        }
+        answer_parked_console_graph_wait(waiter, state);
+        answered = true;
+    }
+    // Push the unanswered ones back in front of anything that arrived while
+    // this ran, so a waiter cannot be starved by a busy console.
+    while let Some(waiter) = still_parked.pop_back() {
+        state
+            .session_runtime
+            .console_graph_waiters
+            .push_front(waiter);
+    }
+    answered
+}
+
+/// Re-run the ordinary handler against the stored request, which now answers
+/// immediately because its park budget was cleared when it was retained.
+fn answer_parked_console_graph_wait(waiter: ConsoleGraphWaiter, state: &mut BrokerState) {
+    let mut response = CommercialMaxProtocolResponse {
+        header: waiter.request.header,
+        ..CommercialMaxProtocolResponse::default()
+    };
+    response.header.version = COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
+    response.status = handle_session_request(&waiter.request, state, &mut response);
+    let reply = unsafe {
+        libc::syscall(
+            SYS_RUSTOS_IPC_REPLY as libc::c_long,
+            waiter.reply_cap,
+            (&response as *const CommercialMaxProtocolResponse) as u64,
+            size_of::<CommercialMaxProtocolResponse>() as u64,
+        ) as i64
+    };
+    if reply < 0 {
+        super::spawn::debug_line("runtimed: parked console graph reply failed");
+    }
+}
+
 pub(super) fn service_console_read_waiters(state: &mut BrokerState) -> bool {
     if state.session_runtime.console_read_waiters.is_empty() {
         return false;
@@ -1008,6 +1193,30 @@ fn handle_console_route_request(
             response.value1 = generation;
             0
         }
+        // The graph subject takes no session argument: its answer is about
+        // every session at once, so naming one would be a lie about what
+        // moved. `arg2` instead carries the generation the caller already
+        // holds, which is what lets this reply be withheld until it would say
+        // something new. `arg1` is the park budget, exactly as for a read.
+        COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_GRAPH_READINESS => {
+            if request.payload_len != 0 || request.arg3 != 0 {
+                return libc::EINVAL;
+            }
+            // A console graph is live whenever the broker is answering, and it
+            // is "ready" in the sense the compositor cares about whenever it
+            // has ever produced anything to draw.
+            let generation = state.session_runtime.graph_generation();
+            response.value0 = SESSIOND_CONSOLE_READINESS_LIVE
+                | if generation != 0 {
+                    SESSIOND_CONSOLE_READINESS_READY
+                } else {
+                    0
+                };
+            // Zero would read as "no generation" to the caller's envelope
+            // check, and an untouched console legitimately sits at zero.
+            response.value1 = generation.max(1);
+            0
+        }
         console_abi::CONSOLE_IOCTL_SNAPSHOT_SESSION_OUTPUT => {
             if request.payload_len as usize != size_of::<ConsoleSnapshotSessionOutputRequest>() {
                 return libc::EINVAL;
@@ -1069,11 +1278,28 @@ fn handle_console_route_request(
 }
 
 fn publish_input_readiness(session: u64, generation: u64) {
+    publish_console_readiness(session, generation, "input readiness");
+}
+
+/// Signal the console graph's edge to whoever is blocked on it.
+///
+/// Published under [`SESSIOND_CONSOLE_GRAPH_OBJECT_ID`], which is the one
+/// wait-set object on this provider that is not a session handle.
+#[cfg(not(test))]
+fn publish_console_graph_readiness(generation: u64) {
+    publish_console_readiness(
+        rustos_user_abi::syscall::SESSIOND_CONSOLE_GRAPH_OBJECT_ID,
+        generation,
+        "graph readiness",
+    );
+}
+
+fn publish_console_readiness(object_id: u64, generation: u64, subject: &str) {
     let args = WaitSetSignalBrokerArgs {
         abi_version: WAITSET_ABI_VERSION,
         provider: WAITSET_PROVIDER_SESSIOND,
         flags: 0,
-        object_id: session,
+        object_id,
         generation,
         reserved0: 0,
     };
@@ -1084,7 +1310,7 @@ fn publish_input_readiness(session: u64, generation: u64) {
         ) as i64
     };
     if status < 0 {
-        boot_line("sessiond: input readiness publication failed");
+        boot_line(&format!("sessiond: {subject} publication failed"));
     }
 }
 
@@ -1338,9 +1564,10 @@ mod tests {
     use rustos_user_abi::linux::LinuxTermios;
     use rustos_user_abi::syscall::{
         CommercialMaxProtocolRequest, CommercialMaxProtocolResponse,
+        COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_GRAPH_READINESS,
         COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_READ, COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_WRITE,
         COMMERCIAL_MAX_SESSIOND_OP_CONSOLE_ROUTE, COMMERCIAL_MAX_SESSIOND_OP_UI_BOOTSTRAP,
-        SESSIOND_CONSOLE_READ_WAIT_MAX_MS,
+        SESSIOND_CONSOLE_GRAPH_WAIT_MAX_MS, SESSIOND_CONSOLE_READ_WAIT_MAX_MS,
     };
     use std::time::{Duration, Instant};
 
@@ -1510,6 +1737,93 @@ mod tests {
             (false, false, generation + 1)
         );
         assert!(!runtime.sessions.contains_key(&session));
+    }
+
+    /// Everything the compositor draws has to move the one token it waits on,
+    /// or it parks through a change it should have redrawn for.
+    #[test]
+    fn every_compositor_visible_mutation_advances_the_console_graph() {
+        let mut runtime = SessionRuntime::default();
+        let idle = runtime.graph_generation();
+
+        runtime.create_session(3);
+        let after_create = runtime.graph_generation();
+        assert_ne!(after_create, idle, "a new session is a new window");
+
+        runtime.create_session(3);
+        assert_eq!(
+            runtime.graph_generation(),
+            after_create,
+            "recreating a live session changes nothing to draw"
+        );
+
+        assert_eq!(runtime.write_to_session(3, b"hi"), Some(2));
+        let after_write = runtime.graph_generation();
+        assert_ne!(after_write, after_create, "output is the common case");
+
+        runtime
+            .handle_input_event(3, key_event(30, b'x'))
+            .expect("an echoed key is drawn too");
+        let after_key = runtime.graph_generation();
+        assert_ne!(after_key, after_write);
+
+        runtime.remove_session(3);
+        assert_ne!(
+            runtime.graph_generation(),
+            after_key,
+            "a closed session removes a window"
+        );
+    }
+
+    /// A wait is held only while its answer would repeat what the caller
+    /// already has. Anything else must be answered at once, or the park adds
+    /// the latency it exists to remove.
+    #[test]
+    fn a_graph_wait_parks_only_while_it_would_say_nothing_new() {
+        let mut request = CommercialMaxProtocolRequest {
+            arg0: COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_GRAPH_READINESS,
+            arg1: 1_000,
+            arg2: 7,
+            ..CommercialMaxProtocolRequest::default()
+        };
+        request.header.op = COMMERCIAL_MAX_SESSIOND_OP_CONSOLE_ROUTE;
+        let unchanged = CommercialMaxProtocolResponse {
+            value1: 7,
+            ..CommercialMaxProtocolResponse::default()
+        };
+
+        let budget = super::console_graph_wait_park_budget(&request, &unchanged)
+            .expect("an unchanged graph is exactly what a wait is for");
+        assert_eq!(
+            budget,
+            std::time::Duration::from_millis(SESSIOND_CONSOLE_GRAPH_WAIT_MAX_MS),
+            "an over-long request is clamped, not refused"
+        );
+
+        let moved = CommercialMaxProtocolResponse {
+            value1: 8,
+            ..CommercialMaxProtocolResponse::default()
+        };
+        assert!(
+            super::console_graph_wait_park_budget(&request, &moved).is_none(),
+            "news must never be held"
+        );
+
+        // Zero stays the immediate answer so a caller that predates parking
+        // cannot silently acquire a stall.
+        let mut immediate = request;
+        immediate.arg1 = 0;
+        assert!(super::console_graph_wait_park_budget(&immediate, &unchanged).is_none());
+
+        let failed = CommercialMaxProtocolResponse {
+            status: libc::EINVAL,
+            value1: 7,
+            ..CommercialMaxProtocolResponse::default()
+        };
+        assert!(
+            super::console_graph_wait_park_budget(&request, &failed).is_none(),
+            "a failure carries a reason the caller needs now"
+        );
     }
 
     /// The reported console output generation is a change token, and observing

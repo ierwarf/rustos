@@ -513,11 +513,17 @@ pub(super) fn next_idle_delay(
         .unwrap_or(IDLE_POLL_INTERVAL);
     // Every reply this broker is holding owes its deadline to the wait, or the
     // broker can idle straight past a promise it made.
+    let parked_graph_delay = state
+        .session_runtime
+        .earliest_console_graph_deadline()
+        .map(|deadline| deadline.saturating_duration_since(now))
+        .unwrap_or(IDLE_POLL_INTERVAL);
     let parked_watch_delay = earliest_watch_deadline
         .map(|deadline| deadline.saturating_duration_since(now))
         .unwrap_or(IDLE_POLL_INTERVAL);
     retry_delay
         .min(parked_read_delay)
+        .min(parked_graph_delay)
         .min(parked_watch_delay)
         .min(IDLE_POLL_INTERVAL)
 }

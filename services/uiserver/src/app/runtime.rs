@@ -2,7 +2,8 @@ use std::collections::BTreeMap;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
 use std::vec::Vec;
 
@@ -15,9 +16,9 @@ use crate::render::{self, default_console_window_rect, taskbar_slot_rect};
 use crate::runtime_sync::{runtime_program_is_hidden, runtime_program_title, RuntimeState};
 use crate::sys::{
     console_get_state, console_send_input_event, console_set_focus,
-    console_snapshot_session_output, console_snapshot_sessions, open_console, spawn_ui_thread,
-    ConsoleSessionHandle, ConsoleSessionInfo, ConsoleStateInfo, InputEvent, UiThreadRole,
-    MAX_CONSOLE_SNAPSHOT_BYTES,
+    console_snapshot_session_output, console_snapshot_sessions, console_wait_graph, open_console,
+    spawn_ui_thread, ConsoleSessionHandle, ConsoleSessionInfo, ConsoleStateInfo, InputEvent,
+    UiThreadRole, MAX_CONSOLE_SNAPSHOT_BYTES,
 };
 use crate::wayland::WaylandCompositor;
 use runtime_control::RuntimeRunningProgram;
@@ -25,58 +26,12 @@ use runtime_control::RuntimeRunningProgram;
 const CONSOLE_COMMAND_QUEUE_CAPACITY: usize = 512;
 const SLOW_CONSOLE_INPUT_COMMAND_THRESHOLD: Duration = Duration::from_millis(50);
 
-/// Publishes the one readiness edge the console transport cannot deliver.
-///
-/// Console output is observable only by polling `output_generation`, so the
-/// echo of a keystroke can never arrive sooner than the poll that looks for
-/// it. On a fixed cadence that costs every typed character up to a full
-/// interval here, and then up to another one in the main loop, before a single
-/// pixel changes - a delay the user reads as a slow shell rather than as a
-/// slow poll. The keystroke, however, is known exactly: the dispatcher has
-/// just handed it to the session. Publishing that edge lets the idle wait end
-/// on the keystroke and keeps the interval as the fallback it was meant to be.
-///
-/// The generation is compared under the lock, so an edge published between two
-/// waits is observed by the next one instead of being lost.
-struct ConsoleEchoSignal {
-    generation: Mutex<u64>,
-    published: Condvar,
-}
-
-impl ConsoleEchoSignal {
-    fn new() -> Self {
-        Self {
-            generation: Mutex::new(0),
-            published: Condvar::new(),
-        }
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, u64> {
-        // A panicking peer must not silence the echo path; the counter is a
-        // plain generation and carries no invariant a panic could break.
-        self.generation
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    fn publish(&self) {
-        *self.lock() += 1;
-        self.published.notify_one();
-    }
-
-    fn wait_for_edge(&self, observed: &mut u64, timeout: Duration) {
-        let guard = self.lock();
-        if *guard != *observed {
-            *observed = *guard;
-            return;
-        }
-        let (guard, _) = self
-            .published
-            .wait_timeout(guard, timeout)
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *observed = *guard;
-    }
-}
+/// Longest the refresh worker asks the console broker to hold a graph wait
+/// while nothing changes. This is a re-arm interval, not a latency: the broker
+/// answers on the edge, so shell output reaches the screen as fast as the
+/// scheduler carries it.
+const CONSOLE_GRAPH_WAIT: Duration =
+    Duration::from_millis(rustos_user_abi::syscall::SESSIOND_CONSOLE_GRAPH_WAIT_MAX_MS);
 
 pub(crate) struct ConsoleRefresh {
     state: ConsoleStateInfo,
@@ -204,13 +159,11 @@ pub(crate) fn start_console_command_dispatcher(console_fd: OwnedFd) -> ConsoleCo
     let (sender, receiver) = mpsc::sync_channel::<ConsoleCommand>(CONSOLE_COMMAND_QUEUE_CAPACITY);
     let stats = Arc::new(ConsoleCommandStats::new());
     let worker_stats = Arc::clone(&stats);
-    let echo = Arc::clone(console_echo_signal());
     spawn_ui_thread(
         UiThreadRole::Background,
         "uiserver-console-command",
         move || {
             while let Ok(command) = receiver.recv() {
-                let delivers_input = matches!(command, ConsoleCommand::Input { .. });
                 worker_stats
                     .active_started_ms
                     .store(worker_stats.elapsed_ms(), Ordering::Release);
@@ -234,13 +187,6 @@ pub(crate) fn start_console_command_dispatcher(console_fd: OwnedFd) -> ConsoleCo
                 }
                 worker_stats.completed.fetch_add(1, Ordering::Relaxed);
                 worker_stats.active.store(false, Ordering::Release);
-                // The session now holds the keystroke, so its echo is the next
-                // thing the refresh poll can observe. Publish after the
-                // delivery, never before: an edge published ahead of it would
-                // send the poll looking for output that has not been produced.
-                if delivers_input {
-                    echo.publish();
-                }
             }
         },
     )
@@ -264,14 +210,6 @@ pub(crate) fn drain_console_refreshes(
     Ok(drained)
 }
 
-/// One process-wide edge shared by the dispatcher and the refresh worker. They
-/// are started independently and neither owns the other, so the signal outlives
-/// both rather than being threaded through the startup order.
-fn console_echo_signal() -> &'static Arc<ConsoleEchoSignal> {
-    static SIGNAL: std::sync::OnceLock<Arc<ConsoleEchoSignal>> = std::sync::OnceLock::new();
-    SIGNAL.get_or_init(|| Arc::new(ConsoleEchoSignal::new()))
-}
-
 struct ConsoleSessionOutput {
     session_handle: ConsoleSessionHandle,
     output_generation: u64,
@@ -280,7 +218,6 @@ struct ConsoleSessionOutput {
 
 pub(crate) fn start_console_refresh_worker(wake: UiWakeSender) -> Receiver<ConsoleRefresh> {
     let (sender, receiver) = mpsc::sync_channel(2);
-    let echo = Arc::clone(console_echo_signal());
     spawn_ui_thread(
         UiThreadRole::Background,
         "uiserver-console-refresh",
@@ -290,7 +227,11 @@ pub(crate) fn start_console_refresh_worker(wake: UiWakeSender) -> Receiver<Conso
             };
             let mut snapshot = [0_u8; MAX_CONSOLE_SNAPSHOT_BYTES];
             let mut output_generations = BTreeMap::<ConsoleSessionHandle, u64>::new();
-            let mut observed_echo = 0_u64;
+            // The console graph's change token, handed back on every wait so
+            // the broker can decide there is nothing to say and hold the
+            // reply. Zero means "I have seen nothing", which is answered at
+            // once.
+            let mut observed_graph = 0_u64;
             loop {
                 let mut produced_output = false;
                 if let Ok(refresh) = collect_console_refresh(
@@ -314,7 +255,18 @@ pub(crate) fn start_console_refresh_worker(wake: UiWakeSender) -> Receiver<Conso
                     // held back by an interval it did not need to wait for.
                     continue;
                 }
-                echo.wait_for_edge(&mut observed_echo, CONSOLE_POLL_SLEEP);
+                // Block on the console's own edge rather than on a timer. This
+                // used to be a fixed interval with a keystroke-delivery signal
+                // layered over it, which woke this thread *before* the shell
+                // had produced anything and then left the real output waiting
+                // out the interval. The broker now holds this call until the
+                // graph actually moves.
+                match console_wait_graph(console_fd.as_raw_fd(), observed_graph, CONSOLE_GRAPH_WAIT)
+                {
+                    Ok(generation) => observed_graph = generation,
+                    // A broker that cannot answer must not become a spin.
+                    Err(_) => thread::sleep(CONSOLE_POLL_SLEEP),
+                }
             }
         },
     )
@@ -929,53 +881,19 @@ fn console_session_title(session: &ConsoleSessionInfo) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConsoleEchoSignal, CONSOLE_POLL_SLEEP};
-    use std::time::{Duration, Instant};
+    use super::CONSOLE_GRAPH_WAIT;
+    use rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS;
+    use std::time::Duration;
 
+    /// The broker holds this wait inside a call kernel compat will abandon at
+    /// its class deadline. A re-arm interval at or above that deadline would
+    /// turn every idle wait into a timeout, and the worker would be back to
+    /// looking on a timer - with an error path for a cadence.
     #[test]
-    fn a_keystroke_published_before_the_wait_never_commits_an_interval_sleep() {
-        let signal = ConsoleEchoSignal::new();
-        let mut observed = 0_u64;
-        signal.publish();
-
-        let started = Instant::now();
-        signal.wait_for_edge(&mut observed, Duration::from_secs(30));
-
-        // The edge landed between two waits. Comparing the generation under
-        // the lock is what keeps it from being lost to the parker's state.
-        assert!(started.elapsed() < CONSOLE_POLL_SLEEP);
-        assert_eq!(observed, 1);
-    }
-
-    #[test]
-    fn an_idle_console_falls_back_to_the_poll_interval_instead_of_spinning() {
-        let signal = ConsoleEchoSignal::new();
-        let mut observed = 0_u64;
-
-        let started = Instant::now();
-        signal.wait_for_edge(&mut observed, Duration::from_millis(20));
-
-        assert!(started.elapsed() >= Duration::from_millis(15));
-        assert_eq!(observed, 0);
-    }
-
-    #[test]
-    fn consecutive_keystrokes_are_one_edge_rather_than_a_backlog_of_polls() {
-        let signal = ConsoleEchoSignal::new();
-        let mut observed = 0_u64;
-        signal.publish();
-        signal.publish();
-        signal.publish();
-
-        // Three keystrokes still owe the poll one look, not three: the
-        // generation records that something changed, never how much.
-        let started = Instant::now();
-        signal.wait_for_edge(&mut observed, Duration::from_secs(30));
-        assert!(started.elapsed() < CONSOLE_POLL_SLEEP);
-        assert_eq!(observed, 3);
-
-        let started = Instant::now();
-        signal.wait_for_edge(&mut observed, Duration::from_millis(20));
-        assert!(started.elapsed() >= Duration::from_millis(15));
+    fn the_graph_wait_re_arms_inside_the_class_deadline_that_carries_it() {
+        assert!(CONSOLE_GRAPH_WAIT < Duration::from_millis(IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS));
+        // And it has to be a real park, or the interval poll it replaced is
+        // still being paid under a new name.
+        assert!(CONSOLE_GRAPH_WAIT >= super::CONSOLE_POLL_SLEEP);
     }
 }

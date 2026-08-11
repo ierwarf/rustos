@@ -234,6 +234,11 @@ fn main() {
         // burst releases the reader parked on it within this pass rather than
         // after another idle interval.
         did_work |= session::service_console_read_waiters(&mut state);
+        // Same pass, same reason: a keystroke echo or a shell write moved the
+        // console graph inside that drain, and the compositor is parked on
+        // exactly that edge. Answering it here is what keeps shell output a
+        // scheduling delay rather than a polling interval.
+        did_work |= session::service_console_graph_waiters(&mut state);
         did_work |= spawn::reap_children(&mut state);
         // Publish the running set to anyone parked on a change before the pass
         // does anything else with it. A launch later in this pass sets

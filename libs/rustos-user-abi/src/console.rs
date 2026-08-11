@@ -195,3 +195,24 @@ pub const CONSOLE_IOCTL_BIND_CURRENT_SESSION: u64 =
     ioctl::iow::<ConsoleBindCurrentSessionRequest>(CONSOLE_IOCTL_TYPE, 8);
 pub const CONSOLE_IOCTL_SET_SESSION_STATE: u64 =
     ioctl::iow::<ConsoleSetSessionStateRequest>(CONSOLE_IOCTL_TYPE, 9);
+/// Block until the console graph differs from the generation the caller holds,
+/// or the requested wait elapses.
+///
+/// This is the console's asynchronous-notification surface for a manager: the
+/// compositor registers the token it has and is answered on the edge. It
+/// replaces a fixed-interval snapshot loop, which was the last timer between a
+/// shell writing and a pixel changing.
+pub const CONSOLE_IOCTL_WAIT_GRAPH: u64 =
+    ioctl::iowr::<ConsoleWaitGraphRequest>(CONSOLE_IOCTL_TYPE, 10);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ConsoleWaitGraphRequest {
+    /// In: the generation the caller already observed, or zero when it has
+    /// none. Out: the generation the broker reports.
+    pub generation: u64,
+    /// In: the longest the caller is willing to be held, in milliseconds. The
+    /// broker clamps it; zero asks for an immediate answer.
+    pub wait_ms: u32,
+    pub reserved: u32,
+}
