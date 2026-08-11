@@ -78,7 +78,6 @@ pub(crate) const UI_SERVER_EXEC_PATH: &str = "services/uiserver/uiserver.elf";
 pub(crate) const UI_SERVER_BOOTSTRAP_ENV: [&str; 2] =
     ["RUSTOS_UI_PROFILE=0", "RUSTOS_UI_BOOT_TRACE=0"];
 pub(crate) static LOADER_ENDPOINT_CACHE: AtomicU64 = AtomicU64::new(0);
-pub(crate) static SESSION_GRAPH_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub(crate) struct LaunchEntry {

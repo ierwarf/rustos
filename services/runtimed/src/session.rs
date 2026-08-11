@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::mem::size_of;
-use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use keyboard_core::KeyCode;
@@ -30,9 +29,8 @@ use rustos_user_abi::syscall::{
 
 use super::{
     boot_line, CONSOLE_SESSION_STATE_RUNNING, LINUX_FIONREAD, LINUX_TCGETS, LINUX_TCSETS,
-    LINUX_TCSETSF, LINUX_TCSETSW, SESSION_GRAPH_GENERATION, UI_SERVER_BOOTSTRAP_ENV,
-    UI_SERVER_DESKTOP_FILE_ID, UI_SERVER_DISPLAY_NAME, UI_SERVER_EXEC_PATH,
-    UI_SERVER_TASK_WEIGHT_MICROS,
+    LINUX_TCSETSF, LINUX_TCSETSW, UI_SERVER_BOOTSTRAP_ENV, UI_SERVER_DESKTOP_FILE_ID,
+    UI_SERVER_DISPLAY_NAME, UI_SERVER_EXEC_PATH, UI_SERVER_TASK_WEIGHT_MICROS,
 };
 use super::{BrokerState, LaunchEntry};
 
@@ -1131,10 +1129,15 @@ fn handle_session_graph_request(
             }
 
             let focused = focused_session_handle(state);
-            let generation = state
-                .session_runtime
-                .output_generation()
-                .max(SESSION_GRAPH_GENERATION.fetch_add(1, Ordering::Relaxed));
+            // The reported generation is a change token, so observing it must
+            // not change it. It used to be raised to a counter incremented by
+            // this very handler, which made every snapshot report a value the
+            // caller had never seen: uiserver's refresh worker concluded that
+            // every session had new output on every pass, re-fetched all of it,
+            // woke the render loop, and skipped its idle wait entirely. Two
+            // threads then spun, flooding this endpoint - the same one carrying
+            // the shell's keystrokes and console reads.
+            let generation = state.session_runtime.output_generation();
             let mut written = 0usize;
             for program in state.running.values() {
                 if program.session_handle == 0 || written >= capacity {
@@ -1319,12 +1322,18 @@ fn merge_manifest_env_into(env: &mut Vec<String>, manifest_env: &[String]) {
 
 #[cfg(test)]
 mod tests {
+    use std::mem::size_of;
+
     use super::{
         console_read_park_budget, session_ingress_identity_authorized,
         ui_bootstrap_may_retry_immediately, ConsoleReadWaiter, SessionRuntime,
         MAX_PARKED_CONSOLE_READS,
     };
+    use crate::{BrokerState, RunningProcess};
     use keyboard_core::KeyCode;
+    use rustos_user_abi::console::{
+        self as console_abi, ConsoleSessionInfo, ConsoleSnapshotSessionsRequest,
+    };
     use rustos_user_abi::device::{InputEvent, INPUT_ACTION_PRESSED, INPUT_KIND_KEYBOARD};
     use rustos_user_abi::linux::LinuxTermios;
     use rustos_user_abi::syscall::{
@@ -1501,5 +1510,77 @@ mod tests {
             (false, false, generation + 1)
         );
         assert!(!runtime.sessions.contains_key(&session));
+    }
+
+    /// The reported console output generation is a change token, and observing
+    /// a change token must not change it.
+    ///
+    /// This handler once raised the reported value to a counter it incremented
+    /// itself, so two snapshots taken with nothing in between disagreed. The
+    /// only consumer treats a disagreement as "this session produced output",
+    /// which meant it re-fetched every session's output on every pass, woke the
+    /// render loop each time, and never reached its idle wait - a spin whose
+    /// traffic lands on the same endpoint that carries shell keystrokes.
+    #[test]
+    fn snapshotting_the_console_never_advances_the_generation_it_reports() {
+        let mut state = BrokerState::default();
+        state.running.insert(
+            41,
+            RunningProcess {
+                pid: 41,
+                package_id: String::from("shell"),
+                desktop_file_id: String::from("shell.desktop"),
+                display_name: String::from("Shell"),
+                exec: String::from("apps/shell/shell.elf"),
+                session_handle: 7,
+                restart: false,
+                logical_admin: false,
+            },
+        );
+        state.session_runtime.create_session(7);
+
+        let idle = snapshot_generation(&mut state);
+        assert_eq!(
+            snapshot_generation(&mut state),
+            idle,
+            "an idle console must look idle twice in a row"
+        );
+
+        assert_eq!(state.session_runtime.write_to_session(7, b"$ "), Some(2));
+        let after_output = snapshot_generation(&mut state);
+        assert_ne!(
+            after_output, idle,
+            "real output is the one thing that must move the token"
+        );
+        assert_eq!(snapshot_generation(&mut state), after_output);
+    }
+
+    /// Drive the real session-graph handler and return the output generation it
+    /// reports for the first session.
+    fn snapshot_generation(state: &mut BrokerState) -> u64 {
+        let mut request = CommercialMaxProtocolRequest {
+            arg0: console_abi::CONSOLE_IOCTL_SNAPSHOT_SESSIONS,
+            ..CommercialMaxProtocolRequest::default()
+        };
+        let snapshot = ConsoleSnapshotSessionsRequest {
+            capacity: 4,
+            count: 0,
+            sessions_ptr: 0,
+        };
+        let header = crate::util::as_bytes(&snapshot);
+        request.payload[..header.len()].copy_from_slice(header);
+        request.payload_len = header.len() as u32;
+
+        let mut response = CommercialMaxProtocolResponse::default();
+        assert_eq!(
+            super::handle_session_graph_request(&request, state, &mut response),
+            0
+        );
+        let header_len = size_of::<ConsoleSnapshotSessionsRequest>();
+        let reported =
+            crate::util::read_unaligned::<ConsoleSnapshotSessionsRequest>(&response.payload);
+        assert_eq!(reported.count, 1, "one session with a handle is reported");
+        crate::util::read_unaligned::<ConsoleSessionInfo>(&response.payload[header_len..])
+            .output_generation
     }
 }

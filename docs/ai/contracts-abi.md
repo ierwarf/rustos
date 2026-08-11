@@ -705,6 +705,15 @@ policy remains with the owning service.
   and the number of parked connections is capped by `MAX_RUNTIME_WATCHERS`.
   Past that cap the server answers immediately, which degrades a watcher to the
   poller it replaced instead of pinning descriptors.
+- A change token must not change when it is observed. Reporting one is a read:
+  a handler that advances the value it reports tells every caller that
+  everything changed, every time, and a caller that reacts to change then
+  reacts continuously. `CONSOLE_IOCTL_SNAPSHOT_SESSIONS` violated this by
+  raising its reported `output_generation` to a counter the handler itself
+  incremented, which put uiserver's console-refresh worker and the render loop
+  into a permanent spin against the endpoint carrying shell keystrokes. Bump a
+  token where the state changes - `write_to_session`, an accepted key event -
+  and nowhere else.
 - A change edge must be derived from the bytes the reply would carry, not from a
   counter bumped at each mutation site. A counter has to be incremented
   everywhere the watched state is touched, and forgetting one site fails

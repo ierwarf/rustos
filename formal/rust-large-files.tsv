@@ -20,7 +20,7 @@ libs/rustos-user-abi/src/syscall.rs	3189	user-abi	Split kernel mechanism ABI fro
 services/initd/src/main.rs	1333	initd	Split loader wire calls, rootd lease reconciliation, and child supervision into typed modules.
 services/inputd/src/main.rs	1816	inputd	Split ingress admission, queue/readiness, service RPC, and runtime.
 services/netd/src/main.rs	3444	netd	Split device ingress, socket state, routing policy, service RPC, AF_UNIX segmented ancillary transport, and tests.
-services/runtimed/src/session.rs	1505	runtimed-session	Split TTY line discipline, console-route RPCs, parked-read completion, and tests.
+services/runtimed/src/session.rs	1587	runtimed-session	Split TTY line discipline, console-route RPCs, parked-read completion, and tests.
 services/rootd/src/main.rs	2974	rootd	Split bootstrap graph, authority leases, restart policy, and checkpoints.
 services/syscalld/src/linux_policy.rs	1532	syscalld	Split process, memory, entropy, credential, and advisory policies.
 services/uiserver/src/main.rs	1402	uiserver	Split the protocol, scene, and GPU submission owners per V5-GPU-UI-OWNER-014; the main loop is the shared owner that split removes.

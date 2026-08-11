@@ -438,6 +438,21 @@ if ! grep -Fq 'earliest_console_read_deadline()' <<<"$runtimed_delay_body" \
     echo 'the runtimed idle budget must include every reply deadline it is holding' >&2
     exit 1
 fi
+# A change token that changes when it is read tells every caller that everything
+# changed, every time. The console snapshot once raised its reported generation
+# to a counter the handler itself incremented, so uiserver's refresh worker
+# re-fetched every session's output on every pass, woke the render loop each
+# time, and never reached its idle wait - a spin whose traffic lands on the same
+# endpoint carrying shell keystrokes.
+session_graph_body="$(
+    sed -n '/^fn handle_session_graph_request(/,/^fn /p' services/runtimed/src/session.rs
+)"
+if ! grep -Fq 'let generation = state.session_runtime.output_generation();' \
+    <<<"$session_graph_body" \
+    || grep -Eq 'fetch_add|SESSION_GRAPH_GENERATION' <<<"$session_graph_body"; then
+    echo 'reporting the console generation must not advance it; observing a change token may not be a change' >&2
+    exit 1
+fi
 # The runtimed control socket is deliberately non-blocking so a dead peer cannot
 # hang connect. That makes a short read/write spin unless it waits on the
 # descriptor: uiserver and sessiond issue these RPCs on their own hot paths, and
