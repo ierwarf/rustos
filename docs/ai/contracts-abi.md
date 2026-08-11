@@ -705,6 +705,18 @@ policy remains with the owning service.
   and the number of parked connections is capped by `MAX_RUNTIME_WATCHERS`.
   Past that cap the server answers immediately, which degrades a watcher to the
   poller it replaced instead of pinning descriptors.
+- devmgrd's ioctl **routing** answer is memoized in compat; its **authorization**
+  answer never is. `ioctl_route(request_number)` is a pure total function of the
+  request number - no fd, pid, credentials, or session reach the decision - so
+  asking per call spends a broker round trip deriving a constant.
+  `DEVMGRD_IPC_OP_IOCTL_AUTHORIZE` is the opposite: it reads the caller, and the
+  forwarded path pays it on every call. The memo is keyed by devmgrd's service
+  registration epoch, because the routing table is compiled into that service
+  and a restart may be a different binary. Measured at 8 vCPU, the uncached
+  query was half of roughly ten broker round trips per keystroke, and those
+  round trips were 98% of a 36 ms median key-to-pixel latency - time invisible
+  to every phase uiserver times, because it is spent waiting for the echo rather
+  than doing work.
 - A console has two observers with opposite interests, and each needs its own
   readiness subject. A shell waits to *read its own session*; a compositor waits
   for *anything it draws* to change. Only the first existed, so the second ran a

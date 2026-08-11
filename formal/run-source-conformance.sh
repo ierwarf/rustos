@@ -438,6 +438,29 @@ if ! grep -Fq 'earliest_console_read_deadline()' <<<"$runtimed_delay_body" \
     echo 'the runtimed idle budget must include every reply deadline it is holding' >&2
     exit 1
 fi
+# devmgrd answers the ioctl routing question with a pure function of the request
+# number - no fd, pid, credentials, or session reach it - so re-asking per call
+# spends a broker round trip deriving a constant. It must be memoized, and the
+# memo must be keyed by devmgrd's registration epoch, because the table is
+# compiled into that service. Authorization is the opposite and must never join
+# it: it reads the caller, and the forwarded path pays it every call.
+route_memo_body="$(
+    sed -n '/^pub fn ioctl_route_via_devmgrd(/,/^}/p' \
+        kernel/compat/src/user/syscall/linux/service_ops/ipc_helpers.rs
+)"
+if ! grep -Fq 'memoized_ioctl_route(request_number, epoch)' <<<"$route_memo_body" \
+    || ! grep -Fq 'ipc_ops::service_endpoint_epoch(linux_abi::IPC_SERVICE_DEVMGRD)' \
+        <<<"$route_memo_body"; then
+    echo 'the devmgrd ioctl route must be memoized against its registration epoch, not re-asked per call' >&2
+    exit 1
+fi
+if rg -Fq 'memoized_ioctl_route' \
+    <<<"$(sed -n '/^pub fn ioctl_device_via_devmgrd(/,/^}/p' \
+        kernel/compat/src/user/syscall/linux/service_ops/ipc_helpers.rs)"; then
+    echo 'ioctl authorization reads the caller and must never be served from the routing memo' >&2
+    exit 1
+fi
+
 # The console has two observers with opposite interests: a shell waiting to read
 # its own session, and a compositor waiting for anything it draws to change.
 # Only the first had a readiness subject, so the second ran a timer. Every

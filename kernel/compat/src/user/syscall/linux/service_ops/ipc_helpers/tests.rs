@@ -244,3 +244,51 @@ fn procd_response_envelope_rejects_cross_op_and_oversized_payload() {
         Err(LINUX_EINVAL)
     );
 }
+
+/// A memoized routing answer must be discarded the moment a different devmgrd
+/// could be the one answering. The table is compiled into that service, so an
+/// entry recorded under a superseded registration is a guess about a binary
+/// that is no longer running.
+#[test]
+fn a_memoized_ioctl_route_never_outlives_the_registration_that_produced_it() {
+    use super::{IOCTL_ROUTE_MEMO_CAPACITY, memoized_ioctl_route, record_ioctl_route};
+    use rustos_user_abi::syscall::{
+        DEVMGRD_IOCTL_ROUTE_DEVMGRD, DEVMGRD_IOCTL_ROUTE_DIRECT, DEVMGRD_IOCTL_ROUTE_SESSIOND_TTY,
+    };
+
+    let epoch = 7;
+    let request = 0x4321_u64;
+    assert_eq!(memoized_ioctl_route(request, epoch), None);
+
+    record_ioctl_route(request, epoch, DEVMGRD_IOCTL_ROUTE_SESSIOND_TTY);
+    assert_eq!(
+        memoized_ioctl_route(request, epoch),
+        Some(DEVMGRD_IOCTL_ROUTE_SESSIOND_TTY),
+        "a repeat of the same question is answered without asking again"
+    );
+
+    // A newer registration invalidates every entry, not just the one asked for.
+    assert_eq!(memoized_ioctl_route(request, epoch + 1), None);
+    record_ioctl_route(request, epoch + 1, DEVMGRD_IOCTL_ROUTE_DEVMGRD);
+    assert_eq!(
+        memoized_ioctl_route(request, epoch + 1),
+        Some(DEVMGRD_IOCTL_ROUTE_DEVMGRD),
+        "the new registration's answer replaces the old one"
+    );
+    assert_eq!(
+        memoized_ioctl_route(request, epoch),
+        None,
+        "and the superseded epoch can never read its own entry back"
+    );
+
+    // Past capacity the memo stops growing rather than evicting, so a caller
+    // simply pays the query it paid before.
+    for number in 0..IOCTL_ROUTE_MEMO_CAPACITY as u64 + 8 {
+        record_ioctl_route(0x9000 + number, epoch + 1, DEVMGRD_IOCTL_ROUTE_DIRECT);
+    }
+    assert_eq!(
+        memoized_ioctl_route(request, epoch + 1),
+        Some(DEVMGRD_IOCTL_ROUTE_DEVMGRD),
+        "overflow must not evict or corrupt what is already recorded"
+    );
+}

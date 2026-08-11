@@ -2,7 +2,7 @@
 kernel/compat/src/user/process/linux.rs	1767	compat-process	Split ELF state, signal frame, and Linux task lifecycle.
 kernel/compat/src/user/syscall/linux/ipc_ops.rs	3410	compat-ipc	Split endpoint calls, shared regions, handle transfer, and tests.
 kernel/compat/src/user/syscall/linux/proc_broker_ops.rs	1920	compat-process-broker	Split spawn, exec, wait, signal, and retirement broker clients.
-kernel/compat/src/user/syscall/linux/service_ops/ipc_helpers.rs	1933	compat-service-ipc	Split typed calls, response admission, retry policy, and tests.
+kernel/compat/src/user/syscall/linux/service_ops/ipc_helpers.rs	2023	compat-service-ipc	Split typed calls, response admission, retry policy, and tests.
 kernel/compat/src/user/syscall/linux/service_ops/vfs_meta.rs	1810	compat-vfs	Split metadata RPCs, message-vector copyout, and AF_UNIX transfer control transactions.
 kernel/compat/src/user/syscall/linux/service_ops/vfs_socket.rs	1600	compat-vfs	Split file-descriptor transport, socket transport, and response admission.
 kernel/io-manager/src/input/dvm_ring.rs	1606	io-input	Split aperture admission, atomic header snapshots, worker lifecycle, broker operations, and tests.

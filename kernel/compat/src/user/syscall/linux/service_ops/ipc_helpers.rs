@@ -1530,7 +1530,89 @@ pub fn ioctl_device_via_devmgrd(fd: u64, request_number: u64, arg: u64) -> Resul
     Ok(response.value)
 }
 
+/// Memo of devmgrd's ioctl routing answers.
+///
+/// # Why a routing question is worth memoizing and an authorization is not
+/// devmgrd answers `DEVMGRD_IPC_OP_IOCTL_ROUTE` with `ioctl_route(request)`, a
+/// pure total function of the request number: no fd, no pid, no credentials,
+/// no session reach the decision. It is a static classification table that
+/// happens to live in another address space. Authorization is the opposite -
+/// `DEVMGRD_IPC_OP_IOCTL_AUTHORIZE` reads the caller - and is deliberately not
+/// cached here; the forwarded path still pays it on every call.
+///
+/// # Why it mattered
+/// Uncached, every console ioctl cost a devmgrd round trip to re-derive a
+/// constant, on top of the round trip that did the work. A single keystroke
+/// drives four of them - deliver the key, then read state, sessions, and each
+/// session's output - so half of roughly ten broker round trips per keystroke
+/// were spent asking a question whose inputs never change. Measured at 8 vCPU
+/// that path carried a median 36 ms from key to pixel with 98% of it outside
+/// every phase uiserver times.
+///
+/// # Why the epoch is part of the key
+/// The table is compiled into devmgrd, so a different devmgrd may answer
+/// differently. Registration advances the service epoch, and an entry recorded
+/// under a superseded epoch is discarded rather than trusted.
+struct IoctlRouteMemo {
+    epoch: u64,
+    len: usize,
+    entries: [(u64, u64); IOCTL_ROUTE_MEMO_CAPACITY],
+}
+
+/// Distinct ioctl numbers worth remembering. The hot set is the console and
+/// display surface; past this the memo simply stops growing and those callers
+/// pay the query they paid before.
+const IOCTL_ROUTE_MEMO_CAPACITY: usize = 32;
+
+static IOCTL_ROUTE_MEMO: TrackedSpinLock<
+    IoctlRouteMemo,
+    { LockClass::DeviceIoctlRouteMemo as u8 },
+> = TrackedSpinLock::new(IoctlRouteMemo {
+    epoch: 0,
+    len: 0,
+    entries: [(0, 0); IOCTL_ROUTE_MEMO_CAPACITY],
+});
+
+fn memoized_ioctl_route(request_number: u64, epoch: u64) -> Option<u64> {
+    let memo = IOCTL_ROUTE_MEMO.lock();
+    if memo.epoch != epoch {
+        return None;
+    }
+    memo.entries[..memo.len]
+        .iter()
+        .find(|(number, _)| *number == request_number)
+        .map(|(_, route)| *route)
+}
+
+fn record_ioctl_route(request_number: u64, epoch: u64, route: u64) {
+    let mut memo = IOCTL_ROUTE_MEMO.lock();
+    if memo.epoch != epoch {
+        memo.epoch = epoch;
+        memo.len = 0;
+    }
+    if memo.entries[..memo.len]
+        .iter()
+        .any(|(number, _)| *number == request_number)
+    {
+        return;
+    }
+    if memo.len == IOCTL_ROUTE_MEMO_CAPACITY {
+        return;
+    }
+    let index = memo.len;
+    memo.entries[index] = (request_number, route);
+    memo.len = index + 1;
+}
+
 pub fn ioctl_route_via_devmgrd(fd: u64, request_number: u64) -> Result<u64, i64> {
+    // Zero means devmgrd has never published, and an unpublished service has
+    // given no answer worth remembering.
+    let epoch = ipc_ops::service_endpoint_epoch(linux_abi::IPC_SERVICE_DEVMGRD).unwrap_or(0);
+    if epoch != 0 {
+        if let Some(route) = memoized_ioctl_route(request_number, epoch) {
+            return Ok(route);
+        }
+    }
     let mut request = DevmgrdDeviceIoctlRequest {
         version: rustos_user_abi::syscall::DEVMGRD_IPC_ABI_VERSION,
         op: rustos_user_abi::syscall::DEVMGRD_IPC_OP_IOCTL_ROUTE,
@@ -1584,7 +1666,15 @@ pub fn ioctl_route_via_devmgrd(fd: u64, request_number: u64) -> Result<u64, i64>
         rustos_user_abi::syscall::DEVMGRD_IOCTL_ROUTE_DIRECT
         | rustos_user_abi::syscall::DEVMGRD_IOCTL_ROUTE_DEVMGRD
         | rustos_user_abi::syscall::DEVMGRD_IOCTL_ROUTE_SESSIOND_TTY
-        | rustos_user_abi::syscall::DEVMGRD_IOCTL_ROUTE_SESSIOND_COMMIT => Ok(response.value),
+        | rustos_user_abi::syscall::DEVMGRD_IOCTL_ROUTE_SESSIOND_COMMIT => {
+            // Recorded only after the answer has passed every envelope and
+            // range check above, so the memo can never hold a value the
+            // uncached path would have rejected.
+            if epoch != 0 {
+                record_ioctl_route(request_number, epoch, response.value);
+            }
+            Ok(response.value)
+        }
         _ => Err(LINUX_EINVAL),
     }
 }
