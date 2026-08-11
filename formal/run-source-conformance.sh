@@ -959,6 +959,17 @@ if ! grep -Fq 'scheduler_mut().complete_ipc_reply_wake_handoff(reply, task_id)' 
 fi
 
 checks=0
+# The registry is read first and executed second. One `cargo test` per witness
+# spent almost all of its time re-entering Cargo for a test binary it had
+# already built, and the same test can witness several models, so it was also
+# rebuilt and rerun once per model it appears under. Collecting the witnesses
+# per Cargo selection turns 575 invocations into one per package/feature pair
+# without weakening the claim: `--exact` still admits only a full-path match,
+# every registered witness must still print its own passing line, and the
+# executed count must still equal the exact set that was asked for.
+declare -A group_tests=()
+declare -A group_rows=()
+declare -a group_order=()
 while IFS='|' read -r model package test_name features; do
     [[ -n "$model" ]] || continue
     if [[ -z "$package" || -z "$test_name" ]]; then
@@ -973,25 +984,16 @@ while IFS='|' read -r model package test_name features; do
     printf '%s\n' "$witness_key" >> "$seen"
     awk -F '\t' -v wanted="$model" '$1 == wanted { found++ } END { exit(found == 1 ? 0 : 1) }' \
         formal/models.tsv || { echo "source conformance model is not registered: $model" >&2; exit 1; }
-    cargo_args=(test -q -p "$package")
-    if [[ -n "$features" ]]; then
-        cargo_args+=(--features "$features")
+    group="$package|$features"
+    if [[ -z "${group_rows[$group]+set}" ]]; then
+        group_order+=("$group")
+        group_tests["$group"]=$'\n'
+        group_rows["$group"]=""
     fi
-    cargo_args+=("$test_name" -- --exact)
-    output="$(cargo "${cargo_args[@]}" 2>&1)" || {
-        printf '%s\n' "$output" >&2
-        echo "source conformance test failed: $model -> $test_name" >&2
-        exit 1
-    }
-    if ! grep -Eq 'test result: ok\. 1 passed; 0 failed' <<< "$output"; then
-        printf '%s\n' "$output" >&2
-        echo "source conformance test did not execute exactly one witness: $test_name" >&2
-        exit 1
+    if [[ "${group_tests[$group]}" != *$'\n'"$test_name"$'\n'* ]]; then
+        group_tests["$group"]+="$test_name"$'\n'
     fi
-    jq -cn --arg model "$model" --arg package "$package" --arg test "$test_name" \
-        --arg features "$features" \
-        '{model:$model,package:$package,test:$test,features:$features,status:"passed"}' >> "$records"
-    checks=$((checks + 1))
+    group_rows["$group"]+="$witness_key"$'\n'
 done <<'EOF'
 process-address-space-lifetime/ProcessAddressSpaceLifetime|kernel-ps|multitask::process_table::tests::process_address_space_and_exec_exit_are_serialized
 authority-identity-lifecycle/AuthorityIdentityLifecycle|kernel-ps|user::handles::transfer_registry::transfer_registry_tests::authority_identity_exhaustion_fails_closed_before_wrap
@@ -1568,6 +1570,53 @@ cpu-online-lifecycle/CpuOnlineLifecycle|nucleus-core|ap_trampoline::tests::reset
 cpu-online-lifecycle/CpuOnlineLifecycle|kernel-executive|boot::tests::ap_cache_attributes_are_verified_before_private_ready_publication
 cpu-online-lifecycle/CpuOnlineLifecycle|kernel-executive|boot::tests::local_apic_uses_one_permanent_uncached_direct_map_alias
 EOF
+
+for group in "${group_order[@]}"; do
+    package="${group%%|*}"
+    features="${group#*|}"
+    mapfile -t names < <(printf '%s' "${group_tests[$group]}" | sed '/^$/d')
+    cargo_args=(test -p "$package")
+    if [[ -n "$features" ]]; then
+        cargo_args+=(--features "$features")
+    fi
+    # `-q` would collapse libtest to progress dots, and the per-witness pass
+    # line is the evidence that each registered name really ran.
+    cargo_args+=(-- --exact "${names[@]}")
+    output="$(cargo "${cargo_args[@]}" 2>&1)" || {
+        printf '%s\n' "$output" >&2
+        echo "source conformance witnesses failed for $package${features:+ [$features]}" >&2
+        exit 1
+    }
+    for name in "${names[@]}"; do
+        # libtest decorates a `#[should_panic]` witness, and a registered test
+        # name is compared whole so one witness cannot be satisfied by another
+        # whose name merely extends it.
+        if ! awk -v plain="test $name ... ok" \
+            -v panics="test $name - should panic ... ok" \
+            '$0 == plain || $0 == panics { found = 1 } END { exit(found ? 0 : 1) }' \
+            <<<"$output"; then
+            printf '%s\n' "$output" >&2
+            echo "source conformance witness did not execute and pass: $package -> $name" >&2
+            exit 1
+        fi
+    done
+    executed="$(
+        sed -n 's/^test result: ok\. \([0-9][0-9]*\) passed; 0 failed.*$/\1/p' <<<"$output" \
+            | awk '{ total += $1 } END { print total + 0 }'
+    )"
+    if [[ "$executed" -ne "${#names[@]}" ]]; then
+        printf '%s\n' "$output" >&2
+        echo "source conformance executed $executed witnesses for $package, expected ${#names[@]}" >&2
+        exit 1
+    fi
+    while IFS='|' read -r model row_package row_test row_features; do
+        [[ -n "$model" ]] || continue
+        jq -cn --arg model "$model" --arg package "$row_package" --arg test "$row_test" \
+            --arg features "$row_features" \
+            '{model:$model,package:$package,test:$test,features:$features,status:"passed"}' >> "$records"
+        checks=$((checks + 1))
+    done <<<"${group_rows[$group]}"
+done
 
 jq -s --arg schema rustos-formal-source-conformance-v1 \
     '{schema:$schema,status:"passed",checks:length,models:(map(.model)|unique|length),results:.}' \

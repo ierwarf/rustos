@@ -187,6 +187,11 @@ mod tests {
     }
 
     #[test]
+    fn interactive_multicore_run_seals_formal_evidence_before_claiming_resources() {
+        smp_ring3_qualification::interactive_multicore_run_seals_formal_evidence_before_claiming_resources();
+    }
+
+    #[test]
     fn smp_iteration_is_bounded_and_cannot_claim_acceptance() {
         smp_ring3_qualification::smp_iteration_is_bounded_and_cannot_claim_acceptance();
     }

@@ -47,6 +47,50 @@ pub(crate) fn validate_smp_launch_evidence(
     Ok(ValidatedSmpLaunchEvidence { _private: () })
 }
 
+/// The verification command that seals one profile against the current tree.
+fn verification_command(profile_name: &str) -> Result<Vec<&'static str>> {
+    match profile_name {
+        "smp-iteration" => Ok(vec!["bash", "formal/verify-smp-iteration.sh"]),
+        "pr" => Ok(vec!["bash", "formal/verify-all.sh", "--profile", "pr"]),
+        other => bail!("formal profile {other} has no registered verification command"),
+    }
+}
+
+/// Seal the profile for this tree before refusing to launch.
+///
+/// The gate exists so a multicore boot cannot run ahead of the models that
+/// admit its topology - not to punish a developer for forgetting a command.
+/// When the seal is merely absent, expired, or bound to an older tree, the old
+/// failure said "rerun its verification command"; running that exact command
+/// and re-checking is strictly the same gate, because admission still comes
+/// only from the second validation over the freshly written evidence. A
+/// verification that fails, or that leaves the profile unsealed, still refuses
+/// the launch.
+pub(crate) fn ensure_smp_launch_evidence(root: &Path, profile_name: &str) -> Result<()> {
+    let stale = match validate_smp_launch_evidence(root, profile_name) {
+        Ok(_) => return Ok(()),
+        Err(error) => error,
+    };
+    let command = verification_command(profile_name)?;
+    let printable = command.join(" ");
+    println!(
+        "xtask: formal profile {profile_name} is not sealed for this tree ({stale:#}); running `{printable}`"
+    );
+    let status = Command::new(command[0])
+        .args(&command[1..])
+        .current_dir(root)
+        .status()
+        .with_context(|| format!("run formal verification `{printable}`"))?;
+    if !status.success() {
+        bail!("formal verification `{printable}` failed; refusing the KVM launch");
+    }
+    validate_smp_launch_evidence(root, profile_name).with_context(|| {
+        format!("formal profile {profile_name} is still unsealed after `{printable}`")
+    })?;
+    println!("xtask: formal profile {profile_name} sealed by `{printable}`");
+    Ok(())
+}
+
 #[cfg(test)]
 pub(crate) fn validated_smp_launch_evidence_for_tests() -> ValidatedSmpLaunchEvidence {
     ValidatedSmpLaunchEvidence { _private: () }

@@ -4,6 +4,7 @@ set -euo pipefail
 
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
+gate_started="$SECONDS"
 profile="pr"
 if [[ "${1:-}" == "--profile" ]]; then
     profile="${2:-}"
@@ -38,9 +39,27 @@ mkdir -p "$lane_dir"
 run_parallel_lane() {
     local name="$1"
     shift
-    "$@" >"$lane_dir/$name.log" 2>&1 &
+    # Each lane records its own wall time, because the gate's cost is one
+    # lane's cost: everything else finishes inside the slowest one, and
+    # without this the only way to find that lane is to compare log mtimes.
+    rm -f "$lane_dir/$name.seconds"
+    (
+        lane_started="$SECONDS"
+        # `|| lane_status=$?` exempts the lane from the inherited `set -e`.
+        # Without it the subshell dies on a failing lane before recording
+        # anything, and a failure is exactly when its cost is worth knowing.
+        lane_status=0
+        "$@" >"$lane_dir/$name.log" 2>&1 || lane_status=$?
+        printf '%s\n' "$((SECONDS - lane_started))" >"$lane_dir/$name.seconds"
+        exit "$lane_status"
+    ) &
     lane_names+=("$name")
     lane_pids+=("$!")
+}
+
+lane_seconds() {
+    local file="$lane_dir/$1.seconds"
+    [[ -s "$file" ]] && cat "$file" || printf 'unknown'
 }
 
 wait_parallel_lanes() {
@@ -49,8 +68,11 @@ wait_parallel_lanes() {
     for index in "${!lane_pids[@]}"; do
         if wait "${lane_pids[$index]}"; then
             cat "$lane_dir/${lane_names[$index]}.log"
+            printf 'formal lane passed: %s elapsed_seconds=%s\n' \
+                "${lane_names[$index]}" "$(lane_seconds "${lane_names[$index]}")"
         else
-            printf 'formal lane failed: %s\n' "${lane_names[$index]}" >&2
+            printf 'formal lane failed: %s elapsed_seconds=%s\n' \
+                "${lane_names[$index]}" "$(lane_seconds "${lane_names[$index]}")" >&2
             tail -n 80 "$lane_dir/${lane_names[$index]}.log" >&2
             failed=1
         fi
@@ -60,6 +82,18 @@ wait_parallel_lanes() {
 
 bash formal/selftest.sh
 bash formal/run-proof-index.sh
+# The exhaustive TLC set is the only lane whose contract is a wall clock.
+# `tlc_max_wall_seconds` and each model's pinned per-model timeout are budgets
+# measured in real seconds, so they mean what they say only when the lane is
+# not competing with ten siblings for the same cores: a model that explores its
+# state space in 16 seconds against a 30-second timeout starts failing on load
+# instead of on logic. It runs first, with the machine to itself. When its
+# evidence is reusable that costs a few seconds, and when a model genuinely has
+# to run, it runs under the conditions its budget was pinned for. It also
+# leaves the exact baselines the mutation lane below reuses.
+tlc_started="$SECONDS"
+FORMAL_SELFTEST_ALREADY_PASSED=1 bash formal/run-all-tlc.sh --profile "$profile"
+printf 'formal lane passed: tlc elapsed_seconds=%s\n' "$((SECONDS - tlc_started))"
 declare -a lane_names=()
 declare -a lane_pids=()
 # These gates have disjoint evidence directories and no logical dependency on
@@ -67,8 +101,6 @@ declare -a lane_pids=()
 # while bounding wall time; each lane remains fail-closed and its output is
 # replayed only after the exact child status is collected.
 run_parallel_lane source-conformance bash formal/run-source-conformance.sh
-run_parallel_lane tlc env FORMAL_SELFTEST_ALREADY_PASSED=1 \
-    bash formal/run-all-tlc.sh --profile "$profile"
 run_parallel_lane spec-mutations bash formal/run-spec-mutations.sh
 run_parallel_lane fault-scenarios bash formal/run-fault-scenarios.sh
 run_parallel_lane abi-differential bash formal/run-abi-differential.sh
@@ -91,3 +123,5 @@ python3 formal/write-verification-run.py \
     --profile "$profile" \
     --not-before "$run_marker" \
     --output "$repo_root/build/formal/verification-run/$profile.json"
+printf 'formal gate sealed profile=%s elapsed_seconds=%s\n' \
+    "$profile" "$((SECONDS - gate_started))"

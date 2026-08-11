@@ -406,7 +406,12 @@ fn select_smoke_guest_display(options: &SmokeOptions, host_has_gui: bool) -> Res
 /// closes the DVM QEMU window or interrupts it. Acceptance is still enforced
 /// when the session closes; a slow but progressing debug boot is not killed by
 /// an arbitrary startup deadline.
-pub(crate) fn kvm_run_command(config: &Config, build_image: bool, rustos_vcpus: u8) -> Result<()> {
+pub(crate) fn kvm_run_command(
+    config: &Config,
+    build_image: bool,
+    rustos_vcpus: u8,
+    auto_verify: bool,
+) -> Result<()> {
     let _launch_lock = acquire_kvm_launch_lock(&config.build_dir.join("kvm"))?;
     if build_image {
         crate::build::build(config, false)?;
@@ -449,6 +454,24 @@ pub(crate) fn kvm_run_command(config: &Config, build_image: bool, rustos_vcpus: 
             DVM_BLOCK_READY_MARKER.to_owned(),
         ],
     };
+    // A multicore launch is admitted only by the formal profile that models
+    // its topology, and this is the interactive path: an unsealed profile here
+    // means someone edited the tree and pressed run, not that they intended to
+    // launch unverified. Seal it with the profile's own verification command
+    // rather than failing and asking for that command by hand. The spawn-time
+    // gate below still validates independently, so nothing launches on a
+    // verification that did not pass.
+    if options.smp_iteration || options.rustos_vcpus > 1 {
+        let profile = if options.smp_iteration {
+            "smp-iteration"
+        } else {
+            "pr"
+        };
+        if auto_verify {
+            crate::formal_contracts::ensure_smp_launch_evidence(&config.root_dir, profile)?;
+            log_kvm_start_phase("sealed-formal-evidence", started_at);
+        }
+    }
     let layout = prepare_layout(config, &options)?;
     log_kvm_start_phase("prepared-kvm-layout", started_at);
     require_vhost_vsock()?;

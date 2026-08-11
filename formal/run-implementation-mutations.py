@@ -16,6 +16,7 @@ import sys
 import tempfile
 import time
 import tomllib
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -313,22 +314,26 @@ def run_cargo_command(
     return result, round((time.monotonic() - started) * 1000)
 
 
-def resolve_cargo_witness(
+def list_cargo_tests(
     checkout: Path,
     target_dir: Path,
     mutation: dict[str, str | int],
-) -> tuple[str | None, subprocess.CompletedProcess[str], int, str | None]:
-    """Resolve the test binary's full libtest name without executing tests."""
-    listing, elapsed_ms = run_cargo_command(
+) -> tuple[subprocess.CompletedProcess[str], int]:
+    """List the package's test binary contents without executing tests."""
+    return run_cargo_command(
         checkout,
         target_dir,
         [*cargo_test_base_command(mutation), "--", "--list"],
         int(mutation["max_ms"]),
     )
-    registered = str(mutation["test"])
-    if listing.returncode != 0:
-        return None, listing, elapsed_ms, "could not list the registered witness"
-    listed = [match.group("name") for match in LISTED_TEST.finditer(listing.stdout)]
+
+
+def resolve_listed_witness(
+    listing: str,
+    registered: str,
+) -> tuple[str | None, str | None]:
+    """Resolve the registered witness to exactly one listed libtest name."""
+    listed = [match.group("name") for match in LISTED_TEST.finditer(listing)]
     if "::" in registered:
         matches = [name for name in listed if name == registered]
     else:
@@ -336,11 +341,10 @@ def resolve_cargo_witness(
     if len(matches) != 1:
         return (
             None,
-            listing,
-            elapsed_ms,
-            f"registered witness must resolve to exactly one libtest name; matches={len(matches)}",
+            "registered witness must resolve to exactly one libtest name; "
+            f"matches={len(matches)}",
         )
-    return matches[0], listing, elapsed_ms, None
+    return matches[0], None
 
 
 def run_exact_witness(
@@ -440,50 +444,210 @@ def prepare_checkout(root: Path, destination: Path) -> None:
     subprocess.run(command, check=True)
 
 
-def evaluate_mutation(
-    checkout: Path,
-    target_dir: Path,
-    artifact_dir: Path,
-    mutation: dict[str, str | int],
-    originals: dict[str, str],
-) -> dict[str, str | int]:
-    """Run one mutation's baseline and mutant in an already-prepared checkout."""
-    identity = str(mutation["id"])
-    source = checkout / str(mutation["source"])
-    original = originals[str(mutation["source"])]
-    source.write_text(original, encoding="utf-8")
-    witness, witness_listing, witness_listing_ms, resolution_error = resolve_cargo_witness(
-        checkout, target_dir, mutation
+def build_key(mutation: dict[str, str | int]) -> tuple[str, str, str]:
+    """The Cargo selection that decides which test binary is built."""
+    return (
+        str(mutation["package"]),
+        str(mutation["features"]),
+        str(mutation["target"]),
     )
+
+
+@dataclass(frozen=True)
+class WitnessBaseline:
+    """One pristine-tree precondition shared by every mutant of a witness."""
+
+    witness: str | None
+    listing: str
+    listing_elapsed_ms: int
+    baseline: str
+    baseline_elapsed_ms: int
+    established_by: str
+    error: str | None
+
+
+class PristineBaselines:
+    """Establish each shard's unmutated-tree facts once instead of per mutant.
+
+    The witness listing depends only on the package/feature/target selection,
+    and the baseline depends only on that selection plus the registered test
+    name. Both are properties of the pristine checkout, whose exact bytes are
+    sealed by `source_sha256` and restored after every mutant. Proving them
+    once per witness therefore proves exactly what proving them once per
+    mutation did, over exactly the same bytes - but it removes two of the three
+    Cargo rebuilds each mutation used to pay, because the tree no longer has to
+    travel mutant -> pristine -> mutant. Establishing them all before the first
+    mutant runs is what keeps that promise: the whole priming phase sees one
+    unmutated tree, so each package compiles once for every witness it owns.
+    """
+
+    def __init__(
+        self,
+        checkout: Path,
+        target_dir: Path,
+        artifact_dir: Path,
+        originals: dict[str, str],
+    ) -> None:
+        self.checkout = checkout
+        self.target_dir = target_dir
+        self.artifact_dir = artifact_dir
+        self.originals = originals
+        self._listings: dict[tuple[str, str, str], tuple[int, str, int]] = {}
+        self._witnesses: dict[tuple[str, str, str, str], WitnessBaseline] = {}
+        # Rows sharing a witness may register different budgets. The shared
+        # listing and baseline are preconditions, not kill claims, so they get
+        # the most generous budget any member grants - otherwise the shortest
+        # row could time out the precondition its longer sibling paid for. Each
+        # mutant still runs under its own registered `max_ms`.
+        self._budgets: dict[tuple[str, ...], int] = {}
+
+    def restore(self) -> None:
+        """Return every registered source to its sealed original bytes.
+
+        The rewrite is unconditional even when the bytes already match, and
+        that is load-bearing rather than lazy. `CARGO_TARGET_DIR` outlives the
+        lane, and `rsync -a` gives the fresh checkout the live tree's mtimes -
+        which are older than the artifacts a previous run left behind for the
+        very same paths, and the last thing that run compiled for a mutated
+        source was the mutant. Touching every registered source here makes the
+        priming build strictly newer than anything a previous run cached, so a
+        baseline can never be adjudicated against a stale mutant binary.
+        """
+        for relative, original in self.originals.items():
+            (self.checkout / relative).write_text(original, encoding="utf-8")
+
+    def establish(self, mutations: list[dict[str, str | int]]) -> None:
+        for mutation in mutations:
+            for key in (build_key(mutation), self._witness_key(mutation)):
+                budget = int(mutation["max_ms"])
+                self._budgets[key] = max(self._budgets.get(key, 0), budget)
+        self.restore()
+        for mutation in mutations:
+            self._establish_one(mutation)
+
+    @staticmethod
+    def _witness_key(mutation: dict[str, str | int]) -> tuple[str, ...]:
+        return (*build_key(mutation), str(mutation["test"]))
+
+    def _budgeted(
+        self,
+        mutation: dict[str, str | int],
+        key: tuple[str, ...],
+    ) -> dict[str, str | int]:
+        budget = max(self._budgets.get(key, 0), int(mutation["max_ms"]))
+        return {**mutation, "max_ms": budget}
+
+    def for_mutation(self, mutation: dict[str, str | int]) -> WitnessBaseline:
+        key = self._witness_key(mutation)
+        established = self._witnesses.get(key)
+        if established is None:
+            # A lookup that was not primed can only be reached with the tree in
+            # an unknown state, so restore before measuring the pristine facts.
+            self.restore()
+            established = self._establish_one(mutation)
+        return established
+
+    def _listing(self, mutation: dict[str, str | int]) -> tuple[int, str, int]:
+        key = build_key(mutation)
+        cached = self._listings.get(key)
+        if cached is None:
+            listing, elapsed_ms = list_cargo_tests(
+                self.checkout, self.target_dir, self._budgeted(mutation, key)
+            )
+            cached = (listing.returncode, listing.stdout, elapsed_ms)
+            self._listings[key] = cached
+        return cached
+
+    def _establish_one(self, mutation: dict[str, str | int]) -> WitnessBaseline:
+        key = self._witness_key(mutation)
+        if (established := self._witnesses.get(key)) is not None:
+            return established
+        identity = str(mutation["id"])
+        returncode, listing, listing_ms = self._listing(mutation)
+        if returncode != 0:
+            established = WitnessBaseline(
+                witness=None,
+                listing=listing,
+                listing_elapsed_ms=listing_ms,
+                baseline="",
+                baseline_elapsed_ms=0,
+                established_by=identity,
+                error="could not list the registered witness",
+            )
+            self._witnesses[key] = established
+            return established
+        witness, resolution_error = resolve_listed_witness(
+            listing, str(mutation["test"])
+        )
+        if resolution_error is not None or witness is None:
+            established = WitnessBaseline(
+                witness=None,
+                listing=listing,
+                listing_elapsed_ms=listing_ms,
+                baseline="",
+                baseline_elapsed_ms=0,
+                established_by=identity,
+                error=resolution_error,
+            )
+            self._witnesses[key] = established
+            return established
+        baseline, baseline_ms = run_exact_witness(
+            self.checkout, self.target_dir, self._budgeted(mutation, key), witness
+        )
+        error = None
+        if (
+            baseline.returncode != 0
+            or not exact_witness_executed(baseline.stdout, witness)
+            or not re.search(r"test result: ok\. 1 passed;", baseline.stdout)
+        ):
+            error = "baseline did not execute exactly the registered witness"
+        established = WitnessBaseline(
+            witness=witness,
+            listing=listing,
+            listing_elapsed_ms=listing_ms,
+            baseline=baseline.stdout,
+            baseline_elapsed_ms=baseline_ms,
+            established_by=identity,
+            error=error,
+        )
+        self._witnesses[key] = established
+        return established
+
+
+def evaluate_mutation(
+    baselines: PristineBaselines,
+    mutation: dict[str, str | int],
+) -> dict[str, str | int]:
+    """Run one mutant against the pristine-tree witness already proven for it."""
+    identity = str(mutation["id"])
+    artifact_dir = baselines.artifact_dir
+    established = baselines.for_mutation(mutation)
     (artifact_dir / f"{identity}-witness-list.log").write_text(
-        f"rustos: registered-witness={mutation['test']}\n" + witness_listing.stdout,
+        f"rustos: registered-witness={mutation['test']}\n"
+        f"rustos: pristine-listing established-by={established.established_by}\n"
+        + established.listing,
         encoding="utf-8",
     )
-    if resolution_error is not None:
-        return {
-            **mutation,
-            "status": "baseline-failed",
-            "detail": resolution_error,
-        }
-    assert witness is not None
-    baseline, baseline_ms = run_exact_witness(checkout, target_dir, mutation, witness)
     (artifact_dir / f"{identity}-baseline.log").write_text(
-        baseline.stdout, encoding="utf-8"
+        f"rustos: pristine-baseline established-by={established.established_by}\n"
+        + established.baseline,
+        encoding="utf-8",
     )
-    if (
-        baseline.returncode != 0
-        or not exact_witness_executed(baseline.stdout, witness)
-        or not re.search(r"test result: ok\. 1 passed;", baseline.stdout)
-    ):
+    if established.error is not None or established.witness is None:
         return {
             **mutation,
             "status": "baseline-failed",
-            "detail": "baseline did not execute exactly the registered witness",
+            "detail": established.error or "the registered witness was not established",
         }
+    witness = established.witness
 
+    source = baselines.checkout / str(mutation["source"])
+    original = baselines.originals[str(mutation["source"])]
     mutated = replace_resolved_anchor(original, mutation)
     source.write_text(mutated, encoding="utf-8")
-    mutant, mutant_ms = run_exact_witness(checkout, target_dir, mutation, witness)
+    mutant, mutant_ms = run_exact_witness(
+        baselines.checkout, baselines.target_dir, mutation, witness
+    )
     (artifact_dir / f"{identity}-mutant.log").write_text(mutant.stdout, encoding="utf-8")
     source.write_text(original, encoding="utf-8")
     # Some freestanding service profiles use panic=abort even in host tests, so
@@ -502,8 +666,8 @@ def evaluate_mutation(
         **mutation,
         "status": "killed",
         "resolved_witness": witness,
-        "witness_listing_elapsed_ms": witness_listing_ms,
-        "baseline_elapsed_ms": baseline_ms,
+        "witness_listing_elapsed_ms": established.listing_elapsed_ms,
+        "baseline_elapsed_ms": established.baseline_elapsed_ms,
         "mutant_elapsed_ms": mutant_ms,
     }
 
@@ -533,6 +697,22 @@ def shard_count(mutation_count: int, artifact_dir: Path) -> int:
     return max(1, min(4, (os.cpu_count() or 1) // 4, mutation_count, affordable))
 
 
+def run_bucket_mutations(
+    checkout: Path,
+    target_dir: Path,
+    artifact_dir: Path,
+    mutations: list[dict[str, str | int]],
+    originals: dict[str, str],
+) -> list[dict[str, str | int]]:
+    """Prove one shard's pristine preconditions, then run only its mutants."""
+    ordered = sorted(
+        mutations, key=lambda entry: (*build_key(entry), str(entry["source"]))
+    )
+    baselines = PristineBaselines(checkout, target_dir, artifact_dir, originals)
+    baselines.establish(ordered)
+    return [evaluate_mutation(baselines, mutation) for mutation in ordered]
+
+
 def run_shards(
     checkout: Path,
     target_dir: Path,
@@ -545,14 +725,13 @@ def run_shards(
     # its neighbours: cargo then rebuilds one crate incrementally instead of
     # alternating between crates on every run.
     ordered = sorted(
-        mutations, key=lambda entry: (str(entry["package"]), str(entry["source"]))
+        mutations, key=lambda entry: (*build_key(entry), str(entry["source"]))
     )
     shards = shard_count(len(ordered), artifact_dir)
     if shards == 1:
-        return [
-            evaluate_mutation(checkout, target_dir, artifact_dir, mutation, originals)
-            for mutation in ordered
-        ]
+        return run_bucket_mutations(
+            checkout, target_dir, artifact_dir, ordered, originals
+        )
 
     buckets: list[list[dict[str, str | int]]] = [[] for _ in range(shards)]
     by_source: dict[str, list[dict[str, str | int]]] = {}
@@ -571,12 +750,9 @@ def run_shards(
             shard_checkout = Path(temp) / f"checkout-{index}"
             prepare_checkout(checkout, shard_checkout)
             shard_target = artifact_dir / f"target-{index}"
-        return [
-            evaluate_mutation(
-                shard_checkout, shard_target, artifact_dir, mutation, originals
-            )
-            for mutation in bucket
-        ]
+        return run_bucket_mutations(
+            shard_checkout, shard_target, artifact_dir, bucket, originals
+        )
 
     outcomes: list[dict[str, str | int]] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=shards) as pool:

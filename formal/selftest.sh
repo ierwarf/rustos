@@ -222,9 +222,22 @@ rg -q 'FORMAL_PROOF_INDEX_ALREADY_PASSED=1' formal/verify-all.sh || {
     exit 1
 }
 rg -q 'run_parallel_lane source-conformance' formal/verify-all.sh \
-    && rg -q 'run_parallel_lane tlc' formal/verify-all.sh || {
+    && rg -q 'run_parallel_lane spec-mutations' formal/verify-all.sh || {
         echo "two-minute formal gate stopped parallelizing independent lanes" >&2
         exit 1
     }
+# The exhaustive TLC set is the one lane whose contract is a wall clock:
+# `tlc_max_wall_seconds` plus a pinned per-model timeout. Those budgets are
+# real seconds, so a model that needs 16 of its 30 starts failing on load
+# rather than on logic once ten sibling lanes compete for the same cores. It
+# must run before the fan-out, with the machine to itself.
+rg -q 'FORMAL_SELFTEST_ALREADY_PASSED=1 bash formal/run-all-tlc\.sh' formal/verify-all.sh || {
+    echo "formal PR gate no longer runs the exhaustive TLC set uncontended" >&2
+    exit 1
+}
+if rg -q 'run_parallel_lane tlc' formal/verify-all.sh; then
+    echo "the wall-budgeted TLC set must not compete with the parallel lanes" >&2
+    exit 1
+fi
 
 printf 'formal selftest passed: %s registered models\n' "$(printf '%s\n' "$registered" | wc -l)"

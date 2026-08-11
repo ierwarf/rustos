@@ -10,6 +10,7 @@ verification failure rather than evidence of property quality.
 
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
 import json
 import os
@@ -18,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 from collections import defaultdict
 from pathlib import Path
@@ -233,6 +235,98 @@ def has_exact_passed_baseline(root: Path, model: str) -> bool:
     return False
 
 
+def mutant_jobs() -> int:
+    """How many mutants to kill concurrently.
+
+    Each mutant is a separate single-worker TLC process over its own copied
+    module, configuration, and artifact directory, so mutants share nothing.
+    The lane was sequential only because a *single* TLC run must stay
+    deterministic - a kill check names which invariant rejected the mutant, and
+    on several workers that depends on exploration order. Running one-worker
+    mutants side by side does not touch that: each mutant explores exactly the
+    state space it explored before, in the same order, and reports the same
+    invariant.
+    """
+    override = os.environ.get("RUSTOS_SPEC_MUTATION_JOBS")
+    if override:
+        return max(1, int(override))
+    # Leave room for the sibling proof lanes this one runs beside.
+    return max(1, min(8, (os.cpu_count() or 1) // 2))
+
+
+def kill_mutant(
+    root: Path,
+    base_env: dict[str, str],
+    artifact_root: Path,
+    temporary_root: Path,
+    mutation: dict[str, Any],
+) -> dict[str, Any]:
+    """Run one mutant and return its killed record, or its failure reason."""
+    identity = str(mutation["id"])
+    model = str(mutation["model"])
+    started = time.monotonic()
+    source = root / "formal" / f"{model}.tla"
+    config = root / "formal" / f"{model}.cfg"
+    mutant_dir = temporary_root / identity
+    mutant_dir.mkdir()
+    mutant = mutant_dir / source.name
+    mutant_config = mutant_dir / config.name
+    original = source.read_text(encoding="utf-8")
+    mutant.write_text(replace_once(original, mutation), encoding="utf-8")
+    shutil.copyfile(config, mutant_config)
+    artifact = artifact_root / identity
+    if artifact.exists():
+        shutil.rmtree(artifact)
+    env = base_env | {
+        "TLA_SPEC_OVERRIDE": str(mutant),
+        "TLA_CONFIG_OVERRIDE": str(mutant_config),
+        "TLA_ARTIFACT_DIR": str(artifact),
+        # TLC stops at the first invariant it sees violated, and with
+        # several workers which one that is depends on the order the
+        # state space happens to be explored. A kill check asserts
+        # *which* invariant rejected the mutant, so it is a claim only
+        # a deterministic exploration can carry: on `auto` the same
+        # mutant is killed by a different invariant from run to run and
+        # the lane fails at random. Baselines keep `auto` - "nothing
+        # was violated" does not depend on the order.
+        "TLC_WORKERS": "1",
+    }
+    result = run(
+        ["bash", str(root / "formal/run-tlc.sh"), "--profile", "pr", model],
+        env=env,
+        output=artifact_root / f"{identity}-runner.log",
+    )
+    if result.returncode == 0:
+        return {"id": identity, "failure": f"{identity}: surviving TLA+ mutant"}
+    summary_path = artifact / "summary.json"
+    if not summary_path.is_file():
+        return {
+            "id": identity,
+            "failure": f"{identity}: TLC did not produce mutation summary",
+        }
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    if summary.get("status") != "failed":
+        return {
+            "id": identity,
+            # A timeout is a verdict about the machine, not about the mutant:
+            # the lane re-adjudicates it with the host to itself before calling
+            # it a failure.
+            "timeout": summary.get("status") == "timeout",
+            "failure": (
+                f"{identity}: mutant did not fail an invariant; "
+                f"status={summary.get('status')!r}"
+            ),
+        }
+    return {
+        **mutation,
+        "status": "killed",
+        "source_sha256": hashlib.sha256(original.encode()).hexdigest(),
+        "mutant_sha256": hashlib.sha256(mutant.read_bytes()).hexdigest(),
+        "counterexample": counterexample(root, mutation, artifact),
+        "elapsed_ms": round((time.monotonic() - started) * 1000),
+    }
+
+
 def counterexample(root: Path, mutation: dict[str, Any], artifact: Path) -> dict[str, Any]:
     log = artifact / "tlc.log"
     trace = artifact / "counterexample.json"
@@ -291,7 +385,6 @@ def main() -> int:
     artifact_root.mkdir(parents=True, exist_ok=True)
     base_env = os.environ.copy()
     base_env["FORMAL_MUTATION_MODE"] = "1"
-    results: list[dict[str, Any]] = []
     baseline_models = sorted({str(mutation["model"]) for mutation in selected})
     for model in baseline_models:
         if has_exact_passed_baseline(root, model):
@@ -307,60 +400,56 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory(prefix="rustos-tla-mutations-") as temporary:
         temporary_root = Path(temporary)
-        for mutation in selected:
-            identity = str(mutation["id"])
-            model = str(mutation["model"])
-            source = root / "formal" / f"{model}.tla"
-            config = root / "formal" / f"{model}.cfg"
-            mutant_dir = temporary_root / identity
-            mutant_dir.mkdir()
-            mutant = mutant_dir / source.name
-            mutant_config = mutant_dir / config.name
-            original = source.read_text(encoding="utf-8")
-            mutant.write_text(replace_once(original, mutation), encoding="utf-8")
-            shutil.copyfile(config, mutant_config)
-            artifact = artifact_root / identity
-            if artifact.exists():
-                shutil.rmtree(artifact)
-            env = base_env | {
-                "TLA_SPEC_OVERRIDE": str(mutant),
-                "TLA_CONFIG_OVERRIDE": str(mutant_config),
-                "TLA_ARTIFACT_DIR": str(artifact),
-                # TLC stops at the first invariant it sees violated, and with
-                # several workers which one that is depends on the order the
-                # state space happens to be explored. A kill check asserts
-                # *which* invariant rejected the mutant, so it is a claim only
-                # a deterministic exploration can carry: on `auto` the same
-                # mutant is killed by a different invariant from run to run and
-                # the lane fails at random. Baselines keep `auto` - "nothing
-                # was violated" does not depend on the order.
-                "TLC_WORKERS": "1",
-            }
-            result = run(
-                ["bash", str(root / "formal/run-tlc.sh"), "--profile", "pr", model],
-                env=env,
-                output=artifact_root / f"{identity}-runner.log",
-            )
-            if result.returncode == 0:
-                raise SystemExit(f"{identity}: surviving TLA+ mutant")
-            summary_path = artifact / "summary.json"
-            if not summary_path.is_file():
-                raise SystemExit(f"{identity}: TLC did not produce mutation summary")
-            summary = json.loads(summary_path.read_text(encoding="utf-8"))
-            if summary.get("status") != "failed":
-                raise SystemExit(
-                    f"{identity}: mutant did not fail an invariant; status={summary.get('status')!r}"
+        jobs = min(mutant_jobs(), len(selected))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
+            # `map` preserves corpus order, so the sealed evidence does not
+            # depend on which mutant happened to finish first.
+            outcomes = list(
+                pool.map(
+                    lambda mutation: kill_mutant(
+                        root, base_env, artifact_root, temporary_root, mutation
+                    ),
+                    selected,
                 )
-            trace = counterexample(root, mutation, artifact)
-            results.append(
-                {
-                    **mutation,
-                    "status": "killed",
-                    "source_sha256": hashlib.sha256(original.encode()).hexdigest(),
-                    "mutant_sha256": hashlib.sha256(mutant.read_bytes()).hexdigest(),
-                    "counterexample": trace,
-                }
             )
+        # Every model keeps a pinned wall-clock budget, so a mutant that shared
+        # the host with seven others can exhaust it without ever disagreeing
+        # with the invariant that must reject it. Re-run exactly those alone,
+        # in the sequential conditions the budget was pinned for, and let that
+        # verdict stand: a mutant still unkilled with the machine to itself is
+        # a real gap, and one killed here was always a kill.
+        retried = [
+            outcome["id"]
+            for outcome in outcomes
+            if outcome.get("timeout") and "failure" in outcome
+        ]
+        if retried:
+            print(
+                "re-running timed-out TLA+ mutants sequentially: "
+                + " ".join(str(identity) for identity in retried),
+                file=sys.stderr,
+            )
+            by_id = {str(mutation["id"]): mutation for mutation in selected}
+            for position, outcome in enumerate(outcomes):
+                if not (outcome.get("timeout") and "failure" in outcome):
+                    continue
+                identity = str(outcome["id"])
+                shutil.rmtree(temporary_root / identity, ignore_errors=True)
+                outcomes[position] = kill_mutant(
+                    root, base_env, artifact_root, temporary_root, by_id[identity]
+                )
+
+    failures = [str(outcome["failure"]) for outcome in outcomes if "failure" in outcome]
+    if failures:
+        for failure in failures:
+            print(failure, file=sys.stderr)
+        # Report every survivor in one run: a corpus this size is a survey of
+        # what the invariants actually reject, and stopping at the first gap
+        # turns one pass into one finding.
+        raise SystemExit(
+            f"TLA+ specification mutations failed: {len(failures)} of {len(outcomes)}"
+        )
+    results = outcomes
 
     summary = {
         "schema": "rustos-tla-mutation-evidence-v1",

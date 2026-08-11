@@ -45,6 +45,10 @@ enum XtaskCommand {
         build_image: bool,
         #[arg(long = "rustos-vcpus", default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=8))]
         rustos_vcpus: u8,
+        /// Refuse a multicore launch whose formal profile is unsealed instead
+        /// of sealing it first.
+        #[arg(long = "no-auto-verify")]
+        no_auto_verify: bool,
     },
     Selftest,
     #[command(name = "fuzz-host")]
@@ -145,7 +149,8 @@ pub(crate) fn run() -> Result<()> {
         Some(XtaskCommand::KvmRun {
             build_image,
             rustos_vcpus,
-        }) => kvm::kvm_run_command(&config, build_image, rustos_vcpus),
+            no_auto_verify,
+        }) => kvm::kvm_run_command(&config, build_image, rustos_vcpus, !no_auto_verify),
         Some(XtaskCommand::Selftest) => testinfra::selftest(&config),
         Some(XtaskCommand::FuzzHost {
             target,

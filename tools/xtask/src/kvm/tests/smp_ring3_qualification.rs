@@ -44,6 +44,40 @@ pub(super) fn smoke_readiness_budget_starts_only_after_both_guests_spawn() {
     assert!(boot_started < deadline);
 }
 
+/// The interactive path seals its formal profile, and seals it early.
+///
+/// A missing seal on this path means an edited tree, not an intent to launch
+/// unverified, so `kvm_run_command` runs the profile's own verification rather
+/// than failing. That has to happen before the run claims a layout, a
+/// doorbell, or a relay: sealing takes minutes, and a launch that already owns
+/// host resources would hold them for the whole verification.
+pub(super) fn interactive_multicore_run_seals_formal_evidence_before_claiming_resources() {
+    let source = include_str!("../options.rs");
+    let interactive_start = source
+        .find("pub(crate) fn kvm_run_command")
+        .expect("interactive KVM command");
+    let interactive = &source[interactive_start..];
+    let seal = interactive
+        .find("crate::formal_contracts::ensure_smp_launch_evidence(")
+        .expect("interactive formal seal");
+    let layout = interactive
+        .find("let layout = prepare_layout(config, &options)?;")
+        .expect("interactive layout");
+    let doorbell = interactive
+        .find("let input_doorbell = start_dvm_input_doorbell(&layout)?;")
+        .expect("interactive input doorbell");
+    let spawn = interactive
+        .find("let (mut rustos, mut dvm) = spawn_guests(")
+        .expect("interactive guest spawn");
+    assert!(seal < layout);
+    assert!(layout < doorbell);
+    assert!(doorbell < spawn);
+    // The seal is a repair, never a bypass: the single-CPU launch has no
+    // profile to seal, and `--no-auto-verify` restores the refusal.
+    assert!(interactive[..seal].contains("options.smp_iteration || options.rustos_vcpus > 1"));
+    assert!(interactive[..seal].contains("if auto_verify {"));
+}
+
 fn framed_smp_event(output_seq: u64, name: &str, cpu: u8, arg1: u64) -> String {
     let category = if name == "smp-cpu-online" {
         "boot"
