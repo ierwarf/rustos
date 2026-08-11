@@ -5,6 +5,16 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use runtime_control::{StartupMode, DEFAULT_RUNTIME_SOCKET_PATH};
+// The wire protocol has exactly one definition, and this is the server end of
+// it. These used to be a private second copy of every constant and both frame
+// structs, which nothing checked against the client's copy.
+pub(crate) use runtime_control::protocol::{
+    op_carries_program_payload, running_programs_digest, RuntimeRequest, RuntimeResponse,
+    LAUNCH_TARGET_NEW_SESSION, MAX_REQUEST_PATH_BYTES, MAX_RUNTIME_PROGRAMS, MAX_RUNTIME_WATCHERS,
+    OP_NOTIFY_READY, OP_REQUEST_LAUNCH_PATH, OP_REQUEST_TERMINATE, OP_SNAPSHOT_RUNNING_PROGRAMS,
+    OP_WATCH_RUNNING_PROGRAMS, PROTOCOL_VERSION, READY_COMPONENT_UI_SERVER,
+    RUNTIME_WATCH_MAX_WAIT_MS, TERMINATE_TARGET_PID, TERMINATE_TARGET_SESSION,
+};
 use rustos_user_abi::console as console_abi;
 use rustos_user_abi::performance::IPC_CONTROL_DRAIN_BUDGET;
 use rustos_user_abi::syscall::{
@@ -46,17 +56,6 @@ pub(crate) const SERVICE_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const MAX_RUNTIME_CLIENTS_PER_TICK: usize = 8;
 pub(crate) const MAX_PENDING_RUNTIME_CLIENTS: usize = 16;
 pub(crate) const MAX_POLICY_LAUNCH_ATTEMPTS_PER_TICK: usize = 1;
-pub(crate) const PROTOCOL_VERSION: u16 = 1;
-pub(crate) const OP_SNAPSHOT_RUNNING_PROGRAMS: u16 = 1;
-pub(crate) const OP_REQUEST_LAUNCH_PATH: u16 = 2;
-pub(crate) const OP_REQUEST_TERMINATE: u16 = 3;
-pub(crate) const OP_NOTIFY_READY: u16 = 4;
-pub(crate) const LAUNCH_TARGET_NEW_SESSION: u16 = 2;
-pub(crate) const TERMINATE_TARGET_SESSION: u16 = 1;
-pub(crate) const TERMINATE_TARGET_PID: u16 = 2;
-pub(crate) const READY_COMPONENT_UI_SERVER: u16 = 1;
-pub(crate) const MAX_REQUEST_PATH_BYTES: usize = 128;
-pub(crate) const MAX_RUNTIME_PROGRAMS: usize = 64;
 pub(crate) const MAX_EXEC_ARG_COUNT: usize = 32;
 pub(crate) const MAX_EXEC_ENV_COUNT: usize = 64;
 pub(crate) const MAX_EXEC_TEXT_BYTES: usize = 256;
@@ -80,41 +79,6 @@ pub(crate) const UI_SERVER_BOOTSTRAP_ENV: [&str; 2] =
     ["RUSTOS_UI_PROFILE=0", "RUSTOS_UI_BOOT_TRACE=0"];
 pub(crate) static LOADER_ENDPOINT_CACHE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SESSION_GRAPH_GENERATION: AtomicU64 = AtomicU64::new(1);
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct RuntimeRequest {
-    pub(crate) version: u16,
-    pub(crate) op: u16,
-    pub(crate) target_kind: u16,
-    pub(crate) reserved0: u16,
-    pub(crate) text_len: u32,
-    pub(crate) target_value: u64,
-    pub(crate) text: [u8; MAX_REQUEST_PATH_BYTES],
-}
-
-impl Default for RuntimeRequest {
-    fn default() -> Self {
-        Self {
-            version: 0,
-            op: 0,
-            target_kind: 0,
-            reserved0: 0,
-            text_len: 0,
-            target_value: 0,
-            text: [0; MAX_REQUEST_PATH_BYTES],
-        }
-    }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct RuntimeResponse {
-    pub(crate) version: u16,
-    pub(crate) op: u16,
-    pub(crate) status: i32,
-    pub(crate) count: u32,
-}
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub(crate) struct LaunchEntry {
@@ -184,6 +148,34 @@ pub(crate) struct BrokerState {
     pub(crate) qualification_catalog_failures: u32,
 }
 
+impl Default for BrokerState {
+    fn default() -> Self {
+        Self {
+            console_fd: None,
+            // Zero is the "no session" handle every caller compares against,
+            // so a real session may never be issued it.
+            next_session_handle: 1,
+            focused_session_handle: 0,
+            session_runtime: session::SessionRuntime::default(),
+            running: BTreeMap::new(),
+            launched_once: BTreeSet::new(),
+            retry_after: BTreeMap::new(),
+            launch_failure_counts: BTreeMap::new(),
+            permanent_launch_failures: BTreeMap::new(),
+            launch_entries: Vec::new(),
+            programs: BTreeMap::new(),
+            ui_ready: false,
+            launch_catalog_loaded: false,
+            launch_catalog_retry_after: None,
+            launch_catalog_last_error: None,
+            qualification_catalog_resolved: false,
+            qualification_catalog_retry_after: None,
+            qualification_catalog_last_error: None,
+            qualification_catalog_failures: 0,
+        }
+    }
+}
+
 pub(crate) fn boot_line(message: &str) {
     if option_env!("RUSTOS_LOGGING_BOOT_TRACE_ENABLED") != Some("true") {
         return;
@@ -233,27 +225,7 @@ fn main() {
         }
     };
 
-    let mut state = BrokerState {
-        console_fd: None,
-        next_session_handle: 1,
-        focused_session_handle: 0,
-        session_runtime: session::SessionRuntime::default(),
-        running: BTreeMap::new(),
-        launched_once: BTreeSet::new(),
-        retry_after: BTreeMap::new(),
-        launch_failure_counts: BTreeMap::new(),
-        permanent_launch_failures: BTreeMap::new(),
-        launch_entries: Vec::new(),
-        programs: BTreeMap::new(),
-        ui_ready: false,
-        launch_catalog_loaded: false,
-        launch_catalog_retry_after: None,
-        launch_catalog_last_error: None,
-        qualification_catalog_resolved: false,
-        qualification_catalog_retry_after: None,
-        qualification_catalog_last_error: None,
-        qualification_catalog_failures: 0,
-    };
+    let mut state = BrokerState::default();
     let mut runtime_connections = socket::RuntimeConnections::default();
     let _ = ensure_ui_bootstrap(&mut state);
     loop {
@@ -264,6 +236,11 @@ fn main() {
         // after another idle interval.
         did_work |= session::service_console_read_waiters(&mut state);
         did_work |= spawn::reap_children(&mut state);
+        // Publish the running set to anyone parked on a change before the pass
+        // does anything else with it. A launch later in this pass sets
+        // `did_work`, which sends the loop straight back here, so a watcher
+        // never waits out an idle interval for an edge this pass produced.
+        did_work |= socket::service_running_program_watchers(&mut runtime_connections, &state);
         did_work |= ensure_ui_bootstrap(&mut state);
         // The private SMP qualification workload validates scheduler and IPC
         // progress, not display readiness.  Load the signed catalog after the
@@ -301,7 +278,8 @@ fn main() {
         // child exits, the control socket, and retry deadlines, none of which
         // can wake anything. Without an endpoint there is nothing to block on,
         // so that case keeps the timer.
-        let idle_delay = spawn::next_idle_delay(&state);
+        let idle_delay =
+            spawn::next_idle_delay(&state, runtime_connections.earliest_watch_deadline());
         if session_endpoint.is_some() {
             session::service_session_endpoint(session_endpoint, &mut state, Some(idle_delay));
         } else {

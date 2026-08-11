@@ -7,10 +7,20 @@ pub const MAX_RUNTIME_PROGRAMS: u64 = 64;
 #[derive(PartialEq, Eq)]
 pub enum Operation {
     Snapshot,
+    /// Snapshot semantics with the reply withheld until the running set moves.
+    /// It admits a reply exactly as a snapshot does: parking is a property of
+    /// when the server answers, never of what it is allowed to answer with.
+    Watch,
     Launch,
     Terminate,
     Ready,
     Unknown,
+}
+
+/// The operations whose successful reply may carry a running-program array.
+/// Mirrors `op_carries_program_payload` in the executable protocol.
+pub open spec fn carries_program_payload(op: Operation) -> bool {
+    op == Operation::Snapshot || op == Operation::Watch
 }
 
 #[derive(PartialEq, Eq)]
@@ -45,7 +55,7 @@ pub open spec fn admit_response(
         Status::Ok => {
             if response != request {
                 Outcome::ProtocolError
-            } else if request == Operation::Snapshot {
+            } else if carries_program_payload(request) {
                 if count <= MAX_RUNTIME_PROGRAMS {
                     Outcome::Success
                 } else {
@@ -86,7 +96,7 @@ proof fn command_success_is_payload_free(
     response: Operation,
     count: u64,
 )
-    requires request != Operation::Snapshot,
+    requires !carries_program_payload(request),
              admit_response(request, response, Status::Ok, count) == Outcome::Success,
     ensures count == 0,
 {
@@ -98,6 +108,20 @@ proof fn snapshot_success_is_bounded(
 )
     requires admit_response(Operation::Snapshot, response, Status::Ok, count) == Outcome::Success,
     ensures count <= MAX_RUNTIME_PROGRAMS,
+{
+}
+
+/// A parked reply buys the watcher no extra payload authority. Whatever the
+/// server was holding out for, the array it finally sends is admitted under the
+/// same bound as an immediate snapshot.
+proof fn parked_watch_success_is_bounded_exactly_like_a_snapshot(
+    response: Operation,
+    count: u64,
+)
+    requires admit_response(Operation::Watch, response, Status::Ok, count) == Outcome::Success,
+    ensures count <= MAX_RUNTIME_PROGRAMS,
+            admit_response(Operation::Snapshot, Operation::Snapshot, Status::Ok, count)
+                == Outcome::Success,
 {
 }
 

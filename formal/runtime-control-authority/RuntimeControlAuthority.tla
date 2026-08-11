@@ -15,7 +15,10 @@ UI-readiness remains uiserver-only. Restart, service revoke, and process exit
 withdraw the corresponding authorization before dispatch.
 *******************************************************************************)
 
-Ops == {"snapshot", "launch", "terminate", "ui-ready"}
+(* "watch" is a snapshot the server may hold before answering. A held reply is
+   still a reply, so it is admitted under exactly the snapshot rule: parking
+   grants no authority the caller did not already have when it connected. *)
+Ops == {"snapshot", "watch", "launch", "terminate", "ui-ready"}
 Roles == {"foreign", "uiserver", "logical-admin"}
 Outcomes == {"pending", "admitted", "denied"}
 

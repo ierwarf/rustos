@@ -8,28 +8,23 @@ use std::path::Path;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-const PROTOCOL_VERSION: u16 = 1;
-const OP_SNAPSHOT_RUNNING_PROGRAMS: u16 = 1;
-const OP_REQUEST_LAUNCH_PATH: u16 = 2;
-const OP_REQUEST_TERMINATE: u16 = 3;
-const OP_NOTIFY_READY: u16 = 4;
-
-const LAUNCH_TARGET_NEW_SESSION: u16 = 2;
-const TERMINATE_TARGET_SESSION: u16 = 1;
-const TERMINATE_TARGET_PID: u16 = 2;
-const READY_COMPONENT_UI_SERVER: u16 = 1;
-const MAX_REQUEST_PATH_BYTES: usize = 128;
-const DESKTOP_FILE_ID_CAPACITY: usize = 48;
-const RUNNING_PROGRAM_NAME_CAPACITY: usize = 48;
-const PROGRAM_PATH_CAPACITY: usize = 64;
-const MAX_RUNTIME_PROGRAMS: usize = 64;
 const DEFAULT_WEIGHT_MICROS: u64 = 100;
-const RPC_IO_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const RPC_IO_TIMEOUT: Duration = Duration::from_secs(5);
 
 mod config_snapshot;
+pub mod protocol;
 
 pub use config_snapshot::read_bounded_config_snapshot;
 use config_snapshot::read_config_snapshot;
+pub use protocol::RuntimeRunningProgram;
+use protocol::{
+    op_carries_program_payload, running_programs_digest, RuntimeRequest, RuntimeResponse,
+    LAUNCH_TARGET_NEW_SESSION, MAX_REQUEST_PATH_BYTES, MAX_RUNTIME_PROGRAMS,
+    NO_RUNNING_PROGRAMS_DIGEST, OP_NOTIFY_READY, OP_REQUEST_LAUNCH_PATH, OP_REQUEST_TERMINATE,
+    OP_SNAPSHOT_RUNNING_PROGRAMS, OP_WATCH_RUNNING_PROGRAMS, PROTOCOL_VERSION,
+    READY_COMPONENT_UI_SERVER, RUNTIME_WATCH_MAX_WAIT_MS, TERMINATE_TARGET_PID,
+    TERMINATE_TARGET_SESSION,
+};
 
 pub const DEFAULT_RUNTIME_SOCKET_PATH: &str = "/run/runtimed.sock";
 pub const DEFAULT_APPLICATIONS_DIR: &str = "/usr/share/applications";
@@ -44,67 +39,6 @@ static STARTUP_REGISTRY_CACHE: OnceLock<Vec<StartupEntry>> = OnceLock::new();
 static DESKTOP_REGISTRY_CACHE: OnceLock<Vec<DesktopProgramEntry>> = OnceLock::new();
 static RUNTIME_LAUNCH_REGISTRY_CACHE: OnceLock<Vec<DesktopProgramEntry>> = OnceLock::new();
 static RUNTIME_ENV_REGISTRY_CACHE: OnceLock<Vec<RuntimeEnvEntry>> = OnceLock::new();
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RuntimeRunningProgram {
-    pub pid: u64,
-    pub program_id: u32,
-    reserved: u32,
-    pub session_handle: u64,
-    pub desktop_file_id: [u8; DESKTOP_FILE_ID_CAPACITY],
-    pub display_name: [u8; RUNNING_PROGRAM_NAME_CAPACITY],
-    pub exec_path: [u8; PROGRAM_PATH_CAPACITY],
-}
-
-impl Default for RuntimeRunningProgram {
-    fn default() -> Self {
-        Self {
-            pid: 0,
-            program_id: 0,
-            reserved: 0,
-            session_handle: 0,
-            desktop_file_id: [0; DESKTOP_FILE_ID_CAPACITY],
-            display_name: [0; RUNNING_PROGRAM_NAME_CAPACITY],
-            exec_path: [0; PROGRAM_PATH_CAPACITY],
-        }
-    }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-struct RuntimeRequest {
-    version: u16,
-    op: u16,
-    target_kind: u16,
-    reserved0: u16,
-    text_len: u32,
-    target_value: u64,
-    text: [u8; MAX_REQUEST_PATH_BYTES],
-}
-
-impl Default for RuntimeRequest {
-    fn default() -> Self {
-        Self {
-            version: PROTOCOL_VERSION,
-            op: 0,
-            target_kind: 0,
-            reserved0: 0,
-            text_len: 0,
-            target_value: 0,
-            text: [0; MAX_REQUEST_PATH_BYTES],
-        }
-    }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-struct RuntimeResponse {
-    version: u16,
-    op: u16,
-    status: i32,
-    count: u32,
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum StartupMode {
@@ -186,30 +120,37 @@ impl RuntimeClient {
             ..RuntimeRequest::default()
         };
         let (response, payload) = self.exchange(&request)?;
-        if response.count == 0 {
-            return Ok(Vec::new());
-        }
+        decode_running_programs(&response, &payload)
+    }
 
-        let count = usize::try_from(response.count).map_err(|_| libc::EOVERFLOW)?;
-        if count > MAX_RUNTIME_PROGRAMS {
-            return Err(libc::EOVERFLOW);
-        }
-        let expected = count
-            .checked_mul(size_of::<RuntimeRunningProgram>())
-            .ok_or(libc::EOVERFLOW)?;
-        if payload.len() != expected {
-            return Err(libc::EIO);
-        }
-
-        let mut programs = vec![RuntimeRunningProgram::default(); count];
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                payload.as_ptr(),
-                programs.as_mut_ptr().cast::<u8>(),
-                expected,
-            );
-        }
-        Ok(programs)
+    /// Ask to be told when the running set stops matching `known_digest`, and
+    /// wait up to `wait` for that to happen.
+    ///
+    /// This is the same reply as [`Self::snapshot_running_programs`] with the
+    /// answer withheld while there is nothing new to say, so a caller that only
+    /// reacts to changes stops paying a round trip per interval to be told
+    /// "still the same". Pass [`RUNNING_PROGRAMS_DIGEST_UNKNOWN`] on the first
+    /// call to be answered immediately.
+    ///
+    /// Returns the running set and the digest to hand back next time. An
+    /// unchanged digest means the server re-armed rather than observed a
+    /// change, which is a liveness signal, not an error.
+    pub fn watch_running_programs(
+        &self,
+        known_digest: u64,
+        wait: Duration,
+    ) -> Result<(Vec<RuntimeRunningProgram>, u64), i32> {
+        let wait_ms = u16::try_from(wait.as_millis()).unwrap_or(u16::MAX);
+        let request = RuntimeRequest {
+            op: OP_WATCH_RUNNING_PROGRAMS,
+            target_value: known_digest,
+            wait_ms: wait_ms.min(RUNTIME_WATCH_MAX_WAIT_MS),
+            ..RuntimeRequest::default()
+        };
+        let (response, payload) = self.exchange_with_deadline(&request, watch_io_timeout(wait))?;
+        let programs = decode_running_programs(&response, &payload)?;
+        let digest = running_programs_digest(&programs);
+        Ok((programs, digest))
     }
 
     pub fn request_launch_program_new_session(&self, desktop_file_id: &str) -> Result<(), i32> {
@@ -265,18 +206,66 @@ impl RuntimeClient {
     }
 
     fn exchange(&self, request: &RuntimeRequest) -> Result<(RuntimeResponse, Vec<u8>), i32> {
+        self.exchange_with_deadline(request, RPC_IO_TIMEOUT)
+    }
+
+    fn exchange_with_deadline(
+        &self,
+        request: &RuntimeRequest,
+        io_timeout: Duration,
+    ) -> Result<(RuntimeResponse, Vec<u8>), i32> {
         let mut stream = connect_nonblocking_unix(&self.socket_path)?;
-        write_all_retry(&mut stream, as_bytes(request))?;
+        write_all_retry_until(&mut stream, as_bytes(request), io_timeout)?;
 
         let mut response = RuntimeResponse::default();
-        read_exact_retry(&mut stream, as_bytes_mut(&mut response))?;
+        read_exact_retry_until(&mut stream, as_bytes_mut(&mut response), io_timeout)?;
         let payload_len = response_payload_len(request, &response)?;
         let mut payload = vec![0_u8; payload_len];
         if payload_len != 0 {
-            read_exact_retry(&mut stream, &mut payload)?;
+            read_exact_retry_until(&mut stream, &mut payload, io_timeout)?;
         }
         Ok((response, payload))
     }
+}
+
+/// The digest to present before any reply has been seen.
+pub const RUNNING_PROGRAMS_DIGEST_UNKNOWN: u64 = NO_RUNNING_PROGRAMS_DIGEST;
+
+/// How long a watch may sit on the socket before the caller calls the server
+/// dead. A parked reply is expected to take the full requested wait, so the
+/// deadline has to leave room for it plus the round trip that carries it.
+fn watch_io_timeout(wait: Duration) -> Duration {
+    wait.saturating_add(RPC_IO_TIMEOUT)
+}
+
+fn decode_running_programs(
+    response: &RuntimeResponse,
+    payload: &[u8],
+) -> Result<Vec<RuntimeRunningProgram>, i32> {
+    if response.count == 0 {
+        return Ok(Vec::new());
+    }
+
+    let count = usize::try_from(response.count).map_err(|_| libc::EOVERFLOW)?;
+    if count > MAX_RUNTIME_PROGRAMS {
+        return Err(libc::EOVERFLOW);
+    }
+    let expected = count
+        .checked_mul(size_of::<RuntimeRunningProgram>())
+        .ok_or(libc::EOVERFLOW)?;
+    if payload.len() != expected {
+        return Err(libc::EIO);
+    }
+
+    let mut programs = vec![RuntimeRunningProgram::default(); count];
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            payload.as_ptr(),
+            programs.as_mut_ptr().cast::<u8>(),
+            expected,
+        );
+    }
+    Ok(programs)
 }
 
 /// Validate the complete response identity before a caller can treat an RPC as
@@ -298,16 +287,17 @@ fn response_payload_len(
         return Err(libc::EPROTO);
     }
 
-    match request.op {
-        OP_SNAPSHOT_RUNNING_PROGRAMS => {
-            let count = usize::try_from(response.count).map_err(|_| libc::EOVERFLOW)?;
-            if count > MAX_RUNTIME_PROGRAMS {
-                return Err(libc::EOVERFLOW);
-            }
-            Ok(count
-                .checked_mul(size_of::<RuntimeRunningProgram>())
-                .ok_or(libc::EOVERFLOW)?)
+    if op_carries_program_payload(request.op) {
+        let count = usize::try_from(response.count).map_err(|_| libc::EOVERFLOW)?;
+        if count > MAX_RUNTIME_PROGRAMS {
+            return Err(libc::EOVERFLOW);
         }
+        return count
+            .checked_mul(size_of::<RuntimeRunningProgram>())
+            .ok_or(libc::EOVERFLOW);
+    }
+
+    match request.op {
         OP_REQUEST_LAUNCH_PATH | OP_REQUEST_TERMINATE | OP_NOTIFY_READY if response.count == 0 => {
             Ok(0)
         }
@@ -397,8 +387,12 @@ fn wait_for_socket_ready(stream: &UnixStream, deadline: Instant, events: i16) ->
     Ok(())
 }
 
-fn write_all_retry(stream: &mut UnixStream, mut bytes: &[u8]) -> Result<(), i32> {
-    let deadline = Instant::now() + RPC_IO_TIMEOUT;
+fn write_all_retry_until(
+    stream: &mut UnixStream,
+    mut bytes: &[u8],
+    io_timeout: Duration,
+) -> Result<(), i32> {
+    let deadline = Instant::now() + io_timeout;
     while !bytes.is_empty() {
         match stream.write(bytes) {
             Ok(0) => return Err(libc::EPIPE),
@@ -412,8 +406,16 @@ fn write_all_retry(stream: &mut UnixStream, mut bytes: &[u8]) -> Result<(), i32>
     Ok(())
 }
 
-fn read_exact_retry(stream: &mut UnixStream, mut bytes: &mut [u8]) -> Result<(), i32> {
-    let deadline = Instant::now() + RPC_IO_TIMEOUT;
+fn write_all_retry(stream: &mut UnixStream, bytes: &[u8]) -> Result<(), i32> {
+    write_all_retry_until(stream, bytes, RPC_IO_TIMEOUT)
+}
+
+fn read_exact_retry_until(
+    stream: &mut UnixStream,
+    mut bytes: &mut [u8],
+    io_timeout: Duration,
+) -> Result<(), i32> {
+    let deadline = Instant::now() + io_timeout;
     while !bytes.is_empty() {
         match stream.read(bytes) {
             Ok(0) => return Err(libc::EPIPE),
@@ -1280,7 +1282,7 @@ mod tests {
 mod verification {
     use super::{
         response_payload_len, RuntimeRequest, RuntimeResponse, MAX_RUNTIME_PROGRAMS,
-        OP_SNAPSHOT_RUNNING_PROGRAMS, PROTOCOL_VERSION,
+        OP_SNAPSHOT_RUNNING_PROGRAMS, OP_WATCH_RUNNING_PROGRAMS, PROTOCOL_VERSION,
     };
 
     #[kani::proof]
@@ -1320,6 +1322,32 @@ mod verification {
         assert_eq!(
             response_payload_len(&request, &response),
             Err(libc::EOVERFLOW)
+        );
+    }
+
+    /// A watch reply arrives late by design, and lateness must buy it nothing.
+    /// It is admitted under the same bound as the snapshot it stands in for.
+    #[kani::proof]
+    fn a_parked_watch_reply_is_admitted_exactly_like_a_snapshot() {
+        let count: u32 = kani::any();
+        let watch = RuntimeRequest {
+            op: OP_WATCH_RUNNING_PROGRAMS,
+            ..RuntimeRequest::default()
+        };
+        let snapshot = RuntimeRequest {
+            op: OP_SNAPSHOT_RUNNING_PROGRAMS,
+            ..RuntimeRequest::default()
+        };
+        let reply = |op: u16| RuntimeResponse {
+            version: PROTOCOL_VERSION,
+            op,
+            status: 0,
+            count,
+        };
+        kani::cover!(count > MAX_RUNTIME_PROGRAMS as u32);
+        assert_eq!(
+            response_payload_len(&watch, &reply(OP_WATCH_RUNNING_PROGRAMS)),
+            response_payload_len(&snapshot, &reply(OP_SNAPSHOT_RUNNING_PROGRAMS))
         );
     }
 

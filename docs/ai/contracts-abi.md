@@ -691,9 +691,27 @@ policy remains with the owning service.
   is statically below the caller's own IPC class deadline, the number of held
   capabilities is bounded, and every held capability's deadline is folded into
   the service's idle wait. Netd's deferred local polls and runtimed's parked
-  console reads are the two instances; both consume request state into the reply
-  before it is sent, so a budget above the caller's class deadline would hand
-  consumed bytes to a capability compat had already cancelled.
+  console reads are the two kernel-IPC instances; both consume request state
+  into the reply before it is sent, so a budget above the caller's class
+  deadline would hand consumed bytes to a capability compat had already
+  cancelled.
+- The same discipline applies where the reply capability is a held AF_UNIX
+  connection rather than a kernel reply cap, with one difference: there is no
+  compat-side cancellation, so the bound that matters is the *caller's* socket
+  deadline. Runtimed's `OP_WATCH_RUNNING_PROGRAMS` is the instance. A held
+  socket and a hung server are indistinguishable to the caller, so a parked
+  watch must re-arm on a budget the client's I/O deadline comfortably exceeds
+  (`RUNTIME_WATCH_MAX_WAIT_MS`, asserted at no more than half of `RPC_IO_TIMEOUT`),
+  and the number of parked connections is capped by `MAX_RUNTIME_WATCHERS`.
+  Past that cap the server answers immediately, which degrades a watcher to the
+  poller it replaced instead of pinning descriptors.
+- A change edge must be derived from the bytes the reply would carry, not from a
+  counter bumped at each mutation site. A counter has to be incremented
+  everywhere the watched state is touched, and forgetting one site fails
+  silently: the watcher parks straight through the change it asked about.
+  `running_programs_digest` hashes the reply itself, so a mutation that does not
+  alter the reply is correctly not an edge, and one that does cannot be missed.
+  The digest never travels - server and client compute it over identical bytes.
 - Rootd and runtimed use the shared `IPC_CONTROL_DRAIN_BUDGET` to process at
   most 32 already-queued control requests before returning to lifecycle,
   launch, catalog, and socket work. The kernel's 64-call endpoint admission

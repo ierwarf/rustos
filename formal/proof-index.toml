@@ -112,6 +112,7 @@ scope = "bounded response shape, opcode identity, status, overflow, and payload 
 harnesses = [
   "successful_response_never_crosses_rpc_identity",
   "successful_snapshot_never_accepts_an_unbounded_payload_count",
+  "a_parked_watch_reply_is_admitted_exactly_like_a_snapshot",
   "malformed_minimum_status_never_overflows_into_success",
   "successful_command_never_accepts_a_payload",
   "well_formed_server_error_preserves_the_errno",
@@ -132,6 +133,7 @@ lemmas = [
   "malformed_status_cannot_become_success",
   "command_success_is_payload_free",
   "snapshot_success_is_bounded",
+  "parked_watch_success_is_bounded_exactly_like_a_snapshot",
 ]
 depends_on = ["runtime-response"]
 

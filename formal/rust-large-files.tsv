@@ -13,7 +13,7 @@ kernel/mm/src/memory/kernel_vm.rs	1435	memory-kernel-vm	Split PAT/cache policy, 
 kernel/ps/src/multitask/scheduler.rs	5874	scheduler	Syscall SIMD custody extracted to multitask/syscall_simd.rs; the handoff chain carries per-step self-timing until its dominant member is found and removed; next split run queues, wakeup, deadlines, switching, accounting, and tests.
 libs/driver-domain-host/src/lib.rs	5441	driver-domain-host	Split manifest, lease, QMP, recovery, input-ring publication, and process supervision.
 libs/driver-domain-protocol/src/lib.rs	4149	driver-domain-protocol	Split block, network, input, display, and control wire modules.
-libs/runtime-control/src/lib.rs	1374	runtime-control	Split codec, authority, command lifecycle, and tests.
+libs/runtime-control/src/lib.rs	1402	runtime-control	Split codec, authority, command lifecycle, and tests.
 libs/rustos-image-admission/src/lib.rs	1518	image-admission	Split ELF, PE, region-plan, signature, and tests.
 libs/rustos-user-abi/src/linux.rs	1533	user-abi	Split Linux constants and structures by syscall family.
 libs/rustos-user-abi/src/syscall.rs	3189	user-abi	Split kernel mechanism ABI from service broker protocol families.

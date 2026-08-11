@@ -5,8 +5,8 @@ use std::os::unix::net::UnixStream;
 use super::{RuntimeRequest, RuntimeResponse, MAX_REQUEST_PATH_BYTES};
 use super::{
     LAUNCH_TARGET_NEW_SESSION, OP_NOTIFY_READY, OP_REQUEST_LAUNCH_PATH, OP_REQUEST_TERMINATE,
-    OP_SNAPSHOT_RUNNING_PROGRAMS, READY_COMPONENT_UI_SERVER, TERMINATE_TARGET_PID,
-    TERMINATE_TARGET_SESSION,
+    OP_SNAPSHOT_RUNNING_PROGRAMS, OP_WATCH_RUNNING_PROGRAMS, READY_COMPONENT_UI_SERVER,
+    TERMINATE_TARGET_PID, TERMINATE_TARGET_SESSION,
 };
 
 pub(super) fn as_bytes<T>(value: &T) -> &[u8] {
@@ -66,7 +66,10 @@ pub(super) fn request_path(request: &RuntimeRequest) -> Result<String, i32> {
 }
 
 pub(super) fn validate_runtime_request(request: &RuntimeRequest) -> Result<(), i32> {
-    if request.reserved0 != 0 {
+    // `wait_ms` is meaningful only where the server may park the reply. Every
+    // other op must still send zero, so the field cannot quietly acquire a
+    // second meaning on a path that never reads it.
+    if request.op != OP_WATCH_RUNNING_PROGRAMS && request.wait_ms != 0 {
         return Err(libc::EINVAL);
     }
     let text_len = usize::try_from(request.text_len).map_err(|_| libc::EINVAL)?;
@@ -76,6 +79,14 @@ pub(super) fn validate_runtime_request(request: &RuntimeRequest) -> Result<(), i
     match request.op {
         OP_SNAPSHOT_RUNNING_PROGRAMS => {
             if request.target_kind != 0 || request.target_value != 0 || text_len != 0 {
+                return Err(libc::EINVAL);
+            }
+        }
+        // `target_value` carries the digest the caller already holds, so unlike
+        // a snapshot it is unconstrained: any 64-bit value is a set the caller
+        // may believe in, including one no longer reachable.
+        OP_WATCH_RUNNING_PROGRAMS => {
+            if request.target_kind != 0 || text_len != 0 {
                 return Err(libc::EINVAL);
             }
         }

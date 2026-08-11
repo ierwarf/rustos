@@ -18,18 +18,19 @@ use std::io::{ErrorKind, Read, Write};
 use std::mem::size_of;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use runtime_control::RuntimeRunningProgram;
 use rustos_user_abi::syscall::IPC_SERVICE_UISERVER;
 
 use super::{
-    boot_line, LAUNCH_TARGET_NEW_SESSION, MAX_LAUNCH_RETRY_BACKOFF, MAX_PENDING_RUNTIME_CLIENTS,
-    MAX_POLICY_LAUNCH_ATTEMPTS_PER_TICK, MAX_RUNTIME_CLIENTS_PER_TICK, MAX_RUNTIME_PROGRAMS,
-    OP_NOTIFY_READY, OP_REQUEST_LAUNCH_PATH, OP_REQUEST_TERMINATE, OP_SNAPSHOT_RUNNING_PROGRAMS,
-    PROTOCOL_VERSION, READY_COMPONENT_UI_SERVER, RETRY_BACKOFF, SERVICE_REQUEST_TIMEOUT,
-    STORAGE_NOT_READY_RETRY_BACKOFF, TERMINATE_TARGET_PID, TERMINATE_TARGET_SESSION,
-    UI_SERVER_EXEC_PATH,
+    boot_line, op_carries_program_payload, running_programs_digest, LAUNCH_TARGET_NEW_SESSION,
+    MAX_LAUNCH_RETRY_BACKOFF, MAX_PENDING_RUNTIME_CLIENTS, MAX_POLICY_LAUNCH_ATTEMPTS_PER_TICK,
+    MAX_RUNTIME_CLIENTS_PER_TICK, MAX_RUNTIME_PROGRAMS, MAX_RUNTIME_WATCHERS, OP_NOTIFY_READY,
+    OP_REQUEST_LAUNCH_PATH, OP_REQUEST_TERMINATE, OP_SNAPSHOT_RUNNING_PROGRAMS,
+    OP_WATCH_RUNNING_PROGRAMS, PROTOCOL_VERSION, READY_COMPONENT_UI_SERVER, RETRY_BACKOFF,
+    RUNTIME_WATCH_MAX_WAIT_MS, SERVICE_REQUEST_TIMEOUT, STORAGE_NOT_READY_RETRY_BACKOFF,
+    TERMINATE_TARGET_PID, TERMINATE_TARGET_SESSION, UI_SERVER_EXEC_PATH,
 };
 use super::{BrokerState, LaunchEntry, RuntimeRequest, RuntimeResponse};
 
@@ -46,14 +47,30 @@ struct PendingRuntimeClient {
     deadline: Instant,
 }
 
+/// A watch whose reply is deliberately owed rather than sent.
+///
+/// The caller asked to be told when the running set stops matching
+/// `known_digest`. Until that happens there is nothing truthful to say, so the
+/// connection is retained and answered later - the reply capability is the open
+/// socket. `deadline` is the point at which the server re-arms the caller
+/// instead of continuing to hold it, which is what keeps a held socket
+/// distinguishable from a hung server.
+struct RuntimeWatchClient {
+    stream: UnixStream,
+    known_digest: u64,
+    deadline: Instant,
+}
+
 pub(super) struct RuntimeConnections {
     pending: VecDeque<PendingRuntimeClient>,
+    watchers: VecDeque<RuntimeWatchClient>,
 }
 
 impl Default for RuntimeConnections {
     fn default() -> Self {
         Self {
             pending: VecDeque::with_capacity(MAX_PENDING_RUNTIME_CLIENTS),
+            watchers: VecDeque::with_capacity(MAX_RUNTIME_WATCHERS),
         }
     }
 }
@@ -197,9 +214,15 @@ fn service_pending_clients(connections: &mut RuntimeConnections, state: &mut Bro
             }
             Ok(RequestReadProgress::Complete) => {
                 did_work = true;
-                if let Err(err) =
-                    service_request(&mut client.stream, client.peer, client.request, state)
-                {
+                if let Err(err) = admit_request(&client.request, client.peer, state) {
+                    write_runtime_error(&mut client.stream, err);
+                    continue;
+                }
+                if client.request.op == OP_WATCH_RUNNING_PROGRAMS {
+                    begin_running_program_watch(client, state, &mut connections.watchers);
+                    continue;
+                }
+                if let Err(err) = dispatch_request(&mut client.stream, client.request, state) {
                     write_runtime_error(&mut client.stream, err);
                 }
             }
@@ -210,6 +233,88 @@ fn service_pending_clients(connections: &mut RuntimeConnections, state: &mut Bro
         }
     }
     did_work
+}
+
+/// Retain a watch whose answer is not yet true, or answer it now.
+///
+/// A watch that already differs from what the caller holds is answered on the
+/// spot; there is no reason to park a reply that is ready. Past the watcher
+/// budget the same thing happens for a different reason - the server refuses to
+/// pin an unbounded number of descriptors, and a caller that is answered
+/// immediately simply degrades to the polling it did before.
+fn begin_running_program_watch(
+    mut client: PendingRuntimeClient,
+    state: &BrokerState,
+    watchers: &mut VecDeque<RuntimeWatchClient>,
+) {
+    let programs = running_program_snapshot(state);
+    let known_digest = client.request.target_value;
+    if running_programs_digest(&programs) != known_digest || watchers.len() >= MAX_RUNTIME_WATCHERS
+    {
+        if let Err(err) =
+            write_running_programs(&mut client.stream, OP_WATCH_RUNNING_PROGRAMS, &programs)
+        {
+            write_runtime_error(&mut client.stream, err);
+        }
+        return;
+    }
+
+    let wait_ms = u64::from(client.request.wait_ms.min(RUNTIME_WATCH_MAX_WAIT_MS));
+    watchers.push_back(RuntimeWatchClient {
+        stream: client.stream,
+        known_digest,
+        deadline: Instant::now() + Duration::from_millis(wait_ms),
+    });
+}
+
+impl RuntimeConnections {
+    /// The soonest a parked watch must be re-armed, for the idle budget.
+    ///
+    /// Runtimed's visiting interval is currently far shorter than any watch
+    /// budget, so this never shortens the wait today. It is folded in anyway
+    /// because the rule is that a service holding a reply capability owes its
+    /// deadline to its own idle wait - a broker that later earns a longer idle
+    /// interval must not silently start sleeping through these.
+    pub(super) fn earliest_watch_deadline(&self) -> Option<Instant> {
+        self.watchers.iter().map(|watcher| watcher.deadline).min()
+    }
+}
+
+/// Answer every parked watch the running set has moved past, and re-arm the
+/// ones whose budget ran out.
+///
+/// Called once per broker pass, so a watcher learns about a launch or an exit
+/// within one pass rather than within its own polling interval. The snapshot is
+/// built at most once per pass and only while somebody is actually watching, so
+/// an unwatched broker pays nothing for this.
+pub(super) fn service_running_program_watchers(
+    connections: &mut RuntimeConnections,
+    state: &BrokerState,
+) -> bool {
+    if connections.watchers.is_empty() {
+        return false;
+    }
+
+    let programs = running_program_snapshot(state);
+    let digest = running_programs_digest(&programs);
+    let now = Instant::now();
+    let mut answered = false;
+    for _ in 0..connections.watchers.len() {
+        let Some(mut watcher) = connections.watchers.pop_front() else {
+            break;
+        };
+        if digest == watcher.known_digest && now < watcher.deadline {
+            connections.watchers.push_back(watcher);
+            continue;
+        }
+        answered = true;
+        if let Err(err) =
+            write_running_programs(&mut watcher.stream, OP_WATCH_RUNNING_PROGRAMS, &programs)
+        {
+            write_runtime_error(&mut watcher.stream, err);
+        }
+    }
+    answered
 }
 
 fn read_request_progress(client: &mut PendingRuntimeClient) -> Result<RequestReadProgress, i32> {
@@ -284,9 +389,10 @@ fn runtime_peer_credentials(fd: i32) -> std::io::Result<RuntimePeerCredentials> 
 fn runtime_request_role_authorized(op: u16, is_uiserver: bool, is_logical_admin: bool) -> bool {
     match op {
         OP_NOTIFY_READY => is_uiserver,
-        OP_SNAPSHOT_RUNNING_PROGRAMS | OP_REQUEST_LAUNCH_PATH | OP_REQUEST_TERMINATE => {
-            is_uiserver || is_logical_admin
-        }
+        OP_SNAPSHOT_RUNNING_PROGRAMS
+        | OP_WATCH_RUNNING_PROGRAMS
+        | OP_REQUEST_LAUNCH_PATH
+        | OP_REQUEST_TERMINATE => is_uiserver || is_logical_admin,
         _ => false,
     }
 }
@@ -313,20 +419,33 @@ fn authorize_runtime_request(
     }
 }
 
-fn service_request(
-    stream: &mut UnixStream,
+/// Everything a request must survive before any handler sees it: the wire
+/// version, the shape rules for its opcode, and the peer's live role. Split
+/// from dispatch because a watch is admitted the same way as every other
+/// request but is not answered the same way.
+fn admit_request(
+    request: &RuntimeRequest,
     peer: RuntimePeerCredentials,
-    request: RuntimeRequest,
-    state: &mut BrokerState,
+    state: &BrokerState,
 ) -> Result<(), i32> {
     if request.version != PROTOCOL_VERSION {
         return Err(libc::EPROTO);
     }
-    super::util::validate_runtime_request(&request)?;
-    authorize_runtime_request(&request, peer, state)?;
+    super::util::validate_runtime_request(request)?;
+    authorize_runtime_request(request, peer, state)
+}
 
+fn dispatch_request(
+    stream: &mut UnixStream,
+    request: RuntimeRequest,
+    state: &mut BrokerState,
+) -> Result<(), i32> {
     match request.op {
-        OP_SNAPSHOT_RUNNING_PROGRAMS => handle_snapshot(stream, state),
+        OP_SNAPSHOT_RUNNING_PROGRAMS => write_running_programs(
+            stream,
+            OP_SNAPSHOT_RUNNING_PROGRAMS,
+            &running_program_snapshot(state),
+        ),
         OP_REQUEST_LAUNCH_PATH => handle_launch(stream, state, request),
         OP_REQUEST_TERMINATE => handle_terminate(stream, state, request),
         OP_NOTIFY_READY => handle_ready(stream, state, request),
@@ -334,7 +453,10 @@ fn service_request(
     }
 }
 
-fn handle_snapshot(stream: &mut UnixStream, state: &BrokerState) -> Result<(), i32> {
+/// The exact running-program array a reply would carry, in the exact order it
+/// would carry it. Both the snapshot reply and the watch change edge read this,
+/// so a watcher's digest is taken over the same bytes the caller will hash.
+fn running_program_snapshot(state: &BrokerState) -> Vec<RuntimeRunningProgram> {
     let mut programs = state
         .running
         .values()
@@ -351,12 +473,20 @@ fn handle_snapshot(stream: &mut UnixStream, state: &BrokerState) -> Result<(), i
         })
         .collect::<Vec<_>>();
     programs.sort_by_key(|program| program.pid);
+    programs
+}
 
+fn write_running_programs(
+    stream: &mut UnixStream,
+    op: u16,
+    programs: &[RuntimeRunningProgram],
+) -> Result<(), i32> {
+    debug_assert!(op_carries_program_payload(op));
     super::util::write_response(
         stream,
         RuntimeResponse {
             version: PROTOCOL_VERSION,
-            op: OP_SNAPSHOT_RUNNING_PROGRAMS,
+            op,
             status: 0,
             count: u32::try_from(programs.len()).unwrap_or(u32::MAX),
         },
@@ -366,7 +496,7 @@ fn handle_snapshot(stream: &mut UnixStream, state: &BrokerState) -> Result<(), i
             .write_all(unsafe {
                 std::slice::from_raw_parts(
                     programs.as_ptr().cast::<u8>(),
-                    std::mem::size_of_val(programs.as_slice()),
+                    std::mem::size_of_val(programs),
                 )
             })
             .map_err(super::util::io_errno)?;
@@ -685,23 +815,24 @@ fn last_errno() -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
+    use std::collections::VecDeque;
+    use std::io::{ErrorKind, Read, Write};
     use std::os::unix::net::UnixStream;
     use std::time::Instant;
 
     use super::{
         launch_may_precede_ui_ready, launch_retry_backoff, read_request_progress,
         runtime_request_role_authorized, PendingRuntimeClient, RequestReadProgress,
-        RuntimePeerCredentials, OP_NOTIFY_READY, OP_REQUEST_LAUNCH_PATH, OP_REQUEST_TERMINATE,
-        OP_SNAPSHOT_RUNNING_PROGRAMS,
+        RuntimeConnections, RuntimePeerCredentials, OP_NOTIFY_READY, OP_REQUEST_LAUNCH_PATH,
+        OP_REQUEST_TERMINATE, OP_SNAPSHOT_RUNNING_PROGRAMS, OP_WATCH_RUNNING_PROGRAMS,
     };
     use crate::kvm_smp_qualification::{
         inject_kvm_smp_qualification_launch, KvmSmpQualificationContract,
     };
     use crate::{
-        LaunchEntry, RuntimeRequest, DEFAULT_USER_TASK_WEIGHT_MICROS, MAX_LAUNCH_RETRY_BACKOFF,
-        RETRY_BACKOFF, SERVICE_REQUEST_TIMEOUT, STORAGE_NOT_READY_RETRY_BACKOFF,
-        UI_SERVER_EXEC_PATH,
+        BrokerState, LaunchEntry, RunningProcess, RuntimeRequest, DEFAULT_USER_TASK_WEIGHT_MICROS,
+        MAX_LAUNCH_RETRY_BACKOFF, RETRY_BACKOFF, SERVICE_REQUEST_TIMEOUT,
+        STORAGE_NOT_READY_RETRY_BACKOFF, UI_SERVER_EXEC_PATH,
     };
 
     #[test]
@@ -784,10 +915,180 @@ mod tests {
         assert_eq!(client.request.op, OP_SNAPSHOT_RUNNING_PROGRAMS);
     }
 
+    /// Build a watch request the way a client would, carrying the digest the
+    /// caller believes in.
+    fn watch_client(stream: UnixStream, known_digest: u64, wait_ms: u16) -> PendingRuntimeClient {
+        PendingRuntimeClient {
+            stream,
+            peer: RuntimePeerCredentials {
+                pid: std::process::id() as i32,
+            },
+            request: RuntimeRequest {
+                op: OP_WATCH_RUNNING_PROGRAMS,
+                target_value: known_digest,
+                wait_ms,
+                ..RuntimeRequest::default()
+            },
+            bytes_read: 0,
+            deadline: Instant::now() + SERVICE_REQUEST_TIMEOUT,
+        }
+    }
+
+    fn state_running(pids: &[i32]) -> BrokerState {
+        let mut state = BrokerState::default();
+        for pid in pids {
+            state.running.insert(
+                *pid,
+                RunningProcess {
+                    pid: *pid,
+                    package_id: format!("pkg{pid}"),
+                    desktop_file_id: format!("pkg{pid}.desktop"),
+                    display_name: format!("Program {pid}"),
+                    exec: format!("apps/pkg{pid}/pkg{pid}.elf"),
+                    session_handle: 0,
+                    restart: false,
+                    logical_admin: false,
+                },
+            );
+        }
+        state
+    }
+
+    fn peer_has_reply(stream: &UnixStream) -> bool {
+        let mut probe = [0_u8; 1];
+        stream.set_nonblocking(true).expect("nonblocking probe");
+        !matches!(
+            (&mut &*stream).read(&mut probe),
+            Err(err) if err.kind() == ErrorKind::WouldBlock
+        )
+    }
+
+    #[test]
+    fn a_watch_that_matches_the_running_set_is_held_rather_than_answered() {
+        let state = state_running(&[11, 12]);
+        let digest = super::running_programs_digest(&super::running_program_snapshot(&state));
+        let (peer, server) = UnixStream::pair().expect("socket pair");
+        let mut watchers = VecDeque::new();
+
+        super::begin_running_program_watch(
+            watch_client(server, digest, 1_000),
+            &state,
+            &mut watchers,
+        );
+
+        assert_eq!(watchers.len(), 1, "a matching watch must be retained");
+        assert!(
+            !peer_has_reply(&peer),
+            "holding the reply is the whole point; answering it restores the poll"
+        );
+    }
+
+    #[test]
+    fn a_watch_holding_a_stale_digest_is_answered_without_parking() {
+        let state = state_running(&[11]);
+        let (peer, server) = UnixStream::pair().expect("socket pair");
+        let mut watchers = VecDeque::new();
+
+        super::begin_running_program_watch(watch_client(server, 0, 1_000), &state, &mut watchers);
+
+        assert!(watchers.is_empty(), "a ready answer must never park");
+        assert!(peer_has_reply(&peer));
+    }
+
+    #[test]
+    fn a_change_to_the_running_set_answers_every_parked_watch() {
+        let mut state = state_running(&[11]);
+        let digest = super::running_programs_digest(&super::running_program_snapshot(&state));
+        let mut connections = RuntimeConnections::default();
+        let peers = (0..3)
+            .map(|_| {
+                let (peer, server) = UnixStream::pair().expect("socket pair");
+                super::begin_running_program_watch(
+                    watch_client(server, digest, 60_000),
+                    &state,
+                    &mut connections.watchers,
+                );
+                peer
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(connections.watchers.len(), 3);
+        assert!(
+            !super::service_running_program_watchers(&mut connections, &state),
+            "an unchanged set owes nobody an answer"
+        );
+
+        state = state_running(&[11, 12]);
+        assert!(super::service_running_program_watchers(
+            &mut connections,
+            &state
+        ));
+        assert!(connections.watchers.is_empty());
+        for peer in &peers {
+            assert!(peer_has_reply(peer));
+        }
+    }
+
+    #[test]
+    fn an_expired_park_re_arms_the_watcher_instead_of_holding_it_forever() {
+        let state = state_running(&[11]);
+        let digest = super::running_programs_digest(&super::running_program_snapshot(&state));
+        let mut connections = RuntimeConnections::default();
+        let (peer, server) = UnixStream::pair().expect("socket pair");
+        // A zero budget is the shortest legal park: the caller is told nothing
+        // changed rather than left unable to distinguish that from a hang.
+        super::begin_running_program_watch(
+            watch_client(server, digest, 0),
+            &state,
+            &mut connections.watchers,
+        );
+        assert_eq!(connections.watchers.len(), 1);
+
+        assert!(super::service_running_program_watchers(
+            &mut connections,
+            &state
+        ));
+        assert!(connections.watchers.is_empty());
+        assert!(peer_has_reply(&peer));
+    }
+
+    #[test]
+    fn the_watcher_budget_degrades_to_an_immediate_answer_rather_than_pinning_descriptors() {
+        let state = state_running(&[11]);
+        let digest = super::running_programs_digest(&super::running_program_snapshot(&state));
+        let mut watchers = VecDeque::new();
+        let _held = (0..super::MAX_RUNTIME_WATCHERS)
+            .map(|_| {
+                let (peer, server) = UnixStream::pair().expect("socket pair");
+                super::begin_running_program_watch(
+                    watch_client(server, digest, 60_000),
+                    &state,
+                    &mut watchers,
+                );
+                peer
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(watchers.len(), super::MAX_RUNTIME_WATCHERS);
+
+        let (peer, server) = UnixStream::pair().expect("socket pair");
+        super::begin_running_program_watch(
+            watch_client(server, digest, 60_000),
+            &state,
+            &mut watchers,
+        );
+
+        assert_eq!(
+            watchers.len(),
+            super::MAX_RUNTIME_WATCHERS,
+            "the budget is a ceiling on pinned descriptors, not a queue"
+        );
+        assert!(peer_has_reply(&peer));
+    }
+
     #[test]
     fn runtime_control_mutations_require_live_uiserver_or_logical_admin() {
         for op in [
             OP_SNAPSHOT_RUNNING_PROGRAMS,
+            OP_WATCH_RUNNING_PROGRAMS,
             OP_REQUEST_LAUNCH_PATH,
             OP_REQUEST_TERMINATE,
         ] {

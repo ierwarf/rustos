@@ -416,7 +416,7 @@ fi
 # sleep here puts the entire idle interval in front of every synchronous caller,
 # which is how a 10 ms sleep became the dominant term in keystroke latency.
 runtimed_idle_body="$(
-    sed -n '/^        let idle_delay = spawn::next_idle_delay(&state);/,/^    }$/p' \
+    sed -n '/^        let idle_delay =$/,/^    }$/p' \
         services/runtimed/src/main.rs
 )"
 if ! grep -Fq 'service_session_endpoint(session_endpoint, &mut state, Some(idle_delay))' \
@@ -431,8 +431,11 @@ fi
 runtimed_delay_body="$(
     sed -n '/^pub(super) fn next_idle_delay(/,/^}/p' services/runtimed/src/spawn.rs
 )"
-if ! grep -Fq 'earliest_console_read_deadline()' <<<"$runtimed_delay_body"; then
-    echo 'the runtimed idle budget must include the soonest parked console-read deadline' >&2
+if ! grep -Fq 'earliest_console_read_deadline()' <<<"$runtimed_delay_body" \
+    || ! grep -Fq '.min(parked_read_delay)' <<<"$runtimed_delay_body" \
+    || ! grep -Fq 'earliest_watch_deadline' <<<"$runtimed_delay_body" \
+    || ! grep -Fq '.min(parked_watch_delay)' <<<"$runtimed_delay_body"; then
+    echo 'the runtimed idle budget must include every reply deadline it is holding' >&2
     exit 1
 fi
 # The runtimed control socket is deliberately non-blocking so a dead peer cannot
@@ -440,13 +443,69 @@ fi
 # descriptor: uiserver and sessiond issue these RPCs on their own hot paths, and
 # a yield loop here burns a core against the very service it is waiting for.
 runtime_rpc_body="$(
-    sed -n '/^fn write_all_retry(/,/^}/p;/^fn read_exact_retry(/,/^}/p' \
+    sed -n '/^fn write_all_retry_until(/,/^}/p;/^fn read_exact_retry_until(/,/^}/p' \
         libs/runtime-control/src/lib.rs
 )"
 if grep -Fq 'thread::yield_now()' <<<"$runtime_rpc_body" \
     || ! grep -Fq 'wait_for_socket_ready(stream, deadline, libc::POLLOUT)' <<<"$runtime_rpc_body" \
     || ! grep -Fq 'wait_for_socket_ready(stream, deadline, libc::POLLIN)' <<<"$runtime_rpc_body"; then
     echo 'the runtimed control RPC must wait on the socket for readiness, never spin yielding' >&2
+    exit 1
+fi
+# The control wire had two definitions - one per crate - and nothing checked
+# them against each other. A silent divergence in an opcode or a frame field is
+# not a build error, so the server must consume the client's protocol module
+# rather than redeclare any part of it.
+if runtimed_protocol_copy="$(rg -n '^pub\(crate\) const (PROTOCOL_VERSION|OP_[A-Z_]+|LAUNCH_TARGET_[A-Z_]+|TERMINATE_TARGET_[A-Z_]+|READY_COMPONENT_[A-Z_]+|MAX_REQUEST_PATH_BYTES|MAX_RUNTIME_PROGRAMS)\b|^pub\(crate\) struct Runtime(Request|Response)\b' services/runtimed/src)" \
+    && [[ -n "$runtimed_protocol_copy" ]]; then
+    printf '%s\n' "$runtimed_protocol_copy" >&2
+    echo 'the runtimed control protocol must have one definition, not a private server copy' >&2
+    exit 1
+fi
+if ! rg -Fq 'pub(crate) use runtime_control::protocol::{' services/runtimed/src/main.rs; then
+    echo 'runtimed must consume the shared runtime-control protocol module' >&2
+    exit 1
+fi
+# The change edge is defined by the bytes a reply would carry, not by a counter
+# the server bumps at each mutation site. A counter that misses one site parks a
+# watcher through the very change it asked about, and nothing fails until a
+# taskbar silently stops updating.
+watch_service_body="$(
+    sed -n '/^pub(super) fn service_running_program_watchers(/,/^}/p' \
+        services/runtimed/src/socket.rs
+)"
+if ! grep -Fq 'let programs = running_program_snapshot(state);' <<<"$watch_service_body" \
+    || ! grep -Fq 'let digest = running_programs_digest(&programs);' <<<"$watch_service_body" \
+    || ! grep -Fq 'now < watcher.deadline' <<<"$watch_service_body"; then
+    echo 'a parked watch must be judged by the digest of the reply itself and re-armed at its deadline' >&2
+    exit 1
+fi
+# Watchers are answered from the broker pass, so the pass has to visit them.
+# Without this call a held reply is owed forever and the callers that stopped
+# polling never hear about a launch or an exit.
+if ! rg -Fq 'socket::service_running_program_watchers(&mut runtime_connections, &state)' \
+    services/runtimed/src/main.rs; then
+    echo 'the runtimed loop must publish the running-set edge to parked watchers every pass' >&2
+    exit 1
+fi
+# uiserver and sessiond were the two permanent pollers of that set. Each paid a
+# full snapshot round trip per interval, forever, to be told nothing changed.
+uiserver_sync_body="$(
+    sed -n '/^fn runtime_sync_worker(/,/^}/p' services/uiserver/src/runtime_sync.rs
+)"
+if ! grep -Fq 'runtime.watch_running_programs(observed_digest, RUNTIME_WATCH_WAIT)' \
+    <<<"$uiserver_sync_body" \
+    || grep -Fq 'snapshot_running_programs()' <<<"$uiserver_sync_body"; then
+    echo 'the uiserver runtime sync must park on the running-set change edge, not poll a snapshot' >&2
+    exit 1
+fi
+sessiond_observe_body="$(
+    sed -n '/^fn observe_running_programs(/,/^}/p' services/sessiond/src/main.rs
+)"
+if ! grep -Fq 'runtime.watch_running_programs(*observed_digest, idle_watch_wait(retry_after))' \
+    <<<"$sessiond_observe_body" \
+    || ! grep -Fq 'if launch_pending {' <<<"$sessiond_observe_body"; then
+    echo 'an idle sessiond must park on the running-set change edge and keep the tight cadence only while a launch is pending' >&2
     exit 1
 fi
 # Rootd has the same lifecycle/control split as runtimed: its bounded drain may

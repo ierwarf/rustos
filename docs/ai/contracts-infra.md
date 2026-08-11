@@ -151,16 +151,33 @@ or launch policy.
 ## Runtime Control
 
 - Client crate: `libs/runtime-control`.
+- Wire protocol: `libs/runtime-control/src/protocol.rs` is its **only**
+  definition. Runtimed consumes that module; it must not redeclare an opcode,
+  a target kind, a capacity, or either frame struct. The two used to be
+  separate private copies with nothing comparing them, so a divergence would
+  have surfaced as a runtime `EPROTO` rather than a build failure.
 - Default socket: `/run/runtimed.sock`.
-- Main methods: `snapshot_running_programs`, `request_launch_program_new_session`, `request_terminate_session`, `request_terminate_pid`, `notify_ui_ready`.
+- Main methods: `snapshot_running_programs`, `watch_running_programs`,
+  `request_launch_program_new_session`, `request_terminate_session`,
+  `request_terminate_pid`, `notify_ui_ready`.
 - `notify_ui_ready` is one-way: runtimed records readiness without replying,
   so compositor bootstrap never waits on a closed readiness stream.
+- `watch_running_programs` is `snapshot_running_programs` with the reply
+  withheld until the running set stops matching the digest the caller passes
+  back. It is how uiserver's taskbar and sessiond's restart policy observe
+  launches and exits; neither polls a snapshot on a timer. Callers pass
+  `RUNNING_PROGRAMS_DIGEST_UNKNOWN` on the first call to be answered
+  immediately, and recompute the next digest from the array they receive - the
+  digest itself never crosses the socket. An unchanged digest means the server
+  re-armed, which is liveness, not an error.
 - For request/reply operations, a successful `RuntimeResponse` must echo the
-  exact request opcode. Only `OP_SNAPSHOT_RUNNING_PROGRAMS` may carry a count,
-  which is capped at `MAX_RUNTIME_PROGRAMS`; command replies have zero count.
-  After a current-version check, negative status is the server-error envelope
-  (whose opcode may be zero), but positive or `i32::MIN` status is malformed
-  and fails closed as `EPROTO`.
+  exact request opcode. Only ops for which `op_carries_program_payload` holds -
+  `OP_SNAPSHOT_RUNNING_PROGRAMS` and `OP_WATCH_RUNNING_PROGRAMS` - may carry a
+  count, which is capped at `MAX_RUNTIME_PROGRAMS`; command replies have zero
+  count. Parking changes when a watch is answered, never what it may answer
+  with. After a current-version check, negative status is the server-error
+  envelope (whose opcode may be zero), but positive or `i32::MIN` status is
+  malformed and fails closed as `EPROTO`.
 - Request text max: `MAX_REQUEST_PATH_BYTES`.
 - `runtimed` loads the runtime launch catalog on its main loop after UI ready.
   Desktop metadata and runtime-launch policy have separate immutable caches;

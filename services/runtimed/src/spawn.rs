@@ -495,7 +495,10 @@ pub(super) fn reap_children(state: &mut BrokerState) -> bool {
 /// into this value gets serviced late by however long the idle wait happens to
 /// be - which is exactly how a parked console read could outlive its budget
 /// while the broker slept with nothing else to do.
-pub(super) fn next_idle_delay(state: &BrokerState) -> Duration {
+pub(super) fn next_idle_delay(
+    state: &BrokerState,
+    earliest_watch_deadline: Option<Instant>,
+) -> Duration {
     let now = Instant::now();
     let retry_delay = state
         .retry_after
@@ -508,7 +511,15 @@ pub(super) fn next_idle_delay(state: &BrokerState) -> Duration {
         .earliest_console_read_deadline()
         .map(|deadline| deadline.saturating_duration_since(now))
         .unwrap_or(IDLE_POLL_INTERVAL);
-    retry_delay.min(parked_read_delay).min(IDLE_POLL_INTERVAL)
+    // Every reply this broker is holding owes its deadline to the wait, or the
+    // broker can idle straight past a promise it made.
+    let parked_watch_delay = earliest_watch_deadline
+        .map(|deadline| deadline.saturating_duration_since(now))
+        .unwrap_or(IDLE_POLL_INTERVAL);
+    retry_delay
+        .min(parked_read_delay)
+        .min(parked_watch_delay)
+        .min(IDLE_POLL_INTERVAL)
 }
 
 pub(super) fn spawn_exec(

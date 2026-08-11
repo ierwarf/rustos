@@ -14,8 +14,13 @@ share the same outcome matrix.
 
 CONSTANT MaxPrograms
 
-RequestOps == {"snapshot", "launch", "terminate", "ready"}
+RequestOps == {"snapshot", "watch", "launch", "terminate", "ready"}
 ResponseOps == RequestOps \cup {"unknown"}
+(* A watch is a snapshot whose reply the server withheld until the running set
+   moved. Holding a reply changes when it arrives, never what it may contain, so
+   both ops admit a payload under one rule and every bound below is stated over
+   this set rather than over "snapshot". *)
+PayloadOps == {"snapshot", "watch"}
 StatusKinds == {"ok", "server-error", "positive", "minimum"}
 Versions == {"current", "wrong"}
 Outcomes == {"pending", "success", "server-error", "protocol", "overflow"}
@@ -29,7 +34,7 @@ Classify(req, response, responseStatus, responseVersion, responseCount) ==
     ELSE IF responseStatus = "server-error" THEN "server-error"
     ELSE IF responseStatus # "ok" THEN "protocol"
     ELSE IF response # req THEN "protocol"
-    ELSE IF req = "snapshot" THEN
+    ELSE IF req \in PayloadOps THEN
         IF responseCount <= MaxPrograms THEN "success" ELSE "overflow"
     ELSE IF responseCount = 0 THEN "success" ELSE "protocol"
 
@@ -51,7 +56,7 @@ ReceiveResponse ==
     /\ count' \in 0..(MaxPrograms + 1)
     /\ outcome' = Classify(requestOp, responseOp', status', version', count')
     /\ payloadCount' =
-        IF outcome' = "success" /\ requestOp = "snapshot" THEN count' ELSE 0
+        IF outcome' = "success" /\ requestOp \in PayloadOps THEN count' ELSE 0
     /\ responseReceived' = TRUE
     /\ UNCHANGED requestOp
 
@@ -74,12 +79,12 @@ SuccessEchoesExactRequest ==
         /\ responseOp = requestOp
 
 SuccessfulSnapshotIsBounded ==
-    outcome = "success" /\ requestOp = "snapshot" =>
+    outcome = "success" /\ requestOp \in PayloadOps =>
         /\ count <= MaxPrograms
         /\ payloadCount = count
 
 SuccessfulCommandHasNoPayload ==
-    outcome = "success" /\ requestOp # "snapshot" =>
+    outcome = "success" /\ requestOp \notin PayloadOps =>
         /\ count = 0
         /\ payloadCount = 0
 
@@ -97,7 +102,7 @@ NonSuccessHasNoPayloadAuthority ==
 
 OverflowIsSnapshotOnly ==
     outcome = "overflow" =>
-        /\ requestOp = "snapshot"
+        /\ requestOp \in PayloadOps
         /\ responseOp = requestOp
         /\ version = "current"
         /\ status = "ok"
