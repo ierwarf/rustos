@@ -625,6 +625,13 @@ fn handle_ready(
 }
 
 pub(super) fn ensure_policy_launches(state: &mut BrokerState) -> bool {
+    // One supervisor transaction at a time. While a launch is in flight the
+    // loop still owns every decision about it - it records the pid and applies
+    // the outcome - but starting a second would mean two children racing for
+    // the same launch bookkeeping.
+    if state.launch_in_flight.is_some() {
+        return false;
+    }
     let now = Instant::now();
     let running_programs = state
         .running
@@ -731,19 +738,18 @@ pub(super) fn ensure_policy_launches(state: &mut BrokerState) -> bool {
         }
 
         attempts += 1;
-        match super::spawn::spawn_tracked_process(state, entry.clone()) {
+        // Hand the launch to its worker rather than running it here. Every
+        // console caller the loop owns - a keystroke, a parked read, the
+        // compositor's parked graph wait - waits for this pass to end, and a
+        // launch performed inline made that 149 ms.
+        match super::spawn::begin_tracked_launch(state, entry.clone()) {
             Ok(()) => {
-                observability_client::info!(
-                    "runtimed",
-                    service,
-                    "launched {} ({})",
-                    entry.desktop_file_id,
-                    entry.exec
-                );
                 launched_any = true;
-                if !entry.restart {
-                    state.launched_once.insert(entry.package_id);
-                }
+                // The launch has not finished; the terminal bookkeeping is
+                // applied when the worker reports. `launched_once` is recorded
+                // there too, so a launch that fails cannot mark its package as
+                // already started.
+                break;
             }
             Err(err) => {
                 if super::spawn::is_permanent_launch_failure(err) {

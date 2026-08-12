@@ -58,6 +58,263 @@ struct KvmAcceptanceContract {
     network_exercise: bool,
 }
 
+/// What the loop remembers about a launch the worker is running.
+///
+/// The worker never touches `BrokerState`, so everything the terminal
+/// bookkeeping needs has to be kept here rather than read back out of it.
+pub(crate) struct InFlightLaunch {
+    pub(crate) package_id: String,
+    pub(crate) desktop_file_id: String,
+    pub(crate) display_name: String,
+    pub(crate) exec: String,
+    pub(crate) session_handle: Option<u64>,
+    pub(crate) restart: bool,
+    pub(crate) logical_admin: bool,
+    /// Set once the loop has recorded the child, which is what tells the
+    /// failure path whether there is a record to drop.
+    pub(crate) recorded_pid: Option<i32>,
+}
+
+/// The calls the launch worker makes, bound to the real services.
+pub(super) fn launch_calls() -> crate::launch_worker::LaunchCalls {
+    crate::launch_worker::LaunchCalls {
+        spawn: |entry, session_handle| {
+            // Applied here rather than on the loop. It reads a policy file from
+            // the DVM volume, and it deliberately does not cache a failure - the
+            // file is legitimately absent until storaged is up - so every launch
+            // attempt before then repeats the read. On the loop that cost 83 ms
+            // per attempt, paid by every console caller. It only edits the
+            // child's environment, so nothing the loop already decided about
+            // this entry depends on it.
+            let mut entry = entry.clone();
+            apply_kvm_acceptance_contract(&mut entry);
+            let entry = &entry;
+            // The child is created start-suspended. It becomes runnable only
+            // after the loop has recorded it; see `launch_worker`.
+            spawn_exec(
+                entry.exec.as_str(),
+                entry.args.as_slice(),
+                entry.env.as_slice(),
+                entry.logical_admin,
+                entry.weight_micros,
+                session_handle,
+                true,
+            )
+        },
+        report_lease: |entry, pid| {
+            report_rootd_service_lease(IPC_SERVICE_UISERVER, entry.exec.as_str(), pid)
+        },
+        bind_and_activate: |pid, contract| {
+            bind_then_activate_spawned_process(
+                pid,
+                contract,
+                bind_smp_qualification,
+                activate_spawned_process,
+            )
+            .map_err(|(stage, errno)| (stage.cleanup_stage(), errno))
+        },
+        await_endpoint: |pid| wait_for_service_endpoint(IPC_SERVICE_UISERVER, pid).map(|_| ()),
+        retire: retire_failed_spawn_or_abort,
+    }
+}
+
+/// Start a launch on the worker, taking the loop-owned steps here and leaving
+/// every blocking service call to it.
+///
+/// The console session is allocated on this side because it is `BrokerState`,
+/// and because a session that exists before the child does is what lets the
+/// compositor show the window while the image is still loading.
+pub(super) fn begin_tracked_launch(
+    state: &mut BrokerState,
+    entry: LaunchEntry,
+) -> Result<(), i32> {
+    // The acceptance contract is applied by the worker; it is a storage read
+    // and it only rewrites the child's environment, so nothing decided below
+    // depends on it.
+    let qualification_contract =
+        qualification_contract_for_launch(&entry).map_err(|()| libc::EINVAL)?;
+    if state.launch_worker.is_none() {
+        // No worker: run the transaction inline rather than not at all. This is
+        // the old behaviour, head-of-line blocking included, and it is reserved
+        // for a broker that could not create a thread.
+        return spawn_tracked_process(state, entry);
+    }
+    boot_line(
+        format!(
+            "runtimed: spawn begin desktop_id={} exec={} console_hosted={} logical_admin={}",
+            entry.desktop_file_id, entry.exec, entry.console_hosted, entry.logical_admin
+        )
+        .as_str(),
+    );
+    let session_handle = if entry.console_hosted {
+        let _ = ensure_console_fd(state)?;
+        let session = allocate_console_session(state);
+        state.session_runtime.create_session(session);
+        Some(session)
+    } else {
+        None
+    };
+    let is_ui_server = entry.exec == UI_SERVER_EXEC_PATH;
+    let in_flight = InFlightLaunch {
+        package_id: entry.package_id.clone(),
+        desktop_file_id: entry.desktop_file_id.clone(),
+        display_name: entry.display_name.clone(),
+        exec: entry.exec.clone(),
+        session_handle,
+        restart: entry.restart,
+        logical_admin: entry.logical_admin,
+        recorded_pid: None,
+    };
+    let submitted = state
+        .launch_worker
+        .as_ref()
+        .map(|worker| {
+            worker.submit(crate::launch_worker::LaunchJob {
+                entry,
+                qualification_contract,
+                session_handle,
+                is_ui_server,
+            })
+        })
+        .unwrap_or(Err(libc::EPIPE));
+    if let Err(errno) = submitted {
+        release_failed_session(state, session_handle);
+        return Err(errno);
+    }
+    state.launch_in_flight = Some(in_flight);
+    Ok(())
+}
+
+/// Apply whatever the launch worker has reported. Returns whether anything was
+/// applied, so the loop knows this pass did work.
+///
+/// # Why the record happens here and not in the worker
+/// A child that becomes runnable before runtimed owns its pid is unsupervised:
+/// it can exit into a reaper that has never heard of it. The worker therefore
+/// blocks after creating the suspended child and does not activate it until
+/// this function has answered. Running the launch off the loop changed where
+/// the blocking calls happen, not that ordering.
+pub(super) fn service_launch_worker(state: &mut BrokerState) -> bool {
+    let mut applied = false;
+    loop {
+        let Some(worker) = state.launch_worker.as_ref() else {
+            return applied;
+        };
+        let Some(progress) = worker.poll() else {
+            return applied;
+        };
+        applied = true;
+        match progress {
+            crate::launch_worker::LaunchProgress::Spawned { pid } => {
+                record_spawned_launch(state, pid);
+            }
+            crate::launch_worker::LaunchProgress::Finished { pid, result } => {
+                finish_tracked_launch(state, pid, result);
+            }
+        }
+    }
+}
+
+fn record_spawned_launch(state: &mut BrokerState, pid: i32) {
+    let Some(in_flight) = state.launch_in_flight.as_ref() else {
+        // Nothing is in flight, so this child has no owner here. Refusing it is
+        // what makes the worker retire it rather than activate an orphan.
+        if let Some(worker) = state.launch_worker.as_ref() {
+            worker.acknowledge(crate::launch_worker::RecordAck::Duplicate);
+        }
+        return;
+    };
+    if state.running.contains_key(&pid) {
+        if let Some(worker) = state.launch_worker.as_ref() {
+            worker.acknowledge(crate::launch_worker::RecordAck::Duplicate);
+        }
+        return;
+    }
+    let record = RunningProcess {
+        pid,
+        package_id: in_flight.package_id.clone(),
+        desktop_file_id: in_flight.desktop_file_id.clone(),
+        display_name: in_flight.display_name.clone(),
+        exec: in_flight.exec.clone(),
+        session_handle: in_flight.session_handle.unwrap_or(0),
+        restart: in_flight.restart,
+        logical_admin: in_flight.logical_admin,
+    };
+    state.running.insert(pid, record);
+    if let Some(in_flight) = state.launch_in_flight.as_mut() {
+        in_flight.recorded_pid = Some(pid);
+    }
+    boot_line(format!("runtimed: spawned pid={pid}").as_str());
+    if let Some(worker) = state.launch_worker.as_ref() {
+        worker.acknowledge(crate::launch_worker::RecordAck::Recorded);
+    }
+}
+
+fn finish_tracked_launch(state: &mut BrokerState, pid: Option<i32>, result: Result<(), i32>) {
+    let Some(in_flight) = state.launch_in_flight.take() else {
+        return;
+    };
+    match result {
+        Ok(()) => {
+            observability_client::info!(
+                "runtimed",
+                service,
+                "launched {} ({})",
+                in_flight.desktop_file_id,
+                in_flight.exec
+            );
+            state.retry_after.remove(in_flight.desktop_file_id.as_str());
+            state
+                .launch_failure_counts
+                .remove(in_flight.desktop_file_id.as_str());
+            if !in_flight.restart {
+                state.launched_once.insert(in_flight.package_id);
+            }
+            if let Some(session) = in_flight.session_handle {
+                super::session::focus_session_after_spawn(state, session);
+            }
+        }
+        Err(errno) => {
+            // Drop the record only if this loop made one. A failure before the
+            // record leaves nothing to remove, and removing a pid the loop
+            // never inserted would take somebody else's.
+            if let Some(recorded) = in_flight.recorded_pid.filter(|recorded| Some(*recorded) == pid)
+            {
+                state.running.remove(&recorded);
+            }
+            release_failed_session(state, in_flight.session_handle);
+            if is_permanent_launch_failure(errno) {
+                observability_client::warn!(
+                    "runtimed",
+                    service,
+                    "launch {} ({}) disabled after permanent failure: errno={errno}",
+                    in_flight.desktop_file_id,
+                    in_flight.exec
+                );
+                state
+                    .permanent_launch_failures
+                    .insert(in_flight.desktop_file_id.clone(), errno);
+                state
+                    .launch_failure_counts
+                    .remove(in_flight.desktop_file_id.as_str());
+            } else {
+                observability_client::error!(
+                    "runtimed",
+                    service,
+                    "launch {} ({}) failed: errno={errno}",
+                    in_flight.desktop_file_id,
+                    in_flight.exec
+                );
+                super::socket::schedule_launch_retry(
+                    state,
+                    in_flight.desktop_file_id.as_str(),
+                    errno,
+                );
+            }
+        }
+    }
+}
+
 pub(super) fn spawn_tracked_process(
     state: &mut BrokerState,
     mut entry: LaunchEntry,
@@ -938,6 +1195,40 @@ fn last_errno() -> i32 {
 
 #[cfg(test)]
 mod tests {
+    /// The broker loop must not perform the launch's storage reads.
+    ///
+    /// `begin_tracked_launch` runs on the loop that is the console's only
+    /// receiver; the worker exists so the blocking calls do not. The acceptance
+    /// contract is the easiest one to put back by accident, because it looks
+    /// like a cheap entry rewrite and is in fact a DVM-volume read that
+    /// deliberately does not cache its failures - so before storaged is up it
+    /// repeats once per launch attempt, and it measured 83 ms per attempt when
+    /// it ran here.
+    #[test]
+    fn the_loop_side_of_a_launch_performs_no_storage_read() {
+        let source = include_str!("spawn.rs");
+        let body = source
+            .split_once("pub(super) fn begin_tracked_launch(")
+            .expect("the loop-side entry point exists")
+            .1;
+        let body = body
+            .split_once("\n/// Apply whatever the launch worker has reported")
+            .expect("it ends before the completion handler")
+            .0;
+        assert!(
+            !body.contains("apply_kvm_acceptance_contract("),
+            "the acceptance contract is a storage read and belongs to the worker"
+        );
+        assert!(
+            !body.contains("load_kvm_acceptance_contract("),
+            "nor may it be read directly here"
+        );
+        assert!(
+            !body.contains("spawn_exec("),
+            "the loader round trip belongs to the worker"
+        );
+    }
+
     use std::cell::RefCell;
 
     use super::{

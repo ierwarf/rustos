@@ -22,6 +22,8 @@ use rustos_user_abi::syscall::{
 };
 
 mod catalog;
+mod launch_worker;
+mod offload;
 mod kvm_smp_qualification;
 mod session;
 mod socket;
@@ -145,6 +147,21 @@ pub(crate) struct BrokerState {
     pub(crate) qualification_catalog_retry_after: Option<Instant>,
     pub(crate) qualification_catalog_last_error: Option<i32>,
     pub(crate) qualification_catalog_failures: u32,
+    /// The thread that performs a launch's blocking service calls, and the one
+    /// launch it currently has in flight.
+    ///
+    /// Absent only when the thread could not be created, in which case launches
+    /// run inline again - slowly, but not never.
+    pub(crate) launch_worker: Option<launch_worker::LaunchWorker>,
+    pub(crate) launch_in_flight: Option<spawn::InFlightLaunch>,
+    /// The private qualification contract read, which reaches DVM-volume
+    /// storage and took 104 ms on the loop.
+    pub(crate) qualification_load: Option<
+        offload::Offload<Result<Option<kvm_smp_qualification::KvmSmpQualificationContract>, i32>>,
+    >,
+    /// The signed launch catalog read. Also storage, also measured on the loop
+    /// - 70 ms at its worst - and the last one that ran there.
+    pub(crate) launch_catalog_load: Option<offload::Offload<catalog::LaunchCatalogLoad>>,
 }
 
 impl Default for BrokerState {
@@ -171,6 +188,16 @@ impl Default for BrokerState {
             qualification_catalog_retry_after: None,
             qualification_catalog_last_error: None,
             qualification_catalog_failures: 0,
+            launch_worker: launch_worker::start(spawn::launch_calls()),
+            launch_in_flight: None,
+            launch_catalog_load: offload::Offload::start(
+                "runtimed-launch-catalog",
+                catalog::load_launch_catalog_off_loop,
+            ),
+            qualification_load: offload::Offload::start(
+                "runtimed-qualification",
+                kvm_smp_qualification::load_kvm_smp_qualification_contract,
+            ),
         }
     }
 }
@@ -245,6 +272,11 @@ fn main() {
         pass.mark(LoopPhase::ConsoleWaiters);
         did_work |= spawn::reap_children(&mut state);
         pass.mark(LoopPhase::Reap);
+        // Before the watchers, so a launch that finished in this pass is
+        // published to anyone parked on the running set without waiting for the
+        // next one.
+        did_work |= spawn::service_launch_worker(&mut state);
+        pass.mark(LoopPhase::LaunchWorker);
         // Publish the running set to anyone parked on a change before the pass
         // does anything else with it. A launch later in this pass sets
         // `did_work`, which sends the loop straight back here, so a watcher
@@ -316,6 +348,7 @@ enum LoopPhase {
     Drain,
     ConsoleWaiters,
     Reap,
+    LaunchWorker,
     Watchers,
     UiBootstrap,
     Catalog,
@@ -325,7 +358,7 @@ enum LoopPhase {
 }
 
 impl LoopPhase {
-    const COUNT: usize = 9;
+    const COUNT: usize = 10;
 
     const fn index(self) -> usize {
         self as usize
@@ -336,6 +369,7 @@ impl LoopPhase {
             Self::Drain => "drain",
             Self::ConsoleWaiters => "console-waiters",
             Self::Reap => "reap",
+            Self::LaunchWorker => "launch-worker",
             Self::Watchers => "watchers",
             Self::UiBootstrap => "ui-bootstrap",
             Self::Catalog => "catalog",
@@ -407,6 +441,7 @@ impl LoopPassTiming {
                 LoopPhase::Drain,
                 LoopPhase::ConsoleWaiters,
                 LoopPhase::Reap,
+                LoopPhase::LaunchWorker,
                 LoopPhase::Watchers,
                 LoopPhase::UiBootstrap,
                 LoopPhase::Catalog,

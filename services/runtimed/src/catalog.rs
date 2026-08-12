@@ -25,7 +25,14 @@ pub(super) fn load_launch_catalog_into_state(state: &mut BrokerState) -> bool {
     debug_line("runtimed: launch catalog load begin");
     boot_line("runtimed: launch catalog load begin");
     let started_at = Instant::now();
-    let (programs, launch_entries) = match load_launch_catalog() {
+    // The registry is read off the loop for the same reason as the
+    // qualification contract: it is storage, it measured 70 ms here, and the
+    // loop is the console's only receiver. The policy applied to the result is
+    // unchanged and still applied here.
+    let Some(loaded) = request_launch_catalog(state) else {
+        return false;
+    };
+    let (programs, launch_entries) = match loaded {
         Ok(catalog) => catalog,
         Err(errno) => {
             state.launch_catalog_retry_after = Some(Instant::now() + RETRY_BACKOFF);
@@ -75,6 +82,32 @@ pub(super) fn load_launch_catalog_into_state(state: &mut BrokerState) -> bool {
     debug_line("runtimed: launch catalog load done");
     boot_line("runtimed: launch catalog load done");
     true
+}
+
+/// The launch catalog as the worker returns it.
+pub(crate) type LaunchCatalogLoad =
+    Result<(BTreeMap<String, ProgramMetadata>, Vec<LaunchEntry>), i32>;
+
+/// The worker's entry point. A plain function so the offload worker can hold it
+/// without borrowing anything the loop owns.
+pub(crate) fn load_launch_catalog_off_loop() -> LaunchCatalogLoad {
+    load_launch_catalog()
+}
+
+/// The catalog read's answer, if one is in hand; `None` while it is
+/// outstanding. Falls back to reading inline when there is no worker, so a
+/// broker that could not create a thread still boots.
+fn request_launch_catalog(state: &mut BrokerState) -> Option<LaunchCatalogLoad> {
+    let Some(load) = state.launch_catalog_load.as_ref() else {
+        return Some(load_launch_catalog());
+    };
+    if let Some(loaded) = load.poll() {
+        return Some(loaded);
+    }
+    if !load.busy() {
+        load.request();
+    }
+    None
 }
 
 pub(super) fn load_launch_catalog(
@@ -131,10 +164,15 @@ pub(super) fn reconcile_kvm_smp_qualification_into_state(state: &mut BrokerState
         return false;
     }
 
-    let candidate = match qualification_catalog_candidate(
-        &state.launch_entries,
-        super::kvm_smp_qualification::load_kvm_smp_qualification_contract(),
-    ) {
+    // The contract lives on a DVM volume, so reading it is a storage round
+    // trip - measured at 104 ms, which the broker loop paid in full while every
+    // console caller waited for the pass to end. Ask the worker and come back
+    // for the answer; the policy decisions below are unchanged and still made
+    // here.
+    let Some(loaded) = request_qualification_contract(state) else {
+        return false;
+    };
+    let candidate = match qualification_catalog_candidate(&state.launch_entries, loaded) {
         Ok(candidate) => candidate,
         Err(errno) => return defer_qualification_catalog_retry(state, errno),
     };
@@ -149,6 +187,27 @@ pub(super) fn reconcile_kvm_smp_qualification_into_state(state: &mut BrokerState
         boot_line("runtimed: private SMP qualification policy injected");
     }
     true
+}
+
+/// The contract read's answer, if one is in hand.
+///
+/// Returns `None` while the read is outstanding - the caller simply comes back
+/// next pass - and performs the read inline only when there is no worker to do
+/// it, which keeps a broker that could not create a thread working rather than
+/// stuck.
+fn request_qualification_contract(
+    state: &mut BrokerState,
+) -> Option<Result<Option<super::kvm_smp_qualification::KvmSmpQualificationContract>, i32>> {
+    let Some(load) = state.qualification_load.as_ref() else {
+        return Some(super::kvm_smp_qualification::load_kvm_smp_qualification_contract());
+    };
+    if let Some(loaded) = load.poll() {
+        return Some(loaded);
+    }
+    if !load.busy() {
+        load.request();
+    }
+    None
 }
 
 fn defer_qualification_catalog_retry(state: &mut BrokerState, errno: i32) -> bool {
