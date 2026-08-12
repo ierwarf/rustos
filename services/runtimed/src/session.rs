@@ -93,6 +93,11 @@ struct ConsoleReadWaiter {
 /// all moving. They share a shape, not a readiness test, and merging them
 /// would put a session handle on a waiter that is deliberately about no
 /// particular session.
+/// Total console graph advances, for release diagnostics only. A deadline
+/// release whose generation never moved is a different fault from one that
+/// moved and failed to wake the waiter, and only this separates them.
+static GRAPH_ADVANCES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 struct ConsoleGraphWaiter {
     /// Stored with `arg1` cleared, so completion re-runs the ordinary handler
     /// and answers immediately instead of parking a second time.
@@ -100,6 +105,7 @@ struct ConsoleGraphWaiter {
     reply_cap: u64,
     known_generation: u64,
     deadline: Instant,
+    parked_at: Instant,
 }
 
 pub(crate) struct SessionRuntime {
@@ -108,6 +114,13 @@ pub(crate) struct SessionRuntime {
     input_readiness_generation: u64,
     console_read_waiters: VecDeque<ConsoleReadWaiter>,
     console_graph_waiters: VecDeque<ConsoleGraphWaiter>,
+    /// When the graph token last moved.
+    ///
+    /// A parked wait released long after its edge and one released promptly
+    /// look identical in `waited_us`, because that measures the park, not the
+    /// edge. This separates "the broker sat on a due release" from "the release
+    /// was prompt and the time went somewhere after it".
+    last_advance: Option<Instant>,
 }
 
 impl Default for SessionRuntime {
@@ -118,6 +131,7 @@ impl Default for SessionRuntime {
             input_readiness_generation: 1,
             console_read_waiters: VecDeque::new(),
             console_graph_waiters: VecDeque::new(),
+            last_advance: None,
         }
     }
 }
@@ -162,6 +176,8 @@ impl SessionRuntime {
     /// deliberately stopped polling.
     fn advance_graph_generation(&mut self) {
         self.output_generation = self.output_generation.wrapping_add(1).max(1);
+        self.last_advance = Some(Instant::now());
+        GRAPH_ADVANCES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         #[cfg(not(test))]
         publish_console_graph_readiness(self.output_generation);
     }
@@ -306,6 +322,24 @@ struct TtySessionState {
     edit: Vec<u8>,
     edit_cursor: usize,
     output: VecDeque<u8>,
+    /// Total bytes ever pushed into `output`, which is a fixed-capacity ring.
+    ///
+    /// # Why the ring's length cannot be the change token
+    /// `push_output` evicts the oldest byte once the ring is full, so from that
+    /// moment every further write leaves `output.len()` at exactly
+    /// `OUTPUT_BUFFER_CAPACITY`. The bytes move, the snapshot the compositor
+    /// fetches changes - only the number used to notice it does not.
+    ///
+    /// Comparing lengths across a write therefore reports "nothing happened"
+    /// for every keystroke echo after the first 4096 bytes of session output,
+    /// which a shell reaches in a few screens. The graph generation then stops
+    /// advancing for echo, and the compositor - which has deliberately stopped
+    /// polling and is parked on that generation - waits out its entire re-arm
+    /// budget per keystroke. The output is not lost; it appears in a burst the
+    /// next time something else moves the token. That is exactly the
+    /// stall-then-burst this counter exists to prevent, and it is why the token
+    /// has to be monotonic rather than derived from a saturating length.
+    output_writes: u64,
     termios: LinuxTermios,
 }
 
@@ -316,6 +350,7 @@ impl Default for TtySessionState {
             edit: Vec::new(),
             edit_cursor: 0,
             output: VecDeque::new(),
+            output_writes: 0,
             termios: LinuxTermios::default_console(),
         }
     }
@@ -359,14 +394,20 @@ impl TtySessionState {
         count
     }
 
+    /// Apply one keystroke, reporting whether it changed what the console shows.
+    ///
+    /// The answer drives the console graph's change token, so it has to be
+    /// "did anything reach the output buffer", not "did the output buffer get
+    /// bigger". Those are the same question only until the ring saturates; see
+    /// [`TtySessionState::output_writes`].
     fn on_key_event(&mut self, event: InputEvent) -> Result<bool, i32> {
-        let before = self.output.len();
+        let before = self.output_writes;
         if self.termios.is_canonical() {
             self.on_canonical_key_event(event)?;
         } else {
             self.on_noncanonical_key_event(event)?;
         }
-        Ok(self.output.len() != before)
+        Ok(self.output_writes != before)
     }
 
     fn on_canonical_key_event(&mut self, event: InputEvent) -> Result<(), i32> {
@@ -540,6 +581,11 @@ impl TtySessionState {
             let _ = self.output.pop_front();
         }
         self.output.push_back(byte);
+        // Counted here rather than at the call sites, for the same reason the
+        // graph edge is published inside `advance_graph_generation`: every
+        // write to the visible buffer goes through this one method, so the
+        // record of it cannot be forgotten by a new caller.
+        self.output_writes = self.output_writes.wrapping_add(1);
     }
 }
 
@@ -756,6 +802,7 @@ pub(super) fn service_session_endpoint(
                 reply_cap,
                 known_generation,
                 deadline: Instant::now() + budget,
+                parked_at: Instant::now(),
             })
         {
             return true;
@@ -872,6 +919,7 @@ pub(super) fn service_console_graph_waiters(state: &mut BrokerState) -> bool {
     }
     let parked = std::mem::take(&mut state.session_runtime.console_graph_waiters);
     let generation = state.session_runtime.graph_generation();
+    let last_advance = state.session_runtime.last_advance;
     let now = Instant::now();
     let mut still_parked = VecDeque::new();
     let mut answered = false;
@@ -880,6 +928,10 @@ pub(super) fn service_console_graph_waiters(state: &mut BrokerState) -> bool {
             still_parked.push_back(waiter);
             continue;
         }
+        // A wait released by its deadline and one released by the edge it was
+        // waiting for cost the caller entirely different latencies, and only
+        // one of them is the design working. Say which.
+        report_console_graph_wait_release(&waiter, generation, now, last_advance);
         answer_parked_console_graph_wait(waiter, state);
         answered = true;
     }
@@ -892,6 +944,104 @@ pub(super) fn service_console_graph_waiters(state: &mut BrokerState) -> bool {
             .push_front(waiter);
     }
     answered
+}
+
+/// Reports how a parked graph wait ended: on the console graph moving, which
+/// is the design, or on its own deadline, which means the compositor paid the
+/// whole park budget for an edge that had already happened.
+///
+/// Rate limited to the first samples plus a sparse tail, because this fires
+/// once per compositor refresh for as long as the system is running.
+fn report_console_graph_wait_release(
+    waiter: &ConsoleGraphWaiter,
+    generation: u64,
+    now: Instant,
+    last_advance: Option<Instant>,
+) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    const EARLY_RELEASE_SAMPLES: u64 = 24;
+    static RELEASES: AtomicU64 = AtomicU64::new(0);
+    let total = RELEASES.fetch_add(1, Ordering::Relaxed) + 1;
+    if total > EARLY_RELEASE_SAMPLES && total % 64 != 0 {
+        return;
+    }
+    let waited_us = now
+        .saturating_duration_since(waiter.parked_at)
+        .as_micros()
+        .min(u128::from(u64::MAX)) as u64;
+    let by_deadline = generation == waiter.known_generation;
+    super::debug_line(&format!(
+        "runtimed: console graph wait released by={} known={} now={} waited_us={} since_advance_us={} advances={} seq={}",
+        if by_deadline { "deadline" } else { "edge" },
+        waiter.known_generation,
+        generation,
+        waited_us,
+        last_advance
+            .map(|at| now.saturating_duration_since(at).as_micros().min(u128::from(u64::MAX)) as u64)
+            .unwrap_or(u64::MAX),
+        GRAPH_ADVANCES.load(Ordering::Relaxed),
+        total,
+    ));
+}
+
+/// Reports what one delivered keystroke did to the console graph.
+///
+/// # Why this is worth a line
+/// The compositor's parked graph wait exists to be released by exactly this
+/// event. Whether that happens turns on two facts that are only both visible
+/// here: whether the keystroke moved the generation at all - it does not if the
+/// line discipline had nothing to echo - and whether anyone was actually parked
+/// to be told. A keystroke that advances the graph with no waiter parked is
+/// invisible from either side afterwards: the compositor's next park then finds
+/// the generation already equal to its own token and holds for the full budget,
+/// which is indistinguishable in the compositor's own trace from a console that
+/// simply had nothing to say.
+struct ConsoleInputEdge {
+    generation_before: u64,
+    generation_after: u64,
+    waiters_before: usize,
+    action: u16,
+    text: u32,
+    termios: Option<LinuxTermios>,
+}
+
+fn report_console_input_edge(result: &Result<bool, i32>, edge: ConsoleInputEdge) {
+    let ConsoleInputEdge {
+        generation_before,
+        generation_after,
+        waiters_before,
+        action,
+        text,
+        termios,
+    } = edge;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    const EARLY_SAMPLES: u64 = 32;
+    static INPUTS: AtomicU64 = AtomicU64::new(0);
+    let total = INPUTS.fetch_add(1, Ordering::Relaxed) + 1;
+    if total > EARLY_SAMPLES && total % 16 != 0 {
+        return;
+    }
+    let status = match result {
+        Ok(_) => 0,
+        Err(errno) => *errno,
+    };
+    // Whether this session echoes at all decides who is expected to move the
+    // graph: the line discipline here, or the program on the other end after it
+    // has been scheduled to read and write back. Those have completely
+    // different latencies, and every number measured so far is blind to which
+    // one is in force.
+    let (canonical, echo) = match termios {
+        Some(termios) => (
+            u8::from(termios.is_canonical()),
+            u8::from(termios.echo_enabled()),
+        ),
+        None => (2, 2),
+    };
+    super::debug_line(&format!(
+        "runtimed: console input edge status={status} advanced={} gen={generation_before}->{generation_after} \
+         waiters={waiters_before} action={action} text={text} canonical={canonical} echo={echo} seq={total}",
+        u8::from(generation_after != generation_before),
+    ));
 }
 
 /// Re-run the ordinary handler against the stored request, which now answers
@@ -1073,6 +1223,7 @@ fn session_op_accepts_ioctl(op: u16, request_number: u64) -> bool {
                 | console_abi::CONSOLE_IOCTL_SET_SESSION_STATE
                 | COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_READ
                 | COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_READINESS
+                | COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_GRAPH_READINESS
                 | COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_WRITE
         ),
         COMMERCIAL_MAX_SESSIOND_OP_FOREGROUND_FOCUS => {
@@ -1250,10 +1401,24 @@ fn handle_console_route_request(
             }
             let input =
                 super::util::read_unaligned::<ConsoleSendInputEventRequest>(&request.payload);
-            match state
+            let generation_before = state.session_runtime.graph_generation();
+            let waiters_before = state.session_runtime.console_graph_waiters.len();
+            let termios_before = state.session_runtime.termios(input.session_handle);
+            let result = state
                 .session_runtime
-                .handle_input_event(input.session_handle, input.event)
-            {
+                .handle_input_event(input.session_handle, input.event);
+            report_console_input_edge(
+                &result,
+                ConsoleInputEdge {
+                    generation_before,
+                    generation_after: state.session_runtime.graph_generation(),
+                    waiters_before,
+                    action: input.event.action,
+                    text: input.event.text,
+                    termios: termios_before,
+                },
+            );
+            match result {
                 Ok(became_ready) => {
                     if became_ready {
                         publish_input_readiness(
@@ -1551,8 +1716,9 @@ mod tests {
     use std::mem::size_of;
 
     use super::{
-        console_read_park_budget, session_ingress_identity_authorized,
+        console_read_park_budget, session_ingress_identity_authorized, session_op_accepts_ioctl,
         ui_bootstrap_may_retry_immediately, ConsoleReadWaiter, SessionRuntime,
+        OUTPUT_BUFFER_CAPACITY,
         MAX_PARKED_CONSOLE_READS,
     };
     use crate::{BrokerState, RunningProcess};
@@ -1632,6 +1798,69 @@ mod tests {
             deadline: Instant::now() + Duration::from_secs(1),
         }));
         assert!(runtime.earliest_console_read_deadline().is_some());
+    }
+
+    /// A keystroke echoed into an already-full output ring still moves the
+    /// console graph's change token.
+    ///
+    /// # Why this is the case that matters
+    /// `push_output` evicts the oldest byte once the ring is full, so a session
+    /// past `OUTPUT_BUFFER_CAPACITY` bytes of output - a few screens for any
+    /// shell - has a permanently constant `output.len()`. Deriving the token
+    /// from that length made every later echo report "nothing changed", and the
+    /// compositor parked on the token then paid its whole re-arm budget for
+    /// each keystroke and rendered the backlog in one burst when some unrelated
+    /// event finally moved the token. The token has to come from the write, not
+    /// from a length that has stopped being able to move.
+    #[test]
+    fn an_echo_into_a_saturated_output_ring_still_advances_the_graph() {
+        let mut runtime = SessionRuntime::default();
+        let session = 1;
+        runtime.create_session(session);
+
+        // Run the session past the ring's capacity, the way ordinary shell
+        // output does within the first few screens.
+        let filler = vec![b'x'; OUTPUT_BUFFER_CAPACITY + 64];
+        assert_eq!(
+            runtime.write_to_session(session, &filler),
+            Some(filler.len())
+        );
+        let saturated_generation = runtime.graph_generation();
+        let saturated_len = runtime
+            .sessions
+            .get(&session)
+            .expect("session exists")
+            .output
+            .len();
+        assert_eq!(
+            saturated_len, OUTPUT_BUFFER_CAPACITY,
+            "the ring must actually be full, or this test proves nothing"
+        );
+
+        assert_eq!(
+            runtime.handle_input_event(session, key_event(30, b'a')),
+            Ok(false),
+            "an echoed key adds no pending input line, only visible output"
+        );
+
+        assert_eq!(
+            runtime
+                .sessions
+                .get(&session)
+                .expect("session exists")
+                .output
+                .len(),
+            saturated_len,
+            "the ring stays exactly full - which is precisely why its length \
+             cannot be the change token"
+        );
+        assert_ne!(
+            runtime.graph_generation(),
+            saturated_generation,
+            "the echo changed what the compositor draws, so the token it is \
+             parked on has to move; leaving it still strands that observer for \
+             the entire re-arm interval, once per keystroke"
+        );
     }
 
     fn key_event(code: u32, text: u8) -> InputEvent {
@@ -1824,6 +2053,14 @@ mod tests {
             super::console_graph_wait_park_budget(&request, &failed).is_none(),
             "a failure carries a reason the caller needs now"
         );
+    }
+
+    #[test]
+    fn console_route_admits_graph_readiness() {
+        assert!(session_op_accepts_ioctl(
+            COMMERCIAL_MAX_SESSIOND_OP_CONSOLE_ROUTE,
+            COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_GRAPH_READINESS,
+        ));
     }
 
     /// The reported console output generation is a change token, and observing

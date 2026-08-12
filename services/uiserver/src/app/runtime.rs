@@ -37,6 +37,12 @@ pub(crate) struct ConsoleRefresh {
     state: ConsoleStateInfo,
     sessions: Vec<ConsoleSessionInfo>,
     outputs: Vec<ConsoleSessionOutput>,
+    /// Set when a session's output could not be fetched for a reason that is
+    /// not "this session has nothing to fetch". Everything collected before it
+    /// is still carried - the failure costs one session's output, not the whole
+    /// refresh - but it means this snapshot does not fully account for the
+    /// generation that announced it, so the caller must not consume that edge.
+    failed_session: Option<i32>,
 }
 
 /// Console input and focus updates cross the `uiserver` -> `devmgrd` ->
@@ -126,6 +132,7 @@ impl ConsoleCommandDispatcher {
         if session_handle == 0 {
             return;
         }
+        crate::keytrace::mark_submit();
         self.submit(ConsoleCommand::Input {
             session_handle,
             event,
@@ -173,7 +180,13 @@ pub(crate) fn start_console_command_dispatcher(console_fd: OwnedFd) -> ConsoleCo
                     ConsoleCommand::Input {
                         session_handle,
                         event,
-                    } => console_send_input_event(console_fd.as_raw_fd(), session_handle, event),
+                    } => {
+                        crate::keytrace::mark_send();
+                        let sent =
+                            console_send_input_event(console_fd.as_raw_fd(), session_handle, event);
+                        crate::keytrace::mark_delivered();
+                        sent
+                    }
                     ConsoleCommand::SetFocus { session_handle } => {
                         console_set_focus(console_fd.as_raw_fd(), session_handle)
                     }
@@ -216,6 +229,17 @@ struct ConsoleSessionOutput {
     bytes: Vec<u8>,
 }
 
+/// Longest the refresh worker will retry a collect that keeps failing before it
+/// stops holding the graph token back.
+///
+/// A failed collect deliberately does not consume the edge, so the next wait
+/// returns at once and the collect is retried immediately. That is the right
+/// answer for a transient failure and the wrong one for a persistent one: it
+/// would spin this worker against the console broker at full speed. After this
+/// many consecutive failures the worker sleeps before retrying, which bounds
+/// the damage without ever converting the failure into silence.
+const MAX_UNPACED_COLLECT_RETRIES: u32 = 4;
+
 pub(crate) fn start_console_refresh_worker(wake: UiWakeSender) -> Receiver<ConsoleRefresh> {
     let (sender, receiver) = mpsc::sync_channel(2);
     spawn_ui_thread(
@@ -231,22 +255,104 @@ pub(crate) fn start_console_refresh_worker(wake: UiWakeSender) -> Receiver<Conso
             // the broker can decide there is nothing to say and hold the
             // reply. Zero means "I have seen nothing", which is answered at
             // once.
+            //
+            // # Why the announced generation is staged rather than stored
+            // This is an edge-triggered subscription: the broker reports a
+            // generation once and then holds its reply until that generation
+            // moves again. Storing the announcement here - before the snapshot
+            // it refers to has actually been fetched - tells the broker "I have
+            // seen this" on behalf of a collect that may still fail. If it
+            // does, the edge is spent: the payload is still waiting, but the
+            // next wait parks for the whole re-arm interval because, as far as
+            // the broker can tell, this caller is up to date. It is the classic
+            // edge-triggered mistake - consuming the notification without
+            // draining what it announced - and it costs one full park budget
+            // per failure, which is what a burst of them looks like on screen.
+            //
+            // So the announcement is staged, and only promoted to `observed`
+            // once a collect that ran against it has succeeded. A failed
+            // collect leaves the token behind, the next wait is answered
+            // immediately, and the fetch is retried against the edge that is
+            // still outstanding.
             let mut observed_graph = 0_u64;
+            let mut announced_graph = 0_u64;
+            let mut consecutive_collect_failures = 0_u32;
+            let mut reported_permanent_failure = false;
+            let started = Instant::now();
             loop {
                 let mut produced_output = false;
-                if let Ok(refresh) = collect_console_refresh(
+                crate::keytrace::mark_refresh();
+                crate::keytrace::count_collect_round();
+                let collect_started = Instant::now();
+                let collected = collect_console_refresh(
                     console_fd.as_raw_fd(),
                     &mut snapshot,
                     &mut output_generations,
-                ) {
-                    produced_output = !refresh.outputs.is_empty();
-                    if sender.try_send(refresh).is_err() {
-                        output_generations.clear();
-                    } else if produced_output {
-                        // Only new session output can change a pixel. Waking
-                        // the main loop for an unchanged snapshot would trade
-                        // this thread's fixed cadence for a busy render loop.
-                        wake.signal();
+                );
+                crate::keytrace::add_collecting(collect_started.elapsed());
+                match collected {
+                    Ok(refresh) => {
+                        // A partially collected refresh is still worth
+                        // delivering - the sessions that did answer have output
+                        // the screen is waiting for - but it has not accounted
+                        // for the generation that announced it, so it must not
+                        // be allowed to consume that edge.
+                        let failed_session = refresh.failed_session;
+                        match failed_session {
+                            None => consecutive_collect_failures = 0,
+                            Some(errno) => {
+                                consecutive_collect_failures =
+                                    consecutive_collect_failures.saturating_add(1);
+                                crate::keytrace::count_failed_collect(errno);
+                                report_failed_console_collect(errno, consecutive_collect_failures);
+                            }
+                        }
+                        produced_output = !refresh.outputs.is_empty();
+                        if produced_output {
+                            crate::keytrace::mark_snapshot();
+                        } else {
+                            crate::keytrace::count_empty_collect();
+                        }
+                        // A refresh the main loop could not accept has not
+                        // reached anything, so it accounts for nothing.
+                        let delivered = match sender.try_send(refresh) {
+                            Ok(()) => true,
+                            Err(_) => {
+                                output_generations.clear();
+                                produced_output = true;
+                                false
+                            }
+                        };
+                        if collect_accounted_for_its_edge(failed_session, delivered) {
+                            // The payload announced by this generation is in
+                            // hand, so the subscription may now move past it.
+                            observed_graph = announced_graph;
+                        } else if consecutive_collect_failures >= MAX_UNPACED_COLLECT_RETRIES {
+                            thread::sleep(CONSOLE_POLL_SLEEP);
+                        }
+                        if delivered && produced_output {
+                            // Only new session output can change a pixel.
+                            // Waking the main loop for an unchanged snapshot
+                            // would trade this thread's fixed cadence for a
+                            // busy render loop.
+                            wake.signal();
+                        }
+                    }
+                    Err(errno) => {
+                        consecutive_collect_failures =
+                            consecutive_collect_failures.saturating_add(1);
+                        crate::keytrace::count_failed_collect(errno);
+                        report_failed_console_collect(errno, consecutive_collect_failures);
+                        if consecutive_collect_failures >= MAX_UNPACED_COLLECT_RETRIES {
+                            thread::sleep(CONSOLE_POLL_SLEEP);
+                        }
+                        // The edge that announced this snapshot was never
+                        // drained, so it is deliberately not consumed. Falling
+                        // through to the wait below is what retries it: the
+                        // token is still behind the broker's generation, so the
+                        // wait is answered at once rather than parking, and a
+                        // broker that is genuinely unreachable fails there too
+                        // and is paced by that arm instead of spinning here.
                     }
                 }
                 if produced_output {
@@ -261,11 +367,50 @@ pub(crate) fn start_console_refresh_worker(wake: UiWakeSender) -> Receiver<Conso
                 // had produced anything and then left the real output waiting
                 // out the interval. The broker now holds this call until the
                 // graph actually moves.
-                match console_wait_graph(console_fd.as_raw_fd(), observed_graph, CONSOLE_GRAPH_WAIT)
-                {
-                    Ok(generation) => observed_graph = generation,
-                    // A broker that cannot answer must not become a spin.
-                    Err(_) => thread::sleep(CONSOLE_POLL_SLEEP),
+                crate::keytrace::mark_graph_wait();
+                let wait_started = Instant::now();
+                let waited =
+                    console_wait_graph(console_fd.as_raw_fd(), observed_graph, CONSOLE_GRAPH_WAIT);
+                crate::keytrace::add_parked(wait_started.elapsed());
+                match waited {
+                    Ok(generation) => {
+                        crate::keytrace::mark_graph();
+                        if generation == observed_graph {
+                            // The park ran out its budget without the graph
+                            // moving. Nothing to fetch, and nothing to stage.
+                            crate::keytrace::count_graph_stall();
+                        }
+                        // Staged, not stored: this is only what the broker says
+                        // exists. It becomes `observed_graph` once the collect
+                        // that fetches it has succeeded.
+                        announced_graph = generation;
+                    }
+                    Err(errno) => {
+                        crate::keytrace::count_graph_wait_error(errno);
+                        // A refusal means this caller may never use the rail,
+                        // so every later call fails identically and the
+                        // compositor silently becomes a `CONSOLE_POLL_SLEEP`
+                        // poller. That is exactly what happened for three
+                        // releases: a guard admitted only a handle the
+                        // compositor cannot hold, every wait returned
+                        // `ENOTTY`, and the fallback made a dead readiness
+                        // edge look like an idle console.
+                        //
+                        // Startup is the one time a refusal is not final: the
+                        // authority this rail requires is published when the
+                        // service registers, and this worker can outrun that.
+                        // Same budget and reasoning as the input wait set.
+                        let refused_for_good = !console_graph_wait_is_retryable(errno)
+                            && started.elapsed() >= CONSOLE_GRAPH_WAIT_STARTUP_BUDGET;
+                        if refused_for_good && !reported_permanent_failure {
+                            reported_permanent_failure = true;
+                            crate::sys::debug_line(&format!(
+                                "uiserver: console graph wait refused errno={errno}; \
+                                 polling instead and losing keystroke echo latency"
+                            ));
+                        }
+                        thread::sleep(CONSOLE_POLL_SLEEP);
+                    }
                 }
             }
         },
@@ -274,15 +419,110 @@ pub(crate) fn start_console_refresh_worker(wake: UiWakeSender) -> Receiver<Conso
     receiver
 }
 
+/// How long a refusal is still allowed to be a startup race rather than a
+/// verdict. The authority the graph wait requires is published when the
+/// service registers, which this worker can start before.
+const CONSOLE_GRAPH_WAIT_STARTUP_BUDGET: Duration =
+    Duration::from_millis(rustos_user_abi::performance::IPC_BOOT_CONTROL_HARD_LIMIT_MS);
+
+/// Whether a failed console graph wait is worth retrying.
+///
+/// A budget that expired or a broker that is not up yet will answer the next
+/// call. A refusal - the caller lacks the handle or the authority the rail
+/// requires, or the rail is not implemented - will refuse identically forever,
+/// so treating it as transient converts a broken readiness edge into a silent
+/// polling loop.
+fn console_graph_wait_is_retryable(errno: i32) -> bool {
+    matches!(
+        errno,
+        libc::ETIMEDOUT | libc::EAGAIN | libc::EINTR | libc::ENODEV | libc::ECONNRESET
+    )
+}
+
+/// Whether a collect has fully accounted for the console generation that
+/// announced it, and may therefore let the subscription move past that edge.
+///
+/// # Why this is the only place the token may advance
+/// The console graph is an edge-triggered subject: the broker names a
+/// generation once and then holds every later reply until it moves again.
+/// Telling it "I have seen this" is therefore a promise that the snapshot it
+/// announced has been fetched *and* handed on. A collect that failed part way,
+/// or one the main loop refused, has done neither - and if the token advances
+/// anyway the outstanding output is not late, it is unreachable, until some
+/// unrelated change moves the generation again. Every such mistake costs a full
+/// re-arm interval, which is why they show up on screen as output arriving in
+/// bursts rather than as uniformly slower echo.
+fn collect_accounted_for_its_edge(failed_session: Option<i32>, delivered: bool) -> bool {
+    failed_session.is_none() && delivered
+}
+
+/// Reports what one collect saw, against what it already had.
+///
+/// Rate limited to the first samples plus a sparse tail: this runs on every
+/// round of a loop that is meant to be idle most of the time.
+fn report_collect_generations(
+    sessions: &[ConsoleSessionInfo],
+    output_generations: &BTreeMap<ConsoleSessionHandle, u64>,
+) {
+    const EARLY_SAMPLES: u64 = 24;
+    static COLLECTS: AtomicU64 = AtomicU64::new(0);
+    let total = COLLECTS.fetch_add(1, Ordering::Relaxed) + 1;
+    if total > EARLY_SAMPLES && total % 32 != 0 {
+        return;
+    }
+    let Some(session) = sessions.first() else {
+        crate::sys::debug_line(&format!("uiserver: collect sessions=0 seq={total}"));
+        return;
+    };
+    let held = output_generations
+        .get(&session.session_handle)
+        .copied()
+        .unwrap_or(0);
+    crate::sys::debug_line(&format!(
+        "uiserver: collect sessions={} handle={} reported={} held={} fresh={} seq={total}",
+        sessions.len(),
+        session.session_handle,
+        session.output_generation,
+        held,
+        u8::from(session.output_generation != held),
+    ));
+}
+
+/// Reports a console collect that failed.
+///
+/// This used to be `if let Ok(refresh)`, which discarded the error and every
+/// consequence of it. The worker then re-parked as though it had nothing to
+/// fetch, so a failing snapshot rail was indistinguishable from an idle
+/// console - the same silence that hid a dead readiness edge for three
+/// releases.
+///
+/// Rate limited to the first samples plus a sparse tail: a rail that fails
+/// every round must not become the thing that keeps this worker busy.
+fn report_failed_console_collect(errno: i32, consecutive: u32) {
+    const EARLY_SAMPLES: u64 = 8;
+    static FAILURES: AtomicU64 = AtomicU64::new(0);
+    let total = FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+    if total > EARLY_SAMPLES && total % 64 != 0 {
+        return;
+    }
+    crate::sys::debug_line(&format!(
+        "uiserver: console collect failed errno={errno} consecutive={consecutive} seq={total}"
+    ));
+}
+
 fn collect_console_refresh(
     console_fd: i32,
     snapshot: &mut [u8; MAX_CONSOLE_SNAPSHOT_BYTES],
     output_generations: &mut BTreeMap<ConsoleSessionHandle, u64>,
 ) -> Result<ConsoleRefresh, i32> {
+    crate::keytrace::mark_state_start();
     let state = console_get_state(console_fd)?;
+    crate::keytrace::mark_state_done();
     let mut sessions = [ConsoleSessionInfo::default(); crate::sys::CONSOLE_SESSION_CAPACITY];
+    crate::keytrace::mark_sessions_start();
     let session_count = console_snapshot_sessions(console_fd, &mut sessions)?
         .min(crate::sys::CONSOLE_SESSION_CAPACITY);
+    crate::keytrace::mark_sessions_done();
     let sessions = sessions[..session_count].to_vec();
     output_generations.retain(|session_handle, _| {
         sessions
@@ -290,6 +530,14 @@ fn collect_console_refresh(
             .any(|session| session.session_handle == *session_handle)
     });
     let mut outputs = Vec::new();
+    let mut failed_session = None;
+    // The last link with no measurement on it: what the broker reports as each
+    // session's generation, against what this worker already holds. A collect
+    // that is woken by an edge and then finds these equal is being told about a
+    // change it cannot see, and that is the only remaining way `snapshot_us`
+    // can span several park rounds while every ioctl inside it costs about a
+    // millisecond.
+    report_collect_generations(&sessions, output_generations);
     for session in &sessions {
         let previous_generation = output_generations
             .get(&session.session_handle)
@@ -298,22 +546,44 @@ fn collect_console_refresh(
         if previous_generation == session.output_generation {
             continue;
         }
+        crate::keytrace::mark_output_start();
         match console_snapshot_session_output(console_fd, session.session_handle, snapshot) {
-            Ok(count) => outputs.push(ConsoleSessionOutput {
-                session_handle: session.session_handle,
-                output_generation: session.output_generation,
-                bytes: snapshot[..count].to_vec(),
-            }),
-            Err(crate::sys::ENOENT | crate::sys::EINVAL | crate::sys::ESTALE) => {}
-            Err(err) => return Err(err),
+            Ok(count) => {
+                crate::keytrace::mark_output_done();
+                outputs.push(ConsoleSessionOutput {
+                    session_handle: session.session_handle,
+                    output_generation: session.output_generation,
+                    bytes: snapshot[..count].to_vec(),
+                });
+                output_generations.insert(session.session_handle, session.output_generation);
+            }
+            // This session has no output to fetch and never will at this
+            // generation: it is gone, or it is not one this rail serves. Record
+            // the generation so the next round does not ask again, and keep
+            // collecting - one departed session must not cost the others their
+            // refresh.
+            Err(crate::sys::ENOENT | crate::sys::EINVAL | crate::sys::ESTALE) => {
+                output_generations.insert(session.session_handle, session.output_generation);
+            }
+            // A real failure. It used to `return Err` here, which threw away
+            // every session already fetched in this pass along with the
+            // generations recorded for them - so one failing session erased
+            // output that had been read successfully and was already on its way
+            // to the screen. Report what was collected and leave this session's
+            // generation unrecorded, which is what makes the next round retry
+            // exactly the session that failed.
+            Err(errno) => {
+                failed_session = Some(errno);
+                break;
+            }
         }
-        output_generations.insert(session.session_handle, session.output_generation);
     }
 
     Ok(ConsoleRefresh {
         state,
         sessions,
         outputs,
+        failed_session,
     })
 }
 
@@ -895,5 +1165,74 @@ mod tests {
         // And it has to be a real park, or the interval poll it replaced is
         // still being paid under a new name.
         assert!(CONSOLE_GRAPH_WAIT >= super::CONSOLE_POLL_SLEEP);
+    }
+
+    /// An edge-triggered subscription may only be advanced by an observation
+    /// that actually completed.
+    ///
+    /// The broker answers a graph wait once per generation and then holds the
+    /// reply until the generation moves again. So the token this worker hands
+    /// back is a claim to have seen everything up to it. Advancing it after a
+    /// collect that failed, or after a refresh the main loop could not accept,
+    /// makes that claim falsely - and the output it skipped then waits for an
+    /// unrelated change to move the generation, one full re-arm interval at a
+    /// time. `snapshot_us` was measured at 803 ms against ioctls that each took
+    /// about a millisecond, which is what a run of those looks like.
+    #[test]
+    fn only_a_collect_that_fetched_and_delivered_may_consume_the_graph_edge() {
+        assert!(super::collect_accounted_for_its_edge(None, true));
+        assert!(
+            !super::collect_accounted_for_its_edge(Some(libc::EAGAIN), true),
+            "a session whose output could not be fetched leaves the edge outstanding"
+        );
+        assert!(
+            !super::collect_accounted_for_its_edge(None, false),
+            "a refresh the main loop refused has reached nothing and accounts for nothing"
+        );
+        assert!(!super::collect_accounted_for_its_edge(Some(libc::EAGAIN), false));
+    }
+
+    /// The retry that a withheld token produces must be paced.
+    ///
+    /// Not consuming the edge is what makes the next wait return immediately,
+    /// which is exactly right for a transient failure and would be a full-speed
+    /// spin against the console broker for a persistent one.
+    #[test]
+    fn a_persistently_failing_collect_is_paced_rather_than_spun() {
+        assert!(super::MAX_UNPACED_COLLECT_RETRIES >= 1);
+        assert!(
+            super::CONSOLE_POLL_SLEEP > Duration::ZERO,
+            "the paced retry has to actually yield"
+        );
+    }
+
+    /// A refusal and a hiccup must not share a branch.
+    ///
+    /// They did, and it cost three releases: the kernel guard admitted only a
+    /// handle the compositor cannot hold, so every wait returned `ENOTTY`, and
+    /// the retry branch turned that permanent refusal into a `CONSOLE_POLL_SLEEP`
+    /// cadence that looked exactly like an idle console. Keystroke echo was
+    /// measured at a 21 ms median against a rail that had never once answered.
+    #[test]
+    fn a_refused_graph_wait_is_never_mistaken_for_a_broker_hiccup() {
+        for transient in [
+            libc::ETIMEDOUT,
+            libc::EAGAIN,
+            libc::EINTR,
+            libc::ENODEV,
+            libc::ECONNRESET,
+        ] {
+            assert!(
+                super::console_graph_wait_is_retryable(transient),
+                "errno {transient} resolves itself and must be retried"
+            );
+        }
+        for refusal in [libc::ENOTTY, libc::EPERM, libc::EACCES, libc::EINVAL] {
+            assert!(
+                !super::console_graph_wait_is_retryable(refusal),
+                "errno {refusal} will refuse identically forever and must be reported, \
+                 not absorbed into a polling cadence"
+            );
+        }
     }
 }

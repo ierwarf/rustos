@@ -6,6 +6,7 @@ mod font;
 mod gpu_runtime;
 mod gpu_scene;
 mod input_loop;
+mod keytrace;
 mod layout;
 mod loop_timing;
 mod profile;
@@ -63,6 +64,15 @@ const SLOW_LOOP_THRESHOLD: Duration = Duration::from_millis(50);
 /// structure allows and the line would only be noise; above it, the count of
 /// boundaries crossed is exactly the quantity worth acting on.
 const INPUT_TO_PRESENT_REPORT_THRESHOLD: Duration = Duration::from_millis(20);
+/// How long a keystroke trace waits for its echo before reporting what it did
+/// see. A key whose echo never lands - a modifier, or one the shell discards -
+/// must not silence the trace for every key after it.
+///
+/// This has to sit clear of the stall being measured, not near it. At 500 ms
+/// it truncated exactly the samples that mattered: a burst of keystrokes that
+/// stalled and then arrived together all reported the budget rather than their
+/// own latency, which read as a cluster at the cap instead of as a tail.
+const KEY_ECHO_TRACE_BUDGET: Duration = Duration::from_millis(2_000);
 
 const UI_PHASE_IDLE: usize = 0;
 const UI_PHASE_INPUT: usize = 1;
@@ -1200,6 +1210,19 @@ fn run() -> Result<(), i32> {
                     phase_timings.main_present.as_micros(),
                 ));
             }
+        }
+
+        // The keystroke round trip, reported on the frame that carries the
+        // echo rather than on the first frame after the key. The phase figures
+        // above time this loop's own work; these time the hand-offs between it
+        // and the broker, which is where the wait actually is.
+        let key_hops = if rendered {
+            keytrace::report_if_echoed()
+        } else {
+            None
+        };
+        if let Some(hops) = key_hops.or_else(|| keytrace::report_if_stale(KEY_ECHO_TRACE_BUDGET)) {
+            diag_line(format!("uiserver: key-to-echo {hops}"));
         }
 
         let input_reader = input_events.snapshot();

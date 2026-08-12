@@ -227,9 +227,12 @@ fn main() {
     let mut state = BrokerState::default();
     let mut runtime_connections = socket::RuntimeConnections::default();
     let _ = ensure_ui_bootstrap(&mut state);
+    let mut pass = LoopPassTiming::default();
     loop {
+        pass.begin();
         let mut did_work = false;
         did_work |= drain_session_request_burst(session_endpoint, &mut state) != 0;
+        pass.mark(LoopPhase::Drain);
         // Immediately after the drain, so a keystroke delivered by that same
         // burst releases the reader parked on it within this pass rather than
         // after another idle interval.
@@ -239,13 +242,17 @@ fn main() {
         // exactly that edge. Answering it here is what keeps shell output a
         // scheduling delay rather than a polling interval.
         did_work |= session::service_console_graph_waiters(&mut state);
+        pass.mark(LoopPhase::ConsoleWaiters);
         did_work |= spawn::reap_children(&mut state);
+        pass.mark(LoopPhase::Reap);
         // Publish the running set to anyone parked on a change before the pass
         // does anything else with it. A launch later in this pass sets
         // `did_work`, which sends the loop straight back here, so a watcher
         // never waits out an idle interval for an edge this pass produced.
         did_work |= socket::service_running_program_watchers(&mut runtime_connections, &state);
+        pass.mark(LoopPhase::Watchers);
         did_work |= ensure_ui_bootstrap(&mut state);
+        pass.mark(LoopPhase::UiBootstrap);
         // The private SMP qualification workload validates scheduler and IPC
         // progress, not display readiness.  Load the signed catalog after the
         // synchronous UI bootstrap attempt even when the display provider
@@ -260,13 +267,18 @@ fn main() {
         // topology cannot hold the ordinary UI/application catalog hostage,
         // while a requested qualification remains pending until an exact
         // snapshot is visible.
+        pass.mark(LoopPhase::Catalog);
         did_work |= catalog::reconcile_kvm_smp_qualification_into_state(&mut state);
+        pass.mark(LoopPhase::Qualification);
         // Converge signed launch policy before servicing another control
         // client. In particular, a background snapshot client must not delay
         // the first desktop launch after the catalog-ready transition.
         did_work |= socket::ensure_policy_launches(&mut state);
+        pass.mark(LoopPhase::PolicyLaunches);
         did_work |= socket::service_listener(&listener, &mut runtime_connections, &mut state);
+        pass.mark(LoopPhase::Listener);
         if did_work {
+            pass.report_if_slow("busy");
             continue;
         }
         // Idle. Wait on the session endpoint rather than on a timer.
@@ -284,12 +296,153 @@ fn main() {
         // so that case keeps the timer.
         let idle_delay =
             spawn::next_idle_delay(&state, runtime_connections.earliest_watch_deadline());
+        pass.report_if_slow("idle");
+        let idle_started = Instant::now();
         if session_endpoint.is_some() {
             session::service_session_endpoint(session_endpoint, &mut state, Some(idle_delay));
         } else {
             thread::sleep(idle_delay);
         }
+        // An idle wait that outruns the budget it was given is the broker
+        // failing to be where its parked callers were promised it would be,
+        // and it is invisible from inside any single phase above.
+        report_idle_overshoot(idle_started.elapsed(), idle_delay);
     }
+}
+
+/// Phases of one broker pass, in the order the loop runs them.
+#[derive(Clone, Copy)]
+enum LoopPhase {
+    Drain,
+    ConsoleWaiters,
+    Reap,
+    Watchers,
+    UiBootstrap,
+    Catalog,
+    Qualification,
+    PolicyLaunches,
+    Listener,
+}
+
+impl LoopPhase {
+    const COUNT: usize = 9;
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Drain => "drain",
+            Self::ConsoleWaiters => "console-waiters",
+            Self::Reap => "reap",
+            Self::Watchers => "watchers",
+            Self::UiBootstrap => "ui-bootstrap",
+            Self::Catalog => "catalog",
+            Self::Qualification => "qualification",
+            Self::PolicyLaunches => "policy-launches",
+            Self::Listener => "listener",
+        }
+    }
+}
+
+/// Per-phase timing for one broker pass.
+///
+/// This loop is a single receiver: console reads, keystroke delivery, the
+/// compositor's parked graph wait, child reaping, the signed launch catalog,
+/// and the control socket all take their turn in it. A pass that runs long
+/// therefore delays every one of those, and from outside it is indistinguishable
+/// from a slow console - a parked wait promised an 80 ms budget was observed
+/// answering after 253 ms, with no way to say which phase owned the gap.
+struct LoopPassTiming {
+    started: Instant,
+    phase_started: Instant,
+    phases: [Duration; LoopPhase::COUNT],
+}
+
+impl Default for LoopPassTiming {
+    fn default() -> Self {
+        let now = Instant::now();
+        Self {
+            started: now,
+            phase_started: now,
+            phases: [Duration::ZERO; LoopPhase::COUNT],
+        }
+    }
+}
+
+impl LoopPassTiming {
+    /// A pass longer than this has already overrun the readiness class its
+    /// parked callers belong to, so it is worth a line.
+    const SLOW_PASS: Duration =
+        Duration::from_millis(rustos_user_abi::performance::IPC_READINESS_QUERY_HARD_LIMIT_MS);
+
+    fn begin(&mut self) {
+        let now = Instant::now();
+        self.started = now;
+        self.phase_started = now;
+        self.phases = [Duration::ZERO; LoopPhase::COUNT];
+    }
+
+    fn mark(&mut self, phase: LoopPhase) {
+        let now = Instant::now();
+        self.phases[phase.index()] = now.saturating_duration_since(self.phase_started);
+        self.phase_started = now;
+    }
+
+    fn report_if_slow(&self, outcome: &str) {
+        let elapsed = self.started.elapsed();
+        if elapsed < Self::SLOW_PASS {
+            return;
+        }
+        let mut line = format!(
+            "runtimed: slow broker pass outcome={outcome} total_us={}",
+            elapsed.as_micros()
+        );
+        for (index, duration) in self.phases.iter().enumerate() {
+            if duration.is_zero() {
+                continue;
+            }
+            let phase = [
+                LoopPhase::Drain,
+                LoopPhase::ConsoleWaiters,
+                LoopPhase::Reap,
+                LoopPhase::Watchers,
+                LoopPhase::UiBootstrap,
+                LoopPhase::Catalog,
+                LoopPhase::Qualification,
+                LoopPhase::PolicyLaunches,
+                LoopPhase::Listener,
+            ][index];
+            line.push_str(&format!(" {}_us={}", phase.name(), duration.as_micros()));
+        }
+        debug_line(&line);
+    }
+}
+
+/// Reports an idle wait that ran past the budget it asked for.
+///
+/// Rate limited: an overshoot that repeats every pass must not become the
+/// thing that keeps the loop busy.
+fn report_idle_overshoot(elapsed: Duration, budget: Duration) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    const EARLY_SAMPLES: u64 = 16;
+    // A wait may legitimately return a little late; only a wait that outruns
+    // its budget by more than the readiness class it serves is a finding.
+    let slack = Duration::from_millis(rustos_user_abi::performance::IPC_READINESS_QUERY_HARD_LIMIT_MS);
+    if elapsed <= budget + slack {
+        return;
+    }
+    static OVERSHOOTS: AtomicU64 = AtomicU64::new(0);
+    let total = OVERSHOOTS.fetch_add(1, Ordering::Relaxed) + 1;
+    if total > EARLY_SAMPLES && total % 32 != 0 {
+        return;
+    }
+    debug_line(&format!(
+        "runtimed: idle wait overshoot budget_us={} elapsed_us={} seq={total}",
+        budget.as_micros(),
+        elapsed.as_micros(),
+    ));
 }
 
 fn policy_catalog_load_due(launch_catalog_loaded: bool) -> bool {

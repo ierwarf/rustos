@@ -513,10 +513,7 @@ pub fn syscall_linux_ioctl(fd: u64, request_number: u64, arg: u64) -> u64 {
     // rail for the same reason. The console handle is the authority: a caller
     // without one is refused here, before the broker is reached.
     if request_number == rustos_user_abi::console::CONSOLE_IOCTL_WAIT_GRAPH {
-        if !current_kernel_handle(fd).is_some_and(|handle| is_console_handle(&handle)) {
-            return linux_errno(LINUX_ENOTTY);
-        }
-        return match console_wait_graph(arg) {
+        return match console_graph_wait_authority(fd).and_then(|()| console_wait_graph(arg)) {
             Ok(value) => value,
             Err(errno) => linux_errno(errno),
         };
@@ -572,6 +569,100 @@ pub fn syscall_linux_ioctl(fd: u64, request_number: u64, arg: u64) -> u64 {
 
 fn is_console_handle(handle: &multitask::KernelHandle) -> bool {
     matches!(handle, multitask::KernelHandle::Console(_))
+}
+
+/// True for a handle opened on the console *device*, which is what a process
+/// that serves the console gets from `open(CONSOLE_PATH)`.
+///
+/// This is deliberately not [`is_console_handle`]. That one is true only for a
+/// process's own stdin/stdout/stderr, the handles a shell holds for its single
+/// session; the compositor never has one, because it reaches the console as a
+/// device. Guarding a compositor-only call with the shell's handle kind is how
+/// the graph wait came to fail `ENOTTY` on every call it ever received.
+fn is_console_device_handle(handle: &multitask::KernelHandle) -> bool {
+    matches!(handle, multitask::KernelHandle::Device(device)
+        if device.device_id() == crate::io::device::DeviceId::Console)
+}
+
+/// Identifies the handle kind behind an fd, for refusal diagnostics only.
+///
+/// The milestone log carries integers, not strings, so a refusal reports which
+/// kind it actually found rather than only that it found the wrong one. Naming
+/// the kind is the whole diagnostic: the guard that failed here was rejecting
+/// a handle nobody had yet established the kind of.
+fn kernel_handle_kind_code(handle: &multitask::KernelHandle) -> u64 {
+    match handle {
+        multitask::KernelHandle::Console(_) => 1,
+        multitask::KernelHandle::Device(_) => 2,
+        multitask::KernelHandle::Epoll(_) => 3,
+        multitask::KernelHandle::InetSocket(_) => 4,
+        multitask::KernelHandle::Memfd(_) => 5,
+        multitask::KernelHandle::RemoteVfs(_) => 6,
+        multitask::KernelHandle::Socket(_) => 7,
+        multitask::KernelHandle::VfsDirectory(_) => 8,
+        multitask::KernelHandle::DisplaySurface(_) => 9,
+    }
+}
+
+const CONSOLE_GRAPH_REFUSAL_NO_HANDLE: u64 = 1;
+const CONSOLE_GRAPH_REFUSAL_WRONG_HANDLE_KIND: u64 = 2;
+const CONSOLE_GRAPH_REFUSAL_NO_CAPABILITY: u64 = 3;
+
+/// May this caller wait on the console graph?
+///
+/// The refusals are deliberately distinguishable, and a refused wait is
+/// reported rather than merely returned. The single caller of this rail turns
+/// a failed wait into a polling fallback, so a refusal that says nothing here
+/// is indistinguishable from an idle console at every layer above - which is
+/// exactly how a rail that had never once answered went unnoticed while the
+/// compositor polled the broker roughly two hundred times a second.
+fn console_graph_wait_authority(fd: u64) -> Result<(), i64> {
+    let Some(handle) = current_kernel_handle(fd) else {
+        report_console_graph_wait_refusal(CONSOLE_GRAPH_REFUSAL_NO_HANDLE, 0);
+        return Err(LINUX_EBADF);
+    };
+    if !is_console_device_handle(&handle) {
+        report_console_graph_wait_refusal(
+            CONSOLE_GRAPH_REFUSAL_WRONG_HANDLE_KIND,
+            kernel_handle_kind_code(&handle),
+        );
+        return Err(LINUX_ENOTTY);
+    }
+    // The graph is every session at once, which is the display policy owner's
+    // subject and no single session's. A shell holds a console handle for its
+    // own session and is served by the per-session readiness subject instead.
+    if !ipc_ops::current_process_has_service_capability(
+        rustos_user_abi::syscall::IPC_SERVICE_CAP_UI_POLICY,
+    ) {
+        report_console_graph_wait_refusal(CONSOLE_GRAPH_REFUSAL_NO_CAPABILITY, 0);
+        return Err(LINUX_EPERM);
+    }
+    Ok(())
+}
+
+/// Reports the first few graph-wait refusals, then falls silent. A refusal
+/// repeats at the caller's polling rate, so this must never be unbounded.
+///
+/// `arg0` carries the refusing process, `arg1` packs the reason in its high
+/// half and, for a wrong handle kind, the kind that was actually found in its
+/// low half.
+fn report_console_graph_wait_refusal(reason: u64, handle_kind: u64) {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    const REPORTED_REFUSAL_BUDGET: u64 = 4;
+    // ORDERING: Relaxed is exact; this counter owns diagnostics only.
+    static REPORTED_REFUSALS: AtomicU64 = AtomicU64::new(0);
+    if REPORTED_REFUSALS.fetch_add(1, Ordering::Relaxed) >= REPORTED_REFUSAL_BUDGET {
+        return;
+    }
+    let process_id = multitask::current_user_snapshot()
+        .map(|snapshot| snapshot.process_id())
+        .unwrap_or(0);
+    nucleus_core::debug::record_milestone(
+        nucleus_core::debug::LogCategory::Compat,
+        "console-graph-wait-refused",
+        process_id,
+        (reason << 32) | (handle_kind & 0xffff_ffff),
+    );
 }
 
 fn ioctl_is_direct_display_present(request_number: u64) -> bool {

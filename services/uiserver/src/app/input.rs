@@ -54,6 +54,11 @@ impl AppState {
                     }
                 }
                 if self.focused_session_handle != 0 {
+                    // Arm before the submit, not after the input phase: the
+                    // submit happens inside this phase, so arming afterwards
+                    // stamped the *next* keystroke's queueing and reported the
+                    // gap between two keys as this key's latency.
+                    crate::keytrace::arm();
                     self.console_commands
                         .submit_input(self.focused_session_handle, *event);
                 }
