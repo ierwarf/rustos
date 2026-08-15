@@ -14,6 +14,7 @@
 //! - **Evidence:** `user-memory-access`.
 use x86_64::VirtAddr;
 
+use super::usermem_profile;
 use crate::memory::paging;
 use crate::multitask;
 
@@ -37,10 +38,16 @@ pub fn copy_from_current_user_exact(
     user_ptr: u64,
     dest: &mut [u8],
 ) -> Result<(), paging::AddressSpaceError> {
+    let entry = usermem_profile::now();
     with_current_address_space(|address_space| {
+        let bound = usermem_profile::charge(usermem_profile::UserCopyPhase::ReadBind, entry);
         let start = user_virt_addr(user_ptr, dest.len())?;
         address_space.validate_user_read_buffer(start, dest.len())?;
-        address_space.copy_from_user(start, dest)
+        let validated =
+            usermem_profile::charge(usermem_profile::UserCopyPhase::ReadValidate, bound);
+        let result = address_space.copy_from_user(start, dest);
+        usermem_profile::charge(usermem_profile::UserCopyPhase::ReadCopy, validated);
+        result
     })
 }
 
@@ -62,10 +69,16 @@ pub fn write_current_user_bytes(
     user_ptr: u64,
     bytes: &[u8],
 ) -> Result<(), paging::AddressSpaceError> {
+    let entry = usermem_profile::now();
     with_current_address_space(|address_space| {
+        let bound = usermem_profile::charge(usermem_profile::UserCopyPhase::WriteBind, entry);
         let start = user_virt_addr(user_ptr, bytes.len())?;
         address_space.validate_user_write_buffer(start, bytes.len())?;
-        address_space.copy_into_user(start, bytes)
+        let validated =
+            usermem_profile::charge(usermem_profile::UserCopyPhase::WriteValidate, bound);
+        let result = address_space.copy_into_user(start, bytes);
+        usermem_profile::charge(usermem_profile::UserCopyPhase::WriteCopy, validated);
+        result
     })
 }
 

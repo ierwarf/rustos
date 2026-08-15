@@ -787,6 +787,13 @@ pub fn housekeeping_once() -> usize {
     // exit cannot turn into a multi-megabyte allocator critical section.
     work += ps_api::service_deferred_shared_region_reclaims(64);
     work += ps_api::drain_scheduler_runtime_profile();
+    work += ps_api::drain_user_copy_profile();
+    work += compat_api::syscall::drain_ipc_call_profile();
+    // lockdep owns no clock, so the window comes from here.
+    work += nucleus_core::util::lockdep::drain_lock_profile(
+        hal_api::arch::rtc::ticks(),
+        hal_api::arch::rtc::ticks_per_second(),
+    );
 
     trace_service_phase("heartbeat");
     // Emit the once-per-second wall-clock heartbeat outside IRQ context. The

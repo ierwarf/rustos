@@ -44,12 +44,14 @@ use dependency_graph::{
     DEPENDENCIES, VALIDATED_RAW_EDGES, VALIDATED_TASK_EDGES, dependency_reaches,
     edge_already_validated, irq_dependency_conflicts, publish_validated_edge, record_irq_usage,
 };
+pub(super) mod lock_profile;
 #[cfg(rustos_boot_image)]
 mod raw_diag;
 mod scheduler_diag;
 #[cfg(any(rustos_boot_image, test))]
 mod spin_budget;
 
+pub use lock_profile::drain_lock_profile;
 pub use cpu_identity::{
     bind_current_cpu_identity, current_apic_id, current_cpu_index, finalize_cpu_identities,
     hardware_apic_id, register_cpu_identity,
@@ -68,6 +70,8 @@ pub const MAX_TRACKED_CPUS: usize = 8;
 const MAX_HELD_LOCK_DEPTH: usize = 16;
 #[cfg(rustos_boot_image)]
 const MAX_TRACKED_TASK_LOCK_STACKS: usize = 512;
+#[cfg(rustos_boot_image)]
+const TASK_STACK_OCCUPANCY_WORDS: usize = MAX_TRACKED_TASK_LOCK_STACKS.div_ceil(64);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum LockClass {
@@ -169,6 +173,17 @@ static HELD_STACKS: PerCpuHeldStacks =
 #[cfg(rustos_boot_image)]
 static TASK_HELD_STACKS: [TaskHeldStack; MAX_TRACKED_TASK_LOCK_STACKS] =
     [const { TaskHeldStack::new() }; MAX_TRACKED_TASK_LOCK_STACKS];
+/// Registered-slot bitmap for `TASK_HELD_STACKS`.
+///
+/// A slot is registered only while a task holds a sleepable class, which is
+/// rare, but `before_acquire` consults the table on every tracked spin
+/// acquisition. Scanning every owner word touches one cache line per slot to
+/// answer "not registered" almost every time. This answers the same question
+/// by visiting only registered slots, and the owner word is still compared, so
+/// the check keeps its exact strength.
+#[cfg(rustos_boot_image)]
+static TASK_STACK_OCCUPANCY: [AtomicU64; TASK_STACK_OCCUPANCY_WORDS] =
+    [const { AtomicU64::new(0) }; TASK_STACK_OCCUPANCY_WORDS];
 #[cfg(rustos_boot_image)]
 static PREEMPT_DISABLE_DEPTH: [AtomicUsize; MAX_TRACKED_CPUS] =
     [const { AtomicUsize::new(0) }; MAX_TRACKED_CPUS];
@@ -450,7 +465,9 @@ impl<T: ?Sized, const CLASS: u8> TrackedSpinLock<T, CLASS> {
         let acquire_site = ();
         #[cfg(rustos_boot_image)]
         disable_preemption();
+        let profile_entry = lock_profile::now();
         let pending = before_acquire(CLASS, acquire_site);
+        let profile_checked = lock_profile::charge(lock_profile::LockPhase::BeforeAcquire, profile_entry);
         #[cfg(rustos_boot_image)]
         let guard = {
             let wait_start_tsc = read_tsc();
@@ -482,7 +499,9 @@ impl<T: ?Sized, const CLASS: u8> TrackedSpinLock<T, CLASS> {
         };
         #[cfg(not(rustos_boot_image))]
         let guard = self.inner.lock();
+        let profile_taken = lock_profile::charge(lock_profile::LockPhase::Spin, profile_checked);
         after_acquire(pending);
+        lock_profile::charge(lock_profile::LockPhase::AfterAcquire, profile_taken);
         TrackedSpinGuard {
             guard: Some(guard),
             owner_cpu: tracked_guard_owner_cpu(),
@@ -641,6 +660,7 @@ impl<T: ?Sized, const CLASS: u8> DerefMut for TrackedSpinGuard<'_, T, CLASS> {
 
 impl<T: ?Sized, const CLASS: u8> Drop for TrackedSpinGuard<'_, T, CLASS> {
     fn drop(&mut self) {
+        let profile_entry = lock_profile::now();
         #[cfg(rustos_boot_image)]
         {
             x86_64::instructions::interrupts::without_interrupts(|| {
@@ -691,6 +711,7 @@ impl<T: ?Sized, const CLASS: u8> Drop for TrackedSpinGuard<'_, T, CLASS> {
             release(CLASS);
             let _ = (self.owner_cpu, self.owner_apic_id);
         }
+        lock_profile::charge(lock_profile::LockPhase::Release, profile_entry);
     }
 }
 
@@ -991,9 +1012,11 @@ fn before_acquire_with_irq_tracking(
     track_irq_usage: bool,
 ) -> PendingAcquire {
     let class_index = validate_class(class);
+    let profile_entry = lock_profile::now();
     if track_irq_usage {
         record_irq_usage(class_index, acquire_site);
     }
+    let profile_irq = lock_profile::charge(lock_profile::LockPhase::BeforeIrqUsage, profile_entry);
     if irq_context_depth() == 0 {
         // ORDERING: Acquire observes the scheduler's task-owner publication
         // before attributing any sleepable-to-raw dependency.
@@ -1021,6 +1044,7 @@ fn before_acquire_with_irq_tracking(
             });
         }
     }
+    let profile_task = lock_profile::charge(lock_profile::LockPhase::BeforeTaskEdges, profile_irq);
     with_current_stack(|stack| {
         assert!(
             !stack.classes[..stack.len].contains(&class),
@@ -1052,6 +1076,7 @@ fn before_acquire_with_irq_tracking(
             publish_validated_edge(&VALIDATED_RAW_EDGES, held_index, class_index);
         }
     });
+    lock_profile::charge(lock_profile::LockPhase::BeforeRawEdges, profile_task);
     PendingAcquire { class }
 }
 
@@ -1108,18 +1133,33 @@ fn with_current_stack<R>(f: impl FnOnce(&mut HeldLockStack) -> R) -> R {
     })
 }
 
+/// Finds `owner`'s registered stack slot, visiting only registered slots.
+#[cfg(rustos_boot_image)]
+fn find_task_stack(owner: u64) -> Option<(usize, &'static TaskHeldStack)> {
+    for (word_index, word) in TASK_STACK_OCCUPANCY.iter().enumerate() {
+        // ORDERING: Acquire observes the owner publication that preceded this
+        // occupancy bit being set.
+        let mut bits = word.load(Ordering::Acquire);
+        while let Some(bit) = next_occupied_bit(&mut bits) {
+            let index = word_index * 64 + bit;
+            let entry = &TASK_HELD_STACKS[index];
+            // ORDERING: Acquire observes the complete task-owned lock stack
+            // published before its owner slot was released or retained.
+            if entry.owner.load(Ordering::Acquire) == owner {
+                return Some((index, entry));
+            }
+        }
+    }
+    None
+}
+
 #[cfg(rustos_boot_image)]
 fn with_task_stack<R>(
     owner: u64,
     create: bool,
     f: impl FnOnce(&mut HeldLockStack) -> R,
 ) -> Option<R> {
-    // ORDERING: Acquire observes the complete task-owned lock stack published
-    // before its owner slot was released or retained.
-    if let Some(entry) = TASK_HELD_STACKS
-        .iter()
-        .find(|entry| entry.owner.load(Ordering::Acquire) == owner)
-    {
+    if let Some((_, entry)) = find_task_stack(owner) {
         // SAFETY: a task cannot execute concurrently on two CPUs, and its
         // stack remains registered until the last held class is released.
         return Some(f(unsafe { &mut *entry.stack.get() }));
@@ -1127,7 +1167,7 @@ fn with_task_stack<R>(
     if !create {
         return None;
     }
-    let entry = TASK_HELD_STACKS.iter().find(|entry| {
+    let (index, entry) = TASK_HELD_STACKS.iter().enumerate().find(|(_, entry)| {
         // ORDERING: AcqRel claims one empty stack exclusively; Acquire failure
         // observes the winning task owner before another slot is considered.
         entry
@@ -1135,6 +1175,9 @@ fn with_task_stack<R>(
             .compare_exchange(0, owner, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
     })?;
+    // ORDERING: Release publishes the owner word before a scan can observe the
+    // slot, so a reader that sees the bit also sees the owner it belongs to.
+    TASK_STACK_OCCUPANCY[index / 64].fetch_or(1_u64 << (index % 64), Ordering::Release);
     // SAFETY: the successful owner publication gives this task exclusive
     // ownership of the empty stack until release_task_stack().
     Some(f(unsafe { &mut *entry.stack.get() }))
@@ -1152,15 +1195,28 @@ fn task_stack_depth(owner: u64) -> usize {
 fn release_task_stack(owner: u64) {
     // ORDERING: Acquire identifies the exact live owner publication before its
     // empty stack is validated; Release below makes the slot reusable.
-    let entry = TASK_HELD_STACKS
-        .iter()
-        .find(|entry| entry.owner.load(Ordering::Acquire) == owner)
-        .expect("sleepable lock-class owner disappeared");
+    let (index, entry) = find_task_stack(owner).expect("sleepable lock-class owner disappeared");
     // SAFETY: the task owns this entry and has just observed an empty stack.
     assert_eq!(unsafe { (*entry.stack.get()).len }, 0);
+    // ORDERING: the occupancy bit clears before the owner word, so the slot
+    // leaves every scan while it is still unclaimable. Clearing in the other
+    // order would let this release erase a new owner's freshly set bit.
+    TASK_STACK_OCCUPANCY[index / 64].fetch_and(!(1_u64 << (index % 64)), Ordering::AcqRel);
     // ORDERING: Release publishes all final stack mutations before a new task
     // may acquire and reuse this owner slot.
     entry.owner.store(0, Ordering::Release);
+}
+
+/// Takes the lowest set bit out of an occupancy word.
+#[cfg(any(rustos_boot_image, test))]
+#[inline]
+fn next_occupied_bit(bits: &mut u64) -> Option<usize> {
+    if *bits == 0 {
+        return None;
+    }
+    let bit = bits.trailing_zeros() as usize;
+    *bits &= *bits - 1;
+    Some(bit)
 }
 
 #[cfg(test)]
@@ -1170,6 +1226,25 @@ mod tests {
         graph_reaches, guard_release_is_admissible, preemption_release_is_admissible,
         preemption_units_match,
     };
+
+    #[test]
+    fn occupancy_bits_are_visited_in_ascending_slot_order() {
+        let mut bits = (1_u64 << 0) | (1 << 3) | (1 << 63);
+        let mut seen = alloc::vec::Vec::new();
+        while let Some(bit) = super::next_occupied_bit(&mut bits) {
+            seen.push(bit);
+        }
+        assert_eq!(seen, [0, 3, 63]);
+        assert_eq!(bits, 0);
+    }
+
+    #[test]
+    fn an_empty_occupancy_word_visits_nothing() {
+        // This is the common case: no task holds a sleepable class, so a
+        // tracked spin acquisition must not walk the stack table at all.
+        let mut bits = 0_u64;
+        assert_eq!(super::next_occupied_bit(&mut bits), None);
+    }
 
     #[test]
     fn dependency_walk_detects_transitive_cycle_edge() {

@@ -1,0 +1,8 @@
+[package]
+name = "ipcbench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+rustos-user-abi = { path = "../../libs/rustos-user-abi" }

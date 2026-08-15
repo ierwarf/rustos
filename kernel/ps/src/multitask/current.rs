@@ -25,6 +25,7 @@ use super::{
 use crate::debug;
 use crate::io::session::ConsoleSessionHandle;
 use crate::memory::paging::ProcessAddressSpace;
+use crate::user::sysops::usermem_profile as user_copy_profile;
 use crate::user::abi::UserAbi;
 use crate::user::linux::{LinuxProcessState, LinuxThreadState};
 use crate::user::process_state::{ProcessSecurityContext, UserProcessState};
@@ -562,6 +563,47 @@ pub fn set_next_pick_hint(task_id: u64) {
 
 /// Retains one exact synchronous call/reply handoff until the receiver/caller
 /// receives its bounded direct turn or retires.
+/// Commits one synchronous-IPC call handoff under a single scheduler
+/// acquisition.
+///
+/// `wake_task` defers to the per-CPU wake queue when preemption is disabled,
+/// and that fallback exists because the caller may hold a raw lock. This entry
+/// point keeps it: with preemption disabled it performs the same three
+/// operations through their individual paths rather than taking the scheduler
+/// here, so the fused path never changes who may call it.
+pub fn commit_ipc_call_handoff(
+    reply: u64,
+    donor_task_id: u64,
+    receiver_task_id: u64,
+    donation_required: bool,
+) -> super::scheduler::IpcCallHandoffOutcome {
+    if nucleus_core::util::lockdep::preemption_disabled() {
+        let inherited = if donation_required {
+            bind_reserved_ipc_priority(reply, donor_task_id, receiver_task_id)
+        } else {
+            true
+        };
+        let woke = wake_task(receiver_task_id);
+        let hinted = set_next_synchronous_pick_hint(receiver_task_id);
+        return super::scheduler::IpcCallHandoffOutcome {
+            inherited,
+            woke,
+            hinted,
+        };
+    }
+    // SAFETY: interrupt exclusion plus the scheduler access guard make the
+    // bind/wake/hint sequence one atomic scheduler mutation, exactly as each
+    // step was individually.
+    interrupts::without_interrupts(|| unsafe {
+        scheduler_mut().commit_ipc_call_handoff(
+            reply,
+            donor_task_id,
+            receiver_task_id,
+            donation_required,
+        )
+    })
+}
+
 pub fn set_next_synchronous_pick_hint(task_id: u64) -> bool {
     interrupts::without_interrupts(|| unsafe {
         scheduler_mut().set_next_synchronous_pick_hint(task_id)
@@ -875,7 +917,18 @@ pub fn wait_for_child(
 
 pub fn with_current_mm<R>(f: impl FnOnce(&ProcessAddressSpace) -> R) -> Option<R> {
     let (_, _, process) = retain_current_user_process_binding()?;
-    process.with_visible_state(|_, state| f(state.address_space()))
+    let retained = user_copy_profile::now();
+    let result = process.with_visible_state(|_, state| {
+        // Charged inside the closure so the phase ends once the per-process
+        // state lock is held and visibility has been re-tested, not when the
+        // caller's own work finishes.
+        user_copy_profile::charge(user_copy_profile::UserCopyPhase::BindVisible, retained);
+        f(state.address_space())
+    });
+    let visible_done = user_copy_profile::now();
+    drop(process);
+    user_copy_profile::charge(user_copy_profile::UserCopyPhase::BindRelease, visible_done);
+    result
 }
 
 pub fn with_current_process_credentials<R>(
@@ -964,6 +1017,7 @@ pub fn any_user_process_state(mut f: impl FnMut(u64, &UserProcessState) -> bool)
 }
 
 fn retain_current_user_process_binding() -> Option<(u64, UserAbi, process_table::ProcessRef)> {
+    let entry = user_copy_profile::now();
     let (thread_id, abi, process_handle, _) = interrupts::without_interrupts(|| {
         if let Some(identity) = published_current_identity() {
             return identity.user_binding();
@@ -971,7 +1025,10 @@ fn retain_current_user_process_binding() -> Option<(u64, UserAbi, process_table:
         // SAFETY: interrupts are masked, so the current slot is stable.
         unsafe { scheduler_ref().current_user_process_binding() }
     })?;
+    let identified =
+        user_copy_profile::charge(user_copy_profile::UserCopyPhase::BindIdentity, entry);
     let process = process_table::retain_process(process_handle)?;
+    user_copy_profile::charge(user_copy_profile::UserCopyPhase::BindRetain, identified);
     Some((thread_id, abi, process))
 }
 

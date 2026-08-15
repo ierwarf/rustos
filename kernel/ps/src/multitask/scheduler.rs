@@ -353,6 +353,17 @@ impl SchedulerDispatch {
     }
 }
 
+/// Result of one fused synchronous-IPC call handoff.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IpcCallHandoffOutcome {
+    /// The reply donation edge was installed, or none was required.
+    pub inherited: bool,
+    /// The receiver transitioned from blocked to runnable.
+    pub woke: bool,
+    /// The direct pick hint was accepted by the receiver's dispatch CPU.
+    pub hinted: bool,
+}
+
 pub(super) struct Scheduler {
     contexts: [Option<TaskContext>; MAX_TASK],
     /// Thread metadata is independently synchronized from scheduler state.
@@ -702,6 +713,36 @@ impl Scheduler {
         policy.latency_pick_hints[tail] = Some(slot);
         policy.latency_pick_hint_len += 1;
         true
+    }
+
+    /// Performs one synchronous-IPC call handoff as a single scheduler
+    /// mutation: reply-donation bind, receiver wake, and the direct pick hint.
+    ///
+    /// These ran as three separate global-scheduler acquisitions on the IPC
+    /// call path, in this exact order. Each acquisition pays the tracked-lock
+    /// prologue, and the measured cost of the three was about 18.5k cycles per
+    /// call against a ~400k-cycle round trip. Fusing them changes neither the
+    /// operations nor their order; it removes two acquisitions of the most
+    /// contended lock in the system from the hottest path that takes it.
+    pub(super) fn commit_ipc_call_handoff(
+        &mut self,
+        reply: u64,
+        donor_task_id: u64,
+        receiver_task_id: u64,
+        donation_required: bool,
+    ) -> IpcCallHandoffOutcome {
+        let inherited = if donation_required {
+            self.bind_reserved_ipc_priority(reply, donor_task_id, receiver_task_id)
+        } else {
+            true
+        };
+        let woke = self.wake_task(receiver_task_id);
+        let hinted = self.set_next_synchronous_pick_hint(receiver_task_id);
+        IpcCallHandoffOutcome {
+            inherited,
+            woke,
+            hinted,
+        }
     }
 
     /// Selects a runnable worker for a process-owned endpoint when the sender

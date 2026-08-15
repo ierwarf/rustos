@@ -50,6 +50,15 @@ enum XtaskCommand {
         #[arg(long = "no-auto-verify")]
         no_auto_verify: bool,
     },
+    /// Measure ring3 syscall, scheduler, and IPC round-trip cost.
+    Bench {
+        #[arg(long = "build")]
+        build_image: bool,
+        /// Write the rendered table to this path so a regression is visible in
+        /// a diff instead of only in a terminal that has scrolled away.
+        #[arg(long)]
+        baseline: Option<PathBuf>,
+    },
     Selftest,
     #[command(name = "fuzz-host")]
     FuzzHost {
@@ -151,6 +160,10 @@ pub(crate) fn run() -> Result<()> {
             rustos_vcpus,
             no_auto_verify,
         }) => kvm::kvm_run_command(&config, build_image, rustos_vcpus, !no_auto_verify),
+        Some(XtaskCommand::Bench {
+            build_image,
+            baseline,
+        }) => crate::bench::bench(&config, build_image, baseline.as_deref()),
         Some(XtaskCommand::Selftest) => testinfra::selftest(&config),
         Some(XtaskCommand::FuzzHost {
             target,

@@ -614,11 +614,27 @@ if [ "$(rg -c 'complete_ipc_reply_wake_handoff\(' \
     echo "one terminal IPC reply ABI bypasses the combined donation/wake handoff" >&2
     exit 1
 fi
-rg -Fq 'set_next_synchronous_pick_hint(receiver_task_id)' \
+# The call path arms the L4-style direct handoff hint for the exact receiver.
+# The bind, the wake, and the hint were three separate acquisitions of the
+# global scheduler; they are now one, so custody is pinned across the fusion:
+# the ABI must pass the exact receiver into the combined commit, and the
+# combined commit must still be what arms the hint.
+rg -Fq 'commit_ipc_call_handoff(' \
     kernel/compat/src/user/syscall/linux/ipc_ops.rs || {
     echo "IPC call enqueue bypasses exact receiver handoff custody" >&2
     exit 1
 }
+rg -Uq 'commit_ipc_call_handoff\(\n[[:space:]]*reply\.raw\(\),\n[[:space:]]*task_id,\n[[:space:]]*receiver_task_id,' \
+    kernel/compat/src/user/syscall/linux/ipc_ops.rs || {
+    echo "IPC call enqueue no longer commits handoff for the exact receiver task" >&2
+    exit 1
+}
+for handoff_source in kernel/ps/src/multitask/scheduler.rs kernel/ps/src/multitask/current.rs; do
+    rg -Fq 'set_next_synchronous_pick_hint(receiver_task_id)' "$handoff_source" || {
+        echo "combined IPC call handoff stopped arming the exact receiver pick hint in $handoff_source" >&2
+        exit 1
+    }
+done
 rg -Fq 'set_next_process_pick_hint(receiver_process_id)' \
     kernel/compat/src/user/syscall/linux/ipc_ops.rs || {
     echo "process-owned IPC call enqueue bypasses runnable receiver custody" >&2

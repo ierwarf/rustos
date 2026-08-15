@@ -271,6 +271,12 @@ fn rdtscp_supported() -> bool {
 pub fn hardware_apic_id() -> u32 {
     use core::arch::x86_64::{__cpuid, __cpuid_count};
 
+    // Charged so the sample count answers whether the dense map is actually
+    // serving. Any nonzero count on a steady-state path means acquisitions are
+    // still paying a VM exit apiece.
+    let profile_entry = super::lock_profile::now();
+    let _charge = ChargeHardwareApicId(profile_entry);
+
     // CPUID is unprivileged on x86_64 and these leaves are queried only after
     // checking the maximum supported basic leaf.
     let maximum = __cpuid(0).eax;
@@ -290,4 +296,16 @@ pub fn hardware_apic_id() -> u32 {
 #[cfg(not(rustos_boot_image))]
 pub fn hardware_apic_id() -> u32 {
     0
+}
+
+/// Charges the `CPUID` derivation on every exit path, including the early
+/// returns inside the topology-leaf loop.
+#[cfg(rustos_boot_image)]
+struct ChargeHardwareApicId(u64);
+
+#[cfg(rustos_boot_image)]
+impl Drop for ChargeHardwareApicId {
+    fn drop(&mut self) {
+        super::lock_profile::charge(super::lock_profile::LockPhase::HardwareApicId, self.0);
+    }
 }

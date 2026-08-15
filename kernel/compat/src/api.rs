@@ -45,6 +45,12 @@ pub mod syscall {
         crate::user::syscall::linux::service_deferred_transfer_releases()
     }
 
+    /// Emits the bounded per-second IPC call-path cycle attribution. This is
+    /// diagnostics only; nothing consumes it to make a decision.
+    pub fn drain_ipc_call_profile() -> usize {
+        crate::user::syscall::linux::drain_ipc_call_profile()
+    }
+
     pub fn cleanup_retired_task_runtime_state(
         task_id: u64,
         process_id: u64,

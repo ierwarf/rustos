@@ -39,6 +39,7 @@ members = [
     "services/runtimed",
     "services/sessiond",
     "services/uiserver",
+    "apps/ipcbench",
     "apps/wayclick",
     "drivers/libs/input-evdev",
     "drivers/libs/keyboard-core",

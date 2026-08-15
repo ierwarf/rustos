@@ -365,7 +365,11 @@ tokens = [
 # the degradation is recorded rather than silent.
     "priority == EndpointCallPriority::System && multitask::reserve_ipc_priority(task_id)",
     "enqueue_endpoint_call_with_handles_and_priority(",
-    "multitask::bind_reserved_ipc_priority(reply.raw(), task_id, receiver_task_id)",
+# The bind token is now the combined commit. The donation bind, the receiver
+# wake, and the synchronous pick hint were three separate acquisitions of the
+# global scheduler and are now one; the bind still happens, in the same place
+# in this order, but `commit_ipc_call_handoff` is what performs it.
+    "multitask::commit_ipc_call_handoff(",
     "\"ipc-donation-bind-degraded\"",
 ]
 

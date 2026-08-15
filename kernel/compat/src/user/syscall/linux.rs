@@ -3,6 +3,7 @@ mod broker_ops;
 mod debug_ops;
 mod error_ops;
 mod ipc_ops;
+mod ipc_profile;
 mod memory_ops;
 mod mm_broker_ops;
 pub(crate) mod offload_ops;
@@ -12,6 +13,10 @@ mod service_ops;
 mod smp_qualification_ops;
 mod support;
 mod syscalld_ops;
+
+pub(crate) fn drain_ipc_call_profile() -> usize {
+    ipc_profile::drain_ipc_call_profile()
+}
 
 pub(crate) fn service_deferred_transfer_releases() -> usize {
     service_ops::service_deferred_handle_maintenance()

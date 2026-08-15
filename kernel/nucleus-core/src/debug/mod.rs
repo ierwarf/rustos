@@ -6,6 +6,7 @@ mod kdiag_macros;
 mod milestone_class;
 #[cfg(rustos_debug_print_enabled)]
 mod milestone_frame;
+pub mod phase_profile;
 #[cfg(rustos_debug_print_enabled)]
 use milestone_class::{MilestoneOutputClass, milestone_loss_snapshot, milestone_output_class};
 

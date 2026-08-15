@@ -1,0 +1,20 @@
+id = "ipcbench"
+kind = "app"
+execution_domain = "user"
+startup = "session"
+
+[build]
+builder = "cargo-kernel-binary"
+package = "ipcbench"
+
+[install]
+path = "apps/ipcbench/ipcbench.elf"
+
+[[desktop.entries]]
+display_name = "IPC Bench"
+# The harness measures scheduler and IPC cost, so it must not receive an
+# interactive weight that a foreground surface would get: an unusual share
+# would be measured instead of the ordinary User class it reports on.
+weight_micros = 1000
+console_hosted = false
+no_display = true

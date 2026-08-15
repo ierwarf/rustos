@@ -21,6 +21,7 @@ use super::*;
 mod diagnostics;
 #[path = "ipc_reply_recv.rs"]
 mod ipc_reply_recv;
+mod reply_wait;
 mod subject;
 
 use alloc::vec::Vec;
@@ -28,6 +29,7 @@ use core::mem::size_of;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 pub(super) use diagnostics::diagnostic_rate_limit_permit;
 use diagnostics::record_ipc_reply_rejection;
+use reply_wait::wait_for_reply_with_deadline;
 pub(super) use subject::{
     current_process_has_service_capability, current_process_with_service_capability,
 };
@@ -38,6 +40,11 @@ use kernel_ipc_runtime::api::{
     TransferContext,
 };
 use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
+
+// The call path charges a dozen phase boundaries; the fully qualified names
+// wrapped every one of them across three lines and buried the code being
+// measured.
+use super::ipc_profile::{IpcCallPhase, charge as charge_phase, now as phase_mark};
 
 macro_rules! ipc_trace {
     ($($arg:tt)*) => {
@@ -1378,10 +1385,12 @@ fn syscall_linux_rustos_ipc_call_with_timeout(
         reply_capacity
     );
     let start_ticks = crate::arch::rtc::ticks();
+    let mut cycle_mark = phase_mark();
     let request = match copy_request_from_user(request_ptr, request_len) {
         Ok(request) => request,
         Err(errno) => return linux_errno(errno),
     };
+    cycle_mark = charge_phase(IpcCallPhase::CopyRequest, cycle_mark);
     ipc_trace!(
         "ipc call copied: endpoint={} request_len={}",
         endpoint.raw(),
@@ -1393,6 +1402,7 @@ fn syscall_linux_rustos_ipc_call_with_timeout(
     // reply budget.
     let reply_deadline =
         service_reply_deadline_tick_for_endpoint(endpoint, request.as_slice(), timeout_ms);
+    cycle_mark = charge_phase(IpcCallPhase::EnqueueDeadline, cycle_mark);
     let reply = match enqueue_call_and_wake(endpoint, request.as_slice()) {
         Ok(reply) => reply,
         Err(errno) => return linux_errno(errno),
@@ -1404,6 +1414,7 @@ fn syscall_linux_rustos_ipc_call_with_timeout(
         reply.raw()
     );
     let send_ticks = crate::arch::rtc::ticks();
+    cycle_mark = charge_phase(IpcCallPhase::Enqueue, cycle_mark);
     ipc_trace!("ipc call waiting: endpoint={}", endpoint.raw());
     let response =
         match wait_for_service_reply_with_deadline_tick(reply, reply_deadline, timeout_ms) {
@@ -1411,6 +1422,9 @@ fn syscall_linux_rustos_ipc_call_with_timeout(
             Err(errno) => return linux_errno(errno),
         };
     let wait_ticks = crate::arch::rtc::ticks();
+    // The wait charges its own sub-phases; restart the chain so the response
+    // write-back is not charged the whole wait.
+    cycle_mark = phase_mark();
     let Ok(reply_capacity) = usize::try_from(reply_capacity) else {
         return linux_errno(LINUX_EINVAL);
     };
@@ -1423,6 +1437,7 @@ fn syscall_linux_rustos_ipc_call_with_timeout(
         return linux_errno(address_space_error_to_linux_errno(err));
     }
     let write_ticks = crate::arch::rtc::ticks();
+    let _ = charge_phase(IpcCallPhase::WriteResponse, cycle_mark);
     log_slow_ipc_call(
         "call",
         endpoint.raw(),
@@ -2426,6 +2441,7 @@ fn enqueue_call_and_wake_with_handles(
     } else {
         priority
     };
+    let enqueue_mark = phase_mark();
     let (reply, receiver_to_wake) =
         match kernel_ipc_runtime::api::enqueue_endpoint_call_with_handles_and_priority(
             endpoint,
@@ -2442,6 +2458,7 @@ fn enqueue_call_and_wake_with_handles(
                 return Err(ipc_error_to_linux_errno(error));
             }
         };
+    let wake_mark = charge_phase(IpcCallPhase::EnqueueRuntime, enqueue_mark);
     ipc_trace!(
         "ipc call queued: endpoint={} receiver_to_wake={:?}",
         endpoint.raw(),
@@ -2476,26 +2493,27 @@ fn enqueue_call_and_wake_with_handles(
         // directly needed by a System caller is eligible for the very next
         // pick, rather than being indefinitely deferred by unrelated System
         // pollers.
-        let inherited = if donation_required {
-            multitask::bind_reserved_ipc_priority(reply.raw(), task_id, receiver_task_id)
-        } else {
-            true
-        };
-        donation_admitted |= inherited;
-        let woke = multitask::wake_task(receiver_task_id);
+        // Bind, wake, and the L4-style direct handoff hint are one scheduler
+        // mutation. The hint is why the caller still returns to arm its reply
+        // wait before yielding: a fast service reply must not race a
+        // not-yet-armed waiter, so `wait_for_reply` performs the actual yield
+        // after the wait state is committed.
+        let handoff = multitask::commit_ipc_call_handoff(
+            reply.raw(),
+            task_id,
+            receiver_task_id,
+            donation_required,
+        );
+        donation_admitted |= handoff.inherited;
         ipc_trace!(
             "ipc call wake: endpoint={} receiver_task={} woke={} inherited={}",
             endpoint.raw(),
             receiver_task_id,
-            woke,
-            inherited,
+            handoff.woke,
+            handoff.inherited,
         );
-        // L4-style direct handoff hint: the caller still returns to arm its
-        // reply wait before yielding, so a fast service reply cannot race a
-        // not-yet-armed waiter. `wait_for_reply` performs the actual yield
-        // after the wait state is committed.
-        let _ = multitask::set_next_synchronous_pick_hint(receiver_task_id);
     }
+    let _ = charge_phase(IpcCallPhase::EnqueueWake, wake_mark);
     if !donation_admitted {
         // The scheduling edge could not be installed. This used to cancel the
         // reply and return `ENOSPC`, on the reasoning that a System caller must
@@ -2586,147 +2604,6 @@ fn wait_for_service_reply_with_handle_limit_after(
         handle_capacity,
         service_ipc_deadline_tick_after(timeout_ms),
     )
-}
-
-fn wait_for_reply_with_deadline(
-    reply: KernelReplyHandle,
-    handle_capacity: usize,
-    deadline_tick: u64,
-) -> Result<(Vec<u8>, Vec<KernelTransferredHandle>), i64> {
-    let caller_task_id = multitask::current_task_id().ok_or(LINUX_EINVAL)?;
-    loop {
-        // Sample expiry on both sides of the queue take. A reply cannot win
-        // if expiry was already visible or becomes visible during the take.
-        let expired_before_take = reply_deadline_expired(deadline_tick);
-        if !rustos_user_abi::deadline::reply_observation_allows_publication(
-            expired_before_take,
-            false,
-        ) {
-            cancel_reply_wait(reply, caller_task_id, ReplyCancelReason::DeadlineBeforeArm);
-            return Err(LINUX_ETIMEDOUT);
-        }
-        match take_endpoint_response_for_wait(reply, handle_capacity) {
-            Ok(Some(response)) => {
-                if !rustos_user_abi::deadline::reply_observation_allows_publication(
-                    expired_before_take,
-                    reply_deadline_expired(deadline_tick),
-                ) {
-                    disarm_reply_deadline_waiter(caller_task_id);
-                    drop_transfer_descriptors(response.1.as_slice());
-                    return Err(LINUX_ETIMEDOUT);
-                }
-                disarm_reply_deadline_waiter(caller_task_id);
-                return Ok(response);
-            }
-            Ok(None) => {}
-            Err(errno) => {
-                disarm_reply_deadline_waiter(caller_task_id);
-                if errno == LINUX_EOVERFLOW {
-                    // A byte-only caller cannot own a response descriptor.
-                    // Cancel while the reply remains live so the normal
-                    // transfer result reaches deferred provider cleanup.
-                    cancel_reply_wait(reply, caller_task_id, ReplyCancelReason::TransferCapacity);
-                }
-                record_ipc_reply_wait_failure(reply, caller_task_id, errno);
-                return Err(errno);
-            }
-        }
-        if !multitask::arm_block_current_task() {
-            cancel_reply_wait(reply, caller_task_id, ReplyCancelReason::InvalidArm);
-            return Err(LINUX_EINVAL);
-        }
-        if !arm_reply_deadline_waiter(caller_task_id, deadline_tick) {
-            let _ = multitask::cancel_block_current_task();
-            multitask::yield_now();
-            continue;
-        }
-        // Re-poll after arming. If the replier completed the response between our
-        // first take and arming, the wake_task call landed before arm_block, so
-        // wake_armed would be set but no further wake arrives; re-checking the
-        // queue here picks up that response without sleeping.
-        let expired_before_take = reply_deadline_expired(deadline_tick);
-        if !rustos_user_abi::deadline::reply_observation_allows_publication(
-            expired_before_take,
-            false,
-        ) {
-            disarm_reply_deadline_waiter(caller_task_id);
-            let _ = multitask::wake_task(caller_task_id);
-            cancel_reply_wait(reply, caller_task_id, ReplyCancelReason::DeadlineAfterArm);
-            return Err(LINUX_ETIMEDOUT);
-        }
-        match take_endpoint_response_for_wait(reply, handle_capacity) {
-            Ok(Some(response)) => {
-                if !rustos_user_abi::deadline::reply_observation_allows_publication(
-                    expired_before_take,
-                    reply_deadline_expired(deadline_tick),
-                ) {
-                    disarm_reply_deadline_waiter(caller_task_id);
-                    let _ = multitask::cancel_block_current_task();
-                    drop_transfer_descriptors(response.1.as_slice());
-                    return Err(LINUX_ETIMEDOUT);
-                }
-                disarm_reply_deadline_waiter(caller_task_id);
-                let _ = multitask::cancel_block_current_task();
-                return Ok(response);
-            }
-            Ok(None) => {}
-            Err(errno) => {
-                disarm_reply_deadline_waiter(caller_task_id);
-                let _ = multitask::cancel_block_current_task();
-                if errno == LINUX_EOVERFLOW {
-                    // See the pre-arm case: capacity rejection is terminal
-                    // for this caller and must retire a prepared reply handle.
-                    cancel_reply_wait(reply, caller_task_id, ReplyCancelReason::TransferCapacity);
-                }
-                record_ipc_reply_wait_failure(reply, caller_task_id, errno);
-                return Err(errno);
-            }
-        }
-        if reply_deadline_expired(deadline_tick) {
-            disarm_reply_deadline_waiter(caller_task_id);
-            let _ = multitask::wake_task(caller_task_id);
-            cancel_reply_wait(reply, caller_task_id, ReplyCancelReason::DeadlineAfterArm);
-            return Err(LINUX_ETIMEDOUT);
-        }
-        match multitask::commit_block_current_task_and_yield() {
-            Some(true) => {
-                disarm_reply_deadline_waiter(caller_task_id);
-            }
-            Some(false) => {
-                disarm_reply_deadline_waiter(caller_task_id);
-                continue;
-            }
-            None => {
-                disarm_reply_deadline_waiter(caller_task_id);
-                cancel_reply_wait(reply, caller_task_id, ReplyCancelReason::InvalidCommit);
-                return Err(LINUX_EINVAL);
-            }
-        }
-    }
-}
-
-type EndpointWaitResponse = (Vec<u8>, Vec<KernelTransferredHandle>);
-
-fn take_endpoint_response_for_wait(
-    reply: KernelReplyHandle,
-    handle_capacity: usize,
-) -> Result<Option<EndpointWaitResponse>, i64> {
-    match kernel_ipc_runtime::api::take_endpoint_response_detailed(reply, handle_capacity) {
-        Ok(kernel_ipc_runtime::api::EndpointResponseTake::Pending) => Ok(None),
-        Ok(kernel_ipc_runtime::api::EndpointResponseTake::Response(response)) => {
-            let _ = multitask::release_ipc_priority(reply.raw());
-            Ok(Some(response))
-        }
-        Ok(kernel_ipc_runtime::api::EndpointResponseTake::Error {
-            error,
-            discarded_request_handles,
-        }) => {
-            let _ = multitask::release_ipc_priority(reply.raw());
-            drop_transfer_descriptors(discarded_request_handles.as_slice());
-            Err(ipc_error_to_linux_errno(error))
-        }
-        Err(err) => Err(ipc_error_to_linux_errno(err)),
-    }
 }
 
 fn service_ipc_deadline_tick_after(timeout_ms: u64) -> u64 {
@@ -3303,7 +3180,9 @@ fn copy_request_from_user(user_ptr: u64, user_len: u64) -> Result<Vec<u8>, i64> 
     if len == 0 || len > rustos_user_abi::syscall::IPC_MAX_INLINE_BYTES {
         return Err(LINUX_EINVAL);
     }
+    let alloc_mark = phase_mark();
     let mut bytes = alloc::vec![0_u8; len];
+    let _ = charge_phase(IpcCallPhase::CopyAlloc, alloc_mark);
     usermem::copy_from_current_user_exact(user_ptr, &mut bytes)
         .map_err(address_space_error_to_linux_errno)?;
     Ok(bytes)

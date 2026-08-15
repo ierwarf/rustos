@@ -666,6 +666,23 @@ fn publish_migrating_record(
 
 pub(super) fn drain_remote_wakes(cpu: usize) -> usize {
     validate_cpu(cpu);
+    // ORDERING: Acquire pairs with the producer's 0->1 edge, which it publishes
+    // only after the mailbox lock release that publishes the record. Observing
+    // zero therefore proves no record is waiting, and a producer that arrives
+    // after this load still wins the edge and its notification custody, so the
+    // wake is delivered on the next pass rather than lost.
+    // `local_dispatch_work_pending` already treats this word as authoritative
+    // for the same reason.
+    //
+    // The early return is what makes that worth reading: every dispatch used to
+    // zero the fixed `MAILBOX_CAPACITY` staging array and take the mailbox
+    // owner even on an empty mailbox, and `MAILBOX_CAPACITY` is `MAX_TASK`. On
+    // the voluntary-yield path neither balance helper below runs, so that
+    // unconditional clear and acquire were nearly the whole measured cost of
+    // this phase.
+    if MAILBOX_PENDING[cpu].load(Ordering::Acquire) == 0 {
+        return 0;
+    }
     let mut records = [RemoteWakeRecord::EMPTY; MAILBOX_CAPACITY];
     let mut count = 0;
     {
