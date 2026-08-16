@@ -18,9 +18,12 @@
 //! separates a cost that is inherent to the protected work from a cost that
 //! belongs to the debug instrumentation wrapped around it.
 
+#[cfg(rustos_lock_phase_profile)]
 use crate::debug::LogCategory;
+#[cfg(rustos_lock_phase_profile)]
 use crate::debug::phase_profile::{PhaseProfile, phase_now};
 
+#[cfg(rustos_lock_phase_profile)]
 pub(super) const LOCK_PHASE_COUNT: usize = 17;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -75,6 +78,7 @@ pub(super) enum LockPhase {
     ApicFallbackSentinel = 16,
 }
 
+#[cfg(rustos_lock_phase_profile)]
 static PROFILE: PhaseProfile<LOCK_PHASE_COUNT> = PhaseProfile::new(
     LogCategory::Debug,
     [
@@ -99,17 +103,37 @@ static PROFILE: PhaseProfile<LOCK_PHASE_COUNT> = PhaseProfile::new(
     "lock-phase-discarded",
 );
 
-/// Reads the cycle counter for a phase boundary.
+/// Reads the cycle counter for a phase boundary, or zero when this build does
+/// not attribute lock phases.
 #[inline]
 pub(super) fn now() -> u64 {
-    phase_now()
+    #[cfg(rustos_lock_phase_profile)]
+    {
+        phase_now()
+    }
+    #[cfg(not(rustos_lock_phase_profile))]
+    {
+        0
+    }
 }
 
 /// Charges `phase` with the interval since `since` and returns the boundary
 /// timestamp, so consecutive phases chain without a second read.
+///
+/// Compiled to nothing unless this build attributes lock phases. The call
+/// sites stay unconditional so a phase can never be added to the enum and
+/// forgotten at the boundary it names.
 #[inline]
 pub(super) fn charge(phase: LockPhase, since: u64) -> u64 {
-    PROFILE.charge(phase as usize, since)
+    #[cfg(rustos_lock_phase_profile)]
+    {
+        PROFILE.charge(phase as usize, since)
+    }
+    #[cfg(not(rustos_lock_phase_profile))]
+    {
+        let _ = (phase, since);
+        0
+    }
 }
 
 /// Emits one fixed record per phase at most once per second and clears the
@@ -118,5 +142,13 @@ pub(super) fn charge(phase: LockPhase, since: u64) -> u64 {
 ///
 /// The caller supplies the tick window because this crate owns no clock.
 pub fn drain_lock_profile(now_tick: u64, window_ticks: u64) -> usize {
-    PROFILE.drain(now_tick, window_ticks)
+    #[cfg(rustos_lock_phase_profile)]
+    {
+        PROFILE.drain(now_tick, window_ticks)
+    }
+    #[cfg(not(rustos_lock_phase_profile))]
+    {
+        let _ = (now_tick, window_ticks);
+        0
+    }
 }

@@ -79,8 +79,11 @@ that sets IPC latency.
 
 ## Where the round trip actually goes
 
-The `ipc_split_*` rows answer this directly. On the recorded baseline the
-~403,000-cycle intra-process round trip is:
+The `ipc_split_*` rows answer this directly. The tables in this section and the
+next several were recorded when the round trip was ~403,000 cycles; it is now
+118,160. **Read the shapes, not the absolute numbers** — the ratios below have
+held across every reduction since, and `docs/benchmarks/ipc-baseline.txt` is the
+current figure of record.
 
 | segment | min cycles | share |
 | --- | --- | --- |
@@ -297,6 +300,47 @@ Every per-operation cost fell with it, in proportion: `copy-request` 12,173 to
 6,450, `enqueue-runtime` 20,842 to 8,554, `bind-retain` 3,079 to 1,225. That is
 the signature of a cost that was in every operation rather than in any of them.
 
+## The profiler was a quarter of the round trip
+
+The tables above price an acquire/release pair at 939 cycles. That number was
+never the lock. It was the lock **plus the eleven counter reads and twenty-two
+atomic adds this profile wraps around it**, and the kernel takes roughly thirty
+tracked locks per synchronous IPC round trip.
+
+Stubbing `lock_profile::now` and `lock_profile::charge` to constants and
+rebuilding, changing nothing else:
+
+| probe | with the profile | without | change |
+| --- | ---: | ---: | ---: |
+| `ipc_rt_intra_process` | 160,120 | 117,840 | **−26.4%** |
+| `ipc_split_call_to_recv` | 97,280 | 70,080 | −28.0% |
+| `ipc_split_reply_to_return` | 62,240 | 47,320 | −24.0% |
+| `ipc_rt_cross_process` | 170,720 | 130,720 | −23.4% |
+| `sched_yield` | 51,880 | 42,800 | −17.5% |
+| `ipc_try_recv_empty` | 7,000 | 5,840 | −16.6% |
+| `null_syscall_getpid` | 3,840 | 3,880 | 0 |
+
+`null_syscall_getpid` is the control: it takes no tracked lock, and it does not
+move. Everything that does move, moves in proportion to how many locks it
+takes.
+
+So the profile is now a build switch — `[lock_telemetry] phase_profile` in
+`config/rustos.toml`, off by default, `RUSTOS_LOCK_PHASE_PROFILE=true` to turn
+it on for one build. The call sites stay unconditional so a phase cannot be
+added to the enum and forgotten at the boundary it names; only the counter read
+and the accumulator compile away.
+
+It stays in the tree because it is what found the global process-table binds,
+the `CPUID`-per-IPI exit, and the queue lock inside the pick scans. But every
+lock-phase table in this document was measured with it on, and each one should
+be read as the cost of an *instrumented* lock, not of a lock. The two are
+different by roughly half.
+
+This is the same trap as the `current_cpu_index` charge below, two orders of
+magnitude larger, and it was found the same way: by removing the measurement
+and measuring again. Any profile that wraps an operation cheaper than a few
+thousand cycles is worth ablating before its numbers are trusted.
+
 ## What only eight CPUs could show
 
 `cargo xtask bench --rustos-vcpus N` runs the lane at a chosen CPU count. The
@@ -365,8 +409,16 @@ the shipped configuration honestly, but it does not isolate a design cost from
 an instrumentation cost, and the two are not the same number.
 
 Reducing the instrumentation's cost, as the bitmap above does, is a real win
-that needs no policy decision. Deciding whether a build without it should exist
-at all is a policy question this document does not answer.
+that needs no policy decision.
+
+The policy question this document used to leave open — whether a build without
+the instrumentation should exist — is now answered for one half of it and still
+open for the other. The **lock-order verification** is not optional: it is what
+`cfg(rustos_boot_image)` buys, every kernel build has it, and a test asserts
+that. The **per-phase cycle attribution around** that verification is optional,
+was 26% of a round trip, and is now off unless a diagnosis run asks for it.
+Every figure in this document from that switch onward is the shipped
+configuration.
 
 ## Caveat
 

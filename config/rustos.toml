@@ -54,6 +54,20 @@ startup_delay_ms = 1500
 # Disabled by default because lock timing warnings add overhead and can be noisy.
 # Enable for hardening runs to surface hidden contention and long critical sections.
 enabled = false
+# Per-phase cycle attribution inside every tracked lock acquire and release.
+#
+# This is eleven counter reads and twenty-two atomic adds wrapped around an
+# operation that costs a few hundred cycles, and the kernel takes about thirty
+# tracked locks per synchronous IPC round trip. Measured by building with it
+# stubbed out, it was 26 percent of `ipc_rt_intra_process`, 28 percent of the
+# call-to-recv half, and zero of `null_syscall_getpid`, which takes no lock.
+#
+# It stays in the tree because it is what identified the global process-table
+# binds, the CPUID-per-IPI exit, and the queue lock inside the pick scans. Turn
+# it on for a diagnosis run -- `RUSTOS_LOCK_PHASE_PROFILE=true cargo xtask bench
+# --build` -- and read the result as the cost of an instrumented lock, not of a
+# lock.
+phase_profile = false
 warn_wait_cycles = 250000
 warn_hold_cycles = 250000
 

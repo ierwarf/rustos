@@ -56,6 +56,11 @@ pub struct LoggingConfig {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LockTelemetryConfig {
     pub enabled: bool,
+    /// Per-phase cycle attribution inside every tracked lock acquire and
+    /// release. Off by default: it is eleven counter reads around an operation
+    /// that costs a few hundred cycles, and measuring it that way accounted for
+    /// 26 percent of a synchronous IPC round trip.
+    pub phase_profile: bool,
     pub warn_wait_cycles: u64,
     pub warn_hold_cycles: u64,
 }
@@ -64,6 +69,7 @@ impl LockTelemetryConfig {
     pub const fn default() -> Self {
         Self {
             enabled: false,
+            phase_profile: false,
             warn_wait_cycles: 250_000,
             warn_hold_cycles: 250_000,
         }
@@ -171,6 +177,7 @@ pub fn emit_check_cfgs() {
     println!("cargo:rustc-check-cfg=cfg(rustos_debug_print_enabled)");
     println!("cargo:rustc-check-cfg=cfg(rustos_boot_trace_enabled)");
     println!("cargo:rustc-check-cfg=cfg(rustos_lock_telemetry_enabled)");
+    println!("cargo:rustc-check-cfg=cfg(rustos_lock_phase_profile)");
     for category in LOG_CATEGORIES {
         for (level, _) in LOG_LEVELS {
             println!("cargo:rustc-check-cfg=cfg(rustos_log_{category}_{level})");
@@ -180,12 +187,17 @@ pub fn emit_check_cfgs() {
 
 pub fn emit_lock_telemetry_cfgs(project_toml: &str) {
     println!("cargo:rerun-if-env-changed=RUSTOS_LOCK_TELEMETRY");
+    println!("cargo:rerun-if-env-changed=RUSTOS_LOCK_PHASE_PROFILE");
     println!("cargo:rerun-if-env-changed=RUSTOS_LOCK_TELEMETRY_WARN_WAIT_CYCLES");
     println!("cargo:rerun-if-env-changed=RUSTOS_LOCK_TELEMETRY_WARN_HOLD_CYCLES");
     let config = lock_telemetry_with_env_overrides(parse_lock_telemetry_toml(project_toml));
     println!(
         "cargo:rustc-env=RUSTOS_LOCK_TELEMETRY_ENABLED={}",
         bool_name(config.enabled)
+    );
+    println!(
+        "cargo:rustc-env=RUSTOS_LOCK_PHASE_PROFILE={}",
+        bool_name(config.phase_profile)
     );
     println!(
         "cargo:rustc-env=RUSTOS_LOCK_TELEMETRY_WARN_WAIT_CYCLES={}",
@@ -197,6 +209,9 @@ pub fn emit_lock_telemetry_cfgs(project_toml: &str) {
     );
     if config.enabled {
         println!("cargo:rustc-cfg=rustos_lock_telemetry_enabled");
+    }
+    if config.phase_profile {
+        println!("cargo:rustc-cfg=rustos_lock_phase_profile");
     }
 }
 
@@ -304,6 +319,10 @@ pub fn lock_telemetry_with_env_overrides(
         config.enabled = parse_bool_value(&value, "RUSTOS_LOCK_TELEMETRY")
             .unwrap_or_else(|err| panic!("invalid RUSTOS_LOCK_TELEMETRY: {err}"));
     }
+    if let Ok(value) = std::env::var("RUSTOS_LOCK_PHASE_PROFILE") {
+        config.phase_profile = parse_bool_value(&value, "RUSTOS_LOCK_PHASE_PROFILE")
+            .unwrap_or_else(|err| panic!("invalid RUSTOS_LOCK_PHASE_PROFILE: {err}"));
+    }
     if let Ok(value) = std::env::var("RUSTOS_LOCK_TELEMETRY_WARN_WAIT_CYCLES") {
         config.warn_wait_cycles = parse_u64_value(&value, "RUSTOS_LOCK_TELEMETRY_WARN_WAIT_CYCLES")
             .unwrap_or_else(|err| {
@@ -345,6 +364,7 @@ pub fn try_parse_lock_telemetry_toml(source: &str) -> Result<LockTelemetryConfig
         let value = raw_value.trim();
         match key {
             "enabled" => config.enabled = parse_bool_value(value, key)?,
+            "phase_profile" => config.phase_profile = parse_bool_value(value, key)?,
             "warn_wait_cycles" => config.warn_wait_cycles = parse_u64_value(value, key)?,
             "warn_hold_cycles" => config.warn_hold_cycles = parse_u64_value(value, key)?,
             other => return Err(format!("unknown lock_telemetry config key: {other}")),

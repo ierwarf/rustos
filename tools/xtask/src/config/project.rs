@@ -77,6 +77,9 @@ pub(crate) struct FuzzingConfig {
 #[derive(Clone, Debug)]
 pub(crate) struct LockTelemetryConfig {
     pub(crate) enabled: bool,
+    /// Per-phase cycle attribution inside every tracked lock acquire and
+    /// release. See `config/rustos.toml` for why it is off by default.
+    pub(crate) phase_profile: bool,
     pub(crate) warn_wait_cycles: u64,
     pub(crate) warn_hold_cycles: u64,
 }
@@ -85,6 +88,7 @@ impl Default for LockTelemetryConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            phase_profile: false,
             warn_wait_cycles: 250_000,
             warn_hold_cycles: 250_000,
         }
@@ -235,6 +239,7 @@ struct FuzzingConfigFile {
 #[serde(default, deny_unknown_fields)]
 struct LockTelemetryConfigFile {
     enabled: Option<bool>,
+    phase_profile: Option<bool>,
     warn_wait_cycles: Option<u64>,
     warn_hold_cycles: Option<u64>,
 }
@@ -374,6 +379,9 @@ fn project_from_file(file: ProjectConfigFile) -> ProjectConfig {
     if let Some(value) = lock_telemetry.enabled {
         config.lock_telemetry.enabled = value;
     }
+    if let Some(value) = lock_telemetry.phase_profile {
+        config.lock_telemetry.phase_profile = value;
+    }
     if let Some(value) = lock_telemetry.warn_wait_cycles {
         config.lock_telemetry.warn_wait_cycles = value;
     }
@@ -493,6 +501,9 @@ fn apply_fuzzing_env_overrides(fuzzing: &mut FuzzingConfig) -> Result<()> {
 fn apply_lock_telemetry_env_overrides(lock_telemetry: &mut LockTelemetryConfig) -> Result<()> {
     if let Some(value) = env_string("RUSTOS_LOCK_TELEMETRY") {
         lock_telemetry.enabled = parse_bool_env("RUSTOS_LOCK_TELEMETRY", &value)?;
+    }
+    if let Some(value) = env_string("RUSTOS_LOCK_PHASE_PROFILE") {
+        lock_telemetry.phase_profile = parse_bool_env("RUSTOS_LOCK_PHASE_PROFILE", &value)?;
     }
     if let Some(value) = env_string("RUSTOS_LOCK_TELEMETRY_WARN_WAIT_CYCLES") {
         lock_telemetry.warn_wait_cycles =
@@ -666,9 +677,39 @@ pub(crate) fn effective_config_toml(config: &ProjectConfig) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        FaultInjectionConfig, KernelBuildConfig, apply_fault_rule_overrides,
-        validate_fault_injection,
+        FaultInjectionConfig, KernelBuildConfig, LockTelemetryConfig, ProjectConfigFile,
+        apply_fault_rule_overrides, project_from_file, validate_fault_injection,
     };
+
+    /// The lock phase profile is eleven counter reads inside every tracked lock
+    /// acquire and release. Measured against a build with it stubbed out, it was
+    /// 26 percent of `ipc_rt_intra_process`. The only thing keeping a product
+    /// build from paying that is this key defaulting to off and the shipped
+    /// configuration leaving it off, so both are asserted here.
+    #[test]
+    fn lock_phase_profile_is_off_by_default_and_in_the_shipped_configuration() {
+        assert!(
+            !LockTelemetryConfig::default().phase_profile,
+            "an absent key must not compile the lock phase profile in"
+        );
+
+        let enabled: ProjectConfigFile =
+            toml::from_str("[lock_telemetry]\nphase_profile = true\n")
+                .expect("phase_profile is a recognized lock_telemetry key");
+        assert!(project_from_file(enabled).lock_telemetry.phase_profile);
+
+        let shipped = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../config/rustos.toml"),
+        )
+        .expect("read the shipped project configuration");
+        let shipped: ProjectConfigFile =
+            toml::from_str(&shipped).expect("shipped configuration parses");
+        assert!(
+            !project_from_file(shipped).lock_telemetry.phase_profile,
+            "the shipped build must not pay for lock phase attribution"
+        );
+    }
 
     #[test]
     fn kernel_rustflags_select_the_boot_image_contract() {
