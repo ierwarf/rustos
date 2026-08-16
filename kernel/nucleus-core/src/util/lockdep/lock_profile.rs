@@ -21,7 +21,7 @@
 use crate::debug::LogCategory;
 use crate::debug::phase_profile::{PhaseProfile, phase_now};
 
-pub(super) const LOCK_PHASE_COUNT: usize = 8;
+pub(super) const LOCK_PHASE_COUNT: usize = 13;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum LockPhase {
@@ -46,6 +46,22 @@ pub(super) enum LockPhase {
     BeforeTaskEdges = 6,
     /// The CPU-local held-stack recursion check and raw dependency edges.
     BeforeRawEdges = 7,
+    /// Release ownership derivation: logical index, architectural identity,
+    /// preemption depth, and the admissibility comparison.
+    ReleaseIdentity = 8,
+    /// Handing the lock word back.
+    ReleaseUnlock = 9,
+    /// Popping the CPU-local held-class stack.
+    ReleaseStack = 10,
+    /// The preemption depth decrement and its ownership correspondence check.
+    ReleaseEnable = 11,
+    /// One `current_cpu_index` derivation, counted but not timed.
+    ///
+    /// Timing it was tried and rejected: the derivation is cheap and called
+    /// often enough that two counter reads per call pushed guest boot past the
+    /// display provider's 2500 ms deadline. The sample count still gives the
+    /// multiplier the timed phases are paying.
+    CpuIndex = 12,
 }
 
 static PROFILE: PhaseProfile<LOCK_PHASE_COUNT> = PhaseProfile::new(
@@ -59,6 +75,11 @@ static PROFILE: PhaseProfile<LOCK_PHASE_COUNT> = PhaseProfile::new(
         "lock-phase-before-irq-usage",
         "lock-phase-before-task-edges",
         "lock-phase-before-raw-edges",
+        "lock-phase-release-identity",
+        "lock-phase-release-unlock",
+        "lock-phase-release-stack",
+        "lock-phase-release-enable",
+        "lock-phase-cpu-index",
     ],
     "lock-phase-discarded",
 );

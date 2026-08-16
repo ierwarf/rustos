@@ -258,6 +258,61 @@ outside the noise band. Seven earlier runs put `ipc_rt_intra_process` between
 397,040 and 402,800; 376,440 is twenty thousand cycles below the lowest of
 them, and all four IPC probes moved together by the same proportion.
 
+### The repeated identity derivation
+
+Splitting the release the same way showed where the rest of it went:
+
+| phase | cycles |
+| --- | ---: |
+| `release-identity` | 631 |
+| `release-enable` | 253 |
+| `release-stack` | 174 |
+| `release-unlock` (the actual lock word) | **36** |
+
+Handing the lock word back is 36 cycles. The other ~1,050 was answering "which
+CPU am I" — over and over. `current_apic_id` derived the logical index again
+internally, `preemption_depth` built an entire `PreemptionSnapshot` (four more
+derivations and three nested interrupt-mask blocks) to read one field, and
+`release` and `enable_preemption` each derived it once more. The acquire side
+repeated the same pattern five times.
+
+Interrupts are masked for the whole release block, and preemption is disabled
+for the guard's whole lifetime, so the index cannot change across either. It is
+now derived once and passed down. No assertion was removed — the diagnostic
+calls inside the panic messages take the index too.
+
+| measurement | before | after | change |
+| --- | ---: | ---: | ---: |
+| `lock-phase-release` | 1,172 | 472 | −60% |
+| `lock-phase-before-acquire` | 614 | 302 | −51% |
+| `lock-phase-before-task-edges` | 234 | 36 | −85% |
+| `lock-phase-after-acquire` | 244 | 103 | −58% |
+| acquire + release pair | 2,512 | **939** | **−63%** |
+| `ipc_rt_intra_process` (min) | 397,040 | **204,640** | **−48%** |
+| `ipc_rt_cross_process` (min) | 419,040 | **217,560** | −48% |
+| `sched_yield` (min) | 115,720 | **62,560** | −46% |
+| `ipc_try_recv_empty` (min) | 10,200 | **6,520** | −36% |
+
+Every per-operation cost fell with it, in proportion: `copy-request` 12,173 to
+6,450, `enqueue-runtime` 20,842 to 8,554, `bind-retain` 3,079 to 1,225. That is
+the signature of a cost that was in every operation rather than in any of them.
+
+## Two traps this work hit
+
+**A plain `cargo build` does not type-check the kernel.** The kernel builds
+with `--cfg rustos_boot_image`, and everything lockdep does is behind that cfg.
+`cargo build -p nucleus-core` compiled a version of the file with the hot paths
+cfg'd out and reported success; the errors appeared only during the boot-image
+build. Check with `RUSTFLAGS="--cfg rustos_boot_image" cargo check -p <crate>`
+before spending a boot cycle.
+
+**Instrumentation can break what it measures.** Charging a phase around
+`current_cpu_index` — two counter reads and two atomic adds against a function
+that costs tens of cycles — slowed the guest enough to miss the display
+provider's 2500 ms boot deadline, and the run produced no data at all. The
+sample count of a hot, cheap function is worth having; its per-call time is not
+worth what measuring it costs.
+
 ## Decoding the in-kernel profile
 
 The milestones pack two `u32` per `u64` argument. `kernel-scheduler-profile`

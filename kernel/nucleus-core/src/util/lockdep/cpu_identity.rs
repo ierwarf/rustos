@@ -90,7 +90,21 @@ pub fn current_apic_id() -> u32 {
     if !CPU_IDENTITIES_PUBLISHED.load(Ordering::Acquire) {
         return hardware_apic_id();
     }
-    let index = current_cpu_index();
+    apic_id_for_index(current_cpu_index())
+}
+
+/// The admitted architectural identity for an already-derived logical index.
+///
+/// Callers that hold interrupts masked have a stable index in hand; deriving it
+/// again per query was measured at roughly two hundred cycles apiece on the
+/// lock release path, which performed the same derivation six times.
+#[cfg(rustos_boot_image)]
+pub fn apic_id_for_index(index: usize) -> u32 {
+    // ORDERING: Acquire observes the complete dense map published by topology
+    // admission before any entry is read.
+    if !CPU_IDENTITIES_PUBLISHED.load(Ordering::Acquire) {
+        return hardware_apic_id();
+    }
     let count = CPU_IDENTITY_COUNT.load(Ordering::Relaxed);
     if index >= count {
         return hardware_apic_id();
