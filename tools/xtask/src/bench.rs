@@ -28,7 +28,12 @@ const TSC_PREFIX: &str = "ipcbench: tsc_khz=";
 /// Milestone families the in-kernel phase profiles publish. A name outside this
 /// list is some other milestone that happens to carry two arguments, and
 /// folding it into the phase table would invent a cost that was never measured.
-const PHASE_PREFIXES: [&str; 3] = ["ipc-call-phase-", "usermem-phase-", "lock-phase-"];
+const PHASE_PREFIXES: [&str; 4] = [
+    "ipc-call-phase-",
+    "usermem-phase-",
+    "lock-phase-",
+    "syscall-phase-",
+];
 
 /// One parsed probe result. Cycle counts are the primary record: they survive
 /// a host frequency change, while the nanosecond columns do not.
@@ -265,7 +270,12 @@ fn render_derived(results: &[BenchResult]) -> String {
     out
 }
 
-pub(crate) fn bench(config: &Config, build_image: bool, baseline: Option<&Path>) -> Result<()> {
+pub(crate) fn bench(
+    config: &Config,
+    build_image: bool,
+    baseline: Option<&Path>,
+    rustos_vcpus: u8,
+) -> Result<()> {
     if build_image {
         crate::build::build(config, false)?;
     }
@@ -282,6 +292,12 @@ pub(crate) fn bench(config: &Config, build_image: bool, baseline: Option<&Path>)
             "--dvm-block-shmem".to_owned(),
             "--timeout".to_owned(),
             "120".to_owned(),
+            // Lock contention is invisible on one CPU: `lock-phase-spin` only
+            // moves when two CPUs actually want the same word. Comparing a
+            // one-vCPU run against a multi-vCPU one is how a sharding or
+            // lock-free change earns its risk.
+            "--rustos-vcpus".to_owned(),
+            rustos_vcpus.to_string(),
             "--expect".to_owned(),
             END_MARKER.to_owned(),
         ]

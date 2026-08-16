@@ -13,6 +13,7 @@
 //!   or current-task state used to clean a foreign retired task.
 //! - **Evidence:** `process-address-space-lifecycle`, `endpoint-lifecycle`, and
 //!   `kernel-resource-lifecycle`.
+use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 use alloc::boxed::Box;
 use core::ptr::NonNull;
 
@@ -280,7 +281,83 @@ impl ProcessTable {
 
 static PROCESS_TABLE: ProcessTableLock = ProcessTableLock::new(ProcessTable::new());
 
-fn reclaim_slot(slot: &mut ProcessSlot) -> Option<Box<ProcessObject>> {
+/// Per-slot state visibility, readable without the table lock.
+///
+/// Encodes `(generation << 1) | staged`, and zero for a slot with no live
+/// object. Testing visibility used to take the global process table, and a
+/// user-memory copy did that on top of a retain and a release of the same
+/// lock -- three acquisitions to answer a question about one slot. A reader
+/// still compares the generation its handle carries, so a reused slot reads as
+/// invisible exactly as the locked scan made it.
+///
+/// Every transition that changes object presence, slot generation, or the
+/// staged flag republishes this word while holding the table lock.
+static PROCESS_STATE_VISIBILITY: [AtomicU64; MAX_PROCESS_OBJECTS] =
+    [const { AtomicU64::new(0) }; MAX_PROCESS_OBJECTS];
+
+/// Per-slot process state pointer, readable without the table lock.
+///
+/// `state_ptr` addresses a field inside the boxed process object and
+/// `replace_for_exec` mutates the state in place, so this stays valid for the
+/// object's whole lifetime.
+static PROCESS_STATE_PTR: [AtomicPtr<ProcessStateLock<UserProcessState>>; MAX_PROCESS_OBJECTS] =
+    [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_PROCESS_OBJECTS];
+
+/// Republishes `index`'s unlocked view from the authoritative slot.
+fn publish_slot_visibility(index: usize, slot: &ProcessSlot) {
+    let (word, state) = match slot.object.as_deref() {
+        Some(object) => {
+            let generation = u64::from(slot.generation) << 1;
+            let word = if object.exec_state_staged {
+                generation | 1
+            } else {
+                generation
+            };
+            (word, object.state_ptr().as_ptr())
+        }
+        None => (0, core::ptr::null_mut()),
+    };
+    // ORDERING: Release publishes the object installation, generation bump, or
+    // staged transition that preceded it before any unlocked reader can
+    // observe either word. The pointer is stored first so a reader that
+    // observes a live visibility word always observes the matching state.
+    PROCESS_STATE_PTR[index].store(state, Ordering::Release);
+    // ORDERING: Release orders the pointer store above before this word, so a
+    // reader that observes a live generation also observes the matching state.
+    PROCESS_STATE_VISIBILITY[index].store(word, Ordering::Release);
+}
+
+/// Runs `f` against the **current task's own** process state without touching
+/// the process table.
+///
+/// # Contract
+///
+/// Sound only for a process that has a live thread on this CPU.
+/// `reclaim_slot` refuses to reclaim while `thread_count != 0`, so a running
+/// task keeps its own object alive and its published state pointer valid. No
+/// other process carries that guarantee, and every other caller must keep
+/// going through [`retain_process`].
+///
+/// Binding an address space for a user copy used to cost three acquisitions of
+/// the global table -- retain, visibility, release -- to reach a pointer the
+/// running task already owned.
+pub(super) fn with_own_visible_state<R>(
+    handle: ProcessHandle,
+    f: impl FnOnce(&UserProcessState) -> R,
+) -> Option<R> {
+    // ORDERING: Acquire observes the object installation published before the
+    // pointer store.
+    let state = NonNull::new(PROCESS_STATE_PTR.get(handle.index())?.load(Ordering::Acquire))?;
+    // SAFETY: the caller's own live thread pins this object, so the published
+    // pointer addresses a state lock that cannot be reclaimed under it.
+    let state = unsafe { state.as_ref() }.lock();
+    // Visibility is tested after the state lock exactly as the locked path did:
+    // an exec that is staging state holds this lock, so the flag it publishes
+    // cannot be observed early.
+    process_state_is_visible(handle).then(|| f(&state))
+}
+
+fn reclaim_slot(index: usize, slot: &mut ProcessSlot) -> Option<Box<ProcessObject>> {
     let object = slot.object.as_mut()?;
     if object.ref_count != 0 || object.thread_count != 0 {
         object.queued_for_reap = false;
@@ -295,6 +372,7 @@ fn reclaim_slot(slot: &mut ProcessSlot) -> Option<Box<ProcessObject>> {
     // Generation exhaustion permanently retires this slot. Reusing generation
     // one would let a stale ProcessHandle alias a new process.
     slot.generation = ProcessTable::next_generation(slot.generation).unwrap_or(0);
+    publish_slot_visibility(index, slot);
     Some(object)
 }
 
@@ -317,6 +395,7 @@ pub fn create_process_with_parent(
         .enumerate()
         .find(|(_, slot)| slot.object.is_none() && slot.generation != 0)?;
     slot.object = Some(object);
+    publish_slot_visibility(index, slot);
     let handle = ProcessHandle::new(index, slot.generation);
     Some(handle)
 }
@@ -561,6 +640,9 @@ pub fn stage_exec_state(
             );
             object.mm_generation = reservation.next_mm_generation;
             object.exec_state_staged = true;
+            let index = reservation.handle.index();
+            let slot = &table.slots[index];
+            publish_slot_visibility(index, slot);
         }
         Some(StagedExec {
             reservation,
@@ -595,6 +677,8 @@ pub fn finalize_exec_state(staged: StagedExec, published_handle: ProcessHandle) 
         if exit_pending {
             object.exiting = true;
         }
+        let index = staged.reservation.handle.index();
+        publish_slot_visibility(index, &table.slots[index]);
         exit_pending
     };
     ExecFinalize {
@@ -627,13 +711,13 @@ fn exec_commit_may_transfer(object: &ProcessObject, reservation: ExecReservation
 }
 
 fn process_state_is_visible(handle: ProcessHandle) -> bool {
-    let table = PROCESS_TABLE.lock();
-    table
-        .slots
-        .get(handle.index())
-        .filter(|slot| slot.generation == handle.generation())
-        .and_then(|slot| slot.object.as_deref())
-        .is_some_and(|object| !object.exec_state_staged)
+    let Some(word) = PROCESS_STATE_VISIBILITY.get(handle.index()) else {
+        return false;
+    };
+    // ORDERING: Acquire observes the object installation, generation bump, or
+    // staged transition published before this word.
+    let encoded = word.load(Ordering::Acquire);
+    encoded != 0 && encoded >> 1 == u64::from(handle.generation()) && encoded & 1 == 0
 }
 
 pub fn begin_exec(handle: ProcessHandle) -> Option<ExecReservation> {
@@ -853,10 +937,11 @@ pub fn reap_exited_processes() -> usize {
         let queue_len = core::mem::replace(&mut table.reap_len, 0);
         let scan_all = core::mem::replace(&mut table.reap_scan_pending, false);
         for handle in queue.into_iter().take(queue_len).flatten() {
+            let index = handle.index();
             let Some(slot) = table.lookup_slot_mut(handle) else {
                 continue;
             };
-            let Some(object) = reclaim_slot(slot) else {
+            let Some(object) = reclaim_slot(index, slot) else {
                 continue;
             };
             reclaimed[reclaimed_len] = Some(object);
@@ -864,8 +949,8 @@ pub fn reap_exited_processes() -> usize {
             reaped += 1;
         }
         if scan_all {
-            for slot in &mut table.slots {
-                let Some(object) = reclaim_slot(slot) else {
+            for (index, slot) in table.slots.iter_mut().enumerate() {
+                let Some(object) = reclaim_slot(index, slot) else {
                     continue;
                 };
                 reclaimed[reclaimed_len] = Some(object);
@@ -882,7 +967,13 @@ pub fn reap_exited_processes() -> usize {
 fn reset_for_tests() {
     let retired = {
         let mut table = PROCESS_TABLE.lock();
-        core::mem::replace(&mut *table, ProcessTable::new())
+        let retired = core::mem::replace(&mut *table, ProcessTable::new());
+        // The unlocked visibility words mirror the table, so a reset that left
+        // them behind would let one test read another's slot as live.
+        for (index, slot) in table.slots.iter().enumerate() {
+            publish_slot_visibility(index, slot);
+        }
+        retired
     };
     // LIFECYCLE: address spaces and process-owned allocations may release
     // memory while being dropped, so test reset follows the production reaper
@@ -896,8 +987,8 @@ pub(crate) mod tests {
         ExecReservation, ProcessHandle, ProcessObject, ProcessTable, WaitResult, attach_task,
         begin_exec, cancel_exec, create_process, create_process_with_parent, detach_task,
         is_process_exiting, mark_process_exiting, note_process_continued, note_process_exit_status,
-        note_process_stopped, reap_exited_processes, retain_process, thread_count_by_pid,
-        try_with_process_state_mut, wait_for_child,
+        note_process_stopped, process_state_is_visible, reap_exited_processes, retain_process,
+        thread_count_by_pid, try_with_process_state_mut, wait_for_child,
     };
     use crate::memory::paging::ProcessAddressSpace;
     use crate::user::process_state::UserProcessState;
@@ -1118,5 +1209,31 @@ pub(crate) mod tests {
         assert_eq!(reap_exited_processes(), 1);
         detach_task(parent).expect("detach parent");
         assert_eq!(reap_exited_processes(), 1);
+    }
+
+    /// The unlocked visibility word must track the slot through its whole
+    /// lifecycle. A publication site missed by a future change shows up here
+    /// rather than as a user copy reading a staged or reaped address space.
+    #[test]
+    fn unlocked_visibility_tracks_creation_exec_staging_and_reclamation() {
+        let _isolation = isolate_process_table();
+        let handle = create_process(910_001, new_state()).expect("create process");
+        assert!(
+            process_state_is_visible(handle),
+            "a freshly created process must be visible"
+        );
+
+        let stale = ProcessHandle::new(handle.index(), handle.generation().wrapping_add(1));
+        assert!(
+            !process_state_is_visible(stale),
+            "a handle from another generation must never read as visible"
+        );
+
+        detach_task(handle).expect("detach task");
+        assert_eq!(reap_exited_processes(), 1);
+        assert!(
+            !process_state_is_visible(handle),
+            "a reclaimed slot must not read as visible"
+        );
     }
 }

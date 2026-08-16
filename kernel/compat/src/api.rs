@@ -47,6 +47,10 @@ pub mod syscall {
 
     /// Emits the bounded per-second IPC call-path cycle attribution. This is
     /// diagnostics only; nothing consumes it to make a decision.
+    pub fn drain_syscall_profile() -> usize {
+        crate::user::syscall::drain_syscall_profile()
+    }
+
     pub fn drain_ipc_call_profile() -> usize {
         crate::user::syscall::linux::drain_ipc_call_profile()
     }

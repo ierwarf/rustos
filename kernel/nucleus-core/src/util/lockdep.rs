@@ -60,7 +60,9 @@ pub use preemption::{
 use preemption::{
     cancel_pending_acquire_and_enable, disable_preemption, enable_preemption, enable_preemption_on,
 };
-#[cfg(any(rustos_boot_image, test))]
+// Only the anchored unit tests reach these directly; the production callers
+// moved into `preemption` with the functions that use them.
+#[cfg(test)]
 use preemption::{preemption_release_is_admissible, preemption_units_match};
 pub use cpu_identity::{
     bind_current_cpu_identity, current_apic_id, current_cpu_index, finalize_cpu_identities,

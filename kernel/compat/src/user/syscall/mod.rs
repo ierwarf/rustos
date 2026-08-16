@@ -11,6 +11,9 @@ use crate::multitask;
 use crate::user::abi::UserAbi;
 use kernel_ps::api::syscall as syscall_core;
 
+mod syscall_profile;
+pub use syscall_profile::drain_syscall_profile;
+
 pub(crate) mod linux;
 pub(crate) mod windows;
 
@@ -257,25 +260,35 @@ unsafe extern "C" {
 #[unsafe(no_mangle)]
 extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> u64 {
     let frame = unsafe { &mut *frame };
+    let phase = syscall_profile::now();
     let user_simd = multitask::SyscallUserSimdSnapshot::capture()
         .expect("nested syscall SIMD capture or missing current task");
+    let phase = syscall_profile::charge(syscall_profile::SyscallPhase::SimdCapture, phase);
     let abi = validate_syscall_entry_or_terminate(frame);
+    let phase = syscall_profile::charge(syscall_profile::SyscallPhase::Validate, phase);
     trace_syscall_entry(frame, abi);
+    let phase = syscall_profile::charge(syscall_profile::SyscallPhase::Trace, phase);
     let result = dispatch_syscall(frame, abi);
+    let phase = syscall_profile::charge(syscall_profile::SyscallPhase::Dispatch, phase);
     assert!(
         user_simd.restore(),
         "syscall SIMD restore no longer owns the entering task"
     );
+    let phase = syscall_profile::charge(syscall_profile::SyscallPhase::SimdRestore, phase);
     // The syscall body runs with IF=1, so this software interrupt preserves
     // an interruptible kernel continuation. The scheduler may switch here and
     // later resume the exact syscall before restoring the entering user SIMD
     // image. This closes hot-syscall starvation without a high-rate PIT retry.
     multitask::reschedule_deferred_from_interruptible_syscall();
+    let phase =
+        syscall_profile::charge(syscall_profile::SyscallPhase::RescheduleDeferred, phase);
     // The syscall frame stayed live on the task's kernel stack across that
     // possible continuation. Revalidate the exact SYSRET boundary after the
     // last resume so a stale pre-schedule decision can never authorize return.
     let return_abi = validate_syscall_entry_or_terminate(frame);
+    let phase = syscall_profile::charge(syscall_profile::SyscallPhase::Validate, phase);
     trace_syscall_exit(frame, return_abi, result);
+    syscall_profile::charge(syscall_profile::SyscallPhase::Trace, phase);
     result
 }
 

@@ -915,19 +915,32 @@ pub fn wait_for_child(
     }
 }
 
+/// Runs `f` against the current task's address space.
+///
+/// This is the hottest user-copy step in the kernel, and it used to retain the
+/// process, test visibility, and release the retain -- three acquisitions of
+/// the global process table to reach a pointer the running task already owned.
+/// A live thread pins its own process object, so the published per-slot state
+/// pointer is enough; the visibility test still runs, still under the process
+/// state lock, and now reads one atomic instead of taking the table.
 pub fn with_current_mm<R>(f: impl FnOnce(&ProcessAddressSpace) -> R) -> Option<R> {
-    let (_, _, process) = retain_current_user_process_binding()?;
-    let retained = user_copy_profile::now();
-    let result = process.with_visible_state(|_, state| {
+    let entry = user_copy_profile::now();
+    let (_, _, process_handle, _) = interrupts::without_interrupts(|| {
+        if let Some(identity) = published_current_identity() {
+            return identity.user_binding();
+        }
+        // SAFETY: interrupts are masked, so the current slot is stable.
+        unsafe { scheduler_ref().current_user_process_binding() }
+    })?;
+    let identified =
+        user_copy_profile::charge(user_copy_profile::UserCopyPhase::BindIdentity, entry);
+    let result = process_table::with_own_visible_state(process_handle, |state| {
         // Charged inside the closure so the phase ends once the per-process
         // state lock is held and visibility has been re-tested, not when the
         // caller's own work finishes.
-        user_copy_profile::charge(user_copy_profile::UserCopyPhase::BindVisible, retained);
+        user_copy_profile::charge(user_copy_profile::UserCopyPhase::BindVisible, identified);
         f(state.address_space())
     });
-    let visible_done = user_copy_profile::now();
-    drop(process);
-    user_copy_profile::charge(user_copy_profile::UserCopyPhase::BindRelease, visible_done);
     result
 }
 

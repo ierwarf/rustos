@@ -58,6 +58,10 @@ enum XtaskCommand {
         /// a diff instead of only in a terminal that has scrolled away.
         #[arg(long)]
         baseline: Option<PathBuf>,
+        /// Lock contention only exists with more than one CPU wanting the same
+        /// word, so a contention claim needs a run at more than one.
+        #[arg(long = "rustos-vcpus", default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=8))]
+        rustos_vcpus: u8,
     },
     Selftest,
     #[command(name = "fuzz-host")]
@@ -163,7 +167,8 @@ pub(crate) fn run() -> Result<()> {
         Some(XtaskCommand::Bench {
             build_image,
             baseline,
-        }) => crate::bench::bench(&config, build_image, baseline.as_deref()),
+            rustos_vcpus,
+        }) => crate::bench::bench(&config, build_image, baseline.as_deref(), rustos_vcpus),
         Some(XtaskCommand::Selftest) => testinfra::selftest(&config),
         Some(XtaskCommand::FuzzHost {
             target,
