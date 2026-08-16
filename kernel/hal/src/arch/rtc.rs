@@ -324,15 +324,27 @@ pub fn monotonic_nanos() -> u64 {
     nanos
 }
 
+/// `RTC_TICKS_PER_SEC / 1e9` in the clock's fixed point, rounded up.
+///
+/// Both operands are literals and the division still compiled to a `__udivti3`
+/// call -- LLVM does not strength reduce a `u128` division by a constant.
+/// Evaluating it in a `const` does, because the whole expression folds at
+/// compile time.
+///
+/// Rounded up for the same reason as the clock's multipliers, and here the
+/// truncating version was off by a whole tick: one second of uptime came back
+/// as 1023, because 1024 landed at 1023.99999946 before the shift.
+const NANOS_TO_TICKS_MULT: u64 = {
+    let numerator = (RTC_TICKS_PER_SEC as u128) << crate::arch::clock::NANOS_SHIFT;
+    ((numerator + 1_000_000_000 - 1) / 1_000_000_000) as u64
+};
+
 pub fn ticks() -> u64 {
     let nanos = crate::arch::clock::monotonic_nanos();
     if nanos == 0 && crate::arch::clock::current_source().is_none() {
         return RTC_TICKS.load(Ordering::Acquire);
     }
-    u64::try_from(
-        u128::from(nanos).saturating_mul(u128::from(RTC_TICKS_PER_SEC)) / 1_000_000_000_u128,
-    )
-    .unwrap_or(u64::MAX)
+    crate::arch::clock::scale_by_nanos_mult(nanos, NANOS_TO_TICKS_MULT)
 }
 
 pub const fn ticks_per_second() -> u64 {
@@ -870,5 +882,25 @@ mod tests {
             try_snapshot_ready_sleep_waiters(&waiters, 4, &mut ready),
             Some(0)
         );
+    }
+
+    /// A second of uptime is `RTC_TICKS_PER_SEC` ticks, and every whole second
+    /// after it still is.
+    ///
+    /// The tick conversion stopped dividing and started multiplying by a
+    /// fixed-point reciprocal. With that reciprocal truncated instead of
+    /// rounded up, one second read as 1023: the product landed at 1023.99999946
+    /// and the shift took the fraction. Nothing else in this file would have
+    /// noticed a deadline wheel running slow by one tick in every second.
+    #[test]
+    fn whole_seconds_convert_to_whole_ticks() {
+        for seconds in [1_u64, 2, 60, 3_600, 86_400] {
+            let nanos = seconds * 1_000_000_000;
+            assert_eq!(
+                crate::arch::clock::scale_by_nanos_mult(nanos, NANOS_TO_TICKS_MULT),
+                seconds * RTC_TICKS_PER_SEC,
+                "{seconds}s did not convert to whole ticks"
+            );
+        }
     }
 }

@@ -97,7 +97,7 @@ pub fn preemption_snapshot() -> PreemptionSnapshot {
             let depth = PREEMPT_DISABLE_DEPTH[logical_cpu].load(Ordering::Acquire);
             let pending_depth = PREEMPT_PENDING_DEPTH[logical_cpu].load(Ordering::Relaxed);
             let held_depth = held_spin_lock_depth_on(logical_cpu);
-            let top_class = current_lock_class();
+            let top_class = current_lock_class_on(logical_cpu);
             assert!(
                 preemption_units_match(depth, held_depth, pending_depth),
                 "raw-spin preemption snapshot mismatch cpu={} apic={:#x} depth={} held_depth={} pending_depth={} top_class={:?}",

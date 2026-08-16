@@ -929,6 +929,22 @@ pub fn current_lock_class() -> Option<u8> {
     }
 }
 
+/// `current_lock_class` for a caller that already masked interrupts and derived
+/// its logical index. See [`irq_context_depth_on`] for the contract.
+#[cfg(rustos_boot_image)]
+#[inline]
+pub fn current_lock_class_on(cpu: usize) -> Option<u8> {
+    with_current_stack_on(cpu, |stack| {
+        stack.len.checked_sub(1).map(|index| stack.classes[index])
+    })
+}
+
+#[cfg(not(rustos_boot_image))]
+#[inline]
+pub fn current_lock_class_on(_cpu: usize) -> Option<u8> {
+    None
+}
+
 #[inline]
 pub fn current_task_sleepable_lock_class() -> Option<u8> {
     #[cfg(rustos_boot_image)]

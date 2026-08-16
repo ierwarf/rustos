@@ -42,6 +42,22 @@ static HPET_BASE_COUNTER: AtomicU64 = AtomicU64::new(0);
 static TSC_BASE: AtomicU64 = AtomicU64::new(0);
 static TSC_HZ: AtomicU64 = AtomicU64::new(0);
 
+/// Fixed-point scale for every counter-to-nanosecond conversion:
+/// `nanos = (delta * mult) >> NANOS_SHIFT`.
+///
+/// A `u128` division is a call into `__udivti3`, and LLVM does not strength
+/// reduce one even when the divisor is a literal -- checked against the
+/// generated assembly, not assumed. Reading the clock went through two of them:
+/// `monotonic_nanos` divided by the rate, and `rtc::ticks` divided the result
+/// again. There are 55 call sites of the first and about 90 of the second.
+///
+/// The multiplier is derived once, when the rate is admitted. 48 bits keeps it
+/// inside a `u64` across the whole admitted rate range and bounds the truncation
+/// at `delta / 2^48` -- under a nanosecond per hour of uptime at 4 GHz.
+pub(crate) const NANOS_SHIFT: u32 = 48;
+static TSC_NANOS_MULT: AtomicU64 = AtomicU64::new(0);
+static HPET_NANOS_MULT: AtomicU64 = AtomicU64::new(0);
+
 // Cross-CPU TSC warp rendezvous. A multiprocessor topology may publish the raw
 // TSC as the global monotonic source only after every application processor has
 // proven, against the boot processor, that no CPU ever observes a timestamp
@@ -91,6 +107,7 @@ pub fn init() -> Option<ClockSourceInfo> {
         // The calibrated rate remains useful for each CPU's local
         // TSC-deadline clockevent even when HPET owns global monotonic time.
         TSC_HZ.store(tsc_hz, Ordering::Relaxed);
+        TSC_NANOS_MULT.store(nanos_mult_from_hz(tsc_hz), Ordering::Relaxed);
         // Invariant TSC proves rate stability, not cross-CPU offset/skew. Only
         // a uniprocessor topology may expose the raw TSC here. A multiprocessor
         // topology starts on HPET and is upgraded by
@@ -109,6 +126,7 @@ pub fn init() -> Option<ClockSourceInfo> {
     if let Some((base, period_fs, counter)) = hpet {
         HPET_BASE.store(base, Ordering::Relaxed);
         HPET_PERIOD_FS.store(period_fs, Ordering::Relaxed);
+        HPET_NANOS_MULT.store(nanos_mult_from_period_fs(period_fs), Ordering::Relaxed);
         HPET_BASE_COUNTER.store(counter, Ordering::Relaxed);
         SOURCE.store(SOURCE_HPET, Ordering::Release);
         return Some(ClockSourceInfo {
@@ -474,17 +492,55 @@ fn read_tsc_ordered() -> u64 {
     (u64::from(high) << 32) | u64::from(low)
 }
 
+/// `1e9 / hz` in `NANOS_SHIFT` fixed point, rounded up.
+///
+/// Rounding up is the whole reason the conversions still round-trip. The
+/// product is truncated by the shift, so a multiplier rounded *down* truncates
+/// twice: at 2.5 GHz, one millisecond of counter came back as 999,999 ns and
+/// the promotion-continuity witness caught it. A multiplier at or above the
+/// true ratio makes the result at or above the division's, and the shift can
+/// then only bring it back down to it.
+fn nanos_mult_from_hz(hz: u64) -> u64 {
+    let hz = u128::from(hz.max(1));
+    u64::try_from((1_000_000_000_u128 << NANOS_SHIFT).div_ceil(hz)).unwrap_or(u64::MAX)
+}
+
+/// `period_fs / 1e6` in `NANOS_SHIFT` fixed point, rounded up for the same
+/// reason as [`nanos_mult_from_hz`].
+fn nanos_mult_from_period_fs(period_fs: u64) -> u64 {
+    u64::try_from((u128::from(period_fs) << NANOS_SHIFT).div_ceil(FEMTOSECONDS_PER_NANOSECOND))
+        .unwrap_or(u64::MAX)
+}
+
+/// One `mul` and one shift, where a division used to be a libcall.
+#[inline]
+pub(crate) fn scale_by_nanos_mult(delta: u64, mult: u64) -> u64 {
+    u64::try_from((u128::from(delta) * u128::from(mult)) >> NANOS_SHIFT).unwrap_or(u64::MAX)
+}
+
 fn nanos_from_tsc_delta(delta: u64, hz: u64) -> u64 {
-    u64::try_from(
-        u128::from(delta)
-            .saturating_mul(1_000_000_000)
-            .checked_div(u128::from(hz.max(1)))
-            .unwrap_or(u128::MAX),
-    )
-    .unwrap_or(u64::MAX)
+    // The multiplier is published with the rate, so a zero here means a caller
+    // reached this before admission. Deriving it now keeps the answer exact
+    // rather than reporting zero elapsed time.
+    let mult = match TSC_NANOS_MULT.load(Ordering::Relaxed) {
+        0 => nanos_mult_from_hz(hz),
+        mult => mult,
+    };
+    scale_by_nanos_mult(delta, mult)
 }
 
 fn nanos_from_hpet_delta(delta: u64, period_fs: u64) -> u64 {
+    let mult = match HPET_NANOS_MULT.load(Ordering::Relaxed) {
+        0 => nanos_mult_from_period_fs(period_fs),
+        mult => mult,
+    };
+    scale_by_nanos_mult(delta, mult)
+}
+
+/// The division this file used to perform, kept as the reference the fixed-point
+/// conversions are checked against.
+#[cfg(test)]
+fn nanos_from_hpet_delta_by_division(delta: u64, period_fs: u64) -> u64 {
     u64::try_from(
         u128::from(delta)
             .saturating_mul(u128::from(period_fs))
@@ -554,5 +610,63 @@ mod tests {
         assert_eq!(ticks_from_nanos(1_000_000_000, hz), hz);
         assert_eq!(nanos_from_tsc_delta(ticks_from_nanos(4_000, hz), hz), 4_000);
         assert_eq!(ticks_from_nanos(0, hz), 0);
+    }
+
+    /// The fixed-point conversion replaced a `__udivti3` call. It has to give
+    /// the same answer as the division it replaced, across the whole admitted
+    /// rate range and out to a realistic uptime, or it traded a real cost for a
+    /// real bug.
+    #[test]
+    fn the_fixed_point_conversion_matches_the_division_it_replaced() {
+        fn by_division(delta: u64, hz: u64) -> u64 {
+            u64::try_from(
+                u128::from(delta)
+                    .saturating_mul(1_000_000_000)
+                    .checked_div(u128::from(hz.max(1)))
+                    .unwrap_or(u128::MAX),
+            )
+            .unwrap_or(u64::MAX)
+        }
+
+        for hz in [
+            MIN_TSC_HZ,
+            1_000_000_000,
+            2_400_000_000,
+            3_991_222_000,
+            MAX_TSC_HZ,
+        ] {
+            let mult = nanos_mult_from_hz(hz);
+            // One second, one hour, and one day of counter, plus the edges.
+            for delta in [0, 1, 1_000, hz, hz * 3_600, hz.saturating_mul(86_400)] {
+                let exact = by_division(delta, hz);
+                let scaled = scale_by_nanos_mult(delta, mult);
+                // The multiplier rounds up and the shift truncates, so the
+                // result is never below the division's and never more than one
+                // part in 2^48 of the counter delta above it.
+                let slack = (u128::from(delta) >> NANOS_SHIFT) as u64 + 1;
+                assert!(
+                    scaled >= exact && scaled - exact <= slack,
+                    "hz={hz} delta={delta}: fixed point {scaled} vs division {exact}"
+                );
+            }
+        }
+    }
+
+    /// Same obligation for the HPET path, against the division still in this
+    /// file as the reference.
+    #[test]
+    fn the_hpet_fixed_point_conversion_matches_its_division() {
+        for period_fs in [69_841_279_u64, 100_000_000, 10_000_000] {
+            let mult = nanos_mult_from_period_fs(period_fs);
+            for delta in [0_u64, 1, 1_000, 14_318_180, 14_318_180 * 3_600] {
+                let exact = nanos_from_hpet_delta_by_division(delta, period_fs);
+                let scaled = scale_by_nanos_mult(delta, mult);
+                let slack = (u128::from(delta) >> NANOS_SHIFT) as u64 + 1;
+                assert!(
+                    scaled >= exact && scaled - exact <= slack,
+                    "period_fs={period_fs} delta={delta}: {scaled} vs {exact}"
+                );
+            }
+        }
     }
 }

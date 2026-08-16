@@ -349,6 +349,66 @@ reason to re-read. That is the argument for the ceilings below, and it is not
 hypothetical: the first ceiling declared on this path found six derivations on
 its first boot.
 
+### Reading the clock was a libcall into a software divide
+
+`rtc::ticks()` is called about ninety places and `monotonic_nanos` fifty-five,
+and one `ticks()` performed two `u128` divisions: `monotonic_nanos` divided the
+counter delta by the rate, then `ticks` divided that by a nanosecond. An IPC
+call took five of them, purely to fill in a slow-call latency record.
+
+The premise was checked against the generated assembly rather than assumed:
+
+| expression | emits |
+| --- | --- |
+| `delta * 1e9 / hz` in `u128` | `callq __udivti3` |
+| `nanos * 1024 / 1_000_000_000` in `u128`, **literal divisor** | `callq __udivti3` |
+| `(delta * mult) >> 48` | 9 instructions, no call |
+
+LLVM does not strength-reduce a `u128` division even by a constant, so the
+literal divisor bought nothing. Both conversions now multiply by a reciprocal in
+48-bit fixed point, derived once when the rate is admitted; the tick reciprocal
+is a `const`, which does fold at compile time.
+
+Two off-by-ones came out of it, and the second is the argument for writing the
+witness before trusting the change:
+
+- A multiplier rounded *down* truncates twice, because the shift truncates too.
+  At 2.5 GHz one millisecond of counter came back as 999,999 ns, and the
+  existing promotion-continuity witness caught it.
+- The tick reciprocal had the same flaw and **no** witness. One second would
+  have read 1023 ticks instead of 1024 -- the product landed at 1023.99999946 --
+  and a deadline wheel losing a tick per second is not something any other test
+  in that file would have noticed.
+
+Both fixed by rounding the multiplier up, so the result is never below the
+division's and the shift can only bring it back down to it. Three witnesses now
+pin it: the TSC and HPET conversions against the divisions they replaced, and
+whole seconds against whole ticks.
+
+Measured with the anchor at exactly 0.0% on both runs, so raw and normalized
+are the same number:
+
+| probe | run 1 | run 2 |
+| --- | ---: | ---: |
+| `sched_yield` | −20.3% | −29.5% |
+| `ipc_split_call_to_recv` | −6.7% | −7.3% |
+| `ipc_rt_intra_process` | −6.2% | −6.6% |
+| `ipc_split_reply_to_return` | −5.5% | −5.8% |
+| `ipc_try_recv_empty` | −5.6% | −5.6% |
+| `null_syscall_getpid` | −5.6% | −5.6% |
+| `ipc_rt_cross_process` | −5.1% | −5.3% |
+| `vmexit_cpuid` (anchor) | 0.0% | 0.0% |
+
+`sched_yield` leading is what the change predicts: the scheduler reads the clock
+about thirteen times per dispatch. The phase counters attribute it directly
+rather than by inference -- `ipc-call-phase-wait-deadline-sample`, which is one
+`rtc::ticks()` call and nothing else, went 173 to 120.
+
+That measurement also carries a smaller change made with it: `preemption_snapshot`
+called `current_lock_class()`, which derived the CPU index again from a frame
+that had it. `preemption_disabled()` is on the `getpid` path, which is where that
+probe's 5.6% comes from -- it reads no clock at all.
+
 ## The profiler was a quarter of the round trip
 
 The tables above price an acquire/release pair at 939 cycles. That number was
