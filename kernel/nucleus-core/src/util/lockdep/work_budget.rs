@@ -14,13 +14,17 @@
 //!   blocking scope cannot manufacture a failure.
 //! - **Failure:** exceeding a declared ceiling panics, naming the class, the
 //!   ceiling, the count, and the declaring site.
-//! - **Forbidden:** never declare a ceiling on a class an interrupt handler can
-//!   take. `LockClass::Scheduler` is the clear example: the timer dispatch
-//!   takes it, so an unrelated handler firing inside a budgeted scope would
-//!   land in this CPU's counter. Sleepable classes qualify by construction --
-//!   `record_sleepable_acquire` already fails an acquisition from interrupt
-//!   context -- and a raw class qualifies only with a stated argument that no
-//!   handler reaches it.
+//! - **Forbidden:** never declare a *lock-class* ceiling on a class an interrupt
+//!   handler can take. `LockClass::Scheduler` is the clear example: the timer
+//!   dispatch takes it, so an unrelated handler firing inside a budgeted scope
+//!   would land in this CPU's counter. Sleepable classes qualify by
+//!   construction -- `record_sleepable_acquire` already fails an acquisition
+//!   from interrupt context -- and a raw class qualifies only with a stated
+//!   argument that no handler reaches it. The identity ceiling carries no such
+//!   restriction, because `IrqContextGuard` restores the derivation count a
+//!   handler found on entry; that is not a courtesy but the fix for the first
+//!   run of it, which charged an acquisition with six derivations it never
+//!   made.
 //! - **Evidence:** `docs/benchmarks/README.md`.
 //!
 //! # Why cost gets an assertion
@@ -39,7 +43,7 @@
 //! that would not have caught the eight.
 
 use core::panic::Location;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use super::{LockClass, MAX_LOCK_CLASSES, MAX_TRACKED_CPUS, current_cpu_index};
 
@@ -67,6 +71,195 @@ pub(crate) fn charge_acquire(cpu: usize, class_index: usize) {
         counter.load(Ordering::Relaxed).wrapping_add(1),
         Ordering::Relaxed,
     );
+}
+
+/// Further derivations of this CPU's logical index inside one lock
+/// acquisition, after the one the acquire path already made.
+///
+/// This is not an ABI limit -- nothing outside the kernel can observe how often
+/// it reads CPU-local architectural state -- so it lives with the module that
+/// owns the counter rather than in `rustos_user_abi::performance`.
+///
+/// An acquisition holds the CPU stable, by masked interrupts or disabled
+/// preemption, so every step after the first derivation can be handed the
+/// answer. One sleepable acquisition instead derived it five times: its own
+/// wait-context assertion asked twice, and the lockdep record that followed
+/// asked the same two questions again and then once more to charge the
+/// acquisition. The four extra produced identical answers and cost roughly 350
+/// ticks -- more than the user-memory copy the acquisition existed to
+/// authorize.
+///
+/// Zero is the only defensible value. A path that threads its index performs no
+/// further derivation by construction, and a helper that later reaches for
+/// `current_cpu_index()` instead of an `_on` form returns exactly the same
+/// result, so nothing but this would notice.
+pub const LOCK_ACQUIRE_MAX_EXTRA_CPU_IDENTITY_DERIVATIONS: u32 = 0;
+
+/// Per-CPU count of logical-identity derivations. Same shape and same reason as
+/// [`ACQUIRES`]: monotonic, free-running, read as a delta.
+static IDENTITY_DERIVATIONS: [AtomicU32; MAX_TRACKED_CPUS] =
+    [const { AtomicU32::new(0) }; MAX_TRACKED_CPUS];
+
+/// Where each CPU last derived its index.
+///
+/// A `&'static Location` is one pointer, so remembering the site costs one
+/// relaxed store against a function that executes `RDTSCP`. Without it the
+/// ceiling below reports that a scope derived once too often and leaves the
+/// reader to find which of its callees did it; the first time it fired, that
+/// search was the whole cost of the diagnostic.
+static LAST_IDENTITY_SITE: [AtomicUsize; MAX_TRACKED_CPUS] =
+    [const { AtomicUsize::new(0) }; MAX_TRACKED_CPUS];
+
+/// Records one derivation of this CPU's logical index.
+///
+/// Charged by `cpu_identity::current_cpu_index` with the index it just derived,
+/// so this adds no derivation of its own.
+#[inline]
+pub(crate) fn charge_identity_derivation(cpu: usize, site: &'static Location<'static>) {
+    let Some(counter) = IDENTITY_DERIVATIONS.get(cpu) else {
+        return;
+    };
+    counter.store(
+        counter.load(Ordering::Relaxed).wrapping_add(1),
+        Ordering::Relaxed,
+    );
+    if let Some(slot) = LAST_IDENTITY_SITE.get(cpu) {
+        slot.store(core::ptr::from_ref(site) as usize, Ordering::Relaxed);
+    }
+}
+
+/// The site of `cpu`'s most recent derivation, for a failing ceiling to name.
+fn last_identity_site(cpu: usize) -> Option<&'static Location<'static>> {
+    let raw = LAST_IDENTITY_SITE.get(cpu)?.load(Ordering::Relaxed);
+    if raw == 0 {
+        return None;
+    }
+    // SAFETY: the only value ever stored here is a `&'static Location` written
+    // by `charge_identity_derivation`, and a `Location` from `Location::caller`
+    // has static storage duration.
+    Some(unsafe { &*(raw as *const Location<'static>) })
+}
+
+/// The current derivation count on `cpu`, for IRQ entry to snapshot.
+#[cfg(rustos_boot_image)]
+pub(crate) fn identity_count_on(cpu: usize) -> u32 {
+    identity_count(cpu)
+}
+
+/// Puts `cpu`'s derivation count back to what IRQ entry found.
+///
+/// A handler's own derivations are the handler's, so an interrupted scope must
+/// not be charged for them. Restoring rather than subtracting keeps nested
+/// handlers exact: each restores the count its own entry observed.
+#[cfg(rustos_boot_image)]
+pub(crate) fn restore_identity_count_on(cpu: usize, value: u32) {
+    let Some(counter) = IDENTITY_DERIVATIONS.get(cpu) else {
+        return;
+    };
+    counter.store(value, Ordering::Relaxed);
+}
+
+fn identity_count(cpu: usize) -> u32 {
+    IDENTITY_DERIVATIONS
+        .get(cpu)
+        .map(|counter| counter.load(Ordering::Relaxed))
+        .unwrap_or(0)
+}
+
+/// A scope's declared ceiling on further derivations of this CPU's index.
+///
+/// Unlike [`LockBudget`], neither opening nor closing this derives an index:
+/// it is handed one and trusts the caller's stability contract. An instrument
+/// that performed the operation it is counting would cost more than the
+/// duplication it exists to find.
+#[must_use = "the ceiling is checked when the budget is dropped, so it must outlive the work"]
+pub struct IdentityBudget {
+    ceiling: u32,
+    entry_count: u32,
+    cpu: usize,
+    owner: u64,
+    epoch: u32,
+    site: &'static Location<'static>,
+}
+
+/// Declares that the calling scope derives this CPU's logical index at most
+/// `ceiling` further times.
+///
+/// # Contract
+///
+/// `cpu` must be this CPU's index and interrupts must stay masked for the
+/// guard's whole life. That is asserted, not documented, because the weaker
+/// contract does not work: the first version of this allowed "preemption
+/// disabled" and was declared on the raw-spin acquire path, which runs with
+/// interrupts on. Handler derivations were excluded by `IrqContextGuard`, but
+/// the context-switch commit the timer stub runs *after* that guard is dropped
+/// was not, and the ceiling failed an acquisition that had behaved. A scope
+/// that cannot be interrupted has no such window. The raw-spin path keeps the
+/// same property through a source witness instead.
+///
+/// # Why zero is the usual ceiling
+///
+/// A path that derived the index and threaded it into its callees performs no
+/// further derivation by construction. The ceiling is how that stays true: a
+/// helper that later reaches for `current_cpu_index()` instead of an `_on`
+/// form produces identical results and costs a hardware read, which no test
+/// and no assertion would otherwise notice. One lock acquisition accumulated
+/// five that way.
+#[track_caller]
+pub fn declare_identity_derivations_on(cpu: usize, ceiling: u32) -> IdentityBudget {
+    // Host unit tests run with interrupts enabled and no kernel to mask them,
+    // so the contract is checked where it means something.
+    #[cfg(rustos_boot_image)]
+    assert!(
+        !x86_64::instructions::interrupts::are_enabled(),
+        "identity budget declared on an interruptible scope at {}:{}",
+        Location::caller().file(),
+        Location::caller().line(),
+    );
+    IdentityBudget {
+        ceiling,
+        entry_count: identity_count(cpu),
+        cpu,
+        owner: running_owner(cpu),
+        epoch: running_epoch(cpu),
+        site: Location::caller(),
+    }
+}
+
+impl IdentityBudget {
+    /// Derivations charged to this scope, or `None` when this CPU stopped
+    /// running the task that declared it.
+    pub fn used(&self) -> Option<u32> {
+        if running_owner(self.cpu) != self.owner || running_epoch(self.cpu) != self.epoch {
+            return None;
+        }
+        Some(identity_count(self.cpu).wrapping_sub(self.entry_count))
+    }
+}
+
+impl Drop for IdentityBudget {
+    fn drop(&mut self) {
+        // As in `LockBudget`: a counter that stopped being this scope's says
+        // nothing about it. The stability contract makes migration impossible,
+        // so the owner word is the only thing left that can change.
+        let Some(used) = self.used() else {
+            return;
+        };
+        let (last_file, last_line) = match last_identity_site(self.cpu) {
+            Some(site) => (site.file(), site.line()),
+            None => ("<unknown>", 0),
+        };
+        assert!(
+            used <= self.ceiling,
+            "cpu identity derived {} times in a scope declared for {} at {}:{}; last derivation at {}:{}",
+            used,
+            self.ceiling,
+            self.site.file(),
+            self.site.line(),
+            last_file,
+            last_line,
+        );
+    }
 }
 
 fn acquire_count(cpu: usize, class_index: usize) -> u32 {
@@ -98,6 +291,26 @@ fn running_owner(cpu: usize) -> u64 {
     }
 }
 
+/// How many times `cpu` has published a running task.
+///
+/// The owner word alone cannot tell a scope that was never switched from one
+/// that was switched away and switched back; both read the same owner at the
+/// close. This does, and it is what a budget compares.
+fn running_epoch(cpu: usize) -> u32 {
+    #[cfg(rustos_boot_image)]
+    {
+        super::CURRENT_TASK_EPOCH
+            .get(cpu)
+            .map(|epoch| epoch.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+    #[cfg(not(rustos_boot_image))]
+    {
+        let _ = cpu;
+        0
+    }
+}
+
 /// A scope's declared ceiling on one lock class.
 ///
 /// Dropping this with more acquisitions charged than declared panics. See the
@@ -110,6 +323,7 @@ pub struct LockBudget {
     entry_count: u32,
     cpu: usize,
     owner: u64,
+    epoch: u32,
     site: &'static Location<'static>,
 }
 
@@ -129,6 +343,7 @@ pub fn declare(class: LockClass, ceiling: u32) -> LockBudget {
         entry_count: acquire_count(cpu, class_index),
         cpu,
         owner: running_owner(cpu),
+        epoch: running_epoch(cpu),
         site: Location::caller(),
     }
 }
@@ -139,7 +354,7 @@ impl LockBudget {
     /// own.
     pub fn used(&self) -> Option<u32> {
         let cpu = current_cpu_index();
-        if cpu != self.cpu || running_owner(cpu) != self.owner {
+        if cpu != self.cpu || running_owner(cpu) != self.owner || running_epoch(cpu) != self.epoch {
             return None;
         }
         Some(acquire_count(cpu, self.class_index).wrapping_sub(self.entry_count))
@@ -226,6 +441,56 @@ mod tests {
             assert_eq!(budget.used(), None);
         }
         drop(budget);
+    }
+
+    /// Zero is the ceiling every acquire path declares, so the test that
+    /// matters is that one further derivation fails it.
+    #[test]
+    fn one_extra_identity_derivation_past_the_ceiling_panics() {
+        let cpu = current_cpu_index();
+
+        let clean = std::panic::catch_unwind(|| {
+            let budget = declare_identity_derivations_on(
+                cpu,
+                LOCK_ACQUIRE_MAX_EXTRA_CPU_IDENTITY_DERIVATIONS,
+            );
+            assert_eq!(budget.used(), Some(0));
+            drop(budget);
+        });
+        assert!(
+            clean.is_ok(),
+            "a scope that derives nothing further must not panic"
+        );
+
+        let extra = std::panic::catch_unwind(|| {
+            let budget = declare_identity_derivations_on(
+                cpu,
+                LOCK_ACQUIRE_MAX_EXTRA_CPU_IDENTITY_DERIVATIONS,
+            );
+            charge_identity_derivation(cpu, Location::caller());
+            drop(budget);
+        });
+        assert!(
+            extra.is_err(),
+            "one re-derivation past the ceiling must panic"
+        );
+    }
+
+    /// The instrument must not perform the operation it counts, or declaring a
+    /// ceiling of zero would immediately violate it.
+    #[test]
+    fn declaring_and_closing_an_identity_budget_derives_nothing() {
+        let cpu = current_cpu_index();
+        let before = identity_count(cpu);
+        let budget = declare_identity_derivations_on(cpu, 0);
+        let used = budget.used();
+        drop(budget);
+        assert_eq!(used, Some(0));
+        assert_eq!(
+            identity_count(cpu),
+            before,
+            "the budget itself derived the index it exists to count"
+        );
     }
 
     /// Free-running counters wrap. A scope that straddles the wrap must read

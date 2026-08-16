@@ -27,8 +27,38 @@ const IA32_TSC_AUX: u32 = 0xC000_0103;
 #[cfg(rustos_boot_image)]
 static RDTSCP_CPU_TOKEN_ADMITTED: AtomicBool = AtomicBool::new(false);
 
+/// This CPU's dense logical index.
+///
+/// Every derivation reads CPU-local architectural state, so a scope that has
+/// one in hand and asks again pays hardware for a value already in a register.
+/// The count is what makes that visible: see
+/// [`super::work_budget::declare_identity_derivations_on`].
 #[cfg(rustos_boot_image)]
+#[inline]
+#[track_caller]
 pub fn current_cpu_index() -> usize {
+    let index = derive_cpu_index();
+    // One relaxed increment and one relaxed pointer store on a CPU-private
+    // line, inside a function that executes `RDTSCP` and two acquire loads.
+    // It is the only thing that keeps a re-derivation from reappearing here
+    // silently, which is exactly how five of them accumulated on one lock
+    // acquisition, and the site is what makes the sixth findable.
+    super::work_budget::charge_identity_derivation(index, core::panic::Location::caller());
+    index
+}
+
+/// The same derivation, uncharged.
+///
+/// For the counting machinery itself: an instrument that charged its own reads
+/// would report the cost it exists to find.
+#[cfg(rustos_boot_image)]
+#[inline]
+pub(super) fn current_cpu_index_uncharged() -> usize {
+    derive_cpu_index()
+}
+
+#[cfg(rustos_boot_image)]
+fn derive_cpu_index() -> usize {
     // ORDERING: Acquire makes the complete dense APIC-ID map visible after HAL
     // finishes ACPI topology publication. Earlier BSP boot remains index zero.
     if !CPU_IDENTITIES_PUBLISHED.load(Ordering::Acquire) {

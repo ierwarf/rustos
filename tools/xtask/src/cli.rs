@@ -51,9 +51,11 @@ enum XtaskCommand {
         no_auto_verify: bool,
     },
     /// Measure ring3 syscall, scheduler, and IPC round-trip cost.
+    ///
+    /// The image is always rebuilt. Measuring a stale one is silent: the run
+    /// completes, the table looks ordinary, and it describes a binary that no
+    /// longer exists in the tree.
     Bench {
-        #[arg(long = "build")]
-        build_image: bool,
         /// Write the rendered table to this path so a regression is visible in
         /// a diff instead of only in a terminal that has scrolled away.
         #[arg(long)]
@@ -172,13 +174,11 @@ pub(crate) fn run() -> Result<()> {
             no_auto_verify,
         }) => kvm::kvm_run_command(&config, build_image, rustos_vcpus, !no_auto_verify),
         Some(XtaskCommand::Bench {
-            build_image,
             baseline,
             compare,
             rustos_vcpus,
         }) => crate::bench::bench(
             &config,
-            build_image,
             baseline.as_deref(),
             compare.as_deref(),
             rustos_vcpus,

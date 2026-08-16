@@ -114,7 +114,6 @@ impl<T: ?Sized> ProcessStateLock<T> {
     #[track_caller]
     pub(super) fn lock(&self) -> ProcessStateGuard<'_, T> {
         let acquire_site = Location::caller();
-        assert_process_state_wait_context(acquire_site);
         let owner = current_owner_token();
         self.assert_not_recursive(owner, acquire_site);
         let mut spins = 0usize;
@@ -155,7 +154,6 @@ impl<T: ?Sized> ProcessStateLock<T> {
     #[track_caller]
     pub(super) fn try_lock(&self) -> Option<ProcessStateGuard<'_, T>> {
         let acquire_site = Location::caller();
-        assert_process_state_wait_context(acquire_site);
         let owner = current_owner_token();
         if self.try_acquire(owner, acquire_site) {
             Some(ProcessStateGuard { lock: self, owner })
@@ -164,17 +162,38 @@ impl<T: ?Sized> ProcessStateLock<T> {
         }
     }
 
+    /// Admits the wait context, takes the word, and records the acquisition
+    /// against one derived logical CPU index.
+    ///
+    /// The admission check and `record_sleepable_acquire` ask the same two
+    /// per-CPU questions, and each question used to derive this CPU's index
+    /// from architectural state on its own -- five derivations for one
+    /// acquisition, which is what made binding an address space cost more than
+    /// the copy it was binding for. Interrupts stay masked across the whole
+    /// step so the one index remains this CPU's for every use of it.
     fn try_acquire(&self, owner: usize, acquire_site: &'static Location<'static>) -> bool {
-        if self
-            .state
-            .compare_exchange(UNLOCKED, LOCKED, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            return false;
-        }
-        lockdep::record_sleepable_acquire(owner as u64, LockClass::ProcessState as u8);
-        self.record_owner(owner, acquire_site);
-        true
+        with_interrupts_masked(|| {
+            let cpu = lockdep::current_cpu_index();
+            let _identity_budget = lockdep::work_budget::declare_identity_derivations_on(
+                cpu,
+                lockdep::work_budget::LOCK_ACQUIRE_MAX_EXTRA_CPU_IDENTITY_DERIVATIONS,
+            );
+            assert_process_state_wait_context(cpu, acquire_site);
+            if self
+                .state
+                .compare_exchange(UNLOCKED, LOCKED, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
+            {
+                return false;
+            }
+            lockdep::record_sleepable_acquire_on(
+                cpu,
+                owner as u64,
+                LockClass::ProcessState as u8,
+            );
+            self.record_owner(owner, acquire_site);
+            true
+        })
     }
 
     fn block_until_woken_or_acquired(
@@ -312,16 +331,37 @@ impl<T: ?Sized> Drop for ProcessStateGuard<'_, T> {
     }
 }
 
-fn assert_process_state_wait_context(acquire_site: &'static Location<'static>) {
+/// Runs `f` with interrupts masked, where there are interrupts to mask.
+///
+/// `cli` is privileged, so calling it unconditionally makes the host unit tests
+/// take SIGSEGV in ring 3 -- which is exactly what happened, and which
+/// `cargo check` in both configurations does not catch because it is a runtime
+/// fault, not a type error. Everything the mask protects here is behind the
+/// same cfg.
+#[inline]
+fn with_interrupts_masked<R>(f: impl FnOnce() -> R) -> R {
+    #[cfg(rustos_boot_image)]
+    {
+        interrupts::without_interrupts(f)
+    }
+    #[cfg(not(rustos_boot_image))]
+    {
+        f()
+    }
+}
+
+/// `cpu` must be this CPU's index, derived with interrupts masked and still
+/// masked here.
+fn assert_process_state_wait_context(cpu: usize, acquire_site: &'static Location<'static>) {
     assert_eq!(
-        lockdep::irq_context_depth(),
+        lockdep::irq_context_depth_on(cpu),
         0,
         "ProcessStateLock acquired from IRQ context at {}:{}",
         acquire_site.file(),
         acquire_site.line()
     );
     assert_eq!(
-        lockdep::held_spin_lock_depth(),
+        lockdep::held_spin_lock_depth_on(cpu),
         0,
         "ProcessStateLock acquired while raw-spin class held at {}:{} class={:?}",
         acquire_site.file(),

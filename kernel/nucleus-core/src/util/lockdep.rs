@@ -29,7 +29,7 @@ use core::{
     cell::UnsafeCell,
     hint::spin_loop,
     panic::Location,
-    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
 };
 
 use spin::{Mutex, MutexGuard};
@@ -199,6 +199,17 @@ static TASK_STACK_OCCUPANCY: [AtomicU64; TASK_STACK_OCCUPANCY_WORDS] =
     [const { AtomicU64::new(0) }; TASK_STACK_OCCUPANCY_WORDS];
 // The per-CPU statics contract in `formal/smp-source-contracts.toml` pins these
 // declarations to this file; `preemption` reads them through `super`.
+/// Context switches this CPU has published, for a work budget to notice one.
+///
+/// A budget compares the running task at its declaration against the one at its
+/// close. That catches a scope switched away and never resumed, but not one
+/// switched away and switched back: the owner word reads the same on both
+/// sides while the counters in between belong to whoever ran. This epoch
+/// changes twice across that window, so the scope declines to judge instead of
+/// charging itself another task's work.
+#[cfg(rustos_boot_image)]
+static CURRENT_TASK_EPOCH: [AtomicU32; MAX_TRACKED_CPUS] =
+    [const { AtomicU32::new(0) }; MAX_TRACKED_CPUS];
 #[cfg(rustos_boot_image)]
 static PREEMPT_DISABLE_DEPTH: [AtomicUsize; MAX_TRACKED_CPUS] =
     [const { AtomicUsize::new(0) }; MAX_TRACKED_CPUS];
@@ -252,7 +263,20 @@ pub struct TrackedSpinGuard<'a, T: ?Sized, const CLASS: u8> {
     acquire_preemption_depth: usize,
 }
 
-pub struct IrqContextGuard;
+/// An interrupt handler's entry into IRQ context.
+///
+/// The guard carries this CPU's index and the identity-derivation count it
+/// found there. A handler derives that index several times of its own accord,
+/// and every one of those lands in the same CPU-private counter an interrupted
+/// scope is measuring itself against -- the first run of the ceiling below
+/// attributed six of them to a lock acquisition that made none. Restoring the
+/// count on the way out is what keeps a budget about its own work.
+pub struct IrqContextGuard {
+    #[cfg(rustos_boot_image)]
+    cpu: usize,
+    #[cfg(rustos_boot_image)]
+    entry_identity_count: u32,
+}
 
 
 /// Tracks a successful, non-blocking acquisition of an externally implemented
@@ -269,29 +293,63 @@ pub struct ExternalRawLockGuard {
 pub fn enter_irq_context() -> IrqContextGuard {
     #[cfg(rustos_boot_image)]
     {
+        // Uncharged, and read before the snapshot: charging the derivation that
+        // takes the snapshot would leave exactly one of the handler's own reads
+        // inside the interrupted scope's delta.
+        let cpu = cpu_identity::current_cpu_index_uncharged();
+        let entry_identity_count = work_budget::identity_count_on(cpu);
         // ORDERING: AcqRel publishes this CPU's IRQ nesting before any handler
         // lock acquisition and pairs with the final AcqRel guard release.
-        let previous = IRQ_CONTEXT_DEPTH[current_cpu_index()].fetch_add(1, Ordering::AcqRel);
+        let previous = IRQ_CONTEXT_DEPTH[cpu].fetch_add(1, Ordering::AcqRel);
         assert!(
             previous < MAX_HELD_LOCK_DEPTH,
             "interrupt-context nesting exceeded bound"
         );
+        return IrqContextGuard {
+            cpu,
+            entry_identity_count,
+        };
     }
-    IrqContextGuard
+    #[cfg(not(rustos_boot_image))]
+    IrqContextGuard {}
 }
 
 #[inline]
 pub fn irq_context_depth() -> usize {
     #[cfg(rustos_boot_image)]
     {
-        // ORDERING: Acquire observes the CPU-local entry/release transition
-        // before deciding whether task-owned lock state may be consulted.
-        IRQ_CONTEXT_DEPTH[current_cpu_index()].load(Ordering::Acquire)
+        return irq_context_depth_on(current_cpu_index());
     }
     #[cfg(not(rustos_boot_image))]
     {
         0
     }
+}
+
+/// `irq_context_depth` for a caller that already derived its logical index.
+///
+/// Deriving the index reads CPU-local architectural state, so a path that asks
+/// the same question twice pays for it twice. The sleepable acquire path asked
+/// four times: its own wait-context assertion and `record_sleepable_acquire`
+/// checked the same two depths from the same two per-CPU words.
+///
+/// # Contract
+///
+/// `cpu` must be this CPU's index, derived with interrupts masked and still
+/// masked here. A stale index reads another CPU's nesting and admits a wait
+/// the local context forbids.
+#[cfg(rustos_boot_image)]
+#[inline]
+pub fn irq_context_depth_on(cpu: usize) -> usize {
+    // ORDERING: Acquire observes the CPU-local entry/release transition
+    // before deciding whether task-owned lock state may be consulted.
+    IRQ_CONTEXT_DEPTH[cpu].load(Ordering::Acquire)
+}
+
+#[cfg(not(rustos_boot_image))]
+#[inline]
+pub fn irq_context_depth_on(_cpu: usize) -> usize {
+    0
 }
 
 /// Number of tracked raw-spin classes held by the current CPU. Sleepable
@@ -310,6 +368,20 @@ pub fn held_spin_lock_depth() -> usize {
     }
 }
 
+/// `held_spin_lock_depth` for a caller that already masked interrupts and
+/// derived its logical index. See [`irq_context_depth_on`] for the contract.
+#[cfg(rustos_boot_image)]
+#[inline]
+pub fn held_spin_lock_depth_on(cpu: usize) -> usize {
+    with_current_stack_on(cpu, |stack| stack.len)
+}
+
+#[cfg(not(rustos_boot_image))]
+#[inline]
+pub fn held_spin_lock_depth_on(_cpu: usize) -> usize {
+    0
+}
+
 /// Publish the task currently executing in process context on this CPU.
 ///
 /// The scheduler updates this immediately before a context switch becomes
@@ -321,9 +393,17 @@ pub fn set_current_task_owner(owner: u64) {
     #[cfg(rustos_boot_image)]
     {
         assert!(owner != 0, "lockdep current task owner must be nonzero");
+        let cpu = current_cpu_index();
+        // The epoch moves on every publication, including a republication of
+        // the same owner, which is what makes a switched-away-and-back scope
+        // detectable at all.
+        CURRENT_TASK_EPOCH[cpu].store(
+            CURRENT_TASK_EPOCH[cpu].load(Ordering::Relaxed).wrapping_add(1),
+            Ordering::Relaxed,
+        );
         // ORDERING: Release publishes scheduler current-task ownership before
         // subsequent lock acquisitions load it with Acquire.
-        CURRENT_TASK_OWNER[current_cpu_index()].store(owner, Ordering::Release);
+        CURRENT_TASK_OWNER[cpu].store(owner, Ordering::Release);
     }
     #[cfg(not(rustos_boot_image))]
     {
@@ -358,15 +438,42 @@ pub fn current_task_owner() -> Option<u64> {
 pub fn record_sleepable_acquire(owner: u64, class: u8) {
     #[cfg(rustos_boot_image)]
     {
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            record_sleepable_acquire_on(current_cpu_index(), owner, class);
+        });
+    }
+    #[cfg(not(rustos_boot_image))]
+    {
+        let _ = owner;
+        let _ = validate_class(class);
+    }
+}
+
+/// `record_sleepable_acquire` for a caller that already masked interrupts and
+/// derived its logical index.
+///
+/// A sleepable lock's own admission check asks the same two questions this
+/// does, immediately before the acquisition it is admitting. Sharing one
+/// derived index across both is the difference between one read of CPU-local
+/// architectural state per acquire and five.
+///
+/// # Contract
+///
+/// `cpu` must be this CPU's index and interrupts must stay masked until this
+/// returns. See [`irq_context_depth_on`].
+#[cfg(rustos_boot_image)]
+#[inline]
+pub fn record_sleepable_acquire_on(cpu: usize, owner: u64, class: u8) {
+    {
         assert!(owner != 0, "sleepable lock owner must be nonzero");
         assert_eq!(
-            irq_context_depth(),
+            irq_context_depth_on(cpu),
             0,
             "sleepable lock acquired from interrupt context class={}",
             class
         );
         assert_eq!(
-            held_spin_lock_depth(),
+            held_spin_lock_depth_on(cpu),
             0,
             "sleepable lock acquired while raw-spin class is held class={}",
             class
@@ -376,7 +483,7 @@ pub fn record_sleepable_acquire(owner: u64, class: u8) {
         // assertions above already established that this is task context with
         // no raw class held, which is exactly the condition a declared ceiling
         // on a sleepable class relies on.
-        work_budget::charge_acquire(current_cpu_index(), class_index);
+        work_budget::charge_acquire(cpu, class_index);
         dependency_graph::mark_class_irq_unsafe(class_index);
         with_task_stack(owner, true, |stack| {
             assert!(
@@ -410,35 +517,44 @@ pub fn record_sleepable_acquire(owner: u64, class: u8) {
         })
         .expect("sleepable lock-class stack capacity exhausted");
     }
-    #[cfg(not(rustos_boot_image))]
-    {
-        let _ = owner;
-        let _ = validate_class(class);
-    }
+}
+
+/// The build without lockdep still owns the class-validity check, so a caller
+/// that threads its index compiles in both configurations. Every check this
+/// performs lives behind the cfg, exactly as `record_sleepable_acquire` does.
+#[cfg(not(rustos_boot_image))]
+#[inline]
+pub fn record_sleepable_acquire_on(_cpu: usize, owner: u64, class: u8) {
+    let _ = owner;
+    let _ = validate_class(class);
 }
 
 #[inline]
 pub fn release_sleepable_lock(owner: u64, class: u8) {
     #[cfg(rustos_boot_image)]
     {
-        let became_empty = with_task_stack(owner, false, |stack| {
-            assert!(
-                stack.len != 0,
-                "sleepable lock-class release without acquisition"
-            );
-            let top = stack.classes[stack.len - 1];
-            assert_eq!(
-                top, class,
-                "sleepable lock-class release order violation held={} released={}",
-                top, class
-            );
-            stack.len -= 1;
-            stack.classes[stack.len] = 0;
-            stack.len == 0
-        })
-        .expect("sleepable lock-class owner is not registered");
-        if became_empty {
-            release_task_stack(owner);
+        // One lookup for the release and, when it empties the stack, for the
+        // deregistration too. Finding the slot again to free it scanned the
+        // registry a second time for an index this frame already held.
+        let (index, entry) =
+            find_task_stack(owner).expect("sleepable lock-class owner is not registered");
+        // SAFETY: a task cannot execute concurrently on two CPUs, and its
+        // stack stays registered until the last held class is released.
+        let stack = unsafe { &mut *entry.stack.get() };
+        assert!(
+            stack.len != 0,
+            "sleepable lock-class release without acquisition"
+        );
+        let top = stack.classes[stack.len - 1];
+        assert_eq!(
+            top, class,
+            "sleepable lock-class release order violation held={} released={}",
+            top, class
+        );
+        stack.len -= 1;
+        stack.classes[stack.len] = 0;
+        if stack.len == 0 {
+            release_task_stack_at(index, entry);
         }
     }
     #[cfg(not(rustos_boot_image))]
@@ -453,8 +569,11 @@ impl Drop for IrqContextGuard {
         {
             // ORDERING: AcqRel publishes the completed IRQ handler before the
             // CPU-local nesting depth becomes observable as one level lower.
-            let previous = IRQ_CONTEXT_DEPTH[current_cpu_index()].fetch_sub(1, Ordering::AcqRel);
+            let previous = IRQ_CONTEXT_DEPTH[self.cpu].fetch_sub(1, Ordering::AcqRel);
             assert!(previous != 0, "interrupt-context depth underflow");
+            // Every identity derivation this handler made belongs to the
+            // handler, not to whatever it interrupted.
+            work_budget::restore_identity_count_on(self.cpu, self.entry_identity_count);
         }
     }
 }
@@ -892,11 +1011,17 @@ fn before_acquire_with_irq_tracking(
     acquire_site: &'static Location<'static>,
     track_irq_usage: bool,
 ) -> PendingAcquire {
+    // `cpu` was derived once by the caller and is stable for the guard's whole
+    // lifetime; everything below takes it as an argument, and `record_irq_usage`
+    // used to ask the hardware again from right here. This scope runs with
+    // interrupts enabled, so the property is held by
+    // `the_raw_acquire_path_never_rederives_the_cpu_index` rather than by a
+    // declared ceiling -- see `work_budget::declare_identity_derivations_on`.
     let class_index = validate_class(class);
     work_budget::charge_acquire(cpu, class_index);
     let profile_entry = lock_profile::now();
     if track_irq_usage {
-        record_irq_usage(class_index, acquire_site);
+        record_irq_usage(cpu, class_index, acquire_site);
     }
     let profile_irq = lock_profile::charge(lock_profile::LockPhase::BeforeIrqUsage, profile_entry);
     // ORDERING: Acquire observes the CPU-local entry/release transition before
@@ -1101,11 +1226,9 @@ fn task_stack_depth(owner: u64) -> usize {
     with_task_stack(owner, false, |stack| stack.len).unwrap_or(0)
 }
 
+/// Deregisters the slot the caller already located.
 #[cfg(rustos_boot_image)]
-fn release_task_stack(owner: u64) {
-    // ORDERING: Acquire identifies the exact live owner publication before its
-    // empty stack is validated; Release below makes the slot reusable.
-    let (index, entry) = find_task_stack(owner).expect("sleepable lock-class owner disappeared");
+fn release_task_stack_at(index: usize, entry: &'static TaskHeldStack) {
     // SAFETY: the task owns this entry and has just observed an empty stack.
     assert_eq!(unsafe { (*entry.stack.get()).len }, 0);
     // ORDERING: the occupancy bit clears before the owner word, so the slot
@@ -1130,73 +1253,4 @@ fn next_occupied_bit(bits: &mut u64) -> Option<usize> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::cpu_identity::{decode_cpu_token, select_cpu_index};
-    use super::{
-        graph_reaches, guard_release_is_admissible, preemption_release_is_admissible,
-        preemption_units_match,
-    };
-
-    #[test]
-    fn occupancy_bits_are_visited_in_ascending_slot_order() {
-        let mut bits = (1_u64 << 0) | (1 << 3) | (1 << 63);
-        let mut seen = alloc::vec::Vec::new();
-        while let Some(bit) = super::next_occupied_bit(&mut bits) {
-            seen.push(bit);
-        }
-        assert_eq!(seen, [0, 3, 63]);
-        assert_eq!(bits, 0);
-    }
-
-    #[test]
-    fn an_empty_occupancy_word_visits_nothing() {
-        // This is the common case: no task holds a sleepable class, so a
-        // tracked spin acquisition must not walk the stack table at all.
-        let mut bits = 0_u64;
-        assert_eq!(super::next_occupied_bit(&mut bits), None);
-    }
-
-    #[test]
-    fn dependency_walk_detects_transitive_cycle_edge() {
-        let mut rows = [0_u64; 64];
-        rows[1] = 1 << 2;
-        rows[2] = 1 << 3;
-        assert!(graph_reaches(1, 3, |node| rows[node]));
-        assert!(!graph_reaches(3, 1, |node| rows[node]));
-        rows[3] = 1 << 1;
-        assert!(graph_reaches(3, 2, |node| rows[node]));
-    }
-
-    #[test]
-    fn dense_apic_identity_map_does_not_index_by_raw_apic_id() {
-        let identities = [1_u64, u64::from(0x1234_u32) + 1, 8];
-        assert_eq!(select_cpu_index(identities, 0), Some(0));
-        assert_eq!(select_cpu_index(identities, 0x1234), Some(1));
-        assert_eq!(select_cpu_index(identities, 7), Some(2));
-        assert_eq!(select_cpu_index(identities, 2), None);
-        assert_eq!(decode_cpu_token(0, 3), None);
-        assert_eq!(decode_cpu_token(1, 3), Some(0));
-        assert_eq!(decode_cpu_token(3, 3), Some(2));
-        assert_eq!(decode_cpu_token(4, 3), None);
-    }
-
-    #[test]
-    fn tracked_guard_release_requires_same_cpu_apic_and_positive_depth() {
-        assert!(guard_release_is_admissible(1, 0x1234, 1, 0x1234, 1));
-        assert!(guard_release_is_admissible(1, 0x1234, 1, 0x1234, 3));
-        assert!(!guard_release_is_admissible(1, 0x1234, 0, 0, 1));
-        assert!(!guard_release_is_admissible(1, 0x1234, 1, 0x4321, 1));
-        assert!(!guard_release_is_admissible(1, 0x1234, 1, 0x1234, 0));
-    }
-
-    #[test]
-    fn pending_acquire_units_cannot_consume_a_held_guard_pin() {
-        assert!(preemption_units_match(1, 1, 0));
-        assert!(preemption_units_match(1, 0, 1));
-        assert!(preemption_units_match(2, 1, 1));
-        assert!(!preemption_units_match(0, 1, 0));
-        assert!(preemption_release_is_admissible(2, 1, 0));
-        assert!(preemption_release_is_admissible(2, 0, 1));
-        assert!(!preemption_release_is_admissible(1, 1, 0));
-    }
-}
+mod tests;

@@ -19,7 +19,7 @@
 //!   publication of an edge whose checks have not passed.
 //! - **Evidence:** `scheduler-cpu-ownership` and the lockdep unit witnesses.
 
-use super::{MAX_LOCK_CLASSES, irq_context_depth};
+use super::{MAX_LOCK_CLASSES, irq_context_depth_on};
 use core::panic::Location;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -78,9 +78,13 @@ static IRQ_SAFE_CLASSES: AtomicU64 = AtomicU64::new(0);
 static IRQ_UNSAFE_CLASSES: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(rustos_boot_image)]
-pub(super) fn record_irq_usage(class: usize, acquire_site: &'static Location<'static>) {
+pub(super) fn record_irq_usage(
+    cpu: usize,
+    class: usize,
+    acquire_site: &'static Location<'static>,
+) {
     let bit = 1_u64 << class;
-    if irq_context_depth() != 0 {
+    if irq_context_depth_on(cpu) != 0 {
         // ORDERING: SeqCst observes every prior unsafe classification before
         // this IRQ-side admission and globally orders its safe publication.
         let unsafe_classes = IRQ_UNSAFE_CLASSES.load(Ordering::SeqCst);

@@ -87,13 +87,16 @@ pub fn preemption_snapshot() -> PreemptionSnapshot {
     #[cfg(rustos_boot_image)]
     {
         return x86_64::instructions::interrupts::without_interrupts(|| {
+            // Interrupts are masked, so one derivation serves the whole
+            // snapshot. Asking again per field re-reads CPU-local
+            // architectural state for an index already in a register.
             let logical_cpu = current_cpu_index();
-            let apic_id = current_apic_id();
+            let apic_id = super::cpu_identity::apic_id_for_index(logical_cpu);
             // ORDERING: Acquire observes completed guard/pending transitions
             // before a scheduler gate consumes this coherent snapshot.
             let depth = PREEMPT_DISABLE_DEPTH[logical_cpu].load(Ordering::Acquire);
             let pending_depth = PREEMPT_PENDING_DEPTH[logical_cpu].load(Ordering::Relaxed);
-            let held_depth = held_spin_lock_depth();
+            let held_depth = held_spin_lock_depth_on(logical_cpu);
             let top_class = current_lock_class();
             assert!(
                 preemption_units_match(depth, held_depth, pending_depth),

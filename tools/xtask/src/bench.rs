@@ -48,6 +48,21 @@ const ANCHOR_DRIFT_TOLERANCE_PERCENT: f64 = 3.0;
 /// at this floor is reporting the counter, not the work.
 const TSC_GRANULARITY_TICKS: u64 = 40;
 
+/// The smallest anchor-normalized change this lane can attribute to the guest.
+///
+/// Measured, not assumed. Three consecutive runs of one unchanged image against
+/// one baseline reported `ipc_rt_intra_process` at +1.9%, -0.5% and -0.2%, and
+/// `null_syscall_getpid` -- which is the control -- at +0.1%, +5.1% and -0.2%.
+/// The binary was byte-identical across all three, so every one of those
+/// numbers is the instrument. `min` over twenty thousand iterations is stable;
+/// what is not stable is the anchor ratio the normalization divides by, and
+/// the background service traffic the probes share a CPU with.
+///
+/// A change smaller than this needs a phase counter, which measures one
+/// operation instead of a whole round trip, or more repeats. It does not need a
+/// more confident reading of one pair of runs.
+const RESOLVABLE_DELTA_PERCENT: f64 = 2.0;
+
 /// Milestone families the in-kernel phase profiles publish. A name outside this
 /// list is some other milestone that happens to carry two arguments, and
 /// folding it into the phase table would invent a cost that was never measured.
@@ -329,10 +344,16 @@ fn render_comparison(baseline_path: &Path, baseline: &str, results: &[BenchResul
             "floor".to_owned()
         } else {
             let expected = (before as f64 * scale).max(1.0);
-            format!(
-                "{:.1}%",
-                ((result.min as f64 - expected) / expected) * 100.0
-            )
+            let delta = ((result.min as f64 - expected) / expected) * 100.0;
+            // Below the instrument's own spread there is nothing to read. The
+            // number is still printed, because hiding it invites the same
+            // reader to go find it; the label is what stops it being reported
+            // as a result.
+            if delta.abs() < RESOLVABLE_DELTA_PERCENT {
+                format!("{delta:.1}% noise")
+            } else {
+                format!("{delta:.1}%")
+            }
         };
         out.push_str(&format!(
             "  {:<40} {:>10} {:>10} {:>9} {:>11}\n",
@@ -404,14 +425,18 @@ fn render_derived(results: &[BenchResult]) -> String {
 
 pub(crate) fn bench(
     config: &Config,
-    build_image: bool,
     baseline: Option<&Path>,
     compare: Option<&Path>,
     rustos_vcpus: u8,
 ) -> Result<()> {
-    if build_image {
-        crate::build::build(config, false)?;
-    }
+    // Unconditional, and this is the second measurement bug this lane has had.
+    // Building was opt-in, so a run that forgot the flag booted whatever image
+    // was last built and reported it without complaint: two runs across a
+    // kernel change produced the same binary's numbers twice and read as "the
+    // change did nothing". Nothing in the output could have shown that. The
+    // build is incremental, so paying for it always is cheaper than one wrong
+    // conclusion.
+    crate::build::build(config, false)?;
 
     // The harness is a session-startup program, so it needs the same
     // interactive topology an ordinary desktop launch brings up. Requiring the
@@ -537,6 +562,48 @@ ipc_rt_intra_process                        20000     118160     121720     3944
             "a probe at the counter granularity must not be normalized: {report}"
         );
         assert!(report.contains("Rerun both sides"), "{report}");
+    }
+
+    /// The instrument's own spread was measured at about two percent across
+    /// three runs of one unchanged image. A delta inside that is a reading of
+    /// the harness, and saying so is the difference between a measurement and
+    /// a story about one.
+    #[test]
+    fn a_delta_inside_the_instrument_spread_is_labelled_noise() {
+        let results = vec![
+            BenchResult {
+                name: "vmexit_cpuid".to_owned(),
+                iters: 50_000,
+                min: 4_760,
+                p50: 4_800,
+                p99: 5_120,
+                mean: 6_919,
+                min_ns: 1_192,
+                p50_ns: 1_202,
+            },
+            // One percent above where the anchor says it should have landed.
+            BenchResult {
+                name: "ipc_rt_intra_process".to_owned(),
+                iters: 20_000,
+                min: 119_340,
+                p50: 122_000,
+                p99: 400_000,
+                mean: 200_000,
+                min_ns: 29_900,
+                p50_ns: 30_500,
+            },
+        ];
+        let baseline = concat!(
+            "probe                                       iters    min_cyc\n",
+            "vmexit_cpuid                                50000       4760\n",
+            "ipc_rt_intra_process                        20000     118160\n",
+        );
+        let report = render_comparison(Path::new("baseline.txt"), baseline, &results);
+
+        assert!(
+            report.contains("1.0% noise"),
+            "a sub-spread delta must carry its label: {report}"
+        );
     }
 
     /// A comparison with no anchor is not a comparison. Reporting deltas anyway

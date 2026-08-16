@@ -4,7 +4,7 @@
 `apps/ipcbench` as a session-startup program, and parses its debugcon output.
 
 ```sh
-cargo xtask bench --build --baseline docs/benchmarks/ipc-baseline.txt
+cargo xtask bench --baseline docs/benchmarks/ipc-baseline.txt
 ```
 
 Every probe uses an already-published ABI. There is no bench-only kernel path
@@ -300,6 +300,55 @@ Every per-operation cost fell with it, in proportion: `copy-request` 12,173 to
 6,450, `enqueue-runtime` 20,842 to 8,554, `bind-retain` 3,079 to 1,225. That is
 the signature of a cost that was in every operation rather than in any of them.
 
+### The same defect, five more times
+
+The fix above threaded the index through the *release* path. Nothing checked
+that the acquire path had the same property, and it did not. One
+`ProcessStateLock` acquisition derived the index five times:
+
+| step | derivations |
+| --- | ---: |
+| its own wait-context assertion (`irq_context_depth`, `held_spin_lock_depth`) | 2 |
+| `record_sleepable_acquire`, asking the same two questions again | 2 |
+| `work_budget::charge_acquire`, deriving once more to name the CPU | 1 |
+
+Every raw tracked spin lock in the kernel had a smaller version of the same
+thing: `before_acquire_with_irq_tracking` takes `cpu` as an argument and then
+called `record_irq_usage`, which derived it again from the same frame.
+
+All of it removed. The sleepable acquire now derives once inside one interrupt
+mask, and `record_irq_usage` takes the index.
+
+| measurement | before | after | change |
+| --- | ---: | ---: | ---: |
+| `usermem-phase-bind-visible` | 1,161 | **762** | **−34%** |
+| `ipc_try_recv_empty` (min, anchor-normalized) | | | **−14.1%** |
+| `ipc_split_call_to_recv` | | | −7.4% |
+| `ipc_rt_intra_process` | | | −7.1% |
+| `ipc_split_reply_to_return` | | | −7.0% |
+| `null_syscall_getpid` | | | −7.8% |
+| `vmexit_cpuid` (anchor) | 3,960 | 3,920 | 0.0% |
+
+The anchor held at −1.0% for that run, so the normalized column is a
+measurement rather than an estimate; two further runs reproduced every figure
+within the instrument's spread.
+
+`null_syscall_getpid` moving 7.8% retires it as a control, and the reason is
+worth being exact about: it really does take no tracked lock. It calls
+`current_user_log_ids`, which asks `preemption_disabled()` whether it may
+consult the scheduler at all -- and that boolean was answered by building a
+whole `PreemptionSnapshot`: three identity derivations and a nested interrupt
+mask to read one field. Taking no lock is not the same as being independent of
+lockdep, and this document treated the two as the same thing. `vmexit_cpuid` is
+the control.
+
+The reason this survived a fix aimed directly at it is that there was nothing to
+notice it. Deriving the index twice returns the same index. No test failed, no
+assertion fired, and the only visible trace was a phase counter nobody had
+reason to re-read. That is the argument for the ceilings below, and it is not
+hypothetical: the first ceiling declared on this path found six derivations on
+its first boot.
+
 ## The profiler was a quarter of the round trip
 
 The tables above price an acquire/release pair at 939 cycles. That number was
@@ -377,12 +426,53 @@ cfg'd out and reported success; the errors appeared only during the boot-image
 build. Check with `RUSTFLAGS="--cfg rustos_boot_image" cargo check -p <crate>`
 before spending a boot cycle.
 
+The reverse costs a gate run. Adding a `#[cfg(rustos_boot_image)]`-only
+function and calling it from a kernel crate passes that check and fails the
+source-conformance lane, which builds the host tests without the cfg. Both
+configurations have to compile, so check both:
+
+```
+for f in "" "--cfg rustos_boot_image"; do RUSTFLAGS="$f" cargo check -p <crate> --lib; done
+```
+
+That is still not enough, and the same change proved it. Wrapping a lock
+acquire in `interrupts::without_interrupts` compiles in both configurations and
+takes SIGSEGV in the host tests, because `cli` is privileged and the host tests
+run in ring 3. Everything a mask protects here is already behind
+`rustos_boot_image`, so the mask belongs behind it too. Run the tests, not just
+the checks:
+
+```
+for p in nucleus-core kernel-ps kernel-compat kernel-io-manager kernel-hal; do cargo test -p $p --lib; done
+```
+
 **Instrumentation can break what it measures.** Charging a phase around
 `current_cpu_index` — two counter reads and two atomic adds against a function
 that costs tens of cycles — slowed the guest enough to miss the display
 provider's 2500 ms boot deadline, and the run produced no data at all. The
 sample count of a hot, cheap function is worth having; its per-call time is not
 worth what measuring it costs.
+
+**A bench run did not rebuild the image.** `--build` was opt-in, so a run that
+forgot it booted whatever was last built and reported those numbers without
+complaint. Two runs across a kernel change measured the same binary twice and
+read as "the change did nothing" -- and nothing in the output could have shown
+that. `cargo xtask bench` now always builds; the build is incremental, which is
+cheaper than one wrong conclusion.
+
+**The probe table has a noise floor of about two percent.** Three consecutive
+runs of one byte-identical image against one baseline reported
+`ipc_rt_intra_process` at +1.9%, −0.5% and −0.2% normalized, and
+`null_syscall_getpid` at +0.1%, +5.1% and −0.2%. `min` over twenty thousand
+iterations is stable; the anchor ratio the normalization divides by is not, and
+neither is the background service traffic the probes share a CPU with.
+`--compare` now labels any normalized delta under that as `noise`. A change
+smaller than the floor needs a phase counter, which prices one operation instead
+of a whole round trip -- not a more confident reading of one pair of runs.
+
+`sched_yield` deserves its own note: across those same three identical runs it
+spanned +6.2% to +12.4%. Nothing under about fifteen percent is readable on that
+probe.
 
 ## Decoding the in-kernel profile
 
@@ -460,7 +550,7 @@ is why an eight-bind receive, a per-dispatch scan for a value read only at
 spawn, and a `CPUID` triple exit per IPI all survived: each produced exactly the
 right answer, so nothing asserted, and only a benchmark eventually objected.
 
-Three places now assert cost directly:
+Four places now assert cost directly:
 
 - `kernel/nucleus-core/src/util/lockdep/work_budget.rs` declares a ceiling on
   how many times a scope may take a lock class. Lockdep already derives the CPU
@@ -473,6 +563,33 @@ Three places now assert cost directly:
   batching change, stated as an assertion instead of a comment.
 - `ipc_ops/reply_wait.rs` counts its polls per turn against
   `POLLS_PER_WAIT_TURN`, which is `PollsPerTurn` in the TLA+ model.
+- The same module declares that a lock acquisition derives this CPU's logical
+  index *no further times* after the one its caller already made. Charging is
+  free where it matters -- `current_cpu_index` has the index in hand -- and the
+  panic names the site of the last derivation, because "derived once too often"
+  without a location is a puzzle rather than a diagnostic.
+
+That last one took three attempts to make sound, and each failure is the reason
+for a piece of the design:
+
+1. Declared on the raw-spin acquire path, it reported **six** derivations on the
+   first boot. The scope runs with interrupts enabled, so every handler that
+   landed inside it charged its own derivations to the acquisition.
+   `IrqContextGuard` now restores the count it found on entry, which took the
+   six to one.
+2. The remaining one came from `commit_context_switch`, named by the recorded
+   site. A scope can straddle a context switch and come back to find the counter
+   holding another task's work, and the owner word reads identically on both
+   sides. Both budgets now compare a per-CPU switch epoch as well.
+3. Neither fix makes an interruptible scope countable, because the switch commit
+   runs after the IRQ guard is already dropped. So `declare_identity_derivations_on`
+   now *asserts* interrupts are masked, and the raw-spin path keeps the property
+   through a source witness instead. The property is static anyway -- whether a
+   function calls `current_cpu_index()` or takes a `cpu` argument -- so counting
+   was never the right instrument for it.
+
+A cost assertion that fires on a kernel which behaved is worse than no
+assertion, and two of the three iterations above would have done exactly that.
 
 `formal/ipc-reply-deadline/IpcReplyDeadline.tla` carries the same three
 statements as invariants -- `WaitTurnPollsAtMostTwice`,
