@@ -693,14 +693,12 @@ mod tests {
             "an absent key must not compile the lock phase profile in"
         );
 
-        let enabled: ProjectConfigFile =
-            toml::from_str("[lock_telemetry]\nphase_profile = true\n")
-                .expect("phase_profile is a recognized lock_telemetry key");
+        let enabled: ProjectConfigFile = toml::from_str("[lock_telemetry]\nphase_profile = true\n")
+            .expect("phase_profile is a recognized lock_telemetry key");
         assert!(project_from_file(enabled).lock_telemetry.phase_profile);
 
         let shipped = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../config/rustos.toml"),
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/rustos.toml"),
         )
         .expect("read the shipped project configuration");
         let shipped: ProjectConfigFile =

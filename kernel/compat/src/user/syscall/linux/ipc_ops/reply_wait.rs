@@ -22,6 +22,13 @@
 
 use super::*;
 
+/// Polls of the endpoint response queue in one turn of the reply wait.
+///
+/// The number is the published performance contract, not a local choice, and
+/// `PollsPerTurn` in `formal/ipc-reply-deadline/IpcReplyDeadline.tla` is the
+/// same one.
+const POLLS_PER_WAIT_TURN: u32 = rustos_user_abi::performance::IPC_REPLY_WAIT_POLLS_PER_TURN;
+
 pub(super) fn wait_for_reply_with_deadline(
     reply: KernelReplyHandle,
     handle_capacity: usize,
@@ -30,6 +37,14 @@ pub(super) fn wait_for_reply_with_deadline(
     let caller_task_id = multitask::current_task_id().ok_or(LINUX_EINVAL)?;
     let mut cycle_mark = phase_mark();
     loop {
+        // One turn of this loop polls the response queue exactly twice: once
+        // before the block is armed and once after, which is the race fix. A
+        // third poll in one turn is a busy-wait, and a busy-wait on this path
+        // is invisible in the result -- the caller still gets its reply -- so
+        // it is counted and asserted rather than left to a benchmark. Each
+        // poll is a reply-object and a message-object acquisition, priced at
+        // 3,197 cycles.
+        let mut polls = 0_u32;
         // Sample expiry on both sides of the queue take. A reply cannot win
         // if expiry was already visible or becomes visible during the take.
         let expired_before_take = reply_deadline_expired(deadline_tick);
@@ -41,6 +56,7 @@ pub(super) fn wait_for_reply_with_deadline(
             cancel_reply_wait(reply, caller_task_id, ReplyCancelReason::DeadlineBeforeArm);
             return Err(LINUX_ETIMEDOUT);
         }
+        polls += 1;
         let take = take_endpoint_response_for_wait(reply, handle_capacity);
         cycle_mark = charge_phase(IpcCallPhase::WaitTake, cycle_mark);
         match take {
@@ -96,6 +112,11 @@ pub(super) fn wait_for_reply_with_deadline(
             cancel_reply_wait(reply, caller_task_id, ReplyCancelReason::DeadlineAfterArm);
             return Err(LINUX_ETIMEDOUT);
         }
+        polls += 1;
+        assert_eq!(
+            polls, POLLS_PER_WAIT_TURN,
+            "reply wait polled the response queue {polls} times in one turn"
+        );
         let take = take_endpoint_response_for_wait(reply, handle_capacity);
         cycle_mark = charge_phase(IpcCallPhase::WaitTake, cycle_mark);
         match take {
@@ -139,13 +160,11 @@ pub(super) fn wait_for_reply_with_deadline(
         match committed {
             Some(true) => {
                 disarm_reply_deadline_waiter(caller_task_id);
-                cycle_mark =
-                    charge_phase(IpcCallPhase::WaitDisarm, cycle_mark);
+                cycle_mark = charge_phase(IpcCallPhase::WaitDisarm, cycle_mark);
             }
             Some(false) => {
                 disarm_reply_deadline_waiter(caller_task_id);
-                cycle_mark =
-                    charge_phase(IpcCallPhase::WaitDisarm, cycle_mark);
+                cycle_mark = charge_phase(IpcCallPhase::WaitDisarm, cycle_mark);
                 continue;
             }
             None => {
@@ -178,5 +197,61 @@ fn take_endpoint_response_for_wait(
             Err(ipc_error_to_linux_errno(error))
         }
         Err(err) => Err(ipc_error_to_linux_errno(err)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Witness for the cost invariants in `ipc-reply-deadline`.
+    ///
+    /// `WaitTurnPollsAtMostTwice` and `TimerArmedOnlyAfterAPoll` are statements
+    /// about this function, and TLC checks them against `PollsPerTurn == 2`.
+    /// This pins the same number here and pins the shape it describes, so a
+    /// third poll or an arm that precedes the first poll fails a test rather
+    /// than becoming 3,197 cycles nobody notices.
+    ///
+    /// The source is split at the test module first: the strings this test
+    /// searches for also appear in the test, and counting those would make the
+    /// witness pass for the wrong reason.
+    #[test]
+    fn the_wait_polls_twice_per_turn_and_arms_only_after_the_first_poll() {
+        assert_eq!(super::POLLS_PER_WAIT_TURN, 2, "PollsPerTurn in the model");
+
+        let source = include_str!("reply_wait.rs");
+        let body = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the wait implementation precedes its tests");
+
+        assert_eq!(
+            body.matches("take_endpoint_response_for_wait(reply, handle_capacity)")
+                .count(),
+            2,
+            "a turn takes the response queue exactly twice"
+        );
+        assert_eq!(
+            body.matches("polls += 1;").count(),
+            2,
+            "every take is counted, or the runtime assertion cannot fire"
+        );
+
+        let first_poll = body.find("polls += 1;").expect("pre-arm poll");
+        let arm = body
+            .find("multitask::arm_block_current_task()")
+            .expect("block arm");
+        assert!(
+            first_poll < arm,
+            "the turn polls before it arms: an already completed reply must not \
+             pay the arm and disarm pair"
+        );
+
+        let ceiling = body
+            .find("polls, POLLS_PER_WAIT_TURN,")
+            .expect("the runtime ceiling assertion");
+        assert!(
+            arm < ceiling,
+            "the ceiling is checked on the post-arm poll, which is the one a \
+             busy-wait would repeat"
+        );
     }
 }

@@ -2,12 +2,12 @@
 # Formal Contract Registry
 
 - Schema: `3`
-- Registry SHA-256: `71b7bd6c861dcc904505700f73d06fe87af675223438098d2534c81e32f24221`
+- Registry SHA-256: `aca58d34cde9af71926e33870eed73a845d2e80d0bc4987aaef8e1e79228444d`
 - Models: `127`
 - Whole flows: `68`
 - Transitions: `688`
 - Product runtime scenarios: `3`
-- Exact source witnesses: `574`
+- Exact source witnesses: `575`
 - Apalache pilots: `3`
 - TLAPS theorem models: `2`
 - Runtime-traced models: `7`

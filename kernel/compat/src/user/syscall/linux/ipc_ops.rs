@@ -39,7 +39,7 @@ use kernel_ipc_runtime::api::{
     KernelTransferTicket, KernelTransferredHandle, ProcessIdentity, ServiceIdentity,
     TransferContext,
 };
-use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
+use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock, work_budget};
 
 // The call path charges a dozen phase boundaries; the fully qualified names
 // wrapped every one of them across three lines and buried the code being
@@ -70,6 +70,7 @@ const SLOW_IPC_THRESHOLD_MS: u64 = 10;
 const MAX_SLOW_IPC_LOGS_PER_SECOND: usize = 1;
 const EARLY_IPC_SAMPLE_COUNT: usize = 6;
 const SERVICE_IPC_TIMEOUT_MS: u64 = rustos_user_abi::performance::IPC_BULK_DATA_HARD_LIMIT_MS;
+use rustos_user_abi::performance::IPC_RECEIVE_REPORT_MAX_ADDRESS_SPACE_BINDS as MAX_RECEIVE_BINDS;
 // RING3-MIGRATION-REFERENCE START: rootd should own service namespace endpoint
 // ownership and capability leases. Ring0 keeps the temporary service registry
 // table until rootd can mint narrow broker capabilities.
@@ -1838,6 +1839,8 @@ fn recv_endpoint_once_with_sender(
     sender_tid_ptr: u64,
 ) -> Result<usize, i64> {
     let endpoint = KernelEndpointHandle::from_raw(endpoint);
+    // Admit four output ranges once, write them once; see `MAX_RECEIVE_BINDS`.
+    let _bind_budget = work_budget::declare(LockClass::ProcessState, MAX_RECEIVE_BINDS);
     let process_id = multitask::current_user_process_id().ok_or(LINUX_EINVAL)?;
     kernel_ipc_runtime::api::authorize_endpoint_receiver_for_process(endpoint, process_id)
         .map_err(ipc_error_to_linux_errno)?;

@@ -12,6 +12,7 @@
 //! - **Forbidden:** No raw slice construction before admission, partial
 //!   authority copy, or foreign-process access by PID alone.
 //! - **Evidence:** `user-memory-access`.
+use nucleus_core::util::lockdep::{self, LockClass};
 use x86_64::VirtAddr;
 
 use super::usermem_profile;
@@ -111,6 +112,14 @@ pub fn validate_current_user_write_buffers(
     if buffers.iter().all(|(_, len)| *len == 0) {
         return Ok(());
     }
+    // The whole point of the batched form is that the bind happens once. That
+    // is not visible in the bytes it produces, so it gets an assertion rather
+    // than a comment: an edit that reintroduces a per-range bind fails here
+    // instead of costing 1,240 cycles a range until a benchmark notices.
+    let _bind_budget = lockdep::work_budget::declare(
+        LockClass::ProcessState,
+        rustos_user_abi::performance::USER_COPY_BATCH_MAX_ADDRESS_SPACE_BINDS,
+    );
     with_current_address_space(|address_space| {
         for (user_ptr, len) in buffers.iter().copied() {
             if len == 0 {
@@ -137,6 +146,12 @@ pub fn write_current_user_bytes_batch(
     if writes.iter().all(|(_, bytes)| bytes.is_empty()) {
         return Ok(());
     }
+    // As in `validate_current_user_write_buffers`: one bind for the whole
+    // batch is the contract, so it is asserted.
+    let _bind_budget = lockdep::work_budget::declare(
+        LockClass::ProcessState,
+        rustos_user_abi::performance::USER_COPY_BATCH_MAX_ADDRESS_SPACE_BINDS,
+    );
     let entry = usermem_profile::now();
     with_current_address_space(|address_space| {
         let mut phase = usermem_profile::charge(usermem_profile::UserCopyPhase::WriteBind, entry);

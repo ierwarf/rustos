@@ -871,6 +871,42 @@ invariant = "PreCommitFailurePreservesReply"
 min_counterexample_states = 2
 
 [[mutation]]
+id = "ipc-reply-wait-arms-without-polling"
+kind = "transition-guard-removal"
+severity = "high"
+model = "ipc-reply-deadline/IpcReplyDeadline"
+flow = "ipc-call"
+find = "    /\\ turnPolls[caller] > 0\n    /\\ taskState' = [taskState EXCEPT ![caller] = Armed]"
+replace = "    /\\ taskState' = [taskState EXCEPT ![caller] = Armed]"
+occurrence = 1
+invariant = "TimerArmedOnlyAfterAPoll"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "ipc-reply-wait-poll-budget-omitted"
+kind = "transition-guard-removal"
+severity = "high"
+model = "ipc-reply-deadline/IpcReplyDeadline"
+flow = "ipc-call"
+find = "    /\\ turnPolls[caller] < PollsPerTurn\n    /\\ turnPolls' = [turnPolls EXCEPT ![caller] = @ + 1]\n    /\\ UNCHANGED <<now, taskState, waitFor, timerDeadline, replyState, callerOf,"
+replace = "    /\\ turnPolls' = [turnPolls EXCEPT ![caller] = @ + 1]\n    /\\ UNCHANGED <<now, taskState, waitFor, timerDeadline, replyState, callerOf,"
+occurrence = 1
+invariant = "WaitTurnPollsAtMostTwice"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "ipc-reply-wait-turn-not-closed-on-take"
+kind = "transition-effect"
+severity = "high"
+model = "ipc-reply-deadline/IpcReplyDeadline"
+flow = "ipc-call"
+find = "    /\\ turnPolls' = [turnPolls EXCEPT ![caller] = 0]\n    /\\ turnTimerArms' = [turnTimerArms EXCEPT ![caller] = 0]\n    /\\ UNCHANGED <<now, taskState, timerDeadline, callerOf, serverOf,"
+replace = "    /\\ turnPolls' = turnPolls\n    /\\ turnTimerArms' = [turnTimerArms EXCEPT ![caller] = 0]\n    /\\ UNCHANGED <<now, taskState, timerDeadline, callerOf, serverOf,"
+occurrence = 1
+invariant = "EveryChargedPollBelongsToALiveWait"
+min_counterexample_states = 4
+
+[[mutation]]
 id = "ipc-transfer-receiver-set-epoch-guard-removed"
 kind = "transition-guard-removal"
 severity = "critical"
@@ -2660,3 +2696,13 @@ replace = '''BeginAcceptCall ==
 occurrence = 1
 invariant = "AcceptRequiresPublishedReadiness"
 min_counterexample_states = 2
+
+# --- Cost invariants ------------------------------------------------------
+#
+# Everything else in this corpus mutates a guard whose absence produces a wrong
+# answer. These three mutate a guard whose absence produces the *right* answer
+# more slowly, which is the defect class this kernel kept shipping: an
+# eight-bind receive, a per-dispatch scan for a value read only at spawn, a
+# CPUID triple exit per IPI. All three were correct and none tripped an
+# assertion. A cost invariant that no mutation kills is decoration, so each of
+# the three has one here.

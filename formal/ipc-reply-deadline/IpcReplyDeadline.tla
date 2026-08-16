@@ -61,11 +61,36 @@ VARIABLES now,
           replyUsed,
           publicationState,
           observedOutcome,
-          lastOutcomeReply
+          lastOutcomeReply,
+          turnPolls,
+          turnTimerArms
 
 vars == <<now, taskState, waitFor, timerDeadline, replyState, callerOf,
           serverOf, replyDeadline, replyUsed, publicationState, observedOutcome,
-          lastOutcomeReply>>
+          lastOutcomeReply, turnPolls, turnTimerArms>>
+
+(*******************************************************************************
+Cost, not correctness.
+
+`turnPolls` and `turnTimerArms` count what one turn of the caller's wait loop
+spends, and the two invariants that read them bound it. Nothing else in this
+model consults them and no outcome depends on them: a wait that polls the
+response queue ten times still returns the same reply to the same caller, which
+is exactly why the implementation carried an eight-bind receive and a redundant
+derivation for as long as it did. Every assertion here was about the answer,
+and none was about the work.
+
+One turn polls at most twice -- once before the block is armed, once after,
+which is the race fix for a reply that lands between them -- and arms the
+deadline timer at most once. `POLLS_PER_WAIT_TURN` in
+`kernel/compat/src/user/syscall/linux/ipc_ops/reply_wait.rs` is the same
+constant, asserted at runtime.
+*******************************************************************************)
+PollsPerTurn == 2
+TimerArmsPerTurn == 1
+
+\* Actions that neither poll, arm, nor begin a turn leave both counters alone.
+TurnCostUnchanged == UNCHANGED <<turnPolls, turnTimerArms>>
 
 NoOutcome == "none"
 ReplyReceived == "reply-received"
@@ -98,6 +123,8 @@ Init ==
     /\ publicationState = [r \in Replies |-> NoPublication]
     /\ observedOutcome = [t \in Tasks |-> NoOutcome]
     /\ lastOutcomeReply = [t \in Tasks |-> NoReply]
+    /\ turnPolls = [t \in Tasks |-> 0]
+    /\ turnTimerArms = [t \in Tasks |-> 0]
 
 (*******************************************************************************
 The reply identity is allocated together with the endpoint message.  A task is
@@ -118,6 +145,8 @@ EnqueueCall(caller, server, reply) ==
     /\ replyState' = [replyState EXCEPT ![reply] = Queued]
     /\ callerOf' = [callerOf EXCEPT ![reply] = caller]
     /\ serverOf' = [serverOf EXCEPT ![reply] = server]
+    /\ turnPolls' = [turnPolls EXCEPT ![caller] = 0]
+    /\ turnTimerArms' = [turnTimerArms EXCEPT ![caller] = 0]
     /\ replyDeadline' = [replyDeadline EXCEPT ![reply] = now + DeadlineTicks]
     /\ observedOutcome' = [observedOutcome EXCEPT ![caller] = NoOutcome]
     /\ lastOutcomeReply' = [lastOutcomeReply EXCEPT ![caller] = NoReply]
@@ -134,6 +163,7 @@ DequeueCall(server, reply) ==
     /\ UNCHANGED <<now, taskState, waitFor, timerDeadline, callerOf, serverOf,
                   replyDeadline, replyUsed, publicationState, observedOutcome,
                   lastOutcomeReply>>
+    /\ TurnCostUnchanged
 
 (*******************************************************************************
 An optional handle publication is prepared only after the server owns the
@@ -154,6 +184,7 @@ PreparePublication(server, reply) ==
     /\ UNCHANGED <<now, taskState, waitFor, timerDeadline, replyState,
                   callerOf, serverOf, replyDeadline, replyUsed,
                   observedOutcome, lastOutcomeReply>>
+    /\ TurnCostUnchanged
 
 (*******************************************************************************
 This is the response write plus the caller wake.  The concrete reply object is
@@ -173,6 +204,7 @@ CompleteReply(server, reply) ==
     /\ timerDeadline' = [timerDeadline EXCEPT ![callerOf[reply]] = NoTimer]
     /\ UNCHANGED <<now, waitFor, callerOf, serverOf, replyDeadline,
                   publicationState, observedOutcome, lastOutcomeReply>>
+    /\ TurnCostUnchanged
 
 (*******************************************************************************
 The first poll handles a reply that arrived before arm; the second poll is
@@ -186,10 +218,15 @@ ArmBlock(caller) ==
     /\ waitFor[caller] # NoReply
     /\ LiveReply(waitFor[caller])
     /\ timerDeadline[caller] = NoTimer
+    \* The turn polls before it arms. Arming costs a scheduler acquisition and
+    \* a deadline waiter -- 3,881 cycles -- and disarming costs 1,728 more, and
+    \* a reply that was already complete needs neither.
+    /\ turnPolls[caller] > 0
     /\ taskState' = [taskState EXCEPT ![caller] = Armed]
     /\ UNCHANGED <<now, waitFor, timerDeadline, replyState, callerOf, serverOf,
                   replyDeadline, replyUsed, publicationState, observedOutcome,
                   lastOutcomeReply>>
+    /\ TurnCostUnchanged
 
 ArmDeadlineTimer(caller) ==
     /\ caller \in Tasks
@@ -198,11 +235,13 @@ ArmDeadlineTimer(caller) ==
     /\ LiveReply(waitFor[caller])
     /\ timerDeadline[caller] = NoTimer
     /\ replyDeadline[waitFor[caller]] > now
+    /\ turnTimerArms[caller] < TimerArmsPerTurn
     /\ timerDeadline' =
         [timerDeadline EXCEPT ![caller] = replyDeadline[waitFor[caller]]]
+    /\ turnTimerArms' = [turnTimerArms EXCEPT ![caller] = @ + 1]
     /\ UNCHANGED <<now, taskState, waitFor, replyState, callerOf, serverOf,
                   replyDeadline, replyUsed, publicationState, observedOutcome,
-                  lastOutcomeReply>>
+                  lastOutcomeReply, turnPolls>>
 
 CommitBlock(caller) ==
     /\ caller \in Tasks
@@ -212,6 +251,10 @@ CommitBlock(caller) ==
     /\ timerDeadline[caller] = replyDeadline[waitFor[caller]]
     /\ timerDeadline[caller] > now
     /\ taskState' = [taskState EXCEPT ![caller] = Blocked]
+    \* The wait loop begins a fresh turn after the block completes, so the
+    \* per-turn budget resets exactly here and nowhere else.
+    /\ turnPolls' = [turnPolls EXCEPT ![caller] = 0]
+    /\ turnTimerArms' = [turnTimerArms EXCEPT ![caller] = 0]
     /\ UNCHANGED <<now, waitFor, timerDeadline, replyState, callerOf, serverOf,
                   replyDeadline, replyUsed, publicationState, observedOutcome,
                   lastOutcomeReply>>
@@ -230,10 +273,12 @@ BeginTakeCompletedReply(caller, reply) ==
     /\ callerOf[reply] = caller
     /\ replyState[reply] = Replied
     /\ now < replyDeadline[reply]
+    /\ turnPolls[caller] < PollsPerTurn
     /\ replyState' = [replyState EXCEPT ![reply] = Taking]
+    /\ turnPolls' = [turnPolls EXCEPT ![caller] = @ + 1]
     /\ UNCHANGED <<now, taskState, waitFor, timerDeadline, callerOf, serverOf,
                   replyDeadline, replyUsed, publicationState,
-                  observedOutcome, lastOutcomeReply>>
+                  observedOutcome, lastOutcomeReply, turnTimerArms>>
 
 FinishTakeBeforeDeadline(caller, reply) ==
     /\ caller \in Tasks
@@ -252,6 +297,8 @@ FinishTakeBeforeDeadline(caller, reply) ==
                       ELSE @]
     /\ observedOutcome' = [observedOutcome EXCEPT ![caller] = ReplyReceived]
     /\ lastOutcomeReply' = [lastOutcomeReply EXCEPT ![caller] = reply]
+    /\ turnPolls' = [turnPolls EXCEPT ![caller] = 0]
+    /\ turnTimerArms' = [turnTimerArms EXCEPT ![caller] = 0]
     /\ UNCHANGED <<now, taskState, timerDeadline, callerOf, serverOf,
                   replyDeadline, replyUsed>>
 
@@ -301,6 +348,15 @@ ExitTask(task) ==
         [t \in Tasks |->
             IF t # task /\ waitFor[t] \in ClosedCalls THEN waitFor[t]
             ELSE lastOutcomeReply[t]]
+    \* A wait that ends here has no turn left to charge, for the exiting task
+    \* and for every peer whose call it closed.
+    /\ turnPolls' =
+        [t \in Tasks |->
+            IF t = task \/ waitFor[t] \in ClosedCalls THEN 0 ELSE turnPolls[t]]
+    /\ turnTimerArms' =
+        [t \in Tasks |->
+            IF t = task \/ waitFor[t] \in ClosedCalls THEN 0
+            ELSE turnTimerArms[t]]
     /\ UNCHANGED <<now, callerOf, serverOf, replyDeadline>>
 
 (*******************************************************************************
@@ -338,7 +394,36 @@ Tick ==
             IF r \in DueCalls /\ publicationState[r] = PendingPublication
             THEN DroppedPublication
             ELSE publicationState[r]]
+    /\ turnPolls' =
+        [t \in Tasks |-> IF waitFor[t] \in DueCalls THEN 0 ELSE turnPolls[t]]
+    /\ turnTimerArms' =
+        [t \in Tasks |-> IF waitFor[t] \in DueCalls THEN 0 ELSE turnTimerArms[t]]
     /\ UNCHANGED <<callerOf, serverOf, replyDeadline, replyUsed>>
+
+(*******************************************************************************
+A poll that finds no response.
+
+The implementation cannot distinguish this from the successful take until it
+has already paid for it: `take_endpoint_response_detailed` acquires the reply
+object and the message object either way, 3,197 cycles measured. Modelling only
+the take that succeeds would make the wait look free whenever it does not, and
+would make a busy-wait -- the failure this file's two cost invariants exist for
+-- unrepresentable.
+
+The guards are the wait protocol: a caller polls while it is still deciding
+whether to block, and only within its turn's budget.
+*******************************************************************************)
+PollPendingReply(caller) ==
+    /\ caller \in Tasks
+    /\ taskState[caller] \in {Runnable, Armed}
+    /\ waitFor[caller] # NoReply
+    /\ callerOf[waitFor[caller]] = caller
+    /\ replyState[waitFor[caller]] \in {Queued, Dequeued}
+    /\ turnPolls[caller] < PollsPerTurn
+    /\ turnPolls' = [turnPolls EXCEPT ![caller] = @ + 1]
+    /\ UNCHANGED <<now, taskState, waitFor, timerDeadline, replyState, callerOf,
+                  serverOf, replyDeadline, replyUsed, publicationState,
+                  observedOutcome, lastOutcomeReply, turnTimerArms>>
 
 Next ==
     \/ \E caller \in Tasks, server \in Tasks, reply \in Replies :
@@ -346,6 +431,7 @@ Next ==
     \/ \E server \in Tasks, reply \in Replies : DequeueCall(server, reply)
     \/ \E server \in Tasks, reply \in Replies : PreparePublication(server, reply)
     \/ \E server \in Tasks, reply \in Replies : CompleteReply(server, reply)
+    \/ \E caller \in Tasks : PollPendingReply(caller)
     \/ \E caller \in Tasks : ArmBlock(caller)
     \/ \E caller \in Tasks : ArmDeadlineTimer(caller)
     \/ \E caller \in Tasks : CommitBlock(caller)
@@ -379,6 +465,8 @@ TypeOK ==
     /\ observedOutcome \in
         [Tasks -> {NoOutcome, ReplyReceived, TimedOut, PeerClosedOutcome}]
     /\ lastOutcomeReply \in [Tasks -> Replies \cup {NoReply}]
+    /\ turnPolls \in [Tasks -> Nat]
+    /\ turnTimerArms \in [Tasks -> Nat]
 
 ExactCallerOwnsEveryWait ==
     \A t \in Tasks :
@@ -478,6 +566,29 @@ TerminalReplyRetainsNoPendingPublication ==
 TakingReplyStillPrecedesDeadline ==
     \A r \in Replies :
         replyState[r] = Taking => now < replyDeadline[r]
+
+(*******************************************************************************
+The two cost invariants.
+
+Neither says anything about which reply a caller receives; both say what the
+wait is allowed to spend getting it. A violation is a kernel that still works
+and is slower, which is precisely the class of defect this model had no way to
+express before.
+*******************************************************************************)
+WaitTurnPollsAtMostTwice ==
+    \A t \in Tasks : turnPolls[t] <= PollsPerTurn
+
+TimerArmedOnlyAfterAPoll ==
+    \A t \in Tasks : turnTimerArms[t] > 0 => turnPolls[t] > 0
+
+(*******************************************************************************
+A poll is not free and must therefore be attributable to a live wait. A caller
+with no outstanding reply that has polled has spent two object acquisitions on
+nothing, which is the shape of a spin loop that a bounded counter alone would
+not catch: the count stays under its ceiling while the turn never ends.
+*******************************************************************************)
+EveryChargedPollBelongsToALiveWait ==
+    \A t \in Tasks : turnPolls[t] > 0 => waitFor[t] # NoReply
 
 DroppedPublicationNeverBecomesVisible ==
     \A r \in Replies :

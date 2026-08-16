@@ -25,6 +25,29 @@ const RESULT_PREFIX: &str = "ipcbench: result ";
 const SKIP_PREFIX: &str = "ipcbench: skip ";
 const TSC_PREFIX: &str = "ipcbench: tsc_khz=";
 
+/// The probe that contains no RustOS code.
+///
+/// `vmexit_cpuid` is `CPUID` from ring 3: the hypervisor exit and the host's
+/// handling of it, and nothing this repository can change. Every figure in this
+/// lane is an *invariant-TSC tick*, which advances at a fixed rate while the
+/// core clock does not, so a host that boosts higher completes the same work in
+/// fewer ticks. Comparing two runs across that shift reads as a uniform
+/// improvement in every probe at once. Anchoring on a probe with no code in it
+/// is what tells the two apart.
+const HARDWARE_ANCHOR: &str = "vmexit_cpuid";
+
+/// How far the anchor may move before a comparison stops being a comparison.
+///
+/// Seven consecutive runs held `vmexit_cpuid` between 4,760 and 4,840 ticks --
+/// under 2% -- and the eighth read 3,960, a 17% shift with no guest change,
+/// alongside a 17% shift in every other probe including `null_syscall_getpid`.
+/// Three percent admits ordinary run-to-run variation and rejects that.
+const ANCHOR_DRIFT_TOLERANCE_PERCENT: f64 = 3.0;
+
+/// Guest TSC granularity, measured by `tsc_overhead` as its own `min`. A probe
+/// at this floor is reporting the counter, not the work.
+const TSC_GRANULARITY_TICKS: u64 = 40;
+
 /// Milestone families the in-kernel phase profiles publish. A name outside this
 /// list is some other milestone that happens to carry two arguments, and
 /// folding it into the phase table would invent a cost that was never measured.
@@ -87,13 +110,14 @@ fn parse_phase_milestone(line: &str) -> Option<(String, u64, u64)> {
     let name = line
         .split_whitespace()
         .find_map(|token| token.strip_prefix("name="))?;
-    if !PHASE_PREFIXES
-        .iter()
-        .any(|prefix| name.starts_with(prefix))
-    {
+    if !PHASE_PREFIXES.iter().any(|prefix| name.starts_with(prefix)) {
         return None;
     }
-    Some((name.to_owned(), hex_field(line, "arg0=")?, hex_field(line, "arg1=")?))
+    Some((
+        name.to_owned(),
+        hex_field(line, "arg0=")?,
+        hex_field(line, "arg1=")?,
+    ))
 }
 
 fn parse_result(line: &str) -> Option<BenchResult> {
@@ -215,6 +239,114 @@ fn render_phases(phases: &[PhaseTotal]) -> String {
     out
 }
 
+/// Reads the `min_cyc` column out of a previously written baseline table.
+///
+/// The baseline is the rendered table, so this parses what it wrote rather
+/// than a second serialization that could drift from it.
+fn parse_baseline_minimums(table: &str) -> Vec<(String, u64)> {
+    table
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let name = fields.next()?;
+            if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') || name == "probe" {
+                return None;
+            }
+            let _iters: u64 = fields.next()?.parse().ok()?;
+            let min: u64 = fields.next()?.parse().ok()?;
+            Some((name.to_owned(), min))
+        })
+        .collect()
+}
+
+fn percent_change(before: u64, after: u64) -> f64 {
+    if before == 0 {
+        return 0.0;
+    }
+    ((after as f64 - before as f64) / before as f64) * 100.0
+}
+
+/// Compares this run's `min` column against a baseline, with the hardware
+/// anchor in front of the result rather than in a footnote.
+///
+/// When the anchor held, the raw deltas are the answer. When it moved, the raw
+/// deltas are contaminated by exactly that much, so the report says so and
+/// prints the anchor-normalized column instead of a conclusion. Normalization
+/// is an estimate and is labelled as one; the honest reading of a drifted run
+/// is to rerun it, and the report says that too.
+fn render_comparison(baseline_path: &Path, baseline: &str, results: &[BenchResult]) -> String {
+    let previous = parse_baseline_minimums(baseline);
+    let find_previous = |name: &str| {
+        previous
+            .iter()
+            .find(|(probe, _)| probe == name)
+            .map(|(_, min)| *min)
+    };
+    let current = |name: &str| {
+        results
+            .iter()
+            .find(|result| result.name == name)
+            .map(|result| result.min)
+    };
+
+    let mut out = format!("\ncomparison vs {}\n", baseline_path.display());
+    let anchor = find_previous(HARDWARE_ANCHOR).zip(current(HARDWARE_ANCHOR));
+    let Some((anchor_before, anchor_after)) = anchor else {
+        out.push_str(&format!(
+            "  no comparison: {HARDWARE_ANCHOR} is missing from one of the two runs, so\n               nothing separates a guest change from a host clock change\n"
+        ));
+        return out;
+    };
+    let anchor_drift = percent_change(anchor_before, anchor_after);
+    let anchor_held = anchor_drift.abs() <= ANCHOR_DRIFT_TOLERANCE_PERCENT;
+    out.push_str(&format!(
+        "  anchor {HARDWARE_ANCHOR}: {anchor_before} -> {anchor_after} ({anchor_drift:+.1}%){}\n",
+        if anchor_held {
+            " -- held"
+        } else {
+            " -- MOVED, so every raw delta below is contaminated by this much"
+        }
+    ));
+    let scale = if anchor_before == 0 {
+        1.0
+    } else {
+        anchor_after as f64 / anchor_before as f64
+    };
+
+    out.push_str(&format!(
+        "\n  {:<40} {:>10} {:>10} {:>9} {:>11}\n",
+        "probe", "before", "after", "raw", "normalized"
+    ));
+    for result in results {
+        let Some(before) = find_previous(&result.name) else {
+            continue;
+        };
+        let raw = format!("{:.1}%", percent_change(before, result.min));
+        // A probe already at the counter's granularity cannot scale with the
+        // anchor: it reads the same handful of ticks at any core clock. Scaling
+        // it produces a number that looks like a regression and means nothing.
+        let normalized = if before <= TSC_GRANULARITY_TICKS || result.min <= TSC_GRANULARITY_TICKS {
+            "floor".to_owned()
+        } else {
+            let expected = (before as f64 * scale).max(1.0);
+            format!(
+                "{:.1}%",
+                ((result.min as f64 - expected) / expected) * 100.0
+            )
+        };
+        out.push_str(&format!(
+            "  {:<40} {:>10} {:>10} {:>9} {:>11}\n",
+            result.name, before, result.min, raw, normalized,
+        ));
+    }
+    if !anchor_held {
+        out.push_str(
+            "\n  The normalized column assumes every probe scales with the anchor, which is\n               an estimate, not a measurement. Rerun both sides in one session before\n               attributing a change to the guest.\n",
+        );
+    }
+    out
+}
+
 fn render(tsc_khz: u64, results: &[BenchResult], skipped: &[String]) -> String {
     let mut out = String::new();
     out.push_str(&format!("tsc_khz={tsc_khz}\n\n"));
@@ -274,6 +406,7 @@ pub(crate) fn bench(
     config: &Config,
     build_image: bool,
     baseline: Option<&Path>,
+    compare: Option<&Path>,
     rustos_vcpus: u8,
 ) -> Result<()> {
     if build_image {
@@ -315,6 +448,12 @@ pub(crate) fn bench(
     let phases = render_phases(&run.phases);
     println!("\n=== ipcbench ===\n{table}{derived}{phases}");
 
+    if let Some(path) = compare {
+        let previous = fs::read_to_string(path)
+            .with_context(|| format!("read comparison baseline {}", path.display()))?;
+        println!("{}", render_comparison(path, &previous, &run.results));
+    }
+
     if let Some(path) = baseline {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -329,6 +468,130 @@ pub(crate) fn bench(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two real runs of this lane, four minutes apart, with a guest change
+    /// between them that touches neither `vmexit_cpuid` nor `null_syscall_getpid`.
+    const DRIFTED_BASELINE: &str = "\
+tsc_overhead                                50000         40         80         80         68        10        20
+null_syscall_getpid                         50000       3840       3880       9720       7504       962       972
+vmexit_cpuid                                50000       4760       4800       5120       6919      1192      1202
+ipc_rt_intra_process                        20000     118160     121720     394400     198472     29604     30496
+";
+
+    /// The lane reports ticks of an invariant TSC, and the core clock is not
+    /// the TSC. A host that boosts higher finishes the same work in fewer
+    /// ticks, and every probe improves at once -- including one with no code of
+    /// ours in it. Reading that as a win is the failure this guards.
+    #[test]
+    fn a_host_clock_shift_is_reported_as_drift_rather_than_as_an_improvement() {
+        let results = vec![
+            BenchResult {
+                name: "tsc_overhead".to_owned(),
+                iters: 50_000,
+                min: 40,
+                p50: 40,
+                p99: 80,
+                mean: 58,
+                min_ns: 10,
+                p50_ns: 10,
+            },
+            BenchResult {
+                name: "vmexit_cpuid".to_owned(),
+                iters: 50_000,
+                min: 3_960,
+                p50: 4_040,
+                p99: 6_840,
+                mean: 9_072,
+                min_ns: 992,
+                p50_ns: 1_012,
+            },
+            BenchResult {
+                name: "ipc_rt_intra_process".to_owned(),
+                iters: 20_000,
+                min: 97_680,
+                p50: 100_000,
+                p99: 200_000,
+                mean: 150_000,
+                min_ns: 24_474,
+                p50_ns: 25_000,
+            },
+        ];
+        let report = render_comparison(Path::new("baseline.txt"), DRIFTED_BASELINE, &results);
+
+        assert!(report.contains("MOVED"), "drift must be stated: {report}");
+        // The raw column still says -17%, which is exactly why it must not be
+        // the only column: the anchor moved by the same proportion.
+        assert!(
+            report.contains("-17.3%"),
+            "raw delta belongs in the report: {report}"
+        );
+        // Normalized against the anchor, the round trip did not move.
+        assert!(
+            report.contains("-0.6%") || report.contains("-0.7%"),
+            "normalized delta must show the change was not the guest: {report}"
+        );
+        // Both runs read 40 ticks for `tsc_overhead`; scaling that would print
+        // a 20% regression in the measurement counter itself.
+        assert!(
+            report.contains("floor"),
+            "a probe at the counter granularity must not be normalized: {report}"
+        );
+        assert!(report.contains("Rerun both sides"), "{report}");
+    }
+
+    /// A comparison with no anchor is not a comparison. Reporting deltas anyway
+    /// would be the same error with the evidence removed.
+    #[test]
+    fn a_comparison_without_the_anchor_refuses_to_report_deltas() {
+        let baseline = "ipc_rt_intra_process 20000 118160 121720 394400 198472 29604 30496\n";
+        let results = vec![BenchResult {
+            name: "ipc_rt_intra_process".to_owned(),
+            iters: 20_000,
+            min: 97_680,
+            p50: 100_000,
+            p99: 200_000,
+            mean: 150_000,
+            min_ns: 24_474,
+            p50_ns: 25_000,
+        }];
+        let report = render_comparison(Path::new("baseline.txt"), baseline, &results);
+        assert!(report.contains("no comparison"), "{report}");
+        assert!(
+            !report.contains("-17"),
+            "no delta may be reported: {report}"
+        );
+    }
+
+    /// A stable anchor is the case the lane is for, and it must not warn.
+    #[test]
+    fn a_held_anchor_reports_the_raw_delta_without_a_drift_warning() {
+        let results = vec![
+            BenchResult {
+                name: "vmexit_cpuid".to_owned(),
+                iters: 50_000,
+                min: 4_800,
+                p50: 4_840,
+                p99: 5_120,
+                mean: 6_919,
+                min_ns: 1_202,
+                p50_ns: 1_212,
+            },
+            BenchResult {
+                name: "ipc_rt_intra_process".to_owned(),
+                iters: 20_000,
+                min: 106_344,
+                p50: 110_000,
+                p99: 200_000,
+                mean: 150_000,
+                min_ns: 26_646,
+                p50_ns: 27_000,
+            },
+        ];
+        let report = render_comparison(Path::new("baseline.txt"), DRIFTED_BASELINE, &results);
+        assert!(report.contains("held"), "{report}");
+        assert!(!report.contains("MOVED"), "{report}");
+        assert!(!report.contains("Rerun both sides"), "{report}");
+    }
 
     const SAMPLE: &str = "\
 user-debug payload=ipcbench: tsc_khz=3990809\\n

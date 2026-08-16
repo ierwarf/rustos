@@ -1,6 +1,6 @@
 # path	line_limit	owner	required split boundary
 kernel/compat/src/user/process/linux.rs	1767	compat-process	Split ELF state, signal frame, and Linux task lifecycle.
-kernel/compat/src/user/syscall/linux/ipc_ops.rs	3281	compat-ipc	Reply wait split to ipc_ops/reply_wait.rs; next split endpoint calls, shared regions, handle transfer, and tests.
+kernel/compat/src/user/syscall/linux/ipc_ops.rs	3284	compat-ipc	Reply wait split to ipc_ops/reply_wait.rs; next split endpoint calls, shared regions, handle transfer, and tests.
 kernel/compat/src/user/syscall/linux/proc_broker_ops.rs	1920	compat-process-broker	Split spawn, exec, wait, signal, and retirement broker clients.
 kernel/compat/src/user/syscall/linux/service_ops/ipc_helpers.rs	2023	compat-service-ipc	Split typed calls, response admission, retry policy, and tests.
 kernel/compat/src/user/syscall/linux/service_ops/vfs_meta.rs	1902	compat-vfs	Split metadata RPCs, message-vector copyout, and AF_UNIX transfer control transactions.

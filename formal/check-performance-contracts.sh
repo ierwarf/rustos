@@ -21,7 +21,10 @@ for witness in \
     'IPC_BULK_DATA_HARD_LIMIT_MS: u64 = 30_000' \
     'UI_FRAME_MAX_SYNCHRONOUS_POLICY_IPC: u32 = 0' \
     'SERVICE_LOOKUP_MAX_IPC_WITH_EXACT_GRANT: u32 = 0' \
-    'SERVICE_ENDPOINT_STABLE_LOOKUP_MAX_LOCK_ACQUISITIONS: u32 = 0'
+    'SERVICE_ENDPOINT_STABLE_LOOKUP_MAX_LOCK_ACQUISITIONS: u32 = 0' \
+    'USER_COPY_BATCH_MAX_ADDRESS_SPACE_BINDS: u32 = 1' \
+    'IPC_RECEIVE_REPORT_MAX_ADDRESS_SPACE_BINDS: u32 = 2' \
+    'IPC_REPLY_WAIT_POLLS_PER_TURN: u32 = 2'
 do
     rg -Fq "$witness" "$performance" || {
         echo "missing performance contract witness: $witness" >&2

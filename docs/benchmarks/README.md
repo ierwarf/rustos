@@ -420,6 +420,67 @@ was 26% of a round trip, and is now off unless a diagnosis run asks for it.
 Every figure in this document from that switch onward is the shipped
 configuration.
 
+## The anchor, and why a run without one proves nothing
+
+Every figure in this document is an **invariant-TSC tick**, not a core cycle.
+The TSC advances at a fixed rate; the core clock does not. A host that boosts
+higher finishes the same work in fewer ticks, and *every probe improves at
+once* -- including probes with no code of ours in them.
+
+That happened here. Two runs four minutes apart, with a guest change that
+touches neither probe below:
+
+| probe | before | after | change |
+| --- | ---: | ---: | ---: |
+| `vmexit_cpuid` (no RustOS code at all) | 4,760 | 3,960 | −16.8% |
+| `null_syscall_getpid` | 3,840 | 3,200 | −16.7% |
+| `ipc_rt_intra_process` | 118,160 | 97,680 | −17.3% |
+
+Read raw, that is a 17% win. It is a host clock shift: `/proc/cpuinfo` showed a
+core at 4.77 GHz against the guest's 3.99 GHz nominal TSC. Normalized against
+the anchor, `ipc_rt_intra_process` moved −0.6% and `null_syscall_getpid` +0.2%
+-- which is also the check that the normalization is doing something real,
+since the control lands on zero.
+
+`cargo xtask bench --compare <baseline>` reports this. It prints `vmexit_cpuid`
+first, states whether it held within 3%, and when it did not it prints the
+anchor-normalized column beside the raw one and says to rerun both sides in one
+session rather than attributing the change to the guest. Seven consecutive runs
+held the anchor inside 2%, so the tolerance admits ordinary variation and
+rejects a clock shift.
+
+**A single run's absolute numbers are still meaningful** -- they are what the
+guest experienced on that host state. What needs the anchor is any *comparison*
+between two runs, which is every claim in this document.
+
+## Cost invariants
+
+Correctness invariants in this kernel panic. Cost invariants did not, and that
+is why an eight-bind receive, a per-dispatch scan for a value read only at
+spawn, and a `CPUID` triple exit per IPI all survived: each produced exactly the
+right answer, so nothing asserted, and only a benchmark eventually objected.
+
+Three places now assert cost directly:
+
+- `kernel/nucleus-core/src/util/lockdep/work_budget.rs` declares a ceiling on
+  how many times a scope may take a lock class. Lockdep already derives the CPU
+  index and knows the class, so charging is one index and one increment. The
+  guard records the CPU and the running task and declines to judge when either
+  changed, so preemption and migration cannot manufacture a failure. Only
+  classes an interrupt handler cannot take qualify.
+- `usermem`'s batched validate and write declare a ceiling of one bind each,
+  and the synchronous receive declares two. That is the whole content of the
+  batching change, stated as an assertion instead of a comment.
+- `ipc_ops/reply_wait.rs` counts its polls per turn against
+  `POLLS_PER_WAIT_TURN`, which is `PollsPerTurn` in the TLA+ model.
+
+`formal/ipc-reply-deadline/IpcReplyDeadline.tla` carries the same three
+statements as invariants -- `WaitTurnPollsAtMostTwice`,
+`TimerArmedOnlyAfterAPoll`, `EveryChargedPollBelongsToALiveWait` -- with a
+`PollPendingReply` action so a poll that finds nothing is representable at all,
+and three entries in `formal/spec-mutations.toml` that each kill exactly one of
+them. A cost invariant no mutation kills is decoration.
+
 ## Caveat
 
 A single vCPU and a live desktop are the measured conditions. The phase

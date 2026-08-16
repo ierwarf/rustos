@@ -58,6 +58,13 @@ enum XtaskCommand {
         /// a diff instead of only in a terminal that has scrolled away.
         #[arg(long)]
         baseline: Option<PathBuf>,
+        /// Compare this run's `min` column against a previously written table,
+        /// with the hardware anchor reported first. Every figure in this lane
+        /// is an invariant-TSC tick, so a host clock change moves every probe
+        /// at once and reads as an improvement; the anchor is what separates
+        /// the two.
+        #[arg(long)]
+        compare: Option<PathBuf>,
         /// Lock contention only exists with more than one CPU wanting the same
         /// word, so a contention claim needs a run at more than one.
         #[arg(long = "rustos-vcpus", default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=8))]
@@ -167,8 +174,15 @@ pub(crate) fn run() -> Result<()> {
         Some(XtaskCommand::Bench {
             build_image,
             baseline,
+            compare,
             rustos_vcpus,
-        }) => crate::bench::bench(&config, build_image, baseline.as_deref(), rustos_vcpus),
+        }) => crate::bench::bench(
+            &config,
+            build_image,
+            baseline.as_deref(),
+            compare.as_deref(),
+            rustos_vcpus,
+        ),
         Some(XtaskCommand::Selftest) => testinfra::selftest(&config),
         Some(XtaskCommand::FuzzHost {
             target,

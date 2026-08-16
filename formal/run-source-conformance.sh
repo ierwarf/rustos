@@ -1506,6 +1506,7 @@ ipc-reply-deadline/IpcReplyDeadline|rustos-user-abi|tests::performance_limits_ar
 ipc-reply-deadline/IpcReplyDeadline|rootd|control_drain::tests::root_control_drain_services_a_bounded_ready_burst|host-test
 ipc-reply-deadline/IpcReplyDeadline|runtimed|tests::session_control_drain_services_a_bounded_ready_burst
 ipc-reply-deadline/IpcReplyDeadline|kernel-compat|user::syscall::linux::ipc_ops::tests::public_ipc_calls_share_the_finite_service_deadline
+ipc-reply-deadline/IpcReplyDeadline|kernel-compat|user::syscall::linux::ipc_ops::reply_wait::tests::the_wait_polls_twice_per_turn_and_arms_only_after_the_first_poll
 ipc-reply-deadline/IpcReplyDeadline|kernel-compat|user::syscall::linux::ipc_ops::tests::stable_service_endpoint_snapshot_rejects_revoked_owners
 ipc-reply-deadline/IpcReplyDeadline|kernel-ipc-runtime|ipc::tests::prepared_reply_bind_rejects_foreign_and_duplicate_owner_without_mutation
 ipc-reply-deadline/IpcReplyDeadline|kernel-ipc-runtime|ipc::tests::cancelling_before_reply_returns_prepared_descriptor_once

@@ -61,6 +61,33 @@ pub const SERVICE_LOOKUP_MAX_IPC_WITH_EXACT_GRANT: u32 = 0;
 /// publication/revocation mutation lock.
 pub const SERVICE_ENDPOINT_STABLE_LOOKUP_MAX_LOCK_ACQUISITIONS: u32 = 0;
 
+/// Address-space binds a batched user-memory admission or write may perform.
+///
+/// Binding re-derives the caller's identity and takes the per-process state
+/// lock -- about 1,240 cycles -- against roughly 110 for a range check and 310
+/// for a copy of a few dozen bytes. The batched forms exist so a report of
+/// several small buffers binds once, and that is the whole content of them, so
+/// it is a declared ceiling rather than a comment.
+pub const USER_COPY_BATCH_MAX_ADDRESS_SPACE_BINDS: u32 = 1;
+/// Address-space binds one synchronous receive may perform.
+///
+/// A receive reports a message, a reply capability, and two sender identifiers:
+/// it admits the four output ranges once and writes them once. This path bound
+/// eight times before the batched forms existed. Nothing was wrong with the
+/// bytes it produced, which is exactly why no assertion objected and only a
+/// benchmark did, at 12,500 cycles per call.
+pub const IPC_RECEIVE_REPORT_MAX_ADDRESS_SPACE_BINDS: u32 = 2;
+/// Endpoint response-queue polls in one turn of a synchronous reply wait.
+///
+/// One before the block is armed, which answers an already completed reply
+/// without arming anything, and one after, which is the race fix for a reply
+/// that lands between them. Each poll acquires the reply object and the message
+/// object, 3,197 cycles measured. A third is a busy-wait, and a busy-wait here
+/// returns the same reply to the same caller, so it is invisible except as
+/// latency. `PollsPerTurn` in `formal/ipc-reply-deadline/IpcReplyDeadline.tla`
+/// is this number.
+pub const IPC_REPLY_WAIT_POLLS_PER_TURN: u32 = 2;
+
 /// Global vfsd admission limit for live epoll provider objects.
 ///
 /// The current kernel has 32 live process slots and 16-bit dynamic descriptor
@@ -86,5 +113,14 @@ const _: () = assert!(IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS < IPC_BOOT_CONTROL_H
 const _: () = assert!(EXECUTABLE_SNAPSHOT_HARD_LIMIT_MS < IPC_BOOT_CONTROL_HARD_LIMIT_MS);
 const _: () = assert!(DVM_STORAGE_BOOT_READY_HARD_LIMIT_MS < BOOT_TO_UI_HARD_LIMIT_MS);
 const _: () = assert!(IPC_BOOT_CONTROL_HARD_LIMIT_MS < IPC_BULK_DATA_HARD_LIMIT_MS);
+// A receive reports four buffers through the two batched forms, so its ceiling
+// is exactly two of theirs. Raising the batch ceiling without raising this one
+// would let the receive silently regain a bind.
+const _: () = assert!(
+    IPC_RECEIVE_REPORT_MAX_ADDRESS_SPACE_BINDS == 2 * USER_COPY_BATCH_MAX_ADDRESS_SPACE_BINDS
+);
+// The pre-arm poll and the post-arm race fix. One would drop the race fix; more
+// than two is a busy-wait.
+const _: () = assert!(IPC_REPLY_WAIT_POLLS_PER_TURN == 2);
 const _: () = assert!(WAITSET_MAX_EPOLL_OBJECTS <= u16::MAX as usize + 1);
 const _: () = assert!(WAITSET_MAX_GLOBAL_INTERESTS >= WAITSET_MAX_INTERESTS);

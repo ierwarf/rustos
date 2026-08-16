@@ -51,6 +51,7 @@ mod raw_diag;
 mod scheduler_diag;
 #[cfg(any(rustos_boot_image, test))]
 mod spin_budget;
+pub mod work_budget;
 
 pub use lock_profile::drain_lock_profile;
 pub use preemption::{
@@ -371,6 +372,11 @@ pub fn record_sleepable_acquire(owner: u64, class: u8) {
             class
         );
         let class_index = validate_class(class);
+        // A sleepable acquisition is charged to the CPU that made it. The two
+        // assertions above already established that this is task context with
+        // no raw class held, which is exactly the condition a declared ceiling
+        // on a sleepable class relies on.
+        work_budget::charge_acquire(current_cpu_index(), class_index);
         dependency_graph::mark_class_irq_unsafe(class_index);
         with_task_stack(owner, true, |stack| {
             assert!(
@@ -887,6 +893,7 @@ fn before_acquire_with_irq_tracking(
     track_irq_usage: bool,
 ) -> PendingAcquire {
     let class_index = validate_class(class);
+    work_budget::charge_acquire(cpu, class_index);
     let profile_entry = lock_profile::now();
     if track_irq_usage {
         record_irq_usage(class_index, acquire_site);
