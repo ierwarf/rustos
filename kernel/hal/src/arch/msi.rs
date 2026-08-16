@@ -368,7 +368,12 @@ fn send_private_fixed_ipi(apic_id: u32, vector: u8) -> Result<(), StartupIpiErro
     {
         return Err(StartupIpiError::LocalApicUnavailable);
     }
-    if apic_id > u32::from(u8::MAX) || apic_id == nucleus_core::util::lockdep::hardware_apic_id() {
+    // `hardware_apic_id` derives the identity with CPUID, which is three
+    // unconditional VM exits on a virtualized topology. This runs on every
+    // reschedule and every TLB shootdown, and at eight vCPUs it was the single
+    // most expensive thing either path did. The dense identity map answers the
+    // same question -- "is this destination me" -- without leaving the guest.
+    if apic_id > u32::from(u8::MAX) || apic_id == nucleus_core::util::lockdep::current_apic_id() {
         return Err(StartupIpiError::UnsupportedDestination);
     }
 

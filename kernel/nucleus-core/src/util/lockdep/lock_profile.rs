@@ -21,7 +21,7 @@
 use crate::debug::LogCategory;
 use crate::debug::phase_profile::{PhaseProfile, phase_now};
 
-pub(super) const LOCK_PHASE_COUNT: usize = 13;
+pub(super) const LOCK_PHASE_COUNT: usize = 17;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum LockPhase {
@@ -62,6 +62,17 @@ pub(super) enum LockPhase {
     /// display provider's 2500 ms deadline. The sample count still gives the
     /// multiplier the timed phases are paying.
     CpuIndex = 12,
+    /// `current_cpu_index` fell back to `CPUID` because this CPU's TSC_AUX
+    /// token was unwritten or the token was never admitted.
+    ApicFallbackToken = 13,
+    /// An APIC-identity query ran before topology publication.
+    ApicFallbackUnpublished = 14,
+    /// An APIC-identity query named a logical index outside the admitted
+    /// topology.
+    ApicFallbackRange = 15,
+    /// An APIC-identity query found the never-published sentinel in the dense
+    /// map.
+    ApicFallbackSentinel = 16,
 }
 
 static PROFILE: PhaseProfile<LOCK_PHASE_COUNT> = PhaseProfile::new(
@@ -80,6 +91,10 @@ static PROFILE: PhaseProfile<LOCK_PHASE_COUNT> = PhaseProfile::new(
         "lock-phase-release-stack",
         "lock-phase-release-enable",
         "lock-phase-cpu-index",
+        "lock-phase-apic-fallback-token",
+        "lock-phase-apic-fallback-unpublished",
+        "lock-phase-apic-fallback-range",
+        "lock-phase-apic-fallback-sentinel",
     ],
     "lock-phase-discarded",
 );

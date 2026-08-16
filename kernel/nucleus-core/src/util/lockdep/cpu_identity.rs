@@ -49,7 +49,11 @@ pub fn current_cpu_index() -> usize {
             panic!("lockdep invariant: current TSC_AUX token {aux:#x} is outside topology");
         }
     }
+    // Charged so the reason a lock acquisition paid a CPUID exit is a
+    // measurement rather than an inference.
+    let fallback = super::lock_profile::now();
     let apic_id = hardware_apic_id();
+    super::lock_profile::charge(super::lock_profile::LockPhase::ApicFallbackToken, fallback);
     let index = select_cpu_index(
         CPU_APIC_IDENTITIES[..count]
             .iter()
@@ -103,18 +107,35 @@ pub fn apic_id_for_index(index: usize) -> u32 {
     // ORDERING: Acquire observes the complete dense map published by topology
     // admission before any entry is read.
     if !CPU_IDENTITIES_PUBLISHED.load(Ordering::Acquire) {
-        return hardware_apic_id();
+        let fallback = super::lock_profile::now();
+        let apic_id = hardware_apic_id();
+        super::lock_profile::charge(
+            super::lock_profile::LockPhase::ApicFallbackUnpublished,
+            fallback,
+        );
+        return apic_id;
     }
     let count = CPU_IDENTITY_COUNT.load(Ordering::Relaxed);
     if index >= count {
-        return hardware_apic_id();
+        let fallback = super::lock_profile::now();
+        let apic_id = hardware_apic_id();
+        super::lock_profile::charge(super::lock_profile::LockPhase::ApicFallbackRange, fallback);
+        return apic_id;
     }
     // ORDERING: the publication flag acquired above covers this payload; the
     // map is immutable afterwards. Zero is the never-published sentinel, so the
     // stored value is the identity biased by one.
     let encoded = CPU_APIC_IDENTITIES[index].load(Ordering::Relaxed);
     match encoded {
-        0 => hardware_apic_id(),
+        0 => {
+            let fallback = super::lock_profile::now();
+            let apic_id = hardware_apic_id();
+            super::lock_profile::charge(
+                super::lock_profile::LockPhase::ApicFallbackSentinel,
+                fallback,
+            );
+            apic_id
+        }
         encoded => u32::try_from(encoded - 1)
             .expect("lockdep invariant: admitted APIC identity exceeds u32 capacity"),
     }

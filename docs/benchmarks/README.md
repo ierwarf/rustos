@@ -297,6 +297,33 @@ Every per-operation cost fell with it, in proportion: `copy-request` 12,173 to
 6,450, `enqueue-runtime` 20,842 to 8,554, `bind-retain` 3,079 to 1,225. That is
 the signature of a cost that was in every operation rather than in any of them.
 
+## What only eight CPUs could show
+
+`cargo xtask bench --rustos-vcpus N` runs the lane at a chosen CPU count. The
+smoke path always accepted the flag; this lane simply never passed it, and one
+vCPU cannot observe two classes of cost at all.
+
+The first was expected and turned out not to matter. Lock **contention** --
+`lock-phase-spin`, the only phase that measures two CPUs wanting the same word
+-- goes from 72 cycles at one vCPU to 98 at eight. That is a 36% rise on 10% of
+an acquisition, so sharding the global process table would buy almost nothing;
+the acquisition cost is bookkeeping, not waiting.
+
+The second was invisible by construction. At eight vCPUs
+`lock-phase-hardware-apic-id` recorded **931,626 samples at 11,837 cycles
+each** -- roughly eleven billion cycles -- against 35 samples at one vCPU.
+`hardware_apic_id` derives the identity with `CPUID`, which is three
+unconditional VM exits on a virtualized topology.
+
+Splitting the fallback by reason found all four lockdep paths at zero, which
+said the caller was somewhere else entirely: `send_private_fixed_ipi`, the
+path behind every reschedule IPI and every TLB shootdown, called it to check
+whether the destination was the sending CPU. One vCPU never sends those, so no
+amount of single-CPU profiling could have found it. The dense identity map was
+built for exactly this question and this caller had been missed;
+`current_apic_id` answers it without leaving the guest, and the steady-state
+count is now zero.
+
 ## Two traps this work hit
 
 **A plain `cargo build` does not type-check the kernel.** The kernel builds
