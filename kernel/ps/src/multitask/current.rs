@@ -480,6 +480,16 @@ pub fn inherit_ipc_priority(reply: u64, donor_task_id: u64, receiver_task_id: u6
     })
 }
 
+/// One scheduler acquisition for the class query and the reservation an IPC
+/// call needs before it can enqueue. See [`scheduler::IpcCallAdmission`].
+pub fn reserve_ipc_call_donation(donor_task_id: u64) -> super::scheduler::IpcCallAdmission {
+    // SAFETY: interrupt exclusion and the scheduler access guard serialize the
+    // exact class query and donor reservation; no borrow escapes.
+    interrupts::without_interrupts(|| unsafe {
+        scheduler_mut().reserve_ipc_call_donation(donor_task_id)
+    })
+}
+
 pub fn reserve_ipc_priority(donor_task_id: u64) -> bool {
     // SAFETY: interrupt exclusion and the scheduler access guard serialize the
     // exact donor reservation; no scheduler-owned reference escapes.

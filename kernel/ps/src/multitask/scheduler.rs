@@ -395,6 +395,21 @@ impl SchedulerDispatch {
     }
 }
 
+/// Result of one fused synchronous-IPC call admission.
+///
+/// A call needs its caller's scheduling class and, when that class is System,
+/// a bounded donation reservation. Both start from `find_task_slot` for the
+/// same task, and asking separately took the global scheduler lock twice --
+/// masking interrupts twice -- to answer two questions about one slot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IpcCallAdmission {
+    /// The caller is live and in the System scheduling class.
+    pub system_class: bool,
+    /// Donation capacity was reserved. Only a System caller reserves, and a
+    /// full donation table degrades the call rather than failing it.
+    pub donation_reserved: bool,
+}
+
 /// Result of one fused synchronous-IPC call handoff.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IpcCallHandoffOutcome {

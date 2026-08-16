@@ -2398,16 +2398,17 @@ fn enqueue_call_and_wake_with_handles(
     attached_handles: &[KernelTransferredHandle],
 ) -> Result<KernelReplyHandle, i64> {
     let task_id = multitask::current_task_id().ok_or(LINUX_EINVAL)?;
-    // Queue priority is scheduler authority: derive it from the live task
-    // slot, never from request bytes controlled by ring3. Sampling occurs
-    // before the IPC slot lock, preserving the scheduler -> IPC lock order.
-    let priority = if multitask::task_has_system_scheduling_class(task_id) {
+    // Queue priority is scheduler authority: derive it from the live task slot,
+    // never from request bytes controlled by ring3. Sampling occurs before the
+    // IPC slot lock, preserving the scheduler -> IPC lock order, and one
+    // acquisition answers both questions; see `IpcCallAdmission`.
+    let admission = multitask::reserve_ipc_call_donation(task_id);
+    let priority = if admission.system_class {
         EndpointCallPriority::System
     } else {
         EndpointCallPriority::Ordinary
     };
-    // A full donation table degrades the call's priority; it does not fail the
-    // call.
+    // A full donation table degrades the call's priority rather than failing it.
     //
     // Priority inheritance is a scheduling optimisation. Returning `ENOSPC`
     // when the table is full turns a transient scheduling condition into a
@@ -2423,8 +2424,7 @@ fn enqueue_call_and_wake_with_handles(
     // not incorrect. The audit's own counterexample for
     // `V5-SCHED-DONATION-002` describes the same expectation — a caller that
     // cannot donate blocks without the boost.
-    let donation_required =
-        priority == EndpointCallPriority::System && multitask::reserve_ipc_priority(task_id);
+    let donation_required = admission.donation_reserved;
     let priority = if priority == EndpointCallPriority::System && !donation_required {
         crate::debug::record_milestone(
             crate::debug::LogCategory::Sched,

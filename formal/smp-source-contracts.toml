@@ -347,6 +347,16 @@ tokens = [
     ".compare_exchange(self.start, end, Ordering::AcqRel, Ordering::Acquire)",
 ]
 
+# A caller's scheduling class and its donation reservation are two questions
+# about one scheduler slot, reached through the same `find_task_slot`. Asking
+# them separately took the global scheduler lock twice, and masked interrupts
+# twice, per IPC call. `reserve_ipc_call_donation` answers both from one entry,
+# and only it may be reached from outside the scheduler.
+[[forbidden_patterns]]
+scope = "kernel/compat/**/*.rs"
+regex = '\bmultitask::(?:task_has_system_scheduling_class|reserve_ipc_priority)\s*\('
+reason = "the IPC call path admits through reserve_ipc_call_donation, in one scheduler acquisition"
+
 [[required_sequences]]
 path = "kernel/compat/src/user/syscall/linux/ipc_ops.rs"
 tokens = [
@@ -363,7 +373,13 @@ tokens = [
 # had already succeeded, and uiserver died mid thread-spawn on the resulting
 # `ENOSPC`. Binding failure now degrades, so what this sequence pins is that
 # the degradation is recorded rather than silent.
-    "priority == EndpointCallPriority::System && multitask::reserve_ipc_priority(task_id)",
+#
+# The admission token is now the fused one. The class query and the reservation
+# were two acquisitions of the global scheduler answering two questions about
+# one slot, from the same `find_task_slot`; `reserve_ipc_call_donation` is one.
+# What this sequence pins is unchanged: admission is sampled before the IPC slot
+# lock is taken.
+    "multitask::reserve_ipc_call_donation(task_id)",
     "enqueue_endpoint_call_with_handles_and_priority(",
 # The bind token is now the combined commit. The donation bind, the receiver
 # wake, and the synchronous pick hint were three separate acquisitions of the

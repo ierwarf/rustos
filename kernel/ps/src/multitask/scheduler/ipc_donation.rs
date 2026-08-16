@@ -84,6 +84,24 @@ impl Scheduler {
         Some(receiver_task_id)
     }
 
+    /// The caller's scheduling class and its donation reservation, in one
+    /// scheduler entry.
+    ///
+    /// Only a System caller reserves, so the class decides whether the
+    /// reservation is attempted at all -- which is exactly why the two used to
+    /// be separate calls, and exactly why one entry can do both from a single
+    /// slot lookup. See [`super::IpcCallAdmission`].
+    pub(in crate::multitask) fn reserve_ipc_call_donation(
+        &mut self,
+        donor_task_id: u64,
+    ) -> super::IpcCallAdmission {
+        let system_class = self.task_has_system_scheduling_class(donor_task_id);
+        super::IpcCallAdmission {
+            system_class,
+            donation_reserved: system_class && self.reserve_ipc_priority(donor_task_id),
+        }
+    }
+
     /// Reserve bounded donation capacity before the IPC runtime publishes a
     /// reply capability or removes a receive waiter. The caller task is the
     /// temporary unique identity until the reply and worker are both known.
