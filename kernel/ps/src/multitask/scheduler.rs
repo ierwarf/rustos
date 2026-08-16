@@ -100,6 +100,48 @@ use sync_handoff::ReplyWakeHandoff;
 // panic. Keep the scheduler allocation-free and explicitly bounded, but size
 // the product contract for service growth and application headroom.
 pub(super) const MAX_TASK: usize = 128;
+
+/// A set of task slots held in one machine word pair.
+///
+/// The donation walk needs a cycle-breaking set, and it needs it on the
+/// dispatch path: both O(local-runnable) pick scans derive a class per
+/// candidate, so the set is constructed once per candidate per dispatch. A
+/// `[bool; MAX_TASK]` costs a 128-byte stack clear each time to record at most
+/// `MAX_IPC_DONATION_CHAIN_DEPTH` members.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct SlotSet(u128);
+
+/// One bit per slot, so the table may not outgrow the word.
+const _: () = assert!(MAX_TASK <= u128::BITS as usize);
+
+impl SlotSet {
+    pub(super) const EMPTY: Self = Self(0);
+
+    /// Rejects an out-of-range slot rather than wrapping it onto another
+    /// member, which is what the array this replaced did by panicking on the
+    /// index.
+    #[inline]
+    fn bit(slot: usize) -> u128 {
+        assert!(slot < MAX_TASK, "slot set index exceeds capacity");
+        1_u128 << slot
+    }
+
+    #[inline]
+    pub(super) fn contains(&self, slot: usize) -> bool {
+        self.0 & Self::bit(slot) != 0
+    }
+
+    #[inline]
+    pub(super) fn insert(&mut self, slot: usize) {
+        self.0 |= Self::bit(slot);
+    }
+
+    #[inline]
+    pub(super) fn remove(&mut self, slot: usize) {
+        self.0 &= !Self::bit(slot);
+    }
+}
+
 /// How far a priority donation may propagate before the chain is truncated.
 ///
 /// A real chain is a client calling a service that calls another service; four
@@ -626,8 +668,7 @@ impl Scheduler {
     }
 
     fn new_task_vruntime(&self) -> u64 {
-        self.current_dispatch_policy()
-            .last_min_vruntime_ns
+        self.min_ready_vruntime()
             .saturating_add(SCHED_NEW_TASK_VRUNTIME_PENALTY_NS)
     }
 
@@ -1114,6 +1155,10 @@ impl Scheduler {
     /// floor for newly-spawned tasks (whose class is not yet known) and
     /// nowhere else; class-aware floors go through
     /// `min_ready_vruntime_in_class`.
+    ///
+    /// The single caller is `new_task_vruntime`, which runs on the spawning
+    /// CPU with the scheduler owner held, so the scan sees exactly the
+    /// runnable set the new task is about to join.
     fn min_ready_vruntime(&self) -> u64 {
         let mut min: Option<u64> = None;
         let current_cpu = nucleus_core::util::lockdep::current_cpu_index();
@@ -1178,7 +1223,11 @@ impl Scheduler {
     /// trusted launcher opts them in; this prevents a high-throughput weight
     /// from silently becoming a strict-priority capability.
     fn slot_class(&self, slot: usize) -> Option<SchedClass> {
-        let mut visiting = [false; MAX_TASK];
+        // The cycle-breaking set is a bitmap, not `[bool; MAX_TASK]`. Both
+        // O(local-runnable) pick scans call this once per candidate on every
+        // dispatch, and a byte-per-slot set costs a 128-byte stack clear per
+        // call for at most one bit that is ever set outside a donation chain.
+        let mut visiting = SlotSet::EMPTY;
         self.effective_slot_class(slot, &mut visiting, 0)
     }
 
@@ -1194,13 +1243,21 @@ impl Scheduler {
     fn effective_slot_class(
         &self,
         slot: usize,
-        visiting: &mut [bool; MAX_TASK],
+        visiting: &mut SlotSet,
         depth: usize,
     ) -> Option<SchedClass> {
         let base = self.base_slot_class(slot)?;
         // A System task cannot be promoted further and root-idle must remain
         // an idle fallback even if stale external state tried to reference it.
-        if base != SchedClass::User || visiting[slot] {
+        //
+        // With no live donation there is nothing that could promote this slot,
+        // so the walk below has no candidates to examine. The scan is O(slots)
+        // and the walk is O(donations) inside it; naming the empty case keeps
+        // an idle system from paying the product.
+        if base != SchedClass::User
+            || self.ipc_priority_donation_len == 0
+            || visiting.contains(slot)
+        {
             return Some(base);
         }
         // `visiting` breaks cycles but says nothing about depth, and this
@@ -1220,7 +1277,7 @@ impl Scheduler {
             );
             return Some(base);
         }
-        visiting[slot] = true;
+        visiting.insert(slot);
         let mut effective = base;
         for (index, donation) in self.ipc_priority_donations[..self.ipc_priority_donation_len]
             .iter()
@@ -1247,7 +1304,7 @@ impl Scheduler {
                 effective = donor_class;
             }
         }
-        visiting[slot] = false;
+        visiting.remove(slot);
         Some(effective)
     }
 
@@ -1429,27 +1486,32 @@ impl Scheduler {
     }
 
     fn record_dispatch_class(&mut self, slot: usize) {
-        let next = match self.slot_class(slot) {
-            Some(SchedClass::System) => self
-                .current_dispatch_policy()
+        // The class lookup does not need the policy, and taking it separately
+        // for the read and the write charged the dispatch two acquisitions of
+        // a lock it holds exclusively either way.
+        let class = self.slot_class(slot);
+        let mut policy = self.current_dispatch_policy_mut();
+        let next = match class {
+            Some(SchedClass::System) => policy
                 .system_dispatch_streak
                 .saturating_add(1)
                 .min(MAX_CONSECUTIVE_SYSTEM_DISPATCHES),
             Some(SchedClass::User | SchedClass::Idle) | None => 0,
         };
-        self.current_dispatch_policy_mut().system_dispatch_streak = next;
+        policy.system_dispatch_streak = next;
     }
 
     fn record_latency_handoff(&mut self, latency_handoff: bool) {
+        let mut policy = self.current_dispatch_policy_mut();
         let next = if latency_handoff {
-            self.current_dispatch_policy()
+            policy
                 .latency_handoff_streak
                 .saturating_add(1)
                 .min(MAX_CONSECUTIVE_LATENCY_HANDOFFS)
         } else {
             0
         };
-        self.current_dispatch_policy_mut().latency_handoff_streak = next;
+        policy.latency_handoff_streak = next;
     }
 
     /// Removes the current user task's *base* System-class admission and caps
@@ -2711,10 +2773,13 @@ impl Scheduler {
         self.assert_live_task_state_partition();
         self.mark_phase(SchedulerPhase::Validate, &mut phase_marker);
 
-        // Refresh cached min_vruntime: this is fed to newly-spawned tasks so
-        // they do not preempt the rest of the system on creation alone.
-        let local_min_vruntime = self.min_ready_vruntime();
-        self.current_dispatch_policy_mut().last_min_vruntime_ns = local_min_vruntime;
+        // The new-task vruntime floor is read at spawn and nowhere else, so it
+        // is computed at spawn. Refreshing it here charged every dispatch an
+        // O(local-runnable) scan plus a policy acquisition -- 998ns of a 7.8us
+        // owner turn, 14 percent of all attributed in-lock work -- to keep a
+        // cache warm for an event that happens thousands of times less often.
+        // Computing it on demand also makes it exact rather than as stale as
+        // this CPU's previous dispatch.
         #[cfg(not(test))]
         {
             self.runtime_profile_runnable_samples = self

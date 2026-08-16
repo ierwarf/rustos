@@ -91,6 +91,69 @@ pub fn validate_current_user_write_buffer(
     })
 }
 
+/// Admits several user write ranges under one address-space bind.
+///
+/// Binding is the expensive half of a small user access: it re-derives the
+/// caller's identity and takes the per-process state lock, about 1,240 cycles,
+/// against roughly 110 for the range check itself. A synchronous receive
+/// admits a message buffer, a reply-capability word, and two sender-identity
+/// words before it consumes anything, and doing that as four calls bound four
+/// times.
+///
+/// Ranges are admitted in the given order and a zero-length range is skipped,
+/// which is what the call sites expressed with an explicit length test. The
+/// first rejection returns, so an unadmitted range is never reported as
+/// admitted.
+#[track_caller]
+pub fn validate_current_user_write_buffers(
+    buffers: &[(u64, usize)],
+) -> Result<(), paging::AddressSpaceError> {
+    if buffers.iter().all(|(_, len)| *len == 0) {
+        return Ok(());
+    }
+    with_current_address_space(|address_space| {
+        for (user_ptr, len) in buffers.iter().copied() {
+            if len == 0 {
+                continue;
+            }
+            address_space.validate_user_write_buffer(user_virt_addr(user_ptr, len)?, len)?;
+        }
+        Ok(())
+    })
+}
+
+/// Writes several user buffers under one address-space bind.
+///
+/// The same binding cost as [`validate_current_user_write_buffers`], against
+/// copies of a few dozen bytes each.
+///
+/// Every buffer is validated immediately before it is copied, in the given
+/// order, so a failure leaves exactly the prefix the equivalent sequence of
+/// single writes would have left. A zero-length buffer is skipped.
+#[track_caller]
+pub fn write_current_user_bytes_batch(
+    writes: &[(u64, &[u8])],
+) -> Result<(), paging::AddressSpaceError> {
+    if writes.iter().all(|(_, bytes)| bytes.is_empty()) {
+        return Ok(());
+    }
+    let entry = usermem_profile::now();
+    with_current_address_space(|address_space| {
+        let mut phase = usermem_profile::charge(usermem_profile::UserCopyPhase::WriteBind, entry);
+        for (user_ptr, bytes) in writes.iter().copied() {
+            if bytes.is_empty() {
+                continue;
+            }
+            let start = user_virt_addr(user_ptr, bytes.len())?;
+            address_space.validate_user_write_buffer(start, bytes.len())?;
+            phase = usermem_profile::charge(usermem_profile::UserCopyPhase::WriteValidate, phase);
+            address_space.copy_into_user(start, bytes)?;
+            phase = usermem_profile::charge(usermem_profile::UserCopyPhase::WriteCopy, phase);
+        }
+        Ok(())
+    })
+}
+
 pub fn write_current_user_struct<T: Copy>(
     user_ptr: u64,
     value: &T,

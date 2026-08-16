@@ -1689,16 +1689,13 @@ fn prepare_recv_with_sender(
     if request_capacity > rustos_user_abi::syscall::IPC_MAX_INLINE_BYTES {
         return Err(LINUX_EINVAL);
     }
-    if request_capacity > 0 {
-        usermem::validate_current_user_write_buffer(request_ptr, request_capacity)
-            .map_err(address_space_error_to_linux_errno)?;
-    }
-    usermem::validate_current_user_write_buffer(reply_cap_ptr, size_of::<u64>())
-        .map_err(address_space_error_to_linux_errno)?;
-    usermem::validate_current_user_write_buffer(sender_pid_ptr, size_of::<u64>())
-        .map_err(address_space_error_to_linux_errno)?;
-    usermem::validate_current_user_write_buffer(sender_tid_ptr, size_of::<u64>())
-        .map_err(address_space_error_to_linux_errno)?;
+    usermem::validate_current_user_write_buffers(&[
+        (request_ptr, request_capacity),
+        (reply_cap_ptr, size_of::<u64>()),
+        (sender_pid_ptr, size_of::<u64>()),
+        (sender_tid_ptr, size_of::<u64>()),
+    ])
+    .map_err(address_space_error_to_linux_errno)?;
     Ok((endpoint, task_id, process_id, request_capacity))
 }
 
@@ -1733,16 +1730,15 @@ fn recv_with_sender_blocking_prepared(
             Ok(Some((reply, request, _handles, caller_task_id))) => {
                 let (sender_pid, sender_tid) =
                     multitask::user_log_ids_for_task(caller_task_id).unwrap_or((0, 0));
-                if !request.is_empty() {
-                    usermem::write_current_user_bytes(request_ptr, &request)
-                        .map_err(|err| (address_space_error_to_linux_errno(err), yielded))?;
-                }
-                usermem::write_current_user_bytes(reply_cap_ptr, &reply.raw().to_ne_bytes())
-                    .map_err(|err| (address_space_error_to_linux_errno(err), yielded))?;
-                usermem::write_current_user_bytes(sender_pid_ptr, &sender_pid.to_ne_bytes())
-                    .map_err(|err| (address_space_error_to_linux_errno(err), yielded))?;
-                usermem::write_current_user_bytes(sender_tid_ptr, &sender_tid.to_ne_bytes())
-                    .map_err(|err| (address_space_error_to_linux_errno(err), yielded))?;
+                let reply_raw = reply.raw().to_ne_bytes();
+                let (pid, tid) = (sender_pid.to_ne_bytes(), sender_tid.to_ne_bytes());
+                usermem::write_current_user_bytes_batch(&[
+                    (request_ptr, &request),
+                    (reply_cap_ptr, &reply_raw),
+                    (sender_pid_ptr, &pid),
+                    (sender_tid_ptr, &tid),
+                ])
+                .map_err(|err| (address_space_error_to_linux_errno(err), yielded))?;
                 let _ = multitask::inherit_ipc_priority(reply.raw(), caller_task_id, task_id);
                 return Ok((request.len(), yielded));
             }
@@ -1849,16 +1845,13 @@ fn recv_endpoint_once_with_sender(
     if request_capacity > rustos_user_abi::syscall::IPC_MAX_INLINE_BYTES {
         return Err(LINUX_EINVAL);
     }
-    if request_capacity > 0 {
-        usermem::validate_current_user_write_buffer(request_ptr, request_capacity)
-            .map_err(address_space_error_to_linux_errno)?;
-    }
-    usermem::validate_current_user_write_buffer(reply_cap_ptr, size_of::<u64>())
-        .map_err(address_space_error_to_linux_errno)?;
-    usermem::validate_current_user_write_buffer(sender_pid_ptr, size_of::<u64>())
-        .map_err(address_space_error_to_linux_errno)?;
-    usermem::validate_current_user_write_buffer(sender_tid_ptr, size_of::<u64>())
-        .map_err(address_space_error_to_linux_errno)?;
+    usermem::validate_current_user_write_buffers(&[
+        (request_ptr, request_capacity),
+        (reply_cap_ptr, size_of::<u64>()),
+        (sender_pid_ptr, size_of::<u64>()),
+        (sender_tid_ptr, size_of::<u64>()),
+    ])
+    .map_err(address_space_error_to_linux_errno)?;
 
     match kernel_ipc_runtime::api::recv_endpoint_with_sender_and_limits(
         endpoint,
@@ -1868,16 +1861,15 @@ fn recv_endpoint_once_with_sender(
         Ok(Some((reply, request, _handles, caller_task_id))) => {
             let (sender_pid, sender_tid) =
                 multitask::user_log_ids_for_task(caller_task_id).unwrap_or((0, 0));
-            if !request.is_empty() {
-                usermem::write_current_user_bytes(request_ptr, &request)
-                    .map_err(address_space_error_to_linux_errno)?;
-            }
-            usermem::write_current_user_bytes(reply_cap_ptr, &reply.raw().to_ne_bytes())
-                .map_err(address_space_error_to_linux_errno)?;
-            usermem::write_current_user_bytes(sender_pid_ptr, &sender_pid.to_ne_bytes())
-                .map_err(address_space_error_to_linux_errno)?;
-            usermem::write_current_user_bytes(sender_tid_ptr, &sender_tid.to_ne_bytes())
-                .map_err(address_space_error_to_linux_errno)?;
+            let reply_raw = reply.raw().to_ne_bytes();
+            let (pid, tid) = (sender_pid.to_ne_bytes(), sender_tid.to_ne_bytes());
+            usermem::write_current_user_bytes_batch(&[
+                (request_ptr, &request),
+                (reply_cap_ptr, &reply_raw),
+                (sender_pid_ptr, &pid),
+                (sender_tid_ptr, &tid),
+            ])
+            .map_err(address_space_error_to_linux_errno)?;
             let receiver_task_id = multitask::current_task_id().ok_or(LINUX_EINVAL)?;
             let _ = multitask::inherit_ipc_priority(reply.raw(), caller_task_id, receiver_task_id);
             Ok(request.len())

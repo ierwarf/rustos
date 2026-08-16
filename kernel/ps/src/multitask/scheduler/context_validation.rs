@@ -72,17 +72,14 @@ impl Scheduler {
     }
 
     pub(super) fn periodic_ready_validation_due(&mut self) -> bool {
-        let turn = self
-            .current_dispatch_policy()
-            .ready_validation_turn
-            .saturating_add(1);
-        if turn >= READY_VALIDATION_INTERVAL_TURNS {
-            self.current_dispatch_policy_mut().ready_validation_turn = 0;
-            true
-        } else {
-            self.current_dispatch_policy_mut().ready_validation_turn = turn;
-            false
-        }
+        // One acquisition, not two. This runs on every dispatch, and the read
+        // and the write were separate acquisitions of the same CPU-private
+        // policy lock; the turn counter is the only state either touched.
+        let mut policy = self.current_dispatch_policy_mut();
+        let turn = policy.ready_validation_turn.saturating_add(1);
+        let due = turn >= READY_VALIDATION_INTERVAL_TURNS;
+        policy.ready_validation_turn = if due { 0 } else { turn };
+        due
     }
 }
 

@@ -99,6 +99,10 @@ pub(in crate::multitask) struct SchedulerRuntimeProfile {
     pub(in crate::multitask) handoff_steps: [(u64, u64); super::locality::HANDOFF_STEP_COUNT],
     pub(in crate::multitask) phase_ns: [u64; SCHEDULER_PHASE_COUNT],
     pub(in crate::multitask) runnable_samples: u64,
+    /// Live priority donations when the window closed. The class derivation
+    /// each pick scan runs per candidate walks this list, so it is the second
+    /// factor in the scan cost.
+    pub(in crate::multitask) live_ipc_donations: u64,
     /// First slot whose lock-free identity record disagrees with the
     /// scheduler's own tables, or `usize::MAX` when publication is complete.
     /// This is the standing proof that no identity write site was missed.
@@ -335,6 +339,19 @@ pub fn drain_scheduler_runtime_profile() -> usize {
             profile.phase_ns.iter().copied().sum::<u64>() / 1_000,
             profile.lock_hold_ns / 1_000,
         ),
+    );
+    // How long the O(local-runnable) pick scans actually are, and how many
+    // donations each candidate's class derivation walks. Both pick scans are
+    // O(runnable) and the class walk inside them is O(donations), so their
+    // product is the cost, and neither term was measured: the scan time alone
+    // cannot say whether to shorten the list or the walk.
+    // arg0=(runnable samples summed over dispatches), arg1=(live donations at
+    // the sample, dispatches).
+    crate::debug::record_milestone(
+        crate::debug::LogCategory::Sched,
+        "kernel-scheduler-scan",
+        profile.runnable_samples,
+        pack_u32_pair(profile.live_ipc_donations, profile.total_dispatches),
     );
     // arg0=(timer, software), arg1=(reschedule IPI, RTC). Keep the high-rate
     // entry causes in one fixed record; debugcon is itself a VM-exit under KVM.
@@ -616,6 +633,7 @@ impl Scheduler {
             handoff_steps: super::locality::take_handoff_step_window(),
             phase_ns: self.runtime_profile_phase_ns,
             runnable_samples: self.runtime_profile_runnable_samples,
+            live_ipc_donations: self.ipc_priority_donation_len as u64,
             divergent_identity_slot: self.divergent_published_identity().unwrap_or(usize::MAX),
             run_authority_divergence: {
                 // Sweep before taking the window so a position no publication
@@ -779,6 +797,7 @@ mod tests {
             handoff_steps: [(0, 0); super::locality::HANDOFF_STEP_COUNT],
             phase_ns: [0; SCHEDULER_PHASE_COUNT],
             runnable_samples: 0,
+            live_ipc_donations: 0,
             divergent_identity_slot: usize::MAX,
             run_authority_divergence: None,
             top: [SchedulerRuntimeProfileEntry::default(); PROFILE_TOP_TASKS],
