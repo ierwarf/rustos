@@ -499,7 +499,8 @@ the reachability search, the IRQ-conflict check and the publication;
 `record_irq_usage` returned early. Held-stack bookkeeping and the recursion
 assertions were left intact.
 
-The ablated build was **slower**, three runs out of three, anchor held:
+The ablated build first read **slower**, three runs out of three, anchor held —
+and that reading was an artifact. See the correction below.
 
 | probe | ablated vs shipped |
 | --- | ---: |
@@ -510,15 +511,36 @@ The ablated build was **slower**, three runs out of three, anchor held:
 | `null_syscall_getpid` | −1.0% |
 | `vmexit_cpuid` (anchor) | 0.0% |
 
-`ipc_try_recv_empty` read exactly 4,000 in all three ablated runs against 3,800
-shipped — a deterministic 200 ticks, not variance.
+### The correction: a held anchor does not make a baseline current
 
-Deleting work cannot make code execute faster, so this is code layout: a
-constant-returning `edge_already_validated` makes the loops dead and changes
-inlining across every `TrackedSpinLock::lock` call site. The layout effect is
-larger than the work removed.
+Deleting work cannot make code execute faster, so the reading above had to be
+instrumental. The cause was not code layout, which is what this section first
+claimed. It was the baseline.
 
-**That is the answer.** In steady state the dependency graph is one acquire load
+Running **unmodified HEAD** against its own committed baseline, same session:
+
+| probe | HEAD vs its own baseline |
+| --- | ---: |
+| `ipc_rt_intra_process` | +5.4% |
+| `ipc_try_recv_empty` | +4.2% |
+| `null_syscall_getpid` | −1.0% |
+| `vmexit_cpuid` (anchor) | +1.0%, held |
+
+The tree that produced `ipc-baseline.txt` now measures five percent slower than
+the file it produced, with the anchor holding. So `vmexit_cpuid` catches a core
+clock shift and nothing else: host cache and memory state, KVM, and background
+load all move the guest without moving a hypervisor exit.
+
+**A committed baseline is a record, not a control.** Every comparison needs a
+same-session control run of the unmodified tree. This document previously said to
+rerun both sides only when the anchor moved; that is not enough, and it cost two
+wrong readings in a row.
+
+Re-derived against the same-session control, the ablation is worth **0–2%**, at
+or under the noise floor, and `ipc_try_recv_empty` is identical at 4,000 either
+way.
+
+**The conclusion is unchanged.** In steady state the dependency graph is one acquire load
 per held class per acquisition, because the validated-edge cache already reduced
 it to that; the reachability search and the globally ordered publication run only
 for a genuinely new edge, which is a boot-time cost. There is no large win
@@ -614,6 +636,16 @@ of a whole round trip -- not a more confident reading of one pair of runs.
 `sched_yield` deserves its own note: across those same three identical runs it
 spanned +6.2% to +12.4%. Nothing under about fifteen percent is readable on that
 probe.
+
+**A committed baseline is a record, not a control.** `ipc-baseline.txt` is
+written by a run and then goes stale, and it goes stale *while the anchor holds*:
+unmodified HEAD once measured 5.4% slower than the file HEAD itself had produced,
+with `vmexit_cpuid` inside 1%. The anchor catches a core clock shift and nothing
+else — host cache and memory state, KVM, and background load all move the guest
+without moving a hypervisor exit. So every comparison needs a **same-session
+control run of the unmodified tree**, not just a held anchor. Two changes in a
+row were read as five-percent regressions before this was written down; both were
+free.
 
 ## Decoding the in-kernel profile
 
