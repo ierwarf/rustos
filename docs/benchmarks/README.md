@@ -484,6 +484,53 @@ per-phase timing profile is only affordable where the phases are expensive.**
 Two of them in this kernel wrapped operations of a few hundred cycles or less,
 and both cost more than what they measured. Before adding a third, ablate it.
 
+## What lock-order verification actually costs
+
+RustOS ships `--cfg rustos_boot_image` on every kernel build, asserted by a test
+so it cannot be switched off by accident. Linux's equivalent,
+`CONFIG_PROVE_LOCKING`, is a debug option its own documentation says will never
+be enabled in a production kernel. So the obvious question is what the posture
+costs — and every previous figure for it was measured with the lock phase
+profiler attached, which was itself 26% of a round trip.
+
+Ablated properly: `edge_already_validated` forced to `true`, which makes every
+dependency-edge loop `continue` immediately and removes the dependency store,
+the reachability search, the IRQ-conflict check and the publication;
+`record_irq_usage` returned early. Held-stack bookkeeping and the recursion
+assertions were left intact.
+
+The ablated build was **slower**, three runs out of three, anchor held:
+
+| probe | ablated vs shipped |
+| --- | ---: |
+| `sched_yield` | +16.3% / +13.2% / +2.9% |
+| `ipc_split_reply_to_return` | +6.1% |
+| `ipc_rt_intra_process` | +5.2% / +3.5% / +4.0% |
+| `ipc_try_recv_empty` | +4.2% / +4.2% / +4.2% |
+| `null_syscall_getpid` | −1.0% |
+| `vmexit_cpuid` (anchor) | 0.0% |
+
+`ipc_try_recv_empty` read exactly 4,000 in all three ablated runs against 3,800
+shipped — a deterministic 200 ticks, not variance.
+
+Deleting work cannot make code execute faster, so this is code layout: a
+constant-returning `edge_already_validated` makes the loops dead and changes
+inlining across every `TrackedSpinLock::lock` call site. The layout effect is
+larger than the work removed.
+
+**That is the answer.** In steady state the dependency graph is one acquire load
+per held class per acquisition, because the validated-edge cache already reduced
+it to that; the reachability search and the globally ordered publication run only
+for a genuinely new edge, which is a boot-time cost. There is no large win
+available here, so the safety posture stays.
+
+Two limits on that claim, both worth stating. It prices the *graph*, not all of
+lockdep — the expensive halves were the repeated CPU-identity derivations and the
+task-stack registry scans, and both were fixed earlier rather than measured here.
+And an effect smaller than a few percent is invisible under a layout change of
+this size, so "no large win" is the honest ceiling on the conclusion, not "no
+cost".
+
 ## What only eight CPUs could show
 
 `cargo xtask bench --rustos-vcpus N` runs the lane at a chosen CPU count. The
