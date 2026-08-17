@@ -47,9 +47,9 @@ impl Scheduler {
     /// Walk scheduling classes in priority order and select the global
     /// least-vruntime task or one bounded local alternative in that class.
     pub(super) fn pick_min_vruntime(&self, current: usize) -> Option<usize> {
-        let started_ns = crate::arch::clock::monotonic_nanos();
+        let started_ns = scan_clock();
         let picked = self.pick_min_vruntime_inner(current);
-        charge_pick_scan(crate::arch::clock::monotonic_nanos().saturating_sub(started_ns));
+        charge_pick_scan(scan_clock().saturating_sub(started_ns));
         picked
     }
 
@@ -98,9 +98,9 @@ impl Scheduler {
     }
 
     pub(super) fn pick_min_vruntime_excluding(&self, excluded: usize) -> Option<usize> {
-        let started_ns = crate::arch::clock::monotonic_nanos();
+        let started_ns = scan_clock();
         let picked = self.pick_min_vruntime_excluding_inner(excluded);
-        charge_pick_scan(crate::arch::clock::monotonic_nanos().saturating_sub(started_ns));
+        charge_pick_scan(scan_clock().saturating_sub(started_ns));
         picked
     }
 
@@ -266,6 +266,23 @@ fn charge_pick_scan(elapsed_ns: u64) {
 /// turned out to be 29 ms of a 216 ms segment, so it is not the one.
 static HANDOFF_SCAN_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static HANDOFF_SCAN_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The scan stopwatch's clock, or zero when dispatch is not instrumented.
+///
+/// Both pick scans run on every dispatch and each was bracketed by two
+/// `lfence; rdtsc` reads plus two globally shared atomic adds -- to time a walk
+/// over a handful of slots. See `Scheduler::mark_phase`.
+#[inline]
+fn scan_clock() -> u64 {
+    #[cfg(rustos_scheduler_phase_profile)]
+    {
+        crate::arch::clock::monotonic_nanos()
+    }
+    #[cfg(not(rustos_scheduler_phase_profile))]
+    {
+        0
+    }
+}
 
 pub(in crate::multitask) fn charge_handoff_scan(elapsed_ns: u64) {
     // ORDERING: Relaxed; diagnostic counters drained once per second.

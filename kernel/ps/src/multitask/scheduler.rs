@@ -635,10 +635,40 @@ impl Scheduler {
     /// cannot attribute a stall to a segment, and the release gate requires
     /// that attribution rather than an assumption.
     #[inline]
+    /// Charges one dispatch phase, when the dispatch is instrumented.
+    ///
+    /// Thirteen call sites reach this per dispatch and each one reads the clock
+    /// with `lfence; rdtsc`. Wrapping individually cheap phases in that is the
+    /// same shape as the lock phase profiler, and ablation priced it the same
+    /// way: `sched_yield` -11.7%, `ipc_rt_intra_process` -3.8%, and zero on a
+    /// probe that performs no dispatch. The call sites stay unconditional so
+    /// the phase split is one build switch away.
+    #[inline]
     fn mark_phase(&mut self, phase: SchedulerPhase, marker: &mut u64) {
-        let now = crate::arch::clock::monotonic_nanos();
-        self.record_runtime_profile_phase(phase, now.saturating_sub(*marker));
-        *marker = now;
+        #[cfg(rustos_scheduler_phase_profile)]
+        {
+            let now = crate::arch::clock::monotonic_nanos();
+            self.record_runtime_profile_phase(phase, now.saturating_sub(*marker));
+            *marker = now;
+        }
+        #[cfg(not(rustos_scheduler_phase_profile))]
+        {
+            let _ = (phase, marker);
+        }
+    }
+
+    /// The clock read that opens a dispatch phase chain, or zero when the
+    /// dispatch is not instrumented. Every consumer is a `mark_phase` delta.
+    #[inline]
+    fn phase_chain_start() -> u64 {
+        #[cfg(rustos_scheduler_phase_profile)]
+        {
+            crate::arch::clock::monotonic_nanos()
+        }
+        #[cfg(not(rustos_scheduler_phase_profile))]
+        {
+            0
+        }
     }
 
     #[inline]
@@ -1430,10 +1460,10 @@ impl Scheduler {
         class: SchedClass,
         latency_bound_ms: u64,
     ) -> Option<usize> {
-        let started_ns = crate::arch::clock::monotonic_nanos();
+        let started_ns = Self::phase_chain_start();
         let picked = self.overdue_class_pick_inner(current, now_ticks, class, latency_bound_ms);
         locality::charge_handoff_scan(
-            crate::arch::clock::monotonic_nanos().saturating_sub(started_ns),
+            Self::phase_chain_start().saturating_sub(started_ns),
         );
         picked
     }
@@ -2682,7 +2712,7 @@ impl Scheduler {
         voluntary_yield: bool,
     ) -> SchedulerDispatch {
         let dispatch_cpu = nucleus_core::util::lockdep::current_cpu_index();
-        let mut phase_marker = crate::arch::clock::monotonic_nanos();
+        let mut phase_marker = Self::phase_chain_start();
         #[cfg(not(test))]
         let current_cpu = dispatch_cpu;
         let current_slot = self.current_task_slot();
@@ -3289,7 +3319,7 @@ impl Scheduler {
     /// restored by every IRQ leaf because compiler-generated kernel code may
     /// use vector registers after the save boundary.
     pub(super) fn prepare_dispatched_task_execution(&mut self, dispatch: SchedulerDispatch) {
-        let mut phase_marker = crate::arch::clock::monotonic_nanos();
+        let mut phase_marker = Self::phase_chain_start();
         assert_eq!(
             self.current_task_slot(),
             dispatch.next_slot,
@@ -3381,7 +3411,7 @@ impl Scheduler {
     }
 
     pub(super) fn save_current_simd_state(&mut self) {
-        let mut phase_marker = crate::arch::clock::monotonic_nanos();
+        let mut phase_marker = Self::phase_chain_start();
         let slot = self.current_task_slot();
         unsafe {
             save_state(&mut self.simd_states[slot]);
@@ -3390,7 +3420,7 @@ impl Scheduler {
     }
 
     pub(super) fn restore_current_simd_state(&mut self) {
-        let mut phase_marker = crate::arch::clock::monotonic_nanos();
+        let mut phase_marker = Self::phase_chain_start();
         let slot = self.current_task_slot();
         unsafe {
             restore_state(&self.simd_states[slot]);
@@ -4480,13 +4510,21 @@ impl Scheduler {
 /// before any of them is changed — the one predicate reorder attempted on a
 /// guess moved nothing.
 fn timed_handoff_step<T>(step: usize, body: impl FnOnce() -> T) -> T {
-    let started_ns = crate::arch::clock::monotonic_nanos();
-    let value = body();
-    locality::charge_handoff_step(
-        step,
-        crate::arch::clock::monotonic_nanos().saturating_sub(started_ns),
-    );
-    value
+    #[cfg(not(rustos_scheduler_phase_profile))]
+    {
+        let _ = step;
+        return body();
+    }
+    #[cfg(rustos_scheduler_phase_profile)]
+    {
+        let started_ns = crate::arch::clock::monotonic_nanos();
+        let value = body();
+        locality::charge_handoff_step(
+            step,
+            crate::arch::clock::monotonic_nanos().saturating_sub(started_ns),
+        );
+        value
+    }
 }
 
 #[cfg(rustos_log_sched_debug)]

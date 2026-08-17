@@ -71,6 +71,22 @@ phase_profile = false
 warn_wait_cycles = 250000
 warn_hold_cycles = 250000
 
+[scheduler_telemetry]
+# Per-phase nanosecond attribution inside every scheduler dispatch, plus the
+# handoff- and pick-scan stopwatches.
+#
+# This is about seventeen `lfence; rdtsc` reads and their accumulators per
+# dispatch, wrapped around phases that are individually cheap -- the same shape
+# as `lock_telemetry.phase_profile` and found the same way. Measured by building
+# with it stubbed out: `sched_yield` -11.7 percent, `ipc_rt_intra_process` -3.8
+# percent, and zero on `null_syscall_getpid`, which performs no dispatch.
+#
+# It stays in the tree because the phase split is what attributes a dispatch at
+# all. Turn it on for a diagnosis run --
+# `RUSTOS_SCHEDULER_PHASE_PROFILE=true cargo xtask bench` -- and read the result
+# as the cost of an instrumented dispatch, not of a dispatch.
+phase_profile = false
+
 [kernel.build]
 # Hardened/release-oriented kernel build knobs. Copy this block, or this whole
 # file, into config/rustos.toml when testing a release-shaped image.

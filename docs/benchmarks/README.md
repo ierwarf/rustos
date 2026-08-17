@@ -450,6 +450,40 @@ magnitude larger, and it was found the same way: by removing the measurement
 and measuring again. Any profile that wraps an operation cheaper than a few
 thousand cycles is worth ablating before its numbers are trusted.
 
+## The scheduler had the same stopwatch
+
+`b44a629` found that the lock phase profiler cost 26% of a round trip and put it
+behind a build switch. The scheduler's own phase profile is the same shape and
+was not switched: `mark_phase` has thirteen call sites per dispatch, each reading
+the clock with `lfence; rdtsc`, and both pick scans plus the overdue-handoff scan
+bracket themselves with two more reads and two *globally shared* atomic adds --
+to time a walk over a handful of slots.
+
+Ablated the same way, then shipped as `[scheduler_telemetry] phase_profile`,
+off by default, cfg `rustos_scheduler_phase_profile`, env
+`RUSTOS_SCHEDULER_PHASE_PROFILE=true` for a diagnosis build. Call sites stay
+unconditional; only the clock read and the accumulator compile out.
+
+Measured with the anchor held at exactly 0.0%:
+
+| probe | change | performs a dispatch? |
+| --- | ---: | --- |
+| `sched_yield` | **−12.2%** | yes, two |
+| `ipc_split_reply_to_return` | −5.4% | yes |
+| `ipc_rt_intra_process` | −3.7% | yes |
+| `ipc_rt_cross_process` | −2.3% | yes |
+| `ipc_try_recv_empty` | **0.0%** | no |
+| `null_syscall_getpid` | **0.0%** | no |
+| `vmexit_cpuid` (anchor) | 0.0% | no |
+
+Both probes that perform no dispatch read exactly zero. That is the attribution,
+not an inference from it.
+
+The lesson generalizes past this instance and is worth stating as a rule: **a
+per-phase timing profile is only affordable where the phases are expensive.**
+Two of them in this kernel wrapped operations of a few hundred cycles or less,
+and both cost more than what they measured. Before adding a third, ablate it.
+
 ## What only eight CPUs could show
 
 `cargo xtask bench --rustos-vcpus N` runs the lane at a chosen CPU count. The

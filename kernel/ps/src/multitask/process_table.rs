@@ -999,6 +999,21 @@ pub(crate) mod tests {
     // flakes. Keep only this shared-state group serialized.
     pub(crate) static PROCESS_TABLE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Takes the shared-state lock, ignoring poisoning.
+    ///
+    /// The lock guards a group, so a poisoned lock fails every member of that
+    /// group. One flaky test therefore reported as nineteen failures, all with
+    /// the same `PoisonError` message and none of them naming the test that
+    /// actually panicked -- the root cause was the only thing the output did not
+    /// contain. Poisoning has nothing to protect here either: the guard's `Drop`
+    /// calls `reset_for_tests`, so the next holder starts from a clean table
+    /// whether or not the previous one unwound.
+    pub(crate) fn lock_process_table_for_tests() -> std::sync::MutexGuard<'static, ()> {
+        PROCESS_TABLE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     pub(crate) struct ProcessTableTestIsolation {
         _guard: std::sync::MutexGuard<'static, ()>,
     }
@@ -1010,9 +1025,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn isolate_process_table() -> ProcessTableTestIsolation {
-        let guard = PROCESS_TABLE_TEST_LOCK
-            .lock()
-            .expect("process table test lock");
+        let guard = lock_process_table_for_tests();
         super::reset_for_tests();
         ProcessTableTestIsolation { _guard: guard }
     }
@@ -1037,9 +1050,7 @@ pub(crate) mod tests {
 
     #[test]
     fn retained_ref_delays_reclaim_until_drop() {
-        let _guard = PROCESS_TABLE_TEST_LOCK
-            .lock()
-            .expect("process table test lock");
+        let _guard = lock_process_table_for_tests();
         let handle = create_process(42, new_state()).expect("process handle");
         let retained = retain_process(handle).expect("retained process");
         detach_task(handle).expect("detach");
@@ -1112,9 +1123,7 @@ pub(crate) mod tests {
 
     #[test]
     fn leader_thread_retirement_does_not_mark_live_process_exited() {
-        let _guard = PROCESS_TABLE_TEST_LOCK
-            .lock()
-            .expect("process table test lock");
+        let _guard = lock_process_table_for_tests();
         let handle = create_process(43, new_state()).expect("process handle");
         attach_task(handle).expect("second thread");
         assert_eq!(thread_count_by_pid(43), Some(2));
@@ -1130,9 +1139,7 @@ pub(crate) mod tests {
 
     #[test]
     fn exiting_process_rejects_new_thread_attachment() {
-        let _guard = PROCESS_TABLE_TEST_LOCK
-            .lock()
-            .expect("process table test lock");
+        let _guard = lock_process_table_for_tests();
         let handle = create_process(44, new_state()).expect("process handle");
         mark_process_exiting(44).expect("mark exiting");
 
@@ -1146,9 +1153,7 @@ pub(crate) mod tests {
 
     #[test]
     fn one_process_cannot_consume_the_global_task_table() {
-        let _guard = PROCESS_TABLE_TEST_LOCK
-            .lock()
-            .expect("process table test lock");
+        let _guard = lock_process_table_for_tests();
         let handle = create_process(45, new_state()).expect("process handle");
         for _ in 1..super::MAX_THREADS_PER_PROCESS {
             attach_task(handle).expect("thread within per-process ceiling");
@@ -1167,9 +1172,7 @@ pub(crate) mod tests {
 
     #[test]
     fn child_stop_and_continue_status_require_exact_wait_options() {
-        let _guard = PROCESS_TABLE_TEST_LOCK
-            .lock()
-            .expect("process table test lock");
+        let _guard = lock_process_table_for_tests();
         let parent = create_process(46, new_state()).expect("parent");
         let child =
             create_process_with_parent(47, Some(46), new_state()).expect("child process handle");
