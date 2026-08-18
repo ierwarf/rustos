@@ -460,6 +460,10 @@ pub(super) fn private_kvm_contract_renderers_are_canonical() {
         render_smp_ring3_qualification_contract(8),
         "contract=rustos-kvm-smp-qualification-v1\nworkers=8\nwork_units=1000000\ndeadline_ms=5000\n"
     );
+    assert_eq!(
+        render_ipcbench_probe_contract("ipc_rt_intra_process"),
+        "contract=rustos-ipcbench-probe-v1\nprobe=ipc_rt_intra_process\n"
+    );
 }
 
 pub(super) fn smp_boot_acceptance_uses_kernel_stamped_milestones_when_text_interleaves() {
@@ -695,6 +699,42 @@ pub(super) fn smp_evidence_cohort_is_strict_and_paired() {
             vec![
                 "--smp-evidence-cohort".into(),
                 "0123456789abcdef0123456789abcdef".into(),
+            ]
+            .into_iter(),
+        )
+        .is_err()
+    );
+}
+
+pub(super) fn ipcbench_probe_option_is_a_strict_singular_name() {
+    let valid = parse_smoke_options(
+        vec![
+            "--gui-dvm-surfaces".into(),
+            "--ipcbench-probe".into(),
+            "ipc_rt_intra_process".into(),
+        ]
+        .into_iter(),
+    )
+    .expect("a plain alphanumeric/underscore name is accepted");
+    assert_eq!(valid.ipcbench_probe.as_deref(), Some("ipc_rt_intra_process"));
+
+    for invalid in ["", "ipc rt", "../../etc/passwd", "name=1"] {
+        assert!(
+            parse_smoke_options(
+                vec!["--ipcbench-probe".into(), invalid.to_owned()].into_iter(),
+            )
+            .is_err(),
+            "{invalid}"
+        );
+    }
+
+    assert!(
+        parse_smoke_options(
+            vec![
+                "--ipcbench-probe".into(),
+                "a".into(),
+                "--ipcbench-probe".into(),
+                "b".into(),
             ]
             .into_iter(),
         )

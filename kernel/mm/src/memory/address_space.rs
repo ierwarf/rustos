@@ -35,6 +35,10 @@ use crate::memory::{kernel_vm, phys};
 const ENTRIES_PER_TABLE: usize = 512;
 const PAGE_4KIB: usize = 4096;
 const PAGE_4KIB_U64: u64 = PAGE_4KIB as u64;
+/// Frames per `phys::alloc_frames_batch`/`try_free_frames_batch` chunk,
+/// matching the housekeeping-quantum convention already used for shared
+/// IPC region reclaim (`service_deferred_shared_region_reclaims`).
+const FRAME_BATCH_CHUNK: usize = 64;
 const USER_PML4_INDEX: usize = 1;
 pub const USER_SPACE_BASE: u64 = (USER_PML4_INDEX as u64) << 39;
 pub const USER_SPACE_END_EXCLUSIVE: u64 = ((USER_PML4_INDEX + 1) as u64) << 39;
@@ -228,17 +232,34 @@ impl ProcessAddressSpace {
             .map_err(|_| AddressSpaceError::OutOfFrames)?;
         let mutation = begin_address_space_mutation(self.root_phys());
 
+        // Frames are allocated in chunks under one `PHYS_ALLOCATOR` acquisition
+        // instead of one per page: this loop maps each page independently, so
+        // nothing downstream needs the frames to be physically adjacent, and a
+        // large mapping otherwise pays one tracked-lock acquire/release pair
+        // per 4 KiB page.
+        let mut frame_buffer = [PhysAddr::new(0); FRAME_BATCH_CHUNK];
+        let mut frame_buffer_len = 0usize;
+        let mut frame_buffer_pos = 0usize;
+
         for page_index in 0..page_count {
             let virt = page_addr(start, page_index)?;
             if self.translate_user(virt).is_some() {
+                free_frame_buffer_tail(&frame_buffer[frame_buffer_pos..frame_buffer_len]);
                 rollback_user_pages(self, &mapped_pages, &published_tables, mutation);
                 return Err(AddressSpaceError::AlreadyMapped);
             }
 
-            let Some(frame_phys) = phys::alloc_frame() else {
-                rollback_user_pages(self, &mapped_pages, &published_tables, mutation);
-                return Err(AddressSpaceError::OutOfFrames);
-            };
+            if frame_buffer_pos == frame_buffer_len {
+                let want = (page_count - page_index).min(FRAME_BATCH_CHUNK);
+                frame_buffer_len = phys::alloc_frames_batch(&mut frame_buffer[..want]);
+                frame_buffer_pos = 0;
+                if frame_buffer_len == 0 {
+                    rollback_user_pages(self, &mapped_pages, &published_tables, mutation);
+                    return Err(AddressSpaceError::OutOfFrames);
+                }
+            }
+            let frame_phys = frame_buffer[frame_buffer_pos];
+            frame_buffer_pos += 1;
 
             unsafe {
                 ptr::write_bytes(higher_half_ptr(frame_phys), 0, PAGE_4KIB);
@@ -248,6 +269,7 @@ impl ProcessAddressSpace {
                 self.map_user_page(virt, frame_phys, page_flags, &mut published_tables)
             {
                 phys::free_frame(frame_phys);
+                free_frame_buffer_tail(&frame_buffer[frame_buffer_pos..frame_buffer_len]);
                 rollback_user_pages(self, &mapped_pages, &published_tables, mutation);
                 return Err(err);
             }
@@ -985,12 +1007,7 @@ impl Drop for ProcessAddressSpace {
             let mut recorded_frames = self.owned_frames.clone();
             recorded_frames.sort_unstable();
             recorded_frames.dedup();
-            for frame_phys in recorded_frames {
-                if frame_phys == 0 || frame_phys % PAGE_4KIB_U64 != 0 {
-                    continue;
-                }
-                let _ = phys::try_free_frame(PhysAddr::new(frame_phys));
-            }
+            free_owned_frames_silently(recorded_frames.into_iter());
             return;
         }
 
@@ -1029,25 +1046,86 @@ impl Drop for ProcessAddressSpace {
         // owned_frames is the allocation ledger. A page-table walk is not an
         // ownership oracle because shared memfd and device mappings install
         // borrowed leaf frames which their backing objects must release.
-        for frame_phys in recorded_frames {
-            if frame_phys == 0 || frame_phys % PAGE_4KIB_U64 != 0 {
-                crate::debug::println!(
-                    "process address space: skipping invalid owned frame root={:#x} frame={:#x}",
-                    self.pml4_frame_phys,
-                    frame_phys,
-                );
-                continue;
-            }
+        free_owned_frames_logged(self.pml4_frame_phys, recorded_frames.into_iter());
+    }
+}
 
-            if let Err(err) = phys::try_free_frame(PhysAddr::new(frame_phys)) {
+/// Frees a process's owned frames under `PHYS_ALLOCATOR` in chunks instead of
+/// one lock acquisition per frame, discarding every failure — the synthetic
+/// address spaces this backs have no privileged root to attribute a log line
+/// to, matching the loop this replaced.
+fn free_owned_frames_silently(frames: impl Iterator<Item = u64>) {
+    let mut batch = [PhysAddr::new(0); FRAME_BATCH_CHUNK];
+    let mut failures = [(PhysAddr::new(0), phys::FreeFrameError::AlreadyFree); FRAME_BATCH_CHUNK];
+    let mut batch_len = 0;
+    for frame_phys in frames {
+        if frame_phys == 0 || frame_phys % PAGE_4KIB_U64 != 0 {
+            continue;
+        }
+        batch[batch_len] = PhysAddr::new(frame_phys);
+        batch_len += 1;
+        if batch_len == FRAME_BATCH_CHUNK {
+            phys::try_free_frames_batch(&batch[..batch_len], &mut failures);
+            batch_len = 0;
+        }
+    }
+    if batch_len != 0 {
+        phys::try_free_frames_batch(&batch[..batch_len], &mut failures);
+    }
+}
+
+/// Frees a process's owned frames under `PHYS_ALLOCATOR` in chunks, logging
+/// every skipped or rejected frame exactly as the per-frame loop this
+/// replaced did — the logging happens after each chunk's lock is released,
+/// never while it is held.
+fn free_owned_frames_logged(pml4_frame_phys: u64, frames: impl Iterator<Item = u64>) {
+    let mut batch = [PhysAddr::new(0); FRAME_BATCH_CHUNK];
+    let mut failures = [(PhysAddr::new(0), phys::FreeFrameError::AlreadyFree); FRAME_BATCH_CHUNK];
+    let mut batch_len = 0;
+    for frame_phys in frames {
+        if frame_phys == 0 || frame_phys % PAGE_4KIB_U64 != 0 {
+            crate::debug::println!(
+                "process address space: skipping invalid owned frame root={:#x} frame={:#x}",
+                pml4_frame_phys,
+                frame_phys,
+            );
+            continue;
+        }
+        batch[batch_len] = PhysAddr::new(frame_phys);
+        batch_len += 1;
+        if batch_len == FRAME_BATCH_CHUNK {
+            let failed = phys::try_free_frames_batch(&batch[..batch_len], &mut failures);
+            for &(failed_phys, err) in &failures[..failed.min(failures.len())] {
                 crate::debug::println!(
                     "process address space: frame cleanup rejected root={:#x} frame={:#x} err={:?}",
-                    self.pml4_frame_phys,
-                    frame_phys,
+                    pml4_frame_phys,
+                    failed_phys.as_u64(),
                     err,
                 );
             }
+            batch_len = 0;
         }
+    }
+    if batch_len != 0 {
+        let failed = phys::try_free_frames_batch(&batch[..batch_len], &mut failures);
+        for &(failed_phys, err) in &failures[..failed.min(failures.len())] {
+            crate::debug::println!(
+                "process address space: frame cleanup rejected root={:#x} frame={:#x} err={:?}",
+                pml4_frame_phys,
+                failed_phys.as_u64(),
+                err,
+            );
+        }
+    }
+}
+
+/// Returns unused frames from a batch-allocation buffer to the allocator on
+/// an error path — `mapped_pages`/`rollback_user_pages` only knows about
+/// frames already committed to a page-table entry, not ones sitting in the
+/// buffer ahead of where the loop stopped.
+fn free_frame_buffer_tail(frames: &[PhysAddr]) {
+    for &frame in frames {
+        phys::free_frame(frame);
     }
 }
 

@@ -19,6 +19,11 @@ options:
                        RustOS inputd keyboard and pointer ingress markers
   --exercise-network   run netprobe through netd and the DVM Ethernet ring;
                        requires --gui-dvm-surfaces and --dvm-network-shmem
+  --ipcbench-probe <name>
+                       restrict the `ipcbench` session-startup harness to one
+                       named probe, so the in-kernel `ipc-call-phase-*` and
+                       `usermem-phase-*` counters it charges belong to that
+                       probe alone for the whole boot
   --min-ui-fps <fps>   enable the private KVM-only UI profiler and bounded DVM
                        uinput/evdev load, then require three high-volume input
                        windows, WayClick commit/frame-callback windows, and three

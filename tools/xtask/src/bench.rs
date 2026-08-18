@@ -66,8 +66,9 @@ const RESOLVABLE_DELTA_PERCENT: f64 = 2.0;
 /// Milestone families the in-kernel phase profiles publish. A name outside this
 /// list is some other milestone that happens to carry two arguments, and
 /// folding it into the phase table would invent a cost that was never measured.
-const PHASE_PREFIXES: [&str; 4] = [
+const PHASE_PREFIXES: [&str; 5] = [
     "ipc-call-phase-",
+    "ipc-server-phase-",
     "usermem-phase-",
     "lock-phase-",
     "syscall-phase-",
@@ -239,6 +240,28 @@ const ROUND_TRIP_UNIT_PHASE: &str = "ipc-call-phase-copy-request";
 /// How close a phase's sample count must be to the unit's before it can be read
 /// as "once per round trip".
 const ATTRIBUTABLE_RATIO: (f64, f64) = (0.95, 1.05);
+
+/// Whether every phase row divides cleanly into one round trip: the
+/// acceptance test for `--isolate-probe`. A phase absent from the run, or
+/// present but charged by a probe that never reaches `ipc_call` at all
+/// (`ROUND_TRIP_UNIT_PHASE` itself unsampled), does not contradict isolation.
+fn isolation_holds(phases: &[PhaseTotal]) -> bool {
+    let Some(unit) = phases
+        .iter()
+        .find(|phase| phase.name == ROUND_TRIP_UNIT_PHASE)
+        .map(|phase| phase.samples)
+        .filter(|samples| *samples > 0)
+    else {
+        return true;
+    };
+    phases.iter().all(|phase| {
+        if phase.samples == 0 {
+            return true;
+        }
+        let ratio = phase.samples as f64 / unit as f64;
+        (ATTRIBUTABLE_RATIO.0..=ATTRIBUTABLE_RATIO.1).contains(&ratio)
+    })
+}
 
 fn render_phases(phases: &[PhaseTotal]) -> String {
     let mut out = String::new();
@@ -464,6 +487,7 @@ pub(crate) fn bench(
     baseline: Option<&Path>,
     compare: Option<&Path>,
     rustos_vcpus: u8,
+    isolate_probe: Option<&str>,
 ) -> Result<()> {
     // Unconditional, and this is the second measurement bug this lane has had.
     // Building was opt-in, so a run that forgot the flag booted whatever image
@@ -478,31 +502,53 @@ pub(crate) fn bench(
     // interactive topology an ordinary desktop launch brings up. Requiring the
     // end marker is what bounds the run: a guest that never finished must not
     // fall through to parsing a stale log.
-    kvm::kvm_smoke_command(
-        config,
-        [
-            "--gui-dvm-surfaces".to_owned(),
-            "--dvm-network-shmem".to_owned(),
-            "--dvm-block-shmem".to_owned(),
-            "--timeout".to_owned(),
-            "120".to_owned(),
-            // Lock contention is invisible on one CPU: `lock-phase-spin` only
-            // moves when two CPUs actually want the same word. Comparing a
-            // one-vCPU run against a multi-vCPU one is how a sharding or
-            // lock-free change earns its risk.
-            "--rustos-vcpus".to_owned(),
-            rustos_vcpus.to_string(),
-            "--expect".to_owned(),
-            END_MARKER.to_owned(),
-        ]
-        .into_iter(),
-    )
-    .context("boot the interactive topology and wait for the ipcbench end marker")?;
+    let mut kvm_args = vec![
+        "--gui-dvm-surfaces".to_owned(),
+        "--dvm-network-shmem".to_owned(),
+        "--dvm-block-shmem".to_owned(),
+        "--timeout".to_owned(),
+        "120".to_owned(),
+        // Lock contention is invisible on one CPU: `lock-phase-spin` only
+        // moves when two CPUs actually want the same word. Comparing a
+        // one-vCPU run against a multi-vCPU one is how a sharding or
+        // lock-free change earns its risk.
+        "--rustos-vcpus".to_owned(),
+        rustos_vcpus.to_string(),
+        "--expect".to_owned(),
+        END_MARKER.to_owned(),
+    ];
+    if let Some(probe) = isolate_probe {
+        // Every `ipc-call-phase-*`/`usermem-phase-*` counter is process-wide
+        // for the whole boot, so running more than one probe in it makes a
+        // phase's total undivideable by any one probe's round-trip count.
+        // Restricting the boot to one probe is what makes the ratio below
+        // meaningful instead of parenthesised.
+        kvm_args.push("--ipcbench-probe".to_owned());
+        kvm_args.push(probe.to_owned());
+    }
+    kvm::kvm_smoke_command(config, kvm_args.into_iter())
+        .context("boot the interactive topology and wait for the ipcbench end marker")?;
 
     let log_path = config.build_dir.join("kvm/rustos-debugcon.log");
     let log = fs::read_to_string(&log_path)
         .with_context(|| format!("read debugcon log {}", log_path.display()))?;
     let run = parse_log(&log)?;
+
+    if let Some(probe) = isolate_probe {
+        let phases = render_phases(&run.phases);
+        let verdict = if isolation_holds(&run.phases) {
+            "PASS"
+        } else {
+            "FAIL"
+        };
+        println!(
+            "\n=== ipcbench (isolated: {probe}) ==={phases}\nisolation check: {verdict} \
+             (every ipc-call-phase-*/usermem-phase-* row is inside {:.2}..={:.2} per round trip, \
+             or absent)\n",
+            ATTRIBUTABLE_RATIO.0, ATTRIBUTABLE_RATIO.1,
+        );
+        return Ok(());
+    }
 
     let table = render(run.tsc_khz, &run.results, &run.skipped);
     let derived = render_derived(&run.results);
@@ -758,6 +804,53 @@ user-debug payload=ipcbench: end\\n";
         assert!(rendered.contains("1.00"), "{rendered}");
         assert!(rendered.contains("(14.62)"), "{rendered}");
         assert!(rendered.contains("shared with other probes"), "{rendered}");
+    }
+
+    #[test]
+    fn isolation_holds_when_every_phase_divides_cleanly() {
+        let phases = vec![
+            PhaseTotal {
+                name: String::from("ipc-call-phase-copy-request"),
+                cycles: 1_762 * 22_987,
+                samples: 22_987,
+            },
+            PhaseTotal {
+                name: String::from("ipc-call-phase-write-response"),
+                cycles: 1_618 * 22_958,
+                samples: 22_958,
+            },
+        ];
+        assert!(isolation_holds(&phases));
+    }
+
+    #[test]
+    fn isolation_fails_when_a_phase_is_charged_by_more_than_the_round_trip() {
+        let phases = vec![
+            PhaseTotal {
+                name: String::from("ipc-call-phase-copy-request"),
+                cycles: 1_762 * 22_987,
+                samples: 22_987,
+            },
+            PhaseTotal {
+                name: String::from("usermem-phase-bind-visible"),
+                cycles: 677 * 335_989,
+                samples: 335_989,
+            },
+        ];
+        assert!(!isolation_holds(&phases));
+    }
+
+    #[test]
+    fn isolation_holds_vacuously_when_the_probe_charges_no_ipc_call_phase() {
+        // Isolating `vmexit_cpuid` charges nothing in either family, so there
+        // is no round trip to divide and nothing to contradict isolation.
+        assert!(isolation_holds(&[]));
+        let phases = vec![PhaseTotal {
+            name: String::from("usermem-phase-bind-visible"),
+            cycles: 677 * 12,
+            samples: 12,
+        }];
+        assert!(isolation_holds(&phases));
     }
 
     #[test]

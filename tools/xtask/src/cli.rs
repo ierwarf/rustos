@@ -58,19 +58,26 @@ enum XtaskCommand {
     Bench {
         /// Write the rendered table to this path so a regression is visible in
         /// a diff instead of only in a terminal that has scrolled away.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "isolate_probe")]
         baseline: Option<PathBuf>,
         /// Compare this run's `min` column against a previously written table,
         /// with the hardware anchor reported first. Every figure in this lane
         /// is an invariant-TSC tick, so a host clock change moves every probe
         /// at once and reads as an improvement; the anchor is what separates
         /// the two.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "isolate_probe")]
         compare: Option<PathBuf>,
         /// Lock contention only exists with more than one CPU wanting the same
         /// word, so a contention claim needs a run at more than one.
         #[arg(long = "rustos-vcpus", default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=8))]
         rustos_vcpus: u8,
+        /// Reboot with `ipcbench` restricted to this one probe, so its
+        /// `ipc-call-phase-*` / `usermem-phase-*` counters belong to that probe
+        /// alone for the whole boot instead of being summed across every probe
+        /// the harness runs. Prints the isolated phase table only; the ordinary
+        /// probe-timing table needs the unrestricted run.
+        #[arg(long = "isolate-probe")]
+        isolate_probe: Option<String>,
     },
     Selftest,
     #[command(name = "fuzz-host")]
@@ -177,11 +184,13 @@ pub(crate) fn run() -> Result<()> {
             baseline,
             compare,
             rustos_vcpus,
+            isolate_probe,
         }) => crate::bench::bench(
             &config,
             baseline.as_deref(),
             compare.as_deref(),
             rustos_vcpus,
+            isolate_probe.as_deref(),
         ),
         Some(XtaskCommand::Selftest) => testinfra::selftest(&config),
         Some(XtaskCommand::FuzzHost {

@@ -100,6 +100,7 @@ struct SmokeOptions {
     smp_evidence_cohort: Option<String>,
     physical_gpu_bdf: Option<String>,
     physical_gpu_firmware: Option<PathBuf>,
+    ipcbench_probe: Option<String>,
     min_ui_fps: Option<u32>,
     ui_proof_windows: usize,
     recovery_probe: RecoveryProbe,
@@ -438,6 +439,7 @@ pub(crate) fn kvm_run_command(
         smp_evidence_cohort: None,
         physical_gpu_bdf: None,
         physical_gpu_firmware: None,
+        ipcbench_probe: None,
         min_ui_fps: None,
         ui_proof_windows: DEFAULT_UI_FPS_ACTIVE_WINDOWS,
         recovery_probe: RecoveryProbe::None,
@@ -726,6 +728,7 @@ where
         smp_evidence_cohort: None,
         physical_gpu_bdf: None,
         physical_gpu_firmware: None,
+        ipcbench_probe: None,
         min_ui_fps: None,
         ui_proof_windows: DEFAULT_UI_FPS_ACTIVE_WINDOWS,
         recovery_probe: RecoveryProbe::None,
@@ -773,6 +776,22 @@ where
                     bail!("physical GPU firmware was supplied more than once");
                 }
                 options.physical_gpu_firmware = Some(PathBuf::from(next_value(&mut args, &arg)?));
+            }
+            "--ipcbench-probe" => {
+                if options.ipcbench_probe.is_some() {
+                    bail!("--ipcbench-probe was supplied more than once");
+                }
+                let probe = next_value(&mut args, "--ipcbench-probe")?;
+                if probe.is_empty()
+                    || !probe
+                        .bytes()
+                        .all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
+                {
+                    bail!(
+                        "--ipcbench-probe must be a non-empty name of letters, digits, and underscores, got {probe}"
+                    );
+                }
+                options.ipcbench_probe = Some(probe);
             }
             "--min-ui-fps" => {
                 let value = next_value(&mut args, "--min-ui-fps")?;

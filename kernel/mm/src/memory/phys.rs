@@ -241,6 +241,32 @@ impl PhysAllocatorState {
         self.alloc_contiguous_bounded_locked(page_count, self.frame_count)
     }
 
+    /// Fills `out` with up to `out.len()` single frames under one lock hold,
+    /// stopping at the first allocation failure. Unlike
+    /// `alloc_contiguous_locked`, frames need not be adjacent — callers that
+    /// map each page independently (a process's private address space) should
+    /// use this instead of a contiguous run, which is a strictly harder
+    /// search this caller does not need and can fail under fragmentation
+    /// where single-frame allocation would not.
+    fn alloc_frames_locked(&mut self, out: &mut [PhysAddr]) -> usize {
+        let mut filled = 0;
+        while filled < out.len() {
+            let faulted = nucleus_core::util::fault_injection::should_fail("alloc.frame");
+            if faulted {
+                crate::debug::warn!(memory, "fault injection: alloc.frame failed");
+                break;
+            }
+            match self.alloc_contiguous_bounded_locked(1, self.frame_count) {
+                Some(addr) => {
+                    out[filled] = addr;
+                    filled += 1;
+                }
+                None => break,
+            }
+        }
+        filled
+    }
+
     fn alloc_contiguous_bounded_locked(
         &mut self,
         page_count: usize,
@@ -399,6 +425,28 @@ impl PhysAllocatorState {
         self.free_frames = self.free_frames.saturating_add(1);
         self.next_hint = self.next_hint.min(frame_index);
         Ok(())
+    }
+
+    /// Frees every frame in `frames` under one lock hold. Every failure is
+    /// recorded into `failures` (best-effort — extras past its capacity are
+    /// dropped from the count only, not silently lost from the free itself)
+    /// so the caller can log outside the lock; `free_frame_locked` continues
+    /// past a rejected frame rather than aborting the batch.
+    fn free_frames_locked(
+        &mut self,
+        frames: &[PhysAddr],
+        failures: &mut [(PhysAddr, FreeFrameError)],
+    ) -> usize {
+        let mut failed = 0;
+        for &phys in frames {
+            if let Err(err) = self.free_frame_locked(phys) {
+                if let Some(slot) = failures.get_mut(failed) {
+                    *slot = (phys, err);
+                }
+                failed += 1;
+            }
+        }
+        failed
     }
 }
 
@@ -575,6 +623,28 @@ pub fn alloc_contiguous_below(page_count: usize, max_phys_addr_inclusive: u64) -
 
 pub fn try_free_frame(phys: PhysAddr) -> Result<(), FreeFrameError> {
     irq_safe(|| PHYS_ALLOCATOR.lock().free_frame_locked(phys))
+}
+
+/// Fills `out` with independent (not necessarily adjacent) frames under one
+/// lock acquisition, for callers that would otherwise call `alloc_frame` once
+/// per page in a loop — a process's private address-space population is the
+/// motivating case. Returns the number of frames actually filled; a short
+/// fill (fewer than `out.len()`) means the allocator ran out, mirroring what
+/// a per-page `alloc_frame()` loop would have found on its next iteration.
+pub fn alloc_frames_batch(out: &mut [PhysAddr]) -> usize {
+    irq_safe(|| PHYS_ALLOCATOR.lock().alloc_frames_locked(out))
+}
+
+/// Frees every frame in `frames` under one lock acquisition. Failures are
+/// written into `failures` (per-slot, extras beyond its length are counted
+/// but not recorded) so the caller can log them *after* the lock and any
+/// IRQ-off region has already ended — logging must never happen while
+/// `PHYS_ALLOCATOR` is held. Returns the number of failures.
+pub fn try_free_frames_batch(
+    frames: &[PhysAddr],
+    failures: &mut [(PhysAddr, FreeFrameError)],
+) -> usize {
+    irq_safe(|| PHYS_ALLOCATOR.lock().free_frames_locked(frames, failures))
 }
 
 pub fn free_frame(phys: PhysAddr) {
@@ -861,6 +931,60 @@ mod tests {
             .alloc_contiguous_locked(2)
             .expect("allocator should use the last valid contiguous range");
         assert_eq!(allocated.as_u64(), PAGE_SIZE * 6);
+    }
+
+    #[test]
+    fn batch_alloc_fills_distinct_frames_under_one_lock_hold() {
+        let mut bitmap = [u64::MAX; 1];
+        let mut state = test_state(&mut bitmap, 8, 0);
+
+        let mut out = [PhysAddr::new(0); 5];
+        let filled = state.alloc_frames_locked(&mut out);
+        assert_eq!(filled, 5);
+
+        let mut seen: alloc::vec::Vec<u64> = out.iter().map(|frame| frame.as_u64()).collect();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), 5, "batch must not repeat a frame");
+        assert_eq!(state.free_frames, 3);
+    }
+
+    #[test]
+    fn batch_alloc_short_fills_when_the_allocator_runs_out() {
+        let mut bitmap = [u64::MAX; 1];
+        let mut state = test_state(&mut bitmap, 3, 0);
+
+        let mut out = [PhysAddr::new(0); 5];
+        let filled = state.alloc_frames_locked(&mut out);
+        assert_eq!(filled, 3, "only 3 frames exist to give");
+        assert_eq!(state.free_frames, 0);
+    }
+
+    #[test]
+    fn batch_free_returns_every_frame_and_reports_every_failure() {
+        let mut bitmap = [u64::MAX; 1];
+        let mut state = test_state(&mut bitmap, 8, 0);
+
+        let mut allocated = [PhysAddr::new(0); 4];
+        assert_eq!(state.alloc_frames_locked(&mut allocated), 4);
+        assert_eq!(state.free_frames, 4);
+
+        // Free three real frames plus one already-free frame, which must be
+        // reported as a failure without aborting the rest of the batch.
+        let already_free = PhysAddr::new(PAGE_SIZE * 7);
+        let to_free = [allocated[0], allocated[1], already_free, allocated[2]];
+        let mut failures = [(PhysAddr::new(0), FreeFrameError::AlreadyFree); 4];
+        let failed = state.free_frames_locked(&to_free, &mut failures);
+
+        assert_eq!(failed, 1);
+        assert_eq!(failures[0], (already_free, FreeFrameError::AlreadyFree));
+        // The three real frees landed even though one entry in the batch failed.
+        assert_eq!(state.free_frames, 7);
+        assert!(!state.is_used((allocated[0].as_u64() / PAGE_SIZE) as usize));
+        assert!(!state.is_used((allocated[1].as_u64() / PAGE_SIZE) as usize));
+        assert!(!state.is_used((allocated[2].as_u64() / PAGE_SIZE) as usize));
+        // The fourth allocated frame was never included in the free batch.
+        assert!(state.is_used((allocated[3].as_u64() / PAGE_SIZE) as usize));
     }
 
     #[test]

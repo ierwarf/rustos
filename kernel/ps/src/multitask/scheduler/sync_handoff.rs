@@ -102,13 +102,49 @@ impl SyncHandoffRecord {
                 owner_generation,
                 target_cpu,
             } => {
-                owner.generation == owner_generation
-                    && owner.cpu == Some(target_cpu)
-                    && owner.runnable
-                    && matches!(
-                        owner.state,
-                        runqueue::RunOwnerState::Local | runqueue::RunOwnerState::RemoteQueued
-                    )
+                // Each condition below is negated with `!(...)` rather than
+                // by flipping its operator: `formal/implementation-mutations.tsv`
+                // pins the positive comparison's exact source text
+                // (sync-handoff-owner-{cpu,generation}-bypass) to mutate it.
+                #[allow(clippy::nonminimal_bool)]
+                if !(owner.generation == owner_generation) {
+                    #[cfg(rustos_scheduler_phase_profile)]
+                    {
+                        super::locality::record_sync_handoff_reply_custody_fail(
+                            super::locality::SyncHandoffReplyCustodyFailReason::Generation,
+                        );
+                        super::locality::record_sync_handoff_generation_fail_state(
+                            owner.state as usize,
+                        );
+                    }
+                    return false;
+                }
+                #[allow(clippy::nonminimal_bool)]
+                if !(owner.cpu == Some(target_cpu)) {
+                    #[cfg(rustos_scheduler_phase_profile)]
+                    super::locality::record_sync_handoff_reply_custody_fail(
+                        super::locality::SyncHandoffReplyCustodyFailReason::Cpu,
+                    );
+                    return false;
+                }
+                if !owner.runnable {
+                    #[cfg(rustos_scheduler_phase_profile)]
+                    super::locality::record_sync_handoff_reply_custody_fail(
+                        super::locality::SyncHandoffReplyCustodyFailReason::NotRunnable,
+                    );
+                    return false;
+                }
+                if !matches!(
+                    owner.state,
+                    runqueue::RunOwnerState::Local | runqueue::RunOwnerState::RemoteQueued
+                ) {
+                    #[cfg(rustos_scheduler_phase_profile)]
+                    super::locality::record_sync_handoff_reply_custody_fail(
+                        super::locality::SyncHandoffReplyCustodyFailReason::State,
+                    );
+                    return false;
+                }
+                true
             }
         }
     }
@@ -230,6 +266,10 @@ impl SyncHandoffState {
         mut ready: impl FnMut(SyncHandoffRecord) -> bool,
     ) -> Option<usize> {
         if self.handoff_streak >= MAX_CONSECUTIVE_SYNC_HANDOFFS {
+            #[cfg(rustos_scheduler_phase_profile)]
+            super::locality::record_sync_handoff_miss(
+                super::locality::SyncHandoffMissReason::StreakCapped,
+            );
             return None;
         }
         while self.len != 0 {
@@ -243,6 +283,8 @@ impl SyncHandoffState {
                 return Some(record.slot);
             }
         }
+        #[cfg(rustos_scheduler_phase_profile)]
+        super::locality::record_sync_handoff_miss(super::locality::SyncHandoffMissReason::DrainedStale);
         None
     }
 
@@ -383,11 +425,14 @@ fn enqueue_reply_wake_after_catalog(
 /// changed owner generation, target CPU, terminal state, or withdrawn
 /// runnability merely drops urgency; it can never publish another owner.
 pub(super) fn enqueue_reply_wake(token: ReplyWakeHandoff) -> bool {
-    enqueue_reply_wake_after_catalog(
+    let accepted = enqueue_reply_wake_after_catalog(
         token,
         ReplyWakeHandoff::owner_still_matches,
         enqueue_and_publish,
-    )
+    );
+    #[cfg(rustos_scheduler_phase_profile)]
+    super::locality::record_sync_handoff_arm(super::locality::SyncHandoffArmSite::Reply, accepted);
+    accepted
 }
 
 /// Consumes this CPU's FIFO while the scheduler catalog validates each exact

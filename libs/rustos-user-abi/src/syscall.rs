@@ -123,6 +123,12 @@ pub const SYS_RUSTOS_IPC_CALL_WITH_HANDLES_BOUNDED: u64 = 0x5255_0045;
 /// QNX spells it `MsgReceive` under `TimerTimeout`. The endpoint is already a
 /// multi-sender object here, so the deadline was the only missing half.
 pub const SYS_RUSTOS_IPC_RECV_WITH_SENDER_BOUNDED: u64 = 0x5255_004a;
+/// Flushes the `ipc-call-phase-*`/`usermem-phase-*` diagnostics immediately
+/// instead of waiting for their ordinary once-per-second housekeeping drain.
+/// Diagnostics only: nothing reads these counters to make a decision, and
+/// this syscall grants no authority. `ipcbench --isolate-probe` is the sole
+/// caller, bracketing one probe's measurement window with it.
+pub const SYS_RUSTOS_PHASE_PROFILE_DRAIN: u64 = 0x5255_004b;
 /// Emits one kernel-timestamped, fixed-name product acceptance milestone.
 ///
 /// This is observability only: it grants no authority and accepts only the

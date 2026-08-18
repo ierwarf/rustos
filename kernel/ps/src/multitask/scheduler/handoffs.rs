@@ -237,6 +237,11 @@ impl Scheduler {
     /// overwrite older custody.
     pub(in crate::multitask) fn set_next_synchronous_pick_hint(&mut self, task_id: u64) -> bool {
         let Some(slot) = self.find_task_slot(task_id) else {
+            #[cfg(rustos_scheduler_phase_profile)]
+            super::locality::record_sync_handoff_arm(
+                super::locality::SyncHandoffArmSite::Call,
+                false,
+            );
             return false;
         };
         // Admission into a pick-hint queue is the same question whichever
@@ -248,9 +253,16 @@ impl Scheduler {
             || !self.slot_is_runnable(slot)
             || !self.handoff_slot_ready(slot)
         {
+            #[cfg(rustos_scheduler_phase_profile)]
+            super::locality::record_sync_handoff_arm(
+                super::locality::SyncHandoffArmSite::Call,
+                false,
+            );
             return false;
         }
         self.enqueue_synchronous_handoff_slot(slot);
+        #[cfg(rustos_scheduler_phase_profile)]
+        super::locality::record_sync_handoff_arm(super::locality::SyncHandoffArmSite::Call, true);
         true
     }
 
@@ -360,12 +372,36 @@ impl Scheduler {
     /// The exact validation predicate is shared by the static production
     /// backend and each test scheduler's isolated `SyncHandoffState`.
     fn synchronous_handoff_record_is_ready(&self, record: sync_handoff::SyncHandoffRecord) -> bool {
-        self.starts
+        let identity_matches = self
+            .starts
             .get(record.slot())
             .and_then(|start| *start)
-            .is_some_and(|start| start.id == record.task_id())
-            && record.has_current_dispatch_custody()
-            && self.pick_hint_candidate_slot(Some(record.slot())).is_some()
+            .is_some_and(|start| start.id == record.task_id());
+        if !identity_matches {
+            #[cfg(rustos_scheduler_phase_profile)]
+            super::locality::record_sync_handoff_stale(
+                super::locality::SyncHandoffStaleReason::Identity,
+            );
+            return false;
+        }
+        if !record.has_current_dispatch_custody() {
+            #[cfg(rustos_scheduler_phase_profile)]
+            super::locality::record_sync_handoff_stale(
+                super::locality::SyncHandoffStaleReason::Custody,
+            );
+            return false;
+        }
+        // `!...is_some()` rather than `.is_none()`: `run-source-conformance.sh`
+        // pins the `.is_some()` substring literally.
+        #[allow(clippy::nonminimal_bool)]
+        if !self.pick_hint_candidate_slot(Some(record.slot())).is_some() {
+            #[cfg(rustos_scheduler_phase_profile)]
+            super::locality::record_sync_handoff_stale(
+                super::locality::SyncHandoffStaleReason::NotCandidate,
+            );
+            return false;
+        }
+        true
     }
 
     pub(super) fn take_next_synchronous_pick_hint_ready_slot(&self) -> Option<usize> {
@@ -380,6 +416,10 @@ impl Scheduler {
             // taking its lock can find anything, which on most dispatches it
             // cannot.
             if !sync_handoff::pending(cpu) {
+                #[cfg(rustos_scheduler_phase_profile)]
+                super::locality::record_sync_handoff_miss(
+                    super::locality::SyncHandoffMissReason::QueueEmpty,
+                );
                 return None;
             }
             sync_handoff::take_next_ready(cpu, |record| {

@@ -155,6 +155,14 @@ const PRIVATE_ACCEPTANCE_CONTRACT_PATH: &str = "system/registry/system/kvm-accep
 // qualification workload.
 const PRIVATE_SMP_QUALIFICATION_CONTRACT_PATH: &str =
     "system/registry/system/kvm-smp-qualification-v1.env";
+// Isolates the in-kernel `ipc-call-phase-*` / `usermem-phase-*` counters to
+// one `ipcbench` probe per boot: they are process-wide, so any other probe
+// sharing the boot would charge the same window and make its phase totals
+// undivideable by one round trip. `ipcbench` reads this directly, the same
+// way `uiserver` reads the acceptance contract above, so no service mediates
+// it.
+const PRIVATE_IPCBENCH_PROBE_CONTRACT_PATH: &str =
+    "system/registry/system/ipcbench-probe-v1.env";
 const SMP_QUALIFICATION_WORK_UNITS: u64 = 1_000_000;
 const SMP_QUALIFICATION_DEADLINE_MS: u64 = 5_000;
 const SMP_QUALIFICATION_DEADLINE_US: u64 = SMP_QUALIFICATION_DEADLINE_MS * 1_000;

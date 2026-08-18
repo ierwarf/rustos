@@ -2873,6 +2873,10 @@ impl Scheduler {
             .is_none()
             .then(|| timed_handoff_step(1, || self.take_next_synchronous_pick_hint_ready_slot()))
             .flatten();
+        #[cfg(rustos_scheduler_phase_profile)]
+        if sync_handoff.is_some() {
+            locality::record_sync_handoff_hit();
+        }
         let mut policy = timed_handoff_step(6, || self.current_dispatch_policy());
         let (next_idx, ipc_handoff, reserved_user_pick, latency_handoff_pick, sync_handoff_pick) =
             match atomic_activation_handoff {

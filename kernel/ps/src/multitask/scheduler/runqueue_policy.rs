@@ -88,6 +88,16 @@ impl Scheduler {
     /// build.  Callers that already have an exact target (the outgoing CPU of
     /// an assembly transition, for example) use this rather than recreating
     /// the publication protocol around a test-only mirror.
+    ///
+    /// When `target` is the CPU already executing this wake, the mailbox
+    /// round trip is unnecessary — nothing needs cross-CPU synchronization to
+    /// touch a local runqueue we already exclusively own via the scheduler
+    /// guard — so this publishes directly (`publish_local_wake`) instead of
+    /// going through `publish_remote_wake`'s Blocked -> RemoteQueued -> Local
+    /// two-step. See `publish_local_wake`'s doc comment for why the two-step
+    /// path's second, deferred generation bump matters: it is what made a
+    /// same-CPU synchronous-IPC reply-wake token observe a generation one
+    /// past what it captured, deterministically, every time.
     pub(super) fn publish_runqueue_wake_to(
         &self,
         slot: usize,
@@ -96,7 +106,11 @@ impl Scheduler {
         let Some(context) = self.contexts[slot] else {
             return runqueue::RemoteWakeOutcome::Rejected;
         };
-        let outcome = runqueue::publish_remote_wake(slot, target, context.weight);
+        let outcome = if target == Self::current_dispatch_cpu() {
+            runqueue::publish_local_wake(slot, target, context.weight)
+        } else {
+            runqueue::publish_remote_wake(slot, target, context.weight)
+        };
         #[cfg(not(test))]
         if let runqueue::RemoteWakeOutcome::Published { cpu, notify: true } = outcome {
             // Notification only shortens the latency to observe the already

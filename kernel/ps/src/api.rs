@@ -379,7 +379,7 @@ pub mod wait {
     }
 }
 
-pub use crate::user::sysops::drain_user_copy_profile;
+pub use crate::user::sysops::{drain_user_copy_profile, force_drain_user_copy_profile};
 
 pub use boot::{is_initialized, service_deferred_work, start, start_secondary_cpu};
 pub use fault::{halt_current_retired_task, retire_current_user_task_due_to_fault};

@@ -26,8 +26,10 @@ fn prepare_layout(config: &Config, options: &SmokeOptions) -> Result<KvmLayout> 
     // snapshot mode below protects it from guest writes, avoiding a full disk
     // copy on every F5. Only proof options that patch private boot content
     // receive a per-run image.
-    let needs_private_contracts =
-        options.min_ui_fps.is_some() || options.exercise_network || options.smp_ring3_qualification;
+    let needs_private_contracts = options.min_ui_fps.is_some()
+        || options.exercise_network
+        || options.smp_ring3_qualification
+        || options.ipcbench_probe.is_some();
     let runtime_disk = if needs_private_contracts {
         let runtime_disk = run_dir.join("rustos-kvm.img");
         fs::copy(&config.boot_disk_image, &runtime_disk).with_context(|| {
@@ -50,6 +52,7 @@ fn prepare_layout(config: &Config, options: &SmokeOptions) -> Result<KvmLayout> 
             options
                 .smp_ring3_qualification
                 .then_some(options.rustos_vcpus),
+            options.ipcbench_probe.as_deref(),
         )?;
     }
     let display_backing_dir = if options.gui_dvm_surfaces {
@@ -520,12 +523,17 @@ fn render_smp_ring3_qualification_contract(workers: u8) -> String {
     )
 }
 
+fn render_ipcbench_probe_contract(probe: &str) -> String {
+    format!("contract=rustos-ipcbench-probe-v1\nprobe={probe}\n")
+}
+
 /// Write every per-run KVM contract through one mounted private FAT image.
 /// Acceptance-v1 stays verbatim; Ring3 uses a disjoint path and proof mode.
 fn write_private_kvm_contracts(
     runtime_disk: &Path,
     acceptance: Option<(bool, bool)>,
     smp_ring3_workers: Option<u8>,
+    ipcbench_probe: Option<&str>,
 ) -> Result<()> {
     let disk = std::fs::OpenOptions::new()
         .read(true)
@@ -556,6 +564,15 @@ fn write_private_kvm_contracts(
                 })?;
             contract.truncate()?;
             let contents = render_smp_ring3_qualification_contract(workers);
+            FatWrite::write_all(&mut contract, contents.as_bytes())?;
+            FatWrite::flush(&mut contract)?;
+        }
+        if let Some(probe) = ipcbench_probe {
+            let mut contract = root
+                .create_file(PRIVATE_IPCBENCH_PROBE_CONTRACT_PATH)
+                .context("create private KVM ipcbench probe contract file")?;
+            contract.truncate()?;
+            let contents = render_ipcbench_probe_contract(probe);
             FatWrite::write_all(&mut contract, contents.as_bytes())?;
             FatWrite::flush(&mut contract)?;
         }

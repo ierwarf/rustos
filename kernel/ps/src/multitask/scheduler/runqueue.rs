@@ -544,6 +544,49 @@ pub(super) fn publish_blocked(slot: usize, cpu: usize, weight: u32) {
     RUN_QUEUES[cpu].publish_load(&rq);
 }
 
+/// Same-CPU counterpart to `publish_remote_wake`: when a wake's target CPU is
+/// the CPU already executing the wake, publish directly into the local
+/// runqueue in one step (`publish_local`, the same Blocked -> Local
+/// transition Balance already performs for the outgoing task) instead of
+/// round-tripping through the cross-CPU mailbox.
+///
+/// The mailbox path is correct but not free: it always transitions
+/// Blocked -> RemoteQueued -> Local, two separate owner-generation bumps, the
+/// second one (`drain_remote_wakes`, run unconditionally by every dispatch's
+/// Balance phase) landing before the *same* dispatch's Select phase ever
+/// checks anything that captured the first bump's generation. A synchronous
+/// IPC reply-wake token is exactly such a capture
+/// (`SyncHandoffCustody::ReplyWake`, `sync_handoff.rs`): minted right after
+/// the RemoteQueued transition, checked one phase later in the very next
+/// dispatch, by which time Balance has already promoted it past that
+/// generation — a mismatch on every same-CPU reply-wake, deterministically,
+/// not a contention-dependent race. Skipping the mailbox for the same-CPU
+/// case removes the extra hop, so the token's captured generation is the one
+/// it is actually checked against.
+///
+/// Mirrors `publish_remote_wake`'s exact state dispatch (terminal/Dormant
+/// rejects, already-owned states dedup, only `Blocked` proceeds) so every
+/// caller's existing rejection/dedup contract is unchanged; only the
+/// mechanism for the `Blocked` case differs.
+pub(super) fn publish_local_wake(slot: usize, cpu: usize, weight: u32) -> RemoteWakeOutcome {
+    validate_cpu(cpu);
+    let owner = owner(slot);
+    if owner.state.is_terminal() || owner.state == RunOwnerState::Dormant {
+        return RemoteWakeOutcome::Rejected;
+    }
+    if matches!(
+        owner.state,
+        RunOwnerState::Local | RunOwnerState::RemoteQueued | RunOwnerState::Running
+    ) {
+        return RemoteWakeOutcome::AlreadyOwned { cpu: owner.cpu };
+    }
+    if owner.state != RunOwnerState::Blocked {
+        return RemoteWakeOutcome::Rejected;
+    }
+    publish_local(slot, cpu, weight);
+    RemoteWakeOutcome::Published { cpu, notify: false }
+}
+
 pub(super) fn publish_remote_wake(
     slot: usize,
     target_cpu: usize,

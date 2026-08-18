@@ -496,12 +496,26 @@ change here; four separate plans have been refuted by its numbers.
 | `enqueue-runtime` | 4,051 | 1.00 | 4,051 |
 | `wait-arm` | 2,897 | 1.00 | 2,897 |
 
-**81% of the round trip is unmeasured, and that is the ceiling.** Every
-`IpcCallPhase` is charged from the *caller*; `ipc_reply_recv.rs` has zero
-`charge_phase` calls. And `ipcbench` runs every probe in one boot with
-system-wide counters, so only four phases divide into one round trip. Fix the
-instrumentation before naming a target — four plans that did not are recorded as
-refuted.
+**Stage 0 closed the caller-only blind spot; the round trip is now 61-67%
+attributed, not 81% unmeasured.** `cargo xtask bench --isolate-probe <name>`
+(Stage 0a) makes four syscall-path phases (`copy-request`, `enqueue`,
+`write-response`, `enqueue-deadline`) divide exactly into one round trip
+(ratio 1.00). `kernel/compat/src/user/syscall/linux/ipc_server_profile.rs`
+(Stage 0b) adds four receiver-side phases (`recv-take`, `recv-write`,
+`reply-publish`, `reply-wake`), ablated free (-0.5%, inside the ±2% floor),
+shipped unconditional. Stage 1 decoded one `kernel-scheduler-phase-*` window
+to size the dispatch chain and self-corrected a double-count: the 20.5% of
+scheduler lock-hold time not covered by the seven named phases is not new
+dark cost, it is six `current.rs` functions each called *from inside* a
+phase already charged elsewhere. Net accounting: 4 clean caller phases
+(14,224 ticks) + 4 Stage 0b receiver phases (~14,414, approximate) +
+dispatch chain (~19,200-24,050, historical estimate, not independently
+re-verified) ≈ 48,000-53,000 of 78,080 ticks. What is still dark is the two
+blocked transitions' architectural mechanics and the syscall entry/exit
+floor (~4,920 ticks for three syscalls) — not a new target, the same one
+this lane already had. Full detail, including the receiver-phase and
+dispatch-chain writeups: `docs/benchmarks/README.md`, "Instrumenting the
+receiver side" and "Sizing the dark ticks with what Stage 0 built".
 
 **Do not propose another acquisition fusion.** Three attempts reached the floor:
 the reply-wait poll budget is a *net loss* (an arm costs 2,897, a take 2,350, and

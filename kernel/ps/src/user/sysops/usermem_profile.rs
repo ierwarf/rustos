@@ -89,6 +89,13 @@ pub fn drain_user_copy_profile() -> usize {
     )
 }
 
+/// Emits and clears the current window immediately, bypassing the one-second
+/// gate. See `force_drain_ipc_call_profile` for why an isolated probe needs
+/// this instead of waiting for the ordinary housekeeping cadence.
+pub fn force_drain_user_copy_profile() -> usize {
+    PROFILE.drain(crate::arch::rtc::ticks(), 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -94,6 +94,20 @@ pub(super) fn syscall_linux_rustos_product_milestone(milestone: u64, arg0: u64, 
     0
 }
 
+/// Flushes the IPC-call and user-copy phase profiles immediately instead of
+/// waiting for their ordinary once-per-second housekeeping drain. Diagnostics
+/// only: nothing reads these counters to make a decision, and this grants no
+/// authority beyond emitting the same milestones housekeeping would emit
+/// anyway. `ipcbench --isolate-probe` is the sole caller, bracketing one
+/// probe's own measurement window so a probe that finishes inside one window
+/// cannot leave its tail-end charges stranded, undrained, and invisible to a
+/// log capture that stops as soon as the probe's own end marker appears.
+pub(super) fn syscall_linux_rustos_phase_profile_drain() -> u64 {
+    (super::ipc_profile::force_drain_ipc_call_profile()
+        + super::ipc_server_profile::force_drain_ipc_server_profile()
+        + kernel_ps::api::force_drain_user_copy_profile()) as u64
+}
+
 pub(super) fn linux_errno(errno: i64) -> u64 {
     (-errno) as u64
 }

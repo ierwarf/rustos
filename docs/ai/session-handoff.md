@@ -6,15 +6,20 @@ command output win when they disagree with this page.
 
 ## Current checkout snapshot
 
-Recorded 2026-08-18. **This block is the only current-state section.**
+Recorded 2026-08-18 (updated same day, later in the session — Stage 2 and
+the wake-path fix landed and were committed after everything below through
+"Stage 1" was written). **This block is the only current-state section.**
 Everything from "Session log" onward is a dated chronological archive, oldest
-first, containing claims that were true when written and several that were later
-corrected in place further down. Read this block, then search the archive for a
-topic; never read it top-down and treat what you hit first as current.
+first, containing claims that were true when written and several that were
+later corrected in place further down. Read this block, then search the
+archive for a topic; never read it top-down and treat what you hit first as
+current.
 
-- The worktree is **clean** and the `pr` profile seals. Earlier revisions of this
-  block said the tree was intentionally dirty; that has not been true since
-  2026-08-17.
+- The worktree is **clean**; Stage 0a, 0b, and Stage 2 (see below) are
+  **committed**.
+- `ipc_rt_intra_process` is **70,120** invariant-TSC ticks, down from 73,760
+  (the Stage 0/1 figure below) and 397,040 originally. See "Stage 2" below —
+  the drop is a real fix, not a re-measurement.
 - The active lane is synchronous IPC and syscall entry cost.
   `docs/benchmarks/README.md` is the evidence and
   `docs/ai/performance-hardening.md` has the routing rules. **Both outrank this
@@ -53,6 +58,200 @@ one.
 **Next work is instrumentation, not optimisation.** No target may be named until
 a phase total divides into one round trip. `cargo xtask bench` now prints that
 ratio and parenthesises it when it does not hold.
+
+### Stage 0a landed, partially: `cargo xtask bench --isolate-probe <name>`
+
+Restricts `ipcbench` to one probe per boot (private KVM contract at
+`system/registry/system/ipcbench-probe-v1.env`, read directly by `ipcbench`
+the way `uiserver` reads its own acceptance contract — no service mediates
+it) plus a 15-second post-readiness settle and a new diagnostic syscall,
+`SYS_RUSTOS_PHASE_PROFILE_DRAIN`, that flushes the IPC-call and user-copy
+phase windows immediately instead of waiting for their once-per-second
+housekeeping drain. Full writeup and the exact ratios:
+`docs/benchmarks/README.md`, "Isolating one probe per boot".
+
+**Result: two of the section's premises were wrong, found by booting rather
+than by reasoning about it.** The four phases charged once per syscall-path
+call now attribute **exactly** (ratio 1.00, verified against a real boot).
+The phases charged once per *endpoint* call, and every `usermem-phase-*`,
+still read 1.4x–7x high in the cleanest run — down from ratios in the
+thousands, but not inside the 0.95–1.05 band. Tripling the settle from 15s to
+45s moved these by under 10%, so it is **steady-state** desktop traffic
+(most likely uiserver's own compositor/Wayland loop, which shares these
+global counters), not a decaying startup burst, and more settle time will not
+close it. `ipcbench` cannot run without `--gui-dvm-surfaces` — without it,
+uiserver's `open_display` polls forever and the session catalog never
+launches `ipcbench` at all — so this topology, and this noise floor, is not
+avoidable by a smaller flag change.
+
+**Decision made by the user (2026-08-18, same session):** (a) — proceed with
+the four clean syscall-path phases; treat endpoint-call/usermem phases as
+bounded-but-imprecise rather than blocking on (b) or (c).
+
+### Stage 0b landed: receiver-side phases, ablated, unconditional
+
+`kernel/compat/src/user/syscall/linux/ipc_server_profile.rs` adds four
+phases mirroring the caller's four clean ones — `recv-take`, `recv-write`,
+`reply-publish`, `reply-wake` — charged in `recv_with_sender_blocking_prepared`
+and `syscall_linux_rustos_ipc_reply` (the exact two syscalls `ipcbench`'s
+server uses; the plain `syscall_linux_rustos_ipc_recv` and combined
+`ipc_reply_recv_with_sender` paths are not instrumented yet, a scoping
+choice). Full writeup: `docs/benchmarks/README.md`, "Instrumenting the
+receiver side".
+
+**Ablated in-session** (stub `now`/`charge` to constants, rebuild, boot,
+compare against the unstubbed build with the anchor held at +1.0%):
+`ipc_rt_intra_process` moved **-0.5% normalized** — inside the ±2% floor.
+Unlike `[lock_telemetry]`/`[scheduler_telemetry]`/`[syscall_telemetry]`
+(16-28% each), this one costs nothing measurable and ships **unconditional**,
+no `[ipc_telemetry]` gate needed.
+
+**Attribution:** all four land at 1.34x-1.35x per round trip under
+`--isolate-probe` — the same band as the caller's endpoint-call phases, for
+the same reason (any receiver on this path charges them, not only
+`ipcbench`'s own server). They join the bounded-but-imprecise bucket, not the
+four clean ones. Per-operation costs, less sensitive to the sample-count
+contamination: `recv-write` ~4,535 cyc, `reply-publish` ~5,782 cyc,
+`reply-wake` ~4,097 cyc. `recv-take` averages 897,796 — that is wait time
+(the receiver blocked between requests), not a cost; the phase is closer in
+spirit to the caller's `wait-blocked` than to its narrow `wait-take`, and the
+doc explains why a narrower charge wasn't possible without re-adding the
+per-retry contamination the caller's four clean phases specifically avoid.
+
+**Bug found and fixed along the way, worth knowing if this recurs:** the
+first boot with these phases live showed zero `ipc-server-phase-*` rows in
+the rendered table even though the debugcon log had them. Cause:
+`tools/xtask/src/bench.rs`'s `PHASE_PREFIXES` filter didn't include
+`"ipc-server-phase-"`, so `parse_phase_milestone` silently dropped every one
+of them. Not a kernel bug — check this list first if a new phase family
+prints nothing.
+
+### Stage 1 sizing attempted, no fusable target found
+
+User chose to size the dark ticks rather than stop at Stage 0. Using
+`RUSTOS_SCHEDULER_PHASE_PROFILE=true` layered onto `--isolate-probe`, decoded
+one `kernel-scheduler-phase-*` window by hand (68,841 dispatches, 315,163
+lock acquisitions, 999ms): the dispatch chain (account/balance/validate/
+select/commit/arch_restore/prologue) summed to 207,395µs of 260,982µs total
+lock-hold — 20.5% (53,587µs) uncovered by any of those seven phases.
+
+**First pass at this was wrong and got corrected in the same session, not
+after.** Initially read the uncovered 20.5% as a new dark chunk and added it
+on top of the caller/receiver phase totals (~19,200-24,050 more ticks,
+"scheduler in-lock ~25-31%"). The acquisition census (`kernel-scheduler-
+acquire-0..7`, FNV-1a32 file hash + line, matched against the tree)
+corrected this: two sites (`irq.rs:736` dispatch, `irq.rs:850` block-commit)
+are dispatch/block; the other six, ~108,000 acquisitions, are all in
+`kernel/ps/src/multitask/current.rs` (`arm_block_current_task`,
+`inherit_ipc_priority`, `reserve_ipc_call_donation`, `release_ipc_priority`,
+`complete_ipc_reply_wake_handoff`, `user_log_ids_for_task`) and every one is
+called **from inside** a phase already instrumented this session
+(`arm_block_current_task` inside `WaitArm`, etc.). **The 20.5% is already
+inside the phase totals, not additive to them.**
+
+Net effect: no new fusable target. Each of the six `current.rs` functions is
+already minimal and single-purpose; fusing them repeats the shape of the
+three acquisition-fusion attempts this lane already refuted. This
+*reinforces* "lockdep dominates every operation, no single hot spot" rather
+than finding an exception to it. Full writeup: `docs/benchmarks/README.md`,
+"Sizing the dark ticks with what Stage 0 built".
+
+**`perf record` was also tried** (user request), attached to the RustOS QEMU
+process during an isolated run. `perf report`'s aggregation hung
+indefinitely regardless of options (host kernel symbols are
+permission-restricted in this environment — `/sys/kernel/debug/tracing/...`
+denies access — root cause not fully diagnosed, `perf script` works fine as
+a workaround). Findings from `perf script`: 88.7% of samples are inside the
+KVM guest-run path (`[unknown]`, unresolvable — perf cannot see inside a
+non-Linux guest's own execution, no guest symbol table exists for RustOS).
+Of the resolved 11.3%, the largest cluster is QEMU's MMIO/character-device
+dispatch machinery (`address_space_translate_internal`, `qemu_chr_write*`,
+`io_channel_send_full`) — debugcon-adjacent host emulation cost, ~1.5% of
+all samples. Small and corroborating (consistent with `vmexit_cpuid` already
+ruling out hypervisor exits as dominant), not a new finding.
+
+**State at session end: instrumentation and sizing work is done and
+verified; no code change was made to the IPC path itself.** The four clean
+phases plus the four Stage 0b receiver phases plus the dispatch chain
+account for roughly 48,000-53,000 of 78,080 ticks (61-67%, receiver and
+dispatch figures both approximate). What remains dark is the two blocking
+transitions' architectural mechanics and syscall entry/exit floor
+(~4,920 ticks for three syscalls) — the same target this lane already had,
+not a newly discovered one.
+
+### Stage 2: the seL4-bypass hypothesis was refuted, root-causing the sync-handoff miss rate found a real fix
+
+User asked to take the IPC/scheduler lane seL4/QNX-style and accept
+structural risk. The literal hypothesis — dispatch runs the full seven-phase
+pipeline even when the decision is already O(1) via the IPC direct-handoff
+hint — was **half right and the actionable half was different from what it
+looked like**: the decision was already O(1) on a hint hit (pre-existing,
+not a gap), and the pipeline stages that stay unconditional are load-bearing
+for other CPUs/lock-ordering (a documented past corruption incident exists
+from making them stale), not free CFS-scan residue to skip. A literal
+"skip the pipeline" bypass was refuted by reading the dispatch phases before
+any code was written — see `docs/benchmarks/README.md`, "Sizing the
+synchronous handoff hit rate".
+
+The real lever, found by measuring instead of designing around the
+refuted hypothesis: only **28.3%** of dispatches hit the direct-handoff FIFO.
+New counters (`kernel/ps/src/multitask/scheduler/locality.rs`, gated behind
+`rustos_scheduler_phase_profile`, zero cost off) traced the miss precisely:
+43.3% is unrelated CPU traffic (expected, system-wide counter), and **28.4%
+was 100% attributable to reply-direction (caller-wake) tokens going stale on
+`Generation` mismatch, every time, deterministically** — not contention.
+
+Root cause: `wake_task_slot` unconditionally routes every wake, even a
+same-CPU one, through `publish_remote_wake`'s cross-CPU mailbox protocol
+(Blocked → `RemoteQueued`, one generation bump). The reply-wake token mints
+correctly against that generation. But `drain_remote_wakes`, run
+unconditionally by every dispatch's Balance phase (which runs *before*
+Select in the same dispatch), promotes `RemoteQueued` → `Local` with a
+*second* generation bump before Select ever checks the token once. Two
+static-reasoning-only hypotheses along the way ("cross-entry-point racing",
+"already dispatched via CFS") were both wrong and both refuted by counters
+before landing on this — see `docs/benchmarks/README.md`,
+"Root-causing the sync-handoff miss rate", for the full trace and the two
+wrong turns, kept rather than deleted.
+
+**Fix**: `runqueue::publish_local_wake` (new, `runqueue.rs`) — identical
+terminal/dedup dispatch to `publish_remote_wake`, but its `Blocked` case
+calls `publish_local` directly (the one-step transition Balance already uses
+for the outgoing task) instead of minting a mailbox record.
+`publish_runqueue_wake_to` branches on `target == current_dispatch_cpu()`.
+Researched seL4's actual fastpath first (`docs.sel4.systems`,
+`src/fastpath/fastpath.c`): its governing principle, "dest thread is set
+Running, but not queued" — schedulability is exactly one structure at a
+time, never two racing representations — is what this fix reproduces for the
+same-CPU case, with the cross-CPU mailbox path (every actual liveness
+guarantee) byte-for-byte unchanged. General wake-primitive change, not an
+IPC-only patch — every same-CPU wake in the kernel takes the direct path now.
+
+**Measured**: hit rate 28.3% → **56.6%** (exactly doubled — call-direction
+was already ~100%, reply-direction now also hits reliably). `Custody`
+mismatch: 99.5% of the stale bucket → **0.0%**, eliminated not reduced.
+`ipc_rt_intra_process`: 73,760 → 70,120 (**-5.9% normalized**, anchor held).
+`ipc_split_reply_to_return` (the half this targets): **-10.1%**. Both
+control probes (`null_syscall_getpid`, `sched_yield`) read as noise.
+`ipc_rt_cross_process_syscalld_getuid` (a real server, not the synthetic
+bench pair) also moved (-3.7%), so this is not an `ipcbench` artifact.
+
+Two source-conformance/mutation-anchor breaks along the way, both from
+logically-equivalent refactoring changing literal text these tools pin
+exactly — `formal/run-source-conformance.sh` and
+`formal/implementation-mutations.tsv` both anchor on exact source strings,
+not behavior. Fixed by preserving literal text with `!(...)` wrapping rather
+than flipping operators, and by retargeting/adding `occurrence=N/M` rows
+when a pattern got duplicated. Full detail:
+`~/.claude/plans/radiant-stargazing-moon.md` (this session's plan file) and
+the `formal-witness-anchors` memory.
+
+Also landed, lower priority, not yet benchmarked against a workload:
+`phys.rs` batched frame allocator (`alloc_frames_batch`/
+`try_free_frames_batch`) wired into `address_space.rs`'s private-address-
+space map/unmap paths, replacing one `PHYS_ALLOCATOR` lock acquisition per
+4 KiB page with one per 64-page chunk. Unit-tested; no spawn/exec/exit bench
+probe exists yet to measure it end to end.
 
 ### Deleted surfaces — do not re-create
 

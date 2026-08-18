@@ -789,6 +789,7 @@ pub fn housekeeping_once() -> usize {
     work += ps_api::drain_scheduler_runtime_profile();
     work += ps_api::drain_user_copy_profile();
     work += compat_api::syscall::drain_ipc_call_profile();
+    work += compat_api::syscall::drain_ipc_server_profile();
     work += compat_api::syscall::drain_syscall_profile();
     // lockdep owns no clock, so the window comes from here.
     work += nucleus_core::util::lockdep::drain_lock_profile(

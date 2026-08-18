@@ -27,7 +27,8 @@ mod tests {
         parse_smoke_options, parse_verified_milestone_frame,
         parse_verified_smp_qualification_event, parse_verified_smp_runtime_event,
         physical_gpu_profile, prepare_runtime_log, qemu_display_backend,
-        render_private_acceptance_contract, render_smp_ring3_qualification_contract,
+        render_ipcbench_probe_contract, render_private_acceptance_contract,
+        render_smp_ring3_qualification_contract,
         required_dvm_gpu_ready, runtime_stall_or_crash_observed, rustos_marker_present,
         select_smoke_guest_display, smp_ring3_qualification_is_complete,
         smp_runtime_missing_markers, uiserver_has_interactive_slow_loop,
@@ -204,6 +205,11 @@ mod tests {
     #[test]
     fn smp_evidence_cohort_is_strict_and_paired() {
         smp_ring3_qualification::smp_evidence_cohort_is_strict_and_paired();
+    }
+
+    #[test]
+    fn ipcbench_probe_option_is_a_strict_singular_name() {
+        smp_ring3_qualification::ipcbench_probe_option_is_a_strict_singular_name();
     }
 
     #[test]

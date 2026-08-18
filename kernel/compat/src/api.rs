@@ -55,6 +55,12 @@ pub mod syscall {
         crate::user::syscall::linux::drain_ipc_call_profile()
     }
 
+    /// Emits the bounded per-second IPC receive/reply-path cycle attribution.
+    /// This is diagnostics only; nothing consumes it to make a decision.
+    pub fn drain_ipc_server_profile() -> usize {
+        crate::user::syscall::linux::ipc_server_profile::drain_ipc_server_profile()
+    }
+
     pub fn cleanup_retired_task_runtime_state(
         task_id: u64,
         process_id: u64,

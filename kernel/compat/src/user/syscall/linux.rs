@@ -4,6 +4,7 @@ mod debug_ops;
 mod error_ops;
 mod ipc_ops;
 mod ipc_profile;
+pub(crate) mod ipc_server_profile;
 mod memory_ops;
 mod mm_broker_ops;
 pub(crate) mod offload_ops;
@@ -180,6 +181,7 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
         linux_abi::SYS_RUSTOS_PRODUCT_MILESTONE => {
             syscall_linux_rustos_product_milestone(frame.rdi, frame.rsi, frame.rdx)
         }
+        linux_abi::SYS_RUSTOS_PHASE_PROFILE_DRAIN => syscall_linux_rustos_phase_profile_drain(),
         linux_abi::SYS_RUSTOS_SMP_QUALIFICATION_BIND => {
             syscall_linux_rustos_smp_qualification_bind(frame.rdi)
         }

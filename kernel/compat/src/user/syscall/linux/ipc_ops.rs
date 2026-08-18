@@ -45,6 +45,9 @@ use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock, work_budget};
 // wrapped every one of them across three lines and buried the code being
 // measured.
 use super::ipc_profile::{IpcCallPhase, charge as charge_phase, now as phase_mark};
+use super::ipc_server_profile::{
+    IpcServerPhase, charge as charge_server_phase, now as server_phase_mark,
+};
 
 macro_rules! ipc_trace {
     ($($arg:tt)*) => {
@@ -1700,16 +1703,6 @@ fn prepare_recv_with_sender(
     Ok((endpoint, task_id, process_id, request_capacity))
 }
 
-/// Receives on an already-authorized endpoint after every user output range
-/// has been validated.  The boolean records whether this invocation actually
-/// committed a block and crossed the scheduler; reply-receive uses it to avoid
-/// issuing a redundant syscall-tail reschedule after the exact caller already
-/// received its direct handoff.
-///
-/// `deadline_tick` is `None` for the historical wait-forever receive. When it
-/// is `Some`, the same block additionally arms an RTC waiter, so the task
-/// resumes on whichever comes first: a sender, or the deadline. That is the
-/// one primitive a multi-source supervisor needs in order to stop polling.
 #[allow(clippy::too_many_arguments)]
 fn recv_with_sender_blocking_prepared(
     endpoint: KernelEndpointHandle,
@@ -1722,6 +1715,7 @@ fn recv_with_sender_blocking_prepared(
     deadline_tick: Option<u64>,
 ) -> Result<(usize, bool), (i64, bool)> {
     let mut yielded = false;
+    let take_mark = server_phase_mark();
     loop {
         match kernel_ipc_runtime::api::recv_endpoint_with_sender_and_limits(
             endpoint,
@@ -1729,6 +1723,7 @@ fn recv_with_sender_blocking_prepared(
             0,
         ) {
             Ok(Some((reply, request, _handles, caller_task_id))) => {
+                let write_mark = charge_server_phase(IpcServerPhase::RecvTake, take_mark);
                 let (sender_pid, sender_tid) =
                     multitask::user_log_ids_for_task(caller_task_id).unwrap_or((0, 0));
                 let reply_raw = reply.raw().to_ne_bytes();
@@ -1740,6 +1735,7 @@ fn recv_with_sender_blocking_prepared(
                     (sender_tid_ptr, &tid),
                 ])
                 .map_err(|err| (address_space_error_to_linux_errno(err), yielded))?;
+                let _ = charge_server_phase(IpcServerPhase::RecvWrite, write_mark);
                 let _ = multitask::inherit_ipc_priority(reply.raw(), caller_task_id, task_id);
                 return Ok((request.len(), yielded));
             }
@@ -1888,6 +1884,7 @@ pub(super) fn syscall_linux_rustos_ipc_reply(
     response_len: u64,
 ) -> u64 {
     let start_ticks = crate::arch::rtc::ticks();
+    let publish_mark = server_phase_mark();
     let response = match copy_request_from_user(response_ptr, response_len) {
         Ok(response) => response,
         Err(errno) => return linux_errno(errno),
@@ -1908,15 +1905,18 @@ pub(super) fn syscall_linux_rustos_ipc_reply(
         }
     };
     let reply_ticks = crate::arch::rtc::ticks();
+    let wake_mark = charge_server_phase(IpcServerPhase::ReplyPublish, publish_mark);
     // Direct hand-back to the caller: the service is about to wait on its
     // endpoint again, so donate the remaining quantum to the original caller
     // instead of round-robining away from a freshly-completed reply.
-    if multitask::complete_ipc_reply_wake_handoff(reply, task_id) {
+    let handoff = multitask::complete_ipc_reply_wake_handoff(reply, task_id);
+    if handoff {
         // The common syscall tail consumes this request with IF enabled. The
         // shared synchronous IPC FIFO is burst-bounded, so direct hand-back
         // cannot erase the scheduler's overdue-task fairness turn.
         multitask::request_deferred_reschedule();
     }
+    let _ = charge_server_phase(IpcServerPhase::ReplyWake, wake_mark);
     log_slow_ipc_reply(
         "reply",
         reply,

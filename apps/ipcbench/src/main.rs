@@ -19,6 +19,7 @@ use std::time::Duration;
 use rustos_user_abi::syscall::{
     SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
     SYS_RUSTOS_IPC_RECV_WITH_SENDER, SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_IPC_TRY_RECV,
+    SYS_RUSTOS_PHASE_PROFILE_DRAIN,
 };
 
 const SYS_LINUX_GETPID: u64 = 39;
@@ -36,6 +37,14 @@ const CLOCK_MONOTONIC: u64 = 1;
 const WARMUP: usize = 2_000;
 const SYSCALL_ITERS: usize = 50_000;
 const IPC_ITERS: usize = 20_000;
+
+/// `--isolate-probe` wants every phase-profile sample charged while this
+/// probe runs to belong to it alone. The rest of the session catalog starts
+/// at roughly the same wall-clock moment this program does, so without a
+/// settle the one-time startup burst of every other session program lands
+/// inside the measured window just from launch order, not from anything the
+/// isolated probe did.
+const ISOLATE_SETTLE: Duration = Duration::from_secs(15);
 
 // ---------------------------------------------------------------- syscalls
 
@@ -147,6 +156,15 @@ unsafe fn syscall6(n: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64)
         );
     }
     ret
+}
+
+/// See `SYS_RUSTOS_PHASE_PROFILE_DRAIN`: flushes the kernel's
+/// `ipc-call-phase-*`/`usermem-phase-*` counters immediately rather than
+/// waiting for their ordinary once-per-second housekeeping drain.
+fn force_drain_phase_profiles() {
+    unsafe {
+        syscall0(SYS_RUSTOS_PHASE_PROFILE_DRAIN);
+    }
 }
 
 fn debug_line(message: &str) {
@@ -570,11 +588,46 @@ fn probe_syscall_offload(tsc_khz: u64) {
     }
 }
 
-fn main() {
-    debug_line("ipcbench: begin");
-    let tsc_khz = calibrate_tsc_khz();
-    debug_line(&format!("ipcbench: tsc_khz={tsc_khz}"));
+// ------------------------------------------------------------ probe filter
 
+/// Every `ipc-call-phase-*`/`usermem-phase-*` counter this harness's probes
+/// charge is process-wide and drains on a wall-clock window that has nothing
+/// to do with probe boundaries, so a phase total charged by more than one
+/// probe in the same boot cannot be divided into either probe's round-trip
+/// count. `cargo xtask bench --isolate-probe <name>` writes this contract to
+/// the private per-run KVM disk so exactly one probe runs, and every counter
+/// in the boot belongs to it. Reading it directly, the same way `uiserver`
+/// reads its own acceptance contract, keeps this a two-file change: no
+/// service mediates it.
+const IPCBENCH_PROBE_CONTRACT_PATH: &str = "/system/registry/system/ipcbench-probe-v1.env";
+const IPCBENCH_PROBE_CONTRACT_MAX_BYTES: usize = 256;
+
+fn probe_filter() -> Option<String> {
+    let contents = runtime_control::read_bounded_config_snapshot(
+        IPCBENCH_PROBE_CONTRACT_PATH,
+        IPCBENCH_PROBE_CONTRACT_MAX_BYTES,
+    )
+    .ok()?;
+    parse_ipcbench_probe_contract(&contents)
+}
+
+fn parse_ipcbench_probe_contract(contents: &str) -> Option<String> {
+    let mut contract = false;
+    let mut probe = None;
+    for line in contents.lines() {
+        if !contract && line == "contract=rustos-ipcbench-probe-v1" {
+            contract = true;
+            continue;
+        }
+        match line.strip_prefix("probe=") {
+            Some(name) if probe.is_none() && !name.is_empty() => probe = Some(name.to_owned()),
+            _ => return None,
+        }
+    }
+    probe.filter(|_| contract)
+}
+
+fn run_all_probes(tsc_khz: u64) {
     probe_tsc_overhead(tsc_khz);
     probe_null_syscall(tsc_khz);
     probe_vmexit_cpuid(tsc_khz);
@@ -582,6 +635,114 @@ fn main() {
     probe_ipc_mechanism_only(tsc_khz);
     probe_ipc_intra_process(tsc_khz);
     probe_syscall_offload(tsc_khz);
+}
+
+/// A closed vocabulary rather than a dispatch table keyed by the report name:
+/// an unrecognized filter must not silently fall back to running everything,
+/// which would defeat the isolation this exists for.
+fn run_single_probe(name: &str, tsc_khz: u64) {
+    match name {
+        "tsc_overhead" => probe_tsc_overhead(tsc_khz),
+        "null_syscall_getpid" => probe_null_syscall(tsc_khz),
+        "vmexit_cpuid" => probe_vmexit_cpuid(tsc_khz),
+        "sched_yield" => probe_sched_yield(tsc_khz),
+        "ipc_try_recv_empty" => probe_ipc_mechanism_only(tsc_khz),
+        "ipc_rt_intra_process" => probe_ipc_intra_process(tsc_khz),
+        "ipc_rt_cross_process_syscalld_getuid" => probe_syscall_offload(tsc_khz),
+        other => skip(other, "unrecognized-probe-filter"),
+    }
+}
+
+#[cfg(test)]
+mod probe_filter_tests {
+    use super::parse_ipcbench_probe_contract;
+
+    #[test]
+    fn exact_contract_with_a_probe_name_parses() {
+        assert_eq!(
+            parse_ipcbench_probe_contract(
+                "contract=rustos-ipcbench-probe-v1\nprobe=ipc_rt_intra_process\n"
+            ),
+            Some("ipc_rt_intra_process".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_missing_contract_line_is_rejected() {
+        assert_eq!(
+            parse_ipcbench_probe_contract("probe=ipc_rt_intra_process\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn an_empty_probe_name_is_rejected() {
+        assert_eq!(
+            parse_ipcbench_probe_contract("contract=rustos-ipcbench-probe-v1\nprobe=\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_duplicated_probe_line_is_rejected() {
+        assert_eq!(
+            parse_ipcbench_probe_contract(
+                "contract=rustos-ipcbench-probe-v1\nprobe=a\nprobe=b\n"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn an_unrecognized_line_is_rejected() {
+        assert_eq!(
+            parse_ipcbench_probe_contract(
+                "contract=rustos-ipcbench-probe-v1\nprobe=a\nextra=1\n"
+            ),
+            None
+        );
+    }
+}
+
+fn main() {
+    debug_line("ipcbench: begin");
+
+    let filter = probe_filter();
+    if filter.is_some() {
+        // `--isolate-probe` wants every `ipc-call-phase-*`/`usermem-phase-*`
+        // sample in the window to belong to this probe alone, but every
+        // session-startup program launches around the same moment: uiserver's
+        // first scene compile, wayclick's first frame, and netprobe's
+        // self-test are a one-time burst that would otherwise land inside the
+        // measured window just by starting at the same time as this probe
+        // does. Letting that burst pass before calibrating or charging
+        // anything is cheap; a contaminated sample is not recoverable after
+        // the fact.
+        debug_line("ipcbench: isolate settle begin");
+        thread::sleep(ISOLATE_SETTLE);
+        debug_line("ipcbench: isolate settle done");
+        // The ordinary housekeeping drain runs on its own once-per-second
+        // cadence, decoupled from this boundary, so whatever it has not yet
+        // flushed from boot and the settle sleep would otherwise leak into
+        // the measured window the moment it next fires.
+        force_drain_phase_profiles();
+    }
+
+    let tsc_khz = calibrate_tsc_khz();
+    debug_line(&format!("ipcbench: tsc_khz={tsc_khz}"));
+
+    match filter {
+        Some(name) => {
+            run_single_probe(&name, tsc_khz);
+            // Flush the probe's own tail charges before the log capture can
+            // see "end": the ordinary once-per-second drain cadence is not
+            // synchronized to a probe's own finish time, so whatever
+            // accumulated since its last window closed would otherwise sit in
+            // the live counters, undrained and invisible to the log.
+            force_drain_phase_profiles();
+        }
+        None => run_all_probes(tsc_khz),
+    }
 
     debug_line("ipcbench: end");
 }

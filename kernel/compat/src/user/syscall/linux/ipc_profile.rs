@@ -92,6 +92,16 @@ pub fn drain_ipc_call_profile() -> usize {
     )
 }
 
+/// Emits and clears the current window immediately, bypassing the one-second
+/// gate. `--isolate-probe` brackets one probe's measurement with this: the
+/// ordinary once-per-second housekeeping cadence is decoupled from a probe's
+/// own timing, so a probe that finishes inside one window leaves its tail
+/// charges sitting in the live counters, undrained and therefore invisible to
+/// a log capture that stops as soon as the probe's own end marker appears.
+pub fn force_drain_ipc_call_profile() -> usize {
+    PROFILE.drain(crate::arch::rtc::ticks(), 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

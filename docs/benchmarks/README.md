@@ -875,6 +875,424 @@ a 522,018-tick average, which is wall time during which the *other* task runs
 and therefore cannot be added to the round trip, but is where the round trip
 spends its latency.
 
+## Isolating one probe per boot
+
+`cargo xtask bench --isolate-probe <name>` reboots with `ipcbench` restricted
+to one named probe, so the counters above stop summing every probe in the
+run into one table. `ipcbench` reads the restriction from a private per-run
+KVM contract the same way `uiserver` reads its own acceptance contract
+(`system/registry/system/ipcbench-probe-v1.env`, parsed directly by
+`apps/ipcbench/src/main.rs`) — no service mediates it, so this is a two-file
+change plus the syscall below.
+
+That alone was not enough. `ipcbench` is a session-startup program, and every
+other session-startup program launches at roughly the same wall-clock moment
+it does: uiserver's first scene compile, WayClick's first frame, and
+netprobe's self-test are a one-time burst that lands inside the measured
+window purely from launch order. Restricting `ipcbench` to one probe made
+`null_syscall_getpid` and `ipc_try_recv_empty` stop contaminating
+`ipc_rt_intra_process`, but the first isolated run still read
+`usermem-phase-bind-visible` at a **14,927x** ratio — worse than some
+unisolated runs — because the whole session's startup burst landed inside a
+window that opened right as boot reached readiness.
+
+Two fixes closed most of the gap:
+
+- A 15-second settle between reaching readiness and calibrating the TSC, so
+  the isolated probe's window opens after the one-time burst has passed
+  rather than during it.
+- `SYS_RUSTOS_PHASE_PROFILE_DRAIN`, a new syscall that flushes the
+  `ipc-call-phase-*` and `usermem-phase-*` windows immediately instead of
+  waiting for their ordinary once-per-second housekeeping drain
+  (`force_drain_ipc_call_profile` / `force_drain_user_copy_profile`).
+  `ipcbench` calls it once right after the settle, to discard whatever
+  accumulated during boot and the settle itself, and once right after the
+  probe's own loop returns, to flush its tail charges before the log capture
+  can see `ipcbench: end`. Without the second call, a probe that finishes
+  faster than the next housekeeping drain leaves most of its own charges
+  sitting in the live counters, undrained and invisible to the log — which
+  is why an early attempt at this measured only 354 of `ipc_rt_intra_process`'s
+  22,000 `copy-request` calls.
+
+With both in place, the four phases charged once per *syscall-path* call —
+`copy-request`, `enqueue`, `write-response`, `enqueue-deadline` — land on
+**exactly** 22,084 samples apiece against 22,000 issued calls, a ratio of
+1.00. Those four are now cleanly attributable by this document's own test:
+`cargo xtask bench --isolate-probe ipc_rt_intra_process` prints
+`isolation check: PASS` or `FAIL` computed the same way `render_phases`
+parenthesises an unattributable ratio.
+
+**It does not reach `PASS` overall.** The phases charged once per *endpoint*
+call (`wait-take`, `wait-arm`, `wait-disarm`, `wait-blocked`, `enqueue-wake`,
+`enqueue-runtime`, `copy-alloc`, `wait-deadline-sample`) and every
+`usermem-phase-*` still read high — `wait-take` at 4.15x, `usermem-phase-bind-visible`
+at 6.69x, in the cleanest run so far. Tripling the settle from 15 to 45
+seconds moved every one of these ratios by less than 10%, which rules out a
+decaying startup transient: this is steady-state traffic, not a burst. The
+likely source is uiserver's own compositor and Wayland-dispatch loop, which
+runs continuously once the desktop is up and shares these same global
+counters. It cannot be excluded from the topology: without
+`--gui-dvm-surfaces`, uiserver's `open_display` polls forever waiting for a
+display provider and the session catalog never reaches `ipcbench` at all, so
+the isolated boot needs the exact topology that produces this noise.
+
+**Read this as the current ceiling on Stage 0a, not as it having failed.**
+The four syscall-path phases are now genuine, reproducible, single-probe
+measurements — real progress over being unattributable at all. The
+endpoint-call and usermem-phase families went from ratios in the thousands
+(contaminated by every other probe in the same boot) to single digits
+(contaminated only by the live desktop's own steady-state traffic), which is
+a different and much smaller problem, but it is not yet solved. Closing it
+further needs either a session topology that excludes uiserver/WayClick from
+the boot `ipcbench` runs in — a larger change than this document's boundary —
+or per-caller attribution inside the endpoint-call phases themselves, so a
+background process's charge can be told apart from `ipcbench`'s own.
+
+**Decision, made explicitly rather than assumed:** Stage 1 proceeds on the
+four clean syscall-path phases. The endpoint-call and `usermem-phase-*`
+families stay bounded-but-imprecise rather than blocking on either larger fix
+above.
+
+## Instrumenting the receiver side
+
+Every `IpcCallPhase` variant is charged from the caller: `ipc_reply_recv.rs`
+had zero `charge_phase` calls, and neither `syscall_linux_rustos_ipc_recv` nor
+`syscall_linux_rustos_ipc_reply` charged one, which is why the reply-to-return
+half of a round trip was 94% dark. `kernel/compat/src/user/syscall/linux/ipc_server_profile.rs`
+adds four phases mirroring the caller's four clean ones — charged exactly once
+per syscall invocation, never once per retry inside the receive loop's
+block/wake cycle, so each has the same chance the caller's four had of
+dividing into one round trip:
+
+- `recv-take`: from a receive syscall's first attempt to the request actually
+  being taken off the endpoint, including any block/wake cycles in between.
+  This is closer in spirit to the caller's `wait-blocked` than to its narrow
+  `wait-take` — it prices however long the receiver waited, not one endpoint
+  operation — because `ipcbench`'s server spends most of its life blocked
+  waiting for the next call, and there was no way to charge only the
+  take without also instrumenting every retry (which would put this phase
+  back in the endpoint-call-per-retry category the caller's four clean phases
+  specifically avoid).
+- `recv-write`: the batched write of the request bytes, reply capability, and
+  sender identity into the receiver's user memory.
+- `reply-publish`: copying the response out of user memory and publishing it
+  to the caller's reply slot.
+- `reply-wake`: the donation bind and direct hand-back to the woken caller.
+
+Charged in `recv_with_sender_blocking_prepared` (the function
+`syscall_linux_rustos_ipc_recv_with_sender` and its bounded variant share) and
+in `syscall_linux_rustos_ipc_reply` — the exact two syscalls `ipcbench`'s
+server uses. The plain `syscall_linux_rustos_ipc_recv` and the combined
+`ipc_reply_recv_with_sender` path, used by other real servers, are not
+instrumented yet; that is a scoping choice, not an oversight, kept to what
+this lane's own benchmark exercises.
+
+**Ablated before being trusted, per this document's own rule.** Three phase
+profiles in this kernel already cost more than they measured
+(`[lock_telemetry]`, `[scheduler_telemetry]`, `[syscall_telemetry]`, all gated
+off by default). Stubbing `ipc_server_profile::now`/`charge` to constants and
+comparing against the unstubbed build in the same session:
+
+| probe | ablated | with the four phases | normalized |
+|---|---:|---:|---:|
+| `vmexit_cpuid` (anchor) | 3,960 | 4,000 | held, +1.0% |
+| `ipc_rt_intra_process` | 78,280 | 78,640 | **-0.5%, noise** |
+| `ipc_split_reply_to_return` | 30,440 | 30,480 | -0.9%, noise |
+
+Inside the ±2% floor. Unlike the three gated profiles, this one does not need
+`[ipc_telemetry]`: four charge sites, matching the same primitives the
+caller's already-unconditional twelve use, cost nothing measurable against a
+~78,000-cycle round trip. It ships unconditional.
+
+**Attribution under `--isolate-probe ipc_rt_intra_process`:** all four land at
+1.34x-1.35x per round trip — the same band as the caller's endpoint-call
+phases, and for the same reason. `recv-take`, `recv-write`, `reply-publish`,
+and `reply-wake` are charged by *any* process receiving and replying on this
+path, not only `ipcbench`'s own server, so they inherit the live desktop's
+steady-state noise exactly like `wait-arm` and `enqueue-wake` do. They join
+the bounded-but-imprecise bucket, not the four clean ones.
+
+Per-operation costs (`cyc/sample`, less sensitive to the sample-count
+contamination above since the extra samples are the same code path, not a
+different one): `recv-write` ~4,535, `reply-publish` ~5,782, `reply-wake`
+~4,097. `recv-take` averaged 897,796 in the same run, which is wait time, not
+a cost, for the reason given above — do not read it as one.
+
+## Sizing the dark ticks with what Stage 0 built
+
+With `RUSTOS_SCHEDULER_PHASE_PROFILE=true` layered onto `--isolate-probe
+ipc_rt_intra_process`, the one `kernel-scheduler-phase-*` drain window that
+fell inside the run gave, at 68,841 dispatches and 315,163 lock acquisitions
+in 999ms: `account` 5,729µs, `balance` 21,903µs, `validate` 10,270µs,
+`select` (vruntime+handoff+pick) 64,816µs, `commit` 37,134µs, `arch_restore`
+42,305µs, `prologue` 25,235µs — summing to the profile's own reported
+`attributed` total (207,395µs) within rounding, which is a real
+cross-check, not an assumed one. Lock hold totalled 260,982µs, so **20.5%
+of scheduler lock-hold time (53,587µs) was not covered by any of those seven
+phases.**
+
+The acquisition census in the same window (`kernel-scheduler-acquire-0..7`,
+each packing a count and an FNV-1a32 file hash + line, matched against the
+tree) explains where: `irq.rs:736` (`scheduler_mut()` inside the
+software-yield dispatch, 71,451 acquisitions — this *is* the seven phases
+above) and `irq.rs:850` (`commit_block_current_task`, 39,496) are dispatch
+and block-commit respectively. The other six sites, ~108,000 acquisitions
+combined, are all in `kernel/ps/src/multitask/current.rs`:
+`arm_block_current_task`, `inherit_ipc_priority`, `reserve_ipc_call_donation`,
+`release_ipc_priority`, `complete_ipc_reply_wake_handoff`,
+`user_log_ids_for_task` — and every one of them is called **from inside** a
+phase this session already instrumented (`arm_block_current_task` inside
+`WaitArm`, `inherit_ipc_priority`/`user_log_ids_for_task` inside
+`RecvWrite`/`RecvTake`, `reserve_ipc_call_donation` inside `Enqueue`,
+`complete_ipc_reply_wake_handoff` inside `ReplyWake`).
+
+**That 20.5% is not a new dark chunk — it's already inside the phase totals
+above, measured by a different instrumentation system.** An earlier version
+of this section added "scheduler in-lock, ~25-31%" on top of the caller and
+receiver phase totals as if the three were disjoint; they are not. Only the
+dispatch chain proper (`irq.rs:736`'s seven phases, which fire on a context
+switch, not inside a syscall body) is genuinely separate wall-clock time from
+the syscall-side phases. This also closes off a fusion target rather than
+opening one: each of the six `current.rs` functions is already a minimal,
+single-purpose wrapper, and fusing them repeats the shape of the three
+acquisition-fusion attempts this lane already refuted (rule 7, below) — it
+reinforces "lockdep dominates every operation, no single hot spot" rather
+than contradicting it.
+
+**Where this leaves Stage 1:** the four clean caller phases (14,224 ticks),
+the four Stage 0b receiver phases (~14,414, approximate), and the dispatch
+chain (~19,200-24,050, at the historical 1.6-2.0 dispatches/round-trip
+estimate, not independently re-verified this session because dispatch counts
+in a shared window are contaminated the same way everything else is) are
+the closest this lane has to a full accounting — roughly 48,000-53,000 of
+78,080 ticks, 61-67%, with the caveat that the receiver and dispatch figures
+both carry real uncertainty rather than being exact. What's left is mostly
+the two blocking transitions' architectural mechanics and three syscall
+entries/exits (~4,920 ticks floor) — not a new named target, the same one
+this lane already had.
+
+## Sizing the synchronous handoff hit rate
+
+Stage 1 sized the seven-phase dispatch chain but not whether its *decision*
+(`select`) actually needed to scan. `kernel/ps/src/multitask/scheduler.rs:2872-2875`
+already resolves an IPC direct handoff in O(1) — a FIFO pop from
+`take_next_synchronous_pick_hint_ready_slot`, armed by `commit_ipc_call_handoff`
+— which short-circuits the CFS vruntime scan whenever it hits. That much was
+already documented ("Where the round trip actually goes", above). What was
+never measured is *how often* it hits versus falls through: `HANDOFF_STEP_CALLS[1]`
+counted attempts at this lookup but nothing counted `Some` outcomes.
+
+Two new counters close that gap: `SYNC_HANDOFF_HITS` in
+`kernel/ps/src/multitask/scheduler/locality.rs`, incremented at the same call
+site, gated behind the existing `rustos_scheduler_phase_profile` switch (zero
+cost off), drained into a new milestone `kernel-scheduler-step-sync-hits`
+alongside the pre-existing `kernel-scheduler-step-sync`.
+
+`RUSTOS_SCHEDULER_PHASE_PROFILE=true cargo xtask bench --isolate-probe
+ipc_rt_intra_process`, read from the raw debugcon capture (these milestones
+are decoded by hand, like the acquisition census — `cargo xtask bench` does
+not print them): 19 one-second windows, the first 3 settling and the last
+truncated. The 15 steady windows in between:
+
+| window | attempts | hits | rate |
+|---:|---:|---:|---:|
+| 3 | 59,146 | 16,708 | 28.2% |
+| 4 | 58,906 | 16,653 | 28.3% |
+| 5 | 58,247 | 16,459 | 28.3% |
+| 6 | 62,569 | 17,688 | 28.3% |
+| 7 | 63,609 | 17,985 | 28.3% |
+| 8 | 65,247 | 18,458 | 28.3% |
+| 9 | 64,488 | 18,243 | 28.3% |
+| 10 | 65,966 | 18,658 | 28.3% |
+| 11 | 67,551 | 19,121 | 28.3% |
+| 12 | 65,880 | 18,641 | 28.3% |
+| 13 | 66,154 | 18,715 | 28.3% |
+| 14 | 68,519 | 19,400 | 28.3% |
+| 15 | 67,764 | 19,190 | 28.3% |
+| 16 | 66,734 | 18,880 | 28.3% |
+| 17 | 60,371 | 17,092 | 28.3% |
+
+**28.3%, flat to one decimal place across 15 consecutive windows** — steady
+state, not a decaying startup transient, the same signature Stage 0a used to
+tell the two apart.
+
+**Caveat, same shape as every endpoint-call and `usermem-phase-*` counter
+before it:** this is system-wide on one vCPU. `attempts` per window
+(58,000-68,000) is the same magnitude as Stage 1's 68,841-dispatch window, so
+most of what it counts is not `ipcbench`'s own traffic — the live desktop
+shares the same dispatch stream and this counter cannot yet tell the two
+apart, for the same reason Stage 0a's per-caller-attribution fork was never
+built.
+
+Sizing it anyway, on the assumption that favors `ipcbench` (background
+dispatches arm this hint too, so this direction only makes `ipcbench`'s share
+look larger than it is): the isolated run's own phase table shows 22,082
+syscall-path calls in a comparably-sized window, and a round trip arms this
+hint twice — once waking the receiver, once waking the caller — so up to
+44,164 hits are possible per window. Observed hits (~18,500-19,400) are
+**~0.84-0.88 per round trip, not 2**, meaning even `ipcbench`'s own traffic
+misses this hint more often than a naive reading predicts. Whether that gap is
+desktop contamination, the `MAX_CONSECUTIVE_SYNC_HANDOFFS` streak cap
+(`sync_handoff.rs:232`) forcing a CFS-scanned dispatch after 8 consecutive
+hits, or an unrelated dispatch consuming the queue slot first is not yet
+distinguished.
+
+**Against the lane's own significance bar** (thousands of ticks or more):
+~18,500 hits/second on one CPU is unambiguously past it — this is not a rare
+path. But the change the hypothesis pointed at next — skipping the seven-phase
+pipeline's unconditional stages (account/balance/validate/commit/arch_restore/
+prologue) for a hint-hit dispatch, the way seL4/QNX switch TCBs directly — is
+categorically larger than anything Stages 0-1 touched: every one of those
+stages does real bookkeeping (vruntime accounting, deferred-wake drain,
+lock-order publication, arch/SIMD state) that a bypass would have to prove
+unnecessary per-stage or keep and still pay for. Not started; this is a
+direction decision, not a sizing question.
+
+## Root-causing the sync-handoff miss rate
+
+The 28.3% figure above only says how often the hint hits; it does not say
+*why* the other 71.7% miss. Three new counter families close that gap, each
+gated behind `rustos_scheduler_phase_profile` exactly like the hit counter
+(`kernel/ps/src/multitask/scheduler/locality.rs`, zero cost off): a
+miss-reason split (`QueueEmpty`/`StreakCapped`/`DrainedStale`) at the two
+early-return points inside `take_next_synchronous_pick_hint_ready_slot`
+and `SyncHandoffState::take_next_ready`; a stale-discard sub-split
+(`Identity`/`Custody`/`NotCandidate`) inside
+`synchronous_handoff_record_is_ready`; and an arm-side accept/reject split by
+direction (call vs. reply) at `set_next_synchronous_pick_hint` and
+`enqueue_reply_wake`.
+
+`RUSTOS_SCHEDULER_PHASE_PROFILE=true cargo xtask bench --isolate-probe
+ipc_rt_intra_process`, 15 steady-state windows, decoded from the raw debugcon
+capture by timestamp (list-index pairing across milestone families produced
+nonsense the first attempt — two drain events landed close together during
+the post-readiness settle, shifting the index alignment; timestamp pairing
+reproduces cleanly across every window):
+
+| outcome | share |
+|---|---:|
+| Hit | 28.3% |
+| Miss: QueueEmpty | 43.3% |
+| Miss: StreakCapped | **0.0%** |
+| Miss: DrainedStale | 28.4% |
+| — of which Custody | **99.5%** |
+| — of which Identity / NotCandidate | 0.0% each |
+| Call-side arm accept rate | **100.0%** |
+| Reply-side arm accept rate | **100.0%** |
+
+Two hypotheses from the original decision rule are **fully refuted, not just
+deprioritized**: the streak cap never fires, and neither arm direction is
+ever rejected. QueueEmpty at 43.3% matches the already-documented caveat that
+this counter is system-wide — most attempts on a live-desktop CPU are not
+`ipcbench`'s own traffic.
+
+The real finding is that `DrainedStale` is **99.5% attributable to `Custody`
+alone**, and reading `matches_dispatch_owner`
+(`kernel/ps/src/multitask/scheduler/sync_handoff.rs:98-139`) explains why
+structurally: `SyncHandoffCustody::Generic` (the call-direction record, which
+wakes a *receiver*) always passes this check unconditionally.  Only
+`SyncHandoffCustody::ReplyWake` (the reply-direction record, which wakes a
+*caller*) carries a real check — generation, CPU, runnable, and state must
+all still match what was captured at arm time. That single asymmetry explains
+the near-even Hit/DrainedStale split almost exactly: of the ~57% of attempts
+where the queue held something, roughly half are call-direction records
+(never fail) and roughly half are reply-direction records (failing at a rate
+close to 100% by the time they're consumed).
+
+Splitting the `ReplyWake` check into its four sub-conditions found **100.0%
+`Generation` mismatch, exactly, across all 15 windows** — `Cpu`,
+`NotRunnable`, `State` are all exactly zero, no exceptions. A first pass at
+explaining this reached for "cross-entry-point racing between two
+independent dispatch paths" — a plausible-sounding hypothesis reached by
+static reasoning rather than measurement, and wrong. A further counter
+(the owner state found at the moment of mismatch) read **100.0% `Local`, not
+`Running`, across every window** — ruling out "the caller already got
+dispatched elsewhere first" outright, since that would read `Running`.
+
+Reading the actual call sequence instead of reasoning further about it found
+the real mechanism, and it is fully deterministic, not contention-dependent:
+`wake_task_slot` (`scheduler.rs:4164-4361`) calls `publish_remote_wake`
+(`runqueue.rs:547-589`) **unconditionally, even when the wake's target CPU is
+the CPU already executing it**. That function transitions Blocked ->
+`RemoteQueued` (one generation bump) and publishes a cross-CPU mailbox
+record — correct and necessary for a genuinely remote wake, but for a
+same-CPU wake it is pure overhead. The reply-wake token is minted right
+after, correctly capturing this fresh generation (not a capture-before-
+publish bug). But `drain_remote_wakes` (`runqueue.rs:687-745`), called
+**unconditionally by every dispatch's Balance phase**, promotes
+`RemoteQueued` -> `Local` with a **second** generation bump — and Balance
+runs before Select in the same dispatch (Account -> Balance -> Validate ->
+Select). So on the very next dispatch after the reply, before the token is
+ever checked even once, Balance has already bumped the generation past what
+the token captured. This happens on **every** same-CPU reply-wake,
+unconditionally — not under contention, not sometimes. The 100% figure was
+never a coincidence.
+
+### The fix: give same-CPU wakes a direct path
+
+Researched seL4's actual fastpath mechanism before designing anything
+(`docs.sel4.systems`, the seL4 reference manual, `src/fastpath/fastpath.c`)
+rather than assuming what "seL4-style" means. Its governing principle:
+**"dest thread is set Running, but not queued"** — a fastpath IPC target
+never touches the ordinary ready queue at all; thread schedulability is
+represented by exactly one structure at a time, so no two paths can ever
+race for the same thread. When the fastpath's preconditions fail, it falls
+back to the slowpath wholesale — the decision is made once, up front, never
+as two simultaneously live representations.
+
+RustOS's `publish_remote_wake` violates exactly this for the common case:
+every wake, even a same-CPU one needing no cross-CPU synchronization at all,
+goes through the mailbox protocol, producing a transient `RemoteQueued`
+representation a second mechanism (`drain_remote_wakes`) has to reconcile —
+exactly the redundant second structure seL4's design avoids by construction.
+
+**Fix**: `runqueue::publish_local_wake`, new, alongside `publish_remote_wake`
+— identical terminal/Dormant rejection and already-owned dedup (verified
+against a still-`RemoteQueued` owner specifically, not just the common case),
+but its `Blocked` case calls `publish_local` directly (the same one-step
+transition Balance already performs for the outgoing task) instead of
+minting a mailbox record. `publish_runqueue_wake_to` now branches on `target
+== current_dispatch_cpu()`: same-CPU takes the direct path, genuinely
+cross-CPU keeps the unmodified mailbox path. This is a change to the general
+wake primitive — every same-CPU wake in the kernel benefits, not just IPC
+reply — which is architecturally the same same-core/cross-core split seL4's
+fastpath/slowpath makes, not a narrow one-off patch.
+
+The cross-CPU path, which carries every actual liveness guarantee this
+defect doesn't touch, is byte-for-byte unchanged. The new same-CPU path
+reuses `publish_local` verbatim — already in production, already exercised
+every dispatch by Balance, its preconditions (`state ∈ {Blocked, Running}`,
+`cpu.is_none() || cpu == Some(target)`) confirmed to hold exactly at this
+call site by reading `publish_blocked`: blocking always clears `owner.cpu` to
+`None`.
+
+**Result**, same isolated-probe method as above, 14 windows:
+
+| outcome | before | after |
+|---|---:|---:|
+| Hit | 28.3% | **56.6%** (exactly doubled) |
+| Miss: DrainedStale | 28.4% | 14.2% |
+| — of which Custody | 99.5% | **0.0%** |
+
+And end-to-end, `cargo xtask bench --compare docs/benchmarks/ipc-baseline.txt`
+(anchor held +1.0%):
+
+| probe | before | after | normalized |
+|---|---:|---:|---:|
+| `null_syscall_getpid` (control) | 1,640 | 1,640 | -1.0% noise |
+| `sched_yield` (control) | 22,440 | 22,760 | 0.4% noise |
+| **`ipc_rt_intra_process`** | 73,760 | 70,120 | **-5.9%** |
+| `ipc_split_call_to_recv` | 44,720 | 44,000 | -2.6% |
+| **`ipc_split_reply_to_return`** | 28,480 | 25,880 | **-10.1%** |
+| `ipc_rt_cross_process_syscalld_getuid` | 81,240 | 79,080 | -3.7% |
+
+Both controls read as noise; every probe that actually crosses the wake path
+moved, in the expected direction and proportion — `ipc_split_call_to_recv`
+(already ~100% hit before the fix) barely moves, `ipc_split_reply_to_return`
+(the half this targets) moves the most. `ipc_rt_cross_process_syscalld_getuid`
+— a real cross-process server, not the synthetic bench pair — moved too, so
+this is not an artifact specific to `ipcbench`.
+
 ## What only eight CPUs could show
 
 `cargo xtask bench --rustos-vcpus N` runs the lane at a chosen CPU count. The

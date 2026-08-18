@@ -97,6 +97,33 @@ pub(in crate::multitask) struct SchedulerRuntimeProfile {
     /// Per-member cost of the handoff chain, in the order the chain runs them.
     /// `(ns, calls)`; steps two and five overlap `handoff_scan_ns`.
     pub(in crate::multitask) handoff_steps: [(u64, u64); super::locality::HANDOFF_STEP_COUNT],
+    /// Subset of `handoff_steps[1]`'s calls that found a ready synchronous IPC
+    /// pick hint (`Some`), so `select` resolved without the CFS vruntime scan.
+    pub(in crate::multitask) sync_handoff_hits: u64,
+    /// The rest of `handoff_steps[1]`'s calls, split by why they missed.
+    /// Indexed by `locality::SyncHandoffMissReason`. `sync_handoff_hits` plus
+    /// this sum should equal `handoff_steps[1].1`.
+    pub(in crate::multitask) sync_handoff_misses:
+        [u64; super::locality::SYNC_HANDOFF_MISS_REASON_COUNT],
+    /// Sub-reasons for `sync_handoff_misses`'s `DrainedStale` bucket, indexed
+    /// by `locality::SyncHandoffStaleReason`. Per-discard, not per-dispatch.
+    pub(in crate::multitask) sync_handoff_stale:
+        [u64; super::locality::SYNC_HANDOFF_STALE_REASON_COUNT],
+    /// Arm-side (accepted, rejected) pairs, indexed by
+    /// `locality::SyncHandoffArmSite` — call direction then reply direction.
+    pub(in crate::multitask) sync_handoff_arms:
+        [(u64, u64); super::locality::SYNC_HANDOFF_ARM_SITE_COUNT],
+    /// Which exact condition failed inside a `ReplyWake` record's custody
+    /// check, indexed by `locality::SyncHandoffReplyCustodyFailReason`. See
+    /// that type's doc comment for the attribution caveat.
+    pub(in crate::multitask) sync_handoff_reply_custody_fail:
+        [u64; super::locality::SYNC_HANDOFF_REPLY_CUSTODY_FAIL_REASON_COUNT],
+    /// The owner state found at the moment of a `Generation` mismatch,
+    /// indexed by `RunOwnerState`'s discriminant. `Running` (index 3) means
+    /// the caller was already dispatched through a different entry point
+    /// before this FIFO record was ever reached.
+    pub(in crate::multitask) sync_handoff_generation_fail_state:
+        [u64; super::locality::SYNC_HANDOFF_GENERATION_FAIL_STATE_COUNT],
     pub(in crate::multitask) phase_ns: [u64; SCHEDULER_PHASE_COUNT],
     pub(in crate::multitask) runnable_samples: u64,
     /// Live priority donations when the window closed. The class derivation
@@ -287,6 +314,131 @@ pub fn drain_scheduler_runtime_profile() -> usize {
     {
         let (ns, calls) = profile.handoff_steps[step];
         crate::debug::record_milestone(crate::debug::LogCategory::Sched, name, ns / 1_000, calls);
+    }
+    // Step 1's hit/attempt split: how often the synchronous IPC pick hint
+    // actually held a ready slot, against how often it was asked.
+    // arg0=hits, arg1=attempts (handoff_steps[1].1).
+    crate::debug::record_milestone(
+        crate::debug::LogCategory::Sched,
+        "kernel-scheduler-step-sync-hits",
+        profile.sync_handoff_hits,
+        profile.handoff_steps[1].1,
+    );
+    // The miss side of the same split, by cause. Each arg1 repeats the same
+    // attempt count as the hits line above, so every row is self-contained.
+    for (reason_count, name) in [
+        (profile.sync_handoff_misses[0], "kernel-scheduler-step-sync-miss-empty"),
+        (profile.sync_handoff_misses[1], "kernel-scheduler-step-sync-miss-streak"),
+        (profile.sync_handoff_misses[2], "kernel-scheduler-step-sync-miss-stale"),
+    ] {
+        crate::debug::record_milestone(
+            crate::debug::LogCategory::Sched,
+            name,
+            reason_count,
+            profile.handoff_steps[1].1,
+        );
+    }
+    // Sub-reasons within the `-miss-stale` bucket: which check inside
+    // `synchronous_handoff_record_is_ready` discarded a queued record.
+    // arg1 repeats the stale total, so each row's share of it is self-evident.
+    // Per-discard, not per-dispatch: one attempt can discard more than one.
+    let drained_stale = profile.sync_handoff_misses[2];
+    for (stale_count, name) in [
+        (profile.sync_handoff_stale[0], "kernel-scheduler-step-sync-stale-identity"),
+        (profile.sync_handoff_stale[1], "kernel-scheduler-step-sync-stale-custody"),
+        (profile.sync_handoff_stale[2], "kernel-scheduler-step-sync-stale-not-candidate"),
+    ] {
+        crate::debug::record_milestone(
+            crate::debug::LogCategory::Sched,
+            name,
+            stale_count,
+            drained_stale,
+        );
+    }
+    // Arm-side outcome, split by which direction armed it. arg0=accepted,
+    // arg1=rejected. Tests whether a round trip's hint shortfall is one-sided.
+    for ((accepted, rejected), name) in [
+        (profile.sync_handoff_arms[0], "kernel-scheduler-step-sync-arm-call"),
+        (profile.sync_handoff_arms[1], "kernel-scheduler-step-sync-arm-reply"),
+    ] {
+        crate::debug::record_milestone(crate::debug::LogCategory::Sched, name, accepted, rejected);
+    }
+    // Which exact condition failed inside a ReplyWake record's custody check
+    // (Generic records never reach this — see the type's doc comment for the
+    // arm-vs-consume attribution caveat). arg1 repeats the stale-custody total
+    // so each row's share is self-evident.
+    let reply_custody_fail_total: u64 = profile.sync_handoff_reply_custody_fail.iter().sum();
+    for (fail_count, name) in [
+        (
+            profile.sync_handoff_reply_custody_fail[0],
+            "kernel-scheduler-step-sync-custody-fail-generation",
+        ),
+        (
+            profile.sync_handoff_reply_custody_fail[1],
+            "kernel-scheduler-step-sync-custody-fail-cpu",
+        ),
+        (
+            profile.sync_handoff_reply_custody_fail[2],
+            "kernel-scheduler-step-sync-custody-fail-not-runnable",
+        ),
+        (
+            profile.sync_handoff_reply_custody_fail[3],
+            "kernel-scheduler-step-sync-custody-fail-state",
+        ),
+    ] {
+        crate::debug::record_milestone(
+            crate::debug::LogCategory::Sched,
+            name,
+            fail_count,
+            reply_custody_fail_total,
+        );
+    }
+    // One-shot mechanism diagnostic: the owner state found at the moment a
+    // Generation mismatch fired. `Running` means the caller was already
+    // dispatched through a different entry point before this FIFO record was
+    // ever reached. arg1 repeats the generation-fail total, matching
+    // `sync_handoff_reply_custody_fail[0]` above.
+    let generation_fail_total: u64 = profile.sync_handoff_generation_fail_state.iter().sum();
+    for (state_count, name) in [
+        (
+            profile.sync_handoff_generation_fail_state[0],
+            "kernel-scheduler-step-sync-generation-fail-dormant",
+        ),
+        (
+            profile.sync_handoff_generation_fail_state[1],
+            "kernel-scheduler-step-sync-generation-fail-local",
+        ),
+        (
+            profile.sync_handoff_generation_fail_state[2],
+            "kernel-scheduler-step-sync-generation-fail-remote-queued",
+        ),
+        (
+            profile.sync_handoff_generation_fail_state[3],
+            "kernel-scheduler-step-sync-generation-fail-running",
+        ),
+        (
+            profile.sync_handoff_generation_fail_state[4],
+            "kernel-scheduler-step-sync-generation-fail-migrating",
+        ),
+        (
+            profile.sync_handoff_generation_fail_state[5],
+            "kernel-scheduler-step-sync-generation-fail-blocked",
+        ),
+        (
+            profile.sync_handoff_generation_fail_state[6],
+            "kernel-scheduler-step-sync-generation-fail-retiring",
+        ),
+        (
+            profile.sync_handoff_generation_fail_state[7],
+            "kernel-scheduler-step-sync-generation-fail-retired",
+        ),
+    ] {
+        crate::debug::record_milestone(
+            crate::debug::LogCategory::Sched,
+            name,
+            state_count,
+            generation_fail_total,
+        );
     }
     // Owner publication plus the deferred wake drain, which every acquisition
     // pays before its caller runs. arg0=prologue us, arg1=wakes drained.
@@ -631,6 +783,14 @@ impl Scheduler {
             },
             handoff_scan_calls,
             handoff_steps: super::locality::take_handoff_step_window(),
+            sync_handoff_hits: super::locality::take_sync_handoff_hit_window(),
+            sync_handoff_misses: super::locality::take_sync_handoff_miss_window(),
+            sync_handoff_stale: super::locality::take_sync_handoff_stale_window(),
+            sync_handoff_arms: super::locality::take_sync_handoff_arm_window(),
+            sync_handoff_reply_custody_fail:
+                super::locality::take_sync_handoff_reply_custody_fail_window(),
+            sync_handoff_generation_fail_state:
+                super::locality::take_sync_handoff_generation_fail_state_window(),
             phase_ns: self.runtime_profile_phase_ns,
             runnable_samples: self.runtime_profile_runnable_samples,
             live_ipc_donations: self.ipc_priority_donation_len as u64,
@@ -795,6 +955,14 @@ mod tests {
             handoff_scan_ns: 0,
             handoff_scan_calls: 0,
             handoff_steps: [(0, 0); super::locality::HANDOFF_STEP_COUNT],
+            sync_handoff_hits: 0,
+            sync_handoff_misses: [0; super::locality::SYNC_HANDOFF_MISS_REASON_COUNT],
+            sync_handoff_stale: [0; super::locality::SYNC_HANDOFF_STALE_REASON_COUNT],
+            sync_handoff_arms: [(0, 0); super::locality::SYNC_HANDOFF_ARM_SITE_COUNT],
+            sync_handoff_reply_custody_fail:
+                [0; super::locality::SYNC_HANDOFF_REPLY_CUSTODY_FAIL_REASON_COUNT],
+            sync_handoff_generation_fail_state:
+                [0; super::locality::SYNC_HANDOFF_GENERATION_FAIL_STATE_COUNT],
             phase_ns: [0; SCHEDULER_PHASE_COUNT],
             runnable_samples: 0,
             live_ipc_donations: 0,

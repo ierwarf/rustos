@@ -127,6 +127,54 @@ fn duplicate_wake_is_idempotent_and_terminal_wake_fails_closed() {
 }
 
 #[test]
+fn duplicate_local_wake_is_idempotent_and_terminal_wake_fails_closed() {
+    let _guard = TEST_GUARD.lock().unwrap();
+    reset_before_publication();
+    admit_blocked(10);
+    assert_eq!(
+        publish_local_wake(10, 1, 100),
+        RemoteWakeOutcome::Published {
+            cpu: 1,
+            notify: false
+        }
+    );
+    assert_eq!(owner(10).state, RunOwnerState::Local);
+    assert_eq!(
+        publish_local_wake(10, 1, 100),
+        RemoteWakeOutcome::AlreadyOwned { cpu: Some(1) }
+    );
+    retire(10, 100);
+    assert_eq!(owner(10).state, RunOwnerState::Retired);
+    assert_eq!(publish_local_wake(10, 1, 100), RemoteWakeOutcome::Rejected);
+    release_retired(10);
+    assert_eq!(owner(10).state, RunOwnerState::Dormant);
+}
+
+#[test]
+fn local_wake_deduplicates_a_still_remote_queued_owner() {
+    let _guard = TEST_GUARD.lock().unwrap();
+    reset_before_publication();
+    admit_blocked(12);
+    // A cross-CPU wake lands the owner in `RemoteQueued`, not yet drained
+    // into the local runqueue.
+    assert_eq!(
+        publish_remote_wake(12, 2, 100),
+        RemoteWakeOutcome::Published {
+            cpu: 2,
+            notify: true
+        }
+    );
+    assert_eq!(owner(12).state, RunOwnerState::RemoteQueued);
+    // A same-CPU wake racing that drain must dedup against it, not treat the
+    // still-in-flight owner as fresh `Blocked` custody it can re-publish.
+    assert_eq!(
+        publish_local_wake(12, 2, 100),
+        RemoteWakeOutcome::AlreadyOwned { cpu: Some(2) }
+    );
+    assert_eq!(owner(12).state, RunOwnerState::RemoteQueued);
+}
+
+#[test]
 fn dispatch_rejects_wrong_cpu_without_changing_owner() {
     let _guard = TEST_GUARD.lock().unwrap();
     reset_before_publication();

@@ -6,3 +6,4 @@ publish = false
 
 [dependencies]
 rustos-user-abi = { path = "../../libs/rustos-user-abi" }
+runtime-control = { path = "../../libs/runtime-control" }
