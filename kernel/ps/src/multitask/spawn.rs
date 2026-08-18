@@ -5,9 +5,8 @@ use kernel_hal::api::cpu;
 
 use super::{
     MAIN_THREAD_SLICE_MICROS, NEXT_TASK_ID, SpawnTaskError, UserTaskBootstrap, allocate_task_id,
-    checked_thread_pit_divisor, cpu_local, current_identity, initial_task_rflags,
-    kernel_task_entry_trampoline_addr, noop_task_entry, publish_cpu_current_task,
-    publish_scheduler_initialized, scheduler_mut, scheduler_ref,
+    checked_thread_pit_divisor, initial_task_rflags, kernel_task_entry_trampoline_addr,
+    noop_task_entry, publish_cpu_current_task, publish_scheduler_initialized, scheduler_mut,
 };
 use crate::memory::paging::ProcessAddressSpace;
 use crate::user::process_state::UserProcessState;

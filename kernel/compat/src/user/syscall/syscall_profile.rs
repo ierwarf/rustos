@@ -49,22 +49,46 @@ static PROFILE: PhaseProfile<SYSCALL_PHASE_COUNT> = PhaseProfile::new(
 );
 
 /// Reads the cycle counter for a phase boundary.
+///
+/// Compiled out unless `[syscall_telemetry] phase_profile` is on. The call
+/// sites stay unconditional -- only the clock read and the accumulator go --
+/// exactly as the lock and scheduler switches do it.
 #[inline]
 pub(super) fn now() -> u64 {
-    phase_now()
+    #[cfg(rustos_syscall_phase_profile)]
+    {
+        phase_now()
+    }
+    #[cfg(not(rustos_syscall_phase_profile))]
+    {
+        0
+    }
 }
 
 /// Charges `phase` with the interval since `since` and returns the boundary
 /// timestamp, so consecutive phases chain without a second read.
 #[inline]
 pub(super) fn charge(phase: SyscallPhase, since: u64) -> u64 {
-    PROFILE.charge(phase as usize, since)
+    #[cfg(rustos_syscall_phase_profile)]
+    {
+        PROFILE.charge(phase as usize, since)
+    }
+    #[cfg(not(rustos_syscall_phase_profile))]
+    {
+        let _ = (phase, since);
+        0
+    }
 }
 
 /// Emits one fixed record per phase at most once per second and clears the
 /// window. Returns the number of records emitted so housekeeping can count it
 /// as work.
 pub fn drain_syscall_profile() -> usize {
+    #[cfg(not(rustos_syscall_phase_profile))]
+    {
+        return 0;
+    }
+    #[cfg(rustos_syscall_phase_profile)]
     PROFILE.drain(
         crate::arch::rtc::ticks(),
         crate::arch::rtc::ticks_per_second(),

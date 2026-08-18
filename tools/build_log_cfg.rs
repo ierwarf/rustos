@@ -53,44 +53,55 @@ pub struct LoggingConfig {
     pub category_levels: [u8; LOG_CATEGORIES.len()],
 }
 
-/// Per-phase nanosecond attribution inside every scheduler dispatch.
+/// A telemetry section whose only key is `phase_profile`.
 ///
-/// Off by default for the same reason as `LockTelemetryConfig::phase_profile`
-/// and found the same way: about seventeen `lfence; rdtsc` reads per dispatch
-/// wrapped around individually cheap phases. Stubbing it out measured
-/// `sched_yield` at -11.7 percent and `null_syscall_getpid`, which performs no
-/// dispatch, at zero.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SchedulerTelemetryConfig {
-    pub phase_profile: bool,
+/// Three of these now exist -- lock, scheduler, and syscall -- because the same
+/// defect keeps recurring: a per-phase timing profile wrapped around an
+/// operation cheaper than the profile. Each was found the same way, by stubbing
+/// it out and measuring, and each cost more than what it measured. The lock
+/// section keeps its own parser because it carries three other keys; these two
+/// are identical but for a name, so they share one.
+pub struct PhaseProfileSection {
+    /// The `[section]` header in `config/rustos.toml`.
+    pub section: &'static str,
+    /// The environment variable that overrides it for a diagnosis build.
+    pub env: &'static str,
+    /// The `cfg` compiled in when it is on.
+    pub cfg: &'static str,
 }
 
-impl SchedulerTelemetryConfig {
-    pub const fn default() -> Self {
-        Self {
-            phase_profile: false,
-        }
+pub const SCHEDULER_PHASE_PROFILE: PhaseProfileSection = PhaseProfileSection {
+    section: "scheduler_telemetry",
+    env: "RUSTOS_SCHEDULER_PHASE_PROFILE",
+    cfg: "rustos_scheduler_phase_profile",
+};
+
+/// About seven `rdtsc` reads per syscall, wrapped around a path whose cheapest
+/// member is 1,640 ticks. Stubbing it out measured `null_syscall_getpid` at
+/// -12.8 percent, twice, with the anchor at exactly zero both times.
+pub const SYSCALL_PHASE_PROFILE: PhaseProfileSection = PhaseProfileSection {
+    section: "syscall_telemetry",
+    env: "RUSTOS_SYSCALL_PHASE_PROFILE",
+    cfg: "rustos_syscall_phase_profile",
+};
+
+pub const PHASE_PROFILE_SECTIONS: [PhaseProfileSection; 2] =
+    [SCHEDULER_PHASE_PROFILE, SYSCALL_PHASE_PROFILE];
+
+pub fn parse_phase_profile_toml(source: &str, section_name: &str) -> bool {
+    try_parse_phase_profile_toml(source, section_name).unwrap_or_else(|err| panic!("{err}"))
+}
+
+pub fn phase_profile_with_env_override(mut enabled: bool, env: &str) -> bool {
+    if let Ok(value) = std::env::var(env) {
+        enabled = parse_bool_value(&value, env)
+            .unwrap_or_else(|err| panic!("invalid {env}: {err}"));
     }
+    enabled
 }
 
-pub fn parse_scheduler_telemetry_toml(source: &str) -> SchedulerTelemetryConfig {
-    try_parse_scheduler_telemetry_toml(source).unwrap_or_else(|err| panic!("{err}"))
-}
-
-pub fn scheduler_telemetry_with_env_overrides(
-    mut config: SchedulerTelemetryConfig,
-) -> SchedulerTelemetryConfig {
-    if let Ok(value) = std::env::var("RUSTOS_SCHEDULER_PHASE_PROFILE") {
-        config.phase_profile = parse_bool_value(&value, "RUSTOS_SCHEDULER_PHASE_PROFILE")
-            .unwrap_or_else(|err| panic!("invalid RUSTOS_SCHEDULER_PHASE_PROFILE: {err}"));
-    }
-    config
-}
-
-pub fn try_parse_scheduler_telemetry_toml(
-    source: &str,
-) -> Result<SchedulerTelemetryConfig, String> {
-    let mut config = SchedulerTelemetryConfig::default();
+pub fn try_parse_phase_profile_toml(source: &str, section_name: &str) -> Result<bool, String> {
+    let mut enabled = false;
     let mut section = "";
 
     for raw_line in source.lines() {
@@ -102,36 +113,35 @@ pub fn try_parse_scheduler_telemetry_toml(
             section = name.trim();
             continue;
         }
-        if section != "scheduler_telemetry" {
+        if section != section_name {
             continue;
         }
         let Some((raw_key, raw_value)) = line.split_once('=') else {
-            return Err(format!("invalid scheduler_telemetry config line: {line}"));
+            return Err(format!("invalid {section_name} config line: {line}"));
         };
         match raw_key.trim() {
-            "phase_profile" => {
-                config.phase_profile = parse_bool_value(raw_value.trim(), "phase_profile")?
-            }
-            other => return Err(format!("unknown scheduler_telemetry config key: {other}")),
+            "phase_profile" => enabled = parse_bool_value(raw_value.trim(), "phase_profile")?,
+            other => return Err(format!("unknown {section_name} config key: {other}")),
         }
     }
 
-    Ok(config)
+    Ok(enabled)
 }
 
-/// Emits the scheduler-telemetry cfg. Called from `emit_log_cfgs`, so every
-/// crate that emits the logging configuration emits this one consistently --
-/// a cfg that disagreed between crates would compile two different kernels.
-pub fn emit_scheduler_telemetry_cfgs(project_toml: &str) {
-    println!("cargo:rerun-if-env-changed=RUSTOS_SCHEDULER_PHASE_PROFILE");
-    let config =
-        scheduler_telemetry_with_env_overrides(parse_scheduler_telemetry_toml(project_toml));
-    println!(
-        "cargo:rustc-env=RUSTOS_SCHEDULER_PHASE_PROFILE={}",
-        bool_name(config.phase_profile)
-    );
-    if config.phase_profile {
-        println!("cargo:rustc-cfg=rustos_scheduler_phase_profile");
+/// Emits the phase-profile cfgs. Called from `emit_log_cfgs`, so every crate
+/// that emits the logging configuration emits these consistently -- a cfg that
+/// disagreed between crates would compile two different kernels.
+pub fn emit_phase_profile_cfgs(project_toml: &str) {
+    for section in PHASE_PROFILE_SECTIONS {
+        println!("cargo:rerun-if-env-changed={}", section.env);
+        let enabled = phase_profile_with_env_override(
+            parse_phase_profile_toml(project_toml, section.section),
+            section.env,
+        );
+        println!("cargo:rustc-env={}={}", section.env, bool_name(enabled));
+        if enabled {
+            println!("cargo:rustc-cfg={}", section.cfg);
+        }
     }
 }
 
@@ -183,7 +193,7 @@ pub fn emit_log_cfgs(logging_toml: &str) {
     emit_check_cfgs();
     emit_logging_env(&config);
     emit_lock_telemetry_cfgs(logging_toml);
-    emit_scheduler_telemetry_cfgs(logging_toml);
+    emit_phase_profile_cfgs(logging_toml);
     if !config.enabled {
         return;
     }
@@ -261,7 +271,9 @@ pub fn emit_check_cfgs() {
     println!("cargo:rustc-check-cfg=cfg(rustos_boot_trace_enabled)");
     println!("cargo:rustc-check-cfg=cfg(rustos_lock_telemetry_enabled)");
     println!("cargo:rustc-check-cfg=cfg(rustos_lock_phase_profile)");
-    println!("cargo:rustc-check-cfg=cfg(rustos_scheduler_phase_profile)");
+    for section in PHASE_PROFILE_SECTIONS {
+        println!("cargo:rustc-check-cfg=cfg({})", section.cfg);
+    }
     for category in LOG_CATEGORIES {
         for (level, _) in LOG_LEVELS {
             println!("cargo:rustc-check-cfg=cfg(rustos_log_{category}_{level})");

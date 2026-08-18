@@ -87,6 +87,22 @@ warn_hold_cycles = 250000
 # as the cost of an instrumented dispatch, not of a dispatch.
 phase_profile = false
 
+[syscall_telemetry]
+# Per-phase cycle attribution across the syscall entry and exit path.
+#
+# Seven `rdtsc` reads per syscall and their accumulators, to attribute a path
+# whose cheapest member is 1,640 ticks -- the third instance of the shape
+# `lock_telemetry.phase_profile` and `scheduler_telemetry.phase_profile` already
+# carry, and found the same way. Measured by building with it stubbed out, twice
+# with the anchor at exactly zero: `null_syscall_getpid` -12.8 percent both
+# times, `ipc_try_recv_empty` -8.8 and -7.5 percent.
+#
+# It stays in the tree because it is what priced the per-syscall XSAVE pair at
+# 829 ticks and got it deleted. Turn it on for a diagnosis run --
+# `RUSTOS_SYSCALL_PHASE_PROFILE=true cargo xtask bench` -- and read the result as
+# the cost of an instrumented syscall, not of a syscall.
+phase_profile = false
+
 [kernel.build]
 # Hardened/release-oriented kernel build knobs. Copy this block, or this whole
 # file, into config/rustos.toml when testing a release-shaped image.

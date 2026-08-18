@@ -38,6 +38,7 @@ pub(crate) struct ProjectConfig {
     pub(crate) fuzzing: FuzzingConfig,
     pub(crate) lock_telemetry: LockTelemetryConfig,
     pub(crate) scheduler_telemetry: SchedulerTelemetryConfig,
+    pub(crate) syscall_telemetry: SyscallTelemetryConfig,
 }
 
 #[derive(Clone, Debug)]
@@ -79,6 +80,13 @@ pub(crate) struct FuzzingConfig {
 /// `config/rustos.toml` for why it is off by default.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SchedulerTelemetryConfig {
+    pub(crate) phase_profile: bool,
+}
+
+/// Per-phase cycle attribution across the syscall entry and exit path. See
+/// `config/rustos.toml` for why it is off by default.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SyscallTelemetryConfig {
     pub(crate) phase_profile: bool,
 }
 
@@ -203,6 +211,7 @@ struct ProjectConfigFile {
     fuzzing: FuzzingConfigFile,
     lock_telemetry: LockTelemetryConfigFile,
     scheduler_telemetry: SchedulerTelemetryConfigFile,
+    syscall_telemetry: SyscallTelemetryConfigFile,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -252,6 +261,12 @@ struct SchedulerTelemetryConfigFile {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+struct SyscallTelemetryConfigFile {
+    phase_profile: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 struct LockTelemetryConfigFile {
     enabled: Option<bool>,
     phase_profile: Option<bool>,
@@ -266,6 +281,7 @@ pub(crate) fn load_project_config(root_dir: &Path) -> Result<ProjectConfig> {
     apply_fuzzing_env_overrides(&mut config.fuzzing)?;
     apply_lock_telemetry_env_overrides(&mut config.lock_telemetry)?;
     apply_scheduler_telemetry_env_overrides(&mut config.scheduler_telemetry)?;
+    apply_syscall_telemetry_env_overrides(&mut config.syscall_telemetry)?;
     validate_kernel_build(&config.kernel.build)?;
     validate_fault_injection(&config.fault_injection)?;
     validate_fuzzing(&config.fuzzing)?;
@@ -277,6 +293,7 @@ pub(crate) fn load_project_config(root_dir: &Path) -> Result<ProjectConfig> {
         fuzzing: config.fuzzing,
         lock_telemetry: config.lock_telemetry,
         scheduler_telemetry: config.scheduler_telemetry,
+        syscall_telemetry: config.syscall_telemetry,
     })
 }
 
@@ -408,6 +425,9 @@ fn project_from_file(file: ProjectConfigFile) -> ProjectConfig {
     if let Some(value) = file.scheduler_telemetry.phase_profile {
         config.scheduler_telemetry.phase_profile = value;
     }
+    if let Some(value) = file.syscall_telemetry.phase_profile {
+        config.syscall_telemetry.phase_profile = value;
+    }
     config
 }
 
@@ -420,6 +440,7 @@ impl Default for ProjectConfig {
             fuzzing: FuzzingConfig::default(),
             lock_telemetry: LockTelemetryConfig::default(),
             scheduler_telemetry: SchedulerTelemetryConfig::default(),
+            syscall_telemetry: SyscallTelemetryConfig::default(),
         }
     }
 }
@@ -525,6 +546,15 @@ fn apply_scheduler_telemetry_env_overrides(
     if let Some(value) = env_string("RUSTOS_SCHEDULER_PHASE_PROFILE") {
         scheduler_telemetry.phase_profile =
             parse_bool_env("RUSTOS_SCHEDULER_PHASE_PROFILE", &value)?;
+    }
+    Ok(())
+}
+
+fn apply_syscall_telemetry_env_overrides(
+    syscall_telemetry: &mut SyscallTelemetryConfig,
+) -> Result<()> {
+    if let Some(value) = env_string("RUSTOS_SYSCALL_PHASE_PROFILE") {
+        syscall_telemetry.phase_profile = parse_bool_env("RUSTOS_SYSCALL_PHASE_PROFILE", &value)?;
     }
     Ok(())
 }
@@ -709,8 +739,8 @@ pub(crate) fn effective_config_toml(config: &ProjectConfig) -> String {
 mod tests {
     use super::{
         FaultInjectionConfig, KernelBuildConfig, LockTelemetryConfig, ProjectConfigFile,
-        SchedulerTelemetryConfig, apply_fault_rule_overrides, project_from_file,
-        validate_fault_injection,
+        SchedulerTelemetryConfig, SyscallTelemetryConfig, apply_fault_rule_overrides,
+        project_from_file, validate_fault_injection,
     };
 
     /// The lock phase profile is eleven counter reads inside every tracked lock
@@ -769,6 +799,41 @@ mod tests {
             !project_from_file(shipped).scheduler_telemetry.phase_profile,
             "the shipped build must not pay for scheduler phase attribution"
         );
+    }
+
+    #[test]
+    fn every_phase_profile_is_off_by_default_and_in_the_shipped_configuration() {
+        // Three sections now carry this key, because the same defect recurred
+        // three times: a per-phase timing profile around an operation cheaper
+        // than the profile. The default is the only thing between a product
+        // build and paying for all three, so assert it once for all of them
+        // rather than once per section and miss the fourth.
+        let shipped = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/rustos.toml"),
+        )
+        .expect("read the shipped project configuration");
+        let parsed: ProjectConfigFile =
+            toml::from_str(&shipped).expect("shipped configuration parses");
+        let shipped = project_from_file(parsed);
+        for (section, enabled) in [
+            ("lock_telemetry", shipped.lock_telemetry.phase_profile),
+            (
+                "scheduler_telemetry",
+                shipped.scheduler_telemetry.phase_profile,
+            ),
+            ("syscall_telemetry", shipped.syscall_telemetry.phase_profile),
+        ] {
+            assert!(
+                !enabled,
+                "the shipped build pays for {section} phase attribution"
+            );
+        }
+
+        assert!(!SyscallTelemetryConfig::default().phase_profile);
+        let enabled: ProjectConfigFile =
+            toml::from_str("[syscall_telemetry]\nphase_profile = true\n")
+                .expect("phase_profile is a recognized syscall_telemetry key");
+        assert!(project_from_file(enabled).syscall_telemetry.phase_profile);
     }
 
     #[test]
