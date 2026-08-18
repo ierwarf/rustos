@@ -738,19 +738,44 @@ Per endpoint call, with `wait-arm` as the unit:
 Per syscall-path call: `enqueue` 11,052 (which contains runtime + wake),
 `copy-request` 1,946, `write-response` 1,712, `enqueue-deadline` 714.
 
-And the user-copy side, which every one of those transfers pays:
+And the user-copy side, which every one of those transfers pays. **These nest**,
+and adding them up is a double count:
 
-| usermem phase | ticks/op | samples |
-|---|---:|---:|
-| `read-copy` | 1,002 | 104,835 |
-| `read-bind` | 989 | 104,513 |
-| `write-bind` | 961 | 141,744 |
-| `bind-visible` | **706** | **356,788** |
-| `bind-identity` | 218 | 368,517 |
+| usermem phase | ticks/op | samples | contains |
+|---|---:|---:|---|
+| `read-copy` | 1,002 | 104,835 | — |
+| `read-bind` | 989 | 104,513 | identity + visible |
+| `write-bind` | 961 | 141,744 | identity + visible |
+| ├ `bind-visible` | **706** | 356,788 | the `ProcessStateLock` acquire |
+| └ `bind-identity` | 218 | 368,517 | the published per-slot lookup |
 
-`bind-visible` is the largest usermem cost by total volume. Note that `read-bind`
-(989) and `read-copy` (1,002) are now *equal* — binding the address space used to
-be 86–94% of a copy, and no longer is.
+`ReadBind` is charged *inside* the `with_current_mm` closure, so it spans the
+whole bind: 218 + 706 + 65 of overhead = 989. **About 93% of a "bind" is the
+process-state lock acquire plus the identity lookup**, and the pointer it reaches
+belongs to a task that already pins its own process.
+
+`bind-visible` has more samples than `read-bind` and `write-bind` together
+because `with_current_address_space` has a dozen other callers charging other
+phases.
+
+`read-bind` (989) and `read-copy` (1,002) are now *equal*. Binding the address
+space used to be 86–94% of a copy; halving it is what earlier commits in this
+lane did.
+
+### What ceiling 04 is actually worth
+
+Per syscall-path call, with the nesting resolved:
+
+| category | ticks/call |
+|---|---:|
+| binds (`read-bind` 4,415 + `write-bind` 5,819) | **10,234** |
+| copies (`read-copy` 4,486 + `write-copy` 3,736) | 8,222 |
+| **addressable by a pinned per-thread buffer** | **~18,500** |
+
+That is 25% of a 73,760-tick round trip, and it is the first time this ceiling
+has been sized rather than asserted. A pinned buffer whose higher-half address
+the kernel records once removes the bind *and* the copy together — which is also
+why no subset of it is worth building.
 
 ### Why the next change has to be structural
 
@@ -766,6 +791,14 @@ another fusion**. Three attempts at acquisition-counting reached the same place:
 - a take's third acquisition (`REPLIES` re-acquired inside `ENDPOINT_MESSAGES`,
   which on the Pending path guards a decision with no effect) — best case ~1,560
   ticks, against a TOCTOU guard with formal models attached. Not attempted.
+
+`enqueue-wake`'s 5,048 is not extra questions either.
+`endpoint_receiver_process_for_reply` is one `REPLIES.with` read that returns
+`None` outright for a task-owned endpoint, which is why removing it from the fast
+path moved two ticks. What remains in that phase is `commit_ipc_call_handoff`,
+already one fused scheduler mutation, costing ~1.7x a bare scheduler acquisition
+(`wait-arm`, 2,897). That is the wake itself — runqueue insert, hint, possible
+IPI — and it is the price of waking a task, not of asking anything.
 
 The remaining ceiling removes whole *categories* rather than acquisitions. A
 per-thread pinned IPC buffer takes out the request copy, the response write, the
