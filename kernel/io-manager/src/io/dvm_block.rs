@@ -875,6 +875,13 @@ fn verify_epoch_signature_with_key(header: DvmBlockHeader, key_bytes: [u8; 32]) 
         return false;
     };
     let signature = Signature::from_bytes(&header.epoch_signature);
+    // `curve25519-dalek` selects an AVX2 or AVX512-IFMA field backend, and
+    // ed25519 hashes with `sha2`, whose SHA-512 compression has an AVX2 path.
+    // Together they are the kernel's largest body of wide SIMD -- roughly three
+    // thousand VEX instructions -- and this verification runs from block I/O with
+    // a user task's registers live. Neither kernel entry path saves the `ymm`
+    // upper halves, so the custody is this bracket's.
+    let _wide_simd = crate::arch::simd::wide_simd_section();
     key.verify_strict(&header.epoch_signing_bytes(), &signature)
         .is_ok()
 }

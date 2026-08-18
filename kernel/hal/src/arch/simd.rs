@@ -29,7 +29,17 @@ const SIMD_PROFILE_READY: u8 = 2;
 const SIMD_STATE_BYTES: usize = 4096;
 const FXSAVE_STATE_BYTES: usize = 512;
 const XMM_COPY_THRESHOLD_BYTES: usize = 256;
-const YMM_COPY_THRESHOLD_BYTES: usize = 256;
+/// A wide copy has to move enough to pay for its own custody.
+///
+/// Both kernel entry paths save `xmm0`-`xmm15` and nothing else, so the wide
+/// path can only run inside a `WideSimdSection`, and that section moves 512
+/// bytes of lane data across the two halves of the bracket. At the old 256-byte
+/// threshold the bracket moved twice what the copy did. Both `copy_fast` callers
+/// chunk by page, so a page is the size at which whole-page copies take the wide
+/// path and partial-page tails do not.
+const YMM_COPY_THRESHOLD_BYTES: usize = 4096;
+/// Bytes of `ymm` upper-half state a wide-SIMD section takes custody of.
+const YMM_UPPER_HALF_BYTES: usize = 16 * 16;
 
 static SIMD_MODE: AtomicU8 = AtomicU8::new(SIMD_MODE_FXSAVE);
 static SIMD_PROFILE_STATE: AtomicU8 = AtomicU8::new(SIMD_PROFILE_UNINITIALIZED);
@@ -284,6 +294,65 @@ pub unsafe fn restore_state(area: &SimdState) {
     }
 }
 
+/// The sixteen `ymm` upper halves, in register order.
+#[repr(C, align(32))]
+struct YmmUpperHalves([u8; YMM_UPPER_HALF_BYTES]);
+
+/// Custody of the `ymm` upper halves across kernel code that uses wide SIMD.
+///
+/// Neither kernel entry path saves them. The syscall stub and the interrupt
+/// stubs both save `xmm0`-`xmm15` with legacy `movdqu`, which leaves bits
+/// 255:128 exactly as the kernel left them — and *any* VEX-encoded instruction
+/// rewrites those bits, including a 128-bit one, which zeroes them. So a section
+/// of kernel code that executes wide SIMD while a user task's upper halves are
+/// live has to give them back itself.
+///
+/// The section is not a critical section. It needs no interrupt mask and it
+/// survives preemption and migration: the scheduler's per-task `XSAVE`/`XRSTOR`
+/// pair restores the whole register file at resume, and the saved copy rides the
+/// task's own kernel stack. It nests safely for the same reason — an inner
+/// section saves whatever the outer one was mid-way through and puts it back.
+///
+/// `tools/xtask/src/build/nucleus_audit.rs` audits the linked image for VEX
+/// instructions outside the symbols this bracket covers, so a new wide-SIMD
+/// dependency fails the build instead of silently corrupting a caller.
+#[must_use = "the upper halves are restored when the section is dropped"]
+pub struct WideSimdSection {
+    /// `None` when AVX is not enabled for this boot, in which case nothing in
+    /// the kernel can reach a VEX instruction and the section is inert.
+    saved: Option<YmmUpperHalves>,
+}
+
+/// Takes custody of the `ymm` upper halves until the returned value is dropped.
+pub fn wide_simd_section() -> WideSimdSection {
+    #[cfg(target_arch = "x86_64")]
+    if avx_enabled() {
+        let mut saved = YmmUpperHalves([0u8; YMM_UPPER_HALF_BYTES]);
+        // SAFETY: `avx_enabled()` is only published after XCR0 admits the YMM
+        // component on this CPU, and `saved` is 32-byte aligned storage for
+        // exactly the sixteen halves the save writes.
+        unsafe {
+            save_ymm_upper_halves(&mut saved);
+        }
+        return WideSimdSection { saved: Some(saved) };
+    }
+    WideSimdSection { saved: None }
+}
+
+impl Drop for WideSimdSection {
+    fn drop(&mut self) {
+        #[cfg(target_arch = "x86_64")]
+        if let Some(saved) = self.saved.as_ref() {
+            // SAFETY: the halves were saved on a CPU whose XCR0 admits YMM, and
+            // AVX enablement is immutable for the boot, so the restore is valid
+            // on whichever CPU the section ends on.
+            unsafe {
+                restore_ymm_upper_halves(saved);
+            }
+        }
+    }
+}
+
 #[inline]
 /// # Safety
 ///
@@ -294,6 +363,7 @@ pub unsafe fn copy_fast(src: *const u8, dst: *mut u8, len: usize) {
     }
 
     if avx_enabled() && len >= YMM_COPY_THRESHOLD_BYTES {
+        let _wide_simd = wide_simd_section();
         unsafe {
             copy_ymm(src, dst, len);
         }
@@ -394,6 +464,75 @@ pub unsafe fn copy_ymm(src: *const u8, dst: *mut u8, len: usize) {
             ptr::copy_nonoverlapping(src.add(i), dst.add(i), len - i);
         }
         _mm256_zeroupper();
+    }
+}
+
+/// Copies the sixteen `ymm` upper halves out to `area`.
+///
+/// # Safety
+///
+/// XCR0 must admit the YMM component on this CPU.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+unsafe fn save_ymm_upper_halves(area: &mut YmmUpperHalves) {
+    unsafe {
+        asm!(
+            "vextractf128 [{ptr} + 0x00], ymm0, 1",
+            "vextractf128 [{ptr} + 0x10], ymm1, 1",
+            "vextractf128 [{ptr} + 0x20], ymm2, 1",
+            "vextractf128 [{ptr} + 0x30], ymm3, 1",
+            "vextractf128 [{ptr} + 0x40], ymm4, 1",
+            "vextractf128 [{ptr} + 0x50], ymm5, 1",
+            "vextractf128 [{ptr} + 0x60], ymm6, 1",
+            "vextractf128 [{ptr} + 0x70], ymm7, 1",
+            "vextractf128 [{ptr} + 0x80], ymm8, 1",
+            "vextractf128 [{ptr} + 0x90], ymm9, 1",
+            "vextractf128 [{ptr} + 0xA0], ymm10, 1",
+            "vextractf128 [{ptr} + 0xB0], ymm11, 1",
+            "vextractf128 [{ptr} + 0xC0], ymm12, 1",
+            "vextractf128 [{ptr} + 0xD0], ymm13, 1",
+            "vextractf128 [{ptr} + 0xE0], ymm14, 1",
+            "vextractf128 [{ptr} + 0xF0], ymm15, 1",
+            ptr = in(reg) area.0.as_mut_ptr(),
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// Puts the sixteen `ymm` upper halves in `area` back, leaving every low half
+/// alone.
+///
+/// `vinsertf128` takes bits 127:0 from its first source, which is the same
+/// register, so this restores exactly the half the entry stubs cannot.
+///
+/// # Safety
+///
+/// `area` must hold halves saved by `save_ymm_upper_halves` on a CPU whose XCR0
+/// admits the YMM component.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+unsafe fn restore_ymm_upper_halves(area: &YmmUpperHalves) {
+    unsafe {
+        asm!(
+            "vinsertf128 ymm0, ymm0, [{ptr} + 0x00], 1",
+            "vinsertf128 ymm1, ymm1, [{ptr} + 0x10], 1",
+            "vinsertf128 ymm2, ymm2, [{ptr} + 0x20], 1",
+            "vinsertf128 ymm3, ymm3, [{ptr} + 0x30], 1",
+            "vinsertf128 ymm4, ymm4, [{ptr} + 0x40], 1",
+            "vinsertf128 ymm5, ymm5, [{ptr} + 0x50], 1",
+            "vinsertf128 ymm6, ymm6, [{ptr} + 0x60], 1",
+            "vinsertf128 ymm7, ymm7, [{ptr} + 0x70], 1",
+            "vinsertf128 ymm8, ymm8, [{ptr} + 0x80], 1",
+            "vinsertf128 ymm9, ymm9, [{ptr} + 0x90], 1",
+            "vinsertf128 ymm10, ymm10, [{ptr} + 0xA0], 1",
+            "vinsertf128 ymm11, ymm11, [{ptr} + 0xB0], 1",
+            "vinsertf128 ymm12, ymm12, [{ptr} + 0xC0], 1",
+            "vinsertf128 ymm13, ymm13, [{ptr} + 0xD0], 1",
+            "vinsertf128 ymm14, ymm14, [{ptr} + 0xE0], 1",
+            "vinsertf128 ymm15, ymm15, [{ptr} + 0xF0], 1",
+            ptr = in(reg) area.0.as_ptr(),
+            options(nostack, readonly, preserves_flags),
+        );
     }
 }
 

@@ -652,3 +652,54 @@ names = [
     "CPU_APIC_IDENTITIES",
 ]
 capacity = "MAX_TRACKED_CPUS"
+
+# Wide-SIMD custody. Neither kernel entry path saves the `ymm` upper halves --
+# the syscall stub and the interrupt stubs both use legacy `movdqu`, which
+# preserves bits 255:128 rather than restoring them -- and every VEX-encoded
+# instruction rewrites those bits, a 128-bit one by zeroing them. So kernel code
+# that executes wide SIMD while a user task's registers are live owns the
+# custody, through `wide_simd_section`.
+#
+# `tools/xtask/src/build/nucleus_audit.rs` audits the linked image for VEX
+# instructions in symbols outside the covered set, which catches a *new*
+# wide-SIMD dependency. It cannot catch a new *caller* of an
+# already-covered symbol, because the symbol is the same either way. These rules
+# close that half: the bracket must precede the verification that needs it, and
+# no other kernel crate may reach the crypto at all.
+[[required_sequences]]
+path = "kernel/io-manager/src/io/dvm_block.rs"
+tokens = [
+    "fn verify_epoch_signature_with_key(",
+    "let _wide_simd = crate::arch::simd::wide_simd_section();",
+    "key.verify_strict(",
+]
+
+[[forbidden_patterns]]
+scope = "kernel/compat/**/*.rs"
+regex = '\b(?:ed25519_dalek|curve25519_dalek|Sha512)\b'
+reason = "kernel wide-SIMD crypto is reachable only through the bracketed dvm-block epoch verification"
+
+[[forbidden_patterns]]
+scope = "kernel/ps/**/*.rs"
+regex = '\b(?:ed25519_dalek|curve25519_dalek|Sha512)\b'
+reason = "kernel wide-SIMD crypto is reachable only through the bracketed dvm-block epoch verification"
+
+[[forbidden_patterns]]
+scope = "kernel/hal/**/*.rs"
+regex = '\b(?:ed25519_dalek|curve25519_dalek|Sha512)\b'
+reason = "kernel wide-SIMD crypto is reachable only through the bracketed dvm-block epoch verification"
+
+[[forbidden_patterns]]
+scope = "kernel/ipc-runtime/**/*.rs"
+regex = '\b(?:ed25519_dalek|curve25519_dalek|Sha512)\b'
+reason = "kernel wide-SIMD crypto is reachable only through the bracketed dvm-block epoch verification"
+
+[[forbidden_patterns]]
+scope = "kernel/mm/**/*.rs"
+regex = '\b(?:ed25519_dalek|curve25519_dalek|Sha512)\b'
+reason = "kernel wide-SIMD crypto is reachable only through the bracketed dvm-block epoch verification"
+
+[[forbidden_patterns]]
+scope = "kernel/nucleus-core/**/*.rs"
+regex = '\b(?:ed25519_dalek|curve25519_dalek|Sha512)\b'
+reason = "kernel wide-SIMD crypto is reachable only through the bracketed dvm-block epoch verification"

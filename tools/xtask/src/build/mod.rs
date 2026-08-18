@@ -16,8 +16,12 @@ use crate::util::{
 };
 
 mod cargo;
+mod nucleus_audit;
 
 use cargo::{run_cargo_kernel_check, run_cargo_kernel_rustc};
+use nucleus_audit::{
+    audit_simd_custody, check_nucleus_multiboot2, check_nucleus_multiboot2_if_present,
+};
 
 const DEFAULT_GRUB_DEV_KEY: &str = "RustOS Dev GRUB <rustos-dev-grub@example.invalid>";
 
@@ -566,30 +570,8 @@ pub(crate) fn build_nucleus(config: &Config) -> Result<()> {
         copy_with_parent(&source, &artifact)?;
     }
     check_nucleus_multiboot2(config)?;
+    audit_simd_custody(config)?;
     refresh_nucleus_signature_after_build(config)
-}
-
-fn check_nucleus_multiboot2_if_present(config: &Config) -> Result<()> {
-    if config.artifact_nucleus_elf_path().is_file() {
-        check_nucleus_multiboot2(config)?;
-    }
-    Ok(())
-}
-
-fn check_nucleus_multiboot2(config: &Config) -> Result<()> {
-    let artifact = config.artifact_nucleus_elf_path();
-    let status = Command::new(&config.grub_file)
-        .arg("--is-x86-multiboot2")
-        .arg(&artifact)
-        .status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(anyhow!(
-            "nucleus artifact is not Multiboot2-compliant: {}",
-            artifact.display()
-        ))
-    }
 }
 
 pub(crate) fn sign_nucleus(config: &Config) -> Result<()> {
