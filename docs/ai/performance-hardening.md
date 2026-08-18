@@ -496,6 +496,13 @@ change here; four separate plans have been refuted by its numbers.
 | `enqueue-runtime` | 4,051 | 1.00 | 4,051 |
 | `wait-arm` | 2,897 | 1.00 | 2,897 |
 
+**81% of the round trip is unmeasured, and that is the ceiling.** Every
+`IpcCallPhase` is charged from the *caller*; `ipc_reply_recv.rs` has zero
+`charge_phase` calls. And `ipcbench` runs every probe in one boot with
+system-wide counters, so only four phases divide into one round trip. Fix the
+instrumentation before naming a target — four plans that did not are recorded as
+refuted.
+
 **Do not propose another acquisition fusion.** Three attempts reached the floor:
 the reply-wait poll budget is a *net loss* (an arm costs 2,897, a take 2,350, and
 `commit_block_current_task` consumes `wake_armed` in both branches so every turn

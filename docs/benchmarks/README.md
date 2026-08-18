@@ -807,6 +807,40 @@ honest position is that the synchronous IPC path has no remaining change whose
 measured value justifies its risk. What is left in the round trip is the two
 blocked transitions and the two dispatches — scheduling, not IPC.
 
+### 81% of the round trip has never been measured
+
+The reason four plans in a row named the wrong target is not that they reasoned
+badly. It is that the instrumentation only covers one side, and everyone
+optimised where the light was.
+
+| half | ticks | attributable | dark |
+|---|---:|---:|---:|
+| client `call` entry → server `recv` returns | 44,720 | 12,606 | **32,114 (72%)** |
+| server `reply` → client `call` returns | 28,480 | 1,618 | **26,862 (94%)** |
+| **round trip** | 73,200 | 14,224 | **58,976 (81%)** |
+
+Two independent gaps produce it:
+
+**1. The receiver side has no phase instrumentation at all.** Every
+`IpcCallPhase` variant — `CopyRequest`, `Enqueue*`, `Wait*`, `WriteResponse` —
+is charged from the *caller*. `ipc_reply_recv.rs` contains zero `charge_phase`
+calls, and neither `syscall_linux_rustos_ipc_recv` nor
+`syscall_linux_rustos_ipc_reply` charges a phase. The reply-to-return half is 94%
+dark, and that half contains the server's `reply` syscall, the caller's wake, a
+dispatch, and the caller's resume.
+
+**2. The counters are system-wide and the bench runs every probe in one boot.**
+`apps/ipcbench/src/main.rs` runs its probes unconditionally in sequence, and
+nothing resets a phase window between them. So a phase charged by more than one
+probe can never be divided into one, no matter how it is instrumented — which is
+why `syscall-phase-dispatch` reads 15.53 per round trip and `bind-visible` 18.76.
+Turning both diagnostic profiles on does not help; it adds rows that are equally
+unattributable, at a measured +6% to the round trip.
+
+**These are the ceiling.** Not the poll budget, not the enqueue chain, not the
+pinned buffer. Until a phase total can be divided into one round trip, every
+target is a guess, and this lane has now produced four of them.
+
 ### Why the next change has to be structural
 
 Nothing left in this table is individually above the probe table's ±2%

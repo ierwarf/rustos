@@ -25,20 +25,34 @@ topic; never read it top-down and treat what you hit first as current.
 `ipc_rt_intra_process` is **73,760** invariant-TSC ticks, from 397,040. seL4's
 x86 MCS round trip is ~720 cycles, so the gap is ~102x.
 
-Four structural ceilings are closed and one remains:
+All five structural ceilings are closed, **four of them by measurement rather
+than by a change**:
 
 | ceiling | outcome |
 |---|---|
-| lockdep posture | priced, kept; the baseline was stale, not the code |
-| FPU custody | per-syscall `XSAVE` pair **deleted**, 829 ticks/syscall |
-| reply-wait protocol | **refuted** — arming before the poll is a net loss |
-| enqueue chain | **exhausted** — two fusions measured nothing |
-| per-thread IPC buffer | open, and must be built whole |
+| 06 lockdep posture | priced, kept; the baseline was stale, not the code |
+| 05 FPU custody | per-syscall `XSAVE` pair **deleted**, 829 ticks/syscall |
+| 01+02 reply-wait protocol | refuted — an arm (2,897) costs more than a poll (2,350) |
+| 03 enqueue chain | exhausted — two fusions measured 5,050 → 5,048 |
+| 04 per-thread IPC buffer | 3,380 ticks, 4.6% — does not earn its pinning hazards |
 
-**The three refutations all started from a stale document.** Each plan named a
-target the counters did not support: "allocation" (`copy-alloc` is 701 ticks),
-"two polls per turn" (three), "fewer polls is cheaper" (an arm costs more than a
-poll). Measure the specific phase before designing against it.
+**The real ceiling is that 81% of the round trip has never been measured.**
+
+| half | ticks | attributable | dark |
+|---|---:|---:|---:|
+| client `call` → server `recv` returns | 44,720 | 12,606 | 32,114 (72%) |
+| server `reply` → client `call` returns | 28,480 | 1,618 | 26,862 (94%) |
+
+Two gaps cause it: `ipc_reply_recv.rs` has **zero** `charge_phase` calls and
+neither `syscall_linux_rustos_ipc_recv` nor `syscall_linux_rustos_ipc_reply`
+charges a phase, so the receiver side is entirely dark; and
+`apps/ipcbench/src/main.rs` runs every probe in one boot with system-wide
+counters, so a phase charged by more than one probe can never be divided into
+one.
+
+**Next work is instrumentation, not optimisation.** No target may be named until
+a phase total divides into one round trip. `cargo xtask bench` now prints that
+ratio and parenthesises it when it does not hold.
 
 ### Deleted surfaces — do not re-create
 
