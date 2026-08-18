@@ -45,6 +45,7 @@
 - [Commands](ai/commands.md)
 - [Contracts](ai/contracts.md)
 - [Performance & Hardening](ai/performance-hardening.md)
+- [IPC & Syscall Cost](benchmarks/README.md)
 - [Physical GPU Status](ai/physical-gpu-status.md)
 - [Kernel API Map](ai/kernel-api-map.md)
 - [Workflows](ai/workflows.md)

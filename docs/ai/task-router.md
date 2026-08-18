@@ -29,6 +29,7 @@ set settles. The printed plan is not validation evidence.
 | UI/rendering issue | `repo-map.md` | search `services/uiserver/src`; open only the matching `render.rs` or `app/*` range |
 | Hardening request | `core-engineering-contract.md`, `commercial-quality-gates.md`, `system-flows.md`, `contracts-abi.md`, `kernel-api-map.md` | highest-risk whole flow first; exact API, broker, service, lock, memory, or device path found by MCP search |
 | Boot/runtime performance cleanup | `performance-hardening.md`, `commands.md` | one focused log extract; exact `services/*`, `kernel/*`, `drivers/*`, or `tools/xtask/*` owner range named by the log |
+| IPC / syscall / scheduler *cost* change | `performance-hardening.md` → "Synchronous IPC and the Syscall Entry Path", then `docs/benchmarks/README.md` | the evidence is `cargo xtask bench` and the in-kernel phase counters, **not** a log extract. Read the measured decomposition before naming a target; three premises in this lane were refuted by it and two fusions measured nothing. Never propose another acquisition fusion without a counter that resolves it |
 | Ring0/ring3 ownership or microkernel boundary | `contracts-abi.md`, `commands.md` | `kernel-api-map.md`, then exact broker, service, driver, input, storage, or compat path and its owning service contract |
 | Add service/app/driver | `workflows.md` | one closest existing manifest, one closest source file, target manifest/source only |
 | Docs update | `docs/SUMMARY.md` | target doc only; AI docs only if agent context changes |

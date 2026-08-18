@@ -1,51 +1,44 @@
-tsc_khz=3991188
+tsc_khz=3991205
 
 probe                                       iters    min_cyc    p50_cyc    p99_cyc   mean_cyc    min_ns    p50_ns
 ----------------------------------------------------------------------------------------------------------------
 tsc_overhead                                50000         40         40         80         56        10        10
-null_syscall_getpid                         50000       2720       2760       2800       2886       681       691
-vmexit_cpuid                                50000       3920       4000       4320       4048       982      1002
-sched_yield                                 50000      23120      61360     153360      91793      5792     15373
-ipc_try_recv_empty                          50000       3800       3840       3920       3898       952       962
-ipc_rt_intra_process                        20000      76080      79800     264760     111419     19061     19994
-ipc_split_call_to_recv                      20000      45280      48440      66600      49767     11344     12136
-ipc_split_server_body                       20000         40         40         80         54        10        10
-ipc_split_reply_to_return                   20000      30160      31200     214120      61597      7556      7817
-ipc_rt_cross_process_syscalld_getuid        20000      84320     115280     342040     142607     21126     28883
+null_syscall_getpid                         50000       1640       1680       1880       1733       410       420
+vmexit_cpuid                                50000       3880       3960       4520       4045       972       992
+sched_yield                                 50000      22440      61040     141120      85508      5622     15293
+ipc_try_recv_empty                          50000       2800       2840       3240       2919       701       711
+ipc_rt_intra_process                        20000      73760      76720     262040      94716     18480     19222
+ipc_split_call_to_recv                      20000      44720      47200      65440      48523     11204     11826
+ipc_split_server_body                       20000         40         40        120         56        10        10
+ipc_split_reply_to_return                   20000      28480      29360     212040      46136      7135      7356
+ipc_rt_cross_process_syscalld_getuid        20000      81240     111720     347760     153159     20354     27991
 
 derived:
-  cross-process IPC round trip (getuid - getpid): min=81600 cyc  p50=112520 cyc
-  round trip / local syscall ratio: min=30.0x  p50=40.8x
+  cross-process IPC round trip (getuid - getpid): min=79600 cyc  p50=110040 cyc
+  round trip / local syscall ratio: min=48.5x  p50=65.5x
 
 in-kernel phase profile (system-wide, summed over the run):
   phase                                     samples     cyc/sample
   ----------------------------------------------------------------
-  syscall-phase-dispatch                     347021         558510
-  ipc-call-phase-wait-blocked                 52796         484360
-  syscall-phase-reschedule-deferred          342830          38725
-  ipc-call-phase-enqueue                      23179          10194
-  ipc-call-phase-enqueue-wake                 53213           4712
-  ipc-call-phase-enqueue-runtime              53143           3529
-  ipc-call-phase-wait-arm                     52741           2690
-  ipc-call-phase-wait-take                   158038           2238
-  ipc-call-phase-copy-request                 23179           1727
-  ipc-call-phase-write-response               23161           1596
-  usermem-phase-read-copy                     87285           1093
-  usermem-phase-read-bind                     87018            930
-  usermem-phase-write-bind                   115269            911
-  ipc-call-phase-wait-disarm                 105628            844
-  usermem-phase-bind-visible                 291081            657
-  ipc-call-phase-enqueue-deadline             23161            650
-  ipc-call-phase-copy-alloc                   76245            552
-  syscall-phase-simd-restore                 347525            527
-  usermem-phase-bind-retain                    7974            517
-  syscall-phase-simd-capture                 346746            281
-  usermem-phase-write-copy                   270980            261
-  syscall-phase-validate                     693920            225
-  usermem-phase-bind-identity                298237            206
-  usermem-phase-read-validate                 87162            187
-  ipc-call-phase-wait-deadline-sample        158606            115
-  usermem-phase-write-validate               270593             92
-  syscall-phase-trace                        694263             29
+  ipc-call-phase-wait-blocked                 51103         522018
+  ipc-call-phase-enqueue                      22960          10164
+  ipc-call-phase-enqueue-wake                 51517           4853
+  ipc-call-phase-enqueue-runtime              51448           3525
+  ipc-call-phase-wait-arm                     51001           2720
+  ipc-call-phase-wait-take                   152822           2260
+  ipc-call-phase-copy-request                 22987           1762
+  ipc-call-phase-write-response               22958           1618
+  usermem-phase-read-bind                     66731            932
+  usermem-phase-write-bind                   135214            929
+  ipc-call-phase-wait-disarm                 102115            892
+  ipc-call-phase-enqueue-deadline             22955            680
+  usermem-phase-bind-visible                 335989            677
+  usermem-phase-bind-retain                    6113            547
+  usermem-phase-read-copy                     97401            274
+  ipc-call-phase-copy-alloc                   74336            264
+  usermem-phase-write-copy                   278915            258
+  usermem-phase-bind-identity                341432            207
+  ipc-call-phase-wait-deadline-sample        153574            115
+  usermem-phase-write-validate               278519             88
+  usermem-phase-read-validate                 66892             85
   ipc-call-phase-discarded                        0              0
-  syscall-phase-discarded                         0              0

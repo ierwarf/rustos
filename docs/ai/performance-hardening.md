@@ -462,6 +462,61 @@ lock, and service restart invalidates it by advancing the epoch.
   ready-wait rail therefore covers causal core servers without making dynamic
   applications strict-priority work.
 
+## Synchronous IPC and the Syscall Entry Path
+
+The evidence for this lane is `cargo xtask bench`, not a debugcon capture, and
+its findings live in `docs/benchmarks/README.md`. Read that before proposing a
+change here; four separate plans have been refuted by its numbers.
+
+**Five rules, each of which was learned by getting it wrong:**
+
+1. **The anchor is `vmexit_cpuid`.** It contains no RustOS code. A comparison
+   whose anchor moved more than ~3% is not a measurement. `null_syscall_getpid`
+   is *not* a control — it moved 7.8% on a lockdep-only change.
+2. **The probe floor is ±2%**, and ~15% on `sched_yield`. Below that, judge by an
+   `ipc-call-phase-*` / `usermem-phase-*` counter or not at all.
+3. **A committed baseline is a record, not a control.** Unmodified HEAD once
+   measured +5.4% against its own baseline file with the anchor held. Every
+   comparison needs a same-session control run.
+4. **Ablation and a shipped gate are different measurements.** Stubbing the
+   syscall phase profile read −2.4%/−1.7% on the round-trip probes; the gate read
+   +0.7%. The gate is the honest one.
+5. **The phase counters have two denominators.** `copy-request`,
+   `write-response`, `enqueue`, and `enqueue-deadline` are charged once per
+   *syscall-path* call; `enqueue-runtime`, `enqueue-wake`, and every `wait-*`
+   once per *endpoint* call, ~2.4x more often. Mixing them inflates every ratio
+   by that factor.
+
+**Where the cost is**, per endpoint call, measured:
+
+| phase | ticks/op | per call | ticks/call |
+|---|---:|---:|---:|
+| `wait-take` | 2,350 | 2.97 | 6,980 |
+| `enqueue-wake` | 5,048 | 1.00 | 5,048 |
+| `enqueue-runtime` | 4,051 | 1.00 | 4,051 |
+| `wait-arm` | 2,897 | 1.00 | 2,897 |
+
+**Do not propose another acquisition fusion.** Three attempts reached the floor:
+the reply-wait poll budget is a *net loss* (an arm costs 2,897, a take 2,350, and
+`commit_block_current_task` consumes `wake_armed` in both branches so every turn
+must re-arm); the enqueue chain's last unconditional acquisition moved
+`enqueue-wake` by 2 ticks; a take's third acquisition is worth ~1,560 against a
+TOCTOU guard with formal models attached. 2% of 73,760 is ~1,500 ticks, which is
+the size of everything that remains individually.
+
+**Three telemetry profiles are build switches, all off by default**:
+`[lock_telemetry]`, `[scheduler_telemetry]`, and `[syscall_telemetry]`
+`phase_profile` in `config/rustos.toml`. Each cost more than the work it
+measured. Turn one on for a diagnosis run and read the result as the cost of an
+*instrumented* operation.
+
+**FPU custody is an invariant, not a save.** Both kernel entry paths preserve
+`xmm0`-`xmm15` and nothing else. x87, MXCSR, and the `ymm` upper halves are held
+by `tools/xtask/src/build/nucleus_audit.rs`, which audits the linked image on
+every build and fails it on any x87 instruction, any floating-point arithmetic,
+or wide SIMD outside `kernel_hal::arch::simd::wide_simd_section`. Adding
+floating-point work to the kernel is therefore a build error, by design.
+
 ## Executable Snapshot Path
 
 - Vfsd materializes one exact admitted executable file into a private memfd,

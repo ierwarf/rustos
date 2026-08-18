@@ -8,7 +8,10 @@ description: Resume or prepare a RustOS development session without losing goal,
 ## Resume
 
 1. Read the root `AGENTS.md` stable prefix, then
-   `docs/ai/session-handoff.md`. Do not load unrelated AI contracts.
+   `docs/ai/session-handoff.md` — **its "Current checkout snapshot" section
+   only**. Everything from "Session log" onward is a dated archive whose early
+   entries are superseded in place further down; reading it top-down is how a
+   stale claim gets treated as current. Do not load unrelated AI contracts.
 2. Query the live goal state. Never infer that a documented old objective is
    active, and create a goal only when the user explicitly requests one.
 3. Run `git status --short` and a focused `git diff --stat`. Preserve every

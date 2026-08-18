@@ -81,9 +81,9 @@ that sets IPC latency.
 
 The `ipc_split_*` rows answer this directly. The tables in this section and the
 next several were recorded when the round trip was ~403,000 cycles; it is now
-118,160. **Read the shapes, not the absolute numbers** — the ratios below have
+**73,760**. **Read the shapes, not the absolute numbers** — the ratios below have
 held across every reduction since, and `docs/benchmarks/ipc-baseline.txt` is the
-current figure of record.
+figure of record, refreshed at the commit that last moved it.
 
 | segment | min cycles | share |
 | --- | --- | --- |
@@ -714,7 +714,8 @@ allocation, the byte copy, and two slab inserts — is 3,950 and `enqueue-wake` 
 
 ## Where the round trip's time actually sits
 
-`ipc_rt_intra_process` is 73,640 ticks. The phase counters account for it, but
+`ipc_rt_intra_process` is 73,760 ticks in the baseline of record. The phase
+counters account for it, but
 only if the denominators are right — this lane has **two** populations, and
 mixing them inflates every ratio:
 
@@ -754,7 +755,7 @@ be 86–94% of a copy, and no longer is.
 ### Why the next change has to be structural
 
 Nothing left in this table is individually above the probe table's ±2%
-resolution. 73,640 ticks × 2% is about 1,500, and the largest single removable
+resolution. 73,760 ticks × 2% is about 1,500, and the largest single removable
 item found in this session's three attempts was worth roughly that.
 
 That is not an argument for a smaller optimization; it is the argument **against

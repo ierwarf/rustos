@@ -6,15 +6,51 @@ command output win when they disagree with this page.
 
 ## Current checkout snapshot
 
-Recorded on 2026-08-04 during the active SMP performance investigation.
+Recorded 2026-08-18. **This block is the only current-state section.**
+Everything from "Session log" onward is a dated chronological archive, oldest
+first, containing claims that were true when written and several that were later
+corrected in place further down. Read this block, then search the archive for a
+topic; never read it top-down and treat what you hit first as current.
 
-- The worktree is intentionally dirty. Preserve all tracked and untracked work.
-  Never use `reset`, `clean`, or a broad `restore`.
-- The tree did not compile when this session started: a previous session had
-  moved `Scheduler::current_task` behind `#[cfg(test)]` without updating
-  `scheduler/affinity.rs`, `scheduler/linux_thread_state.rs`, and
-  `scheduler/smp.rs`. That migration is now finished; `cargo xtask check`,
-  `cargo xtask build`, and `formal/verify-all.sh --profile pr` all pass.
+- The worktree is **clean** and the `pr` profile seals. Earlier revisions of this
+  block said the tree was intentionally dirty; that has not been true since
+  2026-08-17.
+- The active lane is synchronous IPC and syscall entry cost.
+  `docs/benchmarks/README.md` is the evidence and
+  `docs/ai/performance-hardening.md` has the routing rules. **Both outrank this
+  page**, and both outrank any plan file.
+
+### Where the IPC lane stands
+
+`ipc_rt_intra_process` is **73,760** invariant-TSC ticks, from 397,040. seL4's
+x86 MCS round trip is ~720 cycles, so the gap is ~102x.
+
+Four structural ceilings are closed and one remains:
+
+| ceiling | outcome |
+|---|---|
+| lockdep posture | priced, kept; the baseline was stale, not the code |
+| FPU custody | per-syscall `XSAVE` pair **deleted**, 829 ticks/syscall |
+| reply-wait protocol | **refuted** — arming before the poll is a net loss |
+| enqueue chain | **exhausted** — two fusions measured nothing |
+| per-thread IPC buffer | open, and must be built whole |
+
+**The three refutations all started from a stale document.** Each plan named a
+target the counters did not support: "allocation" (`copy-alloc` is 701 ticks),
+"two polls per turn" (three), "fewer polls is cheaper" (an arm costs more than a
+poll). Measure the specific phase before designing against it.
+
+### Deleted surfaces — do not re-create
+
+- `kernel/ps/src/multitask/syscall_simd.rs` and `SyscallUserSimdSnapshot`. The
+  syscall entry stub's sixteen `movdqu` are the whole of the syscall path's FPU
+  custody. See `nucleus_audit.rs` for what holds the rest.
+- `kernel/compat/src/user/linux.rs`. Truth is `kernel/ps/src/user/linux.rs`.
+
+## Session log
+
+Historical, oldest first. Superseded by the snapshot above wherever they
+disagree, and by `docs/benchmarks/README.md` on anything measured.
 
 ### Root cause of the SMP collapse: `CPUID` in the raw-lock path
 

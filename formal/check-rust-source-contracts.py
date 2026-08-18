@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Reject undocumented high-risk Rust boundaries and unbounded source debt."""
+"""Reject undocumented high-risk Rust boundaries, unbounded source debt, and
+documentation that points at source files which no longer exist."""
 
 from __future__ import annotations
 
@@ -17,6 +18,23 @@ DEBT = ROOT / "formal/rust-source-debt.tsv"
 LARGE_FILES = ROOT / "formal/rust-large-files.tsv"
 LARGE_FILE_THRESHOLD = 1300
 HEADER_SCAN_LINES = 100
+
+# Markdown outside `references/`, which is vendored upstream material this repo
+# does not own.
+DOC_ROOTS = ("docs", "formal", "kernel", "tools", "libs", "services", ".agents", ".serena")
+SOURCE_PATH_IN_DOCS = re.compile(
+    r"\b((?:kernel|tools|libs|services|boot|formal|config|drivers|apps)"
+    r"/[A-Za-z0-9_./-]+\.(?:rs|toml|tla|sh|py|tsv|cfg))\b"
+)
+# Paths a document names precisely *because* they were removed. Each entry is a
+# standing instruction not to re-create the file, so the reference has to
+# survive the file. Anything else that stops existing is documentation rot.
+RETIRED_PATH_REFERENCES = {
+    "kernel/compat/src/user/linux.rs":
+        "consumed into syscalld routing; kernel/ps/src/user/linux.rs is the truth",
+    "kernel/ps/src/multitask/syscall_simd.rs":
+        "the per-syscall FPU snapshot was deleted, not relocated",
+}
 
 HEADER_FIELDS = (
     "owner",
@@ -232,6 +250,54 @@ def check_production_markers(files: list[Path], errors: list[str]) -> None:
                     )
 
 
+def tracked_markdown() -> list[Path]:
+    output = subprocess.check_output(
+        ["git", "ls-files", "--cached", "--others", "--exclude-standard", "--", "*.md"],
+        cwd=ROOT,
+        text=True,
+    )
+    return [
+        Path(line)
+        for line in output.split()
+        if line and line.split("/", 1)[0] in DOC_ROOTS or line in ("AGENTS.md", "README.md")
+    ]
+
+
+def check_documented_source_paths(errors: list[str]) -> int:
+    """Every source path a document names must exist, or be a retired one.
+
+    Documentation that points at a moved or deleted file is worse than silence:
+    it reads as current and sends the next reader, human or agent, to design
+    against something that is not there. Three plans in the IPC lane were
+    refuted only after the work started, each one having named a target the
+    source no longer supported.
+    """
+    checked = 0
+    for relative in tracked_markdown():
+        path = ROOT / relative
+        if not path.is_file():
+            continue
+        for number, line in enumerate(path.read_text(errors="replace").splitlines(), 1):
+            for named in SOURCE_PATH_IN_DOCS.findall(line):
+                checked += 1
+                if (ROOT / named).exists():
+                    continue
+                if named in RETIRED_PATH_REFERENCES:
+                    continue
+                fail(
+                    errors,
+                    f"{relative}:{number}: documented source path does not exist: {named}",
+                )
+    for retired, reason in RETIRED_PATH_REFERENCES.items():
+        if (ROOT / retired).exists():
+            fail(
+                errors,
+                f"{retired} was re-created; it is registered as retired in "
+                f"check-rust-source-contracts.py because {reason}",
+            )
+    return checked
+
+
 def main() -> int:
     errors: list[str] = []
     files = tracked_rust_files()
@@ -240,6 +306,7 @@ def main() -> int:
     check_debt_ledger(debt, errors)
     check_large_files(files, errors)
     check_production_markers(files, errors)
+    documented = check_documented_source_paths(errors)
 
     if errors:
         for error in errors:
@@ -247,7 +314,8 @@ def main() -> int:
         return 1
     print(
         "rust source contracts passed: "
-        f"{len(files)} Rust files, {len(risks)} critical/high surfaces"
+        f"{len(files)} Rust files, {len(risks)} critical/high surfaces, "
+        f"{documented} documented source paths"
     )
     return 0
 

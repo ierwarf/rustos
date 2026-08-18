@@ -34,6 +34,9 @@ output outside the cached unit.
 - `docs/ai/physical-gpu-status.md` — current physical GPU evidence boundary,
   remaining generic userspace readiness ABI, and safe continuation rules.
 - `docs/ai/performance-hardening.md` — boot/runtime bottleneck and cleanup runbook.
+- `docs/benchmarks/README.md` — the IPC/syscall cost lane: measured phase
+  decomposition, the anchor and noise-floor rules, and the ceilings that were
+  closed by measurement rather than by a change. Outranks any plan file.
 - `docs/ai/smp-contract.md` — normative x86_64 CPU topology, AP startup,
   per-CPU state, IPI, scheduler, TLB, lifetime, panic, and release gates.
 - `docs/ai/structural-ownership-design.md` — source-verified status of the

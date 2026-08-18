@@ -178,4 +178,4 @@ existing artifact; it does not justify a DVM rebuild.
 - Do not add `--release` to xtask invocations unless the user asks; debug
   builds catch more bugs.
 - Do not touch `Cargo.lock` to "fix" a resolver error without checking
-  `tools/xtask/src/build.rs` first.
+  `tools/xtask/src/build/mod.rs` first.
