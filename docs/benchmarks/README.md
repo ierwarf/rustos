@@ -712,6 +712,66 @@ documented invariant's comment to be trimmed to fit, is not an improvement.
 allocation, the byte copy, and two slab inserts — is 3,950 and `enqueue-wake` is
 5,207. Those are the things to attack, not the acquisitions around them.
 
+## Where the round trip's time actually sits
+
+`ipc_rt_intra_process` is 73,640 ticks. The phase counters account for it, but
+only if the denominators are right — this lane has **two** populations, and
+mixing them inflates every ratio:
+
+- `copy-request` / `write-response` / `enqueue` / `enqueue-deadline` are charged
+  once per *syscall-path* call: 23,411 in the run below.
+- `enqueue-runtime` / `enqueue-wake` / `wait-*` are charged once per *endpoint*
+  call: 56,730. There are ~2.4 endpoint calls per syscall-path call.
+
+Per endpoint call, with `wait-arm` as the unit:
+
+| phase | ticks/op | per call | ticks/call |
+|---|---:|---:|---:|
+| `wait-take` | 2,350 | 2.97 | **6,980** |
+| `enqueue-wake` | 5,048 | 1.00 | **5,048** |
+| `enqueue-runtime` | 4,051 | 1.00 | **4,051** |
+| `wait-arm` | 2,897 | 1.00 | 2,897 |
+| `wait-disarm` | 889 | 1.98 | 1,760 |
+| `wait-deadline-sample` | 122 | 2.98 | 364 |
+
+Per syscall-path call: `enqueue` 11,052 (which contains runtime + wake),
+`copy-request` 1,946, `write-response` 1,712, `enqueue-deadline` 714.
+
+And the user-copy side, which every one of those transfers pays:
+
+| usermem phase | ticks/op | samples |
+|---|---:|---:|
+| `read-copy` | 1,002 | 104,835 |
+| `read-bind` | 989 | 104,513 |
+| `write-bind` | 961 | 141,744 |
+| `bind-visible` | **706** | **356,788** |
+| `bind-identity` | 218 | 368,517 |
+
+`bind-visible` is the largest usermem cost by total volume. Note that `read-bind`
+(989) and `read-copy` (1,002) are now *equal* — binding the address space used to
+be 86–94% of a copy, and no longer is.
+
+### Why the next change has to be structural
+
+Nothing left in this table is individually above the probe table's ±2%
+resolution. 73,640 ticks × 2% is about 1,500, and the largest single removable
+item found in this session's three attempts was worth roughly that.
+
+That is not an argument for a smaller optimization; it is the argument **against
+another fusion**. Three attempts at acquisition-counting reached the same place:
+
+- the reply-wait poll budget — a net loss, because an arm costs more than a poll;
+- the enqueue chain's last unconditional acquisition — 5,050 → 5,048 ticks;
+- a take's third acquisition (`REPLIES` re-acquired inside `ENDPOINT_MESSAGES`,
+  which on the Pending path guards a decision with no effect) — best case ~1,560
+  ticks, against a TOCTOU guard with formal models attached. Not attempted.
+
+The remaining ceiling removes whole *categories* rather than acquisitions. A
+per-thread pinned IPC buffer takes out the request copy, the response write, the
+address-space binds on both, and the allocating half of `enqueue-runtime` — in
+one change, and only as one change. Attacking any of them alone lands under the
+floor.
+
 ## What only eight CPUs could show
 
 `cargo xtask bench --rustos-vcpus N` runs the lane at a chosen CPU count. The
