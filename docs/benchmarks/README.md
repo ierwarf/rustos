@@ -652,6 +652,66 @@ forever, to protect against arithmetic the image does not contain.
 from the allowlist and rebuilding failed the build naming all eight of its
 symbols with their instruction counts.
 
+## Two ceilings the measurement closed without a change
+
+### The reply-wait poll budget is already right
+
+The plan for the largest remaining ceiling was to reorder the reply wait so the
+block is armed before the request is published, cutting the polls per turn from
+two to one. The reasoning was that each poll is an endpoint acquisition and one
+of them is redundant.
+
+The `ipc-call-phase-*` counters price the whole loop, and the sample ratios
+confirm its shape independently of reading it. Taking the armed-turn count
+(59,010) as the unit:
+
+| phase | ticks/op | samples | per armed wait |
+|---|---:|---:|---:|
+| `wait-take` | 2,354 | 176,809 | **3.0** |
+| `wait-arm` | **2,858** | 59,010 | 1.0 |
+| `wait-disarm` | 958 | 118,142 | 2.0 |
+| `wait-blocked` | 680,506 | 59,118 | 1.0 |
+
+So a successful call performs **three** takes, not two: turn 1 polls before the
+arm and again after it, then blocks; the wake returns `Some(true)`, the loop
+continues, and turn 2 polls a third time and wins.
+
+The reorder fails on the row above it. `commit_block_current_task` **consumes**
+`wake_armed` in both of its branches, so every turn must re-arm. Arming before
+the single poll therefore costs turn 2 an arm it does not currently pay — turn 2
+finds the response on its first poll and returns *before* arming anything:
+
+|  | takes | arms | cancels |
+|---|---:|---:|---:|
+| today | 3 | 1 | 0 |
+| arm-before-poll | 2 | 2 | 1 |
+
+At 2,354 a take and **2,858 an arm**, trading a take for an arm is a loss before
+the cancel is counted. The current structure is already the cheaper one.
+
+The premise was wrong three times, each corrected by looking rather than
+reasoning: first that a non-waking enqueue would close the race (publication
+makes the message visible, not the wake); then that the budget was 2 (it is 3);
+then that fewer polls is cheaper (an arm costs more than a poll).
+
+### The enqueue chain has no more fusions in it
+
+`receiver_process_for_reply` was called unconditionally in
+`enqueue_call_and_wake_with_handles` and read only inside the branch for "no
+receiver was parked" — a reply-object acquisition the synchronous fast path
+never looked at. Moving it inside the branch measured **nothing**, on the probe
+table and on `ipc-call-phase-enqueue-wake` alike: 5,050 → 5,048 ticks.
+
+That is the second consecutive fusion on this chain to measure nothing. The
+first was kept on structural grounds; this one was reverted, because a third
+unmeasurable change into a file already over its split-debt budget, requiring a
+documented invariant's comment to be trimmed to fit, is not an improvement.
+
+**The enqueue chain's cost is not the number of questions it asks.**
+`ipc-call-phase-enqueue` is 11,001 ticks, of which `enqueue-runtime` — the
+allocation, the byte copy, and two slab inserts — is 3,950 and `enqueue-wake` is
+5,207. Those are the things to attack, not the acquisitions around them.
+
 ## What only eight CPUs could show
 
 `cargo xtask bench --rustos-vcpus N` runs the lane at a chosen CPU count. The
