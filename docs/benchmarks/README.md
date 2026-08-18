@@ -553,6 +553,105 @@ And an effect smaller than a few percent is invisible under a layout change of
 this size, so "no large win" is the honest ceiling on the conclusion, not "no
 cost".
 
+## A third stopwatch, and the shape that produced all three
+
+The syscall entry path carried its own per-phase profile, unconditional, seven
+`rdtsc` reads per syscall. Ablated, then measured again through the shipped
+switch:
+
+| probe | ablation 1 | ablation 2 | shipped gate |
+|---|---:|---:|---:|
+| `null_syscall_getpid` | −12.8% | −12.8% | −12.8% |
+| `ipc_try_recv_empty` | −8.8% | −7.5% | −7.5% |
+| `vmexit_cpuid` (anchor) | 0.0% | 0.0% | +1.0% |
+
+The round-trip probes read −2.4% and −1.7% under ablation and +0.7% through the
+gate. **The gated number is the honest one and the ablation pair was noise.** At
+~240 ticks a syscall, an `ipc_rt_intra_process` of 79,440 should move about 1.1%
+— inside this probe's ±2% floor. Two of three runs suggested a round-trip win
+that is not there, which is what the floor is for.
+
+Three instances of one shape now: a per-phase timing profile wrapped around an
+operation cheaper than the profile. Each was found the same way — stub it out,
+measure — and each cost more than what it measured. The third survived two
+commits that fixed the first two, in the same way the acquire-side identity
+derivations survived a commit that fixed the release side: **the fix was applied
+where the problem was found rather than everywhere the shape occurs.**
+
+## Preserving register state nothing disturbs
+
+Every syscall did an `XSAVE` on entry and an `XRSTOR` on return. The syscall
+phase counters priced the pair directly, over 1.08 million syscalls:
+
+| phase | ticks/syscall |
+|---|---:|
+| `simd-capture` | 290 |
+| `simd-restore` | 539 |
+| **total** | **829** |
+
+`null_syscall_getpid` was 2,560 ticks. Nearly a third of the cheapest possible
+syscall was preserving registers.
+
+What made it removable was not a cheaper save. It was **disassembling the linked
+image** instead of reasoning about the source:
+
+| property of `nucleus.elf` (315,292 instructions) | count |
+|---|---:|
+| x87 instructions | 0 |
+| SSE/AVX floating-point *arithmetic* | 0 |
+| symbols containing VEX/EVEX instructions | 10 |
+
+Every SSE instruction in the kernel is data movement or bitwise — 9,294
+`movaps`, 4,668 `movups`, 200 `xorps` — and none of those writes an `MXCSR`
+status flag. Nine of the ten wide-SIMD symbols are `curve25519-dalek` and
+`sha2`, reached from ed25519 epoch-signature verification that runs from block
+I/O with a user task's registers live. That one is real, and is now bracketed.
+
+So of the four things the pair saved, XMM was already covered by the entry
+stub's sixteen `movdqu`, x87 and MXCSR had nothing to save from, and YMM had
+exactly two call sites. The pair was insurance against code the kernel does not
+contain.
+
+### The measurement that attributes itself
+
+| probe | before | after | delta | syscalls it performs |
+|---|---:|---:|---:|---:|
+| `null_syscall_getpid` | 2,560 | 1,840 | −720 | 1 |
+| `ipc_try_recv_empty` | 3,760 | 3,000 | −760 | 1 |
+| `ipc_split_call_to_recv` | 45,360 | 44,600 | −760 | 1 |
+| `ipc_split_reply_to_return` | 30,240 | 28,680 | −1,560 | 2 |
+| `ipc_rt_intra_process` | 76,160 | 73,640 | −2,520 | ~3.5 |
+| `ipc_rt_cross_process` | 84,360 | 80,560 | −3,800 | ~5 |
+| `vmexit_cpuid` (anchor) | 3,720 | 3,800 | +80 | 0 |
+
+Every probe drops by roughly 760 ticks **times the number of syscalls it
+performs**, and the one that performs none moves only with the anchor. That is
+the attribution rather than an inference from it — the same clean shape the
+scheduler-stopwatch commit produced when both non-dispatch probes read exactly
+zero.
+
+### Verifying a property instead of paying for it
+
+Linux keeps kernel code away from the FPU with `-msoft-float`, confining hard
+float to `kernel_fpu_begin()` sections. Rust cannot express that split on
+x86-64: measured, `-C target-feature=+soft-float` emits no XMM/YMM even inside a
+`#[target_feature(enable = "avx")]` function, and the kernel target's baseline
+includes SSE2 (rust-lang/rust#136540, #133611, #116344).
+
+`tools/xtask/src/build/nucleus_audit.rs` gets the property anyway, by auditing
+the artifact on every nucleus build, before signing. A violation fails the build
+with the remedy named.
+
+This retired a change that was already written and already measured free: an
+`stmxcsr`/`ldmxcsr` pair in the syscall stub. It fixes no live leak, and the
+interrupt stubs do not save `MXCSR` either, so shipping only the syscall half
+would have been an incoherent guarantee — two instructions on every syscall
+forever, to protect against arithmetic the image does not contain.
+
+**A green check that cannot go red is not evidence.** Dropping `curve25519_dalek`
+from the allowlist and rebuilding failed the build naming all eight of its
+symbols with their instruction counts.
+
 ## What only eight CPUs could show
 
 `cargo xtask bench --rustos-vcpus N` runs the lane at a chosen CPU count. The
