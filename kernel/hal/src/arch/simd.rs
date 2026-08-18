@@ -690,3 +690,56 @@ unsafe fn write_cr4(value: u64) {
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_wide_simd_section_covers_every_register_the_entry_stubs_leave_behind() {
+        // The syscall stub and the interrupt stubs each save sixteen XMM
+        // registers with legacy `movdqu`, which preserves ymm bits 255:128
+        // rather than restoring them. So the bracket owes the caller all
+        // sixteen upper halves, not the four `copy_ymm` happens to name.
+        let source = include_str!("simd.rs");
+        let save = source
+            .split("unsafe fn save_ymm_upper_halves")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}").next())
+            .expect("upper-half save");
+        let restore = source
+            .split("unsafe fn restore_ymm_upper_halves")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}").next())
+            .expect("upper-half restore");
+        assert_eq!(save.matches("vextractf128 [{ptr}").count(), 16);
+        assert_eq!(restore.matches("vinsertf128 ymm").count(), 16);
+        for register in 0..16 {
+            let mut save_operand = alloc::format!(", ymm{register}, 1");
+            assert!(save.contains(&save_operand), "save ymm{register}");
+            save_operand = alloc::format!("vinsertf128 ymm{register}, ymm{register}, ");
+            assert!(restore.contains(&save_operand), "restore ymm{register}");
+        }
+        assert_eq!(YMM_UPPER_HALF_BYTES, 16 * 16);
+    }
+
+    #[test]
+    fn the_section_is_inert_until_a_boot_publishes_avx() {
+        // `avx_enabled()` is false until the BSP admits the YMM component into
+        // XCR0. Executing `vextractf128` before that is #UD, so the guard has
+        // to take the inert path rather than trust the caller to check.
+        assert!(!avx_enabled());
+        let section = wide_simd_section();
+        assert!(section.saved.is_none());
+        drop(section);
+    }
+
+    #[test]
+    fn the_wide_copy_threshold_pays_for_its_own_bracket() {
+        // The bracket moves 512 bytes of lane data across its two halves. A
+        // wide copy below several times that is a net loss, which is what the
+        // old 256-byte threshold was.
+        assert!(YMM_COPY_THRESHOLD_BYTES >= 4 * 2 * YMM_UPPER_HALF_BYTES);
+        assert!(YMM_COPY_THRESHOLD_BYTES > XMM_COPY_THRESHOLD_BYTES);
+    }
+}

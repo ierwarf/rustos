@@ -15,7 +15,6 @@
 //!   `process-address-space-lifecycle`, `syscall-simd-lifecycle`, and
 //!   `user-memory-access`.
 pub use crate::multitask::ProcessIdentity;
-pub use crate::multitask::SyscallUserSimdSnapshot;
 pub use crate::multitask::{
     AffinityCommit, AffinityError, CurrentKernelStackScope, CurrentUserSnapshot,
     DEFAULT_USER_TASK_WEIGHT_MICROS, MAX_SCHEDULER_TASKS, ProcessAffinitySnapshot,

@@ -2,12 +2,12 @@
 # Formal Contract Registry
 
 - Schema: `3`
-- Registry SHA-256: `aca58d34cde9af71926e33870eed73a845d2e80d0bc4987aaef8e1e79228444d`
+- Registry SHA-256: `48f801d2390bf024f91943a026786e7a08f885c54d7dfffdcbdb597f2ea07f99`
 - Models: `127`
 - Whole flows: `68`
-- Transitions: `688`
+- Transitions: `687`
 - Product runtime scenarios: `3`
-- Exact source witnesses: `575`
+- Exact source witnesses: `578`
 - Apalache pilots: `3`
 - TLAPS theorem models: `2`
 - Runtime-traced models: `7`
@@ -77,7 +77,7 @@
 | `smp-release-admission` | `critical` | xtask | smp-release-admission/SmpReleaseAdmission | 6 | 6 | admitted, rejected |
 | `smp-reschedule-ipi-lifecycle` | `critical` | kernel-hal, kernel-ps | smp-reschedule-ipi/SmpRescheduleIpi | 9 | 9 | dispatched, invariant-panic |
 | `smp-ring3-qualification` | `critical` | kernel-compat, nucleus-core, runtimed, smpqual, vfsd, xtask, xtask-kvm | smp-ring3-qualification/SmpRing3Qualification | 31 | 31 | activation-rejected, contract-rejected, evidence-expired, evidence-rejected, qualification-absent, qualified, terminal |
-| `syscall-simd-lifecycle` | `critical` | kernel-compat, kernel-ps | syscall-scheduler-continuation/SyscallSchedulerContinuation, syscall-simd-lifecycle/SyscallSimdLifecycle | 15 | 15 | rejected, returned |
+| `syscall-simd-lifecycle` | `critical` | kernel-compat, kernel-hal, kernel-ps | syscall-scheduler-continuation/SyscallSchedulerContinuation, syscall-simd-lifecycle/SyscallSimdLifecycle | 14 | 14 | returned |
 | `task-affinity-lifecycle` | `critical` | kernel-compat, kernel-ps, syscalld | task-affinity-lifecycle/TaskAffinityLifecycle | 14 | 14 | inherited, migrated, preserved, process-committed, rejected, replied, thread-committed |
 | `thread-exit-futex-cleanup` | `critical` | kernel-compat, kernel-mm | robust-futex-owner-death/RobustFutexOwnerDeath | 10 | 10 | cleaned, rejected |
 | `tlb-shootdown-lifecycle` | `critical` | kernel-hal, kernel-mm | tlb-shootdown-lifecycle/TlbShootdownLifecycle | 7 | 7 | invariant-panic, reclaimed |

@@ -549,24 +549,18 @@ does not indicate a regression in the identity work.
 dispatch itself, so its acquisitions are the scheduler doing its job. It cannot
 be removed the way the identity queries were; reducing it means reducing yields.
 
-### Syscall SIMD custody moved out of the scheduler lock
+### Syscall SIMD custody was removed, not relocated
 
-`kernel/ps/src/multitask/syscall_simd.rs` now owns the per-slot entering-user
-SIMD image. It previously lived in two `Scheduler` fields, so both the syscall
-entry capture and the syscall return restore took the exclusive global lock,
-about 13.1k each per second, and each one carried a full `XSAVE`/`XRSTOR` inside
-the critical section.
+The per-slot entering-user SIMD image once lived in two `Scheduler` fields, so
+both the syscall entry capture and the syscall return restore took the exclusive
+global lock, about 13.1k each per second, each carrying a full `XSAVE`/`XRSTOR`
+inside the critical section. It then moved to a per-slot module outside the lock.
 
-The buffer for a slot is reachable only by the CPU executing that slot's task at
-a syscall boundary with interrupts masked, and by `reset` when the scheduler
-binds or rebinds the slot under its lock. A slot cannot be current on two CPUs —
-`SchedulerAccessGuard::drop` fails the kernel if it ever is — so the exclusion
-does not need the lock. `SyscallUserSimdSnapshot` carries both the slot and the
-exact task bound to it, because the syscall body may block and resume on another
-CPU, and an exec rebind between entry and return must still be refused.
-
-1 vCPU passes end to end with this in place, which exercises the path on every
-syscall.
+Both steps priced the pair rather than asking whether it was needed. Measured at
+829 ticks of every syscall, it is now gone entirely: the entry stub's sixteen
+`movdqu` are the whole of the syscall path's FPU custody, and the state they do
+not cover is held by an invariant the build checks
+(`tools/xtask/src/build/nucleus_audit.rs`) rather than by a save.
 
 ### The 8 vCPU blocker is not the input-ring stall, and it is not new
 

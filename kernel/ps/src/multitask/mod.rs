@@ -11,7 +11,6 @@ mod retirement;
 mod run_authority;
 mod scheduler;
 mod spawn;
-mod syscall_simd;
 
 use core::{
     cell::Cell,
@@ -86,7 +85,7 @@ pub(crate) use self::irq::{
     reschedule_deferred_from_interruptible_syscall, reschedule_if_requested,
 };
 pub use self::spawn::{
-    SyscallUserSimdSnapshot, spawn_kernel_process, spawn_user_process,
+    spawn_kernel_process, spawn_user_process,
     spawn_user_process_state_with_parent, spawn_user_process_suspended,
     spawn_user_process_with_parent, spawn_user_process_without_deferred_reschedule,
     spawn_user_thread_suspended, start, start_secondary_cpu,

@@ -7,68 +7,10 @@ use super::{
     MAIN_THREAD_SLICE_MICROS, NEXT_TASK_ID, SpawnTaskError, UserTaskBootstrap, allocate_task_id,
     checked_thread_pit_divisor, cpu_local, current_identity, initial_task_rflags,
     kernel_task_entry_trampoline_addr, noop_task_entry, publish_cpu_current_task,
-    publish_scheduler_initialized, scheduler_mut, scheduler_ref, syscall_simd,
+    publish_scheduler_initialized, scheduler_mut, scheduler_ref,
 };
 use crate::memory::paging::ProcessAddressSpace;
 use crate::user::process_state::UserProcessState;
-
-/// Exact user SIMD/FPU image captured at a syscall trust boundary.
-///
-/// This snapshot is deliberately separate from the scheduler's per-task SIMD
-/// slot. A blocking syscall may context-switch while its kernel continuation
-/// is live; the scheduler must then save the kernel continuation's SIMD
-/// scratch state in the task slot. Reusing that slot for syscall return would
-/// expose the scratch state to userspace and corrupt registers the syscall ABI
-/// promises to preserve.
-///
-/// The image itself lives in `syscall_simd`, outside the scheduler lock, so a
-/// boundary that concerns one task on one CPU no longer serializes against
-/// every other CPU's scheduling. The slot and the exact task bound to it are
-/// both carried: the syscall body may block and resume on a different CPU, and
-/// an exec rebind between entry and return must still be refused.
-pub struct SyscallUserSimdSnapshot {
-    slot: usize,
-    task_id: u64,
-}
-
-impl SyscallUserSimdSnapshot {
-    pub fn capture() -> Option<Self> {
-        interrupts::without_interrupts(|| {
-            let slot = cpu_local::current_cpu_task_slot()?;
-            let task_id = slot_task_id(slot)?;
-            // SAFETY: interrupts are masked and this CPU is the execution owner
-            // of `slot`, which is what excludes every other reader of its image.
-            unsafe { syscall_simd::capture(slot) }.then_some(Self { slot, task_id })
-        })
-    }
-
-    pub fn restore(self) -> bool {
-        interrupts::without_interrupts(|| {
-            if cpu_local::current_cpu_task_slot() != Some(self.slot)
-                || slot_task_id(self.slot) != Some(self.task_id)
-            {
-                return false;
-            }
-            // SAFETY: as in `capture`; this CPU still owns the captured slot.
-            unsafe { syscall_simd::restore(self.slot) }
-        })
-    }
-}
-
-/// The exact task bound to `slot`, from the published record when it is
-/// available and from the scheduler otherwise.
-///
-/// Callers must already have interrupts masked. Falling back to the locked
-/// query matters here: a syscall return that cannot identify its own task must
-/// not silently skip restoring the caller's registers.
-fn slot_task_id(slot: usize) -> Option<u64> {
-    if let Some(identity) = current_identity::read(slot) {
-        return identity.task_id;
-    }
-    // SAFETY: the caller masked interrupts, so the current slot is stable and
-    // no reference escapes the guard.
-    unsafe { scheduler_ref().current_task_id() }
-}
 
 pub fn spawn_user_process(
     address_space: ProcessAddressSpace,

@@ -1165,7 +1165,10 @@ loader-request-authority/LoaderRequestAuthority|kernel-compat|user::syscall::lin
 remote-file-mapping/RemoteFileMapping|rustos-user-abi|syscall::syscall_tests::statx_offload_messages_fit_inline_ipc_v1
 remote-file-mapping/RemoteFileMapping|vfsd|tests::early_system_reads_chunk_larger_vfs_buffers_to_the_broker_bound
 remote-file-mapping/RemoteFileMapping|kernel-compat|user::syscall::linux::proc_broker_ops::tests::truncated_file_mapping_never_commits_zero_filled_tail
-syscall-simd-lifecycle/SyscallSimdLifecycle|kernel-ps|multitask::syscall_simd::tests::syscall_simd_image_is_captured_once_consumed_once_and_dropped_by_rebind
+syscall-simd-lifecycle/SyscallSimdLifecycle|kernel-compat|user::syscall::tests::the_entry_stub_is_the_whole_of_the_syscall_paths_fpu_custody
+syscall-simd-lifecycle/SyscallSimdLifecycle|kernel-hal|arch::simd::tests::a_wide_simd_section_covers_every_register_the_entry_stubs_leave_behind
+syscall-simd-lifecycle/SyscallSimdLifecycle|kernel-ps|multitask::scheduler::tests::scheduler_block_arm_is_exact_race_safe_and_terminally_revoked
+syscall-simd-lifecycle/SyscallSimdLifecycle|kernel-ps|multitask::scheduler::tests::raced_wake_never_validates_a_consumed_current_frame
 syscall-simd-lifecycle/SyscallSimdLifecycle|kernel-compat|user::syscall::tests::sysret_validation_follows_last_interruptible_resume
 syscall-simd-lifecycle/SyscallSimdLifecycle|kernel-compat|user::syscall::tests::sysret_contract_rejects_forbidden_rflags
 syscall-simd-lifecycle/SyscallSimdLifecycle|kernel-compat|user::syscall::tests::syscall_entry_preserves_xmm_before_any_rust_dispatch

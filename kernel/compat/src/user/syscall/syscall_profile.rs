@@ -18,24 +18,20 @@
 use nucleus_core::debug::LogCategory;
 use nucleus_core::debug::phase_profile::{PhaseProfile, phase_now};
 
-pub(super) const SYSCALL_PHASE_COUNT: usize = 6;
+pub(super) const SYSCALL_PHASE_COUNT: usize = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SyscallPhase {
-    /// Capturing the entering task's user SIMD image.
-    SimdCapture = 0,
     /// `validate_syscall_entry_or_terminate`. Charged on entry and again
     /// before SYSRET, so the sample count is twice the syscall count.
-    Validate = 1,
+    Validate = 0,
     /// Entry and exit tracing, likewise charged twice.
-    Trace = 2,
+    Trace = 1,
     /// The ABI dispatch and the syscall body itself.
-    Dispatch = 3,
-    /// Restoring the entering task's user SIMD image.
-    SimdRestore = 4,
+    Dispatch = 2,
     /// The deferred-reschedule software interrupt that keeps a hot syscall
     /// from starving the scheduler.
-    RescheduleDeferred = 5,
+    RescheduleDeferred = 3,
 }
 
 // `Syscall` is compiled out by `config/rustos.toml` (`syscall = "off"`), which
@@ -44,11 +40,9 @@ pub(super) enum SyscallPhase {
 static PROFILE: PhaseProfile<SYSCALL_PHASE_COUNT> = PhaseProfile::new(
     LogCategory::Compat,
     [
-        "syscall-phase-simd-capture",
         "syscall-phase-validate",
         "syscall-phase-trace",
         "syscall-phase-dispatch",
-        "syscall-phase-simd-restore",
         "syscall-phase-reschedule-deferred",
     ],
     "syscall-phase-discarded",
@@ -86,12 +80,10 @@ mod tests {
         // The discriminants index the name array, so a reordered enum that
         // silently mislabels every measurement must fail here.
         let phases = [
-            (SyscallPhase::SimdCapture, 0),
-            (SyscallPhase::Validate, 1),
-            (SyscallPhase::Trace, 2),
-            (SyscallPhase::Dispatch, 3),
-            (SyscallPhase::SimdRestore, 4),
-            (SyscallPhase::RescheduleDeferred, 5),
+            (SyscallPhase::Validate, 0),
+            (SyscallPhase::Trace, 1),
+            (SyscallPhase::Dispatch, 2),
+            (SyscallPhase::RescheduleDeferred, 3),
         ];
         for (phase, index) in phases {
             assert_eq!(phase as usize, index, "phase {phase:?} moved slot");

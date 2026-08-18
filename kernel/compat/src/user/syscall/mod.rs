@@ -135,10 +135,15 @@ global_asm!(
         # aligned Rust load/store into #GP.
         and rsp, -16
         # Preserve every architectural XMM register before the first Rust
-        # instruction. The compiler may use XMM scratch in syscall_dispatch's
-        # prologue, before SyscallUserSimdSnapshot::capture can execute. The
-        # full FPU/XSAVE snapshot still owns x87/MXCSR/YMM state; this entry
-        # prefix closes the otherwise unobservable pre-capture window.
+        # instruction. This is the whole of the syscall path's FPU custody:
+        # xmm0-xmm15 are the only registers ordinary kernel code can disturb.
+        #
+        # x87 and MXCSR are not saved because nothing writes them -- verified on
+        # the linked image by `tools/xtask/src/build/nucleus_audit.rs`, which
+        # fails the build on any x87 or floating-point arithmetic instruction.
+        # The ymm upper halves are not saved because the only kernel code that
+        # touches them brackets itself with `kernel_hal::arch::simd`'s
+        # `wide_simd_section`, which the same audit enforces.
         #
         # The complete 384-byte allocation preserves call-site alignment so
         # Rust enters with rsp % 16 == 8 as required by the x86_64 SysV ABI.
@@ -261,20 +266,12 @@ unsafe extern "C" {
 extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> u64 {
     let frame = unsafe { &mut *frame };
     let phase = syscall_profile::now();
-    let user_simd = multitask::SyscallUserSimdSnapshot::capture()
-        .expect("nested syscall SIMD capture or missing current task");
-    let phase = syscall_profile::charge(syscall_profile::SyscallPhase::SimdCapture, phase);
     let abi = validate_syscall_entry_or_terminate(frame);
     let phase = syscall_profile::charge(syscall_profile::SyscallPhase::Validate, phase);
     trace_syscall_entry(frame, abi);
     let phase = syscall_profile::charge(syscall_profile::SyscallPhase::Trace, phase);
     let result = dispatch_syscall(frame, abi);
     let phase = syscall_profile::charge(syscall_profile::SyscallPhase::Dispatch, phase);
-    assert!(
-        user_simd.restore(),
-        "syscall SIMD restore no longer owns the entering task"
-    );
-    let phase = syscall_profile::charge(syscall_profile::SyscallPhase::SimdRestore, phase);
     // The syscall body runs with IF=1, so this software interrupt preserves
     // an interruptible kernel continuation. The scheduler may switch here and
     // later resume the exact syscall before restoring the entering user SIMD
@@ -285,6 +282,11 @@ extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> u64 {
     // The syscall frame stayed live on the task's kernel stack across that
     // possible continuation. Revalidate the exact SYSRET boundary after the
     // last resume so a stale pre-schedule decision can never authorize return.
+    //
+    // The user's XMM image rode that continuation on this task's own kernel
+    // stack, so it needs no separate custody: the stack is the save area, and
+    // the scheduler's per-task XSAVE pair covers the register file across the
+    // switch.
     let return_abi = validate_syscall_entry_or_terminate(frame);
     let phase = syscall_profile::charge(syscall_profile::SyscallPhase::Validate, phase);
     trace_syscall_exit(frame, return_abi, result);
@@ -582,5 +584,51 @@ mod tests {
         assert_eq!(restore.matches("movdqu xmm").count(), 16);
         assert!(save_begin < dispatch);
         assert!(dispatch < restore_begin);
+    }
+
+    #[test]
+    fn the_entry_stub_is_the_whole_of_the_syscall_paths_fpu_custody() {
+        // A per-syscall XSAVE/XRSTOR pair used to sit inside `syscall_dispatch`,
+        // covering x87, MXCSR, and the ymm upper halves as well as XMM, at a
+        // measured 829 ticks of every syscall. It is gone. What replaced it is
+        // not a cheaper save: it is the checked absence of anything to save.
+        //
+        // Two of the three gaps are empty in the linked image -- no x87, no
+        // floating-point arithmetic -- and the third is bracketed at its two
+        // call sites. `tools/xtask/src/build/nucleus_audit.rs` fails the build
+        // if any of that stops holding.
+        //
+        // This witness is what stops the pair from being reintroduced by reflex
+        // the next time someone reads the entry stub and notices it saves only
+        // sixteen registers.
+        let source = include_str!("mod.rs");
+        let dispatch = source
+            .split("extern \"C\" fn syscall_dispatch(")
+            .nth(1)
+            .and_then(|rest| rest.split("\nfn dispatch_syscall(").next())
+            .expect("syscall_dispatch body");
+        for reintroduced in [
+            "SyscallUserSimdSnapshot",
+            "syscall_simd",
+            "save_state",
+            "restore_state",
+            "SimdCapture",
+            "SimdRestore",
+        ] {
+            assert!(
+                !dispatch.contains(reintroduced),
+                "syscall_dispatch reintroduced a per-syscall FPU snapshot: {reintroduced}",
+            );
+        }
+        // The entry stub has to say why it saves only the narrow image, and
+        // name the check that keeps that true.
+        let stub = source
+            .split("syscall_entry:")
+            .nth(1)
+            .expect("entry stub body");
+        assert!(stub.contains("nucleus_audit.rs"));
+        assert!(stub.contains("wide_simd_section"));
+        // The image rides the blocked continuation on the task's own stack.
+        assert!(dispatch.contains("kernel stack"));
     }
 }

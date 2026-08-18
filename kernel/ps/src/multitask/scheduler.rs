@@ -936,7 +936,6 @@ impl Scheduler {
 
         self.simd_states = [SimdState::new(); MAX_TASK];
         for slot in 0..MAX_TASK {
-            super::syscall_simd::reset(slot);
         }
         self.retired = [false; MAX_TASK];
         self.retirement_cleanup = [None; MAX_TASK];
@@ -1075,7 +1074,6 @@ impl Scheduler {
         self.job_stopped[slot] = false;
         self.retire_reasons[slot] = None;
         self.simd_states[slot] = SimdState::new();
-        super::syscall_simd::reset(slot);
         self.starts[slot] = None;
         self.publish_slot_identity(slot);
         self.idle_cpu[slot] = NO_IDLE_CPU;
@@ -2188,7 +2186,6 @@ impl Scheduler {
                     windows_thread_state: None,
                 });
                 self.simd_states[slot] = SimdState::new();
-                super::syscall_simd::reset(slot);
                 self.starts[slot] = Some(TaskStart { entry, id });
                 self.publish_slot_identity(slot);
                 #[cfg(not(test))]
@@ -2289,7 +2286,6 @@ impl Scheduler {
                     }),
                 });
                 self.simd_states[slot] = SimdState::new();
-                super::syscall_simd::reset(slot);
                 self.starts[slot] = Some(TaskStart {
                     entry: idle_entry,
                     id,
@@ -2363,7 +2359,6 @@ impl Scheduler {
                     }),
                 });
                 self.simd_states[slot] = SimdState::new();
-                super::syscall_simd::reset(slot);
                 self.starts[slot] = Some(TaskStart {
                     entry: idle_entry,
                     id,
@@ -2433,7 +2428,6 @@ impl Scheduler {
                     windows_thread_state: None,
                 });
                 self.simd_states[slot] = SimdState::new();
-                super::syscall_simd::reset(slot);
                 self.starts[slot] = Some(TaskStart {
                     entry: super::noop_task_entry,
                     id,
@@ -3788,7 +3782,6 @@ impl Scheduler {
 
         self.exec_target_quiesced[slot] = false;
         self.simd_states[slot] = SimdState::new();
-        super::syscall_simd::reset(slot);
         self.starts[slot] = Some(TaskStart {
             entry: super::noop_task_entry,
             id: process_id,
@@ -3857,7 +3850,6 @@ impl Scheduler {
         }
         self.exec_target_quiesced[slot] = false;
         self.simd_states[slot] = SimdState::new();
-        super::syscall_simd::reset(slot);
         self.starts[slot] = Some(TaskStart {
             entry: super::noop_task_entry,
             id: process_id,
