@@ -762,20 +762,50 @@ phases.
 space used to be 86–94% of a copy; halving it is what earlier commits in this
 lane did.
 
+### What can be attributed to one round trip — and what cannot
+
+**Corrected. The first version of this section was wrong by five times**, and it
+was wrong the same way this page warns about two sections earlier, one commit
+after that warning was written.
+
+A phase total can be divided into one round trip only if it is charged once per
+round trip. `cargo xtask bench` now prints that ratio, and parenthesises it when
+it does not hold. Against `ipc-call-phase-copy-request` as the unit (22,987
+samples, and `ipc_rt_intra_process` runs 20,000 iterations):
+
+| phase | samples | per round trip | ticks |
+|---|---:|---:|---:|
+| `ipc-call-phase-enqueue` | 22,960 | 1.00 | 10,164 |
+| `ipc-call-phase-copy-request` | 22,987 | 1.00 | 1,762 |
+| `ipc-call-phase-write-response` | 22,958 | 1.00 | 1,618 |
+| `ipc-call-phase-enqueue-deadline` | 22,955 | 1.00 | 680 |
+| | | | **14,224** |
+
+Everything else is charged by more probes than this one. `wait-arm` and
+`enqueue-runtime` are at 2.22 and 2.24 — the `ipc_split_*` probes enqueue and
+wait without charging a `copy-request`. `bind-visible` is at **14.62**, because
+every user copy in the run charges it. Multiplying its 677 ticks by a
+round-trip count produced 10,767 ticks of "cost" that no round trip pays.
+
+So 14,224 of 73,760 ticks — 19% — is attributable, and the rest belongs to the
+two blocked transitions, the two dispatches, and the server side, which these
+counters cannot split by probe.
+
 ### What ceiling 04 is actually worth
 
-Per syscall-path call, with the nesting resolved:
+`copy-request` (1,762) and `write-response` (1,618) are the request and response
+transfers, and each **contains** its own address-space bind: 932 bind + 85
+validate + 274 copy + 264 alloc ≈ 1,555 of the 1,762.
 
-| category | ticks/call |
-|---|---:|
-| binds (`read-bind` 4,415 + `write-bind` 5,819) | **10,234** |
-| copies (`read-copy` 4,486 + `write-copy` 3,736) | 8,222 |
-| **addressable by a pinned per-thread buffer** | **~18,500** |
+So a pinned per-thread buffer addresses **3,380 ticks, 4.6% of the round trip**.
+Not 25%. That is barely above this lane's ±2% floor, against pinning that has to
+be owned across exec, exit, fork, and reclaim, and 27 models with 149 witness
+tests.
 
-That is 25% of a 73,760-tick round trip, and it is the first time this ceiling
-has been sized rather than asserted. A pinned buffer whose higher-half address
-the kernel records once removes the bind *and* the copy together — which is also
-why no subset of it is worth building.
+**On this measurement ceiling 04 does not earn its hazards either**, and the
+honest position is that the synchronous IPC path has no remaining change whose
+measured value justifies its risk. What is left in the round trip is the two
+blocked transitions and the two dispatches — scheduling, not IPC.
 
 ### Why the next change has to be structural
 
@@ -800,11 +830,16 @@ already one fused scheduler mutation, costing ~1.7x a bare scheduler acquisition
 (`wait-arm`, 2,897). That is the wake itself — runqueue insert, hint, possible
 IPI — and it is the price of waking a task, not of asking anything.
 
-The remaining ceiling removes whole *categories* rather than acquisitions. A
-per-thread pinned IPC buffer takes out the request copy, the response write, the
-address-space binds on both, and the allocating half of `enqueue-runtime` — in
-one change, and only as one change. Attacking any of them alone lands under the
-floor.
+And the last ceiling, sized above, addresses 3,380 ticks. **There is no
+remaining change to this path whose measured value justifies its risk.** Four
+plans said otherwise; the counters said no to all four.
+
+What is left inside a round trip after the 14,224 attributable ticks is the two
+blocked transitions and the two dispatches. That is scheduling, not IPC, and it
+is where the next real reduction has to come from — `wait-blocked` alone carries
+a 522,018-tick average, which is wall time during which the *other* task runs
+and therefore cannot be added to the round trip, but is where the round trip
+spends its latency.
 
 ## What only eight CPUs could show
 

@@ -232,24 +232,60 @@ fn parse_log(log: &str) -> Result<ParsedRun> {
 /// the window contributes. That is stated in the header rather than hidden,
 /// because a reader who assumes otherwise will over-attribute a phase to the
 /// probe it sits next to.
+/// The phase charged exactly once per synchronous IPC round trip, used as the
+/// unit that decides which other phases can be attributed to one.
+const ROUND_TRIP_UNIT_PHASE: &str = "ipc-call-phase-copy-request";
+
+/// How close a phase's sample count must be to the unit's before it can be read
+/// as "once per round trip".
+const ATTRIBUTABLE_RATIO: (f64, f64) = (0.95, 1.05);
+
 fn render_phases(phases: &[PhaseTotal]) -> String {
     let mut out = String::new();
     if phases.is_empty() {
         return out;
     }
+    let unit = phases
+        .iter()
+        .find(|phase| phase.name == ROUND_TRIP_UNIT_PHASE)
+        .map(|phase| phase.samples)
+        .filter(|samples| *samples > 0);
+
     out.push_str("\nin-kernel phase profile (system-wide, summed over the run):\n");
     out.push_str(&format!(
-        "  {:<36} {:>12} {:>14}\n",
-        "phase", "samples", "cyc/sample"
+        "  {:<36} {:>12} {:>12} {:>8}\n",
+        "phase", "samples", "cyc/sample", "per rt"
     ));
-    out.push_str(&format!("  {}\n", "-".repeat(64)));
+    out.push_str(&format!("  {}\n", "-".repeat(72)));
     for phase in phases {
+        // The sample count is half the finding. A phase whose samples do not
+        // match the unit's is charged by more probes than the round trip, and
+        // its total cannot be divided into one -- which is exactly how an
+        // aggregate gets multiplied by the wrong denominator and reported as a
+        // per-call cost it never had.
+        let per_round_trip = match unit {
+            Some(unit) if phase.samples > 0 => {
+                let ratio = phase.samples as f64 / unit as f64;
+                if (ATTRIBUTABLE_RATIO.0..=ATTRIBUTABLE_RATIO.1).contains(&ratio) {
+                    format!("{ratio:.2}")
+                } else {
+                    format!("({ratio:.2})")
+                }
+            }
+            _ => String::from("-"),
+        };
         out.push_str(&format!(
-            "  {:<36} {:>12} {:>14}\n",
+            "  {:<36} {:>12} {:>12} {:>8}\n",
             phase.name,
             phase.samples,
-            phase.per_sample()
+            phase.per_sample(),
+            per_round_trip,
         ));
+    }
+    if unit.is_some() {
+        out.push_str(
+            "  a parenthesised ratio is shared with other probes: multiply it by\n             \x20 nothing, and do not read the phase as a per-round-trip cost\n",
+        );
     }
     out
 }
@@ -691,6 +727,49 @@ user-debug payload=ipcbench: end\\n";
     fn a_finished_run_with_no_results_is_a_failure_not_an_empty_table() {
         let empty = "user-debug payload=ipcbench: end\\n";
         assert!(parse_log(empty).is_err());
+    }
+
+    #[test]
+    fn a_phase_charged_by_more_probes_than_the_round_trip_is_marked_unattributable() {
+        // This is the trap the marker exists for. `usermem-phase-bind-visible`
+        // is charged by every user copy in the run, so dividing its total by the
+        // round-trip count invents a per-call cost it never had. A published
+        // figure was wrong by five times before this was rendered.
+        let phases = vec![
+            PhaseTotal {
+                name: String::from("ipc-call-phase-copy-request"),
+                cycles: 1_762 * 22_987,
+                samples: 22_987,
+            },
+            PhaseTotal {
+                name: String::from("ipc-call-phase-write-response"),
+                cycles: 1_618 * 22_958,
+                samples: 22_958,
+            },
+            PhaseTotal {
+                name: String::from("usermem-phase-bind-visible"),
+                cycles: 677 * 335_989,
+                samples: 335_989,
+            },
+        ];
+        let rendered = render_phases(&phases);
+        assert!(rendered.contains("ipc-call-phase-write-response"));
+        // 22,958 / 22,987 is one per round trip; 335,989 / 22,987 is not.
+        assert!(rendered.contains("1.00"), "{rendered}");
+        assert!(rendered.contains("(14.62)"), "{rendered}");
+        assert!(rendered.contains("shared with other probes"), "{rendered}");
+    }
+
+    #[test]
+    fn a_run_without_the_unit_phase_claims_no_attribution_at_all() {
+        let phases = vec![PhaseTotal {
+            name: String::from("usermem-phase-bind-visible"),
+            cycles: 677 * 335_989,
+            samples: 335_989,
+        }];
+        let rendered = render_phases(&phases);
+        assert!(rendered.contains(" -"), "{rendered}");
+        assert!(!rendered.contains("shared with other probes"), "{rendered}");
     }
 
     #[test]
