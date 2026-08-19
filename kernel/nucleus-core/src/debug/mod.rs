@@ -7,6 +7,7 @@ mod milestone_class;
 #[cfg(rustos_debug_print_enabled)]
 mod milestone_frame;
 pub mod phase_profile;
+pub mod product_snapshot_evidence;
 #[cfg(rustos_debug_print_enabled)]
 use milestone_class::{MilestoneOutputClass, milestone_loss_snapshot, milestone_output_class};
 
@@ -108,6 +109,8 @@ struct MilestoneRecord {
     name: &'static str,
     arg0: u64,
     arg1: u64,
+    executable_snapshot_evidence:
+        Option<product_snapshot_evidence::ProductExecutableSnapshotEvidence>,
 }
 
 #[cfg(rustos_debug_print_enabled)]
@@ -120,6 +123,7 @@ impl MilestoneRecord {
         name: "",
         arg0: 0,
         arg1: 0,
+        executable_snapshot_evidence: None,
     };
 }
 
@@ -626,13 +630,6 @@ fn render_serialized_debugcon_line<const N: usize>(
     line.write_str("\r\n")
 }
 
-#[cfg(rustos_debug_print_enabled)]
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(FNV1A64_OFFSET_BASIS, |checksum, byte| {
-        (checksum ^ u64::from(*byte)).wrapping_mul(FNV1A64_PRIME)
-    })
-}
-
 /// Pure frame verifier used by the unit tests. It accepts only a complete v1
 /// milestone frame with an exact suffix and a checksum matching every semantic
 /// payload byte.
@@ -643,11 +640,40 @@ fn verify_milestone_debugcon_line(line: &[u8]) -> bool {
     else {
         return false;
     };
-    fnv1a64(&line[semantic_start..checksum_offset]) == expected_checksum
+    milestone_frame::fnv1a64(&line[semantic_start..checksum_offset]) == expected_checksum
 }
 
 #[cfg(rustos_debug_print_enabled)]
 pub fn record_milestone(category: LogCategory, name: &'static str, arg0: u64, arg1: u64) {
+    record_milestone_with_executable_snapshot_evidence(category, name, arg0, arg1, None);
+}
+
+/// Records the product executable snapshot only after the compat boundary has
+/// authenticated its live Vfsd owner and endpoint generation.
+#[cfg(rustos_debug_print_enabled)]
+pub fn record_product_executable_snapshot_evidence(
+    file_bytes: u64,
+    evidence: product_snapshot_evidence::ProductExecutableSnapshotEvidence,
+) {
+    record_milestone_with_executable_snapshot_evidence(
+        LogCategory::Compat,
+        "product-executable-snapshot-sealed",
+        file_bytes,
+        evidence.mount_generation,
+        Some(evidence),
+    );
+}
+
+#[cfg(rustos_debug_print_enabled)]
+fn record_milestone_with_executable_snapshot_evidence(
+    category: LogCategory,
+    name: &'static str,
+    arg0: u64,
+    arg1: u64,
+    executable_snapshot_evidence: Option<
+        product_snapshot_evidence::ProductExecutableSnapshotEvidence,
+    >,
+) {
     let (tick, ts_us) = current_tick_and_micros();
     let record = MilestoneRecord {
         seq: MILESTONE_SEQUENCE.fetch_add(1, Ordering::Relaxed),
@@ -657,6 +683,7 @@ pub fn record_milestone(category: LogCategory, name: &'static str, arg0: u64, ar
         name,
         arg0,
         arg1,
+        executable_snapshot_evidence,
     };
     if let Some(mut milestones) = MILESTONES.try_lock() {
         milestones.push(record);
@@ -666,6 +693,13 @@ pub fn record_milestone(category: LogCategory, name: &'static str, arg0: u64, ar
 
 #[cfg(not(rustos_debug_print_enabled))]
 pub fn record_milestone(_category: LogCategory, _name: &'static str, _arg0: u64, _arg1: u64) {}
+
+#[cfg(not(rustos_debug_print_enabled))]
+pub fn record_product_executable_snapshot_evidence(
+    _file_bytes: u64,
+    _evidence: product_snapshot_evidence::ProductExecutableSnapshotEvidence,
+) {
+}
 
 #[cfg(rustos_debug_print_enabled)]
 fn emit_milestone_debugcon_line(record: MilestoneRecord) {

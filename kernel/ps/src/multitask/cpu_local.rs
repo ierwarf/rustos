@@ -269,12 +269,6 @@ impl Drop for SchedulerAccessGuard {
             original_task: self.original_task,
         }
         .publish(selected_task, guard.current_task_is_idle_task());
-        // Re-mirror the runnable bit for every executing slot. Bounded by the
-        // CPU count and done here rather than at each write site, because a
-        // wake on one CPU can change the readiness of a task executing on
-        // another and no writer's own release point covers that.
-        #[cfg(not(test))]
-        guard.sync_running_runnable_bits();
         // ORDERING: diagnostic metadata is not lock authority. Release-clear
         // its publication immediately before the tracked guard releases the
         // real lock.

@@ -41,6 +41,7 @@ struct RuntimeEvent<'a> {
     model: &'a str,
     log: &'a str,
     marker: &'a str,
+    evidence: &'a str,
     requires: &'a [String],
     outcome: &'static str,
     guest_ts_us: u64,
@@ -168,7 +169,7 @@ pub(crate) fn record_kvm_runtime_trace(
         }
         observed_guest_ts_us.insert(step.step.as_str(), guest_ts_us);
         let event = RuntimeEvent {
-            schema: "rustos-formal-runtime-event-v4",
+            schema: "rustos-formal-runtime-event-v5",
             run_id,
             topology,
             scenario: step.scenario.as_str(),
@@ -179,6 +180,7 @@ pub(crate) fn record_kvm_runtime_trace(
             model: step.model.as_str(),
             log: step.log.as_str(),
             marker: step.marker.as_str(),
+            evidence: step.evidence.as_str(),
             requires: &step.requires,
             outcome: "success",
             guest_ts_us,
@@ -231,13 +233,21 @@ fn find_structured_step(lines: &[&str], step: &ProductScenarioStep) -> Result<(u
         if !line.contains(step.marker.as_str()) {
             continue;
         }
-        let guest_ts_us = structured_timestamp_us(line).with_context(|| {
+        let milestone = verified_milestone(line).with_context(|| {
             format!(
-                "runtime marker {} for step {} lacks a kernel-stamped ts_us field",
+                "runtime marker {} for step {} is not one complete kernel-stamped milestone frame",
                 step.marker, step.step
             )
         })?;
-        return Ok((offset + 1, guest_ts_us));
+        if !milestone_evidence_matches(milestone.semantic, step.evidence.as_str()) {
+            bail!(
+                "runtime marker {} for step {} does not satisfy evidence contract {}",
+                step.marker,
+                step.step,
+                step.evidence
+            );
+        }
+        return Ok((offset + 1, milestone.timestamp_us));
     }
     bail!(
         "runtime trace is missing scenario marker {} for step {}",
@@ -246,29 +256,133 @@ fn find_structured_step(lines: &[&str], step: &ProductScenarioStep) -> Result<(u
     )
 }
 
-fn structured_timestamp_us(line: &str) -> Option<u64> {
-    line.split_ascii_whitespace().find_map(|field| {
+const MILESTONE_PREFIX: &str = "milestone-begin v=1 ";
+const MILESTONE_CHECKSUM_PREFIX: &str = " checksum=";
+const MILESTONE_SUFFIX: &str = " milestone-end\"";
+const FNV1A64_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV1A64_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+struct VerifiedMilestone<'a> {
+    semantic: &'a str,
+    timestamp_us: u64,
+}
+
+fn verified_milestone(line: &str) -> Option<VerifiedMilestone<'_>> {
+    let semantic_start = line.find(MILESTONE_PREFIX)?;
+    let checksum_offset =
+        semantic_start + line[semantic_start..].find(MILESTONE_CHECKSUM_PREFIX)?;
+    let checksum_start = checksum_offset.checked_add(MILESTONE_CHECKSUM_PREFIX.len())?;
+    let checksum_end = checksum_start.checked_add(16)?;
+    let expected = u64::from_str_radix(line.get(checksum_start..checksum_end)?, 16).ok()?;
+    if line.get(checksum_end..)? != MILESTONE_SUFFIX
+        || fnv1a64(line[semantic_start..checksum_offset].as_bytes()) != expected
+    {
+        return None;
+    }
+    let semantic = &line[semantic_start..checksum_offset];
+    let timestamp_us = semantic.split_ascii_whitespace().find_map(|field| {
         field
             .strip_prefix("ts_us=")
             .and_then(|value| value.parse().ok())
+    })?;
+    Some(VerifiedMilestone {
+        semantic,
+        timestamp_us,
+    })
+}
+
+fn milestone_evidence_matches(semantic: &str, contract: &str) -> bool {
+    let mut fields = std::collections::BTreeMap::new();
+    for field in semantic.split_ascii_whitespace().skip(2) {
+        let Some((key, value)) = field.split_once('=') else {
+            return false;
+        };
+        if fields.insert(key, value).is_some() {
+            return false;
+        }
+    }
+    match contract {
+        "none" => !fields.contains_key("evidence_v"),
+        "executable-snapshot-v1" => {
+            fields.get("evidence_v") == Some(&"1")
+                && fields.get("backing") == Some(&"dvm-volume")
+                && fields.get("provider_service") == Some(&"2")
+                && [
+                    "provider_generation",
+                    "storage_epoch",
+                    "mount_generation",
+                    "request_id",
+                ]
+                .iter()
+                .all(|key| {
+                    fields
+                        .get(*key)
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .is_some_and(|value| value != 0)
+                })
+                && fields.get("sha256").is_some_and(|digest| {
+                    digest.len() == 64
+                        && digest
+                            .bytes()
+                            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                        && digest.bytes().any(|byte| byte != b'0')
+                })
+        }
+        _ => false,
+    }
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(FNV1A64_OFFSET_BASIS, |checksum, byte| {
+        (checksum ^ u64::from(*byte)).wrapping_mul(FNV1A64_PRIME)
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::structured_timestamp_us;
+    use super::{
+        FNV1A64_OFFSET_BASIS, FNV1A64_PRIME, milestone_evidence_matches, verified_milestone,
+    };
+
+    fn framed(semantic: &str) -> String {
+        let checksum = semantic
+            .as_bytes()
+            .iter()
+            .fold(FNV1A64_OFFSET_BASIS, |value, byte| {
+                (value ^ u64::from(*byte)).wrapping_mul(FNV1A64_PRIME)
+            });
+        format!("seq=7 msg=\"{semantic} checksum={checksum:016x} milestone-end\"")
+    }
 
     #[test]
-    fn product_trace_accepts_only_kernel_timestamped_records() {
+    fn product_trace_accepts_only_complete_checksumming_milestone_frames() {
+        let complete = framed(
+            "milestone-begin v=1 output_seq=7 seq=3 ts_us=4999123 tick=9 cat=compat name=product-first-frame arg0=0x1 arg1=0x2 pid=71 tid=72 dropped=0 discarded_bytes=0",
+        );
         assert_eq!(
-            structured_timestamp_us(
-                "seq=7 ts_us=4999123 tick=9 lvl=info msg=\"name=product-first-frame\""
-            ),
+            verified_milestone(&complete).map(|milestone| milestone.timestamp_us),
             Some(4_999_123)
         );
-        assert_eq!(
-            structured_timestamp_us("wayclick: first frame presented"),
-            None
-        );
+        assert!(verified_milestone("wayclick: first frame presented").is_none());
+        assert!(verified_milestone(&complete.replacen("arg1=0x2", "arg1=0x3", 1)).is_none());
+    }
+
+    #[test]
+    fn executable_snapshot_evidence_requires_every_kernel_stamped_identity_field() {
+        let semantic = "milestone-begin v=1 output_seq=7 seq=3 ts_us=99 tick=9 cat=compat name=product-executable-snapshot-sealed arg0=0x1 arg1=0x2 pid=71 tid=72 dropped=0 discarded_bytes=0 evidence_v=1 backing=dvm-volume provider_service=2 provider_generation=7 storage_epoch=8 mount_generation=9 request_id=10 sha256=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert!(milestone_evidence_matches(
+            semantic,
+            "executable-snapshot-v1"
+        ));
+        assert!(!milestone_evidence_matches(
+            semantic.replacen("storage_epoch=8 ", "", 1).as_str(),
+            "executable-snapshot-v1"
+        ));
+        assert!(!milestone_evidence_matches(
+            semantic
+                .replacen("backing=dvm-volume", "backing=bootstrap", 1)
+                .as_str(),
+            "executable-snapshot-v1"
+        ));
     }
 }

@@ -6,7 +6,7 @@ fn raced_wake_never_validates_a_consumed_current_frame() {
         // Dispatch consumed this frame. Deliberately leave an address that
         // could never be validated as a published continuation.
         saved_rsp: 0,
-        ready: false,
+        test_ready: false,
         ready_since_ticks: 0,
         blocked: false,
         blocked_since_ticks: 0,
@@ -36,7 +36,7 @@ fn raced_wake_never_validates_a_consumed_current_frame() {
     assert!(scheduler.wake_task(691));
     let context = scheduler.contexts[slot].expect("running task survived raced wake");
     assert!(!scheduler.retired[slot]);
-    assert!(!context.ready);
+    assert!(!context.test_ready);
     assert!(!context.blocked);
     assert!(!context.wake_armed);
     assert_eq!(scheduler.commit_block_current_task(), Some(false));
@@ -50,7 +50,7 @@ fn raced_wake_never_validates_a_consumed_current_frame() {
     assert!(scheduler.wake_task(691));
     let context = scheduler.contexts[slot].expect("post-commit wake survived");
     assert!(!scheduler.retired[slot]);
-    assert!(!context.ready);
+    assert!(!context.test_ready);
     assert!(!context.blocked);
     assert!(!context.wake_armed);
 }
@@ -91,7 +91,7 @@ fn wake_transition_publishes_one_owner_before_commit_and_claims_once_after() {
     let context = scheduler.contexts[slot]
         .as_mut()
         .expect("transition wake context");
-    context.ready = false;
+    context.test_ready = false;
     context.blocked = true;
     context.wake_armed = true;
     scheduler.current_task = super::ROOT_TASK_SLOT;
@@ -99,6 +99,13 @@ fn wake_transition_publishes_one_owner_before_commit_and_claims_once_after() {
     let transition = super::super::cpu_local::install_test_transition_owner(1, 2, slot);
 
     assert!(scheduler.wake_task(task_id));
+    assert_ne!(
+        scheduler.contexts[slot]
+            .expect("transition wake context")
+            .ready_since_ticks,
+        0,
+        "transition wake must publish a queued-age timestamp"
+    );
     let published = super::runqueue::owner(slot);
     assert_eq!(
         published.state,
@@ -534,7 +541,7 @@ fn overdue_system_continuation_precedes_unrelated_ipc_hint_without_losing_it() {
     scheduler.contexts[overdue]
         .as_mut()
         .expect("overdue context")
-        .ready = false;
+        .test_ready = false;
     assert_eq!(
         scheduler.mandatory_overdue_system_pick(current, now_ticks),
         None
@@ -585,7 +592,7 @@ fn stale_pick_hint_falls_through_without_mutating_task_state() {
         "candidate validation must not turn a stale hint into task authority"
     );
     let after = scheduler.contexts[hinted].expect("post-validation hinted context");
-    assert_eq!(after.ready, before.ready);
+    assert_eq!(after.test_ready, before.test_ready);
     assert_eq!(after.blocked, before.blocked);
     assert_eq!(after.wake_armed, before.wake_armed);
     assert_eq!(after.ready_since_ticks, before.ready_since_ticks);
@@ -646,7 +653,7 @@ fn overdue_system_continuation_precedes_a_fresh_latency_handoff() {
     scheduler.contexts[overdue]
         .as_mut()
         .expect("overdue context")
-        .ready = false;
+        .test_ready = false;
     assert_eq!(
         scheduler.mandatory_overdue_system_pick(current, now_ticks),
         None

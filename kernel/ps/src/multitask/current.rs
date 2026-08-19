@@ -25,10 +25,10 @@ use super::{
 use crate::debug;
 use crate::io::session::ConsoleSessionHandle;
 use crate::memory::paging::ProcessAddressSpace;
-use crate::user::sysops::usermem_profile as user_copy_profile;
 use crate::user::abi::UserAbi;
 use crate::user::linux::{LinuxProcessState, LinuxThreadState};
 use crate::user::process_state::{ProcessSecurityContext, UserProcessState};
+use crate::user::sysops::usermem_profile as user_copy_profile;
 
 impl CurrentUserSnapshot {
     pub(crate) const fn new(
@@ -541,7 +541,7 @@ pub fn bind_ipc_priority_to_process_worker(
 /// Revokes the bounded priority donation owned by a completed or cancelled IPC
 /// reply capability. It is safe to call more than once for terminal races.
 pub fn release_ipc_priority(reply: u64) -> bool {
-    interrupts::without_interrupts(|| unsafe { scheduler_mut().release_ipc_priority(reply) })
+    interrupts::without_interrupts(|| super::scheduler::release_reply_donation(reply))
 }
 
 /// Completes the scheduling side of a terminal reply with one Scheduler
@@ -550,6 +550,7 @@ pub fn release_ipc_priority(reply: u64) -> bool {
 /// never falls back to the catalog hint path and cannot create execution
 /// authority.
 pub fn complete_ipc_reply_wake_handoff(reply: u64, task_id: u64) -> bool {
+    let _ = interrupts::without_interrupts(|| super::scheduler::release_reply_donation(reply));
     let token = interrupts::without_interrupts(|| unsafe {
         scheduler_mut().complete_ipc_reply_wake_handoff(reply, task_id)
     });
@@ -855,6 +856,14 @@ pub fn with_current_user_linux_state_mut<R>(
             )
         })
     })?
+}
+
+/// Updates the dispatch-only FS-base cache after the generation-bound Linux
+/// thread state has accepted a new architectural TLS base.
+pub fn set_current_linux_tls_fs_base(value: u64) {
+    interrupts::without_interrupts(|| unsafe {
+        scheduler_mut().set_current_tls_fs_base(value);
+    });
 }
 
 pub fn with_current_user_process_state_mut<R>(

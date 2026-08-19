@@ -31,11 +31,11 @@ Terminal == {Presented, StorageUsable, Failed, Revoked}
 InteractivePreterminal ==
     {InputReady, SnapshotReady, ImageActive, WaylandReady}
 
-VARIABLES mode, phase, now, displayProven, snapshotSealed, imageCommitted,
-          appActive, waylandConnected, firstFrame, storageProven
+VARIABLES mode, phase, now, displayProven, snapshotSealed, snapshotDvmIdentityBound,
+          imageCommitted, appActive, waylandConnected, firstFrame, storageProven
 
-vars == <<mode, phase, now, displayProven, snapshotSealed, imageCommitted,
-          appActive, waylandConnected, firstFrame, storageProven>>
+vars == <<mode, phase, now, displayProven, snapshotSealed, snapshotDvmIdentityBound,
+          imageCommitted, appActive, waylandConnected, firstFrame, storageProven>>
 
 Init ==
     /\ mode \in Modes
@@ -43,6 +43,7 @@ Init ==
     /\ now = 0
     /\ displayProven = FALSE
     /\ snapshotSealed = FALSE
+    /\ snapshotDvmIdentityBound = FALSE
     /\ imageCommitted = FALSE
     /\ appActive = FALSE
     /\ waylandConnected = FALSE
@@ -53,7 +54,7 @@ CoreServicesReady ==
     /\ phase = Start
     /\ now <= CoreDeadline
     /\ phase' = CoreReady
-    /\ UNCHANGED <<mode, now, displayProven, snapshotSealed, imageCommitted,
+    /\ UNCHANGED <<mode, now, displayProven, snapshotSealed, snapshotDvmIdentityBound, imageCommitted,
                   appActive, waylandConnected, firstFrame, storageProven>>
 
 InputPolicyReady ==
@@ -61,7 +62,7 @@ InputPolicyReady ==
     /\ phase = CoreReady
     /\ now <= InputDeadline
     /\ phase' = InputReady
-    /\ UNCHANGED <<mode, now, displayProven, snapshotSealed, imageCommitted,
+    /\ UNCHANGED <<mode, now, displayProven, snapshotSealed, snapshotDvmIdentityBound, imageCommitted,
                   appActive, waylandConnected, firstFrame, storageProven>>
 
 DisplayProviderReady ==
@@ -70,7 +71,7 @@ DisplayProviderReady ==
     /\ ~displayProven
     /\ now <= DisplayDeadline
     /\ displayProven' = TRUE
-    /\ UNCHANGED <<mode, phase, now, snapshotSealed, imageCommitted, appActive,
+    /\ UNCHANGED <<mode, phase, now, snapshotSealed, snapshotDvmIdentityBound, imageCommitted, appActive,
                   waylandConnected, firstFrame, storageProven>>
 
 StorageDataPlaneReady ==
@@ -79,7 +80,7 @@ StorageDataPlaneReady ==
     /\ ~storageProven
     /\ now <= StorageDeadline
     /\ storageProven' = TRUE
-    /\ UNCHANGED <<mode, phase, now, displayProven, snapshotSealed,
+    /\ UNCHANGED <<mode, phase, now, displayProven, snapshotSealed, snapshotDvmIdentityBound,
                   imageCommitted, appActive, waylandConnected, firstFrame>>
 
 StorageOnlyDataPlaneReady ==
@@ -88,7 +89,7 @@ StorageOnlyDataPlaneReady ==
     /\ now <= StorageDeadline
     /\ phase' = StorageUsable
     /\ storageProven' = TRUE
-    /\ UNCHANGED <<mode, now, displayProven, snapshotSealed, imageCommitted,
+    /\ UNCHANGED <<mode, now, displayProven, snapshotSealed, snapshotDvmIdentityBound, imageCommitted,
                   appActive, waylandConnected, firstFrame>>
 
 SealExecutableSnapshot ==
@@ -98,6 +99,7 @@ SealExecutableSnapshot ==
     /\ now <= SnapshotDeadline
     /\ phase' = SnapshotReady
     /\ snapshotSealed' = TRUE
+    /\ snapshotDvmIdentityBound' = TRUE
     /\ UNCHANGED <<mode, now, displayProven, imageCommitted, appActive,
                   waylandConnected, firstFrame, storageProven>>
 
@@ -105,11 +107,12 @@ CommitAndActivateImage ==
     /\ mode = Interactive
     /\ phase = SnapshotReady
     /\ snapshotSealed
+    /\ snapshotDvmIdentityBound
     /\ now <= FrameDeadline
     /\ phase' = ImageActive
     /\ imageCommitted' = TRUE
     /\ appActive' = TRUE
-    /\ UNCHANGED <<mode, now, displayProven, snapshotSealed, waylandConnected,
+    /\ UNCHANGED <<mode, now, displayProven, snapshotSealed, snapshotDvmIdentityBound, waylandConnected,
                   firstFrame, storageProven>>
 
 ConnectWayland ==
@@ -120,7 +123,7 @@ ConnectWayland ==
     /\ now <= FrameDeadline
     /\ phase' = WaylandReady
     /\ waylandConnected' = TRUE
-    /\ UNCHANGED <<mode, now, displayProven, snapshotSealed, imageCommitted,
+    /\ UNCHANGED <<mode, now, displayProven, snapshotSealed, snapshotDvmIdentityBound, imageCommitted,
                   appActive, firstFrame, storageProven>>
 
 PresentFirstFrame ==
@@ -129,13 +132,14 @@ PresentFirstFrame ==
     /\ displayProven
     /\ storageProven
     /\ snapshotSealed
+    /\ snapshotDvmIdentityBound
     /\ imageCommitted
     /\ appActive
     /\ waylandConnected
     /\ now <= FrameDeadline
     /\ phase' = Presented
     /\ firstFrame' = TRUE
-    /\ UNCHANGED <<mode, now, displayProven, snapshotSealed, imageCommitted,
+    /\ UNCHANGED <<mode, now, displayProven, snapshotSealed, snapshotDvmIdentityBound, imageCommitted,
                   appActive, waylandConnected, storageProven>>
 
 DeadlineMissed ==
@@ -157,7 +161,7 @@ DeadlineMissed ==
        /\ now >= StorageDeadline
     \/ /\ mode = Interactive
        /\ phase = InputReady
-       /\ ~snapshotSealed
+       /\ (~snapshotSealed \/ ~snapshotDvmIdentityBound)
        /\ now >= SnapshotDeadline
     \/ /\ mode = Interactive
        /\ phase \in {SnapshotReady, ImageActive, WaylandReady}
@@ -167,20 +171,20 @@ Expire ==
     /\ phase \notin Terminal
     /\ DeadlineMissed
     /\ phase' = Failed
-    /\ UNCHANGED <<mode, now, displayProven, snapshotSealed, imageCommitted,
+    /\ UNCHANGED <<mode, now, displayProven, snapshotSealed, snapshotDvmIdentityBound, imageCommitted,
                   appActive, waylandConnected, firstFrame, storageProven>>
 
 Revoke ==
     /\ phase \notin Terminal
     /\ phase' = Revoked
-    /\ UNCHANGED <<mode, now, displayProven, snapshotSealed, imageCommitted,
+    /\ UNCHANGED <<mode, now, displayProven, snapshotSealed, snapshotDvmIdentityBound, imageCommitted,
                   appActive, waylandConnected, firstFrame, storageProven>>
 
 Tick ==
     /\ phase \notin Terminal
     /\ now < HardDeadline
     /\ now' = now + 1
-    /\ UNCHANGED <<mode, phase, displayProven, snapshotSealed, imageCommitted,
+    /\ UNCHANGED <<mode, phase, displayProven, snapshotSealed, snapshotDvmIdentityBound, imageCommitted,
                   appActive, waylandConnected, firstFrame, storageProven>>
 
 Next ==
@@ -210,6 +214,7 @@ TypeOK ==
     /\ now \in 0..HardDeadline
     /\ displayProven \in BOOLEAN
     /\ snapshotSealed \in BOOLEAN
+    /\ snapshotDvmIdentityBound \in BOOLEAN
     /\ imageCommitted \in BOOLEAN
     /\ appActive \in BOOLEAN
     /\ waylandConnected \in BOOLEAN
@@ -232,6 +237,7 @@ PresentedHasCompleteAuthorityChain ==
         /\ displayProven
         /\ storageProven
         /\ snapshotSealed
+        /\ snapshotDvmIdentityBound
         /\ imageCommitted
         /\ appActive
         /\ waylandConnected
@@ -241,7 +247,7 @@ StorageSuccessHasProvenDataPlane ==
 
 NoPartialImageBecomesActive ==
     (imageCommitted \/ appActive \/ waylandConnected \/ firstFrame) =>
-        snapshotSealed /\ storageProven
+        snapshotSealed /\ snapshotDvmIdentityBound /\ storageProven
 
 NoConnectionBeforeActivation ==
     (waylandConnected \/ firstFrame) => imageCommitted /\ appActive

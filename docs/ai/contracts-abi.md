@@ -1768,6 +1768,15 @@ ELF file mappings cross the VFS/loader/process boundary only as one immutable
 executable snapshot. Vfsd reads the admitted file once into a bounded private
 memfd and applies
 `F_SEAL_WRITE|F_SEAL_GROW|F_SEAL_SHRINK|F_SEAL_SEAL` before publishing it.
+The kernel-stamped `product-executable-snapshot-sealed` milestone is reserved
+for a DVM-volume read. Its checksummed `evidence_v=1` payload contains the
+fixed Vfsd service identity, kernel-observed live Vfsd endpoint generation,
+storaged block-provider generation, VFS mount generation, nonzero Vfsd
+request identity, and SHA-256 of the terminally sealed bytes. Vfsd cannot
+supply the service identity or endpoint generation, and a failed kernel stamp
+fails the DVM snapshot open closed. A snapshot sourced from the signed early-system image emits only
+`product-bootstrap-executable-snapshot-sealed` and cannot satisfy a product
+storage-execution scenario.
 Loaderd validates every `PT_LOAD` range against that same sealed file and
 passes the snapshot plus original file offsets to the process broker; it does
 not reopen the pathname or duplicate segment bytes. The snapshot is bounded to

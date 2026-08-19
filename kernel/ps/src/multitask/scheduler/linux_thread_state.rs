@@ -9,6 +9,8 @@ use core::ptr::NonNull;
 
 use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
 
+#[cfg(not(test))]
+use super::runqueue;
 use super::{LinuxThreadState, MAX_TASK, ProcessHandle, Scheduler, UserAbi, process_table};
 
 pub(in crate::multitask) struct CurrentLinuxThreadBinding {
@@ -79,6 +81,11 @@ impl Scheduler {
         let mut cell = self.linux_thread_states[slot].lock();
         cell.owner_tid = owner_tid;
         cell.state = state;
+        #[cfg(not(test))]
+        runqueue::simd_tls::set_tls_fs_base(
+            slot,
+            cell.state.map(|state| state.fs_base).unwrap_or(0),
+        );
     }
 
     pub(in crate::multitask) fn current_linux_thread_binding(

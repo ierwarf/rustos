@@ -124,10 +124,7 @@ pub(super) fn launch_calls() -> crate::launch_worker::LaunchCalls {
 /// The console session is allocated on this side because it is `BrokerState`,
 /// and because a session that exists before the child does is what lets the
 /// compositor show the window while the image is still loading.
-pub(super) fn begin_tracked_launch(
-    state: &mut BrokerState,
-    entry: LaunchEntry,
-) -> Result<(), i32> {
+pub(super) fn begin_tracked_launch(state: &mut BrokerState, entry: LaunchEntry) -> Result<(), i32> {
     // The acceptance contract is applied by the worker; it is a storage read
     // and it only rewrites the child's environment, so nothing decided below
     // depends on it.
@@ -278,7 +275,9 @@ fn finish_tracked_launch(state: &mut BrokerState, pid: Option<i32>, result: Resu
             // Drop the record only if this loop made one. A failure before the
             // record leaves nothing to remove, and removing a pid the loop
             // never inserted would take somebody else's.
-            if let Some(recorded) = in_flight.recorded_pid.filter(|recorded| Some(*recorded) == pid)
+            if let Some(recorded) = in_flight
+                .recorded_pid
+                .filter(|recorded| Some(*recorded) == pid)
             {
                 state.running.remove(&recorded);
             }

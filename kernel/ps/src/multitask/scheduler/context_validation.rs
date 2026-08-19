@@ -62,11 +62,10 @@ impl Scheduler {
             ) {
                 continue;
             }
-            if let Err(reason) =
-                self.validate_saved_context(slot, context.user_mode, context.saved_rsp)
-            {
-                self.log_invalid_context(slot, context.saved_rsp, reason, "ready-scan");
-                self.retire_slot_due_to_invalid_context(slot, context.saved_rsp, reason);
+            let saved_rsp = self.slot_saved_rsp(slot);
+            if let Err(reason) = self.validate_saved_context(slot, context.user_mode, saved_rsp) {
+                self.log_invalid_context(slot, saved_rsp, reason, "ready-scan");
+                self.retire_slot_due_to_invalid_context(slot, saved_rsp, reason);
             }
         }
     }

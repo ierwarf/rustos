@@ -28,6 +28,7 @@ pub use affinity::{AffinityCommit, AffinityError, ProcessAffinitySnapshot};
 mod activation_batch_tests;
 mod context_validation;
 mod dispatch_policy;
+mod donation_ledger;
 mod handoff_queue;
 mod handoffs;
 mod ipc_donation;
@@ -60,6 +61,7 @@ mod thread_slots;
 
 use alloc::string::String;
 use alloc::vec::Vec;
+#[cfg(test)]
 use core::sync::atomic::{AtomicU8, Ordering};
 use core::{mem, ptr};
 
@@ -69,7 +71,8 @@ use x86_64::instructions::segmentation::{DS, ES, FS, GS, Segment};
 use x86_64::registers::model_specific::FsBase;
 use x86_64::structures::gdt::SegmentSelector;
 
-use crate::arch::simd::{SimdState, restore_state, save_state};
+#[cfg(test)]
+use crate::arch::simd::SimdState;
 use crate::debug;
 use crate::io::session::ConsoleSessionHandle;
 use crate::memory::paging::ProcessAddressSpace;
@@ -86,6 +89,7 @@ use super::{UserFaultDisposition, UserStackState, UserTaskBootstrap, initial_tas
 use context_validation::context_validation_reason_code;
 use dispatch_policy::{CpuDispatchGuard, CpuDispatchLock, CpuDispatchPolicy};
 use handoff_queue::SlotHandoffQueue;
+#[cfg(test)]
 use ipc_donation::{IpcDonationTarget, IpcPriorityDonation};
 pub(super) use linux_thread_state::CurrentLinuxThreadBinding;
 use linux_thread_state::{LinuxThreadStateLock, empty_linux_thread_state_lock};
@@ -101,19 +105,29 @@ use sync_handoff::ReplyWakeHandoff;
 // the product contract for service growth and application headroom.
 pub(super) const MAX_TASK: usize = 128;
 
-/// A set of task slots held in one machine word pair.
+/// Releases reply-owned scheduling urgency without acquiring the scheduler
+/// catalog. The donation ledger's exact reply identity is the terminal owner;
+/// wake publication still runs through its separate owner-word transition.
+pub(in crate::multitask) fn release_reply_donation(reply: u64) -> bool {
+    donation_ledger::release_reply(reply)
+}
+
+/// A host-test set of task slots held in one machine word pair.
 ///
 /// The donation walk needs a cycle-breaking set, and it needs it on the
 /// dispatch path: both O(local-runnable) pick scans derive a class per
 /// candidate, so the set is constructed once per candidate per dispatch. A
 /// `[bool; MAX_TASK]` costs a 128-byte stack clear each time to record at most
 /// `MAX_IPC_DONATION_CHAIN_DEPTH` members.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct SlotSet(u128);
 
 /// One bit per slot, so the table may not outgrow the word.
+#[cfg(test)]
 const _: () = assert!(MAX_TASK <= u128::BITS as usize);
 
+#[cfg(test)]
 impl SlotSet {
     pub(super) const EMPTY: Self = Self(0);
 
@@ -150,9 +164,11 @@ impl SlotSet {
 /// userspace. The bound is what keeps the recursion in `effective_slot_class`
 /// a constant cost inside the global scheduler lock rather than one that grows
 /// with how many tasks happen to be waiting on each other.
+#[cfg(test)]
 const MAX_IPC_DONATION_CHAIN_DEPTH: usize = 4;
 /// Sentinel for an unresolved donor-slot hint. `MAX_TASK` fits in `u8`, so the
 /// hint table stays one cache-friendly byte per donation entry.
+#[cfg(test)]
 const NO_SLOT_HINT: u8 = u8::MAX;
 const _: () = assert!(kernel_ipc_runtime::api::MAX_ENDPOINT_WAKE_TASKS >= MAX_TASK);
 const ROOT_TASK_SLOT: usize = 0;
@@ -320,8 +336,11 @@ enum TaskRetireReason {
 
 #[derive(Clone, Copy)]
 struct TaskContext {
+    /// Host-test fixture for the production per-slot saved-frame pointer.
+    #[cfg(test)]
     saved_rsp: usize,
-    ready: bool,
+    #[cfg(test)]
+    test_ready: bool,
     ready_since_ticks: u64,
     blocked: bool,
     blocked_since_ticks: u64,
@@ -336,15 +355,23 @@ struct TaskContext {
     weight: u32,
     /// Virtual runtime in nanoseconds, scaled by NICE_0_LOAD/weight. The task
     /// with the smallest vruntime among the ready set is picked next.
+    #[cfg(test)]
     vruntime_ns: u64,
-    /// RTC tick when the task last started running (was switched to). Zero
-    /// while the task is not running. Used to accumulate vruntime on
-    /// preemption / context switch.
+    /// Test fixture for the per-slot execution baseline. Production storage
+    /// is in `runqueue`, so runtime accounting does not require a task-catalog
+    /// read. Zero means the task is not currently charging an interval.
+    #[cfg(test)]
     exec_start_ticks: u64,
     address_space_root: u64,
+    /// Host-test mirrors for production per-slot primary stack geometry.
+    #[cfg(test)]
     kernel_stack_base: u64,
+    #[cfg(test)]
     kernel_stack_top: u64,
+    /// Host-test mirror for the production versioned alternate-stack record.
+    #[cfg(test)]
     alternate_kernel_stack_base: u64,
+    #[cfg(test)]
     alternate_kernel_stack_top: u64,
     user_mode: bool,
     user_abi: Option<UserAbi>,
@@ -441,17 +468,24 @@ pub(super) struct Scheduler {
     start_suspended: [bool; MAX_TASK],
     job_stopped: [bool; MAX_TASK],
     retire_reasons: [Option<TaskRetireReason>; MAX_TASK],
+    /// Host-test fixture for production per-slot SIMD storage.
+    #[cfg(test)]
     simd_states: [SimdState; MAX_TASK],
     starts: [Option<TaskStart>; MAX_TASK],
     stacks: [Option<Vec<u8>>; MAX_TASK],
     idle_cpu: [u8; MAX_TASK],
+    /// Host-test mirrors for the production versioned affinity payload.
+    #[cfg(test)]
     task_affinity_masks: [u64; MAX_TASK],
+    #[cfg(test)]
     process_affinity_masks: [u64; MAX_TASK],
+    #[cfg(test)]
     affinity_migration_pending: [bool; MAX_TASK],
     /// Last CPU that actually dispatched each exact live task. This is
     /// scheduler policy metadata, unlike the independently reset diagnostic
     /// profile. It is only a bounded fair-pick tie-break and grants no CPU
     /// ownership or affinity authority.
+    #[cfg(test)]
     task_last_cpu: [u8; MAX_TASK],
     // Unit tests construct isolated scheduler instances without CPU-local
     // boot state.  Production dispatch state lives in
@@ -469,10 +503,10 @@ pub(super) struct Scheduler {
     #[cfg(test)]
     sync_handoff_states:
         [sync_handoff::SyncHandoffLock; nucleus_core::util::lockdep::MAX_TRACKED_CPUS],
-    /// At most one synchronous IPC wait can be active per runnable task, so
-    /// `MAX_TASK` fixed entries cover every live donation without allocating
-    /// from scheduler or IPC paths.
+    /// Host-test mirror of the production reply-edge ledger.
+    #[cfg(test)]
     ipc_priority_donations: [Option<IpcPriorityDonation>; MAX_TASK],
+    #[cfg(test)]
     ipc_priority_donation_len: usize,
     /// Self-validating donor-slot hints for the reply donation table.
     ///
@@ -483,6 +517,7 @@ pub(super) struct Scheduler {
     /// serialized dispatch critical section. Every hint is validated against
     /// the exact live identity before use and repaired from the authoritative
     /// scan on a miss, so a stale hint can never change a derived class.
+    #[cfg(test)]
     donation_donor_slot_hints: [AtomicU8; MAX_TASK],
     /// Attribution remains fixed-size and is rendered only after the global
     /// scheduler owner is released; normal logging policy may discard it.
@@ -541,13 +576,18 @@ impl Scheduler {
             start_suspended: [false; MAX_TASK],
             job_stopped: [false; MAX_TASK],
             retire_reasons: [None; MAX_TASK],
+            #[cfg(test)]
             simd_states: [SimdState::new(); MAX_TASK],
             starts: [None; MAX_TASK],
             stacks: [const { None }; MAX_TASK],
             idle_cpu: [NO_IDLE_CPU; MAX_TASK],
+            #[cfg(test)]
             task_affinity_masks: [UNRESTRICTED_CPU_MASK; MAX_TASK],
+            #[cfg(test)]
             process_affinity_masks: [UNRESTRICTED_CPU_MASK; MAX_TASK],
+            #[cfg(test)]
             affinity_migration_pending: [false; MAX_TASK],
+            #[cfg(test)]
             task_last_cpu: [NO_IDLE_CPU; MAX_TASK],
             #[cfg(test)]
             current_task: 0,
@@ -556,8 +596,11 @@ impl Scheduler {
                 nucleus_core::util::lockdep::MAX_TRACKED_CPUS],
             #[cfg(test)]
             sync_handoff_states: sync_handoff::per_scheduler_locks(),
+            #[cfg(test)]
             ipc_priority_donations: [None; MAX_TASK],
+            #[cfg(test)]
             ipc_priority_donation_len: 0,
+            #[cfg(test)]
             donation_donor_slot_hints: [const { AtomicU8::new(NO_SLOT_HINT) }; MAX_TASK],
             runtime_profile_started_ticks: 0,
             runtime_profile_ns: [0; MAX_TASK],
@@ -698,7 +741,7 @@ impl Scheduler {
             && !self.job_stopped[slot]
             && !self.exec_target_quiesced[slot]
             && self.deferred_retire_reasons[slot].is_none()
-            // Queue membership replaces `context.ready`, but `!blocked` stays.
+            // Queue membership replaces the legacy test readiness bit, but `!blocked` stays.
             //
             // The first conversion dropped it and panicked on both 8-vCPU runs.
             // The predicates differ in *both* directions, not just the obvious
@@ -715,6 +758,347 @@ impl Scheduler {
     fn new_task_vruntime(&self) -> u64 {
         self.min_ready_vruntime()
             .saturating_add(SCHED_NEW_TASK_VRUNTIME_PENALTY_NS)
+    }
+
+    /// Returns the fair-share key from the slot payload authority.
+    ///
+    /// Production never stores this hot scheduling value in the global
+    /// `Scheduler` payload. Host-only unit schedulers retain their private
+    /// fixture field because they intentionally do not publish runqueue owner
+    /// words or static kernel state.
+    #[inline]
+    fn slot_vruntime(&self, slot: usize) -> u64 {
+        #[cfg(not(test))]
+        {
+            runqueue::vruntime(slot)
+        }
+        #[cfg(test)]
+        {
+            self.contexts[slot]
+                .map(|context| context.vruntime_ns)
+                .unwrap_or(0)
+        }
+    }
+
+    #[inline]
+    fn initialize_slot_vruntime(&mut self, slot: usize, value: u64) {
+        #[cfg(not(test))]
+        runqueue::initialize_vruntime(slot, value);
+        #[cfg(test)]
+        if let Some(context) = self.contexts[slot].as_mut() {
+            context.vruntime_ns = value;
+        }
+    }
+
+    #[inline]
+    fn slot_exec_start_ticks(&self, slot: usize) -> u64 {
+        #[cfg(not(test))]
+        {
+            runqueue::exec_start_ticks(slot)
+        }
+        #[cfg(test)]
+        {
+            self.contexts[slot]
+                .map(|context| context.exec_start_ticks)
+                .unwrap_or(0)
+        }
+    }
+
+    #[inline]
+    fn initialize_slot_exec_start_ticks(&mut self, slot: usize, value: u64) {
+        #[cfg(not(test))]
+        runqueue::initialize_exec_start_ticks(slot, value);
+        #[cfg(test)]
+        if let Some(context) = self.contexts[slot].as_mut() {
+            context.exec_start_ticks = value;
+        }
+    }
+
+    #[inline]
+    fn set_slot_exec_start_ticks(&mut self, slot: usize, value: u64) {
+        #[cfg(not(test))]
+        runqueue::set_exec_start_ticks(slot, value);
+        #[cfg(test)]
+        if let Some(context) = self.contexts[slot].as_mut() {
+            context.exec_start_ticks = value;
+        }
+    }
+
+    #[inline]
+    fn slot_saved_rsp(&self, slot: usize) -> usize {
+        #[cfg(not(test))]
+        {
+            runqueue::saved_rsp(slot)
+        }
+        #[cfg(test)]
+        {
+            self.contexts[slot]
+                .map(|context| context.saved_rsp)
+                .unwrap_or(0)
+        }
+    }
+
+    #[inline]
+    fn initialize_slot_saved_rsp(&mut self, slot: usize, value: usize) {
+        #[cfg(not(test))]
+        runqueue::initialize_saved_rsp(slot, value);
+        #[cfg(test)]
+        if let Some(context) = self.contexts[slot].as_mut() {
+            context.saved_rsp = value;
+        }
+    }
+
+    #[inline]
+    fn set_slot_saved_rsp(&mut self, slot: usize, value: usize) {
+        #[cfg(not(test))]
+        runqueue::set_saved_rsp(slot, value);
+        #[cfg(test)]
+        if let Some(context) = self.contexts[slot].as_mut() {
+            context.saved_rsp = value;
+        }
+    }
+
+    #[inline]
+    fn slot_tls_fs_base(&self, slot: usize) -> u64 {
+        #[cfg(not(test))]
+        {
+            runqueue::simd_tls::tls_fs_base(slot)
+        }
+        #[cfg(test)]
+        {
+            self.linux_thread_state(slot)
+                .map(|state| state.fs_base)
+                .unwrap_or(0)
+        }
+    }
+
+    #[inline]
+    pub(in crate::multitask) fn set_current_tls_fs_base(&mut self, value: u64) {
+        let slot = self.current_task_slot();
+        #[cfg(not(test))]
+        runqueue::simd_tls::set_tls_fs_base(slot, value);
+        #[cfg(test)]
+        if let Some(state) = self.linux_thread_states[slot].lock().state.as_mut() {
+            state.fs_base = value;
+        }
+    }
+
+    #[inline]
+    fn slot_kernel_stack_bounds(&self, slot: usize) -> (u64, u64) {
+        #[cfg(not(test))]
+        {
+            runqueue::kernel_stack_bounds(slot)
+        }
+        #[cfg(test)]
+        {
+            self.contexts[slot]
+                .map(|context| (context.kernel_stack_base, context.kernel_stack_top))
+                .unwrap_or((0, 0))
+        }
+    }
+
+    #[inline]
+    fn initialize_slot_kernel_stack_bounds(&mut self, slot: usize, base: u64, top: u64) {
+        #[cfg(not(test))]
+        runqueue::initialize_kernel_stack_bounds(slot, base, top);
+        #[cfg(test)]
+        if let Some(context) = self.contexts[slot].as_mut() {
+            context.kernel_stack_base = base;
+            context.kernel_stack_top = top;
+        }
+    }
+
+    #[inline]
+    fn slot_alternate_kernel_stack_bounds(&self, slot: usize) -> (u64, u64) {
+        #[cfg(not(test))]
+        {
+            runqueue::alternate_kernel_stack_bounds(slot)
+        }
+        #[cfg(test)]
+        {
+            self.contexts[slot]
+                .map(|context| {
+                    (
+                        context.alternate_kernel_stack_base,
+                        context.alternate_kernel_stack_top,
+                    )
+                })
+                .unwrap_or((0, 0))
+        }
+    }
+
+    #[inline]
+    fn initialize_slot_alternate_kernel_stack_bounds(&mut self, slot: usize) {
+        #[cfg(not(test))]
+        runqueue::initialize_alternate_kernel_stack_bounds(slot);
+        #[cfg(test)]
+        if let Some(context) = self.contexts[slot].as_mut() {
+            context.alternate_kernel_stack_base = 0;
+            context.alternate_kernel_stack_top = 0;
+        }
+    }
+
+    #[inline]
+    fn replace_slot_alternate_kernel_stack_bounds(&mut self, slot: usize, base: u64, top: u64) {
+        #[cfg(not(test))]
+        runqueue::replace_alternate_kernel_stack_bounds(slot, base, top);
+        #[cfg(test)]
+        if let Some(context) = self.contexts[slot].as_mut() {
+            context.alternate_kernel_stack_base = base;
+            context.alternate_kernel_stack_top = top;
+        }
+    }
+
+    #[inline]
+    fn initialize_slot_simd_state(&mut self, slot: usize) {
+        #[cfg(not(test))]
+        runqueue::simd_tls::initialize_simd_state(slot);
+        #[cfg(test)]
+        {
+            self.simd_states[slot] = SimdState::new();
+        }
+    }
+
+    #[inline]
+    fn reset_slot_simd_state(&mut self, slot: usize) {
+        #[cfg(not(test))]
+        runqueue::simd_tls::reset_simd_state(slot);
+        #[cfg(test)]
+        {
+            self.simd_states[slot] = SimdState::new();
+        }
+    }
+
+    #[inline]
+    fn save_slot_simd_state(&mut self, slot: usize) {
+        #[cfg(not(test))]
+        runqueue::simd_tls::save_simd_state(slot);
+        #[cfg(test)]
+        unsafe {
+            crate::arch::simd::save_state(&mut self.simd_states[slot]);
+        }
+    }
+
+    #[inline]
+    fn restore_slot_simd_state(&mut self, slot: usize) {
+        #[cfg(not(test))]
+        runqueue::simd_tls::restore_simd_state(slot);
+        #[cfg(test)]
+        unsafe {
+            crate::arch::simd::restore_state(&self.simd_states[slot]);
+        }
+    }
+
+    #[inline]
+    fn slot_affinity_snapshot(&self, slot: usize) -> (u64, u64, bool) {
+        #[cfg(not(test))]
+        {
+            runqueue::affinity_payload::affinity_snapshot(slot)
+        }
+        #[cfg(test)]
+        {
+            (
+                self.task_affinity_masks[slot],
+                self.process_affinity_masks[slot],
+                self.affinity_migration_pending[slot],
+            )
+        }
+    }
+
+    #[inline]
+    fn replace_slot_affinity(
+        &mut self,
+        slot: usize,
+        task_mask: u64,
+        process_mask: u64,
+        migration_pending: bool,
+    ) {
+        #[cfg(not(test))]
+        runqueue::affinity_payload::set_affinity(slot, task_mask, process_mask, migration_pending);
+        #[cfg(test)]
+        {
+            self.task_affinity_masks[slot] = task_mask;
+            self.process_affinity_masks[slot] = process_mask;
+            self.affinity_migration_pending[slot] = migration_pending;
+        }
+    }
+
+    #[inline]
+    fn initialize_slot_affinity_payload(&mut self, slot: usize, task_mask: u64, process_mask: u64) {
+        #[cfg(not(test))]
+        runqueue::affinity_payload::initialize_affinity(slot, task_mask, process_mask);
+        #[cfg(test)]
+        self.replace_slot_affinity(slot, task_mask, process_mask, false);
+    }
+
+    #[inline]
+    fn slot_last_cpu(&self, slot: usize) -> u8 {
+        #[cfg(not(test))]
+        {
+            runqueue::affinity_payload::last_cpu(slot)
+        }
+        #[cfg(test)]
+        {
+            self.task_last_cpu[slot]
+        }
+    }
+
+    #[inline]
+    fn record_slot_last_cpu(&mut self, slot: usize, cpu: u8) {
+        #[cfg(not(test))]
+        runqueue::affinity_payload::record_last_cpu(slot, cpu);
+        #[cfg(test)]
+        {
+            self.task_last_cpu[slot] = cpu;
+        }
+    }
+
+    #[inline]
+    fn add_slot_vruntime(&mut self, slot: usize, delta: u64) -> u64 {
+        #[cfg(not(test))]
+        {
+            runqueue::add_vruntime(slot, delta)
+        }
+        #[cfg(test)]
+        {
+            let context = self.contexts[slot]
+                .as_mut()
+                .expect("scheduler vruntime charge missing task context");
+            context.vruntime_ns = context.vruntime_ns.saturating_add(delta);
+            context.vruntime_ns
+        }
+    }
+
+    #[inline]
+    fn raise_slot_vruntime_floor(&mut self, slot: usize, floor: u64) -> u64 {
+        #[cfg(not(test))]
+        {
+            runqueue::raise_vruntime_floor(slot, floor)
+        }
+        #[cfg(test)]
+        {
+            let context = self.contexts[slot]
+                .as_mut()
+                .expect("scheduler sleeper floor missing task context");
+            context.vruntime_ns = context.vruntime_ns.max(floor);
+            context.vruntime_ns
+        }
+    }
+
+    #[inline]
+    fn lower_slot_vruntime_ceiling(&mut self, slot: usize, ceiling: u64) -> u64 {
+        #[cfg(not(test))]
+        {
+            runqueue::lower_vruntime_ceiling(slot, ceiling)
+        }
+        #[cfg(test)]
+        {
+            let context = self.contexts[slot]
+                .as_mut()
+                .expect("scheduler IPC donation missing task context");
+            context.vruntime_ns = context.vruntime_ns.min(ceiling);
+            context.vruntime_ns
+        }
     }
 
     fn remove_slot_from_dispatch_policies(&mut self, slot: usize) {
@@ -934,8 +1318,9 @@ impl Scheduler {
             self.clear_slot(slot);
         }
 
-        self.simd_states = [SimdState::new(); MAX_TASK];
-        for slot in 0..MAX_TASK {
+        #[cfg(test)]
+        {
+            self.simd_states = [SimdState::new(); MAX_TASK];
         }
         self.retired = [false; MAX_TASK];
         self.retirement_cleanup = [None; MAX_TASK];
@@ -946,10 +1331,13 @@ impl Scheduler {
         self.job_stopped = [false; MAX_TASK];
         self.retire_reasons = [None; MAX_TASK];
         self.idle_cpu = [NO_IDLE_CPU; MAX_TASK];
-        self.task_affinity_masks = [UNRESTRICTED_CPU_MASK; MAX_TASK];
-        self.process_affinity_masks = [UNRESTRICTED_CPU_MASK; MAX_TASK];
-        self.affinity_migration_pending = [false; MAX_TASK];
-        self.task_last_cpu = [NO_IDLE_CPU; MAX_TASK];
+        #[cfg(test)]
+        {
+            self.task_affinity_masks = [UNRESTRICTED_CPU_MASK; MAX_TASK];
+            self.process_affinity_masks = [UNRESTRICTED_CPU_MASK; MAX_TASK];
+            self.affinity_migration_pending = [false; MAX_TASK];
+            self.task_last_cpu = [NO_IDLE_CPU; MAX_TASK];
+        }
         self.runtime_profile_started_ticks = 0;
         self.runtime_profile_ns = [0; MAX_TASK];
         self.runtime_profile_dispatches = [0; MAX_TASK];
@@ -980,34 +1368,50 @@ impl Scheduler {
         }
         #[cfg(not(test))]
         sync_handoff::reset_all_cpus();
-        self.ipc_priority_donations = [None; MAX_TASK];
-        self.ipc_priority_donation_len = 0;
+        #[cfg(not(test))]
+        donation_ledger::reset();
+        #[cfg(test)]
+        {
+            self.ipc_priority_donations = [None; MAX_TASK];
+            self.ipc_priority_donation_len = 0;
+            self.donation_donor_slot_hints = [const { AtomicU8::new(NO_SLOT_HINT) }; MAX_TASK];
+        }
         self.root_idle = false;
         self.scheduler_tick_divisor = main_thread_pit_divisor;
         self.reset_stack_storage(ROOT_TASK_SLOT)
             .expect("scheduler root stack allocation failed");
         let (kernel_stack_base, kernel_stack_top) = self.stack_bounds(ROOT_TASK_SLOT);
+        let root_exec_start_ticks = crate::arch::rtc::ticks();
+        let root_saved_rsp = self.init_kernel_entry_context(
+            ROOT_TASK_SLOT,
+            kernel_cs,
+            kernel_ss,
+            rflags,
+            kernel_task_entry_rip,
+            0,
+        );
         self.contexts[ROOT_TASK_SLOT] = Some(TaskContext {
-            saved_rsp: self.init_kernel_entry_context(
-                ROOT_TASK_SLOT,
-                kernel_cs,
-                kernel_ss,
-                rflags,
-                kernel_task_entry_rip,
-                0,
-            ),
-            ready: true,
+            #[cfg(test)]
+            saved_rsp: root_saved_rsp,
+            #[cfg(test)]
+            test_ready: true,
             ready_since_ticks: crate::arch::rtc::ticks(),
             blocked: false,
             blocked_since_ticks: 0,
             wake_armed: false,
             weight: Self::weight_from_pit_divisor(main_thread_pit_divisor),
+            #[cfg(test)]
             vruntime_ns: 0,
-            exec_start_ticks: crate::arch::rtc::ticks(),
+            #[cfg(test)]
+            exec_start_ticks: root_exec_start_ticks,
             address_space_root: crate::memory::paging::kernel_root_phys().as_u64(),
+            #[cfg(test)]
             kernel_stack_base: kernel_stack_base as u64,
+            #[cfg(test)]
             kernel_stack_top: kernel_stack_top as u64,
+            #[cfg(test)]
             alternate_kernel_stack_base: 0,
+            #[cfg(test)]
             alternate_kernel_stack_top: 0,
             user_mode: false,
             user_abi: None,
@@ -1017,6 +1421,16 @@ impl Scheduler {
             user_stack: None,
             windows_thread_state: None,
         });
+        self.initialize_slot_vruntime(ROOT_TASK_SLOT, 0);
+        self.initialize_slot_exec_start_ticks(ROOT_TASK_SLOT, root_exec_start_ticks);
+        self.initialize_slot_saved_rsp(ROOT_TASK_SLOT, root_saved_rsp);
+        self.initialize_slot_kernel_stack_bounds(
+            ROOT_TASK_SLOT,
+            kernel_stack_base as u64,
+            kernel_stack_top as u64,
+        );
+        self.initialize_slot_alternate_kernel_stack_bounds(ROOT_TASK_SLOT);
+        self.initialize_slot_simd_state(ROOT_TASK_SLOT);
         self.starts[ROOT_TASK_SLOT] = Some(TaskStart { entry, id });
         self.publish_slot_identity(ROOT_TASK_SLOT);
         #[cfg(not(test))]
@@ -1026,9 +1440,7 @@ impl Scheduler {
                 .expect("root task id exhausted lock owner token"),
         );
 
-        unsafe {
-            save_state(&mut self.simd_states[ROOT_TASK_SLOT]);
-        }
+        self.save_slot_simd_state(ROOT_TASK_SLOT);
     }
 
     pub(super) fn initialized(&self) -> bool {
@@ -1053,10 +1465,9 @@ impl Scheduler {
         let context = self.contexts[slot];
         let process_handle = context.and_then(|context| context.process_handle);
         let user_mode = context.is_some_and(|context| context.user_mode);
-        let stack_base = context
-            .map(|context| context.kernel_stack_base)
-            .unwrap_or(0);
-        let stack_top = context.map(|context| context.kernel_stack_top).unwrap_or(0);
+        let (stack_base, stack_top) = context
+            .map(|_| self.slot_kernel_stack_bounds(slot))
+            .unwrap_or((0, 0));
         let reason = self.retire_reasons[slot];
 
         #[cfg(not(test))]
@@ -1073,14 +1484,14 @@ impl Scheduler {
         self.start_suspended[slot] = false;
         self.job_stopped[slot] = false;
         self.retire_reasons[slot] = None;
-        self.simd_states[slot] = SimdState::new();
+        self.reset_slot_simd_state(slot);
         self.starts[slot] = None;
         self.publish_slot_identity(slot);
         self.idle_cpu[slot] = NO_IDLE_CPU;
-        self.task_affinity_masks[slot] = UNRESTRICTED_CPU_MASK;
-        self.process_affinity_masks[slot] = UNRESTRICTED_CPU_MASK;
-        self.affinity_migration_pending[slot] = false;
-        self.task_last_cpu[slot] = NO_IDLE_CPU;
+        #[cfg(test)]
+        self.replace_slot_affinity(slot, UNRESTRICTED_CPU_MASK, UNRESTRICTED_CPU_MASK, false);
+        #[cfg(test)]
+        self.record_slot_last_cpu(slot, NO_IDLE_CPU);
         self.runtime_profile_last_cpu[slot] = NO_IDLE_CPU;
         self.runtime_profile_last_task_id[slot] = 0;
         RetiredSlotReclaim::new(
@@ -1100,46 +1511,34 @@ impl Scheduler {
             return;
         };
 
-        context.saved_rsp = saved_rsp;
-        if ready && !context.ready {
-            context.ready_since_ticks = crate::arch::rtc::ticks();
+        #[cfg(test)]
+        {
+            context.saved_rsp = saved_rsp;
+        }
+        if ready && context.ready_since_ticks == 0 {
+            context.ready_since_ticks = Self::ready_since_now_ticks();
         } else if !ready {
             context.ready_since_ticks = 0;
         }
-        context.ready = ready;
-        // Mirror into the owner word so a task that blocks while executing stops
-        // being runnable there too. This covers the funnelled writes; the
-        // fourteen direct assignments elsewhere are covered by
-        // `sync_running_runnable_bits` at guard release, because a mirror that
-        // depends on remembering to call it is a mirror that goes stale.
+        #[cfg(test)]
+        {
+            context.test_ready = ready;
+        }
+        // This funnel owns the explicit turn-boundary transition. Direct
+        // lifecycle writes below intentionally do not mirror the legacy field:
+        // `ready = false` historically meant both "not queued" and "blocked",
+        // while a `Running` owner must retain run intent until its block
+        // transaction commits.
         #[cfg(not(test))]
         runqueue::set_runnable(slot, ready);
+        self.set_slot_saved_rsp(slot, saved_rsp);
     }
 
-    /// Re-mirrors the runnable bit for every slot a CPU is executing.
-    ///
-    /// Called once at guard release. Bounded by the CPU count, not the slot
-    /// count, because the bit only has to agree while a task is `Running`: a
-    /// queued or blocked slot carries it from its own state transition.
-    ///
-    /// This exists because mirroring at each write site does not work. There
-    /// are fourteen direct assignments to `context.ready`, several inside a
-    /// mutable borrow of the context that cannot call back into `self`, and the
-    /// first attempt to mirror only at the funnel diverged 7-9 times per second
-    /// at 8 vCPU while reading clean at 1. A wake on one CPU can change the
-    /// readiness of a task executing on another, so no single writer's own
-    /// release point covers it either.
-    #[cfg(not(test))]
-    pub(super) fn sync_running_runnable_bits(&self) {
-        for cpu in 0..nucleus_core::util::lockdep::MAX_TRACKED_CPUS {
-            let Some(slot) = super::cpu_local::published_current_slot(cpu) else {
-                continue;
-            };
-            let Some(context) = self.contexts.get(slot).and_then(|context| *context) else {
-                continue;
-            };
-            runqueue::set_runnable(slot, context.ready);
-        }
+    /// Queue-age zero is the exact not-queued sentinel, including during the
+    /// earliest boot ticks where the RTC itself can still report zero.
+    #[inline]
+    fn ready_since_now_ticks() -> u64 {
+        crate::arch::rtc::ticks().max(1)
     }
 
     fn ticks_elapsed_ms(start_ticks: u64, end_ticks: u64) -> u64 {
@@ -1218,7 +1617,7 @@ impl Scheduler {
             if !self.context_is_schedulable(slot, ctx) {
                 continue;
             }
-            let v = ctx.vruntime_ns;
+            let v = self.slot_vruntime(slot);
             min = Some(min.map(|m| m.min(v)).unwrap_or(v));
         }
         min.unwrap_or(0)
@@ -1248,7 +1647,7 @@ impl Scheduler {
             if self.slot_class(slot) != Some(class) {
                 continue;
             }
-            let v = ctx.vruntime_ns;
+            let v = self.slot_vruntime(slot);
             min = Some(min.map(|m| m.min(v)).unwrap_or(v));
         }
         min.unwrap_or(0)
@@ -1266,12 +1665,26 @@ impl Scheduler {
     /// trusted launcher opts them in; this prevents a high-throughput weight
     /// from silently becoming a strict-priority capability.
     fn slot_class(&self, slot: usize) -> Option<SchedClass> {
-        // The cycle-breaking set is a bitmap, not `[bool; MAX_TASK]`. Both
-        // O(local-runnable) pick scans call this once per candidate on every
-        // dispatch, and a byte-per-slot set costs a 128-byte stack clear per
-        // call for at most one bit that is ever set outside a donation chain.
-        let mut visiting = SlotSet::EMPTY;
-        self.effective_slot_class(slot, &mut visiting, 0)
+        #[cfg(not(test))]
+        {
+            let base = self.base_slot_class(slot)?;
+            return Some(
+                if base == SchedClass::User && donation_ledger::inherited_system(slot) {
+                    SchedClass::System
+                } else {
+                    base
+                },
+            );
+        }
+        #[cfg(test)]
+        {
+            // The cycle-breaking set is a bitmap, not `[bool; MAX_TASK]`. Both
+            // O(local-runnable) pick scans call this once per candidate on every
+            // dispatch, and a byte-per-slot set costs a 128-byte stack clear per
+            // call for at most one bit that is ever set outside a donation chain.
+            let mut visiting = SlotSet::EMPTY;
+            self.effective_slot_class(slot, &mut visiting, 0)
+        }
     }
 
     /// Returns the kernel-derived effective IPC/scheduling class for a live
@@ -1283,6 +1696,7 @@ impl Scheduler {
         })
     }
 
+    #[cfg(test)]
     fn effective_slot_class(
         &self,
         slot: usize,
@@ -1394,9 +1808,10 @@ impl Scheduler {
     /// historical zero-charge behavior, since storage and other kernel paths
     /// rely on it to make timely forward progress under TCG.
     fn account_current_runtime(&mut self, slot: usize, now_ticks: u64, force_min_charge: bool) {
-        let Some(start) = self.contexts[slot].map(|context| context.exec_start_ticks) else {
+        if self.contexts[slot].is_none() {
             return;
-        };
+        }
+        let start = self.slot_exec_start_ticks(slot);
         if start == 0 {
             return;
         }
@@ -1411,16 +1826,16 @@ impl Scheduler {
         } else {
             elapsed_ns
         };
-        let context = self.contexts[slot]
-            .as_mut()
-            .expect("profiled scheduler task disappeared under scheduler owner");
         if elapsed_ns == 0 {
-            context.exec_start_ticks = 0;
+            self.set_slot_exec_start_ticks(slot, 0);
             return;
         }
-        let delta = Self::weighted_vruntime_delta(elapsed_ns, context.weight);
-        context.vruntime_ns = context.vruntime_ns.saturating_add(delta);
-        context.exec_start_ticks = 0;
+        let weight = self.contexts[slot]
+            .map(|context| context.weight)
+            .expect("profiled scheduler task disappeared under scheduler owner");
+        let delta = Self::weighted_vruntime_delta(elapsed_ns, weight);
+        self.add_slot_vruntime(slot, delta);
+        self.set_slot_exec_start_ticks(slot, 0);
     }
 
     /// Returns the lowest-vruntime User task only after the class-wide System
@@ -1460,9 +1875,7 @@ impl Scheduler {
     ) -> Option<usize> {
         let started_ns = Self::phase_chain_start();
         let picked = self.overdue_class_pick_inner(current, now_ticks, class, latency_bound_ms);
-        locality::charge_handoff_scan(
-            Self::phase_chain_start().saturating_sub(started_ns),
-        );
+        locality::charge_handoff_scan(Self::phase_chain_start().saturating_sub(started_ns));
         picked
     }
 
@@ -1490,13 +1903,14 @@ impl Scheduler {
             {
                 continue;
             }
-            let candidate = (slot, context.ready_since_ticks, context.vruntime_ns);
+            let vruntime = self.slot_vruntime(slot);
+            let candidate = (slot, context.ready_since_ticks, vruntime);
             match oldest {
                 None => oldest = Some(candidate),
                 Some((_, oldest_since, oldest_vruntime))
                     if context.ready_since_ticks < oldest_since
                         || (context.ready_since_ticks == oldest_since
-                            && context.vruntime_ns < oldest_vruntime) =>
+                            && vruntime < oldest_vruntime) =>
                 {
                     oldest = Some(candidate);
                 }
@@ -1763,7 +2177,6 @@ impl Scheduler {
         }
         self.retirement_cleanup[slot] = retirement_cleanup;
         if let Some(context) = self.contexts[slot].as_mut() {
-            context.ready = false;
             context.ready_since_ticks = 0;
             context.blocked = false;
             context.blocked_since_ticks = 0;
@@ -1872,11 +2285,12 @@ impl Scheduler {
         let base = if let Some(storage) = self.stacks[slot].as_ref() {
             storage.as_ptr() as *const u64
         } else {
-            let Some(context) = self.contexts[slot] else {
+            if self.contexts[slot].is_none() {
                 return false;
-            };
-            let Some(raw_base) = context
-                .kernel_stack_base
+            }
+            let Some(raw_base) = self
+                .slot_kernel_stack_bounds(slot)
+                .0
                 .checked_sub(TASK_STACK_GUARD_BYTES as u64)
             else {
                 return false;
@@ -1945,7 +2359,7 @@ impl Scheduler {
 
     pub(super) fn current_saved_rsp(&self) -> usize {
         self.contexts[self.current_task_slot()]
-            .map(|context| context.saved_rsp)
+            .map(|_| self.slot_saved_rsp(self.current_task_slot()))
             .unwrap_or(0)
     }
 
@@ -1958,20 +2372,17 @@ impl Scheduler {
             return None;
         }
 
-        let context = self.contexts[self.current_task_slot()].as_mut()?;
-        let previous = (
-            context.alternate_kernel_stack_base,
-            context.alternate_kernel_stack_top,
-        );
-        context.alternate_kernel_stack_base = base;
-        context.alternate_kernel_stack_top = top;
+        let slot = self.current_task_slot();
+        self.contexts[slot]?;
+        let previous = self.slot_alternate_kernel_stack_bounds(slot);
+        self.replace_slot_alternate_kernel_stack_bounds(slot, base, top);
         Some(previous)
     }
 
     pub(super) fn restore_current_alternate_kernel_stack(&mut self, previous: (u64, u64)) {
-        if let Some(context) = self.contexts[self.current_task_slot()].as_mut() {
-            context.alternate_kernel_stack_base = previous.0;
-            context.alternate_kernel_stack_top = previous.1;
+        let slot = self.current_task_slot();
+        if self.contexts[slot].is_some() {
+            self.replace_slot_alternate_kernel_stack_bounds(slot, previous.0, previous.1);
         }
     }
 
@@ -1997,20 +2408,14 @@ impl Scheduler {
     }
 
     fn context_stack_contains(&self, slot: usize, start: usize, end: usize) -> bool {
-        let Some(context) = self.contexts.get(slot).and_then(|context| *context) else {
+        let Some(_context) = self.contexts.get(slot).and_then(|context| *context) else {
             return false;
         };
-        stack_range_contains(
-            context.kernel_stack_base,
-            context.kernel_stack_top,
-            start,
-            end,
-        ) || stack_range_contains(
-            context.alternate_kernel_stack_base,
-            context.alternate_kernel_stack_top,
-            start,
-            end,
-        )
+        let (kernel_stack_base, kernel_stack_top) = self.slot_kernel_stack_bounds(slot);
+        stack_range_contains(kernel_stack_base, kernel_stack_top, start, end) || {
+            let (alternate_base, alternate_top) = self.slot_alternate_kernel_stack_bounds(slot);
+            stack_range_contains(alternate_base, alternate_top, start, end)
+        }
     }
 
     fn context_validation_error(
@@ -2155,27 +2560,31 @@ impl Scheduler {
             if self.contexts[slot].is_none() && !self.thread_slot_reserved[slot] {
                 self.reset_stack_storage(slot)?;
                 let (kernel_stack_base, kernel_stack_top) = self.stack_bounds(slot);
+                let vruntime_ns = self.new_task_vruntime();
+                let saved_rsp =
+                    self.init_kernel_entry_context(slot, cs, ss, rflags, kernel_task_entry_rip, 0);
                 self.contexts[slot] = Some(TaskContext {
-                    saved_rsp: self.init_kernel_entry_context(
-                        slot,
-                        cs,
-                        ss,
-                        rflags,
-                        kernel_task_entry_rip,
-                        0,
-                    ),
-                    ready: true,
+                    #[cfg(test)]
+                    saved_rsp,
+                    #[cfg(test)]
+                    test_ready: true,
                     ready_since_ticks: crate::arch::rtc::ticks(),
                     blocked: false,
                     blocked_since_ticks: 0,
                     wake_armed: false,
                     weight: Self::weight_from_pit_divisor(pit_divisor),
-                    vruntime_ns: self.new_task_vruntime(),
+                    #[cfg(test)]
+                    vruntime_ns,
+                    #[cfg(test)]
                     exec_start_ticks: 0,
                     address_space_root: crate::memory::paging::kernel_root_phys().as_u64(),
+                    #[cfg(test)]
                     kernel_stack_base: kernel_stack_base as u64,
+                    #[cfg(test)]
                     kernel_stack_top: kernel_stack_top as u64,
+                    #[cfg(test)]
                     alternate_kernel_stack_base: 0,
+                    #[cfg(test)]
                     alternate_kernel_stack_top: 0,
                     user_mode: false,
                     user_abi: None,
@@ -2185,7 +2594,16 @@ impl Scheduler {
                     user_stack: None,
                     windows_thread_state: None,
                 });
-                self.simd_states[slot] = SimdState::new();
+                self.initialize_slot_vruntime(slot, vruntime_ns);
+                self.initialize_slot_exec_start_ticks(slot, 0);
+                self.initialize_slot_saved_rsp(slot, saved_rsp);
+                self.initialize_slot_kernel_stack_bounds(
+                    slot,
+                    kernel_stack_base as u64,
+                    kernel_stack_top as u64,
+                );
+                self.initialize_slot_alternate_kernel_stack_bounds(slot);
+                self.initialize_slot_simd_state(slot);
                 self.starts[slot] = Some(TaskStart { entry, id });
                 self.publish_slot_identity(slot);
                 #[cfg(not(test))]
@@ -2251,9 +2669,12 @@ impl Scheduler {
                     exec_path
                 );
 
+                let vruntime_ns = self.new_task_vruntime();
                 self.contexts[slot] = Some(TaskContext {
+                    #[cfg(test)]
                     saved_rsp,
-                    ready: !start_suspended,
+                    #[cfg(test)]
+                    test_ready: !start_suspended,
                     ready_since_ticks: if start_suspended {
                         0
                     } else {
@@ -2267,12 +2688,18 @@ impl Scheduler {
                     },
                     wake_armed: false,
                     weight: Self::weight_from_pit_divisor(pit_divisor),
-                    vruntime_ns: self.new_task_vruntime(),
+                    #[cfg(test)]
+                    vruntime_ns,
+                    #[cfg(test)]
                     exec_start_ticks: 0,
                     address_space_root: root_phys,
+                    #[cfg(test)]
                     kernel_stack_base: kernel_stack_base as u64,
+                    #[cfg(test)]
                     kernel_stack_top: kernel_stack_top as u64,
+                    #[cfg(test)]
                     alternate_kernel_stack_base: 0,
+                    #[cfg(test)]
                     alternate_kernel_stack_top: 0,
                     user_mode: true,
                     user_abi: Some(bootstrap.abi),
@@ -2285,7 +2712,16 @@ impl Scheduler {
                         state
                     }),
                 });
-                self.simd_states[slot] = SimdState::new();
+                self.initialize_slot_vruntime(slot, vruntime_ns);
+                self.initialize_slot_exec_start_ticks(slot, 0);
+                self.initialize_slot_saved_rsp(slot, saved_rsp);
+                self.initialize_slot_kernel_stack_bounds(
+                    slot,
+                    kernel_stack_base as u64,
+                    kernel_stack_top as u64,
+                );
+                self.initialize_slot_alternate_kernel_stack_bounds(slot);
+                self.initialize_slot_simd_state(slot);
                 self.starts[slot] = Some(TaskStart {
                     entry: idle_entry,
                     id,
@@ -2332,20 +2768,29 @@ impl Scheduler {
                     process_state,
                 )?;
                 let (kernel_stack_base, kernel_stack_top) = self.stack_bounds(slot);
+                let vruntime_ns = self.new_task_vruntime();
                 self.contexts[slot] = Some(TaskContext {
+                    #[cfg(test)]
                     saved_rsp,
-                    ready: true,
+                    #[cfg(test)]
+                    test_ready: true,
                     ready_since_ticks: crate::arch::rtc::ticks(),
                     blocked: false,
                     blocked_since_ticks: 0,
                     wake_armed: false,
                     weight: Self::weight_from_pit_divisor(pit_divisor),
-                    vruntime_ns: self.new_task_vruntime(),
+                    #[cfg(test)]
+                    vruntime_ns,
+                    #[cfg(test)]
                     exec_start_ticks: 0,
                     address_space_root: root_phys,
+                    #[cfg(test)]
                     kernel_stack_base: kernel_stack_base as u64,
+                    #[cfg(test)]
                     kernel_stack_top: kernel_stack_top as u64,
+                    #[cfg(test)]
                     alternate_kernel_stack_base: 0,
+                    #[cfg(test)]
                     alternate_kernel_stack_top: 0,
                     user_mode: true,
                     user_abi: Some(bootstrap.abi),
@@ -2358,7 +2803,16 @@ impl Scheduler {
                         state
                     }),
                 });
-                self.simd_states[slot] = SimdState::new();
+                self.initialize_slot_vruntime(slot, vruntime_ns);
+                self.initialize_slot_exec_start_ticks(slot, 0);
+                self.initialize_slot_saved_rsp(slot, saved_rsp);
+                self.initialize_slot_kernel_stack_bounds(
+                    slot,
+                    kernel_stack_base as u64,
+                    kernel_stack_top as u64,
+                );
+                self.initialize_slot_alternate_kernel_stack_bounds(slot);
+                self.initialize_slot_simd_state(slot);
                 self.starts[slot] = Some(TaskStart {
                     entry: idle_entry,
                     id,
@@ -2397,27 +2851,37 @@ impl Scheduler {
                 let _exec_path = String::from(process_state.exec_path());
                 let process_handle = process_table::create_process(id, process_state)?;
                 let (kernel_stack_base, kernel_stack_top) = self.stack_bounds(slot);
+                let vruntime_ns = self.new_task_vruntime();
+                let saved_rsp = self.init_kernel_entry_context(
+                    slot,
+                    kernel_cs,
+                    kernel_ss,
+                    rflags,
+                    entry.as_u64(),
+                    arg0,
+                );
                 self.contexts[slot] = Some(TaskContext {
-                    saved_rsp: self.init_kernel_entry_context(
-                        slot,
-                        kernel_cs,
-                        kernel_ss,
-                        rflags,
-                        entry.as_u64(),
-                        arg0,
-                    ),
-                    ready: true,
+                    #[cfg(test)]
+                    saved_rsp,
+                    #[cfg(test)]
+                    test_ready: true,
                     ready_since_ticks: crate::arch::rtc::ticks(),
                     blocked: false,
                     blocked_since_ticks: 0,
                     wake_armed: false,
                     weight: Self::weight_from_pit_divisor(pit_divisor),
-                    vruntime_ns: self.new_task_vruntime(),
+                    #[cfg(test)]
+                    vruntime_ns,
+                    #[cfg(test)]
                     exec_start_ticks: 0,
                     address_space_root: root_phys,
+                    #[cfg(test)]
                     kernel_stack_base: kernel_stack_base as u64,
+                    #[cfg(test)]
                     kernel_stack_top: kernel_stack_top as u64,
+                    #[cfg(test)]
                     alternate_kernel_stack_base: 0,
+                    #[cfg(test)]
                     alternate_kernel_stack_top: 0,
                     user_mode: false,
                     user_abi: None,
@@ -2427,7 +2891,16 @@ impl Scheduler {
                     user_stack: None,
                     windows_thread_state: None,
                 });
-                self.simd_states[slot] = SimdState::new();
+                self.initialize_slot_vruntime(slot, vruntime_ns);
+                self.initialize_slot_exec_start_ticks(slot, 0);
+                self.initialize_slot_saved_rsp(slot, saved_rsp);
+                self.initialize_slot_kernel_stack_bounds(
+                    slot,
+                    kernel_stack_base as u64,
+                    kernel_stack_top as u64,
+                );
+                self.initialize_slot_alternate_kernel_stack_bounds(slot);
+                self.initialize_slot_simd_state(slot);
                 self.starts[slot] = Some(TaskStart {
                     entry: super::noop_task_entry,
                     id,
@@ -2574,7 +3047,6 @@ impl Scheduler {
         self.retire_reasons[slot] = Some(reason);
         self.deferred_retire_reasons[slot] = Some(reason);
         if let Some(context) = self.contexts[slot].as_mut() {
-            context.ready = false;
             context.ready_since_ticks = 0;
             context.blocked = false;
             context.blocked_since_ticks = 0;
@@ -2630,18 +3102,22 @@ impl Scheduler {
             stack_top,
             scheduler_base,
             scheduler_end,
-            context.map(|context| context.ready).unwrap_or(false),
+            context
+                .map(|context| context.ready_since_ticks != 0)
+                .unwrap_or(false),
             context.map(|context| context.blocked).unwrap_or(false),
             context.map(|context| context.user_mode).unwrap_or(false),
             context
-                .map(|context| context.kernel_stack_base)
-                .unwrap_or(0),
-            context.map(|context| context.kernel_stack_top).unwrap_or(0),
-            context
-                .map(|context| context.alternate_kernel_stack_base)
+                .map(|_| self.slot_kernel_stack_bounds(slot).0)
                 .unwrap_or(0),
             context
-                .map(|context| context.alternate_kernel_stack_top)
+                .map(|_| self.slot_kernel_stack_bounds(slot).1)
+                .unwrap_or(0),
+            context
+                .map(|_| self.slot_alternate_kernel_stack_bounds(slot).0)
+                .unwrap_or(0),
+            context
+                .map(|_| self.slot_alternate_kernel_stack_bounds(slot).1)
                 .unwrap_or(0),
             saved.map(|saved| saved.rip).unwrap_or(0),
             saved.map(|saved| saved.cs).unwrap_or(0),
@@ -2673,7 +3149,7 @@ impl Scheduler {
                 self.retired[slot],
                 self.start_suspended[slot],
                 self.job_stopped[slot],
-                context.ready,
+                context.ready_since_ticks != 0,
                 context.blocked,
             ) {
                 continue;
@@ -2685,7 +3161,7 @@ impl Scheduler {
                 task_id,
                 context.process_id,
                 self.current_task_slot(),
-                context.ready,
+                context.ready_since_ticks != 0,
                 context.blocked,
                 context.wake_armed
             );
@@ -2715,7 +3191,7 @@ impl Scheduler {
             .expect("running task missing scheduler identity");
         let now_ticks = crate::arch::rtc::ticks();
         let current_runtime_ns = self.contexts[current_slot]
-            .map(|context| context.exec_start_ticks)
+            .map(|_| self.slot_exec_start_ticks(current_slot))
             .filter(|start| *start != 0 && now_ticks > *start)
             .map(|start| Self::ticks_elapsed_ns(start, now_ticks))
             .unwrap_or(0);
@@ -2757,8 +3233,8 @@ impl Scheduler {
                 let weight = self.contexts[current_slot]
                     .map(|context| context.weight)
                     .unwrap_or(NICE_0_LOAD);
-                let current_affinity = self.task_affinity_masks[current_slot]
-                    & self.process_affinity_masks[current_slot];
+                let (task_mask, process_mask, _) = self.slot_affinity_snapshot(current_slot);
+                let current_affinity = task_mask & process_mask;
                 let current_cpu_is_eligible = current_affinity & (1_u64 << current_cpu) != 0;
                 // The owner word answers this. `owner.runnable` is Linux's
                 // `p->on_rq` for an executing task, and this turn's prologue has
@@ -3000,7 +3476,8 @@ impl Scheduler {
         };
         self.mark_phase(SchedulerPhase::SelectPick, &mut phase_marker);
         if let Some(next) = self.contexts[next_idx] {
-            match self.context_validation_error(next_idx, next, next.saved_rsp) {
+            let next_saved_rsp = self.slot_saved_rsp(next_idx);
+            match self.context_validation_error(next_idx, next, next_saved_rsp) {
                 None => {
                     #[cfg(not(test))]
                     assert!(
@@ -3022,10 +3499,13 @@ impl Scheduler {
                         );
                     }
                     if let Some(context) = self.contexts[next_idx].as_mut() {
-                        context.ready = false;
                         context.ready_since_ticks = 0;
-                        context.exec_start_ticks = now_ticks;
+                        #[cfg(test)]
+                        {
+                            context.test_ready = false;
+                        }
                     }
+                    self.set_slot_exec_start_ticks(next_idx, now_ticks);
                     self.record_dispatch_class(next_idx);
                     self.record_runtime_profile_dispatch(next_idx);
                     self.record_runtime_profile_transition(current_slot, next_idx, dispatch_cpu);
@@ -3042,7 +3522,7 @@ impl Scheduler {
                         next_task_id,
                         current_slot,
                         next_idx,
-                        next.saved_rsp,
+                        next_saved_rsp,
                         self.slot_class(next_idx) == Some(SchedClass::Idle),
                         atomic_activation_handoff.is_some(),
                     );
@@ -3053,24 +3533,26 @@ impl Scheduler {
                     );
                     self.mark_phase(SchedulerPhase::Commit, &mut phase_marker);
                     return SchedulerDispatch::new(
-                        next.saved_rsp,
+                        next_saved_rsp,
                         self.scheduler_tick_divisor,
                         current_slot,
                         next_idx,
                     );
                 }
                 Some(reason) if next_idx == ROOT_TASK_SLOT => {
-                    self.log_invalid_context(next_idx, next.saved_rsp, reason, "next");
+                    self.log_invalid_context(next_idx, next_saved_rsp, reason, "next");
                     panic!("scheduler root kernel context is corrupted: {}", reason);
                 }
                 Some(reason) => {
-                    self.log_invalid_context(next_idx, next.saved_rsp, reason, "next");
-                    self.retire_slot_due_to_invalid_context(next_idx, next.saved_rsp, reason);
+                    self.log_invalid_context(next_idx, next_saved_rsp, reason, "next");
+                    self.retire_slot_due_to_invalid_context(next_idx, next_saved_rsp, reason);
                 }
             }
         }
 
+        #[cfg(not(test))]
         let current = self.contexts[current_slot].expect("scheduler lost the current task context");
+        let current_saved_rsp = self.slot_saved_rsp(current_slot);
         #[cfg(not(test))]
         assert!(
             runqueue::claim_dispatch(current_slot, dispatch_cpu, current.weight),
@@ -3080,9 +3562,8 @@ impl Scheduler {
         );
         // Keep running current: refresh its exec_start_ticks so subsequent
         // vruntime accounting sees a non-zero baseline.
-        if let Some(ctx) = self.contexts[current_slot].as_mut() {
-            ctx.exec_start_ticks = now_ticks;
-            ctx.ready = false;
+        if self.contexts[current_slot].is_some() {
+            self.set_slot_exec_start_ticks(current_slot, now_ticks);
         }
         nucleus_core::util::lockdep::record_scheduler_dispatch(
             nucleus_core::util::lockdep::current_cpu_index(),
@@ -3090,7 +3571,7 @@ impl Scheduler {
             current_task_id,
             current_slot,
             current_slot,
-            current.saved_rsp,
+            current_saved_rsp,
             self.slot_class(current_slot) == Some(SchedClass::Idle),
             false,
         );
@@ -3099,7 +3580,7 @@ impl Scheduler {
         self.record_task_dispatch_cpu(current_slot, dispatch_cpu);
         self.mark_phase(SchedulerPhase::Commit, &mut phase_marker);
         SchedulerDispatch::new(
-            current.saved_rsp,
+            current_saved_rsp,
             self.scheduler_tick_divisor,
             current_slot,
             current_slot,
@@ -3130,12 +3611,20 @@ impl Scheduler {
         let Some(current_ctx) = self.contexts[current_slot] else {
             return cfs_pick;
         };
-        if !current_ctx.ready || !self.context_is_schedulable(current_slot, current_ctx) {
+        // Host unit schedulers do not publish global owner words. Preserve
+        // their isolation by adapting the legacy bit only under `cfg(test)`;
+        // the production fairness decision takes the owner word's run-intent
+        // bit after this turn's prologue has published it.
+        #[cfg(test)]
+        let current_has_run_intent = current_ctx.test_ready;
+        #[cfg(not(test))]
+        let current_has_run_intent = runqueue::owner_has_run_intent(runqueue::owner(current_slot));
+        if !current_has_run_intent || !self.context_is_schedulable(current_slot, current_ctx) {
             return cfs_pick;
         }
-        let Some(pick_ctx) = self.contexts[cfs_pick] else {
+        if self.contexts[cfs_pick].is_none() {
             return cfs_pick;
-        };
+        }
 
         // Cross-class preemption is unconditional. The min-granularity guard
         // below is a CFS fairness damper that only makes sense between peers
@@ -3153,8 +3642,8 @@ impl Scheduler {
 
         // If the pick's vruntime advantage is large, preempt unconditionally:
         // current has burned through too much CPU relative to peers.
-        let current_v = current_ctx.vruntime_ns;
-        let pick_v = pick_ctx.vruntime_ns;
+        let current_v = self.slot_vruntime(current_slot);
+        let pick_v = self.slot_vruntime(cfs_pick);
         let advantage_ns = current_v.saturating_sub(pick_v);
 
         // Linux rule (simplified): only preempt if either
@@ -3185,13 +3674,17 @@ impl Scheduler {
                 .unwrap_or(false);
             let to_user = to_context.map(|context| context.user_mode).unwrap_or(false);
             let from_rip = from_context
-                .and_then(|context| saved_context_rip(context.saved_rsp))
+                .and_then(|_| saved_context_rip(self.slot_saved_rsp(from_slot)))
                 .unwrap_or(0);
             let to_rip = to_context
-                .and_then(|context| saved_context_rip(context.saved_rsp))
+                .and_then(|_| saved_context_rip(self.slot_saved_rsp(to_slot)))
                 .unwrap_or(0);
-            let from_rsp = from_context.map(|context| context.saved_rsp).unwrap_or(0);
-            let to_rsp = to_context.map(|context| context.saved_rsp).unwrap_or(0);
+            let from_rsp = from_context
+                .map(|_| self.slot_saved_rsp(from_slot))
+                .unwrap_or(0);
+            let to_rsp = to_context
+                .map(|_| self.slot_saved_rsp(to_slot))
+                .unwrap_or(0);
             let from_id = self
                 .starts
                 .get(from_slot)
@@ -3269,25 +3762,28 @@ impl Scheduler {
         let current =
             self.contexts[current_slot].expect("scheduler selected a missing task context");
         self.assert_current_task_affinity_allows_dispatch();
-        self.affinity_migration_pending[current_slot] = false;
-        let return_to_user = self.context_returns_to_user(current);
-        self.validate_saved_context(current_slot, current.user_mode, current.saved_rsp)
-            .expect("scheduler selected an invalid task context");
+        let (task_mask, process_mask, _) = self.slot_affinity_snapshot(current_slot);
+        self.replace_slot_affinity(current_slot, task_mask, process_mask, false);
+        let return_to_user = self.context_returns_to_user(current_slot);
+        self.validate_saved_context(
+            current_slot,
+            current.user_mode,
+            self.slot_saved_rsp(current_slot),
+        )
+        .expect("scheduler selected an invalid task context");
         crate::memory::paging::load_address_space_phys(PhysAddr::new(current.address_space_root));
-        if current.kernel_stack_top != 0 {
+        let (_, kernel_stack_top) = self.slot_kernel_stack_bounds(current_slot);
+        if kernel_stack_top != 0 {
             assert_eq!(
-                current.kernel_stack_top & 0xF,
+                kernel_stack_top & 0xF,
                 0,
                 "scheduler selected a kernel stack top that violates the x86_64 SysV ABI"
             );
-            crate::arch::gdt::set_privilege_stack(current.kernel_stack_top);
-            crate::user::syscall::set_kernel_stack_top(current.kernel_stack_top);
+            crate::arch::gdt::set_privilege_stack(kernel_stack_top);
+            crate::user::syscall::set_kernel_stack_top(kernel_stack_top);
         }
 
-        let fs_base = self
-            .linux_thread_state(current_slot)
-            .map(|state| state.fs_base)
-            .unwrap_or(0);
+        let fs_base = self.slot_tls_fs_base(current_slot);
         let user_gs_base = current
             .windows_thread_state
             .map(|state| state.teb_address)
@@ -3411,18 +3907,14 @@ impl Scheduler {
     pub(super) fn save_current_simd_state(&mut self) {
         let mut phase_marker = Self::phase_chain_start();
         let slot = self.current_task_slot();
-        unsafe {
-            save_state(&mut self.simd_states[slot]);
-        }
+        self.save_slot_simd_state(slot);
         self.mark_phase(SchedulerPhase::ArchRestore, &mut phase_marker);
     }
 
     pub(super) fn restore_current_simd_state(&mut self) {
         let mut phase_marker = Self::phase_chain_start();
         let slot = self.current_task_slot();
-        unsafe {
-            restore_state(&self.simd_states[slot]);
-        }
+        self.restore_slot_simd_state(slot);
         self.mark_phase(SchedulerPhase::ArchRestore, &mut phase_marker);
     }
 
@@ -3463,7 +3955,7 @@ impl Scheduler {
     ///
     /// This is half of the refinement map `V5-FORMAL-SCHED-019` needs written
     /// down. Execution ownership comes from the published current/transition
-    /// pair, runnability from `context.ready`, and lifetime from the retire
+    /// pair, runnability from the owner word, and lifetime from the retire
     /// flag and the presence of a context. `runqueue.rs` holds all three in one
     /// word; here they are three sources, which is exactly why they can
     /// disagree.
@@ -3485,8 +3977,8 @@ impl Scheduler {
         if self.retired[slot] {
             return LegacyPosition::Retiring;
         }
-        // A suspended slot is not runnable, whatever `context.ready` says.
-        // `allocate_user_slot` initialises the context with `ready: true` and
+        // A suspended slot is not runnable, regardless of the test adapter.
+        // `allocate_user_slot` initializes that adapter true and
         // then admits the slot with `admit_runqueue_slot(slot, !start_suspended)`,
         // so a service spawned suspended sits ready-but-unqueued by design until
         // activation publishes it. Reading the field alone reported that as a
@@ -3494,7 +3986,7 @@ impl Scheduler {
         // slot existed — which is also the trap stage four would have walked
         // into, since deleting the field naively would make every suspended task
         // look runnable.
-        if context.ready && !self.start_suspended[slot] {
+        if context.ready_since_ticks != 0 && !self.start_suspended[slot] {
             return LegacyPosition::Runnable;
         }
         LegacyPosition::Blocked
@@ -3523,8 +4015,9 @@ impl Scheduler {
 
     /// Whether `slot` is queued and waiting to run.
     ///
-    /// This is the authority `context.ready` used to be. The two are the same
-    /// predicate: dispatch clears `ready` on the task it selects at the same
+    /// This is the authority the legacy readiness bit used to represent. The
+    /// two predicates agree in unit fixtures: dispatch clears the adapter on
+    /// the task it selects at the same
     /// moment `runqueue::claim_dispatch` moves its owner word to `Running`, so
     /// `ready == true` is exactly `Local | RemoteQueued`. Stage one of
     /// `V5-SCHED-GLOBAL-001` swept every slot once per second at 1 and 8 vCPU
@@ -3535,20 +4028,12 @@ impl Scheduler {
     /// locked `Scheduler` struct. Every reader moved here is one fewer reason
     /// for that struct to be shared.
     ///
-    /// **This cannot answer for the task a CPU is currently executing**, and
-    /// that limit is a real gap rather than an accident of this helper.
-    /// `claim_dispatch` moves the owner word to `Running` and removes the slot
-    /// from the queue, so the word no longer records whether that task still
-    /// wants to run when it is preempted. Linux keeps exactly this distinction:
-    /// a running task remains `TASK_ON_RQ_QUEUED` in `p->on_rq` and only
-    /// `deactivate_task` removes it, so "running" and "runnable" stay separable.
-    ///
-    /// Until the owner word carries the same bit, the sites that ask about the
-    /// *current* slot — whether the outgoing task returns to its queue or is
-    /// published blocked, and whether the current task can still beat the fair
-    /// pick — must keep reading `context.ready`. Converting them would answer
-    /// "not runnable" for every running task and publish it blocked on every
-    /// preemption.
+    /// **This cannot answer for the task a CPU is currently executing**: it
+    /// intentionally asks for queue or direct-handoff custody. Current-task
+    /// decisions use `runqueue::owner_has_run_intent` instead. That shared bit
+    /// preserves run intent across `Running`, `Local`, `RemoteQueued`, and
+    /// `Migrating`, while this predicate remains narrow enough to reject a
+    /// task that is running elsewhere or still crossing a mailbox boundary.
     pub(super) fn slot_is_runnable(&self, slot: usize) -> bool {
         // `admit_runqueue_slot` is `#[cfg(not(test))]`, so under unit test no
         // slot is ever admitted and every owner word stays `Dormant`. That is
@@ -3559,13 +4044,10 @@ impl Scheduler {
         // itself is covered by the once-per-drain divergence sweep on real runs.
         #[cfg(test)]
         {
-            return self.contexts[slot].is_some_and(|context| context.ready);
+            return self.contexts[slot].is_some_and(|context| context.test_ready);
         }
         #[cfg(not(test))]
-        matches!(
-            runqueue::owner(slot).state,
-            runqueue::RunOwnerState::Local | runqueue::RunOwnerState::RemoteQueued
-        )
+        runqueue::is_handoff_dispatchable(slot)
     }
 
     /// Compares the per-CPU owner word against the legacy tables for every slot.
@@ -3595,7 +4077,7 @@ impl Scheduler {
             if let Some(kind) = run_authority::compare(
                 self.queue_owner(slot),
                 self.legacy_position(slot),
-                self.contexts[slot].is_some_and(|context| context.ready),
+                self.contexts[slot].is_some_and(|context| context.ready_since_ticks != 0),
             ) {
                 run_authority::record(slot, kind);
             }
@@ -3780,12 +4262,11 @@ impl Scheduler {
             context.blocked_since_ticks = 0;
             // Self-exec keeps the only Running owner. Publishing Ready here
             // would let another CPU validate or dispatch this live stack.
-            context.ready = false;
             context.ready_since_ticks = 0;
         }
 
         self.exec_target_quiesced[slot] = false;
-        self.simd_states[slot] = SimdState::new();
+        self.reset_slot_simd_state(slot);
         self.starts[slot] = Some(TaskStart {
             entry: super::noop_task_entry,
             id: process_id,
@@ -3842,18 +4323,21 @@ impl Scheduler {
 
         {
             let context = self.contexts[slot].as_mut()?;
-            context.saved_rsp = saved_rsp;
+            #[cfg(test)]
+            {
+                context.saved_rsp = saved_rsp;
+            }
             context.address_space_root = new_root;
             context.user_abi = Some(bootstrap.abi);
             context.console_session = bootstrap.console_session;
             context.user_stack = bootstrap.user_stack;
             context.blocked = false;
             context.blocked_since_ticks = 0;
-            context.ready = true;
-            context.ready_since_ticks = crate::arch::rtc::ticks();
+            context.ready_since_ticks = Self::ready_since_now_ticks();
         }
+        self.set_slot_saved_rsp(slot, saved_rsp);
         self.exec_target_quiesced[slot] = false;
-        self.simd_states[slot] = SimdState::new();
+        self.reset_slot_simd_state(slot);
         self.starts[slot] = Some(TaskStart {
             entry: super::noop_task_entry,
             id: process_id,
@@ -4055,8 +4539,11 @@ impl Scheduler {
         // may have marked this still-running task ready; the caller has
         // already rechecked that condition before a new arm, so consume that
         // stale runnable mark before publishing the next wait epoch.
-        context.ready = false;
         context.ready_since_ticks = 0;
+        #[cfg(test)]
+        {
+            context.test_ready = false;
+        }
         context.wake_armed = true;
         true
     }
@@ -4075,8 +4562,11 @@ impl Scheduler {
         if context.blocked || !context.wake_armed {
             return false;
         }
-        context.ready = false;
         context.ready_since_ticks = 0;
+        #[cfg(test)]
+        {
+            context.test_ready = false;
+        }
         context.wake_armed = false;
         true
     }
@@ -4098,15 +4588,27 @@ impl Scheduler {
             // `wake_task` makes the current context ready to record the race,
             // but it never stopped executing. Consume that transient queue
             // mark before returning to the caller's condition loop.
-            context.ready = false;
             context.ready_since_ticks = 0;
+            #[cfg(test)]
+            {
+                context.test_ready = false;
+            }
             return Some(false);
         }
         context.wake_armed = false;
         context.blocked = true;
-        context.ready = false;
         context.ready_since_ticks = 0;
+        #[cfg(test)]
+        {
+            context.test_ready = false;
+        }
         context.blocked_since_ticks = crate::arch::rtc::ticks();
+        // A blocked task remains `Running` until the next scheduler turn
+        // publishes blocked custody, but must immediately withdraw run intent
+        // so that turn cannot requeue it merely because the legacy queue bit
+        // is overloaded with dispatch state.
+        #[cfg(not(test))]
+        runqueue::set_runnable(slot, false);
         Some(true)
     }
 
@@ -4133,7 +4635,10 @@ impl Scheduler {
         reply: u64,
         task_id: u64,
     ) -> Option<ReplyWakeHandoff> {
+        #[cfg(test)]
         let _ = self.release_ipc_priority(reply);
+        #[cfg(not(test))]
+        let _ = reply;
         let slot = self.find_task_slot(task_id)?;
         if !self.wake_task_slot(slot) {
             return None;
@@ -4174,17 +4679,34 @@ impl Scheduler {
             .unwrap_or(0);
         let task_id = self.starts[slot].map(|start| start.id);
         let process_id = self.contexts[slot].and_then(|context| context.process_id);
-        let (saved_rsp, user_mode, was_ready, was_blocked, wake_was_armed) =
-            match self.contexts[slot] {
-                Some(context) => (
-                    context.saved_rsp,
-                    context.user_mode,
-                    context.ready,
-                    context.blocked,
-                    context.wake_armed,
-                ),
-                None => return false,
-            };
+        let (saved_rsp, user_mode, was_blocked, wake_was_armed) = match self.contexts[slot] {
+            Some(context) => (
+                self.slot_saved_rsp(slot),
+                context.user_mode,
+                context.blocked,
+                context.wake_armed,
+            ),
+            None => return false,
+        };
+        // Unit schedulers intentionally do not publish global owner words;
+        // adapt their isolated legacy bit into the same snapshot shape. The
+        // production decision below takes exactly one acquire owner snapshot.
+        #[cfg(test)]
+        let wake_owner = self.contexts[slot].map(|context| runqueue::RunOwnerSnapshot {
+            state: if context.ready_since_ticks != 0 {
+                runqueue::RunOwnerState::Local
+            } else {
+                runqueue::RunOwnerState::Blocked
+            },
+            cpu: None,
+            generation: 1,
+            runnable: context.ready_since_ticks != 0,
+        });
+        #[cfg(not(test))]
+        let wake_owner = Some(runqueue::owner(slot));
+        let Some(wake_owner) = wake_owner else {
+            return false;
+        };
         let execution_owner = if slot == self.current_task_slot() {
             // Unit schedulers do not publish CPU-local ownership, and at
             // runtime this is the scheduler's exact current task.
@@ -4212,8 +4734,11 @@ impl Scheduler {
                 .expect("current scheduler slot lost its context during wake");
             context.wake_armed = false;
             context.blocked = false;
-            context.ready = false;
             context.ready_since_ticks = 0;
+            #[cfg(test)]
+            {
+                context.test_ready = false;
+            }
             context.blocked_since_ticks = 0;
             return true;
         }
@@ -4242,12 +4767,16 @@ impl Scheduler {
                 .expect("transitioning scheduler slot lost its context during wake");
             context.wake_armed = false;
             context.blocked = false;
-            context.ready = true;
-            context.ready_since_ticks = crate::arch::rtc::ticks();
+            context.ready_since_ticks = Self::ready_since_now_ticks();
+            #[cfg(test)]
+            {
+                context.test_ready = true;
+            }
             context.blocked_since_ticks = 0;
             return true;
         }
-        let already_runnable = was_ready && !was_blocked && !wake_was_armed;
+        let already_runnable =
+            runqueue::wake_is_already_runnable(wake_owner, was_blocked, wake_was_armed);
         let invalid_reason = self
             .validate_saved_context(slot, user_mode, saved_rsp)
             .err();
@@ -4268,7 +4797,7 @@ impl Scheduler {
         };
         let wake_floor = class_min_vruntime.saturating_sub(SLEEPER_LATENCY_BONUS_NS);
 
-        let (waker_vruntime, waker_ready) = {
+        let waker_ready = {
             let Some(context) = self.contexts[slot].as_mut() else {
                 return false;
             };
@@ -4276,7 +4805,10 @@ impl Scheduler {
             // observes that a wake raced before the caller actually slept.
             context.wake_armed = false;
             context.blocked = false;
-            context.ready = invalid_reason.is_none() || already_runnable;
+            #[cfg(test)]
+            {
+                context.test_ready = invalid_reason.is_none() || already_runnable;
+            }
             context.blocked_since_ticks = 0;
             if already_runnable {
                 // Leave ready_since_ticks and vruntime unchanged for tasks
@@ -4293,13 +4825,13 @@ impl Scheduler {
                 // (which would just shift starvation onto the rest of the
                 // system), while still granting them latency-sensitive
                 // priority via SLEEPER_LATENCY_BONUS_NS.
-                context.vruntime_ns = context.vruntime_ns.max(wake_floor);
             }
-            (
-                context.vruntime_ns,
-                context.ready && invalid_reason.is_none() && !self.job_stopped[slot],
-            )
+            invalid_reason.is_none() && !self.job_stopped[slot]
         };
+        if invalid_reason.is_none() && !already_runnable {
+            self.raise_slot_vruntime_floor(slot, wake_floor);
+        }
+        let waker_vruntime = self.slot_vruntime(slot);
 
         if invalid_reason.is_none() && blocked_since_ticks != 0 {
             self.maybe_log_blocked_wait(slot, task_id, process_id, blocked_since_ticks, now_ticks);
@@ -4340,9 +4872,7 @@ impl Scheduler {
                 // Same class: only preempt if the wake brings the waker
                 // distinctly ahead in vruntime — the CFS wake-preempt rule.
                 (Some(wc), Some(cc)) if wc == cc => {
-                    let current_v = self.contexts[current_slot]
-                        .map(|ctx| ctx.vruntime_ns)
-                        .unwrap_or(0);
+                    let current_v = self.slot_vruntime(current_slot);
                     current_v.saturating_sub(waker_vruntime) >= SCHED_MIN_GRANULARITY_NS
                 }
                 _ => false,
@@ -4369,7 +4899,9 @@ impl Scheduler {
 
         self.mark_slot_ready(
             slot,
-            self.contexts[slot].map(|ctx| ctx.saved_rsp).unwrap_or(0),
+            self.contexts[slot]
+                .map(|_| self.slot_saved_rsp(slot))
+                .unwrap_or(0),
             false,
         );
         if self.retire_reasons[slot].is_none() {
@@ -4394,7 +4926,7 @@ impl Scheduler {
         let logical_cpu = nucleus_core::util::lockdep::current_cpu_index();
         for slot in sibling_slots.iter().copied().take(sibling_count) {
             if let Some(context) = self.contexts[slot] {
-                let state_flags = (u64::from(context.ready)
+                let state_flags = (u64::from(context.ready_since_ticks != 0)
                     * nucleus_core::util::lockdep::SchedulerObservation::STATE_READY)
                     | (u64::from(context.blocked)
                         * nucleus_core::util::lockdep::SchedulerObservation::STATE_BLOCKED)
@@ -4430,8 +4962,8 @@ impl Scheduler {
         self.exit_current_task();
     }
 
-    fn context_returns_to_user(&self, context: TaskContext) -> bool {
-        Self::saved_context_returns_to_user(context.saved_rsp)
+    fn context_returns_to_user(&self, slot: usize) -> bool {
+        Self::saved_context_returns_to_user(self.slot_saved_rsp(slot))
     }
 
     fn saved_context_returns_to_user(saved_rsp: usize) -> bool {
@@ -4462,6 +4994,7 @@ impl Scheduler {
     /// The hint is only an accelerator: it is accepted solely when the named
     /// slot still carries that exact live identity, and any miss falls back to
     /// the authoritative scan and repairs the hint.
+    #[cfg(test)]
     fn resolve_donation_slot(&self, index: usize, task_id: u64) -> Option<usize> {
         // ORDERING: Relaxed is exact. The hint is an accelerator validated
         // against live identity below, never ownership or publication authority,

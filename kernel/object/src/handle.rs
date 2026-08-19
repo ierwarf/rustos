@@ -1,3 +1,5 @@
+use crate::identity::{ObjectIdentity, ObjectKind, ObjectOwner};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HandleOwner {
     Io,
@@ -5,15 +7,60 @@ pub enum HandleOwner {
     Ps,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Provider-facing token retained by a process descriptor entry.
+///
+/// The pair remains the compatibility identity for older providers. New
+/// providers whose slot is proven non-reusable also carry an
+/// [`ObjectIdentity`], without changing the process-visible `u64` fd/handle
+/// representation or making an unproven token look generational.
+#[derive(Clone, Copy, Debug)]
 pub struct HandleToken {
     owner: HandleOwner,
     object_id: u64,
+    identity: Option<ObjectIdentity>,
 }
+
+impl PartialEq for HandleToken {
+    fn eq(&self, other: &Self) -> bool {
+        self.owner == other.owner && self.object_id == other.object_id
+    }
+}
+
+impl Eq for HandleToken {}
 
 impl HandleToken {
     pub const fn new(owner: HandleOwner, object_id: u64) -> Self {
-        Self { owner, object_id }
+        Self {
+            owner,
+            object_id,
+            identity: None,
+        }
+    }
+
+    /// Adapts a provider token that is allocated once and never reused.
+    ///
+    /// Such providers use the token as the stable slot and generation `1`.
+    /// This is not available for tokens whose allocator/lifetime has not yet
+    /// established the non-reuse property.
+    pub const fn from_nonreusable_open_description(
+        owner: HandleOwner,
+        object_id: u64,
+    ) -> Option<Self> {
+        let object_owner = match owner {
+            HandleOwner::Io => ObjectOwner::Io,
+            HandleOwner::Compat => ObjectOwner::ServiceProxy,
+            HandleOwner::Ps => ObjectOwner::Ps,
+        };
+        let Some(identity) =
+            ObjectIdentity::new(object_owner, ObjectKind::OpenDescription, object_id, 1)
+        else {
+            return None;
+        };
+        Some(Self {
+            owner,
+            object_id,
+            identity: Some(identity),
+        })
     }
 
     pub const fn owner(self) -> HandleOwner {
@@ -22,6 +69,12 @@ impl HandleToken {
 
     pub const fn object_id(self) -> u64 {
         self.object_id
+    }
+
+    /// `None` denotes a legacy provider token pending a generation-safe
+    /// adapter. Callers must not infer a generation from that absence.
+    pub const fn identity(self) -> Option<ObjectIdentity> {
+        self.identity
     }
 }
 
@@ -45,6 +98,10 @@ impl FileHandleRights {
 
     pub const fn contains(self, right: Self) -> bool {
         self.0 & right.0 == right.0
+    }
+
+    pub const fn is_subset_of(self, parent: Self) -> bool {
+        self.0 & !parent.0 == 0
     }
 }
 
@@ -70,6 +127,10 @@ impl DeviceHandleRights {
     pub const fn contains(self, right: Self) -> bool {
         self.0 & right.0 == right.0
     }
+
+    pub const fn is_subset_of(self, parent: Self) -> bool {
+        self.0 & !parent.0 == 0
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -91,6 +152,10 @@ impl SharedRegionRights {
 
     pub const fn contains(self, right: Self) -> bool {
         self.0 & right.0 == right.0
+    }
+
+    pub const fn is_subset_of(self, parent: Self) -> bool {
+        self.0 & !parent.0 == 0
     }
 }
 
@@ -114,6 +179,10 @@ impl SocketHandleRights {
     pub const fn contains(self, right: Self) -> bool {
         self.0 & right.0 == right.0
     }
+
+    pub const fn is_subset_of(self, parent: Self) -> bool {
+        self.0 & !parent.0 == 0
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -128,6 +197,24 @@ pub enum HandleRights {
 }
 
 impl HandleRights {
+    /// Returns whether `child` is a typed attenuation of this capability.
+    /// Different object kinds are never interchangeable, even when their
+    /// private bit layouts happen to overlap.
+    pub const fn can_attenuate_to(self, child: Self) -> bool {
+        match (self, child) {
+            (Self::File(parent), Self::File(child)) | (Self::Memfd(parent), Self::Memfd(child)) => {
+                child.is_subset_of(parent)
+            }
+            (Self::Device(parent), Self::Device(child)) => child.is_subset_of(parent),
+            (Self::Socket(parent), Self::Socket(child)) => child.is_subset_of(parent),
+            (Self::DisplaySurface(parent), Self::DisplaySurface(child)) => {
+                child.is_subset_of(parent)
+            }
+            (Self::Console, Self::Console) | (Self::Epoll, Self::Epoll) => true,
+            _ => false,
+        }
+    }
+
     pub const fn allows_transfer(self) -> bool {
         match self {
             Self::File(rights) | Self::Memfd(rights) => rights.contains(FileHandleRights::TRANSFER),
@@ -176,5 +263,46 @@ impl HandleRights {
             Self::Device(rights) => rights.contains(DeviceHandleRights::ADMIN),
             _ => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DeviceHandleRights, FileHandleRights, HandleOwner, HandleRights, HandleToken};
+    use crate::identity::{ObjectKind, ObjectOwner};
+
+    #[test]
+    fn nonreusable_open_description_adapter_preserves_legacy_token_equality() {
+        let token = HandleToken::from_nonreusable_open_description(HandleOwner::Ps, 17)
+            .expect("nonzero nonreusable token");
+        let identity = token.identity().expect("identity adapter");
+        assert_eq!(identity.owner(), ObjectOwner::Ps);
+        assert_eq!(identity.kind(), ObjectKind::OpenDescription);
+        assert_eq!(identity.slot(), 17);
+        assert_eq!(identity.generation(), 1);
+        assert_eq!(token, HandleToken::new(HandleOwner::Ps, 17));
+        assert!(HandleToken::new(HandleOwner::Ps, 17).identity().is_none());
+        assert!(HandleToken::from_nonreusable_open_description(HandleOwner::Ps, 0).is_none());
+    }
+
+    #[test]
+    fn typed_rights_attenuation_rejects_widening_and_kind_substitution() {
+        let parent = HandleRights::File(
+            FileHandleRights::READ
+                .union(FileHandleRights::WRITE)
+                .union(FileHandleRights::TRANSFER),
+        );
+        assert!(parent.can_attenuate_to(HandleRights::File(
+            FileHandleRights::READ.union(FileHandleRights::TRANSFER),
+        )));
+        assert!(
+            !parent.can_attenuate_to(HandleRights::File(
+                FileHandleRights::READ
+                    .union(FileHandleRights::WRITE)
+                    .union(FileHandleRights::APPEND)
+                    .union(FileHandleRights::TRANSFER),
+            ))
+        );
+        assert!(!parent.can_attenuate_to(HandleRights::Device(DeviceHandleRights::READ)));
     }
 }

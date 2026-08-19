@@ -13,10 +13,11 @@
 //!   or current-task state used to clean a foreign retired task.
 //! - **Evidence:** `process-address-space-lifecycle`, `endpoint-lifecycle`, and
 //!   `kernel-resource-lifecycle`.
-use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 use alloc::boxed::Box;
 use core::ptr::NonNull;
+use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
+use kernel_object::api::identity::{ObjectIdentity, ObjectKind, ObjectOwner};
 use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
 
 use super::process_state_lock::ProcessStateLock;
@@ -75,6 +76,21 @@ impl ProcessHandle {
     pub const fn generation(self) -> u32 {
         self.generation
     }
+
+    /// Typed process-table identity for capability boundaries.
+    ///
+    /// The table's zero-based slot is converted to the shared vocabulary's
+    /// nonzero slot. This does not prove that the process remains live; users
+    /// still retain or resolve this exact handle through the process table.
+    pub fn object_identity(self) -> Option<ObjectIdentity> {
+        let slot = u64::try_from(self.index).ok()?.checked_add(1)?;
+        ObjectIdentity::new(
+            ObjectOwner::Ps,
+            ObjectKind::Process,
+            slot,
+            u64::from(self.generation),
+        )
+    }
 }
 
 pub struct ProcessRef {
@@ -94,6 +110,24 @@ pub struct ExecReservation {
     handle: ProcessHandle,
     expected_mm_generation: u32,
     next_mm_generation: u32,
+}
+
+impl ExecReservation {
+    /// One-shot lifecycle-token identity for the exact pre-exec MM generation.
+    ///
+    /// `handle` remains the process-table generation authority, while this
+    /// token lets capability-facing code name the reservation without
+    /// collapsing process and MM generations. Callers must still authorize or
+    /// consume the reservation through the process table.
+    pub fn object_identity(self) -> Option<ObjectIdentity> {
+        let slot = u64::try_from(self.handle.index()).ok()?.checked_add(1)?;
+        ObjectIdentity::new(
+            ObjectOwner::Ps,
+            ObjectKind::LifecycleToken,
+            slot,
+            u64::from(self.expected_mm_generation),
+        )
+    }
 }
 
 pub struct StagedExec {
@@ -347,7 +381,12 @@ pub(super) fn with_own_visible_state<R>(
 ) -> Option<R> {
     // ORDERING: Acquire observes the object installation published before the
     // pointer store.
-    let state = NonNull::new(PROCESS_STATE_PTR.get(handle.index())?.load(Ordering::Acquire))?;
+    let state = NonNull::new(
+        PROCESS_STATE_PTR
+            .get(handle.index())?
+            // ORDERING: the acquire below observes the installed state pointer.
+            .load(Ordering::Acquire),
+    )?;
     // SAFETY: the caller's own live thread pins this object, so the published
     // pointer addresses a state lock that cannot be reclaimed under it.
     let state = unsafe { state.as_ref() }.lock();
@@ -992,6 +1031,8 @@ pub(crate) mod tests {
     };
     use crate::memory::paging::ProcessAddressSpace;
     use crate::user::process_state::UserProcessState;
+
+    mod identity_tests;
 
     // These tests exercise the one global process table and call the global
     // reaper. Running them concurrently lets one test reap another test's

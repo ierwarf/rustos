@@ -24,6 +24,16 @@ use crate::user::abi::UserAbi;
 
 static TEST_SCHEDULER_TEMPLATE: Scheduler = Scheduler::new();
 
+/// Reclaims the shared owner words even if a white-box assertion fails. The
+/// scheduler under test is private, but its publication backing is global.
+struct RunqueuePublicationReset;
+
+impl Drop for RunqueuePublicationReset {
+    fn drop(&mut self) {
+        runqueue::reset_before_publication();
+    }
+}
+
 fn boxed_scheduler() -> Box<Scheduler> {
     let mut scheduler = Box::<Scheduler>::new_uninit();
     unsafe {
@@ -40,6 +50,10 @@ fn boxed_scheduler() -> Box<Scheduler> {
 
 #[test]
 fn synchronous_ipc_handoff_is_fifo_deduplicated_and_fairness_bounded() {
+    let _publication_lock = crate::multitask::cpu_local::test_publication_lock();
+    let _runqueue_serial = runqueue::test_serial_guard();
+    let _runqueue_reset = RunqueuePublicationReset;
+    runqueue::reset_before_publication();
     let mut scheduler = boxed_scheduler();
     let base = crate::memory::paging::USER_SPACE_BASE;
     let user_cs = crate::arch::gdt::user_code_selector().0 as u64;
@@ -120,6 +134,10 @@ fn synchronous_ipc_handoff_is_fifo_deduplicated_and_fairness_bounded() {
 
 #[test]
 fn reply_wake_token_mint_requires_exact_task_and_dispatch_custody() {
+    let _publication_lock = crate::multitask::cpu_local::test_publication_lock();
+    let _runqueue_serial = runqueue::test_serial_guard();
+    let _runqueue_reset = RunqueuePublicationReset;
+    runqueue::reset_before_publication();
     let mut scheduler = boxed_scheduler();
     let base = crate::memory::paging::USER_SPACE_BASE;
     let slot = scheduler
@@ -206,7 +224,7 @@ fn terminal_reply_releases_donation_and_wakes_exact_caller_in_one_scheduler_oper
     assert_eq!(scheduler.slot_class(caller), Some(SchedClass::System));
     {
         let context = scheduler.contexts[caller].as_mut().expect("caller");
-        context.ready = false;
+        context.test_ready = false;
         context.blocked = true;
         context.wake_armed = true;
     }
@@ -221,7 +239,7 @@ fn terminal_reply_releases_donation_and_wakes_exact_caller_in_one_scheduler_oper
         "the terminal reply must revoke its exact donation"
     );
     let context = scheduler.contexts[caller].expect("woken caller");
-    assert!(context.ready);
+    assert!(context.test_ready);
     assert!(!context.blocked);
     assert!(!context.wake_armed);
 }

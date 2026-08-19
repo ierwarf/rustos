@@ -1189,7 +1189,10 @@ mod tests {
             !super::collect_accounted_for_its_edge(None, false),
             "a refresh the main loop refused has reached nothing and accounts for nothing"
         );
-        assert!(!super::collect_accounted_for_its_edge(Some(libc::EAGAIN), false));
+        assert!(!super::collect_accounted_for_its_edge(
+            Some(libc::EAGAIN),
+            false
+        ));
     }
 
     /// The retry that a withheld token produces must be paced.

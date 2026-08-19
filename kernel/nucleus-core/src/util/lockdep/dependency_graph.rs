@@ -78,11 +78,7 @@ static IRQ_SAFE_CLASSES: AtomicU64 = AtomicU64::new(0);
 static IRQ_UNSAFE_CLASSES: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(rustos_boot_image)]
-pub(super) fn record_irq_usage(
-    cpu: usize,
-    class: usize,
-    acquire_site: &'static Location<'static>,
-) {
+pub(super) fn record_irq_usage(cpu: usize, class: usize, acquire_site: &'static Location<'static>) {
     let bit = 1_u64 << class;
     if irq_context_depth_on(cpu) != 0 {
         // ORDERING: SeqCst observes every prior unsafe classification before

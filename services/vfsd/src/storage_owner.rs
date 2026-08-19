@@ -19,6 +19,27 @@
 //! - **Evidence:** `vfs-open-description` and the vfsd recovery scenarios.
 
 use super::*;
+use core::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_EXECUTABLE_SNAPSHOT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Mint one nonzero, never-reused-in-process snapshot transaction identity.
+/// Exhaustion fails closed rather than wrapping and making an old evidence
+/// record ambiguous with a new seal.
+pub(crate) fn next_executable_snapshot_request_id() -> Result<u64, i32> {
+    loop {
+        let current = NEXT_EXECUTABLE_SNAPSHOT_REQUEST_ID.load(Ordering::Acquire);
+        if current == 0 || current == u64::MAX {
+            return Err(EOVERFLOW);
+        }
+        if NEXT_EXECUTABLE_SNAPSHOT_REQUEST_ID
+            .compare_exchange_weak(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return Ok(current);
+        }
+    }
+}
 
 /// Mount-generation storage: the FAT volume and every cache derived from it.
 ///
@@ -52,6 +73,8 @@ pub(crate) struct VfsStorage {
     pub(crate) executable_snapshot_cache: BTreeMap<String, ExecutableSnapshot>,
     pub(crate) executable_snapshot_cache_bytes: usize,
     pub(crate) mount_generation: u64,
+    /// Exact storaged DVM block-provider generation that backs `volume`.
+    pub(crate) dvm_storage_epoch: u64,
     pub(crate) cache_generation: u64,
 }
 
@@ -66,6 +89,7 @@ impl VfsStorage {
             executable_snapshot_cache: BTreeMap::new(),
             executable_snapshot_cache_bytes: 0,
             mount_generation: 1,
+            dvm_storage_epoch: 0,
             cache_generation: 1,
         }
     }
@@ -171,6 +195,14 @@ pub(crate) struct ExecutableSnapshotPlan {
     pub(crate) file_len: usize,
     pub(crate) metadata_len: u64,
     pub(crate) verbose: bool,
+    /// The immutable bootstrap image and the DVM-mounted volume are distinct
+    /// evidence sources. A sealed memfd proves bytes, not which source
+    /// supplied them, so retain that source through commit and publication.
+    pub(crate) backing: ExecutableSnapshotBacking,
+    /// Storaged's nonzero block-provider generation, or zero for bootstrap.
+    pub(crate) storage_epoch: u64,
+    /// Vfsd-local transaction identity for one fresh source read and seal.
+    pub(crate) request_id: u64,
     /// The mount generation the plan was resolved against.
     ///
     /// The bulk read runs without storage held, so a remount can land between

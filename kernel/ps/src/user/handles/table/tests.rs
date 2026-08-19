@@ -6,7 +6,10 @@ use super::{
 };
 use crate::memory::paging::UserRegion;
 use crate::user::linux as linux_abi;
-use kernel_object::api::handle::{FileHandleRights, HandleOwner, HandleRights};
+use kernel_object::api::{
+    handle::{FileHandleRights, HandleOwner, HandleRights},
+    identity::{ObjectKind, ObjectOwner},
+};
 use x86_64::VirtAddr;
 
 #[test]
@@ -48,6 +51,19 @@ fn standard_descriptors_are_real_unique_open_descriptions() {
         table.get_entry(1).expect("stdout entry").token(),
         table.get_entry(2).expect("stderr entry").token()
     );
+}
+
+#[test]
+fn nonreusable_console_descriptors_carry_the_open_description_identity_adapter() {
+    let table = HandleTable::new();
+    for fd in 0..3 {
+        let token = table.get_entry(fd).expect("standard descriptor").token();
+        let identity = token.identity().expect("console token adapter");
+        assert_eq!(identity.owner(), ObjectOwner::Ps);
+        assert_eq!(identity.kind(), ObjectKind::OpenDescription);
+        assert_eq!(identity.slot(), token.object_id());
+        assert_eq!(identity.generation(), 1);
+    }
 }
 
 #[test]

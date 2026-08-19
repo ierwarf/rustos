@@ -740,6 +740,7 @@ The PR and SMP-iteration profiles now include the compact
 `user-stack-growth/UserStackGrowth`,
 `exec-address-space-transaction/ExecAddressSpaceTransaction`,
 `ipc-transfer-authority/IpcTransferAuthority`,
+`capability-derivation-lifecycle/CapabilityDerivationLifecycle`,
 `dvm-transport-lifecycle/DvmTransportLifecycle`,
 `page-table-map-transaction/PageTableMapTransaction`,
 `gpu-submit-transaction/GpuSubmitTransaction`, and

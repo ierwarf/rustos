@@ -41,6 +41,7 @@ OwnerBlocked == "owner-blocked"
 Local == "local"
 RemoteQueued == "remote-queued"
 OwnerRunning == "owner-running"
+OwnerMigrating == "owner-migrating"
 OwnerRetired == "owner-retired"
 
 TokenNone == "none"
@@ -290,6 +291,23 @@ MigrateOwner(task, cpu, state) ==
                     publicationObserverFault, postCheckObserverFault,
                     dispatchObserverFault, nonLocalConsumeObserverFault>>
 
+\* Migration begins before target-mailbox publication.  It preserves the
+\* exact token generation and target CPU, so admission must reject it on
+\* custody state alone rather than accidentally relying on stale identity.
+EnterMigratingOwner(task) ==
+    /\ task \in Tasks
+    /\ taskState[task] = TaskRunnable
+    /\ ownerRunnable[task]
+    /\ ownerState[task] \in {Local, RemoteQueued}
+    /\ ownerCpu[task] \in Cpus
+    /\ ownerState' = [ownerState EXCEPT ![task] = OwnerMigrating]
+    /\ UNCHANGED <<taskState, ownerGeneration, ownerCpu, ownerRunnable,
+                    replyDonation, tokenPhase, tokenRecord, tokenUses, queue,
+                    publicationBegins, postAccepted, schedulerSerial,
+                    replyCommitSerial, dispatched, consumedWithoutDispatch,
+                    publicationObserverFault, postCheckObserverFault,
+                    dispatchObserverFault, nonLocalConsumeObserverFault>>
+
 \* The packed owner word carries CPU separately from its generation.  This
 \* bounded adversarial perturbation proves that captured-target equality is
 \* independently necessary even where a generation mutation is not the reason
@@ -428,6 +446,7 @@ Next ==
     \/ \E task \in Tasks: ChangeOwnerGeneration(task)
     \/ \E task \in Tasks, cpu \in Cpus, state \in {Local, RemoteQueued}:
           MigrateOwner(task, cpu, state)
+    \/ \E task \in Tasks: EnterMigratingOwner(task)
     \/ \E task \in Tasks, cpu \in Cpus, state \in {Local, RemoteQueued}:
           MoveOwnerCpuOnly(task, cpu, state)
     \/ \E task \in Tasks: ClearOwnerRunnable(task)
@@ -470,7 +489,7 @@ TypeOK ==
     /\ taskState \in [Tasks -> {TaskBlocked, TaskRunnable, TaskRetired}]
     /\ ownerGeneration \in [Tasks -> 1..MaxGeneration]
     /\ ownerCpu \in [Tasks -> (Cpus \cup {NoCpu})]
-    /\ ownerState \in [Tasks -> {OwnerBlocked, Local, RemoteQueued, OwnerRunning,
+    /\ ownerState \in [Tasks -> {OwnerBlocked, Local, RemoteQueued, OwnerRunning, OwnerMigrating,
                                   OwnerRetired}]
     /\ ownerRunnable \in [Tasks -> BOOLEAN]
     /\ replyDonation \in [Tasks -> BOOLEAN]
@@ -498,7 +517,7 @@ OwnerShapeIsSourceFaithful ==
     /\ \A task \in Tasks:
           taskState[task] = TaskRunnable =>
             /\ ownerCpu[task] \in Cpus
-            /\ ownerState[task] \in {Local, RemoteQueued, OwnerRunning}
+          /\ ownerState[task] \in {Local, RemoteQueued, OwnerRunning, OwnerMigrating}
     /\ \A task \in Tasks:
           taskState[task] = TaskRetired =>
             /\ ownerCpu[task] = NoCpu

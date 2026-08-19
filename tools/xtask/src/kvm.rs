@@ -161,8 +161,7 @@ const PRIVATE_SMP_QUALIFICATION_CONTRACT_PATH: &str =
 // undivideable by one round trip. `ipcbench` reads this directly, the same
 // way `uiserver` reads the acceptance contract above, so no service mediates
 // it.
-const PRIVATE_IPCBENCH_PROBE_CONTRACT_PATH: &str =
-    "system/registry/system/ipcbench-probe-v1.env";
+const PRIVATE_IPCBENCH_PROBE_CONTRACT_PATH: &str = "system/registry/system/ipcbench-probe-v1.env";
 const SMP_QUALIFICATION_WORK_UNITS: u64 = 1_000_000;
 const SMP_QUALIFICATION_DEADLINE_MS: u64 = 5_000;
 const SMP_QUALIFICATION_DEADLINE_US: u64 = SMP_QUALIFICATION_DEADLINE_MS * 1_000;

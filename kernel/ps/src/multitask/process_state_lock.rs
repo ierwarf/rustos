@@ -186,11 +186,7 @@ impl<T: ?Sized> ProcessStateLock<T> {
             {
                 return false;
             }
-            lockdep::record_sleepable_acquire_on(
-                cpu,
-                owner as u64,
-                LockClass::ProcessState as u8,
-            );
+            lockdep::record_sleepable_acquire_on(cpu, owner as u64, LockClass::ProcessState as u8);
             self.record_owner(owner, acquire_site);
             true
         })

@@ -1,5 +1,10 @@
 use super::*;
 use core::sync::atomic::{AtomicUsize, Ordering};
+use rustos_user_abi::syscall::{
+    PRODUCT_MILESTONE_BOOTSTRAP_EXECUTABLE_SNAPSHOT_SEALED,
+    ProductExecutableSnapshotEvidence as ProductSnapshotEvidenceWire,
+    product_executable_snapshot_evidence_shape_valid,
+};
 
 const SECONDARY_LINUX_SYSCALL_DEBUG_LIMIT: usize = 64;
 static SECONDARY_LINUX_SYSCALL_DEBUG_LOGS: AtomicUsize = AtomicUsize::new(0);
@@ -45,6 +50,9 @@ fn product_milestone_name(milestone: u64) -> Option<(&'static str, bool)> {
         linux_abi::PRODUCT_MILESTONE_STORAGE_READY => Some(("product-storage-ready", true)),
         linux_abi::PRODUCT_MILESTONE_EXECUTABLE_SNAPSHOT_SEALED => {
             Some(("product-executable-snapshot-sealed", true))
+        }
+        PRODUCT_MILESTONE_BOOTSTRAP_EXECUTABLE_SNAPSHOT_SEALED => {
+            Some(("product-bootstrap-executable-snapshot-sealed", true))
         }
         linux_abi::PRODUCT_MILESTONE_FIRST_FRAME => Some(("product-first-frame", false)),
         PRODUCT_MILESTONE_INIT_IDENTITY_READY => Some(("product-init-identity-ready", false)),
@@ -94,6 +102,43 @@ pub(super) fn syscall_linux_rustos_product_milestone(milestone: u64, arg0: u64, 
     0
 }
 
+/// Accept the product executable witness only from the live Vfsd endpoint.
+/// The service cannot supply its identity or endpoint generation: ring0 binds
+/// both at publication time, so a restarted Vfsd cannot forge continuity.
+pub(super) fn syscall_linux_rustos_product_executable_snapshot_evidence(args_ptr: u64) -> u64 {
+    let evidence = match usermem::read_current_user_struct::<ProductSnapshotEvidenceWire>(args_ptr)
+    {
+        Ok(evidence) => evidence,
+        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
+    };
+    if !product_executable_snapshot_evidence_shape_valid(&evidence) {
+        return linux_errno(LINUX_EINVAL);
+    }
+    let Some(process_id) = multitask::current_user_process_id() else {
+        return linux_errno(LINUX_EPERM);
+    };
+    let Some((owner_process_id, provider_generation)) =
+        ipc_ops::live_service_endpoint_owner_and_epoch(linux_abi::IPC_SERVICE_VFSD)
+    else {
+        return linux_errno(LINUX_EPERM);
+    };
+    if owner_process_id != process_id {
+        return linux_errno(LINUX_EPERM);
+    }
+    debug::record_product_executable_snapshot_evidence(
+        evidence.file_bytes,
+        debug::product_snapshot_evidence::ProductExecutableSnapshotEvidence {
+            provider_service_id: linux_abi::IPC_SERVICE_VFSD,
+            provider_generation,
+            storage_epoch: evidence.storage_epoch,
+            mount_generation: evidence.mount_generation,
+            request_id: evidence.request_id,
+            digest: evidence.digest,
+        },
+    );
+    0
+}
+
 /// Flushes the IPC-call and user-copy phase profiles immediately instead of
 /// waiting for their ordinary once-per-second housekeeping drain. Diagnostics
 /// only: nothing reads these counters to make a decision, and this grants no
@@ -129,6 +174,10 @@ mod product_milestone_tests {
         assert_eq!(
             product_milestone_name(linux_abi::PRODUCT_MILESTONE_EXECUTABLE_SNAPSHOT_SEALED),
             Some(("product-executable-snapshot-sealed", true))
+        );
+        assert_eq!(
+            product_milestone_name(PRODUCT_MILESTONE_BOOTSTRAP_EXECUTABLE_SNAPSHOT_SEALED),
+            Some(("product-bootstrap-executable-snapshot-sealed", true))
         );
         assert_eq!(
             product_milestone_name(PRODUCT_MILESTONE_INIT_IDENTITY_READY),

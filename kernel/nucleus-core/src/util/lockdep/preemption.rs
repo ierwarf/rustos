@@ -37,7 +37,11 @@ pub struct PreemptionSnapshot {
 
 #[inline]
 #[cfg(any(rustos_boot_image, test))]
-pub(super) const fn preemption_units_match(depth: usize, held_depth: usize, pending_depth: usize) -> bool {
+pub(super) const fn preemption_units_match(
+    depth: usize,
+    held_depth: usize,
+    pending_depth: usize,
+) -> bool {
     match held_depth.checked_add(pending_depth) {
         Some(expected) => depth == expected,
         None => false,
@@ -239,4 +243,3 @@ pub(super) fn cancel_pending_acquire_and_enable(class: u8) {
         enable_preemption(class);
     });
 }
-

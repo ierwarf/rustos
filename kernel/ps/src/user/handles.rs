@@ -336,12 +336,22 @@ impl InetSocketHandle {
 impl KernelHandle {
     pub(crate) fn token(&self) -> HandleToken {
         match self {
-            Self::Console(console) => HandleToken::new(HandleOwner::Ps, console.token_id()),
+            Self::Console(console) => {
+                HandleToken::from_nonreusable_open_description(HandleOwner::Ps, console.token_id())
+                    .expect("console open-description token is nonzero and nonreusable")
+            }
             Self::Device(device) => HandleToken::new(HandleOwner::Io, device.token_id()),
             Self::Epoll(epoll) => HandleToken::new(HandleOwner::Compat, epoll.token_id()),
-            Self::InetSocket(socket) => HandleToken::new(HandleOwner::Compat, socket.token_id()),
+            Self::InetSocket(socket) => HandleToken::from_nonreusable_open_description(
+                HandleOwner::Compat,
+                socket.token_id(),
+            )
+            .unwrap_or_else(|| HandleToken::new(HandleOwner::Compat, socket.token_id())),
             Self::Memfd(memfd) => HandleToken::new(HandleOwner::Compat, memfd.token_id()),
-            Self::RemoteVfs(remote) => HandleToken::new(HandleOwner::Io, remote.token_id()),
+            Self::RemoteVfs(remote) => {
+                HandleToken::from_nonreusable_open_description(HandleOwner::Io, remote.token_id())
+                    .expect("remote VFS open-description token is nonzero and nonreusable")
+            }
             Self::Socket(socket) => HandleToken::new(HandleOwner::Compat, socket.token_id()),
             Self::VfsDirectory(directory) => {
                 HandleToken::new(HandleOwner::Io, directory.token_id())

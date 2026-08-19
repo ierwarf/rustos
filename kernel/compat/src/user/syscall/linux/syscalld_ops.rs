@@ -20,6 +20,10 @@ use rustos_user_abi::syscall::{
     CPU_TOPOLOGY_MAX_LOGICAL_CPUS, CPU_TOPOLOGY_OBSERVATION_ABI_VERSION,
 };
 
+pub(crate) fn call_syscalld_raw(request: &[u8]) -> Result<Vec<u8>, i64> {
+    ipc_ops::call_linux_syscall_endpoint(request)
+}
+
 pub(super) fn syscall_linux_syscalld_uname(buf_ptr: u64) -> u64 {
     if let Err(err) = usermem::validate_current_user_write_buffer(buf_ptr, LINUX_UTSNAME_SIZE) {
         return linux_errno(address_space_error_to_linux_errno(err));

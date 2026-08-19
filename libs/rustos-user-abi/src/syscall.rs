@@ -140,6 +140,10 @@ pub const PRODUCT_MILESTONE_DISPLAY_READY: u64 = 2;
 pub const PRODUCT_MILESTONE_STORAGE_READY: u64 = 3;
 pub const PRODUCT_MILESTONE_EXECUTABLE_SNAPSHOT_SEALED: u64 = 4;
 pub const PRODUCT_MILESTONE_FIRST_FRAME: u64 = 5;
+/// A sealed executable read from the immutable signed bootstrap image. This
+/// never proves that the live DVM storage provider supplied the executable.
+pub const PRODUCT_MILESTONE_BOOTSTRAP_EXECUTABLE_SNAPSHOT_SEALED: u64 = 11;
+
 /// Retained source-contract predicate for the versioned SMP qualification
 /// wire. The public validator lives in `smp_qualification`; this narrow shim
 /// keeps the registered mutation anchors co-located with the syscall ABI root.
@@ -3205,31 +3209,16 @@ pub struct LinuxSigActionWire {
     pub mask: u64,
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct LinuxUtsName {
-    pub sysname: [u8; 65],
-    pub nodename: [u8; 65],
-    pub release: [u8; 65],
-    pub version: [u8; 65],
-    pub machine: [u8; 65],
-    pub domainname: [u8; 65],
-}
-
-impl Default for LinuxUtsName {
-    fn default() -> Self {
-        Self {
-            sysname: [0; 65],
-            nodename: [0; 65],
-            release: [0; 65],
-            version: [0; 65],
-            machine: [0; 65],
-            domainname: [0; 65],
-        }
-    }
-}
-
+mod linux_uts;
+mod product_snapshot_evidence;
 #[cfg(test)]
 mod smp_qualification_tests;
 #[cfg(test)]
 mod syscall_tests;
+pub use linux_uts::LinuxUtsName;
+pub use product_snapshot_evidence::{
+    PRODUCT_EXECUTABLE_SNAPSHOT_BACKING_DVM_VOLUME,
+    PRODUCT_EXECUTABLE_SNAPSHOT_EVIDENCE_ABI_VERSION, ProductExecutableSnapshotEvidence,
+    SYS_RUSTOS_PRODUCT_EXECUTABLE_SNAPSHOT_EVIDENCE,
+    product_executable_snapshot_evidence_shape_valid,
+};

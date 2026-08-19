@@ -3,7 +3,7 @@
 //! - **Owner:** nothing. This module holds no ownership state and grants no
 //!   authority; it compares two sources that already exist.
 //! - **Boundary:** `scheduler/runqueue.rs` owns the authoritative
-//!   `RunOwnerWord` per slot. The legacy tables — `context.ready`, the
+//!   `RunOwnerWord` per slot. The old readiness mirror, the
 //!   published current/transition pair, and the retire flag — are the second
 //!   source. Both are mutated under the global scheduler lock today.
 //! - **Lifecycle:** swept once per profile drain while the lock is held, so
@@ -107,7 +107,7 @@ pub(super) enum QueueOwner {
 /// not yet been adopted, so the two sources are allowed to describe different
 /// halves of that handoff.
 ///
-/// `legacy_running_is_runnable` is `context.ready` for the executing task. The
+/// `legacy_running_is_runnable` is the old readiness mirror for the executing task. The
 /// owner word cannot be compared against a position for that case, because
 /// `Running` is a position and "still wants to run" is not; they are the two
 /// facts Linux keeps apart in `p->on_rq` and the task state.

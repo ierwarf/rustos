@@ -4,12 +4,13 @@
 use alloc::{format, vec::Vec};
 use core::sync::atomic::{AtomicU64, Ordering};
 use rustos_user_abi::syscall::{
-    IpcReplyRecvResultKind, IpcReplyRecvWithSenderArgs, RustosIpcValidateServiceOwnerArgs,
-    IPC_ABI_VERSION, SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_IPC_CALL_BOUNDED,
-    SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
-    SYS_RUSTOS_IPC_RECV_WITH_SENDER, SYS_RUSTOS_IPC_REGISTER_LINUX_SYSCALL_ENDPOINT,
-    SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
-    SYS_RUSTOS_IPC_REPLY_RECV_WITH_SENDER, SYS_RUSTOS_IPC_VALIDATE_SERVICE_OWNER,
+    IpcReplyRecvResultKind, IpcReplyRecvWithSenderArgs, ProductExecutableSnapshotEvidence,
+    RustosIpcValidateServiceOwnerArgs, IPC_ABI_VERSION, SYS_RUSTOS_DEBUG_PRINT,
+    SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_IPC_CALL_BOUNDED, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
+    SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_RECV_WITH_SENDER,
+    SYS_RUSTOS_IPC_REGISTER_LINUX_SYSCALL_ENDPOINT, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT,
+    SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_IPC_REPLY_RECV_WITH_SENDER,
+    SYS_RUSTOS_IPC_VALIDATE_SERVICE_OWNER, SYS_RUSTOS_PRODUCT_EXECUTABLE_SNAPSHOT_EVIDENCE,
     SYS_RUSTOS_PRODUCT_MILESTONE,
 };
 
@@ -262,6 +263,19 @@ pub fn debug_line(message: &str) {
 #[inline]
 pub fn product_milestone(milestone: u64, arg0: u64, arg1: u64) -> i64 {
     unsafe { syscall3(SYS_RUSTOS_PRODUCT_MILESTONE, milestone, arg0, arg1) }
+}
+
+/// Ask ring0 to stamp a fully identified DVM executable snapshot witness.
+/// The kernel accepts it only from the live Vfsd endpoint and independently
+/// supplies the provider identity and endpoint generation.
+#[inline]
+pub fn product_executable_snapshot_evidence(evidence: &ProductExecutableSnapshotEvidence) -> i64 {
+    unsafe {
+        syscall1(
+            SYS_RUSTOS_PRODUCT_EXECUTABLE_SNAPSHOT_EVIDENCE,
+            evidence as *const ProductExecutableSnapshotEvidence as u64,
+        )
+    }
 }
 
 #[cfg(test)]

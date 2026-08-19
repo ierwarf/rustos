@@ -119,9 +119,9 @@ source_symbol = "wake_task_slot"
 source_anchors = [
   "TaskExecutionOwner::Transition(transition_cpu)",
   "match self.publish_runqueue_wake_to(slot, transition_cpu)",
-  "context.ready = true;",
+  "context.test_ready = true;",
 ]
-invariant = "a blocked transition wake publishes one durable target mailbox owner before legacy ready changes, cannot dispatch before assembly commit, and is claimed at most once after commit"
+invariant = "a blocked transition wake publishes one durable target mailbox owner before the test adapter changes, cannot dispatch before assembly commit, and is claimed at most once after commit"
 loom_test = "scheduler_transition_wake_has_one_queued_owner_until_commit"
 shuttle_test = "scheduler_transition_wake_has_one_mailbox_owner_until_commit"
 herd_not_applicable = "the decisive property composes assembly transition state, an owner-word CAS, and a lock-protected mailbox drain; the atomic transition publication already has a separate x86_64 litmus, while an ISA-only wake litmus would omit queue identity and one-shot dispatch"

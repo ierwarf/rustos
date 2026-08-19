@@ -2,18 +2,18 @@
 # Formal Contract Registry
 
 - Schema: `3`
-- Registry SHA-256: `48f801d2390bf024f91943a026786e7a08f885c54d7dfffdcbdb597f2ea07f99`
-- Models: `127`
-- Whole flows: `68`
-- Transitions: `687`
+- Registry SHA-256: `5392807f9b8483286f445b1ad1a09c189a13efbaec9f0c61b196bff29c8c222a`
+- Models: `128`
+- Whole flows: `69`
+- Transitions: `697`
 - Product runtime scenarios: `3`
-- Exact source witnesses: `578`
+- Exact source witnesses: `592`
 - Apalache pilots: `3`
 - TLAPS theorem models: `2`
 - Runtime-traced models: `7`
 - Intentional-terminal exceptions: `91` (ceiling `91`)
-- Cyclic strongly connected components: `42`
-- Supporting model bindings: `99`
+- Cyclic strongly connected components: `43`
+- Supporting model bindings: `100`
 - Explicit critical/high risk surfaces: `100`
 - Additional source mappings: `164`
 
@@ -25,6 +25,7 @@
 | `boot-storage-handoff` | `critical` | hostd, storage-dvm, storaged, xtask | boot-storage-handoff/BootStorageHandoff | 14 | 14 | host-restored, proven, quarantined |
 | `bootstrap-activation-handoff` | `critical` | kernel-ps | bootstrap-activation-handoff/BootstrapActivationHandoff | 6 | 6 | first-turn, revoked |
 | `bootstrap-content-admission` | `critical` | kernel-io-manager | filesystem-content-integrity/FilesystemContentIntegrity | 2 | 2 | admitted, rejected |
+| `capability-derivation-lifecycle` | `critical` | kernel-ipc-runtime, kernel-object, kernel-ps | capability-derivation-lifecycle/CapabilityDerivationLifecycle | 10 | 10 | rejected, revoked |
 | `commercial-envelope` | `critical` | caller, kernel-ipc, netd, service | commercial-service-envelope/CommercialServiceEnvelope | 6 | 6 | admitted, malformed-replied, peer-closed, reply-rejected, timed-out |
 | `commercial-product-boot` | `critical` | kernel-io-manager, rootd, storaged, uiserver, vfsd, wayclick, xtask-kvm | acceptance-profile-publication/AcceptanceProfilePublication, dvm-block-startup/DvmBlockStartup, dvm-display-readiness/DvmDisplayReadiness, input-ingestion-worker/InputIngestionWorker, product-boot/ProductBoot, rootd-bootstrap/RootdBootstrap, ui-frame-budget/UiFrameBudget | 19 | 19 | control-ready, failed, presented, revoked, storage-usable |
 | `cpu-affinity-observation` | `critical` | kernel-compat, kernel-hal, syscalld | cpu-affinity-observation/CpuAffinityObservation | 7 | 7 | rejected, replied |

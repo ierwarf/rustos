@@ -1087,6 +1087,16 @@ authority-identity-lifecycle/AuthorityIdentityLifecycle|kernel-ps|multitask::ide
 authority-identity-lifecycle/AuthorityIdentityLifecycle|kernel-ps|multitask::process_table::tests::process_generations_fail_closed_instead_of_aliasing_stale_handles
 authority-identity-lifecycle/AuthorityIdentityLifecycle|kernel-compat|user::syscall::linux::proc_broker_ops::tests::broker_authority_identity_exhaustion_never_wraps
 authority-identity-lifecycle/AuthorityIdentityLifecycle|kernel-ipc-runtime|ipc::slab::tests::removed_handle_never_aliases_reused_slot
+capability-derivation-lifecycle/CapabilityDerivationLifecycle|kernel-object|identity::tests::identity_rejects_zero_slot_or_generation
+capability-derivation-lifecycle/CapabilityDerivationLifecycle|kernel-object|identity::tests::capability_epochs_keep_lease_and_revoke_distinct
+capability-derivation-lifecycle/CapabilityDerivationLifecycle|kernel-object|handle::tests::typed_rights_attenuation_rejects_widening_and_kind_substitution
+capability-derivation-lifecycle/CapabilityDerivationLifecycle|kernel-ps|user::handles::table::tests::nonreusable_console_descriptors_carry_the_open_description_identity_adapter
+capability-derivation-lifecycle/CapabilityDerivationLifecycle|kernel-ipc-runtime|ipc::tests::endpoint_and_reply_handles_decode_only_in_range_generational_identities
+capability-derivation-lifecycle/CapabilityDerivationLifecycle|kernel-ps|multitask::process_table::tests::identity_tests::process_handle_adapts_table_slot_and_generation_to_typed_identity
+capability-derivation-lifecycle/CapabilityDerivationLifecycle|kernel-ps|multitask::process_table::tests::identity_tests::exec_reservation_adapts_exact_pre_exec_mm_generation_to_lifecycle_token
+capability-derivation-lifecycle/CapabilityDerivationLifecycle|kernel-ipc-runtime|ipc::tests::kernel_transfer_ticket_binds_the_nonzero_transfer_object_generation
+capability-derivation-lifecycle/CapabilityDerivationLifecycle|kernel-ipc-runtime|ipc::tests::transferred_handle_derivation_only_attenuates_typed_rights
+capability-derivation-lifecycle/CapabilityDerivationLifecycle|kernel-ps|user::handles::transfer_registry::transfer_registry_tests::opaque_transfer_ticket_is_exact_one_shot_and_nonce_bound
 root-authority-publication/RootAuthorityPublication|kernel-compat|user::syscall::linux::ipc_ops::tests::root_service_publication_is_boot_owner_sealed_and_epoch_bound
 root-authority-publication/RootAuthorityPublication|kernel-ipc-runtime|ipc::tests::process_owned_endpoint_allows_worker_and_rejects_foreign_process
 service-call-authority/ServiceCallAuthority|kernel-compat|user::syscall::linux::ipc_ops::tests::service_call_grants_are_exact_epoch_bounded_and_revocable
@@ -1226,6 +1236,8 @@ per-cpu-clockevent-lifecycle/PerCpuClockeventLifecycle|kernel-ps|multitask::irq:
 scheduler-wakeup/SchedulerWakeup|kernel-ps|multitask::scheduler::tests::scheduler_block_arm_is_exact_race_safe_and_terminally_revoked
 scheduler-wakeup/SchedulerWakeup|kernel-ps|multitask::scheduler::tests::raced_wake_never_validates_a_consumed_current_frame
 scheduler-wakeup/SchedulerWakeup|kernel-ps|multitask::scheduler::tests::live_noncurrent_task_must_retain_one_scheduler_state_owner
+scheduler-wakeup/SchedulerWakeup|kernel-ps|multitask::scheduler::runqueue::tests::wake_runnable_predicate_uses_owner_bit_but_respects_wait_lifecycle
+scheduler-wakeup/SchedulerWakeup|kernel-ps|multitask::scheduler::runqueue::tests::owner_run_intent_keeps_running_queued_and_migrating_states_distinct_from_handoff
 scheduler-wakeup/SchedulerWakeup|kernel-ps|multitask::cpu_local::tests::current_task_ownership_ignores_offline_slots_and_is_cpu_distinct
 scheduler-wakeup/SchedulerWakeup|kernel-hal|hooks::tests::scheduler_callback_runs_after_hook_registry_read_guard_is_released
 scheduler-wakeup/SchedulerWakeup|kernel-compat|user::syscall::linux::broker_ops::input_broker_ops::tests::ingestion_watchdog_is_bounded_below_ring_exhaustion_time
@@ -1260,9 +1272,11 @@ synchronous-ipc-handoff/SynchronousIpcHandoff|kernel-ps|multitask::scheduler::sy
 synchronous-ipc-handoff/SynchronousIpcHandoff|kernel-ps|multitask::scheduler::sync_handoff::tests::generic_handoff_cannot_downgrade_reply_generation_custody
 synchronous-ipc-handoff/SynchronousIpcHandoff|kernel-ps|multitask::scheduler::sync_handoff::tests::stale_reply_enqueue_has_no_scheduler_or_global_fallback
 synchronous-ipc-handoff/SynchronousIpcHandoff|kernel-ps|multitask::scheduler::sync_handoff::tests::reply_enqueue_rechecks_owner_after_the_exact_target_queue_mutation
+synchronous-ipc-handoff/SynchronousIpcHandoff|kernel-ps|multitask::scheduler::runqueue::tests::direct_handoff_predicate_rejects_running_and_migrating_even_if_runnable
 synchronous-ipc-handoff-concurrency/SynchronousIpcHandoffConcurrency|kernel-ps|multitask::scheduler::sync_handoff::tests::reply_wake_token_rejects_stale_owner_generation_migration_and_retirement
 synchronous-ipc-handoff-concurrency/SynchronousIpcHandoffConcurrency|kernel-ps|multitask::scheduler::sync_handoff::tests::stale_reply_enqueue_has_no_scheduler_or_global_fallback
 synchronous-ipc-handoff-concurrency/SynchronousIpcHandoffConcurrency|kernel-ps|multitask::scheduler::sync_handoff::tests::reply_enqueue_rechecks_owner_after_the_exact_target_queue_mutation
+synchronous-ipc-handoff-concurrency/SynchronousIpcHandoffConcurrency|kernel-ps|multitask::scheduler::runqueue::tests::direct_handoff_predicate_rejects_running_and_migrating_even_if_runnable
 ipc-priority-inheritance/IpcPriorityInheritance|kernel-ps|multitask::scheduler::tests::synchronous_ipc_donation_promotes_and_revokes_a_transitive_user_chain
 ipc-priority-queue/IpcPriorityQueue|kernel-ipc-runtime|ipc::tests::receiver_waiter_tests::endpoint_system_calls_bypass_backlog_without_starving_ordinary_lane
 pci-bar-discovery/PciBarDiscovery|kernel-hal|arch::pci::tests::mem64_bar_size_uses_the_lowest_implemented_mask_bit
@@ -1572,7 +1586,7 @@ ui-main-loop-wakeup/UiMainLoopWakeup|kernel-hal|arch::rtc::tests::sleep_waiter_u
 ui-main-loop-wakeup/UiMainLoopWakeup|wayclick|damage_tests::first_frame_marker_is_the_user_visible_boot_terminal
 ui-input-motion/UiInputMotion|uiserver|input_loop::tests::input_reader_batch_coalesces_relative_motion
 vfio-release-authorization/VfioReleaseAuthorization|rustos-driver-domain-host|tests::release_authorization_binds_artifacts_policy_and_complete_iommu_group
-product-boot/ProductBoot|vfsd|tests::executable_snapshot_marker_binds_path_and_exact_length
+product-boot/ProductBoot|vfsd|tests::executable_snapshot_marker_binds_source_and_mount_identity
 product-boot/ProductBoot|vfsd|tests::snapshot_worker_admission_is_single_slot_and_exact_owner
 product-boot/ProductBoot|rootd|tests::core_readiness_budget_is_bounded_and_resets_only_on_readiness|host-test
 product-boot/ProductBoot|kernel-io-manager|input::dvm_ring::tests::policy_consumer_readiness_requires_transport_and_is_idempotent

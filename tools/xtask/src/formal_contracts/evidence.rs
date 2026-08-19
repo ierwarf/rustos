@@ -277,7 +277,7 @@ fn validate_runtime_trace(
         bail!("KVM runtime trace summary is not passed");
     }
     if summary.get("schema").and_then(serde_json::Value::as_str)
-        != Some("rustos-kvm-formal-trace-evidence-v4")
+        != Some("rustos-kvm-formal-trace-evidence-v5")
     {
         bail!("KVM runtime trace summary uses a stale evidence schema");
     }

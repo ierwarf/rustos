@@ -177,6 +177,8 @@ pub(crate) struct ProductScenarioStep {
     pub model: String,
     pub log: String,
     pub marker: String,
+    /// Additional checksummed milestone payload required for this step.
+    pub evidence: String,
     pub requires: Vec<String>,
     pub deadline_ms: u64,
 }
@@ -407,6 +409,21 @@ impl ContractRegistry {
                 if step.marker.is_empty() || step.marker.contains(['\n', '\r', '\t']) {
                     bail!(
                         "product scenario {scenario}/{topology} step {} has an invalid marker",
+                        step.step
+                    );
+                }
+                if !matches!(step.evidence.as_str(), "none" | "executable-snapshot-v1") {
+                    bail!(
+                        "product scenario {scenario}/{topology} step {} uses unknown evidence contract {}",
+                        step.step,
+                        step.evidence
+                    );
+                }
+                if step.evidence == "executable-snapshot-v1"
+                    && step.marker != "name=product-executable-snapshot-sealed"
+                {
+                    bail!(
+                        "product scenario {scenario}/{topology} step {} binds executable evidence to the wrong marker",
                         step.step
                     );
                 }
@@ -1276,7 +1293,7 @@ fn parse_product_scenarios(path: &Path) -> Result<Vec<ProductScenarioStep>> {
             continue;
         }
         let fields = line.split('\t').collect::<Vec<_>>();
-        if fields.len() != 11 {
+        if fields.len() != 12 {
             bail!(
                 "{}:{} has {} product scenario fields",
                 path.display(),
@@ -1296,13 +1313,14 @@ fn parse_product_scenarios(path: &Path) -> Result<Vec<ProductScenarioStep>> {
             model: fields[6].to_owned(),
             log: fields[7].to_owned(),
             marker: fields[8].to_owned(),
-            requires: fields[9]
+            evidence: fields[9].to_owned(),
+            requires: fields[10]
                 .split(',')
                 .map(str::trim)
                 .filter(|required| !required.is_empty())
                 .map(str::to_owned)
                 .collect(),
-            deadline_ms: fields[10].parse().with_context(|| {
+            deadline_ms: fields[11].parse().with_context(|| {
                 format!("{}:{} invalid scenario deadline", path.display(), index + 1)
             })?,
         });
@@ -1452,6 +1470,7 @@ fn registry_hash(registry: &ContractRegistry) -> String {
             step.model.as_str(),
             step.log.as_str(),
             step.marker.as_str(),
+            step.evidence.as_str(),
         ] {
             hasher.update(field.as_bytes());
             hasher.update([0]);
@@ -1526,51 +1545,4 @@ fn registry_hash(registry: &ContractRegistry) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::path::Path;
-
-    use super::{
-        BTreeMap, BTreeSet, FlowGraph, cyclic_scc_count, is_unregistered_high_risk_source,
-    };
-
-    #[test]
-    fn strongly_connected_cycle_with_terminal_exit_is_counted_once() {
-        let nodes = BTreeSet::from(["START", "a", "b", "done"]);
-        let outgoing = BTreeMap::from([
-            ("START", BTreeSet::from(["a"])),
-            ("a", BTreeSet::from(["b"])),
-            ("b", BTreeSet::from(["a", "done"])),
-        ]);
-        let incoming = BTreeMap::from([
-            ("a", BTreeSet::from(["START", "b"])),
-            ("b", BTreeSet::from(["a"])),
-            ("done", BTreeSet::from(["b"])),
-        ]);
-        let graph = FlowGraph {
-            transitions: Vec::new(),
-            nodes,
-            outgoing,
-            incoming,
-        };
-        assert_eq!(cyclic_scc_count(&graph), 1);
-    }
-
-    #[test]
-    fn high_risk_fallback_targets_stateful_boundaries_not_every_rust_file() {
-        assert!(is_unregistered_high_risk_source(Path::new(
-            "kernel/ps/src/multitask/scheduler.rs"
-        )));
-        assert!(is_unregistered_high_risk_source(Path::new(
-            "services/newpolicyd/src/main.rs"
-        )));
-        assert!(is_unregistered_high_risk_source(Path::new(
-            "kernel/compat/src/user/syscall/linux/new_broker_ops.rs"
-        )));
-        assert!(!is_unregistered_high_risk_source(Path::new(
-            "services/uiserver/src/color.rs"
-        )));
-        assert!(!is_unregistered_high_risk_source(Path::new(
-            "kernel/ps/src/debug_format.rs"
-        )));
-    }
-}
+mod registry_tests;

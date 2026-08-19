@@ -1,5 +1,6 @@
 # model	class	deadlock_policy	deadlock_reason	pr_timeout_s	nightly_timeout_s	nightly_mode	apalache	tlaps	trace
 authority-identity-lifecycle/AuthorityIdentityLifecycle	safety	intentional-terminal	bounded identity namespace may exhaust	30	120	exhaustive	no	no	no
+capability-derivation-lifecycle/CapabilityDerivationLifecycle	safety	check	explicit rejection and terminal revoke states stutter while typed rights attenuation and independent epochs remain explicit	30	120	exhaustive	no	no	no
 atomic-process-activation-batch/AtomicProcessActivationBatch	safety	check	committed rejected and requester-exit terminals stutter while full target identities and all-or-nothing activation remain explicit	30	120	exhaustive	no	no	no
 cpu-affinity-observation/CpuAffinityObservation	safety	check	reply and rejection terminals stutter while exact online-mask publication remains explicit	30	120	exhaustive	no	no	no
 task-affinity-lifecycle/TaskAffinityLifecycle	safety	check	rejected affinity requests stutter while successful changes retain explicit migration fork and exec progress	30	120	exhaustive	no	no	no

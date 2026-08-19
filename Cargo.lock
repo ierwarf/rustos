@@ -1607,6 +1607,7 @@ dependencies = [
  "fatfs",
  "rustos-svc-runtime",
  "rustos-user-abi",
+ "sha2",
  "storage-core",
  "storage-fat",
 ]

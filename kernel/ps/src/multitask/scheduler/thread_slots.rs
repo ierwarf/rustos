@@ -50,8 +50,8 @@ impl Scheduler {
                     inherited_task_mask,
                     inherited_process_mask,
                     weight: current.weight,
-                    vruntime_ns: current
-                        .vruntime_ns
+                    vruntime_ns: self
+                        .slot_vruntime(self.current_task_slot())
                         .saturating_add(SCHED_NEW_TASK_VRUNTIME_PENALTY_NS),
                 });
             }
@@ -81,20 +81,29 @@ impl Scheduler {
             return None;
         }
         let (kernel_stack_base, kernel_stack_top) = self.stack_bounds(slot);
+        let saved_rsp = self.init_user_task_context(slot, &bootstrap, user_cs, user_ss, rflags);
         self.contexts[slot] = Some(TaskContext {
-            saved_rsp: self.init_user_task_context(slot, &bootstrap, user_cs, user_ss, rflags),
-            ready: false,
+            #[cfg(test)]
+            saved_rsp,
+            #[cfg(test)]
+            test_ready: false,
             ready_since_ticks: 0,
             blocked: true,
             blocked_since_ticks: crate::arch::rtc::ticks(),
             wake_armed: false,
             weight: reservation.weight,
+            #[cfg(test)]
             vruntime_ns: reservation.vruntime_ns,
+            #[cfg(test)]
             exec_start_ticks: 0,
             address_space_root: reservation.root_phys,
+            #[cfg(test)]
             kernel_stack_base: kernel_stack_base as u64,
+            #[cfg(test)]
             kernel_stack_top: kernel_stack_top as u64,
+            #[cfg(test)]
             alternate_kernel_stack_base: 0,
+            #[cfg(test)]
             alternate_kernel_stack_top: 0,
             user_mode: true,
             user_abi: Some(bootstrap.abi),
@@ -107,7 +116,16 @@ impl Scheduler {
                 state
             }),
         });
-        self.simd_states[slot] = SimdState::new();
+        self.initialize_slot_vruntime(slot, reservation.vruntime_ns);
+        self.initialize_slot_exec_start_ticks(slot, 0);
+        self.initialize_slot_saved_rsp(slot, saved_rsp);
+        self.initialize_slot_kernel_stack_bounds(
+            slot,
+            kernel_stack_base as u64,
+            kernel_stack_top as u64,
+        );
+        self.initialize_slot_alternate_kernel_stack_bounds(slot);
+        self.initialize_slot_simd_state(slot);
         self.start_suspended[slot] = true;
         self.starts[slot] = Some(TaskStart {
             entry: super::super::noop_task_entry,

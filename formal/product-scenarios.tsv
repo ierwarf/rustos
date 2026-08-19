@@ -1,10 +1,10 @@
-# scenario	topology	sequence	step	flow	transition	model	log	marker	requires	absolute_deadline_ms
-interactive-boot	qemu-commercial	0	core-services	commercial-product-boot	core-services	rootd-bootstrap/RootdBootstrap	rustos	name=product-root-core-ready	START	1000
-interactive-boot	qemu-commercial	1	input-policy	commercial-product-boot	input-policy	input-ingestion-worker/InputIngestionWorker	rustos	name=dvm-input-policy-ready	core-services	1500
-interactive-boot	qemu-commercial	2	storage-data-plane	commercial-product-boot	storage-data-plane	dvm-block-startup/DvmBlockStartup	rustos	name=product-storage-ready	input-policy	4000
-interactive-boot	qemu-commercial	3	display-provider	commercial-product-boot	display-provider	dvm-display-readiness/DvmDisplayReadiness	rustos	name=product-display-ready	input-policy	2500
-interactive-boot	qemu-commercial	4	executable-snapshot	commercial-product-boot	executable-snapshot	product-boot/ProductBoot	rustos	name=product-executable-snapshot-sealed	storage-data-plane	4500
-interactive-boot	qemu-commercial	5	first-frame	commercial-product-boot	first-frame	ui-frame-budget/UiFrameBudget	rustos	name=product-first-frame	display-provider,executable-snapshot	10000
-storage-boot	storage-dvm	0	core-services	commercial-product-boot	core-services	rootd-bootstrap/RootdBootstrap	rustos	name=product-root-core-ready	START	1000
-storage-boot	storage-dvm	1	storage-data-plane	commercial-product-boot	storage-only-data-plane	dvm-block-startup/DvmBlockStartup	rustos	name=product-storage-ready	core-services	5000
-control-smoke	qemu-control	0	core-services	commercial-product-boot	control-only	rootd-bootstrap/RootdBootstrap	rustos	name=product-root-core-ready	START	5000
+# scenario	topology	sequence	step	flow	transition	model	log	marker	evidence	requires	absolute_deadline_ms
+interactive-boot	qemu-commercial	0	core-services	commercial-product-boot	core-services	rootd-bootstrap/RootdBootstrap	rustos	name=product-root-core-ready	none	START	1000
+interactive-boot	qemu-commercial	1	input-policy	commercial-product-boot	input-policy	input-ingestion-worker/InputIngestionWorker	rustos	name=dvm-input-policy-ready	none	core-services	1500
+interactive-boot	qemu-commercial	2	storage-data-plane	commercial-product-boot	storage-data-plane	dvm-block-startup/DvmBlockStartup	rustos	name=product-storage-ready	none	input-policy	4000
+interactive-boot	qemu-commercial	3	display-provider	commercial-product-boot	display-provider	dvm-display-readiness/DvmDisplayReadiness	rustos	name=product-display-ready	none	input-policy	2500
+interactive-boot	qemu-commercial	4	executable-snapshot	commercial-product-boot	executable-snapshot	product-boot/ProductBoot	rustos	name=product-executable-snapshot-sealed	executable-snapshot-v1	storage-data-plane	4500
+interactive-boot	qemu-commercial	5	first-frame	commercial-product-boot	first-frame	ui-frame-budget/UiFrameBudget	rustos	name=product-first-frame	none	display-provider,executable-snapshot	10000
+storage-boot	storage-dvm	0	core-services	commercial-product-boot	core-services	rootd-bootstrap/RootdBootstrap	rustos	name=product-root-core-ready	none	START	1000
+storage-boot	storage-dvm	1	storage-data-plane	commercial-product-boot	storage-only-data-plane	dvm-block-startup/DvmBlockStartup	rustos	name=product-storage-ready	none	core-services	5000
+control-smoke	qemu-control	0	core-services	commercial-product-boot	control-only	rootd-bootstrap/RootdBootstrap	rustos	name=product-root-core-ready	none	START	5000

@@ -83,7 +83,7 @@ pub(super) fn boxed_scheduler() -> Box<Scheduler> {
 pub(super) fn test_user_context(handle: process_table::ProcessHandle) -> TaskContext {
     TaskContext {
         saved_rsp: 0,
-        ready: true,
+        test_ready: true,
         ready_since_ticks: 0,
         blocked: false,
         blocked_since_ticks: 0,
@@ -146,7 +146,7 @@ struct TerminalRejectionSnapshot {
 fn terminal_rejection_snapshot(scheduler: &Scheduler, slot: usize) -> TerminalRejectionSnapshot {
     let context = scheduler.contexts[slot].expect("terminal test context");
     TerminalRejectionSnapshot {
-        ready: context.ready,
+        ready: context.test_ready,
         blocked: context.blocked,
         wake_armed: context.wake_armed,
         current_task: scheduler.current_task,
@@ -274,7 +274,7 @@ fn unmasked_signal_revokes_a_pending_block_arm() {
     let mut scheduler = boxed_scheduler();
     let process = test_process(52);
     let mut context = test_user_context(process);
-    context.ready = false;
+    context.test_ready = false;
     scheduler.contexts[1] = Some(context);
     scheduler.starts[1] = Some(TaskStart {
         entry: noop_task_entry,
@@ -289,7 +289,7 @@ fn unmasked_signal_revokes_a_pending_block_arm() {
     let context = scheduler.contexts[1].expect("signalled context");
     assert!(!context.wake_armed);
     assert!(!context.blocked);
-    assert!(!context.ready);
+    assert!(!context.test_ready);
     assert_eq!(scheduler.commit_block_current_task(), Some(false));
 
     process_table::note_process_exit_status(52, 0).expect("record exit");
@@ -596,7 +596,7 @@ fn exec_rejects_slot_with_unconsumed_side_effect_token() {
     let task_id = 0xec01;
     let mut context = test_user_context(owner);
     context.address_space_root = 0x1234_5000;
-    context.ready = true;
+    context.test_ready = true;
     scheduler.contexts[slot] = Some(context);
     scheduler.starts[slot] = Some(TaskStart {
         entry: noop_task_entry,
@@ -622,7 +622,7 @@ fn exec_rejects_slot_with_unconsumed_side_effect_token() {
     let after = scheduler.contexts[slot].expect("rejected exec target remains live");
     assert_eq!(after.address_space_root, before.address_space_root);
     assert_eq!(after.user_abi, before.user_abi);
-    assert_eq!(after.ready, before.ready);
+    assert_eq!(after.test_ready, before.test_ready);
     assert_eq!(after.blocked, before.blocked);
     assert_eq!(
         scheduler.starts[slot].expect("identity preserved").id,
@@ -778,7 +778,7 @@ fn synchronous_ipc_donation_promotes_and_revokes_a_transitive_user_chain() {
 
     // If the server is executing between receive calls, the reservation
     // follows the reply until that exact worker dequeues the request.
-    scheduler.contexts[2].as_mut().unwrap().ready = false;
+    scheduler.contexts[2].as_mut().unwrap().test_ready = false;
     assert!(scheduler.reserve_ipc_priority(601));
     assert!(
         scheduler
@@ -855,30 +855,30 @@ fn scheduler_block_arm_is_exact_race_safe_and_terminally_revoked() {
     scheduler.contexts[slot]
         .as_mut()
         .expect("dispatched context")
-        .ready = false;
+        .test_ready = false;
 
     assert!(scheduler.arm_block_current_task());
     assert!(scheduler.contexts[slot].expect("context").wake_armed);
     assert!(scheduler.wake_task(690));
     assert!(!scheduler.contexts[slot].expect("context").wake_armed);
     assert_eq!(scheduler.commit_block_current_task(), Some(false));
-    assert!(!scheduler.contexts[slot].expect("context").ready);
+    assert!(!scheduler.contexts[slot].expect("context").test_ready);
 
     assert!(scheduler.arm_block_current_task());
     assert_eq!(scheduler.commit_block_current_task(), Some(true));
     let blocked = scheduler.contexts[slot].expect("context");
     assert!(blocked.blocked);
-    assert!(!blocked.ready);
+    assert!(!blocked.test_ready);
     assert!(!scheduler.arm_block_current_task());
     assert!(!scheduler.cancel_block_current_task());
 
     scheduler.current_task = super::ROOT_TASK_SLOT;
     assert!(scheduler.wake_task(690));
-    assert!(scheduler.contexts[slot].expect("context").ready);
+    assert!(scheduler.contexts[slot].expect("context").test_ready);
     scheduler.contexts[slot]
         .as_mut()
         .expect("redispatched context")
-        .ready = false;
+        .test_ready = false;
     scheduler.current_task = slot;
     assert!(scheduler.arm_block_current_task());
     scheduler.retire_slot(slot, super::TaskRetireReason::Exited);

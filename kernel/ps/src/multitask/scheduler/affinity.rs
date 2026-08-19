@@ -101,7 +101,7 @@ impl Scheduler {
         online_mask: u64,
     ) -> Result<u64, AffinityError> {
         let slot = self.resolve_current_process_task(target_task_id, UserAbi::Linux)?;
-        Self::admitted_mask(self.task_affinity_masks[slot], online_mask)
+        Self::admitted_mask(self.slot_affinity_snapshot(slot).0, online_mask)
             .ok_or(AffinityError::InvalidMask)
     }
 
@@ -113,11 +113,11 @@ impl Scheduler {
     ) -> Result<AffinityCommit, AffinityError> {
         let slot = self.resolve_current_process_task(target_task_id, UserAbi::Linux)?;
         let requested = Self::validate_requested_mask(requested_mask, online_mask, online_mask)?;
-        let previous_mask = Self::admitted_mask(self.task_affinity_masks[slot], online_mask)
+        let (_, process_mask, _) = self.slot_affinity_snapshot(slot);
+        let previous_mask = Self::admitted_mask(self.slot_affinity_snapshot(slot).0, online_mask)
             .ok_or(AffinityError::InvalidMask)?;
         let reschedule_required = self.migration_required(slot, requested);
-        self.task_affinity_masks[slot] = requested;
-        self.affinity_migration_pending[slot] = reschedule_required;
+        self.replace_slot_affinity(slot, requested, process_mask, reschedule_required);
         #[cfg(not(test))]
         if reschedule_required {
             self.rehome_runqueue_slot(slot);
@@ -133,7 +133,7 @@ impl Scheduler {
         online_mask: u64,
     ) -> Result<ProcessAffinitySnapshot, AffinityError> {
         let slot = self.resolve_current_process_task(0, UserAbi::Windows)?;
-        let process_mask = Self::admitted_mask(self.process_affinity_masks[slot], online_mask)
+        let process_mask = Self::admitted_mask(self.slot_affinity_snapshot(slot).1, online_mask)
             .ok_or(AffinityError::InvalidMask)?;
         Ok(ProcessAffinitySnapshot {
             process_mask,
@@ -152,7 +152,7 @@ impl Scheduler {
             .ok_or(AffinityError::MissingTask)?;
         let requested = Self::validate_requested_mask(requested_mask, online_mask, online_mask)?;
         let previous_mask =
-            Self::admitted_mask(self.process_affinity_masks[current_slot], online_mask)
+            Self::admitted_mask(self.slot_affinity_snapshot(current_slot).1, online_mask)
                 .ok_or(AffinityError::InvalidMask)?;
 
         let mut reschedule_required = false;
@@ -171,9 +171,7 @@ impl Scheduler {
             );
             matched += 1;
             let migrate = self.migration_required(slot, requested);
-            self.process_affinity_masks[slot] = requested;
-            self.task_affinity_masks[slot] = requested;
-            self.affinity_migration_pending[slot] = migrate;
+            self.replace_slot_affinity(slot, requested, requested, migrate);
             #[cfg(not(test))]
             if migrate {
                 self.rehome_runqueue_slot(slot);
@@ -196,14 +194,14 @@ impl Scheduler {
         online_mask: u64,
     ) -> Result<AffinityCommit, AffinityError> {
         let slot = self.resolve_current_process_task(0, UserAbi::Windows)?;
-        let process_mask = Self::admitted_mask(self.process_affinity_masks[slot], online_mask)
+        let (_, stored_process_mask, _) = self.slot_affinity_snapshot(slot);
+        let process_mask = Self::admitted_mask(stored_process_mask, online_mask)
             .ok_or(AffinityError::InvalidMask)?;
         let requested = Self::validate_requested_mask(requested_mask, online_mask, process_mask)?;
-        let previous_mask = Self::admitted_mask(self.task_affinity_masks[slot], online_mask)
+        let previous_mask = Self::admitted_mask(self.slot_affinity_snapshot(slot).0, online_mask)
             .ok_or(AffinityError::InvalidMask)?;
         let reschedule_required = self.migration_required(slot, requested);
-        self.task_affinity_masks[slot] = requested;
-        self.affinity_migration_pending[slot] = reschedule_required;
+        self.replace_slot_affinity(slot, requested, stored_process_mask, reschedule_required);
         #[cfg(not(test))]
         if reschedule_required {
             self.rehome_runqueue_slot(slot);
@@ -228,9 +226,7 @@ impl Scheduler {
             task_mask & !process_mask == 0,
             "scheduler invariant: initial task affinity escapes process mask"
         );
-        self.task_affinity_masks[slot] = task_mask;
-        self.process_affinity_masks[slot] = process_mask;
-        self.affinity_migration_pending[slot] = false;
+        self.initialize_slot_affinity_payload(slot, task_mask, process_mask);
     }
 
     pub(super) fn inherited_process_affinity(&self, parent_process_id: Option<u64>) -> u64 {
@@ -243,30 +239,23 @@ impl Scheduler {
             .find_map(|(slot, context)| {
                 context
                     .filter(|context| context.process_id == Some(parent_process_id))
-                    .map(|_| self.process_affinity_masks[slot])
+                    .map(|_| self.slot_affinity_snapshot(slot).1)
             })
             .unwrap_or(UNRESTRICTED_CPU_MASK)
     }
 
     pub(super) fn current_affinity_for_child_thread(&self) -> (u64, u64) {
-        (
-            self.task_affinity_masks[self.current_task_slot()],
-            self.process_affinity_masks[self.current_task_slot()],
-        )
+        let (task_mask, process_mask, _) = self.slot_affinity_snapshot(self.current_task_slot());
+        (task_mask, process_mask)
     }
 
     pub(super) fn exec_affinity_snapshot(&self, slot: usize) -> (u64, u64, bool) {
-        let task_mask = self.task_affinity_masks[slot];
-        let process_mask = self.process_affinity_masks[slot];
+        let (task_mask, process_mask, migration_pending) = self.slot_affinity_snapshot(slot);
         assert!(
             task_mask != 0 && process_mask != 0 && task_mask & !process_mask == 0,
             "scheduler invariant: exec target has invalid affinity state"
         );
-        (
-            task_mask,
-            process_mask,
-            self.affinity_migration_pending[slot],
-        )
+        (task_mask, process_mask, migration_pending)
     }
 
     pub(super) fn assert_exec_affinity_preserved(&self, slot: usize, expected: (u64, u64, bool)) {
@@ -282,15 +271,17 @@ impl Scheduler {
         let bit = 1_u64
             .checked_shl(u32::try_from(logical_cpu).expect("logical CPU index overflow"))
             .expect("logical CPU index exceeds affinity mask");
+        let (task_mask, _, migration_pending) =
+            self.slot_affinity_snapshot(self.current_task_slot());
         assert!(
-            self.task_affinity_masks[self.current_task_slot()] & bit != 0,
+            task_mask & bit != 0,
             "scheduler invariant: task {} dispatched on excluded logical CPU {} mask={:#x} migration_pending={}",
             self.starts[self.current_task_slot()]
                 .map(|start| start.id)
                 .unwrap_or(0),
             logical_cpu,
-            self.task_affinity_masks[self.current_task_slot()],
-            self.affinity_migration_pending[self.current_task_slot()],
+            task_mask,
+            migration_pending,
         );
     }
 }

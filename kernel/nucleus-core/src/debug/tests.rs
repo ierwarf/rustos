@@ -134,6 +134,7 @@ fn milestone_frame_is_complete_self_framed_and_checksum_verified() {
         name: "smp-cpu-first-user-dispatch",
         arg0: 5,
         arg1: 7,
+        executable_snapshot_evidence: None,
     };
     let mut line = FixedDebugconLine::<MILESTONE_DEBUGCON_LINE_CAPACITY>::new();
     milestone_frame::render_milestone_debugcon_line(
@@ -176,12 +177,46 @@ fn milestone_render_overflow_is_an_explicit_failure_before_publication() {
         name: "smp-cpu-first-user-dispatch",
         arg0: 4,
         arg1: 5,
+        executable_snapshot_evidence: None,
     };
     let mut line = FixedDebugconLine::<8>::new();
     assert!(
         milestone_frame::render_milestone_debugcon_line(&mut line, 6, record, None, 7, 8).is_err(),
         "a milestone that cannot fit must fail before print_bytes_unlocked is reachable"
     );
+}
+
+#[test]
+fn product_snapshot_frame_binds_every_dvm_identity_field_under_the_checksum() {
+    let record = MilestoneRecord {
+        seq: 29,
+        ts_us: 31,
+        tick: 37,
+        category: LogCategory::Compat,
+        name: "product-executable-snapshot-sealed",
+        arg0: 5,
+        arg1: 7,
+        executable_snapshot_evidence: Some(
+            product_snapshot_evidence::ProductExecutableSnapshotEvidence {
+                provider_service_id: 2,
+                provider_generation: 3,
+                storage_epoch: 4,
+                mount_generation: 7,
+                request_id: 8,
+                digest: [0x5a; 32],
+            },
+        ),
+    };
+    let mut line = FixedDebugconLine::<MILESTONE_DEBUGCON_LINE_CAPACITY>::new();
+    milestone_frame::render_milestone_debugcon_line(&mut line, 41, record, None, 0, 0).unwrap();
+    let rendered = core::str::from_utf8(line.bytes()).unwrap();
+    assert!(rendered.contains("backing=dvm-volume provider_service=2 provider_generation=3 storage_epoch=4 mount_generation=7 request_id=8 sha256=5a"));
+    assert!(verify_milestone_debugcon_line(line.bytes()));
+    let mut tampered = line.bytes().to_vec();
+    let storage_epoch =
+        milestone_frame::find_debugcon_bytes(&tampered, b"storage_epoch=4").unwrap();
+    tampered[storage_epoch + "storage_epoch=".len()] = b'9';
+    assert!(!verify_milestone_debugcon_line(&tampered));
 }
 
 #[test]

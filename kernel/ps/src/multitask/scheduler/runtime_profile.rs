@@ -327,9 +327,18 @@ pub fn drain_scheduler_runtime_profile() -> usize {
     // The miss side of the same split, by cause. Each arg1 repeats the same
     // attempt count as the hits line above, so every row is self-contained.
     for (reason_count, name) in [
-        (profile.sync_handoff_misses[0], "kernel-scheduler-step-sync-miss-empty"),
-        (profile.sync_handoff_misses[1], "kernel-scheduler-step-sync-miss-streak"),
-        (profile.sync_handoff_misses[2], "kernel-scheduler-step-sync-miss-stale"),
+        (
+            profile.sync_handoff_misses[0],
+            "kernel-scheduler-step-sync-miss-empty",
+        ),
+        (
+            profile.sync_handoff_misses[1],
+            "kernel-scheduler-step-sync-miss-streak",
+        ),
+        (
+            profile.sync_handoff_misses[2],
+            "kernel-scheduler-step-sync-miss-stale",
+        ),
     ] {
         crate::debug::record_milestone(
             crate::debug::LogCategory::Sched,
@@ -344,9 +353,18 @@ pub fn drain_scheduler_runtime_profile() -> usize {
     // Per-discard, not per-dispatch: one attempt can discard more than one.
     let drained_stale = profile.sync_handoff_misses[2];
     for (stale_count, name) in [
-        (profile.sync_handoff_stale[0], "kernel-scheduler-step-sync-stale-identity"),
-        (profile.sync_handoff_stale[1], "kernel-scheduler-step-sync-stale-custody"),
-        (profile.sync_handoff_stale[2], "kernel-scheduler-step-sync-stale-not-candidate"),
+        (
+            profile.sync_handoff_stale[0],
+            "kernel-scheduler-step-sync-stale-identity",
+        ),
+        (
+            profile.sync_handoff_stale[1],
+            "kernel-scheduler-step-sync-stale-custody",
+        ),
+        (
+            profile.sync_handoff_stale[2],
+            "kernel-scheduler-step-sync-stale-not-candidate",
+        ),
     ] {
         crate::debug::record_milestone(
             crate::debug::LogCategory::Sched,
@@ -358,8 +376,14 @@ pub fn drain_scheduler_runtime_profile() -> usize {
     // Arm-side outcome, split by which direction armed it. arg0=accepted,
     // arg1=rejected. Tests whether a round trip's hint shortfall is one-sided.
     for ((accepted, rejected), name) in [
-        (profile.sync_handoff_arms[0], "kernel-scheduler-step-sync-arm-call"),
-        (profile.sync_handoff_arms[1], "kernel-scheduler-step-sync-arm-reply"),
+        (
+            profile.sync_handoff_arms[0],
+            "kernel-scheduler-step-sync-arm-call",
+        ),
+        (
+            profile.sync_handoff_arms[1],
+            "kernel-scheduler-step-sync-arm-reply",
+        ),
     ] {
         crate::debug::record_milestone(crate::debug::LogCategory::Sched, name, accepted, rejected);
     }
@@ -793,7 +817,16 @@ impl Scheduler {
                 super::locality::take_sync_handoff_generation_fail_state_window(),
             phase_ns: self.runtime_profile_phase_ns,
             runnable_samples: self.runtime_profile_runnable_samples,
-            live_ipc_donations: self.ipc_priority_donation_len as u64,
+            live_ipc_donations: {
+                #[cfg(not(test))]
+                {
+                    super::donation_ledger::live_len() as u64
+                }
+                #[cfg(test)]
+                {
+                    self.ipc_priority_donation_len as u64
+                }
+            },
             divergent_identity_slot: self.divergent_published_identity().unwrap_or(usize::MAX),
             run_authority_divergence: {
                 // Sweep before taking the window so a position no publication
@@ -883,13 +916,16 @@ mod tests {
     fn profile_context(address_space_root: u64) -> TaskContext {
         TaskContext {
             saved_rsp: 0,
-            ready: true,
+            #[cfg(test)]
+            test_ready: true,
             ready_since_ticks: 0,
             blocked: false,
             blocked_since_ticks: 0,
             wake_armed: false,
             weight: NICE_0_LOAD,
+            #[cfg(test)]
             vruntime_ns: 0,
+            #[cfg(test)]
             exec_start_ticks: 0,
             address_space_root,
             kernel_stack_base: 0,
@@ -959,10 +995,10 @@ mod tests {
             sync_handoff_misses: [0; super::locality::SYNC_HANDOFF_MISS_REASON_COUNT],
             sync_handoff_stale: [0; super::locality::SYNC_HANDOFF_STALE_REASON_COUNT],
             sync_handoff_arms: [(0, 0); super::locality::SYNC_HANDOFF_ARM_SITE_COUNT],
-            sync_handoff_reply_custody_fail:
-                [0; super::locality::SYNC_HANDOFF_REPLY_CUSTODY_FAIL_REASON_COUNT],
-            sync_handoff_generation_fail_state:
-                [0; super::locality::SYNC_HANDOFF_GENERATION_FAIL_STATE_COUNT],
+            sync_handoff_reply_custody_fail: [0;
+                super::locality::SYNC_HANDOFF_REPLY_CUSTODY_FAIL_REASON_COUNT],
+            sync_handoff_generation_fail_state: [0;
+                super::locality::SYNC_HANDOFF_GENERATION_FAIL_STATE_COUNT],
             phase_ns: [0; SCHEDULER_PHASE_COUNT],
             runnable_samples: 0,
             live_ipc_donations: 0,

@@ -197,6 +197,14 @@ fn decode_handle<const N: usize>(handle: u64) -> Option<(usize, u64)> {
     (index < N).then_some((index, generation))
 }
 
+/// Decodes the stable, nonzero slot and generation carried by a valid-shaped
+/// slab handle. This is an identity adapter only: callers must still use the
+/// slab operation that validates a live object at that generation.
+pub(super) fn identity_components<const N: usize>(handle: u64) -> Option<(u64, u64)> {
+    let (index, generation) = decode_handle::<N>(handle)?;
+    Some((index as u64 + 1, generation))
+}
+
 #[cfg(test)]
 mod tests {
     use super::GenerationalSlab;

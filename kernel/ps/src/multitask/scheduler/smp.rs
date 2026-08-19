@@ -182,13 +182,13 @@ impl Scheduler {
         let affinity_bit = 1_u64
             .checked_shl(u32::try_from(current_cpu).expect("logical CPU index overflow"))
             .expect("logical CPU index exceeds affinity mask");
-        if self.task_affinity_masks[slot] & affinity_bit == 0 {
+        if self.slot_affinity_snapshot(slot).0 & affinity_bit == 0 {
             return false;
         }
         !self.job_stopped[slot]
             && !self.exec_target_quiesced[slot]
             && self
-                .context_validation_error(slot, context, context.saved_rsp)
+                .context_validation_error(slot, context, self.slot_saved_rsp(slot))
                 .is_none()
     }
 
@@ -216,12 +216,13 @@ impl Scheduler {
         let target_bit = 1_u64
             .checked_shl(u32::try_from(target_cpu).expect("logical CPU index overflow"))
             .expect("logical CPU index exceeds affinity mask");
-        if self.task_affinity_masks[slot] & self.process_affinity_masks[slot] & target_bit == 0 {
+        let (task_mask, process_mask, _) = self.slot_affinity_snapshot(slot);
+        if task_mask & process_mask & target_bit == 0 {
             return false;
         }
         self.handoff_slot_ready(slot)
             && self
-                .context_validation_error(slot, context, context.saved_rsp)
+                .context_validation_error(slot, context, self.slot_saved_rsp(slot))
                 .is_none()
     }
 
@@ -280,19 +281,27 @@ impl Scheduler {
         }
         let now = crate::arch::rtc::ticks();
         self.contexts[slot] = Some(TaskContext {
+            #[cfg(test)]
             saved_rsp: 0,
-            ready: false,
+            #[cfg(test)]
+            test_ready: false,
             ready_since_ticks: 0,
             blocked: false,
             blocked_since_ticks: 0,
             wake_armed: false,
             weight: NICE_0_LOAD,
+            #[cfg(test)]
             vruntime_ns: 0,
+            #[cfg(test)]
             exec_start_ticks: now,
             address_space_root: crate::memory::paging::kernel_root_phys().as_u64(),
+            #[cfg(test)]
             kernel_stack_base: raw_stack_base + TASK_STACK_GUARD_BYTES as u64,
+            #[cfg(test)]
             kernel_stack_top: stack_top,
+            #[cfg(test)]
             alternate_kernel_stack_base: 0,
+            #[cfg(test)]
             alternate_kernel_stack_top: 0,
             user_mode: false,
             user_abi: None,
@@ -302,6 +311,16 @@ impl Scheduler {
             user_stack: None,
             windows_thread_state: None,
         });
+        self.initialize_slot_vruntime(slot, 0);
+        self.initialize_slot_exec_start_ticks(slot, now);
+        self.initialize_slot_saved_rsp(slot, 0);
+        self.initialize_slot_kernel_stack_bounds(
+            slot,
+            raw_stack_base + TASK_STACK_GUARD_BYTES as u64,
+            stack_top,
+        );
+        self.initialize_slot_alternate_kernel_stack_bounds(slot);
+        self.initialize_slot_simd_state(slot);
         self.starts[slot] = Some(TaskStart { entry, id });
         self.publish_slot_identity(slot);
         self.idle_cpu[slot] = logical_index;
@@ -336,12 +355,13 @@ impl Scheduler {
             !context.user_mode
                 && !self.slot_is_runnable(expected_slot)
                 && !context.blocked
-                && context.saved_rsp == 0,
+                && self.slot_saved_rsp(expected_slot) == 0,
             "secondary CPU idle bootstrap state is inconsistent"
         );
         crate::memory::paging::load_address_space_phys(PhysAddr::new(context.address_space_root));
-        crate::arch::gdt::set_privilege_stack(context.kernel_stack_top);
-        crate::user::syscall::set_kernel_stack_top(context.kernel_stack_top);
+        let (_, kernel_stack_top) = self.slot_kernel_stack_bounds(expected_slot);
+        crate::arch::gdt::set_privilege_stack(kernel_stack_top);
+        crate::user::syscall::set_kernel_stack_top(kernel_stack_top);
         let task_id = self.starts[expected_slot]
             .map(|start| start.id)
             .expect("secondary idle task is missing identity");

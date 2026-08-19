@@ -18,7 +18,7 @@ def load_scenario(registry: Path, topology: str) -> list[dict[str, object]]:
         if not line or line.startswith("#"):
             continue
         fields = line.split("\t")
-        if len(fields) != 11:
+        if len(fields) != 12:
             raise ValueError(
                 f"{registry}:{line_number} has {len(fields)} scenario fields"
             )
@@ -34,8 +34,9 @@ def load_scenario(registry: Path, topology: str) -> list[dict[str, object]]:
             "model": fields[6],
             "log": fields[7],
             "marker": fields[8],
-            "requires": [item for item in fields[9].split(",") if item],
-            "deadline_ms": int(fields[10]),
+            "evidence": fields[9],
+            "requires": [item for item in fields[10].split(",") if item],
+            "deadline_ms": int(fields[11]),
         }
         candidates.setdefault(fields[0], []).append(record)
     if len(candidates) != 1:
@@ -97,6 +98,7 @@ def main() -> int:
     args = parser.parse_args()
 
     failures: list[str] = []
+    legacy_schema = False
     overshoot: list[str] = []
     events: list[dict[str, object]] = []
     try:
@@ -124,6 +126,7 @@ def main() -> int:
                 "model",
                 "log",
                 "marker",
+                "evidence",
                 "requires",
                 "outcome",
                 "guest_ts_us",
@@ -138,9 +141,20 @@ def main() -> int:
                 "dvm_manifest_sha256",
             }
             missing = sorted(required - event.keys())
-            if missing:
+            if event.get("schema") == "rustos-formal-runtime-event-v4":
+                # The old frame cannot satisfy a newly added source-identity
+                # contract. Preserve it only long enough to classify it stale;
+                # never let it become a current acceptance trace.
+                if missing not in ([], ["evidence"]):
+                    raise ValueError(f"missing fields {missing}")
+                legacy_schema = True
+                event["evidence"] = "legacy-v4"
+            elif missing:
                 raise ValueError(f"missing fields {missing}")
-            if event["schema"] != "rustos-formal-runtime-event-v4":
+            if event["schema"] not in {
+                "rustos-formal-runtime-event-v4",
+                "rustos-formal-runtime-event-v5",
+            }:
                 raise ValueError("unsupported schema")
             if event["topology"] != args.topology:
                 raise ValueError("event topology differs from selected topology")
@@ -229,7 +243,7 @@ def main() -> int:
             f"trace event count {len(events)} differs from scenario {len(scenario)}"
         )
     for index, (event, expected) in enumerate(zip(events, scenario)):
-        for field in (
+        compared_fields = (
             "scenario",
             "topology",
             "sequence",
@@ -239,9 +253,13 @@ def main() -> int:
             "model",
             "log",
             "marker",
+            "evidence",
             "requires",
             "deadline_ms",
-        ):
+        )
+        for field in compared_fields:
+            if legacy_schema and field == "evidence":
+                continue
             if event[field] != expected[field]:
                 failures.append(
                     f"event {index} {field}={event[field]!r}, expected {expected[field]!r}"
@@ -260,6 +278,8 @@ def main() -> int:
         ).read_bytes()
     ).hexdigest()
     stale_inputs: list[str] = []
+    if legacy_schema:
+        stale_inputs.append("trace uses legacy v4 schema without versioned evidence contract")
     if events:
         for field, current in (
             ("source_tree_sha256", current_source_sha256),
@@ -271,7 +291,7 @@ def main() -> int:
     if stale_inputs and not args.classify_stale:
         failures.extend(stale_inputs)
     summary = {
-        "schema": "rustos-kvm-formal-trace-evidence-v4",
+        "schema": "rustos-kvm-formal-trace-evidence-v5",
         "status": (
             "failed"
             if failures

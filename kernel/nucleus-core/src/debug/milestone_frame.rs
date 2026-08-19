@@ -2,13 +2,19 @@ use core::fmt;
 use core::fmt::Write as _;
 
 use super::{
-    CurrentUserLogContext, FixedDebugconLine, MilestoneRecord, SYNTHETIC_WARNING_MODULE_PATH,
-    fnv1a64,
+    CurrentUserLogContext, FNV1A64_OFFSET_BASIS, FNV1A64_PRIME, FixedDebugconLine, MilestoneRecord,
+    SYNTHETIC_WARNING_MODULE_PATH,
 };
 
 const MILESTONE_FRAME_PREFIX: &str = "milestone-begin v=1 ";
 const MILESTONE_CHECKSUM_PREFIX: &str = " checksum=";
 const MILESTONE_FRAME_SUFFIX: &str = " milestone-end\"\r\n";
+
+pub(super) fn fnv1a64(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(FNV1A64_OFFSET_BASIS, |checksum, byte| {
+        (checksum ^ u64::from(*byte)).wrapping_mul(FNV1A64_PRIME)
+    })
+}
 
 fn write_optional_debug_id<const N: usize>(
     line: &mut FixedDebugconLine<N>,
@@ -18,6 +24,29 @@ fn write_optional_debug_id<const N: usize>(
         Some(value) => write!(line, "{value}"),
         None => line.write_str("-"),
     }
+}
+
+fn write_hex_bytes<const N: usize>(line: &mut FixedDebugconLine<N>, bytes: &[u8]) -> fmt::Result {
+    for byte in bytes {
+        write!(line, "{byte:02x}")?;
+    }
+    Ok(())
+}
+
+fn write_executable_snapshot_evidence<const N: usize>(
+    line: &mut FixedDebugconLine<N>,
+    evidence: super::product_snapshot_evidence::ProductExecutableSnapshotEvidence,
+) -> fmt::Result {
+    write!(
+        line,
+        " evidence_v=1 backing=dvm-volume provider_service={} provider_generation={} storage_epoch={} mount_generation={} request_id={} sha256=",
+        evidence.provider_service_id,
+        evidence.provider_generation,
+        evidence.storage_epoch,
+        evidence.mount_generation,
+        evidence.request_id,
+    )?;
+    write_hex_bytes(line, &evidence.digest)
 }
 
 /// Renders one self-framing milestone record into a fixed buffer.
@@ -70,6 +99,9 @@ pub(super) fn render_milestone_debugcon_line<const N: usize>(
         " dropped={} discarded_bytes={}",
         milestones_dropped, discarded_bytes
     )?;
+    if let Some(evidence) = record.executable_snapshot_evidence {
+        write_executable_snapshot_evidence(line, evidence)?;
+    }
     let checksum = fnv1a64(&line.bytes()[semantic_start..]);
     write!(line, "{MILESTONE_CHECKSUM_PREFIX}{checksum:016x}")?;
     line.write_str(MILESTONE_FRAME_SUFFIX)

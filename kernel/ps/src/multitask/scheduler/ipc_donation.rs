@@ -1,14 +1,16 @@
 //! Reply-owned IPC priority donation.
 //!
 //! - **Owner:** one live reply capability owns at most one donation record;
-//!   the scheduler owns the fixed-capacity table and the derived class floor.
+//!   `SchedulerDonation` owns the bounded ledger while the scheduler resolves
+//!   task identity and dispatch reads the receiver's derived floor.
 //! - **Boundary:** the compat IPC boundary supplies exact reply, donor, and
 //!   receiver identities. A process id is admitted only long enough to select
 //!   one concrete eligible worker; it never becomes the donation target.
 //! - **Lifecycle:** reserve on call admission, bind to the exact receiving
 //!   worker at receive commit, then revoke on the first terminal event
 //!   (reply, cancel, donor exit, worker exit, or process teardown).
-//! - **Concurrency:** the scheduler raw lock serializes the table; the
+//! - **Concurrency:** `SchedulerDonation` serializes reply-edge mutation;
+//!   dispatch observes only its receiver-slot inheritance counter. The
 //!   selected worker's direct handoff is enqueued on that worker's own CPU
 //!   dispatch policy, never on a system-wide hint.
 //! - **Failure:** exhausted capacity fails admission closed instead of
@@ -56,7 +58,7 @@ impl Scheduler {
             })
             .min_by_key(|slot| {
                 self.contexts[*slot]
-                    .map(|context| (context.vruntime_ns, *slot))
+                    .map(|_| (self.slot_vruntime(*slot), *slot))
                     .unwrap_or((u64::MAX, *slot))
             })
     }
@@ -106,43 +108,63 @@ impl Scheduler {
     /// reply capability or removes a receive waiter. The caller task is the
     /// temporary unique identity until the reply and worker are both known.
     pub(in crate::multitask) fn reserve_ipc_priority(&mut self, donor_task_id: u64) -> bool {
-        let Some(donor_slot) = self.find_task_slot(donor_task_id) else {
-            return false;
-        };
-        if self.retired[donor_slot]
-            || self.ipc_priority_donations[..self.ipc_priority_donation_len]
-                .iter()
-                .flatten()
-                .any(|entry| entry.reply == 0 && entry.donor_task_id == donor_task_id)
+        #[cfg(not(test))]
         {
-            return false;
+            let Some(donor_slot) = self.find_task_slot(donor_task_id) else {
+                return false;
+            };
+            return !self.retired[donor_slot] && super::donation_ledger::reserve(donor_task_id);
         }
-        if !self.ipc_priority_donation_capacity_available() {
-            return false;
+        #[cfg(test)]
+        {
+            let Some(donor_slot) = self.find_task_slot(donor_task_id) else {
+                return false;
+            };
+            if self.retired[donor_slot]
+                || self.ipc_priority_donations[..self.ipc_priority_donation_len]
+                    .iter()
+                    .flatten()
+                    .any(|entry| entry.reply == 0 && entry.donor_task_id == donor_task_id)
+            {
+                return false;
+            }
+            if !self.ipc_priority_donation_capacity_available() {
+                return false;
+            }
+            self.ipc_priority_donations[self.ipc_priority_donation_len] =
+                Some(IpcPriorityDonation {
+                    reply: 0,
+                    donor_task_id,
+                    target: IpcDonationTarget::AwaitingReceiver,
+                });
+            self.ipc_priority_donation_len += 1;
+            true
         }
-        self.ipc_priority_donations[self.ipc_priority_donation_len] = Some(IpcPriorityDonation {
-            reply: 0,
-            donor_task_id,
-            target: IpcDonationTarget::AwaitingReceiver,
-        });
-        self.ipc_priority_donation_len += 1;
-        true
     }
 
     pub(in crate::multitask) fn cancel_ipc_priority_reservation(
         &mut self,
         donor_task_id: u64,
     ) -> bool {
-        let Some(index) = self.ipc_priority_donations[..self.ipc_priority_donation_len]
-            .iter()
-            .position(|entry| {
-                entry.is_some_and(|entry| entry.reply == 0 && entry.donor_task_id == donor_task_id)
-            })
-        else {
-            return false;
-        };
-        self.remove_ipc_priority_donation(index);
-        true
+        #[cfg(not(test))]
+        {
+            return super::donation_ledger::cancel_reservation(donor_task_id);
+        }
+        #[cfg(test)]
+        {
+            let Some(index) = self.ipc_priority_donations[..self.ipc_priority_donation_len]
+                .iter()
+                .position(|entry| {
+                    entry.is_some_and(|entry| {
+                        entry.reply == 0 && entry.donor_task_id == donor_task_id
+                    })
+                })
+            else {
+                return false;
+            };
+            self.remove_ipc_priority_donation(index);
+            true
+        }
     }
 
     /// Transfers a pre-enqueue reservation to the exact reply when no worker
@@ -154,23 +176,32 @@ impl Scheduler {
         reply: u64,
         donor_task_id: u64,
     ) -> bool {
-        if reply == 0 {
-            return false;
+        #[cfg(not(test))]
+        {
+            return super::donation_ledger::attach(reply, donor_task_id);
         }
-        let Some(entry) = self.ipc_priority_donations[..self.ipc_priority_donation_len]
-            .iter_mut()
-            .find(|entry| {
-                entry.is_some_and(|entry| entry.reply == 0 && entry.donor_task_id == donor_task_id)
-            })
-        else {
-            return false;
-        };
-        *entry = Some(IpcPriorityDonation {
-            reply,
-            donor_task_id,
-            target: IpcDonationTarget::AwaitingReceiver,
-        });
-        true
+        #[cfg(test)]
+        {
+            if reply == 0 {
+                return false;
+            }
+            let Some(entry) = self.ipc_priority_donations[..self.ipc_priority_donation_len]
+                .iter_mut()
+                .find(|entry| {
+                    entry.is_some_and(|entry| {
+                        entry.reply == 0 && entry.donor_task_id == donor_task_id
+                    })
+                })
+            else {
+                return false;
+            };
+            *entry = Some(IpcPriorityDonation {
+                reply,
+                donor_task_id,
+                target: IpcDonationTarget::AwaitingReceiver,
+            });
+            true
+        }
     }
 
     pub(in crate::multitask) fn bind_reserved_ipc_priority(
@@ -179,29 +210,52 @@ impl Scheduler {
         donor_task_id: u64,
         receiver_task_id: u64,
     ) -> bool {
-        if reply == 0 || donor_task_id == receiver_task_id {
-            return false;
+        #[cfg(not(test))]
+        {
+            if reply == 0 || donor_task_id == receiver_task_id {
+                return false;
+            }
+            let Some(receiver_slot) = self.find_task_slot(receiver_task_id) else {
+                return false;
+            };
+            if self.retired[receiver_slot] {
+                return false;
+            }
+            return super::donation_ledger::bind_reserved(
+                reply,
+                donor_task_id,
+                receiver_task_id,
+                receiver_slot,
+            );
         }
-        let Some(receiver_slot) = self.find_task_slot(receiver_task_id) else {
-            return false;
-        };
-        if self.retired[receiver_slot] {
-            return false;
+        #[cfg(test)]
+        {
+            if reply == 0 || donor_task_id == receiver_task_id {
+                return false;
+            }
+            let Some(receiver_slot) = self.find_task_slot(receiver_task_id) else {
+                return false;
+            };
+            if self.retired[receiver_slot] {
+                return false;
+            }
+            let Some(entry) = self.ipc_priority_donations[..self.ipc_priority_donation_len]
+                .iter_mut()
+                .find(|entry| {
+                    entry.is_some_and(|entry| {
+                        entry.reply == 0 && entry.donor_task_id == donor_task_id
+                    })
+                })
+            else {
+                return false;
+            };
+            *entry = Some(IpcPriorityDonation {
+                reply,
+                donor_task_id,
+                target: IpcDonationTarget::BoundWorker(receiver_task_id),
+            });
+            true
         }
-        let Some(entry) = self.ipc_priority_donations[..self.ipc_priority_donation_len]
-            .iter_mut()
-            .find(|entry| {
-                entry.is_some_and(|entry| entry.reply == 0 && entry.donor_task_id == donor_task_id)
-            })
-        else {
-            return false;
-        };
-        *entry = Some(IpcPriorityDonation {
-            reply,
-            donor_task_id,
-            target: IpcDonationTarget::BoundWorker(receiver_task_id),
-        });
-        true
     }
 
     /// Makes `receiver_task_id` inherit the effective strict scheduling class
@@ -245,29 +299,49 @@ impl Scheduler {
         donor_task_id: u64,
         receiver_task_id: u64,
     ) -> bool {
-        if let Some(entry) = self.ipc_priority_donations[..self.ipc_priority_donation_len]
-            .iter_mut()
-            .flatten()
-            .find(|entry| entry.reply == reply)
+        #[cfg(not(test))]
         {
-            entry.donor_task_id = donor_task_id;
-            entry.target = IpcDonationTarget::BoundWorker(receiver_task_id);
-            return true;
+            let Some(receiver_slot) = self.find_task_slot(receiver_task_id) else {
+                return false;
+            };
+            if self.retired[receiver_slot] {
+                return false;
+            }
+            return super::donation_ledger::upsert(
+                reply,
+                donor_task_id,
+                receiver_task_id,
+                receiver_slot,
+            );
         }
-        if !self.ipc_priority_donation_capacity_available() {
-            // The caller must fail admission before blocking. Silently losing
-            // donation here would violate the reply's scheduling contract.
-            return false;
+        #[cfg(test)]
+        {
+            if let Some(entry) = self.ipc_priority_donations[..self.ipc_priority_donation_len]
+                .iter_mut()
+                .flatten()
+                .find(|entry| entry.reply == reply)
+            {
+                entry.donor_task_id = donor_task_id;
+                entry.target = IpcDonationTarget::BoundWorker(receiver_task_id);
+                return true;
+            }
+            if !self.ipc_priority_donation_capacity_available() {
+                // The caller must fail admission before blocking. Silently losing
+                // donation here would violate the reply's scheduling contract.
+                return false;
+            }
+            self.ipc_priority_donations[self.ipc_priority_donation_len] =
+                Some(IpcPriorityDonation {
+                    reply,
+                    donor_task_id,
+                    target: IpcDonationTarget::BoundWorker(receiver_task_id),
+                });
+            self.ipc_priority_donation_len += 1;
+            true
         }
-        self.ipc_priority_donations[self.ipc_priority_donation_len] = Some(IpcPriorityDonation {
-            reply,
-            donor_task_id,
-            target: IpcDonationTarget::BoundWorker(receiver_task_id),
-        });
-        self.ipc_priority_donation_len += 1;
-        true
     }
 
+    #[cfg(test)]
     pub(super) fn ipc_priority_donation_capacity_available(&self) -> bool {
         self.ipc_priority_donation_len < MAX_TASK
     }
@@ -275,6 +349,7 @@ impl Scheduler {
     /// Revokes the donation associated with a completed or cancelled reply
     /// capability.  This is deliberately idempotent so reply/error/timeout
     /// races cannot leave an inherited System class behind.
+    #[cfg(test)]
     pub(in crate::multitask) fn release_ipc_priority(&mut self, reply: u64) -> bool {
         let mut released = false;
         let mut index = 0;
@@ -290,9 +365,16 @@ impl Scheduler {
     }
 
     pub(super) fn release_ipc_priorities_for_task(&mut self, task_id: u64) {
-        let mut index = 0;
-        while index < self.ipc_priority_donation_len {
-            if self.ipc_priority_donations[index].is_some_and(|entry| {
+        #[cfg(not(test))]
+        {
+            super::donation_ledger::release_task(task_id);
+            return;
+        }
+        #[cfg(test)]
+        {
+            let mut index = 0;
+            while index < self.ipc_priority_donation_len {
+                if self.ipc_priority_donations[index].is_some_and(|entry| {
                 entry.donor_task_id == task_id
                     || matches!(entry.target, IpcDonationTarget::BoundWorker(target) if target == task_id)
             }) {
@@ -300,29 +382,45 @@ impl Scheduler {
             } else {
                 index += 1;
             }
-        }
-    }
-
-    pub(in crate::multitask) fn release_ipc_priorities_for_process(&mut self, process_id: u64) {
-        let mut index = 0;
-        while index < self.ipc_priority_donation_len {
-            let Some(entry) = self.ipc_priority_donations[index] else {
-                panic!("scheduler donation prefix contains an empty entry");
-            };
-            if self.task_belongs_to_process(entry.donor_task_id, process_id)
-                || matches!(
-                    entry.target,
-                    IpcDonationTarget::BoundWorker(task_id)
-                        if self.task_belongs_to_process(task_id, process_id)
-                )
-            {
-                self.remove_ipc_priority_donation(index);
-            } else {
-                index += 1;
             }
         }
     }
 
+    pub(in crate::multitask) fn release_ipc_priorities_for_process(&mut self, process_id: u64) {
+        #[cfg(not(test))]
+        {
+            for slot in 0..MAX_TASK {
+                if self.contexts[slot].is_some_and(|context| context.process_id == Some(process_id))
+                    && let Some(start) = self.starts[slot]
+                {
+                    super::donation_ledger::release_task(start.id);
+                }
+            }
+            return;
+        }
+        #[cfg(test)]
+        {
+            let mut index = 0;
+            while index < self.ipc_priority_donation_len {
+                let Some(entry) = self.ipc_priority_donations[index] else {
+                    panic!("scheduler donation prefix contains an empty entry");
+                };
+                if self.task_belongs_to_process(entry.donor_task_id, process_id)
+                    || matches!(
+                        entry.target,
+                        IpcDonationTarget::BoundWorker(task_id)
+                            if self.task_belongs_to_process(task_id, process_id)
+                    )
+                {
+                    self.remove_ipc_priority_donation(index);
+                } else {
+                    index += 1;
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
     pub(super) fn remove_ipc_priority_donation(&mut self, index: usize) -> IpcPriorityDonation {
         assert!(index < self.ipc_priority_donation_len);
         self.ipc_priority_donation_len -= 1;
@@ -336,6 +434,7 @@ impl Scheduler {
         removed
     }
 
+    #[cfg(test)]
     pub(super) fn task_belongs_to_process(&self, task_id: u64, process_id: u64) -> bool {
         self.find_task_slot(task_id).is_some_and(|slot| {
             self.contexts[slot].is_some_and(|context| context.process_id == Some(process_id))
@@ -353,15 +452,17 @@ impl Scheduler {
         {
             return;
         }
-        let Some(current) = self.contexts[self.current_task_slot()] else {
+        if self.contexts[self.current_task_slot()].is_none() {
             return;
-        };
+        }
         if !self.is_fair_candidate_slot(target_slot)
             || !self.is_fair_candidate_slot(self.current_task_slot())
         {
             return;
         }
-        let caller_floor = current.vruntime_ns.saturating_sub(IPC_DONATION_BONUS_NS);
+        let caller_floor = self
+            .slot_vruntime(self.current_task_slot())
+            .saturating_sub(IPC_DONATION_BONUS_NS);
         let class_floor = self
             .slot_class(target_slot)
             .map(|class| {
@@ -370,8 +471,8 @@ impl Scheduler {
             })
             .unwrap_or(caller_floor);
         let donated_floor = caller_floor.min(class_floor);
-        if let Some(target) = self.contexts[target_slot].as_mut() {
-            target.vruntime_ns = target.vruntime_ns.min(donated_floor);
+        if self.contexts[target_slot].is_some() {
+            self.lower_slot_vruntime_ceiling(target_slot, donated_floor);
         }
     }
 }

@@ -127,21 +127,16 @@ impl SyncHandoffRecord {
                     );
                     return false;
                 }
-                if !owner.runnable {
+                if !runqueue::is_handoff_dispatchable_owner(owner) {
                     #[cfg(rustos_scheduler_phase_profile)]
-                    super::locality::record_sync_handoff_reply_custody_fail(
-                        super::locality::SyncHandoffReplyCustodyFailReason::NotRunnable,
-                    );
-                    return false;
-                }
-                if !matches!(
-                    owner.state,
-                    runqueue::RunOwnerState::Local | runqueue::RunOwnerState::RemoteQueued
-                ) {
-                    #[cfg(rustos_scheduler_phase_profile)]
-                    super::locality::record_sync_handoff_reply_custody_fail(
-                        super::locality::SyncHandoffReplyCustodyFailReason::State,
-                    );
+                    {
+                        let reason = if owner.runnable {
+                            super::locality::SyncHandoffReplyCustodyFailReason::State
+                        } else {
+                            super::locality::SyncHandoffReplyCustodyFailReason::NotRunnable
+                        };
+                        super::locality::record_sync_handoff_reply_custody_fail(reason);
+                    }
                     return false;
                 }
                 true
@@ -284,7 +279,9 @@ impl SyncHandoffState {
             }
         }
         #[cfg(rustos_scheduler_phase_profile)]
-        super::locality::record_sync_handoff_miss(super::locality::SyncHandoffMissReason::DrainedStale);
+        super::locality::record_sync_handoff_miss(
+            super::locality::SyncHandoffMissReason::DrainedStale,
+        );
         None
     }
 

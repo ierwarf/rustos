@@ -22,9 +22,9 @@ use rustos_user_abi::syscall::{
 };
 
 mod catalog;
+mod kvm_smp_qualification;
 mod launch_worker;
 mod offload;
-mod kvm_smp_qualification;
 mod session;
 mod socket;
 mod spawn;
@@ -464,7 +464,8 @@ fn report_idle_overshoot(elapsed: Duration, budget: Duration) {
     const EARLY_SAMPLES: u64 = 16;
     // A wait may legitimately return a little late; only a wait that outruns
     // its budget by more than the readiness class it serves is a finding.
-    let slack = Duration::from_millis(rustos_user_abi::performance::IPC_READINESS_QUERY_HARD_LIMIT_MS);
+    let slack =
+        Duration::from_millis(rustos_user_abi::performance::IPC_READINESS_QUERY_HARD_LIMIT_MS);
     if elapsed <= budget + slack {
         return;
     }

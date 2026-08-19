@@ -38,7 +38,10 @@ use crate::ipc_core::SharedRegionHandle;
 use crate::ipc_core::{
     ChannelHandle, EventHandle, IpcHeader, PORT_NAME_CAPACITY, PortHandle, PortName,
 };
-use kernel_object::api::handle::{HandleRights, HandleToken};
+use kernel_object::api::{
+    handle::{HandleRights, HandleToken},
+    identity::{ObjectIdentity, ObjectKind, ObjectOwner},
+};
 use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
 #[cfg(test)]
 use spin::Mutex;
@@ -161,6 +164,16 @@ impl KernelEndpointHandle {
     pub const fn raw(&self) -> u64 {
         self.raw
     }
+
+    /// Stable endpoint identity decoded from the generational wire handle.
+    ///
+    /// `Some` means the raw value has a valid shape for the endpoint slab;
+    /// it does not establish that the endpoint remains live. Every operation
+    /// continues to validate this generation against `ENDPOINTS`.
+    pub fn identity(&self) -> Option<ObjectIdentity> {
+        let (slot, generation) = slab::identity_components::<MAX_ENDPOINT_OBJECTS>(self.raw)?;
+        ObjectIdentity::new(ObjectOwner::Ipc, ObjectKind::Endpoint, slot, generation)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -175,6 +188,15 @@ impl KernelReplyHandle {
 
     pub const fn raw(&self) -> u64 {
         self.raw
+    }
+
+    /// Stable reply identity decoded from the generational wire handle.
+    ///
+    /// `Some` means the raw value has a valid shape for the reply slab; live
+    /// ownership and consumption remain checked by the reply operation.
+    pub fn identity(&self) -> Option<ObjectIdentity> {
+        let (slot, generation) = slab::identity_components::<MAX_REPLY_OBJECTS>(self.raw)?;
+        ObjectIdentity::new(ObjectOwner::Ipc, ObjectKind::Reply, slot, generation)
     }
 }
 
@@ -192,25 +214,28 @@ pub struct KernelTransferredHandle {
 /// registry id or replaying a stale id after a future registry reuse.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KernelTransferTicket {
-    transfer_id: u64,
+    identity: ObjectIdentity,
     nonce: u64,
-    batch_generation: u64,
 }
 
 impl KernelTransferTicket {
     pub const fn new(transfer_id: u64, nonce: u64, batch_generation: u64) -> Option<Self> {
-        if transfer_id == 0 || nonce == 0 || batch_generation == 0 {
+        let Some(identity) = ObjectIdentity::new(
+            ObjectOwner::Ipc,
+            ObjectKind::Transfer,
+            transfer_id,
+            batch_generation,
+        ) else {
+            return None;
+        };
+        if nonce == 0 {
             return None;
         }
-        Some(Self {
-            transfer_id,
-            nonce,
-            batch_generation,
-        })
+        Some(Self { identity, nonce })
     }
 
     pub const fn transfer_id(self) -> u64 {
-        self.transfer_id
+        self.identity.slot()
     }
 
     pub const fn nonce(self) -> u64 {
@@ -218,7 +243,13 @@ impl KernelTransferTicket {
     }
 
     pub const fn batch_generation(self) -> u64 {
-        self.batch_generation
+        self.identity.generation()
+    }
+
+    /// Internal object identity; this is never serialized as a userspace
+    /// layout. The wire ticket remains the same opaque integer tuple.
+    pub const fn identity(self) -> ObjectIdentity {
+        self.identity
     }
 }
 
@@ -301,6 +332,16 @@ impl KernelTransferredHandle {
 
     pub const fn rights(self) -> HandleRights {
         self.rights
+    }
+
+    /// Derive an IPC descriptor with no authority beyond the source typed
+    /// rights. The opaque transfer id and provider token are retained, so this
+    /// is attenuation rather than a new object or a wire-visible capability.
+    pub const fn attenuate(self, rights: HandleRights) -> Option<Self> {
+        if !self.rights.can_attenuate_to(rights) {
+            return None;
+        }
+        Some(Self { rights, ..self })
     }
 
     pub const fn is_transferable(self) -> bool {

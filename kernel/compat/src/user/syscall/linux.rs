@@ -43,6 +43,7 @@ use scheduler_ops::*;
 use service_ops::*;
 use smp_qualification_ops::*;
 use support::*;
+pub(crate) use syscalld_ops::call_syscalld_raw;
 use syscalld_ops::*;
 
 use rustos_user_abi::syscall::{
@@ -157,10 +158,6 @@ const LINUX_EOVERFLOW: i64 = 75;
 const LINUX_ETIMEDOUT: i64 = 110;
 const MAX_RUSTOS_DEBUG_PRINT_BYTES: usize = 2048;
 
-pub(crate) fn call_syscalld_raw(request: &[u8]) -> Result<Vec<u8>, i64> {
-    ipc_ops::call_linux_syscall_endpoint(request)
-}
-
 pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
     if let Err(error) = syscall_check(frame) {
         return error;
@@ -180,6 +177,9 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
         linux_abi::SYS_RUSTOS_DEBUG_PRINT => syscall_linux_rustos_debug_print(frame.rdi, frame.rsi),
         linux_abi::SYS_RUSTOS_PRODUCT_MILESTONE => {
             syscall_linux_rustos_product_milestone(frame.rdi, frame.rsi, frame.rdx)
+        }
+        rustos_user_abi::syscall::SYS_RUSTOS_PRODUCT_EXECUTABLE_SNAPSHOT_EVIDENCE => {
+            syscall_linux_rustos_product_executable_snapshot_evidence(frame.rdi)
         }
         linux_abi::SYS_RUSTOS_PHASE_PROFILE_DRAIN => syscall_linux_rustos_phase_profile_drain(),
         linux_abi::SYS_RUSTOS_SMP_QUALIFICATION_BIND => {

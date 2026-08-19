@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: MIT
 
+use rustos_user_abi::syscall::ProductExecutableSnapshotEvidence;
+use sha2::{Digest, Sha256};
+
 /// Whether an `open` metadata errno is an answer rather than a fault.
 ///
 /// `open` is how a caller asks whether a path exists, so `ENOENT` is the
@@ -231,7 +234,6 @@ impl VfsState {
         }
         Ok(read)
     }
-
 }
 
 impl VfsStorage {
@@ -330,11 +332,32 @@ impl VfsStorage {
         }
         let file_len = usize::try_from(metadata.len).map_err(|_| EOVERFLOW)?;
         let product_interactive_snapshot = path == "/apps/wayclick/wayclick.elf";
+        let backing = if early_system_owned {
+            ExecutableSnapshotBacking::EarlySystem
+        } else {
+            ExecutableSnapshotBacking::DvmVolume
+        };
+        let storage_epoch = match backing {
+            ExecutableSnapshotBacking::EarlySystem => 0,
+            ExecutableSnapshotBacking::DvmVolume => {
+                if self.dvm_storage_epoch == 0 {
+                    return Err(EIO);
+                }
+                self.dvm_storage_epoch
+            }
+        };
+        let request_id = match backing {
+            ExecutableSnapshotBacking::EarlySystem => 0,
+            ExecutableSnapshotBacking::DvmVolume => next_executable_snapshot_request_id()?,
+        };
         Ok(ExecutableSnapshotAdmission::Read(ExecutableSnapshotPlan {
             path,
             file_len,
             metadata_len: metadata.len,
             verbose: !early_system_owned || product_interactive_snapshot,
+            backing,
+            storage_epoch,
+            request_id,
             mount_generation: self.mount_generation,
         }))
     }
@@ -365,19 +388,51 @@ impl VfsStorage {
         bytes: &[u8],
     ) -> Result<ExecutableSnapshotOpen, i32> {
         self.invalidate_caches_if_remounted();
-        if !vfsd::snapshot_plan_is_current(plan.mount_generation, self.mount_generation) {
+        if !vfsd::snapshot_plan_is_current(plan.mount_generation, self.mount_generation)
+            || (plan.backing == ExecutableSnapshotBacking::DvmVolume
+                && plan.storage_epoch != self.dvm_storage_epoch)
+        {
             return Err(EAGAIN);
         }
         let path = plan.path.clone();
         let file_len = plan.file_len;
         let fd = create_terminally_sealed_snapshot(path.as_str(), bytes)?;
         if plan.verbose {
-            ipc::debug_line(executable_snapshot_marker(path.as_str(), file_len).as_str());
-            let _ = ipc::product_milestone(
-                PRODUCT_MILESTONE_EXECUTABLE_SNAPSHOT_SEALED,
-                file_len as u64,
-                0,
+            ipc::debug_line(
+                executable_snapshot_marker(
+                    path.as_str(),
+                    file_len,
+                    plan.backing,
+                    plan.mount_generation,
+                )
+                .as_str(),
             );
+            match plan.backing {
+                ExecutableSnapshotBacking::EarlySystem => {
+                    let _ = ipc::product_milestone(
+                        PRODUCT_MILESTONE_BOOTSTRAP_EXECUTABLE_SNAPSHOT_SEALED,
+                        file_len as u64,
+                        plan.mount_generation,
+                    );
+                }
+                ExecutableSnapshotBacking::DvmVolume => {
+                    let digest = Sha256::digest(bytes);
+                    let mut digest_bytes = [0; 32];
+                    digest_bytes.copy_from_slice(digest.as_slice());
+                    let evidence = ProductExecutableSnapshotEvidence {
+                        storage_epoch: plan.storage_epoch,
+                        mount_generation: plan.mount_generation,
+                        request_id: plan.request_id,
+                        file_bytes: file_len as u64,
+                        digest: digest_bytes,
+                        ..ProductExecutableSnapshotEvidence::default()
+                    };
+                    if ipc::product_executable_snapshot_evidence(&evidence) != 0 {
+                        close_fd(fd);
+                        return Err(EIO);
+                    }
+                }
+            }
         }
 
         if file_len > EXECUTABLE_SNAPSHOT_CACHE_BUDGET_BYTES {
@@ -412,7 +467,6 @@ impl VfsStorage {
             close_after_reply: false,
         })
     }
-
 }
 
 impl VfsState {
@@ -452,7 +506,6 @@ impl VfsState {
         }
         Ok((written, consumed))
     }
-
 }
 
 impl VfsStorage {
@@ -548,15 +601,16 @@ impl VfsStorage {
                     ));
                 }
             })?;
-            self.volume = Some(
-                FatVolume::new(device)
-                    .map_err(map_fat_error)
-                    .inspect_err(|&errno| {
-                        debug_line(&format!(
-                            "vfsd: volume unavailable stage=fat-admission errno={errno}"
-                        ));
-                    })?,
-            );
+            let storage_epoch = device.generation;
+            let volume = FatVolume::new(device)
+                .map_err(map_fat_error)
+                .inspect_err(|&errno| {
+                    debug_line(&format!(
+                        "vfsd: volume unavailable stage=fat-admission errno={errno}"
+                    ));
+                })?;
+            self.dvm_storage_epoch = storage_epoch;
+            self.volume = Some(volume);
         }
         Ok(self.volume.as_ref().expect("volume initialized"))
     }

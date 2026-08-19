@@ -3,7 +3,13 @@
 //! Split out of `runqueue.rs` so the module stays under the source line
 //! budget; the contents are unchanged.
 
-use super::*;
+use super::{
+    affinity_payload::{
+        affinity_snapshot, initialize_affinity, last_cpu, record_last_cpu, set_affinity,
+    },
+    simd_tls::{set_tls_fs_base, tls_fs_base},
+    *,
+};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 struct RunQueueTestScope {
@@ -303,6 +309,54 @@ fn local_dispatch_gate_observes_queue_and_remote_mailbox_authority() {
 }
 
 #[test]
+fn direct_handoff_predicate_rejects_running_and_migrating_even_if_runnable() {
+    let local = RunOwnerSnapshot::new(RunOwnerState::Local, Some(2), 7);
+    let remote = RunOwnerSnapshot::new(RunOwnerState::RemoteQueued, Some(2), 7);
+    let running = RunOwnerSnapshot::new(RunOwnerState::Running, Some(2), 7);
+    let migrating = RunOwnerSnapshot::new(RunOwnerState::Migrating, Some(2), 7);
+    let blocked_local = local.with_runnable(false);
+
+    assert!(is_handoff_dispatchable_owner(local));
+    assert!(is_handoff_dispatchable_owner(remote));
+    assert!(!is_handoff_dispatchable_owner(blocked_local));
+    assert!(running.runnable);
+    assert!(!is_handoff_dispatchable_owner(running));
+    assert!(migrating.runnable);
+    assert!(
+        !is_handoff_dispatchable_owner(migrating),
+        "a migrating owner must reach its target mailbox before direct-handoff nomination"
+    );
+}
+
+#[test]
+fn wake_runnable_predicate_uses_owner_bit_but_respects_wait_lifecycle() {
+    let running = RunOwnerSnapshot::new(RunOwnerState::Running, Some(2), 7);
+    let migrating = RunOwnerSnapshot::new(RunOwnerState::Migrating, Some(2), 7);
+    let blocked = RunOwnerSnapshot::new(RunOwnerState::Blocked, None, 7);
+
+    assert!(wake_is_already_runnable(running, false, false));
+    assert!(wake_is_already_runnable(migrating, false, false));
+    assert!(!wake_is_already_runnable(running, true, false));
+    assert!(!wake_is_already_runnable(running, false, true));
+    assert!(!wake_is_already_runnable(blocked, false, false));
+}
+
+#[test]
+fn owner_run_intent_keeps_running_queued_and_migrating_states_distinct_from_handoff() {
+    let local = RunOwnerSnapshot::new(RunOwnerState::Local, Some(2), 7);
+    let running = RunOwnerSnapshot::new(RunOwnerState::Running, Some(2), 7);
+    let migrating = RunOwnerSnapshot::new(RunOwnerState::Migrating, Some(2), 7);
+    let blocked = RunOwnerSnapshot::new(RunOwnerState::Blocked, None, 7);
+
+    assert!(owner_has_run_intent(local));
+    assert!(owner_has_run_intent(running));
+    assert!(owner_has_run_intent(migrating));
+    assert!(!owner_has_run_intent(blocked));
+    assert!(!is_handoff_dispatchable_owner(running));
+    assert!(!is_handoff_dispatchable_owner(migrating));
+}
+
+#[test]
 fn migrating_owner_remains_runnable_until_mailbox_admission() {
     let _guard = TEST_GUARD.lock().unwrap();
     reset_before_publication();
@@ -359,6 +413,102 @@ fn running_owner_runnable_bit_tracks_block_and_wake() {
     retire(slot, 100);
     release_retired(slot);
     reset_before_publication();
+}
+
+/// Fair-share accounting is a slot payload, not a field behind the global
+/// scheduler catalog.  Its lifetime is exactly one admitted-owner generation:
+/// initialize before publication, permit monotonic accounting/donation
+/// updates while live, and erase it only after terminal release.
+#[test]
+fn vruntime_payload_is_monotonic_and_cleared_before_slot_reuse() {
+    let _scope = RunQueueTestScope::new();
+    let slot = 34;
+    let cpu = 2;
+
+    initialize_vruntime(slot, 100);
+    initialize_exec_start_ticks(slot, 17);
+    initialize_saved_rsp(slot, 0x40_000);
+    initialize_kernel_stack_bounds(slot, 0x30_000, 0x40_000);
+    initialize_alternate_kernel_stack_bounds(slot);
+    initialize_affinity(slot, 0b0011, 0b0111);
+    assert_eq!(vruntime(slot), 100);
+    assert_eq!(exec_start_ticks(slot), 17);
+    assert_eq!(saved_rsp(slot), 0x40_000);
+    assert_eq!(tls_fs_base(slot), 0);
+    assert_eq!(affinity_snapshot(slot), (0b0011, 0b0111, false));
+    assert_eq!(kernel_stack_bounds(slot), (0x30_000, 0x40_000));
+    admit_running(slot, cpu);
+    set_tls_fs_base(slot, 0x51_000);
+    assert_eq!(tls_fs_base(slot), 0x51_000);
+    set_affinity(slot, 0b0010, 0b0111, true);
+    record_last_cpu(slot, 2);
+    assert_eq!(affinity_snapshot(slot), (0b0010, 0b0111, true));
+    assert_eq!(last_cpu(slot), 2);
+    replace_alternate_kernel_stack_bounds(slot, 0x48_000, 0x50_000);
+    assert_eq!(alternate_kernel_stack_bounds(slot), (0x48_000, 0x50_000));
+    assert_eq!(add_vruntime(slot, 23), 123);
+    assert_eq!(raise_vruntime_floor(slot, 180), 180);
+    assert_eq!(raise_vruntime_floor(slot, 120), 180);
+    assert_eq!(lower_vruntime_ceiling(slot, 150), 150);
+    assert_eq!(lower_vruntime_ceiling(slot, 200), 150);
+
+    retire(slot, 100);
+    release_retired(slot);
+    assert_eq!(owner(slot).state, RunOwnerState::Dormant);
+    assert_eq!(
+        vruntime(slot),
+        0,
+        "retired payload leaked into a reused slot"
+    );
+    assert_eq!(
+        exec_start_ticks(slot),
+        0,
+        "retired execution baseline leaked into a reused slot"
+    );
+    assert_eq!(
+        saved_rsp(slot),
+        0,
+        "retired execution frame leaked into a reused slot"
+    );
+    assert_eq!(
+        tls_fs_base(slot),
+        0,
+        "retired TLS base leaked into a reused slot"
+    );
+    assert_eq!(
+        affinity_snapshot(slot),
+        (u64::MAX, u64::MAX, false),
+        "retired affinity state leaked into a reused slot"
+    );
+    assert_eq!(last_cpu(slot), u8::MAX);
+    assert_eq!(
+        kernel_stack_bounds(slot),
+        (0, 0),
+        "retired kernel stack bounds leaked into a reused slot"
+    );
+    assert_eq!(
+        alternate_kernel_stack_bounds(slot),
+        (0, 0),
+        "retired alternate stack bounds leaked into a reused slot"
+    );
+
+    initialize_vruntime(slot, 7);
+    initialize_exec_start_ticks(slot, 0);
+    initialize_saved_rsp(slot, 0x50_000);
+    set_tls_fs_base(slot, 0x61_000);
+    initialize_affinity(slot, 0b0100, 0b1100);
+    initialize_kernel_stack_bounds(slot, 0x60_000, 0x70_000);
+    initialize_alternate_kernel_stack_bounds(slot);
+    assert_eq!(
+        vruntime(slot),
+        7,
+        "new admission must not inherit old fairness"
+    );
+    assert_eq!(saved_rsp(slot), 0x50_000);
+    assert_eq!(tls_fs_base(slot), 0x61_000);
+    assert_eq!(affinity_snapshot(slot), (0b0100, 0b1100, false));
+    assert_eq!(kernel_stack_bounds(slot), (0x60_000, 0x70_000));
+    assert_eq!(alternate_kernel_stack_bounds(slot), (0, 0));
 }
 
 #[test]

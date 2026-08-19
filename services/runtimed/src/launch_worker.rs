@@ -60,7 +60,10 @@ pub(crate) enum LaunchProgress {
     Spawned { pid: i32 },
     /// Terminal. `pid` is present whenever a child was created, so the loop
     /// knows whether it has a record to drop.
-    Finished { pid: Option<i32>, result: Result<(), i32> },
+    Finished {
+        pid: Option<i32>,
+        result: Result<(), i32>,
+    },
 }
 
 /// The loop's answer to `Spawned`.

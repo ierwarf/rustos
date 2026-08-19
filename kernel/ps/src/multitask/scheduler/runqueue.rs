@@ -20,11 +20,14 @@
 //! - **Evidence:** `per-cpu-runqueue-ownership`, `scheduler-dispatch`, and
 //!   `smp-reschedule-ipi-lifecycle`.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering, fence};
 
 use nucleus_core::util::lockdep::{LockClass, MAX_TRACKED_CPUS, TrackedSpinLock};
 
 use super::MAX_TASK;
+
+pub(super) mod affinity_payload;
+pub(super) mod simd_tls;
 
 const OWNER_STATE_BITS: u64 = 4;
 const OWNER_CPU_BITS: u64 = 8;
@@ -38,7 +41,7 @@ const OWNER_CPU_SHIFT: u64 = OWNER_STATE_BITS;
 /// on a CPU or waiting to run". Without it, `Running` conflates executing with
 /// no longer runnable, and the question "does the outgoing task go back to its
 /// queue or get published blocked?" has no answer in the owner word — which is
-/// why `context.ready` still had readers after stage two of
+/// why the old readiness mirror still had readers after stage two of
 /// `V5-SCHED-GLOBAL-001`.
 const OWNER_RUNNABLE_SHIFT: u64 = OWNER_STATE_BITS + OWNER_CPU_BITS;
 const OWNER_RUNNABLE_BIT: u64 = 1 << OWNER_RUNNABLE_SHIFT;
@@ -47,6 +50,48 @@ const OWNER_GENERATION_MAX: u64 = u64::MAX >> OWNER_GENERATION_SHIFT;
 const NO_CPU: usize = u8::MAX as usize;
 const BITMAP_WORDS: usize = MAX_TASK.div_ceil(64);
 const MAILBOX_CAPACITY: usize = MAX_TASK;
+
+/// Per-slot CFS accounting payload.
+///
+/// Queue custody and virtual-runtime accounting have different ownership
+/// lifetimes: the owner word decides where a continuation may execute, while
+/// this table survives queue migration and is read by the CPU that owns the
+/// selected local queue.  Keeping it out of `Scheduler::contexts` means a
+/// dispatch or wake does not need the monolithic scheduler payload merely to
+/// compare fair-share keys.  Slot admission initializes it before publishing
+/// any runnable owner; terminal release clears it before the slot is reused.
+///
+/// Release stores pair with Acquire readers so a CPU that observes a newly
+/// published queue owner also sees the initial key for that generation.  The
+/// compare-and-exchange updates preserve donation and accounting changes if a
+/// remote scheduling action races a local fair-share update.
+static VRUNTIME_NS: [AtomicU64; MAX_TASK] = [const { AtomicU64::new(0) }; MAX_TASK];
+
+/// Per-slot execution-accounting baseline. Zero means that the slot is not
+/// currently charging a running interval.
+static EXEC_START_TICKS: [AtomicU64; MAX_TASK] = [const { AtomicU64::new(0) }; MAX_TASK];
+
+/// Per-slot saved execution-frame pointer. The owner-word generation bounds
+/// its lifetime: admission installs it before publication, only the execution
+/// owner replaces it at a trap boundary, and terminal release clears it.
+static SAVED_RSP: [AtomicUsize; MAX_TASK] = [const { AtomicUsize::new(0) }; MAX_TASK];
+
+/// Immutable-for-one-generation usable kernel-stack bounds. They are written
+/// before owner publication and cleared only after terminal owner release, so
+/// frame validation and the execution owner need not consult the scheduler
+/// catalog for primary stack geometry.
+static KERNEL_STACK_BASE: [AtomicU64; MAX_TASK] = [const { AtomicU64::new(0) }; MAX_TASK];
+static KERNEL_STACK_TOP: [AtomicU64; MAX_TASK] = [const { AtomicU64::new(0) }; MAX_TASK];
+
+/// Per-slot temporary execution-stack bounds. Unlike the primary stack, an
+/// alternate stack may be installed and removed while its owner is running.
+/// The version makes the base/top pair an indivisible observation: odd means
+/// a writer is between the two values, and readers reject that transient range
+/// rather than accepting a mixed pair.
+static ALTERNATE_KERNEL_STACK_VERSION: [AtomicU64; MAX_TASK] =
+    [const { AtomicU64::new(0) }; MAX_TASK];
+static ALTERNATE_KERNEL_STACK_BASE: [AtomicU64; MAX_TASK] = [const { AtomicU64::new(0) }; MAX_TASK];
+static ALTERNATE_KERNEL_STACK_TOP: [AtomicU64; MAX_TASK] = [const { AtomicU64::new(0) }; MAX_TASK];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -411,9 +456,34 @@ fn validate_cpu(cpu: usize) {
 }
 
 pub(super) fn reset_before_publication() {
-    for owner in &OWNER_WORDS {
+    for (
+        (((((owner, vruntime), exec_start), saved_rsp), stack_base), alternate_version),
+        alternate_base,
+    ) in OWNER_WORDS
+        .iter()
+        .zip(VRUNTIME_NS.iter())
+        .zip(EXEC_START_TICKS.iter())
+        .zip(SAVED_RSP.iter())
+        .zip(KERNEL_STACK_BASE.iter())
+        .zip(ALTERNATE_KERNEL_STACK_VERSION.iter())
+        .zip(ALTERNATE_KERNEL_STACK_BASE.iter())
+    {
         owner.store_reset();
+        vruntime.store(0, Ordering::Release);
+        exec_start.store(0, Ordering::Release);
+        saved_rsp.store(0, Ordering::Release);
+        stack_base.store(0, Ordering::Release);
+        alternate_version.store(0, Ordering::Release);
+        alternate_base.store(0, Ordering::Release);
     }
+    for stack_top in &KERNEL_STACK_TOP {
+        stack_top.store(0, Ordering::Release);
+    }
+    for alternate_top in &ALTERNATE_KERNEL_STACK_TOP {
+        alternate_top.store(0, Ordering::Release);
+    }
+    simd_tls::reset_before_publication();
+    affinity_payload::reset_before_publication();
     for cpu in 0..MAX_TRACKED_CPUS {
         let mut rq = RUN_QUEUES[cpu].inner.lock();
         *rq = RunQueueInner::new();
@@ -422,6 +492,208 @@ pub(super) fn reset_before_publication() {
         let mut mailbox = REMOTE_WAKE_MAILBOXES[cpu].lock();
         *mailbox = RemoteWakeMailbox::new();
         MAILBOX_PENDING[cpu].store(0, Ordering::Release);
+    }
+}
+
+#[inline]
+pub(super) fn vruntime(slot: usize) -> u64 {
+    VRUNTIME_NS
+        .get(slot)
+        .expect("scheduler vruntime slot exceeds capacity")
+        .load(Ordering::Acquire)
+}
+
+/// Installs a fresh fair-share key before the slot's owner is admitted.
+pub(super) fn initialize_vruntime(slot: usize, value: u64) {
+    assert_eq!(
+        owner(slot).state,
+        RunOwnerState::Dormant,
+        "scheduler vruntime initialized after owner publication"
+    );
+    VRUNTIME_NS[slot].store(value, Ordering::Release);
+}
+
+/// Installs the initial execution-accounting baseline before owner admission.
+pub(super) fn initialize_exec_start_ticks(slot: usize, value: u64) {
+    assert_eq!(
+        owner(slot).state,
+        RunOwnerState::Dormant,
+        "scheduler execution baseline initialized after owner publication"
+    );
+    EXEC_START_TICKS[slot].store(value, Ordering::Release);
+}
+
+#[inline]
+pub(super) fn exec_start_ticks(slot: usize) -> u64 {
+    EXEC_START_TICKS
+        .get(slot)
+        .expect("scheduler execution baseline slot exceeds capacity")
+        .load(Ordering::Acquire)
+}
+
+/// Replaces the running interval baseline. The execution owner alone chooses
+/// this value; AtomicU64 keeps readers from requiring the global task catalog.
+#[inline]
+pub(super) fn set_exec_start_ticks(slot: usize, value: u64) {
+    EXEC_START_TICKS
+        .get(slot)
+        .expect("scheduler execution baseline slot exceeds capacity")
+        .store(value, Ordering::Release);
+}
+
+pub(super) fn initialize_saved_rsp(slot: usize, value: usize) {
+    assert_eq!(
+        owner(slot).state,
+        RunOwnerState::Dormant,
+        "scheduler saved context initialized after owner publication"
+    );
+    SAVED_RSP[slot].store(value, Ordering::Release);
+}
+
+#[inline]
+pub(super) fn saved_rsp(slot: usize) -> usize {
+    SAVED_RSP
+        .get(slot)
+        .expect("scheduler saved context slot exceeds capacity")
+        .load(Ordering::Acquire)
+}
+
+#[inline]
+pub(super) fn set_saved_rsp(slot: usize, value: usize) {
+    SAVED_RSP
+        .get(slot)
+        .expect("scheduler saved context slot exceeds capacity")
+        .store(value, Ordering::Release);
+}
+
+pub(super) fn initialize_kernel_stack_bounds(slot: usize, base: u64, top: u64) {
+    assert_eq!(
+        owner(slot).state,
+        RunOwnerState::Dormant,
+        "scheduler stack bounds initialized after owner publication"
+    );
+    assert!(
+        base != 0 && top > base,
+        "scheduler stack bounds are invalid"
+    );
+    KERNEL_STACK_BASE[slot].store(base, Ordering::Release);
+    KERNEL_STACK_TOP[slot].store(top, Ordering::Release);
+}
+
+#[inline]
+pub(super) fn kernel_stack_bounds(slot: usize) -> (u64, u64) {
+    let base = KERNEL_STACK_BASE
+        .get(slot)
+        .expect("scheduler stack base slot exceeds capacity")
+        .load(Ordering::Acquire);
+    let top = KERNEL_STACK_TOP
+        .get(slot)
+        .expect("scheduler stack top slot exceeds capacity")
+        .load(Ordering::Acquire);
+    (base, top)
+}
+
+/// Initializes the alternate-stack record before owner publication. A fresh
+/// task has no alternate execution stack, but the explicit initialization
+/// keeps its lifetime coupled to the owner generation rather than BSS state.
+pub(super) fn initialize_alternate_kernel_stack_bounds(slot: usize) {
+    assert_eq!(
+        owner(slot).state,
+        RunOwnerState::Dormant,
+        "scheduler alternate stack initialized after owner publication"
+    );
+    replace_alternate_kernel_stack_bounds(slot, 0, 0);
+}
+
+/// Replaces the running task's alternate-stack pair. Scheduler exclusion gives
+/// this record one writer; the version still makes accidental lock-free
+/// observations fail closed instead of accepting a half-replaced range.
+pub(super) fn replace_alternate_kernel_stack_bounds(slot: usize, base: u64, top: u64) {
+    assert!(
+        (base == 0 && top == 0) || (base != 0 && top > base),
+        "scheduler alternate stack bounds are invalid"
+    );
+    let version = ALTERNATE_KERNEL_STACK_VERSION[slot].load(Ordering::Relaxed);
+    assert_eq!(
+        version & 1,
+        0,
+        "scheduler alternate stack replacement raced for slot {slot}"
+    );
+    // ORDERING: the odd version is visible before either payload half changes.
+    ALTERNATE_KERNEL_STACK_VERSION[slot].store(version.wrapping_add(1), Ordering::Relaxed);
+    fence(Ordering::Release);
+    ALTERNATE_KERNEL_STACK_BASE[slot].store(base, Ordering::Relaxed);
+    ALTERNATE_KERNEL_STACK_TOP[slot].store(top, Ordering::Relaxed);
+    // ORDERING: this Release commits a matched base/top pair to Acquire readers.
+    ALTERNATE_KERNEL_STACK_VERSION[slot].store(version.wrapping_add(2), Ordering::Release);
+}
+
+/// Reads one coherent alternate-stack pair. An observation that overlaps a
+/// writer has no valid range, which causes frame validation to reject it.
+#[inline]
+pub(super) fn alternate_kernel_stack_bounds(slot: usize) -> (u64, u64) {
+    let version = ALTERNATE_KERNEL_STACK_VERSION
+        .get(slot)
+        .expect("scheduler alternate stack version slot exceeds capacity")
+        .load(Ordering::Acquire);
+    if version & 1 != 0 {
+        return (0, 0);
+    }
+    let base = ALTERNATE_KERNEL_STACK_BASE[slot].load(Ordering::Relaxed);
+    let top = ALTERNATE_KERNEL_STACK_TOP[slot].load(Ordering::Relaxed);
+    // ORDERING: neither payload read may move after the validating version.
+    fence(Ordering::Acquire);
+    if ALTERNATE_KERNEL_STACK_VERSION[slot].load(Ordering::Relaxed) != version {
+        return (0, 0);
+    }
+    (base, top)
+}
+
+fn clear_alternate_kernel_stack_bounds(slot: usize) {
+    replace_alternate_kernel_stack_bounds(slot, 0, 0);
+}
+
+pub(super) fn add_vruntime(slot: usize, delta: u64) -> u64 {
+    let cell = &VRUNTIME_NS[slot];
+    let mut observed = cell.load(Ordering::Acquire);
+    loop {
+        let next = observed.saturating_add(delta);
+        match cell.compare_exchange_weak(observed, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return next,
+            Err(current) => observed = current,
+        }
+    }
+}
+
+/// Raises the fair-share key only when a sleeper floor is ahead of it.
+pub(super) fn raise_vruntime_floor(slot: usize, floor: u64) -> u64 {
+    let cell = &VRUNTIME_NS[slot];
+    let mut observed = cell.load(Ordering::Acquire);
+    loop {
+        let next = observed.max(floor);
+        if next == observed {
+            return observed;
+        }
+        match cell.compare_exchange_weak(observed, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return next,
+            Err(current) => observed = current,
+        }
+    }
+}
+
+/// Lowers the fair-share key only for an authenticated IPC donation.
+pub(super) fn lower_vruntime_ceiling(slot: usize, ceiling: u64) -> u64 {
+    let cell = &VRUNTIME_NS[slot];
+    let mut observed = cell.load(Ordering::Acquire);
+    loop {
+        let next = observed.min(ceiling);
+        if next == observed {
+            return observed;
+        }
+        match cell.compare_exchange_weak(observed, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return next,
+            Err(current) => observed = current,
+        }
     }
 }
 
@@ -870,6 +1142,45 @@ pub(super) fn is_local_dispatchable(slot: usize, cpu: usize) -> bool {
     owner.state == RunOwnerState::Local && owner.cpu == Some(cpu) && owner.runnable
 }
 
+/// Returns whether one acquire snapshot may nominate `slot` for a direct
+/// handoff. `Migrating` deliberately remains runnable while its target mailbox
+/// is being admitted, but it has no dispatch-handoff custody until that
+/// admission publishes `Local` or `RemoteQueued` ownership.
+pub(super) const fn is_handoff_dispatchable_owner(owner: RunOwnerSnapshot) -> bool {
+    owner.runnable
+        && matches!(
+            owner.state,
+            RunOwnerState::Local | RunOwnerState::RemoteQueued
+        )
+}
+
+/// Returns whether the owner word still records execution or queue run intent.
+/// This deliberately accepts `Running`, `Local`, `RemoteQueued`, and the
+/// transient `Migrating` state when their shared runnable bit is set; callers
+/// that require dispatch custody must use the stricter predicate above.
+pub(super) const fn owner_has_run_intent(owner: RunOwnerSnapshot) -> bool {
+    owner.runnable
+}
+
+/// Returns whether a wake is merely a scheduling hint for an already runnable
+/// non-current task. The owner word is the runnability authority; blocked and
+/// armed remain scheduler lifecycle state because they describe an uncommitted
+/// wait epoch rather than queue custody.
+pub(super) const fn wake_is_already_runnable(
+    owner: RunOwnerSnapshot,
+    was_blocked: bool,
+    wake_was_armed: bool,
+) -> bool {
+    owner_has_run_intent(owner) && !was_blocked && !wake_was_armed
+}
+
+/// Returns whether the current owner word may nominate `slot` for a direct
+/// handoff. The runnable bit and custody state come from the same acquire
+/// snapshot, so a just-blocked or migrating slot cannot be selected.
+pub(super) fn is_handoff_dispatchable(slot: usize) -> bool {
+    is_handoff_dispatchable_owner(owner(slot))
+}
+
 pub(super) fn claim_dispatch(slot: usize, cpu: usize, weight: u32) -> bool {
     validate_cpu(cpu);
     let owner = owner(slot);
@@ -943,6 +1254,14 @@ pub(super) fn release_retired(slot: usize) {
         .unwrap_or_else(|observed| {
             panic!("scheduler retired slot release raced observed={observed:?}")
         });
+    VRUNTIME_NS[slot].store(0, Ordering::Release);
+    EXEC_START_TICKS[slot].store(0, Ordering::Release);
+    SAVED_RSP[slot].store(0, Ordering::Release);
+    simd_tls::clear_tls_fs_base(slot);
+    affinity_payload::reset_affinity(slot);
+    KERNEL_STACK_BASE[slot].store(0, Ordering::Release);
+    KERNEL_STACK_TOP[slot].store(0, Ordering::Release);
+    clear_alternate_kernel_stack_bounds(slot);
 }
 
 pub(super) fn least_loaded_cpu(eligible_mask: u64, fallback_cpu: usize) -> usize {

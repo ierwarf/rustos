@@ -63,12 +63,12 @@ use preemption::{
 };
 // Only the anchored unit tests reach these directly; the production callers
 // moved into `preemption` with the functions that use them.
-#[cfg(test)]
-use preemption::{preemption_release_is_admissible, preemption_units_match};
 pub use cpu_identity::{
     bind_current_cpu_identity, current_apic_id, current_cpu_index, finalize_cpu_identities,
     hardware_apic_id, register_cpu_identity,
 };
+#[cfg(test)]
+use preemption::{preemption_release_is_admissible, preemption_units_match};
 pub use scheduler_diag::{
     SchedulerDispatchWitness, SchedulerObservation, SchedulerObservationKind,
     SchedulerObservationWitness, record_scheduler_dispatch, record_scheduler_observation,
@@ -132,6 +132,10 @@ pub enum LockClass {
     SchedulerPolicy = 42,
     PciConfigTransaction = 43,
     DeviceIoctlRouteMemo = 44,
+    /// Reply-edge lifecycle ledger; distinct from the scheduler catalog so
+    /// dispatch may consume per-slot inheritance without serializing on task
+    /// directory state.
+    SchedulerDonation = 45,
 }
 
 #[cfg(rustos_boot_image)]
@@ -278,7 +282,6 @@ pub struct IrqContextGuard {
     entry_identity_count: u32,
 }
 
-
 /// Tracks a successful, non-blocking acquisition of an externally implemented
 /// lock while the caller already owns a raw-spin class or runs in IRQ context.
 /// This is deliberately not available for blocking acquisition: its only
@@ -398,7 +401,9 @@ pub fn set_current_task_owner(owner: u64) {
         // the same owner, which is what makes a switched-away-and-back scope
         // detectable at all.
         CURRENT_TASK_EPOCH[cpu].store(
-            CURRENT_TASK_EPOCH[cpu].load(Ordering::Relaxed).wrapping_add(1),
+            CURRENT_TASK_EPOCH[cpu]
+                .load(Ordering::Relaxed)
+                .wrapping_add(1),
             Ordering::Relaxed,
         );
         // ORDERING: Release publishes scheduler current-task ownership before
@@ -604,7 +609,8 @@ impl<T: ?Sized, const CLASS: u8> TrackedSpinLock<T, CLASS> {
         let pending = before_acquire_with_irq_tracking(acquire_cpu, CLASS, acquire_site, true);
         #[cfg(not(rustos_boot_image))]
         let pending = before_acquire(CLASS, acquire_site);
-        let profile_checked = lock_profile::charge(lock_profile::LockPhase::BeforeAcquire, profile_entry);
+        let profile_checked =
+            lock_profile::charge(lock_profile::LockPhase::BeforeAcquire, profile_entry);
         #[cfg(rustos_boot_image)]
         let guard = {
             let wait_start_tsc = read_tsc();
@@ -745,12 +751,8 @@ impl<T: ?Sized, const CLASS: u8> TrackedSpinLock<T, CLASS> {
             }
             let acquire_site = Location::caller();
             let acquire_cpu = disable_preemption();
-            let pending = before_acquire_with_irq_tracking(
-                acquire_cpu,
-                CLASS,
-                acquire_site,
-                !irq_context,
-            );
+            let pending =
+                before_acquire_with_irq_tracking(acquire_cpu, CLASS, acquire_site, !irq_context);
             loop {
                 while self.inner.is_locked() {
                     if timed_out() {
@@ -900,8 +902,6 @@ const fn guard_release_is_admissible(
     owner_cpu == release_cpu && owner_apic_id == release_apic_id && preemption_depth != 0
 }
 
-
-
 #[inline]
 fn tracked_guard_owner_cpu() -> usize {
     #[cfg(rustos_boot_image)]
@@ -913,9 +913,6 @@ fn tracked_guard_owner_cpu() -> usize {
         0
     }
 }
-
-
-
 
 #[inline]
 pub fn current_lock_class() -> Option<u8> {
@@ -997,11 +994,6 @@ impl Drop for ExternalRawLockGuard {
         }
     }
 }
-
-
-
-
-
 
 fn validate_class(class: u8) -> usize {
     let class = usize::from(class);

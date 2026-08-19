@@ -23,21 +23,21 @@ impl Scheduler {
     /// Emitted as milestones because the ordinary log channel does not reach
     /// the debug transport in the product configuration, and because the panic
     /// that follows must not depend on formatting to be diagnosable.
-    fn report_invalid_activation_context(&self, task_id: u64, slot: usize, context: &TaskContext) {
-        let saved_rsp = context.saved_rsp as u64;
+    fn report_invalid_activation_context(&self, task_id: u64, slot: usize) {
+        let saved_rsp = self.slot_saved_rsp(slot);
         crate::debug::record_milestone(
             crate::debug::LogCategory::Sched,
             "sched-activation-invalid-slot",
             (task_id << 32) | slot as u64,
-            saved_rsp,
+            saved_rsp as u64,
         );
         crate::debug::record_milestone(
             crate::debug::LogCategory::Sched,
             "sched-activation-invalid-stack",
-            context.kernel_stack_base,
-            context.kernel_stack_top,
+            self.slot_kernel_stack_bounds(slot).0,
+            self.slot_kernel_stack_bounds(slot).1,
         );
-        let (rflags, cs, rip, rsp) = match Self::saved_context_ref(context.saved_rsp) {
+        let (rflags, cs, rip, rsp) = match Self::saved_context_ref(saved_rsp) {
             Some(saved) => (saved.rflags, saved.cs, saved.rip, saved.rsp),
             None => (0, 0, 0, 0),
         };
@@ -51,7 +51,7 @@ impl Scheduler {
             crate::debug::LogCategory::Sched,
             "sched-activation-invalid-frame-rsp",
             rsp,
-            u64::from(self.stack_frame_is_all_zero(context.saved_rsp)),
+            u64::from(self.stack_frame_is_all_zero(saved_rsp)),
         );
     }
 
@@ -128,15 +128,14 @@ impl Scheduler {
                 slot != self.current_task_slot() && !super::super::task_slot_is_running(slot),
                 "scheduler activation invariant: suspended task {task_id} is already running"
             );
-            if let Err(reason) =
-                self.validate_saved_context(slot, context.user_mode, context.saved_rsp)
-            {
+            let saved_rsp = self.slot_saved_rsp(slot);
+            if let Err(reason) = self.validate_saved_context(slot, context.user_mode, saved_rsp) {
                 // The reason alone cannot separate "the frame was never
                 // written" from "the frame was written somewhere else" from
                 // "something overwrote it". Report the exact slot geometry and
                 // the words actually present so the next occurrence is
                 // attributable without another run.
-                self.report_invalid_activation_context(task_id, slot, &context);
+                self.report_invalid_activation_context(task_id, slot);
                 panic!(
                     "scheduler activation invariant: suspended task {task_id} has invalid context: {reason}"
                 );

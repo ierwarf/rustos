@@ -277,8 +277,7 @@ extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> u64 {
     // later resume the exact syscall before restoring the entering user SIMD
     // image. This closes hot-syscall starvation without a high-rate PIT retry.
     multitask::reschedule_deferred_from_interruptible_syscall();
-    let phase =
-        syscall_profile::charge(syscall_profile::SyscallPhase::RescheduleDeferred, phase);
+    let phase = syscall_profile::charge(syscall_profile::SyscallPhase::RescheduleDeferred, phase);
     // The syscall frame stayed live on the task's kernel stack across that
     // possible continuation. Revalidate the exact SYSRET boundary after the
     // last resume so a stale pre-schedule decision can never authorize return.

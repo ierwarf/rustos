@@ -1718,8 +1718,7 @@ mod tests {
     use super::{
         console_read_park_budget, session_ingress_identity_authorized, session_op_accepts_ioctl,
         ui_bootstrap_may_retry_immediately, ConsoleReadWaiter, SessionRuntime,
-        OUTPUT_BUFFER_CAPACITY,
-        MAX_PARKED_CONSOLE_READS,
+        MAX_PARKED_CONSOLE_READS, OUTPUT_BUFFER_CAPACITY,
     };
     use crate::{BrokerState, RunningProcess};
     use keyboard_core::KeyCode;

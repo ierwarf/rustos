@@ -129,8 +129,31 @@ pub fn ui_bootstrap_snapshot_reply_completed(
             .is_some_and(|path| path == expected_path)
 }
 
-pub fn executable_snapshot_marker(path: &str, file_len: usize) -> alloc::string::String {
-    format!("vfsd: executable snapshot sealed path={path} bytes={file_len}")
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExecutableSnapshotBacking {
+    EarlySystem,
+    DvmVolume,
+}
+
+impl ExecutableSnapshotBacking {
+    pub const fn marker_name(self) -> &'static str {
+        match self {
+            Self::EarlySystem => "bootstrap",
+            Self::DvmVolume => "dvm-volume",
+        }
+    }
+}
+
+pub fn executable_snapshot_marker(
+    path: &str,
+    file_len: usize,
+    backing: ExecutableSnapshotBacking,
+    mount_generation: u64,
+) -> alloc::string::String {
+    format!(
+        "vfsd: executable snapshot sealed path={path} bytes={file_len} backing={} mount_generation={mount_generation}",
+        backing.marker_name()
+    )
 }
 
 pub fn validate_dvm_block_range(
@@ -757,10 +780,15 @@ mod tests {
     }
 
     #[test]
-    fn executable_snapshot_marker_binds_path_and_exact_length() {
+    fn executable_snapshot_marker_binds_source_and_mount_identity() {
         assert_eq!(
-            executable_snapshot_marker("apps/wayclick/wayclick.elf", 916_224),
-            "vfsd: executable snapshot sealed path=apps/wayclick/wayclick.elf bytes=916224"
+            executable_snapshot_marker(
+                "apps/wayclick/wayclick.elf",
+                916_224,
+                ExecutableSnapshotBacking::DvmVolume,
+                7,
+            ),
+            "vfsd: executable snapshot sealed path=apps/wayclick/wayclick.elf bytes=916224 backing=dvm-volume mount_generation=7"
         );
     }
     #[test]

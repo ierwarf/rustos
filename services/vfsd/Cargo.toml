@@ -11,6 +11,7 @@ rustos-svc-runtime = { path = "../../libs/rustos-svc-runtime" }
 rustos-user-abi = { path = "../../libs/rustos-user-abi", features = ["linux-compat-state"] }
 storage-core = { path = "../../libs/storage-core" }
 storage-fat = { path = "../../libs/storage-fat" }
+sha2 = { version = "0.10", default-features = false }
 
 [[bin]]
 name = "vfsd"

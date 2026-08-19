@@ -12,6 +12,7 @@ schema = "rustos-tla-mutation-corpus-v1"
 required_models = [
     "acceptance-profile-publication/AcceptanceProfilePublication",
     "atomic-process-activation-batch/AtomicProcessActivationBatch",
+    "capability-derivation-lifecycle/CapabilityDerivationLifecycle",
     "clocksource-deadline/ClocksourceDeadline",
     "cpu-online-lifecycle/CpuOnlineLifecycle",
     "cross-cpu-task-retirement/CrossCpuTaskRetirement",
@@ -124,6 +125,48 @@ find = "    TargetIdentity(currentGeneration) = TargetIdentity(snapshotGeneratio
 replace = "    TargetIdentity(currentGeneration).pid = TargetIdentity(snapshotGeneration).pid"
 occurrence = 1
 invariant = "TargetIdentityReplacementCannotActivate"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "capability-derivation-lease-drift"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "capability-derivation-lifecycle/CapabilityDerivationLifecycle"
+flow = "capability-derivation-lifecycle"
+find = "    /\\ lease = parentLease"
+replace = "    /\\ TRUE"
+occurrence = 1
+invariant = "LiveChildIsAttenuatedAndExact"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "capability-derivation-parent-revoke-leaks-child"
+kind = "transition-revocation"
+severity = "critical"
+model = "capability-derivation-lifecycle/CapabilityDerivationLifecycle"
+flow = "capability-derivation-lifecycle"
+find = '''RevokeParent ==
+    /\ parentState = Live
+    /\ parentState' = Revoked
+    /\ childState' = IF childState = Live THEN Revoked ELSE childState'''
+replace = '''RevokeParent ==
+    /\ parentState = Live
+    /\ parentState' = Revoked
+    /\ childState' = childState'''
+occurrence = 1
+invariant = "LiveChildIsAttenuatedAndExact"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "capability-derivation-rights-broadened"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "capability-derivation-lifecycle/CapabilityDerivationLifecycle"
+flow = "capability-derivation-lifecycle"
+find = "    /\\ rights \\subseteq parentRights"
+replace = "    /\\ TRUE"
+occurrence = 1
+invariant = "LiveChildIsAttenuatedAndExact"
 min_counterexample_states = 2
 
 [[mutation]]
@@ -2064,6 +2107,34 @@ replace = '''PublicationAdmission(task) ==
 occurrence = 1
 invariant = "PublicationObserverNeverBypassed"
 min_counterexample_states = 4
+
+[[mutation]]
+id = "synchronous-concurrency-publication-state-widened"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "synchronous-ipc-handoff-concurrency/SynchronousIpcHandoffConcurrency"
+flow = "scheduler-dispatch"
+find = '''PublicationAdmission(task) ==
+    /\ tokenPhase[task] \in {TokenMinted, TokenBegun}
+    /\ tokenRecord[task].slot = task
+    /\ tokenRecord[task].taskId = TaskId(task)
+    /\ tokenRecord[task].generation = ownerGeneration[task]
+    /\ tokenRecord[task].cpu = ownerCpu[task]
+    /\ taskState[task] = TaskRunnable
+    /\ ownerRunnable[task]
+    /\ ownerState[task] \in {Local, RemoteQueued}'''
+replace = '''PublicationAdmission(task) ==
+    /\ tokenPhase[task] \in {TokenMinted, TokenBegun}
+    /\ tokenRecord[task].slot = task
+    /\ tokenRecord[task].taskId = TaskId(task)
+    /\ tokenRecord[task].generation = ownerGeneration[task]
+    /\ tokenRecord[task].cpu = ownerCpu[task]
+    /\ taskState[task] = TaskRunnable
+    /\ ownerRunnable[task]
+    /\ ownerState[task] \in {Local, RemoteQueued, OwnerMigrating}'''
+occurrence = 1
+invariant = "PublicationObserverNeverBypassed"
+min_counterexample_states = 3
 
 [[mutation]]
 id = "synchronous-concurrency-publication-target-cpu-bypassed"

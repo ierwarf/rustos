@@ -13,20 +13,61 @@ use super::{
     NET_BROKER_SOCKET_PUBLICATION_VERSION, NETD_IPC_ABI_VERSION, NETD_IPC_PAYLOAD_CAPACITY,
     NETD_IPC_REQUEST_HEADER_SIZE, NETD_IPC_RESPONSE_HEADER_SIZE, NetBrokerPrepareSocketPublication,
     NetdIpcRequest, NetdIpcResponse, PROCD_SIGACTION_SA_NOCLDSTOP, PROCD_SIGCHLD_EVENT_EXIT,
-    PROCD_SIGCHLD_EVENT_MASK, RustosIpcValidateServiceOwnerArgs,
-    STORAGED_BULK_READ_PAYLOAD_CAPACITY, STORAGED_BULK_READ_RESPONSE_HEADER_BYTES,
-    SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_LINUX_ARCH_PRCTL_POLICY,
-    SYSCALL_OFFLOAD_OP_LINUX_MPROTECT, SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET,
-    SYSCALL_OFFLOAD_OP_LINUX_STATX, SYSCALL_OFFLOAD_PATH_CAPACITY,
-    SYSCALL_OFFLOAD_PAYLOAD_CAPACITY, StoragedBulkReadResponse,
+    PROCD_SIGCHLD_EVENT_MASK, PRODUCT_EXECUTABLE_SNAPSHOT_BACKING_DVM_VOLUME,
+    PRODUCT_EXECUTABLE_SNAPSHOT_EVIDENCE_ABI_VERSION, ProductExecutableSnapshotEvidence,
+    RustosIpcValidateServiceOwnerArgs, STORAGED_BULK_READ_PAYLOAD_CAPACITY,
+    STORAGED_BULK_READ_RESPONSE_HEADER_BYTES, SYSCALL_OFFLOAD_ABI_VERSION,
+    SYSCALL_OFFLOAD_OP_LINUX_ARCH_PRCTL_POLICY, SYSCALL_OFFLOAD_OP_LINUX_MPROTECT,
+    SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET, SYSCALL_OFFLOAD_OP_LINUX_STATX,
+    SYSCALL_OFFLOAD_PATH_CAPACITY, SYSCALL_OFFLOAD_PAYLOAD_CAPACITY, StoragedBulkReadResponse,
     VFS_EXECUTABLE_SNAPSHOT_ABI_VERSION, VFS_EXECUTABLE_SNAPSHOT_OP_OPEN, VFS_IPC_ABI_VERSION,
     VFS_IPC_OP_OPENAT, VFS_IPC_PAYLOAD_CAPACITY, VFS_IPC_RESPONSE_HEADER_BYTES,
     VfsExecutableSnapshotRequest, VfsExecutableSnapshotResponse, VfsIpcRequest, VfsIpcResponse,
     WAITSET_ABI_VERSION, WAITSET_PROVIDER_MAX, WAITSET_PROVIDER_VFSD, WaitSetInterestWire,
     WaitSetSignalBrokerArgs, identity_is_exact_sender, loader_service_role_allows_operation,
     net_broker_socket_publication_shape_valid, procd_sigchld_is_suppressed,
-    waitset_interest_shape_valid, waitset_signal_shape_valid,
+    product_executable_snapshot_evidence_shape_valid, waitset_interest_shape_valid,
+    waitset_signal_shape_valid,
 };
+
+#[test]
+fn product_executable_snapshot_evidence_requires_every_nonforgeable_input() {
+    let valid = ProductExecutableSnapshotEvidence {
+        storage_epoch: 7,
+        mount_generation: 8,
+        request_id: 9,
+        file_bytes: 10,
+        digest: [0x5a; 32],
+        ..ProductExecutableSnapshotEvidence::default()
+    };
+    assert!(product_executable_snapshot_evidence_shape_valid(&valid));
+    assert_eq!(
+        valid.abi_version,
+        PRODUCT_EXECUTABLE_SNAPSHOT_EVIDENCE_ABI_VERSION
+    );
+    assert_eq!(
+        valid.backing,
+        PRODUCT_EXECUTABLE_SNAPSHOT_BACKING_DVM_VOLUME
+    );
+    assert!(!product_executable_snapshot_evidence_shape_valid(
+        &ProductExecutableSnapshotEvidence {
+            request_id: 0,
+            ..valid
+        }
+    ));
+    assert!(!product_executable_snapshot_evidence_shape_valid(
+        &ProductExecutableSnapshotEvidence {
+            digest: [0; 32],
+            ..valid
+        }
+    ));
+    assert!(!product_executable_snapshot_evidence_shape_valid(
+        &ProductExecutableSnapshotEvidence {
+            reserved0: 1,
+            ..valid
+        }
+    ));
+}
 
 #[test]
 fn smp_qualification_worker_shape_is_exact_and_bounded() {

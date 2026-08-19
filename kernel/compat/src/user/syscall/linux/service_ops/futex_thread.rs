@@ -1069,7 +1069,12 @@ pub fn syscall_linux_arch_prctl(_code: u64, _arg: u64) -> u64 {
             else {
                 return linux_errno(LINUX_ENOSYS);
             };
-            if result { 0 } else { linux_errno(LINUX_ENOSYS) }
+            if result {
+                multitask::set_current_linux_tls_fs_base(_arg);
+                0
+            } else {
+                linux_errno(LINUX_ENOSYS)
+            }
         }
         linux_abi::ARCH_GET_FS => {
             let fs = x86_64::registers::model_specific::FsBase::read().as_u64();

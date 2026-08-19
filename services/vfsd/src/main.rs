@@ -51,7 +51,7 @@ use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_VFSD_OP_FD_TABLE_PLAN, COMMERCIAL_MAX_VFSD_OP_FILE_CURSOR,
     COMMERCIAL_MAX_VFSD_OP_METADATA_POLICY, COMMERCIAL_MAX_VFSD_OP_MOUNT_GRAPH,
     COMMERCIAL_MAX_VFSD_OP_PATH_RESOLVE, IPC_SERVICE_LOADERD, IPC_SERVICE_ROOTD, IPC_SERVICE_VFSD,
-    LINUX_STATX_SIZE, LINUX_STAT_SIZE, PRODUCT_MILESTONE_EXECUTABLE_SNAPSHOT_SEALED,
+    LINUX_STATX_SIZE, LINUX_STAT_SIZE, PRODUCT_MILESTONE_BOOTSTRAP_EXECUTABLE_SNAPSHOT_SEALED,
     SERVICE_CHECKPOINT_FLAG_TOMBSTONE, SERVICE_CHECKPOINT_VALUE_CAPACITY,
     SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_LINUX_ACCESS, SYSCALL_OFFLOAD_OP_LINUX_CHDIR,
     SYSCALL_OFFLOAD_OP_LINUX_CLOSE, SYSCALL_OFFLOAD_OP_LINUX_DUP, SYSCALL_OFFLOAD_OP_LINUX_FCNTL,
@@ -82,11 +82,12 @@ use vfsd::{
     executable_snapshot_marker, mkdir_policy, persistent_mutation_status,
     reply_failure_diagnostic_due, should_materialize_file_cache,
     ui_bootstrap_snapshot_reply_completed, unlink_policy, valid_checkpoint_record,
-    OpenDescriptionCheckpointWire, SeekPositionError, WaitSetInterestKey, WaitSetInterestRecord,
-    WaitSetRegistry, WaitSetRegistryError, FILE_BYTES_CACHE_BUDGET_BYTES,
-    VFSD_CHECKPOINT_HANDLE_TAG, VFSD_OPEN_CHECKPOINT_VERSION, VFSD_OPEN_MUTATION_FCNTL,
-    VFSD_OPEN_MUTATION_GETDENTS, VFSD_OPEN_MUTATION_LSEEK, VFSD_OPEN_MUTATION_OPEN,
-    VFSD_OPEN_MUTATION_READ, VFSD_OPEN_MUTATION_STABLE, VFSD_OPEN_MUTATION_STAGING,
+    ExecutableSnapshotBacking, OpenDescriptionCheckpointWire, SeekPositionError,
+    WaitSetInterestKey, WaitSetInterestRecord, WaitSetRegistry, WaitSetRegistryError,
+    FILE_BYTES_CACHE_BUDGET_BYTES, VFSD_CHECKPOINT_HANDLE_TAG, VFSD_OPEN_CHECKPOINT_VERSION,
+    VFSD_OPEN_MUTATION_FCNTL, VFSD_OPEN_MUTATION_GETDENTS, VFSD_OPEN_MUTATION_LSEEK,
+    VFSD_OPEN_MUTATION_OPEN, VFSD_OPEN_MUTATION_READ, VFSD_OPEN_MUTATION_STABLE,
+    VFSD_OPEN_MUTATION_STAGING,
 };
 
 mod block;
@@ -520,8 +521,8 @@ pub(crate) struct Metadata {
 }
 
 use storage_owner::{
-    lock_vfs_storage, open_executable_snapshot, ExecutableSnapshotAdmission,
-    ExecutableSnapshotPlan, VfsStorage,
+    lock_vfs_storage, next_executable_snapshot_request_id, open_executable_snapshot,
+    ExecutableSnapshotAdmission, ExecutableSnapshotPlan, VfsStorage,
 };
 
 include!("state_checkpoint.rs");

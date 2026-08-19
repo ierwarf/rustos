@@ -17,7 +17,7 @@ impl Scheduler {
         }
         let logical_cpu = u8::try_from(nucleus_core::util::lockdep::current_cpu_index())
             .expect("logical CPU index exceeds scheduler locality capacity");
-        self.task_last_cpu[slot] == logical_cpu
+        self.slot_last_cpu(slot) == logical_cpu
     }
 
     /// Select a local fair candidate only while its virtual-runtime lag from
@@ -40,8 +40,11 @@ impl Scheduler {
     }
 
     pub(super) fn record_task_dispatch_cpu(&mut self, slot: usize, logical_cpu: usize) {
-        self.task_last_cpu[slot] = u8::try_from(logical_cpu)
-            .expect("logical CPU index exceeds scheduler locality capacity");
+        self.record_slot_last_cpu(
+            slot,
+            u8::try_from(logical_cpu)
+                .expect("logical CPU index exceeds scheduler locality capacity"),
+        );
     }
 
     /// Walk scheduling classes in priority order and select the global
@@ -70,10 +73,11 @@ impl Scheduler {
             let Some(class) = self.slot_class(slot) else {
                 continue;
             };
+            let vruntime = self.slot_vruntime(slot);
             let key = if slot == current {
-                context.vruntime_ns.saturating_add(1)
+                vruntime.saturating_add(1)
             } else {
-                context.vruntime_ns
+                vruntime
             };
             let candidate = &mut best_by_class[class.index()];
             if candidate
@@ -123,25 +127,26 @@ impl Scheduler {
             };
             let distance = (slot + MAX_TASK - excluded) % MAX_TASK;
             let candidate = &mut best_by_class[class.index()];
+            let vruntime = self.slot_vruntime(slot);
             if candidate
                 .map(|(_, best_vruntime, best_distance)| {
-                    context.vruntime_ns < best_vruntime
-                        || (context.vruntime_ns == best_vruntime && distance < best_distance)
+                    vruntime < best_vruntime
+                        || (vruntime == best_vruntime && distance < best_distance)
                 })
                 .unwrap_or(true)
             {
-                *candidate = Some((slot, context.vruntime_ns, distance));
+                *candidate = Some((slot, vruntime, distance));
             }
             if self.candidate_is_local_to_current_cpu(slot) {
                 let local = &mut local_by_class[class.index()];
                 if local
                     .map(|(_, best_vruntime, best_distance)| {
-                        context.vruntime_ns < best_vruntime
-                            || (context.vruntime_ns == best_vruntime && distance < best_distance)
+                        vruntime < best_vruntime
+                            || (vruntime == best_vruntime && distance < best_distance)
                     })
                     .unwrap_or(true)
                 {
-                    *local = Some((slot, context.vruntime_ns, distance));
+                    *local = Some((slot, vruntime, distance));
                 }
             }
         }
@@ -179,10 +184,11 @@ impl Scheduler {
             if self.slot_class(slot) != Some(class) {
                 continue;
             }
+            let vruntime = self.slot_vruntime(slot);
             let key = if slot == current {
-                ctx.vruntime_ns.saturating_add(1)
+                vruntime.saturating_add(1)
             } else {
-                ctx.vruntime_ns
+                vruntime
             };
             match best {
                 None => best = Some((slot, key)),
@@ -218,7 +224,7 @@ impl Scheduler {
             if self.slot_class(slot) != Some(class) {
                 continue;
             }
-            let key = ctx.vruntime_ns;
+            let key = self.slot_vruntime(slot);
             if best
                 .map(|(_, current_key)| key < current_key)
                 .unwrap_or(true)
@@ -403,8 +409,8 @@ pub(in crate::multitask) fn record_sync_handoff_miss(reason: SyncHandoffMissReas
 
 /// Takes the window's sync-handoff miss breakdown, clearing it for the next
 /// window. Indexed by `SyncHandoffMissReason`.
-pub(in crate::multitask) fn take_sync_handoff_miss_window()
--> [u64; SYNC_HANDOFF_MISS_REASON_COUNT] {
+pub(in crate::multitask) fn take_sync_handoff_miss_window() -> [u64; SYNC_HANDOFF_MISS_REASON_COUNT]
+{
     core::array::from_fn(|reason| {
         SYNC_HANDOFF_MISSES[reason].swap(0, core::sync::atomic::Ordering::Relaxed)
     })
@@ -515,9 +521,8 @@ pub(in crate::multitask) enum SyncHandoffReplyCustodyFailReason {
 }
 
 static SYNC_HANDOFF_REPLY_CUSTODY_FAIL: [core::sync::atomic::AtomicU64;
-    SYNC_HANDOFF_REPLY_CUSTODY_FAIL_REASON_COUNT] = [const {
-    core::sync::atomic::AtomicU64::new(0)
-}; SYNC_HANDOFF_REPLY_CUSTODY_FAIL_REASON_COUNT];
+    SYNC_HANDOFF_REPLY_CUSTODY_FAIL_REASON_COUNT] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; SYNC_HANDOFF_REPLY_CUSTODY_FAIL_REASON_COUNT];
 
 pub(in crate::multitask) fn record_sync_handoff_reply_custody_fail(
     reason: SyncHandoffReplyCustodyFailReason,
@@ -546,9 +551,8 @@ pub(in crate::multitask) fn take_sync_handoff_reply_custody_fail_window()
 pub(in crate::multitask) const SYNC_HANDOFF_GENERATION_FAIL_STATE_COUNT: usize = 8;
 
 static SYNC_HANDOFF_GENERATION_FAIL_STATE: [core::sync::atomic::AtomicU64;
-    SYNC_HANDOFF_GENERATION_FAIL_STATE_COUNT] = [const {
-    core::sync::atomic::AtomicU64::new(0)
-}; SYNC_HANDOFF_GENERATION_FAIL_STATE_COUNT];
+    SYNC_HANDOFF_GENERATION_FAIL_STATE_COUNT] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; SYNC_HANDOFF_GENERATION_FAIL_STATE_COUNT];
 
 pub(in crate::multitask) fn record_sync_handoff_generation_fail_state(state_index: usize) {
     if let Some(counter) = SYNC_HANDOFF_GENERATION_FAIL_STATE.get(state_index) {

@@ -44,7 +44,8 @@ impl Scheduler {
                 online_mask |= 1_u64 << descriptor.logical_index;
             }
         }
-        let affinity = self.task_affinity_masks[slot] & self.process_affinity_masks[slot];
+        let (task_mask, process_mask, _) = self.slot_affinity_snapshot(slot);
+        let affinity = task_mask & process_mask;
         let eligible = affinity & online_mask;
         if eligible != 0 {
             return eligible;
@@ -66,7 +67,7 @@ impl Scheduler {
     fn runqueue_target_cpu(&self, slot: usize) -> usize {
         let eligible = self.runqueue_online_affinity_mask(slot);
         let current = nucleus_core::util::lockdep::current_cpu_index();
-        let last = usize::from(self.task_last_cpu[slot]);
+        let last = usize::from(self.slot_last_cpu(slot));
         let preferred = if last < nucleus_core::util::lockdep::MAX_TRACKED_CPUS
             && eligible & (1_u64 << last) != 0
         {
@@ -193,7 +194,7 @@ impl Scheduler {
                 let Some(class) = self.slot_class(slot) else {
                     continue;
                 };
-                let candidate = (class, context.vruntime_ns, slot);
+                let candidate = (class, self.slot_vruntime(slot), slot);
                 if selected.is_none_or(|current| candidate < current) {
                     selected = Some(candidate);
                 }
@@ -265,7 +266,7 @@ impl Scheduler {
             {
                 continue;
             }
-            let candidate = (class, context.vruntime_ns, slot, target_cpu);
+            let candidate = (class, self.slot_vruntime(slot), slot, target_cpu);
             if selected.is_none_or(|current| candidate < current) {
                 selected = Some(candidate);
             }

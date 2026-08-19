@@ -986,6 +986,8 @@ were both answered in a single run.
 2. Query the live goal state, then run `git status --short` and a focused
    `git diff --stat`. Treat both as inspection only; do not normalize the
    checkout.
+   When the worktree is intentionally dirty, preserve it as an explicit
+   boundary: never reset, checkout, clean, or otherwise discard its changes.
 3. Route the new user request through `task-router.md`. Read this page again
    only for continuation or handoff work, not as a universal fifth prefix.
 4. Use Serena or ripgrep for scoped discovery. If either MCP server is absent

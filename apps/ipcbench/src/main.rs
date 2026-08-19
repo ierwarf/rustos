@@ -686,9 +686,7 @@ mod probe_filter_tests {
     #[test]
     fn a_duplicated_probe_line_is_rejected() {
         assert_eq!(
-            parse_ipcbench_probe_contract(
-                "contract=rustos-ipcbench-probe-v1\nprobe=a\nprobe=b\n"
-            ),
+            parse_ipcbench_probe_contract("contract=rustos-ipcbench-probe-v1\nprobe=a\nprobe=b\n"),
             None
         );
     }
@@ -696,9 +694,7 @@ mod probe_filter_tests {
     #[test]
     fn an_unrecognized_line_is_rejected() {
         assert_eq!(
-            parse_ipcbench_probe_contract(
-                "contract=rustos-ipcbench-probe-v1\nprobe=a\nextra=1\n"
-            ),
+            parse_ipcbench_probe_contract("contract=rustos-ipcbench-probe-v1\nprobe=a\nextra=1\n"),
             None
         );
     }

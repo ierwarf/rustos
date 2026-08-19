@@ -13,6 +13,7 @@ use super::{
     service_deferred_shared_region_reclaims, shared_region_len, signal_event,
 };
 use kernel_object::api::handle::{FileHandleRights, HandleOwner, HandleRights, HandleToken};
+use kernel_object::api::identity::{ObjectKind, ObjectOwner};
 use spin::Mutex;
 
 static IPC_TEST_GUARD: Mutex<()> = Mutex::new(());
@@ -65,6 +66,91 @@ fn non_transferable_file_handle(id: u64) -> super::KernelTransferredHandle {
         HandleToken::new(HandleOwner::Io, id),
         HandleRights::File(FileHandleRights::READ),
     )
+}
+
+#[test]
+fn kernel_transfer_ticket_binds_the_nonzero_transfer_object_generation() {
+    assert!(super::KernelTransferTicket::new(0, 7, 9).is_none());
+    assert!(super::KernelTransferTicket::new(7, 0, 9).is_none());
+    assert!(super::KernelTransferTicket::new(7, 9, 0).is_none());
+
+    let ticket = super::KernelTransferTicket::new(7, 9, 11).expect("valid ticket");
+    let identity = ticket.identity();
+    assert_eq!(identity.owner(), ObjectOwner::Ipc);
+    assert_eq!(identity.kind(), ObjectKind::Transfer);
+    assert_eq!(identity.slot(), ticket.transfer_id());
+    assert_eq!(identity.generation(), ticket.batch_generation());
+}
+
+#[test]
+fn endpoint_and_reply_handles_decode_only_in_range_generational_identities() {
+    let endpoint = super::KernelEndpointHandle::from_raw((7_u64 << 16) | 3);
+    let endpoint_identity = endpoint.identity().expect("endpoint identity");
+    assert_eq!(endpoint_identity.owner(), ObjectOwner::Ipc);
+    assert_eq!(endpoint_identity.kind(), ObjectKind::Endpoint);
+    assert_eq!(endpoint_identity.slot(), 3);
+    assert_eq!(endpoint_identity.generation(), 7);
+
+    let reply = super::KernelReplyHandle::from_raw((9_u64 << 16) | 11);
+    let reply_identity = reply.identity().expect("reply identity");
+    assert_eq!(reply_identity.owner(), ObjectOwner::Ipc);
+    assert_eq!(reply_identity.kind(), ObjectKind::Reply);
+    assert_eq!(reply_identity.slot(), 11);
+    assert_eq!(reply_identity.generation(), 9);
+
+    assert!(
+        super::KernelEndpointHandle::from_raw(3)
+            .identity()
+            .is_none()
+    );
+    assert!(
+        super::KernelEndpointHandle::from_raw((1_u64 << 16) | 513)
+            .identity()
+            .is_none()
+    );
+    assert!(
+        super::KernelReplyHandle::from_raw((1_u64 << 16) | 129)
+            .identity()
+            .is_none()
+    );
+}
+
+#[test]
+fn transferred_handle_derivation_only_attenuates_typed_rights() {
+    let parent_rights = FileHandleRights::READ
+        .union(FileHandleRights::WRITE)
+        .union(FileHandleRights::TRANSFER);
+    let parent = super::KernelTransferredHandle::new(
+        7,
+        HandleToken::new(HandleOwner::Io, 9),
+        HandleRights::File(parent_rights),
+    );
+
+    let child = parent
+        .attenuate(HandleRights::File(
+            FileHandleRights::READ.union(FileHandleRights::TRANSFER),
+        ))
+        .expect("read-only transfer derivation");
+    assert_eq!(child.transfer_id(), parent.transfer_id());
+    assert_eq!(child.token(), parent.token());
+    assert!(child.rights().allows_read());
+    assert!(!child.rights().allows_write());
+    assert!(child.is_transferable());
+
+    assert!(
+        parent
+            .attenuate(HandleRights::File(
+                parent_rights.union(FileHandleRights::APPEND),
+            ))
+            .is_none()
+    );
+    assert!(
+        parent
+            .attenuate(HandleRights::Device(
+                kernel_object::api::handle::DeviceHandleRights::READ,
+            ))
+            .is_none()
+    );
 }
 
 #[test]
