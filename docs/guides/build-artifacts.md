@@ -58,26 +58,58 @@ there silently reprices every recorded cycle count.
 
 ## Build speed
 
-`.cargo/config.toml` adds two host-target flags: LLD for linking and the
-parallel rustc front-end at 8 threads. Both reach ordinary `cargo
-build`/`test`/`check` only. Kernel and nucleus builds go through
-`apply_kernel_cargo_env`, which sets the `RUSTFLAGS` environment variable
-outright, and Cargo discards `target.*.rustflags` whenever that variable is
-present — so the kernel's `-static-pie` / `-nostartfiles` link line is
-untouched. Express host tuning as `rustflags`, never as a `linker` key:
-`target.*.linker` is *not* suppressed by the environment variable and would
-follow the kernel into its link step.
-
-Measured on cold builds into a scratch target directory:
+The size settings pay a little speed as a side effect — there is less debug info
+to emit and less for the linker to move — but only a little. Measured serially
+on cold builds into a scratch target directory, against the tree as it stood
+before these settings:
 
 | Build | Before | After |
 | --- | --- | --- |
-| `xtask` dependency closure | 10.96s, 498M | 8.97s, 165M |
-| `cargo test -p kernel-ps --no-run` | 7.60s, 464M | 4.63s, 299M |
+| `xtask` dependency closure | 10.68s, 498M | 10.20s, 253M |
+| `cargo test -p kernel-ps --no-run` | 7.82s, 464M | 7.52s, 299M |
 
-Optimizing build scripts and proc macros was measured too and rejected: at
-`opt-level = 1` the `xtask` closure went from 10.96s to 13.01s, so only their
-debug info is dropped.
+Roughly 4% off the clock and 40-50% off the disk. Do not expect more from this
+change; the disk is what it was for.
+
+Three further levers were tried and are deliberately absent. Each is recorded
+because the reasoning is not recoverable from the config once the line is gone.
+
+- **`opt-level = 1` for build scripts and proc macros.** The `xtask` closure
+  went from 10.96s to 13.01s. Optimizing them costs more than it repays at this
+  workspace's size.
+- **`-Clink-arg=-fuse-ld=lld`.** This target's `linker-flavor` is already
+  `gnu-lld-cc`, so rustc links with the toolchain's own `rust-lld`. The flag
+  only swaps that for whatever `ld.lld` sits on `PATH`, trading a
+  version-matched bundled linker for an external, skewable one.
+- **`-Zthreads=8`, the parallel front-end.** At 8 threads it dropped a
+  monomorphized instance from `wayclick`, whose link then failed on an
+  undefined `<DispatchError as From<WaylandError>>::from`. That is a
+  miscompilation, not a flag mismatch, and `cargo xtask check` cannot see it
+  because checking never links. Its artifacts also poison a target tree: a
+  later, correct build reused them and failed identically until the tree was
+  removed. If it is ever retried, `cargo build -p wayclick` in a fresh target
+  directory is the cheap test.
+
+## Why `--workspace` does not build
+
+`cargo build --workspace` fails on a duplicate `panic_impl` lang item, and no
+dependency pin fixes it. The workspace holds 28 `no_std` members and 17 host
+members. The `no_std` service binaries define their own panic handler; the host
+members pull shared dependencies — `fatfs`, `bitflags`, and others behind them —
+with the `std` feature on. Cargo unifies features across whatever one invocation
+is asked to build, so the union links `std` into a freestanding binary and rustc
+rejects the second lang item.
+
+The split is not tools-versus-RustOS. `uiserver` and `netd` are std services;
+`vfsd` and `syscalld` are not. Any fix that keeps both halves in one cargo
+invocation would have to repartition the services themselves.
+
+Each half builds cleanly alone, so `default-members` in the workspace manifest
+pins the default to the host half. Plain `cargo build`, `cargo test`, and
+`cargo clippy` work at the repo root; the freestanding half is built per
+package, with its own target and link line, by `cargo xtask build`.
+`cargo xtask check` remains the whole-tree gate. `cargo build --workspace`
+explicitly asks for the union and still fails — that is the invocation to avoid.
 
 ## What this means for the formal gate
 
@@ -89,10 +121,11 @@ other lane moves nothing until it passes 159s.
 The mutation lane is compile-bound: it shards across four checkouts and, for
 each of 484 mutants, compiles and runs one witness test under the `dev`
 profile. 184 of those mutants target `kernel-ps`, whose test build is the
-second row of the table above. The profile and linker changes land directly on
-that inner loop.
+second row of the table above, so the profile change lands directly on that
+inner loop — at about 4%, which is honest but small. Nothing here makes the
+formal gate substantially faster.
 
-Two things that look like levers are not:
+Three things that look like levers are not:
 
 - **sccache.** It is installed but unused, and the four shards do compile
   overlapping trees. Enabling it disables incremental compilation, and the
@@ -102,6 +135,8 @@ Two things that look like levers are not:
 - **Shard count.** It is `min(4, cpu_count / 4, mutants, affordable)`. On 16
   cores that is 4, and the disk term only binds on a nearly full device.
   Reclaiming space does not buy more shards here.
+- **The parallel front-end.** It would have cut the inner loop far more than
+  4%, and it miscompiles — see the previous section.
 
 TLC is left as it is. It runs first and alone, because its budgets are wall
 clocks that only mean what they say when the lane is not competing for cores,

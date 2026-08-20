@@ -49,6 +49,43 @@ members = [
 ]
 resolver = "3"
 
+# A single cargo invocation cannot build every member. `no_std` service
+# binaries such as vfsd and syscalld define their own `panic_impl`, while
+# host members such as uiserver and xtask pull the same shared dependencies
+# with their `std` feature on. Cargo unifies features across whatever it is
+# asked to build, so a union of the two halves links std into a freestanding
+# binary and rustc rejects the duplicate lang item. The split does not follow
+# tools-versus-RustOS either: uiserver and netd are std services, vfsd and
+# syscalld are not.
+#
+# Each half builds cleanly on its own, so `default-members` pins the default
+# to the host half and plain `cargo build`, `cargo test`, and `cargo clippy`
+# work at the repo root. The freestanding half is built per package, with its
+# target and link line, by `cargo xtask build`.
+#
+# `cargo build --workspace` explicitly asks for the union and still fails.
+# That is the invocation to avoid; `cargo xtask check` is the whole-tree gate.
+default-members = [
+    "libs/driver-domain-host",
+    "libs/observability-client",
+    "libs/runtime-control",
+    "libs/trace-loc-macro",
+    "services/initd",
+    "services/storaged",
+    "services/inputd",
+    "services/netd",
+    "services/devmgrd",
+    "services/runtimed",
+    "services/sessiond",
+    "services/uiserver",
+    "apps/ipcbench",
+    "apps/wayclick",
+    "tests/contract-tests",
+    "tools/xtask",
+    "tools/hostd",
+]
+
+
 [profile.release]
 panic = "abort"
 
