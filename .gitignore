@@ -14,7 +14,10 @@
 /result_output_dir/
 /states/
 /formal/fuzz/artifacts/
-/formal/fuzz/target/
+# Every proof harness under formal/ builds into its own cargo tree; loom and
+# shuttle alone reached 360M. They are build caches, not evidence -- the
+# evidence each lane seals on lives under build/formal.
+/formal/*/target/
 /docs/book/
 /docs/src/
 

@@ -28,6 +28,7 @@
 
 - [Add a Service](guides/add-service.md)
 - [Add an App](guides/add-app.md)
+- [Build Artifacts and Disk](guides/build-artifacts.md)
 
 # Reference
 

@@ -52,5 +52,33 @@ resolver = "3"
 [profile.release]
 panic = "abort"
 
+# `release` is the profile the nucleus, the image, and every `cargo xtask bench`
+# baseline are built under. Its codegen settings are load-bearing for those
+# recorded cycle counts, so size and speed tuning stays out of it -- a change
+# here silently reprices every `min` column the bench baselines compare against.
+
 [profile.dev]
 panic = "abort"
+# Full DWARF for 48 workspace crates plus their dependency closure is what made
+# `target/debug` grow past 40G, and emitting and linking it is also a large part
+# of a debug build's wall time. Line tables keep every backtrace's file and line
+# number -- what panics and test failures actually report -- and drop only the
+# variable-inspection data a source debugger would want.
+debug = "line-tables-only"
+# Leave debug info in the object files instead of copying it into each output
+# binary. The linker stops moving DWARF around, which is the single largest cost
+# in a link once LLD is doing the linking.
+split-debuginfo = "unpacked"
+
+# Dependencies are not what anyone steps through here, and their debug info was
+# the bulk of `target/debug/deps`. Workspace crates keep the line tables set
+# above; this applies to the closure outside the workspace only.
+[profile.dev.package."*"]
+debug = false
+
+# Build scripts and proc macros are run, never stepped through, so their debug
+# info is pure overhead. Optimizing them was measured too and did not pay for
+# itself -- a cold build of the xtask closure went from 10.96s to 13.01s -- so
+# only the debug info is dropped here.
+[profile.dev.build-override]
+debug = false

@@ -1,2 +1,33 @@
 [alias]
 xtask = "run -q -p xtask --"
+
+# Host-target build acceleration.
+#
+# These flags reach ordinary `cargo build`/`test`/`check` runs only. Every
+# kernel and nucleus invocation goes through `apply_kernel_cargo_env`, which
+# sets the `RUSTFLAGS` environment variable outright, and Cargo drops
+# `target.*.rustflags` entirely whenever that variable is present. The kernel's
+# `-static-pie`/`-nostartfiles`/`--no-dynamic-linker` link line is therefore
+# untouched by anything written here. Keep it that way: express host build
+# tuning as `rustflags`, never as a `linker` key, because `target.*.linker` is
+# *not* suppressed by the environment variable and would follow the kernel into
+# its link step.
+[target.x86_64-unknown-linux-gnu]
+rustflags = [
+    # LLD links the 48-crate workspace's test and service binaries several times
+    # faster than BFD ld. GCC resolves `-fuse-ld=lld` against `ld.lld` on PATH,
+    # so this needs no linker key and no toolchain-internal path.
+    "-Clink-arg=-fuse-ld=lld",
+    # Parallel rustc front-end. 8 is the value upstream measures as the plateau;
+    # past it the coordination cost cancels the added threads.
+    "-Zthreads=8",
+]
+
+[unstable]
+# Stop duplicating each crate's metadata into its `.rlib` when a `.rmeta`
+# already carries it. Pure disk saving: same artifacts, same semantics.
+no-embed-metadata = true
+# Let Cargo age out unused registry sources and caches under CARGO_HOME on its
+# own. This governs the Cargo home cache, not `target/` -- the target tree is
+# what `cargo xtask clean --stale` is for.
+gc = true

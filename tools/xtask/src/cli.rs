@@ -26,7 +26,34 @@ enum XtaskCommand {
         #[arg(long)]
         timings: bool,
     },
-    Clean,
+    /// Reclaim build artifacts.
+    ///
+    /// Bare `clean` is the full wipe: the whole target tree, `build/`, and
+    /// `logs/`. That is rarely what a working tree needs, and AGENTS.md tells
+    /// an interrupted build to resume rather than clean. The flags below are
+    /// the graduated forms - each one names artifacts that are provably not
+    /// reachable by a future build, so nothing warm is thrown away.
+    Clean {
+        /// Drop only compilation artifacts untouched for this many days.
+        ///
+        /// Cargo keys an incremental session directory by crate and
+        /// fingerprint and never revisits a session whose fingerprint has
+        /// moved on, so aged sessions are pure residue: 1372 of 1733 of them
+        /// held 24G here. The current build cache is left alone.
+        #[arg(long, value_name = "DAYS")]
+        stale: Option<u32>,
+        /// Also drop the formal lanes' regenerable scratch.
+        ///
+        /// The mutation shards' cargo target trees, the ABI differential's
+        /// Wine prefix, and the proof kernels' build caches. Evidence - every
+        /// log, summary, signature, and proof index under `build/formal` - is
+        /// never touched; it totals under 10M against their 14G.
+        #[arg(long)]
+        scratch: bool,
+        /// Report what each tier would reclaim and delete nothing.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+    },
     #[command(name = "dev-plan")]
     DevPlan,
     #[command(name = "formal-contracts")]
@@ -169,7 +196,11 @@ pub(crate) fn run() -> Result<()> {
     match cli.command {
         Some(XtaskCommand::Build { timings }) => build::build(&config, timings),
         Some(XtaskCommand::Check { timings }) => build::check(&config, timings),
-        Some(XtaskCommand::Clean) => build::clean(&config),
+        Some(XtaskCommand::Clean {
+            stale,
+            scratch,
+            dry_run,
+        }) => build::clean(&config, stale, scratch, dry_run),
         Some(XtaskCommand::DevPlan) => unreachable!("dev-plan returned before loading config"),
         Some(XtaskCommand::FormalContracts { .. }) => {
             unreachable!("formal-contracts returned before loading config")

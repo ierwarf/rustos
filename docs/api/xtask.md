@@ -20,6 +20,7 @@ is defined in `tools/xtask/src/cli.rs`.
 | `cargo xtask verify-dvm` | Verify DVM artifact and pre-transport contract hashes. |
 | `cargo xtask kvm-smoke` | Concurrently boot the Linux DVM and RustOS through QEMU/KVM. |
 | `cargo xtask selftest` / `fuzz-host` | Run host contract tests and deterministic parser fuzzing, including hostd launch plans. |
+| `cargo xtask clean` | Reclaim build artifacts. `--stale <DAYS>` drops only aged compilation residue, `--scratch` drops the formal lanes' regenerable trees, `--dry-run` reports without deleting. Bare `clean` is the full wipe. |
 
 `build-dvm` is a full Buildroot appliance build, not the default validation for
 small RustOS changes. Reuse an already verified appliance. Before integration,
@@ -117,6 +118,7 @@ surface는 `tools/xtask/src/cli.rs`에 있습니다.
 | `cargo xtask build-dvm` | 고정된 Buildroot Linux DVM을 빌드하고 hash를 검증합니다. |
 | `cargo xtask verify-dvm` | DVM artifact와 host-control contract hash를 검증합니다. |
 | `cargo xtask kvm-smoke` | QEMU/KVM에서 Linux DVM과 RustOS를 병렬 부팅합니다. |
+| `cargo xtask clean` | build artifact를 회수합니다. `--stale <DAYS>`는 오래된 컴파일 잔여물만, `--scratch`는 formal lane의 재생성 가능한 tree만 지우고 `--dry-run`은 삭제 없이 보고합니다. 인자 없는 `clean`은 전체 삭제입니다. |
 | `cargo xtask selftest` / `fuzz-host` | host contract test와 hostd launch plan을 포함한 deterministic parser fuzz를 실행합니다. |
 
 `build-dvm`은 Buildroot appliance 전체 빌드이므로 작은 RustOS 수정의 기본
