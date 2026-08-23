@@ -150,6 +150,11 @@ mod tests {
         );
         assert_eq!(syscall::SYS_RUSTOS_ROOTD_WAIT_BROKER, 0x5255_003b);
         assert_eq!(syscall::SYS_RUSTOS_ROOTD_TERMINATE_BROKER, 0x5255_003c);
+        assert_eq!(
+            syscall::SYS_RUSTOS_SCHEDULING_CONTEXT_GRANT_BROKER,
+            0x5255_004d
+        );
+        assert_eq!(syscall::SYS_RUSTOS_SCHEDULING_CONTEXT_SNAPSHOT, 0x5255_004e);
         assert!(
             size_of::<syscall::RustosRootdTerminateBrokerArgs>() <= syscall::IPC_MAX_INLINE_BYTES
         );

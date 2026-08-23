@@ -263,6 +263,30 @@ fn isolation_holds(phases: &[PhaseTotal]) -> bool {
     })
 }
 
+/// Semantic acceptance probes intentionally exercise scheduler transitions
+/// rather than phase-profile attribution. Their kernel-stamped invariant is
+/// the primary result gate; unrelated system-wide IPC housekeeping cannot be
+/// divided by their iteration count and must not fabricate a failure.
+fn requires_phase_attribution(probe: &str) -> bool {
+    !matches!(
+        probe,
+        "scheduling_budget_exhaust_refill" | "ipc_nested_passive_server"
+    )
+}
+
+fn isolated_primary_result_holds(run: &ParsedRun, probe: &str) -> bool {
+    let primary_results = run
+        .results
+        .iter()
+        .filter(|result| result.name == probe)
+        .count();
+    let primary_skips = run.skipped.iter().any(|skip| {
+        skip.split_ascii_whitespace()
+            .any(|field| field.strip_prefix("name=") == Some(probe))
+    });
+    primary_results == 1 && !primary_skips
+}
+
 fn render_phases(phases: &[PhaseTotal]) -> String {
     let mut out = String::new();
     if phases.is_empty() {
@@ -507,7 +531,10 @@ pub(crate) fn bench(
         "--dvm-network-shmem".to_owned(),
         "--dvm-block-shmem".to_owned(),
         "--timeout".to_owned(),
-        "120".to_owned(),
+        // The guest normally reaches the harness terminal in under twenty
+        // seconds even with the isolated-probe settle. Keep a broken boot
+        // bounded by the repository's KVM acceptance ceiling.
+        "30".to_owned(),
         // Lock contention is invisible on one CPU: `lock-phase-spin` only
         // moves when two CPUs actually want the same word. Comparing a
         // one-vCPU run against a multi-vCPU one is how a sharding or
@@ -535,17 +562,25 @@ pub(crate) fn bench(
     let run = parse_log(&log)?;
 
     if let Some(probe) = isolate_probe {
+        if !isolated_primary_result_holds(&run, probe) {
+            bail!(
+                "isolated ipcbench probe {probe} did not produce exactly one non-skipped primary result"
+            );
+        }
         let phases = render_phases(&run.phases);
-        let verdict = if isolation_holds(&run.phases) {
-            "PASS"
+        if requires_phase_attribution(probe) && !isolation_holds(&run.phases) {
+            bail!("isolated ipcbench phase attribution failed for probe {probe}");
+        }
+        let check = if requires_phase_attribution(probe) {
+            format!(
+                "phase attribution; every ipc-call-phase-*/usermem-phase-* row is inside {:.2}..={:.2} per round trip, or absent",
+                ATTRIBUTABLE_RATIO.0, ATTRIBUTABLE_RATIO.1,
+            )
         } else {
-            "FAIL"
+            "kernel-stamped semantic proof; the primary result is emitted only after every probe invariant passes".to_owned()
         };
         println!(
-            "\n=== ipcbench (isolated: {probe}) ==={phases}\nisolation check: {verdict} \
-             (every ipc-call-phase-*/usermem-phase-* row is inside {:.2}..={:.2} per round trip, \
-             or absent)\n",
-            ATTRIBUTABLE_RATIO.0, ATTRIBUTABLE_RATIO.1,
+            "\n=== ipcbench (isolated: {probe}) ==={phases}\nisolation check: PASS ({check})\n",
         );
         return Ok(());
     }
@@ -761,6 +796,23 @@ user-debug payload=ipcbench: end\\n";
         assert_eq!(run.results[0].min, 3360);
         assert_eq!(run.results[0].p50_ns, 851);
         assert_eq!(run.skipped.len(), 1);
+    }
+
+    #[test]
+    fn isolated_probe_requires_its_exact_primary_result_without_a_skip() {
+        let run = parse_log(SAMPLE).expect("sample parses");
+        assert!(isolated_primary_result_holds(&run, "null_syscall_getpid"));
+        assert!(!isolated_primary_result_holds(&run, "other"));
+        assert!(!isolated_primary_result_holds(&run, "missing"));
+    }
+
+    #[test]
+    fn semantic_probes_do_not_misattribute_system_wide_ipc_housekeeping() {
+        assert!(!requires_phase_attribution(
+            "scheduling_budget_exhaust_refill"
+        ));
+        assert!(!requires_phase_attribution("ipc_nested_passive_server"));
+        assert!(requires_phase_attribution("ipc_rt_intra_process"));
     }
 
     #[test]

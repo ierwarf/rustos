@@ -52,10 +52,15 @@ impl RetirementSideEffect {
         if let Some(task_id) = self.task_id {
             kernel_hal::api::arch::rtc::disarm_sleep_waiter(task_id);
             kernel_ipc_runtime::api::remove_endpoint_waiters_for_task(task_id);
-            let cancelled =
-                kernel_ipc_runtime::api::cancel_endpoint_calls_for_task(task_id, |discarded| {
+            let cancelled = kernel_ipc_runtime::api::cancel_endpoint_calls_for_task(
+                task_id,
+                |discarded| {
                     crate::user::handles::drop_ipc_transfer_descriptors(discarded);
-                });
+                },
+                |reply, custody| {
+                    let _ = super::super::settle_ipc_reply_scheduling_context(reply.raw(), custody);
+                },
+            );
             if cancelled != 0 {
                 debug::record_milestone(
                     debug::LogCategory::Sched,
@@ -68,6 +73,7 @@ impl RetirementSideEffect {
                 task_id,
                 kernel_ipc_runtime::api::IpcError::PeerClosed,
             );
+            settle_endpoint_scheduling_contexts(&wake_set);
             wake_tasks(wake_set.callers(), &mut wake_task);
             wake_tasks(wake_set.receivers(), &mut wake_task);
         }
@@ -76,12 +82,22 @@ impl RetirementSideEffect {
                 process_id,
                 kernel_ipc_runtime::api::IpcError::PeerClosed,
             );
+            settle_endpoint_scheduling_contexts(&wake_set);
             wake_tasks(wake_set.callers(), &mut wake_task);
             wake_tasks(wake_set.receivers(), &mut wake_task);
         }
         if let Some(process_handle) = self.detach_process_handle {
             let _ = process_table::detach_task(process_handle);
         }
+    }
+}
+
+fn settle_endpoint_scheduling_contexts(wake_set: &kernel_ipc_runtime::api::EndpointWakeSet) {
+    for returned in wake_set.scheduling_contexts() {
+        let _ = super::super::settle_ipc_reply_scheduling_context(
+            returned.reply.raw(),
+            returned.custody,
+        );
     }
 }
 

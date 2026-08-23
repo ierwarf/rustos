@@ -386,12 +386,81 @@ pub enum IpcError {
     NoMemory,
 }
 
+/// Scheduling authority carried by one synchronous call until its reply
+/// reaches a terminal transition.  The IPC runtime owns only this neutral,
+/// integer-only custody token; budget policy and charging remain in
+/// `kernel-ps` and, ultimately, the user-mode scheduler policy service.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReplySchedulingContextCustody {
+    identity: ObjectIdentity,
+    /// Task whose scheduling-context object supplies temporal authority.
+    /// This differs from `caller_task_id` across a nested passive-server call.
+    context_owner_task_id: u64,
+    /// Immediate caller that must receive this custody on terminal reply.
+    caller_task_id: u64,
+}
+
+impl ReplySchedulingContextCustody {
+    pub fn new(identity: ObjectIdentity, caller_task_id: u64) -> Option<Self> {
+        Self::new_with_owner(identity, caller_task_id, caller_task_id)
+    }
+
+    pub fn new_with_owner(
+        identity: ObjectIdentity,
+        context_owner_task_id: u64,
+        caller_task_id: u64,
+    ) -> Option<Self> {
+        if identity.owner() != ObjectOwner::Ps
+            || identity.kind() != ObjectKind::SchedulingContext
+            || context_owner_task_id == 0
+            || caller_task_id == 0
+        {
+            return None;
+        }
+        Some(Self {
+            identity,
+            context_owner_task_id,
+            caller_task_id,
+        })
+    }
+
+    pub const fn identity(self) -> ObjectIdentity {
+        self.identity
+    }
+
+    pub const fn donor_task_id(self) -> u64 {
+        self.caller_task_id
+    }
+
+    pub const fn context_owner_task_id(self) -> u64 {
+        self.context_owner_task_id
+    }
+
+    pub const fn caller_task_id(self) -> u64 {
+        self.caller_task_id
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReplyCompletion {
+    pub caller_task_id: u64,
+    pub scheduling_context: Option<ReplySchedulingContextCustody>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReplySchedulingContextReturn {
+    pub reply: KernelReplyHandle,
+    pub custody: ReplySchedulingContextCustody,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EndpointWakeSet {
     callers: [u64; MAX_ENDPOINT_WAKE_TASKS],
     caller_count: usize,
     receivers: [u64; MAX_ENDPOINT_WAKE_TASKS],
     receiver_count: usize,
+    scheduling_contexts: [Option<ReplySchedulingContextReturn>; MAX_ENDPOINT_WAKE_TASKS],
+    scheduling_context_count: usize,
 }
 
 impl Default for EndpointWakeSet {
@@ -401,6 +470,8 @@ impl Default for EndpointWakeSet {
             caller_count: 0,
             receivers: [0; MAX_ENDPOINT_WAKE_TASKS],
             receiver_count: 0,
+            scheduling_contexts: [None; MAX_ENDPOINT_WAKE_TASKS],
+            scheduling_context_count: 0,
         }
     }
 }
@@ -430,12 +501,33 @@ impl EndpointWakeSet {
         self.receiver_count += 1;
     }
 
+    fn push_scheduling_context(
+        &mut self,
+        reply: KernelReplyHandle,
+        custody: ReplySchedulingContextCustody,
+    ) {
+        assert!(
+            self.scheduling_context_count < self.scheduling_contexts.len(),
+            "endpoint scheduling-context settlement exceeds message capacity"
+        );
+        self.scheduling_contexts[self.scheduling_context_count] =
+            Some(ReplySchedulingContextReturn { reply, custody });
+        self.scheduling_context_count += 1;
+    }
+
     pub fn callers(&self) -> &[u64] {
         &self.callers[..self.caller_count]
     }
 
     pub fn receivers(&self) -> &[u64] {
         &self.receivers[..self.receiver_count]
+    }
+
+    pub fn scheduling_contexts(&self) -> impl Iterator<Item = ReplySchedulingContextReturn> + '_ {
+        self.scheduling_contexts[..self.scheduling_context_count]
+            .iter()
+            .copied()
+            .flatten()
     }
 }
 
@@ -722,6 +814,7 @@ struct ReplyObject {
     receiver_owner: Option<EndpointOwner>,
     used: bool,
     consumed: bool,
+    scheduling_context: Option<ReplySchedulingContextCustody>,
 }
 
 enum EndpointResponse {
@@ -1398,12 +1491,52 @@ pub fn enqueue_endpoint_call_with_handles_and_priority(
     attached_handles: &[KernelTransferredHandle],
     priority: EndpointCallPriority,
 ) -> Result<(KernelReplyHandle, Option<u64>), IpcError> {
+    enqueue_endpoint_call_with_handles_priority_and_optional_custody(
+        endpoint,
+        caller_task_id,
+        request,
+        attached_handles,
+        priority,
+        None,
+    )
+}
+
+pub fn enqueue_endpoint_call_with_handles_priority_and_custody(
+    endpoint: KernelEndpointHandle,
+    caller_task_id: u64,
+    request: &[u8],
+    attached_handles: &[KernelTransferredHandle],
+    priority: EndpointCallPriority,
+    scheduling_context: ReplySchedulingContextCustody,
+) -> Result<(KernelReplyHandle, Option<u64>), IpcError> {
+    if scheduling_context.donor_task_id() != caller_task_id {
+        return Err(IpcError::InvalidArgument);
+    }
+    enqueue_endpoint_call_with_handles_priority_and_optional_custody(
+        endpoint,
+        caller_task_id,
+        request,
+        attached_handles,
+        priority,
+        Some(scheduling_context),
+    )
+}
+
+fn enqueue_endpoint_call_with_handles_priority_and_optional_custody(
+    endpoint: KernelEndpointHandle,
+    caller_task_id: u64,
+    request: &[u8],
+    attached_handles: &[KernelTransferredHandle],
+    priority: EndpointCallPriority,
+    scheduling_context: Option<ReplySchedulingContextCustody>,
+) -> Result<(KernelReplyHandle, Option<u64>), IpcError> {
     enqueue_endpoint_call_with_handles_faultable(
         endpoint,
         caller_task_id,
         request,
         attached_handles,
         priority,
+        scheduling_context,
         rustos_fault_injection::should_fail("ipc.endpoint.enqueue"),
     )
 }
@@ -1414,6 +1547,7 @@ fn enqueue_endpoint_call_with_handles_faultable(
     request: &[u8],
     attached_handles: &[KernelTransferredHandle],
     priority: EndpointCallPriority,
+    scheduling_context: Option<ReplySchedulingContextCustody>,
     injected_failure: bool,
 ) -> Result<(KernelReplyHandle, Option<u64>), IpcError> {
     if request.is_empty() || request.len() > MAX_ENDPOINT_INLINE_MESSAGE_BYTES {
@@ -1451,6 +1585,7 @@ fn enqueue_endpoint_call_with_handles_faultable(
         receiver_owner,
         used: false,
         consumed: false,
+        scheduling_context,
     }) {
         Ok(reply_id) => reply_id,
         Err(_) => {
@@ -1755,6 +1890,7 @@ pub fn complete_endpoint_reply_with_handles(
     response: &[u8],
     attached_handles: &[KernelTransferredHandle],
 ) -> Result<u64, IpcError> {
+    ensure_reply_has_no_scheduling_context(reply)?;
     complete_endpoint_reply_with_handles_faultable(
         reply,
         response,
@@ -1782,6 +1918,7 @@ fn complete_endpoint_reply_with_handles_faultable(
         None,
         prepare_endpoint_response(response, attached_handles)?,
     )
+    .map(|completion| completion.caller_task_id)
 }
 
 /// Completes a reply obtained through a task-owned internal endpoint.
@@ -1804,6 +1941,7 @@ pub fn complete_endpoint_reply_with_handles_for_task(
     response: &[u8],
     attached_handles: &[KernelTransferredHandle],
 ) -> Result<u64, IpcError> {
+    ensure_reply_has_no_scheduling_context(reply)?;
     complete_endpoint_reply_with_handles_for_owner(
         reply,
         EndpointOwner::Task(receiver_task_id),
@@ -1834,6 +1972,7 @@ pub fn complete_endpoint_reply_with_handles_for_process(
     response: &[u8],
     attached_handles: &[KernelTransferredHandle],
 ) -> Result<u64, IpcError> {
+    ensure_reply_has_no_scheduling_context(reply)?;
     complete_endpoint_reply_with_handles_for_owner(
         reply,
         EndpointOwner::Process(receiver_process_id),
@@ -1842,18 +1981,74 @@ pub fn complete_endpoint_reply_with_handles_for_process(
     )
 }
 
+pub fn complete_endpoint_reply_for_process_with_custody(
+    reply: KernelReplyHandle,
+    receiver_process_id: u64,
+    response: &[u8],
+) -> Result<ReplyCompletion, IpcError> {
+    complete_endpoint_reply_with_handles_for_owner_with_custody(
+        reply,
+        EndpointOwner::Process(receiver_process_id),
+        response,
+        &[],
+    )
+}
+
+pub fn complete_endpoint_reply_with_handles_for_process_with_custody(
+    reply: KernelReplyHandle,
+    receiver_process_id: u64,
+    response: &[u8],
+    attached_handles: &[KernelTransferredHandle],
+) -> Result<ReplyCompletion, IpcError> {
+    complete_endpoint_reply_with_handles_for_owner_with_custody(
+        reply,
+        EndpointOwner::Process(receiver_process_id),
+        response,
+        attached_handles,
+    )
+}
+
+fn ensure_reply_has_no_scheduling_context(reply: KernelReplyHandle) -> Result<(), IpcError> {
+    REPLIES
+        .with(reply.raw(), |object| object.scheduling_context.is_none())
+        .ok_or(IpcError::InvalidHandle)?
+        .then_some(())
+        .ok_or(IpcError::InvalidArgument)
+}
+
 fn complete_endpoint_reply_with_handles_for_owner(
     reply: KernelReplyHandle,
     receiver_owner: EndpointOwner,
     response: &[u8],
     attached_handles: &[KernelTransferredHandle],
 ) -> Result<u64, IpcError> {
+    ensure_reply_has_no_scheduling_context(reply)?;
     complete_endpoint_reply_with_handles_for_owner_faultable(
         reply,
         receiver_owner,
         response,
         attached_handles,
         rustos_fault_injection::should_fail("ipc.endpoint.reply"),
+    )
+}
+
+fn complete_endpoint_reply_with_handles_for_owner_with_custody(
+    reply: KernelReplyHandle,
+    receiver_owner: EndpointOwner,
+    response: &[u8],
+    attached_handles: &[KernelTransferredHandle],
+) -> Result<ReplyCompletion, IpcError> {
+    if response.len() > MAX_ENDPOINT_INLINE_MESSAGE_BYTES {
+        return Err(IpcError::InvalidArgument);
+    }
+    validate_endpoint_transfer_handles(attached_handles)?;
+    if rustos_fault_injection::should_fail("ipc.endpoint.reply") {
+        return Err(IpcError::NoMemory);
+    }
+    complete_endpoint_reply_prepared(
+        reply,
+        Some(receiver_owner),
+        prepare_endpoint_response(response, attached_handles)?,
     )
 }
 
@@ -1877,6 +2072,7 @@ fn complete_endpoint_reply_with_handles_for_owner_faultable(
         Some(receiver_owner),
         prepare_endpoint_response(response, attached_handles)?,
     )
+    .map(|completion| completion.caller_task_id)
 }
 
 fn prepare_endpoint_response(
@@ -1906,7 +2102,7 @@ fn complete_endpoint_reply_prepared(
     reply: KernelReplyHandle,
     required_owner: Option<EndpointOwner>,
     response: EndpointResponse,
-) -> Result<u64, IpcError> {
+) -> Result<ReplyCompletion, IpcError> {
     let message_id = REPLIES
         .with(reply.raw(), |reply_object| {
             if required_owner
@@ -1975,10 +2171,13 @@ fn complete_endpoint_reply_prepared(
                             attached_handles.append(&mut prepared_handles);
                         }
                     }
-                    let caller = message.caller_task_id;
+                    let caller_task_id = message.caller_task_id;
                     message.response = response.take();
                     reply_object.used = true;
-                    Ok(caller)
+                    Ok(ReplyCompletion {
+                        caller_task_id,
+                        scheduling_context: reply_object.scheduling_context.take(),
+                    })
                 })
                 .ok_or(IpcError::InvalidHandle)?
         })
@@ -2091,6 +2290,7 @@ pub fn take_endpoint_response_detailed(
 }
 
 pub fn cancel_endpoint_call(reply: KernelReplyHandle, caller_task_id: u64) -> Result<(), IpcError> {
+    ensure_reply_has_no_scheduling_context(reply)?;
     cancel_endpoint_call_with_transfers(reply, caller_task_id).map(|_| ())
 }
 
@@ -2116,6 +2316,7 @@ pub enum CancelledCallDisposition {
 pub struct CancelledCall {
     pub transfers: Vec<KernelTransferredHandle>,
     pub disposition: CancelledCallDisposition,
+    pub scheduling_context: Option<ReplySchedulingContextCustody>,
 }
 
 pub fn cancel_endpoint_call_with_transfers(
@@ -2176,7 +2377,7 @@ pub fn cancel_endpoint_call_with_transfers(
     let message = ENDPOINT_MESSAGES
         .remove(message_id)
         .ok_or(IpcError::InvalidHandle)?;
-    let _ = REPLIES.remove(reply.raw());
+    let reply_object = REPLIES.remove(reply.raw()).ok_or(IpcError::InvalidHandle)?;
     Ok(CancelledCall {
         transfers: transfers_from_message(message),
         disposition: if was_queued {
@@ -2184,6 +2385,7 @@ pub fn cancel_endpoint_call_with_transfers(
         } else {
             CancelledCallDisposition::InFlight
         },
+        scheduling_context: reply_object.scheduling_context,
     })
 }
 
@@ -2193,6 +2395,7 @@ pub fn cancel_endpoint_call_with_transfers(
 pub fn cancel_endpoint_calls_for_task(
     task_id: u64,
     mut release_transfers: impl FnMut(&[KernelTransferredHandle]),
+    mut release_scheduling_context: impl FnMut(KernelReplyHandle, ReplySchedulingContextCustody),
 ) -> usize {
     let mut cancelled = 0usize;
     for _ in 0..MAX_ENDPOINT_MESSAGE_OBJECTS {
@@ -2208,6 +2411,9 @@ pub fn cancel_endpoint_calls_for_task(
             cancel_endpoint_call_with_transfers(KernelReplyHandle::from_raw(reply_id), task_id)
                 .expect("published task-owned endpoint call lost exact cancellation state");
         release_transfers(&cancelled_call.transfers);
+        if let Some(custody) = cancelled_call.scheduling_context {
+            release_scheduling_context(KernelReplyHandle::from_raw(reply_id), custody);
+        }
         cancelled += 1;
     }
     if ENDPOINT_MESSAGES
@@ -2281,14 +2487,20 @@ fn fail_endpoints_owned_by(owner: EndpointOwner, err: IpcError) -> EndpointWakeS
             }
             let failed = REPLIES.with_mut(message.reply_id, |reply| {
                 if reply.message_id != message_id || reply.consumed {
-                    return false;
+                    return (false, None);
                 }
                 reply.used = true;
                 message.response = Some(EndpointResponse::Error(err));
-                true
+                (true, reply.scheduling_context.take())
             });
-            if failed == Some(true) {
+            if let Some((true, scheduling_context)) = failed {
                 wake_set.push_caller(message.caller_task_id);
+                if let Some(custody) = scheduling_context {
+                    wake_set.push_scheduling_context(
+                        KernelReplyHandle::from_raw(message.reply_id),
+                        custody,
+                    );
+                }
             }
         });
     }

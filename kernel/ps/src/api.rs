@@ -19,8 +19,8 @@ pub use crate::multitask::{
     AffinityCommit, AffinityError, CurrentKernelStackScope, CurrentUserSnapshot,
     DEFAULT_USER_TASK_WEIGHT_MICROS, MAX_SCHEDULER_TASKS, ProcessAffinitySnapshot,
     RetainedCurrentUserAddressSpace, RetainedCurrentUserProcessState, RetiredTaskCleanup,
-    SpawnTaskError, Thread, UserFaultDisposition, UserStackState, UserTaskBootstrap,
-    UserTaskRegisters, WaitChildResult,
+    SchedulingContextAdmission, SpawnTaskError, Thread, UserFaultDisposition, UserStackState,
+    UserTaskBootstrap, UserTaskRegisters, WaitChildResult,
 };
 pub use crate::multitask::{
     activate_suspended_user_task, activate_suspended_user_tasks,
@@ -28,24 +28,28 @@ pub use crate::multitask::{
     attach_reserved_ipc_priority, bind_ipc_priority_to_process_worker, bind_reserved_ipc_priority,
     cancel_block_current_task, cancel_ipc_priority_reservation,
     commit_block_current_task_and_yield, commit_ipc_call_handoff, complete_ipc_reply_wake_handoff,
-    complete_retired_task_cleanup, current_linux_thread_state,
-    current_thread_may_have_pending_signals, current_user_address_space,
-    current_user_process_identity, current_user_process_thread_count, current_user_stack_state,
-    current_user_thread_id, current_user_wait_binding, demote_current_user_task_to_user_class,
-    drain_scheduler_runtime_profile, exec_current_user_process, exec_user_process_by_pid,
-    exit_current_user_process, exit_current_user_task, inherit_ipc_priority,
-    is_user_process_exiting, is_user_task_alive, linux_task_affinity, linux_thread_snapshot_by_ids,
-    live_user_process_identity_by_pid, live_user_process_identity_with_exact_exec_path,
-    mark_user_process_exiting, mark_user_process_exiting_once, next_retired_task_cleanup,
-    note_process_exit_status, queue_linux_process_sigchld, queue_linux_signal,
-    release_ipc_priorities_for_process, release_ipc_priority, reserve_ipc_call_donation,
-    reserve_ipc_priority, set_current_linux_tls_fs_base, set_linux_task_affinity,
-    set_next_latency_pick_hint, set_next_pick_hint, set_next_process_pick_hint,
-    set_next_spawn_pick_hint, set_next_synchronous_pick_hint, set_windows_current_thread_affinity,
-    set_windows_process_affinity, spawn_user_process_state_with_parent,
-    spawn_user_process_with_parent, spawn_user_thread_suspended, stop_current_linux_process,
-    task_has_system_scheduling_class, terminate_user_process, terminate_user_task, wake_task,
-    wake_user_task, windows_process_affinity, with_current_mm, with_current_process_state,
+    complete_ipc_reply_wake_handoff_with_custody, complete_retired_task_cleanup,
+    current_linux_thread_state, current_thread_may_have_pending_signals,
+    current_user_address_space, current_user_process_identity, current_user_process_thread_count,
+    current_user_stack_state, current_user_thread_id, current_user_wait_binding,
+    demote_current_user_task_to_user_class, drain_scheduler_runtime_profile,
+    exec_current_user_process, exec_user_process_by_pid, exit_current_user_process,
+    exit_current_user_task, inherit_ipc_priority, is_user_process_exiting, is_user_task_alive,
+    linux_task_affinity, linux_thread_snapshot_by_ids, live_user_process_identity_by_pid,
+    live_user_process_identity_with_exact_exec_path, mark_user_process_exiting,
+    mark_user_process_exiting_once, next_retired_task_cleanup, note_process_exit_status,
+    queue_linux_process_sigchld, queue_linux_signal, release_ipc_priorities_for_process,
+    release_ipc_priority, reserve_ipc_call_donation, reserve_ipc_priority,
+    set_current_linux_tls_fs_base, set_linux_task_affinity, set_next_latency_pick_hint,
+    set_next_pick_hint, set_next_process_pick_hint, set_next_spawn_pick_hint,
+    set_next_synchronous_pick_hint, set_windows_current_thread_affinity,
+    set_windows_process_affinity, settle_ipc_reply_scheduling_context,
+    spawn_user_process_state_with_parent, spawn_user_process_suspended_with_scheduling_context,
+    spawn_user_process_with_scheduling_context,
+    spawn_user_process_without_deferred_reschedule_with_scheduling_context,
+    spawn_user_thread_suspended, stop_current_linux_process, task_has_system_scheduling_class,
+    terminate_user_process, terminate_user_task, wake_task, wake_user_task,
+    windows_process_affinity, with_current_mm, with_current_process_state,
     with_current_process_state_mut, with_current_user_linux_state_mut,
     with_current_user_process_and_linux_thread_state_mut, with_current_user_process_state,
     with_process_state_by_pid, with_process_state_by_pid_mut,
@@ -185,35 +189,50 @@ pub mod fault {
 
 pub mod process {
     use super::{
-        ProcessSecurityContext, SpawnTaskError, UserProcessState, UserTaskBootstrap, VirtAddr,
+        ProcessSecurityContext, SchedulingContextAdmission, SpawnTaskError, UserProcessState,
+        UserTaskBootstrap, VirtAddr,
     };
 
-    pub fn spawn_user_process(
+    pub fn spawn_user_process_with_scheduling_context(
         address_space: crate::memory::paging::ProcessAddressSpace,
         bootstrap: UserTaskBootstrap,
         weight_micros: u64,
+        admission: SchedulingContextAdmission,
     ) -> Result<u64, SpawnTaskError> {
-        crate::multitask::spawn_user_process(address_space, bootstrap, weight_micros)
-    }
-
-    pub fn spawn_user_process_without_deferred_reschedule(
-        address_space: crate::memory::paging::ProcessAddressSpace,
-        bootstrap: UserTaskBootstrap,
-        weight_micros: u64,
-    ) -> Result<u64, SpawnTaskError> {
-        crate::multitask::spawn_user_process_without_deferred_reschedule(
+        crate::multitask::spawn_user_process_with_scheduling_context(
             address_space,
             bootstrap,
             weight_micros,
+            admission,
         )
     }
 
-    pub fn spawn_user_process_suspended(
+    pub fn spawn_user_process_without_deferred_reschedule_with_scheduling_context(
         address_space: crate::memory::paging::ProcessAddressSpace,
         bootstrap: UserTaskBootstrap,
         weight_micros: u64,
+        admission: SchedulingContextAdmission,
     ) -> Result<u64, SpawnTaskError> {
-        crate::multitask::spawn_user_process_suspended(address_space, bootstrap, weight_micros)
+        crate::multitask::spawn_user_process_without_deferred_reschedule_with_scheduling_context(
+            address_space,
+            bootstrap,
+            weight_micros,
+            admission,
+        )
+    }
+
+    pub fn spawn_user_process_suspended_with_scheduling_context(
+        address_space: crate::memory::paging::ProcessAddressSpace,
+        bootstrap: UserTaskBootstrap,
+        weight_micros: u64,
+        admission: SchedulingContextAdmission,
+    ) -> Result<u64, SpawnTaskError> {
+        crate::multitask::spawn_user_process_suspended_with_scheduling_context(
+            address_space,
+            bootstrap,
+            weight_micros,
+            admission,
+        )
     }
 
     pub fn spawn_kernel_process(
@@ -250,6 +269,11 @@ pub mod snapshot {
 
     pub fn current_task_id() -> Option<u64> {
         crate::multitask::current_task_id()
+    }
+
+    pub fn current_scheduling_context_runtime_snapshot()
+    -> Option<crate::multitask::SchedulingContextRuntimeSnapshot> {
+        crate::multitask::current_scheduling_context_runtime_snapshot()
     }
 
     pub fn current_user_log_ids() -> Option<(u64, u64)> {
@@ -381,12 +405,12 @@ pub use crate::user::sysops::{drain_user_copy_profile, force_drain_user_copy_pro
 
 pub use boot::{is_initialized, service_deferred_work, start, start_secondary_cpu};
 pub use fault::{halt_current_retired_task, retire_current_user_task_due_to_fault};
-pub use process::{spawn_kernel_process, spawn_user_process};
+pub use process::spawn_kernel_process;
 pub use snapshot::{
-    any_user_process_state, current_task_id, current_user_abi, current_user_id,
-    current_user_log_ids, current_user_process_id, current_user_snapshot, parent_process_id_of,
-    retain_current_user_process_state, user_log_ids_for_task, with_current_process_credentials,
-    with_current_user_process_state_mut,
+    any_user_process_state, current_scheduling_context_runtime_snapshot, current_task_id,
+    current_user_abi, current_user_id, current_user_log_ids, current_user_process_id,
+    current_user_snapshot, parent_process_id_of, retain_current_user_process_state,
+    user_log_ids_for_task, with_current_process_credentials, with_current_user_process_state_mut,
 };
 pub use task::{
     rtc_interrupt_handler_addr, software_schedule_interrupt_handler_addr,

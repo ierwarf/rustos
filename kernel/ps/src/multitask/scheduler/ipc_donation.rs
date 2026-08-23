@@ -41,6 +41,12 @@ pub(super) enum IpcDonationTarget {
 pub(super) struct IpcPriorityDonation {
     pub(super) reply: u64,
     pub(super) donor_task_id: u64,
+    /// Root scheduling-context owner propagated across nested passive-server
+    /// calls. The immediate donor remains the reply wake owner.
+    pub(super) context_owner_task_id: u64,
+    pub(super) context_owner_slot: usize,
+    pub(super) priority_donated: bool,
+    pub(super) custody_active: bool,
     /// Donation is never process-wide. A process-owned endpoint must select a
     /// concrete eligible receiver before a System-class call is admitted.
     pub(super) target: IpcDonationTarget,
@@ -97,10 +103,78 @@ impl Scheduler {
         &mut self,
         donor_task_id: u64,
     ) -> super::IpcCallAdmission {
-        let system_class = self.task_has_system_scheduling_class(donor_task_id);
+        let Some(slot) = self.find_task_slot(donor_task_id) else {
+            return super::IpcCallAdmission {
+                system_class: false,
+                donation_reserved: false,
+                scheduling_context: None,
+                scheduling_context_owner_task_id: None,
+            };
+        };
+        let system_class = !self.retired[slot] && self.slot_class(slot) == Some(SchedClass::System);
+        let context_owner_slot = self.effective_scheduling_context_owner_slot(slot);
+        let context_owner_task_id = self.starts[context_owner_slot].map(|start| start.id);
+        let scheduling_context = self.contexts[context_owner_slot]
+            .map(|context| context.scheduling_context)
+            .zip(context_owner_task_id)
+            .filter(|(context, owner_task_id)| context.is_bound_to(*owner_task_id))
+            .map(|(context, _)| context.identity());
+        let donation_reserved = scheduling_context.is_some()
+            && context_owner_task_id.is_some()
+            && self.reserve_ipc_priority_with_context(
+                donor_task_id,
+                context_owner_task_id.expect("live context owner disappeared"),
+                context_owner_slot,
+                system_class,
+            );
         super::IpcCallAdmission {
             system_class,
-            donation_reserved: system_class && self.reserve_ipc_priority(donor_task_id),
+            donation_reserved,
+            scheduling_context,
+            scheduling_context_owner_task_id: context_owner_task_id,
+        }
+    }
+
+    pub(super) fn effective_scheduling_context_owner_slot(&self, slot: usize) -> usize {
+        #[cfg(not(test))]
+        {
+            super::donation_ledger::borrowed_context_owner_slot(slot).unwrap_or(slot)
+        }
+        #[cfg(test)]
+        {
+            let task_id = self.starts[slot].map(|start| start.id);
+            self.ipc_priority_donations[..self.ipc_priority_donation_len]
+                .iter()
+                .flatten()
+                .find_map(|entry| {
+                    (entry.custody_active
+                        && matches!(entry.target, IpcDonationTarget::BoundWorker(target)
+                        if Some(target) == task_id))
+                    .then_some(entry.context_owner_slot)
+                })
+                .unwrap_or(slot)
+        }
+    }
+
+    pub(super) fn effective_scheduling_context_charge_token(&self, slot: usize) -> (usize, u64) {
+        #[cfg(not(test))]
+        {
+            super::donation_ledger::borrowed_context_charge_token(slot).unwrap_or((slot, 0))
+        }
+        #[cfg(test)]
+        {
+            let task_id = self.starts[slot].map(|start| start.id);
+            self.ipc_priority_donations[..self.ipc_priority_donation_len]
+                .iter()
+                .rev()
+                .flatten()
+                .find_map(|entry| {
+                    (entry.custody_active
+                        && matches!(entry.target, IpcDonationTarget::BoundWorker(target)
+                        if Some(target) == task_id))
+                    .then_some((entry.context_owner_slot, entry.reply))
+                })
+                .unwrap_or((slot, 0))
         }
     }
 
@@ -108,12 +182,41 @@ impl Scheduler {
     /// reply capability or removes a receive waiter. The caller task is the
     /// temporary unique identity until the reply and worker are both known.
     pub(in crate::multitask) fn reserve_ipc_priority(&mut self, donor_task_id: u64) -> bool {
+        let Some(donor_slot) = self.find_task_slot(donor_task_id) else {
+            return false;
+        };
+        let context_owner_slot = self.effective_scheduling_context_owner_slot(donor_slot);
+        let Some(context_owner_task_id) = self.starts[context_owner_slot].map(|start| start.id)
+        else {
+            return false;
+        };
+        self.reserve_ipc_priority_with_context(
+            donor_task_id,
+            context_owner_task_id,
+            context_owner_slot,
+            true,
+        )
+    }
+
+    fn reserve_ipc_priority_with_context(
+        &mut self,
+        donor_task_id: u64,
+        context_owner_task_id: u64,
+        context_owner_slot: usize,
+        priority_donated: bool,
+    ) -> bool {
         #[cfg(not(test))]
         {
             let Some(donor_slot) = self.find_task_slot(donor_task_id) else {
                 return false;
             };
-            return !self.retired[donor_slot] && super::donation_ledger::reserve(donor_task_id);
+            return !self.retired[donor_slot]
+                && super::donation_ledger::reserve(
+                    donor_task_id,
+                    context_owner_task_id,
+                    context_owner_slot,
+                    priority_donated,
+                );
         }
         #[cfg(test)]
         {
@@ -135,6 +238,10 @@ impl Scheduler {
                 Some(IpcPriorityDonation {
                     reply: 0,
                     donor_task_id,
+                    context_owner_task_id,
+                    context_owner_slot,
+                    priority_donated,
+                    custody_active: false,
                     target: IpcDonationTarget::AwaitingReceiver,
                 });
             self.ipc_priority_donation_len += 1;
@@ -195,11 +302,10 @@ impl Scheduler {
             else {
                 return false;
             };
-            *entry = Some(IpcPriorityDonation {
-                reply,
-                donor_task_id,
-                target: IpcDonationTarget::AwaitingReceiver,
-            });
+            let mut reservation = entry.expect("located IPC reservation disappeared");
+            reservation.reply = reply;
+            reservation.custody_active = false;
+            *entry = Some(reservation);
             true
         }
     }
@@ -249,11 +355,11 @@ impl Scheduler {
             else {
                 return false;
             };
-            *entry = Some(IpcPriorityDonation {
-                reply,
-                donor_task_id,
-                target: IpcDonationTarget::BoundWorker(receiver_task_id),
-            });
+            let mut reservation = entry.expect("located IPC reservation disappeared");
+            reservation.reply = reply;
+            reservation.target = IpcDonationTarget::BoundWorker(receiver_task_id);
+            reservation.custody_active = true;
+            *entry = Some(reservation);
             true
         }
     }
@@ -282,10 +388,6 @@ impl Scheduler {
             return false;
         }
 
-        if self.slot_class(donor_slot) != Some(SchedClass::System) {
-            return true;
-        }
-
         if self.bind_reserved_ipc_priority(reply, donor_task_id, receiver_task_id) {
             return true;
         }
@@ -299,6 +401,15 @@ impl Scheduler {
         donor_task_id: u64,
         receiver_task_id: u64,
     ) -> bool {
+        let Some(donor_slot) = self.find_task_slot(donor_task_id) else {
+            return false;
+        };
+        let context_owner_slot = self.effective_scheduling_context_owner_slot(donor_slot);
+        let Some(context_owner_task_id) = self.starts[context_owner_slot].map(|start| start.id)
+        else {
+            return false;
+        };
+        let priority_donated = self.slot_class(donor_slot) == Some(SchedClass::System);
         #[cfg(not(test))]
         {
             let Some(receiver_slot) = self.find_task_slot(receiver_task_id) else {
@@ -312,6 +423,9 @@ impl Scheduler {
                 donor_task_id,
                 receiver_task_id,
                 receiver_slot,
+                context_owner_task_id,
+                context_owner_slot,
+                priority_donated,
             );
         }
         #[cfg(test)]
@@ -323,6 +437,7 @@ impl Scheduler {
             {
                 entry.donor_task_id = donor_task_id;
                 entry.target = IpcDonationTarget::BoundWorker(receiver_task_id);
+                entry.custody_active = true;
                 return true;
             }
             if !self.ipc_priority_donation_capacity_available() {
@@ -334,6 +449,10 @@ impl Scheduler {
                 Some(IpcPriorityDonation {
                     reply,
                     donor_task_id,
+                    context_owner_task_id,
+                    context_owner_slot,
+                    priority_donated,
+                    custody_active: true,
                     target: IpcDonationTarget::BoundWorker(receiver_task_id),
                 });
             self.ipc_priority_donation_len += 1;
@@ -351,17 +470,24 @@ impl Scheduler {
     /// races cannot leave an inherited System class behind.
     #[cfg(test)]
     pub(in crate::multitask) fn release_ipc_priority(&mut self, reply: u64) -> bool {
-        let mut released = false;
-        let mut index = 0;
-        while index < self.ipc_priority_donation_len {
-            if self.ipc_priority_donations[index].is_some_and(|entry| entry.reply == reply) {
-                self.remove_ipc_priority_donation(index);
-                released = true;
-            } else {
-                index += 1;
+        let Some(index) = self.ipc_priority_donations[..self.ipc_priority_donation_len]
+            .iter()
+            .position(|entry| entry.is_some_and(|entry| entry.reply == reply))
+        else {
+            return false;
+        };
+        let removed = self.remove_ipc_priority_donation(index);
+        if removed.donor_task_id == removed.context_owner_task_id {
+            for entry in self.ipc_priority_donations[..self.ipc_priority_donation_len]
+                .iter_mut()
+                .flatten()
+            {
+                if entry.context_owner_slot == removed.context_owner_slot {
+                    entry.custody_active = false;
+                }
             }
         }
-        released
+        true
     }
 
     pub(super) fn release_ipc_priorities_for_task(&mut self, task_id: u64) {
@@ -376,6 +502,7 @@ impl Scheduler {
             while index < self.ipc_priority_donation_len {
                 if self.ipc_priority_donations[index].is_some_and(|entry| {
                 entry.donor_task_id == task_id
+                    || entry.context_owner_task_id == task_id
                     || matches!(entry.target, IpcDonationTarget::BoundWorker(target) if target == task_id)
             }) {
                 self.remove_ipc_priority_donation(index);
@@ -406,6 +533,7 @@ impl Scheduler {
                     panic!("scheduler donation prefix contains an empty entry");
                 };
                 if self.task_belongs_to_process(entry.donor_task_id, process_id)
+                    || self.task_belongs_to_process(entry.context_owner_task_id, process_id)
                     || matches!(
                         entry.target,
                         IpcDonationTarget::BoundWorker(task_id)

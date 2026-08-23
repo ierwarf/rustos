@@ -4,51 +4,63 @@ use x86_64::instructions::interrupts;
 use kernel_hal::api::cpu;
 
 use super::{
-    MAIN_THREAD_SLICE_MICROS, NEXT_TASK_ID, SpawnTaskError, UserTaskBootstrap, allocate_task_id,
-    checked_thread_pit_divisor, initial_task_rflags, kernel_task_entry_trampoline_addr,
-    noop_task_entry, publish_cpu_current_task, publish_scheduler_initialized, scheduler_mut,
+    MAIN_THREAD_SLICE_MICROS, NEXT_TASK_ID, SchedulingContextAdmission, SpawnTaskError,
+    UserTaskBootstrap, allocate_task_id, checked_thread_pit_divisor, initial_task_rflags,
+    kernel_task_entry_trampoline_addr, noop_task_entry, publish_cpu_current_task,
+    publish_scheduler_initialized, scheduler_mut,
 };
 use crate::memory::paging::ProcessAddressSpace;
 use crate::user::process_state::UserProcessState;
 
-pub fn spawn_user_process(
+pub fn spawn_user_process_with_scheduling_context(
     address_space: ProcessAddressSpace,
     bootstrap: UserTaskBootstrap,
     weight_micros: u64,
-) -> Result<u64, SpawnTaskError> {
-    spawn_user_process_inner(address_space, bootstrap, None, weight_micros, true, false)
-}
-
-pub fn spawn_user_process_with_parent(
-    address_space: ProcessAddressSpace,
-    bootstrap: UserTaskBootstrap,
-    parent_process_id: Option<u64>,
-    weight_micros: u64,
+    admission: SchedulingContextAdmission,
 ) -> Result<u64, SpawnTaskError> {
     spawn_user_process_inner(
         address_space,
         bootstrap,
-        parent_process_id,
+        None,
         weight_micros,
         true,
         false,
+        Some(admission),
     )
 }
 
-pub fn spawn_user_process_without_deferred_reschedule(
+pub fn spawn_user_process_without_deferred_reschedule_with_scheduling_context(
     address_space: ProcessAddressSpace,
     bootstrap: UserTaskBootstrap,
     weight_micros: u64,
+    admission: SchedulingContextAdmission,
 ) -> Result<u64, SpawnTaskError> {
-    spawn_user_process_inner(address_space, bootstrap, None, weight_micros, false, false)
+    spawn_user_process_inner(
+        address_space,
+        bootstrap,
+        None,
+        weight_micros,
+        false,
+        false,
+        Some(admission),
+    )
 }
 
-pub fn spawn_user_process_suspended(
+pub fn spawn_user_process_suspended_with_scheduling_context(
     address_space: ProcessAddressSpace,
     bootstrap: UserTaskBootstrap,
     weight_micros: u64,
+    admission: SchedulingContextAdmission,
 ) -> Result<u64, SpawnTaskError> {
-    spawn_user_process_inner(address_space, bootstrap, None, weight_micros, false, true)
+    spawn_user_process_inner(
+        address_space,
+        bootstrap,
+        None,
+        weight_micros,
+        false,
+        true,
+        Some(admission),
+    )
 }
 
 fn spawn_user_process_inner(
@@ -58,6 +70,7 @@ fn spawn_user_process_inner(
     weight_micros: u64,
     defer_reschedule: bool,
     start_suspended: bool,
+    scheduling_context: Option<SchedulingContextAdmission>,
 ) -> Result<u64, SpawnTaskError> {
     let (id, pit_divisor) =
         prepare_user_spawn(weight_micros, process_spawn_faulted(), allocate_task_id)?;
@@ -68,7 +81,7 @@ fn spawn_user_process_inner(
         let mut scheduler = scheduler_mut();
         let current_is_user = scheduler.current_task_is_user_task();
         let slot = scheduler
-            .allocate_user_slot(
+            .allocate_user_slot_with_scheduling_context(
                 id,
                 address_space,
                 bootstrap,
@@ -79,6 +92,7 @@ fn spawn_user_process_inner(
                 rflags,
                 start_suspended,
                 noop_task_entry,
+                scheduling_context,
             )
             .ok_or(SpawnTaskError::NoFreeTaskSlot)?;
         Ok((current_is_user, slot))

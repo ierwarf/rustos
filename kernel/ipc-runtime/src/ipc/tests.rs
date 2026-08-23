@@ -487,6 +487,7 @@ fn endpoint_fault_boundaries_fail_before_queue_or_reply_mutation() {
                 b"request",
                 &[],
                 super::EndpointCallPriority::Ordinary,
+                None,
                 true,
             ),
             Err(IpcError::NoMemory)
@@ -505,6 +506,100 @@ fn endpoint_fault_boundaries_fail_before_queue_or_reply_mutation() {
         );
         assert_eq!(super::take_endpoint_response(reply), Ok(None));
         assert_eq!(super::complete_endpoint_reply(reply, b"response"), Ok(41));
+    });
+}
+
+fn test_scheduling_custody(task_id: u64) -> super::ReplySchedulingContextCustody {
+    let identity = kernel_object::api::identity::ObjectIdentity::new(
+        kernel_object::api::identity::ObjectOwner::Ps,
+        kernel_object::api::identity::ObjectKind::SchedulingContext,
+        3,
+        task_id,
+    )
+    .expect("test scheduling-context identity");
+    super::ReplySchedulingContextCustody::new(identity, task_id)
+        .expect("test scheduling-context custody")
+}
+
+#[test]
+fn reply_returns_scheduling_context_custody_exactly_once() {
+    with_isolated_ipc_test(|| {
+        let endpoint = super::create_endpoint_for_process(10).expect("create endpoint");
+        let custody = test_scheduling_custody(41);
+        let (reply, _) = super::enqueue_endpoint_call_with_handles_priority_and_custody(
+            endpoint,
+            41,
+            b"request",
+            &[],
+            super::EndpointCallPriority::Ordinary,
+            custody,
+        )
+        .expect("enqueue call with custody");
+        let _ = super::recv_endpoint(endpoint).expect("receive request");
+        let completion =
+            super::complete_endpoint_reply_for_process_with_custody(reply, 10, b"response")
+                .expect("complete reply with custody");
+        assert_eq!(completion.caller_task_id, 41);
+        assert_eq!(completion.scheduling_context, Some(custody));
+        assert_eq!(
+            super::complete_endpoint_reply_for_process_with_custody(reply, 10, b"duplicate"),
+            Err(super::IpcError::InvalidArgument)
+        );
+    });
+}
+
+#[test]
+fn cancellation_returns_scheduling_context_custody_exactly_once() {
+    with_isolated_ipc_test(|| {
+        let endpoint = super::create_endpoint().expect("create endpoint");
+        let custody = test_scheduling_custody(42);
+        let (reply, _) = super::enqueue_endpoint_call_with_handles_priority_and_custody(
+            endpoint,
+            42,
+            b"request",
+            &[],
+            super::EndpointCallPriority::Ordinary,
+            custody,
+        )
+        .expect("enqueue call with custody");
+        let cancelled = super::cancel_endpoint_call_with_transfers(reply, 42)
+            .expect("cancel call with custody");
+        assert_eq!(cancelled.scheduling_context, Some(custody));
+        assert!(super::cancel_endpoint_call_with_transfers(reply, 42).is_err());
+    });
+}
+
+#[test]
+fn endpoint_failure_returns_scheduling_context_custody_exactly_once() {
+    with_isolated_ipc_test(|| {
+        let endpoint = super::create_endpoint_for_task(Some(10)).expect("create endpoint");
+        let custody = test_scheduling_custody(43);
+        let (reply, _) = super::enqueue_endpoint_call_with_handles_priority_and_custody(
+            endpoint,
+            43,
+            b"request",
+            &[],
+            super::EndpointCallPriority::Ordinary,
+            custody,
+        )
+        .expect("enqueue call with custody");
+        let wake_set = super::fail_endpoints_owned_by_task(10, super::IpcError::PeerClosed);
+        let returned = wake_set
+            .scheduling_contexts()
+            .collect::<alloc::vec::Vec<_>>();
+        assert_eq!(returned.len(), 1);
+        assert_eq!(returned[0].reply, reply);
+        assert_eq!(returned[0].custody, custody);
+        assert_eq!(
+            super::take_endpoint_response(reply),
+            Err(super::IpcError::PeerClosed)
+        );
+        assert!(
+            super::fail_endpoints_owned_by_task(10, super::IpcError::PeerClosed)
+                .scheduling_contexts()
+                .next()
+                .is_none()
+        );
     });
 }
 
@@ -1025,9 +1120,13 @@ fn retiring_caller_returns_all_outstanding_transfer_batches() {
 
         let mut discarded = Vec::new();
         assert_eq!(
-            super::cancel_endpoint_calls_for_task(22, |batch| {
-                discarded.extend_from_slice(batch);
-            }),
+            super::cancel_endpoint_calls_for_task(
+                22,
+                |batch| {
+                    discarded.extend_from_slice(batch);
+                },
+                |_, _| panic!("legacy test call unexpectedly carried scheduling custody")
+            ),
             2
         );
         assert_eq!(discarded, alloc::vec![first, second]);
@@ -1056,9 +1155,13 @@ fn retiring_caller_may_consume_the_exact_global_message_capacity() {
         }
 
         assert_eq!(
-            super::cancel_endpoint_calls_for_task(22, |batch| {
-                assert!(batch.is_empty());
-            }),
+            super::cancel_endpoint_calls_for_task(
+                22,
+                |batch| {
+                    assert!(batch.is_empty());
+                },
+                |_, _| panic!("legacy test call unexpectedly carried scheduling custody")
+            ),
             super::MAX_ENDPOINT_MESSAGE_OBJECTS
         );
         assert_eq!(recv_endpoint(first), Ok(None));

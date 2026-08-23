@@ -51,19 +51,20 @@ pub(super) fn syscall_linux_rustos_ipc_reply_recv_with_sender(args_ptr: u64) -> 
         Err(errno) => return linux_errno(errno),
     };
     let copy_ticks = crate::arch::rtc::ticks();
-    let caller_task_id = match kernel_ipc_runtime::api::complete_endpoint_reply_for_process(
+    let completion = match kernel_ipc_runtime::api::complete_endpoint_reply_for_process_with_custody(
         KernelReplyHandle::from_raw(args.reply_cap),
         receiver_process_id,
         response.as_slice(),
     ) {
-        Ok(task_id) => task_id,
+        Ok(completion) => completion,
         Err(err) => {
             record_ipc_reply_rejection(args.reply_cap, receiver_process_id, err);
             return linux_errno(ipc_error_to_linux_errno(err));
         }
     };
     let reply_ticks = crate::arch::rtc::ticks();
-    let handoff_queued = multitask::complete_ipc_reply_wake_handoff(args.reply_cap, caller_task_id);
+    let handoff_queued =
+        multitask::complete_ipc_reply_wake_handoff_with_custody(args.reply_cap, completion);
     log_slow_ipc_reply(
         "reply-recv",
         args.reply_cap,

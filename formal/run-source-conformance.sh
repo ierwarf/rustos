@@ -1019,6 +1019,7 @@ fi
 # owner-generation token; publication happens only after the catalog guard is
 # gone, and selection revalidates the same custody with no generic fallback.
 reply_current_body="$(sed -n '/^pub fn complete_ipc_reply_wake_handoff(/,/^pub fn release_ipc_priorities_for_process/p' kernel/ps/src/multitask/current.rs)"
+reply_custody_body="$(sed -n '/^pub fn settle_ipc_reply_scheduling_context(/,/^pub fn complete_ipc_reply_wake_handoff(/p' kernel/ps/src/multitask/current.rs)"
 reply_scheduler_body="$(sed -n '/^    pub(super) fn complete_ipc_reply_wake_handoff(/,/^    fn wake_task_slot/p' kernel/ps/src/multitask/scheduler.rs)"
 reply_enqueue_body="$(sed -n '/^fn enqueue_reply_wake_after_catalog(/,/^pub(super) fn enqueue_reply_wake/p' kernel/ps/src/multitask/scheduler/sync_handoff.rs)"
 reply_selection_body="$(sed -n '/^    fn synchronous_handoff_record_is_ready(/,/^    pub(super) fn take_next_synchronous_pick_hint_ready_slot/p' kernel/ps/src/multitask/scheduler/handoffs.rs)"
@@ -1034,13 +1035,30 @@ if ! grep -Fq 'scheduler_mut().complete_ipc_reply_wake_handoff(reply, task_id)' 
     || ! grep -Fq 'owner_still_matches(token) && retained' <<<"$reply_enqueue_body" \
     || ! grep -Fq 'record.has_current_dispatch_custody()' <<<"$reply_selection_body" \
     || ! grep -Fq 'self.pick_hint_candidate_slot(Some(record.slot())).is_some()' <<<"$reply_selection_body" \
-    || ! grep -Fq 'multitask::complete_ipc_reply_wake_handoff(reply, task_id)' <<<"$plain_reply_body" \
-    || ! grep -Fq 'multitask::complete_ipc_reply_wake_handoff(args.reply_cap, task_id)' <<<"$handle_reply_body" \
-    || ! grep -Fq 'multitask::complete_ipc_reply_wake_handoff(args.reply_cap, caller_task_id)' <<<"$reply_recv_body" \
+    || ! grep -Fq 'settle_ipc_reply_scheduling_context(reply, custody)' <<<"$reply_custody_body" \
+    || ! grep -Fq 'complete_ipc_reply_wake_handoff(reply, completion.caller_task_id)' <<<"$reply_custody_body" \
+    || ! grep -Fq 'multitask::complete_ipc_reply_wake_handoff_with_custody(reply, completion)' <<<"$plain_reply_body" \
+    || ! grep -Fq 'multitask::complete_ipc_reply_wake_handoff_with_custody(args.reply_cap, completion)' <<<"$handle_reply_body" \
+    || ! grep -Fq 'multitask::complete_ipc_reply_wake_handoff_with_custody(args.reply_cap, completion)' <<<"$reply_recv_body" \
     || grep -Eq 'release_ipc_priority|wake_task|set_next_synchronous_pick_hint' <<<"$plain_reply_body" \
     || grep -Eq 'release_ipc_priority|wake_task|set_next_synchronous_pick_hint' <<<"$handle_reply_body" \
     || grep -Eq 'release_ipc_priority|wake_task|set_next_synchronous_pick_hint' <<<"$reply_recv_body"; then
-    echo 'terminal IPC replies must retain one exact post-catalog per-CPU handoff token without legacy fallback' >&2
+    echo 'terminal IPC replies must return exact scheduling-context custody and retain one exact post-catalog per-CPU handoff token without legacy fallback' >&2
+    exit 1
+fi
+
+# ReplyObject is the sole transport owner of caller scheduling-context custody.
+# Every terminal class must extract the field with `take` or remove the exact
+# reply object and return it; legacy reply/cancel helpers reject custody-bearing
+# calls so no internal caller can accidentally discard the token.
+ipc_runtime_source=kernel/ipc-runtime/src/ipc/mod.rs
+if ! rg -Uq 'struct ReplyObject \{[^}]*scheduling_context: Option<ReplySchedulingContextCustody>' "$ipc_runtime_source" \
+    || [ "$(rg -c 'reply_object\.scheduling_context\.take\(\)|reply\.scheduling_context\.take\(\)' "$ipc_runtime_source")" -ne 2 ] \
+    || ! rg -Fq 'pub scheduling_context: Option<ReplySchedulingContextCustody>' "$ipc_runtime_source" \
+    || ! rg -Fq 'ensure_reply_has_no_scheduling_context(reply)?;' "$ipc_runtime_source" \
+    || ! rg -Fq 'enqueue_endpoint_call_with_handles_priority_and_custody(' kernel/compat/src/user/syscall/linux/ipc_ops.rs \
+    || ! rg -Fq 'settle_endpoint_scheduling_contexts(&wake_set);' kernel/ps/src/multitask/scheduler/reclaim.rs; then
+    echo 'reply-owned scheduling-context custody no longer covers reply, cancel, owner failure, and retirement exactly once' >&2
     exit 1
 fi
 
@@ -1264,6 +1282,17 @@ scheduler-thread-demotion/SchedulerThreadDemotion|kernel-ps|multitask::scheduler
 scheduler-thread-demotion/SchedulerThreadDemotion|vfsd|tests::ui_bootstrap_demotion_requires_successful_terminal_snapshot_reply
 scheduler-thread-demotion/SchedulerThreadDemotion|loaderd|tests::ui_bootstrap_demotion_is_custodied_until_terminal_reply
 scheduler-thread-demotion/SchedulerThreadDemotion|uiserver|sys::tests::only_bootstrap_gpu_role_retains_inherited_boot_class
+scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::tests::ipc_admission_exports_only_the_live_bound_scheduling_context
+scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::tests::nested_passive_server_runtime_is_billed_to_the_root_caller_context
+scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::tests::deadline_domains_require_per_cpu_utilization_headroom
+scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::tests::production_user_slot_publication_rejects_an_unbudgeted_context
+scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::scheduling_context::tests::timeout_fault_is_one_shot_observable_and_never_retried
+scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::donation_ledger::tests::ordinary_nested_calls_borrow_one_root_context_without_system_promotion
+scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::donation_ledger::tests::multithreaded_server_charge_tokens_restore_the_previous_live_reply
+scheduling-context-budget/SchedulingContextBudget|kernel-compat|user::syscall::linux::service_ops::ipc_helpers::tests::direct_bootstrap_consumes_exact_rootd_scheduling_authority_before_spawn
+scheduling-context-budget/SchedulingContextBudget|kernel-compat|user::process::tests::production_process_spawn_surface_requires_scheduling_authority
+scheduling-context-budget/SchedulingContextBudget|kernel-executive|boot::tests::rootd_bootstrap_is_published_with_a_bounded_scheduling_context
+scheduling-context-budget/SchedulingContextBudget|rootd|tests::scheduling_policy_is_owned_by_the_immutable_service_manifest|host-test
 synchronous-ipc-handoff/SynchronousIpcHandoff|kernel-ps|multitask::scheduler::synchronous_handoff_tests::synchronous_ipc_handoff_is_fifo_deduplicated_and_fairness_bounded
 synchronous-ipc-handoff/SynchronousIpcHandoff|kernel-ps|multitask::scheduler::synchronous_handoff_tests::reply_wake_token_mint_requires_exact_task_and_dispatch_custody
 synchronous-ipc-handoff/SynchronousIpcHandoff|kernel-ps|multitask::scheduler::synchronous_handoff_tests::terminal_reply_releases_donation_and_wakes_exact_caller_in_one_scheduler_operation

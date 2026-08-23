@@ -3,6 +3,9 @@ fn raced_wake_never_validates_a_consumed_current_frame() {
     let mut scheduler = boxed_scheduler();
     let slot = 1;
     scheduler.contexts[slot] = Some(TaskContext {
+        scheduling_context: crate::multitask::scheduler::scheduling_context::SchedulingContext::bind(
+            slot, 691,
+        ),
         // Dispatch consumed this frame. Deliberately leave an address that
         // could never be validated as a published continuation.
         saved_rsp: 0,

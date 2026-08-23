@@ -19,6 +19,7 @@ use super::*;
 
 mod activation_batch;
 mod authority;
+mod scheduling_context_grants;
 
 pub(super) use activation_batch::syscall_linux_rustos_proc_activate_batch_broker;
 
@@ -137,14 +138,20 @@ static EXEC_TRANSITIONS: TrackedSpinLock<
     ExecTransitionRegistry,
     { LockClass::ProcBrokerRegistry as u8 },
 > = TrackedSpinLock::new(FnvIndexMap::new());
-/// A deferred process is inert until the exact process/address-space identity
-/// that requested its creation consumes this one-shot authority. Keeping this
-/// in ring0 makes the authority survive loaderd restart without trusting a
-/// replayed userspace PID claim or a recycled PID generation.
 static DEFERRED_ACTIVATIONS: TrackedSpinLock<
     DeferredActivationRegistry,
     { LockClass::ProcBrokerRegistry as u8 },
 > = TrackedSpinLock::new(FnvIndexMap::new());
+pub(super) fn syscall_linux_rustos_scheduling_context_grant_broker(args_ptr: u64) -> u64 {
+    scheduling_context_grants::grant(args_ptr)
+}
+
+pub(super) fn consume_direct_bootstrap_scheduling_context(
+    requester_pid: u64,
+    exec_path: &str,
+) -> Result<rustos_user_abi::syscall::RustosSchedulingContextPolicy, i64> {
+    scheduling_context_grants::consume_direct_bootstrap(requester_pid, exec_path)
+}
 
 pub(super) fn syscall_linux_rustos_proc_prepare_broker(args_ptr: u64) -> u64 {
     if !current_process_can_load() {
@@ -633,6 +640,14 @@ pub(super) fn syscall_linux_rustos_proc_commit_broker(args_ptr: u64) -> u64 {
         Ok(path) => path,
         Err(errno) => return linux_errno(errno),
     };
+    let scheduling_policy = match scheduling_context_grants::consume(
+        args.scheduling_context,
+        args.requester_pid,
+        exec_path.as_str(),
+    ) {
+        Ok(policy) => policy,
+        Err(errno) => return linux_errno(errno),
+    };
     let qualification_required =
         super::smp_qualification_ops::smp_qualification_exec_path_matches(exec_path.as_str());
     let argv_storage = match read_user_string_vector(
@@ -732,11 +747,23 @@ pub(super) fn syscall_linux_rustos_proc_commit_broker(args_ptr: u64) -> u64 {
         state.format as u64,
     );
     let spawned = if args.flags & LOADER_SPAWN_FLAG_DEFER_START as u64 != 0 {
-        crate::user::process::spawn_prepared_process_suspended(prepared, args.weight_micros)
+        crate::user::process::spawn_prepared_process_suspended_with_scheduling_context(
+            prepared,
+            args.weight_micros,
+            scheduling_policy,
+        )
     } else if args.flags & LOADER_SPAWN_FLAG_IMMEDIATE_HANDOFF as u64 != 0 {
-        crate::user::process::spawn_prepared_process(prepared, args.weight_micros)
+        crate::user::process::spawn_prepared_process_with_scheduling_context(
+            prepared,
+            args.weight_micros,
+            scheduling_policy,
+        )
     } else {
-        crate::user::process::spawn_prepared_process_for_loader_reply(prepared, args.weight_micros)
+        crate::user::process::spawn_prepared_process_for_loader_reply_with_scheduling_context(
+            prepared,
+            args.weight_micros,
+            scheduling_policy,
+        )
     };
     match spawned {
         Ok(spawned) => {
@@ -1312,6 +1339,7 @@ pub(super) fn cleanup_proc_broker_state_for_process(process_id: u64) -> (usize, 
     // cleanup entry. Revoke the generation-bound qualification first so a
     // reused PID cannot inherit an owner or target evidence grant.
     super::smp_qualification_ops::revoke_smp_qualification_for_process(process_id);
+    scheduling_context_grants::revoke_for_process(process_id);
     let mut deferred_targets = [0_u64; MAX_DEFERRED_ACTIVATIONS];
     let deferred_target_count = {
         let mut activations = DEFERRED_ACTIVATIONS.lock();
@@ -1818,6 +1846,7 @@ fn range_contains(base: u64, len: u64, ptr: u64, access_len: u64) -> bool {
 
 fn process_load_error_to_linux_errno(error: crate::user::process::ProcessLoadError) -> i64 {
     match error {
+        crate::user::process::ProcessLoadError::MissingSchedulingContext => LINUX_EPERM,
         crate::user::process::ProcessLoadError::AddressSpace(err) => {
             address_space_error_to_linux_errno(err)
         }

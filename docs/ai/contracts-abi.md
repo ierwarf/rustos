@@ -1804,6 +1804,45 @@ create scheduler authority. The 100 us PIT edge is an upper bound if the
 normal user-return scheduler check is missed; no handoff preempts an arbitrary
 kernel frame.
 
+## Scheduling-context accounting snapshot
+
+Rootd owns scheduling policy in its immutable bootstrap/post-init manifests.
+Each launch grant is sealed to the live rootd endpoint epoch, exact requester
+identity, executable path, and complete policy, then consumed once. The direct
+pre-loaderd spawn path obeys the same rule; rootd itself is the sole explicit
+boot exception and receives a fixed 4 ms/10 ms context before publication.
+Production user-slot publication fails closed without an admitted context.
+Deadline-critical domains additionally pass a conservative per-CPU utilization
+test capped at 90%; Linux or Windows priority requests cannot widen this
+temporal authority.
+
+`SYS_RUSTOS_SCHEDULING_CONTEXT_SNAPSHOT` is a read-only, versioned diagnostic
+ABI (version 2). It copies the calling thread's executing identity and the exact effective
+scheduling-context owner, object identity, admitted budget/period, bounded
+refill state, exhaustion counters, and shared-domain ledger. During a nested
+passive-server call, the executing task remains the server but the reported
+context owner and both ledgers are the root caller's. The syscall returns
+`EAGAIN` when no admitted effective context exists and never grants mutation,
+donation, endpoint, or scheduling authority. Context and domain runtime
+milestones use distinct counter banks so domain billing is not double-counted
+as client consumption. On exhaustion the same snapshot exposes the cumulative
+consumed time, original budget/period, timeout endpoint token, and exact latest
+reply identity. A missing or unresolved endpoint selects one bounded throttle
+until the already-scheduled refill; the kernel records that terminal action
+once and never retries handler delivery in the accounting path.
+
+`ipcbench` carries two KVM-only public-ABI acceptance probes for this contract.
+`scheduling_budget_exhaust_refill` runs one continuously runnable User context
+across four admitted periods and emits a result only when the same object and
+domain show consumption, exhaustion, refill, and the bounded missing-handler
+timeout action. `ipc_nested_passive_server` sends one caller through two
+receive-blocked server threads and emits a result only when both executing
+server identities observe the root caller's exact context object/domain and
+the caller regains that identity after both replies. An isolated `xtask bench`
+run fails if its exact primary result is missing, duplicated, or skipped.
+System-wide IPC phase totals are displayed but are not divided into these
+semantic probes; their acceptance is the kernel-stamped snapshot invariant.
+
 ## Network Surface (`netd`)
 
 Routed Linux ops after bootstrap: `socket`, `socketpair`, socket `dup`/`dup2`/`dup3`, socket `close`, socket `read`/`write`/`writev`, `bind`, `listen`, `accept`/`accept4`, `connect`, `sendto`, `recvfrom`, `sendmsg`, `recvmsg`, `getsockname`, `getpeername`, `setsockopt`, `getsockopt`, `shutdown`.

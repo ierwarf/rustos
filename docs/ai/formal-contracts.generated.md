@@ -2,20 +2,20 @@
 # Formal Contract Registry
 
 - Schema: `3`
-- Registry SHA-256: `5392807f9b8483286f445b1ad1a09c189a13efbaec9f0c61b196bff29c8c222a`
-- Models: `128`
+- Registry SHA-256: `4bd3b3532dce56955363a65b7cc4ea5d94c0837c76354eadadd83f706d5335ca`
+- Models: `129`
 - Whole flows: `69`
-- Transitions: `697`
+- Transitions: `709`
 - Product runtime scenarios: `3`
-- Exact source witnesses: `592`
+- Exact source witnesses: `603`
 - Apalache pilots: `3`
 - TLAPS theorem models: `2`
 - Runtime-traced models: `7`
-- Intentional-terminal exceptions: `91` (ceiling `91`)
-- Cyclic strongly connected components: `43`
-- Supporting model bindings: `100`
+- Intentional-terminal exceptions: `92` (ceiling `92`)
+- Cyclic strongly connected components: `44`
+- Supporting model bindings: `101`
 - Explicit critical/high risk surfaces: `100`
-- Additional source mappings: `164`
+- Additional source mappings: `177`
 
 | Flow | Severity | Owners | Models | Requirements | Hazards | Sinks |
 | --- | --- | --- | --- | ---: | ---: | --- |
@@ -69,7 +69,7 @@
 | `root-authority` | `critical` | kernel-compat, kernel-ipc-runtime, rootd | root-authority-publication/RootAuthorityPublication | 6 | 6 | denied, service-published |
 | `runtime-control-ingress` | `critical` | runtimed | runtime-control-authority/RuntimeControlAuthority | 5 | 5 | admitted, denied |
 | `scheduler-cpu-ownership` | `critical` | kernel-hal, kernel-ps, nucleus-core | scheduler-cpu-ownership/SchedulerCpuOwnership | 13 | 13 | invariant-panic |
-| `scheduler-dispatch` | `critical` | inputd, kernel-compat, kernel-ipc-runtime, kernel-ps, loaderd, runtimed, uiserver, vfsd | ipc-priority-inheritance/IpcPriorityInheritance, ipc-priority-queue/IpcPriorityQueue, ipc-reply-recv-transaction/IpcReplyRecvTransaction, scheduler-active-balance/SchedulerActiveBalance, scheduler-admission/SchedulerAdmission, scheduler-cpu-distribution/SchedulerCpuDistribution, scheduler-thread-demotion/SchedulerThreadDemotion, synchronous-ipc-handoff/SynchronousIpcHandoff | 37 | 37 | peer-dispatched, reply-token-dropped, revoked, system-dispatched, user-dispatched |
+| `scheduler-dispatch` | `critical` | inputd, kernel-compat, kernel-ipc-runtime, kernel-ps, loaderd, rootd, runtimed, uiserver, vfsd | ipc-priority-inheritance/IpcPriorityInheritance, ipc-priority-queue/IpcPriorityQueue, ipc-reply-recv-transaction/IpcReplyRecvTransaction, scheduler-active-balance/SchedulerActiveBalance, scheduler-admission/SchedulerAdmission, scheduler-cpu-distribution/SchedulerCpuDistribution, scheduler-thread-demotion/SchedulerThreadDemotion, scheduling-context-budget/SchedulingContextBudget, synchronous-ipc-handoff/SynchronousIpcHandoff | 49 | 49 | context-revoked, peer-dispatched, reply-token-dropped, revoked, system-dispatched, user-dispatched |
 | `scheduler-lifecycle` | `critical` | kernel-compat, kernel-hal, kernel-ps | scheduler-wakeup/SchedulerWakeup | 18 | 18 | retired |
 | `service-bootstrap` | `critical` | initd, kernel-compat, rootd | service-bootstrap-lifecycle/ServiceBootstrapLifecycle | 10 | 10 | denied, entry-rejected, ready |
 | `service-call-authority` | `critical` | kernel-compat, kernel-ipc-runtime | service-call-authority/ServiceCallAuthority | 6 | 6 | admitted, cleared, denied, stale |

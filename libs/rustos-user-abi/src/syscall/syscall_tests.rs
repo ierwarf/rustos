@@ -15,11 +15,12 @@ use super::{
     NetdIpcRequest, NetdIpcResponse, PROCD_SIGACTION_SA_NOCLDSTOP, PROCD_SIGCHLD_EVENT_EXIT,
     PROCD_SIGCHLD_EVENT_MASK, PRODUCT_EXECUTABLE_SNAPSHOT_BACKING_DVM_VOLUME,
     PRODUCT_EXECUTABLE_SNAPSHOT_EVIDENCE_ABI_VERSION, ProductExecutableSnapshotEvidence,
-    RustosIpcValidateServiceOwnerArgs, STORAGED_BULK_READ_PAYLOAD_CAPACITY,
-    STORAGED_BULK_READ_RESPONSE_HEADER_BYTES, SYSCALL_OFFLOAD_ABI_VERSION,
-    SYSCALL_OFFLOAD_OP_LINUX_ARCH_PRCTL_POLICY, SYSCALL_OFFLOAD_OP_LINUX_MPROTECT,
-    SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET, SYSCALL_OFFLOAD_OP_LINUX_STATX,
-    SYSCALL_OFFLOAD_PATH_CAPACITY, SYSCALL_OFFLOAD_PAYLOAD_CAPACITY, StoragedBulkReadResponse,
+    RustosIpcValidateServiceOwnerArgs, RustosSchedulingContextPolicy,
+    STORAGED_BULK_READ_PAYLOAD_CAPACITY, STORAGED_BULK_READ_RESPONSE_HEADER_BYTES,
+    SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_LINUX_ARCH_PRCTL_POLICY,
+    SYSCALL_OFFLOAD_OP_LINUX_MPROTECT, SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET,
+    SYSCALL_OFFLOAD_OP_LINUX_STATX, SYSCALL_OFFLOAD_PATH_CAPACITY,
+    SYSCALL_OFFLOAD_PAYLOAD_CAPACITY, StoragedBulkReadResponse,
     VFS_EXECUTABLE_SNAPSHOT_ABI_VERSION, VFS_EXECUTABLE_SNAPSHOT_OP_OPEN, VFS_IPC_ABI_VERSION,
     VFS_IPC_OP_OPENAT, VFS_IPC_PAYLOAD_CAPACITY, VFS_IPC_RESPONSE_HEADER_BYTES,
     VfsExecutableSnapshotRequest, VfsExecutableSnapshotResponse, VfsIpcRequest, VfsIpcResponse,
@@ -29,6 +30,26 @@ use super::{
     product_executable_snapshot_evidence_shape_valid, waitset_interest_shape_valid,
     waitset_signal_shape_valid,
 };
+
+#[test]
+fn scheduling_context_policy_is_closed_versioned_and_budget_bounded() {
+    let valid = RustosSchedulingContextPolicy::new(0b11, 2_000_000, 10_000_000, 4, 1, 7, 9);
+    assert!(valid.is_canonical());
+    assert_eq!(size_of::<RustosSchedulingContextPolicy>(), 72);
+
+    let mut malformed = valid;
+    malformed.abi_version = malformed.abi_version.wrapping_add(1);
+    assert!(!malformed.is_canonical());
+    malformed = valid;
+    malformed.budget_ns = malformed.period_ns + 1;
+    assert!(!malformed.is_canonical());
+    malformed = valid;
+    malformed.refill_capacity = 9;
+    assert!(!malformed.is_canonical());
+    malformed = valid;
+    malformed.reserved1 = 1;
+    assert!(!malformed.is_canonical());
+}
 
 #[test]
 fn product_executable_snapshot_evidence_requires_every_nonforgeable_input() {

@@ -378,15 +378,23 @@ tokens = [
 # were two acquisitions of the global scheduler answering two questions about
 # one slot, from the same `find_task_slot`; `reserve_ipc_call_donation` is one.
 # What this sequence pins is unchanged: admission is sampled before the IPC slot
-# lock is taken.
-    "multitask::reserve_ipc_call_donation(task_id)",
-    "enqueue_endpoint_call_with_handles_and_priority(",
+# lock is taken. The admission helper returns before this file enters IPC.
+    "ipc_call_admission::reserve(task_id)?",
+    "enqueue_endpoint_call_with_handles_priority_and_custody(",
 # The bind token is now the combined commit. The donation bind, the receiver
 # wake, and the synchronous pick hint were three separate acquisitions of the
 # global scheduler and are now one; the bind still happens, in the same place
 # in this order, but `commit_ipc_call_handoff` is what performs it.
     "multitask::commit_ipc_call_handoff(",
-    "\"ipc-donation-bind-degraded\"",
+    "\"ipc-scheduling-custody-bind-rejected\"",
+]
+
+[[required_sequences]]
+path = "kernel/compat/src/user/syscall/linux/ipc_call_admission.rs"
+tokens = [
+    "multitask::reserve_ipc_call_donation(task_id)",
+    "ReplySchedulingContextCustody::new_with_owner(",
+    "Ok(CallSchedulingAdmission",
 ]
 
 [[required_sequences]]
@@ -673,6 +681,31 @@ tokens = [
     "let _wide_simd = crate::arch::simd::wide_simd_section();",
     "key.verify_strict(",
 ]
+
+# Temporal authority is charged before fair-share bookkeeping, and a bounded
+# refill overflow may only move authority to the later eligibility point.
+[[required_sequences]]
+path = "kernel/ps/src/multitask/scheduler.rs"
+tokens = [
+    "self.charge_effective_scheduling_context_runtime(slot, now_ns, elapsed_ns)",
+    "let elapsed_ns = if force_min_charge",
+    ".prepare_dispatch(now_ns),",
+    "self.set_slot_exec_start_ticks(next_idx, now_ticks);",
+]
+
+[[required_sequences]]
+path = "kernel/ps/src/multitask/scheduler/scheduling_context.rs"
+tokens = [
+    "let Some(amount_ns) = latest.amount_ns.checked_add(refill.amount_ns) else {",
+    "latest.eligible_ns = latest.eligible_ns.max(refill.eligible_ns);",
+    "let charged_ns = elapsed_ns.min(self.available_ns);",
+    "self.available_ns -= charged_ns;",
+]
+
+[[forbidden_patterns]]
+scope = "kernel/ps/src/multitask/scheduler/scheduling_context.rs"
+regex = '\b(?:Vec|VecDeque|BinaryHeap)\b'
+reason = "scheduling-context refill accounting must remain fixed-capacity and allocation-free"
 
 [[forbidden_patterns]]
 scope = "kernel/compat/**/*.rs"

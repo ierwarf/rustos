@@ -24,6 +24,11 @@ TIMEOUT_RETURNCODE = -1024
 OCCURRENCE_SPEC = re.compile(r"(?:(?P<selected>[1-9][0-9]*)/)?(?P<total>[1-9][0-9]*)$")
 LISTED_TEST = re.compile(r"(?m)^(?P<name>[^\s].*): test$")
 
+_MIRROR_EXCLUDED_TOP_LEVEL = frozenset(
+    {".git", "target", "build", "logs", "perf.data"}
+)
+_MIRROR_EXCLUDED_PATHS = (Path("driver-domains/linux/out"),)
+
 
 FIELDS = (
     "id",
@@ -424,6 +429,54 @@ def replace_resolved_anchor(text: str, mutation: dict[str, str | int]) -> str:
     return text[:offset] + str(mutation["replace"]) + text[offset + len(find) :]
 
 
+def mirror_live_tree(root: Path, destination: Path) -> None:
+    """Mirror the live worktree into a fresh clone without build artifacts.
+
+    `prepare_checkout` creates `destination` from `HEAD` before this function
+    runs.  Replacing every non-Git entry therefore preserves untracked source
+    edits and deletions while retaining the clone's object database.  The
+    fallback preserves the `rsync -a --delete` contract when `rsync` is not
+    installed on the host; it is not a weaker source-seal path.
+    """
+
+    def excluded(path: Path) -> bool:
+        relative = path.relative_to(root)
+        if relative.parts and relative.parts[0] in _MIRROR_EXCLUDED_TOP_LEVEL:
+            return True
+        return any(relative == excluded_path for excluded_path in _MIRROR_EXCLUDED_PATHS)
+
+    def ignored_names(directory: str, names: list[str]) -> set[str]:
+        directory_path = Path(directory)
+        return {
+            name
+            for name in names
+            if excluded(directory_path / name)
+        }
+
+    for existing in destination.iterdir():
+        if existing.name == ".git":
+            continue
+        if existing.is_dir() and not existing.is_symlink():
+            shutil.rmtree(existing)
+        else:
+            existing.unlink()
+
+    for source in root.iterdir():
+        if excluded(source):
+            continue
+        target = destination / source.name
+        if source.is_dir() and not source.is_symlink():
+            shutil.copytree(
+                source,
+                target,
+                symlinks=True,
+                copy_function=shutil.copy2,
+                ignore=ignored_names,
+            )
+        else:
+            shutil.copy2(source, target, follow_symlinks=False)
+
+
 def prepare_checkout(root: Path, destination: Path) -> None:
     subprocess.run(
         ["git", "clone", "-q", "--shared", "--no-checkout", str(root), str(destination)],
@@ -441,7 +494,10 @@ def prepare_checkout(root: Path, destination: Path) -> None:
     command = ["rsync", "-a", "--delete"]
     command.extend(f"--exclude={value}" for value in excludes)
     command.extend([f"{root}/", f"{destination}/"])
-    subprocess.run(command, check=True)
+    if shutil.which("rsync") is not None:
+        subprocess.run(command, check=True)
+    else:
+        mirror_live_tree(root, destination)
 
 
 def build_key(mutation: dict[str, str | int]) -> tuple[str, str, str]:
@@ -806,8 +862,6 @@ def main() -> int:
     artifact_dir.mkdir(parents=True, exist_ok=True)
     target_dir = artifact_dir / "target"
 
-    if shutil.which("rsync") is None:
-        raise SystemExit("implementation mutation runner requires rsync")
     with tempfile.TemporaryDirectory(prefix="rustos-implementation-mutations-") as temp:
         checkout = Path(temp) / "checkout"
         prepare_checkout(root, checkout)

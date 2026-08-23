@@ -1,11 +1,13 @@
 mod activation_batch;
 mod affinity;
 mod ipc_reply_recv;
+mod scheduling_context;
 pub mod smp_qualification;
 
 pub use activation_batch::*;
 pub use affinity::*;
 pub use ipc_reply_recv::*;
+pub use scheduling_context::*;
 pub use smp_qualification::*;
 
 pub const SYS_RUSTOS_DEBUG_PRINT: u64 = 0x5255_0001;
@@ -129,6 +131,8 @@ pub const SYS_RUSTOS_IPC_RECV_WITH_SENDER_BOUNDED: u64 = 0x5255_004a;
 /// this syscall grants no authority. `ipcbench --isolate-probe` is the sole
 /// caller, bracketing one probe's measurement window with it.
 pub const SYS_RUSTOS_PHASE_PROFILE_DRAIN: u64 = 0x5255_004b;
+/// Rootd-only publication of one exact, one-shot scheduling-context grant.
+pub const SYS_RUSTOS_SCHEDULING_CONTEXT_GRANT_BROKER: u64 = 0x5255_004d;
 /// Emits one kernel-timestamped, fixed-name product acceptance milestone.
 ///
 /// This is observability only: it grants no authority and accepts only the
@@ -923,6 +927,7 @@ pub const LIFECYCLE_DRAIN_MAX_EVENTS: usize = 32;
 pub const LIFECYCLE_EVENT_EXIT: u16 = 1;
 pub const LIFECYCLE_EVENT_FORK: u16 = 2;
 pub const LIFECYCLE_EVENT_EXEC: u16 = 3;
+
 pub const COMMERCIAL_MAX_PROTOCOL_ABI_VERSION: u16 = 1;
 pub const COMMERCIAL_MAX_PROTOCOL_NAME_CAPACITY: usize = 32;
 pub const COMMERCIAL_MAX_PROTOCOL_PATH_CAPACITY: usize = 256;
@@ -968,6 +973,9 @@ pub const COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_COMPACT: u16 = 12;
 /// publishes a PID/errno result. Only another thread in the live rootd process
 /// may issue this operation; it carries no caller-selected result bytes.
 pub const COMMERCIAL_MAX_ROOTD_OP_LOADER_WORKER_COMPLETE: u16 = 13;
+/// Issue one rootd-authored, kernel-sealed scheduling-context authority for
+/// the authenticated caller and exact executable path in this request.
+pub const COMMERCIAL_MAX_ROOTD_OP_SCHEDULING_CONTEXT_GRANT: u16 = 14;
 pub const SERVICE_CHECKPOINT_ABI_VERSION: u16 = 1;
 pub const SERVICE_CHECKPOINT_FLAG_TOMBSTONE: u16 = 1 << 0;
 pub const SERVICE_CHECKPOINT_VALUE_CAPACITY: usize = 64;
@@ -2815,6 +2823,7 @@ pub struct RustosProcCommitBrokerArgs {
     /// Kernel-stamped immediate caller of loaderd's spawn request. For a
     /// deferred spawn this identity becomes the sole activation authority.
     pub requester_pid: u64,
+    pub scheduling_context: RustosSchedulingContextAuthority,
 }
 
 #[repr(C)]
@@ -2922,6 +2931,7 @@ pub struct LoaderSpawnRequest {
     /// Immediate caller PID. Loaderd must compare this with the kernel-stamped
     /// IPC sender before acting on any target PID or exec ticket.
     pub requester_pid: u64,
+    pub scheduling_context: RustosSchedulingContextAuthority,
     pub exec_path: [u8; LOADER_SPAWN_EXEC_PATH_CAPACITY],
     pub argv_bytes: [u8; LOADER_SPAWN_ARG_BYTES],
     pub env_bytes: [u8; LOADER_SPAWN_ENV_BYTES],
@@ -2944,6 +2954,7 @@ impl Default for LoaderSpawnRequest {
             argv_bytes_len: 0,
             env_bytes_len: 0,
             requester_pid: 0,
+            scheduling_context: RustosSchedulingContextAuthority::default(),
             exec_path: [0; LOADER_SPAWN_EXEC_PATH_CAPACITY],
             argv_bytes: [0; LOADER_SPAWN_ARG_BYTES],
             env_bytes: [0; LOADER_SPAWN_ENV_BYTES],

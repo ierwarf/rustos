@@ -10,6 +10,7 @@ mod reschedule_observation;
 mod retirement;
 mod run_authority;
 mod scheduler;
+mod scheduling_api;
 mod spawn;
 
 use core::{
@@ -42,27 +43,30 @@ pub use self::current::{
     activate_suspended_user_tasks_with_commit, any_user_process_state, arm_block_current_task,
     attach_reserved_ipc_priority, bind_ipc_priority_to_process_worker, bind_reserved_ipc_priority,
     cancel_block_current_task, cancel_ipc_priority_reservation, commit_ipc_call_handoff,
-    complete_ipc_reply_wake_handoff, complete_retired_task_cleanup, current_console_session,
-    current_linux_thread_state, current_task_id, current_thread_may_have_pending_signals,
-    current_user_abi, current_user_address_space, current_user_id, current_user_log_ids,
-    current_user_process_id, current_user_process_identity, current_user_process_thread_count,
-    current_user_snapshot, current_user_stack_state, current_user_thread_id,
-    current_user_wait_binding, demote_current_user_task_to_user_class, exec_current_user_process,
-    exec_user_process_by_pid, exit_current_user_process, exit_current_user_task,
-    halt_current_retired_task, inherit_ipc_priority, is_user_process_exiting, is_user_task_alive,
-    linux_task_affinity, linux_thread_snapshot_by_ids, live_user_process_identity_by_pid,
-    live_user_process_identity_with_exact_exec_path, mark_user_process_exiting,
-    mark_user_process_exiting_once, next_retired_task_cleanup, note_process_exit_status,
-    parent_process_id_of, queue_linux_process_sigchld, queue_linux_signal,
-    release_ipc_priorities_for_process, release_ipc_priority, reserve_ipc_call_donation,
-    reserve_ipc_priority, retain_current_user_process_state, retire_current_user_task_due_to_fault,
-    service_deferred_work, set_current_linux_tls_fs_base, set_linux_task_affinity,
-    set_next_latency_pick_hint, set_next_pick_hint, set_next_process_pick_hint,
-    set_next_spawn_pick_hint, set_next_synchronous_pick_hint, set_windows_current_thread_affinity,
-    set_windows_process_affinity, stop_current_linux_process, task_has_system_scheduling_class,
-    terminate_user_process, terminate_user_task, user_log_ids_for_task, wait_for_child, wake_task,
-    wake_user_task, windows_process_affinity, with_current_mm, with_current_process_credentials,
-    with_current_process_state, with_current_process_state_mut, with_current_user_linux_state_mut,
+    complete_ipc_reply_wake_handoff, complete_ipc_reply_wake_handoff_with_custody,
+    complete_retired_task_cleanup, current_console_session, current_linux_thread_state,
+    current_scheduling_context_runtime_snapshot, current_task_id,
+    current_thread_may_have_pending_signals, current_user_abi, current_user_address_space,
+    current_user_id, current_user_log_ids, current_user_process_id, current_user_process_identity,
+    current_user_process_thread_count, current_user_snapshot, current_user_stack_state,
+    current_user_thread_id, current_user_wait_binding, demote_current_user_task_to_user_class,
+    exec_current_user_process, exec_user_process_by_pid, exit_current_user_process,
+    exit_current_user_task, halt_current_retired_task, inherit_ipc_priority,
+    is_user_process_exiting, is_user_task_alive, linux_task_affinity, linux_thread_snapshot_by_ids,
+    live_user_process_identity_by_pid, live_user_process_identity_with_exact_exec_path,
+    mark_user_process_exiting, mark_user_process_exiting_once, next_retired_task_cleanup,
+    note_process_exit_status, parent_process_id_of, queue_linux_process_sigchld,
+    queue_linux_signal, release_ipc_priorities_for_process, release_ipc_priority,
+    reserve_ipc_call_donation, reserve_ipc_priority, retain_current_user_process_state,
+    retire_current_user_task_due_to_fault, service_deferred_work, set_current_linux_tls_fs_base,
+    set_linux_task_affinity, set_next_latency_pick_hint, set_next_pick_hint,
+    set_next_process_pick_hint, set_next_spawn_pick_hint, set_next_synchronous_pick_hint,
+    set_windows_current_thread_affinity, set_windows_process_affinity,
+    settle_ipc_reply_scheduling_context, stop_current_linux_process,
+    task_has_system_scheduling_class, terminate_user_process, terminate_user_task,
+    user_log_ids_for_task, wait_for_child, wake_task, wake_user_task, windows_process_affinity,
+    with_current_mm, with_current_process_credentials, with_current_process_state,
+    with_current_process_state_mut, with_current_user_linux_state_mut,
     with_current_user_process_and_linux_thread_state_mut, with_current_user_process_state,
     with_current_user_process_state_mut, with_process_state_by_pid, with_process_state_by_pid_mut,
 };
@@ -70,9 +74,11 @@ pub use self::process_table::ProcessIdentity;
 pub use self::retirement::UserFaultDisposition;
 pub use self::scheduler::drain_scheduler_runtime_profile;
 pub use self::scheduler::{AffinityCommit, AffinityError, ProcessAffinitySnapshot};
+pub use self::scheduling_api::{SchedulingContextAdmission, SchedulingContextRuntimeSnapshot};
 
 /// Upper bound for schedulable task identities and cross-crate bounded registries.
 pub const MAX_SCHEDULER_TASKS: usize = scheduler::MAX_TASK;
+
 pub use self::irq::{
     commit_block_current_task_and_yield, rtc_interrupt_handler_addr,
     software_schedule_interrupt_handler_addr, timer_interrupt_handler_addr, yield_now,
@@ -83,10 +89,11 @@ pub(crate) use self::irq::{
     reschedule_deferred_from_interruptible_syscall, reschedule_if_requested,
 };
 pub use self::spawn::{
-    spawn_kernel_process, spawn_user_process, spawn_user_process_state_with_parent,
-    spawn_user_process_suspended, spawn_user_process_with_parent,
-    spawn_user_process_without_deferred_reschedule, spawn_user_thread_suspended, start,
-    start_secondary_cpu,
+    spawn_kernel_process, spawn_user_process_state_with_parent,
+    spawn_user_process_suspended_with_scheduling_context,
+    spawn_user_process_with_scheduling_context,
+    spawn_user_process_without_deferred_reschedule_with_scheduling_context,
+    spawn_user_thread_suspended, start, start_secondary_cpu,
 };
 
 // A one-millisecond periodic preemption edge spent a material fraction of a

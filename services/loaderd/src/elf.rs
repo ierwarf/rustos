@@ -113,6 +113,7 @@ fn validate_request(received: usize, request: &LoaderSpawnRequest) -> Result<(),
             || request.env_count != 0
             || request.argv_bytes_len != 0
             || request.env_bytes_len != 0
+            || request.scheduling_context != Default::default()
         {
             return Err(EINVAL);
         }
@@ -125,12 +126,19 @@ fn validate_request(received: usize, request: &LoaderSpawnRequest) -> Result<(),
         return Err(EINVAL);
     }
     if request.op == LOADER_OP_SPAWN_EXEC
-        && (request.target_pid != 0 || request.target_tid != 0 || request.exec_ticket != 0)
+        && (request.target_pid != 0
+            || request.target_tid != 0
+            || request.exec_ticket != 0
+            || request.scheduling_context.token == 0
+            || !request.scheduling_context.policy.is_canonical())
     {
         return Err(EINVAL);
     }
     if request.op == LOADER_OP_EXEC_TARGET
-        && (request.target_pid == 0 || request.target_tid == 0 || request.exec_ticket == 0)
+        && (request.target_pid == 0
+            || request.target_tid == 0
+            || request.exec_ticket == 0
+            || request.scheduling_context != Default::default())
     {
         return Err(EINVAL);
     }

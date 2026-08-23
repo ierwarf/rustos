@@ -44,6 +44,7 @@ pub struct ConsoleProgramSpec<'a> {
     pub logical_admin: bool,
     pub argv: &'a [&'a str],
     pub env: &'a [&'a str],
+    scheduling_context: Option<rustos_user_abi::syscall::RustosSchedulingContextPolicy>,
 }
 
 impl<'a> ConsoleProgramSpec<'a> {
@@ -55,6 +56,7 @@ impl<'a> ConsoleProgramSpec<'a> {
             logical_admin: false,
             argv: &[],
             env: &[],
+            scheduling_context: None,
         }
     }
 
@@ -67,6 +69,34 @@ impl<'a> ConsoleProgramSpec<'a> {
     pub const fn with_logical_admin(mut self, logical_admin: bool) -> Self {
         self.logical_admin = logical_admin;
         self
+    }
+
+    pub const fn with_scheduling_context(
+        mut self,
+        policy: rustos_user_abi::syscall::RustosSchedulingContextPolicy,
+    ) -> Self {
+        self.scheduling_context = Some(policy);
+        self
+    }
+
+    pub const fn with_bootstrap_scheduling_context(
+        self,
+        domain: u64,
+        budget_ns: u64,
+        period_ns: u64,
+        criticality: u8,
+    ) -> Self {
+        self.with_scheduling_context(
+            rustos_user_abi::syscall::RustosSchedulingContextPolicy::new(
+                u64::MAX,
+                budget_ns,
+                period_ns,
+                8,
+                criticality,
+                domain,
+                1,
+            ),
+        )
     }
 }
 
@@ -159,7 +189,16 @@ pub fn spawn_program_in_session(
         logical_admin: program.logical_admin,
     };
 
-    process::spawn_bootstrap_linux_process_with_launch(program.image, program.weight_micros, launch)
+    let policy = program.scheduling_context.ok_or(ConsoleHostError::Spawn {
+        error: ProcessLoadError::MissingSchedulingContext,
+    })?;
+    let spawned = process::spawn_bootstrap_linux_process_with_launch_and_scheduling_context(
+        program.image,
+        program.weight_micros,
+        launch,
+        policy,
+    );
+    spawned
         .inspect(|spawned| {
             if trace {
                 emit_console(

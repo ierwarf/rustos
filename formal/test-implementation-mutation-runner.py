@@ -160,6 +160,43 @@ def restore_touches_every_registered_source() -> None:
         assert source.stat().st_mtime_ns != stale
 
 
+def checkout_mirror_has_a_no_rsync_path() -> None:
+    """The source seal must not depend on an optional host binary."""
+    with tempfile.TemporaryDirectory(prefix="rustos-mutation-mirror-") as temporary:
+        root = Path(temporary) / "source"
+        checkout = Path(temporary) / "checkout"
+        root.mkdir()
+        subprocess.run(["git", "init", "-q", str(root)], check=True)
+        subprocess.run(["git", "-C", str(root), "config", "user.email", "test@example.invalid"], check=True)
+        subprocess.run(["git", "-C", str(root), "config", "user.name", "Mutation Test"], check=True)
+        (root / "tracked.rs").write_text("initial\n", encoding="utf-8")
+        (root / "removed.rs").write_text("remove me\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(root), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(root), "commit", "-q", "-m", "initial"], check=True)
+
+        (root / "tracked.rs").write_text("dirty source\n", encoding="utf-8")
+        (root / "removed.rs").unlink()
+        (root / "untracked.rs").write_text("live source\n", encoding="utf-8")
+        (root / "target").mkdir()
+        (root / "target" / "artifact").write_text("ignore\n", encoding="utf-8")
+        (root / "driver-domains/linux/out").mkdir(parents=True)
+        (root / "driver-domains/linux/out/artifact").write_text("ignore\n", encoding="utf-8")
+
+        original_which = runner.shutil.which
+        runner.shutil.which = lambda name: None if name == "rsync" else original_which(name)
+        try:
+            runner.prepare_checkout(root, checkout)
+        finally:
+            runner.shutil.which = original_which
+
+        assert (checkout / ".git").is_dir()
+        assert (checkout / "tracked.rs").read_text(encoding="utf-8") == "dirty source\n"
+        assert (checkout / "untracked.rs").read_text(encoding="utf-8") == "live source\n"
+        assert not (checkout / "removed.rs").exists()
+        assert not (checkout / "target").exists()
+        assert not (checkout / "driver-domains/linux/out").exists()
+
+
 def main() -> int:
     witness = "ipc::tests::exact_contract"
     started = sealed_output(witness, "running 1 test\n")
@@ -191,6 +228,7 @@ def main() -> int:
 
     pristine_work_is_established_once_per_witness()
     restore_touches_every_registered_source()
+    checkout_mirror_has_a_no_rsync_path()
 
     print("implementation mutation runner selftest passed")
     return 0

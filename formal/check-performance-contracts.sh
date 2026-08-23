@@ -611,10 +611,10 @@ if [ -z "$atomic_handoff_line" ] || [ -z "$sync_handoff_line" ] || \
     echo "atomic activation or synchronous IPC handoff no longer precedes unrelated overdue work" >&2
     exit 1
 fi
-if [ "$(rg -c 'complete_ipc_reply_wake_handoff\(' \
+if [ "$(rg -c 'complete_ipc_reply_wake_handoff_with_custody\(' \
     kernel/compat/src/user/syscall/linux/{ipc_ops.rs,ipc_reply_recv.rs} | \
     awk -F: '{ total += $2 } END { print total + 0 }')" -ne 3 ]; then
-    echo "one terminal IPC reply ABI bypasses the combined donation/wake handoff" >&2
+    echo "one terminal IPC reply ABI bypasses the combined scheduling-context return/donation/wake handoff" >&2
     exit 1
 fi
 # The call path arms the L4-style direct handoff hint for the exact receiver.
@@ -682,7 +682,7 @@ rg -Fq 'SYS_RUSTOS_IPC_REPLY_RECV_WITH_SENDER' \
 for witness in \
     'ipc_reply_recv_shape_valid(&args)' \
     'prepare_recv_with_sender(' \
-    'complete_endpoint_reply_for_process(' \
+    'complete_endpoint_reply_for_process_with_custody(' \
     'recv_with_sender_blocking_prepared(' \
     'IPC_REPLY_RECV_COMMITTED_ERROR_BASE + errno'; do
     rg -Fq "$witness" "$reply_recv_kernel" || {
@@ -690,7 +690,7 @@ for witness in \
         exit 1
     }
 done
-rg -Uq 'prepare_recv_with_sender\([\s\S]{0,1800}copy_request_from_user\([\s\S]{0,1800}complete_endpoint_reply_for_process\([\s\S]{0,2600}recv_with_sender_blocking_prepared\(' \
+rg -Uq 'prepare_recv_with_sender\([\s\S]{0,1800}copy_request_from_user\([\s\S]{0,1800}complete_endpoint_reply_for_process_with_custody\([\s\S]{0,2600}recv_with_sender_blocking_prepared\(' \
     "$reply_recv_kernel" || {
     echo "fused reply-receive no longer preflights before reply commit and receive" >&2
     exit 1

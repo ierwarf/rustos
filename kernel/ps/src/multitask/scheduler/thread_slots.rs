@@ -16,6 +16,8 @@ pub(in crate::multitask) struct UserThreadSlotReservation {
     inherited_process_mask: u64,
     weight: u32,
     vruntime_ns: u64,
+    scheduling_policy: Option<scheduling_context::SchedulingContextPolicy>,
+    scheduling_domain_slot: Option<usize>,
 }
 
 impl Scheduler {
@@ -50,6 +52,8 @@ impl Scheduler {
                     inherited_task_mask,
                     inherited_process_mask,
                     weight: current.weight,
+                    scheduling_policy: current.scheduling_context.policy(),
+                    scheduling_domain_slot: current.scheduling_context.domain_slot(),
                     vruntime_ns: self
                         .slot_vruntime(self.current_task_slot())
                         .saturating_add(SCHED_NEW_TASK_VRUNTIME_PENALTY_NS),
@@ -82,7 +86,26 @@ impl Scheduler {
         }
         let (kernel_stack_base, kernel_stack_top) = self.stack_bounds(slot);
         let saved_rsp = self.init_user_task_context(slot, &bootstrap, user_cs, user_ss, rflags);
+        let mut scheduling_context =
+            scheduling_context::SchedulingContext::bind(slot, reservation.id);
+        match (
+            reservation.scheduling_policy,
+            reservation.scheduling_domain_slot,
+        ) {
+            (Some(policy), Some(domain_slot)) => {
+                if !scheduling_context.admit(policy, domain_slot) {
+                    self.cancel_user_thread_slot(reservation);
+                    return None;
+                }
+            }
+            (None, None) => {}
+            _ => {
+                self.cancel_user_thread_slot(reservation);
+                return None;
+            }
+        }
         self.contexts[slot] = Some(TaskContext {
+            scheduling_context,
             #[cfg(test)]
             saved_rsp,
             #[cfg(test)]

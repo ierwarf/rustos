@@ -160,6 +160,26 @@ impl Scheduler {
 
     pub(super) fn context_is_schedulable(&self, slot: usize, context: TaskContext) -> bool {
         let current_cpu = nucleus_core::util::lockdep::current_cpu_index();
+        let context_owner_slot = self.effective_scheduling_context_owner_slot(slot);
+        let scheduling_context = self.contexts[context_owner_slot]
+            .map(|owner| owner.scheduling_context)
+            .unwrap_or(context.scheduling_context);
+        if scheduling_context.is_budgeted() {
+            if !scheduling_context.allows_cpu(current_cpu) {
+                return false;
+            }
+            let now_ns = crate::arch::clock::monotonic_nanos();
+            if !scheduling_context.is_eligible(now_ns)
+                || !scheduling_context
+                    .policy()
+                    .zip(scheduling_context.domain_slot())
+                    .is_some_and(|(policy, domain_slot)| {
+                        self.scheduling_domain_is_eligible(domain_slot, policy, now_ns)
+                    })
+            {
+                return false;
+            }
+        }
         #[cfg(not(test))]
         if !runqueue::is_local_dispatchable(slot, current_cpu) {
             return false;
@@ -281,6 +301,7 @@ impl Scheduler {
         }
         let now = crate::arch::rtc::ticks();
         self.contexts[slot] = Some(TaskContext {
+            scheduling_context: scheduling_context::SchedulingContext::bind(slot, id),
             #[cfg(test)]
             saved_rsp: 0,
             #[cfg(test)]

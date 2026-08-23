@@ -33,6 +33,13 @@ use super::{CurrentUserLogContext, MilestoneOutputClass, MilestoneRecord};
 /// uncontended and a burst is charged to the CPU that produced it. Total depth
 /// also rises with the topology instead of being shared out.
 const DEFERRED_SLOTS_PER_CPU: usize = 64;
+/// Ordinary diagnostics cannot consume these final slots. Required milestone
+/// evidence is produced from scheduler/IRQ contexts where waiting for the
+/// sink is forbidden, so it needs a bounded private reserve during the dense
+/// multi-vCPU startup burst.
+const DEFERRED_REQUIRED_RESERVE_PER_CPU: usize = 16;
+const DEFERRED_GENERAL_SLOTS_PER_CPU: usize =
+    DEFERRED_SLOTS_PER_CPU - DEFERRED_REQUIRED_RESERVE_PER_CPU;
 /// Longest line the ring accepts, matching the serialized diagnostic bound.
 pub(super) const DEFERRED_LINE_BYTES: usize = 512;
 
@@ -122,7 +129,7 @@ pub(super) fn park(bytes: &[u8]) -> bool {
     if bytes.is_empty() || bytes.len() > DEFERRED_LINE_BYTES {
         return false;
     }
-    for slot in DEFERRED.local_slots().iter() {
+    for slot in DEFERRED.local_slots()[..DEFERRED_GENERAL_SLOTS_PER_CPU].iter() {
         // ORDERING: AcqRel claims the slot before any byte is written to it,
         // so no drainer can observe a partially filled record.
         if slot
@@ -231,7 +238,10 @@ pub(super) fn drain(
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFERRED, DEFERRED_LINE_BYTES, DEFERRED_SLOTS_PER_CPU, drain, park};
+    use super::{
+        DEFERRED, DEFERRED_GENERAL_SLOTS_PER_CPU, DEFERRED_LINE_BYTES,
+        DEFERRED_REQUIRED_RESERVE_PER_CPU, ParkedMilestone, drain, park, park_milestone,
+    };
     use alloc::vec::Vec;
 
     /// The rings are process-wide statics and every test here fills and drains
@@ -271,13 +281,13 @@ mod tests {
     #[test]
     fn a_full_ring_refuses_rather_than_overwriting_a_parked_line() {
         let _serial = serialized();
-        for _ in 0..DEFERRED_SLOTS_PER_CPU {
+        for _ in 0..DEFERRED_GENERAL_SLOTS_PER_CPU {
             assert!(park(b"x"));
         }
         // The caller must account this loss; silently dropping the oldest
         // record would make the gap invisible.
         assert!(!park(b"x"));
-        assert_eq!(drain_all().len(), DEFERRED_SLOTS_PER_CPU);
+        assert_eq!(drain_all().len(), DEFERRED_GENERAL_SLOTS_PER_CPU);
     }
 
     #[test]
@@ -296,7 +306,7 @@ mod tests {
         let _serial = serialized();
         // Filling this CPU's ring must not reach any other CPU's slots; that
         // sharing is what let one noisy CPU drop everyone else's records.
-        for _ in 0..DEFERRED_SLOTS_PER_CPU {
+        for _ in 0..DEFERRED_GENERAL_SLOTS_PER_CPU {
             assert!(park(b"x"));
         }
         assert!(!park(b"x"));
@@ -311,6 +321,30 @@ mod tests {
             })
             .count();
         assert_eq!(remaining, 0);
-        assert_eq!(drain_all().len(), DEFERRED_SLOTS_PER_CPU);
+        assert_eq!(drain_all().len(), DEFERRED_GENERAL_SLOTS_PER_CPU);
+    }
+
+    #[test]
+    fn ordinary_burst_cannot_consume_required_milestone_reserve() {
+        let _serial = serialized();
+        for _ in 0..DEFERRED_GENERAL_SLOTS_PER_CPU {
+            assert!(park(b"ordinary"));
+        }
+        assert!(!park(b"ordinary"));
+        for _ in 0..DEFERRED_REQUIRED_RESERVE_PER_CPU {
+            assert!(park_milestone(ParkedMilestone {
+                record: super::super::MilestoneRecord::EMPTY,
+                user_context: None,
+                output_class: super::MilestoneOutputClass::Required,
+            }));
+        }
+        assert!(!park_milestone(ParkedMilestone {
+            record: super::super::MilestoneRecord::EMPTY,
+            user_context: None,
+            output_class: super::MilestoneOutputClass::Required,
+        }));
+        let mut milestones = 0;
+        super::drain(|_| {}, |_| milestones += 1);
+        assert_eq!(milestones, DEFERRED_REQUIRED_RESERVE_PER_CPU);
     }
 }

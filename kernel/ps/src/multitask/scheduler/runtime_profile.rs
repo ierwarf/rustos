@@ -235,8 +235,39 @@ fn fnv1a32(value: &str) -> u32 {
 }
 
 pub fn drain_scheduler_runtime_profile() -> usize {
+    let scheduling_context = super::scheduling_context::drain_runtime_counters();
+    let mut work = 0;
+    for (budget, budget_name, refill_name) in [
+        (
+            scheduling_context.context,
+            "kernel-scheduling-context-budget",
+            "kernel-scheduling-context-refill",
+        ),
+        (
+            scheduling_context.domain,
+            "kernel-scheduling-domain-budget",
+            "kernel-scheduling-domain-refill",
+        ),
+    ] {
+        if budget == Default::default() {
+            continue;
+        }
+        crate::debug::record_milestone(
+            crate::debug::LogCategory::Sched,
+            budget_name,
+            budget.charged_ns,
+            pack_u32_pair(budget.exhaustions, budget.overrun_ns / 1_000),
+        );
+        crate::debug::record_milestone(
+            crate::debug::LogCategory::Sched,
+            refill_name,
+            budget.refill_ns,
+            pack_u32_pair(budget.refills, budget.overflow_merges),
+        );
+        work += 1;
+    }
     let Some(profile) = PENDING_RUNTIME_PROFILE.take() else {
-        return 0;
+        return work;
     };
     crate::debug::record_milestone(
         crate::debug::LogCategory::Sched,
@@ -631,7 +662,7 @@ pub fn drain_scheduler_runtime_profile() -> usize {
             pack_u32_pair(entry.runtime_ns / 1_000_000, entry.dispatches),
         );
     }
-    1
+    work + 1
 }
 
 impl Scheduler {
@@ -915,6 +946,7 @@ mod tests {
 
     fn profile_context(address_space_root: u64) -> TaskContext {
         TaskContext {
+            scheduling_context: scheduling_context::SchedulingContext::bind(0, 1),
             saved_rsp: 0,
             #[cfg(test)]
             test_ready: true,

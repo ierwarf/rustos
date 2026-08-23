@@ -27,7 +27,19 @@
 extern crate alloc;
 
 mod control_drain;
+mod loader_wire;
+mod scheduling_policy;
 mod service_checkpoint;
+mod service_manifest;
+
+use loader_wire::{
+    contains_nul, copy_bytes, empty_loader_spawn_request, empty_loader_spawn_response,
+};
+use scheduling_policy::{
+    issue_scheduling_context_authority, register_scheduling_context_authority,
+    scheduling_context_policy_for_exec,
+};
+use service_manifest::*;
 
 use core::arch::asm;
 use core::cell::UnsafeCell;
@@ -42,14 +54,16 @@ use rustos_user_abi::syscall::{
     CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, CoreServiceLeaseWire,
     IpcRecvWithSenderArgs, LifecycleDrainBrokerArgs, LifecycleEventWire, LoaderSpawnRequest,
     LoaderSpawnResponse, RustosProcValidateDeferredSpawnBrokerArgs, RustosRootdTerminateBrokerArgs,
-    ServiceCheckpointRecordWire, COMMERCIAL_MAX_CAPABILITY_OP_LEASE_GRANT,
-    COMMERCIAL_MAX_CAPABILITY_OP_LEASE_RENEW, COMMERCIAL_MAX_CAPABILITY_OP_LEASE_REVOKE,
-    COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_CAPABILITY,
-    COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS, COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR,
-    COMMERCIAL_MAX_ROOTD_OP_BOOTSTRAP_MANIFEST, COMMERCIAL_MAX_ROOTD_OP_CORE_SERVICE_LEASE,
-    COMMERCIAL_MAX_ROOTD_OP_DEPENDENCY_GRAPH, COMMERCIAL_MAX_ROOTD_OP_LOADER_WORKER_COMPLETE,
-    COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_QUERY, COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM,
-    COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL, COMMERCIAL_MAX_ROOTD_OP_RESTART_POLICY,
+    RustosSchedulingContextAuthority, RustosSchedulingContextGrantBrokerArgs,
+    RustosSchedulingContextPolicy, ServiceCheckpointRecordWire,
+    COMMERCIAL_MAX_CAPABILITY_OP_LEASE_GRANT, COMMERCIAL_MAX_CAPABILITY_OP_LEASE_RENEW,
+    COMMERCIAL_MAX_CAPABILITY_OP_LEASE_REVOKE, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
+    COMMERCIAL_MAX_PROTOCOL_CAPABILITY, COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS,
+    COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR, COMMERCIAL_MAX_ROOTD_OP_BOOTSTRAP_MANIFEST,
+    COMMERCIAL_MAX_ROOTD_OP_CORE_SERVICE_LEASE, COMMERCIAL_MAX_ROOTD_OP_DEPENDENCY_GRAPH,
+    COMMERCIAL_MAX_ROOTD_OP_LOADER_WORKER_COMPLETE, COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_QUERY,
+    COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM, COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL,
+    COMMERCIAL_MAX_ROOTD_OP_RESTART_POLICY, COMMERCIAL_MAX_ROOTD_OP_SCHEDULING_CONTEXT_GRANT,
     COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY, COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_COMPACT,
     COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE,
     COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_SCAN, COMMERCIAL_MAX_ROOTD_OP_SERVICE_LOOKUP,
@@ -61,13 +75,14 @@ use rustos_user_abi::syscall::{
     LOADER_SPAWN_ARG_BYTES, LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_EXEC_PATH_CAPACITY,
     LOADER_SPAWN_FLAG_DEFER_START, PRODUCT_MILESTONE_ROOT_CORE_READY, ROOTD_LEASE_STATE_EXITED,
     ROOTD_LEASE_STATE_FAILED, ROOTD_LEASE_STATE_RESTART_PENDING, ROOTD_LEASE_STATE_RUNNING,
-    ROOTD_TERMINATE_BROKER_ABI_VERSION, SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_IPC_CALL,
-    SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
-    SYS_RUSTOS_IPC_RECV_WITH_SENDER, SYS_RUSTOS_IPC_RECV_WITH_SENDER_BOUNDED,
-    SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
-    SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER, SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER,
+    ROOTD_TERMINATE_BROKER_ABI_VERSION, SCHEDULING_CONTEXT_POLICY_ABI_UNSET,
+    SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
+    SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_RECV_WITH_SENDER,
+    SYS_RUSTOS_IPC_RECV_WITH_SENDER_BOUNDED, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT,
+    SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER, SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER,
     SYS_RUSTOS_PROC_VALIDATE_DEFERRED_SPAWN_BROKER, SYS_RUSTOS_PRODUCT_MILESTONE,
-    SYS_RUSTOS_ROOTD_TERMINATE_BROKER, SYS_RUSTOS_ROOTD_WAIT_BROKER, SYS_RUSTOS_SPAWN_EXEC,
+    SYS_RUSTOS_ROOTD_TERMINATE_BROKER, SYS_RUSTOS_ROOTD_WAIT_BROKER,
+    SYS_RUSTOS_SCHEDULING_CONTEXT_GRANT_BROKER, SYS_RUSTOS_SPAWN_EXEC,
     TASK_WEIGHT_INTERACTIVE_FLAG,
 };
 use service_checkpoint::ServiceCheckpointStore;
@@ -88,121 +103,10 @@ const SPAWN_FLAG_LOGICAL_ADMIN: u64 = 1;
 // from a package or desktop entry. This lets the scheduler's bounded System
 // ready-wait rail break priority inversion when an ordinary caller blocks on
 // one of these servers under sustained display/input load.
-const CORE_SERVICE_WEIGHT_MICROS: u64 = TASK_WEIGHT_INTERACTIVE_FLAG | 4_000;
-const INITD_WEIGHT_MICROS: u64 = 4_000;
-const _: () = assert!(CORE_SERVICE_WEIGHT_MICROS & TASK_WEIGHT_INTERACTIVE_FLAG != 0);
-const _: () = assert!(INITD_WEIGHT_MICROS & TASK_WEIGHT_INTERACTIVE_FLAG == 0);
 const BOOTSTRAP_SPAWN_MAX_ATTEMPTS: u32 = 64;
 const INITD_SPAWN_MAX_ATTEMPTS: u32 = 64;
 const CORE_READINESS_POLL_INTERVAL_MS: u32 = 250;
 const CORE_READINESS_POLL_MAX: u32 = 20;
-const SYSCALLD_EXEC: &[u8] = b"services/syscalld/syscalld.elf\0";
-const VFSD_EXEC: &[u8] = b"services/vfsd/vfsd.elf\0";
-const LOADERD_EXEC: &[u8] = b"services/loaderd/loaderd.elf\0";
-const PROCD_EXEC: &[u8] = b"services/procd/procd.elf\0";
-const INITD_EXEC: &[u8] = b"services/initd/initd.elf\0";
-const NETD_EXEC: &[u8] = b"services/netd/netd.elf\0";
-const DEVMGRD_EXEC: &[u8] = b"services/devmgrd/devmgrd.elf\0";
-const INPUTD_EXEC: &[u8] = b"services/inputd/inputd.elf\0";
-const STORAGED_EXEC: &[u8] = b"services/storaged/storaged.elf\0";
-const RUNTIMED_EXEC: &[u8] = b"services/runtimed/runtimed.elf\0";
-const UISERVER_EXEC: &[u8] = b"services/uiserver/uiserver.elf\0";
-const INITD_LEASE_ID: u64 = IPC_SERVICE_INITD;
-const INITD_LEASE_INDEX: usize = 4;
-const DEP_SYSCALLD: u16 = 1 << 0;
-const DEP_VFSD: u16 = 1 << 1;
-const DEP_LOADERD: u16 = 1 << 2;
-const DEP_PROCD: u16 = 1 << 3;
-const DEP_PAGERD: u16 = 1 << 4;
-
-#[derive(Clone, Copy)]
-struct BootstrapServiceSpec {
-    service_id: u64,
-    exec_path: &'static [u8],
-    weight_micros: u64,
-    dependency_mask: u16,
-    bootstrap_direct: bool,
-    restart_direct: bool,
-}
-
-const BOOTSTRAP_MANIFEST: [BootstrapServiceSpec; 5] = [
-    BootstrapServiceSpec {
-        service_id: IPC_SERVICE_LINUX_SYSCALLD,
-        exec_path: SYSCALLD_EXEC,
-        weight_micros: CORE_SERVICE_WEIGHT_MICROS,
-        dependency_mask: 0,
-        bootstrap_direct: true,
-        restart_direct: false,
-    },
-    BootstrapServiceSpec {
-        service_id: IPC_SERVICE_VFSD,
-        exec_path: VFSD_EXEC,
-        weight_micros: CORE_SERVICE_WEIGHT_MICROS,
-        dependency_mask: 0,
-        bootstrap_direct: true,
-        restart_direct: false,
-    },
-    BootstrapServiceSpec {
-        service_id: IPC_SERVICE_LOADERD,
-        exec_path: LOADERD_EXEC,
-        weight_micros: CORE_SERVICE_WEIGHT_MICROS,
-        // loaderd requests terminally sealed executable snapshots from vfsd;
-        // it never reads mutable path-backed bytes into a commit transaction.
-        dependency_mask: DEP_VFSD,
-        bootstrap_direct: true,
-        restart_direct: true,
-    },
-    BootstrapServiceSpec {
-        service_id: IPC_SERVICE_PROCD,
-        exec_path: PROCD_EXEC,
-        weight_micros: CORE_SERVICE_WEIGHT_MICROS,
-        dependency_mask: 0,
-        bootstrap_direct: true,
-        restart_direct: false,
-    },
-    BootstrapServiceSpec {
-        service_id: INITD_LEASE_ID,
-        exec_path: INITD_EXEC,
-        weight_micros: INITD_WEIGHT_MICROS,
-        dependency_mask: DEP_SYSCALLD | DEP_VFSD | DEP_LOADERD | DEP_PROCD | DEP_PAGERD,
-        bootstrap_direct: false,
-        restart_direct: false,
-    },
-];
-
-#[derive(Clone, Copy)]
-struct PostInitServiceSpec {
-    service_id: u64,
-    exec_path: &'static [u8],
-}
-
-const POST_INIT_MANIFEST: [PostInitServiceSpec; 6] = [
-    PostInitServiceSpec {
-        service_id: IPC_SERVICE_NETD,
-        exec_path: NETD_EXEC,
-    },
-    PostInitServiceSpec {
-        service_id: IPC_SERVICE_DEVMGRD,
-        exec_path: DEVMGRD_EXEC,
-    },
-    PostInitServiceSpec {
-        service_id: IPC_SERVICE_INPUTD,
-        exec_path: INPUTD_EXEC,
-    },
-    PostInitServiceSpec {
-        service_id: IPC_SERVICE_STORAGED,
-        exec_path: STORAGED_EXEC,
-    },
-    PostInitServiceSpec {
-        service_id: IPC_SERVICE_SESSIOND,
-        exec_path: RUNTIMED_EXEC,
-    },
-    PostInitServiceSpec {
-        service_id: IPC_SERVICE_UISERVER,
-        exec_path: UISERVER_EXEC,
-    },
-];
-
 struct RootdIpcCell<T>(UnsafeCell<T>);
 
 unsafe impl<T> Sync for RootdIpcCell<T> {}
@@ -481,6 +385,16 @@ fn spawn_tracked_with_attempts(lease: &mut Lease, max_attempts: u32) -> Result<(
 }
 
 fn spawn_exec(path: &'static [u8], weight_micros: u64) -> Result<u64, i64> {
+    let requester_pid = syscall0(SYS_GETPID);
+    if requester_pid <= 0 {
+        return Err(5);
+    }
+    register_scheduling_context_authority(
+        trim_nul(path),
+        requester_pid as u64,
+        scheduling_context_policy_for_exec(path),
+    )
+    .map_err(i64::from)?;
     let argv = [path.as_ptr(), core::ptr::null()];
     let result = syscall6(
         SYS_RUSTOS_SPAWN_EXEC,
@@ -892,6 +806,19 @@ fn validate_commercial_max_request(
             | COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_COMPACT
             | COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_SCAN
             | COMMERCIAL_MAX_ROOTD_OP_LOADER_WORKER_COMPLETE => Ok(()),
+            COMMERCIAL_MAX_ROOTD_OP_SCHEDULING_CONTEXT_GRANT => {
+                if request.path_len == 0
+                    || request.payload_len != 0
+                    || request.arg0 != 0
+                    || request.arg1 != 0
+                    || request.arg2 != 0
+                    || request.arg3 != 0
+                {
+                    Err(22)
+                } else {
+                    Ok(())
+                }
+            }
             _ => Err(22),
         },
         COMMERCIAL_MAX_PROTOCOL_CAPABILITY => match request.header.op {
@@ -1006,6 +933,12 @@ fn fill_commercial_max_response(
         COMMERCIAL_MAX_ROOTD_OP_LOADER_WORKER_COMPLETE => {
             complete_loader_worker(request, sender)?;
             response.value0 = 1;
+            Ok(())
+        }
+        COMMERCIAL_MAX_ROOTD_OP_SCHEDULING_CONTEXT_GRANT => {
+            let authority = issue_scheduling_context_authority(request, sender)?;
+            response.payload_len = write_payload_struct(&authority, &mut response.payload);
+            response.value0 = authority.token;
             Ok(())
         }
         COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_QUERY => {
@@ -1331,6 +1264,7 @@ fn rootd_capability_mask(op: u16) -> u64 {
         COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE => 1 << 9,
         COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_SCAN => 1 << 10,
         COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_COMPACT => 1 << 11,
+        COMMERCIAL_MAX_ROOTD_OP_SCHEDULING_CONTEXT_GRANT => 1 << 12,
         _ => 0,
     }
 }
@@ -1846,7 +1780,7 @@ fn write_payload_struct<T>(value: &T, dest: &mut [u8]) -> u32 {
     count as u32
 }
 
-fn trim_nul(bytes: &'static [u8]) -> &'static [u8] {
+fn trim_nul(bytes: &[u8]) -> &[u8] {
     if bytes.last() == Some(&0) {
         &bytes[..bytes.len() - 1]
     } else {
@@ -2205,6 +2139,12 @@ fn spawn_exec_via_loaderd_blocking(path: &'static [u8], weight_micros: u64) -> R
         return Err(22);
     }
     request.requester_pid = requester_pid as u64;
+    request.scheduling_context = register_scheduling_context_authority(
+        path,
+        request.requester_pid,
+        scheduling_context_policy_for_exec(path),
+    )
+    .map_err(i64::from)?;
     request.flags = SPAWN_FLAG_LOGICAL_ADMIN as u32 | LOADER_SPAWN_FLAG_DEFER_START;
     request.weight_micros = weight_micros;
     request.exec_path_len = path.len() as u32;
@@ -2282,57 +2222,6 @@ fn activate_exec_via_loaderd(pid: u64) -> Result<(), i64> {
         return Err(response.status as i64);
     }
     Ok(())
-}
-
-const fn empty_loader_spawn_request() -> LoaderSpawnRequest {
-    LoaderSpawnRequest {
-        version: 0,
-        op: 0,
-        flags: 0,
-        console_session: 0,
-        weight_micros: 0,
-        target_pid: 0,
-        target_tid: 0,
-        exec_ticket: 0,
-        exec_path_len: 0,
-        argv_count: 0,
-        env_count: 0,
-        argv_bytes_len: 0,
-        env_bytes_len: 0,
-        requester_pid: 0,
-        exec_path: [0; LOADER_SPAWN_EXEC_PATH_CAPACITY],
-        argv_bytes: [0; LOADER_SPAWN_ARG_BYTES],
-        env_bytes: [0; LOADER_SPAWN_ENV_BYTES],
-    }
-}
-
-const fn empty_loader_spawn_response() -> LoaderSpawnResponse {
-    LoaderSpawnResponse {
-        version: 0,
-        op: 0,
-        status: 0,
-        pid: 0,
-        reserved0: 0,
-    }
-}
-
-fn contains_nul(bytes: &[u8]) -> bool {
-    let mut index = 0usize;
-    while index < bytes.len() {
-        if bytes[index] == 0 {
-            return true;
-        }
-        index += 1;
-    }
-    false
-}
-
-fn copy_bytes(src: &[u8], dest: &mut [u8]) {
-    let mut index = 0usize;
-    while index < src.len() {
-        dest[index] = src[index];
-        index += 1;
-    }
 }
 
 fn debug_line(bytes: &[u8]) {
@@ -2514,6 +2403,37 @@ mod tests {
             .expect("first rootd service action");
         assert!(allocator < first_service_action);
         assert_eq!(source.matches("RootdBumpAllocator").count(), 1);
+    }
+
+    #[test]
+    fn scheduling_policy_is_owned_by_the_immutable_service_manifest() {
+        for service in BOOTSTRAP_MANIFEST {
+            assert!(service.scheduling.is_canonical());
+            assert_eq!(service.scheduling.domain, service.service_id);
+            assert_eq!(
+                scheduling_context_policy_for_exec(trim_nul(service.exec_path)),
+                service.scheduling
+            );
+            assert_eq!(
+                scheduling_context_policy_for_exec(service.exec_path),
+                service.scheduling
+            );
+        }
+        for service in POST_INIT_MANIFEST {
+            assert!(service.scheduling.is_canonical());
+            assert_eq!(service.scheduling.domain, service.service_id);
+            assert_eq!(
+                scheduling_context_policy_for_exec(trim_nul(service.exec_path)),
+                service.scheduling
+            );
+            assert_eq!(
+                scheduling_context_policy_for_exec(service.exec_path),
+                service.scheduling
+            );
+        }
+        let ordinary = scheduling_context_policy_for_exec(b"apps/ipcbench/ipcbench.elf");
+        assert_eq!(ordinary, USER_WORKLOAD_SCHEDULING_POLICY);
+        assert_eq!(ordinary.criticality, 0);
     }
 
     #[test]

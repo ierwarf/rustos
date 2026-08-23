@@ -368,6 +368,19 @@ pub fn current_user_snapshot() -> Option<CurrentUserSnapshot> {
     })
 }
 
+pub fn current_scheduling_context_runtime_snapshot()
+-> Option<super::SchedulingContextRuntimeSnapshot> {
+    if nucleus_core::util::lockdep::preemption_disabled() || !current_cpu_task_slot_admitted() {
+        return None;
+    }
+    // SAFETY: local interrupts are excluded for the complete read-only
+    // scheduler snapshot, so execution and borrowed-context custody cannot
+    // change while their paired accounting ledgers are copied.
+    interrupts::without_interrupts(|| unsafe {
+        scheduler_ref().current_scheduling_context_runtime_snapshot()
+    })
+}
+
 pub fn is_user_task_alive(task_id: u64) -> bool {
     interrupts::without_interrupts(|| unsafe { scheduler_ref().is_user_task_alive(task_id) })
 }
@@ -542,6 +555,40 @@ pub fn bind_ipc_priority_to_process_worker(
 /// reply capability. It is safe to call more than once for terminal races.
 pub fn release_ipc_priority(reply: u64) -> bool {
     interrupts::without_interrupts(|| super::scheduler::release_reply_donation(reply))
+}
+
+/// Returns the exact caller scheduling-context custody carried by one terminal
+/// reply. The IPC runtime guarantees one-shot extraction; PS revalidates the
+/// live slot/generation before releasing any reply-scoped donation state.
+pub fn settle_ipc_reply_scheduling_context(
+    reply: u64,
+    custody: kernel_ipc_runtime::api::ReplySchedulingContextCustody,
+) -> bool {
+    let identity = custody.identity();
+    let valid = interrupts::without_interrupts(|| unsafe {
+        scheduler_ref().scheduling_context_matches(custody.context_owner_task_id(), identity)
+    });
+    let _ = interrupts::without_interrupts(|| super::scheduler::release_reply_donation(reply));
+    valid
+}
+
+pub fn complete_ipc_reply_wake_handoff_with_custody(
+    reply: u64,
+    completion: kernel_ipc_runtime::api::ReplyCompletion,
+) -> bool {
+    let custody = completion
+        .scheduling_context
+        .expect("synchronous IPC reply completed without scheduling-context custody");
+    assert_eq!(
+        custody.caller_task_id(),
+        completion.caller_task_id,
+        "reply returned scheduling-context custody to a different caller"
+    );
+    assert!(
+        settle_ipc_reply_scheduling_context(reply, custody),
+        "reply returned stale scheduling-context custody"
+    );
+    complete_ipc_reply_wake_handoff(reply, completion.caller_task_id)
 }
 
 /// Completes the scheduling side of a terminal reply with one Scheduler

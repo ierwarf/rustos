@@ -38,6 +38,7 @@ mod reclaim;
 mod runqueue;
 mod runqueue_policy;
 mod runtime_profile;
+mod scheduling_context;
 mod sync_handoff;
 pub(in crate::multitask) use runtime_profile::SchedulerEntryCause;
 pub use runtime_profile::drain_scheduler_runtime_profile;
@@ -70,6 +71,8 @@ use x86_64::VirtAddr;
 use x86_64::instructions::segmentation::{DS, ES, FS, GS, Segment};
 use x86_64::registers::model_specific::FsBase;
 use x86_64::structures::gdt::SegmentSelector;
+
+use kernel_object::api::identity::ObjectIdentity;
 
 #[cfg(test)]
 use crate::arch::simd::SimdState;
@@ -336,6 +339,7 @@ enum TaskRetireReason {
 
 #[derive(Clone, Copy)]
 struct TaskContext {
+    scheduling_context: scheduling_context::SchedulingContext,
     /// Host-test fixture for the production per-slot saved-frame pointer.
     #[cfg(test)]
     saved_rsp: usize,
@@ -432,9 +436,17 @@ impl SchedulerDispatch {
 pub struct IpcCallAdmission {
     /// The caller is live and in the System scheduling class.
     pub system_class: bool,
-    /// Donation capacity was reserved. Only a System caller reserves, and a
-    /// full donation table degrades the call rather than failing it.
+    /// Reply-owned scheduling-context custody capacity was reserved. System
+    /// callers additionally use the same edge for strict-priority donation.
     pub donation_reserved: bool,
+    /// Exact 1:1 scheduling-context identity for this live scheduler slot.
+    /// Slot reuse cannot inherit custody because the monotonically allocated
+    /// task label maps to a distinct nonzero object generation.
+    pub scheduling_context: Option<ObjectIdentity>,
+    /// Task that owns `scheduling_context`. For a nested passive-server call
+    /// this is the root client, while the immediate caller remains the reply
+    /// wake target.
+    pub scheduling_context_owner_task_id: Option<u64>,
 }
 
 /// Result of one fused synchronous-IPC call handoff.
@@ -450,6 +462,8 @@ pub struct IpcCallHandoffOutcome {
 
 pub(super) struct Scheduler {
     contexts: [Option<TaskContext>; MAX_TASK],
+    scheduling_domains: [Option<scheduling_context::SchedulingDomainState>;
+        scheduling_context::MAX_SCHEDULING_DOMAINS],
     /// Thread metadata is independently synchronized from scheduler state.
     /// Process-state operations may hold this bounded raw lock without
     /// escaping an unprotected pointer into `contexts`; scheduler signal and
@@ -566,6 +580,7 @@ impl Scheduler {
     pub(super) const fn new() -> Self {
         Self {
             contexts: [None; MAX_TASK],
+            scheduling_domains: [None; scheduling_context::MAX_SCHEDULING_DOMAINS],
             linux_thread_states: [const { empty_linux_thread_state_lock() }; MAX_TASK],
             retired: [false; MAX_TASK],
             retirement_cleanup: [None; MAX_TASK],
@@ -635,6 +650,143 @@ impl Scheduler {
             "scheduler dispatch CPU exceeds capacity"
         );
         cpu
+    }
+
+    fn scheduling_domain_is_eligible(
+        &self,
+        domain_slot: usize,
+        policy: scheduling_context::SchedulingContextPolicy,
+        now_ns: u64,
+    ) -> bool {
+        self.scheduling_domains
+            .get(domain_slot)
+            .and_then(|domain| *domain)
+            .is_some_and(|domain| domain.policy() == policy && domain.is_eligible(now_ns))
+    }
+
+    fn prepare_scheduling_domain_dispatch(
+        &mut self,
+        domain_slot: usize,
+        policy: scheduling_context::SchedulingContextPolicy,
+        now_ns: u64,
+    ) -> bool {
+        self.scheduling_domains
+            .get_mut(domain_slot)
+            .and_then(Option::as_mut)
+            .is_some_and(|domain| domain.policy() == policy && domain.prepare_dispatch(now_ns))
+    }
+
+    fn charge_scheduling_domain_runtime(
+        &mut self,
+        domain_slot: usize,
+        policy: scheduling_context::SchedulingContextPolicy,
+        now_ns: u64,
+        elapsed_ns: u64,
+    ) -> Option<scheduling_context::ChargeOutcome> {
+        let domain = self.scheduling_domains.get_mut(domain_slot)?.as_mut()?;
+        (domain.policy() == policy).then(|| domain.charge_runtime(now_ns, elapsed_ns))?
+    }
+
+    fn charge_effective_scheduling_context_runtime(
+        &mut self,
+        executing_slot: usize,
+        now_ns: u64,
+        elapsed_ns: u64,
+    ) -> Option<(u64, scheduling_context::ChargeOutcome)> {
+        let (context_owner_slot, reply) =
+            self.effective_scheduling_context_charge_token(executing_slot);
+        let owner = self.contexts[context_owner_slot]?;
+        if !owner.scheduling_context.is_budgeted() {
+            return None;
+        }
+        let policy = owner
+            .scheduling_context
+            .policy()
+            .expect("budgeted scheduling context lost its policy");
+        let domain_slot = owner
+            .scheduling_context
+            .domain_slot()
+            .expect("budgeted scheduling context lost its domain slot");
+        let owner_task_id = self.starts[context_owner_slot]
+            .map(|start| start.id)
+            .expect("budgeted scheduling context lost its owner task");
+        let context_outcome = self.contexts[context_owner_slot]
+            .as_mut()
+            .expect("accounted scheduling-context owner disappeared")
+            .scheduling_context
+            .charge_runtime(now_ns, elapsed_ns)
+            .expect("scheduling-context accounting violated budget conservation");
+        let domain_outcome = self
+            .charge_scheduling_domain_runtime(domain_slot, policy, now_ns, elapsed_ns)
+            .expect("scheduling-domain accounting lost admitted policy");
+        if (context_outcome.exhausted || domain_outcome.exhausted)
+            && context_outcome.charged_ns != 0
+        {
+            let recorded = self.contexts[context_owner_slot]
+                .as_mut()
+                .expect("exhausted scheduling-context owner disappeared")
+                .scheduling_context
+                .record_timeout_fault(reply);
+            assert!(recorded, "budget exhaustion lost timeout-fault state");
+        }
+        Some((
+            owner_task_id,
+            scheduling_context::ChargeOutcome {
+                charged_ns: context_outcome.charged_ns.min(domain_outcome.charged_ns),
+                overrun_ns: context_outcome.overrun_ns.max(domain_outcome.overrun_ns),
+                exhausted: context_outcome.exhausted || domain_outcome.exhausted,
+            },
+        ))
+    }
+
+    pub(super) fn current_scheduling_context_runtime_snapshot(
+        &self,
+    ) -> Option<super::SchedulingContextRuntimeSnapshot> {
+        let executing_slot = self.current_task_slot();
+        let executing_task_id = self.starts[executing_slot]?.id;
+        let context_owner_slot = self.effective_scheduling_context_owner_slot(executing_slot);
+        let owner = self.contexts[context_owner_slot]?;
+        let context_owner_task_id = self.starts[context_owner_slot]?.id;
+        let policy = owner.scheduling_context.policy()?;
+        let context = owner.scheduling_context.runtime_snapshot()?;
+        let domain_slot = owner.scheduling_context.domain_slot()?;
+        let domain = self.scheduling_domains.get(domain_slot)?.as_ref()?;
+        if domain.policy() != policy {
+            return None;
+        }
+        let domain_budget = domain.runtime_snapshot()?;
+        let identity = owner.scheduling_context.identity();
+        Some(super::SchedulingContextRuntimeSnapshot {
+            executing_task_id,
+            context_owner_task_id,
+            context_identity_slot: identity.slot(),
+            context_identity_generation: identity.generation(),
+            domain: policy.domain,
+            policy_epoch: policy.policy_epoch,
+            budget_ns: policy.budget_ns,
+            period_ns: policy.period_ns,
+            context_available_ns: context.available_ns,
+            context_pending_refill_ns: context.pending_refill_ns,
+            context_next_eligible_ns: context.next_eligible_ns,
+            context_consumed_ns: context.consumed_ns,
+            context_exhaustion_count: context.exhaustion_count,
+            context_refill_count: context.refill_count,
+            context_overflow_merge_count: context.overflow_merge_count,
+            timeout_fault_count: context.timeout_fault_count,
+            timeout_fault_consumed_ns: context.timeout_fault_consumed_ns,
+            timeout_fault_budget_ns: policy.budget_ns,
+            timeout_fault_period_ns: policy.period_ns,
+            timeout_fault_reply: context.timeout_fault_reply,
+            timeout_endpoint_cap: policy.timeout_endpoint_cap,
+            timeout_fault_action: context.timeout_fault_action,
+            domain_available_ns: domain_budget.available_ns,
+            domain_pending_refill_ns: domain_budget.pending_refill_ns,
+            domain_next_eligible_ns: domain_budget.next_eligible_ns,
+            domain_consumed_ns: domain_budget.consumed_ns,
+            domain_exhaustion_count: domain_budget.exhaustion_count,
+            domain_refill_count: domain_budget.refill_count,
+            domain_overflow_merge_count: domain_budget.overflow_merge_count,
+        })
     }
 
     /// Returns this scheduler invocation's exact CPU-local current slot.
@@ -1391,6 +1543,7 @@ impl Scheduler {
             0,
         );
         self.contexts[ROOT_TASK_SLOT] = Some(TaskContext {
+            scheduling_context: scheduling_context::SchedulingContext::bind(ROOT_TASK_SLOT, id),
             #[cfg(test)]
             saved_rsp: root_saved_rsp,
             #[cfg(test)]
@@ -1741,6 +1894,9 @@ impl Scheduler {
             .enumerate()
             .filter_map(|(index, entry)| entry.as_ref().map(|entry| (index, entry)))
         {
+            if !donation.priority_donated || !donation.custody_active {
+                continue;
+            }
             let target_is_slot = matches!(
                 donation.target,
                 IpcDonationTarget::BoundWorker(task_id)
@@ -1821,6 +1977,28 @@ impl Scheduler {
             0
         };
         self.account_runtime_profile(slot, elapsed_ns);
+        if elapsed_ns != 0 {
+            let now_ns = crate::arch::clock::monotonic_nanos();
+            if let Some((context_owner_task_id, outcome)) =
+                self.charge_effective_scheduling_context_runtime(slot, now_ns, elapsed_ns)
+            {
+                if outcome.overrun_ns != 0 {
+                    nucleus_core::debug::record_milestone(
+                        nucleus_core::debug::LogCategory::Sched,
+                        "scheduling-budget-overrun",
+                        context_owner_task_id,
+                        outcome.overrun_ns,
+                    );
+                } else if outcome.exhausted {
+                    nucleus_core::debug::record_milestone(
+                        nucleus_core::debug::LogCategory::Sched,
+                        "scheduling-budget-exhausted",
+                        context_owner_task_id,
+                        outcome.charged_ns,
+                    );
+                }
+            }
+        }
         let elapsed_ns = if force_min_charge {
             elapsed_ns.max(SCHED_MIN_GRANULARITY_NS)
         } else {
@@ -2564,6 +2742,7 @@ impl Scheduler {
                 let saved_rsp =
                     self.init_kernel_entry_context(slot, cs, ss, rflags, kernel_task_entry_rip, 0);
                 self.contexts[slot] = Some(TaskContext {
+                    scheduling_context: scheduling_context::SchedulingContext::bind(slot, id),
                     #[cfg(test)]
                     saved_rsp,
                     #[cfg(test)]
@@ -2616,6 +2795,7 @@ impl Scheduler {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub(super) fn allocate_user_slot(
         &mut self,
         id: u64,
@@ -2629,7 +2809,74 @@ impl Scheduler {
         start_suspended: bool,
         idle_entry: fn(u64),
     ) -> Option<usize> {
+        self.allocate_user_slot_with_scheduling_context(
+            id,
+            address_space,
+            bootstrap,
+            parent_process_id,
+            pit_divisor,
+            user_cs,
+            user_ss,
+            rflags,
+            start_suspended,
+            idle_entry,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn allocate_user_slot_with_scheduling_context(
+        &mut self,
+        id: u64,
+        address_space: ProcessAddressSpace,
+        bootstrap: UserTaskBootstrap,
+        parent_process_id: Option<u64>,
+        pit_divisor: u16,
+        user_cs: u64,
+        user_ss: u64,
+        rflags: u64,
+        start_suspended: bool,
+        idle_entry: fn(u64),
+        admission: Option<super::SchedulingContextAdmission>,
+    ) -> Option<usize> {
         let inherited_process_mask = self.inherited_process_affinity(parent_process_id);
+        let scheduling_policy = admission
+            .map(|admission| scheduling_context::SchedulingContextPolicy {
+                budget_ns: admission.budget_ns,
+                period_ns: admission.period_ns,
+                refill_capacity: admission.refill_capacity,
+                cpu_mask: admission.cpu_mask,
+                criticality: admission.criticality,
+                domain: admission.domain,
+                policy_epoch: admission.policy_epoch,
+                timeout_endpoint_cap: admission.timeout_endpoint_cap,
+            })
+            .or_else(|| {
+                parent_process_id.and_then(|parent| {
+                    self.contexts.iter().flatten().find_map(|context| {
+                        (context.process_id == Some(parent))
+                            .then(|| context.scheduling_context.policy())
+                            .flatten()
+                    })
+                })
+            });
+        #[cfg(not(test))]
+        if scheduling_policy.is_none() {
+            return None;
+        }
+        if scheduling_policy.is_some_and(|policy| !policy.is_valid()) {
+            return None;
+        }
+        let scheduling_domain_slot = match scheduling_policy {
+            Some(policy) => Some(self.admit_scheduling_domain(policy)?),
+            None => None,
+        };
+        let admitted_task_mask = scheduling_policy
+            .map(|policy| inherited_process_mask & policy.cpu_mask)
+            .unwrap_or(inherited_process_mask);
+        if admitted_task_mask == 0 {
+            return None;
+        }
         for slot in FIRST_DYNAMIC_TASK_SLOT..MAX_TASK {
             if self.contexts[slot].is_none() && !self.thread_slot_reserved[slot] {
                 self.reset_stack_storage(slot)?;
@@ -2670,7 +2917,18 @@ impl Scheduler {
                 );
 
                 let vruntime_ns = self.new_task_vruntime();
+                let mut scheduling_context = scheduling_context::SchedulingContext::bind(slot, id);
+                if let Some(policy) = scheduling_policy
+                    && !scheduling_context.admit(
+                        policy,
+                        scheduling_domain_slot
+                            .expect("budgeted context lost admitted scheduling domain"),
+                    )
+                {
+                    unreachable!("validated scheduling-context policy failed admission");
+                }
                 self.contexts[slot] = Some(TaskContext {
+                    scheduling_context,
                     #[cfg(test)]
                     saved_rsp,
                     #[cfg(test)]
@@ -2732,7 +2990,7 @@ impl Scheduler {
                     bootstrap.linux_thread_state.map(|_| id),
                     bootstrap.linux_thread_state,
                 );
-                self.initialize_slot_affinity(slot, inherited_process_mask, inherited_process_mask);
+                self.initialize_slot_affinity(slot, admitted_task_mask, inherited_process_mask);
                 self.start_suspended[slot] = start_suspended;
                 #[cfg(not(test))]
                 self.admit_runqueue_slot(slot, !start_suspended);
@@ -2756,6 +3014,28 @@ impl Scheduler {
         rflags: u64,
         idle_entry: fn(u64),
     ) -> Option<usize> {
+        let inherited_process_mask = self.inherited_process_affinity(parent_process_id);
+        let scheduling_policy = parent_process_id.and_then(|parent| {
+            self.contexts.iter().flatten().find_map(|context| {
+                (context.process_id == Some(parent))
+                    .then(|| context.scheduling_context.policy())
+                    .flatten()
+            })
+        });
+        #[cfg(not(test))]
+        if scheduling_policy.is_none() {
+            return None;
+        }
+        let scheduling_domain_slot = match scheduling_policy {
+            Some(policy) => Some(self.admit_scheduling_domain(policy)?),
+            None => None,
+        };
+        let admitted_task_mask = scheduling_policy
+            .map(|policy| inherited_process_mask & policy.cpu_mask)
+            .unwrap_or(inherited_process_mask);
+        if admitted_task_mask == 0 {
+            return None;
+        }
         for slot in FIRST_DYNAMIC_TASK_SLOT..MAX_TASK {
             if self.contexts[slot].is_none() && !self.thread_slot_reserved[slot] {
                 self.reset_stack_storage(slot)?;
@@ -2769,7 +3049,18 @@ impl Scheduler {
                 )?;
                 let (kernel_stack_base, kernel_stack_top) = self.stack_bounds(slot);
                 let vruntime_ns = self.new_task_vruntime();
+                let mut scheduling_context = scheduling_context::SchedulingContext::bind(slot, id);
+                if let Some(policy) = scheduling_policy
+                    && !scheduling_context.admit(
+                        policy,
+                        scheduling_domain_slot
+                            .expect("forked context lost admitted scheduling domain"),
+                    )
+                {
+                    unreachable!("inherited scheduling-context policy failed admission");
+                }
                 self.contexts[slot] = Some(TaskContext {
+                    scheduling_context,
                     #[cfg(test)]
                     saved_rsp,
                     #[cfg(test)]
@@ -2823,6 +3114,7 @@ impl Scheduler {
                     bootstrap.linux_thread_state.map(|_| id),
                     bootstrap.linux_thread_state,
                 );
+                self.initialize_slot_affinity(slot, admitted_task_mask, inherited_process_mask);
                 #[cfg(not(test))]
                 self.admit_runqueue_slot(slot, true);
                 return Some(slot);
@@ -2861,6 +3153,7 @@ impl Scheduler {
                     arg0,
                 );
                 self.contexts[slot] = Some(TaskContext {
+                    scheduling_context: scheduling_context::SchedulingContext::bind(slot, id),
                     #[cfg(test)]
                     saved_rsp,
                     #[cfg(test)]
@@ -3479,6 +3772,30 @@ impl Scheduler {
             let next_saved_rsp = self.slot_saved_rsp(next_idx);
             match self.context_validation_error(next_idx, next, next_saved_rsp) {
                 None => {
+                    let context_owner_slot = self.effective_scheduling_context_owner_slot(next_idx);
+                    if self.contexts[context_owner_slot]
+                        .is_some_and(|context| context.scheduling_context.is_budgeted())
+                    {
+                        let now_ns = crate::arch::clock::monotonic_nanos();
+                        let policy = self.contexts[context_owner_slot]
+                            .and_then(|context| context.scheduling_context.policy())
+                            .expect("budgeted scheduling context lost its policy");
+                        let domain_slot = self.contexts[context_owner_slot]
+                            .and_then(|context| context.scheduling_context.domain_slot())
+                            .expect("budgeted scheduling context lost its domain slot");
+                        assert!(
+                            self.prepare_scheduling_domain_dispatch(domain_slot, policy, now_ns),
+                            "scheduler selected a task without eligible domain budget slot={next_idx}"
+                        );
+                        assert!(
+                            self.contexts[context_owner_slot]
+                                .as_mut()
+                                .expect("selected scheduling context disappeared")
+                                .scheduling_context
+                                .prepare_dispatch(now_ns),
+                            "scheduler selected a task without eligible budget slot={next_idx}"
+                        );
+                    }
                     #[cfg(not(test))]
                     assert!(
                         runqueue::claim_dispatch(next_idx, dispatch_cpu, next.weight),
@@ -5016,7 +5333,7 @@ impl Scheduler {
         Some(slot)
     }
 
-    fn find_task_slot(&self, task_id: u64) -> Option<usize> {
+    pub(super) fn find_task_slot(&self, task_id: u64) -> Option<usize> {
         for slot in 0..MAX_TASK {
             if self.retired[slot] || self.contexts[slot].is_none() {
                 continue;
@@ -5027,6 +5344,19 @@ impl Scheduler {
         }
 
         None
+    }
+
+    pub(super) fn scheduling_context_matches(
+        &self,
+        task_id: u64,
+        identity: ObjectIdentity,
+    ) -> bool {
+        self.find_task_slot(task_id).is_some_and(|slot| {
+            self.contexts[slot].is_some_and(|context| {
+                context.scheduling_context.is_bound_to(task_id)
+                    && context.scheduling_context.identity() == identity
+            })
+        })
     }
 }
 

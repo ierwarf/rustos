@@ -19,6 +19,8 @@ use super::*;
 
 #[path = "ipc_reply_diagnostics.rs"]
 mod diagnostics;
+#[path = "ipc_call_admission.rs"]
+mod ipc_call_admission;
 #[path = "ipc_reply_recv.rs"]
 mod ipc_reply_recv;
 mod reply_wait;
@@ -1893,12 +1895,12 @@ pub(super) fn syscall_linux_rustos_ipc_reply(
     let Some(receiver_process_id) = multitask::current_user_process_id() else {
         return linux_errno(LINUX_EINVAL);
     };
-    let task_id = match kernel_ipc_runtime::api::complete_endpoint_reply_for_process(
+    let completion = match kernel_ipc_runtime::api::complete_endpoint_reply_for_process_with_custody(
         KernelReplyHandle::from_raw(reply),
         receiver_process_id,
         response.as_slice(),
     ) {
-        Ok(task_id) => task_id,
+        Ok(completion) => completion,
         Err(err) => {
             record_ipc_reply_rejection(reply, receiver_process_id, err);
             return linux_errno(ipc_error_to_linux_errno(err));
@@ -1909,7 +1911,7 @@ pub(super) fn syscall_linux_rustos_ipc_reply(
     // Direct hand-back to the caller: the service is about to wait on its
     // endpoint again, so donate the remaining quantum to the original caller
     // instead of round-robining away from a freshly-completed reply.
-    let handoff = multitask::complete_ipc_reply_wake_handoff(reply, task_id);
+    let handoff = multitask::complete_ipc_reply_wake_handoff_with_custody(reply, completion);
     if handoff {
         // The common syscall tail consumes this request with IF enabled. The
         // shared synchronous IPC FIFO is burst-bounded, so direct hand-back
@@ -2186,20 +2188,21 @@ pub(super) fn syscall_linux_rustos_ipc_reply_with_handles(args_ptr: u64) -> u64 
         drop_transfer_descriptors(send_handles.as_slice());
         return linux_errno(LINUX_EINVAL);
     };
-    let task_id = match kernel_ipc_runtime::api::complete_endpoint_reply_with_handles_for_process(
-        KernelReplyHandle::from_raw(args.reply_cap),
-        receiver_process_id,
-        response.as_slice(),
-        send_handles.as_slice(),
-    ) {
-        Ok(task_id) => task_id,
-        Err(err) => {
-            drop_transfer_descriptors(send_handles.as_slice());
-            record_ipc_reply_rejection(args.reply_cap, receiver_process_id, err);
-            return linux_errno(ipc_error_to_linux_errno(err));
-        }
-    };
-    if multitask::complete_ipc_reply_wake_handoff(args.reply_cap, task_id) {
+    let completion =
+        match kernel_ipc_runtime::api::complete_endpoint_reply_with_handles_for_process_with_custody(
+            KernelReplyHandle::from_raw(args.reply_cap),
+            receiver_process_id,
+            response.as_slice(),
+            send_handles.as_slice(),
+        ) {
+            Ok(completion) => completion,
+            Err(err) => {
+                drop_transfer_descriptors(send_handles.as_slice());
+                record_ipc_reply_rejection(args.reply_cap, receiver_process_id, err);
+                return linux_errno(ipc_error_to_linux_errno(err));
+            }
+        };
+    if multitask::complete_ipc_reply_wake_handoff_with_custody(args.reply_cap, completion) {
         multitask::request_deferred_reschedule();
     }
     0
@@ -2398,52 +2401,25 @@ fn enqueue_call_and_wake_with_handles(
     attached_handles: &[KernelTransferredHandle],
 ) -> Result<KernelReplyHandle, i64> {
     let task_id = multitask::current_task_id().ok_or(LINUX_EINVAL)?;
-    // Queue priority is scheduler authority: derive it from the live task slot,
-    // never from request bytes controlled by ring3. Sampling occurs before the
-    // IPC slot lock, preserving the scheduler -> IPC lock order, and one
-    // acquisition answers both questions; see `IpcCallAdmission`.
-    let admission = multitask::reserve_ipc_call_donation(task_id);
-    let priority = if admission.system_class {
-        EndpointCallPriority::System
-    } else {
-        EndpointCallPriority::Ordinary
-    };
-    // A full donation table degrades the call's priority rather than failing it.
-    //
-    // Priority inheritance is a scheduling optimisation. Returning `ENOSPC`
-    // when the table is full turns a transient scheduling condition into a
-    // terminal I/O error for the caller, and the caller has no way to tell the
-    // two apart — the same defect shape as netd answering "not ready yet" with
-    // `ENOSYS`, which `V5-DEADLINE-012` names. It cost a Wayland client: the
-    // compositor's socket write returned `ENOSPC`, `wayland-server` treats that
-    // as fatal, and WayClick's surface was retired mid-session with
-    // `alive=true`.
-    //
-    // seL4 and QNX both degrade rather than fail here: without a donated
-    // scheduling context the server runs at its own priority, which is slower,
-    // not incorrect. The audit's own counterexample for
-    // `V5-SCHED-DONATION-002` describes the same expectation — a caller that
-    // cannot donate blocks without the boost.
-    let donation_required = admission.donation_reserved;
-    let priority = if priority == EndpointCallPriority::System && !donation_required {
-        crate::debug::record_milestone(
-            crate::debug::LogCategory::Sched,
-            "ipc-donation-capacity-degraded",
-            task_id,
-            0,
-        );
-        EndpointCallPriority::Ordinary
-    } else {
-        priority
-    };
+    // Queue priority and temporal authority are scheduler-derived, never
+    // request bytes controlled by ring3. The bounded reservation precedes IPC
+    // publication and carries both optional System urgency and mandatory
+    // scheduling-context custody. Ordinary callers do not receive a priority
+    // boost, but every synchronous call must retain exact budget/domain
+    // billing through its reply lifetime.
+    let admission = ipc_call_admission::reserve(task_id)?;
+    let priority = admission.priority;
+    let scheduling_context = admission.scheduling_context;
+    let donation_required = admission.donation_required;
     let enqueue_mark = phase_mark();
     let (reply, receiver_to_wake) =
-        match kernel_ipc_runtime::api::enqueue_endpoint_call_with_handles_and_priority(
+        match kernel_ipc_runtime::api::enqueue_endpoint_call_with_handles_priority_and_custody(
             endpoint,
             task_id,
             request,
             attached_handles,
             priority,
+            scheduling_context,
         ) {
             Ok(enqueued) => enqueued,
             Err(error) => {
@@ -2461,26 +2437,16 @@ fn enqueue_call_and_wake_with_handles(
     );
     let receiver_process_id = kernel_ipc_runtime::api::endpoint::receiver_process_for_reply(reply);
     let mut donation_admitted = !donation_required;
-    if receiver_to_wake.is_none()
-        && let Some(receiver_process_id) = receiver_process_id
-    {
-        if donation_required {
-            donation_admitted = multitask::bind_ipc_priority_to_process_worker(
-                reply.raw(),
-                task_id,
-                receiver_process_id,
-            )
-            .is_some();
-        } else {
+    if receiver_to_wake.is_none() && donation_required {
+        // No receiver is parked, so no concrete worker owns this request yet.
+        // Keep custody AwaitingReceiver on the reply; selecting an arbitrary
+        // runnable process worker here could bind caller budget to a worker
+        // still serving a different reply. The exact IPC_RECV worker performs
+        // the one allowed bind before it observes the request.
+        donation_admitted = multitask::attach_reserved_ipc_priority(reply.raw(), task_id);
+        if let Some(receiver_process_id) = receiver_process_id {
             let _ = multitask::set_next_process_pick_hint(receiver_process_id);
         }
-    }
-    if receiver_to_wake.is_none() && donation_required && !donation_admitted {
-        // No receiver was parked at publication time. Transfer the bounded
-        // reservation to the reply itself; the concrete `IPC_RECV` worker
-        // binds it before observing the request, while timeout/revoke can
-        // release the same exact reply without process-wide boosting.
-        donation_admitted = multitask::attach_reserved_ipc_priority(reply.raw(), task_id);
     }
     if let Some(receiver_task_id) = receiver_to_wake {
         // The reply capability is the lifetime authority for this donation.
@@ -2510,27 +2476,23 @@ fn enqueue_call_and_wake_with_handles(
     }
     let _ = charge_phase(IpcCallPhase::EnqueueWake, wake_mark);
     if !donation_admitted {
-        // The scheduling edge could not be installed. This used to cancel the
-        // reply and return `ENOSPC`, on the reasoning that a System caller must
-        // not block after silently losing its donation. That reasoning was
-        // wrong about the consequence: the caller does not block indefinitely,
-        // because `wait_for_reply` arms a bounded deadline and returns
-        // `ETIMEDOUT`, and the direct handoff hint below still runs. What the
-        // cancellation did produce was a terminal `ENOSPC` on a syscall that
-        // had already succeeded — observed as uiserver dying inside a thread
-        // spawn with "failed to allocate an alternative stack: No space left on
-        // device", which killed the compositor and the whole FPS proof with it.
-        //
-        // Donation capacity is a scheduling condition. Degrade the priority
-        // edge and keep the call, exactly as a full donation table already
-        // degrades at reservation time.
-        let _ = multitask::cancel_ipc_priority_reservation(task_id);
+        // Reply publication and scheduling-context custody are one admission
+        // contract. Continuing here would let a passive server consume its
+        // native/domain budget for caller work and silently bypass temporal
+        // isolation. Reclaim the exact published reply and its custody before
+        // reporting bounded capacity failure.
+        assert!(
+            multitask::attach_reserved_ipc_priority(reply.raw(), task_id),
+            "failed scheduling-context bind lost its reserved rollback edge"
+        );
+        cancel_reply_wait(reply, task_id, ReplyCancelReason::SchedulingCustody);
         debug::record_milestone(
             debug::LogCategory::Sched,
-            "ipc-donation-bind-degraded",
+            "ipc-scheduling-custody-bind-rejected",
             task_id,
             reply.raw(),
         );
+        return Err(LINUX_ENOSPC);
     }
     Ok(reply)
 }
@@ -2705,6 +2667,7 @@ enum ReplyCancelReason {
     DeadlineAfterArm = 3,
     InvalidCommit = 4,
     TransferCapacity = 5,
+    SchedulingCustody = 6,
 }
 
 fn cancel_reply_wait(reply: KernelReplyHandle, caller_task_id: u64, reason: ReplyCancelReason) {
@@ -2712,7 +2675,14 @@ fn cancel_reply_wait(reply: KernelReplyHandle, caller_task_id: u64, reason: Repl
         kernel_ipc_runtime::api::cancel_endpoint_call_with_transfers(reply, caller_task_id);
     let mut in_flight = false;
     if let Ok(cancelled) = &result {
-        let _ = multitask::release_ipc_priority(reply.raw());
+        if let Some(custody) = cancelled.scheduling_context {
+            assert!(
+                multitask::settle_ipc_reply_scheduling_context(reply.raw(), custody),
+                "cancelled reply returned stale scheduling-context custody"
+            );
+        } else {
+            let _ = multitask::release_ipc_priority(reply.raw());
+        }
         drop_transfer_descriptors(cancelled.transfers.as_slice());
         in_flight =
             cancelled.disposition == kernel_ipc_runtime::api::CancelledCallDisposition::InFlight;
@@ -2727,7 +2697,8 @@ fn cancel_reply_wait(reply: KernelReplyHandle, caller_task_id: u64, reason: Repl
         }
         ReplyCancelReason::InvalidArm
         | ReplyCancelReason::InvalidCommit
-        | ReplyCancelReason::TransferCapacity => "ipc-reply-cancelled",
+        | ReplyCancelReason::TransferCapacity
+        | ReplyCancelReason::SchedulingCustody => "ipc-reply-cancelled",
     };
     debug::record_milestone(
         debug::LogCategory::Compat,

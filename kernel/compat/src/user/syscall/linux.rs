@@ -14,11 +14,9 @@ mod service_ops;
 mod smp_qualification_ops;
 mod support;
 mod syscalld_ops;
-
 pub(crate) fn drain_ipc_call_profile() -> usize {
     ipc_profile::drain_ipc_call_profile()
 }
-
 pub(crate) fn service_deferred_transfer_releases() -> usize {
     service_ops::service_deferred_handle_maintenance()
         .saturating_add(ipc_ops::service_deferred_transfer_releases())
@@ -182,6 +180,9 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
             syscall_linux_rustos_product_executable_snapshot_evidence(frame.rdi)
         }
         linux_abi::SYS_RUSTOS_PHASE_PROFILE_DRAIN => syscall_linux_rustos_phase_profile_drain(),
+        rustos_user_abi::syscall::SYS_RUSTOS_SCHEDULING_CONTEXT_SNAPSHOT => {
+            syscall_sched_context_snapshot(frame.rdi)
+        }
         linux_abi::SYS_RUSTOS_SMP_QUALIFICATION_BIND => {
             syscall_linux_rustos_smp_qualification_bind(frame.rdi)
         }

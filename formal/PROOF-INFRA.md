@@ -64,7 +64,10 @@ not a bug. Keep it in `CONFORMANCE.md` until it is resolved.
   and fails rather than silently lowering the configured finite state space.
   A PR or SMP-iteration pass is reusable for 24 hours only when the exact TLA/CFG hashes, pinned
   tool, registry deadlock policy, and execution policy match; all misses run
-  normally. Nightly covers the complete registry without reuse. TLC `-depth`
+  normally. Their reciprocal profile allow-list permits one exact completed
+  result to satisfy the other for shared models, avoiding duplicate exhaustive
+  exploration without touching the artifact or widening its age. Nightly
+  covers the complete registry without reuse. TLC `-depth`
   controls simulation, not exhaustive graph depth, so it is not used as a
   shortcut. The default is `TLC_WORKERS=auto`; set
   `TLC_WORKERS=1` for serial reproduction.

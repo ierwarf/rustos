@@ -1,5 +1,5 @@
 schema = 3
-max_intentional_terminal_models = 91
+max_intentional_terminal_models = 92
 models = "formal/models.tsv"
 model_bindings = "formal/model-bindings.tsv"
 flows = "formal/system-flows.tsv"
@@ -969,6 +969,10 @@ path = "libs/rustos-user-abi/src/syscall/ipc_reply_recv.rs"
 models = ["ipc-reply-recv-transaction/IpcReplyRecvTransaction"]
 
 [[source_mappings]]
+path = "libs/rustos-user-abi/src/syscall/scheduling_context.rs"
+models = ["scheduling-context-budget/SchedulingContextBudget"]
+
+[[source_mappings]]
 path = "libs/rustos-svc-runtime/src/ipc.rs"
 models = ["ipc-reply-recv-transaction/IpcReplyRecvTransaction"]
 
@@ -999,6 +1003,10 @@ models = [
 ]
 
 [[source_mappings]]
+path = "kernel/compat/src/user/syscall/linux/proc_broker_ops/scheduling_context_grants.rs"
+models = ["scheduling-context-budget/SchedulingContextBudget"]
+
+[[source_mappings]]
 path = "kernel/compat/src/user/syscall/linux/support.rs"
 models = [
     "process-signal-delivery/ProcessSignalDelivery",
@@ -1007,14 +1015,22 @@ models = [
 
 [[source_mappings]]
 path = "kernel/compat/src/user/syscall/linux/scheduler_ops.rs"
-models = ["scheduler-thread-demotion/SchedulerThreadDemotion"]
+models = [
+    "scheduler-thread-demotion/SchedulerThreadDemotion",
+    "scheduling-context-budget/SchedulingContextBudget",
+]
 
 [[source_mappings]]
 path = "kernel/compat/src/user/syscall/linux/service_ops/ipc_helpers.rs"
 models = [
+    "scheduling-context-budget/SchedulingContextBudget",
     "service-mutation-recovery/ServiceMutationRecovery",
     "vfs-open-description-recovery/VfsOpenDescriptionRecovery",
 ]
+
+[[source_mappings]]
+path = "kernel/compat/src/user/syscall/linux/service_ops/ipc_helpers/bootstrap_spawn.rs"
+models = ["scheduling-context-budget/SchedulingContextBudget"]
 
 [[source_mappings]]
 path = "kernel/compat/src/user/syscall/linux/service_ops/poll_epoll.rs"
@@ -1059,6 +1075,7 @@ models = [
     "ipc-priority-queue/IpcPriorityQueue",
     "ipc-reply-deadline/IpcReplyDeadline",
     "kernel-resource-accounting/KernelResourceAccounting",
+    "scheduling-context-budget/SchedulingContextBudget",
 ]
 
 [[source_mappings]]
@@ -1113,6 +1130,7 @@ models = [
     "ipc-handle-transfer/IpcHandleTransfer",
     "ipc-reply-deadline/IpcReplyDeadline",
     "kernel-resource-accounting/KernelResourceAccounting",
+    "scheduling-context-budget/SchedulingContextBudget",
 ]
 
 [[source_mappings]]
@@ -1143,6 +1161,10 @@ models = [
 ]
 
 [[source_mappings]]
+path = "services/initd/src/scheduling_context.rs"
+models = ["scheduling-context-budget/SchedulingContextBudget"]
+
+[[source_mappings]]
 path = "services/initd/src/bootstrap_barrier.rs"
 models = ["post-init-bootstrap-barrier/PostInitBootstrapBarrier"]
 
@@ -1150,6 +1172,7 @@ models = ["post-init-bootstrap-barrier/PostInitBootstrapBarrier"]
 path = "kernel/ps/src/api.rs"
 models = [
     "process-address-space-lifetime/ProcessAddressSpaceLifetime",
+    "scheduling-context-budget/SchedulingContextBudget",
     "syscall-simd-lifecycle/SyscallSimdLifecycle",
 ]
 
@@ -1173,6 +1196,7 @@ models = [
     "ipc-priority-inheritance/IpcPriorityInheritance",
     "process-address-space-lifetime/ProcessAddressSpaceLifetime",
     "scheduler-cpu-distribution/SchedulerCpuDistribution",
+    "scheduling-context-budget/SchedulingContextBudget",
     "scheduler-thread-demotion/SchedulerThreadDemotion",
     "synchronous-ipc-handoff-concurrency/SynchronousIpcHandoffConcurrency",
     "synchronous-ipc-handoff/SynchronousIpcHandoff",
@@ -1198,7 +1222,12 @@ models = [
     "bootstrap-activation-handoff/BootstrapActivationHandoff",
     "cpu-online-lifecycle/CpuOnlineLifecycle",
     "per-cpu-clockevent-lifecycle/PerCpuClockeventLifecycle",
+    "scheduling-context-budget/SchedulingContextBudget",
 ]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduling_api.rs"
+models = ["scheduling-context-budget/SchedulingContextBudget"]
 
 [[source_mappings]]
 path = "kernel/ps/src/multitask/cpu_local.rs"
@@ -1217,6 +1246,7 @@ models = [
     "cross-cpu-task-retirement/CrossCpuTaskRetirement",
     "exec-address-space-transaction/ExecAddressSpaceTransaction",
     "scheduler-cpu-ownership/SchedulerCpuOwnership",
+    "scheduling-context-budget/SchedulingContextBudget",
     "scheduler-thread-demotion/SchedulerThreadDemotion",
     "smp-reschedule-ipi/SmpRescheduleIpi",
     "synchronous-ipc-handoff-concurrency/SynchronousIpcHandoffConcurrency",
@@ -1224,6 +1254,14 @@ models = [
     "task-affinity-lifecycle/TaskAffinityLifecycle",
     "user-stack-growth/UserStackGrowth",
 ]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/ipc_donation.rs"
+models = ["scheduling-context-budget/SchedulingContextBudget"]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/donation_ledger.rs"
+models = ["scheduling-context-budget/SchedulingContextBudget"]
 
 [[source_mappings]]
 path = "kernel/ps/src/multitask/scheduler/runqueue_policy.rs"
@@ -1345,6 +1383,7 @@ models = [
     "cpu-online-lifecycle/CpuOnlineLifecycle",
     "futex-waiter-lifecycle/FutexWaiterLifecycle",
     "physical-frame-lifecycle/PhysicalFrameLifecycle",
+    "scheduling-context-budget/SchedulingContextBudget",
 ]
 
 [[source_mappings]]
@@ -1353,10 +1392,15 @@ models = [
     "input-ingestion-worker/InputIngestionWorker",
     "ipc-reply-recv-transaction/IpcReplyRecvTransaction",
     "netd-deferred-reply/NetdDeferredReply",
+    "scheduling-context-budget/SchedulingContextBudget",
     "service-call-authority/ServiceCallAuthority",
     "synchronous-ipc-handoff-concurrency/SynchronousIpcHandoffConcurrency",
     "synchronous-ipc-handoff/SynchronousIpcHandoff",
 ]
+
+[[source_mappings]]
+path = "kernel/compat/src/user/syscall/linux/ipc_call_admission.rs"
+models = ["scheduling-context-budget/SchedulingContextBudget"]
 
 [[source_mappings]]
 path = "kernel/compat/src/user/syscall/linux/ipc_reply_recv.rs"
@@ -1513,6 +1557,10 @@ path = "services/runtimed/src/spawn.rs"
 models = ["smp-ring3-qualification/SmpRing3Qualification"]
 
 [[source_mappings]]
+path = "services/runtimed/src/scheduling_context.rs"
+models = ["scheduling-context-budget/SchedulingContextBudget"]
+
+[[source_mappings]]
 path = "services/runtimed/src/catalog.rs"
 models = ["smp-ring3-qualification/SmpRing3Qualification"]
 
@@ -1554,8 +1602,25 @@ models = [
 path = "services/rootd/src/main.rs"
 models = [
     "post-init-bootstrap-barrier/PostInitBootstrapBarrier",
+    "scheduling-context-budget/SchedulingContextBudget",
     "service-heap-lifecycle/ServiceHeapLifecycle",
 ]
+
+[[source_mappings]]
+path = "kernel/compat/src/user/console_host.rs"
+models = ["scheduling-context-budget/SchedulingContextBudget"]
+
+[[source_mappings]]
+path = "kernel/compat/src/user/process/mod.rs"
+models = ["scheduling-context-budget/SchedulingContextBudget"]
+
+[[source_mappings]]
+path = "services/rootd/src/scheduling_policy.rs"
+models = ["scheduling-context-budget/SchedulingContextBudget"]
+
+[[source_mappings]]
+path = "services/rootd/src/service_manifest.rs"
+models = ["scheduling-context-budget/SchedulingContextBudget"]
 
 [[source_mappings]]
 path = "libs/rustos-svc-runtime/src/allocator.rs"
@@ -1675,6 +1740,10 @@ tlc_max_wall_seconds = 120
 # Reuse only exact, recent pass evidence.  The validator binds the TLA/CFG,
 # pinned TLC binary, deadlock policy, workers, fingerprint, and seed.
 tlc_reuse_max_age_hours = 24
+# PR and SMP-iteration invoke TLC with the same exhaustive execution policy.
+# Permit either profile's exact-input result to satisfy the other only because
+# this allow-list is reciprocal; release still runs every non-TLC PR lane.
+tlc_compatible_reuse_profiles = ["smp-iteration"]
 # Refresh an exact cache entry before it can expire while the remaining proof
 # lanes run and the current-tree evidence manifest is sealed.
 tlc_seal_reserve_seconds = 300
@@ -1700,6 +1769,7 @@ required_models = [
     "product-boot/ProductBoot",
     "robust-futex-owner-death/RobustFutexOwnerDeath",
     "scheduler-cpu-ownership/SchedulerCpuOwnership",
+    "scheduling-context-budget/SchedulingContextBudget",
     "smp-ring3-qualification/SmpRing3Qualification",
     "smp-release-admission/SmpReleaseAdmission",
     "smp-reschedule-ipi/SmpRescheduleIpi",
@@ -1733,6 +1803,7 @@ required_evidence = [
 evidence_max_age_hours = 24
 tlc_max_wall_seconds = 120
 tlc_reuse_max_age_hours = 24
+tlc_compatible_reuse_profiles = ["pr"]
 tlc_seal_reserve_seconds = 300
 required_evidence = [
     "build/formal/source-conformance/summary.json",

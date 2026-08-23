@@ -1,6 +1,23 @@
 use super::*;
 
 #[test]
+fn direct_bootstrap_consumes_exact_rootd_scheduling_authority_before_spawn() {
+    let source = include_str!("bootstrap_spawn.rs");
+    let direct = source
+        .split_once("pub fn syscall_linux_loader_spawn_exec(")
+        .expect("direct bootstrap syscall")
+        .1;
+    let consume = direct
+        .find("consume_direct_bootstrap_scheduling_context")
+        .expect("one-shot scheduling authority consumption");
+    let spawn = direct
+        .find("spawn_bootstrap_exec_direct(")
+        .expect("direct bootstrap spawn");
+    assert!(consume < spawn);
+    assert!(direct.contains(".with_scheduling_context(scheduling_policy)"));
+}
+
+#[test]
 fn empty_nonblocking_console_read_returns_eagain_without_retry() {
     assert_eq!(empty_console_read_result(true, 0), Some(Err(LINUX_EAGAIN)));
     assert_eq!(empty_console_read_result(false, 0), None);

@@ -38,6 +38,11 @@ def main() -> int:
         (formal / "contracts.toml").write_text(
             "[profiles.pr]\n"
             "tlc_reuse_max_age_hours = 24\n"
+            'tlc_compatible_reuse_profiles = ["smp-iteration"]\n'
+            'required_models = ["sample/Sample"]\n'
+            "[profiles.smp-iteration]\n"
+            "tlc_reuse_max_age_hours = 24\n"
+            'tlc_compatible_reuse_profiles = ["pr"]\n'
             'required_models = ["sample/Sample"]\n',
             encoding="utf-8",
         )
@@ -119,6 +124,23 @@ def main() -> int:
         old = summary.stat().st_mtime - 25 * 3600
         os.utime(summary, (old, old))
         expect_rejected(root, "expired evidence")
+
+        shared = root / "build/formal/tlc/smp-iteration/sample__Sample/summary.json"
+        shared.parent.mkdir(parents=True)
+        write_summary()
+        shared_value = json.loads(summary.read_text(encoding="utf-8"))
+        shared_value["profile"] = "smp-iteration"
+        shared.write_text(json.dumps(shared_value), encoding="utf-8")
+        old = summary.stat().st_mtime - 25 * 3600
+        os.utime(summary, (old, old))
+        reused = validate_cached_summary(root, "pr", "sample/Sample")
+        assert reused.summary == shared
+        assert reused.evidence_profile == "smp-iteration"
+
+        value = json.loads(shared.read_text(encoding="utf-8"))
+        value["policy"]["seed"] = 2
+        shared.write_text(json.dumps(value), encoding="utf-8")
+        expect_rejected(root, "a cross-profile result with a changed execution policy")
 
     print("TLC exact-input cache selftest passed")
     return 0

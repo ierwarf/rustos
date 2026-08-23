@@ -22,6 +22,8 @@ use rustos_user_abi::syscall::{
     SYS_RUSTOS_PHASE_PROFILE_DRAIN,
 };
 
+mod scheduling_context_probe;
+
 const SYS_LINUX_GETPID: u64 = 39;
 /// Offloaded to `syscalld`, so one call is one complete cross-process IPC
 /// round trip over the ordinary application path. The gap against
@@ -649,6 +651,12 @@ fn run_single_probe(name: &str, tsc_khz: u64) {
         "ipc_try_recv_empty" => probe_ipc_mechanism_only(tsc_khz),
         "ipc_rt_intra_process" => probe_ipc_intra_process(tsc_khz),
         "ipc_rt_cross_process_syscalld_getuid" => probe_syscall_offload(tsc_khz),
+        "ipc_nested_passive_server" => {
+            scheduling_context_probe::probe_nested_passive_server(tsc_khz)
+        }
+        "scheduling_budget_exhaust_refill" => {
+            scheduling_context_probe::probe_budget_exhaust_refill(tsc_khz)
+        }
         other => skip(other, "unrecognized-probe-filter"),
     }
 }

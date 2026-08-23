@@ -64,6 +64,182 @@ fn slot_identity_keeps_exact_user_pid_and_tid_together() {
     );
 }
 
+#[test]
+fn ipc_admission_exports_only_the_live_bound_scheduling_context() {
+    let _process_table = process_table::tests::isolate_process_table();
+    let mut scheduler = boxed_scheduler();
+    let process = test_process(0x510);
+    let slot = 3;
+    let task_id = 0x611;
+    let mut context = test_user_context(process);
+    context.scheduling_context =
+        crate::multitask::scheduler::scheduling_context::SchedulingContext::bind(slot, task_id);
+    scheduler.contexts[slot] = Some(context);
+    scheduler.starts[slot] = Some(TaskStart {
+        entry: noop_task_entry,
+        id: task_id,
+    });
+
+    let admission = scheduler.reserve_ipc_call_donation(task_id);
+    let identity = admission
+        .scheduling_context
+        .expect("live task scheduling context");
+    assert_eq!(identity.slot(), u64::try_from(slot).unwrap() + 1);
+    assert_eq!(identity.generation(), task_id + 1);
+
+    scheduler.contexts[slot]
+        .as_mut()
+        .unwrap()
+        .scheduling_context =
+        crate::multitask::scheduler::scheduling_context::SchedulingContext::bind(slot, task_id + 1);
+    assert!(
+        scheduler
+            .reserve_ipc_call_donation(task_id)
+            .scheduling_context
+            .is_none(),
+        "stale task/context binding must fail closed"
+    );
+}
+
+#[test]
+fn nested_passive_server_runtime_is_billed_to_the_root_caller_context() {
+    let _process_table = process_table::tests::isolate_process_table();
+    let mut scheduler = boxed_scheduler();
+    let root_policy = super::scheduling_context::SchedulingContextPolicy {
+        budget_ns: 4_000,
+        period_ns: 10_000,
+        refill_capacity: 4,
+        cpu_mask: u64::MAX,
+        criticality: 2,
+        domain: 0x41,
+        policy_epoch: 1,
+        timeout_endpoint_cap: 0,
+    };
+    let server_policy = super::scheduling_context::SchedulingContextPolicy {
+        budget_ns: 7_000,
+        criticality: 1,
+        domain: 0x42,
+        ..root_policy
+    };
+    let root_domain = scheduler
+        .admit_scheduling_domain(root_policy)
+        .expect("root caller domain");
+    let server_domain = scheduler
+        .admit_scheduling_domain(server_policy)
+        .expect("server domain");
+
+    for (slot, task_id, process_id) in [(1, 601, 61), (2, 602, 62), (3, 603, 63)] {
+        let process = test_process(process_id);
+        let mut context = test_user_context(process);
+        context.scheduling_context =
+            super::scheduling_context::SchedulingContext::bind(slot, task_id);
+        let (policy, domain) = if slot == 1 {
+            (root_policy, root_domain)
+        } else {
+            (server_policy, server_domain)
+        };
+        assert!(context.scheduling_context.admit(policy, domain));
+        scheduler.contexts[slot] = Some(context);
+        scheduler.starts[slot] = Some(TaskStart {
+            entry: noop_task_entry,
+            id: task_id,
+        });
+    }
+
+    let outer = scheduler.reserve_ipc_call_donation(601);
+    assert!(outer.donation_reserved);
+    assert!(scheduler.bind_reserved_ipc_priority(10, 601, 602));
+    let nested = scheduler.reserve_ipc_call_donation(602);
+    assert_eq!(nested.scheduling_context, outer.scheduling_context);
+    assert_eq!(nested.scheduling_context_owner_task_id, Some(601));
+    assert!(scheduler.bind_reserved_ipc_priority(11, 602, 603));
+    assert_eq!(scheduler.effective_scheduling_context_owner_slot(3), 1);
+
+    let (owner, donated) = scheduler
+        .charge_effective_scheduling_context_runtime(3, 100, 4_500)
+        .expect("nested server borrowed caller budget");
+    assert_eq!(owner, 601);
+    assert_eq!(donated.charged_ns, 4_000);
+    assert_eq!(donated.overrun_ns, 500);
+    scheduler.current_task = 3;
+    let borrowed = scheduler
+        .current_scheduling_context_runtime_snapshot()
+        .expect("borrowed context snapshot");
+    assert_eq!(borrowed.executing_task_id, 603);
+    assert_eq!(borrowed.context_owner_task_id, 601);
+    assert_eq!(borrowed.domain, root_policy.domain);
+    assert_eq!(borrowed.context_available_ns, 0);
+    assert_eq!(borrowed.context_pending_refill_ns, root_policy.budget_ns);
+    assert_eq!(borrowed.domain_available_ns, 0);
+    assert_eq!(borrowed.domain_pending_refill_ns, root_policy.budget_ns);
+    assert_eq!(borrowed.timeout_fault_count, 1);
+    assert_eq!(borrowed.timeout_fault_consumed_ns, root_policy.budget_ns);
+    assert_eq!(borrowed.timeout_fault_budget_ns, root_policy.budget_ns);
+    assert_eq!(borrowed.timeout_fault_period_ns, root_policy.period_ns);
+    assert_eq!(borrowed.timeout_fault_reply, 11);
+    assert_eq!(borrowed.timeout_endpoint_cap, 0);
+    assert_eq!(borrowed.timeout_fault_action, 1);
+
+    assert!(scheduler.release_ipc_priority(11));
+    assert_eq!(scheduler.effective_scheduling_context_owner_slot(3), 3);
+    let (owner, native) = scheduler
+        .charge_effective_scheduling_context_runtime(3, 200, 4_500)
+        .expect("server native context restored");
+    assert_eq!(owner, 603);
+    assert_eq!(native.charged_ns, 4_500);
+    assert_eq!(native.overrun_ns, 0);
+}
+
+#[test]
+fn deadline_domains_require_per_cpu_utilization_headroom() {
+    let mut scheduler = boxed_scheduler();
+    let base = super::scheduling_context::SchedulingContextPolicy {
+        budget_ns: 6_000_000,
+        period_ns: 10_000_000,
+        refill_capacity: 4,
+        cpu_mask: 1,
+        criticality: 2,
+        domain: 0x700,
+        policy_epoch: 1,
+        timeout_endpoint_cap: 0,
+    };
+    assert!(scheduler.admit_scheduling_domain(base).is_some());
+
+    let overlapping = super::scheduling_context::SchedulingContextPolicy {
+        budget_ns: 3_000_001,
+        domain: 0x701,
+        ..base
+    };
+    assert!(scheduler.admit_scheduling_domain(overlapping).is_none());
+
+    let exact_limit = super::scheduling_context::SchedulingContextPolicy {
+        budget_ns: 3_000_000,
+        domain: 0x702,
+        ..base
+    };
+    assert!(scheduler.admit_scheduling_domain(exact_limit).is_some());
+
+    let disjoint_cpu = super::scheduling_context::SchedulingContextPolicy {
+        budget_ns: 9_000_000,
+        cpu_mask: 2,
+        domain: 0x703,
+        ..base
+    };
+    assert!(scheduler.admit_scheduling_domain(disjoint_cpu).is_some());
+}
+
+#[test]
+fn production_user_slot_publication_rejects_an_unbudgeted_context() {
+    let production = include_str!("../../scheduler.rs");
+    assert_eq!(
+        production
+            .matches("if scheduling_policy.is_none()")
+            .count(),
+        2
+    );
+    assert!(production.contains("return None;"));
+}
+
 pub(super) fn boxed_scheduler() -> Box<Scheduler> {
     let mut scheduler = Box::<Scheduler>::new_uninit();
     unsafe {
@@ -82,6 +258,9 @@ pub(super) fn boxed_scheduler() -> Box<Scheduler> {
 
 pub(super) fn test_user_context(handle: process_table::ProcessHandle) -> TaskContext {
     TaskContext {
+        scheduling_context: crate::multitask::scheduler::scheduling_context::SchedulingContext::bind(
+            0, 1,
+        ),
         saved_rsp: 0,
         test_ready: true,
         ready_since_ticks: 0,

@@ -4,13 +4,15 @@ pub use crate::ipc::{
     EndpointResponseWithHandles, EndpointWakeSet, IpcError, KernelEndpointHandle,
     KernelReplyHandle, KernelSharedRegionHandle, KernelSharedRegionMappingHold,
     KernelTransferTicket, KernelTransferredHandle, MAX_ENDPOINT_WAKE_TASKS,
-    PreparedReplyHandleBindError, ProcessIdentity, ServiceIdentity, TransferContext,
+    PreparedReplyHandleBindError, ProcessIdentity, ReplyCompletion, ReplySchedulingContextCustody,
+    ReplySchedulingContextReturn, ServiceIdentity, TransferContext,
 };
 
 pub mod endpoint {
     pub use crate::ipc::{
         EndpointCallPriority, EndpointWakeSet, IpcError, KernelEndpointHandle, KernelReplyHandle,
-        KernelTransferredHandle, PreparedReplyHandleBindError,
+        KernelTransferredHandle, PreparedReplyHandleBindError, ReplyCompletion,
+        ReplySchedulingContextCustody, ReplySchedulingContextReturn,
     };
 
     pub fn create() -> Result<KernelEndpointHandle, IpcError> {
@@ -63,6 +65,24 @@ pub mod endpoint {
             request,
             attached_handles,
             priority,
+        )
+    }
+
+    pub fn enqueue_call_with_handles_priority_and_custody(
+        endpoint: KernelEndpointHandle,
+        caller_task_id: u64,
+        request: &[u8],
+        attached_handles: &[KernelTransferredHandle],
+        priority: EndpointCallPriority,
+        scheduling_context: ReplySchedulingContextCustody,
+    ) -> Result<(KernelReplyHandle, Option<u64>), IpcError> {
+        crate::ipc::enqueue_endpoint_call_with_handles_priority_and_custody(
+            endpoint,
+            caller_task_id,
+            request,
+            attached_handles,
+            priority,
+            scheduling_context,
         )
     }
 
@@ -195,6 +215,32 @@ pub mod endpoint {
         )
     }
 
+    pub fn reply_for_process_with_custody(
+        reply: KernelReplyHandle,
+        receiver_process_id: u64,
+        response: &[u8],
+    ) -> Result<ReplyCompletion, IpcError> {
+        crate::ipc::complete_endpoint_reply_for_process_with_custody(
+            reply,
+            receiver_process_id,
+            response,
+        )
+    }
+
+    pub fn reply_with_handles_for_process_with_custody(
+        reply: KernelReplyHandle,
+        receiver_process_id: u64,
+        response: &[u8],
+        attached_handles: &[KernelTransferredHandle],
+    ) -> Result<ReplyCompletion, IpcError> {
+        crate::ipc::complete_endpoint_reply_with_handles_for_process_with_custody(
+            reply,
+            receiver_process_id,
+            response,
+            attached_handles,
+        )
+    }
+
     pub fn take_response_detailed(
         reply: KernelReplyHandle,
         handle_capacity: usize,
@@ -216,8 +262,13 @@ pub mod endpoint {
     pub fn cancel_calls_for_task(
         task_id: u64,
         release_transfers: impl FnMut(&[KernelTransferredHandle]),
+        release_scheduling_context: impl FnMut(KernelReplyHandle, ReplySchedulingContextCustody),
     ) -> usize {
-        crate::ipc::cancel_endpoint_calls_for_task(task_id, release_transfers)
+        crate::ipc::cancel_endpoint_calls_for_task(
+            task_id,
+            release_transfers,
+            release_scheduling_context,
+        )
     }
 
     pub fn remove_waiters_for_task(task_id: u64) -> usize {
@@ -286,6 +337,7 @@ pub use endpoint::{
     enqueue_call as enqueue_endpoint_call,
     enqueue_call_with_handles as enqueue_endpoint_call_with_handles,
     enqueue_call_with_handles_and_priority as enqueue_endpoint_call_with_handles_and_priority,
+    enqueue_call_with_handles_priority_and_custody as enqueue_endpoint_call_with_handles_priority_and_custody,
     fail_owned_by_process as fail_endpoints_owned_by_process,
     fail_owned_by_task as fail_endpoints_owned_by_task, recv as recv_endpoint,
     recv_with_limit as recv_endpoint_with_limit,
@@ -293,9 +345,11 @@ pub use endpoint::{
     recv_with_sender_and_limits as recv_endpoint_with_sender_and_limits,
     remove_waiters_for_task as remove_endpoint_waiters_for_task, reply as complete_endpoint_reply,
     reply_for_process as complete_endpoint_reply_for_process,
+    reply_for_process_with_custody as complete_endpoint_reply_for_process_with_custody,
     reply_for_task as complete_endpoint_reply_for_task,
     reply_with_handles as complete_endpoint_reply_with_handles,
     reply_with_handles_for_process as complete_endpoint_reply_with_handles_for_process,
+    reply_with_handles_for_process_with_custody as complete_endpoint_reply_with_handles_for_process_with_custody,
     reply_with_handles_for_task as complete_endpoint_reply_with_handles_for_task,
     take_response_detailed as take_endpoint_response_detailed,
 };

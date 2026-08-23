@@ -19,6 +19,7 @@ from typing import Any
 class CacheValidation:
     summary: Path
     age_seconds: float
+    evidence_profile: str
 
 
 def _sha256(path: Path) -> str:
@@ -91,7 +92,8 @@ def validate_cached_summary(
     profiles = contracts["profiles"]
     if profile not in profiles:
         raise ValueError(f"unknown formal profile: {profile}")
-    max_age_hours = profiles[profile].get("tlc_reuse_max_age_hours", 0)
+    requested_profile = profiles[profile]
+    max_age_hours = requested_profile.get("tlc_reuse_max_age_hours", 0)
     if not isinstance(max_age_hours, int) or max_age_hours <= 0:
         raise ValueError(f"TLC evidence reuse is disabled for profile {profile}")
     if not isinstance(min_remaining_seconds, int) or min_remaining_seconds < 0:
@@ -99,19 +101,80 @@ def validate_cached_summary(
     max_age_seconds = max_age_hours * 3600
     if min_remaining_seconds >= max_age_seconds:
         raise ValueError("TLC minimum remaining lifetime exhausts the reuse window")
-    required_models = profiles[profile].get("required_models", [])
+    required_models = requested_profile.get("required_models", [])
     if model not in required_models:
         raise ValueError(f"model is not selected by profile {profile}: {model}")
     if os.environ.get("TLA_SPEC_OVERRIDE") or os.environ.get("TLA_CONFIG_OVERRIDE"):
         raise ValueError("TLC override inputs are never reusable as baseline evidence")
 
-    summary = (
-        root
-        / "build/formal/tlc"
-        / profile
-        / model.replace("/", "__")
-        / "summary.json"
-    )
+    compatible = requested_profile.get("tlc_compatible_reuse_profiles", [])
+    if not isinstance(compatible, list) or not all(
+        isinstance(candidate, str) for candidate in compatible
+    ):
+        raise ValueError(f"TLC compatible reuse profiles are malformed for {profile}")
+    candidate_profiles = [profile]
+    for candidate in compatible:
+        if candidate not in profiles:
+            raise ValueError(f"unknown TLC compatible reuse profile: {candidate}")
+        reciprocal = profiles[candidate].get("tlc_compatible_reuse_profiles", [])
+        if profile not in reciprocal:
+            raise ValueError(
+                f"TLC compatible reuse is not reciprocal: {profile} -> {candidate}"
+            )
+        if model in profiles[candidate].get("required_models", []):
+            candidate_profiles.append(candidate)
+
+    errors: list[str] = []
+    for evidence_profile in candidate_profiles:
+        evidence_max_age_hours = profiles[evidence_profile].get(
+            "tlc_reuse_max_age_hours", 0
+        )
+        if not isinstance(evidence_max_age_hours, int) or evidence_max_age_hours <= 0:
+            errors.append(f"{evidence_profile}: TLC evidence reuse is disabled")
+            continue
+        effective_max_age_hours = min(max_age_hours, evidence_max_age_hours)
+        effective_max_age_seconds = effective_max_age_hours * 3600
+        if min_remaining_seconds >= effective_max_age_seconds:
+            errors.append(
+                f"{evidence_profile}: TLC minimum remaining lifetime exhausts the reuse window"
+            )
+            continue
+        summary = (
+            root
+            / "build/formal/tlc"
+            / evidence_profile
+            / model.replace("/", "__")
+            / "summary.json"
+        )
+        try:
+            return _validate_candidate(
+                root,
+                profile,
+                evidence_profile,
+                model,
+                summary,
+                max_age_seconds=effective_max_age_seconds,
+                max_age_hours=effective_max_age_hours,
+                min_remaining_seconds=min_remaining_seconds,
+                now=now,
+            )
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            errors.append(f"{evidence_profile}: {error}")
+    raise ValueError("; ".join(errors))
+
+
+def _validate_candidate(
+    root: Path,
+    requested_profile: str,
+    evidence_profile: str,
+    model: str,
+    summary: Path,
+    *,
+    max_age_seconds: int,
+    max_age_hours: int,
+    min_remaining_seconds: int,
+    now: float | None,
+) -> CacheValidation:
     try:
         value = json.loads(summary.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
@@ -120,7 +183,7 @@ def validate_cached_summary(
     _require_equal(value.get("schema"), "rustos-formal-evidence-v1", "schema")
     _require_equal(value.get("status"), "passed", "status")
     _require_equal(value.get("model"), model, "model")
-    _require_equal(value.get("profile"), profile, "profile")
+    _require_equal(value.get("profile"), evidence_profile, "profile")
     _require_equal(value.get("exit_code"), 0, "exit code")
 
     lock = _lock_values(root / "formal/tla2tools.lock")
@@ -137,7 +200,7 @@ def validate_cached_summary(
     _require_equal(inputs.get("spec_sha256"), _sha256(spec), "specification digest")
     _require_equal(inputs.get("config_sha256"), _sha256(config), "configuration digest")
 
-    expected_policy = _expected_policy(profile)
+    expected_policy = _expected_policy(requested_profile)
     expected_policy["deadlock"] = _model_deadlock_policy(root, model)
     _require_equal(value.get("policy"), expected_policy, "execution policy")
 
@@ -161,7 +224,11 @@ def validate_cached_summary(
         raise ValueError(
             "cached TLC summary cannot remain valid through the seal reserve"
         )
-    return CacheValidation(summary=summary, age_seconds=max(age_seconds, 0.0))
+    return CacheValidation(
+        summary=summary,
+        age_seconds=max(age_seconds, 0.0),
+        evidence_profile=evidence_profile,
+    )
 
 
 def main() -> int:
@@ -183,7 +250,7 @@ def main() -> int:
         return 1
     print(
         f"TLC reused model={args.model} "
-        f"age_seconds={int(result.age_seconds)}"
+        f"evidence_profile={result.evidence_profile} age_seconds={int(result.age_seconds)}"
     )
     return 0
 

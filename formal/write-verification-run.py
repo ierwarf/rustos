@@ -84,14 +84,21 @@ def main() -> int:
         ).splitlines():
             if line and not line.startswith("#"):
                 models.append(line.split("\t", 1)[0])
-    tlc_paths = {
-        root
-        / "build/formal/tlc"
-        / args.profile
-        / model.replace("/", "__")
-        / "summary.json": model
-        for model in models
-    }
+    reusable_tlc = profile.get("tlc_reuse_max_age_hours", 0) > 0
+    tlc_paths = {}
+    for model in models:
+        if reusable_tlc:
+            validated = validate_cached_summary(root, args.profile, model)
+            tlc_paths[validated.summary] = model
+        else:
+            path = (
+                root
+                / "build/formal/tlc"
+                / args.profile
+                / model.replace("/", "__")
+                / "summary.json"
+            )
+            tlc_paths[path] = model
     required = sorted(set(required) | set(tlc_paths))
     not_before = args.not_before.resolve()
     if not_before.parent != (root / "build/formal/verification-run").resolve():
@@ -99,8 +106,12 @@ def main() -> int:
     marker_mtime_ns = not_before.stat().st_mtime_ns
     artifacts = []
     for path in required:
-        if path in tlc_paths and profile.get("tlc_reuse_max_age_hours", 0) > 0:
-            validate_cached_summary(root, args.profile, tlc_paths[path])
+        if path in tlc_paths and reusable_tlc:
+            validated = validate_cached_summary(root, args.profile, tlc_paths[path])
+            if validated.summary != path:
+                raise ValueError(
+                    f"reusable TLC evidence selection changed while sealing: {path}"
+                )
         else:
             require_fresh(path, marker_mtime_ns)
         require_passed(path)

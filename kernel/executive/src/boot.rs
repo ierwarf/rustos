@@ -30,6 +30,9 @@ use crate::{announce_ready, debug, fatal, flow_debug, flow_info, hal_hooks, io_s
 
 const ROOTD_EXEC_PATH: &str = "services/rootd/rootd.elf";
 const ROOTD_BOOTSTRAP_WEIGHT_MICROS: u64 = 4_000;
+const ROOTD_BOOTSTRAP_DOMAIN: u64 = 10;
+const ROOTD_BOOTSTRAP_BUDGET_NS: u64 = 4_000_000;
+const ROOTD_BOOTSTRAP_PERIOD_NS: u64 = 10_000_000;
 const MAX_RETIRED_TASK_CLEANUPS_PER_TURN: usize = 4;
 const AP_ONLINE_PARKED_TIMEOUT_NS: u64 = 2_000_000_000;
 static PANIC_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
@@ -719,7 +722,13 @@ pub fn bootstrap_init_process() {
         ROOTD_EXEC_PATH,
         ROOTD_BOOTSTRAP_WEIGHT_MICROS,
     )
-    .with_logical_admin(true);
+    .with_logical_admin(true)
+    .with_bootstrap_scheduling_context(
+        ROOTD_BOOTSTRAP_DOMAIN,
+        ROOTD_BOOTSTRAP_BUDGET_NS,
+        ROOTD_BOOTSTRAP_PERIOD_NS,
+        1,
+    );
     match console_host::spawn_program_in_session(io_services::system_console_session_raw(), program)
     {
         Ok(_spawned) => {}
@@ -869,5 +878,26 @@ mod tests {
             .expect("AP entry must publish private readiness");
         assert!(cache_init < online_parked);
         assert!(cache_init < private_ready);
+    }
+
+    #[test]
+    fn rootd_bootstrap_is_published_with_a_bounded_scheduling_context() {
+        let source = include_str!("boot.rs")
+            .split_once("#[cfg(test)]")
+            .expect("boot tests must remain below production")
+            .0;
+        let spawn = source
+            .split_once("let program = ConsoleProgramSpec::new(")
+            .expect("rootd bootstrap program")
+            .1;
+        let admission = spawn
+            .find(".with_bootstrap_scheduling_context(")
+            .expect("rootd bootstrap scheduling context");
+        let publication = spawn
+            .find("console_host::spawn_program_in_session")
+            .expect("rootd bootstrap publication");
+        assert!(admission < publication);
+        assert!(source.contains("const ROOTD_BOOTSTRAP_BUDGET_NS: u64 = 4_000_000"));
+        assert!(source.contains("const ROOTD_BOOTSTRAP_PERIOD_NS: u64 = 10_000_000"));
     }
 }

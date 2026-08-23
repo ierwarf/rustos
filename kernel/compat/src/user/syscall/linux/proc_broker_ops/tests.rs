@@ -51,6 +51,21 @@ fn exited_prepare_owner_cannot_republish_after_cleanup() {
 }
 
 #[test]
+fn scheduling_context_grant_is_rootd_epoch_bound_and_terminally_consumed() {
+    let source = include_str!("scheduling_context_grants.rs");
+    assert!(source.contains("struct SchedulingContextGrant"));
+    assert!(source.contains("rootd: multitask::ProcessIdentity"));
+    assert!(source.contains("requester: multitask::ProcessIdentity"));
+    assert!(source.contains("rootd_epoch: u64"));
+    assert!(source.contains("grant.exec_path != exec_path"));
+    assert!(source.contains("grant.policy != authority.policy"));
+    assert!(source.contains(".remove(&authority.token)"));
+    assert!(source.contains("consume_direct_bootstrap"));
+    assert!(source.contains("if matched.next().is_some()"));
+    assert!(source.contains("let grant = grants.remove(&token)"));
+}
+
+#[test]
 fn deferred_activation_authority_is_exact_one_shot_and_nontransferable() {
     let source = include_str!("../proc_broker_ops.rs");
     assert!(source.contains("struct DeferredActivationAuthority"));

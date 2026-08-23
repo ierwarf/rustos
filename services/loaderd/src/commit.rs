@@ -51,6 +51,7 @@ pub(crate) fn commit_prepared_executable(
                 console_session: request.console_session,
                 weight_micros: request.weight_micros,
                 requester_pid: request.requester_pid,
+                scheduling_context: request.scheduling_context,
             };
             unsafe {
                 syscall1(

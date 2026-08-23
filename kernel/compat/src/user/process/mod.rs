@@ -27,6 +27,7 @@ const USER_STACK_TOP_EXCLUSIVE: u64 = paging::USER_SPACE_END_EXCLUSIVE;
 
 #[derive(Debug)]
 pub enum ProcessLoadError {
+    MissingSchedulingContext,
     InvalidElf(&'static str),
     InvalidPe(&'static str),
     InterpreterLoad {
@@ -58,6 +59,7 @@ impl From<multitask::SpawnTaskError> for ProcessLoadError {
 impl ProcessLoadError {
     pub fn summary(&self) -> &'static str {
         match self {
+            Self::MissingSchedulingContext => "user process has no admitted scheduling context",
             Self::InvalidElf(reason) => reason,
             Self::InvalidPe(reason) => reason,
             Self::InterpreterLoad { .. } => "failed to load ELF interpreter",
@@ -225,20 +227,17 @@ pub struct ProcessLaunchOptions<'a> {
     pub logical_admin: bool,
 }
 
-#[inline(never)]
 // RING3-MIGRATION-REFERENCE START: loaderd/procd should own bootstrap Linux
 // image loading policy. Ring0 keeps this direct ELF path only for pre-loaderd
 // bootstrap services; normal launches arrive as prepared metadata.
-pub fn spawn_bootstrap_linux_process_with_launch(
+pub fn spawn_bootstrap_linux_process_with_launch_and_scheduling_context(
     image: &[u8],
     weight_micros: u64,
     launch: ProcessLaunchOptions<'_>,
+    policy: rustos_user_abi::syscall::RustosSchedulingContextPolicy,
 ) -> Result<SpawnedProcess, ProcessLoadError> {
     let prepared = prepare_bootstrap_linux_process_with_launch(image, launch)?;
-    // Direct bootstrap is synchronously supervised by rootd. Return the PID
-    // before handing CPU to the child so rootd can publish the lease that the
-    // child's endpoint registration will be checked against.
-    spawn_prepared_process_for_loader_reply(prepared, weight_micros)
+    spawn_prepared_process_with_scheduling_context(prepared, weight_micros, policy)
 }
 
 fn prepare_bootstrap_linux_process_with_launch(
@@ -280,39 +279,60 @@ pub fn prepare_linux_process_with_metadata(
     prepare_loaded_process_with_launch(loaded, launch)
 }
 
-pub fn spawn_prepared_process(
-    prepared: PreparedProcessImage,
-    weight_micros: u64,
-) -> Result<SpawnedProcess, ProcessLoadError> {
-    let pid =
-        multitask::spawn_user_process(prepared.address_space, prepared.bootstrap, weight_micros)?;
-
-    Ok(SpawnedProcess { pid })
+fn scheduling_context_admission(
+    policy: rustos_user_abi::syscall::RustosSchedulingContextPolicy,
+) -> kernel_ps::api::SchedulingContextAdmission {
+    kernel_ps::api::SchedulingContextAdmission {
+        budget_ns: policy.budget_ns,
+        period_ns: policy.period_ns,
+        refill_capacity: policy.refill_capacity,
+        cpu_mask: policy.cpu_mask,
+        criticality: policy.criticality,
+        domain: policy.domain,
+        policy_epoch: policy.policy_epoch,
+        timeout_endpoint_cap: policy.timeout_endpoint_cap,
+    }
 }
 
-pub fn spawn_prepared_process_for_loader_reply(
+pub fn spawn_prepared_process_with_scheduling_context(
     prepared: PreparedProcessImage,
     weight_micros: u64,
+    policy: rustos_user_abi::syscall::RustosSchedulingContextPolicy,
 ) -> Result<SpawnedProcess, ProcessLoadError> {
-    let pid = kernel_ps::api::process::spawn_user_process_without_deferred_reschedule(
+    let pid = kernel_ps::api::process::spawn_user_process_with_scheduling_context(
         prepared.address_space,
         prepared.bootstrap,
         weight_micros,
+        scheduling_context_admission(policy),
     )?;
-
     Ok(SpawnedProcess { pid })
 }
 
-pub fn spawn_prepared_process_suspended(
+pub fn spawn_prepared_process_for_loader_reply_with_scheduling_context(
     prepared: PreparedProcessImage,
     weight_micros: u64,
+    policy: rustos_user_abi::syscall::RustosSchedulingContextPolicy,
 ) -> Result<SpawnedProcess, ProcessLoadError> {
-    let pid = kernel_ps::api::process::spawn_user_process_suspended(
+    let pid = kernel_ps::api::process::spawn_user_process_without_deferred_reschedule_with_scheduling_context(
         prepared.address_space,
         prepared.bootstrap,
         weight_micros,
+        scheduling_context_admission(policy),
     )?;
+    Ok(SpawnedProcess { pid })
+}
 
+pub fn spawn_prepared_process_suspended_with_scheduling_context(
+    prepared: PreparedProcessImage,
+    weight_micros: u64,
+    policy: rustos_user_abi::syscall::RustosSchedulingContextPolicy,
+) -> Result<SpawnedProcess, ProcessLoadError> {
+    let pid = kernel_ps::api::process::spawn_user_process_suspended_with_scheduling_context(
+        prepared.address_space,
+        prepared.bootstrap,
+        weight_micros,
+        scheduling_context_admission(policy),
+    )?;
     Ok(SpawnedProcess { pid })
 }
 
@@ -522,5 +542,16 @@ mod tests {
         assert_eq!(state.reserve_start, usable_start);
         assert_eq!(state.reserve_start, state.committed_start);
         assert_eq!(state.reserve_end, USER_STACK_TOP_EXCLUSIVE);
+    }
+
+    #[test]
+    fn production_process_spawn_surface_requires_scheduling_authority() {
+        let source = include_str!("mod.rs")
+            .split_once("#[cfg(test)]")
+            .expect("process tests remain below production")
+            .0;
+        assert!(source.contains("spawn_prepared_process_with_scheduling_context"));
+        assert!(!source.contains("pub fn spawn_prepared_process("));
+        assert!(!source.contains("pub fn spawn_bootstrap_linux_process_with_launch("));
     }
 }

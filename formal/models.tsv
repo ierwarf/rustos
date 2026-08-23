@@ -107,6 +107,7 @@ runtime-control-rpc/RuntimeControlRpc	safety	intentional-terminal	one response r
 runtime-control-authority/RuntimeControlAuthority	safety	intentional-terminal	control request is admitted or denied	30	120	exhaustive	no	no	no
 scheduler-active-balance/SchedulerActiveBalance	temporal	check	loaded opportunity, mailbox drain, and target dispatch remain live under explicit fairness	30	120	exhaustive	no	no	no
 scheduler-admission/SchedulerAdmission	temporal	intentional-terminal	admission decision is terminal	120	900	exhaustive	no	no	no
+scheduling-context-budget/SchedulingContextBudget	safety	intentional-terminal	bounded clock and reply namespace may terminate	120	900	exhaustive	no	no	no
 scheduler-cpu-distribution/SchedulerCpuDistribution	temporal	intentional-terminal	bounded schedule may stop	120	900	exhaustive+simulate	no	no	no
 scheduler-thread-demotion/SchedulerThreadDemotion	safety	intentional-terminal	thread restoration may terminate	120	900	exhaustive	no	no	no
 scheduler-wakeup/SchedulerWakeup	temporal	intentional-terminal	retired task outcome is terminal	120	900	exhaustive	no	no	no
