@@ -1982,14 +1982,14 @@ impl Scheduler {
             if let Some((context_owner_task_id, outcome)) =
                 self.charge_effective_scheduling_context_runtime(slot, now_ns, elapsed_ns)
             {
-                if outcome.overrun_ns != 0 {
-                    nucleus_core::debug::record_milestone(
-                        nucleus_core::debug::LogCategory::Sched,
-                        "scheduling-budget-overrun",
-                        context_owner_task_id,
-                        outcome.overrun_ns,
-                    );
-                } else if outcome.exhausted {
+                // Overrun volume is accumulated in the fixed runtime-counter
+                // bank and rendered once per scheduler profile window.  A
+                // task that remains throttled can reach this branch on every
+                // scheduling attempt; publishing one debugcon record per
+                // attempt turns diagnostics into the dominant runtime cost.
+                // Keep the one-shot transition marker for the charge that
+                // actually consumes the final budget quantum.
+                if outcome.exhausted && outcome.charged_ns != 0 {
                     nucleus_core::debug::record_milestone(
                         nucleus_core::debug::LogCategory::Sched,
                         "scheduling-budget-exhausted",

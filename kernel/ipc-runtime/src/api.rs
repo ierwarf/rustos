@@ -90,6 +90,10 @@ pub mod endpoint {
         crate::ipc::endpoint_receiver_process_for_reply(reply)
     }
 
+    pub fn reply_custody_returned(reply: KernelReplyHandle, caller_task_id: u64) -> bool {
+        crate::ipc::endpoint_reply_custody_returned(reply, caller_task_id)
+    }
+
     /// Binds broker-prepared descriptors to one live reply owned by the exact
     /// receiving process.  On error, the returned error retains descriptor
     /// ownership for the broker's unpublished-object rollback path.
@@ -344,6 +348,7 @@ pub use endpoint::{
     recv_with_limits_and_handles as recv_endpoint_with_limits_and_handles,
     recv_with_sender_and_limits as recv_endpoint_with_sender_and_limits,
     remove_waiters_for_task as remove_endpoint_waiters_for_task, reply as complete_endpoint_reply,
+    reply_custody_returned as endpoint_reply_custody_returned,
     reply_for_process as complete_endpoint_reply_for_process,
     reply_for_process_with_custody as complete_endpoint_reply_for_process_with_custody,
     reply_for_task as complete_endpoint_reply_for_task,

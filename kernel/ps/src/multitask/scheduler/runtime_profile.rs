@@ -235,6 +235,16 @@ fn fnv1a32(value: &str) -> u32 {
 }
 
 pub fn drain_scheduler_runtime_profile() -> usize {
+    // Budget counters share the scheduler's one-second profile window.  They
+    // used to be drained before this readiness check, so the fast
+    // housekeeping loop emitted four debugcon milestones on almost every
+    // pass.  Under KVM that diagnostic MMIO was charged back to the running
+    // scheduling context, exhausted its budget, and could prevent ipcbench
+    // from completing.  Take the window token first: no profile means no
+    // rendering and, importantly, no destructive counter drain.
+    let Some(profile) = PENDING_RUNTIME_PROFILE.take() else {
+        return 0;
+    };
     let scheduling_context = super::scheduling_context::drain_runtime_counters();
     let mut work = 0;
     for (budget, budget_name, refill_name) in [
@@ -266,9 +276,6 @@ pub fn drain_scheduler_runtime_profile() -> usize {
         );
         work += 1;
     }
-    let Some(profile) = PENDING_RUNTIME_PROFILE.take() else {
-        return work;
-    };
     crate::debug::record_milestone(
         crate::debug::LogCategory::Sched,
         "kernel-scheduler-profile",

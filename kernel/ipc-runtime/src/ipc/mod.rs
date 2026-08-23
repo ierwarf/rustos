@@ -1650,6 +1650,31 @@ pub fn endpoint_receiver_process_for_reply(reply: KernelReplyHandle) -> Option<u
         .flatten()
 }
 
+/// Confirms that the exact live reply already crossed its terminal reply
+/// transition and returned scheduling-context custody to `caller_task_id`.
+///
+/// This is a narrow race discriminator for the sender-side admission commit:
+/// a receiver on another CPU may bind and answer between endpoint publication
+/// and the sender attaching its scheduler reservation. `used` is published in
+/// the same reply transition that takes custody, while the message identity
+/// keeps an unrelated or recycled reply from satisfying the check.
+pub fn endpoint_reply_custody_returned(reply: KernelReplyHandle, caller_task_id: u64) -> bool {
+    let Some((message_id, returned)) = REPLIES.with(reply.raw(), |reply_object| {
+        (
+            reply_object.message_id,
+            reply_object.used && reply_object.scheduling_context.is_none(),
+        )
+    }) else {
+        return false;
+    };
+    returned
+        && ENDPOINT_MESSAGES
+            .with(message_id, |message| {
+                message.reply_id == reply.raw() && message.caller_task_id == caller_task_id
+            })
+            .unwrap_or(false)
+}
+
 /// Atomically binds already-registered descriptors to one live reply owned by
 /// `receiver_process_id`.
 ///

@@ -149,6 +149,16 @@ fn nested_passive_server_runtime_is_billed_to_the_root_caller_context() {
     let outer = scheduler.reserve_ipc_call_donation(601);
     assert!(outer.donation_reserved);
     assert!(scheduler.bind_reserved_ipc_priority(10, 601, 602));
+    assert!(
+        scheduler.bind_reserved_ipc_priority(10, 601, 603),
+        "sender commit must accept the receiver's earlier exact bind"
+    );
+    assert_eq!(scheduler.effective_scheduling_context_owner_slot(2), 1);
+    assert_eq!(
+        scheduler.effective_scheduling_context_owner_slot(3),
+        3,
+        "a stale sender waiter must not replace the actual receiver"
+    );
     let nested = scheduler.reserve_ipc_call_donation(602);
     assert_eq!(nested.scheduling_context, outer.scheduling_context);
     assert_eq!(nested.scheduling_context_owner_task_id, Some(601));

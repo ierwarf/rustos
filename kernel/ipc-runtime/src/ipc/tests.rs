@@ -525,6 +525,9 @@ fn test_scheduling_custody(task_id: u64) -> super::ReplySchedulingContextCustody
 fn reply_returns_scheduling_context_custody_exactly_once() {
     with_isolated_ipc_test(|| {
         let endpoint = super::create_endpoint_for_process(10).expect("create endpoint");
+        let (uncustodied, _) = super::enqueue_endpoint_call(endpoint, 40, b"ordinary")
+            .expect("enqueue ordinary call without custody");
+        assert!(!super::endpoint_reply_custody_returned(uncustodied, 40));
         let custody = test_scheduling_custody(41);
         let (reply, _) = super::enqueue_endpoint_call_with_handles_priority_and_custody(
             endpoint,
@@ -535,12 +538,15 @@ fn reply_returns_scheduling_context_custody_exactly_once() {
             custody,
         )
         .expect("enqueue call with custody");
+        assert!(!super::endpoint_reply_custody_returned(reply, 41));
         let _ = super::recv_endpoint(endpoint).expect("receive request");
         let completion =
             super::complete_endpoint_reply_for_process_with_custody(reply, 10, b"response")
                 .expect("complete reply with custody");
         assert_eq!(completion.caller_task_id, 41);
         assert_eq!(completion.scheduling_context, Some(custody));
+        assert!(super::endpoint_reply_custody_returned(reply, 41));
+        assert!(!super::endpoint_reply_custody_returned(reply, 42));
         assert_eq!(
             super::complete_endpoint_reply_for_process_with_custody(reply, 10, b"duplicate"),
             Err(super::IpcError::InvalidArgument)

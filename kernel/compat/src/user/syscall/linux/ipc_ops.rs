@@ -2436,14 +2436,18 @@ fn enqueue_call_and_wake_with_handles(
         receiver_to_wake
     );
     let receiver_process_id = kernel_ipc_runtime::api::endpoint::receiver_process_for_reply(reply);
-    let mut donation_admitted = !donation_required;
+    // Transfer the temporary reservation to the immutable reply identity as
+    // soon as publication returns. A process worker can dequeue on another
+    // CPU before this sender reaches its wake transaction; reply ownership
+    // makes that race idempotent and gives cancellation an exact edge.
+    let mut donation_admitted =
+        !donation_required || multitask::attach_reserved_ipc_priority(reply.raw(), task_id);
     if receiver_to_wake.is_none() && donation_required {
         // No receiver is parked, so no concrete worker owns this request yet.
         // Keep custody AwaitingReceiver on the reply; selecting an arbitrary
         // runnable process worker here could bind caller budget to a worker
         // still serving a different reply. The exact IPC_RECV worker performs
         // the one allowed bind before it observes the request.
-        donation_admitted = multitask::attach_reserved_ipc_priority(reply.raw(), task_id);
         if let Some(receiver_process_id) = receiver_process_id {
             let _ = multitask::set_next_process_pick_hint(receiver_process_id);
         }
@@ -2481,10 +2485,24 @@ fn enqueue_call_and_wake_with_handles(
         // native/domain budget for caller work and silently bypass temporal
         // isolation. Reclaim the exact published reply and its custody before
         // reporting bounded capacity failure.
-        assert!(
-            multitask::attach_reserved_ipc_priority(reply.raw(), task_id),
-            "failed scheduling-context bind lost its reserved rollback edge"
-        );
+        // A racing receiver may have bound, replied, and settled the exact
+        // edge before this sender acquired the scheduler. Accept only the IPC
+        // runtime's exact live-reply proof of that terminal transition. Any
+        // other missing edge is cancelled fail-closed instead of panicking the
+        // whole system or silently running a passive server on native budget.
+        if !multitask::attach_reserved_ipc_priority(reply.raw(), task_id) {
+            if kernel_ipc_runtime::api::endpoint_reply_custody_returned(reply, task_id) {
+                debug::record_milestone(
+                    debug::LogCategory::Sched,
+                    "ipc-scheduling-custody-settled-before-sender-bind",
+                    task_id,
+                    reply.raw(),
+                );
+                return Ok(reply);
+            }
+            cancel_reply_wait(reply, task_id, ReplyCancelReason::SchedulingCustody);
+            return Err(LINUX_ENOSPC);
+        }
         cancel_reply_wait(reply, task_id, ReplyCancelReason::SchedulingCustody);
         debug::record_milestone(
             debug::LogCategory::Sched,

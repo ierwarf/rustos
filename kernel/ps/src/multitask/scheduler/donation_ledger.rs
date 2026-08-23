@@ -83,6 +83,20 @@ static BORROWED_CONTEXT_OWNER: [AtomicU16; MAX_TASK] =
     [const { AtomicU16::new(NO_BORROWED_CONTEXT) }; MAX_TASK];
 static BORROWED_CONTEXT_REPLY: [AtomicU64; MAX_TASK] = [const { AtomicU64::new(0) }; MAX_TASK];
 
+fn bind_entry_to_receiver(entry: &mut LedgerEntry, receiver_task_id: u64, receiver_slot: usize) {
+    entry.donation.target = IpcDonationTarget::BoundWorker(receiver_task_id);
+    entry.donation.custody_active = true;
+    entry.receiver_slot = Some(receiver_slot);
+    publish_charge_token(
+        receiver_slot,
+        entry.donation.context_owner_slot,
+        entry.donation.reply,
+    );
+    if entry.donation.priority_donated {
+        increment_receiver(receiver_slot);
+    }
+}
+
 pub(super) fn reset() {
     let mut ledger = DONATION_LEDGER.lock();
     *ledger = DonationLedger::new();
@@ -142,6 +156,15 @@ pub(super) fn attach(reply: u64, donor_task_id: u64) -> bool {
         return false;
     }
     let mut ledger = DONATION_LEDGER.lock();
+    if let Some(index) = ledger.find_reply(reply) {
+        // A running receiver may bind the published reply before the sender
+        // attaches its reservation. Confirm the exact donor edge instead of
+        // treating that legal publication race as lost custody.
+        return ledger.entries[index].is_some_and(|entry| {
+            entry.donation.donor_task_id == donor_task_id
+                && (entry.receiver_slot.is_none() || entry.donation.custody_active)
+        });
+    }
     let Some(index) = ledger.find_reservation(donor_task_id) else {
         return false;
     };
@@ -163,6 +186,25 @@ pub(super) fn bind_reserved(
         return false;
     }
     let mut ledger = DONATION_LEDGER.lock();
+    if let Some(index) = ledger.find_reply(reply) {
+        // The receiver can consume a just-published request on another CPU
+        // before the sender commits its wake/handoff. That receive path binds
+        // the reservation to the actual worker. Confirm that exact edge as
+        // already admitted instead of looking only for the now-consumed
+        // `reply == 0` reservation; rebinding it to the sender's stale waiter
+        // would transfer custody to the wrong worker.
+        let entry = ledger.entries[index]
+            .as_mut()
+            .expect("scheduler donation reply disappeared during bind");
+        if entry.donation.donor_task_id != donor_task_id {
+            return false;
+        }
+        if entry.donation.custody_active {
+            return entry.receiver_slot.is_some();
+        }
+        bind_entry_to_receiver(entry, receiver_task_id, receiver_slot);
+        return true;
+    }
     let Some(index) = ledger.find_reservation(donor_task_id) else {
         return false;
     };
@@ -170,17 +212,7 @@ pub(super) fn bind_reserved(
         .as_mut()
         .expect("scheduler donation reservation disappeared");
     entry.donation.reply = reply;
-    entry.donation.target = IpcDonationTarget::BoundWorker(receiver_task_id);
-    entry.donation.custody_active = true;
-    entry.receiver_slot = Some(receiver_slot);
-    publish_charge_token(
-        receiver_slot,
-        entry.donation.context_owner_slot,
-        entry.donation.reply,
-    );
-    if entry.donation.priority_donated {
-        increment_receiver(receiver_slot);
-    }
+    bind_entry_to_receiver(entry, receiver_task_id, receiver_slot);
     true
 }
 
@@ -434,7 +466,18 @@ mod tests {
             "a donor may reserve only one live reply edge"
         );
         assert!(bind_reserved(700, 41, 52, 5));
+        assert!(!bind_reserved(700, 42, 53, 6));
         assert!(inherited_system(5));
+        assert!(!inherited_system(6));
+
+        assert!(
+            bind_reserved(700, 41, 53, 6),
+            "the sender must accept a reply the receiver already bound"
+        );
+        assert!(
+            inherited_system(5),
+            "a stale sender waiter replaced the actual receiver"
+        );
         assert!(!inherited_system(6));
 
         assert!(upsert(700, 41, 53, 6, 41, 4, true));
@@ -460,7 +503,9 @@ mod tests {
 
         assert!(reserve(61, 61, 6, true));
         assert!(attach(701, 61));
-        assert!(upsert(701, 61, 62, 7, 61, 6, true));
+        assert!(!attach(701, 62), "another donor claimed the reply edge");
+        assert!(attach(701, 61), "exact attach must be idempotent");
+        assert!(bind_reserved(701, 61, 62, 7));
         assert!(inherited_system(7));
         release_task(62);
         assert!(!inherited_system(7));

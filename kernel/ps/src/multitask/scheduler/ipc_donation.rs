@@ -292,6 +292,13 @@ impl Scheduler {
             if reply == 0 {
                 return false;
             }
+            if let Some(existing) = self.ipc_priority_donations[..self.ipc_priority_donation_len]
+                .iter()
+                .flatten()
+                .find(|entry| entry.reply == reply)
+            {
+                return existing.donor_task_id == donor_task_id;
+            }
             let Some(entry) = self.ipc_priority_donations[..self.ipc_priority_donation_len]
                 .iter_mut()
                 .find(|entry| {
@@ -344,6 +351,24 @@ impl Scheduler {
             };
             if self.retired[receiver_slot] {
                 return false;
+            }
+            if let Some(existing) = self.ipc_priority_donations[..self.ipc_priority_donation_len]
+                .iter_mut()
+                .flatten()
+                .find(|entry| entry.reply == reply)
+            {
+                // Match the production ledger's cross-CPU receive race: an
+                // already-bound exact reply is successful admission, but the
+                // stale sender waiter must not replace its worker.
+                if existing.donor_task_id != donor_task_id {
+                    return false;
+                }
+                if existing.custody_active {
+                    return matches!(existing.target, IpcDonationTarget::BoundWorker(_));
+                }
+                existing.target = IpcDonationTarget::BoundWorker(receiver_task_id);
+                existing.custody_active = true;
+                return true;
             }
             let Some(entry) = self.ipc_priority_donations[..self.ipc_priority_donation_len]
                 .iter_mut()

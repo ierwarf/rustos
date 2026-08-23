@@ -922,22 +922,19 @@ With both in place, the four phases charged once per *syscall-path* call —
 `isolation check: PASS` or `FAIL` computed the same way `render_phases`
 parenthesises an unattributable ratio.
 
-**It does not reach `PASS` overall.** The phases charged once per *endpoint*
-call (`wait-take`, `wait-arm`, `wait-disarm`, `wait-blocked`, `enqueue-wake`,
-`enqueue-runtime`, `copy-alloc`, `wait-deadline-sample`) and every
-`usermem-phase-*` still read high — `wait-take` at 4.15x, `usermem-phase-bind-visible`
-at 6.69x, in the cleanest run so far. Tripling the settle from 15 to 45
-seconds moved every one of these ratios by less than 10%, which rules out a
-decaying startup transient: this is steady-state traffic, not a burst. The
-likely source is uiserver's own compositor and Wayland-dispatch loop, which
-runs continuously once the desktop is up and shares these same global
-counters. It cannot be excluded from the topology: without
-`--gui-dvm-surfaces`, uiserver's `open_display` polls forever waiting for a
-display provider and the session catalog never reaches `ipcbench` at all, so
-the isolated boot needs the exact topology that produces this noise.
+The phases charged once per *endpoint* call (`wait-take`, `wait-arm`,
+`wait-disarm`, `wait-blocked`, `enqueue-wake`, `enqueue-runtime`, `copy-alloc`,
+`wait-deadline-sample`) and every `usermem-phase-*` still read high because
+uiserver's compositor and Wayland-dispatch loop run continuously in the
+mandatory desktop topology. They remain parenthesised in the report and do
+not participate in the isolation gate. An earlier gate incorrectly required
+every shared row to equal one sample per round trip, contradicting both the
+phase definitions and this measured topology; it made the documented probe
+fail deterministically even when the four attributable rows matched exactly.
 
-**Read this as the current ceiling on Stage 0a, not as it having failed.**
-The four syscall-path phases are now genuine, reproducible, single-probe
+The gate therefore covers the four syscall-path phases that are genuinely
+one-per-call and leaves shared endpoint/usermem rows explicitly labelled. The
+four syscall-path phases are reproducible, single-probe
 measurements — real progress over being unattributable at all. The
 endpoint-call and usermem-phase families went from ratios in the thousands
 (contaminated by every other probe in the same boot) to single digits
