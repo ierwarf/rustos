@@ -540,15 +540,17 @@ pub(crate) fn bench(
     // interactive topology an ordinary desktop launch brings up. Requiring the
     // end marker is what bounds the run: a guest that never finished must not
     // fall through to parsing a stale log.
+    let timeout_seconds = benchmark_timeout_seconds(rustos_vcpus, isolate_probe.is_some());
     let mut kvm_args = vec![
         "--gui-dvm-surfaces".to_owned(),
         "--dvm-network-shmem".to_owned(),
         "--dvm-block-shmem".to_owned(),
         "--timeout".to_owned(),
-        // The guest normally reaches the harness terminal in under twenty
-        // seconds even with the isolated-probe settle. Keep a broken boot
-        // bounded by the repository's KVM acceptance ceiling.
-        "30".to_owned(),
+        // SMP and isolated attribution can legitimately finish after the
+        // ordinary 30-second desktop deadline while host scheduling is noisy.
+        // Keep the diagnostic run bounded without turning that noise into a
+        // false benchmark failure.
+        timeout_seconds.to_string(),
         // Lock contention is invisible on one CPU: `lock-phase-spin` only
         // moves when two CPUs actually want the same word. Comparing a
         // one-vCPU run against a multi-vCPU one is how a sharding or
@@ -567,7 +569,7 @@ pub(crate) fn bench(
         kvm_args.push("--ipcbench-probe".to_owned());
         kvm_args.push(probe.to_owned());
     }
-    kvm::kvm_smoke_command(config, kvm_args.into_iter())
+    kvm::kvm_benchmark_command(config, kvm_args.into_iter())
         .context("boot the interactive topology and wait for the ipcbench end marker")?;
 
     let log_path = config.build_dir.join("kvm/rustos-debugcon.log");
@@ -621,9 +623,20 @@ pub(crate) fn bench(
     Ok(())
 }
 
+const fn benchmark_timeout_seconds(rustos_vcpus: u8, isolated: bool) -> u64 {
+    if rustos_vcpus > 1 || isolated { 60 } else { 30 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn benchmark_timeout_distinguishes_short_control_from_smp_and_isolation() {
+        assert_eq!(benchmark_timeout_seconds(1, false), 30);
+        assert_eq!(benchmark_timeout_seconds(8, false), 60);
+        assert_eq!(benchmark_timeout_seconds(1, true), 60);
+    }
 
     /// Two real runs of this lane, four minutes apart, with a guest change
     /// between them that touches neither `vmexit_cpuid` nor `null_syscall_getpid`.

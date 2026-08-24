@@ -197,6 +197,32 @@ pub(crate) fn kvm_smoke_command<I>(config: &Config, args: I) -> Result<()>
 where
     I: Iterator<Item = String>,
 {
+    kvm_smoke_command_with_runtime_trace(config, args, Some(true))
+}
+
+/// Runs the normal KVM smoke topology without publishing product-acceptance
+/// runtime-trace evidence.
+///
+/// This is private to `xtask bench`: benchmark probes need the complete guest
+/// output while iterating on an intentionally unsealed source tree. Ordinary
+/// `kvm-smoke` and every qualification lane still publish a strictly checked
+/// trace through [`kvm_smoke_command`]; a benchmark result cannot substitute
+/// for that gate.
+pub(crate) fn kvm_benchmark_command<I>(config: &Config, args: I) -> Result<()>
+where
+    I: Iterator<Item = String>,
+{
+    kvm_smoke_command_with_runtime_trace(config, args, None)
+}
+
+fn kvm_smoke_command_with_runtime_trace<I>(
+    config: &Config,
+    args: I,
+    runtime_trace_deadlines: Option<bool>,
+) -> Result<()>
+where
+    I: Iterator<Item = String>,
+{
     let args = args.collect::<Vec<_>>();
     if args
         .iter()
@@ -321,7 +347,9 @@ where
     // A deliberately failed flush is a negative fault proof, not a successful
     // storage-ready scenario. Replaying it through the positive product trace
     // would either fabricate readiness or reject an otherwise valid fault run.
-    if !options.expect_block_flush_fault {
+    if !options.expect_block_flush_fault
+        && let Some(enforce_deadlines) = runtime_trace_deadlines
+    {
         crate::formal_contracts::record_kvm_runtime_trace(
             &config.root_dir,
             crate::formal_contracts::KvmRuntimeObservation {
@@ -336,7 +364,7 @@ where
                 network: options.exercise_network,
                 ui_budget: options.min_ui_fps.is_some(),
                 storage_only: options.storage_only,
-                enforce_deadlines: true,
+                enforce_deadlines,
             },
             &layout.debugcon_log,
             &layout.dvm_serial_log,

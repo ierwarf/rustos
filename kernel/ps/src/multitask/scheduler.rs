@@ -71,7 +71,6 @@ mod thread_slots;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-#[cfg(test)]
 use core::sync::atomic::{AtomicU8, Ordering};
 use core::{mem, ptr};
 
@@ -182,6 +181,8 @@ const MAX_IPC_DONATION_CHAIN_DEPTH: usize = 4;
 /// hint table stays one cache-friendly byte per donation entry.
 #[cfg(test)]
 const NO_SLOT_HINT: u8 = u8::MAX;
+const TASK_SLOT_HINT_EMPTY: u8 = u8::MAX;
+const _: () = assert!(MAX_TASK.is_power_of_two() && MAX_TASK < u8::MAX as usize);
 const _: () = assert!(kernel_ipc_runtime::api::MAX_ENDPOINT_WAKE_TASKS >= MAX_TASK);
 const ROOT_TASK_SLOT: usize = 0;
 const FIRST_DYNAMIC_TASK_SLOT: usize = 1;
@@ -525,6 +526,10 @@ pub(super) struct Scheduler {
     #[cfg(test)]
     simd_states: [SimdState; MAX_TASK],
     starts: [Option<TaskStart>; MAX_TASK],
+    /// Direct-mapped accelerator for exact task-ID lookup. Every hit is
+    /// revalidated against the authoritative live slot, so collision, reuse,
+    /// or stale cache state can only cause a bounded fallback scan.
+    task_slot_hints: [AtomicU8; MAX_TASK],
     stacks: [Option<Vec<u8>>; MAX_TASK],
     idle_cpu: [u8; MAX_TASK],
     /// Host-test mirrors for the production versioned affinity payload.
@@ -633,6 +638,7 @@ impl Scheduler {
             #[cfg(test)]
             simd_states: [SimdState::new(); MAX_TASK],
             starts: [None; MAX_TASK],
+            task_slot_hints: [const { AtomicU8::new(TASK_SLOT_HINT_EMPTY) }; MAX_TASK],
             stacks: [const { None }; MAX_TASK],
             idle_cpu: [NO_IDLE_CPU; MAX_TASK],
             #[cfg(test)]
@@ -1674,6 +1680,7 @@ impl Scheduler {
         self.runtime_profile_deferred_wakes = 0;
         self.set_current_task_slot(ROOT_TASK_SLOT);
         self.pending_reap = false;
+        self.task_slot_hints = [const { AtomicU8::new(TASK_SLOT_HINT_EMPTY) }; MAX_TASK];
         for policy in &self.cpu_dispatch {
             *policy.lock() = CpuDispatchPolicy::new();
         }
@@ -5164,6 +5171,14 @@ impl Scheduler {
         let Some(caller_slot) = self.find_task_slot(caller_task_id) else {
             return FastIpcReplyHandoffOutcome::Rejected;
         };
+        self.complete_fast_ipc_reply_handoff_slot(reply, caller_slot)
+    }
+
+    fn complete_fast_ipc_reply_handoff_slot(
+        &mut self,
+        reply: u64,
+        caller_slot: usize,
+    ) -> FastIpcReplyHandoffOutcome {
         if self.retired[caller_slot]
             || self.start_suspended[caller_slot]
             || !self.contexts[caller_slot].is_some_and(|context| {
@@ -5237,11 +5252,15 @@ impl Scheduler {
         context_owner_task_id: u64,
         scheduling_context: ObjectIdentity,
     ) -> Option<FastIpcReplyHandoffOutcome> {
-        if !self.scheduling_context_matches(context_owner_task_id, scheduling_context) {
-            return None;
-        }
+        let context_owner_slot =
+            self.scheduling_context_slot(context_owner_task_id, scheduling_context)?;
+        let caller_slot = if context_owner_task_id == caller_task_id {
+            context_owner_slot
+        } else {
+            self.find_task_slot(caller_task_id)?
+        };
         let _ = release_reply_donation(reply);
-        Some(self.complete_fast_ipc_reply_handoff(reply, caller_task_id))
+        Some(self.complete_fast_ipc_reply_handoff_slot(reply, caller_slot))
     }
 
     fn reply_wake_handoff(&self, slot: usize, task_id: u64) -> Option<ReplyWakeHandoff> {
@@ -5618,15 +5637,31 @@ impl Scheduler {
     }
 
     pub(super) fn find_task_slot(&self, task_id: u64) -> Option<usize> {
+        let hint_index = task_id as usize & (MAX_TASK - 1);
+        let hint = usize::from(self.task_slot_hints[hint_index].load(Ordering::Relaxed));
+        if hint < MAX_TASK
+            && !self.retired[hint]
+            && self.contexts[hint].is_some()
+            && self.starts[hint].is_some_and(|start| start.id == task_id)
+        {
+            return Some(hint);
+        }
         for slot in 0..MAX_TASK {
             if self.retired[slot] || self.contexts[slot].is_none() {
                 continue;
             }
             if self.starts[slot].map(|start| start.id) == Some(task_id) {
+                // ORDERING: Relaxed is exact. The scheduler owner serializes
+                // writers and the value is only a hint revalidated above.
+                self.task_slot_hints[hint_index].store(
+                    u8::try_from(slot).expect("scheduler slot exceeds task hint capacity"),
+                    Ordering::Relaxed,
+                );
                 return Some(slot);
             }
         }
 
+        self.task_slot_hints[hint_index].store(TASK_SLOT_HINT_EMPTY, Ordering::Relaxed);
         None
     }
 
@@ -5635,12 +5670,24 @@ impl Scheduler {
         task_id: u64,
         identity: ObjectIdentity,
     ) -> bool {
-        self.find_task_slot(task_id).is_some_and(|slot| {
-            self.contexts[slot].is_some_and(|context| {
-                context.scheduling_context.is_bound_to(task_id)
-                    && context.scheduling_context.identity() == identity
-            })
-        })
+        self.scheduling_context_slot(task_id, identity).is_some()
+    }
+
+    /// Resolves the authoritative slot encoded in the typed object identity,
+    /// then revalidates the exact monotonic task binding and complete identity.
+    /// Scanning every task is redundant because no other slot can own it.
+    fn scheduling_context_slot(&self, task_id: u64, identity: ObjectIdentity) -> Option<usize> {
+        let raw_slot = identity.slot().checked_sub(1)?;
+        let slot = usize::try_from(raw_slot).ok()?;
+        let context = self.contexts.get(slot).copied().flatten()?;
+        self.starts
+            .get(slot)
+            .copied()
+            .flatten()
+            .filter(|start| start.id == task_id)?;
+        (context.scheduling_context.is_bound_to(task_id)
+            && context.scheduling_context.identity() == identity)
+            .then_some(slot)
     }
 }
 

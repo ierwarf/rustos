@@ -78,32 +78,42 @@ struct SleepWaiterTable {
 }
 
 impl SleepWaiterTable {
+    const SLOT_MASK: usize = RTC_SLEEP_WAITER_CAPACITY - 1;
+
     const fn new() -> Self {
+        assert!(RTC_SLEEP_WAITER_CAPACITY.is_power_of_two());
         Self {
             slots: [None; RTC_SLEEP_WAITER_CAPACITY],
         }
     }
 
+    #[inline]
+    fn home_slot(task_id: u64) -> usize {
+        // Fibonacci hashing keeps sequential task IDs and IDs sharing low bits
+        // spread across the fixed-size table without storing hash metadata.
+        let shift = u64::BITS - RTC_SLEEP_WAITER_CAPACITY.ilog2();
+        (task_id.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> shift) as usize
+    }
+
     fn insert_or_update(&mut self, waiter: SleepWaiter) -> bool {
-        let mut free_index = None;
-        for (index, slot) in self.slots.iter_mut().enumerate() {
-            match slot {
+        let home = Self::home_slot(waiter.task_id);
+        for probe in 0..RTC_SLEEP_WAITER_CAPACITY {
+            let index = (home + probe) & Self::SLOT_MASK;
+            match self.slots[index].as_mut() {
                 Some(existing) if existing.task_id == waiter.task_id => {
                     existing.wake_tick = waiter.wake_tick;
                     existing.last_notify_tick = RTC_SLEEP_UNNOTIFIED_TICK;
                     existing.notification_count = 0;
                     return true;
                 }
-                None if free_index.is_none() => free_index = Some(index),
+                None => {
+                    self.slots[index] = Some(waiter);
+                    return true;
+                }
                 _ => {}
             }
         }
-
-        let Some(index) = free_index else {
-            return false;
-        };
-        self.slots[index] = Some(waiter);
-        true
+        false
     }
 
     fn snapshot_ready(
@@ -132,17 +142,35 @@ impl SleepWaiterTable {
     }
 
     fn remove_task(&mut self, task_id: u64) -> bool {
-        let mut removed = false;
-        for slot in self.slots.iter_mut() {
-            if slot
-                .map(|waiter| waiter.task_id == task_id)
-                .unwrap_or(false)
-            {
-                *slot = None;
-                removed = true;
+        let home = Self::home_slot(task_id);
+        for probe in 0..RTC_SLEEP_WAITER_CAPACITY {
+            let index = (home + probe) & Self::SLOT_MASK;
+            match self.slots[index] {
+                Some(waiter) if waiter.task_id == task_id => {
+                    self.close_deletion_hole(index);
+                    return true;
+                }
+                None => return false,
+                Some(_) => {}
             }
         }
-        removed
+        false
+    }
+
+    fn close_deletion_hole(&mut self, mut hole: usize) {
+        self.slots[hole] = None;
+        let mut scan = (hole + 1) & Self::SLOT_MASK;
+        while let Some(waiter) = self.slots[scan] {
+            let home = Self::home_slot(waiter.task_id);
+            let scan_distance = scan.wrapping_sub(home) & Self::SLOT_MASK;
+            let hole_distance = hole.wrapping_sub(home) & Self::SLOT_MASK;
+            if hole_distance < scan_distance {
+                self.slots[hole] = Some(waiter);
+                self.slots[scan] = None;
+                hole = scan;
+            }
+            scan = (scan + 1) & Self::SLOT_MASK;
+        }
     }
 }
 
@@ -842,6 +870,70 @@ mod tests {
         waiters.remove_task(41);
         waiters.remove_task(42);
         assert_eq!(waiters.snapshot_ready(u64::MAX, &mut ready), 0);
+    }
+
+    #[test]
+    fn sleep_waiter_hash_chain_survives_middle_and_wrapped_deletions() {
+        let first = 1_u64;
+        let home = SleepWaiterTable::home_slot(first);
+        let mut colliders = [first, 0, 0];
+        let mut found = 1;
+        for candidate in 2_u64..10_000 {
+            if SleepWaiterTable::home_slot(candidate) == home {
+                colliders[found] = candidate;
+                found += 1;
+                if found == colliders.len() {
+                    break;
+                }
+            }
+        }
+        assert_eq!(found, colliders.len());
+
+        let mut waiters = SleepWaiterTable::new();
+        for task_id in colliders {
+            assert!(waiters.insert_or_update(SleepWaiter {
+                task_id,
+                wake_tick: 10,
+                last_notify_tick: RTC_SLEEP_UNNOTIFIED_TICK,
+                notification_count: 0,
+            }));
+        }
+        assert!(waiters.remove_task(colliders[1]));
+        assert!(!waiters.remove_task(colliders[1]));
+        assert!(waiters.remove_task(colliders[0]));
+        assert!(waiters.remove_task(colliders[2]));
+    }
+
+    #[test]
+    fn sleep_waiter_full_table_can_delete_and_reuse_every_slot() {
+        let mut waiters = SleepWaiterTable::new();
+        for task_id in 0..RTC_SLEEP_WAITER_CAPACITY as u64 {
+            assert!(waiters.insert_or_update(SleepWaiter {
+                task_id,
+                wake_tick: task_id,
+                last_notify_tick: RTC_SLEEP_UNNOTIFIED_TICK,
+                notification_count: 0,
+            }));
+        }
+        assert!(!waiters.insert_or_update(SleepWaiter {
+            task_id: u64::MAX,
+            wake_tick: 0,
+            last_notify_tick: RTC_SLEEP_UNNOTIFIED_TICK,
+            notification_count: 0,
+        }));
+
+        for task_id in 0..RTC_SLEEP_WAITER_CAPACITY as u64 {
+            assert!(waiters.remove_task(task_id));
+            assert!(waiters.insert_or_update(SleepWaiter {
+                task_id: task_id + RTC_SLEEP_WAITER_CAPACITY as u64,
+                wake_tick: task_id,
+                last_notify_tick: RTC_SLEEP_UNNOTIFIED_TICK,
+                notification_count: 0,
+            }));
+        }
+        for task_id in RTC_SLEEP_WAITER_CAPACITY as u64..(RTC_SLEEP_WAITER_CAPACITY as u64 * 2) {
+            assert!(waiters.remove_task(task_id));
+        }
     }
 
     #[test]

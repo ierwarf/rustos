@@ -103,7 +103,20 @@ impl Scheduler {
         &mut self,
         donor_task_id: u64,
     ) -> super::IpcCallAdmission {
-        let Some(slot) = self.find_task_slot(donor_task_id) else {
+        // A syscall call admission is issued by the currently executing donor.
+        // Validate that CPU-local slot first; keep the bounded scan only for
+        // non-syscall/test callers so the fast path does not rediscover its
+        // own already-published identity in the global task table.
+        let current_slot = self.current_task_slot();
+        let slot = if !self.retired[current_slot]
+            && self.contexts[current_slot].is_some()
+            && self.starts[current_slot].is_some_and(|start| start.id == donor_task_id)
+        {
+            Some(current_slot)
+        } else {
+            self.find_task_slot(donor_task_id)
+        };
+        let Some(slot) = slot else {
             return super::IpcCallAdmission {
                 system_class: false,
                 donation_reserved: false,

@@ -66,6 +66,34 @@ fn slot_identity_keeps_exact_user_pid_and_tid_together() {
 }
 
 #[test]
+fn task_slot_hint_collisions_and_stale_entries_fall_back_to_exact_identity() {
+    let _process_table = process_table::tests::isolate_process_table();
+    let mut scheduler = boxed_scheduler();
+    let process = test_process(0x1a2c);
+    let first_slot = 2;
+    let second_slot = 3;
+    let first_task = 5;
+    let second_task = first_task + MAX_TASK as u64;
+    scheduler.contexts[first_slot] = Some(test_user_context(process));
+    scheduler.contexts[second_slot] = Some(test_user_context(process));
+    scheduler.starts[first_slot] = Some(TaskStart {
+        entry: noop_task_entry,
+        id: first_task,
+    });
+    scheduler.starts[second_slot] = Some(TaskStart {
+        entry: noop_task_entry,
+        id: second_task,
+    });
+
+    assert_eq!(scheduler.find_task_slot(first_task), Some(first_slot));
+    assert_eq!(scheduler.find_task_slot(second_task), Some(second_slot));
+    assert_eq!(scheduler.find_task_slot(first_task), Some(first_slot));
+    scheduler.retired[first_slot] = true;
+    assert_eq!(scheduler.find_task_slot(first_task), None);
+    assert_eq!(scheduler.find_task_slot(second_task), Some(second_slot));
+}
+
+#[test]
 fn ipc_admission_exports_only_the_live_bound_scheduling_context() {
     let _process_table = process_table::tests::isolate_process_table();
     let mut scheduler = boxed_scheduler();

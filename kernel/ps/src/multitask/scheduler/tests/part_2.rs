@@ -135,6 +135,20 @@ fn fast_ipc_commit_requires_exact_typed_waits_and_mutates_both_peers_once() {
         entry: noop_task_entry,
         id: receiver_task_id,
     });
+    let sender_context_identity = scheduler.contexts[sender_slot]
+        .expect("sender context")
+        .scheduling_context
+        .identity();
+    assert!(scheduler.scheduling_context_matches(sender_task_id, sender_context_identity));
+    assert!(!scheduler.scheduling_context_matches(receiver_task_id, sender_context_identity));
+    let wrong_slot_identity = kernel_object::api::identity::ObjectIdentity::new(
+        kernel_object::api::identity::ObjectOwner::Ps,
+        kernel_object::api::identity::ObjectKind::SchedulingContext,
+        receiver_slot as u64 + 1,
+        sender_task_id + 1,
+    )
+    .expect("nonzero malformed identity");
+    assert!(!scheduler.scheduling_context_matches(sender_task_id, wrong_slot_identity));
     scheduler.task_affinity_masks[sender_slot] = 1;
     scheduler.process_affinity_masks[sender_slot] = 1;
     scheduler.task_affinity_masks[receiver_slot] = 1;

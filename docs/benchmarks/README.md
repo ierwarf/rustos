@@ -1515,3 +1515,47 @@ counters are global: any task running during a window contributes to them, so
 read them as system-wide costs of an operation, not as the benchmark's private
 tally. `min` in the probe table is the structural cost; `p99` and `mean` move
 with desktop contention and are not a regression signal on their own.
+
+## Phase 0--5 post-cutover hot-path pass
+
+This pass deliberately stopped before any Phase-6 ownership or service-graph
+change. `perf record` around an isolated intra-process run confirmed that a
+host profile mostly sees the KVM vCPU thread and the `xtask` log parser, not
+guest Rust symbols; the guest phase counters therefore remain the useful
+attribution source. The isolated once-per-call phase contract passed.
+
+Three bounded lookups were still doing full-table work on every synchronous
+round trip:
+
+- RTC deadline arm and disarm scanned all 256 waiter slots under one tracked
+  lock. The table is now fixed-size open addressing with exact-key update and
+  backward-shift deletion; expiry notification still scans deliberately.
+- scheduling-context custody scanned 128 task slots even though its typed
+  `ObjectIdentity` already contains the authoritative slot and monotonic
+  generation. The reply path now derives that slot and revalidates the full
+  identity before returning custody.
+- other task-ID lookups now use a 128-byte direct-mapped slot hint. A hit is
+  never authority: retired state, live context, and exact task ID are checked
+  before use, and collisions or reuse fall back to the original bounded scan.
+  Call admission also checks the already-published current slot first.
+
+Same-session controls and candidates kept the CPUID anchor within 1.1%. Two
+anchored one-vCPU repeats both moved the intra-process minimum from 55,720 to
+53,920 TSC ticks (-3.2%), and reply-to-return from 20,840 to 20,080 (-3.6%);
+the cross-process minimum landed at 59,960 and 60,640 (-3.5% and -2.4%). Their
+intra-process p50 values were 98,280 and 99,160 against 100,600 (-2.3% and
+-1.4%). `p99` remained dominated by desktop preemption and made no repeatable
+claim. On eight vCPUs, the anchored exact-tree run moved the intra-process
+minimum from 66,520 to 64,120 (-3.6% raw, -4.6% normalized), its p50 from
+221,480 to 210,360 (-5.0% raw), and the cross-process minimum from 89,360 to
+77,040 (-13.8% raw, -14.7% normalized). The eight-vCPU intra-process p50
+amplification is still about 2.14x; scheduler-catalog contention remains the
+measured owner and eliminating it requires the larger ownership work
+intentionally left for Phase 6 or later.
+
+Benchmark execution is not product acceptance evidence. `xtask bench` uses a
+private KVM launch that does not publish a runtime-trace seal for an
+intentionally changing source tree; ordinary smoke and qualification commands
+remain strict. A multi-vCPU or isolated diagnostic gets a bounded 60-second
+terminal budget because a second eight-vCPU repeat completed the product UI
+but crossed the former 30-second harness cutoff before `ipcbench: end`.
