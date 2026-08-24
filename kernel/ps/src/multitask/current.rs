@@ -75,10 +75,13 @@ impl CurrentUserSnapshot {
 }
 
 pub fn current_user_address_space() -> Option<RetainedCurrentUserAddressSpace> {
-    let (_, abi, process) = retain_current_user_process_binding()?;
+    let (thread_id, abi, process) = retain_current_user_process_binding()?;
+    let identity = process.live_identity()?;
     Some(RetainedCurrentUserAddressSpace {
         abi,
         process_id: process.process_id(),
+        thread_id,
+        identity,
         process,
     })
 }
@@ -453,6 +456,23 @@ pub fn arm_block_current_task() -> bool {
     interrupts::without_interrupts(|| unsafe { scheduler_mut().arm_block_current_task() })
 }
 
+/// Arms the current task for one exact endpoint receive epoch. Only this typed
+/// wait may be consumed by the same-CPU direct IPC handoff path.
+pub fn arm_block_current_task_on_endpoint(endpoint: u64) -> bool {
+    interrupts::without_interrupts(|| unsafe {
+        scheduler_mut().arm_block_current_task_on_endpoint(endpoint)
+    })
+}
+
+/// Arms the caller for one exact synchronous reply epoch.  The typed reason is
+/// consumed by the fast rendezvous commit; ordinary wake/block code preserves
+/// its existing race semantics.
+pub fn arm_block_current_task_on_reply(reply: u64) -> bool {
+    interrupts::without_interrupts(|| unsafe {
+        scheduler_mut().arm_block_current_task_on_reply(reply)
+    })
+}
+
 /// Cancels a previously armed block without marking the current task blocked.
 pub fn cancel_block_current_task() -> bool {
     interrupts::without_interrupts(|| unsafe { scheduler_mut().cancel_block_current_task() })
@@ -589,6 +609,36 @@ pub fn complete_ipc_reply_wake_handoff_with_custody(
         "reply returned stale scheduling-context custody"
     );
     complete_ipc_reply_wake_handoff(reply, completion.caller_task_id)
+}
+
+pub fn complete_fast_ipc_reply_wake_handoff_with_custody(
+    reply: u64,
+    completion: kernel_ipc_runtime::api::ReplyCompletion,
+) -> bool {
+    let custody = completion
+        .scheduling_context
+        .expect("fast synchronous IPC reply completed without scheduling-context custody");
+    assert_eq!(
+        custody.caller_task_id(),
+        completion.caller_task_id,
+        "fast reply returned scheduling-context custody to a different caller"
+    );
+    let outcome = interrupts::without_interrupts(|| unsafe {
+        scheduler_mut().settle_and_complete_fast_ipc_reply_handoff(
+            reply,
+            completion.caller_task_id,
+            custody.context_owner_task_id(),
+            custody.identity(),
+        )
+    })
+    .expect("fast reply returned stale scheduling-context custody");
+    match outcome {
+        super::scheduler::FastIpcReplyHandoffOutcome::Direct
+        | super::scheduler::FastIpcReplyHandoffOutcome::LocalFallback => true,
+        super::scheduler::FastIpcReplyHandoffOutcome::Rejected => {
+            complete_ipc_reply_wake_handoff(reply, completion.caller_task_id)
+        }
+    }
 }
 
 /// Completes the scheduling side of a terminal reply with one Scheduler

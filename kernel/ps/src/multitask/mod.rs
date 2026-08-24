@@ -41,10 +41,12 @@ use crate::user::process_state::{
 pub use self::current::{
     activate_suspended_user_task, activate_suspended_user_tasks,
     activate_suspended_user_tasks_with_commit, any_user_process_state, arm_block_current_task,
+    arm_block_current_task_on_endpoint, arm_block_current_task_on_reply,
     attach_reserved_ipc_priority, bind_ipc_priority_to_process_worker, bind_reserved_ipc_priority,
     cancel_block_current_task, cancel_ipc_priority_reservation, commit_ipc_call_handoff,
-    complete_ipc_reply_wake_handoff, complete_ipc_reply_wake_handoff_with_custody,
-    complete_retired_task_cleanup, current_console_session, current_linux_thread_state,
+    complete_fast_ipc_reply_wake_handoff_with_custody, complete_ipc_reply_wake_handoff,
+    complete_ipc_reply_wake_handoff_with_custody, complete_retired_task_cleanup,
+    current_console_session, current_linux_thread_state,
     current_scheduling_context_runtime_snapshot, current_task_id,
     current_thread_may_have_pending_signals, current_user_abi, current_user_address_space,
     current_user_id, current_user_log_ids, current_user_process_id, current_user_process_identity,
@@ -72,6 +74,7 @@ pub use self::current::{
 };
 pub use self::process_table::ProcessIdentity;
 pub use self::retirement::UserFaultDisposition;
+pub use self::scheduler::FastIpcCallHandoffOutcome;
 pub use self::scheduler::drain_scheduler_runtime_profile;
 pub use self::scheduler::{AffinityCommit, AffinityError, ProcessAffinitySnapshot};
 pub use self::scheduling_api::{SchedulingContextAdmission, SchedulingContextRuntimeSnapshot};
@@ -80,8 +83,9 @@ pub use self::scheduling_api::{SchedulingContextAdmission, SchedulingContextRunt
 pub const MAX_SCHEDULER_TASKS: usize = scheduler::MAX_TASK;
 
 pub use self::irq::{
-    commit_block_current_task_and_yield, rtc_interrupt_handler_addr,
-    software_schedule_interrupt_handler_addr, timer_interrupt_handler_addr, yield_now,
+    commit_block_current_task_and_yield, commit_fast_ipc_call_handoff_and_yield,
+    rtc_interrupt_handler_addr, software_schedule_interrupt_handler_addr,
+    timer_interrupt_handler_addr, yield_now,
 };
 #[allow(unused_imports)]
 pub(crate) use self::irq::{
@@ -164,6 +168,8 @@ pub struct RetainedCurrentUserProcessState {
 pub struct RetainedCurrentUserAddressSpace {
     abi: UserAbi,
     process_id: u64,
+    thread_id: u64,
+    identity: ProcessIdentity,
     process: process_table::ProcessRef,
 }
 
@@ -226,16 +232,32 @@ impl RetainedCurrentUserAddressSpace {
         self.process_id
     }
 
+    pub const fn thread_id(&self) -> u64 {
+        self.thread_id
+    }
+
+    pub const fn identity(&self) -> ProcessIdentity {
+        self.identity
+    }
+
     pub fn with_process_state<R>(&self, f: impl FnOnce(&UserProcessState) -> R) -> R {
         self.process
-            .with_visible_state(|_, state| f(state))
-            .expect("retained current process crossed an exec staging boundary")
+            .with_exact_visible_state(self.identity, |_, state| f(state))
+            .expect("retained current process crossed its exact MM generation")
     }
 
     pub fn with_address_space<R>(&self, f: impl FnOnce(&ProcessAddressSpace) -> R) -> R {
         self.process
-            .with_visible_state(|_, state| f(state.address_space()))
-            .expect("retained current address space crossed an exec staging boundary")
+            .with_exact_visible_state(self.identity, |_, state| f(state.address_space()))
+            .expect("retained current address space crossed its exact MM generation")
+    }
+
+    pub fn try_with_address_space<R>(
+        &self,
+        f: impl FnOnce(&ProcessAddressSpace) -> R,
+    ) -> Option<R> {
+        self.process
+            .with_exact_visible_state(self.identity, |_, state| f(state.address_space()))
     }
 }
 

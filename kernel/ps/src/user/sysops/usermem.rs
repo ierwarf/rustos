@@ -52,6 +52,27 @@ pub fn copy_from_current_user_exact(
     })
 }
 
+/// Performs the fast-call request copy and reply-range admission under one
+/// exact MM-generation bind. No IPC state is visible yet, so both operations
+/// remain preflight; combining only removes a duplicate process/table lock.
+pub fn copy_from_retained_user_and_validate_write(
+    retained: &multitask::RetainedCurrentUserAddressSpace,
+    read_ptr: u64,
+    dest: &mut [u8],
+    write_ptr: u64,
+    write_len: usize,
+) -> Result<(), paging::AddressSpaceError> {
+    retained
+        .try_with_address_space(|address_space| {
+            let write_start = user_virt_addr(write_ptr, write_len)?;
+            address_space.validate_user_write_buffer(write_start, write_len)?;
+            let read_start = user_virt_addr(read_ptr, dest.len())?;
+            address_space.validate_user_read_buffer(read_start, dest.len())?;
+            address_space.copy_from_user(read_start, dest)
+        })
+        .ok_or(paging::AddressSpaceError::NotMapped)?
+}
+
 pub fn read_current_user_struct<T: Copy + Default>(
     user_ptr: u64,
 ) -> Result<T, paging::AddressSpaceError> {
@@ -81,6 +102,20 @@ pub fn write_current_user_bytes(
         usermem_profile::charge(usermem_profile::UserCopyPhase::WriteCopy, validated);
         result
     })
+}
+
+pub fn write_retained_user_bytes(
+    retained: &multitask::RetainedCurrentUserAddressSpace,
+    user_ptr: u64,
+    bytes: &[u8],
+) -> Result<(), paging::AddressSpaceError> {
+    retained
+        .try_with_address_space(|address_space| {
+            let start = user_virt_addr(user_ptr, bytes.len())?;
+            address_space.validate_user_write_buffer(start, bytes.len())?;
+            address_space.copy_into_user(start, bytes)
+        })
+        .ok_or(paging::AddressSpaceError::NotMapped)?
 }
 
 pub fn validate_current_user_write_buffer(
@@ -131,6 +166,23 @@ pub fn validate_current_user_write_buffers(
     })
 }
 
+pub fn validate_retained_user_write_buffers(
+    retained: &multitask::RetainedCurrentUserAddressSpace,
+    buffers: &[(u64, usize)],
+) -> Result<(), paging::AddressSpaceError> {
+    retained
+        .try_with_address_space(|address_space| {
+            for (user_ptr, len) in buffers.iter().copied() {
+                if len != 0 {
+                    address_space
+                        .validate_user_write_buffer(user_virt_addr(user_ptr, len)?, len)?;
+                }
+            }
+            Ok(())
+        })
+        .ok_or(paging::AddressSpaceError::NotMapped)?
+}
+
 /// Writes several user buffers under one address-space bind.
 ///
 /// The same binding cost as [`validate_current_user_write_buffers`], against
@@ -167,6 +219,25 @@ pub fn write_current_user_bytes_batch(
         }
         Ok(())
     })
+}
+
+pub fn write_retained_user_bytes_batch(
+    retained: &multitask::RetainedCurrentUserAddressSpace,
+    writes: &[(u64, &[u8])],
+) -> Result<(), paging::AddressSpaceError> {
+    retained
+        .try_with_address_space(|address_space| {
+            for (user_ptr, bytes) in writes.iter().copied() {
+                if bytes.is_empty() {
+                    continue;
+                }
+                let start = user_virt_addr(user_ptr, bytes.len())?;
+                address_space.validate_user_write_buffer(start, bytes.len())?;
+                address_space.copy_into_user(start, bytes)?;
+            }
+            Ok(())
+        })
+        .ok_or(paging::AddressSpaceError::NotMapped)?
 }
 
 pub fn write_current_user_struct<T: Copy>(

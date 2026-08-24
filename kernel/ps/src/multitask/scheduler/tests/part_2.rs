@@ -14,6 +14,7 @@ fn raced_wake_never_validates_a_consumed_current_frame() {
         blocked: false,
         blocked_since_ticks: 0,
         wake_armed: true,
+        block_reason: BlockReason::Generic,
         weight: NICE_0_LOAD,
         vruntime_ns: 0,
         exec_start_ticks: 0,
@@ -56,6 +57,157 @@ fn raced_wake_never_validates_a_consumed_current_frame() {
     assert!(!context.test_ready);
     assert!(!context.blocked);
     assert!(!context.wake_armed);
+    assert_eq!(context.block_reason, BlockReason::None);
+
+    assert!(scheduler.arm_block_current_task_on_endpoint(0xfeed));
+    assert_eq!(
+        scheduler.contexts[slot].expect("typed endpoint wait armed").block_reason,
+        BlockReason::EndpointReceive(0xfeed)
+    );
+    assert!(scheduler.cancel_block_current_task());
+    assert_eq!(
+        scheduler.contexts[slot].expect("typed endpoint wait cancelled").block_reason,
+        BlockReason::None
+    );
+    assert!(scheduler.arm_block_current_task_on_reply(0xcafe));
+    assert_eq!(
+        scheduler.contexts[slot].expect("typed reply wait armed").block_reason,
+        BlockReason::EndpointReply(0xcafe)
+    );
+    assert!(scheduler.cancel_block_current_task());
+    assert_eq!(
+        scheduler.contexts[slot].expect("typed reply wait cancelled").block_reason,
+        BlockReason::None
+    );
+}
+
+#[test]
+fn fast_ipc_commit_requires_exact_typed_waits_and_mutates_both_peers_once() {
+    let mut scheduler = boxed_scheduler();
+    let sender_slot = 1;
+    let receiver_slot = 2;
+    let sender_task_id = 701;
+    let receiver_task_id = 702;
+    let sender = TaskContext {
+        scheduling_context: crate::multitask::scheduler::scheduling_context::SchedulingContext::bind(
+            sender_slot,
+            sender_task_id,
+        ),
+        saved_rsp: 0,
+        test_ready: false,
+        ready_since_ticks: 0,
+        blocked: false,
+        blocked_since_ticks: 0,
+        wake_armed: false,
+        block_reason: BlockReason::None,
+        weight: NICE_0_LOAD,
+        vruntime_ns: 0,
+        exec_start_ticks: 0,
+        address_space_root: 0,
+        kernel_stack_base: 0,
+        kernel_stack_top: 0,
+        alternate_kernel_stack_base: 0,
+        alternate_kernel_stack_top: 0,
+        user_mode: true,
+        user_abi: Some(UserAbi::Linux),
+        console_session: ConsoleSessionHandle::SYSTEM,
+        process_handle: None,
+        process_id: None,
+        user_stack: None,
+        windows_thread_state: None,
+    };
+    let mut receiver = sender;
+    receiver.scheduling_context =
+        crate::multitask::scheduler::scheduling_context::SchedulingContext::bind(
+            receiver_slot,
+            receiver_task_id,
+        );
+    receiver.blocked = true;
+    receiver.blocked_since_ticks = 1;
+    receiver.block_reason = BlockReason::EndpointReceive(0xabc);
+    scheduler.contexts[sender_slot] = Some(sender);
+    scheduler.contexts[receiver_slot] = Some(receiver);
+    scheduler.starts[sender_slot] = Some(TaskStart {
+        entry: noop_task_entry,
+        id: sender_task_id,
+    });
+    scheduler.starts[receiver_slot] = Some(TaskStart {
+        entry: noop_task_entry,
+        id: receiver_task_id,
+    });
+    scheduler.task_affinity_masks[sender_slot] = 1;
+    scheduler.process_affinity_masks[sender_slot] = 1;
+    scheduler.task_affinity_masks[receiver_slot] = 1;
+    scheduler.process_affinity_masks[receiver_slot] = 1;
+    scheduler.current_task = sender_slot;
+    assert!(
+        scheduler
+            .reserve_ipc_call_donation(sender_task_id)
+            .donation_reserved
+    );
+    assert!(scheduler.arm_block_current_task_on_reply(0xdef));
+
+    assert_eq!(
+        scheduler.commit_fast_ipc_call_handoff(0xabe, 0xdef, receiver_task_id),
+        FastIpcCallHandoffOutcome::ReceiverMismatch
+    );
+    assert!(!scheduler.contexts[sender_slot].expect("sender retained").blocked);
+    assert!(scheduler.contexts[receiver_slot].expect("receiver retained").blocked);
+
+    assert_eq!(
+        scheduler.commit_fast_ipc_call_handoff(0xabc, 0xdef, receiver_task_id),
+        FastIpcCallHandoffOutcome::CommittedSameCpu
+    );
+    let sender = scheduler.contexts[sender_slot].expect("sender committed");
+    let receiver = scheduler.contexts[receiver_slot].expect("receiver committed");
+    assert!(sender.blocked);
+    assert!(!sender.wake_armed);
+    assert_eq!(sender.block_reason, BlockReason::EndpointReply(0xdef));
+    assert!(!receiver.blocked);
+    assert_eq!(receiver.block_reason, BlockReason::None);
+    assert!(receiver.test_ready);
+
+    scheduler.current_task = receiver_slot;
+    assert_eq!(
+        scheduler.complete_fast_ipc_reply_handoff(0xdef, sender_task_id),
+        FastIpcReplyHandoffOutcome::Direct
+    );
+    let sender = scheduler.contexts[sender_slot].expect("caller returned");
+    assert!(!sender.blocked);
+    assert_eq!(sender.block_reason, BlockReason::None);
+    assert!(sender.test_ready);
+
+    assert!(scheduler.release_ipc_priority(0xdef));
+    {
+        let cross_receiver = scheduler.contexts[sender_slot]
+            .as_mut()
+            .expect("cross-CPU receiver context");
+        cross_receiver.blocked = true;
+        cross_receiver.test_ready = false;
+        cross_receiver.block_reason = BlockReason::EndpointReceive(0xbee);
+    }
+    scheduler.task_last_cpu[sender_slot] = 1;
+    scheduler.current_task = receiver_slot;
+    assert!(
+        scheduler
+            .reserve_ipc_call_donation(receiver_task_id)
+            .donation_reserved
+    );
+    assert!(scheduler.arm_block_current_task_on_reply(0xfee));
+    assert_eq!(
+        scheduler.commit_fast_ipc_call_handoff(0xbee, 0xfee, sender_task_id),
+        FastIpcCallHandoffOutcome::CommittedCrossCpu
+    );
+    assert!(
+        scheduler.contexts[receiver_slot]
+            .expect("cross-CPU caller")
+            .blocked
+    );
+    assert!(
+        !scheduler.contexts[sender_slot]
+            .expect("cross-CPU receiver")
+            .blocked
+    );
 }
 
 #[test]

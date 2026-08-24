@@ -855,6 +855,41 @@ pub fn commit_block_current_task_and_yield() -> Option<bool> {
     })
 }
 
+/// Linearizes the Phase-5 same-CPU call transfer with the schedule trap.
+/// A committed sender cannot execute with blocked owner state while interrupts
+/// are enabled; every rejected result returns without trapping so the caller
+/// can rollback the fixed frame and restart the slowpath from scratch.
+pub fn commit_fast_ipc_call_handoff_and_yield(
+    endpoint: u64,
+    reply: u64,
+    receiver_task_id: u64,
+) -> super::scheduler::FastIpcCallHandoffOutcome {
+    let preemption = nucleus_core::util::lockdep::preemption_snapshot();
+    assert!(
+        preemption.depth == 0,
+        "fast IPC committed while raw spin lock held cpu={} apic={:#x} depth={} held_depth={} pending_depth={} class={:?}",
+        preemption.logical_cpu,
+        preemption.apic_id,
+        preemption.depth,
+        preemption.held_depth,
+        preemption.pending_depth,
+        preemption.top_class,
+    );
+    interrupts::without_interrupts(|| {
+        let outcome = unsafe {
+            scheduler_mut().commit_fast_ipc_call_handoff(endpoint, reply, receiver_task_id)
+        };
+        if matches!(
+            outcome,
+            super::scheduler::FastIpcCallHandoffOutcome::CommittedSameCpu
+                | super::scheduler::FastIpcCallHandoffOutcome::CommittedCrossCpu
+        ) {
+            crate::lowlevel::interrupts::trigger_software_schedule();
+        }
+        outcome
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use core::sync::atomic::{AtomicU64, Ordering};

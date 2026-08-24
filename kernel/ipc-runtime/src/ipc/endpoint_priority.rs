@@ -41,13 +41,22 @@ pub(super) enum EndpointQueueLane {
     System,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct EndpointReceiverWaiter {
+    pub(super) task_id: u64,
+    pub(super) request_capacity: usize,
+}
+
 #[derive(Default)]
 pub(super) struct EndpointObject {
     pub(super) owner: Option<EndpointOwner>,
     pub(super) pending_messages: VecDeque<u64>,
     pub(super) pending_system_messages: VecDeque<u64>,
     consecutive_system_deliveries: u8,
-    pub(super) waiting_receivers: VecDeque<u64>,
+    pub(super) waiting_receivers: VecDeque<EndpointReceiverWaiter>,
+    /// One queue-bypassing byte-only synchronous rendezvous. Its reply object
+    /// owns the fixed frame; this field is only endpoint publication custody.
+    pub(super) fast_reply: Option<u64>,
 }
 
 impl EndpointObject {
@@ -55,7 +64,7 @@ impl EndpointObject {
         owner: Option<EndpointOwner>,
         pending_messages: VecDeque<u64>,
         pending_system_messages: VecDeque<u64>,
-        waiting_receivers: VecDeque<u64>,
+        waiting_receivers: VecDeque<EndpointReceiverWaiter>,
     ) -> Self {
         Self {
             owner,
@@ -63,6 +72,7 @@ impl EndpointObject {
             pending_system_messages,
             consecutive_system_deliveries: 0,
             waiting_receivers,
+            fast_reply: None,
         }
     }
 
@@ -73,7 +83,7 @@ impl EndpointObject {
     }
 
     pub(super) fn has_pending(&self) -> bool {
-        self.pending_len() != 0
+        self.pending_len() != 0 || self.fast_reply.is_some()
     }
 
     pub(super) fn push_pending(&mut self, priority: EndpointCallPriority, message_id: u64) {

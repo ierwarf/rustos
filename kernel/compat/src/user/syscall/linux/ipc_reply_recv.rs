@@ -33,7 +33,7 @@ pub(super) fn syscall_linux_rustos_ipc_reply_recv_with_sender(args_ptr: u64) -> 
     // authority happens before the one-shot reply is consumed. This keeps an
     // ordinary errno unambiguously pre-commit and makes the tagged post-commit
     // range below the sole retry boundary.
-    let (endpoint, receiver_task_id, receiver_process_id, request_capacity) =
+    let (endpoint, receiver_task_id, receiver_process_id, request_capacity, retained_mm) =
         match prepare_recv_with_sender(
             args.endpoint,
             args.request_ptr,
@@ -46,6 +46,58 @@ pub(super) fn syscall_linux_rustos_ipc_reply_recv_with_sender(args_ptr: u64) -> 
             Err(errno) => return linux_errno(errno),
         };
     let start_ticks = crate::arch::rtc::ticks();
+    if let Ok(response_len) = usize::try_from(args.response_len)
+        && response_len <= kernel_ipc_runtime::api::IPC_FAST_INLINE_BYTES
+    {
+        let mut response = [0_u8; kernel_ipc_runtime::api::IPC_FAST_INLINE_BYTES];
+        if response_len != 0
+            && let Err(error) = usermem::copy_from_current_user_exact(
+                args.response_ptr,
+                &mut response[..response_len],
+            )
+        {
+            return linux_errno(address_space_error_to_linux_errno(error));
+        }
+        let copy_ticks = crate::arch::rtc::ticks();
+        match kernel_ipc_runtime::api::endpoint::complete_fast_reply_for_task(
+            KernelReplyHandle::from_raw(args.reply_cap),
+            receiver_task_id,
+            &response[..response_len],
+        ) {
+            Ok(published) => {
+                note_fast_ipc(IpcFastCounter::FusedReplyPublished);
+                let reply_ticks = crate::arch::rtc::ticks();
+                let handoff_queued = multitask::complete_fast_ipc_reply_wake_handoff_with_custody(
+                    args.reply_cap,
+                    published.completion,
+                );
+                log_slow_ipc_reply(
+                    "reply-recv-fast",
+                    args.reply_cap,
+                    start_ticks,
+                    copy_ticks,
+                    reply_ticks,
+                    response_len,
+                );
+                if let Some(error) = published.terminal_error {
+                    return ipc_reply_recv_committed_error(ipc_error_to_linux_errno(error));
+                }
+                return finish_committed_reply_receive(
+                    endpoint,
+                    receiver_task_id,
+                    &retained_mm,
+                    args.request_ptr,
+                    request_capacity,
+                    args.next_reply_cap_ptr,
+                    args.sender_pid_ptr,
+                    args.sender_tid_ptr,
+                    handoff_queued,
+                );
+            }
+            Err(kernel_ipc_runtime::api::IpcError::InvalidHandle) => {}
+            Err(error) => return linux_errno(ipc_error_to_linux_errno(error)),
+        }
+    }
     let response = match copy_request_from_user(args.response_ptr, args.response_len) {
         Ok(response) => response,
         Err(errno) => return linux_errno(errno),
@@ -78,14 +130,40 @@ pub(super) fn syscall_linux_rustos_ipc_reply_recv_with_sender(args_ptr: u64) -> 
     // it blocks, that software-schedule transition consumes the exact caller
     // hint. If a request was already queued, request one syscall-tail handoff
     // so the completed caller still receives its bounded direct turn.
-    match recv_with_sender_blocking_prepared(
+    finish_committed_reply_receive(
         endpoint,
         receiver_task_id,
+        &retained_mm,
         args.request_ptr,
         request_capacity,
         args.next_reply_cap_ptr,
         args.sender_pid_ptr,
         args.sender_tid_ptr,
+        handoff_queued,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_committed_reply_receive(
+    endpoint: KernelEndpointHandle,
+    receiver_task_id: u64,
+    retained_mm: &multitask::RetainedCurrentUserAddressSpace,
+    request_ptr: u64,
+    request_capacity: usize,
+    next_reply_cap_ptr: u64,
+    sender_pid_ptr: u64,
+    sender_tid_ptr: u64,
+    handoff_queued: bool,
+) -> u64 {
+    match recv_with_sender_blocking_prepared(
+        endpoint,
+        receiver_task_id,
+        retained_mm,
+        request_ptr,
+        request_capacity,
+        next_reply_cap_ptr,
+        sender_pid_ptr,
+        sender_tid_ptr,
         // Reply-and-receive belongs to a single-endpoint server, which has
         // nothing else to service and so has no reason to wake early.
         None,

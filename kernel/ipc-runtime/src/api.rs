@@ -1,17 +1,19 @@
 pub use crate::ipc::{
     CancelledCall, CancelledCallDisposition, ChannelIdentity, EndpointCallPriority,
     EndpointReceived, EndpointReceivedWithSender, EndpointResponseTake,
-    EndpointResponseWithHandles, EndpointWakeSet, IpcError, KernelEndpointHandle,
-    KernelReplyHandle, KernelSharedRegionHandle, KernelSharedRegionMappingHold,
-    KernelTransferTicket, KernelTransferredHandle, MAX_ENDPOINT_WAKE_TASKS,
-    PreparedReplyHandleBindError, ProcessIdentity, ReplyCompletion, ReplySchedulingContextCustody,
-    ReplySchedulingContextReturn, ServiceIdentity, TransferContext,
+    EndpointResponseWithHandles, EndpointWakeSet, FastEndpointReceived, FastEndpointResponseTake,
+    FastEndpointRollback, FastReplyCompletion, IPC_FAST_INLINE_BYTES, IpcError,
+    KernelEndpointHandle, KernelReplyHandle, KernelSharedRegionHandle,
+    KernelSharedRegionMappingHold, KernelTransferTicket, KernelTransferredHandle,
+    MAX_ENDPOINT_WAKE_TASKS, PreparedReplyHandleBindError, ProcessIdentity, ReplyCompletion,
+    ReplySchedulingContextCustody, ReplySchedulingContextReturn, ServiceIdentity, TransferContext,
 };
 
 pub mod endpoint {
     pub use crate::ipc::{
-        EndpointCallPriority, EndpointWakeSet, IpcError, KernelEndpointHandle, KernelReplyHandle,
-        KernelTransferredHandle, PreparedReplyHandleBindError, ReplyCompletion,
+        EndpointCallPriority, EndpointWakeSet, FastEndpointReceived, FastEndpointResponseTake,
+        FastEndpointRollback, FastReplyCompletion, IpcError, KernelEndpointHandle,
+        KernelReplyHandle, KernelTransferredHandle, PreparedReplyHandleBindError, ReplyCompletion,
         ReplySchedulingContextCustody, ReplySchedulingContextReturn,
     };
 
@@ -90,6 +92,79 @@ pub mod endpoint {
         crate::ipc::endpoint_receiver_process_for_reply(reply)
     }
 
+    pub fn reserve_fast_call(
+        endpoint: KernelEndpointHandle,
+        caller_process_id: u64,
+        caller_task_id: u64,
+        request: &[u8],
+        scheduling_context: Option<ReplySchedulingContextCustody>,
+    ) -> Result<(KernelReplyHandle, u64), IpcError> {
+        crate::ipc::reserve_fast_endpoint_call(
+            endpoint,
+            caller_process_id,
+            caller_task_id,
+            request,
+            scheduling_context,
+        )
+    }
+
+    pub fn reserve_fast_call_with_response_capacity(
+        endpoint: KernelEndpointHandle,
+        caller_process_id: u64,
+        caller_task_id: u64,
+        request: &[u8],
+        response_capacity: usize,
+        scheduling_context: Option<ReplySchedulingContextCustody>,
+    ) -> Result<(KernelReplyHandle, u64), IpcError> {
+        crate::ipc::reserve_fast_endpoint_call_with_response_capacity(
+            endpoint,
+            caller_process_id,
+            caller_task_id,
+            request,
+            response_capacity,
+            scheduling_context,
+        )
+    }
+
+    pub fn take_fast_request(
+        endpoint: KernelEndpointHandle,
+        receiver_task_id: u64,
+    ) -> Result<Option<FastEndpointReceived>, IpcError> {
+        crate::ipc::take_fast_endpoint_request(endpoint, receiver_task_id)
+    }
+
+    pub fn rollback_fast_call(
+        endpoint: KernelEndpointHandle,
+        reply: KernelReplyHandle,
+        caller_task_id: u64,
+        receiver_task_id: u64,
+    ) -> Result<FastEndpointRollback, IpcError> {
+        crate::ipc::rollback_fast_endpoint_call(endpoint, reply, caller_task_id, receiver_task_id)
+    }
+
+    pub fn complete_fast_reply_for_task(
+        reply: KernelReplyHandle,
+        receiver_task_id: u64,
+        response: &[u8],
+    ) -> Result<FastReplyCompletion, IpcError> {
+        crate::ipc::complete_fast_endpoint_reply_for_task(reply, receiver_task_id, response)
+    }
+
+    pub fn reject_fast_reply_for_task(
+        reply: KernelReplyHandle,
+        receiver_task_id: u64,
+        error: IpcError,
+    ) -> Result<FastReplyCompletion, IpcError> {
+        crate::ipc::reject_fast_endpoint_reply_for_task(reply, receiver_task_id, error)
+    }
+
+    pub fn take_fast_response(
+        reply: KernelReplyHandle,
+        caller_task_id: u64,
+    ) -> Result<FastEndpointResponseTake, IpcError> {
+        crate::ipc::take_fast_endpoint_response(reply, caller_task_id)
+    }
+
     pub fn reply_custody_returned(reply: KernelReplyHandle, caller_task_id: u64) -> bool {
         crate::ipc::endpoint_reply_custody_returned(reply, caller_task_id)
     }
@@ -161,6 +236,14 @@ pub mod endpoint {
         task_id: u64,
     ) -> Result<bool, IpcError> {
         crate::ipc::add_endpoint_receiver_waiter(endpoint, task_id)
+    }
+
+    pub fn add_receiver_waiter_with_capacity(
+        endpoint: KernelEndpointHandle,
+        task_id: u64,
+        request_capacity: usize,
+    ) -> Result<bool, IpcError> {
+        crate::ipc::add_endpoint_receiver_waiter_with_capacity(endpoint, task_id, request_capacity)
     }
 
     pub fn reply(reply: KernelReplyHandle, response: &[u8]) -> Result<u64, IpcError> {
@@ -332,6 +415,7 @@ pub mod region {
 
 pub use endpoint::{
     add_receiver_waiter as add_endpoint_receiver_waiter,
+    add_receiver_waiter_with_capacity as add_endpoint_receiver_waiter_with_capacity,
     authorize_receiver as authorize_endpoint_receiver,
     authorize_receiver_for_process as authorize_endpoint_receiver_for_process,
     cancel_call as cancel_endpoint_call,

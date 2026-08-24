@@ -1,22 +1,25 @@
 # path	line_limit	owner	required split boundary
 kernel/compat/src/user/process/linux.rs	1767	compat-process	Split ELF state, signal frame, and Linux task lifecycle.
-kernel/compat/src/user/syscall/linux/ipc_ops.rs	3284	compat-ipc	Reply wait split to ipc_ops/reply_wait.rs; next split endpoint calls, shared regions, handle transfer, and tests.
+kernel/compat/src/user/syscall/linux/ipc_ops.rs	3834	compat-ipc	Extract fixed-frame admission, fast receive/reply, counters, and service-wrapper fallback into ipc_ops/fast_path.rs; then split endpoint calls, shared regions, handle transfer, and tests.
 kernel/compat/src/user/syscall/linux/proc_broker_ops.rs	1920	compat-process-broker	Split spawn, exec, wait, signal, and retirement broker clients.
 kernel/compat/src/user/syscall/linux/service_ops/ipc_helpers.rs	2023	compat-service-ipc	Split typed calls, response admission, retry policy, and tests.
 kernel/compat/src/user/syscall/linux/service_ops/vfs_meta.rs	1902	compat-vfs	Split metadata RPCs, message-vector copyout, and AF_UNIX transfer control transactions.
 kernel/compat/src/user/syscall/linux/service_ops/vfs_socket.rs	1600	compat-vfs	Split file-descriptor transport, socket transport, and response admission.
 kernel/io-manager/src/input/dvm_ring.rs	1606	io-input	Split aperture admission, atomic header snapshots, worker lifecycle, broker operations, and tests.
 kernel/io-manager/src/io/dvm_display.rs	1835	io-display	Split handshake, shared-surface lifecycle, present queue, and tests.
-kernel/ipc-runtime/src/ipc/mod.rs	3169	ipc-runtime	Split endpoint, reply, shared-region, accounting, and test modules.
+kernel/ipc-runtime/src/ipc/mod.rs	3260	ipc-runtime	Extract the fixed FastCallFrame state machine into ipc/fast_call.rs, then split endpoint, reply, shared-region, and accounting modules.
 kernel/mm/src/memory/address_space.rs	1518	memory	Split page-table mutation, VMA admission, teardown, and tests.
 kernel/mm/src/memory/kernel_vm.rs	1435	memory-kernel-vm	Split PAT/cache policy, direct-map transactions, high-window mappings, and tests.
+kernel/ps/src/multitask/current.rs	1317	scheduler-current	Split typed endpoint/reply block and terminal fast-reply custody adapters into current/ipc.rs.
+kernel/ps/src/multitask/process_table.rs	1322	process-table	Split retained exact-MM generation access and identity adapters into process_table/identity.rs.
 kernel/ps/src/multitask/scheduler.rs	5874	scheduler	The handoff chain carries per-step self-timing until its dominant member is found and removed; next split run queues, wakeup, deadlines, switching, accounting, and tests.
+kernel/ps/src/multitask/scheduler/runqueue.rs	1427	scheduler-runqueue	Extract DirectHandoff and fixed RunTransfer custody transitions into scheduler/runqueue/ipc_handoff.rs.
 libs/driver-domain-host/src/lib.rs	5441	driver-domain-host	Split manifest, lease, QMP, recovery, input-ring publication, and process supervision.
 libs/driver-domain-protocol/src/lib.rs	4149	driver-domain-protocol	Split block, network, input, display, and control wire modules.
 libs/runtime-control/src/lib.rs	1402	runtime-control	Split codec, authority, command lifecycle, and tests.
 libs/rustos-image-admission/src/lib.rs	1518	image-admission	Split ELF, PE, region-plan, signature, and tests.
 libs/rustos-user-abi/src/linux.rs	1534	user-abi	Split Linux constants and structures by syscall family.
-libs/rustos-user-abi/src/syscall.rs	3235	user-abi	Split kernel mechanism ABI from service broker protocol families.
+libs/rustos-user-abi/src/syscall.rs	3278	user-abi	Extract compact syscalld identity offload request and response wires into syscall/syscalld.rs, then split remaining broker protocol families.
 services/initd/src/main.rs	1333	initd	Split loader wire calls, rootd lease reconciliation, and child supervision into typed modules.
 services/inputd/src/main.rs	1816	inputd	Split ingress admission, queue/readiness, service RPC, and runtime.
 services/netd/src/main.rs	3444	netd	Split device ingress, socket state, routing policy, service RPC, AF_UNIX segmented ancillary transport, and tests.

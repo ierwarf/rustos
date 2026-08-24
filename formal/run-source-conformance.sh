@@ -1053,7 +1053,7 @@ fi
 # calls so no internal caller can accidentally discard the token.
 ipc_runtime_source=kernel/ipc-runtime/src/ipc/mod.rs
 if ! rg -Uq 'struct ReplyObject \{[^}]*scheduling_context: Option<ReplySchedulingContextCustody>' "$ipc_runtime_source" \
-    || [ "$(rg -c 'reply_object\.scheduling_context\.take\(\)|reply\.scheduling_context\.take\(\)' "$ipc_runtime_source")" -ne 2 ] \
+    || [ "$(rg -c 'reply_object\.scheduling_context\.take\(\)|reply\.scheduling_context\.take\(\)' "$ipc_runtime_source")" -ne 7 ] \
     || ! rg -Fq 'pub scheduling_context: Option<ReplySchedulingContextCustody>' "$ipc_runtime_source" \
     || ! rg -Fq 'ensure_reply_has_no_scheduling_context(reply)?;' "$ipc_runtime_source" \
     || ! rg -Fq 'enqueue_endpoint_call_with_handles_priority_and_custody(' kernel/compat/src/user/syscall/linux/ipc_ops.rs \
@@ -1293,6 +1293,11 @@ scheduling-context-budget/SchedulingContextBudget|kernel-compat|user::syscall::l
 scheduling-context-budget/SchedulingContextBudget|kernel-compat|user::process::tests::production_process_spawn_surface_requires_scheduling_authority
 scheduling-context-budget/SchedulingContextBudget|kernel-executive|boot::tests::rootd_bootstrap_is_published_with_a_bounded_scheduling_context
 scheduling-context-budget/SchedulingContextBudget|rootd|tests::scheduling_policy_is_owned_by_the_immutable_service_manifest|host-test
+ipc-fast-handoff/IpcFastHandoff|kernel-ps|multitask::scheduler::runqueue::tests::direct_handoff_bypasses_the_fair_runqueue_and_is_cpu_exact
+ipc-fast-handoff/IpcFastHandoff|kernel-ipc-runtime|ipc::tests::fast_call_tests::fast_call_uses_fixed_frame_and_exact_receiver_caller_identities
+ipc-fast-handoff/IpcFastHandoff|kernel-ipc-runtime|ipc::tests::fast_call_tests::fast_call_rollback_restores_exact_front_waiter_and_custody
+ipc-fast-handoff/IpcFastHandoff|kernel-ps|multitask::scheduler::tests::fast_ipc_commit_requires_exact_typed_waits_and_mutates_both_peers_once
+ipc-fast-handoff/IpcFastHandoff|syscalld|fast_offload::tests::compact_id_wire_is_fixed_frame_bounded_sender_exact_and_lossless
 synchronous-ipc-handoff/SynchronousIpcHandoff|kernel-ps|multitask::scheduler::synchronous_handoff_tests::synchronous_ipc_handoff_is_fifo_deduplicated_and_fairness_bounded
 synchronous-ipc-handoff/SynchronousIpcHandoff|kernel-ps|multitask::scheduler::synchronous_handoff_tests::reply_wake_token_mint_requires_exact_task_and_dispatch_custody
 synchronous-ipc-handoff/SynchronousIpcHandoff|kernel-ps|multitask::scheduler::synchronous_handoff_tests::terminal_reply_releases_donation_and_wakes_exact_caller_in_one_scheduler_operation

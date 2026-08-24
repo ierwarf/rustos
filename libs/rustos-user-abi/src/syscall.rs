@@ -444,6 +444,7 @@ pub const SYSCALL_OFFLOAD_OP_WIN32_PROTECT_VIRTUAL_MEMORY: u16 = 89;
 pub const SYSCALL_OFFLOAD_OP_WIN32_QUERY_VIRTUAL_MEMORY: u16 = 90;
 pub const SYSCALL_OFFLOAD_PATH_CAPACITY: usize = 256;
 pub const SYSCALL_OFFLOAD_PAYLOAD_CAPACITY: usize = 0x200;
+pub const SYSCALL_OFFLOAD_FAST_PAYLOAD_CAPACITY: usize = 32;
 pub const MM_BROKER_ABI_VERSION: u16 = 1;
 pub const MM_BROKER_OP_QUERY_LAYOUT: u16 = 1;
 pub const MM_BROKER_OP_DESCRIBE_FD: u16 = 2;
@@ -3119,6 +3120,24 @@ pub struct LinuxSyscallOffloadRequest {
     pub path: [u8; SYSCALL_OFFLOAD_PATH_CAPACITY],
 }
 
+/// Compact byte-only syscalld envelope for high-frequency operations whose
+/// complete request and response are statically bounded by the IPC rendezvous
+/// frame. Its distinct size is the wire discriminator; it does not alias or
+/// weaken the full path-bearing request ABI.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LinuxSyscallOffloadFastRequest {
+    pub version: u16,
+    pub op: u16,
+    pub reserved0: u32,
+    pub pid: u64,
+    pub tid: u64,
+    pub uid: u32,
+    pub gid: u32,
+    pub euid: u32,
+    pub egid: u32,
+}
+
 impl Default for LinuxSyscallOffloadRequest {
     fn default() -> Self {
         Self {
@@ -3155,6 +3174,30 @@ pub struct LinuxSyscallOffloadResponse {
     pub payload_len: u32,
     pub reserved0: u32,
     pub payload: [u8; SYSCALL_OFFLOAD_PAYLOAD_CAPACITY],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LinuxSyscallOffloadFastResponse {
+    pub version: u16,
+    pub op: u16,
+    pub status: i32,
+    pub payload_len: u32,
+    pub reserved0: u32,
+    pub payload: [u8; SYSCALL_OFFLOAD_FAST_PAYLOAD_CAPACITY],
+}
+
+impl Default for LinuxSyscallOffloadFastResponse {
+    fn default() -> Self {
+        Self {
+            version: SYSCALL_OFFLOAD_ABI_VERSION,
+            op: 0,
+            status: 0,
+            payload_len: 0,
+            reserved0: 0,
+            payload: [0; SYSCALL_OFFLOAD_FAST_PAYLOAD_CAPACITY],
+        }
+    }
 }
 
 impl Default for LinuxSyscallOffloadResponse {

@@ -114,6 +114,7 @@ impl Scheduler {
             blocked: true,
             blocked_since_ticks: crate::arch::rtc::ticks(),
             wake_armed: false,
+            block_reason: BlockReason::None,
             weight: reservation.weight,
             #[cfg(test)]
             vruntime_ns: reservation.vruntime_ns,

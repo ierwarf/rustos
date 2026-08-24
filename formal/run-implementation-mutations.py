@@ -509,6 +509,101 @@ def build_key(mutation: dict[str, str | int]) -> tuple[str, str, str]:
     )
 
 
+def mutation_cache_key(root: Path, mutation: dict[str, str | int]) -> str:
+    """Seal the mutation, witness package, and build-selection inputs.
+
+    This deliberately uses package-scoped rather than repository-scoped
+    source hashing. A change to an unrelated service must not force hundreds
+    of already-killed kernel mutants to rebuild. Workspace/toolchain inputs
+    remain in the seal; a changed local dependency outside the package is the
+    intentionally accepted small cache approximation and is always repaired
+    by nightly/fresh-cache runs.
+    """
+    source = source_path(root, str(mutation["id"]), str(mutation["source"]))
+    package_root = source.parent
+    while package_root != root and not (package_root / "Cargo.toml").is_file():
+        package_root = package_root.parent
+    if package_root == root:
+        raise ValueError(f"no package root for {mutation['source']}")
+    digest = hashlib.sha256()
+    semantic_fields = (
+        "id", "source", "find", "replace", "anchor_spec", "package",
+        "features", "target", "test", "max_ms",
+    )
+    for field in semantic_fields:
+        digest.update(field.encode())
+        digest.update(b"\0")
+        digest.update(str(mutation[field]).encode())
+        digest.update(b"\0")
+    inputs = [
+        path for path in package_root.rglob("*")
+        if path.is_file()
+        and "target" not in path.relative_to(package_root).parts
+        and (path.suffix in {".rs", ".toml"} or path.name == "build.rs")
+    ]
+    for name in ("Cargo.toml", "Cargo.lock", "rust-toolchain.toml"):
+        path = root / name
+        if path.is_file():
+            inputs.append(path)
+    inputs.append(Path(__file__))
+    for path in sorted(set(inputs)):
+        relative = path.relative_to(root)
+        digest.update(relative.as_posix().encode())
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def reusable_mutation_outcomes(
+    root: Path,
+    mutations: list[dict[str, str | int]],
+    summary_path: Path,
+    registry_sha256: str,
+) -> tuple[list[dict[str, str | int]], list[dict[str, str | int]]]:
+    """Split current rows into reusable kills and rows that must execute."""
+    try:
+        previous_summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        previous_summary = {}
+    previous = {
+        str(entry.get("id")): entry
+        for entry in previous_summary.get("mutations", [])
+        if isinstance(entry, dict) and entry.get("status") == "killed"
+    }
+    same_registry = previous_summary.get("registry_sha256") == registry_sha256
+    reused: list[dict[str, str | int]] = []
+    pending: list[dict[str, str | int]] = []
+    for mutation in mutations:
+        cache_key = mutation_cache_key(root, mutation)
+        old = previous.get(str(mutation["id"]))
+        exact = old is not None and old.get("cache_key") == cache_key
+        # Migration path for evidence written before package-scoped cache keys
+        # existed. It is intentionally conservative about registry and exact
+        # mutated-source bytes; after one run every entry uses the full key.
+        legacy = (
+            old is not None
+            and "cache_key" not in old
+            and same_registry
+            and old.get("source_sha256") == mutation.get("source_sha256")
+            and old.get("test") == mutation.get("test")
+            and old.get("find") == mutation.get("find")
+            and old.get("replace") == mutation.get("replace")
+        )
+        if exact or legacy:
+            reused.append({
+                **mutation,
+                "status": "killed",
+                "cache_key": cache_key,
+                "cache_reused": True,
+                "resolved_witness": old.get("resolved_witness", mutation["test"]),
+            })
+        else:
+            mutation["cache_key"] = cache_key
+            pending.append(mutation)
+    return reused, pending
+
+
 @dataclass(frozen=True)
 class WitnessBaseline:
     """One pristine-tree precondition shared by every mutant of a witness."""
@@ -862,25 +957,41 @@ def main() -> int:
     artifact_dir.mkdir(parents=True, exist_ok=True)
     target_dir = artifact_dir / "target"
 
-    with tempfile.TemporaryDirectory(prefix="rustos-implementation-mutations-") as temp:
-        checkout = Path(temp) / "checkout"
-        prepare_checkout(root, checkout)
-        originals = {
-            str(mutation["source"]): (
-                checkout / str(mutation["source"])
-            ).read_text(encoding="utf-8")
-            for mutation in mutations
-        }
-        for mutation in mutations:
-            source_name = str(mutation["source"])
-            original = originals[source_name]
-            if hashlib.sha256(original.encode("utf-8")).hexdigest() != mutation[
-                "source_sha256"
-            ]:
-                raise SystemExit(
-                    f"{mutation['id']}: source changed after mutation preflight; rerun the lane"
-                )
-        outcomes = run_shards(checkout, target_dir, artifact_dir, mutations, originals, temp)
+    registry = root / "formal/implementation-mutations.tsv"
+    registry_sha256 = hashlib.sha256(registry.read_bytes()).hexdigest()
+    summary_name = "focused-summary.json" if focused_ids else "summary.json"
+    summary_path = artifact_dir / summary_name
+    reused, pending = reusable_mutation_outcomes(
+        root, mutations, summary_path, registry_sha256
+    )
+    outcomes = list(reused)
+    if pending:
+        with tempfile.TemporaryDirectory(prefix="rustos-implementation-mutations-") as temp:
+            checkout = Path(temp) / "checkout"
+            prepare_checkout(root, checkout)
+            originals = {
+                str(mutation["source"]): (
+                    checkout / str(mutation["source"])
+                ).read_text(encoding="utf-8")
+                for mutation in pending
+            }
+            for mutation in pending:
+                source_name = str(mutation["source"])
+                original = originals[source_name]
+                if hashlib.sha256(original.encode("utf-8")).hexdigest() != mutation[
+                    "source_sha256"
+                ]:
+                    raise SystemExit(
+                        f"{mutation['id']}: source changed after mutation preflight; rerun the lane"
+                    )
+            executed = run_shards(
+                checkout, target_dir, artifact_dir, pending, originals, temp
+            )
+            outcomes.extend(
+                {**outcome, "cache_reused": False}
+                for outcome in executed
+            )
+    outcomes.sort(key=lambda outcome: str(outcome["id"]))
 
     failures = [outcome for outcome in outcomes if outcome.get("status") != "killed"]
     if failures:
@@ -900,25 +1011,29 @@ def main() -> int:
         for outcome in outcomes
     ]
 
-    registry = root / "formal/implementation-mutations.tsv"
     summary = {
         "schema": "rustos-implementation-mutation-evidence-v1",
         "status": "passed",
-        "registry_sha256": hashlib.sha256(registry.read_bytes()).hexdigest(),
+        "registry_sha256": registry_sha256,
         "mutation_count": len(results),
         "kill_count": len(results),
         "kill_ratio": 1.0,
         "mutations": results,
         "scope": "focused" if focused_ids else "complete",
+        "cache": {
+            "reused": len(reused),
+            "executed": len(pending),
+            "approximation": "package-scoped-local-dependency",
+        },
     }
-    summary_name = "focused-summary.json" if focused_ids else "summary.json"
-    (artifact_dir / summary_name).write_text(
+    summary_path.write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     scope = "focused" if focused_ids else "complete"
     print(
         f"implementation mutations passed scope={scope} "
-        f"killed={len(results)}/{len(results)}"
+        f"killed={len(results)}/{len(results)} "
+        f"reused={len(reused)} executed={len(pending)}"
     )
     return 0
 

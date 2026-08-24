@@ -1070,6 +1070,7 @@ models = [
 path = "kernel/ipc-runtime/src/ipc/mod.rs"
 models = [
     "endpoint-receiver-wakeup/EndpointReceiverWakeup",
+    "ipc-fast-handoff/IpcFastHandoff",
     "ipc-endpoint-ownership/IpcEndpointOwnership",
     "ipc-handle-transfer/IpcHandleTransfer",
     "ipc-priority-queue/IpcPriorityQueue",
@@ -1245,6 +1246,7 @@ models = [
     "bootstrap-activation-handoff/BootstrapActivationHandoff",
     "cross-cpu-task-retirement/CrossCpuTaskRetirement",
     "exec-address-space-transaction/ExecAddressSpaceTransaction",
+    "ipc-fast-handoff/IpcFastHandoff",
     "scheduler-cpu-ownership/SchedulerCpuOwnership",
     "scheduling-context-budget/SchedulingContextBudget",
     "scheduler-thread-demotion/SchedulerThreadDemotion",
@@ -1270,6 +1272,7 @@ models = ["scheduler-active-balance/SchedulerActiveBalance"]
 [[source_mappings]]
 path = "kernel/ps/src/multitask/scheduler/runqueue.rs"
 models = [
+    "ipc-fast-handoff/IpcFastHandoff",
     "scheduler-cpu-distribution/SchedulerCpuDistribution",
     "synchronous-ipc-handoff-concurrency/SynchronousIpcHandoffConcurrency",
     "synchronous-ipc-handoff/SynchronousIpcHandoff",
@@ -1390,6 +1393,7 @@ models = [
 path = "kernel/compat/src/user/syscall/linux/ipc_ops.rs"
 models = [
     "input-ingestion-worker/InputIngestionWorker",
+    "ipc-fast-handoff/IpcFastHandoff",
     "ipc-reply-recv-transaction/IpcReplyRecvTransaction",
     "netd-deferred-reply/NetdDeferredReply",
     "scheduling-context-budget/SchedulingContextBudget",

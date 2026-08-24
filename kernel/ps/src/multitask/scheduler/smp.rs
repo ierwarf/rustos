@@ -158,14 +158,22 @@ impl Scheduler {
         );
     }
 
-    pub(super) fn context_is_schedulable(&self, slot: usize, context: TaskContext) -> bool {
-        let current_cpu = nucleus_core::util::lockdep::current_cpu_index();
+    /// Validates every dispatch constraint that is independent of runqueue
+    /// custody. Direct handoff publishers use this before changing `Blocked`
+    /// into `DirectHandoff`; otherwise a budget or affinity rejection in the
+    /// picker could discard the one-shot handoff record and strand the task.
+    pub(super) fn context_is_dispatch_eligible_on_cpu(
+        &self,
+        slot: usize,
+        context: TaskContext,
+        dispatch_cpu: usize,
+    ) -> bool {
         let context_owner_slot = self.effective_scheduling_context_owner_slot(slot);
         let scheduling_context = self.contexts[context_owner_slot]
             .map(|owner| owner.scheduling_context)
             .unwrap_or(context.scheduling_context);
         if scheduling_context.is_budgeted() {
-            if !scheduling_context.allows_cpu(current_cpu) {
+            if !scheduling_context.allows_cpu(dispatch_cpu) {
                 return false;
             }
             let now_ns = crate::arch::clock::monotonic_nanos();
@@ -180,29 +188,26 @@ impl Scheduler {
                 return false;
             }
         }
-        #[cfg(not(test))]
-        if !runqueue::is_local_dispatchable(slot, current_cpu) {
-            return false;
-        }
         if candidate_has_foreign_execution_owner(
             slot,
             self.current_task_slot(),
-            current_cpu,
+            dispatch_cpu,
             super::super::cpu_local::task_running_cpu(slot),
         ) {
             return false;
         }
-        if slot == ROOT_TASK_SLOT && current_cpu != 0 {
+        if slot == ROOT_TASK_SLOT && dispatch_cpu != 0 {
             return false;
         }
         let idle_cpu = self.idle_cpu[slot];
-        if idle_cpu != NO_IDLE_CPU && usize::from(idle_cpu) != current_cpu {
+        if idle_cpu != NO_IDLE_CPU && usize::from(idle_cpu) != dispatch_cpu {
             return false;
         }
         let affinity_bit = 1_u64
-            .checked_shl(u32::try_from(current_cpu).expect("logical CPU index overflow"))
+            .checked_shl(u32::try_from(dispatch_cpu).expect("logical CPU index overflow"))
             .expect("logical CPU index exceeds affinity mask");
-        if self.slot_affinity_snapshot(slot).0 & affinity_bit == 0 {
+        let (task_affinity, process_affinity, _) = self.slot_affinity_snapshot(slot);
+        if task_affinity & process_affinity & affinity_bit == 0 {
             return false;
         }
         !self.job_stopped[slot]
@@ -210,6 +215,28 @@ impl Scheduler {
             && self
                 .context_validation_error(slot, context, self.slot_saved_rsp(slot))
                 .is_none()
+    }
+
+    pub(super) fn context_is_dispatch_eligible(&self, slot: usize, context: TaskContext) -> bool {
+        self.context_is_dispatch_eligible_on_cpu(
+            slot,
+            context,
+            nucleus_core::util::lockdep::current_cpu_index(),
+        )
+    }
+
+    pub(super) fn context_is_schedulable(&self, slot: usize, context: TaskContext) -> bool {
+        if !self.context_is_dispatch_eligible(slot, context) {
+            return false;
+        }
+        #[cfg(not(test))]
+        {
+            let current_cpu = nucleus_core::util::lockdep::current_cpu_index();
+            if !runqueue::is_current_cpu_dispatchable(slot, current_cpu) {
+                return false;
+            }
+        }
+        true
     }
 
     /// Checks a queued continuation while an idle CPU considers moving it from
@@ -310,6 +337,7 @@ impl Scheduler {
             blocked: false,
             blocked_since_ticks: 0,
             wake_armed: false,
+            block_reason: BlockReason::None,
             weight: NICE_0_LOAD,
             #[cfg(test)]
             vruntime_ns: 0,

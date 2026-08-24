@@ -961,6 +961,7 @@ mod tests {
             blocked: false,
             blocked_since_ticks: 0,
             wake_armed: false,
+            block_reason: BlockReason::None,
             weight: NICE_0_LOAD,
             #[cfg(test)]
             vruntime_ns: 0,

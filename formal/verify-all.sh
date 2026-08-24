@@ -16,12 +16,20 @@ case "$profile" in
     *) echo "invalid formal profile: $profile" >&2; exit 2 ;;
 esac
 
-# The formal lanes are what fill this device: each one keeps its own cargo
-# target tree, and a four-shard mutation run once exhausted the disk mid-lane -
-# which fails the gate and leaves the trees behind, strictly worse than having
-# reclaimed them first. Reclaim only when space is actually short, so an
-# ordinary run keeps its warm caches.
-reclaim_threshold_kb=$((20 * 1024 * 1024))
+# An exact source-tree seal already binds every required artifact by content
+# digest. Rechecking those digests is equivalent to rerunning an unchanged
+# gate and avoids rebuilding hundreds of mutation witnesses after commands
+# that only consume, rather than modify, the checkout.
+if python3 formal/reuse-verification-run.py --root "$repo_root" --profile "$profile"; then
+    exit 0
+fi
+
+# Keep warm Cargo/proof caches unless the filesystem is genuinely close to
+# exhaustion. The old 20 GiB trigger discarded several gigabytes on this
+# workstation before every PR gate even though one complete four-shard run
+# needs less than half of that headroom. Operators can still raise the floor
+# explicitly for a smaller or shared volume.
+reclaim_threshold_kb="${RUSTOS_FORMAL_RECLAIM_THRESHOLD_KB:-$((4 * 1024 * 1024))}"
 available_kb="$(df -Pk "$repo_root" | awk 'NR==2 {print $4}')"
 if [[ -n "$available_kb" && "$available_kb" -lt "$reclaim_threshold_kb" ]]; then
     printf 'formal: %s KiB free, reclaiming regenerable lane caches\n' "$available_kb"

@@ -188,6 +188,21 @@ impl ProcessRef {
         process_state_is_visible(self.handle).then(|| f(self.process_id, &state))
     }
 
+    /// Accesses process state only while the exact process and address-space
+    /// generations retained by the caller are still live. The state lock is
+    /// acquired before the process table, matching exec's replacement order,
+    /// so validation and the complete access are one MM-generation epoch.
+    pub fn with_exact_visible_state<R>(
+        &self,
+        expected: ProcessIdentity,
+        f: impl FnOnce(u64, &UserProcessState) -> R,
+    ) -> Option<R> {
+        // SAFETY: ProcessRef retains the owning Arc, so the NonNull state
+        // pointer stays live through the exact-identity check and callback.
+        let state = unsafe { self.state_ptr.as_ref() }.lock();
+        (live_process_identity(self.handle) == Some(expected)).then(|| f(self.process_id, &state))
+    }
+
     pub fn with_visible_state_mut<R>(
         &self,
         f: impl FnOnce(u64, &mut UserProcessState) -> R,
@@ -1098,6 +1113,30 @@ pub(crate) mod tests {
         assert_eq!(reap_exited_processes(), 0);
         drop(retained);
         assert_eq!(reap_exited_processes(), 1);
+    }
+
+    #[test]
+    fn retained_ref_rejects_address_space_generation_substitution() {
+        let _isolation = isolate_process_table();
+        let handle = create_process(4_242, new_state()).expect("process handle");
+        let retained = retain_process(handle).expect("retained process");
+        let identity = retained.live_identity().expect("live identity");
+        assert_eq!(
+            retained.with_exact_visible_state(identity, |process_id, _| process_id),
+            Some(4_242)
+        );
+
+        {
+            let mut table = super::PROCESS_TABLE.lock();
+            let object = table
+                .lookup_object_mut(handle)
+                .expect("live process object");
+            object.mm_generation += 1;
+        }
+        assert_eq!(
+            retained.with_exact_visible_state(identity, |process_id, _| process_id),
+            None
+        );
     }
 
     #[test]

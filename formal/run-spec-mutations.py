@@ -361,6 +361,24 @@ def counterexample(root: Path, mutation: dict[str, Any], artifact: Path) -> dict
     }
 
 
+def mutation_cache_key(
+    root: Path, mutation: dict[str, Any], corpus_sha256: str
+) -> str:
+    digest = hashlib.sha256()
+    digest.update(corpus_sha256.encode())
+    for suffix in (".tla", ".cfg"):
+        path = root / "formal" / f"{mutation['model']}{suffix}"
+        digest.update(path.read_bytes())
+    digest.update((root / "formal/tla2tools.lock").read_bytes())
+    digest.update(Path(__file__).read_bytes())
+    for key in sorted(mutation):
+        digest.update(key.encode())
+        digest.update(b"\0")
+        digest.update(str(mutation[key]).encode())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
 def main() -> int:
     root = root_path()
     mutations, corpus_sha256 = validate_corpus(root)
@@ -383,9 +401,50 @@ def main() -> int:
         raise SystemExit("usage: formal/run-spec-mutations.py [--check|--id <mutation-id>]")
     artifact_root = root / "build/formal/spec-mutations"
     artifact_root.mkdir(parents=True, exist_ok=True)
+    summary_path = (
+        artifact_root / "summary.json"
+        if not targeted
+        else artifact_root / str(selected[0]["id"]) / "targeted-result.json"
+    )
+    try:
+        previous_summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        previous_summary = {}
+    previous = {
+        str(entry.get("id")): entry
+        for entry in previous_summary.get("mutations", [])
+        if isinstance(entry, dict) and entry.get("status") == "killed"
+    }
+    same_corpus = previous_summary.get("corpus_sha256") == corpus_sha256
+    reused: dict[str, dict[str, Any]] = {}
+    pending: list[dict[str, Any]] = []
+    for mutation in selected:
+        key = mutation_cache_key(root, mutation, corpus_sha256)
+        old = previous.get(str(mutation["id"]))
+        exact = old is not None and old.get("cache_key") == key
+        legacy = (
+            old is not None
+            and "cache_key" not in old
+            and same_corpus
+            and old.get("source_sha256")
+            == hashlib.sha256(
+                (root / "formal" / f"{mutation['model']}.tla").read_bytes()
+            ).hexdigest()
+        )
+        if exact or legacy:
+            reused[str(mutation["id"])] = {
+                **old,
+                **mutation,
+                "status": "killed",
+                "cache_key": key,
+                "cache_reused": True,
+            }
+        else:
+            mutation["cache_key"] = key
+            pending.append(mutation)
     base_env = os.environ.copy()
     base_env["FORMAL_MUTATION_MODE"] = "1"
-    baseline_models = sorted({str(mutation["model"]) for mutation in selected})
+    baseline_models = sorted({str(mutation["model"]) for mutation in pending})
     for model in baseline_models:
         if has_exact_passed_baseline(root, model):
             continue
@@ -398,18 +457,20 @@ def main() -> int:
         if result.returncode != 0:
             raise SystemExit(f"{model}: baseline TLC run failed; see {baseline_log}")
 
-    with tempfile.TemporaryDirectory(prefix="rustos-tla-mutations-") as temporary:
+    executed: list[dict[str, Any]] = []
+    if pending:
+      with tempfile.TemporaryDirectory(prefix="rustos-tla-mutations-") as temporary:
         temporary_root = Path(temporary)
-        jobs = min(mutant_jobs(), len(selected))
+        jobs = min(mutant_jobs(), len(pending))
         with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
             # `map` preserves corpus order, so the sealed evidence does not
             # depend on which mutant happened to finish first.
-            outcomes = list(
+            executed = list(
                 pool.map(
                     lambda mutation: kill_mutant(
                         root, base_env, artifact_root, temporary_root, mutation
                     ),
-                    selected,
+                    pending,
                 )
             )
         # Every model keeps a pinned wall-clock budget, so a mutant that shared
@@ -420,7 +481,7 @@ def main() -> int:
         # a real gap, and one killed here was always a kill.
         retried = [
             outcome["id"]
-            for outcome in outcomes
+            for outcome in executed
             if outcome.get("timeout") and "failure" in outcome
         ]
         if retried:
@@ -429,15 +490,25 @@ def main() -> int:
                 + " ".join(str(identity) for identity in retried),
                 file=sys.stderr,
             )
-            by_id = {str(mutation["id"]): mutation for mutation in selected}
-            for position, outcome in enumerate(outcomes):
+            by_id = {str(mutation["id"]): mutation for mutation in pending}
+            for position, outcome in enumerate(executed):
                 if not (outcome.get("timeout") and "failure" in outcome):
                     continue
                 identity = str(outcome["id"])
                 shutil.rmtree(temporary_root / identity, ignore_errors=True)
-                outcomes[position] = kill_mutant(
+                executed[position] = kill_mutant(
                     root, base_env, artifact_root, temporary_root, by_id[identity]
                 )
+
+    for outcome in executed:
+        outcome["cache_reused"] = False
+    executed_by_id = {str(outcome["id"]): outcome for outcome in executed}
+    outcomes = [
+        reused.get(str(mutation["id"]), executed_by_id.get(str(mutation["id"])))
+        for mutation in selected
+    ]
+    if any(outcome is None for outcome in outcomes):
+        raise SystemExit("spec mutation cache lost a selected outcome")
 
     failures = [str(outcome["failure"]) for outcome in outcomes if "failure" in outcome]
     if failures:
@@ -460,18 +531,14 @@ def main() -> int:
         "kill_ratio": 1.0,
         "mutations": results,
     }
-    summary_path = (
-        artifact_root / "summary.json"
-        if not targeted
-        else artifact_root / str(selected[0]["id"]) / "targeted-result.json"
-    )
     summary_path.write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     scope = "targeted" if targeted else "full"
     print(
         "TLA+ specification mutations passed "
-        f"scope={scope} killed={len(results)}/{len(results)}"
+        f"scope={scope} killed={len(results)}/{len(results)} "
+        f"reused={len(reused)} executed={len(pending)}"
     )
     return 0
 

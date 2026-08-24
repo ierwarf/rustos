@@ -104,6 +104,10 @@ pub(super) enum RunOwnerState {
     Blocked = 5,
     Retiring = 6,
     Retired = 7,
+    /// Same-CPU synchronous IPC custody. The task is runnable on exactly one
+    /// CPU but is deliberately absent from its fair runqueue: the bounded
+    /// synchronous-handoff FIFO is its sole ordering owner until dispatch.
+    DirectHandoff = 8,
 }
 
 impl RunOwnerState {
@@ -117,6 +121,7 @@ impl RunOwnerState {
             5 => Self::Blocked,
             6 => Self::Retiring,
             7 => Self::Retired,
+            8 => Self::DirectHandoff,
             state => panic!("scheduler owner word contains invalid state {state}"),
         }
     }
@@ -142,6 +147,26 @@ pub(super) enum RemoteWakeOutcome {
     Published { cpu: usize, notify: bool },
 }
 
+const fn local_wake_owner_is_already_owned(state: RunOwnerState) -> bool {
+    matches!(
+        state,
+        RunOwnerState::Local
+            | RunOwnerState::RemoteQueued
+            | RunOwnerState::Running
+            | RunOwnerState::DirectHandoff
+    )
+}
+
+const fn remote_wake_owner_is_already_owned(state: RunOwnerState) -> bool {
+    matches!(
+        state,
+        RunOwnerState::Local
+            | RunOwnerState::RemoteQueued
+            | RunOwnerState::Running
+            | RunOwnerState::DirectHandoff
+    )
+}
+
 impl RunOwnerSnapshot {
     const fn new(state: RunOwnerState, cpu: Option<usize>, generation: u64) -> Self {
         Self {
@@ -164,6 +189,7 @@ impl RunOwnerSnapshot {
                 | RunOwnerState::RemoteQueued
                 | RunOwnerState::Running
                 | RunOwnerState::Migrating
+                | RunOwnerState::DirectHandoff
         )
     }
 
@@ -352,14 +378,18 @@ impl PerCpuRunQueue {
     }
 }
 
+/// Fixed, allocation-free cross-CPU execution-custody transfer. The owner
+/// generation is the exact linearization identity for `RemoteQueued`; a stale
+/// mailbox slot can never publish a second runnable owner.
+#[repr(C, align(32))]
 #[derive(Clone, Copy)]
-struct RemoteWakeRecord {
+struct RunTransfer {
     slot: usize,
     generation: u64,
     weight: u32,
 }
 
-impl RemoteWakeRecord {
+impl RunTransfer {
     const EMPTY: Self = Self {
         slot: 0,
         generation: 0,
@@ -368,7 +398,7 @@ impl RemoteWakeRecord {
 }
 
 struct RemoteWakeMailbox {
-    records: [RemoteWakeRecord; MAILBOX_CAPACITY],
+    records: [RunTransfer; MAILBOX_CAPACITY],
     head: usize,
     len: usize,
 }
@@ -376,13 +406,13 @@ struct RemoteWakeMailbox {
 impl RemoteWakeMailbox {
     const fn new() -> Self {
         Self {
-            records: [RemoteWakeRecord::EMPTY; MAILBOX_CAPACITY],
+            records: [RunTransfer::EMPTY; MAILBOX_CAPACITY],
             head: 0,
             len: 0,
         }
     }
 
-    fn publish(&mut self, record: RemoteWakeRecord) {
+    fn publish(&mut self, record: RunTransfer) {
         // Rehoming invalidates an earlier generation without synchronously
         // deleting its record from the old target. If the task later returns
         // to this CPU before a drain, replace that stale record in place. One
@@ -404,12 +434,12 @@ impl RemoteWakeMailbox {
         self.len += 1;
     }
 
-    fn pop(&mut self) -> Option<RemoteWakeRecord> {
+    fn pop(&mut self) -> Option<RunTransfer> {
         if self.len == 0 {
             return None;
         }
         let record = self.records[self.head];
-        self.records[self.head] = RemoteWakeRecord::EMPTY;
+        self.records[self.head] = RunTransfer::EMPTY;
         self.head = (self.head + 1) % self.records.len();
         self.len -= 1;
         Some(record)
@@ -846,10 +876,7 @@ pub(super) fn publish_local_wake(slot: usize, cpu: usize, weight: u32) -> Remote
     if owner.state.is_terminal() || owner.state == RunOwnerState::Dormant {
         return RemoteWakeOutcome::Rejected;
     }
-    if matches!(
-        owner.state,
-        RunOwnerState::Local | RunOwnerState::RemoteQueued | RunOwnerState::Running
-    ) {
+    if local_wake_owner_is_already_owned(owner.state) {
         return RemoteWakeOutcome::AlreadyOwned { cpu: owner.cpu };
     }
     if owner.state != RunOwnerState::Blocked {
@@ -857,6 +884,67 @@ pub(super) fn publish_local_wake(slot: usize, cpu: usize, weight: u32) -> Remote
     }
     publish_local(slot, cpu, weight);
     RemoteWakeOutcome::Published { cpu, notify: false }
+}
+
+/// Transfers a blocked task directly to the current CPU's synchronous IPC
+/// handoff owner without inserting it into the fair runqueue. The caller must
+/// publish the matching bounded handoff record before releasing Scheduler.
+pub(super) fn publish_direct_handoff(slot: usize, cpu: usize) -> RemoteWakeOutcome {
+    validate_cpu(cpu);
+    loop {
+        let owner = owner(slot);
+        if owner.state.is_terminal() || owner.state == RunOwnerState::Dormant {
+            return RemoteWakeOutcome::Rejected;
+        }
+        if remote_wake_owner_is_already_owned(owner.state) {
+            return RemoteWakeOutcome::AlreadyOwned { cpu: owner.cpu };
+        }
+        if owner.state != RunOwnerState::Blocked {
+            return RemoteWakeOutcome::Rejected;
+        }
+        let next = owner.next(RunOwnerState::DirectHandoff, Some(cpu));
+        if OWNER_WORDS[slot].compare_exchange(owner, next).is_ok() {
+            return RemoteWakeOutcome::Published { cpu, notify: false };
+        }
+    }
+}
+
+/// Restores fair-runqueue custody when the bounded synchronous-handoff FIFO
+/// cannot retain a freshly published direct transfer. Scheduler serialization
+/// guarantees the task has not been selected between publication and this
+/// rollback.
+pub(super) fn materialize_direct_handoff(slot: usize, cpu: usize, weight: u32) -> bool {
+    validate_cpu(cpu);
+    let owner = owner(slot);
+    if owner.state != RunOwnerState::DirectHandoff || owner.cpu != Some(cpu) || !owner.runnable {
+        return false;
+    }
+    let mut rq = RUN_QUEUES[cpu].inner.lock();
+    rq.insert(slot, weight);
+    if OWNER_WORDS[slot]
+        .compare_exchange(owner, owner.next(RunOwnerState::Local, Some(cpu)))
+        .is_err()
+    {
+        rq.remove(slot, weight);
+        RUN_QUEUES[cpu].publish_load(&rq);
+        return false;
+    }
+    RUN_QUEUES[cpu].publish_load(&rq);
+    true
+}
+
+/// Returns a not-yet-dispatched direct receiver to exact blocked custody.
+/// No runqueue or mailbox entry exists while `DirectHandoff` is owned, so one
+/// owner-word CAS restores the pre-reservation representation.
+pub(super) fn rollback_direct_handoff(slot: usize, cpu: usize) -> bool {
+    validate_cpu(cpu);
+    let owner = owner(slot);
+    if owner.state != RunOwnerState::DirectHandoff || owner.cpu != Some(cpu) || !owner.runnable {
+        return false;
+    }
+    OWNER_WORDS[slot]
+        .compare_exchange(owner, owner.next(RunOwnerState::Blocked, None))
+        .is_ok()
 }
 
 pub(super) fn publish_remote_wake(
@@ -872,7 +960,10 @@ pub(super) fn publish_remote_wake(
         }
         if matches!(
             owner.state,
-            RunOwnerState::Local | RunOwnerState::RemoteQueued | RunOwnerState::Running
+            RunOwnerState::Local
+                | RunOwnerState::RemoteQueued
+                | RunOwnerState::Running
+                | RunOwnerState::DirectHandoff
         ) {
             return RemoteWakeOutcome::AlreadyOwned { cpu: owner.cpu };
         }
@@ -885,7 +976,7 @@ pub(super) fn publish_remote_wake(
         }
         {
             let mut mailbox = REMOTE_WAKE_MAILBOXES[target_cpu].lock();
-            mailbox.publish(RemoteWakeRecord {
+            mailbox.publish(RunTransfer {
                 slot,
                 generation: next.generation,
                 weight,
@@ -962,6 +1053,21 @@ pub(super) fn rehome_queued(slot: usize, target_cpu: usize, weight: u32) -> Remo
                 }
                 return publish_migrating_record(slot, migrating, target_cpu, weight);
             }
+            RunOwnerState::DirectHandoff => {
+                if owner.cpu == Some(target_cpu) {
+                    return RemoteWakeOutcome::AlreadyOwned {
+                        cpu: Some(target_cpu),
+                    };
+                }
+                let migrating = owner.next(RunOwnerState::Migrating, Some(target_cpu));
+                if OWNER_WORDS[slot]
+                    .compare_exchange(owner, migrating)
+                    .is_err()
+                {
+                    continue;
+                }
+                return publish_migrating_record(slot, migrating, target_cpu, weight);
+            }
             RunOwnerState::Migrating => continue,
             RunOwnerState::Dormant | RunOwnerState::Retiring | RunOwnerState::Retired => {
                 return RemoteWakeOutcome::Rejected;
@@ -984,7 +1090,7 @@ fn publish_migrating_record(
         });
     {
         let mut mailbox = REMOTE_WAKE_MAILBOXES[target_cpu].lock();
-        mailbox.publish(RemoteWakeRecord {
+        mailbox.publish(RunTransfer {
             slot,
             generation: queued.generation,
             weight,
@@ -1018,7 +1124,7 @@ pub(super) fn drain_remote_wakes(cpu: usize) -> usize {
     if MAILBOX_PENDING[cpu].load(Ordering::Acquire) == 0 {
         return 0;
     }
-    let mut records = [RemoteWakeRecord::EMPTY; MAILBOX_CAPACITY];
+    let mut records = [RunTransfer::EMPTY; MAILBOX_CAPACITY];
     let mut count = 0;
     {
         let mut mailbox = REMOTE_WAKE_MAILBOXES[cpu].lock();
@@ -1142,16 +1248,32 @@ pub(super) fn is_local_dispatchable(slot: usize, cpu: usize) -> bool {
     owner.state == RunOwnerState::Local && owner.cpu == Some(cpu) && owner.runnable
 }
 
+/// Returns whether `slot` has execution custody that this CPU may claim now.
+/// A direct synchronous handoff is deliberately absent from the fair local
+/// queue, but it is just as dispatchable by its exact target CPU. Selection
+/// must therefore accept it while ordinary CFS scans continue to require
+/// [`is_local_dispatchable`].
+pub(super) fn is_current_cpu_dispatchable(slot: usize, cpu: usize) -> bool {
+    validate_cpu(cpu);
+    let owner = owner(slot);
+    owner.cpu == Some(cpu)
+        && owner.runnable
+        && matches!(
+            owner.state,
+            RunOwnerState::Local | RunOwnerState::DirectHandoff
+        )
+}
+
 /// Returns whether one acquire snapshot may nominate `slot` for a direct
 /// handoff. `Migrating` deliberately remains runnable while its target mailbox
 /// is being admitted, but it has no dispatch-handoff custody until that
 /// admission publishes `Local` or `RemoteQueued` ownership.
 pub(super) const fn is_handoff_dispatchable_owner(owner: RunOwnerSnapshot) -> bool {
     owner.runnable
-        && matches!(
+        && (matches!(
             owner.state,
             RunOwnerState::Local | RunOwnerState::RemoteQueued
-        )
+        ) || matches!(owner.state, RunOwnerState::DirectHandoff))
 }
 
 /// Returns whether the owner word still records execution or queue run intent.
@@ -1184,6 +1306,14 @@ pub(super) fn is_handoff_dispatchable(slot: usize) -> bool {
 pub(super) fn claim_dispatch(slot: usize, cpu: usize, weight: u32) -> bool {
     validate_cpu(cpu);
     let owner = owner(slot);
+    if owner.state == RunOwnerState::DirectHandoff {
+        if owner.cpu != Some(cpu) || !owner.runnable {
+            return false;
+        }
+        return OWNER_WORDS[slot]
+            .compare_exchange(owner, owner.next(RunOwnerState::Running, Some(cpu)))
+            .is_ok();
+    }
     if owner.state != RunOwnerState::Local || owner.cpu != Some(cpu) || !owner.runnable {
         return false;
     }

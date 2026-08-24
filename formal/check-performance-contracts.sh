@@ -690,7 +690,9 @@ for witness in \
         exit 1
     }
 done
-rg -Uq 'prepare_recv_with_sender\([\s\S]{0,1800}copy_request_from_user\([\s\S]{0,1800}complete_endpoint_reply_for_process_with_custody\([\s\S]{0,2600}recv_with_sender_blocking_prepared\(' \
+rg -Uq 'prepare_recv_with_sender\([\s\S]{0,3600}copy_request_from_user\([\s\S]{0,1800}complete_endpoint_reply_for_process_with_custody\([\s\S]{0,2600}finish_committed_reply_receive\(' \
+    "$reply_recv_kernel" \
+    && rg -Uq 'fn finish_committed_reply_receive\([\s\S]{0,1200}recv_with_sender_blocking_prepared\(' \
     "$reply_recv_kernel" || {
     echo "fused reply-receive no longer preflights before reply commit and receive" >&2
     exit 1

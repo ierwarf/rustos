@@ -1,9 +1,10 @@
 use alloc::boxed::Box;
 
 use super::{
-    ConsoleSessionHandle, IpcDonationTarget, MAX_CONSECUTIVE_SYSTEM_DISPATCHES, MAX_TASK,
-    MIN_LOAD_WEIGHT, NICE_0_LOAD, SCHED_CPU_LOCALITY_LAG_NS, SYSTEM_CLASS_WEIGHT_FLAG, SchedClass,
-    Scheduler, SchedulerDispatch, TaskContext, TaskStart, align_kernel_stack_top,
+    BlockReason, ConsoleSessionHandle, FastIpcCallHandoffOutcome, FastIpcReplyHandoffOutcome,
+    IpcDonationTarget, MAX_CONSECUTIVE_SYSTEM_DISPATCHES, MAX_TASK, MIN_LOAD_WEIGHT, NICE_0_LOAD,
+    SCHED_CPU_LOCALITY_LAG_NS, SYSTEM_CLASS_WEIGHT_FLAG, SchedClass, Scheduler, SchedulerDispatch,
+    TaskContext, TaskStart, align_kernel_stack_top,
 };
 use crate::memory::paging::ProcessAddressSpace;
 use crate::multitask::{UserTaskBootstrap, noop_task_entry, process_table};
@@ -277,6 +278,7 @@ pub(super) fn test_user_context(handle: process_table::ProcessHandle) -> TaskCon
         blocked: false,
         blocked_since_ticks: 0,
         wake_armed: false,
+        block_reason: BlockReason::None,
         weight: NICE_0_LOAD,
         vruntime_ns: 0,
         exec_start_ticks: 0,

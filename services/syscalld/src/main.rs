@@ -13,18 +13,18 @@ use rustos_user_abi::syscall::{
     identity_is_exact_sender, CommercialMaxCapabilityLeaseWire,
     CommercialMaxProtocolDescriptorWire, CommercialMaxProtocolRequest,
     CommercialMaxProtocolResponse, LifecycleDrainBrokerArgs, LifecycleEventWire,
-    LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse, Win32SyscallOffloadRequest,
-    Win32SyscallOffloadResponse, COMMERCIAL_MAX_PAGERD_OP_BACKING_OBJECT,
-    COMMERCIAL_MAX_PAGERD_OP_FAULT_RESOLVE, COMMERCIAL_MAX_PAGERD_OP_PAGE_CACHE_POLICY,
-    COMMERCIAL_MAX_PAGERD_OP_WRITEBACK_POLICY, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
-    COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS, COMMERCIAL_MAX_PROTOCOL_PAGERD,
-    COMMERCIAL_MAX_PROTOCOL_SYSCALLD, COMMERCIAL_MAX_SYSCALLD_OP_CLOCK_POLICY,
-    COMMERCIAL_MAX_SYSCALLD_OP_COLD_SYSCALL_OFFLOAD, COMMERCIAL_MAX_SYSCALLD_OP_CREDS_LIMITS,
-    COMMERCIAL_MAX_SYSCALLD_OP_LINUX_POLICY, COMMERCIAL_MAX_SYSCALLD_OP_MM_POLICY,
-    COMMERCIAL_MAX_SYSCALLD_OP_RANDOM_POLICY, COMMERCIAL_MAX_SYSCALLD_OP_WIN32_POLICY,
-    IPC_MAX_INLINE_BYTES, IPC_SERVICE_LINUX_SYSCALLD, IPC_SERVICE_PAGERD,
-    LIFECYCLE_DRAIN_BROKER_ABI_VERSION, LIFECYCLE_DRAIN_MAX_EVENTS, LIFECYCLE_EVENT_EXIT,
-    SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_LINUX_ARCH_PRCTL_POLICY,
+    LinuxSyscallOffloadFastRequest, LinuxSyscallOffloadFastResponse, LinuxSyscallOffloadRequest,
+    LinuxSyscallOffloadResponse, Win32SyscallOffloadRequest, Win32SyscallOffloadResponse,
+    COMMERCIAL_MAX_PAGERD_OP_BACKING_OBJECT, COMMERCIAL_MAX_PAGERD_OP_FAULT_RESOLVE,
+    COMMERCIAL_MAX_PAGERD_OP_PAGE_CACHE_POLICY, COMMERCIAL_MAX_PAGERD_OP_WRITEBACK_POLICY,
+    COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS,
+    COMMERCIAL_MAX_PROTOCOL_PAGERD, COMMERCIAL_MAX_PROTOCOL_SYSCALLD,
+    COMMERCIAL_MAX_SYSCALLD_OP_CLOCK_POLICY, COMMERCIAL_MAX_SYSCALLD_OP_COLD_SYSCALL_OFFLOAD,
+    COMMERCIAL_MAX_SYSCALLD_OP_CREDS_LIMITS, COMMERCIAL_MAX_SYSCALLD_OP_LINUX_POLICY,
+    COMMERCIAL_MAX_SYSCALLD_OP_MM_POLICY, COMMERCIAL_MAX_SYSCALLD_OP_RANDOM_POLICY,
+    COMMERCIAL_MAX_SYSCALLD_OP_WIN32_POLICY, IPC_MAX_INLINE_BYTES, IPC_SERVICE_LINUX_SYSCALLD,
+    IPC_SERVICE_PAGERD, LIFECYCLE_DRAIN_BROKER_ABI_VERSION, LIFECYCLE_DRAIN_MAX_EVENTS,
+    LIFECYCLE_EVENT_EXIT, SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_LINUX_ARCH_PRCTL_POLICY,
     SYSCALL_OFFLOAD_OP_LINUX_BRK, SYSCALL_OFFLOAD_OP_LINUX_GETEGID,
     SYSCALL_OFFLOAD_OP_LINUX_GETEUID, SYSCALL_OFFLOAD_OP_LINUX_GETGID,
     SYSCALL_OFFLOAD_OP_LINUX_GETPGID, SYSCALL_OFFLOAD_OP_LINUX_GETPPID,
@@ -46,7 +46,7 @@ use rustos_user_abi::syscall::{
 };
 use rustos_user_abi::windows::ERROR_INVALID_PARAMETER;
 
-use syscalld::{affinity_policy, errno};
+use syscalld::{affinity_policy, errno, fast_offload};
 mod linux_policy;
 mod mmap_policy;
 mod vma_policy;
@@ -159,6 +159,7 @@ fn drain_lifecycle_events() {
 // from this early policy service's bootstrap allocator.
 #[allow(clippy::large_enum_variant)]
 enum SyscallOffloadReply {
+    LinuxFast(LinuxSyscallOffloadFastResponse),
     Linux(LinuxSyscallOffloadResponse),
     Win32(Win32SyscallOffloadResponse),
     Commercial(CommercialMaxProtocolResponse),
@@ -167,6 +168,9 @@ enum SyscallOffloadReply {
 impl SyscallOffloadReply {
     fn as_ptr(&self) -> *const u8 {
         match self {
+            Self::LinuxFast(response) => {
+                (response as *const LinuxSyscallOffloadFastResponse).cast::<u8>()
+            }
             Self::Linux(response) => (response as *const LinuxSyscallOffloadResponse).cast::<u8>(),
             Self::Win32(response) => (response as *const Win32SyscallOffloadResponse).cast::<u8>(),
             Self::Commercial(response) => {
@@ -177,6 +181,7 @@ impl SyscallOffloadReply {
 
     fn len(&self) -> usize {
         match self {
+            Self::LinuxFast(_) => size_of::<LinuxSyscallOffloadFastResponse>(),
             Self::Linux(_) => size_of::<LinuxSyscallOffloadResponse>(),
             Self::Win32(_) => size_of::<Win32SyscallOffloadResponse>(),
             Self::Commercial(_) => size_of::<CommercialMaxProtocolResponse>(),
@@ -190,6 +195,12 @@ fn handle_request(
     sender_pid: u64,
     sender_tid: u64,
 ) -> SyscallOffloadReply {
+    if received == size_of::<LinuxSyscallOffloadFastRequest>() {
+        let request = read_unaligned::<LinuxSyscallOffloadFastRequest>(bytes);
+        return SyscallOffloadReply::LinuxFast(handle_fast_linux_request(
+            &request, sender_pid, sender_tid,
+        ));
+    }
     if received == size_of::<CommercialMaxProtocolRequest>() {
         let request = read_unaligned::<CommercialMaxProtocolRequest>(bytes);
         let response = handle_commercial_request(&request, sender_pid, sender_tid);
@@ -216,6 +227,34 @@ fn handle_request(
         ..LinuxSyscallOffloadResponse::default()
     };
     SyscallOffloadReply::Linux(response)
+}
+
+fn handle_fast_linux_request(
+    request: &LinuxSyscallOffloadFastRequest,
+    sender_pid: u64,
+    sender_tid: u64,
+) -> LinuxSyscallOffloadFastResponse {
+    let mut fast = LinuxSyscallOffloadFastResponse {
+        version: SYSCALL_OFFLOAD_ABI_VERSION,
+        op: request.op,
+        ..LinuxSyscallOffloadFastResponse::default()
+    };
+    let full_request = match fast_offload::expand_id_request(request, sender_pid, sender_tid) {
+        Ok(request) => request,
+        Err(status) => {
+            fast.status = status;
+            return fast;
+        }
+    };
+    let mut full_response = LinuxSyscallOffloadResponse::default();
+    handle_linux_request(
+        size_of::<LinuxSyscallOffloadRequest>(),
+        &full_request,
+        &mut full_response,
+        sender_pid,
+        sender_tid,
+    );
+    fast_offload::compact_response(request.op, &full_response)
 }
 
 fn handle_commercial_request(
@@ -690,5 +729,42 @@ mod tests {
             validate_request(size_of::<LinuxSyscallOffloadRequest>(), &request),
             Err(errno::EINVAL)
         );
+    }
+
+    #[test]
+    fn compact_id_envelope_is_fixed_frame_bounded_and_sender_exact() {
+        assert!(size_of::<LinuxSyscallOffloadFastRequest>() <= 256);
+        assert!(size_of::<LinuxSyscallOffloadFastResponse>() <= 256);
+        let request = LinuxSyscallOffloadFastRequest {
+            version: SYSCALL_OFFLOAD_ABI_VERSION,
+            op: SYSCALL_OFFLOAD_OP_LINUX_GETUID,
+            pid: 98_001,
+            tid: 98_002,
+            uid: 1_234,
+            gid: 1_235,
+            euid: 1_236,
+            egid: 1_237,
+            ..LinuxSyscallOffloadFastRequest::default()
+        };
+        let response = handle_fast_linux_request(&request, request.pid, request.tid);
+        assert_eq!(response.status, 0);
+        assert_eq!(response.op, request.op);
+        assert_eq!(response.payload_len as usize, size_of::<u32>());
+        assert_eq!(
+            u32::from_le_bytes(response.payload[..4].try_into().expect("uid payload")),
+            request.uid
+        );
+
+        let rejected = handle_fast_linux_request(&request, request.pid, request.tid + 1);
+        assert_eq!(rejected.status, errno::EACCES);
+        let unsupported = handle_fast_linux_request(
+            &LinuxSyscallOffloadFastRequest {
+                op: SYSCALL_OFFLOAD_OP_LINUX_UNAME,
+                ..request
+            },
+            request.pid,
+            request.tid,
+        );
+        assert_eq!(unsupported.status, errno::EINVAL);
     }
 }

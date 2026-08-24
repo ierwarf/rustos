@@ -226,6 +226,18 @@ rg -q 'run_parallel_lane source-conformance' formal/verify-all.sh \
         echo "two-minute formal gate stopped parallelizing independent lanes" >&2
         exit 1
     }
+[[ -x formal/reuse-verification-run.py ]] \
+    && rg -q 'reuse-verification-run.py' formal/verify-all.sh \
+    && rg -q 'source_tree_sha256' formal/reuse-verification-run.py \
+    && rg -Fq 'sha256(path)' formal/reuse-verification-run.py || {
+        echo "exact-tree formal seal reuse lost source or artifact digest validation" >&2
+        exit 1
+    }
+rg -q 'mutation_cache_key' formal/run-implementation-mutations.py \
+    && rg -q 'mutation_cache_key' formal/run-spec-mutations.py || {
+        echo "formal mutation lanes lost package/model-scoped warm evidence reuse" >&2
+        exit 1
+    }
 # The exhaustive TLC set is the one lane whose contract is a wall clock:
 # `tlc_max_wall_seconds` plus a pinned per-model timeout. Those budgets are
 # real seconds, so a model that needs 16 of its 30 starts failing on load

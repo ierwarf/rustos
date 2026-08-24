@@ -75,6 +75,55 @@ const SLOW_IPC_THRESHOLD_MS: u64 = 10;
 const MAX_SLOW_IPC_LOGS_PER_SECOND: usize = 1;
 const EARLY_IPC_SAMPLE_COUNT: usize = 6;
 const SERVICE_IPC_TIMEOUT_MS: u64 = rustos_user_abi::performance::IPC_BULK_DATA_HARD_LIMIT_MS;
+const IPC_FAST_CALL_LIVE: bool = true;
+const IPC_FAST_COUNTER_COUNT: usize = 17;
+static IPC_FAST_COUNTERS: [AtomicU64; IPC_FAST_COUNTER_COUNT] =
+    [const { AtomicU64::new(0) }; IPC_FAST_COUNTER_COUNT];
+
+#[repr(usize)]
+#[derive(Clone, Copy)]
+enum IpcFastCounter {
+    AdmissionAttempt = 0,
+    AdmissionFallback = 1,
+    ReservationPublished = 2,
+    HandoffCommitted = 3,
+    HandoffRejected = 4,
+    ReceiverTaken = 5,
+    ReplyPublished = 6,
+    CallerResponse = 7,
+    CallerTerminalError = 8,
+    CallerDeadline = 9,
+    FusedReplyPublished = 10,
+    Rollback = 11,
+    FallbackShape = 12,
+    FallbackNoFrame = 13,
+    FallbackDeadlineArm = 14,
+    FallbackScheduler = 15,
+    CallerMmRejected = 16,
+}
+
+#[inline]
+fn note_fast_ipc(counter: IpcFastCounter) {
+    IPC_FAST_COUNTERS[counter as usize].fetch_add(1, Ordering::Relaxed);
+}
+
+pub(super) fn drain_fast_ipc_counters() -> usize {
+    let mut emitted = 0;
+    for (reason, counter) in IPC_FAST_COUNTERS.iter().enumerate() {
+        let count = counter.swap(0, Ordering::Relaxed);
+        if count == 0 {
+            continue;
+        }
+        debug::record_milestone(
+            debug::LogCategory::Compat,
+            "ipc-fastpath-counter",
+            reason as u64,
+            count,
+        );
+        emitted += 1;
+    }
+    emitted
+}
 use rustos_user_abi::performance::IPC_RECEIVE_REPORT_MAX_ADDRESS_SPACE_BINDS as MAX_RECEIVE_BINDS;
 // RING3-MIGRATION-REFERENCE START: rootd should own service namespace endpoint
 // ownership and capability leases. Ring0 keeps the temporary service registry
@@ -733,13 +782,15 @@ fn current_process_granted_service_endpoint(service_id: u64) -> Result<Option<u6
     Ok(Some(publication.endpoint))
 }
 
-fn authorize_current_process_ipc_call(endpoint: u64) -> Result<(), i64> {
+fn authorize_current_process_ipc_call(
+    endpoint: u64,
+) -> Result<multitask::RetainedCurrentUserAddressSpace, i64> {
     if endpoint == 0 {
         return Err(LINUX_EINVAL);
     }
-    let Some(process_id) = multitask::current_user_process_id() else {
-        return Err(LINUX_EINVAL);
-    };
+    let retained_mm =
+        usermem::current_user_address_space().map_err(address_space_error_to_linux_errno)?;
+    let process_id = retained_mm.process_id();
     for index in 0..MAX_SERVICE_ENDPOINTS {
         let Some(publication) = stable_published_service_endpoint(index) else {
             continue;
@@ -755,7 +806,7 @@ fn authorize_current_process_ipc_call(endpoint: u64) -> Result<(), i64> {
                 publication.epoch,
             )
         {
-            return Ok(());
+            return Ok(retained_mm);
         }
         let granted = {
             let grants = SERVICE_CALL_GRANTS.lock();
@@ -771,9 +822,11 @@ fn authorize_current_process_ipc_call(endpoint: u64) -> Result<(), i64> {
         }
         SERVICE_LAST_GRANTED_EPOCH[index].store(publication.epoch, Ordering::Relaxed);
         SERVICE_LAST_GRANTED_CALLER[index].store(process_id, Ordering::Release);
-        return Ok(());
+        return Ok(retained_mm);
     }
-    validate_endpoint_publication_owner(endpoint, process_id).map_err(|_| LINUX_EACCES)
+    validate_endpoint_publication_owner(endpoint, process_id)
+        .map_err(|_| LINUX_EACCES)
+        .map(|_| retained_mm)
 }
 
 fn cached_service_call_grant_matches(
@@ -1378,9 +1431,10 @@ fn syscall_linux_rustos_ipc_call_with_timeout(
     reply_capacity: u64,
     timeout_ms: u64,
 ) -> u64 {
-    if let Err(errno) = authorize_current_process_ipc_call(endpoint) {
-        return linux_errno(errno);
-    }
+    let retained_mm = match authorize_current_process_ipc_call(endpoint) {
+        Ok(retained) => retained,
+        Err(errno) => return linux_errno(errno),
+    };
     let endpoint = KernelEndpointHandle::from_raw(endpoint);
     ipc_trace!(
         "ipc call start: endpoint={} request_ptr={:#x} request_len={} reply_ptr={:#x} reply_capacity={}",
@@ -1392,6 +1446,31 @@ fn syscall_linux_rustos_ipc_call_with_timeout(
     );
     let start_ticks = crate::arch::rtc::ticks();
     let mut cycle_mark = phase_mark();
+    // The first live fast-path tranche covers the ordinary synchronous ABI.
+    // Bounded control calls retain the mature slow-path deadline transaction
+    // until the fixed-frame path carries the same pinned-mm/deadline proof;
+    // silently weakening that contract during boot is not an optimization.
+    if IPC_FAST_CALL_LIVE
+        && timeout_ms == SERVICE_IPC_TIMEOUT_MS
+        && let Ok(request_len) = usize::try_from(request_len)
+        && request_len <= kernel_ipc_runtime::api::IPC_FAST_INLINE_BYTES
+    {
+        note_fast_ipc(IpcFastCounter::AdmissionAttempt);
+        match try_fast_ipc_call(
+            endpoint,
+            request_ptr,
+            request_len,
+            reply_ptr,
+            reply_capacity,
+            timeout_ms,
+            &retained_mm,
+        ) {
+            Ok(Some(response_len)) => return response_len as u64,
+            Ok(None) => note_fast_ipc(IpcFastCounter::AdmissionFallback),
+            Err(errno) => return linux_errno(errno),
+        }
+        cycle_mark = phase_mark();
+    }
     let request = match copy_request_from_user(request_ptr, request_len) {
         Ok(request) => request,
         Err(errno) => return linux_errno(errno),
@@ -1459,6 +1538,237 @@ fn syscall_linux_rustos_ipc_call_with_timeout(
     response.len() as u64
 }
 
+fn try_fast_ipc_call(
+    endpoint: KernelEndpointHandle,
+    request_ptr: u64,
+    request_len: usize,
+    reply_ptr: u64,
+    reply_capacity: u64,
+    timeout_ms: u64,
+    retained_mm: &multitask::RetainedCurrentUserAddressSpace,
+) -> Result<Option<usize>, i64> {
+    if request_len > kernel_ipc_runtime::api::IPC_FAST_INLINE_BYTES {
+        note_fast_ipc(IpcFastCounter::FallbackShape);
+        return Ok(None);
+    }
+    let reply_capacity = usize::try_from(reply_capacity).map_err(|_| LINUX_EINVAL)?;
+    if reply_capacity > kernel_ipc_runtime::api::IPC_FAST_INLINE_BYTES {
+        note_fast_ipc(IpcFastCounter::FallbackShape);
+        return Ok(None);
+    }
+    let mut request = [0_u8; kernel_ipc_runtime::api::IPC_FAST_INLINE_BYTES];
+    if let Err(error) = usermem::copy_from_retained_user_and_validate_write(
+        retained_mm,
+        request_ptr,
+        &mut request[..request_len],
+        reply_ptr,
+        reply_capacity,
+    ) {
+        note_fast_ipc(IpcFastCounter::CallerMmRejected);
+        return Err(address_space_error_to_linux_errno(error));
+    }
+    let request = &request[..request_len];
+    let Some(response) = try_fast_ipc_call_bytes(
+        endpoint,
+        retained_mm.process_id(),
+        retained_mm.thread_id(),
+        request,
+        reply_capacity,
+        timeout_ms,
+    )?
+    else {
+        return Ok(None);
+    };
+    if response.len != 0 {
+        usermem::write_retained_user_bytes(retained_mm, reply_ptr, &response.bytes[..response.len])
+            .map_err(address_space_error_to_linux_errno)?;
+    }
+    Ok(Some(response.len))
+}
+
+struct FastCallResponse {
+    len: usize,
+    bytes: [u8; kernel_ipc_runtime::api::IPC_FAST_INLINE_BYTES],
+}
+
+fn try_fast_ipc_call_bytes(
+    endpoint: KernelEndpointHandle,
+    caller_process_id: u64,
+    task_id: u64,
+    request: &[u8],
+    reply_capacity: usize,
+    timeout_ms: u64,
+) -> Result<Option<FastCallResponse>, i64> {
+    if request.len() > kernel_ipc_runtime::api::IPC_FAST_INLINE_BYTES
+        || reply_capacity > kernel_ipc_runtime::api::IPC_FAST_INLINE_BYTES
+    {
+        note_fast_ipc(IpcFastCounter::FallbackShape);
+        return Ok(None);
+    }
+    let deadline_tick = service_reply_deadline_tick_for_endpoint(endpoint, request, timeout_ms);
+    if reply_deadline_expired(deadline_tick) {
+        return Err(LINUX_ETIMEDOUT);
+    }
+    let admission = ipc_call_admission::reserve(task_id)?;
+    let (reply, receiver_task_id) =
+        match kernel_ipc_runtime::api::endpoint::reserve_fast_call_with_response_capacity(
+            endpoint,
+            caller_process_id,
+            task_id,
+            request,
+            reply_capacity,
+            Some(admission.scheduling_context),
+        ) {
+            Ok(reservation) => reservation,
+            Err(kernel_ipc_runtime::api::IpcError::NoMemory) => {
+                let _ = multitask::cancel_ipc_priority_reservation(task_id);
+                note_fast_ipc(IpcFastCounter::FallbackNoFrame);
+                return Ok(None);
+            }
+            Err(error) => {
+                let _ = multitask::cancel_ipc_priority_reservation(task_id);
+                return Err(ipc_error_to_linux_errno(error));
+            }
+        };
+    note_fast_ipc(IpcFastCounter::ReservationPublished);
+
+    if !multitask::arm_block_current_task_on_reply(reply.raw()) {
+        rollback_fast_call(endpoint, reply, task_id, receiver_task_id)?;
+        return Err(LINUX_EINVAL);
+    }
+    if !arm_reply_deadline_waiter(task_id, deadline_tick) {
+        let _ = multitask::cancel_block_current_task();
+        rollback_fast_call(endpoint, reply, task_id, receiver_task_id)?;
+        note_fast_ipc(IpcFastCounter::FallbackDeadlineArm);
+        return Ok(None);
+    }
+    let handoff = multitask::commit_fast_ipc_call_handoff_and_yield(
+        endpoint.raw(),
+        reply.raw(),
+        receiver_task_id,
+    );
+    disarm_reply_deadline_waiter(task_id);
+    if !matches!(
+        handoff,
+        multitask::FastIpcCallHandoffOutcome::CommittedSameCpu
+            | multitask::FastIpcCallHandoffOutcome::CommittedCrossCpu
+    ) {
+        note_fast_ipc(IpcFastCounter::HandoffRejected);
+        note_fast_ipc(IpcFastCounter::FallbackScheduler);
+        let _ = multitask::cancel_block_current_task();
+        rollback_fast_call(endpoint, reply, task_id, receiver_task_id)?;
+        return Ok(None);
+    }
+    note_fast_ipc(IpcFastCounter::HandoffCommitted);
+
+    loop {
+        let response = match kernel_ipc_runtime::api::endpoint::take_fast_response(reply, task_id) {
+            Ok(response) => response,
+            Err(error) => {
+                cancel_reply_wait(reply, task_id, ReplyCancelReason::InvalidCommit);
+                return Err(ipc_error_to_linux_errno(error));
+            }
+        };
+        match response {
+            kernel_ipc_runtime::api::FastEndpointResponseTake::Response {
+                response_len,
+                response,
+            } => {
+                note_fast_ipc(IpcFastCounter::CallerResponse);
+                if response_len > reply_capacity {
+                    return Err(LINUX_EOVERFLOW);
+                }
+                return Ok(Some(FastCallResponse {
+                    len: response_len,
+                    bytes: response,
+                }));
+            }
+            kernel_ipc_runtime::api::FastEndpointResponseTake::Error(error) => {
+                note_fast_ipc(IpcFastCounter::CallerTerminalError);
+                return Err(ipc_error_to_linux_errno(error));
+            }
+            kernel_ipc_runtime::api::FastEndpointResponseTake::Pending => {}
+        }
+        if reply_deadline_expired(deadline_tick) {
+            note_fast_ipc(IpcFastCounter::CallerDeadline);
+            cancel_reply_wait(reply, task_id, ReplyCancelReason::DeadlineAfterArm);
+            return Err(LINUX_ETIMEDOUT);
+        }
+        if !multitask::arm_block_current_task_on_reply(reply.raw()) {
+            cancel_reply_wait(reply, task_id, ReplyCancelReason::InvalidArm);
+            return Err(LINUX_EINVAL);
+        }
+        if !arm_reply_deadline_waiter(task_id, deadline_tick) {
+            let _ = multitask::cancel_block_current_task();
+            multitask::yield_now();
+            continue;
+        }
+        let response = match kernel_ipc_runtime::api::endpoint::take_fast_response(reply, task_id) {
+            Ok(response) => response,
+            Err(error) => {
+                disarm_reply_deadline_waiter(task_id);
+                let _ = multitask::cancel_block_current_task();
+                cancel_reply_wait(reply, task_id, ReplyCancelReason::InvalidCommit);
+                return Err(ipc_error_to_linux_errno(error));
+            }
+        };
+        match response {
+            kernel_ipc_runtime::api::FastEndpointResponseTake::Pending => {}
+            kernel_ipc_runtime::api::FastEndpointResponseTake::Response {
+                response_len,
+                response,
+            } => {
+                note_fast_ipc(IpcFastCounter::CallerResponse);
+                disarm_reply_deadline_waiter(task_id);
+                let _ = multitask::cancel_block_current_task();
+                if response_len > reply_capacity {
+                    return Err(LINUX_EOVERFLOW);
+                }
+                return Ok(Some(FastCallResponse {
+                    len: response_len,
+                    bytes: response,
+                }));
+            }
+            kernel_ipc_runtime::api::FastEndpointResponseTake::Error(error) => {
+                note_fast_ipc(IpcFastCounter::CallerTerminalError);
+                disarm_reply_deadline_waiter(task_id);
+                let _ = multitask::cancel_block_current_task();
+                return Err(ipc_error_to_linux_errno(error));
+            }
+        }
+        let committed = multitask::commit_block_current_task_and_yield();
+        disarm_reply_deadline_waiter(task_id);
+        if committed.is_none() {
+            cancel_reply_wait(reply, task_id, ReplyCancelReason::InvalidCommit);
+            return Err(LINUX_EINVAL);
+        }
+    }
+}
+
+fn rollback_fast_call(
+    endpoint: KernelEndpointHandle,
+    reply: KernelReplyHandle,
+    caller_task_id: u64,
+    receiver_task_id: u64,
+) -> Result<(), i64> {
+    note_fast_ipc(IpcFastCounter::Rollback);
+    let rollback = kernel_ipc_runtime::api::endpoint::rollback_fast_call(
+        endpoint,
+        reply,
+        caller_task_id,
+        receiver_task_id,
+    )
+    .map_err(ipc_error_to_linux_errno)?;
+    if let Some(custody) = rollback.scheduling_context {
+        assert!(
+            multitask::settle_ipc_reply_scheduling_context(reply.raw(), custody),
+            "fast IPC rollback returned stale scheduling-context custody"
+        );
+    }
+    let _ = multitask::cancel_ipc_priority_reservation(caller_task_id);
+    Ok(())
+}
+
 pub(super) fn syscall_linux_rustos_ipc_recv(
     endpoint: u64,
     request_ptr: u64,
@@ -1487,7 +1797,21 @@ pub(super) fn syscall_linux_rustos_ipc_recv(
     let Ok(request_capacity) = usize::try_from(request_capacity) else {
         return linux_errno(LINUX_EINVAL);
     };
+    if let Err(err) = usermem::validate_current_user_write_buffers(&[
+        (request_ptr, request_capacity),
+        (reply_cap_ptr, size_of::<u64>()),
+    ]) {
+        return linux_errno(address_space_error_to_linux_errno(err));
+    }
     loop {
+        match take_fast_endpoint_request(endpoint, task_id) {
+            Ok(Some(received)) => {
+                return write_fast_endpoint_request(received, request_ptr, reply_cap_ptr)
+                    .map_or_else(linux_errno, |received| received as u64);
+            }
+            Ok(None) => {}
+            Err(errno) => return linux_errno(errno),
+        }
         match kernel_ipc_runtime::api::recv_endpoint_with_sender_and_limits(
             endpoint,
             request_capacity,
@@ -1514,18 +1838,21 @@ pub(super) fn syscall_linux_rustos_ipc_recv(
                 return request.len() as u64;
             }
             Ok(None) => {
-                if !multitask::arm_block_current_task() {
+                if !multitask::arm_block_current_task_on_endpoint(endpoint.raw()) {
                     return linux_errno(LINUX_EINVAL);
                 }
-                let pending = match kernel_ipc_runtime::api::add_endpoint_receiver_waiter(
-                    endpoint, task_id,
-                ) {
-                    Ok(pending) => pending,
-                    Err(err) => {
-                        let _ = multitask::cancel_block_current_task();
-                        return linux_errno(ipc_error_to_linux_errno(err));
-                    }
-                };
+                let pending =
+                    match kernel_ipc_runtime::api::add_endpoint_receiver_waiter_with_capacity(
+                        endpoint,
+                        task_id,
+                        request_capacity,
+                    ) {
+                        Ok(pending) => pending,
+                        Err(err) => {
+                            let _ = multitask::cancel_block_current_task();
+                            return linux_errno(ipc_error_to_linux_errno(err));
+                        }
+                    };
                 ipc_trace!(
                     "ipc recv wait armed: endpoint={} task={} pending={}",
                     endpoint.raw(),
@@ -1594,20 +1921,22 @@ pub(super) fn syscall_linux_rustos_ipc_recv_with_sender(
     sender_pid_ptr: u64,
     sender_tid_ptr: u64,
 ) -> u64 {
-    let (endpoint, task_id, _process_id, request_capacity) = match prepare_recv_with_sender(
-        endpoint,
-        request_ptr,
-        request_capacity,
-        reply_cap_ptr,
-        sender_pid_ptr,
-        sender_tid_ptr,
-    ) {
-        Ok(prepared) => prepared,
-        Err(errno) => return linux_errno(errno),
-    };
+    let (endpoint, task_id, _process_id, request_capacity, retained_mm) =
+        match prepare_recv_with_sender(
+            endpoint,
+            request_ptr,
+            request_capacity,
+            reply_cap_ptr,
+            sender_pid_ptr,
+            sender_tid_ptr,
+        ) {
+            Ok(prepared) => prepared,
+            Err(errno) => return linux_errno(errno),
+        };
     match recv_with_sender_blocking_prepared(
         endpoint,
         task_id,
+        &retained_mm,
         request_ptr,
         request_capacity,
         reply_cap_ptr,
@@ -1644,17 +1973,18 @@ pub(super) fn syscall_linux_rustos_ipc_recv_with_sender_bounded(
         Ok(args) => args,
         Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
     };
-    let (endpoint, task_id, _process_id, request_capacity) = match prepare_recv_with_sender(
-        args.endpoint,
-        args.request_ptr,
-        args.request_capacity,
-        args.reply_cap_ptr,
-        args.sender_pid_ptr,
-        args.sender_tid_ptr,
-    ) {
-        Ok(prepared) => prepared,
-        Err(errno) => return linux_errno(errno),
-    };
+    let (endpoint, task_id, _process_id, request_capacity, retained_mm) =
+        match prepare_recv_with_sender(
+            args.endpoint,
+            args.request_ptr,
+            args.request_capacity,
+            args.reply_cap_ptr,
+            args.sender_pid_ptr,
+            args.sender_tid_ptr,
+        ) {
+            Ok(prepared) => prepared,
+            Err(errno) => return linux_errno(errno),
+        };
     let ticks_per_second = crate::arch::rtc::ticks_per_second().max(1);
     // Round the deadline up: a budget shorter than one tick must still buy one
     // tick of waiting, or a caller asking for 1 ms would spin.
@@ -1666,6 +1996,7 @@ pub(super) fn syscall_linux_rustos_ipc_recv_with_sender_bounded(
     match recv_with_sender_blocking_prepared(
         endpoint,
         task_id,
+        &retained_mm,
         args.request_ptr,
         request_capacity,
         args.reply_cap_ptr,
@@ -1685,7 +2016,16 @@ fn prepare_recv_with_sender(
     reply_cap_ptr: u64,
     sender_pid_ptr: u64,
     sender_tid_ptr: u64,
-) -> Result<(KernelEndpointHandle, u64, u64, usize), i64> {
+) -> Result<
+    (
+        KernelEndpointHandle,
+        u64,
+        u64,
+        usize,
+        multitask::RetainedCurrentUserAddressSpace,
+    ),
+    i64,
+> {
     let endpoint = KernelEndpointHandle::from_raw(endpoint);
     let task_id = multitask::current_task_id().ok_or(LINUX_EINVAL)?;
     let process_id = multitask::current_user_process_id().ok_or(LINUX_EINVAL)?;
@@ -1695,20 +2035,26 @@ fn prepare_recv_with_sender(
     if request_capacity > rustos_user_abi::syscall::IPC_MAX_INLINE_BYTES {
         return Err(LINUX_EINVAL);
     }
-    usermem::validate_current_user_write_buffers(&[
-        (request_ptr, request_capacity),
-        (reply_cap_ptr, size_of::<u64>()),
-        (sender_pid_ptr, size_of::<u64>()),
-        (sender_tid_ptr, size_of::<u64>()),
-    ])
+    let retained_mm =
+        usermem::current_user_address_space().map_err(address_space_error_to_linux_errno)?;
+    usermem::validate_retained_user_write_buffers(
+        &retained_mm,
+        &[
+            (request_ptr, request_capacity),
+            (reply_cap_ptr, size_of::<u64>()),
+            (sender_pid_ptr, size_of::<u64>()),
+            (sender_tid_ptr, size_of::<u64>()),
+        ],
+    )
     .map_err(address_space_error_to_linux_errno)?;
-    Ok((endpoint, task_id, process_id, request_capacity))
+    Ok((endpoint, task_id, process_id, request_capacity, retained_mm))
 }
 
 #[allow(clippy::too_many_arguments)]
 fn recv_with_sender_blocking_prepared(
     endpoint: KernelEndpointHandle,
     task_id: u64,
+    retained_mm: &multitask::RetainedCurrentUserAddressSpace,
     request_ptr: u64,
     request_capacity: usize,
     reply_cap_ptr: u64,
@@ -1719,6 +2065,24 @@ fn recv_with_sender_blocking_prepared(
     let mut yielded = false;
     let take_mark = server_phase_mark();
     loop {
+        match take_fast_endpoint_request(endpoint, task_id) {
+            Ok(Some(received)) => {
+                let write_mark = charge_server_phase(IpcServerPhase::RecvTake, take_mark);
+                let result = write_fast_endpoint_request_with_sender(
+                    received,
+                    retained_mm,
+                    request_ptr,
+                    reply_cap_ptr,
+                    sender_pid_ptr,
+                    sender_tid_ptr,
+                )
+                .map_err(|errno| (errno, yielded));
+                let _ = charge_server_phase(IpcServerPhase::RecvWrite, write_mark);
+                return result.map(|received| (received, yielded));
+            }
+            Ok(None) => {}
+            Err(errno) => return Err((errno, yielded)),
+        }
         match kernel_ipc_runtime::api::recv_endpoint_with_sender_and_limits(
             endpoint,
             request_capacity,
@@ -1730,12 +2094,15 @@ fn recv_with_sender_blocking_prepared(
                     multitask::user_log_ids_for_task(caller_task_id).unwrap_or((0, 0));
                 let reply_raw = reply.raw().to_ne_bytes();
                 let (pid, tid) = (sender_pid.to_ne_bytes(), sender_tid.to_ne_bytes());
-                usermem::write_current_user_bytes_batch(&[
-                    (request_ptr, &request),
-                    (reply_cap_ptr, &reply_raw),
-                    (sender_pid_ptr, &pid),
-                    (sender_tid_ptr, &tid),
-                ])
+                usermem::write_retained_user_bytes_batch(
+                    retained_mm,
+                    &[
+                        (request_ptr, &request),
+                        (reply_cap_ptr, &reply_raw),
+                        (sender_pid_ptr, &pid),
+                        (sender_tid_ptr, &tid),
+                    ],
+                )
                 .map_err(|err| (address_space_error_to_linux_errno(err), yielded))?;
                 let _ = charge_server_phase(IpcServerPhase::RecvWrite, write_mark);
                 let _ = multitask::inherit_ipc_priority(reply.raw(), caller_task_id, task_id);
@@ -1749,18 +2116,21 @@ fn recv_with_sender_blocking_prepared(
                 if deadline_tick.is_some_and(|deadline| crate::arch::rtc::ticks() >= deadline) {
                     return Err((LINUX_EAGAIN, yielded));
                 }
-                if !multitask::arm_block_current_task() {
+                if !multitask::arm_block_current_task_on_endpoint(endpoint.raw()) {
                     return Err((LINUX_EINVAL, yielded));
                 }
-                let pending = match kernel_ipc_runtime::api::add_endpoint_receiver_waiter(
-                    endpoint, task_id,
-                ) {
-                    Ok(pending) => pending,
-                    Err(err) => {
-                        let _ = multitask::cancel_block_current_task();
-                        return Err((ipc_error_to_linux_errno(err), yielded));
-                    }
-                };
+                let pending =
+                    match kernel_ipc_runtime::api::add_endpoint_receiver_waiter_with_capacity(
+                        endpoint,
+                        task_id,
+                        request_capacity,
+                    ) {
+                        Ok(pending) => pending,
+                        Err(err) => {
+                            let _ = multitask::cancel_block_current_task();
+                            return Err((ipc_error_to_linux_errno(err), yielded));
+                        }
+                    };
                 if pending {
                     let _ = multitask::cancel_block_current_task();
                     continue;
@@ -1808,6 +2178,19 @@ fn recv_endpoint_once(
         .map_err(ipc_error_to_linux_errno)?;
     let request_capacity = usize::try_from(request_capacity).map_err(|_| LINUX_EINVAL)?;
     let receiver_task_id = multitask::current_task_id().ok_or(LINUX_EINVAL)?;
+    let retained_mm =
+        usermem::current_user_address_space().map_err(address_space_error_to_linux_errno)?;
+    usermem::validate_retained_user_write_buffers(
+        &retained_mm,
+        &[
+            (request_ptr, request_capacity),
+            (reply_cap_ptr, size_of::<u64>()),
+        ],
+    )
+    .map_err(address_space_error_to_linux_errno)?;
+    if let Some(received) = take_fast_endpoint_request(endpoint, receiver_task_id)? {
+        return write_fast_endpoint_request(received, request_ptr, reply_cap_ptr);
+    }
     match kernel_ipc_runtime::api::recv_endpoint_with_sender_and_limits(
         endpoint,
         request_capacity,
@@ -1828,6 +2211,56 @@ fn recv_endpoint_once(
     }
 }
 
+fn take_fast_endpoint_request(
+    endpoint: KernelEndpointHandle,
+    receiver_task_id: u64,
+) -> Result<Option<kernel_ipc_runtime::api::FastEndpointReceived>, i64> {
+    let received = kernel_ipc_runtime::api::endpoint::take_fast_request(endpoint, receiver_task_id)
+        .map_err(ipc_error_to_linux_errno)?;
+    if received.is_some() {
+        note_fast_ipc(IpcFastCounter::ReceiverTaken);
+    }
+    Ok(received)
+}
+
+fn write_fast_endpoint_request(
+    received: kernel_ipc_runtime::api::FastEndpointReceived,
+    request_ptr: u64,
+    reply_cap_ptr: u64,
+) -> Result<usize, i64> {
+    let request = &received.request[..received.request_len];
+    let reply = received.reply.raw().to_ne_bytes();
+    usermem::write_current_user_bytes_batch(&[(request_ptr, request), (reply_cap_ptr, &reply)])
+        .map_err(address_space_error_to_linux_errno)?;
+    Ok(received.request_len)
+}
+
+fn write_fast_endpoint_request_with_sender(
+    received: kernel_ipc_runtime::api::FastEndpointReceived,
+    retained_mm: &multitask::RetainedCurrentUserAddressSpace,
+    request_ptr: u64,
+    reply_cap_ptr: u64,
+    sender_pid_ptr: u64,
+    sender_tid_ptr: u64,
+) -> Result<usize, i64> {
+    let (sender_pid, sender_tid) = (received.caller_process_id, received.caller_task_id);
+    let request = &received.request[..received.request_len];
+    let reply = received.reply.raw().to_ne_bytes();
+    let pid = sender_pid.to_ne_bytes();
+    let tid = sender_tid.to_ne_bytes();
+    usermem::write_retained_user_bytes_batch(
+        retained_mm,
+        &[
+            (request_ptr, request),
+            (reply_cap_ptr, &reply),
+            (sender_pid_ptr, &pid),
+            (sender_tid_ptr, &tid),
+        ],
+    )
+    .map_err(address_space_error_to_linux_errno)?;
+    Ok(received.request_len)
+}
+
 fn recv_endpoint_once_with_sender(
     endpoint: u64,
     request_ptr: u64,
@@ -1843,16 +2276,33 @@ fn recv_endpoint_once_with_sender(
     kernel_ipc_runtime::api::authorize_endpoint_receiver_for_process(endpoint, process_id)
         .map_err(ipc_error_to_linux_errno)?;
     let request_capacity = usize::try_from(request_capacity).map_err(|_| LINUX_EINVAL)?;
+    let receiver_task_id = multitask::current_task_id().ok_or(LINUX_EINVAL)?;
     if request_capacity > rustos_user_abi::syscall::IPC_MAX_INLINE_BYTES {
         return Err(LINUX_EINVAL);
     }
-    usermem::validate_current_user_write_buffers(&[
-        (request_ptr, request_capacity),
-        (reply_cap_ptr, size_of::<u64>()),
-        (sender_pid_ptr, size_of::<u64>()),
-        (sender_tid_ptr, size_of::<u64>()),
-    ])
+    let retained_mm =
+        usermem::current_user_address_space().map_err(address_space_error_to_linux_errno)?;
+    usermem::validate_retained_user_write_buffers(
+        &retained_mm,
+        &[
+            (request_ptr, request_capacity),
+            (reply_cap_ptr, size_of::<u64>()),
+            (sender_pid_ptr, size_of::<u64>()),
+            (sender_tid_ptr, size_of::<u64>()),
+        ],
+    )
     .map_err(address_space_error_to_linux_errno)?;
+
+    if let Some(received) = take_fast_endpoint_request(endpoint, receiver_task_id)? {
+        return write_fast_endpoint_request_with_sender(
+            received,
+            &retained_mm,
+            request_ptr,
+            reply_cap_ptr,
+            sender_pid_ptr,
+            sender_tid_ptr,
+        );
+    }
 
     match kernel_ipc_runtime::api::recv_endpoint_with_sender_and_limits(
         endpoint,
@@ -1871,7 +2321,6 @@ fn recv_endpoint_once_with_sender(
                 (sender_tid_ptr, &tid),
             ])
             .map_err(address_space_error_to_linux_errno)?;
-            let receiver_task_id = multitask::current_task_id().ok_or(LINUX_EINVAL)?;
             let _ = multitask::inherit_ipc_priority(reply.raw(), caller_task_id, receiver_task_id);
             Ok(request.len())
         }
@@ -1887,6 +2336,64 @@ pub(super) fn syscall_linux_rustos_ipc_reply(
 ) -> u64 {
     let start_ticks = crate::arch::rtc::ticks();
     let publish_mark = server_phase_mark();
+    let Some(receiver_task_id) = multitask::current_task_id() else {
+        return linux_errno(LINUX_EINVAL);
+    };
+    if response_len > kernel_ipc_runtime::api::IPC_FAST_INLINE_BYTES as u64 {
+        match kernel_ipc_runtime::api::endpoint::reject_fast_reply_for_task(
+            KernelReplyHandle::from_raw(reply),
+            receiver_task_id,
+            kernel_ipc_runtime::api::IpcError::BufferTooSmall,
+        ) {
+            Ok(published) => {
+                note_fast_ipc(IpcFastCounter::ReplyPublished);
+                let wake_mark = charge_server_phase(IpcServerPhase::ReplyPublish, publish_mark);
+                if multitask::complete_fast_ipc_reply_wake_handoff_with_custody(
+                    reply,
+                    published.completion,
+                ) {
+                    multitask::request_deferred_reschedule();
+                }
+                let _ = charge_server_phase(IpcServerPhase::ReplyWake, wake_mark);
+                return linux_errno(LINUX_EOVERFLOW);
+            }
+            Err(kernel_ipc_runtime::api::IpcError::InvalidHandle) => {}
+            Err(error) => return linux_errno(ipc_error_to_linux_errno(error)),
+        }
+    }
+    if let Ok(response_len) = usize::try_from(response_len)
+        && response_len <= kernel_ipc_runtime::api::IPC_FAST_INLINE_BYTES
+    {
+        let mut response = [0_u8; kernel_ipc_runtime::api::IPC_FAST_INLINE_BYTES];
+        if response_len != 0
+            && let Err(error) =
+                usermem::copy_from_current_user_exact(response_ptr, &mut response[..response_len])
+        {
+            return linux_errno(address_space_error_to_linux_errno(error));
+        }
+        match kernel_ipc_runtime::api::endpoint::complete_fast_reply_for_task(
+            KernelReplyHandle::from_raw(reply),
+            receiver_task_id,
+            &response[..response_len],
+        ) {
+            Ok(published) => {
+                note_fast_ipc(IpcFastCounter::ReplyPublished);
+                let wake_mark = charge_server_phase(IpcServerPhase::ReplyPublish, publish_mark);
+                if multitask::complete_fast_ipc_reply_wake_handoff_with_custody(
+                    reply,
+                    published.completion,
+                ) {
+                    multitask::request_deferred_reschedule();
+                }
+                let _ = charge_server_phase(IpcServerPhase::ReplyWake, wake_mark);
+                return published
+                    .terminal_error
+                    .map_or(0, |error| linux_errno(ipc_error_to_linux_errno(error)));
+            }
+            Err(kernel_ipc_runtime::api::IpcError::InvalidHandle) => {}
+            Err(error) => return linux_errno(ipc_error_to_linux_errno(error)),
+        }
+    }
     let response = match copy_request_from_user(response_ptr, response_len) {
         Ok(response) => response,
         Err(errno) => return linux_errno(errno),
@@ -2099,6 +2606,23 @@ pub(super) fn syscall_linux_rustos_ipc_recv_with_handles(args_ptr: u64) -> u64 {
     }
 
     loop {
+        match take_fast_endpoint_request(endpoint, task_id) {
+            Ok(Some(received)) => {
+                let request = &received.request[..received.request_len];
+                let reply = received.reply.raw().to_ne_bytes();
+                let handle_count = 0_u16.to_ne_bytes();
+                if let Err(err) = usermem::write_current_user_bytes_batch(&[
+                    (args.request_ptr, request),
+                    (args.reply_cap_ptr, &reply),
+                    (args.recv_fd_count_ptr, &handle_count),
+                ]) {
+                    return linux_errno(address_space_error_to_linux_errno(err));
+                }
+                return received.request_len as u64;
+            }
+            Ok(None) => {}
+            Err(errno) => return linux_errno(errno),
+        }
         match kernel_ipc_runtime::api::recv_endpoint_with_sender_and_limits(
             endpoint,
             request_capacity,
@@ -2138,18 +2662,21 @@ pub(super) fn syscall_linux_rustos_ipc_recv_with_handles(args_ptr: u64) -> u64 {
                 return request.len() as u64;
             }
             Ok(None) => {
-                if !multitask::arm_block_current_task() {
+                if !multitask::arm_block_current_task_on_endpoint(endpoint.raw()) {
                     return linux_errno(LINUX_EINVAL);
                 }
-                let pending = match kernel_ipc_runtime::api::add_endpoint_receiver_waiter(
-                    endpoint, task_id,
-                ) {
-                    Ok(pending) => pending,
-                    Err(err) => {
-                        let _ = multitask::cancel_block_current_task();
-                        return linux_errno(ipc_error_to_linux_errno(err));
-                    }
-                };
+                let pending =
+                    match kernel_ipc_runtime::api::add_endpoint_receiver_waiter_with_capacity(
+                        endpoint,
+                        task_id,
+                        request_capacity,
+                    ) {
+                        Ok(pending) => pending,
+                        Err(err) => {
+                            let _ = multitask::cancel_block_current_task();
+                            return linux_errno(ipc_error_to_linux_errno(err));
+                        }
+                    };
                 if pending {
                     let _ = multitask::cancel_block_current_task();
                     continue;
@@ -2228,6 +2755,40 @@ pub(super) fn call_linux_syscall_endpoint(request: &[u8]) -> Result<Vec<u8>, i64
         response.len(),
     );
     Ok(response)
+}
+
+pub(super) fn call_linux_syscall_fast_endpoint(
+    request: &[u8],
+    response_capacity: usize,
+) -> Result<(usize, [u8; kernel_ipc_runtime::api::IPC_FAST_INLINE_BYTES]), i64> {
+    let endpoint = linux_syscall_endpoint().ok_or(LINUX_ENOSYS)?;
+    let (caller_process_id, caller_task_id) =
+        multitask::current_user_log_ids().ok_or(LINUX_EINVAL)?;
+    note_fast_ipc(IpcFastCounter::AdmissionAttempt);
+    if let Some(response) = try_fast_ipc_call_bytes(
+        endpoint,
+        caller_process_id,
+        caller_task_id,
+        request,
+        response_capacity,
+        SERVICE_IPC_TIMEOUT_MS,
+    )? {
+        return Ok((response.len, response.bytes));
+    }
+    note_fast_ipc(IpcFastCounter::AdmissionFallback);
+
+    // The wrapper fallback restarts from the untouched compact request. It
+    // deliberately uses the established bounded endpoint transaction rather
+    // than trying to continue a rolled-back fixed frame.
+    let response = call_linux_syscall_endpoint(request)?;
+    if response.len() > response_capacity
+        || response.len() > kernel_ipc_runtime::api::IPC_FAST_INLINE_BYTES
+    {
+        return Err(LINUX_EOVERFLOW);
+    }
+    let mut bytes = [0_u8; kernel_ipc_runtime::api::IPC_FAST_INLINE_BYTES];
+    bytes[..response.len()].copy_from_slice(response.as_slice());
+    Ok((response.len(), bytes))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

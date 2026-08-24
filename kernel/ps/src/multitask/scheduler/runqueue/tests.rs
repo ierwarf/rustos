@@ -329,6 +329,77 @@ fn direct_handoff_predicate_rejects_running_and_migrating_even_if_runnable() {
 }
 
 #[test]
+fn direct_handoff_bypasses_the_fair_runqueue_and_is_cpu_exact() {
+    let _scope = RunQueueTestScope::new();
+    let slot = 24;
+    let cpu = 3;
+    admit_blocked(slot);
+    assert_eq!(
+        publish_direct_handoff(slot, cpu),
+        RemoteWakeOutcome::Published { cpu, notify: false }
+    );
+    let handed = owner(slot);
+    assert_eq!(handed.state, RunOwnerState::DirectHandoff);
+    assert_eq!(handed.cpu, Some(cpu));
+    assert!(handed.runnable);
+    assert_eq!(published_runnable_count(cpu), 0);
+    assert!(is_handoff_dispatchable(slot));
+    assert!(is_current_cpu_dispatchable(slot, cpu));
+    assert!(!is_current_cpu_dispatchable(slot, cpu + 1));
+    assert!(!is_local_dispatchable(slot, cpu));
+    assert!(!claim_dispatch(slot, cpu + 1, 100));
+    assert!(claim_dispatch(slot, cpu, 100));
+    assert_eq!(owner(slot).state, RunOwnerState::Running);
+    assert_eq!(published_runnable_count(cpu), 0);
+}
+
+#[test]
+fn rejected_direct_ordering_can_restore_exactly_one_local_owner() {
+    let _scope = RunQueueTestScope::new();
+    let slot = 25;
+    let cpu = 2;
+    let weight = 144;
+    admit_blocked(slot);
+    assert!(matches!(
+        publish_direct_handoff(slot, cpu),
+        RemoteWakeOutcome::Published { .. }
+    ));
+    assert!(materialize_direct_handoff(slot, cpu, weight));
+    assert_eq!(owner(slot).state, RunOwnerState::Local);
+    assert_eq!(published_runnable_count(cpu), 1);
+    assert!(!materialize_direct_handoff(slot, cpu, weight));
+    assert!(claim_dispatch(slot, cpu, weight));
+    assert_eq!(published_runnable_count(cpu), 0);
+}
+
+#[test]
+fn rejected_fast_transaction_restores_exact_blocked_owner() {
+    let _scope = RunQueueTestScope::new();
+    let slot = 26;
+    let cpu = 4;
+    admit_blocked(slot);
+    assert!(matches!(
+        publish_direct_handoff(slot, cpu),
+        RemoteWakeOutcome::Published { .. }
+    ));
+    assert!(rollback_direct_handoff(slot, cpu));
+    let restored = owner(slot);
+    assert_eq!(restored.state, RunOwnerState::Blocked);
+    assert_eq!(restored.cpu, None);
+    assert!(!restored.runnable);
+    assert_eq!(published_runnable_count(cpu), 0);
+    assert!(!rollback_direct_handoff(slot, cpu));
+    assert!(matches!(
+        publish_direct_handoff(slot, cpu),
+        RemoteWakeOutcome::Published { .. }
+    ));
+    assert_eq!(
+        publish_direct_handoff(slot, cpu),
+        RemoteWakeOutcome::AlreadyOwned { cpu: Some(cpu) }
+    );
+}
+
+#[test]
 fn wake_runnable_predicate_uses_owner_bit_but_respects_wait_lifecycle() {
     let running = RunOwnerSnapshot::new(RunOwnerState::Running, Some(2), 7);
     let migrating = RunOwnerSnapshot::new(RunOwnerState::Migrating, Some(2), 7);

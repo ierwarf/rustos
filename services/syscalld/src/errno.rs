@@ -7,6 +7,7 @@ pub const ESRCH: i32 = 3;
 pub const ENOMEM: i32 = 12;
 pub const EACCES: i32 = 13;
 pub const EINVAL: i32 = 22;
+pub const EOVERFLOW: i32 = 75;
 pub const ENOSYS: i32 = 38;
 
 /// Linux `RLIMIT_*` resource codes we care about.

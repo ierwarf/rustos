@@ -14,7 +14,8 @@
 //!   `bootstrap-activation-handoff`, and `synchronous-ipc-handoff`.
 
 use super::{
-    CpuDispatchGuard, MAX_ATOMIC_ACTIVATION_HANDOFFS, Scheduler, TaskContext, sync_handoff,
+    CpuDispatchGuard, MAX_ATOMIC_ACTIVATION_HANDOFFS, Scheduler, TaskContext, runqueue,
+    sync_handoff,
 };
 
 impl Scheduler {
@@ -394,6 +395,17 @@ impl Scheduler {
         // pins the `.is_some()` substring literally.
         #[allow(clippy::nonminimal_bool)]
         if !self.pick_hint_candidate_slot(Some(record.slot())).is_some() {
+            // A direct owner has no fair-runqueue entry. A late policy,
+            // budget, or frame rejection must materialize exact local custody
+            // before the one-shot record is consumed.
+            #[cfg(not(test))]
+            if let Some(context) = self.contexts[record.slot()] {
+                let _ = runqueue::materialize_direct_handoff(
+                    record.slot(),
+                    Self::current_dispatch_cpu(),
+                    context.weight,
+                );
+            }
             #[cfg(rustos_scheduler_phase_profile)]
             super::locality::record_sync_handoff_stale(
                 super::locality::SyncHandoffStaleReason::NotCandidate,

@@ -45,7 +45,16 @@ pub use runtime_profile::drain_scheduler_runtime_profile;
 pub(in crate::multitask) use runtime_profile::publish_scheduler_runtime_profile;
 
 pub(in crate::multitask) fn local_dispatch_work_pending(cpu: usize) -> bool {
-    runqueue::local_dispatch_work_pending(cpu)
+    // A direct synchronous handoff deliberately has no fair-runqueue entry.
+    // Its FIFO publication is therefore an independent durable source of
+    // dispatch work and must defeat the periodic continuation fast return.
+    if runqueue::local_dispatch_work_pending(cpu) {
+        return true;
+    }
+    #[cfg(not(test))]
+    return sync_handoff::pending(cpu);
+    #[cfg(test)]
+    false
 }
 
 /// Enqueue the opaque post-reply token only after the scheduler catalog guard
@@ -354,6 +363,10 @@ struct TaskContext {
     /// `commit_block_current_task` observes that a wake raced and refuses to
     /// block. Mirrors Linux's `prepare_to_wait` / `set_current_state` pattern.
     wake_armed: bool,
+    /// Exact condition authorized by the current wait epoch. Endpoint receive
+    /// identity is required before a sender may bypass ordinary wake/runqueue
+    /// publication; every other sleeper remains deliberately generic.
+    block_reason: BlockReason,
     /// CFS-like load weight. Bigger weight -> larger CPU share. Derived from
     /// the task's `weight_micros` / pit_divisor at allocation time.
     weight: u32,
@@ -386,10 +399,36 @@ struct TaskContext {
     windows_thread_state: Option<WindowsThreadRuntimeState>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BlockReason {
+    None,
+    Generic,
+    EndpointReceive(u64),
+    EndpointReply(u64),
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct TaskStart {
     pub(super) entry: fn(u64),
     pub(super) id: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FastIpcCallHandoffOutcome {
+    CommittedSameCpu,
+    CommittedCrossCpu,
+    SenderMismatch,
+    ReceiverMismatch,
+    DonationUnavailable,
+    DirectCustodyUnavailable,
+    OrderingUnavailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum FastIpcReplyHandoffOutcome {
+    Direct,
+    LocalFallback,
+    Rejected,
 }
 
 /// Exact result of one serialized scheduling decision.
@@ -829,7 +868,6 @@ impl Scheduler {
     /// monotonic read plus a counter update. It exists because total hold time
     /// cannot attribute a stall to a segment, and the release gate requires
     /// that attribution rather than an assumption.
-    #[inline]
     /// Charges one dispatch phase, when the dispatch is instrumented.
     ///
     /// Thirteen call sites reach this per dispatch and each one reads the clock
@@ -881,8 +919,10 @@ impl Scheduler {
         if let Some(cpu) = runqueue::owner(slot).cpu {
             return cpu;
         }
-        #[cfg(test)]
-        let _ = slot;
+        let last_cpu = self.slot_last_cpu(slot);
+        if last_cpu != NO_IDLE_CPU {
+            return usize::from(last_cpu);
+        }
         Self::current_dispatch_cpu()
     }
 
@@ -1367,6 +1407,131 @@ impl Scheduler {
         }
     }
 
+    /// Atomically replaces the current sender with one exact receive-blocked
+    /// peer on the same CPU. The fixed IPC frame is already reserved, but no
+    /// receiver may observe it until this transaction succeeds. Every reject
+    /// leaves both scheduler contexts unchanged so the caller can rollback the
+    /// frame and restart through the ordinary endpoint slowpath.
+    pub(super) fn commit_fast_ipc_call_handoff(
+        &mut self,
+        endpoint: u64,
+        reply: u64,
+        receiver_task_id: u64,
+    ) -> FastIpcCallHandoffOutcome {
+        let sender_slot = self.current_task_slot();
+        let sender_matches = !self.retired[sender_slot]
+            && !self.start_suspended[sender_slot]
+            && self.contexts[sender_slot].is_some_and(|context| {
+                !context.blocked
+                    && context.wake_armed
+                    && context.block_reason == BlockReason::EndpointReply(reply)
+            });
+        if endpoint == 0 || reply == 0 || !sender_matches {
+            return FastIpcCallHandoffOutcome::SenderMismatch;
+        }
+        let Some(receiver_slot) = self.find_task_slot(receiver_task_id) else {
+            return FastIpcCallHandoffOutcome::ReceiverMismatch;
+        };
+        if receiver_slot == sender_slot
+            || self.retired[receiver_slot]
+            || self.start_suspended[receiver_slot]
+            || !self.contexts[receiver_slot].is_some_and(|context| {
+                context.blocked
+                    && !context.wake_armed
+                    && context.block_reason == BlockReason::EndpointReceive(endpoint)
+            })
+        {
+            return FastIpcCallHandoffOutcome::ReceiverMismatch;
+        }
+        let current_cpu = Self::current_dispatch_cpu();
+        let target_cpu = self.slot_dispatch_cpu(receiver_slot);
+        #[cfg(not(test))]
+        {
+            if !self.context_is_dispatch_eligible_on_cpu(
+                receiver_slot,
+                self.contexts[receiver_slot].expect("validated fast IPC receiver lost context"),
+                target_cpu,
+            ) {
+                return FastIpcCallHandoffOutcome::DirectCustodyUnavailable;
+            }
+        }
+        let sender_task_id = self.starts[sender_slot]
+            .expect("validated fast IPC sender lost identity")
+            .id;
+        if !self.bind_reserved_ipc_priority(reply, sender_task_id, receiver_task_id) {
+            return FastIpcCallHandoffOutcome::DonationUnavailable;
+        }
+
+        if target_cpu == current_cpu {
+            #[cfg(not(test))]
+            if !matches!(
+                runqueue::publish_direct_handoff(receiver_slot, current_cpu),
+                runqueue::RemoteWakeOutcome::Published { .. }
+            ) {
+                return FastIpcCallHandoffOutcome::DirectCustodyUnavailable;
+            }
+            if !self.enqueue_synchronous_handoff_slot(receiver_slot) {
+                #[cfg(not(test))]
+                assert!(
+                    runqueue::rollback_direct_handoff(receiver_slot, current_cpu),
+                    "fast IPC ordering rejection lost direct receiver custody"
+                );
+                return FastIpcCallHandoffOutcome::OrderingUnavailable;
+            }
+        } else {
+            #[cfg(not(test))]
+            if !matches!(
+                runqueue::publish_remote_wake(
+                    receiver_slot,
+                    target_cpu,
+                    self.contexts[receiver_slot]
+                        .expect("validated fast IPC receiver lost context")
+                        .weight,
+                ),
+                runqueue::RemoteWakeOutcome::Published { .. }
+            ) {
+                return FastIpcCallHandoffOutcome::DirectCustodyUnavailable;
+            }
+            assert!(
+                self.enqueue_synchronous_handoff_slot(receiver_slot),
+                "cross-CPU fast IPC RunTransfer lost bounded ordering custody"
+            );
+            #[cfg(not(test))]
+            super::irq::request_target_reschedule(target_cpu);
+        }
+
+        let receiver = self.contexts[receiver_slot]
+            .as_mut()
+            .expect("validated fast IPC receiver lost context");
+        receiver.blocked = false;
+        receiver.blocked_since_ticks = 0;
+        receiver.block_reason = BlockReason::None;
+        receiver.ready_since_ticks = Self::ready_since_now_ticks();
+        #[cfg(test)]
+        {
+            receiver.test_ready = true;
+        }
+
+        let sender = self.contexts[sender_slot]
+            .as_mut()
+            .expect("validated fast IPC sender lost context");
+        sender.wake_armed = false;
+        sender.blocked = true;
+        sender.blocked_since_ticks = crate::arch::rtc::ticks();
+        sender.ready_since_ticks = 0;
+        #[cfg(test)]
+        {
+            sender.test_ready = false;
+        }
+        #[cfg(not(test))]
+        runqueue::set_runnable(sender_slot, false);
+        if target_cpu == current_cpu {
+            FastIpcCallHandoffOutcome::CommittedSameCpu
+        } else {
+            FastIpcCallHandoffOutcome::CommittedCrossCpu
+        }
+    }
+
     /// Selects a runnable worker for a process-owned endpoint when the sender
     /// enqueues between the server's reply and its next `IPC_RECV`. In that
     /// window the endpoint has no waiter task to return, but an associated
@@ -1552,6 +1717,7 @@ impl Scheduler {
             blocked: false,
             blocked_since_ticks: 0,
             wake_armed: false,
+            block_reason: BlockReason::None,
             weight: Self::weight_from_pit_divisor(main_thread_pit_divisor),
             #[cfg(test)]
             vruntime_ns: 0,
@@ -2359,6 +2525,7 @@ impl Scheduler {
             context.blocked = false;
             context.blocked_since_ticks = 0;
             context.wake_armed = false;
+            context.block_reason = BlockReason::None;
         }
         self.retire_reasons[slot] = Some(reason);
         let terminal_process_id =
@@ -2751,6 +2918,7 @@ impl Scheduler {
                     blocked: false,
                     blocked_since_ticks: 0,
                     wake_armed: false,
+                    block_reason: BlockReason::None,
                     weight: Self::weight_from_pit_divisor(pit_divisor),
                     #[cfg(test)]
                     vruntime_ns,
@@ -2945,6 +3113,7 @@ impl Scheduler {
                         0
                     },
                     wake_armed: false,
+                    block_reason: BlockReason::None,
                     weight: Self::weight_from_pit_divisor(pit_divisor),
                     #[cfg(test)]
                     vruntime_ns,
@@ -3069,6 +3238,7 @@ impl Scheduler {
                     blocked: false,
                     blocked_since_ticks: 0,
                     wake_armed: false,
+                    block_reason: BlockReason::None,
                     weight: Self::weight_from_pit_divisor(pit_divisor),
                     #[cfg(test)]
                     vruntime_ns,
@@ -3162,6 +3332,7 @@ impl Scheduler {
                     blocked: false,
                     blocked_since_ticks: 0,
                     wake_armed: false,
+                    block_reason: BlockReason::None,
                     weight: Self::weight_from_pit_divisor(pit_divisor),
                     #[cfg(test)]
                     vruntime_ns,
@@ -3344,6 +3515,7 @@ impl Scheduler {
             context.blocked = false;
             context.blocked_since_ticks = 0;
             context.wake_armed = false;
+            context.block_reason = BlockReason::None;
         }
     }
 
@@ -4318,9 +4490,9 @@ impl Scheduler {
         match snapshot.state {
             runqueue::RunOwnerState::Dormant => QueueOwner::Dormant,
             runqueue::RunOwnerState::Blocked => QueueOwner::Blocked,
-            runqueue::RunOwnerState::Local | runqueue::RunOwnerState::RemoteQueued => {
-                QueueOwner::Queued(cpu)
-            }
+            runqueue::RunOwnerState::Local
+            | runqueue::RunOwnerState::RemoteQueued
+            | runqueue::RunOwnerState::DirectHandoff => QueueOwner::Queued(cpu),
             runqueue::RunOwnerState::Running => {
                 QueueOwner::Running(cpu.unwrap_or(u8::MAX), snapshot.runnable)
             }
@@ -4842,6 +5014,24 @@ impl Scheduler {
     /// commit returns `false` and the caller stays runnable instead of
     /// sleeping with a lost wakeup.
     pub(super) fn arm_block_current_task(&mut self) -> bool {
+        self.arm_block_current_task_with_reason(BlockReason::Generic)
+    }
+
+    pub(super) fn arm_block_current_task_on_endpoint(&mut self, endpoint: u64) -> bool {
+        if endpoint == 0 {
+            return false;
+        }
+        self.arm_block_current_task_with_reason(BlockReason::EndpointReceive(endpoint))
+    }
+
+    pub(super) fn arm_block_current_task_on_reply(&mut self, reply: u64) -> bool {
+        if reply == 0 {
+            return false;
+        }
+        self.arm_block_current_task_with_reason(BlockReason::EndpointReply(reply))
+    }
+
+    fn arm_block_current_task_with_reason(&mut self, reason: BlockReason) -> bool {
         let slot = self.current_task_slot();
         if slot == ROOT_TASK_SLOT || self.retired[slot] || self.start_suspended[slot] {
             return false;
@@ -4862,6 +5052,7 @@ impl Scheduler {
             context.test_ready = false;
         }
         context.wake_armed = true;
+        context.block_reason = reason;
         true
     }
 
@@ -4885,6 +5076,7 @@ impl Scheduler {
             context.test_ready = false;
         }
         context.wake_armed = false;
+        context.block_reason = BlockReason::None;
         true
     }
 
@@ -4910,6 +5102,7 @@ impl Scheduler {
             {
                 context.test_ready = false;
             }
+            context.block_reason = BlockReason::None;
             return Some(false);
         }
         context.wake_armed = false;
@@ -4961,6 +5154,94 @@ impl Scheduler {
             return None;
         }
         self.reply_wake_handoff(slot, task_id)
+    }
+
+    pub(super) fn complete_fast_ipc_reply_handoff(
+        &mut self,
+        reply: u64,
+        caller_task_id: u64,
+    ) -> FastIpcReplyHandoffOutcome {
+        let Some(caller_slot) = self.find_task_slot(caller_task_id) else {
+            return FastIpcReplyHandoffOutcome::Rejected;
+        };
+        if self.retired[caller_slot]
+            || self.start_suspended[caller_slot]
+            || !self.contexts[caller_slot].is_some_and(|context| {
+                context.blocked
+                    && !context.wake_armed
+                    && context.block_reason == BlockReason::EndpointReply(reply)
+            })
+        {
+            return FastIpcReplyHandoffOutcome::Rejected;
+        }
+        let current_cpu = Self::current_dispatch_cpu();
+        if self.slot_dispatch_cpu(caller_slot) != current_cpu {
+            return FastIpcReplyHandoffOutcome::Rejected;
+        }
+        #[cfg(not(test))]
+        {
+            if !self.context_is_dispatch_eligible(
+                caller_slot,
+                self.contexts[caller_slot].expect("validated fast IPC caller lost context"),
+            ) {
+                return FastIpcReplyHandoffOutcome::Rejected;
+            }
+        }
+        #[cfg(not(test))]
+        if !matches!(
+            runqueue::publish_direct_handoff(caller_slot, current_cpu),
+            runqueue::RemoteWakeOutcome::Published { .. }
+        ) {
+            return FastIpcReplyHandoffOutcome::Rejected;
+        }
+        let direct = self.enqueue_synchronous_handoff_slot(caller_slot);
+        if !direct {
+            #[cfg(not(test))]
+            assert!(
+                runqueue::materialize_direct_handoff(
+                    caller_slot,
+                    current_cpu,
+                    self.contexts[caller_slot]
+                        .expect("validated fast IPC caller lost context")
+                        .weight,
+                ),
+                "fast IPC reply fallback lost caller custody"
+            );
+        }
+        let caller = self.contexts[caller_slot]
+            .as_mut()
+            .expect("validated fast IPC caller lost context");
+        caller.blocked = false;
+        caller.blocked_since_ticks = 0;
+        caller.block_reason = BlockReason::None;
+        caller.ready_since_ticks = Self::ready_since_now_ticks();
+        #[cfg(test)]
+        {
+            caller.test_ready = true;
+        }
+        if direct {
+            FastIpcReplyHandoffOutcome::Direct
+        } else {
+            FastIpcReplyHandoffOutcome::LocalFallback
+        }
+    }
+
+    /// Validates returned scheduling-context custody, releases the reply-owned
+    /// donation, and publishes the reverse fast handoff under one scheduler
+    /// catalog acquisition. The established Scheduler -> DonationLedger order
+    /// is already used by call admission; no reverse acquisition exists.
+    pub(super) fn settle_and_complete_fast_ipc_reply_handoff(
+        &mut self,
+        reply: u64,
+        caller_task_id: u64,
+        context_owner_task_id: u64,
+        scheduling_context: ObjectIdentity,
+    ) -> Option<FastIpcReplyHandoffOutcome> {
+        if !self.scheduling_context_matches(context_owner_task_id, scheduling_context) {
+            return None;
+        }
+        let _ = release_reply_donation(reply);
+        Some(self.complete_fast_ipc_reply_handoff(reply, caller_task_id))
     }
 
     fn reply_wake_handoff(&self, slot: usize, task_id: u64) -> Option<ReplyWakeHandoff> {
@@ -5051,6 +5332,7 @@ impl Scheduler {
                 .expect("current scheduler slot lost its context during wake");
             context.wake_armed = false;
             context.blocked = false;
+            context.block_reason = BlockReason::None;
             context.ready_since_ticks = 0;
             #[cfg(test)]
             {
@@ -5084,6 +5366,7 @@ impl Scheduler {
                 .expect("transitioning scheduler slot lost its context during wake");
             context.wake_armed = false;
             context.blocked = false;
+            context.block_reason = BlockReason::None;
             context.ready_since_ticks = Self::ready_since_now_ticks();
             #[cfg(test)]
             {
@@ -5122,6 +5405,7 @@ impl Scheduler {
             // observes that a wake raced before the caller actually slept.
             context.wake_armed = false;
             context.blocked = false;
+            context.block_reason = BlockReason::None;
             #[cfg(test)]
             {
                 context.test_ready = invalid_reason.is_none() || already_runnable;

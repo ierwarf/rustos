@@ -18,6 +18,7 @@
 use super::*;
 use rustos_user_abi::syscall::{
     CPU_TOPOLOGY_MAX_LOGICAL_CPUS, CPU_TOPOLOGY_OBSERVATION_ABI_VERSION,
+    LinuxSyscallOffloadFastRequest, LinuxSyscallOffloadFastResponse,
 };
 
 pub(crate) fn call_syscalld_raw(request: &[u8]) -> Result<Vec<u8>, i64> {
@@ -211,19 +212,61 @@ fn stamp_affinity_topology(
 }
 
 pub(super) fn syscall_linux_syscalld_id_getter(op: u16) -> u64 {
-    let response = match call_syscalld(new_syscalld_request(op)) {
+    let response = match call_syscalld_fast_id(op) {
         Ok(response) => response,
         Err(errno) => return linux_errno(errno),
     };
-    if let Err(errno) = ensure_syscalld_payload(&response, size_of::<u32>()) {
-        return linux_errno(errno);
-    }
     u32::from_le_bytes([
         response.payload[0],
         response.payload[1],
         response.payload[2],
         response.payload[3],
     ]) as u64
+}
+
+fn call_syscalld_fast_id(op: u16) -> Result<LinuxSyscallOffloadFastResponse, i64> {
+    if !matches!(
+        op,
+        SYSCALL_OFFLOAD_OP_LINUX_GETUID
+            | SYSCALL_OFFLOAD_OP_LINUX_GETGID
+            | SYSCALL_OFFLOAD_OP_LINUX_GETEUID
+            | SYSCALL_OFFLOAD_OP_LINUX_GETEGID
+    ) {
+        return Err(LINUX_EINVAL);
+    }
+    let full = new_syscalld_request(op);
+    let request = LinuxSyscallOffloadFastRequest {
+        version: full.version,
+        op,
+        reserved0: 0,
+        pid: full.pid,
+        tid: full.tid,
+        uid: full.uid,
+        gid: full.gid,
+        euid: full.euid,
+        egid: full.egid,
+    };
+    let (received, bytes) = ipc_ops::call_linux_syscall_fast_endpoint(
+        as_bytes(&request),
+        size_of::<LinuxSyscallOffloadFastResponse>(),
+    )?;
+    if received != size_of::<LinuxSyscallOffloadFastResponse>() {
+        return Err(LINUX_EINVAL);
+    }
+    let response = read_unaligned::<LinuxSyscallOffloadFastResponse>(&bytes[..received]);
+    if response.version != SYSCALL_OFFLOAD_ABI_VERSION
+        || response.op != op
+        || response.reserved0 != 0
+        || response.status != 0
+        || response.payload_len as usize != size_of::<u32>()
+    {
+        return Err(if response.status != 0 {
+            response.status.unsigned_abs() as i64
+        } else {
+            LINUX_EINVAL
+        });
+    }
+    Ok(response)
 }
 
 pub(super) fn syscall_linux_syscalld_setid(op: u16, id: u64) -> u64 {

@@ -1,3 +1,4 @@
+mod fast_call_tests;
 mod receiver_waiter_tests;
 
 use alloc::vec::Vec;

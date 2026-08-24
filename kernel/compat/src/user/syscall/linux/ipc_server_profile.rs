@@ -67,16 +67,20 @@ pub(super) fn charge(phase: IpcServerPhase, since: u64) -> u64 {
 /// window. Returns the number of records emitted so housekeeping can count it
 /// as work.
 pub fn drain_ipc_server_profile() -> usize {
-    PROFILE.drain(
-        crate::arch::rtc::ticks(),
-        crate::arch::rtc::ticks_per_second(),
-    )
+    PROFILE
+        .drain(
+            crate::arch::rtc::ticks(),
+            crate::arch::rtc::ticks_per_second(),
+        )
+        .saturating_add(super::ipc_ops::drain_fast_ipc_counters())
 }
 
 /// See `ipc_profile::force_drain_ipc_call_profile`: the same forced,
 /// window-bypassing drain, for the receiver's four phases.
 pub fn force_drain_ipc_server_profile() -> usize {
-    PROFILE.drain(crate::arch::rtc::ticks(), 0)
+    PROFILE
+        .drain(crate::arch::rtc::ticks(), 0)
+        .saturating_add(super::ipc_ops::drain_fast_ipc_counters())
 }
 
 #[cfg(test)]
