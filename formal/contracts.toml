@@ -124,7 +124,7 @@ reason = "Kernel-derived endpoint lane selection prevents service priority inver
 [[risk_surfaces]]
 path = "kernel/mm/src/memory/address_space.rs"
 severity = "critical"
-flows = ["memory-map", "user-memory-access", "tlb-shootdown-lifecycle", "thread-exit-futex-cleanup"]
+flows = ["memory-map", "user-memory-access", "tlb-shootdown-lifecycle", "thread-exit-futex-cleanup", "process-lifecycle-transaction"]
 reason = "Page-table mutations control isolation, W xor X, cross-CPU translation visibility, and physical-frame ownership."
 
 [[risk_surfaces]]
@@ -148,13 +148,19 @@ reason = "A sealed BSP MTRR/PAT/cache baseline must be restored and exactly read
 [[risk_surfaces]]
 path = "kernel/mm/src/memory/address_space/rollback.rs"
 severity = "critical"
-flows = ["physical-frame-lifecycle", "tlb-shootdown-lifecycle"]
+flows = ["physical-frame-lifecycle", "tlb-shootdown-lifecycle", "process-lifecycle-transaction"]
 reason = "Rollback must revoke every cross-CPU translation before returning private frames or rejected external mappings."
+
+[[risk_surfaces]]
+path = "kernel/mm/src/memory/address_space/owned_frames.rs"
+severity = "critical"
+flows = ["physical-frame-lifecycle", "tlb-shootdown-lifecycle", "process-lifecycle-transaction"]
+reason = "Exact process-frame ownership settlement must remain fail-closed and bounded after rollback, unmap, and address-space retirement."
 
 [[risk_surfaces]]
 path = "kernel/mm/src/memory/phys.rs"
 severity = "critical"
-flows = ["physical-frame-lifecycle"]
+flows = ["physical-frame-lifecycle", "process-lifecycle-transaction"]
 reason = "Frame reservation, allocation, and one-time release determine all physical memory ownership."
 
 [[risk_surfaces]]
@@ -250,7 +256,7 @@ reason = "Pure mmap classification must accept the complete backing contract bef
 [[risk_surfaces]]
 path = "kernel/ps/src/multitask/process_table.rs"
 severity = "critical"
-flows = ["process-address-space-lifecycle", "cross-cpu-task-retirement", "endpoint-lifecycle", "kernel-resource-lifecycle", "exception-retirement"]
+flows = ["process-address-space-lifecycle", "process-lifecycle-transaction", "cross-cpu-task-retirement", "endpoint-lifecycle", "kernel-resource-lifecycle", "exception-retirement"]
 reason = "Process generation, exit, address-space, endpoint lifetime, and per-process task admission share one identity boundary."
 
 [[risk_surfaces]]
@@ -654,7 +660,7 @@ models = [
 
 [[source_mappings]]
 path = "kernel/mm/src/memory/phys.rs"
-models = ["physical-frame-lifecycle/PhysicalFrameLifecycle"]
+models = ["physical-frame-lifecycle/PhysicalFrameLifecycle", "process-lifecycle-transaction/ProcessLifecycleTransaction"]
 
 [[source_mappings]]
 path = "kernel/mm/src/memory/address_space.rs"
@@ -663,6 +669,7 @@ models = [
     "page-table-lifecycle/PageTableLifecycle",
     "page-table-map-transaction/PageTableMapTransaction",
     "process-address-space-lifetime/ProcessAddressSpaceLifetime",
+    "process-lifecycle-transaction/ProcessLifecycleTransaction",
     "robust-futex-owner-death/RobustFutexOwnerDeath",
     "tlb-shootdown-lifecycle/TlbShootdownLifecycle",
 ]
@@ -676,6 +683,14 @@ path = "kernel/mm/src/memory/address_space/rollback.rs"
 models = [
     "page-table-map-transaction/PageTableMapTransaction",
     "physical-frame-lifecycle/PhysicalFrameLifecycle",
+    "tlb-shootdown-lifecycle/TlbShootdownLifecycle",
+]
+
+[[source_mappings]]
+path = "kernel/mm/src/memory/address_space/owned_frames.rs"
+models = [
+    "physical-frame-lifecycle/PhysicalFrameLifecycle",
+    "process-lifecycle-transaction/ProcessLifecycleTransaction",
     "tlb-shootdown-lifecycle/TlbShootdownLifecycle",
 ]
 
@@ -901,6 +916,7 @@ models = [
     "page-table-lifecycle/PageTableLifecycle",
     "physical-frame-lifecycle/PhysicalFrameLifecycle",
     "process-address-space-lifetime/ProcessAddressSpaceLifetime",
+    "process-lifecycle-transaction/ProcessLifecycleTransaction",
 ]
 
 [[source_mappings]]
@@ -1141,6 +1157,7 @@ models = [
     "exec-address-space-transaction/ExecAddressSpaceTransaction",
     "kernel-resource-accounting/KernelResourceAccounting",
     "process-address-space-lifetime/ProcessAddressSpaceLifetime",
+    "process-lifecycle-transaction/ProcessLifecycleTransaction",
     "user-stack-growth/UserStackGrowth",
 ]
 
@@ -1770,6 +1787,7 @@ required_models = [
     "ipc-reply-recv-transaction/IpcReplyRecvTransaction",
     "per-cpu-clockevent-lifecycle/PerCpuClockeventLifecycle",
     "process-address-space-lifetime/ProcessAddressSpaceLifetime",
+    "process-lifecycle-transaction/ProcessLifecycleTransaction",
     "product-boot/ProductBoot",
     "robust-futex-owner-death/RobustFutexOwnerDeath",
     "scheduler-cpu-ownership/SchedulerCpuOwnership",
@@ -1833,6 +1851,7 @@ required_models = [
     "per-cpu-clockevent-lifecycle/PerCpuClockeventLifecycle",
     "syscall-simd-lifecycle/SyscallSimdLifecycle",
     "process-address-space-lifetime/ProcessAddressSpaceLifetime",
+    "process-lifecycle-transaction/ProcessLifecycleTransaction",
     "smp-ring3-qualification/SmpRing3Qualification",
     "smp-release-admission/SmpReleaseAdmission",
     "user-stack-growth/UserStackGrowth",

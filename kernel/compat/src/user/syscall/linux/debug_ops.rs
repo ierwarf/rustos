@@ -150,7 +150,8 @@ pub(super) fn syscall_linux_rustos_product_executable_snapshot_evidence(args_ptr
 pub(super) fn syscall_linux_rustos_phase_profile_drain() -> u64 {
     (super::ipc_profile::force_drain_ipc_call_profile()
         + super::ipc_server_profile::force_drain_ipc_server_profile()
-        + kernel_ps::api::force_drain_user_copy_profile()) as u64
+        + kernel_ps::api::force_drain_user_copy_profile()
+        + crate::memory::phys::drain_frame_batch_profile(crate::arch::rtc::ticks(), 0)) as u64
 }
 
 pub(super) fn linux_errno(errno: i64) -> u64 {

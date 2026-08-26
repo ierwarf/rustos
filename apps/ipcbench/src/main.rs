@@ -6,12 +6,15 @@
 //! - **Lifecycle:** calibrate the TSC, run each probe warm, report, exit.
 //! - **Failure:** a probe that cannot run reports `skip` and the harness
 //!   continues, so one unavailable service cannot void the whole run.
-//! - **Forbidden:** no allocation, formatting, or logging inside a measured
-//!   interval; samples are collected into preallocated storage and only
-//!   formatted after the loop ends.
+//! - **Forbidden:** no incidental formatting or logging inside a measured
+//!   interval; samples are collected into preallocated storage. Lifecycle
+//!   probes deliberately include allocations performed by the operation they
+//!   name (thread creation, fork, exec, and anonymous mapping).
 
 use std::arch::asm;
+use std::ffi::CString;
 use std::mem::size_of;
+use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
@@ -39,6 +42,10 @@ const CLOCK_MONOTONIC: u64 = 1;
 const WARMUP: usize = 2_000;
 const SYSCALL_ITERS: usize = 50_000;
 const IPC_ITERS: usize = 20_000;
+const LIFECYCLE_ITERS: usize = 128;
+const LIFECYCLE_WARMUP: usize = 8;
+const EXEC_REPLACE_ITERS: usize = 32;
+const EXEC_REPLACE_WARMUP: usize = 2;
 
 /// `--isolate-probe` wants every phase-profile sample charged while this
 /// probe runs to belong to it alone. The rest of the session catalog starts
@@ -328,6 +335,24 @@ where
     Some(samples)
 }
 
+/// Variant for probes whose authoritative timestamp is produced by the child
+/// at a lifecycle boundary.  The parent still owns all setup and cleanup, but
+/// recording the child's stamped interval prevents scheduler delay after the
+/// observed transition from being charged as though it occurred before it.
+fn measure_stamped<F>(iters: usize, warmup: usize, mut op: F) -> Option<Vec<u64>>
+where
+    F: FnMut() -> Option<u64>,
+{
+    for _ in 0..warmup {
+        op()?;
+    }
+    let mut samples = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        samples.push(op()?);
+    }
+    Some(samples)
+}
+
 // ------------------------------------------------------------------ probes
 
 /// The cost of the measurement itself. Every other number in the report
@@ -590,6 +615,460 @@ fn probe_syscall_offload(tsc_khz: u64) {
     }
 }
 
+// ------------------------------------------------------- lifecycle / memory
+
+fn child_exited_successfully(status: i32) -> bool {
+    libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
+}
+
+/// Invoke the libc fork contract, including its clone-style child-tid fields.
+/// This keeps the benchmark on the ABI used by ordinary dynamically linked
+/// applications rather than a narrower raw `SYS_fork` special case.
+unsafe fn linux_fork_syscall() -> libc::pid_t {
+    unsafe { libc::fork() }
+}
+
+unsafe fn wait_child(pid: libc::pid_t, status: &mut i32) -> Result<(), i32> {
+    loop {
+        if unsafe { libc::waitpid(pid, status, 0) } == pid {
+            return Ok(());
+        }
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+        if errno != libc::EINTR {
+            return Err(errno);
+        }
+    }
+}
+
+/// One explicit child-to-parent lifecycle result backing. This is deliberately
+/// a memfd rather than anonymous memory: an exec replacement cannot retain an
+/// old mapping, and a positional read/write keeps the acknowledgement tied to
+/// the same published backing across both address-space generations.
+struct LifecycleStampMapping {
+    fd: libc::c_int,
+}
+
+impl LifecycleStampMapping {
+    unsafe fn new() -> Result<Self, i32> {
+        let name =
+            CString::new("ipcbench-lifecycle").expect("fixed lifecycle memfd name contains no NUL");
+        // No MFD_CLOEXEC: the exec replacement child remaps this exact fd.
+        let fd = unsafe { libc::memfd_create(name.as_ptr(), 0) };
+        if fd < 0 {
+            return Err(last_errno());
+        }
+        let length = size_of::<[u64; 2]>();
+        if unsafe { libc::ftruncate(fd, length as libc::off_t) } != 0 {
+            let errno = last_errno();
+            unsafe { libc::close(fd) };
+            return Err(errno);
+        }
+        Ok(Self { fd })
+    }
+
+    fn read(&self) -> Result<(u64, u64), i32> {
+        let mut bytes = [0_u8; size_of::<[u64; 2]>()];
+        let read = unsafe {
+            libc::pread(
+                self.fd,
+                bytes.as_mut_ptr().cast::<libc::c_void>(),
+                bytes.len(),
+                0,
+            )
+        };
+        if read != bytes.len() as isize {
+            return Err(last_errno());
+        }
+        let before = u64::from_le_bytes(bytes[..8].try_into().expect("fixed stamp width"));
+        let after = u64::from_le_bytes(bytes[8..].try_into().expect("fixed stamp width"));
+        Ok((before, after))
+    }
+
+    fn rewind(&self) -> Result<(), i32> {
+        (unsafe { libc::lseek(self.fd, 0, libc::SEEK_SET) } == 0)
+            .then_some(())
+            .ok_or_else(last_errno)
+    }
+}
+
+impl Drop for LifecycleStampMapping {
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(self.fd);
+        }
+    }
+}
+
+fn last_errno() -> i32 {
+    std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+}
+
+unsafe fn write_lifecycle_stamp(fd: libc::c_int, before: u64, after: u64) -> Result<(), i32> {
+    let mut bytes = [0_u8; size_of::<[u64; 2]>()];
+    bytes[..8].copy_from_slice(&before.to_le_bytes());
+    bytes[8..].copy_from_slice(&after.to_le_bytes());
+    // RustOS publishes regular `write` for local memfd descriptions; the
+    // parent reads position-independently through `pread64`, so the child's
+    // inherited description offset cannot alter the observation boundary.
+    let written = unsafe { libc::write(fd, bytes.as_ptr().cast::<libc::c_void>(), bytes.len()) };
+    (written == bytes.len() as isize)
+        .then_some(())
+        .ok_or_else(last_errno)
+}
+
+/// Measures the complete published Linux lifecycle rather than a private
+/// kernel helper: procd authorizes fork, the child retires, wait observes the
+/// exact exit status, and the process becomes eligible for the kernel reaper.
+fn probe_fork_exit_wait(tsc_khz: u64) {
+    let mut failure_errno = 0;
+    let mut failure_stage = "unknown";
+    let mut completed = 0_usize;
+    let result = measure(LIFECYCLE_ITERS, LIFECYCLE_WARMUP, || unsafe {
+        let pid = linux_fork_syscall();
+        if pid == 0 {
+            libc::_exit(0);
+        }
+        if pid < 0 {
+            failure_stage = "fork";
+            failure_errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+            return false;
+        }
+        let mut status = 0;
+        if let Err(errno) = wait_child(pid, &mut status) {
+            failure_stage = "wait";
+            failure_errno = errno;
+            return false;
+        }
+        if !child_exited_successfully(status) {
+            failure_stage = "child-status";
+            failure_errno = -2;
+            return false;
+        }
+        completed += 1;
+        true
+    });
+    match result {
+        Some(mut samples) => report("fork_exit_wait", &summarize(&mut samples), tsc_khz),
+        None => skip(
+            "fork_exit_wait",
+            &format!("{failure_stage}-failed-errno-{failure_errno}-after-{completed}"),
+        ),
+    }
+}
+
+/// Includes loaderd/vfsd/procd policy and the kernel's staged exec ownership
+/// transfer. The child mode exits before reading the benchmark probe contract,
+/// preventing recursive benchmark execution after replacement.
+fn probe_fork_exec_exit_wait(tsc_khz: u64) {
+    let path = CString::new("apps/ipcbench/ipcbench.elf").expect("fixed exec path");
+    let child_arg = CString::new("--lifecycle-child").expect("fixed child argument");
+    let argv = [path.as_ptr(), child_arg.as_ptr(), ptr::null()];
+    let envp = [ptr::null()];
+    let mut failure_stage = "unknown";
+    let mut failure_detail = 0;
+    let mut completed = 0_usize;
+    let result = measure(32, 2, || unsafe {
+        let pid = linux_fork_syscall();
+        if pid == 0 {
+            libc::execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr());
+            let errno = std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(127);
+            libc::_exit(errno.clamp(1, 125));
+        }
+        if pid < 0 {
+            failure_stage = "fork";
+            failure_detail = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+            return false;
+        }
+        let mut status = 0;
+        if let Err(errno) = wait_child(pid, &mut status) {
+            failure_stage = "wait";
+            failure_detail = errno;
+            return false;
+        }
+        if !child_exited_successfully(status) {
+            failure_stage = "child-status";
+            failure_detail = status;
+            return false;
+        }
+        completed += 1;
+        true
+    });
+    match result {
+        Some(mut samples) => report("fork_exec_exit_wait", &summarize(&mut samples), tsc_khz),
+        None => skip(
+            "fork_exec_exit_wait",
+            &format!("{failure_stage}-{failure_detail}-after-{completed}"),
+        ),
+    }
+}
+
+fn probe_thread_clone_exit_join(tsc_khz: u64) {
+    let mut completed = 0_usize;
+    let mut failure = "unknown";
+    let result = measure(64, 4, || {
+        let handle = match thread::Builder::new().spawn(|| 0_u64) {
+            Ok(handle) => handle,
+            Err(_) => {
+                failure = "spawn";
+                return false;
+            }
+        };
+        if handle.join().is_err() {
+            failure = "join";
+            return false;
+        }
+        completed += 1;
+        true
+    });
+    match result {
+        Some(mut samples) => report("thread_clone_exit_join", &summarize(&mut samples), tsc_khz),
+        None => skip(
+            "thread_clone_exit_join",
+            &format!("{failure}-failed-after-{completed}"),
+        ),
+    }
+}
+
+/// Measures from the parent publishing a fork request until the child has
+/// executed its first ordinary user instruction and acknowledged it through a
+/// shared memfd. The final wait keeps every iteration self-contained, but is
+/// intentionally outside the reported child-first-turn interval.
+fn probe_spawn_activation_to_first_turn(tsc_khz: u64) {
+    let mapping = match unsafe { LifecycleStampMapping::new() } {
+        Ok(mapping) => mapping,
+        Err(errno) => {
+            skip(
+                "spawn_activation_to_first_turn",
+                &format!("memfd-errno-{errno}"),
+            );
+            return;
+        }
+    };
+    let mut failure = "unknown";
+    let result = measure_stamped(LIFECYCLE_ITERS, LIFECYCLE_WARMUP, || unsafe {
+        if mapping.rewind().is_err() {
+            failure = "rewind-stamp";
+            return None;
+        }
+        let start = tsc();
+        let pid = linux_fork_syscall();
+        if pid == 0 {
+            let after = tsc();
+            let status = write_lifecycle_stamp(mapping.fd, 0, after)
+                .map(|_| 0)
+                .unwrap_or(125);
+            libc::_exit(status);
+        }
+        if pid < 0 {
+            failure = "fork";
+            return None;
+        }
+        let mut status = 0;
+        if let Err(_) = wait_child(pid, &mut status) {
+            failure = "wait";
+            return None;
+        }
+        let (_, after) = match mapping.read() {
+            Ok(stamp) => stamp,
+            Err(_) => {
+                failure = "read-stamp";
+                return None;
+            }
+        };
+        if !child_exited_successfully(status) || after < start {
+            failure = "child-status-or-tsc-order";
+            return None;
+        }
+        Some(after - start)
+    });
+    match result {
+        Some(mut samples) => report(
+            "spawn_activation_to_first_turn",
+            &summarize(&mut samples),
+            tsc_khz,
+        ),
+        None => skip(
+            "spawn_activation_to_first_turn",
+            &format!("{failure}-failed"),
+        ),
+    }
+}
+
+/// Measures the published child terminal path from the child's final user
+/// instruction through exit retirement, wait status publication, and the
+/// parent-triggered reap opportunity.  No private reaper syscall is used.
+fn probe_exit_retire_to_reap(tsc_khz: u64) {
+    let mapping = match unsafe { LifecycleStampMapping::new() } {
+        Ok(mapping) => mapping,
+        Err(errno) => {
+            skip("exit_retire_to_reap", &format!("memfd-errno-{errno}"));
+            return;
+        }
+    };
+    let mut failure = "unknown";
+    let result = measure_stamped(LIFECYCLE_ITERS, LIFECYCLE_WARMUP, || unsafe {
+        if mapping.rewind().is_err() {
+            failure = "rewind-stamp";
+            return None;
+        }
+        let pid = linux_fork_syscall();
+        if pid == 0 {
+            let exit_started = tsc();
+            let status = write_lifecycle_stamp(mapping.fd, 0, exit_started)
+                .map(|_| 0)
+                .unwrap_or(125);
+            libc::_exit(status);
+        }
+        if pid < 0 {
+            failure = "fork";
+            return None;
+        }
+        let mut status = 0;
+        if let Err(_) = wait_child(pid, &mut status) {
+            failure = "wait";
+            return None;
+        }
+        let reaped_at = tsc();
+        let (_, exit_started) = match mapping.read() {
+            Ok(stamp) => stamp,
+            Err(_) => {
+                failure = "read-stamp";
+                return None;
+            }
+        };
+        if !child_exited_successfully(status) || exit_started == 0 || reaped_at < exit_started {
+            failure = "child-status-or-tsc-order";
+            return None;
+        }
+        Some(reaped_at - exit_started)
+    });
+    match result {
+        Some(mut samples) => report("exit_retire_to_reap", &summarize(&mut samples), tsc_khz),
+        None => skip("exit_retire_to_reap", &format!("{failure}-failed")),
+    }
+}
+
+/// A separate exec probe from `fork_exec_exit_wait`: the latter measures the
+/// complete child lifecycle, while this one timestamps exactly the pre-exec
+/// handoff and first instruction of the replacement image. The replacement
+/// writes the inherited pre-created memfd only after it has entered the new
+/// address space, so its acknowledgement cannot come from the pre-exec image.
+fn probe_exec_replace_single_thread(tsc_khz: u64) {
+    let mapping = match unsafe { LifecycleStampMapping::new() } {
+        Ok(mapping) => mapping,
+        Err(errno) => {
+            skip(
+                "exec_replace_single_thread",
+                &format!("memfd-errno-{errno}"),
+            );
+            return;
+        }
+    };
+    let path = CString::new("apps/ipcbench/ipcbench.elf").expect("fixed exec path");
+    let child_mode = CString::new("--exec-replace-child").expect("fixed child mode");
+    let envp = [ptr::null()];
+    let mut failure = "unknown";
+    let result = measure_stamped(EXEC_REPLACE_ITERS, EXEC_REPLACE_WARMUP, || unsafe {
+        if mapping.rewind().is_err() {
+            failure = "rewind-stamp";
+            return None;
+        }
+        let pid = linux_fork_syscall();
+        if pid == 0 {
+            let before = tsc();
+            let fd = CString::new(mapping.fd.to_string()).expect("fd decimal has no NUL");
+            let before_arg = CString::new(before.to_string()).expect("tsc decimal has no NUL");
+            let argv = [
+                path.as_ptr(),
+                child_mode.as_ptr(),
+                fd.as_ptr(),
+                before_arg.as_ptr(),
+                ptr::null(),
+            ];
+            libc::execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr());
+            libc::_exit(last_errno().clamp(1, 125));
+        }
+        if pid < 0 {
+            failure = "fork";
+            return None;
+        }
+        let mut status = 0;
+        if let Err(_) = wait_child(pid, &mut status) {
+            failure = "wait";
+            return None;
+        }
+        let (before, after) = match mapping.read() {
+            Ok(stamp) => stamp,
+            Err(_) => {
+                failure = "read-stamp";
+                return None;
+            }
+        };
+        if !child_exited_successfully(status) || before == 0 || after < before {
+            failure = "child-status-or-tsc-order";
+            return None;
+        }
+        Some(after - before)
+    });
+    match result {
+        Some(mut samples) => report(
+            "exec_replace_single_thread",
+            &summarize(&mut samples),
+            tsc_khz,
+        ),
+        None => skip("exec_replace_single_thread", &format!("{failure}-failed")),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum MappingTouch {
+    None,
+    Read,
+    Write,
+}
+
+fn measure_anonymous_mapping(
+    name: &str,
+    pages: usize,
+    touch: MappingTouch,
+    iters: usize,
+    tsc_khz: u64,
+) {
+    let Some(len) = pages.checked_mul(4096) else {
+        skip(name, "mapping-length-overflow");
+        return;
+    };
+    let result = measure(iters, 8, || unsafe {
+        let mapping = libc::mmap(
+            ptr::null_mut(),
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        );
+        if mapping == libc::MAP_FAILED {
+            return false;
+        }
+        match touch {
+            MappingTouch::None => {}
+            MappingTouch::Read => {
+                ptr::read_volatile(mapping.cast::<u8>());
+            }
+            MappingTouch::Write => {
+                ptr::write_volatile(mapping.cast::<u8>(), 0xa5);
+            }
+        }
+        libc::munmap(mapping, len) == 0
+    });
+    match result {
+        Some(mut samples) => report(name, &summarize(&mut samples), tsc_khz),
+        None => skip(name, "mmap-touch-or-munmap-failed"),
+    }
+}
+
 // ------------------------------------------------------------ probe filter
 
 /// Every `ipc-call-phase-*`/`usermem-phase-*` counter this harness's probes
@@ -651,6 +1130,25 @@ fn run_single_probe(name: &str, tsc_khz: u64) {
         "ipc_try_recv_empty" => probe_ipc_mechanism_only(tsc_khz),
         "ipc_rt_intra_process" => probe_ipc_intra_process(tsc_khz),
         "ipc_rt_cross_process_syscalld_getuid" => probe_syscall_offload(tsc_khz),
+        "fork_exit_wait" => probe_fork_exit_wait(tsc_khz),
+        "fork_exec_exit_wait" => probe_fork_exec_exit_wait(tsc_khz),
+        "thread_clone_exit_join" => probe_thread_clone_exit_join(tsc_khz),
+        "exec_replace_single_thread" => probe_exec_replace_single_thread(tsc_khz),
+        "spawn_activation_to_first_turn" => probe_spawn_activation_to_first_turn(tsc_khz),
+        "exit_retire_to_reap" => probe_exit_retire_to_reap(tsc_khz),
+        "anon_mmap_reserve" => {
+            measure_anonymous_mapping(name, 1, MappingTouch::None, 2_000, tsc_khz)
+        }
+        "anon_first_read_fault" => {
+            measure_anonymous_mapping(name, 1, MappingTouch::Read, 2_000, tsc_khz)
+        }
+        "anon_first_write_fault" | "mmap_unmap_1" => {
+            measure_anonymous_mapping(name, 1, MappingTouch::Write, 2_000, tsc_khz)
+        }
+        "mmap_unmap_64" => measure_anonymous_mapping(name, 64, MappingTouch::Write, 256, tsc_khz),
+        "mmap_unmap_1024_pages" => {
+            measure_anonymous_mapping(name, 1024, MappingTouch::Write, 32, tsc_khz)
+        }
         "ipc_nested_passive_server" => {
             scheduling_context_probe::probe_nested_passive_server(tsc_khz)
         }
@@ -659,6 +1157,17 @@ fn run_single_probe(name: &str, tsc_khz: u64) {
         }
         other => skip(other, "unrecognized-probe-filter"),
     }
+}
+
+/// Keep the hardware-only CPUID anchor in every isolated report. It performs
+/// no RustOS syscall and therefore cannot contaminate kernel phase or frame
+/// counters, while making a same-session target-only A-B-A comparison capable
+/// of rejecting host clock drift instead of trusting equal-looking TSC rates.
+fn run_isolated_probe(name: &str, tsc_khz: u64) {
+    if name != "vmexit_cpuid" {
+        probe_vmexit_cpuid(tsc_khz);
+    }
+    run_single_probe(name, tsc_khz);
 }
 
 #[cfg(test)]
@@ -708,7 +1217,38 @@ mod probe_filter_tests {
     }
 }
 
+fn run_exec_replace_child(fd_arg: &str, before_arg: &str) -> ! {
+    let fd = match fd_arg.parse::<libc::c_int>() {
+        Ok(fd) if fd >= 0 => fd,
+        _ => unsafe { libc::_exit(126) },
+    };
+    let before = match before_arg.parse::<u64>() {
+        Ok(before) if before != 0 => before,
+        _ => unsafe { libc::_exit(126) },
+    };
+    let after = tsc();
+    let status = unsafe { write_lifecycle_stamp(fd, before, after) }
+        .map(|_| 0)
+        .unwrap_or(126);
+    unsafe {
+        libc::close(fd);
+        libc::_exit(status);
+    }
+}
+
 fn main() {
+    let mut args = std::env::args();
+    let _program = args.next();
+    match args.next().as_deref() {
+        Some("--lifecycle-child") => return,
+        Some("--exec-replace-child") => {
+            let (Some(fd), Some(before)) = (args.next(), args.next()) else {
+                std::process::exit(126);
+            };
+            run_exec_replace_child(&fd, &before);
+        }
+        _ => {}
+    }
     debug_line("ipcbench: begin");
 
     let filter = probe_filter();
@@ -737,7 +1277,7 @@ fn main() {
 
     match filter {
         Some(name) => {
-            run_single_probe(&name, tsc_khz);
+            run_isolated_probe(&name, tsc_khz);
             // Flush the probe's own tail charges before the log capture can
             // see "end": the ordinary once-per-second drain cadence is not
             // synchronized to a probe's own finish time, so whatever

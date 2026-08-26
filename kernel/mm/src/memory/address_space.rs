@@ -27,7 +27,12 @@ use x86_64::structures::paging::{PageTable, PageTableFlags};
 use kernel_hal::api::arch::tlb::{AddressSpaceMutationGuard, begin_address_space_mutation};
 
 mod atomic_user;
+mod owned_frames;
 mod rollback;
+use owned_frames::{
+    FRAME_BATCH_CHUNK, free_frame_buffer_tail, free_owned_frames_exact, free_owned_frames_logged,
+    free_owned_frames_silently, free_rollback_frames_exact, remove_owned_frame, track_owned_frame,
+};
 use rollback::{rollback_external_user_pages, rollback_user_pages};
 
 use crate::memory::{kernel_vm, phys};
@@ -35,10 +40,6 @@ use crate::memory::{kernel_vm, phys};
 const ENTRIES_PER_TABLE: usize = 512;
 const PAGE_4KIB: usize = 4096;
 const PAGE_4KIB_U64: u64 = PAGE_4KIB as u64;
-/// Frames per `phys::alloc_frames_batch`/`try_free_frames_batch` chunk,
-/// matching the housekeeping-quantum convention already used for shared
-/// IPC region reclaim (`service_deferred_shared_region_reclaims`).
-const FRAME_BATCH_CHUNK: usize = 64;
 const USER_PML4_INDEX: usize = 1;
 pub const USER_SPACE_BASE: u64 = (USER_PML4_INDEX as u64) << 39;
 pub const USER_SPACE_END_EXCLUSIVE: u64 = ((USER_PML4_INDEX + 1) as u64) << 39;
@@ -79,6 +80,47 @@ pub struct ProcessAddressSpace {
     next_user_addr: u64,
     owned_frames: Vec<u64>,
     regions: Vec<UserRegion>,
+}
+
+/// Proof that one exact user range was admitted for reading against this
+/// address-space snapshot.  Keeping the proof tied to `&ProcessAddressSpace`
+/// lets a caller copy without walking the same page tables a second time.
+#[must_use]
+pub struct ValidatedUserRead<'a> {
+    address_space: &'a ProcessAddressSpace,
+    start: VirtAddr,
+    byte_len: usize,
+}
+
+impl ValidatedUserRead<'_> {
+    pub fn copy_into(self, dest: &mut [u8]) -> Result<(), AddressSpaceError> {
+        assert_eq!(
+            dest.len(),
+            self.byte_len,
+            "validated user-read proof used with a different byte length"
+        );
+        self.address_space.read_user_bytes(self.start, dest)
+    }
+}
+
+/// Proof that one exact user range was admitted for writing against this
+/// address-space snapshot.
+#[must_use]
+pub struct ValidatedUserWrite<'a> {
+    address_space: &'a ProcessAddressSpace,
+    start: VirtAddr,
+    byte_len: usize,
+}
+
+impl ValidatedUserWrite<'_> {
+    pub fn copy_from(self, data: &[u8]) -> Result<(), AddressSpaceError> {
+        assert_eq!(
+            data.len(),
+            self.byte_len,
+            "validated user-write proof used with a different byte length"
+        );
+        self.address_space.write_user_bytes(self.start, data)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -424,10 +466,10 @@ impl ProcessAddressSpace {
         }
         let _flushed_mutation = mutation.flush_for_reclaim();
 
-        for frame_phys in frames {
+        for &frame_phys in &frames {
             remove_owned_frame(&mut self.owned_frames, frame_phys)?;
-            phys::free_frame(PhysAddr::new(frame_phys));
         }
+        free_owned_frames_exact(&frames);
 
         self.regions = updated_regions;
         Ok(page_count)
@@ -632,7 +674,20 @@ impl ProcessAddressSpace {
         start: VirtAddr,
         byte_len: usize,
     ) -> Result<(), AddressSpaceError> {
-        self.validate_user_buffer_access(start, byte_len, UserBufferAccess::Write)
+        self.validate_user_write(start, byte_len).map(drop)
+    }
+
+    pub fn validate_user_write(
+        &self,
+        start: VirtAddr,
+        byte_len: usize,
+    ) -> Result<ValidatedUserWrite<'_>, AddressSpaceError> {
+        self.validate_user_buffer_access(start, byte_len, UserBufferAccess::Write)?;
+        Ok(ValidatedUserWrite {
+            address_space: self,
+            start,
+            byte_len,
+        })
     }
 
     pub fn validate_user_read_buffer(
@@ -640,7 +695,20 @@ impl ProcessAddressSpace {
         start: VirtAddr,
         byte_len: usize,
     ) -> Result<(), AddressSpaceError> {
-        self.validate_user_buffer_access(start, byte_len, UserBufferAccess::Read)
+        self.validate_user_read(start, byte_len).map(drop)
+    }
+
+    pub fn validate_user_read(
+        &self,
+        start: VirtAddr,
+        byte_len: usize,
+    ) -> Result<ValidatedUserRead<'_>, AddressSpaceError> {
+        self.validate_user_buffer_access(start, byte_len, UserBufferAccess::Read)?;
+        Ok(ValidatedUserRead {
+            address_space: self,
+            start,
+            byte_len,
+        })
     }
 
     pub fn initialize_user_bytes(
@@ -1048,110 +1116,6 @@ impl Drop for ProcessAddressSpace {
         // borrowed leaf frames which their backing objects must release.
         free_owned_frames_logged(self.pml4_frame_phys, recorded_frames.into_iter());
     }
-}
-
-/// Frees a process's owned frames under `PHYS_ALLOCATOR` in chunks instead of
-/// one lock acquisition per frame, discarding every failure — the synthetic
-/// address spaces this backs have no privileged root to attribute a log line
-/// to, matching the loop this replaced.
-fn free_owned_frames_silently(frames: impl Iterator<Item = u64>) {
-    let mut batch = [PhysAddr::new(0); FRAME_BATCH_CHUNK];
-    let mut failures = [(PhysAddr::new(0), phys::FreeFrameError::AlreadyFree); FRAME_BATCH_CHUNK];
-    let mut batch_len = 0;
-    for frame_phys in frames {
-        if frame_phys == 0 || frame_phys % PAGE_4KIB_U64 != 0 {
-            continue;
-        }
-        batch[batch_len] = PhysAddr::new(frame_phys);
-        batch_len += 1;
-        if batch_len == FRAME_BATCH_CHUNK {
-            phys::try_free_frames_batch(&batch[..batch_len], &mut failures);
-            batch_len = 0;
-        }
-    }
-    if batch_len != 0 {
-        phys::try_free_frames_batch(&batch[..batch_len], &mut failures);
-    }
-}
-
-/// Frees a process's owned frames under `PHYS_ALLOCATOR` in chunks, logging
-/// every skipped or rejected frame exactly as the per-frame loop this
-/// replaced did — the logging happens after each chunk's lock is released,
-/// never while it is held.
-fn free_owned_frames_logged(pml4_frame_phys: u64, frames: impl Iterator<Item = u64>) {
-    let mut batch = [PhysAddr::new(0); FRAME_BATCH_CHUNK];
-    let mut failures = [(PhysAddr::new(0), phys::FreeFrameError::AlreadyFree); FRAME_BATCH_CHUNK];
-    let mut batch_len = 0;
-    for frame_phys in frames {
-        if frame_phys == 0 || frame_phys % PAGE_4KIB_U64 != 0 {
-            crate::debug::println!(
-                "process address space: skipping invalid owned frame root={:#x} frame={:#x}",
-                pml4_frame_phys,
-                frame_phys,
-            );
-            continue;
-        }
-        batch[batch_len] = PhysAddr::new(frame_phys);
-        batch_len += 1;
-        if batch_len == FRAME_BATCH_CHUNK {
-            let failed = phys::try_free_frames_batch(&batch[..batch_len], &mut failures);
-            for &(failed_phys, err) in &failures[..failed.min(failures.len())] {
-                crate::debug::println!(
-                    "process address space: frame cleanup rejected root={:#x} frame={:#x} err={:?}",
-                    pml4_frame_phys,
-                    failed_phys.as_u64(),
-                    err,
-                );
-            }
-            batch_len = 0;
-        }
-    }
-    if batch_len != 0 {
-        let failed = phys::try_free_frames_batch(&batch[..batch_len], &mut failures);
-        for &(failed_phys, err) in &failures[..failed.min(failures.len())] {
-            crate::debug::println!(
-                "process address space: frame cleanup rejected root={:#x} frame={:#x} err={:?}",
-                pml4_frame_phys,
-                failed_phys.as_u64(),
-                err,
-            );
-        }
-    }
-}
-
-/// Returns unused frames from a batch-allocation buffer to the allocator on
-/// an error path — `mapped_pages`/`rollback_user_pages` only knows about
-/// frames already committed to a page-table entry, not ones sitting in the
-/// buffer ahead of where the loop stopped.
-fn free_frame_buffer_tail(frames: &[PhysAddr]) {
-    for &frame in frames {
-        phys::free_frame(frame);
-    }
-}
-
-fn remove_owned_frame(
-    owned_frames: &mut Vec<u64>,
-    frame_phys: u64,
-) -> Result<(), AddressSpaceError> {
-    let Some(position) = owned_frames.iter().position(|owned| *owned == frame_phys) else {
-        return Err(AddressSpaceError::NotMapped);
-    };
-    owned_frames.swap_remove(position);
-    Ok(())
-}
-
-fn track_owned_frame(
-    owned_frames: &mut Vec<u64>,
-    frame_phys: u64,
-) -> Result<(), AddressSpaceError> {
-    if frame_phys == 0 || !frame_phys.is_multiple_of(PAGE_4KIB_U64) {
-        return Err(AddressSpaceError::InvalidFrameOwnership);
-    }
-    if owned_frames.contains(&frame_phys) {
-        return Err(AddressSpaceError::InvalidFrameOwnership);
-    }
-    owned_frames.push(frame_phys);
-    Ok(())
 }
 
 fn ensure_next_table(

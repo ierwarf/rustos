@@ -361,6 +361,19 @@ fn state_for_cpu(cpu: usize) -> &'static SyncHandoffLock {
 static SYNC_HANDOFF_PENDING: [core::sync::atomic::AtomicBool; MAX_TRACKED_CPUS] =
     [const { core::sync::atomic::AtomicBool::new(false) }; MAX_TRACKED_CPUS];
 
+/// Per-CPU fairness streak for the production dispatcher.
+///
+/// Only that CPU's interrupt-disabled scheduler transaction reads or writes
+/// its element. Keeping the scalar outside `SyncHandoffState` avoids taking
+/// the FIFO lock a second time after every selection merely to update one
+/// byte; atomics also make reset publication explicit without weakening the
+/// bounded eight-turn rule.
+// ORDERING: One interrupt-disabled scheduler transaction owns each CPU-local
+// streak. Relaxed accesses preserve the local bound; reset release only
+// publishes the cleared diagnostic/scheduling state to a later owner.
+static SYNC_HANDOFF_STREAK: [core::sync::atomic::AtomicU8; MAX_TRACKED_CPUS] =
+    [const { core::sync::atomic::AtomicU8::new(0) }; MAX_TRACKED_CPUS];
+
 /// Enqueue into one target FIFO and advertise it to that CPU's dispatcher.
 fn enqueue_and_publish(target_cpu: usize, record: SyncHandoffRecord) -> bool {
     let retained = state_for_cpu(target_cpu).lock().enqueue(record);
@@ -439,7 +452,19 @@ pub(super) fn take_next_ready(
     cpu: usize,
     ready: impl FnMut(SyncHandoffRecord) -> bool,
 ) -> Option<usize> {
+    if SYNC_HANDOFF_STREAK[cpu].load(core::sync::atomic::Ordering::Relaxed)
+        >= MAX_CONSECUTIVE_SYNC_HANDOFFS
+    {
+        #[cfg(rustos_scheduler_phase_profile)]
+        super::locality::record_sync_handoff_miss(
+            super::locality::SyncHandoffMissReason::StreakCapped,
+        );
+        return None;
+    }
     let mut state = state_for_cpu(cpu).lock();
+    // The production fairness owner is `SYNC_HANDOFF_STREAK`; the field in
+    // `SyncHandoffState` is the identical isolated host-fixture state machine.
+    debug_assert_eq!(state.handoff_streak, 0);
     let taken = state.take_next_ready(ready);
     // Clear only on a queue this CPU has just seen empty under the lock. A
     // capped handoff streak returns None with records still queued, and
@@ -457,9 +482,16 @@ pub(super) fn take_next_ready(
 
 #[cfg(not(test))]
 pub(super) fn record_dispatch(cpu: usize, synchronous_handoff: bool) {
-    state_for_cpu(cpu)
-        .lock()
-        .record_dispatch(synchronous_handoff);
+    let streak = &SYNC_HANDOFF_STREAK[cpu];
+    let next = if synchronous_handoff {
+        streak
+            .load(core::sync::atomic::Ordering::Relaxed)
+            .saturating_add(1)
+            .min(MAX_CONSECUTIVE_SYNC_HANDOFFS)
+    } else {
+        0
+    };
+    streak.store(next, core::sync::atomic::Ordering::Relaxed);
 }
 
 #[cfg(not(test))]
@@ -471,8 +503,12 @@ pub(super) fn remove_slot_all_cpus(slot: usize) {
 
 #[cfg(not(test))]
 pub(super) fn reset_all_cpus() {
-    for state in &SYNC_HANDOFFS {
+    for (cpu, state) in SYNC_HANDOFFS.iter().enumerate() {
         *state.lock() = SyncHandoffState::new();
+        // ORDERING: Reset publishes the cleared CPU-local streak after the
+        // protected FIFO state is empty; subsequent relaxed local accesses
+        // cannot revive a pre-reset fairness debt.
+        SYNC_HANDOFF_STREAK[cpu].store(0, core::sync::atomic::Ordering::Release);
     }
 }
 

@@ -820,6 +820,101 @@ mod tests {
         });
     }
 
+    /// Mirrors cancellation after exit has latched a separate transaction.
+    /// Cancellation consumes that pending token once and publishes it as the
+    /// active exit transaction; a concurrent duplicate exit cannot mint or
+    /// promote another identity.
+    #[test]
+    fn exec_cancel_promotes_pending_exit_transaction_once() {
+        loom::model(|| {
+            struct State {
+                exec_reserved: bool,
+                exit_pending: bool,
+                pending_exit_transaction: Option<usize>,
+                active_transaction: usize,
+                exiting: bool,
+                promotions: usize,
+            }
+            let state = Arc::new(Mutex::new(State {
+                exec_reserved: true,
+                exit_pending: true,
+                pending_exit_transaction: Some(2),
+                active_transaction: 1,
+                exiting: false,
+                promotions: 0,
+            }));
+
+            let cancel_state = Arc::clone(&state);
+            let cancel = thread::spawn(move || {
+                let mut state = cancel_state.lock().unwrap();
+                assert!(state.exec_reserved);
+                state.exec_reserved = false;
+                if state.exit_pending {
+                    state.exit_pending = false;
+                    state.active_transaction = state
+                        .pending_exit_transaction
+                        .take()
+                        .expect("pending exit lost transaction identity");
+                    state.exiting = true;
+                    state.promotions += 1;
+                }
+            });
+
+            let duplicate_state = Arc::clone(&state);
+            let duplicate_exit = thread::spawn(move || {
+                let state = duplicate_state.lock().unwrap();
+                assert!(state.exit_pending || state.exiting);
+            });
+
+            cancel.join().unwrap();
+            duplicate_exit.join().unwrap();
+            let state = state.lock().unwrap();
+            assert!(state.exiting);
+            assert!(!state.exit_pending);
+            assert!(state.pending_exit_transaction.is_none());
+            assert_eq!(state.active_transaction, 2);
+            assert_eq!(state.promotions, 1);
+        });
+    }
+
+    /// Mirrors rollback's remove -> shootdown acknowledgement -> batched free
+    /// publication. Any observer that sees a returned frame must also see the
+    /// stale leaf removed and the exact shootdown acknowledged.
+    #[test]
+    fn map_rollback_batches_only_after_shootdown() {
+        loom::model(|| {
+            let leaf_published = Arc::new(AtomicBool::new(true));
+            let shootdown_acked = Arc::new(AtomicBool::new(false));
+            let frame_freed = Arc::new(AtomicBool::new(false));
+
+            let rollback_leaf = Arc::clone(&leaf_published);
+            let rollback_ack = Arc::clone(&shootdown_acked);
+            let rollback_free = Arc::clone(&frame_freed);
+            let rollback = thread::spawn(move || {
+                rollback_leaf.store(false, Ordering::Release);
+                rollback_ack.store(true, Ordering::Release);
+                assert!(rollback_ack.load(Ordering::Acquire));
+                rollback_free.store(true, Ordering::Release);
+            });
+
+            let observe_leaf = Arc::clone(&leaf_published);
+            let observe_ack = Arc::clone(&shootdown_acked);
+            let observe_free = Arc::clone(&frame_freed);
+            let observer = thread::spawn(move || {
+                if observe_free.load(Ordering::Acquire) {
+                    assert!(observe_ack.load(Ordering::Acquire));
+                    assert!(!observe_leaf.load(Ordering::Acquire));
+                }
+            });
+
+            rollback.join().unwrap();
+            observer.join().unwrap();
+            assert!(shootdown_acked.load(Ordering::Acquire));
+            assert!(frame_freed.load(Ordering::Acquire));
+            assert!(!leaf_published.load(Ordering::Acquire));
+        });
+    }
+
     /// Mirrors kernel-generated robust-list and clear-child wakes. Userspace
     /// flags are unavailable at exit, so a stable shared identity is tried
     /// first and the exact private identity remains the anonymous fallback.

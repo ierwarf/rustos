@@ -1,13 +1,12 @@
-use x86_64::VirtAddr;
 use x86_64::instructions::interrupts;
 
 use kernel_hal::api::cpu;
 
 use super::{
-    MAIN_THREAD_SLICE_MICROS, NEXT_TASK_ID, SchedulingContextAdmission, SpawnTaskError,
-    UserTaskBootstrap, allocate_task_id, checked_thread_pit_divisor, initial_task_rflags,
-    kernel_task_entry_trampoline_addr, noop_task_entry, publish_cpu_current_task,
-    publish_scheduler_initialized, scheduler_mut,
+    MAIN_THREAD_SLICE_MICROS, NEXT_TASK_ID, SchedulingContextAdmission, SpawnReservation,
+    SpawnTaskError, UserTaskBootstrap, allocate_task_id, cancel_process_spawn,
+    checked_thread_pit_divisor, initial_task_rflags, kernel_task_entry_trampoline_addr,
+    noop_task_entry, publish_cpu_current_task, publish_scheduler_initialized, scheduler_mut,
 };
 use crate::memory::paging::ProcessAddressSpace;
 use crate::user::process_state::UserProcessState;
@@ -17,6 +16,7 @@ pub fn spawn_user_process_with_scheduling_context(
     bootstrap: UserTaskBootstrap,
     weight_micros: u64,
     admission: SchedulingContextAdmission,
+    spawn_reservation: SpawnReservation,
 ) -> Result<u64, SpawnTaskError> {
     spawn_user_process_inner(
         address_space,
@@ -26,6 +26,7 @@ pub fn spawn_user_process_with_scheduling_context(
         true,
         false,
         Some(admission),
+        spawn_reservation,
     )
 }
 
@@ -34,6 +35,7 @@ pub fn spawn_user_process_without_deferred_reschedule_with_scheduling_context(
     bootstrap: UserTaskBootstrap,
     weight_micros: u64,
     admission: SchedulingContextAdmission,
+    spawn_reservation: SpawnReservation,
 ) -> Result<u64, SpawnTaskError> {
     spawn_user_process_inner(
         address_space,
@@ -43,6 +45,7 @@ pub fn spawn_user_process_without_deferred_reschedule_with_scheduling_context(
         false,
         false,
         Some(admission),
+        spawn_reservation,
     )
 }
 
@@ -51,6 +54,7 @@ pub fn spawn_user_process_suspended_with_scheduling_context(
     bootstrap: UserTaskBootstrap,
     weight_micros: u64,
     admission: SchedulingContextAdmission,
+    spawn_reservation: SpawnReservation,
 ) -> Result<u64, SpawnTaskError> {
     spawn_user_process_inner(
         address_space,
@@ -60,6 +64,7 @@ pub fn spawn_user_process_suspended_with_scheduling_context(
         false,
         true,
         Some(admission),
+        spawn_reservation,
     )
 }
 
@@ -71,13 +76,20 @@ fn spawn_user_process_inner(
     defer_reschedule: bool,
     start_suspended: bool,
     scheduling_context: Option<SchedulingContextAdmission>,
+    spawn_reservation: SpawnReservation,
 ) -> Result<u64, SpawnTaskError> {
     let (id, pit_divisor) =
-        prepare_user_spawn(weight_micros, process_spawn_faulted(), allocate_task_id)?;
+        match prepare_user_spawn(weight_micros, process_spawn_faulted(), allocate_task_id) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let _ = cancel_process_spawn(spawn_reservation);
+                return Err(error);
+            }
+        };
     let user_cs = crate::arch::gdt::user_code_selector().0 as u64;
     let user_ss = crate::arch::gdt::user_data_selector().0 as u64;
     let rflags = initial_task_rflags().bits();
-    let (spawned_from_user, slot) = interrupts::without_interrupts(|| unsafe {
+    let allocation = interrupts::without_interrupts(|| unsafe {
         let mut scheduler = scheduler_mut();
         let current_is_user = scheduler.current_task_is_user_task();
         let slot = scheduler
@@ -93,10 +105,18 @@ fn spawn_user_process_inner(
                 start_suspended,
                 noop_task_entry,
                 scheduling_context,
+                spawn_reservation,
             )
             .ok_or(SpawnTaskError::NoFreeTaskSlot)?;
         Ok((current_is_user, slot))
-    })?;
+    });
+    let (spawned_from_user, slot) = match allocation {
+        Ok(allocation) => allocation,
+        Err(error) => {
+            let _ = cancel_process_spawn(spawn_reservation);
+            return Err(error);
+        }
+    };
     crate::debug::record_milestone(
         crate::debug::LogCategory::Sched,
         "spawn-user-process",
@@ -143,18 +163,46 @@ fn prepare_user_spawn(
     Ok((id, pit_divisor))
 }
 
-pub fn spawn_user_process_state_with_parent(
+/// Publish one already-reserved process birth after its fallible address-space
+/// transaction has completed. The reservation was acquired before cloning or
+/// mapping and is cancelled on every scheduler/admission failure here.
+pub fn spawn_user_process_state_suspended_with_parent_reservation(
     process_state: UserProcessState,
     bootstrap: UserTaskBootstrap,
     parent_process_id: Option<u64>,
     weight_micros: u64,
+    reservation: SpawnReservation,
+) -> Result<u64, SpawnTaskError> {
+    spawn_user_process_state_inner(
+        process_state,
+        bootstrap,
+        parent_process_id,
+        weight_micros,
+        true,
+        reservation,
+    )
+}
+
+fn spawn_user_process_state_inner(
+    process_state: UserProcessState,
+    bootstrap: UserTaskBootstrap,
+    parent_process_id: Option<u64>,
+    weight_micros: u64,
+    start_suspended: bool,
+    spawn_reservation: SpawnReservation,
 ) -> Result<u64, SpawnTaskError> {
     let (id, pit_divisor) =
-        prepare_user_spawn(weight_micros, process_spawn_faulted(), allocate_task_id)?;
+        match prepare_user_spawn(weight_micros, process_spawn_faulted(), allocate_task_id) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let _ = cancel_process_spawn(spawn_reservation);
+                return Err(error);
+            }
+        };
     let user_cs = crate::arch::gdt::user_code_selector().0 as u64;
     let user_ss = crate::arch::gdt::user_data_selector().0 as u64;
     let rflags = initial_task_rflags().bits();
-    let (spawned_from_user, slot) = interrupts::without_interrupts(|| unsafe {
+    let allocation = interrupts::without_interrupts(|| unsafe {
         let mut scheduler = scheduler_mut();
         let current_is_user = scheduler.current_task_is_user_task();
         let slot = scheduler
@@ -167,11 +215,20 @@ pub fn spawn_user_process_state_with_parent(
                 user_cs,
                 user_ss,
                 rflags,
+                start_suspended,
                 noop_task_entry,
+                spawn_reservation,
             )
             .ok_or(SpawnTaskError::NoFreeTaskSlot)?;
         Ok((current_is_user, slot))
-    })?;
+    });
+    let (spawned_from_user, slot) = match allocation {
+        Ok(allocation) => allocation,
+        Err(error) => {
+            let _ = cancel_process_spawn(spawn_reservation);
+            return Err(error);
+        }
+    };
     crate::debug::record_milestone(
         crate::debug::LogCategory::Sched,
         "spawn-user-process-state",
@@ -179,39 +236,9 @@ pub fn spawn_user_process_state_with_parent(
         spawn_milestone_arg(slot, spawned_from_user, weight_micros),
     );
 
-    if spawned_from_user {
+    if spawned_from_user && !start_suspended {
         super::request_deferred_reschedule();
     }
-
-    Ok(id)
-}
-
-pub fn spawn_kernel_process(
-    process_state: UserProcessState,
-    entry: VirtAddr,
-    arg0: u64,
-    weight_micros: u64,
-) -> Result<u64, SpawnTaskError> {
-    let pit_divisor = checked_thread_pit_divisor(weight_micros)?;
-    let id = allocate_task_id().ok_or(SpawnTaskError::NoFreeTaskSlot)?;
-    let kernel_cs = crate::arch::gdt::kernel_code_selector().0 as u64;
-    let kernel_ss = crate::arch::gdt::kernel_data_selector().0 as u64;
-    let rflags = initial_task_rflags().bits();
-
-    interrupts::without_interrupts(|| unsafe {
-        scheduler_mut()
-            .allocate_kernel_process_slot(
-                id,
-                process_state,
-                entry,
-                arg0,
-                pit_divisor,
-                kernel_cs,
-                kernel_ss,
-                rflags,
-            )
-            .ok_or(SpawnTaskError::NoFreeTaskSlot)
-    })?;
 
     Ok(id)
 }
@@ -446,5 +473,25 @@ mod tests {
             Err(SpawnTaskError::InvalidWeightMicros)
         );
         assert!(!allocator_called.get());
+    }
+
+    #[test]
+    fn process_state_spawn_has_no_unreserved_production_alias() {
+        let spawn_source = include_str!("spawn.rs")
+            .split_once("#[cfg(test)]")
+            .expect("spawn tests remain below production")
+            .0;
+        let scheduler_source = include_str!("scheduler.rs");
+        assert!(!spawn_source.contains("spawn_user_process_state_with_parent("));
+        assert!(!spawn_source.contains("spawn_user_process_state_suspended_with_parent("));
+        assert!(!spawn_source.contains("spawn_reservation: Option<SpawnReservation>"));
+        assert!(
+            !scheduler_source
+                .contains("spawn_reservation: Option<process_table::SpawnReservation>")
+        );
+        assert!(scheduler_source.contains(
+            "process_table::publish_spawn(\n                    spawn_reservation,\n                    id,\n                    parent_process_id,\n                    process_state,"
+        ));
+        assert!(!scheduler_source.contains("process_table::create_process_with_parent("));
     }
 }

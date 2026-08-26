@@ -2,20 +2,20 @@
 # Formal Contract Registry
 
 - Schema: `3`
-- Registry SHA-256: `a76196dff411009391dd47b7aeac0cf183a055520b7d93686c6ef7d798febe31`
-- Models: `130`
-- Whole flows: `69`
-- Transitions: `716`
+- Registry SHA-256: `0933407952a0c252fd8d0c7e1a5cd84d9e152653d2244015906aa54cb3df68d4`
+- Models: `131`
+- Whole flows: `70`
+- Transitions: `726`
 - Product runtime scenarios: `3`
-- Exact source witnesses: `608`
+- Exact source witnesses: `619`
 - Apalache pilots: `3`
 - TLAPS theorem models: `2`
 - Runtime-traced models: `7`
 - Intentional-terminal exceptions: `92` (ceiling `92`)
-- Cyclic strongly connected components: `44`
-- Supporting model bindings: `102`
-- Explicit critical/high risk surfaces: `100`
-- Additional source mappings: `177`
+- Cyclic strongly connected components: `45`
+- Supporting model bindings: `103`
+- Explicit critical/high risk surfaces: `101`
+- Additional source mappings: `178`
 
 | Flow | Severity | Owners | Models | Requirements | Hazards | Sinks |
 | --- | --- | --- | --- | ---: | ---: | --- |
@@ -64,6 +64,7 @@
 | `post-init-bootstrap-barrier` | `critical` | initd | post-init-bootstrap-barrier/PostInitBootstrapBarrier | 5 | 5 | barrier-failed, consumer-started |
 | `post-init-service-authority` | `critical` | kernel-compat, loaderd, rootd | post-init-leases/PostInitLeases | 6 | 6 | denied, revoked |
 | `process-address-space-lifecycle` | `critical` | kernel-ps | exec-address-space-transaction/ExecAddressSpaceTransaction, process-address-space-lifetime/ProcessAddressSpaceLifetime | 15 | 15 | live, reclaimed, rejected |
+| `process-lifecycle-transaction` | `critical` | kernel-mm, kernel-ps | process-lifecycle-transaction/ProcessLifecycleTransaction | 10 | 10 | dead, rejected, rolled-back |
 | `process-signal-lifecycle` | `critical` | kernel-compat, kernel-executive, kernel-ps, procd | process-signal-delivery/ProcessSignalDelivery, sigchld-notification/SigchldNotification | 15 | 15 | delivered, frame-installed, lifecycle-committed, process-terminated, rejected, reported, runtime-preserved |
 | `remote-file-map` | `critical` | kernel-compat, vfsd | remote-file-mapping/RemoteFileMapping | 9 | 9 | aborted, mapped |
 | `root-authority` | `critical` | kernel-compat, kernel-ipc-runtime, rootd | root-authority-publication/RootAuthorityPublication | 6 | 6 | denied, service-published |

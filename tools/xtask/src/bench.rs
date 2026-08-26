@@ -20,6 +20,12 @@ use crate::Result;
 use crate::config::Config;
 use crate::kvm;
 
+mod lifecycle;
+use lifecycle::{
+    LifecycleTotal, lifecycle_trace_holds, parse_lifecycle_milestone, render_lifecycle,
+    required_lifecycle_stages,
+};
+
 const END_MARKER: &str = "ipcbench: end";
 const RESULT_PREFIX: &str = "ipcbench: result ";
 const SKIP_PREFIX: &str = "ipcbench: skip ";
@@ -74,6 +80,28 @@ const PHASE_PREFIXES: [&str; 5] = [
     "syscall-phase-",
 ];
 
+const COUNTER_PREFIXES: [&str; 1] = ["frame-batch-"];
+
+const IPC_FAST_COUNTER_NAMES: [&str; 17] = [
+    "ipc-fast-admission-attempt",
+    "ipc-fast-admission-fallback",
+    "ipc-fast-reservation-published",
+    "ipc-fast-handoff-committed",
+    "ipc-fast-handoff-rejected",
+    "ipc-fast-receiver-taken",
+    "ipc-fast-reply-published",
+    "ipc-fast-caller-response",
+    "ipc-fast-caller-terminal-error",
+    "ipc-fast-caller-deadline",
+    "ipc-fast-fused-reply-published",
+    "ipc-fast-rollback",
+    "ipc-fast-fallback-shape",
+    "ipc-fast-fallback-no-waiting-receiver",
+    "ipc-fast-fallback-deadline-arm",
+    "ipc-fast-fallback-scheduler",
+    "ipc-fast-caller-mm-rejected",
+];
+
 /// One parsed probe result. Cycle counts are the primary record: they survive
 /// a host frequency change, while the nanosecond columns do not.
 struct BenchResult {
@@ -96,6 +124,12 @@ struct PhaseTotal {
     name: String,
     cycles: u128,
     samples: u128,
+}
+
+struct CounterTotal {
+    name: String,
+    units: u128,
+    operations: u128,
 }
 
 impl PhaseTotal {
@@ -121,12 +155,35 @@ fn hex_field(line: &str, key: &str) -> Option<u64> {
     })
 }
 
+fn milestone_name(line: &str) -> Option<&str> {
+    line.split_whitespace()
+        .find_map(|token| token.strip_prefix("name="))
+}
+
 /// Extracts one phase-profile milestone, if this line carries one.
 fn parse_phase_milestone(line: &str) -> Option<(String, u64, u64)> {
-    let name = line
-        .split_whitespace()
-        .find_map(|token| token.strip_prefix("name="))?;
+    let name = milestone_name(line)?;
     if !PHASE_PREFIXES.iter().any(|prefix| name.starts_with(prefix)) {
+        return None;
+    }
+    Some((
+        name.to_owned(),
+        hex_field(line, "arg0=")?,
+        hex_field(line, "arg1=")?,
+    ))
+}
+
+fn parse_counter_milestone(line: &str) -> Option<(String, u64, u64)> {
+    let name = milestone_name(line)?;
+    if name == "ipc-fastpath-counter" {
+        let reason = usize::try_from(hex_field(line, "arg0=")?).ok()?;
+        let count = hex_field(line, "arg1=")?;
+        return Some((IPC_FAST_COUNTER_NAMES.get(reason)?.to_string(), count, 0));
+    }
+    if !COUNTER_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+    {
         return None;
     }
     Some((
@@ -170,6 +227,8 @@ struct ParsedRun {
     results: Vec<BenchResult>,
     skipped: Vec<String>,
     phases: Vec<PhaseTotal>,
+    counters: Vec<CounterTotal>,
+    lifecycle: Vec<LifecycleTotal>,
 }
 
 fn parse_log(log: &str) -> Result<ParsedRun> {
@@ -177,6 +236,8 @@ fn parse_log(log: &str) -> Result<ParsedRun> {
     let mut results = Vec::new();
     let mut skipped = Vec::new();
     let mut phases: Vec<PhaseTotal> = Vec::new();
+    let mut counters: Vec<CounterTotal> = Vec::new();
+    let mut lifecycle: Vec<LifecycleTotal> = Vec::new();
     let mut saw_end = false;
     // The phase counters are global and drain on a wall-clock window, so a
     // window that closed before the harness started describes boot, not the
@@ -197,6 +258,24 @@ fn parse_log(log: &str) -> Result<ParsedRun> {
         } else if line.starts_with(END_MARKER) {
             saw_end = true;
             inside_run = false;
+        } else if inside_run
+            && milestone_name(line).is_some_and(|name| name.starts_with("lifecycle-"))
+        {
+            let Some((name, identity)) = parse_lifecycle_milestone(line) else {
+                bail!("malformed lifecycle exact-target milestone: {line}");
+            };
+            match lifecycle.iter_mut().find(|total| total.name == name) {
+                Some(total) => {
+                    total.count += 1;
+                    total.last = identity;
+                }
+                None => lifecycle.push(LifecycleTotal {
+                    name,
+                    count: 1,
+                    first: identity,
+                    last: identity,
+                }),
+            }
         } else if inside_run && let Some((name, cycles, samples)) = parse_phase_milestone(line) {
             match phases.iter_mut().find(|phase| phase.name == name) {
                 Some(phase) => {
@@ -209,6 +288,19 @@ fn parse_log(log: &str) -> Result<ParsedRun> {
                     samples: u128::from(samples),
                 }),
             }
+        } else if inside_run && let Some((name, units, operations)) = parse_counter_milestone(line)
+        {
+            match counters.iter_mut().find(|counter| counter.name == name) {
+                Some(counter) => {
+                    counter.units += u128::from(units);
+                    counter.operations += u128::from(operations);
+                }
+                None => counters.push(CounterTotal {
+                    name,
+                    units: u128::from(units),
+                    operations: u128::from(operations),
+                }),
+            }
         }
     }
 
@@ -219,12 +311,46 @@ fn parse_log(log: &str) -> Result<ParsedRun> {
         bail!("ipcbench finished but reported no results");
     }
     phases.sort_by(|left, right| right.per_sample().cmp(&left.per_sample()));
+    counters.sort_by(|left, right| left.name.cmp(&right.name));
+    lifecycle.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(ParsedRun {
         tsc_khz,
         results,
         skipped,
         phases,
+        counters,
+        lifecycle,
     })
+}
+
+fn render_counters(counters: &[CounterTotal]) -> String {
+    if counters.is_empty() {
+        return String::new();
+    }
+    let mut out =
+        String::from("\nin-kernel workload counters (system-wide, summed over the run):\n");
+    out.push_str(&format!(
+        "  {:<36} {:>12} {:>12} {:>12}\n",
+        "counter", "units", "operations", "units/op"
+    ));
+    out.push_str(&format!("  {}\n", "-".repeat(76)));
+    for counter in counters {
+        let operations = if counter.operations == 0 {
+            "-".to_owned()
+        } else {
+            counter.operations.to_string()
+        };
+        let per_operation = if counter.operations == 0 {
+            "-".to_owned()
+        } else {
+            (counter.units / counter.operations).to_string()
+        };
+        out.push_str(&format!(
+            "  {:<36} {:>12} {:>12} {:>12}\n",
+            counter.name, counter.units, operations, per_operation
+        ));
+    }
+    out
 }
 
 /// Renders the in-kernel phase profiles the run collected.
@@ -288,6 +414,10 @@ fn requires_phase_attribution(probe: &str) -> bool {
     )
 }
 
+fn strict_phase_attribution_required(rustos_vcpus: u8, probe: &str) -> bool {
+    rustos_vcpus == 1 && requires_phase_attribution(probe)
+}
+
 fn isolated_primary_result_holds(run: &ParsedRun, probe: &str) -> bool {
     let primary_results = run
         .results
@@ -298,7 +428,12 @@ fn isolated_primary_result_holds(run: &ParsedRun, probe: &str) -> bool {
         skip.split_ascii_whitespace()
             .any(|field| field.strip_prefix("name=") == Some(probe))
     });
-    primary_results == 1 && !primary_skips
+    let anchor_results = run
+        .results
+        .iter()
+        .filter(|result| result.name == HARDWARE_ANCHOR)
+        .count();
+    primary_results == 1 && !primary_skips && (probe == HARDWARE_ANCHOR || anchor_results == 1)
 }
 
 fn render_phases(phases: &[PhaseTotal]) -> String {
@@ -493,6 +628,17 @@ fn render(tsc_khz: u64, results: &[BenchResult], skipped: &[String]) -> String {
     out
 }
 
+fn render_isolated(run: &ParsedRun, probe: &str, rustos_vcpus: u8, check: &str) -> String {
+    let table = render(run.tsc_khz, &run.results, &run.skipped);
+    let phases = render_phases(&run.phases);
+    let counters = render_counters(&run.counters);
+    let lifecycle = render_lifecycle(&run.lifecycle);
+    format!(
+        "\n=== ipcbench (isolated: {probe}, rustos_vcpus={rustos_vcpus}) ===\n\
+         {table}{phases}{counters}{lifecycle}\nisolation check: PASS ({check})\n"
+    )
+}
+
 /// Derived costs the raw table cannot show: a round trip is only meaningful
 /// against the local-syscall floor it is built on.
 fn render_derived(results: &[BenchResult]) -> String {
@@ -580,31 +726,47 @@ pub(crate) fn bench(
     if let Some(probe) = isolate_probe {
         if !isolated_primary_result_holds(&run, probe) {
             bail!(
-                "isolated ipcbench probe {probe} did not produce exactly one non-skipped primary result"
+                "isolated ipcbench probe {probe} did not produce exactly one non-skipped primary result and one hardware anchor"
             );
         }
-        let phases = render_phases(&run.phases);
-        if requires_phase_attribution(probe) && !isolation_holds(&run.phases) {
+        let strict_phase_attribution = strict_phase_attribution_required(rustos_vcpus, probe);
+        if strict_phase_attribution && !isolation_holds(&run.phases) {
             bail!("isolated ipcbench phase attribution failed for probe {probe}");
         }
-        let check = if requires_phase_attribution(probe) {
+        let lifecycle_trace = config.project.lifecycle_telemetry.phase_profile
+            && !required_lifecycle_stages(probe).is_empty();
+        if lifecycle_trace && !lifecycle_trace_holds(&run.lifecycle, probe) {
+            bail!(
+                "isolated lifecycle trace for {probe} omitted one or more required exact-target stages"
+            );
+        }
+        let check = if strict_phase_attribution && lifecycle_trace {
+            format!(
+                "phase attribution inside {:.2}..={:.2} where applicable; exact-target lifecycle trace carries process, MM, and transaction generations for every required stage",
+                ATTRIBUTABLE_RATIO.0, ATTRIBUTABLE_RATIO.1,
+            )
+        } else if strict_phase_attribution {
             format!(
                 "phase attribution; the four once-per-call IPC rows are inside {:.2}..={:.2} per round trip, or absent; shared endpoint/usermem rows remain labelled",
                 ATTRIBUTABLE_RATIO.0, ATTRIBUTABLE_RATIO.1,
             )
+        } else if lifecycle_trace {
+            "exact-target lifecycle trace; required spawn/exec/exit/reap stages carry process, MM, and transaction generations".to_owned()
+        } else if rustos_vcpus > 1 {
+            "kernel-stamped semantic result; SMP system-wide phase counters remain observational and are not claimed as probe-private attribution".to_owned()
         } else {
             "kernel-stamped semantic proof; the primary result is emitted only after every probe invariant passes".to_owned()
         };
-        println!(
-            "\n=== ipcbench (isolated: {probe}) ==={phases}\nisolation check: PASS ({check})\n",
-        );
+        println!("{}", render_isolated(&run, probe, rustos_vcpus, &check));
         return Ok(());
     }
 
     let table = render(run.tsc_khz, &run.results, &run.skipped);
     let derived = render_derived(&run.results);
     let phases = render_phases(&run.phases);
-    println!("\n=== ipcbench ===\n{table}{derived}{phases}");
+    let counters = render_counters(&run.counters);
+    let lifecycle = render_lifecycle(&run.lifecycle);
+    println!("\n=== ipcbench ===\n{table}{derived}{phases}{counters}{lifecycle}");
 
     if let Some(path) = compare {
         let previous = fs::read_to_string(path)
@@ -616,8 +778,11 @@ pub(crate) fn bench(
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(path, format!("{table}{derived}{phases}"))
-            .with_context(|| format!("write baseline {}", path.display()))?;
+        fs::write(
+            path,
+            format!("{table}{derived}{phases}{counters}{lifecycle}"),
+        )
+        .with_context(|| format!("write baseline {}", path.display()))?;
         println!("baseline written to {}", path.display());
     }
     Ok(())
@@ -636,6 +801,16 @@ mod tests {
         assert_eq!(benchmark_timeout_seconds(1, false), 30);
         assert_eq!(benchmark_timeout_seconds(8, false), 60);
         assert_eq!(benchmark_timeout_seconds(1, true), 60);
+    }
+
+    #[test]
+    fn smp_isolated_runs_never_claim_system_wide_phase_counters_as_probe_private() {
+        assert!(strict_phase_attribution_required(1, "fork_exit_wait"));
+        assert!(!strict_phase_attribution_required(8, "fork_exit_wait"));
+        assert!(!strict_phase_attribution_required(
+            1,
+            "scheduling_budget_exhaust_refill"
+        ));
     }
 
     /// Two real runs of this lane, four minutes apart, with a guest change
@@ -807,18 +982,21 @@ ipc_rt_intra_process                        20000     118160     121720     3944
     const SAMPLE: &str = "\
 user-debug payload=ipcbench: tsc_khz=3990809\\n
 user-debug payload=ipcbench: result name=null_syscall_getpid iters=50000 min=3360 p50=3400 p90=3400 p99=5960 max=71972000 mean=6751 min_ns=841 p50_ns=851 mean_ns=1691\\n
+user-debug payload=ipcbench: result name=vmexit_cpuid iters=50000 min=4760 p50=4800 p90=5000 p99=5200 max=8000 mean=4900 min_ns=1192 p50_ns=1202 mean_ns=1227\\n
 user-debug payload=ipcbench: skip name=other reason=unavailable\\n
 user-debug payload=ipcbench: end\\n";
 
     /// One real milestone line, verbatim, including the debugcon envelope the
     /// guest wraps it in.
     const MILESTONE: &str = "seq=316 ts_us=3238281 tick=3316 lvl=info cat=compat mod=nucleus_core::debug line=0 pid=- tid=- msg=\"milestone-begin v=1 output_seq=316 seq=281 ts_us=3238281 tick=3316 cat=compat name=ipc-call-phase-wait-take arg0=0x100 arg1=0x4 pid=- tid=- dropped=0 discarded_bytes=0 checksum=be4fc44b6e85f301 milestone-end\"";
+    const FAST_COUNTER: &str = "seq=317 ts_us=3238282 tick=3317 lvl=info cat=compat mod=nucleus_core::debug line=0 pid=- tid=- msg=\"milestone-begin v=1 output_seq=317 seq=282 ts_us=3238282 tick=3317 cat=compat name=ipc-fastpath-counter arg0=0xd arg1=0x20 pid=- tid=- dropped=0 discarded_bytes=0 checksum=0 milestone-end\"";
+    const LIFECYCLE_MILESTONE: &str = "seq=318 ts_us=3238283 tick=3318 lvl=info cat=process mod=nucleus_core::debug line=0 pid=- tid=- msg=\"milestone-begin v=1 output_seq=318 seq=283 ts_us=3238283 tick=3318 cat=process name=lifecycle-exec-publish arg0=0x700000003 arg1=0x90000000b pid=- tid=- dropped=0 discarded_bytes=0 checksum=0 milestone-end\"";
 
     #[test]
     fn parses_wrapped_debugcon_payload_lines() {
         let run = parse_log(SAMPLE).expect("sample parses");
         assert_eq!(run.tsc_khz, 3_990_809);
-        assert_eq!(run.results.len(), 1);
+        assert_eq!(run.results.len(), 2);
         assert_eq!(run.results[0].name, "null_syscall_getpid");
         assert_eq!(run.results[0].min, 3360);
         assert_eq!(run.results[0].p50_ns, 851);
@@ -831,6 +1009,58 @@ user-debug payload=ipcbench: end\\n";
         assert!(isolated_primary_result_holds(&run, "null_syscall_getpid"));
         assert!(!isolated_primary_result_holds(&run, "other"));
         assert!(!isolated_primary_result_holds(&run, "missing"));
+    }
+
+    #[test]
+    fn isolated_probe_without_hardware_anchor_fails_closed() {
+        let without_anchor = SAMPLE
+            .lines()
+            .filter(|line| !line.contains("name=vmexit_cpuid"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let run = parse_log(&without_anchor).expect("otherwise complete sample parses");
+        assert!(!isolated_primary_result_holds(&run, "null_syscall_getpid"));
+    }
+
+    #[test]
+    fn isolated_report_keeps_primary_distribution_tsc_rate_and_vcpu_count() {
+        let run = parse_log(SAMPLE).expect("sample parses");
+        let rendered = render_isolated(&run, "null_syscall_getpid", 8, "semantic result");
+        assert!(rendered.contains("rustos_vcpus=8"), "{rendered}");
+        assert!(rendered.contains("tsc_khz=3990809"), "{rendered}");
+        assert!(
+            rendered.contains("null_syscall_getpid"),
+            "primary distribution was hidden: {rendered}"
+        );
+        assert!(
+            rendered.contains("vmexit_cpuid"),
+            "hardware anchor was hidden: {rendered}"
+        );
+        assert!(rendered.contains("semantic result"), "{rendered}");
+    }
+
+    #[test]
+    fn lifecycle_report_decodes_exact_process_mm_and_transaction_generations() {
+        let log = format!(
+            "user-debug payload=ipcbench: tsc_khz=3990809\\n\n{LIFECYCLE_MILESTONE}\nuser-debug payload=ipcbench: result name=exec_replace_single_thread iters=1 min=10 p50=10 p90=10 p99=10 max=10 mean=10 min_ns=2 p50_ns=2 mean_ns=2\\n\nuser-debug payload=ipcbench: end\\n"
+        );
+        let run = parse_log(&log).expect("lifecycle sample parses");
+        assert_eq!(run.lifecycle.len(), 1);
+        let rendered = render_lifecycle(&run.lifecycle);
+        assert!(rendered.contains("lifecycle-exec-publish"), "{rendered}");
+        assert!(
+            rendered.contains("3:7/9:11..3:7/9:11"),
+            "decoded identity missing: {rendered}"
+        );
+    }
+
+    #[test]
+    fn lifecycle_marker_without_exact_generation_fails_closed() {
+        let malformed = LIFECYCLE_MILESTONE.replace("arg0=0x700000003", "arg0=0x3");
+        let log = format!(
+            "user-debug payload=ipcbench: tsc_khz=3990809\\n\n{malformed}\nuser-debug payload=ipcbench: result name=exec_replace_single_thread iters=1 min=10 p50=10 p90=10 p99=10 max=10 mean=10 min_ns=2 p50_ns=2 mean_ns=2\\n\nuser-debug payload=ipcbench: end\\n"
+        );
+        assert!(parse_log(&log).is_err());
     }
 
     #[test]
@@ -999,5 +1229,24 @@ user-debug payload=ipcbench: end\\n";
         );
         let run = parse_log(&log).expect("run parses");
         assert!(run.phases.is_empty());
+    }
+
+    #[test]
+    fn fast_path_reason_counters_are_named_and_summed_inside_the_run() {
+        let log = format!(
+            "user-debug payload=ipcbench: tsc_khz=3990809\n{FAST_COUNTER}\n{FAST_COUNTER}\n\
+             user-debug payload=ipcbench: result name=null_syscall_getpid iters=1 min=1 p50=1 p99=1 mean=1 min_ns=1 p50_ns=1\n\
+             user-debug payload=ipcbench: end\n"
+        );
+        let run = parse_log(&log).expect("run parses");
+        assert_eq!(run.counters.len(), 1);
+        assert_eq!(
+            run.counters[0].name,
+            "ipc-fast-fallback-no-waiting-receiver"
+        );
+        assert_eq!(run.counters[0].units, 64);
+        assert_eq!(run.counters[0].operations, 0);
+        let rendered = render_counters(&run.counters);
+        assert!(rendered.contains("ipc-fast-fallback-no-waiting-receiver"));
     }
 }

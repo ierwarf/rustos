@@ -22,7 +22,7 @@ pub(crate) fn service_deferred_transfer_releases() -> usize {
         .saturating_add(ipc_ops::service_deferred_transfer_releases())
 }
 
-pub(crate) use broker_ops::cleanup_retired_task_runtime_state;
+pub(crate) use broker_ops::{RETIRED_TASK_CLEANUP_BUDGET, service_retired_task_runtime_cleanup};
 
 use alloc::string::String;
 use alloc::vec::Vec;

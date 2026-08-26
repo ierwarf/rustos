@@ -22,6 +22,103 @@ fn truncated_file_mapping_never_commits_zero_filled_tail() {
 }
 
 #[test]
+fn process_fork_admits_libc_child_tid_contract_and_rejects_shared_state() {
+    let mut args = RustosProcForkBrokerArgs {
+        clone_flags: linux_abi::SIGCHLD
+            | linux_abi::CLONE_CHILD_SETTID
+            | linux_abi::CLONE_CHILD_CLEARTID,
+        ctid_ptr: PROC_BROKER_USER_SPACE_BASE,
+        ..RustosProcForkBrokerArgs::default()
+    };
+    assert!(valid_process_fork_plan_locally(&args));
+
+    args.clone_flags |= linux_abi::CLONE_VM;
+    assert!(!valid_process_fork_plan_locally(&args));
+    args.clone_flags &= !linux_abi::CLONE_VM;
+    args.ctid_ptr = PROC_BROKER_USER_SPACE_END_EXCLUSIVE;
+    assert!(!valid_process_fork_plan_locally(&args));
+}
+
+#[test]
+fn process_fork_commits_child_tid_before_runnable_publication() {
+    let source = include_str!("fork.rs");
+    let fork = source
+        .split("pub(super) fn syscall_linux_rustos_proc_fork_broker")
+        .nth(1)
+        .expect("fork broker");
+    let validate = fork
+        .find("validate_user_write_buffer")
+        .expect("child TID prevalidation");
+    let reservation = fork
+        .find("let spawn_reservation = match multitask::reserve_process_spawn()")
+        .expect("pre-clone lifecycle reservation");
+    let clone = fork
+        .find("clone_user_space")
+        .expect("child address-space clone");
+    let suspended = fork
+        .find("spawn_user_process_state_suspended_with_parent")
+        .expect("suspended child publication");
+    let published_reservation = fork
+        .find("        spawn_reservation,\n")
+        .expect("exact reserved lifecycle token publication");
+    let write = fork.find("copy_into_user").expect("child TID commit");
+    let activate = fork
+        .find("activate_suspended_user_task")
+        .expect("runnable child activation");
+    assert!(validate < suspended);
+    assert!(reservation < clone);
+    assert!(clone < suspended);
+    assert!(suspended < published_reservation);
+    assert!(suspended < write);
+    assert!(write < activate);
+}
+
+#[test]
+fn loader_spawn_reserves_exact_identity_before_address_space_construction() {
+    let source = include_str!("../proc_broker_ops.rs");
+    let spawn = source
+        .split("pub(super) fn syscall_linux_rustos_proc_commit_broker")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split("pub(super) fn syscall_linux_rustos_proc_activate_broker")
+                .next()
+        })
+        .expect("loader spawn commit");
+    let reserve = spawn
+        .find("reserve_process_spawn_transaction")
+        .expect("exact lifecycle reservation");
+    let map = spawn
+        .find("address_space_from_mappings")
+        .expect("address-space construction");
+    let bind = spawn
+        .find("bind_prepared_spawn(prepared, spawn_transaction)")
+        .expect("reserved token bound to prepared image");
+    let publish = spawn
+        .find("spawn_prepared_process_suspended_with_scheduling_context")
+        .expect("scheduler publication");
+    assert!(reserve < map && map < bind && bind < publish);
+}
+
+#[test]
+fn exec_prepare_authority_is_exact_and_cannot_be_reused_as_spawn() {
+    assert!(exec_prepare_ticket_matches(Some(41), 41));
+    assert!(!exec_prepare_ticket_matches(None, 41));
+    assert!(!exec_prepare_ticket_matches(Some(42), 41));
+    assert!(!exec_prepare_ticket_matches(Some(41), 0));
+
+    let source = include_str!("../proc_broker_ops.rs");
+    let spawn_commit = source
+        .split("pub(super) fn syscall_linux_rustos_proc_commit_broker")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split("pub(super) fn syscall_linux_rustos_proc_activate_broker")
+                .next()
+        })
+        .expect("spawn commit broker");
+    assert!(spawn_commit.contains("Some(s) if s.exec_ticket.is_some()"));
+}
+
+#[test]
 fn executable_file_backing_requires_a_terminally_sealed_snapshot() {
     let snapshot = MemfdHandle::new(String::from("loader-test"), true);
     assert!(!executable_snapshot_is_immutable(&snapshot));

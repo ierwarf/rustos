@@ -33,6 +33,7 @@ required_models = [
     "netd-deferred-reply/NetdDeferredReply",
     "page-table-map-transaction/PageTableMapTransaction",
     "per-cpu-clockevent-lifecycle/PerCpuClockeventLifecycle",
+    "process-lifecycle-transaction/ProcessLifecycleTransaction",
     "product-boot/ProductBoot",
     "robust-futex-owner-death/RobustFutexOwnerDeath",
     "scheduler-active-balance/SchedulerActiveBalance",
@@ -1137,6 +1138,61 @@ replace = '''ConfigureLvt(cpu) ==
 occurrence = 1
 invariant = "ApOnlineRequiresProgrammedDeadline"
 min_counterexample_states = 2
+
+[[mutation]]
+id = "process-lifecycle-partial-frame-rollback-dropped"
+kind = "transition-effect"
+severity = "critical"
+model = "process-lifecycle-transaction/ProcessLifecycleTransaction"
+flow = "process-lifecycle-transaction"
+find = '''    /\ phase' = Idle
+    /\ freeFrames' = freeFrames + unpublishedFrames'''
+replace = '''    /\ phase' = Idle
+    /\ freeFrames' = freeFrames'''
+occurrence = 1
+invariant = "FrameConservation"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "process-lifecycle-reap-with-live-task"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "process-lifecycle-transaction/ProcessLifecycleTransaction"
+flow = "process-lifecycle-transaction"
+find = '''QueueReap ==
+    /\ phase = Exiting
+    /\ tasks = 0
+    /\ references = 0'''
+replace = '''QueueReap ==
+    /\ phase = Exiting
+    /\ TRUE'''
+occurrence = 1
+invariant = "ReapRequiresNoAuthority"
+min_counterexample_states = 5
+
+[[mutation]]
+id = "process-lifecycle-transaction-id-reuse"
+kind = "transition-effect"
+severity = "critical"
+model = "process-lifecycle-transaction/ProcessLifecycleTransaction"
+flow = "process-lifecycle-transaction"
+find = '''ReserveExec ==
+    /\ phase = Running
+    /\ tasks = 1
+    /\ CanAllocateTxn
+    /\ phase' = ExecReserved
+    /\ activeTxn' = nextTxn
+    /\ nextTxn' = nextTxn + 1'''
+replace = '''ReserveExec ==
+    /\ phase = Running
+    /\ tasks = 1
+    /\ CanAllocateTxn
+    /\ phase' = ExecReserved
+    /\ activeTxn' = nextTxn
+    /\ nextTxn' = nextTxn'''
+occurrence = 1
+invariant = "GenerationNeverAliases"
+min_counterexample_states = 5
 
 [[mutation]]
 id = "product-boot-display-authority-guard-removed"

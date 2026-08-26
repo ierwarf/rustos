@@ -127,5 +127,6 @@ wayland-frame-pacing/WaylandFramePacing	temporal	intentional-terminal	bounded pa
 product-boot/ProductBoot	temporal	intentional-terminal	product boot reaches a complete topology terminal or an explicit bounded failure	30	120	exhaustive	no	no	yes
 acceptance-profile-publication/AcceptanceProfilePublication	temporal	check	enabled and expired terminals stutter while bounded late publication remains explicit	30	120	exhaustive	no	no	no
 exec-address-space-transaction/ExecAddressSpaceTransaction	temporal	check	owned and cancelled terminals stutter while root ownership transfer remains explicit	30	120	exhaustive	no	no	no
+process-lifecycle-transaction/ProcessLifecycleTransaction	safety	check	dead and exhausted identity terminals stutter while spawn exec exit reap and partial frame rollback remain explicit	30	120	exhaustive	no	no	no
 gpu-submit-transaction/GpuSubmitTransaction	safety	check	accepted submit stutters while rejected submits retain an explicit retry transition	30	120	exhaustive	no	no	no
 user-stack-growth/UserStackGrowth	temporal	check	committed and retired terminals stutter while the cross-lock transaction settles	30	120	exhaustive	no	no	no

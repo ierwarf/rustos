@@ -55,24 +55,6 @@ pub(crate) fn retire_current_linux_task_due_to_fault(
     disposition
 }
 
-pub(crate) fn cleanup_retired_task_runtime_state(
-    task_id: u64,
-    process_id: u64,
-    process_terminal: bool,
-    clear_child_tid: u64,
-    robust_list_head: u64,
-    robust_list_len: u64,
-) -> usize {
-    linux::cleanup_retired_task_runtime_state(
-        task_id,
-        process_id,
-        process_terminal,
-        clear_child_tid,
-        robust_list_head,
-        robust_list_len,
-    )
-}
-
 fn fault_termination_process(
     disposition: multitask::UserFaultDisposition,
     final_process_thread: Option<u64>,

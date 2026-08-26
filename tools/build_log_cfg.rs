@@ -85,8 +85,20 @@ pub const SYSCALL_PHASE_PROFILE: PhaseProfileSection = PhaseProfileSection {
     cfg: "rustos_syscall_phase_profile",
 };
 
-pub const PHASE_PROFILE_SECTIONS: [PhaseProfileSection; 2] =
-    [SCHEDULER_PHASE_PROFILE, SYSCALL_PHASE_PROFILE];
+/// Exact process lifecycle marker emission. This performs a formatted
+/// debugcon publication per stage and therefore must never contaminate the
+/// shipping lifecycle latency run.
+pub const LIFECYCLE_TRACE: PhaseProfileSection = PhaseProfileSection {
+    section: "lifecycle_telemetry",
+    env: "RUSTOS_LIFECYCLE_TRACE",
+    cfg: "rustos_lifecycle_trace",
+};
+
+pub const PHASE_PROFILE_SECTIONS: [PhaseProfileSection; 3] = [
+    SCHEDULER_PHASE_PROFILE,
+    SYSCALL_PHASE_PROFILE,
+    LIFECYCLE_TRACE,
+];
 
 pub fn parse_phase_profile_toml(source: &str, section_name: &str) -> bool {
     try_parse_phase_profile_toml(source, section_name).unwrap_or_else(|err| panic!("{err}"))

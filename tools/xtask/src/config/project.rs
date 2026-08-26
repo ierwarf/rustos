@@ -39,6 +39,7 @@ pub(crate) struct ProjectConfig {
     pub(crate) lock_telemetry: LockTelemetryConfig,
     pub(crate) scheduler_telemetry: SchedulerTelemetryConfig,
     pub(crate) syscall_telemetry: SyscallTelemetryConfig,
+    pub(crate) lifecycle_telemetry: LifecycleTelemetryConfig,
 }
 
 #[derive(Clone, Debug)]
@@ -87,6 +88,13 @@ pub(crate) struct SchedulerTelemetryConfig {
 /// `config/rustos.toml` for why it is off by default.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SyscallTelemetryConfig {
+    pub(crate) phase_profile: bool,
+}
+
+/// Checksum-framed lifecycle stage markers. Kept distinct from shipping
+/// latency measurements because each marker performs debugcon output.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct LifecycleTelemetryConfig {
     pub(crate) phase_profile: bool,
 }
 
@@ -212,6 +220,7 @@ struct ProjectConfigFile {
     lock_telemetry: LockTelemetryConfigFile,
     scheduler_telemetry: SchedulerTelemetryConfigFile,
     syscall_telemetry: SyscallTelemetryConfigFile,
+    lifecycle_telemetry: LifecycleTelemetryConfigFile,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -267,6 +276,12 @@ struct SyscallTelemetryConfigFile {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+struct LifecycleTelemetryConfigFile {
+    phase_profile: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 struct LockTelemetryConfigFile {
     enabled: Option<bool>,
     phase_profile: Option<bool>,
@@ -282,6 +297,7 @@ pub(crate) fn load_project_config(root_dir: &Path) -> Result<ProjectConfig> {
     apply_lock_telemetry_env_overrides(&mut config.lock_telemetry)?;
     apply_scheduler_telemetry_env_overrides(&mut config.scheduler_telemetry)?;
     apply_syscall_telemetry_env_overrides(&mut config.syscall_telemetry)?;
+    apply_lifecycle_telemetry_env_overrides(&mut config.lifecycle_telemetry)?;
     validate_kernel_build(&config.kernel.build)?;
     validate_fault_injection(&config.fault_injection)?;
     validate_fuzzing(&config.fuzzing)?;
@@ -294,6 +310,7 @@ pub(crate) fn load_project_config(root_dir: &Path) -> Result<ProjectConfig> {
         lock_telemetry: config.lock_telemetry,
         scheduler_telemetry: config.scheduler_telemetry,
         syscall_telemetry: config.syscall_telemetry,
+        lifecycle_telemetry: config.lifecycle_telemetry,
     })
 }
 
@@ -428,6 +445,9 @@ fn project_from_file(file: ProjectConfigFile) -> ProjectConfig {
     if let Some(value) = file.syscall_telemetry.phase_profile {
         config.syscall_telemetry.phase_profile = value;
     }
+    if let Some(value) = file.lifecycle_telemetry.phase_profile {
+        config.lifecycle_telemetry.phase_profile = value;
+    }
     config
 }
 
@@ -441,6 +461,7 @@ impl Default for ProjectConfig {
             lock_telemetry: LockTelemetryConfig::default(),
             scheduler_telemetry: SchedulerTelemetryConfig::default(),
             syscall_telemetry: SyscallTelemetryConfig::default(),
+            lifecycle_telemetry: LifecycleTelemetryConfig::default(),
         }
     }
 }
@@ -555,6 +576,15 @@ fn apply_syscall_telemetry_env_overrides(
 ) -> Result<()> {
     if let Some(value) = env_string("RUSTOS_SYSCALL_PHASE_PROFILE") {
         syscall_telemetry.phase_profile = parse_bool_env("RUSTOS_SYSCALL_PHASE_PROFILE", &value)?;
+    }
+    Ok(())
+}
+
+fn apply_lifecycle_telemetry_env_overrides(
+    lifecycle_telemetry: &mut LifecycleTelemetryConfig,
+) -> Result<()> {
+    if let Some(value) = env_string("RUSTOS_LIFECYCLE_TRACE") {
+        lifecycle_telemetry.phase_profile = parse_bool_env("RUSTOS_LIFECYCLE_TRACE", &value)?;
     }
     Ok(())
 }
@@ -738,9 +768,9 @@ pub(crate) fn effective_config_toml(config: &ProjectConfig) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        FaultInjectionConfig, KernelBuildConfig, LockTelemetryConfig, ProjectConfigFile,
-        SchedulerTelemetryConfig, SyscallTelemetryConfig, apply_fault_rule_overrides,
-        project_from_file, validate_fault_injection,
+        FaultInjectionConfig, KernelBuildConfig, LifecycleTelemetryConfig, LockTelemetryConfig,
+        ProjectConfigFile, SchedulerTelemetryConfig, SyscallTelemetryConfig,
+        apply_fault_rule_overrides, project_from_file, validate_fault_injection,
     };
 
     /// The lock phase profile is eleven counter reads inside every tracked lock
@@ -822,6 +852,10 @@ mod tests {
                 shipped.scheduler_telemetry.phase_profile,
             ),
             ("syscall_telemetry", shipped.syscall_telemetry.phase_profile),
+            (
+                "lifecycle_telemetry",
+                shipped.lifecycle_telemetry.phase_profile,
+            ),
         ] {
             assert!(
                 !enabled,
@@ -830,6 +864,7 @@ mod tests {
         }
 
         assert!(!SyscallTelemetryConfig::default().phase_profile);
+        assert!(!LifecycleTelemetryConfig::default().phase_profile);
         let enabled: ProjectConfigFile =
             toml::from_str("[syscall_telemetry]\nphase_profile = true\n")
                 .expect("phase_profile is a recognized syscall_telemetry key");

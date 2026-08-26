@@ -604,11 +604,11 @@ fn unsupported_execveat_flags(flags: u64) -> bool {
 }
 
 fn handle_fork(request: &ProcdIpcRequest, response: &mut ProcdIpcResponse) {
-    let clone_flags = request.arg0;
-    if clone_flags & !0xff != 0 || clone_flags & process_clone_unsupported_mask() != 0 {
+    if !valid_process_fork_plan(request) {
         response.status = EINVAL;
         return;
     }
+    let clone_flags = request.arg0;
     let args = RustosProcForkBrokerArgs {
         abi_version: rustos_user_abi::syscall::PROC_BROKER_ABI_VERSION,
         source_pid: request.pid,
@@ -674,13 +674,22 @@ fn user_pointer_in_range(ptr: u64) -> bool {
     (LINUX_USER_SPACE_BASE..LINUX_USER_SPACE_END).contains(&ptr)
 }
 
-fn process_clone_unsupported_mask() -> u64 {
-    const CLONE_VM: u64 = 0x0000_0100;
-    const CLONE_FS: u64 = 0x0000_0200;
-    const CLONE_FILES: u64 = 0x0000_0400;
-    const CLONE_SIGHAND: u64 = 0x0000_0800;
-    const CLONE_THREAD: u64 = 0x0001_0000;
-    CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD
+fn valid_process_fork_plan(request: &ProcdIpcRequest) -> bool {
+    const CSIGNAL: u64 = 0xff;
+    const SIGCHLD: u64 = 17;
+    const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
+    const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
+
+    let flags = request.arg0;
+    let supported = CSIGNAL | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID;
+    let exit_signal = flags & CSIGNAL;
+    flags & !supported == 0
+        && (exit_signal == 0 || exit_signal == SIGCHLD)
+        && (request.arg1 == 0 || user_pointer_in_range(request.arg1))
+        && request.arg2 == 0
+        && request.arg4 == 0
+        && (flags & (CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID) == 0
+            || user_pointer_in_range(request.arg3))
 }
 
 fn handle_wait4(request: &ProcdIpcRequest, response: &mut ProcdIpcResponse) {

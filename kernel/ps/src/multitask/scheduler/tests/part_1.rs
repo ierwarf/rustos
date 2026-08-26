@@ -710,6 +710,11 @@ fn retired_user_slot_waits_for_exact_runtime_cleanup_ack() {
     assert_eq!(cleanup.task_id(), 961);
     assert_eq!(cleanup.process_id(), 96);
     assert!(cleanup.process_terminal());
+    assert_eq!(
+        scheduler.next_retired_task_cleanup(),
+        None,
+        "an in-flight cleanup token must have exactly one SMP owner"
+    );
     // Retain the external side-effect token locally so this assertion
     // isolates the runtime-cleanup acknowledgement gate. If that gate is
     // removed, the retired stack becomes reclaimable before its exact

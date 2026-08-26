@@ -596,13 +596,18 @@ rg -Fq 'static SYNC_HANDOFFS: [SyncHandoffLock; MAX_TRACKED_CPUS]' \
     exit 1
 }
 scheduler_source=kernel/ps/src/multitask/scheduler.rs
-rg -Uq 'let sync_handoff = atomic_activation_handoff\n[[:space:]]*\.is_none\(\)\n[[:space:]]*\.then\(\|\| timed_handoff_step\(1, \|\| self\.take_next_synchronous_pick_hint_ready_slot\(\)\)\)' \
+rg -Uq 'let atomic_activation_pending =\n[[:space:]]*dispatch_policy::atomic_activation_pending\(Self::current_dispatch_cpu\(\)\);' \
+    "$scheduler_source" || {
+    echo "atomic activation pending authority no longer guards early synchronous handoff selection" >&2
+    exit 1
+}
+rg -Uq 'let sync_handoff = \(!atomic_activation_pending\)\n[[:space:]]*\.then\(\|\| timed_handoff_step\(1, \|\| self\.take_next_synchronous_pick_hint_ready_slot\(\)\)\)' \
     "$scheduler_source" || {
     echo "atomic activation or synchronous IPC handoff no longer precedes unrelated overdue work" >&2
     exit 1
 }
-atomic_handoff_line=$(rg -n -m1 'let atomic_activation_handoff =' "$scheduler_source" | cut -d: -f1)
-sync_handoff_line=$(rg -n -m1 'let sync_handoff = atomic_activation_handoff' "$scheduler_source" | cut -d: -f1)
+atomic_handoff_line=$(rg -n -m1 'let atomic_activation_pending =' "$scheduler_source" | cut -d: -f1)
+sync_handoff_line=$(rg -n -m1 'let sync_handoff = \(!atomic_activation_pending\)' "$scheduler_source" | cut -d: -f1)
 overdue_pick_line=$(rg -n -m1 'self\.mandatory_overdue_system_pick\(current_slot, now_ticks\)' \
     "$scheduler_source" | cut -d: -f1)
 if [ -z "$atomic_handoff_line" ] || [ -z "$sync_handoff_line" ] || \
@@ -681,7 +686,8 @@ rg -Fq 'SYS_RUSTOS_IPC_REPLY_RECV_WITH_SENDER' \
 }
 for witness in \
     'ipc_reply_recv_shape_valid(&args)' \
-    'prepare_recv_with_sender(' \
+    'prepare_recv_identity(' \
+    'copy_from_retained_user_and_validate_writes(' \
     'complete_endpoint_reply_for_process_with_custody(' \
     'recv_with_sender_blocking_prepared(' \
     'IPC_REPLY_RECV_COMMITTED_ERROR_BASE + errno'; do
@@ -690,7 +696,7 @@ for witness in \
         exit 1
     }
 done
-rg -Uq 'prepare_recv_with_sender\([\s\S]{0,3600}copy_request_from_user\([\s\S]{0,1800}complete_endpoint_reply_for_process_with_custody\([\s\S]{0,2600}finish_committed_reply_receive\(' \
+rg -Uq 'prepare_recv_identity\([\s\S]{0,3600}copy_request_from_user\([\s\S]{0,1800}complete_endpoint_reply_for_process_with_custody\([\s\S]{0,2600}finish_committed_reply_receive\(' \
     "$reply_recv_kernel" \
     && rg -Uq 'fn finish_committed_reply_receive\([\s\S]{0,1200}recv_with_sender_blocking_prepared\(' \
     "$reply_recv_kernel" || {

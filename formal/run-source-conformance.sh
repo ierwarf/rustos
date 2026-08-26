@@ -1111,7 +1111,18 @@ capability-derivation-lifecycle/CapabilityDerivationLifecycle|kernel-object|hand
 capability-derivation-lifecycle/CapabilityDerivationLifecycle|kernel-ps|user::handles::table::tests::nonreusable_console_descriptors_carry_the_open_description_identity_adapter
 capability-derivation-lifecycle/CapabilityDerivationLifecycle|kernel-ipc-runtime|ipc::tests::endpoint_and_reply_handles_decode_only_in_range_generational_identities
 capability-derivation-lifecycle/CapabilityDerivationLifecycle|kernel-ps|multitask::process_table::tests::identity_tests::process_handle_adapts_table_slot_and_generation_to_typed_identity
-capability-derivation-lifecycle/CapabilityDerivationLifecycle|kernel-ps|multitask::process_table::tests::identity_tests::exec_reservation_adapts_exact_pre_exec_mm_generation_to_lifecycle_token
+capability-derivation-lifecycle/CapabilityDerivationLifecycle|kernel-ps|multitask::process_table::tests::identity_tests::exec_reservation_binds_process_generation_and_unique_transaction_token
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_table::tests::lifecycle_transaction_ids_are_nonzero_unique_and_fail_closed_at_exhaustion
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-mm|memory::phys::tests::partial_batch_fault_returns_every_acquired_frame_exactly_once
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_table::tests::retained_ref_delays_reclaim_until_drop
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_table::tests::exec_seal_rejects_thread_attachment_until_cancel
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_table::tests::stale_exec_transaction_id_cannot_authorize_or_cancel_live_reservation
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_table::tests::process_address_space_and_exec_exit_are_serialized
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_table::tests::exit_pending_wins_when_exec_is_cancelled
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_table::tests::exiting_process_rejects_new_thread_attachment
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_table::tests::parent_wait_is_required_before_child_reap
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_table::tests::process_generations_fail_closed_instead_of_aliasing_stale_handles
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::spawn::tests::process_state_spawn_has_no_unreserved_production_alias
 capability-derivation-lifecycle/CapabilityDerivationLifecycle|kernel-ipc-runtime|ipc::tests::kernel_transfer_ticket_binds_the_nonzero_transfer_object_generation
 capability-derivation-lifecycle/CapabilityDerivationLifecycle|kernel-ipc-runtime|ipc::tests::transferred_handle_derivation_only_attenuates_typed_rights
 capability-derivation-lifecycle/CapabilityDerivationLifecycle|kernel-ps|user::handles::transfer_registry::transfer_registry_tests::opaque_transfer_ticket_is_exact_one_shot_and_nonce_bound
@@ -1720,11 +1731,24 @@ for group in "${group_order[@]}"; do
     # `-q` would collapse libtest to progress dots, and the per-witness pass
     # line is the evidence that each registered name really ran.
     cargo_args+=(-- --exact "${names[@]}")
-    output="$(cargo "${cargo_args[@]}" 2>&1)" || {
-        printf '%s\n' "$output" >&2
-        echo "source conformance witnesses failed for $package${features:+ [$features]}" >&2
-        exit 1
-    }
+    # `kernel-ps` witnesses share architecture-test publication state (GDT,
+    # runqueue and process-table reset fixtures). Their production protocol is
+    # concurrent, but these host fixtures are intentionally single-owner; run
+    # the bounded witness group serially rather than letting one reset another
+    # witness's synthetic scheduler while it is allocating a slot.
+    if [[ "$package" == "kernel-ps" ]]; then
+        output="$(RUST_TEST_THREADS=1 cargo "${cargo_args[@]}" 2>&1)" || {
+            printf '%s\n' "$output" >&2
+            echo "source conformance witnesses failed for $package${features:+ [$features]}" >&2
+            exit 1
+        }
+    else
+        output="$(cargo "${cargo_args[@]}" 2>&1)" || {
+            printf '%s\n' "$output" >&2
+            echo "source conformance witnesses failed for $package${features:+ [$features]}" >&2
+            exit 1
+        }
+    fi
     for name in "${names[@]}"; do
         # libtest decorates a `#[should_panic]` witness, and a registered test
         # name is compared whole so one witness cannot be satisfied by another

@@ -1265,7 +1265,7 @@ fn complete_retirement_side_effects() {
 }
 
 pub fn next_retired_task_cleanup() -> Option<super::RetiredTaskCleanup> {
-    interrupts::without_interrupts(|| unsafe { scheduler_ref().next_retired_task_cleanup() })
+    interrupts::without_interrupts(|| unsafe { scheduler_mut().next_retired_task_cleanup() })
 }
 
 pub fn complete_retired_task_cleanup(cleanup: super::RetiredTaskCleanup) -> bool {

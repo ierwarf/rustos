@@ -18,9 +18,13 @@
 use super::*;
 
 pub(super) fn syscall_linux_rustos_ipc_reply_recv_with_sender(args_ptr: u64) -> u64 {
-    let args = match usermem::read_current_user_struct::<
+    let retained_mm = match usermem::current_user_address_space() {
+        Ok(retained) => retained,
+        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
+    };
+    let args = match usermem::read_retained_user_struct::<
         rustos_user_abi::syscall::IpcReplyRecvWithSenderArgs,
-    >(args_ptr)
+    >(&retained_mm, args_ptr)
     {
         Ok(args) => args,
         Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
@@ -33,36 +37,44 @@ pub(super) fn syscall_linux_rustos_ipc_reply_recv_with_sender(args_ptr: u64) -> 
     // authority happens before the one-shot reply is consumed. This keeps an
     // ordinary errno unambiguously pre-commit and makes the tagged post-commit
     // range below the sole retry boundary.
+    let response_len = match usize::try_from(args.response_len) {
+        Ok(len) => len,
+        Err(_) => return linux_errno(LINUX_EINVAL),
+    };
+    let mut inline_response = [0_u8; kernel_ipc_runtime::api::IPC_FAST_INLINE_BYTES];
+    let inline = response_len <= inline_response.len();
     let (endpoint, receiver_task_id, receiver_process_id, request_capacity, retained_mm) =
-        match prepare_recv_with_sender(
-            args.endpoint,
-            args.request_ptr,
-            args.request_capacity,
-            args.next_reply_cap_ptr,
-            args.sender_pid_ptr,
-            args.sender_tid_ptr,
-        ) {
+        match prepare_recv_identity(args.endpoint, args.request_capacity, retained_mm) {
             Ok(prepared) => prepared,
             Err(errno) => return linux_errno(errno),
         };
-    let start_ticks = crate::arch::rtc::ticks();
-    if let Ok(response_len) = usize::try_from(args.response_len)
-        && response_len <= kernel_ipc_runtime::api::IPC_FAST_INLINE_BYTES
-    {
-        let mut response = [0_u8; kernel_ipc_runtime::api::IPC_FAST_INLINE_BYTES];
-        if response_len != 0
-            && let Err(error) = usermem::copy_from_current_user_exact(
-                args.response_ptr,
-                &mut response[..response_len],
-            )
-        {
+    let output_buffers = [
+        (args.request_ptr, request_capacity),
+        (args.next_reply_cap_ptr, size_of::<u64>()),
+        (args.sender_pid_ptr, size_of::<u64>()),
+        (args.sender_tid_ptr, size_of::<u64>()),
+    ];
+    if inline {
+        if let Err(error) = usermem::copy_from_retained_user_and_validate_writes(
+            &retained_mm,
+            args.response_ptr,
+            &mut inline_response[..response_len],
+            &output_buffers,
+        ) {
             return linux_errno(address_space_error_to_linux_errno(error));
         }
+    } else if let Err(error) =
+        usermem::validate_retained_user_write_buffers(&retained_mm, &output_buffers)
+    {
+        return linux_errno(address_space_error_to_linux_errno(error));
+    }
+    let start_ticks = crate::arch::rtc::ticks();
+    if inline {
         let copy_ticks = crate::arch::rtc::ticks();
         match kernel_ipc_runtime::api::endpoint::complete_fast_reply_for_task(
             KernelReplyHandle::from_raw(args.reply_cap),
             receiver_task_id,
-            &response[..response_len],
+            &inline_response[..response_len],
         ) {
             Ok(published) => {
                 note_fast_ipc(IpcFastCounter::FusedReplyPublished);

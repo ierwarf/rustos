@@ -32,12 +32,11 @@ pub(super) fn rollback_user_pages(
     }
     rollback_published_tables(space, published_tables);
     let _flushed_mutation = mutation.flush_for_reclaim();
-    for &(_, frame_phys) in pages.iter().rev() {
-        phys::free_frame(PhysAddr::new(frame_phys));
-    }
-    for table in published_tables_in_rollback_order(published_tables) {
-        phys::free_frame(PhysAddr::new(table.table_phys));
-    }
+    free_rollback_frames_exact(
+        pages.iter().rev().map(|(_, frame_phys)| *frame_phys).chain(
+            published_tables_in_rollback_order(published_tables).map(|table| table.table_phys),
+        ),
+    );
 }
 
 pub(super) fn rollback_external_user_pages(
@@ -51,9 +50,9 @@ pub(super) fn rollback_external_user_pages(
     }
     rollback_published_tables(space, published_tables);
     let _flushed_mutation = mutation.flush_for_reclaim();
-    for table in published_tables_in_rollback_order(published_tables) {
-        phys::free_frame(PhysAddr::new(table.table_phys));
-    }
+    free_rollback_frames_exact(
+        published_tables_in_rollback_order(published_tables).map(|table| table.table_phys),
+    );
 }
 
 fn rollback_published_tables(

@@ -15,14 +15,42 @@ installed="$(cargo kani --version | awk 'NR == 1 { print $2 }')"
 cd "$repo_root"
 artifact_dir="${KANI_ARTIFACT_DIR:-$repo_root/build/formal/kani}"
 mkdir -p "$artifact_dir"
+cache_dir="${KANI_CACHE_DIR:-$repo_root/build/formal/kani-cache-v1}"
+mkdir -p "$cache_dir"
 if [[ "${FORMAL_PROOF_INDEX_ALREADY_PASSED:-0}" != 1 ]]; then
     bash formal/run-proof-index.sh
 fi
 
 packages=(runtime-control rustos-image-admission driver-domain-protocol rustos-user-abi)
+cache_key_args=()
+for package in "${packages[@]}"; do
+    cache_key_args+=(--package "$package")
+done
+cache_keys="$(python3 formal/kani-cache-key.py \
+    --root "$repo_root" \
+    --version "$version" \
+    "${cache_key_args[@]}")"
 overall=0
+cache_hits=0
+cache_misses=0
 for package in "${packages[@]}"; do
     log="$artifact_dir/$package.log"
+    cache_key="$(jq -er --arg package "$package" '.[$package]' <<<"$cache_keys")"
+    cached_log="$cache_dir/$package-$cache_key.log"
+    cached_manifest="$cache_dir/$package-$cache_key.json"
+    rm -f "$artifact_dir/$package-playback.log"
+    if [[ -s "$cached_log" && -s "$cached_manifest" ]] \
+        && [[ "$(jq -er '.schema' "$cached_manifest")" == rustos-kani-package-cache-v1 ]] \
+        && [[ "$(jq -er '.status' "$cached_manifest")" == passed ]] \
+        && [[ "$(jq -er '.package' "$cached_manifest")" == "$package" ]] \
+        && [[ "$(jq -er '.input_sha256' "$cached_manifest")" == "$cache_key" ]] \
+        && [[ "$(jq -er '.log_sha256' "$cached_manifest")" == "$(sha256sum "$cached_log" | awk '{print $1}')" ]] \
+        && ! rg -q '\*\* 0 of [1-9][0-9]* cover properties satisfied|VERIFICATION:- (FAILED|UNDETERMINED)' "$cached_log"; then
+        cp "$cached_log" "$log"
+        cache_hits=$((cache_hits + 1))
+        continue
+    fi
+    cache_misses=$((cache_misses + 1))
     set +e
     cargo kani -p "$package" \
         --output-format terse \
@@ -41,6 +69,22 @@ for package in "${packages[@]}"; do
             -Z unstable-options \
             --run-sanity-checks >"$artifact_dir/$package-playback.log" 2>&1
         set -e
+    elif ! rg -q '\*\* 0 of [1-9][0-9]* cover properties satisfied|VERIFICATION:- (FAILED|UNDETERMINED)' "$log"; then
+        cache_tmp="$cache_dir/.$package-$cache_key.$$.tmp"
+        cp "$log" "$cache_tmp"
+        chmod 0644 "$cache_tmp"
+        mv -f "$cache_tmp" "$cached_log"
+        manifest_tmp="$cache_dir/.$package-$cache_key.$$.json.tmp"
+        jq -n \
+            --arg schema rustos-kani-package-cache-v1 \
+            --arg status passed \
+            --arg package "$package" \
+            --arg input_sha256 "$cache_key" \
+            --arg log_sha256 "$(sha256sum "$cached_log" | awk '{print $1}')" \
+            '{schema:$schema,status:$status,package:$package,input_sha256:$input_sha256,log_sha256:$log_sha256}' \
+            > "$manifest_tmp"
+        chmod 0644 "$manifest_tmp"
+        mv -f "$manifest_tmp" "$cached_manifest"
     fi
 done
 
@@ -71,4 +115,5 @@ if [[ "$overall" -ne 0 ]]; then
     done
     exit 1
 fi
-printf 'Kani passed packages=%s evidence=%s\n' "${#packages[@]}" "$artifact_dir/summary.json"
+printf 'Kani passed packages=%s cache_hits=%s cache_misses=%s evidence=%s\n' \
+    "${#packages[@]}" "$cache_hits" "$cache_misses" "$artifact_dir/summary.json"

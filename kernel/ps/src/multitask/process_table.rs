@@ -91,6 +91,12 @@ impl ProcessHandle {
             u64::from(self.generation),
         )
     }
+
+    fn lifecycle_token_slot(self) -> Option<u64> {
+        let slot = u64::try_from(self.index).ok()?.checked_add(1)?;
+        (self.generation != 0 && slot <= u64::from(u32::MAX))
+            .then_some((u64::from(self.generation) << 32) | slot)
+    }
 }
 
 pub struct ProcessRef {
@@ -110,23 +116,41 @@ pub struct ExecReservation {
     handle: ProcessHandle,
     expected_mm_generation: u32,
     next_mm_generation: u32,
+    transaction_id: u32,
 }
 
 impl ExecReservation {
-    /// One-shot lifecycle-token identity for the exact pre-exec MM generation.
+    /// One-shot lifecycle-token identity for this exact exec transaction.
     ///
     /// `handle` remains the process-table generation authority, while this
-    /// token lets capability-facing code name the reservation without
-    /// collapsing process and MM generations. Callers must still authorize or
-    /// consume the reservation through the process table.
+    /// token slot encodes the process-table slot and process generation, while
+    /// its generation is a non-reusable transaction ID. The expected/next MM
+    /// generations remain explicit fields, so none of the three identities is
+    /// collapsed into another. Callers must still authorize or consume the
+    /// reservation through the process table.
     pub fn object_identity(self) -> Option<ObjectIdentity> {
-        let slot = u64::try_from(self.handle.index()).ok()?.checked_add(1)?;
         ObjectIdentity::new(
             ObjectOwner::Ps,
             ObjectKind::LifecycleToken,
-            slot,
-            u64::from(self.expected_mm_generation),
+            self.handle.lifecycle_token_slot()?,
+            u64::from(self.transaction_id),
         )
+    }
+
+    pub const fn transaction_id(self) -> u32 {
+        self.transaction_id
+    }
+
+    pub const fn process_handle(self) -> ProcessHandle {
+        self.handle
+    }
+
+    pub const fn expected_mm_generation(self) -> u32 {
+        self.expected_mm_generation
+    }
+
+    pub const fn next_mm_generation(self) -> u32 {
+        self.next_mm_generation
     }
 }
 
@@ -236,6 +260,8 @@ struct ProcessObject {
     ref_count: usize,
     thread_count: usize,
     mm_generation: u32,
+    lifecycle_transaction_id: u32,
+    pending_exit_transaction_id: Option<u32>,
     exec_in_progress: bool,
     exec_commit_authorized: bool,
     exec_state_staged: bool,
@@ -249,13 +275,20 @@ struct ProcessObject {
 }
 
 impl ProcessObject {
-    fn new(process_id: u64, parent_process_id: Option<u64>, state: UserProcessState) -> Self {
+    fn new(
+        process_id: u64,
+        parent_process_id: Option<u64>,
+        state: UserProcessState,
+        lifecycle_transaction_id: u32,
+    ) -> Self {
         Self {
             process_id,
             parent_process_id,
             ref_count: 1,
             thread_count: 1,
             mm_generation: 1,
+            lifecycle_transaction_id,
+            pending_exit_transaction_id: None,
             exec_in_progress: false,
             exec_commit_authorized: false,
             exec_state_staged: false,
@@ -277,6 +310,7 @@ impl ProcessObject {
 struct ProcessSlot {
     generation: u32,
     object: Option<Box<ProcessObject>>,
+    spawn_transaction_id: Option<u32>,
 }
 
 impl ProcessSlot {
@@ -284,6 +318,7 @@ impl ProcessSlot {
         Self {
             generation: 1,
             object: None,
+            spawn_transaction_id: None,
         }
     }
 }
@@ -328,6 +363,9 @@ impl ProcessTable {
     }
 }
 
+mod spawn;
+pub use spawn::{SpawnReservation, cancel_spawn, publish_spawn, reserve_spawn};
+
 static PROCESS_TABLE: ProcessTableLock = ProcessTableLock::new(ProcessTable::new());
 
 /// Per-slot state visibility, readable without the table lock.
@@ -351,6 +389,56 @@ static PROCESS_STATE_VISIBILITY: [AtomicU64; MAX_PROCESS_OBJECTS] =
 /// object's whole lifetime.
 static PROCESS_STATE_PTR: [AtomicPtr<ProcessStateLock<UserProcessState>>; MAX_PROCESS_OBJECTS] =
     [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_PROCESS_OBJECTS];
+
+/// One namespace for spawn/exec/exit/reap transactions. IDs never wrap: after
+/// the final u32 identity is consumed, new lifecycle admission fails closed
+/// instead of letting a stale marker or one-shot token alias later work.
+static NEXT_LIFECYCLE_TRANSACTION_ID: AtomicU64 = AtomicU64::new(1);
+
+fn allocate_lifecycle_transaction_id() -> Option<u32> {
+    allocate_nonwrapping_lifecycle_transaction_id(&NEXT_LIFECYCLE_TRANSACTION_ID)
+}
+
+fn allocate_nonwrapping_lifecycle_transaction_id(counter: &AtomicU64) -> Option<u32> {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            (current != 0 && current <= u64::from(u32::MAX)).then(|| current + 1)
+        })
+        .ok()
+        .and_then(|current| u32::try_from(current).ok())
+}
+
+/// A fixed lifecycle marker encodes all authority-bearing fields without
+/// relying on PID labels: arg0 is `(process_generation << 32) | one_based_slot`
+/// and arg1 is `(mm_generation << 32) | transaction_id`.
+#[cfg(rustos_lifecycle_trace)]
+fn record_lifecycle_marker(
+    name: &'static str,
+    handle: ProcessHandle,
+    mm_generation: u32,
+    transaction_id: u32,
+) {
+    let Some(process_token) = handle.lifecycle_token_slot() else {
+        return;
+    };
+    let mm_transaction = (u64::from(mm_generation) << 32) | u64::from(transaction_id);
+    crate::debug::record_milestone(
+        crate::debug::LogCategory::Process,
+        name,
+        process_token,
+        mm_transaction,
+    );
+}
+
+#[cfg(not(rustos_lifecycle_trace))]
+#[inline]
+fn record_lifecycle_marker(
+    _name: &'static str,
+    _handle: ProcessHandle,
+    _mm_generation: u32,
+    _transaction_id: u32,
+) {
+}
 
 /// Republishes `index`'s unlocked view from the authoritative slot.
 fn publish_slot_visibility(index: usize, slot: &ProcessSlot) {
@@ -430,28 +518,23 @@ fn reclaim_slot(index: usize, slot: &mut ProcessSlot) -> Option<Box<ProcessObjec
     Some(object)
 }
 
+#[cfg(test)]
 pub fn create_process(process_id: u64, state: UserProcessState) -> Option<ProcessHandle> {
     create_process_with_parent(process_id, None, state)
 }
 
+#[cfg(test)]
 pub fn create_process_with_parent(
     process_id: u64,
     parent_process_id: Option<u64>,
     state: UserProcessState,
 ) -> Option<ProcessHandle> {
-    let object = Box::new(ProcessObject::new(process_id, parent_process_id, state));
-    // Allocation and construction may enter the heap. Publish only the
-    // completed object while holding the process-table spin lock.
-    let mut table = PROCESS_TABLE.lock();
-    let (index, slot) = table
-        .slots
-        .iter_mut()
-        .enumerate()
-        .find(|(_, slot)| slot.object.is_none() && slot.generation != 0)?;
-    slot.object = Some(object);
-    publish_slot_visibility(index, slot);
-    let handle = ProcessHandle::new(index, slot.generation);
-    Some(handle)
+    let reservation = reserve_spawn()?;
+    let handle = publish_spawn(reservation, process_id, parent_process_id, state);
+    if handle.is_none() {
+        let _ = cancel_spawn(reservation);
+    }
+    handle
 }
 
 pub fn attach_task(handle: ProcessHandle) -> Option<()> {
@@ -472,10 +555,14 @@ pub fn attach_task(handle: ProcessHandle) -> Option<()> {
 
 pub fn detach_task(handle: ProcessHandle) -> Option<()> {
     let mut table = PROCESS_TABLE.lock();
-    let should_queue = {
+    let (should_queue, exit_marker) = {
         let object = table.lookup_object_mut(handle)?;
         if object.thread_count == 0 || object.ref_count == 0 {
             return Some(());
+        }
+        let final_thread_starts_exit = object.thread_count == 1 && !object.exiting;
+        if final_thread_starts_exit {
+            object.lifecycle_transaction_id = allocate_lifecycle_transaction_id()?;
         }
         object.thread_count -= 1;
         object.ref_count -= 1;
@@ -487,10 +574,23 @@ pub fn detach_task(handle: ProcessHandle) -> Option<()> {
         if should_queue {
             object.queued_for_reap = true;
         }
-        should_queue
+        (
+            should_queue,
+            final_thread_starts_exit
+                .then_some((object.mm_generation, object.lifecycle_transaction_id)),
+        )
     };
     if should_queue {
         table.push_reap_handle(handle);
+    }
+    drop(table);
+    if let Some((mm_generation, transaction_id)) = exit_marker {
+        record_lifecycle_marker(
+            "lifecycle-exit-final-thread",
+            handle,
+            mm_generation,
+            transaction_id,
+        );
     }
     Some(())
 }
@@ -666,7 +766,7 @@ pub fn stage_exec_state(
     exec_path: &str,
 ) -> Option<StagedExec> {
     let process = retain_process(reservation.handle)?;
-    process.with_state_mut(|process_id, state| {
+    let staged = process.with_state_mut(|process_id, state| {
         {
             let mut table = PROCESS_TABLE.lock();
             let object = table.lookup_object_mut(reservation.handle)?;
@@ -704,7 +804,16 @@ pub fn stage_exec_state(
             closed,
             old_state,
         })
-    })
+    });
+    if staged.is_some() {
+        record_lifecycle_marker(
+            "lifecycle-exec-stage",
+            reservation.handle,
+            reservation.next_mm_generation,
+            reservation.transaction_id,
+        );
+    }
+    staged
 }
 
 pub fn finalize_exec_state(staged: StagedExec, published_handle: ProcessHandle) -> ExecFinalize {
@@ -729,12 +838,26 @@ pub fn finalize_exec_state(staged: StagedExec, published_handle: ProcessHandle) 
         object.exec_state_staged = false;
         let exit_pending = core::mem::take(&mut object.exit_pending);
         if exit_pending {
+            object.lifecycle_transaction_id = object
+                .pending_exit_transaction_id
+                .take()
+                .expect("exec exit-pending latch lost its transaction identity");
             object.exiting = true;
         }
         let index = staged.reservation.handle.index();
         publish_slot_visibility(index, &table.slots[index]);
         exit_pending
     };
+    record_lifecycle_marker(
+        if exit_pending {
+            "lifecycle-exec-publish-exit-pending"
+        } else {
+            "lifecycle-exec-publish"
+        },
+        staged.reservation.handle,
+        staged.reservation.next_mm_generation,
+        staged.reservation.transaction_id,
+    );
     ExecFinalize {
         process_id: staged.process_id,
         exit_pending,
@@ -752,6 +875,7 @@ fn exec_may_replace(object: &ProcessObject) -> bool {
 
 fn exec_reservation_matches(object: &ProcessObject, reservation: ExecReservation) -> bool {
     object.exec_in_progress
+        && object.lifecycle_transaction_id == reservation.transaction_id
         && object.mm_generation == reservation.expected_mm_generation
         && ProcessTable::next_generation(object.mm_generation)
             == Some(reservation.next_mm_generation)
@@ -781,13 +905,24 @@ pub fn begin_exec(handle: ProcessHandle) -> Option<ExecReservation> {
         return None;
     }
     let next_mm_generation = ProcessTable::next_generation(object.mm_generation)?;
+    let transaction_id = allocate_lifecycle_transaction_id()?;
     object.exec_in_progress = true;
     object.exec_commit_authorized = false;
-    Some(ExecReservation {
+    object.lifecycle_transaction_id = transaction_id;
+    let reservation = ExecReservation {
         handle,
         expected_mm_generation: object.mm_generation,
         next_mm_generation,
-    })
+        transaction_id,
+    };
+    drop(table);
+    record_lifecycle_marker(
+        "lifecycle-exec-reserve",
+        handle,
+        reservation.expected_mm_generation,
+        transaction_id,
+    );
+    Some(reservation)
 }
 
 pub fn authorize_exec(reservation: ExecReservation) -> bool {
@@ -799,6 +934,13 @@ pub fn authorize_exec(reservation: ExecReservation) -> bool {
         return false;
     }
     object.exec_commit_authorized = true;
+    drop(table);
+    record_lifecycle_marker(
+        "lifecycle-exec-authorize",
+        reservation.handle,
+        reservation.expected_mm_generation,
+        reservation.transaction_id,
+    );
     true
 }
 
@@ -816,6 +958,32 @@ pub fn cancel_exec(reservation: ExecReservation) -> bool {
     object.exec_in_progress = false;
     object.exec_commit_authorized = false;
     object.exec_state_staged = false;
+    let exit_transaction = if core::mem::take(&mut object.exit_pending) {
+        let transaction_id = object
+            .pending_exit_transaction_id
+            .take()
+            .expect("exec cancellation lost pending exit transaction identity");
+        object.lifecycle_transaction_id = transaction_id;
+        object.exiting = true;
+        Some((object.mm_generation, transaction_id))
+    } else {
+        None
+    };
+    drop(table);
+    record_lifecycle_marker(
+        "lifecycle-exec-cancel",
+        reservation.handle,
+        reservation.expected_mm_generation,
+        reservation.transaction_id,
+    );
+    if let Some((mm_generation, transaction_id)) = exit_transaction {
+        record_lifecycle_marker(
+            "lifecycle-exit-after-exec-cancel",
+            reservation.handle,
+            mm_generation,
+            transaction_id,
+        );
+    }
     true
 }
 
@@ -861,16 +1029,38 @@ pub fn note_process_continued(process_id: u64) -> Option<()> {
 /// reaps it, but new authority publication must fail once this bit is set.
 pub fn mark_process_exiting(process_id: u64) -> Option<()> {
     let mut table = PROCESS_TABLE.lock();
-    let object = table
-        .slots
-        .iter_mut()
-        .filter_map(|slot| slot.object.as_deref_mut())
-        .find(|object| object.process_id == process_id)?;
+    let index = table.slots.iter().position(|slot| {
+        slot.object
+            .as_deref()
+            .is_some_and(|object| object.process_id == process_id)
+    })?;
+    let handle = ProcessHandle::new(index, table.slots[index].generation);
+    let object = table.slots[index].object.as_deref_mut()?;
     if object.exec_in_progress {
+        let first = !object.exit_pending;
+        if first {
+            object.pending_exit_transaction_id = Some(allocate_lifecycle_transaction_id()?);
+        }
         object.exit_pending = true;
+        let marker = first.then_some((object.mm_generation, object.pending_exit_transaction_id?));
+        drop(table);
+        if let Some((mm_generation, transaction_id)) = marker {
+            record_lifecycle_marker(
+                "lifecycle-exit-pending",
+                handle,
+                mm_generation,
+                transaction_id,
+            );
+        }
         return None;
     }
+    if !object.exiting {
+        object.lifecycle_transaction_id = allocate_lifecycle_transaction_id()?;
+    }
     object.exiting = true;
+    let marker = (object.mm_generation, object.lifecycle_transaction_id);
+    drop(table);
+    record_lifecycle_marker("lifecycle-exit-seal", handle, marker.0, marker.1);
     Some(())
 }
 
@@ -879,17 +1069,41 @@ pub fn mark_process_exiting(process_id: u64) -> Option<()> {
 /// service-side open-description teardown under concurrent exit_group calls.
 pub fn mark_process_exiting_once(process_id: u64) -> Option<bool> {
     let mut table = PROCESS_TABLE.lock();
-    let object = table
-        .slots
-        .iter_mut()
-        .filter_map(|slot| slot.object.as_deref_mut())
-        .find(|object| object.process_id == process_id)?;
+    let index = table.slots.iter().position(|slot| {
+        slot.object
+            .as_deref()
+            .is_some_and(|object| object.process_id == process_id)
+    })?;
+    let handle = ProcessHandle::new(index, table.slots[index].generation);
+    let object = table.slots[index].object.as_deref_mut()?;
     if object.exec_in_progress {
+        let first = !object.exit_pending;
+        if first {
+            object.pending_exit_transaction_id = Some(allocate_lifecycle_transaction_id()?);
+        }
         object.exit_pending = true;
+        let marker = first.then_some((object.mm_generation, object.pending_exit_transaction_id?));
+        drop(table);
+        if let Some((mm_generation, transaction_id)) = marker {
+            record_lifecycle_marker(
+                "lifecycle-exit-pending",
+                handle,
+                mm_generation,
+                transaction_id,
+            );
+        }
         return Some(false);
     }
     let first = !object.exiting;
+    if first {
+        object.lifecycle_transaction_id = allocate_lifecycle_transaction_id()?;
+    }
     object.exiting = true;
+    let marker = first.then_some((object.mm_generation, object.lifecycle_transaction_id));
+    drop(table);
+    if let Some((mm_generation, transaction_id)) = marker {
+        record_lifecycle_marker("lifecycle-exit-seal", handle, mm_generation, transaction_id);
+    }
     Some(first)
 }
 
@@ -922,6 +1136,7 @@ pub fn wait_for_child(
     let mut table = PROCESS_TABLE.lock();
     let mut saw_child = false;
     let mut queued_handle = None;
+    let mut queued_identity = None;
     let mut exited = None;
 
     for (index, slot) in table.slots.iter_mut().enumerate() {
@@ -946,7 +1161,13 @@ pub fn wait_for_child(
             object.waited = true;
             if object.thread_count == 0 && object.ref_count == 0 && !object.queued_for_reap {
                 object.queued_for_reap = true;
-                queued_handle = Some(ProcessHandle::new(index, slot.generation));
+                let handle = ProcessHandle::new(index, slot.generation);
+                queued_handle = Some(handle);
+                queued_identity = Some((
+                    handle,
+                    object.mm_generation,
+                    object.lifecycle_transaction_id,
+                ));
             }
             exited = Some(WaitResult::Exited { pid, status });
             break;
@@ -969,6 +1190,16 @@ pub fn wait_for_child(
         table.push_reap_handle(handle);
     }
 
+    drop(table);
+    if let Some((handle, mm_generation, transaction_id)) = queued_identity {
+        record_lifecycle_marker(
+            "lifecycle-reap-queued",
+            handle,
+            mm_generation,
+            transaction_id,
+        );
+    }
+
     if let Some(result) = exited {
         return result;
     }
@@ -984,6 +1215,8 @@ pub fn reap_exited_processes() -> usize {
     let mut reclaimed: [Option<Box<ProcessObject>>; MAX_PROCESS_OBJECTS] =
         [const { None }; MAX_PROCESS_OBJECTS];
     let mut reclaimed_len = 0usize;
+    let mut markers: [Option<(ProcessHandle, u32, u32)>; MAX_PROCESS_OBJECTS] =
+        [const { None }; MAX_PROCESS_OBJECTS];
 
     {
         let mut table = PROCESS_TABLE.lock();
@@ -995,23 +1228,49 @@ pub fn reap_exited_processes() -> usize {
             let Some(slot) = table.lookup_slot_mut(handle) else {
                 continue;
             };
+            let identity = slot.object.as_deref().map(|object| {
+                (
+                    handle,
+                    object.mm_generation,
+                    object.lifecycle_transaction_id,
+                )
+            });
             let Some(object) = reclaim_slot(index, slot) else {
                 continue;
             };
+            markers[reclaimed_len] = identity;
             reclaimed[reclaimed_len] = Some(object);
             reclaimed_len += 1;
             reaped += 1;
         }
         if scan_all {
             for (index, slot) in table.slots.iter_mut().enumerate() {
+                let handle = ProcessHandle::new(index, slot.generation);
+                let identity = slot.object.as_deref().map(|object| {
+                    (
+                        handle,
+                        object.mm_generation,
+                        object.lifecycle_transaction_id,
+                    )
+                });
                 let Some(object) = reclaim_slot(index, slot) else {
                     continue;
                 };
+                markers[reclaimed_len] = identity;
                 reclaimed[reclaimed_len] = Some(object);
                 reclaimed_len += 1;
                 reaped += 1;
             }
         }
+    }
+    for (handle, mm_generation, transaction_id) in markers.into_iter().take(reclaimed_len).flatten()
+    {
+        record_lifecycle_marker(
+            "lifecycle-reap-complete",
+            handle,
+            mm_generation,
+            transaction_id,
+        );
     }
     drop(reclaimed);
     reaped
@@ -1019,6 +1278,7 @@ pub fn reap_exited_processes() -> usize {
 
 #[cfg(test)]
 fn reset_for_tests() {
+    NEXT_LIFECYCLE_TRANSACTION_ID.store(1, Ordering::Relaxed);
     let retired = {
         let mut table = PROCESS_TABLE.lock();
         let retired = core::mem::replace(&mut *table, ProcessTable::new());
@@ -1037,6 +1297,8 @@ fn reset_for_tests() {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use core::sync::atomic::AtomicU64;
+
     use super::{
         ExecReservation, ProcessHandle, ProcessObject, ProcessTable, WaitResult, attach_task,
         begin_exec, cancel_exec, create_process, create_process_with_parent, detach_task,
@@ -1105,6 +1367,76 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn lifecycle_transaction_ids_are_nonzero_unique_and_fail_closed_at_exhaustion() {
+        let counter = AtomicU64::new(1);
+        assert_eq!(
+            super::allocate_nonwrapping_lifecycle_transaction_id(&counter),
+            Some(1)
+        );
+        assert_eq!(
+            super::allocate_nonwrapping_lifecycle_transaction_id(&counter),
+            Some(2)
+        );
+
+        let exhausted = AtomicU64::new(u64::from(u32::MAX));
+        assert_eq!(
+            super::allocate_nonwrapping_lifecycle_transaction_id(&exhausted),
+            Some(u32::MAX)
+        );
+        assert_eq!(
+            super::allocate_nonwrapping_lifecycle_transaction_id(&exhausted),
+            None
+        );
+    }
+
+    #[test]
+    fn stale_exec_transaction_id_cannot_authorize_or_cancel_live_reservation() {
+        let _isolation = isolate_process_table();
+        let handle = create_process(5_050, new_state()).expect("process handle");
+        let reservation = begin_exec(handle).expect("exec reservation");
+        let stale = ExecReservation {
+            transaction_id: reservation.transaction_id.wrapping_add(1),
+            ..reservation
+        };
+        assert!(!super::authorize_exec(stale));
+        assert!(!cancel_exec(stale));
+        assert!(cancel_exec(reservation));
+    }
+
+    #[test]
+    fn exit_pending_wins_when_exec_is_cancelled() {
+        let _isolation = isolate_process_table();
+        let handle = create_process(5_051, new_state()).expect("process handle");
+        let reservation = begin_exec(handle).expect("exec reservation");
+        assert_eq!(mark_process_exiting(5_051), None);
+        assert!(cancel_exec(reservation));
+        assert_eq!(is_process_exiting(5_051), Some(true));
+        assert_eq!(attach_task(handle), None);
+        detach_task(handle).expect("detach exiting task");
+        assert_eq!(reap_exited_processes(), 1);
+    }
+
+    #[test]
+    fn parent_wait_is_required_before_child_reap() {
+        let _isolation = isolate_process_table();
+        let parent = create_process(5_060, new_state()).expect("parent");
+        let child = create_process_with_parent(5_061, Some(5_060), new_state()).expect("child");
+        note_process_exit_status(5_061, 0).expect("child exit status");
+        detach_task(child).expect("child detach");
+        assert_eq!(reap_exited_processes(), 0);
+        assert!(matches!(
+            wait_for_child(5_060, 5_061, false, false),
+            WaitResult::Exited {
+                pid: 5_061,
+                status: 0
+            }
+        ));
+        assert_eq!(reap_exited_processes(), 1);
+        detach_task(parent).expect("parent detach");
+        assert_eq!(reap_exited_processes(), 1);
+    }
+
+    #[test]
     fn retained_ref_delays_reclaim_until_drop() {
         let _guard = lock_process_table_for_tests();
         let handle = create_process(42, new_state()).expect("process handle");
@@ -1141,7 +1473,7 @@ pub(crate) mod tests {
 
     #[test]
     fn process_address_space_and_exec_exit_are_serialized() {
-        let mut object = ProcessObject::new(7, None, new_state());
+        let mut object = ProcessObject::new(7, None, new_state(), 41);
         let held = object.state.lock();
         assert!(object.state.try_lock().is_none());
         drop(held);
@@ -1155,6 +1487,7 @@ pub(crate) mod tests {
             handle: ProcessHandle::new(0, 1),
             expected_mm_generation: object.mm_generation,
             next_mm_generation: object.mm_generation + 1,
+            transaction_id: object.lifecycle_transaction_id,
         };
         object.exit_pending = true;
         assert!(super::exec_commit_may_transfer(&object, reservation));

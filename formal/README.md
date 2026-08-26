@@ -147,6 +147,16 @@ The full formal gate also runs the Rust implementation proofs:
     bash formal/setup-herdtools.sh # once, with documented OCaml prerequisites
     bash formal/verify-all.sh --profile pr
 
+The Kani lane retains successful package logs in
+`build/formal/kani-cache-v1/`. A cache key covers the pinned Kani version,
+proof policy/scripts, workspace lock/configuration, and every non-ignored file
+in the selected package's complete local Cargo dependency closure. A hit is
+still rescanned for failed or uncovered properties and a new normalized
+summary is emitted for the current verification run. Consequently an
+unrelated model or documentation edit does not repeat four unchanged proof
+builds, while a source, dependency, harness, tool, or proof-policy change
+cannot reuse the old result.
+
 For an iterative multi-vCPU debugging boot, use the bounded exact-tree SMP
 profile instead:
 
@@ -220,6 +230,7 @@ and counterexamples are retained under `build/formal/`.
 | physical-frame-lifecycle/PhysicalFrameLifecycle | `kernel-mm` boot physical-frame allocator | only aligned firmware-usable frames below the direct-map ceiling enter the free set; kernel/module reservations are monotonic before allocation; allocation and exact release preserve single ownership; invalid/double release and exhaustion fail without minting capacity |
 | service-heap-lifecycle/ServiceHeapLifecycle | `rustos-svc-runtime` allocator, syscalld VM policy, xtask KVM health oracle | dropped service allocations return exact spans to an address-ordered coalescing free set; growth occurs only after no reusable span fits; Linux mapping hints wrap to released gaps; allocation and fatal core-service failures are explicit failed runtime evidence |
 | process-address-space-lifetime/ProcessAddressSpaceLifetime | `kernel-ps` process table and `UserProcessState` | every state/address-space access holds one retained process reference and the per-process mutex; exit freezes the address-space epoch, stale exec cannot clear it, a prepared thread attachment cannot publish after exit and must release its unpublished stack, and reclamation waits for all authority to disappear |
+| process-lifecycle-transaction/ProcessLifecycleTransaction | `kernel-ps` process table plus `kernel-mm` address-space rollback and physical allocator | non-reused transactions separate spawn, exec, pending exit, and reap; attachment closes during exec/exit; exact process/MM generations reject stale completion; partial unpublished frame batches roll back after shootdown; published frames remain owned until task/reference and external authority settle |
 | futex-waiter-lifecycle/FutexWaiterLifecycle | Linux futex scheduler substrate | a task owns at most one bounded waiter and original identity; requeue changes only its active key; keyed wake, key-independent timeout/spurious wake, and every retirement leave one explicit terminal outcome; the exact 24-byte robust-list ABI is snapshotted per thread, traversed at most 2048 entries, includes the pending operation, marks only words still owned by the retiring task as owner-died, and wakes an existing waiter before slot reuse |
 | kernel-resource-accounting/KernelResourceAccounting | IPC endpoint/shared-region allocation and process task admission | process and task owners reserve endpoint quota before queue allocation; process-owned regions have object and byte ceilings plus a global byte ceiling; dropped backing remains charged through deferred physical reclaim; one process cannot consume the global scheduler task table |
 | process-signal-delivery/ProcessSignalDelivery | procd policy, HAL fault handoff, scheduler job-control gate, child wait state, and ring0 signal substrate | ring0 consumes only a still-pending unmasked signal; SIGKILL can only terminate and SIGSTOP can only stop; SIGCONT resumes the complete process before disposition; `WUNTRACED`/`WCONTINUED` consume exact child state; invalid targets and stale policy replies cannot redirect execution; recoverable faults retain authority while fatal final-thread faults revoke it |
@@ -568,7 +579,9 @@ can distinguish.
 The pre-QEMU transaction set additionally includes
 `user-stack-growth/UserStackGrowth` for recoverable page faults,
 `exec-address-space-transaction/ExecAddressSpaceTransaction` for active-root
-ownership, `gpu-submit-transaction/GpuSubmitTransaction` for rejected-submit
+ownership, `process-lifecycle-transaction/ProcessLifecycleTransaction` for
+spawn/exec/exit/reap and partial-frame rollback,
+`gpu-submit-transaction/GpuSubmitTransaction` for rejected-submit
 rollback, and
 `acceptance-profile-publication/AcceptanceProfilePublication` for bounded late
 observer activation. `robust-futex-owner-death/RobustFutexOwnerDeath` includes

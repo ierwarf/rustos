@@ -2026,19 +2026,86 @@ fn prepare_recv_with_sender(
     ),
     i64,
 > {
+    let retained_mm =
+        usermem::current_user_address_space().map_err(address_space_error_to_linux_errno)?;
+    prepare_recv_with_sender_retained(
+        endpoint,
+        request_ptr,
+        request_capacity,
+        reply_cap_ptr,
+        sender_pid_ptr,
+        sender_tid_ptr,
+        retained_mm,
+    )
+}
+
+fn prepare_recv_with_sender_retained(
+    endpoint: u64,
+    request_ptr: u64,
+    request_capacity: u64,
+    reply_cap_ptr: u64,
+    sender_pid_ptr: u64,
+    sender_tid_ptr: u64,
+    retained_mm: multitask::RetainedCurrentUserAddressSpace,
+) -> Result<
+    (
+        KernelEndpointHandle,
+        u64,
+        u64,
+        usize,
+        multitask::RetainedCurrentUserAddressSpace,
+    ),
+    i64,
+> {
+    let (endpoint, task_id, process_id, request_capacity, retained_mm) =
+        prepare_recv_identity(endpoint, request_capacity, retained_mm)?;
+    validate_recv_with_sender_buffers(
+        &retained_mm,
+        request_ptr,
+        request_capacity,
+        reply_cap_ptr,
+        sender_pid_ptr,
+        sender_tid_ptr,
+    )?;
+    Ok((endpoint, task_id, process_id, request_capacity, retained_mm))
+}
+
+fn prepare_recv_identity(
+    endpoint: u64,
+    request_capacity: u64,
+    retained_mm: multitask::RetainedCurrentUserAddressSpace,
+) -> Result<
+    (
+        KernelEndpointHandle,
+        u64,
+        u64,
+        usize,
+        multitask::RetainedCurrentUserAddressSpace,
+    ),
+    i64,
+> {
     let endpoint = KernelEndpointHandle::from_raw(endpoint);
-    let task_id = multitask::current_task_id().ok_or(LINUX_EINVAL)?;
-    let process_id = multitask::current_user_process_id().ok_or(LINUX_EINVAL)?;
+    let task_id = retained_mm.thread_id();
+    let process_id = retained_mm.process_id();
     kernel_ipc_runtime::api::authorize_endpoint_receiver_for_process(endpoint, process_id)
         .map_err(ipc_error_to_linux_errno)?;
     let request_capacity = usize::try_from(request_capacity).map_err(|_| LINUX_EINVAL)?;
     if request_capacity > rustos_user_abi::syscall::IPC_MAX_INLINE_BYTES {
         return Err(LINUX_EINVAL);
     }
-    let retained_mm =
-        usermem::current_user_address_space().map_err(address_space_error_to_linux_errno)?;
+    Ok((endpoint, task_id, process_id, request_capacity, retained_mm))
+}
+
+fn validate_recv_with_sender_buffers(
+    retained_mm: &multitask::RetainedCurrentUserAddressSpace,
+    request_ptr: u64,
+    request_capacity: usize,
+    reply_cap_ptr: u64,
+    sender_pid_ptr: u64,
+    sender_tid_ptr: u64,
+) -> Result<(), i64> {
     usermem::validate_retained_user_write_buffers(
-        &retained_mm,
+        retained_mm,
         &[
             (request_ptr, request_capacity),
             (reply_cap_ptr, size_of::<u64>()),
@@ -2047,7 +2114,7 @@ fn prepare_recv_with_sender(
         ],
     )
     .map_err(address_space_error_to_linux_errno)?;
-    Ok((endpoint, task_id, process_id, request_capacity, retained_mm))
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

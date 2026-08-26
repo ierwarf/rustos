@@ -46,7 +46,9 @@ use rustos_user_abi::syscall::{
 };
 use rustos_user_abi::windows::ERROR_INVALID_PARAMETER;
 
-use syscalld::{affinity_policy, errno, fast_offload};
+use syscalld::{
+    affinity_policy, classify_reply_recv_recovery, errno, fast_offload, ReplyRecvRecoveryAction,
+};
 mod linux_policy;
 mod mmap_policy;
 mod vma_policy;
@@ -91,24 +93,28 @@ fn service_main() {
 }
 
 fn serve(endpoint: u64) {
+    let mut request = [0_u8; IPC_MAX_INLINE_BYTES];
+    let mut reply_cap = 0_u64;
+    let mut sender_pid = 0_u64;
+    let mut sender_tid = 0_u64;
+    let mut received = recv_syscall_request(
+        endpoint,
+        &mut request,
+        &mut reply_cap,
+        &mut sender_pid,
+        &mut sender_tid,
+    );
     loop {
-        let mut request = [0_u8; IPC_MAX_INLINE_BYTES];
-        let mut reply_cap = 0_u64;
-        let mut sender_pid = 0_u64;
-        let mut sender_tid = 0_u64;
-        let received = unsafe {
-            ipc::recv_with_sender(
-                endpoint,
-                request.as_mut_ptr(),
-                request.len(),
-                &mut reply_cap as *mut u64,
-                &mut sender_pid as *mut u64,
-                &mut sender_tid as *mut u64,
-            )
-        };
         if received < 0 {
-            // Brief back-off (raw nanosleep, ~10 ms) before retrying.
+            // Brief back-off before a fresh receive after an endpoint error.
             errno::sleep_millis(1);
+            received = recv_syscall_request(
+                endpoint,
+                &mut request,
+                &mut reply_cap,
+                &mut sender_pid,
+                &mut sender_tid,
+            );
             continue;
         }
 
@@ -117,11 +123,97 @@ fn serve(endpoint: u64) {
         // so syscalld recovery never participates in a bootstrap IPC cycle.
         drain_lifecycle_events();
         let response = handle_request(received as usize, &request, sender_pid, sender_tid);
-        let reply = unsafe { ipc::reply(reply_cap, response.as_ptr(), response.len()) };
-        if reply < 0 {
-            ipc::debug_line("syscalld: reply failed");
+        let next_received = reply_recv_syscall_request(
+            endpoint,
+            reply_cap,
+            response.as_ptr(),
+            response.len(),
+            &mut request,
+            &mut reply_cap,
+            &mut sender_pid,
+            &mut sender_tid,
+        );
+        received = if next_received < 0 {
+            recv_syscall_request(
+                endpoint,
+                &mut request,
+                &mut reply_cap,
+                &mut sender_pid,
+                &mut sender_tid,
+            )
+        } else {
+            next_received
+        };
+    }
+}
+
+fn recv_syscall_request(
+    endpoint: u64,
+    request: &mut [u8; IPC_MAX_INLINE_BYTES],
+    reply_cap: &mut u64,
+    sender_pid: &mut u64,
+    sender_tid: &mut u64,
+) -> i64 {
+    // SAFETY: every output is exclusive and remains live for the complete
+    // blocking receive.
+    unsafe {
+        ipc::recv_with_sender(
+            endpoint,
+            request.as_mut_ptr(),
+            request.len(),
+            reply_cap,
+            sender_pid,
+            sender_tid,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reply_recv_syscall_request(
+    endpoint: u64,
+    reply_cap: u64,
+    response: *const u8,
+    response_len: usize,
+    request: &mut [u8; IPC_MAX_INLINE_BYTES],
+    next_reply_cap: &mut u64,
+    sender_pid: &mut u64,
+    sender_tid: &mut u64,
+) -> i64 {
+    // SAFETY: response and request storage remain live and disjoint until the
+    // fused syscall returns; every output is exclusively borrowed.
+    let result = unsafe {
+        ipc::reply_recv_with_sender(
+            endpoint,
+            reply_cap,
+            response,
+            response_len,
+            request.as_mut_ptr(),
+            request.len(),
+            next_reply_cap,
+            sender_pid,
+            sender_tid,
+        )
+    };
+    match classify_reply_recv_recovery(result) {
+        ReplyRecvRecoveryAction::None => {}
+        ReplyRecvRecoveryAction::PostCommit(_) => {
+            ipc::debug_line("syscalld: reply-recv receive failed");
+        }
+        ReplyRecvRecoveryAction::RetryReply(_) => {
+            ipc::debug_line("syscalld: reply-recv reply failed");
+            // SAFETY: only the pre-commit result partition reaches this arm,
+            // so the old reply capability and immutable response remain live
+            // for exactly one terminal recovery attempt.
+            let recovery = unsafe { ipc::reply(reply_cap, response, response_len) };
+            if recovery < 0 {
+                ipc::debug_line("syscalld: reply-recv recovery failed");
+            }
+        }
+        ReplyRecvRecoveryAction::ProtocolViolation => {
+            panic!("syscalld: invalid reply-recv result outside native ABI partition")
         }
     }
+    result
 }
 
 fn drain_lifecycle_events() {

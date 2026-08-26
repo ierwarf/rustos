@@ -103,6 +103,14 @@ phase_profile = false
 # the cost of an instrumented syscall, not of a syscall.
 phase_profile = false
 
+[lifecycle_telemetry]
+# Emits an exact checksum-framed marker for spawn/exec/exit/reap stages. Each
+# marker carries process slot+generation, MM generation, and a non-reusable
+# transaction ID. Debugcon formatting is intentionally expensive, so keep this
+# off for shipping latency measurements and enable it only for an identity/
+# fault trace: `RUSTOS_LIFECYCLE_TRACE=true cargo xtask bench --build`.
+phase_profile = false
+
 [kernel.build]
 # Hardened/release-oriented kernel build knobs. Copy this block, or this whole
 # file, into config/rustos.toml when testing a release-shaped image.

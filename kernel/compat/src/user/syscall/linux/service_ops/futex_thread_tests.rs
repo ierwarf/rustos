@@ -1,6 +1,27 @@
 use super::*;
 
 #[test]
+fn futex_return_advances_retired_thread_cleanup_before_userspace_join_resumes() {
+    let source = include_str!("futex_thread.rs");
+    let dispatch = source
+        .split("pub fn futex_impl")
+        .nth(1)
+        .and_then(|rest| rest.split("fn validate_futex_policy_locally").next())
+        .expect("futex dispatch");
+    let runtime_cleanup = dispatch
+        .find("service_retired_task_runtime_cleanup(RETIRED_TASK_CLEANUP_BUDGET)")
+        .expect("bounded retired-thread runtime cleanup");
+    let scheduler_reap = dispatch
+        .find("multitask::service_deferred_work()")
+        .expect("scheduler retirement progress");
+    let userspace_return = dispatch
+        .find("match result")
+        .expect("userspace result publication");
+    assert!(runtime_cleanup < scheduler_reap);
+    assert!(scheduler_reap < userspace_return);
+}
+
+#[test]
 fn futex_keys_preserve_private_generation_and_shared_backing_identity() {
     let shared_alias_a = FutexKey::Shared {
         backing: multitask::SharedFutexBackingKey::Memfd {

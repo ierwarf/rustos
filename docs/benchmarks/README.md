@@ -1559,3 +1559,54 @@ intentionally changing source tree; ordinary smoke and qualification commands
 remain strict. A multi-vCPU or isolated diagnostic gets a bounded 60-second
 terminal budget because a second eight-vCPU repeat completed the product UI
 but crossed the former 30-second harness cutoff before `ipcbench: end`.
+
+## Phase 6 process-lifecycle and frame-settlement checkpoint
+
+The Phase-6 lifecycle probes use the ordinary process ABI. An isolated run
+also executes `vmexit_cpuid`, which changes no RustOS phase or frame counter and
+anchors every target-only comparison. With `RUSTOS_LIFECYCLE_TRACE=true`, a
+fresh one-vCPU `fork_exec_exit_wait` run carried all required exact-target
+markers for 34 warmup-plus-measured children: spawn reserve/publish, exec
+reserve/authorize/stage/publish, exit seal, and reap completion. The first and
+last records retained distinct process generations and non-reused lifecycle
+transactions; the measured 32 children also carried `reap-queued`. The trace
+run passed exact-target and phase isolation with a 3,440-cycle anchor p50.
+Trace-enabled latency is diagnostic and is not compared with shipping builds.
+
+Fresh shipping one-vCPU results after the exact pre-map spawn reservation and
+batched frame return were:
+
+| probe | min cycles | p50 cycles | p99 cycles |
+| --- | ---: | ---: | ---: |
+| `fork_exit_wait` | 61,186,880 | 132,670,840 | 197,724,360 |
+| `fork_exec_exit_wait` | 266,364,360 | 335,289,200 | 754,290,400 |
+| `thread_clone_exit_join` | 2,902,520 | 40,854,960 | 190,787,960 |
+| `exec_replace_single_thread` | 160,459,120 | 222,626,440 | 348,398,880 |
+| `spawn_activation_to_first_turn` | 28,249,800 | 61,506,600 | 83,408,280 |
+| `exit_retire_to_reap` | 27,843,400 | 68,890,280 | 137,308,560 |
+
+Every successful run passed isolated attribution. One first
+`exit_retire_to_reap` boot completed the benchmark but missed unrelated UI
+terminal markers at the 60-second product-readiness boundary; the immediate
+fresh retry reached both guests' readiness and produced the row above. It is
+recorded as a harness/topology failure, not silently admitted as benchmark
+success.
+
+For 1,024-page map-touch-unmap, exact source-paired scalar-free/candidate/scalar-
+free A-B-A controls held the anchor p50 at 3,640 cycles and its minimum within
+1.1%. Candidate p50 was 7,050,160 cycles versus 8,076,240 and 7,458,080 in the
+two scalar controls (-12.7% and -5.5%); its mean was lower by 1.3% and 7.1%.
+The p99 ordering was not repeatable and makes no tail claim. More importantly,
+the scalar source requires 40,960 free-side allocator acquisitions, while the
+candidate measured 640 exact 64-frame acquisitions: a structural 64x lock
+reduction without weakening ownership checks.
+
+After the unreserved lifecycle aliases were removed, the final exact-tree
+rerun retained the result. On one vCPU the 1,024-page probe reported min/p50
+6,002,880/6,384,800 cycles with allocation and free both 41,058 frames in 642
+bounded operations. On eight vCPUs it reported 6,149,960/6,477,200 cycles; the
+eight-vCPU `fork_exit_wait` min/p50 was 9,741,800/99,132,640 cycles. Both SMP
+runs passed the kernel-stamped semantic isolation gate. The final trace build
+again carried all nine required lifecycle stages for 34 exact identities with
+a 3,680-cycle anchor p50. These distributions establish the Phase-6 closure;
+they do not claim that desktop-contention p99 is stable.

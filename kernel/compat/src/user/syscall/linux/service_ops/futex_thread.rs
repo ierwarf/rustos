@@ -94,6 +94,13 @@ pub fn futex_impl(uaddr: u64, op: u64, val: u64, timeout_ptr: u64, uaddr2: u64, 
         }
         _ => Err(LINUX_ENOSYS),
     };
+    // A successful pthread join resumes through FUTEX_WAIT after the exiting
+    // child cleared its TID. Advance the same bounded retirement owner used by
+    // wait4 before returning to the joining thread, otherwise a tight
+    // create/join loop can pin every retired scheduler slot while executive
+    // housekeeping is starved.
+    let _ = service_retired_task_runtime_cleanup(RETIRED_TASK_CLEANUP_BUDGET);
+    multitask::service_deferred_work();
     match result {
         Ok(value) => value,
         Err(errno) => linux_errno(errno),

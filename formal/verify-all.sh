@@ -29,7 +29,16 @@ fi
 # workstation before every PR gate even though one complete four-shard run
 # needs less than half of that headroom. Operators can still raise the floor
 # explicitly for a smaller or shared volume.
-reclaim_threshold_kb="${RUSTOS_FORMAL_RECLAIM_THRESHOLD_KB:-$((4 * 1024 * 1024))}"
+# A warm mutation target is the dominant cache and is also required by this
+# very gate. Deleting it to cross the cold-start floor only recreates the same
+# bytes and turns every verification into a multi-minute rebuild. Once that
+# exact lane cache exists, retain it and require only incremental headroom.
+if [[ -d "$repo_root/build/formal/implementation-mutations/target" ]]; then
+    default_reclaim_threshold_kb=$((512 * 1024))
+else
+    default_reclaim_threshold_kb=$((4 * 1024 * 1024))
+fi
+reclaim_threshold_kb="${RUSTOS_FORMAL_RECLAIM_THRESHOLD_KB:-$default_reclaim_threshold_kb}"
 available_kb="$(df -Pk "$repo_root" | awk 'NR==2 {print $4}')"
 if [[ -n "$available_kb" && "$available_kb" -lt "$reclaim_threshold_kb" ]]; then
     printf 'formal: %s KiB free, reclaiming regenerable lane caches\n' "$available_kb"
@@ -113,7 +122,13 @@ run_parallel_lane spec-mutations bash formal/run-spec-mutations.sh
 run_parallel_lane fault-scenarios bash formal/run-fault-scenarios.sh
 run_parallel_lane abi-differential bash formal/run-abi-differential.sh
 run_parallel_lane recovery-scenarios bash formal/run-recovery-scenarios.sh
-run_parallel_lane implementation-mutations bash formal/run-implementation-mutations.sh
+if [[ "$profile" == nightly ]]; then
+    run_parallel_lane implementation-mutations env \
+        RUSTOS_IMPLEMENTATION_MUTATION_CACHE=off \
+        bash formal/run-implementation-mutations.sh
+else
+    run_parallel_lane implementation-mutations bash formal/run-implementation-mutations.sh
+fi
 run_parallel_lane kani env FORMAL_PROOF_INDEX_ALREADY_PASSED=1 bash formal/run-kani.sh
 run_parallel_lane verus env FORMAL_PROOF_INDEX_ALREADY_PASSED=1 bash formal/run-verus.sh
 run_parallel_lane concurrency-triangle bash formal/run-concurrency-triangle.sh

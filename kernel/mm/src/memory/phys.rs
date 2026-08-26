@@ -14,6 +14,7 @@
 //! - **Evidence:** `physical-frame-lifecycle`.
 use boot_protocol::{BootInfo, BootMemoryKind, BootMemoryRegion};
 use core::ptr;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
 use x86_64::PhysAddr;
@@ -29,6 +30,67 @@ const PHYS_ALLOC_SCAN_MILESTONE_FRAMES: usize = 64 * 1024;
 
 static PHYS_ALLOCATOR: TrackedSpinLock<PhysAllocatorState, { LockClass::PhysicalAllocator as u8 }> =
     TrackedSpinLock::new(PhysAllocatorState::new());
+
+/// Count-only workload evidence for the batched allocator. These atomics never
+/// participate in admission and add no TSC read to the allocator critical
+/// section. A drain publishes `(frames, lock acquisitions)` for each class.
+// ORDERING: Profile counts are diagnostic-only and intentionally approximate;
+// the AcqRel drain claim below only elects one emitter for each time window.
+struct FrameBatchProfile {
+    alloc_frames: AtomicU64,
+    alloc_batches: AtomicU64,
+    alloc_short: AtomicU64,
+    free_frames: AtomicU64,
+    free_batches: AtomicU64,
+    free_failures: AtomicU64,
+    rollback_frames: AtomicU64,
+    rollback_batches: AtomicU64,
+    rollback_failures: AtomicU64,
+    last_drain_tick: AtomicU64,
+}
+
+impl FrameBatchProfile {
+    const fn new() -> Self {
+        Self {
+            alloc_frames: AtomicU64::new(0),
+            alloc_batches: AtomicU64::new(0),
+            alloc_short: AtomicU64::new(0),
+            free_frames: AtomicU64::new(0),
+            free_batches: AtomicU64::new(0),
+            free_failures: AtomicU64::new(0),
+            rollback_frames: AtomicU64::new(0),
+            rollback_batches: AtomicU64::new(0),
+            rollback_failures: AtomicU64::new(0),
+            last_drain_tick: AtomicU64::new(0),
+        }
+    }
+
+    fn record_allocation(&self, requested: usize, filled: usize) {
+        self.alloc_frames
+            .fetch_add(filled as u64, Ordering::Relaxed);
+        self.alloc_batches.fetch_add(1, Ordering::Relaxed);
+        if filled < requested {
+            self.alloc_short.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn record_free(&self, frames: usize, failed: usize, rollback: bool) {
+        let freed = frames.saturating_sub(failed) as u64;
+        if rollback {
+            self.rollback_frames.fetch_add(freed, Ordering::Relaxed);
+            self.rollback_batches.fetch_add(1, Ordering::Relaxed);
+            self.rollback_failures
+                .fetch_add(failed as u64, Ordering::Relaxed);
+        } else {
+            self.free_frames.fetch_add(freed, Ordering::Relaxed);
+            self.free_batches.fetch_add(1, Ordering::Relaxed);
+            self.free_failures
+                .fetch_add(failed as u64, Ordering::Relaxed);
+        }
+    }
+}
+
+static FRAME_BATCH_PROFILE: FrameBatchProfile = FrameBatchProfile::new();
 
 #[inline]
 fn irq_safe<T>(f: impl FnOnce() -> T) -> T {
@@ -249,10 +311,19 @@ impl PhysAllocatorState {
     /// search this caller does not need and can fail under fragmentation
     /// where single-frame allocation would not.
     fn alloc_frames_locked(&mut self, out: &mut [PhysAddr]) -> usize {
+        self.alloc_frames_locked_with_fault_gate(out, || {
+            nucleus_core::util::fault_injection::should_fail("alloc.frame")
+        })
+    }
+
+    fn alloc_frames_locked_with_fault_gate(
+        &mut self,
+        out: &mut [PhysAddr],
+        mut should_fail: impl FnMut() -> bool,
+    ) -> usize {
         let mut filled = 0;
         while filled < out.len() {
-            let faulted = nucleus_core::util::fault_injection::should_fail("alloc.frame");
-            if faulted {
+            if should_fail() {
                 crate::debug::warn!(memory, "fault injection: alloc.frame failed");
                 break;
             }
@@ -632,7 +703,9 @@ pub fn try_free_frame(phys: PhysAddr) -> Result<(), FreeFrameError> {
 /// fill (fewer than `out.len()`) means the allocator ran out, mirroring what
 /// a per-page `alloc_frame()` loop would have found on its next iteration.
 pub fn alloc_frames_batch(out: &mut [PhysAddr]) -> usize {
-    irq_safe(|| PHYS_ALLOCATOR.lock().alloc_frames_locked(out))
+    let filled = irq_safe(|| PHYS_ALLOCATOR.lock().alloc_frames_locked(out));
+    FRAME_BATCH_PROFILE.record_allocation(out.len(), filled);
+    filled
 }
 
 /// Frees every frame in `frames` under one lock acquisition. Failures are
@@ -644,7 +717,92 @@ pub fn try_free_frames_batch(
     frames: &[PhysAddr],
     failures: &mut [(PhysAddr, FreeFrameError)],
 ) -> usize {
-    irq_safe(|| PHYS_ALLOCATOR.lock().free_frames_locked(frames, failures))
+    try_free_frames_batch_profiled(frames, failures, false)
+}
+
+/// Rollback-only counterpart to [`try_free_frames_batch`]. Keeping the
+/// operation identical while classifying its count separately lets a real
+/// map-failure workload prove that every partially acquired frame returned
+/// under bounded allocator lock acquisitions.
+pub fn try_free_frames_batch_rollback(
+    frames: &[PhysAddr],
+    failures: &mut [(PhysAddr, FreeFrameError)],
+) -> usize {
+    try_free_frames_batch_profiled(frames, failures, true)
+}
+
+fn try_free_frames_batch_profiled(
+    frames: &[PhysAddr],
+    failures: &mut [(PhysAddr, FreeFrameError)],
+    rollback: bool,
+) -> usize {
+    let failed = irq_safe(|| PHYS_ALLOCATOR.lock().free_frames_locked(frames, failures));
+    FRAME_BATCH_PROFILE.record_free(frames.len(), failed, rollback);
+    failed
+}
+
+fn emit_frame_batch_total(name: &'static str, frames: &AtomicU64, batches: &AtomicU64) -> usize {
+    let frames = frames.swap(0, Ordering::Relaxed);
+    let batches = batches.swap(0, Ordering::Relaxed);
+    if frames == 0 && batches == 0 {
+        return 0;
+    }
+    crate::debug::record_milestone(crate::debug::LogCategory::Memory, name, frames, batches);
+    1
+}
+
+fn emit_frame_batch_scalar(name: &'static str, value: &AtomicU64) -> usize {
+    let value = value.swap(0, Ordering::Relaxed);
+    if value == 0 {
+        return 0;
+    }
+    crate::debug::record_milestone(crate::debug::LogCategory::Memory, name, value, 0);
+    1
+}
+
+/// Emits and clears one bounded count window. `window_ticks == 0` forces a
+/// drain for an isolated benchmark boundary.
+pub fn drain_frame_batch_profile(now_tick: u64, window_ticks: u64) -> usize {
+    let last = FRAME_BATCH_PROFILE.last_drain_tick.load(Ordering::Relaxed);
+    if window_ticks != 0 && now_tick.saturating_sub(last) < window_ticks {
+        return 0;
+    }
+    // ORDERING: Winning this AcqRel claim elects one drain owner for the
+    // window; the count swaps remain diagnostic-only relaxed operations.
+    if FRAME_BATCH_PROFILE
+        .last_drain_tick
+        .compare_exchange(last, now_tick, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return 0;
+    }
+
+    let mut emitted = 0;
+    emitted += emit_frame_batch_total(
+        "frame-batch-alloc",
+        &FRAME_BATCH_PROFILE.alloc_frames,
+        &FRAME_BATCH_PROFILE.alloc_batches,
+    );
+    emitted += emit_frame_batch_total(
+        "frame-batch-free",
+        &FRAME_BATCH_PROFILE.free_frames,
+        &FRAME_BATCH_PROFILE.free_batches,
+    );
+    emitted += emit_frame_batch_total(
+        "frame-batch-rollback",
+        &FRAME_BATCH_PROFILE.rollback_frames,
+        &FRAME_BATCH_PROFILE.rollback_batches,
+    );
+    emitted += emit_frame_batch_scalar("frame-batch-short", &FRAME_BATCH_PROFILE.alloc_short);
+    emitted += emit_frame_batch_scalar(
+        "frame-batch-free-failure",
+        &FRAME_BATCH_PROFILE.free_failures,
+    );
+    emitted += emit_frame_batch_scalar(
+        "frame-batch-rollback-failure",
+        &FRAME_BATCH_PROFILE.rollback_failures,
+    );
+    emitted
 }
 
 pub fn free_frame(phys: PhysAddr) {
@@ -958,6 +1116,47 @@ mod tests {
         let filled = state.alloc_frames_locked(&mut out);
         assert_eq!(filled, 3, "only 3 frames exist to give");
         assert_eq!(state.free_frames, 0);
+    }
+
+    #[test]
+    fn partial_batch_fault_returns_every_acquired_frame_exactly_once() {
+        let mut bitmap = [u64::MAX; 1];
+        let mut state = test_state(&mut bitmap, 16, 0);
+        let free_before = state.free_frames;
+        let mut out = [PhysAddr::new(0); 8];
+        let mut attempts = 0;
+        let filled = state.alloc_frames_locked_with_fault_gate(&mut out, || {
+            attempts += 1;
+            attempts == 4
+        });
+        assert_eq!(filled, 3);
+        assert_eq!(state.free_frames, free_before - filled);
+
+        let mut failures = [(PhysAddr::new(0), FreeFrameError::AlreadyFree); 8];
+        assert_eq!(state.free_frames_locked(&out[..filled], &mut failures), 0);
+        assert_eq!(state.free_frames, free_before);
+        assert_eq!(
+            state.free_frames_locked(&out[..filled], &mut failures),
+            filled,
+            "a second rollback must reject every already-returned frame"
+        );
+    }
+
+    #[test]
+    fn rollback_workload_is_counted_separately_from_ordinary_free() {
+        let profile = FrameBatchProfile::new();
+        profile.record_allocation(8, 3);
+        profile.record_free(3, 0, true);
+        profile.record_free(4, 1, false);
+
+        assert_eq!(profile.alloc_frames.load(Ordering::Relaxed), 3);
+        assert_eq!(profile.alloc_short.load(Ordering::Relaxed), 1);
+        assert_eq!(profile.rollback_frames.load(Ordering::Relaxed), 3);
+        assert_eq!(profile.rollback_batches.load(Ordering::Relaxed), 1);
+        assert_eq!(profile.rollback_failures.load(Ordering::Relaxed), 0);
+        assert_eq!(profile.free_frames.load(Ordering::Relaxed), 3);
+        assert_eq!(profile.free_batches.load(Ordering::Relaxed), 1);
+        assert_eq!(profile.free_failures.load(Ordering::Relaxed), 1);
     }
 
     #[test]

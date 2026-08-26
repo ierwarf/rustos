@@ -617,11 +617,12 @@ fn handle_request(
     let mut envp = env.iter().map(|value| value.as_ptr()).collect::<Vec<_>>();
     envp.push(core::ptr::null());
 
+    let (prepare_flags, prepare_ticket) = prepare_authority(operation, request);
     let prepare_args = RustosProcPrepareBrokerArgs {
         abi_version: PROC_BROKER_ABI_VERSION,
         format: executable_format,
-        flags: 0,
-        reserved0: 0,
+        flags: prepare_flags,
+        reserved0: prepare_ticket,
     };
     trace_line(&format!("loaderd: prepare begin exec={exec_path}"));
     let prepare_handle = syscall1(
@@ -706,6 +707,17 @@ fn handle_request(
         reply: LoaderReply::Spawn(response),
         cleanup_fds: prepared.cleanup_fds,
         demote_after_reply: exec_path == UI_SERVER_EXEC_PATH,
+    }
+}
+
+fn prepare_authority(operation: LoaderOperation, request: &LoaderSpawnRequest) -> (u32, u64) {
+    if operation == LoaderOperation::ExecTarget {
+        (
+            rustos_user_abi::syscall::PROC_BROKER_PREPARE_FLAG_EXEC_TICKET,
+            request.exec_ticket,
+        )
+    } else {
+        (0, 0)
     }
 }
 
@@ -1154,7 +1166,8 @@ fn trace_line(message: &str) {
 
 #[cfg(test)]
 mod activation_batch_tests {
-    use super::activate_batch_targets_valid;
+    use super::{activate_batch_targets_valid, prepare_authority, LoaderOperation};
+    use rustos_user_abi::syscall::{LoaderSpawnRequest, PROC_BROKER_PREPARE_FLAG_EXEC_TICKET};
 
     #[test]
     fn activation_batch_targets_are_nonzero_and_unique() {
@@ -1162,5 +1175,21 @@ mod activation_batch_tests {
         assert!(!activate_batch_targets_valid(&[]));
         assert!(!activate_batch_targets_valid(&[11, 0]));
         assert!(!activate_batch_targets_valid(&[11, 12, 11]));
+    }
+
+    #[test]
+    fn exec_prepare_forwards_the_exact_procd_ticket_without_widening_spawn() {
+        let request = LoaderSpawnRequest {
+            exec_ticket: 0x1234_5678,
+            ..LoaderSpawnRequest::default()
+        };
+        assert_eq!(
+            prepare_authority(LoaderOperation::ExecTarget, &request),
+            (PROC_BROKER_PREPARE_FLAG_EXEC_TICKET, request.exec_ticket)
+        );
+        assert_eq!(
+            prepare_authority(LoaderOperation::SpawnExec, &request),
+            (0, 0)
+        );
     }
 }

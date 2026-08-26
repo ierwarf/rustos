@@ -141,6 +141,58 @@ pub struct PreparedProcessImage {
     pub bootstrap: multitask::UserTaskBootstrap,
 }
 
+/// RAII custody for an invisible process slot and its non-reusable lifecycle
+/// transaction. Mapping and stack preparation may fail at many points; Drop
+/// makes every such return cancel the exact reservation without duplicating
+/// cleanup branches throughout loader policy.
+pub struct ProcessSpawnTransaction {
+    reservation: Option<multitask::SpawnReservation>,
+}
+
+impl ProcessSpawnTransaction {
+    fn take(&mut self) -> multitask::SpawnReservation {
+        self.reservation
+            .take()
+            .expect("process spawn transaction consumed more than once")
+    }
+}
+
+impl Drop for ProcessSpawnTransaction {
+    fn drop(&mut self) {
+        if let Some(reservation) = self.reservation.take() {
+            let cancelled = multitask::cancel_process_spawn(reservation);
+            assert!(
+                cancelled,
+                "live spawn transaction failed exact cancellation"
+            );
+        }
+    }
+}
+
+pub struct PreparedSpawnImage {
+    prepared: PreparedProcessImage,
+    transaction: ProcessSpawnTransaction,
+}
+
+pub fn reserve_process_spawn_transaction() -> Result<ProcessSpawnTransaction, ProcessLoadError> {
+    let reservation = multitask::reserve_process_spawn().ok_or(ProcessLoadError::Spawn(
+        multitask::SpawnTaskError::NoFreeTaskSlot,
+    ))?;
+    Ok(ProcessSpawnTransaction {
+        reservation: Some(reservation),
+    })
+}
+
+pub fn bind_prepared_spawn(
+    prepared: PreparedProcessImage,
+    transaction: ProcessSpawnTransaction,
+) -> PreparedSpawnImage {
+    PreparedSpawnImage {
+        prepared,
+        transaction,
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ProcessStartRegisters {
     pub rax: u64,
@@ -236,8 +288,13 @@ pub fn spawn_bootstrap_linux_process_with_launch_and_scheduling_context(
     launch: ProcessLaunchOptions<'_>,
     policy: rustos_user_abi::syscall::RustosSchedulingContextPolicy,
 ) -> Result<SpawnedProcess, ProcessLoadError> {
+    let transaction = reserve_process_spawn_transaction()?;
     let prepared = prepare_bootstrap_linux_process_with_launch(image, launch)?;
-    spawn_prepared_process_with_scheduling_context(prepared, weight_micros, policy)
+    spawn_prepared_process_with_scheduling_context(
+        bind_prepared_spawn(prepared, transaction),
+        weight_micros,
+        policy,
+    )
 }
 
 fn prepare_bootstrap_linux_process_with_launch(
@@ -295,43 +352,52 @@ fn scheduling_context_admission(
 }
 
 pub fn spawn_prepared_process_with_scheduling_context(
-    prepared: PreparedProcessImage,
+    mut spawn: PreparedSpawnImage,
     weight_micros: u64,
     policy: rustos_user_abi::syscall::RustosSchedulingContextPolicy,
 ) -> Result<SpawnedProcess, ProcessLoadError> {
+    let reservation = spawn.transaction.take();
+    let prepared = spawn.prepared;
     let pid = kernel_ps::api::process::spawn_user_process_with_scheduling_context(
         prepared.address_space,
         prepared.bootstrap,
         weight_micros,
         scheduling_context_admission(policy),
+        reservation,
     )?;
     Ok(SpawnedProcess { pid })
 }
 
 pub fn spawn_prepared_process_for_loader_reply_with_scheduling_context(
-    prepared: PreparedProcessImage,
+    mut spawn: PreparedSpawnImage,
     weight_micros: u64,
     policy: rustos_user_abi::syscall::RustosSchedulingContextPolicy,
 ) -> Result<SpawnedProcess, ProcessLoadError> {
+    let reservation = spawn.transaction.take();
+    let prepared = spawn.prepared;
     let pid = kernel_ps::api::process::spawn_user_process_without_deferred_reschedule_with_scheduling_context(
         prepared.address_space,
         prepared.bootstrap,
         weight_micros,
         scheduling_context_admission(policy),
+        reservation,
     )?;
     Ok(SpawnedProcess { pid })
 }
 
 pub fn spawn_prepared_process_suspended_with_scheduling_context(
-    prepared: PreparedProcessImage,
+    mut spawn: PreparedSpawnImage,
     weight_micros: u64,
     policy: rustos_user_abi::syscall::RustosSchedulingContextPolicy,
 ) -> Result<SpawnedProcess, ProcessLoadError> {
+    let reservation = spawn.transaction.take();
+    let prepared = spawn.prepared;
     let pid = kernel_ps::api::process::spawn_user_process_suspended_with_scheduling_context(
         prepared.address_space,
         prepared.bootstrap,
         weight_micros,
         scheduling_context_admission(policy),
+        reservation,
     )?;
     Ok(SpawnedProcess { pid })
 }
@@ -553,5 +619,7 @@ mod tests {
         assert!(source.contains("spawn_prepared_process_with_scheduling_context"));
         assert!(!source.contains("pub fn spawn_prepared_process("));
         assert!(!source.contains("pub fn spawn_bootstrap_linux_process_with_launch("));
+        assert!(source.contains("multitask::cancel_process_spawn(reservation)"));
+        assert!(source.contains("spawn.transaction.take()"));
     }
 }

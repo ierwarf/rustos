@@ -14,7 +14,6 @@
 //! - **Evidence:** `scheduler-lifecycle`,
 //!   `process-address-space-lifecycle`, `syscall-simd-lifecycle`, and
 //!   `user-memory-access`.
-pub use crate::multitask::ProcessIdentity;
 pub use crate::multitask::{
     AffinityCommit, AffinityError, CurrentKernelStackScope, CurrentUserSnapshot,
     DEFAULT_USER_TASK_WEIGHT_MICROS, FastIpcCallHandoffOutcome, MAX_SCHEDULER_TASKS,
@@ -22,12 +21,13 @@ pub use crate::multitask::{
     RetiredTaskCleanup, SchedulingContextAdmission, SpawnTaskError, Thread, UserFaultDisposition,
     UserStackState, UserTaskBootstrap, UserTaskRegisters, WaitChildResult,
 };
+pub use crate::multitask::{ProcessIdentity, SpawnReservation};
 pub use crate::multitask::{
     activate_suspended_user_task, activate_suspended_user_tasks,
     activate_suspended_user_tasks_with_commit, arm_block_current_task,
     arm_block_current_task_on_endpoint, arm_block_current_task_on_reply,
     attach_reserved_ipc_priority, bind_ipc_priority_to_process_worker, bind_reserved_ipc_priority,
-    cancel_block_current_task, cancel_ipc_priority_reservation,
+    cancel_block_current_task, cancel_ipc_priority_reservation, cancel_process_spawn,
     commit_block_current_task_and_yield, commit_fast_ipc_call_handoff_and_yield,
     commit_ipc_call_handoff, complete_fast_ipc_reply_wake_handoff_with_custody,
     complete_ipc_reply_wake_handoff, complete_ipc_reply_wake_handoff_with_custody,
@@ -42,11 +42,13 @@ pub use crate::multitask::{
     mark_user_process_exiting, mark_user_process_exiting_once, next_retired_task_cleanup,
     note_process_exit_status, queue_linux_process_sigchld, queue_linux_signal,
     release_ipc_priorities_for_process, release_ipc_priority, reserve_ipc_call_donation,
-    reserve_ipc_priority, set_current_linux_tls_fs_base, set_linux_task_affinity,
-    set_next_latency_pick_hint, set_next_pick_hint, set_next_process_pick_hint,
-    set_next_spawn_pick_hint, set_next_synchronous_pick_hint, set_windows_current_thread_affinity,
-    set_windows_process_affinity, settle_ipc_reply_scheduling_context,
-    spawn_user_process_state_with_parent, spawn_user_process_suspended_with_scheduling_context,
+    reserve_ipc_priority, reserve_process_spawn, set_current_linux_tls_fs_base,
+    set_linux_task_affinity, set_next_latency_pick_hint, set_next_pick_hint,
+    set_next_process_pick_hint, set_next_spawn_pick_hint, set_next_synchronous_pick_hint,
+    set_windows_current_thread_affinity, set_windows_process_affinity,
+    settle_ipc_reply_scheduling_context,
+    spawn_user_process_state_suspended_with_parent_reservation,
+    spawn_user_process_suspended_with_scheduling_context,
     spawn_user_process_with_scheduling_context,
     spawn_user_process_without_deferred_reschedule_with_scheduling_context,
     spawn_user_thread_suspended, stop_current_linux_process, task_has_system_scheduling_class,
@@ -191,8 +193,8 @@ pub mod fault {
 
 pub mod process {
     use super::{
-        ProcessSecurityContext, SchedulingContextAdmission, SpawnTaskError, UserProcessState,
-        UserTaskBootstrap, VirtAddr,
+        ProcessSecurityContext, SchedulingContextAdmission, SpawnReservation, SpawnTaskError,
+        UserTaskBootstrap,
     };
 
     pub fn spawn_user_process_with_scheduling_context(
@@ -200,12 +202,14 @@ pub mod process {
         bootstrap: UserTaskBootstrap,
         weight_micros: u64,
         admission: SchedulingContextAdmission,
+        spawn_reservation: SpawnReservation,
     ) -> Result<u64, SpawnTaskError> {
         crate::multitask::spawn_user_process_with_scheduling_context(
             address_space,
             bootstrap,
             weight_micros,
             admission,
+            spawn_reservation,
         )
     }
 
@@ -214,12 +218,14 @@ pub mod process {
         bootstrap: UserTaskBootstrap,
         weight_micros: u64,
         admission: SchedulingContextAdmission,
+        spawn_reservation: SpawnReservation,
     ) -> Result<u64, SpawnTaskError> {
         crate::multitask::spawn_user_process_without_deferred_reschedule_with_scheduling_context(
             address_space,
             bootstrap,
             weight_micros,
             admission,
+            spawn_reservation,
         )
     }
 
@@ -228,22 +234,15 @@ pub mod process {
         bootstrap: UserTaskBootstrap,
         weight_micros: u64,
         admission: SchedulingContextAdmission,
+        spawn_reservation: SpawnReservation,
     ) -> Result<u64, SpawnTaskError> {
         crate::multitask::spawn_user_process_suspended_with_scheduling_context(
             address_space,
             bootstrap,
             weight_micros,
             admission,
+            spawn_reservation,
         )
-    }
-
-    pub fn spawn_kernel_process(
-        process_state: UserProcessState,
-        entry: VirtAddr,
-        arg0: u64,
-        weight_micros: u64,
-    ) -> Result<u64, SpawnTaskError> {
-        crate::multitask::spawn_kernel_process(process_state, entry, arg0, weight_micros)
     }
 
     pub type SecurityContext = ProcessSecurityContext;
@@ -407,7 +406,6 @@ pub use crate::user::sysops::{drain_user_copy_profile, force_drain_user_copy_pro
 
 pub use boot::{is_initialized, service_deferred_work, start, start_secondary_cpu};
 pub use fault::{halt_current_retired_task, retire_current_user_task_due_to_fault};
-pub use process::spawn_kernel_process;
 pub use snapshot::{
     any_user_process_state, current_scheduling_context_runtime_snapshot, current_task_id,
     current_user_abi, current_user_id, current_user_log_ids, current_user_process_id,

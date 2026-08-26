@@ -79,6 +79,10 @@ pub(crate) fn apply_kernel_cargo_env<'a>(
             config.project.syscall_telemetry.phase_profile.to_string(),
         )
         .env(
+            "RUSTOS_LIFECYCLE_TRACE",
+            config.project.lifecycle_telemetry.phase_profile.to_string(),
+        )
+        .env(
             "RUSTOS_LOCK_TELEMETRY_WARN_WAIT_CYCLES",
             config.project.lock_telemetry.warn_wait_cycles.to_string(),
         )

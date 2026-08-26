@@ -61,22 +61,11 @@ pub mod syscall {
         crate::user::syscall::linux::ipc_server_profile::drain_ipc_server_profile()
     }
 
-    pub fn cleanup_retired_task_runtime_state(
-        task_id: u64,
-        process_id: u64,
-        process_terminal: bool,
-        clear_child_tid: u64,
-        robust_list_head: u64,
-        robust_list_len: u64,
-    ) -> usize {
-        crate::user::syscall::cleanup_retired_task_runtime_state(
-            task_id,
-            process_id,
-            process_terminal,
-            clear_child_tid,
-            robust_list_head,
-            robust_list_len,
-        )
+    pub const RETIRED_TASK_CLEANUP_BUDGET: usize =
+        crate::user::syscall::linux::RETIRED_TASK_CLEANUP_BUDGET;
+
+    pub fn service_retired_task_runtime_cleanup(limit: usize) -> usize {
+        crate::user::syscall::linux::service_retired_task_runtime_cleanup(limit)
     }
 }
 

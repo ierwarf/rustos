@@ -19,6 +19,7 @@ use super::*;
 
 mod activation_batch;
 mod authority;
+mod fork;
 mod scheduling_context_grants;
 
 pub(super) use activation_batch::syscall_linux_rustos_proc_activate_batch_broker;
@@ -43,14 +44,15 @@ use rustos_user_abi::syscall::{
     LOADER_SPAWN_MAX_ENV_COUNT, PROC_BROKER_ABI_VERSION, PROC_BROKER_BATCH_CAPACITY,
     PROC_BROKER_FORMAT_ELF64, PROC_BROKER_FORMAT_PE64, PROC_BROKER_LINUX_INTERP_PATH_CAPACITY,
     PROC_BROKER_MAP_EXEC, PROC_BROKER_MAP_PRIVATE, PROC_BROKER_MAP_READ, PROC_BROKER_MAP_WRITE,
-    PROC_BROKER_USER_SPACE_BASE, PROC_BROKER_USER_SPACE_END_EXCLUSIVE, RustosProcAbortBrokerArgs,
-    RustosProcActivateBrokerArgs, RustosProcAuthorizeExecBrokerArgs,
-    RustosProcCancelExecBrokerArgs, RustosProcCommitBrokerArgs, RustosProcExecTargetBrokerArgs,
-    RustosProcForkBrokerArgs, RustosProcMapDataBrokerArgs, RustosProcMapFileBatchBrokerArgs,
-    RustosProcMapFileBrokerArgs, RustosProcMapZeroedBrokerArgs, RustosProcPrepareBrokerArgs,
-    RustosProcSetLinuxRuntimeBrokerArgs, RustosProcSetWindowsRuntimeBrokerArgs,
-    RustosProcSignalQueueBrokerArgs, RustosProcValidateDeferredSpawnBrokerArgs,
-    RustosUserRegisters, loader_service_role_allows_operation,
+    PROC_BROKER_PREPARE_FLAG_EXEC_TICKET, PROC_BROKER_USER_SPACE_BASE,
+    PROC_BROKER_USER_SPACE_END_EXCLUSIVE, RustosProcAbortBrokerArgs, RustosProcActivateBrokerArgs,
+    RustosProcAuthorizeExecBrokerArgs, RustosProcCancelExecBrokerArgs, RustosProcCommitBrokerArgs,
+    RustosProcExecTargetBrokerArgs, RustosProcForkBrokerArgs, RustosProcMapDataBrokerArgs,
+    RustosProcMapFileBatchBrokerArgs, RustosProcMapFileBrokerArgs, RustosProcMapZeroedBrokerArgs,
+    RustosProcPrepareBrokerArgs, RustosProcSetLinuxRuntimeBrokerArgs,
+    RustosProcSetWindowsRuntimeBrokerArgs, RustosProcSignalQueueBrokerArgs,
+    RustosProcValidateDeferredSpawnBrokerArgs, RustosUserRegisters,
+    loader_service_role_allows_operation,
 };
 const PAGE_SIZE: u64 = 4096;
 const SPAWN_FLAG_LOGICAL_ADMIN: u64 = 1;
@@ -93,6 +95,7 @@ enum MappingEntry {
 struct ProcPrepareState {
     owner_pid: u64,
     format: u16,
+    exec_ticket: Option<u64>,
     #[allow(
         clippy::vec_box,
         reason = "mapping entries may carry a page payload; stable indirection avoids copying page-sized records when the bounded vector grows"
@@ -154,19 +157,35 @@ pub(super) fn consume_direct_bootstrap_scheduling_context(
 }
 
 pub(super) fn syscall_linux_rustos_proc_prepare_broker(args_ptr: u64) -> u64 {
-    if !current_process_can_load() {
+    let Some(loader_pid) = current_loader_process_id() else {
         return linux_errno(LINUX_EPERM);
-    }
+    };
     let args = match usermem::read_current_user_struct::<RustosProcPrepareBrokerArgs>(args_ptr) {
         Ok(args) => args,
         Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
     };
-    if args.abi_version != PROC_BROKER_ABI_VERSION || args.reserved0 != 0 {
+    if args.abi_version != PROC_BROKER_ABI_VERSION
+        || args.flags & !PROC_BROKER_PREPARE_FLAG_EXEC_TICKET != 0
+        || (args.flags == 0) != (args.reserved0 == 0)
+    {
         return linux_errno(LINUX_EINVAL);
     }
-    let owner_pid = match procd_process_prepare_policy(args.format) {
-        Ok(owner_pid) => owner_pid,
-        Err(errno) => return linux_errno(errno),
+    let exec_ticket =
+        (args.flags & PROC_BROKER_PREPARE_FLAG_EXEC_TICKET != 0).then_some(args.reserved0);
+    let owner_pid = match exec_ticket {
+        Some(ticket) => {
+            if !EXEC_TICKETS.lock().contains_key(&ticket) {
+                return linux_errno(LINUX_EPERM);
+            }
+            // procd already minted this exact one-shot exec authority before
+            // calling loaderd. Re-entering procd here would deadlock the
+            // procd -> loaderd -> prepare call chain.
+            loader_pid
+        }
+        None => match procd_process_prepare_policy(args.format) {
+            Ok(owner_pid) => owner_pid,
+            Err(errno) => return linux_errno(errno),
+        },
     };
     {
         let prepares = PROC_PREPARES.lock();
@@ -183,6 +202,7 @@ pub(super) fn syscall_linux_rustos_proc_prepare_broker(args_ptr: u64) -> u64 {
     let state = ProcPrepareState {
         owner_pid,
         format: args.format,
+        exec_ticket,
         mappings: Vec::with_capacity(MAX_MAPPINGS_PER_PREPARE),
         windows_runtime: None,
         linux_runtime: None,
@@ -626,6 +646,7 @@ pub(super) fn syscall_linux_rustos_proc_commit_broker(args_ptr: u64) -> u64 {
         match prepares.get(&args.prepare_handle) {
             None => return linux_errno(LINUX_EINVAL),
             Some(s) if !prepare_owned_by(s, loader_pid) => return linux_errno(LINUX_EPERM),
+            Some(s) if s.exec_ticket.is_some() => return linux_errno(LINUX_EPERM),
             _ => {}
         }
         prepares.remove(&args.prepare_handle).unwrap()
@@ -672,6 +693,10 @@ pub(super) fn syscall_linux_rustos_proc_commit_broker(args_ptr: u64) -> u64 {
         exec_path: &exec_path,
         argv: argv_refs.as_slice(),
         env: env_refs.as_slice(),
+    };
+    let spawn_transaction = match crate::user::process::reserve_process_spawn_transaction() {
+        Ok(transaction) => transaction,
+        Err(err) => return linux_errno(process_load_error_to_linux_errno(err)),
     };
     nucleus_core::debug::record_milestone(
         nucleus_core::debug::LogCategory::Compat,
@@ -746,6 +771,7 @@ pub(super) fn syscall_linux_rustos_proc_commit_broker(args_ptr: u64) -> u64 {
         args.prepare_handle,
         state.format as u64,
     );
+    let prepared = crate::user::process::bind_prepared_spawn(prepared, spawn_transaction);
     let spawned = if args.flags & LOADER_SPAWN_FLAG_DEFER_START as u64 != 0 {
         crate::user::process::spawn_prepared_process_suspended_with_scheduling_context(
             prepared,
@@ -1051,7 +1077,10 @@ pub(super) fn syscall_linux_rustos_proc_exec_target_broker(args_ptr: u64) -> u64
         }
         prepares.remove(&args.prepare_handle).unwrap()
     };
-    if state.format != PROC_BROKER_FORMAT_ELF64 || state.windows_runtime.is_some() {
+    if !exec_prepare_ticket_matches(state.exec_ticket, args.exec_ticket)
+        || state.format != PROC_BROKER_FORMAT_ELF64
+        || state.windows_runtime.is_some()
+    {
         return linux_errno(LINUX_EINVAL);
     }
     let exec_path = match read_user_text(args.exec_path_ptr, args.exec_path_len) {
@@ -1169,6 +1198,10 @@ pub(super) fn syscall_linux_rustos_proc_exec_target_broker(args_ptr: u64) -> u64
     }
 }
 
+fn exec_prepare_ticket_matches(bound_ticket: Option<u64>, requested_ticket: u64) -> bool {
+    requested_ticket != 0 && bound_ticket == Some(requested_ticket)
+}
+
 pub(super) fn apply_pending_exec_transition(frame: &mut SyscallFrame) -> bool {
     let Some(tid) = multitask::current_user_thread_id() else {
         return false;
@@ -1201,85 +1234,11 @@ pub(super) fn apply_pending_exec_transition(frame: &mut SyscallFrame) -> bool {
 }
 
 pub(super) fn syscall_linux_rustos_proc_fork_broker(args_ptr: u64) -> u64 {
-    if !current_process_can_policy() {
-        return linux_errno(LINUX_EPERM);
-    }
-    let args = match usermem::read_current_user_struct::<RustosProcForkBrokerArgs>(args_ptr) {
-        Ok(args) => args,
-        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
-    };
-    if args.abi_version != PROC_BROKER_ABI_VERSION
-        || args.reserved0 != 0
-        || args.flags != 0
-        || args.source_pid == 0
-        || args.source_tid == 0
-    {
-        return linux_errno(LINUX_EINVAL);
-    }
-    let Some(thread_snapshot) =
-        multitask::linux_thread_snapshot_by_ids(args.source_pid, args.source_tid)
-    else {
-        return linux_errno(LINUX_ESRCH);
-    };
-    let child_state = match multitask::with_process_state_by_pid(args.source_pid, |parent| {
-        let address_space = parent.address_space().clone_user_space()?;
-        Ok::<_, crate::memory::paging::AddressSpaceError>(parent.fork_clone(address_space, None))
-    }) {
-        Some(Ok(state)) => state,
-        Some(Err(err)) => return linux_errno(address_space_error_to_linux_errno(err)),
-        None => return linux_errno(LINUX_ESRCH),
-    };
-    let mut child_thread_state = thread_snapshot.thread_state;
-    child_thread_state.clear_child_tid = 0;
-    child_thread_state.robust_list_head = 0;
-    child_thread_state.robust_list_len = 0;
-    child_thread_state.rseq_area = 0;
-    child_thread_state.rseq_len = 0;
-    child_thread_state.rseq_signature = 0;
-    child_thread_state.pending_signals = 0;
-    child_thread_state.pending_sigchld_events = 0;
+    fork::syscall_linux_rustos_proc_fork_broker(args_ptr)
+}
 
-    let mut bootstrap = multitask::UserTaskBootstrap::new(
-        crate::user::abi::UserAbi::Linux,
-        VirtAddr::new(args.registers.rip),
-        VirtAddr::new(if args.stack_ptr != 0 {
-            args.stack_ptr
-        } else {
-            args.registers.rsp
-        }),
-    );
-    bootstrap.registers = user_registers_to_task_registers(args.registers);
-    bootstrap.registers.rax = 0;
-    bootstrap.registers.rcx = args.registers.rip;
-    bootstrap.registers.r11 = args.registers.rflags;
-    bootstrap.user_stack = thread_snapshot.user_stack;
-    bootstrap.console_session = thread_snapshot.console_session;
-    bootstrap.logical_admin = child_state.security().is_logical_admin();
-    bootstrap.linux_process_state = child_state.linux_process_state().copied();
-    bootstrap.linux_memory_map = child_state.linux_memory_map().cloned();
-    bootstrap.linux_runtime_profile = child_state.linux_runtime_profile().cloned();
-    bootstrap.linux_thread_state = Some(child_thread_state);
-    bootstrap.set_exec_path(child_state.exec_path());
-
-    // Reserve every service-owned open-description reference before the child
-    // becomes runnable. A child close must not be able to retire a socket,
-    // remote VFS handle, or epoll object still referenced by its parent.
-    let inherited_service_refs = match acquire_cloned_service_handle_refs(&child_state) {
-        Ok(refs) => refs,
-        Err(errno) => return linux_errno(errno),
-    };
-    match multitask::spawn_user_process_state_with_parent(
-        child_state,
-        bootstrap,
-        Some(args.source_pid),
-        multitask::DEFAULT_USER_TASK_WEIGHT_MICROS,
-    ) {
-        Ok(pid) => pid,
-        Err(err) => {
-            release_service_handle_refs(&inherited_service_refs);
-            linux_errno(process_spawn_error_to_linux_errno(err))
-        }
-    }
+fn valid_process_fork_plan_locally(args: &RustosProcForkBrokerArgs) -> bool {
+    fork::valid_process_fork_plan_locally(args)
 }
 
 pub(super) fn syscall_linux_rustos_proc_signal_queue_broker(args_ptr: u64) -> u64 {

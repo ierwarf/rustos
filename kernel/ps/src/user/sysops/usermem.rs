@@ -43,10 +43,10 @@ pub fn copy_from_current_user_exact(
     with_current_address_space(|address_space| {
         let bound = usermem_profile::charge(usermem_profile::UserCopyPhase::ReadBind, entry);
         let start = user_virt_addr(user_ptr, dest.len())?;
-        address_space.validate_user_read_buffer(start, dest.len())?;
+        let validated_read = address_space.validate_user_read(start, dest.len())?;
         let validated =
             usermem_profile::charge(usermem_profile::UserCopyPhase::ReadValidate, bound);
-        let result = address_space.copy_from_user(start, dest);
+        let result = validated_read.copy_into(dest);
         usermem_profile::charge(usermem_profile::UserCopyPhase::ReadCopy, validated);
         result
     })
@@ -62,18 +62,67 @@ pub fn copy_from_retained_user_and_validate_write(
     write_ptr: u64,
     write_len: usize,
 ) -> Result<(), paging::AddressSpaceError> {
+    copy_from_retained_user_and_validate_writes(retained, read_ptr, dest, &[(write_ptr, write_len)])
+}
+
+/// Copies one input and admits every output under one exact-MM state lock.
+/// This is the reply-receive pre-commit shape: the old reply capability is
+/// still live, so all user ranges must succeed before any IPC publication.
+pub fn copy_from_retained_user_and_validate_writes(
+    retained: &multitask::RetainedCurrentUserAddressSpace,
+    read_ptr: u64,
+    dest: &mut [u8],
+    write_buffers: &[(u64, usize)],
+) -> Result<(), paging::AddressSpaceError> {
     retained
         .try_with_address_space(|address_space| {
-            let write_start = user_virt_addr(write_ptr, write_len)?;
-            address_space.validate_user_write_buffer(write_start, write_len)?;
+            for (write_ptr, write_len) in write_buffers.iter().copied() {
+                if write_len != 0 {
+                    let write_start = user_virt_addr(write_ptr, write_len)?;
+                    address_space.validate_user_write_buffer(write_start, write_len)?;
+                }
+            }
             let read_start = user_virt_addr(read_ptr, dest.len())?;
-            address_space.validate_user_read_buffer(read_start, dest.len())?;
-            address_space.copy_from_user(read_start, dest)
+            address_space
+                .validate_user_read(read_start, dest.len())?
+                .copy_into(dest)
+        })
+        .ok_or(paging::AddressSpaceError::NotMapped)?
+}
+
+pub fn copy_from_retained_user_exact(
+    retained: &multitask::RetainedCurrentUserAddressSpace,
+    user_ptr: u64,
+    dest: &mut [u8],
+) -> Result<(), paging::AddressSpaceError> {
+    retained
+        .try_with_address_space(|address_space| {
+            let start = user_virt_addr(user_ptr, dest.len())?;
+            address_space
+                .validate_user_read(start, dest.len())?
+                .copy_into(dest)
         })
         .ok_or(paging::AddressSpaceError::NotMapped)?
 }
 
 pub fn read_current_user_struct<T: Copy + Default>(
+    user_ptr: u64,
+) -> Result<T, paging::AddressSpaceError> {
+    let mut value = T::default();
+    // SAFETY: `value` is live and uniquely borrowed for exactly `size_of::<T>()`
+    // bytes; the byte copy initializes only that existing `T` allocation.
+    let bytes = unsafe {
+        core::slice::from_raw_parts_mut(
+            core::ptr::addr_of_mut!(value).cast::<u8>(),
+            core::mem::size_of::<T>(),
+        )
+    };
+    copy_from_current_user_exact(user_ptr, bytes)?;
+    Ok(value)
+}
+
+pub fn read_retained_user_struct<T: Copy + Default>(
+    retained: &multitask::RetainedCurrentUserAddressSpace,
     user_ptr: u64,
 ) -> Result<T, paging::AddressSpaceError> {
     let mut value = T::default();
@@ -83,7 +132,7 @@ pub fn read_current_user_struct<T: Copy + Default>(
             core::mem::size_of::<T>(),
         )
     };
-    copy_from_current_user_exact(user_ptr, bytes)?;
+    copy_from_retained_user_exact(retained, user_ptr, bytes)?;
     Ok(value)
 }
 
@@ -95,10 +144,10 @@ pub fn write_current_user_bytes(
     with_current_address_space(|address_space| {
         let bound = usermem_profile::charge(usermem_profile::UserCopyPhase::WriteBind, entry);
         let start = user_virt_addr(user_ptr, bytes.len())?;
-        address_space.validate_user_write_buffer(start, bytes.len())?;
+        let validated_write = address_space.validate_user_write(start, bytes.len())?;
         let validated =
             usermem_profile::charge(usermem_profile::UserCopyPhase::WriteValidate, bound);
-        let result = address_space.copy_into_user(start, bytes);
+        let result = validated_write.copy_from(bytes);
         usermem_profile::charge(usermem_profile::UserCopyPhase::WriteCopy, validated);
         result
     })
@@ -112,8 +161,9 @@ pub fn write_retained_user_bytes(
     retained
         .try_with_address_space(|address_space| {
             let start = user_virt_addr(user_ptr, bytes.len())?;
-            address_space.validate_user_write_buffer(start, bytes.len())?;
-            address_space.copy_into_user(start, bytes)
+            address_space
+                .validate_user_write(start, bytes.len())?
+                .copy_from(bytes)
         })
         .ok_or(paging::AddressSpaceError::NotMapped)?
 }
@@ -212,9 +262,9 @@ pub fn write_current_user_bytes_batch(
                 continue;
             }
             let start = user_virt_addr(user_ptr, bytes.len())?;
-            address_space.validate_user_write_buffer(start, bytes.len())?;
+            let validated_write = address_space.validate_user_write(start, bytes.len())?;
             phase = usermem_profile::charge(usermem_profile::UserCopyPhase::WriteValidate, phase);
-            address_space.copy_into_user(start, bytes)?;
+            validated_write.copy_from(bytes)?;
             phase = usermem_profile::charge(usermem_profile::UserCopyPhase::WriteCopy, phase);
         }
         Ok(())
@@ -232,8 +282,9 @@ pub fn write_retained_user_bytes_batch(
                     continue;
                 }
                 let start = user_virt_addr(user_ptr, bytes.len())?;
-                address_space.validate_user_write_buffer(start, bytes.len())?;
-                address_space.copy_into_user(start, bytes)?;
+                address_space
+                    .validate_user_write(start, bytes.len())?
+                    .copy_from(bytes)?;
             }
             Ok(())
         })

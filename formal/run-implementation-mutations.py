@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import functools
 import hashlib
 import json
 import os
@@ -509,15 +510,48 @@ def build_key(mutation: dict[str, str | int]) -> tuple[str, str, str]:
     )
 
 
-def mutation_cache_key(root: Path, mutation: dict[str, str | int]) -> str:
-    """Seal the mutation, witness package, and build-selection inputs.
+@functools.lru_cache(maxsize=None)
+def witness_context_index(package_root_raw: str) -> dict[str, tuple[tuple[str, bytes], ...]]:
+    """Index literal Rust test bodies once per package for cache-key routing."""
+    package_root = Path(package_root_raw)
+    indexed: dict[str, list[tuple[str, bytes]]] = {}
+    declaration = re.compile(r"\bfn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+    for path in package_root.rglob("*.rs"):
+        if "target" in path.relative_to(package_root).parts:
+            continue
+        text = path.read_text(encoding="utf-8")
+        for match in declaration.finditer(text):
+            body_start = text.find("{", match.end())
+            if body_start < 0:
+                continue
+            depth = 0
+            body_end = body_start
+            for body_end in range(body_start, len(text)):
+                if text[body_end] == "{":
+                    depth += 1
+                elif text[body_end] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        body_end += 1
+                        break
+            if depth != 0:
+                continue
+            context_start = max(0, text.rfind("#[test]", 0, match.start()))
+            indexed.setdefault(match.group(1), []).append(
+                (str(path), text[context_start:body_end].encode("utf-8"))
+            )
+    return {name: tuple(contexts) for name, contexts in indexed.items()}
 
-    This deliberately uses package-scoped rather than repository-scoped
-    source hashing. A change to an unrelated service must not force hundreds
-    of already-killed kernel mutants to rebuild. Workspace/toolchain inputs
-    remain in the seal; a changed local dependency outside the package is the
-    intentionally accepted small cache approximation and is always repaired
-    by nightly/fresh-cache runs.
+
+def mutation_cache_key(root: Path, mutation: dict[str, str | int]) -> str:
+    """Seal one anchor, its exact witness body, and build policy inputs.
+
+    Mutation evidence is deliberately cached at the decision witness rather
+    than the containing package. Rust compiles a package as one unit, but a
+    line insertion beside one scheduler decision does not invalidate hundreds
+    of independent already-killed decisions. This is a bounded incremental
+    approximation: changes outside the selected anchor and witness body are
+    re-audited by cache-disabled qualification/nightly runs.
     """
     source = source_path(root, str(mutation["id"]), str(mutation["source"]))
     package_root = source.parent
@@ -526,6 +560,7 @@ def mutation_cache_key(root: Path, mutation: dict[str, str | int]) -> str:
     if package_root == root:
         raise ValueError(f"no package root for {mutation['source']}")
     digest = hashlib.sha256()
+    digest.update(b"rustos-implementation-mutation-cache-v2\0")
     semantic_fields = (
         "id", "source", "find", "replace", "anchor_spec", "package",
         "features", "target", "test", "max_ms",
@@ -535,13 +570,30 @@ def mutation_cache_key(root: Path, mutation: dict[str, str | int]) -> str:
         digest.update(b"\0")
         digest.update(str(mutation[field]).encode())
         digest.update(b"\0")
-    inputs = [
-        path for path in package_root.rglob("*")
-        if path.is_file()
-        and "target" not in path.relative_to(package_root).parts
-        and (path.suffix in {".rs", ".toml"} or path.name == "build.rs")
+    digest.update(str(mutation["anchor_context_sha256"]).encode())
+    digest.update(b"\0")
+
+    leaf = str(mutation["test"]).rsplit("::", 1)[-1]
+    witness_contexts = [
+        (Path(path), context)
+        for path, context in witness_context_index(str(package_root)).get(leaf, ())
     ]
-    for name in ("Cargo.toml", "Cargo.lock", "rust-toolchain.toml"):
+    if not witness_contexts:
+        # Macro-generated or otherwise non-literal witnesses keep the previous
+        # conservative package scope instead of receiving an unsafe cache hit.
+        witness_contexts = [
+            (path, path.read_bytes())
+            for path in package_root.rglob("*.rs")
+            if "target" not in path.relative_to(package_root).parts
+        ]
+    for path, context in sorted(witness_contexts, key=lambda item: item[0]):
+        digest.update(path.relative_to(root).as_posix().encode())
+        digest.update(b"\0")
+        digest.update(context)
+        digest.update(b"\0")
+
+    inputs = [package_root / "Cargo.toml"]
+    for name in ("Cargo.toml", "Cargo.lock", ".cargo/config.toml", "rust-toolchain.toml"):
         path = root / name
         if path.is_file():
             inputs.append(path)
@@ -562,6 +614,10 @@ def reusable_mutation_outcomes(
     registry_sha256: str,
 ) -> tuple[list[dict[str, str | int]], list[dict[str, str | int]]]:
     """Split current rows into reusable kills and rows that must execute."""
+    if os.environ.get("RUSTOS_IMPLEMENTATION_MUTATION_CACHE", "on") == "off":
+        for mutation in mutations:
+            mutation["cache_key"] = mutation_cache_key(root, mutation)
+        return [], mutations
     try:
         previous_summary = json.loads(summary_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -578,14 +634,15 @@ def reusable_mutation_outcomes(
         cache_key = mutation_cache_key(root, mutation)
         old = previous.get(str(mutation["id"]))
         exact = old is not None and old.get("cache_key") == cache_key
-        # Migration path for evidence written before package-scoped cache keys
-        # existed. It is intentionally conservative about registry and exact
-        # mutated-source bytes; after one run every entry uses the full key.
+        # Migration path for evidence written before witness-scoped cache keys
+        # existed. Exact registry, source, anchor, and witness semantics must
+        # still match; after one run every entry carries the v2 key.
         legacy = (
             old is not None
-            and "cache_key" not in old
             and same_registry
             and old.get("source_sha256") == mutation.get("source_sha256")
+            and old.get("anchor_context_sha256")
+            == mutation.get("anchor_context_sha256")
             and old.get("test") == mutation.get("test")
             and old.get("find") == mutation.get("find")
             and old.get("replace") == mutation.get("replace")
@@ -1023,7 +1080,7 @@ def main() -> int:
         "cache": {
             "reused": len(reused),
             "executed": len(pending),
-            "approximation": "package-scoped-local-dependency",
+            "approximation": "anchor-and-exact-witness-body-v2",
         },
     }
     summary_path.write_text(

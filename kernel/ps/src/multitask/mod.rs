@@ -72,7 +72,10 @@ pub use self::current::{
     with_current_user_process_and_linux_thread_state_mut, with_current_user_process_state,
     with_current_user_process_state_mut, with_process_state_by_pid, with_process_state_by_pid_mut,
 };
-pub use self::process_table::ProcessIdentity;
+pub use self::process_table::{
+    ProcessIdentity, SpawnReservation, cancel_spawn as cancel_process_spawn,
+    reserve_spawn as reserve_process_spawn,
+};
 pub use self::retirement::UserFaultDisposition;
 pub use self::scheduler::FastIpcCallHandoffOutcome;
 pub use self::scheduler::drain_scheduler_runtime_profile;
@@ -93,7 +96,7 @@ pub(crate) use self::irq::{
     reschedule_deferred_from_interruptible_syscall, reschedule_if_requested,
 };
 pub use self::spawn::{
-    spawn_kernel_process, spawn_user_process_state_with_parent,
+    spawn_user_process_state_suspended_with_parent_reservation,
     spawn_user_process_suspended_with_scheduling_context,
     spawn_user_process_with_scheduling_context,
     spawn_user_process_without_deferred_reschedule_with_scheduling_context,

@@ -13,6 +13,7 @@ use rustos_user_abi::syscall::{
 /// an unbounded privileged sleep primitive. The backoff value is published by
 /// rootd and deliberately fits below this cap.
 const ROOTD_WAIT_MAX_MILLIS: u64 = 1_000;
+pub(crate) const RETIRED_TASK_CLEANUP_BUDGET: usize = 4;
 
 /// Remove every task-scoped runtime registration that lives outside the
 /// scheduler before its retired slot may be recycled. The caller supplies the
@@ -55,6 +56,36 @@ pub(crate) fn cleanup_retired_task_runtime_state(
         }
     }
     removed
+}
+
+/// Complete a bounded cohort of scheduler-stamped runtime cleanup tokens.
+/// The acknowledgement is the linearization point that permits later task
+/// slot and process-object reclamation; a mismatched token is fatal rather
+/// than silently pinning a finite process-table slot forever.
+pub(crate) fn service_retired_task_runtime_cleanup(limit: usize) -> usize {
+    let mut work = 0;
+    for _ in 0..limit {
+        let Some(cleanup) = multitask::next_retired_task_cleanup() else {
+            break;
+        };
+        work += cleanup_retired_task_runtime_state(
+            cleanup.task_id(),
+            cleanup.process_id(),
+            cleanup.process_terminal(),
+            cleanup.clear_child_tid(),
+            cleanup.robust_list_head(),
+            cleanup.robust_list_len(),
+        );
+        if !multitask::complete_retired_task_cleanup(cleanup) {
+            panic!(
+                "retired task cleanup acknowledgement lost: task_id={} process_id={}",
+                cleanup.task_id(),
+                cleanup.process_id()
+            );
+        }
+        work += 1;
+    }
+    work
 }
 
 fn rootd_wait_delay_is_valid(millis: u64) -> bool {

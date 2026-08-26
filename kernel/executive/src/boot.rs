@@ -33,7 +33,6 @@ const ROOTD_BOOTSTRAP_WEIGHT_MICROS: u64 = 4_000;
 const ROOTD_BOOTSTRAP_DOMAIN: u64 = 10;
 const ROOTD_BOOTSTRAP_BUDGET_NS: u64 = 4_000_000;
 const ROOTD_BOOTSTRAP_PERIOD_NS: u64 = 10_000_000;
-const MAX_RETIRED_TASK_CLEANUPS_PER_TURN: usize = 4;
 const AP_ONLINE_PARKED_TIMEOUT_NS: u64 = 2_000_000_000;
 static PANIC_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
@@ -768,27 +767,9 @@ pub fn housekeeping_once() -> usize {
     // of complete lifecycle transactions per scheduler turn so a process-exit
     // storm cannot concatenate individually bounded waits into an unbounded UI
     // or input stall. Unacknowledged records remain owned by the scheduler.
-    for _ in 0..MAX_RETIRED_TASK_CLEANUPS_PER_TURN {
-        let Some(cleanup) = ps_api::next_retired_task_cleanup() else {
-            break;
-        };
-        work += compat_api::syscall::cleanup_retired_task_runtime_state(
-            cleanup.task_id(),
-            cleanup.process_id(),
-            cleanup.process_terminal(),
-            cleanup.clear_child_tid(),
-            cleanup.robust_list_head(),
-            cleanup.robust_list_len(),
-        );
-        if !ps_api::complete_retired_task_cleanup(cleanup) {
-            panic!(
-                "retired task cleanup acknowledgement lost: task_id={} process_id={}",
-                cleanup.task_id(),
-                cleanup.process_id()
-            );
-        }
-        work += 1;
-    }
+    work += compat_api::syscall::service_retired_task_runtime_cleanup(
+        compat_api::syscall::RETIRED_TASK_CLEANUP_BUDGET,
+    );
     work += ps_api::service_deferred_work();
     work += compat_api::syscall::service_deferred_transfer_releases();
     // Shared display mappings may own large contiguous frame sets. Reclaim a
@@ -797,6 +778,10 @@ pub fn housekeeping_once() -> usize {
     work += ps_api::service_deferred_shared_region_reclaims(64);
     work += ps_api::drain_scheduler_runtime_profile();
     work += ps_api::drain_user_copy_profile();
+    work += mm_api::phys::drain_frame_batch_profile(
+        hal_api::arch::rtc::ticks(),
+        hal_api::arch::rtc::ticks_per_second(),
+    );
     work += compat_api::syscall::drain_ipc_call_profile();
     work += compat_api::syscall::drain_ipc_server_profile();
     work += compat_api::syscall::drain_syscall_profile();

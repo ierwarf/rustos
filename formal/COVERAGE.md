@@ -741,6 +741,7 @@ TLC.
 The PR and SMP-iteration profiles now include the compact
 `user-stack-growth/UserStackGrowth`,
 `exec-address-space-transaction/ExecAddressSpaceTransaction`,
+`process-lifecycle-transaction/ProcessLifecycleTransaction`,
 `ipc-transfer-authority/IpcTransferAuthority`,
 `capability-derivation-lifecycle/CapabilityDerivationLifecycle`,
 `dvm-transport-lifecycle/DvmTransportLifecycle`,
@@ -751,6 +752,16 @@ existing `robust-futex-owner-death/RobustFutexOwnerDeath` model also carries
 shared/private key equivalence. Each changed model has a named source witness
 and a killed specification mutation. This closes the reported abstract gaps;
 runtime contention, DVM behavior, and sustained FPS remain separate KVM gates.
+
+The process-lifecycle model covers partial-frame rollback, exact exec/exit
+transaction separation, attachment sealing, authority-free reap, and
+non-aliasing process generations. Fork and loader-created processes now reserve
+and retain the exact invisible spawn identity before initial address-space
+construction; every fallible preparation edge is held by a fail-closed RAII
+transaction. Source refinement and Phase-6 runtime closure are matched in
+`formal/CONFORMANCE.md`: exact-target KVM lifecycle probes cover all required
+stages, while executable race/fault witnesses cover exec/exit, attach/exit,
+reap/reuse, spawn failure, and partial-frame rollback.
 
 ## Shared-RAM cache and AP PAT coverage
 

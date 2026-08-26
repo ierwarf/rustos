@@ -417,6 +417,11 @@ pub(super) fn syscall_linux_wait4(pid: i64, status_ptr: u64, options: u64, rusag
                 {
                     return linux_errno(address_space_error_to_linux_errno(err));
                 }
+                // Blocking wait is the lifecycle consumer's backpressure
+                // point. Advance the same bounded cleanup owner as executive
+                // housekeeping, then release one acknowledged reclaim token.
+                let _ = service_retired_task_runtime_cleanup(RETIRED_TASK_CLEANUP_BUDGET);
+                let _ = multitask::service_deferred_work();
                 return child_pid;
             }
             multitask::WaitChildResult::Pending if nohang => return 0,
@@ -595,5 +600,25 @@ mod tests {
         assert_eq!(request.arg1, 4);
         assert_eq!(request.arg2, CPU_TOPOLOGY_OBSERVATION_ABI_VERSION);
         assert_eq!(request.arg3, 42);
+    }
+
+    #[test]
+    fn wait_exit_advances_runtime_cleanup_before_reclaim_and_return() {
+        let source = include_str!("syscalld_ops.rs");
+        let wait = source
+            .split_once("pub(super) fn syscall_linux_wait4(")
+            .expect("wait4 entry")
+            .1
+            .split_once("pub(super) fn syscall_linux_memfd_create(")
+            .expect("wait4 boundary")
+            .0;
+        let cleanup = wait
+            .find("service_retired_task_runtime_cleanup(RETIRED_TASK_CLEANUP_BUDGET)")
+            .expect("bounded runtime cleanup");
+        let reclaim = wait
+            .find("multitask::service_deferred_work()")
+            .expect("acknowledged scheduler/process reclaim");
+        let returned = wait.find("return child_pid").expect("terminal wait return");
+        assert!(cleanup < reclaim && reclaim < returned);
     }
 }

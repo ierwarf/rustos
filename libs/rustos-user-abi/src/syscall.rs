@@ -903,7 +903,8 @@ pub const fn procd_sigchld_is_suppressed(events: u32, action_flags: u64) -> bool
         && events & PROCD_SIGCHLD_EVENT_EXIT == 0
         && action_flags & PROCD_SIGACTION_SA_NOCLDSTOP != 0
 }
-pub const PROC_BROKER_ABI_VERSION: u16 = 2;
+pub const PROC_BROKER_ABI_VERSION: u16 = 3;
+pub const PROC_BROKER_PREPARE_FLAG_EXEC_TICKET: u32 = 1 << 0;
 /// Lifecycle fan-out is an independent contract. Do not couple its wire
 /// version to process prepare/commit ABI revisions.
 pub const LIFECYCLE_DRAIN_BROKER_ABI_VERSION: u16 = 1;
