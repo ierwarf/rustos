@@ -57,9 +57,15 @@ acquire_build_lock() {
 }
 
 prepare_host_tools() {
-    local gnu_install
+    local gnu_install system_install
 
     gnu_install="$(command -v gnuinstall || true)"
+    if test -z "$gnu_install"; then
+        system_install="$(command -v install || true)"
+        if test -n "$system_install" && "$system_install" --version 2>&1 | grep -q '^install (GNU coreutils) '; then
+            gnu_install="$system_install"
+        fi
+    fi
     test -n "$gnu_install" || die "missing GNU install; install gnu-coreutils"
     mkdir -p "$HOST_TOOL_DIR"
     ln -sfn "$gnu_install" "$HOST_TOOL_DIR/install"

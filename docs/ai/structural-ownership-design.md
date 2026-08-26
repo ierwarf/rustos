@@ -80,7 +80,7 @@ by writing the mapping down rather than by renaming either side.
 
 | item | what is actually missing |
 |---|---|
-| `V5-SCHED-GLOBAL-001` | **narrower than the item text.** The per-CPU runqueue, owner words, remote mailboxes, and per-CPU selection all exist and are already lock-free. What is left is that the `Scheduler` struct's per-task arrays still sit behind one `TrackedSpinLock`, so the remaining work is a data-structure split. Stage one is done: the owner word and the legacy tables were proven to agree, zero mismatches at 1 and 8 vCPU. Section 2 |
+| `V5-SCHED-GLOBAL-001` | **narrower than the item text.** The per-CPU runqueue, owner words, remote mailboxes, and per-CPU selection already avoid the global scheduler lock. What remains is that the `Scheduler` struct's per-task arrays still sit behind one `TrackedSpinLock`, so the remaining work is a data-structure split. There is no separate `TaskContext.ready` authority left to reconcile. Section 2 |
 | `V5-FORMAL-SCHED-019` | `SchedulerCpuOwnership.tla` models the guard, not the removal of the guard. Section 2.7 |
 | `V5-VFSD-HOL-007` | **structure landed, runtime evidence owed.** The receive owner never blocks, the plan carries its mount generation and the commit refuses a stale one, and custody is a bounded two-worker pool. What is still owed is the measured control-lane residence bound in section 3, and the 2005 ms snapshot itself is still unattributed. Section 3 |
 | `V5-WAYLAND-HOL-013`, `V5-GPU-UI-OWNER-014` | no `WaylandProtocolOwner`, `SceneOwner`, `GpuSubmissionOwner`, or `FramePlan`. Section 4 |
@@ -131,10 +131,11 @@ CPU mutates have to leave the globally locked struct for per-slot storage whose
 writer is that CPU, exactly as the writer table in 2.4 states. The scheduling
 policy above them is already per-CPU and does not move.
 
-This is also why `context.ready` matters more than it looks. It duplicates what
-the owner word already says, and stage one proved they agree — zero mismatches
-at 1 and 8 vCPU. Removing it as authority is the first field of the split, not a
-cleanup.
+The former `TaskContext.ready` duplicate has already been removed. The split
+must instead preserve the existing run-owner transition as the sole runnable
+authority while moving only fields whose writer is provably the owning CPU.
+That is a data-ownership migration, not a reason to weaken the lock or duplicate
+state again.
 
 ### 2.1b Where the lock time actually goes, measured at 8 vCPU
 

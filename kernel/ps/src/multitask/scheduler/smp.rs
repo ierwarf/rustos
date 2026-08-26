@@ -15,7 +15,40 @@
 //! - **Evidence:** `cpu-online-lifecycle`, `scheduler-lifecycle`, and
 //!   `smp-reschedule-ipi-lifecycle`.
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use super::*;
+
+const FAST_IPC_ELIGIBILITY_REJECTION_COUNT: usize = 10;
+static FAST_IPC_ELIGIBILITY_REJECTIONS: [AtomicU64; FAST_IPC_ELIGIBILITY_REJECTION_COUNT] =
+    [const { AtomicU64::new(0) }; FAST_IPC_ELIGIBILITY_REJECTION_COUNT];
+
+#[repr(usize)]
+#[derive(Clone, Copy)]
+pub(super) enum FastIpcEligibilityRejection {
+    BudgetCpu = 0,
+    ContextBudget = 1,
+    DomainBudget = 2,
+    ForeignExecutionOwner = 3,
+    RootCpu = 4,
+    IdleCpu = 5,
+    Affinity = 6,
+    JobStopped = 7,
+    ExecQuiesced = 8,
+    InvalidContext = 9,
+}
+
+pub(super) fn record_fast_ipc_eligibility_rejection(reason: FastIpcEligibilityRejection) {
+    FAST_IPC_ELIGIBILITY_REJECTIONS[reason as usize].fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn drain_fast_ipc_eligibility_rejections() -> [u64; FAST_IPC_ELIGIBILITY_REJECTION_COUNT] {
+    let mut counters = [0; FAST_IPC_ELIGIBILITY_REJECTION_COUNT];
+    for (index, counter) in FAST_IPC_ELIGIBILITY_REJECTIONS.iter().enumerate() {
+        counters[index] = counter.swap(0, Ordering::Relaxed);
+    }
+    counters
+}
 
 fn candidate_has_foreign_execution_owner(
     candidate_slot: usize,
@@ -162,30 +195,32 @@ impl Scheduler {
     /// custody. Direct handoff publishers use this before changing `Blocked`
     /// into `DirectHandoff`; otherwise a budget or affinity rejection in the
     /// picker could discard the one-shot handoff record and strand the task.
-    pub(super) fn context_is_dispatch_eligible_on_cpu(
+    pub(super) fn context_dispatch_ineligibility_on_cpu(
         &self,
         slot: usize,
         context: TaskContext,
         dispatch_cpu: usize,
-    ) -> bool {
+    ) -> Option<FastIpcEligibilityRejection> {
         let context_owner_slot = self.effective_scheduling_context_owner_slot(slot);
         let scheduling_context = self.contexts[context_owner_slot]
             .map(|owner| owner.scheduling_context)
             .unwrap_or(context.scheduling_context);
         if scheduling_context.is_budgeted() {
             if !scheduling_context.allows_cpu(dispatch_cpu) {
-                return false;
+                return Some(FastIpcEligibilityRejection::BudgetCpu);
             }
             let now_ns = crate::arch::clock::monotonic_nanos();
-            if !scheduling_context.is_eligible(now_ns)
-                || !scheduling_context
-                    .policy()
-                    .zip(scheduling_context.domain_slot())
-                    .is_some_and(|(policy, domain_slot)| {
-                        self.scheduling_domain_is_eligible(domain_slot, policy, now_ns)
-                    })
+            if !scheduling_context.is_eligible(now_ns) {
+                return Some(FastIpcEligibilityRejection::ContextBudget);
+            }
+            if !scheduling_context
+                .policy()
+                .zip(scheduling_context.domain_slot())
+                .is_some_and(|(policy, domain_slot)| {
+                    self.scheduling_domain_is_eligible(domain_slot, policy, now_ns)
+                })
             {
-                return false;
+                return Some(FastIpcEligibilityRejection::DomainBudget);
             }
         }
         if candidate_has_foreign_execution_owner(
@@ -194,35 +229,40 @@ impl Scheduler {
             dispatch_cpu,
             super::super::cpu_local::task_running_cpu(slot),
         ) {
-            return false;
+            return Some(FastIpcEligibilityRejection::ForeignExecutionOwner);
         }
         if slot == ROOT_TASK_SLOT && dispatch_cpu != 0 {
-            return false;
+            return Some(FastIpcEligibilityRejection::RootCpu);
         }
         let idle_cpu = self.idle_cpu[slot];
         if idle_cpu != NO_IDLE_CPU && usize::from(idle_cpu) != dispatch_cpu {
-            return false;
+            return Some(FastIpcEligibilityRejection::IdleCpu);
         }
         let affinity_bit = 1_u64
             .checked_shl(u32::try_from(dispatch_cpu).expect("logical CPU index overflow"))
             .expect("logical CPU index exceeds affinity mask");
         let (task_affinity, process_affinity, _) = self.slot_affinity_snapshot(slot);
         if task_affinity & process_affinity & affinity_bit == 0 {
-            return false;
+            return Some(FastIpcEligibilityRejection::Affinity);
         }
-        !self.job_stopped[slot]
-            && !self.exec_target_quiesced[slot]
-            && self
-                .context_validation_error(slot, context, self.slot_saved_rsp(slot))
-                .is_none()
+        if self.job_stopped[slot] {
+            return Some(FastIpcEligibilityRejection::JobStopped);
+        }
+        if self.exec_target_quiesced[slot] {
+            return Some(FastIpcEligibilityRejection::ExecQuiesced);
+        }
+        self.context_validation_error(slot, context, self.slot_saved_rsp(slot))
+            .is_some()
+            .then_some(FastIpcEligibilityRejection::InvalidContext)
     }
 
     pub(super) fn context_is_dispatch_eligible(&self, slot: usize, context: TaskContext) -> bool {
-        self.context_is_dispatch_eligible_on_cpu(
+        self.context_dispatch_ineligibility_on_cpu(
             slot,
             context,
             nucleus_core::util::lockdep::current_cpu_index(),
         )
+        .is_none()
     }
 
     pub(super) fn context_is_schedulable(&self, slot: usize, context: TaskContext) -> bool {

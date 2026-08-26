@@ -79,6 +79,7 @@ pub use self::process_table::{
 pub use self::retirement::UserFaultDisposition;
 pub use self::scheduler::FastIpcCallHandoffOutcome;
 pub use self::scheduler::drain_scheduler_runtime_profile;
+pub use self::scheduler::smp::drain_fast_ipc_eligibility_rejections;
 pub use self::scheduler::{AffinityCommit, AffinityError, ProcessAffinitySnapshot};
 pub use self::scheduling_api::{SchedulingContextAdmission, SchedulingContextRuntimeSnapshot};
 

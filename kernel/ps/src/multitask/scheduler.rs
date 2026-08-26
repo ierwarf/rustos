@@ -64,7 +64,7 @@ pub(super) fn enqueue_reply_wake_handoff(token: ReplyWakeHandoff) -> bool {
     sync_handoff::enqueue_reply_wake(token)
 }
 
-mod smp;
+pub(crate) mod smp;
 #[cfg(test)]
 mod synchronous_handoff_tests;
 mod thread_slots;
@@ -412,7 +412,6 @@ pub(super) struct TaskStart {
     pub(super) entry: fn(u64),
     pub(super) id: u64,
 }
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FastIpcCallHandoffOutcome {
     CommittedSameCpu,
@@ -420,10 +419,10 @@ pub enum FastIpcCallHandoffOutcome {
     SenderMismatch,
     ReceiverMismatch,
     DonationUnavailable,
+    EligibilityUnavailable,
     DirectCustodyUnavailable,
     OrderingUnavailable,
 }
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum FastIpcReplyHandoffOutcome {
     Direct,
@@ -1452,21 +1451,22 @@ impl Scheduler {
         }
         let current_cpu = Self::current_dispatch_cpu();
         let target_cpu = self.slot_dispatch_cpu(receiver_slot);
-        #[cfg(not(test))]
-        {
-            if !self.context_is_dispatch_eligible_on_cpu(
-                receiver_slot,
-                self.contexts[receiver_slot].expect("validated fast IPC receiver lost context"),
-                target_cpu,
-            ) {
-                return FastIpcCallHandoffOutcome::DirectCustodyUnavailable;
-            }
-        }
         let sender_task_id = self.starts[sender_slot]
             .expect("validated fast IPC sender lost identity")
             .id;
         if !self.bind_reserved_ipc_priority(reply, sender_task_id, receiver_task_id) {
             return FastIpcCallHandoffOutcome::DonationUnavailable;
+        }
+        #[cfg(not(test))]
+        {
+            if let Some(reason) = self.context_dispatch_ineligibility_on_cpu(
+                receiver_slot,
+                self.contexts[receiver_slot].expect("validated fast IPC receiver lost context"),
+                target_cpu,
+            ) {
+                smp::record_fast_ipc_eligibility_rejection(reason);
+                return FastIpcCallHandoffOutcome::EligibilityUnavailable;
+            }
         }
 
         if target_cpu == current_cpu {

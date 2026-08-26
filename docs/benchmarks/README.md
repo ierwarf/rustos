@@ -1549,9 +1549,10 @@ claim. On eight vCPUs, the anchored exact-tree run moved the intra-process
 minimum from 66,520 to 64,120 (-3.6% raw, -4.6% normalized), its p50 from
 221,480 to 210,360 (-5.0% raw), and the cross-process minimum from 89,360 to
 77,040 (-13.8% raw, -14.7% normalized). The eight-vCPU intra-process p50
-amplification is still about 2.14x; scheduler-catalog contention remains the
-measured owner and eliminating it requires the larger ownership work
-intentionally left for Phase 6 or later.
+amplification was about 2.14x in that historical run. It must not be read as a
+claim that the per-task `Scheduler` catalog has been split: the remaining
+`V5-SCHED-GLOBAL-001` work is still explicitly open in
+`docs/ai/structural-ownership-design.md`.
 
 Benchmark execution is not product acceptance evidence. `xtask bench` uses a
 private KVM launch that does not publish a runtime-trace seal for an
@@ -1559,6 +1560,43 @@ intentionally changing source tree; ordinary smoke and qualification commands
 remain strict. A multi-vCPU or isolated diagnostic gets a bounded 60-second
 terminal budget because a second eight-vCPU repeat completed the product UI
 but crossed the former 30-second harness cutoff before `ipcbench: end`.
+
+## Current fast-IPC eligibility result
+
+This supersedes the old implication that every fast-handoff admission fallback
+was a generic scheduler limitation. The fast commit used to test the receiver's
+dispatch eligibility before it bound the reply's scheduling-context custody.
+That made the eligibility resolver see the server-native context, including an
+already exhausted budget, instead of the caller's live donated context.
+
+The commit now binds the exact reply custody first and keeps the existing
+rollback path for every later rejection. Reason counters reuse the benchmark's
+existing `ipc-fastpath-counter` record; they are observational, do not grant
+authority, and are drained after each run. In the immediately preceding
+eight-vCPU diagnostic, 2,228 of 2,239 eligibility rejections were
+`context-budget`, accounting for 2,243 scheduler fallbacks. The corrected run
+recorded zero context-budget rejections, four domain-budget rejections, twenty
+foreign-execution-owner rejections, and twenty-nine scheduler fallbacks.
+
+| isolated `syscalld getuid`, eight vCPUs | preceding diagnostic | corrected run |
+| --- | ---: | ---: |
+| CPUID anchor p50 | 3,880 | 3,960 |
+| IPC min / p50 cycles | 69,440 / 166,920 | 68,040 / 163,160 |
+| committed fast handoffs | 19,252 | 21,145 |
+| context-budget rejections | 2,228 | 0 |
+| scheduler fallbacks | 2,243 | 29 |
+
+The anchor changed by more than the comparison rule permits, so the table is
+**not** a latency-improvement claim. It is a correctness and path-selection
+result: the rejected work no longer consults the wrong scheduling context. A
+fresh one-vCPU corrected run measured 67,920/73,400 cycles (min/p50) with
+22,000 committed handoffs and no fast-path fallback. The eight-vCPU p50 remains
+roughly 169,000 cycles, so this fix does not establish a 3,000-cycle IPC target.
+
+For the same current tree, isolated `sched_yield` measured 11,520/37,120 cycles
+at one vCPU and 9,120/10,240 at eight vCPUs (min/p50). That rules out a simple
+single-dispatch regression, but it is not a concurrent runqueue-contention
+test and does not close the outstanding scheduler data-structure split.
 
 ## Phase 6 process-lifecycle and frame-settlement checkpoint
 

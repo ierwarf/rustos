@@ -9,6 +9,9 @@
 # style settings (model, reasoning effort, plugins, memories) stay in
 # the user config.
 
+web_search = "live"
+model_verbosity = "medium"
+sandbox_mode = "workspace-write"
 [features]
 hooks = true
 
@@ -97,3 +100,6 @@ approval_mode = "approve"
 [mcp_servers.serena]
 command = "uvx"
 args = ["--from", "serena-agent==1.6.0", "serena", "start-mcp-server"]
+
+[sandbox_workspace_write]
+network_access = true

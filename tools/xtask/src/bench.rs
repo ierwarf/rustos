@@ -82,7 +82,7 @@ const PHASE_PREFIXES: [&str; 5] = [
 
 const COUNTER_PREFIXES: [&str; 1] = ["frame-batch-"];
 
-const IPC_FAST_COUNTER_NAMES: [&str; 17] = [
+const IPC_FAST_COUNTER_NAMES: [&str; 33] = [
     "ipc-fast-admission-attempt",
     "ipc-fast-admission-fallback",
     "ipc-fast-reservation-published",
@@ -100,6 +100,22 @@ const IPC_FAST_COUNTER_NAMES: [&str; 17] = [
     "ipc-fast-fallback-deadline-arm",
     "ipc-fast-fallback-scheduler",
     "ipc-fast-caller-mm-rejected",
+    "ipc-fast-handoff-reject-sender",
+    "ipc-fast-handoff-reject-receiver",
+    "ipc-fast-handoff-reject-donation",
+    "ipc-fast-handoff-reject-eligibility",
+    "ipc-fast-handoff-reject-custody",
+    "ipc-fast-handoff-reject-ordering",
+    "ipc-fast-eligibility-reject-budget-cpu",
+    "ipc-fast-eligibility-reject-context-budget",
+    "ipc-fast-eligibility-reject-domain-budget",
+    "ipc-fast-eligibility-reject-foreign-execution-owner",
+    "ipc-fast-eligibility-reject-root-cpu",
+    "ipc-fast-eligibility-reject-idle-cpu",
+    "ipc-fast-eligibility-reject-affinity",
+    "ipc-fast-eligibility-reject-job-stopped",
+    "ipc-fast-eligibility-reject-exec-quiesced",
+    "ipc-fast-eligibility-reject-invalid-context",
 ];
 
 /// One parsed probe result. Cycle counts are the primary record: they survive

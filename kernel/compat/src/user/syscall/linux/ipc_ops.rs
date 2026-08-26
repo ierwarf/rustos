@@ -21,6 +21,8 @@ use super::*;
 mod diagnostics;
 #[path = "ipc_call_admission.rs"]
 mod ipc_call_admission;
+#[path = "ipc_fast_metrics.rs"]
+mod ipc_fast_metrics;
 #[path = "ipc_reply_recv.rs"]
 mod ipc_reply_recv;
 mod reply_wait;
@@ -31,6 +33,8 @@ use core::mem::size_of;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 pub(super) use diagnostics::diagnostic_rate_limit_permit;
 use diagnostics::record_ipc_reply_rejection;
+pub(super) use ipc_fast_metrics::drain_fast_ipc_counters;
+use ipc_fast_metrics::{IpcFastCounter, note_fast_ipc, note_fast_ipc_handoff_rejection};
 use reply_wait::wait_for_reply_with_deadline;
 pub(super) use subject::{
     current_process_has_service_capability, current_process_with_service_capability,
@@ -76,54 +80,6 @@ const MAX_SLOW_IPC_LOGS_PER_SECOND: usize = 1;
 const EARLY_IPC_SAMPLE_COUNT: usize = 6;
 const SERVICE_IPC_TIMEOUT_MS: u64 = rustos_user_abi::performance::IPC_BULK_DATA_HARD_LIMIT_MS;
 const IPC_FAST_CALL_LIVE: bool = true;
-const IPC_FAST_COUNTER_COUNT: usize = 17;
-static IPC_FAST_COUNTERS: [AtomicU64; IPC_FAST_COUNTER_COUNT] =
-    [const { AtomicU64::new(0) }; IPC_FAST_COUNTER_COUNT];
-
-#[repr(usize)]
-#[derive(Clone, Copy)]
-enum IpcFastCounter {
-    AdmissionAttempt = 0,
-    AdmissionFallback = 1,
-    ReservationPublished = 2,
-    HandoffCommitted = 3,
-    HandoffRejected = 4,
-    ReceiverTaken = 5,
-    ReplyPublished = 6,
-    CallerResponse = 7,
-    CallerTerminalError = 8,
-    CallerDeadline = 9,
-    FusedReplyPublished = 10,
-    Rollback = 11,
-    FallbackShape = 12,
-    FallbackNoFrame = 13,
-    FallbackDeadlineArm = 14,
-    FallbackScheduler = 15,
-    CallerMmRejected = 16,
-}
-
-#[inline]
-fn note_fast_ipc(counter: IpcFastCounter) {
-    IPC_FAST_COUNTERS[counter as usize].fetch_add(1, Ordering::Relaxed);
-}
-
-pub(super) fn drain_fast_ipc_counters() -> usize {
-    let mut emitted = 0;
-    for (reason, counter) in IPC_FAST_COUNTERS.iter().enumerate() {
-        let count = counter.swap(0, Ordering::Relaxed);
-        if count == 0 {
-            continue;
-        }
-        debug::record_milestone(
-            debug::LogCategory::Compat,
-            "ipc-fastpath-counter",
-            reason as u64,
-            count,
-        );
-        emitted += 1;
-    }
-    emitted
-}
 use rustos_user_abi::performance::IPC_RECEIVE_REPORT_MAX_ADDRESS_SPACE_BINDS as MAX_RECEIVE_BINDS;
 // RING3-MIGRATION-REFERENCE START: rootd should own service namespace endpoint
 // ownership and capability leases. Ring0 keeps the temporary service registry
@@ -1654,6 +1610,7 @@ fn try_fast_ipc_call_bytes(
             | multitask::FastIpcCallHandoffOutcome::CommittedCrossCpu
     ) {
         note_fast_ipc(IpcFastCounter::HandoffRejected);
+        note_fast_ipc_handoff_rejection(handoff);
         note_fast_ipc(IpcFastCounter::FallbackScheduler);
         let _ = multitask::cancel_block_current_task();
         rollback_fast_call(endpoint, reply, task_id, receiver_task_id)?;

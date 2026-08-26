@@ -6,58 +6,42 @@ command output win when they disagree with this page.
 
 ## Current checkout snapshot
 
-Recorded 2026-08-18 (updated same day, later in the session — Stage 2 and
-the wake-path fix landed and were committed after everything below through
-"Stage 1" was written). **This block is the only current-state section.**
-Everything from "Session log" onward is a dated chronological archive, oldest
-first, containing claims that were true when written and several that were
-later corrected in place further down. Read this block, then search the
-archive for a topic; never read it top-down and treat what you hit first as
-current.
+Recorded 2026-08-27. **This block is the only current-state section.** The
+working tree intentionally contains an uncommitted fast-IPC eligibility fix,
+its reason telemetry, a GNU-`install` portability repair for the Linux DVM
+wrapper, and the documentation updates that describe them. Do not infer a
+Phase-0--6 closure from the older archive below.
 
-- The worktree is **clean**; Stage 0a, 0b, and Stage 2 (see below) are
-  **committed**.
-- `ipc_rt_intra_process` is **70,120** invariant-TSC ticks, down from 73,760
-  (the Stage 0/1 figure below) and 397,040 originally. See "Stage 2" below —
-  the drop is a real fix, not a re-measurement.
-- The active lane is synchronous IPC and syscall entry cost.
-  `docs/benchmarks/README.md` is the evidence and
-  `docs/ai/performance-hardening.md` has the routing rules. **Both outrank this
-  page**, and both outrank any plan file.
+- The current `pr` formal gate is sealed against this tree: 131 models, 70
+  flows, 726 transitions, 619 source-conformance checks, and 555/555
+  implementation mutations killed.
+- The fast call path now binds the exact reply scheduling-context custody
+  before it tests dispatch eligibility. The effective owner is therefore the
+  caller's donated context rather than an already-exhausted server-native
+  context; any later rejection follows the existing rollback/settlement path.
+- In fresh isolated KVM runs, `ipc_rt_cross_process_syscalld_getuid` was
+  67,920/73,400 cycles (min/p50) on one vCPU with 22,000/22,000 fast handoffs,
+  and 68,040/163,160 on eight vCPUs with 21,145 committed handoffs. The
+  eight-vCPU run recorded zero context-budget rejections, four domain-budget
+  rejections, twenty foreign-owner rejections, and twenty-nine scheduler
+  fallbacks.
+  Its p99 is desktop-contention-sensitive and is not a regression signal.
+- `sched_yield` measured 11,520/37,120 cycles on one vCPU and 9,120/10,240 on
+  eight vCPUs (min/p50). These isolated probes establish no simple dispatch
+  regression; they are not a concurrent runqueue-scaling proof. The remaining
+  `V5-SCHED-GLOBAL-001` work is still the per-task `Scheduler` data-structure
+  split, not a reason to remove its authority lock blindly.
+- `docs/benchmarks/README.md` is the measurement record and
+  `docs/ai/performance-hardening.md` owns the measurement rules. Both outrank
+  this routing note and the historical archive.
+- Host `perf` is not installed. The package manager identifies `extra/perf`,
+  but installing it requires the interactive sudo password; do not substitute a
+  host profile of `xtask` or the QEMU wrapper for guest attribution.
 
-### Where the IPC lane stands
+## Session log
 
-`ipc_rt_intra_process` is **73,760** invariant-TSC ticks, from 397,040. seL4's
-x86 MCS round trip is ~720 cycles, so the gap is ~102x.
-
-All five structural ceilings are closed, **four of them by measurement rather
-than by a change**:
-
-| ceiling | outcome |
-|---|---|
-| 06 lockdep posture | priced, kept; the baseline was stale, not the code |
-| 05 FPU custody | per-syscall `XSAVE` pair **deleted**, 829 ticks/syscall |
-| 01+02 reply-wait protocol | refuted — an arm (2,897) costs more than a poll (2,350) |
-| 03 enqueue chain | exhausted — two fusions measured 5,050 → 5,048 |
-| 04 per-thread IPC buffer | 3,380 ticks, 4.6% — does not earn its pinning hazards |
-
-**The real ceiling is that 81% of the round trip has never been measured.**
-
-| half | ticks | attributable | dark |
-|---|---:|---:|---:|
-| client `call` → server `recv` returns | 44,720 | 12,606 | 32,114 (72%) |
-| server `reply` → client `call` returns | 28,480 | 1,618 | 26,862 (94%) |
-
-Two gaps cause it: `ipc_reply_recv.rs` has **zero** `charge_phase` calls and
-neither `syscall_linux_rustos_ipc_recv` nor `syscall_linux_rustos_ipc_reply`
-charges a phase, so the receiver side is entirely dark; and
-`apps/ipcbench/src/main.rs` runs every probe in one boot with system-wide
-counters, so a phase charged by more than one probe can never be divided into
-one.
-
-**Next work is instrumentation, not optimisation.** No target may be named until
-a phase total divides into one round trip. `cargo xtask bench` now prints that
-ratio and parenthesises it when it does not hold.
+Historical, oldest first. Superseded by the snapshot above wherever they
+disagree, and by `docs/benchmarks/README.md` on anything measured.
 
 ### Stage 0a landed, partially: `cargo xtask bench --isolate-probe <name>`
 
@@ -259,11 +243,6 @@ probe exists yet to measure it end to end.
   syscall entry stub's sixteen `movdqu` are the whole of the syscall path's FPU
   custody. See `nucleus_audit.rs` for what holds the rest.
 - `kernel/compat/src/user/linux.rs`. Truth is `kernel/ps/src/user/linux.rs`.
-
-## Session log
-
-Historical, oldest first. Superseded by the snapshot above wherever they
-disagree, and by `docs/benchmarks/README.md` on anything measured.
 
 ### Root cause of the SMP collapse: `CPUID` in the raw-lock path
 
