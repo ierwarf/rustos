@@ -1,73 +1,38 @@
 ---
 name: rustos-microkernel-trace
-description: Debug RustOS microkernel IPC offload paths — kernel-to-service brokers, fast-path skip rules, and stall diagnosis. Use when investigating syscall latency, broker stalls, missing fast path, or service handoff bugs. Skip for unrelated debugging.
+description: Trace RustOS microkernel IPC, broker, scheduler, and service handoff paths to explain stalls or cost. Use for IPC latency, broker routing, fast-path, or service-handoff diagnosis.
 ---
 
-# RustOS Microkernel Trace Skill
+# RustOS Microkernel Trace
 
-## Architecture Recap
+If the diagnosis leads to a source change, load `rustos-code-editing` and pass
+the mandatory Serena, ast-grep MCP, and CodeGraph preflight before editing.
 
-Offload syscalls follow this path:
+## Trace the ownership path
 
-```
-ring0 entry  →  narrow privileged broker  →  user service
-            (SYS_RUSTOS_*_BROKER)         (syscalld/vfsd/etc.)
-```
+Start with the syscall family and authoritative API surface. Then identify:
 
-Brokers exist to **arbitrate capabilities**. When a broker is a no-op
-forwarder (just shuttles a request into a shared region and signals the
-service), the broker IPC is pure overhead and should be skipped.
+- ring0 entry and the narrow broker, if any;
+- the owning service (`syscalld`, `vfsd`, `loaderd`, `netd`, `inputd`, or other);
+- shared-memory or capability mapping, queue bounds, and readiness generation;
+- reply/wakeup, cancellation, timeout, close, restart, and revoke paths.
 
-## Diagnosis Checklist
+Use Serena for symbols/references, ast-grep for structural patterns such as
+broker-forwarding shapes, and CodeGraph for callers, callees, dependencies,
+and blast radius. Local text search is not a substitute for the source-editing
+gate.
 
-When the user reports a syscall stall, slowdown, or unexpected IPC churn:
+## Interpretation
 
-1. **Identify the syscall family** — MM, VFS, signal, clock, net, etc.
-2. **Locate the broker** — `rg "SYS_RUSTOS_.*_BROKER" kernel/`
-3. **Inspect the broker body** — does it actually arbitrate, or just
-   forward? If forward-only → fast-path candidate.
-4. **Check shared region access** — is the kernel pointer to the shared
-   region cached at the call site, or re-resolved each call? Re-resolve =
-   stall.
-5. **Check the service side** — `services/<svc>d/` — is it draining the
-   request ring promptly, or blocked on its own dependency?
-6. **Count one logical operation** — look for query/wait/query sequences,
-   fixed-capacity payload copies, a single receiver serializing callers, or a
-   one-slot handoff that overwrites an earlier owner.
-7. **Name the ABI boundary** — if every data byte still crosses synchronous
-   broker IPC, scheduler hints can reduce wake delay but cannot provide a
-   shared data fast path. Record the missing userspace ABI as a failed gate;
-   do not add an application-specific ring or move socket policy into ring0.
-   Before calling that ABI a small patch, account for bounded ring ownership,
-   asymmetric mapping rights, readiness generations/lost-wake closure,
-   short-I/O ordering, dup/fork/exec, peer close/shutdown, descriptor and
-   credential transfer, revoke, and recovery. If these cross several owners,
-   stop and report the interface/model scope before implementing it.
+Do not call a scheduler handoff a data fast path. Count syscalls, IPC rounds,
+payload copies, rendezvous transitions, lock acquisitions, queue depth, and
+tail latency separately. A fast path is valid only when capability checks,
+ordering, ownership, cancellation, and observable results remain equivalent.
 
-## Common Patterns
+If a broker only forwards data, treat bypassing it as a hypothesis until the
+contract proves that no capability arbitration occurs there. Move policy into
+the owning user service; never restore ring0 policy to hide a stall.
 
-| Symptom | Likely Cause | Fix Location |
-|---|---|---|
-| Syscall takes 2× expected IPC count | No-op broker not bypassed | broker source in `kernel/<area>/` |
-| Stall on first call after fork | Shared region pointer not cached per task | call site in `kernel/ps/` |
-| Service spins but never replies | Service ring drain stuck on a dep | `services/<svc>d/src/main.rs` |
-| Black frame after policy change | Surface re-prime in `apply_runtime_state` | `services/uiserver/` |
-| Local socket client is slow while compositor is fast | Per-send/recv synchronous service IPC or redundant readiness queries | `kernel/compat/.../service_ops`, `services/netd/`, ABI crate |
-| One caller delays unrelated clients | Single service receiver or unbounded blocking worker | service receiver and fixed worker admission |
-| Wake optimization loses an earlier target | One-slot or cross-class handoff overwrite | bounded scheduler FIFO plus exact endpoint authorization |
-
-## Cross-Reference
-
-- `kernel/AGENTS.md` — fast-path rule, broker naming
-- `services/AGENTS.md` — service authority map, bootstrap traps
-- `libs/runtime-control/src/lib.rs` — runtime protocol surface
-
-## Do Not
-
-- Do not "fix" a stall by reintroducing ring0 policy. Move the work into
-  the owning service instead.
-- Do not add a new broker unless the new syscall family genuinely needs
-  capability arbitration. Otherwise the service can be called directly
-  through an existing port.
-- Do not call a scheduler handoff a data fast path. Validate payload copies,
-  request count, service ownership, and end-to-end throughput separately.
+Report the first trustworthy evidence, the exact path, the remaining unknown,
+and the next bounded probe. Do not make performance claims from a single
+minimum or from visual/model output.

@@ -180,6 +180,31 @@ expect_match \
   'serena-agent==1\.6\.0'
 
 expect_match \
+  "ast-grep MCP is configured" \
+  .codex/config.toml \
+  'mcp_servers\.ast_grep'
+
+expect_match \
+  "CodeGraph MCP is configured" \
+  .codex/config.toml \
+  'mcp_servers\.codegraph'
+
+expect_match \
+  "source edits require the three MCP tools" \
+  AGENTS.md \
+  'preflight all three project MCP servers'
+
+expect_match \
+  "RustOS code editing skill exists" \
+  .agents/skills/rustos-code-editing/SKILL.md \
+  '^name: rustos-code-editing'
+
+expect_match \
+  "RustOS code editing skill makes Serena primary" \
+  .agents/skills/rustos-code-editing/SKILL.md \
+  'Serena is the primary editor'
+
+expect_match \
   "unified shell tool is hook-covered" \
   .codex/config.toml \
   'Bash\|exec_command\|mcp__serena__execute_shell_command'

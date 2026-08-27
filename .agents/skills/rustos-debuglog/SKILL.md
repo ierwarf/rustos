@@ -1,71 +1,34 @@
 ---
 name: rustos-debuglog
-description: Filter and summarize RustOS runtime logs (debugcon, serial) without flooding context. Use whenever the user references a boot log, asks why something stalled, or wants to find a panic / service failure. Use INSTEAD of reading log files whole.
+description: Filter and summarize RustOS debugcon or serial runtime logs with bounded evidence. Use for boot stalls, panics, service failures, and runtime symptoms; do not use for source edits.
 ---
 
-# RustOS Debug Log Skill
+# RustOS Debug Logs
 
-## Files
+Keep the main context small. Do not read a log whole. Search a marker first,
+then extract only the relevant lines from `logs/` or the focused KVM captures
+under `build/kvm/`.
 
-- `logs/debugcon.log` — primary kernel + service debug stream
-- `logs/serial.log` — UART serial output (sometimes duplicated)
-- `logs/*.log` — per-run snapshots, may persist across boots
-- `build/kvm/rustos-debugcon.log` — current `xtask kvm-smoke` RustOS capture
-- `build/kvm/linux-dvm-serial.log` — current Linux DVM relay capture
+Useful bounded filters:
 
-These files are excluded from the default inspection allow-list in the
-repo root `AGENTS.md`. Always treat them as bounded extracts, never as
-whole-file reads.
+```sh
+rg -n -m 1 'panic|BUG|fatal' logs/debugcon.log
+rg -n 'service.*(failed|crashed|exit)' logs/debugcon.log | tail -n 30
+rg -n 'stall|timeout|deadline' logs/debugcon.log | tail -n 30
+```
 
-## Standard Filters
+For KVM, use the command's failure output first, then inspect only matching
+lines in `build/kvm/rustos-debugcon.log` and
+`build/kvm/linux-dvm-serial.log`. Do not turn a visual observation, one good
+window, or a provider-side FPS number into end-to-end evidence.
 
-| Goal | Command |
-|---|---|
-| Find first panic | `rg -n --max-count=1 'panic\|BUG\|fatal' logs/debugcon.log` |
-| Service startup failures | `rg -n 'service.*(failed\|crashed\|exit)' logs/debugcon.log \| tail -n 30` |
-| Stalls / watchdogs | `rg -n 'stall\|timeout\|deadline' logs/debugcon.log \| tail -n 30` |
-| UI / surface issues | `rg -n 'wayclick profile\|uiserver wayland callback profile\|uiserver profile\|display (not available\|unavailable)\|black frame' build/kvm/rustos-debugcon.log \| tail -n 30` |
-| Physical GPU ownership split | `rg -n 'input watchdog\|gpu-compositor (active\|offline)\|physical-gpu-frame\|page-flip\|present-fence' build/kvm/{rustos-debugcon,linux-dvm-serial}.log \| tail -n 30` |
-| IPC / broker round-trips | `rg -n 'BROKER\|ipc\|fast.?path' logs/debugcon.log \| tail -n 30` |
+## Report
 
-For a slow Wayland client, compare three independent rates before editing:
+Return the earliest relevant failure with file and line, the five to ten
+events immediately before it, the likely owning subsystem, and the next
+focused source query. Distinguish fact from inference. If source must change,
+stop log triage and load `rustos-code-editing`; its three-MCP preflight is a
+hard gate.
 
-1. WayClick redraw time and balanced commit/callback/release rate.
-2. uiserver callback wait plus `shm_copy_avg_us`/`shm_copy_max_us`.
-3. uiserver render/present rate and input/cursor integrity.
-4. DVM atomic-page-flip relay rate and matched fence counts.
-
-Low WayClick redraw time plus low callback/commit rate while uiserver and the
-DVM stay near refresh rate points to OS transport or scheduling, not expensive
-application drawing. Low compositor callback wait but low client callback rate
-narrows it further to the client/server AF_UNIX data plane. High SHM copy time
-instead points to damage/copy amplification. A callback without a matching
-buffer release is a different lifetime bug. Treat a `--min-ui-fps` failure as
-evidence; do not average independent good windows into success.
-
-For a physical display freeze, separate owners before editing. A uiserver input
-watchdog with matched DVM GPU/page-flip/present fences and no compositor-offline
-record is a userspace readiness failure, not GPU/KMS loss. Rapid visual flicker
-with advancing matched fences can instead be stale multi-slot atlas content.
-The latest operator-observed physical rerun did not reproduce either symptom;
-see `docs/ai/physical-gpu-status.md`. Do not request another FPS run merely to
-diagnose the still-open generic wait-set ABI.
-
-## Reporting
-
-When summarizing a log for the user:
-
-1. Report the **first** failure line (file, message, timestamp if shown).
-2. Report the **last 5-10 events before the failure** (what was the system
-   doing right before it broke).
-3. Cite line ranges, not the full output: e.g. "panic at
-   `logs/debugcon.log:4821`, preceded by uiserver surface rebuild loop
-   from `:4790-:4820`".
-
-## Do Not
-
-- Do not `cat`, broad `head`/`tail`, or read a log without a marker or line
-  range. If no marker is known, inspect file size and the last 30 lines once.
-- Do not paste more than ~30 lines of log into chat. Summarize instead.
-- Do not re-grep the same pattern multiple times — cache the result in
-  your reply.
+Do not propose speculative fixes from a log alone. Preserve the first failure
+and its causal context instead of averaging later healthy events into success.

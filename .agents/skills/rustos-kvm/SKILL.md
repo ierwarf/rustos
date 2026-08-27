@@ -1,111 +1,42 @@
 ---
 name: rustos-kvm
-description: Prepare and diagnose RustOS KVM and Linux DVM parallel-boot runs. Use when the user asks to run, boot, test, or debug RustOS through KVM.
+description: Prepare, run, and diagnose bounded RustOS KVM and Linux DVM boots with independent acceptance evidence. Use for boot, run, KVM, DVM, or SMP requests.
 ---
 
-# RustOS KVM Skill
+# RustOS KVM
 
-## Entry points
+If source changes are needed, load `rustos-code-editing` first and pass the
+Serena/ast-grep/CodeGraph gate. For build routing, use `rustos-build`.
 
-- KVM parallel-boot runner: `tools/xtask/src/kvm.rs`
-- Linux DVM appliance: `driver-domains/linux/`
-- Generated runtime inputs: `build/kvm/`
-- Physical GPU continuation status: `docs/ai/physical-gpu-status.md`
+## Order
 
-## Validation order
+1. Run `cargo xtask dev-plan` and its selected fast checks.
+2. Run `cargo xtask build` for a RustOS disk when the requested gate needs a
+   fresh signed image. RustOS-only changes reuse a verified DVM artifact.
+3. For DVM relay changes, run `make -C driver-domains/linux build-plan`, then
+   the matching stable `rebuild-*` before verification.
+4. Run one bounded `cargo xtask kvm-smoke` command with an explicit timeout.
+5. Use the command's acceptance output, exit code, and focused log extracts.
 
-1. Run `cargo xtask dev-plan`; use its fast lane to select the focused checks.
-2. Run `cargo xtask check` and `cargo xtask build` for the RustOS disk.
-3. Run `cargo xtask verify-dvm` against the existing artifact for RustOS-only,
-   documentation, formal-model, or xtask changes. If DVM relay source changed,
-   batch the coherent source set and run exactly one matching `rebuild-agent`,
-   `rebuild-display`, or `rebuild-net` before `verify-dvm`. Run full
-   `build-dvm` only for a cold artifact, toolchain/config/source-lock change, or
-   explicit full-appliance request.
-4. With `/dev/kvm` access, run one bounded command with `--timeout 30` or less:
+Acceptance requires the final expected acceptance line, exit code 0, and real
+pointer ingress where the topology claims input. A relay reset after those
+conditions is non-fatal only if the final acceptance evidence is already
+complete. Do not accept a GUI or UI-server marker as proof of DVM, input, or
+GPU readiness; a cross-service userspace ABI claim needs its own contract and
+end-to-end evidence.
 
-   ```sh
-   cargo xtask kvm-smoke --expect 'runtimed: bootstrap ui done'
-   ```
+For UI/DVM work, use the repository's explicit `--gui-dvm-surfaces` and
+`--min-ui-fps` gates only when requested; keep commit, frame-callback, release,
+uiserver, and relay windows balanced. For SMP, run the requested vCPU cohort
+and report each result separately.
 
-   For storage-DVM work, use the independent profile so a GPU/UI marker cannot
-   fabricate either failure or success:
+## Physical hardware
 
-   ```sh
-   cargo xtask kvm-smoke --timeout 30 --storage-dvm-only
-   ```
+Read `docs/ai/physical-gpu-status.md` before physical GPU/VFIO work. A stable
+panel proves visual behavior only, not frame rate, reset, revoke, latency, or
+recovery. Do not repeat a failed physical launch in the same boot when the
+device is failure-sticky.
 
-   To prove the flush failure path, use the explicit negative gate. It accepts
-   only one exact unconditional rule and fails if normal E2E flush success is
-   also observed:
-
-   ```sh
-   RUSTOS_FAULTS='block.flush=fail' cargo xtask kvm-smoke --timeout 30 \
-     --storage-dvm-only --storage-dvm-expect-flush-fault
-   ```
-
-5. Inspect only focused extracts from `build/kvm/rustos-debugcon.log` and
-   `build/kvm/linux-dvm-serial.log`.
-
-For UI performance, use:
-
-```sh
-cargo xtask kvm-smoke --timeout 30 --gui-dvm-surfaces \
-  --dvm-network-shmem --min-ui-fps 55 --ui-proof-windows 3
-```
-
-This enables uiserver and WayClick profiling only in the private KVM disk and
-automatically attaches the production DVM block path needed to load those apps.
-Passing requires the same number of consecutive render/input windows, balanced
-WayClick commit/frame-callback/buffer-release windows with a bounded callback
-gap, and DVM runtime/relay windows. Never infer WayClick success from uiserver
-or relay FPS. On failure, use the command's `wayclick-observed` range before
-opening logs; then extract only callback/SHM-copy and relay lines with the
-debug-log skill.
-
-`--gui-dvm-surfaces` proves the V3 shared backing and private GPU-atlas path in
-QEMU. Its accepted relay marker is explicitly
-`source-path=staged-copy zero-copy=0 gpu-composition=1`; it is not physical
-DMA-BUF import or direct scanout evidence. Treat a legacy
-`dmabuf-direct-scanout` marker as rejected, and never restore a CPU-frame
-renderer merely to make the virtual gate pass.
-
-For physical GPU work, prefer the vendor-neutral
-`--physical-gpu <BDF> --gpu-firmware <path>` interface. It resolves one sealed
-PCI/DRM/backend profile; unknown devices and ambiguous registered render nodes
-fail closed. The currently certified physical profile is AMD `1002:1900` and
-interprets the firmware input as a relocated VFCT. Do not add a vendor name to
-the common readiness, DMA-BUF, fence, or KMS mechanisms. Add a profile and
-backend-registry entry only with matching firmware, reset/recovery,
-format/modifier, fence, KMS, and physical performance evidence.
-The current non-commercial physical lane disables PCI reset and consequently
-allows one launch attempt per host boot. Its boot-ID claim is failure-sticky;
-after any guest failure, require a cold boot with the target bound to VFIO
-before its native host driver initializes. Repeating QEMU in the same boot is
-dirty-device evidence, not a useful retry.
-
-Classify physical evidence before proposing another launch. A coherent,
-responsive panel proves the visual regression only; it does not prove a frame
-rate, latency distribution, reset, revoke, or recovery. The current AMD run has
-operator-observed stable visual/input behavior after the atlas and bounded
-input-readiness fixes. Further FPS capture is user-deferred, so do not rerun
-hardware or convert that observation into a 60 FPS pass.
-
-Do not misdiagnose userspace wait/recovery evidence as a GPU compositor
-failure. Generic finite/infinite `poll`/`epoll` now uses the capability-bound
-cross-service wait set with readiness generations, atomic check-arm-recheck,
-timeout/cancellation, fd lifetime, and restart/revoke semantics. Uiserver's
-bounded `STATS`-then-`READ` input bridge remains valid. Read
-`docs/ai/physical-gpu-status.md` before changing that boundary; virtual KVM
-performance does not prove the still-deferred physical reset/recovery gate.
-
-## Boundaries
-
-- `kvm-smoke` starts both QEMU/KVM guests concurrently and proves independent
-  readiness only. The hash-bound pre-transport contract is not RustOS-to-DVM
-  device transport, `.ko` loading, PCI assignment, or a real NIC/storage data
-  plane.
-- Stop only the QEMU children created by the smoke command.
-- Do not rebuild the DVM to validate a RustOS-only scheduler, service, client,
-  documentation, or formal-model change. A verified cached artifact is the
-  intended input.
+Never inspect all generated KVM output. Use `rustos-debuglog` for bounded
+extracts and do not convert visual/model output into physical performance
+evidence.

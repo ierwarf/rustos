@@ -4,6 +4,13 @@ Pick the smallest context set. Do not load all docs.
 
 **Mandatory first step:** read `token-policy.md`.
 
+For any source-code edit, also apply the project tool gate: Serena, ast-grep
+MCP, and CodeGraph MCP must all pass a focused preflight before source is
+changed. Serena is the primary navigator/editor; ast-grep supplies structural
+patterns and CodeGraph supplies call/dependency/impact context. If one fails,
+stop the source edit and report it. This gate does not block documentation-only
+or agent-infrastructure edits.
+
 **Second step:** classify the user task into one row below. Read only the
 `Read first` files, then use symbol-aware or scoped text search before
 opening anything under `Then read only if needed`.

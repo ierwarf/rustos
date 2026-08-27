@@ -1,0 +1,4 @@
+interface:
+  display_name: "RustOS Code Editing"
+  short_description: "Serena-first OS code editing with AST and graph checks"
+  default_prompt: "Use $rustos-code-editing for RustOS code changes; preflight Serena, ast-grep MCP, and CodeGraph, then use Serena as the primary editor."

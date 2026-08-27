@@ -10,7 +10,7 @@ Read this document first, then keep the working context small. This file, togeth
    If a build is interrupted, resume the same target without running `clean` or `distclean`.
    For a cached DVM relay source package, its `dev-*` command is only the fast compilation loop. Batch the corresponding `rebuild-*` image or artifact refresh once, after the change set is stable.
    Never clean or rebuild a toolchain for an ordinary relay edit.
-3. Use Serena MCP or ripgrep MCP for symbol-scoped and pattern-scoped lookups. Do not open entire files or entire subsystems.
+3. For every source-code change, preflight all three project MCP servers: Serena, ast-grep, and CodeGraph. Use Serena as the primary semantic navigator and editor; use ast-grep for syntax-structure searches/rules and CodeGraph for call/dependency/impact context. If any one of the three cannot be listed or cannot complete its focused probe, stop source editing and report the exact failing server/tool. Do not continue a code edit with local `rg` or a text-only fallback. Documentation-only and agent-infrastructure edits may use the normal scoped-search fallback.
 4. Sub-agents must use **GPT-5.6 terra** with `xhigh` reasoning. Do not use GPT-5.5.
 5. Never bypass hooks with `--no-verify`, `--no-gpg-sign`, or equivalent options. Treat hook output as primary evidence.
 6. RustOS is in the middle of evacuating functionality from ring0 into user services. Move policy into `rootd`, `syscalld`, `vfsd`, `loaderd`, `netd`, `inputd`, and other named services rather than moving it back into the kernel.
@@ -23,7 +23,7 @@ Search before opening files. Load the stable prefix first and place the task tex
 
 ## Tool Usage
 
-Use symbol-aware search and narrowly scoped text search before opening files. When project MCP servers such as Serena, ripgrep, or GitHub are available, use them first. Otherwise, fall back to equivalent shell tools with tightly constrained scopes.
+Use Serena, ast-grep, and CodeGraph together for source work. Serena owns symbol discovery, references, focused reads, and edits; ast-grep owns syntax-aware pattern/rule matching; CodeGraph owns call graph, dependency, and blast-radius checks. Use ripgrep MCP or local `rg` only for narrowly scoped text/documentation lookup. The three source-editing MCPs are a hard gate: if one fails its preflight or focused query, do not modify source and report the failure.
 
 Allow project hooks to run. Do not bypass them with `--no-verify`, `--no-gpg-sign`, or equivalent options.
 
