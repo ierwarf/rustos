@@ -43,7 +43,7 @@
 //! that would not have caught the eight.
 
 use core::panic::Location;
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use super::{LockClass, MAX_LOCK_CLASSES, MAX_TRACKED_CPUS, current_cpu_index};
 
@@ -71,6 +71,125 @@ pub(crate) fn charge_acquire(cpu: usize, class_index: usize) {
         counter.load(Ordering::Relaxed).wrapping_add(1),
         Ordering::Relaxed,
     );
+}
+
+/// Per-site acquisition census for one selected lock class.
+///
+/// The per-class census answers *which* lock a workload pays for; it cannot
+/// answer *who* is taking it, and that is the question a redundant acquisition
+/// hides behind. The scheduler catalog was split only after its callers were
+/// named, and the IPC object locks needed the same treatment.
+///
+/// One class at a time, because the table is a fixed side allocation and a
+/// per-class-per-caller matrix is not worth its cache footprint on the acquire
+/// path. `select_site_census_class` chooses it; zero disables the census
+/// entirely, which is the default and costs one relaxed load per acquisition.
+const SITE_CENSUS_SLOTS: usize = 32;
+const _: () = assert!(SITE_CENSUS_SLOTS.is_power_of_two());
+
+static SITE_CENSUS_CLASS: AtomicU32 = AtomicU32::new(0);
+static SITE_CENSUS_CALLERS: [AtomicPtr<Location<'static>>; SITE_CENSUS_SLOTS] =
+    [const { AtomicPtr::new(core::ptr::null_mut()) }; SITE_CENSUS_SLOTS];
+static SITE_CENSUS_COUNTS: [AtomicU64; SITE_CENSUS_SLOTS] =
+    [const { AtomicU64::new(0) }; SITE_CENSUS_SLOTS];
+
+/// The class whose acquire sites are currently counted, or zero for none.
+pub fn site_census_class() -> usize {
+    SITE_CENSUS_CLASS.load(Ordering::Relaxed) as usize
+}
+
+/// Selects the class whose acquire sites are counted. Zero disables it.
+pub fn select_site_census_class(class_index: usize) {
+    SITE_CENSUS_CLASS.store(class_index as u32, Ordering::Relaxed);
+    for caller in &SITE_CENSUS_CALLERS {
+        caller.store(core::ptr::null_mut(), Ordering::Relaxed);
+    }
+    for count in &SITE_CENSUS_COUNTS {
+        count.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Charges one acquisition of `class_index` to `caller` when that class is the
+/// selected one. A direct-mapped bucket keeps the common case one line.
+#[inline]
+pub(crate) fn charge_site(class_index: usize, caller: &'static Location<'static>) {
+    if SITE_CENSUS_CLASS.load(Ordering::Relaxed) as usize != class_index {
+        return;
+    }
+    let key = caller as *const Location<'static> as *mut Location<'static>;
+    // Fibonacci hashing of the pointer; `Location` allocations are aligned, so
+    // the low bits alone would collide across every site.
+    let mixed = (key as usize as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    let first = (mixed >> 32) as usize & (SITE_CENSUS_SLOTS - 1);
+    for probe in 0..SITE_CENSUS_SLOTS {
+        let slot = (first + probe) & (SITE_CENSUS_SLOTS - 1);
+        // ORDERING: Acquire observes a claim published by whichever CPU first
+        // registered this site.
+        let current = SITE_CENSUS_CALLERS[slot].load(Ordering::Acquire);
+        if current == key {
+            SITE_CENSUS_COUNTS[slot].fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        if current.is_null()
+            // ORDERING: Release publishes the claim before its count is used.
+            && SITE_CENSUS_CALLERS[slot]
+                .compare_exchange(
+                    core::ptr::null_mut(),
+                    key,
+                    Ordering::Release,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+        {
+            SITE_CENSUS_COUNTS[slot].fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    }
+}
+
+/// Takes the per-site census so far, clearing counts for the next window.
+///
+/// Callers must be outside every tracked lock; rendering the result takes the
+/// debug sink.
+pub fn take_site_census() -> [(&'static str, u32, u64); SITE_CENSUS_SLOTS] {
+    let mut census = [("", 0_u32, 0_u64); SITE_CENSUS_SLOTS];
+    for slot in 0..SITE_CENSUS_SLOTS {
+        let count = SITE_CENSUS_COUNTS[slot].swap(0, Ordering::Relaxed);
+        if count == 0 {
+            continue;
+        }
+        // ORDERING: Acquire pairs with the claim publication above.
+        let caller = SITE_CENSUS_CALLERS[slot].load(Ordering::Acquire);
+        if caller.is_null() {
+            continue;
+        }
+        // SAFETY: `Location::caller` returns a static allocation that outlives
+        // every observer of this table.
+        let caller = unsafe { &*caller };
+        census[slot] = (caller.file(), caller.line(), count);
+    }
+    census
+}
+
+/// Takes and clears every CPU's per-class acquisition counts.
+///
+/// A scope ceiling proves one path behaves; this answers the question a
+/// ceiling cannot, which is *which* class a workload is actually paying for.
+/// The scheduler catalog was found and split that way, and the lock classes
+/// under the IPC round trip needed the same census rather than a reading of
+/// the call graph.
+///
+/// Callers must be outside every tracked lock: the counters are diagnostics,
+/// and rendering them takes the debug sink.
+pub fn take_class_census() -> [u64; MAX_LOCK_CLASSES] {
+    let mut census = [0_u64; MAX_LOCK_CLASSES];
+    for classes in &ACQUIRES {
+        for (class_index, counter) in classes.iter().enumerate() {
+            let count = counter.swap(0, Ordering::Relaxed);
+            census[class_index] = census[class_index].saturating_add(u64::from(count));
+        }
+    }
+    census
 }
 
 /// Further derivations of this CPU's logical index inside one lock

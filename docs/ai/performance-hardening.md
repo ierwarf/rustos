@@ -462,6 +462,59 @@ lock, and service restart invalidates it by advancing the epoch.
   ready-wait rail therefore covers causal core servers without making dynamic
   applications strict-priority work.
 
+- **Size a global-lock change against acquisitions per scheduler entry, never
+  against acquisitions per second or against hold time.** Acquisitions per
+  second move with how fast the probe itself runs, and hold time under KVM
+  includes host descheduling of the owning vCPU, which is why one window can
+  report 55% hold duty at a single vCPU with nothing contending.
+  `kernel-scheduler-phase-select` `arg1` carries the window's guard
+  acquisitions and `kernel-scheduler-entry` carries its entry causes; the ratio
+  is stable across boots and is what makes a per-caller cut legible. The
+  measured record is in `docs/benchmarks/README.md`.
+- Removing an acquisition is a structural claim and is reported as one. The
+  latency that follows it is a separate claim with its own anchored control,
+  and at eight vCPUs the probe minimum has a 10% control spread of its own, so
+  a minimum delta smaller than that says nothing there.
+- A per-caller census that walks a shared table from slot zero costs the
+  acquisition it is measuring: about ten shared cache lines per acquisition on
+  every CPU. Hash the caller into its bucket. An instrument that is a
+  measurable share of what it instruments is not free just because it is
+  always on.
+
+- **Never render a debug-sink record inside a tracked lock.** A milestone is a
+  port write per byte, which is a VM exit per byte under KVM, and its emitter
+  drains whatever deferred records are parked before it renders. The scheduler
+  emitted one budget-exhaustion marker from inside the global guard about sixty
+  times a second; it cost 5.9-27 microseconds *per dispatch* and 59% of the
+  guard's hold total. Latch the event and let the profile drain, which runs
+  outside every tracked lock, render it. The ceiling is
+  `SCHEDULER_GUARD_MAX_DEBUG_SINK_RECORDS` and it is zero.
+- **Count lock classes before choosing one to split.** `work_budget::take_class_census()`
+  and the `kernel-lock-class-0..5` milestones report acquisitions per class per
+  window. The class the lane had been splitting was fourth; the global process
+  table was first, at about ten acquisitions per synchronous round trip.
+- **Render the ranked lock census only in a lock-profile build.** Its
+  acquisition counters also enforce exact work budgets and remain live in
+  ordinary builds, but destructive census draining, per-site class rotation,
+  and debugcon output require `RUSTOS_LOCK_PHASE_PROFILE=true`. At eight vCPUs
+  unconditional rendering stretched a 15-second guest settle beyond a
+  90-second host timeout, so it is itself a p99 contaminant rather than free
+  observability.
+- **A running thread pins its own process object**, so the hot path takes no
+  reference count: `reclaim_slot` refuses while `thread_count != 0`. An
+  uncounted pin must re-read the published state pointer rather than cache it,
+  because an exec replaces the object and no count holds the old one.
+- **A rendezvous fastpath hit is not automatically a speedup.** Moving one
+  probe from 21% to 100% fastpath raised its minimum and lowered its p50: the
+  fastpath removes variance, not the critical path. Do not present a hit-rate
+  change as a latency result.
+- Performance invariants belong in `libs/rustos-user-abi/src/performance.rs` as
+  named ceilings, in `formal/check-performance-contracts.sh` as source
+  witnesses, and in `formal/implementation-mutations.tsv` with a host test that
+  *counts* something. Acquisitions are charged on the host path for exactly
+  that reason: a path that quietly reopens a global lock still produces correct
+  bytes, so nothing but a count objects to it.
+
 ## Synchronous IPC and the Syscall Entry Path
 
 The evidence for this lane is `cargo xtask bench`, not a debugcon capture, and
@@ -502,8 +555,11 @@ attributed, not 81% unmeasured.** `cargo xtask bench --isolate-probe <name>`
 `write-response`, `enqueue-deadline`) divide exactly into one round trip
 (ratio 1.00). `kernel/compat/src/user/syscall/linux/ipc_server_profile.rs`
 (Stage 0b) adds four receiver-side phases (`recv-take`, `recv-write`,
-`reply-publish`, `reply-wake`), ablated free (-0.5%, inside the ±2% floor),
-shipped unconditional. Stage 1 decoded one `kernel-scheduler-phase-*` window
+`reply-publish`, `reply-wake`). A later review corrected the original
+four-site-only ablation: it did not include the caller's twelve TSC charges or
+the fast-handoff's shared counters. All IPC attribution now sits behind
+`[ipc_telemetry] phase_profile`, off in shipping builds. Stage 1 decoded one
+`kernel-scheduler-phase-*` window
 to size the dispatch chain and self-corrected a double-count: the 20.5% of
 scheduler lock-hold time not covered by the seven named phases is not new
 dark cost, it is six `current.rs` functions each called *from inside* a
@@ -525,8 +581,18 @@ must re-arm); the enqueue chain's last unconditional acquisition moved
 TOCTOU guard with formal models attached. 2% of 73,760 is ~1,500 ticks, which is
 the size of everything that remains individually.
 
-**Three telemetry profiles are build switches, all off by default**:
-`[lock_telemetry]`, `[scheduler_telemetry]`, and `[syscall_telemetry]`
+The later Phase-3 ownership cut is not another fusion. Wait reason kind, arm,
+block intent, and runnable intent now share `RunOwnerWord`; the ordinary commit
+is a single CAS and a wake either clears the arm first (commit refuses sleep)
+or restores runnable intent after the commit. The catalog remains only as the
+invalid-owner fallback. A one-vCPU instrumented census measured catalog
+acquisitions per scheduler entry at **1.99**, down from 2.59 before this cut.
+The remaining normal-path entries are dispatch, reply-wake handoff, pick hints,
+and retirement cleanup, so the Phase-3 zero-acquisition gate remains open.
+
+**Four telemetry profiles are build switches, all off by default**:
+`[lock_telemetry]`, `[scheduler_telemetry]`, `[syscall_telemetry]`, and
+`[ipc_telemetry]`
 `phase_profile` in `config/rustos.toml`. Each cost more than the work it
 measured. Turn one on for a diagnosis run and read the result as the cost of an
 *instrumented* operation.
@@ -535,8 +601,11 @@ measured. Turn one on for a diagnosis run and read the result as the cost of an
 `xmm0`-`xmm15` and nothing else. x87, MXCSR, and the `ymm` upper halves are held
 by `tools/xtask/src/build/nucleus_audit.rs`, which audits the linked image on
 every build and fails it on any x87 instruction, any floating-point arithmetic,
-or wide SIMD outside `kernel_hal::arch::simd::wide_simd_section`. Adding
-floating-point work to the kernel is therefore a build error, by design.
+or wide SIMD outside `kernel_hal::arch::simd::wide_simd_section`. The one
+exception is the 32-bit `_start` transition stub: it runs before any user
+register set exists, and x86-64 `objdump` misdecodes its far jump as x87 bytes.
+Adding floating-point work after `rustos_multiboot_long_mode` is therefore a
+build error, by design.
 
 ## Executable Snapshot Path
 

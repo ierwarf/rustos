@@ -9,7 +9,7 @@
 //! - **Failure:** zero/stale identities fail admission instead of manufacturing
 //!   anonymous execution authority.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use kernel_object::api::identity::{ObjectIdentity, ObjectKind, ObjectOwner};
 
 struct RuntimeCounterBank {
@@ -69,6 +69,46 @@ pub(super) fn drain_runtime_counters() -> SchedulingContextRuntimeCounters {
         context: CONTEXT_RUNTIME_COUNTERS.drain(),
         domain: DOMAIN_RUNTIME_COUNTERS.drain(),
     }
+}
+
+/// First budget exhaustion of the current profile window: owner task and the
+/// quantum that consumed the budget, packed so the pair is published or lost
+/// together.
+static EXHAUSTION_OWNER: AtomicU64 = AtomicU64::new(0);
+static EXHAUSTION_CHARGED_NS: AtomicU64 = AtomicU64::new(0);
+static EXHAUSTION_LATCHED: AtomicBool = AtomicBool::new(false);
+
+/// Records one exhaustion transition without touching the debug sink.
+///
+/// The charge that consumes a budget runs under the global scheduler guard,
+/// and a debugcon record is a port write per byte, which is a VM exit per byte
+/// under KVM. Latching here and rendering from the profile drain keeps that
+/// cost outside the guard; the window's full exhaustion count is already
+/// carried by the drained counter bank, so nothing is lost by keeping only the
+/// first exact owner.
+pub(super) fn latch_budget_exhaustion(owner_task_id: u64, charged_ns: u64) {
+    if EXHAUSTION_LATCHED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    EXHAUSTION_OWNER.store(owner_task_id, Ordering::Relaxed);
+    // ORDERING: Release publishes both fields to the drain that observes the
+    // latch through its Acquire load below.
+    EXHAUSTION_CHARGED_NS.store(charged_ns, Ordering::Release);
+}
+
+/// Takes the window's latched exhaustion, if any. Callers must already have
+/// released the scheduler guard.
+pub(super) fn take_latched_budget_exhaustion() -> Option<(u64, u64)> {
+    if !EXHAUSTION_LATCHED.load(Ordering::Acquire) {
+        return None;
+    }
+    let charged_ns = EXHAUSTION_CHARGED_NS.load(Ordering::Acquire);
+    let owner_task_id = EXHAUSTION_OWNER.load(Ordering::Relaxed);
+    EXHAUSTION_LATCHED.store(false, Ordering::Release);
+    Some((owner_task_id, charged_ns))
 }
 
 fn saturating_add(counter: &AtomicU64, value: u64) {
@@ -501,17 +541,24 @@ pub(super) struct SchedulingContext {
 }
 
 impl SchedulingContext {
-    pub(super) fn bind(slot: usize, task_id: u64) -> Self {
-        let generation = task_id
-            .checked_add(1)
-            .expect("scheduling-context generation exhausted");
-        let identity = ObjectIdentity::new(
+    /// The identity a scheduling context bound to `task_id` in `slot` has.
+    ///
+    /// Custody is decided entirely by this pair, so a reader that already
+    /// knows the live slot/task binding can settle a custody claim without
+    /// reading the stored context. Both the binding site below and that reader
+    /// derive the value here so the two can never drift apart.
+    pub(super) fn derived_identity(slot: usize, task_id: u64) -> Option<ObjectIdentity> {
+        ObjectIdentity::new(
             ObjectOwner::Ps,
             ObjectKind::SchedulingContext,
-            u64::try_from(slot).expect("scheduler slot exceeds u64") + 1,
-            generation,
+            u64::try_from(slot).ok()?.checked_add(1)?,
+            task_id.checked_add(1)?,
         )
-        .expect("live task requires nonzero scheduling-context identity");
+    }
+
+    pub(super) fn bind(slot: usize, task_id: u64) -> Self {
+        let identity = Self::derived_identity(slot, task_id)
+            .expect("live task requires nonzero scheduling-context identity");
         Self {
             identity,
             bound_task: task_id,
@@ -609,11 +656,63 @@ impl SchedulingContext {
 }
 
 #[cfg(test)]
+mod exhaustion_latch_tests {
+    use super::{latch_budget_exhaustion, take_latched_budget_exhaustion};
+
+    /// The latch exists so a budget exhaustion is never rendered to the debug
+    /// sink from inside the global scheduler guard. It must therefore keep the
+    /// first event of a window and refuse to grow, and it must hand the exact
+    /// pair to the drain exactly once.
+    #[test]
+    fn the_first_exhaustion_of_a_window_is_kept_and_taken_once() {
+        // Another window's leftover would make this witness order-dependent.
+        let _ = take_latched_budget_exhaustion();
+        latch_budget_exhaustion(0x4242, 7_000);
+        // A throttled context reaches the charge on every scheduling attempt;
+        // the later events are counted by the drained counter bank, not
+        // latched, so none of them can displace the first.
+        latch_budget_exhaustion(0x9999, 1);
+        assert_eq!(take_latched_budget_exhaustion(), Some((0x4242, 7_000)));
+        assert_eq!(take_latched_budget_exhaustion(), None);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
         BudgetCounterScope, BudgetState, Refill, SchedulingContext, SchedulingContextPolicy,
         SchedulingDomainState,
     };
+
+    /// The unlocked custody and call-admission readers reconstruct a bound
+    /// context's identity from the slot and task alone rather than reading the
+    /// catalog. That is only sound while binding derives it the same way, so
+    /// the equivalence is a test rather than a comment.
+    #[test]
+    fn a_bound_context_identity_is_exactly_its_derived_identity() {
+        for (slot, task_id) in [
+            (0_usize, 0_u64),
+            (1, 7),
+            (63, 4_097),
+            (127, u32::MAX as u64),
+        ] {
+            assert_eq!(
+                Some(SchedulingContext::bind(slot, task_id).identity()),
+                SchedulingContext::derived_identity(slot, task_id),
+            );
+            assert!(SchedulingContext::bind(slot, task_id).is_bound_to(task_id));
+        }
+        // A different slot or task can never produce the same identity, which
+        // is what makes an unlocked reader's revalidation exact.
+        assert_ne!(
+            SchedulingContext::derived_identity(3, 9),
+            SchedulingContext::derived_identity(4, 9),
+        );
+        assert_ne!(
+            SchedulingContext::derived_identity(3, 9),
+            SchedulingContext::derived_identity(3, 10),
+        );
+    }
 
     fn policy(refill_capacity: u8) -> SchedulingContextPolicy {
         SchedulingContextPolicy {

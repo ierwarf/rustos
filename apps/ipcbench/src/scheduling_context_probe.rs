@@ -15,10 +15,13 @@ use rustos_user_abi::syscall::{
     SYS_RUSTOS_SCHEDULING_CONTEXT_SNAPSHOT,
 };
 
-use super::{
-    debug_line, monotonic_nanos, report, skip, syscall0, syscall3, syscall5, syscall6, tsc, Stats,
+use rustos_user_abi::syscall::{
     SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_RECV_WITH_SENDER,
     SYS_RUSTOS_IPC_REPLY,
+};
+
+use super::{
+    debug_line, monotonic_nanos, report, skip, syscall0, syscall3, syscall5, syscall6, tsc, Stats,
 };
 
 const EXHAUST_PROBE: &str = "scheduling_budget_exhaust_refill";

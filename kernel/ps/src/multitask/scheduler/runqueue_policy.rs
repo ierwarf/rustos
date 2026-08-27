@@ -104,13 +104,13 @@ impl Scheduler {
         slot: usize,
         target: usize,
     ) -> runqueue::RemoteWakeOutcome {
-        let Some(context) = self.contexts[slot] else {
+        if self.contexts[slot].is_none() {
             return runqueue::RemoteWakeOutcome::Rejected;
-        };
+        }
         let outcome = if target == Self::current_dispatch_cpu() {
-            runqueue::publish_local_wake(slot, target, context.weight)
+            runqueue::publish_local_wake(slot, target, self.slot_weight(slot))
         } else {
-            runqueue::publish_remote_wake(slot, target, context.weight)
+            runqueue::publish_remote_wake(slot, target, self.slot_weight(slot))
         };
         #[cfg(not(test))]
         if let runqueue::RemoteWakeOutcome::Published { cpu, notify: true } = outcome {
@@ -143,11 +143,11 @@ impl Scheduler {
 
     #[cfg(not(test))]
     pub(super) fn rehome_runqueue_slot(&self, slot: usize) {
-        let Some(context) = self.contexts[slot] else {
+        if self.contexts[slot].is_none() {
             return;
-        };
+        }
         let target = self.runqueue_target_cpu(slot);
-        let outcome = runqueue::rehome_queued(slot, target, context.weight);
+        let outcome = runqueue::rehome_queued(slot, target, self.slot_weight(slot));
         let notify_cpu = match outcome {
             runqueue::RemoteWakeOutcome::Rejected => None,
             runqueue::RemoteWakeOutcome::AlreadyOwned { cpu } => cpu,
@@ -204,8 +204,8 @@ impl Scheduler {
         let Some((_, _, slot)) = selected else {
             return false;
         };
-        let context = self.contexts[slot].expect("idle steal candidate disappeared");
-        match runqueue::rehome_queued(slot, target_cpu, context.weight) {
+        self.contexts[slot].expect("idle steal candidate disappeared");
+        match runqueue::rehome_queued(slot, target_cpu, self.slot_weight(slot)) {
             runqueue::RemoteWakeOutcome::Published { cpu, .. } => {
                 assert_eq!(cpu, target_cpu, "idle steal crossed target CPU");
                 assert!(
@@ -275,8 +275,8 @@ impl Scheduler {
         let Some((_, _, slot, target_cpu)) = selected else {
             return false;
         };
-        let context = self.contexts[slot].expect("active balance candidate disappeared");
-        match runqueue::rehome_queued(slot, target_cpu, context.weight) {
+        self.contexts[slot].expect("active balance candidate disappeared");
+        match runqueue::rehome_queued(slot, target_cpu, self.slot_weight(slot)) {
             runqueue::RemoteWakeOutcome::Published { cpu, notify } => {
                 assert_eq!(cpu, target_cpu, "active balance crossed target CPU");
                 if notify {

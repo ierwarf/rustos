@@ -320,6 +320,12 @@ flows = ["scheduler-lifecycle", "scheduler-dispatch", "monotonic-deadline-lifecy
 reason = "Current-task access is the interrupt-excluded gateway to scheduler and process generation state."
 
 [[risk_surfaces]]
+path = "kernel/ps/src/multitask/current/ipc.rs"
+severity = "critical"
+flows = ["scheduler-dispatch"]
+reason = "Current-task IPC edges transfer reply-owned donation, scheduling-context custody, and exact wake authority without reopening the lifecycle catalog on the ordinary path."
+
+[[risk_surfaces]]
 path = "kernel/ps/src/multitask/irq.rs"
 severity = "critical"
 flows = ["scheduler-lifecycle", "scheduler-dispatch", "scheduler-cpu-ownership", "monotonic-deadline-lifecycle", "smp-reschedule-ipi-lifecycle", "per-cpu-clockevent-lifecycle"]
@@ -1221,6 +1227,16 @@ models = [
     "scheduler-wakeup/SchedulerWakeup",
     "syscall-simd-lifecycle/SyscallSimdLifecycle",
     "user-stack-growth/UserStackGrowth",
+]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/current/ipc.rs"
+models = [
+    "ipc-priority-inheritance/IpcPriorityInheritance",
+    "scheduling-context-budget/SchedulingContextBudget",
+    "scheduler-wakeup/SchedulerWakeup",
+    "synchronous-ipc-handoff-concurrency/SynchronousIpcHandoffConcurrency",
+    "synchronous-ipc-handoff/SynchronousIpcHandoff",
 ]
 
 [[source_mappings]]

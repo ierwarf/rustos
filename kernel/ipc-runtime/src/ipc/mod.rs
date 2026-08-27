@@ -26,8 +26,13 @@ use core::ptr;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 mod endpoint_priority;
+#[cfg(test)]
+mod legacy_test_api;
 mod shared_region_hold;
 mod slab;
+
+#[cfg(test)]
+use legacy_test_api::*;
 
 pub use endpoint_priority::EndpointCallPriority;
 use endpoint_priority::EndpointObject;
@@ -2971,6 +2976,26 @@ fn transfers_from_message(mut message: EndpointMessageObject) -> Vec<KernelTrans
     transfers
 }
 
+/// Withdraws `task_id`'s receive waiter from one exact endpoint.
+///
+/// The whole-slab form below acquires the slab lock once per slot -- 512 of
+/// them -- because a retiring task does not know which endpoints it was parked
+/// on. A receive that is abandoning its own wait does know: it is the endpoint
+/// it just tried to receive from. Taking the general form there cost that
+/// receive 512 acquisitions and made it the most-acquired endpoint site in the
+/// system, for a removal that touches one object.
+pub fn remove_endpoint_waiter_for_task(endpoint: KernelEndpointHandle, task_id: u64) -> usize {
+    ENDPOINTS
+        .with_mut(endpoint.raw(), |endpoint_object| {
+            let before = endpoint_object.waiting_receivers.len();
+            endpoint_object
+                .waiting_receivers
+                .retain(|waiter| waiter.task_id != task_id);
+            before.saturating_sub(endpoint_object.waiting_receivers.len())
+        })
+        .unwrap_or(0)
+}
+
 pub fn remove_endpoint_waiters_for_task(task_id: u64) -> usize {
     let mut removed = 0;
     ENDPOINTS.visit_mut(|_, endpoint| {
@@ -3128,132 +3153,6 @@ pub fn shared_region_frames(region: KernelSharedRegionHandle) -> Option<Vec<u64>
         }
         Some(frames)
     }
-}
-
-#[cfg(test)]
-pub fn create_event() -> Result<KernelEventHandle, IpcError> {
-    with_ipc_objects(|objects| {
-        let id = objects.allocate_id()?;
-        objects.events.insert(id, EventObject::default());
-        Ok(KernelEventHandle::from_raw(id))
-    })
-}
-
-#[cfg(test)]
-pub fn signal_event(event: KernelEventHandle) -> Result<u64, IpcError> {
-    with_ipc_objects(|objects| {
-        let Some(object) = objects.events.get_mut(&event.raw()) else {
-            return Err(IpcError::InvalidHandle);
-        };
-        object.signal_count = object.signal_count.saturating_add(1);
-        Ok(object.signal_count)
-    })
-}
-
-#[cfg(test)]
-pub fn event_signal_count(event: KernelEventHandle) -> Option<u64> {
-    with_ipc_objects_ref(|objects| {
-        objects
-            .events
-            .get(&event.raw())
-            .map(|object| object.signal_count)
-    })
-}
-
-#[cfg(test)]
-pub fn port_name(port: KernelPortHandle) -> Option<PortName> {
-    with_ipc_objects_ref(|objects| {
-        objects
-            .ports
-            .get(&port.raw())
-            .and_then(|object| object.name)
-    })
-}
-
-#[cfg(test)]
-pub(crate) fn enqueue_message(
-    channel: KernelChannelHandle,
-    header: IpcHeader,
-    payload: &[u8],
-    attached_handles: &[KernelHandle],
-) -> Result<(), IpcError> {
-    if payload.len() > MAX_IPC_PAYLOAD_BYTES || attached_handles.len() > MAX_IPC_ATTACHED_HANDLES {
-        return Err(IpcError::InvalidArgument);
-    }
-
-    let header = normalize_header(header, payload.len(), attached_handles.len())?;
-    let message = IpcMessage {
-        header,
-        payload: payload.to_vec(),
-        attached_handles: attached_handles.to_vec(),
-    };
-    with_ipc_objects(|objects| {
-        let peer_id = {
-            let Some(channel_object) = objects.channels.get(&channel.raw()) else {
-                return Err(IpcError::InvalidHandle);
-            };
-            if channel_object.closed {
-                return Err(IpcError::PeerClosed);
-            }
-            channel_object.peer.ok_or(IpcError::PeerClosed)?
-        };
-
-        let Some(peer_object) = objects.channels.get_mut(&peer_id) else {
-            return Err(IpcError::PeerClosed);
-        };
-        if peer_object.closed {
-            return Err(IpcError::PeerClosed);
-        }
-        if peer_object.recv_queue.len() >= MAX_CHANNEL_QUEUE_DEPTH {
-            return Err(IpcError::NoMemory);
-        }
-
-        peer_object.recv_queue.push_back(message);
-        Ok(())
-    })
-}
-
-#[cfg(test)]
-pub(crate) fn dequeue_message(
-    channel: KernelChannelHandle,
-) -> Result<Option<IpcMessage>, IpcError> {
-    dequeue_message_with_limits(channel, usize::MAX, usize::MAX)
-}
-
-#[cfg(test)]
-pub(crate) fn dequeue_message_with_limits(
-    channel: KernelChannelHandle,
-    payload_capacity: usize,
-    handle_capacity: usize,
-) -> Result<Option<IpcMessage>, IpcError> {
-    with_ipc_objects(|objects| {
-        let Some(channel_object) = objects.channels.get_mut(&channel.raw()) else {
-            return Err(IpcError::InvalidHandle);
-        };
-        if let Some(message) = channel_object.recv_queue.front()
-            && (message.payload.len() > payload_capacity
-                || message.attached_handles.len() > handle_capacity)
-        {
-            return Err(IpcError::BufferTooSmall);
-        }
-        Ok(channel_object.recv_queue.pop_front())
-    })
-}
-
-#[cfg(test)]
-pub fn channel_peer(channel: KernelChannelHandle) -> Option<KernelChannelHandle> {
-    with_ipc_objects_ref(|objects| {
-        let channel_object = objects.channels.get(&channel.raw())?;
-        channel_object.peer.map(KernelChannelHandle::from_raw)
-    })
-}
-
-#[cfg(test)]
-pub fn channel_queue_len(channel: KernelChannelHandle) -> Option<usize> {
-    with_ipc_objects_ref(|objects| {
-        let channel_object = objects.channels.get(&channel.raw())?;
-        Some(channel_object.recv_queue.len())
-    })
 }
 
 #[cfg(test)]

@@ -80,7 +80,7 @@ by writing the mapping down rather than by renaming either side.
 
 | item | what is actually missing |
 |---|---|
-| `V5-SCHED-GLOBAL-001` | **narrower than the item text.** The per-CPU runqueue, owner words, remote mailboxes, and per-CPU selection already avoid the global scheduler lock. What remains is that the `Scheduler` struct's per-task arrays still sit behind one `TrackedSpinLock`, so the remaining work is a data-structure split. There is no separate `TaskContext.ready` authority left to reconcile. Section 2 |
+| `V5-SCHED-GLOBAL-001` | **narrower than the item text, and now measured against a normalizer.** The per-CPU runqueue, owner words, remote mailboxes, and per-CPU selection already avoid the global scheduler lock. Dispatch frame/stack/SIMD/TLS/vruntime/affinity/root/weight plus blocked state, ready/block timing, wait arm, exact wait reason, and ordinary block commit live in owner-generation-bound per-slot storage. The block mirror, runnable bit, reason kind, and arm now share one owner word, so commit and a racing wake linearize through one CAS instead of the catalog. Synchronous-IPC call admission, receive-side donation bind, reply custody settlement, log-identity lookup, wait arm/cancel, and the normal block commit answer without the guard. Catalog acquisitions per scheduler entry moved 4.65 -> 2.59 -> **1.99** at one vCPU; the previously measured eight-vCPU 3.27 -> 2.02 predates the commit cut. What still enters the guard on the ordinary path is dispatch itself, the reply wake handoff, pick hints, and retired-task cleanup. Scheduling-context budget/custody and lifecycle/directory metadata still sit behind one `TrackedSpinLock`; ordinary-path acquisition zero is therefore still open. Section 2 |
 | `V5-FORMAL-SCHED-019` | `SchedulerCpuOwnership.tla` models the guard, not the removal of the guard. Section 2.7 |
 | `V5-VFSD-HOL-007` | **structure landed, runtime evidence owed.** The receive owner never blocks, the plan carries its mount generation and the commit refuses a stale one, and custody is a bounded two-worker pool. What is still owed is the measured control-lane residence bound in section 3, and the 2005 ms snapshot itself is still unattributed. Section 3 |
 | `V5-WAYLAND-HOL-013`, `V5-GPU-UI-OWNER-014` | no `WaylandProtocolOwner`, `SceneOwner`, `GpuSubmissionOwner`, or `FramePlan`. Section 4 |
@@ -122,8 +122,12 @@ scheduler lock:
 
 So what the global `SCHEDULER` lock still protects is neither the queue nor the
 selection. It is the `Scheduler` struct itself: one `TrackedSpinLock` over the
-per-task arrays — `contexts` (ready, blocked, vruntime, stacks, address-space
-root), `starts`, `retired`, the SIMD slots, and the lifecycle flags.
+remaining scheduling-context budget/custody and per-task lifecycle arrays —
+`contexts` (scheduling context plus immutable ABI and process metadata),
+`starts`, `retired`, and lifecycle flags. Dispatch and wait payloads
+(`vruntime`, fair-share weight, frame, stack geometry, SIMD/TLS, affinity,
+address-space root, blocked state, ready/block timing, arm, and exact reason)
+are per-slot storage and no longer reside in that catalog.
 
 **The remaining work for `V5-SCHED-GLOBAL-001` is therefore a data-structure
 split, not a scheduling-algorithm change.** The per-task fields only the owning
@@ -368,9 +372,10 @@ Adopting ULE's per-field classification explicitly:
 | state | who may write |
 |---|---|
 | local trees, `current`, vruntime, timer heap | the owning CPU, under its own `rq_lock` |
+| fair-share weight and trusted base-class bit | lifecycle admission before owner publication; current owner for surrender-only demotion |
 | `TaskRunAuthority.owner` | any CPU, by CAS only |
 | `transfer` slot | the CPU that won the owner CAS, before publishing the mailbox entry |
-| saved frame, kernel stack, FPU/SIMD, TLS, mm-active bit | the `Running` owner CPU only |
+| saved frame, kernel stack, FPU/SIMD, TLS, dispatch address-space root/mm-active bit | the `Running` owner CPU only |
 | `TaskDirectory` rows | the lifecycle owner, under the directory token |
 
 **Two run-queue locks are never held at once.** ULE orders them by address;
@@ -420,17 +425,59 @@ per-task state does.
    both. Done: `run_authority::compare` sweeps every slot once per drain and
    reports the first disagreement with a direction, and the calling CPU's
    in-flight dispatch pair is excluded because it disagrees by construction.
-   Zero mismatches at 1 and 8 vCPU.
+   Zero mismatches at 1, 2, 4, and 8 vCPU.
+
+   That claim was previously true only at one vCPU. The sweep passed the
+   queued-since stamp as an executing task's "still wants to run", and dispatch
+   clears that stamp on the exact task it selects, so every task executing on
+   *another* CPU read as divergent: 28-30 records per eight-vCPU run. One vCPU
+   hid it because the only executing task there is the excluded one. The
+   comparand is now the block mirror, and the comparison is one-directional —
+   a wake clears the mirror in place and the owner word's bit is re-derived at
+   the next `mark_slot_ready`, so a remote observer between those points is
+   seeing a handoff half, like `Migrating`. Only the word claiming run intent
+   against a blocked mirror is reported, because that is the one that would
+   publish a blocked task back onto a run queue. **This is not the refuted
+   `!blocked` mirror below:** the mirror source is unchanged, and no scheduling
+   decision consumes the sweep.
 2. **Retire `context.ready` as authority.** It duplicates the owner word, which
    step one proved. Every reader moves to `runqueue::owner(slot)`; the field is
    deleted rather than left as a shadow, because a shadow is what goes stale.
-3. **Move the remaining per-task fields out of the globally locked struct**, in
-   the writer classes of 2.4: saved frame, kernel stack, FPU/SIMD, TLS, and the
-   mm-active bit are written only by the `Running` owner, so they belong in
-   per-slot storage that CPU owns. Lifecycle rows stay behind the directory
-   token.
-4. **Delete the global guard** from the paths that no longer touch shared state,
-   and only then the legacy formal model.
+3. **Move execution and wait payload out of the globally locked struct.** Done
+   for saved frame, kernel stack, FPU/SIMD, TLS, fair-share weight/class,
+   dispatch address-space root, blocked state, ready/block timing, arm, and
+   exact reason. Admission initializes every payload before owner publication;
+   exec replaces the root only after exact target quiescence; self-demotion is
+   the weight's only post-admission writer; terminal release clears the full
+   payload before reuse.
+4. **Answer each remaining hot-path question from published per-slot state.**
+   Landed for the log-identity lookup, the terminal reply's scheduling-context
+   custody, the reply-donation attach/cancel, the synchronous call admission,
+   the receive-side donation bind, and the wait arm/cancel. Each one either
+   reads a seqlock-published identity revalidated against the exact task id, or
+   takes `Running(this cpu)` from the owner word — which is strictly stronger
+   than the three catalog flags it replaces, because `runqueue::retire` drives
+   the word terminal in the same guarded transaction that sets `retired` and
+   runs first, a `start_suspended` slot is admitted `Blocked` and cannot reach
+   `Running` before activation clears the flag, and admission publishes the
+   payload before the owner word. Every one keeps the locked path as its
+   fallback, so a slot the reader cannot decide for is still decided.
+5. **Split scheduling-context budget/custody from lifecycle directory rows, then
+   delete the global guard** from ordinary dispatch/wake/block/accounting paths.
+   Delete the legacy formal guard only after the source cutover and runtime
+   acquisition counter both read zero.
+
+**The two acquisitions left on the block path, and why they are one change.**
+The arm and its cancel left the guard because the arm and its exact reason are
+one store: a racing wake's own single store either precedes the arm — which is
+what the caller's post-arm recheck has always covered — or follows it and
+withdraws the arm, so the commit refuses to sleep. The **commit** cannot follow
+yet. It reads the arm and then writes the block mirror and the runnable bit as
+separate words, and a wake that lands between the read and those writes would
+be reported complete while the task sleeps. Putting the block mirror and the
+runnable bit into the same word as the arm, so the commit is one compare-and-
+exchange against the wake's single store, is the prerequisite. Do not convert
+the commit before that word exists.
 
 Each step keeps its own KVM gate at 1, then 2, then 4 and 8. Dual-write is
 forbidden throughout: the divergence sweep is a comparison of two authorities

@@ -24,7 +24,10 @@ for witness in \
     'SERVICE_ENDPOINT_STABLE_LOOKUP_MAX_LOCK_ACQUISITIONS: u32 = 0' \
     'USER_COPY_BATCH_MAX_ADDRESS_SPACE_BINDS: u32 = 1' \
     'IPC_RECEIVE_REPORT_MAX_ADDRESS_SPACE_BINDS: u32 = 2' \
-    'IPC_REPLY_WAIT_POLLS_PER_TURN: u32 = 2'
+    'IPC_REPLY_WAIT_POLLS_PER_TURN: u32 = 2' \
+    'SCHEDULER_GUARD_MAX_DEBUG_SINK_RECORDS: u32 = 0' \
+    'SCHEDULER_DISPATCH_MAX_CATALOG_ACQUISITIONS: u32 = 1' \
+    'IPC_SYSCALL_MAX_PROCESS_TABLE_ACQUISITIONS: u32 = 2'
 do
     rg -Fq "$witness" "$performance" || {
         echo "missing performance contract witness: $witness" >&2
@@ -340,9 +343,45 @@ rg -Fq 'const GPU_INITIALIZATION_RETAINS_BOOT_CLASS: bool = true;' \
     echo "mandatory GPU initialization can be demoted before its boot result" >&2
     exit 1
 }
-rg -Fq 'context.weight = (context.weight & LOAD_WEIGHT_MASK).min(NICE_0_LOAD);' \
+rg -Fq 'self.set_slot_weight(slot, (weight & LOAD_WEIGHT_MASK).min(NICE_0_LOAD));' \
     kernel/ps/src/multitask/scheduler.rs || {
     echo "scheduler self-demotion no longer caps inherited permanent fair weight" >&2
+    exit 1
+}
+scheduler_context=$(sed -n '/^struct TaskContext {/,/^}/p' kernel/ps/src/multitask/scheduler.rs)
+for field in ready_since_ticks blocked blocked_since_ticks; do
+    if ! grep -E -B1 "^[[:space:]]+$field:" <<<"$scheduler_context" \
+        | grep -Fq '#[cfg(test)]'; then
+        echo "scheduler wait payload returned to the global production TaskContext: $field" >&2
+        exit 1
+    fi
+done
+for witness in \
+    'static READY_SINCE_TICKS: [AtomicU64; MAX_TASK]' \
+    'static BLOCKED_SINCE_TICKS: [AtomicU64; MAX_TASK]'; do
+    rg -Fq "$witness" kernel/ps/src/multitask/scheduler/runqueue/wait.rs || {
+        echo "scheduler owner-generation-bound wait payload witness missing: $witness" >&2
+        exit 1
+    }
+done
+for witness in \
+    'const OWNER_WAIT_REASON_MASK:' \
+    'const OWNER_WAIT_ARMED_BIT:' \
+    '.with_runnable(false)' \
+    '.with_wait(false, observed.wait_reason_kind)'; do
+    rg -Fq "$witness" kernel/ps/src/multitask/scheduler/runqueue.rs || {
+        echo "scheduler atomic owner/wait commit witness missing: $witness" >&2
+        exit 1
+    }
+done
+if rg -n 'static (BLOCKED|ARM_STATE):' \
+    kernel/ps/src/multitask/scheduler/runqueue/wait.rs >/dev/null; then
+    echo "scheduler wait state escaped the authoritative owner word" >&2
+    exit 1
+fi
+rg -Uq 'current_wait_commit_or_fallback\([[:space:]]*super::scheduler::commit_current_wait\(\),[[:space:]]*\|\| unsafe \{[[:space:]]*scheduler_mut\(\)\.commit_block_current_task\(\)[[:space:]]*\}' \
+    kernel/ps/src/multitask/irq.rs || {
+    echo "ordinary block commit no longer prefers owner-word authority before catalog fallback" >&2
     exit 1
 }
 rg -Uq 'let reply = unsafe \{[\s\S]{0,700}rustos_svc_runtime::ipc::reply\([\s\S]{0,700}completion_demotion_due\(reply, handled\.demote_after_reply\)' \
@@ -709,6 +748,82 @@ rg -Fq 'pub unsafe fn reply_recv_with_sender(' libs/rustos-svc-runtime/src/ipc.r
     && rg -Fq 'reply_recv_input_request(' services/inputd/src/service_loop.rs \
     && rg -Fq 'let response = malformed_input_response();' services/inputd/src/service_loop.rs || {
     echo "inputd or service runtime bypasses fused reply-receive phase handling" >&2
+    exit 1
+}
+
+# A milestone is rendered to the debug port, which is a VM exit per byte under
+# KVM, and its emitter drains whatever deferred records are parked first. The
+# scheduler's runtime accounting used to do that inside the global guard, which
+# put an unbounded host cost inside the kernel's most serializing critical
+# section: measured at 5.9-27 microseconds per dispatch and 59% of the guard's
+# hold total. The event is latched and rendered by the profile drain instead,
+# which already runs outside every tracked lock.
+# See `rustos_user_abi::performance::SCHEDULER_GUARD_MAX_DEBUG_SINK_RECORDS`.
+accounting_body="$(sed -n '/fn account_current_runtime(/,/^    fn /p' kernel/ps/src/multitask/scheduler.rs)"
+if rg -Fq 'record_milestone' <<<"$accounting_body"; then
+    echo 'scheduler runtime accounting renders a debug-sink record inside the global guard' >&2
+    exit 1
+fi
+if ! rg -Fq 'scheduling_context::latch_budget_exhaustion(' <<<"$accounting_body"; then
+    echo 'scheduler budget exhaustion no longer latches its marker for the out-of-guard drain' >&2
+    exit 1
+fi
+for witness in \
+    'pub(super) fn latch_budget_exhaustion(' \
+    'pub(super) fn take_latched_budget_exhaustion(' ; do
+    rg -Fq "$witness" kernel/ps/src/multitask/scheduler/scheduling_context.rs || {
+        echo "scheduler budget exhaustion latch witness missing: $witness" >&2
+        exit 1
+    }
+done
+rg -Fq 'super::scheduling_context::take_latched_budget_exhaustion()' \
+    kernel/ps/src/multitask/scheduler/runtime_profile.rs || {
+    echo 'latched budget exhaustion is never rendered outside the scheduler guard' >&2
+    exit 1
+}
+
+# Which tracked lock class a workload pays for is a measurement, not a reading
+# of the call graph. The per-class census is what found the global process
+# table under the synchronous IPC path, ahead of the endpoint, the reply
+# object, and the scheduler catalog. It is emitted from the profile drain
+# because rendering a milestone takes the debug sink.
+rg -Fq 'pub fn take_class_census()' kernel/nucleus-core/src/util/lockdep/work_budget.rs || {
+    echo 'per-class tracked-lock census is missing' >&2
+    exit 1
+}
+rg -Fq 'nucleus_core::util::lockdep::work_budget::take_class_census()' \
+    kernel/ps/src/multitask/scheduler/runtime_profile.rs \
+    kernel/ps/src/multitask/scheduler/runtime_profile || {
+    echo 'per-class tracked-lock census is not drained outside the scheduler guard' >&2
+    exit 1
+}
+runtime_profile_drain_body="$(
+    sed -n '/^pub fn drain_scheduler_runtime_profile(/,/^}/p' \
+        kernel/ps/src/multitask/scheduler/runtime_profile.rs
+)"
+if ! grep -Fq '#[cfg(rustos_lock_phase_profile)]' <<<"$runtime_profile_drain_body" \
+    || ! grep -Fq 'lock_census::drain_class_and_site_census();' <<<"$runtime_profile_drain_body"; then
+    echo 'ranked lock census rendering must remain restricted to diagnostic lock-profile builds' >&2
+    exit 1
+fi
+
+# A running thread already pins its own process object, so the hot path takes
+# no reference count: a retain plus its release are two acquisitions of the one
+# global process table, and the census measured roughly ten per synchronous
+# round trip. The pin re-reads the published state pointer rather than caching
+# it, which is what keeps it sound across an exec.
+for witness in \
+    'pub(super) fn own_process_ref(' \
+    'ProcessRefPin::OwnThread => NonNull::new(' \
+    'if matches!(self.pin, ProcessRefPin::Counted(_)) {' ; do
+    rg -Fq "$witness" kernel/ps/src/multitask/process_table.rs || {
+        echo "own-thread process pin witness missing: $witness" >&2
+        exit 1
+    }
+done
+rg -Fq 'process_table::own_process_ref(process_handle, process_id)' \
+    kernel/ps/src/multitask/current.rs || {
+    echo 'current-task address-space bind reopened the counted process retain' >&2
     exit 1
 }
 

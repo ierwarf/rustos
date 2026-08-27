@@ -9,9 +9,12 @@ use core::cell::UnsafeCell;
 use core::panic::Location;
 use core::sync::atomic::{AtomicU8, Ordering};
 
+mod lock_census;
+use lock_census::{acquire_site_is_reportable, fnv1a32};
+
 const PROFILE_TOP_TASKS: usize = 4;
 pub(super) const SCHEDULER_ENTRY_CAUSE_COUNT: usize = 4;
-pub(super) const SCHEDULER_PHASE_COUNT: usize = 9;
+pub(super) const SCHEDULER_PHASE_COUNT: usize = 14;
 const PROFILE_EMPTY: u8 = 0;
 const PROFILE_BUSY: u8 = 1;
 const PROFILE_READY: u8 = 2;
@@ -53,6 +56,19 @@ pub(in crate::multitask) enum SchedulerPhase {
     /// to whichever caller took the lock next rather than to what it asked
     /// for, so it is only visible as a segment of its own.
     Prologue = 8,
+    /// Disjoint split of [`SchedulerPhase::Account`], which measured as the
+    /// dominant in-owner segment and covers three unrelated jobs: charging the
+    /// outgoing task's runtime against its scheduling context and domain,
+    /// validating the frame it published, and republishing its readiness.
+    AccountCharge = 9,
+    /// The outgoing frame's validation sweep, split out of `Account`.
+    AccountValidate = 10,
+    /// Ready/saved-frame republication, split out of `Account`.
+    AccountReady = 11,
+    /// Identity, clock, and elapsed-runtime derivation before any charge.
+    AccountPreamble = 12,
+    /// The scheduling-context and domain budget charge alone.
+    AccountBudget = 13,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -217,23 +233,6 @@ fn pack_u32_pair(high: u64, low: u64) -> u64 {
     (high << 32) | low
 }
 
-/// Whether an acquisition site explains enough of the window to be worth a
-/// debugcon line. The census is sorted, so the first site that fails this ends
-/// the report.
-fn acquire_site_is_reportable(count: u64, acquisitions: u64) -> bool {
-    count != 0 && count.saturating_mul(100) >= acquisitions
-}
-
-/// Stable 32-bit file identity for the acquisition census.
-fn fnv1a32(value: &str) -> u32 {
-    let mut hash = 0x811c_9dc5_u32;
-    for byte in value.as_bytes() {
-        hash ^= u32::from(*byte);
-        hash = hash.wrapping_mul(0x0100_0193);
-    }
-    hash
-}
-
 pub fn drain_scheduler_runtime_profile() -> usize {
     // Budget counters share the scheduler's one-second profile window.  They
     // used to be drained before this readiness check, so the fast
@@ -245,7 +244,27 @@ pub fn drain_scheduler_runtime_profile() -> usize {
     let Some(profile) = PENDING_RUNTIME_PROFILE.take() else {
         return 0;
     };
+    // The ranked class/site census is a diagnosis build feature. Rendering
+    // its dozen debugcon records every second is observable work (one VM exit
+    // per byte under KVM) and, on SMP, can consume most of an isolated
+    // benchmark's wall-clock budget. Shipping builds retain the acquisition
+    // counters used by exact work-budget assertions but neither drain nor
+    // enable the rotating per-site census.
+    #[cfg(rustos_lock_phase_profile)]
+    lock_census::drain_class_and_site_census();
     let scheduling_context = super::scheduling_context::drain_runtime_counters();
+    // Rendered here, outside the scheduler guard, for the reason
+    // `latch_budget_exhaustion` documents.
+    if let Some((owner_task_id, charged_ns)) =
+        super::scheduling_context::take_latched_budget_exhaustion()
+    {
+        crate::debug::record_milestone(
+            crate::debug::LogCategory::Sched,
+            "scheduling-budget-exhausted",
+            owner_task_id,
+            charged_ns,
+        );
+    }
     let mut work = 0;
     for (budget, budget_name, refill_name) in [
         (
@@ -510,6 +529,30 @@ pub fn drain_scheduler_runtime_profile() -> usize {
         profile.phase_ns[SchedulerPhase::Prologue as usize] / 1_000,
         profile.deferred_wakes,
     );
+    // The three disjoint jobs inside `Account`, which is the dominant in-owner
+    // segment. arg0=(charge us, validate us), arg1=(ready us, 0).
+    crate::debug::record_milestone(
+        crate::debug::LogCategory::Sched,
+        "kernel-scheduler-phase-account",
+        pack_u32_pair(
+            profile.phase_ns[SchedulerPhase::AccountCharge as usize] / 1_000,
+            profile.phase_ns[SchedulerPhase::AccountValidate as usize] / 1_000,
+        ),
+        pack_u32_pair(
+            profile.phase_ns[SchedulerPhase::AccountReady as usize] / 1_000,
+            0,
+        ),
+    );
+    // arg0=(preamble us, budget us). Both are inside `AccountCharge`.
+    crate::debug::record_milestone(
+        crate::debug::LogCategory::Sched,
+        "kernel-scheduler-phase-account-charge",
+        pack_u32_pair(
+            profile.phase_ns[SchedulerPhase::AccountPreamble as usize] / 1_000,
+            profile.phase_ns[SchedulerPhase::AccountBudget as usize] / 1_000,
+        ),
+        0,
+    );
     // Disjoint in-owner segments in microseconds.
     // arg0=(account, balance), arg1=(validate, select).
     crate::debug::record_milestone(
@@ -698,10 +741,10 @@ impl Scheduler {
             self.runtime_profile_task_switches =
                 self.runtime_profile_task_switches.saturating_add(1);
             let previous_root = self.contexts[previous_slot]
-                .map(|context| context.address_space_root)
+                .map(|_| self.slot_address_space_root(previous_slot))
                 .expect("profiled outgoing task missing context");
             let next_root = self.contexts[next_slot]
-                .map(|context| context.address_space_root)
+                .map(|_| self.slot_address_space_root(next_slot))
                 .expect("profiled incoming task missing context");
             if previous_root != next_root {
                 self.runtime_profile_address_space_switches = self
@@ -960,7 +1003,9 @@ mod tests {
             ready_since_ticks: 0,
             blocked: false,
             blocked_since_ticks: 0,
+            #[cfg(test)]
             wake_armed: false,
+            #[cfg(test)]
             block_reason: BlockReason::None,
             weight: NICE_0_LOAD,
             #[cfg(test)]

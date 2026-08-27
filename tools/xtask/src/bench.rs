@@ -805,7 +805,13 @@ pub(crate) fn bench(
 }
 
 const fn benchmark_timeout_seconds(rustos_vcpus: u8, isolated: bool) -> u64 {
-    if rustos_vcpus > 1 || isolated { 60 } else { 30 }
+    if rustos_vcpus > 1 && isolated {
+        90
+    } else if rustos_vcpus > 1 || isolated {
+        60
+    } else {
+        30
+    }
 }
 
 #[cfg(test)]
@@ -817,6 +823,7 @@ mod tests {
         assert_eq!(benchmark_timeout_seconds(1, false), 30);
         assert_eq!(benchmark_timeout_seconds(8, false), 60);
         assert_eq!(benchmark_timeout_seconds(1, true), 60);
+        assert_eq!(benchmark_timeout_seconds(8, true), 90);
     }
 
     #[test]

@@ -642,3 +642,293 @@ impl Scheduler {
         }
     }
 }
+
+/// Reserves one synchronous-call donation for the task this CPU is running,
+/// without the task catalog.
+///
+/// Every input this admission needs is already published per slot: the current
+/// slot and its derived idle class come from CPU-local publication, the
+/// trusted System-class bit from the per-slot fair-share weight, the borrowed
+/// context owner and the inherited-System count from the donation ledger's own
+/// atomics, and the scheduling-context identity is a pure function of the
+/// owning slot and the monotonic task bound to it. The ledger serializes the
+/// edge behind its own bounded lock, so the exclusive catalog guard added one
+/// acquisition per synchronous call and excluded nothing.
+///
+/// `None` means the catalog guard must answer: the donor is not this CPU's
+/// published current task, the record was caught mid-update, the slot has
+/// reached terminal run ownership, or a borrowed context owner could not be
+/// resolved from publication alone.
+pub(in crate::multitask) fn reserve_current_call_donation(
+    donor_task_id: u64,
+) -> Option<super::IpcCallAdmission> {
+    let logical_cpu = nucleus_core::util::lockdep::current_cpu_index();
+    let slot = super::super::cpu_local::current_cpu_task_slot()?;
+    // The root task's Idle class depends on catalog `root_idle`, which is not
+    // published per slot. It issues no synchronous service calls in steady
+    // state, so it keeps the authoritative path rather than a second rule.
+    if slot == super::ROOT_TASK_SLOT {
+        return None;
+    }
+    if super::current_identity::read(slot)?.task_id != Some(donor_task_id) {
+        return None;
+    }
+    // Terminal run ownership is what `retired` means here: `runqueue::retire`
+    // drives the owner word terminal in the same guarded transaction that sets
+    // the catalog flag, and it runs first.
+    if super::runqueue::owner(slot).state.is_terminal() {
+        return None;
+    }
+
+    // `slot_class` upgrades a User base class to System through the ledger and
+    // never upgrades an Idle one, which is exactly this expression.
+    let system_class = !super::super::cpu_local::current_cpu_task_is_idle(logical_cpu)
+        && (super::runqueue::weight::value(slot) & SYSTEM_CLASS_WEIGHT_FLAG != 0
+            || super::donation_ledger::inherited_system(slot));
+
+    let context_owner_slot =
+        super::donation_ledger::borrowed_context_owner_slot(slot).unwrap_or(slot);
+    let context_owner_task_id = if context_owner_slot == slot {
+        donor_task_id
+    } else {
+        super::current_identity::read(context_owner_slot)?.task_id?
+    };
+    let scheduling_context = scheduling_context::SchedulingContext::derived_identity(
+        context_owner_slot,
+        context_owner_task_id,
+    );
+    let donation_reserved = scheduling_context.is_some()
+        && super::donation_ledger::reserve(
+            donor_task_id,
+            context_owner_task_id,
+            context_owner_slot,
+            system_class,
+        );
+    Some(super::IpcCallAdmission {
+        system_class,
+        donation_reserved,
+        scheduling_context,
+        scheduling_context_owner_task_id: Some(context_owner_task_id),
+    })
+}
+
+/// Binds a reserved donor edge to the receiver this CPU is running, without
+/// the task catalog.
+///
+/// This is the common receive commit: the server that just took a request is
+/// the current task, and the call admission that preceded it already reserved
+/// the donor edge, so the bind needs only the ledger's own lock plus two
+/// published identities. `None` means the guard must answer -- the receiver is
+/// not this CPU's published current task, either party has reached terminal
+/// run ownership, or no reservation existed and the edge has to be created
+/// through the authoritative upsert path.
+pub(in crate::multitask) fn bind_current_receiver_call_donation(
+    reply: u64,
+    donor_task_id: u64,
+    receiver_task_id: u64,
+) -> Option<bool> {
+    // `bind_reserved` is the authority on a zero reply and on a self-loop and
+    // rejects both without mutating the ledger, so this reader does not repeat
+    // either test: a second copy would be one more place to keep in agreement.
+    let receiver_slot = super::super::cpu_local::current_cpu_task_slot()?;
+    if super::current_identity::read(receiver_slot)?.task_id != Some(receiver_task_id)
+        || super::runqueue::owner(receiver_slot).state.is_terminal()
+    {
+        return None;
+    }
+    let donor_slot = super::task_directory::live_slot(donor_task_id)?;
+    if super::runqueue::owner(donor_slot).state.is_terminal() {
+        return None;
+    }
+    // A false result is a missing reservation, not a rejection: the ledger
+    // leaves its state unchanged and the upsert path under the guard owns
+    // creating the edge from scratch.
+    super::donation_ledger::bind_reserved(reply, donor_task_id, receiver_task_id, receiver_slot)
+        .then_some(true)
+}
+
+#[cfg(test)]
+mod current_donation_tests {
+    use super::*;
+    use crate::io::session::ConsoleSessionHandle;
+    use crate::multitask::cpu_local::{install_test_current_owner, test_publication_lock};
+    use crate::multitask::current_identity::{self, TaskIdentity};
+
+    const CPU: usize = 0;
+    const DONOR_SLOT: usize = 11;
+    const RECEIVER_SLOT: usize = 12;
+
+    /// Holds every shared publication these witnesses install. Production
+    /// ownership is CPU-local and cannot alias; host tests share one process,
+    /// so the same guards the scheduler fixtures take are required here.
+    struct Published {
+        donor_task: u64,
+        _serial: std::sync::MutexGuard<'static, ()>,
+        _runqueue: std::sync::MutexGuard<'static, ()>,
+        _cpu: crate::multitask::cpu_local::TestCpuPublicationRestore,
+    }
+
+    impl Drop for Published {
+        fn drop(&mut self) {
+            // The donation ledger is process-wide. Leave no reservation behind
+            // even when an assertion aborted the body.
+            let _ = super::super::donation_ledger::cancel_reservation(self.donor_task);
+            current_identity::clear(DONOR_SLOT);
+            current_identity::clear(RECEIVER_SLOT);
+            super::super::runqueue::reset_before_publication();
+        }
+    }
+
+    fn user_identity(task_id: u64) -> TaskIdentity {
+        TaskIdentity {
+            task_id: Some(task_id),
+            user_mode: true,
+            abi: Some(crate::user::abi::UserAbi::Linux),
+            process_handle: None,
+            process_id: Some(0x900),
+            console_session: ConsoleSessionHandle::SYSTEM,
+        }
+    }
+
+    /// Publishes a donor and a receiver in the exact shape a synchronous call
+    /// admission observes: one running on this CPU, one blocked peer, both
+    /// resolvable through the shared task directory.
+    fn publish(donor_task: u64, receiver_task: u64, running: usize, weight: u32) -> Published {
+        let serial = test_publication_lock();
+        let runqueue = super::super::runqueue::test_serial_guard();
+        super::super::runqueue::reset_before_publication();
+        for (slot, task_id) in [(DONOR_SLOT, donor_task), (RECEIVER_SLOT, receiver_task)] {
+            current_identity::clear(slot);
+            current_identity::publish(slot, user_identity(task_id));
+            super::super::task_directory::record(task_id, slot);
+        }
+        super::super::runqueue::weight::initialize(DONOR_SLOT, weight);
+        super::super::runqueue::weight::initialize(RECEIVER_SLOT, NICE_0_LOAD);
+        super::super::runqueue::admit_running(running, CPU);
+        super::super::runqueue::admit_blocked(if running == DONOR_SLOT {
+            RECEIVER_SLOT
+        } else {
+            DONOR_SLOT
+        });
+        let cpu = install_test_current_owner(CPU, running);
+        Published {
+            donor_task,
+            _serial: serial,
+            _runqueue: runqueue,
+            _cpu: cpu,
+        }
+    }
+
+    #[test]
+    fn a_running_donor_is_admitted_from_publication_without_the_catalog() {
+        let donor = 0x5101;
+        let published = publish(donor, 0x5102, DONOR_SLOT, NICE_0_LOAD);
+        let admission =
+            reserve_current_call_donation(donor).expect("published donor needs no catalog");
+        assert!(
+            !admission.system_class,
+            "a plain weight is not System class"
+        );
+        assert!(admission.donation_reserved);
+        assert_eq!(
+            admission.scheduling_context,
+            scheduling_context::SchedulingContext::derived_identity(DONOR_SLOT, donor),
+        );
+        assert_eq!(admission.scheduling_context_owner_task_id, Some(donor));
+        drop(published);
+    }
+
+    #[test]
+    fn the_trusted_system_weight_bit_decides_the_admitted_class() {
+        let donor = 0x5201;
+        let published = publish(
+            donor,
+            0x5202,
+            DONOR_SLOT,
+            NICE_0_LOAD | SYSTEM_CLASS_WEIGHT_FLAG,
+        );
+        let admission =
+            reserve_current_call_donation(donor).expect("published donor needs no catalog");
+        assert!(admission.system_class);
+        drop(published);
+    }
+
+    #[test]
+    fn a_donor_that_is_not_this_cpus_current_task_defers_to_the_catalog() {
+        let donor = 0x5301;
+        let receiver = 0x5302;
+        let published = publish(donor, receiver, DONOR_SLOT, NICE_0_LOAD);
+        // The receiver is live and published, but it is not what this CPU is
+        // running, so the unlocked reader must refuse rather than answer.
+        assert!(reserve_current_call_donation(receiver).is_none());
+        assert!(reserve_current_call_donation(donor + 0x1000).is_none());
+        drop(published);
+    }
+
+    #[test]
+    fn a_reserved_edge_binds_to_the_running_receiver_without_the_catalog() {
+        let donor = 0x5401;
+        let receiver = 0x5402;
+        let published = publish(donor, receiver, RECEIVER_SLOT, NICE_0_LOAD);
+        assert!(super::super::donation_ledger::reserve(
+            donor, donor, DONOR_SLOT, false
+        ));
+        assert_eq!(
+            bind_current_receiver_call_donation(0x77, donor, receiver),
+            Some(true)
+        );
+        assert!(super::super::donation_ledger::release_reply(0x77));
+        drop(published);
+    }
+
+    /// The receiver a reserved edge binds to is decided by this CPU's own
+    /// publication, never by the caller's claim. With a live reservation in
+    /// place, that check is the only thing standing between a wrong receiver
+    /// identity and a committed edge.
+    #[test]
+    fn a_claimed_receiver_that_is_not_the_published_one_is_never_bound() {
+        let donor = 0x5601;
+        let receiver = 0x5602;
+        let impostor = 0x5603;
+        let published = publish(donor, receiver, RECEIVER_SLOT, NICE_0_LOAD);
+        assert!(super::super::donation_ledger::reserve(
+            donor, donor, DONOR_SLOT, false
+        ));
+        assert_eq!(
+            bind_current_receiver_call_donation(0x7b, donor, impostor),
+            None,
+            "an unpublished receiver claim must reach the catalog, not the ledger"
+        );
+        // The reservation is still unbound, which is what makes the refusal a
+        // deferral rather than a silent consumption.
+        assert!(super::super::donation_ledger::cancel_reservation(donor));
+        drop(published);
+    }
+
+    #[test]
+    fn a_missing_reservation_self_loop_or_foreign_receiver_defers_to_the_catalog() {
+        let donor = 0x5501;
+        let receiver = 0x5502;
+        let published = publish(donor, receiver, RECEIVER_SLOT, NICE_0_LOAD);
+        // No reservation exists, so creating the edge belongs to the
+        // authoritative upsert path rather than to this reader.
+        assert_eq!(
+            bind_current_receiver_call_donation(0x78, donor, receiver),
+            None
+        );
+        assert_eq!(
+            bind_current_receiver_call_donation(0, donor, receiver),
+            None
+        );
+        assert_eq!(
+            bind_current_receiver_call_donation(0x79, receiver, receiver),
+            None
+        );
+        // A receiver this CPU is not running is never bound from publication.
+        assert_eq!(
+            bind_current_receiver_call_donation(0x7a, receiver, donor),
+            None
+        );
+        drop(published);
+    }
+}

@@ -37,6 +37,7 @@ services/syscalld/src/mmap_policy.rs	0	0
 libs/rustos-user-abi/src/syscall/affinity.rs	0	0
 libs/rustos-user-abi/src/syscall/activation_batch.rs	0	0
 kernel/ps/src/multitask/process_table.rs	2	0
+kernel/ps/src/multitask/current/ipc.rs	0	0
 kernel/ps/src/user/process_state.rs	0	0
 kernel/ps/src/multitask/scheduler.rs	16	0
 kernel/ps/src/multitask/scheduler/affinity.rs	0	0

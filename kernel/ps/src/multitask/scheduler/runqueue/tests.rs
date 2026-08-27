@@ -12,6 +12,12 @@ use super::{
 };
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
+pub(in crate::multitask) fn test_serial_guard() -> std::sync::MutexGuard<'static, ()> {
+    TEST_GUARD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 struct RunQueueTestScope {
     _serial: std::sync::MutexGuard<'static, ()>,
 }
@@ -154,6 +160,162 @@ fn duplicate_local_wake_is_idempotent_and_terminal_wake_fails_closed() {
     assert_eq!(publish_local_wake(10, 1, 100), RemoteWakeOutcome::Rejected);
     release_retired(10);
     assert_eq!(owner(10).state, RunOwnerState::Dormant);
+}
+
+#[test]
+fn address_space_root_is_published_before_admission_and_cleared_on_release() {
+    let _scope = RunQueueTestScope::new();
+    const SLOT: usize = 11;
+    const ROOT: u64 = 0x1234_5000;
+
+    address_space::initialize(SLOT, ROOT);
+    assert_eq!(address_space::root(SLOT), ROOT);
+
+    admit_blocked(SLOT);
+    let late_initialization = catch_unwind(AssertUnwindSafe(|| {
+        address_space::initialize(SLOT, ROOT + 0x1000);
+    }));
+    assert!(
+        late_initialization.is_err(),
+        "a published task must not accept a fresh address-space root"
+    );
+
+    retire(SLOT, 100);
+    release_retired(SLOT);
+    assert_eq!(
+        address_space::root(SLOT),
+        0,
+        "terminal release must clear the root before slot reuse"
+    );
+}
+
+#[test]
+fn wait_payload_is_published_before_admission_and_cleared_on_release() {
+    let _scope = RunQueueTestScope::new();
+    const SLOT: usize = 12;
+    const ENDPOINT: u64 = 0xfeed;
+
+    wait::initialize(SLOT);
+    admit_running(SLOT, 0);
+    wait::set_blocked(SLOT, true);
+    wait::set_blocked_since_ticks(SLOT, 41);
+    wait::set_ready_since_ticks(SLOT, 37);
+    wait::set_armed(SLOT, true);
+    wait::set_reason(SLOT, wait::REASON_ENDPOINT_RECEIVE, ENDPOINT);
+    assert!(wait::blocked(SLOT));
+    assert_eq!(wait::blocked_since_ticks(SLOT), 41);
+    assert_eq!(wait::ready_since_ticks(SLOT), 37);
+    assert!(wait::armed(SLOT));
+    assert_eq!(
+        wait::reason(SLOT),
+        (wait::REASON_ENDPOINT_RECEIVE, ENDPOINT)
+    );
+
+    let late_initialization = catch_unwind(AssertUnwindSafe(|| wait::initialize(SLOT)));
+    assert!(
+        late_initialization.is_err(),
+        "a published task must not accept a fresh wait payload"
+    );
+
+    retire(SLOT, 100);
+    release_retired(SLOT);
+    assert!(!wait::blocked(SLOT));
+    assert_eq!(wait::blocked_since_ticks(SLOT), 0);
+    assert_eq!(wait::ready_since_ticks(SLOT), 0);
+    assert!(!wait::armed(SLOT));
+    assert_eq!(wait::reason(SLOT), (wait::REASON_NONE, 0));
+}
+
+#[test]
+fn wait_commit_and_wake_share_the_owner_word_linearization_point() {
+    let _scope = RunQueueTestScope::new();
+    const SLOT: usize = 13;
+
+    wait::initialize(SLOT);
+    admit_running(SLOT, 0);
+    wait::publish_arm(SLOT, wait::REASON_GENERIC, 0);
+    let armed = owner(SLOT);
+    assert!(armed.runnable);
+    assert!(armed.wait_armed);
+    assert_eq!(armed.wait_reason_kind, wait::REASON_GENERIC);
+
+    assert_eq!(wait::commit(SLOT), WaitCommitOutcome::Committed);
+    let committed = owner(SLOT);
+    assert!(!committed.runnable);
+    assert!(!committed.wait_armed);
+    assert_eq!(committed.wait_reason_kind, wait::REASON_GENERIC);
+    assert!(wait::blocked(SLOT));
+
+    wake_wait(SLOT);
+    let woken = owner(SLOT);
+    assert!(woken.runnable);
+    assert!(!woken.wait_armed);
+    assert_eq!(woken.wait_reason_kind, wait::REASON_NONE);
+    assert!(!wait::blocked(SLOT));
+}
+
+#[test]
+fn wake_that_withdraws_an_arm_makes_the_following_commit_refuse_sleep() {
+    let _scope = RunQueueTestScope::new();
+    const SLOT: usize = 14;
+
+    wait::initialize(SLOT);
+    admit_running(SLOT, 0);
+    wait::publish_arm(SLOT, wait::REASON_GENERIC, 0);
+    wake_wait(SLOT);
+
+    assert_eq!(wait::commit(SLOT), WaitCommitOutcome::WakeWon);
+    let owner = owner(SLOT);
+    assert!(owner.runnable);
+    assert!(!owner.wait_armed);
+    assert_eq!(owner.wait_reason_kind, wait::REASON_NONE);
+}
+
+#[test]
+fn endpoint_wait_identity_survives_block_and_direct_handoff_rollback() {
+    let _scope = RunQueueTestScope::new();
+    const SLOT: usize = 15;
+    const CPU: usize = 0;
+    const ENDPOINT: u64 = 0xfeed_beef;
+
+    wait::initialize(SLOT);
+    admit_running(SLOT, CPU);
+    wait::publish_arm(SLOT, wait::REASON_ENDPOINT_RECEIVE, ENDPOINT);
+    assert_eq!(wait::commit(SLOT), WaitCommitOutcome::Committed);
+
+    publish_blocked(SLOT, CPU, 1024);
+    assert_eq!(owner(SLOT).state, RunOwnerState::Blocked);
+    assert_eq!(
+        wait::reason(SLOT),
+        (wait::REASON_ENDPOINT_RECEIVE, ENDPOINT),
+        "block publication must retain the exact receiver identity"
+    );
+
+    assert_eq!(
+        publish_direct_handoff(SLOT, CPU),
+        RemoteWakeOutcome::Published {
+            cpu: CPU,
+            notify: false
+        }
+    );
+    assert_eq!(owner(SLOT).state, RunOwnerState::DirectHandoff);
+    assert_eq!(
+        wait::reason(SLOT),
+        (wait::REASON_ENDPOINT_RECEIVE, ENDPOINT),
+        "reservation publication must retain receiver identity"
+    );
+
+    assert!(rollback_direct_handoff(SLOT, CPU));
+    assert_eq!(owner(SLOT).state, RunOwnerState::Blocked);
+    assert_eq!(
+        wait::reason(SLOT),
+        (wait::REASON_ENDPOINT_RECEIVE, ENDPOINT),
+        "rollback must restore the same blocked receiver"
+    );
+
+    wake_wait(SLOT);
+    assert_eq!(wait::reason(SLOT), (wait::REASON_NONE, ENDPOINT));
+    assert!(!owner(SLOT).runnable);
 }
 
 #[test]
@@ -497,12 +659,14 @@ fn vruntime_payload_is_monotonic_and_cleared_before_slot_reuse() {
     let cpu = 2;
 
     initialize_vruntime(slot, 100);
+    weight::initialize(slot, 100);
     initialize_exec_start_ticks(slot, 17);
     initialize_saved_rsp(slot, 0x40_000);
     initialize_kernel_stack_bounds(slot, 0x30_000, 0x40_000);
     initialize_alternate_kernel_stack_bounds(slot);
     initialize_affinity(slot, 0b0011, 0b0111);
     assert_eq!(vruntime(slot), 100);
+    assert_eq!(weight::value(slot), 100);
     assert_eq!(exec_start_ticks(slot), 17);
     assert_eq!(saved_rsp(slot), 0x40_000);
     assert_eq!(tls_fs_base(slot), 0);
@@ -530,6 +694,11 @@ fn vruntime_payload_is_monotonic_and_cleared_before_slot_reuse() {
         vruntime(slot),
         0,
         "retired payload leaked into a reused slot"
+    );
+    let cleared_weight = catch_unwind(AssertUnwindSafe(|| weight::value(slot)));
+    assert!(
+        cleared_weight.is_err(),
+        "retired fair-share weight leaked into a reused slot"
     );
     assert_eq!(
         exec_start_ticks(slot),
@@ -564,6 +733,7 @@ fn vruntime_payload_is_monotonic_and_cleared_before_slot_reuse() {
     );
 
     initialize_vruntime(slot, 7);
+    weight::initialize(slot, 200);
     initialize_exec_start_ticks(slot, 0);
     initialize_saved_rsp(slot, 0x50_000);
     set_tls_fs_base(slot, 0x61_000);
@@ -576,6 +746,7 @@ fn vruntime_payload_is_monotonic_and_cleared_before_slot_reuse() {
         "new admission must not inherit old fairness"
     );
     assert_eq!(saved_rsp(slot), 0x50_000);
+    assert_eq!(weight::value(slot), 200);
     assert_eq!(tls_fs_base(slot), 0x61_000);
     assert_eq!(affinity_snapshot(slot), (0b0100, 0b1100, false));
     assert_eq!(kernel_stack_bounds(slot), (0x60_000, 0x70_000));

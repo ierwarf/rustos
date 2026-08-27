@@ -362,6 +362,13 @@ pub mod endpoint {
         crate::ipc::remove_endpoint_waiters_for_task(task_id)
     }
 
+    /// Withdraws one task's receive waiter from one exact endpoint. Prefer this
+    /// wherever the endpoint is known; see
+    /// `crate::ipc::remove_endpoint_waiter_for_task`.
+    pub fn remove_waiter_for_task(endpoint: KernelEndpointHandle, task_id: u64) -> usize {
+        crate::ipc::remove_endpoint_waiter_for_task(endpoint, task_id)
+    }
+
     pub fn fail_owned_by_task(task_id: u64, err: IpcError) -> EndpointWakeSet {
         crate::ipc::fail_endpoints_owned_by_task(task_id, err)
     }
@@ -431,6 +438,7 @@ pub use endpoint::{
     recv_with_limit as recv_endpoint_with_limit,
     recv_with_limits_and_handles as recv_endpoint_with_limits_and_handles,
     recv_with_sender_and_limits as recv_endpoint_with_sender_and_limits,
+    remove_waiter_for_task as remove_endpoint_waiter_for_task,
     remove_waiters_for_task as remove_endpoint_waiters_for_task, reply as complete_endpoint_reply,
     reply_custody_returned as endpoint_reply_custody_returned,
     reply_for_process as complete_endpoint_reply_for_process,

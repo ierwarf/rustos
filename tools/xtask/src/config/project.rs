@@ -39,6 +39,7 @@ pub(crate) struct ProjectConfig {
     pub(crate) lock_telemetry: LockTelemetryConfig,
     pub(crate) scheduler_telemetry: SchedulerTelemetryConfig,
     pub(crate) syscall_telemetry: SyscallTelemetryConfig,
+    pub(crate) ipc_telemetry: IpcTelemetryConfig,
     pub(crate) lifecycle_telemetry: LifecycleTelemetryConfig,
 }
 
@@ -88,6 +89,14 @@ pub(crate) struct SchedulerTelemetryConfig {
 /// `config/rustos.toml` for why it is off by default.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SyscallTelemetryConfig {
+    pub(crate) phase_profile: bool,
+}
+
+/// IPC caller/receiver attribution and fast-path counters. These perform TSC
+/// reads and system-wide atomic updates in the synchronous request path, so a
+/// shipping build must leave them compiled out.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct IpcTelemetryConfig {
     pub(crate) phase_profile: bool,
 }
 
@@ -220,6 +229,7 @@ struct ProjectConfigFile {
     lock_telemetry: LockTelemetryConfigFile,
     scheduler_telemetry: SchedulerTelemetryConfigFile,
     syscall_telemetry: SyscallTelemetryConfigFile,
+    ipc_telemetry: IpcTelemetryConfigFile,
     lifecycle_telemetry: LifecycleTelemetryConfigFile,
 }
 
@@ -276,6 +286,12 @@ struct SyscallTelemetryConfigFile {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+struct IpcTelemetryConfigFile {
+    phase_profile: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 struct LifecycleTelemetryConfigFile {
     phase_profile: Option<bool>,
 }
@@ -297,6 +313,7 @@ pub(crate) fn load_project_config(root_dir: &Path) -> Result<ProjectConfig> {
     apply_lock_telemetry_env_overrides(&mut config.lock_telemetry)?;
     apply_scheduler_telemetry_env_overrides(&mut config.scheduler_telemetry)?;
     apply_syscall_telemetry_env_overrides(&mut config.syscall_telemetry)?;
+    apply_ipc_telemetry_env_overrides(&mut config.ipc_telemetry)?;
     apply_lifecycle_telemetry_env_overrides(&mut config.lifecycle_telemetry)?;
     validate_kernel_build(&config.kernel.build)?;
     validate_fault_injection(&config.fault_injection)?;
@@ -310,6 +327,7 @@ pub(crate) fn load_project_config(root_dir: &Path) -> Result<ProjectConfig> {
         lock_telemetry: config.lock_telemetry,
         scheduler_telemetry: config.scheduler_telemetry,
         syscall_telemetry: config.syscall_telemetry,
+        ipc_telemetry: config.ipc_telemetry,
         lifecycle_telemetry: config.lifecycle_telemetry,
     })
 }
@@ -445,6 +463,9 @@ fn project_from_file(file: ProjectConfigFile) -> ProjectConfig {
     if let Some(value) = file.syscall_telemetry.phase_profile {
         config.syscall_telemetry.phase_profile = value;
     }
+    if let Some(value) = file.ipc_telemetry.phase_profile {
+        config.ipc_telemetry.phase_profile = value;
+    }
     if let Some(value) = file.lifecycle_telemetry.phase_profile {
         config.lifecycle_telemetry.phase_profile = value;
     }
@@ -461,6 +482,7 @@ impl Default for ProjectConfig {
             lock_telemetry: LockTelemetryConfig::default(),
             scheduler_telemetry: SchedulerTelemetryConfig::default(),
             syscall_telemetry: SyscallTelemetryConfig::default(),
+            ipc_telemetry: IpcTelemetryConfig::default(),
             lifecycle_telemetry: LifecycleTelemetryConfig::default(),
         }
     }
@@ -576,6 +598,13 @@ fn apply_syscall_telemetry_env_overrides(
 ) -> Result<()> {
     if let Some(value) = env_string("RUSTOS_SYSCALL_PHASE_PROFILE") {
         syscall_telemetry.phase_profile = parse_bool_env("RUSTOS_SYSCALL_PHASE_PROFILE", &value)?;
+    }
+    Ok(())
+}
+
+fn apply_ipc_telemetry_env_overrides(ipc_telemetry: &mut IpcTelemetryConfig) -> Result<()> {
+    if let Some(value) = env_string("RUSTOS_IPC_PHASE_PROFILE") {
+        ipc_telemetry.phase_profile = parse_bool_env("RUSTOS_IPC_PHASE_PROFILE", &value)?;
     }
     Ok(())
 }
@@ -726,6 +755,10 @@ pub(crate) fn effective_config_toml(config: &ProjectConfig) -> String {
     let fault = &config.fault_injection;
     let fuzzing = &config.fuzzing;
     let lock_telemetry = &config.lock_telemetry;
+    let scheduler_telemetry = &config.scheduler_telemetry;
+    let syscall_telemetry = &config.syscall_telemetry;
+    let ipc_telemetry = &config.ipc_telemetry;
+    let lifecycle_telemetry = &config.lifecycle_telemetry;
     let extra = build
         .extra_rustflags
         .iter()
@@ -739,7 +772,7 @@ pub(crate) fn effective_config_toml(config: &ProjectConfig) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "# source: {}\n[kernel.build]\ncodegen_units = {}\nopt_level = {:?}\noverflow_checks = {}\ndebug_assertions = {}\nlto = {:?}\nforce_frame_pointers = {}\nincremental = {}\ndebuginfo = {:?}\nembed_bitcode = {}\npanic = {:?}\nrelocation_model = {:?}\nstrip = {:?}\nextra_rustflags = [{}]\n\n[fault_injection]\nenabled = {}\nrules = [{}]\n\n[fuzzing]\nenabled = {}\nfd_transfer_stress = {}\nstartup_delay_ms = {}\n\n[lock_telemetry]\nenabled = {}\nwarn_wait_cycles = {}\nwarn_hold_cycles = {}\n",
+        "# source: {}\n[kernel.build]\ncodegen_units = {}\nopt_level = {:?}\noverflow_checks = {}\ndebug_assertions = {}\nlto = {:?}\nforce_frame_pointers = {}\nincremental = {}\ndebuginfo = {:?}\nembed_bitcode = {}\npanic = {:?}\nrelocation_model = {:?}\nstrip = {:?}\nextra_rustflags = [{}]\n\n[fault_injection]\nenabled = {}\nrules = [{}]\n\n[fuzzing]\nenabled = {}\nfd_transfer_stress = {}\nstartup_delay_ms = {}\n\n[lock_telemetry]\nenabled = {}\nphase_profile = {}\nwarn_wait_cycles = {}\nwarn_hold_cycles = {}\n\n[scheduler_telemetry]\nphase_profile = {}\n\n[syscall_telemetry]\nphase_profile = {}\n\n[ipc_telemetry]\nphase_profile = {}\n\n[lifecycle_telemetry]\nphase_profile = {}\n",
         config.source.label(),
         build.codegen_units,
         build.opt_level,
@@ -760,16 +793,21 @@ pub(crate) fn effective_config_toml(config: &ProjectConfig) -> String {
         fuzzing.fd_transfer_stress,
         fuzzing.startup_delay_ms,
         lock_telemetry.enabled,
+        lock_telemetry.phase_profile,
         lock_telemetry.warn_wait_cycles,
         lock_telemetry.warn_hold_cycles,
+        scheduler_telemetry.phase_profile,
+        syscall_telemetry.phase_profile,
+        ipc_telemetry.phase_profile,
+        lifecycle_telemetry.phase_profile,
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        FaultInjectionConfig, KernelBuildConfig, LifecycleTelemetryConfig, LockTelemetryConfig,
-        ProjectConfigFile, SchedulerTelemetryConfig, SyscallTelemetryConfig,
+        FaultInjectionConfig, IpcTelemetryConfig, KernelBuildConfig, LifecycleTelemetryConfig,
+        LockTelemetryConfig, ProjectConfigFile, SchedulerTelemetryConfig, SyscallTelemetryConfig,
         apply_fault_rule_overrides, project_from_file, validate_fault_injection,
     };
 
@@ -833,10 +871,10 @@ mod tests {
 
     #[test]
     fn every_phase_profile_is_off_by_default_and_in_the_shipped_configuration() {
-        // Three sections now carry this key, because the same defect recurred
-        // three times: a per-phase timing profile around an operation cheaper
+        // Four sections now carry this key, because the same defect recurred
+        // four times: a per-phase timing profile around an operation cheaper
         // than the profile. The default is the only thing between a product
-        // build and paying for all three, so assert it once for all of them
+        // build and paying for all four, so assert it once for all of them
         // rather than once per section and miss the fourth.
         let shipped = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/rustos.toml"),
@@ -852,6 +890,7 @@ mod tests {
                 shipped.scheduler_telemetry.phase_profile,
             ),
             ("syscall_telemetry", shipped.syscall_telemetry.phase_profile),
+            ("ipc_telemetry", shipped.ipc_telemetry.phase_profile),
             (
                 "lifecycle_telemetry",
                 shipped.lifecycle_telemetry.phase_profile,
@@ -864,11 +903,15 @@ mod tests {
         }
 
         assert!(!SyscallTelemetryConfig::default().phase_profile);
+        assert!(!IpcTelemetryConfig::default().phase_profile);
         assert!(!LifecycleTelemetryConfig::default().phase_profile);
         let enabled: ProjectConfigFile =
             toml::from_str("[syscall_telemetry]\nphase_profile = true\n")
                 .expect("phase_profile is a recognized syscall_telemetry key");
         assert!(project_from_file(enabled).syscall_telemetry.phase_profile);
+        let enabled: ProjectConfigFile = toml::from_str("[ipc_telemetry]\nphase_profile = true\n")
+            .expect("phase_profile is a recognized ipc_telemetry key");
+        assert!(project_from_file(enabled).ipc_telemetry.phase_profile);
     }
 
     #[test]

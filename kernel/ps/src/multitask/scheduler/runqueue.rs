@@ -25,27 +25,41 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering, fence};
 use nucleus_core::util::lockdep::{LockClass, MAX_TRACKED_CPUS, TrackedSpinLock};
 
 use super::MAX_TASK;
+use validation::{bitmap_location, validate_cpu};
 
+pub(super) mod address_space;
 pub(super) mod affinity_payload;
+mod ipc_handoff;
 pub(super) mod simd_tls;
+mod validation;
+pub(super) mod wait;
+pub(super) mod weight;
+
+#[cfg(test)]
+use ipc_handoff::publish_migrating_record;
+pub(super) use ipc_handoff::{
+    RemoteWakeOutcome, drain_remote_wakes, materialize_direct_handoff, publish_direct_handoff,
+    publish_local_wake, publish_remote_wake, rehome_queued, rollback_direct_handoff,
+};
 
 const OWNER_STATE_BITS: u64 = 4;
 const OWNER_CPU_BITS: u64 = 8;
 const OWNER_STATE_MASK: u64 = (1 << OWNER_STATE_BITS) - 1;
 const OWNER_CPU_MASK: u64 = (1 << OWNER_CPU_BITS) - 1;
 const OWNER_CPU_SHIFT: u64 = OWNER_STATE_BITS;
-/// "Still wants to run", independent of whether a CPU is executing it.
-///
 /// This is Linux's `p->on_rq == TASK_ON_RQ_QUEUED`, which the kernel documents
 /// as covering a task that is "present in a runqueue, either actively executing
 /// on a CPU or waiting to run". Without it, `Running` conflates executing with
 /// no longer runnable, and the question "does the outgoing task go back to its
 /// queue or get published blocked?" has no answer in the owner word — which is
-/// why the old readiness mirror still had readers after stage two of
-/// `V5-SCHED-GLOBAL-001`.
 const OWNER_RUNNABLE_SHIFT: u64 = OWNER_STATE_BITS + OWNER_CPU_BITS;
 const OWNER_RUNNABLE_BIT: u64 = 1 << OWNER_RUNNABLE_SHIFT;
-const OWNER_GENERATION_SHIFT: u64 = OWNER_RUNNABLE_SHIFT + 1;
+const OWNER_WAIT_REASON_BITS: u64 = 2;
+const OWNER_WAIT_REASON_SHIFT: u64 = OWNER_RUNNABLE_SHIFT + 1;
+const OWNER_WAIT_REASON_MASK: u64 = ((1 << OWNER_WAIT_REASON_BITS) - 1) << OWNER_WAIT_REASON_SHIFT;
+const OWNER_WAIT_ARMED_SHIFT: u64 = OWNER_WAIT_REASON_SHIFT + OWNER_WAIT_REASON_BITS;
+const OWNER_WAIT_ARMED_BIT: u64 = 1 << OWNER_WAIT_ARMED_SHIFT;
+const OWNER_GENERATION_SHIFT: u64 = OWNER_WAIT_ARMED_SHIFT + 1;
 const OWNER_GENERATION_MAX: u64 = u64::MAX >> OWNER_GENERATION_SHIFT;
 const NO_CPU: usize = u8::MAX as usize;
 const BITMAP_WORDS: usize = MAX_TASK.div_ceil(64);
@@ -138,33 +152,12 @@ pub(super) struct RunOwnerSnapshot {
     pub(super) generation: u64,
     /// Whether the task still wants to run. See [`OWNER_RUNNABLE_SHIFT`].
     pub(super) runnable: bool,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum RemoteWakeOutcome {
-    Rejected,
-    AlreadyOwned { cpu: Option<usize> },
-    Published { cpu: usize, notify: bool },
-}
-
-const fn local_wake_owner_is_already_owned(state: RunOwnerState) -> bool {
-    matches!(
-        state,
-        RunOwnerState::Local
-            | RunOwnerState::RemoteQueued
-            | RunOwnerState::Running
-            | RunOwnerState::DirectHandoff
-    )
-}
-
-const fn remote_wake_owner_is_already_owned(state: RunOwnerState) -> bool {
-    matches!(
-        state,
-        RunOwnerState::Local
-            | RunOwnerState::RemoteQueued
-            | RunOwnerState::Running
-            | RunOwnerState::DirectHandoff
-    )
+    /// Exact wait kind retained from arm through blocked custody. Values use
+    /// the stable `runqueue::wait::REASON_*` encoding.
+    pub(super) wait_reason_kind: u8,
+    /// An uncommitted wait arm. Commit and a racing wake update this bit with
+    /// `runnable` in the same owner-word CAS.
+    pub(super) wait_armed: bool,
 }
 
 impl RunOwnerSnapshot {
@@ -174,6 +167,8 @@ impl RunOwnerSnapshot {
             cpu,
             generation,
             runnable: Self::state_implies_runnable(state),
+            wait_reason_kind: 0,
+            wait_armed: false,
         }
     }
 
@@ -197,6 +192,21 @@ impl RunOwnerSnapshot {
         Self { runnable, ..self }
     }
 
+    const fn with_wait(self, wait_armed: bool, wait_reason_kind: u8) -> Self {
+        Self {
+            wait_reason_kind,
+            wait_armed,
+            ..self
+        }
+    }
+
+    fn next_preserving_wait(self, state: RunOwnerState, cpu: Option<usize>) -> Self {
+        let mut next = self.next(state, cpu);
+        next.wait_reason_kind = self.wait_reason_kind;
+        next.wait_armed = self.wait_armed;
+        next
+    }
+
     fn encode(self) -> u64 {
         assert!(
             self.generation != 0 && self.generation <= OWNER_GENERATION_MAX,
@@ -204,7 +214,17 @@ impl RunOwnerSnapshot {
         );
         let cpu = self.cpu.unwrap_or(NO_CPU);
         assert!(cpu <= NO_CPU, "scheduler owner CPU exceeds packed range");
+        assert!(
+            u64::from(self.wait_reason_kind) < (1 << OWNER_WAIT_REASON_BITS),
+            "scheduler wait reason exceeds packed range"
+        );
         (self.generation << OWNER_GENERATION_SHIFT)
+            | if self.wait_armed {
+                OWNER_WAIT_ARMED_BIT
+            } else {
+                0
+            }
+            | (u64::from(self.wait_reason_kind) << OWNER_WAIT_REASON_SHIFT)
             | if self.runnable { OWNER_RUNNABLE_BIT } else { 0 }
             | ((cpu as u64 & OWNER_CPU_MASK) << OWNER_CPU_SHIFT)
             | self.state as u64
@@ -217,6 +237,8 @@ impl RunOwnerSnapshot {
             cpu: (cpu != NO_CPU).then_some(cpu),
             generation: raw >> OWNER_GENERATION_SHIFT,
             runnable: raw & OWNER_RUNNABLE_BIT != 0,
+            wait_reason_kind: ((raw & OWNER_WAIT_REASON_MASK) >> OWNER_WAIT_REASON_SHIFT) as u8,
+            wait_armed: raw & OWNER_WAIT_ARMED_BIT != 0,
         }
     }
 
@@ -476,15 +498,6 @@ fn reset_test_local_migrating_owner() {
     *TEST_LOCAL_MIGRATING_OWNER.lock().unwrap() = None;
 }
 
-fn bitmap_location(slot: usize) -> (usize, u64) {
-    assert!(slot < MAX_TASK, "scheduler rq slot exceeds capacity");
-    (slot / 64, 1_u64 << (slot % 64))
-}
-
-fn validate_cpu(cpu: usize) {
-    assert!(cpu < MAX_TRACKED_CPUS, "scheduler rq CPU exceeds capacity");
-}
-
 pub(super) fn reset_before_publication() {
     for (
         (((((owner, vruntime), exec_start), saved_rsp), stack_base), alternate_version),
@@ -512,8 +525,11 @@ pub(super) fn reset_before_publication() {
     for alternate_top in &ALTERNATE_KERNEL_STACK_TOP {
         alternate_top.store(0, Ordering::Release);
     }
+    address_space::reset_before_publication();
     simd_tls::reset_before_publication();
     affinity_payload::reset_before_publication();
+    wait::reset_before_publication();
+    weight::reset_before_publication();
     for cpu in 0..MAX_TRACKED_CPUS {
         let mut rq = RUN_QUEUES[cpu].inner.lock();
         *rq = RunQueueInner::new();
@@ -727,11 +743,6 @@ pub(super) fn lower_vruntime_ceiling(slot: usize, ceiling: u64) -> u64 {
     }
 }
 
-#[cfg(test)]
-pub(super) fn test_serial_guard() -> std::sync::MutexGuard<'static, ()> {
-    TEST_GUARD.lock().unwrap()
-}
-
 pub(super) fn owner(slot: usize) -> RunOwnerSnapshot {
     OWNER_WORDS
         .get(slot)
@@ -766,6 +777,136 @@ pub(super) fn set_runnable(slot: usize, runnable: bool) {
             return;
         }
     }
+}
+
+/// Result of atomically converting the current running task's wait arm into a
+/// non-runnable continuation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum WaitCommitOutcome {
+    Committed,
+    WakeWon,
+    InvalidOwner,
+}
+
+pub(super) fn publish_wait_arm(slot: usize, reason_kind: u8) -> bool {
+    assert!(reason_kind != 0 && reason_kind < (1 << OWNER_WAIT_REASON_BITS) as u8);
+    let word = &OWNER_WORDS[slot];
+    loop {
+        let observed = word.load();
+        if observed.state != RunOwnerState::Running || !observed.runnable {
+            return false;
+        }
+        let next = observed.with_wait(true, reason_kind);
+        if word.compare_exchange(observed, next).is_ok() {
+            return true;
+        }
+    }
+}
+
+pub(super) fn clear_wait_arm(slot: usize) {
+    let word = &OWNER_WORDS[slot];
+    loop {
+        let observed = word.load();
+        if !observed.wait_armed && observed.wait_reason_kind == 0 {
+            return;
+        }
+        if word
+            .compare_exchange(observed, observed.with_wait(false, 0))
+            .is_ok()
+        {
+            return;
+        }
+    }
+}
+
+pub(super) fn set_wait_armed(slot: usize, armed: bool) {
+    let word = &OWNER_WORDS[slot];
+    loop {
+        let observed = word.load();
+        if word
+            .compare_exchange(
+                observed,
+                observed.with_wait(armed, observed.wait_reason_kind),
+            )
+            .is_ok()
+        {
+            return;
+        }
+    }
+}
+
+pub(super) fn set_wait_reason(slot: usize, reason_kind: u8) {
+    assert!(reason_kind < (1 << OWNER_WAIT_REASON_BITS) as u8);
+    let word = &OWNER_WORDS[slot];
+    loop {
+        let observed = word.load();
+        if word
+            .compare_exchange(
+                observed,
+                observed.with_wait(observed.wait_armed, reason_kind),
+            )
+            .is_ok()
+        {
+            return;
+        }
+    }
+}
+
+pub(super) fn commit_wait(slot: usize) -> WaitCommitOutcome {
+    let word = &OWNER_WORDS[slot];
+    loop {
+        let observed = word.load();
+        if observed.state != RunOwnerState::Running || !observed.runnable {
+            return WaitCommitOutcome::InvalidOwner;
+        }
+        if !observed.wait_armed {
+            return WaitCommitOutcome::WakeWon;
+        }
+        let next = observed
+            .with_runnable(false)
+            .with_wait(false, observed.wait_reason_kind);
+        if word.compare_exchange(observed, next).is_ok() {
+            return WaitCommitOutcome::Committed;
+        }
+    }
+}
+
+/// Clears any wait epoch and, while the task still owns this CPU, restores its
+/// run intent in the same CAS that defeats a pending block commit.
+pub(super) fn wake_wait(slot: usize) {
+    let word = &OWNER_WORDS[slot];
+    loop {
+        let observed = word.load();
+        let runnable = if matches!(
+            observed.state,
+            RunOwnerState::Local
+                | RunOwnerState::RemoteQueued
+                | RunOwnerState::Running
+                | RunOwnerState::Migrating
+                | RunOwnerState::DirectHandoff
+        ) {
+            true
+        } else {
+            observed.runnable
+        };
+        let next = observed.with_runnable(runnable).with_wait(false, 0);
+        if next == observed || word.compare_exchange(observed, next).is_ok() {
+            return;
+        }
+    }
+}
+
+pub(super) fn wait_blocked(owner: RunOwnerSnapshot) -> bool {
+    owner.state == RunOwnerState::Blocked
+        || (!owner.runnable
+            && matches!(
+                owner.state,
+                RunOwnerState::Local
+                    | RunOwnerState::RemoteQueued
+                    | RunOwnerState::Running
+                    | RunOwnerState::Migrating
+                    | RunOwnerState::DirectHandoff
+            ))
 }
 
 pub(super) fn admit_blocked(slot: usize) {
@@ -841,328 +982,12 @@ pub(super) fn publish_blocked(slot: usize, cpu: usize, weight: u32) {
         );
     }
     OWNER_WORDS[slot]
-        .compare_exchange(owner, owner.next(RunOwnerState::Blocked, None))
+        .compare_exchange(
+            owner,
+            owner.next_preserving_wait(RunOwnerState::Blocked, None),
+        )
         .unwrap_or_else(|observed| panic!("scheduler block lost owner race observed={observed:?}"));
     RUN_QUEUES[cpu].publish_load(&rq);
-}
-
-/// Same-CPU counterpart to `publish_remote_wake`: when a wake's target CPU is
-/// the CPU already executing the wake, publish directly into the local
-/// runqueue in one step (`publish_local`, the same Blocked -> Local
-/// transition Balance already performs for the outgoing task) instead of
-/// round-tripping through the cross-CPU mailbox.
-///
-/// The mailbox path is correct but not free: it always transitions
-/// Blocked -> RemoteQueued -> Local, two separate owner-generation bumps, the
-/// second one (`drain_remote_wakes`, run unconditionally by every dispatch's
-/// Balance phase) landing before the *same* dispatch's Select phase ever
-/// checks anything that captured the first bump's generation. A synchronous
-/// IPC reply-wake token is exactly such a capture
-/// (`SyncHandoffCustody::ReplyWake`, `sync_handoff.rs`): minted right after
-/// the RemoteQueued transition, checked one phase later in the very next
-/// dispatch, by which time Balance has already promoted it past that
-/// generation — a mismatch on every same-CPU reply-wake, deterministically,
-/// not a contention-dependent race. Skipping the mailbox for the same-CPU
-/// case removes the extra hop, so the token's captured generation is the one
-/// it is actually checked against.
-///
-/// Mirrors `publish_remote_wake`'s exact state dispatch (terminal/Dormant
-/// rejects, already-owned states dedup, only `Blocked` proceeds) so every
-/// caller's existing rejection/dedup contract is unchanged; only the
-/// mechanism for the `Blocked` case differs.
-pub(super) fn publish_local_wake(slot: usize, cpu: usize, weight: u32) -> RemoteWakeOutcome {
-    validate_cpu(cpu);
-    let owner = owner(slot);
-    if owner.state.is_terminal() || owner.state == RunOwnerState::Dormant {
-        return RemoteWakeOutcome::Rejected;
-    }
-    if local_wake_owner_is_already_owned(owner.state) {
-        return RemoteWakeOutcome::AlreadyOwned { cpu: owner.cpu };
-    }
-    if owner.state != RunOwnerState::Blocked {
-        return RemoteWakeOutcome::Rejected;
-    }
-    publish_local(slot, cpu, weight);
-    RemoteWakeOutcome::Published { cpu, notify: false }
-}
-
-/// Transfers a blocked task directly to the current CPU's synchronous IPC
-/// handoff owner without inserting it into the fair runqueue. The caller must
-/// publish the matching bounded handoff record before releasing Scheduler.
-pub(super) fn publish_direct_handoff(slot: usize, cpu: usize) -> RemoteWakeOutcome {
-    validate_cpu(cpu);
-    loop {
-        let owner = owner(slot);
-        if owner.state.is_terminal() || owner.state == RunOwnerState::Dormant {
-            return RemoteWakeOutcome::Rejected;
-        }
-        if remote_wake_owner_is_already_owned(owner.state) {
-            return RemoteWakeOutcome::AlreadyOwned { cpu: owner.cpu };
-        }
-        if owner.state != RunOwnerState::Blocked {
-            return RemoteWakeOutcome::Rejected;
-        }
-        let next = owner.next(RunOwnerState::DirectHandoff, Some(cpu));
-        if OWNER_WORDS[slot].compare_exchange(owner, next).is_ok() {
-            return RemoteWakeOutcome::Published { cpu, notify: false };
-        }
-    }
-}
-
-/// Restores fair-runqueue custody when the bounded synchronous-handoff FIFO
-/// cannot retain a freshly published direct transfer. Scheduler serialization
-/// guarantees the task has not been selected between publication and this
-/// rollback.
-pub(super) fn materialize_direct_handoff(slot: usize, cpu: usize, weight: u32) -> bool {
-    validate_cpu(cpu);
-    let owner = owner(slot);
-    if owner.state != RunOwnerState::DirectHandoff || owner.cpu != Some(cpu) || !owner.runnable {
-        return false;
-    }
-    let mut rq = RUN_QUEUES[cpu].inner.lock();
-    rq.insert(slot, weight);
-    if OWNER_WORDS[slot]
-        .compare_exchange(owner, owner.next(RunOwnerState::Local, Some(cpu)))
-        .is_err()
-    {
-        rq.remove(slot, weight);
-        RUN_QUEUES[cpu].publish_load(&rq);
-        return false;
-    }
-    RUN_QUEUES[cpu].publish_load(&rq);
-    true
-}
-
-/// Returns a not-yet-dispatched direct receiver to exact blocked custody.
-/// No runqueue or mailbox entry exists while `DirectHandoff` is owned, so one
-/// owner-word CAS restores the pre-reservation representation.
-pub(super) fn rollback_direct_handoff(slot: usize, cpu: usize) -> bool {
-    validate_cpu(cpu);
-    let owner = owner(slot);
-    if owner.state != RunOwnerState::DirectHandoff || owner.cpu != Some(cpu) || !owner.runnable {
-        return false;
-    }
-    OWNER_WORDS[slot]
-        .compare_exchange(owner, owner.next(RunOwnerState::Blocked, None))
-        .is_ok()
-}
-
-pub(super) fn publish_remote_wake(
-    slot: usize,
-    target_cpu: usize,
-    weight: u32,
-) -> RemoteWakeOutcome {
-    validate_cpu(target_cpu);
-    loop {
-        let owner = owner(slot);
-        if owner.state.is_terminal() || owner.state == RunOwnerState::Dormant {
-            return RemoteWakeOutcome::Rejected;
-        }
-        if matches!(
-            owner.state,
-            RunOwnerState::Local
-                | RunOwnerState::RemoteQueued
-                | RunOwnerState::Running
-                | RunOwnerState::DirectHandoff
-        ) {
-            return RemoteWakeOutcome::AlreadyOwned { cpu: owner.cpu };
-        }
-        if owner.state != RunOwnerState::Blocked {
-            return RemoteWakeOutcome::Rejected;
-        }
-        let next = owner.next(RunOwnerState::RemoteQueued, Some(target_cpu));
-        if OWNER_WORDS[slot].compare_exchange(owner, next).is_err() {
-            continue;
-        }
-        {
-            let mut mailbox = REMOTE_WAKE_MAILBOXES[target_cpu].lock();
-            mailbox.publish(RunTransfer {
-                slot,
-                generation: next.generation,
-                weight,
-            });
-        }
-        // ORDERING: the mailbox lock release publishes the record before this
-        // 0->1 edge grants notification custody to the winning producer.
-        let notify = MAILBOX_PENDING[target_cpu]
-            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok();
-        return RemoteWakeOutcome::Published {
-            cpu: target_cpu,
-            notify,
-        };
-    }
-}
-
-/// Move queued custody to a newly admitted affinity target.
-///
-/// The global lifecycle owner currently serializes affinity mutation against
-/// dispatch, but queue authority still follows the same source-owned transfer
-/// protocol required by the final per-CPU backend.  An old mailbox record is
-/// harmless: its generation no longer matches and the old target discards it.
-pub(super) fn rehome_queued(slot: usize, target_cpu: usize, weight: u32) -> RemoteWakeOutcome {
-    validate_cpu(target_cpu);
-    loop {
-        let owner = owner(slot);
-        match owner.state {
-            RunOwnerState::Blocked => return publish_remote_wake(slot, target_cpu, weight),
-            RunOwnerState::Running => {
-                return RemoteWakeOutcome::AlreadyOwned { cpu: owner.cpu };
-            }
-            RunOwnerState::Local => {
-                let source_cpu = owner.cpu.expect("local scheduler owner omitted CPU");
-                if source_cpu == target_cpu {
-                    return RemoteWakeOutcome::AlreadyOwned {
-                        cpu: Some(source_cpu),
-                    };
-                }
-                let mut source = RUN_QUEUES[source_cpu].inner.lock();
-                if !source.contains(slot) {
-                    panic!(
-                        "scheduler rehome found Local owner without source membership slot={slot} cpu={source_cpu}"
-                    );
-                }
-                source.remove(slot, weight);
-                let migrating = owner.next(RunOwnerState::Migrating, Some(target_cpu));
-                if OWNER_WORDS[slot]
-                    .compare_exchange(owner, migrating)
-                    .is_err()
-                {
-                    source.insert(slot, weight);
-                    RUN_QUEUES[source_cpu].publish_load(&source);
-                    continue;
-                }
-                #[cfg(test)]
-                record_test_local_migrating_owner(migrating);
-                RUN_QUEUES[source_cpu].publish_load(&source);
-                drop(source);
-                return publish_migrating_record(slot, migrating, target_cpu, weight);
-            }
-            RunOwnerState::RemoteQueued => {
-                if owner.cpu == Some(target_cpu) {
-                    return RemoteWakeOutcome::AlreadyOwned {
-                        cpu: Some(target_cpu),
-                    };
-                }
-                let migrating = owner.next(RunOwnerState::Migrating, Some(target_cpu));
-                if OWNER_WORDS[slot]
-                    .compare_exchange(owner, migrating)
-                    .is_err()
-                {
-                    continue;
-                }
-                return publish_migrating_record(slot, migrating, target_cpu, weight);
-            }
-            RunOwnerState::DirectHandoff => {
-                if owner.cpu == Some(target_cpu) {
-                    return RemoteWakeOutcome::AlreadyOwned {
-                        cpu: Some(target_cpu),
-                    };
-                }
-                let migrating = owner.next(RunOwnerState::Migrating, Some(target_cpu));
-                if OWNER_WORDS[slot]
-                    .compare_exchange(owner, migrating)
-                    .is_err()
-                {
-                    continue;
-                }
-                return publish_migrating_record(slot, migrating, target_cpu, weight);
-            }
-            RunOwnerState::Migrating => continue,
-            RunOwnerState::Dormant | RunOwnerState::Retiring | RunOwnerState::Retired => {
-                return RemoteWakeOutcome::Rejected;
-            }
-        }
-    }
-}
-
-fn publish_migrating_record(
-    slot: usize,
-    migrating: RunOwnerSnapshot,
-    target_cpu: usize,
-    weight: u32,
-) -> RemoteWakeOutcome {
-    let queued = migrating.next(RunOwnerState::RemoteQueued, Some(target_cpu));
-    OWNER_WORDS[slot]
-        .compare_exchange(migrating, queued)
-        .unwrap_or_else(|observed| {
-            panic!("scheduler migration publication raced observed={observed:?}")
-        });
-    {
-        let mut mailbox = REMOTE_WAKE_MAILBOXES[target_cpu].lock();
-        mailbox.publish(RunTransfer {
-            slot,
-            generation: queued.generation,
-            weight,
-        });
-    }
-    let notify = MAILBOX_PENDING[target_cpu]
-        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-        .is_ok();
-    RemoteWakeOutcome::Published {
-        cpu: target_cpu,
-        notify,
-    }
-}
-
-pub(super) fn drain_remote_wakes(cpu: usize) -> usize {
-    validate_cpu(cpu);
-    // ORDERING: Acquire pairs with the producer's 0->1 edge, which it publishes
-    // only after the mailbox lock release that publishes the record. Observing
-    // zero therefore proves no record is waiting, and a producer that arrives
-    // after this load still wins the edge and its notification custody, so the
-    // wake is delivered on the next pass rather than lost.
-    // `local_dispatch_work_pending` already treats this word as authoritative
-    // for the same reason.
-    //
-    // The early return is what makes that worth reading: every dispatch used to
-    // zero the fixed `MAILBOX_CAPACITY` staging array and take the mailbox
-    // owner even on an empty mailbox, and `MAILBOX_CAPACITY` is `MAX_TASK`. On
-    // the voluntary-yield path neither balance helper below runs, so that
-    // unconditional clear and acquire were nearly the whole measured cost of
-    // this phase.
-    if MAILBOX_PENDING[cpu].load(Ordering::Acquire) == 0 {
-        return 0;
-    }
-    let mut records = [RunTransfer::EMPTY; MAILBOX_CAPACITY];
-    let mut count = 0;
-    {
-        let mut mailbox = REMOTE_WAKE_MAILBOXES[cpu].lock();
-        while let Some(record) = mailbox.pop() {
-            records[count] = record;
-            count += 1;
-        }
-        // ORDERING: clearing while holding the mailbox owner closes the race
-        // with a producer that observes/publishes the next 0->1 edge.
-        MAILBOX_PENDING[cpu].store(0, Ordering::Release);
-    }
-    if count == 0 {
-        return 0;
-    }
-    let mut rq = RUN_QUEUES[cpu].inner.lock();
-    for record in records.into_iter().take(count) {
-        let observed = owner(record.slot);
-        if observed.state != RunOwnerState::RemoteQueued
-            || observed.cpu != Some(cpu)
-            || observed.generation != record.generation
-        {
-            if observed.state.is_terminal() || observed.generation > record.generation {
-                continue;
-            }
-            panic!(
-                "scheduler mailbox record lost exact owner slot={} record_gen={} observed={observed:?}",
-                record.slot, record.generation
-            );
-        }
-        rq.insert(record.slot, record.weight);
-        OWNER_WORDS[record.slot]
-            .compare_exchange(observed, observed.next(RunOwnerState::Local, Some(cpu)))
-            .unwrap_or_else(|winner| {
-                panic!("scheduler mailbox adoption lost owner race observed={winner:?}")
-            });
-    }
-    RUN_QUEUES[cpu].publish_load(&rq);
-    count
 }
 
 fn local_runnable_snapshot(cpu: usize) -> [u64; BITMAP_WORDS] {
@@ -1386,6 +1211,9 @@ pub(super) fn release_retired(slot: usize) {
         });
     VRUNTIME_NS[slot].store(0, Ordering::Release);
     EXEC_START_TICKS[slot].store(0, Ordering::Release);
+    address_space::clear(slot);
+    wait::clear(slot);
+    weight::clear(slot);
     SAVED_RSP[slot].store(0, Ordering::Release);
     simd_tls::clear_tls_fs_base(slot);
     affinity_payload::reset_affinity(slot);
@@ -1425,3 +1253,5 @@ pub(super) fn least_loaded_cpu(eligible_mask: u64, fallback_cpu: usize) -> usize
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(super) use tests::test_serial_guard;

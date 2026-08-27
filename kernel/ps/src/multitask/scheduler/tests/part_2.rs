@@ -226,11 +226,6 @@ fn fast_ipc_commit_requires_exact_typed_waits_and_mutates_both_peers_once() {
 
 #[test]
 fn wake_transition_publishes_one_owner_before_commit_and_claims_once_after() {
-    let _process_table = process_table::tests::isolate_process_table();
-    let _publication_lock = super::super::cpu_local::test_publication_lock();
-    let _runqueue_serial = super::runqueue::test_serial_guard();
-    let _runqueue_reset = RunqueuePublicationReset;
-    super::runqueue::reset_before_publication();
     let mut scheduler = boxed_scheduler();
     let task_id = 0xec02;
     let base = crate::memory::paging::USER_SPACE_BASE;
@@ -315,7 +310,6 @@ fn wake_transition_publishes_one_owner_before_commit_and_claims_once_after() {
 
 #[test]
 fn strict_class_requires_explicit_admission_not_a_large_cfs_weight() {
-    let _process_table = process_table::tests::isolate_process_table();
     let mut scheduler = boxed_scheduler();
     let broker = test_process(69);
     let interactive = test_process(70);
@@ -333,7 +327,6 @@ fn strict_class_requires_explicit_admission_not_a_large_cfs_weight() {
 
 #[test]
 fn self_demotion_removes_base_system_class_and_caps_fair_weight() {
-    let _process_table = process_table::tests::isolate_process_table();
     let mut scheduler = boxed_scheduler();
     let helper = test_process(73);
     let donor = test_process(74);
@@ -389,7 +382,6 @@ fn self_demotion_removes_base_system_class_and_caps_fair_weight() {
 /// acyclic chain, and seL4 proves the two separately for this reason.
 #[test]
 fn ipc_donation_chain_depth_is_bounded() {
-    let _process_table = process_table::tests::isolate_process_table();
     let mut scheduler = boxed_scheduler();
 
     // Slot 1 is the System donor; slots 2.. are User links, each inheriting
@@ -435,7 +427,6 @@ fn ipc_donation_chain_depth_is_bounded() {
 
 #[test]
 fn bounded_system_burst_reserves_a_ready_user_turn() {
-    let _process_table = process_table::tests::isolate_process_table();
     let mut scheduler = boxed_scheduler();
     let system = test_process(71);
     let user = test_process(72);
@@ -451,7 +442,7 @@ fn bounded_system_burst_reserves_a_ready_user_turn() {
     assert!(Scheduler::user_reservation_due(
         &scheduler.current_dispatch_policy()
     ));
-    scheduler.record_dispatch_class(2);
+    scheduler.record_dispatch_streaks(2, false);
     assert_eq!(
         scheduler.current_dispatch_policy().system_dispatch_streak,
         0
@@ -460,7 +451,7 @@ fn bounded_system_burst_reserves_a_ready_user_turn() {
         &scheduler.current_dispatch_policy()
     ));
 
-    scheduler.record_dispatch_class(1);
+    scheduler.record_dispatch_streaks(1, false);
     assert_eq!(
         scheduler.current_dispatch_policy().system_dispatch_streak,
         1
@@ -724,7 +715,6 @@ fn overdue_system_continuation_precedes_unrelated_ipc_hint_without_losing_it() {
 
 #[test]
 fn stale_pick_hint_falls_through_without_mutating_task_state() {
-    let _process_table = process_table::tests::isolate_process_table();
     let mut scheduler = boxed_scheduler();
     let base = crate::memory::paging::USER_SPACE_BASE;
     let user_cs = crate::arch::gdt::user_code_selector().0 as u64;
@@ -920,7 +910,7 @@ fn event_wait_handoff_is_fifo_deduplicated_and_burst_bounded() {
         scheduler.take_next_latency_pick_hint_ready_slot(&mut scheduler.current_dispatch_policy()),
         None
     );
-    scheduler.record_latency_handoff(false);
+    scheduler.record_dispatch_streaks(super::ROOT_TASK_SLOT, false);
     assert_eq!(
         scheduler.take_next_latency_pick_hint_ready_slot(&mut scheduler.current_dispatch_policy()),
         Some(user_slot)
@@ -929,7 +919,6 @@ fn event_wait_handoff_is_fifo_deduplicated_and_burst_bounded() {
 
 #[test]
 fn dispatch_fairness_and_handoff_state_is_cpu_isolated() {
-    let _process_table = process_table::tests::isolate_process_table();
     let mut scheduler = boxed_scheduler();
     let user = test_process(904);
     scheduler.contexts[1] = Some(test_user_context(user));
@@ -939,7 +928,7 @@ fn dispatch_fairness_and_handoff_state_is_cpu_isolated() {
         policy.next_pick_hint = Some(7);
     }
 
-    scheduler.record_dispatch_class(1);
+    scheduler.record_dispatch_streaks(1, false);
     scheduler.current_dispatch_policy_mut().next_pick_hint = None;
 
     assert_eq!(scheduler.cpu_dispatch[0].lock().system_dispatch_streak, 0);
@@ -958,7 +947,6 @@ fn dispatch_fairness_and_handoff_state_is_cpu_isolated() {
 /// is caught here rather than only through the other's redundancy.
 #[test]
 fn ipc_donation_rejects_self_referential_and_retired_targets() {
-    let _process_table = process_table::tests::isolate_process_table();
     let mut scheduler = boxed_scheduler();
     let owner = test_process(64);
 
@@ -1144,4 +1132,62 @@ fn ipc_donation_floors_target_vruntime_and_never_raises_it() {
         999_999,
         "an idle-classed slot must never be donated to"
     );
+}
+
+/// The dual-authority sweep must be silent for a task executing on another
+/// CPU, and must still name a real disagreement about whether that task wants
+/// to run.
+///
+/// Dispatch clears the queued-since stamp on the exact task it selects, so a
+/// sweep that reads the stamp as "still wants to run" reports every remotely
+/// executing task as divergent. One vCPU never showed it because the sweep
+/// excludes the sweeping CPU's own current slot, which is the only executing
+/// task there is.
+#[test]
+fn the_authority_sweep_is_silent_for_a_task_executing_on_another_cpu() {
+    let mut scheduler = boxed_scheduler();
+    let slot = 2;
+    let task_id = 0x7311;
+    let process = test_process(0x7310);
+    scheduler.contexts[slot] = Some(test_user_context(process));
+    scheduler.starts[slot] = Some(TaskStart {
+        entry: noop_task_entry,
+        id: task_id,
+    });
+    // Exactly what dispatch leaves behind on the task it selected.
+    let context = scheduler.contexts[slot]
+        .as_mut()
+        .expect("remote execution context");
+    context.blocked = false;
+    context.ready_since_ticks = 0;
+    context.test_ready = false;
+    scheduler.current_task = super::ROOT_TASK_SLOT;
+    super::runqueue::admit_running(slot, 1);
+    let remote = super::super::cpu_local::install_test_current_owner(1, slot);
+
+    let _ = super::super::run_authority::take_window();
+    scheduler.sweep_run_authority();
+    assert_eq!(
+        super::super::run_authority::take_window(),
+        None,
+        "a task executing on another CPU is not a divergence"
+    );
+
+    // The same sweep must still catch the real disagreement: the owner word
+    // says the executing task wants to run and the legacy mirror says it
+    // blocked in place.
+    scheduler.contexts[slot]
+        .as_mut()
+        .expect("remote execution context")
+        .blocked = true;
+    scheduler.sweep_run_authority();
+    let (first, count) = super::super::run_authority::take_window()
+        .expect("a blocked-in-place mirror is a real divergence");
+    assert_eq!(count, 1);
+    assert_eq!(
+        first & 0xFFFF_FFFF,
+        super::super::run_authority::Mismatch::RunningRunnableBit as u64,
+    );
+
+    drop(remote);
 }

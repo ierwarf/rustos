@@ -581,6 +581,8 @@ mod tests {
             cpu: Some(2),
             generation: 7,
             runnable: true,
+            wait_reason_kind: 0,
+            wait_armed: false,
         };
         assert!(token.matches_owner_snapshot(live));
         assert!(
@@ -618,6 +620,8 @@ mod tests {
                 cpu: None,
                 generation: 9,
                 runnable: false,
+                wait_reason_kind: 0,
+                wait_armed: false,
             }),
             "retirement must not leave token dispatch authority"
         );
@@ -633,6 +637,8 @@ mod tests {
             cpu: Some(2),
             generation: 8,
             runnable: true,
+            wait_reason_kind: 0,
+            wait_armed: false,
         };
 
         assert!(state.enqueue(old));
@@ -695,6 +701,8 @@ mod tests {
             cpu: Some(2),
             generation: 8,
             runnable: true,
+            wait_reason_kind: 0,
+            wait_armed: false,
         };
 
         assert!(state.enqueue(reply));

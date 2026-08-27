@@ -6,37 +6,101 @@ command output win when they disagree with this page.
 
 ## Current checkout snapshot
 
-Recorded 2026-08-27. **This block is the only current-state section.** The
-working tree intentionally contains an uncommitted fast-IPC eligibility fix,
-its reason telemetry, a GNU-`install` portability repair for the Linux DVM
-wrapper, and the documentation updates that describe them. Do not infer a
+Recorded 2026-08-28. **This block is the only current-state section.** The
+pre-commit worktree carries the Phase-3 per-slot payload work, the
+owner-word wait state, and a performance slice that adds a per-class tracked-lock
+census, removes a debugcon write from inside the global scheduler guard, and
+takes the counted process retain off the current-task path. Do not infer a
 Phase-0--6 closure from the older archive below.
 
-- The current `pr` formal gate is sealed against this tree: 131 models, 70
-  flows, 726 transitions, 619 source-conformance checks, and 555/555
-  implementation mutations killed.
-- The fast call path now binds the exact reply scheduling-context custody
-  before it tests dispatch eligibility. The effective owner is therefore the
-  caller's donated context rather than an already-exhausted server-native
-  context; any later rejection follows the existing rollback/settlement path.
-- In fresh isolated KVM runs, `ipc_rt_cross_process_syscalld_getuid` was
-  67,920/73,400 cycles (min/p50) on one vCPU with 22,000/22,000 fast handoffs,
-  and 68,040/163,160 on eight vCPUs with 21,145 committed handoffs. The
-  eight-vCPU run recorded zero context-budget rejections, four domain-budget
-  rejections, twenty foreign-owner rejections, and twenty-nine scheduler
-  fallbacks.
-  Its p99 is desktop-contention-sensitive and is not a regression signal.
-- `sched_yield` measured 11,520/37,120 cycles on one vCPU and 9,120/10,240 on
-  eight vCPUs (min/p50). These isolated probes establish no simple dispatch
-  regression; they are not a concurrent runqueue-scaling proof. The remaining
-  `V5-SCHED-GLOBAL-001` work is still the per-task `Scheduler` data-structure
-  split, not a reason to remove its authority lock blindly.
+- The `pr` formal gate passes against this tree: 619 source-conformance
+  checks and **585/585** implementation mutations killed, every lane passing.
+  Any documentation edit after that run invalidates its source seal and the
+  final commit must reseal it.
+  `cargo test -p kernel-ps` passes 241 tests.
+- **Count lock classes, not one lock.** `work_budget::take_class_census()` plus
+  the `kernel-lock-class-0..5` milestones report tracked-lock acquisitions per
+  class per window. One synchronous round trip takes about forty-two of them,
+  and the most-acquired class was the **global process table** (~10.7/rt) --
+  ahead of the endpoint object, the reply object, and the scheduler catalog the
+  lane had been splitting (~4.0/rt).
+- **A debugcon record was being rendered inside the global scheduler guard.**
+  `scheduling-budget-exhausted` fired about sixty times a second from the
+  runtime accounting; a milestone is a VM exit per byte under KVM and its
+  emitter drains parked records first. Measured, instrumented build: the budget
+  charge went 5.9-27 us per dispatch to 0.02-0.03, the `Account` phase 244,085
+  us to 10,501 per window, and the guard's hold total 358,280 us to 146,492.
+  Shipping build: **minimum and p50 unmoved, mean -39%, p99 about -50%.** It is
+  a tail fix. The ceiling is now
+  `performance::SCHEDULER_GUARD_MAX_DEBUG_SINK_RECORDS = 0` with a source
+  witness.
+- **Own-thread process pin.** A running thread pins its own process object, so
+  `ProcessRef` now carries either a counted reference or an uncounted pin. The
+  pin re-reads the published state pointer instead of caching it, because an
+  exec replaces the object and no count holds the old one; every accessor
+  reachable from it validates the exact process and MM generation.
+  `ProcessTable` fell ~10.7 -> ~8.4 acquisitions per round trip.
+- **Where the round trip stands**, one vCPU, against this session's own
+  control: `ipc_rt_intra_process` min 47,700 -> **43,560--46,720**, p50
+  91,800 -> **75,200--83,360**. The historical best p99 is 5.65M, but three
+  final bounded reruns read **16.95M--17.20M**; report that repeated range, not
+  the best run. The pre-fix p99 was ~33M, so the tail improved materially but
+  remains host/KVM-deschedule sensitive.
+  `ipc_try_recv_empty` 6,360 -> 5,440. Cross-process `syscalld getuid` 59,040
+  -> 55,040. Full tables: `docs/benchmarks/README.md`.
+- **The 20,000-30,000 target is not met and no single change reaches it.** The
+  cost model the census supports, for the 44,000 minimum: three syscall floors
+  (~4,900), two scheduler dispatches (~15,000), three IPC syscall shells
+  (~11,500), and ~12,000 of copies and rendezvous. The next three slices, in
+  the order their measurements justify:
+  1. `with_exact_visible_state` calls `live_process_identity` on **every**
+     user-memory access and that still enters the global table. Publish the
+     process lifecycle state per slot with a divergence sweep, exactly as
+     `current_identity` was, and `ProcessTable` goes to roughly zero on the
+     hot path.
+  2. `IpcEndpoint` (~8.5/rt) and `IpcReply` (~6.5/rt): the endpoint and reply
+     objects are entered several times per syscall. Fuse the authorization
+     entry into the operation it authorizes.
+  3. The dispatch pair (~15,000 of 44,000). seL4's fastpath does not run the
+     scheduler at all; RustOS's direct handoff still traps into the full
+     dispatch pipeline.
+- **Do not try to make the tracked lock cheaper.** Per-acquisition attribution
+  is ~735 instrumented cycles spread evenly across admission, the held-class
+  stack, and release, with no dominant sub-phase. About forty-two acquisitions
+  per round trip makes tracked locking roughly 20,000 of the 43,880 minimum,
+  and the only lever is acquiring fewer. A direct-mapped hint over
+  `find_task_stack`'s occupancy scan -- the same shape that paid for the task
+  directory -- measured no change and was reverted.
+- **A fastpath hit is not automatically a speedup.** `ipcbench`'s two-syscall
+  server missed the rendezvous fastpath 79% of the time, every miss
+  `FallbackNoFrame` -- the receiver was not parked, which is seL4's precondition
+  too. The new `ipc_rt_intra_process_reply_recv` probe uses the fused
+  reply-and-receive call every production service uses and hits 22,002/22,002;
+  its **minimum is higher** (48,000 vs 44,000) and its p50 much lower (52,400 vs
+  73,520). Keep both probes; averaging them hides exactly this.
+- Performance invariants live in `libs/rustos-user-abi/src/performance.rs`
+  (named ceilings), `formal/check-performance-contracts.sh` (source witnesses),
+  and `formal/implementation-mutations.tsv` (host tests that *count*
+  something). Lock acquisitions are charged on the host path so a ceiling is
+  unit-testable; see
+  `process_table::tests::an_own_thread_pin_enters_the_global_process_table_zero_times`.
+- Ranked lock-class/site rendering is now compiled only with
+  `RUSTOS_LOCK_PHASE_PROFILE=true`. Leaving it on in a shipping image emitted
+  multiple debugcon records per second; at eight vCPUs the guest advanced only
+  about 13 seconds during a 90-second host timeout and never left ipcbench's
+  15-second isolation settle. The counters used by exact work-budget
+  assertions remain active; only destructive ranking, site rotation, and
+  rendering are diagnostic. The immediate eight-vCPU rerun completed: CPUID
+  p50 3,760, IPC min 62,560, p50 202,560, p99 36,698,960 cycles. That proves
+  liveness is restored, not that SMP latency improved; p50 is worse than the
+  prior 172,640--175,640 controls.
+- Runtime gates on the previous slice: `cargo xtask kvm-smoke --smp-iteration
+  --smp-ring3-qualification` passed at 1, 2, 4, and 8 vCPU with zero
+  run-authority mismatches and zero identity divergences. **Re-run the cohort
+  before claiming this slice.**
 - `docs/benchmarks/README.md` is the measurement record and
   `docs/ai/performance-hardening.md` owns the measurement rules. Both outrank
   this routing note and the historical archive.
-- Host `perf` is not installed. The package manager identifies `extra/perf`,
-  but installing it requires the interactive sudo password; do not substitute a
-  host profile of `xtask` or the QEMU wrapper for guest attribution.
 
 ## Session log
 
@@ -83,12 +147,14 @@ server uses; the plain `syscall_linux_rustos_ipc_recv` and combined
 choice). Full writeup: `docs/benchmarks/README.md`, "Instrumenting the
 receiver side".
 
-**Ablated in-session** (stub `now`/`charge` to constants, rebuild, boot,
-compare against the unstubbed build with the anchor held at +1.0%):
+**Historical four-site-only ablation** (stub `now`/`charge` to constants,
+rebuild, boot, compare against the unstubbed build with the anchor held at
++1.0%):
 `ipc_rt_intra_process` moved **-0.5% normalized** — inside the ±2% floor.
-Unlike `[lock_telemetry]`/`[scheduler_telemetry]`/`[syscall_telemetry]`
-(16-28% each), this one costs nothing measurable and ships **unconditional**,
-no `[ipc_telemetry]` gate needed.
+That result covered only receiver sites, not the caller's twelve TSC charges
+or fast-handoff shared counters. It no longer justifies shipping all IPC
+instrumentation unconditionally: `[ipc_telemetry] phase_profile` now gates the
+complete diagnostic unit.
 
 **Attribution:** all four land at 1.34x-1.35x per round trip under
 `--isolate-probe` — the same band as the caller's endpoint-call phases, for

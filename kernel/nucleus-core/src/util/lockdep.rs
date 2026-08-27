@@ -468,6 +468,7 @@ pub fn record_sleepable_acquire(owner: u64, class: u8) {
 /// returns. See [`irq_context_depth_on`].
 #[cfg(rustos_boot_image)]
 #[inline]
+#[track_caller]
 pub fn record_sleepable_acquire_on(cpu: usize, owner: u64, class: u8) {
     {
         assert!(owner != 0, "sleepable lock owner must be nonzero");
@@ -489,6 +490,7 @@ pub fn record_sleepable_acquire_on(cpu: usize, owner: u64, class: u8) {
         // no raw class held, which is exactly the condition a declared ceiling
         // on a sleepable class relies on.
         work_budget::charge_acquire(cpu, class_index);
+        work_budget::charge_site(class_index, Location::caller());
         dependency_graph::mark_class_irq_unsafe(class_index);
         with_task_stack(owner, true, |stack| {
             assert!(
@@ -1027,6 +1029,7 @@ fn before_acquire_with_irq_tracking(
     // declared ceiling -- see `work_budget::declare_identity_derivations_on`.
     let class_index = validate_class(class);
     work_budget::charge_acquire(cpu, class_index);
+    work_budget::charge_site(class_index, acquire_site);
     let profile_entry = lock_profile::now();
     if track_irq_usage {
         record_irq_usage(cpu, class_index, acquire_site);
@@ -1099,7 +1102,12 @@ fn before_acquire_with_irq_tracking(
 
 #[cfg(not(rustos_boot_image))]
 fn before_acquire(class: u8, _acquire_site: ()) -> PendingAcquire {
-    let _ = validate_class(class);
+    let class_index = validate_class(class);
+    // Charged on the host path too, which is what makes a lock-acquisition
+    // ceiling a unit-testable property rather than only a runtime census. A
+    // path that quietly reopens a global lock produces bytes nothing objects
+    // to; only a count does. See `work_budget::take_class_census`.
+    work_budget::charge_acquire(current_cpu_index(), class_index);
     PendingAcquire {}
 }
 

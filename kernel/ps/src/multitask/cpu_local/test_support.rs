@@ -12,7 +12,13 @@ static TEST_SCHEDULER_FOR_GUARD_RELEASE: TrackedSpinLock<
 /// through one process, so these white-box witnesses need the equivalent
 /// exclusion while they save and restore one CPU's publication words.
 pub(in super::super) fn test_publication_lock() -> std::sync::MutexGuard<'static, ()> {
-    TEST_PUBLICATION_LOCK.lock().unwrap()
+    // This guards disposable host fixtures.  Preserve the next test's
+    // ability to restore a clean publication snapshot after an assertion
+    // failure, so a single failed witness does not mask every later failure
+    // behind `PoisonError`.
+    TEST_PUBLICATION_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 pub(in super::super) struct TestCpuPublicationRestore {
@@ -112,7 +118,7 @@ pub(super) fn install_test_transition_owner_with_admission(
 /// Installs a synthetic current owner before a test drives the real guard
 /// release publication. The caller retains `test_publication_lock` until the
 /// restore guard drops.
-pub(super) fn install_test_current_owner(
+pub(in super::super) fn install_test_current_owner(
     logical_index: usize,
     slot: usize,
 ) -> TestCpuPublicationRestore {

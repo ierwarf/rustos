@@ -103,6 +103,13 @@ phase_profile = false
 # the cost of an instrumented syscall, not of a syscall.
 phase_profile = false
 
+[ipc_telemetry]
+# Caller/receiver IPC phase attribution and fast-handoff counters read the TSC
+# and update shared atomics along every synchronous request. Keep the shipping
+# image free of that cache traffic; enable it only for a bounded diagnosis run:
+# `RUSTOS_IPC_PHASE_PROFILE=true cargo xtask bench --isolate-probe <probe>`.
+phase_profile = false
+
 [lifecycle_telemetry]
 # Emits an exact checksum-framed marker for spawn/exec/exit/reap stages. Each
 # marker carries process slot+generation, MM generation, and a non-reusable

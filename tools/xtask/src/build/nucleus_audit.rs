@@ -28,7 +28,7 @@
 //! So the kernel gets to keep the user's FPU state only while three properties
 //! hold of the linked image:
 //!
-//! 1. no x87 instruction executes in the kernel;
+//! 1. no x87 instruction executes after the 64-bit bootstrap entry;
 //! 2. no floating-point *arithmetic* instruction executes in the kernel, since
 //!    those are what write `MXCSR`'s status flags; and
 //! 3. every VEX/EVEX-encoded instruction sits inside a function that runs under
@@ -86,6 +86,12 @@ const WIDE_SIMD_ALLOWLIST: &[(&str, &str)] = &[
 /// behalf of a user task, which is the one legitimate reason for x87 state to
 /// be named in kernel code.
 const X87_CUSTODY_MNEMONICS: &[&str] = &["fxsave", "fxsave64", "fxrstor", "fxrstor64"];
+
+/// `_start` is the 32-bit Multiboot transition stub.  `objdump` decodes its
+/// far jump as 64-bit bytes and can manufacture an x87 mnemonic from the
+/// jump offset.  It runs before the kernel can return to a user register set,
+/// so the post-entry custody contract begins at `rustos_multiboot_long_mode`.
+const MULTIBOOT32_BOOTSTRAP_SYMBOL: &str = "_start";
 
 /// Mnemonics that end in an SSE/AVX floating-point suffix but perform no
 /// arithmetic, so they cannot write an `MXCSR` status flag.
@@ -222,6 +228,9 @@ fn audit_disassembly(listing: &str) -> SimdCustodyReport {
         let Some(mnemonic) = instruction_mnemonic(line) else {
             continue;
         };
+        if symbol == MULTIBOOT32_BOOTSTRAP_SYMBOL {
+            continue;
+        }
         report.instructions += 1;
 
         if is_x87(mnemonic) {
@@ -455,6 +464,19 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["fldl", "fmul", "fstpl"],
         );
+    }
+
+    #[test]
+    fn skips_only_the_pre_user_32_bit_bootstrap_decode_artifact() {
+        let report = audit_disassembly(&listing(
+            "ffffffff80100000 <_start>:\n\
+             ffffffff80100000:\t(bad)\n\
+             ffffffff80100001:\tfidivl (%rax,%rax,1)\n\
+             ffffffff80100005 <rustos_multiboot_long_mode>:\n\
+             ffffffff80100005:\tret\n",
+        ));
+        assert_eq!(report.instructions, 1);
+        assert!(report.x87.is_empty());
     }
 
     #[test]

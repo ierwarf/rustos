@@ -1,4 +1,5 @@
 use alloc::boxed::Box;
+use core::ops::{Deref, DerefMut};
 
 use super::{
     BlockReason, ConsoleSessionHandle, FastIpcCallHandoffOutcome, FastIpcReplyHandoffOutcome,
@@ -26,6 +27,34 @@ impl Drop for RunqueuePublicationReset {
     }
 }
 
+/// One host scheduler fixture owns the globally published runqueue and
+/// CPU-local execution witnesses for its complete lifetime.  Production uses
+/// per-CPU ownership; unit schedulers deliberately share these backing words
+/// so their white-box proof must serialize and reset them as one custody
+/// domain.  Keeping the guard with the heap scheduler prevents a later test
+/// from clearing a live fixture between allocation and its final assertion.
+pub(super) struct SchedulerTestFixture {
+    scheduler: Box<Scheduler>,
+    _runqueue_reset: RunqueuePublicationReset,
+    _runqueue_serial: std::sync::MutexGuard<'static, ()>,
+    _cpu_publication: std::sync::MutexGuard<'static, ()>,
+    _process_table: process_table::tests::ProcessTableTestIsolation,
+}
+
+impl Deref for SchedulerTestFixture {
+    type Target = Scheduler;
+
+    fn deref(&self) -> &Self::Target {
+        &self.scheduler
+    }
+}
+
+impl DerefMut for SchedulerTestFixture {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.scheduler
+    }
+}
+
 #[test]
 fn kernel_stack_top_is_aligned_for_sysv_rust_calls() {
     for low_bits in 0..16 {
@@ -47,7 +76,6 @@ fn architectural_restore_is_required_exactly_for_a_task_switch() {
 
 #[test]
 fn slot_identity_keeps_exact_user_pid_and_tid_together() {
-    let _process_table = process_table::tests::isolate_process_table();
     let mut scheduler = boxed_scheduler();
     let process = test_process(0x1a2b);
     let slot = 1;
@@ -67,7 +95,6 @@ fn slot_identity_keeps_exact_user_pid_and_tid_together() {
 
 #[test]
 fn task_slot_hint_collisions_and_stale_entries_fall_back_to_exact_identity() {
-    let _process_table = process_table::tests::isolate_process_table();
     let mut scheduler = boxed_scheduler();
     let process = test_process(0x1a2c);
     let first_slot = 2;
@@ -95,7 +122,6 @@ fn task_slot_hint_collisions_and_stale_entries_fall_back_to_exact_identity() {
 
 #[test]
 fn ipc_admission_exports_only_the_live_bound_scheduling_context() {
-    let _process_table = process_table::tests::isolate_process_table();
     let mut scheduler = boxed_scheduler();
     let process = test_process(0x510);
     let slot = 3;
@@ -132,7 +158,6 @@ fn ipc_admission_exports_only_the_live_bound_scheduling_context() {
 
 #[test]
 fn nested_passive_server_runtime_is_billed_to_the_root_caller_context() {
-    let _process_table = process_table::tests::isolate_process_table();
     let mut scheduler = boxed_scheduler();
     let root_policy = super::scheduling_context::SchedulingContextPolicy {
         budget_ns: 4_000,
@@ -279,7 +304,11 @@ fn production_user_slot_publication_rejects_an_unbudgeted_context() {
     assert!(production.contains("return None;"));
 }
 
-pub(super) fn boxed_scheduler() -> Box<Scheduler> {
+pub(super) fn boxed_scheduler() -> SchedulerTestFixture {
+    let process_table = process_table::tests::isolate_process_table();
+    let cpu_publication = super::super::cpu_local::test_publication_lock();
+    let runqueue_serial = super::runqueue::test_serial_guard();
+    super::runqueue::reset_before_publication();
     let mut scheduler = Box::<Scheduler>::new_uninit();
     unsafe {
         // The const template owns no heap allocation: every Vec-bearing
@@ -291,7 +320,13 @@ pub(super) fn boxed_scheduler() -> Box<Scheduler> {
             scheduler.as_mut_ptr(),
             1,
         );
-        scheduler.assume_init()
+        SchedulerTestFixture {
+            scheduler: scheduler.assume_init(),
+            _runqueue_reset: RunqueuePublicationReset,
+            _runqueue_serial: runqueue_serial,
+            _cpu_publication: cpu_publication,
+            _process_table: process_table,
+        }
     }
 }
 
@@ -417,7 +452,6 @@ fn live_noncurrent_task_must_retain_one_scheduler_state_owner() {
 
 #[test]
 fn collect_process_sibling_slots_returns_matching_user_slots_only() {
-    let _process_table = process_table::tests::isolate_process_table();
     let mut scheduler = boxed_scheduler();
     let owner = test_process(1);
     let other = test_process(2);
@@ -442,7 +476,6 @@ fn collect_process_sibling_slots_returns_matching_user_slots_only() {
 
 #[test]
 fn process_stop_is_scheduler_wide_and_sigcont_resumes_before_delivery() {
-    let _process_table = process_table::tests::isolate_process_table();
     let mut scheduler = boxed_scheduler();
     let process = test_process(48);
     process_table::attach_task(process).expect("second thread");
@@ -489,7 +522,6 @@ fn process_stop_is_scheduler_wide_and_sigcont_resumes_before_delivery() {
 
 #[test]
 fn unmasked_signal_revokes_a_pending_block_arm() {
-    let _process_table = process_table::tests::isolate_process_table();
     let mut scheduler = boxed_scheduler();
     let process = test_process(52);
     let mut context = test_user_context(process);
@@ -518,7 +550,6 @@ fn unmasked_signal_revokes_a_pending_block_arm() {
 
 #[test]
 fn process_sigchld_prefers_leader_and_retains_exact_coalesced_causes() {
-    let _process_table = process_table::tests::isolate_process_table();
     let mut scheduler = boxed_scheduler();
     let process = test_process(50);
     process_table::attach_task(process).expect("second thread");
@@ -589,7 +620,6 @@ fn process_sigchld_prefers_leader_and_retains_exact_coalesced_causes() {
 
 #[test]
 fn terminate_user_process_retires_every_live_sibling() {
-    let _process_table = process_table::tests::isolate_process_table();
     let mut scheduler = boxed_scheduler();
     let owner = test_process(41);
     let other = test_process(42);
@@ -619,7 +649,6 @@ fn terminate_user_process_retires_every_live_sibling() {
 
 #[test]
 fn terminating_the_last_task_marks_its_process_exiting() {
-    let _process_table = process_table::tests::isolate_process_table();
     let mut scheduler = boxed_scheduler();
     let owner = test_process(45);
     scheduler.contexts[1] = Some(test_user_context(owner));
@@ -635,7 +664,6 @@ fn terminating_the_last_task_marks_its_process_exiting() {
 
 #[test]
 fn retirement_revokes_task_and_process_ipc_authority() {
-    let _process_table = process_table::tests::isolate_process_table();
     let mut scheduler = boxed_scheduler();
     let owner = test_process(94);
     scheduler.contexts[1] = Some(test_user_context(owner));
@@ -694,7 +722,6 @@ fn retirement_revokes_task_and_process_ipc_authority() {
 
 #[test]
 fn retired_user_slot_waits_for_exact_runtime_cleanup_ack() {
-    let _process_table = process_table::tests::isolate_process_table();
     let mut scheduler = boxed_scheduler();
     let owner = test_process(96);
     scheduler.contexts[1] = Some(test_user_context(owner));
@@ -751,7 +778,6 @@ fn retired_user_slot_waits_for_exact_runtime_cleanup_ack() {
 
 #[test]
 fn retirement_cleanup_stamps_process_terminal_only_on_last_live_thread() {
-    let _process_table = process_table::tests::isolate_process_table();
     let mut scheduler = boxed_scheduler();
     let owner = test_process(97);
     scheduler.contexts[1] = Some(test_user_context(owner));
@@ -783,7 +809,6 @@ fn retirement_cleanup_stamps_process_terminal_only_on_last_live_thread() {
 
 #[test]
 fn exec_sibling_slot_stays_quarantined_until_runtime_cleanup() {
-    let _process_table = process_table::tests::isolate_process_table();
     let mut scheduler = boxed_scheduler();
     let owner = test_process(98);
     scheduler.contexts[1] = Some(test_user_context(owner));
@@ -813,7 +838,6 @@ fn exec_sibling_slot_stays_quarantined_until_runtime_cleanup() {
 
 #[test]
 fn exec_rejects_slot_with_unconsumed_side_effect_token() {
-    let _process_table = process_table::tests::isolate_process_table();
     let mut scheduler = boxed_scheduler();
     let owner = test_process(0xeca1);
     let slot = 1;
@@ -861,7 +885,6 @@ fn exec_rejects_slot_with_unconsumed_side_effect_token() {
 
 #[test]
 fn rejected_thread_attachment_releases_unpublished_stack() {
-    let _process_table = process_table::tests::isolate_process_table();
     let mut scheduler = boxed_scheduler();
     let owner = test_process(95);
     scheduler.current_task = 1;
@@ -874,7 +897,6 @@ fn rejected_thread_attachment_releases_unpublished_stack() {
 
 #[test]
 fn synchronous_ipc_donation_promotes_and_revokes_a_transitive_user_chain() {
-    let _process_table = process_table::tests::isolate_process_table();
     let mut scheduler = boxed_scheduler();
     let interactive = test_process(61);
     let broker = test_process(62);
@@ -1033,8 +1055,6 @@ fn synchronous_ipc_donation_promotes_and_revokes_a_transitive_user_chain() {
 
 #[test]
 fn scheduler_block_arm_is_exact_race_safe_and_terminally_revoked() {
-    let _process_table = process_table::tests::isolate_process_table();
-    let _publication_lock = super::super::cpu_local::test_publication_lock();
     let mut scheduler = boxed_scheduler();
     let base = crate::memory::paging::USER_SPACE_BASE;
     let user_cs = crate::arch::gdt::user_code_selector().0 as u64;

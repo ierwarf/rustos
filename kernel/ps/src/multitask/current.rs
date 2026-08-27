@@ -16,6 +16,19 @@
 //!   `monotonic-deadline-lifecycle`, and `user-memory-access`.
 use x86_64::{VirtAddr, instructions::interrupts};
 
+mod ipc;
+
+pub use ipc::{
+    arm_block_current_task, arm_block_current_task_on_endpoint, arm_block_current_task_on_reply,
+    attach_reserved_ipc_priority, bind_ipc_priority_to_process_worker, bind_reserved_ipc_priority,
+    cancel_block_current_task, cancel_ipc_priority_reservation,
+    complete_fast_ipc_reply_wake_handoff_with_custody, complete_ipc_reply_wake_handoff,
+    complete_ipc_reply_wake_handoff_with_custody, demote_current_user_task_to_user_class,
+    inherit_ipc_priority, release_ipc_priorities_for_process, release_ipc_priority,
+    reserve_ipc_call_donation, reserve_ipc_priority, settle_ipc_reply_scheduling_context,
+    task_has_system_scheduling_class, wake_task,
+};
+
 use super::cpu_local;
 use super::{
     CurrentUserSnapshot, RetainedCurrentUserAddressSpace, RetainedCurrentUserProcessState,
@@ -74,16 +87,45 @@ impl CurrentUserSnapshot {
     }
 }
 
+/// Binds the current task's own address space for one syscall.
+///
+/// The calling thread already pins its process object, so this takes no
+/// reference count: the retain and its release were two acquisitions of the
+/// one global process table, and the per-class census measured that table as
+/// the most-acquired lock class under a synchronous IPC round trip. Every
+/// accessor on the returned value validates the exact process and MM
+/// generation, which is what makes the uncounted pin safe across an exec.
 pub fn current_user_address_space() -> Option<RetainedCurrentUserAddressSpace> {
-    let (thread_id, abi, process) = retain_current_user_process_binding()?;
+    let entry = user_copy_profile::now();
+    let (thread_id, abi, process_handle, _) = interrupts::without_interrupts(|| {
+        if let Some(identity) = published_current_identity() {
+            return identity.user_binding();
+        }
+        // SAFETY: interrupts are masked, so the current slot is stable.
+        unsafe { scheduler_ref().current_user_process_binding() }
+    })?;
+    let identified =
+        user_copy_profile::charge(user_copy_profile::UserCopyPhase::BindIdentity, entry);
+    let process_id = published_current_identity_process_id(process_handle)?;
+    let process = process_table::own_process_ref(process_handle, process_id)?;
     let identity = process.live_identity()?;
+    user_copy_profile::charge(user_copy_profile::UserCopyPhase::BindRetain, identified);
     Some(RetainedCurrentUserAddressSpace {
         abi,
-        process_id: process.process_id(),
+        process_id,
         thread_id,
         identity,
         process,
     })
+}
+
+/// The current task's published process id, when it names the same process
+/// handle the binding did.
+fn published_current_identity_process_id(handle: process_table::ProcessHandle) -> Option<u64> {
+    let identity = interrupts::without_interrupts(published_current_identity)?;
+    (identity.process_handle == Some(handle))
+        .then_some(identity.process_id)
+        .flatten()
 }
 
 pub fn current_user_id() -> Option<u64> {
@@ -233,8 +275,20 @@ fn published_current_user_log_ids() -> Option<Option<(u64, u64)>> {
     published_current_identity()?.complete_user_log_ids()
 }
 
+/// Log identity for an exact task, which the IPC receive path writes back to
+/// the server for every request it takes.
+///
+/// The published per-slot record answers this without the catalog guard
+/// whenever the shared task directory still resolves the id; a stale, absent,
+/// or terminal slot falls back to the authoritative locked lookup.
 pub fn user_log_ids_for_task(task_id: u64) -> Option<(u64, u64)> {
-    interrupts::without_interrupts(|| unsafe { scheduler_ref().user_log_ids_for_task(task_id) })
+    interrupts::without_interrupts(|| {
+        if let Some(published) = super::scheduler::published_user_log_ids(task_id) {
+            return published;
+        }
+        // SAFETY: interrupts are masked and no scheduler-owned reference escapes.
+        unsafe { scheduler_ref().user_log_ids_for_task(task_id) }
+    })
 }
 
 pub fn current_user_process_id() -> Option<u64> {
@@ -447,219 +501,6 @@ pub fn wake_user_task(task_id: u64) -> bool {
         return super::deferred_wake::defer_current_cpu(task_id);
     }
     interrupts::without_interrupts(|| unsafe { scheduler_mut().wake_user_task(task_id) })
-}
-
-/// Arms a race-free block on the current task; must be paired with
-/// `commit_block_current_task`. Returns false if the slot is invalid or this is
-/// the root task.
-pub fn arm_block_current_task() -> bool {
-    interrupts::without_interrupts(|| unsafe { scheduler_mut().arm_block_current_task() })
-}
-
-/// Arms the current task for one exact endpoint receive epoch. Only this typed
-/// wait may be consumed by the same-CPU direct IPC handoff path.
-pub fn arm_block_current_task_on_endpoint(endpoint: u64) -> bool {
-    interrupts::without_interrupts(|| unsafe {
-        scheduler_mut().arm_block_current_task_on_endpoint(endpoint)
-    })
-}
-
-/// Arms the caller for one exact synchronous reply epoch.  The typed reason is
-/// consumed by the fast rendezvous commit; ordinary wake/block code preserves
-/// its existing race semantics.
-pub fn arm_block_current_task_on_reply(reply: u64) -> bool {
-    interrupts::without_interrupts(|| unsafe {
-        scheduler_mut().arm_block_current_task_on_reply(reply)
-    })
-}
-
-/// Cancels a previously armed block without marking the current task blocked.
-pub fn cancel_block_current_task() -> bool {
-    interrupts::without_interrupts(|| unsafe { scheduler_mut().cancel_block_current_task() })
-}
-
-pub fn wake_task(task_id: u64) -> bool {
-    if nucleus_core::util::lockdep::preemption_disabled() {
-        return super::deferred_wake::defer_current_cpu(task_id);
-    }
-    interrupts::without_interrupts(|| unsafe { scheduler_mut().wake_task(task_id) })
-}
-
-/// Permanently removes the current user task's base System-class admission and
-/// caps its permanent fair weight without ever increasing a lower weight. A
-/// reply-scoped IPC priority donation, if any, remains owned by that reply
-/// capability and therefore remains effective until the normal release path.
-pub fn demote_current_user_task_to_user_class() -> bool {
-    interrupts::without_interrupts(|| unsafe {
-        scheduler_mut().demote_current_user_task_to_user_class()
-    })
-}
-
-/// Reports whether `task_id` currently carries the kernel's effective System
-/// class, including a live reply-scoped donation. This value is sampled before
-/// endpoint enqueue; the reply capability remains the authoritative donation
-/// lifetime after publication.
-pub fn task_has_system_scheduling_class(task_id: u64) -> bool {
-    interrupts::without_interrupts(|| unsafe {
-        scheduler_ref().task_has_system_scheduling_class(task_id)
-    })
-}
-
-/// Associates a live synchronous IPC reply with a caller-to-server priority
-/// donation. The reply/cancellation paths revoke it before waking the caller.
-pub fn inherit_ipc_priority(reply: u64, donor_task_id: u64, receiver_task_id: u64) -> bool {
-    interrupts::without_interrupts(|| unsafe {
-        scheduler_mut().inherit_ipc_priority(reply, donor_task_id, receiver_task_id)
-    })
-}
-
-/// One scheduler acquisition for the class query and the reservation an IPC
-/// call needs before it can enqueue. See [`scheduler::IpcCallAdmission`].
-pub fn reserve_ipc_call_donation(donor_task_id: u64) -> super::scheduler::IpcCallAdmission {
-    // SAFETY: interrupt exclusion and the scheduler access guard serialize the
-    // exact class query and donor reservation; no borrow escapes.
-    interrupts::without_interrupts(|| unsafe {
-        scheduler_mut().reserve_ipc_call_donation(donor_task_id)
-    })
-}
-
-pub fn reserve_ipc_priority(donor_task_id: u64) -> bool {
-    // SAFETY: interrupt exclusion and the scheduler access guard serialize the
-    // exact donor reservation; no scheduler-owned reference escapes.
-    interrupts::without_interrupts(|| unsafe {
-        scheduler_mut().reserve_ipc_priority(donor_task_id)
-    })
-}
-
-pub fn cancel_ipc_priority_reservation(donor_task_id: u64) -> bool {
-    // SAFETY: interrupt exclusion and the scheduler access guard serialize the
-    // exact donor reservation cancellation; no borrow escapes.
-    interrupts::without_interrupts(|| unsafe {
-        scheduler_mut().cancel_ipc_priority_reservation(donor_task_id)
-    })
-}
-
-pub fn attach_reserved_ipc_priority(reply: u64, donor_task_id: u64) -> bool {
-    // SAFETY: interrupt exclusion and the scheduler access guard transfer one
-    // temporary donor reservation to one immutable reply identity.
-    interrupts::without_interrupts(|| unsafe {
-        scheduler_mut().attach_reserved_ipc_priority(reply, donor_task_id)
-    })
-}
-
-pub fn bind_reserved_ipc_priority(reply: u64, donor_task_id: u64, receiver_task_id: u64) -> bool {
-    // SAFETY: interrupt exclusion and the scheduler access guard make binding
-    // the reserved donor to one reply/receiver an atomic scheduler mutation.
-    interrupts::without_interrupts(|| unsafe {
-        scheduler_mut().bind_reserved_ipc_priority(reply, donor_task_id, receiver_task_id)
-    })
-}
-
-/// Selects and binds one exact worker for a process-owned endpoint in the same
-/// scheduler transaction that reserves its reply-scoped donation.
-pub fn bind_ipc_priority_to_process_worker(
-    reply: u64,
-    donor_task_id: u64,
-    receiver_process_id: u64,
-) -> Option<u64> {
-    interrupts::without_interrupts(|| unsafe {
-        scheduler_mut().bind_ipc_priority_to_process_worker(
-            reply,
-            donor_task_id,
-            receiver_process_id,
-        )
-    })
-}
-
-/// Revokes the bounded priority donation owned by a completed or cancelled IPC
-/// reply capability. It is safe to call more than once for terminal races.
-pub fn release_ipc_priority(reply: u64) -> bool {
-    interrupts::without_interrupts(|| super::scheduler::release_reply_donation(reply))
-}
-
-/// Returns the exact caller scheduling-context custody carried by one terminal
-/// reply. The IPC runtime guarantees one-shot extraction; PS revalidates the
-/// live slot/generation before releasing any reply-scoped donation state.
-pub fn settle_ipc_reply_scheduling_context(
-    reply: u64,
-    custody: kernel_ipc_runtime::api::ReplySchedulingContextCustody,
-) -> bool {
-    let identity = custody.identity();
-    let valid = interrupts::without_interrupts(|| unsafe {
-        scheduler_ref().scheduling_context_matches(custody.context_owner_task_id(), identity)
-    });
-    let _ = interrupts::without_interrupts(|| super::scheduler::release_reply_donation(reply));
-    valid
-}
-
-pub fn complete_ipc_reply_wake_handoff_with_custody(
-    reply: u64,
-    completion: kernel_ipc_runtime::api::ReplyCompletion,
-) -> bool {
-    let custody = completion
-        .scheduling_context
-        .expect("synchronous IPC reply completed without scheduling-context custody");
-    assert_eq!(
-        custody.caller_task_id(),
-        completion.caller_task_id,
-        "reply returned scheduling-context custody to a different caller"
-    );
-    assert!(
-        settle_ipc_reply_scheduling_context(reply, custody),
-        "reply returned stale scheduling-context custody"
-    );
-    complete_ipc_reply_wake_handoff(reply, completion.caller_task_id)
-}
-
-pub fn complete_fast_ipc_reply_wake_handoff_with_custody(
-    reply: u64,
-    completion: kernel_ipc_runtime::api::ReplyCompletion,
-) -> bool {
-    let custody = completion
-        .scheduling_context
-        .expect("fast synchronous IPC reply completed without scheduling-context custody");
-    assert_eq!(
-        custody.caller_task_id(),
-        completion.caller_task_id,
-        "fast reply returned scheduling-context custody to a different caller"
-    );
-    let outcome = interrupts::without_interrupts(|| unsafe {
-        scheduler_mut().settle_and_complete_fast_ipc_reply_handoff(
-            reply,
-            completion.caller_task_id,
-            custody.context_owner_task_id(),
-            custody.identity(),
-        )
-    })
-    .expect("fast reply returned stale scheduling-context custody");
-    match outcome {
-        super::scheduler::FastIpcReplyHandoffOutcome::Direct
-        | super::scheduler::FastIpcReplyHandoffOutcome::LocalFallback => true,
-        super::scheduler::FastIpcReplyHandoffOutcome::Rejected => {
-            complete_ipc_reply_wake_handoff(reply, completion.caller_task_id)
-        }
-    }
-}
-
-/// Completes the scheduling side of a terminal reply with one Scheduler
-/// acquisition, then publishes only its opaque exact wake token to the
-/// target CPU's handoff owner.  A stale token deliberately loses urgency; it
-/// never falls back to the catalog hint path and cannot create execution
-/// authority.
-pub fn complete_ipc_reply_wake_handoff(reply: u64, task_id: u64) -> bool {
-    let _ = interrupts::without_interrupts(|| super::scheduler::release_reply_donation(reply));
-    let token = interrupts::without_interrupts(|| unsafe {
-        scheduler_mut().complete_ipc_reply_wake_handoff(reply, task_id)
-    });
-    interrupts::without_interrupts(|| {
-        token.is_some_and(super::scheduler::enqueue_reply_wake_handoff)
-    })
-}
-
-pub fn release_ipc_priorities_for_process(process_id: u64) {
-    interrupts::without_interrupts(|| unsafe {
-        scheduler_mut().release_ipc_priorities_for_process(process_id)
-    });
 }
 
 /// Biases the next scheduler pick toward `task_id`. Combine with `wake_task` +
@@ -1145,6 +986,13 @@ pub fn any_user_process_state(mut f: impl FnMut(u64, &UserProcessState) -> bool)
     false
 }
 
+/// Binds the current task's own process for one syscall.
+///
+/// The calling thread pins its own process object, so this takes no reference
+/// count. See [`current_user_address_space`] and
+/// `rustos_user_abi::performance::IPC_SYSCALL_MAX_PROCESS_TABLE_ACQUISITIONS`
+/// for why the two acquisitions a retain/release pair costs are worth
+/// removing, and `process_table::own_process_ref` for why the pin is sound.
 fn retain_current_user_process_binding() -> Option<(u64, UserAbi, process_table::ProcessRef)> {
     let entry = user_copy_profile::now();
     let (thread_id, abi, process_handle, _) = interrupts::without_interrupts(|| {
@@ -1156,7 +1004,12 @@ fn retain_current_user_process_binding() -> Option<(u64, UserAbi, process_table:
     })?;
     let identified =
         user_copy_profile::charge(user_copy_profile::UserCopyPhase::BindIdentity, entry);
-    let process = process_table::retain_process(process_handle)?;
+    let process = match published_current_identity_process_id(process_handle) {
+        Some(process_id) => process_table::own_process_ref(process_handle, process_id)?,
+        // A slot whose published record is incomplete or mid-update cannot
+        // prove the pin's premise, so it pays the counted retain.
+        None => process_table::retain_process(process_handle)?,
+    };
     user_copy_profile::charge(user_copy_profile::UserCopyPhase::BindRetain, identified);
     Some((thread_id, abi, process))
 }
@@ -1178,7 +1031,12 @@ fn retain_current_linux_thread_binding() -> Option<RetainedLinuxThreadBinding> {
 fn retain_current_process_ref() -> Option<process_table::ProcessRef> {
     let process_handle =
         interrupts::without_interrupts(|| unsafe { scheduler_ref().current_process_handle() })?;
-    process_table::retain_process(process_handle)
+    // Same own-thread pin as `retain_current_user_process_binding`; a slot the
+    // published record cannot vouch for still pays the counted retain.
+    match published_current_identity_process_id(process_handle) {
+        Some(process_id) => process_table::own_process_ref(process_handle, process_id),
+        None => process_table::retain_process(process_handle),
+    }
 }
 
 pub fn retire_current_user_task_due_to_fault(

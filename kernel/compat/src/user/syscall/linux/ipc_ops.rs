@@ -33,6 +33,7 @@ use core::mem::size_of;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 pub(super) use diagnostics::diagnostic_rate_limit_permit;
 use diagnostics::record_ipc_reply_rejection;
+#[cfg(rustos_ipc_phase_profile)]
 pub(super) use ipc_fast_metrics::drain_fast_ipc_counters;
 use ipc_fast_metrics::{IpcFastCounter, note_fast_ipc, note_fast_ipc_handoff_rejection};
 use reply_wait::wait_for_reply_with_deadline;
@@ -2165,7 +2166,7 @@ fn recv_with_sender_blocking_prepared(
                         // the block would let a sender hand this endpoint's next
                         // request to a task that is not waiting for it, and no
                         // other receiver would be woken. Withdraw it first.
-                        kernel_ipc_runtime::api::remove_endpoint_waiters_for_task(task_id);
+                        kernel_ipc_runtime::api::remove_endpoint_waiter_for_task(endpoint, task_id);
                         let _ = multitask::cancel_block_current_task();
                         return Err((LINUX_EBUSY, yielded));
                     }
@@ -2177,7 +2178,7 @@ fn recv_with_sender_blocking_prepared(
                     // endpoint's receiver list; a timer wake did not. Withdraw
                     // unconditionally - the second removal is a no-op, while a
                     // missed one is a permanently misrouted wake.
-                    kernel_ipc_runtime::api::remove_endpoint_waiters_for_task(task_id);
+                    kernel_ipc_runtime::api::remove_endpoint_waiter_for_task(endpoint, task_id);
                 }
                 match committed {
                     Some(true) => yielded = true,

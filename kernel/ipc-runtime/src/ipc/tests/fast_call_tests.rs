@@ -191,3 +191,70 @@ fn fast_call_cancel_and_endpoint_failure_have_one_terminal_owner() {
         );
     });
 }
+
+/// Acquisitions of the endpoint slab lock during `body`.
+///
+/// A performance invariant needs a number: both forms below produce the same
+/// waiter list, so nothing but a count distinguishes touching one object from
+/// walking every slot of the slab.
+fn endpoint_lock_acquisitions_during<R>(body: impl FnOnce() -> R) -> (R, u64) {
+    let class = nucleus_core::util::lockdep::LockClass::IpcEndpoint as usize;
+    let _ = nucleus_core::util::lockdep::work_budget::take_class_census();
+    let value = body();
+    let census = nucleus_core::util::lockdep::work_budget::take_class_census();
+    (value, census[class])
+}
+
+/// The exact withdrawal enters the slab once; the whole-slab form enters it
+/// once per slot, which is what made it the most-acquired endpoint site.
+#[test]
+fn an_exact_waiter_withdrawal_enters_the_slab_once() {
+    with_isolated_ipc_test(|| {
+        let endpoint = super::super::create_endpoint().expect("create endpoint");
+        super::super::add_endpoint_receiver_waiter(endpoint, 31).expect("park");
+        let (removed, exact) = endpoint_lock_acquisitions_during(|| {
+            super::super::remove_endpoint_waiter_for_task(endpoint, 31)
+        });
+        assert_eq!(removed, 1);
+        assert_eq!(exact, 1, "an exact withdrawal must enter the slab once");
+
+        super::super::add_endpoint_receiver_waiter(endpoint, 31).expect("park again");
+        let (removed, walked) = endpoint_lock_acquisitions_during(|| {
+            super::super::remove_endpoint_waiters_for_task(31)
+        });
+        assert_eq!(removed, 1);
+        assert!(
+            walked > exact * 8,
+            "the whole-slab form is expected to enter once per slot, got {walked}"
+        );
+    });
+}
+
+/// A receive that abandons its own wait knows which endpoint it was parked on.
+/// The whole-slab form acquires the slab lock once per slot -- 512 of them --
+/// and exists for a retiring task that does not know; taking it on the receive
+/// path made it the most-acquired endpoint site in the system for a removal
+/// that touches one object.
+#[test]
+fn withdrawing_one_waiter_touches_only_its_own_endpoint() {
+    with_isolated_ipc_test(|| {
+        let parked = super::super::create_endpoint().expect("create endpoint");
+        let other = super::super::create_endpoint().expect("create second endpoint");
+        super::super::add_endpoint_receiver_waiter(parked, 21).expect("park on the first");
+        super::super::add_endpoint_receiver_waiter(other, 21).expect("park on the second");
+
+        assert_eq!(super::super::remove_endpoint_waiter_for_task(parked, 21), 1);
+        // The exact form must not reach the endpoint it was not given.
+        assert_eq!(super::super::remove_endpoint_waiter_for_task(parked, 21), 0);
+        assert_eq!(super::super::remove_endpoint_waiters_for_task(21), 1);
+
+        // An unknown endpoint is a no-op, not a panic and not a slab walk.
+        assert_eq!(
+            super::super::remove_endpoint_waiter_for_task(
+                super::super::KernelEndpointHandle::from_raw(0xdead_beef),
+                21
+            ),
+            0
+        );
+    });
+}

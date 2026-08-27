@@ -102,7 +102,29 @@ impl ProcessHandle {
 pub struct ProcessRef {
     handle: ProcessHandle,
     process_id: u64,
-    state_ptr: NonNull<ProcessStateLock<UserProcessState>>,
+    pin: ProcessRefPin,
+}
+
+/// What keeps a [`ProcessRef`]'s object reachable.
+///
+/// The global table covers every process, and retain plus release acquire it
+/// twice. IPC measured roughly ten such acquisitions per round trip, mostly
+/// from running threads redundantly counting their own already-pinned process.
+#[derive(Clone, Copy)]
+enum ProcessRefPin {
+    /// A reference counted in the table. The state pointer is fixed for the
+    /// reference's lifetime because the count keeps that exact object alive.
+    Counted(NonNull<ProcessStateLock<UserProcessState>>),
+    /// The caller's own live thread pins the object: `reclaim_slot` refuses
+    /// while `thread_count != 0`, so no count is needed and neither
+    /// acquisition happens.
+    ///
+    /// The state pointer is re-read on every access rather than cached,
+    /// because an exec replaces the object and no count holds the old one.
+    /// Every accessor reachable from this pin validates the exact process and
+    /// MM generation before it uses the state, so a replaced object is
+    /// rejected rather than silently used.
+    OwnThread,
 }
 
 /// Generation-bound authority for one exec ownership transfer.
@@ -195,20 +217,45 @@ impl ProcessRef {
         live_process_identity(self.handle)
     }
 
+    /// The state object this reference currently addresses.
+    ///
+    /// A counted reference answers from its own fixed pointer; an own-thread
+    /// pin re-reads the published one, so an exec that replaced the object is
+    /// observed rather than cached over.
+    fn state(&self) -> Option<NonNull<ProcessStateLock<UserProcessState>>> {
+        match self.pin {
+            ProcessRefPin::Counted(state) => Some(state),
+            ProcessRefPin::OwnThread => NonNull::new(
+                // ORDERING: Acquire observes the object installation published
+                // before the pointer store.
+                PROCESS_STATE_PTR
+                    .get(self.handle.index())?
+                    .load(Ordering::Acquire),
+            ),
+        }
+    }
+
     pub fn with_state<R>(&self, f: impl FnOnce(u64, &UserProcessState) -> R) -> R {
-        let state = unsafe { self.state_ptr.as_ref() }.lock();
+        let state = self
+            .state()
+            .expect("process reference lost its state object");
+        let state = unsafe { state.as_ref() }.lock();
         f(self.process_id, &state)
     }
 
     pub fn with_state_mut<R>(&self, f: impl FnOnce(u64, &mut UserProcessState) -> R) -> R {
-        let mut state = unsafe { self.state_ptr.as_ref() }.lock();
+        let state = self
+            .state()
+            .expect("process reference lost its state object");
+        let mut state = unsafe { state.as_ref() }.lock();
         f(self.process_id, &mut state)
     }
 
     pub fn with_visible_state<R>(&self, f: impl FnOnce(u64, &UserProcessState) -> R) -> Option<R> {
-        // SAFETY: ProcessRef retains the owning Arc, so the NonNull state
-        // pointer remains live for this complete guarded access.
-        let state = unsafe { self.state_ptr.as_ref() }.lock();
+        // SAFETY: a counted reference retains the owning object and an
+        // own-thread pin re-read the live pointer above, so either way this
+        // addresses a state lock that cannot be reclaimed under the access.
+        let state = unsafe { self.state()?.as_ref() }.lock();
         process_state_is_visible(self.handle).then(|| f(self.process_id, &state))
     }
 
@@ -221,9 +268,9 @@ impl ProcessRef {
         expected: ProcessIdentity,
         f: impl FnOnce(u64, &UserProcessState) -> R,
     ) -> Option<R> {
-        // SAFETY: ProcessRef retains the owning Arc, so the NonNull state
-        // pointer stays live through the exact-identity check and callback.
-        let state = unsafe { self.state_ptr.as_ref() }.lock();
+        // SAFETY: see `with_visible_state`; the exact-identity check below is
+        // what rejects an object an exec replaced under an own-thread pin.
+        let state = unsafe { self.state()?.as_ref() }.lock();
         (live_process_identity(self.handle) == Some(expected)).then(|| f(self.process_id, &state))
     }
 
@@ -231,9 +278,9 @@ impl ProcessRef {
         &self,
         f: impl FnOnce(u64, &mut UserProcessState) -> R,
     ) -> Option<R> {
-        // SAFETY: ProcessRef retains the owning Arc, and the per-process lock
-        // is the unique mutable access authority for the pointed-to state.
-        let mut state = unsafe { self.state_ptr.as_ref() }.lock();
+        // SAFETY: see `with_visible_state`; the per-process lock is the unique
+        // mutable access authority for the pointed-to state.
+        let mut state = unsafe { self.state()?.as_ref() }.lock();
         process_state_is_visible(self.handle).then(|| f(self.process_id, &mut state))
     }
 
@@ -241,16 +288,20 @@ impl ProcessRef {
         &self,
         f: impl FnOnce(u64, &mut UserProcessState) -> R,
     ) -> Option<R> {
-        // SAFETY: ProcessRef's retained table reference pins the allocation;
-        // ProcessStateLock supplies the exclusive mutable access.
-        let mut state = unsafe { self.state_ptr.as_ref() }.try_lock()?;
+        // SAFETY: see `with_visible_state`; `ProcessStateLock` supplies the
+        // exclusive mutable access.
+        let mut state = unsafe { self.state()?.as_ref() }.try_lock()?;
         process_state_is_visible(self.handle).then(|| f(self.process_id, &mut state))
     }
 }
 
 impl Drop for ProcessRef {
     fn drop(&mut self) {
-        release_process_ref(self.handle);
+        // An own-thread pin took no count, so it releases none. That is also
+        // why a retired task cannot leak one: nothing was taken.
+        if matches!(self.pin, ProcessRefPin::Counted(_)) {
+            release_process_ref(self.handle);
+        }
     }
 }
 
@@ -604,7 +655,36 @@ pub fn retain_process(handle: ProcessHandle) -> Option<ProcessRef> {
     Some(ProcessRef {
         handle,
         process_id,
-        state_ptr,
+        pin: ProcessRefPin::Counted(state_ptr),
+    })
+}
+
+/// The current task's own process, without taking a reference count.
+///
+/// # Contract
+///
+/// Sound only for the process that owns the calling task. `reclaim_slot`
+/// refuses while `thread_count != 0`, so a running or blocked thread keeps its
+/// own object alive; no other process carries that guarantee and every other
+/// caller must keep going through [`retain_process`].
+///
+/// This exists because the retain and its release are two acquisitions of the
+/// one global process table, and the synchronous IPC path made roughly ten of
+/// them per round trip to pin objects its own threads already pinned. See
+/// `rustos_user_abi::performance::IPC_SYSCALL_MAX_PROCESS_TABLE_ACQUISITIONS`.
+pub(super) fn own_process_ref(handle: ProcessHandle, process_id: u64) -> Option<ProcessRef> {
+    // ORDERING: Acquire observes the object installation published before the
+    // pointer store; a slot that has never been installed answers `None`.
+    let installed = PROCESS_STATE_PTR
+        .get(handle.index())?
+        .load(Ordering::Acquire);
+    if installed.is_null() || !process_state_is_visible(handle) {
+        return None;
+    }
+    Some(ProcessRef {
+        handle,
+        process_id,
+        pin: ProcessRefPin::OwnThread,
     })
 }
 
@@ -623,7 +703,7 @@ pub fn retain_process_by_pid(process_id: u64) -> Option<ProcessRef> {
         return Some(ProcessRef {
             handle: ProcessHandle::new(index, generation),
             process_id,
-            state_ptr,
+            pin: ProcessRefPin::Counted(state_ptr),
         });
     }
     None
@@ -1300,11 +1380,12 @@ pub(crate) mod tests {
     use core::sync::atomic::AtomicU64;
 
     use super::{
-        ExecReservation, ProcessHandle, ProcessObject, ProcessTable, WaitResult, attach_task,
-        begin_exec, cancel_exec, create_process, create_process_with_parent, detach_task,
-        is_process_exiting, mark_process_exiting, note_process_continued, note_process_exit_status,
-        note_process_stopped, process_state_is_visible, reap_exited_processes, retain_process,
-        thread_count_by_pid, try_with_process_state_mut, wait_for_child,
+        ExecReservation, LockClass, Ordering, PROCESS_STATE_PTR, ProcessHandle, ProcessObject,
+        ProcessTable, WaitResult, attach_task, begin_exec, cancel_exec, create_process,
+        create_process_with_parent, detach_task, is_process_exiting, mark_process_exiting,
+        note_process_continued, note_process_exit_status, note_process_stopped, own_process_ref,
+        process_state_is_visible, reap_exited_processes, retain_process, thread_count_by_pid,
+        try_with_process_state_mut, wait_for_child,
     };
     use crate::memory::paging::ProcessAddressSpace;
     use crate::user::process_state::UserProcessState;
@@ -1358,6 +1439,76 @@ pub(crate) mod tests {
             false,
             "/test.elf",
         )
+    }
+
+    /// Acquisitions of one tracked lock class during `body`.
+    ///
+    /// A performance invariant needs a number, not a comment: a path that
+    /// quietly reopens a global lock still produces correct bytes, so nothing
+    /// but a count objects to it. The per-class census is charged on the host
+    /// path for exactly this.
+    fn process_table_acquisitions_during<R>(body: impl FnOnce() -> R) -> (R, u64) {
+        let class = LockClass::ProcessTable as usize;
+        let _ = nucleus_core::util::lockdep::work_budget::take_class_census();
+        let value = body();
+        let census = nucleus_core::util::lockdep::work_budget::take_class_census();
+        (value, census[class])
+    }
+
+    /// The hot path's whole reason to exist. A running thread already pins its
+    /// own process object, so binding it must not enter the one global table
+    /// that every process shares; a counted retain enters it twice, once to
+    /// take the count and once to give it back.
+    #[test]
+    fn an_own_thread_pin_enters_the_global_process_table_zero_times() {
+        let _isolation = isolate_process_table();
+        let handle = create_process(0x9101, new_state()).expect("test process");
+        attach_task(handle).expect("test thread");
+
+        let (counted, counted_acquisitions) = process_table_acquisitions_during(|| {
+            let reference = retain_process(handle).expect("counted retain");
+            let process_id = reference.process_id();
+            drop(reference);
+            process_id
+        });
+        assert_eq!(counted, 0x9101);
+        assert_eq!(
+            counted_acquisitions, 2,
+            "a counted retain is exactly the retain and its release"
+        );
+
+        let (pinned, pinned_acquisitions) = process_table_acquisitions_during(|| {
+            let reference = own_process_ref(handle, 0x9101).expect("own-thread pin");
+            let process_id = reference.process_id();
+            drop(reference);
+            process_id
+        });
+        assert_eq!(pinned, 0x9101);
+        assert_eq!(
+            pinned_acquisitions, 0,
+            "the own-thread pin must not enter the global process table"
+        );
+    }
+
+    /// The pin re-reads the published state pointer instead of caching it,
+    /// which is what makes it safe across the exec that replaces the object.
+    /// A cached pointer would address a freed object with nothing holding it.
+    #[test]
+    fn an_own_thread_pin_answers_from_the_published_state_pointer() {
+        let _isolation = isolate_process_table();
+        let handle = create_process(0x9201, new_state()).expect("test process");
+        attach_task(handle).expect("test thread");
+        let reference = own_process_ref(handle, 0x9201).expect("own-thread pin");
+        assert!(reference.with_visible_state(|_, _| ()).is_some());
+
+        // A slot with no published state cannot be pinned at all, and an
+        // already-pinned reference stops answering rather than dereferencing a
+        // pointer nothing holds.
+        // ORDERING: Release matches the production publication this witness
+        // stands in for, so the pin's Acquire load observes the cleared slot.
+        PROCESS_STATE_PTR[handle.index()].store(core::ptr::null_mut(), Ordering::Release);
+        assert!(own_process_ref(handle, 0x9201).is_none());
+        assert!(reference.with_visible_state(|_, _| ()).is_none());
     }
 
     #[test]

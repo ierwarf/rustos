@@ -401,14 +401,16 @@ fi
 # pops the receiver it wakes; a timer does not, so a task that resumes on its
 # deadline is still published as this endpoint's next receiver. Leaving it there
 # sends the endpoint's next request to a task that is not waiting for it and
-# wakes nobody else - a lost wakeup that looks like a hung service. The
-# withdrawal and the timer must therefore stay together.
+# wakes nobody else - a lost wakeup that looks like a hung service. The exact
+# endpoint withdrawal and the timer must therefore stay together; using the
+# task-retirement whole-slab scan here is both unnecessary and a tail-latency
+# regression.
 bounded_recv_body="$(
     sed -n '/^fn recv_with_sender_blocking_prepared(/,/^}/p' \
         kernel/compat/src/user/syscall/linux/ipc_ops.rs
 )"
 if ! grep -Fq 'arm_sleep_waiter_until_tick' <<<"$bounded_recv_body" \
-    || ! grep -Fq 'remove_endpoint_waiters_for_task' <<<"$bounded_recv_body"; then
+    || ! grep -Fq 'remove_endpoint_waiter_for_task(endpoint, task_id)' <<<"$bounded_recv_body"; then
     echo 'the bounded endpoint receive must arm a deadline waiter and must withdraw its endpoint receiver waiter when it resumes' >&2
     exit 1
 fi
@@ -1018,8 +1020,8 @@ fi
 # transaction revokes donation, wakes the exact task, and mints one opaque
 # owner-generation token; publication happens only after the catalog guard is
 # gone, and selection revalidates the same custody with no generic fallback.
-reply_current_body="$(sed -n '/^pub fn complete_ipc_reply_wake_handoff(/,/^pub fn release_ipc_priorities_for_process/p' kernel/ps/src/multitask/current.rs)"
-reply_custody_body="$(sed -n '/^pub fn settle_ipc_reply_scheduling_context(/,/^pub fn complete_ipc_reply_wake_handoff(/p' kernel/ps/src/multitask/current.rs)"
+reply_current_body="$(sed -n '/^pub fn complete_ipc_reply_wake_handoff(/,/^pub fn release_ipc_priorities_for_process/p' kernel/ps/src/multitask/current/ipc.rs)"
+reply_custody_body="$(sed -n '/^pub fn settle_ipc_reply_scheduling_context(/,/^pub fn complete_ipc_reply_wake_handoff(/p' kernel/ps/src/multitask/current/ipc.rs)"
 reply_scheduler_body="$(sed -n '/^    pub(super) fn complete_ipc_reply_wake_handoff(/,/^    fn wake_task_slot/p' kernel/ps/src/multitask/scheduler.rs)"
 reply_enqueue_body="$(sed -n '/^fn enqueue_reply_wake_after_catalog(/,/^pub(super) fn enqueue_reply_wake/p' kernel/ps/src/multitask/scheduler/sync_handoff.rs)"
 reply_selection_body="$(sed -n '/^    fn synchronous_handoff_record_is_ready(/,/^    pub(super) fn take_next_synchronous_pick_hint_ready_slot/p' kernel/ps/src/multitask/scheduler/handoffs.rs)"
@@ -1027,7 +1029,7 @@ plain_reply_body="$(sed -n '/^pub(super) fn syscall_linux_rustos_ipc_reply(/,/^p
 handle_reply_body="$(sed -n '/^pub(super) fn syscall_linux_rustos_ipc_reply_with_handles/,/^pub(super) fn call_linux_syscall_endpoint/p' kernel/compat/src/user/syscall/linux/ipc_ops.rs)"
 reply_recv_body="$(sed -n '/^pub(super) fn syscall_linux_rustos_ipc_reply_recv_with_sender/,$p' kernel/compat/src/user/syscall/linux/ipc_reply_recv.rs)"
 if ! grep -Fq 'scheduler_mut().complete_ipc_reply_wake_handoff(reply, task_id)' <<<"$reply_current_body" \
-    || ! grep -Fq 'token.is_some_and(super::scheduler::enqueue_reply_wake_handoff)' <<<"$reply_current_body" \
+    || ! grep -Fq 'token.is_some_and(scheduler::enqueue_reply_wake_handoff)' <<<"$reply_current_body" \
     || ! grep -Fq 'let _ = self.release_ipc_priority(reply);' <<<"$reply_scheduler_body" \
     || ! grep -Fq 'if !self.wake_task_slot(slot)' <<<"$reply_scheduler_body" \
     || ! grep -Fq 'ReplyWakeHandoff::from_owner(slot, task_id, owner)' <<<"$reply_scheduler_body" \

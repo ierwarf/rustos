@@ -59,7 +59,10 @@ static TRANSITION_ACTIVE: [AtomicBool; nucleus_core::util::lockdep::MAX_TRACKED_
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]
-pub(super) use test_support::{install_test_transition_owner, test_publication_lock};
+pub(super) use test_support::{
+    TestCpuPublicationRestore, install_test_current_owner, install_test_transition_owner,
+    test_publication_lock,
+};
 
 // This remains a dead-owner fail-stop, not a scheduling latency budget. A KVM
 // vCPU can be descheduled by the host while it owns an otherwise bounded raw
@@ -100,10 +103,28 @@ static ACQUIRE_SITE_COUNTS: [AtomicU64; ACQUIRE_SITE_SLOTS] =
     [const { AtomicU64::new(0) }; ACQUIRE_SITE_SLOTS];
 static ACQUIRE_SITE_OVERFLOW: AtomicU64 = AtomicU64::new(0);
 
+/// Spreads a caller's static address over the census table.
+///
+/// The probe below started at slot zero for every site, so an acquisition
+/// walked the whole registered prefix before finding its own counter: about
+/// ten shared cache lines touched per acquisition, on every CPU, in the
+/// shipping build. Hashing the address makes the common case one line, which
+/// matters most at eight vCPUs where those lines are the ones bouncing.
+#[inline]
+fn acquire_site_bucket(key: *mut Location<'static>) -> usize {
+    // Fibonacci hashing of the pointer; `Location` allocations are aligned, so
+    // the low bits alone would collide across every site.
+    const _: () = assert!(ACQUIRE_SITE_SLOTS.is_power_of_two());
+    let mixed = (key as usize as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    (mixed >> 32) as usize & (ACQUIRE_SITE_SLOTS - 1)
+}
+
 /// Charges one acquisition to its caller.
 fn record_acquire_site(caller: &'static Location<'static>) {
     let key = caller as *const Location<'static> as *mut Location<'static>;
-    for slot in 0..ACQUIRE_SITE_SLOTS {
+    let first = acquire_site_bucket(key);
+    for probe in 0..ACQUIRE_SITE_SLOTS {
+        let slot = (first + probe) % ACQUIRE_SITE_SLOTS;
         // ORDERING: Acquire observes a claim published by whichever CPU first
         // registered this site.
         let current = ACQUIRE_SITE_CALLERS[slot].load(Ordering::Acquire);

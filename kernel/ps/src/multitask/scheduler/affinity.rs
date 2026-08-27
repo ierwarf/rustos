@@ -324,7 +324,6 @@ mod tests {
         // Affinity tests attach real processes to the one global process
         // table, so they must hold the same exclusive test isolation as every
         // other scheduler test or a concurrent test observes a foreign process.
-        let _process_table = process_table::tests::isolate_process_table();
         let mut scheduler = boxed_scheduler();
         let process = test_process(0xaff1_0001);
         let slot = FIRST_DYNAMIC_TASK_SLOT;
@@ -352,7 +351,6 @@ mod tests {
         // Affinity tests attach real processes to the one global process
         // table, so they must hold the same exclusive test isolation as every
         // other scheduler test or a concurrent test observes a foreign process.
-        let _process_table = process_table::tests::isolate_process_table();
         let mut scheduler = boxed_scheduler();
         let process = test_process(0xaff1_0002);
         let slot = FIRST_DYNAMIC_TASK_SLOT;
@@ -384,7 +382,6 @@ mod tests {
     fn foreign_task_affinity_is_permission_denied() {
         // Both task identities are attached to the global process table, so
         // retain its test isolation through the complete rejected request.
-        let _process_table = process_table::tests::isolate_process_table();
         let mut scheduler = boxed_scheduler();
         let caller_process = test_process(0xaff1_0101);
         let foreign_process = test_process(0xaff1_0102);
@@ -440,7 +437,6 @@ mod tests {
 
     #[test]
     fn dispatch_panics_when_current_mask_excludes_cpu() {
-        let _process_table = process_table::tests::isolate_process_table();
         let mut scheduler = boxed_scheduler();
         let process = test_process(0xaff1_0103);
         let slot = FIRST_DYNAMIC_TASK_SLOT;
@@ -472,7 +468,6 @@ mod tests {
         // Affinity tests attach real processes to the one global process
         // table, so they must hold the same exclusive test isolation as every
         // other scheduler test or a concurrent test observes a foreign process.
-        let _process_table = process_table::tests::isolate_process_table();
         let mut scheduler = boxed_scheduler();
         let process = test_process(0xaff1_0006);
         let slot = FIRST_DYNAMIC_TASK_SLOT;
@@ -504,7 +499,6 @@ mod tests {
         // Affinity tests attach real processes to the one global process
         // table, so they must hold the same exclusive test isolation as every
         // other scheduler test or a concurrent test observes a foreign process.
-        let _process_table = process_table::tests::isolate_process_table();
         let mut scheduler = boxed_scheduler();
         let process_id = 0xaff1_0003;
         let process = test_process(process_id);
@@ -534,7 +528,6 @@ mod tests {
         // Affinity tests attach real processes to the one global process
         // table, so they must hold the same exclusive test isolation as every
         // other scheduler test or a concurrent test observes a foreign process.
-        let _process_table = process_table::tests::isolate_process_table();
         let mut scheduler = boxed_scheduler();
         let process = test_process(0xaff1_0007);
         let slot = FIRST_DYNAMIC_TASK_SLOT;
@@ -565,7 +558,6 @@ mod tests {
         // Affinity tests attach real processes to the one global process
         // table, so they must hold the same exclusive test isolation as every
         // other scheduler test or a concurrent test observes a foreign process.
-        let _process_table = process_table::tests::isolate_process_table();
         let mut scheduler = boxed_scheduler();
         let process = test_process(0xaff1_0004);
         let first = FIRST_DYNAMIC_TASK_SLOT;
@@ -604,7 +596,6 @@ mod tests {
         // Affinity tests attach real processes to the one global process
         // table, so they must hold the same exclusive test isolation as every
         // other scheduler test or a concurrent test observes a foreign process.
-        let _process_table = process_table::tests::isolate_process_table();
         let mut scheduler = boxed_scheduler();
         let process = test_process(0xaff1_0005);
         let slot = FIRST_DYNAMIC_TASK_SLOT;

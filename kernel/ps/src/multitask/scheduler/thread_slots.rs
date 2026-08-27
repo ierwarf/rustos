@@ -32,7 +32,7 @@ impl Scheduler {
             return None;
         }
 
-        let root_phys = current.address_space_root;
+        let root_phys = self.slot_address_space_root(self.current_task_slot());
         let process_handle = current.process_handle?;
         let process_id = current.process_id?;
         for slot in FIRST_DYNAMIC_TASK_SLOT..MAX_TASK {
@@ -51,7 +51,7 @@ impl Scheduler {
                     root_phys,
                     inherited_task_mask,
                     inherited_process_mask,
-                    weight: current.weight,
+                    weight: self.slot_weight(self.current_task_slot()),
                     scheduling_policy: current.scheduling_context.policy(),
                     scheduling_domain_slot: current.scheduling_context.domain_slot(),
                     vruntime_ns: self
@@ -110,16 +110,23 @@ impl Scheduler {
             saved_rsp,
             #[cfg(test)]
             test_ready: false,
+            #[cfg(test)]
             ready_since_ticks: 0,
+            #[cfg(test)]
             blocked: true,
+            #[cfg(test)]
             blocked_since_ticks: crate::arch::rtc::ticks(),
+            #[cfg(test)]
             wake_armed: false,
+            #[cfg(test)]
             block_reason: BlockReason::None,
+            #[cfg(test)]
             weight: reservation.weight,
             #[cfg(test)]
             vruntime_ns: reservation.vruntime_ns,
             #[cfg(test)]
             exec_start_ticks: 0,
+            #[cfg(test)]
             address_space_root: reservation.root_phys,
             #[cfg(test)]
             kernel_stack_base: kernel_stack_base as u64,
@@ -142,6 +149,11 @@ impl Scheduler {
         });
         self.initialize_slot_vruntime(slot, reservation.vruntime_ns);
         self.initialize_slot_exec_start_ticks(slot, 0);
+        self.initialize_slot_weight(slot, reservation.weight);
+        self.initialize_slot_address_space_root(slot, reservation.root_phys);
+        self.initialize_slot_wait_state(slot);
+        self.set_slot_blocked(slot, true);
+        self.set_slot_blocked_since_ticks(slot, crate::arch::rtc::ticks());
         self.initialize_slot_saved_rsp(slot, saved_rsp);
         self.initialize_slot_kernel_stack_bounds(
             slot,

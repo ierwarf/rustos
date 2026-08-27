@@ -13,10 +13,7 @@
 //! - **Evidence:** `atomic-process-activation-batch`,
 //!   `bootstrap-activation-handoff`, and `synchronous-ipc-handoff`.
 
-use super::{
-    CpuDispatchGuard, MAX_ATOMIC_ACTIVATION_HANDOFFS, Scheduler, TaskContext, runqueue,
-    sync_handoff,
-};
+use super::{CpuDispatchGuard, MAX_ATOMIC_ACTIVATION_HANDOFFS, Scheduler, sync_handoff};
 
 impl Scheduler {
     /// Publishes the geometry and contents behind a rejected activation frame.
@@ -399,11 +396,11 @@ impl Scheduler {
             // budget, or frame rejection must materialize exact local custody
             // before the one-shot record is consumed.
             #[cfg(not(test))]
-            if let Some(context) = self.contexts[record.slot()] {
-                let _ = runqueue::materialize_direct_handoff(
+            if self.contexts[record.slot()].is_some() {
+                let _ = super::runqueue::materialize_direct_handoff(
                     record.slot(),
                     Self::current_dispatch_cpu(),
-                    context.weight,
+                    self.slot_weight(record.slot()),
                 );
             }
             #[cfg(rustos_scheduler_phase_profile)]

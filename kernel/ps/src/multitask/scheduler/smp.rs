@@ -15,11 +15,13 @@
 //! - **Evidence:** `cpu-online-lifecycle`, `scheduler-lifecycle`, and
 //!   `smp-reschedule-ipi-lifecycle`.
 
+#[cfg(rustos_ipc_phase_profile)]
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::*;
 
 const FAST_IPC_ELIGIBILITY_REJECTION_COUNT: usize = 10;
+#[cfg(rustos_ipc_phase_profile)]
 static FAST_IPC_ELIGIBILITY_REJECTIONS: [AtomicU64; FAST_IPC_ELIGIBILITY_REJECTION_COUNT] =
     [const { AtomicU64::new(0) }; FAST_IPC_ELIGIBILITY_REJECTION_COUNT];
 
@@ -39,15 +41,23 @@ pub(super) enum FastIpcEligibilityRejection {
 }
 
 pub(super) fn record_fast_ipc_eligibility_rejection(reason: FastIpcEligibilityRejection) {
+    #[cfg(rustos_ipc_phase_profile)]
     FAST_IPC_ELIGIBILITY_REJECTIONS[reason as usize].fetch_add(1, Ordering::Relaxed);
+    #[cfg(not(rustos_ipc_phase_profile))]
+    let _ = reason;
 }
 
 pub fn drain_fast_ipc_eligibility_rejections() -> [u64; FAST_IPC_ELIGIBILITY_REJECTION_COUNT] {
-    let mut counters = [0; FAST_IPC_ELIGIBILITY_REJECTION_COUNT];
-    for (index, counter) in FAST_IPC_ELIGIBILITY_REJECTIONS.iter().enumerate() {
-        counters[index] = counter.swap(0, Ordering::Relaxed);
+    #[cfg(rustos_ipc_phase_profile)]
+    {
+        let mut counters = [0; FAST_IPC_ELIGIBILITY_REJECTION_COUNT];
+        for (index, counter) in FAST_IPC_ELIGIBILITY_REJECTIONS.iter().enumerate() {
+            counters[index] = counter.swap(0, Ordering::Relaxed);
+        }
+        counters
     }
-    counters
+    #[cfg(not(rustos_ipc_phase_profile))]
+    [0; FAST_IPC_ELIGIBILITY_REJECTION_COUNT]
 }
 
 fn candidate_has_foreign_execution_owner(
@@ -373,16 +383,23 @@ impl Scheduler {
             saved_rsp: 0,
             #[cfg(test)]
             test_ready: false,
+            #[cfg(test)]
             ready_since_ticks: 0,
+            #[cfg(test)]
             blocked: false,
+            #[cfg(test)]
             blocked_since_ticks: 0,
+            #[cfg(test)]
             wake_armed: false,
+            #[cfg(test)]
             block_reason: BlockReason::None,
+            #[cfg(test)]
             weight: NICE_0_LOAD,
             #[cfg(test)]
             vruntime_ns: 0,
             #[cfg(test)]
             exec_start_ticks: now,
+            #[cfg(test)]
             address_space_root: crate::memory::paging::kernel_root_phys().as_u64(),
             #[cfg(test)]
             kernel_stack_base: raw_stack_base + TASK_STACK_GUARD_BYTES as u64,
@@ -402,6 +419,12 @@ impl Scheduler {
         });
         self.initialize_slot_vruntime(slot, 0);
         self.initialize_slot_exec_start_ticks(slot, now);
+        self.initialize_slot_weight(slot, NICE_0_LOAD);
+        self.initialize_slot_address_space_root(
+            slot,
+            crate::memory::paging::kernel_root_phys().as_u64(),
+        );
+        self.initialize_slot_wait_state(slot);
         self.initialize_slot_saved_rsp(slot, 0);
         self.initialize_slot_kernel_stack_bounds(
             slot,
@@ -443,11 +466,13 @@ impl Scheduler {
         assert!(
             !context.user_mode
                 && !self.slot_is_runnable(expected_slot)
-                && !context.blocked
+                && !self.slot_blocked(expected_slot)
                 && self.slot_saved_rsp(expected_slot) == 0,
             "secondary CPU idle bootstrap state is inconsistent"
         );
-        crate::memory::paging::load_address_space_phys(PhysAddr::new(context.address_space_root));
+        crate::memory::paging::load_address_space_phys(PhysAddr::new(
+            self.slot_address_space_root(expected_slot),
+        ));
         let (_, kernel_stack_top) = self.slot_kernel_stack_bounds(expected_slot);
         crate::arch::gdt::set_privilege_stack(kernel_stack_top);
         crate::user::syscall::set_kernel_stack_top(kernel_stack_top);
@@ -474,7 +499,7 @@ const fn remote_task_requires_quiescence(
 mod tests {
     use super::{candidate_has_foreign_execution_owner, remote_task_requires_quiescence};
     use crate::memory::paging::ProcessAddressSpace;
-    use crate::multitask::{UserTaskBootstrap, noop_task_entry, process_table};
+    use crate::multitask::{UserTaskBootstrap, noop_task_entry};
     use crate::user::abi::UserAbi;
 
     #[test]
@@ -495,10 +520,6 @@ mod tests {
 
     #[test]
     fn source_migration_requires_exact_runnable_local_owner_and_target_affinity() {
-        let _process_table = process_table::tests::isolate_process_table();
-        let _cpu_publication = crate::multitask::cpu_local::test_publication_lock();
-        let _runqueue_guard = super::super::runqueue::test_serial_guard();
-        super::super::runqueue::reset_before_publication();
         let mut scheduler = super::super::tests::boxed_scheduler();
         let source_cpu = 1;
         let target_cpu = 2;
@@ -527,7 +548,7 @@ mod tests {
         scheduler.initialize_slot_affinity(slot, target_mask, target_mask);
         super::super::runqueue::admit_blocked(slot);
         let context = scheduler.contexts[slot].expect("source migration context");
-        super::super::runqueue::publish_local(slot, source_cpu, context.weight);
+        super::super::runqueue::publish_local(slot, source_cpu, scheduler.slot_weight(slot));
 
         assert!(scheduler.context_is_migratable_from_source(slot, context, source_cpu, target_cpu));
         super::super::runqueue::set_runnable(slot, false);
@@ -559,6 +580,5 @@ mod tests {
             scheduler.context_is_migratable_from_source(slot, context, source_cpu, target_cpu),
             "dropping the exact execution owner must restore queued migration eligibility"
         );
-        super::super::runqueue::reset_before_publication();
     }
 }

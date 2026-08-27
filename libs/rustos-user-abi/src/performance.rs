@@ -88,6 +88,46 @@ pub const IPC_RECEIVE_REPORT_MAX_ADDRESS_SPACE_BINDS: u32 = 2;
 /// is this number.
 pub const IPC_REPLY_WAIT_POLLS_PER_TURN: u32 = 2;
 
+/// Debug-sink records one scheduler dispatch may render while it holds the
+/// global scheduler guard.
+///
+/// A milestone is not a counter increment: rendering one writes the line to the
+/// debug port, which is a VM exit per byte under KVM, and the emitter first
+/// drains whatever deferred records are parked. Doing that inside the guard
+/// put an unbounded host-side cost inside the kernel's most serializing
+/// critical section. Measured on the budget-exhaustion marker, which fired
+/// about sixty times a second: the accounting phase cost 5.9-27 microseconds
+/// per dispatch and the guard's hold total was 358 ms per second; latching the
+/// event and rendering it from the profile drain moved the same phase to
+/// 0.02-0.03 microseconds and the hold total to 146 ms.
+///
+/// Zero is the ceiling because there is no such thing as a cheap one. A
+/// diagnostic that must name an in-guard event latches it and lets the drain,
+/// which already runs outside every tracked lock, render it.
+pub const SCHEDULER_GUARD_MAX_DEBUG_SINK_RECORDS: u32 = 0;
+
+/// Global task-catalog acquisitions one ordinary dispatch may make.
+///
+/// The per-CPU run queues, owner words, and wait state are already outside the
+/// catalog, so a dispatch enters it once, for the task payload it still owns.
+/// This is the Phase-3 ceiling in the form the runtime can check: the census
+/// behind `kernel-scheduler-acquire-*` reports the callers, and this says how
+/// many the decision itself is allowed to be.
+pub const SCHEDULER_DISPATCH_MAX_CATALOG_ACQUISITIONS: u32 = 1;
+
+/// Global process-table acquisitions one synchronous IPC syscall may make.
+///
+/// The table is a single lock over every process object, and a reference
+/// retain plus its release are two acquisitions of it. A synchronous round trip
+/// took roughly ten, measured by the per-class acquisition census, which made
+/// it the most-acquired tracked lock class under IPC -- ahead of the endpoint,
+/// the reply object, and the scheduler catalog itself.
+///
+/// The ceiling is what keeps a convenience `retain_process` from reappearing on
+/// the path: a running thread already pins its own process object, so the hot
+/// path answers from the published per-slot state instead.
+pub const IPC_SYSCALL_MAX_PROCESS_TABLE_ACQUISITIONS: u32 = 2;
+
 /// Global vfsd admission limit for live epoll provider objects.
 ///
 /// The current kernel has 32 live process slots and 16-bit dynamic descriptor

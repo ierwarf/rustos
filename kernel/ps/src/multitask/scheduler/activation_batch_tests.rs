@@ -275,6 +275,7 @@ fn atomic_activation_cohort_is_bounded_at_the_exact_queue_capacity() {
             .atomic_activation_handoff_remaining,
         AT_CAPACITY as usize
     );
+    drop(scheduler);
 
     // A fresh cohort one member over the bound must be rejected before any
     // target is disturbed, leaving every member still suspended.

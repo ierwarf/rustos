@@ -58,7 +58,7 @@ impl Scheduler {
                 self.retired[slot],
                 self.start_suspended[slot],
                 self.slot_is_runnable(slot),
-                context.blocked,
+                self.slot_blocked(slot),
             ) {
                 continue;
             }

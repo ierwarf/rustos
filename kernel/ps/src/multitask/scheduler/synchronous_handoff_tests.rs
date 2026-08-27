@@ -12,8 +12,7 @@
 //! - **Forbidden:** No host timing assumptions or allocation in production.
 //! - **Evidence:** `synchronous-ipc-handoff/SynchronousIpcHandoff`.
 
-use alloc::boxed::Box;
-
+use super::tests::boxed_scheduler;
 use super::{
     MAX_CONSECUTIVE_SYNC_HANDOFFS, NICE_0_LOAD, SYSTEM_CLASS_WEIGHT_FLAG, SchedClass, Scheduler,
     runqueue,
@@ -22,38 +21,8 @@ use crate::memory::paging::ProcessAddressSpace;
 use crate::multitask::{UserTaskBootstrap, noop_task_entry};
 use crate::user::abi::UserAbi;
 
-static TEST_SCHEDULER_TEMPLATE: Scheduler = Scheduler::new();
-
-/// Reclaims the shared owner words even if a white-box assertion fails. The
-/// scheduler under test is private, but its publication backing is global.
-struct RunqueuePublicationReset;
-
-impl Drop for RunqueuePublicationReset {
-    fn drop(&mut self) {
-        runqueue::reset_before_publication();
-    }
-}
-
-fn boxed_scheduler() -> Box<Scheduler> {
-    let mut scheduler = Box::<Scheduler>::new_uninit();
-    unsafe {
-        // SAFETY: the source is one fully initialized immutable Scheduler;
-        // destination is a disjoint allocation of exactly the same type.
-        core::ptr::copy_nonoverlapping(
-            core::ptr::addr_of!(TEST_SCHEDULER_TEMPLATE),
-            scheduler.as_mut_ptr(),
-            1,
-        );
-        scheduler.assume_init()
-    }
-}
-
 #[test]
 fn synchronous_ipc_handoff_is_fifo_deduplicated_and_fairness_bounded() {
-    let _publication_lock = crate::multitask::cpu_local::test_publication_lock();
-    let _runqueue_serial = runqueue::test_serial_guard();
-    let _runqueue_reset = RunqueuePublicationReset;
-    runqueue::reset_before_publication();
     let mut scheduler = boxed_scheduler();
     let base = crate::memory::paging::USER_SPACE_BASE;
     let user_cs = crate::arch::gdt::user_code_selector().0 as u64;
@@ -134,10 +103,6 @@ fn synchronous_ipc_handoff_is_fifo_deduplicated_and_fairness_bounded() {
 
 #[test]
 fn reply_wake_token_mint_requires_exact_task_and_dispatch_custody() {
-    let _publication_lock = crate::multitask::cpu_local::test_publication_lock();
-    let _runqueue_serial = runqueue::test_serial_guard();
-    let _runqueue_reset = RunqueuePublicationReset;
-    runqueue::reset_before_publication();
     let mut scheduler = boxed_scheduler();
     let base = crate::memory::paging::USER_SPACE_BASE;
     let slot = scheduler
@@ -163,6 +128,8 @@ fn reply_wake_token_mint_requires_exact_task_and_dispatch_custody() {
         cpu: Some(2),
         generation: 7,
         runnable: true,
+        wait_reason_kind: 0,
+        wait_armed: false,
     };
 
     assert!(

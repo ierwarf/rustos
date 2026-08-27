@@ -7,13 +7,11 @@ kernel/compat/src/user/syscall/linux/service_ops/vfs_meta.rs	1902	compat-vfs	Spl
 kernel/compat/src/user/syscall/linux/service_ops/vfs_socket.rs	1600	compat-vfs	Split file-descriptor transport, socket transport, and response admission.
 kernel/io-manager/src/input/dvm_ring.rs	1606	io-input	Split aperture admission, atomic header snapshots, worker lifecycle, broker operations, and tests.
 kernel/io-manager/src/io/dvm_display.rs	1835	io-display	Split handshake, shared-surface lifecycle, present queue, and tests.
-kernel/ipc-runtime/src/ipc/mod.rs	3260	ipc-runtime	Extract the fixed FastCallFrame state machine into ipc/fast_call.rs, then split endpoint, reply, shared-region, and accounting modules.
+kernel/ipc-runtime/src/ipc/mod.rs	3159	ipc-runtime	Extract the fixed FastCallFrame state machine into ipc/fast_call.rs, then split endpoint, reply, shared-region, and accounting modules.
 kernel/mm/src/memory/address_space.rs	1482	memory	Split validated user-copy proofs, page-table mutation, VMA admission, teardown, and tests.
 kernel/mm/src/memory/kernel_vm.rs	1435	memory-kernel-vm	Split PAT/cache policy, direct-map transactions, high-window mappings, and tests.
-kernel/ps/src/multitask/current.rs	1317	scheduler-current	Split typed endpoint/reply block and terminal fast-reply custody adapters into current/ipc.rs.
-kernel/ps/src/multitask/process_table.rs	1663	process-table	Split lifecycle transaction state and markers into process_table/lifecycle.rs, then retained exact-MM generation access and identity adapters into process_table/identity.rs.
-kernel/ps/src/multitask/scheduler.rs	5730	scheduler	The handoff chain carries per-step self-timing until its dominant member is found and removed; next split run queues, wakeup, deadlines, switching, accounting, and tests.
-kernel/ps/src/multitask/scheduler/runqueue.rs	1427	scheduler-runqueue	Extract DirectHandoff and fixed RunTransfer custody transitions into scheduler/runqueue/ipc_handoff.rs.
+kernel/ps/src/multitask/process_table.rs	1806	process-table	Split lifecycle transaction state and markers into process_table/lifecycle.rs, then the own-thread pin, retained exact-MM generation access, and identity adapters into process_table/identity.rs.
+kernel/ps/src/multitask/scheduler.rs	5686	scheduler	The handoff chain carries per-step self-timing until its dominant member is found and removed; next split run queues, wakeup, deadlines, switching, accounting, and tests.
 libs/driver-domain-host/src/lib.rs	5441	driver-domain-host	Split manifest, lease, QMP, recovery, input-ring publication, and process supervision.
 libs/driver-domain-protocol/src/lib.rs	4149	driver-domain-protocol	Split block, network, input, display, and control wire modules.
 libs/runtime-control/src/lib.rs	1402	runtime-control	Split codec, authority, command lifecycle, and tests.

@@ -847,12 +847,23 @@ pub fn commit_block_current_task_and_yield() -> Option<bool> {
         preemption.top_class,
     );
     interrupts::without_interrupts(|| {
-        let committed = unsafe { scheduler_mut().commit_block_current_task() };
+        let committed =
+            current_wait_commit_or_fallback(super::scheduler::commit_current_wait(), || unsafe {
+                scheduler_mut().commit_block_current_task()
+            });
         if committed == Some(true) {
             crate::lowlevel::interrupts::trigger_software_schedule();
         }
         committed
     })
+}
+
+#[inline]
+fn current_wait_commit_or_fallback(
+    fast: Option<bool>,
+    fallback: impl FnOnce() -> Option<bool>,
+) -> Option<bool> {
+    fast.map(Some).unwrap_or_else(fallback)
 }
 
 /// Linearizes the Phase-5 same-CPU call transfer with the schedule trap.
@@ -895,9 +906,31 @@ mod tests {
     use core::sync::atomic::{AtomicU64, Ordering};
 
     use super::{
-        RescheduleIpiGate, consume_syscall_tail_reschedule, periodic_idle_continuation_is_local,
-        periodic_user_continuation_is_local, remote_notification_required, reschedule_ipi_gate,
+        RescheduleIpiGate, consume_syscall_tail_reschedule, current_wait_commit_or_fallback,
+        periodic_idle_continuation_is_local, periodic_user_continuation_is_local,
+        remote_notification_required, reschedule_ipi_gate,
     };
+
+    #[test]
+    fn current_wait_commit_uses_catalog_only_when_owner_publication_cannot_answer() {
+        let mut fallbacks = 0;
+        assert_eq!(
+            current_wait_commit_or_fallback(Some(true), || {
+                fallbacks += 1;
+                Some(false)
+            }),
+            Some(true)
+        );
+        assert_eq!(fallbacks, 0, "ordinary commit reopened the catalog");
+        assert_eq!(
+            current_wait_commit_or_fallback(None, || {
+                fallbacks += 1;
+                Some(false)
+            }),
+            Some(false)
+        );
+        assert_eq!(fallbacks, 1, "unpublished owner lost its safe fallback");
+    }
 
     #[test]
     fn periodic_tick_stays_local_only_without_any_dispatch_authority() {

@@ -50,10 +50,11 @@ inference, and direct measurement contradicts it.
 ## What the in-kernel profile adds
 
 `cargo xtask bench` decodes the `ipc-call-phase-*`, `usermem-phase-*`, and
-`lock-phase-*` milestones itself and prints them under the probe table, so the
-phase numbers in this document are reproduced by running the lane rather than
-by post-processing the log by hand. Only windows that closed inside the run are
-counted; a window that closed during boot describes boot.
+`lock-phase-*` milestones itself and prints any profiles enabled for that
+build under the probe table. Shipping images leave the timing profiles off;
+run `RUSTOS_IPC_PHASE_PROFILE=true cargo xtask bench --isolate-probe <probe>`
+for IPC attribution. Only windows that closed inside the run are counted; a
+window that closed during boot describes boot.
 
 The scheduler additionally instruments itself per phase and emits the result
 once a second as `kernel-scheduler-*` milestones on debugcon. Decoding those
@@ -124,6 +125,13 @@ inside what the `synchronous-ipc-handoff` models cover.
 phase with a TSC sample and emits `ipc-call-phase-*` milestones once a second.
 The path already had these boundaries but sampled them with `rtc::ticks()` at
 1024 Hz, which can only see a stall, never a cost.
+
+The caller's twelve phases, the receiver's four phases, and the fast-handoff
+reason counters are one diagnostic unit. They are compiled only when
+`[ipc_telemetry] phase_profile` or `RUSTOS_IPC_PHASE_PROFILE=true` is set.
+That keeps their TSC reads and shared atomic updates out of the shipping IPC
+path; a phase table describes an instrumented diagnosis build, not product
+latency.
 
 Measured per-operation costs, stable across runs (the counters are global, so
 read the per-sample column, not per-call):
@@ -996,10 +1004,12 @@ comparing against the unstubbed build in the same session:
 | `ipc_rt_intra_process` | 78,280 | 78,640 | **-0.5%, noise** |
 | `ipc_split_reply_to_return` | 30,440 | 30,480 | -0.9%, noise |
 
-Inside the ±2% floor. Unlike the three gated profiles, this one does not need
-`[ipc_telemetry]`: four charge sites, matching the same primitives the
-caller's already-unconditional twelve use, cost nothing measurable against a
-~78,000-cycle round trip. It ships unconditional.
+Inside the ±2% floor for the receiver's four sites alone. That ablation did
+not cover the caller's twelve always-live sites or the fast-handoff's shared
+atomic counters, so it was insufficient to justify shipping the combined
+instrumentation. All sixteen phase sites and the reason counters now share
+`[ipc_telemetry] phase_profile`, off by default. Enable it only for a bounded
+diagnosis run and read its phase table as instrumented cost.
 
 **Attribution under `--isolate-probe ipc_rt_intra_process`:** all four land at
 1.34x-1.35x per round trip — the same band as the caller's endpoint-call
@@ -1558,8 +1568,10 @@ Benchmark execution is not product acceptance evidence. `xtask bench` uses a
 private KVM launch that does not publish a runtime-trace seal for an
 intentionally changing source tree; ordinary smoke and qualification commands
 remain strict. A multi-vCPU or isolated diagnostic gets a bounded 60-second
-terminal budget because a second eight-vCPU repeat completed the product UI
-but crossed the former 30-second harness cutoff before `ipcbench: end`.
+terminal budget; combining both conditions gets 90 seconds. This preserves the
+short ordinary lane while admitting observed eight-vCPU runs that finish the
+guest benchmark after 60 seconds. Missing product readiness still rejects the
+run even if the guest has printed `ipcbench: end`.
 
 ## Current fast-IPC eligibility result
 
@@ -1572,7 +1584,7 @@ already exhausted budget, instead of the caller's live donated context.
 The commit now binds the exact reply custody first and keeps the existing
 rollback path for every later rejection. Reason counters reuse the benchmark's
 existing `ipc-fastpath-counter` record; they are observational, do not grant
-authority, and are drained after each run. In the immediately preceding
+authority, and are compiled only for an IPC diagnosis build. In the immediately preceding
 eight-vCPU diagnostic, 2,228 of 2,239 eligibility rejections were
 `context-budget`, accounting for 2,243 scheduler fallbacks. The corrected run
 recorded zero context-budget rejections, four domain-budget rejections, twenty
@@ -1597,6 +1609,82 @@ For the same current tree, isolated `sched_yield` measured 11,520/37,120 cycles
 at one vCPU and 9,120/10,240 at eight vCPUs (min/p50). That rules out a simple
 single-dispatch regression, but it is not a concurrent runqueue-contention
 test and does not close the outstanding scheduler data-structure split.
+
+### Latest staged Phase-3 root and fair-share-weight split
+
+The staged Phase-3 slice stores the production task address-space root and
+fair-share weight (including its trusted System-class bit) in
+owner-generation-bound per-slot runqueue storage rather than in the global
+`Scheduler::contexts` catalog. Admission publishes both before the owner word;
+exec updates only the root through its existing quiesced transaction;
+self-demotion is the sole post-admission weight writer; and terminal release
+clears both before reuse. Lifecycle and wait metadata still live in the global
+catalog, so this is a data-ownership split, not a claim that the scheduler
+authority lock has been removed from dispatch.
+
+Fresh isolated `syscalld getuid` runs on that staged tree were:
+
+| vCPUs | runs | CPUID p50 cycles | IPC min / p50 / p99 cycles |
+| ---: | ---: | ---: | ---: |
+| 1 | 1 | 3,680 | 65,960 / 70,000 / 15,934,600 |
+| 8 | 1 | 3,840 | 69,720 / 170,120 / 43,859,080 |
+
+The one-vCPU p50 is within the existing ±2% probe floor, and the eight-vCPU p50
+lies within the earlier 168,560--174,320-cycle band. Neither is evidence of a
+latency regression or speedup. The one-vCPU phase table passed isolated
+attribution; the SMP system-wide phase table remains diagnostic context. The
+slice deliberately leaves `V5-SCHED-GLOBAL-001` open: removing the catalog's
+hot-path acquisition requires the remaining scheduling-context custody/budget
+and lifecycle-directory split plus its own repeatable SMP measurement.
+
+### Owner-generation-bound block and ready timing split
+
+The next Phase-3 slice removed the production `blocked`, `ready_since_ticks`,
+and `blocked_since_ticks` fields from `TaskContext`. They now share the per-slot
+wait payload with the arm and exact reason; host tests retain cfg-only mirrors.
+Admission initializes the payload before owner publication, and terminal
+release clears all state before slot reuse. Scheduling-context budget/custody
+and lifecycle/directory metadata still require the global catalog, so this is
+not the zero-acquisition Phase-3 cutover.
+
+A same-session control immediately before this timing split and candidate after
+it produced:
+
+| vCPUs | tree | CPUID p50 | IPC min / p50 cycles |
+| ---: | --- | ---: | ---: |
+| 1 | control | 3,680 | 64,040 / 70,280 |
+| 1 | candidate repeat | 3,760 | 66,160 / 74,000 |
+| 8 | control | 4,040 | 71,280 / 171,240 |
+| 8 | candidate repeat | 4,000 | 69,880 / 178,800 |
+
+The one-vCPU normalized minimum moved about +1.1%, inside the probe floor, but
+its normalized p50 moved about +3.1%. The eight-vCPU anchor held within 1% and
+its p50 moved +4.4% raw (about +5.5% normalized). One earlier candidate at each
+topology had anchor drift larger than the comparison rule and was rejected.
+This is a regression warning, not a regression conclusion: an A-B-A source
+pair is still required, and the atomics are a prerequisite for removing the
+catalog guard rather than a standalone latency optimization. Fresh isolated
+semantic attribution passed in every admitted run. Fresh SMP cohort
+`4b44f34d5f0ce03263d3abf031bfae00` passed 1/2/4/8-vCPU qualification on the
+candidate image.
+
+## IPC telemetry-gate check (2026-08-27)
+
+On 2026-08-27, the shipping build was measured before and after one
+`RUSTOS_IPC_PHASE_PROFILE=true` diagnostic run on the same one-vCPU isolated
+`syscalld getuid` probe. The normal runs were 66,120/68,960 and
+66,280/70,600 cycles (min/p50); the instrumented run was 66,520/70,480. Its
+CPUID-anchor p50 was 3,720 versus 3,680/3,720 for the normal runs. This is not
+a speed claim: the normal p50 itself moved 2.4% across the two controls.
+
+A one-pair eight-vCPU check had an identical 4,280-cycle CPUID-anchor p50 but
+reported 67,800/168,360 cycles normal and 68,600/158,240 instrumented. That
+direction contradicts the deterministic cost of the added TSC reads and shared
+atomics, demonstrating that one SMP p50 pair is dominated by guest scheduling
+noise. The gate is therefore a hot-path hygiene correction, not a measured
+latency win. It preserves the diagnostic build and makes ordinary benchmarks
+measure the uninstrumented shipping path; repeated controlled runs are still
+required before claiming its latency delta.
 
 ## Phase 6 process-lifecycle and frame-settlement checkpoint
 
@@ -1648,3 +1736,297 @@ runs passed the kernel-stamped semantic isolation gate. The final trace build
 again carried all nine required lifecycle stages for 34 exact identities with
 a 3,680-cycle anchor p50. These distributions establish the Phase-6 closure;
 they do not claim that desktop-contention p99 is stable.
+
+## Catalog acquisitions per scheduler entry, and what removing them moved
+
+The scheduler's own latency is not what a per-caller cut changes; the number of
+times the global task catalog is entered is. That count now has a stable
+normalizer: `kernel-scheduler-phase-select` `arg1` carries the window's guard
+acquisitions and `kernel-scheduler-entry` carries the window's dispatch entry
+causes, so **acquisitions per scheduler entry** is comparable across boots whose
+absolute round-trip rates differ. Use it rather than acquisitions per second,
+which moves with how fast the probe itself runs.
+
+Every number below is same-session. The control is the session's starting tree
+in a detached worktree, not the committed baseline, and the order was
+control -> candidate -> control at each topology.
+
+### One vCPU, isolated `ipc_rt_intra_process`
+
+| run | tree | CPUID anchor p50 | IPC min | IPC p50 | acq/entry |
+| --- | --- | ---: | ---: | ---: | ---: |
+| ctrl1 | control | 3,640 | 47,840 | 92,600 | 4.65 |
+| ctrl2 | control | 3,640 | 47,600 | 92,040 | 4.66 |
+| cand9 | candidate | 3,680 | 45,160 | 76,720 | 2.59 |
+| cand14 | candidate | 3,600 | 45,000 | 76,080 | 2.59 |
+| ctrl6 | control | 3,640 | 47,800 | 91,040 | 4.65 |
+
+The anchor is within 1.1% across every run. The two distributions do not
+overlap on either statistic: **min -5.4%**, **p50 -16.7%**, and catalog
+acquisitions per scheduler entry **-44%**. `ipc_split_call_to_recv` min moved
+30,120 -> 27,440 (-8.9%) and `ipc_split_reply_to_return` min did not move,
+which is where the removed acquisitions are: the call admission and the
+receive-side bind, not the reply return.
+
+### Eight vCPUs, isolated `ipc_rt_intra_process`
+
+| run | tree | CPUID anchor p50 | IPC min | IPC p50 | acq/entry |
+| --- | --- | ---: | ---: | ---: | ---: |
+| ctrl3 | control | 3,680 | 61,600 | 187,720 | 3.26 |
+| ctrl4 | control | 3,680 | 58,440 | 185,760 | 3.27 |
+| ctrl5 | control | 3,720 | 55,840 | 184,320 | 3.27 |
+| cand11 | candidate | 3,720 | 57,000 | 174,160 | 2.02 |
+| cand12 | candidate | 3,680 | 55,880 | 172,640 | 2.02 |
+
+The eight-vCPU **minimum makes no claim**: the control's own spread is 10%
+and the two ranges overlap. The p50 ranges do not overlap and the anchors
+agree within 1.1%, so **p50 -6.5%** is repeatable, as is **acq/entry -38%**.
+The eight-vCPU p50 amplification against a fresh one-vCPU p50 is 2.27x on the
+candidate and 2.03x on the control; both exceed the 1.5x structural target and
+neither is closed by this change.
+
+### What was removed, and what was not
+
+Seven per-round-trip catalog acquisitions were removed by giving each question
+a published per-slot answer rather than by shortening a critical section:
+
+- `user_log_ids_for_task` and the terminal reply's scheduling-context custody
+  check now read the seqlock-published per-slot identity through a shared
+  direct-mapped task directory. A hit is revalidated against the exact task id
+  and the owner word's lifetime; a miss falls back to the locked scan.
+- `attach_reserved_ipc_priority` and `cancel_ipc_priority_reservation` touched
+  no catalog state at all. They now call the donation ledger, which has always
+  had its own bounded lock, directly.
+- The synchronous call admission and the receive-side donation bind resolve
+  from CPU-local current-slot publication, the per-slot fair-share weight, and
+  the ledger's own atomics. A scheduling context's identity is a pure function
+  of the slot and the monotonic task bound to it, which is what makes the
+  published binding a complete answer.
+- The wait arm and its cancel now publish the arm and its exact reason as one
+  word, which is the atomicity the catalog guard used to supply, and take
+  `Running(this cpu)` from the owner word as the whole liveness precondition.
+
+### Owner-word block commit
+
+The next cut first packed reason kind, arm, block intent, and runnable intent
+into `RunOwnerWord`, then moved ordinary commit off the catalog. Commit changes
+running+runnable+armed to non-runnable+disarmed with one CAS. A wake that wins
+first clears the arm and makes commit refuse sleep; a wake that follows commit
+restores runnable intent. Exact endpoint identity survives Blocked,
+DirectHandoff, and rollback custody. The locked path remains only when current
+CPU ownership cannot answer.
+
+| one-vCPU isolated run | CPUID p50 | IPC min | IPC p50 |
+| --- | ---: | ---: | ---: |
+| owner-word candidate 1 | 3,640 | 47,440 | 77,880 |
+| owner-word candidate 2 | 3,720 | 47,480 | 78,520 |
+
+Against the preceding candidate's 45,000-45,160 minimum and 76,080-76,720 p50,
+the new minimum is about 5% higher and p50 1.5-3.2% higher. This is not claimed
+as a latency win. It still retains most of the p50 reduction against the
+91,040-92,600 control. The instrumented catalog census fell from 2.59 to
+**1.99 acquisitions per scheduler entry**, which is the structural result.
+
+One admitted eight-vCPU run measured a 4,320-cycle CPUID p50 and
+64,880/175,640 IPC min/p50. A repeat completed inside the guest at a
+3,760-cycle anchor and 61,480/203,640 IPC min/p50, but the product gate rejected
+it after the DVM GPU context was lost; those numbers demonstrate host/product
+variance and are not admitted benchmark evidence.
+
+The first intermediate implementation accidentally cleared the typed receive
+reason at Running -> Blocked and rejected every direct reservation. After
+preserving the reason through Blocked and provisional handoff transitions, an
+IPC-profile run recorded 4,764 reservations, 4,764 committed handoffs, and zero
+receiver-custody rejection. All 17,237 fallbacks were the expected
+`no-waiting-receiver` case. A focused lifecycle test and three implementation
+mutations now pin the exact identity across block, handoff, and rollback.
+
+What still enters the catalog on the ordinary path is dispatch itself, the
+reply wake handoff, pick hints, and retired-task cleanup. The Phase-3 ordinary
+hot-path acquisition-zero gate therefore remains open.
+
+### The dual-authority sweep was reporting a steady state as a divergence
+
+`run_authority::compare` was passed the queued-since stamp as an executing
+task's "still wants to run". Dispatch clears that stamp on the exact task it
+selects, so **every task executing on another CPU** read as divergent. One vCPU
+never showed it because the sweep already excludes the sweeping CPU's own
+current slot, which is the only executing task there is. Measured: 28-30
+`RunningRunnableBit` records per eight-vCPU run on the control, 0 after the
+comparand became the block mirror.
+
+The comparison is also now one-directional, and the direction that was dropped
+is the one that is not remotely observable. A wake clears the block mirror in
+place and the owner word's runnable bit is re-derived at the next
+`mark_slot_ready`, so a remote observer between those two points sees a handoff
+half, exactly like `Migrating`. The surviving direction — the word claims an
+executing task still wants to run while it has blocked in place — is the one
+that would publish a blocked task back onto a run queue, and it still fires.
+
+This is **not** the refuted idea in `structural-ownership-design.md` §2.7 of
+mirroring the runnable bit from `!blocked`. The mirror source is unchanged;
+only the sweep's comparand and its direction changed, and no scheduling
+decision consumes either.
+
+## What the IPC round trip is actually made of, and the two things removed
+
+The previous pass counted global *scheduler catalog* acquisitions. That is one
+lock. This pass counted **every tracked lock class**, which is what the cost
+model needed, and the answer was not the class the lane had been working on.
+
+`work_budget::take_class_census()` takes and clears the per-CPU, per-class
+acquisition counters that `charge_acquire` has always maintained, and the
+scheduler's profile drain renders the top six as `kernel-lock-class-0..5`
+(`arg0` = acquisitions in the window, `arg1` = class index). It is emitted from
+the drain, not from the acquire path, because rendering a milestone takes the
+debug sink.
+
+One vCPU, isolated `ipc_rt_intra_process_reply_recv`, one window:
+
+| class | acquisitions | per round trip |
+| --- | ---: | ---: |
+| `ProcessTable` | 365,807 | ~10.7 |
+| `IpcEndpoint` | 292,046 | ~8.5 |
+| `SchedulerPolicy` | 280,658 | ~8.2 |
+| `IpcReply` | 224,241 | ~6.5 |
+| `SchedulerRunQueue` | 142,788 | ~4.2 |
+| `Scheduler` (the catalog) | 137,618 | ~4.0 |
+
+About forty-two tracked locks per round trip, and the global process table was
+the most-acquired class — ahead of the endpoint object, the reply object, and
+the scheduler catalog the lane had been splitting.
+
+### A debugcon record inside the global scheduler guard
+
+The scheduler's runtime accounting emitted `scheduling-budget-exhausted` from
+inside the guard. A milestone is not a counter: rendering one writes the line
+to the debug port, which is a VM exit per byte under KVM, and the emitter first
+drains whatever deferred records are parked. That put an unbounded host-side
+cost inside the kernel's most serializing critical section.
+
+Splitting the `Account` phase found it. Instrumented build, per one-second
+window:
+
+| | before | after |
+| --- | ---: | ---: |
+| budget charge per dispatch | 5.9–27 us | 0.02–0.03 us |
+| `Account` phase total | 244,085 us | 10,501 us |
+| scheduler guard hold total | 358,280 us | 146,492 us |
+| exhaustion records rendered | ~62/s | ~1/s |
+
+The event is latched and rendered by the profile drain instead, which already
+runs outside every tracked lock; the window's full exhaustion count was always
+carried by `kernel-scheduling-context-budget` and is unchanged.
+
+Shipping build: the round-trip **minimum and p50 did not move**, and the mean
+fell 39% and p99 about 50%. It is a tail fix. `SCHEDULER_GUARD_MAX_DEBUG_SINK_RECORDS`
+is now zero in `rustos-user-abi::performance` with a source witness, because
+there is no such thing as a cheap one.
+
+### The own-thread process pin
+
+A `retain_process` and its release are two acquisitions of the one global
+process table, and the synchronous path was taking them to pin process objects
+its own threads already pinned: `reclaim_slot` refuses while
+`thread_count != 0`. `ProcessRef` now carries either a counted reference or an
+own-thread pin; the pin takes no count and **re-reads** the published state
+pointer on every access rather than caching it, because an exec replaces the
+object and no count holds the old one. Every accessor reachable from the pin
+validates the exact process and MM generation, which is what makes that safe.
+
+`ProcessTable` fell from ~10.7 to ~8.4 acquisitions per round trip. The
+remainder is `live_process_identity`, which `with_exact_visible_state` calls on
+**every** user-memory access and which still enters the table; closing it needs
+the process lifecycle state published per slot with a divergence sweep, exactly
+as `current_identity` was.
+
+### Where the round trip stands
+
+One vCPU, anchor 3,640 in every run, same session as the controls:
+
+| probe | session-start control | now |
+| --- | ---: | ---: |
+| `null_syscall_getpid` min | 1,640 | 1,600 |
+| `sched_yield` min | 8,640 | 9,200 |
+| `ipc_try_recv_empty` min | 6,360 | 5,440 |
+| `ipc_rt_intra_process` min | 47,700 | 44,000 |
+| `ipc_rt_intra_process` p50 | 91,800 | 73,520 |
+| `ipc_rt_intra_process` p99 | ~33,000,000 | 5,648,600 historical best |
+| `ipc_rt_cross_process_syscalld_getuid` min | 59,040 | 55,040 |
+
+The cost model the census supports, for the 44,000-cycle minimum: three syscall
+floors (~4,900), two scheduler dispatches (~15,000, from `sched_yield` minus
+the floor), three IPC syscall shells (~11,500, from `ipc_try_recv_empty` minus
+the floor), and roughly 12,000 of copies and rendezvous. **No single change
+reaches the 20,000–30,000 target**; the dispatch pair and the remaining lock
+classes are each worth about a third of it.
+
+Three bounded final one-vCPU reruns, with CPUID p50 3,760--3,800, measured
+`ipc_rt_intra_process` min 43,560--46,720, p50 75,200--83,360, and p99
+16,952,960--17,201,920. The 5,648,600 row above is therefore a best observed
+tail, not the current repeatable p99. The repeated range is still roughly half
+the session-start ~33M result, but KVM/desktop descheduling remains visible and
+prevents a tighter product-tail claim.
+
+The ranked lock census initially rendered in every shipping profile window.
+At eight vCPUs those debugcon records made the 15-second guest isolation settle
+consume more than the benchmark's 90-second host timeout (the guest advanced
+only about 13 seconds). `drain_class_and_site_census` is now restricted to
+`RUSTOS_LOCK_PHASE_PROFILE=true`; ordinary builds retain exact acquisition
+budget counters but do not drain, rotate, or render the diagnostic census.
+The immediate eight-vCPU rerun then completed in about 31 seconds host time:
+CPUID p50 3,760, IPC min 62,560, p50 202,560, and p99 36,698,960 cycles. This
+closes the benchmark-liveness regression; it does not establish an SMP latency
+improvement against the earlier 172,640--175,640 p50 controls, and the p99 is
+still dominated by multicore contention and host scheduling.
+
+### The fastpath was missing four times out of five, and that was not the cost
+
+`ipcbench`'s intra-process server replied and received as two syscalls.
+The rendezvous fastpath requires a receiver already parked on the endpoint —
+seL4's has the identical precondition — and a server that returns to ring3
+between its reply and its next receive loses that race to the caller it just
+woke. Measured: 22,002 admission attempts, **17,472 (79%) fell back**, every
+one of them `FallbackNoFrame`, which is that race and not a capacity limit.
+
+`ipc_rt_intra_process_reply_recv` is the same client against a server using the
+fused reply-and-receive call that `syscalld`, `loaderd`, and `inputd` all use.
+It hits the fastpath **22,002 out of 22,002**. Its minimum is *higher*
+(48,000 against 44,000) and its p50 much lower (52,400 against 73,520): the
+fastpath buys consistency, not a shorter critical path. The cross-process
+`syscalld getuid` probe already hit the fastpath 100% of the time and costs
+55,040, so a fastpath hit is not where the missing 20,000 cycles are. Both
+probes are kept; averaging them would hide exactly this.
+
+### The lock count is the cost, not the lock
+
+Per-acquisition attribution, `RUSTOS_LOCK_PHASE_PROFILE=true`, one vCPU. That
+build is itself 46% slower (64,280 against 43,880), so read the proportions,
+not the absolute figures:
+
+| lock phase | cycles/acquisition |
+| --- | ---: |
+| `release` (covers the four below) | 397 |
+| `before-acquire` (covers irq-usage/task-edges/raw-edges) | 191 |
+| `release-identity` | 137 |
+| `after-acquire` | 87 |
+| `release-enable` | 83 |
+| `release-stack` | 82 |
+| `spin` (uncontended) | 60 |
+| `before-irq-usage`, `before-task-edges`, `before-raw-edges`, `release-unlock` | 30–34 each |
+
+Roughly 735 instrumented cycles per tracked acquisition, and **no dominant
+sub-phase**: the cost is spread across admission, the held-class stack, and
+release. That is the answer to "make the lock cheaper" -- there is no single
+thing to remove. At about forty-two acquisitions per round trip the class
+census gives, tracked locking is on the order of 20,000 of the 43,880-cycle
+minimum, and the only lever that moves it is **acquiring fewer of them**.
+
+**Refuted here, recorded so it is not retried.** `find_task_stack` scans the
+occupancy bitmap of a 512-entry table on every sleepable acquire and release,
+which reads like an O(live-lock-holders) hot-path scan. A direct-mapped,
+revalidated `owner -> slot` hint of exactly the shape that paid for the task
+directory measured 43,880 against 44,000 with an identical 3,640 anchor -- no
+change. The scan is short because few tasks hold a sleepable lock at once. It
+was reverted rather than kept as scaling insurance, for the same reason the
+per-slot execution-owner word was.

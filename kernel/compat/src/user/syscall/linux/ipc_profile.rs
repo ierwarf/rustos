@@ -14,9 +14,12 @@
 //! `rtc::ticks()` at 1024 Hz. That is ~1 ms of resolution against phases the
 //! bench measures in microseconds, so it can only see a stall, never a cost.
 
+#[cfg(rustos_ipc_phase_profile)]
 use nucleus_core::debug::LogCategory;
+#[cfg(rustos_ipc_phase_profile)]
 use nucleus_core::debug::phase_profile::{PhaseProfile, phase_now};
 
+#[cfg(any(test, rustos_ipc_phase_profile))]
 pub(super) const IPC_CALL_PHASE_COUNT: usize = 12;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -50,6 +53,7 @@ pub(super) enum IpcCallPhase {
     EnqueueWake = 11,
 }
 
+#[cfg(rustos_ipc_phase_profile)]
 static PROFILE: PhaseProfile<IPC_CALL_PHASE_COUNT> = PhaseProfile::new(
     LogCategory::Compat,
     [
@@ -72,20 +76,40 @@ static PROFILE: PhaseProfile<IPC_CALL_PHASE_COUNT> = PhaseProfile::new(
 /// Reads the cycle counter for a phase boundary.
 #[inline]
 pub(super) fn now() -> u64 {
-    phase_now()
+    #[cfg(rustos_ipc_phase_profile)]
+    {
+        phase_now()
+    }
+    #[cfg(not(rustos_ipc_phase_profile))]
+    {
+        0
+    }
 }
 
 /// Charges `phase` with the interval since `since` and returns the boundary
 /// timestamp, so consecutive phases chain without a second read.
 #[inline]
 pub(super) fn charge(phase: IpcCallPhase, since: u64) -> u64 {
-    PROFILE.charge(phase as usize, since)
+    #[cfg(rustos_ipc_phase_profile)]
+    {
+        PROFILE.charge(phase as usize, since)
+    }
+    #[cfg(not(rustos_ipc_phase_profile))]
+    {
+        let _ = (phase, since);
+        0
+    }
 }
 
 /// Emits one fixed record per phase at most once per second and clears the
 /// window. Returns the number of records emitted so housekeeping can count it
 /// as work.
 pub fn drain_ipc_call_profile() -> usize {
+    #[cfg(not(rustos_ipc_phase_profile))]
+    {
+        return 0;
+    }
+    #[cfg(rustos_ipc_phase_profile)]
     PROFILE.drain(
         crate::arch::rtc::ticks(),
         crate::arch::rtc::ticks_per_second(),
@@ -99,6 +123,11 @@ pub fn drain_ipc_call_profile() -> usize {
 /// charges sitting in the live counters, undrained and therefore invisible to
 /// a log capture that stops as soon as the probe's own end marker appears.
 pub fn force_drain_ipc_call_profile() -> usize {
+    #[cfg(not(rustos_ipc_phase_profile))]
+    {
+        return 0;
+    }
+    #[cfg(rustos_ipc_phase_profile)]
     PROFILE.drain(crate::arch::rtc::ticks(), 0)
 }
 

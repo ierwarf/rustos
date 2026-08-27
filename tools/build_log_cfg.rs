@@ -55,7 +55,7 @@ pub struct LoggingConfig {
 
 /// A telemetry section whose only key is `phase_profile`.
 ///
-/// Three of these now exist -- lock, scheduler, and syscall -- because the same
+/// Four of these now exist -- lock, scheduler, syscall, and IPC -- because the same
 /// defect keeps recurring: a per-phase timing profile wrapped around an
 /// operation cheaper than the profile. Each was found the same way, by stubbing
 /// it out and measuring, and each cost more than what it measured. The lock
@@ -85,6 +85,15 @@ pub const SYSCALL_PHASE_PROFILE: PhaseProfileSection = PhaseProfileSection {
     cfg: "rustos_syscall_phase_profile",
 };
 
+/// The IPC caller/receiver phases and fast-handoff rejection counters add TSC
+/// reads and shared atomic traffic to every synchronous request. Keep them out
+/// of shipping builds; a diagnosis build can turn them on for one bounded run.
+pub const IPC_PHASE_PROFILE: PhaseProfileSection = PhaseProfileSection {
+    section: "ipc_telemetry",
+    env: "RUSTOS_IPC_PHASE_PROFILE",
+    cfg: "rustos_ipc_phase_profile",
+};
+
 /// Exact process lifecycle marker emission. This performs a formatted
 /// debugcon publication per stage and therefore must never contaminate the
 /// shipping lifecycle latency run.
@@ -94,9 +103,10 @@ pub const LIFECYCLE_TRACE: PhaseProfileSection = PhaseProfileSection {
     cfg: "rustos_lifecycle_trace",
 };
 
-pub const PHASE_PROFILE_SECTIONS: [PhaseProfileSection; 3] = [
+pub const PHASE_PROFILE_SECTIONS: [PhaseProfileSection; 4] = [
     SCHEDULER_PHASE_PROFILE,
     SYSCALL_PHASE_PROFILE,
+    IPC_PHASE_PROFILE,
     LIFECYCLE_TRACE,
 ];
 

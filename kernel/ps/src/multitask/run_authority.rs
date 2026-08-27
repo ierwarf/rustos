@@ -107,10 +107,14 @@ pub(super) enum QueueOwner {
 /// not yet been adopted, so the two sources are allowed to describe different
 /// halves of that handoff.
 ///
-/// `legacy_running_is_runnable` is the old readiness mirror for the executing task. The
-/// owner word cannot be compared against a position for that case, because
-/// `Running` is a position and "still wants to run" is not; they are the two
-/// facts Linux keeps apart in `p->on_rq` and the task state.
+/// `legacy_running_is_runnable` is the legacy block mirror for the executing
+/// task, inverted. Only a word that claims runnable against a blocked mirror is
+/// a divergence; see the `Running`/`Running` arm. The owner word cannot be compared against a position for
+/// that case, because `Running` is a position and "still wants to run" is not;
+/// they are the two facts Linux keeps apart in `p->on_rq` and the task state.
+/// It must not be derived from the queued-since stamp: dispatch clears that
+/// stamp on the task it selects, so every task executing on another CPU would
+/// report a divergence it does not have.
 pub(super) const fn compare(
     queue: QueueOwner,
     legacy: LegacyPosition,
@@ -124,13 +128,21 @@ pub(super) const fn compare(
         {
             Some(Mismatch::RunningOnDifferentCpus)
         }
-        (QueueOwner::Running(_, runnable), LegacyPosition::Running(_)) => {
-            if runnable == legacy_running_is_runnable {
-                None
-            } else {
-                Some(Mismatch::RunningRunnableBit)
-            }
+        // Only one direction is observable from another CPU. The owning CPU
+        // re-derives this bit from `!retired && !blocked && frame validates` in
+        // its own dispatch prologue, immediately before the bit decides
+        // anything, so a wake that clears `blocked` in place legitimately
+        // leaves the word behind until that refresh -- the same kind of
+        // handoff half the `Migrating` case is silent about. The dangerous
+        // direction is the one that survives a refresh: a word claiming an
+        // executing task still wants to run while it has blocked in place,
+        // which is what would publish a blocked task back onto a run queue.
+        (QueueOwner::Running(_, true), LegacyPosition::Running(_))
+            if !legacy_running_is_runnable =>
+        {
+            Some(Mismatch::RunningRunnableBit)
         }
+        (QueueOwner::Running(_, _), LegacyPosition::Running(_)) => None,
         (QueueOwner::Running(_, _), LegacyPosition::Transition(_)) => None,
         (QueueOwner::Running(_, _), _) => Some(Mismatch::QueueRunningLegacyNot),
         (_, LegacyPosition::Running(_)) => Some(Mismatch::LegacyRunningQueueNot),
@@ -242,7 +254,7 @@ mod tests {
             None
         );
         // A task that blocked while executing but whose bit is still set would
-        // be re-queued; the reverse strands a runnable task.
+        // be re-queued off a run queue it does not belong on.
         assert_eq!(
             compare(
                 QueueOwner::Running(1, true),
@@ -251,13 +263,17 @@ mod tests {
             ),
             Some(Mismatch::RunningRunnableBit)
         );
+        // The opposite direction is a handoff half, not a divergence: a wake
+        // clears the block mirror in place, and the executing CPU re-derives
+        // the bit from that mirror in its own dispatch prologue before the bit
+        // decides anything. Reporting it made every remote wake look divergent.
         assert_eq!(
             compare(
                 QueueOwner::Running(1, false),
                 LegacyPosition::Running(1),
                 true
             ),
-            Some(Mismatch::RunningRunnableBit)
+            None
         );
         // A different CPU still outranks the bit: that one is fatal after the
         // cutover, this one is a scheduling error.
