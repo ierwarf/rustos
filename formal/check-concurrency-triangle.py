@@ -6,6 +6,7 @@ from __future__ import annotations
 import csv
 import pathlib
 import re
+import concurrent.futures
 import subprocess
 import sys
 import tomllib
@@ -96,8 +97,14 @@ def main() -> None:
             ]
         loom_source = rust_tree_source(LOOM_ROOT)
         shuttle_source = rust_tree_source(SHUTTLE_ROOT)
-        loom_tests = compiled_tests(LOOM_MANIFEST)
-        shuttle_tests = compiled_tests(SHUTTLE_MANIFEST)
+        # Two independent manifests, each paying its own Cargo entry and build.
+        # Listing them concurrently made this lane's dominant cost a maximum
+        # rather than a sum; the calls share nothing but the repository root.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            loom_future = pool.submit(compiled_tests, LOOM_MANIFEST)
+            shuttle_future = pool.submit(compiled_tests, SHUTTLE_MANIFEST)
+            loom_tests = loom_future.result()
+            shuttle_tests = shuttle_future.result()
         herd_seen: set[str] = set()
         for entry in scenarios:
             ident = entry["id"]

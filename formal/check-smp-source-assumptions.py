@@ -57,6 +57,12 @@ def source_digest(paths: list[Path]) -> str:
     return digest.hexdigest()
 
 
+# "Immediately before, in the same critical section" as a number. Wide enough
+# for the intervening lines these sites actually have, narrow enough that a
+# precondition moved to another function or another lock hold fails.
+AUDITED_FAIL_STOP_MAX_DISTANCE = 1200
+
+
 def main() -> int:
     manifest = tomllib.loads(CONTRACT.read_text(encoding="utf-8"))
     if manifest.get("schema") != "rustos-smp-source-contracts-v1":
@@ -139,6 +145,46 @@ def main() -> int:
                     f"the caller must fall back instead"
                 )
 
+    # The other half of the rule above. A fail-stop on a commit is sound when
+    # the precondition it asserts is established inside the same critical
+    # section, immediately before it, leaving no window for the two to disagree
+    # across. Recording that keeps a completed audit from being redone, and
+    # pinning both statements plus their distance makes the entry go stale --
+    # rather than silently becoming the defect -- if anyone moves the
+    # establishing statement away from the commit it guards.
+    audited_fail_stops = 0
+    for entry in manifest.get("audited_fail_stops", []):
+        audited_fail_stops += 1
+        checks += 1
+        name = entry["name"]
+        relative = entry["path"]
+        path = by_relative.get(relative)
+        if path is None:
+            errors.append(f"audited fail-stop {name}: source is absent: {relative}")
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        establishes = text.find(entry["establishes"])
+        fail_stop = text.find(entry["fail_stop"], max(establishes, 0))
+        if establishes < 0:
+            errors.append(
+                f"audited fail-stop {name}: the establishing statement is gone "
+                f"from {relative}: {entry['establishes']!r}"
+            )
+            continue
+        if fail_stop < 0:
+            errors.append(
+                f"audited fail-stop {name}: the fail-stop no longer follows its "
+                f"establishing statement in {relative}: {entry['fail_stop']!r}"
+            )
+            continue
+        distance = fail_stop - establishes
+        if distance > AUDITED_FAIL_STOP_MAX_DISTANCE:
+            errors.append(
+                f"{relative}: audited fail-stop {name} is now {distance} characters "
+                f"after the statement that establishes it; re-audit it as an "
+                f"admit/commit pair or move them back together"
+            )
+
     unsafe_impls = 0
     for relative, path in by_relative.items():
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -210,7 +256,8 @@ def main() -> int:
     print(
         "SMP source assumptions passed "
         f"checks={checks} files={len(paths)} per_cpu_statics={per_cpu_statics} "
-        f"admit_commit_pairs={admit_commit_pairs}"
+        f"admit_commit_pairs={admit_commit_pairs} "
+        f"audited_fail_stops={audited_fail_stops}"
     )
     return 0
 

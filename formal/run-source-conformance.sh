@@ -1722,6 +1722,15 @@ cpu-online-lifecycle/CpuOnlineLifecycle|kernel-executive|boot::tests::ap_cache_a
 cpu-online-lifecycle/CpuOnlineLifecycle|kernel-executive|boot::tests::local_apic_uses_one_permanent_uncached_direct_map_alias
 EOF
 
+# Every group is an independent Cargo selection over an already-built target
+# directory, and there are fewer groups than cores. Re-entering Cargo once per
+# package/feature pair was this lane's dominant cost, and running the groups
+# concurrently turns that sum into a maximum. Only the execution moves:
+# verification below still walks `group_order` in registry order, so a failure
+# names the same group, witness, and count it always did.
+run_dir="$(mktemp -d)"
+trap 'rm -f "$records" "$seen"; rm -rf "$run_dir"' EXIT
+group_index=0
 for group in "${group_order[@]}"; do
     package="${group%%|*}"
     features="${group#*|}"
@@ -1735,21 +1744,34 @@ for group in "${group_order[@]}"; do
     cargo_args+=(-- --exact "${names[@]}")
     # `kernel-ps` witnesses share architecture-test publication state (GDT,
     # runqueue and process-table reset fixtures). Their production protocol is
-    # concurrent, but these host fixtures are intentionally single-owner; run
-    # the bounded witness group serially rather than letting one reset another
-    # witness's synthetic scheduler while it is allocating a slot.
-    if [[ "$package" == "kernel-ps" ]]; then
-        output="$(RUST_TEST_THREADS=1 cargo "${cargo_args[@]}" 2>&1)" || {
-            printf '%s\n' "$output" >&2
-            echo "source conformance witnesses failed for $package${features:+ [$features]}" >&2
-            exit 1
-        }
-    else
-        output="$(cargo "${cargo_args[@]}" 2>&1)" || {
-            printf '%s\n' "$output" >&2
-            echo "source conformance witnesses failed for $package${features:+ [$features]}" >&2
-            exit 1
-        }
+    # concurrent, but these host fixtures are intentionally single-owner; keep
+    # that group's own threads at one rather than letting one witness reset
+    # another's synthetic scheduler while it is allocating a slot. Running it
+    # beside *other* packages is unaffected: the fixtures are process-local.
+    (
+        if [[ "$package" == "kernel-ps" ]]; then
+            RUST_TEST_THREADS=1 cargo "${cargo_args[@]}" > "$run_dir/$group_index.out" 2>&1
+        else
+            cargo "${cargo_args[@]}" > "$run_dir/$group_index.out" 2>&1
+        fi
+        printf '%s' "$?" > "$run_dir/$group_index.rc"
+    ) &
+    group_index=$((group_index + 1))
+done
+wait
+
+group_index=0
+for group in "${group_order[@]}"; do
+    package="${group%%|*}"
+    features="${group#*|}"
+    mapfile -t names < <(printf '%s' "${group_tests[$group]}" | sed '/^$/d')
+    output="$(cat "$run_dir/$group_index.out")"
+    group_rc="$(cat "$run_dir/$group_index.rc")"
+    group_index=$((group_index + 1))
+    if [[ "$group_rc" != "0" ]]; then
+        printf '%s\n' "$output" >&2
+        echo "source conformance witnesses failed for $package${features:+ [$features]}" >&2
+        exit 1
     fi
     for name in "${names[@]}"; do
         # libtest decorates a `#[should_panic]` witness, and a registered test
@@ -1775,15 +1797,20 @@ for group in "${group_order[@]}"; do
     fi
     while IFS='|' read -r model row_package row_test row_features; do
         [[ -n "$model" ]] || continue
-        jq -cn --arg model "$model" --arg package "$row_package" --arg test "$row_test" \
-            --arg features "$row_features" \
-            '{model:$model,package:$package,test:$test,features:$features,status:"passed"}' >> "$records"
+        # One `jq` per witness spawned it 619 times to build 619 one-line
+        # objects. The row is already the exact `|`-separated witness key that
+        # was validated on the way in, so it is recorded verbatim and converted
+        # once below.
+        printf '%s|%s|%s|%s\n' "$model" "$row_package" "$row_test" "$row_features" >> "$records"
         checks=$((checks + 1))
     done <<<"${group_rows[$group]}"
 done
 
-jq -s --arg schema rustos-formal-source-conformance-v1 \
-    '{schema:$schema,status:"passed",checks:length,models:(map(.model)|unique|length),results:.}' \
+jq -R -s --arg schema rustos-formal-source-conformance-v1 \
+    'split("\n")
+     | map(select(length > 0) | split("|")
+         | {model:.[0],package:.[1],test:.[2],features:(.[3] // ""),status:"passed"})
+     | {schema:$schema,status:"passed",checks:length,models:(map(.model)|unique|length),results:.}' \
     "$records" > "$artifact_dir/summary.json"
 printf 'source conformance passed checks=%s models=%s\n' "$checks" \
     "$(jq -r '.models' "$artifact_dir/summary.json")"

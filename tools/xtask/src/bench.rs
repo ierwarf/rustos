@@ -731,10 +731,20 @@ pub(crate) fn bench(
         kvm_args.push("--ipcbench-probe".to_owned());
         kvm_args.push(probe.to_owned());
     }
-    kvm::kvm_benchmark_command(config, kvm_args.into_iter())
-        .context("boot the interactive topology and wait for the ipcbench end marker")?;
+    let launch = kvm::kvm_benchmark_command(config, kvm_args.into_iter())
+        .context("boot the interactive topology and wait for the ipcbench end marker");
 
     let log_path = config.build_dir.join("kvm/rustos-debugcon.log");
+    // Archive before propagating the launch error. The next run truncates this
+    // path, so a guest panic that reproduces once in twenty used to cost a
+    // whole fresh repro loop to see its message again -- the run that produced
+    // it had already overwritten the evidence by the time anyone looked. The
+    // canonical path is unchanged for every consumer; this only keeps copies
+    // beside it.
+    if let Err(error) = kvm::archive_run_log(&log_path) {
+        eprintln!("xtask: could not archive the debugcon log: {error:#}");
+    }
+    launch?;
     let log = fs::read_to_string(&log_path)
         .with_context(|| format!("read debugcon log {}", log_path.display()))?;
     let run = parse_log(&log)?;

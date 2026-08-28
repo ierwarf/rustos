@@ -1227,3 +1227,50 @@ fn start_dvm_input_doorbell(layout: &KvmLayout) -> Result<IvshmemDoorbellServer>
         })?;
     IvshmemDoorbellServer::start_input(&layout.dvm_input_doorbell, &backing)
 }
+
+/// How many past debugcon logs to keep beside the canonical one.
+///
+/// A repro loop is tens of runs, and a log is a few megabytes; keeping the
+/// window a little larger than one loop is what makes "run 17 failed" still
+/// answerable after the loop has moved on.
+const DEBUGCON_HISTORY_LIMIT: usize = 48;
+
+/// Copies one finished run's log into a bounded per-run history.
+///
+/// Best effort by design: losing an archive copy must never fail a run that
+/// otherwise succeeded, and the canonical log is still written either way.
+pub(crate) fn archive_run_log(log_path: &Path) -> Result<()> {
+    if !log_path.exists() {
+        return Ok(());
+    }
+    let history_dir = log_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("debugcon-history");
+    fs::create_dir_all(&history_dir)
+        .with_context(|| format!("create {}", history_dir.display()))?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_millis())
+        .unwrap_or(0);
+    let destination = history_dir.join(format!("{stamp}-{}.log", std::process::id()));
+    fs::copy(log_path, &destination)
+        .with_context(|| format!("archive debugcon log to {}", destination.display()))?;
+
+    // Prune oldest-first by name, which sorts by the millisecond stamp it
+    // starts with, so the window stays bounded without stat-ing every entry.
+    let mut existing: Vec<_> = fs::read_dir(&history_dir)
+        .with_context(|| format!("read {}", history_dir.display()))?
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "log"))
+        .collect();
+    existing.sort();
+    for stale in existing
+        .iter()
+        .take(existing.len().saturating_sub(DEBUGCON_HISTORY_LIMIT))
+    {
+        let _ = fs::remove_file(stale);
+    }
+    Ok(())
+}

@@ -2168,10 +2168,36 @@ commit sits inside an `assert!`, `panic!`, or `expect`. It was verified by
 reintroducing the assert, which it named by file and line, and it caught a
 later refactor of its own commit token.
 
-Three fail-stops of the same shape are **not** registered because their
-disposition has not been audited: `publish_runqueue_wake` in the balance phase,
-and `rollback_direct_handoff` / `materialize_direct_handoff`. Registering a pair
-should mean its disposition is established, so these are backlog, not omissions.
-The main-path `claim_dispatch(next_idx)` assert was audited and left alone:
-every selection arm re-admits its winner after the last owner-word mutation in
-that dispatch, so it is sound under the single global lock.
+The rest of the family was then audited, and **the two fixed above were its
+only defects**. Every other fail-stop of this shape is sound for one reason:
+the precondition it asserts is established inside the same critical section,
+immediately before it, so there is no window for the two to disagree across.
+
+| fail-stop | what establishes it |
+| --- | --- |
+| `publish_runqueue_wake` (balance phase) | the `publish_blocked` on the line above sets `Blocked`, which is exactly what the wake requires |
+| `rollback_direct_handoff` | undoes a `DirectHandoff` custody this branch published two statements earlier |
+| `materialize_direct_handoff` | the same, on the reply side |
+| `drain_remote_wakes` (idle steal) | `rehome_queued` returned `Published` to this target CPU on the line above |
+| activation cohort `wake_task_slot` | preflight and publication are two passes of one `&mut self` call under the global lock |
+| main-path `claim_dispatch(next_idx)` | every selection arm re-admits its winner after the last owner-word mutation in that dispatch |
+
+That distinction is now checked rather than merely written down.
+`[[audited_fail_stops]]` in `formal/smp-source-contracts.toml` pins each
+establishing statement, its fail-stop, and the distance between them, so moving
+a precondition away from the commit it guards fails the gate instead of quietly
+recreating the defect. Verified by inserting filler between one pair, which the
+checker reported by name and character distance.
+
+Two candidates were examined and dismissed with reasons worth keeping. The
+cross-CPU fast-IPC `enqueue_synchronous_handoff_slot` assert looked wrong
+because the same-CPU branch beside it treats the same failure as an ordinary
+outcome, but the queue holds `MAX_TASK` entries and dedupes by task id, so it
+cannot overflow; the asymmetry is defensiveness, not a hazard. The `ENDPOINT_MESSAGES.remove`
+assert in `ipc-runtime` is `#[cfg(test)]` fault injection.
+
+The activation preflight is worth reading as precedent: its comment records an
+earlier defect of exactly this class, where a supervisor choosing its own thread
+count could drive the cohort past the handoff FIFO and panic ring0. The fix was
+the same one -- decide it where the answer is knowable, and return a clean
+refusal instead of a fail-stop.

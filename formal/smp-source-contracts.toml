@@ -770,3 +770,53 @@ admit_token = "pub(super) fn is_current_cpu_dispatchable(slot: usize, cpu: usize
 commit_path = "kernel/ps/src/multitask/scheduler/runqueue_policy.rs"
 commit_token = "fallback_slot_for(current_slot, idle_slot, current_claimed)"
 commit_call = "claimable_fallback_slot("
+
+# A fail-stop on a commit is sound when the precondition it asserts is
+# established inside the same critical section, immediately before it. That is
+# the property separating these from the two admit/commit pairs above, whose
+# preconditions came from an admission scan and could therefore go stale. Each
+# entry below is a completed audit; the checker pins both statements and their
+# distance, so moving a precondition away from the commit it guards makes the
+# entry fail rather than quietly recreating the defect.
+
+# The wake's precondition is the `publish_blocked` on the line above it: the
+# owner word is `Blocked` because this statement just made it so.
+[[audited_fail_stops]]
+name = "affinity-excluded-current-rehome"
+path = "kernel/ps/src/multitask/scheduler.rs"
+establishes = "runqueue::publish_blocked(current_slot, current_cpu, weight);\n                    assert!("
+fail_stop = "self.publish_runqueue_wake(current_slot),"
+
+# The rollback undoes a `DirectHandoff` custody this same branch published two
+# statements earlier, after the ordering enqueue declined it.
+[[audited_fail_stops]]
+name = "fast-ipc-call-ordering-rollback"
+path = "kernel/ps/src/multitask/scheduler.rs"
+establishes = "runqueue::publish_direct_handoff(receiver_slot, current_cpu),"
+fail_stop = "runqueue::rollback_direct_handoff(receiver_slot, current_cpu),"
+
+# Same shape on the reply side: the caller's `DirectHandoff` custody was
+# published here, and the fair-queue materialization is its fallback.
+[[audited_fail_stops]]
+name = "fast-ipc-reply-fallback-materialize"
+path = "kernel/ps/src/multitask/scheduler.rs"
+establishes = "runqueue::publish_direct_handoff(caller_slot, current_cpu),"
+fail_stop = "runqueue::materialize_direct_handoff("
+
+# The mailbox is non-empty because `rehome_queued` returned `Published` to this
+# exact target CPU on the line above.
+[[audited_fail_stops]]
+name = "idle-steal-mailbox-drain"
+path = "kernel/ps/src/multitask/scheduler/runqueue_policy.rs"
+establishes = "assert_eq!(cpu, target_cpu, \"idle steal crossed target CPU\");"
+fail_stop = "runqueue::drain_remote_wakes(target_cpu) != 0,"
+
+# Preflight and publication are two passes of one `&mut self` call under the
+# global scheduler lock, separated only by a callback contracted to be bounded,
+# infallible registry mutation. The cohort size that could once reach the
+# enqueue and panic ring0 is rejected by the preflight itself.
+[[audited_fail_stops]]
+name = "atomic-activation-cohort-publication"
+path = "kernel/ps/src/multitask/scheduler/handoffs.rs"
+establishes = "expect(\"scheduler activation preflight target disappeared\");"
+fail_stop = "self.wake_task_slot(slot),"

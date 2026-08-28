@@ -1628,9 +1628,11 @@ The formal seal binds to the source tree and is a precondition for the bench, so
 file -- including a markdown file -- can change while an 8-vCPU repro loop runs.
 Everything below follows from that.
 
-1. **`build/kvm/rustos-debugcon.log` is overwritten every run.** A 1-in-20
-   panic whose log is gone costs a fresh 50-minute loop to recapture. That
-   happened in this session. Suffix the log with the run id.
+1. ~~**`build/kvm/rustos-debugcon.log` is overwritten every run.**~~ **Done.**
+   Every bench run now copies its log to `build/kvm/debugcon-history/`, bounded
+   to the newest 48, and it archives *before* propagating a launch failure --
+   which is the case that mattered, since the failing run is the one whose
+   evidence used to be gone by the time anyone looked.
 2. **Bind the bench's seal to the built image, or exempt non-code paths.** A
    markdown edit invalidating a boot image's provenance is pure friction and is
    what makes the two activities exclusive.
@@ -1647,3 +1649,40 @@ The remaining cost is the problem, not the tooling: a defect that appears at 8
 vCPU roughly one run in ten needs ~25 runs to confirm a fix. The four items
 above do not remove that hour; they make it possible to do something else
 during it.
+
+
+## Verification lane costs, measured
+
+The earlier claim in this document that a 25-run 8-vCPU loop costs ~50 minutes
+was wrong; one bench run is 25 seconds, so the loop is 12-20 minutes. The rest
+of the incremental cycle, warm:
+
+| step | before | after |
+| --- | ---: | ---: |
+| `cargo xtask check` (one file) | 6s | 6s |
+| `cargo xtask build` | 13s | 13s |
+| `formal/verify-all.sh --profile pr` | 46s | **18s** |
+| `formal/run-source-conformance.sh` | 21s | **6s** |
+| `cargo test` (7 packages) | 5s | 5s |
+| one `cargo xtask bench` | 25s | 25s |
+| `run-implementation-mutations.sh` (incremental) | 1s | 1s |
+
+Two changes account for it, both in `run-source-conformance.sh`, which was 76%
+of `verify-all`. Its 14 per-package/feature `cargo test --exact` groups now run
+concurrently and are verified afterwards in registry order, so a failure still
+names the same group; and the per-witness `jq` -- 619 process spawns to build
+619 one-line objects -- became one invocation over the `|`-separated rows that
+were already validated on the way in. `summary.json` is unchanged, which is the
+check that matters. `check-concurrency-triangle.py` lists its two independent
+manifests concurrently, which only shows up on a cold build.
+
+**Refuted, so it is not retried.** Raising `shard_count`'s cap in
+`run-implementation-mutations.py` looked obvious on a 16-core machine with
+330 GB free. Sixteen mutants measured 21s at four shards and 22s at eight. The
+cap is not the bottleneck and was left alone.
+
+What is still worth doing, in order: bind the bench seal to the built image (or
+exempt non-code paths) so a markdown edit stops invalidating a boot image and
+verification stops being exclusive with reproduction; and add
+`cargo xtask soak --rustos-vcpus 8 --runs N`, which this session hand-rolled
+three times.
