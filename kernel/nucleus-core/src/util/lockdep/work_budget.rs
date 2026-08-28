@@ -595,6 +595,13 @@ impl Drop for LockBudget {
 
 #[cfg(test)]
 mod tests {
+    //! `ACQUIRES` and the identity-derivation counters are one process-global
+    //! array each, and `cargo test` runs this module's cases on parallel
+    //! threads against the same host CPU index. **Every case that charges a
+    //! lock class must therefore own that class alone.** Two cases sharing one
+    //! meant each could observe the other's charges: they passed in isolation
+    //! and failed roughly one loaded run in ten, which reads as flakiness
+    //! rather than as the sharing it is.
     use super::*;
 
     /// The ceiling is the point of the type, so the test that matters is that
@@ -626,12 +633,19 @@ mod tests {
 
     /// A budget must never fail a scope whose counter stopped being its own.
     /// Without this the first contended run turns a diagnostic into a crash.
+    ///
+    /// The class is `IpcMessage` rather than `ProcessState` for the reason in
+    /// this module's test note: `ACQUIRES` is one process-global array and the
+    /// suite runs in parallel, so sharing a class with
+    /// `a_scope_that_exceeds_its_declared_ceiling_panics` meant each test could
+    /// see the other's charges. It failed roughly one loaded run in ten while
+    /// passing every run in isolation.
     #[test]
     fn a_scope_that_lost_the_cpu_or_the_task_declines_to_judge() {
         let cpu = current_cpu_index();
-        let class_index = usize::from(LockClass::ProcessState as u8);
+        let class_index = usize::from(LockClass::IpcMessage as u8);
 
-        let mut budget = declare(LockClass::ProcessState, 0);
+        let mut budget = declare(LockClass::IpcMessage, 0);
         for _ in 0..8 {
             charge_acquire(cpu, class_index);
         }
@@ -644,7 +658,7 @@ mod tests {
         drop(budget);
 
         // A different CPU's counter is likewise not this scope's.
-        let mut budget = declare(LockClass::ProcessState, 0);
+        let mut budget = declare(LockClass::IpcMessage, 0);
         charge_acquire(cpu, class_index);
         budget.cpu = cpu.wrapping_add(1) % MAX_TRACKED_CPUS;
         if budget.cpu != cpu {

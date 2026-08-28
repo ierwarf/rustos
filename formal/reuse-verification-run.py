@@ -9,25 +9,8 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from source_binding import source_tree_sha256
 
-
-def source_tree_sha256(root: Path) -> str:
-    output = subprocess.run(
-        [
-            "git", "ls-files", "-z", "--cached", "--others",
-            "--exclude-standard",
-        ],
-        cwd=root,
-        check=True,
-        capture_output=True,
-    ).stdout
-    digest = hashlib.sha256()
-    for raw_path in sorted(path for path in output.split(b"\0") if path):
-        digest.update(raw_path)
-        digest.update(b"\0")
-        digest.update((root / raw_path.decode("utf-8")).read_bytes())
-        digest.update(b"\0")
-    return digest.hexdigest()
 
 
 def sha256(path: Path) -> str:

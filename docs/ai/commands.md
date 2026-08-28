@@ -391,6 +391,23 @@ fallback.
   validation, so a failed verification refuses the launch; `--no-auto-verify`
   restores the plain refusal. `kvm-smoke` is unchanged and still requires the
   seal up front.
+- A defect that appears in roughly one boot of ten is a reproduction question,
+  not a measurement one: `cargo xtask soak --runs 25 --rustos-vcpus 8` repeats
+  the bench lane, keeps going past a failure, and names every failed run with
+  the guest's own panic line. Each run's debugcon log is archived to
+  `build/kvm/debugcon-history/` (newest 48) *before* a launch failure is
+  propagated, so the failing run's evidence survives the next run's truncation.
+  `soak` derives no measurement of its own; the per-run `bench` tables remain
+  the only measurement surface.
+- `formal/binding-exempt-paths.txt` lists the prose documents excluded from the
+  verification-run source binding, so editing them does not invalidate a seal
+  and refuse the next `cargo xtask bench`. `formal/check-binding-exemptions.py`
+  proves nothing under `formal/` or `tools/` reads an exempt path; adding a
+  document that any lane consumes fails the gate. Every Python consumer of the
+  binding shares `formal/source_binding.py`, and the Rust comparison in
+  `tools/xtask/src/formal_contracts/evidence.rs` reads the same list -- four
+  copies of one hash was four chances to disagree, and a disagreement fails
+  every binding check at once.
 - Iterative SMP debugging uses `bash formal/verify-smp-iteration.sh` followed
   by `cargo xtask kvm-smoke --timeout 30 --rustos-vcpus <1|2|4|8>
   --smp-iteration --smp-ring3-qualification --smp-evidence-cohort <32hex>`.

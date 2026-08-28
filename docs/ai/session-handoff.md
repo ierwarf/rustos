@@ -1681,8 +1681,38 @@ manifests concurrently, which only shows up on a cold build.
 330 GB free. Sixteen mutants measured 21s at four shards and 22s at eight. The
 cap is not the bottleneck and was left alone.
 
-What is still worth doing, in order: bind the bench seal to the built image (or
-exempt non-code paths) so a markdown edit stops invalidating a boot image and
-verification stops being exclusive with reproduction; and add
-`cargo xtask soak --rustos-vcpus 8 --runs N`, which this session hand-rolled
-three times.
+Both remaining items are now done.
+
+**The binding no longer covers prose no lane reads.**
+`formal/binding-exempt-paths.txt` lists four documents excluded from the
+verification-run source hash, and `formal/check-binding-exemptions.py` proves
+nothing under `formal/` or `tools/` mentions an exempt path -- so a document
+that ever becomes an input fails the gate until the exemption is withdrawn. The
+list is tracked and therefore inside the hash it governs.
+`docs/benchmarks/README.md` is deliberately *not* exempt: `formal/CONFORMANCE.md`
+cites it as phase-closure evidence. Verified in both directions at 8 vCPU --
+editing an exempt document leaves the seal valid and the bench runs; editing a
+non-exempt one still refuses with a binding mismatch.
+
+Doing that turned up four separate implementations of the same tree hash --
+`write-verification-run.py`, `reuse-verification-run.py`,
+`check-kvm-runtime-trace.py`, and `evidence.rs` -- which is four chances to
+disagree, and a disagreement fails every binding check at once. Changing only
+the Rust one is exactly what happened first, and every 8-vCPU bench refused
+until the others matched. The three Python copies now share
+`formal/source_binding.py`; the Rust one reads the same list.
+
+**`cargo xtask soak --runs N --rustos-vcpus 8`** repeats the bench lane, keeps
+going past a failure, and names every failed run with the guest's own panic
+line taken from the per-run archive. It derives no measurement; the per-run
+`bench` tables remain the only measurement surface.
+
+### A flaky test that was not flaky
+
+`work_budget::tests::a_scope_that_lost_the_cpu_or_the_task_declines_to_judge`
+failed once in a loaded seven-package run and passed every isolated run. It and
+`a_scope_that_exceeds_its_declared_ceiling_panics` both charged
+`LockClass::ProcessState` on the same host CPU index, and `ACQUIRES` is one
+process-global array against which `cargo test` runs both on parallel threads,
+so each could observe the other's charges. The classes are now disjoint and the
+module's test note states the rule. Ten consecutive seven-package runs pass.

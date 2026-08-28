@@ -7,6 +7,7 @@ mod formal_contracts;
 mod kvm;
 mod layering;
 mod package_manifest;
+mod soak;
 mod stage;
 mod storage_epoch;
 mod testinfra;

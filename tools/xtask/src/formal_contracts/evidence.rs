@@ -456,7 +456,32 @@ fn evidence_mtime(path: PathBuf) -> Result<u64> {
         .as_secs())
 }
 
+/// Paths the verification-run binding deliberately does not cover.
+///
+/// The binding says a sealed result corresponds to this exact tree. A file no
+/// lane reads is not an input to that result, so hashing it does not strengthen
+/// the claim -- it only makes the seal stale for an edit that cannot change any
+/// answer, and the binding is a precondition for `cargo xtask bench`. The list
+/// lives in `formal/binding-exempt-paths.txt`, which is itself tracked and
+/// therefore inside this hash, and `formal/check-binding-exemptions.py` proves
+/// no file under `formal/` or `tools/` mentions an exempt path.
+fn binding_exempt_paths(root: &Path) -> Result<Vec<String>> {
+    let list = root.join("formal/binding-exempt-paths.txt");
+    let Ok(text) = fs::read_to_string(&list) else {
+        // An absent list is an empty list: the binding then covers everything,
+        // which is the conservative direction.
+        return Ok(Vec::new());
+    };
+    Ok(text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_owned)
+        .collect())
+}
+
 pub(super) fn source_tree_hash(root: &Path) -> Result<String> {
+    let exempt = binding_exempt_paths(root)?;
     let output = Command::new("git")
         .args([
             "ls-files",
@@ -482,6 +507,7 @@ pub(super) fn source_tree_hash(root: &Path) -> Result<String> {
         })
         .collect::<Result<Vec<_>>>()?;
     paths.sort();
+    paths.retain(|relative| !exempt.iter().any(|entry| entry == relative));
     let mut hasher = Sha256::new();
     for relative in paths {
         hasher.update(relative.as_bytes());

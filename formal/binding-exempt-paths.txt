@@ -1,0 +1,24 @@
+# Paths excluded from the formal verification-run source binding.
+#
+# The binding exists to say "this verification result corresponds to this exact
+# tree". A file no lane reads is not an input to that result, so hashing it does
+# not strengthen the claim -- it only makes the binding stale for an edit that
+# cannot change any answer. That mattered in practice: the binding is a
+# precondition for `cargo xtask bench`, so editing a prose note while an 8-vCPU
+# repro loop was running invalidated the seal and refused the next run, making
+# verification and reproduction mutually exclusive for no reason.
+#
+# Exemption is not a judgement call. `check-binding-exemptions.py` requires that
+# no file under `formal/` or `tools/` mention an exempt path, so a document that
+# ever becomes a verification input -- cited as evidence, parsed by a checker,
+# or read by xtask -- fails the gate until it is removed from this list. This
+# file is itself tracked and therefore inside the binding, so the list cannot be
+# extended without changing the hash it governs.
+#
+# `docs/benchmarks/README.md` is deliberately absent: `formal/CONFORMANCE.md`
+# cites it as phase-closure evidence, which makes it part of the provenance
+# story even though no checker parses it.
+docs/ai/session-handoff.md
+docs/ai/performance-hardening.md
+docs/ai/structural-ownership-design.md
+docs/ai/task-router.md

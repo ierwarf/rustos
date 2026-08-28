@@ -106,6 +106,22 @@ enum XtaskCommand {
         #[arg(long = "isolate-probe")]
         isolate_probe: Option<String>,
     },
+    /// Repeat the bench lane to reproduce a defect that is rare per boot.
+    ///
+    /// An SMP fail-stop that appears in roughly one boot of ten cannot be
+    /// confirmed fixed by one boot. This keeps going past a failure and names
+    /// every failed run with the guest's own panic line, from the per-run log
+    /// archive that `bench` writes. It derives no measurement of its own.
+    Soak {
+        /// How many boots to run. A defect seen once in ten needs enough runs
+        /// that not seeing it means something.
+        #[arg(long, default_value_t = 25)]
+        runs: usize,
+        #[arg(long = "rustos-vcpus", default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=8))]
+        rustos_vcpus: u8,
+        #[arg(long = "isolate-probe")]
+        isolate_probe: Option<String>,
+    },
     Selftest,
     #[command(name = "fuzz-host")]
     FuzzHost {
@@ -223,6 +239,11 @@ pub(crate) fn run() -> Result<()> {
             rustos_vcpus,
             isolate_probe.as_deref(),
         ),
+        Some(XtaskCommand::Soak {
+            runs,
+            rustos_vcpus,
+            isolate_probe,
+        }) => crate::soak::soak(&config, runs, rustos_vcpus, isolate_probe.as_deref()),
         Some(XtaskCommand::Selftest) => testinfra::selftest(&config),
         Some(XtaskCommand::FuzzHost {
             target,
