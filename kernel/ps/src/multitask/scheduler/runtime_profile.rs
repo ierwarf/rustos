@@ -286,6 +286,20 @@ pub fn drain_scheduler_runtime_profile() -> usize {
             charged_ns,
         );
     }
+    // A CPU that parked on idle because its current task lost run-queue custody
+    // made a correct choice, but the task must then be woken elsewhere. A run
+    // that misses its deadline without panicking is either accompanied by this
+    // or it is not, and that is the difference between a scheduler stall and an
+    // unrelated one.
+    let fallback_idle = super::runqueue_policy::take_fallback_idle_dispatch_window();
+    if fallback_idle != 0 {
+        crate::debug::record_milestone(
+            crate::debug::LogCategory::Sched,
+            "scheduler-fallback-idle",
+            fallback_idle,
+            0,
+        );
+    }
     // A domain that refuses a dispatch it was admitted for is a lost race the
     // dispatch recovers from by reselecting, so it must not be silent: a rise
     // here means the admission scan and the budget commit are disagreeing more

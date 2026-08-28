@@ -741,3 +741,32 @@ reason = "kernel wide-SIMD crypto is reachable only through the bracketed dvm-bl
 scope = "kernel/nucleus-core/**/*.rs"
 regex = '\b(?:ed25519_dalek|curve25519_dalek|Sha512)\b'
 reason = "kernel wide-SIMD crypto is reachable only through the bracketed dvm-block epoch verification"
+
+# An admission predicate and the commit that spends what it admitted. The two
+# read the same state at two different times, so they may disagree; the caller
+# must treat a refusal as a policy outcome. Registering a pair forbids every
+# call site of its commit from sitting inside an `assert!`, `panic!`, or
+# `expect`, which is the shape both 8-vCPU scheduler panics had.
+
+# Selection admits a candidate with `is_eligible`, which accepts a refill that
+# is merely due; the commit applies that refill and spends the budget. The
+# refusal is latched for `scheduling-domain-budget-refused` and the dispatch
+# reselects.
+[[admit_commit_pairs]]
+name = "scheduling-domain-budget"
+admit_path = "kernel/ps/src/multitask/scheduler/smp.rs"
+admit_token = "self.scheduling_domain_is_eligible(domain_slot, policy, now_ns)"
+commit_path = "kernel/ps/src/multitask/scheduler/scheduling_context.rs"
+commit_token = "if !self.prepare_scheduling_domain_dispatch(domain_slot, policy, now_ns) {"
+commit_call = "commit_scheduling_budget_for_dispatch("
+
+# The balance phase may publish the current task `Blocked` or rehome it after
+# the scan that admitted it, so the dispatch fallback cannot assume it still
+# holds local run-queue custody. The idle slot is the one that always does.
+[[admit_commit_pairs]]
+name = "dispatch-fallback-custody"
+admit_path = "kernel/ps/src/multitask/scheduler/runqueue.rs"
+admit_token = "pub(super) fn is_current_cpu_dispatchable(slot: usize, cpu: usize) -> bool {"
+commit_path = "kernel/ps/src/multitask/scheduler/runqueue_policy.rs"
+commit_token = "fallback_slot_for(current_slot, idle_slot, current_claimed)"
+commit_call = "claimable_fallback_slot("

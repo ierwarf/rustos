@@ -206,6 +206,79 @@ impl Scheduler {
         Self::prefer_local_candidate(best, local)
     }
 
+    /// Min-granularity guard. Returns either `cfs_pick` (preempt) or
+    /// `current_slot` (keep running) based on whether preemption is worth
+    /// the context-switch cost. Mirrors `wakeup_preempt_entity` /
+    /// `check_preempt_tick` from Linux CFS at a much smaller scale.
+    pub(super) fn maybe_keep_current(
+        &self,
+        current_slot: usize,
+        cfs_pick: usize,
+        current_runtime_ns: u64,
+    ) -> usize {
+        if cfs_pick == current_slot {
+            if current_runtime_ns >= SCHED_MAX_BURST_NS
+                && let Some(alternate) = self.pick_burst_alternate_in_current_class(current_slot)
+            {
+                return alternate;
+            }
+            return cfs_pick;
+        }
+        if !self.is_fair_candidate_slot(current_slot) {
+            return cfs_pick;
+        }
+        let Some(current_ctx) = self.contexts[current_slot] else {
+            return cfs_pick;
+        };
+        // Host unit schedulers do not publish global owner words. Preserve
+        // their isolation by adapting the legacy bit only under `cfg(test)`;
+        // the production fairness decision takes the owner word's run-intent
+        // bit after this turn's prologue has published it.
+        #[cfg(test)]
+        let current_has_run_intent = current_ctx.test_ready;
+        #[cfg(not(test))]
+        let current_has_run_intent = runqueue::owner_has_run_intent(runqueue::owner(current_slot));
+        if !current_has_run_intent || !self.context_is_schedulable(current_slot, current_ctx) {
+            return cfs_pick;
+        }
+        if self.contexts[cfs_pick].is_none() {
+            return cfs_pick;
+        }
+
+        // Cross-class preemption is unconditional. The min-granularity guard
+        // below is a CFS fairness damper that only makes sense between peers
+        // in the same class — applying it across bands would let, say, a
+        // sub-tick User-class task block a freshly-woken System task and
+        // recreate exactly the latency bug this scheduler is meant to fix.
+        // Mirrors Mach's QoS preemption rule and Linux's "RT > CFS, no
+        // sched_min_granularity check between policies" stacking.
+        if let (Some(current_class), Some(pick_class)) =
+            (self.slot_class(current_slot), self.slot_class(cfs_pick))
+            && pick_class < current_class
+        {
+            return cfs_pick;
+        }
+
+        // If the pick's vruntime advantage is large, preempt unconditionally:
+        // current has burned through too much CPU relative to peers.
+        let current_v = self.slot_vruntime(current_slot);
+        let pick_v = self.slot_vruntime(cfs_pick);
+        let advantage_ns = current_v.saturating_sub(pick_v);
+
+        // Linux rule (simplified): only preempt if either
+        //   - current has run at least SCHED_MIN_GRANULARITY_NS, or
+        //   - the peer's vruntime advantage exceeds SCHED_MIN_GRANULARITY_NS
+        //     (peer was starved long enough to deserve immediate dispatch).
+        if current_runtime_ns >= SCHED_MIN_GRANULARITY_NS
+            || advantage_ns >= SCHED_MIN_GRANULARITY_NS
+            || current_runtime_ns >= SCHED_MAX_BURST_NS
+        {
+            cfs_pick
+        } else {
+            current_slot
+        }
+    }
+
     pub(super) fn pick_burst_alternate_in_current_class(&self, current: usize) -> Option<usize> {
         let class = self.slot_class(current)?;
         let mut best: Option<(usize, u64)> = None;

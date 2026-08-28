@@ -2096,13 +2096,27 @@ validated against `RDTSCP` at boot and admitted, and the 1/2/4/8 vCPU ring3
 qualification cohort passed throughout.
 
 Selection admits a candidate with `is_eligible`, which accepts a refill that is
-merely *due*. The commit applies that refill and spends the budget. A charge on
-the same domain in between pops the due refill and re-arms it a period later,
-so the exact state the scan admitted is gone by the time the commit looks --
-`available_ns == 0` with the next refill in the future. Making the message name
-its own cause is what turned one reproduction into that sentence; the arm flags
-then showed a plain CFS pick, not a handoff, which ruled out the publication
-paths.
+merely *due*. The commit applies that refill and spends the budget. Making the
+message name its own cause turned one reproduction into a sentence: at commit
+time `available_ns == 0` with the next refill in the future, from a plain CFS
+pick rather than any handoff arm.
+
+**The exact interleaving is not established, and an earlier revision of this
+section claimed one it should not have.** Every owner-word and domain mutation
+runs under the single global `SCHEDULER` lock, and the only site that spends a
+domain budget is the commit itself, so no *intra-dispatch* charge can explain
+the observed transition. Two candidates were not ruled out and are the leads to
+follow: `effective_scheduling_context_owner_slot` may resolve to a different --
+possibly unbudgeted -- owner at scan time than at commit time, in which case the
+scan skipped the budget checks entirely; and `eligible_ns` is computed from one
+CPU's clock and compared against another's, so cross-CPU TSC skew changes what
+"due" means. The `scheduling-domain-budget-refused` milestone now records
+slot/domain/cause per window instead of killing the run, which is what the next
+attempt should read.
+
+The fix does not depend on knowing the interleaving. The two predicates are
+structurally different and nothing constructs an obligation for them to agree;
+relying on agreement is the defect.
 
 A domain that cannot fund the selected task is a **policy outcome**, not an
 invariant break: it is the answer the admission scan itself would have given one
@@ -2111,3 +2125,53 @@ a rejected candidate takes, latching the refusal for the
 `scheduling-domain-budget-refused` milestone so a *rise* in the rate stays
 visible instead of becoming a silent reselect. Twenty-four 8-vCPU runs: one
 failure before the change, none in the eighteen after it.
+
+
+## The fallback dispatched a task it no longer owned
+
+The domain-budget fix routed a refused dispatch into the existing "keep running
+current" fallback, and that fallback asserted the current slot still held local
+run-queue custody. It does not always: the balance phase publishes the current
+slot `Blocked` when it retired or stopped being runnable, and rehomes it when it
+lost affinity for this CPU. Reaching the fallback in either state means there is
+nothing to keep *and* nothing was selected -- exactly what a CPU's idle slot
+exists for. The assert made that legitimate outcome fatal:
+
+```
+scheduler fallback task lost local rq custody slot=48 cpu=3
+```
+
+Two failures in thirteen 8-vCPU runs. The panic only appears at 8 vCPU because a
+task loses this CPU often enough there to land in the window. This was latent
+before the budget fix -- an invalid selected context could already reach the
+fallback -- but the refusal path made it common enough to see.
+
+The fallback now claims the current slot, and takes this CPU's idle slot when
+that claim fails. Twenty-five 8-vCPU runs after the change: no panics and no
+missed boot deadlines, against two panics in thirteen before it and two missed
+deadlines in twenty-four between.
+
+`scheduler-fallback-idle` counts the idle landings. It has not fired in a clean
+run yet, while `scheduling-domain-budget-refused` fires one or two times per
+window -- so the refusal is routine and always lands on a claimable current
+slot, and the idle landing is the rare arm. That distinction is only visible
+because both are counted; a run that misses its deadline without panicking is
+now either accompanied by these or it is not.
+
+### The rule, not the instance
+
+Both panics had one shape: an admission predicate and a commit that spends what
+it admitted, read at two different times, with the caller fail-stopping on the
+disagreement. `formal/smp-source-contracts.toml` now registers those pairs and
+`check-smp-source-assumptions.py` rejects any call site where a registered
+commit sits inside an `assert!`, `panic!`, or `expect`. It was verified by
+reintroducing the assert, which it named by file and line, and it caught a
+later refactor of its own commit token.
+
+Three fail-stops of the same shape are **not** registered because their
+disposition has not been audited: `publish_runqueue_wake` in the balance phase,
+and `rollback_direct_handoff` / `materialize_direct_handoff`. Registering a pair
+should mean its disposition is established, so these are backlog, not omissions.
+The main-path `claim_dispatch(next_idx)` assert was audited and left alone:
+every selection arm re-admits its winner after the last owner-word mutation in
+that dispatch, so it is sound under the single global lock.

@@ -4056,112 +4056,55 @@ impl Scheduler {
             self.contexts[current_slot].is_some(),
             "scheduler lost the current task context"
         );
-        let current_saved_rsp = self.slot_saved_rsp(current_slot);
-        #[cfg(not(test))]
-        assert!(
-            runqueue::claim_dispatch(current_slot, dispatch_cpu, self.slot_weight(current_slot)),
-            "scheduler fallback task lost local rq custody slot={} cpu={}",
-            current_slot,
-            dispatch_cpu
-        );
-        // Keep running current: refresh its exec_start_ticks so subsequent
-        // vruntime accounting sees a non-zero baseline.
-        if self.contexts[current_slot].is_some() {
-            self.set_slot_exec_start_ticks(current_slot, now_ticks);
+        // The current task is not always keepable here. The balance phase
+        // publishes it `Blocked` when it retired or stopped being runnable, and
+        // rehomes it when it lost affinity for this CPU. Reaching this point
+        // with either published means there is nothing to keep *and* nothing
+        // was selected, which is exactly what this CPU's idle slot exists for.
+        // Asserting the current slot's custody made that legitimate outcome
+        // fatal, and only at 8 vCPU, where a task loses this CPU often enough
+        // to land in the window.
+        let fallback_idx = self.claimable_fallback_slot(current_slot, dispatch_cpu);
+        let fallback_saved_rsp = self.slot_saved_rsp(fallback_idx);
+        // Refresh exec_start_ticks so subsequent vruntime accounting sees a
+        // non-zero baseline.
+        if self.contexts[fallback_idx].is_some() {
+            self.set_slot_exec_start_ticks(fallback_idx, now_ticks);
         }
+        let fallback_task_id = if fallback_idx == current_slot {
+            current_task_id
+        } else {
+            self.set_current_task_slot(fallback_idx);
+            let task_id = self.starts[fallback_idx]
+                .map(|start| start.id)
+                .expect("idle fallback missing lockdep owner identity");
+            nucleus_core::util::lockdep::set_current_task_owner(
+                task_id
+                    .checked_add(1)
+                    .expect("task id exhausted lock owner token"),
+            );
+            task_id
+        };
         nucleus_core::util::lockdep::record_scheduler_dispatch(
-            nucleus_core::util::lockdep::current_cpu_index(),
+            dispatch_cpu,
             current_task_id,
-            current_task_id,
+            fallback_task_id,
             current_slot,
-            current_slot,
-            current_saved_rsp,
-            self.slot_class(current_slot) == Some(SchedClass::Idle),
+            fallback_idx,
+            fallback_saved_rsp,
+            self.slot_class(fallback_idx) == Some(SchedClass::Idle),
             false,
         );
-        self.record_runtime_profile_dispatch(current_slot);
-        self.record_runtime_profile_transition(current_slot, current_slot, dispatch_cpu);
-        self.record_task_dispatch_cpu(current_slot, dispatch_cpu);
+        self.record_runtime_profile_dispatch(fallback_idx);
+        self.record_runtime_profile_transition(current_slot, fallback_idx, dispatch_cpu);
+        self.record_task_dispatch_cpu(fallback_idx, dispatch_cpu);
         self.mark_phase(SchedulerPhase::Commit, &mut phase_marker);
         SchedulerDispatch::new(
-            current_saved_rsp,
+            fallback_saved_rsp,
             self.scheduler_tick_divisor,
             current_slot,
-            current_slot,
+            fallback_idx,
         )
-    }
-
-    /// Min-granularity guard. Returns either `cfs_pick` (preempt) or
-    /// `current_slot` (keep running) based on whether preemption is worth
-    /// the context-switch cost. Mirrors `wakeup_preempt_entity` /
-    /// `check_preempt_tick` from Linux CFS at a much smaller scale.
-    fn maybe_keep_current(
-        &self,
-        current_slot: usize,
-        cfs_pick: usize,
-        current_runtime_ns: u64,
-    ) -> usize {
-        if cfs_pick == current_slot {
-            if current_runtime_ns >= SCHED_MAX_BURST_NS
-                && let Some(alternate) = self.pick_burst_alternate_in_current_class(current_slot)
-            {
-                return alternate;
-            }
-            return cfs_pick;
-        }
-        if !self.is_fair_candidate_slot(current_slot) {
-            return cfs_pick;
-        }
-        let Some(current_ctx) = self.contexts[current_slot] else {
-            return cfs_pick;
-        };
-        // Host unit schedulers do not publish global owner words. Preserve
-        // their isolation by adapting the legacy bit only under `cfg(test)`;
-        // the production fairness decision takes the owner word's run-intent
-        // bit after this turn's prologue has published it.
-        #[cfg(test)]
-        let current_has_run_intent = current_ctx.test_ready;
-        #[cfg(not(test))]
-        let current_has_run_intent = runqueue::owner_has_run_intent(runqueue::owner(current_slot));
-        if !current_has_run_intent || !self.context_is_schedulable(current_slot, current_ctx) {
-            return cfs_pick;
-        }
-        if self.contexts[cfs_pick].is_none() {
-            return cfs_pick;
-        }
-
-        // Cross-class preemption is unconditional. The min-granularity guard
-        // below is a CFS fairness damper that only makes sense between peers
-        // in the same class — applying it across bands would let, say, a
-        // sub-tick User-class task block a freshly-woken System task and
-        // recreate exactly the latency bug this scheduler is meant to fix.
-        // Mirrors Mach's QoS preemption rule and Linux's "RT > CFS, no
-        // sched_min_granularity check between policies" stacking.
-        if let (Some(current_class), Some(pick_class)) =
-            (self.slot_class(current_slot), self.slot_class(cfs_pick))
-            && pick_class < current_class
-        {
-            return cfs_pick;
-        }
-
-        // If the pick's vruntime advantage is large, preempt unconditionally:
-        // current has burned through too much CPU relative to peers.
-        let current_v = self.slot_vruntime(current_slot);
-        let pick_v = self.slot_vruntime(cfs_pick);
-        let advantage_ns = current_v.saturating_sub(pick_v);
-
-        // Linux rule (simplified): only preempt if either
-        //   - current has run at least SCHED_MIN_GRANULARITY_NS, or
-        //   - the peer's vruntime advantage exceeds SCHED_MIN_GRANULARITY_NS
-        //     (peer was starved long enough to deserve immediate dispatch).
-        if current_runtime_ns >= SCHED_MIN_GRANULARITY_NS
-            || advantage_ns >= SCHED_MIN_GRANULARITY_NS
-            || current_runtime_ns >= SCHED_MAX_BURST_NS
-        {
-            cfs_pick
-        } else {
-            current_slot
-        }
     }
 
     #[allow(clippy::needless_return)]

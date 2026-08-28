@@ -1594,3 +1594,56 @@ rising rate means the two predicates are drifting apart and is worth chasing.
 One 8-vCPU bench failure was seen in 24 runs and did not reproduce in the 18
 after the fix; its message was not captured. If it returns, capture
 `build/kvm/rustos-debugcon.log` before rerunning -- the log is overwritten.
+
+## The 8-vCPU fail-stops are fixed; two rules replaced them
+
+Both panics were the same shape -- an admission predicate and the commit that
+spends what it admitted, read at two different times, with the caller
+fail-stopping on the disagreement:
+
+| panic | admit | commit | now |
+| --- | --- | --- | --- |
+| `without eligible domain budget` | `scheduling_domain_is_eligible` | `prepare_scheduling_domain_dispatch` | commit declines, dispatch reselects |
+| `fallback task lost local rq custody` | `is_current_cpu_dispatchable` | `claim_dispatch` | fallback takes this CPU's idle slot |
+
+Twenty-five 8-vCPU runs after both: no panics, no missed boot deadlines. Before:
+two panics in thirteen, then two missed deadlines in twenty-four.
+
+`formal/smp-source-contracts.toml` registers the pairs and
+`check-smp-source-assumptions.py` rejects any call site where a registered
+commit sits inside `assert!`, `panic!`, or `expect`. Verified by reintroducing
+the assert. **Registering a pair means its disposition is established** --
+`publish_runqueue_wake`, `rollback_direct_handoff`, and
+`materialize_direct_handoff` have the same shape and are deliberately
+unregistered backlog.
+
+Read `scheduler-fallback-idle` and `scheduling-domain-budget-refused` before
+chasing any 8-vCPU stall. The refusal fires one or two times per window and is
+routine; the idle landing has not fired in a clean run.
+
+## What actually costs time here, and the four fixes that would stop it
+
+The formal seal binds to the source tree and is a precondition for the bench, so
+**verification and reproduction are mutually exclusive in time**: no tracked
+file -- including a markdown file -- can change while an 8-vCPU repro loop runs.
+Everything below follows from that.
+
+1. **`build/kvm/rustos-debugcon.log` is overwritten every run.** A 1-in-20
+   panic whose log is gone costs a fresh 50-minute loop to recapture. That
+   happened in this session. Suffix the log with the run id.
+2. **Bind the bench's seal to the built image, or exempt non-code paths.** A
+   markdown edit invalidating a boot image's provenance is pure friction and is
+   what makes the two activities exclusive.
+3. **`cargo xtask soak --rustos-vcpus 8 --runs N`**, keeping per-run logs and
+   summarizing panics. This session hand-rolled that loop twice.
+4. **Prefer structural contracts to literal source pins.** Four literal pins
+   were retargeted this session (`sed` ranges in `run-source-conformance.sh`,
+   `timed_handoff_step`, `.prepare_dispatch(now_ns),`, and a fresh
+   `commit_token`); each cost a gate failure and a reseal, and none caught a
+   defect. Every contract that earned its keep was structural: the required
+   sequences, the acquisition ceilings, and the new admit/commit register.
+
+The remaining cost is the problem, not the tooling: a defect that appears at 8
+vCPU roughly one run in ten needs ~25 runs to confirm a fix. The four items
+above do not remove that hour; they make it possible to do something else
+during it.

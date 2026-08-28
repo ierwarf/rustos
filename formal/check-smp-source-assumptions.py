@@ -102,6 +102,43 @@ def main() -> int:
                 break
             cursor = position + len(token)
 
+    # An admission predicate and the commit that spends what it admitted read
+    # the same state at two different times, so they may disagree. A caller that
+    # fail-stops on that disagreement turns a policy outcome into a panic; both
+    # 8-vCPU scheduler panics fixed in this class had exactly that shape. The
+    # rule is therefore mechanical: a registered commit may not appear inside an
+    # `assert!`, an `expect`, or a `panic!` guard at any call site in the tree.
+    admit_commit_pairs = 0
+    for entry in manifest.get("admit_commit_pairs", []):
+        admit_commit_pairs += 1
+        checks += 1
+        name = entry["name"]
+        for role in ("admit", "commit"):
+            relative = entry[f"{role}_path"]
+            path = by_relative.get(relative)
+            if path is None:
+                errors.append(f"admit/commit pair {name}: {role} source is absent: {relative}")
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+            if entry[f"{role}_token"] not in text:
+                errors.append(
+                    f"admit/commit pair {name}: {role} token is missing from "
+                    f"{relative}: {entry[f'{role}_token']!r}"
+                )
+        fail_stop = re.compile(
+            r"(?:assert!|panic!|\.expect)\s*\([^;]{0,400}?"
+            + re.escape(entry["commit_call"])
+        )
+        for relative, path in by_relative.items():
+            text = path.read_text(encoding="utf-8", errors="replace")
+            for match in fail_stop.finditer(text):
+                line = text.count("\n", 0, match.start()) + 1
+                errors.append(
+                    f"{relative}:{line}: admit/commit pair {name} is fail-stopped "
+                    f"at its call site; a refused commit is a policy outcome and "
+                    f"the caller must fall back instead"
+                )
+
     unsafe_impls = 0
     for relative, path in by_relative.items():
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -172,7 +209,8 @@ def main() -> int:
         return 1
     print(
         "SMP source assumptions passed "
-        f"checks={checks} files={len(paths)} per_cpu_statics={per_cpu_statics}"
+        f"checks={checks} files={len(paths)} per_cpu_statics={per_cpu_statics} "
+        f"admit_commit_pairs={admit_commit_pairs}"
     )
     return 0
 

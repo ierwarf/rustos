@@ -158,6 +158,83 @@ impl Scheduler {
         }
     }
 
+}
+
+/// The fallback target, given whether the current slot's custody was claimed.
+///
+/// Split out so the decision has a witness. The claim itself is a lock-free CAS
+/// that host unit schedulers do not model, but the rule it feeds is the whole
+/// defect: a *failed* claim must never resolve back to the current slot, which
+/// is what asserting custody there amounted to.
+pub(super) const fn fallback_slot_for(
+    current_slot: usize,
+    idle_slot: usize,
+    current_claimed: bool,
+) -> usize {
+    if current_claimed { current_slot } else { idle_slot }
+}
+
+/// How many times a dispatch fell back to idle because the current slot had
+/// lost custody, and whether any has happened at all this window.
+static FALLBACK_IDLE_DISPATCHES: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+#[cfg(not(test))]
+fn latch_fallback_idle_dispatch() {
+    // ORDERING: Relaxed; a diagnostic counter drained once per profile window.
+    FALLBACK_IDLE_DISPATCHES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Takes the window's idle-fallback count, clearing it for the next window.
+pub(in crate::multitask) fn take_fallback_idle_dispatch_window() -> u64 {
+    FALLBACK_IDLE_DISPATCHES.swap(0, core::sync::atomic::Ordering::Relaxed)
+}
+
+impl super::Scheduler {
+    /// The slot the dispatch fallback may actually claim, taking its custody.
+    ///
+    /// Prefers keeping the current task, which is the common and cheapest
+    /// outcome. When the balance phase has already published that task
+    /// `Blocked` or rehomed it to another CPU, it must not keep running, and
+    /// this CPU's idle slot is the one slot that always has local custody --
+    /// it is never retired, never loses affinity for its own CPU, and is
+    /// exactly what a CPU with nothing to run exists to dispatch.
+    ///
+    /// The idle claim keeps a fail-stop because an unclaimable idle slot is a
+    /// real invariant break rather than a lost race: there is no correct
+    /// dispatch left to make.
+    #[cfg(not(test))]
+    pub(super) fn claimable_fallback_slot(&self, current_slot: usize, dispatch_cpu: usize) -> usize {
+        let current_claimed =
+            runqueue::claim_dispatch(current_slot, dispatch_cpu, self.slot_weight(current_slot));
+        let idle_slot = self.idle_fallback_slot();
+        if fallback_slot_for(current_slot, idle_slot, current_claimed) == current_slot {
+            return current_slot;
+        }
+        assert!(
+            idle_slot != current_slot,
+            "scheduler idle slot lost its own local rq custody slot={idle_slot} cpu={dispatch_cpu}"
+        );
+        assert!(
+            runqueue::claim_dispatch(idle_slot, dispatch_cpu, self.slot_weight(idle_slot)),
+            "scheduler idle fallback lost local rq custody slot={idle_slot} cpu={dispatch_cpu}"
+        );
+        // Parking a CPU on idle because the current task lost custody is
+        // correct but not free: the task must be woken elsewhere for the system
+        // to make progress. Counting it is what separates "this path ran" from
+        // "this path stalled something" the next time a run misses its boot
+        // deadline without panicking.
+        latch_fallback_idle_dispatch();
+        idle_slot
+    }
+
+    /// Host unit schedulers publish no owner words, so there is no custody to
+    /// claim and the current slot is always the fallback.
+    #[cfg(test)]
+    pub(super) fn claimable_fallback_slot(&self, current_slot: usize, _dispatch_cpu: usize) -> usize {
+        current_slot
+    }
+
     /// Pull one eligible non-idle continuation only when this CPU has no
     /// local work. This is the bounded idle-balance point used by Linux,
     /// FreeBSD ULE, and Zircon-style per-CPU schedulers: ordinary ticks never
@@ -341,5 +418,31 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The defect this rule exists for: the dispatch fallback used to assert
+    /// that the current slot still held local run-queue custody. The balance
+    /// phase publishes that slot `Blocked` when it retired or stopped being
+    /// runnable, and rehomes it when it lost affinity for this CPU, so a failed
+    /// claim is a legitimate outcome and must resolve to the CPU's idle slot --
+    /// never back to a task this CPU may no longer run.
+    #[test]
+    fn a_failed_current_claim_never_resolves_back_to_the_current_slot() {
+        let current_slot = 7;
+        let idle_slot = 127;
+        assert_eq!(
+            super::fallback_slot_for(current_slot, idle_slot, true),
+            current_slot,
+            "a claimed current slot is the cheapest and correct fallback"
+        );
+        assert_eq!(
+            super::fallback_slot_for(current_slot, idle_slot, false),
+            idle_slot,
+            "an unclaimable current slot must fall back to idle, not to itself"
+        );
+        assert_ne!(
+            super::fallback_slot_for(current_slot, idle_slot, false),
+            current_slot
+        );
     }
 }
