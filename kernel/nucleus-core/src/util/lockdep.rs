@@ -615,11 +615,21 @@ impl<T: ?Sized, const CLASS: u8> TrackedSpinLock<T, CLASS> {
             lock_profile::charge(lock_profile::LockPhase::BeforeAcquire, profile_entry);
         #[cfg(rustos_boot_image)]
         let guard = {
-            let wait_start_tsc = read_tsc();
+            // The wait clock starts at the first *failed* attempt, not before
+            // the first attempt. An uncontended acquire -- which is nearly all
+            // of them, and the shape the IPC round trip is made of -- therefore
+            // issues no `RDTSC` at all, where it previously paid one on a path
+            // that never read the result. The deadline below still measures a
+            // real wait: it is only ever sampled after a failure has already
+            // set this.
+            let mut wait_start_tsc = 0_u64;
             let mut spins = 0usize;
             loop {
                 if let Some(guard) = self.inner.try_lock() {
                     break guard;
+                }
+                if spins == 0 {
+                    wait_start_tsc = read_tsc();
                 }
                 spins += 1;
                 let wait_cycles = if spins & 0x3ff == 0 {

@@ -334,36 +334,11 @@ pub(in crate::multitask) fn take_pick_scan_window() -> (u64, u64) {
 /// acquisitions, not decisions, about ten of them per dispatch. It now takes
 /// the guard once and threads it, so step 6 is the entire acquisition cost the
 /// chain pays.
-pub(in crate::multitask) const HANDOFF_STEP_COUNT: usize = 7;
-static HANDOFF_STEP_NS: [core::sync::atomic::AtomicU64; HANDOFF_STEP_COUNT] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; HANDOFF_STEP_COUNT];
-static HANDOFF_STEP_CALLS: [core::sync::atomic::AtomicU64; HANDOFF_STEP_COUNT] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; HANDOFF_STEP_COUNT];
-
-pub(in crate::multitask) fn charge_handoff_step(step: usize, elapsed_ns: u64) {
-    let Some(total) = HANDOFF_STEP_NS.get(step) else {
-        return;
-    };
-    // ORDERING: Relaxed; diagnostic counters drained once per second.
-    total.fetch_add(elapsed_ns, core::sync::atomic::Ordering::Relaxed);
-    HANDOFF_STEP_CALLS[step].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-}
-
-/// Takes the window's per-step chain cost, clearing it for the next window.
-pub(in crate::multitask) fn take_handoff_step_window() -> [(u64, u64); HANDOFF_STEP_COUNT] {
-    core::array::from_fn(|step| {
-        (
-            HANDOFF_STEP_NS[step].swap(0, core::sync::atomic::Ordering::Relaxed),
-            HANDOFF_STEP_CALLS[step].swap(0, core::sync::atomic::Ordering::Relaxed),
-        )
-    })
-}
-
-/// Step 1's `Some` outcomes: the synchronous IPC pick-hint queue held a ready
-/// receiver or caller, so `select` resolved in one FIFO pop instead of the
-/// CFS-style vruntime scan. `HANDOFF_STEP_CALLS[1]` (in the window above) is
-/// the attempt count; this is the subset that hit. The gap between the two is
-/// how often a dispatch pays for the scan the hint queue exists to skip.
+/// The pick hint's `Some` outcomes: the synchronous IPC pick-hint queue held a
+/// ready receiver or caller, so `select` resolved in one FIFO pop instead of
+/// the CFS-style vruntime scan. This plus the three miss causes below partition
+/// every attempt, so the gap between this and their sum is how often a dispatch
+/// pays for the scan the hint queue exists to skip.
 ///
 /// This does not say whether the *dispatch itself* was skippable — every
 /// dispatch still runs the full seven-phase pipeline (account/balance/
@@ -381,8 +356,8 @@ pub(in crate::multitask) fn take_sync_handoff_hit_window() -> u64 {
     SYNC_HANDOFF_HITS.swap(0, core::sync::atomic::Ordering::Relaxed)
 }
 
-/// Step 1's `None` outcomes, split by cause. Hits (above) plus these three
-/// should sum to `HANDOFF_STEP_CALLS[1]`'s attempt count.
+/// The pick hint's `None` outcomes, split by cause. Hits (above) plus these
+/// three are the whole attempt count.
 pub(in crate::multitask) const SYNC_HANDOFF_MISS_REASON_COUNT: usize = 3;
 
 #[derive(Clone, Copy)]

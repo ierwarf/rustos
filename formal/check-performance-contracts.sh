@@ -640,7 +640,7 @@ rg -Uq 'let atomic_activation_pending =\n[[:space:]]*dispatch_policy::atomic_act
     echo "atomic activation pending authority no longer guards early synchronous handoff selection" >&2
     exit 1
 }
-rg -Uq 'let sync_handoff = \(!atomic_activation_pending\)\n[[:space:]]*\.then\(\|\| timed_handoff_step\(1, \|\| self\.take_next_synchronous_pick_hint_ready_slot\(\)\)\)' \
+rg -Uq 'let sync_handoff = \(!atomic_activation_pending\)\n[[:space:]]*\.then\(\|\| self\.take_next_synchronous_pick_hint_ready_slot\(\)\)' \
     "$scheduler_source" || {
     echo "atomic activation or synchronous IPC handoff no longer precedes unrelated overdue work" >&2
     exit 1
@@ -813,17 +813,58 @@ fi
 # round trip. The pin re-reads the published state pointer rather than caching
 # it, which is what keeps it sound across an exec.
 for witness in \
-    'pub(super) fn own_process_ref(' \
+    'pub(in crate::multitask) fn own_process_ref(' \
     'ProcessRefPin::OwnThread => NonNull::new(' \
     'if matches!(self.pin, ProcessRefPin::Counted(_)) {' ; do
-    rg -Fq "$witness" kernel/ps/src/multitask/process_table.rs || {
+    rg -Fq "$witness" kernel/ps/src/multitask/process_table/identity.rs || {
         echo "own-thread process pin witness missing: $witness" >&2
+        exit 1
+    }
+done
+for witness in \
+    'pub const EXACT_PROCESS_IDENTITY_MAX_PROCESS_TABLE_ACQUISITIONS: u32 = 0;' \
+    'published_live_process_identity(handle).or_else(|| locked_live_process_identity(handle))' \
+    'fn exact_live_identity_validation_never_reenters_the_process_table()' \
+    'fn missing_identity_publication_is_detected_and_falls_back_to_authority()' ; do
+    rg -Fq "$witness" libs/rustos-user-abi/src/performance.rs \
+        kernel/ps/src/multitask/process_table/identity.rs \
+        kernel/ps/src/multitask/process_table/tests/identity_tests.rs || {
+        echo "exact process identity performance witness missing: $witness" >&2
         exit 1
     }
 done
 rg -Fq 'process_table::own_process_ref(process_handle, process_id)' \
     kernel/ps/src/multitask/current.rs || {
     echo 'current-task address-space bind reopened the counted process retain' >&2
+    exit 1
+}
+
+# The busiest tracked-lock acquisition site in the kernel was one global table
+# lock plus a full slot walk to read one bool, asked several times per
+# synchronous IPC syscall. The live answer must come from publication alone,
+# and only the live direction may -- publication cannot tell an exiting process
+# from a mid-exec one or an unknown PID, so serving a negative answer from it
+# would make the accelerator a second lifecycle authority.
+for witness in \
+    'pub const LIVE_PROCESS_EXIT_QUERY_MAX_PROCESS_TABLE_ACQUISITIONS: u32 = 0;' \
+    'if identity::published_process_is_live_by_pid(process_id) {' \
+    'pub(super) fn published_process_is_live_by_pid(process_id: u64) -> bool {' \
+    'fn a_live_process_exit_query_never_enters_the_table_and_exiting_still_reaches_authority()' ; do
+    rg -Fq "$witness" libs/rustos-user-abi/src/performance.rs \
+        kernel/ps/src/multitask/process_table.rs \
+        kernel/ps/src/multitask/process_table/identity.rs \
+        kernel/ps/src/multitask/process_table/tests/identity_tests.rs || {
+        echo "live process exit query performance witness missing: $witness" >&2
+        exit 1
+    }
+done
+
+# The wait clock must start at the first failed attempt. Reading it before the
+# first attempt charged every uncontended acquisition -- nearly all of them, and
+# what the IPC round trip is made of -- for a timestamp it never reads.
+rg -Fq 'let mut wait_start_tsc = 0_u64;' \
+    kernel/nucleus-core/src/util/lockdep.rs || {
+    echo 'tracked spin acquire reopened an unconditional wait timestamp' >&2
     exit 1
 }
 

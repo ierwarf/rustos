@@ -1934,11 +1934,27 @@ pointer on every access rather than caching it, because an exec replaces the
 object and no count holds the old one. Every accessor reachable from the pin
 validates the exact process and MM generation, which is what makes that safe.
 
-`ProcessTable` fell from ~10.7 to ~8.4 acquisitions per round trip. The
-remainder is `live_process_identity`, which `with_exact_visible_state` calls on
-**every** user-memory access and which still enters the table; closing it needs
-the process lifecycle state published per slot with a divergence sweep, exactly
-as `current_identity` was.
+`ProcessTable` first fell from ~10.7 to ~8.4 acquisitions per round trip. The
+remaining ordinary access was `live_process_identity`, called by
+`with_exact_visible_state` on every user-memory access. It now reads a
+generation-bound per-slot lifecycle publication before using the locked table
+only for revoked, stale, or torn state. A counted unit witness fixes the
+committed live path at **zero** `ProcessTable` acquisitions, and an
+out-of-scheduler-guard sweep compares publication against exact lifecycle
+authority.
+
+Fresh candidate reruns after this slice, with CPUID held within 1.1%, were:
+
+| vCPUs | min | p50 | p99 |
+| ---: | ---: | ---: | ---: |
+| 1 | 44,360--44,640 | 73,080--77,600 | 17.32M--18.03M |
+| 8 | 59,480--60,560 | 188,720--190,120 | 35.63M--37.99M |
+
+These overlap the immediately preceding candidate ranges, so this is a
+structural lock-removal result, not yet an end-to-end latency win. One first
+eight-vCPU attempt hit the 60-second host readiness limit and the next two
+completed; p99 remains dominated by host/KVM descheduling. The profiled run
+reported zero `process-identity-divergence` records.
 
 ### Where the round trip stands
 
@@ -2030,3 +2046,68 @@ directory measured 43,880 against 44,000 with an identical 3,640 anchor -- no
 change. The scan is short because few tasks hold a sleepable lock at once. It
 was reverted rather than kept as scaling insurance, for the same reason the
 per-slot execution-owner word was.
+
+## The busiest lock site in the kernel was one bool
+
+The section above ends on "acquiring fewer of them". Rotating the acquisition-
+site census across the six busiest classes, rather than re-selecting the winner
+every window, is what named where those acquisitions actually were. One line
+answered for 94% of a whole lock class:
+
+| class | site | acquisitions/window |
+| --- | --- | ---: |
+| `ProcessTable` | `is_process_exiting` | 142,677 |
+| `SchedulerPolicy` | `scheduler.rs` dispatch policy | 68,863 |
+| `IpcReply` | `take_endpoint_response_detailed` (two, paired) | 30,368 × 2 |
+
+`is_process_exiting` took the one global process-table lock and walked every
+slot to read a single bool, and every synchronous IPC syscall asks it several
+times -- about 6.6 acquisitions per round trip from that one call. The
+lifecycle publication that already exists answers it without a lock, because a
+committed publication *means* `!exiting && !exec_in_progress &&
+!exec_state_staged`. The asymmetry is the whole design: publication may only
+prove a process live. An absent publication is an exiting process, a mid-exec
+one, or an unknown PID alike, so every other answer still comes from the locked
+lifecycle authority -- serving a negative answer from publication would make the
+accelerator a second authority. `LIVE_PROCESS_EXIT_QUERY_MAX_PROCESS_TABLE_ACQUISITIONS`
+pins the live direction at zero.
+
+One vCPU, anchor 3,640-3,720 throughout, `ipc_rt_intra_process_reply_recv`:
+
+| | min | p50 |
+| --- | ---: | ---: |
+| before | 30,480 | 33,160 |
+| after | 25,360-25,440 | **27,360-28,120** |
+
+Eight vCPU minimum over the same change: 31,320 -> 26,440-27,280.
+
+Also removed on the acquire path: the wait-deadline `RDTSC` was read *before*
+the first `try_lock`, so every uncontended acquisition -- nearly all of them, and
+what the round trip is made of -- paid for a timestamp whose value it never
+read. The clock now starts at the first failed attempt. On its own this is
+inside run-to-run noise; it is kept because it removes work from a path taken
+forty times per round trip and costs nothing to hold.
+
+### Selection and the budget commit are not the same predicate
+
+The 8-vCPU bench panicked with `scheduler selected a task without eligible
+domain budget`. It was not an SMP-identity problem: `RDPID` was independently
+validated against `RDTSCP` at boot and admitted, and the 1/2/4/8 vCPU ring3
+qualification cohort passed throughout.
+
+Selection admits a candidate with `is_eligible`, which accepts a refill that is
+merely *due*. The commit applies that refill and spends the budget. A charge on
+the same domain in between pops the due refill and re-arms it a period later,
+so the exact state the scan admitted is gone by the time the commit looks --
+`available_ns == 0` with the next refill in the future. Making the message name
+its own cause is what turned one reproduction into that sentence; the arm flags
+then showed a plain CFS pick, not a handoff, which ruled out the publication
+paths.
+
+A domain that cannot fund the selected task is a **policy outcome**, not an
+invariant break: it is the answer the admission scan itself would have given one
+instant later. The commit now declines and the dispatch takes the same fallback
+a rejected candidate takes, latching the refusal for the
+`scheduling-domain-budget-refused` milestone so a *rise* in the rate stays
+visible instead of becoming a silent reselect. Twenty-four 8-vCPU runs: one
+failure before the change, none in the eighteen after it.

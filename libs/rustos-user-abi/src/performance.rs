@@ -128,6 +128,32 @@ pub const SCHEDULER_DISPATCH_MAX_CATALOG_ACQUISITIONS: u32 = 1;
 /// path answers from the published per-slot state instead.
 pub const IPC_SYSCALL_MAX_PROCESS_TABLE_ACQUISITIONS: u32 = 2;
 
+/// Global process-table acquisitions required to validate one already-pinned
+/// process against an exact published process/MM generation.
+///
+/// User-copy and IPC paths perform this check repeatedly while the current
+/// thread already pins its process object. The ordinary live path must answer
+/// from the per-slot lifecycle publication; only revoked or torn publication
+/// may fall back to locked lifecycle authority.
+pub const EXACT_PROCESS_IDENTITY_MAX_PROCESS_TABLE_ACQUISITIONS: u32 = 0;
+
+/// Global process-table acquisitions a liveness query for a *live* process may
+/// make.
+///
+/// Every synchronous IPC syscall asks whether its peer process is exiting
+/// several times, and that question was the single busiest acquisition site in
+/// the kernel by a wide margin: one global table lock plus a walk of all slots
+/// to read one bool. A committed slot publication already means the process is
+/// neither exiting nor mid-exec, so the live answer must be served from
+/// publication alone.
+///
+/// The ceiling is deliberately asymmetric, and only the live direction is
+/// bounded. Publication cannot distinguish an exiting process from one that is
+/// mid-exec or from an unknown PID, so those answers must still come from the
+/// locked lifecycle authority; serving a *negative* liveness answer from
+/// publication would make it a second authority rather than an accelerator.
+pub const LIVE_PROCESS_EXIT_QUERY_MAX_PROCESS_TABLE_ACQUISITIONS: u32 = 0;
+
 /// Global vfsd admission limit for live epoll provider objects.
 ///
 /// The current kernel has 32 live process slots and 16-bit dynamic descriptor

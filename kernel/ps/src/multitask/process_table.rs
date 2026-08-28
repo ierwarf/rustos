@@ -15,7 +15,7 @@
 //!   `kernel-resource-lifecycle`.
 use alloc::boxed::Box;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use kernel_object::api::identity::{ObjectIdentity, ObjectKind, ObjectOwner};
 use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
@@ -32,99 +32,6 @@ type ProcessTableLock = TrackedSpinLock<ProcessTable, { LockClass::ProcessTable 
 enum ChildStateChange {
     Stopped(u8),
     Continued,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ProcessHandle {
-    index: usize,
-    generation: u32,
-}
-
-/// Stable, live process authority used at capability boundaries. A PID is only
-/// a routing label; callers retain both the process-table and address-space
-/// generations so PID reuse and exec cannot inherit a prior grant.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ProcessIdentity {
-    process_id: u64,
-    process_generation: u32,
-    mm_generation: u32,
-}
-
-impl ProcessIdentity {
-    pub const fn process_id(self) -> u64 {
-        self.process_id
-    }
-
-    pub const fn process_generation(self) -> u32 {
-        self.process_generation
-    }
-
-    pub const fn mm_generation(self) -> u32 {
-        self.mm_generation
-    }
-}
-
-impl ProcessHandle {
-    pub const fn new(index: usize, generation: u32) -> Self {
-        Self { index, generation }
-    }
-
-    pub const fn index(self) -> usize {
-        self.index
-    }
-
-    pub const fn generation(self) -> u32 {
-        self.generation
-    }
-
-    /// Typed process-table identity for capability boundaries.
-    ///
-    /// The table's zero-based slot is converted to the shared vocabulary's
-    /// nonzero slot. This does not prove that the process remains live; users
-    /// still retain or resolve this exact handle through the process table.
-    pub fn object_identity(self) -> Option<ObjectIdentity> {
-        let slot = u64::try_from(self.index).ok()?.checked_add(1)?;
-        ObjectIdentity::new(
-            ObjectOwner::Ps,
-            ObjectKind::Process,
-            slot,
-            u64::from(self.generation),
-        )
-    }
-
-    fn lifecycle_token_slot(self) -> Option<u64> {
-        let slot = u64::try_from(self.index).ok()?.checked_add(1)?;
-        (self.generation != 0 && slot <= u64::from(u32::MAX))
-            .then_some((u64::from(self.generation) << 32) | slot)
-    }
-}
-
-pub struct ProcessRef {
-    handle: ProcessHandle,
-    process_id: u64,
-    pin: ProcessRefPin,
-}
-
-/// What keeps a [`ProcessRef`]'s object reachable.
-///
-/// The global table covers every process, and retain plus release acquire it
-/// twice. IPC measured roughly ten such acquisitions per round trip, mostly
-/// from running threads redundantly counting their own already-pinned process.
-#[derive(Clone, Copy)]
-enum ProcessRefPin {
-    /// A reference counted in the table. The state pointer is fixed for the
-    /// reference's lifetime because the count keeps that exact object alive.
-    Counted(NonNull<ProcessStateLock<UserProcessState>>),
-    /// The caller's own live thread pins the object: `reclaim_slot` refuses
-    /// while `thread_count != 0`, so no count is needed and neither
-    /// acquisition happens.
-    ///
-    /// The state pointer is re-read on every access rather than cached,
-    /// because an exec replaces the object and no count holds the old one.
-    /// Every accessor reachable from this pin validates the exact process and
-    /// MM generation before it uses the state, so a replaced object is
-    /// rejected rather than silently used.
-    OwnThread,
 }
 
 /// Generation-bound authority for one exec ownership transfer.
@@ -205,103 +112,6 @@ impl ExecFinalize {
             self.closed,
             self.old_state,
         )
-    }
-}
-
-impl ProcessRef {
-    pub const fn process_id(&self) -> u64 {
-        self.process_id
-    }
-
-    pub fn live_identity(&self) -> Option<ProcessIdentity> {
-        live_process_identity(self.handle)
-    }
-
-    /// The state object this reference currently addresses.
-    ///
-    /// A counted reference answers from its own fixed pointer; an own-thread
-    /// pin re-reads the published one, so an exec that replaced the object is
-    /// observed rather than cached over.
-    fn state(&self) -> Option<NonNull<ProcessStateLock<UserProcessState>>> {
-        match self.pin {
-            ProcessRefPin::Counted(state) => Some(state),
-            ProcessRefPin::OwnThread => NonNull::new(
-                // ORDERING: Acquire observes the object installation published
-                // before the pointer store.
-                PROCESS_STATE_PTR
-                    .get(self.handle.index())?
-                    .load(Ordering::Acquire),
-            ),
-        }
-    }
-
-    pub fn with_state<R>(&self, f: impl FnOnce(u64, &UserProcessState) -> R) -> R {
-        let state = self
-            .state()
-            .expect("process reference lost its state object");
-        let state = unsafe { state.as_ref() }.lock();
-        f(self.process_id, &state)
-    }
-
-    pub fn with_state_mut<R>(&self, f: impl FnOnce(u64, &mut UserProcessState) -> R) -> R {
-        let state = self
-            .state()
-            .expect("process reference lost its state object");
-        let mut state = unsafe { state.as_ref() }.lock();
-        f(self.process_id, &mut state)
-    }
-
-    pub fn with_visible_state<R>(&self, f: impl FnOnce(u64, &UserProcessState) -> R) -> Option<R> {
-        // SAFETY: a counted reference retains the owning object and an
-        // own-thread pin re-read the live pointer above, so either way this
-        // addresses a state lock that cannot be reclaimed under the access.
-        let state = unsafe { self.state()?.as_ref() }.lock();
-        process_state_is_visible(self.handle).then(|| f(self.process_id, &state))
-    }
-
-    /// Accesses process state only while the exact process and address-space
-    /// generations retained by the caller are still live. The state lock is
-    /// acquired before the process table, matching exec's replacement order,
-    /// so validation and the complete access are one MM-generation epoch.
-    pub fn with_exact_visible_state<R>(
-        &self,
-        expected: ProcessIdentity,
-        f: impl FnOnce(u64, &UserProcessState) -> R,
-    ) -> Option<R> {
-        // SAFETY: see `with_visible_state`; the exact-identity check below is
-        // what rejects an object an exec replaced under an own-thread pin.
-        let state = unsafe { self.state()?.as_ref() }.lock();
-        (live_process_identity(self.handle) == Some(expected)).then(|| f(self.process_id, &state))
-    }
-
-    pub fn with_visible_state_mut<R>(
-        &self,
-        f: impl FnOnce(u64, &mut UserProcessState) -> R,
-    ) -> Option<R> {
-        // SAFETY: see `with_visible_state`; the per-process lock is the unique
-        // mutable access authority for the pointed-to state.
-        let mut state = unsafe { self.state()?.as_ref() }.lock();
-        process_state_is_visible(self.handle).then(|| f(self.process_id, &mut state))
-    }
-
-    pub fn try_with_state_mut<R>(
-        &self,
-        f: impl FnOnce(u64, &mut UserProcessState) -> R,
-    ) -> Option<R> {
-        // SAFETY: see `with_visible_state`; `ProcessStateLock` supplies the
-        // exclusive mutable access.
-        let mut state = unsafe { self.state()?.as_ref() }.try_lock()?;
-        process_state_is_visible(self.handle).then(|| f(self.process_id, &mut state))
-    }
-}
-
-impl Drop for ProcessRef {
-    fn drop(&mut self) {
-        // An own-thread pin took no count, so it releases none. That is also
-        // why a retired task cannot leak one: nothing was taken.
-        if matches!(self.pin, ProcessRefPin::Counted(_)) {
-            release_process_ref(self.handle);
-        }
     }
 }
 
@@ -414,32 +224,19 @@ impl ProcessTable {
     }
 }
 
+mod identity;
+pub use identity::{
+    ProcessHandle, ProcessIdentity, ProcessRef, live_process_identity,
+    live_process_identity_by_pid, release_process_ref, retain_process, retain_process_by_pid,
+};
+#[cfg(test)]
+use identity::{clear_publication_for_test, process_state_is_visible};
+pub(super) use identity::{own_process_ref, publication_divergence_count, with_own_visible_state};
+
 mod spawn;
 pub use spawn::{SpawnReservation, cancel_spawn, publish_spawn, reserve_spawn};
 
 static PROCESS_TABLE: ProcessTableLock = ProcessTableLock::new(ProcessTable::new());
-
-/// Per-slot state visibility, readable without the table lock.
-///
-/// Encodes `(generation << 1) | staged`, and zero for a slot with no live
-/// object. Testing visibility used to take the global process table, and a
-/// user-memory copy did that on top of a retain and a release of the same
-/// lock -- three acquisitions to answer a question about one slot. A reader
-/// still compares the generation its handle carries, so a reused slot reads as
-/// invisible exactly as the locked scan made it.
-///
-/// Every transition that changes object presence, slot generation, or the
-/// staged flag republishes this word while holding the table lock.
-static PROCESS_STATE_VISIBILITY: [AtomicU64; MAX_PROCESS_OBJECTS] =
-    [const { AtomicU64::new(0) }; MAX_PROCESS_OBJECTS];
-
-/// Per-slot process state pointer, readable without the table lock.
-///
-/// `state_ptr` addresses a field inside the boxed process object and
-/// `replace_for_exec` mutates the state in place, so this stays valid for the
-/// object's whole lifetime.
-static PROCESS_STATE_PTR: [AtomicPtr<ProcessStateLock<UserProcessState>>; MAX_PROCESS_OBJECTS] =
-    [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_PROCESS_OBJECTS];
 
 /// One namespace for spawn/exec/exit/reap transactions. IDs never wrap: after
 /// the final u32 identity is consumed, new lifecycle admission fails closed
@@ -491,63 +288,17 @@ fn record_lifecycle_marker(
 ) {
 }
 
-/// Republishes `index`'s unlocked view from the authoritative slot.
 fn publish_slot_visibility(index: usize, slot: &ProcessSlot) {
-    let (word, state) = match slot.object.as_deref() {
-        Some(object) => {
-            let generation = u64::from(slot.generation) << 1;
-            let word = if object.exec_state_staged {
-                generation | 1
-            } else {
-                generation
-            };
-            (word, object.state_ptr().as_ptr())
-        }
-        None => (0, core::ptr::null_mut()),
-    };
-    // ORDERING: Release publishes the object installation, generation bump, or
-    // staged transition that preceded it before any unlocked reader can
-    // observe either word. The pointer is stored first so a reader that
-    // observes a live visibility word always observes the matching state.
-    PROCESS_STATE_PTR[index].store(state, Ordering::Release);
-    // ORDERING: Release orders the pointer store above before this word, so a
-    // reader that observes a live generation also observes the matching state.
-    PROCESS_STATE_VISIBILITY[index].store(word, Ordering::Release);
-}
-
-/// Runs `f` against the **current task's own** process state without touching
-/// the process table.
-///
-/// # Contract
-///
-/// Sound only for a process that has a live thread on this CPU.
-/// `reclaim_slot` refuses to reclaim while `thread_count != 0`, so a running
-/// task keeps its own object alive and its published state pointer valid. No
-/// other process carries that guarantee, and every other caller must keep
-/// going through [`retain_process`].
-///
-/// Binding an address space for a user copy used to cost three acquisitions of
-/// the global table -- retain, visibility, release -- to reach a pointer the
-/// running task already owned.
-pub(super) fn with_own_visible_state<R>(
-    handle: ProcessHandle,
-    f: impl FnOnce(&UserProcessState) -> R,
-) -> Option<R> {
-    // ORDERING: Acquire observes the object installation published before the
-    // pointer store.
-    let state = NonNull::new(
-        PROCESS_STATE_PTR
-            .get(handle.index())?
-            // ORDERING: the acquire below observes the installed state pointer.
-            .load(Ordering::Acquire),
-    )?;
-    // SAFETY: the caller's own live thread pins this object, so the published
-    // pointer addresses a state lock that cannot be reclaimed under it.
-    let state = unsafe { state.as_ref() }.lock();
-    // Visibility is tested after the state lock exactly as the locked path did:
-    // an exec that is staging state holds this lock, so the flag it publishes
-    // cannot be observed early.
-    process_state_is_visible(handle).then(|| f(&state))
+    let publication = slot
+        .object
+        .as_deref()
+        .map(|object| identity::SlotPublication {
+            process_id: object.process_id,
+            mm_generation: object.mm_generation,
+            live: !object.exiting && !object.exec_in_progress && !object.exec_state_staged,
+            state: object.state_ptr().as_ptr(),
+        });
+    identity::publish_slot_visibility(index, slot.generation, publication);
 }
 
 fn reclaim_slot(index: usize, slot: &mut ProcessSlot) -> Option<Box<ProcessObject>> {
@@ -631,6 +382,7 @@ pub fn detach_task(handle: ProcessHandle) -> Option<()> {
                 .then_some((object.mm_generation, object.lifecycle_transaction_id)),
         )
     };
+    publish_slot_visibility(handle.index(), &table.slots[handle.index()]);
     if should_queue {
         table.push_reap_handle(handle);
     }
@@ -644,129 +396,6 @@ pub fn detach_task(handle: ProcessHandle) -> Option<()> {
         );
     }
     Some(())
-}
-
-pub fn retain_process(handle: ProcessHandle) -> Option<ProcessRef> {
-    let mut table = PROCESS_TABLE.lock();
-    let object = table.lookup_object_mut(handle)?;
-    object.ref_count = object.ref_count.checked_add(1)?;
-    let process_id = object.process_id;
-    let state_ptr = object.state_ptr();
-    Some(ProcessRef {
-        handle,
-        process_id,
-        pin: ProcessRefPin::Counted(state_ptr),
-    })
-}
-
-/// The current task's own process, without taking a reference count.
-///
-/// # Contract
-///
-/// Sound only for the process that owns the calling task. `reclaim_slot`
-/// refuses while `thread_count != 0`, so a running or blocked thread keeps its
-/// own object alive; no other process carries that guarantee and every other
-/// caller must keep going through [`retain_process`].
-///
-/// This exists because the retain and its release are two acquisitions of the
-/// one global process table, and the synchronous IPC path made roughly ten of
-/// them per round trip to pin objects its own threads already pinned. See
-/// `rustos_user_abi::performance::IPC_SYSCALL_MAX_PROCESS_TABLE_ACQUISITIONS`.
-pub(super) fn own_process_ref(handle: ProcessHandle, process_id: u64) -> Option<ProcessRef> {
-    // ORDERING: Acquire observes the object installation published before the
-    // pointer store; a slot that has never been installed answers `None`.
-    let installed = PROCESS_STATE_PTR
-        .get(handle.index())?
-        .load(Ordering::Acquire);
-    if installed.is_null() || !process_state_is_visible(handle) {
-        return None;
-    }
-    Some(ProcessRef {
-        handle,
-        process_id,
-        pin: ProcessRefPin::OwnThread,
-    })
-}
-
-pub fn retain_process_by_pid(process_id: u64) -> Option<ProcessRef> {
-    let mut table = PROCESS_TABLE.lock();
-    for (index, slot) in table.slots.iter_mut().enumerate() {
-        let generation = slot.generation;
-        let Some(object) = slot.object.as_deref_mut() else {
-            continue;
-        };
-        if object.process_id != process_id {
-            continue;
-        }
-        object.ref_count = object.ref_count.checked_add(1)?;
-        let state_ptr = object.state_ptr();
-        return Some(ProcessRef {
-            handle: ProcessHandle::new(index, generation),
-            process_id,
-            pin: ProcessRefPin::Counted(state_ptr),
-        });
-    }
-    None
-}
-
-/// Resolve a PID to its live generational authority. Processes that are
-/// exiting or transitioning address spaces are deliberately not identities:
-/// publication during either interval would make an old capability survive a
-/// teardown or exec boundary.
-pub fn live_process_identity_by_pid(process_id: u64) -> Option<ProcessIdentity> {
-    let table = PROCESS_TABLE.lock();
-    table.slots.iter().find_map(|slot| {
-        let object = slot.object.as_deref()?;
-        (object.process_id == process_id
-            && !object.exiting
-            && !object.exec_in_progress
-            && !object.exec_state_staged)
-            .then_some(ProcessIdentity {
-                process_id,
-                process_generation: slot.generation,
-                mm_generation: object.mm_generation,
-            })
-    })
-}
-
-/// Resolve one scheduler-held process handle to a live identity without
-/// accepting a recycled slot generation.
-pub fn live_process_identity(handle: ProcessHandle) -> Option<ProcessIdentity> {
-    let table = PROCESS_TABLE.lock();
-    let slot = table
-        .slots
-        .get(handle.index())
-        .filter(|slot| slot.generation == handle.generation())?;
-    let object = slot.object.as_deref()?;
-    (!object.exiting && !object.exec_in_progress && !object.exec_state_staged).then_some(
-        ProcessIdentity {
-            process_id: object.process_id,
-            process_generation: handle.generation(),
-            mm_generation: object.mm_generation,
-        },
-    )
-}
-
-pub fn release_process_ref(handle: ProcessHandle) {
-    let mut table = PROCESS_TABLE.lock();
-    let should_queue = {
-        let Some(object) = table.lookup_object_mut(handle) else {
-            return;
-        };
-        if object.ref_count == 0 {
-            return;
-        }
-        object.ref_count -= 1;
-        let should_queue =
-            object.thread_count == 0 && object.ref_count == 0 && !object.queued_for_reap;
-        if should_queue {
-            object.queued_for_reap = true;
-        }
-        should_queue
-    };
-    if should_queue {
-        table.push_reap_handle(handle);
-    }
 }
 
 pub fn parent_process_id_of(process_id: u64) -> Option<u64> {
@@ -968,16 +597,6 @@ fn exec_commit_may_transfer(object: &ProcessObject, reservation: ExecReservation
         && !object.exiting
 }
 
-fn process_state_is_visible(handle: ProcessHandle) -> bool {
-    let Some(word) = PROCESS_STATE_VISIBILITY.get(handle.index()) else {
-        return false;
-    };
-    // ORDERING: Acquire observes the object installation, generation bump, or
-    // staged transition published before this word.
-    let encoded = word.load(Ordering::Acquire);
-    encoded != 0 && encoded >> 1 == u64::from(handle.generation()) && encoded & 1 == 0
-}
-
 pub fn begin_exec(handle: ProcessHandle) -> Option<ExecReservation> {
     let mut table = PROCESS_TABLE.lock();
     let object = table.lookup_object_mut(handle)?;
@@ -995,6 +614,7 @@ pub fn begin_exec(handle: ProcessHandle) -> Option<ExecReservation> {
         next_mm_generation,
         transaction_id,
     };
+    publish_slot_visibility(handle.index(), &table.slots[handle.index()]);
     drop(table);
     record_lifecycle_marker(
         "lifecycle-exec-reserve",
@@ -1049,6 +669,10 @@ pub fn cancel_exec(reservation: ExecReservation) -> bool {
     } else {
         None
     };
+    publish_slot_visibility(
+        reservation.handle.index(),
+        &table.slots[reservation.handle.index()],
+    );
     drop(table);
     record_lifecycle_marker(
         "lifecycle-exec-cancel",
@@ -1069,14 +693,16 @@ pub fn cancel_exec(reservation: ExecReservation) -> bool {
 
 pub fn note_process_exit_status(process_id: u64, status: i32) -> Option<()> {
     let mut table = PROCESS_TABLE.lock();
-    let object = table
-        .slots
-        .iter_mut()
-        .filter_map(|slot| slot.object.as_deref_mut())
-        .find(|object| object.process_id == process_id)?;
+    let index = table.slots.iter().position(|slot| {
+        slot.object
+            .as_deref()
+            .is_some_and(|object| object.process_id == process_id)
+    })?;
+    let object = table.slots[index].object.as_deref_mut()?;
     object.exit_status = Some(status);
     object.child_state_change = None;
     object.exiting = true;
+    publish_slot_visibility(index, &table.slots[index]);
     Some(())
 }
 
@@ -1123,6 +749,7 @@ pub fn mark_process_exiting(process_id: u64) -> Option<()> {
         }
         object.exit_pending = true;
         let marker = first.then_some((object.mm_generation, object.pending_exit_transaction_id?));
+        publish_slot_visibility(handle.index(), &table.slots[handle.index()]);
         drop(table);
         if let Some((mm_generation, transaction_id)) = marker {
             record_lifecycle_marker(
@@ -1139,6 +766,7 @@ pub fn mark_process_exiting(process_id: u64) -> Option<()> {
     }
     object.exiting = true;
     let marker = (object.mm_generation, object.lifecycle_transaction_id);
+    publish_slot_visibility(handle.index(), &table.slots[handle.index()]);
     drop(table);
     record_lifecycle_marker("lifecycle-exit-seal", handle, marker.0, marker.1);
     Some(())
@@ -1163,6 +791,7 @@ pub fn mark_process_exiting_once(process_id: u64) -> Option<bool> {
         }
         object.exit_pending = true;
         let marker = first.then_some((object.mm_generation, object.pending_exit_transaction_id?));
+        publish_slot_visibility(handle.index(), &table.slots[handle.index()]);
         drop(table);
         if let Some((mm_generation, transaction_id)) = marker {
             record_lifecycle_marker(
@@ -1180,6 +809,7 @@ pub fn mark_process_exiting_once(process_id: u64) -> Option<bool> {
     }
     object.exiting = true;
     let marker = first.then_some((object.mm_generation, object.lifecycle_transaction_id));
+    publish_slot_visibility(handle.index(), &table.slots[handle.index()]);
     drop(table);
     if let Some((mm_generation, transaction_id)) = marker {
         record_lifecycle_marker("lifecycle-exit-seal", handle, mm_generation, transaction_id);
@@ -1188,6 +818,14 @@ pub fn mark_process_exiting_once(process_id: u64) -> Option<bool> {
 }
 
 pub fn is_process_exiting(process_id: u64) -> Option<bool> {
+    // Every IPC syscall asks this several times, and it was the single busiest
+    // acquisition site in the kernel: a global table lock plus a full slot walk
+    // to read one bool. A live publication already means "not exiting", so the
+    // affirmative answer needs no lock at all. Only the cases the publication
+    // cannot distinguish -- exiting, mid-exec, or unknown -- reach the table.
+    if identity::published_process_is_live_by_pid(process_id) {
+        return Some(false);
+    }
     let table = PROCESS_TABLE.lock();
     table
         .slots
@@ -1380,8 +1018,8 @@ pub(crate) mod tests {
     use core::sync::atomic::AtomicU64;
 
     use super::{
-        ExecReservation, LockClass, Ordering, PROCESS_STATE_PTR, ProcessHandle, ProcessObject,
-        ProcessTable, WaitResult, attach_task, begin_exec, cancel_exec, create_process,
+        ExecReservation, LockClass, ProcessHandle, ProcessObject, ProcessTable, WaitResult,
+        attach_task, begin_exec, cancel_exec, clear_publication_for_test, create_process,
         create_process_with_parent, detach_task, is_process_exiting, mark_process_exiting,
         note_process_continued, note_process_exit_status, note_process_stopped, own_process_ref,
         process_state_is_visible, reap_exited_processes, retain_process, thread_count_by_pid,
@@ -1490,9 +1128,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// The pin re-reads the published state pointer instead of caching it,
-    /// which is what makes it safe across the exec that replaces the object.
-    /// A cached pointer would address a freed object with nothing holding it.
     #[test]
     fn an_own_thread_pin_answers_from_the_published_state_pointer() {
         let _isolation = isolate_process_table();
@@ -1501,12 +1136,10 @@ pub(crate) mod tests {
         let reference = own_process_ref(handle, 0x9201).expect("own-thread pin");
         assert!(reference.with_visible_state(|_, _| ()).is_some());
 
-        // A slot with no published state cannot be pinned at all, and an
+        // A slot with no committed identity cannot be pinned at all, and an
         // already-pinned reference stops answering rather than dereferencing a
-        // pointer nothing holds.
-        // ORDERING: Release matches the production publication this witness
-        // stands in for, so the pin's Acquire load observes the cleared slot.
-        PROCESS_STATE_PTR[handle.index()].store(core::ptr::null_mut(), Ordering::Release);
+        // payload whose lifecycle publication was revoked.
+        clear_publication_for_test(handle.index());
         assert!(own_process_ref(handle, 0x9201).is_none());
         assert!(reference.with_visible_state(|_, _| ()).is_none());
     }
@@ -1615,6 +1248,7 @@ pub(crate) mod tests {
                 .lookup_object_mut(handle)
                 .expect("live process object");
             object.mm_generation += 1;
+            super::publish_slot_visibility(handle.index(), &table.slots[handle.index()]);
         }
         assert_eq!(
             retained.with_exact_visible_state(identity, |process_id, _| process_id),

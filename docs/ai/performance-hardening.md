@@ -634,3 +634,16 @@ build error, by design.
 - Delete a marked path only after its broker callers and owning service prove
   that it is replaced. A marker or LOC total alone does not prove that ring0
   substrate is obsolete.
+
+## Exact process identity hot path
+
+- A running thread already pins its process object. Exact process/MM generation
+  validation therefore reads the per-slot lifecycle publication and has a hard
+  ceiling of zero `ProcessTable` acquisitions on the committed live path.
+- Publication is fail-closed: the writer first revokes the identity word,
+  updates PID and state-pointer payload, then release-publishes the exact
+  process/MM generation. A reader observes the identity on both sides of the
+  payload and rejects a changed or zero word.
+- Revoked, incomplete, or damaged publication uses the locked lifecycle table
+  as the correctness fallback. The out-of-scheduler-guard divergence sweep is
+  the evidence that this fallback is exceptional rather than silently normal.

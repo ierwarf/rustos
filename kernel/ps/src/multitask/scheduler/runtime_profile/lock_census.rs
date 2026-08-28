@@ -95,9 +95,45 @@ pub(super) fn drain_class_and_site_census() {
         }
     }
 
-    if let Some((top_class, count)) = ranked.first().copied()
-        && count != 0
-    {
-        nucleus_core::util::lockdep::work_budget::select_site_census_class(top_class);
+    let mut identity_sites =
+        nucleus_core::util::lockdep::work_budget::take_identity_site_census();
+    identity_sites.sort_unstable_by(|left, right| right.2.cmp(&left.2));
+    const IDENTITY_SITE_NAMES: [&str; 6] = [
+        "kernel-identity-site-0",
+        "kernel-identity-site-1",
+        "kernel-identity-site-2",
+        "kernel-identity-site-3",
+        "kernel-identity-site-4",
+        "kernel-identity-site-5",
+    ];
+    for (name, (file, line, count)) in IDENTITY_SITE_NAMES.into_iter().zip(identity_sites) {
+        if count == 0 {
+            break;
+        }
+        crate::debug::record_milestone(
+            crate::debug::LogCategory::Sched,
+            name,
+            count,
+            (u64::from(fnv1a32(file)) << 32) | u64::from(line),
+        );
+    }
+
+    // Rotate through the ranked classes rather than re-selecting the winner
+    // every window. Pinning the top class meant five of the six ranked classes
+    // never produced a single site, so the census could name the busiest class
+    // but never say which lines made the others busy. One window each, in rank
+    // order, covers all six without widening the fixed-capacity site table.
+    let ranked_classes = ranked
+        .iter()
+        .take(LOCK_CLASS_NAMES.len())
+        .filter(|(_, count)| *count != 0)
+        .map(|(class_index, _)| *class_index);
+    let next_class = ranked_classes
+        .clone()
+        .skip_while(|class_index| *class_index != censused_class)
+        .nth(1)
+        .or_else(|| ranked_classes.clone().next());
+    if let Some(next_class) = next_class {
+        nucleus_core::util::lockdep::work_budget::select_site_census_class(next_class);
     }
 }

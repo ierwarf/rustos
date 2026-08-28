@@ -26,6 +26,19 @@ use x86_64::registers::model_specific::Msr;
 const IA32_TSC_AUX: u32 = 0xC000_0103;
 #[cfg(rustos_boot_image)]
 static RDTSCP_CPU_TOKEN_ADMITTED: AtomicBool = AtomicBool::new(false);
+/// `RDPID` reads the same kernel-owned `IA32_TSC_AUX` token as `RDTSCP`, and
+/// nothing else.
+///
+/// `RDTSCP` also reads the timestamp counter and orders itself against prior
+/// loads, which is a serializing cost paid on a path that only wants a CPU
+/// label. The per-site census measured about 124 derivations per dispatch --
+/// roughly 250 per synchronous IPC round trip -- so the difference between the
+/// two instructions is a measurable share of the round trip, not a
+/// micro-optimization. `RDPID` is used where the CPU has it and `RDTSCP`
+/// remains the exact fallback, so the admitted token and its decoding are
+/// unchanged either way.
+#[cfg(rustos_boot_image)]
+static RDPID_CPU_TOKEN_ADMITTED: AtomicBool = AtomicBool::new(false);
 
 /// This CPU's dense logical index.
 ///
@@ -35,15 +48,22 @@ static RDTSCP_CPU_TOKEN_ADMITTED: AtomicBool = AtomicBool::new(false);
 /// [`super::work_budget::declare_identity_derivations_on`].
 #[cfg(rustos_boot_image)]
 #[inline]
-#[track_caller]
+// `#[track_caller]` is what lets a failing ceiling name the derivation it could
+// not account for, and it costs a hidden `&Location` argument at every call
+// site plus the inlining it inhibits. The per-site census measured about 124
+// derivations per dispatch, so that argument is itself a measurable share of
+// the dispatch; the shipping build keeps the count, which is what the ceilings
+// assert on, and the diagnosis build keeps the site.
+#[cfg_attr(rustos_lock_phase_profile, track_caller)]
 pub fn current_cpu_index() -> usize {
     let index = derive_cpu_index();
-    // One relaxed increment and one relaxed pointer store on a CPU-private
-    // line, inside a function that executes `RDTSCP` and two acquire loads.
-    // It is the only thing that keeps a re-derivation from reappearing here
-    // silently, which is exactly how five of them accumulated on one lock
-    // acquisition, and the site is what makes the sixth findable.
+    // One relaxed increment on a CPU-private line. It is the only thing that
+    // keeps a re-derivation from reappearing here silently, which is exactly
+    // how five of them accumulated on one lock acquisition.
+    #[cfg(rustos_lock_phase_profile)]
     super::work_budget::charge_identity_derivation(index, core::panic::Location::caller());
+    #[cfg(not(rustos_lock_phase_profile))]
+    super::work_budget::charge_identity_derivation_count(index);
     index
 }
 
@@ -58,6 +78,7 @@ pub(super) fn current_cpu_index_uncharged() -> usize {
 }
 
 #[cfg(rustos_boot_image)]
+#[inline]
 fn derive_cpu_index() -> usize {
     // ORDERING: Acquire makes the complete dense APIC-ID map visible after HAL
     // finishes ACPI topology publication. Earlier BSP boot remains index zero.
@@ -68,10 +89,17 @@ fn derive_cpu_index() -> usize {
     // ORDERING: Acquire observes token admission after immutable topology
     // publication. TSC_AUX itself is CPU-local architectural state.
     if RDTSCP_CPU_TOKEN_ADMITTED.load(Ordering::Acquire) {
-        let mut aux = 0_u32;
-        // SAFETY: admission proved RDTSCP support; the instruction only reads
-        // the timestamp and this CPU's kernel-owned TSC_AUX token.
-        let _ = unsafe { core::arch::x86_64::__rdtscp(&mut aux) };
+        // ORDERING: Acquire observes the same admission publication; both
+        // instructions read the identical token, so either answer is exact.
+        let aux = if RDPID_CPU_TOKEN_ADMITTED.load(Ordering::Acquire) {
+            read_tsc_aux_rdpid()
+        } else {
+            let mut aux = 0_u32;
+            // SAFETY: admission proved RDTSCP support; the instruction only
+            // reads the timestamp and this CPU's kernel-owned TSC_AUX token.
+            let _ = unsafe { core::arch::x86_64::__rdtscp(&mut aux) };
+            aux
+        };
         if let Some(index) = decode_cpu_token(aux, count) {
             return index;
         }
@@ -263,6 +291,29 @@ pub fn finalize_cpu_identities(cpu_count: usize) {
             "lockdep invariant: CPU identity map published twice"
         );
         if rdtscp_supported() {
+            // `RDPID` is admitted only after it is observed returning the exact
+            // token `RDTSCP` returns on this machine. The architecture says
+            // they read the same MSR, but this kernel runs under a hypervisor
+            // that may intercept one and not the other, and a wrong logical
+            // CPU index is not a slow path -- it is a task dispatched on the
+            // wrong run queue. Fail closed to `RDTSCP` rather than trust the
+            // feature bit.
+            let rdpid_admitted = rdpid_supported() && rdpid_agrees_with_rdtscp();
+            if rdpid_admitted {
+                // ORDERING: Release admits the cheaper reader before the token
+                // itself, so no CPU can select `RDPID` without also observing
+                // the admission that makes the token meaningful.
+                RDPID_CPU_TOKEN_ADMITTED.store(true, Ordering::Release);
+            }
+            // Which reader is serving is the first thing to check when a
+            // logical-CPU question is suspected, so it is recorded rather than
+            // inferred from a feature bit.
+            crate::debug::record_milestone(
+                crate::debug::LogCategory::Boot,
+                "cpu-index-reader",
+                u64::from(rdpid_admitted),
+                cpu_count as u64,
+            );
             // ORDERING: Release admits the CPU-local token only after the
             // immutable dense topology is visible.
             RDTSCP_CPU_TOKEN_ADMITTED.store(true, Ordering::Release);
@@ -323,6 +374,42 @@ pub fn bind_current_cpu_identity(logical_index: u8, expected_apic_id: u32) {
 }
 
 #[cfg(rustos_boot_image)]
+/// Reads `IA32_TSC_AUX` with `RDPID`.
+#[cfg(rustos_boot_image)]
+#[inline]
+fn read_tsc_aux_rdpid() -> u32 {
+    let aux: u64;
+    // SAFETY: admission proved `RDPID` support. The instruction reads only this
+    // CPU's kernel-owned `IA32_TSC_AUX` and writes one general register.
+    unsafe {
+        core::arch::asm!(
+            "rdpid {aux}",
+            aux = out(reg) aux,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    aux as u32
+}
+
+/// Whether `RDPID` and `RDTSCP` report the identical `IA32_TSC_AUX` here.
+#[cfg(rustos_boot_image)]
+fn rdpid_agrees_with_rdtscp() -> bool {
+    let mut rdtscp_aux = 0_u32;
+    // SAFETY: the caller established `RDTSCP` support; the instruction reads
+    // only the timestamp and this CPU's kernel-owned TSC_AUX token.
+    let _ = unsafe { core::arch::x86_64::__rdtscp(&mut rdtscp_aux) };
+    read_tsc_aux_rdpid() == rdtscp_aux
+}
+
+#[cfg(rustos_boot_image)]
+fn rdpid_supported() -> bool {
+    use core::arch::x86_64::{__cpuid, __cpuid_count};
+
+    // CPUID.(EAX=07H,ECX=0):ECX.RDPID[bit 22]; leaf 7 requires a maximum basic
+    // leaf that reaches it.
+    __cpuid(0).eax >= 7 && __cpuid_count(7, 0).ecx & (1 << 22) != 0
+}
+
 fn rdtscp_supported() -> bool {
     use core::arch::x86_64::__cpuid;
 

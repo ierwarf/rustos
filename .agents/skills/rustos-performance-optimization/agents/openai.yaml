@@ -1,0 +1,4 @@
+interface:
+  display_name: "RustOS Performance Optimization"
+  short_description: "Evidence-led perf optimization with five analysis tools"
+  default_prompt: "Use $rustos-performance-optimization to measure, explain, and verify a RustOS performance change."

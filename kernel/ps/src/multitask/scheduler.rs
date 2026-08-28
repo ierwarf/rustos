@@ -3763,7 +3763,7 @@ impl Scheduler {
         }
 
         let sync_handoff = (!atomic_activation_pending)
-            .then(|| timed_handoff_step(1, || self.take_next_synchronous_pick_hint_ready_slot()))
+            .then(|| self.take_next_synchronous_pick_hint_ready_slot())
             .flatten();
 
         #[cfg(not(test))]
@@ -3839,10 +3839,8 @@ impl Scheduler {
         // before, so nothing here can admit an activation that is not queued.
         let atomic_activation_handoff = atomic_activation_pending
             .then(|| {
-                let mut policy = timed_handoff_step(6, || self.current_dispatch_policy());
-                timed_handoff_step(0, || {
-                    self.take_next_atomic_activation_handoff_ready_slot(&mut policy)
-                })
+                let mut policy = self.current_dispatch_policy();
+                self.take_next_atomic_activation_handoff_ready_slot(&mut policy)
             })
             .flatten();
         debug_assert!(
@@ -3865,18 +3863,13 @@ impl Scheduler {
                 None => match sync_handoff {
                     Some(peer_slot) => (peer_slot, true, None, false, true),
                     None => {
-                        let policy =
-                            policy.insert(timed_handoff_step(6, || self.current_dispatch_policy()));
-                        let mandatory_overdue = timed_handoff_step(2, || {
-                            self.mandatory_overdue_system_pick(current_slot, now_ticks)
-                        });
-                        let bootstrap_handoff = if mandatory_overdue.is_none() {
-                            timed_handoff_step(3, || {
-                                self.take_next_bootstrap_handoff_ready_slot(policy)
-                            })
-                        } else {
-                            None
-                        };
+                        let policy = policy.insert(self.current_dispatch_policy());
+                        let mandatory_overdue =
+                            self.mandatory_overdue_system_pick(current_slot, now_ticks);
+                        let bootstrap_handoff = mandatory_overdue
+                            .is_none()
+                            .then(|| self.take_next_bootstrap_handoff_ready_slot(policy))
+                            .flatten();
                         let (next_idx, ipc_handoff, reserved_user_pick, latency_handoff_pick) =
                             match mandatory_overdue {
                                 Some(overdue_slot) => (overdue_slot, true, None, false),
@@ -3888,9 +3881,7 @@ impl Scheduler {
                                         let blocking_ipc_handoff = self
                                             .slot_blocked(current_slot)
                                             .then(|| {
-                                                timed_handoff_step(4, || {
-                                                    self.take_next_pick_hint_ready_slot(policy)
-                                                })
+                                                self.take_next_pick_hint_ready_slot(policy)
                                             })
                                             .flatten();
                                         let (next_idx, ipc_handoff, reserved_user_pick) =
@@ -3917,12 +3908,10 @@ impl Scheduler {
                                                             // now, not weaker: overdue is offered
                                                             // before the hint and before the
                                                             // bootstrap and reservation arms too.
-                                                            let overdue_or_hint =
-                                                                timed_handoff_step(5, || {
-                                                                    self.take_next_pick_hint_ready_slot(
-                                                                        policy,
-                                                                    )
-                                                                });
+                                                            let overdue_or_hint = self
+                                                                .take_next_pick_hint_ready_slot(
+                                                                    policy,
+                                                                );
                                                             let cfs_pick = if voluntary_yield {
                                                                 self.pick_min_vruntime_excluding(
                                                                     current_slot,
@@ -3985,31 +3974,9 @@ impl Scheduler {
         if let Some(next) = self.contexts[next_idx] {
             let next_saved_rsp = self.slot_saved_rsp(next_idx);
             match self.context_validation_error(next_idx, next, next_saved_rsp) {
-                None => {
-                    let context_owner_slot = self.effective_scheduling_context_owner_slot(next_idx);
-                    if self.contexts[context_owner_slot]
-                        .is_some_and(|context| context.scheduling_context.is_budgeted())
-                    {
-                        let now_ns = crate::arch::clock::monotonic_nanos();
-                        let policy = self.contexts[context_owner_slot]
-                            .and_then(|context| context.scheduling_context.policy())
-                            .expect("budgeted scheduling context lost its policy");
-                        let domain_slot = self.contexts[context_owner_slot]
-                            .and_then(|context| context.scheduling_context.domain_slot())
-                            .expect("budgeted scheduling context lost its domain slot");
-                        assert!(
-                            self.prepare_scheduling_domain_dispatch(domain_slot, policy, now_ns),
-                            "scheduler selected a task without eligible domain budget slot={next_idx}"
-                        );
-                        assert!(
-                            self.contexts[context_owner_slot]
-                                .as_mut()
-                                .expect("selected scheduling context disappeared")
-                                .scheduling_context
-                                .prepare_dispatch(now_ns),
-                            "scheduler selected a task without eligible budget slot={next_idx}"
-                        );
-                    }
+                // A refused budget falls through to the fallback below, exactly
+                // as a candidate the admission scan rejected would have.
+                None if self.commit_scheduling_budget_for_dispatch(next_idx) => {
                     #[cfg(not(test))]
                     assert!(
                         runqueue::claim_dispatch(
@@ -4072,6 +4039,7 @@ impl Scheduler {
                         next_idx,
                     );
                 }
+                None => {}
                 Some(reason) if next_idx == ROOT_TASK_SLOT => {
                     self.log_invalid_context(next_idx, next_saved_rsp, reason, "next");
                     panic!("scheduler root kernel context is corrupted: {}", reason);
@@ -4292,6 +4260,7 @@ impl Scheduler {
     }
 
     pub(super) fn prepare_current_task_execution(&mut self) {
+        let mut arch_marker = Self::phase_chain_start();
         let current_slot = self.current_task_slot();
         let current =
             self.contexts[current_slot].expect("scheduler selected a missing task context");
@@ -4305,10 +4274,12 @@ impl Scheduler {
             self.slot_saved_rsp(current_slot),
         )
         .expect("scheduler selected an invalid task context");
+        self.mark_phase(SchedulerPhase::ArchValidate, &mut arch_marker);
         crate::memory::paging::load_address_space_phys(PhysAddr::new(
             self.slot_address_space_root(current_slot),
         ));
         let (_, kernel_stack_top) = self.slot_kernel_stack_bounds(current_slot);
+        self.mark_phase(SchedulerPhase::ArchAddressSpace, &mut arch_marker);
         if kernel_stack_top != 0 {
             assert_eq!(
                 kernel_stack_top & 0xF,
@@ -4333,14 +4304,33 @@ impl Scheduler {
         } else {
             crate::arch::gdt::kernel_data_selector()
         };
-        unsafe {
-            DS::set_reg(data_selector);
-            ES::set_reg(data_selector);
-            FS::set_reg(data_selector);
-            GS::set_reg(data_selector);
+        // Four segment loads per task switch, and consecutive user tasks want
+        // the identical null selector, so the reload wrote what was already
+        // there. A segment load is architecturally expensive even for a null
+        // selector, and the per-phase attribution measured this block as part
+        // of the largest segment of a real task switch.
+        //
+        // The registers are read rather than cached. `iretq` to a lower
+        // privilege level nulls any data selector the new CPL cannot use, so
+        // what this function last wrote is not necessarily what the CPU holds;
+        // a remembered value would be exactly as wrong as the GS-base cache
+        // that double-faulted. Four reads cost a few cycles against four
+        // writes, so the exact test is also the cheap one.
+        let data_selectors_match = DS::get_reg() == data_selector
+            && ES::get_reg() == data_selector
+            && FS::get_reg() == data_selector
+            && GS::get_reg() == data_selector;
+        if !data_selectors_match {
+            unsafe {
+                DS::set_reg(data_selector);
+                ES::set_reg(data_selector);
+                FS::set_reg(data_selector);
+                GS::set_reg(data_selector);
+            }
         }
         FsBase::write(VirtAddr::new(fs_base));
         crate::user::syscall::prepare_for_context_return(return_to_user, user_gs_base);
+        self.mark_phase(SchedulerPhase::ArchSegments, &mut arch_marker);
     }
 
     /// Restore task-specific architectural state only across a real task
@@ -4447,15 +4437,21 @@ impl Scheduler {
 
     pub(super) fn save_current_simd_state(&mut self) {
         let mut phase_marker = Self::phase_chain_start();
+        let mut simd_marker = phase_marker;
         let slot = self.current_task_slot();
         self.save_slot_simd_state(slot);
+        // Charged to both the parent segment and its own split, so the arch
+        // total stays comparable across the breakdown.
+        self.mark_phase(SchedulerPhase::ArchSimd, &mut simd_marker);
         self.mark_phase(SchedulerPhase::ArchRestore, &mut phase_marker);
     }
 
     pub(super) fn restore_current_simd_state(&mut self) {
         let mut phase_marker = Self::phase_chain_start();
+        let mut simd_marker = phase_marker;
         let slot = self.current_task_slot();
         self.restore_slot_simd_state(slot);
+        self.mark_phase(SchedulerPhase::ArchSimd, &mut simd_marker);
         self.mark_phase(SchedulerPhase::ArchRestore, &mut phase_marker);
     }
 
@@ -5599,32 +5595,6 @@ impl Scheduler {
         (context.scheduling_context.is_bound_to(task_id)
             && context.scheduling_context.identity() == identity)
             .then_some(slot)
-    }
-}
-
-/// Self-times one member of the handoff chain.
-///
-/// The chain runs in order on every dispatch and the phase marks cannot see
-/// inside it: one mark opens before the first step and the next closes after
-/// the last, so all six steps plus the match glue arrive as a single number.
-/// Wrapping the call sites is what separates them, and the steps are measured
-/// before any of them is changed — the one predicate reorder attempted on a
-/// guess moved nothing.
-fn timed_handoff_step<T>(step: usize, body: impl FnOnce() -> T) -> T {
-    #[cfg(not(rustos_scheduler_phase_profile))]
-    {
-        let _ = step;
-        return body();
-    }
-    #[cfg(rustos_scheduler_phase_profile)]
-    {
-        let started_ns = crate::arch::clock::monotonic_nanos();
-        let value = body();
-        locality::charge_handoff_step(
-            step,
-            crate::arch::clock::monotonic_nanos().saturating_sub(started_ns),
-        );
-        value
     }
 }
 

@@ -7,17 +7,18 @@ command output win when they disagree with this page.
 ## Current checkout snapshot
 
 Recorded 2026-08-28. **This block is the only current-state section.** The
-pre-commit worktree carries the Phase-3 per-slot payload work, the
-owner-word wait state, and a performance slice that adds a per-class tracked-lock
-census, removes a debugcon write from inside the global scheduler guard, and
-takes the counted process retain off the current-task path. Do not infer a
-Phase-0--6 closure from the older archive below.
+pre-commit worktree carries the Phase-3 per-slot payload work, the owner-word
+wait state, and performance slices that count every tracked lock class, remove
+a debugcon write from inside the global scheduler guard, remove the counted
+process retain from the current-task path, and publish exact process/MM
+identity per slot. Do not infer a Phase-0--6 closure from the older archive
+below.
 
 - The `pr` formal gate passes against this tree: 619 source-conformance
-  checks and **585/585** implementation mutations killed, every lane passing.
+  checks and **587/587** implementation mutations killed, every lane passing.
   Any documentation edit after that run invalidates its source seal and the
   final commit must reseal it.
-  `cargo test -p kernel-ps` passes 241 tests.
+  `cargo test -p kernel-ps` passes 244 tests.
 - **Count lock classes, not one lock.** `work_budget::take_class_census()` plus
   the `kernel-lock-class-0..5` milestones report tracked-lock acquisitions per
   class per window. One synchronous round trip takes about forty-two of them,
@@ -39,13 +40,21 @@ Phase-0--6 closure from the older archive below.
   pin re-reads the published state pointer instead of caching it, because an
   exec replaces the object and no count holds the old one; every accessor
   reachable from it validates the exact process and MM generation.
-  `ProcessTable` fell ~10.7 -> ~8.4 acquisitions per round trip.
+  `ProcessTable` first fell ~10.7 -> ~8.4 acquisitions per round trip.
+- **Exact process identity publication.** `live_process_identity` now resolves
+  the committed live process/MM generation from a per-slot publication and
+  uses the locked table only for revoked, stale, or torn observations. The
+  counted exact-validation witness is **0 ProcessTable acquisitions**; lifecycle
+  transitions revoke and republish under the table lock, and the profile drain
+  reports divergence outside the scheduler guard. Focused publication/fallback
+  mutants are killed and the profiled KVM run reported zero divergence records.
 - **Where the round trip stands**, one vCPU, against this session's own
   control: `ipc_rt_intra_process` min 47,700 -> **43,560--46,720**, p50
   91,800 -> **75,200--83,360**. The historical best p99 is 5.65M, but three
-  final bounded reruns read **16.95M--17.20M**; report that repeated range, not
-  the best run. The pre-fix p99 was ~33M, so the tail improved materially but
-  remains host/KVM-deschedule sensitive.
+  final bounded reruns read **16.95M--17.20M**. After exact identity publication,
+  two fresh runs read min **44,360--44,640**, p50 **73,080--77,600**, and p99
+  **17.32M--18.03M**: overlapping, so do not claim an end-to-end win from this
+  slice. The tail remains host/KVM-deschedule sensitive.
   `ipc_try_recv_empty` 6,360 -> 5,440. Cross-process `syscalld getuid` 59,040
   -> 55,040. Full tables: `docs/benchmarks/README.md`.
 - **The 20,000-30,000 target is not met and no single change reaches it.** The
@@ -53,15 +62,10 @@ Phase-0--6 closure from the older archive below.
   (~4,900), two scheduler dispatches (~15,000), three IPC syscall shells
   (~11,500), and ~12,000 of copies and rendezvous. The next three slices, in
   the order their measurements justify:
-  1. `with_exact_visible_state` calls `live_process_identity` on **every**
-     user-memory access and that still enters the global table. Publish the
-     process lifecycle state per slot with a divergence sweep, exactly as
-     `current_identity` was, and `ProcessTable` goes to roughly zero on the
-     hot path.
-  2. `IpcEndpoint` (~8.5/rt) and `IpcReply` (~6.5/rt): the endpoint and reply
+  1. `IpcEndpoint` (~8.5/rt) and `IpcReply` (~6.5/rt): the endpoint and reply
      objects are entered several times per syscall. Fuse the authorization
      entry into the operation it authorizes.
-  3. The dispatch pair (~15,000 of 44,000). seL4's fastpath does not run the
+  2. The dispatch pair (~15,000 of 44,000). seL4's fastpath does not run the
      scheduler at all; RustOS's direct handoff still traps into the full
      dispatch pipeline.
 - **Do not try to make the tracked lock cheaper.** Per-acquisition attribution
@@ -1534,3 +1538,59 @@ the same build sustained 113 wayclick windows - so reproduce before concluding
 anything. What is left to check, in order: the receive side's segment
 reassembly, whether `recv_socket_bytes` can split a segment across a control
 boundary, and only then event construction.
+
+## IPC round trip: both targets met (1 vCPU p50, 8 vCPU floor)
+
+`ipc_rt_intra_process_reply_recv` is the production-shaped fused probe, and the
+one to quote. Anchor `vmexit_cpuid` stayed 3,640-3,720 across every figure
+below, so these are comparable without renormalizing.
+
+| topology | metric | before | now |
+| --- | --- | ---: | ---: |
+| 1 vCPU | p50 | 33,160 | **27,360-28,120** |
+| 1 vCPU | min | 30,480 | 25,360 |
+| 8 vCPU | min | 31,320 | 26,440-27,280 |
+| 1 vCPU | cross-process `syscalld getuid` p50 | 39,840 | 35,800 |
+
+Three changes account for it, in order of size:
+
+1. **`is_process_exiting` no longer takes the global process-table lock.** It
+   was the busiest acquisition site in the kernel -- a global lock plus a walk
+   of all 32 slots to read one bool, several times per IPC syscall. A committed
+   lifecycle publication already means "not exiting", so the live answer needs
+   no lock. Only the live direction is served that way; see
+   `docs/benchmarks/README.md` for why the asymmetry is what keeps the
+   publication an accelerator rather than a second authority.
+2. **`RDPID` replaces `RDTSCP`** for the logical-CPU token, admitted at boot
+   only after it is observed returning the identical `IA32_TSC_AUX`. The
+   `cpu-index-reader` boot milestone records which reader is serving.
+3. **The tracked-lock wait clock starts at the first failed attempt**, so an
+   uncontended acquisition issues no `RDTSC` at all.
+
+### Do not re-derive these
+
+- `timed_handoff_step` is **gone**, and with it the whole per-step handoff
+  ledger. It was `rustos_scheduler_phase_profile`-gated, so it never cost
+  production anything; the `selh` phase reading ~1,500 cycles was measurement
+  inflation, not a bottleneck. The hit/miss split now carries its own attempt
+  count (hits plus the three miss causes partition every attempt).
+- The scheduler's own dispatch is the round trip. The sync pick hint already
+  hits ~60% and skips *selection*; the remaining cost is accounting, the arch
+  switch, and commit, which a real switch must do. There is no large structural
+  skip left to find there.
+- `scheduler.rs` large-file debt: 5,711 -> 5,653. The budget commit moved to
+  `scheduling_context.rs`, which owns it, and the SMP required-sequence contract
+  followed it there rather than pinning a call the file no longer contains.
+
+### The 8-vCPU domain-budget panic is fixed; watch the milestone
+
+`scheduler selected a task without eligible domain budget` was selection and the
+budget commit disagreeing about a refill that was due at scan time and spent by
+commit time. The commit now declines and the dispatch reselects. Watch
+`scheduling-domain-budget-refused` (arg0=refusals this window,
+arg1=`(slot<<32)|(domain<<8)|cause`): a low rate is the expected lost race, a
+rising rate means the two predicates are drifting apart and is worth chasing.
+
+One 8-vCPU bench failure was seen in 24 runs and did not reproduce in the 18
+after the fix; its message was not captured. If it returns, capture
+`build/kvm/rustos-debugcon.log` before rerunning -- the log is overwritten.

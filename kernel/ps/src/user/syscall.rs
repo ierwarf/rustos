@@ -180,6 +180,11 @@ pub fn prepare_for_context_return(returning_to_user: bool, user_gs_base: u64) {
     // kernel lifetime; the value is consumed only as an MSR base address.
     let kernel_gs_base = VirtAddr::new(unsafe { syscall_cpu_local_addr(logical_index) });
     let user_gs_base = VirtAddr::new(user_gs_base);
+    // Both writes are unconditional on purpose. `swapgs` exchanges these two
+    // MSRs on every kernel entry and exit, so what is architecturally in
+    // `IA32_GS_BASE` is not what this function last wrote there. A cache of the
+    // last written pair skipped the rewrite while the pair was swapped and
+    // double-faulted on the first GS-relative kernel access that followed.
     interrupts::without_interrupts(|| {
         if returning_to_user {
             GsBase::write(user_gs_base);

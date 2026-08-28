@@ -452,6 +452,37 @@ impl SchedulingDomainState {
         self.budget.replenish(now_ns) && self.budget.available_ns != 0
     }
 
+    /// Names why this domain would refuse a dispatch, without mutating it.
+    ///
+    /// Selection admits a slot through `is_eligible` and dispatch commits it
+    /// through `prepare_dispatch`. The two are deliberately different -- the
+    /// first accepts a due refill that the second must actually apply -- so
+    /// when they disagree the panic has to say which of several possible
+    /// disagreements happened. One message covering an absent domain, a policy
+    /// epoch mismatch, a refused refill, and a plain empty budget alike is what
+    /// made the 8-vCPU report unactionable.
+    pub(super) fn dispatch_refusal(
+        self,
+        policy: SchedulingContextPolicy,
+        now_ns: u64,
+    ) -> DomainRefusalCause {
+        if self.policy() != policy {
+            return if self.policy().policy_epoch != policy.policy_epoch {
+                DomainRefusalCause::PolicyEpoch
+            } else {
+                DomainRefusalCause::Policy
+            };
+        }
+        if self.budget.available_ns != 0 {
+            return DomainRefusalCause::RefillRefused;
+        }
+        match self.budget.next_eligible_ns() {
+            None => DomainRefusalCause::EmptyNoRefill,
+            Some(eligible_ns) if eligible_ns > now_ns => DomainRefusalCause::EmptyRefillPending,
+            Some(_) => DomainRefusalCause::ConservationRefused,
+        }
+    }
+
     pub(super) fn charge_runtime(&mut self, now_ns: u64, elapsed_ns: u64) -> Option<ChargeOutcome> {
         self.budget.charge(now_ns, elapsed_ns)
     }
@@ -461,7 +492,124 @@ impl SchedulingDomainState {
     }
 }
 
+/// Why a domain refused to fund a dispatch it had already been admitted for.
+///
+/// A discriminant rather than a message: the refusal is latched inside the
+/// scheduler guard and rendered outside it, and a `&'static str` would have to
+/// survive that boundary in a static slot for no gain over one number.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum DomainRefusalCause {
+    NoDomain = 0,
+    Policy = 1,
+    PolicyEpoch = 2,
+    RefillRefused = 3,
+    EmptyNoRefill = 4,
+    EmptyRefillPending = 5,
+    ConservationRefused = 6,
+}
+
+/// The most recent refusal, plus how many happened, for the profile drain.
+/// Packed into one word so the render sees a coherent pair.
+static DOMAIN_BUDGET_REFUSAL: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+static DOMAIN_BUDGET_REFUSALS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Records one refusal from inside the scheduler guard.
+pub(super) fn latch_domain_budget_refusal(
+    slot: usize,
+    domain_slot: usize,
+    cause: DomainRefusalCause,
+) {
+    // ORDERING: Relaxed; a diagnostic pair drained once per profile window.
+    DOMAIN_BUDGET_REFUSAL.store(
+        ((slot as u64) << 32) | ((domain_slot as u64) << 8) | cause as u64,
+        core::sync::atomic::Ordering::Relaxed,
+    );
+    DOMAIN_BUDGET_REFUSALS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Takes the window's refusal count and its last exact refusal, if any.
+pub(in crate::multitask) fn take_domain_budget_refusal_window() -> Option<(u64, u64)> {
+    let refusals = DOMAIN_BUDGET_REFUSALS.swap(0, core::sync::atomic::Ordering::Relaxed);
+    (refusals != 0).then(|| {
+        (
+            refusals,
+            DOMAIN_BUDGET_REFUSAL.swap(0, core::sync::atomic::Ordering::Relaxed),
+        )
+    })
+}
+
 impl super::Scheduler {
+    /// Commits the selected slot's domain and context budgets for this turn,
+    /// reporting whether the funding actually admitted the dispatch.
+    ///
+    /// Selection admits a candidate with a read-only eligibility check that
+    /// accepts a refill which is merely *due*; this is where that refill is
+    /// applied and the budget is really spent. The two therefore disagree
+    /// whenever the funding state moves between them -- a charge on the same
+    /// domain pops the due refill and re-arms it a period later, so the exact
+    /// state the scan admitted is gone by the time the commit looks.
+    ///
+    /// That is a policy outcome, not an invariant break: it is the same answer
+    /// the admission scan itself would have produced one instant later, and the
+    /// caller must treat a refusal exactly as it treats a candidate the scan
+    /// rejected. Failing the dispatch here instead made a lost race fatal, and
+    /// it only ever reproduced at 8 vCPU, where charges on a shared domain are
+    /// frequent enough to land inside that window.
+    #[must_use = "a refused budget must not be dispatched"]
+    pub(super) fn commit_scheduling_budget_for_dispatch(&mut self, slot: usize) -> bool {
+        let owner_slot = self.effective_scheduling_context_owner_slot(slot);
+        let Some(context) = self.contexts[owner_slot].map(|owner| owner.scheduling_context) else {
+            return true;
+        };
+        if !context.is_budgeted() {
+            return true;
+        }
+        let now_ns = crate::arch::clock::monotonic_nanos();
+        let policy = context
+            .policy()
+            .expect("budgeted scheduling context lost its policy");
+        let domain_slot = context
+            .domain_slot()
+            .expect("budgeted scheduling context lost its domain slot");
+        if !self.prepare_scheduling_domain_dispatch(domain_slot, policy, now_ns) {
+            self.note_domain_budget_refusal(slot, domain_slot, policy, now_ns);
+            return false;
+        }
+        self.contexts[owner_slot]
+            .as_mut()
+            .expect("selected scheduling context disappeared")
+            .scheduling_context
+            .prepare_dispatch(now_ns)
+    }
+
+    /// Latches one budget refusal for rendering after the scheduler guard.
+    ///
+    /// The refusal is rare and self-correcting, but a *rise* in it means the
+    /// admission scan and the commit are disagreeing more often, so it must
+    /// stay visible rather than become a silent reselect. Debugcon inside the
+    /// guard is a VM exit per byte, so this only records; the profile drain
+    /// renders it.
+    #[cold]
+    #[inline(never)]
+    fn note_domain_budget_refusal(
+        &self,
+        slot: usize,
+        domain_slot: usize,
+        policy: SchedulingContextPolicy,
+        now_ns: u64,
+    ) {
+        let cause = self
+            .scheduling_domains
+            .get(domain_slot)
+            .and_then(|domain| *domain)
+            .map_or(DomainRefusalCause::NoDomain, |domain| {
+                domain.dispatch_refusal(policy, now_ns)
+            });
+        latch_domain_budget_refusal(slot, domain_slot, cause);
+    }
+
     pub(super) fn admit_scheduling_domain(
         &mut self,
         policy: SchedulingContextPolicy,

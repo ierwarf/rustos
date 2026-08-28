@@ -523,25 +523,35 @@ pub(super) fn current_cpu_task_is_idle(logical_index: usize) -> bool {
     CURRENT_TASK_IDLE[logical_index].load(Ordering::Acquire)
 }
 
-/// Reports whether the calling CPU may safely enter current-task snapshot
-/// paths. Early AP boot and panic/log formatting use this as a non-blocking
-/// authority check before touching the scheduler lock.
 /// The slot the asking CPU is currently running, or `None` when the slot has
 /// not been admitted yet. Callers must already have interrupts masked, which
 /// is what keeps the answer from changing underneath them.
+///
+/// The logical index is derived once and threaded into the admission test.
+/// Deriving it twice was not merely redundant: the admission and the slot read
+/// would answer for two separately derived CPUs, so the saving is incidental to
+/// making the pair name one CPU by construction.
 pub(super) fn current_cpu_task_slot() -> Option<usize> {
-    if !current_cpu_task_slot_admitted() {
+    let logical_index = nucleus_core::util::lockdep::current_cpu_index();
+    if !cpu_task_slot_admitted(logical_index) {
         return None;
     }
-    let logical_index = nucleus_core::util::lockdep::current_cpu_index();
     let slot = CURRENT_TASK_SLOTS.get(logical_index)?;
     // ORDERING: Acquire pairs with the current-slot publication in dispatch
     // and in `publish_cpu_current_task`.
     Some(slot.load(Ordering::Acquire))
 }
 
+/// Reports whether the calling CPU may safely enter current-task snapshot
+/// paths. Early AP boot and panic/log formatting use this as a non-blocking
+/// authority check before touching the scheduler lock.
 pub(super) fn current_cpu_task_slot_admitted() -> bool {
-    let logical_index = nucleus_core::util::lockdep::current_cpu_index();
+    cpu_task_slot_admitted(nucleus_core::util::lockdep::current_cpu_index())
+}
+
+/// The admission test above, against an already-derived logical index.
+#[inline]
+fn cpu_task_slot_admitted(logical_index: usize) -> bool {
     logical_index < CURRENT_TASK_ACTIVE.len()
         // ORDERING: Acquire pairs with initial current-slot publication and
         // prevents a snapshot from observing an uninitialized slot value.

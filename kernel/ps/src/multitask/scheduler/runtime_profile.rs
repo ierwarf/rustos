@@ -14,7 +14,7 @@ use lock_census::{acquire_site_is_reportable, fnv1a32};
 
 const PROFILE_TOP_TASKS: usize = 4;
 pub(super) const SCHEDULER_ENTRY_CAUSE_COUNT: usize = 4;
-pub(super) const SCHEDULER_PHASE_COUNT: usize = 14;
+pub(super) const SCHEDULER_PHASE_COUNT: usize = 18;
 const PROFILE_EMPTY: u8 = 0;
 const PROFILE_BUSY: u8 = 1;
 const PROFILE_READY: u8 = 2;
@@ -69,6 +69,19 @@ pub(in crate::multitask) enum SchedulerPhase {
     AccountPreamble = 12,
     /// The scheduling-context and domain budget charge alone.
     AccountBudget = 13,
+    /// Disjoint split of [`SchedulerPhase::ArchRestore`], which measured as the
+    /// largest in-owner segment of a real task switch.
+    ///
+    /// The outgoing task's SIMD image. Both entry stubs already preserve
+    /// `xmm0`-`xmm15`; this exists for the `ymm` upper halves and `MXCSR`,
+    /// which no stub saves and which a second user task can destroy.
+    ArchSimd = 14,
+    /// Affinity snapshot/republication and the incoming frame's validation.
+    ArchValidate = 15,
+    /// CR3 activation and the TSS/syscall kernel-stack publication.
+    ArchAddressSpace = 16,
+    /// Data-segment reloads and the FS/GS base writes.
+    ArchSegments = 17,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -112,13 +125,12 @@ pub(in crate::multitask) struct SchedulerRuntimeProfile {
     pub(in crate::multitask) handoff_scan_calls: u64,
     /// Per-member cost of the handoff chain, in the order the chain runs them.
     /// `(ns, calls)`; steps two and five overlap `handoff_scan_ns`.
-    pub(in crate::multitask) handoff_steps: [(u64, u64); super::locality::HANDOFF_STEP_COUNT],
-    /// Subset of `handoff_steps[1]`'s calls that found a ready synchronous IPC
+    /// Subset of the pick-hint attempts that found a ready synchronous IPC
     /// pick hint (`Some`), so `select` resolved without the CFS vruntime scan.
     pub(in crate::multitask) sync_handoff_hits: u64,
-    /// The rest of `handoff_steps[1]`'s calls, split by why they missed.
+    /// The rest of the pick-hint attempts, split by why they missed.
     /// Indexed by `locality::SyncHandoffMissReason`. `sync_handoff_hits` plus
-    /// this sum should equal `handoff_steps[1].1`.
+    /// this sum is the attempt count itself.
     pub(in crate::multitask) sync_handoff_misses:
         [u64; super::locality::SYNC_HANDOFF_MISS_REASON_COUNT],
     /// Sub-reasons for `sync_handoff_misses`'s `DrainedStale` bucket, indexed
@@ -244,6 +256,15 @@ pub fn drain_scheduler_runtime_profile() -> usize {
     let Some(profile) = PENDING_RUNTIME_PROFILE.take() else {
         return 0;
     };
+    let process_identity_divergences = super::super::process_table::publication_divergence_count();
+    if process_identity_divergences != 0 {
+        crate::debug::record_milestone(
+            crate::debug::LogCategory::Process,
+            "process-identity-divergence",
+            process_identity_divergences,
+            0,
+        );
+    }
     // The ranked class/site census is a diagnosis build feature. Rendering
     // its dozen debugcon records every second is observable work (one VM exit
     // per byte under KVM) and, on SMP, can consume most of an isolated
@@ -263,6 +284,20 @@ pub fn drain_scheduler_runtime_profile() -> usize {
             "scheduling-budget-exhausted",
             owner_task_id,
             charged_ns,
+        );
+    }
+    // A domain that refuses a dispatch it was admitted for is a lost race the
+    // dispatch recovers from by reselecting, so it must not be silent: a rise
+    // here means the admission scan and the budget commit are disagreeing more
+    // often. arg0=refusals this window, arg1=(slot<<32)|(domain<<8)|cause.
+    if let Some((refusals, last)) =
+        super::scheduling_context::take_domain_budget_refusal_window()
+    {
+        crate::debug::record_milestone(
+            crate::debug::LogCategory::Sched,
+            "scheduling-domain-budget-refused",
+            refusals,
+            last,
         );
     }
     let mut work = 0;
@@ -355,31 +390,20 @@ pub fn drain_scheduler_runtime_profile() -> usize {
         profile.handoff_scan_ns / 1_000,
         profile.handoff_scan_calls,
     );
-    // The chain's own six members, in run order. Everything the two scans above
-    // do not explain is here. arg0=us, arg1=calls.
-    for (step, name) in [
-        "kernel-scheduler-step-activation",
-        "kernel-scheduler-step-sync",
-        "kernel-scheduler-step-overdue",
-        "kernel-scheduler-step-bootstrap",
-        "kernel-scheduler-step-blocking-hint",
-        "kernel-scheduler-step-overdue-hint",
-        "kernel-scheduler-step-acquire",
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let (ns, calls) = profile.handoff_steps[step];
-        crate::debug::record_milestone(crate::debug::LogCategory::Sched, name, ns / 1_000, calls);
-    }
-    // Step 1's hit/attempt split: how often the synchronous IPC pick hint
-    // actually held a ready slot, against how often it was asked.
-    // arg0=hits, arg1=attempts (handoff_steps[1].1).
+    // The pick hint's hit/attempt split: how often the synchronous IPC pick
+    // hint actually held a ready slot, against how often it was asked. Hits and
+    // the three miss causes partition every attempt, so their sum *is* the
+    // attempt count -- it needs no separate counter to stay consistent with the
+    // rows below. arg0=hits, arg1=attempts.
+    let sync_handoff_attempts = profile
+        .sync_handoff_misses
+        .iter()
+        .fold(profile.sync_handoff_hits, |total, misses| total + misses);
     crate::debug::record_milestone(
         crate::debug::LogCategory::Sched,
         "kernel-scheduler-step-sync-hits",
         profile.sync_handoff_hits,
-        profile.handoff_steps[1].1,
+        sync_handoff_attempts,
     );
     // The miss side of the same split, by cause. Each arg1 repeats the same
     // attempt count as the hits line above, so every row is self-contained.
@@ -401,7 +425,7 @@ pub fn drain_scheduler_runtime_profile() -> usize {
             crate::debug::LogCategory::Sched,
             name,
             reason_count,
-            profile.handoff_steps[1].1,
+            sync_handoff_attempts,
         );
     }
     // Sub-reasons within the `-miss-stale` bucket: which check inside
@@ -583,6 +607,30 @@ pub fn drain_scheduler_runtime_profile() -> usize {
             profile.phase_ns[SchedulerPhase::SelectPick as usize] / 1_000,
             profile.lock_acquisitions,
         ),
+    );
+    // The four disjoint jobs inside `ArchRestore`, the largest segment of a
+    // real task switch. arg0=(simd us, validate us), arg1=(address space us,
+    // segments us).
+    crate::debug::record_milestone(
+        crate::debug::LogCategory::Sched,
+        "kernel-scheduler-phase-arch",
+        pack_u32_pair(
+            profile.phase_ns[SchedulerPhase::ArchSimd as usize] / 1_000,
+            profile.phase_ns[SchedulerPhase::ArchValidate as usize] / 1_000,
+        ),
+        pack_u32_pair(
+            profile.phase_ns[SchedulerPhase::ArchAddressSpace as usize] / 1_000,
+            profile.phase_ns[SchedulerPhase::ArchSegments as usize] / 1_000,
+        ),
+    );
+    // Logical-CPU-index derivations since boot. Each executes `RDTSCP`, so the
+    // per-window delta against the dispatch count says how many a dispatch
+    // pays. arg0=total, arg1=0.
+    crate::debug::record_milestone(
+        crate::debug::LogCategory::Sched,
+        "kernel-scheduler-identity-derivations",
+        nucleus_core::util::lockdep::work_budget::total_identity_derivations(),
+        0,
     );
     // arg0=(commit, architectural restore), arg1=(attributed total, hold total).
     crate::debug::record_milestone(
@@ -887,7 +935,6 @@ impl Scheduler {
                 ns
             },
             handoff_scan_calls,
-            handoff_steps: super::locality::take_handoff_step_window(),
             sync_handoff_hits: super::locality::take_sync_handoff_hit_window(),
             sync_handoff_misses: super::locality::take_sync_handoff_miss_window(),
             sync_handoff_stale: super::locality::take_sync_handoff_stale_window(),
@@ -1075,7 +1122,6 @@ mod tests {
             pick_scan_calls: 0,
             handoff_scan_ns: 0,
             handoff_scan_calls: 0,
-            handoff_steps: [(0, 0); super::locality::HANDOFF_STEP_COUNT],
             sync_handoff_hits: 0,
             sync_handoff_misses: [0; super::locality::SYNC_HANDOFF_MISS_REASON_COUNT],
             sync_handoff_stale: [0; super::locality::SYNC_HANDOFF_STALE_REASON_COUNT],

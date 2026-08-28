@@ -769,3 +769,18 @@ passed every unit test and only broke in KVM.
 A per-item claim of closure requires the construct to exist in source *and* a
 mutant that fails without it. Source inspection alone is what produced the
 matrix this document had to correct.
+
+## 11. Process identity publication
+
+The global `ProcessTable` remains the exact lifecycle authority, but ordinary
+user-copy and IPC checks no longer acquire it merely to revalidate the current
+process. Each slot publishes one committed word containing the process-slot
+generation and MM generation, alongside its PID and stable state pointer.
+
+Lifecycle writers revoke the committed word before changing payload and
+release-store the new exact identity last. Readers accept only a stable
+word/payload/word observation. Missing, revoked, stale, or torn publication
+falls back to the locked table, so the optimization does not weaken the
+authority decision. The runtime-profile drain compares every published slot
+with the table outside the scheduler guard and reports divergence without
+placing diagnostics on the hot path.

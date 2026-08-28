@@ -683,13 +683,16 @@ tokens = [
 ]
 
 # Temporal authority is charged before fair-share bookkeeping, and a bounded
-# refill overflow may only move authority to the later eligibility point.
+# refill overflow may only move authority to the later eligibility point. The
+# budget commit itself now lives in `scheduling_context.rs`, which owns it; the
+# ordering constraint follows it there rather than pinning a call it no longer
+# contains.
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler.rs"
 tokens = [
     "self.charge_effective_scheduling_context_runtime(slot, now_ns, elapsed_ns)",
     "let elapsed_ns = if force_min_charge",
-    ".prepare_dispatch(now_ns),",
+    "self.commit_scheduling_budget_for_dispatch(",
     "self.set_slot_exec_start_ticks(next_idx, now_ticks);",
 ]
 
@@ -700,6 +703,8 @@ tokens = [
     "latest.eligible_ns = latest.eligible_ns.max(refill.eligible_ns);",
     "let charged_ns = elapsed_ns.min(self.available_ns);",
     "self.available_ns -= charged_ns;",
+    "if !self.prepare_scheduling_domain_dispatch(domain_slot, policy, now_ns) {",
+    ".prepare_dispatch(now_ns)",
 ]
 
 [[forbidden_patterns]]

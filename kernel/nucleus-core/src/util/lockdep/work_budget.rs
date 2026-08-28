@@ -233,18 +233,97 @@ static LAST_IDENTITY_SITE: [AtomicUsize; MAX_TRACKED_CPUS] =
 ///
 /// Charged by `cpu_identity::current_cpu_index` with the index it just derived,
 /// so this adds no derivation of its own.
+/// Charges one derivation without naming its site.
+///
+/// The count is what every declared ceiling asserts on, so it is unconditional.
+/// The site is not: carrying it requires `#[track_caller]` on a function called
+/// about 124 times per dispatch. See `cpu_identity::current_cpu_index`.
 #[inline]
-pub(crate) fn charge_identity_derivation(cpu: usize, site: &'static Location<'static>) {
+pub(crate) fn charge_identity_derivation_count(cpu: usize) {
     let Some(counter) = IDENTITY_DERIVATIONS.get(cpu) else {
         return;
     };
+    // The counter is CPU-private, so this needs no atomic read-modify-write.
     counter.store(
         counter.load(Ordering::Relaxed).wrapping_add(1),
         Ordering::Relaxed,
     );
+}
+
+#[cfg_attr(not(rustos_lock_phase_profile), expect(dead_code, reason = "diagnosis build only"))]
+pub(crate) fn charge_identity_derivation(cpu: usize, site: &'static Location<'static>) {
+    charge_identity_derivation_count(cpu);
     if let Some(slot) = LAST_IDENTITY_SITE.get(cpu) {
         slot.store(core::ptr::from_ref(site) as usize, Ordering::Relaxed);
     }
+    charge_identity_site(site);
+}
+
+/// Per-site census of logical-index derivations.
+///
+/// The total says how many `RDTSCP` executions a workload pays for; only the
+/// per-site count says which caller to give the answer to instead. Same
+/// direct-mapped, self-validating shape as the lock-site census, and gated the
+/// same way: it is only populated in a diagnosis build.
+static IDENTITY_SITE_CALLERS: [AtomicPtr<Location<'static>>; SITE_CENSUS_SLOTS] =
+    [const { AtomicPtr::new(core::ptr::null_mut()) }; SITE_CENSUS_SLOTS];
+static IDENTITY_SITE_COUNTS: [AtomicU64; SITE_CENSUS_SLOTS] =
+    [const { AtomicU64::new(0) }; SITE_CENSUS_SLOTS];
+
+#[inline]
+fn charge_identity_site(site: &'static Location<'static>) {
+    if !cfg!(rustos_lock_phase_profile) {
+        return;
+    }
+    let key = site as *const Location<'static> as *mut Location<'static>;
+    let mixed = (key as usize as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    let first = (mixed >> 32) as usize & (SITE_CENSUS_SLOTS - 1);
+    for probe in 0..SITE_CENSUS_SLOTS {
+        let slot = (first + probe) & (SITE_CENSUS_SLOTS - 1);
+        // ORDERING: Acquire observes a claim published by whichever CPU first
+        // registered this site.
+        let current = IDENTITY_SITE_CALLERS[slot].load(Ordering::Acquire);
+        if current == key {
+            IDENTITY_SITE_COUNTS[slot].fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        if current.is_null()
+            // ORDERING: Release publishes the claim before its count is used.
+            && IDENTITY_SITE_CALLERS[slot]
+                .compare_exchange(
+                    core::ptr::null_mut(),
+                    key,
+                    Ordering::Release,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+        {
+            IDENTITY_SITE_COUNTS[slot].fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    }
+}
+
+/// Takes the per-site derivation census. Callers must be outside every tracked
+/// lock; rendering the result takes the debug sink.
+pub fn take_identity_site_census() -> [(&'static str, u32, u64); SITE_CENSUS_SLOTS] {
+    let mut census = [("", 0_u32, 0_u64); SITE_CENSUS_SLOTS];
+    for slot in 0..SITE_CENSUS_SLOTS {
+        let count = IDENTITY_SITE_COUNTS[slot].swap(0, Ordering::Relaxed);
+        if count == 0 {
+            continue;
+        }
+        // ORDERING: Acquire pairs with the claim publication above.
+        let caller = IDENTITY_SITE_CALLERS[slot].load(Ordering::Acquire);
+        if caller.is_null() {
+            continue;
+        }
+        // SAFETY: `Location::caller` returns a static allocation that outlives
+        // every observer of this table.
+        let caller = unsafe { &*caller };
+        census[slot] = (caller.file(), caller.line(), count);
+    }
+    census
 }
 
 /// The site of `cpu`'s most recent derivation, for a failing ceiling to name.
@@ -276,6 +355,18 @@ pub(crate) fn restore_identity_count_on(cpu: usize, value: u32) {
         return;
     };
     counter.store(value, Ordering::Relaxed);
+}
+
+/// Total logical-index derivations across every CPU since boot.
+///
+/// Each one executes `RDTSCP`. The count is what turns "the dispatch derives
+/// its own CPU a few times" from an inference into a number; a scope ceiling
+/// proves one path behaves, and this says how many the system actually pays.
+pub fn total_identity_derivations() -> u64 {
+    IDENTITY_DERIVATIONS
+        .iter()
+        .map(|counter| u64::from(counter.load(Ordering::Relaxed)))
+        .sum()
 }
 
 fn identity_count(cpu: usize) -> u32 {
