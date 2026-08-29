@@ -12,6 +12,7 @@ pub(super) const INITD_WEIGHT_MICROS: u64 = 4_000;
 const _: () = assert!(CORE_SERVICE_WEIGHT_MICROS & TASK_WEIGHT_INTERACTIVE_FLAG != 0);
 const _: () = assert!(INITD_WEIGHT_MICROS & TASK_WEIGHT_INTERACTIVE_FLAG == 0);
 const SYSCALLD_EXEC: &[u8] = b"services/syscalld/syscalld.elf\0";
+const PAGERD_EXEC: &[u8] = b"services/pagerd/pagerd.elf\0";
 const VFSD_EXEC: &[u8] = b"services/vfsd/vfsd.elf\0";
 const LOADERD_EXEC: &[u8] = b"services/loaderd/loaderd.elf\0";
 const PROCD_EXEC: &[u8] = b"services/procd/procd.elf\0";
@@ -23,7 +24,7 @@ const STORAGED_EXEC: &[u8] = b"services/storaged/storaged.elf\0";
 const RUNTIMED_EXEC: &[u8] = b"services/runtimed/runtimed.elf\0";
 const UISERVER_EXEC: &[u8] = b"services/uiserver/uiserver.elf\0";
 pub(super) const INITD_LEASE_ID: u64 = IPC_SERVICE_INITD;
-pub(super) const INITD_LEASE_INDEX: usize = 4;
+pub(super) const INITD_LEASE_INDEX: usize = 5;
 pub(super) const DEP_SYSCALLD: u16 = 1 << 0;
 pub(super) const DEP_VFSD: u16 = 1 << 1;
 pub(super) const DEP_LOADERD: u16 = 1 << 2;
@@ -63,7 +64,7 @@ pub(super) struct BootstrapServiceSpec {
     pub(super) scheduling: RustosSchedulingContextPolicy,
 }
 
-pub(super) const BOOTSTRAP_MANIFEST: [BootstrapServiceSpec; 5] = [
+pub(super) const BOOTSTRAP_MANIFEST: [BootstrapServiceSpec; 6] = [
     BootstrapServiceSpec {
         service_id: IPC_SERVICE_LINUX_SYSCALLD,
         exec_path: SYSCALLD_EXEC,
@@ -99,6 +100,17 @@ pub(super) const BOOTSTRAP_MANIFEST: [BootstrapServiceSpec; 5] = [
         bootstrap_direct: true,
         restart_direct: false,
         scheduling: scheduling_policy(IPC_SERVICE_PROCD, 4_000_000, 1),
+    },
+    BootstrapServiceSpec {
+        service_id: IPC_SERVICE_PAGERD,
+        exec_path: PAGERD_EXEC,
+        weight_micros: CORE_SERVICE_WEIGHT_MICROS,
+        dependency_mask: 0,
+        bootstrap_direct: true,
+        restart_direct: true,
+        // pagerd and uiserver overlap on every enabled CPU. Keep their
+        // criticality-2 utilization at the kernel's 90% admission ceiling.
+        scheduling: scheduling_policy(IPC_SERVICE_PAGERD, 3_000_000, 2),
     },
     BootstrapServiceSpec {
         service_id: INITD_LEASE_ID,

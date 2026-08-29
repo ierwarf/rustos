@@ -10,6 +10,7 @@ pub mod console;
 pub mod deadline;
 pub mod device;
 pub mod ioctl;
+pub mod pager;
 pub mod performance;
 pub mod syscall;
 pub mod ui;

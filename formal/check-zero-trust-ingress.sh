@@ -20,7 +20,7 @@ declared_sources="$(
     } | sort -u
 )"
 published_sources="$(
-    rg -l 'register_service_endpoint|SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT' \
+    rg -l 'register_service_endpoint|register_linux_syscall_endpoint|SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT' \
         services --glob '*.rs' | sort -u
 )"
 if ! diff -u <(printf '%s\n' "$published_sources") <(printf '%s\n' "$declared_sources"); then

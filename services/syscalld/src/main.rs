@@ -15,34 +15,32 @@ use rustos_user_abi::syscall::{
     CommercialMaxProtocolResponse, LifecycleDrainBrokerArgs, LifecycleEventWire,
     LinuxSyscallOffloadFastRequest, LinuxSyscallOffloadFastResponse, LinuxSyscallOffloadRequest,
     LinuxSyscallOffloadResponse, Win32SyscallOffloadRequest, Win32SyscallOffloadResponse,
-    COMMERCIAL_MAX_PAGERD_OP_BACKING_OBJECT, COMMERCIAL_MAX_PAGERD_OP_FAULT_RESOLVE,
-    COMMERCIAL_MAX_PAGERD_OP_PAGE_CACHE_POLICY, COMMERCIAL_MAX_PAGERD_OP_WRITEBACK_POLICY,
     COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS,
-    COMMERCIAL_MAX_PROTOCOL_PAGERD, COMMERCIAL_MAX_PROTOCOL_SYSCALLD,
-    COMMERCIAL_MAX_SYSCALLD_OP_CLOCK_POLICY, COMMERCIAL_MAX_SYSCALLD_OP_COLD_SYSCALL_OFFLOAD,
-    COMMERCIAL_MAX_SYSCALLD_OP_CREDS_LIMITS, COMMERCIAL_MAX_SYSCALLD_OP_LINUX_POLICY,
-    COMMERCIAL_MAX_SYSCALLD_OP_MM_POLICY, COMMERCIAL_MAX_SYSCALLD_OP_RANDOM_POLICY,
-    COMMERCIAL_MAX_SYSCALLD_OP_WIN32_POLICY, IPC_MAX_INLINE_BYTES, IPC_SERVICE_LINUX_SYSCALLD,
-    IPC_SERVICE_PAGERD, LIFECYCLE_DRAIN_BROKER_ABI_VERSION, LIFECYCLE_DRAIN_MAX_EVENTS,
-    LIFECYCLE_EVENT_EXIT, SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_LINUX_ARCH_PRCTL_POLICY,
-    SYSCALL_OFFLOAD_OP_LINUX_BRK, SYSCALL_OFFLOAD_OP_LINUX_GETEGID,
-    SYSCALL_OFFLOAD_OP_LINUX_GETEUID, SYSCALL_OFFLOAD_OP_LINUX_GETGID,
-    SYSCALL_OFFLOAD_OP_LINUX_GETPGID, SYSCALL_OFFLOAD_OP_LINUX_GETPPID,
-    SYSCALL_OFFLOAD_OP_LINUX_GETRANDOM, SYSCALL_OFFLOAD_OP_LINUX_GETSID,
-    SYSCALL_OFFLOAD_OP_LINUX_GETUID, SYSCALL_OFFLOAD_OP_LINUX_GET_ROBUST_LIST,
-    SYSCALL_OFFLOAD_OP_LINUX_MADVISE, SYSCALL_OFFLOAD_OP_LINUX_MEMFD_CREATE,
-    SYSCALL_OFFLOAD_OP_LINUX_MMAP, SYSCALL_OFFLOAD_OP_LINUX_MPROTECT,
-    SYSCALL_OFFLOAD_OP_LINUX_MUNMAP, SYSCALL_OFFLOAD_OP_LINUX_PRLIMIT64,
-    SYSCALL_OFFLOAD_OP_LINUX_RSEQ, SYSCALL_OFFLOAD_OP_LINUX_SCHED_GETAFFINITY,
-    SYSCALL_OFFLOAD_OP_LINUX_SCHED_SETAFFINITY, SYSCALL_OFFLOAD_OP_LINUX_SETGID,
-    SYSCALL_OFFLOAD_OP_LINUX_SETPGID, SYSCALL_OFFLOAD_OP_LINUX_SETSID,
-    SYSCALL_OFFLOAD_OP_LINUX_SETUID, SYSCALL_OFFLOAD_OP_LINUX_SET_ROBUST_LIST,
-    SYSCALL_OFFLOAD_OP_LINUX_UMASK, SYSCALL_OFFLOAD_OP_LINUX_UNAME,
-    SYSCALL_OFFLOAD_OP_WIN32_ALLOC_VIRTUAL_MEMORY, SYSCALL_OFFLOAD_OP_WIN32_CLOSE,
-    SYSCALL_OFFLOAD_OP_WIN32_DELAY_EXECUTION, SYSCALL_OFFLOAD_OP_WIN32_EXIT_PROCESS,
-    SYSCALL_OFFLOAD_OP_WIN32_GET_CONSOLE_MODE, SYSCALL_OFFLOAD_OP_WIN32_READ_FILE,
-    SYSCALL_OFFLOAD_OP_WIN32_WRITE_FILE, SYSCALL_OFFLOAD_PATH_CAPACITY,
-    SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER, WIN32_SYSCALL_OFFLOAD_ABI_VERSION,
+    COMMERCIAL_MAX_PROTOCOL_SYSCALLD, COMMERCIAL_MAX_SYSCALLD_OP_CLOCK_POLICY,
+    COMMERCIAL_MAX_SYSCALLD_OP_COLD_SYSCALL_OFFLOAD, COMMERCIAL_MAX_SYSCALLD_OP_CREDS_LIMITS,
+    COMMERCIAL_MAX_SYSCALLD_OP_LINUX_POLICY, COMMERCIAL_MAX_SYSCALLD_OP_MM_POLICY,
+    COMMERCIAL_MAX_SYSCALLD_OP_RANDOM_POLICY, COMMERCIAL_MAX_SYSCALLD_OP_WIN32_POLICY,
+    IPC_MAX_INLINE_BYTES, IPC_SERVICE_LINUX_SYSCALLD, LIFECYCLE_DRAIN_BROKER_ABI_VERSION,
+    LIFECYCLE_DRAIN_MAX_EVENTS, LIFECYCLE_EVENT_EXIT, SYSCALL_OFFLOAD_ABI_VERSION,
+    SYSCALL_OFFLOAD_OP_LINUX_ARCH_PRCTL_POLICY, SYSCALL_OFFLOAD_OP_LINUX_BRK,
+    SYSCALL_OFFLOAD_OP_LINUX_GETEGID, SYSCALL_OFFLOAD_OP_LINUX_GETEUID,
+    SYSCALL_OFFLOAD_OP_LINUX_GETGID, SYSCALL_OFFLOAD_OP_LINUX_GETPGID,
+    SYSCALL_OFFLOAD_OP_LINUX_GETPPID, SYSCALL_OFFLOAD_OP_LINUX_GETRANDOM,
+    SYSCALL_OFFLOAD_OP_LINUX_GETSID, SYSCALL_OFFLOAD_OP_LINUX_GETUID,
+    SYSCALL_OFFLOAD_OP_LINUX_GET_ROBUST_LIST, SYSCALL_OFFLOAD_OP_LINUX_MADVISE,
+    SYSCALL_OFFLOAD_OP_LINUX_MEMFD_CREATE, SYSCALL_OFFLOAD_OP_LINUX_MMAP,
+    SYSCALL_OFFLOAD_OP_LINUX_MPROTECT, SYSCALL_OFFLOAD_OP_LINUX_MUNMAP,
+    SYSCALL_OFFLOAD_OP_LINUX_PRLIMIT64, SYSCALL_OFFLOAD_OP_LINUX_RSEQ,
+    SYSCALL_OFFLOAD_OP_LINUX_SCHED_GETAFFINITY, SYSCALL_OFFLOAD_OP_LINUX_SCHED_SETAFFINITY,
+    SYSCALL_OFFLOAD_OP_LINUX_SETGID, SYSCALL_OFFLOAD_OP_LINUX_SETPGID,
+    SYSCALL_OFFLOAD_OP_LINUX_SETSID, SYSCALL_OFFLOAD_OP_LINUX_SETUID,
+    SYSCALL_OFFLOAD_OP_LINUX_SET_ROBUST_LIST, SYSCALL_OFFLOAD_OP_LINUX_UMASK,
+    SYSCALL_OFFLOAD_OP_LINUX_UNAME, SYSCALL_OFFLOAD_OP_WIN32_ALLOC_VIRTUAL_MEMORY,
+    SYSCALL_OFFLOAD_OP_WIN32_CLOSE, SYSCALL_OFFLOAD_OP_WIN32_DELAY_EXECUTION,
+    SYSCALL_OFFLOAD_OP_WIN32_EXIT_PROCESS, SYSCALL_OFFLOAD_OP_WIN32_GET_CONSOLE_MODE,
+    SYSCALL_OFFLOAD_OP_WIN32_READ_FILE, SYSCALL_OFFLOAD_OP_WIN32_WRITE_FILE,
+    SYSCALL_OFFLOAD_PATH_CAPACITY, SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER,
+    WIN32_SYSCALL_OFFLOAD_ABI_VERSION,
 };
 use rustos_user_abi::windows::ERROR_INVALID_PARAMETER;
 
@@ -80,13 +78,6 @@ fn service_main() {
         return;
     }
     ipc::debug_line("syscalld: linux syscall endpoint registered");
-    let pager_register = ipc::register_service_endpoint(IPC_SERVICE_PAGERD, endpoint as u64);
-    if pager_register < 0 {
-        ipc::debug_line("syscalld: pager endpoint register failed");
-        return;
-    }
-
-    ipc::debug_line("syscalld: pager policy endpoint registered");
     drain_lifecycle_events();
     ipc::debug_line("syscalld: lifecycle drain ready");
     serve(endpoint as u64);
@@ -367,10 +358,6 @@ fn handle_commercial_request(
         response.status = errno;
         return response;
     }
-    if request.header.protocol == COMMERCIAL_MAX_PROTOCOL_PAGERD {
-        handle_pager_request(request, &mut response);
-        return response;
-    }
     match request.header.op {
         COMMERCIAL_MAX_SYSCALLD_OP_LINUX_POLICY => {
             fill_syscall_descriptors(
@@ -459,47 +446,6 @@ fn handle_commercial_request(
         _ => response.status = errno::EINVAL,
     }
     response
-}
-
-fn handle_pager_request(
-    request: &CommercialMaxProtocolRequest,
-    response: &mut CommercialMaxProtocolResponse,
-) {
-    match request.header.op {
-        COMMERCIAL_MAX_PAGERD_OP_BACKING_OBJECT => {
-            response.descriptor_count = 1;
-            response.descriptors[0] = pager_descriptor(
-                "backing-object",
-                request.header.op,
-                request.arg0,
-                request.arg1,
-            );
-            response.capability = pager_capability("backing-object", request.header.op);
-        }
-        COMMERCIAL_MAX_PAGERD_OP_PAGE_CACHE_POLICY => {
-            response.descriptor_count = 1;
-            response.descriptors[0] =
-                pager_descriptor("page-cache", request.header.op, request.arg0, request.arg1);
-            response.capability = pager_capability("page-cache", request.header.op);
-        }
-        COMMERCIAL_MAX_PAGERD_OP_FAULT_RESOLVE => {
-            response.descriptor_count = 1;
-            response.descriptors[0] = pager_descriptor(
-                "fault-resolve",
-                request.header.op,
-                request.arg0,
-                request.arg1,
-            );
-            response.capability = pager_capability("fault-resolve", request.header.op);
-        }
-        COMMERCIAL_MAX_PAGERD_OP_WRITEBACK_POLICY => {
-            response.descriptor_count = 1;
-            response.descriptors[0] =
-                pager_descriptor("writeback", request.header.op, request.arg0, request.arg1);
-            response.capability = pager_capability("writeback", request.header.op);
-        }
-        _ => response.status = errno::EINVAL,
-    }
 }
 
 fn handle_linux_request(
@@ -649,13 +595,6 @@ fn validate_commercial_request(request: &CommercialMaxProtocolRequest) -> Result
             | COMMERCIAL_MAX_SYSCALLD_OP_COLD_SYSCALL_OFFLOAD => Ok(()),
             _ => Err(errno::EINVAL),
         },
-        COMMERCIAL_MAX_PROTOCOL_PAGERD => match request.header.op {
-            COMMERCIAL_MAX_PAGERD_OP_BACKING_OBJECT
-            | COMMERCIAL_MAX_PAGERD_OP_PAGE_CACHE_POLICY
-            | COMMERCIAL_MAX_PAGERD_OP_FAULT_RESOLVE
-            | COMMERCIAL_MAX_PAGERD_OP_WRITEBACK_POLICY => Ok(()),
-            _ => Err(errno::EINVAL),
-        },
         _ => Err(errno::EINVAL),
     }
 }
@@ -713,48 +652,6 @@ fn syscalld_capability_mask(op: u16) -> u64 {
         | SYSCALL_OFFLOAD_OP_WIN32_DELAY_EXECUTION => 1 << 4,
         COMMERCIAL_MAX_SYSCALLD_OP_RANDOM_POLICY | SYSCALL_OFFLOAD_OP_LINUX_GETRANDOM => 1 << 5,
         COMMERCIAL_MAX_SYSCALLD_OP_COLD_SYSCALL_OFFLOAD => 1 << 6,
-        _ => 0,
-    }
-}
-
-fn pager_descriptor(
-    name: &str,
-    op: u16,
-    value0: u64,
-    value1: u64,
-) -> CommercialMaxProtocolDescriptorWire {
-    let mut descriptor = CommercialMaxProtocolDescriptorWire {
-        protocol: COMMERCIAL_MAX_PROTOCOL_PAGERD,
-        op,
-        flags: 0,
-        service_id: IPC_SERVICE_PAGERD,
-        capability_mask: pager_capability_mask(op),
-        value0,
-        value1,
-        ..CommercialMaxProtocolDescriptorWire::default()
-    };
-    copy_label(name, &mut descriptor.name, &mut descriptor.name_len);
-    descriptor
-}
-
-fn pager_capability(label: &str, op: u16) -> CommercialMaxCapabilityLeaseWire {
-    let mut capability = CommercialMaxCapabilityLeaseWire {
-        lease_id: ((COMMERCIAL_MAX_PROTOCOL_PAGERD as u64) << 32) | u64::from(op),
-        service_id: IPC_SERVICE_PAGERD,
-        capability_mask: pager_capability_mask(op),
-        rights_mask: pager_capability_mask(op),
-        ..CommercialMaxCapabilityLeaseWire::default()
-    };
-    copy_label(label, &mut capability.label, &mut capability.label_len);
-    capability
-}
-
-fn pager_capability_mask(op: u16) -> u64 {
-    match op {
-        COMMERCIAL_MAX_PAGERD_OP_BACKING_OBJECT => 1 << 0,
-        COMMERCIAL_MAX_PAGERD_OP_PAGE_CACHE_POLICY => 1 << 1,
-        COMMERCIAL_MAX_PAGERD_OP_FAULT_RESOLVE => 1 << 2,
-        COMMERCIAL_MAX_PAGERD_OP_WRITEBACK_POLICY => 1 << 3,
         _ => 0,
     }
 }

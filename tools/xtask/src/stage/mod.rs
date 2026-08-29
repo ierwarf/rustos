@@ -41,6 +41,7 @@ const EARLY_SYSTEM_BOOTSTRAP_PATHS: &[&str] = &[
     "services/initd/initd.elf",
     "services/inputd/inputd.elf",
     "services/loaderd/loaderd.elf",
+    "services/pagerd/pagerd.elf",
     "services/netd/netd.elf",
     "services/procd/procd.elf",
     "services/rootd/rootd.elf",

@@ -58,7 +58,10 @@ fn rejoin_user_debug_records(log: &str) -> String {
 
 #[cfg(test)]
 mod user_debug_record_tests {
-    use super::{rejoin_user_debug_records, uiserver_profile_input_pipeline_healthy};
+    use super::{
+        read_runtime_log_if_present, rejoin_user_debug_records,
+        uiserver_profile_input_pipeline_healthy,
+    };
 
     #[test]
     fn a_profile_line_split_by_the_debug_chunk_boundary_is_rejoined_before_it_is_parsed() {
@@ -92,11 +95,28 @@ mod user_debug_record_tests {
 
         let rejoined = rejoin_user_debug_records(&split);
         assert_eq!(rejoined.lines().count(), 3);
-        assert!(uiserver_profile_input_pipeline_healthy(&rejoined, 3, Some(55)));
+        assert!(uiserver_profile_input_pipeline_healthy(
+            &rejoined,
+            3,
+            Some(55)
+        ));
+
+        let root = tempfile::tempdir().expect("create split-record fixture directory");
+        let path = root.path().join("rustos-debugcon.log");
+        std::fs::write(&path, &split).expect("write split-record fixture");
+        let read_back = read_runtime_log_if_present(&path).expect("read runtime evidence log");
+        assert_eq!(read_back, rejoined);
+        assert!(uiserver_profile_input_pipeline_healthy(
+            &read_back,
+            3,
+            Some(55)
+        ));
 
         // Rejoining must not invent health: the gate still sees a stale cursor.
         assert!(!uiserver_profile_input_pipeline_healthy(
-            &rejoin_user_debug_records(&split.replace("presented_cursor=992,642", "presented_cursor=991,642")),
+            &rejoin_user_debug_records(
+                &split.replace("presented_cursor=992,642", "presented_cursor=991,642")
+            ),
             3,
             Some(55)
         ));

@@ -335,7 +335,6 @@ fn read_runtime_log_if_present(path: &Path) -> Result<String> {
     }
 }
 
-
 #[derive(Debug, Serialize)]
 struct KvmFailureLog {
     path: String,
@@ -1164,7 +1163,7 @@ fn validate_ui_fps_proof(layout: &KvmLayout, options: &SmokeOptions) -> Result<(
     let Some(minimum_fps) = options.min_ui_fps else {
         return Ok(());
     };
-    let log = fs::read_to_string(&layout.debugcon_log)?;
+    let log = read_runtime_log_if_present(&layout.debugcon_log)?;
     if !uiserver_profile_meets_fps(&log, minimum_fps, options.ui_proof_windows) {
         bail!(
             "KVM UI FPS proof failed after guest shutdown: require {} high-volume input windows at or above {} FPS; inspect {}",

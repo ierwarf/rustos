@@ -1,0 +1,19 @@
+id = "pagerd"
+kind = "service"
+execution_domain = "user"
+startup = "none"
+
+[build]
+builder = "cargo-kernel-binary"
+package = "pagerd"
+linkage = "static-pie"
+
+[install]
+path = "services/pagerd/pagerd.elf"
+
+[[desktop.entries]]
+display_name = "pagerd"
+weight_micros = 4000
+logical_admin = true
+console_hosted = false
+

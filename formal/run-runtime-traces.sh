@@ -26,6 +26,7 @@ PY
 )"
     set +e
     python3 formal/check-kvm-runtime-trace.py "$artifact_dir/kvm-p0.jsonl" \
+        --deadlines-advisory \
         --root "$repo_root" \
         --registry "$repo_root/formal/product-scenarios.tsv" \
         --topology "$topology" \

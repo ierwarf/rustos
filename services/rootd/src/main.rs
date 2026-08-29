@@ -206,6 +206,7 @@ pub extern "C" fn __rustos_rootd_start() -> ! {
         lease(BOOTSTRAP_MANIFEST[2]),
         lease(BOOTSTRAP_MANIFEST[3]),
         lease(BOOTSTRAP_MANIFEST[4]),
+        lease(BOOTSTRAP_MANIFEST[5]),
     ];
     let mut post_init_leases = [
         post_init_lease(POST_INIT_MANIFEST[0]),
@@ -227,6 +228,7 @@ pub extern "C" fn __rustos_rootd_start() -> ! {
                 1 => debug_line(b"rootd: spawn vfsd\n"),
                 2 => debug_line(b"rootd: spawn loaderd\n"),
                 3 => debug_line(b"rootd: spawn procd\n"),
+                4 => debug_line(b"rootd: spawn pagerd\n"),
                 _ => {}
             }
             spawn_core_service_without_wait(&mut leases[index]);
@@ -1312,14 +1314,6 @@ fn service_capability_for_subject(
         request.header.subject_pid,
     ) {
         return Ok(capability);
-    }
-    if request.arg0 == IPC_SERVICE_PAGERD {
-        let syscalld = lease_by_service_or_index(leases, IPC_SERVICE_LINUX_SYSCALLD, 0)?;
-        if syscalld.pid == request.header.subject_pid && syscalld.state == ROOTD_LEASE_STATE_RUNNING
-        {
-            return Ok(rustos_user_abi::syscall::IPC_SERVICE_CAP_PAGER_POLICY);
-        }
-        return Err(13);
     }
     let lease = lease_by_service_or_index(leases, request.arg0, request.arg1 as usize)?;
     if lease.pid != request.header.subject_pid || lease.state != ROOTD_LEASE_STATE_RUNNING {
@@ -2434,6 +2428,15 @@ mod tests {
         let ordinary = scheduling_context_policy_for_exec(b"apps/ipcbench/ipcbench.elf");
         assert_eq!(ordinary, USER_WORKLOAD_SCHEDULING_POLICY);
         assert_eq!(ordinary.criticality, 0);
+
+        let critical_budget_ns: u64 = BOOTSTRAP_MANIFEST
+            .iter()
+            .map(|service| service.scheduling)
+            .chain(POST_INIT_MANIFEST.iter().map(|service| service.scheduling))
+            .filter(|policy| policy.criticality == 2)
+            .map(|policy| policy.budget_ns)
+            .sum();
+        assert!(critical_budget_ns <= 9_000_000);
     }
 
     #[test]
@@ -2507,13 +2510,14 @@ mod tests {
         );
     }
 
-    fn leases_with_live_initd(initd_pid: u64) -> [Lease; 5] {
+    fn leases_with_live_initd(initd_pid: u64) -> [Lease; 6] {
         let mut leases = [
             lease(BOOTSTRAP_MANIFEST[0]),
             lease(BOOTSTRAP_MANIFEST[1]),
             lease(BOOTSTRAP_MANIFEST[2]),
             lease(BOOTSTRAP_MANIFEST[3]),
             lease(BOOTSTRAP_MANIFEST[4]),
+            lease(BOOTSTRAP_MANIFEST[5]),
         ];
         leases[INITD_LEASE_INDEX].pid = initd_pid;
         leases[INITD_LEASE_INDEX].state = ROOTD_LEASE_STATE_RUNNING;

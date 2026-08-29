@@ -971,6 +971,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2f3fbf80edff265ba1c0b425b83d880b130196ab88a8642e650aa1b963266fcf"
 
 [[package]]
+name = "pagerd"
+version = "0.1.0"
+dependencies = [
+ "rustos-svc-runtime",
+ "rustos-user-abi",
+]
+
+[[package]]
 name = "paste"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"

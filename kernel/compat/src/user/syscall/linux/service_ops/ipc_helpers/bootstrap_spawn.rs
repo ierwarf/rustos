@@ -57,6 +57,7 @@ fn can_bootstrap_spawn_direct(exec_path: &str) -> bool {
     matches!(
         path,
         "services/syscalld/syscalld.elf"
+            | "services/pagerd/pagerd.elf"
             | "services/vfsd/vfsd.elf"
             | "services/loaderd/loaderd.elf"
             | "services/procd/procd.elf"

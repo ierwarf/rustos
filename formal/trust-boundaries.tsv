@@ -2,6 +2,7 @@
 rootd-supervisor	rootd	services/rootd/src/main.rs	sender\.pid	-	lease-generation-and-dependency-edge	exact-commercial-response
 process-policy	procd	services/procd/src/main.rs	identity_is_exact_sender|subject_is_exact_sender	-	process-ticket-and-lifecycle-generation	exact-versioned-response
 syscall-policy	syscalld	services/syscalld/src/main.rs	identity_is_exact_sender|subject_is_exact_sender	-	per-process-policy-state	exact-versioned-response
+pager-fault-policy	pagerd	services/pagerd/src/main.rs	subject_is_exact_sender	-	pager-region-and-fault-epoch-state	exact-versioned-response
 filesystem-policy	vfsd	services/vfsd/src/main.rs	sender_pid	-	open-description-and-provider-epoch	exact-versioned-response
 image-loader	loaderd	services/loaderd/src/main.rs	requester_pid	-	loader_service_role_allows_operation|sender_owns_any_loader_role	exact-versioned-response
 device-policy	devmgrd	services/devmgrd/src/main.rs	identity_is_exact_sender|subject_is_exact_sender	-	fd-rights-and-device-owner	exact-versioned-response
