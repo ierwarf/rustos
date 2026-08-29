@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# Codex PostToolUse hook for Edit/Write.
+# Shared PostToolUse hook for Edit/Write, wired from both .codex/config.toml
+# and .claude/settings.json.
 #
-# After Rust source edits, run a fast type check so the agent loop gets
-# immediate feedback instead of discovering the break much later. Only
-# runs inside the RustOS workspace; no-op elsewhere.
+# After Rust source edits, run a fast type check plus the source-contract
+# header linter so the agent loop gets immediate feedback instead of
+# discovering the break, or a missing //! contract field, much later at the
+# formal PR gate. Only runs inside the RustOS workspace; no-op elsewhere.
 
 set -euo pipefail
 
@@ -43,7 +45,7 @@ cd "$REPO_ROOT"
 # tracked, staged, and untracked content and namespace the stamp by the
 # canonical repository path instead.
 repo_key="$(printf '%s' "$REPO_ROOT" | sha256sum | awk '{print $1}')"
-STAMP="${TMPDIR:-/tmp}/rustos-xtask-ok-${repo_key}"
+STAMP="${TMPDIR:-/tmp}/rustos-post-edit-ok-${repo_key}"
 workspace_fingerprint="$({
   git diff --no-ext-diff --binary
   git diff --cached --no-ext-diff --binary
@@ -65,11 +67,22 @@ fi
 
 log="$(mktemp)"
 trap 'rm -f "$log"' EXIT
-if timeout 90 cargo xtask check >"$log" 2>&1; then
-  printf '%s\n' "$workspace_fingerprint" >"$STAMP"
+
+if ! timeout 90 cargo xtask check >"$log" 2>&1; then
+  tail="$(tail -n 40 "$log")"
+  jq -n --arg m "cargo xtask check failed (tail):
+$tail" '{systemMessage:$m}'
   exit 0
 fi
 
-tail="$(tail -n 40 "$log")"
-jq -n --arg m "cargo xtask check failed (tail):
+# Cheap (well under a second for the whole tree): catches a missing //!
+# contract header field, an undocumented critical/high boundary, or a stale
+# retired-path reference immediately, instead of only at the formal PR gate.
+if ! timeout 15 python3 formal/check-rust-source-contracts.py >"$log" 2>&1; then
+  tail="$(tail -n 40 "$log")"
+  jq -n --arg m "formal/check-rust-source-contracts.py failed (tail):
 $tail" '{systemMessage:$m}'
+  exit 0
+fi
+
+printf '%s\n' "$workspace_fingerprint" >"$STAMP"

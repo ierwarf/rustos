@@ -61,9 +61,9 @@ matcher = "^(apply_patch|Edit|Write|mcp__serena__(create_text_file|insert_after_
 
 [[hooks.PostToolUse.hooks]]
 type = "command"
-command = '"$(git rev-parse --show-toplevel)/.codex/hooks/post_edit_rust.sh"'
+command = '"$(git rev-parse --show-toplevel)/.agents/hooks/post_edit_rust.sh"'
 timeout = 120
-statusMessage = "cargo xtask check"
+statusMessage = "cargo xtask check + source-contract lint"
 
 [[hooks.UserPromptSubmit]]
 
