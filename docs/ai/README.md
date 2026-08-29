@@ -15,9 +15,13 @@ refactoring, recovery, and review.
 | `session-handoff.md` | Volatile checkout state and safe new-session resume sequence. |
 | `repo-map.md` | Source ownership and canonical entrypoints. Deeper than `docs/ai-map.md`. |
 | `commands.md` | Quiet build/check/debug commands and their failure meanings. |
+| `contracts.md` | Index into `contracts-infra.md`/`contracts-abi.md`; edit the section owner, not this file. |
 | `contracts-infra.md` | Manifest/stage/build/logging/fault contracts. |
 | `contracts-abi.md` | IPC service IDs, broker syscalls, service routing contracts. |
+| `core-engineering-contract.md` | Mandatory source-writing contract: ownership, lifecycle, concurrency, comments, refactoring, review. |
+| `smp-contract.md` | Multi-CPU release gate: AP startup, per-CPU scheduler/IPI/TLB/futex ownership, qualification matrix. |
 | `system-flows.md` | Machine-linked end-to-end exception, IPC, wait-set, VFS, endpoint, and restart lifecycles. |
+| `commercial-quality-gates.md` | Non-negotiable definition of done and risk-ordered release acceptance scope. |
 | `physical-gpu-status.md` | Current physical GPU evidence boundary, userspace wait-set release gates, and continuation rules. |
 | `performance-hardening.md` | Boot/runtime bottleneck triage, provider policy, cleanup rules. |
 | `kernel-api-map.md` | Cross-crate kernel API surfaces (`kernel_*::api`) and boot order. |

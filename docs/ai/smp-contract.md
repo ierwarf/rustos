@@ -47,8 +47,10 @@ Ring0 owns mechanism only:
 | Linux/Windows affinity ABI | `syscalld` and compat services | kernel exposes validated mechanism |
 
 Raw APIC IDs, CPU-local pointers, run-queue internals, and shootdown tokens are
-not application capabilities. A stable `CpuIndex` is a dense logical index;
-it is never interchangeable with firmware processor UID or APIC ID.
+not application capabilities. The stable per-CPU `logical_index: u8`
+(`CpuLifecycleSnapshot`/`CpuLifecycleRegistry` in `kernel/hal/src/arch/smp.rs`)
+is a dense logical index; it is never interchangeable with firmware processor
+UID or APIC ID.
 
 ## 3. CPU lifecycle
 
@@ -63,7 +65,7 @@ Online -> Quarantined -> Failed
 
 - `Discovered`: the complete MADT has passed signature, length, checksum,
   entry-size, uniqueness, enabled-state, and capacity checks.
-- `Starting`: BSP owns the startup mailbox for the exact `(CpuIndex,
+- `Starting`: BSP owns the startup mailbox for the exact `(logical_index,
   generation, APIC ID)` tuple and has issued the architectural INIT/SIPI
   sequence.
 - `OnlineParked`: the AP has installed its private stack, GDT/TSS/IST, IDT,
@@ -97,7 +99,7 @@ MADT parsing is one atomic transaction:
 2. Accept only understood processor entries needed by the supported envelope.
    Reject zero-length, truncated, duplicate UID, duplicate APIC ID, capacity
    overflow, and contradictory enabled/online-capable data.
-3. Construct a dense `CpuIndex -> {firmware UID, APIC ID, generation, state}`
+3. Construct a dense `logical_index -> {firmware UID, APIC ID, generation, state}`
    table. Never allocate or index by raw APIC ID.
 4. Select xAPIC/x2APIC mode once. Every CPU observes the same mode before any
    interrupt can be enabled.
@@ -340,7 +342,7 @@ violates execution ownership.
   Successful acquisition converts that unit to a held raw class; failed
   acquisition cancels it. Both conversions are local-IRQ atomic, and at every
   stable point `preemption_depth == pending_depth + held_depth`.
-- A published raw guard captures the dense `CpuIndex`, architectural APIC
+- A published raw guard captures the dense `logical_index`, architectural APIC
   identity, and nonzero per-CPU preemption depth before protected state is
   exposed.
 - The task that acquires a raw guard remains the exact current task on that
@@ -807,8 +809,9 @@ topology -> process generation -> address-space mutation
 ```
 
 Exceptions require a named protocol and a formal/source witness. Lockdep keys
-include the real `CpuIndex`, interrupt state, preemption depth, raw/sleepable
-class, and observed dependency graph. Cross-CPU recursion is not permitted.
+include the real CPU index (`lockdep::cpu_identity::current_cpu_index`),
+interrupt state, preemption depth, raw/sleepable class, and observed
+dependency graph. Cross-CPU recursion is not permitted.
 
 Every non-relaxed atomic or fence adjacent to SMP code has an `ORDERING:`
 comment naming the published data and matching acquire/release edge. `Relaxed`

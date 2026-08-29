@@ -71,24 +71,19 @@ before these settings:
 Roughly 4% off the clock and 40-50% off the disk. Do not expect more from this
 change; the disk is what it was for.
 
-Three further levers were tried and are deliberately absent. Each is recorded
-because the reasoning is not recoverable from the config once the line is gone.
+Three further levers were tried and rejected. Do not re-add them without
+re-testing:
 
-- **`opt-level = 1` for build scripts and proc macros.** The `xtask` closure
-  went from 10.96s to 13.01s. Optimizing them costs more than it repays at this
-  workspace's size.
-- **`-Clink-arg=-fuse-ld=lld`.** This target's `linker-flavor` is already
-  `gnu-lld-cc`, so rustc links with the toolchain's own `rust-lld`. The flag
-  only swaps that for whatever `ld.lld` sits on `PATH`, trading a
-  version-matched bundled linker for an external, skewable one.
-- **`-Zthreads=8`, the parallel front-end.** At 8 threads it dropped a
-  monomorphized instance from `wayclick`, whose link then failed on an
-  undefined `<DispatchError as From<WaylandError>>::from`. That is a
-  miscompilation, not a flag mismatch, and `cargo xtask check` cannot see it
-  because checking never links. Its artifacts also poison a target tree: a
-  later, correct build reused them and failed identically until the tree was
-  removed. If it is ever retried, `cargo build -p wayclick` in a fresh target
-  directory is the cheap test.
+- `opt-level = 1` for build scripts/proc macros: made the `xtask` dependency
+  closure slower, not faster (10.96s -> 13.01s).
+- `-Clink-arg=-fuse-ld=lld`: this target already links with the toolchain's
+  own `rust-lld` (`linker-flavor = gnu-lld-cc`); the flag only swaps in
+  whatever external `ld.lld` sits on `PATH`.
+- `-Zthreads=8` (parallel front-end): miscompiled `wayclick` (dropped a
+  monomorphized instance, undefined `From<WaylandError>` at link time) and
+  poisoned the target tree until it was removed. `cargo xtask check` can't
+  catch this because checking never links. If retried, test with
+  `cargo build -p wayclick` in a fresh target directory first.
 
 ## Why `--workspace` does not build
 
@@ -127,16 +122,11 @@ formal gate substantially faster.
 
 Three things that look like levers are not:
 
-- **sccache.** It is installed but unused, and the four shards do compile
-  overlapping trees. Enabling it disables incremental compilation, and the
-  shard layout deliberately keeps every mutation of one source file adjacent
-  so cargo rebuilds one crate incrementally. Trading that for a cache is not
-  obviously a win.
-- **Shard count.** It is `min(4, cpu_count / 4, mutants, affordable)`. On 16
-  cores that is 4, and the disk term only binds on a nearly full device.
-  Reclaiming space does not buy more shards here.
-- **The parallel front-end.** It would have cut the inner loop far more than
-  4%, and it miscompiles — see the previous section.
+- sccache is installed but unused: enabling it disables incremental
+  compilation, which the shard layout is built around.
+- Shard count is `min(4, cpu_count / 4, mutants, affordable)`; on 16 cores
+  that's already 4, so freeing disk space buys nothing here.
+- The parallel front-end would help most but miscompiles — see above.
 
 TLC is left as it is. It runs first and alone, because its budgets are wall
 clocks that only mean what they say when the lane is not competing for cores,

@@ -139,7 +139,7 @@ or launch policy.
   `INIT`/`NEXT` configuration bypasses the fairness formula and is rejected by
   `formal/selftest.sh`.
   TLC's `-deadlock` option disables deadlock checking; never describe it as
-  enabling the check. TLC 1.7.4 action coverage is `new-states:evaluations`, so
+  enabling the check. TLC 1.7.4 action coverage is `distinct-successors:evaluations`, so
   `0:N` is exercised convergence and only an evaluation count of zero fails.
 - Stable summaries, SARIF, normalized counterexamples, runtime traces, and
   solver output belong under `build/formal/`. Solver caches and `_apalache-out`
@@ -220,7 +220,7 @@ Kernel entry boot order lives in `kernel/src/main.rs`:
 
 ### Wait / Scheduler API
 
-Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_current_task, wake_task}`. The `current_user_id`, `block_current_user_task`, `wake_user_task` wrappers are userspace-task helpers — **not** general kernel wait primitives.
+Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, arm_block_current_task, commit_block_current_task_and_yield, wake_task}`. The legacy direct `block_current_task`/`block_current_user_task` entry points do not exist; do not reintroduce them.
 
 ## Kernel Build
 
@@ -658,9 +658,11 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, block_c
   and PCI-BDF reuse; unsigned activation is unavailable. Only after all of
   those checks does hostd persist an owner-private `prepared` lease with each
   original PCI driver and `driver_override`. Durable leases use only
-  `VFIO_LEASE_SCHEMA=3` and always bind release, artifact, device-policy, and
-  fleet-policy digests; older schemas are rejected instead of being restored
-  into the active authority graph. Hostd then binds the whole preflighted group
+  `VFIO_LEASE_SCHEMA=5` and always bind release, artifact, device-policy,
+  fleet-policy, and storage (`STORAGE_CONTROLLER_BDF`, `STORAGE_BLOCK_NAME`,
+  `STORAGE_APERTURE`, `STORAGE_GENERATION`, `STORAGE_EPOCH_IDENTITY_SHA256`)
+  digests; older schemas are rejected instead of being restored into the
+  active authority graph. Hostd then binds the whole preflighted group
   to `vfio-pci`, and atomically mark it active. Reverse-order rollback is
   mandatory on failure; failed acquisition retains the prepared record, and
   `release --activate` restores either prepared or active records and deletes

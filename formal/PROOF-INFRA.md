@@ -59,7 +59,7 @@ not a bug. Keep it in `CONFORMANCE.md` until it is resolved.
 ## Tool pins and commands
 
 - TLC is pinned in `tla2tools.lock`; run `bash formal/run-all-tlc.sh`. The PR
-  profile selects the 21 critical models declared in `contracts.toml` and has a
+  profile selects the 32 critical models declared in `contracts.toml` and has a
   hard 120-second aggregate wall budget; it preserves their model constants
   and fails rather than silently lowering the configured finite state space.
   A PR or SMP-iteration pass is reusable for 24 hours only when the exact TLA/CFG hashes, pinned

@@ -18,8 +18,8 @@ changing the file requires rebuilding the affected crates.
 ```toml
 [logging]
 enabled = true
-boot_trace_enabled = true
-serial_mirror = true
+boot_trace_enabled = false
+serial_mirror = false
 ring_buffer_bytes = 16384
 min_level = "info"
 
@@ -42,6 +42,10 @@ compat = "info"
 debug = "info"
 heartbeat = "info"
 ```
+
+This is the current shipped default in `config/rustos.toml`. `boot_trace_enabled` and
+`serial_mirror` are off by default; enable them locally when you need early boot
+trace or a debugcon mirror.
 
 ### Fields
 
@@ -308,8 +312,8 @@ cargo xtask check
 ```toml
 [logging]
 enabled = true
-boot_trace_enabled = true
-serial_mirror = true
+boot_trace_enabled = false
+serial_mirror = false
 ring_buffer_bytes = 16384
 min_level = "info"
 
@@ -332,6 +336,10 @@ compat = "info"
 debug = "info"
 heartbeat = "info"
 ```
+
+이는 `config/rustos.toml`의 현재 기본값입니다. `boot_trace_enabled`와
+`serial_mirror`는 기본적으로 꺼져 있으며, early boot trace나 debugcon 미러링이
+필요할 때만 로컬에서 켭니다.
 
 ### 필드
 

@@ -20,8 +20,8 @@ one-time `stable-batch` gates; its output is routing, not validation evidence.
 | Full signed image | `cargo xtask build` |
 | Kernel | `cargo xtask build-kernel` |
 | Userspace | `cargo xtask build-user` |
-| Driver modules | `cargo xtask build-driver-modules` |
 | Restage existing artifacts | `cargo xtask stage` |
+| Linux DVM appliance | `cargo xtask build-dvm` (see DVM changes below) |
 
 Do not call root `cargo build` directly. The xtask wrapper owns cross-target
 configuration and the repository-local development signing identity. Only set

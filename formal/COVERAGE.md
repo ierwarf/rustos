@@ -26,7 +26,7 @@ registry and whole-flow selftests, the script-registered exact source decision
 witnesses, exhaustive TLC, non-vacuous Kani, Verus, and a source-produced
 runtime trace, and a closed Kani/Verus proof index whose source, formal-model,
 dependency, proof-file, and non-vacuity links are checked before either tool
-runs. Its 120-second TLC sub-lane admits the contract-selected 21 critical
+runs. Its 120-second TLC sub-lane admits the contract-selected 32 critical
 models at their unchanged finite configurations; it reuses only a recent pass
 whose exact model, configuration, pinned tool, and execution-policy hashes
 still match, then runs every cache miss. The full registry is nightly and does
@@ -57,14 +57,17 @@ a source-only point into runtime fault evidence.
 This is not QNX-class or safety-certification evidence. The following remain
 failed infrastructure gates rather than implied successes:
 
-- only one model has a TLAPS theorem, and it proves a definitional owner lemma,
-  not the full inductive invariant or temporal liveness argument;
-- the two Apalache files are deliberately smaller refinements and have no
+- only two models (endpoint-publication, userspace-wait-set) have a TLAPS
+  theorem, and each proves a definitional owner lemma, not the full inductive
+  invariant or temporal liveness argument;
+- the three Apalache files are deliberately smaller refinements and have no
   machine-checked refinement mapping back to their full TLC models;
-- one source boundary emits a replayable action trace, and seventeen models
-  have exact source-decision witnesses; `runtime-control-rpc` is in both sets,
-  none of those unit witnesses is full transition-system equivalence, and 51
-  models still lack either mapping;
+- `runtime-control-rpc` is the only model whose source boundary emits a
+  replayable action trace; 126 of 131 registered models have exact
+  source-decision witnesses instead, none of those unit witnesses is full
+  transition-system equivalence, and five models (`dvm-amdgpu-evidence`,
+  `dvm-gpu-proof-scheduler`, `dvm-input-selftest`, `dvm-release-bundle`,
+  `gui-dvm-install`) still lack either mapping;
 - the PR concurrency triangle covers only its registered source-anchored
   kernels and x86_64 litmuses, not actual scheduler/IPC atomics under the
   complete Rust memory model, and the C/Rust fuzz corpus has no long-term
@@ -313,12 +316,9 @@ netd closes retain replay state through explicit ACK. Queue/capacity failure is
 observable and fail-closed. Runtime provider-crash injection remains required
 to accept the complete teardown topology.
 
-The signal proof now includes SIGSTOP instead of silently omitting it from the
-finite configuration. RustOS currently maps default SIGSTOP to process
-termination and has no complete scheduler stop/SIGCONT/wait-status lifecycle.
-That cross-subsystem behavior is an unimplemented source-conformance gate; the
-passing model describes the required distinction and is not evidence that the
-current implementation provides it.
+The signal proof now includes SIGSTOP alongside the scheduler-level stop,
+SIGCONT resume, and wait-status lifecycle that `process-signal-delivery` and
+`sigchld-notification` audit as matched in `CONFORMANCE.md`.
 
 Scheduler retirement now closes generic task/process IPC authority for normal,
 forced, invalid-context, and fault exits. Linux forced/fault termination still

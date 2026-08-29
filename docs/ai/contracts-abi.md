@@ -615,7 +615,7 @@ policy remains with the owning service.
   batch exactly once. Before netd sees it, the kernel binds the batch to the
   source process generation, intended receiver generation, netd service epoch,
   socket channel generation/direction, and exact byte-stream interval. Netd
-  IPC ABI v6 carries only these opaque tickets; it cannot redirect authority by
+  IPC ABI v7 carries only these opaque tickets; it cannot redirect authority by
   editing a PID, epoch, channel, or stream position.
   A forged, stale, zero, or replayed ticket cannot remove the live entry. The
   Kani parser proofs exhaust the 128-bit input partition and canonical
@@ -659,7 +659,7 @@ policy remains with the owning service.
   Handle close transfers the object to deferred backing reclaim without
   returning object or byte quota. Only completed physical reclaim returns that
   charge. The process table separately caps one process at 32 attached tasks,
-  so a single subject cannot consume all 256 scheduler slots.
+  so a single subject cannot consume all 128 scheduler slots.
 - Public `SYS_RUSTOS_IPC_CALL` and handle-transfer call syscalls keep blocking
   Send/Receive/Reply semantics. Do not add a public timeout ABI for generic
   Linux ELF or Windows PE callers.
@@ -1624,7 +1624,7 @@ policy remains with the owning service.
 - Runtime launches route through `loaderd` (`IPC_SERVICE_LOADERD`), not direct `SYS_RUSTOS_SPAWN_EXEC`.
 - `SYS_RUSTOS_PROC_*_BROKER` calls fail with `EACCES` unless caller owns `PROCESS_LOADER`.
 - Loader request ABI v2 requires `requester_pid` to equal the kernel-stamped
-  IPC sender. Process broker ABI v2 carries that identity into deferred
+  IPC sender. Process broker ABI v3 carries that identity into deferred
   commit: ring0 binds the suspended target PID to the exact requester in a
   bounded registry. ACTIVATE consumes that pair once; foreign callers and
   replays fail, loaderd restart cannot transfer or erase the authority, and
@@ -1692,7 +1692,7 @@ independent because it owns a different open description and load bias.
 
 A prepared remote file mapping may use a larger internal copy buffer, but each
 fallback read from vfsd is capped to the versioned VFS IPC payload.
-Bootstrap-backed reads may fill the larger buffer directly. VFS IPC version 4
+Bootstrap-backed reads may fill the larger buffer directly. VFS IPC version 5
 uses the maximum 64-KiB inline message with a fixed 40-byte response header and
 the remaining 65,496 bytes as payload, so one kernel copy window requires at
 most two bounded reads. The response layout and exact maximum size are source

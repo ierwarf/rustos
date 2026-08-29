@@ -68,7 +68,7 @@ of the index and all indexed inputs, which the PR seal consumes. It is not an
 LLM, proof generator, or claim that the source has been fully verified; see
 `PROOF_INDEX_CONTRACT.md` for the precise boundaries.
 The PR TLC profile is deliberately a 120-second, risk-weighted pre-QEMU set:
-it retains the exact finite configurations of 21 critical ownership, CPU,
+it retains the exact finite configurations of 32 critical ownership, CPU,
 TLB, wake, ABI, and product-boot models rather than quietly reducing their
 state depth. The complete registered inventory is the nightly qualification
 lane. Any changed model is still run directly by `dev-plan` before either

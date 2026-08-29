@@ -106,12 +106,12 @@ contracts.
     region remains charged while its physical backing is deferred and returns
     quota only after reclaim. Kernel/bootstrap reserves are not consumable by
     an ordinary process.
-11. **Usercopy retains one process generation through validation and copy.**
+12. **Usercopy retains one process generation through validation and copy.**
     Copyin/copyout rejects kernel, noncanonical, wrapping, unmapped, and
     wrong-permission spans before dereference. Exec and exit serialize against
     the retained address-space state; a partial stale-generation copy is not a
     valid outcome.
-12. **Physical frames and kernel mappings have disjoint authority.** Boot-owned
+13. **Physical frames and kernel mappings have disjoint authority.** Boot-owned
     and allocator-metadata frames never enter the free set. Allocation consumes
     one exact free frame/run, only an allocated frame may be released, kernel
     image mappings are W xor X, and MMIO/direct-map permission changes require

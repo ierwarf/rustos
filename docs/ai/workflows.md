@@ -39,7 +39,7 @@ Before any workflow: read `token-policy.md`, then `task-router.md`.
 
 ## Modify logging
 
-1. Read `contracts.md` (Logging section). Human `docs/logging.md` only for prose updates.
+1. Read `contracts-infra.md` (Logging section). Human `docs/logging.md` only for prose updates.
 2. Update `config/rustos.toml` `[logging]`.
 3. If adding a category, update `libs/rustos-observability/src/lib.rs`,
    `tools/build_log_cfg.rs`, and AI contracts.

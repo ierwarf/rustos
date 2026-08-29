@@ -38,8 +38,9 @@ Do not reorder without reading `kernel/src/main.rs` and
 ## High-risk APIs
 
 - **`unsafe` boot transfer:** `enter_higher_half`, `call_with_stack`.
-- **User-memory IO:** `read_to_current_user`, `read_to_user`,
-  `ioctl_from_user`.
+- **User-memory IO:** `kernel_ps::api::usermem::{copy_from_current_user_exact,
+  copy_from_retained_user_exact, read_current_user_struct, read_current_user_u32,
+  read_current_user_c_string}`, `ioctl_from_user`.
 - **Process state mutation:** `with_current_user_process_state_mut`,
   `with_process_state_by_pid_mut`.
   Exec uses the staged lifecycle APIs: reserve the exact scheduler target,
