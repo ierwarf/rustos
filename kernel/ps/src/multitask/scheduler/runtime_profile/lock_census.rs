@@ -95,8 +95,7 @@ pub(super) fn drain_class_and_site_census() {
         }
     }
 
-    let mut identity_sites =
-        nucleus_core::util::lockdep::work_budget::take_identity_site_census();
+    let mut identity_sites = nucleus_core::util::lockdep::work_budget::take_identity_site_census();
     identity_sites.sort_unstable_by(|left, right| right.2.cmp(&left.2));
     const IDENTITY_SITE_NAMES: [&str; 6] = [
         "kernel-identity-site-0",

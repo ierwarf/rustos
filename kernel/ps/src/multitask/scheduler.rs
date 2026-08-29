@@ -3880,9 +3880,7 @@ impl Scheduler {
                                     None => {
                                         let blocking_ipc_handoff = self
                                             .slot_blocked(current_slot)
-                                            .then(|| {
-                                                self.take_next_pick_hint_ready_slot(policy)
-                                            })
+                                            .then(|| self.take_next_pick_hint_ready_slot(policy))
                                             .flatten();
                                         let (next_idx, ipc_handoff, reserved_user_pick) =
                                             match blocking_ipc_handoff {

@@ -510,8 +510,7 @@ pub(super) enum DomainRefusalCause {
 
 /// The most recent refusal, plus how many happened, for the profile drain.
 /// Packed into one word so the render sees a coherent pair.
-static DOMAIN_BUDGET_REFUSAL: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+static DOMAIN_BUDGET_REFUSAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static DOMAIN_BUDGET_REFUSALS: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 

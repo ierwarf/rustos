@@ -157,7 +157,6 @@ impl Scheduler {
             super::super::irq::request_target_reschedule(cpu);
         }
     }
-
 }
 
 /// The fallback target, given whether the current slot's custody was claimed.
@@ -171,7 +170,11 @@ pub(super) const fn fallback_slot_for(
     idle_slot: usize,
     current_claimed: bool,
 ) -> usize {
-    if current_claimed { current_slot } else { idle_slot }
+    if current_claimed {
+        current_slot
+    } else {
+        idle_slot
+    }
 }
 
 /// How many times a dispatch fell back to idle because the current slot had
@@ -204,7 +207,11 @@ impl super::Scheduler {
     /// real invariant break rather than a lost race: there is no correct
     /// dispatch left to make.
     #[cfg(not(test))]
-    pub(super) fn claimable_fallback_slot(&self, current_slot: usize, dispatch_cpu: usize) -> usize {
+    pub(super) fn claimable_fallback_slot(
+        &self,
+        current_slot: usize,
+        dispatch_cpu: usize,
+    ) -> usize {
         let current_claimed =
             runqueue::claim_dispatch(current_slot, dispatch_cpu, self.slot_weight(current_slot));
         let idle_slot = self.idle_fallback_slot();
@@ -231,7 +238,11 @@ impl super::Scheduler {
     /// Host unit schedulers publish no owner words, so there is no custody to
     /// claim and the current slot is always the fallback.
     #[cfg(test)]
-    pub(super) fn claimable_fallback_slot(&self, current_slot: usize, _dispatch_cpu: usize) -> usize {
+    pub(super) fn claimable_fallback_slot(
+        &self,
+        current_slot: usize,
+        _dispatch_cpu: usize,
+    ) -> usize {
         current_slot
     }
 

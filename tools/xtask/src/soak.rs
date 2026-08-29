@@ -78,7 +78,10 @@ pub(crate) fn soak(
 }
 
 fn display_path(path: Option<&Path>) -> String {
-    path.map_or_else(|| "no archived log".to_owned(), |path| path.display().to_string())
+    path.map_or_else(
+        || "no archived log".to_owned(),
+        |path| path.display().to_string(),
+    )
 }
 
 /// The most recently archived run log, which sorts last because the archive

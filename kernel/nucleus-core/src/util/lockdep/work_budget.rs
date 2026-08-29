@@ -250,7 +250,10 @@ pub(crate) fn charge_identity_derivation_count(cpu: usize) {
     );
 }
 
-#[cfg_attr(not(rustos_lock_phase_profile), expect(dead_code, reason = "diagnosis build only"))]
+#[cfg_attr(
+    not(rustos_lock_phase_profile),
+    expect(dead_code, reason = "diagnosis build only")
+)]
 pub(crate) fn charge_identity_derivation(cpu: usize, site: &'static Location<'static>) {
     charge_identity_derivation_count(cpu);
     if let Some(slot) = LAST_IDENTITY_SITE.get(cpu) {

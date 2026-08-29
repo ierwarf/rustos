@@ -304,9 +304,7 @@ pub fn drain_scheduler_runtime_profile() -> usize {
     // dispatch recovers from by reselecting, so it must not be silent: a rise
     // here means the admission scan and the budget commit are disagreeing more
     // often. arg0=refusals this window, arg1=(slot<<32)|(domain<<8)|cause.
-    if let Some((refusals, last)) =
-        super::scheduling_context::take_domain_budget_refusal_window()
-    {
+    if let Some((refusals, last)) = super::scheduling_context::take_domain_budget_refusal_window() {
         crate::debug::record_milestone(
             crate::debug::LogCategory::Sched,
             "scheduling-domain-budget-refused",
