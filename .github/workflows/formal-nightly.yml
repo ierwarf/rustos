@@ -16,6 +16,9 @@ jobs:
   formal-nightly:
     runs-on: ubuntu-24.04
     timeout-minutes: 240
+    permissions:
+      contents: read
+      issues: write
     steps:
     - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
     - name: Cache formal toolchains
@@ -59,3 +62,21 @@ jobs:
         path: build/formal
         if-no-files-found: error
         retention-days: 30
+    - name: File or update an issue on nightly failure
+      # Nothing merge-blocking depends on this workflow, so a red run is
+      # otherwise silent unless someone happens to check the Actions tab.
+      # Reuse one open tracking issue instead of filing a new one per night.
+      if: failure()
+      env:
+        GH_TOKEN: ${{ github.token }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: |
+        title="[formal-nightly] gate is failing"
+        existing="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+          --search "in:title \"$title\"" --json number --jq '.[0].number')"
+        body="Scheduled \`formal/verify-all.sh --profile nightly\` failed. Run: $RUN_URL"
+        if [[ -n "$existing" ]]; then
+          gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+        else
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+        fi

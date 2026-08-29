@@ -84,7 +84,10 @@ wait_parallel_lanes() {
     local index
     for index in "${!lane_pids[@]}"; do
         if wait "${lane_pids[$index]}"; then
-            cat "$lane_dir/${lane_names[$index]}.log"
+            # The full lane log is retained under build/formal/ regardless; a
+            # passing lane has nothing an agent or reviewer needs to see, so
+            # stdout stays to the one-line summary instead of replaying every
+            # lane's complete log on every green run.
             printf 'formal lane passed: %s elapsed_seconds=%s\n' \
                 "${lane_names[$index]}" "$(lane_seconds "${lane_names[$index]}")"
         else

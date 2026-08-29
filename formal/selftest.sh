@@ -194,6 +194,11 @@ formal/check-performance-contracts.sh
     exit 1
 }
 formal/check-rust-source-contracts.py
+[[ -x formal/check-dead-tests.py ]] || {
+    echo "dead-test debt checker is not executable" >&2
+    exit 1
+}
+formal/check-dead-tests.py
 [[ -x formal/check-binding-exemptions.py ]] || {
     echo "binding exemption checker is not executable" >&2
     exit 1

@@ -71,6 +71,7 @@ jobs:
         -p boot-random
         -p driver-abi
         -p keyboard-core
+        -p rustos-driver-domain-host
 
   formal:
     runs-on: ubuntu-24.04

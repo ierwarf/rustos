@@ -1,0 +1,3 @@
+# path	dead_test_limit	reason
+services/vfsd/src/main.rs	5	no_std/no_main bin has test = false in services/vfsd/Cargo.toml; #[test] fns here never run under cargo test. Move them into lib.rs, where vfsd's other executing tests live, or make the binary host-testable.
+services/syscalld/src/main.rs	2	no_std/no_main bin has test = false in services/syscalld/Cargo.toml; #[test] fns here never run under cargo test. Move them into lib.rs or make the binary host-testable.

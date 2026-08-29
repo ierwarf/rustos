@@ -44,6 +44,13 @@ set settles. The printed plan is not validation evidence.
 
 ## Stop rules
 
+- `session-handoff.md` is 1700+ lines: only `## Current checkout snapshot`
+  (near the top) is the current-state section resume tasks need. `## Session
+  log` below it is a historical debugging diary — open only the one `###`
+  entry named by the current request, never the whole log.
+- `contracts-abi.md` is organized by owner surface (`## VFS Surface`, `##
+  Storage Surface`, `## Input Surface`, ...). Search for the `##` heading
+  matching the task's owning service instead of reading the file from the top.
 - If the task can be answered from one AI doc and one source file, stop searching.
 - If search returns an exact symbol/function, open only a narrow range around it.
 - If the user asks for implementation and the target owner is clear, stop
