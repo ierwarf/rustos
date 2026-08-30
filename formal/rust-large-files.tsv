@@ -8,7 +8,6 @@ kernel/compat/src/user/syscall/linux/service_ops/vfs_socket.rs	1600	compat-vfs	S
 kernel/io-manager/src/input/dvm_ring.rs	1606	io-input	Split aperture admission, atomic header snapshots, worker lifecycle, broker operations, and tests.
 kernel/io-manager/src/io/dvm_display.rs	1835	io-display	Split handshake, shared-surface lifecycle, present queue, and tests.
 kernel/ipc-runtime/src/ipc/mod.rs	3159	ipc-runtime	Extract the fixed FastCallFrame state machine into ipc/fast_call.rs, then split endpoint, reply, shared-region, and accounting modules.
-kernel/mm/src/memory/address_space.rs	1482	memory	Split validated user-copy proofs, page-table mutation, VMA admission, teardown, and tests.
 kernel/mm/src/memory/kernel_vm.rs	1435	memory-kernel-vm	Split PAT/cache policy, direct-map transactions, high-window mappings, and tests.
 kernel/ps/src/multitask/process_table.rs	1806	process-table	Split lifecycle transaction state and markers into process_table/lifecycle.rs, then the own-thread pin, retained exact-MM generation access, and identity adapters into process_table/identity.rs.
 kernel/ps/src/multitask/scheduler.rs	5596	scheduler	The handoff chain's per-step self-timing is removed; the hit/miss split now carries its own attempt count. Next: split run queues, wakeup, deadlines, switching, accounting, and tests.

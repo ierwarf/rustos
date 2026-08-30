@@ -77,6 +77,15 @@ pub(super) fn current_cpu_index_uncharged() -> usize {
     derive_cpu_index()
 }
 
+/// The steady-state body: three admitted-policy loads, one token read, one
+/// range check.
+///
+/// It is written to be inlined, and the outlining below is what lets it be.
+/// `#[inline]` alone did not: the `CPUID` fallback and both panics inflated the
+/// cost estimate past the threshold, so LLVM emitted seven out-of-line copies,
+/// each with a stack frame, and every derivation in the kernel paid a call and
+/// return to reach six instructions. The per-site census counts roughly thirty
+/// derivations on a null syscall, so that call is not amortized anywhere.
 #[cfg(rustos_boot_image)]
 #[inline]
 fn derive_cpu_index() -> usize {
@@ -104,15 +113,28 @@ fn derive_cpu_index() -> usize {
             return index;
         }
         if aux != 0 {
-            panic!("lockdep invariant: current TSC_AUX token {aux:#x} is outside topology");
+            token_outside_topology(aux);
         }
     }
+    derive_cpu_index_by_apic(count)
+}
+
+/// The `CPUID` fallback, taken only before token admission.
+///
+/// Outlined so the admitted path above stays inlinable. Reaching this on a
+/// steady-state path is itself the finding: it is a VM exit per derivation.
+#[cfg(rustos_boot_image)]
+#[cold]
+#[inline(never)]
+fn derive_cpu_index_by_apic(count: usize) -> usize {
     // Charged so the reason a lock acquisition paid a CPUID exit is a
     // measurement rather than an inference.
     let fallback = super::lock_profile::now();
     let apic_id = hardware_apic_id();
     super::lock_profile::charge(super::lock_profile::LockPhase::ApicFallbackToken, fallback);
     let index = select_cpu_index(
+        // ORDERING: the publication flag the caller acquired covers this
+        // payload; the map is immutable after publication.
         CPU_APIC_IDENTITIES[..count]
             .iter()
             .map(|identity| identity.load(Ordering::Relaxed)),
@@ -122,6 +144,15 @@ fn derive_cpu_index() -> usize {
         return index;
     }
     panic!("lockdep invariant: current APIC ID {apic_id:#x} lacks a logical CPU index");
+}
+
+/// A token the admitted topology cannot name is a wrong run queue, not a slow
+/// path. Outlined with its formatting so the caller keeps no frame for it.
+#[cfg(rustos_boot_image)]
+#[cold]
+#[inline(never)]
+fn token_outside_topology(aux: u32) -> ! {
+    panic!("lockdep invariant: current TSC_AUX token {aux:#x} is outside topology");
 }
 
 #[cfg(not(rustos_boot_image))]

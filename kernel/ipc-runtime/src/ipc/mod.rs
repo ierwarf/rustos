@@ -2016,38 +2016,38 @@ pub fn take_fast_endpoint_response(
     reply: KernelReplyHandle,
     caller_task_id: u64,
 ) -> Result<FastEndpointResponseTake, IpcError> {
-    let result = REPLIES
-        .with_mut(reply.raw(), |reply_object| {
-            let frame = reply_object
-                .fast_frame
-                .as_ref()
-                .ok_or(IpcError::InvalidHandle)?;
+    // One acquisition where `with_mut` then `remove` took this slot's lock
+    // twice; `GenerationalSlab::with_mut_take` says why the object comes back.
+    let (result, retired) = REPLIES
+        .with_mut_take(reply.raw(), |reply_object| 'take: {
+            let Some(frame) = reply_object.fast_frame.as_ref() else {
+                break 'take (Err(IpcError::InvalidHandle), false);
+            };
             if frame.caller_task_id != caller_task_id || reply_object.consumed {
-                return Err(IpcError::PermissionDenied);
+                break 'take (Err(IpcError::PermissionDenied), false);
             }
             if frame.state == FastCallState::ErrorReady {
                 reply_object.consumed = true;
-                return Ok(FastEndpointResponseTake::Error(
-                    frame.terminal_error.ok_or(IpcError::InvalidHandle)?,
-                ));
+                break 'take match frame.terminal_error {
+                    Some(error) => (Ok(FastEndpointResponseTake::Error(error)), true),
+                    None => (Err(IpcError::InvalidHandle), false),
+                };
             }
             if frame.state != FastCallState::ResponseReady {
-                return Ok(FastEndpointResponseTake::Pending);
+                break 'take (Ok(FastEndpointResponseTake::Pending), false);
             }
             reply_object.consumed = true;
-            Ok(FastEndpointResponseTake::Response {
-                response_len: frame.response_len,
-                response: frame.response,
-            })
+            (
+                Ok(FastEndpointResponseTake::Response {
+                    response_len: frame.response_len,
+                    response: frame.response,
+                }),
+                true,
+            )
         })
-        .ok_or(IpcError::InvalidHandle)??;
-    if matches!(
-        result,
-        FastEndpointResponseTake::Response { .. } | FastEndpointResponseTake::Error(_)
-    ) {
-        drop(REPLIES.remove(reply.raw()));
-    }
-    Ok(result)
+        .ok_or(IpcError::InvalidHandle)?;
+    drop(retired);
+    result
 }
 
 /// Returns the process owner of the endpoint bound into a live reply

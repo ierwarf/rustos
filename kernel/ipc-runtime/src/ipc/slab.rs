@@ -96,6 +96,43 @@ impl<T, const N: usize, const CLASS: u8> GenerationalSlab<T, N, CLASS> {
         })
     }
 
+    /// Runs `f` against a live slot's value and, when `f` asks for it, retires
+    /// the slot under the same acquisition.
+    ///
+    /// `with_mut` followed by `remove` takes one slot's lock twice to settle a
+    /// single decision. The ranked acquisition census measured that pair once
+    /// per terminal fast-reply take, and the only lever that moves this
+    /// kernel's IPC floor is acquiring fewer locks, not making one cheaper.
+    ///
+    /// The retired value is returned rather than dropped here, so its
+    /// destructor still runs after the slot guard releases -- which is the
+    /// property the two-step shape existed to get. Fusing also closes the
+    /// window between the two acquisitions, so a decision and the retirement it
+    /// authorizes can no longer be split by another CPU.
+    ///
+    /// `f` must not re-enter this slab: it runs while the slot lock is held.
+    #[track_caller]
+    pub fn with_mut_take<R>(
+        &self,
+        handle: u64,
+        f: impl FnOnce(&mut T) -> (R, bool),
+    ) -> Option<(R, Option<T>)> {
+        let (index, generation) = decode_handle::<N>(handle)?;
+        self.with_slot(index, |slot| {
+            if slot.generation != generation {
+                return None;
+            }
+            let value = slot.value.as_mut()?;
+            let (result, retire) = f(value);
+            if !retire {
+                return Some((result, None));
+            }
+            let retired = slot.value.take();
+            slot.retire_generation();
+            Some((result, retired))
+        })
+    }
+
     #[track_caller]
     pub fn remove(&self, handle: u64) -> Option<T> {
         let (index, generation) = decode_handle::<N>(handle)?;

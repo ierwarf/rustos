@@ -110,6 +110,24 @@ phase_profile = false
 # `RUSTOS_IPC_PHASE_PROFILE=true cargo xtask bench --isolate-probe <probe>`.
 phase_profile = false
 
+[usermem_telemetry]
+# Per-phase cycle attribution across the user-memory bind, admission, and copy
+# path -- the hottest kernel path there is, since every syscall that reads or
+# writes a user buffer goes through it.
+#
+# About ten `rdtsc` reads and twenty relaxed atomic adds per syscall that
+# touches user memory twice, wrapped around phases that individually cost a few
+# hundred cycles: the fifth instance of the shape `lock_telemetry`,
+# `scheduler_telemetry`, `syscall_telemetry`, and `ipc_telemetry` already carry,
+# and this was the last one still compiled into shipping images.
+#
+# It stays in the tree because the bind/validate/copy split is what showed that
+# `with_current_mm` was taking the global process table three times per copy.
+# Turn it on for a diagnosis run -- `RUSTOS_USERMEM_PHASE_PROFILE=true cargo
+# xtask bench` -- and read the result as the cost of an instrumented copy, not
+# of a copy.
+phase_profile = false
+
 [lifecycle_telemetry]
 # Emits an exact checksum-framed marker for spawn/exec/exit/reap stages. Each
 # marker carries process slot+generation, MM generation, and a non-reusable
@@ -132,6 +150,20 @@ incremental = false
 debuginfo = "1"
 embed_bitcode = true
 panic = "abort"
-relocation_model = "none"
+# `"none"` means "do not pass the flag", which is not the same as "no
+# relocation". The kernel target is `x86_64-unknown-linux-gnu`, whose default
+# relocation model is PIC, so every kernel library crate reached its own statics
+# through a GOT slot: `mov (GOT),%rax; mov (%rax),%rdst` -- two dependent loads
+# where one direct RIP-relative load would do. The nucleus *binary* crate never
+# paid that, because `nucleus_rustc_args` already passes
+# `-C relocation-model=static`; but `cargo rustc` args stop at the binary crate,
+# and all the hot code lives in the libraries below it.
+#
+# The image is linked `-no-pie -static` at a fixed `KERNEL_LOAD_BASE = 0x200000`
+# and executes at its link address, which is exactly the condition the static
+# model requires -- the binary crate has been relying on it since it was
+# written. Setting it here makes the libraries agree with the binary and with
+# the link, rather than adding a new assumption.
+relocation_model = "static"
 strip = "none"
 extra_rustflags = []

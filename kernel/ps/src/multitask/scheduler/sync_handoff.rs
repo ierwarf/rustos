@@ -267,6 +267,15 @@ impl SyncHandoffState {
             );
             return None;
         }
+        if self.len == 0 {
+            // Nothing was discarded, so charging `DrainedStale` here would
+            // attribute a stale *flag* to stale *records*.
+            #[cfg(rustos_scheduler_phase_profile)]
+            super::locality::record_sync_handoff_miss(
+                super::locality::SyncHandoffMissReason::StartedEmpty,
+            );
+            return None;
+        }
         while self.len != 0 {
             let index = self.head;
             let record = self.records[index]
@@ -466,10 +475,17 @@ pub(super) fn take_next_ready(
     // `SyncHandoffState` is the identical isolated host-fixture state machine.
     debug_assert_eq!(state.handoff_streak, 0);
     let taken = state.take_next_ready(ready);
-    // Clear only on a queue this CPU has just seen empty under the lock. A
-    // capped handoff streak returns None with records still queued, and
-    // clearing there would strand them.
-    if taken.is_none() && state.len == 0 {
+    // Clear on any queue this CPU has just seen empty under the lock,
+    // including one a successful take emptied. The one-sided invariant is
+    // unchanged and the proof is the same: an enqueue publishes `true` only
+    // after releasing this lock, so a queue observed empty while holding it
+    // has no completed insert to strand. Restricting the clear to `None`
+    // results left the flag set after every take that emptied the FIFO, so the
+    // next dispatch paid this lock only to read `len == 0` -- the exact
+    // acquisition `pending()` exists to avoid. A capped handoff streak still
+    // returns with records queued, and `state.len == 0` declines to clear
+    // there.
+    if state.len == 0 {
         if let Some(pending) = SYNC_HANDOFF_PENDING.get(cpu) {
             // ORDERING: release keeps the clear behind the drain that
             // justified it, so a producer that observes `false` has already
@@ -772,5 +788,42 @@ mod tests {
 
         assert_eq!(state.take_next_ready(|_| true), None);
         assert_ne!(state.len, 0, "a capped streak must leave the record queued");
+    }
+
+    #[test]
+    fn a_take_that_empties_the_queue_leaves_it_clearable() {
+        // The production `take_next_ready(cpu, ..)` clears `SYNC_HANDOFF_PENDING`
+        // on `state.len == 0` alone, so a successful take that drained the FIFO
+        // must leave that condition true. While the clear also required
+        // `taken.is_none()`, every emptying hit left the flag set and the next
+        // dispatch took this lock only to read `len == 0` -- the acquisition
+        // `pending()` exists to avoid, and the one misreported as `DrainedStale`.
+        let mut state = SyncHandoffState::new();
+        assert!(state.enqueue(SyncHandoffRecord::new(1, 7)));
+
+        assert_eq!(state.take_next_ready(|_| true), Some(1));
+        assert_eq!(
+            state.len, 0,
+            "an emptying take must leave the queue clearable"
+        );
+    }
+
+    #[test]
+    fn an_already_empty_queue_discards_nothing() {
+        // `StartedEmpty` exists because this path charged `DrainedStale`, which
+        // names a discard that never happened: the readiness predicate is not
+        // consulted at all.
+        let mut state = SyncHandoffState::new();
+        let mut consulted = 0_usize;
+
+        assert_eq!(
+            state.take_next_ready(|_| {
+                consulted += 1;
+                true
+            }),
+            None
+        );
+        assert_eq!(consulted, 0, "an empty queue must reject no record");
+        assert_eq!(state.len, 0);
     }
 }

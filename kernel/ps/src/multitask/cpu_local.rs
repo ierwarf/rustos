@@ -80,7 +80,9 @@ const SCHEDULER_LOCK_TIMEOUT_NS: u64 = 2_000_000_000;
 const SCHEDULER_LOCK_DEADLINE_POLL_SPINS: u32 = 1_024;
 const NO_SCHEDULER_OWNER: usize = usize::MAX;
 // ORDERING: the owner CPU is the release/acquire publication word for the
-// remaining diagnostic fields. These atomics never grant scheduler authority.
+// remaining diagnostic fields and selects the owning CPU's private turn
+// scratch. These atomics never grant scheduler authority; the tracked guard
+// remains the sole exclusion authority.
 static SCHEDULER_OWNER_CPU: AtomicUsize = AtomicUsize::new(NO_SCHEDULER_OWNER);
 static SCHEDULER_OWNER_SLOT: AtomicUsize = AtomicUsize::new(0);
 static SCHEDULER_OWNER_ACQUIRED_NS: AtomicU64 = AtomicU64::new(0);
@@ -290,9 +292,9 @@ impl Drop for SchedulerAccessGuard {
             original_task: self.original_task,
         }
         .publish(selected_task, guard.current_task_is_idle_task());
-        // ORDERING: diagnostic metadata is not lock authority. Release-clear
-        // its publication immediately before the tracked guard releases the
-        // real lock.
+        // ORDERING: turn metadata is not lock authority. Release-clear its
+        // publication immediately before the tracked guard releases the real
+        // lock, after the final scratch access above.
         SCHEDULER_OWNER_CPU.store(NO_SCHEDULER_OWNER, Ordering::Release);
         // Drop the tracked guard explicitly so the raw lock and its
         // preemption unit are gone before any remote IPI is emitted.
@@ -477,7 +479,7 @@ pub(super) fn publish_cpu_current_task(logical_index: usize, slot: usize) {
 /// together with `TRANSITION_*`, grants remote execution/lifetime authority.
 #[inline]
 pub(super) fn scheduler_current_task_scratch() -> usize {
-    let logical_index = nucleus_core::util::lockdep::current_cpu_index();
+    let logical_index = scheduler_turn_logical_index();
     scheduler_current_task_scratch_for_cpu(logical_index)
 }
 
@@ -488,8 +490,29 @@ pub(super) fn scheduler_current_task_scratch() -> usize {
 /// the outgoing stack-transition owner is installed.
 #[inline]
 pub(super) fn set_scheduler_current_task_scratch(slot: usize) {
-    let logical_index = nucleus_core::util::lockdep::current_cpu_index();
+    let logical_index = scheduler_turn_logical_index();
     set_scheduler_current_task_scratch_for_cpu(logical_index, slot);
+}
+
+/// Returns the CPU already bound to the live global-scheduler turn.
+///
+/// `scheduler_mut` derives this identity before acquiring the guard and
+/// release-publishes it before any `Scheduler` method can inspect the private
+/// scratch slot.  The tracked guard keeps preemption disabled until the owner
+/// word is cleared, so re-deriving the same identity on every
+/// `current_task_slot` call only repeats an architectural CPU-token read.  This
+/// word still grants no scheduler authority: callers must already hold the
+/// guard, and an absent owner fails closed.
+#[inline]
+fn scheduler_turn_logical_index() -> usize {
+    // ORDERING: Acquire observes the live turn record published after the
+    // tracked guard acquired the scheduler and before any method can run.
+    let logical_index = SCHEDULER_OWNER_CPU.load(Ordering::Acquire);
+    assert!(
+        logical_index < SCHEDULER_CURRENT_TASK_SCRATCH.len(),
+        "scheduler invariant: scratch accessed outside a live scheduler turn"
+    );
+    logical_index
 }
 
 #[inline]

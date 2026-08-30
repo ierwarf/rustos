@@ -69,11 +69,31 @@ pub(super) const fn preemption_release_is_admissible(
 /// Interrupt handlers remain available while this is non-zero; only an
 /// explicit task scheduler handoff is forbidden. The scheduler checks this
 /// before every software reschedule entry.
+///
+/// One derivation and one load. This read [`preemption_snapshot`], which builds
+/// and cross-validates six fields -- an APIC identity lookup, a second and third
+/// atomic load, two held-stack scans, and a units assert with its formatting
+/// arguments -- to answer a question that is one word. That cost reached the
+/// nine `current.rs` entry points that open with [`preemption_disabled`], and
+/// the per-site identity census ranked the snapshot's own derivation fourth of
+/// every logical-index derivation in the kernel.
+///
+/// The units assert is not lost. Every `disable_preemption` makes the identical
+/// assertion, and an acquire is the transition that can break the
+/// depth/held/pending correspondence; a read cannot. The three `irq.rs` callers
+/// that want the coherent six-field snapshot still take it directly.
 #[inline]
 pub fn preemption_depth() -> usize {
     #[cfg(rustos_boot_image)]
     {
-        preemption_snapshot().depth
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            // Interrupts are masked, so the derived index and the depth read
+            // against it name one CPU.
+            let cpu = current_cpu_index();
+            // ORDERING: Acquire observes completed guard/pending transitions
+            // before a scheduler gate consumes this depth.
+            PREEMPT_DISABLE_DEPTH[cpu].load(Ordering::Acquire)
+        })
     }
     #[cfg(not(rustos_boot_image))]
     {
@@ -85,6 +105,7 @@ pub fn preemption_depth() -> usize {
 pub fn preemption_disabled() -> bool {
     preemption_depth() != 0
 }
+
 
 /// Take one same-CPU, IRQ-atomic snapshot of scheduler-preemption ownership.
 pub fn preemption_snapshot() -> PreemptionSnapshot {

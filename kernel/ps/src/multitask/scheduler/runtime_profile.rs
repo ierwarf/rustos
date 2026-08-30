@@ -404,7 +404,7 @@ pub fn drain_scheduler_runtime_profile() -> usize {
     );
     // The pick hint's hit/attempt split: how often the synchronous IPC pick
     // hint actually held a ready slot, against how often it was asked. Hits and
-    // the three miss causes partition every attempt, so their sum *is* the
+    // the four miss causes partition every attempt, so their sum *is* the
     // attempt count -- it needs no separate counter to stay consistent with the
     // rows below. arg0=hits, arg1=attempts.
     let sync_handoff_attempts = profile
@@ -431,6 +431,10 @@ pub fn drain_scheduler_runtime_profile() -> usize {
         (
             profile.sync_handoff_misses[2],
             "kernel-scheduler-step-sync-miss-stale",
+        ),
+        (
+            profile.sync_handoff_misses[3],
+            "kernel-scheduler-step-sync-miss-flag-stale",
         ),
     ] {
         crate::debug::record_milestone(

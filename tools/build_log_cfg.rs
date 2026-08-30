@@ -55,7 +55,8 @@ pub struct LoggingConfig {
 
 /// A telemetry section whose only key is `phase_profile`.
 ///
-/// Four of these now exist -- lock, scheduler, syscall, and IPC -- because the same
+/// Five of these now exist -- lock, scheduler, syscall, IPC, and usermem --
+/// because the same
 /// defect keeps recurring: a per-phase timing profile wrapped around an
 /// operation cheaper than the profile. Each was found the same way, by stubbing
 /// it out and measuring, and each cost more than what it measured. The lock
@@ -103,11 +104,25 @@ pub const LIFECYCLE_TRACE: PhaseProfileSection = PhaseProfileSection {
     cfg: "rustos_lifecycle_trace",
 };
 
-pub const PHASE_PROFILE_SECTIONS: [PhaseProfileSection; 4] = [
+/// The user-copy bind/validate/copy phases. Every `copy_from_user` and
+/// `copy_into_user` in the kernel opens with a TSC read and charges three more,
+/// and every process bind charges two, so a syscall that touches user memory
+/// twice pays about ten `rdtsc` reads and twenty relaxed atomic adds on top of
+/// the copy itself. This was the last profile still compiled unconditionally
+/// into shipping images; it is the fifth instance of the shape the four above
+/// already carry, and was found the same way.
+pub const USERMEM_PHASE_PROFILE: PhaseProfileSection = PhaseProfileSection {
+    section: "usermem_telemetry",
+    env: "RUSTOS_USERMEM_PHASE_PROFILE",
+    cfg: "rustos_usermem_phase_profile",
+};
+
+pub const PHASE_PROFILE_SECTIONS: [PhaseProfileSection; 5] = [
     SCHEDULER_PHASE_PROFILE,
     SYSCALL_PHASE_PROFILE,
     IPC_PHASE_PROFILE,
     LIFECYCLE_TRACE,
+    USERMEM_PHASE_PROFILE,
 ];
 
 pub fn parse_phase_profile_toml(source: &str, section_name: &str) -> bool {

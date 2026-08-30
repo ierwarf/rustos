@@ -41,6 +41,7 @@ pub(crate) struct ProjectConfig {
     pub(crate) syscall_telemetry: SyscallTelemetryConfig,
     pub(crate) ipc_telemetry: IpcTelemetryConfig,
     pub(crate) lifecycle_telemetry: LifecycleTelemetryConfig,
+    pub(crate) usermem_telemetry: UsermemTelemetryConfig,
 }
 
 #[derive(Clone, Debug)]
@@ -104,6 +105,14 @@ pub(crate) struct IpcTelemetryConfig {
 /// latency measurements because each marker performs debugcon output.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct LifecycleTelemetryConfig {
+    pub(crate) phase_profile: bool,
+}
+
+/// User-copy bind, admission, and copy attribution. Every syscall that touches
+/// a user buffer charges these, so a shipping build must leave them compiled
+/// out. See `config/rustos.toml` for the measurement.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct UsermemTelemetryConfig {
     pub(crate) phase_profile: bool,
 }
 
@@ -231,6 +240,7 @@ struct ProjectConfigFile {
     syscall_telemetry: SyscallTelemetryConfigFile,
     ipc_telemetry: IpcTelemetryConfigFile,
     lifecycle_telemetry: LifecycleTelemetryConfigFile,
+    usermem_telemetry: UsermemTelemetryConfigFile,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -298,6 +308,12 @@ struct LifecycleTelemetryConfigFile {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+struct UsermemTelemetryConfigFile {
+    phase_profile: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 struct LockTelemetryConfigFile {
     enabled: Option<bool>,
     phase_profile: Option<bool>,
@@ -315,6 +331,7 @@ pub(crate) fn load_project_config(root_dir: &Path) -> Result<ProjectConfig> {
     apply_syscall_telemetry_env_overrides(&mut config.syscall_telemetry)?;
     apply_ipc_telemetry_env_overrides(&mut config.ipc_telemetry)?;
     apply_lifecycle_telemetry_env_overrides(&mut config.lifecycle_telemetry)?;
+    apply_usermem_telemetry_env_overrides(&mut config.usermem_telemetry)?;
     validate_kernel_build(&config.kernel.build)?;
     validate_fault_injection(&config.fault_injection)?;
     validate_fuzzing(&config.fuzzing)?;
@@ -328,6 +345,7 @@ pub(crate) fn load_project_config(root_dir: &Path) -> Result<ProjectConfig> {
         scheduler_telemetry: config.scheduler_telemetry,
         syscall_telemetry: config.syscall_telemetry,
         ipc_telemetry: config.ipc_telemetry,
+        usermem_telemetry: config.usermem_telemetry,
         lifecycle_telemetry: config.lifecycle_telemetry,
     })
 }
@@ -469,6 +487,9 @@ fn project_from_file(file: ProjectConfigFile) -> ProjectConfig {
     if let Some(value) = file.lifecycle_telemetry.phase_profile {
         config.lifecycle_telemetry.phase_profile = value;
     }
+    if let Some(value) = file.usermem_telemetry.phase_profile {
+        config.usermem_telemetry.phase_profile = value;
+    }
     config
 }
 
@@ -484,6 +505,7 @@ impl Default for ProjectConfig {
             syscall_telemetry: SyscallTelemetryConfig::default(),
             ipc_telemetry: IpcTelemetryConfig::default(),
             lifecycle_telemetry: LifecycleTelemetryConfig::default(),
+            usermem_telemetry: UsermemTelemetryConfig::default(),
         }
     }
 }
@@ -614,6 +636,16 @@ fn apply_lifecycle_telemetry_env_overrides(
 ) -> Result<()> {
     if let Some(value) = env_string("RUSTOS_LIFECYCLE_TRACE") {
         lifecycle_telemetry.phase_profile = parse_bool_env("RUSTOS_LIFECYCLE_TRACE", &value)?;
+    }
+    Ok(())
+}
+
+fn apply_usermem_telemetry_env_overrides(
+    usermem_telemetry: &mut UsermemTelemetryConfig,
+) -> Result<()> {
+    if let Some(value) = env_string("RUSTOS_USERMEM_PHASE_PROFILE") {
+        usermem_telemetry.phase_profile =
+            parse_bool_env("RUSTOS_USERMEM_PHASE_PROFILE", &value)?;
     }
     Ok(())
 }
@@ -759,6 +791,7 @@ pub(crate) fn effective_config_toml(config: &ProjectConfig) -> String {
     let syscall_telemetry = &config.syscall_telemetry;
     let ipc_telemetry = &config.ipc_telemetry;
     let lifecycle_telemetry = &config.lifecycle_telemetry;
+    let usermem_telemetry = &config.usermem_telemetry;
     let extra = build
         .extra_rustflags
         .iter()
@@ -772,7 +805,7 @@ pub(crate) fn effective_config_toml(config: &ProjectConfig) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "# source: {}\n[kernel.build]\ncodegen_units = {}\nopt_level = {:?}\noverflow_checks = {}\ndebug_assertions = {}\nlto = {:?}\nforce_frame_pointers = {}\nincremental = {}\ndebuginfo = {:?}\nembed_bitcode = {}\npanic = {:?}\nrelocation_model = {:?}\nstrip = {:?}\nextra_rustflags = [{}]\n\n[fault_injection]\nenabled = {}\nrules = [{}]\n\n[fuzzing]\nenabled = {}\nfd_transfer_stress = {}\nstartup_delay_ms = {}\n\n[lock_telemetry]\nenabled = {}\nphase_profile = {}\nwarn_wait_cycles = {}\nwarn_hold_cycles = {}\n\n[scheduler_telemetry]\nphase_profile = {}\n\n[syscall_telemetry]\nphase_profile = {}\n\n[ipc_telemetry]\nphase_profile = {}\n\n[lifecycle_telemetry]\nphase_profile = {}\n",
+        "# source: {}\n[kernel.build]\ncodegen_units = {}\nopt_level = {:?}\noverflow_checks = {}\ndebug_assertions = {}\nlto = {:?}\nforce_frame_pointers = {}\nincremental = {}\ndebuginfo = {:?}\nembed_bitcode = {}\npanic = {:?}\nrelocation_model = {:?}\nstrip = {:?}\nextra_rustflags = [{}]\n\n[fault_injection]\nenabled = {}\nrules = [{}]\n\n[fuzzing]\nenabled = {}\nfd_transfer_stress = {}\nstartup_delay_ms = {}\n\n[lock_telemetry]\nenabled = {}\nphase_profile = {}\nwarn_wait_cycles = {}\nwarn_hold_cycles = {}\n\n[scheduler_telemetry]\nphase_profile = {}\n\n[syscall_telemetry]\nphase_profile = {}\n\n[ipc_telemetry]\nphase_profile = {}\n\n[lifecycle_telemetry]\nphase_profile = {}\n\n[usermem_telemetry]\nphase_profile = {}\n",
         config.source.label(),
         build.codegen_units,
         build.opt_level,
@@ -800,6 +833,7 @@ pub(crate) fn effective_config_toml(config: &ProjectConfig) -> String {
         syscall_telemetry.phase_profile,
         ipc_telemetry.phase_profile,
         lifecycle_telemetry.phase_profile,
+        usermem_telemetry.phase_profile,
     )
 }
 
@@ -808,6 +842,7 @@ mod tests {
     use super::{
         FaultInjectionConfig, IpcTelemetryConfig, KernelBuildConfig, LifecycleTelemetryConfig,
         LockTelemetryConfig, ProjectConfigFile, SchedulerTelemetryConfig, SyscallTelemetryConfig,
+        UsermemTelemetryConfig,
         apply_fault_rule_overrides, project_from_file, validate_fault_injection,
     };
 
@@ -895,6 +930,7 @@ mod tests {
                 "lifecycle_telemetry",
                 shipped.lifecycle_telemetry.phase_profile,
             ),
+            ("usermem_telemetry", shipped.usermem_telemetry.phase_profile),
         ] {
             assert!(
                 !enabled,
@@ -912,6 +948,11 @@ mod tests {
         let enabled: ProjectConfigFile = toml::from_str("[ipc_telemetry]\nphase_profile = true\n")
             .expect("phase_profile is a recognized ipc_telemetry key");
         assert!(project_from_file(enabled).ipc_telemetry.phase_profile);
+        assert!(!UsermemTelemetryConfig::default().phase_profile);
+        let enabled: ProjectConfigFile =
+            toml::from_str("[usermem_telemetry]\nphase_profile = true\n")
+                .expect("phase_profile is a recognized usermem_telemetry key");
+        assert!(project_from_file(enabled).usermem_telemetry.phase_profile);
     }
 
     #[test]

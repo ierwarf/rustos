@@ -431,7 +431,7 @@ pub(in crate::multitask) fn take_sync_handoff_hit_window() -> u64 {
 
 /// The pick hint's `None` outcomes, split by cause. Hits (above) plus these
 /// three are the whole attempt count.
-pub(in crate::multitask) const SYNC_HANDOFF_MISS_REASON_COUNT: usize = 3;
+pub(in crate::multitask) const SYNC_HANDOFF_MISS_REASON_COUNT: usize = 4;
 
 #[derive(Clone, Copy)]
 pub(in crate::multitask) enum SyncHandoffMissReason {
@@ -441,10 +441,18 @@ pub(in crate::multitask) enum SyncHandoffMissReason {
     /// The queue may hold a ready record, but this CPU's consecutive-hit
     /// streak already reached `MAX_CONSECUTIVE_SYNC_HANDOFFS`.
     StreakCapped = 1,
-    /// The consume loop ran dry — either it started empty (a narrow race
-    /// against the outer `pending()` check) or every record it held was
-    /// discarded as stale. See `SyncHandoffStaleReason` for why.
+    /// The consume loop held records and discarded every one of them as
+    /// stale. See `SyncHandoffStaleReason` for which check rejected each.
     DrainedStale = 2,
+    /// The FIFO was already empty when the lock was taken, so nothing was
+    /// discarded and no `SyncHandoffStaleReason` applies: the lock-free
+    /// `pending()` flag said "may hold a record" and did not.
+    ///
+    /// This was folded into `DrainedStale` and measured at 98% of it — 8.2% of
+    /// every attempt — which made the stale sub-reasons look like they
+    /// accounted for a bucket they explained 2% of. Splitting it is what lets
+    /// a stale-hint claim and a stale-flag claim be told apart.
+    StartedEmpty = 3,
 }
 
 static SYNC_HANDOFF_MISSES: [core::sync::atomic::AtomicU64; SYNC_HANDOFF_MISS_REASON_COUNT] =

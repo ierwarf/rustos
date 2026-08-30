@@ -15,10 +15,21 @@
 //! caller's address space, admit the page span, then move the bytes — and the
 //! call profile charges all three to one phase. These counters split them, so
 //! the answer comes from measurement rather than from reading the call graph.
+//!
+//! Gated behind `usermem_telemetry.phase_profile`, off by default, for the same
+//! reason the lock, scheduler, syscall, and IPC profiles are: this instruments
+//! the hottest path in the kernel, and a shipping image that pays ten `rdtsc`
+//! reads and twenty relaxed atomic adds per user-memory syscall is paying more
+//! for the measurement than the phases it separates cost. Call sites stay
+//! unconditional so a phase cannot be silently forgotten at its boundary; only
+//! the counter read and the accumulator compile in.
 
+#[cfg(rustos_usermem_phase_profile)]
 use nucleus_core::debug::LogCategory;
+#[cfg(rustos_usermem_phase_profile)]
 use nucleus_core::debug::phase_profile::{PhaseProfile, phase_now};
 
+#[cfg(any(test, rustos_usermem_phase_profile))]
 pub(crate) const USER_COPY_PHASE_COUNT: usize = 10;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -49,6 +60,7 @@ pub(crate) enum UserCopyPhase {
     BindRelease = 9,
 }
 
+#[cfg(rustos_usermem_phase_profile)]
 static PROFILE: PhaseProfile<USER_COPY_PHASE_COUNT> = PhaseProfile::new(
     LogCategory::Process,
     [
@@ -69,20 +81,40 @@ static PROFILE: PhaseProfile<USER_COPY_PHASE_COUNT> = PhaseProfile::new(
 /// Reads the cycle counter for a phase boundary.
 #[inline]
 pub(crate) fn now() -> u64 {
-    phase_now()
+    #[cfg(rustos_usermem_phase_profile)]
+    {
+        phase_now()
+    }
+    #[cfg(not(rustos_usermem_phase_profile))]
+    {
+        0
+    }
 }
 
 /// Charges `phase` with the interval since `since` and returns the boundary
 /// timestamp, so consecutive phases chain without a second read.
 #[inline]
 pub(crate) fn charge(phase: UserCopyPhase, since: u64) -> u64 {
-    PROFILE.charge(phase as usize, since)
+    #[cfg(rustos_usermem_phase_profile)]
+    {
+        PROFILE.charge(phase as usize, since)
+    }
+    #[cfg(not(rustos_usermem_phase_profile))]
+    {
+        let _ = (phase, since);
+        0
+    }
 }
 
 /// Emits one fixed record per phase at most once per second and clears the
 /// window. Returns the number of records emitted so housekeeping can count it
 /// as work.
 pub fn drain_user_copy_profile() -> usize {
+    #[cfg(not(rustos_usermem_phase_profile))]
+    {
+        return 0;
+    }
+    #[cfg(rustos_usermem_phase_profile)]
     PROFILE.drain(
         crate::arch::rtc::ticks(),
         crate::arch::rtc::ticks_per_second(),
@@ -93,6 +125,11 @@ pub fn drain_user_copy_profile() -> usize {
 /// gate. See `force_drain_ipc_call_profile` for why an isolated probe needs
 /// this instead of waiting for the ordinary housekeeping cadence.
 pub fn force_drain_user_copy_profile() -> usize {
+    #[cfg(not(rustos_usermem_phase_profile))]
+    {
+        return 0;
+    }
+    #[cfg(rustos_usermem_phase_profile)]
     PROFILE.drain(crate::arch::rtc::ticks(), 0)
 }
 

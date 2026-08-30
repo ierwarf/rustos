@@ -38,6 +38,10 @@ incremental = false
 debuginfo = "1"
 embed_bitcode = true
 panic = "abort"
-relocation_model = "none"
+# The kernel target defaults to PIC, so `"none"` -- do not pass the flag --
+# reached every library-crate static through a GOT double load. The image links
+# `-no-pie -static` at a fixed base and runs at its link address, which is what
+# the static model needs; see the rationale in `config/rustos.toml`.
+relocation_model = "static"
 strip = "none"
 extra_rustflags = []
