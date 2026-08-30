@@ -1247,6 +1247,10 @@ const fn winsys_import_aliases() -> &'static [(&'static str, &'static str)] {
         ("api-ms-win-crt-heap-l1-1-0.dll", "ucrtbase.dll"),
         ("api-ms-win-crt-locale-l1-1-0.dll", "ucrtbase.dll"),
         ("api-ms-win-crt-math-l1-1-0.dll", "ucrtbase.dll"),
+        (
+            "api-ms-win-crt-private-l1-1-0.dll",
+            "ucrtbase.dll",
+        ),
         ("api-ms-win-crt-runtime-l1-1-0.dll", "ucrtbase.dll"),
         ("api-ms-win-crt-stdio-l1-1-0.dll", "ucrtbase.dll"),
         ("api-ms-win-crt-string-l1-1-0.dll", "ucrtbase.dll"),

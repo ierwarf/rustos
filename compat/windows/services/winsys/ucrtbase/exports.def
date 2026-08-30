@@ -1,6 +1,8 @@
 LIBRARY ucrtbase.dll
 EXPORTS
     __C_specific_handler
+    __set_app_type
+    __setusermatherr
     __acrt_iob_func
     __getmainargs
     __initenv DATA
@@ -11,12 +13,18 @@ EXPORTS
     __p__fmode
     _acmdln DATA
     _cexit
+    _crt_atexit
     _commode DATA
+    _configthreadlocale
     _configure_narrow_argv
     _errno
+    _exit
     _fmode DATA
+    _get_fmode
     _get_initial_narrow_environment
+    _get_invalid_parameter_handler
     _get_narrow_winmain_command_line
+    _get_printf_count_output
     _initialize_narrow_environment
     _initialize_onexit_table
     _execute_onexit_table
@@ -25,6 +33,11 @@ EXPORTS
     _lock
     _onexit
     _register_onexit_function
+    _set_abort_behavior
+    _set_fmode
+    _set_invalid_parameter_handler
+    _set_new_mode
+    _set_printf_count_output
     _unlock
     abort
     calloc
@@ -48,6 +61,7 @@ EXPORTS
     puts
     realloc
     scanf
+    setvbuf
     signal
     stderr DATA
     stdin DATA
